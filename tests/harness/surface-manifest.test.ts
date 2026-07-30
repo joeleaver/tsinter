@@ -30,7 +30,7 @@ import {
   renderSurfaceManifest,
   resolveLibraryFences,
   type SurfaceManifest,
-} from "@scriptc/compiler";
+} from "@tsinter/compiler";
 
 const repoRoot = join(import.meta.dirname, "../..");
 const manifestPath = join(repoRoot, "packages/compiler/surface-manifest.json");

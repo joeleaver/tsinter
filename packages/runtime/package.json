@@ -1,5 +1,5 @@
 {
-  "name": "@scriptc/runtime",
+  "name": "@tsinter/runtime",
   "version": "0.0.18",
   "description": "scriptc native runtime — C sources, compiled into every scriptc binary",
   "license": "Apache-2.0",

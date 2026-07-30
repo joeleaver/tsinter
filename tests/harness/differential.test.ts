@@ -16,7 +16,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
 import ts5 from "typescript";
-import { compile } from "@scriptc/compiler";
+import { compile } from "@tsinter/compiler";
 import { shardSelect, shardSuffix } from "./shard.js";
 
 const execFileAsync = promisify(execFile);

@@ -1,7 +1,7 @@
 import { globSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { expect, test } from "vitest";
-import { analyze, renderCoverage } from "@scriptc/compiler";
+import { analyze, renderCoverage } from "@tsinter/compiler";
 import { shardSelect, shardSuffix } from "./shard.js";
 
 const repoRoot = join(import.meta.dirname, "../..");

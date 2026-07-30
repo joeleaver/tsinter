@@ -1,5 +1,5 @@
 {
-  "name": "@scriptc/compiler",
+  "name": "@tsinter/compiler",
   "version": "0.0.18",
   "description": "The scriptc compiler — TypeScript/JavaScript frontend, typed IR, LLVM and C backends",
   "license": "Apache-2.0",
@@ -31,7 +31,7 @@
     "build": "node node_modules/typescript5/bin/tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@scriptc/runtime": "workspace:*",
+    "@tsinter/runtime": "workspace:*",
     "typescript": "7.0.2",
     "typescript5": "npm:typescript@5.9.3"
   }

@@ -19,7 +19,7 @@ import { globSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
-import { compile } from "@scriptc/compiler";
+import { compile } from "@tsinter/compiler";
 import { npmCases } from "./npm-cases.js";
 import { shardSelect, shardSuffix } from "./shard.js";
 

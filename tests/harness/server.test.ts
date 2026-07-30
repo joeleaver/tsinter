@@ -25,7 +25,7 @@ import { createHash } from "node:crypto";
 import { existsSync, globSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { compile } from "@scriptc/compiler";
+import { compile } from "@tsinter/compiler";
 import { shardSelect, shardSuffix } from "./shard.js";
 
 const repoRoot = join(import.meta.dirname, "../..");

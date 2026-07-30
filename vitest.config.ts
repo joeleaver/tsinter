@@ -19,7 +19,7 @@ export default defineConfig({
   resolve: {
     alias: {
       // Tests run against compiler source directly — no build step needed.
-      "@scriptc/compiler": fileURLToPath(
+      "@tsinter/compiler": fileURLToPath(
         new URL("./packages/compiler/src/index.ts", import.meta.url),
       ),
     },

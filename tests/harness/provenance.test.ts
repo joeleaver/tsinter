@@ -21,7 +21,7 @@ import {
   compile,
   resolveProvenanceSources,
   setProvenanceSources,
-} from "@scriptc/compiler";
+} from "@tsinter/compiler";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = join(import.meta.dirname, "../..");

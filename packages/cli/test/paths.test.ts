@@ -1,4 +1,4 @@
-import { buildTargetPlatform } from "@scriptc/compiler";
+import { buildTargetPlatform } from "@tsinter/compiler";
 import { expect, test } from "vitest";
 import { defaultExecutableName } from "../src/paths.js";
 

@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { expect, test } from "vitest";
-import { analyze, compile, renderAll } from "@scriptc/compiler";
+import { analyze, compile, renderAll } from "@tsinter/compiler";
 
 /* Every compile below deliberately carries NO backend pin: this suite is
  * the user-adoption path, so it must see exactly what a flagless

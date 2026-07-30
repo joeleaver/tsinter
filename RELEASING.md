@@ -1,6 +1,6 @@
 # Releasing
 
-Releases are manual, single-commit affairs. The maintainer controls the changelog voice and format. The three npm packages — `@scriptc/runtime`, `@scriptc/compiler`, `scriptc` — always publish together at the same version.
+Releases are manual, single-commit affairs. The maintainer controls the changelog voice and format. The three npm packages — `@tsinter/runtime`, `@tsinter/compiler`, `tsinter` — always publish together at the same version.
 
 To prepare a release:
 
@@ -11,7 +11,7 @@ To prepare a release:
 5. Remove the `<!-- release:start -->` and `<!-- release:end -->` markers from the previous release entry; only the latest release should have markers
 6. Commit to `main`
 
-CI (`.github/workflows/release.yml`) compares the version in `packages/cli/package.json` to what `scriptc` has on npm. If it differs, it builds the workspace, verifies all three package versions match (a mismatch fails with a hint to run `scripts/sync-versions.mjs`), and publishes to npm in dependency order — `@scriptc/runtime`, then `@scriptc/compiler`, then `scriptc` — so each package's dependencies are resolvable the moment it lands. After the publish succeeds, a separate job creates the git tag `v<version>` and the GitHub release with the marked changelog entry as its body, and attaches `surface-manifest.json` — the machine-readable listing of the surface the static tier compiles at that version (stable per-entry ids, so two releases diff mechanically; see `packages/compiler/src/coverage/surface-manifest.ts` for the schema). The job regenerates the manifest from the tree and fails on any byte difference from the committed file before attaching, so the asset is always the manifest of the code being released. The same file ships inside the `@scriptc/compiler` package as `@scriptc/compiler/surface-manifest.json`.
+CI (`.github/workflows/release.yml`) compares the version in `packages/cli/package.json` to what `tsinter` has on npm. If it differs, it builds the workspace, verifies all three package versions match (a mismatch fails with a hint to run `scripts/sync-versions.mjs`), and publishes to npm in dependency order — `@tsinter/runtime`, then `@tsinter/compiler`, then `tsinter` — so each package's dependencies are resolvable the moment it lands. After the publish succeeds, a separate job creates the git tag `v<version>` and the GitHub release with the marked changelog entry as its body, and attaches `surface-manifest.json` — the machine-readable listing of the surface the static tier compiles at that version (stable per-entry ids, so two releases diff mechanically; see `packages/compiler/src/coverage/surface-manifest.ts` for the schema). The job regenerates the manifest from the tree and fails on any byte difference from the committed file before attaching, so the asset is always the manifest of the code being released. The same file ships inside the `@tsinter/compiler` package as `@tsinter/compiler/surface-manifest.json`.
 
 Two deliberate differences from repositories that ship prebuilt binaries: there are no platform binary assets to build or stage — scriptc compiles programs on the user's machine with the local clang — so the GitHub release is a tag, release notes, and the manifest asset only, and the npm publish never waits on the GitHub release (the release job runs after the publish, not before it).
 

@@ -26,7 +26,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, test } from "vitest";
 import * as ts from "../../packages/compiler/src/frontend/ts7/adapter.js";
-import { ambientDtsPath, ir, ISLAND_SURFACE, overridesDtsPath, type IslandFnEntry } from "@scriptc/compiler";
+import { ambientDtsPath, ir, ISLAND_SURFACE, overridesDtsPath, type IslandFnEntry } from "@tsinter/compiler";
 import { loadProgram } from "../../packages/compiler/src/frontend/program.js";
 
 function placeholder(t: ir.IrType): string {

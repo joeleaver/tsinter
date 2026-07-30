@@ -31,7 +31,7 @@ import { existsSync, globSync, mkdirSync, mkdtempSync, readFileSync, readdirSync
 import { homedir, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { compile } from "@scriptc/compiler";
+import { compile } from "@tsinter/compiler";
 
 const repoRoot = join(import.meta.dirname, "../..");
 const cacheDir = join(repoRoot, "node_modules/.cache/scriptc-tests");

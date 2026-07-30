@@ -209,7 +209,7 @@ export class CcCompileError extends Error {
 
 export function runtimeSrcDir(): string {
   const require = createRequire(import.meta.url);
-  return join(dirname(require.resolve("@scriptc/runtime/package.json")), "src");
+  return join(dirname(require.resolve("@tsinter/runtime/package.json")), "src");
 }
 
 /* ── alternate C compiler (SCRIPTC_CC) and cross target (SCRIPTC_TARGET) ──────────

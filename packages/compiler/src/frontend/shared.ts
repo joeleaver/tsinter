@@ -20,7 +20,7 @@ export function tsgoPath(path: string, platform: NodeJS.Platform = process.platf
  * (comptime/__island_eval, setTimeout). Part of EVERY program scriptc
  * builds, the project-world preflight program included. */
 export function ambientDtsPath(): string {
-  return tsgoPath(require.resolve("@scriptc/compiler/scriptc.d.ts"));
+  return tsgoPath(require.resolve("@tsinter/compiler/scriptc.d.ts"));
 }
 
 /** Path of the shipped divergence/precision OVERRIDES (JSON.parse():
@@ -29,7 +29,7 @@ export function ambientDtsPath(): string {
  * so a project that typechecks under its own tsc never fails preflight over
  * an override-manufactured error (checkPreflight). */
 export function overridesDtsPath(): string {
-  return tsgoPath(require.resolve("@scriptc/compiler/scriptc-overrides.d.ts"));
+  return tsgoPath(require.resolve("@tsinter/compiler/scriptc-overrides.d.ts"));
 }
 
 /** Path of the shipped FALLBACK declarations (console, process, node:fs) —
@@ -37,7 +37,7 @@ export function overridesDtsPath(): string {
  * With @types/node, the project's real Node types stand in and this file
  * stands down (its declaration forms would collide). */
 export function fallbackDtsPath(): string {
-  return tsgoPath(require.resolve("@scriptc/compiler/scriptc-node-fallback.d.ts"));
+  return tsgoPath(require.resolve("@tsinter/compiler/scriptc-node-fallback.d.ts"));
 }
 
 /** True for files belonging to the adopted Node type surface: the

@@ -35,13 +35,13 @@ importers:
 
   packages/cli:
     dependencies:
-      '@scriptc/compiler':
+      '@tsinter/compiler':
         specifier: workspace:*
         version: link:../compiler
 
   packages/compiler:
     dependencies:
-      '@scriptc/runtime':
+      '@tsinter/runtime':
         specifier: workspace:*
         version: link:../runtime
       typescript:

@@ -65,7 +65,7 @@ import { createServer, type Server } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { basename, join, relative } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { compile } from "@scriptc/compiler";
+import { compile } from "@tsinter/compiler";
 import { shardSelect } from "./shard.js";
 import { jailEnv, refusedLoopbackUrl } from "./net-jail.js";
 import { MOCK_PROJECT_LINK, startMockVercelApi, type RecordedRequest } from "../fixtures/vercel-e2e/mock-vercel-api.js";

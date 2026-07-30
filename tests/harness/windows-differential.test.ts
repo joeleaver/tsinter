@@ -44,7 +44,7 @@ import { basename, join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import ts5 from "typescript";
-import { compile } from "@scriptc/compiler";
+import { compile } from "@tsinter/compiler";
 
 const execFileAsync = promisify(execFile);
 const enabled = process.env["SCRIPTC_WIN"] === "1";

@@ -22,7 +22,7 @@ import { globSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
-import { analyze, compile } from "@scriptc/compiler";
+import { analyze, compile } from "@tsinter/compiler";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = join(import.meta.dirname, "../..");

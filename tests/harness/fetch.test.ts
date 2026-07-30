@@ -24,7 +24,7 @@ import { globSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { compile } from "@scriptc/compiler";
+import { compile } from "@tsinter/compiler";
 // The servers live in the fixture tree (a plain .mjs): the Linux lane runs
 // the IDENTICAL routes standalone inside its container.
 // eslint-disable-next-line import/no-relative-packages

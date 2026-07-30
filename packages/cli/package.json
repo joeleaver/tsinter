@@ -1,5 +1,5 @@
 {
-  "name": "scriptc",
+  "name": "tsinter",
   "version": "0.0.18",
   "description": "Compile ordinary TypeScript and JavaScript to small, fast native executables — no Node, no V8, no JavaScript engine in the binary",
   "license": "Apache-2.0",
@@ -11,7 +11,7 @@
   },
   "type": "module",
   "bin": {
-    "scriptc": "dist/main.js"
+    "tsinter": "dist/main.js"
   },
   "files": [
     "dist"
@@ -23,6 +23,6 @@
     "build": "node ../../node_modules/typescript/bin/tsc -p tsconfig.json"
   },
   "dependencies": {
-    "@scriptc/compiler": "workspace:*"
+    "@tsinter/compiler": "workspace:*"
   }
 }

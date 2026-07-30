@@ -8,7 +8,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, test } from "vitest";
-import { loadLibraryProfile, profileRemediation, profileTeaching } from "@scriptc/compiler";
+import { loadLibraryProfile, profileRemediation, profileTeaching } from "@tsinter/compiler";
 
 const dir = mkdtempSync(join(tmpdir(), "scriptc-lib-profile-"));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));

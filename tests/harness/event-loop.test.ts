@@ -11,7 +11,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { compile } from "@scriptc/compiler";
+import { compile } from "@tsinter/compiler";
 import { eventLoopCases, type StdinScript } from "./event-loop-cases.js";
 
 const repoRoot = join(import.meta.dirname, "../..");
