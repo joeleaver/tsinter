@@ -2,13 +2,15 @@
 // validation with Node's exact errors, DataCloneError on non-empty
 // transfer lists, DOMException per WebIDL serialization), and builtin
 // error classes answer instanceof on checked-dynamic values through the
-// from_error identity cache.
+// from_error identity cache. The transfer-sequence message follows
+// current Node — v24.18 respelled "can not"→"cannot" (the runtime's copy
+// in scr_json.c/scr_web.c moved with it), so the oracle needs ≥24.18.
 'use strict';
 const assert = require('assert');
 assert.throws(() => structuredClone(), { code: 'ERR_MISSING_ARGS' });
 assert.throws(() => structuredClone(undefined, ''), { code: 'ERR_INVALID_ARG_TYPE', message: "Failed to execute 'structuredClone': Options cannot be converted to a dictionary" });
 assert.throws(() => structuredClone(undefined, 1), { code: 'ERR_INVALID_ARG_TYPE' });
-assert.throws(() => structuredClone(undefined, { transfer: 1 }), { code: 'ERR_INVALID_ARG_TYPE', message: "Failed to execute 'structuredClone': transfer in Options can not be converted to sequence." });
+assert.throws(() => structuredClone(undefined, { transfer: 1 }), { code: 'ERR_INVALID_ARG_TYPE', message: "Failed to execute 'structuredClone': transfer in Options cannot be converted to sequence." });
 assert.throws(() => structuredClone(undefined, { transfer: null }), { code: 'ERR_INVALID_ARG_TYPE' });
 assert.strictEqual(structuredClone(undefined), undefined);
 assert.strictEqual(structuredClone(undefined, null), undefined);

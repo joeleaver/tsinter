@@ -2358,8 +2358,10 @@ void scr_sc_validate_options(const ScrDyn *options) {
   ScrDyn *tr = scr_dyn_obj_get(options, "transfer", 8); /* borrowed */
   if (tr == NULL || tr->kind == SCR_DYN_UNDEF) return;
   if (tr->kind != SCR_DYN_ARR) {
+    /* Spelling follows current Node (≥24.18 says "cannot"; the corpus and
+     * the oracle move together — tests/corpus/2283-structured-clone.cjs). */
     static const char msg[] =
-        "Failed to execute 'structuredClone': transfer in Options can not be converted to sequence.";
+        "Failed to execute 'structuredClone': transfer in Options cannot be converted to sequence.";
     scr_throw_error_msg_code(SCR_ERR_TYPE, msg, sizeof msg - 1, "ERR_INVALID_ARG_TYPE");
     return;
   }

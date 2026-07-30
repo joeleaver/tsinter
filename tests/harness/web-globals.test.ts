@@ -129,7 +129,7 @@ describe(`island web globals (scriptc-only${sanitize ? ", sanitized" : ""})`, ()
         "DataCloneError:t:true",
         'TypeError/ERR_MISSING_ARGS: The "The value argument must be specified" argument must be specified',
         "TypeError/ERR_INVALID_ARG_TYPE: Failed to execute 'structuredClone': Options cannot be converted to a dictionary",
-        "TypeError/ERR_INVALID_ARG_TYPE: Failed to execute 'structuredClone': transfer in Options can not be converted to sequence.",
+        "TypeError/ERR_INVALID_ARG_TYPE: Failed to execute 'structuredClone': transfer in Options cannot be converted to sequence.",
         "true",
         "DataCloneError/25: () => {} could not be cloned.",
       ].join(" | "),

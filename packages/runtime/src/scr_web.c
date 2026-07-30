@@ -1156,7 +1156,7 @@ static const char web_prelude[] =
     "          if (typeof tr === 'string') throw 0;\n"
     "          list = [...tr];\n"
     "        } catch (e) {\n"
-    "          throw scErr(\"Failed to execute 'structuredClone': transfer in Options can not be converted to sequence.\");\n"
+    "          throw scErr(\"Failed to execute 'structuredClone': transfer in Options cannot be converted to sequence.\");\n"
     "        }\n"
     "        if (list.length > 0) {\n"
     "          throw new DOMException('Found invalid value in transferList.', 'DataCloneError');\n"
