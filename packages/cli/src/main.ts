@@ -29,7 +29,12 @@ Options:
                      either way. A program outside the LLVM tier still
                      builds — the default lane emits C for it and a one-line
                      stderr note names the construct — while an explicit
-                     --backend llvm fails with that construct named
+                     --backend llvm fails with that construct named.
+                     wasm emits a WebAssembly module (.wasm) instead of a
+                     native executable — no clang, no link — and is an
+                     explicit pin only: it never joins the fallback chain,
+                     and a construct outside its tier always fails with
+                     that construct named
       --from-c       treat input as a C (or .ll) file (toolchain plumbing/debugging)
       --keep-c       keep the generated program TU next to the executable
                      (default; the .ll — or the .c under --backend=c or
@@ -183,8 +188,14 @@ async function main(): Promise<number> {
   const input = resolve(inputArg);
   const ffiProfilePath = values.ffi !== undefined ? resolve(values.ffi) : undefined;
   const backend = values.backend;
-  if (backend !== undefined && backend !== "c" && backend !== "llvm") {
-    fail(`unknown backend "${backend}" (supported: c, llvm)\n\n${USAGE}`);
+  if (backend !== undefined && backend !== "c" && backend !== "llvm" && backend !== "wasm") {
+    fail(`unknown backend "${backend}" (supported: c, llvm, wasm)\n\n${USAGE}`);
+  }
+  // `run` spawns the build's output as a process; a wasm module needs a
+  // host to instantiate it and this CLI ships none, so the combination is
+  // rejected up front rather than failing at spawn with an exec error.
+  if (backend === "wasm" && command === "run") {
+    fail(`tsinter run cannot run a wasm module — build it with --backend wasm and instantiate it in a host\n\n${USAGE}`);
   }
 
   // --npm-static: repeatable and comma-splittable; the literal "auto"
@@ -262,7 +273,12 @@ async function main(): Promise<number> {
     if (result.llvmRefusal !== undefined) {
       process.stderr.write(`scriptc: backend c (llvm refused: ${result.llvmRefusal})\n`);
     }
-    if (!values["keep-c"]) rmSync(result.cPath, { force: true });
+    // --no-keep-c drops the generated program TU. Under the wasm backend
+    // the module IS the artifact — cPath and binaryPath name the same file
+    // — so the structural test keeps the flag from deleting the output.
+    if (!values["keep-c"] && result.cPath !== result.binaryPath) {
+      rmSync(result.cPath, { force: true });
+    }
     return result.binaryPath;
   };
 

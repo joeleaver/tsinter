@@ -3,6 +3,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { CcCompileError, compileC, compileLibArchive, resolveCc, targetPlatform } from "./backend/cc.js";
 import { emitModule } from "./backend/emission/emitter.js";
 import { emitLlvmModule, LlvmUnsupportedError } from "./backend/llvm/emitter.js";
+import { emitWasmModule, surveyWasmModule, WasmUnsupportedError } from "./backend/wasm/emitter.js";
 import { checkerPanicDiag, ffiNativeBuildDiag, libAsyncExportDiag, libAsyncSurfaceDiag, libExportUnresolvedDiag, libGenericExportDiag, libIntBoundaryDiag, libNpmIneligibleDiag, libUnmappableSignatureDiag, iceDiag, isCheckerPanic, LIB_INBOUND_BYTES_TRAP_CODE, LIB_RUNTIME_TRAP_CODES, type ScrDiagnostic } from "./diagnostics/diagnostic.js";
 import { checkLibraryIntegerSlots, classSeed, hasIntSlots, type FnIntSlots, type IntSlotConfig } from "./library/int-infer.js";
 import { loadLibraryProfile, profileRemediation, profileTeaching, type LibraryProfile } from "./library/profile.js";
@@ -120,8 +121,14 @@ export interface CompileOptions {
    * and every ICE fails the build on either lane. Explicit `llvm` is the
    * debugging/CI pin and keeps the fail-loudly contract: an out-of-tier
    * program is diagnostic SC3001 naming the first unsupported construct,
-   * never a silent lane change. Explicit `c` pins the C backend. */
-  backend?: "c" | "llvm";
+   * never a silent lane change. Explicit `c` pins the C backend.
+   *
+   * `wasm` is an EXPLICIT PIN ONLY and joins no fallback chain in either
+   * direction: it emits a WebAssembly module (.wasm bytes at outPath) and
+   * skips clang and the link entirely, so there is no native executable
+   * for the C backend to stand in for and nothing it could fall back to.
+   * Every out-of-tier program is SC3001, unconditionally. */
+  backend?: "c" | "llvm" | "wasm";
   /** --npm-static: package names whose shipped, unminified JS compiles
    * STATICALLY as program modules (inference types the bodies; statements
    * the lowering cannot prove become runtime fences). "auto" opts in every
@@ -144,15 +151,25 @@ export type CompileResult =
    * seat, same lifecycle — --keep-c in the CLI governs both). `backend` is
    * the code generator that ACTUALLY emitted the TU; `llvmRefusal` is
    * present iff the default lane fell back to C, carrying the tier
-   * refusal's machine-readable kind tag ("npmEmbedding", "stmt:...", ...). */
-  | { ok: true; binaryPath: string; cPath: string; irPath?: string; backend: "c" | "llvm"; llvmRefusal?: string }
-  | { ok: false; diagnostics: ScrDiagnostic[]; sourceTexts: Map<string, string> };
+   * refusal's machine-readable kind tag ("npmEmbedding", "stmt:...", ...).
+   * Under the wasm backend the module IS the artifact: `binaryPath` and
+   * `cPath` name the same .wasm file (no separate TU, no link step), which
+   * is also how `--no-keep-c` knows there is nothing to delete. */
+  | { ok: true; binaryPath: string; cPath: string; irPath?: string; backend: "c" | "llvm" | "wasm"; llvmRefusal?: string }
+  /** `wasmSurvey` rides a wasm tier refusal only: EVERY distinct construct
+   * the program needs from that backend, not just the first one the
+   * refusal names. The diagnostic answers "does it compile?"; the survey
+   * answers "what would it take?", which is the differential harness's
+   * work queue (a first-refusal census is degenerate while the tier is
+   * empty — see backend/wasm/emitter.ts). */
+  | { ok: false; diagnostics: ScrDiagnostic[]; sourceTexts: Map<string, string>; wasmSurvey?: string[] };
 
-/** The LLVM backend's tier refusal as a diagnostic. SC3xxx = backend
- * coverage (the program is fine — this backend doesn't compile it yet);
- * the parenthesized kind tag is machine-readable for the differential
- * harness's histogram. */
-function llvmRefusalDiag(err: LlvmUnsupportedError, entryPath: string): ScrDiagnostic {
+/** An alternate backend's tier refusal as a diagnostic — LLVM's and
+ * wasm's are the same story and share the code. SC3xxx = backend coverage
+ * (the program is fine — this backend doesn't compile it yet); the
+ * parenthesized kind tag is machine-readable for the differential
+ * harness's histogram, and each backend's tags are its own namespace. */
+function backendRefusalDiag(err: LlvmUnsupportedError | WasmUnsupportedError, entryPath: string): ScrDiagnostic {
   return {
     code: "SC3001",
     message: err.message,
@@ -678,7 +695,48 @@ export async function compile(entryPath: string, opts: CompileOptions): Promise<
 
   await mkdir(opts.outDir, { recursive: true });
   const stem = basename(entryPath).replace(/\.(ts|js|mjs|cjs)$/, "");
-  // Both backends hang off the same in-memory IrModule (never the JSON
+
+  // The wasm lane leaves the pipeline here: its artifact is a WebAssembly
+  // module, so there is no program TU, no clang command line, and no link
+  // — and no fallback either way (an explicit pin is the only way to
+  // reach this, and a refusal is SC3001, never a silent lane change).
+  if (opts.backend === "wasm") {
+    // The executable path becomes the module path: .exe (the Windows
+    // default name) is not what a .wasm is called, and a caller that
+    // already asked for .wasm keeps exactly the path it named.
+    const wasmPath = opts.outPath.endsWith(".wasm")
+      ? opts.outPath
+      : `${opts.outPath.replace(/\.exe$/i, "")}.wasm`;
+    let bytes: Uint8Array;
+    try {
+      bytes = emitWasmModule(lowered.module!);
+    } catch (err) {
+      if (!(err instanceof WasmUnsupportedError)) throw err;
+      return {
+        ok: false,
+        diagnostics: [backendRefusalDiag(err, entryPath)],
+        sourceTexts,
+        wasmSurvey: surveyWasmModule(lowered.module!),
+      };
+    }
+    await mkdir(dirname(wasmPath), { recursive: true });
+    await writeFile(wasmPath, bytes);
+    let wasmIrPath: string | undefined;
+    if (opts.emitIr) {
+      wasmIrPath = join(opts.outDir, `${stem}.ir.json`);
+      await writeFile(wasmIrPath, serializeModule(lowered.module));
+    }
+    return {
+      ok: true,
+      binaryPath: wasmPath,
+      // The module IS the TU: one file, named twice.
+      cPath: wasmPath,
+      backend: "wasm",
+      ...(wasmIrPath !== undefined ? { irPath: wasmIrPath } : {}),
+    };
+  }
+
+  // Both native backends hang off the same in-memory IrModule (never the JSON
   // dump); the LLVM backend's .ll takes the .c's seat on the exact clang
   // command line below — compileC accepts either. The default lane tries
   // LLVM first; a tier refusal retries ONLY the emit with the C backend
@@ -697,7 +755,7 @@ export async function compile(entryPath: string, opts: CompileOptions): Promise<
       // Explicit backend "llvm" keeps the fail-loudly contract (the
       // debugging/CI pin): SC3001, never a silent lane change.
       if (opts.backend === "llvm") {
-        return { ok: false, diagnostics: [llvmRefusalDiag(err, entryPath)], sourceTexts };
+        return { ok: false, diagnostics: [backendRefusalDiag(err, entryPath)], sourceTexts };
       }
       llvmRefusal = err.kind;
     }
@@ -1318,7 +1376,7 @@ export async function compileLibrary(opts: CompileLibraryOptions): Promise<Compi
     } catch (err) {
       if (!(err instanceof LlvmUnsupportedError)) throw err;
       // The profile PINS the emission — fail-loudly, never a lane change.
-      return fail([llvmRefusalDiag(err, entryPath)]);
+      return fail([backendRefusalDiag(err, entryPath)]);
     }
   } else {
     cPath = join(opts.outDir, `${stem}.lib.c`);
