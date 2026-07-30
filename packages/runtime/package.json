@@ -3,10 +3,10 @@
   "version": "0.0.18",
   "description": "scriptc native runtime — C sources, compiled into every scriptc binary",
   "license": "Apache-2.0",
-  "homepage": "https://scriptc.dev",
+  "homepage": "https://github.com/joeleaver/tsinter",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/vercel-labs/scriptc.git",
+    "url": "git+https://github.com/joeleaver/tsinter.git",
     "directory": "packages/runtime"
   },
   "files": [

@@ -3,10 +3,10 @@
   "version": "0.0.18",
   "description": "The scriptc compiler — TypeScript/JavaScript frontend, typed IR, LLVM and C backends",
   "license": "Apache-2.0",
-  "homepage": "https://scriptc.dev",
+  "homepage": "https://github.com/joeleaver/tsinter",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/vercel-labs/scriptc.git",
+    "url": "git+https://github.com/joeleaver/tsinter.git",
     "directory": "packages/compiler"
   },
   "type": "module",
