@@ -1,9 +1,11 @@
 /* The wasm backend's differential: tier membership is AUTO-DISCOVERED by
  * attempting the wasm build on every corpus program, exactly like
- * llvm-differential.test.ts. A program the tier claims must run through a
- * wasm host and match the Node oracle byte for byte; a program outside
- * the tier must REFUSE loudly under the `backend: "wasm"` pin — diagnostic
- * SC3001 naming the first unsupported IR construct, never wrong code.
+ * llvm-differential.test.ts. A program the tier claims runs IN-PROCESS
+ * through the abi.ts host contract (instantiate the .wasm, service its
+ * `tsinter.write` import, drive `_start`) and must match the Node oracle
+ * byte for byte; a program outside the tier must REFUSE loudly under the
+ * `backend: "wasm"` pin — diagnostic SC3001 naming the first unsupported
+ * IR construct, never wrong code.
  *
  * TWO DIFFERENCES from the LLVM suite, both structural:
  *
@@ -12,28 +14,30 @@
  *    so a refusal is always SC3001 and there is no "did the default lane
  *    land on C" half to assert.
  *
- * 2. The refusal histogram is not the work queue. While the tier is empty
- *    every program refuses at whatever the frontend emits FIRST, and the
- *    frontend opens every module's `%init.<i>` with the same synthesized
- *    load-once guard — so a first-refusal census is one giant `stmt:if`
- *    bucket that says nothing about what to build. The queue therefore
- *    comes from the SURVEY (compile()'s `wasmSurvey`: every distinct
- *    construct a program needs, not just the first), and both histograms
- *    print at the end. As coverage lands the two converge, and the
- *    first-refusal histogram becomes the useful one — which is the signal
- *    that this comment can go.
+ * 2. The refusal histogram is not the whole work queue yet. While the
+ *    tier is small most programs refuse at whatever the frontend emits
+ *    FIRST, so the queue comes from the SURVEY (compile()'s `wasmSurvey`:
+ *    every distinct construct a program needs, not just the first), and
+ *    both histograms print at the end. As coverage lands the two
+ *    converge, and the first-refusal histogram becomes the useful one —
+ *    which is the signal that this comment can go.
  *
- * ZERO CLAIMED PROGRAMS IS THE EXPECTED STATE TODAY, not a failure: the
- * suite passes on a census. SCRIPTC_WASM_REFUSALS=1 lists every program
- * under its refusal kind — the burn-down view.
- */
+ * A trap in a claimed program is a backend bug and FAILS the test as the
+ * raised trap, never a fabricated exit code: nothing in the tier can
+ * legitimately trap today (no throw, no process.exit — both still
+ * refuse), so the honest report is the error itself. */
+import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { globSync, readFileSync } from "node:fs";
+import { globSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
 import { afterAll, describe, expect, test } from "vitest";
+import ts5 from "typescript";
 import { compile } from "@tsinter/compiler";
 import { shardSelect, shardSuffix } from "./shard.js";
 
+const execFileAsync = promisify(execFile);
 const repoRoot = join(import.meta.dirname, "../..");
 const corpusDir = join(repoRoot, "tests/corpus");
 const cacheDir = join(repoRoot, "node_modules/.cache/scriptc-tests");
@@ -53,9 +57,15 @@ process.env["SCRIPTC_TEST_ENV"] = "from-harness";
 
 /** The tier floor: programs whose membership is pinned, so a regression
  * out of the tier fails the suite instead of quietly shrinking the
- * histogram. EMPTY on day one — the tier claims nothing yet. The first
- * program the backend compiles end to end is the first entry here. */
-const TIER_FLOOR: string[] = [];
+ * histogram. Auto-discovery may claim more; these regressing out is
+ * always a bug. */
+const TIER_FLOOR: string[] = [
+  "001-hello.ts",
+  // Cross-module wiring is in-tier from day one: the frontend flattens
+  // module bindings into %g. globals plus per-file %init functions, all
+  // constructs the prologue increment claims.
+  "2124-imports-field-wildcard/main.ts",
+];
 
 interface RunResult {
   stdout: Buffer;
@@ -67,6 +77,14 @@ interface RunResult {
  * (differential.test.ts's directiveHead). */
 function directiveHead(file: string): string[] {
   return readFileSync(file, "utf8").split("\n", 2);
+}
+
+function expectedExitCode(file: string): number {
+  for (const line of directiveHead(file)) {
+    const m = /^\/\/ @exit:\s*(\d+)\s*$/.exec(line);
+    if (m) return Number(m[1]);
+  }
+  return 0;
 }
 
 function wantsDynamic(file: string): boolean {
@@ -82,15 +100,98 @@ function programInputs(file: string): string[] {
   ].sort();
 }
 
-/** STUB — the wasm lane's host. Nothing instantiates a module here yet:
- * with an empty tier no program is claimed, so this is unreachable by
- * construction (the census below never calls it). It exists so the
- * comparison half has its shape already: when the first program IS
- * claimed, this becomes the host that instantiates the .wasm, drives its
- * entry export, and captures stdout/stderr/exit — and the assertions
- * below start comparing that against the Node oracle byte for byte. */
-async function runWasm(_modulePath: string): Promise<RunResult> {
-  throw new Error("wasm runner not implemented");
+/* ── the Node oracle (llvm-differential.test.ts's twin) ────────────────── */
+
+const comptimeShim = pathToFileURL(join(import.meta.dirname, "comptime-shim.mjs")).href;
+const islandShim = pathToFileURL(join(import.meta.dirname, "island-shim.mjs")).href;
+
+/** The oracle runs with --experimental-transform-types for corpus programs
+ * using non-erasable syntax — the `// @transform-types` directive
+ * (namespaces) OR any enum declaration (strip-only mode refuses to parse
+ * enums, no directive needed; a pure function of the program bytes). */
+function wantsTransformTypes(file: string): boolean {
+  if (directiveHead(file).some((l) => /^\/\/ @transform-types\s*$/.test(l))) return true;
+  return programInputs(file).some((f) => /\benum\s+[A-Za-z_$]/.test(readFileSync(f, "utf8")));
+}
+
+/** `// @tsc-decorators`: decorators are the one supported construct Node
+ * cannot execute at all, so the oracle runs tsc's deterministic ES2022
+ * downlevel materialized under the test cache. */
+function wantsTscDecorators(file: string): boolean {
+  return directiveHead(file).some((l) => /^\/\/ @tsc-decorators\s*$/.test(l));
+}
+
+function nodeOracleFile(file: string): string {
+  if (!wantsTscDecorators(file)) return file;
+  const src = readFileSync(file, "utf8");
+  const out = ts5.transpileModule(src, {
+    compilerOptions: { target: ts5.ScriptTarget.ES2022, module: ts5.ModuleKind.ESNext },
+    fileName: file,
+  }).outputText;
+  const key = createHash("sha256").update(ts5.version).update("\0").update(src).digest("hex").slice(0, 16);
+  const path = join(cacheDir, `dec-oracle-${key}.mjs`);
+  mkdirSync(cacheDir, { recursive: true });
+  // Atomic publish: concurrent suites write this same content-keyed path;
+  // rename keeps readers from ever seeing a truncated oracle.
+  const tmp = `${path}.${process.pid}.tmp`;
+  writeFileSync(tmp, out);
+  renameSync(tmp, path);
+  return path;
+}
+
+function wantsNoDeprecation(file: string): boolean {
+  return directiveHead(file).some((l) => /^\/\/ @no-deprecation\s*$/.test(l));
+}
+
+function nodeOracleArgs(file: string): string[] {
+  const transform = wantsTransformTypes(file)
+    ? ["--experimental-transform-types", "--disable-warning=ExperimentalWarning"]
+    : [];
+  const nodep = wantsNoDeprecation(file) ? ["--no-deprecation"] : [];
+  return [...transform, ...nodep, "--import", comptimeShim, "--import", islandShim, nodeOracleFile(file)];
+}
+
+/** Runs the oracle, tolerating an expected nonzero exit. The child's stdin
+ * closes immediately: corpus programs may read fd 0 to EOF, and the
+ * default open pipe would block both sides forever. */
+async function runNode(file: string): Promise<RunResult> {
+  const pending = execFileAsync("node", nodeOracleArgs(file), { encoding: "buffer" });
+  pending.child.stdin?.end();
+  try {
+    const { stdout, stderr } = await pending;
+    return { stdout, stderr, exitCode: 0 };
+  } catch (err) {
+    const e = err as { code?: unknown; stdout?: Buffer; stderr?: Buffer };
+    if (typeof e.code !== "number" || !Buffer.isBuffer(e.stdout) || !Buffer.isBuffer(e.stderr)) {
+      throw err;
+    }
+    return { stdout: e.stdout, stderr: e.stderr, exitCode: e.code };
+  }
+}
+
+/* ── the wasm host ─────────────────────────────────────────────────────── */
+
+/** The abi.ts contract's Node side: instantiate the module, service
+ * `tsinter.write` by copying [ptr, ptr+len) out of the exported memory
+ * into per-fd buffers, run `_start` to completion. In-process — a .wasm
+ * needs no spawn, and the per-fd capture matches what the comparison
+ * reads (cross-fd interleaving is not observable through separate
+ * buffers on the Node side either). */
+async function runWasm(modulePath: string): Promise<RunResult> {
+  const chunks: { 1: Buffer[]; 2: Buffer[] } = { 1: [], 2: [] };
+  let memory: WebAssembly.Memory | null = null;
+  const { instance } = await WebAssembly.instantiate(readFileSync(modulePath), {
+    tsinter: {
+      write(fd: number, ptr: number, len: number): void {
+        if (fd !== 1 && fd !== 2) throw new Error(`write to unknown fd ${fd}`);
+        if (memory === null) throw new Error("write before instantiation completed");
+        chunks[fd].push(Buffer.from(new Uint8Array(memory.buffer, ptr, len)));
+      },
+    },
+  });
+  memory = instance.exports["memory"] as WebAssembly.Memory;
+  (instance.exports["_start"] as () => void)();
+  return { stdout: Buffer.concat(chunks[1]), stderr: Buffer.concat(chunks[2]), exitCode: 0 };
 }
 
 async function build(file: string) {
@@ -144,18 +245,31 @@ describe(`wasm differential corpus (${files.length} programs${shardSuffix()})`, 
       expect(res.binaryPath.endsWith(".wasm")).toBe(true);
       expect(res.cPath).toBe(res.binaryPath);
 
-      // Unreachable while the tier is empty (see runWasm). The shape the
-      // comparison takes when it is not: the module's output against the
+      // The claimed half of the contract: the module's output against the
       // Node oracle, byte for byte.
-      const wasm = await runWasm(res.binaryPath);
-      expect(wasm.exitCode).toBe(0);
+      const [wasm, node] = await Promise.all([runWasm(res.binaryPath), runNode(file)]);
+      if (!wasm.stdout.equals(node.stdout)) {
+        expect(wasm.stdout.toString("utf8")).toBe(node.stdout.toString("utf8"));
+        expect.unreachable("wasm-vs-node stdout differed at byte level but not after utf8 decode");
+      }
+      // stderr: the exit-0 contract of the main differential suite (a
+      // nonzero-exit oracle's stderr carries Node stack traces no other
+      // backend reproduces — but nothing that exits nonzero is claimable
+      // yet anyway: throw and process.exit both still refuse).
+      const expectedExit = expectedExitCode(file);
+      if (expectedExit === 0 && !wasm.stderr.equals(node.stderr)) {
+        expect(wasm.stderr.toString("utf8")).toBe(node.stderr.toString("utf8"));
+        expect.unreachable("wasm-vs-node stderr differed at byte level but not after utf8 decode");
+      }
+      expect(wasm.exitCode).toBe(expectedExit);
+      expect(node.exitCode).toBe(expectedExit);
     },
   );
 
   test("tier floor: pinned programs stay claimed", () => {
     // Under a shard, only the floor programs THIS slice ran can be
     // asserted (same key as the corpus split above); the shard union
-    // covers the whole list. Vacuous while TIER_FLOOR is empty.
+    // covers the whole list.
     for (const name of shardSelect(TIER_FLOOR, (n) => n)) {
       expect(claimed, `${name} regressed out of the wasm tier`).toContain(name);
     }
@@ -177,6 +291,7 @@ describe(`wasm differential corpus (${files.length} programs${shardSuffix()})`, 
       `wasm work queue (${surveyKinds.size} distinct constructs, by programs needing them): ${top(surveyKinds, 20)}`,
     );
     if (process.env["SCRIPTC_WASM_REFUSALS"] === "1") {
+      console.info(`  claimed: ${[...claimed].sort().join(" ")}`);
       for (const [kind] of [...refusalKinds].sort((a, b) => b[1] - a[1])) {
         console.info(`  ${kind}: ${refusalPrograms.get(kind)!.join(" ")}`);
       }
