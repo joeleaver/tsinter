@@ -60,10 +60,10 @@ process.env["SCRIPTC_TEST_ENV"] = "from-harness";
  * histogram. Auto-discovery may claim more; these regressing out is
  * always a bug. */
 const TIER_FLOOR: string[] = [
+  // Increment 1 (module prologue): hello world, and cross-module wiring
+  // free of charge (module bindings flatten into %g. globals plus
+  // per-file %init functions).
   "001-hello.ts",
-  // Cross-module wiring is in-tier from day one: the frontend flattens
-  // module bindings into %g. globals plus per-file %init functions, all
-  // constructs the prologue increment claims.
   "2124-imports-field-wildcard/main.ts",
   // Increment 2 (scalars + control flow): comparisons, if/else chains,
   // switch dispatch, recursion, and the module-graph family whose
@@ -78,6 +78,43 @@ const TIER_FLOOR: string[] = [
   "2121-esm-cycle-inert-backedge/main.ts",
   "2193-discarded-stdlib-reads.ts",
   "2605-cycle-three-module/main.ts",
+  // Increment 3 (number→string): the Ryū claim wave — number formatting,
+  // templates over numbers, loops that print, enums, IEEE corners (the
+  // emitted fmod under corpus scrutiny), and the rest of the cjs/esm
+  // module-graph family.
+  "002-log-args.ts",
+  "100-number-format.ts",
+  "103-ternary.ts",
+  "200-strings.ts",
+  "201-templates.ts",
+  "301-while.ts",
+  "302-for.ts",
+  "303-break-continue.ts",
+  "305-truthiness.ts",
+  "400-fib.ts",
+  "402-string-functions.ts",
+  "403-void-and-params.ts",
+  "404-rc-stress.ts",
+  "804-switch-braced-blocks.ts",
+  "954-modules-reexport/main.ts",
+  "1620-cjs-require-effects-order/main.js",
+  "1621-cjs-require-cache-hit/main.js",
+  "1623-cjs-require-diamond/main.js",
+  "1624-cjs-require-dir-mid-file/main.js",
+  "1626-cjs-require-mjs/main.js",
+  "1627-mjs-import-cjs-requires/main.mjs",
+  "1822-static-block-js.js",
+  "1830-enum-numeric-basics.ts",
+  "1891-ns-reexport/main.ts",
+  "1968-namespace-import-eq-snapshot.ts",
+  "2092-package-imports/main.ts",
+  "2120-package-self-import/main.ts",
+  "2260-http2-constants.cjs",
+  "2382-cycle-two-decl/main.ts",
+  "2384-cycle-mixed-bindings/main.ts",
+  "2422-ieee-div-rem-corners.ts",
+  "2426-default-snapshot-mutable/main.ts",
+  "2617-enum-static-field-import/main.ts",
 ];
 
 interface RunResult {

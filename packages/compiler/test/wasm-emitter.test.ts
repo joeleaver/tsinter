@@ -145,11 +145,11 @@ test("UTF-16 fidelity: astral output, lone surrogates, S005 ordering", async () 
 });
 
 test("out-of-tier constructs refuse with SC3001 and ride the survey", async () => {
-  const res = await buildWasm("refused.ts", "console.log(1 + 2);\n");
+  const res = await buildWasm("refused.ts", "const xs: number[] = [1, 2];\nconsole.log(xs.length);\n");
   expect(res.ok).toBe(false);
   if (res.ok) return;
   expect(res.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
   expect(res.wasmSurvey).toBeDefined();
-  // The number→string gap carries its own work-item tag.
-  expect(res.wasmSurvey).toContain("intrinsic:console.log:f64");
+  // Arrays are the current tier boundary; the literal is the work item.
+  expect(res.wasmSurvey).toContain("expr:arrayLit");
 });
