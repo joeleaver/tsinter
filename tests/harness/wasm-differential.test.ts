@@ -124,6 +124,23 @@ const TIER_FLOOR: string[] = [
   "963-generics-modules/main.ts",
   "1054-comptime-modules/main.ts",
   "1543-rest-destructuring.ts",
+  // Increment 5 (closures + function values): captures through shared
+  // boxes, per-iteration loop bindings, function identity, and the
+  // programs those unlock (HOF desugars, class statics, namespaces).
+  "600-closures-basic.ts",
+  "601-closures-loops.ts",
+  "602-closures-identity-recursion.ts",
+  "750-cycle-closure-box.ts",
+  "801-switch-lazy-tests.ts",
+  "820-multi-decl.ts",
+  "830-let-uninitialized.ts",
+  "1050-comptime-tables.ts",
+  "1596-cjs-modules/main.js",
+  "1821-static-block-order.ts",
+  "1943-class-statics-expanded.ts",
+  "1960-namespace-basics.ts",
+  "2021-generic-value-binding-modules/main.ts",
+  "2390-dot-requires/main.cjs",
 ];
 
 interface RunResult {

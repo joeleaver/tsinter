@@ -78,10 +78,19 @@ export interface FieldType {
   mutable: boolean;
 }
 
-type TypeEntry =
+/** Subtype declaration: supertypes plus finality. Absent = the plain
+ * shorthand (final, no supertypes). */
+export interface SubInfo {
+  supers: number[];
+  final: boolean;
+}
+
+export type TypeShape =
   | { kind: "func"; params: ValType[]; results: ValType[] }
   | { kind: "array"; elem: StorageType; mutable: boolean }
   | { kind: "struct"; fields: FieldType[] };
+
+type TypeEntry = TypeShape & { sub?: SubInfo };
 
 interface FuncDecl {
   typeIndex: number;
@@ -99,6 +108,10 @@ export class ModuleBuilder {
   private globals: { type: ValType; mutable: boolean; init: (w: ByteWriter) => void }[] = [];
   private exports: ExportEntry[] = [];
   private memoryPages: number | null = null;
+  /** Rec-group starts: type index → member count. */
+  private readonly recStarts = new Map<number, number>();
+  /** Functions needing ref.func (the declarative element segment). */
+  private readonly funcRefs = new Set<number>();
   private blob: number[] = [];
   private blobIndex = new Map<string, number>();
   /** internData was called at all — tracked separately from blob length
@@ -120,6 +133,38 @@ export class ModuleBuilder {
   structType(fields: FieldType[]): number {
     const key = `s:${fields.map((f) => `${storageKey(f.storage)}:${f.mutable ? "m" : "c"}`).join(",")}`;
     return this.internType(key, { kind: "struct", fields });
+  }
+
+  /** A struct SUBTYPE of `superIdx` (width subtyping — the closure envs).
+   * Not interned by shape: two different capture sets may share a field
+   * layout yet stay distinct declarations; callers key by meaning. */
+  subStructType(key: string, fields: FieldType[], superIdx: number): number {
+    const existing = this.typeIndex.get(key);
+    if (existing !== undefined) return existing;
+    const index = this.types.length;
+    this.types.push({ kind: "struct", fields, sub: { supers: [superIdx], final: true } });
+    this.typeIndex.set(key, index);
+    return index;
+  }
+
+  /** A TWO-entry recursive group (the closure-struct/function-type pair):
+   * `make` receives the base index — the entries land at base and
+   * base+1 and may reference each other. Interned by the caller's key. */
+  recGroup2(key: string, make: (base: number) => [TypeEntry, TypeEntry]): number {
+    const existing = this.typeIndex.get(key);
+    if (existing !== undefined) return existing;
+    const base = this.types.length;
+    const [a, b] = make(base);
+    this.types.push(a, b);
+    this.recStarts.set(base, 2);
+    this.typeIndex.set(key, base);
+    return base;
+  }
+
+  /** Marks a function as ref.func-referenced — the declarative element
+   * segment validation requires. */
+  declareFuncRef(funcIndex: number): void {
+    this.funcRefs.add(funcIndex);
   }
 
   private internType(key: string, entry: TypeEntry): number {
@@ -194,26 +239,53 @@ export class ModuleBuilder {
     w.raw(new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]));
 
     if (this.types.length > 0) {
+      const writeComptype = (s: ByteWriter, t: TypeEntry): void => {
+        if (t.kind === "func") {
+          s.u8(0x60);
+          s.uleb(t.params.length);
+          for (const p of t.params) writeValType(s, p);
+          s.uleb(t.results.length);
+          for (const r of t.results) writeValType(s, r);
+        } else if (t.kind === "array") {
+          s.u8(0x5e); // array comptype: fieldtype = storage + mutability
+          writeStorage(s, t.elem);
+          s.u8(t.mutable ? 0x01 : 0x00);
+        } else {
+          s.u8(0x5f); // struct comptype: vec of fieldtypes
+          s.uleb(t.fields.length);
+          for (const f of t.fields) {
+            writeStorage(s, f.storage);
+            s.u8(f.mutable ? 0x01 : 0x00);
+          }
+        }
+      };
+      const writeSubtype = (s: ByteWriter, t: TypeEntry): void => {
+        if (t.sub !== undefined) {
+          s.u8(t.sub.final ? 0x4f : 0x50);
+          s.uleb(t.sub.supers.length);
+          for (const sup of t.sub.supers) s.uleb(sup);
+        }
+        writeComptype(s, t);
+      };
+      // Rec groups count as ONE type-section entry each.
+      let entryCount = 0;
+      for (let i = 0; i < this.types.length; ) {
+        const size = this.recStarts.get(i);
+        entryCount++;
+        i += size ?? 1;
+      }
       w.section(1, (s) => {
-        s.uleb(this.types.length);
-        for (const t of this.types) {
-          if (t.kind === "func") {
-            s.u8(0x60);
-            s.uleb(t.params.length);
-            for (const p of t.params) writeValType(s, p);
-            s.uleb(t.results.length);
-            for (const r of t.results) writeValType(s, r);
-          } else if (t.kind === "array") {
-            s.u8(0x5e); // array comptype: fieldtype = storage + mutability
-            writeStorage(s, t.elem);
-            s.u8(t.mutable ? 0x01 : 0x00);
+        s.uleb(entryCount);
+        for (let i = 0; i < this.types.length; ) {
+          const size = this.recStarts.get(i);
+          if (size !== undefined) {
+            s.u8(0x4e);
+            s.uleb(size);
+            for (let k = 0; k < size; k++) writeSubtype(s, this.types[i + k]!);
+            i += size;
           } else {
-            s.u8(0x5f); // struct comptype: vec of fieldtypes
-            s.uleb(t.fields.length);
-            for (const f of t.fields) {
-              writeStorage(s, f.storage);
-              s.u8(f.mutable ? 0x01 : 0x00);
-            }
+            writeSubtype(s, this.types[i]!);
+            i += 1;
           }
         }
       });
@@ -267,6 +339,19 @@ export class ModuleBuilder {
           s.u8(e.desc === "func" ? 0x00 : 0x02);
           s.uleb(e.index);
         }
+      });
+    }
+
+    // Declarative element segment: every ref.func target must be
+    // pre-declared here or the instruction fails validation.
+    if (this.funcRefs.size > 0) {
+      const refs = [...this.funcRefs].sort((a, b) => a - b);
+      w.section(9, (s) => {
+        s.uleb(1);
+        s.u8(0x03); // declarative, elemkind + funcidx vec
+        s.u8(0x00);
+        s.uleb(refs.length);
+        for (const f of refs) s.uleb(f);
       });
     }
 

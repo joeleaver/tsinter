@@ -71,6 +71,22 @@ export class Code {
     this.w.u8(0x10);
     this.w.uleb(funcIndex);
   }
+  /** Indirect call through a typed function reference. */
+  callRef(typeIndex: number): void {
+    this.w.u8(0x14);
+    this.w.uleb(typeIndex);
+  }
+  refFunc(funcIndex: number): void {
+    this.w.u8(0xd2);
+    this.w.uleb(funcIndex);
+  }
+  /** ref.cast (ref $t) — traps when the value isn't a $t (the closure
+   * env downcast can never fail by construction). */
+  refCast(typeIndex: number): void {
+    this.w.u8(0xfb);
+    this.w.uleb(0x16);
+    this.w.sleb(typeIndex);
+  }
   drop(): void {
     this.w.u8(0x1a);
   }
@@ -310,6 +326,11 @@ export class Code {
   structNew(typeIndex: number): void {
     this.w.u8(0xfb);
     this.w.uleb(0x00);
+    this.w.uleb(typeIndex);
+  }
+  structNewDefault(typeIndex: number): void {
+    this.w.u8(0xfb);
+    this.w.uleb(0x01);
     this.w.uleb(typeIndex);
   }
   structGet(typeIndex: number, fieldIndex: number): void {

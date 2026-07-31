@@ -70,6 +70,10 @@ export { WasmUnsupportedError } from "./unsupported.js";
  * survey sink records and lets the walk continue over placeholders. */
 type Refuse = (kind: string, loc?: SrcLoc) => void;
 
+function valKey(t: ValType): string {
+  return t.kind === "ref" ? `r${t.nullable ? "?" : ""}${t.typeIndex}` : t.kind;
+}
+
 export function emitWasmModule(mod: IrModule): Uint8Array {
   const asm = new Assembler(mod, (kind, loc) => {
     throw new WasmUnsupportedError(kind, loc);
@@ -182,9 +186,9 @@ class Assembler {
     // body walk.
     for (const fn of this.mod.functions) {
       if (!reachable.has(fn.name)) continue;
-      const params = fn.params.map((p) => this.mapTypeSoft(p.type));
-      const results = fn.returnType.kind === "void" ? [] : [this.mapTypeSoft(fn.returnType)];
-      this.funcIndexByName.set(fn.name, this.mb.declareFunc(this.mb.funcType(params, results), fn.name));
+      // Uniform ABI: arg0 is the closure (see the closures block) — the
+      // function type IS the signature's closure-pair fn type.
+      this.funcIndexByName.set(fn.name, this.mb.declareFunc(this.fnClosPair(fn).fn, fn.name));
       this.funcByName.set(fn.name, fn);
     }
 
@@ -193,8 +197,20 @@ class Assembler {
     }
 
     const entry = this.funcIndexByName.get(this.mod.entry);
-    if (entry === undefined) throw new Error(`entry function "${this.mod.entry}" not in module`);
-    this.mb.exportFunc(EXPORT_ENTRY, entry);
+    const entryFn = this.funcByName.get(this.mod.entry);
+    if (entry === undefined || entryFn === undefined) {
+      throw new Error(`entry function "${this.mod.entry}" not in module`);
+    }
+    // _start is ()→() while %main carries the closure arg — a 2-instruction
+    // wrapper bridges.
+    const start = this.mb.declareFunc(this.mb.funcType([], []), "%w.start");
+    {
+      const c = new Code();
+      c.refNull(this.fnClosPair(entryFn).clos);
+      c.call(entry);
+      this.mb.setBody(start, [], c.bytes());
+    }
+    this.mb.exportFunc(EXPORT_ENTRY, start);
     this.mb.exportMemory(EXPORT_MEMORY);
   }
 
@@ -245,6 +261,103 @@ class Assembler {
     return { kind: "ref", nullable: true, typeIndex: this.strType };
   }
 
+  /* ── closures ───────────────────────────────────────────────────────────
+   *
+   * A function VALUE is a closure struct; per IR SIGNATURE one mutually
+   * recursive pair exists:
+   *
+   *   rec $clos = sub open (struct (field code (ref $fn)))
+   *       $fn   = func (param (ref null $clos) ...params) → results
+   *
+   * Every module function takes the closure as arg0 (direct calls pass
+   * ref.null — one dead argument buys one uniform ABI, so a function can
+   * be called directly AND flow as a value). A function with captures
+   * gets an ENV subtype of $clos adding one box-ref field per capture in
+   * captures[] order; its prologue ref.casts arg0 down and unpacks the
+   * boxes into locals. Captured variables live in one-field mutable BOX
+   * structs shared by reference — a boxed local's slot holds the box,
+   * and every read/write goes through it, in the declaring function too.
+   * Zero-capture closures intern per function (f === f, JS identity). */
+
+  private readonly closSigs = new Map<string, { clos: number; fn: number }>();
+  private readonly closInternGlobals = new Map<string, number>();
+
+  /** The (closure struct, function type) pair for a wasm-level signature. */
+  private closPairFor(params: ValType[], results: ValType[]): { clos: number; fn: number } {
+    const key = `${params.map(valKey).join(",")}=>${results.map(valKey).join(",")}`;
+    const cached = this.closSigs.get(key);
+    if (cached !== undefined) return cached;
+    const base = this.mb.recGroup2(`closrec:${key}`, (b) => [
+      {
+        kind: "struct",
+        fields: [{ storage: { kind: "ref", nullable: false, typeIndex: b + 1 }, mutable: false }],
+        sub: { supers: [], final: false },
+      },
+      {
+        kind: "func",
+        params: [{ kind: "ref", nullable: true, typeIndex: b }, ...params],
+        results,
+      },
+    ]);
+    const made = { clos: base, fn: base + 1 };
+    this.closSigs.set(key, made);
+    return made;
+  }
+
+  /** The pair for an IR func TYPE — honest refusals for unmappable
+   * components; rest-marked values live behind the dyn boundary. */
+  private closSigFor(t: IrType & { kind: "func" }, loc: SrcLoc | undefined): { clos: number; fn: number } | null {
+    if (t.rest === true) {
+      this.refuse("type:func-rest", loc);
+      return null;
+    }
+    const params: ValType[] = [];
+    for (const p of t.params) {
+      const v = this.mapType(p, loc);
+      if (v === null) return null;
+      params.push(v);
+    }
+    let results: ValType[] = [];
+    if (t.ret.kind !== "void") {
+      const r = this.mapType(t.ret, loc);
+      if (r === null) return null;
+      results = [r];
+    }
+    return this.closPairFor(params, results);
+  }
+
+  /** The pair for a declared FUNCTION's own signature (soft — pass 1). */
+  private fnClosPair(fn: IrFunction): { clos: number; fn: number } {
+    const params = fn.params.map((p) => this.mapTypeSoft(p.type));
+    const results = fn.returnType.kind === "void" ? [] : [this.mapTypeSoft(fn.returnType)];
+    return this.closPairFor(params, results);
+  }
+
+  /** One-field mutable box per captured-value representation; ref-typed
+   * payloads store nullable (the TDZ-empty state). */
+  private boxTypeFor(v: ValType): number {
+    const storage: ValType = v.kind === "ref" ? { ...v, nullable: true } : v;
+    return this.mb.structType([{ storage, mutable: true }]);
+  }
+
+  private boxRefFor(v: ValType): ValType {
+    return { kind: "ref", nullable: true, typeIndex: this.boxTypeFor(v) };
+  }
+
+  /** The env struct for a function with captures: code + one box ref per
+   * capture, a subtype of the signature's closure struct. */
+  private envTypeFor(fn: IrFunction): number {
+    const pair = this.fnClosPair(fn);
+    return this.mb.subStructType(
+      `env:${fn.name}`,
+      [
+        { storage: { kind: "ref", nullable: false, typeIndex: pair.fn }, mutable: false },
+        ...(fn.captures ?? []).map((c) => ({ storage: this.boxRefFor(this.mapTypeSoft(c.type)), mutable: false })),
+      ],
+      pair.clos,
+    );
+  }
+
   /* ── types ──────────────────────────────────────────────────────────── */
 
   /** The tier's value representations: f64 as itself, bool as i32, string
@@ -264,6 +377,10 @@ class Assembler {
         // Recursive: the ELEMENT representation is what can refuse.
         const info = this.vecInfoFor(t, loc);
         return info === null ? null : this.vecs.vecRef(info);
+      }
+      case "func": {
+        const pair = this.closSigFor(t, loc);
+        return pair === null ? null : { kind: "ref", nullable: true, typeIndex: pair.clos };
       }
       default:
         this.refuse(`type:${t.kind}`, loc);
@@ -296,6 +413,14 @@ class Assembler {
         const storage = t.elem.kind === "bool" ? "i8" : elem;
         return this.vecs.vecRef(this.vecs.info(this.vecKeyFor(t), elem, storage, kind));
       }
+      case "func": {
+        if (t.rest === true) return I32;
+        const pair = this.closPairFor(
+          t.params.map((p) => this.mapTypeSoft(p)),
+          t.ret.kind === "void" ? [] : [this.mapTypeSoft(t.ret)],
+        );
+        return { kind: "ref", nullable: true, typeIndex: pair.clos };
+      }
       default:
         return I32;
     }
@@ -304,24 +429,39 @@ class Assembler {
   /* ── functions ──────────────────────────────────────────────────────── */
 
   private walkFunction(fn: IrFunction): void {
-    // Whole-function shapes, tested BEFORE the body: each needs machinery
-    // the module has no answer for yet (a fiber/state-machine lowering for
-    // async and generators, a closure environment for captures), so the
-    // constructs inside the body are not what blocks the function and must
-    // not be reported as though they were.
+    // Whole-function shapes, tested BEFORE the body: async and generators
+    // need the fiber/state-machine lowering, so the constructs inside
+    // their bodies are not what blocks the function and must not be
+    // reported as though they were.
     if (fn.async === true) this.refuse("fn:async", fn.loc);
     if (fn.generator !== undefined) this.refuse("fn:generator", fn.loc);
-    if (fn.captures !== undefined && fn.captures.length > 0) this.refuse("fn:captures", fn.loc);
 
+    // Wasm layout: arg0 = the closure, declared params from 1. A BOXED
+    // local's slot holds its box ref (all access goes through the box);
+    // everything else holds its value. A boxed PARAM arrives as a raw
+    // argument and is re-boxed into its own slot by the prologue — the
+    // argument slot itself is never referenced again.
     const localIndex = new Map<string, number>();
     const localById = new Map<string, IrLocal>();
     for (const l of fn.locals) localById.set(l.id, l);
-    fn.params.forEach((p, i) => localIndex.set(p.localId, i));
     const localsOut: ValType[] = [];
+    const boxedParamInits: { argIndex: number; slot: number; box: number }[] = [];
+    fn.params.forEach((p, i) => {
+      if (localById.get(p.localId)?.boxed === true) {
+        const soft = this.mapTypeSoft(p.type);
+        const slot = fn.params.length + 1 + localsOut.length;
+        localsOut.push(this.boxRefFor(soft));
+        localIndex.set(p.localId, slot);
+        boxedParamInits.push({ argIndex: i + 1, slot, box: this.boxTypeFor(soft) });
+      } else {
+        localIndex.set(p.localId, i + 1);
+      }
+    });
     for (const l of fn.locals) {
       if (localIndex.has(l.id)) continue; // a param — already indexed
-      localIndex.set(l.id, fn.params.length + localsOut.length);
-      localsOut.push(this.mapTypeSoft(l.type));
+      localIndex.set(l.id, fn.params.length + 1 + localsOut.length);
+      const soft = this.mapTypeSoft(l.type);
+      localsOut.push(l.boxed === true ? this.boxRefFor(soft) : soft);
     }
     this.fn = {
       fn,
@@ -333,6 +473,31 @@ class Assembler {
       depth: 0,
       control: [],
     };
+
+    // Prologue 1: re-box captured params.
+    for (const init of boxedParamInits) {
+      this.fn.code.localGet(init.argIndex);
+      this.fn.code.structNew(init.box);
+      this.fn.code.localSet(init.slot);
+    }
+
+    // Captures prologue: downcast arg0 to this function's env and unpack
+    // each capture's BOX into its slot.
+    const captures = fn.captures ?? [];
+    if (captures.length > 0) {
+      const env = this.envTypeFor(fn);
+      const code = this.fn.code;
+      const envScratch = this.acquireScratch({ kind: "ref", nullable: true, typeIndex: env });
+      code.localGet(0);
+      code.refCast(env);
+      code.localSet(envScratch);
+      captures.forEach((c, i) => {
+        code.localGet(envScratch);
+        code.structGet(env, 1 + i);
+        code.localSet(this.localIndex(c.localId));
+      });
+      this.releaseScratch({ kind: "ref", nullable: true, typeIndex: env }, envScratch);
+    }
 
     this.walkBody(fn.body);
     // Non-void functions never fall off the end (the frontend appends the
@@ -435,12 +600,28 @@ class Assembler {
         // stack-polymorphic, so the drop stays valid on the survey path.
         if (s.expr.type.kind !== "void") code.drop();
         return;
-      case "varDecl":
+      case "varDecl": {
+        const local = this.fn.localById.get(s.localId);
+        if (local?.boxed === true) {
+          // A FRESH box per execution — a loop's `let` binds per
+          // iteration, so closures made in iteration k must not see
+          // iteration k+1's writes. init:null is the TDZ-empty box.
+          const box = this.boxTypeFor(this.mapTypeSoft(local.type));
+          if (s.init !== null) {
+            this.walkExpr(s.init);
+            code.structNew(box);
+          } else {
+            code.structNewDefault(box);
+          }
+          code.localSet(this.localIndex(s.localId));
+          return;
+        }
         // Declared-uninitialized needs nothing: wasm locals are zeroed and
         // the frontend's definite-assignment guarantee (see IrStmt varDecl)
         // means no read precedes the first assign.
         if (s.init !== null) this.storeVar(s.localId, s.init, s.loc);
         return;
+      }
       case "assign":
         this.storeVar(s.localId, s.value, s.loc);
         return;
@@ -509,6 +690,22 @@ class Assembler {
         this.walkBody(s.body);
         this.fn.control.pop();
         this.close();
+        // JS `for (let i ...)`: each iteration gets a FRESH binding
+        // holding a copy of the previous one, and the UPDATE mutates the
+        // fresh binding — that's why closures made in iteration k keep
+        // seeing iteration k's value. Only observable (and only emitted)
+        // when the loop variable is captured; continue lands here too.
+        if (s.init?.kind === "varDecl") {
+          const initLocal = this.fn.localById.get(s.init.localId);
+          if (initLocal?.boxed === true) {
+            const box = this.boxTypeFor(this.mapTypeSoft(initLocal.type));
+            const slot = this.localIndex(s.init.localId);
+            code.localGet(slot);
+            code.structGet(box, 0);
+            code.structNew(box);
+            code.localSet(slot);
+          }
+        }
         if (s.update !== null) this.walkStmt(s.update);
         this.brTo(loopPos, false);
         this.close();
@@ -568,10 +765,6 @@ class Assembler {
           this.walkBody(s.body);
           return;
         }
-        if (this.gateBoxed(s.localId, s.loc)) {
-          this.walkBody(s.body);
-          return;
-        }
         // Ascending index, LENGTH RE-READ each pass (JS-exact for arrays:
         // a body that pushes extends the loop, one that pops shortens
         // it). Direct buffer reads — the guard keeps the index in bounds.
@@ -592,6 +785,14 @@ class Assembler {
         code.structGet(info.struct, 1);
         code.localGet(i);
         this.vecs.emitElemRead(code, info);
+        {
+          // A captured loop binding gets a FRESH box per iteration —
+          // closures made in pass k keep pass k's element.
+          const bindingLocal = this.fn.localById.get(s.localId);
+          if (bindingLocal?.boxed === true) {
+            code.structNew(this.boxTypeFor(this.mapTypeSoft(bindingLocal.type)));
+          }
+        }
         code.localSet(this.localIndex(s.localId));
         const continuePos = this.openBlock();
         this.fn.control.push({ kind: "loop", labels: s.labels ?? [], breakPos, continuePos });
@@ -651,20 +852,26 @@ class Assembler {
     this.walkNested(s);
   }
 
-  /** A local or global write — assign and initializing varDecl share it.
+  /** A local or global write — `assign` and non-boxed varDecl share it.
    * Globals live in the "%g." namespace (IrGlobal docs) and get their wasm
-   * slot lazily, right here at first use. */
+   * slot lazily, right here at first use; a boxed local writes THROUGH
+   * its box (the shared binding every capture sees). */
   private storeVar(localId: string, value: IrExpr, loc: SrcLoc): void {
-    this.walkExpr(value);
     const global = this.globalById.get(localId);
     if (global !== undefined) {
+      this.walkExpr(value);
       this.fn.code.globalSet(this.globalIndex(global, loc));
       return;
     }
-    if (this.gateBoxed(localId, loc)) {
-      this.fn.code.drop(); // survey path: the value was already pushed
+    const local = this.fn.localById.get(localId);
+    if (local?.boxed === true) {
+      const box = this.boxTypeFor(this.mapTypeSoft(local.type));
+      this.fn.code.localGet(this.localIndex(localId));
+      this.walkExpr(value);
+      this.fn.code.structSet(box, 0);
       return;
     }
+    this.walkExpr(value);
     this.fn.code.localSet(this.localIndex(localId));
   }
 
@@ -733,20 +940,95 @@ class Assembler {
           code.globalGet(this.globalIndex(global, e.loc));
           return;
         }
-        if (this.gateBoxed(e.localId, e.loc)) {
-          code.unreachable(); // survey path: stand in for the unread box
+        const local = this.fn.localById.get(e.localId);
+        if (local?.boxed === true) {
+          const box = this.boxTypeFor(this.mapTypeSoft(local.type));
+          code.localGet(this.localIndex(e.localId));
+          code.structGet(box, 0);
+          // A TDZ box reads null until its source-position assign runs;
+          // the trap stands in for the catchable ReferenceError until the
+          // exception protocol lands.
+          if (local.tdz === true) code.refAsNonNull();
           return;
         }
         code.localGet(this.localIndex(e.localId));
         return;
       }
       case "call": {
-        for (const a of e.args) this.walkExpr(a);
+        const callee = this.funcByName.get(e.callee);
         const index = this.funcIndexByName.get(e.callee);
-        if (index === undefined) throw new Error(`call to unknown function "${e.callee}"`);
+        if (callee === undefined || index === undefined) {
+          throw new Error(`call to unknown function "${e.callee}"`);
+        }
+        // Direct calls pass a null closure — the uniform-ABI dead arg.
+        code.refNull(this.fnClosPair(callee).clos);
+        for (const a of e.args) this.walkExpr(a);
         code.call(index);
         return;
       }
+
+      case "closure": {
+        const callee = this.funcByName.get(e.fnName);
+        const index = this.funcIndexByName.get(e.fnName);
+        if (callee === undefined || index === undefined) {
+          throw new Error(`closure over unknown function "${e.fnName}"`);
+        }
+        this.mb.declareFuncRef(index);
+        if (e.captures.length === 0) {
+          // Interned: `f === f` is true for a top-level function value.
+          const pair = this.fnClosPair(callee);
+          let g = this.closInternGlobals.get(e.fnName);
+          if (g === undefined) {
+            g = this.mb.addGlobal({ kind: "ref", nullable: true, typeIndex: pair.clos }, true, (w) => {
+              w.u8(0xd0);
+              w.sleb(pair.clos);
+            });
+            this.closInternGlobals.set(e.fnName, g);
+          }
+          code.globalGet(g);
+          code.refIsNull();
+          this.openIf();
+          code.refFunc(index);
+          code.structNew(pair.clos);
+          code.globalSet(g);
+          this.close();
+          code.globalGet(g);
+          return;
+        }
+        // captures[] is in the CALLEE's captures order; each is a boxed
+        // local of the creating function, whose slot IS the box ref.
+        const env = this.envTypeFor(callee);
+        code.refFunc(index);
+        for (const capturedId of e.captures) code.localGet(this.localIndex(capturedId));
+        code.structNew(env);
+        return;
+      }
+
+      case "callValue": {
+        const ct = e.callee.type;
+        if (ct.kind !== "func") throw new Error("callValue on a non-func callee");
+        const pair = this.closSigFor(ct, e.loc);
+        if (pair === null) {
+          code.unreachable();
+          return;
+        }
+        const closRef: ValType = { kind: "ref", nullable: true, typeIndex: pair.clos };
+        const c = this.acquireScratch(closRef);
+        this.walkExpr(e.callee);
+        code.localSet(c);
+        code.localGet(c); // arg0: the closure itself (selfRef, env)
+        for (const a of e.args) this.walkExpr(a);
+        code.localGet(c);
+        code.structGet(pair.clos, 0);
+        code.callRef(pair.fn);
+        this.releaseScratch(closRef, c);
+        return;
+      }
+
+      case "selfRef":
+        // The running closure — arg0, exactly.
+        code.localGet(0);
+        return;
 
       case "bin":
         this.emitBin(e);
@@ -797,11 +1079,33 @@ class Assembler {
           }
           return;
         }
-        if (this.gateBoxed(e.localId, e.loc)) {
-          code.unreachable();
+        const local = this.fn.localById.get(e.localId);
+        const idx = this.localIndex(e.localId);
+        if (local?.boxed === true) {
+          const box = this.boxTypeFor(F64);
+          const n = this.acquireScratch(F64);
+          if (e.prefix) {
+            code.localGet(idx);
+            code.localGet(idx);
+            code.structGet(box, 0);
+            add();
+            code.localSet(n);
+            code.localGet(n);
+            code.structSet(box, 0);
+            code.localGet(n); // the result: the new value
+          } else {
+            code.localGet(idx);
+            code.structGet(box, 0);
+            code.localSet(n); // the old value
+            code.localGet(idx);
+            code.localGet(n);
+            add();
+            code.structSet(box, 0);
+            code.localGet(n); // the result: the old value
+          }
+          this.releaseScratch(F64, n);
           return;
         }
-        const idx = this.localIndex(e.localId);
         if (e.prefix) {
           code.localGet(idx);
           add();
@@ -824,9 +1128,19 @@ class Assembler {
           code.globalGet(idx);
           return;
         }
-        // On the boxed refusal the pushed value itself stands in as the
-        // result — type-correct without a placeholder.
-        if (this.gateBoxed(e.localId, e.loc)) return;
+        const local = this.fn.localById.get(e.localId);
+        if (local?.boxed === true) {
+          const soft = this.mapTypeSoft(local.type);
+          const box = this.boxTypeFor(soft);
+          const v = this.acquireScratch(soft);
+          code.localSet(v);
+          code.localGet(this.localIndex(e.localId));
+          code.localGet(v);
+          code.structSet(box, 0);
+          code.localGet(v); // the assigned value is the result
+          this.releaseScratch(soft, v);
+          return;
+        }
         code.localTee(this.localIndex(e.localId));
         return;
       }
@@ -837,7 +1151,7 @@ class Assembler {
           this.walkExpr(e.operand);
           return;
         }
-        if (k === "array") {
+        if (k === "array" || k === "func") {
           // Every object is truthy; evaluate for effects, answer true.
           this.walkExpr(e.operand);
           code.drop();
@@ -1069,11 +1383,10 @@ class Assembler {
         code.unreachable();
         return;
 
-      /* Unit values exist only inside unions; selfRef with classes;
-       * fieldIncDec with class fields; nullish/orDefault are union-shaped
-       * (their tests read the arm tag). */
+      /* Unit values exist only inside unions; fieldIncDec with class
+       * fields; nullish/orDefault are union-shaped (their tests read the
+       * arm tag). */
       case "unitLit":
-      case "selfRef":
       case "fieldIncDec":
       case "nullish":
       case "orDefault":
@@ -1094,10 +1407,8 @@ class Assembler {
       case "mapIntrinsic":
       case "setNew":
       case "setIntrinsic":
-      /* Function values. */
+      /* Native FFI — a link-time C ABI, nothing to link against here. */
       case "ffiCall":
-      case "closure":
-      case "callValue":
       /* Async, generators, promises. */
       case "yieldExpr":
       case "genResume":
@@ -1164,18 +1475,6 @@ class Assembler {
         code.unreachable();
       }
     }
-  }
-
-  /** Boxed (captured/TDZ) locals live in shared heap boxes the tier has no
-   * representation for yet — the use-site twin of fn:captures, for the
-   * DECLARING side. Returns true when the access was refused; the caller
-   * keeps the survey path's stack shape (storeVar drops the value it
-   * already pushed, varRef pushes the placeholder instead). */
-  private gateBoxed(localId: string, loc: SrcLoc): boolean {
-    const local = this.fn.localById.get(localId);
-    if (local?.boxed !== true) return false;
-    this.refuse("local:boxed", loc);
-    return true;
   }
 
   private localIndex(localId: string): number {
@@ -1328,8 +1627,9 @@ class Assembler {
           else code.i32Ne();
           return;
         }
-        if (k === "array") {
-          // Reference identity — JS object equality exactly.
+        if (k === "array" || k === "func") {
+          // Reference identity — JS object/function equality exactly
+          // (zero-capture closures intern, so `f === f` holds).
           this.walkExpr(e.left);
           this.walkExpr(e.right);
           code.refEq();
@@ -1647,7 +1947,8 @@ class Assembler {
     const pool = this.fn.scratchFree.get(this.scratchKey(t));
     const free = pool?.pop();
     if (free !== undefined) return free;
-    const index = this.fn.fn.params.length + this.fn.localsOut.length;
+    // +1: arg0 is the closure, declared params start at 1.
+    const index = this.fn.fn.params.length + 1 + this.fn.localsOut.length;
     this.fn.localsOut.push(t);
     return index;
   }
