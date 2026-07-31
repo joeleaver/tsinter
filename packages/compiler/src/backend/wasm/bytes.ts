@@ -81,6 +81,25 @@ export class ByteWriter {
     }
   }
 
+  /** Signed LEB128 over the full i64 range — the i64.const immediate.
+   * BigInt because the interesting i64 constants (mantissa masks, 1n<<52n)
+   * exceed the double-exact integer range. */
+  sleb64(n: bigint): void {
+    if (n < -0x8000_0000_0000_0000n || n > 0x7fff_ffff_ffff_ffffn) {
+      throw new Error(`sleb128 out of i64 range: ${n}`);
+    }
+    for (;;) {
+      const byte = Number(n & 0x7fn);
+      n >>= 7n;
+      const signBit = (byte & 0x40) !== 0;
+      if ((n === 0n && !signBit) || (n === -1n && signBit)) {
+        this.u8(byte);
+        return;
+      }
+      this.u8(byte | 0x80);
+    }
+  }
+
   /** IEEE754 double, little-endian — the f64.const immediate. */
   f64(v: number): void {
     this.grow(8);

@@ -65,6 +65,19 @@ const TIER_FLOOR: string[] = [
   // module bindings into %g. globals plus per-file %init functions, all
   // constructs the prologue increment claims.
   "2124-imports-field-wildcard/main.ts",
+  // Increment 2 (scalars + control flow): comparisons, if/else chains,
+  // switch dispatch, recursion, and the module-graph family whose
+  // programs compute in scalars and print strings/bools.
+  "102-comparisons.ts",
+  "300-if-else.ts",
+  "401-mutual-recursion.ts",
+  "800-switch-basics.ts",
+  "951-modules-diamond/main.ts",
+  "1622-cjs-require-conditional/main.js",
+  "1625-cjs-require-lazy-fn/main.js",
+  "2121-esm-cycle-inert-backedge/main.ts",
+  "2193-discarded-stdlib-reads.ts",
+  "2605-cycle-three-module/main.ts",
 ];
 
 interface RunResult {

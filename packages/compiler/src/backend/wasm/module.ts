@@ -24,20 +24,28 @@ import { ByteWriter } from "./bytes.js";
 
 export type ValType =
   | { kind: "i32" }
+  | { kind: "i64" }
   | { kind: "f64" }
   | { kind: "ref"; nullable: boolean; typeIndex: number };
 
 export const I32: ValType = { kind: "i32" };
+/** No IR value maps to i64 — it exists for the emitted runtime helpers'
+ * double-bit manipulation locals (toInt32, fmod). */
+export const I64: ValType = { kind: "i64" };
 export const F64: ValType = { kind: "f64" };
 
-/** Array element storage: a packed byte or a full valtype. i8 is what
- * strings use; the valtype arm is ready for ref-element arrays. */
-export type StorageType = "i8" | ValType;
+/** Array element storage: a packed byte/code-unit or a full valtype. i16
+ * is what strings use (UTF-16 code units — SEMANTICS.md S002), i8 the
+ * output staging path; the valtype arm is ready for ref-element arrays. */
+export type StorageType = "i8" | "i16" | ValType;
 
 function writeValType(w: ByteWriter, t: ValType): void {
   switch (t.kind) {
     case "i32":
       w.u8(0x7f);
+      break;
+    case "i64":
+      w.u8(0x7e);
       break;
     case "f64":
       w.u8(0x7c);
@@ -87,7 +95,7 @@ export class ModuleBuilder {
   }
 
   arrayType(elem: StorageType, mutable: boolean): number {
-    const key = `a:${elem === "i8" ? "i8" : valTypeKey(elem)}:${mutable ? "m" : "c"}`;
+    const key = `a:${elem === "i8" || elem === "i16" ? elem : valTypeKey(elem)}:${mutable ? "m" : "c"}`;
     return this.internType(key, { kind: "array", elem, mutable });
   }
 
@@ -175,6 +183,7 @@ export class ModuleBuilder {
           } else {
             s.u8(0x5e); // array comptype: fieldtype = storage + mutability
             if (t.elem === "i8") s.u8(0x78);
+            else if (t.elem === "i16") s.u8(0x77);
             else writeValType(s, t.elem);
             s.u8(t.mutable ? 0x01 : 0x00);
           }

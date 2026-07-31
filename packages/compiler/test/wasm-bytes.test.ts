@@ -56,6 +56,25 @@ describe("sleb128", () => {
   });
 });
 
+describe("sleb64", () => {
+  test.for([
+    [0n, [0x00]],
+    [-1n, [0x7f]],
+    [(1n << 52n) - 1n, [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x07]], // the mantissa mask
+    [1n << 52n, [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x08]], // the implicit bit
+    // 9 full groups leave the sign bit set, so a 10th terminates.
+    [0x7fff_ffff_ffff_ffffn, [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00]],
+    [-0x8000_0000_0000_0000n, [0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x7f]],
+  ] as const)("%s", ([n, bytes]) => {
+    expect(written((w) => w.sleb64(n))).toEqual([...bytes]);
+  });
+
+  test("rejects values outside i64", () => {
+    expect(() => written((w) => w.sleb64(1n << 63n))).toThrow(/out of i64 range/);
+    expect(() => written((w) => w.sleb64(-(1n << 63n) - 1n))).toThrow(/out of i64 range/);
+  });
+});
+
 test("f64 is little-endian IEEE754", () => {
   expect(written((w) => w.f64(1))).toEqual([0, 0, 0, 0, 0, 0, 0xf0, 0x3f]);
   expect(written((w) => w.f64(-2))).toEqual([0, 0, 0, 0, 0, 0, 0, 0xc0]);

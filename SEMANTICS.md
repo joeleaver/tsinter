@@ -62,3 +62,18 @@ sandboxed wasm module; ambient OS authority would be a lie at best and a
 sandbox hole at worst. **Tested by:** wasm-differential harness refusal
 histogram (Node-platform corpus programs must appear as refusals, not
 failures).
+
+## S005 — Source string relational comparison is code-point order *(inherited)*
+
+`<` `<=` `>` `>=` between strings compare by Unicode CODE POINT, not by
+UTF-16 code unit as ECMAScript specifies. The two orders disagree exactly
+when a supplementary character (U+10000+) meets a BMP character in
+[U+E000, U+FFFF]: JS sorts the supplementary FIRST (its high surrogate
+0xD800-0xDBFF is a smaller unit), code-point order sorts it LAST. This is
+the IR's documented contract for `strCmp` without the `utf16` flag; the flag
+— set only by the default `Array.prototype.sort` comparator — requests the
+ECMAScript unit order, so sorted output stays Node-exact. **Rationale:**
+inherited stance; code-point order is arguably saner and the divergent
+range is exotic. **Tested by:** the wasm emitter unit test pins one
+divergent-range comparison against this entry; corpus programs stay outside
+the divergent range (they must, to pass the Node differential).

@@ -82,6 +82,68 @@ test("the claimed surface: strings, bools, calls, if/else, console.error", async
   expect(stderr.toString("utf8")).toBe("oops π ✓\n");
 });
 
+test("scalar runtime: fmod, ToInt32, and string ops match Node bit-for-bit", async () => {
+  // Numbers can't PRINT yet (toString is the next increment), so every
+  // expectation routes through a comparison — which is exactly what pins
+  // the hand-emitted helpers: fmod (musl port) and toInt32 (exponent
+  // surgery; i64.trunc_sat would saturate where JS wraps).
+  const res = await buildWasm(
+    "scalars.ts",
+    [
+      "function check(name: string, ok: boolean): void {",
+      '  console.log(name, ok ? "ok" : "FAIL");',
+      "}",
+      "const big: number = 3700000000;",
+      "const twoPow53: number = 9007199254740992;",
+      'check("fmod", 7.5 % 2 === 1.5 && -8 % 3 === -2 && 3 % 5 === 3 && 5.5 % -2 === 1.5);',
+      "const nan: number = big - big + 0 / 0;",
+      'check("fmod-nan", !(nan % 2 === nan % 2) && !(5 % (big - big) === 5 % (big - big)));',
+      'check("toInt32-wrap", (big | 0) === -594967296 && (twoPow53 | 0) === 0 && (1e300 | 0) === 0);',
+      'check("toInt32-neg", (-big | 0) === 594967296 && (~5) === -6);',
+      'check("shifts", (1 << 31) === -2147483648 && (-1 >>> 0) === 4294967295 && (-8 >> 1) === -4);',
+      'check("nan-compare", !(nan < 1) && !(nan > 1) && !(nan === nan));',
+      'const s: string = "con" + "cat";',
+      'check("strings", s === "concat" && "apple" < "banana" && "a" < "ab" && !(s !== "concat"));',
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    ["fmod ok", "fmod-nan ok", "toInt32-wrap ok", "toInt32-neg ok", "shifts ok", "nan-compare ok", "strings ok", ""].join("\n"),
+  );
+});
+
+test("UTF-16 fidelity: astral output, lone surrogates, S005 ordering", async () => {
+  // Strings store UTF-16 code units (SEMANTICS.md S002): lone surrogates
+  // keep their identity in storage — only the WRITE boundary replaces
+  // them with U+FFFD, exactly like Node's stdout — and a supplementary
+  // character round-trips as one 4-byte UTF-8 sequence. Comparisons are
+  // runtime-computed so the frontend can't constant-fold them.
+  const res = await buildWasm(
+    "utf16.ts",
+    [
+      'const astral: string = "𝄞 clef 🎼";',
+      "console.log(astral);",
+      'const lone: string = "\\uD800";',
+      'const repl: string = "\\uFFFD";',
+      'console.log("lone keeps identity:", lone !== repl, lone === "\\uD800");',
+      "console.log(lone);",
+      // S005: code-point order sorts U+1D11E ABOVE U+E000 (JS's unit
+      // order would answer the opposite — the documented divergence).
+      'const supplementary: string = "\\uD834\\uDD1E";',
+      'const privateUse: string = "\\uE000";',
+      'console.log("S005 code-point order:", privateUse < supplementary);',
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    ["𝄞 clef 🎼", "lone keeps identity: true true", "�", "S005 code-point order: true", ""].join("\n"),
+  );
+});
+
 test("out-of-tier constructs refuse with SC3001 and ride the survey", async () => {
   const res = await buildWasm("refused.ts", "console.log(1 + 2);\n");
   expect(res.ok).toBe(false);
