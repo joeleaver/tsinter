@@ -61,9 +61,27 @@ function valTypeKey(t: ValType): string {
   return t.kind === "ref" ? `ref${t.nullable ? "?" : ""}:${t.typeIndex}` : t.kind;
 }
 
+function storageKey(s: StorageType): string {
+  return s === "i8" || s === "i16" ? s : valTypeKey(s);
+}
+
+function writeStorage(w: ByteWriter, s: StorageType): void {
+  if (s === "i8") w.u8(0x78);
+  else if (s === "i16") w.u8(0x77);
+  else writeValType(w, s);
+}
+
+/** One struct field: storage plus mutability, exactly the binary
+ * fieldtype. */
+export interface FieldType {
+  storage: StorageType;
+  mutable: boolean;
+}
+
 type TypeEntry =
   | { kind: "func"; params: ValType[]; results: ValType[] }
-  | { kind: "array"; elem: StorageType; mutable: boolean };
+  | { kind: "array"; elem: StorageType; mutable: boolean }
+  | { kind: "struct"; fields: FieldType[] };
 
 interface FuncDecl {
   typeIndex: number;
@@ -95,8 +113,13 @@ export class ModuleBuilder {
   }
 
   arrayType(elem: StorageType, mutable: boolean): number {
-    const key = `a:${elem === "i8" || elem === "i16" ? elem : valTypeKey(elem)}:${mutable ? "m" : "c"}`;
+    const key = `a:${storageKey(elem)}:${mutable ? "m" : "c"}`;
     return this.internType(key, { kind: "array", elem, mutable });
+  }
+
+  structType(fields: FieldType[]): number {
+    const key = `s:${fields.map((f) => `${storageKey(f.storage)}:${f.mutable ? "m" : "c"}`).join(",")}`;
+    return this.internType(key, { kind: "struct", fields });
   }
 
   private internType(key: string, entry: TypeEntry): number {
@@ -180,12 +203,17 @@ export class ModuleBuilder {
             for (const p of t.params) writeValType(s, p);
             s.uleb(t.results.length);
             for (const r of t.results) writeValType(s, r);
-          } else {
+          } else if (t.kind === "array") {
             s.u8(0x5e); // array comptype: fieldtype = storage + mutability
-            if (t.elem === "i8") s.u8(0x78);
-            else if (t.elem === "i16") s.u8(0x77);
-            else writeValType(s, t.elem);
+            writeStorage(s, t.elem);
             s.u8(t.mutable ? 0x01 : 0x00);
+          } else {
+            s.u8(0x5f); // struct comptype: vec of fieldtypes
+            s.uleb(t.fields.length);
+            for (const f of t.fields) {
+              writeStorage(s, f.storage);
+              s.u8(f.mutable ? 0x01 : 0x00);
+            }
           }
         }
       });

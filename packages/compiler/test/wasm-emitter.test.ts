@@ -145,11 +145,14 @@ test("UTF-16 fidelity: astral output, lone surrogates, S005 ordering", async () 
 });
 
 test("out-of-tier constructs refuse with SC3001 and ride the survey", async () => {
-  const res = await buildWasm("refused.ts", "const xs: number[] = [1, 2];\nconsole.log(xs.length);\n");
+  // Regex — a whole engine — sits far past every near-term increment, so
+  // this example won't rot into the tier the way arithmetic and arrays
+  // did. If it ever compiles, congratulations: pick whatever is furthest
+  // out then.
+  const res = await buildWasm("refused.ts", 'const re = /a+b/; console.log(re.test("aab"));\n');
   expect(res.ok).toBe(false);
   if (res.ok) return;
   expect(res.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
   expect(res.wasmSurvey).toBeDefined();
-  // Arrays are the current tier boundary; the literal is the work item.
-  expect(res.wasmSurvey).toContain("expr:arrayLit");
+  expect(res.wasmSurvey).toContain("expr:regexLit");
 });

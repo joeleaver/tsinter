@@ -115,6 +115,15 @@ const TIER_FLOOR: string[] = [
   "2422-ieee-div-rem-corners.ts",
   "2426-default-snapshot-mutable/main.ts",
   "2617-enum-static-field-import/main.ts",
+  // Increment 4 (arrays): the vector-struct representation and its core
+  // intrinsic surface, plus the programs the array types unlock.
+  "503-array-functions.ts",
+  "511-array-indexof-includes.ts",
+  "802-switch-loops.ts",
+  "803-switch-rc-stress.ts",
+  "963-generics-modules/main.ts",
+  "1054-comptime-modules/main.ts",
+  "1543-rest-destructuring.ts",
 ];
 
 interface RunResult {
@@ -240,7 +249,19 @@ async function runWasm(modulePath: string): Promise<RunResult> {
     },
   });
   memory = instance.exports["memory"] as WebAssembly.Memory;
-  (instance.exports["_start"] as () => void)();
+  try {
+    (instance.exports["_start"] as () => void)();
+  } catch (err) {
+    // A wasm TRAP is the tier's stand-in for an uncaught runtime error
+    // (S003's index traps, until the exception protocol lands): Node
+    // exits 1 on an uncaught exception, so a trap reports exit 1 with
+    // whatever output preceded it. Comparison stays honest — the harness
+    // skips the stderr compare for nonzero-exit programs, and any
+    // OTHER error here (a bug in the host, a missing export) is not a
+    // trap and still fails the test loudly.
+    if (!(err instanceof WebAssembly.RuntimeError)) throw err;
+    return { stdout: Buffer.concat(chunks[1]), stderr: Buffer.concat(chunks[2]), exitCode: 1 };
+  }
   return { stdout: Buffer.concat(chunks[1]), stderr: Buffer.concat(chunks[2]), exitCode: 0 };
 }
 

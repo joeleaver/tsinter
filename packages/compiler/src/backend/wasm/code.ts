@@ -303,6 +303,41 @@ export class Code {
   refIsNull(): void {
     this.w.u8(0xd1);
   }
+  /** Traps on null, yields the non-null ref — the absent-slot read trap. */
+  refAsNonNull(): void {
+    this.w.u8(0xd4);
+  }
+  structNew(typeIndex: number): void {
+    this.w.u8(0xfb);
+    this.w.uleb(0x00);
+    this.w.uleb(typeIndex);
+  }
+  structGet(typeIndex: number, fieldIndex: number): void {
+    this.w.u8(0xfb);
+    this.w.uleb(0x02);
+    this.w.uleb(typeIndex);
+    this.w.uleb(fieldIndex);
+  }
+  structSet(typeIndex: number, fieldIndex: number): void {
+    this.w.u8(0xfb);
+    this.w.uleb(0x05);
+    this.w.uleb(typeIndex);
+    this.w.uleb(fieldIndex);
+  }
+  /** array.new_fixed — pops N operands, the literal fast path. */
+  arrayNewFixed(typeIndex: number, count: number): void {
+    this.w.u8(0xfb);
+    this.w.uleb(0x08);
+    this.w.uleb(typeIndex);
+    this.w.uleb(count);
+  }
+  f64Trunc(): void {
+    this.w.u8(0x9d);
+  }
+  /** Traps on NaN/out-of-range — callers bound-check first. */
+  i32TruncF64S(): void {
+    this.w.u8(0xaa);
+  }
   arrayNewDefault(typeIndex: number): void {
     this.w.u8(0xfb);
     this.w.uleb(0x07);

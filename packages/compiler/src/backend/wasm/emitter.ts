@@ -57,6 +57,7 @@ import type {
   SrcLoc,
 } from "../../ir/nodes.js";
 import { EXPORT_ENTRY, EXPORT_MEMORY, FD_STDERR, FD_STDOUT, IMPORT_MODULE, IMPORT_WRITE } from "./abi.js";
+import { VecBuilder, type VecInfo } from "./arrays.js";
 import { Code } from "./code.js";
 import { buildF64ToStr } from "./numfmt.js";
 import { F64, I32, I64, ModuleBuilder, type ValType } from "./module.js";
@@ -259,6 +260,11 @@ class Assembler {
         return I32;
       case "string":
         return { kind: "ref", nullable: true, typeIndex: this.strType };
+      case "array": {
+        // Recursive: the ELEMENT representation is what can refuse.
+        const info = this.vecInfoFor(t, loc);
+        return info === null ? null : this.vecs.vecRef(info);
+      }
       default:
         this.refuse(`type:${t.kind}`, loc);
         return null;
@@ -276,6 +282,20 @@ class Assembler {
         return I32;
       case "string":
         return { kind: "ref", nullable: true, typeIndex: this.strType };
+      case "array": {
+        // Real when the element maps; the placeholder only when it
+        // cannot (the vec key marks placeholder-elem vectors distinct).
+        const elem = this.mapTypeSoft(t.elem);
+        const mappable = t.elem.kind === "f64" || t.elem.kind === "bool" || t.elem.kind === "string" || t.elem.kind === "array";
+        if (!mappable) return I32;
+        const kind =
+          t.elem.kind === "f64" ? "f64"
+          : t.elem.kind === "bool" ? "bool"
+          : t.elem.kind === "string" ? "string"
+          : "ref";
+        const storage = t.elem.kind === "bool" ? "i8" : elem;
+        return this.vecs.vecRef(this.vecs.info(this.vecKeyFor(t), elem, storage, kind));
+      }
       default:
         return I32;
     }
@@ -523,11 +543,75 @@ class Assembler {
         this.emitSwitch(s);
         return;
 
-      /* forOf iterates arrays — it waits on the array representation, and
-       * the stores into composites below each wait on the GC shape of the
-       * thing being written. */
-      case "forOf":
-      case "arraySet":
+      case "arraySet": {
+        const at = s.arr.type;
+        if (at.kind !== "array") throw new Error("arraySet on a non-array receiver");
+        const info = this.vecInfoFor(at, s.loc);
+        if (info === null) return; // elem-type refusal already recorded
+        this.walkExpr(s.arr);
+        this.walkExpr(s.index);
+        this.walkExpr(s.value);
+        code.call(this.vecs.set(info));
+        return;
+      }
+
+      case "forOf": {
+        const it = s.iterable.type;
+        if (it.kind !== "array") {
+          // for-of over a string iterates CODE POINTS — its own lowering.
+          this.refuse(`forOf:${it.kind}`, s.loc);
+          this.walkBody(s.body);
+          return;
+        }
+        const info = this.vecInfoFor(it, s.loc);
+        if (info === null) {
+          this.walkBody(s.body);
+          return;
+        }
+        if (this.gateBoxed(s.localId, s.loc)) {
+          this.walkBody(s.body);
+          return;
+        }
+        // Ascending index, LENGTH RE-READ each pass (JS-exact for arrays:
+        // a body that pushes extends the loop, one that pops shortens
+        // it). Direct buffer reads — the guard keeps the index in bounds.
+        const vec = this.acquireScratch(this.vecs.vecRef(info));
+        const i = this.acquireScratch(I32);
+        this.walkExpr(s.iterable);
+        code.localSet(vec);
+        code.i32Const(0);
+        code.localSet(i);
+        const breakPos = this.openBlock();
+        const loopPos = this.openLoop();
+        code.localGet(i);
+        code.localGet(vec);
+        code.structGet(info.struct, 0);
+        code.i32GeS();
+        this.brTo(breakPos, true);
+        code.localGet(vec);
+        code.structGet(info.struct, 1);
+        code.localGet(i);
+        this.vecs.emitElemRead(code, info);
+        code.localSet(this.localIndex(s.localId));
+        const continuePos = this.openBlock();
+        this.fn.control.push({ kind: "loop", labels: s.labels ?? [], breakPos, continuePos });
+        this.walkBody(s.body);
+        this.fn.control.pop();
+        this.close();
+        code.localGet(i);
+        code.i32Const(1);
+        code.i32Add();
+        code.localSet(i);
+        this.brTo(loopPos, false);
+        this.close();
+        this.close();
+        this.releaseScratch(I32, i);
+        this.releaseScratch(this.vecs.vecRef(info), vec);
+        return;
+      }
+
+      /* Stores into composites — each waits on the GC shape of the thing
+       * being written. */
       case "bytesSet":
       case "fieldSet":
       case "recordSet":
@@ -591,9 +675,6 @@ class Assembler {
    * walkStmt and return before this.) */
   private walkNested(s: IrStmt): void {
     switch (s.kind) {
-      case "forOf":
-        this.walkBody(s.body);
-        break;
       case "tryCatch":
         this.walkBody(s.tryBody);
         if (s.catchBody !== null) this.walkBody(s.catchBody);
@@ -610,6 +691,7 @@ class Assembler {
       case "for":
       case "switch":
       case "block":
+      case "forOf":
       case "arraySet":
       case "bytesSet":
       case "fieldSet":
@@ -755,6 +837,13 @@ class Assembler {
           this.walkExpr(e.operand);
           return;
         }
+        if (k === "array") {
+          // Every object is truthy; evaluate for effects, answer true.
+          this.walkExpr(e.operand);
+          code.drop();
+          code.i32Const(1);
+          return;
+        }
         if (k === "f64" || k === "string") {
           this.walkExpr(e.operand);
           const t = k === "f64" ? F64 : this.strRef;
@@ -853,6 +942,73 @@ class Assembler {
         code.call(this.concatHelper());
         return;
 
+      case "arrayLit": {
+        if (e.type.kind !== "array") throw new Error("arrayLit with a non-array type");
+        const info = this.vecInfoFor(e.type, e.loc);
+        if (info === null) {
+          code.unreachable();
+          return;
+        }
+        const spreads = new Set(e.spreads ?? []);
+        // Fast path — plain literals build the exact-size buffer straight
+        // off the stack (array.new_fixed caps at 10000 operands).
+        if (spreads.size === 0 && e.elems.length <= 10000) {
+          code.i32Const(e.elems.length);
+          for (const el of e.elems) this.walkExpr(el);
+          code.arrayNewFixed(info.bufType, e.elems.length);
+          code.structNew(info.struct);
+          return;
+        }
+        // Spread path: build incrementally IN SOURCE ORDER — a spread
+        // copies its source's elements at ITS position, before later
+        // element expressions run (JS-exact: [...xs, xs.push(9)] must not
+        // see the push in the spread's copy).
+        const vec = this.acquireScratch(this.vecs.vecRef(info));
+        code.i32Const(0);
+        code.i32Const(0);
+        code.arrayNewDefault(info.bufType);
+        code.structNew(info.struct);
+        code.localSet(vec);
+        e.elems.forEach((el, i) => {
+          code.localGet(vec);
+          this.walkExpr(el);
+          code.call(spreads.has(i) ? this.vecs.pushSpread(info) : this.vecs.pushOne(info));
+        });
+        code.localGet(vec);
+        this.releaseScratch(this.vecs.vecRef(info), vec);
+        return;
+      }
+
+      case "arrayNewLen": {
+        if (e.type.kind !== "array") throw new Error("arrayNewLen with a non-array type");
+        const info = this.vecInfoFor(e.type, e.loc);
+        if (info === null) {
+          code.unreachable();
+          return;
+        }
+        this.walkExpr(e.length);
+        code.call(this.vecs.newLen(info));
+        return;
+      }
+
+      case "arrayGet": {
+        const at = e.arr.type;
+        if (at.kind !== "array") throw new Error("arrayGet on a non-array receiver");
+        const info = this.vecInfoFor(at, e.loc);
+        if (info === null) {
+          code.unreachable();
+          return;
+        }
+        this.walkExpr(e.arr);
+        this.walkExpr(e.index);
+        code.call(this.vecs.get(info));
+        return;
+      }
+
+      case "arrIntrinsic":
+        this.emitArrIntrinsic(e);
+        return;
+
       case "toString": {
         const k = e.operand.type.kind;
         if (k === "f64") {
@@ -931,11 +1087,7 @@ class Assembler {
       /* Regex — a whole engine, host-imported or compiled. */
       case "regexLit":
       case "regexIntrinsic":
-      /* Arrays, typed arrays, and the keyed collections. */
-      case "arrayLit":
-      case "arrayNewLen":
-      case "arrayGet":
-      case "arrIntrinsic":
+      /* Typed arrays and the keyed collections. */
       case "bytesNew":
       case "bytesIntrinsic":
       case "mapNew":
@@ -1040,11 +1192,11 @@ class Assembler {
     // Zero-value init per representation; the frontend's %init functions
     // perform the real initialization, exactly like the native backends.
     const type = this.mapType(g.type, loc) ?? I32; // placeholder en route to the refusal
-    const strType = this.strType;
     const index = this.mb.addGlobal(type, true, (w) => {
       switch (type.kind) {
         case "i32":
-          w.u8(0x41);
+        case "i64":
+          w.u8(type.kind === "i32" ? 0x41 : 0x42);
           w.sleb(0);
           break;
         case "f64":
@@ -1052,8 +1204,10 @@ class Assembler {
           w.f64(0);
           break;
         case "ref":
+          // ref.null of the global's OWN heap type — anything else fails
+          // validation the moment a non-string ref global exists.
           w.u8(0xd0);
-          w.sleb(strType);
+          w.sleb(type.typeIndex);
           break;
       }
     });
@@ -1061,7 +1215,44 @@ class Assembler {
     return index;
   }
 
+  private vecsField: VecBuilder | null = null;
+
+  /** The per-element-type array machinery (arrays.ts), deps injected. */
+  private get vecs(): VecBuilder {
+    this.vecsField ??= new VecBuilder(this.mb, {
+      strEq: () => this.strEqHelper(),
+      f64ToStr: () => this.f64ToStrHelper(),
+      concat: () => this.concatHelper(),
+      lit: (c, s) => this.pushStrLitInto(c, s),
+    });
+    return this.vecsField;
+  }
+
+  /** The vector types for an IR array type; null (with the honest type
+   * refusal already recorded) when the ELEMENT representation is out of
+   * tier. The recursive key mirrors nesting: vec(vec(f64)) etc. */
+  private vecInfoFor(t: IrType & { kind: "array" }, loc: SrcLoc | undefined): VecInfo | null {
+    const elemVal = this.mapType(t.elem, loc);
+    if (elemVal === null) return null;
+    const kind =
+      t.elem.kind === "f64" ? "f64"
+      : t.elem.kind === "bool" ? "bool"
+      : t.elem.kind === "string" ? "string"
+      : "ref";
+    const storage = t.elem.kind === "bool" ? "i8" : elemVal;
+    return this.vecs.info(this.vecKeyFor(t), elemVal, storage, kind);
+  }
+
+  private vecKeyFor(t: IrType): string {
+    if (t.kind === "array") return `vec(${this.vecKeyFor(t.elem)})`;
+    return t.kind === "string" ? "str" : t.kind;
+  }
+
   private pushStrLit(value: string): void {
+    this.pushStrLitInto(this.fn.code, value);
+  }
+
+  private pushStrLitInto(c: Code, value: string): void {
     // UTF-16LE code units, raw — charCodeAt preserves lone surrogates
     // (TextEncoder would replace them and break identity, S002). The
     // array.new_data offset is in BYTES into the segment, the size in
@@ -1074,10 +1265,9 @@ class Assembler {
       units[i * 2 + 1] = u >> 8;
     }
     const offset = this.mb.internData(units);
-    const code = this.fn.code;
-    code.i32Const(offset);
-    code.i32Const(value.length);
-    code.arrayNewData(this.strType, 0);
+    c.i32Const(offset);
+    c.i32Const(value.length);
+    c.arrayNewData(this.strType, 0);
   }
 
   /* ── operators ──────────────────────────────────────────────────────── */
@@ -1138,8 +1328,15 @@ class Assembler {
           else code.i32Ne();
           return;
         }
-        // Same-typed arrays / class values: pointer identity — waits on
-        // those representations.
+        if (k === "array") {
+          // Reference identity — JS object equality exactly.
+          this.walkExpr(e.left);
+          this.walkExpr(e.right);
+          code.refEq();
+          if (e.op === "!==") code.i32Eqz();
+          return;
+        }
+        // Class values: one immortal object per class — waits on classes.
         this.refuse("bin:ref-eq", e.loc);
         code.unreachable();
         return;
@@ -1172,6 +1369,116 @@ class Assembler {
       default: {
         const rest: never = e.op;
         void rest;
+      }
+    }
+  }
+
+  /** Array method/property dispatch. Receiver first, then arguments in
+   * source order; push evaluates every argument BEFORE appending (an
+   * argument reading .length must not see earlier appends). */
+  private emitArrIntrinsic(e: Extract<IrExpr, { kind: "arrIntrinsic" }>): void {
+    const code = this.fn.code;
+    const rt = e.receiver.type;
+    if (rt.kind !== "array") throw new Error("arrIntrinsic on a non-array receiver");
+    const info = this.vecInfoFor(rt, e.loc);
+    if (info === null) {
+      code.unreachable();
+      return;
+    }
+    const vecLen = (): void => {
+      code.structGet(info.struct, 0);
+      code.f64ConvertI32S();
+    };
+    switch (e.method) {
+      case "length":
+        this.walkExpr(e.receiver);
+        vecLen();
+        return;
+      case "push": {
+        const vec = this.acquireScratch(this.vecs.vecRef(info));
+        this.walkExpr(e.receiver);
+        code.localSet(vec);
+        const staged = e.args.map((a) => {
+          this.walkExpr(a);
+          const s = this.acquireScratch(info.elemVal);
+          code.localSet(s);
+          return s;
+        });
+        for (const s of staged) {
+          code.localGet(vec);
+          code.localGet(s);
+          code.call(this.vecs.pushOne(info));
+          this.releaseScratch(info.elemVal, s);
+        }
+        code.localGet(vec);
+        vecLen();
+        this.releaseScratch(this.vecs.vecRef(info), vec);
+        return;
+      }
+      case "pushSpread": {
+        const vec = this.acquireScratch(this.vecs.vecRef(info));
+        this.walkExpr(e.receiver);
+        code.localSet(vec);
+        code.localGet(vec);
+        this.walkExpr(e.args[0]!);
+        code.call(this.vecs.pushSpread(info));
+        code.localGet(vec);
+        vecLen();
+        this.releaseScratch(this.vecs.vecRef(info), vec);
+        return;
+      }
+      case "indexOf":
+      case "includes":
+        this.walkExpr(e.receiver);
+        this.walkExpr(e.args[0]!);
+        if (e.args[1] !== undefined) this.walkExpr(e.args[1]);
+        else code.f64Const(0);
+        code.call(this.vecs.search(info, e.method === "includes"));
+        return;
+      case "join":
+        if (info.elemKind === "ref") {
+          // ToString of an array element is its own recursive join —
+          // later work, its own tag.
+          this.refuse("arrIntrinsic:join:ref-elem", e.loc);
+          code.unreachable();
+          return;
+        }
+        this.walkExpr(e.receiver);
+        if (e.args[0] !== undefined) this.walkExpr(e.args[0]);
+        else this.pushStrLit(",");
+        code.call(this.vecs.join(info, this.strRef));
+        return;
+      case "slice":
+        this.walkExpr(e.receiver);
+        if (e.args[0] !== undefined) this.walkExpr(e.args[0]);
+        else code.f64Const(0);
+        if (e.args[1] !== undefined) this.walkExpr(e.args[1]);
+        else code.f64Const(Infinity);
+        code.call(this.vecs.slice(info));
+        return;
+      case "splice":
+        this.walkExpr(e.receiver);
+        this.walkExpr(e.args[0]!);
+        if (e.args[1] !== undefined) this.walkExpr(e.args[1]);
+        else code.f64Const(Infinity);
+        code.call(this.vecs.splice(info));
+        return;
+      /* pop and shift yield `elem | undefined` unions — they join with
+       * the union representation; `with` throws a catchable RangeError —
+       * it joins with the exception protocol; the ES2023 copiers are
+       * tail work. */
+      case "pop":
+      case "shift":
+      case "toReversed":
+      case "toSpliced":
+      case "with":
+        this.refuse(`arrIntrinsic:${e.method}`, e.loc);
+        code.unreachable();
+        return;
+      default: {
+        const rest: never = e.method;
+        this.refuse(`arrIntrinsic:${rest as string}`, e.loc);
+        code.unreachable();
       }
     }
   }
