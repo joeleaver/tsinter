@@ -141,6 +141,24 @@ const TIER_FLOOR: string[] = [
   "1960-namespace-basics.ts",
   "2021-generic-value-binding-modules/main.ts",
   "2390-dot-requires/main.cjs",
+  // Increment 6 (records): struct-per-shape, tuples, accessor-slot
+  // shapes, and the programs those unlock.
+  "517-array-hof-index-args.ts",
+  "751-cycle-records-mutual.ts",
+  "901-records-eval-order.ts",
+  "902-records-functions-closures.ts",
+  "953-modules-default/main.ts",
+  "960-generics-basics.ts",
+  "1359-json-module/main.ts",
+  "1450-incdec-expression.ts",
+  "1537-chalk-hybrid/main.ts",
+  "1824-for-of-destructuring-defaults.ts",
+  "1964-namespace-type-only.ts",
+  "2045-objlit-accessors-basic.ts",
+  "2102-empty-pattern-decls.ts",
+  "2551-generics-value-aliases.ts",
+  "2555-generics-keyof-writes.ts",
+  "2587-array-entries-forof.ts",
 ];
 
 interface RunResult {

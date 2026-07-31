@@ -52,6 +52,7 @@ import type {
   IrGlobal,
   IrLocal,
   IrModule,
+  IrRecordShape,
   IrStmt,
   IrType,
   SrcLoc,
@@ -163,6 +164,7 @@ class Assembler {
       w.sleb(0);
     });
     for (const g of mod.globals ?? []) this.globalById.set(g.id, g);
+    for (const r of mod.records ?? []) this.recordShapes.set(r.id, r);
   }
 
   run(): void {
@@ -333,6 +335,54 @@ class Assembler {
     return this.closPairFor(params, results);
   }
 
+  /* ── records ────────────────────────────────────────────────────────────
+   * One mutable GC struct per shape, fields in CANONICAL (sorted) order —
+   * the shape's identity. recordLit allocates with defaults and fills in
+   * SOURCE order (JS evaluation order), so canonical layout never
+   * reorders effects. Index-signature (overflow) shapes wait on the map
+   * runtime; shapes recursive through their own fields wait on multi-type
+   * rec-group emission. */
+
+  private readonly recordInfos = new Map<string, { struct: number; fieldIndex: Map<string, number> } | null>();
+  private readonly recordShapes = new Map<string, IrRecordShape>();
+  private readonly recordInFlight = new Set<string>();
+
+  private recordInfo(shapeId: string, loc: SrcLoc | undefined, soft: boolean): { struct: number; fieldIndex: Map<string, number> } | null {
+    const cached = this.recordInfos.get(shapeId);
+    if (cached !== undefined) {
+      if (cached === null && !soft) this.refuseRecord(shapeId, loc);
+      return cached;
+    }
+    const shape = this.recordShapes.get(shapeId);
+    if (shape === undefined) throw new Error(`unknown record shape ${shapeId}`);
+    if (shape.indexValue !== undefined || this.recordInFlight.has(shapeId)) {
+      this.recordInfos.set(shapeId, null);
+      if (!soft) this.refuseRecord(shapeId, loc);
+      return null;
+    }
+    this.recordInFlight.add(shapeId);
+    const fields = shape.fields.map((f) => ({ storage: this.mapTypeSoft(f.type), mutable: true }));
+    this.recordInFlight.delete(shapeId);
+    // A self-recursive shape poisoned its own cache entry while its
+    // fields mapped — keep the refusal, never the placeholder struct.
+    if (this.recordInfos.get(shapeId) === null) {
+      if (!soft) this.refuseRecord(shapeId, loc);
+      return null;
+    }
+    const struct = this.mb.structType(fields);
+    const made = { struct, fieldIndex: new Map(shape.fields.map((f, i) => [f.name, i])) };
+    this.recordInfos.set(shapeId, made);
+    return made;
+  }
+
+  private refuseRecord(shapeId: string, loc: SrcLoc | undefined): void {
+    const shape = this.recordShapes.get(shapeId);
+    this.refuse(
+      shape?.indexValue !== undefined ? "record:index-signature" : "record:recursive",
+      loc,
+    );
+  }
+
   /** One-field mutable box per captured-value representation; ref-typed
    * payloads store nullable (the TDZ-empty state). */
   private boxTypeFor(v: ValType): number {
@@ -382,6 +432,10 @@ class Assembler {
         const pair = this.closSigFor(t, loc);
         return pair === null ? null : { kind: "ref", nullable: true, typeIndex: pair.clos };
       }
+      case "record": {
+        const info = this.recordInfo(t.shapeId, loc, false);
+        return info === null ? null : { kind: "ref", nullable: true, typeIndex: info.struct };
+      }
       default:
         this.refuse(`type:${t.kind}`, loc);
         return null;
@@ -400,10 +454,18 @@ class Assembler {
       case "string":
         return { kind: "ref", nullable: true, typeIndex: this.strType };
       case "array": {
-        // Real when the element maps; the placeholder only when it
-        // cannot (the vec key marks placeholder-elem vectors distinct).
+        // Must produce the SAME type mapType would wherever mapType
+        // succeeds — a placeholder there makes two views of one
+        // signature disagree, which validation catches as a call-site
+        // type clash. Placeholder-elem vectors stay distinct via the key.
         const elem = this.mapTypeSoft(t.elem);
-        const mappable = t.elem.kind === "f64" || t.elem.kind === "bool" || t.elem.kind === "string" || t.elem.kind === "array";
+        const mappable =
+          t.elem.kind === "f64" ||
+          t.elem.kind === "bool" ||
+          t.elem.kind === "string" ||
+          t.elem.kind === "array" ||
+          t.elem.kind === "func" ||
+          t.elem.kind === "record";
         if (!mappable) return I32;
         const kind =
           t.elem.kind === "f64" ? "f64"
@@ -420,6 +482,10 @@ class Assembler {
           t.ret.kind === "void" ? [] : [this.mapTypeSoft(t.ret)],
         );
         return { kind: "ref", nullable: true, typeIndex: pair.clos };
+      }
+      case "record": {
+        const info = this.recordInfo(t.shapeId, undefined, true);
+        return info === null ? I32 : { kind: "ref", nullable: true, typeIndex: info.struct };
       }
       default:
         return I32;
@@ -811,11 +877,22 @@ class Assembler {
         return;
       }
 
+      case "recordSet": {
+        const info = this.recordInfo(s.shapeId, s.loc, false);
+        if (info === null) return; // shape refusal already recorded
+        const idx = info.fieldIndex.get(s.field);
+        if (idx === undefined) throw new Error(`recordSet field ${s.field} not on shape ${s.shapeId}`);
+        this.walkExpr(s.obj);
+        this.walkExpr(s.value);
+        code.structSet(info.struct, idx);
+        return;
+      }
+
       /* Stores into composites — each waits on the GC shape of the thing
-       * being written. */
+       * being written (bytes on the typed-array runtime, fieldSet on
+       * classes, the recordKey pair on the overflow map). */
       case "bytesSet":
       case "fieldSet":
-      case "recordSet":
       case "recordKeySet":
       case "recordKeyDelete":
         this.refuse(`stmt:${s.kind}`, s.loc);
@@ -1151,7 +1228,7 @@ class Assembler {
           this.walkExpr(e.operand);
           return;
         }
-        if (k === "array" || k === "func") {
+        if (k === "array" || k === "func" || k === "record") {
           // Every object is truthy; evaluate for effects, answer true.
           this.walkExpr(e.operand);
           code.drop();
@@ -1323,6 +1400,51 @@ class Assembler {
         this.emitArrIntrinsic(e);
         return;
 
+      case "recordLit": {
+        if (e.type.kind !== "record") throw new Error("recordLit with a non-record type");
+        const info = this.recordInfo(e.type.shapeId, e.loc, false);
+        if (info === null) {
+          code.unreachable();
+          return;
+        }
+        // Allocate with defaults, fill in SOURCE order (JS evaluation
+        // order) — canonical struct layout never reorders effects.
+        const recRef: ValType = { kind: "ref", nullable: true, typeIndex: info.struct };
+        const rec = this.acquireScratch(recRef);
+        code.structNewDefault(info.struct);
+        code.localSet(rec);
+        for (const f of e.fields) {
+          if (f.drop === true) {
+            // The mapping dropped this field: the expression still runs
+            // in its source-order slot; nothing stores.
+            this.walkExpr(f.value);
+            if (f.value.type.kind !== "void") code.drop();
+            continue;
+          }
+          const idx = info.fieldIndex.get(f.name);
+          if (idx === undefined) throw new Error(`recordLit field ${f.name} not on shape ${e.type.shapeId}`);
+          code.localGet(rec);
+          this.walkExpr(f.value);
+          code.structSet(info.struct, idx);
+        }
+        code.localGet(rec);
+        this.releaseScratch(recRef, rec);
+        return;
+      }
+
+      case "recordGet": {
+        const info = this.recordInfo(e.shapeId, e.loc, false);
+        if (info === null) {
+          code.unreachable();
+          return;
+        }
+        const idx = info.fieldIndex.get(e.field);
+        if (idx === undefined) throw new Error(`recordGet field ${e.field} not on shape ${e.shapeId}`);
+        this.walkExpr(e.obj);
+        code.structGet(info.struct, idx);
+        return;
+      }
+
       case "toString": {
         const k = e.operand.type.kind;
         if (k === "f64") {
@@ -1429,8 +1551,7 @@ class Assembler {
       case "upcast":
       case "downcast":
       /* Record shapes. */
-      case "recordLit":
-      case "recordGet":
+      /* The dynamic-keyed record surface rides the overflow map. */
       case "recordKeyGet":
       case "recordOvfKeys":
       /* Tagged unions. */
@@ -1542,9 +1663,24 @@ class Assembler {
     return this.vecs.info(this.vecKeyFor(t), elemVal, storage, kind);
   }
 
+  /** A DISTINCT key per element representation — `func` keys by the
+   * signature's closure type index and `record` by shape id, or two
+   * different func-element arrays would intern one (wrong) vector type. */
   private vecKeyFor(t: IrType): string {
-    if (t.kind === "array") return `vec(${this.vecKeyFor(t.elem)})`;
-    return t.kind === "string" ? "str" : t.kind;
+    switch (t.kind) {
+      case "array":
+        return `vec(${this.vecKeyFor(t.elem)})`;
+      case "string":
+        return "str";
+      case "record":
+        return `rec:${t.shapeId}`;
+      case "func": {
+        const soft = this.mapTypeSoft(t);
+        return `fn:${valKey(soft)}`;
+      }
+      default:
+        return t.kind;
+    }
   }
 
   private pushStrLit(value: string): void {
