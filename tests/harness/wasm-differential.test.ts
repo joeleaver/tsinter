@@ -354,6 +354,45 @@ const TIER_FLOOR: string[] = [
   // `await null` / `await undefined` interleaved with `.then` chains —
   // the bare microtask hop against settled-promise awaits, one turn each.
   "2320-await-unit.ts",
+  // Increment 12 (async), stage 3: timers, immediates, and the event loop
+  // the HOST pumps (`_tick`, abi.ts). One min-heap keyed on (deadline,
+  // seq), Node's delay coercion, eager clears, ref/unref liveness, the
+  // firing flags that carry a self-clear or a self-refresh across the
+  // callback, and the check phase with its end snapshot.
+  //
+  // Delay coercion end to end: 1, 1.8, 1.1 and 0.5 share the 1ms bucket
+  // and fire in registration order.
+  "1806-timer-delay-trunc.ts",
+  // The clearable one-shot: clearTimeout, unref/ref/hasRef, and an
+  // unref'd timer that fires anyway while the loop lives for other work.
+  "1463-timeout-unref.ts",
+  // setInterval on period beside a setTimeout landing between ticks, and
+  // the self-clear that releases the loop.
+  "1440-interval-basics.ts",
+  // Two intervals cleared from OUTSIDE and from inside, with an async
+  // frame awaiting a timer-resolved promise across them.
+  "1441-interval-clear-cross.ts",
+  // A throw out of an interval callback: stdout survives, the trap is
+  // exit 1, and the interval does not re-arm (S007).
+  "1442-interval-throw.ts",
+  // Timeout.refresh() from inside the callback — the one-shot that fires
+  // exactly twice (S011 for the shape this deliberately does not cover).
+  "1803-timeout-refresh.ts",
+  // The check phase: FIFO, clearImmediate mid-phase, and the end
+  // snapshot that makes a mid-phase setImmediate wait a turn.
+  "1800-immediate-basics.ts",
+  // The Immediate handle surface — hasRef/unref/ref chaining, and every
+  // op on a FIRED handle as a tolerated no-op.
+  "1801-immediate-handle.ts",
+  // Immediate liveness: an unref'd immediate rides a reffed neighbour's
+  // phase, and one queued with nothing reffed left never fires.
+  "1802-immediate-unref-exit.ts",
+  // node:timers' named/namespace imports driving the same heap and queue
+  // as the ambient globals.
+  "1804-timers-module.ts",
+  // Microtasks before timers, equal-deadline timers in registration
+  // order, and an async chain woken by promises a timer resolves.
+  "1021-async-ordering.ts",
 ];
 
 interface RunResult {
@@ -462,13 +501,28 @@ async function runNode(file: string): Promise<RunResult> {
 
 /** The abi.ts contract's Node side: instantiate the module, service
  * `tsinter.write` by copying [ptr, ptr+len) out of the exported memory
- * into per-fd buffers, run `_start` to completion. In-process — a .wasm
- * needs no spawn, and the per-fd capture matches what the comparison
- * reads (cross-fd interleaving is not observable through separate
- * buffers on the Node side either). */
+ * into per-fd buffers, run `_start` and then PUMP `_tick` to quiescence.
+ * In-process — a .wasm needs no spawn, and the per-fd capture matches
+ * what the comparison reads (cross-fd interleaving is not observable
+ * through separate buffers on the Node side either).
+ *
+ * THE CLOCK IS VIRTUAL and never sleeps: `tsinter.now` answers whatever
+ * deadline the pump last jumped to, so a program with a 5-second timer
+ * runs in microseconds. That is sound because every claimable timer
+ * program is ORDER-only by construction — the corpus forbids wall-clock
+ * assertions, since the native lane could not make them either.
+ *
+ * One consequence to know about: the synchronous body takes ZERO virtual
+ * time, so a `setTimeout(f, 1)` armed there is never due before the first
+ * check phase, while under Node's real clock module startup has usually
+ * already burned that millisecond. Node calls that particular ordering
+ * non-deterministic ("bound by the performance of the process"), so no
+ * corpus program may pin it — 1804 arms its immediates and timers inside
+ * one root timer for exactly this reason. */
 async function runWasm(modulePath: string): Promise<RunResult> {
   const chunks: { 1: Buffer[]; 2: Buffer[] } = { 1: [], 2: [] };
   let memory: WebAssembly.Memory | null = null;
+  let clock = 0;
   const { instance } = await WebAssembly.instantiate(readFileSync(modulePath), {
     tsinter: {
       write(fd: number, ptr: number, len: number): void {
@@ -476,11 +530,29 @@ async function runWasm(modulePath: string): Promise<RunResult> {
         if (memory === null) throw new Error("write before instantiation completed");
         chunks[fd].push(Buffer.from(new Uint8Array(memory.buffer, ptr, len)));
       },
+      // Timer modules only; wasm ignores an import it never declared.
+      now: (): number => clock,
     },
   });
   memory = instance.exports["memory"] as WebAssembly.Memory;
   try {
     (instance.exports["_start"] as () => void)();
+    // The event loop the module cannot run itself (abi.ts): a negative
+    // deadline is quiescence, `clock` again is ready work (immediates),
+    // anything else is a time to jump to. Inside the try because a trap
+    // mid-pump is the same exit-1 story a trap in _start is.
+    const tick = instance.exports["_tick"] as ((now: number) => number) | undefined;
+    if (tick !== undefined) {
+      for (let turns = 0; ; turns++) {
+        // A pump that never settles would hang the whole suite instead of
+        // failing one program. The bound is generous: an immediate chain
+        // legitimately returns `clock` once per queued callback.
+        if (turns > 1_000_000) throw new Error(`_tick pump did not settle for ${modulePath}`);
+        const due = tick(clock);
+        if (due < 0) break;
+        clock = Math.max(clock, due);
+      }
+    }
   } catch (err) {
     // A wasm TRAP is the tier's stand-in for an uncaught runtime error
     // (S003's index traps, until the exception protocol lands): Node

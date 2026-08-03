@@ -60,7 +60,16 @@ import {
   RUNTIME_ERROR_CLASSES,
 } from "../../ir/nodes.js";
 import { computeMayThrow } from "../emission/may-throw.js";
-import { EXPORT_ENTRY, EXPORT_MEMORY, FD_STDERR, FD_STDOUT, IMPORT_MODULE, IMPORT_WRITE } from "./abi.js";
+import {
+  EXPORT_ENTRY,
+  EXPORT_MEMORY,
+  EXPORT_TICK,
+  FD_STDERR,
+  FD_STDOUT,
+  IMPORT_MODULE,
+  IMPORT_NOW,
+  IMPORT_WRITE,
+} from "./abi.js";
 import { VecBuilder, type VecInfo } from "./arrays.js";
 import {
   PromiseBuilder,
@@ -71,6 +80,7 @@ import {
   PROM_STATE,
 } from "./promises.js";
 import { StrBuilder } from "./strings.js";
+import { TimerBuilder } from "./timers.js";
 import { UnionBuilder, type UnionArmRep } from "./unions.js";
 import { Code } from "./code.js";
 import { buildF64ToStr } from "./numfmt.js";
@@ -91,6 +101,68 @@ export { WasmUnsupportedError } from "./unsupported.js";
 
 function valKey(t: ValType): string {
   return t.kind === "ref" ? `r${t.nullable ? "?" : ""}${t.typeIndex}` : t.kind;
+}
+
+/** The entry's transitive closure over function-name references — the
+ * same GENERIC deep scan `Assembler.reachableFunctions` does, hoisted out
+ * because the timer prescan needs it BEFORE the assembler exists (imports
+ * precede declared functions in the index space, so `tsinter.now` has to
+ * be decided in the constructor). See that method for why the scan is
+ * blunt on purpose. */
+function reachableFunctionNames(mod: WModule): Set<string> {
+  const names = new Set(mod.functions.map((f) => f.name));
+  const byName = new Map(mod.functions.map((f) => [f.name, f]));
+  const reachable = new Set<string>([mod.entry]);
+  const queue = [mod.entry];
+  const scan = (node: unknown): void => {
+    if (typeof node === "string") {
+      if (names.has(node) && !reachable.has(node)) {
+        reachable.add(node);
+        queue.push(node);
+      }
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      for (const value of Object.values(node)) scan(value);
+    }
+  };
+  while (queue.length > 0) {
+    const fn = byName.get(queue.pop()!);
+    if (fn !== undefined) scan(fn.body);
+  }
+  return reachable;
+}
+
+/** Does any reachable function name a `timers.*` libCall? Deliberately a
+ * string scan over the IR rather than a per-kind walk: over-approximating
+ * (a string literal spelling one of these names) costs an unused import,
+ * while missing one would be a miscompile the emitter cannot recover
+ * from. */
+function timerSurfaceReachable(mod: WModule): boolean {
+  const reachable = reachableFunctionNames(mod);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (typeof node === "string") {
+      if (node.startsWith("timers.")) found = true;
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      for (const value of Object.values(node)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn.body);
+  }
+  return found;
 }
 
 export function emitWasmModule(mod: IrModule): Uint8Array {
@@ -191,6 +263,9 @@ class Assembler {
   private readonly strType: number;
   private readonly cursorGlobal: number;
   private readonly writeFunc: number;
+  /** `tsinter.now`'s index, or null in a module that cannot arm a timer
+   * (see the prescan in the constructor). */
+  private readonly nowFunc: number | null;
   private helpers: { stage: number; putc: number; flush: number } | null = null;
   private fn!: FnState;
 
@@ -216,6 +291,16 @@ class Assembler {
       IMPORT_WRITE,
       this.mb.funcType([I32, I32, I32], []),
     );
+    // The timer runtime's clock (abi.ts). Imports occupy the FRONT of the
+    // function index space, so this decision cannot wait for the walk to
+    // discover a `timers.*` libCall — it is made by prescanning the
+    // REACHABLE functions the same generic way reachability itself is
+    // found. Over-approximating costs one unused import in a module that
+    // then refuses anyway; under-approximating would be an emitter bug,
+    // and the runtime says so by name if it ever happens.
+    this.nowFunc = timerSurfaceReachable(mod)
+      ? this.mb.importFunc(IMPORT_MODULE, IMPORT_NOW, this.mb.funcType([], [F64]))
+      : null;
     this.mb.ensureMemory(1);
     this.cursorGlobal = this.mb.addGlobal(I32, true, (w) => {
       w.u8(0x41); // i32.const 0
@@ -568,13 +653,17 @@ class Assembler {
         c.unreachable();
         c.end();
       }
-      // The event loop, such as it is: run microtasks to quiescence, then
-      // answer for any rejection nobody ever looked at. Frames still
-      // parked on a promise that never settles are simply dropped — an
-      // empty queue IS exit 0, which is what Node does with a suspended
-      // await nothing will resolve. Nothing is emitted at all when the
-      // module has no promise surface (the runtime interns on first use,
-      // so a null builder means nothing ever needed it).
+      // The first checkpoint: run microtasks to quiescence, then answer
+      // for any rejection nobody ever looked at. Frames still parked on a
+      // promise that never settles are simply dropped — an empty queue IS
+      // exit 0, which is what Node does with a suspended await nothing
+      // will resolve. Nothing is emitted at all when the module has no
+      // promise surface (the runtime interns on first use, so a null
+      // builder means nothing ever needed it).
+      //
+      // Where the program can still have macrotasks left, that is only
+      // the FIRST checkpoint: `_tick` carries the loop from here, and the
+      // host does the waiting (abi.ts).
       if (this.promsField !== null) {
         c.call(this.proms.drain());
         c.call(this.proms.report());
@@ -582,6 +671,7 @@ class Assembler {
       this.mb.setBody(start, [], c.bytes());
     }
     this.mb.exportFunc(EXPORT_ENTRY, start);
+    if (this.timersField !== null) this.mb.exportFunc(EXPORT_TICK, this.timersField.tick());
     this.mb.exportMemory(EXPORT_MEMORY);
   }
 
@@ -599,31 +689,7 @@ class Assembler {
    * "%Class.method" from two fields) are the known gap; classes refuse at
    * use today, and their edge enumeration joins with their emission. */
   private reachableFunctions(): Set<string> {
-    const names = new Set(this.mod.functions.map((f) => f.name));
-    const byName = new Map(this.mod.functions.map((f) => [f.name, f]));
-    const reachable = new Set<string>([this.mod.entry]);
-    const queue = [this.mod.entry];
-    const scan = (node: unknown): void => {
-      if (typeof node === "string") {
-        if (names.has(node) && !reachable.has(node)) {
-          reachable.add(node);
-          queue.push(node);
-        }
-        return;
-      }
-      if (Array.isArray(node)) {
-        for (const item of node) scan(item);
-        return;
-      }
-      if (node !== null && typeof node === "object") {
-        for (const value of Object.values(node)) scan(value);
-      }
-    };
-    while (queue.length > 0) {
-      const fn = byName.get(queue.pop()!);
-      if (fn !== undefined) scan(fn.body);
-    }
-    return reachable;
+    return reachableFunctionNames(this.mod);
   }
 
   /** The string valtype — nullable in every binding position (a local is
@@ -853,6 +919,34 @@ class Assembler {
    * node over a resume (the lowering types them the same way). */
   private resumeClosPair(): { clos: number; fn: number } {
     return this.closPairFor([{ kind: "ref", nullable: true, typeIndex: this.frameBaseType() }], []);
+  }
+
+  /* ── the timer runtime and the loop the host pumps (timers.ts) ────────
+   * Interned by the first `timers.*` libCall, so a module with no timer
+   * surface emits neither the runtime nor the `_tick` export — and stays
+   * byte-identical to what it compiled to before this existed. */
+
+  private timersField: TimerBuilder | null = null;
+
+  private get timers(): TimerBuilder {
+    this.timersField ??= new TimerBuilder(this.mb, {
+      voidClos: () => this.closPairFor([], []),
+      now: () => {
+        if (this.nowFunc === null) {
+          // The constructor's prescan and the walk disagreed, which can
+          // only mean the scan stopped seeing an IR shape it must see.
+          throw new Error("emitter bug: a timer was armed but tsinter.now was never imported");
+        }
+        return this.nowFunc;
+      },
+      excKind: () => this.exc().kindG,
+      checkpoint: (c) => {
+        if (this.promsField === null) return;
+        c.call(this.proms.drain());
+        c.call(this.proms.report());
+      },
+    });
+    return this.timersField;
   }
 
   /* ── unions ─────────────────────────────────────────────────────────────
@@ -2999,6 +3093,7 @@ class Assembler {
           code.call(this.errToStrHelper());
           return;
         }
+        if (this.emitTimerCall(e)) return;
         this.refuse(`libCall:${e.fn}`, e.loc);
         code.unreachable();
         return;
@@ -3957,6 +4052,83 @@ class Assembler {
     code.call(helpers.flush);
     for (const s of staged) {
       if (s !== null) this.releaseScratch(s.kind === "str" ? { kind: "ref", nullable: true, typeIndex: this.strType } : I32, s.local);
+    }
+  }
+
+  /* ── the timer surface (timers.ts) ────────────────────────────────────
+   *
+   * Each of these is one call into the emitted runtime with the IR's own
+   * arguments: callbacks arrive as `() => void` closures (the frontend
+   * adapts parameterized ones through its %timer.dropret and
+   * checked-dynamic wrappers BEFORE the libCall, so this side never sees
+   * another shape) and handles are f64 ids. Statement-position setTimeout
+   * is the one with no handle at all — nothing can clear or unref it.
+   *
+   * `timers.queueMicrotask` is deliberately absent: the microtask queue's
+   * nodes are typed for (resume, frame) pairs, and admitting a plain
+   * closure would widen that type for every async program to serve the
+   * one corpus program that asks — which asks in the `dyn` spelling
+   * anyway. It keeps refusing by name. */
+  private emitTimerCall(e: Extract<IrExpr, { kind: "libCall" }>): boolean {
+    const code = this.fn.code;
+    const call1 = (idx: number): void => {
+      this.walkExpr(e.args[0]!);
+      code.call(idx);
+    };
+    const call2 = (idx: number): void => {
+      this.walkExpr(e.args[0]!);
+      this.walkExpr(e.args[1]!);
+      code.call(idx);
+    };
+    switch (e.fn) {
+      case "timers.clearNoop":
+        // Node silently ignores a clear of anything that is not a live
+        // handle; the frontend routes only SYNTACTICALLY effect-free
+        // arguments here, so the whole call is nothing at all.
+        return true;
+      case "timers.setTimeout":
+        call2(this.timers.setTimeout());
+        return true;
+      case "timers.setTimeoutHandle":
+        call2(this.timers.setTimeoutHandle());
+        return true;
+      case "timers.setInterval":
+        call2(this.timers.setInterval());
+        return true;
+      // One id space, one removal (scr_clear_interval serves both).
+      case "timers.clearTimeout":
+      case "timers.clearInterval":
+        call1(this.timers.clear());
+        return true;
+      case "timers.unref":
+        call1(this.timers.refOp(false));
+        return true;
+      case "timers.ref":
+        call1(this.timers.refOp(true));
+        return true;
+      case "timers.hasRef":
+        call1(this.timers.hasRef());
+        return true;
+      case "timers.refresh":
+        call1(this.timers.refresh());
+        return true;
+      case "timers.setImmediate":
+        call1(this.timers.setImmediate());
+        return true;
+      case "timers.clearImmediate":
+        call1(this.timers.clearImmediate());
+        return true;
+      case "timers.immediateUnref":
+        call1(this.timers.immRefOp(false));
+        return true;
+      case "timers.immediateRef":
+        call1(this.timers.immRefOp(true));
+        return true;
+      case "timers.immediateHasRef":
+        call1(this.timers.immHasRef());
+        return true;
+      default:
+        return false;
     }
   }
 

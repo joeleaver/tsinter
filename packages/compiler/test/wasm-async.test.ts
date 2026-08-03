@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import { compile } from "../src/index.js";
+import { runWasm, runWasmToTrap } from "./wasm-host.js";
 
 let scratch: string;
 beforeAll(async () => {
@@ -33,41 +34,6 @@ async function buildWasm(name: string, source: string) {
     outDir: scratch,
     backend: "wasm",
   });
-}
-
-async function instantiate(modulePath: string) {
-  const chunks: { 1: Buffer[]; 2: Buffer[] } = { 1: [], 2: [] };
-  let memory: WebAssembly.Memory | null = null;
-  const { instance } = await WebAssembly.instantiate(readFileSync(modulePath), {
-    tsinter: {
-      write(fd: number, ptr: number, len: number): void {
-        if (memory === null) throw new Error("write before instantiation completed");
-        chunks[fd === 2 ? 2 : 1].push(Buffer.from(new Uint8Array(memory.buffer, ptr, len)));
-      },
-    },
-  });
-  memory = instance.exports["memory"] as WebAssembly.Memory;
-  return { instance, chunks };
-}
-
-async function runWasm(modulePath: string): Promise<{ stdout: string; stderr: string }> {
-  const { instance, chunks } = await instantiate(modulePath);
-  (instance.exports["_start"] as () => void)();
-  return { stdout: Buffer.concat(chunks[1]).toString("utf8"), stderr: Buffer.concat(chunks[2]).toString("utf8") };
-}
-
-/** S007/S010's bridge shape: run to an EXPECTED trap (the tier's exit-1
- * channel), returning the output that preceded it. */
-async function runWasmToTrap(modulePath: string): Promise<{ stdout: string; stderr: string }> {
-  const { instance, chunks } = await instantiate(modulePath);
-  const trap = await Promise.resolve()
-    .then(() => (instance.exports["_start"] as () => void)())
-    .then(
-      () => null,
-      (err: unknown) => err,
-    );
-  expect(trap).toBeInstanceOf(WebAssembly.RuntimeError);
-  return { stdout: Buffer.concat(chunks[1]).toString("utf8"), stderr: Buffer.concat(chunks[2]).toString("utf8") };
 }
 
 async function build(name: string, lines: string[]) {
@@ -373,6 +339,10 @@ test("a module with no promise surface emits no promise runtime", async () => {
   const bytes = readFileSync(path);
   expect(bytes.includes(Buffer.from("%w.async"))).toBe(false);
   expect(bytes.includes(Buffer.from("%frameBase"))).toBe(false);
+  // The loop half of the ABI is just as conditional: no timer, no clock
+  // import and no `_tick` export (abi.ts).
+  expect(bytes.includes(Buffer.from("_tick"))).toBe(false);
+  expect(bytes.includes(Buffer.from("%w.timer"))).toBe(false);
   const { stdout } = await runWasm(path);
   expect(stdout).toBe("plain 2\n");
 });

@@ -112,11 +112,16 @@ Node's uncaught-exception exit — while stderr carries only what the program
 itself wrote to fd 2, with no Node-style uncaught-exception report (stack
 traces are not captured; the native tier's uncaught printer writes "name:
 message" where Node writes a trace, so stderr already diverges there too).
-**Rationale:** the artifact ABI has no exit-code channel; the trap IS the
-nonzero exit. **Tested by:** corpus uncaught-throw programs (stdout before
-the throw plus exit code must match Node; the harness skips the stderr
-compare for nonzero-exit programs); the wasm emitter unit test pins the
-evaluation-order-then-trap case.
+The same holds for an exception out of a MACROTASK callback: `_tick` tests
+the cell after every timer and every immediate callback and traps there,
+and a repeating interval whose callback threw does not re-arm — the process
+is already dead, exactly as it is in Node. **Rationale:** the artifact ABI
+has no exit-code channel; the trap IS the nonzero exit. **Tested by:**
+corpus uncaught-throw programs and `1442-interval-throw` (stdout before the
+throw plus exit code must match Node; the harness skips the stderr compare
+for nonzero-exit programs); the wasm emitter unit test pins the
+evaluation-order-then-trap case and the wasm timers unit test the
+interval-callback one.
 
 ## S008 — Wasm tier: string `repeat`/`pad` size cap is 2^31 units
 
@@ -152,20 +157,37 @@ there is no byte-exact lane to compare).
 ## S010 — Wasm tier: an unhandled promise rejection reports as a trap; stderr is not Node's
 
 A promise that is REJECTED and never observed — nothing awaited it, and no
-handler ran — is reported once the microtask queue drains and `_start` has
-nothing left to do. The tier writes `Unhandled promise rejection: <reason>`
-to fd 2 (the reason rendered exactly as the native runtime's
-`scr_report_unhandled_rejections` renders it: numbers through ToString,
-booleans as `true`/`false`, strings raw, `Error`s as `name: message`) and
-then TRAPS, which the harness bridge reports as exit code 1 — Node's
-unhandled-rejection exit. Node's own stderr instead carries an
-`ERR_UNHANDLED_REJECTION` report with a stack trace, and it names the
-rejection at the first microtask checkpoint rather than at quiescence
-(indistinguishable while this tier has no macrotasks: the single drain IS
-that checkpoint). Only the FIRST unobserved rejection is reported, like
-Node and like the native lane. **Rationale:** S007's reasoning exactly — the
-artifact ABI has no exit-code channel, so the trap IS the nonzero exit, and
-stack traces are not captured on this tier. **Tested by:** the wasm async
-unit test (stdout before quiescence plus the stderr line and the trap); the
-differential corpus for the exit code (the harness skips the stderr compare
-for nonzero-exit programs).
+handler ran — is reported at the END of a microtask checkpoint: after
+`_start`'s drain, and inside `_tick` after the drain that follows every
+timer and immediate callback, which is where Node decides it too. The tier
+writes `Unhandled promise rejection: <reason>` to fd 2 (the reason rendered
+exactly as the native runtime's `scr_report_unhandled_rejections` renders
+it: numbers through ToString, booleans as `true`/`false`, strings raw,
+`Error`s as `name: message`) and then TRAPS, which the harness bridge
+reports as exit code 1 — Node's unhandled-rejection exit. Node's own stderr
+instead carries an `ERR_UNHANDLED_REJECTION` report with a stack trace.
+Only the FIRST unobserved rejection is reported, like Node and like the
+native lane. **Rationale:** S007's reasoning exactly — the artifact ABI has
+no exit-code channel, so the trap IS the nonzero exit, and stack traces are
+not captured on this tier. **Tested by:** the wasm async unit test (stdout
+before quiescence plus the stderr line and the trap); the differential
+corpus for the exit code (the harness skips the stderr compare for
+nonzero-exit programs).
+
+## S011 — `Timeout.refresh()` cannot revive a one-shot that already fired *(inherited)*
+
+`refresh()` re-arms a timer to now + its ORIGINAL delay. It works on an
+ARMED timeout or interval and on the timer whose callback is currently
+running (the common `t.refresh()`-inside-its-own-callback shape); but a
+one-shot that fired on an EARLIER turn is gone from the heap, and
+refreshing its handle is a silently tolerated no-op. Node revives it — a
+fired `Timeout` object is still live and `refresh()` puts it back on the
+clock. **Rationale:** inherited from the native tier (`scr_timer_refresh`),
+where a fired one-shot has released its callback closure and there is
+nothing left to re-arm; the compiled handle is an id into the heap, not an
+object that outlives its entry, and giving every fired timeout an
+indefinite afterlife would mean retaining every callback a program ever
+armed. **Tested by:** the corpus pins the SUPPORTED shapes
+(`1803-timeout-refresh`, refresh from inside the callback); the divergent
+one is deliberately untested — a corpus program covering it could not
+match Node on any backend.
