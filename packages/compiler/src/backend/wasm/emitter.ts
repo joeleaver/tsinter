@@ -46,19 +46,23 @@
  * implemented they move out of the grouped refusal arms into their own
  * case — the diff for one increment stays local, and the grouped arms
  * shrink to exactly the work that remains. */
-import type {
-  IrExpr,
-  IrFunction,
-  IrGlobal,
-  IrLocal,
-  IrModule,
-  IrRecordShape,
-  IrStmt,
-  IrType,
-  SrcLoc,
+import {
+  type IrExpr,
+  type IrFunction,
+  type IrGlobal,
+  type IrLocal,
+  type IrModule,
+  type IrRecordShape,
+  type IrStmt,
+  type IrType,
+  type IrUnionDef,
+  type SrcLoc,
+  isUnitType,
+  typeEquals,
 } from "../../ir/nodes.js";
 import { EXPORT_ENTRY, EXPORT_MEMORY, FD_STDERR, FD_STDOUT, IMPORT_MODULE, IMPORT_WRITE } from "./abi.js";
 import { VecBuilder, type VecInfo } from "./arrays.js";
+import { UnionBuilder, type UnionArmRep } from "./unions.js";
 import { Code } from "./code.js";
 import { buildF64ToStr } from "./numfmt.js";
 import { F64, I32, I64, ModuleBuilder, type ValType } from "./module.js";
@@ -120,6 +124,9 @@ interface FnState {
    * `depth` at which the target's label was opened. `continuePos` is null
    * for the targets `continue` skips (switch, labeled blocks). */
   control: { kind: "loop" | "switch" | "block"; labels: string[]; breakPos: number; continuePos: number | null }[];
+  /** Active optional chains: chain id → the local holding the narrowed
+   * receiver, read by chainRecv inside the chain's body. */
+  chainBinds: Map<string, number>;
 }
 
 /* ── the assembler: one walk, both sinks ───────────────────────────────── */
@@ -127,6 +134,7 @@ interface FnState {
 class Assembler {
   private readonly mb = new ModuleBuilder();
   private readonly globalById = new Map<string, IrGlobal>();
+  private readonly unionsById = new Map<string, IrUnionDef>();
   private readonly globalWasmIndex = new Map<string, number>();
   private readonly funcIndexByName = new Map<string, number>();
   private readonly funcByName = new Map<string, IrFunction>();
@@ -165,6 +173,7 @@ class Assembler {
     });
     for (const g of mod.globals ?? []) this.globalById.set(g.id, g);
     for (const r of mod.records ?? []) this.recordShapes.set(r.id, r);
+    for (const u of mod.unions ?? []) this.unionsById.set(u.id, u);
   }
 
   run(): void {
@@ -408,6 +417,118 @@ class Assembler {
     );
   }
 
+  /* ── unions ─────────────────────────────────────────────────────────────
+   * One shared open base struct { tag } every payload arm subtypes with
+   * { tag, payload } (unions.ts). A union value is (ref null base)
+   * EVERYWHERE — mapType never refuses a union type; arms gate at the
+   * sites that read or build their payloads. The dispatch helpers
+   * (ToBoolean / equality / ToString) intern per union, and the emitter
+   * resolves each arm's representation first so refusals for arms a
+   * helper genuinely needs stay in the census with honest names. */
+
+  private unionsField: UnionBuilder | null = null;
+
+  private get unions(): UnionBuilder {
+    this.unionsField ??= new UnionBuilder(this.mb, {
+      strEq: () => this.strEqHelper(),
+      f64ToStr: () => this.f64ToStrHelper(),
+      strRef: () => this.strRef,
+      lit: (c, s) => this.pushStrLitInto(c, s),
+    });
+    return this.unionsField;
+  }
+
+  private unionDef(unionId: string): IrUnionDef {
+    const def = this.unionsById.get(unionId);
+    if (def === undefined) throw new Error(`unknown union ${unionId}`);
+    return def;
+  }
+
+  /** The payload subtype for one (union, arm) — null (refusal recorded)
+   * when the ARM's representation is out of tier. */
+  private unionArmStruct(unionId: string, tag: number, loc: SrcLoc | undefined): number | null {
+    const def = this.unionDef(unionId);
+    const arm = def.arms[tag];
+    if (arm === undefined) throw new Error(`union ${unionId} has no arm ${tag}`);
+    const val = this.mapType(arm, loc);
+    if (val === null) return null;
+    return this.unions.armStruct(unionId, tag, val);
+  }
+
+  /** Resolves every arm for one dispatch helper, gating exactly the arms
+   * whose PAYLOAD that helper reads: truthiness reads scalar/string
+   * payloads only (object arms are just true — a class-armed union still
+   * truth-tests in-tier), equality reads every non-unit payload (ref-arm
+   * identity), ToString is frontend-fenced to unit/string/f64/bool arms
+   * (bytes, which the C runtime formats, refuses with its own tag). */
+  private unionArmReps(unionId: string, need: "truthy" | "eq" | "toStr", loc: SrcLoc | undefined): UnionArmRep[] | null {
+    const def = this.unionDef(unionId);
+    const reps: UnionArmRep[] = [];
+    for (let i = 0; i < def.arms.length; i++) {
+      const arm = def.arms[i]!;
+      if (arm.kind === "undefinedT" || arm.kind === "nullT") {
+        reps.push({ kind: arm.kind === "undefinedT" ? "undefined" : "null", struct: null });
+        continue;
+      }
+      if (arm.kind === "f64" || arm.kind === "bool" || arm.kind === "string") {
+        // Scalar/string arms always map; the struct is never null here.
+        reps.push({ kind: arm.kind, struct: this.unionArmStruct(unionId, i, loc) });
+        continue;
+      }
+      if (need === "toStr") {
+        // The frontend fences union ToString to unit/string/f64/bool
+        // arms plus bytes (scr_bytes_to_str's surface — not in tier).
+        if (arm.kind === "bytes") {
+          this.refuse("toString:union-arm:bytes", loc);
+          return null;
+        }
+        throw new Error(`ToString over a union ${arm.kind} arm (frontend fence breached)`);
+      }
+      if (need === "truthy") {
+        // Every object arm is truthy without a payload read — except
+        // jsval, whose truthiness asks the engine.
+        if (arm.kind === "jsval") {
+          this.refuse("type:jsval", loc);
+          return null;
+        }
+        reps.push({ kind: "ref", struct: null });
+        continue;
+      }
+      // eq: ref-arm pointer identity needs the payload representation.
+      const struct = this.unionArmStruct(unionId, i, loc);
+      if (struct === null) return null;
+      reps.push({ kind: "ref", struct });
+    }
+    return reps;
+  }
+
+  private unionTruthyHelper(unionId: string, loc: SrcLoc | undefined): number | null {
+    const reps = this.unionArmReps(unionId, "truthy", loc);
+    return reps === null ? null : this.unions.truthy(unionId, reps);
+  }
+
+  private unionEqHelper(unionId: string, sameValue: boolean, loc: SrcLoc | undefined): number | null {
+    const reps = this.unionArmReps(unionId, "eq", loc);
+    return reps === null ? null : this.unions.eq(unionId, reps, sameValue);
+  }
+
+  private unionToStrHelper(unionId: string, loc: SrcLoc | undefined): number | null {
+    const reps = this.unionArmReps(unionId, "toStr", loc);
+    return reps === null ? null : this.unions.toStr(unionId, reps);
+  }
+
+  /** The tag of `t` among a union's canonical arms (typeEquals — ids for
+   * records/unions, structure for the rest), or -1. */
+  private unionArmTag(unionId: string, t: IrType): number {
+    return this.unionDef(unionId).arms.findIndex((a) => typeEquals(a, t));
+  }
+
+  /** The undefined arm's tag — the optional-chain short-circuit value and
+   * the pop/shift empty answer both need it. */
+  private undefinedArmTag(unionId: string): number {
+    return this.unionDef(unionId).arms.findIndex((a) => a.kind === "undefinedT");
+  }
+
   /* ── types ──────────────────────────────────────────────────────────── */
 
   /** The tier's value representations: f64 as itself, bool as i32, string
@@ -436,6 +557,11 @@ class Assembler {
         const info = this.recordInfo(t.shapeId, loc, false);
         return info === null ? null : { kind: "ref", nullable: true, typeIndex: info.struct };
       }
+      case "union":
+        // Every union VALUE is a ref to the one shared base — refusal at
+        // use taken to arms: holding/passing a union never needs an arm's
+        // representation, so the gate sits on wrap/narrow/dispatch sites.
+        return this.unions.baseRef();
       default:
         this.refuse(`type:${t.kind}`, loc);
         return null;
@@ -465,7 +591,8 @@ class Assembler {
           t.elem.kind === "string" ||
           t.elem.kind === "array" ||
           t.elem.kind === "func" ||
-          t.elem.kind === "record";
+          t.elem.kind === "record" ||
+          t.elem.kind === "union";
         if (!mappable) return I32;
         const kind =
           t.elem.kind === "f64" ? "f64"
@@ -487,6 +614,10 @@ class Assembler {
         const info = this.recordInfo(t.shapeId, undefined, true);
         return info === null ? I32 : { kind: "ref", nullable: true, typeIndex: info.struct };
       }
+      case "union":
+        // mapType never fails on unions, so the soft map must answer the
+        // same base ref (the consistency rule).
+        return this.unions.baseRef();
       default:
         return I32;
     }
@@ -538,6 +669,7 @@ class Assembler {
       scratchFree: new Map(),
       depth: 0,
       control: [],
+      chainBinds: new Map(),
     };
 
     // Prologue 1: re-box captured params.
@@ -1244,8 +1376,17 @@ class Assembler {
           this.releaseScratch(t, s);
           return;
         }
-        // Union operands wait on the union representation (the per-arm
-        // ToBoolean helper comes with it).
+        if (k === "union") {
+          // The ARM value's ToBoolean via the per-union interned helper.
+          const h = this.unionTruthyHelper(e.operand.type.unionId, e.loc);
+          if (h === null) {
+            code.unreachable();
+            return;
+          }
+          this.walkExpr(e.operand);
+          code.call(h);
+          return;
+        }
         this.refuse(`toBool:${k}`, e.loc);
         code.unreachable();
         return;
@@ -1253,6 +1394,30 @@ class Assembler {
 
       case "logical": {
         const k = e.type.kind;
+        if (k === "union") {
+          // Same value semantics with the per-union truthy helper as the
+          // test; both operands carry the union type.
+          const h = this.unionTruthyHelper(e.type.unionId, e.loc);
+          if (h === null) {
+            code.unreachable();
+            return;
+          }
+          const t = this.unions.baseRef();
+          this.walkExpr(e.left);
+          const s = this.acquireScratch(t);
+          code.localSet(s);
+          code.localGet(s);
+          code.call(h);
+          this.openIfResult(t);
+          if (e.op === "&&") this.walkExpr(e.right);
+          else code.localGet(s);
+          code.else_();
+          if (e.op === "&&") code.localGet(s);
+          else this.walkExpr(e.right);
+          this.close();
+          this.releaseScratch(t, s);
+          return;
+        }
         if (k !== "f64" && k !== "string" && k !== "bool") {
           this.refuse(`logical:${k}`, e.loc);
           code.unreachable();
@@ -1461,10 +1626,447 @@ class Assembler {
           this.close();
           return;
         }
-        // Union operands dispatch per-arm, caught operands snapshot —
-        // both wait on their representations.
+        if (k === "union") {
+          // The ARM value's ToString via the per-union interned helper
+          // (arms frontend-fenced to unit/string/f64/bool).
+          const h = this.unionToStrHelper(e.operand.type.unionId, e.loc);
+          if (h === null) {
+            code.unreachable();
+            return;
+          }
+          this.walkExpr(e.operand);
+          code.call(h);
+          return;
+        }
+        // Caught operands snapshot — waits on the exception protocol.
         this.refuse(`toString:${k}`, e.loc);
         code.unreachable();
+        return;
+      }
+
+      /* ── tagged unions (see the unions block above walkFunction) ─────── */
+
+      case "unionWrap": {
+        const vt = e.value.type;
+        if (isUnitType(vt)) {
+          // No payload and no evaluation: a unit-typed value is a pure
+          // unitLit (the frontend's slot contract) — every wrap yields
+          // THE interned immortal instance for the tag.
+          code.globalGet(this.unions.unitGlobal(e.tag));
+          return;
+        }
+        if (vt.kind === "void") {
+          // A void call flowing into an undefined arm: effects first,
+          // then the interned instance.
+          this.walkExpr(e.value);
+          code.globalGet(this.unions.unitGlobal(e.tag));
+          return;
+        }
+        const st = this.unionArmStruct(e.unionId, e.tag, e.loc);
+        if (st === null) {
+          code.unreachable();
+          return;
+        }
+        code.i32Const(e.tag);
+        this.walkExpr(e.value);
+        code.structNew(st);
+        return;
+      }
+
+      case "unionNarrow": {
+        // Tag-UNCHECKED extraction — the frontend emits this only under
+        // tsc's proof, and the cast can only fail on a frontend bug (it
+        // traps loudly rather than misreading).
+        const st = this.unionArmStruct(e.unionId, e.tag, e.loc);
+        if (st === null) {
+          code.unreachable();
+          return;
+        }
+        this.walkExpr(e.value);
+        code.refCast(st);
+        code.structGet(st, 1);
+        return;
+      }
+
+      case "unionIsTag": {
+        this.walkExpr(e.value);
+        code.structGet(this.unions.base(), 0);
+        code.i32Const(e.tag);
+        if (e.negated) code.i32Ne();
+        else code.i32Eq();
+        return;
+      }
+
+      case "unionEq": {
+        const h = this.unionEqHelper(e.unionId, e.sameValue, e.loc);
+        if (h === null) {
+          code.unreachable();
+          return;
+        }
+        this.walkExpr(e.left);
+        this.walkExpr(e.right);
+        code.call(h);
+        if (e.negated) code.i32Eqz();
+        return;
+      }
+
+      case "unionDisc": {
+        // Shared-field read: switch on the tag, read the (same-typed)
+        // field from the concretely-cast payload. Every arm resolves
+        // BEFORE any emission — one out-of-tier arm refuses the whole
+        // read, never partial code.
+        const def = this.unionDef(e.unionId);
+        const rt = this.mapType(e.type, e.loc);
+        if (rt === null) {
+          code.unreachable();
+          return;
+        }
+        const plan: { struct: number; rec: number; field: number }[] = [];
+        for (let i = 0; i < def.arms.length; i++) {
+          const armT = def.arms[i]!;
+          if (armT.kind !== "record") {
+            // Class (object) arms wait on class objects.
+            this.refuse(`unionDisc:arm:${armT.kind}`, e.loc);
+            code.unreachable();
+            return;
+          }
+          const info = this.recordInfo(armT.shapeId, e.loc, false);
+          const st = this.unionArmStruct(e.unionId, i, e.loc);
+          if (info === null || st === null) {
+            code.unreachable();
+            return;
+          }
+          const field = info.fieldIndex.get(e.field);
+          if (field === undefined) throw new Error(`unionDisc field ${e.field} not on shape ${armT.shapeId}`);
+          plan.push({ struct: st, rec: info.struct, field });
+        }
+        const u = this.acquireScratch(this.unions.baseRef());
+        this.walkExpr(e.value);
+        code.localSet(u);
+        const t = this.acquireScratch(I32);
+        code.localGet(u);
+        code.structGet(this.unions.base(), 0);
+        code.localSet(t);
+        // Nested if-chain over tags; the innermost else is the
+        // corrupted-tag trap (loud, like the C backend's default case).
+        for (const [i, p] of plan.entries()) {
+          code.localGet(t);
+          code.i32Const(i);
+          code.i32Eq();
+          this.openIfResult(rt);
+          code.localGet(u);
+          code.refCast(p.struct);
+          code.structGet(p.struct, 1);
+          code.structGet(p.rec, p.field);
+          code.else_();
+        }
+        code.unreachable();
+        for (let i = 0; i < plan.length; i++) this.close();
+        this.releaseScratch(I32, t);
+        this.releaseScratch(this.unions.baseRef(), u);
+        return;
+      }
+
+      case "unionKeyGet": {
+        // The unionDisc generalization: per arm, a statically-resolved
+        // answer at the JOIN type — a declared literal field reads its
+        // slot (wrapping an arm-typed answer into the join), a unit arm
+        // answers the join's interned undefined arm. Index-signature
+        // shapes refuse at recordInfo; runtime keys and array arms wait
+        // on their machinery.
+        const def = this.unionDef(e.unionId);
+        const rt = this.mapType(e.type, e.loc);
+        if (rt === null) {
+          code.unreachable();
+          return;
+        }
+        const resultUnionId = e.type.kind === "union" ? e.type.unionId : null;
+        const literal = e.key.kind === "strLit" ? e.key.value : null;
+        type ArmPlan =
+          | { kind: "unit"; global: number }
+          | { kind: "read"; struct: number; rec: number; field: number; wrap: { tag: number; struct: number } | null };
+        const plan: ArmPlan[] = [];
+        for (let i = 0; i < def.arms.length; i++) {
+          const armT = def.arms[i]!;
+          if (isUnitType(armT)) {
+            // The optional-chain tail's short-circuit: undefined.
+            if (resultUnionId === null) throw new Error("unionKeyGet unit arm without a union result");
+            const utag = this.undefinedArmTag(resultUnionId);
+            if (utag < 0) throw new Error("unionKeyGet unit arm without an undefined result arm");
+            plan.push({ kind: "unit", global: this.unions.unitGlobal(utag) });
+            continue;
+          }
+          if (armT.kind === "array") {
+            // The string-key → element-index runtime path is not in tier.
+            this.refuse("unionKeyGet:arm:array", e.loc);
+            code.unreachable();
+            return;
+          }
+          if (armT.kind !== "record") throw new Error(`unionKeyGet arm of kind ${armT.kind}`);
+          const shape = this.recordShapes.get(armT.shapeId);
+          if (shape === undefined) throw new Error(`unknown record shape ${armT.shapeId}`);
+          const declared = literal !== null ? shape.fields.find((f) => f.name === literal) : undefined;
+          if (declared === undefined) {
+            // A runtime key (or a literal touching only the overflow
+            // map) rides the keyed-read helper machinery.
+            this.refuse("unionKeyGet:keyed-read", e.loc);
+            code.unreachable();
+            return;
+          }
+          const info = this.recordInfo(armT.shapeId, e.loc, false);
+          const st = this.unionArmStruct(e.unionId, i, e.loc);
+          if (info === null || st === null) {
+            code.unreachable();
+            return;
+          }
+          const field = info.fieldIndex.get(declared.name);
+          if (field === undefined) throw new Error(`unionKeyGet field ${declared.name} not on shape ${armT.shapeId}`);
+          if (typeEquals(declared.type, e.type)) {
+            plan.push({ kind: "read", struct: st, rec: info.struct, field, wrap: null });
+            continue;
+          }
+          if (resultUnionId === null || isUnitType(declared.type)) {
+            throw new Error(`unionKeyGet arm answer ${declared.type.kind} outside the join`);
+          }
+          const wtag = this.unionArmTag(resultUnionId, declared.type);
+          if (wtag < 0) throw new Error(`unionKeyGet arm answer ${declared.type.kind} outside the join`);
+          const wstruct = this.unionArmStruct(resultUnionId, wtag, e.loc);
+          if (wstruct === null) {
+            code.unreachable();
+            return;
+          }
+          plan.push({ kind: "read", struct: st, rec: info.struct, field, wrap: { tag: wtag, struct: wstruct } });
+        }
+        // The key evaluates ONCE, before the switch — its effects are
+        // owed even though every in-tier answer resolves statically.
+        this.walkExpr(e.key);
+        code.drop();
+        const u = this.acquireScratch(this.unions.baseRef());
+        this.walkExpr(e.value);
+        code.localSet(u);
+        const t = this.acquireScratch(I32);
+        code.localGet(u);
+        code.structGet(this.unions.base(), 0);
+        code.localSet(t);
+        for (const [i, p] of plan.entries()) {
+          code.localGet(t);
+          code.i32Const(i);
+          code.i32Eq();
+          this.openIfResult(rt);
+          if (p.kind === "unit") {
+            code.globalGet(p.global);
+          } else {
+            if (p.wrap !== null) code.i32Const(p.wrap.tag);
+            code.localGet(u);
+            code.refCast(p.struct);
+            code.structGet(p.struct, 1);
+            code.structGet(p.rec, p.field);
+            if (p.wrap !== null) code.structNew(p.wrap.struct);
+          }
+          code.else_();
+        }
+        code.unreachable();
+        for (let i = 0; i < plan.length; i++) this.close();
+        this.releaseScratch(I32, t);
+        this.releaseScratch(this.unions.baseRef(), u);
+        return;
+      }
+
+      case "nullish": {
+        // `a ?? b`: the left's runtime TAG against its unit arms as the
+        // test (JS-exact — 0/""/false do NOT take the right side); the
+        // right runs lazily. Pass-through answers the left box itself;
+        // the narrowed shape extracts the single non-unit arm's payload
+        // under the checker's proof.
+        const lt = e.left.type;
+        if (lt.kind !== "union") {
+          // jsval/dyn lefts wait on their representations.
+          this.refuse(`nullish:${lt.kind}`, e.loc);
+          code.unreachable();
+          return;
+        }
+        const def = this.unionDef(lt.unionId);
+        const unitTags = def.arms.flatMap((a, i) => (isUnitType(a) ? [i] : []));
+        if (unitTags.length === 0) throw new Error("nullish union lacks unit arms");
+        const rt = this.mapType(e.type, e.loc);
+        if (rt === null) {
+          code.unreachable();
+          return;
+        }
+        const passThrough = typeEquals(e.type, lt);
+        let narrow: number | null = null;
+        if (!passThrough) {
+          const tag = this.unionArmTag(lt.unionId, e.type);
+          if (tag < 0) throw new Error("nullish narrowed outside the union");
+          narrow = this.unionArmStruct(lt.unionId, tag, e.loc);
+          if (narrow === null) {
+            code.unreachable();
+            return;
+          }
+        }
+        const u = this.acquireScratch(this.unions.baseRef());
+        this.walkExpr(e.left);
+        code.localSet(u);
+        const t = this.acquireScratch(I32);
+        code.localGet(u);
+        code.structGet(this.unions.base(), 0);
+        code.localSet(t);
+        unitTags.forEach((tag, i) => {
+          code.localGet(t);
+          code.i32Const(tag);
+          code.i32Eq();
+          if (i > 0) code.i32Or();
+        });
+        this.openIfResult(rt);
+        this.walkExpr(e.right);
+        code.else_();
+        if (passThrough) {
+          code.localGet(u);
+        } else {
+          code.localGet(u);
+          code.refCast(narrow!);
+          code.structGet(narrow!, 1);
+        }
+        this.close();
+        this.releaseScratch(I32, t);
+        this.releaseScratch(this.unions.baseRef(), u);
+        return;
+      }
+
+      case "orDefault": {
+        // `u || d` — nullish's dance with the per-union TRUTHY helper as
+        // the test. The truthy side extracts the single non-unit arm, or
+        // hands the whole box to the frontend's union→union retag helper
+        // (an ordinary IR function; its body walks like any other).
+        const lt = e.left.type;
+        if (lt.kind !== "union") throw new Error("orDefault left is not a union");
+        const h = this.unionTruthyHelper(lt.unionId, e.loc);
+        const rt = this.mapType(e.type, e.loc);
+        if (h === null || rt === null) {
+          code.unreachable();
+          return;
+        }
+        let retag: { index: number; clos: number } | null = null;
+        let narrow: number | null = null;
+        if (e.retag !== undefined) {
+          const callee = this.funcByName.get(e.retag);
+          const index = this.funcIndexByName.get(e.retag);
+          if (callee === undefined || index === undefined) {
+            throw new Error(`orDefault retag helper "${e.retag}" not in module`);
+          }
+          retag = { index, clos: this.fnClosPair(callee).clos };
+        } else {
+          const tag = this.unionArmTag(lt.unionId, e.type);
+          if (tag < 0) throw new Error("orDefault narrowed outside the union");
+          narrow = this.unionArmStruct(lt.unionId, tag, e.loc);
+          if (narrow === null) {
+            code.unreachable();
+            return;
+          }
+        }
+        const u = this.acquireScratch(this.unions.baseRef());
+        this.walkExpr(e.left);
+        code.localSet(u);
+        code.localGet(u);
+        code.call(h);
+        this.openIfResult(rt);
+        if (retag !== null) {
+          code.refNull(retag.clos);
+          code.localGet(u);
+          code.call(retag.index);
+        } else {
+          code.localGet(u);
+          code.refCast(narrow!);
+          code.structGet(narrow!, 1);
+        }
+        code.else_();
+        this.walkExpr(e.right);
+        this.close();
+        this.releaseScratch(this.unions.baseRef(), u);
+        return;
+      }
+
+      case "optChain": {
+        // `a?.b`: the receiver (a unit-armed union with ONE non-unit arm)
+        // evaluates once; a unit tag short-circuits to the result's
+        // interned undefined arm WITHOUT evaluating the body (argument
+        // effects included); otherwise the narrowed receiver binds to the
+        // chain id and the body produces the result.
+        const recvT = e.receiver.type;
+        if (recvT.kind !== "union") {
+          // jsval/dyn receivers (the `any`/`unknown` chain forms) wait on
+          // their representations.
+          this.refuse(`optChain:${recvT.kind}`, e.loc);
+          code.unreachable();
+          return;
+        }
+        const def = this.unionDef(recvT.unionId);
+        const unitTags = def.arms.flatMap((a, i) => (isUnitType(a) ? [i] : []));
+        const nonUnit = def.arms.findIndex((a) => !isUnitType(a));
+        if (unitTags.length === 0 || nonUnit < 0) throw new Error("optChain receiver union shape");
+        const armVal = this.mapType(def.arms[nonUnit]!, e.loc);
+        const recvStruct = this.unionArmStruct(recvT.unionId, nonUnit, e.loc);
+        if (armVal === null || recvStruct === null) {
+          code.unreachable();
+          return;
+        }
+        const isVoid = e.type.kind === "void";
+        let resultT: ValType | null = null;
+        let shortGlobal = -1;
+        if (!isVoid) {
+          if (e.type.kind !== "union") throw new Error("optChain result is not a union");
+          const utag = this.undefinedArmTag(e.type.unionId);
+          if (utag < 0) throw new Error("optChain result union lacks an undefined arm");
+          resultT = this.unions.baseRef();
+          shortGlobal = this.unions.unitGlobal(utag);
+        }
+        const u = this.acquireScratch(this.unions.baseRef());
+        this.walkExpr(e.receiver);
+        code.localSet(u);
+        const t = this.acquireScratch(I32);
+        code.localGet(u);
+        code.structGet(this.unions.base(), 0);
+        code.localSet(t);
+        unitTags.forEach((tag, i) => {
+          code.localGet(t);
+          code.i32Const(tag);
+          code.i32Eq();
+          if (i > 0) code.i32Or();
+        });
+        const bind = this.acquireScratch(armVal);
+        const emitBind = (): void => {
+          code.localGet(u);
+          code.refCast(recvStruct);
+          code.structGet(recvStruct, 1);
+          code.localSet(bind);
+          this.fn.chainBinds.set(e.id, bind);
+          this.walkExpr(e.body);
+          this.fn.chainBinds.delete(e.id);
+        };
+        if (isVoid) {
+          // The `cb?.()` statement form: run the body only off the unit
+          // tags, no value.
+          code.i32Eqz();
+          this.openIf();
+          emitBind();
+          this.close();
+        } else {
+          this.openIfResult(resultT!);
+          code.globalGet(shortGlobal);
+          code.else_();
+          emitBind();
+          this.close();
+        }
+        this.releaseScratch(armVal, bind);
+        this.releaseScratch(I32, t);
+        this.releaseScratch(this.unions.baseRef(), u);
+        return;
+      }
+
+      case "chainRecv": {
+        const bind = this.fn.chainBinds.get(e.id);
+        if (bind === undefined) throw new Error(`chainRecv outside its chain ("${e.id}")`);
+        code.localGet(bind);
         return;
       }
 
@@ -1501,24 +2103,27 @@ class Assembler {
        * that bucket would top the queue forever while saying nothing about
        * what to implement; the member name IS the work item. */
       case "libCall":
+        if (e.fn === "insp.f64") {
+          // util.inspect's one number-ism (scr_insp_f64): JS ToString
+          // except -0 prints "-0" — console.log's number formatting,
+          // reached through the frontend's per-union format helpers.
+          this.walkExpr(e.args[0]!);
+          code.call(this.inspF64Helper());
+          return;
+        }
         this.refuse(`libCall:${e.fn}`, e.loc);
         code.unreachable();
         return;
 
-      /* Unit values exist only inside unions; fieldIncDec with class
-       * fields; nullish/orDefault are union-shaped (their tests read the
-       * arm tag). */
+      /* Unit values exist only inside unions (unionWrap intercepts them
+       * before the walk, so a reached unitLit is refused loudly);
+       * fieldIncDec waits on class fields. */
       case "unitLit":
       case "fieldIncDec":
-      case "nullish":
-      case "orDefault":
       /* templateStrings is the tagged-template strings OBJECT (string[]);
        * strIntrinsic is the UTF-16-exact method surface. */
       case "templateStrings":
       case "strIntrinsic":
-      /* Optional chaining's two halves (the receiver stash and the guard). */
-      case "optChain":
-      case "chainRecv":
       /* Regex — a whole engine, host-imported or compiled. */
       case "regexLit":
       case "regexIntrinsic":
@@ -1554,13 +2159,6 @@ class Assembler {
       /* The dynamic-keyed record surface rides the overflow map. */
       case "recordKeyGet":
       case "recordOvfKeys":
-      /* Tagged unions. */
-      case "unionWrap":
-      case "unionNarrow":
-      case "unionDisc":
-      case "unionKeyGet":
-      case "unionIsTag":
-      case "unionEq":
       /* Caught-exception snapshots. */
       case "caughtTest":
       case "caughtNarrow":
@@ -1665,7 +2263,11 @@ class Assembler {
 
   /** A DISTINCT key per element representation — `func` keys by the
    * signature's closure type index and `record` by shape id, or two
-   * different func-element arrays would intern one (wrong) vector type. */
+   * different func-element arrays would intern one (wrong) vector type.
+   * `union` deliberately stays ONE key (the default arm): every union
+   * value is a ref to the one shared base, so one vector type and one
+   * ref.eq helper family serve every union-element array — the C lane's
+   * pointer-identity stance for union elements, shared. */
   private vecKeyFor(t: IrType): string {
     switch (t.kind) {
       case "array":
@@ -1899,12 +2501,104 @@ class Assembler {
         else code.f64Const(Infinity);
         code.call(this.vecs.splice(info));
         return;
-      /* pop and shift yield `elem | undefined` unions — they join with
-       * the union representation; `with` throws a catchable RangeError —
-       * it joins with the exception protocol; the ES2023 copiers are
-       * tail work. */
-      case "pop":
-      case "shift":
+      case "pop": {
+        // The ELEMENT itself — the frontend types pop as elem, and the
+        // empty pop throws RangeError instead of answering undefined
+        // (SEMANTICS.md S006; the trap is S003's exit-1 bridge until the
+        // exception protocol lands).
+        const vec = this.acquireScratch(this.vecs.vecRef(info));
+        this.walkExpr(e.receiver);
+        code.localSet(vec);
+        const len = this.acquireScratch(I32);
+        code.localGet(vec);
+        code.structGet(info.struct, 0);
+        code.localSet(len);
+        code.localGet(len);
+        code.i32Eqz();
+        this.openIf();
+        code.unreachable();
+        this.close();
+        const es = this.acquireScratch(info.elemVal);
+        code.localGet(vec);
+        code.structGet(info.struct, 1);
+        code.localGet(len);
+        code.i32Const(1);
+        code.i32Sub();
+        this.vecs.emitElemRead(code, info);
+        code.localSet(es);
+        code.localGet(vec);
+        code.localGet(len);
+        code.i32Const(1);
+        code.i32Sub();
+        code.structSet(info.struct, 0);
+        this.clearVacatedSlot(info, vec, len);
+        code.localGet(es);
+        this.releaseScratch(info.elemVal, es);
+        this.releaseScratch(I32, len);
+        this.releaseScratch(this.vecs.vecRef(info), vec);
+        return;
+      }
+      case "shift": {
+        // `elem | undefined` — undefined on an empty array (JS-exact),
+        // else the first element with the tail sliding down. Union
+        // elements are frontend-fenced (their shift result would collapse
+        // arms), so the wrap below is always a plain arm.
+        if (e.type.kind !== "union") throw new Error("shift result is not a union");
+        const undefTag = this.undefinedArmTag(e.type.unionId);
+        const elemTag = this.unionArmTag(e.type.unionId, rt.elem);
+        if (undefTag < 0 || elemTag < 0) throw new Error("shift result union shape");
+        const st = this.unionArmStruct(e.type.unionId, elemTag, e.loc);
+        if (st === null) {
+          code.unreachable();
+          return;
+        }
+        const vec = this.acquireScratch(this.vecs.vecRef(info));
+        this.walkExpr(e.receiver);
+        code.localSet(vec);
+        const len = this.acquireScratch(I32);
+        code.localGet(vec);
+        code.structGet(info.struct, 0);
+        code.localSet(len);
+        code.localGet(len);
+        code.i32Eqz();
+        this.openIfResult(this.unions.baseRef());
+        // Empty: undefined, and NO length write (JS-exact).
+        code.globalGet(this.unions.unitGlobal(undefTag));
+        code.else_();
+        const es = this.acquireScratch(info.elemVal);
+        code.localGet(vec);
+        code.structGet(info.struct, 1);
+        code.i32Const(0);
+        this.vecs.emitElemRead(code, info);
+        code.localSet(es);
+        // Slide [1, len) down one.
+        code.localGet(vec);
+        code.structGet(info.struct, 1);
+        code.i32Const(0);
+        code.localGet(vec);
+        code.structGet(info.struct, 1);
+        code.i32Const(1);
+        code.localGet(len);
+        code.i32Const(1);
+        code.i32Sub();
+        code.arrayCopy(info.bufType, info.bufType);
+        code.localGet(vec);
+        code.localGet(len);
+        code.i32Const(1);
+        code.i32Sub();
+        code.structSet(info.struct, 0);
+        this.clearVacatedSlot(info, vec, len);
+        code.i32Const(elemTag);
+        code.localGet(es);
+        code.structNew(st);
+        this.releaseScratch(info.elemVal, es);
+        this.close();
+        this.releaseScratch(I32, len);
+        this.releaseScratch(this.vecs.vecRef(info), vec);
+        return;
+      }
+      /* `with` throws a catchable RangeError — it joins with the
+       * exception protocol; the ES2023 copiers are tail work. */
       case "toReversed":
       case "toSpliced":
       case "with":
@@ -1917,6 +2611,21 @@ class Assembler {
         code.unreachable();
       }
     }
+  }
+
+  /** Clears buf[len - 1] after a pop/shift (ref elements only): the
+   * vacated slot would otherwise keep the removed element alive until a
+   * push overwrites it. `vec` holds the vector, `len` the OLD length. */
+  private clearVacatedSlot(info: VecInfo, vec: number, len: number): void {
+    if (!info.refElem || info.elemVal.kind !== "ref") return;
+    const code = this.fn.code;
+    code.localGet(vec);
+    code.structGet(info.struct, 1);
+    code.localGet(len);
+    code.i32Const(1);
+    code.i32Sub();
+    code.refNull(info.elemVal.typeIndex);
+    code.arraySet(info.bufType);
   }
 
   /** Pushes the JS ToBoolean of the value in scratch local `s`. f64 is
@@ -2015,21 +2724,7 @@ class Assembler {
         // Numbers format eagerly and stage as strings — via inspect's one
         // number-ism, exactly scr_console.c: console.log distinguishes -0
         // (String(-0) is "0", console.log(-0) prints "-0").
-        if (t === "f64") {
-          const xs = this.acquireScratch(F64);
-          code.localSet(xs);
-          code.localGet(xs);
-          code.i64ReinterpretF64();
-          code.i64Const(BigInt.asIntN(64, 1n << 63n));
-          code.i64Eq();
-          this.openIfResult(this.strRef);
-          this.pushStrLit("-0");
-          code.else_();
-          code.localGet(xs);
-          code.call(this.f64ToStrHelper());
-          this.close();
-          this.releaseScratch(F64, xs);
-        }
+        if (t === "f64") code.call(this.inspF64Helper());
         const local = this.acquireScratch({ kind: "ref", nullable: true, typeIndex: this.strType });
         code.localSet(local);
         staged.push({ kind: "str", local });
@@ -2384,6 +3079,30 @@ class Assembler {
   private f64ToStrHelper(): number {
     this.f64ToStrFunc ??= buildF64ToStr(this.mb, this.strType, this.strRef);
     return this.f64ToStrFunc;
+  }
+
+  private inspF64Func: number | null = null;
+
+  /** %w.inspF64(f64) → str — util.inspect's one number-ism (scr_insp_f64):
+   * JS ToString except -0 prints "-0". Console number formatting, both
+   * for direct f64 args and through the per-union format helpers. */
+  private inspF64Helper(): number {
+    if (this.inspF64Func !== null) return this.inspF64Func;
+    const idx = this.mb.declareFunc(this.mb.funcType([F64], [this.strRef]), "%w.inspF64");
+    this.inspF64Func = idx;
+    const c = new Code();
+    c.localGet(0);
+    c.i64ReinterpretF64();
+    c.i64Const(BigInt.asIntN(64, 1n << 63n));
+    c.i64Eq();
+    c.ifResult(this.strRef);
+    this.pushStrLitInto(c, "-0");
+    c.else_();
+    c.localGet(0);
+    c.call(this.f64ToStrHelper());
+    c.end();
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
   }
 
   private toInt32Func: number | null = null;

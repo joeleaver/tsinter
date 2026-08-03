@@ -77,3 +77,20 @@ inherited stance; code-point order is arguably saner and the divergent
 range is exotic. **Tested by:** the wasm emitter unit test pins one
 divergent-range comparison against this entry; corpus programs stay outside
 the divergent range (they must, to pass the Node differential).
+
+## S006 — `pop()` on an empty array throws `RangeError` *(inherited)*
+
+`Array.prototype.pop` is typed as the ELEMENT (not `elem | undefined`), and
+popping an empty array throws `RangeError` instead of returning `undefined`
+— S003's stance extended to the one removal method whose JS result type
+would otherwise poison every element type with `| undefined`. `shift()` is
+NOT part of this divergence: it stays JS-exact (`elem | undefined`,
+`undefined` on empty) because its result already crosses the union
+representation. The C runtime's `scr_arr_pop_slot` and the wasm backend's
+pop emission share the stance; on the wasm tier the throw is currently the
+S003 trap bridge (a wasm trap reported as exit 1) until the exception
+protocol lands. **Rationale:** inherited from the upstream runtime; the
+asymmetry with shift is upstream's, kept because re-typing pop would touch
+every corpus program using it. **Tested by:** corpus array programs (pop on
+non-empty paths must match Node byte-for-byte); the wasm emitter unit test
+covers non-empty pop and empty shift.

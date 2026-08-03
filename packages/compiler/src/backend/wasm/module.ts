@@ -147,6 +147,18 @@ export class ModuleBuilder {
     return index;
   }
 
+  /** A keyed OPEN struct — non-final with no supertype, the root other
+   * declarations subtype (the union base). Keyed by meaning like
+   * subStructType, never by shape. */
+  openStructType(key: string, fields: FieldType[]): number {
+    const existing = this.typeIndex.get(key);
+    if (existing !== undefined) return existing;
+    const index = this.types.length;
+    this.types.push({ kind: "struct", fields, sub: { supers: [], final: false } });
+    this.typeIndex.set(key, index);
+    return index;
+  }
+
   /** A TWO-entry recursive group (the closure-struct/function-type pair):
    * `make` receives the base index — the entries land at base and
    * base+1 and may reference each other. Interned by the caller's key. */

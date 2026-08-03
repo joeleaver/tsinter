@@ -144,6 +144,86 @@ test("UTF-16 fidelity: astral output, lone surrogates, S005 ordering", async () 
   );
 });
 
+test("unions: tags, unit singletons, equality (strict and SameValue), console", async () => {
+  // The tagged shared-base representation end to end: wrap/narrow through
+  // typeof narrowing, unit-arm tests (unionIsTag), nullish's tag test
+  // against ToBoolean's value test, per-union equality — f64 arms by
+  // value (strict: NaN !== NaN, +0 === -0; SameValue flips both), ref
+  // arms by identity — and console's per-union formatting incl. the -0
+  // inspect-ism (insp.f64).
+  const res = await buildWasm(
+    "unions.ts",
+    [
+      "function num(x: number): number | undefined {",
+      "  return x < -1000 ? undefined : x;",
+      "}",
+      "console.log(num(5), num(-2000), num(-0), num(0 / 0));",
+      "const a = num(3);",
+      "const b = num(3);",
+      'console.log("eq-by-value:", a === b, a !== b);',
+      "const n1 = num(0 / 0);",
+      "const n2 = num(0 / 0);",
+      'console.log("nan:", n1 === n2, Object.is(n1, n2));',
+      'console.log("zeros:", num(0) === num(-0), Object.is(num(0), num(-0)));',
+      "let s: string | null = null;",
+      'console.log(s ?? "was-null", s === null);',
+      's = "";',
+      // ?? passes "" through (tag test); || takes the default (ToBoolean).
+      'console.log(s ?? "was-null", s || "empty", s === null);',
+      "const r1 = { v: 1 };",
+      "const r2 = { v: 1 };",
+      "function pick(r: { v: number } | null): { v: number } | null { return r; }",
+      'console.log("ref-identity:", pick(r1) === pick(r1), pick(r1) === pick(r2));',
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "5 undefined -0 NaN",
+      "eq-by-value: true false",
+      "nan: false true",
+      "zeros: true false",
+      "was-null true",
+      " empty false",
+      "ref-identity: true false",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("unions: discriminant dispatch, optional chains, templates, pop/shift", async () => {
+  const res = await buildWasm(
+    "unions2.ts",
+    [
+      'type Shape = { kind: "circle"; r: number } | { kind: "square"; s: number };',
+      "function area(sh: Shape): number {",
+      '  return sh.kind === "circle" ? 3 * sh.r * sh.r : sh.s * sh.s;',
+      "}",
+      'console.log(area({ kind: "circle", r: 2 }), area({ kind: "square", s: 3 }));',
+      "function conf(on: boolean): { port: number } | undefined {",
+      "  return on ? { port: 8080 } : undefined;",
+      "}",
+      // The chain short-circuits WITHOUT evaluating the body: undefined.
+      "console.log(conf(true)?.port, conf(false)?.port);",
+      "const u: string | undefined = conf(false)?.port === 1 ? \"x\" : undefined;",
+      "console.log(`tmpl=${u}`);",
+      "const nums = [1, 2, 3];",
+      "console.log(nums.pop(), nums.shift(), nums.length, nums[0]);",
+      "const empty: string[] = [];",
+      "console.log(empty.shift());",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    ["12 9", "8080 undefined", "tmpl=undefined", "3 1 1 2", "undefined", ""].join("\n"),
+  );
+});
+
 test("out-of-tier constructs refuse with SC3001 and ride the survey", async () => {
   // Regex — a whole engine — sits far past every near-term increment, so
   // this example won't rot into the tier the way arithmetic and arrays
