@@ -62,6 +62,7 @@ import {
 } from "../../ir/nodes.js";
 import { EXPORT_ENTRY, EXPORT_MEMORY, FD_STDERR, FD_STDOUT, IMPORT_MODULE, IMPORT_WRITE } from "./abi.js";
 import { VecBuilder, type VecInfo } from "./arrays.js";
+import { StrBuilder } from "./strings.js";
 import { UnionBuilder, type UnionArmRep } from "./unions.js";
 import { Code } from "./code.js";
 import { buildF64ToStr } from "./numfmt.js";
@@ -2152,15 +2153,127 @@ class Assembler {
         code.unreachable();
         return;
 
+      /* The UTF-16-exact string method surface, direct over the faithful
+       * (array i16) storage (strings.ts — scr_string.c's clamps with the
+       * UTF-8 walking deleted). toLowerCase/toUpperCase refuse by MEMBER
+       * (like libCall names its fn): ECMA Default Case Conversion wants
+       * libunicode's tables, a separate rock. */
+      case "strIntrinsic": {
+        const m = e.method;
+        if (m === "toLowerCase" || m === "toUpperCase") {
+          this.refuse(`strIntrinsic:${m}`, e.loc);
+          code.unreachable();
+          return;
+        }
+        this.walkExpr(e.receiver);
+        const argOr = (i: number, dflt: number): void => {
+          const a = e.args[i];
+          if (a !== undefined) this.walkExpr(a);
+          else code.f64Const(dflt);
+        };
+        switch (m) {
+          case "length":
+            code.arrayLen();
+            code.f64ConvertI32S();
+            return;
+          case "charCodeAt":
+            this.walkExpr(e.args[0]!);
+            code.call(this.strs.charCodeAt());
+            return;
+          case "charAt":
+            this.walkExpr(e.args[0]!);
+            code.call(this.strs.charAt());
+            return;
+          case "cpAt":
+            this.walkExpr(e.args[0]!);
+            code.call(this.strs.cpAt());
+            return;
+          case "indexOf":
+            this.walkExpr(e.args[0]!);
+            argOr(1, 0);
+            code.call(this.strs.indexOf());
+            return;
+          case "includes":
+            // The position form is indexOf's clamp exactly (the spec
+            // routes both through StringIndexOf): found ⇔ index != -1.
+            this.walkExpr(e.args[0]!);
+            argOr(1, 0);
+            code.call(this.strs.indexOf());
+            code.f64Const(-1);
+            code.f64Ne();
+            return;
+          case "startsWith":
+            // The prefix match IS matchAt anchored at 0.
+            this.walkExpr(e.args[0]!);
+            code.i32Const(0);
+            code.call(this.strs.matchAt());
+            return;
+          case "endsWith":
+            this.walkExpr(e.args[0]!);
+            code.call(this.strs.endsWith());
+            return;
+          case "slice":
+            argOr(0, 0);
+            argOr(1, Number.POSITIVE_INFINITY);
+            code.call(this.strs.slice());
+            return;
+          case "substring":
+            this.walkExpr(e.args[0]!);
+            argOr(1, Number.POSITIVE_INFINITY);
+            code.call(this.strs.substring());
+            return;
+          case "repeat":
+            this.walkExpr(e.args[0]!);
+            code.call(this.strs.repeat());
+            return;
+          case "trim":
+            code.call(this.strs.trim("both"));
+            return;
+          case "trimStart":
+            code.call(this.strs.trim("start"));
+            return;
+          case "trimEnd":
+            code.call(this.strs.trim("end"));
+            return;
+          case "split":
+            this.walkExpr(e.args[0]!);
+            code.call(this.strs.split());
+            return;
+          case "padStart":
+            this.walkExpr(e.args[0]!);
+            this.walkExpr(e.args[1]!);
+            code.i32Const(1);
+            code.call(this.strs.pad());
+            return;
+          case "padEnd":
+            this.walkExpr(e.args[0]!);
+            this.walkExpr(e.args[1]!);
+            code.i32Const(0);
+            code.call(this.strs.pad());
+            return;
+          case "isWellFormed":
+            code.call(this.strs.isWellFormed());
+            return;
+          case "toWellFormed":
+            code.call(this.strs.toWellFormed());
+            return;
+          default: {
+            const rest: never = m;
+            void rest;
+            this.refuse(`strIntrinsic:${String(m)}`, e.loc);
+            code.unreachable();
+            return;
+          }
+        }
+      }
+
       /* Unit values exist only inside unions (unionWrap intercepts them
        * before the walk, so a reached unitLit is refused loudly);
        * fieldIncDec waits on class fields. */
       case "unitLit":
       case "fieldIncDec":
-      /* templateStrings is the tagged-template strings OBJECT (string[]);
-       * strIntrinsic is the UTF-16-exact method surface. */
+      /* templateStrings is the tagged-template strings OBJECT (string[]). */
       case "templateStrings":
-      case "strIntrinsic":
       /* Regex — a whole engine, host-imported or compiled. */
       case "regexLit":
       case "regexIntrinsic":
@@ -2281,6 +2394,22 @@ class Assembler {
       lit: (c, s) => this.pushStrLitInto(c, s),
     });
     return this.vecsField;
+  }
+
+  private strsField: StrBuilder | null = null;
+
+  /** The string method surface (strings.ts). split's string[] result
+   * must BE the tier's string[] — the same interned vec(str) info the
+   * emitter maps `string[]` to, injected with its push helper. */
+  private get strs(): StrBuilder {
+    this.strsField ??= new StrBuilder(this.mb, this.strType, {
+      vecStr: () => {
+        const strRef: ValType = { kind: "ref", nullable: true, typeIndex: this.strType };
+        const info = this.vecs.info("vec(str)", strRef, strRef, "string");
+        return { info, push1: this.vecs.pushOne(info) };
+      },
+    });
+    return this.strsField;
   }
 
   /** The vector types for an IR array type; null (with the honest type

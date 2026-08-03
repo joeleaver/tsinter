@@ -38,8 +38,10 @@ The IR string contract is UTF-16 code-unit semantics (`length`, indexing,
 and paid translation costs plus a documented lone-surrogate divergence;
 tsinter's WasmGC backend uses UTF-16-faithful representations, so this
 divergence class is *removed*, not inherited. **Tested by:** corpus string
-programs; a lone-surrogate corpus program should be added when the string
-runtime lands.
+programs; the wasm emitter unit test pins lone-surrogate identity through
+`charCodeAt`/`split("")`/`isWellFormed`/`toWellFormed` (a corpus program
+cannot cover this — the native lanes still carry upstream's U+FFFD
+substitution, so the removal is observable on the wasm tier only).
 
 ## S003 — Out-of-bounds array reads throw `RangeError` *(inherited)*
 
@@ -115,3 +117,18 @@ exception protocol. **Tested by:** corpus throw programs (stdout before the
 throw plus exit code must match Node; the harness skips the stderr compare
 for nonzero-exit programs); the wasm emitter unit test pins evaluation-order
 and skipped-evaluation cases against this entry.
+
+## S008 — Wasm tier: string `repeat`/`pad` size cap is 2^31 units
+
+`String.prototype.repeat` with a negative or infinite count traps (the
+spec's RangeError through the S003 bridge, exit 1 like Node). The SIZE
+limit differs: results at or past 2^31 UTF-16 units trap, where Node's
+RangeError fires around 2^29 units — so a result length in [2^29, 2^31)
+that Node rejects may instead be attempted here and survive if the GC can
+allocate it. **Rationale:** the tier has no exception protocol to throw
+the threshold RangeError with, and 2^31 is the storage's own bound; real
+programs between the thresholds are allocating gigabytes of string either
+way. Revisit (match Node's threshold with a real RangeError) when the
+exception protocol lands. **Tested by:** the wasm emitter unit test covers
+the trap side (negative count); the divergent window is deliberately
+untested — corpus programs cannot sit in it without multi-GB appetites.

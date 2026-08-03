@@ -279,6 +279,67 @@ test("S007: uncaught throw traps; effect-free values skip evaluation", async () 
   expect(effRun.stdout.toString("utf8")).toBe("before\nside effect first\n");
 });
 
+test("string intrinsics: UTF-16-exact surface, surrogate fidelity", async () => {
+  // The faithful-storage wins ride along: split("") of an astral char
+  // yields the two REAL lone halves (upstream's U+FFFD divergence is
+  // gone with the UTF-8 storage that forced it), pad truncation keeps
+  // the lone high half, and isWellFormed is a real scan where the C
+  // runtime answers its storage invariant's constant.
+  const res = await buildWasm(
+    "strings.ts",
+    [
+      'const s = "Hello, World";',
+      "console.log(s.length, s.charAt(4), s.charCodeAt(4), s.charCodeAt(99));",
+      'console.log(s.indexOf("o"), s.indexOf("o", 5), s.indexOf(""), s.includes("o", 9), s.startsWith("Hell"), s.endsWith("rld"));',
+      "console.log(s.slice(-5), s.slice(7, 2), s.substring(7, 2), s.substring(-3, 5));",
+      'console.log("ab".repeat(3), "  x\\t ".trim(), " y ".trimStart(), " y ".trimEnd());',
+      'console.log("a,b,,c".split(",").join("|"), "abc".split("").join("-"), "".split("x").length);',
+      'const units = "a\\u{1D11E}b".split("");',
+      "console.log(units.length, units[1].charCodeAt(0), units[2].charCodeAt(0));",
+      'console.log("5".padStart(3, "0"), "5".padEnd(4, "ab"), "x".padStart(4, "\\u{1D11E}").charCodeAt(2));',
+      'console.log("x\\uD834y".isWellFormed(), "ok".isWellFormed(), "x\\uD834y".toWellFormed().charCodeAt(1));',
+      'let steps = "";',
+      'for (const ch of "a\\u{1D11E}b") steps += ch.length.toString();',
+      "console.log(steps);",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "12 o 111 NaN",
+      "4 8 0 false true true",
+      "World  llo,  Hello",
+      "ababab x y   y",
+      "a|b||c a-b-c 1",
+      "4 55348 56606",
+      "005 5aba 55348",
+      "false true 65533",
+      "121",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("S008: repeat's invalid count is the RangeError trap", async () => {
+  const res = await buildWasm(
+    "repeat-neg.ts",
+    ['console.log("pre");', 'console.log("x".repeat(-1));', ""].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const run = await runWasmToTrap(res.binaryPath);
+  expect(run.stdout.toString("utf8")).toBe("pre\n");
+});
+
+test("strIntrinsic: the lre-backed case pair refuses by member", async () => {
+  const res = await buildWasm("lower.ts", 'console.log("AbC".toLowerCase());\n');
+  expect(res.ok).toBe(false);
+  if (res.ok) return;
+  expect(res.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
+  expect(res.wasmSurvey).toContain("strIntrinsic:toLowerCase");
+});
+
 test("out-of-tier constructs refuse with SC3001 and ride the survey", async () => {
   // Regex — a whole engine — sits far past every near-term increment, so
   // this example won't rot into the tier the way arithmetic and arrays
