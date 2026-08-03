@@ -6,9 +6,10 @@
  *
  * Index semantics are the register's: reads and writes validate that the
  * f64 index is an integer in bounds ([0, len) for reads, [0, len] for
- * writes — i == len appends) and TRAP otherwise (S003's stance; the trap
- * becomes the catchable RangeError when the exception protocol lands —
- * emitIndexCheck is the single place to change). Ref-element reads trap
+ * writes — i == len appends) and TRAP otherwise (S003's stance — an
+ * UNCATCHABLE abort on every tier, scr_trap's native parity; the
+ * may-throw analysis counts runtime traps as aborts, so the exception
+ * protocol deliberately does NOT catch these). Ref-element reads trap
  * on an absent (null) slot, SEMANTICS.md 46's arrayNewLen rule.
  *
  * Everything is keyed by the element's VALUE representation: one struct,

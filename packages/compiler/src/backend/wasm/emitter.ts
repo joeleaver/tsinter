@@ -59,7 +59,9 @@ import {
   type SrcLoc,
   isUnitType,
   typeEquals,
+  RUNTIME_ERROR_CLASSES,
 } from "../../ir/nodes.js";
+import { computeMayThrow } from "../emission/may-throw.js";
 import { EXPORT_ENTRY, EXPORT_MEMORY, FD_STDERR, FD_STDOUT, IMPORT_MODULE, IMPORT_WRITE } from "./abi.js";
 import { VecBuilder, type VecInfo } from "./arrays.js";
 import { StrBuilder } from "./strings.js";
@@ -78,28 +80,6 @@ type Refuse = (kind: string, loc?: SrcLoc) => void;
 
 function valKey(t: ValType): string {
   return t.kind === "ref" ? `r${t.nullable ? "?" : ""}${t.typeIndex}` : t.kind;
-}
-
-/** Conservatively effect-free expressions, used ONLY at the throw site
- * (SEMANTICS.md S007): the trap standing in for an uncaught throw makes
- * the thrown VALUE unobservable, so its evaluation may be skipped — but
- * only where skipping cannot drop a side effect. Literals and variable
- * reads qualify; error.new/error.newDom are pure allocations, which keeps
- * `throw new Error("...")` and the frontend's own lowering backstops
- * in-tier even though the Error CONSTRUCTION itself is out of tier. */
-function effectFree(e: IrExpr): boolean {
-  switch (e.kind) {
-    case "numLit":
-    case "strLit":
-    case "boolLit":
-    case "unitLit":
-    case "varRef":
-      return true;
-    case "libCall":
-      return (e.fn === "error.new" || e.fn === "error.newDom") && e.args.every(effectFree);
-    default:
-      return false;
-  }
 }
 
 export function emitWasmModule(mod: IrModule): Uint8Array {
@@ -150,7 +130,34 @@ interface FnState {
   /** Active optional chains: chain id → the local holding the narrowed
    * receiver, read by chainRecv inside the chain's body. */
   chainBinds: Map<string, number>;
+  /** Enclosing exception handlers, innermost last: the block position an
+   * unwind branches to (a catch block, or a finally's exception entry).
+   * Empty ⇒ the unwind returns a dummy out of the function. */
+  tryStack: number[];
+  /** Enclosing finally regions' PENDING-RETURN entries, innermost last: a
+   * `return` inside try/catch parks its value in pretLocal and branches
+   * to the innermost entry instead of returning (emit-stmts.ts's
+   * finallyStack, ported). `used` gates the third finally copy — an
+   * entry nothing branched to emits `unreachable` in its place. */
+  finallyStack: { pos: number; used: boolean }[];
+  /** The parked return value's local (lazily allocated; null until a
+   * return actually crosses a finally, and never for void returns). */
+  pretLocal: number | null;
 }
+
+/* Exception-cell kind tags (the wasm tier's ScrExcKind): 0 = nothing
+ * pending; the rest tag what the payload globals hold. */
+const EXC_F64 = 1;
+const EXC_BOOL = 2;
+const EXC_STR = 3;
+const EXC_REF = 4;
+const EXC_OBJ = 5;
+
+/** The abstract `any` heap type's s33 encoding — every struct/array ref
+ * in the module is a subtype, so (ref null ANY_HEAP) is the one payload
+ * slot every thrown ref shares. */
+const ANY_HEAP = -0x12;
+const ANY_REF: ValType = { kind: "ref", nullable: true, typeIndex: ANY_HEAP };
 
 /* ── the assembler: one walk, both sinks ───────────────────────────────── */
 
@@ -197,6 +204,182 @@ class Assembler {
     for (const g of mod.globals ?? []) this.globalById.set(g.id, g);
     for (const r of mod.records ?? []) this.recordShapes.set(r.id, r);
     for (const u of mod.unions ?? []) this.unionsById.set(u.id, u);
+    // The native backends' may-throw analysis is a pure function of the
+    // IR — reused verbatim to place the pending-exception checks.
+    const mt = computeMayThrow(mod);
+    this.mayThrow = mt.fns;
+    this.mayThrowIndirect = mt.indirect;
+  }
+
+  private readonly mayThrow: Set<string>;
+  private readonly mayThrowIndirect: boolean;
+
+  /* ── the exception protocol (pending-flag unwind, the native model) ────
+   * One cell of three mutable globals: a kind tag (0 = nothing pending)
+   * plus the payload in the f64 or the any-ref slot. `throw` fills the
+   * cell and unwinds; after every call that can throw, the caller tests
+   * the tag and unwinds too — to the innermost handler block of the
+   * CURRENT function, or out through a dummy return the caller never
+   * reads (its own check fires first). catch TAKES the cell into an
+   * immutable snapshot struct (the ScrCaught port) and clears it. */
+
+  private excField: {
+    kindG: number;
+    f64G: number;
+    refG: number;
+    caughtT: number;
+    errT: number;
+  } | null = null;
+
+  private exc(): NonNullable<typeof this.excField> {
+    if (this.excField === null) {
+      const strRef: ValType = { kind: "ref", nullable: true, typeIndex: this.strType };
+      const caughtT = this.mb.structType([
+        { storage: I32, mutable: false },
+        { storage: F64, mutable: false },
+        { storage: ANY_REF, mutable: false },
+      ]);
+      // The builtin error instance: class id (RUNTIME_ERROR_CLASSES's
+      // kind), name, message, and the %code slot (null = absent). User
+      // hierarchy classes never construct in-tier, so this one struct IS
+      // the whole OBJ payload space.
+      const errT = this.mb.structType([
+        { storage: I32, mutable: false },
+        { storage: strRef, mutable: false },
+        { storage: strRef, mutable: false },
+        { storage: strRef, mutable: false },
+      ]);
+      const kindG = this.mb.addGlobal(I32, true, (w) => {
+        w.u8(0x41);
+        w.sleb(0);
+      });
+      const f64G = this.mb.addGlobal(F64, true, (w) => {
+        w.u8(0x44);
+        w.f64(0);
+      });
+      const refG = this.mb.addGlobal(ANY_REF, true, (w) => {
+        w.u8(0xd0);
+        w.sleb(ANY_HEAP);
+      });
+      this.excField = { kindG, f64G, refG, caughtT, errT };
+    }
+    return this.excField;
+  }
+
+  /** The unwind at a point where an exception is pending: branch to the
+   * innermost handler of THIS function, or return a dummy value the
+   * caller never reads (its pending check fires before any use). The
+   * caller owns the surrounding condition; `throw` unwinds directly. */
+  private emitUnwind(): void {
+    const target = this.fn.tryStack[this.fn.tryStack.length - 1];
+    if (target !== undefined) {
+      this.brTo(target, false);
+      return;
+    }
+    const code = this.fn.code;
+    const rt = this.fn.fn.returnType;
+    if (rt.kind !== "void") {
+      const soft = this.mapTypeSoft(rt);
+      if (soft.kind === "f64") code.f64Const(0);
+      else if (soft.kind === "ref") code.refNull(soft.typeIndex);
+      else if (soft.kind === "i64") code.i64Const(0n);
+      else code.i32Const(0);
+    }
+    code.return_();
+  }
+
+  /** The emitter contract for exceptions (the native backends' rule,
+   * ported): after EVERY call that can throw, test the pending tag and
+   * unwind. Values already on the stack are simply abandoned by the
+   * branch — wasm truncates the operand stack at a br. */
+  private emitPendingCheck(): void {
+    this.fn.code.globalGet(this.exc().kindG);
+    this.openIf();
+    this.emitUnwind();
+    this.close();
+  }
+
+  /** Clear the cell: no kind pending, and the payload ref dropped so the
+   * GC can collect it. */
+  private emitCellClear(): void {
+    const exc = this.exc();
+    const code = this.fn.code;
+    code.refNull(ANY_HEAP);
+    code.globalSet(exc.refG);
+    code.i32Const(0);
+    code.globalSet(exc.kindG);
+  }
+
+  /** Build a builtin error instance from literals and store it into the
+   * cell (kind OBJ). Fences and TDZ reads throw this shape; the caller
+   * emits the unwind. */
+  private emitSetCellErrorLit(cls: number, name: string, message: string, codeLit: string | null): void {
+    const exc = this.exc();
+    const code = this.fn.code;
+    code.i32Const(cls);
+    this.pushStrLit(name);
+    this.pushStrLit(message);
+    if (codeLit !== null) this.pushStrLit(codeLit);
+    else code.refNull(this.strType);
+    code.structNew(exc.errT);
+    code.globalSet(exc.refG);
+    code.i32Const(EXC_OBJ);
+    code.globalSet(exc.kindG);
+  }
+
+  /** Evaluate a thrown value and fill the cell from its STATIC type —
+   * emit-stmts.ts's scr_throw_* dispatch, ported. The kind tag writes
+   * LAST (the commit). The caller emits the unwind. */
+  private emitThrowValue(v: IrExpr): void {
+    const exc = this.exc();
+    const code = this.fn.code;
+    const t = v.type;
+    switch (t.kind) {
+      case "f64":
+        this.walkExpr(v);
+        code.globalSet(exc.f64G);
+        code.i32Const(EXC_F64);
+        code.globalSet(exc.kindG);
+        return;
+      case "bool":
+        this.walkExpr(v);
+        code.f64ConvertI32U();
+        code.globalSet(exc.f64G);
+        code.i32Const(EXC_BOOL);
+        code.globalSet(exc.kindG);
+        return;
+      case "string":
+        this.walkExpr(v);
+        code.globalSet(exc.refG);
+        code.i32Const(EXC_STR);
+        code.globalSet(exc.kindG);
+        return;
+      case "object":
+        // Builtin error instances are the only in-tier objects; anything
+        // else already refused at mapType below.
+        this.mapType(t, v.loc);
+        this.walkExpr(v);
+        code.globalSet(exc.refG);
+        code.i32Const(EXC_OBJ);
+        code.globalSet(exc.kindG);
+        return;
+      default: {
+        // Any other representation rides the generic ref slot (union,
+        // record, array, closure — the scr_throw_ref family). mapType
+        // refusing is the honest gate for out-of-tier value kinds.
+        const soft = this.mapType(t, v.loc);
+        if (soft === null || soft.kind !== "ref") {
+          this.refuse(`throw:${t.kind}`, v.loc);
+          code.unreachable();
+          return;
+        }
+        this.walkExpr(v);
+        code.globalSet(exc.refG);
+        code.i32Const(EXC_REF);
+        code.globalSet(exc.kindG);
+        return;
+      }
+    }
   }
 
   run(): void {
@@ -242,6 +425,16 @@ class Assembler {
       const c = new Code();
       c.refNull(this.fnClosPair(entryFn).clos);
       c.call(entry);
+      if (this.mayThrow.has(this.mod.entry)) {
+        // An exception that unwound out of %main is UNCAUGHT: Node's
+        // observables are exit 1 plus a stderr report, and the trap
+        // bridge reports exactly that exit (stderr skipped on nonzero
+        // exits — SEMANTICS.md S007's surviving half).
+        c.globalGet(this.exc().kindG);
+        c.ifVoid();
+        c.unreachable();
+        c.end();
+      }
       this.mb.setBody(start, [], c.bytes());
     }
     this.mb.exportFunc(EXPORT_ENTRY, start);
@@ -426,6 +619,30 @@ class Assembler {
     return { kind: "ref", nullable: true, typeIndex: this.boxTypeFor(v) };
   }
 
+  /** The IR's TDZ contract: the NULL slot IS the sentinel — so a TDZ box
+   * over a NON-ref payload rides one extra indirection (a one-field inner
+   * struct, the C runtime's pointer-slot shape for tdz scalars). Null
+   * when the payload is already a ref (its own nullability serves). */
+  private tdzInnerFor(v: ValType): number | null {
+    return v.kind === "ref" ? null : this.mb.structType([{ storage: v, mutable: false }]);
+  }
+
+  /** The box type for a LOCAL — tdz-aware where the plain valtype box is
+   * not. Every box site must go through this (a plain boxTypeFor on a
+   * tdz scalar would make the read's null test type-invalid). */
+  private boxTypeForLocal(local: IrLocal): number {
+    const soft = this.mapTypeSoft(local.type);
+    if (local.tdz !== true) return this.boxTypeFor(soft);
+    const inner = this.tdzInnerFor(soft);
+    return inner === null
+      ? this.boxTypeFor(soft)
+      : this.boxTypeFor({ kind: "ref", nullable: true, typeIndex: inner });
+  }
+
+  private boxRefForLocal(local: IrLocal): ValType {
+    return { kind: "ref", nullable: true, typeIndex: this.boxTypeForLocal(local) };
+  }
+
   /** The env struct for a function with captures: code + one box ref per
    * capture, a subtype of the signature's closure struct. */
   private envTypeFor(fn: IrFunction): number {
@@ -434,7 +651,15 @@ class Assembler {
       `env:${fn.name}`,
       [
         { storage: { kind: "ref", nullable: false, typeIndex: pair.fn }, mutable: false },
-        ...(fn.captures ?? []).map((c) => ({ storage: this.boxRefFor(this.mapTypeSoft(c.type)), mutable: false })),
+        ...(fn.captures ?? []).map((c) => {
+          // Capture entries inherit tdz from their LOCAL twin (the IR
+          // lists every capture in locals too) — a tdz scalar's box type
+          // differs, and env fields must agree with the local slots.
+          const local = fn.locals.find((l) => l.id === c.localId);
+          const storage =
+            local !== undefined ? this.boxRefForLocal(local) : this.boxRefFor(this.mapTypeSoft(c.type));
+          return { storage, mutable: false };
+        }),
       ],
       pair.clos,
     );
@@ -585,6 +810,18 @@ class Assembler {
         // use taken to arms: holding/passing a union never needs an arm's
         // representation, so the gate sits on wrap/narrow/dispatch sites.
         return this.unions.baseRef();
+      case "caught":
+        // A catch binding: the immutable exception snapshot.
+        return { kind: "ref", nullable: true, typeIndex: this.exc().caughtT };
+      case "object":
+        // The builtin error classes share the ONE error struct (their
+        // class id is a field, not a type); every other object waits on
+        // classes.
+        if (RUNTIME_ERROR_CLASSES.has(t.className)) {
+          return { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+        }
+        this.refuse(`type:${t.kind}`, loc);
+        return null;
       default:
         this.refuse(`type:${t.kind}`, loc);
         return null;
@@ -608,6 +845,8 @@ class Assembler {
         // signature disagree, which validation catches as a call-site
         // type clash. Placeholder-elem vectors stay distinct via the key.
         const elem = this.mapTypeSoft(t.elem);
+        // Grows with EVERY new mappable kind (the increment-6/7 lesson:
+        // a lagging arm here is a call-site vs global type clash).
         const mappable =
           t.elem.kind === "f64" ||
           t.elem.kind === "bool" ||
@@ -615,7 +854,8 @@ class Assembler {
           t.elem.kind === "array" ||
           t.elem.kind === "func" ||
           t.elem.kind === "record" ||
-          t.elem.kind === "union";
+          t.elem.kind === "union" ||
+          (t.elem.kind === "object" && RUNTIME_ERROR_CLASSES.has(t.elem.className));
         if (!mappable) return I32;
         const kind =
           t.elem.kind === "f64" ? "f64"
@@ -641,6 +881,15 @@ class Assembler {
         // mapType never fails on unions, so the soft map must answer the
         // same base ref (the consistency rule).
         return this.unions.baseRef();
+      case "caught":
+        // mapType never fails on caught — same consistency rule.
+        return { kind: "ref", nullable: true, typeIndex: this.exc().caughtT };
+      case "object":
+        // Same arm as mapType: builtin errors map, the rest placeholder.
+        if (RUNTIME_ERROR_CLASSES.has(t.className)) {
+          return { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+        }
+        return I32;
       default:
         return I32;
     }
@@ -680,8 +929,7 @@ class Assembler {
     for (const l of fn.locals) {
       if (localIndex.has(l.id)) continue; // a param — already indexed
       localIndex.set(l.id, fn.params.length + 1 + localsOut.length);
-      const soft = this.mapTypeSoft(l.type);
-      localsOut.push(l.boxed === true ? this.boxRefFor(soft) : soft);
+      localsOut.push(l.boxed === true ? this.boxRefForLocal(l) : this.mapTypeSoft(l.type));
     }
     this.fn = {
       fn,
@@ -693,6 +941,9 @@ class Assembler {
       depth: 0,
       control: [],
       chainBinds: new Map(),
+      tryStack: [],
+      finallyStack: [],
+      pretLocal: null,
     };
 
     // Prologue 1: re-box captured params.
@@ -826,10 +1077,16 @@ class Assembler {
         if (local?.boxed === true) {
           // A FRESH box per execution — a loop's `let` binds per
           // iteration, so closures made in iteration k must not see
-          // iteration k+1's writes. init:null is the TDZ-empty box.
-          const box = this.boxTypeFor(this.mapTypeSoft(local.type));
+          // iteration k+1's writes. init:null is the TDZ-empty box
+          // (structNewDefault leaves the nullable slot null — the
+          // sentinel; the initializing assign fills it).
+          const box = this.boxTypeForLocal(local);
           if (s.init !== null) {
             this.walkExpr(s.init);
+            if (local.tdz === true) {
+              const inner = this.tdzInnerFor(this.mapTypeSoft(local.type));
+              if (inner !== null) code.structNew(inner);
+            }
             code.structNew(box);
           } else {
             code.structNewDefault(box);
@@ -846,10 +1103,29 @@ class Assembler {
       case "assign":
         this.storeVar(s.localId, s.value, s.loc);
         return;
-      case "return":
+      case "return": {
+        // Through a finally: the PENDING-RETURN path — snapshot the value
+        // FIRST (finally mutations of returned locals are invisible,
+        // Node-exact), then branch to the innermost finally's return
+        // entry; the copies chain outward from there.
+        const fin = this.fn.finallyStack[this.fn.finallyStack.length - 1];
+        if (fin !== undefined) {
+          if (s.value !== null) {
+            this.walkExpr(s.value);
+            if (this.fn.pretLocal === null) {
+              this.fn.pretLocal = this.acquireScratch(this.mapTypeSoft(this.fn.fn.returnType));
+              // Never released: the slot is live until the function ends.
+            }
+            code.localSet(this.fn.pretLocal);
+          }
+          fin.used = true;
+          this.brTo(fin.pos, false);
+          return;
+        }
         if (s.value !== null) this.walkExpr(s.value);
         code.return_();
         return;
+      }
       case "if":
         this.walkExpr(s.cond);
         this.openIf();
@@ -919,7 +1195,7 @@ class Assembler {
         if (s.init?.kind === "varDecl") {
           const initLocal = this.fn.localById.get(s.init.localId);
           if (initLocal?.boxed === true) {
-            const box = this.boxTypeFor(this.mapTypeSoft(initLocal.type));
+            const box = this.boxTypeForLocal(initLocal);
             const slot = this.localIndex(s.init.localId);
             code.localGet(slot);
             code.structGet(box, 0);
@@ -1011,7 +1287,7 @@ class Assembler {
           // closures made in pass k keep pass k's element.
           const bindingLocal = this.fn.localById.get(s.localId);
           if (bindingLocal?.boxed === true) {
-            code.structNew(this.boxTypeFor(this.mapTypeSoft(bindingLocal.type)));
+            code.structNew(this.boxTypeForLocal(bindingLocal));
           }
         }
         code.localSet(this.localIndex(s.localId));
@@ -1058,37 +1334,157 @@ class Assembler {
         // (appendImplicitUndefinedReturn): wasm's own `unreachable` IS
         // that trap — reached only if the checker's proof is wrong, and
         // then it fails loudly. Every other code is a JS deferred fence:
-        // a REACHABLE catchable throw, which waits on the exception
-        // protocol with the rest below.
+        // a REACHABLE catchable Error (message pre-rendered by the
+        // lowerer, the SC code in the %code slot), unwinding exactly
+        // like a throw — scr_throw_lowering_fence, ported.
         if (s.code === "SC9002") {
           code.unreachable();
           return;
         }
-        this.refuse(`stmt:${s.kind}`, s.loc);
-        break;
-
-      /* Uncaught-throw-as-trap (SEMANTICS.md S007): a program this tier
-       * emits contains no tryCatch anywhere (the construct refuses, and
-       * refusal is program-level), so every throw that executes is
-       * uncaught — Node's observables are exit 1 plus a stderr report,
-       * and the S003 bridge already reads a trap as that exit. An
-       * effect-free thrown value skips evaluation entirely, so its
-       * out-of-tier construction (error.new of a literal — `throw new
-       * Error("...")` and the frontend's lowering backstops) cannot
-       * refuse a program the trap never lets observe it; anything
-       * effectful evaluates in Node's order first, then traps. */
-      case "throw":
-        if (!effectFree(s.value)) this.walkExpr(s.value);
-        code.unreachable();
+        this.emitSetCellErrorLit(0, "Error", s.message, s.code);
+        this.emitUnwind();
         return;
 
-      /* rethrow exists only inside catch bodies, so it rides with the
-       * exception protocol (wasm exception handling, or a lowered
-       * pending-flag unwind like the other two backends run). */
-      case "rethrow":
-      case "tryCatch":
-        this.refuse(`stmt:${s.kind}`, s.loc);
-        break;
+      case "throw":
+        this.emitThrowValue(s.value);
+        this.emitUnwind();
+        return;
+
+      case "rethrow": {
+        // Re-raise the SAVED snapshot exactly: copy it back into the
+        // cell (kind last — the commit) and unwind. The binding read
+        // rides walkExpr so boxed (captured) bindings unpack correctly.
+        const exc = this.exc();
+        const caughtRef: ValType = { kind: "ref", nullable: true, typeIndex: exc.caughtT };
+        const c = this.acquireScratch(caughtRef);
+        this.walkExpr({ kind: "varRef", localId: s.localId, type: { kind: "caught" }, loc: s.loc });
+        code.localSet(c);
+        code.localGet(c);
+        code.structGet(exc.caughtT, 1);
+        code.globalSet(exc.f64G);
+        code.localGet(c);
+        code.structGet(exc.caughtT, 2);
+        code.globalSet(exc.refG);
+        code.localGet(c);
+        code.structGet(exc.caughtT, 0);
+        code.globalSet(exc.kindG);
+        this.releaseScratch(caughtRef, c);
+        this.emitUnwind();
+        return;
+      }
+
+      case "tryCatch": {
+        /* emit-stmts.ts's emitTryCatch, in forward-only blocks: arrival
+         * at each path = falling out of its block's end. Innermost out:
+         * $catch (exception in try), $finnorm (normal completion),
+         * $finexc (exception path finally), $finret (pending-return
+         * finally), $end. The finally body emits up to THREE copies —
+         * the C backend's shape exactly. */
+        const exc = this.exc();
+        const hasCatch = s.catchBody !== null;
+        const hasFinally = s.finallyBody !== null;
+        const endPos = this.openBlock();
+        let retPos = -1;
+        let excPos = -1;
+        let normPos = -1;
+        if (hasFinally) {
+          retPos = this.openBlock();
+          excPos = this.openBlock();
+          normPos = this.openBlock();
+        }
+        const catchPos = hasCatch ? this.openBlock() : -1;
+        // The try body's unwind target: its catch, or (catchless — the
+        // validator guarantees a finally then) the exception-path
+        // finally, pending still set.
+        this.fn.tryStack.push(hasCatch ? catchPos : excPos);
+        const retEntry = { pos: retPos, used: false };
+        if (hasFinally) this.fn.finallyStack.push(retEntry);
+        this.walkBody(s.tryBody);
+        this.fn.tryStack.pop();
+        this.brTo(hasFinally ? normPos : endPos, false);
+
+        if (hasCatch) {
+          this.close(); // end $catch — an exception is pending here
+          if (s.catchLocalId !== null) {
+            // catch (e): the cell MOVES into an immutable snapshot.
+            code.globalGet(exc.kindG);
+            code.globalGet(exc.f64G);
+            code.globalGet(exc.refG);
+            code.structNew(exc.caughtT);
+            const local = this.fn.localById.get(s.catchLocalId);
+            if (local?.boxed === true) {
+              code.structNew(this.boxTypeForLocal(local));
+            }
+            code.localSet(this.localIndex(s.catchLocalId));
+          }
+          this.emitCellClear();
+          // Exceptions from the CATCH body unwind to the exception-path
+          // finally when one exists, else to the enclosing context.
+          if (hasFinally) this.fn.tryStack.push(excPos);
+          this.walkBody(s.catchBody!);
+          if (hasFinally) this.fn.tryStack.pop();
+          this.brTo(hasFinally ? normPos : endPos, false);
+        }
+
+        if (hasFinally) {
+          // The finally copies run in the OUTER context: their own
+          // may-throw calls unwind outward (a throw inside a finally
+          // REPLACES whatever was in flight), and returns inside them
+          // are frontend-rejected.
+          this.fn.finallyStack.pop();
+
+          this.close(); // end $finnorm — the normal-path copy
+          this.walkBody(s.finallyBody!);
+          this.brTo(endPos, false);
+
+          this.close(); // end $finexc — exception path: stash, run, re-raise
+          // The in-flight exception STASHES across the body so the
+          // body's own pending checks answer for themselves; normal
+          // completion re-raises it and keeps propagating.
+          const kS = this.acquireScratch(I32);
+          const fS = this.acquireScratch(F64);
+          const rS = this.acquireScratch(ANY_REF);
+          code.globalGet(exc.kindG);
+          code.localSet(kS);
+          code.globalGet(exc.f64G);
+          code.localSet(fS);
+          code.globalGet(exc.refG);
+          code.localSet(rS);
+          this.emitCellClear();
+          this.walkBody(s.finallyBody!);
+          code.localGet(fS);
+          code.globalSet(exc.f64G);
+          code.localGet(rS);
+          code.globalSet(exc.refG);
+          code.localGet(kS);
+          code.globalSet(exc.kindG);
+          this.releaseScratch(I32, kS);
+          this.releaseScratch(F64, fS);
+          this.releaseScratch(ANY_REF, rS);
+          this.emitUnwind();
+
+          this.close(); // end $finret — the pending-return copy
+          if (retEntry.used) {
+            this.walkBody(s.finallyBody!);
+            const outer = this.fn.finallyStack[this.fn.finallyStack.length - 1];
+            if (outer !== undefined) {
+              outer.used = true;
+              this.brTo(outer.pos, false);
+            } else if (this.fn.fn.returnType.kind === "void") {
+              code.return_();
+            } else {
+              code.localGet(this.fn.pretLocal!);
+              code.return_();
+            }
+          } else {
+            // Nothing branched here (no return crossed this finally);
+            // the region is unreachable but must still validate.
+            code.unreachable();
+          }
+        }
+        this.close(); // end $end
+        return;
+      }
 
       default: {
         const rest: never = s;
@@ -1112,9 +1508,15 @@ class Assembler {
     }
     const local = this.fn.localById.get(localId);
     if (local?.boxed === true) {
-      const box = this.boxTypeFor(this.mapTypeSoft(local.type));
+      const box = this.boxTypeForLocal(local);
       this.fn.code.localGet(this.localIndex(localId));
       this.walkExpr(value);
+      if (local.tdz === true) {
+        // The initializing assign fills the tdz slot: scalars wrap in
+        // their indirection struct (the non-null ref IS "initialized").
+        const inner = this.tdzInnerFor(this.mapTypeSoft(local.type));
+        if (inner !== null) this.fn.code.structNew(inner);
+      }
       this.fn.code.structSet(box, 0);
       return;
     }
@@ -1189,13 +1591,28 @@ class Assembler {
         }
         const local = this.fn.localById.get(e.localId);
         if (local?.boxed === true) {
-          const box = this.boxTypeFor(this.mapTypeSoft(local.type));
+          const box = this.boxTypeForLocal(local);
           code.localGet(this.localIndex(e.localId));
           code.structGet(box, 0);
-          // A TDZ box reads null until its source-position assign runs;
-          // the trap stands in for the catchable ReferenceError until the
-          // exception protocol lands.
-          if (local.tdz === true) code.refAsNonNull();
+          if (local.tdz === true) {
+            // A TDZ slot reads null until its source-position assign
+            // runs: Node's exact catchable ReferenceError (the C
+            // emitter's scr_throw_error_named site, ported — name
+            // overrides on the %Error base; the builtin table has no
+            // %ReferenceError). Scalar payloads unwrap their tdz
+            // indirection after the test.
+            code.refIsNull();
+            this.openIf();
+            this.emitSetCellErrorLit(0, "ReferenceError", `Cannot access '${local.name}' before initialization`, null);
+            this.emitUnwind();
+            this.close();
+            code.localGet(this.localIndex(e.localId));
+            code.structGet(box, 0);
+            code.refAsNonNull();
+            const inner = this.tdzInnerFor(this.mapTypeSoft(local.type));
+            if (inner !== null) code.structGet(inner, 0);
+            return;
+          }
           return;
         }
         code.localGet(this.localIndex(e.localId));
@@ -1211,6 +1628,7 @@ class Assembler {
         code.refNull(this.fnClosPair(callee).clos);
         for (const a of e.args) this.walkExpr(a);
         code.call(index);
+        if (this.mayThrow.has(e.callee)) this.emitPendingCheck();
         return;
       }
 
@@ -1269,6 +1687,10 @@ class Assembler {
         code.structGet(pair.clos, 0);
         code.callRef(pair.fn);
         this.releaseScratch(closRef, c);
+        // The indirect callee is unknown; one closure target that may
+        // throw makes every callValue a check site (may-throw.ts's
+        // `indirect` answer, the native rule).
+        if (this.mayThrowIndirect) this.emitPendingCheck();
         return;
       }
 
@@ -2012,6 +2434,11 @@ class Assembler {
           code.refNull(retag.clos);
           code.localGet(u);
           code.call(retag.index);
+          // The helper's stranded-arm throw is unreachable here BY
+          // CONSTRUCTION (truthiness ruled unit arms out), but the
+          // name-based may-throw answer doesn't know that — the check
+          // keeps the contract uniform and no-ops at runtime.
+          if (this.mayThrow.has(e.retag!)) this.emitPendingCheck();
         } else {
           code.localGet(u);
           code.refCast(narrow!);
@@ -2149,6 +2576,22 @@ class Assembler {
           code.call(this.inspF64Helper());
           return;
         }
+        if (e.fn === "error.new") {
+          // scr_error_new(kind, message), ported: the builtin instance —
+          // class id and name off the static table, the message
+          // evaluated, no %code. `new Error("...")`, the frontend's
+          // lowering backstops, and throwing setters all mint this.
+          const t = e.type;
+          if (t.kind !== "object") throw new Error("emitter bug: error.new result is not a class");
+          const rec = RUNTIME_ERROR_CLASSES.get(t.className);
+          if (rec === undefined) throw new Error(`emitter bug: error.new of ${t.className}`);
+          code.i32Const(rec.kind);
+          this.pushStrLit(rec.lib);
+          this.walkExpr(e.args[0]!);
+          code.refNull(this.strType);
+          code.structNew(this.exc().errT);
+          return;
+        }
         this.refuse(`libCall:${e.fn}`, e.loc);
         code.unreachable();
         return;
@@ -2267,6 +2710,86 @@ class Assembler {
         }
       }
 
+      /* Runtime tests on a catch binding: the primitive tests compare the
+       * snapshot's kind tag (exactly what typeof observes); instanceof
+       * tests an OBJ payload's class id against the BUILTIN error table —
+       * user hierarchy classes never construct in-tier, so the id space
+       * is closed and %Error is simply "any OBJ". */
+      case "caughtTest": {
+        const exc = this.exc();
+        if (e.test === "instanceof") {
+          const rec = RUNTIME_ERROR_CLASSES.get(e.className ?? "");
+          if (rec === undefined) {
+            this.refuse(`caughtTest:instanceof:${e.className ?? "?"}`, e.loc);
+            code.unreachable();
+            return;
+          }
+          const caughtRef: ValType = { kind: "ref", nullable: true, typeIndex: exc.caughtT };
+          const c = this.acquireScratch(caughtRef);
+          this.walkExpr(e.value);
+          code.localSet(c);
+          code.localGet(c);
+          code.structGet(exc.caughtT, 0);
+          code.i32Const(EXC_OBJ);
+          code.i32Eq();
+          if (rec.base !== null) {
+            // A subclass test needs the payload's id — but only cast it
+            // once the kind says OBJ (any other payload would fail the
+            // ref.cast, not the test).
+            this.openIfResult(I32);
+            code.localGet(c);
+            code.structGet(exc.caughtT, 2);
+            code.refCast(exc.errT);
+            code.structGet(exc.errT, 0);
+            code.i32Const(rec.kind);
+            code.i32Eq();
+            code.else_();
+            code.i32Const(0);
+            this.close();
+          }
+          this.releaseScratch(caughtRef, c);
+          if (e.negated === true) code.i32Eqz();
+          return;
+        }
+        this.walkExpr(e.value);
+        code.structGet(exc.caughtT, 0);
+        code.i32Const(e.test === "number" ? EXC_F64 : e.test === "boolean" ? EXC_BOOL : EXC_STR);
+        if (e.negated === true) code.i32Ne();
+        else code.i32Eq();
+        return;
+      }
+
+      /* Checker-trusted payload extraction (the frontend emits it only
+       * under a proven test, so the read is kind-unchecked — the caught
+       * analog of unionNarrow). Object extraction waits on classes:
+       * builtin errors COULD extract here, but their object type's whole
+       * member surface (fieldGet name/message) is the classes rock. */
+      case "caughtNarrow": {
+        const exc = this.exc();
+        const t = e.type;
+        if (t.kind === "f64") {
+          this.walkExpr(e.value);
+          code.structGet(exc.caughtT, 1);
+          return;
+        }
+        if (t.kind === "bool") {
+          this.walkExpr(e.value);
+          code.structGet(exc.caughtT, 1);
+          code.f64Const(0);
+          code.f64Ne();
+          return;
+        }
+        if (t.kind === "string") {
+          this.walkExpr(e.value);
+          code.structGet(exc.caughtT, 2);
+          code.refCast(this.strType);
+          return;
+        }
+        this.refuse(`caughtNarrow:${t.kind}`, e.loc);
+        code.unreachable();
+        return;
+      }
+
       /* Unit values exist only inside unions (unionWrap intercepts them
        * before the walk, so a reached unitLit is refused loudly);
        * fieldIncDec waits on class fields. */
@@ -2309,9 +2832,8 @@ class Assembler {
       /* The dynamic-keyed record surface rides the overflow map. */
       case "recordKeyGet":
       case "recordOvfKeys":
-      /* Caught-exception snapshots. */
-      case "caughtTest":
-      case "caughtNarrow":
+      /* The caught→object checked cast and the caught→dyn conversion wait
+       * on classes and the dyn surface respectively. */
       case "caughtCheck":
       case "caughtToDyn":
       /* The dyn surface. */

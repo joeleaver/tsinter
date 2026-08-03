@@ -89,34 +89,34 @@ would otherwise poison every element type with `| undefined`. `shift()` is
 NOT part of this divergence: it stays JS-exact (`elem | undefined`,
 `undefined` on empty) because its result already crosses the union
 representation. The C runtime's `scr_arr_pop_slot` and the wasm backend's
-pop emission share the stance; on the wasm tier the throw is currently the
-S003 trap bridge (a wasm trap reported as exit 1) until the exception
-protocol lands. **Rationale:** inherited from the upstream runtime; the
+pop emission share the stance; the "throw" is an UNCATCHABLE abort on both
+tiers (`scr_trap` natively, a wasm trap reported as exit 1 through the S003
+bridge) — native parity, not a temporary bridge: the may-throw analysis
+counts runtime traps as aborts, so no pending check ever observes one. **Rationale:** inherited from the upstream runtime; the
 asymmetry with shift is upstream's, kept because re-typing pop would touch
 every corpus program using it. **Tested by:** corpus array programs (pop on
 non-empty paths must match Node byte-for-byte); the wasm emitter unit test
 covers non-empty pop and empty shift.
 
-## S007 — Wasm tier: uncaught `throw` is a trap; stderr is not Node's
+## S007 — Wasm tier: an UNCAUGHT exception reports as a trap; stderr is not Node's
 
-A program the wasm tier emits contains no `tryCatch` anywhere (the construct
-refuses, and one refusal refuses the whole program), so every `throw` that
-executes is uncaught. `throw` therefore compiles to a wasm trap: the S003
-bridge reports it as exit code 1 — Node's uncaught-exception exit — while
-stderr carries only what the program itself wrote to fd 2, with no Node-style
-uncaught-exception report. An **effect-free** thrown value (literals,
-variable reads, `error.new`/`error.newDom` of effect-free arguments — the
-shape of `throw new Error("...")` and of the frontend's lowering backstops)
-is not evaluated at all: the trap makes the value unobservable, and skipping
-keeps the out-of-tier Error construction from refusing programs it cannot
-affect. Any other thrown value evaluates in Node's order first, then traps.
-This entry retires when the exception protocol lands (real throw/catch/
-rethrow with instances). **Rationale:** unlocks every uncaught-throw corpus
-program — including the union retag/narrow backstop riders — without the
-exception protocol. **Tested by:** corpus throw programs (stdout before the
-throw plus exit code must match Node; the harness skips the stderr compare
-for nonzero-exit programs); the wasm emitter unit test pins evaluation-order
-and skipped-evaluation cases against this entry.
+*(Narrowed 2026-08-03: the original entry described uncaught-throw-as-trap
+for a tier with no `tryCatch` at all. The exception protocol has since
+landed — real throw/catch/finally/rethrow via a pending-flag unwind, the
+native backends' model — so thrown values are always evaluated and
+catchable. What survives is the UNCAUGHT half.)*
+
+An exception that unwinds out of `%main` is uncaught: `_start` tests the
+pending cell and traps, which the harness bridge reports as exit code 1 —
+Node's uncaught-exception exit — while stderr carries only what the program
+itself wrote to fd 2, with no Node-style uncaught-exception report (stack
+traces are not captured; the native tier's uncaught printer writes "name:
+message" where Node writes a trace, so stderr already diverges there too).
+**Rationale:** the artifact ABI has no exit-code channel; the trap IS the
+nonzero exit. **Tested by:** corpus uncaught-throw programs (stdout before
+the throw plus exit code must match Node; the harness skips the stderr
+compare for nonzero-exit programs); the wasm emitter unit test pins the
+evaluation-order-then-trap case.
 
 ## S008 — Wasm tier: string `repeat`/`pad` size cap is 2^31 units
 
@@ -125,10 +125,11 @@ spec's RangeError through the S003 bridge, exit 1 like Node). The SIZE
 limit differs: results at or past 2^31 UTF-16 units trap, where Node's
 RangeError fires around 2^29 units — so a result length in [2^29, 2^31)
 that Node rejects may instead be attempted here and survive if the GC can
-allocate it. **Rationale:** the tier has no exception protocol to throw
-the threshold RangeError with, and 2^31 is the storage's own bound; real
-programs between the thresholds are allocating gigabytes of string either
-way. Revisit (match Node's threshold with a real RangeError) when the
-exception protocol lands. **Tested by:** the wasm emitter unit test covers
-the trap side (negative count); the divergent window is deliberately
-untested — corpus programs cannot sit in it without multi-GB appetites.
+allocate it. **Rationale:** native parity — the C runtime's `scr_str_repeat` aborts
+through `scr_trap` on the same conditions (an UNCATCHABLE termination where
+Node throws a catchable RangeError; the may-throw analysis counts runtime
+traps as aborts on every tier), and 2^31 is the wasm storage's own bound;
+real programs between the thresholds are allocating gigabytes of string
+either way. **Tested by:** the wasm emitter unit test covers the trap side
+(negative count); the divergent window is deliberately untested — corpus
+programs cannot sit in it without multi-GB appetites.

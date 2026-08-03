@@ -310,6 +310,23 @@ const TIER_FLOOR: string[] = [
   "973-unions-rc-stress.ts",
   "975-unions-undefined.ts",
   "977-unions-unit-rc-stress.ts",
+  // Increment 10 (exception protocol): pending-flag unwind — real
+  // throw/catch/finally/rethrow, catch-binding snapshots with typeof and
+  // builtin-error instanceof tests, TDZ ReferenceErrors, fences as
+  // catchable Errors, error.new as an in-tier value. Claims the whole
+  // exceptions corpus family plus the fence/throw riders.
+  "1599-js-uncaught-throw.js",
+  "1613-cjs-esm-proxy-named/main.mjs",
+  "1835-var-basics.ts",
+  "2404-kill-throw-catch.ts",
+  "2588-array-entries-chains.ts",
+  "980-exceptions-basics.ts",
+  "982-exceptions-rc-stress.ts",
+  "983-exceptions-control-flow.ts",
+  "984-exceptions-finally.ts",
+  "985-exceptions-call-chains.ts",
+  "986-exceptions-uncaught.ts",
+  "987-exceptions-result-unions.ts",
 ];
 
 interface RunResult {

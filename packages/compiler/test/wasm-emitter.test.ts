@@ -249,11 +249,11 @@ test("unions: discriminant dispatch, optional chains, templates, pop/shift", asy
   );
 });
 
-test("S007: uncaught throw traps; effect-free values skip evaluation", async () => {
-  // The effect-free carve-out: error.new of a literal is out of tier as a
-  // VALUE, but a throw's trap makes the value unobservable, so this
-  // program must COMPILE (not refuse at libCall:error.new) and trap after
-  // the preceding output.
+test("S007: an uncaught throw exits through the _start trap", async () => {
+  // The exception protocol evaluates every thrown value (error.new is a
+  // real in-tier construction now); nothing catches these, so the
+  // pending cell survives to _start's check and the trap reports
+  // Node's uncaught exit — with all prior output flushed.
   const lit = await buildWasm("throw-lit.ts", ['console.log("before");', 'throw new Error("boom");', ""].join("\n"));
   if (!lit.ok) throw new Error(`refused: ${lit.diagnostics[0]?.message}`);
   expect(WebAssembly.validate(readFileSync(lit.binaryPath))).toBe(true);
@@ -317,6 +317,86 @@ test("string intrinsics: UTF-16-exact surface, surrogate fidelity", async () => 
       "005 5aba 55348",
       "false true 65533",
       "121",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("exception protocol: catch, finally paths, rethrow, TDZ", async () => {
+  const res = await buildWasm(
+    "exceptions.ts",
+    [
+      "function boom(k: number): number {",
+      '  if (k === 1) throw "s";',
+      "  if (k === 2) throw 41;",
+      '  if (k === 3) throw new TypeError("t");',
+      "  return 7;",
+      "}",
+      "for (const k of [0, 1, 2, 3]) {",
+      "  try {",
+      '    console.log("ok", boom(k));',
+      "  } catch (e) {",
+      '    if (typeof e === "string") console.log("str", e);',
+      '    else if (typeof e === "number") console.log("num", e + 1);',
+      "    else console.log(e instanceof TypeError, e instanceof RangeError, e instanceof Error);",
+      "  }",
+      "}",
+      "function via(): number {",
+      "  try {",
+      "    return 10;",
+      "  } finally {",
+      '    console.log("fin-return");',
+      "  }",
+      "}",
+      "console.log(via());",
+      "try {",
+      "  try {",
+      '    throw "inner";',
+      "  } finally {",
+      '    console.log("fin-exc");',
+      "  }",
+      "} catch (e) {",
+      '  console.log("propagated", typeof e === "string");',
+      "}",
+      "try {",
+      "  try {",
+      "    throw 1;",
+      "  } catch (e) {",
+      "    throw e;",
+      "  }",
+      "} catch (e2) {",
+      '  if (typeof e2 === "number") console.log("rethrown", e2);',
+      "}",
+      "function make(): () => number {",
+      "  const get = (): number => later;",
+      "  try {",
+      "    console.log(get());",
+      "  } catch (e) {",
+      '    console.log("tdz caught");',
+      "  }",
+      "  const later = 42;",
+      "  return get;",
+      "}",
+      "console.log(make()());",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "ok 7",
+      "str s",
+      "num 42",
+      "true false true",
+      "fin-return",
+      "10",
+      "fin-exc",
+      "propagated true",
+      "rethrown 1",
+      "tdz caught",
+      "42",
       "",
     ].join("\n"),
   );
