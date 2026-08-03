@@ -48,12 +48,10 @@
  * shrink to exactly the work that remains. */
 import {
   type IrExpr,
-  type IrFunction,
   type IrGlobal,
   type IrLocal,
   type IrModule,
   type IrRecordShape,
-  type IrStmt,
   type IrType,
   type IrUnionDef,
   type SrcLoc,
@@ -69,24 +67,31 @@ import { UnionBuilder, type UnionArmRep } from "./unions.js";
 import { Code } from "./code.js";
 import { buildF64ToStr } from "./numfmt.js";
 import { F64, I32, I64, ModuleBuilder, type ValType } from "./module.js";
-import { lowerResumableFunctions } from "./statemachine.js";
+import {
+  asIrModule,
+  lowerResumableFunctions,
+  type Refuse,
+  type WExpr,
+  type WFunction,
+  type WModule,
+  type WStmt,
+} from "./statemachine.js";
 import { WasmUnsupportedError } from "./unsupported.js";
 
 export { WasmUnsupportedError } from "./unsupported.js";
-
-/** What the walk does with a construct outside the tier. The emit sink
- * throws (so everything after a refusal is unreachable on that path); the
- * survey sink records and lets the walk continue over placeholders. */
-type Refuse = (kind: string, loc?: SrcLoc) => void;
 
 function valKey(t: ValType): string {
   return t.kind === "ref" ? `r${t.nullable ? "?" : ""}${t.typeIndex}` : t.kind;
 }
 
 export function emitWasmModule(mod: IrModule): Uint8Array {
-  const asm = new Assembler(lowerResumableFunctions(mod), (kind, loc) => {
+  // The resumable lowering shares the sink: a function it declines names
+  // itself in the same census the walk feeds, and on this path throws out
+  // of the pass exactly like a construct the walk refuses would.
+  const refuse: Refuse = (kind, loc) => {
     throw new WasmUnsupportedError(kind, loc);
-  });
+  };
+  const asm = new Assembler(lowerResumableFunctions(mod, refuse), refuse);
   asm.run();
   return asm.finish();
 }
@@ -97,9 +102,10 @@ export function emitWasmModule(mod: IrModule): Uint8Array {
  * compile this?", not "does it compile?". */
 export function surveyWasmModule(mod: IrModule): string[] {
   const seen = new Set<string>();
-  new Assembler(lowerResumableFunctions(mod), (kind) => {
+  const refuse: Refuse = (kind) => {
     seen.add(kind);
-  }).run();
+  };
+  new Assembler(lowerResumableFunctions(mod, refuse), refuse).run();
   return [...seen];
 }
 
@@ -107,7 +113,7 @@ export function surveyWasmModule(mod: IrModule): string[] {
 /* ── per-function state ────────────────────────────────────────────────── */
 
 interface FnState {
-  fn: IrFunction;
+  fn: WFunction;
   code: Code;
   /** IR local id → wasm local index (params first, then the rest in
    * locals[] order — wasm's required layout). */
@@ -168,7 +174,7 @@ class Assembler {
   private readonly unionsById = new Map<string, IrUnionDef>();
   private readonly globalWasmIndex = new Map<string, number>();
   private readonly funcIndexByName = new Map<string, number>();
-  private readonly funcByName = new Map<string, IrFunction>();
+  private readonly funcByName = new Map<string, WFunction>();
   private readonly strType: number;
   private readonly cursorGlobal: number;
   private readonly writeFunc: number;
@@ -176,7 +182,7 @@ class Assembler {
   private fn!: FnState;
 
   constructor(
-    private readonly mod: IrModule,
+    private readonly mod: WModule,
     private readonly refuse: Refuse,
   ) {
     // The uniform artifact contract (abi.ts): every module imports write,
@@ -206,8 +212,10 @@ class Assembler {
     for (const r of mod.records ?? []) this.recordShapes.set(r.id, r);
     for (const u of mod.unions ?? []) this.unionsById.set(u.id, u);
     // The native backends' may-throw analysis is a pure function of the
-    // IR — reused verbatim to place the pending-exception checks.
-    const mt = computeMayThrow(mod);
+    // IR — reused verbatim to place the pending-exception checks. It runs
+    // on the LOWERED module and walks it generically, so the `%async.*`
+    // kinds recurse through it like any node it has no case for.
+    const mt = computeMayThrow(asIrModule(mod));
     this.mayThrow = mt.fns;
     this.mayThrowIndirect = mt.indirect;
   }
@@ -366,7 +374,7 @@ class Assembler {
   /** Evaluate a thrown value and fill the cell from its STATIC type —
    * emit-stmts.ts's scr_throw_* dispatch, ported. The kind tag writes
    * LAST (the commit). The caller emits the unwind. */
-  private emitThrowValue(v: IrExpr): void {
+  private emitThrowValue(v: WExpr): void {
     const exc = this.exc();
     const code = this.fn.code;
     const t = v.type;
@@ -590,7 +598,7 @@ class Assembler {
   }
 
   /** The pair for a declared FUNCTION's own signature (soft — pass 1). */
-  private fnClosPair(fn: IrFunction): { clos: number; fn: number } {
+  private fnClosPair(fn: WFunction): { clos: number; fn: number } {
     const params = fn.params.map((p) => this.mapTypeSoft(p.type));
     const results = fn.returnType.kind === "void" ? [] : [this.mapTypeSoft(fn.returnType)];
     return this.closPairFor(params, results);
@@ -681,7 +689,7 @@ class Assembler {
 
   /** The env struct for a function with captures: code + one box ref per
    * capture, a subtype of the signature's closure struct. */
-  private envTypeFor(fn: IrFunction): number {
+  private envTypeFor(fn: WFunction): number {
     const pair = this.fnClosPair(fn);
     return this.mb.subStructType(
       `env:${fn.name}`,
@@ -933,7 +941,7 @@ class Assembler {
 
   /* ── functions ──────────────────────────────────────────────────────── */
 
-  private walkFunction(fn: IrFunction): void {
+  private walkFunction(fn: WFunction): void {
     // Whole-function shapes, tested BEFORE the body: async and generators
     // need the fiber/state-machine lowering, so the constructs inside
     // their bodies are not what blocks the function and must not be
@@ -1030,7 +1038,7 @@ class Assembler {
     this.mb.setBody(index, this.fn.localsOut, this.fn.code.bytes());
   }
 
-  private walkBody(body: IrStmt[]): void {
+  private walkBody(body: WStmt[]): void {
     for (const s of body) this.walkStmt(s);
   }
 
@@ -1099,7 +1107,7 @@ class Assembler {
 
   /* ── statements ─────────────────────────────────────────────────────── */
 
-  private walkStmt(s: IrStmt): void {
+  private walkStmt(s: WStmt): void {
     const code = this.fn.code;
     switch (s.kind) {
       case "exprStmt":
@@ -1537,9 +1545,24 @@ class Assembler {
         return;
       }
 
+      /* The resumable lowering's runtime seam (statemachine.ts). The pass
+       * produces these and stage 2 emits them; until then they refuse
+       * under their own names, so a program whose async bodies DID
+       * linearize names the promise runtime it is waiting on instead of
+       * the whole-function `fn:async`. */
+      case "%async.subscribe":
+      case "%async.hop":
+      case "%async.subscribeUnion":
+      case "%async.settle":
+      case "%async.reject":
+      case "%async.rejectCheck":
+      case "%async.rejectCheckUnion":
+        this.refuse(`stmt:${s.kind}`, s.loc);
+        return;
+
       default: {
         const rest: never = s;
-        this.refuse(`stmt:${(rest as IrStmt).kind}`, (rest as IrStmt).loc);
+        this.refuse(`stmt:${(rest as WStmt).kind}`, (rest as WStmt).loc);
         return;
       }
     }
@@ -1550,7 +1573,7 @@ class Assembler {
    * Globals live in the "%g." namespace (IrGlobal docs) and get their wasm
    * slot lazily, right here at first use; a boxed local writes THROUGH
    * its box (the shared binding every capture sees). */
-  private storeVar(localId: string, value: IrExpr, loc: SrcLoc): void {
+  private storeVar(localId: string, value: WExpr, loc: SrcLoc): void {
     const global = this.globalById.get(localId);
     if (global !== undefined) {
       this.walkExpr(value);
@@ -1580,7 +1603,7 @@ class Assembler {
    * it follows, so a new container kind cannot silently hide its body from
    * the survey. (Implemented containers walk their bodies inline in
    * walkStmt and return before this.) */
-  private walkNested(s: IrStmt): void {
+  private walkNested(s: WStmt): void {
     switch (s.kind) {
       case "tryCatch":
         this.walkBody(s.tryBody);
@@ -1610,6 +1633,15 @@ class Assembler {
       case "throw":
       case "rethrow":
       case "runtimeFence":
+      /* The async seam's statements carry EXPRESSIONS only — no nested
+       * statement bodies for the survey to descend into. */
+      case "%async.subscribe":
+      case "%async.hop":
+      case "%async.subscribeUnion":
+      case "%async.settle":
+      case "%async.reject":
+      case "%async.rejectCheck":
+      case "%async.rejectCheckUnion":
         break;
       default: {
         const rest: never = s;
@@ -1622,7 +1654,7 @@ class Assembler {
 
   /** Emits the expression's value onto the wasm stack. On refusal (survey
    * path) the value is one `unreachable` and the operands stay unwalked. */
-  private walkExpr(e: IrExpr): void {
+  private walkExpr(e: WExpr): void {
     const code = this.fn.code;
     switch (e.kind) {
       case "boolLit":
@@ -2995,13 +3027,19 @@ class Assembler {
       case "jsMarshal":
       case "jsOp":
       case "jsExit":
+      /* The resumable lowering's expression seam (statemachine.ts) —
+       * minting the spawned promise and reading a resumed frame's settled
+       * value. Stage 2's promise runtime is what these wait on. */
+      case "%async.mint":
+      case "%async.settled":
+      case "%async.settledUnion":
         this.refuse(`expr:${e.kind}`, e.loc);
         code.unreachable();
         return;
 
       default: {
         const rest: never = e;
-        this.refuse(`expr:${(rest as IrExpr).kind}`, (rest as IrExpr).loc);
+        this.refuse(`expr:${(rest as WExpr).kind}`, (rest as WExpr).loc);
         code.unreachable();
       }
     }
@@ -3488,7 +3526,7 @@ class Assembler {
    * (which binds to the exit block via the control stack). A default in
    * any position is the dispatch chain's fallback target only — its body
    * keeps its source position. */
-  private emitSwitch(s: Extract<IrStmt, { kind: "switch" }>): void {
+  private emitSwitch(s: Extract<WStmt, { kind: "switch" }>): void {
     const code = this.fn.code;
     this.walkExpr(s.disc);
     const k = s.disc.type.kind;
