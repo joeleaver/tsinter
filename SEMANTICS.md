@@ -94,3 +94,24 @@ asymmetry with shift is upstream's, kept because re-typing pop would touch
 every corpus program using it. **Tested by:** corpus array programs (pop on
 non-empty paths must match Node byte-for-byte); the wasm emitter unit test
 covers non-empty pop and empty shift.
+
+## S007 — Wasm tier: uncaught `throw` is a trap; stderr is not Node's
+
+A program the wasm tier emits contains no `tryCatch` anywhere (the construct
+refuses, and one refusal refuses the whole program), so every `throw` that
+executes is uncaught. `throw` therefore compiles to a wasm trap: the S003
+bridge reports it as exit code 1 — Node's uncaught-exception exit — while
+stderr carries only what the program itself wrote to fd 2, with no Node-style
+uncaught-exception report. An **effect-free** thrown value (literals,
+variable reads, `error.new`/`error.newDom` of effect-free arguments — the
+shape of `throw new Error("...")` and of the frontend's lowering backstops)
+is not evaluated at all: the trap makes the value unobservable, and skipping
+keeps the out-of-tier Error construction from refusing programs it cannot
+affect. Any other thrown value evaluates in Node's order first, then traps.
+This entry retires when the exception protocol lands (real throw/catch/
+rethrow with instances). **Rationale:** unlocks every uncaught-throw corpus
+program — including the union retag/narrow backstop riders — without the
+exception protocol. **Tested by:** corpus throw programs (stdout before the
+throw plus exit code must match Node; the harness skips the stderr compare
+for nonzero-exit programs); the wasm emitter unit test pins evaluation-order
+and skipped-evaluation cases against this entry.

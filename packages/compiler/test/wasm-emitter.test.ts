@@ -46,6 +46,31 @@ async function runWasm(modulePath: string): Promise<{ stdout: Buffer; stderr: Bu
   return { stdout: Buffer.concat(chunks[1]), stderr: Buffer.concat(chunks[2]) };
 }
 
+/** S007's bridge shape: run to an EXPECTED trap, returning the output
+ * that preceded it. A run that completes is the failure here — the
+ * program under test must trap. */
+async function runWasmToTrap(modulePath: string): Promise<{ stdout: Buffer; stderr: Buffer }> {
+  const chunks: { 1: Buffer[]; 2: Buffer[] } = { 1: [], 2: [] };
+  let memory: WebAssembly.Memory | null = null;
+  const { instance } = await WebAssembly.instantiate(readFileSync(modulePath), {
+    tsinter: {
+      write(fd: number, ptr: number, len: number): void {
+        if (memory === null) throw new Error("write before instantiation completed");
+        chunks[fd === 2 ? 2 : 1].push(Buffer.from(new Uint8Array(memory.buffer, ptr, len)));
+      },
+    },
+  });
+  memory = instance.exports["memory"] as WebAssembly.Memory;
+  const trap = await Promise.resolve()
+    .then(() => (instance.exports["_start"] as () => void)())
+    .then(
+      () => null,
+      (err: unknown) => err,
+    );
+  expect(trap).toBeInstanceOf(WebAssembly.RuntimeError);
+  return { stdout: Buffer.concat(chunks[1]), stderr: Buffer.concat(chunks[2]) };
+}
+
 test("hello world compiles, validates, and runs byte-exactly", async () => {
   const res = await buildWasm("hello.ts", 'console.log("hello world");\n');
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
@@ -222,6 +247,36 @@ test("unions: discriminant dispatch, optional chains, templates, pop/shift", asy
   expect(stdout.toString("utf8")).toBe(
     ["12 9", "8080 undefined", "tmpl=undefined", "3 1 1 2", "undefined", ""].join("\n"),
   );
+});
+
+test("S007: uncaught throw traps; effect-free values skip evaluation", async () => {
+  // The effect-free carve-out: error.new of a literal is out of tier as a
+  // VALUE, but a throw's trap makes the value unobservable, so this
+  // program must COMPILE (not refuse at libCall:error.new) and trap after
+  // the preceding output.
+  const lit = await buildWasm("throw-lit.ts", ['console.log("before");', 'throw new Error("boom");', ""].join("\n"));
+  if (!lit.ok) throw new Error(`refused: ${lit.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(lit.binaryPath))).toBe(true);
+  const litRun = await runWasmToTrap(lit.binaryPath);
+  expect(litRun.stdout.toString("utf8")).toBe("before\n");
+
+  // An effectful thrown expression evaluates in Node's order FIRST — its
+  // side effects land before the trap.
+  const eff = await buildWasm(
+    "throw-effect.ts",
+    [
+      "function boom(): string {",
+      '  console.log("side effect first");',
+      '  return "thrown";',
+      "}",
+      'console.log("before");',
+      "throw boom();",
+      "",
+    ].join("\n"),
+  );
+  if (!eff.ok) throw new Error(`refused: ${eff.diagnostics[0]?.message}`);
+  const effRun = await runWasmToTrap(eff.binaryPath);
+  expect(effRun.stdout.toString("utf8")).toBe("before\nside effect first\n");
 });
 
 test("out-of-tier constructs refuse with SC3001 and ride the survey", async () => {

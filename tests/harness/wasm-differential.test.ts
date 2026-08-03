@@ -22,10 +22,13 @@
  *    converge, and the first-refusal histogram becomes the useful one —
  *    which is the signal that this comment can go.
  *
- * A trap in a claimed program is a backend bug and FAILS the test as the
- * raised trap, never a fabricated exit code: nothing in the tier can
- * legitimately trap today (no throw, no process.exit — both still
- * refuse), so the honest report is the error itself. */
+ * A wasm TRAP in a claimed program reports as exit code 1 — the
+ * S003/S007 bridge: traps stand in for uncaught runtime errors (index
+ * checks, empty pop, `throw`) until the exception protocol lands, and
+ * Node exits 1 on an uncaught exception, so the comparison stays honest
+ * through the @exit directive and the skipped nonzero-exit stderr. Any
+ * NON-trap error (a host bug, a missing export) still fails the test as
+ * the raised error itself. */
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { globSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -233,6 +236,27 @@ const TIER_FLOOR: string[] = [
   "971-unions-switch.ts",
   "974-unions-modules/main.ts",
   "976-unions-null.ts",
+  // Increment 8 (uncaught-throw-as-trap, S007): throw compiles to a trap
+  // — an emitted program has no tryCatch, so every executed throw is
+  // uncaught, and effect-free thrown values (error.new of literals) skip
+  // evaluation so their out-of-tier construction can't refuse. Claims the
+  // union retag/narrow backstop riders, the width-lift family, var
+  // hoisting, the startup-crash pair (%main opens with the lowered
+  // throw), and the invisible/poisoned cjs-esm tails.
+  "1124-union-narrowed-retag.ts",
+  "1535-union-param-defaults.ts",
+  "1616-cjs-esm-lexer-invisible/main.mjs",
+  "1618-cjs-esm-poisoned-tail/main.mjs",
+  "1619-cjs-esm-reexport-invisible/main.mjs",
+  "1837-var-undefined-hoisting.ts",
+  "1838-var-modules/main.ts",
+  "2024-width-array-elems.ts",
+  "2025-width-union-compose.ts",
+  "2030-width-nested.ts",
+  "2122-import-refusal-crash/main.ts",
+  "2123-ambient-import-crash/main.ts",
+  "2615-nullish-field-record-binding.ts",
+  "966-unions-retag-rc-stress.ts",
 ];
 
 interface RunResult {

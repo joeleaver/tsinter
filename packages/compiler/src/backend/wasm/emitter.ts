@@ -79,6 +79,28 @@ function valKey(t: ValType): string {
   return t.kind === "ref" ? `r${t.nullable ? "?" : ""}${t.typeIndex}` : t.kind;
 }
 
+/** Conservatively effect-free expressions, used ONLY at the throw site
+ * (SEMANTICS.md S007): the trap standing in for an uncaught throw makes
+ * the thrown VALUE unobservable, so its evaluation may be skipped — but
+ * only where skipping cannot drop a side effect. Literals and variable
+ * reads qualify; error.new/error.newDom are pure allocations, which keeps
+ * `throw new Error("...")` and the frontend's own lowering backstops
+ * in-tier even though the Error CONSTRUCTION itself is out of tier. */
+function effectFree(e: IrExpr): boolean {
+  switch (e.kind) {
+    case "numLit":
+    case "strLit":
+    case "boolLit":
+    case "unitLit":
+    case "varRef":
+      return true;
+    case "libCall":
+      return (e.fn === "error.new" || e.fn === "error.newDom") && e.args.every(effectFree);
+    default:
+      return false;
+  }
+}
+
 export function emitWasmModule(mod: IrModule): Uint8Array {
   const asm = new Assembler(mod, (kind, loc) => {
     throw new WasmUnsupportedError(kind, loc);
@@ -1044,9 +1066,24 @@ class Assembler {
         this.refuse(`stmt:${s.kind}`, s.loc);
         break;
 
-      /* The exception protocol (wasm exception handling, or a lowered
-       * pending-flag unwind like the other two backends run). */
+      /* Uncaught-throw-as-trap (SEMANTICS.md S007): a program this tier
+       * emits contains no tryCatch anywhere (the construct refuses, and
+       * refusal is program-level), so every throw that executes is
+       * uncaught — Node's observables are exit 1 plus a stderr report,
+       * and the S003 bridge already reads a trap as that exit. An
+       * effect-free thrown value skips evaluation entirely, so its
+       * out-of-tier construction (error.new of a literal — `throw new
+       * Error("...")` and the frontend's lowering backstops) cannot
+       * refuse a program the trap never lets observe it; anything
+       * effectful evaluates in Node's order first, then traps. */
       case "throw":
+        if (!effectFree(s.value)) this.walkExpr(s.value);
+        code.unreachable();
+        return;
+
+      /* rethrow exists only inside catch bodies, so it rides with the
+       * exception protocol (wasm exception handling, or a lowered
+       * pending-flag unwind like the other two backends run). */
       case "rethrow":
       case "tryCatch":
         this.refuse(`stmt:${s.kind}`, s.loc);
