@@ -133,3 +133,18 @@ real programs between the thresholds are allocating gigabytes of string
 either way. **Tested by:** the wasm emitter unit test covers the trap side
 (negative count); the divergent window is deliberately untested — corpus
 programs cannot sit in it without multi-GB appetites.
+
+## S009 — A checked cast on a catch binding validates instead of erasing *(inherited)*
+
+`e as C` on a catch binding is a RUNTIME check: a payload that is an
+instance of `C` passes through, and anything else throws a catchable
+`TypeError` reading `caught value is not an instance of <C> (checked cast)`.
+Node erases the annotation, so `(e as Error).message` on a thrown string
+evaluates to `undefined` there and throws here. **Rationale:** inherited —
+`as` is the documented trust-but-verify spelling at every dynamic boundary
+in this compiler (the `dyn` surface's casts behave the same way, and
+`scr_caught_check_obj` is the C runtime's implementation), and a static tier
+that erased it would have to represent every catch payload as `dyn` to keep
+the `undefined` answer. **Tested by:** the wasm emitter unit test (a corpus
+program cannot cover it — every backend diverges from Node the same way, so
+there is no byte-exact lane to compare).

@@ -327,6 +327,16 @@ const TIER_FLOOR: string[] = [
   "985-exceptions-call-chains.ts",
   "986-exceptions-uncaught.ts",
   "987-exceptions-result-unions.ts",
+  // Increment 11 (the builtin-error member surface): name/message reads
+  // and writes off the shared error struct, toString, instanceof and the
+  // checked cast on error VALUES (not just catch bindings), and the
+  // upcast/downcast pair that carries a TypeError through an `Error`
+  // slot. Claims the error surface program outright; the rest are
+  // programs whose last refusal was one error-member read.
+  "1119-switch-union.ts",
+  "1300-errors-basics.ts",
+  "2371-iterator-helpers.ts",
+  "516-array-reduce.ts",
 ];
 
 interface RunResult {

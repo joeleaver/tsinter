@@ -402,6 +402,37 @@ test("exception protocol: catch, finally paths, rethrow, TDZ", async () => {
   );
 });
 
+test("S009: a checked cast on a catch binding validates, it does not erase", async () => {
+  // No corpus program can pin this: Node erases `as`, so `(e as Error)`
+  // on a thrown string answers `undefined` there while every backend here
+  // throws the catchable TypeError. The passing half rides the corpus.
+  const res = await buildWasm(
+    "caught-check.ts",
+    [
+      "function msgOf(v: string | number): string {",
+      "  try {",
+      '    if (typeof v === "string") throw v;',
+      '    throw new RangeError("r" + v);',
+      "  } catch (e) {",
+      "    return (e as Error).message;",
+      "  }",
+      "}",
+      "console.log(msgOf(1));",
+      "try {",
+      '  console.log(msgOf("nope"));',
+      "} catch (e) {",
+      '  if (e instanceof TypeError) console.log(e.name + ": " + e.message);',
+      "}",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    ["r1", "TypeError: caught value is not an instance of Error (checked cast)", ""].join("\n"),
+  );
+});
+
 test("S008: repeat's invalid count is the RangeError trap", async () => {
   const res = await buildWasm(
     "repeat-neg.ts",
