@@ -64,10 +64,12 @@ function nodesOfKind(root: unknown, kind: string): Record<string, unknown>[] {
   return out;
 }
 
-/** The `while (true) switch (frame.%state)` skeleton, unpacked. */
+/** The `while (true) switch (frame.%state)` skeleton, unpacked — past the
+ * one-statement cast prologue every resume opens with (its parameter is
+ * the SHARED frame base; see frameCastPrologue below). */
 function dispatch(resume: WFunction): { test: number | null; body: IrStmt[] }[] {
-  expect(resume.body).toHaveLength(1);
-  const tc = resume.body[0]!;
+  expect(resume.body).toHaveLength(2);
+  const tc = resume.body[1]!;
   expect(tc.kind).toBe("tryCatch");
   if (tc.kind !== "tryCatch") throw new Error("unreachable");
   expect(tc.finallyBody).toBeNull();
@@ -165,10 +167,29 @@ describe("two sequential awaits", () => {
     expect(answer.value).toMatchObject({ kind: "recordGet", field: "%promise" });
   });
 
+  test("resume takes the SHARED base frame and casts it down once", () => {
+    // Every resume has the one signature (base) → void — the only way a
+    // waiter queue can hold frames from different async functions — and
+    // recovers its own shape in a single prologue statement.
+    expect(resume.params.map((p) => p.localId)).toEqual(["%async.frameAny"]);
+    expect(resume.params[0]!.type).toEqual({ kind: "%frameBase" });
+    const prologue = resume.body[0]!;
+    expect(prologue.kind).toBe("varDecl");
+    if (prologue.kind !== "varDecl") throw new Error("unreachable");
+    expect(prologue.localId).toBe("%async.frame");
+    expect(prologue.init).toMatchObject({
+      kind: "%async.frameCast",
+      type: { kind: "record", shapeId: "%frame.f" },
+      value: { kind: "varRef", localId: "%async.frameAny" },
+    });
+    // Nothing else in the body mentions the base-typed parameter: the
+    // state machine is concretely typed from the cast onward.
+    expect(nodesOfKind(resume.body[1], "varRef").filter((r) => r["localId"] === "%async.frameAny")).toHaveLength(0);
+  });
+
   test("resume is a void tryCatch/while/switch over three states", () => {
     expect(resume.async).toBeUndefined();
     expect(resume.returnType).toEqual(VOID);
-    expect(resume.params.map((p) => p.localId)).toEqual(["%async.frame"]);
     const cases = dispatch(resume);
     // states 0, 1, 2 plus the defensive default.
     expect(cases.map((c) => c.test)).toEqual([0, 1, 2, null]);
@@ -176,7 +197,7 @@ describe("two sequential awaits", () => {
   });
 
   test("the catch arm rejects the frame's own promise", () => {
-    const tc = resume.body[0]!;
+    const tc = resume.body[1]!;
     if (tc.kind !== "tryCatch") throw new Error("unreachable");
     expect(tc.catchBody!.map((s) => s.kind)).toEqual(["%async.reject", "return"]);
   });
@@ -615,6 +636,30 @@ describe("refusals leave the function untouched", () => {
     );
   });
 
+  test("awaiting a promise OF a promise (JS would adopt it)", () => {
+    // `await p` where p is Promise<Promise<T>>: JS flattens by adoption —
+    // the awaiting frame ends up with T, two microtask turns later. This
+    // tier stores payloads, so settling with a promise would hand the
+    // INNER promise back: a miscompile, not a slower answer.
+    expectRefusal(
+      plain([exprStmt(await_(call("mkpp", [], promiseOf(promiseOf(F64))), promiseOf(F64)))]),
+      "fn:async:nested-promise",
+    );
+  });
+
+  test("an async function whose own result is a promise", () => {
+    const fn: IrFunction = {
+      name: "f",
+      params: [],
+      returnType: promiseOf(F64),
+      async: true,
+      locals: [],
+      body: [ret(call("mkp", [], promiseOf(F64)))],
+      loc,
+    };
+    expectRefusal(fn, "fn:async:nested-promise");
+  });
+
   test("a source local colliding with the pass's own bindings", () => {
     expectRefusal(
       plain([exprStmt(awaitCall())], [local("%async.frame", F64)]),
@@ -749,15 +794,42 @@ describe("the wasm survey over a lowered module", () => {
     expect(survey).not.toContain("record:index-signature");
   });
 
-  test("the whole-function gate is gone; the runtime seam is what is left", () => {
-    expect(survey).not.toContain("fn:async");
-    expect(survey).toContain("expr:%async.mint");
-    expect(survey).toContain("expr:%async.settled");
-    expect(survey).toContain("stmt:%async.subscribe");
-    expect(survey).toContain("stmt:%async.settle");
-    expect(survey).toContain("stmt:%async.rejectCheck");
-    expect(survey).toContain("stmt:%async.reject");
-    // The promise representation itself is stage 2's other half.
-    expect(survey).toContain("type:promise");
+  test("nothing is left to refuse: the whole seam emits", () => {
+    // Stage 1 traded `fn:async` for the ten `%async.*` names; stage 2's
+    // runtime is what retired those, so a plain two-await function now
+    // surveys CLEAN — no whole-function gate, no runtime seam, and no
+    // `type:promise` (one struct serves every promise).
+    expect(survey).toEqual([]);
   });
+});
+
+/* ── 9. the union-armed seam still waits ───────────────────────────────── */
+
+test("an awaited `Promise<T> | undefined` names the arm dispatch it needs", () => {
+  const inner = { kind: "union" as const, unionId: "u0" };
+  const fn: IrFunction = {
+    name: "f",
+    params: [],
+    returnType: VOID,
+    async: true,
+    locals: [],
+    body: [
+      exprStmt({
+        kind: "awaitUnionExpr",
+        value: { kind: "varRef", localId: "%g.p", type: inner, loc },
+        promiseTag: 0,
+        type: VOID,
+        loc,
+      }),
+    ],
+    loc,
+  };
+  const mod = asyncModule(fn);
+  const survey = surveyWasmModule({
+    ...mod,
+    globals: [{ id: "%g.p", type: inner, loc }],
+    unions: [{ id: "u0", arms: [promiseOf(F64), { kind: "undefinedT" }] }],
+  });
+  expect(survey).toContain("stmt:%async.subscribeUnion");
+  expect(survey).toContain("stmt:%async.rejectCheckUnion");
 });

@@ -15,11 +15,11 @@
  * a mismatched section count instead of the real bug.
  *
  * Type-section ordering: entries land in interning order, and a type can
- * only REFERENCE an earlier entry (each entry here is its own implicit
- * singleton rec group — the backend declares no subtyping and no mutual
- * recursion). Call order enforces this for free: building a ref valtype
- * requires the referenced type's index, so the referent is always interned
- * first. */
+ * only REFERENCE an earlier entry — or ITSELF, since an entry with no
+ * explicit `rec` is its own singleton recursive group (which is what
+ * makes `selfStructType`'s intrusive lists legal). Call order enforces
+ * the backward rule for free: building a ref valtype requires the
+ * referenced type's index, so the referent is always interned first. */
 import { ByteWriter } from "./bytes.js";
 
 export type ValType =
@@ -155,6 +155,27 @@ export class ModuleBuilder {
     if (existing !== undefined) return existing;
     const index = this.types.length;
     this.types.push({ kind: "struct", fields, sub: { supers: [], final: false } });
+    this.typeIndex.set(key, index);
+    return index;
+  }
+
+  /** A struct one of whose fields REFERENCES THE STRUCT ITSELF (the
+   * promise runtime's intrusive lists): `make` receives the index the
+   * entry is about to occupy, so a field can name it. Legal because a
+   * plain type-section entry is its own singleton recursive group.
+   *
+   * `make` must not intern anything — the reserved index would move under
+   * it — so callers resolve every OTHER type the fields need first. Keyed
+   * by meaning like subStructType. */
+  selfStructType(key: string, make: (self: number) => FieldType[]): number {
+    const existing = this.typeIndex.get(key);
+    if (existing !== undefined) return existing;
+    const index = this.types.length;
+    const fields = make(index);
+    if (this.types.length !== index) {
+      throw new Error(`selfStructType("${key}"): make() interned a type`);
+    }
+    this.types.push({ kind: "struct", fields });
     this.typeIndex.set(key, index);
     return index;
   }

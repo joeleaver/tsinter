@@ -62,6 +62,14 @@ import {
 import { computeMayThrow } from "../emission/may-throw.js";
 import { EXPORT_ENTRY, EXPORT_MEMORY, FD_STDERR, FD_STDOUT, IMPORT_MODULE, IMPORT_WRITE } from "./abi.js";
 import { VecBuilder, type VecInfo } from "./arrays.js";
+import {
+  PromiseBuilder,
+  PROM_F64,
+  PROM_KIND,
+  PROM_OBSERVED,
+  PROM_REF,
+  PROM_STATE,
+} from "./promises.js";
 import { StrBuilder } from "./strings.js";
 import { UnionBuilder, type UnionArmRep } from "./unions.js";
 import { Code } from "./code.js";
@@ -75,6 +83,7 @@ import {
   type WFunction,
   type WModule,
   type WStmt,
+  type WType,
 } from "./statemachine.js";
 import { WasmUnsupportedError } from "./unsupported.js";
 
@@ -165,6 +174,10 @@ const EXC_OBJ = 5;
  * slot every thrown ref shares. */
 const ANY_HEAP = -0x12;
 const ANY_REF: ValType = { kind: "ref", nullable: true, typeIndex: ANY_HEAP };
+
+/** Record shapes the resumable lowering owns (statemachine.ts names them
+ * `%frame.<fn>`): the ONLY shapes that declare a supertype. */
+const FRAME_SHAPE_PREFIX = "%frame.";
 
 /* ── the assembler: one walk, both sinks ───────────────────────────────── */
 
@@ -426,6 +439,80 @@ class Assembler {
     }
   }
 
+  /** Push a settled promise's (kind, f64, ref) payload triple from a
+   * value's STATIC type — emitThrowValue's dispatch, answering the same
+   * three slots because a promise payload and a thrown payload share one
+   * encoding. `null` is a VOID fulfilment (kind 0, no payload). The
+   * unused slots still push their zero: the runtime takes all three. */
+  private emitPayload(v: WExpr | null, what: string, loc: SrcLoc): void {
+    const code = this.fn.code;
+    if (v === null) {
+      code.i32Const(0);
+      code.f64Const(0);
+      code.refNull(ANY_HEAP);
+      return;
+    }
+    const t = v.type;
+    switch (t.kind) {
+      case "void":
+        // A void-typed call in value position: run it, carry nothing.
+        this.walkExpr(v);
+        code.i32Const(0);
+        code.f64Const(0);
+        code.refNull(ANY_HEAP);
+        return;
+      case "f64":
+        code.i32Const(EXC_F64);
+        this.walkExpr(v);
+        code.refNull(ANY_HEAP);
+        return;
+      case "bool":
+        code.i32Const(EXC_BOOL);
+        this.walkExpr(v);
+        code.f64ConvertI32U();
+        code.refNull(ANY_HEAP);
+        return;
+      case "string":
+        code.i32Const(EXC_STR);
+        code.f64Const(0);
+        this.walkExpr(v);
+        return;
+      case "object":
+        // Builtin error instances — the only in-tier objects, and the
+        // shape %w.err.toStr renders in the unhandled report.
+        if (this.mapType(t, v.loc) === null) {
+          code.i32Const(0);
+          code.f64Const(0);
+          code.refNull(ANY_HEAP);
+          return;
+        }
+        code.i32Const(EXC_OBJ);
+        code.f64Const(0);
+        this.walkExpr(v);
+        return;
+      case "promise":
+        // Settling WITH a promise is adoption (see promises.ts): the
+        // payload would have to be subscribed to, not stored. The
+        // lowering refuses these functions up front; this is the
+        // backstop for any other route to the same shape.
+        this.refuse(`${what}:adopt`, loc);
+        code.unreachable();
+        return;
+      default: {
+        const soft = this.mapType(t, v.loc);
+        if (soft === null || soft.kind !== "ref") {
+          this.refuse(`${what}:${t.kind}`, loc);
+          code.unreachable();
+          return;
+        }
+        code.i32Const(EXC_REF);
+        code.f64Const(0);
+        this.walkExpr(v);
+        return;
+      }
+    }
+  }
+
   run(): void {
     // The two whole-module emission modes: library mode replaces main with
     // the profile's exported symbols, and the island's embedded npm graph
@@ -473,11 +560,24 @@ class Assembler {
         // An exception that unwound out of %main is UNCAUGHT: Node's
         // observables are exit 1 plus a stderr report, and the trap
         // bridge reports exactly that exit (stderr skipped on nonzero
-        // exits — SEMANTICS.md S007's surviving half).
+        // exits — SEMANTICS.md S007's surviving half). BEFORE the drain,
+        // deliberately: a synchronous uncaught throw exits without
+        // running a single microtask, which is Node's order.
         c.globalGet(this.exc().kindG);
         c.ifVoid();
         c.unreachable();
         c.end();
+      }
+      // The event loop, such as it is: run microtasks to quiescence, then
+      // answer for any rejection nobody ever looked at. Frames still
+      // parked on a promise that never settles are simply dropped — an
+      // empty queue IS exit 0, which is what Node does with a suspended
+      // await nothing will resolve. Nothing is emitted at all when the
+      // module has no promise surface (the runtime interns on first use,
+      // so a null builder means nothing ever needed it).
+      if (this.promsField !== null) {
+        c.call(this.proms.drain());
+        c.call(this.proms.report());
       }
       this.mb.setBody(start, [], c.bytes());
     }
@@ -638,7 +738,14 @@ class Assembler {
       if (!soft) this.refuseRecord(shapeId, loc);
       return null;
     }
-    const struct = this.mb.structType(fields);
+    // A resumable function's frame is a SUBTYPE of the shared frame base,
+    // which is the whole reason one waiter queue can hold every async
+    // function's parked frames (statemachine.ts's ONE RESUME SIGNATURE).
+    // Keyed by shape id — two frames with identical layouts are still
+    // distinct declarations, exactly like closure envs.
+    const struct = shapeId.startsWith(FRAME_SHAPE_PREFIX)
+      ? this.mb.subStructType(`frame:${shapeId}`, fields, this.frameBaseType())
+      : this.mb.structType(fields);
     const made = { struct, fieldIndex: new Map(shape.fields.map((f, i) => [f.name, i])) };
     this.recordInfos.set(shapeId, made);
     return made;
@@ -707,6 +814,45 @@ class Assembler {
       ],
       pair.clos,
     );
+  }
+
+  /* ── the resumable lowering's runtime ───────────────────────────────────
+   *
+   * One promise struct, one waiter queue, one rejection ledger
+   * (promises.ts) — plus the empty OPEN struct every frame shape subtypes,
+   * which is what gives every `%<fn>.resume` the same wasm signature and
+   * so lets the queue be typed at all. Both are interned on first use, so
+   * a module with no promise surface emits neither. */
+
+  private frameBaseField: number | null = null;
+
+  private frameBaseType(): number {
+    this.frameBaseField ??= this.mb.openStructType("%frameBase", []);
+    return this.frameBaseField;
+  }
+
+  private promsField: PromiseBuilder | null = null;
+
+  private get proms(): PromiseBuilder {
+    this.promsField ??= new PromiseBuilder(this.mb, this.strType, {
+      frameBase: () => this.frameBaseType(),
+      resumeClos: () => this.resumeClosPair(),
+      tags: { f64: EXC_F64, bool: EXC_BOOL, str: EXC_STR, obj: EXC_OBJ },
+      anyRef: ANY_REF,
+      errT: () => this.exc().errT,
+      f64ToStr: () => this.f64ToStrHelper(),
+      errToStr: () => this.errToStrHelper(),
+      out: () => this.ensureHelpers(),
+      lit: (c, s) => this.pushStrLitInto(c, s),
+    });
+    return this.promsField;
+  }
+
+  /** The signature EVERY resume has: (frame base) → void. The waiter
+   * queue's call_ref goes through this pair, and so does every `closure`
+   * node over a resume (the lowering types them the same way). */
+  private resumeClosPair(): { clos: number; fn: number } {
+    return this.closPairFor([{ kind: "ref", nullable: true, typeIndex: this.frameBaseType() }], []);
   }
 
   /* ── unions ─────────────────────────────────────────────────────────────
@@ -827,8 +973,13 @@ class Assembler {
    * as an array of UTF-16 code units (S002; nullable in binding positions
    * — a refcounted local is NULL until its first assign, and the
    * frontend's definite-assignment guarantee means no read observes it).
-   * Everything else is unrepresented work. */
-  private mapType(t: IrType, loc: SrcLoc | undefined): ValType | null {
+   * Everything else is unrepresented work.
+   *
+   * Takes the lowering's WType, not IrType: the resumable pass types
+   * resume's parameter with its private `%frameBase`, which is a real
+   * representation here (the promise runtime's frame handle) even though
+   * no frontend IR spells it. */
+  private mapType(t: WType, loc: SrcLoc | undefined): ValType | null {
     switch (t.kind) {
       case "f64":
         return F64;
@@ -857,6 +1008,15 @@ class Assembler {
       case "caught":
         // A catch binding: the immutable exception snapshot.
         return { kind: "ref", nullable: true, typeIndex: this.exc().caughtT };
+      case "promise":
+        // Every promise is the ONE runtime struct whatever its inner type
+        // (promises.ts's header): the payload rides a tagged triple, so
+        // the inner type is the READING side's business, never the
+        // representation's.
+        return this.proms.promRef();
+      case "%frameBase":
+        // The lowering's frame handle — resume's uniform parameter.
+        return { kind: "ref", nullable: true, typeIndex: this.frameBaseType() };
       case "object":
         // The builtin error classes share the ONE error struct (their
         // class id is a field, not a type); every other object waits on
@@ -875,7 +1035,7 @@ class Assembler {
   /** The pre-pass variant: a placeholder for unmappable types, NO refusal.
    * Only reachable bytes matter, and a placeholder can never become one:
    * the honest gate re-maps the same types before any module is emitted. */
-  private mapTypeSoft(t: IrType): ValType {
+  private mapTypeSoft(t: WType): ValType {
     switch (t.kind) {
       case "f64":
         return F64;
@@ -899,6 +1059,7 @@ class Assembler {
           t.elem.kind === "func" ||
           t.elem.kind === "record" ||
           t.elem.kind === "union" ||
+          t.elem.kind === "promise" ||
           (t.elem.kind === "object" && RUNTIME_ERROR_CLASSES.has(t.elem.className));
         if (!mappable) return I32;
         const kind =
@@ -928,6 +1089,11 @@ class Assembler {
       case "caught":
         // mapType never fails on caught — same consistency rule.
         return { kind: "ref", nullable: true, typeIndex: this.exc().caughtT };
+      case "promise":
+        // mapType never fails on promises either (one struct for all).
+        return this.proms.promRef();
+      case "%frameBase":
+        return { kind: "ref", nullable: true, typeIndex: this.frameBaseType() };
       case "object":
         // Same arm as mapType: builtin errors map, the rest placeholder.
         if (RUNTIME_ERROR_CLASSES.has(t.className)) {
@@ -1545,17 +1711,90 @@ class Assembler {
         return;
       }
 
-      /* The resumable lowering's runtime seam (statemachine.ts). The pass
-       * produces these and stage 2 emits them; until then they refuse
-       * under their own names, so a program whose async bodies DID
-       * linearize names the promise runtime it is waiting on instead of
-       * the whole-function `fn:async`. */
+      /* ── the resumable lowering's runtime seam (statemachine.ts) ──── */
+
+      /** Park (resume, frame) on the awaited promise — or, when it has
+       * already settled, spend the one microtask turn anyway. */
       case "%async.subscribe":
+        this.walkExpr(s.promise);
+        this.walkExpr(s.resume);
+        this.walkExpr(s.frame);
+        code.call(this.proms.subscribe());
+        return;
+
+      /** `await <non-thenable>`: no promise, just the turn. */
       case "%async.hop":
-      case "%async.subscribeUnion":
+        this.walkExpr(s.resume);
+        this.walkExpr(s.frame);
+        code.call(this.proms.hop());
+        return;
+
+      /** Fulfil my own promise. The value's STATIC type picks the payload
+       * slot, emitThrowValue's dispatch exactly — the two share the cell's
+       * encoding, which is what lets a rejection copy across field-wise. */
       case "%async.settle":
-      case "%async.reject":
-      case "%async.rejectCheck":
+        this.walkExpr(s.promise);
+        this.emitPayload(s.value, "settle", s.loc);
+        code.i32Const(1);
+        code.call(this.proms.settle());
+        return;
+
+      /** Reject my own promise with a caught snapshot: the three slots
+       * move over unread — a rejection payload IS a thrown payload. */
+      case "%async.reject": {
+        const exc = this.exc();
+        const c = this.acquireScratch(this.caughtRef());
+        this.walkExpr(s.caught);
+        code.localSet(c);
+        this.walkExpr(s.promise);
+        code.localGet(c);
+        code.structGet(exc.caughtT, 0);
+        code.localGet(c);
+        code.structGet(exc.caughtT, 1);
+        code.localGet(c);
+        code.structGet(exc.caughtT, 2);
+        code.i32Const(2);
+        code.call(this.proms.settle());
+        this.releaseScratch(this.caughtRef(), c);
+        return;
+      }
+
+      /** Re-entry after an await: a REJECTED promise re-throws here —
+       * observe it (it is handled, by this frame), copy the payload into
+       * the exception cell (kind LAST, the commit) and unwind, which lands
+       * in resume's own catch and becomes this frame's rejection. */
+      case "%async.rejectCheck": {
+        const exc = this.exc();
+        const pr = this.acquireScratch(this.proms.promRef());
+        this.walkExpr(s.promise);
+        code.localSet(pr);
+        code.localGet(pr);
+        code.structGet(this.proms.promT, PROM_STATE);
+        code.i32Const(2);
+        code.i32Eq();
+        this.openIf();
+        code.localGet(pr);
+        code.i32Const(1);
+        code.structSet(this.proms.promT, PROM_OBSERVED);
+        code.localGet(pr);
+        code.structGet(this.proms.promT, PROM_F64);
+        code.globalSet(exc.f64G);
+        code.localGet(pr);
+        code.structGet(this.proms.promT, PROM_REF);
+        code.globalSet(exc.refG);
+        code.localGet(pr);
+        code.structGet(this.proms.promT, PROM_KIND);
+        code.globalSet(exc.kindG);
+        this.emitUnwind();
+        this.close();
+        this.releaseScratch(this.proms.promRef(), pr);
+        return;
+      }
+
+      /* The union-armed suspensions (`Promise<T> | undefined`) wait on the
+       * arm dispatch: which arm a value carries decides between parking
+       * and hopping, and that read is the union surface's work. */
+      case "%async.subscribeUnion":
       case "%async.rejectCheckUnion":
         this.refuse(`stmt:${s.kind}`, s.loc);
         return;
@@ -2534,6 +2773,68 @@ class Assembler {
         return;
       }
 
+      /* ── the resumable lowering's expression seam ─────────────────── */
+
+      /** The pending promise a spawn wrapper hands back. */
+      case "%async.mint":
+        code.call(this.proms.mint());
+        return;
+
+      /** Resume's prologue: the base-typed parameter narrowed to this
+       * function's own frame. Cannot fail — the runtime hands back the
+       * frame this resume parked. */
+      case "%async.frameCast": {
+        const t = e.type;
+        if (t.kind !== "record") throw new Error("%async.frameCast to a non-record");
+        const info = this.recordInfo(t.shapeId, e.loc, false);
+        if (info === null) {
+          code.unreachable();
+          return;
+        }
+        this.walkExpr(e.value);
+        code.refCast(info.struct);
+        return;
+      }
+
+      /** The value a resumed frame was woken with, read back by the AWAIT
+       * SITE's static type (the payload triple carries no type of its
+       * own). A rejected promise never reaches here — the re-entry's
+       * %async.rejectCheck unwound first. */
+      case "%async.settled": {
+        const t = e.type;
+        const promT = this.proms.promT;
+        if (t.kind === "f64") {
+          this.walkExpr(e.promise);
+          code.structGet(promT, PROM_F64);
+          return;
+        }
+        if (t.kind === "bool") {
+          this.walkExpr(e.promise);
+          code.structGet(promT, PROM_F64);
+          code.f64Const(0);
+          code.f64Ne();
+          return;
+        }
+        const val = this.mapType(t, e.loc);
+        if (val === null || val.kind !== "ref") {
+          this.refuse(`expr:%async.settled:${t.kind}`, e.loc);
+          code.unreachable();
+          return;
+        }
+        this.walkExpr(e.promise);
+        code.structGet(promT, PROM_REF);
+        code.refCast(val.typeIndex);
+        return;
+      }
+
+      /** `new Promise<T>(executor)`: mint, hand the executor its resolve
+       * (and reject) closure, and run it SYNCHRONOUSLY — JS-exact. An
+       * executor throw REJECTS the promise instead of unwinding into the
+       * creator, which is why this cannot use the ordinary pending check. */
+      case "newPromise":
+        this.emitNewPromise(e);
+        return;
+
       case "optChain": {
         // `a?.b`: the receiver (a unit-armed union with ONE non-unit arm)
         // evaluates once; a unit tag short-circuits to the result's
@@ -2626,13 +2927,31 @@ class Assembler {
           case "console.error":
             this.emitConsole(e.name, FD_STDERR, e.args);
             return;
-          /* The promise surface waits on the async story (IR-level
-           * state-machine lowering); module.await on the async-module
-           * machinery above it. */
+          /* `Promise.resolve(v)` / `Promise.reject(e)`: a fresh promise
+           * settled on the spot. The validator guarantees the shapes —
+           * resolve takes zero args (Promise<void>) or one NON-promise
+           * value of the result's inner type, reject one %Error-rooted
+           * reason — so both are a mint plus one settle, and the rejected
+           * one enters the ledger like any other rejection. */
+          case "promise.resolve":
+          case "promise.reject": {
+            const rejecting = e.name === "promise.reject";
+            const p = this.acquireScratch(this.proms.promRef());
+            code.call(this.proms.mint());
+            code.localSet(p);
+            code.localGet(p);
+            this.emitPayload(e.args[0] ?? null, e.name, e.loc);
+            code.i32Const(rejecting ? 2 : 1);
+            code.call(this.proms.settle());
+            code.localGet(p);
+            this.releaseScratch(this.proms.promRef(), p);
+            return;
+          }
+          /* Promise.all/race combine SUBSCRIPTIONS across a set of
+           * promises (per-entry adapters in the native lane); module.await
+           * waits on the async-module machinery. */
           case "promise.race":
           case "promise.all":
-          case "promise.reject":
-          case "promise.resolve":
           case "module.await":
             this.refuse(`intrinsic:${e.name}`, e.loc);
             code.unreachable();
@@ -2986,13 +3305,21 @@ class Assembler {
       case "setIntrinsic":
       /* Native FFI — a link-time C ABI, nothing to link against here. */
       case "ffiCall":
-      /* Async, generators, promises. */
+      /* Async, generators, promises. (awaitExpr/awaitUnionExpr never
+       * reach here in a function the lowering accepted — they are what it
+       * consumes; one that survives belongs to a REFUSED async function
+       * and reports as `fn:async` before its body is walked.) */
       case "yieldExpr":
       case "genResume":
       case "awaitExpr":
       case "awaitUnionExpr":
-      case "newPromise":
+      /* Promise.withResolvers hands the resolve/reject pair out as VALUES
+       * in a record, which needs the pair to outlive the expression —
+       * newPromise's executor-scoped closures do not generalize to it. */
       case "promiseWithResolvers":
+      /* Widening promise<T> into promise<void> is representationally free
+       * here (one struct), but the awaiting side then reads a payload it
+       * has no type for — the void-await path is its own work. */
       case "promiseVoidWiden":
       case "jsBridgePromise":
       /* Classes: GC structs, vtables for the virtual slice. */
@@ -3027,11 +3354,8 @@ class Assembler {
       case "jsMarshal":
       case "jsOp":
       case "jsExit":
-      /* The resumable lowering's expression seam (statemachine.ts) —
-       * minting the spawned promise and reading a resumed frame's settled
-       * value. Stage 2's promise runtime is what these wait on. */
-      case "%async.mint":
-      case "%async.settled":
+      /* The union-armed settled read waits on the same arm dispatch its
+       * subscribe sibling does. */
       case "%async.settledUnion":
         this.refuse(`expr:${e.kind}`, e.loc);
         code.unreachable();
@@ -3129,10 +3453,11 @@ class Assembler {
   /** A DISTINCT key per element representation — `func` keys by the
    * signature's closure type index and `record` by shape id, or two
    * different func-element arrays would intern one (wrong) vector type.
-   * `union` deliberately stays ONE key (the default arm): every union
-   * value is a ref to the one shared base, so one vector type and one
-   * ref.eq helper family serve every union-element array — the C lane's
-   * pointer-identity stance for union elements, shared. */
+   * `union` and `promise` deliberately stay ONE key each (the default
+   * arm): every union value is a ref to the one shared base and every
+   * promise is the one runtime struct, so one vector type and one ref.eq
+   * helper family serve every such array — the C lane's pointer-identity
+   * stance for union elements, shared. */
   private vecKeyFor(t: IrType): string {
     switch (t.kind) {
       case "array":
@@ -3633,6 +3958,173 @@ class Assembler {
     for (const s of staged) {
       if (s !== null) this.releaseScratch(s.kind === "str" ? { kind: "ref", nullable: true, typeIndex: this.strType } : I32, s.local);
     }
+  }
+
+  /* ── new Promise(executor) ──────────────────────────────────────────────
+   *
+   * `new Promise<T>((resolve, reject) => ...)` is a mint, one or two
+   * settler CLOSURES over that promise, and a synchronous call. The
+   * settlers are emitted functions (one per payload representation, since
+   * the body is just "settle my captured promise with my argument"), and
+   * their environment is a one-field subtype of the settler signature's
+   * closure struct holding the promise — envTypeFor's shape without an IR
+   * function to derive it from.
+   *
+   * The executor is the ONE call site with a custom pending check: a
+   * throw out of it REJECTS the promise (JS-exact) and the creator keeps
+   * running, so the cell is drained into the rejection rather than
+   * unwound. */
+
+  private readonly settlerFns = new Map<string, number>();
+
+  /** The settler for one payload shape: `(v: T) => void` fulfilling (or
+   * `(e) => void` rejecting) the promise in its environment. */
+  private settlerFor(param: IrType | null, state: 1 | 2, loc: SrcLoc | undefined): number | null {
+    const val = param === null ? null : this.mapType(param, loc);
+    if (param !== null && val === null) return null;
+    const params = val === null ? [] : [val];
+    const pair = this.closPairFor(params, []);
+    const key = `${state}:${valKey({ kind: "ref", nullable: true, typeIndex: pair.fn })}`;
+    const cached = this.settlerFns.get(key);
+    if (cached !== undefined) return cached;
+    const env = this.mb.subStructType(
+      `settlerEnv:${key}`,
+      [
+        { storage: { kind: "ref", nullable: false, typeIndex: pair.fn }, mutable: false },
+        { storage: this.proms.promRef(), mutable: false },
+      ],
+      pair.clos,
+    );
+    const idx = this.mb.declareFunc(pair.fn, `%w.async.${state === 1 ? "resolve" : "reject"}.${this.settlerFns.size}`);
+    this.settlerFns.set(key, idx);
+    const c = new Code();
+    c.localGet(0);
+    c.refCast(env);
+    c.structGet(env, 1);
+    // The payload triple, from the settler's PARAM type — the same static
+    // dispatch emitPayload does, over an argument instead of an expression.
+    if (param === null || param.kind === "void") {
+      c.i32Const(0);
+      c.f64Const(0);
+      c.refNull(ANY_HEAP);
+    } else if (param.kind === "f64") {
+      c.i32Const(EXC_F64);
+      c.localGet(1);
+      c.refNull(ANY_HEAP);
+    } else if (param.kind === "bool") {
+      c.i32Const(EXC_BOOL);
+      c.localGet(1);
+      c.f64ConvertI32U();
+      c.refNull(ANY_HEAP);
+    } else if (param.kind === "string") {
+      c.i32Const(EXC_STR);
+      c.f64Const(0);
+      c.localGet(1);
+    } else if (param.kind === "object") {
+      c.i32Const(EXC_OBJ);
+      c.f64Const(0);
+      c.localGet(1);
+    } else {
+      c.i32Const(EXC_REF);
+      c.f64Const(0);
+      c.localGet(1);
+    }
+    c.i32Const(state);
+    c.call(this.proms.settle());
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  /** The settler CLOSURE value: ref.func + the promise, in its env. */
+  private pushSettler(fnIndex: number, param: IrType | null, state: 1 | 2, promLocal: number): void {
+    const code = this.fn.code;
+    const val = param === null ? null : this.mapTypeSoft(param);
+    const pair = this.closPairFor(val === null ? [] : [val], []);
+    const key = `${state}:${valKey({ kind: "ref", nullable: true, typeIndex: pair.fn })}`;
+    const env = this.mb.subStructType(
+      `settlerEnv:${key}`,
+      [
+        { storage: { kind: "ref", nullable: false, typeIndex: pair.fn }, mutable: false },
+        { storage: this.proms.promRef(), mutable: false },
+      ],
+      pair.clos,
+    );
+    this.mb.declareFuncRef(fnIndex);
+    code.refFunc(fnIndex);
+    code.localGet(promLocal);
+    code.structNew(env);
+  }
+
+  private emitNewPromise(e: Extract<IrExpr, { kind: "newPromise" }>): void {
+    const code = this.fn.code;
+    const ex = e.executor.type;
+    if (ex.kind !== "func") throw new Error("newPromise executor is not a function");
+    if (ex.params.length > 2) {
+      this.refuse("expr:newPromise:arity", e.loc);
+      code.unreachable();
+      return;
+    }
+    // resolve(p) where p is a promise is ADOPTION — the payload would have
+    // to be subscribed to (promises.ts's header), not stored.
+    if (ex.params.some((p) => p.kind === "func" && p.params.some((q) => q.kind === "promise"))) {
+      this.refuse("expr:newPromise:adopt", e.loc);
+      code.unreachable();
+      return;
+    }
+    const settlers: { fn: number; param: IrType | null; state: 1 | 2 }[] = [];
+    for (const [i, p] of ex.params.entries()) {
+      if (p.kind !== "func" || p.params.length > 1) {
+        this.refuse("expr:newPromise:settler", e.loc);
+        code.unreachable();
+        return;
+      }
+      const state = i === 0 ? 1 : 2;
+      const param = p.params[0] ?? null;
+      const fn = this.settlerFor(param, state, e.loc);
+      if (fn === null) {
+        // The settler's payload representation refused by name already.
+        code.unreachable();
+        return;
+      }
+      settlers.push({ fn, param, state });
+    }
+    const exc = this.exc();
+    const pr = this.acquireScratch(this.proms.promRef());
+    code.call(this.proms.mint());
+    code.localSet(pr);
+
+    const closPair = this.closSigFor(ex, e.loc);
+    if (closPair === null) {
+      code.unreachable();
+      return;
+    }
+    const closRef: ValType = { kind: "ref", nullable: true, typeIndex: closPair.clos };
+    const ec = this.acquireScratch(closRef);
+    this.walkExpr(e.executor);
+    code.localSet(ec);
+    code.localGet(ec); // arg0: the executor closure itself
+    for (const s of settlers) this.pushSettler(s.fn, s.param, s.state, pr);
+    code.localGet(ec);
+    code.structGet(closPair.clos, 0);
+    code.callRef(closPair.fn);
+    this.releaseScratch(closRef, ec);
+
+    // The executor's own exception: it rejects the promise and STOPS
+    // THERE. Node runs the rest of the creating function normally, so the
+    // cell is drained here rather than unwound.
+    code.globalGet(exc.kindG);
+    this.openIf();
+    code.localGet(pr);
+    code.globalGet(exc.kindG);
+    code.globalGet(exc.f64G);
+    code.globalGet(exc.refG);
+    code.i32Const(2);
+    code.call(this.proms.settle());
+    this.emitCellClear();
+    this.close();
+
+    code.localGet(pr);
+    this.releaseScratch(this.proms.promRef(), pr);
   }
 
   private scratchKey(t: ValType): string {

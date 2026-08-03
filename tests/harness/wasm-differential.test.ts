@@ -337,6 +337,23 @@ const TIER_FLOOR: string[] = [
   "1300-errors-basics.ts",
   "2371-iterator-helpers.ts",
   "516-array-reduce.ts",
+  // Increment 12 (async), stage 2: the promise runtime under the state
+  // machines — one promise struct, a FIFO microtask queue drained after
+  // the entry returns, and the unhandled-rejection ledger. Every await
+  // spends exactly one turn, which is what makes these four match Node's
+  // interleaving byte-for-byte.
+  //
+  // A promise nobody resolves: the parked frame is dropped and quiescence
+  // is exit 0.
+  "1024-async-pending-exit.ts",
+  // Awaited record results across two suspensions (the checker's
+  // `T | PromiseLike<T>` return form).
+  "1538-await-promiselike-return.ts",
+  // Fire-and-forget `void asyncFn()` beside an awaiting one.
+  "1540-void-statement.ts",
+  // `await null` / `await undefined` interleaved with `.then` chains —
+  // the bare microtask hop against settled-promise awaits, one turn each.
+  "2320-await-unit.ts",
 ];
 
 interface RunResult {

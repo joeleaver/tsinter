@@ -148,3 +148,24 @@ that erased it would have to represent every catch payload as `dyn` to keep
 the `undefined` answer. **Tested by:** the wasm emitter unit test (a corpus
 program cannot cover it — every backend diverges from Node the same way, so
 there is no byte-exact lane to compare).
+
+## S010 — Wasm tier: an unhandled promise rejection reports as a trap; stderr is not Node's
+
+A promise that is REJECTED and never observed — nothing awaited it, and no
+handler ran — is reported once the microtask queue drains and `_start` has
+nothing left to do. The tier writes `Unhandled promise rejection: <reason>`
+to fd 2 (the reason rendered exactly as the native runtime's
+`scr_report_unhandled_rejections` renders it: numbers through ToString,
+booleans as `true`/`false`, strings raw, `Error`s as `name: message`) and
+then TRAPS, which the harness bridge reports as exit code 1 — Node's
+unhandled-rejection exit. Node's own stderr instead carries an
+`ERR_UNHANDLED_REJECTION` report with a stack trace, and it names the
+rejection at the first microtask checkpoint rather than at quiescence
+(indistinguishable while this tier has no macrotasks: the single drain IS
+that checkpoint). Only the FIRST unobserved rejection is reported, like
+Node and like the native lane. **Rationale:** S007's reasoning exactly — the
+artifact ABI has no exit-code channel, so the trap IS the nonzero exit, and
+stack traces are not captured on this tier. **Tested by:** the wasm async
+unit test (stdout before quiescence plus the stderr line and the trap); the
+differential corpus for the exit code (the harness skips the stderr compare
+for nonzero-exit programs).

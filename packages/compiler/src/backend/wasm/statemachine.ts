@@ -57,6 +57,16 @@
  * the promise, call resume once — JS runs an async body EAGERLY to its
  * first await — and return the promise).
  *
+ * ONE RESUME SIGNATURE. Resume takes `%frameBase` — an empty OPEN struct
+ * every concrete frame subtypes — and casts it down to its own shape in a
+ * one-statement prologue (`%async.frameCast`); everything after is
+ * concretely typed and unchanged. Without that the waiter queue could not
+ * be typed at all: each resume would name its own frame struct, so the
+ * (closure, frame) pairs the runtime parks would have as many wasm
+ * signatures as there are async functions. The runtime never READS a
+ * frame — it only carries one back to the function that made it — so the
+ * base struct is deliberately empty.
+ *
  * THE RESUME CLOSURE IS NOT IN THE FRAME. The obvious layout gives the
  * frame a `%resume` field typed `(frame) => void`, and it does not work:
  * recordInfo maps a shape's fields with mapTypeSoft, a func-typed field
@@ -124,6 +134,12 @@
  *   - `fn:async:await-dyn` — `await` of a checked-dynamic value
  *     (`async.awaitDyn`): the runtime decides between adoption and the
  *     one-hop non-thenable path, which needs the dyn surface.
+ *   - `fn:async:nested-promise` — a promise whose INNER type is itself a
+ *     promise, awaited or returned. JS flattens thenables by ADOPTION (a
+ *     promise resolved with a promise subscribes to it and costs two
+ *     extra microtask turns), and this tier has no adoption: settling
+ *     with a promise payload would hand the inner promise back as the
+ *     awaited value, which is a miscompile, not a slower answer.
  *   - `fn:async:await-in-forof` / `fn:async:await-in-switch` — a
  *     suspension inside a for-of or a switch. Both linearize, neither is
  *     free: for-of hides an index and a per-iteration binding, switch
@@ -173,12 +189,30 @@ export type Refuse = (kind: string, loc?: SrcLoc) => void;
 
 /* ── the superset ──────────────────────────────────────────────────────── */
 
+/** The one type the promise runtime knows a frame by: an OPEN struct with
+ * no fields that every `%frame.<fn>` shape subtypes. Resume's parameter is
+ * typed with it, so every resume shares ONE wasm signature — which is what
+ * lets a waiter queue hold (closure, frame) pairs at all. Backend-private
+ * like the `%async.*` kinds, and confined to the same shallow superset:
+ * the IR nodes that carry it say `IrType` and hold this at runtime. */
+export const FRAME_BASE = { kind: "%frameBase" } as const;
+
+/** A type of the lowered IR (shallow superset, exactly like WStmt). */
+export type WType = IrType | typeof FRAME_BASE;
+
+function widenType(t: WType): IrType {
+  return t as IrType;
+}
+
 /** Expression-position runtime seams. `%async.mint` allocates the pending
- * promise a spawn wrapper hands back; the two `settled*` reads answer the
- * value a resumed frame was woken with (typed by the await site, so the
- * consumer needs no dynamic check). */
+ * promise a spawn wrapper hands back; `%async.frameCast` is resume's
+ * prologue narrowing its base-typed parameter back to its own frame
+ * shape; the two `settled*` reads answer the value a resumed frame was
+ * woken with (typed by the await site, so the consumer needs no dynamic
+ * check). */
 export type AsyncExpr =
   | { kind: "%async.mint"; type: IrType; loc: SrcLoc }
+  | { kind: "%async.frameCast"; value: WExpr; type: IrType; loc: SrcLoc }
   | { kind: "%async.settled"; promise: WExpr; type: IrType; loc: SrcLoc }
   | { kind: "%async.settledUnion"; value: WExpr; promiseTag: number; type: IrType; loc: SrcLoc };
 
@@ -457,6 +491,9 @@ export function lowerResumableFunctions(mod: IrModule, refuse: Refuse): WModule 
 }
 
 const FRAME_LOCAL = "%async.frame";
+/** Resume's actual parameter — the base-typed frame the cast prologue
+ * narrows into FRAME_LOCAL. */
+const FRAME_ANY_LOCAL = "%async.frameAny";
 const EXC_LOCAL = "%async.exc";
 const DISPATCH_LABEL = "%dispatch";
 const STATE_FIELD = "%state";
@@ -487,7 +524,8 @@ class FunctionLowering {
     this.frameShapeId = `%frame.${fn.name}`;
     this.resumeName = `%${fn.name}.resume`;
     this.frameType = { kind: "record", shapeId: this.frameShapeId };
-    this.resumeType = { kind: "func", params: [this.frameType], ret: VOID };
+    // Base-typed, not frame-typed: the ONE signature every resume shares.
+    this.resumeType = { kind: "func", params: [widenType(FRAME_BASE)], ret: VOID };
     this.promiseType = { kind: "promise", inner: fn.returnType };
     const captured = new Set((fn.captures ?? []).map((c) => c.localId));
     this.saved = fn.locals.filter((l) => l.boxed !== true && l.tdz !== true && !captured.has(l.id));
@@ -534,8 +572,21 @@ class FunctionLowering {
       this.decline("fn:async:module-init");
     }
     if (fn.name === this.mod.entry) this.decline("fn:async:entry");
-    if (fn.locals.some((l) => l.id === FRAME_LOCAL || l.id === EXC_LOCAL)) {
+    if (fn.locals.some((l) => l.id === FRAME_LOCAL || l.id === FRAME_ANY_LOCAL || l.id === EXC_LOCAL)) {
       this.decline("fn:async:local-id-clash");
+    }
+    // Adoption: a promise settled WITH a promise. `await` of one would
+    // read the inner promise back as the value (a miscompile), and an
+    // async function returning one would settle with it.
+    if (fn.returnType.kind === "promise") this.decline("fn:async:nested-promise");
+    if (
+      anyNode(fn.body, (rec) => {
+        if (rec["kind"] !== "awaitExpr") return false;
+        const t = (rec["value"] as { type?: IrType } | undefined)?.type;
+        return t !== undefined && t.kind === "promise" && t.inner.kind === "promise";
+      })
+    ) {
+      this.decline("fn:async:nested-promise");
     }
     if (hasAwaitDyn(fn.body)) this.decline("fn:async:await-dyn");
     if (hasSelfRef(fn.body)) this.decline("fn:async:self-ref");
@@ -1085,9 +1136,15 @@ class FunctionLowering {
   /* ── the two emitted functions ───────────────────────────────────────── */
 
   private buildResume(): WFunction {
+    const frameAnyLocal: IrLocal = {
+      id: FRAME_ANY_LOCAL,
+      name: FRAME_ANY_LOCAL,
+      type: widenType(FRAME_BASE),
+      mutable: false,
+    };
     const frameLocal: IrLocal = { id: FRAME_LOCAL, name: FRAME_LOCAL, type: this.frameType, mutable: false };
     const excLocal: IrLocal = { id: EXC_LOCAL, name: EXC_LOCAL, type: CAUGHT, mutable: false };
-    const param: IrParam = { localId: FRAME_LOCAL, name: FRAME_LOCAL, type: this.frameType };
+    const param: IrParam = { localId: FRAME_ANY_LOCAL, name: FRAME_ANY_LOCAL, type: widenType(FRAME_BASE) };
     const dispatch: WStmt = {
       kind: "while",
       cond: { kind: "boolLit", value: true, type: BOOL, loc: this.loc },
@@ -1111,7 +1168,23 @@ class FunctionLowering {
     // body becomes this frame's REJECTION rather than unwinding into
     // whoever pumped the microtask, and the awaited-rejection re-throw
     // (%async.rejectCheck) lands here too.
+    //
+    // The cast prologue sits OUTSIDE it: narrowing the parameter cannot
+    // fail (the runtime hands back the frame this function parked), and
+    // inside the try it would be one more statement between every state
+    // and its handler for no gain.
     const body: WStmt[] = [
+      {
+        kind: "varDecl",
+        localId: FRAME_LOCAL,
+        init: widenExpr({
+          kind: "%async.frameCast",
+          value: { kind: "varRef", localId: FRAME_ANY_LOCAL, type: widenType(FRAME_BASE), loc: this.loc },
+          type: this.frameType,
+          loc: this.loc,
+        }),
+        loc: this.loc,
+      },
       {
         kind: "tryCatch",
         tryBody: widenBody([dispatch]),
@@ -1136,7 +1209,7 @@ class FunctionLowering {
       // The async function's own locals ride along: params become plain
       // locals restored from the frame, and received captures keep their
       // boxed entries so the emitter's box-access gates still apply.
-      locals: [frameLocal, ...this.fn.locals, excLocal],
+      locals: [frameAnyLocal, frameLocal, ...this.fn.locals, excLocal],
       ...(this.fn.captures !== undefined ? { captures: this.fn.captures } : {}),
       body,
       loc: this.fn.loc,
