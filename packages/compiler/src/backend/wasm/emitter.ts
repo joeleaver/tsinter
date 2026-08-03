@@ -69,6 +69,7 @@ import { UnionBuilder, type UnionArmRep } from "./unions.js";
 import { Code } from "./code.js";
 import { buildF64ToStr } from "./numfmt.js";
 import { F64, I32, I64, ModuleBuilder, type ValType } from "./module.js";
+import { lowerResumableFunctions } from "./statemachine.js";
 import { WasmUnsupportedError } from "./unsupported.js";
 
 export { WasmUnsupportedError } from "./unsupported.js";
@@ -83,7 +84,7 @@ function valKey(t: ValType): string {
 }
 
 export function emitWasmModule(mod: IrModule): Uint8Array {
-  const asm = new Assembler(mod, (kind, loc) => {
+  const asm = new Assembler(lowerResumableFunctions(mod), (kind, loc) => {
     throw new WasmUnsupportedError(kind, loc);
   });
   asm.run();
@@ -96,7 +97,7 @@ export function emitWasmModule(mod: IrModule): Uint8Array {
  * compile this?", not "does it compile?". */
 export function surveyWasmModule(mod: IrModule): string[] {
   const seen = new Set<string>();
-  new Assembler(mod, (kind) => {
+  new Assembler(lowerResumableFunctions(mod), (kind) => {
     seen.add(kind);
   }).run();
   return [...seen];
