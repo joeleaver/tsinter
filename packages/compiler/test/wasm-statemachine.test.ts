@@ -7,7 +7,7 @@
  * pass declines must name itself and leave the function untouched, which
  * is what keeps the emitter's own `fn:async` firing behind it. */
 import { describe, expect, test } from "vitest";
-import type { IrFunction, IrModule, IrStmt, IrType, SrcLoc } from "../src/ir/nodes.js";
+import type { IrExpr, IrFunction, IrModule, IrStmt, IrType, SrcLoc } from "../src/ir/nodes.js";
 import { BOOL, CAUGHT, F64, STRING, VOID } from "../src/ir/nodes.js";
 import { asIrModule, lowerResumableFunctions, type WFunction, type WModule } from "../src/backend/wasm/statemachine.js";
 import { computeMayThrow } from "../src/backend/emission/may-throw.js";
@@ -495,8 +495,45 @@ describe("refusals leave the function untouched", () => {
     );
   });
 
-  test("await in a non-root position (a call argument)", () => {
-    expectRefusal(plain([log([awaitCall()])]), "fn:async:await-position");
+  test("await under an operator that may not evaluate it", () => {
+    // Hoisting is what retired the ordinary operand positions; a
+    // CONDITIONAL one is the position where a temp ahead of the statement
+    // would evaluate what JS skips, so it refuses under its own name.
+    const cond = (e: IrExpr): IrExpr => ({ kind: "ternary", cond: bool(true), then: e, else_: num(0), type: F64, loc });
+    expectRefusal(plain([log([cond(awaitCall())])]), "fn:async:await-conditional");
+    expectRefusal(
+      plain([varDecl("x.0", { kind: "logical", op: "&&", left: bool(true), right: awaitCall(), type: F64, loc })], [
+        local("x.0", F64),
+      ]),
+      "fn:async:await-conditional",
+    );
+    expectRefusal(
+      plain([
+        {
+          kind: "if",
+          cond: { kind: "logical", op: "||", left: bool(false), right: awaitCall(), type: BOOL, loc },
+          then: [],
+          else_: null,
+          loc,
+        },
+      ]),
+      "fn:async:await-conditional",
+    );
+  });
+
+  test("await in an expression kind the hoist register has no order for", () => {
+    // A kind absent from HOIST_SLOTS refuses rather than guessing at its
+    // operand order. A seeded `new Map([[k, await p]])` is the shape the
+    // slot vocabulary cannot even spell: key and value interleave per
+    // entry, and hoisting the keys as a block would reorder them.
+    const mapT: IrType = { kind: "map", key: STRING, value: F64 };
+    expectRefusal(
+      plain(
+        [varDecl("m.0", { kind: "mapNew", seed: [{ key: str("k"), value: awaitCall() }], type: mapT, loc })],
+        [local("m.0", mapT)],
+      ),
+      "fn:async:await-position",
+    );
   });
 
   test("await in a loop condition", () => {
@@ -701,6 +738,208 @@ describe("refusals leave the function untouched", () => {
   });
 });
 
+/* ── 4a. order-preserving operand hoisting ─────────────────────────────── */
+
+/* The rewrite that gives a suspension in an operand position a statement
+ * root of its own. What these pin is ORDER: every subexpression that JS
+ * evaluates before the suspension is taken into a `%hoist.<n>` temp on the
+ * suspending side of the split, and everything after it is left where it
+ * was, on the resumed side. */
+describe("order-preserving operand hoisting", () => {
+  const awaitP = () => await_(call("mkp", [], promiseOf(F64)), F64);
+  const asyncF = (body: IrStmt[], locals: IrFunction["locals"] = [], returnType: IrType = VOID): IrFunction => ({
+    name: "f",
+    params: [],
+    returnType,
+    async: true,
+    locals,
+    body,
+    loc,
+  });
+  /** The statements of a state, past the restore prologue AND the reject
+   * check a re-entry opens with. */
+  const resumedBody = (body: IrStmt[]): IrStmt[] => {
+    const rest = afterRestores(body);
+    return rest[0]?.kind === "%async.rejectCheck" ? rest.slice(1) : rest;
+  };
+  const argsOf = (s: IrStmt | undefined): IrExpr[] => {
+    if (s === undefined || s.kind !== "exprStmt") throw new Error("not an exprStmt");
+    return (s.expr as Extract<IrExpr, { kind: "call" }>).args;
+  };
+
+  test("`console.log('x', await p, 'y')` reads the awaited value out of a temp", () => {
+    const mod = lowerOne(asyncF([log([str("x"), awaitP(), str("y")])]));
+    const cases = dispatch(fnNamed(mod, "%f.resume"));
+    expect(cases.map((c) => c.test)).toEqual([0, 1, null]);
+    // The suspension became a varDecl root — the one shape the splitter
+    // takes apart — and the log runs on the resumed side.
+    const resumed = resumedBody(cases[1]!.body);
+    expect(resumed.map((s) => s.kind)).toEqual(["varDecl", "exprStmt", "%async.settle", "return"]);
+    expect(resumed[0]).toMatchObject({ kind: "varDecl", localId: "%hoist.1" });
+    expect((resumed[0] as Extract<IrStmt, { kind: "varDecl" }>).init).toMatchObject({ kind: "%async.settled" });
+    // Literals stay exactly where they were: re-evaluating one after the
+    // resumption is unobservable, so they need no temp.
+    const args = (resumed[1] as Extract<IrStmt, { kind: "exprStmt" }>).expr as { args: IrExpr[] };
+    expect(args.args.map((a) => a.kind)).toEqual(["strLit", "varRef", "strLit"]);
+    expect(args.args[1]).toMatchObject({ localId: "%hoist.1", type: F64 });
+  });
+
+  test("`g(a(), await p, b())` runs a() before the suspend and b() after", () => {
+    const mod = lowerOne(
+      asyncF([exprStmt(call("g", [call("a", [], F64), awaitP(), call("b", [], F64)], VOID))]),
+    );
+    const cases = dispatch(fnNamed(mod, "%f.resume"));
+    // a() is taken into a temp on the SUSPENDING side, ahead of the save.
+    const head = afterRestores(cases[0]!.body);
+    expect(head[0]).toMatchObject({ kind: "varDecl", localId: "%hoist.1", init: { kind: "call", callee: "a" } });
+    const subscribe = head.findIndex((s) => s.kind === "%async.subscribe");
+    expect(subscribe).toBeGreaterThan(0);
+    expect(head.slice(0, subscribe).some((s) => s.kind === "varDecl" && s.localId === "%hoist.1")).toBe(true);
+
+    // b() is NOT hoisted: nothing after it suspends, so JS runs it after
+    // the await — which is where leaving it in place puts it.
+    const resumed = resumedBody(cases[1]!.body);
+    expect(resumed[0]).toMatchObject({ kind: "varDecl", localId: "%hoist.2" });
+    expect(argsOf(resumed[1]).map((a) => a.kind)).toEqual(["varRef", "varRef", "call"]);
+    expect(argsOf(resumed[1])[0]).toMatchObject({ localId: "%hoist.1" });
+    expect(argsOf(resumed[1])[1]).toMatchObject({ localId: "%hoist.2" });
+    expect(argsOf(resumed[1])[2]).toMatchObject({ kind: "call", callee: "b" });
+    expect(nodesOfKind(cases[0]!.body, "call").some((c) => c["callee"] === "b")).toBe(false);
+  });
+
+  test("two awaits in one argument list split twice, left to right", () => {
+    const mod = lowerOne(
+      asyncF([
+        exprStmt(
+          call("g", [await_(call("mkp", [], promiseOf(F64)), F64), await_(call("mkq", [], promiseOf(F64)), F64)], VOID),
+        ),
+      ]),
+    );
+    const resume = fnNamed(mod, "%f.resume");
+    const cases = dispatch(resume);
+    expect(cases.map((c) => c.test)).toEqual([0, 1, 2, null]);
+    expect(nodesOfKind(resume.body, "%async.subscribe")).toHaveLength(2);
+    // One await slot each, and the awaited promises in source order.
+    expect(frameFields(mod, "f")).toEqual([
+      "%state",
+      "%promise",
+      "%l_%hoist.1",
+      "%l_%hoist.2",
+      "%await1",
+      "%await2",
+    ]);
+    const awaited = (n: number) =>
+      nodesOfKind(cases[n]!.body, "recordSet").find((r) => String(r["field"]).startsWith("%await"))!;
+    expect(awaited(0)["value"]).toMatchObject({ kind: "call", callee: "mkp" });
+    expect(awaited(1)["value"]).toMatchObject({ kind: "call", callee: "mkq" });
+    // The call itself runs last, on both temps.
+    const resumed = resumedBody(cases[2]!.body);
+    expect(argsOf(resumed[1])).toMatchObject([{ localId: "%hoist.1" }, { localId: "%hoist.2" }]);
+  });
+
+  test("`await f(await p)` hoists the inner await and leaves the call in place", () => {
+    const mod = lowerOne(
+      asyncF(
+        [varDecl("x.0", await_(call("f2", [awaitP()], promiseOf(F64)), F64))],
+        [local("x.0", F64)],
+      ),
+    );
+    const cases = dispatch(fnNamed(mod, "%f.resume"));
+    expect(cases.map((c) => c.test)).toEqual([0, 1, 2, null]);
+    // Only the INNER await needed a temp: the call is the last operand of
+    // the outer await, so it stays where it is — evaluated after the inner
+    // resumption and before the outer suspend, exactly like JS.
+    expect(nodesOfKind(mod, "varDecl").filter((d) => String(d["localId"]).startsWith("%hoist."))).toHaveLength(1);
+    const second = resumedBody(cases[1]!.body);
+    expect(second[0]).toMatchObject({ kind: "varDecl", localId: "%hoist.1" });
+    const awaited = nodesOfKind(second, "recordSet").find((r) => r["field"] === "%await2")!;
+    expect(awaited["value"]).toMatchObject({ kind: "call", callee: "f2", args: [{ localId: "%hoist.1" }] });
+    expect(resumedBody(cases[2]!.body)[0]).toMatchObject({ kind: "varDecl", localId: "x.0" });
+  });
+
+  test("`arr[i()] = await p` hoists receiver, index and value in that order", () => {
+    // JS evaluates the reference, then the index, then the RHS — so
+    // hoisting only the awaited value would move the other two behind it.
+    const arrT: IrType = { kind: "array", elem: F64 };
+    const mod = lowerOne(
+      asyncF(
+        [{ kind: "arraySet", arr: v("xs.0", arrT), index: call("i", [], F64), value: awaitP(), loc }],
+        [local("xs.0", arrT)],
+      ),
+    );
+    const cases = dispatch(fnNamed(mod, "%f.resume"));
+    const head = afterRestores(cases[0]!.body);
+    expect(head.slice(0, 2)).toMatchObject([
+      { kind: "varDecl", localId: "%hoist.1", init: { kind: "varRef", localId: "xs.0" } },
+      { kind: "varDecl", localId: "%hoist.2", init: { kind: "call", callee: "i" } },
+    ]);
+    const resumed = resumedBody(cases[1]!.body);
+    expect(resumed[0]).toMatchObject({ kind: "varDecl", localId: "%hoist.3" });
+    expect(resumed[1]).toMatchObject({
+      kind: "arraySet",
+      arr: { localId: "%hoist.1" },
+      index: { localId: "%hoist.2" },
+      value: { localId: "%hoist.3" },
+    });
+  });
+
+  test("the hop form hoists too: `console.log(await <non-thenable>)`", () => {
+    // `await <non-thenable>` is a seqExpr, not an awaitExpr — the
+    // classifier recognizes it in an operand position exactly as it does
+    // at a statement root.
+    const mod = lowerOne(asyncF([log([hop("%awaited.0", str("hi"))])], [local("%awaited.0", STRING)]));
+    const resume = fnNamed(mod, "%f.resume");
+    expect(nodesOfKind(resume.body, "%async.hop")).toHaveLength(1);
+    expect(nodesOfKind(resume.body, "libCall")).toHaveLength(0);
+    const cases = dispatch(resume);
+    // The operand parks in the frontend's own temp before the hop; the
+    // hoist temp takes the value on the way out.
+    expect(afterRestores(cases[0]!.body)[0]).toMatchObject({ kind: "varDecl", localId: "%awaited.0" });
+    const resumed = resumedBody(cases[1]!.body);
+    expect(resumed[0]).toMatchObject({ kind: "varDecl", localId: "%hoist.1" });
+    expect(argsOf(resumed[1])).toMatchObject([{ localId: "%hoist.1", type: STRING }]);
+  });
+
+  test("temps are ordinary locals: resume's list, the frame, and nowhere else", () => {
+    const mod = lowerOne(asyncF([log([str("x"), awaitP()])]));
+    const resume = fnNamed(mod, "%f.resume");
+    const temp = resume.locals.find((l) => l.id === "%hoist.1");
+    expect(temp).toMatchObject({ id: "%hoist.1", name: "%hoist.1", type: F64, mutable: false });
+    // It rides the frame's total save/restore like every other local...
+    expect(frameFields(mod, "f")).toContain("%l_%hoist.1");
+    const cases = dispatch(resume);
+    expect(cases[1]!.body[0]).toMatchObject({ kind: "assign", localId: "%hoist.1", value: { kind: "recordGet" } });
+    // ...and the wrapper, which only stores arguments, never sees it.
+    expect(fnNamed(mod, "f").locals.map((l) => l.id)).toEqual(["%async.frame"]);
+  });
+
+  test("a hoist temp the frame cannot hold refuses instead", () => {
+    // A void operand has no frame slot and no reference to hand back to
+    // the position it came from.
+    expectRefusal(
+      {
+        name: "f",
+        params: [],
+        returnType: VOID,
+        async: true,
+        locals: [],
+        body: [exprStmt(call("g", [call("side", [], VOID), awaitP()], VOID))],
+        loc,
+      },
+      "fn:async:hoist-void",
+    );
+  });
+
+  test("the rewrite copies: the input module is never mutated", () => {
+    const fn = asyncF([exprStmt(call("g", [call("a", [], F64), awaitP(), call("b", [], F64)], VOID))]);
+    const input = asyncModule(fn);
+    const before = JSON.stringify(input);
+    const { refusals } = lower(input);
+    expect(refusals).toEqual([]);
+    expect(JSON.stringify(input)).toBe(before);
+  });
+});
+
 /* ── 4b. module initializers and top-level await ───────────────────────── */
 
 describe("the module-initializer protocol", () => {
@@ -847,7 +1086,23 @@ test("a module whose only async function refuses comes back unchanged", () => {
     returnType: VOID,
     async: true,
     locals: [],
-    body: [log([await_(call("mkp", [], promiseOf(F64)), F64)])],
+    // A loop condition: re-evaluated per iteration, so no temp ahead of
+    // the loop can stand in for it.
+    body: [
+      {
+        kind: "while",
+        cond: {
+          kind: "bin",
+          op: ">",
+          left: await_(call("mkp", [], promiseOf(F64)), F64),
+          right: num(0),
+          type: BOOL,
+          loc,
+        },
+        body: [],
+        loc,
+      },
+    ],
     loc,
   };
   const input = asyncModule(fn);

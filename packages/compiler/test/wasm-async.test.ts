@@ -331,6 +331,86 @@ test("a SYNC caller that ignores the promise still runs the body at drain", asyn
   expect(stdout).toBe(["spawned 1", "sync mid 2", "sync tail 3", "spawned after 4", ""].join("\n"));
 });
 
+test("an await in an argument list keeps the list's evaluation order", async () => {
+  // The hoisting rewrite's whole point, at runtime: what JS evaluates
+  // before the await runs before the suspension, and what follows it runs
+  // after the resumption. `tag('a')` is on the suspending side of the
+  // split and `tag('c')` on the resumed side — and `join` runs last.
+  const path = await build("hoist-order.ts", [
+    "function tag(label: string): string {",
+    "  console.log('eval', label);",
+    "  return label;",
+    "}",
+    "function join(a: string, b: string, c: string): string {",
+    "  console.log('join', a, b, c);",
+    "  return a + b + c;",
+    "}",
+    "async function main(): Promise<void> {",
+    "  console.log('x', await Promise.resolve(1), 'y');",
+    "  const s = join(tag('a'), await Promise.resolve('B'), tag('c'));",
+    "  console.log('s', s);",
+    "}",
+    "main();",
+    "console.log('sync');",
+  ]);
+  const { stdout, stderr } = await runWasm(path);
+  expect(stdout).toBe(["sync", "x 1 y", "eval a", "eval c", "join a B c", "s aBc", ""].join("\n"));
+  expect(stderr).toBe("");
+});
+
+test("two awaits in one argument list are two turns another frame runs between", async () => {
+  // Each await in the list costs its own microtask turn, so a second
+  // spawned body makes BOTH of its remaining steps in between — the
+  // interleaving is the proof that the list really did split twice.
+  const path = await build("hoist-interleave.ts", [
+    "function pair(a: number, b: number): number {",
+    "  console.log('pair', a, b);",
+    "  return a + b;",
+    "}",
+    "async function other(): Promise<void> {",
+    "  console.log('other 1');",
+    "  await null;",
+    "  console.log('other 2');",
+    "  await null;",
+    "  console.log('other 3');",
+    "}",
+    "async function main(): Promise<void> {",
+    "  other();",
+    "  const n = pair(await Promise.resolve(1), await Promise.resolve(2));",
+    "  console.log('n', n);",
+    "}",
+    "main();",
+    "console.log('sync tail');",
+  ]);
+  const { stdout } = await runWasm(path);
+  expect(stdout).toBe(["other 1", "sync tail", "other 2", "other 3", "pair 1 2", "n 3", ""].join("\n"));
+});
+
+test("an awaited value written into an element or a field keeps its order", async () => {
+  // The statement half of the rewrite. `xs[idx(1)] = await p` evaluates
+  // the receiver and the INDEX before the await (JS's reference-then-index
+  // order), so hoisting only the value would move `idx` behind the
+  // suspension; a record literal's earlier fields are the same argument.
+  const path = await build("hoist-writes.ts", [
+    "function idx(i: number): number {",
+    "  console.log('idx', i);",
+    "  return i;",
+    "}",
+    "async function main(): Promise<void> {",
+    "  const xs: number[] = [0, 0];",
+    "  xs[idx(1)] = await Promise.resolve(7);",
+    "  console.log('xs', xs[0], xs[1]);",
+    "  const r = { a: idx(0), b: await Promise.resolve(9) };",
+    "  console.log('r', r.a, r.b);",
+    "}",
+    "main();",
+    "console.log('sync');",
+  ]);
+  const { stdout, stderr } = await runWasm(path);
+  expect(stdout).toBe(["idx 1", "sync", "xs 0 7", "idx 0", "r 0 9", ""].join("\n"));
+  expect(stderr).toBe("");
+});
+
 test("a module with no promise surface emits no promise runtime", async () => {
   // The laziness contract: everything above is interned on first use, so
   // a program that never mentions a promise must be byte-identical to

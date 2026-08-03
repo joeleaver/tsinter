@@ -423,6 +423,24 @@ const TIER_FLOOR: string[] = [
   // dependency DOES cost a turn, so the dependency's own microtask still
   // beats the importer's first statement.
   "2658-top-level-await-sync-completion/main.ts",
+  // Increment 12 (async), stage 5a: order-preserving operand hoisting —
+  // an await anywhere in a statement's value expression, rewritten into
+  // temps in evaluation order so each suspension lands at a statement
+  // root the state split can take (statemachine.ts's HOISTING section).
+  // `console.log(await p)` is the shape the whole corpus is full of.
+  //
+  // Timer-resolved awaits, two per body, under console.log arguments,
+  // with two frames interleaving.
+  "1020-async-basics.ts",
+  // A promise as a THROWN value, awaited nowhere: the hoist is in the
+  // console.log tail after the catch.
+  "1026-throw-promise.ts",
+  // Record literals fulfilled through the `T | PromiseLike<T>` return
+  // slot, read back through awaited member arguments.
+  "1028-async-return-record-literals.ts",
+  // The settled-await hop under `console.log(await q)` — the awaited
+  // value reaching an argument list still costs its own turn.
+  "1428-settled-await-order.ts",
 ];
 
 interface RunResult {

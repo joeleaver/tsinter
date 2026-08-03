@@ -95,16 +95,64 @@
  *     %async.rejectCheck(frame.%await<k>);   // a rejected await re-throws
  *     ... %async.settled(frame.%await<k>) ...
  *
- * SAVE/RESTORE IS TOTAL, NOT LIVE. Every non-boxed local (params
- * included) is written at every suspend and read back at every re-entry —
- * STATE 0 INCLUDED, because the wrapper passes the arguments through the
- * frame's %l_ slots rather than through resume's signature, so the entry
- * state is where params become locals. No liveness analysis: a value that
- * was never assigned restores as the slot's zero, and the frontend's
- * definite-assignment guarantee means no read observes it. Received
- * CAPTURES are excluded on purpose — they are boxes, they ride resume's
- * own closure environment, and the box identity is what aliasing across a
- * suspension depends on.
+ * ORDER-PRESERVING HOISTING. A suspension only splits a state when it
+ * sits at the ROOT of a statement's value slot, and the corpus is full of
+ * `console.log(await p)`. So each statement is REWRITTEN before it is
+ * lowered: its value expression is walked in EVALUATION order, everything
+ * that must run before a later suspension is bound to a `%hoist.<n>`
+ * temp, and each suspension lands as its own varDecl root that the
+ * splitter below already knows how to take apart:
+ *
+ *     g(a(), await p, b())
+ *   ⇒ %hoist.1 = a(); %hoist.2 = await p; g(%hoist.1, %hoist.2, b())
+ *
+ * What was already evaluated stays evaluated (in a temp), and what
+ * follows the LAST suspension stays in place — it runs after the
+ * resumption, which is exactly where JS puts it — so the interleaving is
+ * source order. Literals are the one thing never hoisted: re-evaluating
+ * one after the suspension is unobservable. Hoisting more than order
+ * requires costs a frame field and nothing else; hoisting LESS is a
+ * miscompile, which is why the rewrite is total over the positions it
+ * accepts and refuses outright everywhere else.
+ *
+ * The positions it accepts are the ones whose evaluation order is STATIC.
+ * HOIST_SLOTS and STMT_HOIST_SLOTS are the register — one entry per node
+ * kind, operands in JS order (nodes.ts documents that order for the
+ * writes and the literals; where it is silent the C emitter is the
+ * reference for what the backends implement). Both tables are partial ON
+ * PURPOSE: a kind with no entry refuses, so growing the IR can never
+ * silently grow the hoister.
+ *
+ * CONDITIONAL positions are refused rather than hoisted
+ * (`fn:async:await-conditional`): the right operand of `&&`/`||`/`??`, a
+ * ternary arm, an optChain continuation and an orDefault default may all
+ * never evaluate, and a temp ahead of the statement would evaluate them
+ * unconditionally. Loop and for headers keep refusing under the old name
+ * for the mirror-image reason — a hoist ahead of the loop would evaluate
+ * once what the loop evaluates per iteration.
+ *
+ * Three positions are worth naming because they are not expressions in an
+ * argument list: an `if` CONDITION hoists (it evaluates exactly once,
+ * before either arm — the arms are statement lists the pass explodes); a
+ * WRITE statement hoists every operand it has, because JS evaluates
+ * `arr[i] = await p` as reference, then index, then value, and moving only
+ * the value would put the other two behind the suspension; and a
+ * `seqExpr` is SPLICED, its straight-line statements landing in the host
+ * list at the point the expression itself would have run.
+ *
+ * The rewrite runs BEFORE checkPositions, which is left as the checker of
+ * what hoisting could not fix.
+ *
+ * SAVE/RESTORE IS TOTAL, NOT LIVE. Every non-boxed local (params and
+ * `%hoist.<n>` temps included) is written at every suspend and read back
+ * at every re-entry — STATE 0 INCLUDED, because the wrapper passes the
+ * arguments through the frame's %l_ slots rather than through resume's
+ * signature, so the entry state is where params become locals. No
+ * liveness analysis: a value that was never assigned restores as the
+ * slot's zero, and the frontend's definite-assignment guarantee means no
+ * read observes it. Received CAPTURES are excluded on purpose — they are
+ * boxes, they ride resume's own closure environment, and the box identity
+ * is what aliasing across a suspension depends on.
  *
  * COMPLETION AND FAILURE. `return v` becomes `%async.settle(frame.%promise,
  * v)` + `return`, wherever it appears (returns inside statements the pass
@@ -161,19 +209,35 @@
  *     frontend (it emits both globals with the function); the wrapper's
  *     stores would otherwise land on a local slot that does not exist.
  *   - `fn:async:module-await-position` — a `module.await` anywhere but at
- *     the root of an `exprStmt`. The frontend emits exactly that shape;
- *     anything else would need the same temp hoisting `await-position`
- *     does, and the two are told apart so the census keeps naming the
- *     construct that actually needs work.
+ *     the root of an `exprStmt`. The wait is VOID-valued and its re-entry
+ *     produces nothing, so no temp can stand in for it: hoisting rewrites
+ *     its dependency operand, never the wait itself. The frontend emits
+ *     exactly the statement shape, and the two names are kept apart so
+ *     the census keeps naming the construct that actually needs work.
  *   - `fn:async:await-in-try` — an await inside try/catch/finally. The
  *     handler stack has to become frame state that survives suspension
  *     (regenerator carries an explicit try-entry stack), and it has to
  *     agree with the forward-only block shape and finallyStack the
  *     exception protocol emits today.
- *   - `fn:async:await-position` — an await anywhere but a simple statement
- *     slot (varDecl init, exprStmt, return, assign RHS). Everything else
- *     needs order-preserving temp hoisting before the split, because JS
- *     evaluation order across `f(await a, await b)` is observable.
+ *   - `fn:async:await-position` — an await in a slot the hoisting rewrite
+ *     cannot move it out of: a loop or for header (hoisting would
+ *     evaluate once what the loop evaluates per iteration), a statement
+ *     kind whose operand order this pass has no contract for, or an
+ *     expression kind absent from HOIST_SLOTS. Ordinary operand
+ *     positions no longer refuse — they hoist (see ORDER-PRESERVING
+ *     HOISTING above).
+ *   - `fn:async:await-conditional` — an await under an operator that may
+ *     not evaluate it: the right side of `&&`/`||`/`??`, a ternary arm,
+ *     an optChain continuation, an orDefault default. A temp ahead of the
+ *     statement would evaluate it unconditionally, so this is the one
+ *     position where hoisting is a MISCOMPILE rather than a cost; making
+ *     it a name of its own is what lets the census measure the
+ *     conditional-await shapes on their own.
+ *   - `fn:async:hoist-void` — a hoist whose temp would be void-typed (a
+ *     void subexpression ahead of a suspension in the same operand list;
+ *     the frame has no slot for it, and the operand position it came from
+ *     needs SOME expression back). Unreachable from today's frontend —
+ *     void operands only appear as a recordLit `drop` field.
  *   - `fn:async:await-dyn` — `await` of a checked-dynamic value
  *     (`async.awaitDyn`): the runtime decides between adoption and the
  *     one-hop non-thenable path, which needs the dyn surface.
@@ -516,6 +580,126 @@ function classifySuspension(e: IrExpr): Suspension | null {
   return null;
 }
 
+/* ── the hoistable positions ───────────────────────────────────────────── */
+
+/** One operand position of a node: a plain field, a whole list field, or
+ * one field of every entry of a list field. */
+type HoistSlot = string | { list: string } | { each: string; field: string };
+
+/** Expression kinds the rewrite may hoist THROUGH, each with its operands
+ * in JS evaluation order — the register the header's HOISTING section
+ * describes. Absence is a refusal, so this table is the whole contract:
+ * every kind here evaluates its operands unconditionally, in this order,
+ * and every kind NOT here — the conditional operators, most of the dyn
+ * surface, anything the IR grows later — refuses instead of guessing. */
+const HOIST_SLOTS: Partial<Record<IrExpr["kind"], HoistSlot[]>> = {
+  // Operators. `bin` is the non-short-circuit family by construction
+  // (IrNumBinOp); `logical`/`nullish`/`ternary`/`orDefault`/`optChain` are
+  // deliberately absent.
+  bin: ["left", "right"],
+  unary: ["operand"],
+  toBool: ["operand"],
+  toString: ["operand"],
+  strConcat: ["left", "right"],
+  strEq: ["left", "right"],
+  strCmp: ["left", "right"],
+  unionEq: ["left", "right"],
+  assignExpr: ["value"],
+  // Calls: the callee expression evaluates before the arguments, and the
+  // arguments in source order (ArgumentListEvaluation).
+  call: [{ list: "args" }],
+  callValue: ["callee", { list: "args" }],
+  ffiCall: [{ list: "args" }],
+  intrinsic: [{ list: "args" }],
+  libCall: [{ list: "args" }],
+  new: [{ list: "args" }],
+  newValue: ["callee", { list: "args" }],
+  virtualCall: [{ list: "args" }],
+  // The island's engine ops are argument lists like any call (the C
+  // emitter evaluates them left to right); a jsval TEMP is out of tier on
+  // its own, which is the refusal such a program should be wearing.
+  jsOp: [{ list: "args" }],
+  strIntrinsic: ["receiver", { list: "args" }],
+  arrIntrinsic: ["receiver", { list: "args" }],
+  bytesIntrinsic: ["receiver", { list: "args" }],
+  mapIntrinsic: ["receiver", { list: "args" }],
+  setIntrinsic: ["receiver", { list: "args" }],
+  regexIntrinsic: ["receiver", { list: "args" }],
+  // Containers. recordLit's list is SOURCE order and covers `drop` and
+  // `overflow` entries too — a dropped field's value still evaluates.
+  arrayLit: [{ list: "elems" }],
+  arrayNewLen: ["length"],
+  arrayGet: ["arr", "index"],
+  bytesNew: ["source"],
+  setNew: ["seed"],
+  recordLit: [{ each: "fields", field: "value" }],
+  recordGet: ["obj"],
+  recordKeyGet: ["obj", "key"],
+  recordOvfKeys: ["obj"],
+  fieldGet: ["obj"],
+  fieldIncDec: ["obj"],
+  jsonStringify: ["value"],
+  // The two marshalling conversions. The rest of the dyn surface stays
+  // out: `dynObjLit` and `mapNew` interleave key and value per entry,
+  // which the slot vocabulary above cannot even spell, and the kinds that
+  // could be spelled would only trade one out-of-tier refusal for
+  // another. These two are here because a single operand has no order to
+  // get wrong, and a dyn/jsval TEMP is the honest refusal for the
+  // programs that reach them.
+  dynFrom: ["value"],
+  dynFromJsval: ["value"],
+  // Type-only and tag-only nodes: one operand, nothing else to order.
+  upcast: ["value"],
+  downcast: ["value"],
+  promiseVoidWiden: ["value"],
+  instanceOf: ["value"],
+  instanceOfValue: ["value", "classValue"],
+  unionWrap: ["value"],
+  unionNarrow: ["value"],
+  unionDisc: ["value"],
+  unionIsTag: ["value"],
+  // Receiver before key: JS's `r[k]` order, and the C emitter's.
+  unionKeyGet: ["value", "key"],
+  // An await UNDER an await (`await f(await p)`): the inner one hoists
+  // first and the outer is left as the root it already was.
+  awaitExpr: ["value"],
+  awaitUnionExpr: ["value"],
+  newPromise: ["executor"],
+};
+
+/** Statement kinds whose embedded expressions the rewrite may hoist —
+ * none of them can host a state split, so EVERY suspended operand becomes
+ * a temp ahead of the statement. Orders are nodes.ts's own (`arraySet` and
+ * `bytesSet` say nothing there, and the C emitter spells out the JS order:
+ * array, index, then value). */
+const STMT_HOIST_SLOTS: Partial<Record<IrStmt["kind"], HoistSlot[]>> = {
+  arraySet: ["arr", "index", "value"],
+  bytesSet: ["arr", "index", "value"],
+  fieldSet: ["obj", "value"],
+  recordSet: ["obj", "value"],
+  recordKeySet: ["obj", "key", "value"],
+  recordKeyDelete: ["obj", "key"],
+};
+
+/** Operators whose operands evaluate CONDITIONALLY — hoisting one ahead
+ * of the statement would evaluate what JS may skip. Named apart from the
+ * rest of the un-hoistable positions so the census can measure them. */
+const CONDITIONAL_KINDS = new Set<IrExpr["kind"]>(["logical", "nullish", "ternary", "optChain", "orDefault"]);
+
+/** Values a suspension may be re-ordered PAST: re-evaluating one after the
+ * resumption yields the same value and no effects, so they need no temp. */
+function isStable(e: IrExpr): boolean {
+  switch (e.kind) {
+    case "numLit":
+    case "strLit":
+    case "boolLit":
+    case "unitLit":
+      return true;
+    default:
+      return false;
+  }
+}
+
 /* ── the pass ──────────────────────────────────────────────────────────── */
 
 /** Thrown to abandon ONE function after its refusal is recorded. The emit
@@ -569,6 +753,9 @@ const FRAME_LOCAL = "%async.frame";
  * narrows into FRAME_LOCAL. */
 const FRAME_ANY_LOCAL = "%async.frameAny";
 const EXC_LOCAL = "%async.exc";
+/** The hoisting rewrite's temps (see the header). Guarded against a
+ * source local wearing the same prefix, like the three bindings above. */
+const HOIST_PREFIX = "%hoist.";
 const DISPATCH_LABEL = "%dispatch";
 const STATE_FIELD = "%state";
 const PROMISE_FIELD = "%promise";
@@ -580,8 +767,14 @@ class FunctionLowering {
   private readonly frameType: IrType;
   private readonly resumeType: IrType;
   private readonly promiseType: IrType;
-  /** Non-boxed locals (params included) — the total save/restore set. */
-  private readonly saved: IrLocal[];
+  /** The function's locals plus the hoisting rewrite's temps. */
+  private readonly locals: IrLocal[];
+  /** The body AFTER the hoisting rewrite — what the linearization walks. */
+  private body: IrStmt[];
+  /** Non-boxed locals (params and hoist temps included) — the total
+   * save/restore set, fixed once the rewrite has stopped adding temps. */
+  private saved: IrLocal[] = [];
+  private hoisted = 0;
   private readonly frameFields: { name: string; type: IrType }[] = [];
   /** Dispatch states, each a stmt list that must end in a terminator. */
   private readonly states: WStmt[][] = [];
@@ -601,8 +794,8 @@ class FunctionLowering {
     // Base-typed, not frame-typed: the ONE signature every resume shares.
     this.resumeType = { kind: "func", params: [widenType(FRAME_BASE)], ret: VOID };
     this.promiseType = { kind: "promise", inner: fn.returnType };
-    const captured = new Set((fn.captures ?? []).map((c) => c.localId));
-    this.saved = fn.locals.filter((l) => l.boxed !== true && l.tdz !== true && !captured.has(l.id));
+    this.locals = [...fn.locals];
+    this.body = fn.body;
   }
 
   private decline(kind: string): never {
@@ -624,7 +817,7 @@ class FunctionLowering {
     // their wasm locals already hold.
     const entry = this.newState();
     this.emit(entry, ...this.restores());
-    this.lowerList(this.fn.body, entry);
+    this.lowerList(this.body, entry);
     // Every state must END: a switch case that runs off its body falls
     // through into the next state's. The one state that legitimately runs
     // off the end is where control leaves the body, and completing there
@@ -638,8 +831,12 @@ class FunctionLowering {
     return { wrapper: this.buildWrapper(), resume: this.buildResume(), frame };
   }
 
-  /* ── eligibility ─────────────────────────────────────────────────────── */
+  /* ── eligibility and the hoisting rewrite ────────────────────────────── */
 
+  /** One phase: the checks that read the SOURCE body, then the rewrite
+   * that gives every suspension a statement root of its own, then the
+   * checks that read the rewritten body — checkPositions last, as the
+   * verifier of the residue hoisting could not fix. */
   private checkEligible(): void {
     const fn = this.fn;
     // The initializer wrapper writes both caches by ASSIGNING the module
@@ -650,7 +847,15 @@ class FunctionLowering {
       const g = (this.mod.globals ?? []).find((c) => c.id === id);
       if (g === undefined || g.type.kind !== "promise") this.decline("fn:async:module-init-global");
     }
-    if (fn.locals.some((l) => l.id === FRAME_LOCAL || l.id === FRAME_ANY_LOCAL || l.id === EXC_LOCAL)) {
+    if (
+      fn.locals.some(
+        (l) =>
+          l.id === FRAME_LOCAL ||
+          l.id === FRAME_ANY_LOCAL ||
+          l.id === EXC_LOCAL ||
+          l.id.startsWith(HOIST_PREFIX),
+      )
+    ) {
       this.decline("fn:async:local-id-clash");
     }
     // Adoption: a promise settled WITH a promise. `await` of one would
@@ -672,7 +877,6 @@ class FunctionLowering {
     if (fn.locals.some((l) => (l.boxed === true || l.tdz === true) && !captured.has(l.id))) {
       this.decline("fn:async:boxed-local");
     }
-    if (this.saved.some((l) => l.type.kind === "void")) this.decline("fn:async:void-local");
     // A `return` crossing a finally settles AFTER the finally runs, which
     // the settle-then-return rewrite gets backwards. Checked over the WHOLE
     // body (not alongside the position scan) because the try may sit inside
@@ -680,7 +884,181 @@ class FunctionLowering {
     if (anyNode(fn.body, (rec) => rec["kind"] === "tryCatch" && rec["finallyBody"] !== null && hasReturn(rec))) {
       this.decline("fn:async:return-in-finally");
     }
-    this.checkPositions(fn.body);
+    // Order-preserving hoisting: after this, every suspension the pass
+    // accepts sits at the root of a statement's value slot.
+    this.body = this.hoistList(fn.body);
+    this.saved = this.locals.filter((l) => l.boxed !== true && l.tdz !== true && !captured.has(l.id));
+    if (this.saved.some((l) => l.type.kind === "void")) this.decline("fn:async:void-local");
+    this.checkPositions(this.body);
+  }
+
+  /** Rewrite a statement list, splicing each statement's hoist prelude in
+   * ahead of it. */
+  private hoistList(body: IrStmt[]): IrStmt[] {
+    if (!hasSuspension(body)) return body;
+    return body.flatMap((s) => this.hoistStmt(s));
+  }
+
+  /** One statement in, its order-preserving sequence out (see the header).
+   * Statement kinds that CAN host a split keep their root suspension where
+   * it is — the splitter wants it there — and hoist only what surrounds
+   * it; the rest hoist every suspended operand into a temp ahead of
+   * themselves. A kind this does not rewrite comes back untouched and
+   * meets checkPositions instead. */
+  private hoistStmt(s: IrStmt): IrStmt[] {
+    if (!hasSuspension(s)) return [s];
+    const out: IrStmt[] = [];
+    const slots = STMT_HOIST_SLOTS[s.kind];
+    if (slots !== undefined) {
+      const rewritten = this.hoistParts(s, slots, out);
+      out.push(rewritten);
+      return out;
+    }
+    switch (s.kind) {
+      case "varDecl": {
+        const init = s.init === null ? null : this.hoistRoot(s.init, out);
+        out.push({ ...s, init });
+        break;
+      }
+      case "assign": {
+        const value = this.hoistRoot(s.value, out);
+        out.push({ ...s, value });
+        break;
+      }
+      case "exprStmt": {
+        const expr = this.hoistRoot(s.expr, out);
+        out.push({ ...s, expr });
+        break;
+      }
+      case "return": {
+        const value = s.value === null ? null : this.hoistRoot(s.value, out);
+        out.push({ ...s, value });
+        break;
+      }
+      case "throw": {
+        // `throw` cannot host a split (nothing resumes into it), so the
+        // payload has to be a value the resumed state already holds.
+        const value = this.hoistValue(s.value, out);
+        out.push({ ...s, value });
+        break;
+      }
+      case "if": {
+        // The condition evaluates exactly once, before either arm, so it
+        // hoists like any other unconditional operand — the ARMS are what
+        // may not run, and they are statement lists the pass explodes
+        // rather than expressions it hoists.
+        const cond = hasSuspension(s.cond) ? this.hoistValue(s.cond, out) : s.cond;
+        out.push({ ...s, cond, then: this.hoistList(s.then), else_: s.else_ === null ? null : this.hoistList(s.else_) });
+        break;
+      }
+      case "block":
+        out.push({ ...s, body: this.hoistList(s.body) });
+        break;
+      case "while":
+      case "doWhile":
+        // The condition is re-evaluated per iteration: a temp ahead of the
+        // loop would evaluate it once. Left for checkPositions to refuse.
+        out.push({ ...s, body: this.hoistList(s.body) });
+        break;
+      case "for":
+        // Same for the header's three slots, plus the per-iteration `let`
+        // binding an init hoist would move out of the loop's scope.
+        out.push({ ...s, body: this.hoistList(s.body) });
+        break;
+      default:
+        // forOf / switch / tryCatch — suspensions inside them are their own
+        // refusals, and every other kind holds no expression that can
+        // suspend.
+        out.push(s);
+        break;
+    }
+    return out;
+  }
+
+  /** A value slot that CAN host a suspension at its root: a root
+   * suspension stays put, anything else hoists its operands. */
+  private hoistRoot(e: IrExpr, out: IrStmt[]): IrExpr {
+    if (!hasSuspension(e)) return e;
+    if (classifySuspension(e) !== null) return e;
+    if (e.kind === "seqExpr") {
+      // seqExpr is straight-line by construction (the validator's subset),
+      // so its statements can be SPLICED into the host list at the point
+      // the expression itself would have evaluated — nothing reorders.
+      for (const st of e.stmts) out.push(...this.hoistStmt(st));
+      return this.hoistRoot(e.result, out);
+    }
+    if (CONDITIONAL_KINDS.has(e.kind)) this.decline(this.positionRefusal(e, true));
+    const slots = HOIST_SLOTS[e.kind];
+    if (slots === undefined) this.decline(this.positionRefusal(e));
+    return this.hoistParts(e, slots, out);
+  }
+
+  /** A value slot that canNOT host a suspension: hoist, then bind. */
+  private hoistValue(e: IrExpr, out: IrStmt[]): IrExpr {
+    return this.toTemp(this.hoistRoot(e, out), out);
+  }
+
+  /** Walk one node's operands in evaluation order, hoisting everything
+   * that must run before its last suspension. Operands PAST that
+   * suspension stay in place: they evaluate after the resumption, which is
+   * where JS puts them. The node comes back copied, never mutated. */
+  private hoistParts<T extends IrExpr | IrStmt>(node: T, slots: HoistSlot[], out: IrStmt[]): T {
+    const copy = { ...node } as unknown as Record<string, unknown>;
+    const ops: { get: () => IrExpr; set: (v: IrExpr) => void }[] = [];
+    for (const slot of slots) {
+      if (typeof slot === "string") {
+        // Optional slots (bytesNew's source, setNew's seed) read null.
+        if (copy[slot] === null || copy[slot] === undefined) continue;
+        ops.push({ get: () => copy[slot] as IrExpr, set: (val) => void (copy[slot] = val) });
+        continue;
+      }
+      if ("list" in slot) {
+        const items = [...(copy[slot.list] as IrExpr[])];
+        copy[slot.list] = items;
+        items.forEach((_, i) => ops.push({ get: () => items[i]!, set: (val) => void (items[i] = val) }));
+        continue;
+      }
+      const entries = (copy[slot.each] as Record<string, unknown>[]).map((entry) => ({ ...entry }));
+      copy[slot.each] = entries;
+      for (const entry of entries) {
+        ops.push({ get: () => entry[slot.field] as IrExpr, set: (val) => void (entry[slot.field] = val) });
+      }
+    }
+    let last = -1;
+    ops.forEach((op, i) => {
+      if (hasSuspension(op.get())) last = i;
+    });
+    for (let i = 0; i <= last; i++) {
+      const op = ops[i]!;
+      const cur = op.get();
+      const rewritten = hasSuspension(cur) ? this.hoistRoot(cur, out) : cur;
+      if (i < last) {
+        // Something after this one suspends, so its value has to be taken
+        // before the suspension — unless taking it twice is the same thing.
+        op.set(isStable(rewritten) ? rewritten : this.toTemp(rewritten, out));
+      } else {
+        // The last suspended operand. Still suspended after the rewrite
+        // means it IS a root suspension, which only a statement can host.
+        op.set(hasSuspension(rewritten) ? this.toTemp(rewritten, out) : rewritten);
+      }
+    }
+    return copy as unknown as T;
+  }
+
+  /** Bind `e` to a fresh `%hoist.<n>` local, in place, and answer the
+   * reference that stands in for it. Ordinary locals: they ride the
+   * frame's total save/restore like every other one. */
+  private toTemp(e: IrExpr, out: IrStmt[]): IrExpr {
+    // A void temp has no frame slot AND no reference to hand back; the
+    // operand position it came from still needs an expression. The
+    // loader's wait is void by nature, so it keeps its own name.
+    if (e.type.kind === "void") {
+      this.decline(hasModuleAwait(e) ? "fn:async:module-await-position" : "fn:async:hoist-void");
+    }
+    const id = `${HOIST_PREFIX}${++this.hoisted}`;
+    this.locals.push({ id, name: id, type: e.type, mutable: false });
+    out.push({ kind: "varDecl", localId: id, init: e, loc: e.loc });
+    return { kind: "varRef", localId: id, type: e.type, loc: e.loc };
   }
 
   /** Every suspension must sit at the ROOT of a simple statement slot.
@@ -753,11 +1131,13 @@ class FunctionLowering {
     if (hasSuspension(node)) this.decline(this.positionRefusal(node));
   }
 
-  /** The loader's dependency wait and a user `await` need the same work
-   * (order-preserving temp hoisting) in a position this pass cannot split,
-   * but they are different constructs and the census says which. */
-  private positionRefusal(node: unknown): string {
-    return hasModuleAwait(node) ? "fn:async:module-await-position" : "fn:async:await-position";
+  /** The census name for a suspension hoisting could not move: the
+   * loader's dependency wait and a user `await` sit in the same positions
+   * but are different constructs, and a CONDITIONAL position is a
+   * different rock again (the header's refusal list says why). */
+  private positionRefusal(node: unknown, conditional = false): string {
+    if (hasModuleAwait(node)) return "fn:async:module-await-position";
+    return conditional ? "fn:async:await-conditional" : "fn:async:await-position";
   }
 
   /* ── the frame shape ─────────────────────────────────────────────────── */
@@ -1314,10 +1694,11 @@ class FunctionLowering {
       name: this.resumeName,
       params: [param],
       returnType: VOID,
-      // The async function's own locals ride along: params become plain
-      // locals restored from the frame, and received captures keep their
-      // boxed entries so the emitter's box-access gates still apply.
-      locals: [frameAnyLocal, frameLocal, ...this.fn.locals, excLocal],
+      // The async function's own locals ride along (plus the hoisting
+      // rewrite's temps): params become plain locals restored from the
+      // frame, and received captures keep their boxed entries so the
+      // emitter's box-access gates still apply.
+      locals: [frameAnyLocal, frameLocal, ...this.locals, excLocal],
       ...(this.fn.captures !== undefined ? { captures: this.fn.captures } : {}),
       body,
       loc: this.fn.loc,
@@ -1327,7 +1708,10 @@ class FunctionLowering {
   private buildWrapper(): WFunction {
     const frameLocal: IrLocal = { id: FRAME_LOCAL, name: FRAME_LOCAL, type: this.frameType, mutable: false };
     const captured = new Set((this.fn.captures ?? []).map((c) => c.localId));
-    const keep = this.fn.locals.filter(
+    // Params and received captures only: the wrapper stores the arguments
+    // and hands the frame over, so the body's locals — hoist temps
+    // included — belong to resume alone.
+    const keep = this.locals.filter(
       (l) => captured.has(l.id) || this.fn.params.some((p) => p.localId === l.id),
     );
     const frameInit: IrExpr = {
