@@ -20,6 +20,7 @@
  *
  *   (export "_start" (func))            — the program; run it once.
  *   (export "_tick" (func (param f64) (result f64)))  [timer modules only]
+ *   (export "_status" (func (result i32)))  [top-level-await modules only]
  *   (export "memory" (memory))          — where write's bytes live.
  *
  * THE EVENT LOOP. `_start` runs the program to its first checkpoint: the
@@ -42,10 +43,25 @@
  * immediates), or a NEGATIVE value when nothing ref'd is left and the
  * program is over.
  *
- * A TRAP IS THE EXIT CODE. There is no status channel: a trap out of
- * `_start` or `_tick` is the program dying with exit 1 — an uncaught
- * exception or an unhandled rejection (SEMANTICS.md S007, S010) — and a
- * normal return with a negative deadline is exit 0.
+ * A TRAP IS THE EXIT CODE — 1, always. A trap out of `_start` or `_tick`
+ * is the program dying with exit 1: an uncaught exception, an unhandled
+ * rejection, or a rejected top-level-await root (SEMANTICS.md S007, S010).
+ * A normal return with a negative deadline is exit 0, UNLESS the module
+ * exports `_status`:
+ *
+ *     let code = 0;
+ *     try { start(); pump(); code = status?.() ?? 0; }
+ *     catch (trap) { code = 1; }
+ *
+ * `_status()` exists ONLY in a module whose entry is an async module —
+ * i.e. one using top-level await — and answers Node's status for the
+ * module evaluation promise at QUIESCENCE: 13 when it is still pending
+ * (Node's "unsettled top-level await" exit — SEMANTICS.md S012), 0 when
+ * it settled. It is a pure read of that promise's state, so it is
+ * only meaningful once the pump has returned a negative deadline; calling
+ * it earlier answers about a program that is still running. A trap
+ * overrides it: the program is already dead with exit 1, and a rejected
+ * root traps rather than answering here.
  */
 
 export const IMPORT_MODULE = "tsinter";
@@ -53,6 +69,7 @@ export const IMPORT_WRITE = "write";
 export const IMPORT_NOW = "now";
 export const EXPORT_ENTRY = "_start";
 export const EXPORT_TICK = "_tick";
+export const EXPORT_STATUS = "_status";
 export const EXPORT_MEMORY = "memory";
 
 export const FD_STDOUT = 1;

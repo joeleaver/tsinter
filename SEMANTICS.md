@@ -174,6 +174,22 @@ before quiescence plus the stderr line and the trap); the differential
 corpus for the exit code (the harness skips the stderr compare for
 nonzero-exit programs).
 
+A REJECTED TOP-LEVEL-AWAIT ROOT reports through the same channel. The
+module evaluation promise of a program using top-level await is
+loader-owned — marked observed the moment it exists, so the ledger walk
+above never answers for it — and its rejection is instead decided by the
+checkpoint that observed it: the same `Unhandled promise rejection:
+<reason>` line to fd 2, then the same trap, which stops the event loop
+before any timer already armed can fire (Node terminates there too, so a
+later timer is dead code on both sides — corpus 2653). Node's own stderr
+carries the error and a stack trace, and for an unrelated rejection raised
+in the SAME checkpoint Node reports the module error while this tier's
+ledger walk runs first and reports the other one; both are exit 1 with the
+same stdout, and the line they disagree over is stderr on a nonzero exit.
+**Tested by:** corpus 2648/2651/2653 (stdout and exit code) and the wasm
+top-level-await unit test (the stderr line, the trap, and the timer that
+never runs).
+
 ## S011 — `Timeout.refresh()` cannot revive a one-shot that already fired *(inherited)*
 
 `refresh()` re-arms a timer to now + its ORIGINAL delay. It works on an
@@ -191,3 +207,22 @@ armed. **Tested by:** the corpus pins the SUPPORTED shapes
 (`1803-timeout-refresh`, refresh from inside the callback); the divergent
 one is deliberately untested — a corpus program covering it could not
 match Node on any backend.
+
+## S012 — Wasm tier: an unsettled top-level await exits 13 without Node's warning
+
+A program whose module evaluation promise is still PENDING when the event
+loop runs dry exits 13 — Node's dedicated unsettled-top-level-await status
+— which this tier answers through the `_status` export (abi.ts) rather
+than a trap: the artifact has no exit-code channel, and 13 is not the
+trap's 1. The DIVERGENCE is stderr: Node additionally writes a `Warning:
+Detected unsettled top-level await at <file>:<line>` report naming the
+await that never resumed, and this tier writes nothing at all. The loop is
+not cut short by the pending root either way — timers already armed still
+run to quiescence, and the verdict is taken after them. **Rationale:**
+source locations are not carried into the artifact (the same reason S007
+and S010 have no stack traces), so the warning could only be approximated;
+the exit code, which is what a caller branches on, is exact. **Tested by:**
+corpus `2649-top-level-await-pending` and
+`2651-top-level-await-pending-unhandled` (the exit code, with the stderr
+compare skipped for nonzero exits) plus the wasm top-level-await unit test
+(exit 13 with the armed timer's output intact).

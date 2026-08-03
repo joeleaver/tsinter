@@ -84,6 +84,25 @@ export function asyncModule(fn: IrFunction, extra: IrFunction[] = []): IrModule 
   };
 }
 
+/** The loader's INTERNAL dependency wait: `module.await(p)`, which the
+ * frontend only ever emits at the root of an exprStmt. */
+export const moduleAwait = (dep: IrExpr): IrExpr => ({
+  kind: "intrinsic",
+  name: "module.await",
+  args: [dep],
+  type: VOID,
+  loc,
+});
+
+/** A module evaluation promise global — what `asyncCacheGlobal` and
+ * `asyncCycleCacheGlobal` name (mutable, promise-typed, "%g." namespace). */
+export const promiseGlobal = (id: string): NonNullable<IrModule["globals"]>[number] => ({
+  id,
+  name: id,
+  type: promiseOf(VOID),
+  mutable: true,
+});
+
 /** The canonical two-await body:
  *
  *   async function f(): Promise<number> {

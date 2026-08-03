@@ -30,7 +30,14 @@
  * `_start` is done, the report walks the ledger for the FIRST unobserved
  * rejection — scr_async.c's shape, prints once — writes Node's
  * "Unhandled promise rejection: <reason>" to stderr, and TRAPS: the trap
- * is this tier's only exit-1 channel (SEMANTICS.md S007, S010). */
+ * is this tier's exit-1 channel (SEMANTICS.md S007, S010).
+ *
+ * THE MODULE ROOT IS ITS OWN CHANNEL. A top-level-await program's entry
+ * promise belongs to the loader, so it is marked observed at birth and the
+ * ledger walk never answers for it. Its rejection is instead decided by
+ * the emitter's checkpoint, which calls `rootReport` — the SAME rendered
+ * line, the same trap — and thereby stops the event loop before any later
+ * timer runs, exactly where scr_loop_run breaks on a rejected root. */
 import type { ByteWriter } from "./bytes.js";
 import { Code } from "./code.js";
 import { FD_STDERR } from "./abi.js";
@@ -414,6 +421,97 @@ export class PromiseBuilder {
     });
   }
 
+  /** The rejection line itself: `Unhandled promise rejection: <reason>` to
+   * fd 2, then the trap that IS this tier's exit 1 (SEMANTICS.md S010).
+   * `p` holds the rejected promise and `k` is a scratch i32; both the
+   * ledger walk (report) and the module ROOT's own stop-and-trap
+   * (rootReport) render through here, so the two lines cannot drift. */
+  private emitReport(c: Code, p: number, k: number): void {
+    const out = this.deps.out();
+    const tags = this.deps.tags;
+    this.deps.lit(c, "Unhandled promise rejection: ");
+    c.call(out.stage);
+    c.localGet(p);
+    c.structGet(this.promT, PROM_KIND);
+    c.localSet(k);
+    // The payload's four renderable shapes, scr_async.c's report
+    // exactly; anything else prints "[object]" like the C default.
+    c.localGet(k);
+    c.i32Const(tags.f64);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(p);
+    c.structGet(this.promT, PROM_F64);
+    c.call(this.deps.f64ToStr());
+    c.call(out.stage);
+    c.else_();
+    c.localGet(k);
+    c.i32Const(tags.bool);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(p);
+    c.structGet(this.promT, PROM_F64);
+    c.f64Const(0);
+    c.f64Ne();
+    c.ifVoid();
+    this.deps.lit(c, "true");
+    c.call(out.stage);
+    c.else_();
+    this.deps.lit(c, "false");
+    c.call(out.stage);
+    c.end();
+    c.else_();
+    c.localGet(k);
+    c.i32Const(tags.str);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(p);
+    c.structGet(this.promT, PROM_REF);
+    c.refCast(this.strType);
+    c.call(out.stage);
+    c.else_();
+    c.localGet(k);
+    c.i32Const(tags.obj);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(p);
+    c.structGet(this.promT, PROM_REF);
+    c.refCast(this.deps.errT());
+    c.call(this.deps.errToStr());
+    c.call(out.stage);
+    c.else_();
+    this.deps.lit(c, "[object]");
+    c.call(out.stage);
+    c.end();
+    c.end();
+    c.end();
+    c.end();
+    c.i32Const(0x0a);
+    c.call(out.putc);
+    c.i32Const(FD_STDERR);
+    c.call(out.flush);
+    // Node exits 1 on an unhandled rejection; the trap is how this
+    // artifact says that (SEMANTICS.md S010).
+    c.unreachable();
+  }
+
+  /** %w.async.rootReport(p) — the TOP-LEVEL-AWAIT root's own stop: a
+   * rejected module evaluation promise ends the program at the checkpoint
+   * that observed it, before any later timer can run (S010, and
+   * scr_loop_run's root break). The root is marked handled the moment it
+   * exists, so the ledger walk deliberately skips it and this is the only
+   * place it is answered for. Never returns. */
+  rootReport(): number {
+    return this.cached("rootReport", () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.promRef()], []), "%w.async.rootReport");
+      const c = new Code();
+      const P = 0, K = 1;
+      this.emitReport(c, P, K);
+      this.mb.setBody(idx, [I32], c.bytes());
+      return idx;
+    });
+  }
+
   /** %w.async.report() — the quiescent unhandled-rejection check. Walks
    * the ledger, and on the FIRST rejection nobody observed writes Node's
    * line to stderr and traps (S010: the trap IS the exit-1 channel, and
@@ -428,8 +526,6 @@ export class PromiseBuilder {
     return this.cached("report", () => {
       const idx = this.mb.declareFunc(this.mb.funcType([], []), "%w.async.report");
       const led = this.led();
-      const out = this.deps.out();
-      const tags = this.deps.tags;
       const c = new Code();
       const P = 0, K = 1;
       c.globalGet(led.head);
@@ -449,72 +545,7 @@ export class PromiseBuilder {
       c.i32Eqz();
       c.i32And();
       c.ifVoid();
-      {
-        this.deps.lit(c, "Unhandled promise rejection: ");
-        c.call(out.stage);
-        c.localGet(P);
-        c.structGet(this.promT, PROM_KIND);
-        c.localSet(K);
-        // The payload's four renderable shapes, scr_async.c's report
-        // exactly; anything else prints "[object]" like the C default.
-        c.localGet(K);
-        c.i32Const(tags.f64);
-        c.i32Eq();
-        c.ifVoid();
-        c.localGet(P);
-        c.structGet(this.promT, PROM_F64);
-        c.call(this.deps.f64ToStr());
-        c.call(out.stage);
-        c.else_();
-        c.localGet(K);
-        c.i32Const(tags.bool);
-        c.i32Eq();
-        c.ifVoid();
-        c.localGet(P);
-        c.structGet(this.promT, PROM_F64);
-        c.f64Const(0);
-        c.f64Ne();
-        c.ifVoid();
-        this.deps.lit(c, "true");
-        c.call(out.stage);
-        c.else_();
-        this.deps.lit(c, "false");
-        c.call(out.stage);
-        c.end();
-        c.else_();
-        c.localGet(K);
-        c.i32Const(tags.str);
-        c.i32Eq();
-        c.ifVoid();
-        c.localGet(P);
-        c.structGet(this.promT, PROM_REF);
-        c.refCast(this.strType);
-        c.call(out.stage);
-        c.else_();
-        c.localGet(K);
-        c.i32Const(tags.obj);
-        c.i32Eq();
-        c.ifVoid();
-        c.localGet(P);
-        c.structGet(this.promT, PROM_REF);
-        c.refCast(this.deps.errT());
-        c.call(this.deps.errToStr());
-        c.call(out.stage);
-        c.else_();
-        this.deps.lit(c, "[object]");
-        c.call(out.stage);
-        c.end();
-        c.end();
-        c.end();
-        c.end();
-        c.i32Const(0x0a);
-        c.call(out.putc);
-        c.i32Const(FD_STDERR);
-        c.call(out.flush);
-        // Node exits 1 on an unhandled rejection; the trap is how this
-        // artifact says that (SEMANTICS.md S010).
-        c.unreachable();
-      }
+      this.emitReport(c, P, K);
       c.end();
       c.localGet(P);
       c.structGet(this.promT, P_NEXT);

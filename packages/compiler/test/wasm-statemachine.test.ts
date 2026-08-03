@@ -23,7 +23,9 @@ import {
   loc,
   local,
   log,
+  moduleAwait,
   num,
+  promiseGlobal,
   promiseOf,
   ret,
   str,
@@ -526,16 +528,27 @@ describe("refusals leave the function untouched", () => {
     );
   });
 
-  test("an async module initializer", () => {
+  test("an initializer whose cache global is not a promise global", () => {
+    // The wrapper's stores go through the "%g." namespace; a name that is
+    // not a module global of promise type would silently become a write to
+    // a local slot that does not exist.
     expectRefusal(
       plain([exprStmt(awaitCall())], [], { asyncCacheGlobal: "%g.mod.p" }),
-      "fn:async:module-init",
+      "fn:async:module-init-global",
     );
+    expectRefusal(plain([exprStmt(awaitCall())], [], { asyncCacheGlobal: "%g.mod.p" }), "fn:async:module-init-global", (m) => ({
+      ...m,
+      globals: [{ id: "%g.mod.p", name: "p", type: BOOL, mutable: true }],
+    }));
   });
 
-  test("top-level await (the entry function is async)", () => {
-    const fn = plain([exprStmt(awaitCall())]);
-    expectRefusal(fn, "fn:async:entry", (m) => ({ ...m, entry: "f" }));
+  test("module.await outside an exprStmt", () => {
+    // The loader's wait is void-valued and its re-entry produces nothing,
+    // so only the statement slot that discards can host it.
+    expectRefusal(
+      plain([ret(moduleAwait(call("%init.0", [], promiseOf(VOID))))]),
+      "fn:async:module-await-position",
+    );
   });
 
   test("a body-declared boxed local", () => {
@@ -685,6 +698,129 @@ describe("refusals leave the function untouched", () => {
     const { mod, refusals } = lower(asyncModule(gen));
     expect(refusals).toEqual([]);
     expect(fnNamed(mod, "gf")).toEqual(gen);
+  });
+});
+
+/* ── 4b. module initializers and top-level await ───────────────────────── */
+
+describe("the module-initializer protocol", () => {
+  const initFn = (extra: Partial<IrFunction> = {}): IrFunction =>
+    ({
+      name: "%init.0",
+      params: [],
+      returnType: VOID,
+      async: true,
+      locals: [],
+      body: [exprStmt(await_(call("mkp", [], promiseOf(F64)), F64))],
+      loc,
+      ...extra,
+    }) as IrFunction;
+
+  const lowerWithGlobals = (
+    fn: IrFunction,
+    globals: NonNullable<IrModule["globals"]>,
+    entry?: string,
+  ): WModule => {
+    const input: IrModule = { ...asyncModule(fn), globals, ...(entry !== undefined ? { entry } : {}) };
+    const { mod, refusals } = lower(input);
+    expect(refusals).toEqual([]);
+    return mod;
+  };
+
+  test("the wrapper guards the cache FIRST and publishes both caches AFTER the spawn", () => {
+    // emit-async.ts's order, and every step of it is load-bearing under an
+    // import cycle: the guard is what makes a re-entrant call cheap, and
+    // publishing last is what makes the OUTERMOST spawn the promise the
+    // cycle ends up rooted at.
+    const mod = lowerWithGlobals(
+      initFn({ asyncCacheGlobal: "%g.m.%initPromise", asyncCycleCacheGlobal: "%g.m.%cyclePromise" }),
+      [promiseGlobal("%g.m.%initPromise"), promiseGlobal("%g.m.%cyclePromise")],
+    );
+    const wrapper = fnNamed(mod, "%init.0");
+    expect(wrapper.body.map((s) => s.kind)).toEqual([
+      "%async.cacheCheck", // 1. already evaluating or evaluated? hand it back
+      "varDecl", //           2. the frame, with its minted promise
+      "exprStmt", //          … and the eager kick
+      "%async.markHandled", // 3. the loader owns it: never "unhandled"
+      "assign", //            4. the cache, LAST write wins
+      "assign", //            5. the cycle cache, same rule
+      "return",
+    ]);
+    expect(wrapper.body[0]).toMatchObject({ globalId: "%g.m.%initPromise" });
+    // Both stores publish the frame's OWN promise, not the global's
+    // previous value.
+    for (const [i, id] of [[4, "%g.m.%initPromise"], [5, "%g.m.%cyclePromise"]] as const) {
+      expect(wrapper.body[i]).toMatchObject({
+        kind: "assign",
+        localId: id,
+        value: { kind: "recordGet", field: "%promise" },
+      });
+    }
+    expect(wrapper.returnType).toEqual(promiseOf(VOID));
+  });
+
+  test("an initializer with no cycle publishes only its own cache", () => {
+    const mod = lowerWithGlobals(initFn({ asyncCacheGlobal: "%g.m.%initPromise" }), [
+      promiseGlobal("%g.m.%initPromise"),
+    ]);
+    expect(fnNamed(mod, "%init.0").body.map((s) => s.kind)).toEqual([
+      "%async.cacheCheck",
+      "varDecl",
+      "exprStmt",
+      "%async.markHandled",
+      "assign",
+      "return",
+    ]);
+  });
+
+  test("the ENTRY may be async: top-level await lowers like any other body", () => {
+    // The wrapper's promise IS the module evaluation promise `_start`
+    // parks and `_status` reports on (abi.ts) — nothing about the pass
+    // changes, the return type is what tells the emitter.
+    const mod = lowerWithGlobals(initFn({ name: "f" }), [], "f");
+    expect(fnNamed(mod, "f").returnType).toEqual(promiseOf(VOID));
+    expect(mod.functions.some((fn) => fn.name === "%f.resume")).toBe(true);
+  });
+
+  test("module.await splits the state WITHOUT leaving resume when the dependency settled", () => {
+    // The one suspension that can fall through: subscribeIfPending returns
+    // only if it actually parked, so the settled path re-enters the
+    // dispatch loop in the same turn and lands in the resume state, where
+    // the reject check runs exactly as it would after a park.
+    const dep = () => v("%depInit.0", promiseOf(VOID));
+    const fn: IrFunction = {
+      name: "%init.1",
+      params: [],
+      returnType: VOID,
+      async: true,
+      locals: [local("%depInit.0", promiseOf(VOID))],
+      body: [
+        varDecl("%depInit.0", call("%init.0", [], promiseOf(VOID))),
+        exprStmt(moduleAwait(dep())),
+        log([str("body")]),
+      ],
+      loc,
+    };
+    const mod = lowerWithGlobals(fn, []);
+    const resume = fnNamed(mod, "%%init.1.resume");
+    const cases = dispatch(resume);
+    expect(cases.map((c) => c.test)).toEqual([0, 1, null]);
+    // The suspending state parks the dependency, saves, sets the state,
+    // and ends by CONTINUING — no `return`, which is the whole difference
+    // from an ordinary await.
+    const suspend = afterRestores(cases[0]!.body);
+    expect(suspend.at(-2)!.kind).toBe("%async.subscribeIfPending");
+    expect(suspend.at(-1)).toMatchObject({ kind: "continue", label: "%dispatch" });
+    expect(nodesOfKind(cases[0]!.body, "%async.subscribe")).toHaveLength(0);
+    expect(nodesOfKind(cases[0]!.body, "%async.hop")).toHaveLength(0);
+    // Re-entry: the rejection check, then the body that follows the wait.
+    expect(afterRestores(cases[1]!.body).map((s) => s.kind)).toEqual([
+      "%async.rejectCheck",
+      "exprStmt",
+      "%async.settle",
+      "return",
+    ]);
+    expect(frameFields(mod, "%init.1")).toEqual(["%state", "%promise", "%l_%depInit.0", "%await1"]);
   });
 });
 

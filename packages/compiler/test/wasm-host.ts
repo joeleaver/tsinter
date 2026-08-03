@@ -1,6 +1,7 @@
 /* The abi.ts host contract, for the unit tests: instantiate a compiled
- * module, service `tsinter.write` into per-fd buffers, run `_start`, then
- * pump `_tick` to quiescence. The differential harness
+ * module, service `tsinter.write` into per-fd buffers, run `_start`, pump
+ * `_tick` to quiescence, and read `_status` for the exit code. The
+ * differential harness
  * (tests/harness/wasm-differential.test.ts) runs the same driver against
  * the corpus — this is the same loop, kept here so a test can assert on
  * output without a corpus program.
@@ -15,6 +16,11 @@ import { expect } from "vitest";
 export interface HostRun {
   stdout: string;
   stderr: string;
+  /** The process status the abi.ts contract answers with at quiescence:
+   * `_status()` when the module exports one (13 = a top-level await that
+   * never settled), 0 otherwise. A trap is exit 1 and never gets here —
+   * runWasmToTrap is that path. */
+  exitCode: number;
 }
 
 async function instantiate(modulePath: string) {
@@ -31,20 +37,26 @@ async function instantiate(modulePath: string) {
     },
   });
   memory = instance.exports["memory"] as WebAssembly.Memory;
+  let exitCode = 0;
   const drive = (): void => {
     (instance.exports["_start"] as () => void)();
     const tick = instance.exports["_tick"] as ((now: number) => number) | undefined;
-    if (tick === undefined) return;
-    for (let turns = 0; ; turns++) {
-      if (turns > 1_000_000) throw new Error(`_tick pump did not settle for ${modulePath}`);
-      const due = tick(clock);
-      if (due < 0) return;
-      clock = Math.max(clock, due);
+    const status = instance.exports["_status"] as (() => number) | undefined;
+    if (tick !== undefined) {
+      for (let turns = 0; ; turns++) {
+        if (turns > 1_000_000) throw new Error(`_tick pump did not settle for ${modulePath}`);
+        const due = tick(clock);
+        if (due < 0) break;
+        clock = Math.max(clock, due);
+      }
     }
+    // Quiescence: the only point `_status` means anything (abi.ts).
+    exitCode = status?.() ?? 0;
   };
   const out = (): HostRun => ({
     stdout: Buffer.concat(chunks[1]).toString("utf8"),
     stderr: Buffer.concat(chunks[2]).toString("utf8"),
+    exitCode,
   });
   return { drive, out, instance };
 }

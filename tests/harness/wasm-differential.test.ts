@@ -28,7 +28,9 @@
  * Node exits 1 on an uncaught exception, so the comparison stays honest
  * through the @exit directive and the skipped nonzero-exit stderr. Any
  * NON-trap error (a host bug, a missing export) still fails the test as
- * the raised error itself. */
+ * the raised error itself. The one nonzero exit that is NOT a trap is a
+ * top-level-await program whose module evaluation promise never settled:
+ * `_status()` answers Node's 13 (abi.ts). */
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { globSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -393,6 +395,34 @@ const TIER_FLOOR: string[] = [
   // Microtasks before timers, equal-deadline timers in registration
   // order, and an async chain woken by promises a timer resolves.
   "1021-async-ordering.ts",
+  // Increment 12 (async), stage 4: top-level await — the module graph as
+  // async functions. Each initializer's evaluation promise caches in its
+  // own global (guard first, publish after the eager spawn, last write
+  // wins under a cycle), the loader's internal dependency wait continues
+  // synchronously into the importer when the dependency already settled,
+  // and the entry's own promise becomes the root the ABI reports on
+  // (`_status`, abi.ts; SEMANTICS.md S010's root paragraph and S012).
+  //
+  // The whole shape end to end: a settled await, a timer-resolved one, a
+  // bare `await null`, and the module tail after each.
+  "2646-top-level-await.ts",
+  // A rejected root: exit 1 at the checkpoint that observed it.
+  "2648-top-level-await-rejection.ts",
+  // A root nothing settles: the loop drains, `_status` answers 13.
+  "2649-top-level-await-pending.ts",
+  // A pending root beside an unrelated unhandled rejection — the ledger
+  // walk answers first, and it is the same exit 1.
+  "2651-top-level-await-pending-unhandled.ts",
+  // The rejected root STOPS the loop: a 10ms timer armed before it never
+  // fires, exactly where scr_loop_run breaks.
+  "2653-top-level-await-rejection-stops-loop.ts",
+  // An async import cycle: the re-entrant guard, module.await on the
+  // already-settled back edge, and Node's b-then-a evaluation order.
+  "2655-top-level-await-cycle/main.ts",
+  // The counterpart the cycle is told apart from: an ordinary async
+  // dependency DOES cost a turn, so the dependency's own microtask still
+  // beats the importer's first statement.
+  "2658-top-level-await-sync-completion/main.ts",
 ];
 
 interface RunResult {
@@ -552,6 +582,18 @@ async function runWasm(modulePath: string): Promise<RunResult> {
         if (due < 0) break;
         clock = Math.max(clock, due);
       }
+    }
+    // The one non-trap nonzero exit (abi.ts): a top-level-await program
+    // whose module evaluation promise never settled answers 13 here, which
+    // is Node's own status for it. Only meaningful at quiescence, which is
+    // exactly where this reads it.
+    const status = instance.exports["_status"] as (() => number) | undefined;
+    if (status !== undefined) {
+      return {
+        stdout: Buffer.concat(chunks[1]),
+        stderr: Buffer.concat(chunks[2]),
+        exitCode: status(),
+      };
     }
   } catch (err) {
     // A wasm TRAP is the tier's stand-in for an uncaught runtime error

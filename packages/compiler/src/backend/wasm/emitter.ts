@@ -63,6 +63,7 @@ import { computeMayThrow } from "../emission/may-throw.js";
 import {
   EXPORT_ENTRY,
   EXPORT_MEMORY,
+  EXPORT_STATUS,
   EXPORT_TICK,
   FD_STDERR,
   FD_STDOUT,
@@ -316,10 +317,19 @@ class Assembler {
     const mt = computeMayThrow(asIrModule(mod));
     this.mayThrow = mt.fns;
     this.mayThrowIndirect = mt.indirect;
+    // Top-level await: the lowering turned the entry into a spawn wrapper,
+    // so its promise-typed return IS the "this program has a module
+    // evaluation promise" flag (an entry the pass declined stays void and
+    // refuses at its own gate). Read here so the checkpoint — which the
+    // timer runtime may build before `_start` — and `_start` itself always
+    // agree about whether the root global exists.
+    this.asyncEntry =
+      mod.functions.find((fn) => fn.name === mod.entry)?.returnType.kind === "promise";
   }
 
   private readonly mayThrow: Set<string>;
   private readonly mayThrowIndirect: boolean;
+  private readonly asyncEntry: boolean;
 
   /* ── the exception protocol (pending-flag unwind, the native model) ────
    * One cell of three mutable globals: a kind tag (0 = nothing pending)
@@ -641,6 +651,20 @@ class Assembler {
       const c = new Code();
       c.refNull(this.fnClosPair(entryFn).clos);
       c.call(entry);
+      const root = this.rootGlobal();
+      if (root !== null) {
+        // Top-level await: the entry answered with its module evaluation
+        // promise. Park it — the checkpoint and `_status` read it from
+        // here — and mark it HANDLED, because the loader owns it: its
+        // rejection is the program's own stop (rootReport), never an
+        // unhandled rejection the ledger walk should answer for.
+        c.globalSet(root);
+        c.globalGet(root);
+        c.i32Const(1);
+        c.structSet(this.proms.promT, PROM_OBSERVED);
+      } else if (entryFn.returnType.kind === "promise") {
+        throw new Error("emitter bug: a promise-returning entry with no root global");
+      }
       if (this.mayThrow.has(this.mod.entry)) {
         // An exception that unwound out of %main is UNCAUGHT: Node's
         // observables are exit 1 plus a stderr report, and the trap
@@ -657,22 +681,52 @@ class Assembler {
       // for any rejection nobody ever looked at. Frames still parked on a
       // promise that never settles are simply dropped — an empty queue IS
       // exit 0, which is what Node does with a suspended await nothing
-      // will resolve. Nothing is emitted at all when the module has no
-      // promise surface (the runtime interns on first use, so a null
-      // builder means nothing ever needed it).
+      // will resolve (a suspended MODULE root is the one exception: that
+      // is exit 13, and `_status` is where the host reads it). Nothing is
+      // emitted at all when the module has no promise surface (the
+      // runtime interns on first use, so a null builder means nothing
+      // ever needed it).
       //
       // Where the program can still have macrotasks left, that is only
       // the FIRST checkpoint: `_tick` carries the loop from here, and the
       // host does the waiting (abi.ts).
-      if (this.promsField !== null) {
-        c.call(this.proms.drain());
-        c.call(this.proms.report());
-      }
+      this.emitCheckpoint(c);
       this.mb.setBody(start, [], c.bytes());
     }
     this.mb.exportFunc(EXPORT_ENTRY, start);
     if (this.timersField !== null) this.mb.exportFunc(EXPORT_TICK, this.timersField.tick());
+    this.emitStatus();
     this.mb.exportMemory(EXPORT_MEMORY);
+  }
+
+  /** `_status` (abi.ts): the module evaluation promise's verdict, read at
+   * quiescence. 13 — Node's dedicated unsettled-top-level-await status,
+   * minus its stderr warning (SEMANTICS.md S012) — while the root is
+   * still pending, 0 once it settled. A REJECTED root never reaches here:
+   * it trapped at the checkpoint that observed it. Emitted only for a
+   * top-level-await program, so nothing else grows an export. */
+  private emitStatus(): void {
+    const root = this.rootGlobal();
+    if (root === null) return;
+    const status = this.mb.declareFunc(this.mb.funcType([], [I32]), "%w.status");
+    const c = new Code();
+    c.globalGet(root);
+    c.refIsNull();
+    c.ifResult(I32);
+    // `_start` never ran: nothing to report on.
+    c.i32Const(0);
+    c.else_();
+    c.globalGet(root);
+    c.structGet(this.proms.promT, PROM_STATE);
+    c.i32Eqz();
+    c.ifResult(I32);
+    c.i32Const(13);
+    c.else_();
+    c.i32Const(0);
+    c.end();
+    c.end();
+    this.mb.setBody(status, [], c.bytes());
+    this.mb.exportFunc(EXPORT_STATUS, status);
   }
 
   finish(): Uint8Array {
@@ -921,6 +975,59 @@ class Assembler {
     return this.closPairFor([{ kind: "ref", nullable: true, typeIndex: this.frameBaseType() }], []);
   }
 
+  /* ── the top-level-await root (abi.ts's `_status`, SEMANTICS.md S010) ──
+   * A program whose ENTRY is an async module has a module evaluation
+   * promise, and Node reports on it: rejected is exit 1 at the checkpoint
+   * that saw it (before any later timer), still pending at quiescence is
+   * exit 13. `_start` parks it in this global; the checkpoint and
+   * `_status` are its two readers. Interned only for such a program, so
+   * every other module is byte-identical to what it compiled to before. */
+
+  private rootField: number | null = null;
+
+  private rootGlobal(): number | null {
+    if (!this.asyncEntry) return null;
+    this.rootField ??= this.mb.addGlobal(this.proms.promRef(), true, (w) => {
+      w.u8(0xd0); // ref.null $promise
+      w.sleb(this.proms.promT);
+    });
+    return this.rootField;
+  }
+
+  /** One microtask checkpoint: drain to quiescence, answer for a rejection
+   * nobody looked at, and — in a top-level-await program — stop the world
+   * on a rejected module root. `_start` runs it once after the entry
+   * returns and `_tick` after every macrotask callback, which is where
+   * Node decides all three (timers.ts's checkpoint dep).
+   *
+   * The root check comes AFTER the ledger report, where scr_loop_run puts
+   * it FIRST. Both orders reach the same observable: the two verdicts are
+   * the same exit 1 at the same point in the same checkpoint, over the
+   * same stdout, and the stderr line they disagree about is not compared
+   * on a nonzero exit (S007's surviving half, S010's root paragraph). A
+   * program with no module root emits exactly what it did before this
+   * existed — the check is three instructions that only appear with one. */
+  private emitCheckpoint(c: Code): void {
+    if (this.promsField === null) return;
+    c.call(this.proms.drain());
+    c.call(this.proms.report());
+    const root = this.rootGlobal();
+    if (root === null) return;
+    c.globalGet(root);
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    c.globalGet(root);
+    c.structGet(this.proms.promT, PROM_STATE);
+    c.i32Const(2);
+    c.i32Eq();
+    c.ifVoid();
+    c.globalGet(root);
+    c.call(this.proms.rootReport()); // renders, then traps
+    c.end();
+    c.end();
+  }
+
   /* ── the timer runtime and the loop the host pumps (timers.ts) ────────
    * Interned by the first `timers.*` libCall, so a module with no timer
    * surface emits neither the runtime nor the `_tick` export — and stays
@@ -940,11 +1047,7 @@ class Assembler {
         return this.nowFunc;
       },
       excKind: () => this.exc().kindG,
-      checkpoint: (c) => {
-        if (this.promsField === null) return;
-        c.call(this.proms.drain());
-        c.call(this.proms.report());
-      },
+      checkpoint: (c) => this.emitCheckpoint(c),
     });
     return this.timersField;
   }
@@ -1823,6 +1926,56 @@ class Assembler {
         code.call(this.proms.hop());
         return;
 
+      /** The loader's dependency wait (`module.await`): park ONLY on a
+       * pending dependency. A settled one falls through and the state
+       * machine drops into its resume state through the dispatch loop, so
+       * the importer continues in the same turn — ECMAScript's internal
+       * module wait costs no promise job (statemachine.ts's header). */
+      case "%async.subscribeIfPending": {
+        const p = this.acquireScratch(this.proms.promRef());
+        this.walkExpr(s.promise);
+        code.localSet(p);
+        code.localGet(p);
+        code.structGet(this.proms.promT, PROM_STATE);
+        code.i32Eqz();
+        this.openIf();
+        code.localGet(p);
+        this.walkExpr(s.resume);
+        this.walkExpr(s.frame);
+        code.call(this.proms.subscribe());
+        code.return_();
+        this.close();
+        this.releaseScratch(this.proms.promRef(), p);
+        return;
+      }
+
+      /** A module initializer's cache guard — the first statement of its
+       * wrapper. A non-null global is this module's own evaluation
+       * promise (already evaluating, or evaluated): hand it back instead
+       * of running the body a second time. */
+      case "%async.cacheCheck": {
+        const g = this.globalById.get(s.globalId);
+        if (g === undefined) throw new Error(`async cache global "${s.globalId}" not in module`);
+        const index = this.globalIndex(g, s.loc);
+        code.globalGet(index);
+        code.refIsNull();
+        code.i32Eqz();
+        this.openIf();
+        code.globalGet(index);
+        code.return_();
+        this.close();
+        return;
+      }
+
+      /** The loader owns a module evaluation promise: its rejection is the
+       * program's root-rejection exit, never an unhandled rejection, so it
+       * is observed the moment it exists. */
+      case "%async.markHandled":
+        this.walkExpr(s.promise);
+        code.i32Const(1);
+        code.structSet(this.proms.promT, PROM_OBSERVED);
+        return;
+
       /** Fulfil my own promise. The value's STATIC type picks the payload
        * slot, emitThrowValue's dispatch exactly — the two share the cell's
        * encoding, which is what lets a rejection copy across field-wise. */
@@ -1970,11 +2123,14 @@ class Assembler {
        * statement bodies for the survey to descend into. */
       case "%async.subscribe":
       case "%async.hop":
+      case "%async.subscribeIfPending":
       case "%async.subscribeUnion":
       case "%async.settle":
       case "%async.reject":
       case "%async.rejectCheck":
       case "%async.rejectCheckUnion":
+      case "%async.cacheCheck":
+      case "%async.markHandled":
         break;
       default: {
         const rest: never = s;

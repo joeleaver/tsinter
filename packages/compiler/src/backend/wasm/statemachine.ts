@@ -80,10 +80,10 @@
  * allocates nothing; a capturing async function re-packs its (unchanged)
  * boxes per suspend, which the runtime only ever calls.
  *
- * EVERY AWAIT SUSPENDS. JS spends a microtask turn even awaiting an
- * already-settled promise, so there is deliberately no settled fast path;
- * the protocol is uniform, which is what keeps the state numbering and the
- * resume dispatch simple:
+ * EVERY AWAIT SUSPENDS — with ONE exception, `module.await`, below. JS
+ * spends a microtask turn even awaiting an already-settled promise, so
+ * there is deliberately no settled fast path; the protocol is uniform,
+ * which is what keeps the state numbering and the resume dispatch simple:
  *
  *     frame.%await<k> = <the awaited promise>;
  *     <save every non-boxed local into the frame>;
@@ -113,15 +113,58 @@
  * caller, which is what resume's one top-level tryCatch is for: its catch
  * arm is `%async.reject(frame.%promise, e)` + `return`.
  *
+ * THE ONE AWAIT THAT DOES NOT HOP. `module.await` is ECMAScript's INTERNAL
+ * module-dependency wait (the frontend emits it for an import edge inside
+ * an async import CYCLE; an ordinary async dependency gets a real
+ * `awaitExpr`, which is why 2658's "dep micro" still beats "main"). A
+ * dependency that has ALREADY settled continues SYNCHRONOUSLY into the
+ * importer — no promise job, no turn — while a pending one parks like any
+ * other await and a rejected one propagates like any other await
+ * (scr_async.c's `scr_module_await`). Both paths still go through ONE
+ * resume point, so saves/restores stay uniform:
+ *
+ *     frame.%await<k> = <the dependency's promise>;
+ *     <save>; frame.%state = k;
+ *     %async.subscribeIfPending(frame.%await<k>, frame, closure);  // parks
+ *     continue %dispatch;             // settled: fall into case k NOW
+ *   case k:
+ *     <restore>; %async.rejectCheck(frame.%await<k>);
+ *
+ * MODULE INITIALIZERS. An async `%init.N` carries `asyncCacheGlobal` (its
+ * module evaluation promise) and, inside an import cycle, an
+ * `asyncCycleCacheGlobal` shared by the whole SCC. Its wrapper is the
+ * plain wrapper wearing emit-async.ts's protocol, in this exact order:
+ *
+ *   1. CACHE GUARD FIRST (`%async.cacheCheck`): a non-null global means
+ *      this module is already evaluating or evaluated — hand that promise
+ *      back instead of running the body twice.
+ *   2. Spawn (mint + kick), eagerly, like every other wrapper.
+ *   3. `%async.markHandled` on the minted promise: the LOADER owns a
+ *      module evaluation promise, so its rejection is never an unhandled
+ *      rejection — it becomes the root-rejection exit instead.
+ *   4. Store the cache AFTER the spawn returns, not before. An admitted
+ *      cycle re-enters this initializer between the guard and the spawn's
+ *      return (the body's `%loaded` flag is what makes that re-entry a
+ *      no-op body), and that guarded inner spawn temporarily fills the
+ *      cache; the outer store is the LAST write, which is what makes the
+ *      outermost member the promise everyone ends up waiting on.
+ *   5. The cycle cache, when present, is the same last-wins store, and
+ *      records the SCC member that actually rooted evaluation — an
+ *      importer outside the cycle awaits that global directly.
+ *
  * NOT YET LOWERED, REFUSED BY NAME (the loud-refusal contract — these are
  * real work, not oversights). A refusal names the WHOLE function and
  * leaves it untransformed, so the emitter's own `fn:async` still fires
  * behind it:
- *   - `fn:async:module-init` — an async module initializer
- *     (asyncCacheGlobal/asyncCycleCacheGlobal): the promise cache and the
- *     cyclic-SCC completion verdict are their own increment.
- *   - `fn:async:entry` — top-level await (the entry function is async).
- *     Same increment as module-init: the host has to pump the loop.
+ *   - `fn:async:module-init-global` — an initializer whose cache global is
+ *     not a module global of promise type. Unreachable from today's
+ *     frontend (it emits both globals with the function); the wrapper's
+ *     stores would otherwise land on a local slot that does not exist.
+ *   - `fn:async:module-await-position` — a `module.await` anywhere but at
+ *     the root of an `exprStmt`. The frontend emits exactly that shape;
+ *     anything else would need the same temp hoisting `await-position`
+ *     does, and the two are told apart so the census keeps naming the
+ *     construct that actually needs work.
  *   - `fn:async:await-in-try` — an await inside try/catch/finally. The
  *     handler stack has to become frame state that survives suspension
  *     (regenerator carries an explicit try-entry stack), and it has to
@@ -226,6 +269,10 @@ export type AsyncStmt =
   | { kind: "%async.subscribe"; promise: WExpr; frame: WExpr; resume: WExpr; loc: SrcLoc }
   /** Enqueue resume(frame) directly — `await <non-thenable>`'s one turn. */
   | { kind: "%async.hop"; frame: WExpr; resume: WExpr; loc: SrcLoc }
+  /** `module.await`'s half-suspend: subscribe and RETURN when the
+   * dependency is still pending, fall through when it has settled (the
+   * module wait costs no promise job — see the header). */
+  | { kind: "%async.subscribeIfPending"; promise: WExpr; frame: WExpr; resume: WExpr; loc: SrcLoc }
   /** awaitUnionExpr's suspend: the `promiseTag` arm subscribes, every
    * other (unit) arm hops. */
   | { kind: "%async.subscribeUnion"; value: WExpr; promiseTag: number; frame: WExpr; resume: WExpr; loc: SrcLoc }
@@ -239,7 +286,15 @@ export type AsyncStmt =
   | { kind: "%async.rejectCheck"; promise: WExpr; loc: SrcLoc }
   /** rejectCheck for an awaited `Promise<T> | units` union: only the
    * `promiseTag` arm can carry a rejection. */
-  | { kind: "%async.rejectCheckUnion"; value: WExpr; promiseTag: number; loc: SrcLoc };
+  | { kind: "%async.rejectCheckUnion"; value: WExpr; promiseTag: number; loc: SrcLoc }
+  /** A module initializer's cache guard, the first statement of its
+   * wrapper: a non-null global is the module's own evaluation promise, so
+   * hand it straight back instead of evaluating twice. */
+  | { kind: "%async.cacheCheck"; globalId: string; loc: SrcLoc }
+  /** Mark a promise OBSERVED without reading it: a module evaluation
+   * promise belongs to the loader, so its rejection is the program's
+   * root-rejection exit and never an unhandled rejection. */
+  | { kind: "%async.markHandled"; promise: WExpr; loc: SrcLoc };
 
 /** A statement of the lowered IR. SHALLOW by design — see the header:
  * nested bodies keep their `IrStmt[]` static type while carrying
@@ -280,11 +335,18 @@ function widenExpr(e: WExpr): IrExpr {
 
 /** Every node kind that SUSPENDS. `async.hop` is the frontend's `await
  * <non-thenable>` (one microtask turn, no promise); `async.awaitDyn` is
- * the checked-dynamic sibling this pass declines. */
+ * the checked-dynamic sibling this pass declines; `module.await` is the
+ * loader's dependency wait, which only suspends when the dependency is
+ * still pending but is a state split either way. */
 function isSuspensionNode(rec: Record<string, unknown>): boolean {
   const kind = rec["kind"];
   if (kind === "awaitExpr" || kind === "awaitUnionExpr") return true;
+  if (isModuleAwaitNode(rec)) return true;
   return kind === "libCall" && (rec["fn"] === "async.hop" || rec["fn"] === "async.awaitDyn");
+}
+
+function isModuleAwaitNode(rec: Record<string, unknown>): boolean {
+  return rec["kind"] === "intrinsic" && rec["name"] === "module.await";
 }
 
 /** A generic kind-keyed scan, the may-throw walk's shape: the IR is plain
@@ -303,6 +365,10 @@ function anyNode(node: unknown, pred: (rec: Record<string, unknown>) => boolean)
 
 function hasSuspension(node: unknown): boolean {
   return anyNode(node, isSuspensionNode);
+}
+
+function hasModuleAwait(node: unknown): boolean {
+  return anyNode(node, isModuleAwaitNode);
 }
 
 function hasAwaitDyn(node: unknown): boolean {
@@ -412,7 +478,10 @@ type AwaitUnionNode = Extract<IrExpr, { kind: "awaitUnionExpr" }>;
 type Suspension =
   | { form: "await"; node: AwaitNode }
   | { form: "awaitUnion"; node: AwaitUnionNode }
-  | { form: "hop"; before: IrStmt[]; result: IrExpr | null; type: IrType };
+  | { form: "hop"; before: IrStmt[]; result: IrExpr | null; type: IrType }
+  /** `module.await(dep)` — void-valued, and only half a suspension (see
+   * the header): `dep` is the dependency's evaluation promise. */
+  | { form: "moduleAwait"; dep: IrExpr; loc: SrcLoc };
 
 function isHopCall(e: IrExpr): boolean {
   return e.kind === "libCall" && e.fn === "async.hop";
@@ -421,6 +490,11 @@ function isHopCall(e: IrExpr): boolean {
 /** Recognize a root-position suspension, or null when the expression
  * merely CONTAINS one somewhere the pass cannot split. */
 function classifySuspension(e: IrExpr): Suspension | null {
+  if (e.kind === "intrinsic" && e.name === "module.await") {
+    const dep = e.args[0];
+    if (dep === undefined || hasSuspension(dep)) return null;
+    return { form: "moduleAwait", dep, loc: e.loc };
+  }
   if (e.kind === "awaitExpr") {
     return hasSuspension(e.value) ? null : { form: "await", node: e };
   }
@@ -568,10 +642,14 @@ class FunctionLowering {
 
   private checkEligible(): void {
     const fn = this.fn;
-    if (fn.asyncCacheGlobal !== undefined || fn.asyncCycleCacheGlobal !== undefined) {
-      this.decline("fn:async:module-init");
+    // The initializer wrapper writes both caches by ASSIGNING the module
+    // global (storeVar's "%g." namespace); a name that is not a global of
+    // promise type would silently become a local write.
+    for (const id of [fn.asyncCacheGlobal, fn.asyncCycleCacheGlobal]) {
+      if (id === undefined) continue;
+      const g = (this.mod.globals ?? []).find((c) => c.id === id);
+      if (g === undefined || g.type.kind !== "promise") this.decline("fn:async:module-init-global");
     }
-    if (fn.name === this.mod.entry) this.decline("fn:async:entry");
     if (fn.locals.some((l) => l.id === FRAME_LOCAL || l.id === FRAME_ANY_LOCAL || l.id === EXC_LOCAL)) {
       this.decline("fn:async:local-id-clash");
     }
@@ -612,16 +690,16 @@ class FunctionLowering {
     for (const s of body) {
       switch (s.kind) {
         case "varDecl":
-          this.checkRoot(s.init);
+          this.checkRoot(s.init, s.kind);
           break;
         case "assign":
-          this.checkRoot(s.value);
+          this.checkRoot(s.value, s.kind);
           break;
         case "exprStmt":
-          this.checkRoot(s.expr);
+          this.checkRoot(s.expr, s.kind);
           break;
         case "return":
-          this.checkRoot(s.value);
+          this.checkRoot(s.value, s.kind);
           break;
         case "if":
           this.checkClean(s.cond);
@@ -660,13 +738,26 @@ class FunctionLowering {
     }
   }
 
-  private checkRoot(e: IrExpr | null): void {
+  private checkRoot(e: IrExpr | null, host: IrStmt["kind"]): void {
     if (e === null || !hasSuspension(e)) return;
-    if (classifySuspension(e) === null) this.decline("fn:async:await-position");
+    const susp = classifySuspension(e);
+    if (susp === null) this.decline(this.positionRefusal(e));
+    // The loader's wait is void-valued and its re-entry produces nothing,
+    // so the only slot that can host it is the one that discards.
+    if (susp.form === "moduleAwait" && host !== "exprStmt") {
+      this.decline("fn:async:module-await-position");
+    }
   }
 
   private checkClean(node: unknown): void {
-    if (hasSuspension(node)) this.decline("fn:async:await-position");
+    if (hasSuspension(node)) this.decline(this.positionRefusal(node));
+  }
+
+  /** The loader's dependency wait and a user `await` need the same work
+   * (order-preserving temp hoisting) in a position this pass cannot split,
+   * but they are different constructs and the census says which. */
+  private positionRefusal(node: unknown): string {
+    return hasModuleAwait(node) ? "fn:async:module-await-position" : "fn:async:await-position";
   }
 
   /* ── the frame shape ─────────────────────────────────────────────────── */
@@ -928,8 +1019,25 @@ class FunctionLowering {
     const resumeState = this.newState();
     let resumed: WExpr | null = null;
     const reentry: WStmt[] = [];
+    // How the suspending state ENDS. Every form but the module wait leaves
+    // resume outright; that one only leaves when it actually parked, so it
+    // ends by falling into its own resume state through the dispatch loop
+    // (%state is already k) — no microtask turn for a settled dependency.
+    let tail: WStmt = this.ret();
 
-    if (susp.form === "hop") {
+    if (susp.form === "moduleAwait") {
+      const slot = this.awaitSlot(susp.dep.type);
+      this.emit(cur, this.set(slot, susp.dep));
+      this.emit(cur, ...this.saves(), this.set(STATE_FIELD, this.num(resumeState)), {
+        kind: "%async.subscribeIfPending",
+        promise: this.get(slot, susp.dep.type),
+        frame: this.frameRef(),
+        resume: this.resumeClosure(),
+        loc: susp.loc,
+      });
+      tail = { kind: "continue", label: DISPATCH_LABEL, loc: susp.loc };
+      reentry.push({ kind: "%async.rejectCheck", promise: this.get(slot, susp.dep.type), loc: susp.loc });
+    } else if (susp.form === "hop") {
       this.emit(cur, ...susp.before);
       this.emit(cur, ...this.saves(), this.set(STATE_FIELD, this.num(resumeState)), {
         kind: "%async.hop",
@@ -981,7 +1089,7 @@ class FunctionLowering {
         };
       }
     }
-    this.emit(cur, this.ret());
+    this.emit(cur, tail);
 
     this.emit(resumeState, ...this.restores(), ...reentry);
     switch (s.kind) {
@@ -1266,6 +1374,17 @@ class FunctionLowering {
             },
             loc: this.loc,
           };
+    // A module initializer wears emit-async.ts's cache protocol on top of
+    // the plain wrapper — guard first, stores after the spawn (see the
+    // header for why the order is load-bearing under an import cycle).
+    const cache = this.fn.asyncCacheGlobal;
+    const cycleCache = this.fn.asyncCycleCacheGlobal;
+    const publish = (globalId: string): WStmt => ({
+      kind: "assign",
+      localId: globalId,
+      value: widenExpr(this.get(PROMISE_FIELD, this.promiseType)),
+      loc: this.loc,
+    });
     return {
       name: this.fn.name,
       params: this.fn.params,
@@ -1275,8 +1394,22 @@ class FunctionLowering {
       locals: [...keep, frameLocal],
       ...(this.fn.captures !== undefined ? { captures: this.fn.captures } : {}),
       body: [
+        ...(cache !== undefined
+          ? [{ kind: "%async.cacheCheck" as const, globalId: cache, loc: this.loc }]
+          : []),
         { kind: "varDecl", localId: FRAME_LOCAL, init: frameInit, loc: this.loc },
         kick,
+        ...(cache !== undefined
+          ? [
+              {
+                kind: "%async.markHandled" as const,
+                promise: this.get(PROMISE_FIELD, this.promiseType),
+                loc: this.loc,
+              },
+              publish(cache),
+            ]
+          : []),
+        ...(cycleCache !== undefined ? [publish(cycleCache)] : []),
         { kind: "return", value: widenExpr(this.get(PROMISE_FIELD, this.promiseType)), loc: this.loc },
       ],
       loc: this.fn.loc,
