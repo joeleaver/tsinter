@@ -522,6 +522,87 @@ const TIER_FLOOR: string[] = [
   // cycle's external importer (stage 4 named both).
   "2647-top-level-await-modules/main.ts",
   "2662-top-level-await-cycle-external-wait/main.ts",
+  // Increment 13 (classes), stage 1: the types and the MONOMORPHIC data
+  // plane. One GC struct per emitted class, wasm-subtyped along the source
+  // hierarchy (so an upcast is subsumption and a downcast a ref.cast) with
+  // the preorder interval carried as data in a `vt` field; `new` is one
+  // struct.new with every operand explicit followed by the constructor;
+  // fields are struct slots past that word. Instanceof, virtual dispatch,
+  // classes-as-values and `extends Error` are still ahead — stage 1 claims
+  // the programs that build, read, and pass instances around.
+  //
+  // The core shapes: `this` captured into a closure, the refcount stress
+  // program, and an inheritance chain (constructors chaining through
+  // super, base fields as the derived struct's prefix). 700-classes-basic
+  // and 701-classes-composition are NOT here — the class surface stopped
+  // blocking them, but they now name `bin:**` and `bin:ref-eq`, which are
+  // their own work.
+  "702-classes-this-capture.ts",
+  "703-classes-rc-stress.ts",
+  "710-inheritance-basics.ts",
+  // Accessors need no dedicated work: by IR time `get x()` is a call of
+  // `%C.get:x`, so direct-dispatch accessors ride the ordinary call path
+  // (the virtual ones wait for the vtables).
+  "720-accessors-basics.ts",
+  "721-accessors-eval-order.ts",
+  // Parameter lists against constructors: defaults, ctor inheritance, and
+  // the ownership stress program.
+  "406-params-defaults.ts",
+  "408-params-ctors-inheritance.ts",
+  "410-params-rc-stress.ts",
+  // Reference CYCLES are free on this tier — the whole point of a GC
+  // target. These four are the native lanes' collector tests; here they
+  // are just object graphs, including the mutually-recursive class pair
+  // that made the rec-group span necessary in the first place.
+  "752-cycle-classes.ts",
+  "753-cycle-owned-arrays.ts",
+  "754-cycle-external-ref.ts",
+  "533-array-element-cycles.ts",
+  "2604-cycle-classes-mutual/main.ts",
+  // Statics are module globals plus plain functions by IR time, so they
+  // land with the instance side; static blocks and the `.name` reads too.
+  "1529-class-with-statics.ts",
+  "1820-static-block-basics.ts",
+  "1823-static-instance-method-names.ts",
+  // Generic classes are ordinary classes once instantiated (the family
+  // class is their synthetic base, which is exactly a hierarchy).
+  "2001-generic-methods-generic-class.ts",
+  "2004-generic-methods-statics.ts",
+  // Class fields typed by a UNION: an unassigned one reads back as
+  // `undefined`, which is why `new` seeds those slots with the interned
+  // undefined arm instead of a null.
+  "1584-union-field-unassigned.ts",
+  "1585-union-field-conditional-ctor.ts",
+  "2434-deferred-init-fields.ts",
+  // `obj.n++` in both fixities, against fields and through accessors.
+  "1712-field-incdec.ts",
+  "2252-class-iterators.ts",
+  // Instances flowing through the rest of the tier: destructured, spread
+  // into records, width-compared against them, and assigned member-wise.
+  "2429-destructure-class-instance.ts",
+  "2241-width-record-into-class.ts",
+  "2242-width-statics-into-record.ts",
+  "2532-param-destructuring-options.ts",
+  "2537-destructuring-assign-member-targets.ts",
+  "2540-accessor-destructuring-defaults.ts",
+  "2192-object-default-tostring.ts",
+  // Async METHODS ride free: the resumable lowering already walks class
+  // nodes, so it only ever needed the types to map (the increment's
+  // trap G — deliberately no special case in statemachine.ts).
+  "2351-async-methods.ts",
+  // Classes across module boundaries, namespaces, and default exports —
+  // the module-graph family whose only blocker was the class surface.
+  "950-modules-basic/main.ts",
+  "420-dead-strip-modules/main.ts",
+  "1881-default-anon/main.ts",
+  "1883-default-exports/main.ts",
+  "1890-ns-imports/main.ts",
+  "1963-namespace-aliases.ts",
+  "1966-namespace-modules/main.ts",
+  // Union programs that were only ever blocked by an object ARM.
+  "969-unions-arm-matrix.ts",
+  "972-unions-nested.ts",
+  "979-unions-optional-chaining.ts",
 ];
 
 interface RunResult {

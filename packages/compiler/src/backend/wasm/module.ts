@@ -19,7 +19,20 @@
  * explicit `rec` is its own singleton recursive group (which is what
  * makes `selfStructType`'s intrusive lists legal). Call order enforces
  * the backward rule for free: building a ref valtype requires the
- * referenced type's index, so the referent is always interned first. */
+ * referenced type's index, so the referent is always interned first.
+ *
+ * SPANS lift that restriction where a whole FAMILY of types references
+ * itself both ways (classes.ts: a class field typed by another class, an
+ * array of the class, a record holding one). `beginRecGroup`/
+ * `endRecGroup` bracket a region: EVERY entry interned between them —
+ * whoever interned it, at whatever nesting — becomes one `rec` group, and
+ * a group's members may reference each other in either direction.
+ * `reserveType` claims an index inside an open span before its shape is
+ * known and `defineType` fills it, the two-phase `declareFunc`/`setBody`
+ * discipline applied to types; `emit()` refuses a reservation that was
+ * never defined for the same reason it refuses a body-less function. A
+ * later entry may still reference a group member freely — the backward
+ * rule is unchanged outside the span. */
 import { ByteWriter } from "./bytes.js";
 
 export type ValType =
@@ -110,6 +123,11 @@ export class ModuleBuilder {
   private memoryPages: number | null = null;
   /** Rec-group starts: type index → member count. */
   private readonly recStarts = new Map<number, number>();
+  /** The open span's first index, or null outside `beginRecGroup`. */
+  private recSpanStart: number | null = null;
+  /** Reserved-but-undefined types, index → key — emit()'s placeholder
+   * guard, keyed so the failure names the planning walk that skipped. */
+  private readonly reservedTypes = new Map<number, string>();
   /** Functions needing ref.func (the declarative element segment). */
   private readonly funcRefs = new Set<number>();
   private blob: number[] = [];
@@ -194,6 +212,58 @@ export class ModuleBuilder {
     return base;
   }
 
+  /** Opens a rec-group SPAN: every entry interned until `endRecGroup`
+   * joins one group, whoever interns it. Spans do not nest — one open
+   * span already collects everything a nested one would. */
+  beginRecGroup(): void {
+    if (this.recSpanStart !== null) throw new Error("beginRecGroup inside an open rec group");
+    this.recSpanStart = this.types.length;
+  }
+
+  /** Closes the span, recording it as one group. An inner `recGroup2`
+   * that landed inside is absorbed: its own start entry sits strictly
+   * after this one's and the serializer walks group-to-group, so it is
+   * never consulted again. */
+  endRecGroup(): void {
+    const start = this.recSpanStart;
+    if (start === null) throw new Error("endRecGroup with no open rec group");
+    this.recSpanStart = null;
+    if (this.reservedTypes.size > 0) {
+      throw new Error(`endRecGroup with type(s) reserved but never defined: ${[...this.reservedTypes.values()].join(", ")}`);
+    }
+    // An empty span is not a group: a zero-member entry would stall the
+    // serializer's index walk.
+    if (this.types.length > start) this.recStarts.set(start, this.types.length - start);
+  }
+
+  /** Claims an index for a type whose SHAPE is not known yet, so entries
+   * interned after it (its own fields included) can name it. Legal only
+   * inside a span — outside one the forward reference has no group to be
+   * legal in. Interned by the caller's key like every other keyed type. */
+  reserveType(key: string): number {
+    if (this.recSpanStart === null) throw new Error(`reserveType("${key}") outside a rec group`);
+    const existing = this.typeIndex.get(key);
+    if (existing !== undefined) return existing;
+    const index = this.types.length;
+    // The placeholder is never serialized: defineType overwrites it, and
+    // emit() refuses if one survives.
+    this.types.push({ kind: "struct", fields: [] });
+    this.reservedTypes.set(index, key);
+    this.typeIndex.set(key, index);
+    return index;
+  }
+
+  /** Fills a reservation. The entry may reference any member of the open
+   * span, in either direction. */
+  defineType(index: number, entry: TypeEntry): void {
+    if (this.recSpanStart === null) throw new Error(`defineType(${index}) outside a rec group`);
+    if (!this.reservedTypes.has(index)) {
+      throw new Error(`defineType(${index}) on an index that was not reserved (or is already defined)`);
+    }
+    this.types[index] = entry;
+    this.reservedTypes.delete(index);
+  }
+
   /** Marks a function as ref.func-referenced — the declarative element
    * segment validation requires. */
   declareFuncRef(funcIndex: number): void {
@@ -268,6 +338,13 @@ export class ModuleBuilder {
   }
 
   emit(): Uint8Array {
+    if (this.recSpanStart !== null) throw new Error("emit() with a rec group still open");
+    if (this.reservedTypes.size > 0) {
+      // The declareFunc-without-body rule, for types: a reservation that
+      // outlived its span is a planning walk that skipped work, and the
+      // placeholder would validate as an empty struct instead of saying so.
+      throw new Error(`type "${[...this.reservedTypes.values()][0]!}" was reserved but never defined`);
+    }
     const w = new ByteWriter();
     w.raw(new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]));
 

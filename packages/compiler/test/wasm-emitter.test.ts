@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import { compile } from "../src/index.js";
+import { I32, ModuleBuilder } from "../src/backend/wasm/module.js";
 
 let scratch: string;
 beforeAll(async () => {
@@ -462,4 +463,125 @@ test("out-of-tier constructs refuse with SC3001 and ride the survey", async () =
   expect(res.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
   expect(res.wasmSurvey).toBeDefined();
   expect(res.wasmSurvey).toContain("expr:regexLit");
+});
+
+test("classes: a type family that references itself in every direction", async () => {
+  // The rec-group span's reason to exist, in one program: `Node.kids` is
+  // an ARRAY of the class being declared (the vector's element array
+  // reaches back into a type that does not exist yet), `Node.parent` is a
+  // UNION arm over it, and `Leaf` subtypes the class whose own field
+  // mentions the subtype. None of it can be interned in dependency order.
+  // The union field is also read BEFORE any constructor assigns it, which
+  // is what `new`'s undefined-arm seed answers for — a null there would
+  // trap in the union's truthiness helper instead.
+  const res = await buildWasm(
+    "classgraph.ts",
+    [
+      "class Node2 {",
+      "  label: string;",
+      "  kids: Node2[] = [];",
+      "  parent: Node2 | undefined;",
+      "  constructor(label: string) { this.label = label; }",
+      "  path(): string { return this.parent === undefined ? this.label : this.label; }",
+      "}",
+      "class Leaf extends Node2 {",
+      "  weight: number;",
+      "  constructor(label: string, weight: number) { super(label); this.weight = weight; }",
+      "}",
+      'const root = new Node2("root");',
+      'const leaf = new Leaf("leaf", 3);',
+      "leaf.parent = root;",
+      "root.kids.push(leaf);",
+      "const seen: Node2 = leaf;",
+      "console.log(root.label, root.kids.length, seen.label, leaf.weight);",
+      // The unassigned union field reads back as undefined, not null.
+      "console.log(root.parent === undefined, leaf.parent === undefined);",
+      "leaf.weight++;",
+      "console.log(leaf.weight, seen.path());",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("root 1 leaf 3\ntrue false\n4 leaf\n");
+});
+
+test("classes: the runtime-rooted families refuse by their own names", async () => {
+  // The census is the work queue, so these two rocks stay TOLD APART: a
+  // class rooted in the builtin Error hierarchy waits on the error
+  // unification, one rooted in EventEmitter/streams on a runtime this
+  // tier has no port of. Throwing a user class is its own gate — the
+  // exception cell's OBJ payload is still errT-shaped.
+  const err = await buildWasm(
+    "extends-error.ts",
+    ["class Boom extends Error {", "  constructor() { super('boom'); }", "}", "throw new Boom();", ""].join("\n"),
+  );
+  expect(err.ok).toBe(false);
+  if (!err.ok) {
+    expect(err.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
+    expect(err.wasmSurvey).toContain("class:extends-error");
+  }
+
+  const thrown = await buildWasm(
+    "throw-class.ts",
+    ["class Bad { why: string; constructor(w: string) { this.why = w; } }", "throw new Bad('nope');", ""].join("\n"),
+  );
+  expect(thrown.ok).toBe(false);
+  if (!thrown.ok) expect(thrown.wasmSurvey).toContain("throw:class");
+
+  const ee = await buildWasm(
+    "extends-ee.ts",
+    [
+      'import { EventEmitter } from "node:events";',
+      "class Bus extends EventEmitter {",
+      "  count: number = 0;",
+      "}",
+      "const b = new Bus();",
+      "console.log(b.count);",
+      "",
+    ].join("\n"),
+  );
+  expect(ee.ok).toBe(false);
+  if (!ee.ok) expect(ee.wasmSurvey).toContain("class:extends-runtime");
+});
+
+test("ModuleBuilder: the rec-group span's four guards fail loudly", () => {
+  // These are the type-side twin of `declareFunc` without a body, and no
+  // corpus program can reach them: a planning walk that skipped work
+  // would otherwise serialize a placeholder as an empty struct and let
+  // validation blame something unrelated. Pinned directly.
+  const outsideSpan = new ModuleBuilder();
+  expect(() => outsideSpan.reserveType("class:X")).toThrow(/outside a rec group/);
+
+  const unreserved = new ModuleBuilder();
+  unreserved.beginRecGroup();
+  const idx = unreserved.reserveType("class:X");
+  unreserved.defineType(idx, { kind: "struct", fields: [{ storage: I32, mutable: true }] });
+  // Defining twice is the same bug as defining an index nobody claimed.
+  expect(() => unreserved.defineType(idx, { kind: "struct", fields: [] })).toThrow(/was not reserved/);
+
+  const live = new ModuleBuilder();
+  live.beginRecGroup();
+  live.reserveType("class:Y");
+  expect(() => live.endRecGroup()).toThrow(/never defined: class:Y/);
+
+  // A reservation that outlives its span cannot reach emit() through
+  // endRecGroup, so the emit()-time guard is reached with the span still
+  // open — both halves of the same contract.
+  const unfinished = new ModuleBuilder();
+  unfinished.beginRecGroup();
+  unfinished.reserveType("class:Z");
+  expect(() => unfinished.emit()).toThrow(/rec group still open/);
+
+  // And the span-closed path: a group that closed cleanly emits.
+  const ok = new ModuleBuilder();
+  ok.beginRecGroup();
+  const a = ok.reserveType("class:A");
+  const b = ok.reserveType("class:B");
+  // Mutual reference in both directions — the whole point of the span.
+  ok.defineType(a, { kind: "struct", fields: [{ storage: { kind: "ref", nullable: true, typeIndex: b }, mutable: true }] });
+  ok.defineType(b, { kind: "struct", fields: [{ storage: { kind: "ref", nullable: true, typeIndex: a }, mutable: true }] });
+  ok.endRecGroup();
+  expect(WebAssembly.validate(ok.emit())).toBe(true);
 });

@@ -48,6 +48,7 @@
  * shrink to exactly the work that remains. */
 import {
   type IrExpr,
+  type IrFunction,
   type IrGlobal,
   type IrLocal,
   type IrModule,
@@ -61,6 +62,8 @@ import {
   RUNTIME_ERROR_CLASSES,
 } from "../../ir/nodes.js";
 import { computeMayThrow } from "../emission/may-throw.js";
+import { buildClassGraph } from "../llvm/classes.js";
+import { ClassBuilder, type ClassInfo } from "./classes.js";
 import {
   EXPORT_ENTRY,
   EXPORT_MEMORY,
@@ -118,18 +121,61 @@ function valKey(t: ValType): string {
  * because the timer prescan needs it BEFORE the assembler exists (imports
  * precede declared functions in the index space, so `tsinter.now` has to
  * be decided in the constructor). See that method for why the scan is
- * blunt on purpose. */
+ * blunt on purpose.
+ *
+ * The scan sees literal function-name STRINGS, and the class surface has
+ * none: `new`/`classRef` name a class and leave `.constructor` implied,
+ * and `virtualCall` composes `%Class.method` from two fields whose callee
+ * set is the whole subtree. Those edges are spelled out below, off the
+ * shared class graph — miss one and a constructor or an override body
+ * silently never lands. */
 function reachableFunctionNames(mod: WModule): Set<string> {
   const names = new Set(mod.functions.map((f) => f.name));
   const byName = new Map(mod.functions.map((f) => [f.name, f]));
+  const graph = buildClassGraph(asIrModule(mod), byName as unknown as Map<string, IrFunction>);
+  /** Every class in the static receiver's WHOLE HIERARCHY that declares
+   * `method` — the possible targets of one virtual dispatch. The walk
+   * starts at the hierarchy ROOT, not at `className`: the declaration a
+   * dispatch lands on may sit ABOVE the static receiver (validate.ts
+   * resolves it by walking the base chain upward, so `virtualCall{Dog,
+   * speak}` reaches `%Animal.speak` when Dog only inherits it), and the
+   * overrides sit below. One root-down walk covers both directions —
+   * may-throw.ts's virtualCall arm takes the same wide cover. */
+  const overridesOf = (className: string, method: string): string[] => {
+    const meta = graph.get(className);
+    if (meta === undefined) return [];
+    const out: string[] = [];
+    const walk = (m: typeof meta): void => {
+      if (m.def.methods?.includes(method) === true) out.push(m.def.name);
+      for (const c of m.children) walk(c);
+    };
+    walk(meta.root);
+    return out;
+  };
+  /** A class and every strict descendant — `newValue`'s callee could be
+   * any of them (may-throw.ts takes the same wide cover). */
+  const subtree = (className: string): string[] => {
+    const root = graph.get(className);
+    if (root === undefined) return [];
+    const out: string[] = [];
+    const walk = (m: typeof root): void => {
+      out.push(m.def.name);
+      for (const c of m.children) walk(c);
+    };
+    walk(root);
+    return out;
+  };
   const reachable = new Set<string>([mod.entry]);
   const queue = [mod.entry];
+  const edge = (name: string): void => {
+    if (names.has(name) && !reachable.has(name)) {
+      reachable.add(name);
+      queue.push(name);
+    }
+  };
   const scan = (node: unknown): void => {
     if (typeof node === "string") {
-      if (names.has(node) && !reachable.has(node)) {
-        reachable.add(node);
-        queue.push(node);
-      }
+      edge(node);
       return;
     }
     if (Array.isArray(node)) {
@@ -137,6 +183,29 @@ function reachableFunctionNames(mod: WModule): Set<string> {
       return;
     }
     if (node !== null && typeof node === "object") {
+      const rec = node as Record<string, unknown>;
+      switch (rec["kind"]) {
+        case "new":
+        case "classRef":
+          edge(`%${rec["className"] as string}.constructor`);
+          break;
+        case "newValue": {
+          // The callee is classval-typed and the result names the class;
+          // any descendant's constructor may be the one that runs.
+          const t = rec["type"] as { kind?: string; className?: string } | undefined;
+          if (t?.kind === "object" && t.className !== undefined) {
+            for (const c of subtree(t.className)) edge(`%${c}.constructor`);
+          }
+          break;
+        }
+        case "virtualCall":
+          for (const c of overridesOf(rec["className"] as string, rec["method"] as string)) {
+            edge(`%${c}.${rec["method"] as string}`);
+          }
+          break;
+        default:
+          break;
+      }
       for (const value of Object.values(node)) scan(value);
     }
   };
@@ -366,12 +435,14 @@ class Assembler {
         { storage: ANY_REF, mutable: false },
       ]);
       // The builtin error instance: class id (RUNTIME_ERROR_CLASSES's
-      // kind), name, message, and the %code slot (null = absent). User
-      // hierarchy classes never construct in-tier, so this one struct IS
-      // the whole OBJ payload space. `name` and `message` are MUTABLE —
-      // Node's are plain writable fields, and the IR's class def declares
-      // them as such (a fieldSet writes the slot); the class id and the
-      // %code slot are stamped once at construction.
+      // kind), name, message, and the %code slot (null = absent). This
+      // one struct is the whole OBJ payload space — user classes DO
+      // construct in-tier now, but the throw:class / <what>:class gates
+      // keep them out of the cell until the error unification merges the
+      // two representations. `name` and `message` are MUTABLE — Node's
+      // are plain writable fields, and the IR's class def declares them
+      // as such (a fieldSet writes the slot); the class id and the %code
+      // slot are stamped once at construction.
       const errT = this.mb.structType([
         { storage: I32, mutable: false },
         { storage: strRef, mutable: true },
@@ -434,9 +505,10 @@ class Assembler {
 
   /** The instanceof test on a snapshot already in local `c`, over the
    * CLOSED builtin error table: kind is OBJ, and — for a subclass — the
-   * payload's class id matches. User hierarchy classes never construct
-   * in-tier, so %Error (no base) is simply "any OBJ". Leaves an i32.
-   * Shared by caughtTest's instanceof and caughtCheck's guard. */
+   * payload's class id matches. Nothing but a builtin error can BE in the
+   * cell (the throw:class gate), so %Error (no base) is simply "any OBJ".
+   * Leaves an i32. Shared by caughtTest's instanceof and caughtCheck's
+   * guard. */
   private emitCaughtIsClass(rec: { kind: number; base: string | null }, c: number): void {
     const exc = this.exc();
     const code = this.fn.code;
@@ -516,9 +588,16 @@ class Assembler {
         code.globalSet(exc.kindG);
         return;
       case "object":
-        // Builtin error instances are the only in-tier objects; anything
-        // else already refused at mapType below.
-        this.mapType(t, v.loc);
+        // The OBJ cell is errT-shaped: the caught/uncaught paths ref.cast
+        // it to read a name and message. Emitted user classes map now but
+        // have no place in that cell until the error unification merges
+        // the two — mapType success stopped being the honest gate here,
+        // so the builtin table is the gate.
+        if (!RUNTIME_ERROR_CLASSES.has(t.className)) {
+          this.refuse("throw:class", v.loc);
+          code.unreachable();
+          return;
+        }
         this.walkExpr(v);
         code.globalSet(exc.refG);
         code.i32Const(EXC_OBJ);
@@ -582,12 +661,12 @@ class Assembler {
         this.walkExpr(v);
         return;
       case "object":
-        // Builtin error instances — the only in-tier objects, and the
-        // shape %w.err.toStr renders in the unhandled report.
-        if (this.mapType(t, v.loc) === null) {
-          code.i32Const(0);
-          code.f64Const(0);
-          code.refNull(ANY_HEAP);
+        // Builtin error instances only — the payload triple IS the
+        // exception cell's encoding, so it inherits emitThrowValue's
+        // errT-shaped OBJ slot and its gate.
+        if (!RUNTIME_ERROR_CLASSES.has(t.className)) {
+          this.refuse(`${what}:class`, loc);
+          code.unreachable();
           return;
         }
         code.i32Const(EXC_OBJ);
@@ -748,9 +827,9 @@ class Assembler {
    * per-kind field enumeration would silently miss the edge a new expr
    * kind carries, while the scan can only OVER-approximate (a strLit
    * spelling a function's exact "%"-name — no real program), which merely
-   * keeps a function alive. Class-method edges (virtualCall composes
-   * "%Class.method" from two fields) are the known gap; classes refuse at
-   * use today, and their edge enumeration joins with their emission. */
+   * keeps a function alive. The edges the scan CANNOT see — a class
+   * surface names classes and methods, never function names — are spelled
+   * out beside it in `reachableFunctionNames`. */
   private reachableFunctions(): Set<string> {
     return reachableFunctionNames(this.mod);
   }
@@ -1126,6 +1205,13 @@ class Assembler {
           this.refuse("toString:union-arm:bytes", loc);
           return null;
         }
+        // Class arms MAP now, so a breach here would build a helper with
+        // no rendering for the arm instead of failing the fence. Object
+        // rendering is the inspect surface's work; refuse by name.
+        if (arm.kind === "object") {
+          this.refuse("union:toStr:object", loc);
+          return null;
+        }
         throw new Error(`ToString over a union ${arm.kind} arm (frontend fence breached)`);
       }
       if (need === "truthy") {
@@ -1171,6 +1257,93 @@ class Assembler {
    * the pop/shift empty answer both need it. */
   private undefinedArmTag(unionId: string): number {
     return this.unionDef(unionId).arms.findIndex((a) => a.kind === "undefinedT");
+  }
+
+  /* ── classes ────────────────────────────────────────────────────────────
+   * One wasm struct per emitted class, subtyped along the source
+   * hierarchy, with preorder intervals carried as data (classes.ts is the
+   * design doc). Built lazily like every other family here — a module
+   * that never touches a user class pays nothing, and the builder's
+   * constructor runs the shared class-graph numbering. */
+
+  private classesField: ClassBuilder | null = null;
+
+  private get classes(): ClassBuilder {
+    // The graph is numbered over the WHOLE module, never the reachable
+    // subset: intervals must agree with the native lanes', and this
+    // builder is first touched during pass 1 (a class-typed parameter),
+    // when the reachable declaration table is still filling.
+    this.classesField ??= new ClassBuilder(
+      this.mb,
+      asIrModule(this.mod),
+      new Map(this.mod.functions.map((f) => [f.name, f])) as unknown as Map<string, IrFunction>,
+      {
+        softType: (t) => this.mapTypeSoft(t),
+        refuse: (kind, loc) => this.refuse(kind, loc),
+      },
+    );
+    return this.classesField;
+  }
+
+  /** A class's emitted shape, or null with the refusal recorded. The
+   * builtin error classes never arrive: mapType answers errT for them
+   * before anything here runs (classes.ts's header). */
+  private classInfo(className: string, loc: SrcLoc | undefined): ClassInfo | null {
+    return this.classes.info(className, loc, false);
+  }
+
+  /** One field's struct slot, with the field's DECLARED type gated. That
+   * gate is load-bearing: a field the tier cannot represent still OCCUPIES
+   * a slot (the soft map's placeholder — classes.ts's header), and this
+   * is the only thing between that placeholder and an emitted access. */
+  private classField(
+    className: string,
+    field: string,
+    loc: SrcLoc | undefined,
+  ): { info: ClassInfo; index: number; type: IrType } | null {
+    const info = this.classInfo(className, loc);
+    if (info === null) return null;
+    const index = info.fieldIndex.get(field);
+    const type = info.fieldType.get(field);
+    if (index === undefined || type === undefined) {
+      throw new Error(`wasm emitter bug: unknown field ${field} on class ${className}`);
+    }
+    if (this.mapType(type, loc) === null) return null;
+    return { info, index, type };
+  }
+
+  /** One field's value inside `struct.new`: the zero of its
+   * representation, EXCEPT a field whose union admits undefined, which
+   * starts at the interned undefined arm. `undefined` is what JS reads
+   * back from a field no constructor has assigned yet — and a base
+   * constructor's virtual call really can observe a derived field that
+   * early — while a null there would trap the first union helper to
+   * touch it. (The native lanes seed the same slots in their allocator;
+   * llvm/classes.ts's undefFieldInits.) */
+  private emitFieldSeed(t: IrType): void {
+    const code = this.fn.code;
+    if (t.kind === "union") {
+      const tag = this.undefinedArmTag(t.unionId);
+      if (tag >= 0) {
+        code.globalGet(this.unions.unitGlobal(tag));
+        return;
+      }
+    }
+    const soft = this.mapTypeSoft(t);
+    switch (soft.kind) {
+      case "f64":
+        code.f64Const(0);
+        return;
+      case "i64":
+        code.i64Const(0n);
+        return;
+      case "ref":
+        code.refNull(soft.typeIndex);
+        return;
+      default:
+        code.i32Const(0);
+        return;
+    }
   }
 
   /* ── types ──────────────────────────────────────────────────────────── */
@@ -1223,19 +1396,27 @@ class Assembler {
       case "%frameBase":
         // The lowering's frame handle — resume's uniform parameter.
         return { kind: "ref", nullable: true, typeIndex: this.frameBaseType() };
-      case "object":
+      case "object": {
         // The builtin error classes share the ONE error struct (their
-        // class id is a field, not a type); every other object waits on
-        // classes.
+        // class id is a field, not a type) until the error unification
+        // lands; every other class is its own struct (classes.ts).
         if (RUNTIME_ERROR_CLASSES.has(t.className)) {
           return { kind: "ref", nullable: true, typeIndex: this.exc().errT };
         }
-        this.refuse(`type:${t.kind}`, loc);
-        return null;
+        const info = this.classInfo(t.className, loc);
+        return info === null ? null : this.classes.ref(info);
+      }
       default:
         this.refuse(`type:${t.kind}`, loc);
         return null;
     }
+  }
+
+  /** Does `object:<className>` have a representation? The one condition
+   * mapType's and mapTypeSoft's object arms — and the vector-element
+   * mappability list — must share, or one signature gets two views. */
+  private objectMappable(className: string): boolean {
+    return RUNTIME_ERROR_CLASSES.has(className) || this.classes.info(className, undefined, true) !== null;
   }
 
   /** The pre-pass variant: a placeholder for unmappable types, NO refusal.
@@ -1266,7 +1447,7 @@ class Assembler {
           t.elem.kind === "record" ||
           t.elem.kind === "union" ||
           t.elem.kind === "promise" ||
-          (t.elem.kind === "object" && RUNTIME_ERROR_CLASSES.has(t.elem.className));
+          (t.elem.kind === "object" && this.objectMappable(t.elem.className));
         if (!mappable) return I32;
         const kind =
           t.elem.kind === "f64" ? "f64"
@@ -1300,12 +1481,17 @@ class Assembler {
         return this.proms.promRef();
       case "%frameBase":
         return { kind: "ref", nullable: true, typeIndex: this.frameBaseType() };
-      case "object":
-        // Same arm as mapType: builtin errors map, the rest placeholder.
+      case "object": {
+        // Same arm as mapType, in lockstep: builtin errors are errT, an
+        // emitted class is its own struct, a runtime-rooted one is the
+        // placeholder. Answering a placeholder where mapType succeeds is
+        // the recurring increment-6/7/10 bug — one signature, two views.
         if (RUNTIME_ERROR_CLASSES.has(t.className)) {
           return { kind: "ref", nullable: true, typeIndex: this.exc().errT };
         }
-        return I32;
+        const info = this.classes.info(t.className, undefined, true);
+        return info === null ? I32 : this.classes.ref(info);
+      }
       default:
         return I32;
     }
@@ -1735,19 +1921,26 @@ class Assembler {
         return;
       }
 
-      /* The builtin errors' writable members (`e.name = "Custom"`), the
-       * fieldGet twin: errT's own slots. Every other class's fields wait
-       * on the classes rock. */
+      /* Field writes, the fieldGet twin: the builtin errors' writable
+       * members (`e.name = "Custom"`) are errT's own slots, an emitted
+       * class's are its struct's. */
       case "fieldSet": {
-        const isErr = RUNTIME_ERROR_CLASSES.has(s.className);
-        const slot = s.field === "name" ? 1 : s.field === "message" ? 2 : 0;
-        if (isErr && slot !== 0) {
+        if (RUNTIME_ERROR_CLASSES.has(s.className)) {
+          const slot = s.field === "name" ? 1 : s.field === "message" ? 2 : 0;
+          if (slot === 0) {
+            this.refuse(`fieldSet:error:${s.field}`, s.loc);
+            return;
+          }
           this.walkExpr(s.obj);
           this.walkExpr(s.value);
           code.structSet(this.exc().errT, slot);
           return;
         }
-        this.refuse(isErr ? `fieldSet:error:${s.field}` : "stmt:fieldSet", s.loc);
+        const field = this.classField(s.className, s.field, s.loc);
+        if (field === null) return;
+        this.walkExpr(s.obj);
+        this.walkExpr(s.value);
+        code.structSet(field.info.struct, field.index);
         return;
       }
 
@@ -2443,8 +2636,10 @@ class Assembler {
           this.walkExpr(e.operand);
           return;
         }
-        if (k === "array" || k === "func" || k === "record") {
+        if (k === "array" || k === "func" || k === "record" || k === "object") {
           // Every object is truthy; evaluate for effects, answer true.
+          // (A class-typed value is never null — null and undefined ride
+          // unions, whose own helper answers for them.)
           this.walkExpr(e.operand);
           code.drop();
           code.i32Const(1);
@@ -3424,8 +3619,8 @@ class Assembler {
       /* Runtime tests on a catch binding: the primitive tests compare the
        * snapshot's kind tag (exactly what typeof observes); instanceof
        * tests an OBJ payload's class id against the BUILTIN error table —
-       * user hierarchy classes never construct in-tier, so the id space
-       * is closed and %Error is simply "any OBJ". */
+       * the throw:class gate keeps every other class out of the cell, so
+       * the id space is closed and %Error is simply "any OBJ". */
       case "caughtTest": {
         const exc = this.exc();
         if (e.test === "instanceof") {
@@ -3454,8 +3649,9 @@ class Assembler {
       /* Checker-trusted payload extraction (the frontend emits it only
        * under a proven test, so the read is kind-unchecked — the caught
        * analog of unionNarrow). A builtin error extracts as the shared
-       * errT; USER hierarchy classes wait on the classes rock, so the
-       * refusal names `class`, not the bare type kind. */
+       * errT; a USER class never reaches the cell to be extracted from it
+       * (the throw:class gate), so the refusal names `class` rather than
+       * the bare type kind and both halves lift together in stage 4. */
       case "caughtNarrow": {
         const exc = this.exc();
         const t = e.type;
@@ -3526,41 +3722,166 @@ class Assembler {
         return;
       }
 
-      /* Field reads on the builtin errors: `name` and `message` are the
-       * shared errT's own slots. (`%code` never reaches a fieldGet — its
-       * read is the error.code libCall's `string | undefined` lowering.)
-       * Every other class waits on the classes rock. */
+      /* Field reads. On the builtin errors `name` and `message` are the
+       * shared errT's own slots (`%code` never reaches a fieldGet — its
+       * read is the error.code libCall's `string | undefined` lowering);
+       * on an emitted class it is the flattened field's own slot, past
+       * the vt word on hierarchy members. */
       case "fieldGet": {
-        const isErr = RUNTIME_ERROR_CLASSES.has(e.className);
-        const slot = e.field === "name" ? 1 : e.field === "message" ? 2 : 0;
-        if (isErr && slot !== 0) {
+        if (RUNTIME_ERROR_CLASSES.has(e.className)) {
+          const slot = e.field === "name" ? 1 : e.field === "message" ? 2 : 0;
+          if (slot === 0) {
+            this.refuse(`fieldGet:error:${e.field}`, e.loc);
+            code.unreachable();
+            return;
+          }
           this.walkExpr(e.obj);
           code.structGet(this.exc().errT, slot);
           return;
         }
-        this.refuse(isErr ? `fieldGet:error:${e.field}` : "expr:fieldGet", e.loc);
-        code.unreachable();
+        const field = this.classField(e.className, e.field, e.loc);
+        if (field === null) {
+          code.unreachable();
+          return;
+        }
+        this.walkExpr(e.obj);
+        code.structGet(field.info.struct, field.index);
         return;
       }
 
-      /* Widening and checker-proven narrowing between builtin errors: ONE
-       * struct covers the whole builtin hierarchy here, so both directions
-       * are the identical value — type-only, the native backends' pointer
-       * reinterpret with nothing left to reinterpret. Anything reaching a
-       * USER class (either end) is the classes rock. */
+      /* Widening is subsumption and narrowing is `ref.cast`: emitted
+       * classes are wasm subtypes along the source hierarchy, so an
+       * upcast has literally nothing to emit and a downcast — which the
+       * checker has already proven, so it cannot fail on a valid program
+       * — only re-types. Between builtin errors ONE struct covers the
+       * whole hierarchy, so both directions are the identical value.
+       * Mixing the two families is the error unification's work. */
       case "upcast":
       case "downcast": {
         const from = e.value.type;
         const to = e.type;
-        if (
-          to.kind === "object" && RUNTIME_ERROR_CLASSES.has(to.className) &&
-          from.kind === "object" && RUNTIME_ERROR_CLASSES.has(from.className)
-        ) {
+        if (to.kind !== "object" || from.kind !== "object") {
+          this.refuse(`expr:${e.kind}`, e.loc);
+          code.unreachable();
+          return;
+        }
+        if (RUNTIME_ERROR_CLASSES.has(to.className) && RUNTIME_ERROR_CLASSES.has(from.className)) {
           this.walkExpr(e.value);
           return;
         }
-        this.refuse(`expr:${e.kind}`, e.loc);
-        code.unreachable();
+        const toInfo = this.classInfo(to.className, e.loc);
+        const fromInfo = this.classInfo(from.className, e.loc);
+        if (toInfo === null || fromInfo === null) {
+          code.unreachable();
+          return;
+        }
+        this.walkExpr(e.value);
+        if (e.kind === "downcast") code.refCast(toInfo.struct);
+        return;
+      }
+
+      /* `obj.n++` — read, write ±1, yield old (postfix) or new (prefix),
+       * the incDec discipline over a struct slot. The receiver evaluates
+       * ONCE (JS's MemberExpression evaluation), so it is parked in a
+       * local rather than walked twice. */
+      case "fieldIncDec": {
+        if (e.fieldDyn) {
+          // A computed member target (`obj[k]++`) rides the dyn surface.
+          this.refuse("expr:fieldIncDec:dyn", e.loc);
+          code.unreachable();
+          return;
+        }
+        if (RUNTIME_ERROR_CLASSES.has(e.className)) {
+          this.refuse("expr:fieldIncDec:error", e.loc);
+          code.unreachable();
+          return;
+        }
+        const field = this.classField(e.className, e.field, e.loc);
+        if (field === null) {
+          code.unreachable();
+          return;
+        }
+        if (field.type.kind !== "f64") {
+          this.refuse(`expr:fieldIncDec:${field.type.kind}`, e.loc);
+          code.unreachable();
+          return;
+        }
+        const objRef = this.classes.ref(field.info);
+        const o = this.acquireScratch(objRef);
+        const old = this.acquireScratch(F64);
+        const next = this.acquireScratch(F64);
+        this.walkExpr(e.obj);
+        code.localSet(o);
+        code.localGet(o);
+        code.structGet(field.info.struct, field.index);
+        code.localSet(old);
+        code.localGet(o);
+        code.localGet(old);
+        code.f64Const(1);
+        if (e.op === "+") code.f64Add();
+        else code.f64Sub();
+        code.localTee(next);
+        code.structSet(field.info.struct, field.index);
+        code.localGet(e.prefix ? next : old);
+        this.releaseScratch(F64, next);
+        this.releaseScratch(F64, old);
+        this.releaseScratch(objRef, o);
+        return;
+      }
+
+      /* `new C(args)`: one struct.new with every operand explicit — the
+       * class's interval global into `vt` on a hierarchy member, then a
+       * zero per field, EXCEPT undefined-admitting union fields, which
+       * start at the interned undefined arm because that is what JS reads
+       * back from an uninitialized field and a base constructor can
+       * observe one before the derived class assigns it. Then the
+       * constructor over the fresh ref (uniform ABI: null closure,
+       * `this` as the first declared param), with the standard
+       * pending-check-after-call. The ref is parked in a local because
+       * wasm has no way to duplicate a stack value. */
+      case "new": {
+        if (RUNTIME_ERROR_CLASSES.has(e.className)) {
+          // `new Error(...)` reaches the emitter as an error.* libCall;
+          // a raw `new` on a builtin means a shape that lowering missed.
+          this.refuse("new:error", e.loc);
+          code.unreachable();
+          return;
+        }
+        const info = this.classInfo(e.className, e.loc);
+        if (info === null) {
+          code.unreachable();
+          return;
+        }
+        const objRef = this.classes.ref(info);
+        const o = this.acquireScratch(objRef);
+        if (info.meta.hierarchy) code.globalGet(this.classes.ciGlobal(e.className));
+        for (const f of info.meta.def.fields) this.emitFieldSeed(f.type);
+        code.structNew(info.struct);
+        code.localSet(o);
+        // Every class reaches the IR with a constructor function — the
+        // frontend desugars default constructors, field initializers and
+        // parameter properties into one. Both ways of not finding it are
+        // bugs, and they are DIFFERENT bugs: absent from the module means
+        // the frontend stopped desugaring, present but undeclared means a
+        // reachability edge went missing. Neither may fall through — that
+        // would hand back an instance no initializer ever ran over.
+        const ctorName = `%${e.className}.constructor`;
+        const ctor = this.funcByName.get(ctorName);
+        const ctorIndex = this.funcIndexByName.get(ctorName);
+        if (ctor === undefined || ctorIndex === undefined) {
+          throw new Error(
+            this.mod.functions.some((f) => f.name === ctorName)
+              ? `wasm emitter bug: ${ctorName} is in the module but was never declared reachable`
+              : `wasm emitter bug: new ${e.className} with no ${ctorName} in the module`,
+          );
+        }
+        code.refNull(this.fnClosPair(ctor).clos);
+        code.localGet(o);
+        for (const a of e.args) this.walkExpr(a);
+        code.call(ctorIndex);
+        if (this.mayThrow.has(ctorName)) this.emitPendingCheck();
+        code.localGet(o);
+        this.releaseScratch(objRef, o);
         return;
       }
 
@@ -3591,10 +3912,8 @@ class Assembler {
       }
 
       /* Unit values exist only inside unions (unionWrap intercepts them
-       * before the walk, so a reached unitLit is refused loudly);
-       * fieldIncDec waits on class fields. */
+       * before the walk, so a reached unitLit is refused loudly). */
       case "unitLit":
-      case "fieldIncDec":
       /* templateStrings is the tagged-template strings OBJECT (string[]). */
       case "templateStrings":
       /* Regex — a whole engine, host-imported or compiled. */
@@ -3622,8 +3941,8 @@ class Assembler {
        * has no type for — the void-await path is its own work. */
       case "promiseVoidWiden":
       case "jsBridgePromise":
-      /* Classes: GC structs, vtables for the virtual slice. */
-      case "new":
+      /* Classes: the class-as-a-VALUE surface (its own object type with a
+       * construct thunk) and virtual dispatch (vtables). */
       case "classRef":
       case "newValue":
       case "instanceOfValue":
@@ -3767,6 +4086,20 @@ class Assembler {
         const soft = this.mapTypeSoft(t);
         return `fn:${valKey(soft)}`;
       }
+      case "object":
+        // One key for the whole builtin error family — they genuinely
+        // share errT, so `Error[]` and `TypeError[]` are one vector type
+        // (and were, back when "object" meant only errT). Every emitted
+        // class is its own element representation and its own key.
+        //
+        // Nothing else in arrays.ts needed a class-element gate: get/set/
+        // push/slice/splice/newLen are representation-generic, indexOf
+        // and includes go through ref.eq (JS-exact for objects), and JOIN
+        // — the one helper that would have to STRINGIFY an element —
+        // already refuses every ref element as `arrIntrinsic:join:ref-elem`
+        // before the helper is asked for. Verified against the corpus:
+        // there is no class-element hole there to plug.
+        return RUNTIME_ERROR_CLASSES.has(t.className) ? "object" : `obj:${t.className}`;
       default:
         return t.kind;
     }
@@ -3861,7 +4194,10 @@ class Assembler {
           if (e.op === "!==") code.i32Eqz();
           return;
         }
-        // Class values: one immortal object per class — waits on classes.
+        // Records, class instances, and class VALUES — every remaining
+        // reference identity. The instances are ready to join the arm
+        // above (their structs exist); the identity plane is where that
+        // and instanceof land together.
         this.refuse("bin:ref-eq", e.loc);
         code.unreachable();
         return;
