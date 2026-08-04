@@ -748,6 +748,24 @@ const TIER_FLOOR: string[] = [
   // `throw:class` is gone, and ANY class instance now rides both the
   // exception cell and a promise rejection.
   "981-exceptions-values.ts",
+  // Increment 14 (dyn core), stage 1: the checked-dynamic representation
+  // — one $dyn struct with an explicit kind tag, four interned constant
+  // boxes, and the scalar halves of the C emitter's to-dyn and check
+  // walkers. `unknown` is a type the tier HOLDS now, so mapType stopped
+  // refusing it and the census names the missing SHAPE instead
+  // (dynFrom:func, dynCheck:record, ...).
+  //
+  // What that alone claims is the long tail of programs whose only dyn
+  // was incidental: an uninitialized implicit-any `let` (which lowers to
+  // `dynFrom(undefined)` and is now one global.get at THE immortal
+  // undefined), an `unknown` callback parameter nobody validates, a bare
+  // `typeof u`, a width-lifted record field.
+  "519-array-from-length.ts",
+  "1711-cjs-export-single-values/main.js",
+  "1825-exhaustive-typeof-switch.ts",
+  "2352-void-coercions.ts",
+  "2557-width-field-lifts.ts",
+  "2613-for-init-uninitialized-let.ts",
 ];
 
 interface RunResult {

@@ -85,6 +85,7 @@ import {
   IMPORT_WRITE,
 } from "./abi.js";
 import { VecBuilder, type VecInfo } from "./arrays.js";
+import { DK, DYN_KIND, DYN_NUM, DYN_REF, DynBuilder } from "./dyn.js";
 import {
   PromiseBuilder,
   ALL_REMAINING,
@@ -339,6 +340,26 @@ const ANY_REF: ValType = { kind: "ref", nullable: true, typeIndex: ANY_HEAP };
 /** Record shapes the resumable lowering owns (statemachine.ts names them
  * `%frame.<fn>`): the ONLY shapes that declare a supertype. */
 const FRAME_SHAPE_PREFIX = "%frame.";
+
+type DynTestKind = Extract<IrExpr, { kind: "dynTest" }>["test"];
+
+/** dynTest's kind sets, one for one with the C emitter's lowering
+ * (emit-exprs.ts). `typeof x === "object"` admits NULL — JS's oldest
+ * wart — alongside every object-shaped kind. The two tests that are not
+ * kind compares (`truthy` runs the ToBoolean ladder, `error` reads the
+ * dyn tree's "%error" encoding) are excluded by the type. */
+const DYN_TEST_KINDS: Record<Exclude<DynTestKind, "truthy" | "error">, readonly number[]> = {
+  string: [DK.STR],
+  number: [DK.NUM],
+  boolean: [DK.BOOL],
+  undefined: [DK.UNDEF],
+  null: [DK.NULL],
+  nullish: [DK.UNDEF, DK.NULL],
+  bytes: [DK.BYTES],
+  array: [DK.ARR],
+  function: [DK.FUNC],
+  object: [DK.OBJ, DK.ARR, DK.BYTES, DK.HANDLE, DK.PROMISE, DK.NULL],
+};
 
 /* ── the assembler: one walk, both sinks ───────────────────────────────── */
 
@@ -603,23 +624,35 @@ class Assembler {
    * cell (kind OBJ). Fences and TDZ reads throw this shape; the caller
    * emits the unwind. */
   private emitSetCellErrorLit(className: string, name: string, message: string, codeLit: string | null): void {
+    this.emitSetCellError(this.fn.code, className, name, (c) => this.pushStrLitInto(c, message), codeLit);
+  }
+
+  /** The same fill into ANY `Code`, with the MESSAGE left to the caller:
+   * dynCheck's failure renders its message at runtime (dyn.ts's
+   * check_fail), while fences and TDZ reads have theirs as a literal. */
+  private emitSetCellError(
+    c: Code,
+    className: string,
+    name: string,
+    pushMessage: (c: Code) => void,
+    codeLit: string | null,
+  ): void {
     const exc = this.exc();
-    const code = this.fn.code;
-    this.pushErrVt(className);
-    this.pushStrLit(name);
-    this.pushStrLit(message);
-    if (codeLit !== null) this.pushStrLit(codeLit);
-    else code.refNull(this.strType);
-    code.structNew(exc.errT);
-    code.globalSet(exc.refG);
+    c.globalGet(this.classes.vtGlobal(className));
+    this.pushStrLitInto(c, name);
+    pushMessage(c);
+    if (codeLit !== null) this.pushStrLitInto(c, codeLit);
+    else c.refNull(this.strType);
+    c.structNew(exc.errT);
+    c.globalSet(exc.refG);
     // The class is known exactly here, so the cell's interval position is
     // a constant — no vt read.
     const meta = this.classes.meta(className);
     if (meta === undefined) throw new Error(`wasm emitter bug: cell error literal of unknown class ${className}`);
-    code.i32Const(meta.pre);
-    code.globalSet(exc.preG);
-    code.i32Const(EXC_OBJ);
-    code.globalSet(exc.kindG);
+    c.i32Const(meta.pre);
+    c.globalSet(exc.preG);
+    c.i32Const(EXC_OBJ);
+    c.globalSet(exc.kindG);
   }
 
   /** A builtin error class's interval global — errT's `vt` operand. */
@@ -1258,6 +1291,28 @@ class Assembler {
     return this.unionsField;
   }
 
+  /* ── the checked-dynamic surface (dyn.ts) ───────────────────────────────
+   * One `$dyn` struct with an explicit kind tag, four interned constant
+   * boxes, and the dispatch helpers the C runtime spells as scr_dyn_*.
+   * Interned by first use, so a module with no `unknown` in it emits
+   * neither the type nor a single helper. */
+
+  private dynField: DynBuilder | null = null;
+
+  private get dyn(): DynBuilder {
+    this.dynField ??= new DynBuilder(this.mb, {
+      strRef: () => this.strRef,
+      strType: () => this.strType,
+      strEq: () => this.strEqHelper(),
+      concat: () => this.concatHelper(),
+      f64ToStr: () => this.f64ToStrHelper(),
+      lit: (c, s) => this.pushStrLitInto(c, s),
+      throwTypeError: (c, pushMessage) =>
+        this.emitSetCellError(c, "%TypeError", "TypeError", pushMessage, null),
+    });
+    return this.dynField;
+  }
+
   private unionDef(unionId: string): IrUnionDef {
     const def = this.unionsById.get(unionId);
     if (def === undefined) throw new Error(`unknown union ${unionId}`);
@@ -1654,6 +1709,13 @@ class Assembler {
 
   private emitFieldSeed(c: Code, t: IrType): void {
     const code = c;
+    if (t.kind === "dyn") {
+      // Same reasoning as the undefined-armed union below, one layer
+      // down: `undefined` is what JS reads from an unassigned field, and
+      // a null box would trap the first kind read to touch it.
+      code.globalGet(this.dyn.undefinedGlobal());
+      return;
+    }
     if (t.kind === "union") {
       const tag = this.undefinedArmTag(t.unionId);
       if (tag >= 0) {
@@ -1739,6 +1801,11 @@ class Assembler {
         const cv = this.classValInfo(t.className, loc, false);
         return cv === null ? null : { kind: "ref", nullable: true, typeIndex: cv.objT };
       }
+      case "dyn":
+        // The checked-dynamic box (dyn.ts). Like unions and promises this
+        // arm never fails — a dyn value is one struct whatever it holds,
+        // so refusal moves to the sites that BUILD or READ a payload.
+        return this.dyn.dynRef();
       default:
         this.refuse(`type:${t.kind}`, loc);
         return null;
@@ -1780,6 +1847,7 @@ class Assembler {
           t.elem.kind === "record" ||
           t.elem.kind === "union" ||
           t.elem.kind === "promise" ||
+          t.elem.kind === "dyn" ||
           (t.elem.kind === "object" && this.objectMappable(t.elem.className));
         if (!mappable) return I32;
         const kind =
@@ -1827,6 +1895,9 @@ class Assembler {
         const cv = this.classValInfo(t.className, undefined, true);
         return cv === null ? I32 : { kind: "ref", nullable: true, typeIndex: cv.objT };
       }
+      case "dyn":
+        // mapType never fails on dyn either — the consistency rule.
+        return this.dyn.dynRef();
       default:
         return I32;
     }
@@ -1888,6 +1959,21 @@ class Assembler {
       this.fn.code.localGet(init.argIndex);
       this.fn.code.structNew(init.box);
       this.fn.code.localSet(init.slot);
+    }
+
+    // Prologue 2: dyn slots open at THE undefined box, never a null ref.
+    // An implicit-any `let` with no initializer IS `undefined` in JS, and
+    // a null box would trap the first kind read instead of answering it —
+    // the same reasoning emitFieldSeed applies to undefined-armed fields.
+    // The frontend spells most of these out as `dynFrom(undefined)`
+    // initializers, so this is the FLOOR rather than the usual path; a
+    // BOXED local is skipped because its box is minted at its varDecl and
+    // because a tdz slot's null IS the before-initialization sentinel.
+    for (const l of fn.locals) {
+      if (l.type.kind !== "dyn" || l.boxed === true) continue;
+      if (fn.params.some((p) => p.localId === l.id)) continue;
+      this.fn.code.globalGet(this.dyn.undefinedGlobal());
+      this.fn.code.localSet(localIndex.get(l.id)!);
     }
 
     // Captures prologue: downcast arg0 to this function's env and unpack
@@ -3892,6 +3978,14 @@ class Assembler {
           code.call(this.errToStrHelper());
           return;
         }
+        if (e.fn === "dyn.typeof") {
+          // Bare `typeof u` on a dyn value — scr_dyn_typeof's kind→string
+          // table. (The COMPARED forms never arrive here: the frontend
+          // folds `typeof u === "string"` into a dynTest.)
+          this.walkExpr(e.args[0]!);
+          code.call(this.dyn.typeOf());
+          return;
+        }
         if (this.emitTimerCall(e)) return;
         this.refuse(`libCall:${e.fn}`, e.loc);
         code.unreachable();
@@ -4127,6 +4221,166 @@ class Assembler {
         this.emitUnwind();
         this.close();
         this.releaseScratch(this.caughtRef(), c);
+        return;
+      }
+
+      /* Static → checked-dynamic conversion: the C emitter's per-type
+       * to-dyn walkers (sc_td_N, emit-walkers.ts), SCALAR arms. C
+       * allocates a node per conversion; here the box is a `struct.new`
+       * and the two unit conversions are the interned immortals, so
+       * `dynFrom(undefined)` — by far the commonest form, since every
+       * uninitialized implicit-any `let` lowers to one — costs a single
+       * `global.get`. Composite sources need the deep walkers and
+       * function sources the per-signature call thunks; each refuses
+       * under its OWN name so the census names the shape that is missing,
+       * not just "dynFrom". */
+      case "dynFrom": {
+        const vt = e.value.type;
+        switch (vt.kind) {
+          case "f64":
+            this.dyn.boxNum(code, () => this.walkExpr(e.value));
+            return;
+          case "bool":
+            // A literal boxes to the interned instance: BOOL identity is
+            // by VALUE (scr_dyn_strict_eq), so sharing is unobservable.
+            if (e.value.kind === "boolLit") {
+              code.globalGet(this.dyn.boolGlobal(e.value.value));
+              return;
+            }
+            this.dyn.boxBool(code, () => this.walkExpr(e.value));
+            return;
+          case "string":
+            this.dyn.boxStr(code, () => this.walkExpr(e.value));
+            return;
+          case "undefinedT":
+          case "nullT": {
+            // A unit VALUE is the literal and nothing else (nodes.ts: the
+            // unit kinds live in union arms, and bare they are unitLit),
+            // so there is no operand to evaluate — the conversion IS the
+            // interned box. A unit-typed expression of any other shape
+            // would have effects to run first, so it stays refused.
+            if (e.value.kind !== "unitLit") {
+              this.refuse(`dynFrom:${vt.kind}-expr`, e.loc);
+              code.unreachable();
+              return;
+            }
+            code.globalGet(vt.kind === "nullT" ? this.dyn.nullGlobal() : this.dyn.undefinedGlobal());
+            return;
+          }
+          case "dyn":
+            // Already dyn — the walkers' identity arm (a retain in C).
+            this.walkExpr(e.value);
+            return;
+          default:
+            this.refuse(`dynFrom:${vt.kind}`, e.loc);
+            code.unreachable();
+            return;
+        }
+      }
+
+      /* CHECKED extraction from a dyn value (`u as number`): the C
+       * emitter's per-type check walkers (sc_dc_N), SCALAR arms. The kind
+       * must match EXACTLY — no coercions — and a mismatch renders
+       * "expected <want> at <path>, got <kind>" and throws the catchable
+       * TypeError (SEMANTICS.md S009: `as` erases in Node and validates on
+       * every tsinter backend, so the failure texts have no oracle but the
+       * C emitter's). may-throw.ts seeds this node like a `throw`, so the
+       * callers' pending checks come free. */
+      case "dynCheck": {
+        const t = e.type;
+        if (t.kind === "dyn") {
+          // An `unknown` target (a dyn record field): the subtree passes
+          // through unvalidated — nothing to check, nothing to build.
+          this.walkExpr(e.value);
+          return;
+        }
+        const want =
+          t.kind === "f64" ? { desc: "number", kind: DK.NUM, val: F64 }
+          : t.kind === "bool" ? { desc: "boolean", kind: DK.BOOL, val: I32 }
+          : t.kind === "string" ? { desc: "string", kind: DK.STR, val: this.strRef }
+          : null;
+        if (want === null) {
+          this.refuse(`dynCheck:${t.kind}`, e.loc);
+          code.unreachable();
+          return;
+        }
+        const dynT = this.dyn.dynT();
+        const dynRef = this.dyn.dynRef();
+        const d = this.acquireScratch(dynRef);
+        this.walkExpr(e.value);
+        code.localSet(d);
+        code.localGet(d);
+        code.structGet(dynT, DYN_KIND);
+        code.i32Const(want.kind);
+        code.i32Eq();
+        this.openIfResult(want.val);
+        code.localGet(d);
+        if (t.kind === "string") {
+          code.structGet(dynT, DYN_REF);
+          code.refCast(this.strType);
+        } else {
+          code.structGet(dynT, DYN_NUM);
+          if (t.kind === "bool") {
+            code.f64Const(0);
+            code.f64Ne();
+          }
+        }
+        code.else_();
+        // The ROOT path (`$`): a scalar target names the whole value.
+        // Nested walkers push real path nodes (stage 2) — the type and
+        // its renderer exist now so that the message grammar is settled
+        // before anything builds one.
+        code.refNull(this.dyn.pathT());
+        this.pushStrLit(want.desc);
+        code.localGet(d);
+        code.call(this.dyn.checkFail());
+        // The unwind leaves the arm unreachable — wasm's polymorphic
+        // stack supplies the block's result type from here.
+        this.emitUnwind();
+        this.close();
+        this.releaseScratch(dynRef, d);
+        return;
+      }
+
+      /* Kind tests on a dyn value (`typeof u === "string"`,
+       * `Array.isArray(u)`, `if (u)`): inline compares on the tag —
+       * nothing allocates and nothing can throw. A passing test does NOT
+       * license an unchecked payload read: the frontend still emits a
+       * dynCheck for the narrowed read (nodes.ts's trust-but-VERIFY
+       * stance, deliberately unlike unionNarrow). */
+      case "dynTest": {
+        if (e.test === "error") {
+          // `u instanceof Error` is the dyn tree's reserved "%error"
+          // object encoding, which arrives with caughtToDyn.
+          this.refuse("dynTest:error", e.loc);
+          code.unreachable();
+          return;
+        }
+        if (e.test === "truthy") {
+          this.walkExpr(e.value);
+          code.call(this.dyn.truthy());
+          if (e.negated === true) code.i32Eqz();
+          return;
+        }
+        const kinds = DYN_TEST_KINDS[e.test];
+        this.walkExpr(e.value);
+        code.structGet(this.dyn.dynT(), DYN_KIND);
+        if (kinds.length === 1) {
+          code.i32Const(kinds[0]!);
+          if (e.negated === true) code.i32Ne();
+          else code.i32Eq();
+          return;
+        }
+        const k = this.acquireScratch(I32);
+        code.localSet(k);
+        kinds.forEach((want, i) => {
+          code.localGet(k);
+          code.i32Const(want);
+          code.i32Eq();
+          if (i > 0) code.i32Or();
+        });
+        this.releaseScratch(I32, k);
+        if (e.negated === true) code.i32Eqz();
         return;
       }
 
@@ -4531,20 +4785,18 @@ class Assembler {
       case "recordOvfKeys":
       /* The caught→dyn conversion waits on the dyn surface. */
       case "caughtToDyn":
-      /* The dyn surface. */
-      case "dynFrom":
+      /* The dyn surface past the scalar core: the composite converters,
+       * the keyed reads, and the call/invoke boundary. */
       case "dynFromJsval":
       case "dynCall":
       case "dynInvoke":
       case "dynArrLit":
       case "dynObjLit":
-      case "dynTest":
       case "dynKeyGet":
       case "dynHasKey":
       case "dynScalarEq":
       case "dynDestrCheck":
       case "dynIterN":
-      case "dynCheck":
       case "jsonStringify":
       /* The island bridge — an engine embedding, so likely never on this
        * backend at all. */

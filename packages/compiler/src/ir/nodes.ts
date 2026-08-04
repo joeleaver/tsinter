@@ -240,13 +240,21 @@ export type IrType =
    * be stored in locals/globals, passed as a param/call arg, returned,
    * validated with a checked cast (`dynCheck`), CALLED (`dynCall` — the
    * dyn's function kind, boxed closures with per-call argument checks),
-   * and captured by closures (an untraced obj-box: cycles through dyn are
-   * never collected, SEMANTICS.md); it can NOT ride record/class fields,
-   * array elements, union arms, or the exception cell, and every other
-   * operation on it (property access, arithmetic, truthiness, `===`,
-   * console.log, ...) is frontend-rejected with a "validate with 'as
-   * <type>' first" hint — or, in JavaScript sources, met with per-site
-   * checked lowerings (SEMANTICS.md 115-117). */
+   * captured by closures (an untraced obj-box: cycles through dyn are
+   * never collected, SEMANTICS.md), thrown (it rides the exception cell's
+   * REF arm by reference), and held in RECORD FIELDS — `{ v: unknown }`,
+   * `[string, unknown]` entry tuples, and the index-signature value type,
+   * all three validator-admitted. A dyn CLASS field is validator-admitted
+   * too, but no frontend produces one today: `unknown`-typed class fields
+   * are fenced with SC1090, so that half is a validator allowance rather
+   * than a shipping capability. The two exclusions have DIFFERENT
+   * enforcers: a dyn UNION ARM is rejected by validate.ts, while a dyn
+   * ARRAY ELEMENT simply never arises — the frontend collapses `unknown[]`
+   * to a bare dyn and no validator fence exists. Every other operation
+   * (property access, arithmetic, truthiness, `===`, console.log, ...) is
+   * frontend-rejected with a "validate with 'as <type>' first" hint — or,
+   * in JavaScript sources, met with per-site checked lowerings
+   * (SEMANTICS.md 115-117). */
   | { kind: "dyn" }
   /** An island value handle — the type of `any` under --dynamic. Runtime
    * representation is a refcounted cell (ScrJsval) owning one embedded-

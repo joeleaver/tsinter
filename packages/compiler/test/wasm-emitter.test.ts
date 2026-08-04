@@ -434,6 +434,65 @@ test("S009: a checked cast on a catch binding validates, it does not erase", asy
   );
 });
 
+test("S009: `as` on an unknown value validates, and the failure names the path", async () => {
+  // Same inherited divergence one layer out: Node erases `u as number`
+  // and hands the string straight through, so NO corpus program can pin
+  // these texts. The contract they DO have is byte-parity with the C
+  // emitter's scr_dyn_check_fail — "expected <want> at <path>, got
+  // <kind>", where the path is the root `$` for a scalar target and the
+  // kind noun comes from scr_dyn_kind_name (null is "null", a unit is
+  // "undefined"). Verified against a C-lane build of this same program.
+  const res = await buildWasm(
+    "dyn-check-fail.ts",
+    [
+      "function asNum(u: unknown): number { return u as number; }",
+      "function asStr(u: unknown): string { return u as string; }",
+      "function asBool(u: unknown): boolean { return u as boolean; }",
+      "console.log(asNum(7), asStr(\"s\"), asBool(true));",
+      "const bad: string[] = [];",
+      'try { asNum("seven"); } catch (e) { if (e instanceof TypeError) bad.push(e.name + ": " + e.message); }',
+      "try { asStr(1); } catch (e) { if (e instanceof TypeError) bad.push(e.message); }",
+      "try { asBool(undefined); } catch (e) { if (e instanceof TypeError) bad.push(e.message); }",
+      "try { asNum(null); } catch (e) { if (e instanceof TypeError) bad.push(e.message); }",
+      "for (const b of bad) console.log(b);",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "7 s true",
+      "TypeError: expected number at $, got string",
+      "expected string at $, got number",
+      "expected boolean at $, got undefined",
+      "expected number at $, got null",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("dyn: ToBoolean over every constructible kind", async () => {
+  // The truthiness ladder (scr_dyn_truthy) reached the only way a source
+  // can reach it — a JS-lane implicit-any binding in a condition, since
+  // TypeScript sources are fenced to "validate with `as` first". Node IS
+  // the oracle for the answers; no claimed corpus program exercises the
+  // ladder, and the -0/NaN arms are exactly the ones a naive `!= 0` gets
+  // wrong.
+  const res = await buildWasm(
+    "dyn-truthy.js",
+    [
+      'function t(u) { return u ? "y" : "n"; }',
+      'console.log(t(0) + t(-0) + t(NaN) + t(1) + t("") + t("a") + t(undefined) + t(null) + t(true) + t(false));',
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("nnnynynnyn\n");
+});
+
 test("S008: repeat's invalid count is the RangeError trap", async () => {
   const res = await buildWasm(
     "repeat-neg.ts",
