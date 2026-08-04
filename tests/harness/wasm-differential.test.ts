@@ -441,6 +441,29 @@ const TIER_FLOOR: string[] = [
   // The settled-await hop under `console.log(await q)` — the awaited
   // value reaching an argument list still costs its own turn.
   "1428-settled-await-order.ts",
+
+  // Increment 12 (async), stage 5b: the boxes a body OWNS. A captured (or
+  // TDZ) local declared inside an async body is pre-created by the spawn
+  // wrapper, rides resume's closure environment like a received capture,
+  // and its declaration becomes the write that fills it — so the frame,
+  // the closures and any later timer callback all share ONE box
+  // (statemachine.ts's BOXES THE BODY OWNS section).
+  //
+  // Refcounted state held across suspensions by async arrows: the shape
+  // the section was written for.
+  "1023-async-rc-stress.ts",
+  // Promise-typed boxes, awaited more than once through the capture.
+  "1025-async-promise-capture.ts",
+  // Forward-captured scalar consts: the TDZ box pre-creates EMPTY (its
+  // null inner slot is the sentinel), the declaration's `assign` fills it
+  // through the indirection, and an early read is Node's catchable
+  // ReferenceError.
+  "1573-tdz-scalar-forward-capture.ts",
+  // A reference CYCLE through a body box: the box holds a promise that is
+  // fulfilled with a closure capturing that same box. Also the boxed
+  // PARAM shape — no boxInit, since the wrapper's prologue re-boxes every
+  // boxed argument on its way in.
+  "755-cycle-async-promise.ts",
 ];
 
 interface RunResult {

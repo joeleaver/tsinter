@@ -154,6 +154,39 @@
  * boxes, they ride resume's own closure environment, and the box identity
  * is what aliasing across a suspension depends on.
  *
+ * BOXES THE BODY OWNS RIDE THE ENV TOO. A local the body declares and a
+ * nested closure captures lives in a one-field mutable box (increment 5),
+ * and every access — the declaring function's included — goes through it.
+ * By-value save/restore cannot carry one: two closures and the frame must
+ * see ONE box, so copying its contents into a frame slot and back would
+ * fork the binding at every suspension. The fix is to make a body box
+ * look exactly like a RECEIVED one, which the protocol already carries:
+ *
+ *   1. The WRAPPER pre-creates it (`%async.boxInit`), with the payload
+ *      struct.new_default gives — which is precisely what the sync
+ *      `varDecl` emits for an uninitialized boxed local, TDZ sentinel
+ *      included (a tdz box's empty state IS its null inner slot).
+ *   2. resume's `captures` grow by one entry per box, so every re-entry
+ *      unpacks the SAME wrapper-made box out of the env. Order is
+ *      RECEIVED captures first (fn.captures order), then the body's own
+ *      in `locals` order — the frontend's declaration order, so the
+ *      layout is a function of the input alone.
+ *   3. The body's `varDecl` becomes an `assign`, which stores THROUGH the
+ *      box instead of minting a new one (storeVar), so the identity the
+ *      closures captured is the identity the declaration fills — and for
+ *      a tdz local that assign is the same statement the sync path uses
+ *      to leave the dead zone.
+ *
+ * A boxed PARAM needs no boxInit: the wrapper still declares the
+ * parameter, and the emitter's prologue re-boxes every boxed argument
+ * into its own slot. Both kinds drop out of the frame (they are box refs
+ * in an env, not values in a struct), which is why the wrapper's frame
+ * literal skips a boxed param's `%l_` field — there is none.
+ *
+ * WHAT PRE-CREATION CANNOT SERVE is refused by name rather than aliased
+ * together; see `fn:async:boxed-in-loop` and `fn:async:boxed-forward-
+ * capture` in the refusal list.
+ *
  * COMPLETION AND FAILURE. `return v` becomes `%async.settle(frame.%promise,
  * v)` + `return`, wherever it appears (returns inside statements the pass
  * keeps VERBATIM are rewritten in place). A synchronous throw anywhere in
@@ -256,11 +289,26 @@
  *     construct it exploded. Keeping the jump would retarget it at the
  *     dispatch switch; exploding the container is the same work as the
  *     two entries above.
- *   - `fn:async:boxed-local` — a body-declared captured (or TDZ) local.
- *     Its box must be allocated once per DECLARATION and survive the
- *     suspension by identity, which the frame's by-value save/restore
- *     cannot express; hoisting the box into the frame is possible, and
- *     only worth doing with aliasing tests behind it.
+ *   - `fn:async:boxed-in-loop` — a body-boxed local whose declaration can
+ *     run more than once: inside a loop, in a `for` header, or as a
+ *     for-of binding. JS gives each execution a FRESH binding (the
+ *     emitter re-boxes per iteration for exactly this reason), so the
+ *     ONE box the wrapper pre-creates would alias every iteration's
+ *     closures together — a miscompile, not a slower answer.
+ *   - `fn:async:boxed-forward-capture` — a NON-tdz body box some closure
+ *     captures ahead of its declaration. Such a closure would read the
+ *     box's default payload where JS says `undefined`. The frontend does
+ *     not emit the shape (a forward-captured `const` becomes a tdz box,
+ *     whose sentinel answers with Node's ReferenceError; a forward-
+ *     captured `var` gets its hoisted `undefined` initializer pushed
+ *     AHEAD of the capturing closure; a forward-captured `let` is fenced
+ *     in the frontend), so this is the structural proof of that, not a
+ *     measured rock.
+ *   - `fn:async:boxed-local` — a body-boxed local this pass cannot place:
+ *     no declaration at all, more than one, or one nested somewhere the
+ *     placement walk does not reach. Unreachable from today's frontend
+ *     (one boxed binding has exactly one `varDecl`); it refuses rather
+ *     than pre-create a box whose declaration it could not find.
  *   - `fn:async:self-ref` — `selfRef` in the body. It means "the running
  *     closure", and after the split the running closure is resume's, not
  *     the wrapper's; rewriting it to `closure(f)` is future work.
@@ -358,7 +406,12 @@ export type AsyncStmt =
   /** Mark a promise OBSERVED without reading it: a module evaluation
    * promise belongs to the loader, so its rejection is the program's
    * root-rejection exit and never an unhandled rejection. */
-  | { kind: "%async.markHandled"; promise: WExpr; loc: SrcLoc };
+  | { kind: "%async.markHandled"; promise: WExpr; loc: SrcLoc }
+  /** Allocate a body-boxed local's box, empty, into the wrapper's slot —
+   * the one statement that lets a body box ride resume's env (see the
+   * header). Its payload is struct.new_default's, which is bit for bit
+   * what the sync `varDecl` of an uninitialized boxed local emits. */
+  | { kind: "%async.boxInit"; localId: string; loc: SrcLoc };
 
 /** A statement of the lowered IR. SHALLOW by design — see the header:
  * nested bodies keep their `IrStmt[]` static type while carrying
@@ -445,6 +498,121 @@ function hasSelfRef(node: unknown): boolean {
 
 function hasReturn(node: unknown): boolean {
   return anyNode(node, (rec) => rec["kind"] === "return");
+}
+
+/* ── where a body box is declared ──────────────────────────────────────── */
+
+/** Everything the box plan needs to know about one body-boxed local (see
+ * the header's BOXES THE BODY OWNS section). */
+interface BoxSite {
+  /** Declarations the STRUCTURED walk below found — a for-of binding
+   * counts as one, since that is where its box is minted. */
+  decls: number;
+  /** Some declaration sits where it can run more than once. */
+  inLoop: boolean;
+  /** A `closure` listing this local was built before its declaration. */
+  earlyCapture: boolean;
+}
+
+/** Walk `body` in SOURCE order, recording each id's declaration sites and
+ * whether a closure over it was built ahead of them.
+ *
+ * Tree order is time order for the "ahead of" question: reaching a
+ * closure before a declaration that lexically precedes it needs a
+ * backward jump, and a loop holding the closure but not the declaration
+ * necessarily opens before the declaration in tree order too. Loop bodies
+ * are still walked — a closure inside one is "after" a declaration above
+ * it — and only the DECLARATION positions inside them are what `inLoop`
+ * reports. */
+function boxSites(body: IrStmt[], ids: Set<string>): Map<string, BoxSite> {
+  const sites = new Map<string, BoxSite>();
+  for (const id of ids) sites.set(id, { decls: 0, inLoop: false, earlyCapture: false });
+  const declared = new Set<string>();
+
+  const scanExpr = (node: unknown): void => {
+    anyNode(node, (rec) => {
+      if (rec["kind"] !== "closure") return false;
+      for (const id of (rec["captures"] as string[] | undefined) ?? []) {
+        if (ids.has(id) && !declared.has(id)) sites.get(id)!.earlyCapture = true;
+      }
+      return false;
+    });
+  };
+  const declare = (id: string, inLoop: boolean): void => {
+    const site = sites.get(id);
+    if (site === undefined) return;
+    site.decls++;
+    if (inLoop) site.inLoop = true;
+    declared.add(id);
+  };
+  const list = (stmts: IrStmt[], inLoop: boolean): void => {
+    for (const s of stmts) walk(s, inLoop);
+  };
+  const walk = (s: IrStmt, inLoop: boolean): void => {
+    switch (s.kind) {
+      case "varDecl":
+        // The initializer evaluates BEFORE the binding is initialized, so
+        // a closure in it is an early capture like any other.
+        scanExpr(s.init);
+        declare(s.localId, inLoop);
+        return;
+      case "if":
+        scanExpr(s.cond);
+        list(s.then, inLoop);
+        if (s.else_ !== null) list(s.else_, inLoop);
+        return;
+      case "block":
+        list(s.body, inLoop);
+        return;
+      case "while":
+      case "doWhile":
+        scanExpr(s.cond);
+        list(s.body, true);
+        return;
+      case "for":
+        if (s.init !== null) walk(s.init, true);
+        scanExpr(s.cond);
+        scanExpr(s.update);
+        list(s.body, true);
+        return;
+      case "forOf":
+        scanExpr(s.iterable);
+        // The per-iteration binding IS a fresh box every pass.
+        declare(s.localId, true);
+        list(s.body, true);
+        return;
+      case "switch":
+        scanExpr(s.disc);
+        for (const c of s.cases) {
+          scanExpr(c.test);
+          list(c.body, inLoop);
+        }
+        return;
+      case "tryCatch":
+        list(s.tryBody, inLoop);
+        if (s.catchBody !== null) list(s.catchBody, inLoop);
+        if (s.finallyBody !== null) list(s.finallyBody, inLoop);
+        return;
+      default:
+        scanExpr(s);
+        return;
+    }
+  };
+  list(body, false);
+  return sites;
+}
+
+/** Every `varDecl` of `id` ANYWHERE in the tree, `seqExpr` bodies and
+ * unwalked containers included. Disagreeing with boxSites's structured
+ * count means a declaration sits somewhere the plan cannot reason about,
+ * which is a refusal rather than a guess. */
+function declCount(node: unknown, id: string): number {
+  let n = 0;
+  anyNode(node, (rec) => {
+    if (rec["kind"] === "varDecl" && rec["localId"] === id) n++;
+    return false;
+  });
+  return n;
 }
 
 /** Break/continue targets INSIDE a statement, innermost last — the
@@ -774,6 +942,15 @@ class FunctionLowering {
   /** Non-boxed locals (params and hoist temps included) — the total
    * save/restore set, fixed once the rewrite has stopped adding temps. */
   private saved: IrLocal[] = [];
+  /** Boxed (or tdz) locals this function OWNS rather than received — the
+   * wrapper makes their boxes and resume captures them, in `locals`
+   * order. See the header's BOXES THE BODY OWNS section. */
+  private bodyBoxed: IrLocal[] = [];
+  /** The subset the wrapper must allocate. A boxed PARAM is excluded: the
+   * wrapper declares the parameter, and the emitter's prologue re-boxes
+   * every boxed argument into its slot before the body runs. */
+  private boxInits: IrLocal[] = [];
+  private readonly bodyBoxedIds = new Set<string>();
   private hoisted = 0;
   private readonly frameFields: { name: string; type: IrType }[] = [];
   /** Dispatch states, each a stmt list that must end in a terminator. */
@@ -874,9 +1051,7 @@ class FunctionLowering {
     if (hasAwaitDyn(fn.body)) this.decline("fn:async:await-dyn");
     if (hasSelfRef(fn.body)) this.decline("fn:async:self-ref");
     const captured = new Set((fn.captures ?? []).map((c) => c.localId));
-    if (fn.locals.some((l) => (l.boxed === true || l.tdz === true) && !captured.has(l.id))) {
-      this.decline("fn:async:boxed-local");
-    }
+    this.planBoxes(captured);
     // A `return` crossing a finally settles AFTER the finally runs, which
     // the settle-then-return rewrite gets backwards. Checked over the WHOLE
     // body (not alongside the position scan) because the try may sit inside
@@ -887,9 +1062,100 @@ class FunctionLowering {
     // Order-preserving hoisting: after this, every suspension the pass
     // accepts sits at the root of a statement's value slot.
     this.body = this.hoistList(fn.body);
+    // ...and after THIS, no `varDecl` of a body box survives: each one is
+    // the `assign` that fills the wrapper's box in place. A declaration
+    // the rewrite missed would mint a SECOND box in resume and fork the
+    // binding the closures already captured — the one silent miscompile
+    // this design admits, so it is CHECKED rather than argued. (planBoxes
+    // proves there is exactly one declaration at a position the rewrite
+    // reaches; reaching here means the two walks disagree, a pass bug.)
+    this.body = this.rewriteBoxDecls(this.body);
+    for (const id of this.bodyBoxedIds) {
+      if (declCount(this.body, id) !== 0) {
+        throw new Error(`async lowering: body box "${id}" kept its varDecl in "${fn.name}"`);
+      }
+    }
     this.saved = this.locals.filter((l) => l.boxed !== true && l.tdz !== true && !captured.has(l.id));
     if (this.saved.some((l) => l.type.kind === "void")) this.decline("fn:async:void-local");
     this.checkPositions(this.body);
+  }
+
+  /** Decide which boxes the wrapper pre-creates, and refuse the shapes
+   * pre-creation cannot serve (the header's BOXES THE BODY OWNS section
+   * and the three `fn:async:boxed-*` refusals). Runs on the SOURCE body:
+   * hoisting only splices expressions into temps, so it can neither move
+   * a declaration across a loop boundary nor invent one. */
+  private planBoxes(captured: Set<string>): void {
+    const fn = this.fn;
+    const owned = fn.locals.filter((l) => (l.boxed === true || l.tdz === true) && !captured.has(l.id));
+    if (owned.length === 0) return;
+    // `tdz` is documented as always paired with `boxed`; without the box
+    // there is no slot to pre-create and no through-box write to fill.
+    if (owned.some((l) => l.boxed !== true)) this.decline("fn:async:boxed-local");
+    const params = new Set(fn.params.map((p) => p.localId));
+    const sites = boxSites(fn.body, new Set(owned.map((l) => l.id)));
+    for (const l of owned) {
+      if (params.has(l.id)) {
+        // A boxed argument: the emitter's prologue boxes it, and a
+        // parameter is bound exactly once per call by construction. That
+        // prologue boxes by VALTYPE, not tdz-aware, so a tdz param's box
+        // would disagree with the env field the closure packs — a
+        // parameter arrives initialized, so the flag is a contradiction.
+        if (l.tdz === true) this.decline("fn:async:boxed-local");
+        this.bodyBoxed.push(l);
+        continue;
+      }
+      const site = sites.get(l.id)!;
+      if (site.inLoop) this.decline("fn:async:boxed-in-loop");
+      if (site.decls !== 1 || declCount(fn.body, l.id) !== 1) this.decline("fn:async:boxed-local");
+      // A tdz box is BUILT for the forward read — its empty slot answers
+      // with Node's ReferenceError, so an early capture is the point.
+      if (site.earlyCapture && l.tdz !== true) this.decline("fn:async:boxed-forward-capture");
+      this.bodyBoxed.push(l);
+      this.boxInits.push(l);
+    }
+    for (const l of this.bodyBoxed) this.bodyBoxedIds.add(l.id);
+  }
+
+  /** The declaration of a body box becomes the write that FILLS it: the
+   * box already exists (the wrapper made it), and storeVar's boxed path
+   * stores through the ref every closure captured — a tdz local's inner
+   * indirection included, which is how it leaves the dead zone. An
+   * initializer-free declaration disappears outright: `%async.boxInit`
+   * already left the box in exactly the state that `varDecl` would. */
+  private rewriteBoxDecls(body: IrStmt[]): IrStmt[] {
+    if (this.bodyBoxedIds.size === 0) return body;
+    const list = (stmts: IrStmt[]): IrStmt[] => stmts.flatMap((s) => one(s));
+    const one = (s: IrStmt): IrStmt[] => {
+      switch (s.kind) {
+        case "varDecl":
+          if (!this.bodyBoxedIds.has(s.localId)) return [s];
+          return s.init === null ? [] : [{ kind: "assign", localId: s.localId, value: s.init, loc: s.loc }];
+        case "if":
+          return [{ ...s, then: list(s.then), else_: s.else_ === null ? null : list(s.else_) }];
+        case "block":
+        case "while":
+        case "doWhile":
+        case "forOf":
+          return [{ ...s, body: list(s.body) }];
+        case "for":
+          return [{ ...s, body: list(s.body) }];
+        case "switch":
+          return [{ ...s, cases: s.cases.map((c) => ({ ...c, body: list(c.body) })) }];
+        case "tryCatch":
+          return [
+            {
+              ...s,
+              tryBody: list(s.tryBody),
+              catchBody: s.catchBody === null ? null : list(s.catchBody),
+              finallyBody: s.finallyBody === null ? null : list(s.finallyBody),
+            },
+          ];
+        default:
+          return [s];
+      }
+    };
+    return list(body);
   }
 
   /** Rewrite a statement list, splicing each statement's hoist prelude in
@@ -1186,14 +1452,27 @@ class FunctionLowering {
     return { kind: "return", value: null, loc: this.loc };
   }
 
+  /** Resume's environment: the boxes it must be handed to run a body.
+   * RECEIVED captures first, in the async function's own captures[]
+   * order, then the boxes the body owns in `locals` order — a function of
+   * the input alone, so the env layout is deterministic. Every re-entry
+   * unpacks the same boxes, which is what closure aliasing depends on. */
+  private resumeCaptures(): IrParam[] {
+    return [
+      ...(this.fn.captures ?? []),
+      ...this.bodyBoxed.map((l) => ({ localId: l.id, name: l.name, type: l.type })),
+    ];
+  }
+
   /** The resume closure, materialized per use (see the header: it cannot
-   * live in the frame). Captures are the ASYNC function's, in its own
-   * captures[] order, which is also resume's. */
+   * live in the frame). Its capture list is resumeCaptures()'s ids: in
+   * the WRAPPER those name the boxes it just made, and inside resume they
+   * name the slots its own prologue unpacked — the same boxes either way. */
   private resumeClosure(): WExpr {
     return {
       kind: "closure",
       fnName: this.resumeName,
-      captures: (this.fn.captures ?? []).map((c) => c.localId),
+      captures: this.resumeCaptures().map((c) => c.localId),
       type: this.resumeType,
       loc: this.loc,
     };
@@ -1690,16 +1969,17 @@ class FunctionLowering {
         loc: this.loc,
       },
     ];
+    const caps = this.resumeCaptures();
     return {
       name: this.resumeName,
       params: [param],
       returnType: VOID,
       // The async function's own locals ride along (plus the hoisting
       // rewrite's temps): params become plain locals restored from the
-      // frame, and received captures keep their boxed entries so the
-      // emitter's box-access gates still apply.
+      // frame, and every boxed entry — received or body-owned — keeps its
+      // flags so the emitter's box-access gates still apply.
       locals: [frameAnyLocal, frameLocal, ...this.locals, excLocal],
-      ...(this.fn.captures !== undefined ? { captures: this.fn.captures } : {}),
+      ...(caps.length > 0 || this.fn.captures !== undefined ? { captures: caps } : {}),
       body,
       loc: this.fn.loc,
     };
@@ -1708,23 +1988,29 @@ class FunctionLowering {
   private buildWrapper(): WFunction {
     const frameLocal: IrLocal = { id: FRAME_LOCAL, name: FRAME_LOCAL, type: this.frameType, mutable: false };
     const captured = new Set((this.fn.captures ?? []).map((c) => c.localId));
-    // Params and received captures only: the wrapper stores the arguments
-    // and hands the frame over, so the body's locals — hoist temps
-    // included — belong to resume alone.
+    // Params, received captures, and the boxes the body owns: the wrapper
+    // stores the arguments, makes those boxes and hands the frame over, so
+    // every other local — hoist temps included — belongs to resume alone.
     const keep = this.locals.filter(
-      (l) => captured.has(l.id) || this.fn.params.some((p) => p.localId === l.id),
+      (l) =>
+        captured.has(l.id) ||
+        this.bodyBoxedIds.has(l.id) ||
+        this.fn.params.some((p) => p.localId === l.id),
     );
     const frameInit: IrExpr = {
       kind: "recordLit",
       // Fields the literal omits take struct.new_default: %state is 0 (the
       // entry state) and the %await/%l_ slots are filled at their first
-      // suspend.
+      // suspend. A BOXED param has no %l_ field to fill — it rides the env
+      // as a box ref like any other capture, not the frame as a value.
       fields: [
         { name: PROMISE_FIELD, value: widenExpr({ kind: "%async.mint", type: this.promiseType, loc: this.loc }) },
-        ...this.fn.params.map((p) => ({
-          name: slotOf(p.localId),
-          value: { kind: "varRef" as const, localId: p.localId, type: p.type, loc: this.loc },
-        })),
+        ...this.fn.params
+          .filter((p) => !this.bodyBoxedIds.has(p.localId))
+          .map((p) => ({
+            name: slotOf(p.localId),
+            value: { kind: "varRef" as const, localId: p.localId, type: p.type, loc: this.loc },
+          })),
       ],
       type: this.frameType,
       loc: this.loc,
@@ -1735,7 +2021,7 @@ class FunctionLowering {
     // struct); with no captures the direct call is the cheaper shape and
     // arg0 is the dead ref.null every direct call passes.
     const kick: WStmt =
-      (this.fn.captures ?? []).length === 0
+      this.resumeCaptures().length === 0
         ? {
             kind: "exprStmt",
             expr: {
@@ -1781,6 +2067,10 @@ class FunctionLowering {
         ...(cache !== undefined
           ? [{ kind: "%async.cacheCheck" as const, globalId: cache, loc: this.loc }]
           : []),
+        // Before the frame and before the closure that captures them:
+        // resumeClosure() reads these slots, so the boxes must exist by
+        // the time the kick packs the env.
+        ...this.boxInits.map((l) => ({ kind: "%async.boxInit" as const, localId: l.id, loc: this.loc })),
         { kind: "varDecl", localId: FRAME_LOCAL, init: frameInit, loc: this.loc },
         kick,
         ...(cache !== undefined

@@ -18,6 +18,7 @@ import {
   await_,
   bool,
   call,
+  closureOver,
   exprStmt,
   hop,
   loc,
@@ -588,9 +589,65 @@ describe("refusals leave the function untouched", () => {
     );
   });
 
-  test("a body-declared boxed local", () => {
+  test("a body-boxed local whose declaration can run twice", () => {
+    // JS binds `let` afresh per iteration, so closures made in iteration k
+    // must not see iteration k+1's writes — which is exactly what the ONE
+    // box the wrapper pre-creates would give them.
     expectRefusal(
-      plain([varDecl("c.0", num(1)), exprStmt(awaitCall())], [local("c.0", F64, { boxed: true })]),
+      plain(
+        [
+          {
+            kind: "while",
+            cond: bool(true),
+            body: [varDecl("c.0", num(1)), exprStmt(awaitCall())],
+            loc,
+          },
+        ],
+        [local("c.0", F64, { boxed: true })],
+      ),
+      "fn:async:boxed-in-loop",
+    );
+    // A for-of BINDING is the same story without a varDecl to point at.
+    expectRefusal(
+      plain(
+        [
+          {
+            kind: "forOf",
+            localId: "e.0",
+            iterable: v("xs.0", { kind: "array", elem: F64 }),
+            body: [],
+            loc,
+          },
+          exprStmt(awaitCall()),
+        ],
+        [local("e.0", F64, { boxed: true }), local("xs.0", { kind: "array", elem: F64 })],
+      ),
+      "fn:async:boxed-in-loop",
+    );
+  });
+
+  test("a non-tdz body box captured ahead of its declaration", () => {
+    // Such a closure would read the box's DEFAULT payload where JS says
+    // `undefined`. The frontend never emits the shape (a forward-captured
+    // const becomes a tdz box; a forward-captured var gets its hoisted
+    // `undefined` initializer pushed ahead of the closure), so this is the
+    // structural proof of that rather than a measured rock.
+    expectRefusal(
+      plain(
+        [
+          exprStmt(closureOver("%lam", ["c.0"])),
+          varDecl("c.0", num(1)),
+          exprStmt(awaitCall()),
+        ],
+        [local("c.0", F64, { boxed: true })],
+      ),
+      "fn:async:boxed-forward-capture",
+    );
+  });
+
+  test("a body box with no declaration to fill it", () => {
+    expectRefusal(
+      plain([exprStmt(awaitCall())], [local("c.0", F64, { boxed: true })]),
       "fn:async:boxed-local",
     );
   });
@@ -1060,6 +1117,185 @@ describe("the module-initializer protocol", () => {
       "return",
     ]);
     expect(frameFields(mod, "%init.1")).toEqual(["%state", "%promise", "%l_%depInit.0", "%await1"]);
+  });
+});
+
+/* ── 4c. the boxes a body owns ─────────────────────────────────────────── */
+
+/* A captured (or TDZ) local the body declares cannot ride the frame: two
+ * closures and the resumed frame must see ONE box, and by-value
+ * save/restore would fork it at every suspension. What these pin is the
+ * three-part answer — the wrapper pre-creates the box, resume captures it,
+ * and the declaration becomes the write that fills it in place. */
+describe("body-boxed locals ride resume's environment", () => {
+  const awaitP = () => await_(call("mkp", [], promiseOf(F64)), F64);
+  /** `let n = 0; (closure over n); const a = await mkp(); log(a)`. */
+  const boxedBody = (extra: Partial<IrFunction> = {}, decl: IrStmt = varDecl("n.0", num(0))): IrFunction =>
+    ({
+      name: "f",
+      params: [],
+      returnType: VOID,
+      async: true,
+      locals: [local("n.0", F64, { boxed: true }), local("a.0", F64)],
+      body: [decl, exprStmt(closureOver("%bump", ["n.0"])), varDecl("a.0", awaitP()), log([v("a.0", F64)])],
+      loc,
+      ...extra,
+    }) as IrFunction;
+
+  /** The lifted lambda `%bump` points at — a real function, so the survey
+   * at the end of this block has something to make a funcref of. Its own
+   * `n.0` is the received-capture twin of the body's box. */
+  const bump: IrFunction = {
+    name: "%bump",
+    params: [],
+    returnType: VOID,
+    captures: [{ localId: "n.0", name: "n.0", type: F64 }],
+    locals: [local("n.0", F64, { boxed: true })],
+    body: [assign("n.0", { kind: "bin", op: "+", left: v("n.0", F64), right: num(1), type: F64, loc })],
+    loc,
+  };
+
+  const mod = lowerOne(boxedBody(), [bump]);
+  const wrapper = fnNamed(mod, "f");
+  const resume = fnNamed(mod, "%f.resume");
+
+  test("the wrapper makes the box before it packs the resume closure", () => {
+    expect(wrapper.body.map((s) => s.kind)).toEqual(["%async.boxInit", "varDecl", "exprStmt", "return"]);
+    expect(wrapper.body[0]).toMatchObject({ kind: "%async.boxInit", localId: "n.0" });
+    // The box slot lives in the wrapper, which is what the closure below
+    // reads; the rest of the body's locals still belong to resume alone.
+    expect(wrapper.locals.map((l) => l.id)).toEqual(["n.0", "%async.frame"]);
+    expect(wrapper.locals[0]).toMatchObject({ id: "n.0", boxed: true });
+  });
+
+  test("the kick goes through the closure, whose captures name the box", () => {
+    // A capturing resume can only be reached through its env: the direct
+    // call would hand it the dead ref.null every direct call passes.
+    const kick = wrapper.body[2]!;
+    if (kick.kind !== "exprStmt") throw new Error("unreachable");
+    expect(kick.expr.kind).toBe("callValue");
+    expect((kick.expr as { callee: { captures: string[] } }).callee).toMatchObject({
+      kind: "closure",
+      fnName: "%f.resume",
+      captures: ["n.0"],
+    });
+  });
+
+  test("resume receives the box as a capture, with its boxed local twin", () => {
+    expect(resume.captures).toEqual([{ localId: "n.0", name: "n.0", type: F64 }]);
+    expect(resume.locals.find((l) => l.id === "n.0")).toMatchObject({ boxed: true });
+    // Every suspend re-packs the SAME box, which is what makes the
+    // aliasing survive a suspension.
+    for (const c of nodesOfKind(resume.body, "closure")) {
+      if (c["fnName"] === "%f.resume") expect(c["captures"]).toEqual(["n.0"]);
+    }
+  });
+
+  test("the declaration becomes the write that fills the wrapper's box", () => {
+    // `assign` stores THROUGH the box (storeVar); a `varDecl` would mint a
+    // fresh one and fork the binding the closure already captured.
+    expect(nodesOfKind(resume.body, "varDecl").some((d) => d["localId"] === "n.0")).toBe(false);
+    const fill = nodesOfKind(resume.body, "assign").find((a) => a["localId"] === "n.0");
+    expect(fill).toMatchObject({ kind: "assign", value: { kind: "numLit", value: 0 } });
+  });
+
+  test("the box is NOT in the frame: it is a ref in an env, not a value", () => {
+    expect(frameFields(mod, "f")).toEqual(["%state", "%promise", "%l_a.0", "%await1"]);
+    // ...and so it is neither saved nor restored.
+    expect(nodesOfKind(resume.body, "recordSet").some((r) => r["field"] === "%l_n.0")).toBe(false);
+    expect(nodesOfKind(resume.body, "assign").some((a) => a["localId"] === "n.0" && (a["value"] as { kind: string }).kind === "recordGet")).toBe(false);
+  });
+
+  test("an initializer-free TDZ box lowers: boxInit IS its empty state", () => {
+    // The frontend pre-declares a forward-captured const as `varDecl
+    // init:null, boxed, tdz` and turns the source declaration into an
+    // `assign`. struct.new_default leaves the box's inner slot null, which
+    // is the TDZ sentinel, so the declaration disappears outright and the
+    // source assign is the fill — exactly the sync path's two statements.
+    const tdz = boxedBody(
+      { locals: [local("n.0", F64, { boxed: true, tdz: true }), local("a.0", F64)] },
+      varDecl("n.0", null),
+    );
+    const m = lowerOne({ ...tdz, body: [...tdz.body, assign("n.0", num(7))] });
+    expect(fnNamed(m, "f").body[0]).toMatchObject({ kind: "%async.boxInit", localId: "n.0" });
+    const r = fnNamed(m, "%f.resume");
+    expect(nodesOfKind(r.body, "varDecl").some((d) => d["localId"] === "n.0")).toBe(false);
+    expect(nodesOfKind(r.body, "assign").filter((a) => a["localId"] === "n.0")).toMatchObject([
+      { value: { kind: "numLit", value: 7 } },
+    ]);
+    expect(r.locals.find((l) => l.id === "n.0")).toMatchObject({ boxed: true, tdz: true });
+    expect(frameFields(m, "f")).not.toContain("%l_n.0");
+  });
+
+  test("a boxed PARAM needs no boxInit — the wrapper's prologue boxes it", () => {
+    // The emitter re-boxes every boxed argument into its own slot before
+    // the body runs, so the wrapper already holds the box; it just has to
+    // stay OUT of the frame, whose %l_ slots hold values, not box refs.
+    const fn: IrFunction = {
+      name: "g",
+      params: [{ localId: "ms.0", name: "ms", type: F64 }],
+      returnType: VOID,
+      async: true,
+      locals: [local("ms.0", F64, { boxed: true }), local("a.0", F64)],
+      body: [exprStmt(closureOver("%later", ["ms.0"])), varDecl("a.0", awaitP()), log([v("a.0", F64)])],
+      loc,
+    };
+    const m = lowerOne(fn);
+    const w = fnNamed(m, "g");
+    expect(nodesOfKind(w.body, "%async.boxInit")).toHaveLength(0);
+    expect(fnNamed(m, "%g.resume").captures).toEqual([{ localId: "ms.0", name: "ms.0", type: F64 }]);
+    expect(frameFields(m, "g")).toEqual(["%state", "%promise", "%l_a.0", "%await1"]);
+    // The frame literal stores the arguments it has slots for, and only
+    // those: a boxed param has none.
+    const init = (w.body[0] as Extract<IrStmt, { kind: "varDecl" }>).init!;
+    expect((init as { fields: { name: string }[] }).fields.map((f) => f.name)).toEqual(["%promise"]);
+  });
+
+  test("capture order: received first, then the body's own in locals order", () => {
+    // The env layout is a function of the input alone — resume's prologue
+    // unpacks by INDEX, so anything order-dependent here would be a
+    // mismatched struct field read.
+    const fn: IrFunction = {
+      name: "h",
+      params: [],
+      returnType: VOID,
+      async: true,
+      captures: [
+        { localId: "outerA.0", name: "outerA", type: F64 },
+        { localId: "outerB.0", name: "outerB", type: STRING },
+      ],
+      locals: [
+        local("zed.0", F64, { boxed: true }),
+        local("outerA.0", F64, { boxed: true }),
+        local("outerB.0", STRING, { boxed: true }),
+        local("amy.0", F64, { boxed: true }),
+        local("a.0", F64),
+      ],
+      body: [
+        varDecl("zed.0", num(1)),
+        varDecl("amy.0", num(2)),
+        exprStmt(closureOver("%lam", ["outerA.0", "zed.0", "amy.0", "outerB.0"])),
+        varDecl("a.0", awaitP()),
+        log([v("a.0", F64)]),
+      ],
+      loc,
+    };
+    const m = lowerOne(fn);
+    const ids = ["outerA.0", "outerB.0", "zed.0", "amy.0"];
+    expect(fnNamed(m, "%h.resume").captures!.map((c) => c.localId)).toEqual(ids);
+    // The wrapper's boxInits cover the body's own boxes only (the received
+    // ones arrive through the wrapper's OWN env), in the same order.
+    expect(nodesOfKind(fnNamed(m, "h").body, "%async.boxInit").map((b) => b["localId"])).toEqual([
+      "zed.0",
+      "amy.0",
+    ]);
+    for (const c of nodesOfKind(m, "closure")) {
+      if (c["fnName"] === "%h.resume") expect(c["captures"]).toEqual(ids);
+    }
+  });
+
+  test("the emitter accepts the shape: the survey is clean", () => {
+    expect(surveyWasmModule(asIrModule(mod))).toEqual([]);
   });
 });
 

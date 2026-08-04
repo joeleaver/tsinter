@@ -1967,6 +1967,19 @@ class Assembler {
         return;
       }
 
+      /** A body-boxed local's box, made in the SPAWN WRAPPER so resume can
+       * capture it (statemachine.ts's BOXES THE BODY OWNS). Bit for bit
+       * the initializer-free `varDecl` above — struct.new_default leaves a
+       * ref payload null, which is also the TDZ sentinel — and the body's
+       * declaration is the `assign` that fills it through the box. */
+      case "%async.boxInit": {
+        const local = this.fn.localById.get(s.localId);
+        if (local?.boxed !== true) throw new Error(`%async.boxInit on non-boxed local "${s.localId}"`);
+        code.structNewDefault(this.boxTypeForLocal(local));
+        code.localSet(this.localIndex(s.localId));
+        return;
+      }
+
       /** The loader owns a module evaluation promise: its rejection is the
        * program's root-rejection exit, never an unhandled rejection, so it
        * is observed the moment it exists. */
@@ -2131,6 +2144,7 @@ class Assembler {
       case "%async.rejectCheckUnion":
       case "%async.cacheCheck":
       case "%async.markHandled":
+      case "%async.boxInit":
         break;
       default: {
         const rest: never = s;

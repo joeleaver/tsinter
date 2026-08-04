@@ -411,6 +411,90 @@ test("an awaited value written into an element or a field keeps its order", asyn
   expect(stderr).toBe("");
 });
 
+test("a captured local is ONE box the frame and its closures share", async () => {
+  // THE ALIASING PIN. `n` is a body-declared boxed local: the wrapper
+  // makes its box, resume captures it, and every re-entry unpacks the SAME
+  // one — so a mutation through `bump` is visible to the resumed frame and
+  // the frame's own write is visible to `bump`, across two suspensions and
+  // then from a timer callback that outlives the body entirely.
+  //
+  // "first 0 1" is the 5a rule still holding: the read of `n` is taken
+  // into its hoist temp at its own evaluation position, ahead of the
+  // `bump()` that follows it in the argument list.
+  const path = await build("box-alias.ts", [
+    "async function main(): Promise<void> {",
+    "  let n = 0;",
+    "  const bump = (): number => { n = n + 1; return n; };",
+    "  console.log('enter', n);",
+    "  await Promise.resolve();",
+    "  console.log('first', n, bump());",
+    "  await null;",
+    "  console.log('second', n, bump());",
+    "  n = n + 100;",
+    "  console.log('wrote', n);",
+    "  await Promise.resolve();",
+    "  console.log('third', n, bump());",
+    "  setTimeout(() => { console.log('timer', bump(), n); }, 1);",
+    "}",
+    "main();",
+    "console.log('sync');",
+  ]);
+  const { stdout, stderr } = await runWasm(path);
+  expect(stdout).toBe(
+    ["enter 0", "sync", "first 0 1", "second 1 2", "wrote 102", "third 102 103", "timer 104 104", ""].join("\n"),
+  );
+  expect(stderr).toBe("");
+});
+
+test("the delay idiom inside an async body: a box the executor's timer reads", async () => {
+  // `new Promise(resolve => setTimeout(() => resolve(v), 1))` with `v` a
+  // local of the ASYNC function — the shape the corpus wears everywhere.
+  // `v` is boxed into the wrapper's slot, the executor's nested arrow
+  // captures it, and the timer reads it a whole turn after the body
+  // suspended on the promise it armed.
+  const path = await build("box-delay.ts", [
+    "async function main(): Promise<void> {",
+    "  const v = 'payload';",
+    "  const p = new Promise<string>((resolve) => {",
+    "    setTimeout(() => { resolve(v + '!'); }, 1);",
+    "  });",
+    "  console.log('armed');",
+    "  const got = await p;",
+    "  console.log('got', got, v);",
+    "}",
+    "main();",
+    "console.log('sync');",
+  ]);
+  const { stdout, stderr } = await runWasm(path);
+  expect(stdout).toBe(["armed", "sync", "got payload! payload", ""].join("\n"));
+  expect(stderr).toBe("");
+});
+
+test("two spawned frames get their own box — boxInit runs per wrapper call", async () => {
+  // The box is made in the WRAPPER, so each spawn allocates one; two
+  // in-flight frames interleaving on the same lexical `n` must never see
+  // each other's.
+  const path = await build("box-perframe.ts", [
+    "async function frame(tag: string, start: number): Promise<void> {",
+    "  let n = start;",
+    "  const bump = (): number => { n = n + 1; return n; };",
+    "  console.log(tag, 'enter', bump());",
+    "  await Promise.resolve();",
+    "  console.log(tag, 'mid', bump());",
+    "  await Promise.resolve();",
+    "  console.log(tag, 'exit', n);",
+    "}",
+    "frame('A', 0);",
+    "frame('B', 100);",
+    "console.log('sync');",
+  ]);
+  const { stdout, stderr } = await runWasm(path);
+  expect(stdout).toBe(
+    ["A enter 1", "B enter 101", "sync", "A mid 2", "B mid 102", "A exit 2", "B exit 102", ""].join("\n"),
+  );
+  expect(stderr).toBe("");
+});
+
 test("a module with no promise surface emits no promise runtime", async () => {
   // The laziness contract: everything above is interned on first use, so
   // a program that never mentions a promise must be byte-identical to

@@ -37,6 +37,16 @@ export const hop = (tmpId: string, value: IrExpr): IrExpr => ({
   loc,
 });
 
+/** A `closure` value over a lifted lambda, capturing the named boxed
+ * locals of the creating function (nodes.ts's IrExpr "closure"). */
+export const closureOver = (fnName: string, captures: string[]): IrExpr => ({
+  kind: "closure",
+  fnName,
+  captures,
+  type: { kind: "func", params: [], ret: VOID },
+  loc,
+});
+
 export const varDecl = (localId: string, init: IrExpr | null): IrStmt => ({ kind: "varDecl", localId, init, loc });
 export const assign = (localId: string, value: IrExpr): IrStmt => ({ kind: "assign", localId, value, loc });
 export const exprStmt = (expr: IrExpr): IrStmt => ({ kind: "exprStmt", expr, loc });
