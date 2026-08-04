@@ -67,27 +67,60 @@ function nodesOfKind(root: unknown, kind: string): Record<string, unknown>[] {
   return out;
 }
 
-/** The `while (true) switch (frame.%state)` skeleton, unpacked — past the
- * one-statement cast prologue every resume opens with (its parameter is
- * the SHARED frame base; see frameCastPrologue below). */
-function dispatch(resume: WFunction): { test: number | null; body: IrStmt[] }[] {
+/** The `while (true) tryCatch { switch (frame.%state) }` skeleton,
+ * unpacked — past the one-statement cast prologue every resume opens with
+ * (its parameter is the SHARED frame base; see frameCastPrologue below).
+ * The tryCatch is INSIDE the loop so a caught exception can hand control
+ * back to the dispatch rather than end it. */
+function guard(resume: WFunction): Extract<IrStmt, { kind: "tryCatch" }> {
   expect(resume.body).toHaveLength(2);
-  const tc = resume.body[1]!;
+  const loop = resume.body[1]!;
+  expect(loop.kind).toBe("while");
+  if (loop.kind !== "while") throw new Error("unreachable");
+  expect(loop.labels).toEqual(["%dispatch"]);
+  expect(loop.body).toHaveLength(1);
+  const tc = loop.body[0]!;
   expect(tc.kind).toBe("tryCatch");
   if (tc.kind !== "tryCatch") throw new Error("unreachable");
   expect(tc.finallyBody).toBeNull();
   expect(tc.catchLocalId).toBe("%async.exc");
-  const loop = tc.tryBody[0]!;
-  expect(loop.kind).toBe("while");
-  if (loop.kind !== "while") throw new Error("unreachable");
-  expect(loop.labels).toEqual(["%dispatch"]);
-  const sw = loop.body[0]!;
+  return tc;
+}
+
+function dispatch(resume: WFunction): { test: number | null; body: IrStmt[] }[] {
+  const sw = guard(resume).tryBody[0]!;
   expect(sw.kind).toBe("switch");
   if (sw.kind !== "switch") throw new Error("unreachable");
   return sw.cases.map((c) => ({
     test: c.test === null ? null : (c.test as { value: number }).value,
     body: c.body,
   }));
+}
+
+/** The catch arm's routing table: state number → the statements that run
+ * when an exception reaches resume in that state. `null` is the default
+ * (no region covers the state). Cases with EMPTY bodies fall through to
+ * the next one, which is how states sharing a handler share a body. */
+function routing(resume: WFunction): { test: number | null; body: IrStmt[] }[] {
+  const arm = guard(resume).catchBody!;
+  if (arm[0]?.kind !== "switch") return [{ test: null, body: arm }];
+  expect(arm).toHaveLength(1);
+  const cases = arm[0].cases;
+  return cases.map((c, i) => {
+    let body = c.body;
+    // Fallthrough: an empty case runs the next non-empty one's body.
+    for (let j = i; j < cases.length && body.length === 0; j++) body = cases[j]!.body;
+    return { test: c.test === null ? null : (c.test as { value: number }).value, body };
+  });
+}
+
+/** Where an exception raised in `state` lands: the handler state number
+ * the routing table points %state at, or null when it rejects instead. */
+function handlerOf(resume: WFunction, state: number): number | null {
+  const arm = routing(resume).find((c) => c.test === state) ?? routing(resume).find((c) => c.test === null)!;
+  const set = arm.body.find((s) => s.kind === "recordSet" && s.field === "%state");
+  if (set === undefined) return null;
+  return ((set as Extract<IrStmt, { kind: "recordSet" }>).value as { value: number }).value;
 }
 
 /** True for one statement of the restore prologue every state opens with. */
@@ -199,10 +232,10 @@ describe("two sequential awaits", () => {
     expect(resume.locals.some((l) => l.id === "%async.exc" && l.type.kind === "caught")).toBe(true);
   });
 
-  test("the catch arm rejects the frame's own promise", () => {
-    const tc = resume.body[1]!;
-    if (tc.kind !== "tryCatch") throw new Error("unreachable");
-    expect(tc.catchBody!.map((s) => s.kind)).toEqual(["%async.reject", "return"]);
+  test("with no protected region the catch arm is the reject default alone", () => {
+    // Nothing to route: the arm skips the routing switch entirely.
+    expect(guard(resume).catchBody!.map((s) => s.kind)).toEqual(["%async.reject", "return"]);
+    expect(handlerOf(resume, 0)).toBeNull();
   });
 
   test("the frame carries state, promise, every local and one slot per await", () => {
@@ -473,6 +506,306 @@ test("a return nested in a statement the pass keeps verbatim still settles", () 
   expect(nodesOfKind(resume.body, "%async.settle")).toHaveLength(2);
 });
 
+/* ── 3b. awaits inside try/catch ───────────────────────────────────────── */
+
+/** `try { <tryBody> } catch (<bind>) { <catchBody> }`. */
+function tryCatch(tryBody: IrStmt[], bind: string | null, catchBody: IrStmt[]): IrStmt {
+  return { kind: "tryCatch", tryBody, catchBody, catchLocalId: bind, finallyBody: null, loc };
+}
+
+const awaited = () => await_(call("mkp", [], promiseOf(F64)), F64);
+
+/** The state whose body prints `text` — the marker each fixture below uses
+ * to name a linearized body. Matched on the string LITERAL node, never as
+ * a substring of the JSON: "inner" and "caught" are also IrType keys. */
+function stateLogging(cases: { test: number | null; body: IrStmt[] }[], text: string): number {
+  const hit = cases.filter(
+    (c) => c.test !== null && nodesOfKind(c.body, "strLit").some((n) => n["value"] === text),
+  );
+  expect(hit, `one state prints ${text}`).toHaveLength(1);
+  return hit[0]!.test!;
+}
+
+/** States that jump to `target` — the incoming edges of a join state.
+ * TOP-LEVEL writes only, so a loop head's conditional goto (nested in an
+ * `if`) is deliberately not one of them. */
+function jumpsTo(cases: { test: number | null; body: IrStmt[] }[], target: number): number[] {
+  return cases
+    .filter(
+      (c) =>
+        c.test !== null &&
+        c.test !== target &&
+        c.body.some(
+          (s) => s.kind === "recordSet" && s.field === "%state" && (s.value as { value: number }).value === target,
+        ),
+    )
+    .map((c) => c.test!);
+}
+
+describe("awaits inside try/catch", () => {
+  /* async function t(): Promise<void> {
+   *   try {
+   *     const a = await mkp();
+   *     console.log(a);
+   *     await mkp();
+   *   } catch (e) {
+   *     console.log('caught');
+   *   }
+   *   console.log('after');
+   * }
+   */
+  const t: IrFunction = {
+    name: "t",
+    params: [],
+    returnType: VOID,
+    async: true,
+    locals: [local("a.0", F64), local("e.0", CAUGHT)],
+    body: [
+      tryCatch(
+        [varDecl("a.0", awaited()), log([v("a.0", F64)]), exprStmt(awaited())],
+        "e.0",
+        [log([str("caught")])],
+      ),
+      log([str("after")]),
+    ],
+    loc,
+  };
+  const mod = lowerOne(t);
+  const resume = fnNamed(mod, "%t.resume");
+  const cases = dispatch(resume);
+
+  test("both bodies linearize — the try is gone as a statement", () => {
+    expect(nodesOfKind(dispatch(resume).map((c) => c.body), "tryCatch")).toHaveLength(0);
+    // Two suspensions, so two await slots and two re-entry states.
+    expect(frameFields(mod, "t")).toEqual(["%state", "%promise", "%l_a.0", "%l_e.0", "%await1", "%await2"]);
+    expect(nodesOfKind(resume.body, "%async.subscribe")).toHaveLength(2);
+  });
+
+  test("the state graph is closed and every state ends", () => {
+    const declared = new Set(cases.filter((c) => c.test !== null).map((c) => c.test!));
+    for (const target of stateWrites(resume)) expect(declared).toContain(target);
+    for (const c of cases) {
+      expect(["return", "continue", "break"]).toContain(c.body[c.body.length - 1]!.kind);
+    }
+  });
+
+  test("every try-body state routes to the handler; nothing else does", () => {
+    // The handler is the state the catch body linearized into: the one
+    // holding its console.log.
+    const handler = stateLogging(cases, "caught");
+    const protectedStates = cases
+      .filter((c) => c.test !== null)
+      .map((c) => c.test!)
+      .filter((s) => handlerOf(resume, s) !== null);
+    expect(protectedStates.length).toBeGreaterThan(0);
+    for (const s of protectedStates) expect(handlerOf(resume, s)).toBe(handler);
+    // Both re-entry states (the ones that restore and reject-check) are in
+    // the region: an awaited rejection inside the try IS what must land.
+    const reentries = cases
+      .filter((c) => c.test !== null && c.body.some((s) => s.kind === "%async.rejectCheck"))
+      .map((c) => c.test!);
+    expect(reentries).toHaveLength(2);
+    for (const s of reentries) expect(handlerOf(resume, s)).toBe(handler);
+    // The handler state itself is NOT protected by its own try (JS), and
+    // neither is the entry state or the join the tail runs in.
+    expect(handlerOf(resume, handler)).toBeNull();
+    expect(handlerOf(resume, 0)).toBeNull();
+    expect(handlerOf(resume, stateLogging(cases, "after"))).toBeNull();
+  });
+
+  test("the join state is reached from the try tail AND from the catch tail", () => {
+    // One from the end of the try body, one from the end of the catch body.
+    expect(jumpsTo(cases, stateLogging(cases, "after"))).toHaveLength(2);
+  });
+
+  test("the catch arm writes the binding, THEN saves, THEN points at the handler", () => {
+    const handler = stateLogging(cases, "caught");
+    const arm = routing(resume).find((c) => c.test !== null && handlerOf(resume, c.test) === handler)!.body;
+    expect(arm[0]).toMatchObject({
+      kind: "assign",
+      localId: "e.0",
+      value: { kind: "varRef", localId: "%async.exc" },
+    });
+    const saveAt = arm.findIndex((s) => s.kind === "recordSet" && s.field === "%l_e.0");
+    const stateAt = arm.findIndex((s) => s.kind === "recordSet" && s.field === "%state");
+    expect(saveAt).toBeGreaterThan(0);
+    expect(stateAt).toBeGreaterThan(saveAt);
+    // ...and falls out, so the dispatch loop's next turn is the handler.
+    expect(arm[arm.length - 1]).toMatchObject({ kind: "break" });
+    // The default is still the rejection of this frame's own promise.
+    const def = routing(resume).find((c) => c.test === null)!.body;
+    expect(def.map((s) => s.kind)).toEqual(["%async.reject", "return"]);
+  });
+
+  test("a bindingless `catch {}` writes no binding", () => {
+    const fn: IrFunction = {
+      ...t,
+      name: "tb",
+      locals: [local("a.0", F64)],
+      body: [tryCatch([exprStmt(awaited())], null, [log([str("c")])])],
+    };
+    const r = fnNamed(lowerOne(fn), "%tb.resume");
+    const arm = routing(r).find((c) => c.test !== null)!.body;
+    expect(arm[0]).toMatchObject({ kind: "recordSet" });
+    expect(nodesOfKind(arm, "assign")).toHaveLength(0);
+  });
+});
+
+test("nested trys: the innermost region wins and the outer keeps its own", () => {
+  /* try { await mkp(); try { await mkp(); } catch (i) { log('i') } await mkp(); }
+   * catch (o) { log('o') } */
+  const fn: IrFunction = {
+    name: "n",
+    params: [],
+    returnType: VOID,
+    async: true,
+    locals: [local("i.0", CAUGHT), local("o.0", CAUGHT)],
+    body: [
+      tryCatch(
+        [
+          exprStmt(awaited()),
+          tryCatch([exprStmt(awaited())], "i.0", [log([str("inner")])]),
+          exprStmt(awaited()),
+        ],
+        "o.0",
+        [log([str("outer")])],
+      ),
+    ],
+    loc,
+  };
+  const resume = fnNamed(lowerOne(fn), "%n.resume");
+  const cases = dispatch(resume);
+  const inner = stateLogging(cases, "inner");
+  const outer = stateLogging(cases, "outer");
+  expect(inner).not.toBe(outer);
+  // The three re-entry states, in await order: the first and third are
+  // the OUTER try's, the middle one is the inner try's.
+  const reentries = cases
+    .filter((c) => c.test !== null && c.body.some((s) => s.kind === "%async.rejectCheck"))
+    .map((c) => c.test!)
+    .sort((a, b) => a - b);
+  expect(reentries).toHaveLength(3);
+  const handlers = reentries.map((s) => handlerOf(resume, s));
+  expect(handlers.filter((h) => h === inner)).toHaveLength(1);
+  expect(handlers.filter((h) => h === outer)).toHaveLength(2);
+  // Each catch body is protected by what encloses ITS try: the inner
+  // catch by the outer try, the outer catch by nothing.
+  expect(handlerOf(resume, inner)).toBe(outer);
+  expect(handlerOf(resume, outer)).toBeNull();
+});
+
+test("an await in a CATCH body is protected by the outer region only", () => {
+  /* try { try { await mkp(); } catch (i) { await mkp(); } } catch (o) {} */
+  const fn: IrFunction = {
+    name: "cb",
+    params: [],
+    returnType: VOID,
+    async: true,
+    locals: [local("i.0", CAUGHT), local("o.0", CAUGHT)],
+    body: [
+      tryCatch(
+        [tryCatch([exprStmt(awaited())], "i.0", [exprStmt(awaited()), log([str("recovered")])])],
+        "o.0",
+        [log([str("outer")])],
+      ),
+    ],
+    loc,
+  };
+  const resume = fnNamed(lowerOne(fn), "%cb.resume");
+  const cases = dispatch(resume);
+  const outer = stateLogging(cases, "outer");
+  const recovered = stateLogging(cases, "recovered");
+  // The suspension inside the catch body resumes into a state the OUTER
+  // try covers — the inner catch does not guard itself.
+  expect(handlerOf(resume, recovered)).toBe(outer);
+});
+
+test("a try with no suspension stays verbatim inside a protected state", () => {
+  /* try { await mkp(); try { throw ... } catch (v) { log } } catch (o) {} */
+  const inner = tryCatch([{ kind: "throw", value: v("o.0", CAUGHT), loc }], "v.0", [log([str("v")])]);
+  const fn: IrFunction = {
+    name: "vb",
+    params: [],
+    returnType: VOID,
+    async: true,
+    locals: [local("v.0", CAUGHT), local("o.0", CAUGHT)],
+    body: [tryCatch([exprStmt(awaited()), inner], "o.0", [log([str("outer")])])],
+    loc,
+  };
+  const resume = fnNamed(lowerOne(fn), "%vb.resume");
+  const cases = dispatch(resume);
+  // The inner try survives as ONE statement — the emitter's own tryStack
+  // nests it inside resume's per-iteration handler, innermost first.
+  const kept = nodesOfKind(
+    cases.map((c) => c.body),
+    "tryCatch",
+  );
+  expect(kept).toHaveLength(1);
+  const host = cases.find((c) => c.body.some((s) => s.kind === "tryCatch"))!.test!;
+  const outer = stateLogging(cases, "outer");
+  // ...and the state HOSTING it is still the outer region's, so anything
+  // its own catch body rethrows routes outward.
+  expect(handlerOf(resume, host)).toBe(outer);
+});
+
+test("a rethrow in a lowered catch body routes to the enclosing handler", () => {
+  /* The `.finally` desugar's shape: try { await mkp() } catch (e) { cb();
+   * throw e; } nested inside an outer try. */
+  const fn: IrFunction = {
+    name: "rt",
+    params: [],
+    returnType: VOID,
+    async: true,
+    locals: [local("e.0", CAUGHT), local("o.0", CAUGHT)],
+    body: [
+      tryCatch(
+        [tryCatch([exprStmt(awaited())], "e.0", [log([str("fin")]), { kind: "rethrow", localId: "e.0", loc }])],
+        "o.0",
+        [log([str("outer")])],
+      ),
+    ],
+    loc,
+  };
+  const resume = fnNamed(lowerOne(fn), "%rt.resume");
+  const cases = dispatch(resume);
+  const outer = stateLogging(cases, "outer");
+  const rethrowState = cases.find((c) => c.body.some((s) => s.kind === "rethrow"))!.test!;
+  // The rethrow re-raises into resume's own per-iteration catch, and the
+  // routing table sends it OUTWARD — the inner region is already closed.
+  expect(handlerOf(resume, rethrowState)).toBe(outer);
+});
+
+test("a break out of a protected region is an ordinary state jump", () => {
+  /* while (true) { try { await mkp(); break; } catch (e) { } } */
+  const fn: IrFunction = {
+    name: "br",
+    params: [],
+    returnType: VOID,
+    async: true,
+    locals: [local("e.0", CAUGHT)],
+    body: [
+      {
+        kind: "while",
+        cond: bool(true),
+        body: [tryCatch([exprStmt(awaited()), { kind: "break", loc }], "e.0", [log([str("c")])])],
+        loc,
+      },
+      log([str("out")]),
+    ],
+    loc,
+  };
+  const resume = fnNamed(lowerOne(fn), "%br.resume");
+  const cases = dispatch(resume);
+  const exit = stateLogging(cases, "out");
+  const jumper = cases.find((c) => c.test === jumpsTo(cases, exit)[0])!;
+  // The jump is stateSet + continue like any other, made from a state the
+  // region covers — and the loop's exit state, created before the region
+  // opened, carries no handler at all.
+  expect(jumper.body[jumper.body.length - 1]).toMatchObject({ kind: "continue", label: "%dispatch" });
+  expect(handlerOf(resume, jumper.test!)).not.toBeNull();
+  expect(handlerOf(resume, exit)).toBeNull();
+});
+
 /* ── 4. the refusal set ────────────────────────────────────────────────── */
 
 describe("refusals leave the function untouched", () => {
@@ -487,13 +820,23 @@ describe("refusals leave the function untouched", () => {
     ...extra,
   } as IrFunction);
 
-  test("await inside try/catch", () => {
-    expectRefusal(
-      plain(
-        [{ kind: "tryCatch", tryBody: [exprStmt(awaitCall())], catchBody: [], catchLocalId: null, finallyBody: null, loc }],
-      ),
-      "fn:async:await-in-try",
-    );
+  test("await inside a try that has a FINALLY", () => {
+    // A plain try/catch linearizes (the "awaits inside try/catch" describe
+    // above); a finalizer takes part in completion, which is its own stage.
+    const withFinally = (tryBody: IrStmt[], catchBody: IrStmt[] | null, finallyBody: IrStmt[]): IrStmt => ({
+      kind: "tryCatch",
+      tryBody,
+      catchBody,
+      catchLocalId: null,
+      finallyBody,
+      loc,
+    });
+    // The suspension in each of the three bodies in turn.
+    expectRefusal(plain([withFinally([exprStmt(awaitCall())], [], [log([str("f")])])]), "fn:async:await-in-finally");
+    expectRefusal(plain([withFinally([], [exprStmt(awaitCall())], [log([str("f")])])]), "fn:async:await-in-finally");
+    expectRefusal(plain([withFinally([], [], [exprStmt(awaitCall())])]), "fn:async:await-in-finally");
+    // Catchless try/finally is the same rock under the same name.
+    expectRefusal(plain([withFinally([exprStmt(awaitCall())], null, [log([str("f")])])]), "fn:async:await-in-finally");
   });
 
   test("await under an operator that may not evaluate it", () => {

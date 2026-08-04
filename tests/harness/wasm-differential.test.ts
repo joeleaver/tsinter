@@ -464,6 +464,25 @@ const TIER_FLOOR: string[] = [
   // PARAM shape — no boxInit, since the wrapper's prologue re-boxes every
   // boxed argument on its way in.
   "755-cycle-async-promise.ts",
+
+  // Increment 12 (async), stage 6: awaits inside try/catch. States are
+  // numbered at compile time, so which handler covers which state is a
+  // STATIC map — no try-entry stack in the frame. It compiles into
+  // resume's catch arm, which moved inside the dispatch loop so a caught
+  // exception can hand control back to it (statemachine.ts's TRY/CATCH
+  // section). Both bodies linearize; a catch body is protected by the
+  // OUTER regions only, which is what makes nesting and rethrow work.
+  //
+  // The rejected/fulfilled `await` inside a try, the throw after it, and a
+  // `return await` under the same handler.
+  "1027-async-return-promise.ts",
+  // The `.catch(h)` and `.finally(f)` desugars, which ARE this shape: a
+  // lifted async function whose whole body is try/catch around one await,
+  // `.finally`'s catch body ending in the rethrow that passes the
+  // rejection on.
+  "1429-promise-catch-finally.ts",
+  // The `.then(onFulfilled, onRejected)` family beside them.
+  "1561-promise-then.ts",
 ];
 
 interface RunResult {

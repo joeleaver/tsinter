@@ -191,8 +191,73 @@
  * v)` + `return`, wherever it appears (returns inside statements the pass
  * keeps VERBATIM are rewritten in place). A synchronous throw anywhere in
  * the body has to become a rejection instead of unwinding into the
- * caller, which is what resume's one top-level tryCatch is for: its catch
- * arm is `%async.reject(frame.%promise, e)` + `return`.
+ * caller, which is what resume's one tryCatch is for.
+ *
+ * TRY/CATCH ACROSS A SUSPENSION — AND WHY THE FRAME NEEDS NOTHING FOR IT.
+ * regenerator carries an explicit try-entry STACK in the generator object,
+ * pushed and popped at runtime, because it re-derives the handler from the
+ * program counter at throw time. This pass does not need one: the states
+ * are numbered AT COMPILE TIME, so "which handler covers this state" is a
+ * static map, and the map compiles into the catch arm as an ordinary
+ * dispatch. Nothing about a region survives into the frame — no push, no
+ * pop, no depth counter, nothing to save or restore.
+ *
+ * That map is what decides resume's skeleton. The tryCatch moves INSIDE
+ * the dispatch loop, so the loop can keep running after it fires:
+ *
+ *     while (%dispatch) {
+ *       tryCatch {
+ *         switch (frame.%state) { ...the states... }
+ *       } catch (%async.exc) {
+ *         switch (frame.%state) {           // the STATIC routing table
+ *           case <a state in a protected region>:
+ *             <that region's catch binding> = %async.exc;
+ *             <save every local>;           // binding first — see below
+ *             frame.%state = <that region's handler state>;
+ *             break;                        // fall out; the loop re-dispatches
+ *           default:                        // no region covers this state
+ *             %async.reject(frame.%promise, %async.exc);
+ *             return;
+ *         }
+ *       }
+ *     }
+ *
+ * The restructure is UNIFORM — a function with no try at all gets the same
+ * skeleton, its catch arm being the reject default alone — because a
+ * second shape would be a second thing to reason about for no gain.
+ *
+ * A try/catch some suspension crosses LINEARIZES: the try body becomes
+ * states, the catch body becomes states, and both meet at a join state.
+ * The region stack is open only while the TRY body is lowered, so every
+ * state created there — including states from nested constructs the pass
+ * explodes — maps to that try's handler, and the catch body's states map
+ * to whatever encloses the statement instead (a catch body is not
+ * protected by its own try). Nested trys nest, innermost wins, for free.
+ *
+ * TWO ORDERING FACTS, both load-bearing:
+ *
+ *   - The try body opens a state of its OWN. `cur` may already hold the
+ *     statements that ran BEFORE the try, and those are not protected;
+ *     a state's handler is fixed when the state is created, so the region
+ *     can only start at a state boundary.
+ *   - The catch arm writes the BINDING before it saves. The arm is reached
+ *     by a BRANCH, never a re-entry, so every wasm local is still live and
+ *     current — a mid-state throw never left resume, and on the
+ *     rejectCheck path the re-entry's restores have already run — which is
+ *     why the handler state needs no restore prologue and reads the locals
+ *     directly. The saves are what keep the frame current at the state
+ *     boundary anyway; writing the binding first is what makes the slot
+ *     and the local agree rather than disagree.
+ *
+ * `rethrow` inside a lowered catch body needs no special case: it refills
+ * the cell from the caught snapshot and unwinds into the SAME per-iteration
+ * catch, whose table routes it to the enclosing handler — or to the reject
+ * default, which is the rejection the `.finally` desugar wants.
+ *
+ * A break or continue LEAVING a protected region is a plain state jump.
+ * With no finalizer there is nothing to run on the way out, and the target
+ * state was created before the region opened, so it already carries the
+ * outer handler.
  *
  * THE ONE AWAIT THAT DOES NOT HOP. `module.await` is ECMAScript's INTERNAL
  * module-dependency wait (the frontend emits it for an import edge inside
@@ -247,11 +312,15 @@
  *     its dependency operand, never the wait itself. The frontend emits
  *     exactly the statement shape, and the two names are kept apart so
  *     the census keeps naming the construct that actually needs work.
- *   - `fn:async:await-in-try` — an await inside try/catch/finally. The
- *     handler stack has to become frame state that survives suspension
- *     (regenerator carries an explicit try-entry stack), and it has to
- *     agree with the forward-only block shape and finallyStack the
- *     exception protocol emits today.
+ *   - `fn:async:await-in-finally` — a suspension anywhere inside a
+ *     try/catch/FINALLY. A finalizer takes part in COMPLETION: a return, a
+ *     break and plain fallthrough each have to run it before they leave,
+ *     which the emitter does with three copies of the body and a
+ *     pending-return path (finallyStack) — and across a suspension those
+ *     copies are states that have to re-dispatch to different places
+ *     depending on why the region was left. Real machinery, and its own
+ *     stage; a plain try/catch needs none of it, which is why the two are
+ *     told apart by name.
  *   - `fn:async:await-position` — an await in a slot the hoisting rewrite
  *     cannot move it out of: a loop or for header (hoisting would
  *     evaluate once what the loop evaluates per iteration), a statement
@@ -266,11 +335,13 @@
  *     position where hoisting is a MISCOMPILE rather than a cost; making
  *     it a name of its own is what lets the census measure the
  *     conditional-await shapes on their own.
- *   - `fn:async:hoist-void` — a hoist whose temp would be void-typed (a
- *     void subexpression ahead of a suspension in the same operand list;
- *     the frame has no slot for it, and the operand position it came from
- *     needs SOME expression back). Unreachable from today's frontend —
- *     void operands only appear as a recordLit `drop` field.
+ *   - `fn:async:hoist-void` — a hoist whose temp would be void-typed: the
+ *     frame has no slot for one, and the operand position it came from
+ *     still needs SOME expression back. The reachable shape is a recordLit
+ *     `drop` field holding a void await (`{ status, value: await f() }`
+ *     where the checker dropped `value`) inside a statement that cannot
+ *     host a split — one corpus program, and the fix is a way to run a
+ *     suspension for its effect alone rather than a wider hoist.
  *   - `fn:async:await-dyn` — `await` of a checked-dynamic value
  *     (`async.awaitDyn`): the runtime decides between adoption and the
  *     one-hop non-thenable path, which needs the dyn surface.
@@ -285,10 +356,12 @@
  *     free: for-of hides an index and a per-iteration binding, switch
  *     hides lazy test evaluation and fallthrough.
  *   - `fn:async:jump-out-of-<kind>` — a break/continue that leaves a
- *     construct this pass keeps verbatim (a for-of, switch or try) for a
- *     construct it exploded. Keeping the jump would retarget it at the
- *     dispatch switch; exploding the container is the same work as the
- *     two entries above.
+ *     construct this pass keeps verbatim (a for-of, a switch, or a try
+ *     with a finalizer) for a construct it exploded. Keeping the jump
+ *     would retarget it at the dispatch switch; exploding the container
+ *     is the same work as the two entries above. A plain try/catch is no
+ *     longer in that set — it linearizes, and a jump out of one leaves
+ *     nothing to run.
  *   - `fn:async:boxed-in-loop` — a body-boxed local whose declaration can
  *     run more than once: inside a loop, in a `for` header, or as a
  *     for-of binding. JS gives each execution a FRESH binding (the
@@ -955,6 +1028,16 @@ class FunctionLowering {
   private readonly frameFields: { name: string; type: IrType }[] = [];
   /** Dispatch states, each a stmt list that must end in a terminator. */
   private readonly states: WStmt[][] = [];
+  /** Parallel to `states`: the handler state of the innermost protected
+   * region each one was created inside, or -1 for none. A state's handler
+   * is fixed by WHERE IT WAS CREATED, which is the whole reason the frame
+   * needs no try-entry stack (see the header). */
+  private readonly handlerOf: number[] = [];
+  /** Protected regions open during linearization, innermost last. */
+  private readonly regions: { handler: number }[] = [];
+  /** Each region's catch binding, by handler state — recorded when the
+   * region opens, read when the catch arm's routing table is built. */
+  private readonly catchBindings = new Map<number, string | null>();
   /** Exploded break/continue targets, innermost last. */
   private readonly jumps: (JumpScope & { breakState: number; continueState: number | null })[] = [];
   private awaitSites = 0;
@@ -1231,10 +1314,19 @@ class FunctionLowering {
         // binding an init hoist would move out of the loop's scope.
         out.push({ ...s, body: this.hoistList(s.body) });
         break;
+      case "tryCatch":
+        // A try WITH a finalizer comes back untouched, so checkPositions
+        // gets to name it `await-in-finally` rather than whatever position
+        // the hoist walk would have refused inside it first.
+        if (s.finallyBody !== null || s.catchBody === null) {
+          out.push(s);
+          break;
+        }
+        out.push({ ...s, tryBody: this.hoistList(s.tryBody), catchBody: this.hoistList(s.catchBody) });
+        break;
       default:
-        // forOf / switch / tryCatch — suspensions inside them are their own
-        // refusals, and every other kind holds no expression that can
-        // suspend.
+        // forOf / switch — suspensions inside them are their own refusals,
+        // and every other kind holds no expression that can suspend.
         out.push(s);
         break;
     }
@@ -1373,7 +1465,16 @@ class FunctionLowering {
           if (hasSuspension(s)) this.decline("fn:async:await-in-switch");
           break;
         case "tryCatch":
-          if (hasSuspension(s)) this.decline("fn:async:await-in-try");
+          if (s.finallyBody !== null || s.catchBody === null) {
+            // A finalizer is completion machinery, not a handler (the
+            // header's refusal list). A catchless try always has one, so
+            // the name stays accurate for every shape that reaches here.
+            if (hasSuspension(s)) this.decline("fn:async:await-in-finally");
+            break;
+          }
+          // Both bodies linearize, so both are checked like any list.
+          this.checkPositions(s.tryBody);
+          this.checkPositions(s.catchBody);
           break;
         default:
           this.checkClean(s);
@@ -1545,6 +1646,7 @@ class FunctionLowering {
 
   private newState(): number {
     this.states.push([]);
+    this.handlerOf.push(this.regions[this.regions.length - 1]?.handler ?? -1);
     return this.states.length - 1;
   }
 
@@ -1604,9 +1706,11 @@ class FunctionLowering {
         return this.lowerFor(s, cur);
       case "block":
         return this.lowerBlock(s, cur);
+      case "tryCatch":
+        return this.lowerTry(s, cur);
       default:
         // A construct with a jump out of it that the pass cannot explode
-        // (for-of, switch, try); suspensions inside these already refused
+        // (for-of, switch); suspensions inside these already refused
         // during the eligibility scan.
         return this.decline(`fn:async:jump-out-of-${s.kind.toLowerCase()}`);
     }
@@ -1883,6 +1987,36 @@ class FunctionLowering {
     return exitS;
   }
 
+  /** A try/catch a suspension crosses (or a jump leaves). Both bodies
+   * linearize; what makes an exception ROUTE is the region stack, open
+   * only while the try body is lowered — see the header's TRY/CATCH
+   * section for why that is the whole mechanism. */
+  private lowerTry(s: Extract<IrStmt, { kind: "tryCatch" }>, cur: number): number | null {
+    if (s.finallyBody !== null || s.catchBody === null) {
+      // checkPositions refused every SUSPENDING try with a finalizer, so
+      // reaching here is a break/continue leaving one — and that jump has
+      // to run the finalizer on its way out, which is the same work.
+      this.decline("fn:async:jump-out-of-trycatch");
+    }
+    // Created with the region still CLOSED: the catch body is not
+    // protected by its own try, and the join is past the region entirely.
+    const handlerState = this.newState();
+    const joinState = this.newState();
+    this.catchBindings.set(handlerState, s.catchLocalId);
+    this.regions.push({ handler: handlerState });
+    // The try body opens a state of its own — `cur` may already hold the
+    // statements that ran before the try, which this handler must not
+    // cover (the header's first ordering fact).
+    const bodyState = this.newState();
+    this.emit(cur, ...this.goto(bodyState));
+    const tried = this.lowerList(s.tryBody, bodyState);
+    this.regions.pop();
+    if (tried !== null) this.emit(tried, ...this.goto(joinState));
+    const caught = this.lowerList(s.catchBody, handlerState);
+    if (caught !== null) this.emit(caught, ...this.goto(joinState));
+    return joinState;
+  }
+
   private lowerBlock(s: Extract<IrStmt, { kind: "block" }>, cur: number): number {
     const bodyS = this.newState();
     const exitS = this.newState();
@@ -1902,6 +2036,60 @@ class FunctionLowering {
 
   /* ── the two emitted functions ───────────────────────────────────────── */
 
+  /** resume's catch arm: the STATIC routing table (the header's TRY/CATCH
+   * section). A state inside a protected region fills that region's catch
+   * binding, mirrors the live locals into the frame, points `%state` at
+   * the handler and falls out — the dispatch loop's next turn is the catch
+   * body. Every other state rejects this frame's own promise and leaves,
+   * which in a function with no protected region at all is the whole arm.
+   *
+   * States sharing a handler share ONE case body: the cases ahead of it
+   * have EMPTY bodies and fall through, exactly as a body-less case does
+   * in the switch this pass's own dispatch already relies on. */
+  private catchArm(): WStmt[] {
+    const excRef: WExpr = { kind: "varRef", localId: EXC_LOCAL, type: CAUGHT, loc: this.loc };
+    const reject: WStmt[] = [
+      {
+        kind: "%async.reject",
+        promise: this.get(PROMISE_FIELD, this.promiseType),
+        caught: excRef,
+        loc: this.loc,
+      },
+      this.ret(),
+    ];
+    const byHandler = new Map<number, number[]>();
+    this.handlerOf.forEach((handler, state) => {
+      if (handler < 0) return;
+      const group = byHandler.get(handler);
+      if (group === undefined) byHandler.set(handler, [state]);
+      else group.push(state);
+    });
+    if (byHandler.size === 0) return reject;
+
+    const cases: { test: IrExpr | null; body: IrStmt[] }[] = [];
+    for (const handler of [...byHandler.keys()].sort((a, b) => a - b)) {
+      const states = byHandler.get(handler)!;
+      const binding = this.catchBindings.get(handler) ?? null;
+      // The binding is written BEFORE the saves so the frame slot and the
+      // wasm local agree about the caught value (the header's second
+      // ordering fact). A bindingless `catch {}` has nothing to write.
+      const body: WStmt[] = [
+        ...(binding === null
+          ? []
+          : [{ kind: "assign" as const, localId: binding, value: widenExpr(excRef), loc: this.loc }]),
+        ...this.saves(),
+        this.set(STATE_FIELD, this.num(handler)),
+        // Out of the switch, out of the catch, and the loop re-dispatches.
+        { kind: "break" as const, loc: this.loc },
+      ];
+      states.forEach((state, i) => {
+        cases.push({ test: this.num(state), body: widenBody(i === states.length - 1 ? body : []) });
+      });
+    }
+    cases.push({ test: null, body: widenBody(reject) });
+    return [{ kind: "switch", disc: widenExpr(this.get(STATE_FIELD, F64)), cases, loc: this.loc }];
+  }
+
   private buildResume(): WFunction {
     const frameAnyLocal: IrLocal = {
       id: FRAME_ANY_LOCAL,
@@ -1912,31 +2100,41 @@ class FunctionLowering {
     const frameLocal: IrLocal = { id: FRAME_LOCAL, name: FRAME_LOCAL, type: this.frameType, mutable: false };
     const excLocal: IrLocal = { id: EXC_LOCAL, name: EXC_LOCAL, type: CAUGHT, mutable: false };
     const param: IrParam = { localId: FRAME_ANY_LOCAL, name: FRAME_ANY_LOCAL, type: widenType(FRAME_BASE) };
+    const states: WStmt = {
+      kind: "switch",
+      disc: widenExpr(this.get(STATE_FIELD, F64)),
+      cases: [
+        ...this.states.map((body, i) => ({ test: this.num(i), body: widenBody(body) })),
+        // Unreachable: this pass is the only writer of %state, and the
+        // default's job is to keep the switch total.
+        { test: null, body: widenBody([this.ret()]) },
+      ],
+      loc: this.loc,
+    };
+    // The one tryCatch is load-bearing three times: a synchronous throw in
+    // the body becomes this frame's REJECTION rather than unwinding into
+    // whoever pumped the microtask, the awaited-rejection re-throw
+    // (%async.rejectCheck) lands here too, and its arm is the routing
+    // table for every protected state.
+    //
+    // It sits INSIDE the loop, not around it, so an exception a region
+    // catches can hand control back to the dispatch instead of ending it.
+    const guarded: WStmt = {
+      kind: "tryCatch",
+      tryBody: widenBody([states]),
+      catchBody: widenBody(this.catchArm()),
+      catchLocalId: EXC_LOCAL,
+      finallyBody: null,
+      loc: this.loc,
+    };
     const dispatch: WStmt = {
       kind: "while",
       cond: { kind: "boolLit", value: true, type: BOOL, loc: this.loc },
-      body: widenBody([
-        {
-          kind: "switch",
-          disc: widenExpr(this.get(STATE_FIELD, F64)),
-          cases: [
-            ...this.states.map((body, i) => ({ test: this.num(i), body: widenBody(body) })),
-            // Unreachable: this pass is the only writer of %state, and
-            // the default's job is to keep the switch total.
-            { test: null, body: widenBody([this.ret()]) },
-          ],
-          loc: this.loc,
-        },
-      ]),
+      body: widenBody([guarded]),
       labels: [DISPATCH_LABEL],
       loc: this.loc,
     };
-    // The one tryCatch is load-bearing twice: a synchronous throw in the
-    // body becomes this frame's REJECTION rather than unwinding into
-    // whoever pumped the microtask, and the awaited-rejection re-throw
-    // (%async.rejectCheck) lands here too.
-    //
-    // The cast prologue sits OUTSIDE it: narrowing the parameter cannot
+    // The cast prologue sits outside both: narrowing the parameter cannot
     // fail (the runtime hands back the frame this function parked), and
     // inside the try it would be one more statement between every state
     // and its handler for no gain.
@@ -1952,22 +2150,7 @@ class FunctionLowering {
         }),
         loc: this.loc,
       },
-      {
-        kind: "tryCatch",
-        tryBody: widenBody([dispatch]),
-        catchBody: widenBody([
-          {
-            kind: "%async.reject",
-            promise: this.get(PROMISE_FIELD, this.promiseType),
-            caught: { kind: "varRef", localId: EXC_LOCAL, type: CAUGHT, loc: this.loc },
-            loc: this.loc,
-          },
-          this.ret(),
-        ]),
-        catchLocalId: EXC_LOCAL,
-        finallyBody: null,
-        loc: this.loc,
-      },
+      dispatch,
     ];
     const caps = this.resumeCaptures();
     return {

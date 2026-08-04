@@ -161,8 +161,7 @@ test("a throw after an await rejects the caller's promise, unhandled", async () 
 
 test("a caught rejection is not unhandled: no report, exit 0", async () => {
   // `await`ing a rejected promise OBSERVES it — the awaiting frame is
-  // about to re-throw, so the ledger walk must skip it. (The catch is in
-  // a SYNC function: await-in-try is its own increment.)
+  // about to re-throw, so the ledger walk must skip it.
   const path = await build("observed.ts", [
     "function trip(): number {",
     "  throw new Error('tripped');",
@@ -492,6 +491,259 @@ test("two spawned frames get their own box — boxInit runs per wrapper call", a
   expect(stdout).toBe(
     ["A enter 1", "B enter 101", "sync", "A mid 2", "B mid 102", "A exit 2", "B exit 102", ""].join("\n"),
   );
+  expect(stderr).toBe("");
+});
+
+/* ── awaits inside try/catch (the static routing table) ────────────────── */
+
+test("an awaited rejection lands in the catch, and the body keeps going", async () => {
+  // The whole shape at once: the re-entry check unwinds into resume's own
+  // per-iteration catch, the routing table sends it to the handler state
+  // instead of rejecting, the catch body runs, and control REJOINS the
+  // body afterwards — including a later await outside the region, which
+  // proves the region exit is clean.
+  const path = await build("try-await.ts", [
+    "async function boom(): Promise<number> {",
+    "  console.log('boom enters');",
+    "  await Promise.resolve();",
+    "  throw new Error('bang');",
+    "}",
+    "async function main(): Promise<void> {",
+    "  try {",
+    "    const n = await boom();",
+    "    console.log('never', n);",
+    "  } catch (e) {",
+    "    if (e instanceof Error) console.log('caught:', e.message);",
+    "  }",
+    "  console.log('region exited');",
+    "  const later = await Promise.resolve(7);",
+    "  console.log('later await still works:', later);",
+    "}",
+    "main().then(() => console.log('fulfilled'));",
+    "console.log('sync');",
+  ]);
+  const { stdout, stderr } = await runWasm(path);
+  expect(stdout).toBe(
+    [
+      "boom enters",
+      "sync",
+      "caught: bang",
+      "region exited",
+      "later await still works: 7",
+      // Nothing was left pending: main's own promise FULFILLED.
+      "fulfilled",
+      "",
+    ].join("\n"),
+  );
+  expect(stderr).toBe("");
+});
+
+test("a sync throw after an await hits the same handler, and the catch may await", async () => {
+  // Two halves of the same region. The throw happens MID-STATE with the
+  // locals live; the catch body then suspends, so the handler's own states
+  // have to be ordinary re-entry states like any other.
+  const path = await build("try-sync-throw.ts", [
+    "async function main(): Promise<void> {",
+    "  try {",
+    "    const a = await Promise.resolve(1);",
+    "    console.log('got', a);",
+    "    throw new Error('sync-after-await');",
+    "  } catch (e) {",
+    "    if (e instanceof Error) console.log('caught:', e.message);",
+    "    const b = await Promise.resolve(2);",
+    "    console.log('await inside catch:', b);",
+    "  }",
+    "  console.log('done');",
+    "}",
+    "main();",
+    "console.log('sync');",
+  ]);
+  const { stdout, stderr } = await runWasm(path);
+  expect(stdout).toBe(["sync", "got 1", "caught: sync-after-await", "await inside catch: 2", "done", ""].join("\n"));
+  expect(stderr).toBe("");
+});
+
+test("a catch that RETHROWS rejects the frame's own promise", async () => {
+  // The rethrow refills the exception cell from the caught snapshot and
+  // unwinds into the SAME per-iteration catch — where the routing table,
+  // the inner region having closed, finds no handler and takes the reject
+  // default. Nobody observes main's promise, so it is the quiescent
+  // report (S010) and the trap that IS exit 1.
+  const path = await build("try-rethrow.ts", [
+    "async function inner(): Promise<void> {",
+    "  try {",
+    "    await Promise.reject(new Error('inner-boom'));",
+    "    console.log('never');",
+    "  } catch (e) {",
+    "    console.log('rethrowing');",
+    "    throw e;",
+    "  }",
+    "}",
+    "async function main(): Promise<void> {",
+    "  await inner();",
+    "  console.log('never either');",
+    "}",
+    "main();",
+    "console.log('top');",
+  ]);
+  const { stdout, stderr } = await runWasmToTrap(path);
+  expect(stdout).toBe(["top", "rethrowing", ""].join("\n"));
+  expect(stderr).toBe("Unhandled promise rejection: Error: inner-boom\n");
+});
+
+test("nested regions: the inner catch handles, the outer never fires", async () => {
+  // Then the mirror image — an inner catch that throws AGAIN, which the
+  // outer region has to take, because a catch body is not protected by
+  // its own try.
+  const path = await build("try-nested.ts", [
+    "async function main(): Promise<void> {",
+    "  try {",
+    "    try {",
+    "      await Promise.reject(new Error('deep'));",
+    "    } catch (e) {",
+    "      if (e instanceof Error) console.log('inner caught:', e.message);",
+    "    }",
+    "    console.log('inner region done');",
+    "    try {",
+    "      await Promise.resolve(1);",
+    "      throw new Error('from-inner-try');",
+    "    } catch (e) {",
+    "      if (e instanceof Error) console.log('inner2:', e.message);",
+    "      throw new Error('from-inner-catch');",
+    "    }",
+    "  } catch (e) {",
+    "    if (e instanceof Error) console.log('outer:', e.message);",
+    "  }",
+    "  console.log('done');",
+    "}",
+    "main();",
+    "console.log('sync');",
+  ]);
+  const { stdout, stderr } = await runWasm(path);
+  expect(stdout).toBe(
+    ["sync", "inner caught: deep", "inner region done", "inner2: from-inner-try", "outer: from-inner-catch", "done", ""].join("\n"),
+  );
+  expect(stderr).toBe("");
+});
+
+test("the .catch and .finally desugars ride the same machinery", async () => {
+  // Both lower to a lifted ASYNC function whose whole body is one
+  // try/catch around `await p` — `.catch`'s catch body IS the handler,
+  // and `.finally`'s ends in the rethrow that passes the rejection on.
+  const path = await build("try-desugars.ts", [
+    "function failing(msg: string): Promise<string> {",
+    "  return new Promise<string>(() => {",
+    "    throw new Error(msg);",
+    "  });",
+    "}",
+    "async function main(): Promise<void> {",
+    "  const a = await Promise.resolve('ok').catch(() => 'fallback');",
+    "  console.log('a:', a);",
+    "  const b = await failing('boom').catch((e) => {",
+    "    if (e instanceof Error) return 'caught:' + e.message;",
+    "    return 'caught:non-error';",
+    "  });",
+    "  console.log('b:', b);",
+    "  const d = await Promise.resolve('val').finally(() => console.log('fin-1'));",
+    "  console.log('d:', d);",
+    "  try {",
+    "    await failing('efail').finally(() => console.log('fin-2'));",
+    "  } catch (e) {",
+    "    if (e instanceof Error) console.log('e:', e.message);",
+    "  }",
+    "}",
+    "main();",
+    "console.log('top');",
+  ]);
+  const { stdout, stderr } = await runWasm(path);
+  expect(stdout).toBe(
+    ["top", "a: ok", "b: caught:boom", "fin-1", "d: val", "fin-2", "e: efail", ""].join("\n"),
+  );
+  expect(stderr).toBe("");
+});
+
+test("break and continue leave a protected region, and a verbatim try nests inside one", async () => {
+  // Two edges in one program. The jumps out of the try are plain state
+  // transitions (no finalizer means nothing runs on the way out) landing
+  // on states the loop created BEFORE the region opened; and the
+  // suspension-free inner try stays one statement, so the emitter's own
+  // tryStack handles it — innermost first, with the region's handler
+  // still underneath for what its catch body throws.
+  const path = await build("try-jumps.ts", [
+    "async function main(): Promise<void> {",
+    "  let total = 0;",
+    "  for (let i = 0; i < 4; i = i + 1) {",
+    "    try {",
+    "      const v = await Promise.resolve(i);",
+    "      if (v === 2) { console.log('break at', v); break; }",
+    "      if (v === 1) { console.log('continue at', v); continue; }",
+    "      total = total + 10;",
+    "      throw new Error('iter ' + v);",
+    "    } catch (e) {",
+    "      if (e instanceof Error) console.log('caught:', e.message);",
+    "    }",
+    "    console.log('tail', i);",
+    "  }",
+    "  console.log('total', total);",
+    "  try {",
+    "    await Promise.resolve();",
+    "    try {",
+    "      throw new Error('inner-verbatim');",
+    "    } catch (e) {",
+    "      if (e instanceof Error) console.log('verbatim:', e.message);",
+    "    }",
+    "    throw new Error('after-verbatim');",
+    "  } catch (e) {",
+    "    if (e instanceof Error) console.log('outer:', e.message);",
+    "  }",
+    "  console.log('end');",
+    "}",
+    "main();",
+    "console.log('sync');",
+  ]);
+  const { stdout, stderr } = await runWasm(path);
+  expect(stdout).toBe(
+    [
+      "sync",
+      "caught: iter 0",
+      "tail 0",
+      "continue at 1",
+      "break at 2",
+      "total 10",
+      "verbatim: inner-verbatim",
+      "outer: after-verbatim",
+      "end",
+      "",
+    ].join("\n"),
+  );
+  expect(stderr).toBe("");
+});
+
+test("a body box and a protected region share one function", async () => {
+  // Stage 5b meets stage 6: `n` is a body-owned box (it rides resume's
+  // closure env, NOT the frame), the catch arm's saves cover the frame
+  // locals only, and the handler state reads the box through the same
+  // ref every closure holds — before, inside and after the region.
+  const path = await build("try-box.ts", [
+    "async function main(): Promise<void> {",
+    "  let n = 0;",
+    "  const bump = (): number => { n = n + 1; return n; };",
+    "  try {",
+    "    console.log('enter', bump());",
+    "    await Promise.reject(new Error('x'));",
+    "    console.log('never');",
+    "  } catch (e) {",
+    "    if (e instanceof Error) console.log('caught', e.message, bump());",
+    "  }",
+    "  console.log('after', n, bump());",
+    "  await Promise.resolve();",
+    "  console.log('end', n);",
+    "}",
+    "main();",
+    "console.log('sync');",
+  ]);
+  const { stdout, stderr } = await runWasm(path);
+  expect(stdout).toBe(["enter 1", "sync", "caught x 2", "after 2 3", "end 3", ""].join("\n"));
   expect(stderr).toBe("");
 });
 
