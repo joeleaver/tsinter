@@ -473,6 +473,73 @@ test("S009: `as` on an unknown value validates, and the failure names the path",
   );
 });
 
+test("S009: a composite `as` names the PATH it failed at", async () => {
+  // Same no-oracle situation as the scalar case, one layer down: Node
+  // erases the cast entirely, so only the C emitter's texts can be the
+  // contract. What is worth pinning here is the PATH grammar — `$` at the
+  // root, `.key` per object step, `[i]` per array step — because it is
+  // built from heap nodes threaded through the walkers, and a wrong
+  // parent link produces a plausible-looking but wrong path. Verified
+  // against a C-lane build of this same program.
+  const res = await buildWasm(
+    "dyn-check-path.ts",
+    [
+      "type Item = { name: string; price: number };",
+      "type Order = { id: string; items: Item[] };",
+      "function toU(o: unknown): unknown { return o; }",
+      "function asOrder(u: unknown): Order { return u as Order; }",
+      "function msg(build: () => void): void {",
+      "  try { build(); console.log('no throw'); }",
+      "  catch (e) { if (e instanceof TypeError) console.log(e.message); else console.log('other'); }",
+      "}",
+      "const good: Order = { id: 'o1', items: [{ name: 'a', price: 1 }] };",
+      "console.log(asOrder(toU(good)).items[0].price);",
+      "type BadA = { id: string; items: { name: string; price: string }[] };",
+      "msg(() => { asOrder(toU({ id: 'o2', items: [{ name: 'a', price: 'x' }] } as BadA)); });",
+      "type BadB = { id: string; items: { name: string }[] };",
+      "msg(() => { asOrder(toU({ id: 'o3', items: [{ name: 'a' }] } as BadB)); });",
+      "msg(() => { asOrder(toU('nope')); });",
+      "type BadC = { id: string; items: number };",
+      "msg(() => { asOrder(toU({ id: 'o4', items: 3 } as BadC)); });",
+      "type Pair = [string, number];",
+      "function asPair(u: unknown): Pair { return u as Pair; }",
+      "msg(() => { asPair(toU(['a', 1, 2] as [string, number, number])); });",
+      "msg(() => { asPair(toU(['a', 'b'] as [string, string])); });",
+      // Two bad fields at once: WHICH one the message names is the
+      // check walker's iteration order, and it must be the shape's
+      // CANONICAL (sorted) order — what the C and LLVM walkers use — not
+      // the declared spelling. Declared order here is z, a; canonical is
+      // a, z, so the answer is "$.a". Iterating declared order made this
+      // lane name a different field than the native ones.
+      "type Ord = { z: number; a: number };",
+      "function asOrd(u: unknown): Ord { return u as Ord; }",
+      "msg(() => { asOrd(toU({ z: 'bad', a: 'bad' })); });",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "1",
+      "expected number at $.items[0].price, got string",
+      // A MISSING key reports exactly like a present one holding
+      // undefined — the walker passes a null `got` and kindName's null
+      // arm answers "undefined".
+      "expected number at $.items[0].price, got undefined",
+      "expected object at $, got string",
+      "expected array at $.items, got number",
+      // Arity failures carry their own message: the element type is not
+      // what went wrong.
+      "expected array of length 2 at $, got array",
+      "expected number at $[1], got string",
+      "expected number at $.a, got string",
+      "",
+    ].join("\n"),
+  );
+});
+
 test("dyn: ToBoolean over every constructible kind", async () => {
   // The truthiness ladder (scr_dyn_truthy) reached the only way a source
   // can reach it — a JS-lane implicit-any binding in a condition, since
@@ -491,6 +558,77 @@ test("dyn: ToBoolean over every constructible kind", async () => {
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
   const { stdout } = await runWasm(res.binaryPath);
   expect(stdout.toString("utf8")).toBe("nnnynynnyn\n");
+});
+
+test("dyn: String(unknown) is Array.prototype.toString, not the JSON writer", async () => {
+  // Node IS the oracle for these, but no claimed corpus program walks the
+  // arms that are easy to get wrong: a null or undefined ELEMENT renders
+  // EMPTY (while the same value at the TOP level spells itself out), and
+  // nested arrays FLATTEN through the recursion rather than bracketing.
+  // The number arm is String()'s, not the serializer's — NaN and Infinity
+  // spell out where JSON would write null.
+  const res = await buildWasm(
+    "dyn-tostring.js",
+    [
+      "function s(u) { return String(u); }",
+      "console.log(s(undefined), s(null), s(true), s(false));",
+      "console.log(s(0), s(-0), s(NaN), s(Infinity), s(-Infinity), s(1e21), s(0.1));",
+      "console.log(s('plain'));",
+      "console.log(s([1, 2, 3]));",
+      "console.log(s([1, null, 3, undefined, 5]));",
+      "console.log(s([[1, 2], [3, [4, 5]]]));",
+      "console.log(s([]));",
+      "console.log(s({ a: 1 }));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "undefined null true false",
+      "0 0 NaN Infinity -Infinity 1e+21 0.1",
+      "plain",
+      "1,2,3",
+      "1,,3,,5",
+      "1,2,3,4,5",
+      "",
+      "[object Object]",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("S014: crossing the dyn boundary COPIES — mutations do not propagate", async () => {
+  // No corpus program can ever pin this, and not for the usual reason: a
+  // program whose output depends on the aliasing would DIVERGE from Node
+  // and fail the differential by construction. Node erases the casts and
+  // hands the same object back, so it prints 3 where every tsinter lane
+  // prints 2 — the source mutation lands on an object the extracted value
+  // does not share. Reproduced identically on the C lane.
+  const res = await buildWasm(
+    "dyn-copy.ts",
+    [
+      "type Box = { n: number; tags: string[] };",
+      "function toU(b: Box): unknown { return b; }",
+      "function fromU(u: unknown): Box { return u as Box; }",
+      "const src: Box = { n: 1, tags: ['a'] };",
+      "const u = toU(src);",
+      "src.n = 2;", // after the conversion: the dyn tree already copied
+      "const out = fromU(u);",
+      "out.n = out.n + 1;", // after the extraction: src cannot see this
+      "console.log(src.n, out.n);", // Node: 3 3 — here: 2 2
+      "const back = fromU(u);",
+      "back.tags.push('b');",
+      "console.log(src.tags.length, back.tags.length);", // Node: 2 2 — here: 1 2
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(["2 2", "1 2", ""].join("\n"));
 });
 
 test("S008: repeat's invalid count is the RangeError trap", async () => {

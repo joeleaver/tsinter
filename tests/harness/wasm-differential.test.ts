@@ -766,6 +766,21 @@ const TIER_FLOOR: string[] = [
   "2352-void-coercions.ts",
   "2557-width-field-lifts.ts",
   "2613-for-init-uninitialized-let.ts",
+  // Increment 14 (dyn core), stage 2: the COMPOSITE walkers — per-typeKey
+  // emitted functions that convert a static value into a dyn tree and
+  // validate one back out, the C emitter's sc_td_N / sc_dc_N / sc_dm_N
+  // families ported. Records are width-tolerant on the way out and
+  // insertion-ordered on the way in; unions try arms in canonical order
+  // and the first FULL match wins, which is what the match predicates
+  // exist to decide before anything is built.
+  //
+  // Also the two JS-lane dyn literals and String(unknown). The claim
+  // count is small because most dyn programs need a SECOND thing (the
+  // keyed reads, the call boundary, json.parse) — what this stage really
+  // moved is the floor under those.
+  "1882-default-cjs-interop/main.ts",
+  "2430-empty-literal-unknown-field.js",
+  "2435-loose-same-kind-equality.ts",
 ];
 
 interface RunResult {

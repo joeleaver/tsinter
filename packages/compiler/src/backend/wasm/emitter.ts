@@ -341,6 +341,14 @@ const ANY_REF: ValType = { kind: "ref", nullable: true, typeIndex: ANY_HEAP };
  * `%frame.<fn>`): the ONLY shapes that declare a supertype. */
 const FRAME_SHAPE_PREFIX = "%frame.";
 
+/** One dyn walker body under construction — see `newWalker`. */
+interface WalkerCtx {
+  c: Code;
+  locals: ValType[];
+  /** The function's parameter count: local slots start here. */
+  base: number;
+}
+
 type DynTestKind = Extract<IrExpr, { kind: "dynTest" }>["test"];
 
 /** dynTest's kind sets, one for one with the C emitter's lowering
@@ -1309,8 +1317,833 @@ class Assembler {
       lit: (c, s) => this.pushStrLitInto(c, s),
       throwTypeError: (c, pushMessage) =>
         this.emitSetCellError(c, "%TypeError", "TypeError", pushMessage, null),
+      arrVec: () => this.dynVecInfo(),
+      arrPush: () => this.vecs.pushOne(this.dynVecInfo()),
     });
     return this.dynField;
+  }
+
+  /** The ARR payload's vector info — the SAME interning a static
+   * `dyn[]` would get (`vecKeyFor` answers "dyn" for a dyn element), so
+   * the two can never become distinct types by accident. */
+  private dynVecInfo(): VecInfo {
+    const elem = this.dyn.dynRef();
+    return this.vecs.info("dyn", elem, elem, "ref");
+  }
+
+  /* ── the type-directed dyn walkers ─────────────────────────────────────
+   * The C emitter GENERATES these as C functions (emit-walkers.ts's
+   * sc_td_N / sc_dc_N / sc_dm_N families); here they are emitted wasm
+   * functions with the same interning discipline — one per typeKey, the
+   * index published BEFORE the body is built so a self-referential shape
+   * terminates instead of recursing forever.
+   *
+   * They live at the emitter rather than in dyn.ts because building the
+   * STATIC side of a conversion is emitter knowledge: record structs,
+   * vectors, union arm subtypes and their canonical tags. dyn.ts owns the
+   * representation and the primitives; these own the type direction.
+   *
+   * A walker body is emitted OUTSIDE any IR function, so there is no
+   * `fn` state and no handler stack: a nested check that throws leaves
+   * the cell set, and `emitWalkerPending` returns the result type's zero
+   * so the CALLER's own pending check fires. That is exactly the
+   * discipline the generated C follows (`if (scr_exc_pending()) return
+   * NULL;`) minus the release calls the GC makes unnecessary. */
+
+  private readonly dynFromFns = new Map<string, number>();
+  private readonly dynCheckFns = new Map<string, number>();
+  private readonly dynMatchFns = new Map<string, number>();
+
+  /** The zero of a representation — a walker's dummy return. */
+  private pushZeroInto(c: Code, t: ValType | null): void {
+    if (t === null) return;
+    switch (t.kind) {
+      case "f64":
+        c.f64Const(0);
+        return;
+      case "i64":
+        c.i64Const(0n);
+        return;
+      case "ref":
+        c.refNull(t.typeIndex);
+        return;
+      default:
+        c.i32Const(0);
+        return;
+    }
+  }
+
+  /** After a nested call that may throw: bail with the dummy. */
+  private emitWalkerPending(c: Code, result: ValType | null): void {
+    c.globalGet(this.exc().kindG);
+    c.ifVoid();
+    this.pushZeroInto(c, result);
+    c.return_();
+    c.end();
+  }
+
+  /** The C emitter's `dynDesc` — the short noun a failure reports for a
+   * target type. Records read as "object" (the path already says where;
+   * the full shape would bloat the message) and tuples as "array",
+   * because that IS the JSON they require. The trailing fallback covers
+   * kinds C throws on: they are all unmappable, so the only messages that
+   * could carry one belong to programs that refuse anyway. */
+  private dynDescOf(t: IrType): string {
+    switch (t.kind) {
+      case "f64":
+        return "number";
+      case "string":
+        return "string";
+      case "bool":
+        return "boolean";
+      case "record":
+        return this.recordShapes.get(t.shapeId)?.tuple === true ? "array" : "object";
+      case "array":
+        return "array";
+      case "nullT":
+        return "null";
+      case "undefinedT":
+        return "undefined";
+      case "dyn":
+        return "unknown";
+      case "bytes":
+        return "Uint8Array";
+      case "object":
+        return t.className.replace(/^%/, "");
+      case "func":
+        return "function";
+      case "map":
+        return "Map";
+      case "set":
+        return "Set";
+      case "union":
+        return this.unionDef(t.unionId).arms.map((a) => this.dynDescOf(a)).join(" | ");
+      default:
+        return t.kind;
+    }
+  }
+
+  /** A record shape's fields in the order a dyn OBJECT must carry them —
+   * the FROM direction only: DECLARED order first (a dyn object's
+   * insertion order is observable through Object.keys, for-in and JSON),
+   * then any field the declared list omits — the internal '%' members,
+   * which round-trip after the visible keys. toDynHelper's rule, ported.
+   *
+   * THE TWO DIRECTIONS USE DIFFERENT ORDERS, deliberately. Going OUT
+   * (here) the order is what the reader will observe, so it must be JS's
+   * insertion order. Coming IN (check/match, `tupleOrCanonical`) the
+   * order is CANONICAL — the sorted list that IS the shape's identity —
+   * because it decides which field a failure names first, and that has to
+   * be the same field on every lane. The C and LLVM walkers iterate
+   * `shape.fields` there for exactly this reason; iterating declared
+   * order instead made a record with two bad fields report a different
+   * one here than natively. */
+  private dynFieldOrder(shape: IrRecordShape): typeof shape.fields {
+    const byName = new Map(shape.fields.map((f) => [f.name, f]));
+    const order = shape.declaredOrder ?? shape.fields.map((f) => f.name);
+    const inOrder = new Set(order);
+    return [
+      ...order.map((n) => byName.get(n)).filter((f): f is (typeof shape.fields)[number] => f !== undefined),
+      ...shape.fields.filter((f) => !inOrder.has(f.name)),
+    ];
+  }
+
+  /** Tuple fields positionally ("0".."n-1"). */
+  private tupleFieldOrder(shape: IrRecordShape): typeof shape.fields {
+    return [...shape.fields].sort((a, b) => Number(a.name) - Number(b.name));
+  }
+
+  /** One walker body under construction. Explicit state rather than a
+   * field on the emitter: generating a walker RECURSES into the walkers
+   * its parts need, and each of those builds its own body — a shared
+   * `locals` array would interleave them. */
+  private newWalker(params: number): WalkerCtx {
+    return { c: new Code(), locals: [], base: params };
+  }
+
+  /** Claim a local in `w`. Walkers take no closure argument (they are
+   * runtime helpers, not IR functions), so slots start at `base`. */
+  private wlocal(w: WalkerCtx, t: ValType): number {
+    const index = w.base + w.locals.length;
+    w.locals.push(t);
+    return index;
+  }
+
+  /** Publish a declared walker whose body construction FAILED: the census
+   * already carries the refusal name, the emit sink has thrown, and the
+   * survey sink assembles nothing — so an honest trap stands in for a
+   * body that must never run. */
+  private walkerDead(idx: number): null {
+    const dead = new Code();
+    dead.unreachable();
+    this.mb.setBody(idx, [], dead.bytes());
+    return null;
+  }
+
+  /** %w.dyn.from:<typeKey> — the static→dyn walker (C's sc_td_N), which
+   * DEEP-COPIES composites: a dyn value never aliases static storage, so
+   * a later mutation of the source cannot be observed through the dyn
+   * tree. Never throws. Null (refusal recorded) when a part is out of
+   * tier — the refusal names the SHAPE, not just "dynFrom". */
+  private dynFromHelper(t: IrType, loc: SrcLoc | undefined): number | null {
+    const key = typeKey(t);
+    const hit = this.dynFromFns.get(key);
+    if (hit !== undefined) return hit;
+    const val = this.mapType(t, loc);
+    if (val === null) return null;
+    const idx = this.mb.declareFunc(this.mb.funcType([val], [this.dyn.dynRef()]), `%w.dyn.from:${key}`);
+    this.dynFromFns.set(key, idx);
+    const w = this.newWalker(1);
+    if (!this.emitDynFromBody(w, t, loc)) return this.walkerDead(idx);
+    this.mb.setBody(idx, w.locals, w.c.bytes());
+    return idx;
+  }
+
+  private emitDynFromBody(w: WalkerCtx, t: IrType, loc: SrcLoc | undefined): boolean {
+    const c = w.c;
+    const dyn = this.dyn;
+    switch (t.kind) {
+      case "f64":
+        dyn.boxNum(c, (x) => x.localGet(0));
+        return true;
+      case "bool":
+        dyn.boxBool(c, (x) => x.localGet(0));
+        return true;
+      case "string":
+        dyn.boxStr(c, (x) => x.localGet(0));
+        return true;
+      case "undefinedT":
+        c.globalGet(dyn.undefinedGlobal());
+        return true;
+      case "nullT":
+        c.globalGet(dyn.nullGlobal());
+        return true;
+      case "dyn":
+        // Already dyn — C's retain, which the GC makes a no-op.
+        c.localGet(0);
+        return true;
+      case "record": {
+        const shape = this.recordShapes.get(t.shapeId);
+        const info = this.recordInfo(t.shapeId, loc, false);
+        if (shape === undefined || info === null) return false;
+        if (shape.tuple) {
+          // A tuple converts as the JSON ARRAY it is everywhere else.
+          const a = this.wlocal(w, dyn.arrRef());
+          c.f64Const(0);
+          c.call(this.vecs.newLen(this.dynVecInfo()));
+          c.localSet(a);
+          for (const f of this.tupleFieldOrder(shape)) {
+            const inner = this.dynFromHelper(f.type, loc);
+            const slot = info.fieldIndex.get(f.name);
+            if (inner === null || slot === undefined) return false;
+            c.localGet(a);
+            c.localGet(0);
+            c.structGet(info.struct, slot);
+            c.call(inner);
+            c.call(dyn.arrPush());
+          }
+          dyn.boxArr(c, (x) => x.localGet(a));
+          return true;
+        }
+        const o = this.wlocal(w, dyn.objRef());
+        dyn.pushNewObj(c, false);
+        c.localSet(o);
+        // Keys insert in DECLARED order: a dyn object's insertion order is
+        // observable (Object.keys, for-in, JSON), so it must be JS's.
+        for (const f of this.dynFieldOrder(shape)) {
+          const inner = this.dynFromHelper(f.type, loc);
+          const slot = info.fieldIndex.get(f.name);
+          if (inner === null || slot === undefined) return false;
+          c.localGet(o);
+          this.pushStrLitInto(c, f.name);
+          c.localGet(0);
+          c.structGet(info.struct, slot);
+          c.call(inner);
+          c.call(dyn.objPut());
+        }
+        dyn.boxObj(c, (x) => x.localGet(o));
+        return true;
+      }
+      case "array": {
+        const src = this.vecInfoFor(t, loc);
+        const inner = this.dynFromHelper(t.elem, loc);
+        if (src === null || inner === null) return false;
+        const a = this.wlocal(w, dyn.arrRef());
+        const i = this.wlocal(w, I32);
+        const n = this.wlocal(w, I32);
+        c.f64Const(0);
+        c.call(this.vecs.newLen(this.dynVecInfo()));
+        c.localSet(a);
+        c.localGet(0);
+        c.structGet(src.struct, 0);
+        c.localSet(n);
+        c.i32Const(0);
+        c.localSet(i);
+        c.block();
+        c.loop();
+        c.localGet(i);
+        c.localGet(n);
+        c.i32GeU();
+        c.brIf(1);
+        c.localGet(a);
+        c.localGet(0);
+        c.structGet(src.struct, 1);
+        c.localGet(i);
+        this.vecs.emitElemRead(c, src);
+        c.call(inner);
+        c.call(dyn.arrPush());
+        c.localGet(i);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(i);
+        c.br(0);
+        c.end();
+        c.end();
+        dyn.boxArr(c, (x) => x.localGet(a));
+        return true;
+      }
+      case "union": {
+        const def = this.unionDef(t.unionId);
+        const tag = this.wlocal(w, I32);
+        c.localGet(0);
+        c.structGet(this.unions.base(), 0);
+        c.localSet(tag);
+        for (let i = 0; i < def.arms.length; i++) {
+          const arm = def.arms[i]!;
+          c.localGet(tag);
+          c.i32Const(i);
+          c.i32Eq();
+          c.ifVoid();
+          if (arm.kind === "undefinedT") {
+            c.globalGet(dyn.undefinedGlobal());
+          } else if (arm.kind === "nullT") {
+            c.globalGet(dyn.nullGlobal());
+          } else {
+            const struct = this.unionArmStruct(t.unionId, i, loc);
+            const inner = this.dynFromHelper(arm, loc);
+            if (struct === null || inner === null) return false;
+            c.localGet(0);
+            c.refCast(struct);
+            c.structGet(struct, 1);
+            c.call(inner);
+          }
+          c.return_();
+          c.end();
+        }
+        // A corrupted tag is loud, never silent (the union helpers' rule).
+        c.unreachable();
+        return true;
+      }
+      case "promise": {
+        // Promises box BY REFERENCE — identity is the promise, so one
+        // promise crossing twice stays one JS value. C boxes the
+        // ScrPromise directly when the inner type is ALREADY dyn, and
+        // otherwise builds an adapter promise whose settle callback
+        // converts the payload; only the direct form lands here.
+        if (t.inner.kind !== "dyn") {
+          this.refuse("dynFrom:promise:adapt", loc);
+          return false;
+        }
+        c.i32Const(DK.PROMISE);
+        c.f64Const(0);
+        c.localGet(0);
+        c.structNew(dyn.dynT());
+        return true;
+      }
+      default:
+        this.refuse(`dynFrom:${t.kind}`, loc);
+        return false;
+    }
+  }
+
+  /** %w.dyn.match:<typeKey> — C's sc_dm_N predicate: does this dyn value
+   * FIT the type, without building anything? Only the union check walker
+   * needs it (arms try in canonical order and the first FULL match wins),
+   * which is why a partial match must be detectable before any
+   * construction happens. Never throws, never allocates. */
+  private dynMatchHelper(t: IrType, loc: SrcLoc | undefined): number | null {
+    const key = typeKey(t);
+    const hit = this.dynMatchFns.get(key);
+    if (hit !== undefined) return hit;
+    const idx = this.mb.declareFunc(
+      this.mb.funcType([this.dyn.dynRef()], [I32]),
+      `%w.dyn.match:${key}`,
+    );
+    this.dynMatchFns.set(key, idx);
+    const w = this.newWalker(1);
+    if (!this.emitDynMatchBody(w, t, loc)) return this.walkerDead(idx);
+    this.mb.setBody(idx, w.locals, w.c.bytes());
+    return idx;
+  }
+
+  /** `kind == K` on parameter 0. */
+  private emitKindIs(c: Code, kind: number): void {
+    c.localGet(0);
+    c.structGet(this.dyn.dynT(), DYN_KIND);
+    c.i32Const(kind);
+    c.i32Eq();
+  }
+
+  private emitDynMatchBody(w: WalkerCtx, t: IrType, loc: SrcLoc | undefined): boolean {
+    const c = w.c;
+    const dyn = this.dyn;
+    switch (t.kind) {
+      case "f64":
+        this.emitKindIs(c, DK.NUM);
+        return true;
+      case "string":
+        this.emitKindIs(c, DK.STR);
+        return true;
+      case "bool":
+        this.emitKindIs(c, DK.BOOL);
+        return true;
+      case "nullT":
+        this.emitKindIs(c, DK.NULL);
+        return true;
+      case "undefinedT":
+        // JSON text never parses to undefined, but the tree can HOLD it
+        // (a missing record key builds this arm), and it matches exactly.
+        this.emitKindIs(c, DK.UNDEF);
+        return true;
+      case "dyn":
+        // An `unknown` arm: every dyn value fits, undefined included.
+        c.i32Const(1);
+        return true;
+      case "record": {
+        const shape = this.recordShapes.get(t.shapeId);
+        if (shape === undefined) return false;
+        if (shape.indexValue !== undefined) {
+          // Width CAPTURE needs the overflow map's runtime, a separate
+          // rock (recordInfo refuses the shape for the same reason).
+          this.refuse("dynMatch:record:index-signature", loc);
+          return false;
+        }
+        const fields = this.tupleOrCanonical(shape);
+        if (shape.tuple) {
+          // Arity is part of a tuple's type: width tolerance is an
+          // object-key concept and does not apply here.
+          this.emitKindIs(c, DK.ARR);
+          c.ifVoid();
+          const a = this.wlocal(w, dyn.arrRef());
+          dyn.arrPayload(c, (x) => x.localGet(0));
+          c.localSet(a);
+          dyn.arrLen(c, (x) => x.localGet(a));
+          c.i32Const(fields.length);
+          c.i32Ne();
+          c.ifVoid();
+          c.i32Const(0);
+          c.return_();
+          c.end();
+          for (let i = 0; i < fields.length; i++) {
+            const inner = this.dynMatchHelper(fields[i]!.type, loc);
+            if (inner === null) return false;
+            dyn.arrAt(c, (x) => x.localGet(a), (x) => x.i32Const(i));
+            c.call(inner);
+            c.i32Eqz();
+            c.ifVoid();
+            c.i32Const(0);
+            c.return_();
+            c.end();
+          }
+          c.i32Const(1);
+          c.return_();
+          c.end();
+          c.i32Const(0);
+          return true;
+        }
+        this.emitKindIs(c, DK.OBJ);
+        c.i32Eqz();
+        c.ifVoid();
+        c.i32Const(0);
+        c.return_();
+        c.end();
+        {
+          const o = this.wlocal(w, dyn.objRef());
+          const m = this.wlocal(w, dyn.dynRef());
+          dyn.objPayload(c, (x) => x.localGet(0));
+          c.localSet(o);
+          for (const f of fields) {
+            // A dyn ('unknown') field matches ANY value, present or
+            // missing — no test to emit at all.
+            if (f.type.kind === "dyn") continue;
+            const inner = this.dynMatchHelper(f.type, loc);
+            if (inner === null) return false;
+            c.localGet(o);
+            this.pushStrLitInto(c, f.name);
+            c.call(dyn.objGet());
+            c.localTee(m);
+            c.refIsNull();
+            c.ifVoid();
+            // Missing. An optional-flavored field (an undefined-armed
+            // union) still MATCHES — the absent key is that arm.
+            if (this.undefinedArmTag2(f.type) < 0) {
+              c.i32Const(0);
+              c.return_();
+            }
+            c.else_();
+            c.localGet(m);
+            c.call(inner);
+            c.i32Eqz();
+            c.ifVoid();
+            c.i32Const(0);
+            c.return_();
+            c.end();
+            c.end();
+          }
+        }
+        c.i32Const(1);
+        return true;
+      }
+      case "array": {
+        const inner = this.dynMatchHelper(t.elem, loc);
+        if (inner === null) return false;
+        this.emitKindIs(c, DK.ARR);
+        c.i32Eqz();
+        c.ifVoid();
+        c.i32Const(0);
+        c.return_();
+        c.end();
+        const a = this.wlocal(w, dyn.arrRef());
+        const i = this.wlocal(w, I32);
+        const n = this.wlocal(w, I32);
+        dyn.arrPayload(c, (x) => x.localGet(0));
+        c.localSet(a);
+        dyn.arrLen(c, (x) => x.localGet(a));
+        c.localSet(n);
+        c.i32Const(0);
+        c.localSet(i);
+        c.block();
+        c.loop();
+        c.localGet(i);
+        c.localGet(n);
+        c.i32GeU();
+        c.brIf(1);
+        dyn.arrAt(c, (x) => x.localGet(a), (x) => x.localGet(i));
+        c.call(inner);
+        c.i32Eqz();
+        c.ifVoid();
+        c.i32Const(0);
+        c.return_();
+        c.end();
+        c.localGet(i);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(i);
+        c.br(0);
+        c.end();
+        c.end();
+        c.i32Const(1);
+        return true;
+      }
+      case "union": {
+        const def = this.unionDef(t.unionId);
+        for (let i = 0; i < def.arms.length; i++) {
+          const inner = this.dynMatchHelper(def.arms[i]!, loc);
+          if (inner === null) return false;
+          c.localGet(0);
+          c.call(inner);
+          if (i > 0) c.i32Or();
+        }
+        return true;
+      }
+      default:
+        this.refuse(`dynMatch:${t.kind}`, loc);
+        return false;
+    }
+  }
+
+  /** A shape's fields in the order the CHECK and MATCH walkers visit
+   * them: positional for a tuple, CANONICAL (the sorted list that IS the
+   * shape's identity) otherwise. See `dynFieldOrder` for why the two
+   * directions deliberately disagree. */
+  private tupleOrCanonical(shape: IrRecordShape): typeof shape.fields {
+    return shape.tuple ? this.tupleFieldOrder(shape) : shape.fields;
+  }
+
+  /** The undefined arm's tag for a union-typed field, or -1. The
+   * optional-field rule everywhere in the walkers: an ABSENT key IS that
+   * arm rather than a failure. */
+  private undefinedArmTag2(t: IrType): number {
+    return t.kind === "union" ? this.undefinedArmTag(t.unionId) : -1;
+  }
+
+  /** %w.dyn.check:<typeKey> — the validating extractor (C's sc_dc_N):
+   * validate the dyn tree against T and BUILD the typed value, or throw
+   * the catchable path-annotated TypeError. Records are WIDTH-TOLERANT
+   * (only declared fields are looked up; extras are never examined —
+   * this is check-and-extract, not shape equality). */
+  private dynCheckHelper(t: IrType, loc: SrcLoc | undefined): number | null {
+    const key = typeKey(t);
+    const hit = this.dynCheckFns.get(key);
+    if (hit !== undefined) return hit;
+    const val = this.mapType(t, loc);
+    if (val === null) return null;
+    const idx = this.mb.declareFunc(
+      this.mb.funcType([this.dyn.dynRef(), this.dyn.pathRef()], [val]),
+      `%w.dyn.check:${key}`,
+    );
+    this.dynCheckFns.set(key, idx);
+    const w = this.newWalker(2);
+    if (!this.emitDynCheckBody(w, t, loc, val)) return this.walkerDead(idx);
+    this.mb.setBody(idx, w.locals, w.c.bytes());
+    return idx;
+  }
+
+  /** `check_fail(path, "<want>", got)` then the dummy return — the walker
+   * form of the failure the scalar dynCheck emits inline. */
+  private emitWalkerFail(
+    w: WalkerCtx,
+    want: string,
+    result: ValType | null,
+    pushPath: (c: Code) => void,
+    pushGot: (c: Code) => void,
+  ): void {
+    const c = w.c;
+    pushPath(c);
+    this.pushStrLitInto(c, want);
+    pushGot(c);
+    c.call(this.dyn.checkFail());
+    this.pushZeroInto(c, result);
+    c.return_();
+  }
+
+  private emitDynCheckBody(w: WalkerCtx, t: IrType, loc: SrcLoc | undefined, val: ValType): boolean {
+    const c = w.c;
+    const dyn = this.dyn;
+    const want = this.dynDescOf(t);
+    const kindGuard = (k: number): void => {
+      this.emitKindIs(c, k);
+      c.i32Eqz();
+      c.ifVoid();
+      this.emitWalkerFail(w, want, val, (x) => x.localGet(1), (x) => x.localGet(0));
+      c.end();
+    };
+    switch (t.kind) {
+      case "f64":
+        kindGuard(DK.NUM);
+        c.localGet(0);
+        c.structGet(dyn.dynT(), DYN_NUM);
+        return true;
+      case "bool":
+        kindGuard(DK.BOOL);
+        c.localGet(0);
+        c.structGet(dyn.dynT(), DYN_NUM);
+        c.f64Const(0);
+        c.f64Ne();
+        return true;
+      case "string":
+        kindGuard(DK.STR);
+        c.localGet(0);
+        c.structGet(dyn.dynT(), DYN_REF);
+        c.refCast(this.strType);
+        return true;
+      case "dyn":
+        // An `unknown` slot: the subtree passes through as-is — nothing
+        // to validate, nothing to build.
+        c.localGet(0);
+        return true;
+      case "record": {
+        const shape = this.recordShapes.get(t.shapeId);
+        const info = this.recordInfo(t.shapeId, loc, false);
+        if (shape === undefined || info === null) return false;
+        if (shape.tuple) {
+          const fields = this.tupleFieldOrder(shape);
+          kindGuard(DK.ARR);
+          const a = this.wlocal(w, dyn.arrRef());
+          dyn.arrPayload(c, (x) => x.localGet(0));
+          c.localSet(a);
+          dyn.arrLen(c, (x) => x.localGet(a));
+          c.i32Const(fields.length);
+          c.i32Ne();
+          c.ifVoid();
+          // Arity failures carry their OWN message — the element type is
+          // not what went wrong.
+          this.emitWalkerFail(
+            w,
+            `array of length ${fields.length}`,
+            val,
+            (x) => x.localGet(1),
+            (x) => x.localGet(0),
+          );
+          c.end();
+          const r = this.wlocal(w, val);
+          c.structNewDefault(info.struct);
+          c.localSet(r);
+          for (let i = 0; i < fields.length; i++) {
+            const f = fields[i]!;
+            const inner = this.dynCheckHelper(f.type, loc);
+            const slot = info.fieldIndex.get(f.name);
+            if (inner === null || slot === undefined) return false;
+            c.localGet(r);
+            dyn.arrAt(c, (x) => x.localGet(a), (x) => x.i32Const(i));
+            dyn.pushPathIndex(c, (x) => x.localGet(1), (x) => x.i32Const(i));
+            c.call(inner);
+            c.structSet(info.struct, slot);
+            this.emitWalkerPending(c, val);
+          }
+          c.localGet(r);
+          return true;
+        }
+        kindGuard(DK.OBJ);
+        {
+          const o = this.wlocal(w, dyn.objRef());
+          const m = this.wlocal(w, dyn.dynRef());
+          const r = this.wlocal(w, val);
+          dyn.objPayload(c, (x) => x.localGet(0));
+          c.localSet(o);
+          c.structNewDefault(info.struct);
+          c.localSet(r);
+          // CANONICAL order, matching the C and LLVM walkers: this is the
+          // order that decides WHICH bad field a record with several
+          // reports first, so it has to be the shape's identity rather
+          // than its source spelling (see dynFieldOrder).
+          for (const f of this.tupleOrCanonical(shape)) {
+            const slot = info.fieldIndex.get(f.name);
+            if (slot === undefined) return false;
+            const utag = this.undefinedArmTag2(f.type);
+            c.localGet(o);
+            this.pushStrLitInto(c, f.name);
+            c.call(dyn.objGet());
+            c.localSet(m);
+            if (f.type.kind === "dyn") {
+              // An `unknown` field: a present key passes through, a
+              // missing one IS the undefined value (JS's missing-property
+              // read), never a failure.
+              c.localGet(r);
+              c.localGet(m);
+              c.refIsNull();
+              c.ifResult(dyn.dynRef());
+              c.globalGet(dyn.undefinedGlobal());
+              c.else_();
+              c.localGet(m);
+              c.end();
+              c.structSet(info.struct, slot);
+              continue;
+            }
+            const inner = this.dynCheckHelper(f.type, loc);
+            if (inner === null) return false;
+            c.localGet(m);
+            c.refIsNull();
+            c.ifVoid();
+            if (utag >= 0) {
+              // Optional-flavored field: the ABSENT key builds the
+              // undefined arm's interned immortal instance.
+              c.localGet(r);
+              c.globalGet(this.unions.unitGlobal(utag));
+              c.structSet(info.struct, slot);
+            } else {
+              // Missing and required: the failure names the FIELD's path
+              // and a null `got`, which kindName renders "undefined" —
+              // so an absent key reports exactly like a present one
+              // holding undefined.
+              this.emitWalkerFail(
+                w,
+                this.dynDescOf(f.type),
+                val,
+                (x) => dyn.pushPathKey(x, (y) => y.localGet(1), (y) => this.pushStrLitInto(y, f.name)),
+                (x) => x.refNull(dyn.dynT()),
+              );
+            }
+            c.else_();
+            c.localGet(r);
+            c.localGet(m);
+            dyn.pushPathKey(c, (x) => x.localGet(1), (x) => this.pushStrLitInto(x, f.name));
+            c.call(inner);
+            c.structSet(info.struct, slot);
+            this.emitWalkerPending(c, val);
+            c.end();
+          }
+          c.localGet(r);
+        }
+        return true;
+      }
+      case "array": {
+        const inner = this.dynCheckHelper(t.elem, loc);
+        const out = this.vecInfoFor(t, loc);
+        if (inner === null || out === null) return false;
+        kindGuard(DK.ARR);
+        const a = this.wlocal(w, dyn.arrRef());
+        const r = this.wlocal(w, val);
+        const i = this.wlocal(w, I32);
+        const n = this.wlocal(w, I32);
+        dyn.arrPayload(c, (x) => x.localGet(0));
+        c.localSet(a);
+        dyn.arrLen(c, (x) => x.localGet(a));
+        c.localSet(n);
+        c.f64Const(0);
+        c.call(this.vecs.newLen(out));
+        c.localSet(r);
+        c.i32Const(0);
+        c.localSet(i);
+        c.block();
+        c.loop();
+        c.localGet(i);
+        c.localGet(n);
+        c.i32GeU();
+        c.brIf(1);
+        c.localGet(r);
+        dyn.arrAt(c, (x) => x.localGet(a), (x) => x.localGet(i));
+        dyn.pushPathIndex(c, (x) => x.localGet(1), (x) => x.localGet(i));
+        c.call(inner);
+        c.call(this.vecs.pushOne(out));
+        this.emitWalkerPending(c, val);
+        c.localGet(i);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(i);
+        c.br(0);
+        c.end();
+        c.end();
+        c.localGet(r);
+        return true;
+      }
+      case "union": {
+        const def = this.unionDef(t.unionId);
+        // Arms in CANONICAL order, first FULL match wins — which is how
+        // discriminated unions disambiguate: the arm whose declared
+        // fields all fit. Matching is what makes that decidable BEFORE
+        // any construction, so the chosen arm's builder cannot fail.
+        //
+        // THAT is why no pending check follows the inner check call
+        // below, unlike every other nested call in these walkers: the
+        // matcher and the checker agree arm by arm (`match(d)` true ⇒
+        // `check(d)` reaches its return without touching the cell), so
+        // the only way a check could throw here is a matcher that
+        // accepted something its checker rejects — an emitter bug, not a
+        // runtime condition. Add one if the two ever stop being generated
+        // from the same type.
+        for (let i = 0; i < def.arms.length; i++) {
+          const arm = def.arms[i]!;
+          const match = this.dynMatchHelper(arm, loc);
+          if (match === null) return false;
+          c.localGet(0);
+          c.call(match);
+          c.ifVoid();
+          if (arm.kind === "undefinedT" || arm.kind === "nullT") {
+            // A matched unit arm builds nothing: the answer is THE
+            // interned immortal instance for the tag.
+            c.globalGet(this.unions.unitGlobal(i));
+          } else {
+            const struct = this.unionArmStruct(t.unionId, i, loc);
+            const inner = this.dynCheckHelper(arm, loc);
+            if (struct === null || inner === null) return false;
+            c.i32Const(i);
+            c.localGet(0);
+            c.localGet(1);
+            c.call(inner);
+            c.structNew(struct);
+          }
+          c.return_();
+          c.end();
+        }
+        this.emitWalkerFail(w, want, val, (x) => x.localGet(1), (x) => x.localGet(0));
+        c.unreachable();
+        return true;
+      }
+      default:
+        this.refuse(`dynCheck:${t.kind}`, loc);
+        return false;
+    }
   }
 
   private unionDef(unionId: string): IrUnionDef {
@@ -3349,6 +4182,14 @@ class Assembler {
           code.call(h);
           return;
         }
+        if (k === "dyn") {
+          // String(u) over a checked-dynamic value — the C emitter's sc_ds
+          // walker, which is NOT typeof's table and not the `u.toString()`
+          // method spelling (see dyn.ts's toStr).
+          this.walkExpr(e.operand);
+          code.call(this.dyn.toStr());
+          return;
+        }
         // Caught operands snapshot — waits on the exception protocol.
         this.refuse(`toString:${k}`, e.loc);
         code.unreachable();
@@ -4271,6 +5112,22 @@ class Assembler {
             // Already dyn — the walkers' identity arm (a retain in C).
             this.walkExpr(e.value);
             return;
+          case "record":
+          case "array":
+          case "union":
+          case "promise": {
+            // The composite conversion is a per-typeKey WALKER (the C
+            // emitter's sc_td_N): a deep copy for the structured kinds, a
+            // reference box for a promise.
+            const h = this.dynFromHelper(vt, e.loc);
+            if (h === null) {
+              code.unreachable();
+              return;
+            }
+            this.walkExpr(e.value);
+            code.call(h);
+            return;
+          }
           default:
             this.refuse(`dynFrom:${vt.kind}`, e.loc);
             code.unreachable();
@@ -4300,6 +5157,22 @@ class Assembler {
           : t.kind === "string" ? { desc: "string", kind: DK.STR, val: this.strRef }
           : null;
         if (want === null) {
+          if (t.kind === "record" || t.kind === "array" || t.kind === "union") {
+            // The composite extraction is a per-typeKey WALKER (the C
+            // emitter's sc_dc_N). It returns normally with the cell set on
+            // failure — unlike the scalar path, which unwinds inline — so
+            // the call site owns the pending check.
+            const h = this.dynCheckHelper(t, e.loc);
+            if (h === null) {
+              code.unreachable();
+              return;
+            }
+            this.walkExpr(e.value);
+            code.refNull(this.dyn.pathT()); // the ROOT path: `$`
+            code.call(h);
+            this.emitPendingCheck();
+            return;
+          }
           this.refuse(`dynCheck:${t.kind}`, e.loc);
           code.unreachable();
           return;
@@ -4339,6 +5212,43 @@ class Assembler {
         this.emitUnwind();
         this.close();
         this.releaseScratch(dynRef, d);
+        return;
+      }
+
+      /* The JS-lane dyn LITERALS: a mixed-element array and an object
+       * whose keys may be runtime values. Both build the tree directly —
+       * their elements and values are already dyn, so there is no
+       * conversion, only construction. Neither throws. */
+      case "dynArrLit": {
+        const a = this.acquireScratch(this.dyn.arrRef());
+        code.f64Const(0);
+        code.call(this.vecs.newLen(this.dynVecInfo()));
+        code.localSet(a);
+        for (const el of e.elems) {
+          code.localGet(a);
+          this.walkExpr(el);
+          code.call(this.dyn.arrPush());
+        }
+        this.dyn.boxArr(code, (c) => c.localGet(a));
+        this.releaseScratch(this.dyn.arrRef(), a);
+        return;
+      }
+
+      case "dynObjLit": {
+        const o = this.acquireScratch(this.dyn.objRef());
+        this.dyn.pushNewObj(code, false);
+        code.localSet(o);
+        // Entries evaluate KEY then VALUE in SOURCE order (JS's
+        // object-literal evaluation order); later duplicate keys win,
+        // which is objPut's own rule.
+        for (const f of e.fields ?? []) {
+          code.localGet(o);
+          this.walkExpr(f.key);
+          this.walkExpr(f.value);
+          code.call(this.dyn.objPut());
+        }
+        this.dyn.boxObj(code, (c) => c.localGet(o));
+        this.releaseScratch(this.dyn.objRef(), o);
         return;
       }
 
@@ -4790,8 +5700,6 @@ class Assembler {
       case "dynFromJsval":
       case "dynCall":
       case "dynInvoke":
-      case "dynArrLit":
-      case "dynObjLit":
       case "dynKeyGet":
       case "dynHasKey":
       case "dynScalarEq":

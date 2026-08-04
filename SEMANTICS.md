@@ -226,3 +226,32 @@ corpus `2649-top-level-await-pending` and
 `2651-top-level-await-pending-unhandled` (the exit code, with the stderr
 compare skipped for nonzero exits) plus the wasm top-level-await unit test
 (exit 13 with the armed timer's output intact).
+
+## S014 — Crossing the `unknown` boundary COPIES; mutations do not propagate *(inherited)*
+
+Converting a typed composite into an `unknown` value DEEP-COPIES it, and
+validating one back out with `as T` copies again — so a record, array or
+tuple that has crossed the boundary shares no storage with its source.
+Mutating the original after the conversion is invisible to the extracted
+value, and mutating the extracted value is invisible to the original.
+Node's casts are erased and hand back the SAME object, so a program that
+mutates across the boundary observes the change there and does not here.
+This is not a wasm-tier fact: the C runtime, the LLVM lane that links it,
+and the emitted wasm walkers all copy, and all three print the same
+answers. **Rationale:** inherited from the C runtime's ownership design —
+a `ScrDyn` OWNS its tree, so aliasing static storage would break the
+refcount discipline on the native lanes (a dyn value outliving the record
+it borrowed from). The wasm representation carries no such constraint —
+aliasing would be perfectly representable there (the payload slot could
+point at a static array's vec struct today) and simply WRONG, because it
+would disagree with the native lanes; cross-lane agreement, not the
+representation, is what forbids it. The copy is also what
+makes the boundary's two directions symmetric: `dynCheck` must build a
+typed value it can hand out, and it has nothing to alias if the source
+was itself parsed. Distinct from S009, which is about a lying cast being
+CHECKED rather than erased; this is about a truthful one still not
+sharing. **Tested by:** the wasm emitter unit test only. No corpus
+program can pin it, and not merely because the lanes agree — a program
+whose output depended on the aliasing would diverge from Node and fail
+the differential by construction, so the corpus can only contain
+programs that never look.
