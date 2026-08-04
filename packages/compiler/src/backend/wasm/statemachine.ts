@@ -442,6 +442,10 @@ export type AsyncExpr =
   | { kind: "%async.mint"; type: IrType; loc: SrcLoc }
   | { kind: "%async.frameCast"; value: WExpr; type: IrType; loc: SrcLoc }
   | { kind: "%async.settled"; promise: WExpr; type: IrType; loc: SrcLoc }
+  /** The union-armed read. `type` is the awaitUnionExpr result union —
+   * a DIFFERENT interned union from `value`'s, with its own typeKey-sorted
+   * numbering, so the consumer must map every arm by TYPE. Never emitted
+   * when the result is void (there is nothing to read). */
   | { kind: "%async.settledUnion"; value: WExpr; promiseTag: number; type: IrType; loc: SrcLoc };
 
 /** Statement-position runtime seams: the two halves of a suspension

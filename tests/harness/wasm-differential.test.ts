@@ -483,6 +483,45 @@ const TIER_FLOOR: string[] = [
   "1429-promise-catch-finally.ts",
   // The `.then(onFulfilled, onRejected)` family beside them.
   "1561-promise-then.ts",
+
+  // Increment 12 (async), stage 7: the promise combinators and the
+  // union-armed await. Promise.all and Promise.race subscribe one REACTION
+  // per entry — an ordinary waiter over the existing FIFO, so the promise
+  // runtime is unchanged and the reactions cost the microtask turn
+  // ECMAScript spends on them (emitter.ts's combinator block; scr_async.c
+  // runs them inline and is a turn early). Promise.withResolvers is
+  // newPromise's settler closures assembled into a record instead of
+  // handed to an executor, and `await (p: Promise<T> | units)` narrows on
+  // the tag: the promise arm parks, a unit arm hops, and the settled value
+  // is RE-TAGGED into the result union (the two unions number their arms
+  // independently).
+  //
+  // Promise.all's whole surface: out-of-order settlement with in-order
+  // results, first-rejection-in-settlement-order with the losers still
+  // handled, the empty array, already-settled entries, and void entries.
+  "1438-promise-all.ts",
+  // Promise.all under the checker's TUPLE overload, beside Promise.reject
+  // and the `.catch` desugar.
+  "1572-promise-reject-all-tuple.ts",
+  // Promise.race: first settle wins, a rejection can win, and the
+  // heterogeneous entries exercise the payload-wrapping adapter (a
+  // Promise<number> settling a `string | number` result).
+  "1430-promise-race.ts",
+  // Promise.withResolvers over string/number/void, destructured and held
+  // whole, resolved from a timer long after the expression that made it.
+  "1726-promise-with-resolvers.ts",
+  // `Promise<void> | void` callbacks: the union-armed await where the
+  // result is VOID, so only subscribe/rejectCheck are involved — hop
+  // counts pinned against a background fiber, tick for tick.
+  "518-promise-void-union-callbacks.ts",
+  // The same await where the result carries a VALUE, which is the settled
+  // read and its re-tag.
+  "519-promise-union-await-values.ts",
+  // Free riders: a top-level-await loader waiting on several dependencies
+  // at once is a Promise.all, in the module initializer and across a
+  // cycle's external importer (stage 4 named both).
+  "2647-top-level-await-modules/main.ts",
+  "2662-top-level-await-cycle-external-wait/main.ts",
 ];
 
 interface RunResult {

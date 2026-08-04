@@ -1773,9 +1773,9 @@ describe("the wasm survey over a lowered module", () => {
   });
 });
 
-/* ── 9. the union-armed seam still waits ───────────────────────────────── */
+/* ── 9. the union-armed seam ───────────────────────────────────────────── */
 
-test("an awaited `Promise<T> | undefined` names the arm dispatch it needs", () => {
+test("an awaited `Promise<T> | undefined` surveys clean", () => {
   const inner = { kind: "union" as const, unionId: "u0" };
   const fn: IrFunction = {
     name: "f",
@@ -1800,6 +1800,9 @@ test("an awaited `Promise<T> | undefined` names the arm dispatch it needs", () =
     globals: [{ id: "%g.p", type: inner, loc }],
     unions: [{ id: "u0", arms: [promiseOf(F64), { kind: "undefinedT" }] }],
   });
-  expect(survey).toContain("stmt:%async.subscribeUnion");
-  expect(survey).toContain("stmt:%async.rejectCheckUnion");
+  // Stage 7 retired the last two seam refusals: the tag test picks
+  // between parking on the promise arm and hopping on a unit arm, and the
+  // re-entry check runs only on the promise arm. A VOID result emits no
+  // settled read at all, so this shape needs the pair and nothing else.
+  expect(survey).toEqual([]);
 });

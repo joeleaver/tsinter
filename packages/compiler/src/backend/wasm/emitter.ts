@@ -57,6 +57,7 @@ import {
   type SrcLoc,
   isUnitType,
   typeEquals,
+  typeKey,
   RUNTIME_ERROR_CLASSES,
 } from "../../ir/nodes.js";
 import { computeMayThrow } from "../emission/may-throw.js";
@@ -74,11 +75,19 @@ import {
 import { VecBuilder, type VecInfo } from "./arrays.js";
 import {
   PromiseBuilder,
+  ALL_REMAINING,
+  ALL_RESULT,
+  ALL_VALUES,
+  ALLE_INDEX,
+  ALLE_SRC,
+  ALLE_STATE,
   PROM_F64,
   PROM_KIND,
   PROM_OBSERVED,
   PROM_REF,
   PROM_STATE,
+  RACEE_DST,
+  RACEE_SRC,
 } from "./promises.js";
 import { StrBuilder } from "./strings.js";
 import { TimerBuilder } from "./timers.js";
@@ -2024,40 +2033,68 @@ class Assembler {
        * the exception cell (kind LAST, the commit) and unwind, which lands
        * in resume's own catch and becomes this frame's rejection. */
       case "%async.rejectCheck": {
-        const exc = this.exc();
         const pr = this.acquireScratch(this.proms.promRef());
         this.walkExpr(s.promise);
         code.localSet(pr);
-        code.localGet(pr);
-        code.structGet(this.proms.promT, PROM_STATE);
-        code.i32Const(2);
-        code.i32Eq();
-        this.openIf();
-        code.localGet(pr);
-        code.i32Const(1);
-        code.structSet(this.proms.promT, PROM_OBSERVED);
-        code.localGet(pr);
-        code.structGet(this.proms.promT, PROM_F64);
-        code.globalSet(exc.f64G);
-        code.localGet(pr);
-        code.structGet(this.proms.promT, PROM_REF);
-        code.globalSet(exc.refG);
-        code.localGet(pr);
-        code.structGet(this.proms.promT, PROM_KIND);
-        code.globalSet(exc.kindG);
-        this.emitUnwind();
-        this.close();
+        this.emitRejectCheckOn(pr);
         this.releaseScratch(this.proms.promRef(), pr);
         return;
       }
 
-      /* The union-armed suspensions (`Promise<T> | undefined`) wait on the
-       * arm dispatch: which arm a value carries decides between parking
-       * and hopping, and that read is the union surface's work. */
-      case "%async.subscribeUnion":
-      case "%async.rejectCheckUnion":
-        this.refuse(`stmt:${s.kind}`, s.loc);
+      /** awaitUnionExpr's suspend over `Promise<T> | units`: the promise
+       * arm parks on its promise, every other arm is a unit and takes the
+       * plain `await <non-thenable>` hop. One tag read decides. */
+      case "%async.subscribeUnion": {
+        const arm = this.awaitUnionArm(s.value, s.promiseTag, s.loc);
+        if (arm === null) return;
+        const u = this.acquireScratch(this.unions.baseRef());
+        this.walkExpr(s.value);
+        code.localSet(u);
+        code.localGet(u);
+        code.structGet(this.unions.base(), 0);
+        code.i32Const(s.promiseTag);
+        code.i32Eq();
+        this.openIf();
+        code.localGet(u);
+        code.refCast(arm);
+        code.structGet(arm, 1);
+        this.walkExpr(s.resume);
+        this.walkExpr(s.frame);
+        code.call(this.proms.subscribe());
+        code.else_();
+        this.walkExpr(s.resume);
+        this.walkExpr(s.frame);
+        code.call(this.proms.hop());
+        this.close();
+        this.releaseScratch(this.unions.baseRef(), u);
         return;
+      }
+
+      /** The same re-entry check for a union-armed await. Only the promise
+       * arm can carry a rejection; a unit arm resumed through the hop and
+       * has nothing to check. */
+      case "%async.rejectCheckUnion": {
+        const arm = this.awaitUnionArm(s.value, s.promiseTag, s.loc);
+        if (arm === null) return;
+        const u = this.acquireScratch(this.unions.baseRef());
+        this.walkExpr(s.value);
+        code.localSet(u);
+        code.localGet(u);
+        code.structGet(this.unions.base(), 0);
+        code.i32Const(s.promiseTag);
+        code.i32Eq();
+        this.openIf();
+        const pr = this.acquireScratch(this.proms.promRef());
+        code.localGet(u);
+        code.refCast(arm);
+        code.structGet(arm, 1);
+        code.localSet(pr);
+        this.emitRejectCheckOn(pr);
+        this.releaseScratch(this.proms.promRef(), pr);
+        this.close();
+        this.releaseScratch(this.unions.baseRef(), u);
+        return;
+      }
 
       default: {
         const rest: never = s;
@@ -3064,32 +3101,19 @@ class Assembler {
        * SITE's static type (the payload triple carries no type of its
        * own). A rejected promise never reaches here — the re-entry's
        * %async.rejectCheck unwound first. */
-      case "%async.settled": {
-        const t = e.type;
-        const promT = this.proms.promT;
-        if (t.kind === "f64") {
-          this.walkExpr(e.promise);
-          code.structGet(promT, PROM_F64);
-          return;
-        }
-        if (t.kind === "bool") {
-          this.walkExpr(e.promise);
-          code.structGet(promT, PROM_F64);
-          code.f64Const(0);
-          code.f64Ne();
-          return;
-        }
-        const val = this.mapType(t, e.loc);
-        if (val === null || val.kind !== "ref") {
-          this.refuse(`expr:%async.settled:${t.kind}`, e.loc);
+      case "%async.settled":
+        if (!this.emitSettledPayload(code, e.type, () => this.walkExpr(e.promise), "expr:%async.settled", e.loc)) {
           code.unreachable();
-          return;
         }
-        this.walkExpr(e.promise);
-        code.structGet(promT, PROM_REF);
-        code.refCast(val.typeIndex);
         return;
-      }
+
+      /** The same read for an awaited `Promise<T> | units` union, REWRAPPED
+       * into the result union the await site is typed with. See
+       * emitSettledUnion for the tag mapping — the two unions do not share
+       * a numbering, and assuming they did would miscompile silently. */
+      case "%async.settledUnion":
+        this.emitSettledUnion(e);
+        return;
 
       /** `new Promise<T>(executor)`: mint, hand the executor its resolve
        * (and reject) closure, and run it SYNCHRONOUSLY — JS-exact. An
@@ -3097,6 +3121,17 @@ class Assembler {
        * creator, which is why this cannot use the ordinary pending check. */
       case "newPromise":
         this.emitNewPromise(e);
+        return;
+
+      /** `Promise.withResolvers<T>()`: exactly newPromise's pieces without
+       * an executor — one mint and the SAME interned settler closures,
+       * assembled into the frontend's `{ promise, resolve, reject }`
+       * record instead of being passed to a callback. Handing the pair out
+       * as values needs nothing extra: a settler's environment already
+       * holds the promise and outlives the expression like any other GC
+       * value. Never throws. */
+      case "promiseWithResolvers":
+        this.emitWithResolvers(e);
         return;
 
       case "optChain": {
@@ -3211,11 +3246,15 @@ class Assembler {
             this.releaseScratch(this.proms.promRef(), p);
             return;
           }
-          /* Promise.all/race combine SUBSCRIPTIONS across a set of
-           * promises (per-entry adapters in the native lane); module.await
-           * waits on the async-module machinery. */
-          case "promise.race":
+          /* The two combinators: a fresh result promise plus one REACTION
+           * subscribed to every entry (see the combinator block below). */
           case "promise.all":
+            this.emitPromiseAll(e);
+            return;
+          case "promise.race":
+            this.emitPromiseRace(e);
+            return;
+          /* module.await waits on the async-module machinery. */
           case "module.await":
             this.refuse(`intrinsic:${e.name}`, e.loc);
             code.unreachable();
@@ -3578,10 +3617,6 @@ class Assembler {
       case "genResume":
       case "awaitExpr":
       case "awaitUnionExpr":
-      /* Promise.withResolvers hands the resolve/reject pair out as VALUES
-       * in a record, which needs the pair to outlive the expression —
-       * newPromise's executor-scoped closures do not generalize to it. */
-      case "promiseWithResolvers":
       /* Widening promise<T> into promise<void> is representationally free
        * here (one struct), but the awaiting side then reads a payload it
        * has no type for — the void-await path is its own work. */
@@ -3619,9 +3654,6 @@ class Assembler {
       case "jsMarshal":
       case "jsOp":
       case "jsExit":
-      /* The union-armed settled read waits on the same arm dispatch its
-       * subscribe sibling does. */
-      case "%async.settledUnion":
         this.refuse(`expr:${e.kind}`, e.loc);
         code.unreachable();
         return;
@@ -4302,6 +4334,195 @@ class Assembler {
     }
   }
 
+  /* ── the awaited promise, read back ─────────────────────────────────────
+   *
+   * Three helpers the plain await ops and their union-armed twins share.
+   * The union forms differ from the plain ones only in HOW they reach the
+   * promise (one tag test and a narrow); everything after is identical, so
+   * it lives here once. */
+
+  /** The re-entry rejection check, over a local already holding the
+   * awaited promise: observe it (this frame is about to re-throw, so it
+   * IS handled), copy the payload into the exception cell (kind LAST, the
+   * commit) and unwind — which lands in resume's own catch and becomes
+   * this frame's rejection. */
+  private emitRejectCheckOn(pr: number): void {
+    const code = this.fn.code;
+    const exc = this.exc();
+    code.localGet(pr);
+    code.structGet(this.proms.promT, PROM_STATE);
+    code.i32Const(2);
+    code.i32Eq();
+    this.openIf();
+    code.localGet(pr);
+    code.i32Const(1);
+    code.structSet(this.proms.promT, PROM_OBSERVED);
+    code.localGet(pr);
+    code.structGet(this.proms.promT, PROM_F64);
+    code.globalSet(exc.f64G);
+    code.localGet(pr);
+    code.structGet(this.proms.promT, PROM_REF);
+    code.globalSet(exc.refG);
+    code.localGet(pr);
+    code.structGet(this.proms.promT, PROM_KIND);
+    code.globalSet(exc.kindG);
+    this.emitUnwind();
+    this.close();
+  }
+
+  /** A settled promise's payload, read back by a STATIC type — the
+   * payload triple carries no type of its own. `push` leaves the promise
+   * on `c`'s stack; false means the representation refused, under `what`.
+   * Takes the buffer rather than using this.fn.code because the
+   * combinators' reaction functions are built outside any IR function. */
+  private emitSettledPayload(
+    c: Code,
+    t: IrType,
+    push: () => void,
+    what: string,
+    loc: SrcLoc | undefined,
+  ): boolean {
+    const promT = this.proms.promT;
+    if (t.kind === "f64") {
+      push();
+      c.structGet(promT, PROM_F64);
+      return true;
+    }
+    if (t.kind === "bool") {
+      push();
+      c.structGet(promT, PROM_F64);
+      c.f64Const(0);
+      c.f64Ne();
+      return true;
+    }
+    const val = this.mapType(t, loc);
+    if (val === null || val.kind !== "ref") {
+      this.refuse(`${what}:${t.kind}`, loc);
+      return false;
+    }
+    push();
+    c.structGet(promT, PROM_REF);
+    c.refCast(val.typeIndex);
+    return true;
+  }
+
+  /** The `promiseTag` arm's payload subtype for an awaited
+   * `Promise<T> | units` union — the cast target the three union-armed
+   * ops narrow through. Null (refusal recorded) when the arm's
+   * representation is out of tier. */
+  private awaitUnionArm(value: WExpr, promiseTag: number, loc: SrcLoc): number | null {
+    const ut = value.type;
+    if (ut.kind !== "union") throw new Error("await-union op over a non-union value");
+    return this.unionArmStruct(ut.unionId, promiseTag, loc);
+  }
+
+  /** `await (p: Promise<T> | units)`'s value, in the RESULT union.
+   *
+   * THE TWO UNIONS DO NOT SHARE A NUMBERING, and that is the whole
+   * difficulty. The awaited union's arms are `[Promise<T>, ...units]`; the
+   * result's are `[T, ...units]` (nodes.ts's awaitUnionExpr contract) —
+   * two different interned unions, each sorted by typeKey, so a unit arm's
+   * tag can MOVE between them. `Promise<number> | null` is the smallest
+   * witness: "null" sorts after "promise<f64>" but before "f64", so null
+   * is arm 0 going in and arm 1 coming out. Passing the value through
+   * unchanged would be a silent miscompile — a unit instance is interned
+   * per TAG across the whole module, so the wrong tag is a well-typed lie.
+   *
+   * So every arm is mapped BY TYPE (typeEquals against the result's
+   * canonical arms), never by position, and a lookup that fails refuses by
+   * name instead of guessing. Unit arms carry no payload, which makes the
+   * whole conversion the retag: one interned instance for another. */
+  private emitSettledUnion(e: Extract<WExpr, { kind: "%async.settledUnion" }>): void {
+    const code = this.fn.code;
+    const ut = e.value.type;
+    if (ut.kind !== "union") throw new Error("%async.settledUnion over a non-union value");
+    const inDef = this.unionDef(ut.unionId);
+    const promArm = inDef.arms[e.promiseTag];
+    if (promArm?.kind !== "promise") throw new Error("%async.settledUnion promiseTag is not a promise arm");
+    if (e.type.kind !== "union") {
+      // A non-union result means the value had nowhere to put the unit
+      // arms; the frontend only builds one when it interned the combined
+      // union, so this is a contract breach, not a representation gap.
+      this.refuse("expr:%async.settledUnion:non-union-result", e.loc);
+      code.unreachable();
+      return;
+    }
+    const outId = e.type.unionId;
+    // Plan every arm before emitting (unionDisc's rule): one unmappable
+    // arm refuses the whole read rather than leaving partial code.
+    const innerTag = this.unionArmTag(outId, promArm.inner);
+    if (innerTag < 0) {
+      this.refuse(`expr:%async.settledUnion:inner:${promArm.inner.kind}`, e.loc);
+      code.unreachable();
+      return;
+    }
+    const units: { inTag: number; outTag: number }[] = [];
+    for (const [i, arm] of inDef.arms.entries()) {
+      if (i === e.promiseTag) continue;
+      if (!isUnitType(arm)) throw new Error("%async.settledUnion over a non-unit sibling arm");
+      const outTag = this.unionArmTag(outId, arm);
+      if (outTag < 0) {
+        this.refuse(`expr:%async.settledUnion:unit:${arm.kind}`, e.loc);
+        code.unreachable();
+        return;
+      }
+      units.push({ inTag: i, outTag });
+    }
+    const innerIsUnit = isUnitType(promArm.inner);
+    const outArm = innerIsUnit ? 0 : this.unionArmStruct(outId, innerTag, e.loc);
+    const inArm = this.unionArmStruct(ut.unionId, e.promiseTag, e.loc);
+    if (outArm === null || inArm === null) {
+      code.unreachable();
+      return;
+    }
+
+    const baseRef = this.unions.baseRef();
+    const u = this.acquireScratch(baseRef);
+    this.walkExpr(e.value);
+    code.localSet(u);
+    code.localGet(u);
+    code.structGet(this.unions.base(), 0);
+    code.i32Const(e.promiseTag);
+    code.i32Eq();
+    this.openIfResult(baseRef);
+    if (innerIsUnit) {
+      // A unit inner (`Promise<undefined>`) has no payload to read: the
+      // settled value IS the interned instance for its result tag.
+      code.globalGet(this.unions.unitGlobal(innerTag));
+    } else {
+      code.i32Const(innerTag);
+      const ok = this.emitSettledPayload(
+        code,
+        promArm.inner,
+        () => {
+          code.localGet(u);
+          code.refCast(inArm);
+          code.structGet(inArm, 1);
+        },
+        "expr:%async.settledUnion",
+        e.loc,
+      );
+      if (!ok) code.unreachable();
+      else code.structNew(outArm);
+    }
+    code.else_();
+    for (const arm of units) {
+      code.localGet(u);
+      code.structGet(this.unions.base(), 0);
+      code.i32Const(arm.inTag);
+      code.i32Eq();
+      this.openIfResult(baseRef);
+      code.globalGet(this.unions.unitGlobal(arm.outTag));
+      code.else_();
+    }
+    // No arm matched: a corrupted tag, loud like every other union
+    // dispatch's default.
+    code.unreachable();
+    for (let i = 0; i < units.length; i++) this.close();
+    this.close();
+    this.releaseScratch(baseRef, u);
+  }
+
   /* ── new Promise(executor) ──────────────────────────────────────────────
    *
    * `new Promise<T>((resolve, reject) => ...)` is a mint, one or two
@@ -4467,6 +4688,546 @@ class Assembler {
 
     code.localGet(pr);
     this.releaseScratch(this.proms.promRef(), pr);
+  }
+
+  /** `Promise.withResolvers<T>()` — the record assembly. The settler
+   * FUNCTIONS and their env shape come straight from newPromise's pair
+   * (settlerFor/pushSettler), so a module using both interns one of each;
+   * the only new thing here is the record the frontend's type mapper
+   * shaped, whose field types are what pick the settler signatures. */
+  private emitWithResolvers(e: Extract<IrExpr, { kind: "promiseWithResolvers" }>): void {
+    const code = this.fn.code;
+    if (e.type.kind !== "record") throw new Error("promiseWithResolvers with a non-record type");
+    const shape = this.recordShapes.get(e.type.shapeId);
+    if (shape === undefined) throw new Error(`unknown record shape ${e.type.shapeId}`);
+    const fieldT = (name: string): IrType | undefined => shape.fields.find((f) => f.name === name)?.type;
+    const promiseT = fieldT("promise");
+    const resolveT = fieldT("resolve");
+    const rejectT = fieldT("reject");
+    if (promiseT?.kind !== "promise" || resolveT?.kind !== "func" || rejectT?.kind !== "func") {
+      throw new Error("promiseWithResolvers record is not { promise, resolve, reject }");
+    }
+    // Settling WITH a promise is adoption, exactly as in newPromise.
+    if (resolveT.params.some((p) => p.kind === "promise")) {
+      this.refuse("expr:promiseWithResolvers:adopt", e.loc);
+      code.unreachable();
+      return;
+    }
+    if (resolveT.params.length > 1 || rejectT.params.length !== 1) {
+      this.refuse("expr:promiseWithResolvers:settler", e.loc);
+      code.unreachable();
+      return;
+    }
+    const info = this.recordInfo(e.type.shapeId, e.loc, false);
+    const resolveParam = resolveT.params[0] ?? null;
+    const rejectParam = rejectT.params[0]!;
+    const resolveFn = this.settlerFor(resolveParam, 1, e.loc);
+    const rejectFn = this.settlerFor(rejectParam, 2, e.loc);
+    if (info === null || resolveFn === null || rejectFn === null) {
+      code.unreachable();
+      return;
+    }
+    const slot = (name: string): number => {
+      const i = info.fieldIndex.get(name);
+      if (i === undefined) throw new Error(`promiseWithResolvers shape lacks ${name}`);
+      return i;
+    };
+
+    const pr = this.acquireScratch(this.proms.promRef());
+    code.call(this.proms.mint());
+    code.localSet(pr);
+    const recRef: ValType = { kind: "ref", nullable: true, typeIndex: info.struct };
+    const rec = this.acquireScratch(recRef);
+    code.structNewDefault(info.struct);
+    code.localSet(rec);
+    code.localGet(rec);
+    code.localGet(pr);
+    code.structSet(info.struct, slot("promise"));
+    code.localGet(rec);
+    this.pushSettler(resolveFn, resolveParam, 1, pr);
+    code.structSet(info.struct, slot("resolve"));
+    code.localGet(rec);
+    this.pushSettler(rejectFn, rejectParam, 2, pr);
+    code.structSet(info.struct, slot("reject"));
+    code.localGet(rec);
+    this.releaseScratch(recRef, rec);
+    this.releaseScratch(this.proms.promRef(), pr);
+  }
+
+  /* ── Promise.all / Promise.race ─────────────────────────────────────────
+   *
+   * Both are the same three moves: mint a result promise, and subscribe
+   * one REACTION to every entry. A reaction is an ordinary waiter whose
+   * closure is one of the interned functions below and whose frame is one
+   * of promises.ts's two entry nodes — so the promise runtime needs no
+   * change at all, and the FIFO the reactions ride is the microtask queue
+   * itself.
+   *
+   * WHICH IS ALSO WHERE THE TURNS COME FROM. ECMAScript builds both
+   * combinators out of `.then(...)` on each entry, so an entry's
+   * settlement ENQUEUES its reaction rather than running it: the result
+   * settles one microtask turn after the deciding entry, and an awaiter of
+   * the result resumes a turn after that. Riding the waiter queue gives
+   * exactly that. (scr_async.c runs its callbacks synchronously inside
+   * settle and lands the result a turn early — measured against Node with
+   * a competing microtask chain, which no corpus program has; Node is the
+   * oracle, so this lane queues. See promises.ts's reaction block.)
+   *
+   * FIRST-SETTLE-WINS IS FREE. Every reaction settles the RESULT, and
+   * settle already ignores a non-pending promise, so the first reaction to
+   * run decides and every later one is a no-op — no flags, no unlinking.
+   *
+   * AND EVERY ENTRY IS HANDLED. Both subscribe through
+   * subscribeHandled(): attaching a handler is what makes a rejection
+   * handled in JS, so a loser's rejection never reaches the
+   * unhandled-rejection report. */
+
+  private readonly allFns = new Map<string, number>();
+  private readonly allRxFns = new Map<string, number>();
+  private readonly raceRxFns = new Map<string, number>();
+
+  /** A reaction's closure VALUE: the resume signature's closure struct
+   * holding nothing but the code pointer (reactions capture nothing — all
+   * their state is in the entry node they are handed as a frame). */
+  private pushReactionClosure(c: Code, fnIndex: number): void {
+    this.mb.declareFuncRef(fnIndex);
+    c.refFunc(fnIndex);
+    c.structNew(this.resumeClosPair().clos);
+  }
+
+  /** The (kind, f64, ref) triple a completed `all` fulfils with: the
+   * values array as a REF payload, or the void triple when the entries
+   * were `Promise<void>` and there is no array. */
+  private pushAllFulfilment(c: Code, pushValues: (() => void) | null): void {
+    if (pushValues === null) {
+      c.i32Const(0);
+      c.f64Const(0);
+      c.refNull(ANY_HEAP);
+      return;
+    }
+    c.i32Const(EXC_REF);
+    c.f64Const(0);
+    pushValues();
+  }
+
+  /** One Promise.all entry settling — the spec's `resolveElement`. A
+   * fulfilment stores its payload at the entry's INPUT index (input
+   * order, whatever order things actually settled in) and the LAST
+   * missing one fulfils the result with the array; a rejection settles the
+   * result outright, so the first rejection in SETTLEMENT order wins and
+   * later ones are absorbed by settle's pending guard. Interned per values
+   * REPRESENTATION — which is what decides the payload read and the store
+   * — so one module needs at most one per element type. */
+  private allReactionFor(values: VecInfo | null): number {
+    const key = values?.key ?? "void";
+    const hit = this.allRxFns.get(key);
+    if (hit !== undefined) return hit;
+    const pair = this.resumeClosPair();
+    const idx = this.mb.declareFunc(pair.fn, `%w.async.allRx:${key}`);
+    this.allRxFns.set(key, idx);
+    const promT = this.proms.promT;
+    const stateT = this.proms.allStateT;
+    const entryT = this.proms.allEntryT;
+    const c = new Code();
+    // params: 0 = the reaction's own closure, 1 = the entry node.
+    const E = 2, ST = 3, SRC = 4;
+    c.localGet(1);
+    c.refCast(entryT);
+    c.localSet(E);
+    c.localGet(E);
+    c.structGet(entryT, ALLE_STATE);
+    c.localSet(ST);
+    c.localGet(E);
+    c.structGet(entryT, ALLE_SRC);
+    c.localSet(SRC);
+    c.localGet(SRC);
+    c.structGet(promT, PROM_STATE);
+    c.i32Const(2);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(ST);
+    c.structGet(stateT, ALL_RESULT);
+    c.localGet(SRC);
+    c.call(this.proms.settleFrom());
+    c.return_();
+    c.end();
+    if (values !== null) {
+      c.localGet(ST);
+      c.structGet(stateT, ALL_VALUES);
+      c.refCast(values.struct);
+      c.localGet(E);
+      c.structGet(entryT, ALLE_INDEX);
+      c.localGet(SRC);
+      // The payload by the ARRAY's element representation, which is the
+      // one the fulfilling side wrote (the frontend fences Promise.all to
+      // a single promise type, so entry inner and element agree).
+      if (values.elemKind === "f64") {
+        c.structGet(promT, PROM_F64);
+      } else if (values.elemKind === "bool") {
+        c.structGet(promT, PROM_F64);
+        c.f64Const(0);
+        c.f64Ne();
+      } else {
+        if (values.elemVal.kind !== "ref") throw new Error("ref-kind all element without a ref valtype");
+        c.structGet(promT, PROM_REF);
+        c.refCast(values.elemVal.typeIndex);
+      }
+      c.call(this.vecs.set(values));
+    }
+    c.localGet(ST);
+    c.localGet(ST);
+    c.structGet(stateT, ALL_REMAINING);
+    c.i32Const(1);
+    c.i32Sub();
+    c.structSet(stateT, ALL_REMAINING);
+    c.localGet(ST);
+    c.structGet(stateT, ALL_REMAINING);
+    c.i32Eqz();
+    c.ifVoid();
+    c.localGet(ST);
+    c.structGet(stateT, ALL_RESULT);
+    this.pushAllFulfilment(
+      c,
+      values === null
+        ? null
+        : () => {
+            c.localGet(ST);
+            c.structGet(stateT, ALL_VALUES);
+          },
+    );
+    c.i32Const(1);
+    c.call(this.proms.settle());
+    c.end();
+    this.mb.setBody(
+      idx,
+      [
+        { kind: "ref", nullable: true, typeIndex: entryT },
+        this.proms.allStateRef(),
+        this.proms.promRef(),
+      ],
+      c.bytes(),
+    );
+    return idx;
+  }
+
+  /** `Promise.all(ps)`'s body, interned per (entries, values) pair: mint,
+   * pre-size the values array to the entry count, and subscribe one
+   * reaction per entry in INPUT order (each carrying its index, which is
+   * what makes the result input-ordered).
+   *
+   * Only an EMPTY all can be complete when the loop ends: reactions are
+   * microtasks, so none has run yet, which is exactly why the spec's
+   * "+1 for the iteration" needs no counterpart here. */
+  private promiseAllFor(entries: VecInfo, values: VecInfo | null): number {
+    const key = `${entries.key}|${values?.key ?? "void"}`;
+    const hit = this.allFns.get(key);
+    if (hit !== undefined) return hit;
+    const promRef = this.proms.promRef();
+    const idx = this.mb.declareFunc(
+      this.mb.funcType([this.vecs.vecRef(entries)], [promRef]),
+      `%w.async.all:${key}`,
+    );
+    this.allFns.set(key, idx);
+    const rx = this.allReactionFor(values);
+    const stateT = this.proms.allStateT;
+    const entryT = this.proms.allEntryT;
+    const closRef: ValType = { kind: "ref", nullable: true, typeIndex: this.resumeClosPair().clos };
+    const c = new Code();
+    const PS = 0, RESULT = 1, N = 2, ST = 3, I = 4, CLOS = 5, P = 6;
+    c.call(this.proms.mint());
+    c.localSet(RESULT);
+    c.localGet(PS);
+    c.structGet(entries.struct, 0); // the vector's length field
+    c.localSet(N);
+    c.localGet(N);
+    c.localGet(RESULT);
+    if (values === null) {
+      c.refNull(ANY_HEAP);
+    } else {
+      c.localGet(N);
+      c.f64ConvertI32S();
+      c.call(this.vecs.newLen(values));
+    }
+    c.structNew(stateT);
+    c.localSet(ST);
+    this.pushReactionClosure(c, rx);
+    c.localSet(CLOS);
+    c.i32Const(0);
+    c.localSet(I);
+    c.loop();
+    c.localGet(I);
+    c.localGet(N);
+    c.i32LtS();
+    c.ifVoid();
+    c.localGet(PS);
+    c.localGet(I);
+    c.f64ConvertI32S();
+    c.call(this.vecs.get(entries));
+    c.localSet(P);
+    c.localGet(P);
+    c.localGet(CLOS);
+    c.localGet(ST);
+    c.localGet(I);
+    c.f64ConvertI32S();
+    c.localGet(P);
+    c.structNew(entryT);
+    c.call(this.proms.subscribeHandled());
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(1);
+    c.end();
+    c.end();
+    c.localGet(N);
+    c.i32Eqz();
+    c.ifVoid();
+    c.localGet(RESULT);
+    this.pushAllFulfilment(
+      c,
+      values === null
+        ? null
+        : () => {
+            c.localGet(ST);
+            c.structGet(stateT, ALL_VALUES);
+          },
+    );
+    c.i32Const(1);
+    c.call(this.proms.settle());
+    c.end();
+    c.localGet(RESULT);
+    this.mb.setBody(idx, [promRef, I32, this.proms.allStateRef(), I32, closRef, promRef], c.bytes());
+    return idx;
+  }
+
+  private emitPromiseAll(e: Extract<IrExpr, { kind: "intrinsic" }>): void {
+    const code = this.fn.code;
+    const arg = e.args[0]!;
+    if (arg.type.kind !== "array" || e.type.kind !== "promise") {
+      throw new Error("promise.all outside its validated shape");
+    }
+    const entries = this.vecInfoFor(arg.type, e.loc);
+    let values: VecInfo | null = null;
+    if (e.type.inner.kind === "array") {
+      values = this.vecInfoFor(e.type.inner, e.loc);
+      if (values === null) {
+        code.unreachable();
+        return;
+      }
+    } else if (e.type.inner.kind !== "void") {
+      this.refuse(`intrinsic:promise.all:${e.type.inner.kind}`, e.loc);
+      code.unreachable();
+      return;
+    }
+    if (entries === null) {
+      code.unreachable();
+      return;
+    }
+    const fn = this.promiseAllFor(entries, values);
+    this.walkExpr(arg);
+    code.call(fn);
+  }
+
+  /** One Promise.race entry settling — the spec's pair of capability
+   * callbacks. A rejection copies raw (a reason is not the inner type); a
+   * fulfilment converts the payload to the RESULT's inner type first,
+   * which is what `adapt` means below and the only reason a race reaction
+   * is interned per (from, to) rather than once. */
+  private raceReactionFor(from: IrType, to: IrType, loc: SrcLoc): number | null {
+    const key = typeEquals(from, to) ? "copy" : `${typeKey(from)}=>${typeKey(to)}`;
+    const hit = this.raceRxFns.get(key);
+    if (hit !== undefined) return hit;
+    // Plan the whole conversion before declaring anything: an entry the
+    // adapter cannot express refuses by name and emits no function.
+    let adapt: ((c: Code, src: number) => void) | null = null;
+    if (key === "copy") {
+      adapt = null; // the settleFrom path below
+    } else if (to.kind !== "union") {
+      // The frontend fences entries to the result type, one of its arms,
+      // or a sub-union of it — all three need a union result.
+      this.refuse(`intrinsic:promise.race:adapt:${to.kind}`, loc);
+      return null;
+    } else if (from.kind === "union") {
+      const plan = this.raceRetagPlan(from.unionId, to.unionId, loc);
+      if (plan === null) return null;
+      adapt = (c, src) => this.emitRaceRetag(c, src, plan);
+    } else {
+      const tag = this.unionArmTag(to.unionId, from);
+      if (tag < 0) {
+        this.refuse(`intrinsic:promise.race:adapt:arm:${from.kind}`, loc);
+        return null;
+      }
+      if (isUnitType(from)) {
+        const g = this.unions.unitGlobal(tag);
+        adapt = (c) => c.globalGet(g);
+      } else {
+        const arm = this.unionArmStruct(to.unionId, tag, loc);
+        if (arm === null) return null;
+        adapt = (c, src) => {
+          c.i32Const(tag);
+          if (!this.emitSettledPayload(c, from, () => c.localGet(src), "intrinsic:promise.race:adapt", loc)) {
+            c.unreachable();
+            return;
+          }
+          c.structNew(arm);
+        };
+      }
+    }
+
+    const pair = this.resumeClosPair();
+    const idx = this.mb.declareFunc(pair.fn, `%w.async.raceRx:${this.raceRxFns.size}`);
+    this.raceRxFns.set(key, idx);
+    const promT = this.proms.promT;
+    const entryT = this.proms.raceEntryT;
+    const c = new Code();
+    const E = 2, DST = 3, SRC = 4;
+    c.localGet(1);
+    c.refCast(entryT);
+    c.localSet(E);
+    c.localGet(E);
+    c.structGet(entryT, RACEE_DST);
+    c.localSet(DST);
+    c.localGet(E);
+    c.structGet(entryT, RACEE_SRC);
+    c.localSet(SRC);
+    if (adapt === null) {
+      // Same inner type: the whole outcome moves across unread, state
+      // included, so one call serves both fulfilment and rejection.
+      c.localGet(DST);
+      c.localGet(SRC);
+      c.call(this.proms.settleFrom());
+    } else {
+      c.localGet(SRC);
+      c.structGet(promT, PROM_STATE);
+      c.i32Const(2);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(DST);
+      c.localGet(SRC);
+      c.call(this.proms.settleFrom());
+      c.return_();
+      c.end();
+      c.localGet(DST);
+      c.i32Const(EXC_REF);
+      c.f64Const(0);
+      adapt(c, SRC);
+      c.i32Const(1);
+      c.call(this.proms.settle());
+    }
+    this.mb.setBody(
+      idx,
+      [{ kind: "ref", nullable: true, typeIndex: entryT }, this.proms.promRef(), this.proms.promRef()],
+      c.bytes(),
+    );
+    return idx;
+  }
+
+  /** A sub-union entry's arm-by-arm re-tagging into the result union.
+   * Same problem as emitSettledUnion's: two interned unions number their
+   * arms independently, so every arm is looked up BY TYPE and rebuilt
+   * under the result's tag. Null (refusal recorded) when an arm has no
+   * counterpart or no representation. */
+  private raceRetagPlan(
+    fromId: string,
+    toId: string,
+    loc: SrcLoc,
+  ): { tag: number; outTag: number; inArm: number | null; outArm: number | null }[] | null {
+    const plan: { tag: number; outTag: number; inArm: number | null; outArm: number | null }[] = [];
+    for (const [i, arm] of this.unionDef(fromId).arms.entries()) {
+      const outTag = this.unionArmTag(toId, arm);
+      if (outTag < 0) {
+        this.refuse(`intrinsic:promise.race:adapt:arm:${arm.kind}`, loc);
+        return null;
+      }
+      if (isUnitType(arm)) {
+        plan.push({ tag: i, outTag, inArm: null, outArm: null });
+        continue;
+      }
+      const inArm = this.unionArmStruct(fromId, i, loc);
+      const outArm = this.unionArmStruct(toId, outTag, loc);
+      if (inArm === null || outArm === null) return null;
+      plan.push({ tag: i, outTag, inArm, outArm });
+    }
+    return plan;
+  }
+
+  private emitRaceRetag(
+    c: Code,
+    src: number,
+    plan: { tag: number; outTag: number; inArm: number | null; outArm: number | null }[],
+  ): void {
+    const baseRef = this.unions.baseRef();
+    const base = this.unions.base();
+    // The entry's fulfilment payload IS a union value (its inner type is a
+    // union), so it reads back off the ref slot.
+    const read = (): void => {
+      c.localGet(src);
+      c.structGet(this.proms.promT, PROM_REF);
+      c.refCast(base);
+    };
+    for (const arm of plan) {
+      read();
+      c.structGet(base, 0);
+      c.i32Const(arm.tag);
+      c.i32Eq();
+      c.ifResult(baseRef);
+      if (arm.inArm === null || arm.outArm === null) {
+        c.globalGet(this.unions.unitGlobal(arm.outTag));
+      } else {
+        c.i32Const(arm.outTag);
+        read();
+        c.refCast(arm.inArm);
+        c.structGet(arm.inArm, 1);
+        c.structNew(arm.outArm);
+      }
+      c.else_();
+    }
+    c.unreachable();
+    for (let i = 0; i < plan.length; i++) c.end();
+  }
+
+  private emitPromiseRace(e: Extract<IrExpr, { kind: "intrinsic" }>): void {
+    const code = this.fn.code;
+    if (e.type.kind !== "promise") throw new Error("promise.race outside its validated shape");
+    const to = e.type.inner;
+    // Every adapter resolves BEFORE any emission (unionDisc's rule): one
+    // entry the tier cannot convert refuses the whole race.
+    const reactions: number[] = [];
+    for (const entry of e.args) {
+      if (entry.type.kind !== "promise") throw new Error("promise.race entry is not a promise");
+      const rx = this.raceReactionFor(entry.type.inner, to, e.loc);
+      if (rx === null) {
+        code.unreachable();
+        return;
+      }
+      reactions.push(rx);
+    }
+    // EVERY entry evaluates before ANY of them is subscribed, because the
+    // array literal is a separate expression from the call: an entry that
+    // throws must leave its predecessors un-subscribed (and so NOT marked
+    // handled), which interleaving the two loops would get wrong.
+    const promRef = this.proms.promRef();
+    const held: number[] = [];
+    for (const entry of e.args) {
+      const slot = this.acquireScratch(promRef);
+      this.walkExpr(entry);
+      code.localSet(slot);
+      held.push(slot);
+    }
+    const result = this.acquireScratch(promRef);
+    code.call(this.proms.mint());
+    code.localSet(result);
+    for (const [i, slot] of held.entries()) {
+      code.localGet(slot);
+      this.pushReactionClosure(code, reactions[i]!);
+      code.localGet(result);
+      code.localGet(slot);
+      code.structNew(this.proms.raceEntryT);
+      code.call(this.proms.subscribeHandled());
+    }
+    code.localGet(result);
+    this.releaseScratch(promRef, result);
+    for (const slot of held) this.releaseScratch(promRef, slot);
   }
 
   private scratchKey(t: ValType): string {

@@ -87,10 +87,57 @@ const W_CLOS = 0;
 const W_FRAME = 1;
 const W_NEXT = 2;
 
+/* ── the combinators' reaction nodes ──────────────────────────────────
+ * Promise.all and Promise.race need NO promise-shape change: a reaction
+ * is an ORDINARY WAITER — same waiterT, same FIFO, same subscribe, same
+ * settle, same drain — whose "resume closure" is one of the emitter's
+ * interned reaction functions and whose "frame" is one of the two nodes
+ * below (both subtype %frameBase, exactly like a real async frame; the
+ * runtime never reads either, it just hands them back).
+ *
+ * THAT IS ALSO THE RIGHT SEMANTICS, not merely the cheap one. A
+ * combinator in ECMAScript is `.then(onFulfilled, onRejected)` on every
+ * entry, so an entry's settlement ENQUEUES its reaction job — the result
+ * promise settles one microtask turn AFTER the deciding entry, and an
+ * awaiter of the result resumes a turn after that. Riding the waiter
+ * queue reproduces that for free. (scr_async.c instead runs its `cbs`
+ * synchronously inside settle, which lands the result a full turn early;
+ * measured against Node, that is where the C lane and this one part
+ * company — Node is the oracle, so this lane queues.)
+ *
+ * The `+1 for the iteration` of the spec's remaining-count needs no
+ * counterpart: nothing decrements until a reaction runs, and no reaction
+ * can run before the subscribing loop ends, so an EMPTY all is the only
+ * case that fulfills during construction — which is what the spec says
+ * too. */
+
+/* %w.all.state's fields — the countdown one Promise.all's entries share.
+ * `values` is the pre-sized result array held as a bare anyref so this
+ * type stays ONE type: which vector it really is belongs to the reaction
+ * function, which is interned per element representation anyway. Null for
+ * a void-inner all (`Promise.all(voids)` fulfills void). */
+export const ALL_REMAINING = 0;
+export const ALL_RESULT = 1;
+export const ALL_VALUES = 2;
+
+/* %w.all.entry's fields — one entry's reaction frame. The index is f64
+ * because that is what the vector helpers take. */
+export const ALLE_STATE = 0;
+export const ALLE_INDEX = 1;
+export const ALLE_SRC = 2;
+
+/* %w.race.entry's fields — one entry's reaction frame: where to settle,
+ * and what settled. */
+export const RACEE_DST = 0;
+export const RACEE_SRC = 1;
+
 export class PromiseBuilder {
   private readonly fns = new Map<string, number>();
   private promTField: number | null = null;
   private waiterTField: number | null = null;
+  private allStateField: number | null = null;
+  private allEntryField: number | null = null;
+  private raceEntryField: number | null = null;
   private queue: { head: number; tail: number } | null = null;
   private ledger: { head: number; tail: number } | null = null;
 
@@ -286,6 +333,108 @@ export class PromiseBuilder {
       this.mb.setBody(idx, [this.waiterRef()], c.bytes());
       return idx;
     });
+  }
+
+  /** %w.async.subscribeHandled(p, clos, frame) — subscribe(), plus the
+   * mark every combinator owes its entries. Attaching a handler is what
+   * makes a rejection HANDLED in JS, and a combinator subscribes to
+   * EVERYTHING, so an entry that loses the race (or arrives after the
+   * first rejection won an all) is never an unhandled-rejection report.
+   * Marked at ATTACH time, like V8's [[PromiseIsHandled]] — not at
+   * reaction time, so a report triggered by some other promise before the
+   * reaction runs still sees these as handled. */
+  subscribeHandled(): number {
+    return this.cached("subscribeHandled", () => {
+      const closRef: ValType = { kind: "ref", nullable: true, typeIndex: this.deps.resumeClos().clos };
+      const frameRef: ValType = { kind: "ref", nullable: true, typeIndex: this.deps.frameBase() };
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.promRef(), closRef, frameRef], []),
+        "%w.async.subscribeHandled",
+      );
+      const subscribe = this.subscribe();
+      const c = new Code();
+      const P = 0, CLOS = 1, FRAME = 2;
+      c.localGet(P);
+      c.i32Const(1);
+      c.structSet(this.promT, PROM_OBSERVED);
+      c.localGet(P);
+      c.localGet(CLOS);
+      c.localGet(FRAME);
+      c.call(subscribe);
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.async.settleFrom(dst, src) — copy a settled promise's WHOLE
+   * outcome (payload triple and state alike) into `dst`. Both combinators
+   * settle their result this way on a rejection, and race does it on a
+   * fulfilment too whenever no payload conversion is needed;
+   * first-settle-wins needs no guard of its own because settle already
+   * ignores a non-pending destination. */
+  settleFrom(): number {
+    return this.cached("settleFrom", () => {
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.promRef(), this.promRef()], []),
+        "%w.async.settleFrom",
+      );
+      const settle = this.settle();
+      const c = new Code();
+      const DST = 0, SRC = 1;
+      c.localGet(DST);
+      c.localGet(SRC);
+      c.structGet(this.promT, PROM_KIND);
+      c.localGet(SRC);
+      c.structGet(this.promT, PROM_F64);
+      c.localGet(SRC);
+      c.structGet(this.promT, PROM_REF);
+      c.localGet(SRC);
+      c.structGet(this.promT, PROM_STATE);
+      c.call(settle);
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  /** The countdown one Promise.all's entries share (see the block above). */
+  get allStateT(): number {
+    this.allStateField ??= this.mb.structType([
+      { storage: I32, mutable: true },
+      { storage: this.promRef(), mutable: false },
+      { storage: this.deps.anyRef, mutable: false },
+    ]);
+    return this.allStateField;
+  }
+
+  allStateRef(): ValType {
+    return { kind: "ref", nullable: true, typeIndex: this.allStateT };
+  }
+
+  /** One Promise.all entry's reaction frame. */
+  get allEntryT(): number {
+    this.allEntryField ??= this.mb.subStructType(
+      "%w.all.entry",
+      [
+        { storage: this.allStateRef(), mutable: false },
+        { storage: F64, mutable: false },
+        { storage: this.promRef(), mutable: false },
+      ],
+      this.deps.frameBase(),
+    );
+    return this.allEntryField;
+  }
+
+  /** One Promise.race entry's reaction frame. */
+  get raceEntryT(): number {
+    this.raceEntryField ??= this.mb.subStructType(
+      "%w.race.entry",
+      [
+        { storage: this.promRef(), mutable: false },
+        { storage: this.promRef(), mutable: false },
+      ],
+      this.deps.frameBase(),
+    );
+    return this.raceEntryField;
   }
 
   /** %w.async.settle(p, kind, f64, ref, state) — FIRST SETTLE WINS: a
