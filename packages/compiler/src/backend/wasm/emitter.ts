@@ -97,7 +97,7 @@ import { TimerBuilder } from "./timers.js";
 import { UnionBuilder, type UnionArmRep } from "./unions.js";
 import { Code } from "./code.js";
 import { buildF64ToStr } from "./numfmt.js";
-import { F64, I32, I64, ModuleBuilder, type ValType } from "./module.js";
+import { F64, I32, I64, ModuleBuilder, type FieldType, type ValType } from "./module.js";
 import {
   asIrModule,
   lowerResumableFunctions,
@@ -431,33 +431,43 @@ class Assembler {
     kindG: number;
     f64G: number;
     refG: number;
+    /** The thrown object's DYNAMIC class interval position — the whole
+     * catch-side class test. See emitThrowValue. */
+    preG: number;
     caughtT: number;
     errT: number;
+    errFields: FieldType[];
   } | null = null;
 
   private exc(): NonNullable<typeof this.excField> {
     if (this.excField === null) {
       const strRef: ValType = { kind: "ref", nullable: true, typeIndex: this.strType };
+      // The snapshot a catch TAKES from the cell: the kind tag, the two
+      // payload slots, and the thrown class's preorder position — copied
+      // in because the cell is cleared on entry and a later throw inside
+      // the handler would otherwise move the answer under a class test.
       const caughtT = this.mb.structType([
         { storage: I32, mutable: false },
         { storage: F64, mutable: false },
         { storage: ANY_REF, mutable: false },
-      ]);
-      // The builtin error instance: class id (RUNTIME_ERROR_CLASSES's
-      // kind), name, message, and the %code slot (null = absent). This
-      // one struct is the whole OBJ payload space — user classes DO
-      // construct in-tier now, but the throw:class / <what>:class gates
-      // keep them out of the cell until the error unification merges the
-      // two representations. `name` and `message` are MUTABLE — Node's
-      // are plain writable fields, and the IR's class def declares them
-      // as such (a fieldSet writes the slot); the class id and the %code
-      // slot are stamped once at construction.
-      const errT = this.mb.structType([
         { storage: I32, mutable: false },
+      ]);
+      // The builtin error instance: vt, name, message, and the %code slot
+      // (null = absent). Slot 0 used to be a class ID out of
+      // RUNTIME_ERROR_CLASSES — it is now the same `vt` every hierarchy
+      // class carries, so a builtin error and a user class answer
+      // instanceof through ONE mechanism and a user `extends Error` class
+      // can simply SUBTYPE this struct (its IR field prefix is exactly
+      // name/message/%code). Hence OPEN rather than final. `name` and
+      // `message` are MUTABLE — Node's are plain writable fields and the
+      // IR's class def declares them so; vt and %code are stamped once.
+      const errFields: FieldType[] = [
+        { storage: this.classes.ciRef(), mutable: false },
         { storage: strRef, mutable: true },
         { storage: strRef, mutable: true },
         { storage: strRef, mutable: false },
-      ]);
+      ];
+      const errT = this.mb.openStructType("class:err", errFields);
       const kindG = this.mb.addGlobal(I32, true, (w) => {
         w.u8(0x41);
         w.sleb(0);
@@ -470,9 +480,29 @@ class Assembler {
         w.u8(0xd0);
         w.sleb(ANY_HEAP);
       });
-      this.excField = { kindG, f64G, refG, caughtT, errT };
+      const preG = this.mb.addGlobal(I32, true, (w) => {
+        w.u8(0x41);
+        w.sleb(-1); // no object pending
+      });
+      this.excField = { kindG, f64G, refG, preG, caughtT, errT, errFields };
     }
     return this.excField;
+  }
+
+  /** An already-evaluated instance's DYNAMIC preorder position, from
+   * local `slot`, pushed as an i32. A hierarchy class reads it off the
+   * vt — an Error-typed binding really can hold a subclass — while a
+   * standalone class has exactly one possible runtime class and no vt to
+   * read, so its position is a compile-time constant. */
+  private emitDynamicPre(slot: number, info: ClassInfo): void {
+    const code = this.fn.code;
+    if (!info.meta.hierarchy) {
+      code.i32Const(info.meta.pre);
+      return;
+    }
+    code.localGet(slot);
+    code.structGet(info.struct, CLASS_VT);
+    code.structGet(this.classes.ci(), CI_PRE);
   }
 
   /** The unwind at a point where an exception is pending: branch to the
@@ -512,30 +542,35 @@ class Assembler {
     return { kind: "ref", nullable: true, typeIndex: this.exc().caughtT };
   }
 
-  /** The instanceof test on a snapshot already in local `c`, over the
-   * CLOSED builtin error table: kind is OBJ, and — for a subclass — the
-   * payload's class id matches. Nothing but a builtin error can BE in the
-   * cell (the throw:class gate), so %Error (no base) is simply "any OBJ".
-   * Leaves an i32. Shared by caughtTest's instanceof and caughtCheck's
-   * guard. */
-  private emitCaughtIsClass(rec: { kind: number; base: string | null }, c: number): void {
+  /** `caught instanceof C` on a snapshot already in local `c`: the kind
+   * is OBJ and the recorded interval position falls inside C's range.
+   * The payload is never touched — which is the point. A cast-based test
+   * would have to name a struct, and the thrown object may be a class
+   * with no relation to C at all (an ordinary user class thrown into a
+   * handler asking about Error); the interval simply answers false.
+   * Leaves an i32. Shared by caughtTest's instanceof and caughtCheck. */
+  private emitCaughtIsClass(meta: LlClassMeta, c: number): void {
     const exc = this.exc();
     const code = this.fn.code;
     code.localGet(c);
     code.structGet(exc.caughtT, 0);
     code.i32Const(EXC_OBJ);
     code.i32Eq();
-    if (rec.base === null) return;
-    // A subclass test needs the payload's id — but only cast it once the
-    // kind says OBJ (any other payload would fail the ref.cast, not the
-    // test).
+    // A root with no base spans every class in its own hierarchy, but
+    // NOT other hierarchies, so the range test is still needed — unlike
+    // the closed builtin table this replaces, where "any OBJ" was sound.
     this.openIfResult(I32);
+    const pre = this.acquireScratch(I32);
     code.localGet(c);
-    code.structGet(exc.caughtT, 2);
-    code.refCast(exc.errT);
-    code.structGet(exc.errT, 0);
-    code.i32Const(rec.kind);
-    code.i32Eq();
+    code.structGet(exc.caughtT, 3);
+    code.localTee(pre);
+    code.i32Const(meta.pre);
+    code.i32GeS();
+    code.localGet(pre);
+    code.i32Const(meta.post);
+    code.i32LeS();
+    code.i32And();
+    this.releaseScratch(I32, pre);
     code.else_();
     code.i32Const(0);
     this.close();
@@ -548,6 +583,8 @@ class Assembler {
     const code = this.fn.code;
     code.refNull(ANY_HEAP);
     code.globalSet(exc.refG);
+    code.i32Const(-1);
+    code.globalSet(exc.preG);
     code.i32Const(0);
     code.globalSet(exc.kindG);
   }
@@ -555,18 +592,29 @@ class Assembler {
   /** Build a builtin error instance from literals and store it into the
    * cell (kind OBJ). Fences and TDZ reads throw this shape; the caller
    * emits the unwind. */
-  private emitSetCellErrorLit(cls: number, name: string, message: string, codeLit: string | null): void {
+  private emitSetCellErrorLit(className: string, name: string, message: string, codeLit: string | null): void {
     const exc = this.exc();
     const code = this.fn.code;
-    code.i32Const(cls);
+    this.pushErrVt(className);
     this.pushStrLit(name);
     this.pushStrLit(message);
     if (codeLit !== null) this.pushStrLit(codeLit);
     else code.refNull(this.strType);
     code.structNew(exc.errT);
     code.globalSet(exc.refG);
+    // The class is known exactly here, so the cell's interval position is
+    // a constant — no vt read.
+    const meta = this.classes.meta(className);
+    if (meta === undefined) throw new Error(`wasm emitter bug: cell error literal of unknown class ${className}`);
+    code.i32Const(meta.pre);
+    code.globalSet(exc.preG);
     code.i32Const(EXC_OBJ);
     code.globalSet(exc.kindG);
+  }
+
+  /** A builtin error class's interval global — errT's `vt` operand. */
+  private pushErrVt(className: string): void {
+    this.fn.code.globalGet(this.classes.vtGlobal(className));
   }
 
   /** Evaluate a thrown value and fill the cell from its STATIC type —
@@ -596,22 +644,42 @@ class Assembler {
         code.i32Const(EXC_STR);
         code.globalSet(exc.kindG);
         return;
-      case "object":
-        // The OBJ cell is errT-shaped: the caught/uncaught paths ref.cast
-        // it to read a name and message. Emitted user classes map now but
-        // have no place in that cell until the error unification merges
-        // the two — mapType success stopped being the honest gate here,
-        // so the builtin table is the gate.
-        if (!RUNTIME_ERROR_CLASSES.has(t.className)) {
+      case "object": {
+        // Errors — builtin or a user class rooted in one — now that they
+        // share errT. The cell records the thrown object's DYNAMIC
+        // interval position beside the payload, and THAT is what makes a
+        // `catch (e) { e instanceof AppError }` work: an Error-typed
+        // reference can hold any subclass, so the old class-id compare
+        // could not tell user subclasses apart at all.
+        //
+        // A non-error class still refuses. Not because the cell cannot
+        // hold it — it can, that is what preG is for — but because a
+        // rejected PROMISE carries only (kind, f64, ref), so the interval
+        // would be lost the moment an async function turned this throw
+        // into a rejection. Widening that triple is its own change.
+        if (!this.classes.errorRooted(t.className)) {
           this.refuse("throw:class", v.loc);
           code.unreachable();
           return;
         }
+        const info = this.classInfo(t.className, v.loc);
+        if (info === null) {
+          code.unreachable();
+          return;
+        }
+        const ref = this.classes.ref(info);
+        const o = this.acquireScratch(ref);
         this.walkExpr(v);
+        code.localSet(o);
+        this.emitDynamicPre(o, info);
+        code.globalSet(exc.preG);
+        code.localGet(o);
         code.globalSet(exc.refG);
         code.i32Const(EXC_OBJ);
         code.globalSet(exc.kindG);
+        this.releaseScratch(ref, o);
         return;
+      }
       default: {
         // Any other representation rides the generic ref slot (union,
         // record, array, closure — the scr_throw_ref family). mapType
@@ -635,8 +703,12 @@ class Assembler {
    * value's STATIC type — emitThrowValue's dispatch, answering the same
    * three slots because a promise payload and a thrown payload share one
    * encoding. `null` is a VOID fulfilment (kind 0, no payload). The
-   * unused slots still push their zero: the runtime takes all three. */
-  private emitPayload(v: WExpr | null, what: string, loc: SrcLoc): void {
+   * unused slots still push their zero: the runtime takes all three.
+   *
+   * `rejecting` splits the OBJECT arm, and only that arm: a rejection can
+   * re-enter as an exception and needs its class recoverable, a
+   * fulfilment is read back by the awaiting site's own static type. */
+  private emitPayload(v: WExpr | null, what: string, loc: SrcLoc, rejecting: boolean): void {
     const code = this.fn.code;
     if (v === null) {
       code.i32Const(0);
@@ -670,11 +742,22 @@ class Assembler {
         this.walkExpr(v);
         return;
       case "object":
-        // Builtin error instances only — the payload triple IS the
-        // exception cell's encoding, so it inherits emitThrowValue's
-        // errT-shaped OBJ slot and its gate.
-        if (!RUNTIME_ERROR_CLASSES.has(t.className)) {
+        // A REJECTION payload must be error-rooted: the triple has no
+        // interval slot, so when the rejection re-enters as an exception
+        // the cell's interval is recovered from the payload's own vt, and
+        // only an error-rooted instance is guaranteed to have one.
+        //
+        // A FULFILMENT has no such reader. Its payload is read back by
+        // the awaiting side's STATIC type — a cast to exactly the type
+        // the await site already knows — so any class the tier can
+        // represent rides it, and `async function f(): Promise<Item>`
+        // over an ordinary user class needs no gate at all.
+        if (rejecting && !this.classes.errorRooted(t.className)) {
           this.refuse(`${what}:class`, loc);
+          code.unreachable();
+          return;
+        }
+        if (this.mapType(t, v.loc) === null) {
           code.unreachable();
           return;
         }
@@ -1291,6 +1374,10 @@ class Assembler {
         refuse: (kind, loc) => this.refuse(kind, loc),
         slotFnType: (slot) => this.vtSlotPair(slot).fn,
         slotEntry: (slot, impl) => this.vtSlotEntry(slot, impl),
+        errStruct: () => {
+          const exc = this.exc();
+          return { struct: exc.errT, fields: exc.errFields };
+        },
       },
     );
     return this.classesField;
@@ -1469,12 +1556,9 @@ class Assembler {
         // The lowering's frame handle — resume's uniform parameter.
         return { kind: "ref", nullable: true, typeIndex: this.frameBaseType() };
       case "object": {
-        // The builtin error classes share the ONE error struct (their
-        // class id is a field, not a type) until the error unification
-        // lands; every other class is its own struct (classes.ts).
-        if (RUNTIME_ERROR_CLASSES.has(t.className)) {
-          return { kind: "ref", nullable: true, typeIndex: this.exc().errT };
-        }
+        // ONE door for every class. The five builtin errors resolve to
+        // the shared errT and a user class rooted in one resolves to its
+        // subtype of errT, so nothing above here distinguishes them.
         const info = this.classInfo(t.className, loc);
         return info === null ? null : this.classes.ref(info);
       }
@@ -1488,7 +1572,7 @@ class Assembler {
    * mapType's and mapTypeSoft's object arms — and the vector-element
    * mappability list — must share, or one signature gets two views. */
   private objectMappable(className: string): boolean {
-    return RUNTIME_ERROR_CLASSES.has(className) || this.classes.info(className, undefined, true) !== null;
+    return this.classes.info(className, undefined, true) !== null;
   }
 
   /** The pre-pass variant: a placeholder for unmappable types, NO refusal.
@@ -1554,13 +1638,11 @@ class Assembler {
       case "%frameBase":
         return { kind: "ref", nullable: true, typeIndex: this.frameBaseType() };
       case "object": {
-        // Same arm as mapType, in lockstep: builtin errors are errT, an
-        // emitted class is its own struct, a runtime-rooted one is the
-        // placeholder. Answering a placeholder where mapType succeeds is
-        // the recurring increment-6/7/10 bug — one signature, two views.
-        if (RUNTIME_ERROR_CLASSES.has(t.className)) {
-          return { kind: "ref", nullable: true, typeIndex: this.exc().errT };
-        }
+        // Same arm as mapType, in lockstep: an emitted class (errT and
+        // its subtypes included) is its own struct, a runtime-rooted one
+        // is the placeholder. Answering a placeholder where mapType
+        // succeeds is the recurring increment-6/7/10 bug — one signature,
+        // two views.
         const info = this.classes.info(t.className, undefined, true);
         return info === null ? I32 : this.classes.ref(info);
       }
@@ -2037,7 +2119,7 @@ class Assembler {
           code.unreachable();
           return;
         }
-        this.emitSetCellErrorLit(0, "Error", s.message, s.code);
+        this.emitSetCellErrorLit("%Error", "Error", s.message, s.code);
         this.emitUnwind();
         return;
 
@@ -2061,6 +2143,9 @@ class Assembler {
         code.localGet(c);
         code.structGet(exc.caughtT, 2);
         code.globalSet(exc.refG);
+        code.localGet(c);
+        code.structGet(exc.caughtT, 3);
+        code.globalSet(exc.preG);
         code.localGet(c);
         code.structGet(exc.caughtT, 0);
         code.globalSet(exc.kindG);
@@ -2106,6 +2191,7 @@ class Assembler {
             code.globalGet(exc.kindG);
             code.globalGet(exc.f64G);
             code.globalGet(exc.refG);
+            code.globalGet(exc.preG);
             code.structNew(exc.caughtT);
             const local = this.fn.localById.get(s.catchLocalId);
             if (local?.boxed === true) {
@@ -2140,23 +2226,29 @@ class Assembler {
           const kS = this.acquireScratch(I32);
           const fS = this.acquireScratch(F64);
           const rS = this.acquireScratch(ANY_REF);
+          const pS = this.acquireScratch(I32);
           code.globalGet(exc.kindG);
           code.localSet(kS);
           code.globalGet(exc.f64G);
           code.localSet(fS);
           code.globalGet(exc.refG);
           code.localSet(rS);
+          code.globalGet(exc.preG);
+          code.localSet(pS);
           this.emitCellClear();
           this.walkBody(s.finallyBody!);
           code.localGet(fS);
           code.globalSet(exc.f64G);
           code.localGet(rS);
           code.globalSet(exc.refG);
+          code.localGet(pS);
+          code.globalSet(exc.preG);
           code.localGet(kS);
           code.globalSet(exc.kindG);
           this.releaseScratch(I32, kS);
           this.releaseScratch(F64, fS);
           this.releaseScratch(ANY_REF, rS);
+          this.releaseScratch(I32, pS);
           this.emitUnwind();
 
           this.close(); // end $finret — the pending-return copy
@@ -2268,7 +2360,7 @@ class Assembler {
        * encoding, which is what lets a rejection copy across field-wise. */
       case "%async.settle":
         this.walkExpr(s.promise);
-        this.emitPayload(s.value, "settle", s.loc);
+        this.emitPayload(s.value, "settle", s.loc, false);
         code.i32Const(1);
         code.call(this.proms.settle());
         return;
@@ -2491,7 +2583,7 @@ class Assembler {
             // indirection after the test.
             code.refIsNull();
             this.openIf();
-            this.emitSetCellErrorLit(0, "ReferenceError", `Cannot access '${local.name}' before initialization`, null);
+            this.emitSetCellErrorLit("%Error", "ReferenceError", `Cannot access '${local.name}' before initialization`, null);
             this.emitUnwind();
             this.close();
             code.localGet(this.localIndex(e.localId));
@@ -3506,7 +3598,7 @@ class Assembler {
             code.call(this.proms.mint());
             code.localSet(p);
             code.localGet(p);
-            this.emitPayload(e.args[0] ?? null, e.name, e.loc);
+            this.emitPayload(e.args[0] ?? null, e.name, e.loc, rejecting);
             code.i32Const(rejecting ? 2 : 1);
             code.call(this.proms.settle());
             code.localGet(p);
@@ -3557,11 +3649,43 @@ class Assembler {
           if (t.kind !== "object") throw new Error("emitter bug: error.new result is not a class");
           const rec = RUNTIME_ERROR_CLASSES.get(t.className);
           if (rec === undefined) throw new Error(`emitter bug: error.new of ${t.className}`);
-          code.i32Const(rec.kind);
+          this.pushErrVt(t.className);
           this.pushStrLit(rec.lib);
           this.walkExpr(e.args[0]!);
           code.refNull(this.strType);
           code.structNew(this.exc().errT);
+          return;
+        }
+        if (e.fn === "error.ctor") {
+          // super(message) into the builtin base — scr_error_init, minus
+          // the vt stamp: `new` already wrote the DERIVED class's vt, and
+          // overwriting it with %Error's would erase the subclass. So
+          // this is exactly the two field stores, name off the RECEIVER's
+          // static builtin base (Node's rule: the class name is not the
+          // name property — "Error" unless the constructor assigns one).
+          const recvT = e.args[0]!.type;
+          if (recvT.kind !== "object") throw new Error("emitter bug: error.ctor receiver is not a class");
+          const info = this.classInfo(recvT.className, e.loc);
+          if (info === null) {
+            code.unreachable();
+            return;
+          }
+          // The receiver arrives upcast to its builtin base, so that
+          // base names which builtin name to stamp (the C emitter reads
+          // the same field off the same static type).
+          const rec = RUNTIME_ERROR_CLASSES.get(recvT.className);
+          if (rec === undefined) throw new Error(`emitter bug: error.ctor on ${recvT.className}`);
+          const ref = this.classes.ref(info);
+          const o = this.acquireScratch(ref);
+          this.walkExpr(e.args[0]!);
+          code.localSet(o);
+          code.localGet(o);
+          this.pushStrLit(rec.lib);
+          code.structSet(info.struct, 1);
+          code.localGet(o);
+          this.walkExpr(e.args[1]!);
+          code.structSet(info.struct, 2);
+          this.releaseScratch(ref, o);
           return;
         }
         if (e.fn === "error.toString") {
@@ -3696,8 +3820,8 @@ class Assembler {
       case "caughtTest": {
         const exc = this.exc();
         if (e.test === "instanceof") {
-          const rec = RUNTIME_ERROR_CLASSES.get(e.className ?? "");
-          if (rec === undefined) {
+          const meta = this.classes.meta(e.className ?? "");
+          if (meta === undefined || !this.classes.errorRooted(e.className ?? "")) {
             this.refuse(`caughtTest:instanceof:${e.className ?? "?"}`, e.loc);
             code.unreachable();
             return;
@@ -3705,7 +3829,7 @@ class Assembler {
           const c = this.acquireScratch(this.caughtRef());
           this.walkExpr(e.value);
           code.localSet(c);
-          this.emitCaughtIsClass(rec, c);
+          this.emitCaughtIsClass(meta, c);
           this.releaseScratch(this.caughtRef(), c);
           if (e.negated === true) code.i32Eqz();
           return;
@@ -3720,10 +3844,9 @@ class Assembler {
 
       /* Checker-trusted payload extraction (the frontend emits it only
        * under a proven test, so the read is kind-unchecked — the caught
-       * analog of unionNarrow). A builtin error extracts as the shared
-       * errT; a USER class never reaches the cell to be extracted from it
-       * (the throw:class gate), so the refusal names `class` rather than
-       * the bare type kind and both halves lift together in stage 4. */
+       * analog of unionNarrow). An error extracts as its OWN struct: the
+       * builtins share errT, a user subclass casts to its subtype, and
+       * the guard that proved the class is what makes either honest. */
       case "caughtNarrow": {
         const exc = this.exc();
         const t = e.type;
@@ -3745,10 +3868,15 @@ class Assembler {
           code.refCast(this.strType);
           return;
         }
-        if (t.kind === "object" && RUNTIME_ERROR_CLASSES.has(t.className)) {
+        if (t.kind === "object" && this.classes.errorRooted(t.className)) {
+          const info = this.classInfo(t.className, e.loc);
+          if (info === null) {
+            code.unreachable();
+            return;
+          }
           this.walkExpr(e.value);
           code.structGet(exc.caughtT, 2);
-          code.refCast(exc.errT);
+          code.refCast(info.struct);
           return;
         }
         this.refuse(`caughtNarrow:${t.kind === "object" ? "class" : t.kind}`, e.loc);
@@ -3763,8 +3891,9 @@ class Assembler {
        * erases the cast). may-throw.ts seeds this node like a `throw`, so
        * the callers' pending checks come free. */
       case "caughtCheck": {
-        const rec = RUNTIME_ERROR_CLASSES.get(e.className);
-        if (rec === undefined) {
+        const meta = this.classes.meta(e.className);
+        const checked = this.classes.errorRooted(e.className) ? this.classInfo(e.className, e.loc) : null;
+        if (meta === undefined || checked === null) {
           this.refuse("caughtCheck:class", e.loc);
           code.unreachable();
           return;
@@ -3773,17 +3902,20 @@ class Assembler {
         const c = this.acquireScratch(this.caughtRef());
         this.walkExpr(e.value);
         code.localSet(c);
-        this.emitCaughtIsClass(rec, c);
-        this.openIfResult({ kind: "ref", nullable: true, typeIndex: exc.errT });
-        // The guard just proved the kind, so the payload cast is honest.
+        this.emitCaughtIsClass(meta, c);
+        this.openIfResult({ kind: "ref", nullable: true, typeIndex: checked.struct });
+        // The interval guard just proved the class, so the cast is honest.
         code.localGet(c);
         code.structGet(exc.caughtT, 2);
-        code.refCast(exc.errT);
+        code.refCast(checked.struct);
         code.else_();
         this.emitSetCellErrorLit(
-          RUNTIME_ERROR_CLASSES.get("%TypeError")!.kind,
+          "%TypeError",
           "TypeError",
-          `caught value is not an instance of ${e.className.slice(1)} (checked cast)`,
+          // The '%' prefix is on RUNTIME class names only — a user class
+          // keeps its own spelling, and an unconditional strip ate its
+          // first letter (the C emitter's conditional strip, ported).
+          `caught value is not an instance of ${e.className.startsWith("%") ? e.className.slice(1) : e.className} (checked cast)`,
           null,
         );
         // The unwind leaves the arm unreachable — wasm's polymorphic
@@ -3973,9 +4105,10 @@ class Assembler {
        * receiver would trap on the struct.get rather than answer false,
        * which is the honest failure if that invariant ever breaks.
        *
-       * On an error VALUE the CLOSED builtin table collapses the interval
-       * to an id compare (%Error, the root, is true for any instance) —
-       * one representation still, until the error unification.
+       * Builtin errors take this same path: their class id became a vt,
+       * so `e instanceof TypeError` and `e instanceof AppError` are one
+       * mechanism — which is the whole point of the unification, since an
+       * id compare could never have recognised a user subclass.
        * Statically-decided cases are folded by the frontend, so only real
        * tests arrive; the operand still evaluates for its effects. */
       case "instanceOf": {
@@ -3983,31 +4116,6 @@ class Assembler {
         if (v.kind !== "object") {
           this.refuse("expr:instanceOf", e.loc);
           code.unreachable();
-          return;
-        }
-        const rec = RUNTIME_ERROR_CLASSES.get(e.className);
-        const errOperand = RUNTIME_ERROR_CLASSES.has(v.className);
-        if (rec !== undefined || errOperand) {
-          if (rec === undefined || !errOperand) {
-            // One side builtin, one side emitted — two representations
-            // with no shared interval space until stage 4 merges them.
-            // The emitted side names the real rock when it has one (a
-            // user class descending from Error); anything else is a
-            // statically-false test the frontend should have folded.
-            const other = this.classInfo(rec === undefined ? e.className : v.className, e.loc);
-            if (other !== null) this.refuse("instanceOf:error-mixed", e.loc);
-            code.unreachable();
-            return;
-          }
-          this.walkExpr(e.value);
-          if (rec.base === null) {
-            code.drop();
-            code.i32Const(1);
-            return;
-          }
-          code.structGet(this.exc().errT, 0);
-          code.i32Const(rec.kind);
-          code.i32Eq();
           return;
         }
         const info = this.classInfo(v.className, e.loc);
@@ -4896,9 +5004,28 @@ class Assembler {
     code.localGet(pr);
     code.structGet(this.proms.promT, PROM_REF);
     code.globalSet(exc.refG);
+    // A rejection payload is (kind, f64, ref) — no interval slot — so the
+    // cell's is RECOVERED from the payload here. Sound because the only
+    // objects that can be a rejection payload are error-rooted
+    // (emitPayload's gate), and every one of those carries a vt.
+    const k = this.acquireScratch(I32);
     code.localGet(pr);
     code.structGet(this.proms.promT, PROM_KIND);
+    code.localTee(k);
+    code.i32Const(EXC_OBJ);
+    code.i32Eq();
+    code.ifResult(I32);
+    code.globalGet(exc.refG);
+    code.refCast(exc.errT);
+    code.structGet(exc.errT, CLASS_VT);
+    code.structGet(this.classes.ci(), CI_PRE);
+    code.else_();
+    code.i32Const(-1);
+    code.end();
+    code.globalSet(exc.preG);
+    code.localGet(k);
     code.globalSet(exc.kindG);
+    this.releaseScratch(I32, k);
     this.emitUnwind();
     this.close();
   }

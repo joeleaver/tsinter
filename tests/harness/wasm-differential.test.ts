@@ -687,6 +687,28 @@ const TIER_FLOOR: string[] = [
   // with the interned undefined arm rather than a null (stage 1's seed
   // rule, first actually exercised here).
   "1586-derived-field-before-super-init.ts",
+  // Increment 13 (classes), stage 4: the ERROR UNIFICATION. The builtin
+  // error struct's slot 0 stopped being a class id out of a closed table
+  // and became the same `vt` every hierarchy class carries, so a user
+  // `extends Error` class is now an ordinary wasm SUBTYPE of it (its IR
+  // field prefix is exactly name/message/%code) and instanceof is the
+  // stage-2 interval test for builtins and user subclasses alike — an id
+  // compare could never have recognised a subclass at all.
+  //
+  // The catch side records the thrown object's DYNAMIC interval position
+  // in the cell and copies it into the snapshot, so a class test on a
+  // caught value never casts the payload. That is what lets an
+  // Error-typed binding discriminate a user hierarchy.
+  "1301-errors-subclass.ts",
+  "1303-errors-rc-stress.ts",
+  "1304-errors-uncaught.ts",
+  "2428-field-redeclare-inherited.ts",
+  // Rejections carry error subclasses through the promise runtime: the
+  // payload triple has no interval slot, so the cell's is recovered from
+  // the payload's own vt when a rejection re-enters as an exception.
+  "1029-async-eager-chains.ts",
+  "1305-errors-async-rejections.ts",
+  "1478-promise-reject.ts",
 ];
 
 interface RunResult {

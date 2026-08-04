@@ -115,6 +115,14 @@ export interface ClassDeps {
    * narrowed it. Null when no implementation function exists (see
    * vtGlobal's comment on unreachable slots). */
   slotEntry: (slot: LlVtSlot, impl: LlClassMeta) => number | null;
+  /** The shared builtin-error struct and its field declaration. The five
+   * builtins ARE this struct (their class id became their vt, so one
+   * declaration still covers the whole builtin hierarchy), and a user
+   * class rooted in it SUBTYPES it — which is why the prefix is taken
+   * verbatim rather than re-mapped: a subtype's fields must match the
+   * supertype's exactly, and `%code` is immutable there while a mapped
+   * field is not. */
+  errStruct: () => { struct: number; fields: FieldType[] };
 }
 
 export class ClassBuilder {
@@ -190,6 +198,15 @@ export class ClassBuilder {
     return this.metaMap.get(className);
   }
 
+  /** Is this class errT-shaped — a builtin error or a user class rooted
+   * in one? Those are exactly the instances that may ride the exception
+   * cell's OBJ payload and a promise's rejection slot, because those two
+   * places read a name and message back out of a bare reference. */
+  errorRooted(className: string): boolean {
+    const meta = this.metaMap.get(className);
+    return meta !== undefined && this.rootKind(meta) === "error";
+  }
+
   /** The vtable struct for one hierarchy ROOT: $ci's {pre, post} head
    * repeated (so an instance's vt still reads as a plain interval — see
    * `vtGlobal`), then one nullable funcref per slot in `root.slots`
@@ -263,10 +280,24 @@ export class ClassBuilder {
       return cached;
     }
     const meta = this.metaMap.get(className);
-    if (meta === undefined || this.rootKind(meta) !== "user") {
+    if (meta === undefined || this.rootKind(meta) === "runtime") {
       this.infos.set(className, null);
       if (!soft) this.refuseClass(className, loc);
       return null;
+    }
+    // The five builtin errors don't get planned — they ARE errT, which
+    // the exception cell owns. Everything above this line treats them
+    // like any other class: same interval, same field indices, same
+    // subsumption rules, so instanceof and casts need no special case.
+    if (RUNTIME_ERROR_CLASSES.has(className)) {
+      const made: ClassInfo = {
+        meta,
+        struct: this.deps.errStruct().struct,
+        fieldIndex: new Map(meta.def.fields.map((f, i) => [f.name, 1 + i])),
+        fieldType: new Map(meta.def.fields.map((f) => [f.name, f.type])),
+      };
+      this.infos.set(className, made);
+      return made;
     }
     return this.plan(meta);
   }
@@ -290,7 +321,7 @@ export class ClassBuilder {
       this.deps.refuse("type:object", loc);
       return;
     }
-    this.deps.refuse(this.rootKind(meta) === "error" ? "class:extends-error" : "class:extends-runtime", loc);
+    this.deps.refuse("class:extends-runtime", loc);
   }
 
   /** Reserve, publish, map, define — in that order, so a field that
@@ -324,9 +355,16 @@ export class ClassBuilder {
       fieldType: new Map(meta.def.fields.map((f) => [f.name, f.type])),
     };
     this.infos.set(name, info);
+    // An error-rooted class SUBTYPES errT, so its first three flattened
+    // fields — %Error's name/message/%code — are errT's own declarations
+    // verbatim. Re-mapping them would spell `%code` mutable and break the
+    // subtype match; past the prefix the ordinary map takes over.
+    const errPrefix = this.rootKind(meta) === "error" ? this.deps.errStruct().fields : null;
     const fields: FieldType[] = [];
     if (meta.hierarchy) fields.push({ storage: this.ciRef(), mutable: false });
-    for (const f of meta.def.fields) fields.push({ storage: this.deps.softType(f.type), mutable: true });
+    meta.def.fields.forEach((f, i) => {
+      fields.push(errPrefix?.[i + 1] ?? { storage: this.deps.softType(f.type), mutable: true });
+    });
     this.mb.defineType(struct, {
       kind: "struct",
       fields,
@@ -336,16 +374,17 @@ export class ClassBuilder {
     return info;
   }
 
-  /** A base's shape, planning it if it is new. Goes through the cache so
-   * a base already in flight (a field that cycles back up) answers with
-   * its reserved index instead of being planned twice. */
+  /** A base's shape. Goes through `info` rather than straight to `plan`
+   * so it answers with the cache when the base is already in flight (a
+   * field that cycles back up) AND takes the builtin-error path when the
+   * base is one — planning %Error would mint a SECOND struct beside errT,
+   * and the two would then disagree at every cast. */
   private classOf(meta: LlClassMeta): ClassInfo {
-    const cached = this.infos.get(meta.def.name);
-    if (cached != null) return cached;
-    if (cached === null) {
+    const got = this.info(meta.def.name, undefined, true);
+    if (got === null) {
       throw new Error(`wasm emitter bug: ${meta.def.name} is an emitted class's base but has no shape`);
     }
-    return this.plan(meta);
+    return got;
   }
 
   private openSpan(): boolean {

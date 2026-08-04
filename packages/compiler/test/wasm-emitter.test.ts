@@ -507,29 +507,11 @@ test("classes: a type family that references itself in every direction", async (
   expect(stdout.toString("utf8")).toBe("root 1 leaf 3\ntrue false\n4 leaf\n");
 });
 
-test("classes: the runtime-rooted families refuse by their own names", async () => {
-  // The census is the work queue, so these two rocks stay TOLD APART: a
-  // class rooted in the builtin Error hierarchy waits on the error
-  // unification, one rooted in EventEmitter/streams on a runtime this
-  // tier has no port of. Throwing a user class is its own gate — the
-  // exception cell's OBJ payload is still errT-shaped.
-  const err = await buildWasm(
-    "extends-error.ts",
-    ["class Boom extends Error {", "  constructor() { super('boom'); }", "}", "throw new Boom();", ""].join("\n"),
-  );
-  expect(err.ok).toBe(false);
-  if (!err.ok) {
-    expect(err.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
-    expect(err.wasmSurvey).toContain("class:extends-error");
-  }
-
-  const thrown = await buildWasm(
-    "throw-class.ts",
-    ["class Bad { why: string; constructor(w: string) { this.why = w; } }", "throw new Bad('nope');", ""].join("\n"),
-  );
-  expect(thrown.ok).toBe(false);
-  if (!thrown.ok) expect(thrown.wasmSurvey).toContain("throw:class");
-
+test("classes: the EventEmitter family refuses; a non-error class throw refuses", async () => {
+  // `extends Error` used to be the third rock here and now compiles — the
+  // error unification made a user subclass an ordinary subtype of the
+  // builtin error struct, so what is left is the runtime hierarchy whose
+  // C prefix embeds registry and stream state this tier has no port of.
   const ee = await buildWasm(
     "extends-ee.ts",
     [
@@ -543,7 +525,21 @@ test("classes: the runtime-rooted families refuse by their own names", async () 
     ].join("\n"),
   );
   expect(ee.ok).toBe(false);
-  if (!ee.ok) expect(ee.wasmSurvey).toContain("class:extends-runtime");
+  if (!ee.ok) {
+    expect(ee.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
+    expect(ee.wasmSurvey).toContain("class:extends-runtime");
+  }
+
+  // Throwing a class that is NOT error-rooted still refuses: the cell
+  // could hold it (that is what the interval slot is for), but a rejected
+  // promise carries only (kind, f64, ref), so an async function turning
+  // the throw into a rejection would lose the class.
+  const thrown = await buildWasm(
+    "throw-class.ts",
+    ["class Bad { why: string; constructor(w: string) { this.why = w; } }", "throw new Bad('nope');", ""].join("\n"),
+  );
+  expect(thrown.ok).toBe(false);
+  if (!thrown.ok) expect(thrown.wasmSurvey).toContain("throw:class");
 });
 
 test("ModuleBuilder: the rec-group span's four guards fail loudly", () => {
@@ -692,4 +688,101 @@ test("classes: dispatch lands on an UNOVERRIDDEN ancestor's implementation", asy
   expect(stdout.toString("utf8")).toBe(
     "thing makes a sound/4 dog makes a sound/4 yip/4 tweet/2\ndog makes a sound | yip\n0,9,\n",
   );
+});
+
+test("errors: a caught binding tells USER subclasses apart, and `as` still checks", async () => {
+  // What the class-id compare this replaced could never do. An
+  // Error-typed catch binding can hold anything error-rooted, so the
+  // handler's `instanceof` chain has to discriminate a two-deep user
+  // hierarchy AND the builtins, in the order written — which is a
+  // preorder-interval test over the position the cell recorded at throw
+  // time, never a cast. The corpus covers the passing half; the failing
+  // half of the checked cast is S009's inherited divergence (Node erases
+  // `as`, so no byte-exact lane exists) and is pinned here.
+  const res = await buildWasm(
+    "err-subclasses.ts",
+    [
+      "class AppError extends Error {",
+      "  status: number;",
+      '  constructor(m: string, s: number) { super(m); this.name = "AppError"; this.status = s; }',
+      "}",
+      "class DbError extends AppError {",
+      '  constructor(m: string) { super(m, 500); this.name = "DbError"; }',
+      "}",
+      "function classify(n: number): string {",
+      "  try {",
+      '    if (n === 0) throw new DbError("db");',
+      '    if (n === 1) throw new AppError("app", 400);',
+      '    if (n === 2) throw new TypeError("bad type");',
+      '    throw new Error("plain");',
+      "  } catch (e) {",
+      '    if (e instanceof DbError) return "db " + e.status + " " + e.name;',
+      '    if (e instanceof AppError) return "app " + e.status;',
+      '    if (e instanceof TypeError) return "type " + e.message;',
+      '    if (e instanceof Error) return "err " + e.message;',
+      '    return "other";',
+      "  }",
+      "}",
+      "for (let i = 0; i < 4; i = i + 1) console.log(classify(i));",
+      // S009 against a USER subclass: the payload is a RangeError, so the
+      // interval guard fails and the catchable TypeError names AppError.
+      "try {",
+      "  try {",
+      '    throw new RangeError("r");',
+      "  } catch (e) {",
+      "    console.log((e as AppError).status);",
+      "  }",
+      "} catch (e) {",
+      '  if (e instanceof TypeError) console.log(e.name + ": " + e.message);',
+      "}",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "db 500 DbError",
+      "app 400",
+      "type bad type",
+      "err plain",
+      "TypeError: caught value is not an instance of AppError (checked cast)",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("async: a plain user class FULFILS a promise (only rejections are gated)", async () => {
+  // No corpus program isolates this — the ones that would are blocked
+  // further along — but the two directions are genuinely different and
+  // the difference is easy to lose. A REJECTION payload has to stay
+  // error-rooted, because when it re-enters as an exception the cell's
+  // class interval is recovered from the payload's own vt. A FULFILMENT
+  // is read back by the awaiting site's STATIC type, so it needs no vt
+  // and no gate: any class the tier can represent rides it.
+  const res = await buildWasm(
+    "async-class-value.ts",
+    [
+      "class Item {",
+      "  id: number;",
+      "  label: string;",
+      "  constructor(id: number, label: string) { this.id = id; this.label = label; }",
+      "}",
+      "async function make(n: number): Promise<Item> {",
+      '  return new Item(n, "item" + n);',
+      "}",
+      "async function main(): Promise<void> {",
+      "  const a = await make(1);",
+      "  const b = await make(2);",
+      "  console.log(a.id, a.label, b.id, b.label);",
+      "}",
+      "main();",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("1 item1 2 item2\n");
 });
