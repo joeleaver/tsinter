@@ -280,3 +280,25 @@ program can pin it, and not merely because the lanes agree — a program
 whose output depended on the aliasing would diverge from Node and fail
 the differential by construction, so the corpus can only contain
 programs that never look.
+
+## S015 — Keyed reads on `unknown` see OWN properties only *(inherited)*
+
+`u[k]` on a checked-dynamic value answers the receiver's OWN member, or
+`undefined` when it has none. Node consults the prototype chain, so
+`JSON.parse('{}')["toString"]` is a real function there and `undefined`
+here; the same holds for every inherited member of Object, Array and
+String (`hasOwnProperty`, `valueOf`, `slice` as a VALUE rather than a
+call, ...). The named forms that DO work are the ones the runtime models
+directly: `length` on arrays and strings, canonical index reads, and —
+once the invoke surface lands — prototype METHOD CALLS, which dispatch on
+the receiver's kind rather than reading a member. **Rationale:** inherited
+from the C runtime's dyn tree, which stores own entries and has no
+prototype chain; giving it one means materializing Object/Array/String
+prototypes as real function values on every lane, which is a feature
+rather than a fix, and the runtime's design deliberately routes method
+CALLS through kind dispatch instead. The divergence is only observable
+when a prototype member is read as a VALUE, which is rare in the corpus
+and absent from it entirely. **Tested by:** the wasm emitter unit test —
+no corpus program can pin it, because a program whose output observed the
+divergence would fail the differential by construction; the test pins
+tsinter's answer (`undefined`) with Node's in a comment.

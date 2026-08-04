@@ -5250,6 +5250,22 @@ class Assembler {
         return;
       }
 
+      /* The type-independent keyed read on a dyn value (`pkg.name`,
+       * `pkg["k"]`, a `?.` chain step). A missing member answers THE
+       * undefined immortal — JS's own-property answer, so prototype names
+       * like `toString` read undefined too — while a nullish RECEIVER
+       * throws Node's catchable TypeError naming the key, unless the step
+       * is optional. may-throw.ts seeds this node, so the callers' pending
+       * checks come free; the check here is for the throw inside. */
+      case "dynKeyGet": {
+        this.walkExpr(e.value);
+        this.walkExpr(e.key);
+        code.i32Const(e.optional === true ? 1 : 0);
+        code.call(this.dyn.keyGet());
+        this.emitPendingCheck();
+        return;
+      }
+
       /* The JS-lane dyn LITERALS: a mixed-element array and an object
        * whose keys may be runtime values. Both build the tree directly —
        * their elements and values are already dyn, so there is no
@@ -5735,7 +5751,6 @@ class Assembler {
       case "dynFromJsval":
       case "dynCall":
       case "dynInvoke":
-      case "dynKeyGet":
       case "dynHasKey":
       case "dynScalarEq":
       case "dynDestrCheck":

@@ -953,6 +953,42 @@ test("JSON.parse: trailing garbage after a complete number reports cleanly", asy
   );
 });
 
+test("S015: keyed reads on unknown see OWN properties only", async () => {
+  // Node consults the prototype chain here and answers a real function;
+  // every tsinter lane answers undefined because the dyn tree stores own
+  // entries and has no prototype. No corpus program can pin this — one
+  // whose output observed it would fail the differential by construction.
+  // Node's answers, for the record:
+  //   o["toString"]        -> function toString() { [native code] }
+  //   o["hasOwnProperty"]  -> function hasOwnProperty() { [native code] }
+  //   a["slice"]           -> function slice() { [native code] }
+  // The forms that DO work are the modeled ones, asserted alongside so a
+  // reader sees where the line falls.
+  const res = await buildWasm(
+    "dyn-proto.js",
+    [
+      "function p(u) { return String(u); }",
+      "const o = JSON.parse('{\"a\":1}');",
+      "const a = JSON.parse('[10,20]');",
+      "const s = JSON.parse('\"ab\"');",
+      "console.log(p(o.toString) + ' ' + p(o.hasOwnProperty) + ' ' + p(o.valueOf));",
+      "console.log(p(a.slice) + ' ' + p(s.charAt));",
+      "console.log(p(o.a) + ' ' + p(a.length) + ' ' + p(a[1]) + ' ' + p(s.length) + ' ' + p(s[0]));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "undefined undefined undefined",
+      "undefined undefined",
+      "1 2 20 2 a", // the modeled forms are exact
+      "",
+    ].join("\n"),
+  );
+});
+
 test("S014: crossing the dyn boundary COPIES — mutations do not propagate", async () => {
   // No corpus program can ever pin this, and not for the usual reason: a
   // program whose output depends on the aliasing would DIVERGE from Node

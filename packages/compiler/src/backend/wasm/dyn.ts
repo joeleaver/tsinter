@@ -924,6 +924,254 @@ export class DynBuilder {
     });
   }
 
+  /** %w.dyn.canonIdx(k) → the array index `k` names, or -1 when it is not
+   * a CANONICAL index spelling. JS only treats a string key as an index
+   * when it round-trips: digits only, and no leading zero unless the whole
+   * key is "0" — so `a["01"]` and `a["1.0"]` are ordinary (absent) named
+   * properties, not element 1. The overflow guard makes a key longer than
+   * any possible length answer "not an index" rather than wrapping, which
+   * reaches the same undefined by a safe route.
+   *
+   * NOT REUSABLE FOR KEY ORDERING, and the difference is measurable. The
+   * ordering rule (`Object.keys` putting integer-like keys first) accepts
+   * the full array-index range [0, 2^32-2], while the guard here bails
+   * around 2^31. Verified against Node: with keys {z, 4294967295,
+   * 4294967294, 0} the answer is ["0","4294967294","z","4294967295"] —
+   * 2^32-2 sorts as an index and 2^32-1 does not. That is harmless for
+   * READS (no array on this tier has 2^31 elements, so both rules answer
+   * undefined) and WRONG for ordering, which needs its own wider
+   * predicate. */
+  canonIdx(): number {
+    return this.cached("canonIdx", [this.deps.strRef()], [I32], (idx) => {
+      const c = new Code();
+      const N = 1;
+      const I = 2;
+      const V = 3;
+      const U = 4;
+      c.localGet(0);
+      c.arrayLen();
+      c.localTee(N);
+      c.i32Eqz();
+      c.ifVoid();
+      c.i32Const(-1);
+      c.return_();
+      c.end();
+      // A leading zero disqualifies everything except "0" itself.
+      c.localGet(N);
+      c.i32Const(1);
+      c.i32GtU();
+      c.ifVoid();
+      c.localGet(0);
+      c.i32Const(0);
+      c.arrayGetU(this.deps.strType());
+      c.i32Const(0x30);
+      c.i32Eq();
+      c.ifVoid();
+      c.i32Const(-1);
+      c.return_();
+      c.end();
+      c.end();
+      c.i32Const(0);
+      c.localSet(V);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeU();
+      c.brIf(1);
+      c.localGet(0);
+      c.localGet(I);
+      c.arrayGetU(this.deps.strType());
+      c.i32Const(0x30);
+      c.i32Sub();
+      c.localTee(U);
+      c.i32Const(9);
+      c.i32GtU();
+      // (0x7fffffff - 9) / 10 — past this the next step would overflow.
+      c.localGet(V);
+      c.i32Const(214748363);
+      c.i32GtU();
+      c.i32Or();
+      c.ifVoid();
+      c.i32Const(-1);
+      c.return_();
+      c.end();
+      c.localGet(V);
+      c.i32Const(10);
+      c.i32Mul();
+      c.localGet(U);
+      c.i32Add();
+      c.localSet(V);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(V);
+      this.mb.setBody(idx, [I32, I32, I32, I32], c.bytes());
+    });
+  }
+
+  /** Is `k` exactly "length"? */
+  private pushIsLength(c: Code, pushKey: (c: Code) => void): void {
+    pushKey(c);
+    this.deps.lit(c, "length");
+    c.call(this.deps.strEq());
+  }
+
+  /** %w.dyn.keyGet(d, k, opt) → `d[k]`, the type-independent keyed read
+   * (`scr_dyn_key_get`). A missing member is THE undefined immortal, which
+   * is JS's own-property answer — prototype members like `toString` read
+   * undefined too. An undefined or null RECEIVER throws Node's catchable
+   * TypeError naming the key, unless `opt` (a `?.` step) short-circuits to
+   * undefined instead. */
+  keyGet(): number {
+    return this.cached(
+      "keyGet",
+      [this.dynRef(), this.deps.strRef(), I32],
+      [this.dynRef()],
+      (idx) => {
+        const dynT = this.dynT();
+        const c = new Code();
+        const K = 3;
+        const IDX = 4;
+        const M = 5;
+        const MSG = 6;
+        c.localGet(0);
+        c.structGet(dynT, DYN_KIND);
+        c.localSet(K);
+        // Nullish receiver: short-circuit, or Node's message.
+        c.localGet(K);
+        c.i32Const(DK.UNDEF);
+        c.i32Eq();
+        c.localGet(K);
+        c.i32Const(DK.NULL);
+        c.i32Eq();
+        c.i32Or();
+        c.ifVoid();
+        c.localGet(2);
+        c.ifVoid();
+        c.globalGet(this.undefinedGlobal());
+        c.return_();
+        c.end();
+        c.localGet(K);
+        c.i32Const(DK.UNDEF);
+        c.i32Eq();
+        c.ifResult(this.deps.strRef());
+        this.deps.lit(c, "Cannot read properties of undefined (reading '");
+        c.else_();
+        this.deps.lit(c, "Cannot read properties of null (reading '");
+        c.end();
+        c.localGet(1);
+        c.call(this.deps.concat());
+        this.deps.lit(c, "')");
+        c.call(this.deps.concat());
+        c.localSet(MSG);
+        this.deps.throwTypeError(c, (x) => x.localGet(MSG));
+        c.refNull(dynT);
+        c.return_();
+        c.end();
+        // Objects answer their own members.
+        this.arm(c, K, [DK.OBJ], () => {
+          this.objPayload(c, (x) => x.localGet(0));
+          c.localGet(1);
+          c.call(this.objGet());
+          c.localTee(M);
+          c.refIsNull();
+          c.ifResult(this.dynRef());
+          c.globalGet(this.undefinedGlobal());
+          c.else_();
+          c.localGet(M);
+          c.end();
+        });
+        this.arm(c, K, [DK.ARR], () => {
+          this.pushIsLength(c, (x) => x.localGet(1));
+          c.ifVoid();
+          this.boxNum(c, (x) => {
+            this.arrLen(x, (y) => this.arrPayload(y, (z) => z.localGet(0)));
+            x.f64ConvertI32U();
+          });
+          c.return_();
+          c.end();
+          c.localGet(1);
+          c.call(this.canonIdx());
+          c.localTee(IDX);
+          c.i32Const(0);
+          c.i32GeS();
+          c.ifVoid();
+          c.localGet(IDX);
+          this.arrLen(c, (x) => this.arrPayload(x, (y) => y.localGet(0)));
+          c.i32LtU();
+          c.ifVoid();
+          this.arrAt(
+            c,
+            (x) => this.arrPayload(x, (y) => y.localGet(0)),
+            (x) => x.localGet(IDX),
+          );
+          c.return_();
+          c.end();
+          c.end();
+          c.globalGet(this.undefinedGlobal());
+        });
+        this.arm(c, K, [DK.STR], () => {
+          this.pushIsLength(c, (x) => x.localGet(1));
+          c.ifVoid();
+          this.boxNum(c, (x) => {
+            x.localGet(0);
+            x.structGet(dynT, DYN_REF);
+            x.refCast(this.deps.strType());
+            x.arrayLen();
+            x.f64ConvertI32U();
+          });
+          c.return_();
+          c.end();
+          c.localGet(1);
+          c.call(this.canonIdx());
+          c.localTee(IDX);
+          c.i32Const(0);
+          c.i32GeS();
+          c.ifVoid();
+          c.localGet(IDX);
+          c.localGet(0);
+          c.structGet(dynT, DYN_REF);
+          c.refCast(this.deps.strType());
+          c.arrayLen();
+          c.i32LtU();
+          c.ifVoid();
+          // One code unit as its own string — JS's "abc"[1].
+          this.boxStr(c, (x) => {
+            x.i32Const(1);
+            x.arrayNewDefault(this.deps.strType());
+            x.localSet(MSG);
+            x.localGet(MSG);
+            x.i32Const(0);
+            x.localGet(0);
+            x.structGet(dynT, DYN_REF);
+            x.refCast(this.deps.strType());
+            x.localGet(IDX);
+            x.arrayGetU(this.deps.strType());
+            x.arraySet(this.deps.strType());
+            x.localGet(MSG);
+          });
+          c.return_();
+          c.end();
+          c.end();
+          c.globalGet(this.undefinedGlobal());
+        });
+        // FUNC's own props plus name/length arrive with the boxes (stage
+        // 4); BYTES, HANDLE and JSVAL are unconstructible on this tier.
+        this.arm(c, K, [DK.FUNC, DK.BYTES, DK.HANDLE, DK.JSVAL], () => c.unreachable());
+        // NUM and BOOL have no own properties: JS reads undefined.
+        c.globalGet(this.undefinedGlobal());
+        this.mb.setBody(idx, [I32, I32, this.dynRef(), this.deps.strRef()], c.bytes());
+      },
+    );
+  }
+
   /** %w.dyn.kindName(d) → the noun a check failure reports, verbatim from
    * `scr_dyn_kind_name`. A NULL box is "undefined" — C's missing-object-
    * member case, which reaches this the same way. */

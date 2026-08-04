@@ -4558,7 +4558,7 @@ export type IrExpr =
    * string-typed (a strLit for the dot form); `type` is always dyn. An
    * OBJ receiver answers the member (+1) or the undefined singleton (the
    * own-property answer — prototype members like `toString` answer
-   * undefined, SEMANTICS.md); ARR answers `length` and canonical
+   * undefined, SEMANTICS.md S015); ARR answers `length` and canonical
    * in-range indices, STR answers `length` (UTF-16-exact), both
    * undefined otherwise; NUM/BOOL/BYTES answer undefined. An
    * undefined/null receiver THROWS the catchable Node-shaped TypeError
