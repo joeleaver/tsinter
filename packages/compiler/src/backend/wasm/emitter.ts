@@ -86,6 +86,7 @@ import {
 } from "./abi.js";
 import { VecBuilder, type VecInfo } from "./arrays.js";
 import { DK, DYN_KIND, DYN_NUM, DYN_REF, DynBuilder } from "./dyn.js";
+import { JsonBuilder } from "./json.js";
 import {
   PromiseBuilder,
   ALL_REMAINING,
@@ -1321,6 +1322,31 @@ class Assembler {
       arrPush: () => this.vecs.pushOne(this.dynVecInfo()),
     });
     return this.dynField;
+  }
+
+  /* ── JSON.parse (json.ts) ──────────────────────────────────────────────
+   * A recursive-descent parser over the tier's UTF-16 string, emitted
+   * once per module that calls `JSON.parse` and interned by first use. */
+
+  private jsonField: JsonBuilder | null = null;
+
+  private get json(): JsonBuilder {
+    this.jsonField ??= new JsonBuilder(this.mb, {
+      strRef: () => this.strRef,
+      strType: () => this.strType,
+      concat: () => this.concatHelper(),
+      f64ToStr: () => this.f64ToStrHelper(),
+      lit: (c, s) => this.pushStrLitInto(c, s),
+      throwError: (c, className, name, pushMessage) =>
+        this.emitSetCellError(c, className, name, pushMessage, null),
+      excKind: () => this.exc().kindG,
+      newDynVec: (c) => {
+        c.f64Const(0);
+        c.call(this.vecs.newLen(this.dynVecInfo()));
+      },
+      dyn: () => this.dyn,
+    });
+    return this.jsonField;
   }
 
   /** The ARR payload's vector info — the SAME interning a static
@@ -4817,6 +4843,15 @@ class Assembler {
         if (e.fn === "error.toString") {
           this.walkExpr(e.args[0]!);
           code.call(this.errToStrHelper());
+          return;
+        }
+        if (e.fn === "json.parse") {
+          // The parser returns normally with the cell set on a syntax
+          // error (or the depth cap's RangeError), so the call site owns
+          // the pending check — the walkers' discipline.
+          this.walkExpr(e.args[0]!);
+          code.call(this.json.parse());
+          this.emitPendingCheck();
           return;
         }
         if (e.fn === "dyn.typeof") {

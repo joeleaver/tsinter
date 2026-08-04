@@ -600,6 +600,160 @@ test("dyn: String(unknown) is Array.prototype.toString, not the JSON writer", as
   );
 });
 
+test("JSON.parse: syntax errors carry V8's texts, not the C runtime's", async () => {
+  // These ARE Node-observable (a catch binding reads e.message), so Node is
+  // the oracle and the C runtime's approximation — which matches V8 in 4 of
+  // 18 of these cases — is not inherited. No corpus program pins them:
+  // 1004 deliberately catches bindingless. Every expectation below was
+  // captured from Node itself.
+  const res = await buildWasm(
+    "json-errors.ts",
+    [
+      "const cases: string[] = [",
+      "  '', '[', '{', '[1,]', '{\"a\":}', '{a:1}', '[01]', '[1.]', '[1e]', '[-]',",
+      "  '\"abc', '\"a\\\\qb\"', '{\"a\" 1}', '[1 2]', '1 2', '{}extra',",
+      "  '[1,2,3,4,5,6,7,8,9,10,11,12,13,x]', 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaax',",
+      "  'NaN', 'undefined', '\"\\\\u00zz\"', '{\"a\"', '[1',",
+      // A post-comma key failure is a DIFFERENT V8 sentence from a
+      // first-key one, and the leading ellipsis is gated on the POSITION
+      // reaching the window radius rather than on the clamped window
+      // start — they differ only at exactly pos == 10, which is this
+      // input. Both were parity misses the first pass shipped.
+      "  '{\"a\":1,}', '{\"a\":1,2}', '[\"aaaaaa\",@,\"aaaaaa\"]',",
+      "];",
+      "for (const c of cases) {",
+      "  try { JSON.parse(c); console.log('OK'); }",
+      "  catch (e) { if (e instanceof Error) console.log(e.name + ': ' + e.message); else console.log('non-error'); }",
+      "}",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "SyntaxError: Unexpected end of JSON input",
+      "SyntaxError: Unexpected end of JSON input",
+      "SyntaxError: Expected property name or '}' in JSON at position 1 (line 1 column 2)",
+      `SyntaxError: Unexpected token ']', "[1,]" is not valid JSON`,
+      `SyntaxError: Unexpected token '}', "{"a":}" is not valid JSON`,
+      "SyntaxError: Expected property name or '}' in JSON at position 1 (line 1 column 2)",
+      "SyntaxError: Unexpected number in JSON at position 2 (line 1 column 3)",
+      "SyntaxError: Unterminated fractional number in JSON at position 3 (line 1 column 4)",
+      "SyntaxError: Exponent part is missing a number in JSON at position 3 (line 1 column 4)",
+      "SyntaxError: No number after minus sign in JSON at position 2 (line 1 column 3)",
+      "SyntaxError: Unterminated string in JSON at position 4 (line 1 column 5)",
+      "SyntaxError: Bad escaped character in JSON at position 3 (line 1 column 4)",
+      "SyntaxError: Expected ':' after property name in JSON at position 5 (line 1 column 6)",
+      "SyntaxError: Expected ',' or ']' after array element in JSON at position 3 (line 1 column 4)",
+      "SyntaxError: Unexpected non-whitespace character after JSON at position 2 (line 1 column 3)",
+      "SyntaxError: Unexpected non-whitespace character after JSON at position 2 (line 1 column 3)",
+      // The snippet window: whole input at <=20 units, else +/-10 around the
+      // offending position with an ellipsis on whichever side was cut.
+      `SyntaxError: Unexpected token 'x', ...",11,12,13,x]" is not valid JSON`,
+      `SyntaxError: Unexpected token 'a', "aaaaaaaaaa"... is not valid JSON`,
+      // The three JS literals that look like values get V8's bare form —
+      // but only as the WHOLE input, which is why these have no prefix.
+      `SyntaxError: "NaN" is not valid JSON`,
+      `SyntaxError: "undefined" is not valid JSON`,
+      "SyntaxError: Bad Unicode escape in JSON at position 5 (line 1 column 6)",
+      // A structural expectation fires even at end of input; only a missing
+      // VALUE reports "Unexpected end of JSON input".
+      "SyntaxError: Expected ':' after property name in JSON at position 4 (line 1 column 5)",
+      "SyntaxError: Expected ',' or ']' after array element in JSON at position 2 (line 1 column 3)",
+      "SyntaxError: Expected double-quoted property name in JSON at position 7 (line 1 column 8)",
+      "SyntaxError: Expected double-quoted property name in JSON at position 7 (line 1 column 8)",
+      `SyntaxError: Unexpected token '@', ..."["aaaaaa",@,"aaaaaa""... is not valid JSON`,
+      "",
+    ].join("\n"),
+  );
+});
+
+test("S002: JSON.parse keeps lone surrogates, unlike the native lanes' U+FFFD", async () => {
+  // The tier stores UTF-16 code units, so a \\u escape appends its unit
+  // verbatim: a pair written as two escapes combines, and an unpaired half
+  // survives — which is Node's answer. The C runtime substitutes U+FFFD
+  // here as a house policy; S002 says that class is removed, not inherited,
+  // so no corpus program can cover it (the native lanes disagree).
+  const res = await buildWasm(
+    "json-surrogates.ts",
+    [
+      "const lone = JSON.parse('\"\\\\ud800\"') as string;",
+      "console.log(lone.length, lone.charCodeAt(0));",
+      "const pair = JSON.parse('\"\\\\ud83d\\\\ude00\"') as string;",
+      "console.log(pair.length, pair.charCodeAt(0), pair.charCodeAt(1));",
+      "const mixed = JSON.parse('\"a\\\\udc00b\"') as string;",
+      "console.log(mixed.length, mixed.charCodeAt(1));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(["1 55296", "2 55357 56832", "3 56320", ""].join("\n"));
+});
+
+test("S013: JSON.parse's depth cap is 1000 and throws a CATCHABLE RangeError", async () => {
+  // The boundary's first pin on any lane. Node has no cap at all, so this
+  // is the divergence S013 registers; what a corpus program could never
+  // show is that the failure is CATCHABLE — it goes through the exception
+  // cell, unlike the S003/S006/S008 trap family.
+  const res = await buildWasm(
+    "json-depth.ts",
+    [
+      "function nest(n: number): string { return '['.repeat(n) + ']'.repeat(n); }",
+      "JSON.parse(nest(1000));",
+      "console.log('parsed 1000');",
+      "try { JSON.parse(nest(1001)); console.log('no throw'); }",
+      "catch (e) { if (e instanceof RangeError) console.log('RangeError: ' + e.message); else console.log('wrong kind'); }",
+      "console.log('still running');",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    ["parsed 1000", "RangeError: Maximum call stack size exceeded", "still running", ""].join("\n"),
+  );
+});
+
+test("2b-i: the number fast path is exact to 15 digits and TRAPS past it", async () => {
+  // Pins the half-landed boundary itself so 2b-ii's first act is flipping
+  // this test to the correct value rather than discovering where the edge
+  // was. A >15-significant-digit literal is runtime data that no
+  // compile-time refusal can fence, so the only two runtime choices are a
+  // trap or a wrong answer — this is the loud one.
+  const ok = await buildWasm(
+    "json-num-fast.ts",
+    [
+      "const xs: number[] = [",
+      "  JSON.parse('0') as number, JSON.parse('-0') as number, JSON.parse('42') as number,",
+      "  JSON.parse('-2.5') as number, JSON.parse('3e2') as number, JSON.parse('1e-7') as number,",
+      "  JSON.parse('123456789012345') as number,", // 15 significant digits
+      "  JSON.parse('1e22') as number, JSON.parse('1e-22') as number,",
+      "];",
+      "for (const x of xs) console.log(x);",
+      "",
+    ].join("\n"),
+  );
+  if (!ok.ok) throw new Error(`refused: ${ok.diagnostics[0]?.message}`);
+  const fast = await runWasm(ok.binaryPath);
+  expect(fast.stdout.toString("utf8")).toBe(
+    // console.log(-0) prints "-0": that is util.inspect's rendering, not
+    // String(-0) — the same inspect-ism %w.inspF64 exists for.
+    ["0", "-0", "42", "-2.5", "300", "1e-7", "123456789012345", "1e+22", "1e-22", ""].join("\n"),
+  );
+
+  // 16 significant digits: past Clinger's cap, so the fallback trap fires.
+  const slow = await buildWasm(
+    "json-num-slow.ts",
+    ["console.log('before');", "console.log(JSON.parse('1234567890123456') as number);", ""].join("\n"),
+  );
+  if (!slow.ok) throw new Error(`refused: ${slow.diagnostics[0]?.message}`);
+  const run = await runWasmToTrap(slow.binaryPath);
+  expect(run.stdout.toString("utf8")).toBe("before\n");
+});
+
 test("S014: crossing the dyn boundary COPIES — mutations do not propagate", async () => {
   // No corpus program can ever pin this, and not for the usual reason: a
   // program whose output depends on the aliasing would DIVERGE from Node

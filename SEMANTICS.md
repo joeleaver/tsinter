@@ -227,6 +227,31 @@ corpus `2649-top-level-await-pending` and
 compare skipped for nonzero exits) plus the wasm top-level-await unit test
 (exit 13 with the armed timer's output intact).
 
+## S013 — `JSON.parse` caps nesting depth at 1000 *(inherited)*
+
+A JSON document nested more than 1000 levels deep throws a catchable
+`RangeError` reading `Maximum call stack size exceeded` instead of
+parsing. This diverges on EVERY lane — the C runtime's parser
+(`SCR_JSON_MAX_DEPTH`, scr_json.c), the LLVM lane that links it, and the
+emitted wasm parser all carry the same cap — and it is new to none of
+them: Node has NO depth limit, because V8's JSON parser is iterative and
+nesting is bounded only by memory (100,000 levels parse fine there), so
+every lane has diverged past the cap for as long as the cap has existed.
+**Rationale:** all three parsers are recursive descent, where unbounded
+recursion smashes the native stack (or exhausts the wasm one); a
+predictable catchable `RangeError` at a documented depth is a better
+failure than an unpredictable stack-exhaustion abort. The message is the
+one V8 produces when a *recursive* JS reviver blows the stack, which is
+the nearest true thing to say. The error is CATCHABLE through the
+exception cell on every lane (`scr_throw_error` natively) — deliberately
+NOT a member of the uncatchable-trap family S003/S006/S008, which exists
+for checks the may-throw analysis counts as aborts. Removing the
+divergence means an iterative parser with an explicit value stack on
+every lane. **Tested by:** the wasm emitter unit test — 1000 levels
+parse, 1001 throws — which is the FIRST pin this boundary has ever had;
+the native lanes carry no corpus or unit coverage for it (pre-existing
+untested behavior), and no corpus program goes near the depth.
+
 ## S014 — Crossing the `unknown` boundary COPIES; mutations do not propagate *(inherited)*
 
 Converting a typed composite into an `unknown` value DEEP-COPIES it, and

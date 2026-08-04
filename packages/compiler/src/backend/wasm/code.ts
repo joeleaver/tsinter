@@ -306,6 +306,9 @@ export class Code {
   f64ConvertI32U(): void {
     this.w.u8(0xb8);
   }
+  f64ConvertI64U(): void {
+    this.w.u8(0xba);
+  }
   i64ReinterpretF64(): void {
     this.w.u8(0xbd);
   }

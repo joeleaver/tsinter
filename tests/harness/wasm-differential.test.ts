@@ -781,6 +781,24 @@ const TIER_FLOOR: string[] = [
   "1882-default-cjs-interop/main.ts",
   "2430-empty-literal-unknown-field.js",
   "2435-loose-same-kind-equality.ts",
+  // Increment 14 (dyn core), stage 2b-i: JSON.parse — a recursive-descent
+  // parser over the UTF-16 string (json.ts). The GRAMMAR is scr_json.c's;
+  // the error TEXTS are V8's, because those are observable through a catch
+  // binding and the C runtime's are self-described approximations that
+  // match Node in 4 of 18 cases. Lone surrogates survive (S002), positions
+  // are code-unit indices, and the depth cap throws a CATCHABLE RangeError
+  // (S013).
+  //
+  // The number path is deliberately HALF-LANDED: Clinger's fast path is
+  // exact for <=15 significant digits with |exp10| <= 22, and everything
+  // else traps loudly until Simple Decimal Conversion lands in 2b-ii. A
+  // corpus program whose real input misses the fast path therefore fails
+  // the differential rather than answering wrongly, which is what keeps
+  // this list honest without a compile-time fence.
+  "1002-json-parse-cast.ts",
+  "1004-json-parse-errors.ts",
+  "1539-unknown-truthiness.ts",
+  "912-unknown-slots.ts",
 ];
 
 interface RunResult {
