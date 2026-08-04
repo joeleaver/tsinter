@@ -63,7 +63,7 @@ import {
 } from "../../ir/nodes.js";
 import { computeMayThrow } from "../emission/may-throw.js";
 import { buildClassGraph } from "../llvm/classes.js";
-import { ClassBuilder, type ClassInfo } from "./classes.js";
+import { CI_PRE, CLASS_VT, ClassBuilder, type ClassInfo } from "./classes.js";
 import {
   EXPORT_ENTRY,
   EXPORT_MEMORY,
@@ -3885,29 +3885,83 @@ class Assembler {
         return;
       }
 
-      /* `x instanceof C` on an error VALUE (caughtTest is the catch-binding
-       * twin): the same CLOSED builtin table, so the preorder interval
-       * collapses to an id compare — and %Error, the root every builtin
-       * descends from, is true for any instance. The frontend folds the
-       * statically-decided cases, so only real tests arrive; the operand
-       * still evaluates for its effects. */
+      /* `x instanceof C` — the O(1) PREORDER-INTERVAL test, the C and LLVM
+       * lanes' `vt->pre >= C.pre && vt->pre <= C.post` ported instruction
+       * for instruction. The instance carries its class's interval in the
+       * vt field every hierarchy member has at slot 0; C's interval is a
+       * whole-program constant, so both bounds inline. Preorder numbering
+       * is what makes one range test answer for a whole subtree — and it
+       * is why the numbering is IMPORTED rather than re-derived (a family
+       * class's interval spans its generic instantiations, so
+       * `boxOfNumbers instanceof Box` is true here exactly as in Node).
+       *
+       * Deliberately NOT null-checked: `vt` is stamped by struct.new and
+       * immutable, and a class-typed value is never null — null and
+       * undefined ride unions, which narrow before any instanceof. A null
+       * receiver would trap on the struct.get rather than answer false,
+       * which is the honest failure if that invariant ever breaks.
+       *
+       * On an error VALUE the CLOSED builtin table collapses the interval
+       * to an id compare (%Error, the root, is true for any instance) —
+       * one representation still, until the error unification.
+       * Statically-decided cases are folded by the frontend, so only real
+       * tests arrive; the operand still evaluates for its effects. */
       case "instanceOf": {
         const v = e.value.type;
-        const rec = RUNTIME_ERROR_CLASSES.get(e.className);
-        if (rec === undefined || v.kind !== "object" || !RUNTIME_ERROR_CLASSES.has(v.className)) {
+        if (v.kind !== "object") {
           this.refuse("expr:instanceOf", e.loc);
           code.unreachable();
           return;
         }
-        this.walkExpr(e.value);
-        if (rec.base === null) {
-          code.drop();
-          code.i32Const(1);
+        const rec = RUNTIME_ERROR_CLASSES.get(e.className);
+        const errOperand = RUNTIME_ERROR_CLASSES.has(v.className);
+        if (rec !== undefined || errOperand) {
+          if (rec === undefined || !errOperand) {
+            // One side builtin, one side emitted — two representations
+            // with no shared interval space until stage 4 merges them.
+            // The emitted side names the real rock when it has one (a
+            // user class descending from Error); anything else is a
+            // statically-false test the frontend should have folded.
+            const other = this.classInfo(rec === undefined ? e.className : v.className, e.loc);
+            if (other !== null) this.refuse("instanceOf:error-mixed", e.loc);
+            code.unreachable();
+            return;
+          }
+          this.walkExpr(e.value);
+          if (rec.base === null) {
+            code.drop();
+            code.i32Const(1);
+            return;
+          }
+          code.structGet(this.exc().errT, 0);
+          code.i32Const(rec.kind);
+          code.i32Eq();
           return;
         }
-        code.structGet(this.exc().errT, 0);
-        code.i32Const(rec.kind);
-        code.i32Eq();
+        const info = this.classInfo(v.className, e.loc);
+        const target = this.classInfo(e.className, e.loc);
+        if (info === null || target === null) {
+          code.unreachable();
+          return;
+        }
+        if (!info.meta.hierarchy) {
+          // A standalone class has exactly one possible runtime class, so
+          // the frontend folds the test instead of emitting it — and the
+          // operand has no vt to read. Reaching here means it did not.
+          throw new Error(`wasm emitter bug: instanceOf on standalone class ${v.className}`);
+        }
+        const pre = this.acquireScratch(I32);
+        this.walkExpr(e.value);
+        code.structGet(info.struct, CLASS_VT);
+        code.structGet(this.classes.ci(), CI_PRE);
+        code.localTee(pre);
+        code.i32Const(target.meta.pre);
+        code.i32GeS();
+        code.localGet(pre);
+        code.i32Const(target.meta.post);
+        code.i32LeS();
+        code.i32And();
+        this.releaseScratch(I32, pre);
         return;
       }
 
@@ -4185,19 +4239,37 @@ class Assembler {
           else code.i32Ne();
           return;
         }
-        if (k === "array" || k === "func") {
-          // Reference identity — JS object/function equality exactly
-          // (zero-capture closures intern, so `f === f` holds).
+        if (k === "array" || k === "func" || k === "record" || k === "object" || k === "promise") {
+          // Reference identity — JS object/function equality exactly.
+          // Every one of these is a GC struct or array reference and
+          // `ref.eq` compares references, which is what the C lane's `l ==
+          // r` on the same operands does (one pointer compare for arrays,
+          // closures, records, instances and promises alike). Records
+          // included: recordLit allocates a fresh struct per evaluation,
+          // so two structurally equal literals are correctly unequal, and
+          // two refs of DIFFERENT shapes still compare (every struct ref
+          // is an eqref) and correctly answer false. Zero-capture closures
+          // intern, so `f === f` holds. Promises are ONE struct whatever
+          // their inner type (promises.ts), so promise identity is the
+          // same single comparison — and `p.then()` mints a fresh one, so
+          // `p.then() === p` is false here exactly as in Node.
+          //
+          // The representation has to be REAL: an operand whose type the
+          // tier cannot spell holds a placeholder i32, and `ref.eq` over
+          // that is a validation error rather than a wrong answer. mapType
+          // is the gate, and it names the missing representation.
+          if (this.mapType(e.left.type, e.loc) === null || this.mapType(e.right.type, e.loc) === null) {
+            code.unreachable();
+            return;
+          }
           this.walkExpr(e.left);
           this.walkExpr(e.right);
           code.refEq();
           if (e.op === "!==") code.i32Eqz();
           return;
         }
-        // Records, class instances, and class VALUES — every remaining
-        // reference identity. The instances are ready to join the arm
-        // above (their structs exist); the identity plane is where that
-        // and instanceof land together.
+        // Class VALUES are what is left: one immortal object per class,
+        // so identity is the classval surface's to answer.
         this.refuse("bin:ref-eq", e.loc);
         code.unreachable();
         return;

@@ -603,6 +603,50 @@ const TIER_FLOOR: string[] = [
   "969-unions-arm-matrix.ts",
   "972-unions-nested.ts",
   "979-unions-optional-chaining.ts",
+  // Increment 13 (classes), stage 2: the IDENTITY plane. `instanceof` is
+  // the O(1) preorder-interval test the C and LLVM lanes use — the vt
+  // word an instance carries holds its class's `pre`, the target's
+  // interval inlines as two constants, and one range test answers for a
+  // whole subtree. `===`/`!==` on any GC reference becomes `ref.eq`.
+  //
+  // instanceof across an inheritance chain, including the narrowing the
+  // frontend does NOT fold.
+  "712-inheritance-instanceof.ts",
+  "2455-private-brand-checks.ts",
+  "1962-namespace-classes.ts",
+  "1954-generic-modules/main.ts",
+  "2552-generics-iface-methods.ts",
+  // Class-instance identity: 701 was one `===` away after stage 1, and
+  // upcast-identity pins that widening a reference keeps it the SAME
+  // reference (subsumption emits nothing, so this is the observable
+  // proof).
+  "701-classes-composition.ts",
+  "2569-upcast-identity.ts",
+  // RECORD identity rides the same arm — the C lane compares records with
+  // the same plain pointer compare, and recordLit allocates per
+  // evaluation, so two structurally equal literals are correctly unequal.
+  // This is most of the record surface arriving at once.
+  "900-records-basics.ts",
+  "904-records-optional-fields.ts",
+  "906-records-utility-types.ts",
+  "907-records-utility-generics.ts",
+  "530-record-arrays.ts",
+  "531-record-array-hofs.ts",
+  "540-tuples-basics.ts",
+  "1052-comptime-records.ts",
+  "2481-mutual-recursive-records.ts",
+  "2073-destructuring-assignment.ts",
+  "952-modules-cross/main.ts",
+  // Unions whose only remaining blocker was identity on a ref arm.
+  "965-unions-retag.ts",
+  "970-unions-basics.ts",
+  // PROMISE identity rides the same arm: every promise is one struct
+  // whatever its inner type, so `p1 === p2` is the same single compare.
+  // 1982 is the one that earns its keep — it asserts `p0.then() === p0`
+  // is FALSE, so claiming it puts our `.then` under a live differential
+  // check that it mints a fresh promise rather than passing one through.
+  "1369-promise-union.ts",
+  "1982-freeze-resolve-passthrough.ts",
 ];
 
 interface RunResult {

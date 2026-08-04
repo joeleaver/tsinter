@@ -585,3 +585,58 @@ test("ModuleBuilder: the rec-group span's four guards fail loudly", () => {
   ok.endRecGroup();
   expect(WebAssembly.validate(ok.emit())).toBe(true);
 });
+
+test("classes: preorder intervals answer instanceof across a whole forest", async () => {
+  // The corpus exercises instanceof inside single hierarchies; what it
+  // cannot pin is that the NUMBERING is right in the shapes where a wrong
+  // scheme still looks plausible — a second root (whose interval must not
+  // overlap the first's), a three-deep chain (where an ancestor's interval
+  // has to span a grandchild), a sibling branch (which must NOT be
+  // covered), and a GENERIC family, whose synthetic ancestor is the base
+  // of every instantiation so one interval answers for all of them — that
+  // is how `new Box<number>()` and `new Box<string>()` are both `instanceof
+  // Box`, exactly as JS has one `Box` at runtime.
+  const res = await buildWasm(
+    "forest.ts",
+    [
+      'class Base { tag: string = "base"; }',
+      "class Mid extends Base { m: number = 1; }",
+      "class Deep extends Mid { d: number = 2; }",
+      "class Side extends Base { s: number = 3; }",
+      "class Root2 { r: number = 0; }",
+      "class Root2Sub extends Root2 { z: number = 4; }",
+      "class Box<T> extends Base { v: T; constructor(v: T) { super(); this.v = v; } }",
+      "function label(x: Base): string {",
+      '  if (x instanceof Deep) return "deep";',
+      '  if (x instanceof Box) return "box";',
+      '  if (x instanceof Mid) return "mid";',
+      '  if (x instanceof Side) return "side";',
+      '  return "base";',
+      "}",
+      "const all: Base[] = [new Base(), new Mid(), new Deep(), new Side(),",
+      '  new Box<number>(7), new Box<string>("s")];',
+      'let acc = "";',
+      'for (const x of all) acc += label(x) + ",";',
+      "console.log(acc);",
+      "const deep: Base = new Deep();",
+      // Ancestors true through the whole chain, the sibling branch false.
+      "console.log(deep instanceof Base, deep instanceof Mid, deep instanceof Deep, deep instanceof Side);",
+      "const other: Root2 = new Root2Sub();",
+      "console.log(other instanceof Root2, other instanceof Root2Sub);",
+      "const bn: Base = new Box<number>(1);",
+      'const bs: Base = new Box<string>("x");',
+      "const plain: Base = new Base();",
+      // The family interval spans BOTH instantiations and nothing else.
+      "console.log(bn instanceof Box, bs instanceof Box, plain instanceof Box);",
+      // Reference identity beside it: distinct allocations differ.
+      "console.log(bn === bs, bn === bn, deep !== plain);",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    "base,mid,deep,side,box,box,\ntrue true true false\ntrue true\ntrue true false\nfalse true true\n",
+  );
+});

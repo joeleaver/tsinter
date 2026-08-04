@@ -71,6 +71,19 @@ import {
 import { buildClassGraph, type LlClassMeta } from "../llvm/classes.js";
 import { type FieldType, I32, ModuleBuilder, type ValType } from "./module.js";
 
+/** `vt`'s slot on a HIERARCHY class: field 0, ahead of the flattened
+ * field list (standalone classes have no vt and start at 0 — ClassInfo's
+ * fieldIndex has the shift already applied). */
+export const CLASS_VT = 0;
+
+/** $ci's field indices. `pre` is what an instanceof reads off the
+ * instance; `post` completes the interval the native lanes' ScrVt head
+ * carries — nothing reads it from an INSTANCE today, because a target's
+ * interval is always a compile-time constant (a dynamic target is a class
+ * VALUE, which carries its own interval). */
+export const CI_PRE = 0;
+export const CI_POST = 1;
+
 /** One emitted class's wasm shape. */
 export interface ClassInfo {
   meta: LlClassMeta;
@@ -112,10 +125,12 @@ export class ClassBuilder {
    * whole-program preorder interval, immutable. Interned outside any span
    * (it references nothing). */
   ci(): number {
-    this.ciType ??= this.mb.openStructType("class:ci", [
-      { storage: I32, mutable: false },
-      { storage: I32, mutable: false },
-    ]);
+    if (this.ciType === null) {
+      const fields: FieldType[] = [];
+      fields[CI_PRE] = { storage: I32, mutable: false };
+      fields[CI_POST] = { storage: I32, mutable: false };
+      this.ciType = this.mb.openStructType("class:ci", fields);
+    }
     return this.ciType;
   }
 
@@ -136,6 +151,7 @@ export class ClassBuilder {
     }
     const ci = this.ci();
     const index = this.mb.addGlobal({ kind: "ref", nullable: false, typeIndex: ci }, false, (w) => {
+      // Operands in field order: CI_PRE then CI_POST.
       w.u8(0x41); // i32.const pre
       w.sleb(meta.pre);
       w.u8(0x41); // i32.const post
