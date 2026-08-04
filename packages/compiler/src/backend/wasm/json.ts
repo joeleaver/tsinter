@@ -51,12 +51,15 @@
  *      the shortest round-trip form, which for ordinary doubles runs to
  *      16 or 17 significant digits (Math.PI, Number.MAX_SAFE_INTEGER,
  *      1/3, 0.1+0.2 all miss the 15-digit cap), so a measured 94% of
- *      round-tripped doubles land here. The decimal digits are held
- *      exactly, binary shifts are exact operations on that
- *      representation, and the single final round-half-even acts on an
- *      exactly-known residual — so the result is the correctly-rounded
- *      double, which is what strtod promises and therefore what the
- *      native lanes and V8 both produce. */
+ *      round-tripped doubles land here. The full argument for why that
+ *      path is correctly rounded — including why dropping digits past the
+ *      buffer is safe — sits with the implementation below.
+ *
+ * Both stages are pinned by a 100k-case round-trip fuzz against Node
+ * (random double bit patterns through JSON.stringify and back, asserting
+ * bit equality) plus the hard set: subnormals, both ends of the
+ * representable range, exact ties, long digit strings, and the exponent
+ * overflow/underflow forms. */
 import { Code } from "./code.js";
 import type { DynBuilder } from "./dyn.js";
 import { F64, I32, I64, ModuleBuilder, type ValType } from "./module.js";
@@ -817,6 +820,9 @@ export class JsonBuilder {
       const EV = 6;
       const ENEG = 7;
       const V = 8; // f64
+      const START = 9;
+      c.globalGet(this.pos());
+      c.localSet(START);
       c.i64Const(0n);
       c.localSet(MANT);
       c.i32Const(0);
@@ -1074,14 +1080,16 @@ export class JsonBuilder {
       });
       c.return_();
       c.end();
-      // Stage 2 — SEE THE HEADER'S 2b-ii OBLIGATION. Simple Decimal
-      // Conversion has not landed yet, and a >15-digit literal is RUNTIME
-      // data that no compile-time refusal can fence: the only two runtime
-      // choices are a trap or a wrong answer, and this is the loud one.
-      c.unreachable();
+      // Stage 2: Simple Decimal Conversion over the validated span. The
+      // sign is read there too, so the box takes its answer directly.
+      dyn.boxNum(c, (x) => {
+        x.localGet(START);
+        x.globalGet(this.pos());
+        x.call(this.sdc());
+      });
       this.mb.setBody(
         idx,
-        [I64, I32, I32, I32, I32, I32, I32, I32, F64],
+        [I64, I32, I32, I32, I32, I32, I32, I32, F64, I32],
         c.bytes(),
       );
     });
@@ -1388,6 +1396,1067 @@ export class JsonBuilder {
       c.end();
       c.refNull(dynT);
       this.mb.setBody(idx, [dyn.objRef(), this.deps.strRef(), dyn.dynRef(), I32], c.bytes());
+    });
+  }
+
+  /* ── Simple Decimal Conversion: the correctly-rounded fallback ─────────
+   * The exactness argument, which is the only reason to prefer this over
+   * a faster approximation:
+   *
+   *   The decimal digits are held EXACTLY in a base-10 buffer with a
+   *   decimal-point position. `leftShift(k)` multiplies that value by 2^k
+   *   and `rightShift(k)` divides by it; both are schoolbook operations on
+   *   exact integers, so at every step the buffer still names the exact
+   *   real number the literal did — no error has been introduced yet.
+   *   Scaling by powers of two therefore lets us move the value into
+   *   [1<<52, 1<<53) without approximating, and the ONLY rounding in the
+   *   whole path is the final round-half-even, which acts on a residual we
+   *   know exactly (the digits past the mantissa, plus a sticky bit for
+   *   any we had to drop). A correctly-rounded result is what `strtod`
+   *   promises, so this agrees with the native lanes and with V8.
+   *
+   *   TRUNCATION IS SAFE because of that sticky bit. The buffer holds 800
+   *   digits, far past the ~767 a double can ever need; digits beyond it
+   *   are dropped, but a dropped NONZERO digit sets `trunc`, and the
+   *   half-way test consults `trunc` before it calls a tie. So a value
+   *   that looks exactly half-way in the retained digits but is not really
+   *   half-way still rounds up, which is the correct answer.
+   *
+   * VALIDATE THEN VALUE. The grammar walk in `jnumber` throws before any
+   * of this runs, so a malformed literal never reaches the conversion —
+   * the same order `scr_json_number` uses (its errors return NULL before
+   * the strtod call). Note this does NOT cover trailing garbage after a
+   * COMPLETE number (`123...890@`): that token is grammatical and its
+   * value is genuinely needed to build the dyn box, so the caller reports
+   * the garbage afterwards. It only looked like an ordering question
+   * while the fallback was a trap.
+   *
+   * Ported from the algorithm Go's strconv/decimal.go implements; the
+   * digit-count and shift bounds are re-derived below rather than
+   * inherited, and the leftShift avoids Go's `leftcheats` table by
+   * carrying right-to-left into a buffer with computed headroom. */
+
+  /** Digits a double can ever need to round correctly is ~767; 800 gives
+   * headroom and matches the reference implementation's choice. */
+  private static readonly SDC_DIGITS = 800;
+  /** Per-step shift bound. rightShift's accumulator reaches ~10 * 2^k and
+   * leftShift's ~10 * 2^k too, so k <= 56 keeps both inside u64. */
+  private static readonly SDC_MAX_SHIFT = 56;
+
+  private sdcBufG: number | null = null;
+  private sdcBufT: number | null = null;
+  private sdcNdG: number | null = null;
+  private sdcDpG: number | null = null;
+  private sdcTruncG: number | null = null;
+  private sdcNegG: number | null = null;
+
+  private sdcBuf(): { global: number; type: number } {
+    if (this.sdcBufG === null) {
+      const t = this.mb.arrayType("i8", true);
+      this.sdcBufT = t;
+      this.sdcBufG = this.mb.addGlobal({ kind: "ref", nullable: false, typeIndex: t }, false, (w) => {
+        w.u8(0x41);
+        w.sleb(JsonBuilder.SDC_DIGITS);
+        w.u8(0xfb);
+        w.uleb(0x07); // array.new_default
+        w.uleb(t);
+      });
+    }
+    return { global: this.sdcBufG, type: this.sdcBufT! };
+  }
+
+  private i32Global(slot: "nd" | "dp" | "trunc" | "neg"): number {
+    const key = `sdc${slot}` as const;
+    const cur =
+      key === "sdcnd" ? this.sdcNdG
+      : key === "sdcdp" ? this.sdcDpG
+      : key === "sdctrunc" ? this.sdcTruncG
+      : this.sdcNegG;
+    if (cur !== null) return cur;
+    const g = this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41);
+      w.sleb(0);
+    });
+    if (key === "sdcnd") this.sdcNdG = g;
+    else if (key === "sdcdp") this.sdcDpG = g;
+    else if (key === "sdctrunc") this.sdcTruncG = g;
+    else this.sdcNegG = g;
+    return g;
+  }
+
+  private pushDigit(c: Code, pushIndex: (c: Code) => void): void {
+    c.globalGet(this.sdcBuf().global);
+    pushIndex(c);
+    c.arrayGetU(this.sdcBuf().type);
+  }
+
+  private setDigit(c: Code, pushIndex: (c: Code) => void, pushVal: (c: Code) => void): void {
+    c.globalGet(this.sdcBuf().global);
+    pushIndex(c);
+    pushVal(c);
+    c.arraySet(this.sdcBuf().type);
+  }
+
+  /** Drop trailing zero digits, and collapse an all-zero value to nd == 0
+   * (which the driver reads as "this is zero"). */
+  private sdcTrim(): number {
+    return this.cached("sdcTrim", [], [], (idx) => {
+      const c = new Code();
+      const ND = this.i32Global("nd");
+      c.block();
+      c.loop();
+      // Guarded, not `nd > 0 && d[nd-1] == 0`: i32.and evaluates both
+      // sides, so the natural spelling reads d[-1] at nd == 0.
+      c.globalGet(ND);
+      c.i32Const(0);
+      c.i32GtS();
+      c.ifResult(I32);
+      this.pushDigit(c, (x) => {
+        x.globalGet(ND);
+        x.i32Const(1);
+        x.i32Sub();
+      });
+      c.i32Eqz();
+      c.else_();
+      c.i32Const(0);
+      c.end();
+      c.i32Eqz();
+      c.brIf(1);
+      c.globalGet(ND);
+      c.i32Const(1);
+      c.i32Sub();
+      c.globalSet(ND);
+      c.br(0);
+      c.end();
+      c.end();
+      c.globalGet(ND);
+      c.i32Eqz();
+      c.ifVoid();
+      c.i32Const(0);
+      c.globalSet(this.i32Global("dp"));
+      c.end();
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** `%w.json.sdcRShift(k)` — divide the exact value by 2^k. */
+  private sdcRShift(): number {
+    return this.cached("sdcRShift", [I32], [], (idx) => {
+      const ND = this.i32Global("nd");
+      const DP = this.i32Global("dp");
+      const c = new Code();
+      const R = 1;
+      const W = 2;
+      const N = 3; // i64
+      const MASK = 4; // i64
+      const DIG = 5; // i64
+      c.i32Const(0);
+      c.localSet(R);
+      c.i32Const(0);
+      c.localSet(W);
+      c.i64Const(0n);
+      c.localSet(N);
+      // Pull digits in until the accumulator covers 2^k.
+      c.block();
+      c.loop();
+      c.localGet(N);
+      c.localGet(0);
+      c.i64ExtendI32U();
+      c.i64ShrU();
+      c.i64Eqz();
+      c.i32Eqz();
+      c.brIf(1);
+      c.localGet(R);
+      c.globalGet(ND);
+      c.i32GeS();
+      c.ifVoid();
+      // Ran out of digits: a zero accumulator means the value is zero.
+      c.localGet(N);
+      c.i64Eqz();
+      c.ifVoid();
+      c.i32Const(0);
+      c.globalSet(ND);
+      c.return_();
+      c.end();
+      c.block();
+      c.loop();
+      c.localGet(N);
+      c.localGet(0);
+      c.i64ExtendI32U();
+      c.i64ShrU();
+      c.i64Eqz();
+      c.i32Eqz();
+      c.brIf(1);
+      c.localGet(N);
+      c.i64Const(10n);
+      c.i64Mul();
+      c.localSet(N);
+      c.localGet(R);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(R);
+      c.br(0);
+      c.end();
+      c.end();
+      c.br(1);
+      c.end();
+      c.localGet(N);
+      c.i64Const(10n);
+      c.i64Mul();
+      this.pushDigit(c, (x) => x.localGet(R));
+      c.i64ExtendI32U();
+      c.i64Add();
+      c.localSet(N);
+      c.localGet(R);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(R);
+      c.br(0);
+      c.end();
+      c.end();
+      c.globalGet(DP);
+      c.localGet(R);
+      c.i32Const(1);
+      c.i32Sub();
+      c.i32Sub();
+      c.globalSet(DP);
+      c.i64Const(1n);
+      c.localGet(0);
+      c.i64ExtendI32U();
+      c.i64Shl();
+      c.i64Const(1n);
+      c.i64Sub();
+      c.localSet(MASK);
+      // Emit quotient digits while consuming the rest of the input.
+      c.block();
+      c.loop();
+      c.localGet(R);
+      c.globalGet(ND);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(N);
+      c.localGet(0);
+      c.i64ExtendI32U();
+      c.i64ShrU();
+      c.localSet(DIG);
+      c.localGet(N);
+      c.localGet(MASK);
+      c.i64And();
+      c.localSet(N);
+      this.setDigit(c, (x) => x.localGet(W), (x) => {
+        x.localGet(DIG);
+        x.i32WrapI64();
+      });
+      c.localGet(W);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(W);
+      c.localGet(N);
+      c.i64Const(10n);
+      c.i64Mul();
+      this.pushDigit(c, (x) => x.localGet(R));
+      c.i64ExtendI32U();
+      c.i64Add();
+      c.localSet(N);
+      c.localGet(R);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(R);
+      c.br(0);
+      c.end();
+      c.end();
+      // Drain the accumulator; digits past the buffer set the sticky bit.
+      c.block();
+      c.loop();
+      c.localGet(N);
+      c.i64Eqz();
+      c.brIf(1);
+      c.localGet(N);
+      c.localGet(0);
+      c.i64ExtendI32U();
+      c.i64ShrU();
+      c.localSet(DIG);
+      c.localGet(N);
+      c.localGet(MASK);
+      c.i64And();
+      c.localSet(N);
+      c.localGet(W);
+      c.i32Const(JsonBuilder.SDC_DIGITS);
+      c.i32LtS();
+      c.ifVoid();
+      this.setDigit(c, (x) => x.localGet(W), (x) => {
+        x.localGet(DIG);
+        x.i32WrapI64();
+      });
+      c.localGet(W);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(W);
+      c.else_();
+      c.localGet(DIG);
+      c.i64Eqz();
+      c.i32Eqz();
+      c.ifVoid();
+      c.i32Const(1);
+      c.globalSet(this.i32Global("trunc"));
+      c.end();
+      c.end();
+      c.localGet(N);
+      c.i64Const(10n);
+      c.i64Mul();
+      c.localSet(N);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(W);
+      c.globalSet(ND);
+      c.call(this.sdcTrim());
+      this.mb.setBody(idx, [I32, I32, I64, I64, I64], c.bytes());
+    });
+  }
+
+  /** `%w.json.sdcLShift(k)` — multiply the exact value by 2^k. Carries
+   * right-to-left into headroom at the top of the buffer, then slides the
+   * result back to index 0; that avoids the reference implementation's
+   * precomputed table for "how many digits does 2^k add", at the cost of
+   * one copy. The headroom bound is ceil(k * log10 2), 17 at k = 56. */
+  private sdcLShift(): number {
+    return this.cached("sdcLShift", [I32], [], (idx) => {
+      const ND = this.i32Global("nd");
+      const DP = this.i32Global("dp");
+      const c = new Code();
+      const R = 1;
+      const W = 2;
+      const N = 3; // i64
+      const DELTA = 4;
+      const END = 5;
+      // delta = ceil(k * log10(2)); k <= 56 so 17 always suffices.
+      c.i32Const(17);
+      c.localSet(DELTA);
+      c.globalGet(ND);
+      c.localGet(DELTA);
+      c.i32Add();
+      c.localSet(END);
+      // The buffer must hold nd + delta; if it cannot, the tail digits are
+      // already beyond anything a double can see — drop them (sticky) so
+      // the shift still fits.
+      c.localGet(END);
+      c.i32Const(JsonBuilder.SDC_DIGITS);
+      c.i32GtS();
+      c.ifVoid();
+      c.block();
+      c.loop();
+      c.globalGet(ND);
+      c.localGet(DELTA);
+      c.i32Add();
+      c.i32Const(JsonBuilder.SDC_DIGITS);
+      c.i32LeS();
+      c.brIf(1);
+      this.pushDigit(c, (x) => {
+        x.globalGet(ND);
+        x.i32Const(1);
+        x.i32Sub();
+      });
+      c.i32Eqz();
+      c.i32Eqz();
+      c.ifVoid();
+      c.i32Const(1);
+      c.globalSet(this.i32Global("trunc"));
+      c.end();
+      c.globalGet(ND);
+      c.i32Const(1);
+      c.i32Sub();
+      c.globalSet(ND);
+      c.br(0);
+      c.end();
+      c.end();
+      c.globalGet(ND);
+      c.localGet(DELTA);
+      c.i32Add();
+      c.localSet(END);
+      c.end();
+      c.localGet(END);
+      c.localSet(W);
+      c.i64Const(0n);
+      c.localSet(N);
+      c.globalGet(ND);
+      c.i32Const(1);
+      c.i32Sub();
+      c.localSet(R);
+      c.block();
+      c.loop();
+      c.localGet(R);
+      c.i32Const(0);
+      c.i32LtS();
+      c.brIf(1);
+      c.localGet(N);
+      this.pushDigit(c, (x) => x.localGet(R));
+      c.i64ExtendI32U();
+      c.localGet(0);
+      c.i64ExtendI32U();
+      c.i64Shl();
+      c.i64Add();
+      c.localSet(N);
+      c.localGet(W);
+      c.i32Const(1);
+      c.i32Sub();
+      c.localSet(W);
+      this.setDigit(c, (x) => x.localGet(W), (x) => {
+        x.localGet(N);
+        x.i64Const(10n);
+        x.i64RemU();
+        x.i32WrapI64();
+      });
+      c.localGet(N);
+      c.i64Const(10n);
+      c.i64DivU();
+      c.localSet(N);
+      c.localGet(R);
+      c.i32Const(1);
+      c.i32Sub();
+      c.localSet(R);
+      c.br(0);
+      c.end();
+      c.end();
+      c.block();
+      c.loop();
+      c.localGet(N);
+      c.i64Eqz();
+      c.brIf(1);
+      c.localGet(W);
+      c.i32Const(1);
+      c.i32Sub();
+      c.localSet(W);
+      this.setDigit(c, (x) => x.localGet(W), (x) => {
+        x.localGet(N);
+        x.i64Const(10n);
+        x.i64RemU();
+        x.i32WrapI64();
+      });
+      c.localGet(N);
+      c.i64Const(10n);
+      c.i64DivU();
+      c.localSet(N);
+      c.br(0);
+      c.end();
+      c.end();
+      // Slide [W, END) down to 0 and account for the digits gained.
+      c.globalGet(DP);
+      c.localGet(END);
+      c.localGet(W);
+      c.i32Sub();
+      c.globalGet(ND);
+      c.i32Sub();
+      c.i32Add();
+      c.globalSet(DP);
+      c.localGet(END);
+      c.localGet(W);
+      c.i32Sub();
+      c.globalSet(ND);
+      c.globalGet(this.sdcBuf().global);
+      c.i32Const(0);
+      c.globalGet(this.sdcBuf().global);
+      c.localGet(W);
+      c.globalGet(ND);
+      c.arrayCopy(this.sdcBuf().type, this.sdcBuf().type);
+      c.call(this.sdcTrim());
+      this.mb.setBody(idx, [I32, I32, I64, I32, I32], c.bytes());
+    });
+  }
+
+  /** `%w.json.sdcShift(k)` — signed, in bounded steps. */
+  private sdcShift(): number {
+    return this.cached("sdcShift", [I32], [], (idx) => {
+      const c = new Code();
+      const K = 0;
+      c.globalGet(this.i32Global("nd"));
+      c.i32Eqz();
+      c.ifVoid();
+      c.return_();
+      c.end();
+      const step = (dir: 1 | -1): void => {
+        c.block();
+        c.loop();
+        c.localGet(K);
+        c.i32Const(dir * JsonBuilder.SDC_MAX_SHIFT);
+        if (dir > 0) c.i32LeS();
+        else c.i32GeS();
+        c.brIf(1);
+        c.i32Const(JsonBuilder.SDC_MAX_SHIFT);
+        c.call(dir > 0 ? this.sdcLShift() : this.sdcRShift());
+        c.localGet(K);
+        c.i32Const(dir * JsonBuilder.SDC_MAX_SHIFT);
+        c.i32Sub();
+        c.localSet(K);
+        c.br(0);
+        c.end();
+        c.end();
+      };
+      c.localGet(K);
+      c.i32Const(0);
+      c.i32GtS();
+      c.ifVoid();
+      step(1);
+      c.localGet(K);
+      c.call(this.sdcLShift());
+      c.else_();
+      c.localGet(K);
+      c.i32Const(0);
+      c.i32LtS();
+      c.ifVoid();
+      step(-1);
+      c.i32Const(0);
+      c.localGet(K);
+      c.i32Sub();
+      c.call(this.sdcRShift());
+      c.end();
+      c.end();
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** Round-half-even at digit position `n`: the digit there decides,
+   * except an exact tie, which goes to the even neighbour — UNLESS the
+   * sticky bit says digits were dropped, in which case the value is
+   * strictly above the tie and rounds up. That consultation is what makes
+   * truncation safe (see the exactness argument above). */
+  private sdcRoundUp(): number {
+    return this.cached("sdcRoundUp", [I32], [I32], (idx) => {
+      const ND = this.i32Global("nd");
+      const c = new Code();
+      c.localGet(0);
+      c.i32Const(0);
+      c.i32LtS();
+      c.localGet(0);
+      c.globalGet(ND);
+      c.i32GeS();
+      c.i32Or();
+      c.ifVoid();
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      this.pushDigit(c, (x) => x.localGet(0));
+      c.i32Const(5);
+      c.i32Eq();
+      c.localGet(0);
+      c.i32Const(1);
+      c.i32Add();
+      c.globalGet(ND);
+      c.i32Eq();
+      c.i32And();
+      c.ifVoid();
+      c.globalGet(this.i32Global("trunc"));
+      c.ifVoid();
+      c.i32Const(1);
+      c.return_();
+      c.end();
+      // `n > 0 && d[n-1] is odd`, GUARDED. The reference spells this with
+      // a short-circuiting &&; i32.and evaluates both sides, so the
+      // literal transcription reads d[-1] at n == 0. That is reachable on
+      // real input — exactly 2^-1075, the midpoint between zero and the
+      // smallest subnormal, arrives here with n == 0 — and the read is an
+      // UNCATCHABLE abort at the one place a program hands us untrusted
+      // bytes. Fourth instance of this class in this file; see pushCurOr0.
+      c.localGet(0);
+      c.i32Const(0);
+      c.i32GtS();
+      c.ifResult(I32);
+      this.pushDigit(c, (x) => {
+        x.localGet(0);
+        x.i32Const(1);
+        x.i32Sub();
+      });
+      c.i32Const(1);
+      c.i32And();
+      c.else_();
+      c.i32Const(0); // no preceding digit: zero is even, so round down
+      c.end();
+      c.return_();
+      c.end();
+      this.pushDigit(c, (x) => x.localGet(0));
+      c.i32Const(5);
+      c.i32GeS();
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** The integer part as a u64, rounded per sdcRoundUp. */
+  private sdcRoundedInt(): number {
+    return this.cached("sdcRoundedInt", [], [I64], (idx) => {
+      const ND = this.i32Global("nd");
+      const DP = this.i32Global("dp");
+      const c = new Code();
+      const I = 0;
+      const N = 1; // i64
+      c.globalGet(DP);
+      c.i32Const(20);
+      c.i32GtS();
+      c.ifVoid();
+      c.i64Const(-1n); // 0xFFFF_FFFF_FFFF_FFFF
+      c.return_();
+      c.end();
+      c.i64Const(0n);
+      c.localSet(N);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.globalGet(DP);
+      c.i32GeS();
+      c.localGet(I);
+      c.globalGet(ND);
+      c.i32GeS();
+      c.i32Or();
+      c.brIf(1);
+      c.localGet(N);
+      c.i64Const(10n);
+      c.i64Mul();
+      this.pushDigit(c, (x) => x.localGet(I));
+      c.i64ExtendI32U();
+      c.i64Add();
+      c.localSet(N);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.globalGet(DP);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(N);
+      c.i64Const(10n);
+      c.i64Mul();
+      c.localSet(N);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(N);
+      c.globalGet(DP);
+      c.call(this.sdcRoundUp());
+      c.i64ExtendI32U();
+      c.i64Add();
+      this.mb.setBody(idx, [I32, I64], c.bytes());
+    });
+  }
+
+  /** `%w.json.sdcInit(start, end)` — read the (already validated) literal
+   * span into the exact decimal buffer. Leading zeros shift the decimal
+   * point rather than occupying a slot, and digits past the buffer set the
+   * sticky bit. */
+  private sdcInit(): number {
+    return this.cached("sdcInit", [I32, I32], [], (idx) => {
+      const ND = this.i32Global("nd");
+      const DP = this.i32Global("dp");
+      const c = new Code();
+      const I = 2;
+      const U = 3;
+      const SAWDOT = 4;
+      const ESIGN = 5;
+      const EV = 6;
+      c.i32Const(0);
+      c.globalSet(ND);
+      c.i32Const(0);
+      c.globalSet(DP);
+      c.i32Const(0);
+      c.globalSet(this.i32Global("trunc"));
+      c.i32Const(0);
+      c.globalSet(this.i32Global("neg"));
+      c.i32Const(0);
+      c.localSet(SAWDOT);
+      c.localGet(0);
+      c.localSet(I);
+      this.pushAt(c, (x) => x.localGet(I));
+      c.i32Const(0x2d);
+      c.i32Eq();
+      c.ifVoid();
+      c.i32Const(1);
+      c.globalSet(this.i32Global("neg"));
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.end();
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(1);
+      c.i32GeS();
+      c.brIf(1);
+      this.pushAt(c, (x) => x.localGet(I));
+      c.localSet(U);
+      c.localGet(U);
+      c.i32Const(0x2e); // '.'
+      c.i32Eq();
+      c.ifVoid();
+      c.i32Const(1);
+      c.localSet(SAWDOT);
+      c.globalGet(ND);
+      c.globalSet(DP);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(1); // CONTINUE: if(0), loop(1), block(2)
+      c.end();
+      this.pushIsDigit(c, (x) => x.localGet(U));
+      c.i32Eqz();
+      c.brIf(1); // 'e' / 'E' ends the mantissa
+      c.localGet(U);
+      c.i32Const(0x30);
+      c.i32Eq();
+      c.globalGet(ND);
+      c.i32Eqz();
+      c.i32And();
+      c.ifVoid();
+      // A leading zero moves the point instead of taking a slot.
+      c.globalGet(DP);
+      c.i32Const(1);
+      c.i32Sub();
+      c.globalSet(DP);
+      c.else_();
+      c.globalGet(ND);
+      c.i32Const(JsonBuilder.SDC_DIGITS);
+      c.i32LtS();
+      c.ifVoid();
+      this.setDigit(c, (x) => x.globalGet(ND), (x) => {
+        x.localGet(U);
+        x.i32Const(0x30);
+        x.i32Sub();
+      });
+      c.globalGet(ND);
+      c.i32Const(1);
+      c.i32Add();
+      c.globalSet(ND);
+      c.else_();
+      c.localGet(U);
+      c.i32Const(0x30);
+      c.i32Ne();
+      c.ifVoid();
+      c.i32Const(1);
+      c.globalSet(this.i32Global("trunc"));
+      c.end();
+      c.end();
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(SAWDOT);
+      c.i32Eqz();
+      c.ifVoid();
+      c.globalGet(ND);
+      c.globalSet(DP);
+      c.end();
+      // The explicit exponent just moves the point.
+      c.localGet(I);
+      c.localGet(1);
+      c.i32LtS();
+      c.ifVoid();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.i32Const(1);
+      c.localSet(ESIGN);
+      this.pushAt(c, (x) => x.localGet(I));
+      c.i32Const(0x2b);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.end();
+      this.pushAt(c, (x) => x.localGet(I));
+      c.i32Const(0x2d);
+      c.i32Eq();
+      c.ifVoid();
+      c.i32Const(-1);
+      c.localSet(ESIGN);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.end();
+      c.i32Const(0);
+      c.localSet(EV);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(1);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(EV);
+      c.i32Const(100000);
+      c.i32LtS();
+      c.ifVoid();
+      c.localGet(EV);
+      c.i32Const(10);
+      c.i32Mul();
+      this.pushAt(c, (x) => x.localGet(I));
+      c.i32Const(0x30);
+      c.i32Sub();
+      c.i32Add();
+      c.localSet(EV);
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.globalGet(DP);
+      c.localGet(EV);
+      c.localGet(ESIGN);
+      c.i32Mul();
+      c.i32Add();
+      c.globalSet(DP);
+      c.end();
+      c.call(this.sdcTrim());
+      this.mb.setBody(idx, [I32, I32, I32, I32, I32], c.bytes());
+    });
+  }
+
+  /** log2(10^i) rounded down, for i in [0, 8] — how far we may shift in
+   * one step while approaching the target range. */
+  private powtabG: number | null = null;
+  private powtabT: number | null = null;
+
+  private powtab(): { global: number; type: number } {
+    if (this.powtabG === null) {
+      const t = this.mb.arrayType(I32, false);
+      this.powtabT = t;
+      this.powtabG = this.mb.addGlobal({ kind: "ref", nullable: false, typeIndex: t }, false, (w) => {
+        for (const v of [1, 3, 6, 9, 13, 16, 19, 23, 26]) {
+          w.u8(0x41);
+          w.sleb(v);
+        }
+        w.u8(0xfb);
+        w.uleb(0x08);
+        w.uleb(t);
+        w.uleb(9);
+      });
+    }
+    return { global: this.powtabG, type: this.powtabT! };
+  }
+
+  /** `%w.json.sdc(start, end)` → the correctly-rounded double for the
+   * validated literal in that span. */
+  sdc(): number {
+    return this.cached("sdc", [I32, I32], [F64], (idx) => {
+      const ND = this.i32Global("nd");
+      const DP = this.i32Global("dp");
+      const NEG = this.i32Global("neg");
+      const c = new Code();
+      const EXP = 2;
+      const MANT = 3; // i64
+      const N = 4;
+      const BITS = 5; // i64
+      const pushSigned = (mk: (c: Code) => void): void => {
+        c.globalGet(NEG);
+        c.ifResult(F64);
+        mk(c);
+        c.f64Neg();
+        c.else_();
+        mk(c);
+        c.end();
+      };
+      c.localGet(0);
+      c.localGet(1);
+      c.call(this.sdcInit());
+      // Zero, and the ranges no double can reach.
+      c.globalGet(ND);
+      c.i32Eqz();
+      c.globalGet(DP);
+      c.i32Const(-330);
+      c.i32LtS();
+      c.i32Or();
+      c.ifVoid();
+      pushSigned((x) => x.f64Const(0));
+      c.return_();
+      c.end();
+      c.globalGet(DP);
+      c.i32Const(310);
+      c.i32GtS();
+      c.ifVoid();
+      pushSigned((x) => x.f64Const(Infinity));
+      c.return_();
+      c.end();
+      c.i32Const(0);
+      c.localSet(EXP);
+      // Scale down into [0.5, 1).
+      c.block();
+      c.loop();
+      c.globalGet(DP);
+      c.i32Const(0);
+      c.i32LeS();
+      c.brIf(1);
+      c.globalGet(DP);
+      c.i32Const(9);
+      c.i32GeS();
+      c.ifResult(I32);
+      c.i32Const(27);
+      c.else_();
+      c.globalGet(this.powtab().global);
+      c.globalGet(DP);
+      c.arrayGet(this.powtab().type);
+      c.end();
+      c.localSet(N);
+      c.i32Const(0);
+      c.localGet(N);
+      c.i32Sub();
+      c.call(this.sdcShift());
+      c.localGet(EXP);
+      c.localGet(N);
+      c.i32Add();
+      c.localSet(EXP);
+      c.br(0);
+      c.end();
+      c.end();
+      // ...and up, until the leading digit is at least 5.
+      c.block();
+      c.loop();
+      c.globalGet(DP);
+      c.i32Const(0);
+      c.i32LtS();
+      c.globalGet(DP);
+      c.i32Eqz();
+      this.pushDigit(c, (x) => x.i32Const(0));
+      c.i32Const(5);
+      c.i32LtS();
+      c.i32And();
+      c.i32Or();
+      c.i32Eqz();
+      c.brIf(1);
+      c.i32Const(0);
+      c.globalGet(DP);
+      c.i32Sub();
+      c.i32Const(9);
+      c.i32GeS();
+      c.ifResult(I32);
+      c.i32Const(27);
+      c.else_();
+      c.globalGet(this.powtab().global);
+      c.i32Const(0);
+      c.globalGet(DP);
+      c.i32Sub();
+      c.arrayGet(this.powtab().type);
+      c.end();
+      c.localSet(N);
+      c.localGet(N);
+      c.call(this.sdcShift());
+      c.localGet(EXP);
+      c.localGet(N);
+      c.i32Sub();
+      c.localSet(EXP);
+      c.br(0);
+      c.end();
+      c.end();
+      // [0.5,1) -> [1,2).
+      c.localGet(EXP);
+      c.i32Const(1);
+      c.i32Sub();
+      c.localSet(EXP);
+      // Subnormals: move back up to the minimum exponent.
+      c.localGet(EXP);
+      c.i32Const(-1022);
+      c.i32LtS();
+      c.ifVoid();
+      c.i32Const(-1022);
+      c.localGet(EXP);
+      c.i32Sub();
+      c.localSet(N);
+      c.i32Const(0);
+      c.localGet(N);
+      c.i32Sub();
+      c.call(this.sdcShift());
+      c.localGet(EXP);
+      c.localGet(N);
+      c.i32Add();
+      c.localSet(EXP);
+      c.end();
+      c.localGet(EXP);
+      c.i32Const(1023);
+      c.i32Add();
+      c.i32Const(2047);
+      c.i32GeS();
+      c.ifVoid();
+      pushSigned((x) => x.f64Const(Infinity));
+      c.return_();
+      c.end();
+      // Extract 1 + 52 bits and round ONCE.
+      c.i32Const(53);
+      c.call(this.sdcShift());
+      c.call(this.sdcRoundedInt());
+      c.localSet(MANT);
+      c.localGet(MANT);
+      c.i64Const(1n << 53n);
+      c.i64Eq();
+      c.ifVoid();
+      c.localGet(MANT);
+      c.i64Const(1n);
+      c.i64ShrU();
+      c.localSet(MANT);
+      c.localGet(EXP);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(EXP);
+      c.localGet(EXP);
+      c.i32Const(1023);
+      c.i32Add();
+      c.i32Const(2047);
+      c.i32GeS();
+      c.ifVoid();
+      pushSigned((x) => x.f64Const(Infinity));
+      c.return_();
+      c.end();
+      c.end();
+      // A missing hidden bit means the result is subnormal.
+      c.localGet(MANT);
+      c.i64Const(1n << 52n);
+      c.i64And();
+      c.i64Eqz();
+      c.ifVoid();
+      c.i32Const(-1023);
+      c.localSet(EXP);
+      c.end();
+      c.localGet(MANT);
+      c.i64Const((1n << 52n) - 1n);
+      c.i64And();
+      c.localGet(EXP);
+      c.i32Const(1023);
+      c.i32Add();
+      c.i32Const(2047);
+      c.i32And();
+      c.i64ExtendI32U();
+      c.i64Const(52n);
+      c.i64Shl();
+      c.i64Or();
+      c.localSet(BITS);
+      c.globalGet(NEG);
+      c.ifVoid();
+      c.localGet(BITS);
+      c.i64Const(-(1n << 63n)); // the sign bit, as sleb's signed spelling
+      c.i64Or();
+      c.localSet(BITS);
+      c.end();
+      c.localGet(BITS);
+      c.f64ReinterpretI64();
+      this.mb.setBody(idx, [I32, I64, I32, I64], c.bytes());
     });
   }
 

@@ -717,12 +717,15 @@ test("S013: JSON.parse's depth cap is 1000 and throws a CATCHABLE RangeError", a
   );
 });
 
-test("2b-i: the number fast path is exact to 15 digits and TRAPS past it", async () => {
-  // Pins the half-landed boundary itself so 2b-ii's first act is flipping
-  // this test to the correct value rather than discovering where the edge
-  // was. A >15-significant-digit literal is runtime data that no
-  // compile-time refusal can fence, so the only two runtime choices are a
-  // trap or a wrong answer — this is the loud one.
+test("JSON.parse numbers are correctly rounded on both paths", async () => {
+  // This was 2b-i's trap-boundary pin; 2b-ii flipped its second half from
+  // "traps" to Node's value. The two paths are Clinger's fast path (exact
+  // for <=15 significant digits with |exp10| <= 22) and Simple Decimal
+  // Conversion for everything else. Which path a given input takes is not
+  // observable from a program — only the value is — so both halves assert
+  // Node's answer and the split is a performance boundary, not a semantic
+  // one. The 100k round-trip fuzz is the real gate; this pins the edges a
+  // reader would want to see named.
   const ok = await buildWasm(
     "json-num-fast.ts",
     [
@@ -744,14 +747,210 @@ test("2b-i: the number fast path is exact to 15 digits and TRAPS past it", async
     ["0", "-0", "42", "-2.5", "300", "1e-7", "123456789012345", "1e+22", "1e-22", ""].join("\n"),
   );
 
-  // 16 significant digits: past Clinger's cap, so the fallback trap fires.
+  // Past Clinger's cap, so Simple Decimal Conversion answers. The four
+  // input classes: digit count, exponent overflow/underflow, a short
+  // mantissa with an out-of-range exponent, and the subnormal band.
   const slow = await buildWasm(
     "json-num-slow.ts",
-    ["console.log('before');", "console.log(JSON.parse('1234567890123456') as number);", ""].join("\n"),
+    [
+      "const xs: number[] = [",
+      "  JSON.parse('1234567890123456') as number,",       // 16 digits
+      "  JSON.parse('12345678901234567') as number,",      // 17
+      "  JSON.parse('3.141592653589793') as number,",
+      "  JSON.parse('0.30000000000000004') as number,",
+      "  JSON.parse('9007199254740993') as number,",
+      "  JSON.parse('1e999') as number,",                  // overflow
+      "  JSON.parse('-1e999') as number,",
+      "  JSON.parse('1e-999') as number,",                 // underflow
+      "  JSON.parse('1e30') as number,",                   // short mantissa, |exp| > 22
+      "  JSON.parse('5e-324') as number,",                 // smallest subnormal
+      "  JSON.parse('2.2250738585072014e-308') as number,",
+      "  JSON.parse('1.7976931348623157e308') as number,",
+      "  JSON.parse('1.' + '9'.repeat(100)) as number,",   // past the digit buffer
+      "];",
+      "for (const x of xs) console.log(x);",
+      "",
+    ].join("\n"),
   );
   if (!slow.ok) throw new Error(`refused: ${slow.diagnostics[0]?.message}`);
-  const run = await runWasmToTrap(slow.binaryPath);
-  expect(run.stdout.toString("utf8")).toBe("before\n");
+  const run = await runWasm(slow.binaryPath);
+  expect(run.stdout.toString("utf8")).toBe(
+    [
+      "1234567890123456",
+      "12345678901234568",
+      "3.141592653589793",
+      "0.30000000000000004",
+      "9007199254740992",
+      "Infinity",
+      "-Infinity",
+      "0",
+      "1e+30",
+      "5e-324",
+      "2.2250738585072014e-308",
+      "1.7976931348623157e+308",
+      "2",
+      "",
+    ].join("\n"),
+  );
+});
+
+/** `m * 2^e` as an exact decimal string (m * 2^-k = m * 5^k / 10^k). */
+function exactBinary(m: bigint, e: number): string {
+  if (m === 0n) return "0";
+  const neg = m < 0n;
+  const mag = neg ? -m : m;
+  let out: string;
+  if (e >= 0) {
+    out = (mag << BigInt(e)).toString();
+  } else {
+    const k = -e;
+    let d = (mag * 5n ** BigInt(k)).toString();
+    if (d.length <= k) d = "0".repeat(k - d.length + 1) + d;
+    out = (d.slice(0, d.length - k) + "." + d.slice(d.length - k)).replace(/\.?0+$/, "");
+  }
+  return (neg ? "-" : "") + out;
+}
+
+/** The exact midpoint between `x` and the next double away from zero. */
+function midpointOf(x: number): string {
+  const b = Buffer.alloc(8);
+  b.writeDoubleLE(x);
+  const bits = b.readBigUInt64LE();
+  const expo = Number((bits >> 52n) & 0x7ffn);
+  const frac = bits & 0xfffffffffffffn;
+  const m = expo === 0 ? frac : frac | (1n << 52n);
+  const e = expo === 0 ? -1074 : expo - 1075;
+  // The sign bit is masked out of the extraction above, so reapply it —
+  // without this every generated midpoint is positive and the negative
+  // half of the tie path goes untested by this generator.
+  return (bits >> 63n ? "-" : "") + exactBinary(2n * m + 1n, e - 1);
+}
+
+/* ── JSON.parse's decimal->binary direction (json.ts) ──────────────────────
+ * The inverse of numfmt's Ryu port, gated the same way: random double bit
+ * patterns pushed through JSON.stringify and parsed back, asserting BIT
+ * equality with Node. Correctly-rounded parsing has no cheap partial
+ * credit — a wrong answer is one ULP off and silent — so a generated
+ * sweep, not a hand-picked list, is what makes it trustworthy. This runs
+ * 20k for suite speed; the landing gate was 100k with zero mismatches. */
+test("JSON.parse round-trips random doubles bit-exactly", async () => {
+  const N = 20000;
+  let seed = 0x2b11n;
+  const rnd = (): bigint => {
+    seed ^= (seed << 13n) & 0xffffffffffffffffn;
+    seed ^= seed >> 7n;
+    seed ^= (seed << 17n) & 0xffffffffffffffffn;
+    return seed & 0xffffffffffffffffn;
+  };
+  const buf = Buffer.alloc(8);
+  const cases: string[] = [];
+  for (let i = 0; i < N; i++) {
+    buf.writeBigUInt64LE(rnd());
+    const d = buf.readDoubleLE(0);
+    if (Number.isFinite(d)) cases.push(JSON.stringify(d));
+  }
+  // The hard set rides along: both ends of the range, the subnormal band,
+  // exact ties, the digit-buffer clamp, exponent overflow and underflow.
+  cases.push(
+    "5e-324", "1e-323", "2.2250738585072014e-308", "1.7976931348623157e308",
+    "1e308", "1e309", "1e999", "1e-999", "1e22", "1e23", "1e30",
+    "0.5", "1.5", "2.5", "9007199254740993", "12345678901234567",
+    "1." + "9".repeat(100), "0." + "0".repeat(320) + "1", "1" + "0".repeat(400),
+    "-5e-324", "-1.7976931348623157e308", "-0.1",
+  );
+  // TRUE MIDPOINTS — the cases the round-trip sweep above structurally
+  // CANNOT reach. JSON.stringify emits the shortest form that round-trips,
+  // and a shortest form is never an exact tie: if it were, a shorter
+  // string would have named the same double. So every exact
+  // round-half-even decision is invisible to a round-trip fuzz, which is
+  // precisely where a rounding bug hides. These are generated instead:
+  // decompose a double into m * 2^e and render (2m+1) * 2^(e-1) exactly,
+  // which is the midpoint between it and its successor.
+  for (let i = 0; i < 3000; i++) {
+    buf.writeBigUInt64LE(rnd());
+    const d = buf.readDoubleLE(0);
+    if (!Number.isFinite(d) || d === 0) continue;
+    cases.push(midpointOf(d));
+  }
+  // ...including the one that made this generator necessary: exactly
+  // 2^-1075, the midpoint between zero and the smallest subnormal, whose
+  // tie test has no preceding digit at all.
+  cases.push(exactBinary(1n, -1075));
+  for (const m of [1n, 2n, 3n]) cases.push(exactBinary(2n * m + 1n, -1075));
+  // Strictly above that tie by one digit past the buffer: the sticky bit
+  // is the only thing that can tell them apart.
+  cases.push(exactBinary(1n, -1075) + "0".repeat(150) + "1");
+  const res = await buildWasm(
+    "json-fuzz.ts",
+    "const cases: string[] = [\n" +
+      cases.map((c) => "  " + JSON.stringify(c) + ",").join("\n") +
+      "\n];\nfor (const c of cases) console.log(JSON.parse(c) as number);\n",
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const got = (await runWasm(res.binaryPath)).stdout.toString("utf8").split("\n");
+  const bad: string[] = [];
+  cases.forEach((c, i) => {
+    const v = JSON.parse(c) as number;
+    // console.log renders -0 as "-0" (the inspect-ism String() lacks).
+    const want = Object.is(v, -0) ? "-0" : String(v);
+    if (got[i] !== want) bad.push(`${c}: wasm ${got[i]} vs node ${want}`);
+  });
+  expect(bad.slice(0, 10)).toEqual([]);
+});
+
+test("JSON.parse: exact round-half-even ties, including the one with no preceding digit", async () => {
+  // Named rather than left inside the sweep because one of them is a
+  // REGRESSION FENCE: exactly 2^-1075 — the midpoint between zero and the
+  // smallest subnormal — reaches the tie test with no digit before the
+  // rounding position, and the unguarded read of that digit was an
+  // uncatchable abort on untrusted input. Node answers 0 (half-even, and
+  // zero is even). The others are the first subnormal midpoints, correct
+  // before the fix, which is exactly what makes them a fence.
+  const ties = [
+    exactBinary(1n, -1075), // 0
+    exactBinary(3n, -1075), // 1e-323  (1.5 units -> 2, even)
+    exactBinary(5n, -1075), // 1e-323  (2.5 units -> 2, even)
+    exactBinary(7n, -1075), // 2e-323  (3.5 units -> 4, even)
+    // Strictly ABOVE the first tie, by a digit far past the 800 the buffer
+    // keeps: only the sticky bit distinguishes it, and it must round up.
+    exactBinary(1n, -1075) + "0".repeat(150) + "1",
+  ];
+  const res = await buildWasm(
+    "json-ties.ts",
+    "const cases: string[] = [\n" +
+      ties.map((c) => "  " + JSON.stringify(c) + ",").join("\n") +
+      "\n];\nfor (const c of cases) console.log(JSON.parse(c) as number);\n",
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(["0", "1e-323", "1e-323", "2e-323", "5e-324", ""].join("\n"));
+});
+
+test("JSON.parse: trailing garbage after a complete number reports cleanly", async () => {
+  // The reject-before-value class. The number token is grammatical, so its
+  // value is genuinely computed to build the box; what matters is that the
+  // CALLER then reports the garbage rather than the number path failing
+  // first. While the fallback trapped, this whole class aborted instead.
+  const res = await buildWasm(
+    "json-num-garbage.ts",
+    [
+      "for (const c of ['12345678901234567890@', '1.9999999999999999999x', '1e999!']) {",
+      "  try { JSON.parse(c); console.log('OK'); }",
+      "  catch (e) { if (e instanceof Error) console.log(e.message); else console.log('non-error'); }",
+      "}",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "Unexpected non-whitespace character after JSON at position 20 (line 1 column 21)",
+      "Unexpected non-whitespace character after JSON at position 21 (line 1 column 22)",
+      "Unexpected non-whitespace character after JSON at position 5 (line 1 column 6)",
+      "",
+    ].join("\n"),
+  );
 });
 
 test("S014: crossing the dyn boundary COPIES — mutations do not propagate", async () => {
