@@ -741,6 +741,13 @@ const TIER_FLOOR: string[] = [
   "1971-decorators-rebinding.ts",
   "1972-decorators-throwing.ts",
   "2522-private-statics-decorated.ts",
+  // Increment 13 (classes), stage 6: the promise payload gained a 4th
+  // slot for the thrown object's class interval, so a rejection that
+  // re-enters as an exception restores the class it was thrown with.
+  // That was the last thing forcing thrown objects to be error-rooted —
+  // `throw:class` is gone, and ANY class instance now rides both the
+  // exception cell and a promise rejection.
+  "981-exceptions-values.ts",
 ];
 
 interface RunResult {

@@ -507,11 +507,13 @@ test("classes: a type family that references itself in every direction", async (
   expect(stdout.toString("utf8")).toBe("root 1 leaf 3\ntrue false\n4 leaf\n");
 });
 
-test("classes: the EventEmitter family refuses; a non-error class throw refuses", async () => {
-  // `extends Error` used to be the third rock here and now compiles — the
-  // error unification made a user subclass an ordinary subtype of the
-  // builtin error struct, so what is left is the runtime hierarchy whose
-  // C prefix embeds registry and stream state this tier has no port of.
+test("classes: the EventEmitter family is the last one that refuses", async () => {
+  // Both of the rocks that used to sit here are gone: `extends Error`
+  // compiles since the error unification made a user subclass an ordinary
+  // subtype of the builtin error struct, and throwing a NON-error class
+  // compiles since the promise payload gained an interval slot. What is
+  // left is the runtime hierarchy whose C prefix embeds registry and
+  // stream state this tier has no port of.
   const ee = await buildWasm(
     "extends-ee.ts",
     [
@@ -529,17 +531,6 @@ test("classes: the EventEmitter family refuses; a non-error class throw refuses"
     expect(ee.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
     expect(ee.wasmSurvey).toContain("class:extends-runtime");
   }
-
-  // Throwing a class that is NOT error-rooted still refuses: the cell
-  // could hold it (that is what the interval slot is for), but a rejected
-  // promise carries only (kind, f64, ref), so an async function turning
-  // the throw into a rejection would lose the class.
-  const thrown = await buildWasm(
-    "throw-class.ts",
-    ["class Bad { why: string; constructor(w: string) { this.why = w; } }", "throw new Bad('nope');", ""].join("\n"),
-  );
-  expect(thrown.ok).toBe(false);
-  if (!thrown.ok) expect(thrown.wasmSurvey).toContain("throw:class");
 });
 
 test("ModuleBuilder: the rec-group span's four guards fail loudly", () => {
@@ -838,5 +829,56 @@ test("classvals: one immortal class object per class, construct and test through
       "true true false true",
       "",
     ].join("\n"),
+  );
+});
+
+test("throw: a non-error class survives the round trip, synchronously and through a rejection", async () => {
+  // The reason the promise payload carries a 4th slot. Both paths must
+  // recover the DYNAMIC class: the synchronous one reads the interval the
+  // cell recorded, and the async one reads it back off the promise —
+  // before, a rejection carried only (kind, f64, ref) and the class was
+  // lost the moment an async function turned a throw into one. Nothing in
+  // the corpus exercises the async half over a non-error class.
+  const res = await buildWasm(
+    "throw-plain-class.ts",
+    [
+      "class Carrier { code: number; constructor(c: number) { this.code = c; } }",
+      'class Sub extends Carrier { tag: string; constructor(t: string) { super(1); this.tag = t; } }',
+      "function hurl(n: number): string {",
+      "  if (n === 0) throw new Carrier(7);",
+      '  if (n === 1) throw new Sub("s");',
+      '  if (n === 2) throw new Error("plain");',
+      '  return "none";',
+      "}",
+      "for (let i = 0; i < 4; i = i + 1) {",
+      "  try {",
+      "    console.log(hurl(i));",
+      "  } catch (e) {",
+      '    if (e instanceof Sub) console.log("sub", e.tag, e.code);',
+      '    else if (e instanceof Carrier) console.log("carrier", e.code);',
+      '    else if (e instanceof Error) console.log("err", e.message);',
+      '    else console.log("other");',
+      "  }",
+      "}",
+      "async function boom(n: number): Promise<string> {",
+      '  if (n === 0) throw new Sub("async");',
+      '  return "ok";',
+      "}",
+      "async function main(): Promise<void> {",
+      "  try { console.log(await boom(0)); } catch (e) {",
+      '    if (e instanceof Sub) console.log("caught async sub", e.tag);',
+      '    else console.log("caught async other");',
+      "  }",
+      "  console.log(await boom(1));",
+      "}",
+      "main();",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    ["carrier 7", "sub s 1", "err plain", "none", "caught async sub async", "ok", ""].join("\n"),
   );
 });

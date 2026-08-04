@@ -96,6 +96,7 @@ import {
   PROM_F64,
   PROM_KIND,
   PROM_OBSERVED,
+  PROM_PRE,
   PROM_REF,
   PROM_STATE,
   RACEE_DST,
@@ -654,23 +655,14 @@ class Assembler {
         code.globalSet(exc.kindG);
         return;
       case "object": {
-        // Errors — builtin or a user class rooted in one — now that they
-        // share errT. The cell records the thrown object's DYNAMIC
-        // interval position beside the payload, and THAT is what makes a
-        // `catch (e) { e instanceof AppError }` work: an Error-typed
-        // reference can hold any subclass, so the old class-id compare
-        // could not tell user subclasses apart at all.
+        // ANY class instance. The cell records the thrown object's
+        // DYNAMIC interval position beside the payload, and THAT is what
+        // makes `catch (e) { e instanceof AppError }` work: an
+        // Error-typed reference can hold any subclass, so the old
+        // class-id compare could not tell user subclasses apart — and a
+        // class unrelated to the one being tested for simply falls
+        // outside the range instead of failing a cast.
         //
-        // A non-error class still refuses. Not because the cell cannot
-        // hold it — it can, that is what preG is for — but because a
-        // rejected PROMISE carries only (kind, f64, ref), so the interval
-        // would be lost the moment an async function turned this throw
-        // into a rejection. Widening that triple is its own change.
-        if (!this.classes.errorRooted(t.className)) {
-          this.refuse("throw:class", v.loc);
-          code.unreachable();
-          return;
-        }
         const info = this.classInfo(t.className, v.loc);
         if (info === null) {
           code.unreachable();
@@ -713,16 +705,16 @@ class Assembler {
    * three slots because a promise payload and a thrown payload share one
    * encoding. `null` is a VOID fulfilment (kind 0, no payload). The
    * unused slots still push their zero: the runtime takes all three.
-   *
-   * `rejecting` splits the OBJECT arm, and only that arm: a rejection can
-   * re-enter as an exception and needs its class recoverable, a
-   * fulfilment is read back by the awaiting site's own static type. */
-  private emitPayload(v: WExpr | null, what: string, loc: SrcLoc, rejecting: boolean): void {
+   * The 4th slot is the OBJ payload's class interval, -1 otherwise —
+   * the exception cell's encoding exactly, so a rejection re-entering as
+   * an exception restores the class it was thrown with. */
+  private emitPayload(v: WExpr | null, what: string, loc: SrcLoc): void {
     const code = this.fn.code;
     if (v === null) {
       code.i32Const(0);
       code.f64Const(0);
       code.refNull(ANY_HEAP);
+      code.i32Const(-1);
       return;
     }
     const t = v.type;
@@ -733,47 +725,49 @@ class Assembler {
         code.i32Const(0);
         code.f64Const(0);
         code.refNull(ANY_HEAP);
+        code.i32Const(-1);
         return;
       case "f64":
         code.i32Const(EXC_F64);
         this.walkExpr(v);
         code.refNull(ANY_HEAP);
+        code.i32Const(-1);
         return;
       case "bool":
         code.i32Const(EXC_BOOL);
         this.walkExpr(v);
         code.f64ConvertI32U();
         code.refNull(ANY_HEAP);
+        code.i32Const(-1);
         return;
       case "string":
         code.i32Const(EXC_STR);
         code.f64Const(0);
         this.walkExpr(v);
+        code.i32Const(-1);
         return;
-      case "object":
-        // A REJECTION payload must be error-rooted: the triple has no
-        // interval slot, so when the rejection re-enters as an exception
-        // the cell's interval is recovered from the payload's own vt, and
-        // only an error-rooted instance is guaranteed to have one.
-        //
-        // A FULFILMENT has no such reader. Its payload is read back by
-        // the awaiting side's STATIC type — a cast to exactly the type
-        // the await site already knows — so any class the tier can
-        // represent rides it, and `async function f(): Promise<Item>`
-        // over an ordinary user class needs no gate at all.
-        if (rejecting && !this.classes.errorRooted(t.className)) {
-          this.refuse(`${what}:class`, loc);
+      case "object": {
+        // ANY class. The payload now carries the DYNAMIC interval beside
+        // the reference, exactly as the exception cell does, so a
+        // rejection that re-enters as an exception restores the class it
+        // was thrown with — which is what used to force error-rooted
+        // reasons and is why `rejecting` no longer gates anything here.
+        const info = this.classInfo(t.className, v.loc);
+        if (info === null) {
           code.unreachable();
           return;
         }
-        if (this.mapType(t, v.loc) === null) {
-          code.unreachable();
-          return;
-        }
+        const ref = this.classes.ref(info);
+        const o = this.acquireScratch(ref);
+        this.walkExpr(v);
+        code.localSet(o);
         code.i32Const(EXC_OBJ);
         code.f64Const(0);
-        this.walkExpr(v);
+        code.localGet(o);
+        this.emitDynamicPre(o, info);
+        this.releaseScratch(ref, o);
         return;
+      }
       case "promise":
         // Settling WITH a promise is adoption (see promises.ts): the
         // payload would have to be subscribed to, not stored. The
@@ -792,6 +786,7 @@ class Assembler {
         code.i32Const(EXC_REF);
         code.f64Const(0);
         this.walkExpr(v);
+        code.i32Const(-1);
         return;
       }
     }
@@ -1147,6 +1142,7 @@ class Assembler {
       frameBase: () => this.frameBaseType(),
       resumeClos: () => this.resumeClosPair(),
       tags: { f64: EXC_F64, bool: EXC_BOOL, str: EXC_STR, obj: EXC_OBJ },
+      errInterval: (c) => this.emitErrIntervalTest(c),
       anyRef: ANY_REF,
       errT: () => this.exc().errT,
       f64ToStr: () => this.f64ToStrHelper(),
@@ -1475,6 +1471,25 @@ class Assembler {
     const walk = (m: typeof staticMeta): boolean =>
       this.mayThrow.has(`%${m.def.name}.constructor`) || m.children.some(walk);
     return walk(staticMeta);
+  }
+
+  /** Consumes an interval position, leaves 1 when it falls inside the
+   * BUILTIN error hierarchy — scr_error_is as a range check. The bounds
+   * are %Error's, which spans every builtin and every user subclass, so
+   * this is exactly "does this payload have a name and a message". */
+  private emitErrIntervalTest(c: Code): void {
+    const meta = this.classes.meta("%Error");
+    if (meta === undefined) throw new Error("wasm emitter bug: no %Error in the class graph");
+    // Written as ONE unsigned compare rather than the usual two signed
+    // ones because this runs inside a runtime helper built outside any IR
+    // function, where there is no scratch frame to borrow a local from.
+    // Subtracting the lower bound wraps anything below it — the -1 of a
+    // non-object payload included — past the span, so `<= span` unsigned
+    // is exactly `pre >= lo && pre <= hi`.
+    c.i32Const(meta.pre);
+    c.i32Sub();
+    c.i32Const(meta.post - meta.pre);
+    c.i32LeU();
   }
 
   /** The class object global, filled on first evaluation. */
@@ -2526,7 +2541,7 @@ class Assembler {
        * encoding, which is what lets a rejection copy across field-wise. */
       case "%async.settle":
         this.walkExpr(s.promise);
-        this.emitPayload(s.value, "settle", s.loc, false);
+        this.emitPayload(s.value, "settle", s.loc);
         code.i32Const(1);
         code.call(this.proms.settle());
         return;
@@ -2545,6 +2560,8 @@ class Assembler {
         code.structGet(exc.caughtT, 1);
         code.localGet(c);
         code.structGet(exc.caughtT, 2);
+        code.localGet(c);
+        code.structGet(exc.caughtT, 3);
         code.i32Const(2);
         code.call(this.proms.settle());
         this.releaseScratch(this.caughtRef(), c);
@@ -3764,7 +3781,7 @@ class Assembler {
             code.call(this.proms.mint());
             code.localSet(p);
             code.localGet(p);
-            this.emitPayload(e.args[0] ?? null, e.name, e.loc, rejecting);
+            this.emitPayload(e.args[0] ?? null, e.name, e.loc);
             code.i32Const(rejecting ? 2 : 1);
             code.call(this.proms.settle());
             code.localGet(p);
@@ -4002,8 +4019,11 @@ class Assembler {
       case "caughtTest": {
         const exc = this.exc();
         if (e.test === "instanceof") {
+          // ANY class: the test reads the interval the CELL recorded, so
+          // it needs no struct and no vt — a standalone class answers
+          // here exactly as a hierarchy member does.
           const meta = this.classes.meta(e.className ?? "");
-          if (meta === undefined || !this.classes.errorRooted(e.className ?? "")) {
+          if (meta === undefined) {
             this.refuse(`caughtTest:instanceof:${e.className ?? "?"}`, e.loc);
             code.unreachable();
             return;
@@ -4026,9 +4046,9 @@ class Assembler {
 
       /* Checker-trusted payload extraction (the frontend emits it only
        * under a proven test, so the read is kind-unchecked — the caught
-       * analog of unionNarrow). An error extracts as its OWN struct: the
-       * builtins share errT, a user subclass casts to its subtype, and
-       * the guard that proved the class is what makes either honest. */
+       * analog of unionNarrow). Any class extracts as its OWN struct: the
+       * builtin errors share errT, everything else casts to its own, and
+       * the guard that proved the class is what makes the cast honest. */
       case "caughtNarrow": {
         const exc = this.exc();
         const t = e.type;
@@ -4050,7 +4070,7 @@ class Assembler {
           code.refCast(this.strType);
           return;
         }
-        if (t.kind === "object" && this.classes.errorRooted(t.className)) {
+        if (t.kind === "object") {
           const info = this.classInfo(t.className, e.loc);
           if (info === null) {
             code.unreachable();
@@ -4061,7 +4081,9 @@ class Assembler {
           code.refCast(info.struct);
           return;
         }
-        this.refuse(`caughtNarrow:${t.kind === "object" ? "class" : t.kind}`, e.loc);
+        // Every OBJECT narrowing is handled above, so what reaches here
+        // is a payload kind with no catch-side representation at all.
+        this.refuse(`caughtNarrow:${t.kind}`, e.loc);
         code.unreachable();
         return;
       }
@@ -4074,7 +4096,7 @@ class Assembler {
        * the callers' pending checks come free. */
       case "caughtCheck": {
         const meta = this.classes.meta(e.className);
-        const checked = this.classes.errorRooted(e.className) ? this.classInfo(e.className, e.loc) : null;
+        const checked = this.classInfo(e.className, e.loc);
         if (meta === undefined || checked === null) {
           this.refuse("caughtCheck:class", e.loc);
           code.unreachable();
@@ -5280,28 +5302,12 @@ class Assembler {
     code.localGet(pr);
     code.structGet(this.proms.promT, PROM_REF);
     code.globalSet(exc.refG);
-    // A rejection payload is (kind, f64, ref) — no interval slot — so the
-    // cell's is RECOVERED from the payload here. Sound because the only
-    // objects that can be a rejection payload are error-rooted
-    // (emitPayload's gate), and every one of those carries a vt.
-    const k = this.acquireScratch(I32);
+    code.localGet(pr);
+    code.structGet(this.proms.promT, PROM_PRE);
+    code.globalSet(exc.preG);
     code.localGet(pr);
     code.structGet(this.proms.promT, PROM_KIND);
-    code.localTee(k);
-    code.i32Const(EXC_OBJ);
-    code.i32Eq();
-    code.ifResult(I32);
-    code.globalGet(exc.refG);
-    code.refCast(exc.errT);
-    code.structGet(exc.errT, CLASS_VT);
-    code.structGet(this.classes.ci(), CI_PRE);
-    code.else_();
-    code.i32Const(-1);
-    code.end();
-    code.globalSet(exc.preG);
-    code.localGet(k);
     code.globalSet(exc.kindG);
-    this.releaseScratch(I32, k);
     this.emitUnwind();
     this.close();
   }
@@ -5506,27 +5512,42 @@ class Assembler {
       c.i32Const(0);
       c.f64Const(0);
       c.refNull(ANY_HEAP);
+      c.i32Const(-1);
     } else if (param.kind === "f64") {
       c.i32Const(EXC_F64);
       c.localGet(1);
       c.refNull(ANY_HEAP);
+      c.i32Const(-1);
     } else if (param.kind === "bool") {
       c.i32Const(EXC_BOOL);
       c.localGet(1);
       c.f64ConvertI32U();
       c.refNull(ANY_HEAP);
+      c.i32Const(-1);
     } else if (param.kind === "string") {
       c.i32Const(EXC_STR);
       c.f64Const(0);
       c.localGet(1);
+      c.i32Const(-1);
     } else if (param.kind === "object") {
+      const settlerInfo = this.classes.info(param.className, undefined, true);
       c.i32Const(EXC_OBJ);
       c.f64Const(0);
       c.localGet(1);
+      // The settler's param type is its STATIC class; a hierarchy member
+      // carries the dynamic one in its vt.
+      if (settlerInfo === null) c.i32Const(-1);
+      else if (!settlerInfo.meta.hierarchy) c.i32Const(settlerInfo.meta.pre);
+      else {
+        c.localGet(1);
+        c.structGet(settlerInfo.struct, CLASS_VT);
+        c.structGet(this.classes.ci(), CI_PRE);
+      }
     } else {
       c.i32Const(EXC_REF);
       c.f64Const(0);
       c.localGet(1);
+      c.i32Const(-1);
     }
     c.i32Const(state);
     c.call(this.proms.settle());
@@ -5617,6 +5638,7 @@ class Assembler {
     code.globalGet(exc.kindG);
     code.globalGet(exc.f64G);
     code.globalGet(exc.refG);
+    code.globalGet(exc.preG);
     code.i32Const(2);
     code.call(this.proms.settle());
     this.emitCellClear();
@@ -5731,19 +5753,22 @@ class Assembler {
     c.structNew(this.resumeClosPair().clos);
   }
 
-  /** The (kind, f64, ref) triple a completed `all` fulfils with: the
-   * values array as a REF payload, or the void triple when the entries
-   * were `Promise<void>` and there is no array. */
+  /** The payload a completed `all` fulfils with: the values array as a
+   * REF payload, or the void shape when the entries were `Promise<void>`
+   * and there is no array. Never an OBJECT, so the interval slot is
+   * always absent. */
   private pushAllFulfilment(c: Code, pushValues: (() => void) | null): void {
     if (pushValues === null) {
       c.i32Const(0);
       c.f64Const(0);
       c.refNull(ANY_HEAP);
+      c.i32Const(-1);
       return;
     }
     c.i32Const(EXC_REF);
     c.f64Const(0);
     pushValues();
+    c.i32Const(-1);
   }
 
   /** One Promise.all entry settling — the spec's `resolveElement`. A
@@ -6047,6 +6072,7 @@ class Assembler {
       c.i32Const(EXC_REF);
       c.f64Const(0);
       adapt(c, SRC);
+      c.i32Const(-1);
       c.i32Const(1);
       c.call(this.proms.settle());
     }

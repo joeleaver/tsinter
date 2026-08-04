@@ -61,6 +61,10 @@ export interface PromiseDeps {
   anyRef: ValType;
   /** The builtin-error struct: an OBJ payload's only shape. */
   errT: () => number;
+  /** Consumes an i32 interval position, leaves 1 when it falls inside the
+   * builtin Error hierarchy. The emitter owns it because the bounds are
+   * its class graph's. */
+  errInterval: (c: Code) => void;
   f64ToStr: () => number;
   errToStr: () => number;
   /** The output staging trio (stage/putc/flush) the report writes with. */
@@ -80,6 +84,12 @@ const P_WAIT_HEAD = 4;
 const P_WAIT_TAIL = 5;
 export const PROM_OBSERVED = 6; // a rejection somebody looked at
 const P_NEXT = 7; // the maybe-unhandled ledger's intrusive link
+/** An OBJ payload's class interval position — the exception cell's 4th
+ * slot, carried here so a rejection that re-enters as an exception
+ * restores the class it was thrown with. -1 when the payload is not an
+ * object. Appended rather than placed beside the other payload fields so
+ * no existing index moves. */
+export const PROM_PRE = 8;
 
 /* waiterT's fields — one node type, used both for a promise's own waiter
  * list and for the microtask queue (a node moves between them). */
@@ -185,6 +195,7 @@ export class PromiseBuilder {
         { storage: waiter, mutable: true },
         { storage: I32, mutable: true },
         { storage: { kind: "ref", nullable: true, typeIndex: self }, mutable: true },
+        { storage: I32, mutable: true },
       ]);
     }
     return this.promTField;
@@ -389,6 +400,8 @@ export class PromiseBuilder {
       c.localGet(SRC);
       c.structGet(this.promT, PROM_REF);
       c.localGet(SRC);
+      c.structGet(this.promT, PROM_PRE);
+      c.localGet(SRC);
       c.structGet(this.promT, PROM_STATE);
       c.call(settle);
       this.mb.setBody(idx, [], c.bytes());
@@ -437,7 +450,7 @@ export class PromiseBuilder {
     return this.raceEntryField;
   }
 
-  /** %w.async.settle(p, kind, f64, ref, state) — FIRST SETTLE WINS: a
+  /** %w.async.settle(p, kind, f64, ref, pre, state) — FIRST SETTLE WINS: a
    * second call on the same promise is a no-op (JS's resolve/reject
    * idempotence). `state` is 1 (fulfilled) or 2 (rejected); a rejection
    * additionally joins the ledger. The parked waiters move to the
@@ -445,13 +458,13 @@ export class PromiseBuilder {
   settle(): number {
     return this.cached("settle", () => {
       const idx = this.mb.declareFunc(
-        this.mb.funcType([this.promRef(), I32, F64, this.deps.anyRef, I32], []),
+        this.mb.funcType([this.promRef(), I32, F64, this.deps.anyRef, I32, I32], []),
         "%w.async.settle",
       );
       const q = this.q();
       const led = this.led();
       const c = new Code();
-      const P = 0, KIND = 1, VAL = 2, REF = 3, STATE = 4;
+      const P = 0, KIND = 1, VAL = 2, REF = 3, PRE = 4, STATE = 5;
       c.localGet(P);
       c.structGet(this.promT, PROM_STATE);
       c.ifVoid();
@@ -466,6 +479,9 @@ export class PromiseBuilder {
       c.localGet(P);
       c.localGet(REF);
       c.structSet(this.promT, PROM_REF);
+      c.localGet(P);
+      c.localGet(PRE);
+      c.structSet(this.promT, PROM_PRE);
       c.localGet(P);
       c.localGet(STATE);
       c.structSet(this.promT, PROM_STATE);
@@ -623,11 +639,24 @@ export class PromiseBuilder {
     c.i32Const(tags.obj);
     c.i32Eq();
     c.ifVoid();
+    // An OBJ payload is an error only when its interval says so — any
+    // class can be rejected with now, and the errT cast would trap on
+    // one that is not (scr_error_is, as an interval test). A non-error
+    // reason renders as Node's plain object spelling; the report is
+    // stderr on a nonzero exit, which S010 already says is not Node's.
+    c.localGet(p);
+    c.structGet(this.promT, PROM_PRE);
+    this.deps.errInterval(c);
+    c.ifVoid();
     c.localGet(p);
     c.structGet(this.promT, PROM_REF);
     c.refCast(this.deps.errT());
     c.call(this.deps.errToStr());
     c.call(out.stage);
+    c.else_();
+    this.deps.lit(c, "[object Object]");
+    c.call(out.stage);
+    c.end();
     c.else_();
     this.deps.lit(c, "[object]");
     c.call(out.stage);

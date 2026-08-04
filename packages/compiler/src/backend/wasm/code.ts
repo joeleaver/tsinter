@@ -159,6 +159,9 @@ export class Code {
   i32LeS(): void {
     this.w.u8(0x4c);
   }
+  i32LeU(): void {
+    this.w.u8(0x4d);
+  }
   i32GeS(): void {
     this.w.u8(0x4e);
   }
