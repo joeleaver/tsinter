@@ -87,6 +87,11 @@ export const CI_POST = 1;
 /** Where $vtt_<root>'s slot fields start — after the repeated $ci head. */
 export const VTT_SLOT0 = 2;
 
+/** The class OBJECT's own fields, after the same $ci head: the construct
+ * thunk and the JS-visible `.name`. */
+export const CLASSOBJ_CTOR = 2;
+export const CLASSOBJ_NAME = 3;
+
 /** One emitted class's wasm shape. */
 export interface ClassInfo {
   meta: LlClassMeta;
@@ -196,6 +201,57 @@ export class ClassBuilder {
    * virtual dispatch resolves against. */
   meta(className: string): LlClassMeta | undefined {
     return this.metaMap.get(className);
+  }
+
+  /** The class OBJECT struct — the class as a first-class value. A
+   * SUBTYPE of $ci, so `x instanceof SomeClassValue` reads the target's
+   * interval through the very same head an instance's vt exposes, and
+   * `pre`/`post` are read here rather than inlined because the target is
+   * only known at runtime (this is $ci's `post` finding its reader).
+   *
+   * Keyed by (hierarchy ROOT, constructor ABI) and NOT by class, because
+   * a classval upcast leaves the reference untouched — so every class a
+   * classval can hold must share one wasm type. The validator's rule for
+   * that upcast is exactly "D strictly descends from C and their
+   * completed constructor ABIs are equal", which is the same pair: same
+   * hierarchy, same ABI. Keying by root is what lets the construct
+   * thunk's result be the root's struct (a real type both ends agree on)
+   * instead of a bare structref needing a cast on both sides.
+   *
+   * The key buys a distinct type-section ENTRY, not a distinct runtime
+   * type: two shape-identical roots canonicalize together, and their
+   * classobj types recursively merge with them. That is harmless BY THE
+   * SAME ARGUMENT as instanceof-not-ref.test above — every classobj
+   * operation is a field read off a specific global instance or a
+   * ref.eq, and nothing ever ref.casts TO a classobj type. What keeps a
+   * keying breakage from being silent is the upcast site's index
+   * assertion (a compile-time check on the type-section indices, which
+   * the key does distinguish), not the wasm type system. */
+  classObjType(meta: LlClassMeta, abiKey: string, thunkFn: number, strRef: ValType): number {
+    return this.mb.subStructType(
+      `class:objT:${meta.root.def.name}:${abiKey}`,
+      [
+        { storage: I32, mutable: false }, // CI_PRE
+        { storage: I32, mutable: false }, // CI_POST
+        { storage: { kind: "ref", nullable: true, typeIndex: thunkFn }, mutable: false },
+        { storage: strRef, mutable: false },
+      ],
+      this.ci(),
+    );
+  }
+
+  /** The interval a class OBJECT carries. A generic instantiation's class
+   * object answers for its whole FAMILY — JS has one `Box` at runtime, so
+   * `x instanceof Box` is true for every instantiation — while
+   * construction still runs the instantiation's own thunk. The native
+   * lanes take the same split (llvm/classes.ts's emitClassObjDefs). */
+  classObjInterval(meta: LlClassMeta): { pre: number; post: number } {
+    const family = meta.def.genericOf === undefined ? undefined : this.metaMap.get(meta.def.genericOf);
+    if (meta.def.genericOf !== undefined && family === undefined) {
+      throw new Error(`wasm emitter bug: ${meta.def.name} names unknown generic family ${meta.def.genericOf}`);
+    }
+    const src = family ?? meta;
+    return { pre: src.pre, post: src.post };
   }
 
   /** Is this class errT-shaped — a builtin error or a user class rooted

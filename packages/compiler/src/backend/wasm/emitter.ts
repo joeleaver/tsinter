@@ -63,7 +63,16 @@ import {
 } from "../../ir/nodes.js";
 import { computeMayThrow } from "../emission/may-throw.js";
 import { buildClassGraph, type LlClassMeta, type LlVtSlot } from "../llvm/classes.js";
-import { CI_PRE, CLASS_VT, VTT_SLOT0, ClassBuilder, type ClassInfo } from "./classes.js";
+import {
+  CI_POST,
+  CI_PRE,
+  CLASSOBJ_CTOR,
+  CLASSOBJ_NAME,
+  CLASS_VT,
+  VTT_SLOT0,
+  ClassBuilder,
+  type ClassInfo,
+} from "./classes.js";
 import {
   EXPORT_ENTRY,
   EXPORT_MEMORY,
@@ -1383,6 +1392,122 @@ class Assembler {
     return this.classesField;
   }
 
+  /* ── classes as VALUES ──────────────────────────────────────────────────
+   * One immortal class object per class, holding the interval, a
+   * construct thunk and the JS-visible name. Its struct subtypes $ci
+   * (classes.ts) so instanceOfValue reads the target's interval through
+   * the same head an instance's vt exposes.
+   *
+   * The global is filled LAZILY on first evaluation rather than by a
+   * constant initializer, for one hard reason: the name is a string, and
+   * `array.new_data` is not a constant expression in WasmGC (verified
+   * against V8, not assumed). The zero-capture closure interning right
+   * above does the same dance for the same shape of reason, and it buys
+   * the identity JS requires — `C === C` — because the fill happens once. */
+
+  private readonly classObjGlobals = new Map<string, number>();
+  private readonly ctorThunks = new Map<string, number>();
+
+  /** A classval's wasm shape: the (closure, thunk) pair its construct
+   * call goes through, the classobj struct, and the ABI key both are
+   * interned under. Null (refusal recorded) when the class has no
+   * representation. */
+  private classValInfo(
+    className: string,
+    loc: SrcLoc | undefined,
+    soft: boolean,
+  ): { info: ClassInfo; objT: number; thunk: { clos: number; fn: number } } | null {
+    const info = this.classes.info(className, loc, soft);
+    if (info === null) return null;
+    const ctorName = `%${className}.constructor`;
+    const ctorFn = this.funcByName.get(ctorName) ?? this.mod.functions.find((f) => f.name === ctorName);
+    if (ctorFn === undefined) {
+      if (!soft) this.refuse("classval:no-ctor", loc);
+      return null;
+    }
+    // The thunk's RESULT is the hierarchy root's struct, not the class's:
+    // the classobj type is shared by every class a classval can hold, so
+    // its thunk field has one type, and the root is the type they all
+    // agree on. newValue casts back down to its own static class.
+    const rootInfo = this.classes.info(info.meta.root.def.name, loc, soft);
+    if (rootInfo === null) return null;
+    const params = ctorFn.params.slice(1).map((p) => this.mapTypeSoft(p.type));
+    const thunk = this.closPairFor(params, [this.classes.ref(rootInfo)]);
+    const abiKey = params.map(valKey).join(",");
+    const objT = this.classes.classObjType(info.meta, abiKey, thunk.fn, this.strRef);
+    return { info, objT, thunk };
+  }
+
+  /** `%w.ctor.<C>` — allocate, run the constructor, hand the instance
+   * back. The construct half of `new` behind the thunk ABI, so a class
+   * VALUE builds exactly what `new C(...)` builds. No pending check: the
+   * newValue site owns that, and an unwinding constructor simply leaves
+   * the instance for the caller's check to discard. */
+  private ctorThunk(className: string, info: ClassInfo, thunk: { clos: number; fn: number }): number {
+    const cached = this.ctorThunks.get(className);
+    if (cached !== undefined) return cached;
+    const ctor = this.ctorOf(className);
+    const idx = this.mb.declareFunc(thunk.fn, `%w.ctor.${className}`);
+    this.ctorThunks.set(className, idx);
+    const c = new Code();
+    const argc = ctor.fn.params.length - 1; // params after `this`
+    const self = 1 + argc; // one local past the declared parameters
+    this.emitAlloc(c, className, info);
+    c.localSet(self);
+    c.refNull(this.fnClosPair(ctor.fn).clos);
+    c.localGet(self);
+    for (let i = 1; i <= argc; i++) c.localGet(i);
+    c.call(ctor.index);
+    c.localGet(self);
+    this.mb.setBody(idx, [this.classes.ref(info)], c.bytes());
+    this.mb.declareFuncRef(idx);
+    return idx;
+  }
+
+  /** Can constructing through a class value throw? The dynamic class is
+   * any descendant of the static one, so the answer covers the whole
+   * subtree — may-throw.ts's newValue arm takes the same wide cover. */
+  private newValueMayThrow(className: string): boolean {
+    // The STATIC class's meta, not meta.root: a classval holds that class
+    // or a descendant, so its own subtree is exactly the cover needed.
+    const staticMeta = this.classes.meta(className);
+    if (staticMeta === undefined) return true;
+    const walk = (m: typeof staticMeta): boolean =>
+      this.mayThrow.has(`%${m.def.name}.constructor`) || m.children.some(walk);
+    return walk(staticMeta);
+  }
+
+  /** The class object global, filled on first evaluation. */
+  private emitClassObj(className: string, loc: SrcLoc | undefined): boolean {
+    const cv = this.classValInfo(className, loc, false);
+    if (cv === null) return false;
+    const code = this.fn.code;
+    const objRef: ValType = { kind: "ref", nullable: true, typeIndex: cv.objT };
+    let g = this.classObjGlobals.get(className);
+    if (g === undefined) {
+      g = this.mb.addGlobal(objRef, true, (w) => {
+        w.u8(0xd0);
+        w.sleb(cv.objT);
+      });
+      this.classObjGlobals.set(className, g);
+    }
+    const thunkIdx = this.ctorThunk(className, cv.info, cv.thunk);
+    const interval = this.classes.classObjInterval(cv.info.meta);
+    const jsName = cv.info.meta.def.jsName ?? "";
+    code.globalGet(g);
+    code.refIsNull();
+    this.openIf();
+    code.i32Const(interval.pre);
+    code.i32Const(interval.post);
+    code.refFunc(thunkIdx);
+    this.pushStrLit(jsName);
+    code.structNew(cv.objT);
+    code.globalSet(g);
+    this.close();
+    code.globalGet(g);
+    return true;
+  }
+
   /* ── virtual dispatch ───────────────────────────────────────────────────
    * A slot's ABI is the DECLARER's: the root-most class that declares the
    * method fixes `this`, and every override is otherwise ABI-identical
@@ -1479,8 +1604,41 @@ class Assembler {
    * early — while a null there would trap the first union helper to
    * touch it. (The native lanes seed the same slots in their allocator;
    * llvm/classes.ts's undefFieldInits.) */
-  private emitFieldSeed(t: IrType): void {
-    const code = this.fn.code;
+  /** The allocation half of `new C(...)`, onto an explicit buffer: the
+   * class's vtable global into `vt` on a hierarchy member, then one seed
+   * per flattened field, then struct.new. Shared with the construct
+   * THUNK, which is built outside any IR function and so cannot reach
+   * `this.fn.code` — the two must allocate identically or a class built
+   * through a class value would differ from one built with `new`. */
+  private emitAlloc(c: Code, className: string, info: ClassInfo): void {
+    if (info.meta.hierarchy) c.globalGet(this.classes.vtGlobal(className));
+    for (const f of info.meta.def.fields) this.emitFieldSeed(c, f.type);
+    c.structNew(info.struct);
+  }
+
+  /** A class's constructor function. Every class reaches the IR with one
+   * — the frontend desugars default constructors, field initializers and
+   * parameter properties into it — so both ways of not finding it are
+   * bugs, and they are DIFFERENT bugs: absent from the module means the
+   * frontend stopped desugaring, present but undeclared means a
+   * reachability edge went missing. Neither may fall through, which
+   * would hand back an instance no initializer ever ran over. */
+  private ctorOf(className: string): { name: string; fn: WFunction; index: number } {
+    const name = `%${className}.constructor`;
+    const fn = this.funcByName.get(name);
+    const index = this.funcIndexByName.get(name);
+    if (fn === undefined || index === undefined) {
+      throw new Error(
+        this.mod.functions.some((f) => f.name === name)
+          ? `wasm emitter bug: ${name} is in the module but was never declared reachable`
+          : `wasm emitter bug: new ${className} with no ${name} in the module`,
+      );
+    }
+    return { name, fn, index };
+  }
+
+  private emitFieldSeed(c: Code, t: IrType): void {
+    const code = c;
     if (t.kind === "union") {
       const tag = this.undefinedArmTag(t.unionId);
       if (tag >= 0) {
@@ -1561,6 +1719,10 @@ class Assembler {
         // subtype of errT, so nothing above here distinguishes them.
         const info = this.classInfo(t.className, loc);
         return info === null ? null : this.classes.ref(info);
+      }
+      case "classval": {
+        const cv = this.classValInfo(t.className, loc, false);
+        return cv === null ? null : { kind: "ref", nullable: true, typeIndex: cv.objT };
       }
       default:
         this.refuse(`type:${t.kind}`, loc);
@@ -1645,6 +1807,10 @@ class Assembler {
         // two views.
         const info = this.classes.info(t.className, undefined, true);
         return info === null ? I32 : this.classes.ref(info);
+      }
+      case "classval": {
+        const cv = this.classValInfo(t.className, undefined, true);
+        return cv === null ? I32 : { kind: "ref", nullable: true, typeIndex: cv.objT };
       }
       default:
         return I32;
@@ -2800,7 +2966,7 @@ class Assembler {
           this.walkExpr(e.operand);
           return;
         }
-        if (k === "array" || k === "func" || k === "record" || k === "object") {
+        if (k === "array" || k === "func" || k === "record" || k === "object" || k === "classval") {
           // Every object is truthy; evaluate for effects, answer true.
           // (A class-typed value is never null — null and undefined ride
           // unions, whose own helper answers for them.)
@@ -3688,6 +3854,22 @@ class Assembler {
           this.releaseScratch(ref, o);
           return;
         }
+        if (e.fn === "class.name") {
+          // `X.name` through a class value — the stored string, which is
+          // NamedEvaluation's answer (the declared name, the binding name
+          // for `const x = class {}`, "" for a truly anonymous one), not
+          // the IR's program-qualified class name.
+          const ct = e.args[0]!.type;
+          if (ct.kind !== "classval") throw new Error("emitter bug: class.name on a non-classval");
+          const cv = this.classValInfo(ct.className, e.loc, false);
+          if (cv === null) {
+            code.unreachable();
+            return;
+          }
+          this.walkExpr(e.args[0]!);
+          code.structGet(cv.objT, CLASSOBJ_NAME);
+          return;
+        }
         if (e.fn === "error.toString") {
           this.walkExpr(e.args[0]!);
           code.call(this.errToStrHelper());
@@ -3964,6 +4146,27 @@ class Assembler {
       case "downcast": {
         const from = e.value.type;
         const to = e.type;
+        if (to.kind === "classval" && from.kind === "classval") {
+          // A class VALUE widens without changing: the classobj struct is
+          // keyed by (hierarchy root, constructor ABI), and the
+          // validator's rule for this upcast — strict descendant with an
+          // equal completed ABI — is exactly what keeps both ends on one
+          // key. So this is type-only in the source and a no-op here.
+          const toCv = this.classValInfo(to.className, e.loc, false);
+          const fromCv = this.classValInfo(from.className, e.loc, false);
+          if (toCv === null || fromCv === null) {
+            code.unreachable();
+            return;
+          }
+          if (toCv.objT !== fromCv.objT) {
+            // Would be a silent bad store; the keying invariant broke.
+            throw new Error(
+              `wasm emitter bug: classval ${e.kind} ${from.className}→${to.className} crosses class-object types`,
+            );
+          }
+          this.walkExpr(e.value);
+          return;
+        }
         if (to.kind !== "object" || from.kind !== "object") {
           this.refuse(`expr:${e.kind}`, e.loc);
           code.unreachable();
@@ -4058,32 +4261,14 @@ class Assembler {
         }
         const objRef = this.classes.ref(info);
         const o = this.acquireScratch(objRef);
-        if (info.meta.hierarchy) code.globalGet(this.classes.vtGlobal(e.className));
-        for (const f of info.meta.def.fields) this.emitFieldSeed(f.type);
-        code.structNew(info.struct);
+        this.emitAlloc(code, e.className, info);
         code.localSet(o);
-        // Every class reaches the IR with a constructor function — the
-        // frontend desugars default constructors, field initializers and
-        // parameter properties into one. Both ways of not finding it are
-        // bugs, and they are DIFFERENT bugs: absent from the module means
-        // the frontend stopped desugaring, present but undeclared means a
-        // reachability edge went missing. Neither may fall through — that
-        // would hand back an instance no initializer ever ran over.
-        const ctorName = `%${e.className}.constructor`;
-        const ctor = this.funcByName.get(ctorName);
-        const ctorIndex = this.funcIndexByName.get(ctorName);
-        if (ctor === undefined || ctorIndex === undefined) {
-          throw new Error(
-            this.mod.functions.some((f) => f.name === ctorName)
-              ? `wasm emitter bug: ${ctorName} is in the module but was never declared reachable`
-              : `wasm emitter bug: new ${e.className} with no ${ctorName} in the module`,
-          );
-        }
-        code.refNull(this.fnClosPair(ctor).clos);
+        const ctor = this.ctorOf(e.className);
+        code.refNull(this.fnClosPair(ctor.fn).clos);
         code.localGet(o);
         for (const a of e.args) this.walkExpr(a);
-        code.call(ctorIndex);
-        if (this.mayThrow.has(ctorName)) this.emitPendingCheck();
+        code.call(ctor.index);
+        if (this.mayThrow.has(ctor.name)) this.emitPendingCheck();
         code.localGet(o);
         this.releaseScratch(objRef, o);
         return;
@@ -4145,6 +4330,93 @@ class Assembler {
         code.i32LeS();
         code.i32And();
         this.releaseScratch(I32, pre);
+        return;
+      }
+
+      /* The class itself as a value: its immortal class object. */
+      case "classRef": {
+        if (!this.emitClassObj(e.className, e.loc)) code.unreachable();
+        return;
+      }
+
+      /* `new X(args)` through a class VALUE: the class object's construct
+       * thunk. The thunk answers with the hierarchy ROOT's struct — one
+       * type for every class the value could hold — so the result casts
+       * back down to this site's own static class, which is honest
+       * because a classval only ever holds that class or a descendant
+       * (the upcast rule the validator enforces). */
+      case "newValue": {
+        const ct = e.callee.type;
+        const rt = e.type;
+        if (ct.kind !== "classval" || rt.kind !== "object") {
+          this.refuse("expr:newValue", e.loc);
+          code.unreachable();
+          return;
+        }
+        const cv = this.classValInfo(ct.className, e.loc, false);
+        const resultInfo = this.classInfo(rt.className, e.loc);
+        if (cv === null || resultInfo === null) {
+          code.unreachable();
+          return;
+        }
+        const objRef: ValType = { kind: "ref", nullable: true, typeIndex: cv.objT };
+        const o = this.acquireScratch(objRef);
+        this.walkExpr(e.callee);
+        code.localSet(o);
+        code.refNull(cv.thunk.clos);
+        for (const a of e.args) this.walkExpr(a);
+        code.localGet(o);
+        code.structGet(cv.objT, CLASSOBJ_CTOR);
+        code.callRef(cv.thunk.fn);
+        code.refCast(resultInfo.struct);
+        this.releaseScratch(objRef, o);
+        // The dynamic constructor is unknown here, so may-throw.ts covers
+        // the whole subtree and the check keys on any of them throwing.
+        if (this.newValueMayThrow(ct.className)) this.emitPendingCheck();
+        return;
+      }
+
+      /* `x instanceof X` with a class VALUE on the right: the same
+       * interval containment as the static form, except the target's
+       * bounds are READ off the class object instead of inlined — which
+       * is what $ci's `post` exists for. */
+      case "instanceOfValue": {
+        const vt = e.value.type;
+        const ct = e.classValue.type;
+        if (vt.kind !== "object" || ct.kind !== "classval") {
+          this.refuse("expr:instanceOfValue", e.loc);
+          code.unreachable();
+          return;
+        }
+        const info = this.classInfo(vt.className, e.loc);
+        const cv = this.classValInfo(ct.className, e.loc, false);
+        if (info === null || cv === null) {
+          code.unreachable();
+          return;
+        }
+        if (!info.meta.hierarchy) {
+          throw new Error(`wasm emitter bug: instanceOfValue on standalone class ${vt.className}`);
+        }
+        const objRef: ValType = { kind: "ref", nullable: true, typeIndex: cv.objT };
+        const t = this.acquireScratch(objRef);
+        const pre = this.acquireScratch(I32);
+        this.walkExpr(e.value);
+        code.structGet(info.struct, CLASS_VT);
+        code.structGet(this.classes.ci(), CI_PRE);
+        code.localSet(pre);
+        this.walkExpr(e.classValue);
+        code.localSet(t);
+        code.localGet(pre);
+        code.localGet(t);
+        code.structGet(cv.objT, CI_PRE);
+        code.i32GeS();
+        code.localGet(pre);
+        code.localGet(t);
+        code.structGet(cv.objT, CI_POST);
+        code.i32LeS();
+        code.i32And();
+        this.releaseScratch(I32, pre);
+        this.releaseScratch(objRef, t);
         return;
       }
 
@@ -4231,9 +4503,6 @@ class Assembler {
       case "jsBridgePromise":
       /* Classes: the class-as-a-VALUE surface (its own object type with a
        * construct thunk) and virtual dispatch (vtables). */
-      case "classRef":
-      case "newValue":
-      case "instanceOfValue":
       /* Record shapes. */
       /* The dynamic-keyed record surface rides the overflow map. */
       case "recordKeyGet":
@@ -4387,6 +4656,12 @@ class Assembler {
         // before the helper is asked for. Verified against the corpus:
         // there is no class-element hole there to plug.
         return RUNTIME_ERROR_CLASSES.has(t.className) ? "object" : `obj:${t.className}`;
+      case "classval": {
+        // Keyed by the classobj TYPE, which is already per (root, ABI) —
+        // exactly the set of classvals that can flow into one another.
+        const soft = this.mapTypeSoft(t);
+        return `clsv:${valKey(soft)}`;
+      }
       default:
         return t.kind;
     }
@@ -4472,7 +4747,10 @@ class Assembler {
           else code.i32Ne();
           return;
         }
-        if (k === "array" || k === "func" || k === "record" || k === "object" || k === "promise") {
+        if (
+          k === "array" || k === "func" || k === "record" || k === "object" || k === "promise" ||
+          k === "classval"
+        ) {
           // Reference identity — JS object/function equality exactly.
           // Every one of these is a GC struct or array reference and
           // `ref.eq` compares references, which is what the C lane's `l ==
@@ -4501,8 +4779,6 @@ class Assembler {
           if (e.op === "!==") code.i32Eqz();
           return;
         }
-        // Class VALUES are what is left: one immortal object per class,
-        // so identity is the classval surface's to answer.
         this.refuse("bin:ref-eq", e.loc);
         code.unreachable();
         return;

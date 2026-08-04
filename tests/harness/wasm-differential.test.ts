@@ -709,6 +709,38 @@ const TIER_FLOOR: string[] = [
   "1029-async-eager-chains.ts",
   "1305-errors-async-rejections.ts",
   "1478-promise-reject.ts",
+  // Increment 13 (classes), stage 5: classes as VALUES. One immortal
+  // class object per class — interval, construct thunk, JS-visible name —
+  // in a struct that SUBTYPES $ci, so `x instanceof someClassValue` reads
+  // the target's bounds through the same head an instance's vt exposes.
+  //
+  // The struct is keyed by (hierarchy ROOT, constructor ABI), not by
+  // class: a classval upcast leaves the reference untouched, so every
+  // class one slot can hold must share a wasm type — and the validator's
+  // rule for that upcast (strict descendant, equal completed ABI) is
+  // exactly that pair. The thunk answers with the root's struct and
+  // newValue casts down to its own static class.
+  //
+  // The object is filled on FIRST EVALUATION rather than by a constant
+  // initializer, because its name is a string and `array.new_data` is not
+  // a constant expression in WasmGC (checked against V8). The
+  // zero-capture closure interning does the same for the same reason, and
+  // it is what makes `C === C` hold.
+  "1940-class-values-basics.ts",
+  "1944-class-values-modules/main.ts",
+  "2033-property-assigned-class-extends.cjs",
+  "2523-private-statics-aliased-class.ts",
+  // Generic instantiations: the class object carries the FAMILY's
+  // interval (JS has one `Box` at runtime) while construction still runs
+  // the instantiation's own thunk — the native lanes' split.
+  "1952-generic-class-statics-values.ts",
+  "2041-mixin-values.ts",
+  // Decorators are class values by IR time: the decorator expression
+  // takes and returns one, so the whole family arrives here.
+  "1970-decorators-basics.ts",
+  "1971-decorators-rebinding.ts",
+  "1972-decorators-throwing.ts",
+  "2522-private-statics-decorated.ts",
 ];
 
 interface RunResult {

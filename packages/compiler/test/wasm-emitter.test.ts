@@ -786,3 +786,57 @@ test("async: a plain user class FULFILS a promise (only rejections are gated)", 
   const { stdout } = await runWasm(res.binaryPath);
   expect(stdout.toString("utf8")).toBe("1 item1 2 item2\n");
 });
+
+test("classvals: one immortal class object per class, construct and test through it", async () => {
+  // The whole class-as-a-value surface in one program. The load-bearing
+  // bit the corpus does not isolate is that `K1` and `K2` — a base and a
+  // derived class flowing through the SAME `typeof Animal` slot — must
+  // share one wasm type, because a classval upcast leaves the reference
+  // untouched. That is why the class-object struct is keyed by hierarchy
+  // ROOT and constructor ABI rather than by class, and why the construct
+  // thunk answers with the root's struct and the call site casts down.
+  //
+  // `instanceof k` with a RUNTIME target is the other half: the bounds
+  // are read off the class object instead of inlined, which is the only
+  // reader $ci's `post` has.
+  const res = await buildWasm(
+    "classvals.ts",
+    [
+      "class Animal {",
+      "  name: string;",
+      "  constructor(n: string) { this.name = n; }",
+      "}",
+      "class Dog extends Animal {",
+      "  constructor(n: string) { super(n); }",
+      "}",
+      "const K1: typeof Animal = Animal;",
+      "const K2: typeof Animal = Dog;",
+      "console.log(K1.name, K2.name);",
+      'const a = new K1("generic");',
+      'const d = new K2("rex");',
+      "console.log(a.name, d.name, a instanceof Animal, d instanceof Dog);",
+      // Identity: the object is interned, so `K1 === K1` holds.
+      "console.log(K1 === K1, K1 === K2, K2 !== K1);",
+      "const ks: (typeof Animal)[] = [K1, K2];",
+      'let out = "";',
+      'for (const k of ks) out += k.name + ":" + new k("x").name + " ";',
+      "console.log(out.trim());",
+      "function isA(v: Animal, k: typeof Animal): boolean { return v instanceof k; }",
+      "console.log(isA(d, K1), isA(d, K2), isA(a, K2), isA(a, K1));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "Animal Dog",
+      "generic rex true true",
+      "true false true",
+      "Animal:x Dog:x",
+      "true true false true",
+      "",
+    ].join("\n"),
+  );
+});
