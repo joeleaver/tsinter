@@ -640,3 +640,56 @@ test("classes: preorder intervals answer instanceof across a whole forest", asyn
     "base,mid,deep,side,box,box,\ntrue true true false\ntrue true\ntrue true false\nfalse true true\n",
   );
 });
+
+test("classes: dispatch lands on an UNOVERRIDDEN ancestor's implementation", async () => {
+  // The case the corpus does not isolate, and the one a subtree-only
+  // reachability walk gets wrong: `Dog` declares no `speak`, so a
+  // virtualCall on a Dog-typed receiver must land on `%Animal.speak` — an
+  // implementation ABOVE the static receiver. It is only reachable at all
+  // because a SIBLING (Puppy) overrides, which is what puts `speak` in a
+  // slot in the first place; without that the frontend devirtualizes and
+  // nothing here runs. Bird overriding both methods pins the adapter path
+  // beside it (an override's `this` is narrower than the slot's, so the
+  // funcref stored is a cast-and-forward thunk, not the method itself).
+  const res = await buildWasm(
+    "dispatch.ts",
+    [
+      "class Animal {",
+      "  name: string;",
+      "  constructor(n: string) { this.name = n; }",
+      '  speak(): string { return this.name + " makes a sound"; }',
+      "  legs(): number { return 4; }",
+      "}",
+      'class Dog extends Animal { constructor() { super("dog"); } }',
+      'class Puppy extends Dog { speak(): string { return "yip"; } }',
+      "class Bird extends Animal {",
+      '  constructor() { super("bird"); }',
+      '  speak(): string { return "tweet"; }',
+      "  legs(): number { return 2; }",
+      "}",
+      'const zoo: Animal[] = [new Animal("thing"), new Dog(), new Puppy(), new Bird()];',
+      'let out = "";',
+      'for (const a of zoo) out += a.speak() + "/" + a.legs() + " ";',
+      "console.log(out.trim());",
+      // Dispatch through a Dog-typed reference: the inherited slot.
+      "const d: Dog = new Dog();",
+      "const p: Dog = new Puppy();",
+      'console.log(d.speak(), "|", p.speak());',
+      // Virtual ACCESSORS ride the same slots (`get:area` is an ordinary
+      // method name by IR time).
+      "class Shape { get area(): number { return 0; } }",
+      "class Sq extends Shape { s: number = 3; get area(): number { return this.s * this.s; } }",
+      "const shapes: Shape[] = [new Shape(), new Sq()];",
+      'let a2 = "";',
+      'for (const s of shapes) a2 += s.area + ",";',
+      "console.log(a2);",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    "thing makes a sound/4 dog makes a sound/4 yip/4 tweet/2\ndog makes a sound | yip\n0,9,\n",
+  );
+});

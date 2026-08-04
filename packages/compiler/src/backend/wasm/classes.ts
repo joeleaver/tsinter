@@ -68,7 +68,7 @@ import {
   RUNTIME_ERROR_CLASSES,
   RUNTIME_STREAM_CLASSES,
 } from "../../ir/nodes.js";
-import { buildClassGraph, type LlClassMeta } from "../llvm/classes.js";
+import { buildClassGraph, vtEntriesFor, type LlClassMeta, type LlVtSlot } from "../llvm/classes.js";
 import { type FieldType, I32, ModuleBuilder, type ValType } from "./module.js";
 
 /** `vt`'s slot on a HIERARCHY class: field 0, ahead of the flattened
@@ -83,6 +83,9 @@ export const CLASS_VT = 0;
  * VALUE, which carries its own interval). */
 export const CI_PRE = 0;
 export const CI_POST = 1;
+
+/** Where $vtt_<root>'s slot fields start — after the repeated $ci head. */
+export const VTT_SLOT0 = 2;
 
 /** One emitted class's wasm shape. */
 export interface ClassInfo {
@@ -102,12 +105,23 @@ export interface ClassDeps {
   softType: (t: IrType) => ValType;
   /** The census sink. */
   refuse: (kind: string, loc: SrcLoc | undefined) => void;
+  /** A slot's wasm func type: the DECLARER's `this` plus the rest of the
+   * signature. The emitter owns it because it must be the SAME interned
+   * index a method function is declared with, or a directly-stored
+   * funcref would not call_ref. */
+  slotFnType: (slot: LlVtSlot) => number;
+  /** The function index to store in `slot` for `impl` — the method itself
+   * when its `this` already IS the slot's, an adapter when the override
+   * narrowed it. Null when no implementation function exists (see
+   * vtGlobal's comment on unreachable slots). */
+  slotEntry: (slot: LlVtSlot, impl: LlClassMeta) => number | null;
 }
 
 export class ClassBuilder {
   private readonly metaMap: Map<string, LlClassMeta>;
   private readonly infos = new Map<string, ClassInfo | null>();
   private readonly ciGlobals = new Map<string, number>();
+  private readonly vtGlobals = new Map<string, number>();
   private ciType: number | null = null;
   private spanOpen = false;
 
@@ -125,12 +139,14 @@ export class ClassBuilder {
    * whole-program preorder interval, immutable. Interned outside any span
    * (it references nothing). */
   ci(): number {
-    if (this.ciType === null) {
-      const fields: FieldType[] = [];
-      fields[CI_PRE] = { storage: I32, mutable: false };
-      fields[CI_POST] = { storage: I32, mutable: false };
-      this.ciType = this.mb.openStructType("class:ci", fields);
-    }
+    // Field order IS the contract CI_PRE/CI_POST name, and $vtt_<root>
+    // repeats this head verbatim as its first two fields — written out in
+    // order rather than indexed, so the two declarations stay legible side
+    // by side.
+    this.ciType ??= this.mb.openStructType("class:ci", [
+      { storage: I32, mutable: false }, // CI_PRE
+      { storage: I32, mutable: false }, // CI_POST
+    ]);
     return this.ciType;
   }
 
@@ -166,6 +182,76 @@ export class ClassBuilder {
 
   ref(info: ClassInfo): ValType {
     return { kind: "ref", nullable: true, typeIndex: info.struct };
+  }
+
+  /** The class graph node — the SHARED numbering, and the slot lists a
+   * virtual dispatch resolves against. */
+  meta(className: string): LlClassMeta | undefined {
+    return this.metaMap.get(className);
+  }
+
+  /** The vtable struct for one hierarchy ROOT: $ci's {pre, post} head
+   * repeated (so an instance's vt still reads as a plain interval — see
+   * `vtGlobal`), then one nullable funcref per slot in `root.slots`
+   * order. Final: nothing subtypes a vtable. */
+  vttType(root: LlClassMeta): number {
+    const fields: FieldType[] = [
+      { storage: I32, mutable: false }, // CI_PRE
+      { storage: I32, mutable: false }, // CI_POST
+      ...root.slots.map((slot) => ({
+        storage: { kind: "ref", nullable: true, typeIndex: this.deps.slotFnType(slot) } as ValType,
+        mutable: false,
+      })),
+    ];
+    return this.mb.subStructType(`class:vtt:${root.def.name}`, fields, this.ci());
+  }
+
+  /** The immortal global an instance's `vt` is stamped with. A hierarchy
+   * with virtual slots gets its class's VTABLE instance; one with none
+   * gets the bare interval. Either way the field stays (ref null $ci), so
+   * instanceof reads `pre` through the subtype without knowing which.
+   *
+   * A slot with no implementation FUNCTION stores ref.null, and that is
+   * sound rather than a hole: a slot exists as soon as some descendant
+   * redeclares the method, but the method's function only exists if
+   * something calls it, and the only reader of a slot is a virtualCall —
+   * whose reachability edge (root-down over every declaring class) is
+   * exactly what makes the function exist. So a null slot is a slot no
+   * dispatch can reach. vtEntriesFor answers null for the other case:
+   * outside the declaring subtree, or a fully-abstract chain. */
+  vtGlobal(className: string): number {
+    const existing = this.vtGlobals.get(className);
+    if (existing !== undefined) return existing;
+    const meta = this.metaMap.get(className);
+    if (meta === undefined) throw new Error(`wasm emitter bug: vtable for unknown class ${className}`);
+    if (!meta.hierarchy) throw new Error(`wasm emitter bug: vtable for standalone class ${className}`);
+    if (meta.root.slots.length === 0) return this.ciGlobal(className);
+    const vtt = this.vttType(meta.root);
+    const entries = vtEntriesFor(meta).map(({ slot, impl }) => ({
+      fn: impl === null ? null : this.deps.slotEntry(slot, impl),
+      type: this.deps.slotFnType(slot),
+    }));
+    const index = this.mb.addGlobal({ kind: "ref", nullable: false, typeIndex: vtt }, false, (w) => {
+      // Operands in field order: the interval head, then one per slot.
+      w.u8(0x41); // i32.const pre
+      w.sleb(meta.pre);
+      w.u8(0x41); // i32.const post
+      w.sleb(meta.post);
+      for (const e of entries) {
+        if (e.fn === null) {
+          w.u8(0xd0); // ref.null $slotFnT
+          w.sleb(e.type);
+        } else {
+          w.u8(0xd2); // ref.func
+          w.uleb(e.fn);
+        }
+      }
+      w.u8(0xfb); // struct.new $vtt
+      w.uleb(0x00);
+      w.uleb(vtt);
+    });
+    this.vtGlobals.set(className, index);
+    return index;
   }
 
   /** The emitted shape for a class, or null when the class is out of tier

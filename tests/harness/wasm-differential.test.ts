@@ -647,6 +647,46 @@ const TIER_FLOOR: string[] = [
   // check that it mints a fresh promise rather than passing one through.
   "1369-promise-union.ts",
   "1982-freeze-resolve-passthrough.ts",
+  // Increment 13 (classes), stage 3: VIRTUAL DISPATCH. Each hierarchy
+  // root with virtual slots gets a $vtt_<root> subtype of $ci — the same
+  // interval head, then one funcref per slot — and every class in that
+  // root's subtree gets a constant vtable instance its instances point at.
+  // A dispatch reads the vt, casts to the root's vtable, loads the slot
+  // and call_refs it. Overrides that narrowed `this` are stored as
+  // cast-and-forward ADAPTERS, because wasm parameters are contravariant
+  // and a `(ref $Dog)` function cannot sit in an `(ref $Animal)` slot —
+  // the C backend's sc_vm_* thunks, needed here for the same reason and
+  // needed by neither the LLVM lane (all pointers) nor stages 1-2.
+  //
+  // The dispatch core, including a receiver whose slot implementation
+  // lives on an unoverridden ancestor.
+  "711-inheritance-dispatch.ts",
+  "713-inheritance-rc-stress.ts",
+  "756-cycle-inheritance.ts",
+  // Sibling branches declaring the same method name at different depths —
+  // the slot-numbering torture test.
+  "2044-vtable-sibling-slots.ts",
+  // Virtual ACCESSORS need no dedicated work: `get x()` is the method
+  // `get:x` by IR time, so it takes an ordinary slot.
+  "722-accessors-inheritance.ts",
+  "723-accessors-rc-stress.ts",
+  // Mixins are plain inheritance chains once the frontend has flattened
+  // them, so the whole family arrives with dispatch.
+  "2040-mixin-heritage.ts",
+  "2042-mixin-modules/main.ts",
+  "2043-mixin-rc-stress.ts",
+  // Generic classes and generic methods dispatching through a hierarchy.
+  "1953-generic-class-hierarchy.ts",
+  "2002-generic-methods-inheritance.ts",
+  // Parameter-list shapes against overridden methods.
+  "405-params-optional.ts",
+  "407-params-rest.ts",
+  "1852-overload-class-members.ts",
+  // A base constructor's virtual call reaching a derived field BEFORE the
+  // derived constructor assigns it — the reason `new` seeds union fields
+  // with the interned undefined arm rather than a null (stage 1's seed
+  // rule, first actually exercised here).
+  "1586-derived-field-before-super-init.ts",
 ];
 
 interface RunResult {

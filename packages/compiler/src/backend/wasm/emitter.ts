@@ -62,8 +62,8 @@ import {
   RUNTIME_ERROR_CLASSES,
 } from "../../ir/nodes.js";
 import { computeMayThrow } from "../emission/may-throw.js";
-import { buildClassGraph } from "../llvm/classes.js";
-import { CI_PRE, CLASS_VT, ClassBuilder, type ClassInfo } from "./classes.js";
+import { buildClassGraph, type LlClassMeta, type LlVtSlot } from "../llvm/classes.js";
+import { CI_PRE, CLASS_VT, VTT_SLOT0, ClassBuilder, type ClassInfo } from "./classes.js";
 import {
   EXPORT_ENTRY,
   EXPORT_MEMORY,
@@ -395,6 +395,11 @@ class Assembler {
     const mt = computeMayThrow(asIrModule(mod));
     this.mayThrow = mt.fns;
     this.mayThrowIndirect = mt.indirect;
+    for (const cls of mod.classes ?? []) {
+      for (const m of cls.methods ?? []) {
+        if (this.mayThrow.has(`%${cls.name}.${m}`)) this.mayThrowMethods.add(m);
+      }
+    }
     // Top-level await: the lowering turned the entry into a spawn wrapper,
     // so its promise-typed return IS the "this program has a module
     // evaluation promise" flag (an entry the pass declined stays void and
@@ -407,6 +412,10 @@ class Assembler {
 
   private readonly mayThrow: Set<string>;
   private readonly mayThrowIndirect: boolean;
+  /** Method names with at least one may-throw implementation — a virtual
+   * dispatch cannot name its callee, so the pending check keys on the
+   * METHOD (the native lanes' mayThrowMethods, ported). */
+  private readonly mayThrowMethods = new Set<string>();
   private readonly asyncEntry: boolean;
 
   /* ── the exception protocol (pending-flag unwind, the native model) ────
@@ -1280,9 +1289,72 @@ class Assembler {
       {
         softType: (t) => this.mapTypeSoft(t),
         refuse: (kind, loc) => this.refuse(kind, loc),
+        slotFnType: (slot) => this.vtSlotPair(slot).fn,
+        slotEntry: (slot, impl) => this.vtSlotEntry(slot, impl),
       },
     );
     return this.classesField;
+  }
+
+  /* ── virtual dispatch ───────────────────────────────────────────────────
+   * A slot's ABI is the DECLARER's: the root-most class that declares the
+   * method fixes `this`, and every override is otherwise ABI-identical
+   * (the frontend's override-exactness rule). Wasm function subtyping
+   * cannot paper over the difference — a `(ref null $Dog)` parameter is
+   * NOT usable where `(ref null $Animal)` is expected (parameters are
+   * contravariant, and the subtyping runs the other way) — so an override
+   * that narrowed `this` needs an ADAPTER, exactly the C backend's sc_vm_*
+   * thunks. The LLVM lane needs none because every pointer is `ptr`. */
+
+  private readonly vtAdapters = new Map<string, number>();
+
+  /** A slot's (closure, func) type pair. The `this` parameter is the
+   * DECLARER's — not `slot.fn`'s, which for an ABSTRACT declarer is some
+   * concrete descendant's function and would spell a narrower receiver. */
+  private vtSlotPair(slot: LlVtSlot): { clos: number; fn: number } {
+    const recv: IrType = { kind: "object", className: slot.declarer.def.name };
+    const params = [
+      this.mapTypeSoft(recv),
+      ...slot.fn.params.slice(1).map((p) => this.mapTypeSoft(p.type)),
+    ];
+    const results = slot.fn.returnType.kind === "void" ? [] : [this.mapTypeSoft(slot.fn.returnType)];
+    return this.closPairFor(params, results);
+  }
+
+  /** What `impl` stores in `slot`: the method function itself when its
+   * own func type already IS the slot's (impl declares the slot), an
+   * adapter otherwise. Null when the method has no reachable function —
+   * see ClassBuilder.vtGlobal for why that slot is unreachable too. */
+  private vtSlotEntry(slot: LlVtSlot, impl: LlClassMeta): number | null {
+    const name = `%${impl.def.name}.${slot.method}`;
+    const fn = this.funcByName.get(name);
+    const index = this.funcIndexByName.get(name);
+    if (fn === undefined || index === undefined) return null;
+    const slotPair = this.vtSlotPair(slot);
+    if (this.fnClosPair(fn).fn === slotPair.fn) {
+      this.mb.declareFuncRef(index);
+      return index;
+    }
+    const key = `${name}@${slot.declarer.def.name}`;
+    const cached = this.vtAdapters.get(key);
+    if (cached !== undefined) return cached;
+    const implInfo = this.classInfo(impl.def.name, fn.loc);
+    if (implInfo === null) return null;
+    // The adapter wears the SLOT's type, narrows `this`, and calls the
+    // implementation directly. The incoming closure is dead either way —
+    // a method is never a closure value, so a direct call's null closure
+    // is what the callee expects (the `call` arm passes the same).
+    const adapter = this.mb.declareFunc(slotPair.fn, `%w.vadapt.${impl.def.name}.${slot.method}`);
+    this.vtAdapters.set(key, adapter);
+    const c = new Code();
+    c.refNull(this.fnClosPair(fn).clos);
+    c.localGet(1);
+    c.refCast(implInfo.struct);
+    for (let i = 2; i <= fn.params.length; i++) c.localGet(i);
+    c.call(index);
+    this.mb.setBody(adapter, [], c.bytes());
+    this.mb.declareFuncRef(adapter);
+    return adapter;
   }
 
   /** A class's emitted shape, or null with the refusal recorded. The
@@ -3854,7 +3926,7 @@ class Assembler {
         }
         const objRef = this.classes.ref(info);
         const o = this.acquireScratch(objRef);
-        if (info.meta.hierarchy) code.globalGet(this.classes.ciGlobal(e.className));
+        if (info.meta.hierarchy) code.globalGet(this.classes.vtGlobal(e.className));
         for (const f of info.meta.def.fields) this.emitFieldSeed(f.type);
         code.structNew(info.struct);
         code.localSet(o);
@@ -3953,6 +4025,9 @@ class Assembler {
         const pre = this.acquireScratch(I32);
         this.walkExpr(e.value);
         code.structGet(info.struct, CLASS_VT);
+        // Through the SUBTYPE: a slotted hierarchy stamps $vtt_<root>
+        // here, whose first two fields repeat $ci's head, so the interval
+        // read is the same instruction either way.
         code.structGet(this.classes.ci(), CI_PRE);
         code.localTee(pre);
         code.i32Const(target.meta.pre);
@@ -3962,6 +4037,57 @@ class Assembler {
         code.i32LeS();
         code.i32And();
         this.releaseScratch(I32, pre);
+        return;
+      }
+
+      /* A call that must dispatch on the receiver's DYNAMIC class. The
+       * slot lives on the method's root-most declaring class — an
+       * ancestor of the static receiver, found by the same interval
+       * containment the C emitter uses — and the vtable the instance
+       * carries holds one funcref per slot of its ROOT's slot list.
+       *
+       * The receiver evaluates ONCE and is read twice (as the `this`
+       * argument and to reach the vtable), so it parks in a local. It
+       * needs no upcast: the slot's `this` is the declarer's, and wasm
+       * subsumption already lets a narrower reference stand there.
+       *
+       * The vt is not null-checked, for instanceOf's reason: struct.new
+       * stamps it and the field is immutable. The ref.cast to the root's
+       * vtable would trap on a null vt rather than answer wrongly, which
+       * is the honest failure. */
+      case "virtualCall": {
+        const info = this.classInfo(e.className, e.loc);
+        if (info === null) {
+          code.unreachable();
+          return;
+        }
+        const meta = info.meta;
+        const slots = meta.root.slots;
+        const slotIndex = slots.findIndex(
+          (s) => s.method === e.method && s.declarer.pre <= meta.pre && meta.pre <= s.declarer.post,
+        );
+        const slot = slots[slotIndex];
+        if (slot === undefined) {
+          throw new Error(`wasm emitter bug: no vtable slot for ${e.className}.${e.method}`);
+        }
+        const recv = e.args[0];
+        if (recv === undefined) throw new Error(`wasm emitter bug: virtualCall ${e.method} without a receiver`);
+        const pair = this.vtSlotPair(slot);
+        const vtt = this.classes.vttType(meta.root);
+        const recvRef = this.classes.ref(info);
+        const r = this.acquireScratch(recvRef);
+        this.walkExpr(recv);
+        code.localSet(r);
+        code.refNull(pair.clos); // the uniform ABI's dead closure argument
+        code.localGet(r);
+        for (const a of e.args.slice(1)) this.walkExpr(a);
+        code.localGet(r);
+        code.structGet(info.struct, CLASS_VT);
+        code.refCast(vtt);
+        code.structGet(vtt, VTT_SLOT0 + slotIndex);
+        code.callRef(pair.fn);
+        this.releaseScratch(recvRef, r);
+        if (this.mayThrowMethods.has(e.method)) this.emitPendingCheck();
         return;
       }
 
@@ -4000,7 +4126,6 @@ class Assembler {
       case "classRef":
       case "newValue":
       case "instanceOfValue":
-      case "virtualCall":
       /* Record shapes. */
       /* The dynamic-keyed record surface rides the overflow map. */
       case "recordKeyGet":
