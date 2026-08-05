@@ -829,3 +829,56 @@ the wasm emitter unit test, with Node's answers beside ours; the C lane
 reproduces it. No corpus program can pin it — one whose output observed
 the divergence would fail the differential on every lane by
 construction.
+
+## S026 — `JSON.stringify` over a dyn root caps nesting depth at 1000 *(wasm tier)*
+
+`JSON.stringify(u)` where `u` is `unknown`/`{}`/`Object`/`object` — a dyn
+ROOT, the one stringify shape with no static type to direct a serializer
+— serializes through the emitted dyn walker, which throws a catchable
+`RangeError` reading `Maximum call stack size exceeded` rather than
+recurse past 1000 levels of array/object nesting.
+
+**Node caps this too, and reports the same error with the same message.**
+That is the difference from S013, which this entry otherwise mirrors: V8's
+JSON *parser* is iterative and has no limit at all, but its *stringifier*
+recurses, so deep nesting throws there as well. What diverges is only the
+LIMIT — ours is a fixed 1000 whatever the stack holds, V8's is
+implementation-defined and moves with the stack. Measured on Node 24.18,
+plain nested objects: the deepest that stringifies is roughly 875 levels
+under `--stack-size=200`, ~4.5k under the default stack, and ~18k under
+`--stack-size=4000`. Those numbers drift by a few levels run to run with
+whatever else is on the stack when the call happens, which is the point —
+there is no fixed depth to state. So a tree nested 2000 deep stringifies
+under Node's default stack and throws here, and one nested 800 deep
+stringifies here and throws under a small-stack Node. Neither side is
+uniformly stricter.
+
+The sharper divergence is CYCLES. A cyclic dyn tree is constructible
+through dyn keyed writes (`const o: any = {}; o.self = o`), and Node
+reports it as `TypeError: Converting circular structure to JSON` because
+its stringifier tracks the stack of open values. This walker has no cycle
+detection, so a cycle simply runs out of depth and reports the RangeError
+above — right that it failed, wrong about why. NEITHER stringify path on
+this tier detects cycles today: the STATIC path reaches them only through
+a recursive record shape, and those still refuse as `record:recursive`
+(the V8-exact circular-structure detection described elsewhere in this
+register is the NATIVE lanes'; it arrives here with the recursive-shape
+stage). The C runtime's dyn walker has no guard of either kind: its
+recursive descent exhausts the C stack and the process dies of SIGSEGV
+after a few seconds (`scriptc: program killed by SIGSEGV`, measured at
+~3.5s on both cyclic shapes). An uncatchable crash is strictly worse than
+a documented catchable failure, which is the whole argument for the cap.
+
+**Rationale:** the same as S013's. The walker is recursive descent over a
+tree of unbounded depth, and the wasm stack it runs on is bounded; a
+catchable failure at a fixed, documented depth beats exhausting the stack
+at an unpredictable one. The message is not invented — it is exactly what
+Node produces for the same class of input, which is the nearest true
+thing to say, and the value being reported is genuinely "this recursion
+went too deep". Removing the divergence means an explicit value stack in
+the walker plus a seen-stack cycle detector for the dyn tree, at which
+point the cyclic case could report V8's TypeError instead.
+**Tested by:** the wasm emitter unit tests — 1000 nested objects
+serialize, 1001 throws, a cyclic tree throws, and the buffer and depth
+counter both recover for the next call. No corpus program can pin it: the
+native lanes diverge from this by construction (C has no cap).

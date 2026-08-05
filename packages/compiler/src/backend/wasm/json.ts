@@ -64,7 +64,7 @@
  * representable range, exact ties, long digit strings, and the exponent
  * overflow/underflow forms. */
 import { Code } from "./code.js";
-import type { DynBuilder } from "./dyn.js";
+import { DK, DYN_KIND, DYN_NUM, DYN_REF, type DynBuilder } from "./dyn.js";
 import { F64, I32, I64, ModuleBuilder, type ValType } from "./module.js";
 
 /** C's SCR_JSON_MAX_DEPTH. SEMANTICS.md S013. */
@@ -3222,6 +3222,353 @@ export class JsonBuilder {
       c.end(); // OUTER
       c.call(this.jbFinish());
       this.mb.setBody(idx, [I32, I32, I32, I32, I32, I32], c.bytes());
+    });
+  }
+
+  /* ── JSON.stringify over a DYN root ─────────────────────────────────────
+   * The runtime walk the type-directed serializers exist to avoid. A dyn
+   * value has no static type, so the tree's own kinds drive the walk —
+   * C's `scr_dyn_json_write`, ported with three deliberate differences,
+   * each argued where it happens:
+   *
+   *  - KEY ORDER IS JS OWN-KEY ORDER, not the entry table's. C walks
+   *    `d->v.obj.entries` in insertion order, which reorders nothing;
+   *    Node's stringify uses EnumerableOwnPropertyNames, so integer-like
+   *    keys come out ascending FIRST whatever order they went in
+   *    (`JSON.stringify(JSON.parse('{"2":1,"1":2}'))` is `{"1":2,"2":1}`
+   *    in Node — measured, not assumed). This tier already answers that
+   *    order for `Object.keys`, so the walk goes through the same
+   *    `objWalk` rather than growing a second, subtly different copy of
+   *    the rule. C's raw-order walk is a native-lane divergence, tracked
+   *    separately.
+   *  - NO PROBE BUFFER. C serializes each member into a scratch buffer
+   *    first to discover whether it was absent, because a JSVAL member's
+   *    presence is only known once the engine has been asked. No dyn tree
+   *    here can hold a JSVAL, so absence is exactly `kind is UNDEF or
+   *    FUNC` and a kind test decides it before a byte is written.
+   *  - BYTES / HANDLE / JSVAL ARMS ARE `unreachable`. None is
+   *    constructible on this tier; an honest trap beats a silently wrong
+   *    answer if that ever stops being true.
+   *
+   * THE DEPTH CAP IS SEMANTICS.md S026. Both Node and this walker cap
+   * stringify recursion and both report `RangeError: Maximum call stack
+   * size exceeded` — the kind and the text agree exactly. What differs is
+   * the LIMIT: 1000 here regardless of anything, implementation-defined
+   * and stack-dependent there. The entry has the measurements. */
+
+  private jbDepthG: number | null = null;
+
+  /** The stringify walker's recursion depth. Deliberately NOT the
+   * parser's global: the two never run at once, but one counter serving
+   * two unrelated state machines is a coupling with nothing to buy it. */
+  private jbDepth(): number {
+    this.jbDepthG ??= this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41);
+      w.sleb(0);
+    });
+    return this.jbDepthG;
+  }
+
+  /** depth += 1, and the cap check. Leaves nothing; the caller tests the
+   * exception cell. A throwing exit does NOT decrement — the root entry
+   * zeroes the counter, which is the parser's discipline too. */
+  private emitDepthEnter(c: Code): void {
+    c.globalGet(this.jbDepth());
+    c.i32Const(1);
+    c.i32Add();
+    c.globalSet(this.jbDepth());
+    c.globalGet(this.jbDepth());
+    c.i32Const(MAX_DEPTH);
+    c.i32GtS();
+    c.ifVoid();
+    // SEMANTICS.md S026. Node throws this same RangeError with this same
+    // message for deep nesting; only the depth it happens at differs.
+    this.deps.throwError(c, "%RangeError", "RangeError", (x) =>
+      this.deps.lit(x, "Maximum call stack size exceeded"),
+    );
+    c.i32Const(0);
+    c.return_();
+    c.end();
+  }
+
+  private emitDepthLeave(c: Code): void {
+    c.globalGet(this.jbDepth());
+    c.i32Const(1);
+    c.i32Sub();
+    c.globalSet(this.jbDepth());
+  }
+
+  /** `%w.json.putDyn(d)` → 1 when the value serialized, 0 when it is
+   * ABSENT under stringify (undefined and functions, C's `false` return).
+   * The caller decides what absence means in its position: a dropped
+   * ROOT becomes the text "undefined", an array SLOT becomes `null`, and
+   * an object MEMBER vanishes with its key — all three exactly Node.
+   *
+   * A 0 return is meaningless while the exception cell is set, so every
+   * recursive call tests the cell BEFORE reading the answer. */
+  putDyn(): number {
+    const dyn = this.deps.dyn();
+    return this.cached("putDyn", [dyn.dynRef()], [I32], (idx) => {
+      const dynT = dyn.dynT();
+      const strT = this.deps.strType();
+      const c = new Code();
+      const K = 1; // the receiver's kind
+      const V = 2; // the ARR payload, or the entries vector
+      const N = 3;
+      const I = 4;
+      const ENTS = 5; // objWalk's result box
+      const E = 6; // one element, or one [key, value] pair
+      const P = 7; // the pair's payload vector
+      const MK = 8; // one member's kind
+      const FIRST = 9;
+      const PRESENT = 10;
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.localSet(K);
+
+      // Absent under stringify. C returns false here and so do we; the
+      // three callers differ only in what they do about it.
+      this.emitKindArm(c, K, [DK.UNDEF, DK.FUNC], () => {
+        c.i32Const(0);
+        c.return_();
+      });
+      this.emitKindArm(c, K, [DK.NULL], () => {
+        this.deps.lit(c, "null");
+        c.call(this.jbPuts());
+        c.i32Const(1);
+        c.return_();
+      });
+      this.emitKindArm(c, K, [DK.BOOL], () => {
+        // The flag widened into the num slot at box time (dyn.ts).
+        c.localGet(0);
+        c.structGet(dynT, DYN_NUM);
+        c.f64Const(0);
+        c.f64Ne();
+        c.ifResult(this.deps.strRef());
+        this.deps.lit(c, "true");
+        c.else_();
+        this.deps.lit(c, "false");
+        c.end();
+        c.call(this.jbPuts());
+        c.i32Const(1);
+        c.return_();
+      });
+      this.emitKindArm(c, K, [DK.NUM], () => {
+        c.localGet(0);
+        c.structGet(dynT, DYN_NUM);
+        c.call(this.jbPutF64());
+        c.i32Const(1);
+        c.return_();
+      });
+      this.emitKindArm(c, K, [DK.STR], () => {
+        c.localGet(0);
+        c.structGet(dynT, DYN_REF);
+        c.refCast(strT);
+        c.call(this.jbPutStr());
+        c.i32Const(1);
+        c.return_();
+      });
+      // A promise has no own enumerable properties, so Node stringifies
+      // one as an empty object.
+      this.emitKindArm(c, K, [DK.PROMISE], () => {
+        this.deps.lit(c, "{}");
+        c.call(this.jbPuts());
+        c.i32Const(1);
+        c.return_();
+      });
+
+      this.emitKindArm(c, K, [DK.ARR], () => {
+        this.emitDepthEnter(c);
+        c.i32Const(0x5b); // '['
+        c.call(this.jbPutc());
+        dyn.arrPayload(c, (x) => x.localGet(0));
+        c.localSet(V);
+        dyn.arrLen(c, (x) => x.localGet(V));
+        c.localSet(N);
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(N);
+        c.i32GeU();
+        c.brIf(1);
+        c.localGet(I);
+        c.ifVoid();
+        c.i32Const(0x2c); // ','
+        c.call(this.jbPutc());
+        c.end();
+        dyn.arrAt(c, (x) => x.localGet(V), (x) => x.localGet(I));
+        c.call(idx);
+        c.localSet(PRESENT);
+        // The cell first: a 0 from a walk that THREW is an unwind, not an
+        // absent value, and writing `null` for it would swallow the throw.
+        c.globalGet(this.deps.excKind());
+        c.ifVoid();
+        c.i32Const(0);
+        c.return_();
+        c.end();
+        c.localGet(PRESENT);
+        c.i32Eqz();
+        c.ifVoid();
+        // A hole in the JSON sense: undefined and functions print as null
+        // in ARRAY position, where an object member would have dropped.
+        this.deps.lit(c, "null");
+        c.call(this.jbPuts());
+        c.end();
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        c.i32Const(0x5d); // ']'
+        c.call(this.jbPutc());
+        this.emitDepthLeave(c);
+        c.i32Const(1);
+        c.return_();
+      });
+
+      this.emitKindArm(c, K, [DK.OBJ], () => {
+        this.emitDepthEnter(c);
+        c.i32Const(0x7b); // '{'
+        c.call(this.jbPutc());
+        // Own-key ORDER, through the one helper that defines it.
+        c.localGet(0);
+        c.i32Const(2); // Object.entries mode
+        c.call(dyn.objWalk());
+        c.localSet(ENTS);
+        dyn.arrPayload(c, (x) => x.localGet(ENTS));
+        c.localSet(V);
+        dyn.arrLen(c, (x) => x.localGet(V));
+        c.localSet(N);
+        c.i32Const(0);
+        c.localSet(I);
+        c.i32Const(1);
+        c.localSet(FIRST);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(N);
+        c.i32GeU();
+        c.brIf(1);
+        dyn.arrAt(c, (x) => x.localGet(V), (x) => x.localGet(I));
+        c.localSet(E);
+        dyn.arrPayload(c, (x) => x.localGet(E));
+        c.localSet(P);
+        // An absent MEMBER drops with its key, so the kind decides before
+        // anything is written — no probe buffer needed (see the header).
+        dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(1));
+        c.structGet(dynT, DYN_KIND);
+        c.localSet(MK);
+        c.localGet(MK);
+        c.i32Const(DK.UNDEF);
+        c.i32Eq();
+        c.localGet(MK);
+        c.i32Const(DK.FUNC);
+        c.i32Eq();
+        c.i32Or();
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(FIRST);
+        c.i32Eqz();
+        c.ifVoid();
+        c.i32Const(0x2c); // ','
+        c.call(this.jbPutc());
+        c.end();
+        c.i32Const(0);
+        c.localSet(FIRST);
+        dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(0));
+        c.structGet(dynT, DYN_REF);
+        c.refCast(strT);
+        c.call(this.jbPutStr());
+        c.i32Const(0x3a); // ':'
+        c.call(this.jbPutc());
+        dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(1));
+        c.call(idx);
+        c.drop(); // present: the kind test above already established it
+        c.globalGet(this.deps.excKind());
+        c.ifVoid();
+        c.i32Const(0);
+        c.return_();
+        c.end();
+        c.end();
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        c.i32Const(0x7d); // '}'
+        c.call(this.jbPutc());
+        this.emitDepthLeave(c);
+        c.i32Const(1);
+        c.return_();
+      });
+
+      // BYTES, HANDLE and JSVAL: no producer on this tier can build one
+      // (typed arrays, runtime handles and the island bridge all refuse
+      // upstream of here), so reaching this point means the dyn surface
+      // grew a kind without growing this walk.
+      c.unreachable();
+      this.mb.setBody(
+        idx,
+        [I32, dyn.arrRef(), I32, I32, dyn.dynRef(), dyn.dynRef(), dyn.arrRef(), I32, I32, I32],
+        c.bytes(),
+      );
+    });
+  }
+
+  /** `if (kind is one of ks) { body }` — the kind-dispatch shape dyn.ts
+   * spells `arm`, repeated here so this file needs nothing from it but
+   * the representation. */
+  private emitKindArm(c: Code, kindLocal: number, ks: number[], body: () => void): void {
+    ks.forEach((k, i) => {
+      c.localGet(kindLocal);
+      c.i32Const(k);
+      c.i32Eq();
+      if (i > 0) c.i32Or();
+    });
+    c.ifVoid();
+    body();
+    c.end();
+  }
+
+  /** `%w.json.stringifyDyn(d)` → the stringify text, or a pending
+   * RangeError. THE entry point a dyn-rooted `JSON.stringify` lowers to.
+   *
+   * A root the walk DROPS answers the text "undefined" where Node answers
+   * the undefined VALUE. That is the lowering's documented rule rather
+   * than this walker's invention: tsc's own lib types the return `string`,
+   * so no statically-typed consumer can tell the two apart. */
+  stringifyDyn(): number {
+    const dyn = this.deps.dyn();
+    return this.cached("stringifyDyn", [dyn.dynRef()], [this.deps.strRef()], (idx) => {
+      const c = new Code();
+      const PRESENT = 1;
+      c.call(this.jbBegin());
+      c.i32Const(0);
+      c.globalSet(this.jbDepth());
+      c.localGet(0);
+      c.call(this.putDyn());
+      c.localSet(PRESENT);
+      // The cell first, again: the caller's pending check unwinds, and
+      // the buffer is left for the next site's prologue to reset.
+      c.globalGet(this.deps.excKind());
+      c.ifVoid();
+      c.refNull(this.deps.strType());
+      c.return_();
+      c.end();
+      c.localGet(PRESENT);
+      c.i32Eqz();
+      c.ifVoid();
+      this.deps.lit(c, "undefined");
+      c.return_();
+      c.end();
+      c.call(this.jbFinish());
+      this.mb.setBody(idx, [I32], c.bytes());
     });
   }
 }

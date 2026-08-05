@@ -913,6 +913,26 @@ const TIER_FLOOR: string[] = [
   "2444-union-literal-reducer-spread.ts",
   "2535-destructuring-assign-basics.ts",
   "2539-class-instance-rest.ts",
+  // Increment 15 (JSON.stringify), stage B: the DYN ROOT — the one
+  // stringify shape with no static type to direct a serializer, so the
+  // dyn tree's own kinds drive a runtime walk instead. Undefined and
+  // function members drop with their keys where array slots holding them
+  // print null; a dropped ROOT becomes the text "undefined"; objects
+  // serialize in JS own-key order (through the same helper Object.keys
+  // goes through, so integer-like keys come out ascending first — C walks
+  // its entry table raw and does not); a promise is `{}`; and recursion
+  // caps at 1000 levels with a catchable RangeError, which is
+  // SEMANTICS.md S026.
+  //
+  // `expr:jsonStringify` leaves the census entirely with these five. The
+  // two other programs that were refusing at it turned out to be blocked
+  // behind it as well rather than only by it — 2286 now names
+  // libCall:insp.dynS and 2383 libCall:process.envGet.
+  "1870-unit-type-values.ts",
+  "2081-destructuring-rest.ts",
+  "2110-top-object-types.ts",
+  "2111-json-stringify-unknown.ts",
+  "2534-object-rest-decl.ts",
 ];
 
 interface RunResult {

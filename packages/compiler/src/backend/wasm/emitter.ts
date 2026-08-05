@@ -6921,10 +6921,14 @@ class Assembler {
       case "jsonStringify": {
         // Type-directed serialization: the STATIC type picks the walker,
         // interned per type — no dynamic dispatch anywhere. A dyn ROOT is
-        // the one shape that needs one, and it waits for the dyn walker.
+        // the one shape with no static type to direct it, and takes the
+        // runtime walk instead: the tree's own kinds drive it, it can
+        // throw (the depth cap, S026), and so the site checks the cell.
         if (e.value.type.kind === "dyn") {
-          this.refuse("expr:jsonStringify", e.loc);
-          code.unreachable();
+          this.walkExpr(e.value);
+          code.call(this.json.stringifyDyn());
+          this.emitPendingCheck();
+          this.emitJsonIndent(e);
           return;
         }
         const helper = this.jsonWriteHelper(e.value.type, e.loc);
@@ -6949,14 +6953,7 @@ class Assembler {
         // acyclic and nothing user-written runs mid-walk, so the walkers
         // are throw-free (the walker family's comment carries the
         // argument). Cycle-capable roots bring their own check.
-        const indent = (e as { indent?: string }).indent;
-        if (indent !== undefined && indent !== "") {
-          // `space` arrived here as the frontend's compile-time
-          // resolution of it; the re-indenter rewrites the compact text
-          // with Node's gap algorithm.
-          this.pushStrLit(indent);
-          code.call(this.json.indent());
-        }
+        this.emitJsonIndent(e);
         return;
       }
 
@@ -7014,6 +7011,19 @@ class Assembler {
         code.unreachable();
       }
     }
+  }
+
+  /** The pretty-print wrap both stringify roots share: `space` arrived
+   * here as the frontend's compile-time resolution of it, and the
+   * re-indenter rewrites the compact text with Node's gap algorithm. A
+   * root that produced a bare scalar — or the dyn root's dropped-value
+   * text "undefined" — passes through unchanged, since the state machine
+   * only reacts to structural characters. */
+  private emitJsonIndent(e: Extract<WExpr, { kind: "jsonStringify" }>): void {
+    const indent = (e as { indent?: string }).indent;
+    if (indent === undefined || indent === "") return;
+    this.pushStrLit(indent);
+    this.fn.code.call(this.json.indent());
   }
 
   private localIndex(localId: string): number {

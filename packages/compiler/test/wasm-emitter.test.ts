@@ -1274,6 +1274,191 @@ test("JSON.stringify: `space` re-indents with Node's gap algorithm", async () =>
   );
 });
 
+test("JSON.stringify over a dyn ROOT: the tree's own kinds drive the walk", async () => {
+  // No static type to direct a serializer, so the dyn tree's kinds do it.
+  // The lines that are easy to get wrong, and what each pins:
+  //
+  //  - OWN-KEY ORDER. Integer-like keys come out ASCENDING FIRST whatever
+  //    order they went in, because Node's stringify uses
+  //    EnumerableOwnPropertyNames. The C runtime walks its entry table in
+  //    insertion order and so answers {"2":1,"1":2,...} here — a
+  //    native-lane divergence this tier does not inherit (task #7).
+  //  - ABSENCE, which means three different things by position: an object
+  //    MEMBER holding undefined or a function drops with its key, an
+  //    array SLOT holding one prints null, and a dropped ROOT becomes the
+  //    TEXT "undefined" (Node returns the undefined VALUE, which
+  //    console.log renders identically — the lowering's documented rule).
+  //  - A promise has no own enumerable properties, so it is `{}`.
+  //
+  // Every expectation captured by running the JS twin under Node 24.18.
+  const res = await buildWasm(
+    "json-dyn-root.ts",
+    [
+      `const u1: unknown = JSON.parse('[1,"a",true,null,2.5]');`,
+      "console.log(JSON.stringify(u1));",
+      `const u2: unknown = JSON.parse('{"b":1,"a":[1,{"c":null}]}');`,
+      "console.log(JSON.stringify(u2));",
+      `const u3: unknown = JSON.parse('{"2":1,"1":2,"b":3,"a":4}');`,
+      "console.log(JSON.stringify(u3));",
+      "const o: any = {};",
+      "o.a = 1; o.b = undefined; o.c = function () { return 1; }; o.d = 2;",
+      "console.log(JSON.stringify(o as unknown));",
+      "const arr: any = [1, undefined, 2];",
+      "console.log(JSON.stringify(arr as unknown));",
+      "const hole: any = [];",
+      "hole[3] = 1;",
+      "console.log(JSON.stringify(hole as unknown));",
+      "const gone: unknown = undefined;",
+      "console.log(JSON.stringify(gone));",
+      // Through a dyn-typed BINDING: `p as unknown` keeps the static
+      // Promise type at the call, which the frontend fences.
+      "const p: Promise<unknown> = Promise.resolve(1 as unknown);",
+      "const pu: unknown = p;",
+      "console.log(JSON.stringify(pu));",
+      `const nums: unknown = JSON.parse('[1e21,0.1,-0]');`,
+      "console.log(JSON.stringify(nums));",
+      "const keyed: any = {};",
+      `keyed['a"b'] = 'q\\nr';`,
+      "console.log(JSON.stringify(keyed as unknown));",
+      `const doc: unknown = JSON.parse('{"b":[1,{"c":"x"}],"a":{}}');`,
+      "console.log(JSON.stringify(doc, null, 2));",
+      // A dropped root is dropped whatever `space` says — Node returns
+      // the undefined VALUE and never reaches its gap algorithm, and the
+      // re-indenter here leaves the text "undefined" alone because it
+      // reacts only to structural characters. A boxed CLOSURE is the
+      // other root that drops, alongside undefined.
+      "console.log(JSON.stringify(gone, null, 2));",
+      "const f = function (): number { return 1; };",
+      "const fu: unknown = f;",
+      "console.log(JSON.stringify(fu), JSON.stringify(fu, null, 2));",
+      // The same two values in the two positions that keep them: an
+      // object member drops with its key, an array slot prints null.
+      "const drops: any = {};",
+      "drops.a = f; drops.b = undefined; drops.c = 1;",
+      "console.log(JSON.stringify(drops as unknown, null, 2));",
+      "const slots: any = [];",
+      "slots.push(f); slots.push(undefined);",
+      "console.log(JSON.stringify(slots as unknown, null, 2));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      '[1,"a",true,null,2.5]',
+      '{"b":1,"a":[1,{"c":null}]}',
+      '{"1":2,"2":1,"b":3,"a":4}',
+      '{"a":1,"d":2}',
+      "[1,null,2]",
+      "[null,null,null,1]",
+      "undefined",
+      "{}",
+      "[1e+21,0.1,0]",
+      String.raw`{"a\"b":"q\nr"}`,
+      "{",
+      '  "b": [',
+      "    1,",
+      "    {",
+      '      "c": "x"',
+      "    }",
+      "  ],",
+      '  "a": {}',
+      "}",
+      "undefined",
+      "undefined undefined",
+      "{",
+      '  "c": 1',
+      "}",
+      "[",
+      "  null,",
+      "  null",
+      "]",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("S021: a crossed error stringifies as its MEMBERS, where Node answers {}", async () => {
+  // The dyn tree has no non-enumerable properties, so the error encoding
+  // stores name/message as ordinary members beside the reserved `%error`
+  // marker — and stringify, which walks own enumerable keys, prints them.
+  // S021 names this exact output as one of its consequences; this is the
+  // pin. Node answers `{}` for the same throw (Error's own properties are
+  // non-enumerable). The native lanes agree with this tier, because C
+  // builds the same encoding.
+  const res = await buildWasm(
+    "json-dyn-error.ts",
+    [
+      'try { throw new TypeError("boom"); }',
+      "catch (e) { const u: unknown = e; console.log(JSON.stringify(u)); }",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(`{"%error":true,"name":"TypeError","message":"boom"}\n`);
+});
+
+test("S026: the dyn stringify walker caps depth at 1000, catchably", async () => {
+  // Node caps this too, and reports the SAME RangeError with the SAME
+  // message — its limit is just implementation-defined and stack-
+  // dependent (measured on Node 24.18: roughly 875 levels at
+  // --stack-size=200, ~4.5k at the default, ~18k at --stack-size=4000,
+  // drifting a few levels run to run). Ours is a fixed 1000, which is
+  // what S026 registers.
+  //
+  // 999 links means 1000 nested objects, which is exactly the cap; one
+  // more throws. A CYCLIC tree is the case that matters most: it is
+  // constructible through dyn keyed writes, Node reports it as a
+  // circular-structure TypeError, and this walker has no cycle detection
+  // — so it runs out of depth instead. The C runtime has no guard of
+  // either kind and dies of SIGSEGV with the stack exhausted (task #17),
+  // which is the uncatchable version of this failure.
+  //
+  // The tree is built at TOP LEVEL on purpose: a dyn value bound by a
+  // block-scoped `const` inside a loop is COPIED rather than aliased on
+  // this tier, so the usual `const x = {}; o.a = x; o = x` idiom builds a
+  // tree one level deep. That is a pre-existing dyn-surface bug, filed
+  // separately; this test steps around it rather than depending on it.
+  const res = await buildWasm(
+    "json-dyn-depth.ts",
+    [
+      "const a: any = {};",
+      "let oa: any = a;",
+      "let xa: any = null;",
+      "for (let i = 0; i < 999; i++) { xa = {}; oa.a = xa; oa = xa; }",
+      "console.log('999 links:', JSON.stringify(a as unknown).length);",
+      "const b: any = {};",
+      "let ob: any = b;",
+      "let xb: any = null;",
+      "for (let i = 0; i < 1000; i++) { xb = {}; ob.a = xb; ob = xb; }",
+      "try { JSON.stringify(b as unknown); console.log('1000 links: no throw'); }",
+      "catch (e) { if (e instanceof RangeError) console.log('1000 links: RangeError: ' + e.message); else console.log('wrong kind'); }",
+      "const c: any = {};",
+      "c.self = c;",
+      "try { JSON.stringify(c as unknown); console.log('cyclic: no throw'); }",
+      "catch (e) { if (e instanceof RangeError) console.log('cyclic: RangeError: ' + e.message); else console.log('wrong kind'); }",
+      // The buffer and the depth counter both reset for the next call —
+      // a throw mid-walk must not poison the one after it.
+      `console.log('recovered:', JSON.stringify(JSON.parse('{"ok":1}')));`,
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "999 links: 5996",
+      "1000 links: RangeError: Maximum call stack size exceeded",
+      "cyclic: RangeError: Maximum call stack size exceeded",
+      `recovered: {"ok":1}`,
+      "",
+    ].join("\n"),
+  );
+});
+
 test("S015: keyed reads on unknown see OWN properties only", async () => {
   // Node consults the prototype chain here and answers a real function;
   // every tsinter lane answers undefined because the dyn tree stores own
