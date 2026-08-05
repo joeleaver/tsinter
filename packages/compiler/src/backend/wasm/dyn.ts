@@ -135,6 +135,26 @@ export const PATH_INDEX = 2;
 export const ENTRY_KEY = 0;
 export const ENTRY_VALUE = 1;
 
+/** `$dynFn`'s field indices — the FUNC payload, C's `ScrDynFn` laid out
+ * for a tier with no `strcmp`. CLOS is the boxed closure struct as `eq`
+ * (its wasm type is per-SIGNATURE, so the box cannot name it; the thunk
+ * casts it back, which is sound exactly because the thunk is emitted per
+ * signature and reached only through a matching SIG). THUNK is the
+ * emitted call glue. SIG is the INTERNED typeKey id — C compares the
+ * signature by `strcmp` on a string literal and LLVM interns; an i32
+ * compare is the same question asked once at compile time. NAME and
+ * ARITY answer `f.name` and `f.length`.
+ *
+ * C additionally hangs an own-property TABLE off the CLOSURE (not the
+ * box), lazily allocated by `Object.defineProperties`. That is the
+ * `dyn.defineProps` libCall, which this backend refuses, so nothing can
+ * populate one here and the slot is absent rather than always-null. */
+export const FN_CLOS = 0;
+export const FN_THUNK = 1;
+export const FN_SIG = 2;
+export const FN_NAME = 3;
+export const FN_ARITY = 4;
+
 /** `$dynObj`'s field indices. `nullProto` is the flag C carries beside the
  * kind — it rides the PAYLOAD here (the header's rule: flags never become
  * kind ids) and is false everywhere until `Object.create(null)` lands. */
@@ -194,6 +214,8 @@ export class DynBuilder {
   private entryType: number | null = null;
   private objType: number | null = null;
   private objEntriesType: number | null = null;
+  private fnType: number | null = null;
+  private thunkSigType: number | null = null;
   private readonly consts = new Map<string, number>();
   private readonly fns = new Map<string, number>();
 
@@ -550,6 +572,54 @@ export class DynBuilder {
     });
   }
 
+  /* ── the FUNC payload ───────────────────────────────────────────────── */
+
+  /** The uniform call-glue signature every emitted thunk has: the boxed
+   * closure (as `eq`, cast back inside), the argument vector, answering an
+   * owned dyn. C's `ScrDynThunk` with the (args, argc) pair collapsed into
+   * the vector that already carries its own length. A mismatch leaves the
+   * catchable path-annotated TypeError pending and answers null, exactly
+   * C's contract. */
+  thunkSig(): number {
+    this.thunkSigType ??= this.mb.funcType(
+      [{ kind: "ref", nullable: true, typeIndex: EQ_HEAP }, this.arrRef()],
+      [this.dynRef()],
+    );
+    return this.thunkSigType;
+  }
+
+  /** `$dynFn` — the FUNC payload. Keyed by MEANING like `$dyn` itself:
+   * a later `ref.cast` has to be able to name this struct alone. */
+  fnT(): number {
+    this.fnType ??= this.mb.openStructType("dyn:fn", [
+      { storage: { kind: "ref", nullable: true, typeIndex: EQ_HEAP }, mutable: false },
+      { storage: { kind: "ref", nullable: true, typeIndex: this.thunkSig() }, mutable: false },
+      { storage: I32, mutable: false },
+      { storage: this.deps.strRef(), mutable: false },
+      { storage: I32, mutable: false },
+    ]);
+    return this.fnType;
+  }
+
+  fnRef(): ValType {
+    return { kind: "ref", nullable: true, typeIndex: this.fnT() };
+  }
+
+  /** Wrap a `$dynFn` payload the caller pushes into a FUNC box. */
+  boxFunc(c: Code, pushFn: (c: Code) => void): void {
+    c.i32Const(DK.FUNC);
+    c.f64Const(0);
+    pushFn(c);
+    c.structNew(this.dynT());
+  }
+
+  /** From a `$dyn` the caller pushes, its FUNC payload. */
+  fnPayload(c: Code, pushDyn: (c: Code) => void): void {
+    pushDyn(c);
+    c.structGet(this.dynT(), DYN_REF);
+    c.refCast(this.fnT());
+  }
+
   /* ── the interned constants ─────────────────────────────────────────── */
 
   /** THE immortal `undefined` — one const-initialized global, the C
@@ -695,15 +765,20 @@ export class DynBuilder {
         c.call(this.deps.strEq());
       });
       // FUNC: identity is the boxed CLOSURE, never the box — one closure
-      // crossing the boundary twice is still one JS function value. There
-      // is nothing to compare until FUNC boxes exist (stage 4), and an
-      // unconstructible kind reaching here is a bug, not a false answer.
-      //
-      // STAGE 4 MUST REPLACE THIS ARM with C's compare (scr_json.c:2292 —
-      // `a == b || a->v.fn.clo == b->v.fn.clo`, i.e. the payload's closure
-      // slot). Wiring a caller to strictEq while this still traps would
-      // turn `f === f` on a boxed function into an abort.
-      this.arm(c, K, [DK.FUNC], () => c.unreachable());
+      // crossing the boundary twice is still ONE JS function value, and
+      // the box is a boundary artifact. C's compare exactly
+      // (scr_json.c:2292): the boxes, OR the closures they carry.
+      this.arm(c, K, [DK.FUNC], () => {
+        c.localGet(0);
+        c.localGet(1);
+        c.refEq();
+        this.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(this.fnT(), FN_CLOS);
+        this.fnPayload(c, (x) => x.localGet(1));
+        c.structGet(this.fnT(), FN_CLOS);
+        c.refEq();
+        c.i32Or();
+      });
       this.arm(c, K, [DK.PROMISE], () => {
         c.localGet(0);
         c.structGet(dynT, DYN_REF);
@@ -1187,9 +1262,45 @@ export class DynBuilder {
           c.end();
           c.globalGet(this.undefinedGlobal());
         });
-        // FUNC's own props plus name/length arrive with the boxes (stage
-        // 4); BYTES, HANDLE and JSVAL are unconstructible on this tier.
-        this.arm(c, K, [DK.FUNC, DK.BYTES, DK.HANDLE, DK.JSVAL], () => c.unreachable());
+        // A FUNC box answers the two function-instance members Node
+        // defines, `scr_dyn_fn_get` ported: `name` (the empty string when
+        // the value is anonymous — C's `d->v.fn.name ? : ""`) and
+        // `length` (the declared arity). C consults an own-property table
+        // FIRST, but its only writer is Object.defineProperties, which
+        // this backend refuses — so there is no table to consult and no
+        // key that could shadow these two. Everything else falls through
+        // to undefined, which is C's NULL answer reaching the same place.
+        this.arm(c, K, [DK.FUNC], () => {
+          c.localGet(1);
+          this.deps.lit(c, "name");
+          c.call(this.deps.strEq());
+          c.ifVoid();
+          this.boxStr(c, (x) => {
+            this.fnPayload(x, (y) => y.localGet(0));
+            x.structGet(this.fnT(), FN_NAME);
+            x.localTee(MSG);
+            x.refIsNull();
+            x.ifResult(this.deps.strRef());
+            this.deps.lit(x, "");
+            x.else_();
+            x.localGet(MSG);
+            x.end();
+          });
+          c.return_();
+          c.end();
+          this.pushIsLength(c, (x) => x.localGet(1));
+          c.ifVoid();
+          this.boxNum(c, (x) => {
+            this.fnPayload(x, (y) => y.localGet(0));
+            x.structGet(this.fnT(), FN_ARITY);
+            x.f64ConvertI32U();
+          });
+          c.return_();
+          c.end();
+          c.globalGet(this.undefinedGlobal());
+        });
+        // BYTES, HANDLE and JSVAL are unconstructible on this tier.
+        this.arm(c, K, [DK.BYTES, DK.HANDLE, DK.JSVAL], () => c.unreachable());
         // NUM and BOOL have no own properties: JS reads undefined.
         c.globalGet(this.undefinedGlobal());
         this.mb.setBody(idx, [I32, I32, this.dynRef(), this.deps.strRef()], c.bytes());
