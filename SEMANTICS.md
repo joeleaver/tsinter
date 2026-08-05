@@ -896,3 +896,147 @@ through the static one; a cyclic dyn tree throws; and the buffer, seen
 stack and depth counter all recover for the next call. No corpus program
 can pin it: the native lanes diverge from this by construction (C caps
 neither path).
+
+## S027 — `util.inspect` of an Error renders the STACKLESS bracket form *(wasm tier)*
+
+`util.inspect(err)` and `console.log(err)` on this tier render
+`[Name: message]` — or `[Name]` when the message is empty — where Node
+prints the error's `stack`, which begins `Name: message` and continues with
+`    at ...` frames. A stamped `code` slot renders as the one extra own
+property Node would show alongside: `[Error: boom] { code: 'ENOENT' }`.
+
+This divergence is INHERITED AND WAS NEVER REGISTERED: `scr_inspect.c:655`
+calls the stack-carrying Node output "a documented divergence", but the
+register it refers to is upstream's, which was never shipped. So this entry
+is the first one, and it covers the native lanes' behavior as much as this
+tier's — they make the same choice for the same reason.
+
+**This is not an invented form.** It is exactly what Node prints for an
+error whose stack is empty, which is why the bracket shape was chosen
+rather than something merely plausible. Measured on Node 24.18, setting
+`e.stack = ''` first: `new Error('boom')` renders `[Error: boom]`, an
+Error with no message renders `[Error]`, `new TypeError('bad')` renders
+`[TypeError: bad]`, one with a `code` property renders `[Error: boom] {
+code: 'ENOENT' }`, and a multi-line message keeps its newlines with the
+continuation lines indented to the property's own level (`{\n  e: [Error:
+line one\n  line two]\n}`). Every one of those is reproduced here byte for
+byte. The NAME comes from the error's `name`, not its constructor — a
+renamed error prints `[Custom: m]`, and this tier stores the name in a slot
+for the same reason.
+
+The depth gate follows Node's, including its asymmetry: beyond the depth
+budget an error WITH extra properties collapses to `[Error]`, while one
+WITHOUT them still prints its full base, because for a stackless error the
+bracket form *is* the value rather than a property dump. Measured both ways
+(`{ a: { b: { c: e } } }` gives `[Error]` with a `code` present and
+`[Error: boom]` without).
+
+**Only the BUILTIN error classes reach this rendering**, and that is what
+keeps the claim above exact. `util.inspect` of an error SUBCLASS is fenced
+in the frontend (`inspect of 'AppError' values` — a named refusal, not a
+silent approximation), so the reconstruction Node performs for subclasses
+never arises here. Node's rule is worth recording for whoever unfences
+them, because it is not obvious: `improveStack` compares the error's `name`
+against its CONSTRUCTOR, and when a name ending in `Error` disagrees it
+rewrites the header. Measured with emptied stacks — `class AppError extends
+Error {}` renders `[AppError: m]` (the inherited name `Error` is a
+substring of the constructor name, so the constructor wins outright),
+`class MyType extends TypeError {}` renders `[MyType [TypeError]: m]` (not
+a substring, so both appear), and a plain Error renamed to `Custom` renders
+`[Custom: m]` (the name does not end in `Error`, so the rule never fires).
+This tier stamps the BUILTIN base's name into a slot, which is right for
+every class that reaches the renderer and would be wrong for a subclass —
+another reason the fence stays until someone ports that rule.
+
+**Rationale:** a compiled wasm module has no JS stack to print. There are
+no `.js` source frames, no function-name metadata at runtime, and no
+line/column mapping — the information Node's stack is made of does not
+exist in the artifact. The options were to print a stack that is a
+fabrication, to print nothing where Node prints something, or to print the
+form Node itself uses when the stack is empty. The third is the only one
+that is both honest and a shape existing Node-targeting code already
+handles. Removing the divergence means shipping DWARF-style debug metadata
+and a stack-walking runtime, which is a different project.
+
+Note this is a rendering divergence only: `err.stack` is a separate
+question (the property does not carry frames either), and `err.message`,
+`err.name`, `err.code` and `instanceof` are all exact.
+
+**Tested by:** the wasm inspect unit tests — the five bracket shapes above,
+the `code` property through the frame engine, the multi-line message
+indent, and the depth gate in both directions, each pinned against the
+Node output measured with an emptied stack. No corpus program can pin the
+top-level form: every lane prints its own base there (the C runtime makes
+the same choice for the same reason), so the corpus programs that inspect
+errors compare wasm against Node only where the two agree.
+
+## S028 — Grid-grouping DISPLAY WIDTH uses Node's non-ICU tables, un-normalized *(wasm tier)*
+
+`util.inspect` lays arrays of seven or more short entries out as a grid
+(`groupArrayElements`), and the column arithmetic measures each entry by
+DISPLAY WIDTH rather than string length. This tier computes that width by
+applying Node's own `isFullWidthCodePoint` / `isZeroWidthCodePoint` tables
+per code point. Node computes it differently in two respects, one of which
+is a divergence:
+
+- **NFC normalization is omitted here.** Node normalizes before measuring
+  in BOTH of its implementations — the non-ICU fallback
+  (`inspect.js:2695-2711`) normalizes and then walks these very tables, and
+  the ICU path normalizes before handing off to `icu.getStringWidth`.
+  Normalization can change the code point COUNT and not only widths:
+  U+1D160 decomposes into three characters that do not recompose, so Node
+  measures it 3 where a per-code-point walk answers 1.
+- **The tables are stale against ICU's East_Asian_Width data**, which
+  separates this tier from an ICU-enabled Node (the usual build) but not
+  from Node's own fallback. Measured over all 1,114,112 code points, the
+  two answers differ on 11148, in 480 contiguous ranges, in five buckets
+  that sum to exactly that total:
+
+  | this tier | ICU-Node | count | what they are |
+  |---|---|---|---|
+  | 1 | 2 | 9013 | emoji and symbols ICU widened (U+231A, U+2648..U+2653, ...) |
+  | 1 | 0 | 1812 | marks ICU calls zero-width — 1648 of them Mn/Me, the other 164 format and unassigned code points |
+  | 2 | 1 | 299 | unassigned code points inside the tables' ranges (U+3040, U+4DC0..U+4DFF, U+1B002) |
+  | 0 | 1 | 15 | U+20F1..U+20FF — unassigned tail of the symbol-marks block the tables call zero-width |
+  | 1 | 3 | 9 | U+1D160..U+1D164, U+1D1BD..U+1D1C0 — the NFC expansions above |
+
+**VT-sequence stripping is NOT part of this divergence**, though it looks
+like it should be, and there are two independent reasons — either alone
+settles it. First, the strip is PARAMETERIZED and off here:
+`getStringWidth(str, removeControlChars)` takes the flag and
+`groupArrayElements` passes `ctx.colors`, false under the default options
+this tier accepts, so Node does not strip either. Measured:
+`getStringWidth("\x1b[31mred\x1b[0m")` is 3 with stripping and 10 without,
+and 10 is what this tier answers. Second, and more durably: **no grid entry
+can contain a raw ESC in the first place.** Entries are renderings, and
+strEscape turns U+001B into the four characters `\x1B` — so even if the
+flag flipped, every entry this tier can produce is already ESC-free and the
+two implementations would still agree on all of them.
+
+**The exposure is narrow.** Width feeds grid grouping and nothing else
+under the default options (break-length counts UTF-16 code units, which
+this tier computes exactly). So a divergence requires an array of seven or
+more entries, short enough to group, containing code points in the
+disagreeing set. Pure-ASCII data — the overwhelming majority of what gets
+inspected — is byte-identical, and any array that breaks to one entry per
+line is unaffected whatever it contains.
+
+**Rationale:** matching ICU means shipping an East_Asian_Width table and an
+NFC normalizer into every module that inspects anything. The table is tens
+of kilobytes and full NFC is a Unicode-data-sized dependency, against a
+divergence that needs exotic input in a grid to observe at all. Node's own
+non-ICU builds behave the same way modulo normalization, so this is a
+stance Node itself ships. Removing the divergence means an NFC
+implementation plus current EAW data, best done once, shared with the case
+tables `toLowerCase`/`toUpperCase` are also waiting on.
+
+**Tested by:** the wasm inspect unit tests pin `insp_width` by value
+against a 99-entry hand-checked table, including the code points where ICU
+provably disagrees (U+3040, U+4DC0, U+1B002, U+20FF), so the tests record
+which side this tier implements. A GROUPED-GRID case pins the divergence
+end to end: ten entries of a digit plus U+0483 (COMBINING CYRILLIC TITLO)
+lay out three columns per row here and four in Node, and the test asserts
+both the literal output and that it differs from `util.inspect` — so a
+future change that silently converges, or diverges further, fails. The
+complementary half is pinned too: ASCII grids at the same six shapes are
+byte-identical to Node. Corpus programs cover the grid on ASCII data only.

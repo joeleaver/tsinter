@@ -288,6 +288,12 @@ export class Code {
   f64Neg(): void {
     this.w.u8(0x9a);
   }
+  f64Floor(): void {
+    this.w.u8(0x9c);
+  }
+  f64Sqrt(): void {
+    this.w.u8(0x9f);
+  }
   f64Add(): void {
     this.w.u8(0xa0);
   }
@@ -299,6 +305,15 @@ export class Code {
   }
   f64Div(): void {
     this.w.u8(0xa3);
+  }
+  /** NaN-propagating, like `Math.min` — NOT C's `fmin`, which returns the
+   * non-NaN operand. Node's layout math uses MathMin. */
+  f64Min(): void {
+    this.w.u8(0xa4);
+  }
+  /** NaN-propagating, like `Math.max` (see f64Min). */
+  f64Max(): void {
+    this.w.u8(0xa5);
   }
   i32WrapI64(): void {
     this.w.u8(0xa7);

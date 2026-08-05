@@ -1552,6 +1552,10 @@ class Assembler {
       strType: () => this.strType,
       lit: (c, s) => this.pushStrLitInto(c, s),
       f64ToStr: () => this.f64ToStrHelper(),
+      errT: () => this.exc().errT,
+      errName: () => ERR_NAME,
+      errMessage: () => ERR_MESSAGE,
+      errCode: () => ERR_CODE,
     });
     return this.inspField;
   }
@@ -5780,6 +5784,58 @@ class Assembler {
           this.walkExpr(e.args[0]!);
           code.call(this.insp.key());
           return;
+        }
+        if (
+          e.fn === "insp.begin" ||
+          e.fn === "insp.entry" ||
+          e.fn === "insp.end" ||
+          e.fn === "insp.moreItems" ||
+          e.fn === "insp.circCheck" ||
+          e.fn === "insp.seenPush" ||
+          e.fn === "insp.refWrap" ||
+          e.fn === "insp.circular" ||
+          e.fn === "insp.error"
+        ) {
+          // The LAYOUT engine (inspect.ts): the frame stack that
+          // reduceToSingleString and groupArrayElements run over, the
+          // circular quartet, and the error leaf. The frontend's
+          // synthesized per-type helpers drive the whole protocol, so
+          // these are plain calls with the arguments in IR order. None of
+          // them throws.
+          //
+          // The circular trio takes an `eqref`: every GC struct and array
+          // is a subtype, so a record, vector, map or class value passes
+          // with no cast — identity is `ref.eq` on the value itself.
+          for (const a of e.args) this.walkExpr(a);
+          switch (e.fn) {
+            case "insp.begin":
+              code.call(this.insp.begin());
+              return;
+            case "insp.entry":
+              code.call(this.insp.entry());
+              return;
+            case "insp.end":
+              code.call(this.insp.end());
+              return;
+            case "insp.moreItems":
+              code.call(this.insp.moreItems());
+              return;
+            case "insp.circCheck":
+              code.call(this.insp.circCheck());
+              return;
+            case "insp.seenPush":
+              code.call(this.insp.seenPush());
+              return;
+            case "insp.refWrap":
+              code.call(this.insp.refWrap());
+              return;
+            case "insp.circular":
+              code.call(this.insp.circular());
+              return;
+            default:
+              code.call(this.insp.error());
+              return;
+          }
         }
         if (e.fn === "error.new") {
           // scr_error_new(kind, message), ported: the builtin instance —

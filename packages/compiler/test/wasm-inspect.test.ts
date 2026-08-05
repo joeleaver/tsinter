@@ -20,14 +20,16 @@
  * level (measured).
  *
  * Widths are pinned BY VALUE, because what the backend implements is Node's
- * non-ICU tables applied PER CODE POINT, without NFC normalization and
- * without VT-sequence stripping — and Node does both of those in BOTH its
- * implementations (the non-ICU fallback at inspect.js:2695-2711 as much as
- * the ICU path this build takes), so there is no Node function to
- * differentially compare against. Measured over all 1,114,112 code points,
- * the tables and this build's answer differ on 11148 of them. Width feeds
- * only grid grouping, so the divergence becomes observable, and gets its
- * register entry, when the grid lands. */
+ * non-ICU tables applied PER CODE POINT, WITHOUT NFC normalization — which
+ * Node applies unconditionally in both of its implementations, so there is
+ * no Node function that computes what this does and nothing to compare
+ * against differentially. Measured over all 1,114,112 code points, the
+ * tables and this build's answer differ on 11148. VT-sequence stripping is
+ * NOT part of that: `getStringWidth` takes the flag and the grid passes
+ * `ctx.colors`, false here, so Node does not strip either. Width feeds only
+ * grid grouping, which SEMANTICS.md S028 covers — and the two grid tests
+ * below pin both sides of it, the exotic case diverging and the ASCII case
+ * agreeing exactly. */
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -47,16 +49,34 @@ interface Helpers {
   key: (s: string) => string;
   width: (s: string) => number;
   setIndent: (n: number) => void;
+  /** insp.error over an errT built here: `code` null means no code slot. */
+  error: (name: string, message: string, code: string | null, recurse: number, depth: number) => string;
 }
 
 async function buildHelpers(): Promise<Helpers> {
   const mb = new ModuleBuilder();
   const strType = mb.arrayType("i16", true);
   const strRef: ValType = { kind: "ref", nullable: true, typeIndex: strType };
+  // The exception struct's SHAPE, not the emitter's instance of it: slot 0
+  // is opaque to inspect.ts (the emitter puts a class-info ref there), and
+  // 1/2/3 are name/message/code. Declaring it here is what lets the error
+  // rendering be pinned at all — the only stamped-`code` errors the tier
+  // can currently produce come from deferred JS fences.
+  const errT = mb.structType([
+    { storage: I32, mutable: false },
+    { storage: strRef, mutable: true },
+    { storage: strRef, mutable: true },
+    { storage: strRef, mutable: false },
+  ]);
+  const errRef: ValType = { kind: "ref", nullable: true, typeIndex: errT };
   let f2s: number | null = null;
   const insp = new InspectBuilder(mb, {
     strRef: () => strRef,
     strType: () => strType,
+    errT: () => errT,
+    errName: () => 1,
+    errMessage: () => 2,
+    errCode: () => 3,
     lit: (c, s) => {
       // pushStrLitInto's encoding: UTF-16LE units into the module blob.
       const units = new Uint8Array(s.length * 2);
@@ -102,9 +122,24 @@ async function buildHelpers(): Promise<Helpers> {
     c.localGet(0);
     c.globalSet(insp.indentGlobal());
   });
+  simple("mkerr", [strRef, strRef, strRef], [errRef], (c) => {
+    c.i32Const(0);
+    c.localGet(0);
+    c.localGet(1);
+    c.localGet(2);
+    c.structNew(errT);
+  });
+  simple("mkerrBare", [strRef, strRef], [errRef], (c) => {
+    c.i32Const(0);
+    c.localGet(0);
+    c.localGet(1);
+    c.refNull(strType);
+    c.structNew(errT);
+  });
   mb.exportFunc("str", insp.str());
   mb.exportFunc("key", insp.key());
   mb.exportFunc("width", insp.width());
+  mb.exportFunc("error", insp.error());
 
   const bytes = mb.emit();
   expect(WebAssembly.validate(bytes)).toBe(true);
@@ -118,6 +153,9 @@ async function buildHelpers(): Promise<Helpers> {
     str: (r: unknown) => unknown;
     key: (r: unknown) => unknown;
     width: (r: unknown) => number;
+    error: (e: unknown, recurse: number, depth: number) => unknown;
+    mkerr: (n: unknown, m: unknown, c: unknown) => unknown;
+    mkerrBare: (n: unknown, m: unknown) => unknown;
   };
   const into = (s: string): unknown => {
     const r = ex.alloc(s.length);
@@ -135,6 +173,14 @@ async function buildHelpers(): Promise<Helpers> {
     key: (s) => outOf(ex.key(into(s))),
     width: (s) => ex.width(into(s)),
     setIndent: (n) => ex.setIndent(n),
+    error: (name, message, code, recurse, depth) =>
+      outOf(
+        ex.error(
+          code === null ? ex.mkerrBare(into(name), into(message)) : ex.mkerr(into(name), into(message), into(code)),
+          recurse,
+          depth,
+        ),
+      ),
   };
 }
 
@@ -188,6 +234,34 @@ async function runProgram(name: string, source: string): Promise<string> {
   memory = instance.exports["memory"] as WebAssembly.Memory;
   (instance.exports["_start"] as () => void)();
   return Buffer.concat(chunks).toString("utf8");
+}
+
+/** Compile one program that inspects each TS EXPRESSION and compare the
+ * whole stdout against Node's rendering of the paired JS value. The layout
+ * engine's cases have to be spelled this way — a composite's rendering
+ * depends on its static type, so the source expression is the input and the
+ * JS twin is only the oracle. */
+async function pinValues(name: string, cases: readonly (readonly [string, unknown])[]): Promise<void> {
+  const source = [
+    'import { inspect } from "node:util";',
+    ...cases.map(([src]) => `console.log(inspect(${src}));`),
+    "",
+  ].join("\n");
+  const got = await runProgram(name, source);
+  const want = cases.map(([, v]) => inspect(v) + "\n").join("");
+  if (got !== want) {
+    const g = got.split("\n");
+    const w = want.split("\n");
+    for (let i = 0; i < Math.max(g.length, w.length); i++) {
+      if (g[i] !== w[i]) {
+        expect(
+          `${g[i] ?? "(missing)"}\n  …after ${JSON.stringify(g.slice(Math.max(0, i - 2), i))}`,
+          `first divergence at output line ${i}`,
+        ).toBe(`${w[i] ?? "(missing)"}\n  …after ${JSON.stringify(w.slice(Math.max(0, i - 2), i))}`);
+      }
+    }
+  }
+  expect(got).toBe(want);
 }
 
 /** Compile one program that inspects every case and compare the whole
@@ -677,5 +751,378 @@ describe("the append buffer", () => {
     expect(h.str("a")).toBe("'a'");
     expect(h.key("k")).toBe("k");
     expect(h.str("z".repeat(11000))).toBe(inspect("z".repeat(11000)));
+  });
+});
+
+/* ── the layout engine (stage B) ──────────────────────────────────────── */
+
+const nums = (n: number, f: (i: number) => number = (i) => i): number[] =>
+  Array.from({ length: n }, (_, i) => f(i));
+const list = (v: readonly unknown[]): string => `[${v.map((x) => JSON.stringify(x)).join(", ")}]`;
+
+describe("reduceToSingleString", () => {
+  test("the single-line and one-per-line forms, and the break edges", async () => {
+    await pinValues("layout-basic", [
+      ["[]", []],
+      ["[1, 2, 3]", [1, 2, 3]],
+      ["[1, 2, 3, 4, 5, 6]", [1, 2, 3, 4, 5, 6]],
+      ['({ a: 1 })', { a: 1 }],
+      ['({ a: 1, b: "two", c: true })', { a: 1, b: "two", c: true }],
+      ['({ "a-b": 1, ok_1: 2 })', { "a-b": 1, ok_1: 2 }],
+      // The 80-column edge, one character at a time.
+      [`({ key: "${"v".repeat(60)}" })`, { key: "v".repeat(60) }],
+      [`({ key: "${"v".repeat(61)}" })`, { key: "v".repeat(61) }],
+      [`({ key: "${"v".repeat(62)}" })`, { key: "v".repeat(62) }],
+      [`({ key: "${"v".repeat(63)}" })`, { key: "v".repeat(63) }],
+      [
+        "({ aaaa: 1, bbbb: 2, cccc: 3, dddd: 4, eeee: 5, ffff: 6, gggg: 7, hhhh: 8 })",
+        { aaaa: 1, bbbb: 2, cccc: 3, dddd: 4, eeee: 5, ffff: 6, gggg: 7, hhhh: 8 },
+      ],
+      // An entry containing a newline forbids the single-line form however
+      // short the join is.
+      [`({ s: "${"x".repeat(75)}\\ny" })`, { s: "x".repeat(75) + "\ny" }],
+      [`([${JSON.stringify("a\nb")}])`, ["a\nb"]],
+      // Entries long enough to break one per line.
+      [
+        list(Array.from({ length: 12 }, () => "0123456789012345678901234567890123456789")),
+        Array.from({ length: 12 }, () => "0123456789012345678901234567890123456789"),
+      ],
+    ]);
+  });
+
+  test("the compact window: currentDepth - recurseTimes < 3", async () => {
+    await pinValues("layout-compact", [
+      ["({ a: { b: { c: { d: 1 } } } })", { a: { b: { c: { d: 1 } } } }],
+      ["({ a: { b: { c: {} } } })", { a: { b: { c: {} } } }],
+      ["({ a: { b: { c: [1, 2] } } })", { a: { b: { c: [1, 2] } } }],
+      ["({ a: [[1, [2, [3, [4]]]]] })", { a: [[1, [2, [3, [4]]]]] }],
+      [
+        "({ deep: { deeper: { deepest: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] } } })",
+        { deep: { deeper: { deepest: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10] } } },
+      ],
+      [
+        '({ nested: { one: "aaaaaaaaaaaaaaaaaaaa", two: "bbbbbbbbbbbbbbbbbbbb", three: "cccccccccccccccccccc" } })',
+        { nested: { one: "aaaaaaaaaaaaaaaaaaaa", two: "bbbbbbbbbbbbbbbbbbbb", three: "cccccccccccccccccccc" } },
+      ],
+      // Depth placeholders: the budget is 2, so the fourth level is [Object].
+      ["({ a: { b: { c: { d: { e: 1 } } } } })", { a: { b: { c: { d: { e: 1 } } } } }],
+      ["[[[[1]]]]", [[[[1]]]]],
+      ["[{ a: 1 }, { b: 2 }, { c: 3 }]", [{ a: 1 }, { b: 2 }, { c: 3 }]],
+      [
+        `[${nums(9).map((i) => `{ id: ${i} }`).join(", ")}]`,
+        nums(9).map((i) => ({ id: i })),
+      ],
+    ]);
+  });
+});
+
+describe("groupArrayElements", () => {
+  test("the grid: column math, padStart for numbers, padEnd otherwise", async () => {
+    await pinValues("layout-grid", [
+      // Seven entries is the floor for grouping to be attempted at all.
+      ["[1, 2, 3, 4, 5, 6, 7]", [1, 2, 3, 4, 5, 6, 7]],
+      [list(nums(26)), nums(26)],
+      [list(nums(30, (i) => i * 1000)), nums(30, (i) => i * 1000)],
+      [list(nums(100)), nums(100)],
+      // Wide numeric entries: fewer columns.
+      [list(nums(40, (i) => i * 1e12)), nums(40, (i) => i * 1e12)],
+      // Strings pad END, numbers pad START — the all_num flag.
+      [list(nums(30).map((i) => `str-${i}`)), nums(30).map((i) => `str-${i}`)],
+      [list(nums(20).map((i) => `${i}`)), nums(20).map((i) => `${i}`)],
+      // A mixed array clears all_num on the first non-number.
+      [
+        `[${nums(8).map((i) => (i % 2 ? String(i) : `"s${i}"`)).join(", ")}]`,
+        nums(8).map((i) => (i % 2 ? i : `s${i}`)),
+      ],
+      // Entries of very different length must NOT group (the 1/5 gate).
+      [
+        `[1, 2, 3, 4, 5, 6, 7, "${"z".repeat(70)}"]`,
+        [1, 2, 3, 4, 5, 6, 7, "z".repeat(70)],
+      ],
+      // maxLength <= 6 is the other half of that gate.
+      [list(nums(12).map((i) => `ab${i}`)), nums(12).map((i) => `ab${i}`)],
+    ]);
+  });
+
+  test("a length sweep pins the column count across every transition", async () => {
+    // The column formula is round(sqrt(2.5 * biasedMax * n) / biasedMax)
+    // clamped three ways, so its output steps as `n` grows. Sweeping every
+    // length from the grouping floor up through 40 crosses those steps
+    // repeatedly — a single hand-picked array can sit in the middle of a
+    // step and miss a wrong constant entirely.
+    const cases: [string, unknown][] = [];
+    for (let n = 7; n <= 40; n++) {
+      cases.push([list(nums(n)), nums(n)]);
+    }
+    await pinValues("layout-grid-sweep", cases);
+  });
+
+  test("a width sweep pins it for wider entries too", async () => {
+    // Same sweep at three entry widths: 2-digit, 5-digit and 9-digit
+    // numbers give different actualMax, hence different column counts and
+    // different clamps (the breakLength one starts to bind).
+    const cases: [string, unknown][] = [];
+    for (let n = 7; n <= 26; n++) {
+      cases.push([list(nums(n, (i) => i * 11)), nums(n, (i) => i * 11)]);
+      cases.push([list(nums(n, (i) => i * 11111)), nums(n, (i) => i * 11111)]);
+      cases.push([list(nums(n, (i) => i * 111111111)), nums(n, (i) => i * 111111111)]);
+    }
+    await pinValues("layout-width-sweep", cases);
+  });
+
+  test("the more-items tail is excluded from the grid", async () => {
+    await pinValues("layout-more", [
+      [list(nums(101)), nums(101)],
+      [list(nums(102)), nums(102)],
+      [list(nums(120)), nums(120)],
+      [list(nums(250, (i) => i * 1000)), nums(250, (i) => i * 1000)],
+      // The tail's own numberness decides the pad order: element 100 here
+      // is a string, so the whole grid pads END (Node checks value[100]).
+      [
+        `[${[...nums(100), '"tail"'].map(String).join(", ")}, "x"]`,
+        [...nums(100), "tail", "x"],
+      ],
+      // averageBias divides totalLength by the FULL entry count (the tail
+      // INCLUDED) while the column estimate uses the grid's count. The
+      // asymmetry only bites when a tail exists AND biasedMax does not clamp
+      // to 1 — every other more-items case above has entries short enough to
+      // clamp, which hides it. Here the first 100 entries are exactly three
+      // characters: correct code gives 12 columns, dividing by the grid count
+      // instead gives 11.
+      [list(nums(101, (i) => 100 + i)), nums(101, (i) => 100 + i)],
+    ]);
+  });
+
+  test("the column formula's rounding is half-UP, not half-to-even", async () => {
+    // Ten entries of exactly five characters put the column estimate on an
+    // exact .5 boundary: sqrt(2.5 * 4 * 10) / 4 = 2.5. Math.round gives 3;
+    // wasm's f64.nearest — the tempting single instruction — gives 2, because
+    // it breaks ties to even. Node lays this out three columns wide, so the
+    // floor(x + 0.5) transcription is what is being pinned.
+    await pinValues("layout-tie", [
+      [list(nums(10, (i) => 10000 + i)), nums(10, (i) => 10000 + i)],
+      // A second tie at a different width, for the same reason.
+      [list(nums(10).map((i) => `abc${i}`)), nums(10).map((i) => `abc${i}`)],
+    ]);
+  });
+
+  test("SEMANTICS.md S028: a grid of exotic entries diverges, ASCII does not", async () => {
+    // The one place the width tables become observable. U+0483 (COMBINING
+    // CYRILLIC TITLO) is width 0 to an ICU Node and width 1 to the ported
+    // non-ICU tables, so a grid of ten digit-plus-titlo entries sizes its
+    // columns differently: Node fits four per row, this tier three.
+    //
+    // Our output is pinned LITERALLY here — it is the one case in this file
+    // that must NOT match `util.inspect`, and the assertion that it differs
+    // is what keeps the register entry honest if a future change silently
+    // converges (or diverges further).
+    const titlo = Array.from({ length: 10 }, (_, i) => `${i}҃`);
+    const source = [
+      'import { inspect } from "node:util";',
+      `console.log(inspect([${titlo.map(tsLit).join(", ")}]));`,
+      "",
+    ].join("\n");
+    const got = await runProgram("grid-s028", source);
+    expect(got).toBe(
+      "[\n" +
+        "  '0҃', '1҃', '2҃',\n" +
+        "  '3҃', '4҃', '5҃',\n" +
+        "  '6҃', '7҃', '8҃',\n" +
+        "  '9҃'\n" +
+        "]\n",
+    );
+    // Node's answer for the same value, four columns wide.
+    expect(inspect(titlo)).toBe(
+      "[\n" +
+        "  '0҃', '1҃', '2҃', '3҃',\n" +
+        "  '4҃', '5҃', '6҃', '7҃',\n" +
+        "  '8҃', '9҃'\n" +
+        "]",
+    );
+    expect(got.trimEnd()).not.toBe(inspect(titlo));
+  });
+
+  test("SEMANTICS.md S028: pure-ASCII grids agree with Node exactly", async () => {
+    // The other half of the entry's claim — the divergence needs exotic
+    // code points, so ASCII grids at the same shapes are byte-identical.
+    const cases: [string, unknown][] = [];
+    for (const n of [8, 10, 12, 16, 20, 26]) {
+      cases.push([list(nums(n).map((i) => `a${i}`)), nums(n).map((i) => `a${i}`)]);
+    }
+    await pinValues("grid-ascii", cases);
+  });
+
+  test("width, not length, sizes the columns", async () => {
+    // Full-width CJK entries are two columns each, so a grid of them fits
+    // fewer per row than their .length would suggest.
+    await pinValues("layout-width", [
+      [list(nums(12).map((i) => `日本${i}`)), nums(12).map((i) => `日本${i}`)],
+      [list(nums(9).map(() => "0123456789".repeat(3))), nums(9).map(() => "0123456789".repeat(3))],
+      [list(nums(20).map((i) => (i % 3 ? "✓" : "x").repeat((i % 5) + 1))),
+       nums(20).map((i) => (i % 3 ? "✓" : "x").repeat((i % 5) + 1))],
+    ]);
+  });
+});
+
+describe("circular references", () => {
+  test("<ref *N> and [Circular *N], numbered in discovery order", async () => {
+    const source = [
+      'import { inspect } from "node:util";',
+      "interface N { name: string; next: N | null }",
+      'const a: N = { name: "a", next: null };',
+      "a.next = a;",
+      "console.log(inspect(a));",
+      'const b: N = { name: "b", next: null };',
+      'const c: N = { name: "c", next: b };',
+      "b.next = c;",
+      "console.log(inspect(b));",
+      "interface P { l: N | null; r: N | null }",
+      "console.log(inspect({ l: a, r: b } as P));",
+      'const d: N = { name: "d", next: { name: "e", next: null } };',
+      "console.log(inspect(d));",
+      // The same value twice is NOT circular — it is not on the path.
+      "console.log(inspect({ l: d, r: d } as P));",
+      "",
+    ].join("\n");
+    const got = await runProgram("circular", source);
+
+    // The JS twins, built the same way.
+    type JN = { name: string; next: JN | null };
+    const ja: JN = { name: "a", next: null };
+    ja.next = ja;
+    const jb: JN = { name: "b", next: null };
+    const jc: JN = { name: "c", next: jb };
+    jb.next = jc;
+    const jd: JN = { name: "d", next: { name: "e", next: null } };
+    // Each console.log is a FRESH top-level inspect, which is what resets
+    // the circular numbering — so the oracle calls inspect separately too.
+    const want =
+      inspect(ja) + "\n" +
+      inspect(jb) + "\n" +
+      inspect({ l: ja, r: jb }) + "\n" +
+      inspect(jd) + "\n" +
+      inspect({ l: jd, r: jd }) + "\n";
+    expect(got).toBe(want);
+    // Spot-check the shapes so a change in both sides at once still fails.
+    expect(got).toContain("<ref *1> { name: 'a', next: [Circular *1] }");
+    expect(got).toContain("r: <ref *2> { name: 'b', next: { name: 'c', next: [Circular *2] } }");
+  });
+
+  test("the numbering resets per top-level value", async () => {
+    // Two renders in one program: the second must start at *1 again, which
+    // is begin(1)'s reset. A leak would number it *2.
+    const source = [
+      'import { inspect } from "node:util";',
+      "interface N { name: string; next: N | null }",
+      'const a: N = { name: "a", next: null };',
+      "a.next = a;",
+      "console.log(inspect(a));",
+      "console.log(inspect(a));",
+      "",
+    ].join("\n");
+    const got = await runProgram("circular-reset", source);
+    const line = "<ref *1> { name: 'a', next: [Circular *1] }";
+    expect(got).toBe(line + "\n" + line + "\n");
+  });
+});
+
+describe("errors (SEMANTICS.md S027)", () => {
+  test("the stackless bracket form, the code property, and the depth gate", async () => {
+    const source = [
+      'import { inspect } from "node:util";',
+      'console.log(inspect(new Error("boom")));',
+      "console.log(inspect(new Error()));",
+      'console.log(inspect(new TypeError("bad")));',
+      'console.log(inspect(new RangeError("out")));',
+      'console.log(inspect(new Error("line one\\nline two")));',
+      'console.log(inspect({ e: new Error("line one\\nline two") }));',
+      'console.log(inspect({ a: { b: { c: new Error("deep") } } }));',
+      'console.log(inspect([new Error("in an array")]));',
+      "",
+    ].join("\n");
+    const got = await runProgram("errors", source);
+    // Node's own output for the same errors with an EMPTIED stack — the
+    // form S027 adopts, reproduced here as the oracle rather than pinned as
+    // invented text.
+    const bare = (make: () => Error): Error => {
+      const e = make();
+      e.stack = "";
+      return e;
+    };
+    const want =
+      inspect(bare(() => new Error("boom"))) + "\n" +
+      inspect(bare(() => new Error())) + "\n" +
+      inspect(bare(() => new TypeError("bad"))) + "\n" +
+      inspect(bare(() => new RangeError("out"))) + "\n" +
+      inspect(bare(() => new Error("line one\nline two"))) + "\n" +
+      inspect({ e: bare(() => new Error("line one\nline two")) }) + "\n" +
+      inspect({ a: { b: { c: bare(() => new Error("deep")) } } }) + "\n" +
+      inspect([bare(() => new Error("in an array"))]) + "\n";
+    expect(got).toBe(want);
+    expect(got.startsWith("[Error: boom]\n[Error]\n[TypeError: bad]\n")).toBe(true);
+  });
+
+  test("a stamped code slot renders as the one extra own property", async () => {
+    // Invoked directly: the only errors this tier stamps a `code` onto come
+    // from deferred JS fences, which no small program reaches, so a
+    // compiled pin is not available yet. The oracle is still Node — an
+    // Error with an emptied stack and a `code` property.
+    const h = await buildHelpers();
+    // The oracle has to construct the REAL class, not rename an Error:
+    // Node's improveStack inserts the constructor when a name ending in
+    // "Error" disagrees with it, so a renamed Error renders `[Error
+    // [TypeError]: bad]`. That rule never fires for anything this tier
+    // renders — the builtin classes' name IS their constructor name, and
+    // inspect of an error SUBCLASS is fenced in the frontend.
+    const CTORS: Record<string, ErrorConstructor> = { Error, TypeError, RangeError, SyntaxError };
+    const withCode = (name: string, message: string, code: string): string => {
+      const e = new CTORS[name]!(message);
+      e.stack = "";
+      (e as Error & { code: string }).code = code;
+      return inspect(e);
+    };
+    expect(h.error("Error", "boom", "ENOENT", 0, 2)).toBe(withCode("Error", "boom", "ENOENT"));
+    expect(h.error("Error", "", "ERR_X", 0, 2)).toBe(withCode("Error", "", "ERR_X"));
+    expect(h.error("TypeError", "bad", "ERR_INVALID_ARG_TYPE", 0, 2)).toBe(
+      withCode("TypeError", "bad", "ERR_INVALID_ARG_TYPE"),
+    );
+    // A code needing the quote ladder goes through it.
+    expect(h.error("Error", "m", "it's", 0, 2)).toBe(withCode("Error", "m", "it's"));
+    // Long enough to break the one-property object onto its own line.
+    const long = "E".repeat(70);
+    expect(h.error("Error", "m", long, 0, 2)).toBe(withCode("Error", "m", long));
+  });
+
+  test("the depth gate is asymmetric: only a code-carrying error collapses", async () => {
+    const h = await buildHelpers();
+    // recurse > depth with a code → `[Name]`; without one the full base
+    // still prints, because for a stackless error the bracket form IS the
+    // value. Both directions measured against Node above (S027).
+    expect(h.error("Error", "boom", "ENOENT", 3, 2)).toBe("[Error]");
+    expect(h.error("TypeError", "bad", "X", 3, 2)).toBe("[TypeError]");
+    expect(h.error("Error", "boom", null, 3, 2)).toBe("[Error: boom]");
+    expect(h.error("Error", "", null, 3, 2)).toBe("[Error]");
+    // At the budget exactly, nothing collapses.
+    expect(h.error("Error", "boom", "ENOENT", 2, 2)).toBe(
+      (() => {
+        const e = new Error("boom");
+        e.stack = "";
+        (e as Error & { code: string }).code = "ENOENT";
+        return inspect(e);
+      })(),
+    );
+  });
+
+  test("a multi-line message indents to the CURRENT level", async () => {
+    const h = await buildHelpers();
+    // formatError's closing replaceAll uses ctx.indentationLvl, which the
+    // frame engine has already bumped for a property value.
+    h.setIndent(0);
+    expect(h.error("Error", "one\ntwo", null, 0, 2)).toBe("[Error: one\ntwo]");
+    h.setIndent(2);
+    expect(h.error("Error", "one\ntwo", null, 0, 2)).toBe("[Error: one\n  two]");
+    h.setIndent(4);
+    expect(h.error("Error", "one\ntwo\nthree", null, 0, 2)).toBe("[Error: one\n    two\n    three]");
+    h.setIndent(0);
   });
 });

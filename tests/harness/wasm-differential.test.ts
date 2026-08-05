@@ -957,6 +957,39 @@ const TIER_FLOOR: string[] = [
   "2480-recursive-record-tree.ts",
   "2483-recursive-record-cycles.ts",
   "2484-json-stringify-circular.ts",
+  // Increment 16 (util.inspect), stage B: the LAYOUT ENGINE. The frontend
+  // synthesizes one traversal helper per static type; everything the type
+  // cannot know lives in the runtime — a frame stack driving
+  // reduceToSingleString and groupArrayElements, and Node's
+  // `<ref *N>`/`[Circular *N]` protocol.
+  //
+  // The frame stack is ONE FLAT ITEM STACK plus a frame table, which works
+  // because begin/end nest the way the type nests: a frame is the index its
+  // items start at, an entry is a push, and `end` reads a span. Entries are
+  // finished STRINGS, never open buffer regions — that is what keeps stage
+  // A's mark discipline sound, and grid rows take their marks strictly
+  // between the entries being complete and the output region opening.
+  //
+  // The grid's arithmetic is Node's verbatim including two asymmetries that
+  // look like bugs and are not: averageBias divides by the FULL entry count
+  // while the column estimate uses the grid's count, and MathRound is
+  // floor(x + 0.5) rather than f64.nearest, which breaks ties to even and
+  // picks different columns. Entries are sized by DISPLAY WIDTH, not
+  // length, which is SEMANTICS.md S028's whole exposure. The `... n more
+  // items` tail sits outside the grid but inside the bias.
+  //
+  // Errors render the stackless bracket form (SEMANTICS.md S027) — what
+  // Node prints for an error whose stack is empty, measured shape by shape
+  // rather than invented.
+  //
+  // Nine libCall names leave the census together: begin, entry, end,
+  // moreItems, circCheck, seenPush, refWrap, circular, error.
+  "1631-inspect-arrays.ts",
+  "1632-inspect-records.ts",
+  "2045-parameter-properties.ts",
+  "2046-abstract-classes.ts",
+  "2451-private-fields.ts",
+  "2485-inspect-circular-refs.ts",
 ];
 
 interface RunResult {
