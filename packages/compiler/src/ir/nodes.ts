@@ -4574,7 +4574,11 @@ export type IrExpr =
    * SEMANTICS.md 55 stance), ARR answers true for "length" and canonical
    * in-range indices, everything else answers false (tsc admits `in`
    * only on object-typed operands, so unit receivers — where JS throws —
-   * are checker-unreachable and answer false). Borrowed operand, no
+   * are checker-unreachable and answer false). An INHERITED name answers
+   * false too, where Node walks the prototype chain and says true —
+   * SEMANTICS.md S015, whose own-properties-only stance covers the
+   * presence operator for the same reason it covers the keyed read.
+   * Borrowed operand, no
    * allocation, never throws. Result is bool. */
   | { kind: "dynHasKey"; key: string; negated?: true; value: IrExpr; type: IrType; loc: SrcLoc }
   /** Strict equality between a dyn value and a SCALAR-typed value

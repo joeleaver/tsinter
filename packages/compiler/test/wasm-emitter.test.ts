@@ -1020,6 +1020,413 @@ test("S014: crossing the dyn boundary COPIES — mutations do not propagate", as
   expect(stdout.toString("utf8")).toBe(["2 2", "1 2", ""].join("\n"));
 });
 
+test("dyn keyed write: V8's refusal texts on every receiver that has no slot", async () => {
+  // Node's own strings, verified against node 24 with this exact program
+  // (strict mode — sloppy mode swallows the primitive writes silently).
+  // No corpus program reaches them: the one that tries (2601) prints its
+  // dyn reads through console.log, which needs the inspect surface.
+  const res = await buildWasm(
+    "dyn-keyset-throws.js",
+    [
+      "'use strict';",
+      "const cases = ['null', '5', '1.5', '\"abc\"', 'true', 'false'];",
+      "try { JSON.parse('null')['x'] = 1; } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "try { JSON.parse('5')['x'] = 1; } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "try { JSON.parse('1.5')['x'] = 1; } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "try { JSON.parse('\"abc\"')['x'] = 1; } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "try { JSON.parse('true')['q'] = 1; } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "try { JSON.parse('false')['q'] = 1; } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      // The S016 lines. Node's answers, verified:
+      //   a['nope'] = 1     -> adds the property, no throw
+      //   a['length'] = 1   -> TRUNCATES the array, no throw
+      //   s['0'] = 'z'      -> "Cannot assign to read only property '0'
+      //                         of string 'abc'" (a DIFFERENT V8 message)
+      //   s['length'] = 9   -> the same read-only message for 'length'
+      // The out-of-range string index below is NOT a divergence — Node
+      // says "Cannot create property" there too, which is why it sits
+      // beside them.
+      "try { JSON.parse('[1]')['nope'] = 1; } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "try { JSON.parse('[1,2,3]')['length'] = 1; } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "try { JSON.parse('\"abc\"')['0'] = 'z'; } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "try { JSON.parse('\"abc\"')['length'] = 9; } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "try { JSON.parse('\"abc\"')['9'] = 'z'; } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "console.log(cases.length);",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "Cannot set properties of null (setting 'x')",
+      "Cannot create property 'x' on number '5'",
+      "Cannot create property 'x' on number '1.5'",
+      "Cannot create property 'x' on string 'abc'",
+      "Cannot create property 'q' on boolean 'true'",
+      "Cannot create property 'q' on boolean 'false'",
+      "Cannot create property 'nope' on array", // S016 — Node adds it
+      "Cannot create property 'length' on array", // S016 — Node truncates
+      "Cannot create property '0' on string 'abc'", // S016 — Node: read only
+      "Cannot create property 'length' on string 'abc'", // S016 — same
+      "Cannot create property '9' on string 'abc'", // agrees with Node
+      "6",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("S016: dyn array index writes PAD where Node leaves holes", async () => {
+  // The exact half and the divergent half in one program. Exact: length,
+  // in-place replacement, and every read — all match Node. Divergent: the
+  // padded slots are real own members here and holes there, which only
+  // the ENUMERATION and PRESENCE surfaces can see. Node's answers for the
+  // second and third lines are "0|3" and "false false true / false true".
+  const res = await buildWasm(
+    "dyn-keyset-arr.js",
+    [
+      "'use strict';",
+      "function s(u) {",
+      "  if (typeof u === 'string') return u;",
+      "  if (typeof u === 'number') return String(u);",
+      "  if (u === undefined) return 'undefined';",
+      "  return '?';",
+      "}",
+      "function j(u) {",
+      "  const n = typeof u.length === 'number' ? u.length : 0;",
+      "  let out = '';",
+      "  for (let i = 0; i < n; i = i + 1) { out = out + (i > 0 ? '|' : '') + String(u[i]); }",
+      "  return out;",
+      "}",
+      "const a = JSON.parse('[1,2,3]');",
+      "a[0] = 'zero';",
+      "a[5] = 'five';",
+      "console.log(s(a[0]) + ' ' + s(a[1]) + ' ' + s(a[3]) + ' ' + s(a[4]) + ' ' + s(a[5]) + ' ' + s(a.length));",
+      "const b = JSON.parse('[]');",
+      "b[2] = 9;",
+      "console.log(s(b.length) + ' ' + s(b[0]) + ' ' + s(b[2]));",
+      "const o = JSON.parse('{\"a\":1}');",
+      "o['b'] = 2;",
+      "o['b'] = 3;",
+      "o[7] = true;",
+      "console.log(s(o.a) + ' ' + s(o.b) + ' ' + s(o['7']));",
+      // The divergence itself: Node keys are ["0","3"], and both the
+      // presence tests answer false for the hole.
+      "const h = JSON.parse('[1]');",
+      "h[3] = 9;",
+      "console.log(j(Object.keys(h)));",
+      "console.log(String('1' in h) + ' ' + String('2' in h) + ' ' + String('3' in h));",
+      "console.log(String(Object.hasOwn(h, '1')) + ' ' + String(Object.hasOwn(h, '3')));",
+      // ... while length and the reads stay Node-exact.
+      "console.log(s(h.length) + ' ' + s(h[1]) + ' ' + s(h[3]));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "zero 2 undefined undefined five 6",
+      "3 undefined 9",
+      "1 3 ?",
+      "0|1|2|3", // Node: 0|3
+      "true true true", // Node: false false true
+      "true true", // Node: false true
+      "4 undefined 9", // Node agrees exactly
+      "",
+    ].join("\n"),
+  );
+});
+
+test("S016: Object.assign onto a non-object target drops the copy SILENTLY", async () => {
+  // The one keyed-write arm that does not announce itself. Node writes
+  // `k` through onto the array and lists it in Object.keys (["0","1","k"]
+  // there); here the source is walked and dropped with no throw. The
+  // returned target is the same value on both.
+  const res = await buildWasm(
+    "dyn-assign-nonobj.js",
+    [
+      "'use strict';",
+      "function j(u) {",
+      "  const n = typeof u.length === 'number' ? u.length : 0;",
+      "  let out = '';",
+      "  for (let i = 0; i < n; i = i + 1) { out = out + (i > 0 ? '|' : '') + String(u[i]); }",
+      "  return out;",
+      "}",
+      "const arrTarget = JSON.parse('[1,2]');",
+      "const r = Object.assign(arrTarget, JSON.parse('{\"k\":7}'));",
+      "console.log(String(arrTarget.k) + ' ' + String(r === arrTarget) + ' ' + j(Object.keys(arrTarget)));",
+      // An OBJECT target is exact, so the boundary is visible in place.
+      "const objTarget = JSON.parse('{\"a\":9}');",
+      "Object.assign(objTarget, JSON.parse('{\"a\":1,\"b\":2}'));",
+      "console.log(j(Object.keys(objTarget)) + ' ' + String(objTarget.a) + String(objTarget.b));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "undefined true 0|1", // Node: "7 true 0|1|k"
+      "a|b 12", // Node agrees exactly
+      "",
+    ].join("\n"),
+  );
+});
+
+test("S017: for-of over a COMPUTED member names the value, not the source", async () => {
+  // V8 renders the source expression in a for-of head whenever it can.
+  // The lowering supplies that spelling for an identifier and a DOTTED
+  // member — both exact below — but not for a computed access, where the
+  // message falls back to the value's kind. Node's answers for the two
+  // divergent lines are "arr[0] is not iterable" and "o[k] is not
+  // iterable". DESTRUCTURING position is not affected: V8 itself uses the
+  // kind wording for any member access there, which the last two lines
+  // pin as agreeing.
+  const res = await buildWasm(
+    "dyn-iter-spelling.js",
+    [
+      "'use strict';",
+      "const arr = JSON.parse('[5]');",
+      "const o = JSON.parse('{\"p\":5}');",
+      "const n5 = JSON.parse('5');",
+      "const k = 'p';",
+      "try { for (const v of arr[0]) { } } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "try { for (const v of o[k]) { } } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "try { for (const v of o.p) { } } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "try { for (const v of n5) { } } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "try { const [z] = arr[0]; } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "try { const [z] = n5; } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "number 5 is not iterable (cannot read property Symbol(Symbol.iterator))", // Node: arr[0] is not iterable
+      "number 5 is not iterable (cannot read property Symbol(Symbol.iterator))", // Node: o[k] is not iterable
+      "o.p is not iterable", // exact
+      "n5 is not iterable", // exact
+      "number 5 is not iterable (cannot read property Symbol(Symbol.iterator))", // exact
+      "n5 is not iterable", // exact
+      "",
+    ].join("\n"),
+  );
+});
+
+test("dyn ??, ?. and strict equality against each scalar kind", async () => {
+  // The cheap arms, pinned so they stay correct: `??` decides on the
+  // runtime KIND (0, "" and false are not nullish) and runs its right
+  // side lazily; `?.` short-circuits on the same two kinds; and
+  // dynScalarEq tests the kind tag then the payload — f64.eq for numbers
+  // (NaN false, +0 === -0), content for strings, the flag for booleans,
+  // and whole-value identity when both sides are dyn. Node agrees with
+  // every line.
+  const res = await buildWasm(
+    "dyn-nullish-eq.js",
+    [
+      "'use strict';",
+      "function s(u) {",
+      "  if (typeof u === 'string') return u;",
+      "  if (typeof u === 'number') return String(u);",
+      "  if (typeof u === 'boolean') return String(u);",
+      "  if (u === null) return 'null';",
+      "  if (u === undefined) return 'undefined';",
+      "  return '?';",
+      "}",
+      "const b = JSON.parse('{\"n\":5,\"s\":\"hi\",\"t\":true,\"z\":0,\"e\":\"\",\"f\":false,\"nul\":null,\"arr\":[1],\"obj\":{}}');",
+      // ?? — only the two unit kinds take the default.
+      "console.log(s(b.n ?? 'd') + ' ' + s(b.z ?? 'd') + ' ' + s(b.e ?? 'd') + ' ' + s(b.f ?? 'd') + ' ' + s(b.nul ?? 'd') + ' ' + s(b.missing ?? 'd'));",
+      // ?? is LAZY: the counter moves only for the two nullish reads.
+      "let calls = 0;",
+      "function mk() { calls = calls + 1; return 'made'; }",
+      "console.log(s(b.n ?? mk()) + ' ' + s(b.nul ?? mk()) + ' ' + s(b.missing ?? mk()) + ' calls=' + String(calls));",
+      // && / || keep JS value semantics over the same truthiness.
+      "console.log(s(b.n && 'yes') + ' ' + s(b.z && 'yes') + ' ' + s(b.e || 'alt') + ' ' + s(b.f || 'alt'));",
+      // ?. short-circuits on nullish receivers only.
+      "console.log(s(b.nul?.deep) + ' ' + s(b.missing?.deep) + ' ' + s(b.arr?.length) + ' ' + s(b.obj?.nope));",
+      // dynScalarEq: number, string, boolean, and both-dyn.
+      "console.log(String(b.n === 5) + String(b.n === 6) + String(b.n !== 5));",
+      "console.log(String(b.s === 'hi') + String(b.s === 'no') + String(b.s !== 'hi'));",
+      "console.log(String(b.t === true) + String(b.t === false) + String(b.f === false));",
+      "console.log(String(b.z === 0) + String(b.e === '') + String(b.nul === null) + String(b.missing === undefined));",
+      // Both sides dyn: scalars by value, reference kinds by identity.
+      "console.log(String(b.n === b.n) + String(b.arr === b.arr) + String(b.arr === b.obj) + String(b.nul === b.missing));",
+      // A number that is not the receiver's kind is never equal.
+      "console.log(String(b.s === b.n) + String(b.z === b.f) + String(b.obj === b.obj));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "5 0  false d d",
+      "5 made made calls=2",
+      "yes 0 alt alt",
+      "undefined undefined 1 undefined",
+      "truefalsefalse",
+      "truefalsefalse",
+      "truefalsetrue",
+      "truetruetruetrue",
+      "truetruefalsefalse",
+      "falsefalsetrue",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("dyn Object.hasOwn: the modeled forms, including the STR arm C omits", async () => {
+  // Every line here is Node's answer. The STRING receiver is the one the
+  // native lanes get wrong today (scr_dyn_has_own has OBJ and ARR arms
+  // and no STR arm, so it answers false for "length" and "0" while
+  // scr_dyn_key_get happily reads both) — this lane answers Node and the
+  // C runtime converges under its own task. No corpus program can pin it
+  // while the lanes disagree: one that observed it would fail the C
+  // differential.
+  const res = await buildWasm(
+    "dyn-hasown.js",
+    [
+      "'use strict';",
+      "function b(x) { return x ? 'T' : 'F'; }",
+      "const o = JSON.parse('{\"name\":\"x\",\"zero\":0,\"nul\":null}');",
+      "const k = 'na' + 'me';",
+      "console.log(b(Object.hasOwn(o, k)) + b(Object.hasOwn(o, 'zero')) + b(Object.hasOwn(o, 'nul')) + b(Object.hasOwn(o, 'nope')) + b(Object.hasOwn(o, 'toString')));",
+      "const a = JSON.parse('[1,2,3]');",
+      "console.log(b(Object.hasOwn(a, 'length')) + b(Object.hasOwn(a, '0')) + b(Object.hasOwn(a, '3')) + b(Object.hasOwn(a, '01')) + b(Object.hasOwn(a, '1.0')));",
+      "const s = JSON.parse('\"abc\"');",
+      "console.log(b(Object.hasOwn(s, 'length')) + b(Object.hasOwn(s, '0')) + b(Object.hasOwn(s, '2')) + b(Object.hasOwn(s, '3')) + b(Object.hasOwn(s, 'toString')));",
+      "console.log(b(Object.hasOwn(JSON.parse('5'), 'x')) + b(Object.hasOwn(JSON.parse('true'), 'x')));",
+      "try { Object.hasOwn(JSON.parse('null'), 'x'); } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "TTTFF",
+      "TTFFF",
+      "TTTFF", // Node: TTTFF — the C lane answers FFFFF on this line
+      "FF",
+      "Cannot convert undefined or null to object",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("dyn own-key ORDER: integer-like keys first, and where that range ends", async () => {
+  // Object.keys' own-key order is the one place the array-index predicate
+  // has to be WIDER than the keyed read's: the ordering range is
+  // [0, 2^32-2], while canonIdx bails around 2^31. The near-misses pin
+  // both edges. Node's answer for the mixed line, verified:
+  //   ["0","9","10","4294967294","z","01","1.5","4294967295"," 1"]
+  // — "4294967294" sorts as an index, "4294967295" (2^32-1) does not,
+  // and neither do "01", "1.5" or a key with a leading space.
+  const res = await buildWasm(
+    "dyn-keyorder.js",
+    [
+      "'use strict';",
+      "function j(u) {",
+      "  const n = typeof u.length === 'number' ? u.length : 0;",
+      "  let out = '';",
+      "  for (let i = 0; i < n; i++) { out = out + (i > 0 ? '|' : '') + String(u[i]); }",
+      "  return out;",
+      "}",
+      "const mixed = JSON.parse('{\"z\":1,\"01\":2,\"1.5\":3,\"4294967295\":4,\"4294967294\":5,\"0\":6,\" 1\":7,\"10\":8,\"9\":9}');",
+      "console.log(j(Object.keys(mixed)));",
+      "const small = JSON.parse('{\"b\":\"x\",\"2\":\"two\",\"a\":\"y\",\"0\":\"zero\"}');",
+      "console.log(j(Object.keys(small)));",
+      "console.log(j(Object.values(small)));",
+      "const arr = JSON.parse('[\"p\",\"q\"]');",
+      "console.log(j(Object.keys(arr)) + ' ' + j(Object.values(arr)));",
+      "const str = JSON.parse('\"hi\"');",
+      "console.log(j(Object.keys(str)) + ' ' + j(Object.values(str)));",
+      "console.log('[' + j(Object.keys(JSON.parse('5'))) + ']');",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "0|9|10|4294967294|z|01|1.5|4294967295| 1",
+      "0|2|b|a",
+      "zero|two|x|y",
+      "0|1 p|q",
+      "0|1 h|i",
+      "[]",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("dyn destructuring: V8's not-iterable and not-destructurable wordings", async () => {
+  // Both families name things the emitter has to get from different
+  // places: the ITERATION refusal describes the VALUE's kind (and Node
+  // says bare "object" for a plain {}, not only for nullish), while the
+  // pack form and the object form carry the SOURCE SPELLING from the IR.
+  // Verified against node 24 with this program.
+  const res = await buildWasm(
+    "dyn-destr-texts.js",
+    [
+      "'use strict';",
+      "const num = JSON.parse('5');",
+      "const obj = JSON.parse('{\"a\":1}');",
+      "try { const [z] = num; } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "try { const [z] = obj; } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "try { const [z] = JSON.parse('{\"a\":1}'); } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "try { const [z] = JSON.parse('null'); } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "try { const [z] = JSON.parse('true'); } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "let aa;",
+      "try { ({ a: aa } = num); console.log('num ok ' + String(aa)); } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "const nul = JSON.parse('null');",
+      "try { ({ a: aa } = nul); } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "const und = JSON.parse('[]')[3];",
+      "try { ({ a: aa } = und); } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "try { ({} = und); } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "num is not iterable",
+      "obj is not iterable",
+      "object is not iterable (cannot read property Symbol(Symbol.iterator))",
+      "object null is not iterable (cannot read property Symbol(Symbol.iterator))",
+      "boolean true is not iterable (cannot read property Symbol(Symbol.iterator))",
+      "num ok undefined",
+      "Cannot destructure property 'a' of 'nul' as it is null.",
+      "Cannot destructure property 'a' of 'und' as it is undefined.",
+      "Cannot destructure 'und' as it is undefined.",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("dyn array destructuring steps by CODE POINT, unlike a keyed read", async () => {
+  // The string iterator hands out whole code points — an astral
+  // character arrives unsplit — where `s[0]` answers one UTF-16 unit.
+  // S002's storage is what makes both exact; Node agrees line for line.
+  const res = await buildWasm(
+    "dyn-destr-astral.js",
+    [
+      "'use strict';",
+      "const [c1, c2, c3] = JSON.parse('\"a\\\\ud83d\\\\ude00b\"');",
+      "console.log(String(c1) + ' ' + String(c2) + ' ' + String(c3));",
+      "console.log(String(c1.length) + ' ' + String(c2.length) + ' ' + String(c3.length));",
+      "const s = JSON.parse('\"a\\\\ud83d\\\\ude00b\"');",
+      "console.log(String(s.length) + ' ' + String(s[1] === s[1]));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(["a \u{1F600} b", "1 2 1", "4 true", ""].join("\n"));
+});
+
 test("S008: repeat's invalid count is the RangeError trap", async () => {
   const res = await buildWasm(
     "repeat-neg.ts",

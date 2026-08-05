@@ -799,6 +799,24 @@ const TIER_FLOOR: string[] = [
   "1004-json-parse-errors.ts",
   "1539-unknown-truthiness.ts",
   "912-unknown-slots.ts",
+  // Increment 14 (dyn core), stage 3b: the rest of the keyed surface —
+  // the keyed write, the presence tests, the three enumeration walks and
+  // Object.assign over one shared own-key-order walk, strict equality
+  // against a dyn side, array destructuring's GetIterator + N steps, and
+  // the dyn arms of `??` / `&&` / `||` / `?.`.
+  //
+  // What these three actually pin is narrower than that list, so read
+  // them for what they are: 1544 covers `in` on a dyn receiver and the
+  // dyn `&&` arm, 2300 the keyed WRITE through objPut, and 2471 the
+  // write plus Object.hasOwn and Object.assign. Everything else this
+  // stage built — the enumeration order, the index writes, the
+  // destructuring texts, the equality shapes, `??` and `?.` — is pinned
+  // by the wasm emitter unit tests, because the programs that exercise
+  // it all PRINT their dyn values and the inspect surface (x83 in the
+  // queue) has not landed.
+  "1544-dyn-json-reads.ts",
+  "2300-dyn-record-spread-and-keyed-access.cjs",
+  "2471-record-keyed-write-hasown.js",
 ];
 
 interface RunResult {

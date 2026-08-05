@@ -179,6 +179,13 @@ export interface DynDeps {
   arrVec: () => VecInfo;
   /** %w.vec.push1:dyn — the unchecked append the builders use. */
   arrPush: () => number;
+  /** %w.vec.newLen:dyn — a fresh vector of n ABSENT slots; every caller
+   * here passes 0 and fills by push, which is `scr_dyn_new_arr`. */
+  arrNewLen: () => number;
+  /** %w.str.cpAt — the string iterator's step (a paired high surrogate
+   * brings its low half along). The ITERATION surfaces walk code POINTS,
+   * unlike the keyed read's code units. */
+  strCpAt: () => number;
 }
 
 export class DynBuilder {
@@ -285,6 +292,25 @@ export class DynBuilder {
     c.structGet(v.struct, VEC_BUF);
     pushIndex(c);
     c.arrayGet(v.bufType);
+  }
+
+  /** Element `i` = a value — the UNCHECKED write, C's
+   * `d->v.arr.items[i] = ...`. The vector is pushed FRESH by the caller
+   * (a preceding pad loop may have grown and REPLACED the buffer, so the
+   * buffer read has to happen after it, not before). */
+  arrSet(c: Code, pushVec: (c: Code) => void, pushIndex: (c: Code) => void, pushValue: (c: Code) => void): void {
+    const v = this.deps.arrVec();
+    pushVec(c);
+    c.structGet(v.struct, VEC_BUF);
+    pushIndex(c);
+    pushValue(c);
+    c.arraySet(v.bufType);
+  }
+
+  /** A fresh empty dyn VECTOR — `scr_dyn_new_arr`'s payload. */
+  pushNewArr(c: Code): void {
+    c.f64Const(0);
+    c.call(this.deps.arrNewLen());
   }
 
   /* ── the OBJ payload ────────────────────────────────────────────────── */
@@ -631,12 +657,11 @@ export class DynBuilder {
    * The three kinds with payload-identity arms in C (FUNC, HANDLE, JSVAL)
    * are unconstructible here and trap rather than borrow that answer.
    *
-   * NO CALLER YET, so nothing emits it: the node that asks for whole-dyn
-   * equality is `dynScalarEq` with both operands dyn, which is still
-   * refused. It lives here because the REPRESENTATION decides its answers
-   * — the payload conventions above are exactly what make the BOOL/NUM
-   * arms one compare and what forced the `eq` slot — and settling that
-   * with the layout is cheaper than rediscovering it two stages later. */
+   * Its caller is `dynScalarEq` with BOTH operands dyn. The FUNC arm's
+   * trap stays reachable-in-principle from there, which is safe only
+   * because no FUNC box exists yet: `f === f` cannot arrive until stage 4
+   * builds one, and that stage owes this arm C's compare before it does
+   * (see the note on the arm itself). */
   strictEq(): number {
     return this.cached("strictEq", [this.dynRef(), this.dynRef()], [I32], (idx) => {
       const dynT = this.dynT();
@@ -1170,6 +1195,1093 @@ export class DynBuilder {
         this.mb.setBody(idx, [I32, I32, this.dynRef(), this.deps.strRef()], c.bytes());
       },
     );
+  }
+
+  /** %w.dyn.keySet(d, k, v) — `d[k] = v`, `scr_dyn_key_set` ported. OBJ
+   * writes through objPut (later duplicates win, the surviving entry
+   * keeps its original key); an ARR takes CANONICAL INDEX writes, holes
+   * padding with undefined exactly like JS length growth. Every other
+   * receiver THROWS Node's catchable TypeError — the nullish
+   * "Cannot set properties of undefined (setting 'k')" and, for the rest,
+   * strict mode's "Cannot create property 'k' on number '5'" (the
+   * primitive kinds quote their own rendering after the kind word).
+   *
+   * SEMANTICS.md S016: a NON-INDEX key on a dyn array throws where Node
+   * adds an expando (the ARR payload is a bare vector with no property
+   * table beside it), and an index at or past 2^31 — where canonIdx bails
+   * — throws where Node grows the array. C would instead push undefined
+   * two billion times, so the throw is the same disagreement arriving in
+   * finite time. Every OTHER receiver's refusal is Node's own text. */
+  keySet(): number {
+    return this.cached("keySet", [this.dynRef(), this.deps.strRef(), this.dynRef()], [], (idx) => {
+      const dynT = this.dynT();
+      const c = new Code();
+      const K = 3;
+      const IDX = 4;
+      const A = 5;
+      const MSG = 6;
+      const concat = this.deps.concat();
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.localSet(K);
+      this.arm(c, K, [DK.OBJ], () => {
+        this.objPayload(c, (x) => x.localGet(0));
+        c.localGet(1);
+        c.localGet(2);
+        c.call(this.objPut());
+      });
+      // An ARR takes index writes and FALLS THROUGH on any other key —
+      // the one arm that is not a full dispatch, so `arm` cannot spell it.
+      c.localGet(K);
+      c.i32Const(DK.ARR);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(1);
+      c.call(this.canonIdx());
+      c.localTee(IDX);
+      c.i32Const(0);
+      c.i32GeS();
+      c.ifVoid();
+      this.arrPayload(c, (x) => x.localGet(0));
+      c.localSet(A);
+      // Pad to the index: C's `while (len <= idx) push(undefined)`.
+      c.block();
+      c.loop();
+      this.arrLen(c, (x) => x.localGet(A));
+      c.localGet(IDX);
+      c.i32GtU();
+      c.brIf(1);
+      c.localGet(A);
+      c.globalGet(this.undefinedGlobal());
+      c.call(this.deps.arrPush());
+      c.br(0);
+      c.end();
+      c.end();
+      this.arrSet(
+        c,
+        (x) => x.localGet(A),
+        (x) => x.localGet(IDX),
+        (x) => x.localGet(2),
+      );
+      c.return_();
+      c.end();
+      c.end();
+      // HANDLE routes to the tag's installed setters and JSVAL writes the
+      // REAL engine object; neither is constructible here, and neither may
+      // borrow the throw below (that would be a wrong answer, not a loud
+      // one).
+      this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => c.unreachable());
+      c.localGet(K);
+      c.i32Const(DK.UNDEF);
+      c.i32Eq();
+      c.localGet(K);
+      c.i32Const(DK.NULL);
+      c.i32Eq();
+      c.i32Or();
+      c.ifVoid();
+      this.deps.lit(c, "Cannot set properties of ");
+      c.localGet(K);
+      c.i32Const(DK.UNDEF);
+      c.i32Eq();
+      c.ifResult(this.deps.strRef());
+      this.deps.lit(c, "undefined");
+      c.else_();
+      this.deps.lit(c, "null");
+      c.end();
+      c.call(concat);
+      this.deps.lit(c, " (setting '");
+      c.call(concat);
+      c.localGet(1);
+      c.call(concat);
+      this.deps.lit(c, "')");
+      c.call(concat);
+      c.localSet(MSG);
+      c.else_();
+      this.deps.lit(c, "Cannot create property '");
+      c.localGet(1);
+      c.call(concat);
+      this.deps.lit(c, "' on ");
+      c.call(concat);
+      c.localGet(0);
+      c.call(this.kindName());
+      c.call(concat);
+      c.localSet(MSG);
+      // V8 quotes the primitive's OWN rendering after the kind word —
+      // "on number '5'", "on string 'abc'", "on boolean 'true'". Every
+      // other kind stops at the kind word.
+      this.arm(c, K, [DK.NUM, DK.STR, DK.BOOL], () => {
+        c.localGet(MSG);
+        this.deps.lit(c, " '");
+        c.call(concat);
+        c.localGet(K);
+        c.i32Const(DK.NUM);
+        c.i32Eq();
+        c.ifResult(this.deps.strRef());
+        c.localGet(0);
+        c.structGet(dynT, DYN_NUM);
+        c.call(this.deps.f64ToStr());
+        c.else_();
+        c.localGet(K);
+        c.i32Const(DK.STR);
+        c.i32Eq();
+        c.ifResult(this.deps.strRef());
+        c.localGet(0);
+        c.structGet(dynT, DYN_REF);
+        c.refCast(this.deps.strType());
+        c.else_();
+        c.localGet(0);
+        c.structGet(dynT, DYN_NUM);
+        c.f64Const(0);
+        c.f64Ne();
+        c.ifResult(this.deps.strRef());
+        this.deps.lit(c, "true");
+        c.else_();
+        this.deps.lit(c, "false");
+        c.end();
+        c.end();
+        c.end();
+        c.call(concat);
+        this.deps.lit(c, "'");
+        c.call(concat);
+        c.localSet(MSG);
+        // `arm` closes with a `return`; the throw has to happen inside.
+        this.deps.throwTypeError(c, (x) => x.localGet(MSG));
+      });
+      c.end();
+      this.deps.throwTypeError(c, (x) => x.localGet(MSG));
+      this.mb.setBody(idx, [I32, I32, this.arrRef(), this.deps.strRef()], c.bytes());
+    });
+  }
+
+  /** %w.dyn.hasOwn(d, k) → i32 — `Object.hasOwn(d, k)`,
+   * `scr_dyn_has_own` ported: OBJ answers own-member presence (a member
+   * holding undefined still answers true — the tree stores PRESENCE),
+   * ARR and STR answer "length" and canonical in-range indices, every
+   * other kind answers false, and a NULLISH receiver throws ToObject's
+   * catchable "Cannot convert undefined or null to object".
+   *
+   * THE STR ARM IS NOT IN THE C RUNTIME, deliberately. `scr_dyn_has_own`
+   * has OBJ and ARR arms and stops, so it answers false where Node
+   * answers true for `Object.hasOwn("abc", "length")` — while
+   * `scr_dyn_key_get` DOES model string length and index reads, which
+   * S015 names as the forms that work — answering false for them would
+   * contradict the register's own stated boundary. That reads as an
+   * omission rather than a stance, so this lane matches NODE. The C lane
+   * lacks this arm today; the convergence is task-tracked, and matching
+   * Node REMOVES a divergence rather than adding one, so there is nothing
+   * to register here. */
+  hasOwn(): number {
+    return this.cached("hasOwn", [this.dynRef(), this.deps.strRef()], [I32], (idx) => {
+      const dynT = this.dynT();
+      const c = new Code();
+      const K = 2;
+      const IDX = 3;
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.localSet(K);
+      this.arm(c, K, [DK.UNDEF, DK.NULL], () => {
+        this.pushToObjectFail(c);
+        c.i32Const(0);
+      });
+      this.arm(c, K, [DK.OBJ], () => {
+        this.objPayload(c, (x) => x.localGet(0));
+        c.localGet(1);
+        c.call(this.objGet());
+        c.refIsNull();
+        c.i32Eqz();
+      });
+      this.arm(c, K, [DK.ARR, DK.STR], () => {
+        this.pushIsLength(c, (x) => x.localGet(1));
+        c.ifResult(I32);
+        c.i32Const(1);
+        c.else_();
+        c.localGet(1);
+        c.call(this.canonIdx());
+        c.localTee(IDX);
+        c.i32Const(0);
+        c.i32GeS();
+        c.ifResult(I32);
+        c.localGet(IDX);
+        c.localGet(K);
+        c.i32Const(DK.ARR);
+        c.i32Eq();
+        c.ifResult(I32);
+        this.arrLen(c, (x) => this.arrPayload(x, (y) => y.localGet(0)));
+        c.else_();
+        c.localGet(0);
+        c.structGet(dynT, DYN_REF);
+        c.refCast(this.deps.strType());
+        c.arrayLen();
+        c.end();
+        c.i32LtU();
+        c.else_();
+        c.i32Const(0);
+        c.end();
+        c.end();
+      });
+      // C routes an island receiver to the ENGINE's own Object.hasOwn;
+      // unconstructible here, and `false` would be a silent wrong answer.
+      this.arm(c, K, [DK.JSVAL], () => c.unreachable());
+      c.i32Const(0);
+      this.mb.setBody(idx, [I32, I32], c.bytes());
+    });
+  }
+
+  /** ToObject's refusal, shared by every walk that takes a receiver:
+   * leaves a catchable TypeError in the cell, caller unwinds. */
+  private pushToObjectFail(c: Code): void {
+    this.deps.throwTypeError(c, (x) => this.deps.lit(x, "Cannot convert undefined or null to object"));
+  }
+
+  /** %w.dyn.idxKey(k) → the ARRAY-INDEX number `k` spells, or -1 when it
+   * spells none — the ORDERING predicate, deliberately distinct from
+   * `canonIdx`. Object.keys puts integer-like keys first, and the range
+   * that qualifies is the full [0, 2^32-2]: canonIdx's overflow guard
+   * bails around 2^31, which is harmless for reads (both rules answer
+   * undefined) and WRONG here. Verified against Node with keys
+   * {z, "4294967295", "4294967294", "0"} → ["0","4294967294","z",
+   * "4294967295"]: 2^32-2 sorts as an index and 2^32-1 does not.
+   * `scr_dyn_key_is_index` exactly, accumulating in f64 because the
+   * answers do not fit i32. */
+  idxKey(): number {
+    return this.cached("idxKey", [this.deps.strRef()], [F64], (idx) => {
+      const c = new Code();
+      const N = 1;
+      const I = 2;
+      const V = 3;
+      const U = 4;
+      c.localGet(0);
+      c.arrayLen();
+      c.localTee(N);
+      c.i32Eqz();
+      c.localGet(N);
+      c.i32Const(10); // 4294967294 is ten digits; anything longer cannot be one
+      c.i32GtU();
+      c.i32Or();
+      c.ifVoid();
+      c.f64Const(-1);
+      c.return_();
+      c.end();
+      c.localGet(N);
+      c.i32Const(1);
+      c.i32GtU();
+      c.ifVoid();
+      c.localGet(0);
+      c.i32Const(0);
+      c.arrayGetU(this.deps.strType());
+      c.i32Const(0x30);
+      c.i32Eq();
+      c.ifVoid();
+      c.f64Const(-1);
+      c.return_();
+      c.end();
+      c.end();
+      c.f64Const(0);
+      c.localSet(V);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeU();
+      c.brIf(1);
+      c.localGet(0);
+      c.localGet(I);
+      c.arrayGetU(this.deps.strType());
+      c.i32Const(0x30);
+      c.i32Sub();
+      c.localTee(U);
+      c.i32Const(9);
+      c.i32GtU();
+      c.ifVoid();
+      c.f64Const(-1);
+      c.return_();
+      c.end();
+      c.localGet(V);
+      c.f64Const(10);
+      c.f64Mul();
+      c.localGet(U);
+      c.f64ConvertI32U();
+      c.f64Add();
+      c.localSet(V);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(V);
+      c.f64Const(4294967294);
+      c.f64Gt();
+      c.ifVoid();
+      c.f64Const(-1);
+      c.return_();
+      c.end();
+      c.localGet(V);
+      this.mb.setBody(idx, [I32, I32, F64, I32], c.bytes());
+    });
+  }
+
+  /** One `objWalk` step, per mode: KEYS pushes the key, VALUES the value,
+   * ENTRIES a fresh two-element pair. `pair` is the caller's scratch. */
+  private walkPush(
+    c: Code,
+    mode: number,
+    out: number,
+    pair: number,
+    pushKey: (c: Code) => void,
+    pushValue: (c: Code) => void,
+  ): void {
+    const push = this.deps.arrPush();
+    c.localGet(mode);
+    c.i32Eqz(); // KEYS
+    c.ifVoid();
+    c.localGet(out);
+    this.boxStr(c, pushKey);
+    c.call(push);
+    c.else_();
+    c.localGet(mode);
+    c.i32Const(1); // VALUES
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(out);
+    pushValue(c);
+    c.call(push);
+    c.else_();
+    this.pushNewArr(c);
+    c.localSet(pair);
+    c.localGet(pair);
+    this.boxStr(c, pushKey);
+    c.call(push);
+    c.localGet(pair);
+    pushValue(c);
+    c.call(push);
+    c.localGet(out);
+    this.boxArr(c, (x) => x.localGet(pair));
+    c.call(push);
+    c.end();
+    c.end();
+  }
+
+  /** %w.dyn.objWalk(d, mode) → the fresh dyn array behind Object.keys
+   * (mode 0), Object.values (1) and Object.entries (2) — `scr_dyn_objwalk`
+   * ported. OBJ walks its members in JS OWN-KEY ORDER: array-index keys
+   * ascending FIRST (the `idxKey` range, not canonIdx's), then everything
+   * else in insertion order. ARR answers its dense indices; a nullish
+   * receiver throws ToObject's TypeError; the scalar kinds have no own
+   * enumerable string keys and answer the empty array.
+   *
+   * Two departures from the C body, neither observable:
+   *  - C precomputes each key's index-ness into a scratch array and
+   *    selection-scans that; the scan here re-derives it per pass, which
+   *    is the same order without the allocation (dyn objects are small
+   *    and index keys in them are rare).
+   *  - STRING receivers list one key PER UTF-16 CODE UNIT, which is
+   *    Node's own answer. C walks code POINTS over its UTF-8 storage and
+   *    says so in a comment ("one entry where JS lists two lone
+   *    surrogates"); S002's storage makes the exact answer free here, and
+   *    the two agree on every string without an astral character — which
+   *    is every string a corpus program can hold, since the C lane would
+   *    already fail the differential on one. */
+  objWalk(): number {
+    return this.cached("objWalk", [this.dynRef(), I32], [this.dynRef()], (idx) => {
+      const dynT = this.dynT();
+      const objT = this.objT();
+      const entries = this.entriesArrayType();
+      const entryT = this.entryT();
+      const c = new Code();
+      const MODE = 1; // the walk selector, parameter 1
+      const K = 2;
+      const OUT = 3;
+      const O = 4;
+      const N = 5;
+      const I = 6;
+      const E = 7;
+      const PAIR = 8;
+      const BEST = 9;
+      const BESTV = 10;
+      const LAST = 11;
+      const IV = 12;
+      const A = 13;
+      const S = 14;
+      const CP = 15;
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.localSet(K);
+      this.arm(c, K, [DK.UNDEF, DK.NULL], () => {
+        this.pushToObjectFail(c);
+        c.refNull(dynT);
+      });
+      // The ENGINE walks its own object in C (own-key order, getters
+      // running); a BYTES receiver lists its byte indices. Neither is
+      // constructible here.
+      this.arm(c, K, [DK.BYTES, DK.JSVAL, DK.HANDLE], () => c.unreachable());
+      this.pushNewArr(c);
+      c.localSet(OUT);
+      this.arm(c, K, [DK.OBJ], () => {
+        this.objPayload(c, (x) => x.localGet(0));
+        c.localSet(O);
+        c.localGet(O);
+        c.structGet(objT, OBJ_LEN);
+        c.localSet(N);
+        // Pass 1: index keys, ascending. Each round picks the smallest
+        // index strictly greater than the last one emitted.
+        c.f64Const(-1);
+        c.localSet(LAST);
+        c.block();
+        c.loop();
+        c.i32Const(-1);
+        c.localSet(BEST);
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(N);
+        c.i32GeU();
+        c.brIf(1);
+        c.localGet(O);
+        c.structGet(objT, OBJ_ENTRIES);
+        c.localGet(I);
+        c.arrayGet(entries);
+        c.structGet(entryT, ENTRY_KEY);
+        c.call(this.idxKey());
+        c.localTee(IV);
+        c.localGet(LAST);
+        c.f64Gt();
+        c.ifVoid();
+        // `best < 0 || iv < bestv` — BESTV is only meaningful once BEST
+        // is set, so the two tests nest rather than `or`.
+        c.localGet(BEST);
+        c.i32Const(0);
+        c.i32LtS();
+        c.ifResult(I32);
+        c.i32Const(1);
+        c.else_();
+        c.localGet(IV);
+        c.localGet(BESTV);
+        c.f64Lt();
+        c.end();
+        c.ifVoid();
+        c.localGet(I);
+        c.localSet(BEST);
+        c.localGet(IV);
+        c.localSet(BESTV);
+        c.end();
+        c.end();
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        c.localGet(BEST);
+        c.i32Const(0);
+        c.i32LtS();
+        c.brIf(1);
+        c.localGet(BESTV);
+        c.localSet(LAST);
+        c.localGet(O);
+        c.structGet(objT, OBJ_ENTRIES);
+        c.localGet(BEST);
+        c.arrayGet(entries);
+        c.localSet(E);
+        this.walkPush(
+          c,
+          MODE,
+          OUT,
+          PAIR,
+          (x) => {
+            x.localGet(E);
+            x.structGet(entryT, ENTRY_KEY);
+          },
+          (x) => {
+            x.localGet(E);
+            x.structGet(entryT, ENTRY_VALUE);
+          },
+        );
+        c.br(0);
+        c.end();
+        c.end();
+        // Pass 2: everything else, in insertion order.
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(N);
+        c.i32GeU();
+        c.brIf(1);
+        c.localGet(O);
+        c.structGet(objT, OBJ_ENTRIES);
+        c.localGet(I);
+        c.arrayGet(entries);
+        c.localTee(E);
+        c.structGet(entryT, ENTRY_KEY);
+        c.call(this.idxKey());
+        c.f64Const(0);
+        c.f64Lt();
+        c.ifVoid();
+        this.walkPush(
+          c,
+          MODE,
+          OUT,
+          PAIR,
+          (x) => {
+            x.localGet(E);
+            x.structGet(entryT, ENTRY_KEY);
+          },
+          (x) => {
+            x.localGet(E);
+            x.structGet(entryT, ENTRY_VALUE);
+          },
+        );
+        c.end();
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        this.boxArr(c, (x) => x.localGet(OUT));
+      });
+      this.arm(c, K, [DK.ARR], () => {
+        this.arrPayload(c, (x) => x.localGet(0));
+        c.localSet(A);
+        this.arrLen(c, (x) => x.localGet(A));
+        c.localSet(N);
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(N);
+        c.i32GeU();
+        c.brIf(1);
+        this.walkPush(
+          c,
+          MODE,
+          OUT,
+          PAIR,
+          (x) => {
+            x.localGet(I);
+            x.f64ConvertI32U();
+            x.call(this.deps.f64ToStr());
+          },
+          (x) => this.arrAt(x, (y) => y.localGet(A), (y) => y.localGet(I)),
+        );
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        this.boxArr(c, (x) => x.localGet(OUT));
+      });
+      this.arm(c, K, [DK.STR], () => {
+        c.localGet(0);
+        c.structGet(dynT, DYN_REF);
+        c.refCast(this.deps.strType());
+        c.localTee(S);
+        c.arrayLen();
+        c.localSet(N);
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(N);
+        c.i32GeU();
+        c.brIf(1);
+        // One code UNIT as its own string — keyGet's "abc"[1].
+        c.i32Const(1);
+        c.arrayNewDefault(this.deps.strType());
+        c.localSet(CP);
+        c.localGet(CP);
+        c.i32Const(0);
+        c.localGet(S);
+        c.localGet(I);
+        c.arrayGetU(this.deps.strType());
+        c.arraySet(this.deps.strType());
+        this.walkPush(
+          c,
+          MODE,
+          OUT,
+          PAIR,
+          (x) => {
+            x.localGet(I);
+            x.f64ConvertI32U();
+            x.call(this.deps.f64ToStr());
+          },
+          (x) => this.boxStr(x, (y) => y.localGet(CP)),
+        );
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        this.boxArr(c, (x) => x.localGet(OUT));
+      });
+      // NUM, BOOL, FUNC, PROMISE: no own enumerable string keys.
+      this.boxArr(c, (x) => x.localGet(OUT));
+      this.mb.setBody(
+        idx,
+        [
+          I32,
+          this.arrRef(),
+          this.objRef(),
+          I32,
+          I32,
+          this.entryRef(),
+          this.arrRef(),
+          I32,
+          F64,
+          F64,
+          F64,
+          this.arrRef(),
+          this.deps.strRef(),
+          this.deps.strRef(),
+        ],
+        c.bytes(),
+      );
+    });
+  }
+
+  /** %w.dyn.assign(target, src) → the target — `Object.assign` over dyn
+   * values, `scr_dyn_assign` plus its `assign_from` helper. A nullish
+   * TARGET throws ToObject's TypeError; a non-OBJ target copies nothing
+   * (a dyn array has no property table); nullish sources copy nothing
+   * (Node skips them); an OBJ source copies its members directly, last
+   * write winning; the index-keyed kinds ride the ENTRIES walk, so the
+   * copied key set is exactly what Object.keys answers for them. */
+  assign(): number {
+    return this.cached("assign", [this.dynRef(), this.dynRef()], [this.dynRef()], (idx) => {
+      const dynT = this.dynT();
+      const c = new Code();
+      const K = 2;
+      const O = 3;
+      const N = 4;
+      const I = 5;
+      const E = 6;
+      const PAIRS = 7;
+      const P = 8;
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.localTee(K);
+      c.i32Const(DK.UNDEF);
+      c.i32Eq();
+      c.localGet(K);
+      c.i32Const(DK.NULL);
+      c.i32Eq();
+      c.i32Or();
+      c.ifVoid();
+      this.pushToObjectFail(c);
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      // An ENGINE target runs the copy engine-side in C; unconstructible.
+      this.arm(c, K, [DK.JSVAL], () => c.unreachable());
+      c.localGet(K);
+      c.i32Const(DK.OBJ);
+      c.i32Ne();
+      c.ifVoid();
+      c.localGet(0);
+      c.return_();
+      c.end();
+      this.objPayload(c, (x) => x.localGet(0));
+      c.localSet(O);
+      c.localGet(1);
+      c.structGet(dynT, DYN_KIND);
+      c.localSet(K);
+      this.arm(c, K, [DK.OBJ], () => {
+        const objT = this.objT();
+        const entries = this.entriesArrayType();
+        const entryT = this.entryT();
+        this.objPayload(c, (x) => x.localGet(1));
+        c.structGet(objT, OBJ_LEN);
+        c.localSet(N);
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(N);
+        c.i32GeU();
+        c.brIf(1);
+        this.objPayload(c, (x) => x.localGet(1));
+        c.structGet(objT, OBJ_ENTRIES);
+        c.localGet(I);
+        c.arrayGet(entries);
+        c.localSet(E);
+        c.localGet(O);
+        c.localGet(E);
+        c.structGet(entryT, ENTRY_KEY);
+        c.localGet(E);
+        c.structGet(entryT, ENTRY_VALUE);
+        c.call(this.objPut());
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        c.localGet(0);
+      });
+      // The index-keyed sources go through their own ENTRIES walk, which
+      // is what makes the copied keys agree with Object.keys by
+      // construction. (BYTES belongs here in C; objWalk traps on one.)
+      this.arm(c, K, [DK.ARR, DK.STR, DK.BYTES], () => {
+        c.localGet(1);
+        c.i32Const(2); // ENTRIES
+        c.call(this.objWalk());
+        c.localSet(PAIRS);
+        this.arrLen(c, (x) => this.arrPayload(x, (y) => y.localGet(PAIRS)));
+        c.localSet(N);
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(N);
+        c.i32GeU();
+        c.brIf(1);
+        this.arrAt(
+          c,
+          (x) => this.arrPayload(x, (y) => y.localGet(PAIRS)),
+          (x) => x.localGet(I),
+        );
+        c.localSet(P);
+        c.localGet(O);
+        this.arrAt(
+          c,
+          (x) => this.arrPayload(x, (y) => y.localGet(P)),
+          (x) => x.i32Const(0),
+        );
+        c.structGet(dynT, DYN_REF);
+        c.refCast(this.deps.strType());
+        this.arrAt(
+          c,
+          (x) => this.arrPayload(x, (y) => y.localGet(P)),
+          (x) => x.i32Const(1),
+        );
+        c.call(this.objPut());
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        c.localGet(0);
+      });
+      // Nullish sources copy nothing; the scalar kinds have no own
+      // enumerable string keys. Either way the target answers unchanged.
+      c.localGet(0);
+      this.mb.setBody(
+        idx,
+        [I32, this.objRef(), I32, I32, this.entryRef(), this.dynRef(), this.dynRef()],
+        c.bytes(),
+      );
+    });
+  }
+
+  /** %w.dyn.iterFail(d) — GetIterator's refusal in its VALUE-DESCRIBING
+   * form: "<desc> is not iterable (cannot read property
+   * Symbol(Symbol.iterator))" where desc names the value ("undefined",
+   * "object null", "number 5", "boolean true", "function", bare "object" —
+   * Node says the last one for a plain `{}` too, not only for nullish).
+   * Every word of THAT form is V8's, verified.
+   *
+   * It is the FALLBACK, not the whole story: where V8 can render the
+   * source expression it says "arr[0] is not iterable" instead, and
+   * iterPack takes a compile-time spelling for exactly that reason. The
+   * lowering supplies one for an identifier and a dotted member but not
+   * for a computed access, so a `for...of` over `arr[0]` lands here and
+   * answers the kind wording where Node names the source —
+   * SEMANTICS.md S017. Leaves the TypeError in the cell; the caller
+   * unwinds. */
+  iterFail(): number {
+    return this.cached("iterFail", [this.dynRef()], [], (idx) => {
+      const dynT = this.dynT();
+      const c = new Code();
+      const K = 1;
+      const D = 2;
+      const concat = this.deps.concat();
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.localSet(K);
+      c.localGet(K);
+      c.i32Const(DK.UNDEF);
+      c.i32Eq();
+      c.ifResult(this.deps.strRef());
+      this.deps.lit(c, "undefined");
+      c.else_();
+      c.localGet(K);
+      c.i32Const(DK.NULL);
+      c.i32Eq();
+      c.ifResult(this.deps.strRef());
+      this.deps.lit(c, "object null");
+      c.else_();
+      c.localGet(K);
+      c.i32Const(DK.BOOL);
+      c.i32Eq();
+      c.ifResult(this.deps.strRef());
+      c.localGet(0);
+      c.structGet(dynT, DYN_NUM);
+      c.f64Const(0);
+      c.f64Ne();
+      c.ifResult(this.deps.strRef());
+      this.deps.lit(c, "boolean true");
+      c.else_();
+      this.deps.lit(c, "boolean false");
+      c.end();
+      c.else_();
+      c.localGet(K);
+      c.i32Const(DK.NUM);
+      c.i32Eq();
+      c.ifResult(this.deps.strRef());
+      this.deps.lit(c, "number ");
+      c.localGet(0);
+      c.structGet(dynT, DYN_NUM);
+      c.call(this.deps.f64ToStr());
+      c.call(concat);
+      c.else_();
+      c.localGet(K);
+      c.i32Const(DK.FUNC);
+      c.i32Eq();
+      c.ifResult(this.deps.strRef());
+      this.deps.lit(c, "function");
+      c.else_();
+      this.deps.lit(c, "object"); // OBJ, HANDLE, PROMISE — C's default arm
+      c.end();
+      c.end();
+      c.end();
+      c.end();
+      c.end();
+      this.deps.lit(c, " is not iterable (cannot read property Symbol(Symbol.iterator))");
+      c.call(concat);
+      c.localSet(D);
+      this.deps.throwTypeError(c, (x) => x.localGet(D));
+      this.mb.setBody(idx, [I32, this.deps.strRef()], c.bytes());
+    });
+  }
+
+  /** Push every element of an ITERABLE dyn (ARR or STR) onto the vector
+   * in `out` — the shared body of the destructuring pack and its
+   * first-N cousin. Strings step by CODE POINT (an astral character
+   * arrives unsplit, the string iterator's contract, unlike a keyed
+   * read's code unit); `limit` < 0 drains, otherwise it stops after that
+   * many steps and PADS with undefined. */
+  private emitIterSteps(
+    c: Code,
+    out: number,
+    kindLocal: number,
+    /** The local holding the step count, or null to drain the source. */
+    limit: number | null,
+    locals: { A: number; N: number; I: number; S: number; CP: number; AT: number },
+  ): void {
+    const dynT = this.dynT();
+    const { A, N, I, S, CP, AT } = locals;
+    const push = this.deps.arrPush();
+    c.localGet(kindLocal);
+    c.i32Const(DK.ARR);
+    c.i32Eq();
+    c.ifVoid();
+    this.arrPayload(c, (x) => x.localGet(0));
+    c.localSet(A);
+    this.arrLen(c, (x) => x.localGet(A));
+    c.localSet(N);
+    c.i32Const(0);
+    c.localSet(I);
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.localGet(limit ?? N);
+    c.i32GeU();
+    c.brIf(1);
+    c.localGet(out);
+    c.localGet(I);
+    c.localGet(N);
+    c.i32LtU();
+    c.ifResult(this.dynRef());
+    this.arrAt(c, (x) => x.localGet(A), (x) => x.localGet(I));
+    c.else_();
+    c.globalGet(this.undefinedGlobal());
+    c.end();
+    c.call(push);
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+    c.else_();
+    // STR: a running cursor over the code POINTS. C restarts the walk at
+    // every step (its own O(n²) shape); the cursor answers identically.
+    c.localGet(0);
+    c.structGet(dynT, DYN_REF);
+    c.refCast(this.deps.strType());
+    c.localTee(S);
+    c.arrayLen();
+    c.localSet(N);
+    c.i32Const(0);
+    c.localSet(AT);
+    c.i32Const(0);
+    c.localSet(I);
+    c.block();
+    c.loop();
+    if (limit === null) {
+      // Draining: the cursor reaching the end IS the exit.
+      c.localGet(AT);
+      c.localGet(N);
+    } else {
+      c.localGet(I);
+      c.localGet(limit);
+    }
+    c.i32GeU();
+    c.brIf(1);
+    c.localGet(out);
+    c.localGet(AT);
+    c.localGet(N);
+    c.i32LtU();
+    c.ifResult(this.dynRef());
+    c.localGet(S);
+    c.localGet(AT);
+    c.f64ConvertI32U();
+    c.call(this.deps.strCpAt());
+    c.localSet(CP);
+    c.localGet(AT);
+    c.localGet(CP);
+    c.arrayLen();
+    c.i32Add();
+    c.localSet(AT);
+    this.boxStr(c, (x) => x.localGet(CP));
+    c.else_();
+    c.globalGet(this.undefinedGlobal());
+    c.end();
+    c.call(push);
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+    c.end();
+  }
+
+  /** The locals `emitIterSteps` works in, in the order both callers
+   * declare them (both take the dyn value as parameter 0). */
+  private iterLocals(base: number): { A: number; N: number; I: number; S: number; CP: number; AT: number } {
+    return { A: base, N: base + 1, I: base + 2, S: base + 3, CP: base + 4, AT: base + 5 };
+  }
+
+  private iterLocalTypes(): ValType[] {
+    return [this.arrRef(), I32, I32, this.deps.strRef(), this.deps.strRef(), I32];
+  }
+
+  /** %w.dyn.iterN(d, n) → a fresh dyn array of exactly `n` elements —
+   * GetIterator plus the first N steps, as ARRAY DESTRUCTURING sees it
+   * (`sc_dyn_iter_n`). Arrays step by index, strings by code point, and
+   * everything past the end is undefined (which is what makes a pattern
+   * longer than its source bind undefined rather than throw). A
+   * non-iterable throws V8's wording through iterFail. */
+  iterN(): number {
+    return this.cached("iterN", [this.dynRef(), I32], [this.dynRef()], (idx) => {
+      const dynT = this.dynT();
+      const c = new Code();
+      const K = 2;
+      const OUT = 3;
+      const L = this.iterLocals(4);
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.localSet(K);
+      // Buffers step by BYTE in C; unconstructible here, and the
+      // not-iterable throw below would be a wrong claim about one.
+      this.arm(c, K, [DK.BYTES, DK.JSVAL], () => c.unreachable());
+      c.localGet(K);
+      c.i32Const(DK.ARR);
+      c.i32Eq();
+      c.localGet(K);
+      c.i32Const(DK.STR);
+      c.i32Eq();
+      c.i32Or();
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(0);
+      c.call(this.iterFail());
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      this.pushNewArr(c);
+      c.localSet(OUT);
+      this.emitIterSteps(c, OUT, K, 1, L);
+      this.boxArr(c, (x) => x.localGet(OUT));
+      this.mb.setBody(idx, [I32, this.arrRef(), ...this.iterLocalTypes()], c.bytes());
+    });
+  }
+
+  /** %w.dyn.iterPack(d, msg) → the WHOLE source as a fresh dyn array —
+   * the for-of / rest-pattern drain (`scr_dyn_iter_pack`). Same iterable
+   * kinds and same steps as iterN; the difference is the terminator and
+   * the refusal, which prefers the caller's compile-time `msg` (the
+   * destructuring form, which names the SOURCE spelling) and falls back
+   * to iterFail's value wording when that string is empty. */
+  iterPack(): number {
+    return this.cached("iterPack", [this.dynRef(), this.deps.strRef()], [this.dynRef()], (idx) => {
+      const dynT = this.dynT();
+      const c = new Code();
+      const K = 2;
+      const OUT = 3;
+      const L = this.iterLocals(4);
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.localSet(K);
+      this.arm(c, K, [DK.BYTES, DK.JSVAL], () => c.unreachable());
+      c.localGet(K);
+      c.i32Const(DK.ARR);
+      c.i32Eq();
+      c.localGet(K);
+      c.i32Const(DK.STR);
+      c.i32Eq();
+      c.i32Or();
+      c.i32Eqz();
+      c.ifVoid();
+      // `msg != NULL && msg->len > 0` — the length read must not run on a
+      // null reference, and wasm's i32.and does NOT short-circuit, so the
+      // two tests NEST (json.ts's pushCurOr0, same trap avoided).
+      c.localGet(1);
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(1);
+      c.arrayLen();
+      c.ifVoid();
+      this.deps.throwTypeError(c, (x) => x.localGet(1));
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      c.end();
+      c.localGet(0);
+      c.call(this.iterFail());
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      this.pushNewArr(c);
+      c.localSet(OUT);
+      this.emitIterSteps(c, OUT, K, null, L);
+      this.boxArr(c, (x) => x.localGet(OUT));
+      this.mb.setBody(idx, [I32, this.arrRef(), ...this.iterLocalTypes()], c.bytes());
+    });
   }
 
   /** %w.dyn.kindName(d) → the noun a check failure reports, verbatim from

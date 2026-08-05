@@ -281,15 +281,22 @@ whose output depended on the aliasing would diverge from Node and fail
 the differential by construction, so the corpus can only contain
 programs that never look.
 
-## S015 — Keyed reads on `unknown` see OWN properties only *(inherited)*
+## S015 — Keyed reads and `in` on `unknown` see OWN properties only *(inherited)*
 
 `u[k]` on a checked-dynamic value answers the receiver's OWN member, or
 `undefined` when it has none. Node consults the prototype chain, so
 `JSON.parse('{}')["toString"]` is a real function there and `undefined`
 here; the same holds for every inherited member of Object, Array and
 String (`hasOwnProperty`, `valueOf`, `slice` as a VALUE rather than a
-call, ...). The named forms that DO work are the ones the runtime models
-directly: `length` on arrays and strings, canonical index reads, and —
+call, ...). The PRESENCE operator answers the same way for the same
+reason — `"toString" in u` is `true` in Node and `false` here, as is
+`"slice" in u` on a dyn array — because there is no chain to walk, only
+the own-entry table the read consults. (`Object.hasOwn` is own-only by
+definition, so it agrees with Node wherever the member genuinely exists,
+string receivers included; it parts company only where S016's padding
+invents members Node left as holes.) The named forms that DO work are
+the ones the runtime models directly: `length` on arrays and strings,
+canonical index reads, and —
 once the invoke surface lands — prototype METHOD CALLS, which dispatch on
 the receiver's kind rather than reading a member. **Rationale:** inherited
 from the C runtime's dyn tree, which stores own entries and has no
@@ -297,8 +304,109 @@ prototype chain; giving it one means materializing Object/Array/String
 prototypes as real function values on every lane, which is a feature
 rather than a fix, and the runtime's design deliberately routes method
 CALLS through kind dispatch instead. The divergence is only observable
-when a prototype member is read as a VALUE, which is rare in the corpus
-and absent from it entirely. **Tested by:** the wasm emitter unit test —
-no corpus program can pin it, because a program whose output observed the
-divergence would fail the differential by construction; the test pins
-tsinter's answer (`undefined`) with Node's in a comment.
+when a prototype member is read as a VALUE or asked for by name, which is
+rare in the corpus and absent from it entirely. **Tested by:** the wasm
+emitter unit test — no corpus program can pin it, because a program whose
+output observed the divergence would fail the differential by
+construction; the test pins tsinter's answer (`undefined`, and `false`
+for the presence form) with Node's in a comment.
+
+## S016 — Keyed writes on `unknown`: what the dyn tree cannot store *(inherited)*
+
+The checked-dynamic tree stores objects as an own-entry table and arrays
+as a DENSE vector, with no expando map beside either and no hole bit
+inside the vector. Five observable consequences follow — three loud, and
+two that say nothing at all. What is exact first, so the boundary is
+clear: object writes (insertion order, later writes winning, the
+surviving entry keeping its original key), array index writes within the
+allocatable range (`length` and every read match Node), and the refusals
+on nullish, number and boolean receivers, which are V8's own texts
+character for character.
+
+**Padded slots are OWN PROPERTIES, where Node leaves HOLES.** Growing a
+dyn array by index fills the gap with real `undefined` members instead of
+a sparse region: after `a[3] = 9` on `JSON.parse('[1]')`, both answer
+`length === 4` and both read `a[1]` as `undefined`, but `Object.keys`
+answers `["0","1","2","3"]` here and `["0","3"]` in Node, and `'1' in a`
+and `Object.hasOwn(a, '1')` answer `true` here and `false` there. Values
+and entries follow keys. This is the SILENT one — nothing throws, the
+program simply enumerates members Node never created.
+
+**A non-index key throws where Node writes.** `a['nope'] = 1` raises a
+catchable "Cannot create property 'nope' on array" (V8's strict-mode
+primitive-write shape with the array kind name substituted) where Node
+adds the property and reads it back. `length` is the same throw and the
+more common shape: `a['length'] = 1` truncates a three-element array in
+Node and throws here.
+
+**String receivers get the wrong V8 text for the read-only cases.** An
+in-range index or `length` on a dyn string raises "Cannot create property
+'0' on string 'abc'" where Node raises "Cannot assign to read only
+property '0' of string 'abc'" — a different V8 message for the same
+refusal. Out-of-range indices and named keys agree exactly ("Cannot
+create property '9' on string 'abc'"), so only the read-only pair
+diverges.
+
+**`Object.assign` onto a non-object target copies NOTHING, silently.**
+`Object.assign(arrTarget, {k: 7})` writes `k` through in Node and lists
+it in `Object.keys`; here nothing is copied, no throw and no message. The loudness claim above is about the `d[k] = v` spelling
+alone — this arm is the one place a keyed write disappears without a
+word.
+
+**Index bands.** The canonical-index parse accepts `[0, 2147483639]` (its
+overflow guard's ceiling). Inside that band a large index attempts a
+DENSE allocation of everything below it and dies UNCATCHABLY: the wasm
+lane traps "requested new array is too large" with no output at all, the
+C lane aborts with "scriptc: out of memory" and SIGABRT, and Node
+succeeds instantly with a sparse array. The exact index where this begins
+is allocator-dependent, not a fixed constant; `a[1000000] = 7` still
+allocates and matches Node on `length` and the reads (its million padded
+keys are paragraph one's divergence, not this one's). Above the band, `[2147483640, 4294967294]` — real
+array indices to Node — take the "Cannot create property" throw instead,
+as does anything at or past 2^32-1, which Node treats as an ordinary
+named property and writes.
+
+**Rationale:** inherited from the C runtime's dyn tree. Holes, an expando
+map and a sparse representation are all the same missing feature: a
+second storage plane per array that `Object.keys`, the enumeration walks,
+JSON and the inspect surface would each have to merge with the dense
+indices, with its own key-order question. That is a feature, not a fix.
+The uncatchable band is the S008 shape — an allocation the tier cannot
+serve is a trap, not a diagnosable error — and it is reachable only by
+programs that would have built a two-billion-element array on purpose.
+**Tested by:** the wasm emitter unit tests — one pinning the refusal text
+for every receiver kind (each verified against real Node, which agrees on
+all of them but the array), one pinning the index writes, their padding,
+and the enumeration divergence the padding causes. No corpus program can
+pin any of it: a program observing any of these would fail the
+differential on every lane by construction, and the program that
+exercises the index writes (`2601-dyn-keyed-write-ops.js`) still refuses
+on the wasm lane for an unrelated reason — it prints its dyn values, and
+the inspect surface has not landed.
+
+## S017 — `for...of` over a COMPUTED member names the value, not the source *(inherited)*
+
+V8's not-iterable TypeError names the source expression whenever it can
+render one, and the lowering threads that spelling through only for a
+syntactically BARE identifier or an unparenthesized dotted chain — a
+computed access, a parenthesized source, or an `as` cast all fall back
+to the kind wording. So `for (const v of arr[0])` over a number raises
+"number 5 is not iterable (cannot read property Symbol(Symbol.iterator))"
+where Node raises "arr[0] is not iterable"; the same holds for `o['p']`,
+`o[k]`, `(n5)`, `(deep.a).b` and `n5 as unknown[]`, while bare `n5`,
+`o.p` and `deep.a.b` render correctly. DESTRUCTURING position is
+unaffected — V8 itself falls back to the kind wording for any member
+access there (`const [z] = arr[0]` says "number 5 is not iterable …" in
+Node too), so the lanes agree. Everything else about the message is
+byte-exact, the kind wording included: "undefined", "object null",
+"boolean true", "number 5", "function", and bare "object" for a plain
+`{}`. **Rationale:** inherited — the spelling is a compile-time string
+the lowering passes to the runtime's pack helper, and it supplies one
+only where a simple source text is at hand; the fallback is the runtime's
+own kind renderer (`sc_dyn_iter_n`). Reproduced identically on the C
+lane, message for message. Widening it means teaching the lowering to
+re-render arbitrary expression source, which is a source-mapping feature
+rather than a runtime one. **Tested by:** the wasm emitter unit test,
+which pins the diverging shape beside the ones that agree. No corpus
+program can pin it — one whose output observed it would fail the
+differential on every lane by construction.

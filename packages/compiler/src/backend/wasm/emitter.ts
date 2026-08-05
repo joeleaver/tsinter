@@ -1320,6 +1320,8 @@ class Assembler {
         this.emitSetCellError(c, "%TypeError", "TypeError", pushMessage, null),
       arrVec: () => this.dynVecInfo(),
       arrPush: () => this.vecs.pushOne(this.dynVecInfo()),
+      arrNewLen: () => this.vecs.newLen(this.dynVecInfo()),
+      strCpAt: () => this.strs.cpAt(),
     });
     return this.dynField;
   }
@@ -3988,6 +3990,26 @@ class Assembler {
           this.releaseScratch(t, s);
           return;
         }
+        if (k === "dyn") {
+          // Same value semantics over the checked-dynamic tree, with the
+          // runtime ToBoolean (scr_dyn_truthy) as the test: the deciding
+          // operand IS the result, and the untaken side never runs.
+          const t = this.dyn.dynRef();
+          this.walkExpr(e.left);
+          const s = this.acquireScratch(t);
+          code.localSet(s);
+          code.localGet(s);
+          code.call(this.dyn.truthy());
+          this.openIfResult(t);
+          if (e.op === "&&") this.walkExpr(e.right);
+          else code.localGet(s);
+          code.else_();
+          if (e.op === "&&") code.localGet(s);
+          else this.walkExpr(e.right);
+          this.close();
+          this.releaseScratch(t, s);
+          return;
+        }
         if (k !== "f64" && k !== "string" && k !== "bool") {
           this.refuse(`logical:${k}`, e.loc);
           code.unreachable();
@@ -4457,8 +4479,26 @@ class Assembler {
         // the narrowed shape extracts the single non-unit arm's payload
         // under the checker's proof.
         const lt = e.left.type;
+        if (lt.kind === "dyn") {
+          // A checked-dynamic left: the RUNTIME KIND decides (only
+          // undefined and null take the default — 0, "" and false do
+          // not), and both sides are already dyn, so there is no
+          // narrowing to do and the box passes through.
+          const t = this.dyn.dynRef();
+          this.walkExpr(e.left);
+          const s = this.acquireScratch(t);
+          code.localSet(s);
+          this.emitDynNullish(s);
+          this.openIfResult(t);
+          this.walkExpr(e.right);
+          code.else_();
+          code.localGet(s);
+          this.close();
+          this.releaseScratch(t, s);
+          return;
+        }
         if (lt.kind !== "union") {
-          // jsval/dyn lefts wait on their representations.
+          // jsval lefts wait on the island representation.
           this.refuse(`nullish:${lt.kind}`, e.loc);
           code.unreachable();
           return;
@@ -4636,9 +4676,46 @@ class Assembler {
         // effects included); otherwise the narrowed receiver binds to the
         // chain id and the body produces the result.
         const recvT = e.receiver.type;
+        if (recvT.kind === "dyn") {
+          // A checked-dynamic receiver: the kind tag is the short-circuit
+          // test, the undefined immortal is the unit answer (dyn spells
+          // undefined directly — there is no union wrapper here), and the
+          // body reads the receiver through chainRecv like any other
+          // chain. A void body (`u.m?.()` in statement position) has no
+          // result at all.
+          if (e.type.kind !== "dyn" && e.type.kind !== "void") {
+            this.refuse(`optChain:dyn:${e.type.kind}`, e.loc);
+            code.unreachable();
+            return;
+          }
+          const t = this.dyn.dynRef();
+          const r = this.acquireScratch(t);
+          this.walkExpr(e.receiver);
+          code.localSet(r);
+          this.emitDynNullish(r);
+          const emitBody = (): void => {
+            this.fn.chainBinds.set(e.id, r);
+            this.walkExpr(e.body);
+            this.fn.chainBinds.delete(e.id);
+          };
+          if (e.type.kind === "void") {
+            code.i32Eqz();
+            this.openIf();
+            emitBody();
+            this.close();
+          } else {
+            this.openIfResult(t);
+            code.globalGet(this.dyn.undefinedGlobal());
+            code.else_();
+            emitBody();
+            this.close();
+          }
+          this.releaseScratch(t, r);
+          return;
+        }
         if (recvT.kind !== "union") {
-          // jsval/dyn receivers (the `any`/`unknown` chain forms) wait on
-          // their representations.
+          // jsval receivers (the `any` chain forms) wait on the island
+          // representation.
           this.refuse(`optChain:${recvT.kind}`, e.loc);
           code.unreachable();
           return;
@@ -4852,6 +4929,99 @@ class Assembler {
           this.walkExpr(e.args[0]!);
           code.call(this.json.parse());
           this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "dyn.keySet") {
+          // `d[k] = v` where the RECEIVER is the dynamic thing. The
+          // helper throws Node's TypeErrors on the receivers that cannot
+          // take a property, so the site owns a pending check.
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          this.walkExpr(e.args[2]!);
+          code.call(this.dyn.keySet());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "dyn.hasOwn") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.dyn.hasOwn());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "dyn.objKeys" || e.fn === "dyn.objValues" || e.fn === "dyn.objEntries") {
+          // One walk, three modes — the runtime's own shape
+          // (scr_dyn_objwalk). Nullish receivers throw ToObject's
+          // TypeError, so all three carry the pending check.
+          this.walkExpr(e.args[0]!);
+          code.i32Const(e.fn === "dyn.objKeys" ? 0 : e.fn === "dyn.objValues" ? 1 : 2);
+          code.call(this.dyn.objWalk());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "dyn.assign") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.dyn.assign());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "dyn.iterPack") {
+          // The for-of / rest drain over a dyn source. The second
+          // argument is the compile-time refusal text (empty where the
+          // value's own kind wording is wanted instead).
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.dyn.iterPack());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "dyn.arrLen") {
+          // The pack's length and element reads: an ARR by construction
+          // (the defensive arms in C cover nothing this lowering reaches).
+          // Neither throws.
+          this.walkExpr(e.args[0]!);
+          // The box is already on the stack, so the payload cast and the
+          // length read run over it in place (the no-op pusher).
+          this.dyn.arrLen(code, (c) => this.dyn.arrPayload(c, () => {}));
+          code.f64ConvertI32U();
+          return;
+        }
+        if (e.fn === "dyn.arrAt") {
+          const d = this.acquireScratch(this.dyn.arrRef());
+          const x = this.acquireScratch(F64);
+          this.walkExpr(e.args[0]!);
+          this.dyn.arrPayload(code, () => {});
+          code.localSet(d);
+          this.walkExpr(e.args[1]!);
+          code.localSet(x);
+          // The RANGE test runs in f64 and the truncation only inside the
+          // in-range arm: i32.trunc_f64_s TRAPS on a negative, fractional-
+          // past-the-end or NaN index, where C answers the undefined
+          // singleton. Both operands are pure compares on a local, so the
+          // non-short-circuiting `and` is safe here.
+          code.localGet(x);
+          code.f64Const(0);
+          code.f64Ge();
+          code.localGet(x);
+          this.dyn.arrLen(code, (c) => c.localGet(d));
+          code.f64ConvertI32U();
+          code.f64Lt();
+          code.i32And();
+          this.openIfResult(this.dyn.dynRef());
+          this.dyn.arrAt(
+            code,
+            (c) => c.localGet(d),
+            (c) => {
+              c.localGet(x);
+              c.i32TruncF64S();
+            },
+          );
+          code.else_();
+          code.globalGet(this.dyn.undefinedGlobal());
+          this.close();
+          this.releaseScratch(F64, x);
+          this.releaseScratch(this.dyn.arrRef(), d);
           return;
         }
         if (e.fn === "dyn.typeof") {
@@ -5262,6 +5432,188 @@ class Assembler {
         this.walkExpr(e.key);
         code.i32Const(e.optional === true ? 1 : 0);
         code.call(this.dyn.keyGet());
+        this.emitPendingCheck();
+        return;
+      }
+
+      /* `"k" in u`: a kind-guarded PRESENCE answer with the key known at
+       * compile time, so the array arm folds to a constant or a single
+       * length compare — the C emitter's inline lowering, one for one.
+       * Nothing allocates and nothing throws (the `in` operator's own
+       * TypeError on primitives is checker-unreachable: tsc admits `in`
+       * only on object-typed operands). A member holding undefined still
+       * answers true — the tree stores presence — and an INHERITED name
+       * answers false, which is SEMANTICS.md S015's stance reaching the
+       * presence operator. */
+      case "dynHasKey": {
+        const d = this.acquireScratch(this.dyn.dynRef());
+        this.walkExpr(e.value);
+        code.localSet(d);
+        code.localGet(d);
+        code.structGet(this.dyn.dynT(), DYN_KIND);
+        code.i32Const(DK.OBJ);
+        code.i32Eq();
+        this.openIfResult(I32);
+        this.dyn.objPayload(code, (c) => c.localGet(d));
+        this.pushStrLit(e.key);
+        code.call(this.dyn.objGet());
+        code.refIsNull();
+        code.i32Eqz();
+        code.else_();
+        // The ARRAY arm: "length" is always there, a canonical index is
+        // there when it is in range, and no other spelling ever is.
+        const arrIdx = /^(0|[1-9][0-9]*)$/.test(e.key) ? Number(e.key) : null;
+        if (e.key !== "length" && (arrIdx === null || arrIdx > Number.MAX_SAFE_INTEGER)) {
+          code.i32Const(0);
+        } else {
+          code.localGet(d);
+          code.structGet(this.dyn.dynT(), DYN_KIND);
+          code.i32Const(DK.ARR);
+          code.i32Eq();
+          this.openIfResult(I32);
+          if (e.key === "length") {
+            code.i32Const(1);
+          } else {
+            this.dyn.arrLen(code, (c) => this.dyn.arrPayload(c, (x) => x.localGet(d)));
+            code.f64ConvertI32U();
+            code.f64Const(arrIdx!);
+            code.f64Gt();
+          }
+          code.else_();
+          code.i32Const(0);
+          this.close();
+        }
+        this.close();
+        if (e.negated === true) code.i32Eqz();
+        this.releaseScratch(this.dyn.dynRef(), d);
+        return;
+      }
+
+      /* Strict equality where at least one side is dyn. Both operands
+       * evaluate in SOURCE order (JS's), the dyn side is found by TYPE,
+       * and the compare is a kind test plus a payload compare — f64.eq
+       * for numbers (NaN false, ±0 equal, both JS-exact), content for
+       * strings. Two dyn operands run the whole-dyn equality instead
+       * (scalars by value, units by kind, the reference kinds by node
+       * identity). Nothing allocates, nothing throws. */
+      case "dynScalarEq": {
+        const dynLeft = e.left.type.kind === "dyn";
+        const scalarT = dynLeft ? e.right.type : e.left.type;
+        const st = scalarT.kind === "dyn" ? "dyn" : scalarT.kind;
+        const sType = st === "f64" ? F64 : st === "bool" ? I32 : st === "string" ? this.strRef : this.dyn.dynRef();
+        const d = this.acquireScratch(this.dyn.dynRef());
+        const s = this.acquireScratch(sType);
+        // Source order: whichever side is written first is evaluated
+        // first, and only then does the compare pick them apart.
+        this.walkExpr(e.left);
+        code.localSet(dynLeft ? d : s);
+        this.walkExpr(e.right);
+        code.localSet(dynLeft ? s : d);
+        if (st === "dyn") {
+          code.localGet(dynLeft ? d : s);
+          code.localGet(dynLeft ? s : d);
+          code.call(this.dyn.strictEq());
+        } else {
+          const kind = st === "f64" ? DK.NUM : st === "bool" ? DK.BOOL : DK.STR;
+          code.localGet(d);
+          code.structGet(this.dyn.dynT(), DYN_KIND);
+          code.i32Const(kind);
+          code.i32Eq();
+          this.openIfResult(I32);
+          if (st === "f64") {
+            code.localGet(d);
+            code.structGet(this.dyn.dynT(), DYN_NUM);
+            code.localGet(s);
+            code.f64Eq();
+          } else if (st === "bool") {
+            code.localGet(d);
+            code.structGet(this.dyn.dynT(), DYN_NUM);
+            code.f64Const(0);
+            code.f64Ne();
+            code.localGet(s);
+            code.i32Eq();
+          } else {
+            code.localGet(d);
+            code.structGet(this.dyn.dynT(), DYN_REF);
+            code.refCast(this.strType);
+            code.localGet(s);
+            code.call(this.strEqHelper());
+          }
+          code.else_();
+          code.i32Const(0);
+          this.close();
+        }
+        if (e.negated === true) code.i32Eqz();
+        this.releaseScratch(sType, s);
+        this.releaseScratch(this.dyn.dynRef(), d);
+        return;
+      }
+
+      /* RequireObjectCoercible with V8's destructuring TypeError. Both
+       * halves of the message are compile-time (the SOURCE spelling of
+       * the receiver, and the pattern's first property when there is
+       * one); only the "undefined."/"null." tail is a runtime choice, so
+       * the two whole strings intern as literals and the kind picks. The
+       * value passes through unchanged. */
+      case "dynDestrCheck": {
+        if (e.value.type.kind !== "dyn") {
+          // The island's prelude guard is engine-thrown; its value is a
+          // jsval, which has no representation on this backend.
+          this.refuse(`dynDestrCheck:${e.value.type.kind}`, e.loc);
+          code.unreachable();
+          return;
+        }
+        const head =
+          e.firstProp === undefined
+            ? `Cannot destructure '${e.spelling}' as it is `
+            : `Cannot destructure property '${e.firstProp}' of '${e.spelling}' as it is `;
+        const d = this.acquireScratch(this.dyn.dynRef());
+        this.walkExpr(e.value);
+        code.localTee(d);
+        code.structGet(this.dyn.dynT(), DYN_KIND);
+        const k = this.acquireScratch(I32);
+        code.localTee(k);
+        code.i32Const(DK.UNDEF);
+        code.i32Eq();
+        code.localGet(k);
+        code.i32Const(DK.NULL);
+        code.i32Eq();
+        code.i32Or();
+        this.openIf();
+        code.localGet(k);
+        code.i32Const(DK.UNDEF);
+        code.i32Eq();
+        this.openIfResult(this.strRef);
+        this.pushStrLit(`${head}undefined.`);
+        code.else_();
+        this.pushStrLit(`${head}null.`);
+        this.close();
+        const msg = this.acquireScratch(this.strRef);
+        code.localSet(msg);
+        this.emitSetCellError(code, "%TypeError", "TypeError", (c) => c.localGet(msg), null);
+        this.emitUnwind();
+        this.releaseScratch(this.strRef, msg);
+        this.close();
+        code.localGet(d);
+        this.releaseScratch(I32, k);
+        this.releaseScratch(this.dyn.dynRef(), d);
+        return;
+      }
+
+      /* GetIterator plus the first N steps, as array destructuring sees
+       * it: a fresh dyn array of exactly `count` elements, undefined past
+       * the end. The empty pattern passes 0 and keeps only the
+       * validation. Non-iterables throw V8's wording. */
+      case "dynIterN": {
+        if (e.value.type.kind !== "dyn") {
+          // An island source runs the ENGINE's iterator protocol.
+          this.refuse(`dynIterN:${e.value.type.kind}`, e.loc);
+          code.unreachable();
+          return;
+        }
+        this.walkExpr(e.value);
+        code.i32Const(e.count);
+        code.call(this.dyn.iterN());
         this.emitPendingCheck();
         return;
       }
@@ -5751,10 +6103,6 @@ class Assembler {
       case "dynFromJsval":
       case "dynCall":
       case "dynInvoke":
-      case "dynHasKey":
-      case "dynScalarEq":
-      case "dynDestrCheck":
-      case "dynIterN":
       case "jsonStringify":
       /* The island bridge — an engine embedding, so likely never on this
        * backend at all. */
@@ -6288,6 +6636,24 @@ class Assembler {
         code.localGet(s);
         return;
     }
+  }
+
+  /** `scr_dyn_is_nullish` inline: the two unit kinds, off the tag. The
+   * short-circuit test behind `??` and `?.` over a dyn value — the
+   * FALSY scalars (0, "", false) are emphatically not nullish. */
+  private emitDynNullish(s: number): void {
+    const code = this.fn.code;
+    const k = this.acquireScratch(I32);
+    code.localGet(s);
+    code.structGet(this.dyn.dynT(), DYN_KIND);
+    code.localTee(k);
+    code.i32Const(DK.UNDEF);
+    code.i32Eq();
+    code.localGet(k);
+    code.i32Const(DK.NULL);
+    code.i32Eq();
+    code.i32Or();
+    this.releaseScratch(I32, k);
   }
 
   /** JS-exact switch: the discriminant evaluates once into a scratch; the
