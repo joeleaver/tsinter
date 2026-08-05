@@ -830,13 +830,16 @@ reproduces it. No corpus program can pin it — one whose output observed
 the divergence would fail the differential on every lane by
 construction.
 
-## S026 — `JSON.stringify` over a dyn root caps nesting depth at 1000 *(wasm tier)*
+## S026 — `JSON.stringify` caps nesting depth at 1000 *(wasm tier)*
 
-`JSON.stringify(u)` where `u` is `unknown`/`{}`/`Object`/`object` — a dyn
-ROOT, the one stringify shape with no static type to direct a serializer
-— serializes through the emitted dyn walker, which throws a catchable
-`RangeError` reading `Maximum call stack size exceeded` rather than
-recurse past 1000 levels of array/object nesting.
+`JSON.stringify` on this tier throws a catchable `RangeError` reading
+`Maximum call stack size exceeded` rather than recurse past 1000 levels of
+array/object nesting. BOTH walkers are capped and both share the counter:
+the dyn-root walker, which has no static type to direct it, and the
+type-directed walker for a RECURSIVE record shape, which is recursive at
+runtime for the same reason its type is recursive at compile time. A type
+that cannot recurse never reaches the check — its nesting is bounded by
+its own structure — so acyclic shapes pay nothing.
 
 **Node caps this too, and reports the same error with the same message.**
 That is the difference from S013, which this entry otherwise mirrors: V8's
@@ -853,32 +856,43 @@ under Node's default stack and throws here, and one nested 800 deep
 stringifies here and throws under a small-stack Node. Neither side is
 uniformly stricter.
 
-The sharper divergence is CYCLES. A cyclic dyn tree is constructible
-through dyn keyed writes (`const o: any = {}; o.self = o`), and Node
-reports it as `TypeError: Converting circular structure to JSON` because
-its stringifier tracks the stack of open values. This walker has no cycle
-detection, so a cycle simply runs out of depth and reports the RangeError
-above — right that it failed, wrong about why. NEITHER stringify path on
-this tier detects cycles today: the STATIC path reaches them only through
-a recursive record shape, and those still refuse as `record:recursive`
-(the V8-exact circular-structure detection described elsewhere in this
-register is the NATIVE lanes'; it arrives here with the recursive-shape
-stage). The C runtime's dyn walker has no guard of either kind: its
-recursive descent exhausts the C stack and the process dies of SIGSEGV
-after a few seconds (`scriptc: program killed by SIGSEGV`, measured at
-~3.5s on both cyclic shapes). An uncatchable crash is strictly worse than
-a documented catchable failure, which is the whole argument for the cap.
+CYCLES are where the two walkers part company. The STATIC path detects
+them exactly: a cyclic value of a recursive record type throws V8's
+`TypeError: Converting circular structure to JSON` with the message built
+byte for byte, so the cap is not what reports it. The DYN walker has no
+cycle detector, so a cyclic dyn tree — constructible through dyn keyed
+writes, `const o: any = {}; o.self = o` — runs out of depth instead and
+reports the RangeError above: right that it failed, wrong about why. That
+gap closes when the dyn tree grows its own seen stack.
 
-**Rationale:** the same as S013's. The walker is recursive descent over a
-tree of unbounded depth, and the wasm stack it runs on is bounded; a
-catchable failure at a fixed, documented depth beats exhausting the stack
-at an unpredictable one. The message is not invented — it is exactly what
-Node produces for the same class of input, which is the nearest true
-thing to say, and the value being reported is genuinely "this recursion
-went too deep". Removing the divergence means an explicit value stack in
-the walker plus a seen-stack cycle detector for the dyn tree, at which
-point the cyclic case could report V8's TypeError instead.
-**Tested by:** the wasm emitter unit tests — 1000 nested objects
-serialize, 1001 throws, a cyclic tree throws, and the buffer and depth
-counter both recover for the next call. No corpus program can pin it: the
-native lanes diverge from this by construction (C has no cap).
+WHAT THE OTHER LANES DO with the same inputs, all measured rather than
+assumed. On a CYCLIC dyn tree the C runtime has no guard of either kind:
+recursive descent exhausts the C stack and the process dies of SIGSEGV
+after ~3.5s (`scriptc: program killed by SIGSEGV`). On a deep ACYCLIC
+value of a recursive static type C is far more forgiving than either
+capped walker — 120000 levels serialize fine — but it has no guard there
+either, and somewhere between 120000 and 300000 it SIGSEGVs the same way.
+An uncatchable crash at an unpredictable depth is strictly worse than a
+documented catchable failure at a fixed one, which is the whole argument
+for the cap.
+
+**Rationale:** the same as S013's, and the wasm stack makes it sharper
+than the native lanes need. Both walkers are recursive descent over a
+tree of unbounded depth, and V8's WASM stack is far smaller than the
+native one C gets: UNCAPPED, the static walker was measured trapping
+between 5000 and 10000 levels — and trapping UNCATCHABLY, with the
+program's own `try` never running and its buffered output never flushed,
+which is the S003/S007 abort family rather than an exception. Node throws
+a catchable RangeError on the same input. Capping turns an uncatchable
+abort at an unpredictable depth into the catchable failure Node already
+gives, at a documented one. The message is not invented — it is exactly
+what Node produces for this class of input. Removing the divergence means
+an explicit value stack in both walkers, plus a seen stack for the dyn
+tree so its cycles report the TypeError instead.
+**Tested by:** the wasm emitter unit tests, on both paths — 1000 nested
+objects serialize and 1001 throws through the dyn walker; a 1000-deep
+acyclic value of a recursive record type serializes and 1001 throws
+through the static one; a cyclic dyn tree throws; and the buffer, seen
+stack and depth counter all recover for the next call. No corpus program
+can pin it: the native lanes diverge from this by construction (C caps
+neither path).

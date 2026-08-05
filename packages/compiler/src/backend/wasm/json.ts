@@ -70,6 +70,18 @@ import { F64, I32, I64, ModuleBuilder, type ValType } from "./module.js";
 /** C's SCR_JSON_MAX_DEPTH. SEMANTICS.md S013. */
 export const MAX_DEPTH = 1000;
 
+/** The abstract `eq` heap type's s33 encoding. Every GC struct and array
+ * is a subtype, and unlike `any` it admits `ref.eq` — which is exactly
+ * what circular detection compares. */
+const EQ_HEAP = -0x13;
+const EQ_REF: ValType = { kind: "ref", nullable: true, typeIndex: EQ_HEAP };
+
+/** `json:seen` field indices — one circular-detection frame. */
+const SEEN_PTR = 0;
+const SEEN_IS_ARRAY = 1;
+const SEEN_PROP = 2;
+const SEEN_INDEX = 3;
+
 /** V8 prints the whole input when it is this short, and otherwise a
  * window of this radius around the offending position, with an ellipsis
  * on whichever side it truncated. Reverse-engineered against Node across
@@ -2575,6 +2587,10 @@ export class JsonBuilder {
       const c = new Code();
       c.i32Const(0);
       c.globalSet(this.jbLen());
+      c.i32Const(0);
+      c.globalSet(this.seenLen());
+      c.i32Const(0);
+      c.globalSet(this.jbDepth());
       this.mb.setBody(idx, [], c.bytes());
     });
   }
@@ -3225,6 +3241,416 @@ export class JsonBuilder {
     });
   }
 
+  /* ── circular-structure detection ───────────────────────────────────────
+   * A RECURSIVE type admits runtime reference cycles, and stringifying a
+   * cyclic value throws V8's exact TypeError. The emitted walkers over
+   * cycle-CAPABLE containers bracket their bodies with enter/leave and
+   * stamp the current edge before each cycle-capable member; acyclic
+   * types pay nothing at all. C's scr_jb_enter/leave/edge_* ported.
+   *
+   * Detection is STACK membership, not "seen anywhere": a DAG serializes
+   * its shared subtree twice, exactly like Node, and only a path back to
+   * an ANCESTOR is circular.
+   *
+   * The message mirrors V8's ConstructCircularStructureErrorMessage byte
+   * for byte — the starting object where the repeat lands, one line per
+   * hop up to the top of the stack, the middle elided as "..." when there
+   * are more than three hops (first two and the last one survive), then
+   * the closing edge. Constructor names are only ever 'Object' or
+   * 'Array', which is all a JSON-safe type can be. Verified against Node
+   * 24.18 on every shape the corpus program exercises plus the ellipsis
+   * boundary, by diffing whole program outputs — not inferred from the C
+   * source, which is merely where the algorithm came from. */
+
+  private seenEntT: number | null = null;
+  private seenArrT: number | null = null;
+  private seenG: number | null = null;
+  private seenLenG: number | null = null;
+
+  /** One frame: the container's identity, whether it prints as an Array,
+   * and the edge LEAVING it (a property name, or an index when the name
+   * is null). The edge fields are stamped as the walk moves. */
+  private seenEnt(): number {
+    this.seenEntT ??= this.mb.openStructType("json:seen", [
+      { storage: EQ_REF, mutable: true },
+      { storage: I32, mutable: true },
+      { storage: this.deps.strRef(), mutable: true },
+      { storage: I32, mutable: true },
+    ]);
+    return this.seenEntT;
+  }
+
+  private seenArr(): number {
+    if (this.seenArrT === null) {
+      this.seenArrT = this.mb.arrayType({ kind: "ref", nullable: true, typeIndex: this.seenEnt() }, true);
+    }
+    return this.seenArrT;
+  }
+
+  private seen(): number {
+    this.seenG ??= this.mb.addGlobal({ kind: "ref", nullable: true, typeIndex: this.seenArr() }, true, (w) => {
+      w.u8(0xd0);
+      w.sleb(this.seenArr());
+    });
+    return this.seenG;
+  }
+
+  private seenLen(): number {
+    this.seenLenG ??= this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41);
+      w.sleb(0);
+    });
+    return this.seenLenG;
+  }
+
+  /** The top frame, which every edge stamp writes into. */
+  private pushTop(c: Code): void {
+    c.globalGet(this.seen());
+    c.globalGet(this.seenLen());
+    c.i32Const(1);
+    c.i32Sub();
+    c.arrayGet(this.seenArr());
+    c.refAsNonNull();
+  }
+
+  /** `%w.json.jbEdgeProp(name)` — the top frame leaves by a PROPERTY. */
+  jbEdgeProp(): number {
+    return this.cached("jbEdgeProp", [this.deps.strRef()], [], (idx) => {
+      const c = new Code();
+      this.pushTop(c);
+      c.localGet(0);
+      c.structSet(this.seenEnt(), SEEN_PROP);
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** `%w.json.jbEdgeIdx(i)` — the top frame leaves by an INDEX. A null
+   * property is what marks the edge as an index one. */
+  jbEdgeIdx(): number {
+    return this.cached("jbEdgeIdx", [I32], [], (idx) => {
+      const c = new Code();
+      this.pushTop(c);
+      c.refNull(this.deps.strType());
+      c.structSet(this.seenEnt(), SEEN_PROP);
+      this.pushTop(c);
+      c.localGet(0);
+      c.structSet(this.seenEnt(), SEEN_INDEX);
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** `%w.json.jbLeave()` — pop the frame and the depth it claimed. */
+  jbLeave(): number {
+    return this.cached("jbLeave", [], [], (idx) => {
+      const c = new Code();
+      c.globalGet(this.seenLen());
+      c.i32Const(1);
+      c.i32Sub();
+      c.globalSet(this.seenLen());
+      this.emitDepthLeave(c);
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** One frame's edge, rendered: `property 'x'` or `index 3`. */
+  private circEdge(): number {
+    return this.cached("circEdge", [I32], [this.deps.strRef()], (idx) => {
+      const c = new Code();
+      const E = 1;
+      c.globalGet(this.seen());
+      c.localGet(0);
+      c.arrayGet(this.seenArr());
+      c.refAsNonNull();
+      c.localSet(E);
+      c.localGet(E);
+      c.structGet(this.seenEnt(), SEEN_PROP);
+      c.refIsNull();
+      c.ifResult(this.deps.strRef());
+      this.deps.lit(c, "index ");
+      c.localGet(E);
+      c.structGet(this.seenEnt(), SEEN_INDEX);
+      c.f64ConvertI32S();
+      c.call(this.deps.f64ToStr());
+      c.call(this.deps.concat());
+      c.else_();
+      this.deps.lit(c, "property '");
+      c.localGet(E);
+      c.structGet(this.seenEnt(), SEEN_PROP);
+      c.call(this.deps.concat());
+      this.deps.lit(c, "'");
+      c.call(this.deps.concat());
+      c.end();
+      this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: this.seenEnt() }], c.bytes());
+    });
+  }
+
+  /** One frame's constructor clause. JSON-safe types reach exactly two. */
+  private circCtor(): number {
+    return this.cached("circCtor", [I32], [this.deps.strRef()], (idx) => {
+      const c = new Code();
+      c.globalGet(this.seen());
+      c.localGet(0);
+      c.arrayGet(this.seenArr());
+      c.refAsNonNull();
+      c.structGet(this.seenEnt(), SEEN_IS_ARRAY);
+      c.ifResult(this.deps.strRef());
+      this.deps.lit(c, "object with constructor 'Array'");
+      c.else_();
+      this.deps.lit(c, "object with constructor 'Object'");
+      c.end();
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** V8's message for a repeat found at stack position `i`. */
+  private circMsg(): number {
+    return this.cached("circMsg", [I32], [this.deps.strRef()], (idx) => {
+      const c = new Code();
+      const M = 1; // the accumulator
+      const N = 2;
+      const J = 3;
+      const HOPS = 4;
+      const cat = (): void => {
+        c.call(this.deps.concat());
+        c.localSet(M);
+      };
+      this.deps.lit(c, "Converting circular structure to JSON\n    --> starting at ");
+      c.localSet(M);
+      c.localGet(M);
+      c.localGet(0);
+      c.call(this.circCtor());
+      cat();
+      c.globalGet(this.seenLen());
+      c.localSet(N);
+      // Intermediate lines are j = i+1 .. n-1; more than three of them
+      // and the middle elides, keeping the first two and the last.
+      c.localGet(N);
+      c.i32Const(1);
+      c.i32Sub();
+      c.localGet(0);
+      c.i32Sub();
+      c.localSet(HOPS);
+      c.localGet(0);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(J);
+      c.block();
+      c.loop();
+      c.localGet(J);
+      c.localGet(N);
+      c.i32GeU();
+      c.brIf(1);
+      // The elision test reads only locals, so one i32.and is safe here.
+      c.localGet(HOPS);
+      c.i32Const(3);
+      c.i32GtU();
+      c.localGet(J);
+      c.localGet(0);
+      c.i32Const(1);
+      c.i32Add();
+      c.i32Sub();
+      c.i32Const(2);
+      c.i32Eq();
+      c.i32And();
+      c.ifVoid();
+      c.localGet(M);
+      this.deps.lit(c, "\n    |     ...");
+      cat();
+      // Resume at the LAST hop (the loop's own increment lands on it).
+      c.localGet(N);
+      c.i32Const(2);
+      c.i32Sub();
+      c.localSet(J);
+      c.else_();
+      c.localGet(M);
+      this.deps.lit(c, "\n    |     ");
+      cat();
+      c.localGet(M);
+      c.localGet(J);
+      c.i32Const(1);
+      c.i32Sub();
+      c.call(this.circEdge());
+      cat();
+      c.localGet(M);
+      this.deps.lit(c, " -> ");
+      cat();
+      c.localGet(M);
+      c.localGet(J);
+      c.call(this.circCtor());
+      cat();
+      c.end();
+      c.localGet(J);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(J);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(M);
+      this.deps.lit(c, "\n    --- ");
+      cat();
+      c.localGet(M);
+      c.localGet(N);
+      c.i32Const(1);
+      c.i32Sub();
+      c.call(this.circEdge());
+      cat();
+      c.localGet(M);
+      this.deps.lit(c, " closes the circle");
+      cat();
+      c.localGet(M);
+      this.mb.setBody(idx, [this.deps.strRef(), I32, I32, I32], c.bytes());
+    });
+  }
+
+  /** `%w.json.jbEnter(v, isArray)` → 1 to proceed, 0 with a pending
+   * error — the circular-structure TypeError, or the depth cap's
+   * RangeError.
+   *
+   * THE DEPTH CAP RIDES HERE for the same reason the seen stack does: a
+   * walker for a recursive TYPE is recursive at RUNTIME, so a deep but
+   * perfectly ACYCLIC value recurses without bound. Left unguarded that
+   * exhausts the wasm stack as an UNCATCHABLE trap — measured at between
+   * 5000 and 10000 links, with the program's own `try` never running —
+   * where Node throws a catchable RangeError. Sharing S026's counter
+   * turns that into the same catchable failure the dyn walker already
+   * gives, at the same documented depth. A type that is NOT cycle-capable
+   * never reaches here and pays nothing, which is exactly right: its
+   * nesting is bounded by its own type structure. */
+  jbEnter(): number {
+    return this.cached("jbEnter", [EQ_REF, I32], [I32], (idx) => {
+      const entT = this.seenEnt();
+      const arrT = this.seenArr();
+      const c = new Code();
+      const I = 2;
+      const N = 3;
+      const NA = 4;
+      const E = 5;
+      // THE FIRST THROW WINS. The cell is filled unconditionally, so a
+      // walk that keeps going after one failure overwrites the message
+      // with whatever fails next: `x.a = x; x.b = x` would report the
+      // edge Node does not (`property 'b'` for Node's `property 'a'`),
+      // and a sibling's depth RangeError would overwrite a circular
+      // TypeError outright, which an `instanceof TypeError` catch then
+      // misses. Both were measured before this guard existed. Bailing
+      // here short-circuits the rest of the walk through the 0-return
+      // paths every caller already handles. Nothing pre-existing can be
+      // pending: the site evaluates its value before the prologue, so
+      // the cell is clear when the walk starts.
+      c.globalGet(this.deps.excKind());
+      c.ifVoid();
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      this.emitDepthEnter(c);
+      c.globalGet(this.seenLen());
+      c.localSet(N);
+      // Already on the stack? Then this edge closes a circle.
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeU();
+      c.brIf(1);
+      c.globalGet(this.seen());
+      c.localGet(I);
+      c.arrayGet(arrT);
+      c.refAsNonNull();
+      c.structGet(entT, SEEN_PTR);
+      c.localGet(0);
+      c.refEq();
+      c.ifVoid();
+      this.deps.throwError(c, "%TypeError", "TypeError", (x) => {
+        x.localGet(I);
+        x.call(this.circMsg());
+      });
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      // Room for one more frame (grow by doubling from 8), then fill it.
+      // Frames are REUSED across pushes: the struct in a slot outlives
+      // the pop, so a deep acyclic walk allocates the stack once instead
+      // of once per container.
+      c.globalGet(this.seen());
+      c.refIsNull();
+      c.ifVoid();
+      c.i32Const(8);
+      c.arrayNewDefault(arrT);
+      c.globalSet(this.seen());
+      c.end();
+      c.globalGet(this.seen());
+      c.arrayLen();
+      c.localGet(N);
+      c.i32LeU();
+      c.ifVoid();
+      c.globalGet(this.seen());
+      c.arrayLen();
+      c.i32Const(1);
+      c.i32Shl();
+      c.arrayNewDefault(arrT);
+      c.localSet(NA);
+      c.localGet(NA);
+      c.i32Const(0);
+      c.globalGet(this.seen());
+      c.i32Const(0);
+      c.localGet(N);
+      c.arrayCopy(arrT, arrT);
+      c.localGet(NA);
+      c.globalSet(this.seen());
+      c.end();
+      c.globalGet(this.seen());
+      c.localGet(N);
+      c.arrayGet(arrT);
+      c.localSet(E);
+      c.localGet(E);
+      c.refIsNull();
+      c.ifVoid();
+      c.localGet(0);
+      c.localGet(1);
+      c.refNull(this.deps.strType());
+      c.i32Const(0);
+      c.structNew(entT);
+      c.localSet(E);
+      c.globalGet(this.seen());
+      c.localGet(N);
+      c.localGet(E);
+      c.arraySet(arrT);
+      c.else_();
+      c.localGet(E);
+      c.localGet(0);
+      c.structSet(entT, SEEN_PTR);
+      c.localGet(E);
+      c.localGet(1);
+      c.structSet(entT, SEEN_IS_ARRAY);
+      c.localGet(E);
+      c.refNull(this.deps.strType());
+      c.structSet(entT, SEEN_PROP);
+      c.localGet(E);
+      c.i32Const(0);
+      c.structSet(entT, SEEN_INDEX);
+      c.end();
+      c.localGet(N);
+      c.i32Const(1);
+      c.i32Add();
+      c.globalSet(this.seenLen());
+      c.i32Const(1);
+      this.mb.setBody(
+        idx,
+        [I32, I32, { kind: "ref", nullable: true, typeIndex: arrT }, { kind: "ref", nullable: true, typeIndex: entT }],
+        c.bytes(),
+      );
+    });
+  }
+
   /* ── JSON.stringify over a DYN root ─────────────────────────────────────
    * The runtime walk the type-directed serializers exist to avoid. A dyn
    * value has no static type, so the tree's own kinds drive the walk —
@@ -3548,9 +3974,7 @@ export class JsonBuilder {
     return this.cached("stringifyDyn", [dyn.dynRef()], [this.deps.strRef()], (idx) => {
       const c = new Code();
       const PRESENT = 1;
-      c.call(this.jbBegin());
-      c.i32Const(0);
-      c.globalSet(this.jbDepth());
+      c.call(this.jbBegin()); // buffer, seen stack and depth all reset here
       c.localGet(0);
       c.call(this.putDyn());
       c.localSet(PRESENT);

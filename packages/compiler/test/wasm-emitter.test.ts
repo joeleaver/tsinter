@@ -1459,6 +1459,228 @@ test("S026: the dyn stringify walker caps depth at 1000, catchably", async () =>
   );
 });
 
+test("circular structures: V8's message, byte for byte", async () => {
+  // A recursive record type admits reference cycles, and stringifying one
+  // throws V8's exact TypeError. The corpus program (2484) covers the
+  // shapes it can; these are the ones it cannot reach:
+  //
+  //  - THE ELLIPSIS BOUNDARY. More than three hops elide the middle,
+  //    keeping the first two and the last. Three hops do not elide, so
+  //    the rule is pinned on both sides of the edge rather than only
+  //    past it.
+  //  - AN ARRAY as the starting object, which is the only way to see
+  //    "constructor 'Array'" on the `--> starting at` line and a
+  //    property edge on the closing one.
+  //  - A DAG is NOT a cycle: detection is STACK membership, so a shared
+  //    subtree serializes twice, exactly like Node.
+  //  - Recovery, which is what the site's prologue buys: after a throw
+  //    the walk never reached its finish, so the buffer AND the seen
+  //    stack are both left dirty for the next call to reset.
+  //
+  // Every line was diffed against Node 24.18 running the same program.
+  const res = await buildWasm(
+    "json-circular.ts",
+    [
+      "interface L { next: L | null }",
+      "interface Box { items: Box[] }",
+      "function msg(f: () => void): string {",
+      "  try { f(); return 'no throw'; }",
+      "  catch (e) { return e instanceof TypeError ? (e as Error).message : 'wrong kind'; }",
+      "}",
+      "function chain(n: number): L {",
+      "  const head: L = { next: null };",
+      "  let cur: L = head;",
+      "  for (let i = 0; i < n; i++) { const x: L = { next: null }; cur.next = x; cur = x; }",
+      "  cur.next = head;",
+      "  return head;",
+      "}",
+      "for (const n of [2, 3, 4]) {",
+      "  console.log('--- hops ' + String(n));",
+      "  console.log(msg(() => { JSON.stringify(chain(n)); }));",
+      "}",
+      "const b: Box = { items: [] };",
+      "b.items.push(b);",
+      "console.log('--- array root');",
+      "console.log(msg(() => { JSON.stringify(b.items); }));",
+      "const shared: Box = { items: [] };",
+      "const dag: Box = { items: [shared, shared] };",
+      "console.log('--- dag');",
+      "console.log(JSON.stringify(dag));",
+      "const acyclic: L = { next: { next: null } };",
+      "console.log('--- recovered');",
+      "console.log(JSON.stringify(acyclic), JSON.stringify(acyclic, null, 2).length);",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  const hop = "    |     property 'next' -> object with constructor 'Object'";
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "--- hops 2",
+      "Converting circular structure to JSON",
+      "    --> starting at object with constructor 'Object'",
+      hop,
+      hop,
+      "    --- property 'next' closes the circle",
+      "--- hops 3",
+      "Converting circular structure to JSON",
+      "    --> starting at object with constructor 'Object'",
+      hop,
+      hop,
+      hop,
+      "    --- property 'next' closes the circle",
+      "--- hops 4",
+      "Converting circular structure to JSON",
+      "    --> starting at object with constructor 'Object'",
+      hop,
+      hop,
+      "    |     ...",
+      hop,
+      "    --- property 'next' closes the circle",
+      "--- array root",
+      "Converting circular structure to JSON",
+      "    --> starting at object with constructor 'Array'",
+      "    |     index 0 -> object with constructor 'Object'",
+      "    --- property 'items' closes the circle",
+      "--- dag",
+      '{"items":[{"items":[]},{"items":[]}]}',
+      "--- recovered",
+      '{"next":{"next":null}} 36',
+      "",
+    ].join("\n"),
+  );
+});
+
+test("S026: the STATIC walker for a recursive type is capped too", async () => {
+  // A walker for a recursive TYPE recurses at runtime, so a deep but
+  // perfectly ACYCLIC value has unbounded recursion and nothing to do
+  // with cycles. Uncapped this was measured trapping between 5000 and
+  // 10000 links — and trapping UNCATCHABLY, the program's own `try`
+  // never running and its buffered output never flushed, which is the
+  // abort family rather than an exception. Sharing S026's counter with
+  // the seen-stack bracket makes it the same catchable failure the dyn
+  // walker gives, at the same documented depth.
+  //
+  // What the other lanes do here, measured: Node throws a catchable
+  // RangeError at ~4.5k on its default stack, and the C lane serializes
+  // 120000 levels happily before SIGSEGVing somewhere under 300000. So
+  // 1200 links serialize under both of those and throw here — the limit
+  // divergence S026 registers, now on the static path too.
+  const res = await buildWasm(
+    "json-deep-static.ts",
+    [
+      "interface L { next: L | null }",
+      "function build(n: number): L {",
+      "  const head: L = { next: null };",
+      "  let cur: L = head;",
+      "  for (let i = 0; i < n; i++) { const x: L = { next: null }; cur.next = x; cur = x; }",
+      "  return head;",
+      "}",
+      // 999 links is 1000 nested objects: exactly the cap.
+      "for (const d of [999, 1000, 5000]) {",
+      "  try { console.log(d, 'ok', JSON.stringify(build(d)).length); }",
+      "  catch (e) { if (e instanceof RangeError) console.log(d, 'RangeError:', e.message); else console.log(d, 'wrong kind'); }",
+      "}",
+      // The counter resets with the buffer and the seen stack, so an
+      // ordinary value after an over-cap throw still serializes.
+      "console.log('recovered:', JSON.stringify(build(2)));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "999 ok 9004",
+      "1000 RangeError: Maximum call stack size exceeded",
+      "5000 RangeError: Maximum call stack size exceeded",
+      'recovered: {"next":{"next":{"next":null}}}',
+      "",
+    ].join("\n"),
+  );
+});
+
+test("circular structures: the throw reaches the CALLER, and the first one wins", async () => {
+  // Two wrong-answer shapes, both found by review rather than by any
+  // test, and both about the throw's PLUMBING rather than its detection.
+  //
+  //  - THE SITE MUST CHECK. A root that merely CONTAINS a cyclic type
+  //    without being reachable from itself is not itself cycle-capable,
+  //    so a site predicate asking "is the root cyclic?" answered false
+  //    and skipped the pending check — the walk threw, the site returned
+  //    a garbage string, and an unreachable trap followed downstream.
+  //    Outer-over-cyclic-Inner and the tuple root are that shape, for
+  //    the circular TypeError AND for the depth RangeError.
+  //  - THE FIRST THROW WINS. The exception cell is filled
+  //    unconditionally, so a walk that kept going after failing once
+  //    reported whatever failed LAST: `x.a = x; x.b = x` named
+  //    property 'b' where Node names 'a', and a sibling's depth
+  //    RangeError overwrote a circular TypeError outright — which an
+  //    `instanceof TypeError` catch then misses entirely.
+  //
+  // Node's answers, captured by running the same program, except the
+  // holder/depth line: a 2000-deep chain serializes fine under Node
+  // (its limit is ~4.5k) and throws here at the fixed 1000, which is the
+  // limit divergence SEMANTICS.md S026 registers.
+  const res = await buildWasm(
+    "json-circular-plumbing.ts",
+    [
+      "interface Inner { self: Inner | null; tag: string }",
+      "interface Outer { name: string; inner: Inner }",
+      "interface Two { a: Two | null; b: Two | null }",
+      "interface Deep { next: Deep | null }",
+      "interface Mixed { a: Mixed | null; b: Deep | null }",
+      "interface Holder { label: string; deep: Deep }",
+      "function caught(f: () => void): string {",
+      "  try { f(); return 'no throw'; }",
+      "  catch (e) {",
+      "    if (e instanceof TypeError) { const m = (e as Error).message.split('\\n'); return 'TypeError|' + m[0] + '|' + m[m.length - 1]; }",
+      "    if (e instanceof RangeError) return 'RangeError: ' + (e as Error).message;",
+      "    return 'other';",
+      "  }",
+      "}",
+      "function chain(n: number): Deep {",
+      "  const head: Deep = { next: null };",
+      "  let cur: Deep = head;",
+      "  for (let i = 0; i < n; i++) { const x: Deep = { next: null }; cur.next = x; cur = x; }",
+      "  return head;",
+      "}",
+      "const inner: Inner = { self: null, tag: 'i' };",
+      "inner.self = inner;",
+      "const outer: Outer = { name: 'o', inner };",
+      "console.log('outer/circular:', caught(() => { JSON.stringify(outer); }));",
+      "const holder: Holder = { label: 'h', deep: chain(2000) };",
+      "console.log('holder/depth:', caught(() => { JSON.stringify(holder); }));",
+      "const tup: [string, Inner] = ['t', inner];",
+      "console.log('tuple/circular:', caught(() => { JSON.stringify(tup); }));",
+      "const two: Two = { a: null, b: null };",
+      "two.a = two; two.b = two;",
+      "console.log('two-cycles:', caught(() => { JSON.stringify(two); }));",
+      "const mixed: Mixed = { a: null, b: null };",
+      "mixed.a = mixed; mixed.b = chain(2000);",
+      "console.log('kind:', caught(() => { JSON.stringify(mixed); }));",
+      "console.log('recovered:', JSON.stringify({ ok: 1 }));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  const circ = "TypeError|Converting circular structure to JSON|    --- property ";
+  expect(stdout.toString("utf8")).toBe(
+    [
+      `outer/circular: ${circ}'self' closes the circle`,
+      "holder/depth: RangeError: Maximum call stack size exceeded",
+      `tuple/circular: ${circ}'self' closes the circle`,
+      `two-cycles: ${circ}'a' closes the circle`,
+      `kind: ${circ}'a' closes the circle`,
+      'recovered: {"ok":1}',
+      "",
+    ].join("\n"),
+  );
+});
+
 test("S015: keyed reads on unknown see OWN properties only", async () => {
   // Node consults the prototype chain here and answers a real function;
   // every tsinter lane answers undefined because the dyn tree stores own

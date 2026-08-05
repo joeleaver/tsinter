@@ -1067,12 +1067,159 @@ class Assembler {
    * the shape's identity. recordLit allocates with defaults and fills in
    * SOURCE order (JS evaluation order), so canonical layout never
    * reorders effects. Index-signature (overflow) shapes wait on the map
-   * runtime; shapes recursive through their own fields wait on multi-type
-   * rec-group emission. */
+   * runtime.
+   *
+   * A shape RECURSIVE through its own fields cannot be one type-section
+   * entry, because a struct's fields may only name types that already
+   * exist — so the whole strongly-connected component becomes one
+   * REC GROUP: reserve an index per member, define every member (their
+   * fields may now name each other in either direction), close. The group
+   * is exactly the SCC and nothing else, because group membership is part
+   * of a type's canonical identity in wasm — bracketing an unrelated type
+   * in would give it an identity no unbracketed twin could match.
+   *
+   * WHAT COUNTS AS A STRUCT-LEVEL EDGE is narrower than "mentions": only
+   * a record field, or an array whose element chain reaches one, embeds
+   * another shape's struct. A UNION field does not — every union value is
+   * a ref to the one shared base struct, and the per-arm payload subtypes
+   * are separate entries interned at their use sites — so `{ next: N |
+   * null }` is not recursive at this level at all and needs no group. */
 
   private readonly recordInfos = new Map<string, { struct: number; fieldIndex: Map<string, number> } | null>();
   private readonly recordShapes = new Map<string, IrRecordShape>();
   private readonly recordInFlight = new Set<string>();
+  /** Shapes whose struct is a reserved index inside the open span. */
+  private readonly recordReserved = new Map<string, number>();
+  /** A rec-group span is open — spans do not nest (see resolveRecGroup). */
+  private recGroupOpen = false;
+  /** SCC membership, memoized per shape: the set a shape shares a rec
+   * group with, empty when it is not recursive at the struct level. */
+  private readonly recordSccs = new Map<string, ReadonlySet<string>>();
+
+  /** The shapes a type embeds STRUCTURALLY — through record fields and
+   * array elements only. Unions, promises, closures and dyn all route
+   * through a shared struct, so they end the walk. */
+  private structRefs(t: IrType, out: Set<string>): void {
+    if (t.kind === "record") {
+      out.add(t.shapeId);
+      return;
+    }
+    if (t.kind === "array") this.structRefs(t.elem, out);
+  }
+
+  /** Every shape reachable from `shapeId` along those edges. */
+  private structReach(shapeId: string): Set<string> {
+    const seen = new Set<string>();
+    const stack = [shapeId];
+    while (stack.length > 0) {
+      const id = stack.pop()!;
+      const shape = this.recordShapes.get(id);
+      if (shape === undefined) continue;
+      const next = new Set<string>();
+      for (const f of shape.fields) this.structRefs(f.type, next);
+      if (shape.indexValue !== undefined) this.structRefs(shape.indexValue, next);
+      for (const n of next) {
+        if (seen.has(n)) continue;
+        seen.add(n);
+        stack.push(n);
+      }
+    }
+    return seen;
+  }
+
+  /** `shapeId`'s strongly-connected component, or an EMPTY set when the
+   * shape is not on a struct-level cycle. Memoized for every member at
+   * once — they all share one answer. */
+  private recordScc(shapeId: string): ReadonlySet<string> {
+    const hit = this.recordSccs.get(shapeId);
+    if (hit !== undefined) return hit;
+    const forward = this.structReach(shapeId);
+    const scc = new Set<string>();
+    if (forward.has(shapeId)) {
+      scc.add(shapeId);
+      for (const id of forward) {
+        if (id !== shapeId && this.structReach(id).has(shapeId)) scc.add(id);
+      }
+    }
+    for (const id of scc) this.recordSccs.set(id, scc);
+    if (scc.size === 0) this.recordSccs.set(shapeId, scc);
+    return scc;
+  }
+
+  /** Resolve a whole SCC as one rec group. Every member ends up in
+   * `recordInfos` — with a struct on success, null on refusal, and never
+   * a half-built mixture. */
+  private resolveRecGroup(scc: ReadonlySet<string>, loc: SrcLoc | undefined, soft: boolean): void {
+    // Spans do not nest, and a second group opening inside one would
+    // silently merge into it — every entry between begin and end joins
+    // whoever opened first, so the group would stop being the SCC and
+    // two shapes would acquire an identity no unbracketed twin can
+    // match. Nothing reaches here re-entrantly today (`structRefs` stops
+    // at unions, and mapTypeSoft answers a union with the shared base
+    // rather than mapping arms), which is precisely why this is an
+    // assert: the property should fail loudly if it stops holding rather
+    // than survive on the accident that identical groups canonicalize.
+    if (this.recGroupOpen) {
+      throw new Error(`wasm emitter bug: rec group for ${[...scc].sort().join(",")} opened inside another`);
+    }
+    const members = [...scc].sort();
+    // An index-signature member sinks the whole group: its struct needs
+    // the map runtime, and the others cannot be defined without it.
+    for (const id of members) {
+      const shape = this.recordShapes.get(id);
+      if (shape === undefined || shape.indexValue !== undefined) {
+        for (const m of members) this.recordInfos.set(m, null);
+        if (!soft) this.refuseRecord(id, loc);
+        return;
+      }
+    }
+    // PRE-RESOLVE everything the members need that is NOT in the SCC,
+    // OUTSIDE the span — otherwise it would be interned inside and join
+    // the group. A field type that reaches the SCC at all is itself on a
+    // cycle through this member and so is already a member, which is why
+    // this test is exactly "touches the SCC".
+    for (const id of members) {
+      for (const f of this.recordShapes.get(id)!.fields) {
+        const refs = new Set<string>();
+        this.structRefs(f.type, refs);
+        const reachesScc = [...refs].some((r) => scc.has(r) || [...this.structReach(r)].some((s) => scc.has(s)));
+        if (!reachesScc) this.mapTypeSoft(f.type);
+      }
+    }
+    this.recGroupOpen = true;
+    this.mb.beginRecGroup();
+    for (const id of members) {
+      // A frame shape subtypes frameBase, and a reservation cannot carry
+      // a supertype — no corpus program puts a frame on a cycle, so this
+      // asserts rather than handles.
+      if (id.startsWith(FRAME_SHAPE_PREFIX)) {
+        throw new Error(`wasm emitter bug: resumable frame shape ${id} on a struct-level cycle`);
+      }
+      this.recordReserved.set(id, this.mb.reserveType(`record:${id}`));
+    }
+    const built: { id: string; fields: { storage: ValType; mutable: boolean }[] }[] = [];
+    for (const id of members) {
+      const shape = this.recordShapes.get(id)!;
+      // The in-SCC members now resolve to their reservations, and the
+      // vector types an array field needs intern HERE — inside the span,
+      // which is where they belong: a vec of an SCC member is on the
+      // cycle too (vec struct -> buffer array -> member struct).
+      built.push({ id, fields: shape.fields.map((f) => ({ storage: this.mapTypeSoft(f.type), mutable: true })) });
+    }
+    for (const { id, fields } of built) {
+      this.mb.defineType(this.recordReserved.get(id)!, { kind: "struct", fields });
+    }
+    this.mb.endRecGroup();
+    this.recGroupOpen = false;
+    for (const id of members) {
+      const shape = this.recordShapes.get(id)!;
+      this.recordInfos.set(id, {
+        struct: this.recordReserved.get(id)!,
+        fieldIndex: new Map(shape.fields.map((f, i) => [f.name, i])),
+      });
+      this.recordReserved.delete(id);
+    }
+  }
 
   private recordInfo(shapeId: string, loc: SrcLoc | undefined, soft: boolean): { struct: number; fieldIndex: Map<string, number> } | null {
     const cached = this.recordInfos.get(shapeId);
@@ -1080,8 +1227,23 @@ class Assembler {
       if (cached === null && !soft) this.refuseRecord(shapeId, loc);
       return cached;
     }
+    // Mid-group: the reservation IS the answer, which is what lets a
+    // member's fields name the others.
+    const reserved = this.recordReserved.get(shapeId);
+    if (reserved !== undefined) {
+      const shape = this.recordShapes.get(shapeId);
+      if (shape === undefined) throw new Error(`unknown record shape ${shapeId}`);
+      return { struct: reserved, fieldIndex: new Map(shape.fields.map((f, i) => [f.name, i])) };
+    }
     const shape = this.recordShapes.get(shapeId);
     if (shape === undefined) throw new Error(`unknown record shape ${shapeId}`);
+    const scc = this.recordScc(shapeId);
+    if (scc.size > 0) {
+      this.resolveRecGroup(scc, loc, soft);
+      const made = this.recordInfos.get(shapeId) ?? null;
+      if (made === null && !soft) this.refuseRecord(shapeId, loc);
+      return made;
+    }
     if (shape.indexValue !== undefined || this.recordInFlight.has(shapeId)) {
       this.recordInfos.set(shapeId, null);
       if (!soft) this.refuseRecord(shapeId, loc);
@@ -1749,6 +1911,69 @@ class Assembler {
    * their circular detection are their own stage. */
 
   private readonly jsonWriteFns = new Map<string, number>();
+  private readonly jsonCyclicShapes = new Map<string, boolean>();
+
+  /** Can a VALUE of this type take part in a reference cycle the
+   * stringify walk would traverse?
+   *
+   * THIS IS NOT THE REC-GROUP SCC, and the difference is load-bearing. A
+   * rec group asks which structs embed each other, so a union field ends
+   * the walk — every union value is a ref to one shared base. A CYCLE
+   * asks which values can point back, and a union arm carries a payload
+   * like any other reference: `interface L { next: L | null }` needs no
+   * rec group at all and still builds cycles (`a.next = b; b.next = a`),
+   * which Node reports as a circular structure. C draws the same line —
+   * its `traceAdapterC` answers non-null for a traced UNION — and the
+   * corpus program's chain-with-ellipsis case is exactly this shape. */
+  private jsonCyclic(t: IrType): boolean {
+    switch (t.kind) {
+      case "record":
+        return this.jsonCyclicShape(t.shapeId);
+      case "array":
+        return this.jsonCyclic(t.elem);
+      case "union":
+        return this.unionDef(t.unionId).arms.some((a) => this.jsonCyclic(a));
+      default:
+        return false;
+    }
+  }
+
+  /** Is this shape reachable from itself through fields, array elements
+   * and union arms? Memoized; the walk carries its own visited set, so a
+   * shape that merely CONTAINS a recursive one answers honestly. */
+  private jsonCyclicShape(shapeId: string): boolean {
+    const hit = this.jsonCyclicShapes.get(shapeId);
+    if (hit !== undefined) return hit;
+    // Provisional false: a shape re-entered during its own walk is not
+    // itself the answer, the shape that closed the loop is.
+    this.jsonCyclicShapes.set(shapeId, false);
+    const seen = new Set<string>();
+    const reaches = (t: IrType): boolean => {
+      switch (t.kind) {
+        case "record": {
+          if (t.shapeId === shapeId) return true;
+          if (seen.has(t.shapeId)) return false;
+          seen.add(t.shapeId);
+          const s = this.recordShapes.get(t.shapeId);
+          if (s === undefined) return false;
+          return s.fields.some((f) => reaches(f.type)) || (s.indexValue !== undefined && reaches(s.indexValue));
+        }
+        case "array":
+          return reaches(t.elem);
+        case "union":
+          return this.unionDef(t.unionId).arms.some((a) => reaches(a));
+        default:
+          return false;
+      }
+    };
+    const shape = this.recordShapes.get(shapeId);
+    const answer =
+      shape !== undefined &&
+      (shape.fields.some((f) => reaches(f.type)) ||
+        (shape.indexValue !== undefined && reaches(shape.indexValue)));
+    this.jsonCyclicShapes.set(shapeId, answer);
+    return answer;
+  }
 
   /** %w.json.write:<typeKey> — the serializer for one static type. Null
    * (refusal recorded by whichever part failed) when a constituent is out
@@ -1794,6 +2019,20 @@ class Assembler {
         const shape = this.recordShapes.get(t.shapeId);
         const info = this.recordInfo(t.shapeId, loc, false);
         if (shape === undefined || info === null) return false;
+        // A cycle-capable container brackets its body with the detection
+        // stack, and stamps the edge before every member whose own walk
+        // could re-enter. Acyclic shapes emit none of this.
+        const cyclic = this.jsonCyclic(t);
+        const edgeable = (ft: IrType): boolean => cyclic && this.jsonCyclic(ft);
+        if (cyclic) {
+          c.localGet(0);
+          c.i32Const(shape.tuple === true ? 1 : 0);
+          c.call(json.jbEnter());
+          c.i32Eqz();
+          c.ifVoid();
+          c.return_(); // circular: the TypeError is pending
+          c.end();
+        }
         // A TUPLE serializes as the JSON array it is, in index order —
         // JS-exact (`JSON.stringify(["a", 1])` is `["a",1]`). Every
         // position is required (an undefined-armed position takes the
@@ -1812,12 +2051,17 @@ class Assembler {
               c.i32Const(0x2c);
               c.call(json.jbPutc());
             }
+            if (edgeable(f.type)) {
+              c.i32Const(i);
+              c.call(json.jbEdgeIdx());
+            }
             c.localGet(0);
             c.structGet(info.struct, slot);
             c.call(inner);
           }
           this.pushStrLitInto(c, "]");
           c.call(json.jbPuts());
+          if (cyclic) c.call(json.jbLeave());
           return true;
         }
         // Fields serialize in DECLARED order — JS insertion order, which
@@ -1856,12 +2100,17 @@ class Assembler {
             if (inner === null || slot === undefined) return false;
             this.pushStrLitInto(c, `${i === 0 ? "{" : ","}${jsonQuote(f.name)}:`);
             c.call(json.jbPuts());
+            if (edgeable(f.type)) {
+              this.pushStrLitInto(c, f.name);
+              c.call(json.jbEdgeProp());
+            }
             c.localGet(0);
             c.structGet(info.struct, slot);
             c.call(inner);
           }
           this.pushStrLitInto(c, fields.length === 0 ? "{}" : "}");
           c.call(json.jbPuts());
+          if (cyclic) c.call(json.jbLeave());
           return true;
         }
         const first = this.wlocal(w, I32);
@@ -1892,6 +2141,10 @@ class Assembler {
           c.localSet(first);
           this.pushStrLitInto(c, `${jsonQuote(f.name)}:`);
           c.call(json.jbPuts());
+          if (edgeable(f.type)) {
+            this.pushStrLitInto(c, f.name);
+            c.call(json.jbEdgeProp());
+          }
           c.localGet(0);
           c.structGet(info.struct, slot);
           c.call(inner);
@@ -1899,6 +2152,7 @@ class Assembler {
         }
         this.pushStrLitInto(c, "}");
         c.call(json.jbPuts());
+        if (cyclic) c.call(json.jbLeave());
         return true;
       }
       case "array": {
@@ -1907,6 +2161,18 @@ class Assembler {
         if (src === null || inner === null) return false;
         const i = this.wlocal(w, I32);
         const n = this.wlocal(w, I32);
+        // An array whose ELEMENTS can point back at it joins the stack
+        // exactly like a cycle-capable record.
+        const cyclic = this.jsonCyclic(t);
+        if (cyclic) {
+          c.localGet(0);
+          c.i32Const(1);
+          c.call(json.jbEnter());
+          c.i32Eqz();
+          c.ifVoid();
+          c.return_();
+          c.end();
+        }
         this.pushStrLitInto(c, "[");
         c.call(json.jbPuts());
         c.localGet(0);
@@ -1925,6 +2191,10 @@ class Assembler {
         c.i32Const(0x2c);
         c.call(json.jbPutc());
         c.end();
+        if (cyclic) {
+          c.localGet(i);
+          c.call(json.jbEdgeIdx());
+        }
         c.localGet(0);
         c.structGet(src.struct, 1);
         c.localGet(i);
@@ -1939,6 +2209,7 @@ class Assembler {
         c.end();
         this.pushStrLitInto(c, "]");
         c.call(json.jbPuts());
+        if (cyclic) c.call(json.jbLeave());
         return true;
       }
       case "union": {
@@ -6949,10 +7220,22 @@ class Assembler {
         code.call(helper);
         this.releaseScratch(val, v);
         code.call(this.json.jbFinish());
-        // No pending check: every static root the tier admits today is
-        // acyclic and nothing user-written runs mid-walk, so the walkers
-        // are throw-free (the walker family's comment carries the
-        // argument). Cycle-capable roots bring their own check.
+        // Any COMPOSITE root gets the check, deliberately without asking
+        // whether this particular one can throw. The finer question —
+        // "can the walk reach a cycle-capable container?" — is not
+        // `jsonCyclic(root)`: a root that merely CONTAINS a cyclic type
+        // without being reachable from itself throws through a nested
+        // walker while answering false here, and the missing check turns
+        // a pending TypeError into a garbage string (then an unreachable
+        // trap downstream). C asks the reachability version of the
+        // question; the branch is available if it ever matters, but a
+        // hand-maintained predicate is exactly what just went wrong, and
+        // may-throw.ts seeds this node at KIND level for the same reason
+        // — a never-taken check costs one flag read.
+        const rootKind = e.value.type.kind;
+        if (rootKind === "record" || rootKind === "array" || rootKind === "union") {
+          this.emitPendingCheck();
+        }
         this.emitJsonIndent(e);
         return;
       }

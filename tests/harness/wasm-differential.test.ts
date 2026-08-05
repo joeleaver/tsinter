@@ -933,6 +933,30 @@ const TIER_FLOOR: string[] = [
   "2110-top-object-types.ts",
   "2111-json-stringify-unknown.ts",
   "2534-object-rest-decl.ts",
+  // Increment 15 (JSON.stringify), stage C: RECURSIVE record shapes and
+  // the cycles their values admit. A shape that embeds itself cannot be
+  // one type-section entry, so its whole strongly-connected component
+  // becomes one REC GROUP — reserve an index per member, define them all
+  // while their fields name each other, close. And because such a value
+  // can point back at an ancestor, the walkers over cycle-capable
+  // containers bracket their bodies with a seen STACK and stamp the edge
+  // they are about to follow, so a repeat throws V8's circular-structure
+  // TypeError with its message built byte for byte.
+  //
+  // Cycle-capability is NOT rec-group membership: a union arm breaks the
+  // struct cycle (every union value is a ref to one shared base) while
+  // still carrying a payload that can point back, so `{ next: L | null }`
+  // needs no group and detects cycles anyway. 2484's chain case is
+  // exactly that shape.
+  //
+  // `record:recursive` leaves the census with these three. The rest of
+  // the 2480 family was blocked behind it as well as by it, and now
+  // names what it actually still needs: 2485 libCall:insp.circCheck,
+  // 2486 expr:mapNew, 2487 libCall:assert.deepResult, 2488
+  // libCall:math.max.
+  "2480-recursive-record-tree.ts",
+  "2483-recursive-record-cycles.ts",
+  "2484-json-stringify-circular.ts",
 ];
 
 interface RunResult {
