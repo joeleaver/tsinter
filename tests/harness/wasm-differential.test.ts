@@ -839,6 +839,25 @@ const TIER_FLOOR: string[] = [
   "1667-dyn-fn-not-callable.cjs",
   "1668-dyn-fn-throws.cjs",
   "1805-timer-callback-args.ts",
+  // Increment 14 (dyn core), stage 5: prototype-method DISPATCH on a dyn
+  // receiver, and the ERROR encoding both of its producers build.
+  // `recv.m(...)` runs the real method for the receiver's runtime kind —
+  // the Array surface, String's slice and its string-needle searches,
+  // Function's apply/call, an object's own member — and answers Node's
+  // own TypeError wherever the kind's prototype lacks the name. A caught
+  // value crossing into `unknown` becomes the reserved-key `%error`
+  // object through an identity cache, so `instanceof Error`, the
+  // name/message reads and `String(err)` all answer like Node and one
+  // error crossing twice stays ONE value.
+  //
+  // The four here are what the corpus can actually observe: everything
+  // else this stage built is pinned by the wasm emitter unit tests,
+  // because the dyn-dispatch programs print their receivers and the
+  // inspect surface has not landed.
+  "1839-var-js/main.cjs",
+  "2037-fn-decl-hoisting.cjs",
+  "2195-require-missing-package/main.mjs",
+  "2566-promise-reject-dyn-reason.js",
 ];
 
 interface RunResult {

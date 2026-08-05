@@ -332,6 +332,18 @@ const EXC_STR = 3;
 const EXC_REF = 4;
 const EXC_OBJ = 5;
 
+/* `errT`'s field indices (see `exc()`): the vt, then %Error's three IR
+ * fields. Named because the dyn surface reads them from outside this
+ * file — the `%error` encoding is built out of these three slots. */
+const ERR_NAME = 1;
+const ERR_MESSAGE = 2;
+const ERR_CODE = 3;
+
+/** The three `dynInvoke` names whose real receiver is a PROMISE. They
+ * refuse rather than dispatch: a promise box is constructible here, and
+ * its reactions belong to the fiber machinery, not the dyn surface. */
+const PROMISE_REACTION_METHODS = new Set(["then", "catch", "finally"]);
+
 /** The abstract `any` heap type's s33 encoding — every struct/array ref
  * in the module is a subtype, so (ref null ANY_HEAP) is the one payload
  * slot every thrown ref shares. */
@@ -1322,6 +1334,17 @@ class Assembler {
       arrPush: () => this.vecs.pushOne(this.dynVecInfo()),
       arrNewLen: () => this.vecs.newLen(this.dynVecInfo()),
       strCpAt: () => this.strs.cpAt(),
+      errT: () => this.exc().errT,
+      errName: () => ERR_NAME,
+      errMessage: () => ERR_MESSAGE,
+      errCode: () => ERR_CODE,
+      throwError: (c, className, name, pushMessage) =>
+        this.emitSetCellError(c, className, name, pushMessage, null),
+      excKind: () => this.exc().kindG,
+      strCmpU16: () => this.strCmpHelper(true),
+      strSlice: () => this.strs.slice(),
+      strIndexOf: () => this.strs.indexOf(),
+      strMatchAt: () => this.strs.matchAt(),
     });
     return this.dynField;
   }
@@ -1550,6 +1573,19 @@ class Assembler {
         // Already dyn — C's retain, which the GC makes a no-op.
         c.localGet(0);
         return true;
+      case "object": {
+        // The only class the boundary admits is an ERROR (the frontend's
+        // canConvertToDyn gate), and it converts to the reserved-key
+        // encoding through the identity cache — a class rooted anywhere
+        // else has no dyn shape at all and refuses by NAME.
+        if (!this.isErrorRooted(t.className)) {
+          this.refuse(`dynFrom:object:${t.className}`, loc);
+          return false;
+        }
+        c.localGet(0);
+        c.call(dyn.fromError());
+        return true;
+      }
       case "record": {
         const shape = this.recordShapes.get(t.shapeId);
         const info = this.recordInfo(t.shapeId, loc, false);
@@ -2714,6 +2750,18 @@ class Assembler {
    * BUILTIN error hierarchy — scr_error_is as a range check. The bounds
    * are %Error's, which spans every builtin and every user subclass, so
    * this is exactly "does this payload have a name and a message". */
+  /** Is this class an ERROR — a builtin or anything rooted in one? The
+   * preorder interval answers it, the same question `emitErrIntervalTest`
+   * asks at runtime; a user `extends Error` class subtypes `errT`, so its
+   * name/message/%code live in errT's own slots and the `%error`
+   * conversion reads them the same way a builtin's are read. */
+  private isErrorRooted(className: string): boolean {
+    const meta = this.classes.meta(className);
+    const root = this.classes.meta("%Error");
+    if (meta === undefined || root === undefined) return false;
+    return meta.pre >= root.pre && meta.pre <= root.post;
+  }
+
   private emitErrIntervalTest(c: Code): void {
     const meta = this.classes.meta("%Error");
     if (meta === undefined) throw new Error("wasm emitter bug: no %Error in the class graph");
@@ -5638,13 +5686,15 @@ class Assembler {
             // Already dyn — the walkers' identity arm (a retain in C).
             this.walkExpr(e.value);
             return;
+          case "object":
           case "record":
           case "array":
           case "union":
           case "promise": {
             // The composite conversion is a per-typeKey WALKER (the C
             // emitter's sc_td_N): a deep copy for the structured kinds, a
-            // reference box for a promise.
+            // reference box for a promise, the `%error` encoding for an
+            // error instance.
             const h = this.dynFromHelper(vt, e.loc);
             if (h === null) {
               code.unreachable();
@@ -6066,6 +6116,148 @@ class Assembler {
         return;
       }
 
+      /* Prototype-method DISPATCH on a dyn receiver — the same argument
+       * vector `dynCall` builds, handed to the per-METHOD helper that
+       * dispatches on the receiver's runtime kind (dyn.ts's invoke
+       * section holds the ladder). Evaluation order is the receiver, then
+       * the arguments in source order, then the dispatch — JS's, with one
+       * test hoisted out of the helper to keep it so: a NULLISH receiver
+       * throws at the MEMBER GET, which happens before a single argument
+       * is evaluated, so `nul.push(f())` must not run `f`. The helper
+       * keeps the same rung as its own first step for any other caller.
+       * may-throw.ts seeds this node, so the pending checks cover the
+       * whole family — the nullish read, the is-not-a-function refusals,
+       * an argument fence, a callback's own throw. */
+      case "dynInvoke": {
+        if (PROMISE_REACTION_METHODS.has(e.method)) {
+          // `then`/`catch`/`finally` on a dyn receiver: a PROMISE box is
+          // constructible here (dynFrom boxes one by reference), and its
+          // reaction trio rides the fiber machinery rather than anything
+          // in the dyn surface. Refusing by name beats a helper whose
+          // PROMISE arm would have to lie.
+          this.refuse(`dynInvoke:${e.method}`, e.loc);
+          code.unreachable();
+          return;
+        }
+        const dynRef = this.dyn.dynRef();
+        const arrRef = this.dyn.arrRef();
+        const d = this.acquireScratch(dynRef);
+        const a = this.acquireScratch(arrRef);
+        this.walkExpr(e.recv);
+        code.localSet(d);
+        code.localGet(d);
+        code.call(this.dyn.nullishRecv(e.method));
+        this.emitPendingCheck();
+        code.f64Const(0);
+        code.call(this.vecs.newLen(this.dynVecInfo()));
+        code.localSet(a);
+        for (const arg of e.args) {
+          code.localGet(a);
+          this.walkExpr(arg);
+          code.call(this.dyn.arrPush());
+        }
+        code.localGet(d);
+        code.localGet(a);
+        this.pushStrLitInto(code, e.calleeName);
+        code.call(this.dyn.invoke(e.method));
+        this.releaseScratch(arrRef, a);
+        this.releaseScratch(dynRef, d);
+        this.emitPendingCheck();
+        return;
+      }
+
+      /* A catch binding flowing into an `unknown` slot: the exception
+       * snapshot's RUNTIME kind decides, `sc_cd`'s ladder ported. Scalars
+       * convert exactly; an Error-family payload becomes the `%error`
+       * encoding through the identity cache, so one error crossing twice
+       * is one JS value; a thrown DYN value passes back BY REFERENCE (the
+       * traced-throw shape — identity with every other holder); and every
+       * remaining payload becomes an EMPTY object, the documented
+       * approximation. Never throws. */
+      case "caughtToDyn": {
+        const exc = this.exc();
+        const dynRef = this.dyn.dynRef();
+        const c = this.acquireScratch(this.caughtRef());
+        this.walkExpr(e.value);
+        code.localSet(c);
+        const k = this.acquireScratch(I32);
+        code.localGet(c);
+        code.structGet(exc.caughtT, 0);
+        code.localSet(k);
+        const kindIs = (tag: number): void => {
+          code.localGet(k);
+          code.i32Const(tag);
+          code.i32Eq();
+        };
+        kindIs(EXC_F64);
+        code.ifResult(dynRef);
+        this.dyn.boxNum(code, (x) => {
+          x.localGet(c);
+          x.structGet(exc.caughtT, 1);
+        });
+        code.else_();
+        kindIs(EXC_BOOL);
+        code.ifResult(dynRef);
+        // The cell widens a bool into the f64 slot; the box narrows it
+        // back, exactly as `emitThrowValue` widened it.
+        this.dyn.boxBool(code, (x) => {
+          x.localGet(c);
+          x.structGet(exc.caughtT, 1);
+          x.f64Const(0);
+          x.f64Ne();
+        });
+        code.else_();
+        kindIs(EXC_STR);
+        code.ifResult(dynRef);
+        this.dyn.boxStr(code, (x) => {
+          x.localGet(c);
+          x.structGet(exc.caughtT, 2);
+          x.refCast(this.strType);
+        });
+        code.else_();
+        // An OBJ payload inside %Error's interval — a builtin or any
+        // class rooted in one, both of which read their name/message
+        // through errT's slots.
+        code.localGet(k);
+        code.i32Const(EXC_OBJ);
+        code.i32Eq();
+        code.ifResult(I32);
+        code.localGet(c);
+        code.structGet(exc.caughtT, 3);
+        this.emitErrIntervalTest(code);
+        code.else_();
+        code.i32Const(0);
+        code.end();
+        code.ifResult(dynRef);
+        code.localGet(c);
+        code.structGet(exc.caughtT, 2);
+        code.refCast(exc.errT);
+        code.call(this.dyn.fromError());
+        code.else_();
+        // A thrown dyn value comes back as ITSELF. C tests the payload's
+        // retain function; the GC type test asks the same question.
+        code.localGet(c);
+        code.structGet(exc.caughtT, 2);
+        code.refTest(this.dyn.dynT());
+        code.ifResult(dynRef);
+        code.localGet(c);
+        code.structGet(exc.caughtT, 2);
+        code.refCast(this.dyn.dynT());
+        code.else_();
+        // Records, arrays, closures, unions and non-error classes are
+        // type-erased in the cell, so there is nothing to walk: the
+        // EMPTY object approximation, SEMANTICS.md S022.
+        this.dyn.boxObj(code, (x) => this.dyn.pushNewObj(x, false));
+        code.end();
+        code.end();
+        code.end();
+        code.end();
+        code.end();
+        this.releaseScratch(I32, k);
+        this.releaseScratch(this.caughtRef(), c);
+        return;
+      }
+
       /* Kind tests on a dyn value (`typeof u === "string"`,
        * `Array.isArray(u)`, `if (u)`): inline compares on the tag —
        * nothing allocates and nothing can throw. A passing test does NOT
@@ -6075,9 +6267,12 @@ class Assembler {
       case "dynTest": {
         if (e.test === "error") {
           // `u instanceof Error` is the dyn tree's reserved "%error"
-          // object encoding, which arrives with caughtToDyn.
-          this.refuse("dynTest:error", e.loc);
-          code.unreachable();
+          // object encoding and nothing else — the marker's presence IS
+          // the test (nodes.ts), because only caughtToDyn and the
+          // error-rooted dynFrom mint one.
+          this.walkExpr(e.value);
+          code.call(this.dyn.isError());
+          if (e.negated === true) code.i32Eqz();
           return;
         }
         if (e.test === "truthy") {
@@ -6507,12 +6702,9 @@ class Assembler {
       /* The dynamic-keyed record surface rides the overflow map. */
       case "recordKeyGet":
       case "recordOvfKeys":
-      /* The caught→dyn conversion waits on the dyn surface. */
-      case "caughtToDyn":
       /* The dyn surface past the scalar core: the composite converters,
        * the keyed reads, and the invoke boundary. */
       case "dynFromJsval":
-      case "dynInvoke":
       case "jsonStringify":
       /* The island bridge — an engine embedding, so likely never on this
        * backend at all. */

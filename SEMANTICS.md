@@ -296,9 +296,8 @@ definition, so it agrees with Node wherever the member genuinely exists,
 string receivers included; it parts company only where S016's padding
 invents members Node left as holes.) The named forms that DO work are
 the ones the runtime models directly: `length` on arrays and strings,
-canonical index reads, and —
-once the invoke surface lands — prototype METHOD CALLS, which dispatch on
-the receiver's kind rather than reading a member. **Rationale:** inherited
+canonical index reads, and prototype METHOD CALLS, which dispatch on the
+receiver's kind rather than reading a member (S023's surface). **Rationale:** inherited
 from the C runtime's dyn tree, which stores own entries and has no
 prototype chain; giving it one means materializing Object/Array/String
 prototypes as real function values on every lane, which is a feature
@@ -332,6 +331,15 @@ answers `["0","1","2","3"]` here and `["0","3"]` in Node, and `'1' in a`
 and `Object.hasOwn(a, '1')` answer `true` here and `false` there. Values
 and entries follow keys. This is the SILENT one — nothing throws, the
 program simply enumerates members Node never created.
+
+The index write is not the only route to a padded slot. `map` binds its
+output to the length it captured before the first step (the spec's own
+shape), so a callback that SHRINKS the receiver leaves the steps it
+skipped holding `undefined` where Node leaves holes: `a.map(cb)` on
+`JSON.parse('[1,2,3,4]')` with a `cb` that pops twice answers
+`length === 4`, `join` `"2,4,,"` and `r[2]` `undefined` on both, and
+parts company only at `Object.keys` — `["0","1","2","3"]` here,
+`["0","1"]` in Node. Same storage fact, same silence.
 
 **A non-index key throws where Node writes.** `a['nope'] = 1` raises a
 catchable "Cannot create property 'nope' on array" (V8's strict-mode
@@ -556,3 +564,268 @@ which pins every case above with Node's answer beside it in a comment —
 the S014 argument, since no corpus program can pin any of it: one whose
 output observed the divergence would fail the differential on every lane
 by construction.
+
+## S021 — A caught Error crossing into `unknown` becomes an object whose members ENUMERATE *(inherited)*
+
+The checked-dynamic tree has no notion of a non-enumerable property, so
+the error encoding both of its producers build — `caughtToDyn` and the
+error-rooted `dynFrom` — stores its parts as ordinary own members: the
+reserved marker `%error`, then `name`, `message`, and `code` where one
+is stamped. Node's `Error` carries `name` and `message` as
+non-enumerable own (or prototype) properties and has no marker at all,
+so every enumeration surface parts company. On a `TypeError("boom")`
+that crossed the boundary, `Object.keys` answers
+`["%error","name","message"]` here and `[]` in Node,
+`JSON.stringify` answers `{"%error":true,"name":"TypeError",
+"message":"boom"}` where Node answers `{}`, and `"%error" in err` and
+`Object.hasOwn(err, "name")` are true here and false (respectively
+false and false) there. `for...in` and `Object.values`/`entries` follow
+`keys`.
+
+WHAT AGREES, because the encoding was designed around these: `String(err)`
+is Error.prototype.toString over the same two members and byte-exact
+including its empty-side rules ("Weird" for a message-less error, the
+message alone for a name-less one); `err instanceof Error` is the marker
+test and answers true; `typeof` is "object" and the value is truthy; a
+user `extends Error` class keeps its own `name` through the crossing; and
+IDENTITY holds — one error crossing twice compares `===` equal, because
+both producers go through the same per-error cache the C runtime spells
+`scr_errdyn_cache`.
+
+`err.name` and `err.message` read what Node reads AT THE FIRST CROSSING,
+and only then. The encoding COPIES both strings into the object it
+builds, and the identity cache above then pins that object, so a
+`err.message = "MUTATED"` performed on the typed error after it crossed
+is invisible on every dyn read — including a second crossing, which
+answers the cached box rather than rebuilding it. `try { throw new
+TypeError("boom") } catch (e)`, cross, mutate, cross again: both dyn
+views read "TypeError"/"boom" here and "Renamed"/"MUTATED" in Node,
+while `===` between them holds on both. Write-through is not a fix
+within this design — the box would have to ALIAS the error rather than
+copy it, which is S014's shape and S014's answer.
+
+**Rationale:** inherited from the C runtime's dyn tree, and the same
+shape of missing feature as S016's holes: a non-enumerable bit is a
+second storage plane that `Object.keys`, the enumeration walks, JSON and
+the inspect surface would each have to consult, with its own ordering
+question. The marker specifically cannot hide behind that bit either —
+it is what `instanceof Error` reads. Upstream cites this encoding as
+"SEMANTICS.md 67" in half a dozen places (`caughtToDynHelper`, the
+`caughtToDyn` and `dynTest` node docs, three lowering sites); that number
+belongs to the register they never shipped and resolves to NOTHING on
+this file, so S021 and S022 are its replacement, verified empirically
+against both lanes rather than transcribed. The marker's other cost —
+a user object that spells `%error` itself — is S025. **Tested by:** the wasm emitter
+unit test, with Node's answers beside ours; the C lane reproduces every
+line of it, verified by running both. No corpus program can pin it — one
+whose output observed the divergence would fail the differential on
+every lane by construction.
+
+## S022 — A non-Error exception payload crossing into `unknown` becomes an EMPTY object *(inherited)*
+
+The exception cell type-erases everything that is not a scalar, an error
+or a dyn value: a record, an array, a closure, a union, a class instance
+rooted outside the error hierarchy all arrive as one untyped reference
+with no runtime shape to walk. `caughtToDyn` therefore answers a fresh
+EMPTY dyn object for them — truthy, `typeof "object"`, `String()`
+"[object Object]", `Object.keys` empty, every field unreadable. So
+`try { throw { a: 1 } } catch (e) { const u: unknown = e; }` reads
+`u.a` as `undefined` here and `1` in Node, and a thrown array answers
+`Array.isArray` false here and true there.
+
+The neighbours are exact. Scalars convert to their own dyn kinds
+(`throw 42`, `throw "s"`, `throw false`), errors take S021's encoding,
+and a thrown DYN value passes back BY REFERENCE — `throw u` then
+catching into `unknown` yields the very same value, `===` to the
+original, with its members and `Array.isArray` intact, which is what
+keeps the traced-throw idiom honest.
+
+**Rationale:** inherited from the C runtime, whose `sc_cd` walker has
+the same three arms and the same fallthrough — and which cites the
+dangling "SEMANTICS.md 67" for this arm too (see S021's rationale). Converting the rest means
+the cell carrying a per-payload to-dyn walker beside the reference — a
+type tag the throw site would have to stamp and the catch site dispatch
+on, which is a representation change rather than a fix, and one no
+corpus program has ever wanted. **Tested by:** the wasm emitter unit
+test; `1554-caught-into-unknown.ts` exercises the agreeing arms
+differentially on the native lanes (its mode 7 `throw { a: 1 }` prints
+only "truthy other", which both worlds agree on). No corpus program can
+pin the divergence itself.
+
+## S023 — The dyn INVOKE surface fences unmodeled (kind, method) pairs at RUNTIME *(inherited)*
+
+`recv.m(...)` on a checked-dynamic receiver dispatches on the receiver's
+runtime KIND, so which pairs are implemented cannot be decided at compile
+time — the tier's usual named refusal has nothing to name. A pair the
+prototype really declares but this tier does not implement therefore
+throws a LOUD, catchable, plain `Error` (never a `TypeError`, so a
+handler testing for one is not misled), and never a wrong answer. Node
+answers all of these:
+
+- `'String.prototype.at'` and `'String.prototype.concat'` on a dyn
+  string — `"'String.prototype.at' on a dynamic value is not supported
+  yet"`.
+- `indexOf`, `lastIndexOf` and `includes` on a dyn STRING whose needle is
+  not itself a string: Node applies ToString, this tier has no coercion.
+  With a string needle all three are exact, `fromIndex` included.
+- Any INDEX argument that is not a number, on any receiver — `a.slice("x")`,
+  `a.at(true)`, `a.indexOf(1, "2")` — raises the `TypeError`
+  `"<callee>: non-number index arguments on a dynamic receiver are not
+  supported yet"`. A missing index takes its default and a number
+  truncates toward zero, both JS-exact — including the three rules that
+  differ by method, which are implemented rather than approximated. A
+  NUMBER index is relative on `Array.prototype` (negatives count from
+  the end) and clamped on `String.prototype` (they do not). NaN reads as
+  0 everywhere except `String.prototype.lastIndexOf`, where ToNumber
+  sends it to +∞ and the whole string is searched. And an explicit
+  `undefined` index coincides with an absent one everywhere except
+  `Array.prototype.lastIndexOf`, whose spec branches on argument
+  PRESENCE rather than value: `[1,2,3,1,2,3].lastIndexOf(2, undefined)`
+  coerces to 0 and answers -1, where the absent form starts at the last
+  index and answers 4.
+- `f.apply(thisArg, argsArray)` where `argsArray` is an OBJECT rather
+  than an array — an array-LIKE, which Node walks through
+  CreateListFromArrayLike's `length` and index reads and calls
+  successfully. This tier reads neither, so it raises
+  `"'Function.prototype.apply' with an array-like argsArray on a dynamic
+  value is not supported yet"` rather than borrowing a message for a case
+  Node answers. A PRIMITIVE `argsArray` is NOT fenced: `f.apply(null,
+  "ab")` raises `TypeError: CreateListFromArrayLike called on
+  non-object`, which is Node's own answer there, verified.
+
+Everything else about the surface is Node's own answer, including the
+refusals: a name the receiver's prototype lacks throws Node's
+"<callee> is not a function" (S018 governs the spelling), a nullish
+receiver throws "Cannot read properties of undefined (reading 'm')" —
+and throws it at the MEMBER GET, before an argument is evaluated, so
+`nul.push(sideEffect())` runs nothing before it. The implemented Array,
+String-slice and Function apply/call semantics are Node's own up to the
+divergences registered elsewhere: `map`'s padded output slots (S016),
+`sort`'s comparison sequence, its mutating-comparator case and its
+comparator-result coercion (S024).
+
+**Rationale:** mostly inherited — the C runtime fences the first three
+with exactly these texts, and the fences are TODO markers rather than
+stances: each is one coercion (ToString, ToNumber) away from being
+implementable, and coercion over an arbitrary dyn value is its own
+increment. The alternative — refusing every dyn `.at()` at compile time
+because the receiver MIGHT be a string — would take the implemented
+array path down with it. The `apply` fence is this lane's own: the C
+runtime throws CreateListFromArrayLike's TypeError for an array-like
+object as well, which reads as Node's answer and is not one, so the
+loud fence replaces it here rather than inheriting a message that
+misdescribes a case Node serves. **Tested by:** the wasm emitter unit
+test pins each text; the C lane throws the first three verbatim,
+verified by running both. No corpus program can pin them: a program
+reaching one would fail the differential against Node on every lane.
+
+**Five places this lane is Node-exact where the C runtime is not**, noted
+here because a reader comparing the lanes will meet them. The
+callable-callback gate renders its operand with V8's TYPED wording
+(`arr.map(5)` says "number 5 is not a function", and a string operand
+`string "abc" is not a function`) where the C runtime renders the
+value's ToString image. `sort`'s DEFAULT comparator orders the
+ToString images by UTF-16 code UNIT, ECMAScript's own order, where the C
+runtime's UTF-8 storage makes the same comparison code-POINT order —
+S005's divergence, which the flagged comparator exists to avoid.
+`sort`'s comparator GATE renders the value it rejected the way V8 builds
+a message — without running user code, so `#<Object>` and
+`[object Array]` — where the C runtime renders ToString ("[object
+Object]", "9,8"). The fromIndex argument of `indexOf`, `lastIndexOf` and
+`includes` is threaded on both receivers, with each method's own rule;
+the C runtime ignores the argument entirely (`[1,2,3,1].indexOf(1, 1)`
+answers 3 here and Node, 0 there). And a NULLISH receiver throws at the
+member get, before the arguments run, where the C runtime evaluates them
+first. All five are gaps in the C lane rather than stances, and are
+tracked as such.
+
+## S024 — `sort`'s ORDER is Node-exact; its comparison SEQUENCE is not *(inherited)*
+
+`Array.prototype.sort` over a dyn receiver is a stable merge sort, where
+V8 runs TimSort. For every consistent comparator that ANSWERS IN NUMBERS
+OR BOOLEANS the two agree on the answer — same order, same stability,
+same identity (`a.sort() === a`), verified across 74 outputs spanning
+lengths 0 to 33 plus duplicate-heavy, reverse-sorted and pre-sorted
+shapes with both the default and a numeric
+comparator. What differs is HOW MANY TIMES the comparator runs and in
+what pairing, which a comparator with side effects can see:
+`[3,1,2].sort(counting)` calls it 4 times in Node, 3 on the C lane and 3
+here; `[5,4,3,2,1]` is 4 / 7 / 5; `[5,2,8,1,9,3,7,4,6,0,11,10]` is
+29 / 29 / 31. The wasm lane's count differs from the C lane's as well,
+because its merge runs bottom-up where C's recurses — neither is
+"the" answer, and there is no answer to match short of reimplementing
+TimSort.
+
+The qualifier in that first sentence is the second divergence.
+A comparator's RESULT is read from the shared numeric slot, which
+numbers and booleans fill and no other kind does — C's rule, inherited —
+so a comparator answering anything else reads as 0 at every pair and
+sorts NOTHING. The reachable case is a string-returning comparator,
+which is perfectly consistent and which Node handles by applying
+ToNumber to the result: `[3,1,2].sort((x, y) => x < y ? "-1" : "1")`
+answers `1,2,3` in Node and `3,1,2` here, silently. (Full ToNumber over
+an arbitrary dyn value is the same rock S023's index-argument fence
+names — one coercion away, and its own increment.) An INCONSISTENT
+comparator is outside the claim entirely, as ECMA-262 leaves it
+implementation-defined: a boolean `(x, y) => x > y` never answers
+negative, and `[3,1,2]` sorted with it is `1,2,3` here and `3,1,2` in
+Node.
+
+A comparator that MUTATES the receiver is the same fact at its loudest.
+Both tiers sort a SNAPSHOT (the spec's shape, and what keeps a mutating
+comparator from reordering the elements being compared), then write the
+result back index by index for as many indices as the receiver still
+has — so a comparator that shrinks the array keeps the shrink, where V8
+writes its whole snapshot back and RESTORES the removed elements:
+`[5,3,9,1,7,2]` with a comparator that pops twice answers
+`1,2,3,5,7,9` (length 6) in Node and `1,2,3,5` (length 4) on both tiers.
+
+**Rationale:** ECMA-262 leaves both the algorithm and the mutating-
+comparator case implementation-defined, so neither is a conformance
+question; matching V8's observable comparison sequence would mean
+shipping TimSort, which is a performance-and-fidelity feature nobody has
+asked for and a much larger surface to get wrong than a merge whose
+ORDER is provably right. The result coercion is the one arm here that IS
+a conformance gap rather than a licensed choice — the spec's step is
+plainly ToNumber — and it is inherited exactly: the C runtime reads the
+same two kinds from the same union slot, so narrowing the claim keeps
+the lanes describable together while the coercion increment is
+outstanding. **Tested by:** the wasm emitter unit test pins the
+ordering, the stability, the receiver identity — the properties that ARE
+specified — and the string-comparator result, with Node's answer beside
+ours. No corpus program can pin the sequence: one that counted
+comparisons would fail the differential against Node on every lane.
+
+## S025 — A dyn object carrying the reserved `%error` key IS an error *(inherited)*
+
+S021's encoding marks an error with an ordinary own member named
+`%error`, and nothing reserves that name on the way IN. A dyn object
+that happens to carry it is therefore classified as an error by every
+surface that reads the marker — and `JSON.parse` over untrusted input
+reaches it directly. On
+`JSON.parse('{"%error":true,"name":"Fake","message":"m"}')`,
+`u instanceof Error` answers true where Node answers false, and
+`String(u)` renders Error.prototype.toString's `"Fake: m"` where Node
+renders `"[object Object]"`. Only the marker's PRESENCE is consulted,
+never its value, so `{"%error":1}` and `{"%error":false}` are errors
+here too; with no `name` or `message` beside it, `String(u)` is the
+EMPTY string (Error.prototype.toString over two absent members) against
+Node's `"[object Object]"`. `typeof` and `Object.keys` agree with Node
+throughout — the key really is an own member on both sides, which is
+S021's other half seen from this direction.
+
+**Rationale:** inherited — the C runtime uses the same marker and
+reproduces every line above, verified by running it. The marker cannot
+hide behind a non-enumerable bit for the reason S021's rationale gives
+(it is what `instanceof Error` reads), so a reserved key with no
+reservation is what the encoding costs. Fixing it means either that
+second storage plane or a marker user data cannot spell — a sentinel
+OBJECT identity in place of a string key, which the entry table's
+`memcmp` walk has no way to compare today. Both are representation
+changes rather than repairs. The `%` prefix is at least not a name
+idiomatic JS data uses, which is presumably why upstream picked it; this
+entry records that "not idiomatic" is not "not reachable". **Tested by:**
+the wasm emitter unit test, with Node's answers beside ours; the C lane
+reproduces it. No corpus program can pin it — one whose output observed
+the divergence would fail the differential on every lane by
+construction.

@@ -87,6 +87,15 @@ export class Code {
     this.w.uleb(0x16);
     this.w.sleb(typeIndex);
   }
+  /** ref.test (ref $t) → i32 — refCast's total twin, for the one place
+   * that ASKS rather than knows: a type-erased exception payload, where
+   * the answer decides which arm runs. Null answers 0 (the non-nullable
+   * form), which is what every caller wants. */
+  refTest(typeIndex: number): void {
+    this.w.u8(0xfb);
+    this.w.uleb(0x14);
+    this.w.sleb(typeIndex);
+  }
   drop(): void {
     this.w.u8(0x1a);
   }

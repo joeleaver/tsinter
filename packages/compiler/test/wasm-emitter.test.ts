@@ -1594,6 +1594,718 @@ test("S020: f.name is the BOX SITE's binding and f.length the DECLARED count", a
   );
 });
 
+test("dyn invoke: the Array surface a dyn receiver dispatches to", async () => {
+  // Every Array.prototype name the frontend's dispatch allowlist admits,
+  // over a JSON.parse receiver. All of it is Node-exact — the C lane
+  // prints the same lines, verified against a C-lane build — so this
+  // pins semantics the corpus cannot: the programs that exercise dyn
+  // dispatch all print their receivers, and the inspect surface has not
+  // landed.
+  const res = await buildWasm(
+    "dyn-invoke-arr.ts",
+    [
+      "const a: any = JSON.parse('[3,1,2]');",
+      "const out: string[] = [];",
+      "out.push('push ' + String(a.push(9)) + ' ' + String(a.join('-')));",
+      "out.push('pop ' + String(a.pop()) + ' shift ' + String(a.shift()));",
+      "out.push('unshift ' + String(a.unshift(7, 8)) + ' ' + String(a.join(',')));",
+      "out.push('slice ' + String(a.slice(1, 3).join('|')) + ' neg ' + String(a.slice(-2).join('|')));",
+      "out.push('at ' + String(a.at(0)) + ' ' + String(a.at(-1)) + ' ' + String(a.at(99)));",
+      "out.push('indexOf ' + String(a.indexOf(2)) + ' ' + String(a.indexOf(404)));",
+      "out.push('lastIndexOf ' + String(a.lastIndexOf(1)) + ' includes ' + String(a.includes(8)));",
+      "out.push('concat ' + String(a.concat([100], 200).join(',')));",
+      "out.push('reverse ' + String(a.reverse().join(',')));",
+      // A null or undefined ELEMENT joins as empty — Array.prototype
+      // .join's own rule, one level down from toStr's array arm.
+      "const holes: any = JSON.parse('[1,null,3]');",
+      "out.push('holes [' + String(holes.join(',')) + '] nested [' + String(JSON.parse('[[1,2],[3]]').join(';')) + ']');",
+      "const empty: any = JSON.parse('[]');",
+      "out.push('empty ' + String(empty.pop()) + ' ' + String(empty.shift()) + ' [' + String(empty.join(',')) + ']');",
+      "console.log(out.join('\\n'));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "push 4 3-1-2-9",
+      "pop 9 shift 3",
+      "unshift 4 7,8,1,2",
+      "slice 8|1 neg 1|2",
+      "at 7 2 undefined",
+      "indexOf 3 -1",
+      "lastIndexOf 2 includes true",
+      "concat 7,8,1,2,100,200",
+      "reverse 2,1,8,7",
+      "holes [1,,3] nested [1,2;3]",
+      "empty undefined undefined []",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("dyn invoke: callbacks see (elem, i, receiver), and sort is the spec's", async () => {
+  // The callback family calls through the boxed thunk (stage 4's
+  // machinery), so a TYPED callback validates each argument on the way
+  // in. sort answers the RECEIVER by identity, sinks undefined before
+  // any comparison, and orders by ToString image by default — which the
+  // C runtime compares in code-POINT order and this lane in UTF-16 code
+  // UNITS, ECMAScript's own (S005's flag, and S023's closing note). The
+  // two agree on everything below; they part company only across the
+  // surrogate boundary, which no corpus program touches.
+  const res = await buildWasm(
+    "dyn-invoke-cb.ts",
+    [
+      "const a: any = JSON.parse('[3,1,2]');",
+      "const out: string[] = [];",
+      "a.forEach(function (v: number, i: number, self: unknown): void {",
+      "  out.push('fe ' + String(v) + '@' + String(i) + ' arr=' + String(Array.isArray(self)));",
+      "});",
+      "out.push('map ' + String(a.map(function (v: number): number { return v * 2; }).join(',')));",
+      "out.push('filter ' + String(a.filter(function (v: number): boolean { return v > 1; }).join(',')));",
+      "out.push('some ' + String(a.some(function (v: number): boolean { return v === 2; })) +",
+      "  ' ' + String(a.some(function (v: number): boolean { return v === 99; })));",
+      "out.push('every ' + String(a.every(function (v: number): boolean { return v > 0; })) +",
+      "  ' ' + String(a.every(function (v: number): boolean { return v > 2; })));",
+      "out.push('find ' + String(a.find(function (v: number): boolean { return v < 3; })) +",
+      "  ' ' + String(a.find(function (v: number): boolean { return v > 99; })));",
+      "out.push('findIndex ' + String(a.findIndex(function (v: number): boolean { return v === 2; })) +",
+      "  ' ' + String(a.findIndex(function (v: number): boolean { return v === 99; })));",
+      "const s1: any = JSON.parse('[10,9,1,2]');",
+      "out.push('default ' + String(s1.sort().join(',')) + ' identity ' + String(s1.sort() === s1));",
+      "const s2: any = JSON.parse('[10,9,1,2]');",
+      "out.push('cmp ' + String(s2.sort(function (x: number, y: number): number { return x - y; }).join(',')));",
+      // Stability: equal keys keep first-seen order, so the ORIGINAL
+      // spelling of each one-character key survives the sort.
+      "const s3: any = JSON.parse('[\"b\",\"a\",\"c\",\"aa\"]');",
+      "out.push('str ' + String(s3.sort().join(',')));",
+      // undefined sinks; null does NOT — it sorts by its text.
+      "const s4: any = JSON.parse('[3,null,1]');",
+      "s4.push(undefined);",
+      "out.push('sink ' + String(s4.sort().join(',')) + ' len ' + String(s4.length));",
+      "console.log(out.join('\\n'));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "fe 3@0 arr=true",
+      "fe 1@1 arr=true",
+      "fe 2@2 arr=true",
+      "map 6,2,4",
+      "filter 3,2",
+      "some true false",
+      "every true false",
+      "find 1 undefined",
+      "findIndex 2 -1",
+      "default 1,10,2,9 identity true",
+      "cmp 1,2,9,10",
+      "str a,aa,b,c",
+      "sink 1,3,, len 4",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("dyn invoke: the callback family binds `length` ONCE, like the spec", async () => {
+  // ECMA-262 binds `len` before the Repeat, so an element the callback
+  // APPENDS is never visited — verified against Node for all seven.
+  // The C runtime re-reads the length as its loop limit and does visit
+  // them (it would print steps=5 and a five-element array on every line
+  // but `every`'s), which is a bug rather than a stance, so this lane
+  // does not inherit it. The elements stay live in the other direction:
+  // an in-place write mid-loop IS seen, because each step re-reads the
+  // slot.
+  const res = await buildWasm(
+    "dyn-invoke-len.ts",
+    [
+      "const out: string[] = [];",
+      "function grow(m: string): string {",
+      "  const a: any = JSON.parse('[1,2]');",
+      "  let steps = 0;",
+      "  const cb = function (v: number): boolean {",
+      "    steps = steps + 1; if (steps < 4) { a.push(v + 10); } return false;",
+      "  };",
+      "  if (m === 'forEach') a.forEach(cb);",
+      "  else if (m === 'map') a.map(cb);",
+      "  else if (m === 'filter') a.filter(cb);",
+      "  else if (m === 'some') a.some(cb);",
+      "  else if (m === 'every') a.every(cb);",
+      "  else if (m === 'find') a.find(cb);",
+      "  else a.findIndex(cb);",
+      "  return m + ' steps=' + String(steps) + ' arr=' + String(a.join(','));",
+      "}",
+      "for (const m of ['forEach', 'map', 'filter', 'some', 'every', 'find', 'findIndex']) out.push(grow(m));",
+      "const ip: any = JSON.parse('[1,2,3]');",
+      "const seen: string[] = [];",
+      "ip.forEach(function (v: number, i: number): void { seen.push(String(v)); if (i === 0) { ip[2] = 99; } });",
+      "out.push('inplace ' + seen.join(','));",
+      "console.log(out.join('\\n'));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      // Two steps each: the callback's pushes land past the bound length.
+      "forEach steps=2 arr=1,2,11,12",
+      "map steps=2 arr=1,2,11,12",
+      "filter steps=2 arr=1,2,11,12",
+      "some steps=2 arr=1,2,11,12",
+      // `every` short-circuits on the first falsy answer, so it takes one.
+      "every steps=1 arr=1,2,11",
+      "find steps=2 arr=1,2,11,12",
+      "findIndex steps=2 arr=1,2,11,12",
+      "inplace 1,2,99",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("S023: the dyn invoke ladder — Node's refusals, and the fences that are ours", async () => {
+  // The four rungs, in order. Everything here but the three
+  // "not supported yet" lines is Node's own answer, byte for byte;
+  // those three are S023, and they are plain Errors rather than
+  // TypeErrors precisely so a handler testing for one is not misled.
+  // The callable-callback gate is the one place this lane leaves the C
+  // runtime behind: V8 names the operand's TYPE ("number 5",
+  // `string "abc"`) where the C runtime renders its ToString image.
+  const res = await buildWasm(
+    "dyn-invoke-ladder.ts",
+    [
+      "function msg(f: () => void): string {",
+      "  try { f(); return '(no throw)'; } catch (e) { return (e as Error).name + ': ' + (e as Error).message; }",
+      "}",
+      "const arr: any = JSON.parse('[1,2]');",
+      "const str: any = JSON.parse('\"abc\"');",
+      "const num: any = JSON.parse('5');",
+      "const obj: any = JSON.parse('{\"a\":1}');",
+      "const nul: any = JSON.parse('null');",
+      "const out: string[] = [];",
+      "out.push(msg(() => { nul.push(1); }));",
+      "out.push(msg(() => { arr.nope(); }));",
+      "out.push(msg(() => { str.push(1); }));",
+      "out.push(msg(() => { num.push(1); }));",
+      "out.push(msg(() => { obj.push(1); }));",
+      "out.push(msg(() => { str.at(0); }));",
+      "out.push(msg(() => { str.indexOf(1); }));",
+      "out.push(msg(() => { arr.slice('x'); }));",
+      "out.push('str.slice ' + String(str.slice(1)) + ' indexOf ' + String(str.indexOf('b')) +",
+      "  ' lastIndexOf ' + String(str.lastIndexOf('c')) + ' includes ' + String(str.includes('bc')));",
+      "out.push(msg(() => { arr.map(5); }));",
+      "out.push(msg(() => { arr.map(str); }));",
+      "out.push(msg(() => { arr.map(obj); }));",
+      "out.push(msg(() => { arr.forEach(); }));",
+      "out.push(msg(() => { arr.sort(5); }));",
+      "out.push(msg(() => { arr.sort(obj); }));",
+      "out.push(msg(() => { arr.sort(JSON.parse('[9,8]')); }));",
+      "console.log(out.join('\\n'));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      // Rung four: a nullish receiver never reaches the member at all.
+      "TypeError: Cannot read properties of null (reading 'push')",
+      // Rung three: the name is on no prototype this kind has.
+      "TypeError: arr.nope is not a function",
+      "TypeError: str.push is not a function",
+      "TypeError: num.push is not a function",
+      "TypeError: obj.push is not a function",
+      // Rung two, S023: real on String.prototype, unimplemented here.
+      "Error: 'String.prototype.at' on a dynamic value is not supported yet",
+      "Error: 'String.prototype.indexOf' on a dynamic value is not supported yet",
+      "TypeError: arr.slice: non-number index arguments on a dynamic receiver are not supported yet",
+      // Rung one: the implemented String pairs, exact.
+      "str.slice bc indexOf 1 lastIndexOf 2 includes true",
+      // The callback gate, V8's typed wording. Node agrees with every
+      // line; the C runtime says "5", "abc" and "[object Object]".
+      "TypeError: number 5 is not a function",
+      'TypeError: string "abc" is not a function',
+      "TypeError: object is not a function",
+      "TypeError: undefined is not a function",
+      // sort's own gate folds the whole VALUE in instead of naming its
+      // type — V8's choice here, and not the value's `String()` either:
+      // a message must not run user code, so an object is "#<Object>"
+      // and an array "[object Array]". Node says each of these.
+      "TypeError: The comparison function must be either a function or undefined: 5",
+      "TypeError: The comparison function must be either a function or undefined: #<Object>",
+      "TypeError: The comparison function must be either a function or undefined: [object Array]",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("dyn invoke: fromIndex, and the SameValueZero `includes` alone uses", async () => {
+  // Argument 1 of indexOf/lastIndexOf/includes, on both receivers that
+  // have the methods. Every line is Node's, verified — and the two
+  // receivers do NOT share a rule: an array's fromIndex is RELATIVE
+  // (negatives count from the end), a string's is CLAMPED to [0, len],
+  // and NaN reads as 0 on both except String.lastIndexOf, whose
+  // ToNumber sends it to +infinity. The C lane threads none of this
+  // (it ignores the argument entirely) — task-tracked separately.
+  const res = await buildWasm(
+    "dyn-invoke-fromindex.ts",
+    [
+      "const a: any = JSON.parse('[1,2,3,1,2,3]');",
+      "const s: any = JSON.parse('\"abcabc\"');",
+      "const out: string[] = [];",
+      "out.push('arr idx ' + String(a.indexOf(1)) + ' ' + String(a.indexOf(1, 1)) + ' ' +",
+      "  String(a.indexOf(2, 3)) + ' ' + String(a.indexOf(1, -2)) + ' ' + String(a.indexOf(1, 99)));",
+      "out.push('arr last ' + String(a.lastIndexOf(1)) + ' ' + String(a.lastIndexOf(1, 2)) + ' ' +",
+      "  String(a.lastIndexOf(3, -4)) + ' ' + String(a.lastIndexOf(1, -99)) + ' ' + String(a.lastIndexOf(1, 99)));",
+      "out.push('arr inc ' + String(a.includes(1, 1)) + ' ' + String(a.includes(1, 4)) + ' ' +",
+      "  String(a.includes(3, -1)) + ' ' + String(a.includes(1, -99)));",
+      "out.push('str idx ' + String(s.indexOf('a')) + ' ' + String(s.indexOf('a', 1)) + ' ' +",
+      "  String(s.indexOf('b', 3)) + ' ' + String(s.indexOf('a', -2)) + ' ' + String(s.indexOf('a', 99)));",
+      "out.push('str last ' + String(s.lastIndexOf('a')) + ' ' + String(s.lastIndexOf('a', 2)) + ' ' +",
+      "  String(s.lastIndexOf('a', -1)) + ' ' + String(s.lastIndexOf('a', 99)));",
+      "out.push('str inc ' + String(s.includes('a', 1)) + ' ' + String(s.includes('a', 4)));",
+      // An empty vector's lastIndexOf has no index to default to.
+      "const e: any = JSON.parse('[]');",
+      "out.push('empty ' + String(e.lastIndexOf(1)) + ' ' + String(e.lastIndexOf(1, 0)) + ' ' + String(e.indexOf(1)));",
+      // NaN: the fromIndex rule, then the SameValueZero split. `includes`
+      // finds a NaN that `indexOf` and `lastIndexOf` cannot, which is
+      // JS's own routing (SameValueZero against strict equality) and not
+      // an inconsistency of ours. -0 matches +0 on every path.
+      "const nan: number = Number.NaN;",
+      "const n: any = JSON.parse('[1,2]');",
+      "n.push(nan);",
+      "out.push('nan find ' + String(n.includes(nan)) + ' ' + String(n.indexOf(nan)) + ' ' + String(n.lastIndexOf(nan)));",
+      "out.push('nan from ' + String(a.indexOf(1, nan)) + ' ' + String(a.lastIndexOf(1, nan)) + ' ' +",
+      "  String(s.indexOf('a', nan)) + ' ' + String(s.lastIndexOf('a', nan)));",
+      "const z: any = JSON.parse('[0]');",
+      "out.push('zero ' + String(z.includes(-0)) + ' ' + String(z.indexOf(-0)));",
+      // An explicit `undefined` fromIndex is PRESENT, and one method
+      // branches on presence: Array.lastIndexOf coerces it to 0 and
+      // searches index 0 alone, where the ABSENT form starts at len-1.
+      // Every other index argument spells its default as its undefined
+      // case, so the two coincide there — the rest of this line.
+      "const un: any = JSON.parse('[]').at(5);",
+      "out.push('undef last ' + String(a.lastIndexOf(2, un)) + ' ' + String(a.lastIndexOf(2)) + ' ' +",
+      "  String(a.lastIndexOf(1, un)) + ' ' + String(a.lastIndexOf(1)));",
+      "out.push('undef rest ' + String(a.indexOf(2, un)) + ' ' + String(a.includes(3, un)) + ' ' +",
+      "  String(a.at(un)) + ' [' + String(a.slice(1, un).join(',')) + '] ' +",
+      "  String(s.indexOf('a', un)) + ' ' + String(s.lastIndexOf('a', un)) + ' [' + String(s.slice(1, un)) + ']');",
+      "console.log(out.join('\\n'));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "arr idx 0 3 4 -1 -1",
+      // -99 shifts below zero and scans NOTHING — it does not clamp to 0
+      // the way a forward start does.
+      "arr last 3 0 2 -1 3",
+      "arr inc true false true true",
+      // The string's -2 clamps to 0 rather than counting from the end.
+      "str idx 0 3 4 0 -1",
+      "str last 3 0 0 3",
+      "str inc true false",
+      "empty -1 -1 -1",
+      "nan find true -1 -1",
+      // NaN is 0 everywhere but String.lastIndexOf, which searches all.
+      "nan from 0 0 0 3",
+      "zero true 0",
+      // Present-and-undefined against absent: -1 vs 4, 0 vs 3.
+      "undef last -1 4 0 3",
+      "undef rest 1 true 1 [2,3,1,2,3] 0 3 [bcabc]",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("S016: `map` binds the length for its OUTPUT, so a shrink leaves a slot", async () => {
+  // The spec builds map's result at the length it captured before the
+  // first step, so a callback that shrinks the receiver skips steps and
+  // the output keeps their slots. Node leaves HOLES there and this tier
+  // has none, so the slots hold `undefined` — length, `join`, `at` and
+  // an indexed read all agree with Node, and only `Object.keys` parts
+  // company. That is S016's padded-slot divergence by a second route.
+  // The other collectors are dense in Node too, so theirs just end
+  // shorter; `forEach` simply stops early.
+  const res = await buildWasm(
+    "dyn-invoke-shrink.ts",
+    [
+      "const out: string[] = [];",
+      "const a: any = JSON.parse('[1,2,3,4]');",
+      "const r: any = a.map(function (v: number, i: number): number { if (i === 0) { a.pop(); a.pop(); } return v * 2; });",
+      "const rk: string[] = Object.keys(r);",
+      "out.push('map len ' + String(r.length) + ' join [' + String(r.join(',')) + '] at2 ' + String(r.at(2)) +",
+      "  ' idx2 ' + String(r[2]) + ' keys [' + rk.join(',') + ']');",
+      "const b: any = JSON.parse('[1,2,3,4]');",
+      "const f: any = b.filter(function (v: number, i: number): boolean { if (i === 0) { b.pop(); } return true; });",
+      "out.push('filter len ' + String(f.length) + ' join [' + String(f.join(',')) + ']');",
+      "const c: any = JSON.parse('[1,2,3,4]');",
+      "const seen: string[] = [];",
+      "c.forEach(function (v: number, i: number): void { seen.push(String(i) + ':' + String(v)); if (i === 0) { c.shift(); } });",
+      "out.push('forEach ' + seen.join(' ') + ' len ' + String(c.length));",
+      "console.log(out.join('\\n'));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      // S016 — Node answers keys [0,1]; every other field on this line is
+      // Node's own, the empty join fields included.
+      "map len 4 join [2,4,,] at2 undefined idx2 undefined keys [0,1,2,3]",
+      "filter len 3 join [1,2,3]",
+      "forEach 0:1 1:3 2:4 len 3",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("dyn invoke: a nullish receiver throws at the MEMBER GET, before any argument", async () => {
+  // `nul.push(f())` never runs `f`: JS reads the member first and the
+  // read is what throws. The test is the side-effect log, which stays
+  // empty on that line and fills on the two that DO reach their
+  // arguments (a receiver with no such method still evaluates them —
+  // the call is what fails there, not the get). Node-exact.
+  const res = await buildWasm(
+    "dyn-invoke-order.ts",
+    [
+      "const l1: string[] = [];",
+      "const l2: string[] = [];",
+      "const l3: string[] = [];",
+      "function s1(): number { l1.push('a'); return 1; }",
+      "function s2(): number { l2.push('b'); return 1; }",
+      "function s3(): number { l3.push('c'); return 1; }",
+      "function show(f: () => unknown): string {",
+      "  try { f(); return '(no throw)'; } catch (e) { return (e as Error).message; }",
+      "}",
+      "const nul: any = JSON.parse('null');",
+      "const num: any = JSON.parse('5');",
+      "const arr: any = JSON.parse('[1]');",
+      "const out: string[] = [];",
+      "out.push('null: ' + show(() => { return nul.push(s1()); }) + ' log [' + l1.join(',') + ']');",
+      "out.push('num: ' + show(() => { return num.push(s2()); }) + ' log [' + l2.join(',') + ']');",
+      "out.push('nope: ' + show(() => { return arr.nope(s3()); }) + ' log [' + l3.join(',') + ']');",
+      "console.log(out.join('\\n'));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "null: Cannot read properties of null (reading 'push') log []",
+      "num: num.push is not a function log [b]",
+      "nope: arr.nope is not a function log [c]",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("S023: apply's argsArray — the array-like fence and the primitive's own TypeError", async () => {
+  // Node reads `length` and the index members off an array-LIKE object
+  // and calls successfully; this tier reads neither, so that case takes
+  // the ladder's loud fence rather than borrowing V8's message for it.
+  // A PRIMITIVE argsArray is the case that message is really for, and
+  // Node throws it there too — that line is exact.
+  const res = await buildWasm(
+    "dyn-invoke-apply-like.ts",
+    [
+      "function f(a: unknown, b: unknown): string { return String(a) + '/' + String(b); }",
+      "function box(v: unknown): unknown { return v; }",
+      "const g: any = box(f);",
+      "function mk(): unknown { return JSON.parse('{\"length\":2,\"0\":\"x\",\"1\":\"y\"}'); }",
+      "const al: any = mk();",
+      "function show(h: () => unknown): string {",
+      "  try { return 'ok ' + String(h()); } catch (e) { return (e as Error).name + ': ' + (e as Error).message; }",
+      "}",
+      "const out: string[] = [];",
+      "out.push('arraylike ' + show(() => { return g.apply(null, al); }));",
+      "out.push('string ' + show(() => { return g.apply(null, 'ab'); }));",
+      "out.push('number ' + show(() => { return g.apply(null, 5); }));",
+      "out.push('array ' + show(() => { return g.apply(null, JSON.parse('[\"p\",\"q\"]')); }));",
+      "out.push('nullish ' + show(() => { return g.apply(null, null); }));",
+      "console.log(out.join('\\n'));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      // S023 — Node answers "ok x/y" here, which is exactly why this is a
+      // fence and not the message below.
+      "arraylike Error: 'Function.prototype.apply' with an array-like argsArray on a dynamic value is not supported yet",
+      "string TypeError: CreateListFromArrayLike called on non-object",
+      "number TypeError: CreateListFromArrayLike called on non-object",
+      "array ok p/q",
+      "nullish ok undefined/undefined",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("S024: a comparator's answer is read from numbers and booleans only", async () => {
+  // The result reads the shared numeric slot, which no other kind fills,
+  // so a STRING-returning comparator — consistent, and one Node sorts
+  // correctly by applying ToNumber — reads as 0 at every pair and sorts
+  // nothing. An INCONSISTENT boolean comparator is outside any claim:
+  // ECMA-262 leaves it implementation-defined and the two simply differ.
+  const res = await buildWasm(
+    "dyn-invoke-cmpret.ts",
+    [
+      "const out: string[] = [];",
+      "const a: any = JSON.parse('[3,1,2]');",
+      "out.push('string ' + String(a.sort(function (x: number, y: number): string {",
+      "  return x < y ? '-1' : (x > y ? '1' : '0');",
+      "}).join(',')));",
+      "const b: any = JSON.parse('[3,1,2]');",
+      "out.push('boolean ' + String(b.sort(function (x: number, y: number): boolean { return x > y; }).join(',')));",
+      // The kinds that DO read: a numeric comparator, and the default.
+      "const c: any = JSON.parse('[3,1,2]');",
+      "out.push('number ' + String(c.sort(function (x: number, y: number): number { return x - y; }).join(',')));",
+      "console.log(out.join('\\n'));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      // S024 — Node answers 1,2,3: it ToNumbers the strings.
+      "string 3,1,2",
+      // S024 — Node answers 3,1,2 for the inconsistent one.
+      "boolean 1,2,3",
+      "number 1,2,3",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("S025: a dyn object spelling the reserved `%error` key IS an error", async () => {
+  // Nothing reserves the marker on the way in, so JSON.parse over
+  // untrusted input reaches the error encoding directly. Only its
+  // PRESENCE is read, never its value. The C lane reproduces every line.
+  const res = await buildWasm(
+    "dyn-error-collision.ts",
+    [
+      "function mk(): unknown { return JSON.parse('{\"%error\":true,\"name\":\"Fake\",\"message\":\"m\"}'); }",
+      "const u: any = mk();",
+      "const out: string[] = [];",
+      "const k: string[] = Object.keys(u);",
+      "out.push('shaped isErr ' + String(u instanceof Error) + ' str [' + String(u) + '] typeof ' + typeof u +",
+      "  ' keys [' + k.join(',') + ']');",
+      "function bare(): unknown { return JSON.parse('{\"%error\":1}'); }",
+      "const v: any = bare();",
+      "out.push('bare isErr ' + String(v instanceof Error) + ' str [' + String(v) + ']');",
+      "function falsy(): unknown { return JSON.parse('{\"%error\":false}'); }",
+      "const w: any = falsy();",
+      "out.push('falsy isErr ' + String(w instanceof Error) + ' str [' + String(w) + ']');",
+      // The neighbour without the key is an ordinary object, exactly.
+      "function plain(): unknown { return JSON.parse('{\"name\":\"Fake\",\"message\":\"m\"}'); }",
+      "const p: any = plain();",
+      "out.push('plain isErr ' + String(p instanceof Error) + ' str [' + String(p) + ']');",
+      "console.log(out.join('\\n'));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      // S025 — Node answers isErr false and str [object Object] on the
+      // first three; the key list is Node's own on all four.
+      "shaped isErr true str [Fake: m] typeof object keys [%error,name,message]",
+      // With no name or message beside it, the error text is EMPTY.
+      "bare isErr true str []",
+      "falsy isErr true str []",
+      "plain isErr false str [[object Object]]",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("S021: a crossed error's name and message are a SNAPSHOT of the crossing", async () => {
+  // The encoding copies both strings, and the identity cache then pins
+  // the box — so a mutation performed on the typed error AFTER it
+  // crossed is invisible on every dyn read, including a second crossing.
+  // Node reads both live. Identity holds on both lanes.
+  const res = await buildWasm(
+    "dyn-error-snapshot.ts",
+    [
+      "function run(): string {",
+      "  try { throw new TypeError('boom'); } catch (e) {",
+      "    const first: unknown = e;",
+      "    (e as Error).message = 'MUTATED';",
+      "    (e as Error).name = 'Renamed';",
+      "    const second: unknown = e;",
+      "    const x: any = first;",
+      "    const y: any = second;",
+      "    return 'first ' + String(x.name) + '/' + String(x.message) +",
+      "      ' second ' + String(y.name) + '/' + String(y.message) +",
+      "      ' same ' + String(x === y) + ' str [' + String(x) + ']';",
+      "  }",
+      "}",
+      "console.log(run());",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  // S021 — Node answers Renamed/MUTATED on both sides and
+  // [Renamed: MUTATED]; `same true` is exact on every lane.
+  expect(stdout.toString("utf8")).toBe(
+    "first TypeError/boom second TypeError/boom same true str [TypeError: boom]\n",
+  );
+});
+
+test("S021/S022: a caught value crossing into `unknown`", async () => {
+  // What the %error encoding answers, what it enumerates, and what a
+  // payload with no dyn shape becomes. Node agrees with every line here
+  // but the two marked ones; the C lane agrees with ALL of them,
+  // identity included — one error crossing twice is one value on both,
+  // because both go through the same per-error cache.
+  const res = await buildWasm(
+    "dyn-caught.ts",
+    [
+      "function cross(): unknown { try { throw new TypeError('boom'); } catch (e) { return e; } }",
+      "const c: any = cross();",
+      "const out: string[] = [];",
+      "out.push('str [' + String(c) + '] isErr ' + String(c instanceof Error) + ' typeof ' + typeof c);",
+      "out.push('name ' + String(c.name) + ' message ' + String(c.message) + ' marker ' + String(c['%error']));",
+      "const keys: string[] = Object.keys(c);",
+      "out.push('keys [' + keys.join(',') + ']');",
+      // Error.prototype.toString's two empty-side rules.
+      "function named(): unknown { try { const e = new Error('m'); e.name = ''; throw e; } catch (e) { return e; } }",
+      "function noMsg(): unknown { try { const e = new Error(); e.name = 'Weird'; throw e; } catch (e) { return e; } }",
+      "out.push('empties [' + String(named()) + '] [' + String(noMsg()) + ']');",
+      // Identity: the SAME error, twice.
+      "function twice(): string {",
+      "  let x: unknown = undefined; let y: unknown = undefined;",
+      "  const e = new Error('same');",
+      "  try { throw e; } catch (v) { x = v; }",
+      "  try { throw e; } catch (v) { y = v; }",
+      "  let p: unknown = undefined; let q: unknown = undefined;",
+      "  try { throw new Error('a'); } catch (v) { p = v; }",
+      "  try { throw new Error('a'); } catch (v) { q = v; }",
+      "  return 'same ' + String(x === y) + ' distinct ' + String(p === q);",
+      "}",
+      "out.push(twice());",
+      // A user subclass rides errT, so it crosses like a builtin.
+      "class CustomError extends Error {",
+      "  constructor(m: string) { super(m); this.name = 'CustomError'; }",
+      "}",
+      "function custom(): unknown { try { throw new CustomError('cf'); } catch (e) { return e; } }",
+      "const cu: any = custom();",
+      "out.push('custom [' + String(cu) + '] isErr ' + String(cu instanceof Error) + ' name ' + String(cu.name));",
+      // S022: a record has no dyn shape in the cell.
+      "type Rec = { a: number };",
+      "function rec(): unknown { try { const r: Rec = { a: 1 }; throw r; } catch (e) { return e; } }",
+      "const r: any = rec();",
+      "const rk: string[] = Object.keys(r);",
+      "out.push('rec typeof ' + typeof r + ' truthy ' + String(r ? 'y' : 'n') + ' a ' + String(r.a) +",
+      "  ' keys [' + rk.join(',') + '] isErr ' + String(r instanceof Error));",
+      // Scalars are exact, and a thrown DYN value comes back as itself.
+      "function scalar(): string {",
+      "  let s: unknown = undefined; let n: unknown = undefined; let b: unknown = undefined;",
+      "  try { throw 'plain'; } catch (e) { s = e; }",
+      "  try { throw 42; } catch (e) { n = e; }",
+      "  try { throw false; } catch (e) { b = e; }",
+      "  return 'scalars ' + String(s) + ' ' + String(n) + ' ' + String(b) +",
+      "    ' ' + typeof s + ' ' + typeof n + ' ' + typeof b;",
+      "}",
+      "out.push(scalar());",
+      "const src: unknown = JSON.parse('{\"k\":1}');",
+      "function bounce(v: unknown): unknown { try { throw v; } catch (e) { const u: unknown = e; return u; } }",
+      "const back: any = bounce(src);",
+      "out.push('bounce same ' + String(back === src) + ' k ' + String(back.k));",
+      "console.log(out.join('\\n'));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "str [TypeError: boom] isErr true typeof object",
+      // S021 — Node reads name and message the same way but answers
+      // `undefined` for the marker, which it has no equivalent of.
+      "name TypeError message boom marker true",
+      // S021 — Node answers [] here: its name and message are not
+      // enumerable and its marker does not exist.
+      "keys [%error,name,message]",
+      "empties [m] [Weird]",
+      "same true distinct false",
+      "custom [CustomError: cf] isErr true name CustomError",
+      // S022 — Node reads `a` as 1 and lists ["a"].
+      "rec typeof object truthy y a undefined keys [] isErr false",
+      "scalars plain 42 false string number boolean",
+      "bounce same true k 1",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("dyn invoke: FUNC apply/call, and an object's OWN member", async () => {
+  // The two Function.prototype names the dispatch admits, plus the OBJ
+  // arm every name has (own properties shadow prototypes in JS too).
+  // Node-exact throughout, C lane included. `apply` hands the argument
+  // array's own payload straight to the thunk — no copy — so JS arity
+  // does the rest: a missing argument IS undefined.
+  const res = await buildWasm(
+    "dyn-invoke-fn.ts",
+    [
+      "function msg(f: () => void): string {",
+      "  try { f(); return '(no throw)'; } catch (e) { return (e as Error).message; }",
+      "}",
+      "function add3(a: unknown, b: unknown, c: unknown): string {",
+      "  return String(a) + ':' + String(b) + ':' + String(c);",
+      "}",
+      "function box(v: unknown): unknown { return v; }",
+      "const f: any = box(add3);",
+      "const out: string[] = [];",
+      "out.push('apply ' + String(f.apply(null, ['x', 'y', 'z'])));",
+      "out.push('none ' + String(f.apply(undefined)) + ' null ' + String(f.apply(null, null)));",
+      "out.push('call ' + String(f.call(null, 1, 2, 3)) + ' bare ' + String(f.call(null)));",
+      "out.push('nonarr ' + msg(() => { f.apply(null, 5); }));",
+      "out.push('f.push ' + msg(() => { f.push(1); }));",
+      "function greet(who: unknown): string { return 'hi ' + String(who); }",
+      "const obj: any = JSON.parse('{}');",
+      "obj['greet'] = box(greet);",
+      "obj['notFn'] = 5;",
+      "out.push('own ' + String(obj.greet('there')));",
+      "out.push('missing ' + msg(() => { obj.forEach(function (): void {}); }));",
+      "out.push('notFn ' + msg(() => { obj.notFn(); }));",
+      // Through an array element: mustCall's shape, one level in.
+      "const arr: any = box([box(add3)]);",
+      "out.push('nested ' + String(arr.at(0).apply(null, [1, 2, 3])));",
+      "console.log(out.join('\\n'));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "apply x:y:z",
+      "none undefined:undefined:undefined null undefined:undefined:undefined",
+      "call 1:2:3 bare undefined:undefined:undefined",
+      "nonarr CreateListFromArrayLike called on non-object",
+      "f.push f.push is not a function",
+      "own hi there",
+      "missing obj.forEach is not a function",
+      "notFn obj.notFn is not a function",
+      "nested 1:2:3",
+      "",
+    ].join("\n"),
+  );
+});
+
 test("dyn own-key ORDER: integer-like keys first, and where that range ends", async () => {
   // Object.keys' own-key order is the one place the array-index predicate
   // has to be WIDER than the keyed read's: the ordering range is
