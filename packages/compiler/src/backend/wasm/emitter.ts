@@ -86,6 +86,7 @@ import {
 } from "./abi.js";
 import { VecBuilder, type VecInfo } from "./arrays.js";
 import { DK, DYN_KIND, DYN_NUM, DYN_REF, DynBuilder, FN_CLOS, FN_SIG } from "./dyn.js";
+import { InspectBuilder } from "./inspect.js";
 import { JsonBuilder, jsonQuote } from "./json.js";
 import {
   PromiseBuilder,
@@ -1534,6 +1535,25 @@ class Assembler {
       dyn: () => this.dyn,
     });
     return this.jsonField;
+  }
+
+  /* ── util.inspect (inspect.ts) ─────────────────────────────────────────
+   * The append buffer, the UTF-16 measures, the quoting ladder and the
+   * leaf renderings; the frontend's synthesized per-type traversals
+   * (lower-inspect.ts) drive them through `insp.*` libCalls. Interned by
+   * first use, so a module that never inspects anything is byte-identical
+   * to what it compiled to before. */
+
+  private inspField: InspectBuilder | null = null;
+
+  private get insp(): InspectBuilder {
+    this.inspField ??= new InspectBuilder(this.mb, {
+      strRef: () => this.strRef,
+      strType: () => this.strType,
+      lit: (c, s) => this.pushStrLitInto(c, s),
+      f64ToStr: () => this.f64ToStrHelper(),
+    });
+    return this.inspField;
   }
 
   /** The ARR payload's vector info — the SAME interning a static
@@ -5743,6 +5763,22 @@ class Assembler {
           // reached through the frontend's per-union format helpers.
           this.walkExpr(e.args[0]!);
           code.call(this.inspF64Helper());
+          return;
+        }
+        if (e.fn === "insp.str") {
+          // formatPrimitive's string arm (inspect.ts): the quoting ladder,
+          // the 10000-unit cap and the per-line ` +` continuation, which
+          // reads the layout engine's indentation global. Never throws.
+          this.walkExpr(e.args[0]!);
+          code.call(this.insp.str());
+          return;
+        }
+        if (e.fn === "insp.key") {
+          // formatProperty's key arm over a RUNTIME string — bare
+          // identifier, `['__proto__']`, or the quoting ladder. Never
+          // throws.
+          this.walkExpr(e.args[0]!);
+          code.call(this.insp.key());
           return;
         }
         if (e.fn === "error.new") {
