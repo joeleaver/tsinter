@@ -1,7 +1,10 @@
-/* JSON.parse as emitted WasmGC code: a recursive-descent parser over the
- * tier's UTF-16 string producing dyn trees (dyn.ts). The increment's
- * design doc for this stage — read it before changing the grammar or a
- * message.
+/* JSON, both directions, as emitted WasmGC code: a recursive-descent
+ * parser over the tier's UTF-16 string producing dyn trees (dyn.ts), and
+ * the output BUFFER + escape/number/re-indent primitives the emitted
+ * stringify serializers write through (the serializers themselves are
+ * type-directed and live at the emitter, beside the dyn walkers). The
+ * increment's design doc for this stage — read it before changing the
+ * grammar or a message.
  *
  * THE ORACLE IS NODE, NOT THE C RUNTIME. `scr_json.c`'s parser is the
  * structural reference and this is a faithful port of its GRAMMAR, but
@@ -2516,4 +2519,753 @@ export class JsonBuilder {
       this.mb.setBody(idx, [dyn.dynRef()], c.bytes());
     });
   }
+
+  /* ── JSON.stringify: the output buffer ──────────────────────────────────
+   * C's ScrJsonBuf, with the struct pointer elided the same way the
+   * parser elides its ScrJsonP: TWO MODULE GLOBALS, a growing UTF-16
+   * array and a fill length. The emitted type-directed serializers (the
+   * emitter's `%w.json.write:<typeKey>` family, C's sc_jw_*) write
+   * through these; `jbFinish` copies the filled prefix into an
+   * exact-length string and hands it back.
+   *
+   * NON-REENTRANCY is the same argument the parser makes, and it has to
+   * hold for the globals to be sound: no user code can run mid-walk. A
+   * `toJSON` method and a replacer function are the two things that
+   * could, and both are FRONTEND-fenced (lower-builtins.ts) — they never
+   * reach any backend. A closure sitting in a serialized composite is
+   * dropped UNCALLED. The one nesting that does occur —
+   * `JSON.stringify({ a: JSON.stringify(b) })` — is not reentrancy: the
+   * inner call finishes (and so resets the buffer) while evaluating the
+   * ARGUMENT, strictly before the outer call's prologue zeroes the
+   * length.
+   *
+   * The buffer SURVIVES finish (a stringify loop then allocates once
+   * rather than doubling its way up every round), which is C's size-hint
+   * discipline with the hint being the allocation itself — and bounded
+   * the same way: one giant document must not pin a big array for the
+   * module's lifetime, so a buffer grown past 2^16 units is dropped
+   * instead of kept. */
+
+  private jbBufG: number | null = null;
+  private jbLenG: number | null = null;
+
+  private jbBuf(): number {
+    this.jbBufG ??= this.mb.addGlobal(this.deps.strRef(), true, (w) => {
+      w.u8(0xd0);
+      w.sleb(this.deps.strType());
+    });
+    return this.jbBufG;
+  }
+
+  private jbLen(): number {
+    this.jbLenG ??= this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41);
+      w.sleb(0);
+    });
+    return this.jbLenG;
+  }
+
+  /** `%w.json.jbBegin()` — the serializer prologue: an empty buffer. The
+   * grown array stays for reuse. Every stringify SITE calls this rather
+   * than trusting the previous finish, because a walk that unwinds
+   * mid-way (the circular-structure throw, once cycle-capable roots
+   * land) never reaches its finish. */
+  jbBegin(): number {
+    return this.cached("jbBegin", [], [], (idx) => {
+      const c = new Code();
+      c.i32Const(0);
+      c.globalSet(this.jbLen());
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** `%w.json.jbEnsure(need)` — room for `need` more units, growing by
+   * doubling from a 64-unit floor. */
+  private jbEnsure(): number {
+    return this.cached("jbEnsure", [I32], [], (idx) => {
+      const strT = this.deps.strType();
+      const c = new Code();
+      const NEED = 0;
+      const WANT = 1;
+      const CAP = 2;
+      const NB = 3;
+      // First fill: max(64, need) — the floor is C's initial hint.
+      c.globalGet(this.jbBuf());
+      c.refIsNull();
+      c.ifVoid();
+      c.i32Const(64);
+      c.localGet(NEED);
+      c.i32LtU();
+      c.ifResult(I32);
+      c.localGet(NEED);
+      c.else_();
+      c.i32Const(64);
+      c.end();
+      c.arrayNewDefault(strT);
+      c.globalSet(this.jbBuf());
+      c.return_();
+      c.end();
+      c.globalGet(this.jbLen());
+      c.localGet(NEED);
+      c.i32Add();
+      c.localSet(WANT);
+      c.localGet(WANT);
+      c.globalGet(this.jbBuf());
+      c.arrayLen();
+      c.i32LeU();
+      c.ifVoid();
+      c.return_();
+      c.end();
+      c.globalGet(this.jbBuf());
+      c.arrayLen();
+      c.localSet(CAP);
+      c.block();
+      c.loop();
+      c.localGet(CAP);
+      c.i32Const(1);
+      c.i32Shl();
+      c.localSet(CAP);
+      c.localGet(CAP);
+      c.localGet(WANT);
+      c.i32GeU();
+      c.brIf(1);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(CAP);
+      c.arrayNewDefault(strT);
+      c.localSet(NB);
+      c.localGet(NB);
+      c.i32Const(0);
+      c.globalGet(this.jbBuf());
+      c.i32Const(0);
+      c.globalGet(this.jbLen());
+      c.arrayCopy(strT, strT);
+      c.localGet(NB);
+      c.globalSet(this.jbBuf());
+      this.mb.setBody(idx, [I32, I32, this.deps.strRef()], c.bytes());
+    });
+  }
+
+  /** `%w.json.jbPutc(unit)` — one code unit. */
+  jbPutc(): number {
+    return this.cached("jbPutc", [I32], [], (idx) => {
+      const c = new Code();
+      c.i32Const(1);
+      c.call(this.jbEnsure());
+      c.globalGet(this.jbBuf());
+      c.globalGet(this.jbLen());
+      c.localGet(0);
+      c.arraySet(this.deps.strType());
+      c.globalGet(this.jbLen());
+      c.i32Const(1);
+      c.i32Add();
+      c.globalSet(this.jbLen());
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** `%w.json.jbPuts(s)` — a whole string, VERBATIM (no escaping): the
+   * literal syntax the serializers emit around their values, and the
+   * digits `jbPutF64` produces. */
+  jbPuts(): number {
+    return this.cached("jbPuts", [this.deps.strRef()], [], (idx) => {
+      const strT = this.deps.strType();
+      const c = new Code();
+      const N = 1;
+      c.localGet(0);
+      c.arrayLen();
+      c.localSet(N);
+      // array.copy null-traps on either side whatever the length, and an
+      // empty literal would otherwise force a first allocation.
+      c.localGet(N);
+      c.i32Eqz();
+      c.ifVoid();
+      c.return_();
+      c.end();
+      c.localGet(N);
+      c.call(this.jbEnsure());
+      c.globalGet(this.jbBuf());
+      c.globalGet(this.jbLen());
+      c.localGet(0);
+      c.i32Const(0);
+      c.localGet(N);
+      c.arrayCopy(strT, strT);
+      c.globalGet(this.jbLen());
+      c.localGet(N);
+      c.i32Add();
+      c.globalSet(this.jbLen());
+      this.mb.setBody(idx, [I32], c.bytes());
+    });
+  }
+
+  /** `%w.json.jbPutF64(v)` — JSON's number rule: non-finite serializes as
+   * `null` (JSON has no NaN or Infinity), zero as `0` (which is where -0
+   * loses its sign, exactly like Node), everything else as the shortest
+   * round-trip digits `String(v)` would give. */
+  jbPutF64(): number {
+    return this.cached("jbPutF64", [F64], [], (idx) => {
+      const c = new Code();
+      c.localGet(0);
+      c.localGet(0);
+      c.f64Ne(); // NaN
+      c.localGet(0);
+      c.f64Const(Infinity);
+      c.f64Eq();
+      c.i32Or();
+      c.localGet(0);
+      c.f64Const(-Infinity);
+      c.f64Eq();
+      c.i32Or();
+      c.ifVoid();
+      this.deps.lit(c, "null");
+      c.call(this.jbPuts());
+      c.return_();
+      c.end();
+      c.localGet(0);
+      c.f64Const(0);
+      c.f64Eq();
+      c.ifVoid();
+      c.i32Const(0x30);
+      c.call(this.jbPutc());
+      c.return_();
+      c.end();
+      c.localGet(0);
+      c.call(this.deps.f64ToStr());
+      c.call(this.jbPuts());
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** `%w.json.jbHex4(unit)` — `\uXXXX`, four LOWERCASE hex digits, which
+   * is the case V8 emits (verified against Node 24.18, not assumed). */
+  private jbHex4(): number {
+    return this.cached("jbHex4", [I32], [], (idx) => {
+      const c = new Code();
+      const D = 1;
+      c.i32Const(0x5c);
+      c.call(this.jbPutc());
+      c.i32Const(0x75);
+      c.call(this.jbPutc());
+      for (const shift of [12, 8, 4, 0]) {
+        c.localGet(0);
+        if (shift !== 0) {
+          c.i32Const(shift);
+          c.i32ShrU();
+        }
+        c.i32Const(0xf);
+        c.i32And();
+        c.localSet(D);
+        c.localGet(D);
+        c.i32Const(10);
+        c.i32LtU();
+        c.ifResult(I32);
+        c.localGet(D);
+        c.i32Const(0x30); // '0'
+        c.i32Add();
+        c.else_();
+        c.localGet(D);
+        c.i32Const(0x57); // 10 + 0x57 == 'a'
+        c.i32Add();
+        c.end();
+        c.call(this.jbPutc());
+      }
+      this.mb.setBody(idx, [I32], c.bytes());
+    });
+  }
+
+  /** `%w.json.jbPutStr(s)` — a quoted, escaped JSON string.
+   *
+   * THIS IS NODE'S WELL-FORMED JSON.stringify (ES2019), NOT THE C
+   * RUNTIME'S RULE, and the difference is the same one S002 draws for the
+   * parse side. C walks UTF-8 BYTES whose storage already substituted
+   * U+FFFD for anything unpaired, so it never has a surrogate to decide
+   * about; this tier stores real UTF-16 units, so a lone surrogate
+   * reaches here intact and must escape — `JSON.stringify("\ud800")` is
+   * `"\ud800"` in Node, and the result is well-formed UTF-8 wherever it
+   * is written. A surrogate PAIR passes through as its two units, since
+   * together they encode a real character.
+   *
+   * Per unit: `"` and `\` take their two-character escape; \b \f \n \r \t
+   * take theirs; anything else below 0x20 takes `\u00xx`; an UNPAIRED
+   * surrogate half takes `\uXXXX`; everything else — DEL and every
+   * non-ASCII character included — passes verbatim. */
+  jbPutStr(): number {
+    return this.cached("jbPutStr", [this.deps.strRef()], [], (idx) => {
+      const strT = this.deps.strType();
+      const c = new Code();
+      const N = 1;
+      const I = 2;
+      const U = 3;
+      const V = 4;
+      const P = 5;
+      c.i32Const(0x22);
+      c.call(this.jbPutc());
+      c.localGet(0);
+      c.arrayLen();
+      c.localSet(N);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block(); // OUTER
+      c.loop(); // LOOP
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeU();
+      c.brIf(1);
+      c.localGet(0);
+      c.localGet(I);
+      c.arrayGetU(strT);
+      c.localSet(U);
+      c.block(); // UNIT — every arm leaves through this block's end
+      // '"' and '\': a backslash, then the unit itself.
+      c.localGet(U);
+      c.i32Const(0x22);
+      c.i32Eq();
+      c.localGet(U);
+      c.i32Const(0x5c);
+      c.i32Eq();
+      c.i32Or();
+      c.ifVoid();
+      c.i32Const(0x5c);
+      c.call(this.jbPutc());
+      c.localGet(U);
+      c.call(this.jbPutc());
+      c.br(1);
+      c.end();
+      // Control characters: five have a named escape, the rest go hex.
+      c.localGet(U);
+      c.i32Const(0x20);
+      c.i32LtU();
+      c.ifVoid();
+      for (const [ctrl, letter] of [
+        [0x08, 0x62], // \b
+        [0x0c, 0x66], // \f
+        [0x0a, 0x6e], // \n
+        [0x0d, 0x72], // \r
+        [0x09, 0x74], // \t
+      ]) {
+        c.localGet(U);
+        c.i32Const(ctrl!);
+        c.i32Eq();
+        c.ifVoid();
+        c.i32Const(0x5c);
+        c.call(this.jbPutc());
+        c.i32Const(letter!);
+        c.call(this.jbPutc());
+        c.br(2);
+        c.end();
+      }
+      c.localGet(U);
+      c.call(this.jbHex4());
+      c.br(1);
+      c.end();
+      // A surrogate half (0xD800-0xDFFF): verbatim only if it is half of
+      // a PAIR. A high half pairs with the unit after it, a low half with
+      // the unit before it — and because a high half consumes exactly the
+      // low that follows it, "the previous unit is a high half" is an
+      // exact test for the low side, not an approximation.
+      c.localGet(U);
+      c.i32Const(0xf800);
+      c.i32And();
+      c.i32Const(0xd800);
+      c.i32Eq();
+      c.ifVoid();
+      c.i32Const(0);
+      c.localSet(P);
+      c.localGet(U);
+      c.i32Const(0x0400);
+      c.i32And();
+      c.i32Eqz(); // high half
+      c.ifVoid();
+      // The bounds test and the peek CANNOT be one i32.and: wasm
+      // evaluates both operands, and the peek reads the array — at the
+      // last unit that is an out-of-bounds trap. Hence the if-chain.
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localGet(N);
+      c.i32LtU();
+      c.ifVoid();
+      c.localGet(0);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.arrayGetU(strT);
+      c.localSet(V);
+      c.localGet(V);
+      c.i32Const(0xfc00);
+      c.i32And();
+      c.i32Const(0xdc00);
+      c.i32Eq();
+      c.ifVoid();
+      c.i32Const(1);
+      c.localSet(P);
+      c.end();
+      c.end();
+      c.else_();
+      // Low half: the same if-chain backwards (index 0 has no previous).
+      c.localGet(I);
+      c.i32Const(0);
+      c.i32GtU();
+      c.ifVoid();
+      c.localGet(0);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Sub();
+      c.arrayGetU(strT);
+      c.localSet(V);
+      c.localGet(V);
+      c.i32Const(0xfc00);
+      c.i32And();
+      c.i32Const(0xd800);
+      c.i32Eq();
+      c.ifVoid();
+      c.i32Const(1);
+      c.localSet(P);
+      c.end();
+      c.end();
+      c.end();
+      c.localGet(P);
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(U);
+      c.call(this.jbHex4());
+      c.br(2);
+      c.end();
+      c.end();
+      c.localGet(U);
+      c.call(this.jbPutc());
+      c.end(); // UNIT
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end(); // LOOP
+      c.end(); // OUTER
+      c.i32Const(0x22);
+      c.call(this.jbPutc());
+      this.mb.setBody(idx, [I32, I32, I32, I32, I32], c.bytes());
+    });
+  }
+
+  /** `%w.json.jbFinish()` → the buffered text as a fresh string, with the
+   * buffer emptied for the next document. */
+  jbFinish(): number {
+    return this.cached("jbFinish", [], [this.deps.strRef()], (idx) => {
+      const strT = this.deps.strType();
+      const c = new Code();
+      const L = 0;
+      const R = 1;
+      c.globalGet(this.jbLen());
+      c.localSet(L);
+      c.localGet(L);
+      c.arrayNewDefault(strT);
+      c.localSet(R);
+      // array.copy traps on a null side regardless of length, and an
+      // untouched buffer IS null — so the empty document skips the copy.
+      c.localGet(L);
+      c.ifVoid();
+      c.localGet(R);
+      c.i32Const(0);
+      c.globalGet(this.jbBuf());
+      c.i32Const(0);
+      c.localGet(L);
+      c.arrayCopy(strT, strT);
+      c.end();
+      c.i32Const(0);
+      c.globalSet(this.jbLen());
+      // The hint bound: keep an ordinary buffer for the next document,
+      // drop one that a giant document grew (the null test and the length
+      // read are an if-chain for the usual reason — array.len null-traps).
+      c.globalGet(this.jbBuf());
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifVoid();
+      c.globalGet(this.jbBuf());
+      c.arrayLen();
+      c.i32Const(1 << 16);
+      c.i32GtU();
+      c.ifVoid();
+      c.refNull(strT);
+      c.globalSet(this.jbBuf());
+      c.end();
+      c.end();
+      c.localGet(R);
+      this.mb.setBody(idx, [I32, this.deps.strRef()], c.bytes());
+    });
+  }
+
+  /* ── JSON.stringify: the pretty-print re-indenter ───────────────────────
+   * `JSON.stringify(v, null, space)` as a REWRITE of the compact text —
+   * C's sc_ji (emit-walkers.ts jsonIndentHelper) ported unit for unit,
+   * which is Node's gap algorithm. Structural '{' / '[' open a newline
+   * and one more level of indent unless immediately closed (`{}` and `[]`
+   * stay inline, like Node), '}' / ']' close onto their own line at the
+   * outer depth, ',' breaks the line, and the key ':' gains one space.
+   * String state (with escape skipping) keeps braces, commas and colons
+   * that live INSIDE a JSON string untouched.
+   *
+   * The input is this module's own compact output, so it is well-formed
+   * by construction and the state machine needs no error paths. An empty
+   * indent never reaches here — the frontend drops the property. */
+
+  /** `%w.json.jbNewline(indent, depth)` — a line break and `depth`
+   * copies of the indent unit string. */
+  private jbNewline(): number {
+    return this.cached("jbNewline", [this.deps.strRef(), I32], [], (idx) => {
+      const c = new Code();
+      const T = 2;
+      c.i32Const(0x0a);
+      c.call(this.jbPutc());
+      c.i32Const(0);
+      c.localSet(T);
+      c.block();
+      c.loop();
+      c.localGet(T);
+      c.localGet(1);
+      c.i32GeU();
+      c.brIf(1);
+      c.localGet(0);
+      c.call(this.jbPuts());
+      c.localGet(T);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(T);
+      c.br(0);
+      c.end();
+      c.end();
+      this.mb.setBody(idx, [I32], c.bytes());
+    });
+  }
+
+  /** `%w.json.indent(compact, indent)` → the pretty-printed text. */
+  indent(): number {
+    const strRef = this.deps.strRef();
+    return this.cached("indent", [strRef, strRef], [strRef], (idx) => {
+      const strT = this.deps.strType();
+      const c = new Code();
+      const N = 2;
+      const I = 3;
+      const U = 4;
+      const V = 5;
+      const D = 6;
+      const INSTR = 7;
+      c.call(this.jbBegin());
+      c.localGet(0);
+      c.arrayLen();
+      c.localSet(N);
+      c.i32Const(0);
+      c.localSet(I);
+      c.i32Const(0);
+      c.localSet(D);
+      c.i32Const(0);
+      c.localSet(INSTR);
+      c.block(); // OUTER
+      c.loop(); // LOOP
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeU();
+      c.brIf(1);
+      c.localGet(0);
+      c.localGet(I);
+      c.arrayGetU(strT);
+      c.localSet(U);
+      c.block(); // UNIT
+      // Inside a string: copy verbatim, and copy the unit after a
+      // backslash with it so an escaped quote cannot end the string.
+      c.localGet(INSTR);
+      c.ifVoid();
+      c.localGet(U);
+      c.call(this.jbPutc());
+      c.localGet(U);
+      c.i32Const(0x5c);
+      c.i32Eq();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localGet(N);
+      c.i32LtU();
+      c.i32And(); // both operands are pure compares — no array read
+      c.ifVoid();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.localGet(0);
+      c.localGet(I);
+      c.arrayGetU(strT);
+      c.call(this.jbPutc());
+      c.br(2);
+      c.end();
+      c.localGet(U);
+      c.i32Const(0x22);
+      c.i32Eq();
+      c.ifVoid();
+      c.i32Const(0);
+      c.localSet(INSTR);
+      c.end();
+      c.br(1);
+      c.end();
+      // An opening quote.
+      c.localGet(U);
+      c.i32Const(0x22);
+      c.i32Eq();
+      c.ifVoid();
+      c.i32Const(1);
+      c.localSet(INSTR);
+      c.localGet(U);
+      c.call(this.jbPutc());
+      c.br(1);
+      c.end();
+      // '{' or '[' — an empty container stays on one line.
+      c.localGet(U);
+      c.i32Const(0x7b);
+      c.i32Eq();
+      c.localGet(U);
+      c.i32Const(0x5b);
+      c.i32Eq();
+      c.i32Or();
+      c.ifVoid();
+      c.localGet(U);
+      c.call(this.jbPutc());
+      // The peek reads the array, so bounds and content are an if-chain.
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localGet(N);
+      c.i32LtU();
+      c.ifVoid();
+      c.localGet(0);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.arrayGetU(strT);
+      c.localSet(V);
+      // '}' is '{' + 2 and ']' is '[' + 2, so one compare closes both.
+      c.localGet(V);
+      c.localGet(U);
+      c.i32Const(2);
+      c.i32Add();
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.localGet(V);
+      c.call(this.jbPutc());
+      c.br(3);
+      c.end();
+      c.end();
+      c.localGet(D);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(D);
+      c.localGet(1);
+      c.localGet(D);
+      c.call(this.jbNewline());
+      c.br(1);
+      c.end();
+      // '}' or ']' — close at the OUTER depth.
+      c.localGet(U);
+      c.i32Const(0x7d);
+      c.i32Eq();
+      c.localGet(U);
+      c.i32Const(0x5d);
+      c.i32Eq();
+      c.i32Or();
+      c.ifVoid();
+      c.localGet(D);
+      c.i32Const(1);
+      c.i32Sub();
+      c.localSet(D);
+      c.localGet(1);
+      c.localGet(D);
+      c.call(this.jbNewline());
+      c.localGet(U);
+      c.call(this.jbPutc());
+      c.br(1);
+      c.end();
+      // ',' breaks the line at the current depth.
+      c.localGet(U);
+      c.i32Const(0x2c);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(U);
+      c.call(this.jbPutc());
+      c.localGet(1);
+      c.localGet(D);
+      c.call(this.jbNewline());
+      c.br(1);
+      c.end();
+      // The key ':' gains one space.
+      c.localGet(U);
+      c.i32Const(0x3a);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(U);
+      c.call(this.jbPutc());
+      c.i32Const(0x20);
+      c.call(this.jbPutc());
+      c.br(1);
+      c.end();
+      c.localGet(U);
+      c.call(this.jbPutc());
+      c.end(); // UNIT
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end(); // LOOP
+      c.end(); // OUTER
+      c.call(this.jbFinish());
+      this.mb.setBody(idx, [I32, I32, I32, I32, I32, I32], c.bytes());
+    });
+  }
+}
+
+/** One record KEY (or any compile-time-known string) as a quoted JSON
+ * string literal, escaped by exactly the rule `jbPutStr` applies at
+ * runtime — so the emitter can bake `"name":` into the label literal
+ * instead of writing keys through the escape walk.
+ *
+ * Node escapes keys with the FULL rule, keys and values alike: the object
+ * `{ 'a"b': 1 }` stringifies as `{"a\"b":1}` (verified against Node
+ * 24.18). The C generator writes keys RAW through cStringLiteral, which
+ * is a latent native-lane divergence for any key needing an escape; that
+ * is C's bug to fix, not a rule to inherit. */
+export function jsonQuote(s: string): string {
+  let out = '"';
+  for (let i = 0; i < s.length; i++) {
+    const u = s.charCodeAt(i);
+    if (u === 0x22 || u === 0x5c) {
+      out += `\\${s[i]}`;
+      continue;
+    }
+    if (u < 0x20) {
+      switch (u) {
+        case 0x08: out += "\\b"; break;
+        case 0x0c: out += "\\f"; break;
+        case 0x0a: out += "\\n"; break;
+        case 0x0d: out += "\\r"; break;
+        case 0x09: out += "\\t"; break;
+        default: out += `\\u${u.toString(16).padStart(4, "0")}`;
+      }
+      continue;
+    }
+    if ((u & 0xf800) === 0xd800) {
+      const paired =
+        (u & 0x0400) === 0
+          ? i + 1 < s.length && (s.charCodeAt(i + 1) & 0xfc00) === 0xdc00
+          : i > 0 && (s.charCodeAt(i - 1) & 0xfc00) === 0xd800;
+      if (!paired) {
+        out += `\\u${u.toString(16).padStart(4, "0")}`;
+        continue;
+      }
+    }
+    out += s[i];
+  }
+  return `${out}"`;
 }

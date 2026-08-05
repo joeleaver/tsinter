@@ -953,6 +953,327 @@ test("JSON.parse: trailing garbage after a complete number reports cleanly", asy
   );
 });
 
+test("JSON.stringify: the compact forms a static type serializes to", async () => {
+  // The type-directed walkers, one arm at a time: records in DECLARED
+  // order, tuples as JSON arrays, arrays with their loop, nesting through
+  // both, and unions dispatching on the tag (the null arm writes the text
+  // `null`). Every expectation was captured by running the same program
+  // under Node 24.18.
+  const res = await buildWasm(
+    "json-write-shapes.ts",
+    [
+      "interface Rec { b: number; a: string; ok: boolean }",
+      "interface Inner { z: number }",
+      "interface Outer { n: number[]; r: Inner }",
+      "interface W { v: string | number | null }",
+      'const rec: Rec = { b: 1, a: "x", ok: false };',
+      "console.log(JSON.stringify(rec));",
+      "console.log(JSON.stringify([1, 2, 3]));",
+      'console.log(JSON.stringify(["a", "b"]));',
+      'const tup: [string, number, boolean] = ["a", 1, true];',
+      "console.log(JSON.stringify(tup));",
+      "console.log(JSON.stringify([[1], [2, 3]]));",
+      "const outer: Outer = { n: [1, 2], r: { z: 1 } };",
+      "console.log(JSON.stringify(outer));",
+      "const none: number[] = [];",
+      "console.log(JSON.stringify(none));",
+      "console.log(JSON.stringify('plain'), JSON.stringify(true), JSON.stringify(false));",
+      "const vs: (string | number | null)[] = ['a', 1, null];",
+      "console.log(JSON.stringify(vs));",
+      "const ws: W[] = [{ v: null }, { v: 's' }, { v: 2 }];",
+      "console.log(JSON.stringify(ws));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      '{"b":1,"a":"x","ok":false}',
+      "[1,2,3]",
+      '["a","b"]',
+      '["a",1,true]',
+      "[[1],[2,3]]",
+      '{"n":[1,2],"r":{"z":1}}',
+      "[]",
+      '"plain" true false',
+      '["a",1,null]',
+      '[{"v":null},{"v":"s"},{"v":2}]',
+      "",
+    ].join("\n"),
+  );
+});
+
+test("JSON.stringify: the number rule — non-finite is null, -0 is 0", async () => {
+  // JSON has no NaN and no Infinity, so all three serialize as `null`
+  // (which is NOT what String() does — the same value prints "NaN"
+  // through console.log two lines apart here). Zero loses its sign for
+  // the same reason String(-0) does.
+  const res = await buildWasm(
+    "json-write-nums.ts",
+    [
+      "const zero: number = 0;",
+      "const negZero: number = -0;",
+      "const nan: number = 0 / 0;",
+      "const inf: number = 1 / 0;",
+      "console.log(JSON.stringify([zero, negZero, 1, -1, 0.5, 1e21, 1 / 3, 1e-7]));",
+      "console.log(JSON.stringify(nan), JSON.stringify(inf), JSON.stringify(-inf));",
+      "console.log(JSON.stringify(negZero), String(negZero), String(nan));",
+      "console.log(JSON.stringify([9007199254740993, 1.7976931348623157e308, 5e-324]));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "[0,0,1,-1,0.5,1e+21,0.3333333333333333,1e-7]",
+      "null null null",
+      "0 0 NaN",
+      "[9007199254740992,1.7976931348623157e+308,5e-324]",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("S002: JSON.stringify is Node's WELL-FORMED form, lone surrogates escaped", async () => {
+  // The one place stringify must diverge from the C reference. C walks
+  // UTF-8 bytes whose storage substituted U+FFFD long before stringify
+  // ever ran, so it has no surrogate to decide about; this tier stores
+  // real UTF-16 units (S002), so an unpaired half arrives intact and Node
+  // escapes it — ES2019's well-formed rule. A PAIR passes through as its
+  // two units. No corpus program can pin any of this: the native lanes
+  // disagree by construction, which is exactly S002's stance.
+  //
+  // Note what is NOT escaped: '/', DEL (0x7f), and every non-ASCII
+  // character. Captured from Node 24.18 with the JS twin of this program.
+  const res = await buildWasm(
+    "json-write-escapes.ts",
+    [
+      `const s: string = '"' + '\\\\' + '\\b\\f\\n\\r\\t' + '\\u0000\\u001f\\u007f' + '/' + 'é✓';`,
+      "console.log(JSON.stringify(s));",
+      // Each half of the surrogate range, alone: all four escape.
+      `console.log(JSON.stringify(['\\ud800', '\\udc00', '\\udbff', '\\udfff']));`,
+      // A pair passes verbatim, and stays verbatim next to a lone half.
+      `console.log(JSON.stringify(['\\ud83d\\ude00', 'a\\ud83d\\ude00b', '\\ud800\\ud83d\\ude00', '\\ud83d\\ude00\\udc00']));`,
+      // Low-then-high is TWO unpaired halves, not a pair the wrong way up.
+      `console.log(JSON.stringify(['\\udc00\\ud800', '\\ud800\\ud800\\udc00']));`,
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      String.raw`"\"\\\b\f\n\r\t\u0000\u001f` + '\u007f/é✓"',
+      String.raw`["\ud800","\udc00","\udbff","\udfff"]`,
+      '["😀","a😀b","' + String.raw`\ud800` + '😀","😀' + String.raw`\udc00` + '"]',
+      '["' + String.raw`\udc00\ud800` + '","' + String.raw`\ud800` + '𐀀"]',
+      "",
+    ].join("\n"),
+  );
+});
+
+test("JSON.stringify: record KEYS escape by the SAME rule as values", async () => {
+  // Node escapes keys with the full well-formed rule (verified against
+  // Node 24.18). The C generator writes keys RAW through cStringLiteral,
+  // which is a latent native-lane divergence for any key needing an
+  // escape — C's bug, not a rule to inherit, so no corpus program can pin
+  // this either. The labels here are baked at COMPILE time, which is why
+  // the escape rule exists twice (jsonQuote in TS, jbPutStr in wasm).
+  //
+  // A lone-surrogate KEY is absent on purpose: tsc 7's checker talks to
+  // its native half over a JSON channel that rejects an unpaired half in
+  // a property name, so such a program cannot be compiled at all. That
+  // unit is pinned as a VALUE by the S002 test above, through the very
+  // rule jsonQuote mirrors.
+  const res = await buildWasm(
+    "json-write-keys.ts",
+    [
+      "interface K {",
+      `  '"quoted"': number;`,
+      "  'new\\nline': number;",
+      "  'ctl\\u0001x': number;",
+      "  'back\\\\slash': number;",
+      "  plain: number;",
+      "}",
+      "const k: K = {",
+      `  '"quoted"': 1,`,
+      "  'new\\nline': 2,",
+      "  'ctl\\u0001x': 3,",
+      "  'back\\\\slash': 4,",
+      "  plain: 5,",
+      "};",
+      "console.log(JSON.stringify(k));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    String.raw`{"\"quoted\"":1,"new\nline":2,"ctl\u0001x":3,"back\\slash":4,"plain":5}` + "\n",
+  );
+});
+
+test("JSON.stringify: a key a PROGRAM spelled '%x' serializes, unlike an internal", async () => {
+  // The distinction is the mechanism, and getting it wrong is a silent
+  // miscompile rather than a refusal. Compiler-synthesized members
+  // (Dirent's %dtype) are hidden from JSON because declaredOrder OMITS
+  // them — not because of anything about their name. A key a program
+  // actually wrote is in declaredOrder, so it serializes, and Node and
+  // the native lanes all print it. An emitter that filtered on the '%'
+  // prefix instead would drop it and say nothing; that is the bug this
+  // pins against, and a shape whose keys ALL start with '%' is the case
+  // where such a filter produces an empty object out of a full one.
+  //
+  // Captured from Node 24.18. No corpus program uses a '%' key, which is
+  // why the axis went untested until an oracle probe varied it.
+  const res = await buildWasm(
+    "json-write-pct-keys.ts",
+    [
+      "interface Pct { '%dtype': number; plain: string }",
+      "interface AllPct { '%a': number; '%b': number }",
+      "const pct: Pct = { '%dtype': 1, plain: 'a' };",
+      "console.log(JSON.stringify(pct));",
+      "console.log(JSON.stringify({ '%x': 1, y: 2 }));",
+      "const allPct: AllPct = { '%a': 1, '%b': 2 };",
+      "console.log(JSON.stringify(allPct));",
+      "console.log(JSON.stringify([pct]));",
+      "console.log(JSON.stringify(pct, null, 2));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      '{"%dtype":1,"plain":"a"}',
+      '{"%x":1,"y":2}',
+      '{"%a":1,"%b":2}',
+      '[{"%dtype":1,"plain":"a"}]',
+      "{",
+      '  "%dtype": 1,',
+      '  "plain": "a"',
+      "}",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("JSON.stringify: optional fields DROP, exactly like Node", async () => {
+  // An undefined-armed field turns comma placement into runtime state (a
+  // `first` flag); an all-required shape keeps its separators baked into
+  // the label literals. Both paths are here, plus the all-optional shape
+  // holding nothing — the only way to reach `{}` on this tier, since an
+  // empty interface types as `unknown` and takes the dyn root instead.
+  const res = await buildWasm(
+    "json-write-optional.ts",
+    [
+      "interface P { a?: string; b: number; c?: number }",
+      "interface Q { only?: number }",
+      "const p1: P = { b: 1 };",
+      "const p2: P = { a: 'x', b: 1, c: 2 };",
+      "const p3: P = { a: 'x', b: 1 };",
+      "const p4: P = { b: 1, c: 2 };",
+      "console.log(JSON.stringify(p1), JSON.stringify(p2), JSON.stringify(p3), JSON.stringify(p4));",
+      "const q: Q = {};",
+      "console.log(JSON.stringify(q), JSON.stringify({ only: 1 } as Q));",
+      "console.log(JSON.stringify([p1, p2]));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      '{"b":1} {"a":"x","b":1,"c":2} {"a":"x","b":1} {"b":1,"c":2}',
+      '{} {"only":1}',
+      '[{"b":1},{"a":"x","b":1,"c":2}]',
+      "",
+    ].join("\n"),
+  );
+});
+
+test("JSON.stringify: `space` re-indents with Node's gap algorithm", async () => {
+  // The pretty form is a REWRITE of the compact text, so what it has to
+  // get right is the state machine: empty `{}` and `[]` stay inline,
+  // structural characters INSIDE a string are untouched, the key colon
+  // gains one space, and a string space (not just a number) works.
+  // Scalars ignore the space entirely. Captured from Node 24.18.
+  const res = await buildWasm(
+    "json-write-indent.ts",
+    [
+      "interface Meta { n: number; ok: boolean }",
+      // All-optional and holding nothing: the tier's only `{}` (an empty
+      // interface types as `unknown`, which is the dyn root).
+      "interface Empty { only?: number }",
+      "interface Doc { name: string; tags: string[]; meta: Meta; empty: Empty; none: number[] }",
+      "const doc: Doc = { name: 'x', tags: ['a', 'b'], meta: { n: 1, ok: true }, empty: {}, none: [] };",
+      "console.log(JSON.stringify(doc, null, 2));",
+      "console.log('---');",
+      "console.log(JSON.stringify(doc, null, '--'));",
+      "console.log('---');",
+      `console.log(JSON.stringify({ s: 'a:b,c{d}e"f' }, null, 2));`,
+      "console.log('---');",
+      "console.log(JSON.stringify([1, [2, [3]]], null, 1));",
+      "console.log('---');",
+      "console.log(JSON.stringify('scalar', null, 2), JSON.stringify(7, null, 2));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "{",
+      '  "name": "x",',
+      '  "tags": [',
+      '    "a",',
+      '    "b"',
+      "  ],",
+      '  "meta": {',
+      '    "n": 1,',
+      '    "ok": true',
+      "  },",
+      '  "empty": {},',
+      '  "none": []',
+      "}",
+      "---",
+      "{",
+      '--"name": "x",',
+      '--"tags": [',
+      '----"a",',
+      '----"b"',
+      "--],",
+      '--"meta": {',
+      '----"n": 1,',
+      '----"ok": true',
+      "--},",
+      '--"empty": {},',
+      '--"none": []',
+      "}",
+      "---",
+      "{",
+      `  "s": "a:b,c{d}e${String.raw`\"`}f"`,
+      "}",
+      "---",
+      "[",
+      " 1,",
+      " [",
+      "  2,",
+      "  [",
+      "   3",
+      "  ]",
+      " ]",
+      "]",
+      "---",
+      '"scalar" 7',
+      "",
+    ].join("\n"),
+  );
+});
+
 test("S015: keyed reads on unknown see OWN properties only", async () => {
   // Node consults the prototype chain here and answers a real function;
   // every tsinter lane answers undefined because the dyn tree stores own

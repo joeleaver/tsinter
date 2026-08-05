@@ -86,7 +86,7 @@ import {
 } from "./abi.js";
 import { VecBuilder, type VecInfo } from "./arrays.js";
 import { DK, DYN_KIND, DYN_NUM, DYN_REF, DynBuilder, FN_CLOS, FN_SIG } from "./dyn.js";
-import { JsonBuilder } from "./json.js";
+import { JsonBuilder, jsonQuote } from "./json.js";
 import {
   PromiseBuilder,
   ALL_REMAINING,
@@ -1730,6 +1730,258 @@ class Assembler {
       }
       default:
         this.refuse(`dynFrom:${t.kind}`, loc);
+        return false;
+    }
+  }
+
+  /* ── the type-directed JSON serializers ────────────────────────────────
+   * `JSON.stringify(v)` compiles to a walker chosen by v's STATIC type —
+   * C's sc_jw_* family (emit-walkers.ts jsonWriteHelper), ported with the
+   * same interning discipline as the dyn walkers above. Each writes into
+   * the module's one output buffer (json.ts's jb globals) and returns
+   * nothing; the SITE brackets the call with the buffer's begin/finish.
+   *
+   * Nothing here can throw in this increment. Every static JSON-safe type
+   * the tier admits today is ACYCLIC (recordInfo refuses shapes recursive
+   * through their own fields, which is exactly the cycle-capable set), and
+   * no user code runs mid-walk — so there is no circular-structure check
+   * to pay for and no pending check at the site. Recursive shapes and
+   * their circular detection are their own stage. */
+
+  private readonly jsonWriteFns = new Map<string, number>();
+
+  /** %w.json.write:<typeKey> — the serializer for one static type. Null
+   * (refusal recorded by whichever part failed) when a constituent is out
+   * of tier: a recursive record shape names itself `record:recursive`
+   * through recordInfo, which is the census signal for the stage that
+   * lands it. */
+  private jsonWriteHelper(t: IrType, loc: SrcLoc | undefined): number | null {
+    const key = typeKey(t);
+    const hit = this.jsonWriteFns.get(key);
+    if (hit !== undefined) return hit;
+    const val = this.mapType(t, loc);
+    if (val === null) return null;
+    const idx = this.mb.declareFunc(this.mb.funcType([val], []), `%w.json.write:${key}`);
+    this.jsonWriteFns.set(key, idx);
+    const w = this.newWalker(1);
+    if (!this.emitJsonWriteBody(w, t, loc)) return this.walkerDead(idx);
+    this.mb.setBody(idx, w.locals, w.c.bytes());
+    return idx;
+  }
+
+  private emitJsonWriteBody(w: WalkerCtx, t: IrType, loc: SrcLoc | undefined): boolean {
+    const c = w.c;
+    const json = this.json;
+    switch (t.kind) {
+      case "f64":
+        c.localGet(0);
+        c.call(json.jbPutF64());
+        return true;
+      case "bool":
+        c.localGet(0);
+        c.ifResult(this.strRef);
+        this.pushStrLitInto(c, "true");
+        c.else_();
+        this.pushStrLitInto(c, "false");
+        c.end();
+        c.call(json.jbPuts());
+        return true;
+      case "string":
+        c.localGet(0);
+        c.call(json.jbPutStr());
+        return true;
+      case "record": {
+        const shape = this.recordShapes.get(t.shapeId);
+        const info = this.recordInfo(t.shapeId, loc, false);
+        if (shape === undefined || info === null) return false;
+        // A TUPLE serializes as the JSON array it is, in index order —
+        // JS-exact (`JSON.stringify(["a", 1])` is `["a",1]`). Every
+        // position is required (an undefined-armed position takes the
+        // ARRAY rule, so the frontend fences it), which keeps the commas
+        // static.
+        if (shape.tuple) {
+          this.pushStrLitInto(c, "[");
+          c.call(json.jbPuts());
+          const byIndex = this.tupleFieldOrder(shape);
+          for (let i = 0; i < byIndex.length; i++) {
+            const f = byIndex[i]!;
+            const inner = this.jsonWriteHelper(f.type, loc);
+            const slot = info.fieldIndex.get(f.name);
+            if (inner === null || slot === undefined) return false;
+            if (i > 0) {
+              c.i32Const(0x2c);
+              c.call(json.jbPutc());
+            }
+            c.localGet(0);
+            c.structGet(info.struct, slot);
+            c.call(inner);
+          }
+          this.pushStrLitInto(c, "]");
+          c.call(json.jbPuts());
+          return true;
+        }
+        // Fields serialize in DECLARED order — JS insertion order, which
+        // is what a reader observes — never the canonical (sorted) struct
+        // order.
+        //
+        // WHAT HIDES A COMPILER-SYNTHESIZED FIELD IS declaredOrder
+        // OMISSION, NOT ITS NAME. Internals like Dirent's `%dtype` are
+        // absent from declaredOrder, so mapping over `order` already
+        // leaves them out — while a key a PROGRAM spelled `"%x"` is
+        // present in declaredOrder and must serialize, because Node
+        // prints it and so do the native lanes. Filtering on the '%'
+        // prefix here instead would drop that key silently, which is a
+        // miscompile rather than a refusal; the unit tests pin it.
+        // A declaredOrder omitting a VISIBLE field is an emitter bug.
+        const byName = new Map(shape.fields.map((f) => [f.name, f]));
+        const order = shape.declaredOrder ?? shape.fields.map((f) => f.name);
+        const inOrder = new Set(order);
+        if (shape.fields.some((f) => !inOrder.has(f.name) && !f.name.startsWith("%"))) {
+          throw new Error(`wasm emitter bug: declaredOrder of shape ${t.shapeId} omits a non-internal field`);
+        }
+        const fields = order
+          .map((n) => byName.get(n))
+          .filter((f): f is (typeof shape.fields)[number] => f !== undefined);
+        // An optional-flavored field (an undefined-armed union — the
+        // `a?: T` spelling) DROPS from the output while it holds the
+        // undefined arm, exactly like Node. One such field anywhere makes
+        // comma placement runtime state (a `first` flag); an all-required
+        // shape keeps its separators baked into the label literals.
+        const droppable = fields.some((f) => this.undefinedArmTag2(f.type) >= 0);
+        if (!droppable) {
+          for (let i = 0; i < fields.length; i++) {
+            const f = fields[i]!;
+            const inner = this.jsonWriteHelper(f.type, loc);
+            const slot = info.fieldIndex.get(f.name);
+            if (inner === null || slot === undefined) return false;
+            this.pushStrLitInto(c, `${i === 0 ? "{" : ","}${jsonQuote(f.name)}:`);
+            c.call(json.jbPuts());
+            c.localGet(0);
+            c.structGet(info.struct, slot);
+            c.call(inner);
+          }
+          this.pushStrLitInto(c, fields.length === 0 ? "{}" : "}");
+          c.call(json.jbPuts());
+          return true;
+        }
+        const first = this.wlocal(w, I32);
+        this.pushStrLitInto(c, "{");
+        c.call(json.jbPuts());
+        c.i32Const(1);
+        c.localSet(first);
+        for (const f of fields) {
+          const inner = this.jsonWriteHelper(f.type, loc);
+          const slot = info.fieldIndex.get(f.name);
+          if (inner === null || slot === undefined) return false;
+          const utag = this.undefinedArmTag2(f.type);
+          if (utag >= 0) {
+            c.localGet(0);
+            c.structGet(info.struct, slot);
+            c.structGet(this.unions.base(), 0);
+            c.i32Const(utag);
+            c.i32Ne();
+            c.ifVoid();
+          }
+          c.localGet(first);
+          c.i32Eqz();
+          c.ifVoid();
+          c.i32Const(0x2c);
+          c.call(json.jbPutc());
+          c.end();
+          c.i32Const(0);
+          c.localSet(first);
+          this.pushStrLitInto(c, `${jsonQuote(f.name)}:`);
+          c.call(json.jbPuts());
+          c.localGet(0);
+          c.structGet(info.struct, slot);
+          c.call(inner);
+          if (utag >= 0) c.end();
+        }
+        this.pushStrLitInto(c, "}");
+        c.call(json.jbPuts());
+        return true;
+      }
+      case "array": {
+        const src = this.vecInfoFor(t, loc);
+        const inner = this.jsonWriteHelper(t.elem, loc);
+        if (src === null || inner === null) return false;
+        const i = this.wlocal(w, I32);
+        const n = this.wlocal(w, I32);
+        this.pushStrLitInto(c, "[");
+        c.call(json.jbPuts());
+        c.localGet(0);
+        c.structGet(src.struct, 0);
+        c.localSet(n);
+        c.i32Const(0);
+        c.localSet(i);
+        c.block();
+        c.loop();
+        c.localGet(i);
+        c.localGet(n);
+        c.i32GeU();
+        c.brIf(1);
+        c.localGet(i);
+        c.ifVoid();
+        c.i32Const(0x2c);
+        c.call(json.jbPutc());
+        c.end();
+        c.localGet(0);
+        c.structGet(src.struct, 1);
+        c.localGet(i);
+        this.vecs.emitElemRead(c, src);
+        c.call(inner);
+        c.localGet(i);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(i);
+        c.br(0);
+        c.end();
+        c.end();
+        this.pushStrLitInto(c, "]");
+        c.call(json.jbPuts());
+        return true;
+      }
+      case "union": {
+        const def = this.unionDef(t.unionId);
+        const tag = this.wlocal(w, I32);
+        c.localGet(0);
+        c.structGet(this.unions.base(), 0);
+        c.localSet(tag);
+        for (let i = 0; i < def.arms.length; i++) {
+          const arm = def.arms[i]!;
+          c.localGet(tag);
+          c.i32Const(i);
+          c.i32Eq();
+          c.ifVoid();
+          if (arm.kind === "nullT") {
+            this.pushStrLitInto(c, "null");
+            c.call(json.jbPuts());
+          } else if (arm.kind === "undefinedT") {
+            // Reachable only as a record FIELD's serializer (a bare
+            // undefined-armed union is frontend-fenced), and the record
+            // walker drops the field while it holds this tag before ever
+            // calling — so arriving here is an emitter bug, and loud.
+            c.unreachable();
+          } else {
+            const struct = this.unionArmStruct(t.unionId, i, loc);
+            const inner = this.jsonWriteHelper(arm, loc);
+            if (struct === null || inner === null) return false;
+            c.localGet(0);
+            c.refCast(struct);
+            c.structGet(struct, 1);
+            c.call(inner);
+          }
+          c.return_();
+          c.end();
+        }
+        // A corrupted tag is loud, never silent (the union helpers' rule).
+        c.unreachable();
+        return true;
+      }
+      default:
+        // Reachable only for a nested `dyn` (an index-signature shape's
+        // overflow values), which recordInfo refuses one level up today.
+        this.refuse(`jsonWrite:${t.kind}`, loc);
         return false;
     }
   }
@@ -6666,6 +6918,48 @@ class Assembler {
         return;
       }
 
+      case "jsonStringify": {
+        // Type-directed serialization: the STATIC type picks the walker,
+        // interned per type — no dynamic dispatch anywhere. A dyn ROOT is
+        // the one shape that needs one, and it waits for the dyn walker.
+        if (e.value.type.kind === "dyn") {
+          this.refuse("expr:jsonStringify", e.loc);
+          code.unreachable();
+          return;
+        }
+        const helper = this.jsonWriteHelper(e.value.type, e.loc);
+        const val = this.mapType(e.value.type, e.loc);
+        if (helper === null || val === null) {
+          code.unreachable();
+          return;
+        }
+        // The value is evaluated FIRST (JS order) and parked, so the
+        // buffer prologue sits immediately before this walk — a nested
+        // `JSON.stringify` inside the argument then finishes, and resets
+        // the buffer, strictly before the prologue rather than after it.
+        const v = this.acquireScratch(val);
+        this.walkExpr(e.value);
+        code.localSet(v);
+        code.call(this.json.jbBegin());
+        code.localGet(v);
+        code.call(helper);
+        this.releaseScratch(val, v);
+        code.call(this.json.jbFinish());
+        // No pending check: every static root the tier admits today is
+        // acyclic and nothing user-written runs mid-walk, so the walkers
+        // are throw-free (the walker family's comment carries the
+        // argument). Cycle-capable roots bring their own check.
+        const indent = (e as { indent?: string }).indent;
+        if (indent !== undefined && indent !== "") {
+          // `space` arrived here as the frontend's compile-time
+          // resolution of it; the re-indenter rewrites the compact text
+          // with Node's gap algorithm.
+          this.pushStrLit(indent);
+          code.call(this.json.indent());
+        }
+        return;
+      }
+
       /* Unit values exist only inside unions (unionWrap intercepts them
        * before the walk, so a reached unitLit is refused loudly). */
       case "unitLit":
@@ -6705,7 +6999,6 @@ class Assembler {
       /* The dyn surface past the scalar core: the composite converters,
        * the keyed reads, and the invoke boundary. */
       case "dynFromJsval":
-      case "jsonStringify":
       /* The island bridge — an engine embedding, so likely never on this
        * backend at all. */
       case "jsMarshal":

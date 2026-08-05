@@ -858,6 +858,61 @@ const TIER_FLOOR: string[] = [
   "2037-fn-decl-hoisting.cjs",
   "2195-require-missing-package/main.mjs",
   "2566-promise-reject-dyn-reason.js",
+  // Increment 15 (JSON.stringify), stage A: TYPE-DIRECTED serialization.
+  // The static type picks an emitted walker (one per typeKey, C's sc_jw_*
+  // family) writing into one module-global output buffer; records
+  // serialize in declared order with their labels — keys escaped — baked
+  // into the emitted literals, optional fields drop while they hold
+  // undefined, tuples serialize as JSON arrays, and a `space` argument
+  // re-indents the compact text with Node's gap algorithm. Escaping is
+  // Node's WELL-FORMED rule, which is where this tier stops following the
+  // C runtime (S002 again: unpaired surrogates survive here, so they must
+  // escape rather than never arrive).
+  //
+  // The json-named eight are the direct claim. The rest were blocked on a
+  // stringify buried somewhere in a program about something else, which
+  // is why the queue counted this construct in 148 programs while only 62
+  // refused at it FIRST: the width/spread/destructuring families print
+  // their results as JSON.
+  //
+  // Two shapes stay out and both are named in the census rather than
+  // silent: a dyn ROOT (2110, 2111) needs the dyn walker, and a RECURSIVE
+  // record shape (2484 and the 2480s) now refuses as `record:recursive`,
+  // which is the rec-group stage's queue signal.
+  "541-ref-array-json.ts",
+  "967-record-field-widening.ts",
+  "1000-json-stringify-basics.ts",
+  "1001-json-escapes-unicode.ts",
+  "1003-json-parse-unions.ts",
+  "1005-json-nested.ts",
+  "1007-json-rc-stress.ts",
+  "1008-json-null-arms.ts",
+  "1009-json-optional-fields.ts",
+  "1010-json-stringify-space.ts",
+  "1118-object-spread-conditional.ts",
+  "1373-union-array-arms.ts",
+  "1476-assign-expression.ts",
+  "1479-destructuring-assign.ts",
+  "1530-array-push-variadic.ts",
+  "1531-delete-optional-fields.ts",
+  "1532-array-splice-shift.ts",
+  "1871-empty-array-never.ts",
+  "1942-class-expressions.ts",
+  "2023-width-readonly.ts",
+  "2031-width-tuples.ts",
+  "2036-evolving-array-decl.cjs",
+  "2070-computed-key-folds.ts",
+  "2071-integer-key-enumeration-order.ts",
+  "2105-computed-key-static-folds.ts",
+  "2106-comma-expressions.ts",
+  "2190-new-object-and-string-wrappers.ts",
+  "2240-width-class-into-record.ts",
+  "2243-width-assert-satisfies-shapes.ts",
+  "2416-spread-ternary-positions.ts",
+  "2417-ternary-local-inference.ts",
+  "2444-union-literal-reducer-spread.ts",
+  "2535-destructuring-assign-basics.ts",
+  "2539-class-instance-rest.ts",
 ];
 
 interface RunResult {
