@@ -88,12 +88,26 @@
  * WHAT IS NOT HERE. HANDLE and JSVAL values are unconstructible on this
  * tier (they enter only through libCalls the wasm backend refuses), so
  * the arms that would read their payloads are `unreachable` rather than
- * guesses. FUNC boxes arrive with dynCall and BYTES with the typed-array
- * work; until then their arms say so. The dyn tree's ERROR encoding — an
- * OBJ carrying the reserved "%error" key — has no producer until
- * caughtToDyn lands, and `toStr` TRAPS on one rather than answering
- * "[object Object]": a wrong answer there would be silent, and the trap
- * is what makes the missing arm impossible to forget. */
+ * guesses. BYTES arrives with the typed-array work; until then its arms
+ * say so. The dyn tree's ERROR encoding — an OBJ carrying the reserved
+ * "%error" key — has no producer until caughtToDyn lands, and `toStr`
+ * TRAPS on one rather than answering "[object Object]": a wrong answer
+ * there would be silent, and the trap is what makes the missing arm
+ * impossible to forget.
+ *
+ * FUNC boxes DO exist now, and the sequencing rule they arrived under is
+ * worth keeping: every arm a new payload makes reachable is filled
+ * BEFORE the first producer lands, because an unfilled arm is only loud
+ * while nothing can reach it. The FUNC surface is `strictEq` (closure
+ * identity), `keyGet` and `hasOwn` (`name`/`length` — present exactly
+ * where Node has them, ANSWERING S020's approximations), `toStr` (the
+ * native-code form, S019), `typeof`, `truthy` and `objWalk` (which
+ * answers the empty key list, Node's own answer for a function) — plus
+ * `callFn` and the emitter's per-signature thunks, which are the payload
+ * itself doing its job. `keySet` deliberately KEEPS the throw its
+ * primitive receivers get: a FUNC payload has no property table to write
+ * into (the own-property table C hangs off the closure has no producer
+ * here — see `$dynFn` below), so S016 registers the write. */
 import type { VecInfo } from "./arrays.js";
 import { Code } from "./code.js";
 import { F64, I32, ModuleBuilder, type ValType } from "./module.js";
@@ -143,7 +157,11 @@ export const ENTRY_VALUE = 1;
  * emitted call glue. SIG is the INTERNED typeKey id — C compares the
  * signature by `strcmp` on a string literal and LLVM interns; an i32
  * compare is the same question asked once at compile time. NAME and
- * ARITY answer `f.name` and `f.length`.
+ * ARITY answer `f.name` and `f.length` — APPROXIMATELY: both are what
+ * the lowering could see at the BOX SITE (the binding's spelling, the
+ * declared parameter count), not what the engine derives from the
+ * function's definition, and SEMANTICS.md S020 registers where the two
+ * come apart.
  *
  * C additionally hangs an own-property TABLE off the CLOSURE (not the
  * box), lazily allocated by `Object.defineProperties`. That is the
@@ -620,6 +638,75 @@ export class DynBuilder {
     c.refCast(this.fnT());
   }
 
+  /** Build the whole FUNC box from its five operands —
+   * `scr_dyn_new_func`. The CLOSURE the caller pushes must be the boxed
+   * value's OWN closure (the interned per-function global, or the
+   * capturing env's `struct.new`), never the calling ABI's dead
+   * `ref.null` argument: FN_CLOS is `eq`, `ref.eq(null, null)` is TRUE,
+   * and two functions boxed with a null closure would answer `f === g`
+   * true. C is immune because a ScrClosure is always a real pointer; here
+   * the discipline is the caller's. `pushName` pushes NULL for an
+   * anonymous value — never the empty string, which keyGet's `name` arm
+   * substitutes at READ time (C's `d->v.fn.name ? : ""`). */
+  boxFn(
+    c: Code,
+    pushClos: (c: Code) => void,
+    pushThunk: (c: Code) => void,
+    sig: number,
+    pushName: (c: Code) => void,
+    arity: number,
+  ): void {
+    this.boxFunc(c, (x) => {
+      pushClos(x);
+      pushThunk(x);
+      x.i32Const(sig);
+      pushName(x);
+      x.i32Const(arity);
+      x.structNew(this.fnT());
+    });
+  }
+
+  /** %w.dyn.call(d, args, what) → the call's result — `scr_dyn_call`
+   * ported. A non-FUNC callee throws Node's catchable
+   * "<what> is not a function" (SEMANTICS.md S018: `what` is the source
+   * spelling the lowering threaded through, which V8 re-renders from its
+   * own AST for a few shapes); a FUNC callee dispatches through its boxed
+   * thunk, which owns the per-argument validation because it is the piece
+   * compiled per SIGNATURE. Args ride the vector the caller built; a null
+   * answer means the thunk left an exception pending, exactly C's
+   * contract. */
+  callFn(): number {
+    return this.cached(
+      "call",
+      [this.dynRef(), this.arrRef(), this.deps.strRef()],
+      [this.dynRef()],
+      (idx) => {
+        const c = new Code();
+        const MSG = 3;
+        c.localGet(0);
+        c.structGet(this.dynT(), DYN_KIND);
+        c.i32Const(DK.FUNC);
+        c.i32Ne();
+        c.ifVoid();
+        c.localGet(2);
+        this.deps.lit(c, " is not a function");
+        c.call(this.deps.concat());
+        c.localSet(MSG);
+        this.deps.throwTypeError(c, (x) => x.localGet(MSG));
+        c.refNull(this.dynT());
+        c.return_();
+        c.end();
+        this.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(this.fnT(), FN_CLOS);
+        c.localGet(1);
+        this.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(this.fnT(), FN_THUNK);
+        c.callRef(this.thunkSig());
+        this.mb.setBody(idx, [this.deps.strRef()], c.bytes());
+      },
+    );
+  }
+
   /* ── the interned constants ─────────────────────────────────────────── */
 
   /** THE immortal `undefined` — one const-initialized global, the C
@@ -724,14 +811,15 @@ export class DynBuilder {
    * promise crossing the boundary twice may be reboxed and is still one
    * JS value; and ARR/OBJ/BYTES — C's `default` arm and nothing else —
    * compare the BOXES, which is C's stance for the kinds it never reboxes.
-   * The three kinds with payload-identity arms in C (FUNC, HANDLE, JSVAL)
-   * are unconstructible here and trap rather than borrow that answer.
+   * FUNC compares the boxed CLOSURE, C's own payload-identity arm; the
+   * two remaining payload-identity kinds (HANDLE, JSVAL) are
+   * unconstructible here and trap rather than borrow that answer.
    *
-   * Its caller is `dynScalarEq` with BOTH operands dyn. The FUNC arm's
-   * trap stays reachable-in-principle from there, which is safe only
-   * because no FUNC box exists yet: `f === f` cannot arrive until stage 4
-   * builds one, and that stage owes this arm C's compare before it does
-   * (see the note on the arm itself). */
+   * Its caller is `dynScalarEq` with BOTH operands dyn, so `f === g` over
+   * two boxed functions arrives here — which is exactly why FN_CLOS must
+   * be sourced from the closure value itself. Two boxes built over a null
+   * closure would answer `true` (ref.eq on two nulls is true), silently;
+   * `boxFn` spells the discipline that prevents it. */
   strictEq(): number {
     return this.cached("strictEq", [this.dynRef(), this.dynRef()], [I32], (idx) => {
       const dynT = this.dynT();
@@ -1012,9 +1100,30 @@ export class DynBuilder {
       this.arm(c, K, [DK.PROMISE], () => this.deps.lit(c, "[object Promise]"));
       // The runtime handles inherit Object.prototype.toString.
       this.arm(c, K, [DK.HANDLE], () => this.deps.lit(c, "[object Object]"));
-      // FUNC's text embeds the boxed function's NAME and BYTES' depends on
-      // the Buffer flag — both live in payloads that arrive with their own
-      // stages (4 and the bytes work). Unconstructible until then.
+      // Function.prototype.toString, C's arm exactly: the SOURCE a JS
+      // engine would echo is gone in a compiled program, so this renders
+      // the native-code form engines print for their own non-JS
+      // functions — "function <name>() { [native code] }", with the name
+      // simply absent (and its space kept) when the value is anonymous.
+      // SEMANTICS.md S019.
+      this.arm(c, K, [DK.FUNC], () => {
+        this.deps.lit(c, "function ");
+        this.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(this.fnT(), FN_NAME);
+        c.localTee(OUT);
+        c.refIsNull();
+        c.ifResult(this.deps.strRef());
+        this.deps.lit(c, "");
+        c.else_();
+        c.localGet(OUT);
+        c.end();
+        c.call(concat);
+        this.deps.lit(c, "() { [native code] }");
+        c.call(concat);
+      });
+      // BYTES' text depends on the Buffer flag, which lives in a payload
+      // that arrives with the typed-array work. Unconstructible until
+      // then.
       c.unreachable();
       this.mb.setBody(
         idx,
@@ -1265,11 +1374,13 @@ export class DynBuilder {
         // A FUNC box answers the two function-instance members Node
         // defines, `scr_dyn_fn_get` ported: `name` (the empty string when
         // the value is anonymous — C's `d->v.fn.name ? : ""`) and
-        // `length` (the declared arity). C consults an own-property table
-        // FIRST, but its only writer is Object.defineProperties, which
-        // this backend refuses — so there is no table to consult and no
-        // key that could shadow these two. Everything else falls through
-        // to undefined, which is C's NULL answer reaching the same place.
+        // `length` (the declared arity). BOTH are compile-time
+        // approximations of Node's answers rather than equal to them —
+        // SEMANTICS.md S020 has the cases. C consults an own-property
+        // table FIRST, but its only writer is Object.defineProperties,
+        // which this backend refuses — so there is no table to consult
+        // and no key that could shadow these two. Everything else falls
+        // through to undefined, C's NULL answer reaching the same place.
         this.arm(c, K, [DK.FUNC], () => {
           c.localGet(1);
           this.deps.lit(c, "name");
@@ -1471,16 +1582,20 @@ export class DynBuilder {
    * other kind answers false, and a NULLISH receiver throws ToObject's
    * catchable "Cannot convert undefined or null to object".
    *
-   * THE STR ARM IS NOT IN THE C RUNTIME, deliberately. `scr_dyn_has_own`
-   * has OBJ and ARR arms and stops, so it answers false where Node
-   * answers true for `Object.hasOwn("abc", "length")` — while
-   * `scr_dyn_key_get` DOES model string length and index reads, which
-   * S015 names as the forms that work — answering false for them would
-   * contradict the register's own stated boundary. That reads as an
-   * omission rather than a stance, so this lane matches NODE. The C lane
-   * lacks this arm today; the convergence is task-tracked, and matching
-   * Node REMOVES a divergence rather than adding one, so there is nothing
-   * to register here. */
+   * THE STR AND FUNC ARMS ARE NOT IN THE C RUNTIME, deliberately.
+   * `scr_dyn_has_own` has OBJ and ARR arms and stops, so it answers false
+   * where Node answers true for `Object.hasOwn("abc", "length")` and for
+   * `Object.hasOwn(f, "name")` — while `scr_dyn_key_get` DOES model
+   * string length and index reads AND the two function-instance members,
+   * which S015 names as the forms that work — answering false for them
+   * would contradict the register's own stated boundary. That reads as an
+   * omission rather than a stance, so this lane matches NODE (verified:
+   * Node answers true for `name` and `length` on a function, false for
+   * any other own key, and `"call" in f` stays false here because `call`
+   * is a PROTOTYPE member, which is S015's divergence and not this
+   * arm's). The C lane lacks both arms today; the convergence is
+   * task-tracked, and matching Node REMOVES a divergence rather than
+   * adding one, so there is nothing to register here. */
   hasOwn(): number {
     return this.cached("hasOwn", [this.dynRef(), this.deps.strRef()], [I32], (idx) => {
       const dynT = this.dynT();
@@ -1529,6 +1644,15 @@ export class DynBuilder {
         c.i32Const(0);
         c.end();
         c.end();
+      });
+      // The two members a FUNC box owns — keyGet's arm, asked the other
+      // way round. Every other key falls through to false.
+      this.arm(c, K, [DK.FUNC], () => {
+        c.localGet(1);
+        this.deps.lit(c, "name");
+        c.call(this.deps.strEq());
+        this.pushIsLength(c, (x) => x.localGet(1));
+        c.i32Or();
       });
       // C routes an island receiver to the ENGINE's own Object.hasOwn;
       // unconstructible here, and `false` would be a silent wrong answer.

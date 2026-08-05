@@ -85,7 +85,7 @@ import {
   IMPORT_WRITE,
 } from "./abi.js";
 import { VecBuilder, type VecInfo } from "./arrays.js";
-import { DK, DYN_KIND, DYN_NUM, DYN_REF, DynBuilder } from "./dyn.js";
+import { DK, DYN_KIND, DYN_NUM, DYN_REF, DynBuilder, FN_CLOS, FN_SIG } from "./dyn.js";
 import { JsonBuilder } from "./json.js";
 import {
   PromiseBuilder,
@@ -1678,6 +1678,20 @@ class Assembler {
         c.structNew(dyn.dynT());
         return true;
       }
+      case "func": {
+        // A closure inside a converting composite (a union arm, a
+        // thunk's result, an adapter's argument) boxes ANONYMOUSLY: by
+        // the time a value reaches one of those positions its static
+        // name is gone, so FN_NAME is null and `f.name` reads "".
+        // C's `toDynExprC` func arm exactly. The NAMED spelling belongs
+        // to the dynFrom EXPRESSION, which has `fnName` at hand.
+        const box = this.dynFnBox(t, loc);
+        if (box === null) return false;
+        c.localGet(0);
+        c.refNull(this.strType);
+        c.call(box);
+        return true;
+      }
       default:
         this.refuse(`dynFrom:${t.kind}`, loc);
         return false;
@@ -2168,10 +2182,317 @@ class Assembler {
         c.unreachable();
         return true;
       }
+      case "func": {
+        // The function boundary, OUT direction. A non-function kind fails
+        // like any dynCheck; an IDENTICAL boxed signature hands back the
+        // VERY SAME closure, which is what preserves identity across the
+        // round trip (`u as typeof add` is `add`, so `=== add` is true);
+        // anything else wraps in the per-target adapter, whose env owns
+        // the box. C's arm one for one, with the i32 SIG compare standing
+        // in for its `strcmp`.
+        const pair = this.closSigFor(t, loc);
+        const adapter = this.dynFnAdapter(t, loc);
+        if (pair === null || adapter === null) return false;
+        kindGuard(DK.FUNC);
+        dyn.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(dyn.fnT(), FN_SIG);
+        c.i32Const(this.dynFnSigId(typeKey(t)));
+        c.i32Eq();
+        c.ifVoid();
+        dyn.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(dyn.fnT(), FN_CLOS);
+        c.refCast(pair.clos);
+        c.return_();
+        c.end();
+        c.refFunc(adapter.fn);
+        c.localGet(0);
+        c.structNew(adapter.env);
+        return true;
+      }
       default:
         this.refuse(`dynCheck:${t.kind}`, loc);
         return false;
     }
+  }
+
+  /* ── the checked-dynamic FUNCTION boundary ─────────────────────────────
+   * Three interned per-SIGNATURE helpers, the C emitter's sc_dfk_ /
+   * sc_dfb_ / sc_dfa_ families one for one:
+   *
+   *   %w.dyn.fnThunk:<key> — the CALL GLUE a boxed closure carries.
+   *   Uniform shape for every signature (dyn.ts's `thunkSig`), so the box
+   *   can hold it without naming the closure's own type: validate each
+   *   dyn argument into the declared parameter type, call through the
+   *   closure, convert the result back to dyn.
+   *
+   *   %w.dyn.fnBox:<key> — what `dynFrom` on a func-typed value calls:
+   *   the closure, the thunk's funcref, the interned SIG id, the
+   *   best-effort name and the declared arity, in one `struct.new`.
+   *
+   *   %w.dyn.fnAdapter:<key> — the shim a func-targeted `dynCheck` wraps
+   *   a NON-identical boxed signature in: a closure of the TARGET type
+   *   whose env captures the dyn box, converts its typed arguments into
+   *   dyn, calls through the box, and validates the result back.
+   *
+   * THE SIG IS AN INTERNED i32, not a string: C `strcmp`s a literal and
+   * LLVM interns, and an i32 compare asks the same question once at
+   * compile time. Same id ⇔ same typeKey ⇔ same IR type ⇔ same ABI, which
+   * is what makes both the exact-unwrap fast path and the thunk's
+   * closure downcast sound.
+   *
+   * FN_CLOS IS SOURCED FROM THE VALUE, NEVER FROM THE ABI. Every module
+   * function takes a closure as arg0 and DIRECT calls pass `ref.null`
+   * (the uniform-ABI dead argument) — but that null must never reach a
+   * box: FN_CLOS is `eq`, `ref.eq(null, null)` is TRUE, and two distinct
+   * functions boxed over it would answer `f === g` true with nothing to
+   * see. Every producer here takes the closure from the IR value's own
+   * emission — the interned per-function global for a capture-free
+   * function, the env `struct.new` for a capturing one — which is what
+   * `closure` already pushes. C is immune for free (a ScrClosure is
+   * always a real pointer); this lane is immune by discipline. */
+
+  private readonly dynFnSigIds = new Map<string, number>();
+  private readonly dynFnThunks = new Map<string, number>();
+  private readonly dynFnBoxes = new Map<string, number>();
+  private readonly dynFnAdapters = new Map<string, { fn: number; env: number }>();
+
+  /** The signature's interned id — dense, assigned on first sight. */
+  private dynFnSigId(key: string): number {
+    const hit = this.dynFnSigIds.get(key);
+    if (hit !== undefined) return hit;
+    const id = this.dynFnSigIds.size;
+    this.dynFnSigIds.set(key, id);
+    return id;
+  }
+
+  /** The per-signature call thunk (C's sc_dfk_N). */
+  private dynFnThunk(t: IrType & { kind: "func" }, loc: SrcLoc | undefined): number | null {
+    const key = typeKey(t);
+    const hit = this.dynFnThunks.get(key);
+    if (hit !== undefined) return hit;
+    const pair = this.closSigFor(t, loc);
+    if (pair === null) return null;
+    const idx = this.mb.declareFunc(this.dyn.thunkSig(), `%w.dyn.fnThunk:${key}`);
+    this.dynFnThunks.set(key, idx);
+    const w = this.newWalker(2);
+    if (!this.emitDynFnThunkBody(w, t, pair, loc)) return this.walkerDead(idx);
+    this.mb.setBody(idx, w.locals, w.c.bytes());
+    return idx;
+  }
+
+  private emitDynFnThunkBody(
+    w: WalkerCtx,
+    t: IrType & { kind: "func" },
+    pair: { clos: number; fn: number },
+    loc: SrcLoc | undefined,
+  ): boolean {
+    const c = w.c;
+    const dyn = this.dyn;
+    const dynRef = dyn.dynRef();
+    const n = this.wlocal(w, I32);
+    const ad = this.wlocal(w, dynRef);
+    const cl = this.wlocal(w, { kind: "ref", nullable: true, typeIndex: pair.clos });
+    // JS ARITY lives in this loop: an argument the caller did not supply
+    // IS the undefined immortal, and the parameter's own check decides
+    // whether that flies (a dyn parameter takes it; a number parameter
+    // throws the path-annotated TypeError). Arguments PAST the declared
+    // list were evaluated by the caller and are simply never read —
+    // `argc` is the vector's length, exactly C's (args, argc) pair.
+    dyn.arrLen(c, (x) => x.localGet(1));
+    c.localSet(n);
+    const slots: number[] = [];
+    for (let i = 0; i < t.params.length; i++) {
+      const p = t.params[i]!;
+      const val = this.mapType(p, loc);
+      if (val === null) return false;
+      const slot = this.wlocal(w, val);
+      slots.push(slot);
+      c.i32Const(i);
+      c.localGet(n);
+      c.i32LtU();
+      c.ifResult(dynRef);
+      dyn.arrAt(c, (x) => x.localGet(1), (x) => x.i32Const(i));
+      c.else_();
+      c.globalGet(dyn.undefinedGlobal());
+      c.end();
+      c.localSet(ad);
+      if (p.kind === "dyn") {
+        // An `unknown` parameter takes the argument as it stands.
+        c.localGet(ad);
+        c.localSet(slot);
+        continue;
+      }
+      const check = this.dynCheckHelper(p, loc);
+      if (check === null) return false;
+      c.localGet(ad);
+      // C's `ScrDynPath pp = { NULL, NULL, i }` — a root ARRAY step, so
+      // a failing argument reports at `$[i]`.
+      dyn.pushPathIndex(c, (x) => x.refNull(dyn.pathT()), (x) => x.i32Const(i));
+      c.call(check);
+      c.localSet(slot);
+      this.emitWalkerPending(c, dynRef);
+    }
+    // The closure the box carries, cast back to this signature's own
+    // struct. Sound because a thunk is only ever reached through the box
+    // its own builder filled — see the section header on SIG.
+    c.localGet(0);
+    c.refCast(pair.clos);
+    c.localSet(cl);
+    c.localGet(cl); // arg0: the closure itself (selfRef, env)
+    for (const slot of slots) c.localGet(slot);
+    c.localGet(cl);
+    c.structGet(pair.clos, 0);
+    c.callRef(pair.fn);
+    if (t.ret.kind === "void") {
+      this.emitWalkerPending(c, dynRef);
+      c.globalGet(dyn.undefinedGlobal());
+      return true;
+    }
+    const retVal = this.mapType(t.ret, loc);
+    if (retVal === null) return false;
+    const r = this.wlocal(w, retVal);
+    c.localSet(r);
+    this.emitWalkerPending(c, dynRef);
+    if (t.ret.kind === "dyn") {
+      c.localGet(r);
+      return true;
+    }
+    const from = this.dynFromHelper(t.ret, loc);
+    if (from === null) return false;
+    c.localGet(r);
+    c.call(from);
+    return true;
+  }
+
+  /** The per-signature box builder (C's sc_dfb_N): `(closure, name) →
+   * the FUNC box`. The NAME parameter is null for an anonymous value —
+   * never the empty string, which keyGet substitutes at read time. */
+  private dynFnBox(t: IrType & { kind: "func" }, loc: SrcLoc | undefined): number | null {
+    const key = typeKey(t);
+    const hit = this.dynFnBoxes.get(key);
+    if (hit !== undefined) return hit;
+    const pair = this.closSigFor(t, loc);
+    if (pair === null) return null;
+    const closRef: ValType = { kind: "ref", nullable: true, typeIndex: pair.clos };
+    const idx = this.mb.declareFunc(
+      this.mb.funcType([closRef, this.strRef], [this.dyn.dynRef()]),
+      `%w.dyn.fnBox:${key}`,
+    );
+    this.dynFnBoxes.set(key, idx);
+    const thunk = this.dynFnThunk(t, loc);
+    if (thunk === null) return this.walkerDead(idx);
+    this.mb.declareFuncRef(thunk);
+    const c = new Code();
+    this.dyn.boxFn(
+      c,
+      (x) => x.localGet(0),
+      (x) => x.refFunc(thunk),
+      this.dynFnSigId(key),
+      (x) => x.localGet(1),
+      // ARITY is the DECLARED parameter count. SEMANTICS.md S020: that
+      // is an APPROXIMATION of `f.length`, which JS stops counting at the
+      // first parameter with a DEFAULT — `(a, b = 1)` answers 1 in Node
+      // and 2 here. A rest parameter is excluded from both, and
+      // TypeScript's `?` erases, so those two agree. Only the reported
+      // number is affected: the thunk's checks still admit a missing
+      // defaulted argument (its type carries an undefined arm), so the
+      // body applies its own default exactly like Node.
+      t.params.length,
+    );
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  /** The per-TARGET adapter (C's sc_dfa_N) plus the env struct that owns
+   * the captured box: a closure of the target signature whose body calls
+   * through a box of some OTHER signature. */
+  private dynFnAdapter(
+    t: IrType & { kind: "func" },
+    loc: SrcLoc | undefined,
+  ): { fn: number; env: number } | null {
+    const key = typeKey(t);
+    const hit = this.dynFnAdapters.get(key);
+    if (hit !== undefined) return hit;
+    const pair = this.closSigFor(t, loc);
+    if (pair === null) return null;
+    // The env is a width subtype of the target's closure struct — the
+    // same shape `envTypeFor` builds for a capturing function, with the
+    // dyn box standing in for the capture boxes. C's caps[0] obj-box.
+    const env = this.mb.subStructType(
+      `dynfnenv:${key}`,
+      [
+        { storage: { kind: "ref", nullable: false, typeIndex: pair.fn }, mutable: false },
+        { storage: this.dyn.dynRef(), mutable: false },
+      ],
+      pair.clos,
+    );
+    const idx = this.mb.declareFunc(pair.fn, `%w.dyn.fnAdapter:${key}`);
+    const made = { fn: idx, env };
+    this.dynFnAdapters.set(key, made);
+    const w = this.newWalker(1 + t.params.length);
+    if (!this.emitDynFnAdapterBody(w, t, env, loc)) {
+      this.walkerDead(idx);
+      return null;
+    }
+    this.mb.setBody(idx, w.locals, w.c.bytes());
+    this.mb.declareFuncRef(idx);
+    return made;
+  }
+
+  private emitDynFnAdapterBody(
+    w: WalkerCtx,
+    t: IrType & { kind: "func" },
+    env: number,
+    loc: SrcLoc | undefined,
+  ): boolean {
+    const c = w.c;
+    const dyn = this.dyn;
+    const retVal = t.ret.kind === "void" ? null : this.mapType(t.ret, loc);
+    if (t.ret.kind !== "void" && retVal === null) return false;
+    const d = this.wlocal(w, dyn.dynRef());
+    const a = this.wlocal(w, dyn.arrRef());
+    const r = this.wlocal(w, dyn.dynRef());
+    c.localGet(0);
+    c.refCast(env);
+    c.structGet(env, 1);
+    c.localSet(d);
+    c.f64Const(0);
+    c.call(this.vecs.newLen(this.dynVecInfo()));
+    c.localSet(a);
+    for (let i = 0; i < t.params.length; i++) {
+      const from = this.dynFromHelper(t.params[i]!, loc);
+      if (from === null) return false;
+      c.localGet(a);
+      c.localGet(1 + i);
+      c.call(from);
+      c.call(dyn.arrPush());
+    }
+    // The box's kind is FUNC by construction (the dynCheck that minted
+    // this adapter tested it), so the not-a-function arm below is
+    // unreachable — C spells its `what` "value" for the same reason.
+    c.localGet(d);
+    c.localGet(a);
+    this.pushStrLitInto(c, "value");
+    c.call(dyn.callFn());
+    c.localSet(r);
+    this.emitWalkerPending(c, retVal);
+    if (t.ret.kind === "void") return true;
+    if (t.ret.kind === "dyn") {
+      c.localGet(r);
+      return true;
+    }
+    // A lying wrapper is caught HERE: the dyn result validates into the
+    // target's return type at the ROOT path, exactly the dynCheck stance.
+    const check = this.dynCheckHelper(t.ret, loc);
+    if (check === null) return false;
+    c.localGet(r);
+    c.refNull(dyn.pathT());
+    c.call(check);
+    const out = this.wlocal(w, retVal!);
+    c.localSet(out);
+    this.emitWalkerPending(c, retVal);
+    c.localGet(out);
+    return true;
   }
 
   private unionDef(unionId: string): IrUnionDef {
@@ -5333,6 +5654,30 @@ class Assembler {
             code.call(h);
             return;
           }
+          case "func": {
+            // The function boundary, IN direction. The closure comes from
+            // walking the VALUE — the interned per-function global, or a
+            // capturing env's struct.new — and never from the calling
+            // ABI's dead ref.null argument (the boundary section's
+            // hazard: two boxes over a null closure compare EQUAL).
+            const box = this.dynFnBox(vt, e.loc);
+            if (box === null) {
+              code.unreachable();
+              return;
+            }
+            this.walkExpr(e.value);
+            // The name for `f.name` and the error texts. SEMANTICS.md
+            // S020: `fnName` is the spelling of the BINDING this box is
+            // built from, not the function's defined name, so an ALIAS or
+            // a factory result carries the wrong one — Node fixes a name
+            // at definition and never re-infers it. An anonymous value
+            // stores NULL rather than "" — keyGet is where the empty
+            // string appears, at read time.
+            if (e.fnName !== undefined && e.fnName !== "") this.pushStrLitInto(code, e.fnName);
+            else code.refNull(this.strType);
+            code.call(box);
+            return;
+          }
           default:
             this.refuse(`dynFrom:${vt.kind}`, e.loc);
             code.unreachable();
@@ -5362,11 +5707,13 @@ class Assembler {
           : t.kind === "string" ? { desc: "string", kind: DK.STR, val: this.strRef }
           : null;
         if (want === null) {
-          if (t.kind === "record" || t.kind === "array" || t.kind === "union") {
+          if (t.kind === "record" || t.kind === "array" || t.kind === "union" || t.kind === "func") {
             // The composite extraction is a per-typeKey WALKER (the C
             // emitter's sc_dc_N). It returns normally with the cell set on
             // failure — unlike the scalar path, which unwinds inline — so
-            // the call site owns the pending check.
+            // the call site owns the pending check. A FUNC target rides
+            // the same walker: it either unwraps the identical signature's
+            // closure or mints the adapter, and only the kind guard throws.
             const h = this.dynCheckHelper(t, e.loc);
             if (h === null) {
               code.unreachable();
@@ -5460,11 +5807,28 @@ class Assembler {
         code.refIsNull();
         code.i32Eqz();
         code.else_();
+        // The FUNC arm, which the C emitter's inline lowering lacks: a
+        // boxed function owns exactly `name` and `length` — keyGet's arm
+        // and hasOwn's, asked a third way. Answering false for them would
+        // contradict S015's own rule (the presence operator answers like
+        // the own-member read) at the one kind whose members the runtime
+        // models; `"call" in f` still answers false, because `call` is
+        // INHERITED, which is what S015 actually registers.
+        const pushFuncArm = (): void => {
+          if (e.key !== "name" && e.key !== "length") {
+            code.i32Const(0);
+            return;
+          }
+          code.localGet(d);
+          code.structGet(this.dyn.dynT(), DYN_KIND);
+          code.i32Const(DK.FUNC);
+          code.i32Eq();
+        };
         // The ARRAY arm: "length" is always there, a canonical index is
         // there when it is in range, and no other spelling ever is.
         const arrIdx = /^(0|[1-9][0-9]*)$/.test(e.key) ? Number(e.key) : null;
         if (e.key !== "length" && (arrIdx === null || arrIdx > Number.MAX_SAFE_INTEGER)) {
-          code.i32Const(0);
+          pushFuncArm();
         } else {
           code.localGet(d);
           code.structGet(this.dyn.dynT(), DYN_KIND);
@@ -5480,7 +5844,7 @@ class Assembler {
             code.f64Gt();
           }
           code.else_();
-          code.i32Const(0);
+          pushFuncArm();
           this.close();
         }
         this.close();
@@ -5652,6 +6016,53 @@ class Assembler {
         }
         this.dyn.boxObj(code, (c) => c.localGet(o));
         this.releaseScratch(this.dyn.objRef(), o);
+        return;
+      }
+
+      /* CALLING a dyn value. The callee expression evaluates first, then
+       * the arguments in source order — and only THEN is the callee
+       * tested for callability, which is what puts Node's "<name> is not
+       * a function" after the arguments' side effects (nodes.ts spells
+       * the same order out). Arguments are already dyn (the lowering
+       * boxed or converted them), so the vector is a plain push loop;
+       * EXTRA arguments ride it and the thunk simply never reads them,
+       * which is JS arity from the caller's side. may-throw.ts seeds this
+       * node, so the pending check below is the whole family: the
+       * not-a-function TypeError, the thunk's per-argument checks, and
+       * whatever the called closure itself throws. */
+      case "dynCall": {
+        if (e.spreads !== undefined && e.spreads.length > 0) {
+          // `f(...args)` applies through a runtime-built argument list,
+          // and building one means FLATTENING each spread source —
+          // arrays element-wise, strings by code point, bytes by byte,
+          // V8's spread-call TypeError for every other kind
+          // (scr_dyn_arr_push_spread). That is the iteration surface, a
+          // rock of its own; refusing by name beats half of it.
+          this.refuse("dynCall:spread", e.loc);
+          code.unreachable();
+          return;
+        }
+        const dynRef = this.dyn.dynRef();
+        const arrRef = this.dyn.arrRef();
+        const d = this.acquireScratch(dynRef);
+        const a = this.acquireScratch(arrRef);
+        this.walkExpr(e.callee);
+        code.localSet(d);
+        code.f64Const(0);
+        code.call(this.vecs.newLen(this.dynVecInfo()));
+        code.localSet(a);
+        for (const arg of e.args) {
+          code.localGet(a);
+          this.walkExpr(arg);
+          code.call(this.dyn.arrPush());
+        }
+        code.localGet(d);
+        code.localGet(a);
+        this.pushStrLitInto(code, e.calleeName);
+        code.call(this.dyn.callFn());
+        this.releaseScratch(arrRef, a);
+        this.releaseScratch(dynRef, d);
+        this.emitPendingCheck();
         return;
       }
 
@@ -6099,9 +6510,8 @@ class Assembler {
       /* The caught→dyn conversion waits on the dyn surface. */
       case "caughtToDyn":
       /* The dyn surface past the scalar core: the composite converters,
-       * the keyed reads, and the call/invoke boundary. */
+       * the keyed reads, and the invoke boundary. */
       case "dynFromJsval":
-      case "dynCall":
       case "dynInvoke":
       case "jsonStringify":
       /* The island bridge — an engine embedding, so likely never on this

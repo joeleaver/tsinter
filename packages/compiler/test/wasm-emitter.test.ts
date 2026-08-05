@@ -1315,6 +1315,285 @@ test("dyn Object.hasOwn: the modeled forms, including the STR arm C omits", asyn
   );
 });
 
+test("dyn fn: the boxed CLOSURE is what identity compares, never the box", async () => {
+  // The one hazard the whole function boundary turns on. FN_CLOS is
+  // typed `eq` and `ref.eq(null, null)` is TRUE, so a box built over the
+  // calling ABI's dead ref.null closure argument instead of the value's
+  // own closure would make EVERY pair of boxed functions compare equal —
+  // silently, with `f === f` still answering true to hide it. `u === v`
+  // on line 1 is the assertion that catches it: two distinct capture-free
+  // functions of the SAME signature, which is exactly the pair that
+  // shares a closure struct type and would share a null.
+  //
+  // Every line is Node's answer, and the C lane agrees on all of them.
+  const res = await buildWasm(
+    "dyn-fn-identity.ts",
+    [
+      "function add(a: number, b: number): number { return a + b; }",
+      "function sub(a: number, b: number): number { return a - b; }",
+      "function mk(): (n: number) => number { let s = 0; return (n: number) => { s += n; return s; }; }",
+      "const u: unknown = add;",
+      "const u2: unknown = add;",
+      "const v: unknown = sub;",
+      // Two boxes of ONE function are one JS value; two boxes of two are not.
+      "console.log(`${u === u2} ${u === v} ${u === u}`);",
+      "const f = u as (a: number, b: number) => number;",
+      "const g = v as (a: number, b: number) => number;",
+      // The exact-unwrap path: a cast back to the IDENTICAL signature is
+      // the very same closure, so `=== add` holds.
+      "console.log(`${f === add} ${g === sub} ${f === g} ${f === f}`);",
+      "const c1 = mk();",
+      "const c2 = mk();",
+      "const b1: unknown = c1;",
+      "const b2: unknown = c2;",
+      "const b3: unknown = c1;",
+      // Capturing closures too — the env struct is the identity there.
+      "console.log(`${b1 === b2} ${b1 === b3}`);",
+      "const back = b1 as (n: number) => number;",
+      // And the state is SHARED: one counter, reached both ways.
+      "console.log(`${back === c1} ${back(2)} ${back(3)} ${c1(4)}`);",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    ["true false true", "true true false true", "false true", "true 2 5 9", ""].join("\n"),
+  );
+});
+
+test("dyn fn: JS ARITY through the thunk, and the adapter's result check", async () => {
+  // The thunk is where a call's arguments meet the boxed signature's
+  // declared parameters. Missing arguments are THE undefined immortal —
+  // a dyn parameter takes it (line 3: `typeof x` is "undefined"), a
+  // number parameter throws the path-annotated TypeError naming `$[i]`.
+  // Extra arguments are evaluated by the CALLER and then never read,
+  // which is why "eval extra" prints before the result. The last line is
+  // the adapter's half: a wrapper whose real return type is not the
+  // target's is caught at the ROOT path on the way out.
+  //
+  // Node erases all of this (S009's stance). Its full output is
+  //   eval extra / 3 / undefined / number / s3
+  // — five lines to our six: NOTHING at all where the first check fires
+  // (that statement discards its result, so there is no console.log to
+  // reach), and "s3" where the last one does. The contract here is
+  // byte-parity with the C emitter, verified against a C-lane build of
+  // this same program.
+  const res = await buildWasm(
+    "dyn-fn-arity.ts",
+    [
+      "function pick(a: number, b: number): number { return a + b; }",
+      "function takesDyn(x: unknown): string { return typeof x; }",
+      "function side(tag: string): number { console.log('eval ' + tag); return 1; }",
+      "const u: unknown = pick;",
+      "const one = u as (a: number) => unknown;",
+      "try { one(7); } catch (e) { console.log((e as Error).message); }",
+      "const b: any = pick;",
+      "console.log(`${b(1, 2, side('extra')) as number}`);",
+      "const d: any = takesDyn;",
+      "console.log(d() as string);",
+      "console.log(d(5) as string);",
+      "function lies(a: number): string { return 's' + a; }",
+      "const lu: unknown = lies;",
+      "const lying = lu as (a: number) => number;",
+      "try { console.log(`${lying(3)}`); } catch (e) { console.log((e as Error).message); }",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "expected number at $[1], got undefined", // Node: prints nothing here
+      "eval extra", // the dropped argument still ran
+      "3",
+      "undefined", // a missing arg reaching a dyn parameter
+      "number",
+      "expected number at $, got string", // Node: prints s3
+      "",
+    ].join("\n"),
+  );
+});
+
+test("S018: the not-a-function TypeError names the callee's SOURCE text", async () => {
+  // Four of these seven disagree with Node, and they are the four the
+  // register names: V8 re-renders the callee from its own AST (stripping
+  // parens, normalizing whitespace, spelling a string-literal computed
+  // key as a dotted one) while the lowering threads a compile-time
+  // spelling through. The other three agree exactly. The C lane
+  // reproduces every line, verified against a C-lane build.
+  const res = await buildWasm(
+    "dyn-fn-naf.ts",
+    [
+      "const o: any = JSON.parse('{\"f\":1,\"a\":{\"b\":2},\"arr\":[1]}');",
+      "const g: any = o.f;",
+      "const k = 'f';",
+      "try { g(1); } catch (e) { console.log((e as Error).message); }",
+      "try { (g)(1); } catch (e) { console.log((e as Error).message); }",
+      "try { o.a.b(); } catch (e) { console.log((e as Error).message); }",
+      "try { o . a . b (); } catch (e) { console.log((e as Error).message); }",
+      "try { o['f'](); } catch (e) { console.log((e as Error).message); }",
+      "try { o[k](); } catch (e) { console.log((e as Error).message); }",
+      "try { o.arr[0](); } catch (e) { console.log((e as Error).message); }",
+      "try { (true ? g : g)(1); } catch (e) { console.log((e as Error).message); }",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "g is not a function", // agrees
+      "value is not a function", // S018 — Node: "g"
+      "o.a.b is not a function", // agrees
+      "o . a . b is not a function", // S018 — Node: "o.a.b"
+      "o['f'] is not a function", // S018 — Node: "o.f"
+      "o[k] is not a function", // agrees — the KEY is not evaluated
+      "o.arr[0] is not a function", // agrees
+      // S018 — Node: "(intermediate value)(intermediate value)(intermediate
+      // value)", its wording for a callee with no referenceable spelling.
+      "value is not a function",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("S019/S016: a boxed function's members, its String() and the write it refuses", async () => {
+  // What a FUNC box answers, and the three places that is not Node.
+  // `typeof` and the PRESENCE forms are exact — the last two being where
+  // this lane deliberately leaves the C runtime behind (scr_dyn_has_own
+  // has no FUNC arm, so the C lane answers false for all six). String()
+  // is S019: the source is gone in a compiled program, so this is the
+  // native-code form Node itself prints for its builtins. The WRITE is
+  // S016: functions are objects in Node and `f.x = 1` sticks there,
+  // while a FUNC payload here has no table to put it in.
+  //
+  // The `name` and `length` READS happen to agree with Node on both
+  // functions here — each is defined AT the binding it is boxed from and
+  // has no defaulted parameter, which is S020's coinciding case. The
+  // cases where they do not agree are pinned in S020's own test; do not
+  // read this one as evidence that the two members are exact.
+  const res = await buildWasm(
+    "dyn-fn-members.ts",
+    [
+      "function named(a: number, b: number): number { return a + b; }",
+      "const anon = function (a: number): number { return a; };",
+      "const b1: any = named;",
+      "const b2: any = anon;",
+      "console.log(`${b1.name as string} ${b1.length as number} ${typeof b1}`);",
+      "console.log(`[${b2.name as string}] ${b2.length as number}`);",
+      "function b(x: boolean): string { return x ? 'T' : 'F'; }",
+      "console.log(b('name' in b1) + b('length' in b1) + b('nope' in b1));",
+      "console.log(b(Object.hasOwn(b1, 'name')) + b(Object.hasOwn(b1, 'length')) + b(Object.hasOwn(b1, 'zz')));",
+      "const s: string = `${b1}`;",
+      "console.log(s);",
+      "try { b1.x = 1; console.log('wrote'); } catch (e) { console.log((e as Error).message); }",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "named 2 function", // agrees — S020's coinciding case
+      // Also agrees: JS infers this name for an anonymous expression from
+      // the binding, which is the one spelling the lowering has too.
+      "[anon] 1",
+      "TTF", // Node: TTF — the C lane answers FFF
+      "TTF", // Node: TTF — the C lane answers FFF
+      // S019 — Node prints the SOURCE, and under --experimental-strip-types
+      // the type annotations are blanked to SPACES rather than removed:
+      //   "function named(a        , b        )         { return a + b; }"
+      "function named() { [native code] }",
+      "Cannot create property 'x' on function", // S016 — Node writes it
+      "",
+    ].join("\n"),
+  );
+});
+
+test("S020: f.name is the BOX SITE's binding and f.length the DECLARED count", async () => {
+  // Both members are compile-time approximations captured where the box
+  // is built, and both are close enough to be mistaken for exact. Every
+  // Node answer below was verified against real Node, and the C lane
+  // reproduces this lane's column value for value.
+  //
+  // `name` agrees whenever the function was DEFINED at the binding it is
+  // boxed from — which is most code, and why the divergence hides. It
+  // parts company through an alias, out of a factory, and (worst) through
+  // any converting composite, where there is no binding to read at all
+  // and the value goes anonymous.
+  //
+  // `length` agrees until a parameter has a DEFAULT: JS counts formals
+  // before the first initializer. TypeScript's `?` is not a default and
+  // does not diverge. Only the NUMBER is wrong — the last line calls
+  // through a box with the defaulted argument missing and gets Node's
+  // answer, because a defaulted parameter is typed `T | undefined` and
+  // the body applies its own default.
+  const res = await buildWasm(
+    "dyn-fn-name-length.ts",
+    [
+      "function realName(a: number, b: number): number { return a + b; }",
+      "const alias = realName;",
+      "const b1: any = alias;",
+      "const b2: any = realName;",
+      "console.log(`[${b1.name as string}] [${b2.name as string}]`);",
+      "function factory(): (z: number) => number {",
+      "  function innerFn2(z: number): number { return z; }",
+      "  return innerFn2;",
+      "}",
+      "const got = factory();",
+      "const b3: any = got;",
+      "console.log(`[${b3.name as string}]`);",
+      // The composite path: a function that reaches dyn as a THUNK RESULT
+      // and as an ADAPTER ARGUMENT, neither of which has an fnName.
+      "function outerMaker(): (n: number) => number {",
+      "  function inner(n: number): number { return n; }",
+      "  return inner;",
+      "}",
+      "const om: any = outerMaker;",
+      "const res1: any = om();",
+      "function takesFn(f: (n: number) => number): unknown { return f as unknown; }",
+      "function passed(n: number): number { return n; }",
+      "const tf: any = takesFn;",
+      "const res2: any = tf(passed);",
+      "console.log(`[${res1.name as string}] [${res2.name as string}]`);",
+      "function def(a: number, b: number = 1): number { return a + b; }",
+      "function def2(a: number = 0, b: number = 1): number { return a + b; }",
+      "function opt(a: number, b?: number): number { return a + (b ?? 0); }",
+      "function mix(a: number, b?: number, c: number = 3): number { return a + (b ?? 0) + c; }",
+      "const d1: any = def;",
+      "const d2: any = def2;",
+      "const d3: any = opt;",
+      "const d4: any = mix;",
+      "console.log(`${d1.length as number} ${d2.length as number} ${d3.length as number} ${d4.length as number}`);",
+      "console.log(`${d1(5) as number} ${d1(5, 2) as number} ${d3(5) as number} ${d4(5) as number}`);",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      // S020 — Node: "[realName] [realName]". An alias does not rename a
+      // function; Node fixes the name at definition.
+      "[alias] [realName]",
+      "[got]", // S020 — Node: "[innerFn2]"
+      "[] []", // S020 — Node: "[inner] [passed]"
+      // S020's four length shapes, in order: def / def2 / opt / mix.
+      // Node: "1 0 2 2" — only `opt` (the `?` marker, which erases and so
+      // gets counted on both lanes) agrees, and `mix` shows the split
+      // inside one signature: its `?` is counted, its `= 3` is not.
+      "2 2 2 3",
+      // Agrees exactly — the defaults still APPLY through the box, which
+      // is S020's narrowness paragraph. Only the reported count is wrong.
+      "6 7 5 8",
+      "",
+    ].join("\n"),
+  );
+});
+
 test("dyn own-key ORDER: integer-like keys first, and where that range ends", async () => {
   // Object.keys' own-key order is the one place the array-index predicate
   // has to be WIDER than the keyed read's: the ordering range is

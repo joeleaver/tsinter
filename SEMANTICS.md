@@ -315,8 +315,9 @@ for the presence form) with Node's in a comment.
 
 The checked-dynamic tree stores objects as an own-entry table and arrays
 as a DENSE vector, with no expando map beside either and no hole bit
-inside the vector. Five observable consequences follow — three loud, and
-two that say nothing at all. What is exact first, so the boundary is
+inside the vector — and a boxed function carries no property table at
+all. Six observable consequences follow — four loud, and two that say
+nothing at all. What is exact first, so the boundary is
 clear: object writes (insertion order, later writes winning, the
 surviving entry keeping its original key), array index writes within the
 allocatable range (`length` and every read match Node), and the refusals
@@ -346,6 +347,18 @@ property '0' of string 'abc'" — a different V8 message for the same
 refusal. Out-of-range indices and named keys agree exactly ("Cannot
 create property '9' on string 'abc'"), so only the read-only pair
 diverges.
+
+**A write on a boxed FUNCTION throws where Node stores it.** Functions
+are objects in JS, so `f.x = 1` succeeds there and reads back; here it
+raises the same catchable "Cannot create property 'x' on function" the
+primitive receivers get. A boxed function's payload carries the closure,
+its call thunk, its signature, its name and its arity — and no property
+table: the one the C runtime hangs off the closure is written only by
+`Object.defineProperties`, which this backend refuses, so there is
+nothing a write could land in. The PRESENCE forms over the two members
+Node does define are exact — `"name" in f` and `Object.hasOwn(f, "name")`
+are both true, as in Node — so this arm is about the write alone; what
+those two members ANSWER when read is S020's, not this entry's.
 
 **`Object.assign` onto a non-object target copies NOTHING, silently.**
 `Object.assign(arrTarget, {k: 7})` writes `k` through in Node and lists
@@ -410,3 +423,136 @@ rather than a runtime one. **Tested by:** the wasm emitter unit test,
 which pins the diverging shape beside the ones that agree. No corpus
 program can pin it — one whose output observed it would fail the
 differential on every lane by construction.
+
+**See also S018**, the same lowering habit at the call site: a spelling
+where one is cheap to lift from the source, a fixed fallback otherwise.
+The two entries differ in which shapes fall back and in what the
+fallback says, but they have one cause and one fix — a frontend that
+re-renders expression source the way V8 does would close both at once.
+
+## S018 — `<x> is not a function` names the callee's SOURCE TEXT, not V8's re-rendering *(inherited)*
+
+Calling a checked-dynamic value that is not a function throws Node's
+catchable TypeError, and the name in it is a compile-time string the
+lowering threads through: the identifier's text for a bare identifier,
+`getText()` for a property or element access, and the literal word
+"value" for every other callee shape. V8 instead re-renders the callee
+from its own AST, so the two part company in four places. `(g)(1)` says
+"g is not a function" in Node and "value is not a function" here (any
+parenthesized callee); `o . a . b (1)` says "o.a.b" there and
+"o . a . b" here (raw source keeps the spaces); `o["f"]()` says "o.f"
+there — V8 re-renders a string-literal computed key as a dotted one —
+and `o["f"]` here; and a callee with no referenceable spelling at all,
+such as `(c ? g : g)(1)`,
+says "(intermediate value)(intermediate value)(intermediate value)"
+there and "value" here. The shapes that AGREE are the common ones: a
+bare identifier, a dotted chain, a computed access with a variable key
+(`o[k]`), and an element index (`o.arr[0]`). Argument EVALUATION order
+is unaffected and exact — arguments run, in source order, before the
+callability test, so their side effects appear in Node's order on every
+lane. An `as`-CAST callee never reaches this message at all: `(g as F)(1)`
+validates `g` against `F` first and raises S009's "expected function at
+$, got number" instead, which is a different divergence with a different
+rationale.
+
+**Rationale:** inherited, and S017's divergence one node over: the same
+lowering habit (a compile-time spelling where it is cheap, a fixed
+fallback otherwise), the same runtime consuming it (`scr_dyn_call`'s
+`what`), reproduced identically on the C lane message for message.
+Closing it means teaching the lowering to re-render arbitrary expression
+source the way V8 does, which is a source-mapping feature rather than a
+runtime one — and because S017 has the same cause, one frontend
+re-renderer closes both entries. That is task-tracked as a single joint
+item rather than two. **Tested by:** the wasm emitter unit test, which
+pins the diverging spellings beside the agreeing ones. No corpus program
+can pin it — one whose output observed the divergence would fail the
+differential on every lane by construction;
+`1667-dyn-fn-not-callable.cjs` covers the agreeing spellings
+differentially.
+
+## S019 — `String(f)` on a boxed function renders the native-code form, not the source *(inherited)*
+
+`Function.prototype.toString` echoes a function's SOURCE TEXT in Node.
+A compiled program does not carry its source, so a function that crossed
+the `unknown` boundary renders the form engines use for their own
+non-JS functions: `"function " + f.name + "() { [native code] }"`, with
+the name simply absent (and its space kept) when the value is anonymous.
+So `String(named)` answers "function named() { [native code] }" here and
+"function named(a, b) { return a + b; }" in Node. Node itself prints the
+native-code form for its builtins — `String(Math.max)` is "function
+max() { [native code] }" on both lanes — so the shape is JS's own, not
+an invention; only the source-carrying case diverges. The neighbouring
+answers are exact: `typeof f` is "function", `Object.keys(f)` is `[]`,
+and `f === g` compares the boxed CLOSURE, so one function crossing the
+boundary twice stays one JS value. The NAME this text embeds is the
+approximation S020 registers, so a value whose `f.name` is wrong there
+renders the same wrong name here.
+
+**Rationale:** inherited from the C runtime, which renders exactly this
+text for the same reason. Reproducing Node would mean shipping every
+boxable function's source text in the binary and a decision about which
+source — pre- or post-lowering — the program should claim to be, which
+is a feature (and a size cost) rather than a fix. **Tested by:** the wasm
+emitter unit test, which pins the named and anonymous forms. No corpus
+program can pin it — one whose output observed it would fail the
+differential on every lane by construction.
+
+## S020 — `f.name` and `f.length` on a boxed function are compile-time approximations *(inherited)*
+
+The two members a function value carries across the `unknown` boundary
+are captured when the box is BUILT, from what the lowering can see at
+that site — not from the function's own definition. Both are close
+enough to be mistaken for exact, and neither is.
+
+**`f.name` is the spelling of the BINDING the value was boxed from.**
+That coincides with Node whenever the function was *defined* at that
+binding, which is the common case and why the divergence hides:
+`function realName() {}` boxed as `realName`, `const anon = function
+() {}` and `const arrow = () => {}` all answer exactly what Node's
+inferred-name rules answer. It parts company as soon as the value and
+the binding come apart. Through an ALIAS, `const alias = realName`
+boxed at `alias` answers "alias" where Node answers "realName" — Node's
+name is fixed at definition and never re-inferred by assignment. Out of
+a FACTORY, `const got = factory()` answers "got" where Node answers the
+inner function's own name. And a value boxed inside a CONVERTING
+COMPOSITE — a union arm, a thunk's result, an adapter's argument — has
+no binding to read at all, so it is ANONYMOUS and answers the empty
+string where Node answers the real name: a function returned through a
+boxed call, or handed back out of one, loses its name entirely.
+
+**`f.length` is the DECLARED parameter count**, where JS stops counting
+at the first parameter with a DEFAULT. The two markers that look alike
+here behave oppositely, and the split is the whole rule: TypeScript's
+`b?: number` is a TYPE-level marker that ERASES, so Node sees an
+ordinary parameter and counts it, and both lanes agree; `b = 1` is a
+real initializer that survives into the JS Node runs, so Node stops
+there and this lane does not. Four shapes, this lane first: `function
+opt(a, b?)` answers 2 and 2 — agreeing; `function def(a, b = 1)`
+answers 2 where Node answers 1; `function def2(a = 0, b = 1)` answers 2
+where Node answers 0; and `function mix(a, b?, c = 3)` answers 3 where
+Node answers 2, the mixed case that shows the `?` being counted and the
+`= 3` not.
+
+ONLY THE REPORTED NUMBER DIVERGES — calls through the box behave exactly
+like Node, defaults included. `def(a, b = 1)` invoked through its box as
+`d(5)` answers 6 on every lane, because the lowering types a defaulted
+parameter as `T | undefined`, so the thunk's per-argument check admits
+the missing argument and the body applies its own default. Anyone
+debugging a wrong `f.length` should stop at this entry; a call that
+throws `expected number at $[1]` for a defaulted parameter is a REAL
+thunk bug and not this divergence.
+
+**Rationale:** inherited — every lane builds the box from the same IR,
+whose `dynFrom` node carries a best-effort `fnName` from the binding and
+whose func type carries every declared parameter. Reproduced identically
+on the C lane, value for value. This is the same FAMILY of cause as
+S017 and S018 — a compile-time approximation standing in for something
+the engine derives at runtime — but NOT the same fix: those two want a
+source re-renderer, while this one wants the frontend to thread the
+function's DEFINED name (and its pre-initializer parameter count)
+through `dynFrom` instead of the box site's spelling. Task-tracked with
+them as one frontend item. **Tested by:** the wasm emitter unit test,
+which pins every case above with Node's answer beside it in a comment —
+the S014 argument, since no corpus program can pin any of it: one whose
+output observed the divergence would fail the differential on every lane
+by construction.

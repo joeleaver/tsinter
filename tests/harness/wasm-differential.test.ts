@@ -817,6 +817,28 @@ const TIER_FLOOR: string[] = [
   "1544-dyn-json-reads.ts",
   "2300-dyn-record-spread-and-keyed-access.cjs",
   "2471-record-keyed-write-hasown.js",
+  // Increment 14 (dyn core), stage 4: the FUNCTION boundary. A closure
+  // boxes into the dyn tree carrying a per-SIGNATURE call thunk; a
+  // checked cast back to the IDENTICAL signature hands back the very
+  // same closure (identity survives the round trip), and a cast to any
+  // other signature mints a per-target adapter that converts arguments
+  // in and validates the result out. `dynCall` calls a dyn value: the
+  // arguments evaluate first, then the callability test throws Node's
+  // "<name> is not a function" (S018 for the spellings it renders
+  // differently), then the thunk validates each argument into the
+  // declared parameter type — JS arity, so a missing argument IS
+  // undefined and extras are evaluated and dropped.
+  //
+  // These five are the real thing rather than a fixture: test/common's
+  // mustCall wrapping a typed function and flowing to a timer slot,
+  // captured state surviving both the boundary and an unwind through
+  // it, uncaught TypeErrors at exit 1, and the timer forms that deliver
+  // trailing arguments to a typed callback.
+  "1665-dyn-fn-mustcall/main.cjs",
+  "1666-dyn-fn-identity.ts",
+  "1667-dyn-fn-not-callable.cjs",
+  "1668-dyn-fn-throws.cjs",
+  "1805-timer-callback-args.ts",
 ];
 
 interface RunResult {
