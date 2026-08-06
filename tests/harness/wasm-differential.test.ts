@@ -990,6 +990,64 @@ const TIER_FLOOR: string[] = [
   "2046-abstract-classes.ts",
   "2451-private-fields.ts",
   "2485-inspect-circular-refs.ts",
+  // Increment 16 (util.inspect), stage C: the DYN WALKER — the one runtime
+  // type whose SHAPE lives in the value, so the traversal is emitted code
+  // rather than a synthesized per-type helper. `insp.dyn` recurses over the
+  // tree's own kinds through the same frame engine; `insp.dynS` is
+  // format's %s twin, where a dyn STRING passes verbatim (that ONE rule is
+  // why console.log of a dyn value was blocked, and why unblocking it
+  // claims twenty-four programs that are not about inspect at all); and %j
+  // goes through the stringify walker with Node's tryStringify behavior.
+  //
+  // Four things the walker decides that the C reference decides otherwise,
+  // all measured against Node first: key order is OWN-KEY order through
+  // `objWalk` (integer-like keys ascending FIRST — C walks its entry table
+  // raw); the CIRCULAR protocol runs here at all (C has none, and a cyclic
+  // dyn tree kills the process); identity on the seen stack is the PAYLOAD,
+  // not the `$dyn` box, because a keyed write copies the box and shares the
+  // payload; and recursion is capped, emitting Node's own interruption
+  // marker and finishing the render (SEMANTICS.md S029).
+  //
+  // A PROMISE in the tree fences loudly (S030) — the one throw in the
+  // engine, which is what put `insp.dyn`/`insp.dynS` in the may-throw seed
+  // set. `%j` needed the stringify walker to grow the seen stack S026 had
+  // named as its own missing piece, so a cyclic dyn tree now throws V8's
+  // circular TypeError there instead of running out of depth.
+  //
+  // `libCall:insp.dynS` leaves the census entirely: it was the work
+  // queue's largest single entry (×83 programs, ×34 of them refusing at it
+  // FIRST), and the difference between those numbers is the point — most
+  // of these programs are about dyn keyed writes, prototype dispatch,
+  // destructuring or `any` bindings, and were blocked only on printing
+  // their results.
+  //
+  // 2383 still refuses, at libCall:process.envGet. 2601 was expected to
+  // keep refusing for non-inspect reasons and does not — printing was its
+  // last gap.
+  "1591-js-closures.js",
+  "1617-cjs-esm-lexer-visible/main.mjs",
+  "1637-inspect-dyn.ts",
+  "1664-dyn-fn-boundary.cjs",
+  "1679-console-dyn.js",
+  "1702-dyn-proto-dispatch.cjs",
+  "1713-js-dyn-fields.js",
+  "1760-surplus-args-drop.cjs",
+  "1840-jsdoc-import-type-only/main.js",
+  "2032-cjs-export-assigned-class-expression/main.cjs",
+  "2038-evolving-array-js.cjs",
+  "2040-any-bindings.ts",
+  "2041-any-params-returns.ts",
+  "2043-any-dom-values.ts",
+  "2097-js-evolving-globals.js",
+  "2162-js-dyn-destructure.cjs",
+  "2286-dyn-object-walks.cjs",
+  "2301-cjs-export-table-dom-attach.cjs",
+  "2322-dyn-array-sort.cjs",
+  "2473-option-table-widths.js",
+  "2585-unknown-array.ts",
+  "2600-dyn-keyed-write-harness.js",
+  "2601-dyn-keyed-write-ops.js",
+  "2602-dyn-array-destructure.js",
 ];
 
 interface RunResult {

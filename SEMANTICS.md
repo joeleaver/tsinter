@@ -496,6 +496,18 @@ boundary twice stays one JS value. The NAME this text embeds is the
 approximation S020 registers, so a value whose `f.name` is wrong there
 renders the same wrong name here.
 
+**`util.format`'s `%s` reaches for this same text in Node and gets a
+different answer here.** Node's `%s` arm is `String(arg)` for anything that
+is not an object, so `format('%s', f)` prints the SOURCE, while this tier
+prints inspect's `[Function: name]` / `[Function (anonymous)]` form (on
+every lane — the C runtime's `scr_insp_dyn_s` does the same). Since the
+source text is out of reach either way, the choice is between two non-Node
+answers, and the two `%s` sites share one lowering with `console.log`'s
+rest arguments — where the inspect form IS Node's answer. Splitting them
+means a second libCall carrying the `%s` rule, which is not yet worth it.
+Only the DYN path is affected: `%s` over a statically-typed function value
+refuses by name rather than answering.
+
 **Rationale:** inherited from the C runtime, which renders exactly this
 text for the same reason. Reproducing Node would mean shipping every
 boxable function's source text in the binary and a decision about which
@@ -856,14 +868,16 @@ under Node's default stack and throws here, and one nested 800 deep
 stringifies here and throws under a small-stack Node. Neither side is
 uniformly stricter.
 
-CYCLES are where the two walkers part company. The STATIC path detects
-them exactly: a cyclic value of a recursive record type throws V8's
-`TypeError: Converting circular structure to JSON` with the message built
-byte for byte, so the cap is not what reports it. The DYN walker has no
-cycle detector, so a cyclic dyn tree — constructible through dyn keyed
-writes, `const o: any = {}; o.self = o` — runs out of depth instead and
-reports the RangeError above: right that it failed, wrong about why. That
-gap closes when the dyn tree grows its own seen stack.
+CYCLES ARE NOT WHAT THIS ENTRY COVERS, and no longer differ between the
+two walkers. Both detect them exactly: a cyclic value — of a recursive
+record type, or a dyn tree built through dyn keyed writes (`const o: any =
+{}; o.self = o`) — throws V8's `TypeError: Converting circular structure
+to JSON` with the message built byte for byte, edge path and elision
+included, through one shared builder. So the cap reports deep ACYCLIC
+nesting only. (Until increment 16 the dyn walker had no cycle detector and
+answered a cyclic tree with the RangeError above — right that it failed,
+wrong about why. This entry named a seen stack as the fix; the dyn walker
+grew one, sharing `jbEnter` with the static path, and the gap is closed.)
 
 WHAT THE OTHER LANES DO with the same inputs, all measured rather than
 assumed. On a CYCLIC dyn tree the C runtime has no guard of either kind:
@@ -887,15 +901,15 @@ a catchable RangeError on the same input. Capping turns an uncatchable
 abort at an unpredictable depth into the catchable failure Node already
 gives, at a documented one. The message is not invented — it is exactly
 what Node produces for this class of input. Removing the divergence means
-an explicit value stack in both walkers, plus a seen stack for the dyn
-tree so its cycles report the TypeError instead.
+an explicit value stack in both walkers.
 **Tested by:** the wasm emitter unit tests, on both paths — 1000 nested
 objects serialize and 1001 throws through the dyn walker; a 1000-deep
 acyclic value of a recursive record type serializes and 1001 throws
-through the static one; a cyclic dyn tree throws; and the buffer, seen
-stack and depth counter all recover for the next call. No corpus program
-can pin it: the native lanes diverge from this by construction (C caps
-neither path).
+through the static one; a cyclic dyn tree throws the circular TypeError
+with its edge path, in the property and index forms both; and the buffer,
+seen stack and depth counter all recover for the next call. No corpus
+program can pin it: the native lanes diverge from this by construction (C
+caps neither path).
 
 ## S027 — `util.inspect` of an Error renders the STACKLESS bracket form *(wasm tier)*
 
@@ -1040,3 +1054,111 @@ both the literal output and that it differs from `util.inspect` — so a
 future change that silently converges, or diverges further, fails. The
 complementary half is pinned too: ASCII grids at the same six shapes are
 byte-identical to Node. Corpus programs cover the grid on ASCII data only.
+
+## S029 — `util.inspect` of a dyn tree caps recursion at 1000 *(wasm tier)*
+
+`util.inspect` over a checked-dynamic tree stops descending at 1000 levels
+and renders the composite it stopped at as
+
+```
+[Object: Inspection interrupted prematurely. Maximum call stack size exceeded.]
+```
+
+(`[Array: ...]` for an array, and Node's own doubled-bracket
+`[[Object: null prototype]: ...]` for a null-prototype dictionary). The rest
+of the render then FINISHES normally: the marker takes the place of one
+value, every enclosing level closes, and the call returns a complete string
+rather than throwing.
+
+**That text and that degradation are Node's**, not this tier's invention.
+`formatRaw` wraps its entry-building loop in a try, and on a stack overflow
+`handleMaxCallStackSize` pops the seen stack, restores the indentation level
+and returns exactly the string above — so a deep-enough tree gets a
+truncated-but-complete rendering out of Node too, with one marker in it.
+What diverges is WHEN: ours is a fixed 1000, Node's is wherever its stack
+runs out. Measured on Node 24.18, `inspect(chain, { depth: null })` over a
+loop-built chain of plain objects: the marker appeared after 929 levels on a
+5000-deep tree, and repeated runs across 5000-, 10000-, 12000- and
+20000-deep inputs put the cut anywhere from 929 to 2450 levels (929, 967,
+969, 1191, 1221, 1244, 1419, 2172, 2450 among the observations), because it
+is the stack rather than the tree that decides. There is no fixed depth to
+state, and the spread between runs — roughly 1500 levels — is wider than
+any single number suggests. 1000 sits inside that band, at its low end: it
+reproduces the 929 case closely, and against a run that got 2450 levels deep
+our truncated prefix is around 1450 levels shorter. What matches exactly in
+every case is the MARKER TEXT and the shape of the degradation — one marker,
+then an output that completes.
+
+**The exposure is very narrow.** `depth` defaults to 2, so the walk stops
+three levels down for every ordinary call; reaching 1000 takes an explicit
+`{ depth: null }` (or a numeric depth past 1000) over a tree that is
+actually that deep, which in turn takes a loop that builds one. A cycle does
+NOT reach the cap: the seen check precedes the depth check, so a cyclic tree
+answers `[Circular *N]` at the repeat, however deep the cycle sits.
+
+**Rationale:** S026's, sharpened. The walker is recursive descent over a
+tree of unbounded depth, and the wasm stack is far smaller than the native
+one — UNCAPPED, the sibling stringify walker was measured trapping between
+5000 and 10000 levels, and trapping UNCATCHABLY, with the program's own
+`try` never running and its buffered output never flushed (the S003/S007
+abort family). Node degrades gracefully on the same input. A fixed cap
+reproduces the graceful degradation, including the exact marker, at a
+documented depth instead of an unpredictable one. Removing the divergence
+means an explicit value stack in the walker — the same work S026 names, and
+best done for both walkers at once.
+
+**Tested by:** the wasm inspect unit tests. A 1001-link chain at
+`{ depth: null }` renders one marker, with Node's exact text, and completes
+(the brace counts balance and the chain's `end: true` leaf is gone); a
+1000-link chain renders in full with no marker, which pins the boundary from
+both sides; and the engine renders correctly straight afterwards. The marker
+TEXT is also asserted against Node in the same test, by inspecting a
+20000-deep tree in the test process and matching the string. No corpus
+program can pin it: the native lanes cap nothing, and a program whose output
+observed this would fail the differential on every lane.
+
+## S030 — `util.inspect` of a dyn PROMISE fences at runtime *(wasm tier)*
+
+A promise that has crossed into `any` — `const p: any = somePromise` boxes
+the promise itself, by reference — has no rendering on this tier. Reaching
+one, at any depth of an inspected dyn tree, throws a LOUD, catchable, plain
+`Error` (never a `TypeError`, so a handler testing for one is not misled):
+
+```
+util.inspect of a promise value is not supported yet
+```
+
+Node renders `Promise { <pending> }`, `Promise { 42 }` or
+`Promise { <rejected> Error: ... }`. This tier models promise STATE (the
+async machinery needs it), so the shape is reachable in principle; what is
+missing is the settled VALUE's rendering, which re-enters the walker through
+a payload the frontend has no static type for. Guessing — printing
+`Promise { <pending> }` for a settled promise, say — would be a silently
+wrong answer for the one case anyone would notice.
+
+The throw leaves NO state behind: the fence resets the render's buffer,
+frame stack, item stack, indentation and circular state before filling the
+exception cell, and every recursive step of the walker checks the cell and
+unwinds without touching them. So a program that CATCHES the fence and
+inspects something else gets a correct rendering.
+
+`insp.dyn` and `insp.dynS` are may-throw seeded for this fence, which the
+native lanes need too: `scr_insp_dyn` throws the same text (and two more,
+for a runtime handle and an island value — neither constructible on this
+tier, both `unreachable` here), and before the seed landed nothing checked
+the cell after one, so the exception could outlive the call and surface at
+whatever checked next.
+
+**Rationale:** the handle stance, applied to a kind this tier does model
+enough of to tempt a guess. A loud catchable failure naming the unsupported
+thing is the tier's standing answer for a construct it cannot render
+faithfully (S004's shape, S023's mechanism), and inspect is a rendering
+surface rather than an invoke surface, which is why this is its own entry
+rather than a line in S023. Removing the divergence means rendering the
+settled value, which needs a typed path out of the promise payload —
+tractable, and a different increment.
+
+**Tested by:** the wasm inspect unit test — the fence's name and text from a
+bare promise and from one nested inside a tree (so the unwind crosses frames
+the render left open), followed by two further renders that must come out
+byte-identical to Node, which is what pins the reset.

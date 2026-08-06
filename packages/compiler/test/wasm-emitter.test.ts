@@ -1410,12 +1410,14 @@ test("S026: the dyn stringify walker caps depth at 1000, catchably", async () =>
   // what S026 registers.
   //
   // 999 links means 1000 nested objects, which is exactly the cap; one
-  // more throws. A CYCLIC tree is the case that matters most: it is
-  // constructible through dyn keyed writes, Node reports it as a
-  // circular-structure TypeError, and this walker has no cycle detection
-  // — so it runs out of depth instead. The C runtime has no guard of
-  // either kind and dies of SIGSEGV with the stack exhausted (task #17),
-  // which is the uncatchable version of this failure.
+  // more throws. A CYCLIC tree is the OTHER way to recurse forever, and it
+  // is now reported the way Node reports it — the circular-structure
+  // TypeError, message and edge path included — because the dyn walker
+  // grew the seen stack S026 named as the fix. The depth cap is what
+  // catches a deep ACYCLIC tree, the seen stack what catches a cyclic one,
+  // and the two share `jbEnter`. (The C runtime has neither guard and dies
+  // of SIGSEGV with the stack exhausted, which is the uncatchable version
+  // of both failures.)
   //
   // The tree is built at TOP LEVEL on purpose: a dyn value bound by a
   // block-scoped `const` inside a loop is COPIED rather than aliased on
@@ -1439,7 +1441,24 @@ test("S026: the dyn stringify walker caps depth at 1000, catchably", async () =>
       "const c: any = {};",
       "c.self = c;",
       "try { JSON.stringify(c as unknown); console.log('cyclic: no throw'); }",
-      "catch (e) { if (e instanceof RangeError) console.log('cyclic: RangeError: ' + e.message); else console.log('wrong kind'); }",
+      "catch (e) { if (e instanceof TypeError) console.log('cyclic: ' + e.message); else console.log('wrong kind'); }",
+      // An ARRAY root and a longer edge path, so the message's `index N`
+      // form and its intermediate lines are pinned over a DYN tree too (the
+      // static walker's own pins are in the circular-structures test).
+      "const av: any = [];",
+      "const inner: any = [];",
+      "av[0] = inner;",
+      "inner[0] = av;",
+      "try { JSON.stringify(av as unknown); }",
+      "catch (e) { console.log((e as Error).message); }",
+      "const nest: any = {};",
+      "const mid: any = {};",
+      "const leaf: any = {};",
+      "nest.a = mid;",
+      "mid.b = leaf;",
+      "leaf.back = nest;",
+      "try { JSON.stringify(nest as unknown); }",
+      "catch (e) { console.log((e as Error).message); }",
       // The buffer and the depth counter both reset for the next call —
       // a throw mid-walk must not poison the one after it.
       `console.log('recovered:', JSON.stringify(JSON.parse('{"ok":1}')));`,
@@ -1452,7 +1471,20 @@ test("S026: the dyn stringify walker caps depth at 1000, catchably", async () =>
     [
       "999 links: 5996",
       "1000 links: RangeError: Maximum call stack size exceeded",
-      "cyclic: RangeError: Maximum call stack size exceeded",
+      // V8's message, byte for byte — the same builder the static walker
+      // uses, now reached from the dyn walk.
+      "cyclic: Converting circular structure to JSON",
+      "    --> starting at object with constructor 'Object'",
+      "    --- property 'self' closes the circle",
+      "Converting circular structure to JSON",
+      "    --> starting at object with constructor 'Array'",
+      "    |     index 0 -> object with constructor 'Array'",
+      "    --- index 0 closes the circle",
+      "Converting circular structure to JSON",
+      "    --> starting at object with constructor 'Object'",
+      "    |     property 'a' -> object with constructor 'Object'",
+      "    |     property 'b' -> object with constructor 'Object'",
+      "    --- property 'back' closes the circle",
       `recovered: {"ok":1}`,
       "",
     ].join("\n"),

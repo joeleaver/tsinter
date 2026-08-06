@@ -102,6 +102,12 @@ export interface JsonDeps {
   throwError: (c: Code, className: string, name: string, pushMessage: (c: Code) => void) => void;
   /** Is a pending exception set? (the cell's kind global). */
   excKind: () => number;
+  /** CLEAR the exception cell — the kind tag, the payload ref and the
+   * thrown class's interval position. util.format's `%j` is the one
+   * consumer: it CATCHES the circular TypeError and prints "[Circular]"
+   * (`tryStringify`), so it needs to take the cell back down the way a
+   * `catch` clause does. */
+  clearExc: (c: Code) => void;
   /** Push a fresh empty dyn VECTOR (the ARR payload) — %w.vec.newLen:dyn
    * at length 0. The vector machinery is the emitter's to intern. */
   newDynVec: (c: Code) => void;
@@ -2591,6 +2597,8 @@ export class JsonBuilder {
       c.globalSet(this.seenLen());
       c.i32Const(0);
       c.globalSet(this.jbDepth());
+      c.i32Const(0);
+      c.globalSet(this.circHit());
       this.mb.setBody(idx, [], c.bytes());
     });
   }
@@ -3266,6 +3274,32 @@ export class JsonBuilder {
   private seenArrT: number | null = null;
   private seenG: number | null = null;
   private seenLenG: number | null = null;
+  private circHitG: number | null = null;
+
+  /** Set when `jbEnter` fills the cell with the CIRCULAR TypeError, as
+   * opposed to the depth cap's RangeError — the two are the only errors a
+   * walk can raise, and util.format's `%j` has to tell them apart:
+   * `tryStringify` returns "[Circular]" for the first and RETHROWS
+   * everything else (measured on Node 24.18 — a `%j` over a tree deep
+   * enough to overflow V8's stack propagates the RangeError, it does not
+   * degrade to "[Circular]"). Node discriminates by comparing the caught
+   * error's name and first message line against a probe error it builds
+   * once; a flag set at the throw site answers the same question exactly,
+   * with no string compare. Cleared by `jbBegin` per walk.
+   *
+   * The flag is a FAST PATH, not a load-bearing assumption. `formatJ` only
+   * ever converts a pending error to "[Circular]" when the flag is SET, so
+   * an unflagged error — the depth RangeError, or a third kind a later arm
+   * might add — leaves the cell alone and unwinds through the call site's
+   * pending check. Getting the flag wrong therefore costs a rethrow where
+   * Node degrades, never a degradation where Node rethrows. */
+  private circHit(): number {
+    this.circHitG ??= this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41);
+      w.sleb(0);
+    });
+    return this.circHitG;
+  }
 
   /** One frame: the container's identity, whether it prints as an Array,
    * and the edge LEAVING it (a property name, or an index when the name
@@ -3566,6 +3600,8 @@ export class JsonBuilder {
         x.localGet(I);
         x.call(this.circMsg());
       });
+      c.i32Const(1);
+      c.globalSet(this.circHit());
       c.i32Const(0);
       c.return_();
       c.end();
@@ -3676,11 +3712,24 @@ export class JsonBuilder {
    *    constructible on this tier; an honest trap beats a silently wrong
    *    answer if that ever stops being true.
    *
+   * CYCLES are detected HERE, through the same `jbEnter`/`jbLeave` pair
+   * the type-directed walkers use — so a cyclic dyn tree throws V8's
+   * `TypeError: Converting circular structure to JSON` with the message
+   * built byte for byte, edges and all, instead of running out of depth
+   * and reporting a RangeError that was right about failing and wrong
+   * about why. (S026 registered that gap and named this as the fix; the
+   * entry now records that it closed. C detects nothing here and dies of
+   * SIGSEGV on the same input — a native-lane bug tracked separately.)
+   * IDENTITY IS THE PAYLOAD, not the `$dyn` box: a keyed write COPIES the
+   * box while the vector and the `$dynObj` are shared, so the box would
+   * miss every cycle a program can build.
+   *
    * THE DEPTH CAP IS SEMANTICS.md S026. Both Node and this walker cap
    * stringify recursion and both report `RangeError: Maximum call stack
    * size exceeded` — the kind and the text agree exactly. What differs is
    * the LIMIT: 1000 here regardless of anything, implementation-defined
-   * and stack-dependent there. The entry has the measurements. */
+   * and stack-dependent there. The entry has the measurements. It rides
+   * `jbEnter` too, so both walkers share one counter. */
 
   private jbDepthG: number | null = null;
 
@@ -3748,6 +3797,7 @@ export class JsonBuilder {
       const MK = 8; // one member's kind
       const FIRST = 9;
       const PRESENT = 10;
+      const OP = 11; // the OBJ payload — the seen stack's identity
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
@@ -3804,11 +3854,20 @@ export class JsonBuilder {
       });
 
       this.emitKindArm(c, K, [DK.ARR], () => {
-        this.emitDepthEnter(c);
-        c.i32Const(0x5b); // '['
-        c.call(this.jbPutc());
+        // The seen stack and the depth cap both ride jbEnter, exactly as
+        // the type-directed walkers do — see the header's CYCLES note.
         dyn.arrPayload(c, (x) => x.localGet(0));
         c.localSet(V);
+        c.localGet(V);
+        c.i32Const(1); // prints as an Array
+        c.call(this.jbEnter());
+        c.i32Eqz();
+        c.ifVoid();
+        c.i32Const(0);
+        c.return_();
+        c.end();
+        c.i32Const(0x5b); // '['
+        c.call(this.jbPutc());
         dyn.arrLen(c, (x) => x.localGet(V));
         c.localSet(N);
         c.i32Const(0);
@@ -3824,6 +3883,10 @@ export class JsonBuilder {
         c.i32Const(0x2c); // ','
         c.call(this.jbPutc());
         c.end();
+        // The edge this container leaves by, for the circular message's
+        // `index N` line.
+        c.localGet(I);
+        c.call(this.jbEdgeIdx());
         dyn.arrAt(c, (x) => x.localGet(V), (x) => x.localGet(I));
         c.call(idx);
         c.localSet(PRESENT);
@@ -3851,13 +3914,22 @@ export class JsonBuilder {
         c.end();
         c.i32Const(0x5d); // ']'
         c.call(this.jbPutc());
-        this.emitDepthLeave(c);
+        c.call(this.jbLeave());
         c.i32Const(1);
         c.return_();
       });
 
       this.emitKindArm(c, K, [DK.OBJ], () => {
-        this.emitDepthEnter(c);
+        dyn.objPayload(c, (x) => x.localGet(0));
+        c.localSet(OP);
+        c.localGet(OP);
+        c.i32Const(0); // prints as an Object
+        c.call(this.jbEnter());
+        c.i32Eqz();
+        c.ifVoid();
+        c.i32Const(0);
+        c.return_();
+        c.end();
         c.i32Const(0x7b); // '{'
         c.call(this.jbPutc());
         // Own-key ORDER, through the one helper that defines it.
@@ -3911,6 +3983,11 @@ export class JsonBuilder {
         c.call(this.jbPutStr());
         c.i32Const(0x3a); // ':'
         c.call(this.jbPutc());
+        // The edge, for the circular message's `property 'x'` line.
+        dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(0));
+        c.structGet(dynT, DYN_REF);
+        c.refCast(strT);
+        c.call(this.jbEdgeProp());
         dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(1));
         c.call(idx);
         c.drop(); // present: the kind test above already established it
@@ -3929,7 +4006,7 @@ export class JsonBuilder {
         c.end();
         c.i32Const(0x7d); // '}'
         c.call(this.jbPutc());
-        this.emitDepthLeave(c);
+        c.call(this.jbLeave());
         c.i32Const(1);
         c.return_();
       });
@@ -3941,7 +4018,7 @@ export class JsonBuilder {
       c.unreachable();
       this.mb.setBody(
         idx,
-        [I32, dyn.arrRef(), I32, I32, dyn.dynRef(), dyn.dynRef(), dyn.arrRef(), I32, I32, I32],
+        [I32, dyn.arrRef(), I32, I32, dyn.dynRef(), dyn.dynRef(), dyn.arrRef(), I32, I32, I32, dyn.objRef()],
         c.bytes(),
       );
     });
@@ -3982,6 +4059,55 @@ export class JsonBuilder {
       // the buffer is left for the next site's prologue to reset.
       c.globalGet(this.deps.excKind());
       c.ifVoid();
+      c.refNull(this.deps.strType());
+      c.return_();
+      c.end();
+      c.localGet(PRESENT);
+      c.i32Eqz();
+      c.ifVoid();
+      this.deps.lit(c, "undefined");
+      c.return_();
+      c.end();
+      c.call(this.jbFinish());
+      this.mb.setBody(idx, [I32], c.bytes());
+    });
+  }
+
+  /** `%w.json.formatJ(d)` → util.format's `%j` over a dyn value —
+   * `scr_dyn_format_j`, plus the one thing the C reference does not do.
+   *
+   * Node's `tryStringify` is `JSON.stringify` inside a try that answers
+   * "[Circular]" for exactly ONE error — a TypeError whose first message
+   * line matches the circular-structure text — and RETHROWS anything else.
+   * So a cyclic tree prints the literal "[Circular]" with no `*N`
+   * numbering (that numbering belongs to inspect, not to format), while a
+   * tree deep enough to overflow the stringifier propagates its
+   * RangeError: measured on Node 24.18, `format('%j', tree)` over a
+   * loop-built 5000-deep tree throws where a cyclic one degrades. Both
+   * halves land here: the circular flag decides which, the cell is taken
+   * back down for the caught case, and the RangeError is left pending for
+   * the site's check.
+   *
+   * A root the walk DROPS (undefined, a function) prints "undefined" —
+   * Node's stringify returns the undefined VALUE and format's `${}` spells
+   * it (measured both ways). */
+  formatJ(): number {
+    const dyn = this.deps.dyn();
+    return this.cached("formatJ", [dyn.dynRef()], [this.deps.strRef()], (idx) => {
+      const c = new Code();
+      const PRESENT = 1;
+      c.call(this.jbBegin());
+      c.localGet(0);
+      c.call(this.putDyn());
+      c.localSet(PRESENT);
+      c.globalGet(this.deps.excKind());
+      c.ifVoid();
+      c.globalGet(this.circHit());
+      c.ifVoid();
+      this.deps.clearExc(c);
+      this.deps.lit(c, "[Circular]");
+      c.return_();
+      c.end();
       c.refNull(this.deps.strType());
       c.return_();
       c.end();

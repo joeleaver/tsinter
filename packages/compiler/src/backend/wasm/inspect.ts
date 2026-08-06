@@ -114,10 +114,31 @@
  * the whole exposure. (scr_inspect.c:142-143 attributes the difference to
  * NFC alone; fixing the C is not this increment's business.) */
 import { Code } from "./code.js";
+import { DK, DYN_KIND, DYN_NUM, DYN_REF, FN_NAME, OBJ_LEN, OBJ_NULL_PROTO, type DynBuilder } from "./dyn.js";
 import { F64, I32, ModuleBuilder, type ValType } from "./module.js";
 
 /** Node's `ctx.maxStringLength` default (inspectDefaultOptions). */
 const MAX_STRING_LENGTH = 10000;
+
+/** Node's `ctx.maxArrayLength` default — the entry count past which an
+ * array renders `... N more items` instead. Plain objects are never
+ * truncated (Node truncates arrays and iterables only). */
+const MAX_ARRAY_LENGTH = 100;
+
+/** The dyn walker's recursion cap — SEMANTICS.md S029. Node degrades
+ * instead of failing here, at a stack-dependent depth measured between
+ * 929 and 1421 levels; 1000 sits inside that band and matches the two
+ * other capped walks (S013's parser, S026's stringifier). */
+const MAX_DYN_DEPTH = 1000;
+
+/** Node's `handleMaxCallStackSize` text, whose `constructorName` is the
+ * composite's own — `Object`, `Array`, or (Node's own doubled-bracket
+ * quirk) the whole `[Object: null prototype]` base. */
+const INTERRUPTED = ": Inspection interrupted prematurely. Maximum call stack size exceeded.]";
+
+/** The null-prototype dictionary's base, which Node prints ahead of the
+ * braces at every depth (`formatValue`'s constructor-less base). */
+const NULL_PROTO = "[Object: null prototype]";
 
 /** Node's `kMinLineLength` (inspect.js:258) — the floor below which
  * formatPrimitive never splits a string, whatever the indentation. */
@@ -151,6 +172,20 @@ export interface InspectDeps {
   errName: () => number;
   errMessage: () => number;
   errCode: () => number;
+  /** The dyn representation — the walker's whole vocabulary (kinds, the
+   * ARR/OBJ/FUNC payload accessors, and `objWalk` for key ORDER). */
+  dyn: () => DynBuilder;
+  /** `%w.inspF64` — inspect's number arm (ToString, except -0 prints
+   * "-0"). The frontend reaches it as the `insp.f64` libCall; the dyn
+   * walker needs the same helper for a NUM box. */
+  inspF64: () => number;
+  /** Fill the exception cell with a fresh error of `className`. The dyn
+   * walker's ONE throw is the promise fence (SEMANTICS.md S030). */
+  throwError: (c: Code, className: string, name: string, pushMessage: (c: Code) => void) => void;
+  /** The exception cell's kind global — 0 when nothing is pending. Every
+   * recursive step of the walker tests it, so a fence deep in a tree
+   * unwinds instead of rendering the rest into a string nobody reads. */
+  excKind: () => number;
 }
 
 export class InspectBuilder {
@@ -2996,5 +3031,534 @@ export class InspectBuilder {
 
   private errRef(): ValType {
     return { kind: "ref", nullable: true, typeIndex: this.deps.errT() };
+  }
+
+  /* ── the dyn walker ───────────────────────────────────────────────────
+   * The one runtime type whose SHAPE lives in the value, so the traversal
+   * lives here instead of a synthesized helper: `scr_insp_dyn` ported onto
+   * the engine above, with the same defaults and Node as the oracle. Four
+   * places it deliberately departs from the C, each measured:
+   *
+   *  1. KEY ORDER IS JS OWN-KEY ORDER. C walks `d->v.obj.entries` in
+   *     insertion order; Node prints integer-like keys ASCENDING FIRST,
+   *     the same order `Object.keys` answers (measured: `{b:1,a:2,10:3,
+   *     2:4,c:5}` inspects as `{ '2': 4, '10': 3, b: 1, a: 2, c: 5 }`, and
+   *     one-at-a-time assignment agrees). So the walk goes through
+   *     `objWalk` mode 2 — the one helper that defines that order — rather
+   *     than growing a second, subtly different copy of the rule. C's
+   *     raw-order walk is a native-lane divergence, tracked separately.
+   *     json.ts's `putDyn` made the same call for the same reason.
+   *  2. THE CIRCULAR PROTOCOL RUNS HERE. C's dyn arm has none: a cyclic
+   *     dyn tree recurses until the process dies. Node prints
+   *     `<ref *1> { self: [Circular *1] }`, so the walker drives stage B's
+   *     quartet exactly as the frontend's cycle-capable helpers do —
+   *     circCheck BEFORE the empty and depth answers (measured: a cycle
+   *     found at recursion 3 under depth 2 still says `[Circular *1]`,
+   *     because Node's seen check precedes its depth check), seenPush
+   *     after begin, refWrap around end.
+   *  3. IDENTITY IS THE PAYLOAD, not the `$dyn` box. A keyed write COPIES
+   *     the box while the ARR vector and the OBJ payload are SHARED (the
+   *     dyn-surface bug filed as its own task), so `ref.eq` on the box
+   *     would miss every cycle a program can actually build. The vector /
+   *     `$dynObj` reference is what goes on the seen stack.
+   *  4. THE RECURSION IS CAPPED — SEMANTICS.md S029. Node catches its own
+   *     stack overflow mid-render and substitutes an interruption marker,
+   *     then finishes the output; at a fixed depth this emits Node's exact
+   *     marker text and finishes the same way.
+   *
+   * BYTES, HANDLE and JSVAL are `unreachable` for putDyn's reason: no
+   * producer on this tier can build one (typed arrays, runtime handles and
+   * the island bridge all refuse upstream), so arriving here means the dyn
+   * surface grew a kind without growing this walk. PROMISE is DIFFERENT —
+   * `dynFrom:promise` boxes a `Promise<any>` — and it fences loudly rather
+   * than guess at Node's `Promise { <pending> }` / `Promise { value }`
+   * (SEMANTICS.md S030, the handle stance). That fence is the
+   * only throw in this file, and the reason `insp.dyn`/`insp.dynS` are
+   * may-throw seeded. */
+
+  /** `if (kind is one of ks) { body }` — json.ts's `emitKindArm`, repeated
+   * for the same reason it was: this file needs nothing from dyn.ts but
+   * the representation. */
+  private kindArm(c: Code, kindLocal: number, ks: number[], body: () => void): void {
+    ks.forEach((k, i) => {
+      c.localGet(kindLocal);
+      c.i32Const(k);
+      c.i32Eq();
+      if (i > 0) c.i32Or();
+    });
+    c.ifVoid();
+    body();
+    c.end();
+  }
+
+  /** `%w.insp.reset()` — abandon the whole render: the buffer, the frame
+   * and item stacks, the circular state and the indentation all go back to
+   * their initial values.
+   *
+   * The promise fence needs this because the throw unwinds through
+   * ancestors that will never reach their `end` — their frames would stay
+   * stacked, their marks unconsumed and `ctx.indentationLvl` two per level
+   * too deep, and the NEXT render would inherit all of it. `begin(1)`
+   * clears the circular state on a fresh top-level value but nothing else,
+   * because until this arm existed nothing in the engine could throw.
+   * Resetting `len` to 0 is also what makes the unwind safe: an ancestor
+   * that returned without its `ibTake` leaves a mark ABOVE the fill
+   * length, which the next take would read as a negative region. */
+  private reset(): number {
+    return this.cached("reset", [], [], (idx) => {
+      const c = new Code();
+      c.i32Const(0);
+      c.globalSet(this.len());
+      c.i32Const(0);
+      c.globalSet(this.nitems());
+      c.i32Const(0);
+      c.globalSet(this.nframes());
+      c.i32Const(0);
+      c.globalSet(this.nseen());
+      c.i32Const(0);
+      c.globalSet(this.ncirc());
+      c.i32Const(0);
+      c.globalSet(this.indentGlobal());
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** `%w.insp.dyn(d, recurse, depth)` → the dyn tree's rendering, or null
+   * with the promise fence pending. RECURSIVE. */
+  dyn(): number {
+    const dyn = this.deps.dyn();
+    return this.cached("dyn", [dyn.dynRef(), F64, F64], [this.deps.strRef()], (idx) => {
+      const dynT = dyn.dynT();
+      const objT = dyn.objT();
+      const strT = this.deps.strType();
+      const strRef = this.deps.strRef();
+      const c = new Code();
+      const D = 0;
+      const RECURSE = 1;
+      const DEPTH = 2;
+      const K = 3;
+      const MARK = 4;
+      const V = 5; // the ARR payload, or objWalk's entries vector
+      const O = 6; // the OBJ payload
+      const N = 7;
+      const I = 8;
+      const SHOWN = 9;
+      const MORE = 10;
+      const NP = 11; // nullProto
+      const ID = 12; // the circular id (f64)
+      const E = 13; // one element, or one [key, value] pair
+      const P = 14; // the pair's payload vector
+      const KS = 15; // the key's rendering
+      const VS = 16; // the value's rendering
+      const R = 17; // the composite's rendering
+      const ENTS = 18; // objWalk's result box
+      const NAME = 19; // FN_NAME
+      /** recurse + 1 — the depth children format at. */
+      const deeper = (): void => {
+        c.localGet(RECURSE);
+        c.f64Const(1);
+        c.f64Add();
+      };
+      /** The pending check every recursive step carries: a fence anywhere
+       * in the tree abandons the render, and the arm that threw has
+       * already reset the engine, so bailing touches nothing. */
+      const bailIfPending = (): void => {
+        c.globalGet(this.deps.excKind());
+        c.ifVoid();
+        c.refNull(strT);
+        c.return_();
+        c.end();
+      };
+      /** `[Circular *N]` when `slot` holds an id the circular check just
+       * assigned. */
+      const circularAnswer = (): void => {
+        c.localGet(ID);
+        c.f64Const(0);
+        c.f64Ne();
+        c.ifVoid();
+        c.localGet(ID);
+        c.call(this.circular());
+        c.return_();
+        c.end();
+      };
+
+      c.localGet(D);
+      c.structGet(dynT, DYN_KIND);
+      c.localSet(K);
+
+      /* The scalar arms: no frame, no recursion, no circular state. */
+      this.kindArm(c, K, [DK.NULL], () => {
+        this.deps.lit(c, "null");
+        c.return_();
+      });
+      this.kindArm(c, K, [DK.UNDEF], () => {
+        this.deps.lit(c, "undefined");
+        c.return_();
+      });
+      this.kindArm(c, K, [DK.BOOL], () => {
+        // The flag widened into the num slot at box time (dyn.ts).
+        c.localGet(D);
+        c.structGet(dynT, DYN_NUM);
+        c.f64Const(0);
+        c.f64Ne();
+        c.ifResult(strRef);
+        this.deps.lit(c, "true");
+        c.else_();
+        this.deps.lit(c, "false");
+        c.end();
+        c.return_();
+      });
+      this.kindArm(c, K, [DK.NUM], () => {
+        c.localGet(D);
+        c.structGet(dynT, DYN_NUM);
+        c.call(this.deps.inspF64());
+        c.return_();
+      });
+      this.kindArm(c, K, [DK.STR], () => {
+        // A dyn string INSIDE a composite quotes like any other string;
+        // only the top-level %s/console.log position passes it verbatim,
+        // which is `insp.dynS`'s whole job.
+        c.localGet(D);
+        c.structGet(dynT, DYN_REF);
+        c.refCast(strT);
+        c.call(this.str());
+        c.return_();
+      });
+      this.kindArm(c, K, [DK.FUNC], () => {
+        // The boxed name is the compiler's best-effort static spelling
+        // (S020). C's `name && name[0]`: null OR EMPTY is anonymous.
+        dyn.fnPayload(c, (x) => x.localGet(D));
+        c.structGet(dyn.fnT(), FN_NAME);
+        c.localSet(NAME);
+        c.localGet(NAME);
+        c.refIsNull();
+        c.ifResult(I32);
+        c.i32Const(1);
+        c.else_();
+        c.localGet(NAME);
+        c.arrayLen();
+        c.i32Eqz();
+        c.end();
+        c.ifVoid();
+        this.deps.lit(c, "[Function (anonymous)]");
+        c.return_();
+        c.end();
+        c.globalGet(this.len());
+        c.localSet(MARK);
+        this.deps.lit(c, "[Function: ");
+        c.call(this.ibPuts());
+        c.localGet(NAME);
+        c.call(this.ibPuts());
+        c.i32Const(0x5d); // ']'
+        c.call(this.ibPutc());
+        c.localGet(MARK);
+        c.call(this.ibTake());
+        c.return_();
+      });
+      this.kindArm(c, K, [DK.PROMISE], () => {
+        // Node renders Promise { <pending> } / Promise { value }. The
+        // settled-value rendering would have to re-enter this walker
+        // through the promise representation's payload, and the frontend
+        // has no type for what comes out; fence loudly instead of a
+        // silent-wrong shape (S030, the handle stance).
+        c.call(this.reset());
+        this.deps.throwError(c, "%Error", "Error", (x) =>
+          this.deps.lit(x, "util.inspect of a promise value is not supported yet"),
+        );
+        c.refNull(strT);
+        c.return_();
+      });
+
+      this.kindArm(c, K, [DK.ARR], () => {
+        dyn.arrPayload(c, (x) => x.localGet(D));
+        c.localSet(V);
+        dyn.arrLen(c, (x) => x.localGet(V));
+        c.localSet(N);
+        // The empty answer comes BEFORE the frame (an empty frame renders
+        // "[  ]") and before the circular check, which is sound because an
+        // empty array cannot be on the traversal path — a self-reference
+        // needs a slot to hold it.
+        c.localGet(N);
+        c.i32Eqz();
+        c.ifVoid();
+        this.deps.lit(c, "[]");
+        c.return_();
+        c.end();
+        c.localGet(V);
+        c.call(this.circCheck());
+        c.localSet(ID);
+        circularAnswer();
+        c.localGet(RECURSE);
+        c.localGet(DEPTH);
+        c.f64Gt();
+        c.ifVoid();
+        this.deps.lit(c, "[Array]");
+        c.return_();
+        c.end();
+        // S029: the marker, then a render that still completes.
+        c.localGet(RECURSE);
+        c.f64Const(MAX_DYN_DEPTH);
+        c.f64Gt();
+        c.ifVoid();
+        this.deps.lit(c, `[Array${INTERRUPTED}`);
+        c.return_();
+        c.end();
+        deeper();
+        c.call(this.begin());
+        c.localGet(V);
+        c.call(this.seenPush());
+        // shown = min(n, 100)
+        c.localGet(N);
+        c.i32Const(MAX_ARRAY_LENGTH);
+        c.i32LtS();
+        c.ifResult(I32);
+        c.localGet(N);
+        c.else_();
+        c.i32Const(MAX_ARRAY_LENGTH);
+        c.end();
+        c.localSet(SHOWN);
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(SHOWN);
+        c.i32GeS();
+        c.brIf(1);
+        dyn.arrAt(c, (x) => x.localGet(V), (x) => x.localGet(I));
+        c.localSet(E);
+        c.localGet(E);
+        deeper();
+        c.localGet(DEPTH);
+        c.call(idx);
+        c.localSet(VS);
+        bailIfPending();
+        // The element's rendering is a FINISHED string by the time entry
+        // takes it — no region of ours is open across the recursion, which
+        // is what keeps the buffer's LIFO argument trivial here.
+        c.localGet(VS);
+        c.localGet(E);
+        c.structGet(dynT, DYN_KIND);
+        c.i32Const(DK.NUM);
+        c.i32Eq();
+        c.call(this.entry());
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        c.localGet(N);
+        c.i32Const(MAX_ARRAY_LENGTH);
+        c.i32GtS();
+        c.localSet(MORE);
+        c.localGet(MORE);
+        c.ifVoid();
+        c.localGet(N);
+        c.i32Const(MAX_ARRAY_LENGTH);
+        c.i32Sub();
+        c.f64ConvertI32S();
+        c.call(this.moreItems());
+        // The grid order flag follows the FIRST DROPPED element, C's
+        // `items[100]->kind` (Node reads `output[outputLength]`).
+        dyn.arrAt(c, (x) => x.localGet(V), (x) => x.i32Const(MAX_ARRAY_LENGTH));
+        c.structGet(dynT, DYN_KIND);
+        c.i32Const(DK.NUM);
+        c.i32Eq();
+        c.call(this.entry());
+        c.end();
+        this.deps.lit(c, "");
+        this.deps.lit(c, "[");
+        this.deps.lit(c, "]");
+        deeper();
+        c.i32Const(1); // arrayExtras: grid grouping applies
+        c.localGet(MORE);
+        c.call(this.end());
+        c.localSet(R);
+        c.localGet(V);
+        c.localGet(R);
+        c.call(this.refWrap());
+        c.return_();
+      });
+
+      this.kindArm(c, K, [DK.OBJ], () => {
+        dyn.objPayload(c, (x) => x.localGet(D));
+        c.localSet(O);
+        // Object.create(null)'s dictionary: Node prefixes the rendering
+        // with the constructor-less base at EVERY depth, the empty form
+        // included, and the beyond-depth answer IS the bare marker (where
+        // a plain object says [Object]). No producer on the wasm tier
+        // builds one yet — `dyn.objCreateNullProto` refuses here — so this
+        // is the dyn surface's standing rule that an arm is filled before
+        // the payload that reaches it lands.
+        c.localGet(O);
+        c.structGet(objT, OBJ_NULL_PROTO);
+        c.localSet(NP);
+        c.localGet(O);
+        c.structGet(objT, OBJ_LEN);
+        c.localSet(N);
+        c.localGet(N);
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(NP);
+        c.ifResult(strRef);
+        this.deps.lit(c, `${NULL_PROTO} {}`);
+        c.else_();
+        this.deps.lit(c, "{}");
+        c.end();
+        c.return_();
+        c.end();
+        c.localGet(O);
+        c.call(this.circCheck());
+        c.localSet(ID);
+        circularAnswer();
+        c.localGet(RECURSE);
+        c.localGet(DEPTH);
+        c.f64Gt();
+        c.ifVoid();
+        c.localGet(NP);
+        c.ifResult(strRef);
+        this.deps.lit(c, NULL_PROTO);
+        c.else_();
+        this.deps.lit(c, "[Object]");
+        c.end();
+        c.return_();
+        c.end();
+        // S029 again. Node builds this text as `[${constructorName}: ...]`
+        // over a constructor name that is ALREADY bracketed for a
+        // null-prototype dictionary, so the doubled bracket is Node's own
+        // (measured, not a transcription slip).
+        c.localGet(RECURSE);
+        c.f64Const(MAX_DYN_DEPTH);
+        c.f64Gt();
+        c.ifVoid();
+        c.localGet(NP);
+        c.ifResult(strRef);
+        this.deps.lit(c, `[${NULL_PROTO}${INTERRUPTED}`);
+        c.else_();
+        this.deps.lit(c, `[Object${INTERRUPTED}`);
+        c.end();
+        c.return_();
+        c.end();
+        deeper();
+        c.call(this.begin());
+        c.localGet(O);
+        c.call(this.seenPush());
+        // Own-key ORDER, through the one helper that defines it. The
+        // receiver is an OBJ, so this walk cannot throw.
+        c.localGet(D);
+        c.i32Const(2); // Object.entries mode
+        c.call(dyn.objWalk());
+        c.localSet(ENTS);
+        dyn.arrPayload(c, (x) => x.localGet(ENTS));
+        c.localSet(V);
+        dyn.arrLen(c, (x) => x.localGet(V));
+        c.localSet(N);
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(N);
+        c.i32GeS();
+        c.brIf(1);
+        dyn.arrAt(c, (x) => x.localGet(V), (x) => x.localGet(I));
+        c.localSet(E);
+        dyn.arrPayload(c, (x) => x.localGet(E));
+        c.localSet(P);
+        // Key and value are both rendered into their OWN regions, closed
+        // before the entry's region opens — C's order (it computes `val`
+        // before initializing the entry buffer), and the one that keeps
+        // this walker out of the nested-open-region case entirely.
+        dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(0));
+        c.structGet(dynT, DYN_REF);
+        c.refCast(strT);
+        c.call(this.key());
+        c.localSet(KS);
+        dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(1));
+        deeper();
+        c.localGet(DEPTH);
+        c.call(idx);
+        c.localSet(VS);
+        bailIfPending();
+        c.globalGet(this.len());
+        c.localSet(MARK);
+        c.localGet(KS);
+        c.call(this.ibPuts());
+        this.deps.lit(c, ": ");
+        c.call(this.ibPuts());
+        c.localGet(VS);
+        c.call(this.ibPuts());
+        c.localGet(MARK);
+        c.call(this.ibTake());
+        c.i32Const(0); // a property entry is never the grid's number case
+        c.call(this.entry());
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        c.localGet(NP);
+        c.ifResult(strRef);
+        this.deps.lit(c, NULL_PROTO);
+        c.else_();
+        this.deps.lit(c, "");
+        c.end();
+        this.deps.lit(c, "{");
+        this.deps.lit(c, "}");
+        deeper();
+        c.i32Const(0); // no array extras: properties never grid-group
+        c.i32Const(0);
+        c.call(this.end());
+        c.localSet(R);
+        c.localGet(O);
+        c.localGet(R);
+        c.call(this.refWrap());
+        c.return_();
+      });
+
+      // BYTES, HANDLE and JSVAL: see the header — no producer on this tier
+      // can build one, so arriving here means a kind grew without an arm.
+      c.unreachable();
+      this.mb.setBody(
+        idx,
+        [
+          I32, I32, dyn.arrRef(), dyn.objRef(), I32, I32, I32, I32, I32, F64,
+          dyn.dynRef(), dyn.arrRef(), strRef, strRef, strRef, dyn.dynRef(), strRef,
+        ],
+        c.bytes(),
+      );
+    });
+  }
+
+  /** `%w.insp.dynS(d, depth)` — util.format's %s (and console.log's
+   * rest-argument) rule over a dyn value: a STRING passes VERBATIM, the
+   * classic console.log-vs-inspect distinction, and everything else
+   * inspects from recursion 0. `scr_insp_dyn_s` exactly. */
+  dynS(): number {
+    const dyn = this.deps.dyn();
+    return this.cached("dynS", [dyn.dynRef(), F64], [this.deps.strRef()], (idx) => {
+      const c = new Code();
+      const D = 0;
+      const DEPTH = 1;
+      c.localGet(D);
+      c.structGet(dyn.dynT(), DYN_KIND);
+      c.i32Const(DK.STR);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(D);
+      c.structGet(dyn.dynT(), DYN_REF);
+      c.refCast(this.deps.strType());
+      c.return_();
+      c.end();
+      c.localGet(D);
+      c.f64Const(0);
+      c.localGet(DEPTH);
+      c.call(this.dyn());
+      this.mb.setBody(idx, [], c.bytes());
+    });
   }
 }

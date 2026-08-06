@@ -6867,6 +6867,19 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   // util.inspect of an island `any` composite: the runtime tag is all
   // there is, so the honest answer is a catchable TypeError.
   "insp.jsval",
+  // util.inspect over a dyn TREE (and format's %s twin): the kinds whose
+  // Node rendering is a property dump of internals we do not model fence
+  // loudly with a catchable Error rather than guess a shape. That is three
+  // kinds in the C runtime's `scr_insp_dyn` — a promise, a runtime handle,
+  // an island value — and exactly ONE on the wasm tier, where a promise is
+  // the only one of the three a producer can box (handles and island
+  // values refuse upstream, so those arms are `unreachable`; see
+  // backend/wasm/inspect.ts's dyn-walker header and SEMANTICS.md S030).
+  // Until this seed landed nobody checked the cell after any of them: the
+  // fence's exception could outlive the call and surface at whatever
+  // checked next.
+  "insp.dyn",
+  "insp.dynS",
   // The wider sync fs slice: same catchable errno throws as the rest.
   "fs.unlinkSync",
   "fs.chmodSync",

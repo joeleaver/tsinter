@@ -34,7 +34,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { inspect } from "node:util";
+import { format, inspect } from "node:util";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { compile } from "../src/index.js";
 import { Code } from "../src/backend/wasm/code.js";
@@ -90,6 +90,25 @@ async function buildHelpers(): Promise<Helpers> {
       c.arrayNewData(strType, 0);
     },
     f64ToStr: () => (f2s ??= buildF64ToStr(mb, strType, strRef)),
+    // Stage C's dyn walker needs the whole dyn representation, which needs
+    // the emitter's vector machinery — far past what this harness builds.
+    // The four deps are only READ while `insp.dyn`/`insp.dynS` are emitted,
+    // and this module exports neither, so throwing is the honest stub: the
+    // dyn walker is pinned through COMPILED PROGRAMS below (JSON.parse is
+    // the tier's dyn producer, so `inspect(JSON.parse(s))` reaches it
+    // differentially with Node as the oracle).
+    dyn: () => {
+      throw new Error("harness 1 does not build the dyn representation");
+    },
+    inspF64: () => {
+      throw new Error("harness 1 does not build inspF64");
+    },
+    throwError: () => {
+      throw new Error("harness 1 has no exception cell");
+    },
+    excKind: () => {
+      throw new Error("harness 1 has no exception cell");
+    },
   });
 
   const simple = (name: string, params: ValType[], results: ValType[], body: (c: Code) => void): void => {
@@ -1125,4 +1144,439 @@ describe("errors (SEMANTICS.md S027)", () => {
     expect(h.error("Error", "one\ntwo\nthree", null, 0, 2)).toBe("[Error: one\n    two\n    three]");
     h.setIndent(0);
   });
+});
+
+/* ── the dyn walker ───────────────────────────────────────────────────────
+ * `JSON.parse` is the tier's dyn producer, so `inspect(JSON.parse(s))`
+ * drives the walker over an arbitrary tree with Node as the oracle on the
+ * same JSON text — a real differential, not a transcription check. The
+ * cases below stress what the WALKER decides (kinds, key order, the 100-
+ * entry cap, cycles) on top of everything the layout engine already
+ * decides, since every rendering goes back through begin/entry/end.
+ *
+ * The trees that need mutation (cycles, boxed functions, a promise) are
+ * built with top-level `let` chains, NOT loop-scoped consts: a dyn value
+ * bound inside a loop body is COPIED rather than aliased on a keyed write
+ * (its own task), and the usual `const x = {}; o.a = x; o = x` idiom would
+ * quietly build a tree one level deep. */
+
+/** One compiled program per case list: `inspect(JSON.parse(<lit>))` for
+ * each, whole stdout against Node's rendering of the same parse. */
+async function pinJson(name: string, cases: readonly string[]): Promise<void> {
+  const source = [
+    'import { inspect } from "node:util";',
+    ...cases.map((c) => `console.log(inspect(JSON.parse(${JSON.stringify(c)})));`),
+    "",
+  ].join("\n");
+  const got = await runProgram(name, source);
+  const want = cases.map((c) => inspect(JSON.parse(c)) + "\n").join("");
+  if (got !== want) {
+    const g = got.split("\n");
+    const w = want.split("\n");
+    for (let i = 0; i < Math.max(g.length, w.length); i++) {
+      if (g[i] !== w[i]) {
+        expect(
+          `${g[i] ?? "(missing)"}\n  …after ${JSON.stringify(g.slice(Math.max(0, i - 3), i))}`,
+          `first divergence at output line ${i}`,
+        ).toBe(`${w[i] ?? "(missing)"}\n  …after ${JSON.stringify(w.slice(Math.max(0, i - 3), i))}`);
+      }
+    }
+  }
+  expect(got).toBe(want);
+}
+
+const seq = (n: number): number[] => Array.from({ length: n }, (_, i) => i);
+
+describe("the dyn walker", () => {
+  test("JSON trees, byte for byte against Node", async () => {
+    await pinJson("dyn-trees", [
+      // the kinds
+      '{"a":1,"b":"two","c":[1,2,3],"d":true,"e":false,"f":null}',
+      '"top level string"',
+      "42",
+      "-0",
+      "true",
+      "null",
+      '[true,false,null,0,-0,1.5,1e21,1e-7,123456789]',
+      // the empty answers, which come before the depth check
+      "[]",
+      "{}",
+      "[[]]",
+      "[{}]",
+      '{"e":[]}',
+      '{"e":{}}',
+      // the depth budget's [Array] / [Object]
+      '{"a":{"b":{"c":1}}}',
+      '{"a":{"b":{"c":{"d":1}}}}',
+      "[[[1]]]",
+      "[[[[1]]]]",
+      '{"a":[[{"deep":1}]]}',
+      // the layout engine over a dyn tree: breaking, grouping, indentation
+      '[1,2,3,4,5,6,7]',
+      `[${seq(20).join(",")}]`,
+      '["aa","bb","cc","dd","ee","ff","gg","hh"]',
+      `[${seq(27).map((i) => i * 111).join(",")}]`,
+      `[${seq(8).map((i) => `{"i":${i}}`).join(",")}]`,
+      '{"long":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}',
+      '{"k1":"v1","k2":"v2","k3":"v3","k4":"v4","k5":"v5","k6":"v6","k7":"v7","k8":"v8"}',
+      `{"a":"${"x".repeat(60)}","b":"${"y".repeat(60)}"}`,
+      // maxArrayLength: the "... N more items" tail and its grid order flag
+      `[${seq(101).join(",")}]`,
+      `[${seq(130).join(",")}]`,
+      `[${seq(101).map((i) => `"s${i}"`).join(",")}]`,
+      // strings inside a composite QUOTE (the console.log distinction is
+      // dynS's, not the walker's) and go through the whole ladder
+      `{"s":"with 'quote'","t":"with \\"dquote\\"","u":"line\\nbreak","v":"tab\\there"}`,
+      // key order: integer-like keys ascending FIRST, whatever the text order
+      '{"2":4,"10":3,"b":1,"a":2,"c":5}',
+      '{"10":1,"2":2,"1":3,"b":4,"01":5,"-1":6,"1.5":7}',
+      // keys through the bare / quoted / ['__proto__'] ladder
+      `{"ok_1":1,"1bad":2,"":3,"__proto__":4,"with space":5,"quo'te":6}`,
+    ]);
+  });
+
+  test("random dyn trees", async () => {
+    // A deterministic generator, so a failure is reproducible from the seed
+    // printed in the message. Two programs, many trees each — compilation
+    // is what costs, not cases.
+    const gen = (seed0: number, count: number): string[] => {
+      let seed = seed0;
+      const rnd = (): number => {
+        seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+        return seed / 0x7fffffff;
+      };
+      const pick = <T,>(xs: readonly T[]): T => xs[Math.floor(rnd() * xs.length)]!;
+      const WORDS = ["a", "bb", "key", "long_name", "x1", "with space", "it's", 'q"q', "__proto__", "", "10", "2"];
+      const STRS = ["", "s", "hello world", "a'b", 'a"b', "tab\there", "nl\nhere", "long ".repeat(20), "é", "✓"];
+      const NUMS = [0, 1, -1, 1.5, 1e21, 1e-7, 123456789, -0.5, 3.14159];
+      const one = (depth: number): unknown => {
+        const r = rnd();
+        if (depth <= 0 || r < 0.25) {
+          const k = rnd();
+          if (k < 0.3) return pick(NUMS);
+          if (k < 0.55) return pick(STRS);
+          if (k < 0.7) return rnd() < 0.5;
+          if (k < 0.8) return null;
+          return pick(NUMS);
+        }
+        if (r < 0.62) return Array.from({ length: Math.floor(rnd() * 9) }, () => one(depth - 1));
+        const o: Record<string, unknown> = {};
+        for (let i = 0; i < Math.floor(rnd() * 7); i++) {
+          o[pick(WORDS) + (rnd() < 0.4 ? String(i) : "")] = one(depth - 1);
+        }
+        return o;
+      };
+      return Array.from({ length: count }, () => JSON.stringify(one(1 + Math.floor(rnd() * 4))));
+    };
+    await pinJson("dyn-fuzz-a", gen(1, 60));
+    await pinJson("dyn-fuzz-b", gen(7, 60));
+  });
+
+  test("cycles: the seen check precedes the depth check", async () => {
+    const source = [
+      'import { inspect } from "node:util";',
+      // self
+      "const self: any = JSON.parse('{}');",
+      "self.self = self;",
+      "console.log(inspect(self));",
+      "const arr: any = JSON.parse('[]');",
+      "arr[0] = arr;",
+      "console.log(inspect(arr));",
+      // mutual, numbered from the root outward
+      `const x: any = JSON.parse('{"name":"x"}');`,
+      `const y: any = JSON.parse('{"name":"y"}');`,
+      "x.other = y;",
+      "y.other = x;",
+      "console.log(inspect(x));",
+      // shared but NOT on the path: no marker at all
+      `const shared: any = JSON.parse('{"v":1}');`,
+      "const both: any = JSON.parse('{}');",
+      "both.a = shared;",
+      "both.b = shared;",
+      "console.log(inspect(both));",
+      // the cycle closes at recursion 3 with a depth budget of 2 — still
+      // [Circular *1], because the SEEN check runs first
+      `const o: any = JSON.parse('{"a":{"b":{}}}');`,
+      "o.a.b.c = o;",
+      "console.log(inspect(o));",
+      // one level deeper the DEPTH cut stops the descent before the cycle
+      // is reached, so the answer is a plain [Object] — this looks like a
+      // counterexample to the ordering above and is not one
+      `const p: any = JSON.parse('{"a":{"b":{"c":{}}}}');`,
+      "p.a.b.c.d = p;",
+      "console.log(inspect(p));",
+      "",
+    ].join("\n");
+    const got = await runProgram("dyn-cycles", source);
+
+    const jself: Record<string, unknown> = {};
+    jself["self"] = jself;
+    const jarr: unknown[] = [];
+    jarr[0] = jarr;
+    const jx: Record<string, unknown> = { name: "x" };
+    const jy: Record<string, unknown> = { name: "y" };
+    jx["other"] = jy;
+    jy["other"] = jx;
+    const jshared = { v: 1 };
+    const jboth = { a: jshared, b: jshared };
+    const jo: Record<string, unknown> = { a: { b: {} as Record<string, unknown> } };
+    (jo["a"] as { b: Record<string, unknown> }).b["c"] = jo;
+    const jp: Record<string, unknown> = { a: { b: { c: {} as Record<string, unknown> } } };
+    (jp["a"] as { b: { c: Record<string, unknown> } }).b.c["d"] = jp;
+    expect(got).toBe(
+      [jself, jarr, jx, jboth, jo, jp].map((v) => inspect(v) + "\n").join(""),
+    );
+    // Spot-check the shapes, so a change on both sides at once still fails.
+    expect(got).toContain("<ref *1> { self: [Circular *1] }");
+    expect(got).toContain("<ref *1> [ [Circular *1] ]");
+    expect(got).toContain("<ref *1> { a: { b: { c: [Circular *1] } } }");
+    expect(got).toContain("{ a: { b: { c: [Object] } } }");
+    expect(got).toContain("{ a: { v: 1 }, b: { v: 1 } }");
+  });
+
+  test("%s and console.log's rest-argument rule: a dyn string is verbatim", async () => {
+    // The JSON text is spelled by JSON.stringify twice over — once for the
+    // JSON, once for the TS literal holding it — because hand-escaping a
+    // quote-carrying string through both layers is how you accidentally
+    // write a program whose JSON.parse throws (which the wasm tier reports
+    // as a trap, S007, not as a test failure that tells you why).
+    const quoted = `it's "quoted"`;
+    const deep = { a: { b: { c: { d: 1 } } } };
+    const lit = (v: unknown): string => JSON.stringify(JSON.stringify(v));
+    const source = [
+      'import { inspect, format } from "node:util";',
+      `const s: any = JSON.parse(${lit("hi there")});`,
+      "console.log(s);",
+      'console.log(format("%s", s));',
+      "console.log(inspect(s));",
+      `console.log(JSON.parse(${lit({ s: "hi there" })}));`,
+      // a string needing the quote ladder: still verbatim at the top level
+      `const q: any = JSON.parse(${lit(quoted)});`,
+      "console.log(q);",
+      "console.log(inspect(q));",
+      // non-strings inspect at the rest-arg depth of 2
+      `console.log(JSON.parse(${lit(deep)}));`,
+      `console.log(format("%s", JSON.parse(${lit(deep)})));`,
+      `console.log(JSON.parse("[1,2,3]"), JSON.parse("true"), JSON.parse("null"), JSON.parse("1.5"));`,
+      "",
+    ].join("\n");
+    const got = await runProgram("dyn-fmt-s", source);
+    expect(got).toBe(
+      [
+        "hi there",
+        format("%s", "hi there"),
+        inspect("hi there"),
+        inspect({ s: "hi there" }),
+        quoted,
+        inspect(quoted),
+        inspect(deep),
+        format("%s", deep),
+        [inspect([1, 2, 3]), "true", "null", "1.5"].join(" "),
+        "",
+      ].join("\n"),
+    );
+  });
+
+  test("%j: JSON.stringify's text, with circularity swallowed", async () => {
+    const source = [
+      'import { format } from "node:util";',
+      `console.log(format("%j", JSON.parse('{"a":1}')));`,
+      `console.log(format("%j", JSON.parse('"hi"')));`,
+      `console.log(format("%j", JSON.parse('1.5')));`,
+      `console.log(format("%j", JSON.parse('[1,null,2]')));`,
+      `console.log(format("%j", JSON.parse('{"nested":{"deep":[1,{"x":2}]}}')));`,
+      // a cycle prints the LITERAL text, with no *N numbering
+      "const self: any = JSON.parse('{}');",
+      "self.self = self;",
+      `console.log(format("%j", self));`,
+      "const arr: any = JSON.parse('[]');",
+      "arr[0] = arr;",
+      `console.log(format("%j", arr));`,
+      `const nest: any = JSON.parse('{"a":{"b":{}}}');`,
+      "nest.a.b.back = nest;",
+      `console.log(format("%j", nest));`,
+      // a root the stringify DROPS prints "undefined"
+      `const missing: any = JSON.parse('{"k":1}').nope;`,
+      `console.log(format("%j", missing));`,
+      "const fn: any = JSON.parse('{}');",
+      "fn.f = (): number => 1;",
+      `console.log(format("%j", fn.f));`,
+      // and members that drop, per JSON's own rules
+      `console.log(format("%j", fn));`,
+      // the two ABSENT-value positions, which differ: an object member
+      // vanishes with its key, an array slot becomes null
+      `const holes: any = JSON.parse('[1,2,3]');`,
+      "holes[0] = (): number => 1;",
+      `holes[1] = JSON.parse('{"k":1}').missing;`,
+      `console.log(format("%j", holes));`,
+      `const drops: any = JSON.parse('{"a":1,"b":2,"c":3}');`,
+      "drops.a = (): number => 1;",
+      `drops.b = JSON.parse('{"k":1}').missing;`,
+      `console.log(format("%j", drops));`,
+      // the walk recovers: a plain case straight after a swallowed cycle
+      `console.log(format("%j", JSON.parse('{"after":[1,2]}')));`,
+      "",
+    ].join("\n");
+    const got = await runProgram("dyn-fmt-j", source);
+    const jself: Record<string, unknown> = {};
+    jself["self"] = jself;
+    const jarr: unknown[] = [];
+    jarr[0] = jarr;
+    const jnest: Record<string, unknown> = { a: { b: {} as Record<string, unknown> } };
+    (jnest["a"] as { b: Record<string, unknown> }).b["back"] = jnest;
+    expect(got).toBe(
+      [
+        format("%j", { a: 1 }),
+        format("%j", "hi"),
+        format("%j", 1.5),
+        format("%j", [1, null, 2]),
+        format("%j", { nested: { deep: [1, { x: 2 }] } }),
+        format("%j", jself),
+        format("%j", jarr),
+        format("%j", jnest),
+        format("%j", undefined),
+        format("%j", () => 1),
+        format("%j", { f: () => 1 }),
+        format("%j", [() => 1, undefined, 3]),
+        format("%j", { a: () => 1, b: undefined, c: 3 }),
+        format("%j", { after: [1, 2] }),
+        "",
+      ].join("\n"),
+    );
+    expect(got).toContain("[Circular]");
+    expect(got).not.toContain("[Circular *1]");
+  });
+
+  test("boxed functions: named and anonymous", async () => {
+    const source = [
+      'import { inspect } from "node:util";',
+      "const h: any = JSON.parse('{}');",
+      // a property assignment infers NO name, on both sides
+      "h.a = (): number => 1;",
+      "h.b = function (): number { return 2; };",
+      "h.c = function named(): number { return 3; };",
+      "function decl(): number { return 4; }",
+      "h.d = decl;",
+      "console.log(inspect(h));",
+      "console.log(inspect(h.c));",
+      "console.log(inspect(h.a));",
+      "",
+    ].join("\n");
+    const got = await runProgram("dyn-funcs", source);
+    const jh = {
+      a: (): number => 1,
+      b: function (): number { return 2; },
+      c: function named(): number { return 3; },
+      d: function decl(): number { return 4; },
+    };
+    // The oracle's `a`/`b` DO get inferred names from the object literal, so
+    // the shapes are pinned directly rather than through inspect(jh).
+    void jh;
+    expect(got).toBe(
+      [
+        "{",
+        "  a: [Function (anonymous)],",
+        "  b: [Function (anonymous)],",
+        "  c: [Function: named],",
+        "  d: [Function: decl]",
+        "}",
+        "[Function: named]",
+        "[Function (anonymous)]",
+        "",
+      ].join("\n"),
+    );
+    // Node's own rendering of the same four values, built so that no name
+    // is inferred — the texts above are Node's, not invented.
+    const anon: unknown[] = [(): number => 1];
+    expect(inspect(anon[0])).toBe("[Function (anonymous)]");
+    expect(inspect(function named(): number { return 3; })).toBe("[Function: named]");
+  });
+
+  test("a promise inside a dyn tree fences (SEMANTICS.md S030)", async () => {
+    const source = [
+      'import { inspect } from "node:util";',
+      "async function mk(): Promise<any> { return JSON.parse('{\"v\":1}'); }",
+      "const p: any = mk();",
+      "try { console.log(inspect(p)); }",
+      'catch (e) { console.log("bare:", (e as Error).name, (e as Error).message); }',
+      // nested, so the throw unwinds through frames the render left open
+      `const holder: any = JSON.parse('{"before":1,"deep":{"x":2}}');`,
+      "holder.deep.p = p;",
+      "try { console.log(inspect(holder)); }",
+      'catch (e) { console.log("nested:", (e as Error).message); }',
+      // the engine recovers completely: buffer, frames, indentation
+      `console.log(inspect(JSON.parse('{"after":{"ok":[1,2,3]}}')));`,
+      `console.log(inspect(JSON.parse('{"z":"a string that is quite long so it needs the layout engine to break it up nicely"}')));`,
+      "",
+    ].join("\n");
+    const got = await runProgram("dyn-promise-fence", source);
+    const fence = "util.inspect of a promise value is not supported yet";
+    expect(got).toBe(
+      [
+        `bare: Error ${fence}`,
+        `nested: ${fence}`,
+        inspect({ after: { ok: [1, 2, 3] } }),
+        inspect({ z: "a string that is quite long so it needs the layout engine to break it up nicely" }),
+        "",
+      ].join("\n"),
+    );
+  });
+
+  test("the recursion cap degrades like Node (SEMANTICS.md S029)", async () => {
+    // Node CATCHES its own stack overflow mid-render, substitutes an
+    // interruption marker for the composite that overflowed, and lets the
+    // rest of the output finish. The depth it happens at is stack-dependent
+    // (measured at 929, 1113 and 1421 levels on the same tree), so the
+    // oracle cannot be a byte diff — what is pinned is the MARKER TEXT,
+    // which is Node's exactly, and the shape of the degradation: one
+    // marker, the render completes, the braces balance.
+    const source = [
+      'import { inspect } from "node:util";',
+      "function chain(n: number): any {",
+      "  const root: any = JSON.parse('{}');",
+      "  let cur: any = root;",
+      "  let nxt: any = null;",
+      "  for (let i = 0; i < n; i++) { nxt = JSON.parse('{}'); cur.d = nxt; cur = nxt; }",
+      "  cur.end = true;",
+      "  return root;",
+      "}",
+      "const over: string = inspect(chain(1001), { depth: null });",
+      'console.log("over markers:", over.split("Inspection interrupted").length - 1);',
+      'console.log("over braces:", over.split("{").length - 1, over.split("}").length - 1);',
+      'console.log("over has end:", over.indexOf("end: true") >= 0);',
+      'console.log("over marker:", over.split("\\n")[1001].trim());',
+      "const under: string = inspect(chain(1000), { depth: null });",
+      'console.log("under markers:", under.split("Inspection interrupted").length - 1);',
+      'console.log("under has end:", under.indexOf("end: true") >= 0);',
+      // the engine is fine afterwards
+      `console.log(inspect(JSON.parse('{"after":1}')));`,
+      "",
+    ].join("\n");
+    const got = await runProgram("dyn-depth-cap", source);
+    const marker = "d: [Object: Inspection interrupted prematurely. Maximum call stack size exceeded.]";
+    expect(got).toBe(
+      [
+        "over markers: 1",
+        "over braces: 1001 1001",
+        "over has end: false",
+        `over marker: ${marker}`,
+        "under markers: 0",
+        "under has end: true",
+        "{ after: 1 }",
+        "",
+      ].join("\n"),
+    );
+    // The marker text is NODE'S: this is what it prints for a tree deep
+    // enough to overflow its own stack.
+    const deep: Record<string, unknown> = {};
+    let cur = deep;
+    for (let i = 0; i < 20000; i++) {
+      const next: Record<string, unknown> = {};
+      cur["d"] = next;
+      cur = next;
+    }
+    const nodeOut = inspect(deep, { depth: null });
+    expect(nodeOut).toContain("[Object: Inspection interrupted prematurely. Maximum call stack size exceeded.]");
+    expect(nodeOut.split("Inspection interrupted").length - 1).toBe(1);
+  }, 60_000);
 });

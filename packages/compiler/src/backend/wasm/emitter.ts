@@ -632,14 +632,20 @@ class Assembler {
   /** Clear the cell: no kind pending, and the payload ref dropped so the
    * GC can collect it. */
   private emitCellClear(): void {
+    this.emitCellClearInto(this.fn.code);
+  }
+
+  /** The same clear into ANY `Code` — the runtime builders that CATCH
+   * rather than propagate need it (json.ts's `%j`, which turns the
+   * circular TypeError into the text "[Circular]"). */
+  private emitCellClearInto(c: Code): void {
     const exc = this.exc();
-    const code = this.fn.code;
-    code.refNull(ANY_HEAP);
-    code.globalSet(exc.refG);
-    code.i32Const(-1);
-    code.globalSet(exc.preG);
-    code.i32Const(0);
-    code.globalSet(exc.kindG);
+    c.refNull(ANY_HEAP);
+    c.globalSet(exc.refG);
+    c.i32Const(-1);
+    c.globalSet(exc.preG);
+    c.i32Const(0);
+    c.globalSet(exc.kindG);
   }
 
   /** Build a builtin error instance from literals and store it into the
@@ -1528,6 +1534,7 @@ class Assembler {
       throwError: (c, className, name, pushMessage) =>
         this.emitSetCellError(c, className, name, pushMessage, null),
       excKind: () => this.exc().kindG,
+      clearExc: (c) => this.emitCellClearInto(c),
       newDynVec: (c) => {
         c.f64Const(0);
         c.call(this.vecs.newLen(this.dynVecInfo()));
@@ -1556,6 +1563,11 @@ class Assembler {
       errName: () => ERR_NAME,
       errMessage: () => ERR_MESSAGE,
       errCode: () => ERR_CODE,
+      dyn: () => this.dyn,
+      inspF64: () => this.inspF64Helper(),
+      throwError: (c, className, name, pushMessage) =>
+        this.emitSetCellError(c, className, name, pushMessage, null),
+      excKind: () => this.exc().kindG,
     });
     return this.inspField;
   }
@@ -5783,6 +5795,30 @@ class Assembler {
           // throws.
           this.walkExpr(e.args[0]!);
           code.call(this.insp.key());
+          return;
+        }
+        if (e.fn === "insp.dyn" || e.fn === "insp.dynS") {
+          // The dyn walker (inspect.ts): the one runtime type whose shape
+          // lives in the value, so the traversal is emitted code rather
+          // than a synthesized helper. `dynS` is format's %s twin — a dyn
+          // STRING passes verbatim there and quotes everywhere else.
+          //
+          // Both can throw: a PROMISE anywhere in the tree fences loudly
+          // (S030), which is why the two are may-throw seeded and why the
+          // site checks the cell.
+          for (const a of e.args) this.walkExpr(a);
+          code.call(e.fn === "insp.dyn" ? this.insp.dyn() : this.insp.dynS());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "insp.jsonDyn") {
+          // util.format's %j over a dyn value: the stringify walk, with
+          // the circular TypeError CAUGHT and answered "[Circular]" the
+          // way Node's tryStringify does. A depth RangeError still
+          // propagates, so the site checks the cell.
+          this.walkExpr(e.args[0]!);
+          code.call(this.json.formatJ());
+          this.emitPendingCheck();
           return;
         }
         if (
