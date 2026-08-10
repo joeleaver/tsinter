@@ -89,8 +89,35 @@ export class UnionBuilder {
   }
 
   /** The payload-carrying subtype for one (union, arm): { tag, payload },
-   * keyed by meaning — two unions' arms never intern one type even when
-   * their layouts agree, so a cast can only succeed on the arm it names. */
+   * keyed by meaning — two unions' arms never intern the SAME type-section
+   * ENTRY even when their layouts agree (ModuleBuilder's own `typeIndex`
+   * cache — not this builder's, `armStruct` only calls into it — is keyed
+   * by the literal `union:<unionId>:<tag>` string via `subStructType`, so
+   * two different keys always get two different declarations). That is
+   * NOT the same claim as "a cast can only succeed on the arm it names":
+   * it cannot be, because WasmGC struct types canonicalize STRUCTURALLY
+   * at the engine level (isorecursive equivalence, GC MVP) — but ONLY
+   * PER RECURSION GROUP: two entries with identical shape are ONE runtime
+   * type when EACH is its own singleton group (module.ts's own rule: a
+   * plain entry with no explicit `rec` is its own singleton), which is
+   * what every `armStruct` call produces TODAY — it is never invoked
+   * while a `beginRecGroup`/`endRecGroup` span is open (the only span in
+   * this codebase, `resolveRecGroup`'s record/class SCC resolution,
+   * calls `mapTypeSoft` for field types, never `unionWrap`/`armStruct` —
+   * confirmed by reading that span's body). Two structs that were each
+   * declared as a singleton with identical field layout and supertype ARE
+   * the same runtime type regardless of which entry declared them, so a
+   * `ref.cast` against one CAN succeed on a value built under the other
+   * whenever their payload types agree (confirmed: emitter.ts's map
+   * `get` case relies on exactly this to reuse a stored union value
+   * across two distinct `unionId`s — see its doc for the measurement).
+   * An arm struct interned INSIDE an open span would compare as a member
+   * of its whole multi-entry group instead, and the reuse would very
+   * likely break — this equivalence is conditional on staying a
+   * singleton, not a blanket "any two structurally-identical structs
+   * unify" rule. Never rely on a cast FAILING to distinguish two arms
+   * this way; only the TAG value (read off the shared base, never
+   * cast-dependent) does that safely. */
   armStruct(unionId: string, tag: number, payload: ValType): number {
     const fields: FieldType[] = [
       { storage: I32, mutable: false },

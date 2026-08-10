@@ -44,8 +44,13 @@ export interface VecInfo {
   refElem: boolean;
 }
 
-const LEN = 0; // struct field indices
-const BUF = 1;
+// Vec struct field indices — exported so callers holding a bare
+// (struct, bufType) pair from VecInfo (maps.ts's addAll/toArray, which
+// read/write a caller-supplied seed/target vec directly rather than
+// going through this builder's own methods) don't have to hardcode the
+// layout as an undocumented assumption (review MINOR-2).
+export const LEN = 0;
+export const BUF = 1;
 
 export class VecBuilder {
   private readonly infos = new Map<string, VecInfo>();

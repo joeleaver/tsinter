@@ -87,6 +87,7 @@ import {
 import { VecBuilder, type VecInfo } from "./arrays.js";
 import { DK, DYN_KIND, DYN_NUM, DYN_REF, DynBuilder, FN_CLOS, FN_SIG } from "./dyn.js";
 import { InspectBuilder } from "./inspect.js";
+import { MapBuilder, type MapInfo, type MapKeyKind, type MapValKind } from "./maps.js";
 import { JsonBuilder, jsonQuote } from "./json.js";
 import {
   PromiseBuilder,
@@ -110,7 +111,7 @@ import { TimerBuilder } from "./timers.js";
 import { UnionBuilder, type UnionArmRep } from "./unions.js";
 import { Code } from "./code.js";
 import { buildF64ToStr } from "./numfmt.js";
-import { F64, I32, I64, ModuleBuilder, type FieldType, type ValType } from "./module.js";
+import { F64, I32, I64, ModuleBuilder, type FieldType, type StorageType, type ValType } from "./module.js";
 import {
   asIrModule,
   lowerResumableFunctions,
@@ -3595,6 +3596,30 @@ class Assembler {
         // arm never fails — a dyn value is one struct whatever it holds,
         // so refusal moves to the sites that BUILD or READ a payload.
         return this.dyn.dynRef();
+      case "map":
+      case "set": {
+        // The KEY/VALUE representation is what can refuse (mapInfoFor).
+        // A map/set never needs an SCC/rec-group span the way a self-
+        // referential record does: it has no shapeId-keyed struct that
+        // could point back at ITSELF the way a recursive record can.
+        // Nothing here asserts what a genuinely nested map VALUE
+        // (`Map<K, Map<K,V>>`) does, because that stays frontend-fenced
+        // today (isSupportedMapValue has no map/set arm — measured, it
+        // fails to type-check, never reaches this backend). An ARRAY of
+        // maps/sets (`Map<K,V>[]`) is fenced too, THE SAME WAY — measured
+        // directly (`Map<string, number>[]` hits SC2009: "elements have
+        // no array representation yet"), despite mapTypeSoft's array-elem
+        // list admitting map/set as element kinds; that admission is
+        // dormant until the frontend fence lifts, not evidence of a live
+        // path today. vecKeyFor's own map/set arms (review MAJOR-1) exist
+        // for the case that DOES become reachable first — stage B's
+        // overflow maps (`Record<string, Map<K,V>>` / `Record<string,
+        // Set<T>>`, corpus 2559), which instantiate map/set as a VALUE
+        // kind of the overflow store's own map, not of a user Map/Set —
+        // so two differently-shaped such records don't collide.
+        const info = this.mapInfoFor(t, loc, false);
+        return info === null ? null : this.maps.mapRef(info);
+      }
       default:
         this.refuse(`type:${t.kind}`, loc);
         return null;
@@ -3616,6 +3641,15 @@ class Assembler {
       case "f64":
         return F64;
       case "bool":
+        // I32 out of this whole switch means EITHER this arm (a genuine
+        // bool) OR the unmappable placeholder (every failing sub-check
+        // below — array/func/record/object/classval/map/set — falls to
+        // I32 too, as does the unhandled default). mapValRepFor's soft
+        // path (emitter.ts) leans on that being the ONLY two ways I32
+        // comes out: it treats `val.kind === "i32" && t.kind !== "bool"`
+        // as "did not resolve." Adding a new case that legitimately
+        // answers I32 for something other than bool breaks that guard —
+        // update it there too.
         return I32;
       case "string":
         return { kind: "ref", nullable: true, typeIndex: this.strType };
@@ -3637,6 +3671,8 @@ class Assembler {
           t.elem.kind === "union" ||
           t.elem.kind === "promise" ||
           t.elem.kind === "dyn" ||
+          t.elem.kind === "map" ||
+          t.elem.kind === "set" ||
           (t.elem.kind === "object" && this.objectMappable(t.elem.className));
         if (!mappable) return I32;
         const kind =
@@ -3687,6 +3723,11 @@ class Assembler {
       case "dyn":
         // mapType never fails on dyn either — the consistency rule.
         return this.dyn.dynRef();
+      case "map":
+      case "set": {
+        const info = this.mapInfoFor(t, undefined, true);
+        return info === null ? I32 : this.maps.mapRef(info);
+      }
       default:
         return I32;
     }
@@ -5083,6 +5124,73 @@ class Assembler {
 
       case "arrIntrinsic":
         this.emitArrIntrinsic(e);
+        return;
+
+      case "mapNew": {
+        if (e.type.kind !== "map") throw new Error("mapNew with a non-map type");
+        const info = this.mapInfoFor(e.type, e.loc, false);
+        if (info === null) {
+          code.unreachable();
+          return;
+        }
+        if (e.seed === undefined || e.seed.length === 0) {
+          code.call(this.maps.new_(info));
+          return;
+        }
+        // Construct empty + set() each pair in SOURCE order (a repeated
+        // key overwrites — set()'s own contract already gives "first
+        // position wins, last write wins" for free, matching Node).
+        const mapRef = this.maps.mapRef(info);
+        const mp = this.acquireScratch(mapRef);
+        code.call(this.maps.new_(info));
+        code.localSet(mp);
+        for (const pair of e.seed) {
+          code.localGet(mp);
+          this.walkExpr(pair.key);
+          this.walkExpr(pair.value);
+          code.call(this.maps.set(info));
+        }
+        code.localGet(mp);
+        this.releaseScratch(mapRef, mp);
+        return;
+      }
+
+      case "mapIntrinsic":
+        this.emitMapIntrinsic(e);
+        return;
+
+      case "setNew": {
+        if (e.type.kind !== "set") throw new Error("setNew with a non-set type");
+        const info = this.mapInfoFor(e.type, e.loc, false);
+        if (info === null) {
+          code.unreachable();
+          return;
+        }
+        if (e.seed === undefined) {
+          code.call(this.maps.new_(info));
+          return;
+        }
+        const seedType = e.seed.type;
+        if (seedType.kind !== "array") throw new Error("setNew seed is not an array");
+        const vecInfo = this.vecInfoFor(seedType, e.loc);
+        if (vecInfo === null) {
+          code.unreachable();
+          return;
+        }
+        const mapRef = this.maps.mapRef(info);
+        const mp = this.acquireScratch(mapRef);
+        code.call(this.maps.new_(info));
+        code.localSet(mp);
+        code.localGet(mp);
+        this.walkExpr(e.seed);
+        code.call(this.maps.addAll(info, vecInfo.struct, vecInfo.bufType));
+        code.localGet(mp);
+        this.releaseScratch(mapRef, mp);
+        return;
+      }
+
+      case "setIntrinsic":
+        this.emitSetIntrinsic(e);
         return;
 
       case "recordLit": {
@@ -7376,13 +7484,9 @@ class Assembler {
       /* Regex — a whole engine, host-imported or compiled. */
       case "regexLit":
       case "regexIntrinsic":
-      /* Typed arrays and the keyed collections. */
+      /* Typed arrays. */
       case "bytesNew":
       case "bytesIntrinsic":
-      case "mapNew":
-      case "mapIntrinsic":
-      case "setNew":
-      case "setIntrinsic":
       /* Native FFI — a link-time C ABI, nothing to link against here. */
       case "ffiCall":
       /* Async, generators, promises. (awaitExpr/awaitUnionExpr never
@@ -7487,6 +7591,20 @@ class Assembler {
     return this.vecsField;
   }
 
+  private mapsField: MapBuilder | null = null;
+
+  /** The Map/Set compact-dict machinery (maps.ts), deps injected — just
+   * strEq/strType for string-keyed hashing/equality (map/set intrinsics
+   * never throw and never format, so nothing else is needed the way
+   * dyn/json/insp pull in error/ToString helpers). */
+  private get maps(): MapBuilder {
+    this.mapsField ??= new MapBuilder(this.mb, {
+      strEq: () => this.strEqHelper(),
+      strType: () => this.strType,
+    });
+    return this.mapsField;
+  }
+
   private strsField: StrBuilder | null = null;
 
   /** The string method surface (strings.ts). split's string[] result
@@ -7558,9 +7676,102 @@ class Assembler {
         const soft = this.mapTypeSoft(t);
         return `clsv:${valKey(soft)}`;
       }
+      case "map":
+        // Recursive, exactly like array/record/func above — the default
+        // arm's bare `t.kind` would answer "map" for EVERY map type
+        // regardless of its own key/value, colliding e.g. an array of
+        // `Map<string, number>` with an array of `Map<string, string>`
+        // into one (wrong) shared vector type. mapInfoFor's OWN top-level
+        // key deliberately does NOT add this "map:" prefix (the Set<T>/
+        // Map<T,number> collapse), but vecKeyFor is reached recursively —
+        // as a map's own VALUE type, or here as an array/map element —
+        // where map and set must stay distinguishable from each other and
+        // from every other nested map/set shape (review finding, stage A).
+        return `map(${this.vecKeyFor(t.key)},${this.vecKeyFor(t.value)})`;
+      case "set":
+        return `set(${this.vecKeyFor(t.elem)})`;
       default:
         return t.kind;
     }
+  }
+
+  /** The KEY representation for a map/set key type — f64 or string only
+   * (isSupportedMapKey's fence). The two ref-identity cases this refuses
+   * are NOT symmetric (measured, not assumed — an earlier draft claimed
+   * both were unreachable, which was only half true):
+   *   - Set<symbol>/Set<netServer> ARE reachable: `isSupportedSetElem`
+   *     admits them at the TYPE level, so `new Set<symbol>()` alone (no
+   *     Symbol() call even needed) compiles past the frontend and hits
+   *     `setNew:ref-elem` here as its FIRST refusal — a live census
+   *     bucket, not defensive dead code (probed directly).
+   *   - Map<symbol, V> is genuinely dead: `isSupportedMapKey` has no
+   *     symbol/netServer arm, so the FRONTEND rejects it outright
+   *     (SC2009/SC1090, before any IR reaches this backend at all) —
+   *     `mapNew:ref-key` can still fire on this path in principle, it
+   *     just has no known live program to name today. */
+  private mapKeyRepFor(t: IrType): { kind: MapKeyKind; val: ValType } | null {
+    if (t.kind === "f64") return { kind: "f64", val: F64 };
+    if (t.kind === "string") {
+      return { kind: "str", val: { kind: "ref", nullable: true, typeIndex: this.strType } };
+    }
+    return null;
+  }
+
+  /** The VALUE representation for a map value / set element type (a Set
+   * pins this to the constant f64 `{ kind: "f64" }` — its value slot is
+   * never read). `soft` mirrors mapTypeSoft's own no-refusal contract —
+   * but unlike `mapType`, `mapTypeSoft` never answers null on failure, it
+   * answers the I32 placeholder (its whole contract: "a placeholder for
+   * unmappable types, NO refusal"). I32 is never a LEGITIMATE non-bool
+   * resolution anywhere in mapTypeSoft's switch (every other case answers
+   * a ref, or the array/record/object/classval sub-checks that fail
+   * answer I32 for the same reason) — so `val.kind === "i32"` on the soft
+   * path, for a `t.kind` that ISN'T "bool", unambiguously means the
+   * placeholder fired and this value type didn't actually resolve. Must
+   * be treated as failure here (review MAJOR-2): the earlier draft
+   * derived `kind` from `t.kind` unconditionally, so an unmappable soft
+   * value type interned a MapInfo claiming `valKind: "ref"` while
+   * `valVal` was the bare I32 placeholder — a struct whose declared
+   * field type disagreed with the kind every reader would branch on. */
+  private mapValRepFor(
+    t: IrType,
+    loc: SrcLoc | undefined,
+    soft: boolean,
+  ): { kind: MapValKind; val: ValType; storage: StorageType } | null {
+    const val = soft ? this.mapTypeSoft(t) : this.mapType(t, loc);
+    if (val === null) return null;
+    if (soft && val.kind === "i32" && t.kind !== "bool") return null;
+    const kind: MapValKind = t.kind === "f64" ? "f64" : t.kind === "bool" ? "bool" : "ref";
+    const storage: StorageType = t.kind === "bool" ? "i8" : val;
+    return { kind, val, storage };
+  }
+
+  /** The map/set types for one (key, value) representation, interned —
+   * `t.kind` is "map" (key/value) or "set" (elem, value pinned to f64 0).
+   * Deliberately does NOT prefix the interning key with "map"/"set": a
+   * `Set<T>` and a `Map<T, number>` collapse onto the SAME struct + one
+   * helper family when their keys agree — maps.ts's "ONE representation"
+   * thesis taken one layer tighter than scr_map.c, which still keeps a
+   * distinct `scr_set_new_ref` entry point C doesn't need to share. */
+  private mapInfoFor(t: IrType, loc: SrcLoc | undefined, soft: boolean): MapInfo | null {
+    if (t.kind !== "map" && t.kind !== "set") {
+      throw new Error(`mapInfoFor on a non-map/set type ${t.kind}`);
+    }
+    const keyType = t.kind === "map" ? t.key : t.elem;
+    const valueType: IrType = t.kind === "map" ? t.value : { kind: "f64" };
+    const kr = this.mapKeyRepFor(keyType);
+    if (kr === null) {
+      if (!soft) this.refuse(t.kind === "map" ? "mapNew:ref-key" : "setNew:ref-elem", loc);
+      return null;
+    }
+    const vr = this.mapValRepFor(valueType, loc, soft);
+    // Hard path: mapType already recorded the honest `type:*` refusal.
+    // Soft path: mapTypeSoft never refuses — vr === null here just means
+    // the placeholder fired (mapValRepFor's own doc), so this call site
+    // (mapTypeSoft's own map/set arm) falls back to I32 without a refuse.
+    if (vr === null) return null;
+    const key = `map(${this.vecKeyFor(keyType)},${this.vecKeyFor(valueType)})`;
+    return this.maps.info(key, kr.kind, kr.val, vr.kind, vr.val, vr.storage);
   }
 
   private pushStrLit(value: string): void {
@@ -7707,6 +7918,265 @@ class Assembler {
       default: {
         const rest: never = e.op;
         void rest;
+      }
+    }
+  }
+
+  /** Map method/property dispatch. Receiver first, then arguments in
+   * source order (arrIntrinsic's convention) — map/set intrinsics never
+   * throw (confirmed against may-throw.ts: neither `mapIntrinsic` nor
+   * `setIntrinsic` appears in its switch), so nothing here ever needs a
+   * pending-exception check. */
+  private emitMapIntrinsic(e: Extract<IrExpr, { kind: "mapIntrinsic" }>): void {
+    const code = this.fn.code;
+    const rt = e.receiver.type;
+    if (rt.kind !== "map") throw new Error("mapIntrinsic on a non-map receiver");
+    const info = this.mapInfoFor(rt, e.loc, false);
+    if (info === null) {
+      code.unreachable();
+      return;
+    }
+    switch (e.method) {
+      case "size":
+        this.walkExpr(e.receiver);
+        code.call(this.maps.size(info));
+        return;
+      case "clear":
+        this.walkExpr(e.receiver);
+        code.call(this.maps.clear(info));
+        return;
+      case "has":
+        this.walkExpr(e.receiver);
+        this.walkExpr(e.args[0]!);
+        code.call(this.maps.has(info));
+        return;
+      case "delete":
+        this.walkExpr(e.receiver);
+        this.walkExpr(e.args[0]!);
+        code.call(this.maps.deleteM(info));
+        return;
+      case "set":
+        this.walkExpr(e.receiver);
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        code.call(this.maps.set(info));
+        return;
+      case "iterCount":
+        this.walkExpr(e.receiver);
+        code.call(this.maps.iterCount(info));
+        return;
+      case "iterLive":
+        this.walkExpr(e.receiver);
+        this.walkExpr(e.args[0]!);
+        code.call(this.maps.iterLive(info));
+        return;
+      case "iterKey":
+        this.walkExpr(e.receiver);
+        this.walkExpr(e.args[0]!);
+        code.call(this.maps.iterKey(info));
+        return;
+      case "iterValue":
+        this.walkExpr(e.receiver);
+        this.walkExpr(e.args[0]!);
+        code.call(this.maps.iterValue(info));
+        return;
+      case "iterEnter":
+        this.walkExpr(e.receiver);
+        code.call(this.maps.iterEnter(info));
+        return;
+      case "iterExit":
+        this.walkExpr(e.receiver);
+        code.call(this.maps.iterExit(info));
+        return;
+      case "get": {
+        // Type-directed union construction: get's result is `V |
+        // undefined`. WasmGC's multi-value `get` (found, val) plus real
+        // GC (no retain to skip on a miss) simplify the C reference's
+        // three-way representation split (union-reuse / scalar-out-param
+        // / ref-null-sentinel) down to TWO cases here, not one — an
+        // earlier draft dropped the union-reuse case as an unneeded
+        // optimization, which was WRONG: when V is ITSELF union-typed,
+        // `unionArmTag(e.type.unionId, rt.value)` can never succeed —
+        // rt.value is a WHOLE UNION, never one arm of itself — so this
+        // case is REQUIRED for correctness, not merely an optimization
+        // (increment-17 stage-A finding, corpus program
+        // 523-map-ref-values.ts: `Map<string, string | undefined>`).
+        //
+        // e.type.unionId does NOT generally equal rt.value.unionId (an
+        // earlier version of this comment claimed it did — measured
+        // FALSE via --emit-ir on `Map<string, A | B>` with A|B carrying
+        // no undefined arm of their own: two DISTINCT IrUnionDefs exist,
+        // u0 = A|B and u1 = A|B|undefined). Reusing the stored box is
+        // sound anyway, for two INDEPENDENT reasons that both have to
+        // hold:
+        //   1. Canonical arm order guarantees u0's arms are a PREFIX of
+        //      u1's arms in the SAME relative order (undefined sorts
+        //      LAST, nodes.ts's IrUnionDef contract) — so a given tag
+        //      number means the same logical arm in both unions. Without
+        //      this, reusing the box would misread the tag regardless of
+        //      wasm-level type safety.
+        //   2. WasmGC struct types canonicalize STRUCTURALLY at the
+        //      engine level (isorecursive equivalence, GC MVP) — but ONLY
+        //      PER RECURSION GROUP, so this needs one more fact to be
+        //      airtight: every `armStruct`/`unionArmStruct` call is a
+        //      SINGLETON group (it is only ever reached from `unionWrap`
+        //      during body-walking, never from inside the one
+        //      `beginRecGroup`/`endRecGroup` span this codebase opens —
+        //      `resolveRecGroup`'s record/class SCC resolution, which
+        //      only calls `mapTypeSoft` for field types — see unions.ts's
+        //      `armStruct` doc for the full argument). Two SINGLETON
+        //      entries with identical field layout and supertype are ONE
+        //      runtime type no matter which type-section index or
+        //      author-side key (`union:<unionId>:<tag>`) declared them.
+        //      u0's tag-N arm struct and u1's tag-N arm struct are both
+        //      exactly `{ tag: i32, payload: <same payload type> }`
+        //      subtyping the one shared union base — so a `ref.cast`
+        //      against EITHER declaration succeeds on a value built under
+        //      the OTHER. Confirmed by inspecting the emitted module (a
+        //      struct declared at one type-section index reads back
+        //      through a `ref.cast` naming a DIFFERENT index) and by
+        //      running the `A | B` case above end-to-end against Node.
+        //      Were an arm struct ever interned INSIDE an open span, it
+        //      would compare as a member of that whole multi-entry group
+        //      instead, and this reuse would very likely break.
+        //   unions.ts's own "two unions' arms never intern one type"
+        //   comment predates this finding and is corrected alongside it.
+        if (e.type.kind !== "union") throw new Error("map get result is not a union");
+        const undefTag = this.undefinedArmTag(e.type.unionId);
+        if (undefTag < 0) throw new Error("map get union lacks its undefined arm");
+        if (rt.value.kind === "union") {
+          this.walkExpr(e.receiver);
+          this.walkExpr(e.args[0]!);
+          code.call(this.maps.get(info));
+          const val = this.acquireScratch(info.valVal);
+          code.localSet(val);
+          const found = this.acquireScratch(I32);
+          code.localSet(found);
+          code.localGet(found);
+          this.openIfResult(this.unions.baseRef());
+          code.localGet(val);
+          code.else_();
+          code.globalGet(this.unions.unitGlobal(undefTag));
+          this.close();
+          this.releaseScratch(I32, found);
+          this.releaseScratch(info.valVal, val);
+          return;
+        }
+        // V is not itself a union: e.type is V's arms plus a freshly
+        // appended undefined arm — wrap the retrieved value into e.type's
+        // OWN arm struct on a hit.
+        const valueTag = this.unionArmTag(e.type.unionId, rt.value);
+        if (valueTag < 0) throw new Error("map get union lacks its value arm");
+        const armSt = this.unionArmStruct(e.type.unionId, valueTag, e.loc);
+        if (armSt === null) {
+          code.unreachable();
+          return;
+        }
+        this.walkExpr(e.receiver);
+        this.walkExpr(e.args[0]!);
+        code.call(this.maps.get(info));
+        const val = this.acquireScratch(info.valVal);
+        code.localSet(val);
+        const found = this.acquireScratch(I32);
+        code.localSet(found);
+        code.localGet(found);
+        this.openIfResult(this.unions.baseRef());
+        code.i32Const(valueTag);
+        code.localGet(val);
+        code.structNew(armSt);
+        code.else_();
+        code.globalGet(this.unions.unitGlobal(undefTag));
+        this.close();
+        this.releaseScratch(I32, found);
+        this.releaseScratch(info.valVal, val);
+        return;
+      }
+      default: {
+        const rest: never = e.method;
+        this.refuse(`mapIntrinsic:${rest as string}`, e.loc);
+        code.unreachable();
+      }
+    }
+  }
+
+  /** Set method/property dispatch — mirrors emitMapIntrinsic's shape over
+   * the OVERLAPPING method-name set (has/delete/size/clear/iterCount/
+   * iterLive/iterKey/iterEnter/iterExit share MapBuilder helpers
+   * directly, since a Set's underlying MapInfo IS a Map's whenever their
+   * keys agree — the "ONE representation" thesis, maps.ts's header).
+   * `add` is `set` with the value pinned to the constant f64 0; `toArray`
+   * has no Map counterpart (Map has no bulk-drain method). */
+  private emitSetIntrinsic(e: Extract<IrExpr, { kind: "setIntrinsic" }>): void {
+    const code = this.fn.code;
+    const rt = e.receiver.type;
+    if (rt.kind !== "set") throw new Error("setIntrinsic on a non-set receiver");
+    const info = this.mapInfoFor(rt, e.loc, false);
+    if (info === null) {
+      code.unreachable();
+      return;
+    }
+    switch (e.method) {
+      case "size":
+        this.walkExpr(e.receiver);
+        code.call(this.maps.size(info));
+        return;
+      case "clear":
+        this.walkExpr(e.receiver);
+        code.call(this.maps.clear(info));
+        return;
+      case "has":
+        this.walkExpr(e.receiver);
+        this.walkExpr(e.args[0]!);
+        code.call(this.maps.has(info));
+        return;
+      case "delete":
+        this.walkExpr(e.receiver);
+        this.walkExpr(e.args[0]!);
+        code.call(this.maps.deleteM(info));
+        return;
+      case "add":
+        this.walkExpr(e.receiver);
+        this.walkExpr(e.args[0]!);
+        code.f64Const(0);
+        code.call(this.maps.set(info));
+        return;
+      case "iterCount":
+        this.walkExpr(e.receiver);
+        code.call(this.maps.iterCount(info));
+        return;
+      case "iterLive":
+        this.walkExpr(e.receiver);
+        this.walkExpr(e.args[0]!);
+        code.call(this.maps.iterLive(info));
+        return;
+      case "iterKey":
+        this.walkExpr(e.receiver);
+        this.walkExpr(e.args[0]!);
+        code.call(this.maps.iterKey(info));
+        return;
+      case "iterEnter":
+        this.walkExpr(e.receiver);
+        code.call(this.maps.iterEnter(info));
+        return;
+      case "iterExit":
+        this.walkExpr(e.receiver);
+        code.call(this.maps.iterExit(info));
+        return;
+      case "toArray": {
+        if (e.type.kind !== "array") throw new Error("set toArray result is not an array");
+        const vecInfo = this.vecInfoFor(e.type, e.loc);
+        if (vecInfo === null) {
+          code.unreachable();
+          return;
+        }
+        this.walkExpr(e.receiver);
+        code.call(this.maps.toArray(info, vecInfo.struct, vecInfo.bufType));
+        return;
+      }
+      default: {
+        const rest: never = e.method;
+        this.refuse(`setIntrinsic:${rest as string}`, e.loc);
+        code.unreachable();
       }
     }
   }

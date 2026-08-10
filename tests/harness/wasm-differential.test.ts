@@ -1048,6 +1048,55 @@ const TIER_FLOOR: string[] = [
   "2600-dyn-keyed-write-harness.js",
   "2601-dyn-keyed-write-ops.js",
   "2602-dyn-array-destructure.js",
+  // Increment 17 stage A (the map runtime): the compact-dict Map/Set
+  // surface over WasmGC (maps.ts, new file) — parallel dense arrays
+  // (keys/vals/live) plus an open-addressing bucket table, ported from
+  // scr_map.c's design with one measured, deliberate correction: Node
+  // preserves a NaN key's exact bit pattern in storage (scr_map.c
+  // collapses every NaN to one canonical pattern, an undetected C-lane
+  // divergence — flagged, not fixed there); hashing still canonicalizes
+  // NaN to a fixed sentinel internally so equal keys hash identically.
+  // `Set<T>` shares a `Map<T, number>`'s exact struct/helper family
+  // whenever their keys agree (one interning key, no "map"/"set" prefix)
+  // — one layer tighter than scr_map.c's own design. get()'s `V |
+  // undefined` union construction needed a real case split, not just an
+  // optimization: when V is ITSELF already union-typed with its own
+  // undefined arm, "V | undefined" canonicalizes to V's own union
+  // (measured via --emit-ir: exactly one IrUnionDef, shared by the map's
+  // declared value type and get()'s result type) — 523-map-ref-values.ts
+  // caught the case a naive "always wrap in a fresh arm" implementation
+  // gets wrong. mapType/mapTypeSoft gained map/set arms in lockstep,
+  // including mapTypeSoft's array-elem mappable list (Map<K,V>[] /
+  // Set<T>[] now map instead of falling to the I32 placeholder).
+  "518-array-sort.ts",
+  "521-map-number-keys.ts",
+  "522-map-foreach.ts",
+  "523-map-ref-values.ts",
+  "524-map-cycles.ts",
+  "525-map-rc-stress.ts",
+  "527-set-foreach.ts",
+  "528-set-seeded.ts",
+  "529-map-seeded.ts",
+  "536-map-seed-array.ts",
+  "537-map-iter-drains.ts",
+  "538-map-set-for-of.ts",
+  "1526-set-spread.ts",
+  "1539-readonly-set-map.ts",
+  "1550-param-defaults-func-set.ts",
+  "1563-forof-iterator-projections.ts",
+  "1593-js-jsdoc-records.js",
+  "1614-js-fence-dodges.cjs",
+  "1615-cjs-export-shapes/main.cjs",
+  "1633-inspect-map-set.ts",
+  "1638-inspect-cjs.cjs",
+  "1836-var-loop-capture.ts",
+  "1941-class-values-registry.ts",
+  "2047-objlit-accessors-shapes.ts",
+  "2080-destructuring-defaults.ts",
+  "2085-destructuring-heads-rest-params.ts",
+  "2368-set-methods.ts",
+  "2486-recursive-record-boundaries.ts",
+  "2533-forof-destructuring.ts",
 ];
 
 interface RunResult {
