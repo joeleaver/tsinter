@@ -3626,3 +3626,184 @@ test("throw: a non-error class survives the round trip, synchronously and throug
     ["carrier 7", "sub s 1", "err plain", "none", "caught async sub async", "ok", ""].join("\n"),
   );
 });
+
+test("S031: hybrid record own-key order is declared-then-overflow", async () => {
+  // No corpus program can pin this: Node's single ordered table puts
+  // integer-like keys ascending FIRST regardless of which "store" (JS has
+  // none) a key came from, so a program exercising the split fails the
+  // differential on every lane by construction. Measured on Node 24.18
+  // against the C lane (SEMANTICS.md S031): the declared field sorts
+  // BEFORE the integer-like overflow keys here, and integer-like keys
+  // still sort ascending WITHIN the overflow half.
+  const res = await buildWasm(
+    "hybrid-key-order.ts",
+    [
+      "interface Basic {",
+      "  known: number;",
+      "  [k: string]: number;",
+      "}",
+      "const r: Basic = { known: 1 };",
+      "r.b = 2;",
+      'r["3"] = 3;',
+      "r.a = 4;",
+      'r["1"] = 5;',
+      "console.log(Object.keys(r).join('|'));",
+      "console.log(JSON.stringify(r));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    ["known|1|3|b|a", '{"known":1,"1":5,"3":3,"b":2,"a":4}', ""].join("\n"),
+  );
+});
+
+test("S031 amendment: `__proto__` is an ordinary overflow key, not the prototype accessor", async () => {
+  // Node routes a bracket write naming "__proto__" through
+  // Object.prototype's accessor (a non-object value is a silent no-op, no
+  // own property is created); the overflow map special-cases no key
+  // string, so it stores an ordinary entry. Measured on Node 24.18 against
+  // the C lane (SEMANTICS.md S031's amendment) — no corpus program can pin
+  // the Node-divergent side for the usual byte-exact reason.
+  const res = await buildWasm(
+    "hybrid-proto-key.ts",
+    [
+      "interface U {",
+      "  [k: string]: number;",
+      "}",
+      "const r: U = {};",
+      "r.a = 1;",
+      'r["__proto__"] = 99;',
+      "r.b = 2;",
+      "console.log(Object.keys(r).join('|'));",
+      "console.log(JSON.stringify(r));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    ["a|__proto__|b", '{"a":1,"__proto__":99,"b":2}', ""].join("\n"),
+  );
+});
+
+test("S032: a dynamic-keyed record read with no representable \"missing\" answer TRAPS", async () => {
+  // S003's array-OOB stance applied to the record surface: a bare `V` with
+  // no undefined arm can't answer `undefined` for a miss, so it traps
+  // instead. No corpus program can pin the trap for the same S003 reason
+  // (the harness skips the stderr compare on nonzero exit; only the exit
+  // code and PRECEDING stdout need to match, and they do — Node itself
+  // prints `undefined` and keeps running, so a corpus program observing
+  // this exact read fails the differential by construction).
+  const trapRes = await buildWasm(
+    "record-miss-trap.ts",
+    [
+      "interface Basic {",
+      "  known: number;",
+      "  [k: string]: number;",
+      "}",
+      "console.log('pre');",
+      "const r: Basic = { known: 1 };",
+      "console.log(r.missing);",
+      "",
+    ].join("\n"),
+  );
+  if (!trapRes.ok) throw new Error(`refused: ${trapRes.diagnostics[0]?.message}`);
+  const trapRun = await runWasmToTrap(trapRes.binaryPath);
+  expect(trapRun.stdout.toString("utf8")).toBe("pre\n");
+
+  // The SAME miss, but the index signature's value type carries its own
+  // undefined arm (S032's "explicit annotation" branch of the "V |
+  // undefined" rule) — the checker's result type CAN hold undefined, so
+  // the read returns the interned undefined arm instead of trapping, and
+  // agrees with Node.
+  const okRes = await buildWasm(
+    "record-miss-ok.ts",
+    [
+      "interface Loose {",
+      "  known: number;",
+      "  [k: string]: number | undefined;",
+      "}",
+      "const r: Loose = { known: 1 };",
+      "console.log(r.missing === undefined, r.missing);",
+      "",
+    ].join("\n"),
+  );
+  if (!okRes.ok) throw new Error(`refused: ${okRes.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(okRes.binaryPath);
+  expect(stdout.toString("utf8")).toBe("true undefined\n");
+});
+
+test("S033: a dynamic-keyed write naming no declared field on a signature-free record throws", async () => {
+  // The "mockable module" pattern (corpus 2470): every declared field
+  // shares one common type, so the frontend accepts the computed-key
+  // write, but the record itself is a monomorphic struct with a FIXED
+  // field set. Node adds the property; this tier throws a catchable
+  // TypeError and stores nothing. No corpus program can pin the throwing
+  // side (Node's silent-success text differs by construction).
+  const res = await buildWasm(
+    "fixed-shape-write.ts",
+    [
+      "interface Funcs {",
+      "  tick: () => void;",
+      "  tock: () => void;",
+      "}",
+      "function setKey(r: Funcs, k: string, v: () => void): void {",
+      "  // @ts-expect-error -- generic-write pattern",
+      "  r[k] = v;",
+      "}",
+      "const box: Funcs = { tick: () => console.log('t1'), tock: () => console.log('t2') };",
+      "setKey(box, 'tick', () => console.log('mocked'));",
+      "box.tick();",
+      "try {",
+      "  setKey(box, 'nope', () => console.log('never'));",
+      "  console.log('no-throw');",
+      "} catch (e) {",
+      "  if (e instanceof TypeError) console.log('caught:', e.message);",
+      "  else console.log('other');",
+      "}",
+      "console.log('done');",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    ["mocked", "caught: Cannot add property 'nope' to a fixed-shape object", "done", ""].join("\n"),
+  );
+});
+
+test("S009 amendment: a dynamic-keyed write validates a declared field's type on a hybrid record", async () => {
+  // The SAME trust-but-verify mechanism `e as C` uses (S009), reached from
+  // a second site: `r[k] = v` where the runtime key `k` names a DECLARED
+  // field whose static type is narrower than the index signature's value
+  // type `v` arrives as. Node stores whatever `v` is; here the write
+  // validates through the identical dynCheck machinery and throws,
+  // leaving the field untouched. No corpus program can pin the throwing
+  // side for the usual byte-exact reason.
+  const res = await buildWasm(
+    "hybrid-declared-write-check.ts",
+    [
+      "interface Mixed {",
+      "  known: number;",
+      "  [k: string]: unknown;",
+      "}",
+      "function setKey(r: Mixed, k: string, v: unknown): void {",
+      "  r[k] = v;",
+      "}",
+      "const m: Mixed = { known: 1 };",
+      "try {",
+      "  setKey(m, 'known', 'not a number');",
+      "  console.log('no-throw', m.known);",
+      "} catch (e) {",
+      "  if (e instanceof TypeError) console.log('caught:', e.message, m.known);",
+      "  else console.log('other');",
+      "}",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("caught: expected number at $.known, got string 1\n");
+});

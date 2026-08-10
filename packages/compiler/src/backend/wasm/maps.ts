@@ -127,6 +127,12 @@ export interface MapDeps {
    * (arrayGetU) while hashing a string key; string EQUALITY goes through
    * strEq instead, which already knows its own type. */
   strType: () => number;
+  /** %w.dyn.idxKey's index (str) -> f64: the canonical array-index a key
+   * spells, or -1 — dyn.ts's own predicate, injected rather than
+   * reimplemented (increment-17 stage B's house rule: ONE own-key-order
+   * classification helper in the whole tier, shared by objWalk mode 2
+   * and this file's keysJsOrder, never a second slightly-different one). */
+  idxKey: () => number;
 }
 
 // Struct field indices.
@@ -1607,6 +1613,186 @@ export class MapBuilder {
       c.i32Const(1);
       c.i32Add();
       c.localSet(R);
+      c.br(0);
+      c.end();
+      c.end();
+
+      c.localGet(OUT);
+      c.refAsNonNull();
+
+      this.mb.setBody(idx, locals, c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.map.keysJsOrder — (map) -> fresh string[] of the LIVE keys in JS
+   * OWN-KEY order: canonical array-index keys ("0".."4294967294", the
+   * idxKey predicate — dyn.ts's own, shared rather than reimplemented per
+   * the increment-17 stage B house rule: ONE own-key-order classification
+   * in the whole tier) ascending numerically FIRST, then the rest in
+   * insertion order (scr_map_keys_js_order ported). Str-keyed maps only
+   * — the record overflow store; a plain user Map never needs this (Map
+   * iteration is always insertion order, JS never reorders it).
+   *
+   * Structurally an O(n^2) SELECTION scan — "repeatedly find the
+   * smallest index-key strictly greater than the last one emitted" —
+   * rather than an auxiliary sorted buffer, mirroring dyn.ts's own
+   * objWalk OBJ arm exactly (which this shares idxKey with); the ONE
+   * addition objWalk's dense/tombstone-free entries array never needed is
+   * the LIVE gate on every candidate read here, since this map's dense
+   * span can hold tombstones objWalk's never does. */
+  keysJsOrder(m: MapInfo, vecStruct: number, vecBufType: number): number {
+    if (m.keyKind !== "str") throw new Error(`wasm emitter bug: keysJsOrder on a non-string-keyed map ${m.key}`);
+    return this.cached(`${m.key}:keysJsOrder:${vecStruct}`, () => {
+      const vecRefT: ValType = { kind: "ref", nullable: true, typeIndex: vecStruct };
+      const idx = this.mb.declareFunc(this.mb.funcType([this.mapRef(m)], [vecRefT]), `%w.map.keysJsOrder:${m.key}`);
+      const c = new Code();
+      const M = 0;
+      const OUT = 1;
+      const N = 2; // i32 dense entry count (NENTRIES)
+      const W = 3; // i32 output write cursor
+      const I = 4; // i32 scan cursor
+      const BEST = 5; // i32 best candidate's dense index, -1 = none yet
+      const BESTV = 6; // f64 best candidate's idxKey() value
+      const LAST = 7; // f64 last-emitted idxKey() value
+      const IV = 8; // f64 scratch: idxKey() of the current candidate
+      const locals: ValType[] = [this.nullableBuf(vecStruct), I32, I32, I32, I32, F64, F64, F64];
+
+      c.localGet(M);
+      c.structGet(m.struct, NLIVE);
+      c.localGet(M);
+      c.structGet(m.struct, NLIVE);
+      c.arrayNewDefault(vecBufType);
+      c.structNew(vecStruct);
+      c.localSet(OUT);
+      c.i32Const(0);
+      c.localSet(W);
+      c.localGet(M);
+      c.structGet(m.struct, NENTRIES);
+      c.localSet(N);
+
+      // Pass 1: canonical-index keys, ascending.
+      c.f64Const(-1);
+      c.localSet(LAST);
+      c.block();
+      c.loop();
+      c.i32Const(-1);
+      c.localSet(BEST);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(M);
+      c.structGet(m.struct, LIVE);
+      c.localGet(I);
+      c.arrayGetU(m.liveBufType);
+      c.ifVoid();
+      c.localGet(M);
+      c.structGet(m.struct, KEYS);
+      c.localGet(I);
+      c.arrayGet(m.keysBufType);
+      c.call(this.deps.idxKey());
+      c.localTee(IV);
+      c.localGet(LAST);
+      c.f64Gt();
+      c.ifVoid();
+      // `BEST < 0 || IV < BESTV` — BESTV is only meaningful once BEST is
+      // set, so the two tests nest rather than combine via i32Or (no
+      // memory read on either side here, but nesting mirrors objWalk's
+      // own structure exactly, which this is a direct port of).
+      c.localGet(BEST);
+      c.i32Const(0);
+      c.i32LtS();
+      c.ifResult(I32);
+      c.i32Const(1);
+      c.else_();
+      c.localGet(IV);
+      c.localGet(BESTV);
+      c.f64Lt();
+      c.end();
+      c.ifVoid();
+      c.localGet(I);
+      c.localSet(BEST);
+      c.localGet(IV);
+      c.localSet(BESTV);
+      c.end();
+      c.end();
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(BEST);
+      c.i32Const(0);
+      c.i32LtS();
+      c.brIf(1);
+      c.localGet(BESTV);
+      c.localSet(LAST);
+      c.localGet(OUT);
+      c.refAsNonNull();
+      c.structGet(vecStruct, BUF);
+      c.localGet(W);
+      c.localGet(M);
+      c.structGet(m.struct, KEYS);
+      c.localGet(BEST);
+      c.arrayGet(m.keysBufType);
+      c.arraySet(vecBufType);
+      c.localGet(W);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(W);
+      c.br(0);
+      c.end();
+      c.end();
+
+      // Pass 2: everything else, insertion order.
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(M);
+      c.structGet(m.struct, LIVE);
+      c.localGet(I);
+      c.arrayGetU(m.liveBufType);
+      c.ifVoid();
+      c.localGet(M);
+      c.structGet(m.struct, KEYS);
+      c.localGet(I);
+      c.arrayGet(m.keysBufType);
+      c.call(this.deps.idxKey());
+      c.f64Const(0);
+      c.f64Lt();
+      c.ifVoid();
+      c.localGet(OUT);
+      c.refAsNonNull();
+      c.structGet(vecStruct, BUF);
+      c.localGet(W);
+      c.localGet(M);
+      c.structGet(m.struct, KEYS);
+      c.localGet(I);
+      c.arrayGet(m.keysBufType);
+      c.arraySet(vecBufType);
+      c.localGet(W);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(W);
+      c.end();
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
       c.br(0);
       c.end();
       c.end();

@@ -326,6 +326,21 @@ interface FnState {
   pretLocal: number | null;
 }
 
+/** A resolved record shape's wasm representation: `struct` and per-
+ * declared-field slot indices exactly as before increment 17, plus
+ * `overflow` — the shape's embedded string-keyed overflow map (maps.ts's
+ * "ONE compact-dict backs all three surfaces" thesis: the overflow store
+ * IS a `Map<string, indexValue>`, non-null exactly when the IR shape
+ * carries `indexValue` — a PURE/declared-only shape has `overflow: null`
+ * and its struct has no trailing field). The overflow field, when
+ * present, is field index `fields.size` (right after every declared
+ * field) — never hardcoded at call sites, always read off this record. */
+interface RecordInfo {
+  struct: number;
+  fieldIndex: Map<string, number>;
+  overflow: MapInfo | null;
+}
+
 /* Exception-cell kind tags (the wasm tier's ScrExcKind): 0 = nothing
  * pending; the rest tag what the payload globals hold. */
 const EXC_F64 = 1;
@@ -1093,7 +1108,7 @@ class Assembler {
    * are separate entries interned at their use sites — so `{ next: N |
    * null }` is not recursive at this level at all and needs no group. */
 
-  private readonly recordInfos = new Map<string, { struct: number; fieldIndex: Map<string, number> } | null>();
+  private readonly recordInfos = new Map<string, RecordInfo | null>();
   private readonly recordShapes = new Map<string, IrRecordShape>();
   private readonly recordInFlight = new Set<string>();
   /** Shapes whose struct is a reserved index inside the open span. */
@@ -1171,11 +1186,8 @@ class Assembler {
       throw new Error(`wasm emitter bug: rec group for ${[...scc].sort().join(",")} opened inside another`);
     }
     const members = [...scc].sort();
-    // An index-signature member sinks the whole group: its struct needs
-    // the map runtime, and the others cannot be defined without it.
     for (const id of members) {
-      const shape = this.recordShapes.get(id);
-      if (shape === undefined || shape.indexValue !== undefined) {
+      if (this.recordShapes.get(id) === undefined) {
         for (const m of members) this.recordInfos.set(m, null);
         if (!soft) this.refuseRecord(id, loc);
         return;
@@ -1183,16 +1195,19 @@ class Assembler {
     }
     // PRE-RESOLVE everything the members need that is NOT in the SCC,
     // OUTSIDE the span — otherwise it would be interned inside and join
-    // the group. A field type that reaches the SCC at all is itself on a
-    // cycle through this member and so is already a member, which is why
-    // this test is exactly "touches the SCC".
+    // the group. A field (or indexValue) type that reaches the SCC at all
+    // is itself on a cycle through this member and so is already a
+    // member, which is why this test is exactly "touches the SCC".
     for (const id of members) {
-      for (const f of this.recordShapes.get(id)!.fields) {
+      const shape = this.recordShapes.get(id)!;
+      const preResolve = (t: IrType): void => {
         const refs = new Set<string>();
-        this.structRefs(f.type, refs);
+        this.structRefs(t, refs);
         const reachesScc = [...refs].some((r) => scc.has(r) || [...this.structReach(r)].some((s) => scc.has(s)));
-        if (!reachesScc) this.mapTypeSoft(f.type);
-      }
+        if (!reachesScc) this.mapTypeSoft(t);
+      };
+      for (const f of shape.fields) preResolve(f.type);
+      if (shape.indexValue !== undefined) preResolve(shape.indexValue);
     }
     this.recGroupOpen = true;
     this.mb.beginRecGroup();
@@ -1205,43 +1220,99 @@ class Assembler {
       }
       this.recordReserved.set(id, this.mb.reserveType(`record:${id}`));
     }
-    const built: { id: string; fields: { storage: ValType; mutable: boolean }[] }[] = [];
+    const built: { id: string; fields: { storage: ValType; mutable: boolean }[]; overflow: MapInfo | null }[] = [];
     for (const id of members) {
       const shape = this.recordShapes.get(id)!;
       // The in-SCC members now resolve to their reservations, and the
       // vector types an array field needs intern HERE — inside the span,
       // which is where they belong: a vec of an SCC member is on the
-      // cycle too (vec struct -> buffer array -> member struct).
-      built.push({ id, fields: shape.fields.map((f) => ({ storage: this.mapTypeSoft(f.type), mutable: true })) });
+      // cycle too (vec struct -> buffer array -> member struct). A
+      // hybrid member's overflow map is exactly the same story: its
+      // valsBuf element type may itself be the reservation being defined
+      // right now (`{ [k: string]: Self }`), so it must resolve HERE too
+      // — never before beginRecGroup, never after endRecGroup.
+      const fields = shape.fields.map((f) => ({ storage: this.mapTypeSoft(f.type), mutable: true }));
+      let overflow: MapInfo | null = null;
+      if (shape.indexValue !== undefined) {
+        overflow = this.overflowInfoFor(shape, undefined, true);
+        fields.push({ storage: overflow === null ? I32 : this.maps.mapRef(overflow), mutable: true });
+      }
+      built.push({ id, fields, overflow });
     }
     for (const { id, fields } of built) {
       this.mb.defineType(this.recordReserved.get(id)!, { kind: "struct", fields });
     }
     this.mb.endRecGroup();
     this.recGroupOpen = false;
-    for (const id of members) {
+    // DEFENSIVE: a member whose indexValue type mapType/mapTypeSoft has no
+    // arm for (regex/child/secureCtx — isSupportedIndexValue permits them,
+    // but they never got a wasm representation) would get the I32
+    // placeholder above instead of a real overflow, and the WHOLE GROUP
+    // must refuse rather than hand back a struct silently missing its
+    // overflow's real shape (the type-section entries all still exist —
+    // defineType already ran, unavoidable inside an open span — harmless
+    // bloat, the existing self-recursion-poisons-the-cache path tolerates
+    // the same). No known corpus or probe reaches this branch today: it
+    // needs a bare regex/child/secureCtx index VALUE inside a genuinely
+    // RECURSIVE (SCC) shape specifically — a union-wrapped one dodges it
+    // via unions.baseRef() instead of the leaf type — and no such shape is
+    // known to exist. Kept for the same reason the non-recursive
+    // `recordInfo` path (below) keeps its twin: an unmappable index value
+    // is a real, if currently unconstructed, failure mode.
+    const anyOverflowFailed = built.some(
+      ({ id, overflow }) => this.recordShapes.get(id)!.indexValue !== undefined && overflow === null,
+    );
+    if (anyOverflowFailed) {
+      for (const { id } of built) {
+        this.recordInfos.set(id, null);
+        this.recordReserved.delete(id);
+      }
+      if (!soft) this.refuse("record:index-signature-value", loc);
+      return;
+    }
+    for (const { id, overflow } of built) {
       const shape = this.recordShapes.get(id)!;
       this.recordInfos.set(id, {
         struct: this.recordReserved.get(id)!,
         fieldIndex: new Map(shape.fields.map((f, i) => [f.name, i])),
+        overflow,
       });
       this.recordReserved.delete(id);
     }
   }
 
-  private recordInfo(shapeId: string, loc: SrcLoc | undefined, soft: boolean): { struct: number; fieldIndex: Map<string, number> } | null {
+  /** The shape's overflow store's MapInfo — a synthetic `{ kind: "map",
+   * key: { kind: "string" }, value: shape.indexValue }` fed through the
+   * SAME `mapInfoFor` a user `Map<string, V>` uses (maps.ts's "ONE
+   * compact-dict backs all three surfaces" thesis, increment-17 brief
+   * §0 — a `Record<string, number>`'s overflow and a user
+   * `Map<string, number>` intern the IDENTICAL struct + helper family,
+   * since `mapInfoFor`'s key never distinguishes their origin). */
+  private overflowInfoFor(shape: IrRecordShape, loc: SrcLoc | undefined, soft: boolean): MapInfo | null {
+    if (shape.indexValue === undefined) {
+      throw new Error(`wasm emitter bug: overflowInfoFor on shape ${shape.id} without an index signature`);
+    }
+    const synthetic: IrType = { kind: "map", key: { kind: "string" }, value: shape.indexValue };
+    return this.mapInfoFor(synthetic, loc, soft);
+  }
+
+  private recordInfo(shapeId: string, loc: SrcLoc | undefined, soft: boolean): RecordInfo | null {
     const cached = this.recordInfos.get(shapeId);
     if (cached !== undefined) {
       if (cached === null && !soft) this.refuseRecord(shapeId, loc);
       return cached;
     }
     // Mid-group: the reservation IS the answer, which is what lets a
-    // member's fields name the others.
+    // member's fields name the others. `overflow: null` here is never
+    // actually read — the only path back into recordInfo mid-group is a
+    // recursive TYPE reference (mapType's "record" case wanting `.struct`
+    // for a ValType ref), never a value-level consumer of the overflow
+    // map, so this placeholder is safe.
     const reserved = this.recordReserved.get(shapeId);
     if (reserved !== undefined) {
       const shape = this.recordShapes.get(shapeId);
       if (shape === undefined) throw new Error(`unknown record shape ${shapeId}`);
-      return { struct: reserved, fieldIndex: new Map(shape.fields.map((f, i) => [f.name, i])) };
+      return { struct: reserved, fieldIndex: new Map(shape.fields.map((f, i) => [f.name, i])), overflow: null };
     }
     const shape = this.recordShapes.get(shapeId);
     if (shape === undefined) throw new Error(`unknown record shape ${shapeId}`);
@@ -1252,13 +1323,18 @@ class Assembler {
       if (made === null && !soft) this.refuseRecord(shapeId, loc);
       return made;
     }
-    if (shape.indexValue !== undefined || this.recordInFlight.has(shapeId)) {
+    if (this.recordInFlight.has(shapeId)) {
       this.recordInfos.set(shapeId, null);
       if (!soft) this.refuseRecord(shapeId, loc);
       return null;
     }
     this.recordInFlight.add(shapeId);
     const fields = shape.fields.map((f) => ({ storage: this.mapTypeSoft(f.type), mutable: true }));
+    let overflow: MapInfo | null = null;
+    if (shape.indexValue !== undefined) {
+      overflow = this.overflowInfoFor(shape, undefined, true);
+      fields.push({ storage: overflow === null ? I32 : this.maps.mapRef(overflow), mutable: true });
+    }
     this.recordInFlight.delete(shapeId);
     // A self-recursive shape poisoned its own cache entry while its
     // fields mapped — keep the refusal, never the placeholder struct.
@@ -1266,25 +1342,312 @@ class Assembler {
       if (!soft) this.refuseRecord(shapeId, loc);
       return null;
     }
+    // The overflow's value type has no wasm representation at all
+    // (isSupportedIndexValue permits regex/child/secureCtx, which
+    // mapType/mapTypeSoft have no arm for — a SPLIT name from the generic
+    // "record:index-signature" bucket, which no longer applies to most
+    // index-signature shapes now that they succeed) — never hand back a
+    // struct with a placeholder standing in for a real overflow map.
+    if (shape.indexValue !== undefined && overflow === null) {
+      this.recordInfos.set(shapeId, null);
+      if (!soft) this.refuse("record:index-signature-value", loc);
+      return null;
+    }
     // A resumable function's frame is a SUBTYPE of the shared frame base,
     // which is the whole reason one waiter queue can hold every async
     // function's parked frames (statemachine.ts's ONE RESUME SIGNATURE).
     // Keyed by shape id — two frames with identical layouts are still
-    // distinct declarations, exactly like closure envs.
+    // distinct declarations, exactly like closure envs. (Frame shapes
+    // never carry an index signature — resumable-function frames are
+    // compiler-synthesized, never derived from a TS index-signature type
+    // — so `overflow` is always null on this branch in practice.)
     const struct = shapeId.startsWith(FRAME_SHAPE_PREFIX)
       ? this.mb.subStructType(`frame:${shapeId}`, fields, this.frameBaseType())
       : this.mb.structType(fields);
-    const made = { struct, fieldIndex: new Map(shape.fields.map((f, i) => [f.name, i])) };
+    const made: RecordInfo = { struct, fieldIndex: new Map(shape.fields.map((f, i) => [f.name, i])), overflow };
     this.recordInfos.set(shapeId, made);
     return made;
   }
 
+  /** The generic "this shape's cached answer is null" refuser — reached
+   * from a CACHE HIT (`recordInfo`'s top check), so it cannot simply
+   * remember why the FIRST resolution attempt failed; it recomputes the
+   * honest reason instead. `record:index-signature` (the old blanket
+   * name) is now DEAD in practice: index-signature shapes generally
+   * SUCCEED since increment 17 stage B, and the two paths that still
+   * refuse one call `this.refuse` directly with their own specific name
+   * (`record:index-signature-value`) rather than through here — so this
+   * function's indexValue branch only exists to keep a REPEAT lookup of
+   * an already-poisoned index-signature-value shape honest too (recheck
+   * `overflowInfoFor`, cheap: `mapInfoFor` is interned, a repeat call is
+   * a cache hit, not real work). */
   private refuseRecord(shapeId: string, loc: SrcLoc | undefined): void {
     const shape = this.recordShapes.get(shapeId);
-    this.refuse(
-      shape?.indexValue !== undefined ? "record:index-signature" : "record:recursive",
-      loc,
+    if (shape !== undefined && shape.indexValue !== undefined && this.overflowInfoFor(shape, undefined, true) === null) {
+      this.refuse("record:index-signature-value", loc);
+      return;
+    }
+    this.refuse("record:recursive", loc);
+  }
+
+  /* ── the dynamic-keyed record surface (increment 17 stage B) ─────────
+   * %w.rkg.<n> / %w.rks.<n> — interned per (shapeId, resultType[,
+   * overflowOnly]) / per shapeId, C's memoized pattern (emit-walkers.ts
+   * :1772-1914) ported: house style prefers one interned helper per
+   * distinct signature over LLVM's per-site inlining. */
+
+  private readonly recordKeyGetFns = new Map<string, number>();
+  private readonly recordKeySetFns = new Map<string, number>();
+
+  /** Surfaces a value of type `vt` (already on the stack via `pushRaw`)
+   * as the target type `t` — IDENTITY when they already agree, a
+   * `dynFrom` conversion when `t` is `dyn`, or an arm-into-union wrap
+   * when `t` is a union `vt` is one arm of. Shared by recordKeyGetHelper
+   * (a declared field or an overflow hit) — mirrors C's inline `surface`
+   * closure in `recordKeyGetHelper` (emit-walkers.ts:1785-1804) exactly.
+   * `ok` (the caller's success flag) goes false on an out-of-tier
+   * conversion; nothing after that point matters, since the caller
+   * discards the half-built body via `walkerDead`. */
+  private emitKeyedReadSurface(c: Code, vt: IrType, t: IrType, loc: SrcLoc | undefined, pushRaw: () => void, fail: () => void): void {
+    if (typeEquals(vt, t)) {
+      pushRaw();
+      return;
+    }
+    if (t.kind === "dyn") {
+      const inner = this.dynFromHelper(vt, loc);
+      if (inner === null) {
+        fail();
+        return;
+      }
+      pushRaw();
+      c.call(inner);
+      return;
+    }
+    if (t.kind === "union") {
+      const def = this.unionDef(t.unionId);
+      const tag = def.arms.findIndex((a) => typeEquals(a, vt));
+      if (tag < 0) throw new Error(`emitter bug: keyed read arm for ${typeKey(vt)} in ${typeKey(t)}`);
+      const st = this.unionArmStruct(t.unionId, tag, loc);
+      if (st === null) {
+        fail();
+        return;
+      }
+      c.i32Const(tag);
+      pushRaw();
+      c.structNew(st);
+      return;
+    }
+    throw new Error(`emitter bug: keyed read cannot surface ${typeKey(vt)} as ${typeKey(t)}`);
+  }
+
+  /** %w.rkg.<n> — the dynamic-keyed record READ helper for one (shape,
+   * result type[, overflowOnly]): `(record, key) -> T`. Declared fields
+   * answer FIRST (a string-switch — field access exactness is preserved:
+   * a declared name always answers from the struct slot), skipped
+   * entirely when `overflowOnly` (a literal key that names no declared
+   * field), then the overflow map on index-signature shapes. A MISSING
+   * key answers the undefined dyn singleton (T dyn), the undefined arm
+   * (T undefined-armed union), or TRAPS (S003's array-OOB stance — the
+   * checker claimed T and no undefined is representable; on declared-
+   * only shapes tsc's keyof check makes this unreachable without an `as`
+   * smuggle, nodes.ts:4431-4433). Never THROWS (may-throw.ts has no
+   * recordKeyGet case) — a trap stands in for the type-unsound smuggle
+   * that alone can reach it, same S003 bridge every other OOB trap uses. */
+  private recordKeyGetHelper(shapeId: string, t: IrType, overflowOnly: boolean, loc: SrcLoc | undefined): number | null {
+    const key = `${shapeId}|${typeKey(t)}${overflowOnly ? "|ovf" : ""}`;
+    const hit = this.recordKeyGetFns.get(key);
+    if (hit !== undefined) return hit;
+    const shape = this.recordShapes.get(shapeId);
+    if (shape === undefined) throw new Error(`emitter bug: keyed read of unknown shape ${shapeId}`);
+    const info = this.recordInfo(shapeId, loc, false);
+    const resultVal = this.mapType(t, loc);
+    if (info === null || resultVal === null) return null;
+    const recVal: ValType = { kind: "ref", nullable: true, typeIndex: info.struct };
+    const idx = this.mb.declareFunc(this.mb.funcType([recVal, this.strRef], [resultVal]), `%w.rkg.${this.recordKeyGetFns.size}`);
+    this.recordKeyGetFns.set(key, idx);
+    const c = new Code();
+    const R = 0;
+    const K = 1;
+    let n = 2;
+    const locals: ValType[] = [];
+    let ok = true;
+    const fail = (): void => {
+      ok = false;
+    };
+
+    if (!overflowOnly) {
+      for (const f of shape.fields) {
+        const slot = info.fieldIndex.get(f.name)!;
+        c.localGet(K);
+        this.pushStrLitInto(c, f.name);
+        c.call(this.strEqHelper());
+        c.ifVoid();
+        this.emitKeyedReadSurface(c, f.type, t, loc, () => {
+          c.localGet(R);
+          c.structGet(info.struct, slot);
+        }, fail);
+        c.return_();
+        c.end();
+        if (!ok) return this.walkerDead(idx);
+      }
+    }
+    if (shape.indexValue !== undefined) {
+      if (info.overflow === null) throw new Error(`emitter bug: shape ${shapeId} has an index signature but recordInfo built no overflow`);
+      const FOUND = n++;
+      const VAL = n++;
+      locals.push(I32, info.overflow.valVal);
+      c.localGet(R);
+      c.structGet(info.struct, info.fieldIndex.size);
+      c.localGet(K);
+      c.call(this.maps.get(info.overflow));
+      c.localSet(VAL);
+      c.localSet(FOUND);
+      c.localGet(FOUND);
+      c.ifVoid();
+      this.emitKeyedReadSurface(c, shape.indexValue, t, loc, () => c.localGet(VAL), fail);
+      c.return_();
+      c.end();
+      if (!ok) return this.walkerDead(idx);
+    }
+    // The miss path: dyn's own undefined singleton, an undefined-armed
+    // union's interned unit instance, or a trap — never a throw.
+    if (t.kind === "dyn") {
+      c.globalGet(this.dyn.undefinedGlobal());
+    } else if (t.kind === "union" && this.undefinedArmTag(t.unionId) >= 0) {
+      c.globalGet(this.unions.unitGlobal(this.undefinedArmTag(t.unionId)));
+    } else {
+      c.unreachable();
+    }
+    this.mb.setBody(idx, locals, c.bytes());
+    return idx;
+  }
+
+  /** The catchable TypeError a fixed-shape (no index signature) write's
+   * key MISS throws: `"Cannot add property '<key>' to a fixed-shape
+   * object"`, `k` interpolated at RUNTIME (the message is dynamic; the
+   * prefix/suffix are literals, concatenated). MEASURED against the C
+   * lane directly (Node has no analogous behavior at all here — JS would
+   * silently ADD the property — so the C lane's own inherited behavior
+   * is the match target, per the standing rule for invented divergences
+   * with no Node witness): `box.setUnchecked("nope", ...)` on a
+   * `createMockable`-shaped fixed record throws exactly `TypeError:
+   * Cannot add property 'nope' to a fixed-shape object` under
+   * `--backend c`, uncaught in Node (see SEMANTICS.md for the
+   * registered entry). Sets the pending-exception cell; the CALLER
+   * unwinds (recordKeySetHelper's own body has nothing left to do after
+   * this — a void function's implicit end is the return). */
+  private emitRecordKeyMiss(c: Code, K: number): void {
+    this.emitSetCellError(
+      c,
+      "%TypeError",
+      "TypeError",
+      (cc) => {
+        this.pushStrLitInto(cc, "Cannot add property '");
+        cc.localGet(K);
+        cc.call(this.concatHelper());
+        this.pushStrLitInto(cc, "' to a fixed-shape object");
+        cc.call(this.concatHelper());
+      },
+      null,
     );
+  }
+
+  /** %w.rks.<n> — the dynamic-keyed record WRITE helper for one shape:
+   * `(record, key, V) -> ()`. `V`'s wasm type is `iv` — the shape's OWN
+   * index-signature value type, or (a signature-free shape whose
+   * declared fields all share exactly one type — the "mockable module"
+   * uniform-dispatch pattern the frontend also lowers to recordKeySet,
+   * confirmed reachable via tests/corpus/2470-mockable-module-shape.js;
+   * nodes.ts:1193's "index-signature shapes only" doc comment underclaims
+   * this second path) the first declared field's type. A declared key
+   * writes THROUGH to its struct slot: when `iv.kind === "dyn"` AND the
+   * shape has a real index signature, `V` itself arrives as `dyn` and
+   * EVERY declared field validates its OWN type out of it via dynCheck
+   * (a mismatch throws the catchable TypeError, field untouched — JS
+   * would store anything, the documented S009-adjacent divergence);
+   * otherwise `typeEquals(f.type, iv)` holds by the frontend's
+   * consistency guarantee and the store is direct, no conversion. An
+   * undeclared key inserts/replaces in the overflow map (index-signature
+   * shapes) or throws `emitRecordKeyMiss` (signature-free shapes — the
+   * monomorphic-struct divergence, measured above). MAY THROW exactly
+   * when may-throw.ts's recordKeySet case says: not `overflowOnly`, and
+   * either the shape is signature-free or its index value is dyn with at
+   * least one declared field to validate. WasmGC deletes every RC
+   * release the C reference does on a replaced/rejected value — real GC,
+   * nothing here retains or releases. */
+  private recordKeySetHelper(shapeId: string, loc: SrcLoc | undefined): number | null {
+    const hit = this.recordKeySetFns.get(shapeId);
+    if (hit !== undefined) return hit;
+    const shape = this.recordShapes.get(shapeId);
+    if (shape === undefined) throw new Error(`emitter bug: keyed write of unknown shape ${shapeId}`);
+    const info = this.recordInfo(shapeId, loc, false);
+    if (info === null) return null;
+    const iv = shape.indexValue ?? shape.fields[0]?.type;
+    if (iv === undefined) throw new Error(`emitter bug: keyed write on field-free non-overflow shape ${shapeId}`);
+    const ivVal = this.mapType(iv, loc);
+    if (ivVal === null) return null;
+    const recVal: ValType = { kind: "ref", nullable: true, typeIndex: info.struct };
+    const idx = this.mb.declareFunc(this.mb.funcType([recVal, this.strRef, ivVal], []), `%w.rks.${this.recordKeySetFns.size}`);
+    this.recordKeySetFns.set(shapeId, idx);
+    const c = new Code();
+    const R = 0;
+    const K = 1;
+    const V = 2;
+    let n = 3;
+    const locals: ValType[] = [];
+    let ok = true;
+    // A validated declared field needs V to arrive as dyn (the whole
+    // function's OWN parameter type) — checked once, not per field: if
+    // iv.kind isn't dyn, or there's no real index signature, every field
+    // strictly equals iv by the frontend's guarantee and stores directly.
+    const validate = iv.kind === "dyn" && shape.indexValue !== undefined;
+
+    for (const f of shape.fields) {
+      const slot = info.fieldIndex.get(f.name)!;
+      c.localGet(K);
+      this.pushStrLitInto(c, f.name);
+      c.call(this.strEqHelper());
+      c.ifVoid();
+      if (validate) {
+        const inner = this.dynCheckHelper(f.type, loc);
+        if (inner === null) {
+          ok = false;
+        } else {
+          const fVal = this.mapType(f.type, loc);
+          if (fVal === null) throw new Error(`emitter bug: dynCheckHelper succeeded but mapType failed for ${typeKey(f.type)}`);
+          const nv = n++;
+          locals.push(fVal);
+          c.localGet(V);
+          this.dyn.pushPathKey(c, (x) => x.refNull(this.dyn.pathT()), (x) => this.pushStrLitInto(x, f.name));
+          c.call(inner);
+          c.localSet(nv);
+          this.emitWalkerPending(c, null);
+          c.localGet(R);
+          c.localGet(nv);
+          c.structSet(info.struct, slot);
+        }
+      } else {
+        c.localGet(R);
+        c.localGet(V);
+        c.structSet(info.struct, slot);
+      }
+      c.return_();
+      c.end();
+      if (!ok) return this.walkerDead(idx);
+    }
+
+    if (shape.indexValue !== undefined) {
+      if (info.overflow === null) throw new Error(`emitter bug: shape ${shapeId} has an index signature but recordInfo built no overflow`);
+      c.localGet(R);
+      c.structGet(info.struct, info.fieldIndex.size);
+      c.localGet(K);
+      c.localGet(V);
+      c.call(this.maps.set(info.overflow));
+    } else {
+      this.emitRecordKeyMiss(c, K);
+    }
+    this.mb.setBody(idx, locals, c.bytes());
+    return idx;
   }
 
   /** One-field mutable box per captured-value representation; ref-typed
@@ -1789,6 +2152,20 @@ class Assembler {
         const shape = this.recordShapes.get(t.shapeId);
         const info = this.recordInfo(t.shapeId, loc, false);
         if (shape === undefined || info === null) return false;
+        if (shape.indexValue !== undefined) {
+          // Increment-17 stage B lifted recordInfo's blanket refusal for
+          // hybrid shapes, but this walker only ever built the DECLARED
+          // fields into the dyn object — a hybrid record's overflow keys
+          // would silently vanish from the conversion (missing own keys
+          // Node would show) rather than appear, which is a miscompile,
+          // not a refusal. The overflow TAIL this walker needs is
+          // explicitly stage C's job ("FROM walker (record→dyn) gains
+          // the overflow tail") — refuse by name until it lands, exactly
+          // dynMatch's own `record:index-signature` precedent for the
+          // sibling walker.
+          this.refuse("dynFrom:record:index-signature", loc);
+          return false;
+        }
         if (shape.tuple) {
           // A tuple converts as the JSON ARRAY it is everywhere else.
           const a = this.wlocal(w, dyn.arrRef());
@@ -2127,8 +2504,11 @@ class Assembler {
         // `a?: T` spelling) DROPS from the output while it holds the
         // undefined arm, exactly like Node. One such field anywhere makes
         // comma placement runtime state (a `first` flag); an all-required
-        // shape keeps its separators baked into the label literals.
-        const droppable = fields.some((f) => this.undefinedArmTag2(f.type) >= 0);
+        // shape keeps its separators baked into the label literals. An
+        // index-signature shape ALSO forces the runtime flag (increment
+        // 17 stage B) — overflow entries have an unpredictable count, so
+        // static comma placement can never cover them.
+        const droppable = fields.some((f) => this.undefinedArmTag2(f.type) >= 0) || info.overflow !== null;
         if (!droppable) {
           for (let i = 0; i < fields.length; i++) {
             const f = fields[i]!;
@@ -2186,6 +2566,105 @@ class Assembler {
           c.structGet(info.struct, slot);
           c.call(inner);
           if (utag >= 0) c.end();
+        }
+        if (info.overflow !== null) {
+          // OVERFLOW entries in JS own-key order, after every declared
+          // field (nodes.ts's IrRecordShape.indexValue doc: "JSON
+          // serialization appends overflow entries after the declared
+          // fields in insertion order" — "insertion order" there means
+          // keysJsOrder's own contract, not raw dense order). An overflow
+          // value holding undefined drops from the output entirely,
+          // exactly like `JSON.stringify({a: undefined})` omits `a` — the
+          // same rule the declared-field loop above applies via `utag`.
+          // TWO disjoint cases, both needed (a dyn-valued signature and a
+          // concretely-typed one with its own undefined arm, e.g. `[k:
+          // string]: number | undefined`, are different representations):
+          // a `dyn` slot carries no arm to test, so the drop reads runtime
+          // identity against the dyn undefined singleton; a union-typed
+          // slot tests its tag exactly like `utag` does above, off the
+          // shared union base struct.
+          const ovfType = shape.indexValue!;
+          const ovfWriter = this.jsonWriteHelper(ovfType, loc);
+          if (ovfWriter === null) return false;
+          const keysArrType: IrType = { kind: "array", elem: { kind: "string" } };
+          const keysVec = this.vecInfoFor(keysArrType, loc);
+          if (keysVec === null) return false;
+          const keys = this.wlocal(w, this.vecs.vecRef(keysVec));
+          c.localGet(0);
+          c.structGet(info.struct, info.fieldIndex.size);
+          c.call(this.maps.keysJsOrder(info.overflow, keysVec.struct, keysVec.bufType));
+          c.localSet(keys);
+          const oi = this.wlocal(w, I32);
+          const on = this.wlocal(w, I32);
+          const okey = this.wlocal(w, keysVec.elemVal);
+          const oval = this.wlocal(w, info.overflow.valVal);
+          c.localGet(keys);
+          c.structGet(keysVec.struct, 0);
+          c.localSet(on);
+          c.i32Const(0);
+          c.localSet(oi);
+          c.block();
+          c.loop();
+          c.localGet(oi);
+          c.localGet(on);
+          c.i32GeS();
+          c.brIf(1);
+          c.localGet(keys);
+          c.structGet(keysVec.struct, 1);
+          c.localGet(oi);
+          this.vecs.emitElemRead(c, keysVec);
+          c.localSet(okey);
+          // The found flag is always true here — okey came from this
+          // exact map's own keysJsOrder scan moments ago, and nothing
+          // else runs (no user code, no async gap) between that scan
+          // and this read to mutate it.
+          c.localGet(0);
+          c.structGet(info.struct, info.fieldIndex.size);
+          c.localGet(okey);
+          c.call(this.maps.get(info.overflow));
+          c.localSet(oval);
+          c.drop();
+          const dropUndefined = ovfType.kind === "dyn";
+          const ovfUtag = this.undefinedArmTag2(ovfType);
+          if (dropUndefined) {
+            c.localGet(oval);
+            c.globalGet(this.dyn.undefinedGlobal());
+            c.refEq();
+            c.i32Eqz();
+            c.ifVoid();
+          } else if (ovfUtag >= 0) {
+            c.localGet(oval);
+            c.structGet(this.unions.base(), 0);
+            c.i32Const(ovfUtag);
+            c.i32Ne();
+            c.ifVoid();
+          }
+          c.localGet(first);
+          c.i32Eqz();
+          c.ifVoid();
+          c.i32Const(0x2c);
+          c.call(json.jbPutc());
+          c.end();
+          c.i32Const(0);
+          c.localSet(first);
+          c.localGet(okey);
+          c.call(json.jbPutStr());
+          c.i32Const(0x3a);
+          c.call(json.jbPutc());
+          if (edgeable(ovfType)) {
+            c.localGet(okey);
+            c.call(json.jbEdgeProp());
+          }
+          c.localGet(oval);
+          c.call(ovfWriter);
+          if (dropUndefined || ovfUtag >= 0) c.end();
+          c.localGet(oi);
+          c.i32Const(1);
+          c.i32Add();
+          c.localSet(oi);
+          c.br(0);
+          c.end();
+          c.end();
         }
         this.pushStrLitInto(c, "}");
         c.call(json.jbPuts());
@@ -2584,6 +3063,22 @@ class Assembler {
         const shape = this.recordShapes.get(t.shapeId);
         const info = this.recordInfo(t.shapeId, loc, false);
         if (shape === undefined || info === null) return false;
+        if (shape.indexValue !== undefined) {
+          // Increment-17 stage B lifted recordInfo's blanket refusal for
+          // hybrid shapes, but this walker only ever validated/built the
+          // DECLARED fields — a hybrid shape's dynCheck needs WIDTH
+          // CAPTURE (undeclared keys inserted into the overflow, values
+          // checked against indexValue), explicitly stage C's job
+          // ("dyn.ts CHECK/MATCH walkers gain index-signature arms").
+          // Without it this walker would leave the overflow field at its
+          // struct default and silently drop every extra dyn key instead
+          // of capturing it — a miscompile, not a refusal — so guard
+          // explicitly exactly like dynMatch's own
+          // `dynMatch:record:index-signature` precedent for the sibling
+          // walker (dynMatch:2349-2357).
+          this.refuse("dynCheck:record:index-signature", loc);
+          return false;
+        }
         if (shape.tuple) {
           const fields = this.tupleFieldOrder(shape);
           kindGuard(DK.ARR);
@@ -4172,6 +4667,55 @@ class Assembler {
         return;
       }
 
+      case "recordKeySet": {
+        const objT = s.obj.type;
+        if (objT.kind !== "record") throw new Error("recordKeySet on a non-record receiver");
+        if (s.overflowOnly === true) {
+          // A LITERAL key naming no declared field: a pure overflow
+          // insert — no helper, no validation, no throw (nodes.ts's own
+          // contract for this flag).
+          const info = this.recordInfo(objT.shapeId, s.loc, false);
+          if (info === null) return;
+          if (info.overflow === null) {
+            throw new Error(`emitter bug: recordKeySet overflowOnly on non-hybrid shape ${objT.shapeId}`);
+          }
+          this.walkExpr(s.obj);
+          code.structGet(info.struct, info.fieldIndex.size);
+          this.walkExpr(s.key);
+          this.walkExpr(s.value);
+          code.call(this.maps.set(info.overflow));
+          return;
+        }
+        const helper = this.recordKeySetHelper(objT.shapeId, s.loc);
+        if (helper === null) return;
+        this.walkExpr(s.obj);
+        this.walkExpr(s.key);
+        this.walkExpr(s.value);
+        code.call(helper);
+        // MAY THROW: a dyn-valued declared field validating, or a
+        // signature-free shape's key MISS — may-throw.ts's own condition,
+        // mirrored (overflowOnly is handled entirely above).
+        const shape = this.recordShapes.get(objT.shapeId);
+        if (shape !== undefined && (shape.indexValue === undefined || (shape.indexValue.kind === "dyn" && shape.fields.length > 0))) {
+          this.emitPendingCheck();
+        }
+        return;
+      }
+
+      case "recordKeyDelete": {
+        const objT = s.obj.type;
+        if (objT.kind !== "record") throw new Error("recordKeyDelete on a non-record receiver");
+        const info = this.recordInfo(objT.shapeId, s.loc, false);
+        if (info === null) return;
+        if (info.overflow === null) throw new Error(`emitter bug: recordKeyDelete on non-hybrid shape ${objT.shapeId}`);
+        this.walkExpr(s.obj);
+        code.structGet(info.struct, info.fieldIndex.size);
+        this.walkExpr(s.key);
+        code.call(this.maps.deleteM(info.overflow));
+        code.drop(); // the STATEMENT form discards the found/removed bool
+        return;
+      }
+
       /* Field writes, the fieldGet twin: the builtin errors' writable
        * members (`e.name = "Custom"`) are errT's own slots, an emitted
        * class's are its struct's. */
@@ -4195,12 +4739,9 @@ class Assembler {
         return;
       }
 
-      /* Stores into composites — each waits on the GC shape of the thing
-       * being written (bytes on the typed-array runtime, the recordKey
-       * pair on the overflow map). */
+      /* Stores into composites still waiting on the GC shape of the thing
+       * being written (bytes on the typed-array runtime). */
       case "bytesSet":
-      case "recordKeySet":
-      case "recordKeyDelete":
         this.refuse(`stmt:${s.kind}`, s.loc);
         break;
 
@@ -5206,12 +5747,41 @@ class Assembler {
         const rec = this.acquireScratch(recRef);
         code.structNewDefault(info.struct);
         code.localSet(rec);
+        if (info.overflow !== null) {
+          // Hybrid shape: the overflow map is ALWAYS a fresh empty map at
+          // construction (C does the same — scr_object.c's newFn), set
+          // BEFORE any field value evaluates (allocation itself has no
+          // observable effects, so this is safe ahead of source order —
+          // increment-17 stage A's mapNew seed-pair contract: "construct
+          // empty, then interleave writes"). The field's declared wasm
+          // type is nullable (structNewDefault needs every field
+          // defaultable, and a non-nullable ref never is) — this write is
+          // what keeps it non-null in practice for every later read.
+          code.localGet(rec);
+          code.call(this.maps.new_(info.overflow));
+          code.structSet(info.struct, info.fieldIndex.size);
+        }
         for (const f of e.fields) {
           if (f.drop === true) {
             // The mapping dropped this field: the expression still runs
             // in its source-order slot; nothing stores.
             this.walkExpr(f.value);
             if (f.value.type.kind !== "void") code.drop();
+            continue;
+          }
+          if (f.overflow === true) {
+            // An undeclared key of a hybrid shape — insert into the
+            // overflow map in list order, interleaved with declared
+            // writes (nodes.ts's recordLit doc: "one list keeps JS
+            // source-order evaluation").
+            if (info.overflow === null) {
+              throw new Error(`wasm emitter bug: recordLit overflow field ${f.name} on non-hybrid shape ${e.type.shapeId}`);
+            }
+            code.localGet(rec);
+            code.structGet(info.struct, info.fieldIndex.size);
+            this.pushStrLit(f.name);
+            this.walkExpr(f.value);
+            code.call(this.maps.set(info.overflow));
             continue;
           }
           const idx = info.fieldIndex.get(f.name);
@@ -5235,6 +5805,41 @@ class Assembler {
         if (idx === undefined) throw new Error(`recordGet field ${e.field} not on shape ${e.shapeId}`);
         this.walkExpr(e.obj);
         code.structGet(info.struct, idx);
+        return;
+      }
+
+      case "recordKeyGet": {
+        const objT = e.obj.type;
+        if (objT.kind !== "record") throw new Error("recordKeyGet on a non-record receiver");
+        const helper = this.recordKeyGetHelper(objT.shapeId, e.type, e.overflowOnly === true, e.loc);
+        if (helper === null) {
+          code.unreachable();
+          return;
+        }
+        this.walkExpr(e.obj);
+        this.walkExpr(e.key);
+        code.call(helper);
+        return;
+      }
+
+      case "recordOvfKeys": {
+        const objT = e.obj.type;
+        if (objT.kind !== "record") throw new Error("recordOvfKeys on a non-record receiver");
+        const info = this.recordInfo(objT.shapeId, e.loc, false);
+        if (info === null) {
+          code.unreachable();
+          return;
+        }
+        if (info.overflow === null) throw new Error(`emitter bug: recordOvfKeys on non-hybrid shape ${objT.shapeId}`);
+        if (e.type.kind !== "array") throw new Error("recordOvfKeys result is not an array");
+        const vecInfo = this.vecInfoFor(e.type, e.loc);
+        if (vecInfo === null) {
+          code.unreachable();
+          return;
+        }
+        this.walkExpr(e.obj);
+        code.structGet(info.struct, info.fieldIndex.size);
+        code.call(this.maps.keysJsOrder(info.overflow, vecInfo.struct, vecInfo.bufType));
         return;
       }
 
@@ -5770,11 +6375,22 @@ class Assembler {
         let resultT: ValType | null = null;
         let shortGlobal = -1;
         if (!isVoid) {
-          if (e.type.kind !== "union") throw new Error("optChain result is not a union");
-          const utag = this.undefinedArmTag(e.type.unionId);
-          if (utag < 0) throw new Error("optChain result union lacks an undefined arm");
-          resultT = this.unions.baseRef();
-          shortGlobal = this.unions.unitGlobal(utag);
+          if (e.type.kind === "dyn") {
+            // A dyn-typed chain body (e.g. `maybe(x)?.["k"]` over an
+            // unknown-valued index signature): the union RECEIVER still
+            // narrows the normal way, but the result itself is dyn — dyn
+            // represents undefined directly, so the short-circuit answer
+            // is the dyn undefined singleton, not a union unit arm. Matches
+            // the C/LLVM lane's emit-exprs.ts optChain dyn-result branch.
+            resultT = this.dyn.dynRef();
+            shortGlobal = this.dyn.undefinedGlobal();
+          } else {
+            if (e.type.kind !== "union") throw new Error("optChain result is not a union");
+            const utag = this.undefinedArmTag(e.type.unionId);
+            if (utag < 0) throw new Error("optChain result union lacks an undefined arm");
+            resultT = this.unions.baseRef();
+            shortGlobal = this.unions.unitGlobal(utag);
+          }
         }
         const u = this.acquireScratch(this.unions.baseRef());
         this.walkExpr(e.receiver);
@@ -7505,9 +8121,6 @@ class Assembler {
       /* Classes: the class-as-a-VALUE surface (its own object type with a
        * construct thunk) and virtual dispatch (vtables). */
       /* Record shapes. */
-      /* The dynamic-keyed record surface rides the overflow map. */
-      case "recordKeyGet":
-      case "recordOvfKeys":
       /* The dyn surface past the scalar core: the composite converters,
        * the keyed reads, and the invoke boundary. */
       case "dynFromJsval":
@@ -7593,14 +8206,17 @@ class Assembler {
 
   private mapsField: MapBuilder | null = null;
 
-  /** The Map/Set compact-dict machinery (maps.ts), deps injected — just
-   * strEq/strType for string-keyed hashing/equality (map/set intrinsics
-   * never throw and never format, so nothing else is needed the way
-   * dyn/json/insp pull in error/ToString helpers). */
+  /** The Map/Set compact-dict machinery (maps.ts), deps injected: strEq/
+   * strType for string-keyed hashing/equality (map/set intrinsics never
+   * throw and never format, so nothing else is needed the way dyn/json/
+   * insp pull in error/ToString helpers), plus idxKey — increment 17
+   * stage B's index-signature overflow store needs dyn.ts's own-key-order
+   * predicate for keysJsOrder, shared rather than reimplemented. */
   private get maps(): MapBuilder {
     this.mapsField ??= new MapBuilder(this.mb, {
       strEq: () => this.strEqHelper(),
       strType: () => this.strType,
+      idxKey: () => this.dyn.idxKey(),
     });
     return this.mapsField;
   }
@@ -7856,7 +8472,7 @@ class Assembler {
         }
         if (
           k === "array" || k === "func" || k === "record" || k === "object" || k === "promise" ||
-          k === "classval"
+          k === "classval" || k === "map" || k === "set"
         ) {
           // Reference identity — JS object/function equality exactly.
           // Every one of these is a GC struct or array reference and
@@ -7870,7 +8486,13 @@ class Assembler {
           // intern, so `f === f` holds. Promises are ONE struct whatever
           // their inner type (promises.ts), so promise identity is the
           // same single comparison — and `p.then()` mints a fresh one, so
-          // `p.then() === p` is false here exactly as in Node.
+          // `p.then() === p` is false here exactly as in Node. Map/Set:
+          // maps.ts's map struct is a plain GC ref like the others — `new
+          // Map() === new Map()` is false (two fresh structs), and a
+          // Set<T>/Map<T,number> pair that happen to share one MapInfo
+          // (maps.ts's "ONE representation" collapse) are still each
+          // their OWN struct instance at CONSTRUCTION time, so identity
+          // stays honest even though their wasm TYPE is shared.
           //
           // The representation has to be REAL: an operand whose type the
           // tier cannot spell holds a placeholder i32, and `ref.eq` over

@@ -154,6 +154,28 @@ the `undefined` answer. **Tested by:** the wasm emitter unit test (a corpus
 program cannot cover it — every backend diverges from Node the same way, so
 there is no byte-exact lane to compare).
 
+**Amendment (increment 17, index-signature records):** the SAME
+trust-but-verify mechanism covers a second site — a dynamic-keyed write
+`r[k] = v` on a hybrid (index-signature) record shape, when the runtime key
+`k` happens to name a DECLARED field whose static type is narrower than the
+index signature's `unknown`/`dyn` value type `v` arrives as. Node just
+stores whatever `v` is (`r.known = "not a number"` works). Here the write
+validates `v` against the declared field's type through the identical
+dynCheck machinery `e as C` uses, and a mismatch throws the catchable
+`TypeError: expected <type> at $.<field>, got <type>` with the field left
+untouched, instead of corrupting a monomorphic struct slot with a value of
+the wrong representation. Measured on Node 24.18 against the C lane: given
+`interface Mixed { known: number; [k: string]: unknown }` and
+`function setKey(r: Mixed, k: string, v: unknown) { r[k] = v; }`,
+`setKey(r, "known", "not a number")` runs silently on Node (`r.known`
+becomes the string `"not a number"`) and throws
+`expected number at $.known, got string` here (C and wasm agree
+byte-for-byte), leaving `r.known` at its prior value. **Tested by:** the
+wasm emitter unit test; the C/LLVM lanes have exercised this exact dynCheck
+path since index-signature records first shipped there, so this note
+documents the wasm tier joining an ALREADY-registered divergence rather
+than opening a new one.
+
 ## S010 — Wasm tier: an unhandled promise rejection reports as a trap; stderr is not Node's
 
 A promise that is REJECTED and never observed — nothing awaited it, and no
@@ -1162,3 +1184,153 @@ tractable, and a different increment.
 bare promise and from one nested inside a tree (so the unwind crosses frames
 the render left open), followed by two further renders that must come out
 byte-identical to Node, which is what pins the reset.
+
+## S031 — Hybrid record own-key order is declared-then-overflow, not Node's single interleave *(inherited)*
+
+A record with an index signature (`{ known: number; [k: string]: number }`)
+keeps its declared fields as struct slots and its undeclared keys in an
+embedded overflow map (`IrRecordShape.indexValue`). Every own-key surface —
+`Object.keys`/`values`/`entries`, `for...in`, `JSON.stringify`,
+`util.inspect` — enumerates the DECLARED fields first (in `declaredOrder`),
+then the overflow's own keys (integer-like keys ascending, then insertion
+order — `%w.map.keysJsOrder`, `scr_map_keys_js_order`). Node has no such
+split: every property lives in ONE ordered table, and JS own-key order puts
+integer-like keys ascending FIRST across every property regardless of
+where — declared or dynamically added — it came from, then the rest in
+insertion order.
+
+The two orders can disagree whenever an integer-like key is added
+DYNAMICALLY on a shape that also has declared (non-integer-like) fields —
+the declared field sorts before the integer-like overflow key here, but
+Node sorts the integer-like key first regardless of which "store" (JS has
+none) it lives in. Measured on Node 24.18 against the C lane:
+`interface Basic { known: number; [k: string]: number }`,
+`const r: Basic = { known: 1 }; r.b = 2; r["3"] = 3; r.a = 4; r["1"] = 5;`
+— `Object.keys(r)` is `['1', '3', 'known', 'b', 'a']` on Node and
+`['known', '1', '3', 'b', 'a']` here (C and wasm agree byte-for-byte, as
+does `for...in`). `JSON.stringify(r)` shows the identical split:
+`{"1":5,"3":3,"known":1,"b":2,"a":4}` on Node,
+`{"known":1,"1":5,"3":3,"b":2,"a":4}` here.
+
+**Rationale:** inherited from the C/LLVM lanes, present since index-
+signature records first shipped there — this is the wasm tier's FIRST
+registration of a cross-lane divergence that predates it, the S027
+pattern ("an existing native-lane behavior gets its first SEMANTICS.md
+entry when a new lane adopts it"). A C-side comment cites an upstream
+scriptc register entry ("SEMANTICS.md 36") for this exact gap, but that
+register was never shipped and this file has no corresponding numbered
+entry until now. Unifying declared and overflow keys into one ordered
+table (matching Node exactly) means tracking insertion order across BOTH
+stores as one sequence — a real fix, not a quick one, and out of scope for
+the increment that first makes hybrid shapes representable at all.
+**Tested by:** the wasm emitter unit test (declared-then-overflow order,
+pinned directly, including the integer-like-first rule within the overflow
+half); no corpus program can pin the Node-DIVERGENT order — a corpus
+program's output must match Node byte-for-byte by definition, so a program
+exercising this exact split would fail the differential on every lane.
+
+**Amendment (increment 17, index-signature records): `__proto__` is an
+ordinary own key here, not the prototype accessor.** A dynamic-keyed write
+naming `"__proto__"` — `r["__proto__"] = v` — stores an ordinary overflow
+entry keyed `"__proto__"` on every lane here. Node instead routes the
+bracket write through `Object.prototype`'s `__proto__` ACCESSOR: assigning
+a non-object, non-null value is a silent no-op (the setter's own contract),
+so no own property named `"__proto__"` is ever created there. Measured on
+Node 24.18: `interface U { [k: string]: number }`, `const r: U = {}; r.a =
+1; r["__proto__"] = 99; r.b = 2;` — `Object.keys(r).join("|")` is `a|b` on
+Node (the write to `__proto__` vanished) and `a|__proto__|b` here (C and
+wasm agree byte-for-byte), and `JSON.stringify(r)` is `{"a":1,"b":2}` on
+Node versus `{"a":1,"__proto__":99,"b":2}` here. The read side shows the
+same split from the other direction: `r["__proto__"]` reads back the
+stored value (`99`) here, while on Node it reads the `__proto__` accessor's
+GETTER half — the object's actual prototype, `[Object: null prototype] {}`
+when printed (C-lane measurement covers this too). This split is NOT new to
+this increment — the identical divergence already existed at HEAD on the
+plain dyn-object surface (an untyped `const r = {}; r["__proto__"] = 99;`
+in a `.js` module measures identically: `a|b` / `{"a":1,"b":2}` on Node,
+`a|__proto__|b` / `{"a":1,"__proto__":99,"b":2}` on C and wasm) — index-
+signature records simply WIDEN an already-registered gap onto a second own-
+key surface rather than opening a new one, the S027 pattern this entry
+itself already follows for the ordering split above. **Rationale:**
+neither the record overflow map nor the dyn object's own-key table special-
+cases any key string; replicating `Object.prototype.__proto__`'s accessor
+semantics would mean every dynamic-keyed write on every dyn/overflow
+surface first checking the key against a reserved-name list, for a
+JavaScript legacy accessor this compiler's object model has no equivalent
+of. **Tested by:** the wasm emitter unit test (the record-overflow surface
+pin lives beside the ordering pin above; the dyn-object surface has no
+NEW pin since the gap predates this increment).
+
+## S032 — A dynamic-keyed record read with no representable "missing" answer TRAPS *(wasm tier)*
+
+`r[k]` on a record — hybrid (index-signature) or a signature-free shape
+whose declared fields share one common type — checks declared fields
+first, then (hybrid shapes) the overflow map. When neither answers, JS
+returns `undefined`. This tier can only do that when the CHECKER'S result
+type for the access can actually hold undefined: `unknown` (the checked-
+dynamic box has its own undefined singleton) or an undefined-armed union
+(`V | undefined`, from `noUncheckedIndexedAccess` or an explicit
+annotation). When the checker claims a bare `V` with no undefined arm,
+reading a missing key TRAPS instead of returning a value that violates its
+own claimed type — S003's out-of-bounds stance (an array read past its
+length can't answer `undefined` either, for the identical reason) applied
+to the record surface.
+
+Measured on Node 24.18 against the C lane: `interface Basic { known:
+number; [k: string]: number }`, `const r: Basic = { known: 1 };
+console.log(r.missing)` prints `undefined` on Node and traps here — C with
+`scriptc: TypeError: record has no key 'missing' (typed 'number' — no
+undefined is representable)` before aborting, wasm with a bare
+`unreachable` (S007's trap-report bridge; the differential harness skips
+the stderr comparison on a nonzero exit for exactly this reason — the two
+lanes' trap TEXT differs, only the exit code and preceding stdout need to
+match, and they do). This access is normally UNREACHABLE without an `as`
+smuggle or `noUncheckedIndexedAccess` being off: `Basic`'s index signature
+makes `keyof Basic` admit every string, so `r.missing` type-checks only
+because the checker is (soundly, by TS's own design point) not tracking
+that `missing` is absent.
+
+**Rationale:** S003's array-OOB stance, extended to the one other place a
+statically-typed read can be asked to answer a value its own type
+forbids. **Tested by:** the wasm emitter unit test — the trap fires on the
+non-representable path, and the SAME miss under an explicit `V | undefined`
+index-signature annotation (the IDENTITY branch: the checker's result type
+already carries its own undefined arm, so the emitter needs no union-WRAP
+step) correctly returns the interned undefined arm instead of trapping.
+`noUncheckedIndexedAccess` takes a DIFFERENT emitter path — the flag
+answers a bare `V` index value by wrapping it in a fresh `V | undefined`
+union rather than reading one already on the type — and while that path is
+measured to answer the same way (follow-up task #8 tracks giving it its
+own pin), no pin covers it today. No corpus program can pin the trap
+itself for the same S003 reason.
+
+## S033 — A dynamic-keyed write naming no declared field on a signature-free record throws *(wasm tier)*
+
+`r[k] = v` reaches this construct for a shape with NO index signature only
+when every declared field shares exactly one common type (the frontend's
+own gate for accepting the write at all — SC1090 otherwise; the "mockable
+module" pattern, `Record`-shaped closures dispatched by name, is the
+corpus's live example, `tests/corpus/2470-mockable-module-shape.js`). Node
+adds `k` as a new property when it names no existing one — ordinary
+dynamic-object behavior. This tier's record is a monomorphic struct with a
+FIXED field set; there is no slot to add. The write instead throws a
+catchable `TypeError` reading `Cannot add property '<key>' to a
+fixed-shape object`, and stores nothing.
+
+Measured on Node 24.18 against the C lane (corpus 2470 exercises only the
+success path, behind its own `Object.hasOwn` guard, so this needed a
+dedicated probe): given a `{ tick: ... }`-shaped record and a `setKey`
+helper doing `mocked[functionality] = implementation`, writing an
+undeclared key runs silently on Node (adds the property) and throws
+`TypeError: Cannot add property 'nope' to a fixed-shape object` here — C
+and wasm agree on the exact text.
+
+**Rationale:** the monomorphic-struct divergence every fixed-shape write
+shares — this construct is simply the first place a COMPUTED key makes
+"does this slot exist" a runtime question rather than one the checker
+resolves at compile time (a literal-key `recordSet`/`fieldSet` never
+reaches this path at all). **Tested by:** the wasm emitter unit test;
+may-throw.ts's `!shape.indexValue` seed has required every native-lane
+caller to check the pending-exception cell after this call since
+index-signature records first shipped, so the wasm tier's implementation
+needed no NEW may-throw work, only matching the existing contract.

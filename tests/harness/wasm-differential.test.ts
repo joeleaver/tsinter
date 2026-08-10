@@ -1097,6 +1097,54 @@ const TIER_FLOOR: string[] = [
   "2368-set-methods.ts",
   "2486-recursive-record-boundaries.ts",
   "2533-forof-destructuring.ts",
+  // Increment 17 stage A rider: bin:ref-eq for map/set-typed ===/!==
+  // (ref.eq identity, joining the array/func/record/object/promise/
+  // classval arm that already existed) — both flagship map/set corpus
+  // programs needed it.
+  "520-map-basics.ts",
+  "526-set-basics.ts",
+  // Increment 17 stage B (index-signature records): the overflow store —
+  // a record's `[key: string]: V` slice reuses maps.ts's compact dict
+  // verbatim (one Map<string,V>-shaped struct trailing the declared
+  // fields), so hybrid shapes get BOTH struct-slot fields and an
+  // embedded map with no second implementation. recordKeySet/Get/Delete
+  // and the JSON.stringify overflow-appending fix (a real miscompile:
+  // overflow keys were silently dropped) land here, plus the
+  // recordKeyGet-into-optChain fix for a dyn-typed chain body (`dyn`
+  // represents its own undefined, so a union-receiver optChain whose
+  // BODY is dyn-typed short-circuits to the dyn undefined singleton,
+  // not a union unit arm — see the optChain case in emitter.ts).
+  // recordKeySet/Delete also serve signature-free shapes with a single
+  // uniform field type (the "mockable module" pattern, confirmed via
+  // lower-exprs.ts and corpus 2470) — not just true index signatures.
+  // Own-key order on hybrid shapes (declared-then-overflow) diverges
+  // from Node's single interleave; registered as S031 (inherited from
+  // the existing C lane, not introduced here). S032/S033 register the
+  // trap-on-unrepresentable-miss and fixed-shape-write-refusal wasm-tier
+  // behaviors; S009 gained an amendment for dyn-value validation on
+  // hybrid shapes.
+  "908-records-index-signatures.ts",
+  "911-records-index-dot-access.ts",
+  "1542-record-literal-into-union.ts",
+  "1545-spread-order-and-optional.ts",
+  "1547-computed-key-fold.ts",
+  "1548-boolean-condition-forms.ts",
+  "1555-index-spread-into-declared.ts",
+  "1576-width-coercions.ts",
+  "1642-object-fromentries-rows.ts",
+  "1790-computed-key-folds.ts",
+  "1880-json-declared-field-order.ts",
+  "2022-width-index-capture.ts",
+  "2075-index-signature-runtime-keys.ts",
+  "2090-index-signature-number-keys.ts",
+  "2091-index-signature-string-intersection.ts",
+  "2364-in-runtime-key.ts",
+  "2370-group-by.ts",
+  "2433-as-const-command-tables.ts",
+  "2470-mockable-module-shape.js",
+  "2550-generics-keyof-pick.ts",
+  "2556-width-hybrid-shapes.ts",
+  "2559-index-signature-container-values.ts",
 ];
 
 interface RunResult {
