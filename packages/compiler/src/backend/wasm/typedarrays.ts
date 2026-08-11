@@ -5856,4 +5856,586 @@ export class BytesBuilder {
       return idx;
     });
   }
+
+  /* ── increment 18 stage C, round R1: DataView — dataViewNew, the
+   * dvGet* / dvSet* integer + float families, the flat OOB RangeError, and
+   * BigUint64/BigInt64-as-Number. DataView collapses to bytes<u8> at the
+   * IR level (nodes.ts:1448's contract): any elem kind may be the
+   * RECEIVER of dataViewNew via `.buffer` — a DataView views raw bytes
+   * regardless of what typed array produced them, and this tier's ONE
+   * shared byte-granular $bytes representation makes that aliasing exact
+   * for free (no separate "DataView storage" concept needed) — so only
+   * dataViewNew is elem-templated; every dvGet* / dvSet* method operates on
+   * an ALREADY-CONSTRUCTED u8-elem struct (the view dataViewNew returns),
+   * needing no esize scaling of its own.
+   *
+   * Measured directly against Node before writing anything (this
+   * increment's standing rule): DataView's bounds contracts are
+   * CONSISTENTLY more lenient than Buffer's stage-B ladders — every
+   * offset/length argument ToIndex-truncates toward zero (NOT floor) and
+   * treats NaN as 0 BEFORE any range check runs, so a non-integer or NaN
+   * offset/length never throws on its own, only an out-of-range
+   * TRUNCATED value does. get/set OOB is a single FLAT CONSTANT message,
+   * "Offset is outside the bounds of the DataView", identical across
+   * every width and both directions — no name/min/max parameterization
+   * the way Buffer's readNum/writeNum ladder has. dvSet* integer kinds
+   * have NO value-range RangeError at all (measured: `setInt8(0, 300)`
+   * succeeds, silently wrapping to 44 via the same modular ToInt32/
+   * ToUint32 stage A already implements) — only the offset can throw.
+   * dvSetFloat32/64 inherit stage B's bit-exact PASSTHROUGH design
+   * unchanged (SEMANTICS.md S036 — NaN provenance is a folding-boundary
+   * concern, orthogonal to this file). ───────────────────────────────── */
+
+  /** %w.bytes.dvBoundsError — (); throws Node's CONSTANT "Offset is
+   * outside the bounds of the DataView" RangeError — measured flat text,
+   * no dynamic parts, identical across every dvGet* / dvSet* method and
+   * both directions (unlike Buffer's readNum/writeNum ladder). VOID —
+   * mirrors setFromHelper's shared-constant-message shape; every caller
+   * pushes its own dummy result (or none, if void) and `return_()`s
+   * immediately after. */
+  private dvBoundsErrorHelper(): number {
+    return this.cached("dvBoundsError", () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([], []), "%w.bytes.dvBoundsError");
+      const c = new Code();
+      this.deps.throwError(
+        c,
+        "%RangeError",
+        "RangeError",
+        (x) => this.deps.lit(x, "Offset is outside the bounds of the DataView"),
+        null,
+      );
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  /** Shared CODEGEN (not a callable wasm function — like emitIndexCheck/
+   * emitRelIndex, every caller inlines this) for dvGet* / dvSet*'s offset
+   * validation. Computes OFFT (locals: OFFARG in; OFFT/RECVBYTES out,
+   * caller-owned) and, on failure, calls dvBoundsErrorHelper, runs
+   * `pushDummy` (f64Const(0) for a getter's F64 result; a no-op for a
+   * void setter), and `return_()`s. `width` is the access size in bytes
+   * (1/2/4/8) — the offset-negative and offset+width-past-the-end cases
+   * share the ONE flat message (measured: no separate wording for
+   * either cause). */
+  private emitDvOffsetCheck(
+    c: Code,
+    V: number,
+    OFFARG: number,
+    OFFT: number,
+    RECVBYTES: number,
+    width: number,
+    pushDummy: () => void,
+  ): void {
+    c.localGet(V);
+    c.structGet(this.bytesType(), BLEN);
+    c.f64ConvertI32S();
+    c.localSet(RECVBYTES);
+    c.localGet(OFFARG);
+    c.localGet(OFFARG);
+    c.f64Ne();
+    c.ifResult(F64);
+    c.f64Const(0);
+    c.else_();
+    c.localGet(OFFARG);
+    c.f64Trunc();
+    c.end();
+    c.localSet(OFFT);
+    c.localGet(OFFT);
+    c.f64Const(0);
+    c.f64Lt();
+    c.localGet(OFFT);
+    c.f64Const(width);
+    c.f64Add();
+    c.localGet(RECVBYTES);
+    c.f64Gt();
+    c.i32Or();
+    c.ifVoid();
+    {
+      c.call(this.dvBoundsErrorHelper());
+      pushDummy();
+      c.return_();
+    }
+    c.end();
+  }
+
+  /** The DataView integer method name → (width, signed, hasLE) — hasLE
+   * marks the multi-byte kinds whose wasm signature carries a runtime
+   * `littleEndian` i32 (u8/i8 take none, matching DV_GETTERS/DV_SETTERS'
+   * own `le` field in lower-containers.ts). */
+  private parseDvIntMethod(method: string): { width: number; signed: boolean; hasLE: boolean } {
+    switch (method) {
+      case "dvGetUint8":
+      case "dvSetUint8":
+        return { width: 1, signed: false, hasLE: false };
+      case "dvGetInt8":
+      case "dvSetInt8":
+        return { width: 1, signed: true, hasLE: false };
+      case "dvGetUint16":
+      case "dvSetUint16":
+        return { width: 2, signed: false, hasLE: true };
+      case "dvGetInt16":
+      case "dvSetInt16":
+        return { width: 2, signed: true, hasLE: true };
+      case "dvGetUint32":
+      case "dvSetUint32":
+        return { width: 4, signed: false, hasLE: true };
+      case "dvGetInt32":
+      case "dvSetInt32":
+        return { width: 4, signed: true, hasLE: true };
+      default:
+        throw new Error(`typedarrays.ts bug: dv int method '${method}' reached parseDvIntMethod unguarded`);
+    }
+  }
+
+  /** %w.bytes.<dvGetUint8|dvGetInt8|dvGetUint16|dvGetInt16|dvGetUint32|
+   * dvGetInt32> — (bytes<u8>, f64 offset[, i32 littleEndian]) → f64. The
+   * littleEndian param is RUNTIME (unlike Buffer's readNum, whose BE/LE
+   * choice is compile-time-known from the method NAME) — assembled via
+   * emitAssembleI32 called from BOTH arms of a runtime `if`, each arm
+   * writing the SAME BITS local, so no stack-balance trickery is needed
+   * to merge the two branches (mirrors writeNumVarHelper's runtime-width
+   * pattern). u8/i8 take no LE arg at all — width 1 makes byte order
+   * moot, so emitAssembleI32 runs with a fixed `le` (either value gives
+   * the same single-byte result). */
+  dvGetIntHelper(method: string): number {
+    const { width, signed, hasLE } = this.parseDvIntMethod(method);
+    return this.cached(method, () => {
+      const c = new Code();
+      let idx: number;
+      if (!hasLE) {
+        idx = this.mb.declareFunc(this.mb.funcType([this.bytesRef(), F64], [F64]), `%w.bytes.${method}`);
+        const V = 0, OFFARG = 1;
+        const OFFT = 2, RECVBYTES = 3, ADDR = 4, BUFL = 5, BITS = 6;
+        this.emitDvOffsetCheck(c, V, OFFARG, OFFT, RECVBYTES, width, () => c.f64Const(0));
+        c.localGet(V);
+        c.structGet(this.bytesType(), OFF);
+        c.localGet(OFFT);
+        c.i32TruncF64S();
+        c.i32Add();
+        c.localSet(ADDR);
+        c.localGet(V);
+        c.structGet(this.bytesType(), STORAGE);
+        c.localSet(BUFL);
+        this.emitAssembleI32(c, BUFL, ADDR, width, true, BITS);
+        if (signed) {
+          // width is always 1 here (u8/i8 never carry an LE param) —
+          // sign-extend from bit 7 up to bit 31 before f64ConvertI32S,
+          // the same shift-up/arithmetic-shift-down pattern the hasLE
+          // branch below uses for i16/i32.
+          c.localGet(BITS);
+          c.i32Const(32 - 8 * width);
+          c.i32Shl();
+          c.i32Const(32 - 8 * width);
+          c.i32ShrS();
+          c.localSet(BITS);
+        }
+        c.localGet(BITS);
+        if (signed) c.f64ConvertI32S();
+        else c.f64ConvertI32U();
+        this.mb.setBody(idx, [F64, F64, I32, this.bufRefNN(), I32], c.bytes());
+      } else {
+        idx = this.mb.declareFunc(this.mb.funcType([this.bytesRef(), F64, I32], [F64]), `%w.bytes.${method}`);
+        const V = 0, OFFARG = 1, LE = 2;
+        const OFFT = 3, RECVBYTES = 4, ADDR = 5, BUFL = 6, BITS = 7;
+        this.emitDvOffsetCheck(c, V, OFFARG, OFFT, RECVBYTES, width, () => c.f64Const(0));
+        c.localGet(V);
+        c.structGet(this.bytesType(), OFF);
+        c.localGet(OFFT);
+        c.i32TruncF64S();
+        c.i32Add();
+        c.localSet(ADDR);
+        c.localGet(V);
+        c.structGet(this.bytesType(), STORAGE);
+        c.localSet(BUFL);
+        c.localGet(LE);
+        c.ifVoid();
+        this.emitAssembleI32(c, BUFL, ADDR, width, true, BITS);
+        c.else_();
+        this.emitAssembleI32(c, BUFL, ADDR, width, false, BITS);
+        c.end();
+        if (signed && width < 4) {
+          c.localGet(BITS);
+          c.i32Const(32 - 8 * width);
+          c.i32Shl();
+          c.i32Const(32 - 8 * width);
+          c.i32ShrS();
+          c.localSet(BITS);
+        }
+        c.localGet(BITS);
+        if (signed) c.f64ConvertI32S();
+        else c.f64ConvertI32U();
+        this.mb.setBody(idx, [F64, F64, I32, this.bufRefNN(), I32], c.bytes());
+      }
+      return idx;
+    });
+  }
+
+  /** %w.bytes.<dvSetUint8|dvSetInt8|dvSetUint16|dvSetInt16|dvSetUint32|
+   * dvSetInt32> — (bytes<u8>, f64 offset, f64 value[, i32 littleEndian])
+   * → (); the getters' mirror. NO value-range RangeError (measured: DV
+   * setters never throw on the VALUE, only the offset) — `deps.toInt32()`
+   * (stage A's ECMA ToInt32/ToUint32) is the only value→bits step,
+   * exactly like the fixed-width Buffer writers' post-range-check
+   * truncation, just without the range check itself. */
+  dvSetIntHelper(method: string): number {
+    const { width, signed: _signed, hasLE } = this.parseDvIntMethod(method);
+    void _signed; // ToInt32 covers both signed/unsigned targets identically (modular truncation)
+    return this.cached(method, () => {
+      const c = new Code();
+      let idx: number;
+      if (!hasLE) {
+        idx = this.mb.declareFunc(this.mb.funcType([this.bytesRef(), F64, F64], []), `%w.bytes.${method}`);
+        const V = 0, OFFARG = 1, VALUE = 2;
+        const OFFT = 3, RECVBYTES = 4, ADDR = 5, BUFL = 6, BITS = 7;
+        this.emitDvOffsetCheck(c, V, OFFARG, OFFT, RECVBYTES, width, () => {});
+        c.localGet(V);
+        c.structGet(this.bytesType(), OFF);
+        c.localGet(OFFT);
+        c.i32TruncF64S();
+        c.i32Add();
+        c.localSet(ADDR);
+        c.localGet(V);
+        c.structGet(this.bytesType(), STORAGE);
+        c.localSet(BUFL);
+        c.localGet(VALUE);
+        c.call(this.deps.toInt32());
+        c.localSet(BITS);
+        this.emitScatterI32(c, BUFL, ADDR, width, true, BITS);
+        this.mb.setBody(idx, [F64, F64, I32, this.bufRefNN(), I32], c.bytes());
+      } else {
+        idx = this.mb.declareFunc(this.mb.funcType([this.bytesRef(), F64, F64, I32], []), `%w.bytes.${method}`);
+        const V = 0, OFFARG = 1, VALUE = 2, LE = 3;
+        const OFFT = 4, RECVBYTES = 5, ADDR = 6, BUFL = 7, BITS = 8;
+        this.emitDvOffsetCheck(c, V, OFFARG, OFFT, RECVBYTES, width, () => {});
+        c.localGet(V);
+        c.structGet(this.bytesType(), OFF);
+        c.localGet(OFFT);
+        c.i32TruncF64S();
+        c.i32Add();
+        c.localSet(ADDR);
+        c.localGet(V);
+        c.structGet(this.bytesType(), STORAGE);
+        c.localSet(BUFL);
+        c.localGet(VALUE);
+        c.call(this.deps.toInt32());
+        c.localSet(BITS);
+        c.localGet(LE);
+        c.ifVoid();
+        this.emitScatterI32(c, BUFL, ADDR, width, true, BITS);
+        c.else_();
+        this.emitScatterI32(c, BUFL, ADDR, width, false, BITS);
+        c.end();
+        this.mb.setBody(idx, [F64, F64, I32, this.bufRefNN(), I32], c.bytes());
+      }
+      return idx;
+    });
+  }
+
+  /** %w.bytes.<dvGetFloat32|dvGetFloat64> — (bytes<u8>, f64 offset, i32
+   * littleEndian) → f64. Both float getters DO carry the LE param
+   * (DV_GETTERS' `le: true` for both). Reuses stage B's exact reinterpret
+   * primitives (f32ReinterpretI32/f64PromoteF32 for the narrow kind,
+   * f64ReinterpretI64 for the wide one) — bit-exact passthrough, no NaN
+   * handling of any kind on the READ side (matches readNumFloatHelper). */
+  dvGetFloatHelper(method: "dvGetFloat32" | "dvGetFloat64"): number {
+    const width = method === "dvGetFloat32" ? 4 : 8;
+    return this.cached(method, () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.bytesRef(), F64, I32], [F64]), `%w.bytes.${method}`);
+      const c = new Code();
+      const V = 0, OFFARG = 1, LE = 2;
+      const OFFT = 3, RECVBYTES = 4, ADDR = 5, BUFL = 6, BITS32 = 7, BITS64 = 8;
+      this.emitDvOffsetCheck(c, V, OFFARG, OFFT, RECVBYTES, width, () => c.f64Const(0));
+      c.localGet(V);
+      c.structGet(this.bytesType(), OFF);
+      c.localGet(OFFT);
+      c.i32TruncF64S();
+      c.i32Add();
+      c.localSet(ADDR);
+      c.localGet(V);
+      c.structGet(this.bytesType(), STORAGE);
+      c.localSet(BUFL);
+      if (width === 4) {
+        c.localGet(LE);
+        c.ifVoid();
+        this.emitAssembleI32(c, BUFL, ADDR, 4, true, BITS32);
+        c.else_();
+        this.emitAssembleI32(c, BUFL, ADDR, 4, false, BITS32);
+        c.end();
+        c.localGet(BITS32);
+        c.f32ReinterpretI32();
+        c.f64PromoteF32();
+      } else {
+        c.localGet(LE);
+        c.ifVoid();
+        this.emitAssembleI64(c, BUFL, ADDR, 8, true, BITS64);
+        c.else_();
+        this.emitAssembleI64(c, BUFL, ADDR, 8, false, BITS64);
+        c.end();
+        c.localGet(BITS64);
+        c.f64ReinterpretI64();
+      }
+      this.mb.setBody(idx, [F64, F64, I32, this.bufRefNN(), I32, I64], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.bytes.<dvSetFloat32|dvSetFloat64> — (bytes<u8>, f64 offset, f64
+   * value, i32 littleEndian) → (); PASSTHROUGH, no NaN canonicalization
+   * (SEMANTICS.md S036 — the fold boundary lives in emitter.ts's emitBin,
+   * orthogonal to write-side byte assembly; a runtime-computed NaN's bits
+   * pass through here exactly like every other value, matching
+   * writeNumFloatHelper's current, REVERTED design). */
+  dvSetFloatHelper(method: "dvSetFloat32" | "dvSetFloat64"): number {
+    const width = method === "dvSetFloat32" ? 4 : 8;
+    return this.cached(method, () => {
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.bytesRef(), F64, F64, I32], []),
+        `%w.bytes.${method}`,
+      );
+      const c = new Code();
+      const V = 0, OFFARG = 1, VALUE = 2, LE = 3;
+      const OFFT = 4, RECVBYTES = 5, ADDR = 6, BUFL = 7, BITS32 = 8, BITS64 = 9;
+      this.emitDvOffsetCheck(c, V, OFFARG, OFFT, RECVBYTES, width, () => {});
+      c.localGet(V);
+      c.structGet(this.bytesType(), OFF);
+      c.localGet(OFFT);
+      c.i32TruncF64S();
+      c.i32Add();
+      c.localSet(ADDR);
+      c.localGet(V);
+      c.structGet(this.bytesType(), STORAGE);
+      c.localSet(BUFL);
+      if (width === 4) {
+        c.localGet(VALUE);
+        c.f32DemoteF64();
+        c.i32ReinterpretF32();
+        c.localSet(BITS32);
+        c.localGet(LE);
+        c.ifVoid();
+        this.emitScatterI32(c, BUFL, ADDR, 4, true, BITS32);
+        c.else_();
+        this.emitScatterI32(c, BUFL, ADDR, 4, false, BITS32);
+        c.end();
+      } else {
+        c.localGet(VALUE);
+        c.i64ReinterpretF64();
+        c.localSet(BITS64);
+        c.localGet(LE);
+        c.ifVoid();
+        this.emitScatterI64(c, BUFL, ADDR, 8, true, BITS64);
+        c.else_();
+        this.emitScatterI64(c, BUFL, ADDR, 8, false, BITS64);
+        c.end();
+      }
+      this.mb.setBody(idx, [F64, F64, I32, this.bufRefNN(), I32, I64], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.bytes.<dvGetBigUint64Number|dvGetBigInt64Number> — (bytes<u8>,
+   * f64 offset, i32 littleEndian) → f64. Only the COMPOSED
+   * `Number(view.getBigUint64/getBigInt64(...))` form ever lowers here
+   * (the lowering's own comment, nodes.ts:1459) — the 8-byte integer
+   * converts to a double exactly as `Number(bigint)` would (measured:
+   * matches plain round-to-nearest-even bigint→double conversion, which
+   * is exactly what `f64.convert_i64_u`/`f64.convert_i64_s` are spec-
+   * required to do), so this is a NUMERIC conversion (f64.convert_i64_*),
+   * NOT the bit-reinterpret the float getters use. No sign-extension
+   * needed for the signed kind: an 8-byte assembly already occupies the
+   * FULL i64 width, so the raw bit pattern IS the correct two's-
+   * complement value as-is. */
+  dvGetBigHelper(method: "dvGetBigUint64Number" | "dvGetBigInt64Number"): number {
+    const signed = method === "dvGetBigInt64Number";
+    return this.cached(method, () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.bytesRef(), F64, I32], [F64]), `%w.bytes.${method}`);
+      const c = new Code();
+      const V = 0, OFFARG = 1, LE = 2;
+      const OFFT = 3, RECVBYTES = 4, ADDR = 5, BUFL = 6, BITS64 = 7;
+      this.emitDvOffsetCheck(c, V, OFFARG, OFFT, RECVBYTES, 8, () => c.f64Const(0));
+      c.localGet(V);
+      c.structGet(this.bytesType(), OFF);
+      c.localGet(OFFT);
+      c.i32TruncF64S();
+      c.i32Add();
+      c.localSet(ADDR);
+      c.localGet(V);
+      c.structGet(this.bytesType(), STORAGE);
+      c.localSet(BUFL);
+      c.localGet(LE);
+      c.ifVoid();
+      this.emitAssembleI64(c, BUFL, ADDR, 8, true, BITS64);
+      c.else_();
+      this.emitAssembleI64(c, BUFL, ADDR, 8, false, BITS64);
+      c.end();
+      c.localGet(BITS64);
+      if (signed) c.f64ConvertI64S();
+      else c.f64ConvertI64U();
+      this.mb.setBody(idx, [F64, F64, I32, this.bufRefNN(), I64], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.bytes.dataViewNew — (receiver: bytes<any elem>, f64 offsetArg,
+   * i32 hasLength, f64 lengthArg) → bytes<u8>; `new DataView(x.buffer,
+   * byteOffset?, byteLength?)`. PUSH ORDER for every caller: (receiver,
+   * offsetArg [f64Const(0) if the source omitted it — measured IDENTICAL
+   * to an explicit 0, so no separate hasOffset flag is needed], hasLength
+   * [i32 — whether a length arg was written in source], lengthArg
+   * [ignored when hasLength=0]).
+   *
+   * TWO SEPARATE RangeError messages (measured, not shared): offset uses
+   * "Start offset N is outside the bounds of the buffer" (N = the
+   * TRUNCATED offset, embeds "Infinity" verbatim for an infinite input);
+   * length uses "Invalid DataView length N" (same truncation rule).
+   * `hasLength` is a REAL flag, not a convenience default: an EXPLICIT
+   * `Infinity` length THROWS ("Invalid DataView length Infinity"), so
+   * Infinity cannot double as an "omitted" sentinel the way slice/
+   * subarray's clamping semantics allow.
+   *
+   * NOT elem-templated (unlike slice/subarray/etc.) — and deliberately
+   * NOT `receiver.BLEN * esize(elem)` for the bounds cap, even though
+   * that was this helper's FIRST (wrong) draft. Caught by the corpus
+   * census (1407-dataview-bounds.ts's "a view over a VIEW's .buffer"
+   * case): `x.buffer` in JS always resolves to the ROOT ArrayBuffer,
+   * even when `x` is itself a narrower view (e.g. another DataView with
+   * its own smaller off/len window) — Node validates the new view's
+   * offset/length against the OWNER's full capacity, not against
+   * whatever window `x` itself currently exposes. `receiver.BLEN` is
+   * `x`'s OWN element count (correct for x's own window, wrong for the
+   * owner's), so bounding against it silently under-counted the owner's
+   * true capacity for exactly this rebasing case. The FIX: `array.len`
+   * on the shared STORAGE array directly — storage is always the SAME
+   * `array (mut i8)` for the whole ownership chain (subarray/dataViewNew
+   * never copy, only view), and being byte-granular by construction
+   * (stage A's design), its own length IS the owner's total byte
+   * capacity, elem-independent, with no scaling needed for ANY receiver
+   * elem kind — which is also why this helper needs no `elem` parameter
+   * at all, unlike every other view-constructing helper in this file. */
+  dataViewNewHelper(): number {
+    return this.cached("dataViewNew", () => {
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.bytesRef(), F64, I32, F64], [this.bytesRef()]),
+        "%w.bytes.dataViewNew",
+      );
+      const c = new Code();
+      const V = 0, OFFARG = 1, HASLEN = 2, LENARG = 3;
+      const RECVBYTES = 4, OFFT = 5, CAP = 6, LENT = 7;
+      c.localGet(V);
+      c.structGet(this.bytesType(), STORAGE);
+      c.arrayLen();
+      c.f64ConvertI32S();
+      c.localSet(RECVBYTES);
+      c.localGet(OFFARG);
+      c.localGet(OFFARG);
+      c.f64Ne();
+      c.ifResult(F64);
+      c.f64Const(0);
+      c.else_();
+      c.localGet(OFFARG);
+      c.f64Trunc();
+      c.end();
+      c.localSet(OFFT);
+      c.localGet(OFFT);
+      c.f64Const(0);
+      c.f64Lt();
+      c.localGet(OFFT);
+      c.localGet(RECVBYTES);
+      c.f64Gt();
+      c.i32Or();
+      c.ifVoid();
+      {
+        this.deps.throwError(
+          c,
+          "%RangeError",
+          "RangeError",
+          (x) => {
+            this.deps.lit(x, "Start offset ");
+            x.localGet(OFFT);
+            x.call(this.deps.f64ToStr());
+            x.call(this.deps.concat());
+            this.deps.lit(x, " is outside the bounds of the buffer");
+            x.call(this.deps.concat());
+          },
+          null,
+        );
+        c.refNull(this.bytesType());
+        c.return_();
+      }
+      c.end();
+      c.localGet(RECVBYTES);
+      c.localGet(OFFT);
+      c.f64Sub();
+      c.localSet(CAP);
+      c.localGet(HASLEN);
+      c.ifResult(F64);
+      {
+        c.localGet(LENARG);
+        c.localGet(LENARG);
+        c.f64Ne();
+        c.ifResult(F64);
+        c.f64Const(0);
+        c.else_();
+        c.localGet(LENARG);
+        c.f64Trunc();
+        c.end();
+      }
+      c.else_();
+      c.localGet(CAP);
+      c.end();
+      c.localSet(LENT);
+      c.localGet(HASLEN);
+      c.ifVoid();
+      {
+        c.localGet(LENT);
+        c.f64Const(0);
+        c.f64Lt();
+        c.localGet(LENT);
+        c.localGet(CAP);
+        c.f64Gt();
+        c.i32Or();
+        c.ifVoid();
+        {
+          this.deps.throwError(
+            c,
+            "%RangeError",
+            "RangeError",
+            (x) => {
+              this.deps.lit(x, "Invalid DataView length ");
+              x.localGet(LENT);
+              x.call(this.deps.f64ToStr());
+              x.call(this.deps.concat());
+            },
+            null,
+          );
+          c.refNull(this.bytesType());
+          c.return_();
+        }
+        c.end();
+      }
+      c.end();
+      // OFFT is ROOT-relative already — `.buffer`'s coordinate system is
+      // the ROOT ArrayBuffer's, exactly like RECVBYTES above, so the
+      // result's OFF is OFFT directly, NOT `receiver.OFF + OFFT`. Adding
+      // receiver.OFF here was this helper's SECOND bug (the sibling of
+      // the RECVBYTES one): for a receiver that owns its storage
+      // (receiver.OFF == 0, the common case) the two are numerically
+      // identical, which is exactly why the "view over a VIEW's .buffer"
+      // corpus case (1407-dataview-bounds.ts's "rebased" line — a
+      // DataView constructed from ANOTHER DataView's `.buffer`, which
+      // has its own nonzero OFF) was the only thing that could expose
+      // it: double-counting receiver.OFF put the result's window past
+      // the storage array's real end, an out-of-bounds struct that only
+      // faulted later, on the first dvGet*/dvSet* call through it.
+      c.localGet(V);
+      c.structGet(this.bytesType(), STORAGE);
+      c.localGet(OFFT);
+      c.i32TruncF64S();
+      c.localGet(LENT);
+      c.i32TruncF64S();
+      c.structNew(this.bytesType());
+      this.mb.setBody(idx, [F64, F64, F64, F64], c.bytes());
+      return idx;
+    });
+  }
 }

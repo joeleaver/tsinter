@@ -178,6 +178,23 @@ test("typedarrays.ts: every BytesBuilder helper, every elem kind, emits a VALID 
     bytesB.writeNumVarHelper(kind);
   }
   bytesB.byteLengthErrorHelper();
+  // Increment 18 stage C, round R1: DataView. dataViewNew is NOT elem-
+  // templated (it bounds against the shared STORAGE array's own
+  // array.len, not the receiver's BLEN — the fix for the "view over a
+  // view's .buffer" rebasing bug the corpus census caught), so it's
+  // called once; every dvGet*/dvSet* method operates on an already-
+  // constructed u8-elem view, likewise called once each.
+  bytesB.dataViewNewHelper();
+  const dvIntGetters = ["dvGetUint8", "dvGetInt8", "dvGetUint16", "dvGetInt16", "dvGetUint32", "dvGetInt32"];
+  const dvIntSetters = ["dvSetUint8", "dvSetInt8", "dvSetUint16", "dvSetInt16", "dvSetUint32", "dvSetInt32"];
+  for (const method of dvIntGetters) bytesB.dvGetIntHelper(method);
+  for (const method of dvIntSetters) bytesB.dvSetIntHelper(method);
+  bytesB.dvGetFloatHelper("dvGetFloat32");
+  bytesB.dvGetFloatHelper("dvGetFloat64");
+  bytesB.dvSetFloatHelper("dvSetFloat32");
+  bytesB.dvSetFloatHelper("dvSetFloat64");
+  bytesB.dvGetBigHelper("dvGetBigUint64Number");
+  bytesB.dvGetBigHelper("dvGetBigInt64Number");
 
   const bytes = mb.emit();
   expect(WebAssembly.validate(bytes)).toBe(true);

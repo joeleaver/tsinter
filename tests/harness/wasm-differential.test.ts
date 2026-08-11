@@ -1230,6 +1230,14 @@ const TIER_FLOOR: string[] = [
   // for the literal case), so both compile and are byte-exact.
   "101-arithmetic.ts",
   "1630-inspect-scalars.ts",
+  // Increment 18 stage C, round R1: DataView (dataViewNew + every
+  // dvGet*/dvSet* accessor). 1407 and 2560 claim via the construction +
+  // accessor surface directly; 2625 had been heading at
+  // bytesIntrinsic:dataViewNew since round B2 and cleared the moment
+  // dataViewNew landed.
+  "1407-dataview-bounds.ts",
+  "2560-arraybuffer-dataview-set.ts",
+  "2625-bytes-views.ts",
 ];
 
 interface RunResult {

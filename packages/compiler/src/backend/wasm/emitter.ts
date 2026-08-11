@@ -8714,10 +8714,109 @@ class Assembler {
             this.emitPendingCheck();
             return;
           }
-          default:
-            this.refuse(`bytesIntrinsic:${e.method}`, e.loc);
-            code.unreachable();
+          /* ── increment 18 stage C, round R1: DataView. dataViewNew's
+           * RECEIVER may be any elem kind (u8/u32/i32/f32 — `.buffer` is
+           * valid on every typed array) but the helper itself is NOT
+           * elem-templated (typedarrays.ts's dataViewNewHelper doc
+           * comment has the full story — it bounds against the shared
+           * STORAGE array's own `array.len`, not the receiver's BLEN, so
+           * elem never enters the computation); every dvGet* / dvSet*
+           * method below operates on an ALREADY-CONSTRUCTED u8-elem
+           * view, likewise needing no elem parameter. littleEndian
+           * omitted → i32Const(0) (big-endian, the JS default) — mirrors
+           * writeStr's hasLen flag pattern just above for dataViewNew's
+           * hasLength. ─────────────────────────────────────────────── */
+          case "dataViewNew": {
+            this.walkExpr(e.receiver);
+            if (e.args[0] !== undefined) this.walkExpr(e.args[0]);
+            else code.f64Const(0);
+            const hasLen = e.args[1] !== undefined;
+            code.i32Const(hasLen ? 1 : 0);
+            if (hasLen) this.walkExpr(e.args[1]!);
+            else code.f64Const(0);
+            code.call(this.bytesB.dataViewNewHelper());
+            this.emitPendingCheck();
             return;
+          }
+          case "dvGetUint8":
+          case "dvGetInt8":
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!); // offset
+            code.call(this.bytesB.dvGetIntHelper(e.method));
+            this.emitPendingCheck();
+            return;
+          case "dvGetUint16":
+          case "dvGetInt16":
+          case "dvGetUint32":
+          case "dvGetInt32":
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!); // offset
+            if (e.args[1] !== undefined) this.walkExpr(e.args[1]);
+            else code.i32Const(0);
+            code.call(this.bytesB.dvGetIntHelper(e.method));
+            this.emitPendingCheck();
+            return;
+          case "dvSetUint8":
+          case "dvSetInt8":
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!); // offset
+            this.walkExpr(e.args[1]!); // value
+            code.call(this.bytesB.dvSetIntHelper(e.method));
+            this.emitPendingCheck();
+            return;
+          case "dvSetUint16":
+          case "dvSetInt16":
+          case "dvSetUint32":
+          case "dvSetInt32":
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!); // offset
+            this.walkExpr(e.args[1]!); // value
+            if (e.args[2] !== undefined) this.walkExpr(e.args[2]);
+            else code.i32Const(0);
+            code.call(this.bytesB.dvSetIntHelper(e.method));
+            this.emitPendingCheck();
+            return;
+          case "dvGetFloat32":
+          case "dvGetFloat64":
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!); // offset
+            if (e.args[1] !== undefined) this.walkExpr(e.args[1]);
+            else code.i32Const(0);
+            code.call(this.bytesB.dvGetFloatHelper(e.method));
+            this.emitPendingCheck();
+            return;
+          case "dvSetFloat32":
+          case "dvSetFloat64":
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!); // offset
+            this.walkExpr(e.args[1]!); // value
+            if (e.args[2] !== undefined) this.walkExpr(e.args[2]);
+            else code.i32Const(0);
+            code.call(this.bytesB.dvSetFloatHelper(e.method));
+            this.emitPendingCheck();
+            return;
+          case "dvGetBigUint64Number":
+          case "dvGetBigInt64Number":
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!); // offset
+            if (e.args[1] !== undefined) this.walkExpr(e.args[1]);
+            else code.i32Const(0);
+            code.call(this.bytesB.dvGetBigHelper(e.method));
+            this.emitPendingCheck();
+            return;
+          default: {
+            // The DataView additions above (stage C, round R1) completed
+            // coverage of every IrBytesIntrinsicMethod — this switch is
+            // now PROVABLY exhaustive (TS narrows `e.method` to `never`
+            // here), so the runtime `refuse(...)` this arm used to carry
+            // is dead code by construction: any future new enum member
+            // without a matching case becomes a COMPILE error at this
+            // line instead, a stronger guarantee than the old runtime
+            // fallback. Mirrors emitBin's own `const rest: never = e.op`
+            // exhaustiveness assertion elsewhere in this file.
+            const exhaustive: never = e;
+            throw new Error(`emitter bug: unhandled bytesIntrinsic case (should be unreachable): ${String(exhaustive)}`);
+          }
         }
       }
 

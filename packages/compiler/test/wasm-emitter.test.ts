@@ -5986,3 +5986,494 @@ test("bytes: readNumVar/writeNumVar — every byteLength 1-6, all four kinds, th
   );
   expect(stdout.toString("utf8")).toBe(expected.join("\n"));
 });
+
+/* ── increment 18 stage C, round R1: DataView. Every test below diffs
+ * against Node computed IN-PROCESS (never a hardcoded literal), matching
+ * the rest of this file's oracle discipline. `new DataView(new
+ * ArrayBuffer(n), ...)` must stay INLINE (a free-standing ArrayBuffer
+ * variable is fenced, SC2020) — every source string below constructs it
+ * that way. ────────────────────────────────────────────────────────── */
+
+test("DataView: construction — all forms, two separate RangeError ladders, ToIndex truncation (not floor), NaN-as-0", async () => {
+  const res = await buildWasm(
+    "dataview-construction.ts",
+    [
+      "const caught = (fn: () => void): void => {",
+      "  try { fn(); console.log('no throw'); }",
+      "  catch (e) { const err = e as Error; console.log('caught:' + err.name + ':' + err.message); }",
+      "};",
+      "{ const dv = new DataView(new ArrayBuffer(8)); console.log(dv.byteLength + ':' + dv.byteOffset); }",
+      "{ const u8 = new Uint8Array(8); const dv = new DataView(u8.buffer, 2); console.log(dv.byteLength + ':' + dv.byteOffset); }",
+      "{ const u8 = new Uint8Array(8); const dv = new DataView(u8.buffer, 2, 4); console.log(dv.byteLength + ':' + dv.byteOffset); }",
+      "caught(() => { new DataView(new ArrayBuffer(8), -1); });",
+      "caught(() => { new DataView(new ArrayBuffer(8), 100); });",
+      "caught(() => { new DataView(new ArrayBuffer(8), 0, -1); });",
+      "caught(() => { new DataView(new ArrayBuffer(8), 4, 8); });",
+      "caught(() => { new DataView(new ArrayBuffer(8), 0, Infinity); });",
+      "caught(() => { new DataView(new ArrayBuffer(8), Infinity); });",
+      "{ const dv = new DataView(new ArrayBuffer(8), 1.5); console.log(dv.byteOffset); }",
+      "caught(() => { new DataView(new ArrayBuffer(8), -1.5); });",
+      "{ const dv = new DataView(new ArrayBuffer(8), NaN); console.log(dv.byteOffset); }",
+      "{ const dv = new DataView(new ArrayBuffer(8), 0, NaN); console.log(dv.byteLength); }",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+
+  const caughtJs = (fn: () => unknown): string => {
+    try {
+      fn();
+      return "no throw";
+    } catch (e) {
+      const err = e as Error;
+      return `caught:${err.name}:${err.message}`;
+    }
+  };
+  const expected = [
+    (() => {
+      const dv = new DataView(new ArrayBuffer(8));
+      return `${dv.byteLength}:${dv.byteOffset}`;
+    })(),
+    (() => {
+      const u8 = new Uint8Array(8);
+      const dv = new DataView(u8.buffer, 2);
+      return `${dv.byteLength}:${dv.byteOffset}`;
+    })(),
+    (() => {
+      const u8 = new Uint8Array(8);
+      const dv = new DataView(u8.buffer, 2, 4);
+      return `${dv.byteLength}:${dv.byteOffset}`;
+    })(),
+    caughtJs(() => new DataView(new ArrayBuffer(8), -1)),
+    caughtJs(() => new DataView(new ArrayBuffer(8), 100)),
+    caughtJs(() => new DataView(new ArrayBuffer(8), 0, -1)),
+    caughtJs(() => new DataView(new ArrayBuffer(8), 4, 8)),
+    caughtJs(() => new DataView(new ArrayBuffer(8), 0, Infinity)),
+    caughtJs(() => new DataView(new ArrayBuffer(8), Infinity)),
+    (() => new DataView(new ArrayBuffer(8), 1.5).byteOffset)(),
+    caughtJs(() => new DataView(new ArrayBuffer(8), -1.5)),
+    (() => new DataView(new ArrayBuffer(8), NaN).byteOffset)(),
+    (() => new DataView(new ArrayBuffer(8), 0, NaN).byteLength)(),
+    "",
+  ];
+  expect(stdout.toString("utf8")).toBe(expected.join("\n"));
+});
+
+test("DataView: integer get/set — all six widths, BE/LE, signed sign-extension, NO value-range RangeError (only offset can throw)", async () => {
+  const lines: string[] = [
+    "const caught = (fn: () => void): void => {",
+    "  try { fn(); console.log('no throw'); }",
+    "  catch (e) { const err = e as Error; console.log('caught:' + err.name + ':' + err.message); }",
+    "};",
+    "{ const dv = new DataView(new ArrayBuffer(8)); dv.setUint8(0, 200); console.log(dv.getUint8(0)); }",
+    "{ const dv = new DataView(new ArrayBuffer(8)); dv.setInt8(0, -100); console.log(dv.getInt8(0)); }",
+    "{ const dv = new DataView(new ArrayBuffer(8)); dv.setUint16(0, 0xABCD); console.log(dv.getUint16(0)); }",
+    "{ const dv = new DataView(new ArrayBuffer(8)); dv.setUint16(0, 0xABCD, true); console.log(dv.getUint16(0, true)); }",
+    "{ const dv = new DataView(new ArrayBuffer(8)); dv.setInt16(0, -1234); console.log(dv.getInt16(0)); }",
+    "{ const dv = new DataView(new ArrayBuffer(8)); dv.setInt16(0, -1234, true); console.log(dv.getInt16(0, true)); }",
+    "{ const dv = new DataView(new ArrayBuffer(8)); dv.setUint32(0, 0xABCDEF01); console.log(dv.getUint32(0)); }",
+    "{ const dv = new DataView(new ArrayBuffer(8)); dv.setUint32(0, 0xABCDEF01, true); console.log(dv.getUint32(0, true)); }",
+    "{ const dv = new DataView(new ArrayBuffer(8)); dv.setInt32(0, -123456789); console.log(dv.getInt32(0)); }",
+    "{ const dv = new DataView(new ArrayBuffer(8)); dv.setInt32(0, -123456789, true); console.log(dv.getInt32(0, true)); }",
+    // BE write vs LE read differ (proves the runtime LE branch actually swaps bytes)
+    "{ const dv = new DataView(new ArrayBuffer(4)); dv.setUint32(0, 0x01020304); console.log(dv.getUint32(0, true)); }",
+    // offset OOB — flat constant message across widths and directions
+    "caught(() => { const dv = new DataView(new ArrayBuffer(4)); dv.getUint32(1); });",
+    "caught(() => { const dv = new DataView(new ArrayBuffer(4)); dv.setUint8(4, 1); });",
+    "caught(() => { const dv = new DataView(new ArrayBuffer(4)); dv.getInt16(3); });",
+    // NO value-range RangeError: an out-of-range value wraps silently
+    "{ const dv = new DataView(new ArrayBuffer(4)); dv.setInt8(0, 300); console.log(dv.getInt8(0)); }",
+    "{ const dv = new DataView(new ArrayBuffer(4)); dv.setUint8(0, -1); console.log(dv.getUint8(0)); }",
+    "",
+  ];
+  const res = await buildWasm("dataview-int-getset.ts", lines.join("\n"));
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+
+  const caughtJs = (fn: () => unknown): string => {
+    try {
+      fn();
+      return "no throw";
+    } catch (e) {
+      const err = e as Error;
+      return `caught:${err.name}:${err.message}`;
+    }
+  };
+  const expected = [
+    (() => {
+      const dv = new DataView(new ArrayBuffer(8));
+      dv.setUint8(0, 200);
+      return dv.getUint8(0);
+    })(),
+    (() => {
+      const dv = new DataView(new ArrayBuffer(8));
+      dv.setInt8(0, -100);
+      return dv.getInt8(0);
+    })(),
+    (() => {
+      const dv = new DataView(new ArrayBuffer(8));
+      dv.setUint16(0, 0xabcd);
+      return dv.getUint16(0);
+    })(),
+    (() => {
+      const dv = new DataView(new ArrayBuffer(8));
+      dv.setUint16(0, 0xabcd, true);
+      return dv.getUint16(0, true);
+    })(),
+    (() => {
+      const dv = new DataView(new ArrayBuffer(8));
+      dv.setInt16(0, -1234);
+      return dv.getInt16(0);
+    })(),
+    (() => {
+      const dv = new DataView(new ArrayBuffer(8));
+      dv.setInt16(0, -1234, true);
+      return dv.getInt16(0, true);
+    })(),
+    (() => {
+      const dv = new DataView(new ArrayBuffer(8));
+      dv.setUint32(0, 0xabcdef01);
+      return dv.getUint32(0);
+    })(),
+    (() => {
+      const dv = new DataView(new ArrayBuffer(8));
+      dv.setUint32(0, 0xabcdef01, true);
+      return dv.getUint32(0, true);
+    })(),
+    (() => {
+      const dv = new DataView(new ArrayBuffer(8));
+      dv.setInt32(0, -123456789);
+      return dv.getInt32(0);
+    })(),
+    (() => {
+      const dv = new DataView(new ArrayBuffer(8));
+      dv.setInt32(0, -123456789, true);
+      return dv.getInt32(0, true);
+    })(),
+    (() => {
+      const dv = new DataView(new ArrayBuffer(4));
+      dv.setUint32(0, 0x01020304);
+      return dv.getUint32(0, true);
+    })(),
+    caughtJs(() => {
+      const dv = new DataView(new ArrayBuffer(4));
+      dv.getUint32(1);
+    }),
+    caughtJs(() => {
+      const dv = new DataView(new ArrayBuffer(4));
+      dv.setUint8(4, 1);
+    }),
+    caughtJs(() => {
+      const dv = new DataView(new ArrayBuffer(4));
+      dv.getInt16(3);
+    }),
+    (() => {
+      const dv = new DataView(new ArrayBuffer(4));
+      dv.setInt8(0, 300);
+      return dv.getInt8(0);
+    })(),
+    (() => {
+      const dv = new DataView(new ArrayBuffer(4));
+      dv.setUint8(0, -1);
+      return dv.getUint8(0);
+    })(),
+    "",
+  ];
+  expect(stdout.toString("utf8")).toBe(expected.map(String).join("\n"));
+});
+
+test("DataView: the SAME bad offset (non-integer, NaN) — Buffer's readNum/writeNum ladder THROWS, DataView's ladder silently ToIndex-truncates. Pinned explicitly so no future refactor unifies the two contracts (the B2 ladder-difference precedent)", async () => {
+  const res = await buildWasm(
+    "dataview-vs-buffer-leniency.ts",
+    [
+      "const caught = (fn: () => void): void => {",
+      "  try { fn(); console.log('no throw'); }",
+      "  catch (e) { const err = e as Error; console.log('caught:' + err.name + ':' + err.message); }",
+      "};",
+      // Buffer: a non-integer offset THROWS (stage B's readNum ladder).
+      "caught(() => { const b = Buffer.alloc(8); b.readUInt8(1.5); });",
+      "caught(() => { const b = Buffer.alloc(8); b.writeUInt8(1, 1.5); });",
+      "caught(() => { const b = Buffer.alloc(8); b.readUInt8(NaN); });",
+      // DataView: the SAME shape of bad offset silently truncates instead.
+      "{ const dv = new DataView(new ArrayBuffer(8)); console.log(dv.getUint8(1.5)); }",
+      "{ const dv = new DataView(new ArrayBuffer(8)); dv.setUint8(1.5, 9); console.log(dv.getUint8(1)); }",
+      "{ const dv = new DataView(new ArrayBuffer(8)); console.log(dv.getUint8(NaN)); }",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+
+  const caughtJs = (fn: () => unknown): string => {
+    try {
+      fn();
+      return "no throw";
+    } catch (e) {
+      const err = e as Error;
+      return `caught:${err.name}:${err.message}`;
+    }
+  };
+  const expected = [
+    caughtJs(() => {
+      const b = Buffer.alloc(8);
+      b.readUInt8(1.5);
+    }),
+    caughtJs(() => {
+      const b = Buffer.alloc(8);
+      b.writeUInt8(1, 1.5);
+    }),
+    caughtJs(() => {
+      const b = Buffer.alloc(8);
+      b.readUInt8(NaN);
+    }),
+    (() => new DataView(new ArrayBuffer(8)).getUint8(1.5))(),
+    (() => {
+      const dv = new DataView(new ArrayBuffer(8));
+      dv.setUint8(1.5, 9);
+      return dv.getUint8(1);
+    })(),
+    (() => new DataView(new ArrayBuffer(8)).getUint8(NaN))(),
+    "",
+  ];
+  expect(stdout.toString("utf8")).toBe(expected.map(String).join("\n"));
+  // The actual CLAIM this test exists to pin: Buffer's three cases must
+  // all be "caught:...", DataView's three must all be "no throw"-shaped
+  // (plain numeric output) — assert the CONTRAST directly, not just
+  // byte-for-byte parity with Node (which would still pass even if BOTH
+  // sides had accidentally started throwing, or both stopped).
+  const lines = stdout.toString("utf8").trim().split("\n");
+  expect(lines.slice(0, 3).every((l) => l.startsWith("caught:RangeError:"))).toBe(true);
+  expect(lines.slice(3, 6).every((l) => !l.startsWith("caught:"))).toBe(true);
+});
+
+test("DataView: float get/set — passthrough, and the S036 NaN-provenance boundary (literal-folded canonical, crafted echo, runtime-computed hardware pattern) on both endiannesses", async () => {
+  const hexDv = (varName: string, n: number): string => {
+    const parts: string[] = [];
+    for (let i = 0; i < n; i++) parts.push(`${varName}.getUint8(${i})`);
+    return `console.log([${parts.join(", ")}].join(','));`;
+  };
+  const lines = [
+    `{ const dv = new DataView(new ArrayBuffer(8)); dv.setFloat64(0, 1.5); console.log(dv.getFloat64(0)); }`,
+    `{ const dv = new DataView(new ArrayBuffer(4)); dv.setFloat32(0, 1.5, true); console.log(dv.getFloat32(0, true)); }`,
+    // literal-folded arithmetic NaN -> canonical, BE and LE
+    `{ const dv = new DataView(new ArrayBuffer(8)); dv.setFloat64(0, 0 / 0); ${hexDv("dv", 8)} }`,
+    `{ const dv = new DataView(new ArrayBuffer(4)); dv.setFloat32(0, 0 / 0); ${hexDv("dv", 4)} }`,
+    `{ const dv = new DataView(new ArrayBuffer(8)); dv.setFloat64(0, 0 / 0, true); ${hexDv("dv", 8)} }`,
+    `{ const dv = new DataView(new ArrayBuffer(4)); dv.setFloat32(0, 0 / 0, true); ${hexDv("dv", 4)} }`,
+    // crafted/signaling NaN round trip -> bit-exact echo
+    `{ const dv = new DataView(new ArrayBuffer(8)); dv.setUint32(0, 0x7ff80000); dv.setUint32(4, 1); const v = dv.getFloat64(0); const dv2 = new DataView(new ArrayBuffer(8)); dv2.setFloat64(0, v); ${hexDv("dv2", 8)} }`,
+    // genuinely runtime-computed NaN -> hardware pattern, BE and LE, both widths
+    `{ const arr: number[] = [0, 0]; const dv = new DataView(new ArrayBuffer(8)); dv.setFloat64(0, arr[0]! / arr[1]!); ${hexDv("dv", 8)} }`,
+    `{ const arr: number[] = [0, 0]; const dv = new DataView(new ArrayBuffer(8)); dv.setFloat64(0, arr[0]! / arr[1]!, true); ${hexDv("dv", 8)} }`,
+    `{ const arr: number[] = [0, 0]; const dv = new DataView(new ArrayBuffer(4)); dv.setFloat32(0, arr[0]! / arr[1]!); ${hexDv("dv", 4)} }`,
+    `{ const arr: number[] = [0, 0]; const dv = new DataView(new ArrayBuffer(4)); dv.setFloat32(0, arr[0]! / arr[1]!, true); ${hexDv("dv", 4)} }`,
+    "",
+  ].join("\n");
+  const res = await buildWasm("dataview-float-nan.ts", lines);
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+
+  const dvBytes = (dv: DataView): string => {
+    const parts: number[] = [];
+    for (let i = 0; i < dv.byteLength; i++) parts.push(dv.getUint8(i));
+    return parts.join(",");
+  };
+  const expected = [
+    (() => {
+      const dv = new DataView(new ArrayBuffer(8));
+      dv.setFloat64(0, 1.5);
+      return dv.getFloat64(0);
+    })(),
+    (() => {
+      const dv = new DataView(new ArrayBuffer(4));
+      dv.setFloat32(0, 1.5, true);
+      return dv.getFloat32(0, true);
+    })(),
+    (() => {
+      const dv = new DataView(new ArrayBuffer(8));
+      dv.setFloat64(0, 0 / 0);
+      return dvBytes(dv);
+    })(),
+    (() => {
+      const dv = new DataView(new ArrayBuffer(4));
+      dv.setFloat32(0, 0 / 0);
+      return dvBytes(dv);
+    })(),
+    (() => {
+      const dv = new DataView(new ArrayBuffer(8));
+      dv.setFloat64(0, 0 / 0, true);
+      return dvBytes(dv);
+    })(),
+    (() => {
+      const dv = new DataView(new ArrayBuffer(4));
+      dv.setFloat32(0, 0 / 0, true);
+      return dvBytes(dv);
+    })(),
+    (() => {
+      const dv = new DataView(new ArrayBuffer(8));
+      dv.setUint32(0, 0x7ff80000);
+      dv.setUint32(4, 1);
+      const v = dv.getFloat64(0);
+      const dv2 = new DataView(new ArrayBuffer(8));
+      dv2.setFloat64(0, v);
+      return dvBytes(dv2);
+    })(),
+    (() => {
+      const arr: number[] = [0, 0];
+      const dv = new DataView(new ArrayBuffer(8));
+      dv.setFloat64(0, arr[0]! / arr[1]!);
+      return dvBytes(dv);
+    })(),
+    (() => {
+      const arr: number[] = [0, 0];
+      const dv = new DataView(new ArrayBuffer(8));
+      dv.setFloat64(0, arr[0]! / arr[1]!, true);
+      return dvBytes(dv);
+    })(),
+    (() => {
+      const arr: number[] = [0, 0];
+      const dv = new DataView(new ArrayBuffer(4));
+      dv.setFloat32(0, arr[0]! / arr[1]!);
+      return dvBytes(dv);
+    })(),
+    (() => {
+      const arr: number[] = [0, 0];
+      const dv = new DataView(new ArrayBuffer(4));
+      dv.setFloat32(0, arr[0]! / arr[1]!, true);
+      return dvBytes(dv);
+    })(),
+    "",
+  ];
+  expect(stdout.toString("utf8")).toBe(expected.map(String).join("\n"));
+});
+
+test("DataView: getBigUint64/getBigInt64 composed as Number(...) — round-to-nearest-even bigint-to-double conversion", async () => {
+  const res = await buildWasm(
+    "dataview-big-as-number.ts",
+    [
+      "{ const dv = new DataView(new ArrayBuffer(8)); dv.setUint32(0, 0); dv.setUint32(4, 1); console.log(Number(dv.getBigUint64(0))); }",
+      "{ const dv = new DataView(new ArrayBuffer(8)); dv.setUint32(0, 0xFFFFFFFF); dv.setUint32(4, 0xFFFFFFFF); console.log(Number(dv.getBigUint64(0))); }",
+      "{ const dv = new DataView(new ArrayBuffer(8)); dv.setUint32(0, 0xFFFFFFFF); dv.setUint32(4, 0xFFFFFFFF); console.log(Number(dv.getBigInt64(0))); }",
+      "{ const dv = new DataView(new ArrayBuffer(8)); dv.setUint32(0, 1); dv.setUint32(4, 0); console.log(Number(dv.getBigUint64(0, true))); }",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+
+  const expected = [
+    (() => {
+      const dv = new DataView(new ArrayBuffer(8));
+      dv.setUint32(0, 0);
+      dv.setUint32(4, 1);
+      return Number(dv.getBigUint64(0));
+    })(),
+    (() => {
+      const dv = new DataView(new ArrayBuffer(8));
+      dv.setUint32(0, 0xffffffff);
+      dv.setUint32(4, 0xffffffff);
+      return Number(dv.getBigUint64(0));
+    })(),
+    (() => {
+      const dv = new DataView(new ArrayBuffer(8));
+      dv.setUint32(0, 0xffffffff);
+      dv.setUint32(4, 0xffffffff);
+      return Number(dv.getBigInt64(0));
+    })(),
+    (() => {
+      const dv = new DataView(new ArrayBuffer(8));
+      dv.setUint32(0, 1);
+      dv.setUint32(4, 0);
+      return Number(dv.getBigUint64(0, true));
+    })(),
+    "",
+  ];
+  expect(stdout.toString("utf8")).toBe(expected.map(String).join("\n"));
+});
+
+test("DataView: aliasing over a Uint32Array's storage — write through the view, read through the element access, and back (the byte-granular $bytes representation gives this for free)", async () => {
+  const res = await buildWasm(
+    "dataview-aliasing.ts",
+    [
+      "{ const u32 = new Uint32Array(2); const dv = new DataView(u32.buffer); dv.setUint32(0, 0x11223344); console.log(u32[0]); }",
+      "{ const u32 = new Uint32Array(2); u32[0] = 0x11223344; const dv = new DataView(u32.buffer); console.log(dv.getUint32(0)); }",
+      "{ const u32 = new Uint32Array(2); const dv = new DataView(u32.buffer); dv.setUint32(4, 0xAABBCCDD); console.log(u32[1]); }",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+
+  const expected = [
+    (() => {
+      const u32 = new Uint32Array(2);
+      const dv = new DataView(u32.buffer);
+      dv.setUint32(0, 0x11223344);
+      return u32[0];
+    })(),
+    (() => {
+      const u32 = new Uint32Array(2);
+      u32[0] = 0x11223344;
+      const dv = new DataView(u32.buffer);
+      return dv.getUint32(0);
+    })(),
+    (() => {
+      const u32 = new Uint32Array(2);
+      const dv = new DataView(u32.buffer);
+      dv.setUint32(4, 0xaabbccdd);
+      return u32[1];
+    })(),
+    "",
+  ];
+  expect(stdout.toString("utf8")).toBe(expected.map(String).join("\n"));
+});
+
+test("DataView: a view constructed over ANOTHER view's .buffer rebases against the ROOT buffer, not the parent view's own window — the corpus 1407 regression (two bugs: bounds capacity via receiver.BLEN instead of the shared storage array's real length, and double-counting receiver.OFF into the new offset)", async () => {
+  const res = await buildWasm(
+    "dataview-rebase.ts",
+    [
+      "const buf = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);",
+      "const v = new DataView(buf.buffer, 2, 5);", // window: bytes[2..7), i.e. values 3..7
+      "const inner = new DataView(v.buffer, 6, 2);", // offset 6 is ROOT-relative -> bytes[6..8) = values 7,8
+      "console.log(inner.byteOffset + ':' + inner.byteLength + ':' + inner.getUint8(0) + ':' + inner.getUint16(0));",
+      "const caught = (fn: () => void): void => {",
+      "  try { fn(); console.log('no throw'); }",
+      "  catch (e) { const err = e as Error; console.log('caught:' + err.name + ':' + err.message); }",
+      "};",
+      // offset 6 + length 3 = 9, past the ROOT's 8 bytes (not past v's own
+      // window end at root-offset 7, which a receiver.BLEN-based bounds
+      // check would have wrongly allowed through as if it fit).
+      "caught(() => { new DataView(v.buffer, 6, 3); });",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+
+  const buf = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+  const v = new DataView(buf.buffer, 2, 5);
+  const inner = new DataView(v.buffer, 6, 2);
+  const caughtJs = (fn: () => unknown): string => {
+    try {
+      fn();
+      return "no throw";
+    } catch (e) {
+      const err = e as Error;
+      return `caught:${err.name}:${err.message}`;
+    }
+  };
+  const expected = [
+    `${inner.byteOffset}:${inner.byteLength}:${inner.getUint8(0)}:${inner.getUint16(0)}`,
+    caughtJs(() => new DataView(v.buffer, 6, 3)),
+    "",
+  ];
+  expect(stdout.toString("utf8")).toBe(expected.join("\n"));
+});
