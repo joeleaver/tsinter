@@ -5423,3 +5423,566 @@ test("bytes: Buffer.byteLength(str, 'base64'/'base64url') — the padding-strip 
   }
   expect(stdout.toString("utf8")).toBe(expected.join("\n") + "\n");
 });
+
+test("bytes: readNum/writeNum float kinds (f32be/f32le/f64be/f64le) — no value gate, Infinity narrows, NaN is bit-exact passthrough (literal folds match Node's own constant fold, S036), and Node-exact offset errors", async () => {
+  const res = await buildWasm(
+    "bytes-readnum-writenum-float.ts",
+    [
+      "const caught = (fn: () => void): void => {",
+      "  try { fn(); console.log('no throw'); }",
+      "  catch (e) {",
+      "    const err = e as Error;",
+      "    console.log('caught:' + err.name + ':' + err.message);",
+      "  }",
+      "};",
+      "// basic round trips",
+      "{ const b = Buffer.alloc(4); b.writeFloatBE(1.5, 0); console.log(b.toString('hex') + ':' + b.readFloatBE(0)); }",
+      "{ const b = Buffer.alloc(4); b.writeFloatLE(1.5, 0); console.log(b.toString('hex') + ':' + b.readFloatLE(0)); }",
+      "{ const b = Buffer.alloc(8); b.writeDoubleBE(1.5, 0); console.log(b.toString('hex') + ':' + b.readDoubleBE(0)); }",
+      "{ const b = Buffer.alloc(8); b.writeDoubleLE(1.5, 0); console.log(b.toString('hex') + ':' + b.readDoubleLE(0)); }",
+      "// Infinity / huge-value narrowing",
+      "{ const b = Buffer.alloc(4); b.writeFloatBE(Infinity, 0); console.log(b.toString('hex')); }",
+      "{ const b = Buffer.alloc(4); b.writeFloatBE(-Infinity, 0); console.log(b.toString('hex')); }",
+      "{ const b = Buffer.alloc(4); b.writeFloatBE(1e300, 0); console.log(b.toString('hex')); }",
+      "{ const b = Buffer.alloc(8); b.writeDoubleBE(Infinity, 0); console.log(b.toString('hex')); }",
+      "// NaN (canonical JS NaN) — already canonical",
+      "{ const b = Buffer.alloc(4); b.writeFloatBE(NaN, 0); console.log(b.toString('hex')); }",
+      "{ const b = Buffer.alloc(8); b.writeDoubleBE(NaN, 0); console.log(b.toString('hex')); }",
+      "// S036: a LITERAL-operand arithmetic NaN (0/0 written directly as",
+      "// source literals) constant-folds at compile time to the CANONICAL",
+      "// bit pattern, matching Node's own literal constant-fold exactly —",
+      "// this is the corpus-1660 fix. This is emitter-level folding",
+      "// (emitBin), not write-side canonicalization — see the separate",
+      "// runtime-NaN test below for the genuinely-computed (unfolded) case,",
+      "// which passes through the host toolchain's own NaN bits unchanged.",
+      "{ const b = Buffer.alloc(8); b.writeDoubleBE(0 / 0, 0); console.log(b.toString('hex')); }",
+      "{ const b = Buffer.alloc(4); b.writeFloatBE(0 / 0, 0); console.log(b.toString('hex')); }",
+      "// custom-payload / signaling NaN round trip: read a hand-built bit",
+      "// pattern via readNum, write the SAME value back, compare bytes.",
+      "// Bit-exact passthrough, matching Node exactly (no folding involved —",
+      "// these values arrive via Buffer.from/readDoubleBE, never as IR",
+      "// numLit operands, so emitBin's literal fold never sees them).",
+      "{ const src = Buffer.from('7ff8000000000001', 'hex'); const v = src.readDoubleBE(0); const dst = Buffer.alloc(8); dst.writeDoubleBE(v, 0); console.log(dst.toString('hex')); }",
+      "{ const src = Buffer.from('fff8000000000000', 'hex'); const v = src.readDoubleBE(0); const dst = Buffer.alloc(8); dst.writeDoubleBE(v, 0); console.log(dst.toString('hex')); }",
+      "{ const src = Buffer.from('7ff0000000000001', 'hex'); const v = src.readDoubleBE(0); const dst = Buffer.alloc(8); dst.writeDoubleBE(v, 0); console.log(dst.toString('hex')); }",
+      "{ const src = Buffer.from('7fc00001', 'hex'); const v = src.readFloatBE(0); const dst = Buffer.alloc(4); dst.writeFloatBE(v, 0); console.log(dst.toString('hex')); }",
+      "{ const src = Buffer.from('7f800001', 'hex'); const v = src.readFloatBE(0); const dst = Buffer.alloc(4); dst.writeFloatBE(v, 0); console.log(dst.toString('hex')); }",
+      "// offset errors",
+      "caught(() => { Buffer.alloc(4).writeFloatBE(1.5, 100); });",
+      "caught(() => { Buffer.alloc(4).writeFloatBE(1.5, 1.5); });",
+      "caught(() => { Buffer.alloc(8).readDoubleBE(100); });",
+      "caught(() => { Buffer.alloc(4).readFloatBE(1); });",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+
+  const caughtJs = (fn: () => unknown): string => {
+    try {
+      fn();
+      return "no throw";
+    } catch (e) {
+      const err = e as Error;
+      return `caught:${err.name}:${err.message}`;
+    }
+  };
+  const run = (fn: () => string): string => fn();
+  const expected = [
+    run(() => {
+      const b = Buffer.alloc(4);
+      b.writeFloatBE(1.5, 0);
+      return `${b.toString("hex")}:${b.readFloatBE(0)}`;
+    }),
+    run(() => {
+      const b = Buffer.alloc(4);
+      b.writeFloatLE(1.5, 0);
+      return `${b.toString("hex")}:${b.readFloatLE(0)}`;
+    }),
+    run(() => {
+      const b = Buffer.alloc(8);
+      b.writeDoubleBE(1.5, 0);
+      return `${b.toString("hex")}:${b.readDoubleBE(0)}`;
+    }),
+    run(() => {
+      const b = Buffer.alloc(8);
+      b.writeDoubleLE(1.5, 0);
+      return `${b.toString("hex")}:${b.readDoubleLE(0)}`;
+    }),
+    run(() => {
+      const b = Buffer.alloc(4);
+      b.writeFloatBE(Infinity, 0);
+      return b.toString("hex");
+    }),
+    run(() => {
+      const b = Buffer.alloc(4);
+      b.writeFloatBE(-Infinity, 0);
+      return b.toString("hex");
+    }),
+    run(() => {
+      const b = Buffer.alloc(4);
+      b.writeFloatBE(1e300, 0);
+      return b.toString("hex");
+    }),
+    run(() => {
+      const b = Buffer.alloc(8);
+      b.writeDoubleBE(Infinity, 0);
+      return b.toString("hex");
+    }),
+    run(() => {
+      const b = Buffer.alloc(4);
+      b.writeFloatBE(NaN, 0);
+      return b.toString("hex");
+    }),
+    run(() => {
+      const b = Buffer.alloc(8);
+      b.writeDoubleBE(NaN, 0);
+      return b.toString("hex");
+    }),
+    // S036: literal-operand 0/0 constant-folds at compile time to the
+    // canonical bit pattern, matching Node's own literal fold exactly
+    // (both sides measured to give 7ff8000000000000 / 7fc00000 here).
+    "7ff8000000000000",
+    "7fc00000",
+    // Crafted/signaling NaN bytes echo through unchanged — bit-exact
+    // passthrough, Node-exact (no folding possible: these values never
+    // exist as IR numLit operands).
+    run(() => {
+      const src = Buffer.from("7ff8000000000001", "hex");
+      const v = src.readDoubleBE(0);
+      const dst = Buffer.alloc(8);
+      dst.writeDoubleBE(v, 0);
+      return dst.toString("hex");
+    }),
+    run(() => {
+      const src = Buffer.from("fff8000000000000", "hex");
+      const v = src.readDoubleBE(0);
+      const dst = Buffer.alloc(8);
+      dst.writeDoubleBE(v, 0);
+      return dst.toString("hex");
+    }),
+    run(() => {
+      const src = Buffer.from("7ff0000000000001", "hex");
+      const v = src.readDoubleBE(0);
+      const dst = Buffer.alloc(8);
+      dst.writeDoubleBE(v, 0);
+      return dst.toString("hex");
+    }),
+    run(() => {
+      const src = Buffer.from("7fc00001", "hex");
+      const v = src.readFloatBE(0);
+      const dst = Buffer.alloc(4);
+      dst.writeFloatBE(v, 0);
+      return dst.toString("hex");
+    }),
+    run(() => {
+      const src = Buffer.from("7f800001", "hex");
+      const v = src.readFloatBE(0);
+      const dst = Buffer.alloc(4);
+      dst.writeFloatBE(v, 0);
+      return dst.toString("hex");
+    }),
+    caughtJs(() => Buffer.alloc(4).writeFloatBE(1.5, 100)),
+    caughtJs(() => Buffer.alloc(4).writeFloatBE(1.5, 1.5)),
+    caughtJs(() => Buffer.alloc(8).readDoubleBE(100)),
+    caughtJs(() => Buffer.alloc(4).readFloatBE(1)),
+    "",
+  ];
+  expect(stdout.toString("utf8")).toBe(expected.join("\n"));
+});
+
+test("bin: literal-operand constant folding — behavioral parity across +,-,*,/,%,**, validates, and covers the previously-refused literal ** case (SEMANTICS.md S036)", async () => {
+  const source = [
+    "console.log((2 + 3).toString());",
+    "console.log((2 - 3).toString());",
+    "console.log((2 * 3).toString());",
+    "console.log((7 / 2).toString());",
+    "console.log((7 % 2).toString());",
+    "console.log((2 ** 10).toString());", // previously an unconditional SC3001 refusal — literal-literal now folds
+    "console.log((0 / 0).toString());", // folded NaN — byte-level pinned separately in the float-kinds test
+    "console.log((-0 * 1).toString());", // sign-bit case: fold must not normalize -0 away
+    "",
+  ].join("\n");
+  const res = await buildWasm("bin-literal-fold.ts", source);
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  const expected = [
+    (2 + 3).toString(),
+    (2 - 3).toString(),
+    (2 * 3).toString(),
+    (7 / 2).toString(),
+    (7 % 2).toString(),
+    (2 ** 10).toString(),
+    (0 / 0).toString(),
+    (-0 * 1).toString(),
+    "",
+  ].join("\n");
+  expect(stdout.toString("utf8")).toBe(expected);
+});
+
+test("bin: ** still refuses for NON-literal operands — folding is literal-operand only, no constant propagation or variable lookthrough", async () => {
+  const res = await buildWasm(
+    "bin-pow-nonliteral.ts",
+    ["const a: number = 2;", "const b: number = 10;", "console.log((a ** b).toString());", ""].join("\n"),
+  );
+  expect(res.ok).toBe(false);
+  if (res.ok) return;
+  expect(res.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
+  expect(res.wasmSurvey).toContain("bin:**");
+});
+
+test("bin: a variable-sourced division is NOT folded away — proves no over-folding by diffing raw f64.div (0xa3) opcode counts between otherwise-identical programs", async () => {
+  // Two programs, structurally identical (same locals, one console.log
+  // call each) except line 3: the baseline assigns `c = a` (a plain
+  // varRef, no arithmetic); the test program assigns `c = a / b` (a
+  // REAL division over two `const`-bound variables — provably constant-
+  // valued by a human reader, but NOT IR numLit nodes, so emitBin's fold
+  // check must not touch it). Any 0xa3 bytes contributed by unrelated
+  // stdlib code (e.g. number formatting) are identical in both binaries
+  // and cancel out of the diff — only the count DELTA is asserted, not
+  // an absolute count, so this doesn't assume anything about baseline
+  // noise elsewhere in the module.
+  const countF64Div = (bytes: Uint8Array): number => {
+    let n = 0;
+    for (const b of bytes) if (b === 0xa3) n++;
+    return n;
+  };
+  const baseline = await buildWasm(
+    "bin-nofold-baseline.ts",
+    ["const a: number = 4;", "const b: number = 2;", "const c: number = a;", "console.log(c.toString());", ""].join(
+      "\n",
+    ),
+  );
+  if (!baseline.ok) throw new Error(`refused: ${baseline.diagnostics[0]?.message}`);
+  const withDivision = await buildWasm(
+    "bin-nofold-division.ts",
+    [
+      "const a: number = 4;",
+      "const b: number = 2;",
+      "const c: number = a / b;",
+      "console.log(c.toString());",
+      "",
+    ].join("\n"),
+  );
+  if (!withDivision.ok) throw new Error(`refused: ${withDivision.diagnostics[0]?.message}`);
+  const baselineCount = countF64Div(readFileSync(baseline.binaryPath));
+  const withDivisionCount = countF64Div(readFileSync(withDivision.binaryPath));
+  expect(withDivisionCount).toBe(baselineCount + 1);
+  // Behavioral cross-check: the (unfolded) division still computes the
+  // right answer at runtime.
+  const { stdout } = await runWasm(withDivision.binaryPath);
+  expect(stdout.toString("utf8")).toBe(`${(4 / 2).toString()}\n`);
+});
+
+test("bin: the measured V8 folding boundary — Infinity/NaN globals, recursive literal-derived folds, in-process Node diff (SEMANTICS.md S036's table)", async () => {
+  // Every row is the reviewer's measured boundary table, re-verified here
+  // independently (in-process Node diff, not a hardcoded hex string, so
+  // this travels correctly if a future toolchain moves the hardware
+  // pattern). FOLDS rows must give the CANONICAL NaN on both sides;
+  // DOES-NOT-FOLD rows must give the SAME (hardware) pattern on both
+  // sides, whatever that pattern is on this host/toolchain.
+  const folds: [string, string, () => number][] = [
+    ["0/0", "0 / 0", () => 0 / 0],
+    ["0.0/0.0", "0.0 / 0.0", () => 0.0 / 0.0],
+    ["(0)/(0)", "(0) / (0)", () => (0) / (0)],
+    ["-0/0", "-0 / 0", () => -0 / 0],
+    ["0/-0", "0 / -0", () => 0 / -0],
+    ["0%0", "0 % 0", () => 0 % 0],
+    ["(1/0)-(1/0)", "(1 / 0) - (1 / 0)", () => (1 / 0) - (1 / 0)], // literal-DERIVED Infinity is a foldable intermediate
+    ["(1/0)*0", "(1 / 0) * 0", () => (1 / 0) * 0],
+    ["NaN", "NaN", () => NaN],
+    ["NaN+1", "NaN + 1", () => NaN + 1],
+    ["NaN*2", "NaN * 2", () => NaN * 2],
+  ];
+  const doesNotFold: [string, string, () => number][] = [
+    ["0*Infinity", "0 * Infinity", () => 0 * Infinity], // the Infinity GLOBAL does not fold, unlike a literal-derived Infinity
+    ["Infinity-Infinity", "Infinity - Infinity", () => Infinity - Infinity],
+    ["Infinity/Infinity", "Infinity / Infinity", () => Infinity / Infinity],
+    ["Infinity*0", "Infinity * 0", () => Infinity * 0],
+  ];
+  const rows = [...folds, ...doesNotFold];
+  const lines = rows.map(
+    ([, expr]) => `{ const b = Buffer.alloc(8); b.writeDoubleBE(${expr}, 0); console.log(b.toString('hex')); }`,
+  );
+  const res = await buildWasm("bin-boundary-table.ts", [...lines, ""].join("\n"));
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  const wasmLines = stdout.toString("utf8").trim().split("\n");
+
+  // Node's own answer for the SAME expressions, computed in-process (not
+  // hardcoded) so a future toolchain's hardware pattern doesn't break
+  // this test — only the WASM-VS-NODE agreement is asserted.
+  const nodeHex = (fn: () => number): string => {
+    const b = Buffer.alloc(8);
+    b.writeDoubleBE(fn(), 0);
+    return b.toString("hex");
+  };
+  for (let i = 0; i < rows.length; i++) {
+    const [label, , fn] = rows[i]!;
+    expect(wasmLines[i], `row "${label}"`).toBe(nodeHex(fn));
+  }
+  // The fold rows specifically must be canonical (not just "match Node
+  // by coincidence") — this is the actual claim S036 makes.
+  for (let i = 0; i < folds.length; i++) {
+    expect(wasmLines[i], `fold row "${folds[i]![0]}" must be canonical`).toBe("7ff8000000000000");
+  }
+});
+
+test("bytes: writeNum float LE — the reviewer's LE-shaped NaN vectors, including f32's quiet-but-preserve-payload round trip, in-process Node diff", async () => {
+  // f64: no narrowing conversion involved, so every vector should be a
+  // pure bit-exact echo, LE included. f32: readFloatLE/writeFloatLE
+  // widen to f64 then narrow back to f32 (JS numbers are always f64) —
+  // an ALREADY-QUIET input echoes exactly, but a SIGNALING input (top
+  // mantissa bit clear) gets QUIETED (top mantissa bit set) while every
+  // OTHER payload bit is preserved — a hardware artifact of the
+  // f32->f64->f32 conversion path, not something this tier's write side
+  // does deliberately; Node has the identical artifact (measured), so
+  // this is Node-exact, not a divergence.
+  const f64Vectors = ["010000000000f87f", "010000000000f8ff", "010000000000f07f", "ffffffffffffffff"];
+  const f32Vectors = ["0100c07f", "0100c0ff", "0100807f", "ffffffff"]; // third one is the signaling case
+  const lines: string[] = [];
+  for (const h of f64Vectors) {
+    lines.push(
+      `{ const src = Buffer.from('${h}', 'hex'); const v = src.readDoubleLE(0); const dst = Buffer.alloc(8); dst.writeDoubleLE(v, 0); console.log(dst.toString('hex')); }`,
+    );
+  }
+  for (const h of f32Vectors) {
+    lines.push(
+      `{ const src = Buffer.from('${h}', 'hex'); const v = src.readFloatLE(0); const dst = Buffer.alloc(4); dst.writeFloatLE(v, 0); console.log(dst.toString('hex')); }`,
+    );
+  }
+  const res = await buildWasm("bytes-writenum-float-le-vectors.ts", [...lines, ""].join("\n"));
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  const wasmLines = stdout.toString("utf8").trim().split("\n");
+
+  const expected: string[] = [];
+  for (const h of f64Vectors) {
+    const src = Buffer.from(h, "hex");
+    const v = src.readDoubleLE(0);
+    const dst = Buffer.alloc(8);
+    dst.writeDoubleLE(v, 0);
+    expected.push(dst.toString("hex"));
+  }
+  for (const h of f32Vectors) {
+    const src = Buffer.from(h, "hex");
+    const v = src.readFloatLE(0);
+    const dst = Buffer.alloc(4);
+    dst.writeFloatLE(v, 0);
+    expected.push(dst.toString("hex"));
+  }
+  expect(wasmLines).toEqual(expected);
+  // Pin the specific signaling-quiets-but-preserves-payload claim
+  // explicitly, not just via the diff above.
+  expect(expected[6]).toBe("0100c07f"); // f32Vectors[2] = "0100807f" (signaling) -> quiets
+  expect(wasmLines[6]).toBe("0100c07f");
+});
+
+test("bytes: writeNum float — a GENUINELY runtime-computed NaN (array-element division, not a literal) passes through as bit-exact as Node's own runtime NaN (SEMANTICS.md S036)", async () => {
+  // Deliberately NOT a literal 0/0: emitBin's literal-operand fold only
+  // fires when BOTH operands are IR numLit nodes, and an array read is
+  // not one — this exercises the UNFOLDED path, where this tier passes
+  // the division's own bits through unchanged, exactly like the fixed-
+  // width integer helpers do for every other value. Whatever bit pattern
+  // the host toolchain's wasm f64.div/f32 narrowing actually produces is
+  // the expected answer here — NOT hardcoded, diffed against a real Node
+  // run of the SAME source, so this test travels correctly to a future
+  // toolchain or host architecture that computes a different pattern.
+  const source = [
+    "const arr: number[] = [0, 0];",
+    "const b1 = Buffer.alloc(8); b1.writeDoubleBE(arr[0]! / arr[1]!, 0); console.log(b1.toString('hex'));",
+    "const b2 = Buffer.alloc(8); b2.writeDoubleLE(arr[0]! / arr[1]!, 0); console.log(b2.toString('hex'));",
+    "const b3 = Buffer.alloc(4); b3.writeFloatBE(arr[0]! / arr[1]!, 0); console.log(b3.toString('hex'));",
+    "const b4 = Buffer.alloc(4); b4.writeFloatLE(arr[0]! / arr[1]!, 0); console.log(b4.toString('hex'));",
+    "",
+  ].join("\n");
+  const res = await buildWasm("bytes-writenum-float-runtime-nan.ts", source);
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+
+  const arr: number[] = [0, 0];
+  const b1 = Buffer.alloc(8);
+  b1.writeDoubleBE(arr[0]! / arr[1]!, 0);
+  const b2 = Buffer.alloc(8);
+  b2.writeDoubleLE(arr[0]! / arr[1]!, 0);
+  const b3 = Buffer.alloc(4);
+  b3.writeFloatBE(arr[0]! / arr[1]!, 0);
+  const b4 = Buffer.alloc(4);
+  b4.writeFloatLE(arr[0]! / arr[1]!, 0);
+  const expected = [b1.toString("hex"), b2.toString("hex"), b3.toString("hex"), b4.toString("hex"), ""].join("\n");
+  expect(stdout.toString("utf8")).toBe(expected);
+});
+
+test("bytes: readNumVar/writeNumVar — every byteLength 1-6, all four kinds, the byteLength-first check order, NaN-writes-zero, Node-exact errors, and the byteLength>4 symbolic message-format switch", async () => {
+  const srcLines: string[] = [
+    "const caught = (fn: () => void): void => {",
+    "  try { fn(); console.log('no throw'); }",
+    "  catch (e) {",
+    "    const err = e as Error;",
+    "    console.log('caught:' + err.name + ':' + err.message);",
+    "  }",
+    "};",
+  ];
+  // Round-trip every byteLength 1-6, all four kinds, with a representative value.
+  for (let bl = 1; bl <= 6; bl++) {
+    const uval = `0x${"12".repeat(bl)}`;
+    srcLines.push(
+      `{ const w = Buffer.alloc(${bl}); w.writeUIntLE(${uval}, 0, ${bl}); console.log(w.toString('hex') + ':' + w.readUIntLE(0, ${bl})); }`,
+      `{ const w = Buffer.alloc(${bl}); w.writeUIntBE(${uval}, 0, ${bl}); console.log(w.toString('hex') + ':' + w.readUIntBE(0, ${bl})); }`,
+      `{ const w = Buffer.alloc(${bl}); w.writeIntLE(-1, 0, ${bl}); console.log(w.toString('hex') + ':' + w.readIntLE(0, ${bl})); }`,
+      `{ const w = Buffer.alloc(${bl}); w.writeIntBE(-1, 0, ${bl}); console.log(w.toString('hex') + ':' + w.readIntBE(0, ${bl})); }`,
+    );
+  }
+  // NaN writes zero, byteLength-first check order, value range, offset ladder.
+  srcLines.push(
+    "{ const w = Buffer.alloc(3); const n = w.writeUIntLE(NaN, 0, 3); console.log(n + ':' + w.toString('hex')); }",
+    "{ const w = Buffer.alloc(3); const n = w.writeIntLE(NaN, 0, 3); console.log(n + ':' + w.toString('hex')); }",
+    "{ const w = Buffer.alloc(3); const n = w.writeUIntLE(1.9, 0, 3); console.log(n + ':' + w.toString('hex')); }",
+    "{ const w = Buffer.alloc(3); const n = w.writeIntLE(-1.9, 0, 3); console.log(n + ':' + w.toString('hex')); }",
+    "caught(() => { Buffer.alloc(8).readUIntLE(0, 0); });",
+    "caught(() => { Buffer.alloc(8).readUIntLE(0, 7); });",
+    "caught(() => { Buffer.alloc(8).readUIntLE(0, -1); });",
+    "caught(() => { Buffer.alloc(8).readUIntLE(0, -1.5); });",
+    "caught(() => { Buffer.alloc(8).readUIntLE(0, NaN); });",
+    "caught(() => { Buffer.alloc(8).readUIntLE(0, Infinity); });",
+    "caught(() => { Buffer.alloc(8).readUIntLE(0, -Infinity); });",
+    "caught(() => { Buffer.alloc(8).readUIntLE(100, 7); });", // byteLength error wins over offset
+    "caught(() => { Buffer.alloc(8).writeUIntLE(999999999, 100, 7); });", // byteLength error wins
+    "caught(() => { Buffer.alloc(8).writeUIntLE(-1, 0, 0); });", // byteLength error wins over value
+    "caught(() => { Buffer.alloc(3).writeUIntLE(16777216, 0, 3); });",
+    "caught(() => { Buffer.alloc(3).writeUIntLE(16777215, 0, 3); Buffer.alloc(3).writeUIntLE(-1, 0, 3); });",
+    "caught(() => { Buffer.alloc(3).readUIntLE(1, 3); });", // offset out of range for byteLength
+    "caught(() => { Buffer.alloc(3).readUIntLE(0.5, 3); });",
+    // Value-range error message format switch at byteLength > 4 (measured
+    // against Node directly): 1-4 keeps the decimal "must be >= MIN and
+    // <= MAX"; 5-6 switches to symbolic "must be >= 0 and < 2 ** N" /
+    // "must be >= -(2 ** N) and < 2 ** N" with an EXCLUSIVE upper bound.
+    // `**` isn't supported by this backend, so literal decimals stand in
+    // for `2 ** 40` etc. below.
+    "caught(() => { const b = Buffer.alloc(8); b.writeUIntLE(1099511627776, 0, 5); });", // unsigned width5 over max (2**40)
+    "caught(() => { const b = Buffer.alloc(8); b.writeIntLE(549755813888, 0, 5); });", // signed width5 over max (2**39)
+    "caught(() => { const b = Buffer.alloc(8); b.writeIntLE(-549755813889, 0, 5); });", // signed width5 under min (-(2**39)-1)
+    "caught(() => { const b = Buffer.alloc(8); b.writeUIntLE(281474976710656, 0, 6); });", // unsigned width6 over max (2**48)
+    "caught(() => { const b = Buffer.alloc(8); b.writeIntLE(140737488355328, 0, 6); });", // signed width6 over max (2**47)
+    "caught(() => { const b = Buffer.alloc(8); b.writeIntLE(-140737488355329, 0, 6); });", // signed width6 under min (-(2**47)-1)
+    "caught(() => { const b = Buffer.alloc(8); b.writeUIntBE(4294967296, 0, 4); });", // unsigned width4 (decimal format still, 2**32)
+    "caught(() => { const b = Buffer.alloc(8); b.writeIntBE(2147483648, 0, 4); });", // signed width4 (decimal format still, 2**31)
+    "",
+  );
+  const res = await buildWasm("bytes-readnumvar-writenumvar.ts", srcLines.join("\n"));
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+
+  const expected: string[] = [];
+  const caughtJs = (fn: () => unknown): string => {
+    try {
+      fn();
+      return "no throw";
+    } catch (e) {
+      const err = e as Error;
+      return `caught:${err.name}:${err.message}`;
+    }
+  };
+  for (let bl = 1; bl <= 6; bl++) {
+    const uval = Number(`0x${"12".repeat(bl)}`);
+    {
+      const w = Buffer.alloc(bl);
+      w.writeUIntLE(uval, 0, bl);
+      expected.push(`${w.toString("hex")}:${w.readUIntLE(0, bl)}`);
+    }
+    {
+      const w = Buffer.alloc(bl);
+      w.writeUIntBE(uval, 0, bl);
+      expected.push(`${w.toString("hex")}:${w.readUIntBE(0, bl)}`);
+    }
+    {
+      const w = Buffer.alloc(bl);
+      w.writeIntLE(-1, 0, bl);
+      expected.push(`${w.toString("hex")}:${w.readIntLE(0, bl)}`);
+    }
+    {
+      const w = Buffer.alloc(bl);
+      w.writeIntBE(-1, 0, bl);
+      expected.push(`${w.toString("hex")}:${w.readIntBE(0, bl)}`);
+    }
+  }
+  {
+    const w = Buffer.alloc(3);
+    const n = w.writeUIntLE(NaN, 0, 3);
+    expected.push(`${n}:${w.toString("hex")}`);
+  }
+  {
+    const w = Buffer.alloc(3);
+    const n = w.writeIntLE(NaN, 0, 3);
+    expected.push(`${n}:${w.toString("hex")}`);
+  }
+  {
+    const w = Buffer.alloc(3);
+    const n = w.writeUIntLE(1.9, 0, 3);
+    expected.push(`${n}:${w.toString("hex")}`);
+  }
+  {
+    const w = Buffer.alloc(3);
+    const n = w.writeIntLE(-1.9, 0, 3);
+    expected.push(`${n}:${w.toString("hex")}`);
+  }
+  expected.push(
+    caughtJs(() => Buffer.alloc(8).readUIntLE(0, 0)),
+    caughtJs(() => Buffer.alloc(8).readUIntLE(0, 7)),
+    caughtJs(() => Buffer.alloc(8).readUIntLE(0, -1)),
+    caughtJs(() => Buffer.alloc(8).readUIntLE(0, -1.5)),
+    caughtJs(() => Buffer.alloc(8).readUIntLE(0, NaN)),
+    caughtJs(() => Buffer.alloc(8).readUIntLE(0, Infinity)),
+    caughtJs(() => Buffer.alloc(8).readUIntLE(0, -Infinity)),
+    caughtJs(() => Buffer.alloc(8).readUIntLE(100, 7)),
+    caughtJs(() => Buffer.alloc(8).writeUIntLE(999999999, 100, 7)),
+    caughtJs(() => Buffer.alloc(8).writeUIntLE(-1, 0, 0)),
+    caughtJs(() => Buffer.alloc(3).writeUIntLE(2 ** 24, 0, 3)),
+    caughtJs(() => {
+      Buffer.alloc(3).writeUIntLE(2 ** 24 - 1, 0, 3);
+      Buffer.alloc(3).writeUIntLE(-1, 0, 3);
+    }),
+    caughtJs(() => Buffer.alloc(3).readUIntLE(1, 3)),
+    caughtJs(() => Buffer.alloc(3).readUIntLE(0.5, 3)),
+    caughtJs(() => {
+      const b = Buffer.alloc(8);
+      b.writeUIntLE(2 ** 40, 0, 5);
+    }),
+    caughtJs(() => {
+      const b = Buffer.alloc(8);
+      b.writeIntLE(2 ** 39, 0, 5);
+    }),
+    caughtJs(() => {
+      const b = Buffer.alloc(8);
+      b.writeIntLE(-(2 ** 39) - 1, 0, 5);
+    }),
+    caughtJs(() => {
+      const b = Buffer.alloc(8);
+      b.writeUIntLE(2 ** 48, 0, 6);
+    }),
+    caughtJs(() => {
+      const b = Buffer.alloc(8);
+      b.writeIntLE(2 ** 47, 0, 6);
+    }),
+    caughtJs(() => {
+      const b = Buffer.alloc(8);
+      b.writeIntLE(-(2 ** 47) - 1, 0, 6);
+    }),
+    caughtJs(() => {
+      const b = Buffer.alloc(8);
+      b.writeUIntBE(2 ** 32, 0, 4);
+    }),
+    caughtJs(() => {
+      const b = Buffer.alloc(8);
+      b.writeIntBE(2 ** 31, 0, 4);
+    }),
+    "",
+  );
+  expect(stdout.toString("utf8")).toBe(expected.join("\n"));
+});

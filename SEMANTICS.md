@@ -1597,3 +1597,175 @@ emitter unit test's bytes validate-sweep prints `a.byteOffset` for a
 `Buffer.from(...)`-constructed value and pins `0` — that assertion is
 OUR answer, not Node's, and is commented as such with this citation so
 the test does not silently claim a Node-parity it does not have.
+
+## S036 — A NaN's bit pattern depends on its PROVENANCE, on both Node and this tier — mirrored by folding at the SAME (measured) boundary V8 folds *(wasm tier)*
+
+A NaN value's byte pattern is not one fixed thing on Node itself — it
+depends on where the NaN came from and, per spec, is allowed to depend on
+it. This is not implementation sloppiness: the WebAssembly spec's
+"NaN Propagation" rule (Execution → Numerics) states it outright — for a
+floating-point operator producing a NaN result, **the sign is
+non-deterministic**; the payload is canonical when every NaN INPUT (if
+any) already carried a canonical payload — which trivially includes the
+no-NaN-input case (`0/0` has no NaN operands at all) — and is otherwise
+picked non-deterministically among arithmetic NaNs (only the top payload
+bit fixed at 1). `fneg`/`fabs`/`fcopysign` are the sign-preserving
+exceptions; ordinary arithmetic (`add`/`sub`/`mul`/`div`/`rem`) is not.
+So the SAME operation, `0.0 / 0.0`, is spec-licensed to produce EITHER
+sign — V8's own wasm executor and V8's own JS interpreter are each
+individually spec-conformant even when they pick opposite signs for the
+identical computation, because the spec never promised they'd agree.
+
+**Measured boundary (Node 24.18, V8, x86_64), via `writeDoubleBE`:**
+
+| class | expressions | bytes (f64) |
+|---|---|---|
+| FOLDS → canonical | `0/0`, `0.0/0.0`, `(0)/(0)`, `-0/0`, `0/-0`, `0%0` | `7ff8000000000000` |
+| FOLDS → canonical, recursive | `(1/0)-(1/0)`, `(1/0)*0` — a literal-DERIVED `Infinity` is a foldable intermediate | `7ff8000000000000` |
+| FOLDS → canonical, the `NaN` global | `NaN`, `NaN+1`, `NaN*2` | `7ff8000000000000` |
+| does NOT fold → hardware | `0*Infinity`, `Infinity-Infinity`, `Infinity/Infinity`, `Infinity*0` — the `Infinity` GLOBAL does not fold, unlike a literal-derived Infinity | `fff8000000000000` (sign bit SET on this x86_64 build — non-deterministic per spec, could differ on another host/engine build) |
+| does NOT fold → hardware, variable lookthrough | `const z = 0; z / z` and every param/element/field form | `fff8000000000000` |
+| read from existing bytes | `buf.readDoubleBE(0)` written back unchanged | whatever bits were read (exact echo, sign/payload preserved) |
+| string-derived (STRUCK — see below) | `Number("x")`, `parseFloat("x")`, `+"x"` | N/A — refuses in-tier |
+| **overflowed source literal — REGISTERED RESIDUE** | `1e999 - 1e999`: a decimal literal whose VALUE overflows to `Infinity` at parse time | Node: `7ff8000000000000` (V8 folds it); this tier: `fff8000000000000` (our leaf-Infinity-poisons rule does not distinguish it from the `Infinity` global) — **DIVERGES** |
+
+The "does NOT fold" row for the `Infinity` global is the arbitrary-
+looking but ORACLE-CONFIRMED half of this boundary: `Infinity` and `NaN`
+lower to the exact same IR shape (a bare `numLit`, `lower-exprs.ts`) with
+no provenance marker distinguishing "the global" from "a literal-derived
+value of the same magnitude" — yet V8 folds `NaN`-involving expressions
+and does NOT fold `Infinity`-involving ones. Re-measured independently
+this round (own probe, agreeing with the reviewer's table on every row).
+
+**The overflowed-literal row is a genuine, currently-unresolved
+divergence, not merely an untested axis.** `1e999` is SOURCE SYNTAX — a
+numeric literal token whose decimal value exceeds the f64 range — and V8
+folds `1e999 - 1e999` to the canonical NaN, exactly like the ordinary
+literal-arithmetic rows above, NOT like the `Infinity`-global rows. But
+at the IR level this tier receives, an overflowed literal and the
+`Infinity` global are the SAME THING: both lower to a bare `numLit` with
+value `Infinity` and no further marker (`lower-exprs.ts`), so this tier's
+leaf-poisons-on-Infinity rule cannot tell them apart and treats `1e999`
+the same as the `Infinity` global — incorrectly, for this one row. The
+distinction V8 is actually making lives at a RAW-SOURCE level (was this
+token literally digits-and-exponent syntax, or an identifier lookup) that
+this tier's IR does not preserve past lowering; fixing it would mean
+carrying a provenance bit through `numLit` specifically for this case,
+which is frontend surgery out of scope for this fix round (see the
+board's #22 disposition). **Measured against the differential harness's
+REAL oracle invocation specifically — `node --experimental-transform-types`
+(`tests/harness/wasm-differential.test.ts`), not a third-party
+transpiler:** a naive verification via `tsx` (the popular esbuild-backed
+TS runner) gives `fff8000000000000` for this SAME expression — the WRONG
+answer, i.e. NOT what the actual differential census oracle produces —
+because esbuild's own bundling/constant-folding pass does not replicate
+V8's literal-vs-identifier folding distinction. This is exactly why this
+entry insists on citing the harness's own oracle command rather than "a
+Node-family tool" generically: two different, both-plausible "run this
+TS file" tools disagree with each other on this one row, and only one of
+them is the actual oracle this project holds itself to.
+
+**What this tier does.** `writeDoubleBE`/`writeFloatBE`
+(`typedarrays.ts`'s `writeNumFloatHelper`) are a plain bit-exact
+passthrough — no canonicalization at the write site — matching the
+"does not fold" and "read from existing bytes" rows directly. The FOLDS
+rows are handled upstream, at the emitter's `emitBin`/`tryFoldFloatConst`
+(`emitter.ts`): a RECURSIVE fold over float arithmetic (`+ - * / % **`)
+whose leaves are numLits, mirroring the measured boundary exactly —
+- a `numLit` folds to its value, UNLESS that value is exactly
+  `Infinity`/`-Infinity` reached AT A LEAF (a direct operand position):
+  reaching Infinity there poisons the containing expression, reproducing
+  "the `Infinity` global doesn't fold" without needing a provenance
+  marker the IR doesn't carry.
+- a `bin` node folds if BOTH operands (recursively) fold — this is what
+  lets a literal-DERIVED Infinity (`1/0`, a computed RESULT, not a leaf)
+  re-enter the fold pool for `(1/0)-(1/0)`, even though a bare `Infinity`
+  leaf cannot: the poison rule only fires at a direct numLit leaf.
+- a unary `-` over a foldable operand folds too (`-(1/0)`-shaped
+  expressions); `-0`/`-Infinity`/`-NaN` never reach this arm because the
+  frontend already pre-folds unary-minus directly over a numLit operand
+  into a signed numLit (`lowerPrefixUnary`).
+- anything else (varRef, calls, ...) does not fold: no constant
+  propagation, no variable lookthrough.
+
+A NaN result of the fold gets the CANONICAL bit pattern substituted
+EXPLICITLY (never the fold computation's own bits): folding runs inside
+the compiler's own V8 process, itself "runtime" from the fold's
+perspective, so an unguarded `0/0` computed there would land on the
+hardware pattern, not canonical — exactly the trap this entry's spec
+citation explains.
+
+**Struck: string-derived NaN provenance.** `Number("x")`/`parseFloat`/
+unary `+` over a non-numeric string all route through `num.fromString`
+(`libCall`), which REFUSES on this tier today — there is no in-tier path
+that can produce a string-derived NaN to verify. Revisit this row if/when
+`num.fromString` lands.
+
+**Struck: Math-function NaN provenance.** `Math.sqrt`, `Math.log`,
+`Math.pow`, and every other `Math.*` call all REFUSE on this tier today
+(`SC2012` — dyn-engine-only, `milestone: M4`) — there is no in-tier
+arithmetic path that can produce a NaN outside plain `+ - * / % **`.
+Verified directly this round (`Math.sqrt(-1)`/`Math.log(-1)`/
+`Math.pow(-1,0.5)` all refuse). The reviewer's third NaN-payload pattern
+(`Math.log(-1)` → `7ff4000000000000`, neither canonical nor hardware —
+libm's own payload choice) is registered here as a KNOWN FUTURE AXIS,
+not measured against this tier, because nothing compiles today that
+could diverge on it. Revisit when any `Math.*` call lands in-tier.
+
+**The registered risk — three items: one KNOWN divergence, two axes not
+currently measured to diverge:**
+0. **KNOWN: the overflowed-literal row above.** `1e999 - 1e999` and any
+   equivalent expression built from a source literal that overflows to
+   `Infinity` gives this tier's hardware pattern where Node gives
+   canonical — a real, currently-unfixed residue of the leaf-Infinity-
+   poisons rule, not a hypothetical. Out of scope for this fix round
+   (frontend surgery to carry literal-vs-identifier provenance through
+   `numLit`); tracked for a future increment.
+1. **Our folding boundary vs. V8's, otherwise.** This tier's boundary is:
+   literal IR operands, recursively, with Infinity-as-leaf poisoned — an
+   exact, testable rule. V8's is whatever V8's parser/optimizer actually
+   does, independently measured per row above. Every row this round
+   tested matches EXCEPT the overflowed-literal row (item 0); a row this
+   entry does not enumerate (the struck rows above, or some future
+   syntactic form) could still diverge and would need its own measurement
+   before being trusted.
+2. **The spec's own sign-nondeterminism.** Because NaN sign is
+   spec-legal to vary by engine/build/host, THIS tier's answer for the
+   "does not fold" rows is only guaranteed to match Node's TODAY, on
+   THIS toolchain (Node 24.18, V8, x86_64) — both sides currently choose
+   the SAME hardware pattern for a genuinely-computed NaN because both
+   run on the identical underlying V8/hardware. If a future V8 build (or
+   a differently-configured host, e.g. ARM) flips which sign its
+   OWN wasm executor picks independent of its JS interpreter, the
+   differential census would fail VISIBLY on the "does not fold" rows —
+   this entry is that failure's explanation, not a guarantee it cannot
+   happen. The FOLDS rows are immune to this risk: canonical bits are
+   substituted explicitly, never computed.
+
+**Cross-reference to board item #6.** The C+LLVM backend's Map storage
+has its own, separately-tracked NaN-key bug (board #6). Node's Map/Set
+use SameValueZero, under which every NaN is one key regardless of payload
+bits, so a NaN key's stored bits are unobservable AS a key on any
+backend; they only become observable once they cross a byte-exposure
+boundary like `writeDoubleBE`, at which point THIS entry's provenance
+rule governs the answer (whatever bits the key carried get echoed, per
+the "read from existing bytes" row). No contradiction — different layers.
+
+**Tested by:** `wasm-emitter.test.ts` — a dedicated boundary-table test
+pinning EVERY fold/no-fold row above via an in-process Node diff (not a
+hardcoded hex string, so it travels to a future toolchain that moves the
+hardware pattern) plus an explicit canonical-bits assertion on the fold
+rows specifically; a literal-folding behavioral test (parity across all
+six ops including the previously-refused literal `**` case, plus a `-0`
+sign-preservation check); a byte-level float-kinds test pinning the
+literal-`0/0` fold and the crafted/read-back echo case; an LE-vector test
+(f64 and f32, including the f32 signaling-quiets-but-preserves-payload
+round trip — a hardware artifact of the f32↔f64 conversion path, Node-
+exact, not a divergence); a dedicated runtime-NaN test using an array-
+element division specifically to avoid the fold path (covers BE/LE,
+f32/f64); and an opcode-count test proving a variable-sourced division
+still emits a real `f64.div` (0xa3) rather than being folded away, by
+diffing raw byte counts between two otherwise-identical compiled
+binaries. Corpus program `1660-buffer-read-write-num.ts` pins the
+literal-fold case end-to-end through the differential harness
+(`tests/harness/wasm-differential.test.ts`'s `TIER_FLOOR`).

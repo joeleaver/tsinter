@@ -163,6 +163,21 @@ test("typedarrays.ts: every BytesBuilder helper, every elem kind, emits a VALID 
   }
   bytesB.concatHelper();
   bytesB.concatLenHelper();
+  // Round B4: float readNum/writeNum kinds, readNumVar/writeNumVar (the
+  // 1-6 byte variable-width family), and byteLengthErrorHelper — like
+  // numReceivedHelper, only reached transitively today (through every
+  // readNumVar/writeNumVar byteLength check), so pinned directly too.
+  const floatKinds = ["f32be", "f32le", "f64be", "f64le"];
+  for (const kind of floatKinds) {
+    bytesB.readNumFloatHelper(kind);
+    bytesB.writeNumFloatHelper(kind);
+  }
+  const varKinds = ["ube", "ule", "ibe", "ile"];
+  for (const kind of varKinds) {
+    bytesB.readNumVarHelper(kind);
+    bytesB.writeNumVarHelper(kind);
+  }
+  bytesB.byteLengthErrorHelper();
 
   const bytes = mb.emit();
   expect(WebAssembly.validate(bytes)).toBe(true);

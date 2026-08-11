@@ -330,6 +330,9 @@ export class Code {
   f64ConvertI32U(): void {
     this.w.u8(0xb8);
   }
+  f64ConvertI64S(): void {
+    this.w.u8(0xb9);
+  }
   f64ConvertI64U(): void {
     this.w.u8(0xba);
   }
@@ -408,6 +411,11 @@ export class Code {
   /** Traps on NaN/out-of-range — callers bound-check first. */
   i32TruncF64S(): void {
     this.w.u8(0xaa);
+  }
+  /** Traps on NaN/out-of-range — callers bound-check (or explicitly zero
+   * NaN) first, same discipline as i32TruncF64S. */
+  i64TruncF64S(): void {
+    this.w.u8(0xb0);
   }
   arrayNewDefault(typeIndex: number): void {
     this.w.u8(0xfb);

@@ -1210,6 +1210,26 @@ const TIER_FLOOR: string[] = [
   "1661-buffer-encodings-full.ts",
   "1663-buffer-compare-search-fill.ts",
   "2380-buffer-module-named-import.ts",
+  // Increment 18 stage B, round B4 (closing stage B): readNum/writeNum's
+  // float kinds (f32be/f32le/f64be/f64le) and the readNumVar/writeNumVar
+  // 1-6 byte variable-width family. 1660 needed BOTH pieces to fully
+  // claim, plus a fix mid-round: the census caught the var-width WRITE
+  // family's value-range error message switching to a symbolic "2 ** N"
+  // format at byteLength > 4 (now Node-exact), and separately exposed
+  // that a NaN's bit pattern depends on its PROVENANCE (literal-folded
+  // vs. genuinely runtime-computed) on BOTH Node and this tier — this
+  // tier now folds literal-operand float arithmetic at compile time
+  // (emitter.ts's emitBin) the same way V8 folds it, matching Node's
+  // bytes on every provenance measured (SEMANTICS.md S036) — 1660 is
+  // this fix's own corpus pin for the literal-fold case (`0/0`).
+  "1660-buffer-read-write-num.ts",
+  // Two more programs claimed as a SIDE EFFECT of the same fix: both use
+  // a literal-literal `**` expression (e.g. `2 ** 10`), previously an
+  // unconditional bin:** refusal — emitBin's literal-operand fold now
+  // computes these at compile time (no general Math.pow support needed
+  // for the literal case), so both compile and are byte-exact.
+  "101-arithmetic.ts",
+  "1630-inspect-scalars.ts",
 ];
 
 interface RunResult {

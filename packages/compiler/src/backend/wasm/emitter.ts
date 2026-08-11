@@ -369,6 +369,19 @@ const ERR_NAME = 1;
 const ERR_MESSAGE = 2;
 const ERR_CODE = 3;
 
+/** The canonical IEEE754 quiet NaN (0x7ff8000000000000), constructed
+ * byte-exact from the literal hex rather than trusted from any
+ * expression's OWN NaN bits — SEMANTICS.md S036: a NaN produced by real
+ * arithmetic, even inside THIS COMPILER's own host process (folding runs
+ * under our own V8/Node, which is itself a "runtime" from the target
+ * program's perspective), is not guaranteed to carry this exact pattern
+ * (measured: V8 gives the hardware-dependent pattern for genuinely
+ * computed NaNs, the canonical one only for parser-folded literal
+ * constants). Used by emitBin's literal-operand folding to emit the
+ * SAME answer Node gives for a literal expression, explicitly, rather
+ * than passing through whatever bits our own fold computation produced. */
+const CANONICAL_NAN: number = new Float64Array(new BigUint64Array([0x7ff8000000000000n]).buffer)[0]!;
+
 /** The three `dynInvoke` names whose real receiver is a PROMISE. They
  * refuse rather than dispatch: a promise box is constructible here, and
  * its reactions belong to the fiber machinery, not the dyn surface. */
@@ -8529,28 +8542,42 @@ class Assembler {
           case "readNum":
           case "writeNum": {
             // The kind is ALWAYS a compile-time strLit (validate.ts's
-            // gate on this node). f32/f64 kinds are stage-B follow-up
-            // work (they need i64/f32-reinterpret machinery this file
-            // doesn't build yet) — named-refused per kind so the census
-            // stays honest, before ever calling into typedarrays.ts.
+            // gate on this node).
             const kindArg = e.args[0];
             if (kindArg === undefined || kindArg.kind !== "strLit") {
               throw new Error(`emitter bug: bytesIntrinsic ${e.method} without a strLit kind`);
             }
             const kind = kindArg.value;
-            if (kind === "f32be" || kind === "f32le" || kind === "f64be" || kind === "f64le") {
-              this.refuse(`bytesIntrinsic:${e.method}:${kind}`, e.loc);
-              code.unreachable();
-              return;
-            }
+            const isFloat = kind === "f32be" || kind === "f32le" || kind === "f64be" || kind === "f64le";
             this.walkExpr(e.receiver);
             if (e.method === "readNum") {
               this.walkExpr(e.args[1]!); // offset
-              code.call(this.bytesB.readNumHelper(kind));
+              code.call(isFloat ? this.bytesB.readNumFloatHelper(kind) : this.bytesB.readNumHelper(kind));
             } else {
               this.walkExpr(e.args[1]!); // value
               this.walkExpr(e.args[2]!); // offset
-              code.call(this.bytesB.writeNumHelper(kind));
+              code.call(isFloat ? this.bytesB.writeNumFloatHelper(kind) : this.bytesB.writeNumHelper(kind));
+            }
+            this.emitPendingCheck();
+            return;
+          }
+          case "readNumVar":
+          case "writeNumVar": {
+            const kindArg = e.args[0];
+            if (kindArg === undefined || kindArg.kind !== "strLit") {
+              throw new Error(`emitter bug: bytesIntrinsic ${e.method} without a strLit kind`);
+            }
+            const kind = kindArg.value;
+            this.walkExpr(e.receiver);
+            if (e.method === "readNumVar") {
+              this.walkExpr(e.args[1]!); // offset
+              this.walkExpr(e.args[2]!); // byteLength
+              code.call(this.bytesB.readNumVarHelper(kind));
+            } else {
+              this.walkExpr(e.args[1]!); // value
+              this.walkExpr(e.args[2]!); // offset
+              this.walkExpr(e.args[3]!); // byteLength
+              code.call(this.bytesB.writeNumVarHelper(kind));
             }
             this.emitPendingCheck();
             return;
@@ -9064,8 +9091,87 @@ class Assembler {
 
   /* ── operators ──────────────────────────────────────────────────────── */
 
+  /** Attempts to fold `e` to a plain host number — RECURSIVE over
+   * literal-derived float arithmetic, mirroring V8's OWN measured
+   * constant-folding boundary (SEMANTICS.md S036 has the full table),
+   * not a general partial evaluator:
+   *  - a `numLit` folds to its value, UNLESS that value is EXACTLY
+   *    +/-Infinity: `Infinity`/`NaN` as source globals lower to a BARE
+   *    numLit with no other marker (lower-exprs.ts), so a numLit
+   *    holding +/-Infinity AT A LEAF POSITION is, in this IR,
+   *    indistinguishable from the bare `Infinity` global — which V8
+   *    measurably does NOT constant-fold (`Infinity-Infinity`,
+   *    `0*Infinity`: the runtime/hardware NaN pattern, not canonical).
+   *    Treating a leaf-position Infinity as unfoldable (poisoning its
+   *    containing expression) reproduces that boundary exactly. `NaN`
+   *    has no equivalent ambiguity — there is no OTHER way to spell a
+   *    NaN-valued numLit — so it folds normally alongside ordinary
+   *    finite literals (`NaN+1`, `NaN*2`: both measured to fold).
+   *  - a `bin` node with a foldable op folds if BOTH operands
+   *    (recursively) fold — this is what lets a literal-DERIVED
+   *    Infinity, e.g. `1/0`, re-enter the fold pool for an ENCLOSING
+   *    expression like `(1/0)-(1/0)` (measured to fold), even though a
+   *    BARE `Infinity` leaf cannot: the poison rule above only fires for
+   *    a numLit reached DIRECTLY, not for a value that arrived by
+   *    recursively folding a sub-expression.
+   *  - a unary `-` over a foldable operand folds (its negation) — covers
+   *    `-(1/0)`-shaped expressions; `-0`/`-Infinity`/`-NaN` never reach
+   *    this arm because lowerPrefixUnary already pre-folds unary-minus
+   *    directly over a numLit operand into a signed numLit itself.
+   *  - anything else (varRef, calls, ...) does not fold: NO constant
+   *    propagation, no variable lookthrough, by design (measured:
+   *    `const z = 0; z / z` stays a genuine runtime division on Node
+   *    too — folding it would be the INVERSE divergence). */
+  private tryFoldFloatConst(e: IrExpr): number | undefined {
+    if (e.kind === "numLit") {
+      if (e.value === Infinity || e.value === -Infinity) return undefined;
+      return e.value;
+    }
+    if (e.kind === "unary" && e.op === "-") {
+      const v = this.tryFoldFloatConst(e.operand);
+      return v === undefined ? undefined : -v;
+    }
+    if (e.kind === "bin") {
+      if (e.op !== "+" && e.op !== "-" && e.op !== "*" && e.op !== "/" && e.op !== "%" && e.op !== "**") {
+        return undefined;
+      }
+      const l = this.tryFoldFloatConst(e.left);
+      if (l === undefined) return undefined;
+      const r = this.tryFoldFloatConst(e.right);
+      if (r === undefined) return undefined;
+      switch (e.op) {
+        case "+": return l + r;
+        case "-": return l - r;
+        case "*": return l * r;
+        case "/": return l / r;
+        case "%": return l % r;
+        case "**": return l ** r;
+      }
+    }
+    return undefined;
+  }
+
   private emitBin(e: Extract<IrExpr, { kind: "bin" }>): void {
     const code = this.fn.code;
+    // Conservative literal-operand constant folding (SEMANTICS.md S036).
+    // Folding covers `**` too — a literal-literal exponentiation needs
+    // no general Math.pow support, so this handles it without lifting
+    // bin:**'s refusal for the general (non-foldable) case below.
+    if (e.op === "+" || e.op === "-" || e.op === "*" || e.op === "/" || e.op === "%" || e.op === "**") {
+      const folded = this.tryFoldFloatConst(e);
+      if (folded !== undefined) {
+        // Non-NaN folds are value-identical to what wasm's own f64 ops
+        // would compute (IEEE754 double arithmetic is exactly specified,
+        // no fast-math relaxation in the base wasm spec) — safe to fold
+        // outright. A NaN result gets the CANONICAL bit pattern
+        // explicitly (CANONICAL_NAN, not `folded`'s own bits) because
+        // this fold runs inside the compiler's own host process, and
+        // per S036 a genuinely-computed NaN there is not guaranteed
+        // canonical either.
+        code.f64Const(Number.isNaN(folded) ? CANONICAL_NAN : folded);
+        return;
+      }
+    }
     switch (e.op) {
       case "+":
       case "-":
@@ -9087,7 +9193,9 @@ class Assembler {
         return;
       case "**":
         // Math.pow's transcendental core plus the spec's corner table —
-        // its own work item.
+        // its own work item. The literal-literal case is handled by the
+        // folding check above; this refusal covers only the general
+        // (at least one non-literal operand) case.
         this.refuse("bin:**", e.loc);
         code.unreachable();
         return;

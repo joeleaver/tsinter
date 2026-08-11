@@ -56,7 +56,7 @@
  * defines. */
 import { BUF, LEN, type VecInfo } from "./arrays.js";
 import { Code } from "./code.js";
-import { F64, I32, ModuleBuilder, type ValType } from "./module.js";
+import { F64, I32, I64, ModuleBuilder, type ValType } from "./module.js";
 
 export type BytesElem = "u8" | "u32" | "i32" | "f32";
 
@@ -1642,6 +1642,237 @@ export class BytesBuilder {
       c.f64Const(width);
       c.f64Add();
       this.mb.setBody(idx, [I32, F64, I32, this.bufRefNN(), I32], c.bytes());
+      return idx;
+    });
+  }
+
+  /* ── round B4: the float numeric kinds (f32be/f32le/f64be/f64le) and
+   * readNumVar/writeNumVar. Measured directly against Node before
+   * porting anything (this increment's C-reference prose has been wrong
+   * three times already): floats have NO [min,max] gate on write —
+   * `writeFloatBE(Infinity)` and `writeFloatBE(1e300)` (too large to
+   * represent in f32) both succeed, storing the natural IEEE754 result
+   * (Infinity's bit pattern either way — narrowing an out-of-range f64
+   * to f32 rounds to ±Infinity, the same rule `Float32Array` element
+   * coercion already uses). `writeDoubleBE` is a pure bit-exact
+   * passthrough — no NaN canonicalization at all: a hand-built NaN with
+   * a custom payload, or even a SIGNALING NaN (quiet bit clear), comes
+   * back out with the identical byte pattern (measured via
+   * `writeDoubleBE`/readback of a NaN built through `Buffer.
+   * readDoubleBE` on a hand-assembled byte string). `writeFloatBE`
+   * narrows an f64 input to f32 first (JS numbers are always f64), which
+   * DOES quiet a signaling NaN — but that happens during the SAME
+   * f64->f32 narrowing conversion `Float32Array` element writes already
+   * perform, so f32DemoteF64/f64PromoteF32 (stage A, code.ts) are reused
+   * as-is here rather than re-derived. */
+  private parseFloatNumKind(kind: string): { width: number; le: boolean } {
+    if (kind === "f32be") return { width: 4, le: false };
+    if (kind === "f32le") return { width: 4, le: true };
+    if (kind === "f64be") return { width: 8, le: false };
+    if (kind === "f64le") return { width: 8, le: true };
+    throw new Error(`typedarrays.ts bug: readNum/writeNum kind '${kind}' reached parseFloatNumKind unguarded`);
+  }
+
+  /** LE/BE-aware 8-byte assembly into an i64 — the f64 twin of
+   * emitAssembleI32, same byte-position formula, i64 arithmetic. */
+  private emitAssembleI64(c: Code, BUFL: number, ADDR: number, width: number, le: boolean, BITS: number): void {
+    c.i64Const(0n);
+    c.localSet(BITS);
+    for (let i = 0; i < width; i++) {
+      const bytePos = le ? i : width - 1 - i;
+      c.localGet(BITS);
+      c.localGet(BUFL);
+      c.localGet(ADDR);
+      if (bytePos > 0) {
+        c.i32Const(bytePos);
+        c.i32Add();
+      }
+      c.arrayGetU(this.bufType());
+      c.i64ExtendI32U();
+      if (i > 0) {
+        c.i64Const(BigInt(8 * i));
+        c.i64Shl();
+      }
+      c.i64Or();
+      c.localSet(BITS);
+    }
+  }
+
+  /** The scatter twin of emitAssembleI64 — mirrors emitScatterI32, i64
+   * arithmetic, `i32.wrap_i64` before each `array.set` (packed i8
+   * storage takes the low byte, same as the i32 family — no explicit
+   * `& 0xFF` needed there either). */
+  private emitScatterI64(c: Code, BUFL: number, ADDR: number, width: number, le: boolean, BITS: number): void {
+    for (let i = 0; i < width; i++) {
+      const bytePos = le ? i : width - 1 - i;
+      c.localGet(BUFL);
+      c.localGet(ADDR);
+      if (bytePos > 0) {
+        c.i32Const(bytePos);
+        c.i32Add();
+      }
+      c.localGet(BITS);
+      if (i > 0) {
+        c.i64Const(BigInt(8 * i));
+        c.i64ShrU();
+      }
+      c.i32WrapI64();
+      c.arraySet(this.bufType());
+    }
+  }
+
+  /** %w.bytes.readNum:<f32be|f32le|f64be|f64le> — (bytes<u8>, f64 offset)
+   * → f64; the SAME offset-bounds ladder as the integer family
+   * (boundsErrorHelper), width-aware. f32: assemble 4 bytes (unsigned —
+   * bits, not a value), `f32.reinterpret_i32` then `f64.promote_f32`
+   * (stage A's element-read primitives, reused). f64: assemble 8 bytes
+   * into an i64, `f64.reinterpret_i64` — no widening step needed, the
+   * bytes ARE an f64 already. */
+  readNumFloatHelper(kind: string): number {
+    const { width, le } = this.parseFloatNumKind(kind);
+    return this.cached(`readNum:${kind}`, () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.bytesRef(), F64], [F64]), `%w.bytes.readNum:${kind}`);
+      const c = new Code();
+      const V = 0, OFFSET = 1;
+      const LENI = 2, CAP = 3, ADDR = 4, BUFL = 5, BITS32 = 6, BITS64 = 7;
+      c.localGet(V);
+      c.structGet(this.bytesType(), BLEN);
+      c.localSet(LENI);
+      c.localGet(LENI);
+      c.f64ConvertI32S();
+      c.f64Const(width);
+      c.f64Sub();
+      c.localSet(CAP);
+      c.localGet(OFFSET);
+      c.f64Trunc();
+      c.localGet(OFFSET);
+      c.f64Ne();
+      c.localGet(CAP);
+      c.f64Const(0);
+      c.f64Lt();
+      c.i32Or();
+      c.localGet(OFFSET);
+      c.f64Const(0);
+      c.f64Lt();
+      c.i32Or();
+      c.localGet(OFFSET);
+      c.localGet(CAP);
+      c.f64Gt();
+      c.i32Or();
+      c.ifVoid();
+      {
+        c.localGet(OFFSET);
+        c.localGet(CAP);
+        c.call(this.boundsErrorHelper());
+        c.f64Const(0);
+        c.return_();
+      }
+      c.end();
+      c.localGet(V);
+      c.structGet(this.bytesType(), OFF);
+      c.localGet(OFFSET);
+      c.i32TruncF64S();
+      c.i32Add();
+      c.localSet(ADDR);
+      c.localGet(V);
+      c.structGet(this.bytesType(), STORAGE);
+      c.localSet(BUFL);
+      if (width === 4) {
+        this.emitAssembleI32(c, BUFL, ADDR, 4, le, BITS32);
+        c.localGet(BITS32);
+        c.f32ReinterpretI32();
+        c.f64PromoteF32();
+      } else {
+        this.emitAssembleI64(c, BUFL, ADDR, 8, le, BITS64);
+        c.localGet(BITS64);
+        c.f64ReinterpretI64();
+      }
+      this.mb.setBody(idx, [I32, F64, I32, this.bufRefNN(), I32, I64], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.bytes.writeNum:<f32be|f32le|f64be|f64le> — (bytes<u8>, f64 value,
+   * f64 offset) → f64 (offset + width); the SAME offset-bounds ladder as
+   * the integer family, but NO value-range check — floats accept every
+   * f64 input, including +/-Infinity and NaN (measured, see the section
+   * header). f32: `f64.demote_f32`... `f32.demote_f64` (narrows,
+   * Float32Array's own coercion) then `i32.reinterpret_f32`, scatter 4
+   * bytes. f64: `i64.reinterpret_f64` directly (bit-exact, no narrowing
+   * possible or needed), scatter 8 bytes. Bit-exact passthrough, NaN
+   * included — no write-side canonicalization here (SEMANTICS.md S036:
+   * NaN provenance is handled at the FOLDING boundary in the emitter,
+   * not here — a runtime-computed NaN's bit pattern is whatever the
+   * toolchain produces, on this tier exactly as on Node's own runtime,
+   * so passing it through unchanged is the Node-exact answer). */
+  writeNumFloatHelper(kind: string): number {
+    const { width, le } = this.parseFloatNumKind(kind);
+    return this.cached(`writeNum:${kind}`, () => {
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.bytesRef(), F64, F64], [F64]),
+        `%w.bytes.writeNum:${kind}`,
+      );
+      const c = new Code();
+      const V = 0, VALUE = 1, OFFSET = 2;
+      const LENI = 3, CAP = 4, ADDR = 5, BUFL = 6, BITS32 = 7, BITS64 = 8;
+      c.localGet(V);
+      c.structGet(this.bytesType(), BLEN);
+      c.localSet(LENI);
+      c.localGet(LENI);
+      c.f64ConvertI32S();
+      c.f64Const(width);
+      c.f64Sub();
+      c.localSet(CAP);
+      c.localGet(OFFSET);
+      c.f64Trunc();
+      c.localGet(OFFSET);
+      c.f64Ne();
+      c.localGet(CAP);
+      c.f64Const(0);
+      c.f64Lt();
+      c.i32Or();
+      c.localGet(OFFSET);
+      c.f64Const(0);
+      c.f64Lt();
+      c.i32Or();
+      c.localGet(OFFSET);
+      c.localGet(CAP);
+      c.f64Gt();
+      c.i32Or();
+      c.ifVoid();
+      {
+        c.localGet(OFFSET);
+        c.localGet(CAP);
+        c.call(this.boundsErrorHelper());
+        c.f64Const(0);
+        c.return_();
+      }
+      c.end();
+      c.localGet(V);
+      c.structGet(this.bytesType(), OFF);
+      c.localGet(OFFSET);
+      c.i32TruncF64S();
+      c.i32Add();
+      c.localSet(ADDR);
+      c.localGet(V);
+      c.structGet(this.bytesType(), STORAGE);
+      c.localSet(BUFL);
+      if (width === 4) {
+        c.localGet(VALUE);
+        c.f32DemoteF64();
+        c.i32ReinterpretF32();
+        c.localSet(BITS32);
+        this.emitScatterI32(c, BUFL, ADDR, 4, le, BITS32);
+      } else {
+        c.localGet(VALUE);
+        c.i64ReinterpretF64();
+        c.localSet(BITS64);
+        this.emitScatterI64(c, BUFL, ADDR, 8, le, BITS64);
+      }
+      c.localGet(OFFSET);
+      c.f64Const(width);
+      c.f64Add();
+      this.mb.setBody(idx, [I32, F64, I32, this.bufRefNN(), I32, I64], c.bytes());
       return idx;
     });
   }
@@ -4590,7 +4821,20 @@ export class BytesBuilder {
    * cases including multiple/malformed padding runs (`"QQ==="` -> 2,
    * `"===="` -> 1, `"="` -> 0) to pin the exact two-step, position-by-
    * position shape (not "strip every trailing '=' in a loop", which
-   * would give the wrong answer for `"QQ==="`). */
+   * would give the wrong answer for `"QQ==="`).
+   *
+   * This formula is Node's own ESTIMATE, not the true decode length, and
+   * is DELIBERATELY not the same computation `toStrHelper`'s base64
+   * decode does — the two disagree on inputs the decoder skips
+   * characters from (whitespace, stray junk) that the length-based
+   * formula has no way to see. Measured directly (an independent fuzz
+   * over base64-alphabet strings with injected whitespace, ~140/205
+   * cases disagreeing with `Buffer.from(s,"base64").length`; the gate's
+   * reviewer separately fuzzed ~200 plain strings and got 60/200 —
+   * different methodologies, same conclusion). Do NOT "fix" this arm to
+   * match the decoder's actual output length — that would BE the
+   * divergence from Node, which computes exactly this estimate and nothing
+   * else for `Buffer.byteLength(str, "base64"/"base64url")`. */
   byteLenStrHelper(enc: string): number {
     return this.cached(`byteLenStr:${enc}`, () => {
       const idx = this.mb.declareFunc(this.mb.funcType([this.strRefN()], [F64]), `%w.bytes.byteLenStr:${enc}`);
@@ -5052,6 +5296,563 @@ export class BytesBuilder {
       c.localGet(TOTAL);
       c.call(this.concatLenHelper());
       this.mb.setBody(idx, [I32, this.bytesVecBufRefNN(), F64, I32], c.bytes());
+      return idx;
+    });
+  }
+
+  private parseVarNumKind(kind: string): { signed: boolean; le: boolean } {
+    if (kind === "ube") return { signed: false, le: false };
+    if (kind === "ule") return { signed: false, le: true };
+    if (kind === "ibe") return { signed: true, le: false };
+    if (kind === "ile") return { signed: true, le: true };
+    throw new Error(`typedarrays.ts bug: readNumVar/writeNumVar kind '${kind}' reached parseVarNumKind unguarded`);
+  }
+
+  /** %w.bytes.byteLengthError — (f64 byteLength) → (); readUIntLE/BE's
+   * `byteLength` argument ladder (scr_bytes_read_var/write_var explicitly
+   * reuse scr_bytes_bounds_error for this, per the C reference — the
+   * SAME "and"-spelled message family as boundsErrorHelper, confirmed by
+   * measurement: `b.readUIntLE(0, 0)` answers "It must be >= 1 and <= 6"
+   * (not "&&"). Fixed name ("byteLength") and bounds (min 1, max 6) —
+   * unlike boundsErrorHelper's offset (min 0, cap varies), this ladder's
+   * numbers never vary, so no parameters beyond the value itself.
+   * "Bad integer" here means `trunc(v) != v` with NO separate isFinite
+   * check (matching boundsErrorHelper, NOT validateOffHelper) — measured:
+   * `readUIntLE(0, Infinity)` and `readUIntLE(0, -Infinity)` BOTH answer
+   * the RANGE message ("must be >= 1 and <= 6"), not "must be an
+   * integer" — Infinity trivially satisfies `trunc(v)==v` and falls
+   * through to the range check instead, same as boundsErrorHelper's
+   * offset case. Voids and returns on failure — caller must check the
+   * SAME "already invalid" condition itself before calling in (this
+   * helper does not re-derive it), matching boundsErrorHelper's own
+   * calling convention exactly (not validateOffHelper's i32-return one —
+   * the fixed-bounds case never needs a reusable "skip if omitted"
+   * caller pattern, so there is nothing to gain from that contract). */
+  byteLengthErrorHelper(): number {
+    return this.cached("byteLengthError", () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([F64], []), "%w.bytes.byteLengthError");
+      const c = new Code();
+      const VALUE = 0;
+      c.localGet(VALUE);
+      c.f64Trunc();
+      c.localGet(VALUE);
+      c.f64Ne();
+      c.ifVoid();
+      {
+        this.deps.throwError(
+          c,
+          "%RangeError",
+          "RangeError",
+          (x) => {
+            this.deps.lit(x, 'The value of "byteLength" is out of range. It must be an integer. Received ');
+            x.localGet(VALUE);
+            x.call(this.numReceivedHelper());
+            x.call(this.deps.concat());
+          },
+          "ERR_OUT_OF_RANGE",
+        );
+        c.return_();
+      }
+      c.end();
+      this.deps.throwError(
+        c,
+        "%RangeError",
+        "RangeError",
+        (x) => {
+          this.deps.lit(x, 'The value of "byteLength" is out of range. It must be >= 1 and <= 6. Received ');
+          x.localGet(VALUE);
+          x.call(this.numReceivedHelper());
+          x.call(this.deps.concat());
+        },
+        "ERR_OUT_OF_RANGE",
+      );
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  /** LE/BE-aware byte assembly into an i64 for a RUNTIME width (1-6) —
+   * the var-width twin of emitAssembleI64, which unrolls a COMPILE-TIME
+   * width; here `WIDTH` is a local holding a runtime i32, so this emits
+   * an actual wasm loop instead. `I` is a scratch i32 local. */
+  private emitAssembleI64Runtime(
+    c: Code,
+    BUFL: number,
+    ADDR: number,
+    WIDTH: number,
+    le: boolean,
+    BITS: number,
+    I: number,
+  ): void {
+    c.i64Const(0n);
+    c.localSet(BITS);
+    c.i32Const(0);
+    c.localSet(I);
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.localGet(WIDTH);
+    c.i32GeS();
+    c.brIf(1);
+    c.localGet(BITS);
+    c.localGet(BUFL);
+    c.localGet(ADDR);
+    if (le) {
+      c.localGet(I);
+      c.i32Add();
+    } else {
+      c.localGet(WIDTH);
+      c.i32Const(1);
+      c.i32Sub();
+      c.localGet(I);
+      c.i32Sub();
+      c.i32Add();
+    }
+    c.arrayGetU(this.bufType());
+    c.i64ExtendI32U();
+    c.localGet(I);
+    c.i32Const(8);
+    c.i32Mul();
+    c.i64ExtendI32U();
+    c.i64Shl();
+    c.i64Or();
+    c.localSet(BITS);
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+  }
+
+  /** The scatter twin of emitAssembleI64Runtime. */
+  private emitScatterI64Runtime(
+    c: Code,
+    BUFL: number,
+    ADDR: number,
+    WIDTH: number,
+    le: boolean,
+    BITS: number,
+    I: number,
+  ): void {
+    c.i32Const(0);
+    c.localSet(I);
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.localGet(WIDTH);
+    c.i32GeS();
+    c.brIf(1);
+    c.localGet(BUFL);
+    c.localGet(ADDR);
+    if (le) {
+      c.localGet(I);
+      c.i32Add();
+    } else {
+      c.localGet(WIDTH);
+      c.i32Const(1);
+      c.i32Sub();
+      c.localGet(I);
+      c.i32Sub();
+      c.i32Add();
+    }
+    c.localGet(BITS);
+    c.localGet(I);
+    c.i32Const(8);
+    c.i32Mul();
+    c.i64ExtendI32U();
+    c.i64ShrU();
+    c.i32WrapI64();
+    c.arraySet(this.bufType());
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+  }
+
+  /** %w.bytes.readNumVar:<ube|ule|ibe|ile> — (bytes<u8>, f64 offset, f64
+   * byteLength) → f64; readUIntLE/BE, readIntLE/BE (scr_bytes_read_var).
+   * `byteLength` validates FIRST (Node's own order, measured: an
+   * out-of-range byteLength AND an out-of-range offset together always
+   * report the byteLength error), via byteLengthErrorHelper, THEN the
+   * normal offset ladder (boundsErrorHelper, same as the fixed-width
+   * family, cap = `len - byteLength`). Assembly is always i64 (byteLength
+   * maxes at 6, comfortably inside 8) via the runtime-loop variant. */
+  readNumVarHelper(kind: string): number {
+    const { signed, le } = this.parseVarNumKind(kind);
+    return this.cached(`readNumVar:${kind}`, () => {
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.bytesRef(), F64, F64], [F64]),
+        `%w.bytes.readNumVar:${kind}`,
+      );
+      const c = new Code();
+      const V = 0, OFFSET = 1, BLRAW = 2;
+      const WIDTH = 3, LENI = 4, CAP = 5, ADDR = 6, BUFL = 7, BITS = 8, I = 9, SHIFT = 10;
+      // byteLength: bad_integer, then range [1,6].
+      c.localGet(BLRAW);
+      c.f64Trunc();
+      c.localGet(BLRAW);
+      c.f64Ne();
+      c.ifVoid();
+      {
+        c.localGet(BLRAW);
+        c.call(this.byteLengthErrorHelper());
+        c.f64Const(0);
+        c.return_();
+      }
+      c.end();
+      c.localGet(BLRAW);
+      c.f64Const(1);
+      c.f64Lt();
+      c.localGet(BLRAW);
+      c.f64Const(6);
+      c.f64Gt();
+      c.i32Or();
+      c.ifVoid();
+      {
+        c.localGet(BLRAW);
+        c.call(this.byteLengthErrorHelper());
+        c.f64Const(0);
+        c.return_();
+      }
+      c.end();
+      c.localGet(BLRAW);
+      c.i32TruncF64S();
+      c.localSet(WIDTH);
+      // offset ladder — same shape as readNumHelper, width is now runtime.
+      c.localGet(V);
+      c.structGet(this.bytesType(), BLEN);
+      c.localSet(LENI);
+      c.localGet(LENI);
+      c.f64ConvertI32S();
+      c.localGet(WIDTH);
+      c.f64ConvertI32S();
+      c.f64Sub();
+      c.localSet(CAP);
+      c.localGet(OFFSET);
+      c.f64Trunc();
+      c.localGet(OFFSET);
+      c.f64Ne();
+      c.localGet(CAP);
+      c.f64Const(0);
+      c.f64Lt();
+      c.i32Or();
+      c.localGet(OFFSET);
+      c.f64Const(0);
+      c.f64Lt();
+      c.i32Or();
+      c.localGet(OFFSET);
+      c.localGet(CAP);
+      c.f64Gt();
+      c.i32Or();
+      c.ifVoid();
+      {
+        c.localGet(OFFSET);
+        c.localGet(CAP);
+        c.call(this.boundsErrorHelper());
+        c.f64Const(0);
+        c.return_();
+      }
+      c.end();
+      c.localGet(V);
+      c.structGet(this.bytesType(), OFF);
+      c.localGet(OFFSET);
+      c.i32TruncF64S();
+      c.i32Add();
+      c.localSet(ADDR);
+      c.localGet(V);
+      c.structGet(this.bytesType(), STORAGE);
+      c.localSet(BUFL);
+      this.emitAssembleI64Runtime(c, BUFL, ADDR, WIDTH, le, BITS, I);
+      if (signed) {
+        // Sign-extend across the full i64 from a RUNTIME bit width:
+        // shift up to bit 63, then arithmetic-shift back down.
+        c.i32Const(64);
+        c.localGet(WIDTH);
+        c.i32Const(8);
+        c.i32Mul();
+        c.i32Sub();
+        c.localSet(SHIFT);
+        c.localGet(BITS);
+        c.localGet(SHIFT);
+        c.i64ExtendI32U();
+        c.i64Shl();
+        c.localGet(SHIFT);
+        c.i64ExtendI32U();
+        c.i64ShrS();
+        c.localSet(BITS);
+        c.localGet(BITS);
+        c.f64ConvertI64S();
+      } else {
+        c.localGet(BITS);
+        c.f64ConvertI64U();
+      }
+      this.mb.setBody(
+        idx,
+        [I32, I32, F64, I32, this.bufRefNN(), I64, I32, I32],
+        c.bytes(),
+      );
+      return idx;
+    });
+  }
+
+  /** %w.bytes.writeNumVar:<ube|ule|ibe|ile> — (bytes<u8>, f64 value, f64
+   * offset, f64 byteLength) → f64 (offset + byteLength); writeUIntLE/BE,
+   * writeIntLE/BE (scr_bytes_write_var). Node's own check order,
+   * measured: byteLength, THEN value, THEN offset. Value range is
+   * `[0, 256^byteLength - 1]` (unsigned) or the signed twos-complement
+   * split of the same span — computed at RUNTIME via repeated
+   * multiplication by 256 (no `**` in this tier), rendered into the
+   * RangeError with `f64ToStr` (min/max are no longer compile-time
+   * constants the way the fixed-width family's are). NaN passes the
+   * range gate (every NaN comparison is false) and must be explicitly
+   * zeroed before `i64.trunc_f64_s` — that instruction TRAPS on a NaN
+   * operand, which would turn Node's "writes 0, succeeds" case into an
+   * uncatchable abort if left unguarded (measured: `writeUIntLE(NaN, 0,
+   * 3)` succeeds and writes zero bytes on Node). */
+  writeNumVarHelper(kind: string): number {
+    const { signed, le } = this.parseVarNumKind(kind);
+    return this.cached(`writeNumVar:${kind}`, () => {
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.bytesRef(), F64, F64, F64], [F64]),
+        `%w.bytes.writeNumVar:${kind}`,
+      );
+      const c = new Code();
+      const V = 0, VALUE = 1, OFFSET = 2, BLRAW = 3;
+      const WIDTH = 4, POW = 5, MAXV = 6, MINV = 7, LENI = 8, CAP = 9, ADDR = 10, BUFL = 11, BITS = 12, I = 13, T = 14;
+      c.localGet(BLRAW);
+      c.f64Trunc();
+      c.localGet(BLRAW);
+      c.f64Ne();
+      c.ifVoid();
+      {
+        c.localGet(BLRAW);
+        c.call(this.byteLengthErrorHelper());
+        c.f64Const(0);
+        c.return_();
+      }
+      c.end();
+      c.localGet(BLRAW);
+      c.f64Const(1);
+      c.f64Lt();
+      c.localGet(BLRAW);
+      c.f64Const(6);
+      c.f64Gt();
+      c.i32Or();
+      c.ifVoid();
+      {
+        c.localGet(BLRAW);
+        c.call(this.byteLengthErrorHelper());
+        c.f64Const(0);
+        c.return_();
+      }
+      c.end();
+      c.localGet(BLRAW);
+      c.i32TruncF64S();
+      c.localSet(WIDTH);
+      // pow = 256 ** width, via a runtime loop (no ** in this tier).
+      c.f64Const(1);
+      c.localSet(POW);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(WIDTH);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(POW);
+      c.f64Const(256);
+      c.f64Mul();
+      c.localSet(POW);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      if (signed) {
+        c.localGet(POW);
+        c.f64Const(2);
+        c.f64Div();
+        c.f64Const(1);
+        c.f64Sub();
+        c.localSet(MAXV);
+        c.localGet(POW);
+        c.f64Const(2);
+        c.f64Div();
+        c.f64Const(-1);
+        c.f64Mul();
+        c.localSet(MINV);
+      } else {
+        c.localGet(POW);
+        c.f64Const(1);
+        c.f64Sub();
+        c.localSet(MAXV);
+        c.f64Const(0);
+        c.localSet(MINV);
+      }
+      c.localGet(VALUE);
+      c.localGet(MAXV);
+      c.f64Gt();
+      c.localGet(VALUE);
+      c.localGet(MINV);
+      c.f64Lt();
+      c.i32Or();
+      c.ifVoid();
+      {
+        // Node's value-range message SWITCHES FORMAT at width > 4 —
+        // measured directly, not assumed from the C reference (which
+        // doesn't mention this at all): byteLength 1-4 renders the usual
+        // decimal "must be >= MIN and <= MAX"; byteLength 5-6 renders a
+        // SYMBOLIC "must be >= -(2 ** N) and < 2 ** N" (note also: "<",
+        // not "<=", and the literal text "2 ** N", not a computed
+        // decimal). `width` is only known at RUNTIME here (unlike the
+        // fixed-width family, where each kind is its own compile-time-
+        // known width), so this branches in the emitted bytecode itself,
+        // not at TS build time. `signed` IS compile-time-known (kind is
+        // fixed per interned function), so only the width>4 split needs
+        // a real wasm `if`.
+        this.deps.throwError(
+          c,
+          "%RangeError",
+          "RangeError",
+          (x) => {
+            x.localGet(WIDTH);
+            x.i32Const(4);
+            x.i32GtS();
+            x.ifResult(this.strRefN());
+            {
+              if (signed) {
+                this.deps.lit(x, 'The value of "value" is out of range. It must be >= -(2 ** ');
+                x.localGet(WIDTH);
+                x.i32Const(8);
+                x.i32Mul();
+                x.i32Const(1);
+                x.i32Sub();
+                x.f64ConvertI32S();
+                x.call(this.deps.f64ToStr());
+                x.call(this.deps.concat());
+                this.deps.lit(x, ") and < 2 ** ");
+                x.call(this.deps.concat());
+                x.localGet(WIDTH);
+                x.i32Const(8);
+                x.i32Mul();
+                x.i32Const(1);
+                x.i32Sub();
+                x.f64ConvertI32S();
+                x.call(this.deps.f64ToStr());
+                x.call(this.deps.concat());
+              } else {
+                this.deps.lit(x, 'The value of "value" is out of range. It must be >= 0 and < 2 ** ');
+                x.localGet(WIDTH);
+                x.i32Const(8);
+                x.i32Mul();
+                x.f64ConvertI32S();
+                x.call(this.deps.f64ToStr());
+                x.call(this.deps.concat());
+              }
+              this.deps.lit(x, ". Received ");
+              x.call(this.deps.concat());
+            }
+            x.else_();
+            {
+              this.deps.lit(x, 'The value of "value" is out of range. It must be >= ');
+              x.localGet(MINV);
+              x.call(this.deps.f64ToStr());
+              x.call(this.deps.concat());
+              this.deps.lit(x, " and <= ");
+              x.call(this.deps.concat());
+              x.localGet(MAXV);
+              x.call(this.deps.f64ToStr());
+              x.call(this.deps.concat());
+              this.deps.lit(x, ". Received ");
+              x.call(this.deps.concat());
+            }
+            x.end();
+            x.localGet(VALUE);
+            x.call(this.numReceivedHelper());
+            x.call(this.deps.concat());
+          },
+          "ERR_OUT_OF_RANGE",
+        );
+        c.f64Const(0);
+        c.return_();
+      }
+      c.end();
+      c.localGet(V);
+      c.structGet(this.bytesType(), BLEN);
+      c.localSet(LENI);
+      c.localGet(LENI);
+      c.f64ConvertI32S();
+      c.localGet(WIDTH);
+      c.f64ConvertI32S();
+      c.f64Sub();
+      c.localSet(CAP);
+      c.localGet(OFFSET);
+      c.f64Trunc();
+      c.localGet(OFFSET);
+      c.f64Ne();
+      c.localGet(CAP);
+      c.f64Const(0);
+      c.f64Lt();
+      c.i32Or();
+      c.localGet(OFFSET);
+      c.f64Const(0);
+      c.f64Lt();
+      c.i32Or();
+      c.localGet(OFFSET);
+      c.localGet(CAP);
+      c.f64Gt();
+      c.i32Or();
+      c.ifVoid();
+      {
+        c.localGet(OFFSET);
+        c.localGet(CAP);
+        c.call(this.boundsErrorHelper());
+        c.f64Const(0);
+        c.return_();
+      }
+      c.end();
+      c.localGet(V);
+      c.structGet(this.bytesType(), OFF);
+      c.localGet(OFFSET);
+      c.i32TruncF64S();
+      c.i32Add();
+      c.localSet(ADDR);
+      c.localGet(V);
+      c.structGet(this.bytesType(), STORAGE);
+      c.localSet(BUFL);
+      // value -> bits: NaN -> 0 explicitly (i64.trunc_f64_s TRAPS on NaN,
+      // which would turn Node's "succeeds, writes 0" case into an abort).
+      c.localGet(VALUE);
+      c.localGet(VALUE);
+      c.f64Ne();
+      c.ifResult(F64);
+      c.f64Const(0);
+      c.else_();
+      c.localGet(VALUE);
+      c.f64Trunc();
+      c.end();
+      c.localSet(T);
+      c.localGet(T);
+      c.i64TruncF64S();
+      c.localSet(BITS);
+      this.emitScatterI64Runtime(c, BUFL, ADDR, WIDTH, le, BITS, I);
+      c.localGet(OFFSET);
+      c.localGet(WIDTH);
+      c.f64ConvertI32S();
+      c.f64Add();
+      this.mb.setBody(
+        idx,
+        [I32, F64, F64, F64, I32, F64, I32, this.bufRefNN(), I64, I32, F64],
+        c.bytes(),
+      );
       return idx;
     });
   }
