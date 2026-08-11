@@ -89,6 +89,12 @@ export interface BytesDeps {
   f64VecNewLen: () => number;
   /** %w.vec.push1 for vec(f64) — the unchecked append toArray uses. */
   f64VecPush1: () => number;
+  /** The interned `vec(bytes<u8>)` info (arrays.ts) — `Buffer[]`'s own
+   * representation, needed by concat/concatLen's list argument. Read-
+   * only here (LEN/BUF field access via arrays.ts's exported constants);
+   * concat never constructs a vec, only walks one the emitter already
+   * built from an array literal or variable. */
+  bytesVec: () => VecInfo;
   /** Builds a class-error instance from (className, name, message) and
    * fills the exception cell — emitter.ts's emitSetCellError, which does
    * NOT depend on any per-function walk state (only the `Code` passed
@@ -4560,6 +4566,492 @@ export class BytesBuilder {
         [I32, F64, this.bytesRef(), this.bufRefNN(), I32, I32, I32, I32, this.bufRefNN()],
         c.bytes(),
       );
+      return idx;
+    });
+  }
+
+  /** %w.bytes.byteLenStr:<enc> — (str s) → f64; Buffer.byteLength(s, enc)
+   * with enc ALWAYS a compile-time strLit (bufEncoding's own fence at the
+   * lowering) — dispatched here at build time, matching toStrHelper's
+   * discipline. Formulas measured directly against Node across empty,
+   * ASCII, BMP, and astral inputs: utf8 is the TRUE encoded byte count
+   * (computed by literally calling fromStrHelper and reading its length —
+   * cheaper to reuse the already-correct encoder than re-derive its
+   * byte-counting logic separately); latin1/ascii is the UTF-16 unit
+   * count (`s.length`); utf16le doubles it; hex halves it (floor).
+   *
+   * base64/base64url is NOT the naive `(len*3)>>>2` over the raw string
+   * length — the corpus caught this (1661-buffer-encodings-full.ts's
+   * differential run, not my own unit tests, which never happened to
+   * exercise a PADDED base64 string): Node strips up to TWO trailing '='
+   * characters first, checking one position at a time — `bytes = len; if
+   * (bytes>0 && s[bytes-1]==='=') bytes--; if (bytes>1 && s[bytes-1]===
+   * '=') bytes--;` — THEN applies `(bytes*3)>>>2`. Measured across 11
+   * cases including multiple/malformed padding runs (`"QQ==="` -> 2,
+   * `"===="` -> 1, `"="` -> 0) to pin the exact two-step, position-by-
+   * position shape (not "strip every trailing '=' in a loop", which
+   * would give the wrong answer for `"QQ==="`). */
+  byteLenStrHelper(enc: string): number {
+    return this.cached(`byteLenStr:${enc}`, () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.strRefN()], [F64]), `%w.bytes.byteLenStr:${enc}`);
+      const c = new Code();
+      const S = 0;
+      const N = 1;
+      if (enc === "utf8") {
+        c.localGet(S);
+        c.call(this.fromStrHelper(enc));
+        c.structGet(this.bytesType(), BLEN);
+        c.f64ConvertI32S();
+      } else if (enc === "latin1" || enc === "ascii") {
+        c.localGet(S);
+        c.arrayLen();
+        c.f64ConvertI32S();
+      } else if (enc === "utf16le") {
+        c.localGet(S);
+        c.arrayLen();
+        c.i32Const(2);
+        c.i32Mul();
+        c.f64ConvertI32S();
+      } else if (enc === "hex") {
+        c.localGet(S);
+        c.arrayLen();
+        c.i32Const(1);
+        c.i32ShrU();
+        c.f64ConvertI32S();
+      } else {
+        // base64 / base64url — strip up to two trailing '=' (0x3D), one
+        // position at a time, before the (bytes*3)>>>2 formula. Each
+        // check is a NESTED ifVoid, not `cond1 && cond2` via i32And —
+        // i32.and has no short-circuit (a standing house lesson), and
+        // `arrayGetU(S, N-1)` at N=0 would be an out-of-bounds trap if
+        // evaluated unconditionally.
+        c.localGet(S);
+        c.arrayLen();
+        c.localSet(N);
+        c.localGet(N);
+        c.i32Const(0);
+        c.i32GtS();
+        c.ifVoid();
+        {
+          c.localGet(S);
+          c.localGet(N);
+          c.i32Const(1);
+          c.i32Sub();
+          c.arrayGetU(this.deps.strType());
+          c.i32Const(0x3d);
+          c.i32Eq();
+          c.ifVoid();
+          {
+            c.localGet(N);
+            c.i32Const(1);
+            c.i32Sub();
+            c.localSet(N);
+          }
+          c.end();
+        }
+        c.end();
+        c.localGet(N);
+        c.i32Const(1);
+        c.i32GtS();
+        c.ifVoid();
+        {
+          c.localGet(S);
+          c.localGet(N);
+          c.i32Const(1);
+          c.i32Sub();
+          c.arrayGetU(this.deps.strType());
+          c.i32Const(0x3d);
+          c.i32Eq();
+          c.ifVoid();
+          {
+            c.localGet(N);
+            c.i32Const(1);
+            c.i32Sub();
+            c.localSet(N);
+          }
+          c.end();
+        }
+        c.end();
+        c.localGet(N);
+        c.i32Const(3);
+        c.i32Mul();
+        c.i32Const(2);
+        c.i32ShrU();
+        c.f64ConvertI32S();
+      }
+      this.mb.setBody(idx, [I32], c.bytes());
+      return idx;
+    });
+  }
+
+  /** Pushes an i32 bool: does the string in local S case-insensitively
+   * equal the (already-lowercase) literal `lit`? Fully UNROLLED per
+   * character — `lit` is compile-time-known and short (<=10 chars for
+   * every candidate below), so there is no runtime loop, just a length
+   * check and a fixed chain of char comparisons ANDed together. Each
+   * runtime char is ASCII-case-folded inline (`if (65<=ch<=90) ch+=32`)
+   * since the wasm tier has no `toLowerCase` yet (`strIntrinsic:
+   * toUpperCase` is the corpus's single largest work-queue item) — this
+   * is the ONE place in the bytes surface that needs case-insensitivity
+   * at all, so a general lowercasing helper isn't worth building for it. */
+  private emitCiEqLit(c: Code, S: number, lit: string, CH: number): void {
+    c.localGet(S);
+    c.arrayLen();
+    c.i32Const(lit.length);
+    c.i32Eq();
+    c.ifResult(I32);
+    {
+      c.i32Const(1);
+      for (let i = 0; i < lit.length; i++) {
+        c.localGet(S);
+        c.i32Const(i);
+        c.arrayGetU(this.deps.strType());
+        c.localSet(CH);
+        c.localGet(CH);
+        c.i32Const(65);
+        c.i32GeS();
+        c.localGet(CH);
+        c.i32Const(90);
+        c.i32LeS();
+        c.i32And();
+        c.ifResult(I32);
+        c.localGet(CH);
+        c.i32Const(32);
+        c.i32Add();
+        c.else_();
+        c.localGet(CH);
+        c.end();
+        c.i32Const(lit.charCodeAt(i));
+        c.i32Eq();
+        c.i32And();
+      }
+    }
+    c.else_();
+    c.i32Const(0);
+    c.end();
+  }
+
+  /** %w.bytes.isEncoding — (str name) → i32 bool; Buffer.isEncoding(name)
+   * — the ONE encoding check that reads a genuine RUNTIME string (every
+   * other encoding argument in this file is a compile-time strLit).
+   * Candidate list and case-insensitivity measured directly against Node
+   * 24.18 (`Buffer.isEncoding` over ~28 probes spanning every alias, both
+   * cases, and near-miss strings like "ucs-16le"/"utf32le"): utf8/utf-8,
+   * hex, base64, base64url, latin1, binary, ascii, utf16le/utf-16le,
+   * ucs2/ucs-2 — 12 accepted spellings, everything else false. Never
+   * throws. */
+  isEncodingHelper(): number {
+    return this.cached("isEncoding", () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.strRefN()], [I32]), "%w.bytes.isEncoding");
+      const c = new Code();
+      const S = 0;
+      const CH = 1;
+      const candidates = [
+        "utf8",
+        "utf-8",
+        "hex",
+        "base64",
+        "base64url",
+        "latin1",
+        "binary",
+        "ascii",
+        "utf16le",
+        "utf-16le",
+        "ucs2",
+        "ucs-2",
+      ];
+      c.i32Const(0);
+      for (const lit of candidates) {
+        this.emitCiEqLit(c, S, lit, CH);
+        c.i32Or();
+      }
+      this.mb.setBody(idx, [I32], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.bytes.toStrRange:<enc> — (b, f64 rawStart, f64 rawEnd) → str;
+   * `toString(enc, start, end)`'s clamp rule, measured directly against
+   * Node and confirmed to be its OWN rule, not slice/subarray's: NaN
+   * clamps to 0 (not "start of string" via some other default), and a
+   * NEGATIVE value clamps STRAIGHT to 0 — there is no "relative to the
+   * end" adjustment the way a negative slice index gets (`buf.toString
+   * ("utf8", -2)` returns the WHOLE string, not the last 2 chars).
+   * `start > end` (after clamping) — or an omitted end past the buffer,
+   * clamped down to `b.len` — answers "" (empty), never throws. Reuses
+   * toStrHelper for the actual decode by building a temporary VIEW over
+   * exactly [start, end) — the SAME storage array, a fresh $bytes struct
+   * — rather than duplicating any decode logic. The emitter pushes
+   * `f64Const(0)` for an omitted start and `f64Const(Infinity)` for an
+   * omitted end (Infinity is not NaN, so it takes the "truncate" branch
+   * unchanged, then clamps down to `b.len` — no separate "omitted"
+   * sentinel needed). */
+  toStrRangeHelper(enc: string): number {
+    return this.cached(`toStrRange:${enc}`, () => {
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.bytesRef(), F64, F64], [this.strRefN()]),
+        `%w.bytes.toStrRange:${enc}`,
+      );
+      const c = new Code();
+      const B = 0, RAWSTART = 1, RAWEND = 2;
+      const LENI = 3, START = 4, END = 5, VIEW = 6;
+      c.localGet(B);
+      c.structGet(this.bytesType(), BLEN);
+      c.localSet(LENI);
+      // start = isNaN(rawStart) ? 0 : trunc(rawStart); clamp to [0, len]
+      c.localGet(RAWSTART);
+      c.localGet(RAWSTART);
+      c.f64Ne();
+      c.ifResult(F64);
+      c.f64Const(0);
+      c.else_();
+      c.localGet(RAWSTART);
+      c.f64Trunc();
+      c.end();
+      c.f64Const(0);
+      c.f64Max();
+      c.localGet(LENI);
+      c.f64ConvertI32S();
+      c.f64Min();
+      c.i32TruncF64S();
+      c.localSet(START);
+      // end = isNaN(rawEnd) ? 0 : trunc(rawEnd); clamp to [0, len]
+      c.localGet(RAWEND);
+      c.localGet(RAWEND);
+      c.f64Ne();
+      c.ifResult(F64);
+      c.f64Const(0);
+      c.else_();
+      c.localGet(RAWEND);
+      c.f64Trunc();
+      c.end();
+      c.f64Const(0);
+      c.f64Max();
+      c.localGet(LENI);
+      c.f64ConvertI32S();
+      c.f64Min();
+      c.i32TruncF64S();
+      c.localSet(END);
+      // view length = max(0, end - start); a view, not a copy — the SAME
+      // storage array, matching subarrayHelper's own aliasing (S002).
+      c.localGet(B);
+      c.structGet(this.bytesType(), STORAGE);
+      c.localGet(B);
+      c.structGet(this.bytesType(), OFF);
+      c.localGet(START);
+      c.i32Add();
+      c.localGet(END);
+      c.localGet(START);
+      c.i32LtS();
+      c.ifResult(I32);
+      c.i32Const(0);
+      c.else_();
+      c.localGet(END);
+      c.localGet(START);
+      c.i32Sub();
+      c.end();
+      c.structNew(this.bytesType());
+      c.localSet(VIEW);
+      c.localGet(VIEW);
+      c.call(this.toStrHelper(enc));
+      this.mb.setBody(idx, [I32, I32, I32, this.bytesRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  private bytesVecRef(): ValType {
+    return { kind: "ref", nullable: true, typeIndex: this.deps.bytesVec().struct };
+  }
+
+  private bytesVecBufRefNN(): ValType {
+    return { kind: "ref", nullable: false, typeIndex: this.deps.bytesVec().bufType };
+  }
+
+  /** %w.bytes.concatLen — (list: vec(bytes<u8>), f64 total) → bytes<u8>;
+   * Buffer.concat(list, totalLength) (scr_bytes_concat_len). The EMPTY-
+   * LIST short-circuit runs BEFORE `total` is even looked at — measured
+   * directly: `Buffer.concat([], -1)` and `Buffer.concat([], NaN)` both
+   * answer `""`, NEITHER throwing, confirming the C reference's own
+   * comment here (unlike this round's two other C-reference divergences
+   * — this one held up). Otherwise: `total` validates via
+   * validateOffHelper ("length", [0, MAX_SAFE_INTEGER]) — THEN
+   * emitByteSizeGuard runs (S034's THIRD call site; `total` is already a
+   * BYTE count, esz=1) — the doc comment on that guard requires running
+   * it AFTER any catchable-RangeError validation, which this preserves.
+   * The copy loop truncates (stops once `total` bytes are written,
+   * whichever parts are left over are simply never copied) or zero-pads
+   * (a fresh `array.new_default` is already zero-filled by WasmGC —
+   * measured: `Buffer.concat([a,b], 8)` on a 5-byte sum zero-pads the
+   * trailing 3 bytes, matching the C reference's own memcpy-into-a-
+   * calloc'd-buffer shape, which this mirrors for free by construction). */
+  concatLenHelper(): number {
+    return this.cached("concatLen", () => {
+      const v = this.deps.bytesVec();
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.bytesVecRef(), F64], [this.bytesRef()]),
+        "%w.bytes.concatLen",
+      );
+      const c = new Code();
+      const LIST = 0, TOTAL = 1;
+      const LISTLEN = 2, LISTBUF = 3, TOTALI = 4, OUT = 5, O = 6, I = 7, PART = 8, TAKE = 9;
+      c.localGet(LIST);
+      c.structGet(v.struct, LEN);
+      c.localSet(LISTLEN);
+      c.localGet(LISTLEN);
+      c.i32Eqz();
+      c.ifVoid();
+      {
+        c.i32Const(0);
+        c.arrayNewDefault(this.bufType());
+        c.i32Const(0);
+        c.i32Const(0);
+        c.structNew(this.bytesType());
+        c.return_();
+      }
+      c.end();
+      this.deps.lit(c, "length");
+      c.localGet(TOTAL);
+      c.f64Const(9007199254740991);
+      c.call(this.validateOffHelper());
+      c.i32Eqz();
+      c.ifVoid();
+      {
+        c.refNull(this.bytesType());
+        c.return_();
+      }
+      c.end();
+      this.emitByteSizeGuard(c, 1, () => c.localGet(TOTAL));
+      c.localGet(TOTAL);
+      c.i32TruncF64S();
+      c.localSet(TOTALI);
+      c.localGet(TOTALI);
+      c.arrayNewDefault(this.bufType());
+      c.localSet(OUT);
+      c.localGet(LIST);
+      c.structGet(v.struct, BUF);
+      c.localSet(LISTBUF);
+      c.i32Const(0);
+      c.localSet(O);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(LISTLEN);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(O);
+      c.localGet(TOTALI);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(LISTBUF);
+      c.localGet(I);
+      c.arrayGet(v.bufType);
+      c.refAsNonNull();
+      c.localSet(PART);
+      c.localGet(PART);
+      c.structGet(this.bytesType(), BLEN);
+      c.localGet(TOTALI);
+      c.localGet(O);
+      c.i32Sub();
+      c.i32GtS();
+      c.ifResult(I32);
+      c.localGet(TOTALI);
+      c.localGet(O);
+      c.i32Sub();
+      c.else_();
+      c.localGet(PART);
+      c.structGet(this.bytesType(), BLEN);
+      c.end();
+      c.localSet(TAKE);
+      c.localGet(OUT);
+      c.localGet(O);
+      c.localGet(PART);
+      c.structGet(this.bytesType(), STORAGE);
+      c.localGet(PART);
+      c.structGet(this.bytesType(), OFF);
+      c.localGet(TAKE);
+      c.arrayCopy(this.bufType(), this.bufType());
+      c.localGet(O);
+      c.localGet(TAKE);
+      c.i32Add();
+      c.localSet(O);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(OUT);
+      c.i32Const(0);
+      c.localGet(TOTALI);
+      c.structNew(this.bytesType());
+      this.mb.setBody(
+        idx,
+        [I32, this.bytesVecBufRefNN(), I32, this.bufRefNN(), I32, I32, this.bytesRef(), I32],
+        c.bytes(),
+      );
+      return idx;
+    });
+  }
+
+  /** %w.bytes.concat — (list: vec(bytes<u8>)) → bytes<u8>; Buffer.concat
+   * (list) with no explicit length — total is the SUM of every part's
+   * length, accumulated in F64 (not i32): each part's length is already
+   * < 2^31 individually (S034), but summing enough of them in i32
+   * arithmetic could wrap (2 near-cap buffers wraps negative; 3+ can
+   * wrap back to a small positive) — accumulating in f64 instead (exact
+   * up to 2^53, far past anything reachable here) sidesteps that
+   * entirely, so emitByteSizeGuard's own check (reached via
+   * concatLenHelper, which this defers to once the total is known) is
+   * what decides oversized-or-not, not an accidental wraparound. Never
+   * returns the SAME reference as a single-element input — measured:
+   * `Buffer.concat([a]) === a` is `false` on Node; concat always copies,
+   * with no single-element special case. */
+  concatHelper(): number {
+    return this.cached("concat", () => {
+      const v = this.deps.bytesVec();
+      const idx = this.mb.declareFunc(this.mb.funcType([this.bytesVecRef()], [this.bytesRef()]), "%w.bytes.concat");
+      const c = new Code();
+      const LIST = 0;
+      const LISTLEN = 1, LISTBUF = 2, TOTAL = 3, I = 4;
+      c.localGet(LIST);
+      c.structGet(v.struct, LEN);
+      c.localSet(LISTLEN);
+      c.localGet(LIST);
+      c.structGet(v.struct, BUF);
+      c.localSet(LISTBUF);
+      c.f64Const(0);
+      c.localSet(TOTAL);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(LISTLEN);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(TOTAL);
+      c.localGet(LISTBUF);
+      c.localGet(I);
+      c.arrayGet(v.bufType);
+      c.refAsNonNull();
+      c.structGet(this.bytesType(), BLEN);
+      c.f64ConvertI32S();
+      c.f64Add();
+      c.localSet(TOTAL);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(LIST);
+      c.localGet(TOTAL);
+      c.call(this.concatLenHelper());
+      this.mb.setBody(idx, [I32, this.bytesVecBufRefNN(), F64, I32], c.bytes());
       return idx;
     });
   }

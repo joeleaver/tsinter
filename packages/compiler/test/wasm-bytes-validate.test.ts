@@ -77,6 +77,10 @@ test("typedarrays.ts: every BytesBuilder helper, every elem kind, emits a VALID 
     f64Vec: () => f64VecInfo,
     f64VecNewLen: () => vecs.newLen(f64VecInfo),
     f64VecPush1: () => vecs.pushOne(f64VecInfo),
+    // Self-referencing closure: bytesVec is only ever CALLED later (once
+    // `bytesB` is fully assigned below), never during construction, so
+    // capturing `bytesB` here is safe — the same pattern emitter.ts uses.
+    bytesVec: () => vecs.info("vec(bytes:u8)", bytesB.bytesRef(), bytesB.bytesRef(), "ref"),
     // Consume whatever pushMessage produced and keep the stack balanced —
     // this stub never actually sets an exception cell (there is none
     // here), it only needs to be STRUCTURALLY valid at the call site.
@@ -151,6 +155,14 @@ test("typedarrays.ts: every BytesBuilder helper, every elem kind, emits a VALID 
     bytesB.fillStrHelper(enc);
     bytesB.writeStrHelper(enc);
   }
+  // Round B3: byteLenStr/isEncoding, toString:range, concat/concatLen.
+  bytesB.isEncodingHelper();
+  for (const enc of encodings) {
+    bytesB.byteLenStrHelper(enc);
+    bytesB.toStrRangeHelper(enc);
+  }
+  bytesB.concatHelper();
+  bytesB.concatLenHelper();
 
   const bytes = mb.emit();
   expect(WebAssembly.validate(bytes)).toBe(true);

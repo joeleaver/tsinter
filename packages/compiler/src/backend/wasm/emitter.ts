@@ -8505,23 +8505,25 @@ class Assembler {
           case "toString": {
             // The encoding is ALWAYS a compile-time strLit (nodes.ts's
             // bufEncoding fence at the lowering) — the emitter reads it
-            // directly, no runtime dispatch. Stage B scope: the plain
-            // 1-arg form; the [start, end) range form (2-3 args) keeps a
-            // named refusal (its clamp rule is scr_bytes_to_str_range's
-            // OWN — negatives clamp to 0, no relative-to-end adjustment,
+            // directly, no runtime dispatch. The [start, end) range form
+            // (2-3 args) uses its OWN clamp rule (scr_bytes_to_str_range's
+            // — negatives clamp to 0, no relative-to-end adjustment,
             // unlike slice/subarray — measured against Node directly and
             // deliberately NOT reusing subarrayHelper's emitRelIndex).
             const encArg = e.args[0];
             if (encArg === undefined || encArg.kind !== "strLit") {
               throw new Error("emitter bug: bytesIntrinsic toString without a strLit encoding");
             }
-            if (e.args.length > 1) {
-              this.refuse("bytesIntrinsic:toString:range", e.loc);
-              code.unreachable();
+            this.walkExpr(e.receiver);
+            if (e.args.length === 1) {
+              code.call(this.bytesB.toStrHelper(encArg.value));
               return;
             }
-            this.walkExpr(e.receiver);
-            code.call(this.bytesB.toStrHelper(encArg.value));
+            if (e.args[1] !== undefined) this.walkExpr(e.args[1]);
+            else code.f64Const(0);
+            if (e.args[2] !== undefined) this.walkExpr(e.args[2]);
+            else code.f64Const(Infinity);
+            code.call(this.bytesB.toStrRangeHelper(encArg.value));
             return;
           }
           case "readNum":
@@ -8854,6 +8856,7 @@ class Assembler {
       f64Vec: () => this.f64VecInfo(),
       f64VecNewLen: () => this.vecs.newLen(this.f64VecInfo()),
       f64VecPush1: () => this.vecs.pushOne(this.f64VecInfo()),
+      bytesVec: () => this.bytesVecInfo(),
       throwError: (c, className, name, pushMessage, codeLit) =>
         this.emitSetCellError(c, className, name, pushMessage, codeLit),
     });
@@ -8866,6 +8869,16 @@ class Assembler {
    * incompatible vec(f64) type. */
   private f64VecInfo(): VecInfo {
     return this.vecs.info("vec(f64)", F64, F64, "f64");
+  }
+
+  /** The `Buffer[]` / `Uint8Array[]` vector info — the SAME interning a
+   * static `array<bytes<u8>>` gets via vecInfoFor (vecKeyFor's "bytes"
+   * arm answers `bytes:u8`, wrapped as `vec(bytes:u8)`), so concat's list
+   * argument and any other u8-bytes array never build a second,
+   * incompatible vector type. */
+  private bytesVecInfo(): VecInfo {
+    const elemVal = this.bytesB.bytesRef();
+    return this.vecs.info("vec(bytes:u8)", elemVal, elemVal, "ref");
   }
 
   /** The vector types for an IR array type; null (with the honest type
@@ -9854,6 +9867,41 @@ class Assembler {
       }
       this.walkExpr(e.args[0]!);
       code.call(this.bytesB.fromStrHelper(encArg.value));
+      return true;
+    }
+    if (e.fn === "buffer.byteLenStr") {
+      // Buffer.byteLength(string, enc?) — enc is ALWAYS a compile-time
+      // strLit (lower-containers.ts's bufEncoding fence); never throws.
+      const encArg = e.args[1];
+      if (encArg === undefined || encArg.kind !== "strLit") {
+        throw new Error("emitter bug: buffer.byteLenStr without a strLit encoding");
+      }
+      this.walkExpr(e.args[0]!);
+      code.call(this.bytesB.byteLenStrHelper(encArg.value));
+      return true;
+    }
+    if (e.fn === "buffer.isEncoding") {
+      // Buffer.isEncoding(name) — the ONE case where the encoding is a
+      // genuine RUNTIME string, not a compile-time strLit (it's the
+      // alias-set TEST itself); never throws.
+      this.walkExpr(e.args[0]!);
+      code.call(this.bytesB.isEncodingHelper());
+      return true;
+    }
+    if (e.fn === "buffer.concat") {
+      // NOT in MAY_THROW_LIB_FNS (unlike concatLen) — the internally-
+      // computed total is always a valid non-negative integer, so the
+      // validateOffHelper path inside concatLenHelper (which this
+      // defers to) is provably unreachable here; no emitPendingCheck.
+      this.walkExpr(e.args[0]!); // list
+      code.call(this.bytesB.concatHelper());
+      return true;
+    }
+    if (e.fn === "buffer.concatLen") {
+      this.walkExpr(e.args[0]!); // list
+      this.walkExpr(e.args[1]!); // total
+      code.call(this.bytesB.concatLenHelper());
+      this.emitPendingCheck();
       return true;
     }
     return false;

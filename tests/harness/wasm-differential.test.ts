@@ -1198,6 +1198,18 @@ const TIER_FLOOR: string[] = [
   // `.toString("hex")` specifically, which stage A's own design doc
   // flagged as blocked on this stage.
   "1401-typedarray-slice-set.ts",
+  // Increment 18 stage B, round B3: buffer.concat/concatLen (with the
+  // THIRD emitByteSizeGuard site), toString(enc, start, end)'s own clamp
+  // rule, and Buffer.byteLength/isEncoding over runtime strings. 1402 and
+  // 1663 head at concat/compareBuf-family constructs stage B2 had not
+  // reached yet; 1661 needed toString:range specifically; 2380 needed
+  // fillNum (B2) PLUS one of this round's constructs to fully claim — a
+  // program can carry more than one refusal, and census counts only
+  // change once every one of them is gone.
+  "1402-buffer-encodings.ts",
+  "1661-buffer-encodings-full.ts",
+  "1663-buffer-compare-search-fill.ts",
+  "2380-buffer-module-named-import.ts",
 ];
 
 interface RunResult {

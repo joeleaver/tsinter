@@ -5246,3 +5246,180 @@ test("bytes: writeStr — budget clamping (validated length vs remaining-after-o
   ];
   expect(stdout.toString("utf8")).toBe(expected.join("\n"));
 });
+
+test("bytes: Buffer.byteLength(str, enc) — exact per-encoding formulas across empty/ASCII/BMP/astral strings", async () => {
+  const strs = ["", "a", "ab", "abc", "hello", "a\\u00e9", "a\\u{1F600}b"];
+  const encs = ["utf8", "latin1", "ascii", "utf16le", "hex", "base64", "base64url"];
+  const srcLines: string[] = [];
+  for (const s of strs) {
+    for (const enc of encs) {
+      srcLines.push(`console.log(Buffer.byteLength('${s}', '${enc}'));`);
+    }
+  }
+  srcLines.push("");
+  const res = await buildWasm("bytes-bytelength.ts", srcLines.join("\n"));
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  const realStrs = ["", "a", "ab", "abc", "hello", "aé", "a\u{1F600}b"];
+  const expected: string[] = [];
+  for (const s of realStrs) {
+    for (const enc of encs) {
+      expected.push(String(Buffer.byteLength(s, enc as BufferEncoding)));
+    }
+  }
+  expect(stdout.toString("utf8")).toBe(expected.join("\n") + "\n");
+});
+
+test("bytes: Buffer.isEncoding — every accepted alias, both cases, and near-miss strings that must answer false", async () => {
+  const cases = [
+    "utf8", "utf-8", "UTF8", "UTF-8", "hex", "HEX", "base64", "BASE64",
+    "base64url", "BASE64URL", "latin1", "LATIN1", "binary", "BINARY",
+    "ascii", "ASCII", "utf16le", "UTF16LE", "utf-16le", "UTF-16LE",
+    "ucs2", "UCS2", "ucs-2", "UCS-2", "ucs-16le", "utf32le", "garbage", "",
+  ];
+  const srcLines = cases.map((s) => `console.log(Buffer.isEncoding('${s}'));`);
+  srcLines.push("");
+  const res = await buildWasm("bytes-isencoding.ts", srcLines.join("\n"));
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  const expected = cases.map((s) => String(Buffer.isEncoding(s)));
+  expect(stdout.toString("utf8")).toBe(expected.join("\n") + "\n");
+});
+
+test("bytes: toString(enc, start, end) — its OWN clamp rule (negatives clamp to 0, no relative-to-end), never throws", async () => {
+  const b = Buffer.from("hello world");
+  const cases: [number, number][] = [
+    [2, Infinity],
+    [2, 5],
+    [-2, Infinity],
+    [-2, 5],
+    [0, -2],
+    [-100, -100],
+    [100, 200],
+    [5, 2],
+    [NaN, 5],
+    [2, NaN],
+    [1.9, 5.9],
+  ];
+  const srcLines: string[] = ["const b = Buffer.from('hello world');"];
+  for (const [start, end] of cases) {
+    const startSrc = Number.isNaN(start) ? "NaN" : start === -Infinity ? "-Infinity" : String(start);
+    const endSrc = Number.isNaN(end) ? "NaN" : end === Infinity ? "Infinity" : String(end);
+    srcLines.push(`console.log(JSON.stringify(b.toString('utf8', ${startSrc}, ${endSrc})));`);
+  }
+  srcLines.push("console.log(JSON.stringify(b.toString('utf8')));");
+  srcLines.push("");
+  const res = await buildWasm("bytes-tostring-range.ts", srcLines.join("\n"));
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  const expected = cases.map(([start, end]) => JSON.stringify(b.toString("utf8", start, end)));
+  expected.push(JSON.stringify(b.toString("utf8")));
+  expect(stdout.toString("utf8")).toBe(expected.join("\n") + "\n");
+});
+
+test("bytes: Buffer.concat/concatLen — truncate/zero-pad, empty-list short-circuit (even with an invalid length), never-identity, and Node-exact length errors", async () => {
+  const res = await buildWasm(
+    "bytes-concat.ts",
+    [
+      "const caught = (fn: () => void): void => {",
+      "  try { fn(); console.log('no throw'); }",
+      "  catch (e) {",
+      "    const err = e as Error;",
+      "    console.log('caught:' + err.name + ':' + err.message);",
+      "  }",
+      "};",
+      "const a = Buffer.from([1,2,3]);",
+      "const b = Buffer.from([4,5]);",
+      "console.log(Buffer.concat([a,b]).toString('hex'));",
+      "console.log(Buffer.concat([]).toString('hex'));",
+      "{ const r = Buffer.concat([a]); console.log((r === a) + ':' + r.toString('hex')); }",
+      "console.log(Buffer.concat([a,b], 5).toString('hex'));",
+      "console.log(Buffer.concat([a,b], 3).toString('hex'));",
+      "console.log(Buffer.concat([a,b], 8).toString('hex'));",
+      "console.log(Buffer.concat([a,b], 0).toString('hex'));",
+      "console.log(Buffer.concat([], 5).toString('hex'));",
+      "console.log(Buffer.concat([Buffer.alloc(0), Buffer.from([1,2])]).toString('hex'));",
+      "{ const r = Buffer.concat([a], 5); console.log((r === a) + ':' + r.toString('hex')); }",
+      "console.log(Buffer.concat([a], 1).toString('hex'));",
+      "caught(() => { Buffer.concat([], -1); });",
+      "caught(() => { Buffer.concat([a,b], -1); });",
+      "caught(() => { Buffer.concat([a,b], 1.5); });",
+      "caught(() => { Buffer.concat([a,b], NaN); });",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+
+  const a = Buffer.from([1, 2, 3]);
+  const b = Buffer.from([4, 5]);
+  const caughtJs = (fn: () => unknown): string => {
+    try {
+      fn();
+      return "no throw";
+    } catch (e) {
+      const err = e as Error;
+      return `caught:${err.name}:${err.message}`;
+    }
+  };
+  const r1 = Buffer.concat([a]);
+  const r2 = Buffer.concat([a], 5);
+  const expected = [
+    Buffer.concat([a, b]).toString("hex"),
+    Buffer.concat([]).toString("hex"),
+    `${r1 === a}:${r1.toString("hex")}`,
+    Buffer.concat([a, b], 5).toString("hex"),
+    Buffer.concat([a, b], 3).toString("hex"),
+    Buffer.concat([a, b], 8).toString("hex"),
+    Buffer.concat([a, b], 0).toString("hex"),
+    Buffer.concat([], 5).toString("hex"),
+    Buffer.concat([Buffer.alloc(0), Buffer.from([1, 2])]).toString("hex"),
+    `${r2 === a}:${r2.toString("hex")}`,
+    Buffer.concat([a], 1).toString("hex"),
+    caughtJs(() => Buffer.concat([], -1)),
+    caughtJs(() => Buffer.concat([a, b], -1)),
+    caughtJs(() => Buffer.concat([a, b], 1.5)),
+    caughtJs(() => Buffer.concat([a, b], NaN)),
+    "",
+  ];
+  expect(stdout.toString("utf8")).toBe(expected.join("\n"));
+});
+
+test("S034: concatLen's allocation-cap guard (the THIRD site) traps for a requested totalLength at or past 2^31 bytes", async () => {
+  const res = await buildWasm(
+    "bytes-concatlen-s034.ts",
+    [
+      "console.log('pre');",
+      "Buffer.concat([Buffer.from([1])], 2147483648);",
+      "console.log('unreached');",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasmToTrap(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("pre\n");
+});
+
+test("bytes: Buffer.byteLength(str, 'base64'/'base64url') — the padding-strip rule, not the naive (len*3)>>>2 (a bug this exact sweep caught)", async () => {
+  const cases = ["SGVsbG8=", "SGVsbG8==", "SGVsbG8", "", "QQ==", "QQ===", "====", "QUJD", "QUJDRA==", "=", "A=", "A==="];
+  const srcLines: string[] = [];
+  for (const s of cases) {
+    srcLines.push(`console.log(Buffer.byteLength('${s}', 'base64'));`);
+    srcLines.push(`console.log(Buffer.byteLength('${s}', 'base64url'));`);
+  }
+  srcLines.push("");
+  const res = await buildWasm("bytes-bytelength-b64-padding.ts", srcLines.join("\n"));
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  const expected: string[] = [];
+  for (const s of cases) {
+    expected.push(String(Buffer.byteLength(s, "base64")));
+    expected.push(String(Buffer.byteLength(s, "base64url")));
+  }
+  expect(stdout.toString("utf8")).toBe(expected.join("\n") + "\n");
+});

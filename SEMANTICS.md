@@ -1367,17 +1367,34 @@ looser bound that would still need its own overflow story.
 The guard is ONE private helper, `BytesBuilder.emitByteSizeGuard` in
 `typedarrays.ts`, whose literal boundary constant — `2147483648` (2^31) —
 IS this entry's registered cap by construction (one source of truth, not
-two numbers that have to be kept in sync). It is called from the TWO
+two numbers that have to be kept in sync). It is called from the
 construction sites that can produce an out-of-thin-air length — `newLen`
-(the ToIndex'd f64 argument, unbounded before this check) and `fromArrLit`
+(the ToIndex'd f64 argument, unbounded before this check), `fromArrLit`
 (the source `number[]`'s element count, itself already capped below 2^31
 by arrays.ts's own vec-length guard, but a u32/i32/f32 element's
 `esize=4` multiplier can still carry the BYTE size past 2^31 even though
 the ELEMENT count alone would not, so it needs the identical check, not a
-smaller one). Every other bytes value (`slice`, `subarray`, `with`,
+smaller one), and — round B3 — `concatLen` (`Buffer.concat(list,
+totalLength)`'s explicit `totalLength` argument, the SAME "out-of-thin-
+air numeric length" class as `newLen`, run AFTER `totalLength` passes
+validateOffHelper's own catchable-RangeError check, per this section's
+own "must run after any catchable-RangeError validation" rule). Plain
+`concat` (no explicit length) computes its OWN total as the SUM of every
+list element's length, but does so in **f64, not i32** — each element's
+length is already < 2^31 individually (this same guard, at its own
+construction site), but summing enough of them in i32 arithmetic could
+wrap (two near-cap buffers wraps negative; three or more can wrap back to
+a small positive, a SILENT miscompile risk if the summation itself were
+the thing computing the final byte count) — accumulating in f64 instead
+(exact up to 2^53, far past anything reachable through this tier's own
+per-element cap) sidesteps the wraparound risk entirely, so `concat`
+defers to `concatLen` with an f64 total that emitByteSizeGuard's own
+check decides is oversized or not, never an accidental wraparound
+deciding it. Every other bytes value (`slice`, `subarray`, `with`,
 `toReversed`, `fillElem`, the same-elem `bytesNew` copy form) derives its
-length from an already-valid receiver and never exceeds it, so these are
-the COMPLETE set of from-scratch allocation roots — guarding both is
+length from an already-valid receiver and never exceeds it, so these
+three (`newLen`, `fromArrLit`, `concatLen`) are the COMPLETE set of
+from-scratch NUMERIC-length allocation roots — guarding all three is
 sufficient for the invariant `len * esize` never overflows i32 to hold
 everywhere `byteLength` (or any byte-address arithmetic) reads it — this
 "complete set" claim is scoped to that ONE invariant (an out-of-thin-air
