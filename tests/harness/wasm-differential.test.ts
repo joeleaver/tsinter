@@ -1145,6 +1145,38 @@ const TIER_FLOOR: string[] = [
   "2550-generics-keyof-pick.ts",
   "2556-width-hybrid-shapes.ts",
   "2559-index-signature-container-values.ts",
+  // Increment 17 stage C (the edges + integration sweep): dyn.ts's CHECK
+  // and MATCH walkers gain index-signature arms — width TOLERANCE becomes
+  // width CAPTURE (undeclared keys inserted into the overflow, values
+  // checked/matched against indexValue), dissolving dynCheck:record:
+  // index-signature, dynMatch:record:index-signature and dynFrom:record:
+  // index-signature (the record→dyn overflow tail, JS own-key order via
+  // keysJsOrder like the JSON writer). unionKeyGet:keyed-read now routes
+  // a record-armed union's runtime/overflow-only keyed reads through the
+  // same %w.rkg helper a single-record read uses, rather than
+  // reimplementing declared-then-overflow dispatch a second time. A
+  // downstream gap surfaced by dynCheck's dissolution and fixed here too:
+  // JSON.stringify of a `dyn`-valued (`unknown`-signature) overflow entry
+  // routed through jsonWriteHelper, which has no "dyn" arm and refused
+  // (`jsonWrite:dyn`) — routed through json.ts's putDyn instead (already
+  // a complete dyn-tree serializer with its own cycle detection), peeking
+  // the entry's kind for putDyn's own undefined-or-function "absent" rule
+  // BEFORE writing the comma/key, matching putDyn's own OBJ-arm pattern
+  // for its own members exactly. A record↔dyn aliasing cycle cannot be
+  // constructed in the first place (S014: crossing the dyn boundary
+  // always deep-copies), so no coordination with the record's own
+  // jbEnter/jbLeave identity stack is needed — verified with a probe
+  // (function-valued and cyclic dyn overflow entries, both matching Node
+  // exactly: the former drops silently, the latter throws the identical
+  // circular-structure TypeError after the same preceding stdout).
+  "909-records-index-json.ts",
+  "910-records-index-rc-stress.ts",
+  "913-records-index-iteration.ts",
+  "914-records-from-entries.ts",
+  "915-unknown-tostring-eq.ts",
+  "1011-json-unknown-typeof.ts",
+  "1525-unknown-typeof-validation.ts",
+  "1575-unknown-assert-into-record.ts",
 ];
 
 interface RunResult {

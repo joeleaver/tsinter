@@ -426,7 +426,12 @@ export class DynBuilder {
     return { kind: "ref", nullable: true, typeIndex: this.objT() };
   }
 
-  private entriesArrayType(): number {
+  /** The OBJ payload's entries-array type index — public because the
+   * width-CAPTURE walkers (emitter.ts's dynCheck/dynMatch/dynFrom record
+   * arms) iterate a source object's RAW entries directly (storage/
+   * insertion order, not objWalk's own-key-order transform), the same way
+   * emitter.ts already pokes UnionBuilder's base struct fields directly. */
+  entriesArrayType(): number {
     this.objT();
     if (this.objEntriesType === null) throw new Error("wasm dyn builder: entries array type unresolved");
     return this.objEntriesType;

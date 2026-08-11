@@ -85,7 +85,19 @@ import {
   IMPORT_WRITE,
 } from "./abi.js";
 import { VecBuilder, type VecInfo } from "./arrays.js";
-import { DK, DYN_KIND, DYN_NUM, DYN_REF, DynBuilder, FN_CLOS, FN_SIG } from "./dyn.js";
+import {
+  DK,
+  DYN_KIND,
+  DYN_NUM,
+  DYN_REF,
+  DynBuilder,
+  ENTRY_KEY,
+  ENTRY_VALUE,
+  FN_CLOS,
+  FN_SIG,
+  OBJ_ENTRIES,
+  OBJ_LEN,
+} from "./dyn.js";
 import { InspectBuilder } from "./inspect.js";
 import { MapBuilder, type MapInfo, type MapKeyKind, type MapValKind } from "./maps.js";
 import { JsonBuilder, jsonQuote } from "./json.js";
@@ -2152,20 +2164,6 @@ class Assembler {
         const shape = this.recordShapes.get(t.shapeId);
         const info = this.recordInfo(t.shapeId, loc, false);
         if (shape === undefined || info === null) return false;
-        if (shape.indexValue !== undefined) {
-          // Increment-17 stage B lifted recordInfo's blanket refusal for
-          // hybrid shapes, but this walker only ever built the DECLARED
-          // fields into the dyn object — a hybrid record's overflow keys
-          // would silently vanish from the conversion (missing own keys
-          // Node would show) rather than appear, which is a miscompile,
-          // not a refusal. The overflow TAIL this walker needs is
-          // explicitly stage C's job ("FROM walker (record→dyn) gains
-          // the overflow tail") — refuse by name until it lands, exactly
-          // dynMatch's own `record:index-signature` precedent for the
-          // sibling walker.
-          this.refuse("dynFrom:record:index-signature", loc);
-          return false;
-        }
         if (shape.tuple) {
           // A tuple converts as the JSON ARRAY it is everywhere else.
           const a = this.wlocal(w, dyn.arrRef());
@@ -2200,6 +2198,69 @@ class Assembler {
           c.structGet(info.struct, slot);
           c.call(inner);
           c.call(dyn.objPut());
+        }
+        if (info.overflow !== null) {
+          // The overflow TAIL: unlike dynCheck/dynMatch's width-CAPTURE
+          // loops (which scan a SOURCE dyn object's raw storage order),
+          // this walker is building a FRESH dyn object from a static
+          // record — its own insertion order becomes what a later
+          // Object.keys/JSON observes, so the entries must insert in JS
+          // OWN-KEY order up front (keysJsOrder), exactly matching the
+          // JSON writer's overflow-appending loop and the C reference's
+          // `scr_map_keys_js_order` walk.
+          const ovfType = shape.indexValue!;
+          const ovfFromHelper = this.dynFromHelper(ovfType, loc);
+          if (ovfFromHelper === null) return false;
+          const keysArrType: IrType = { kind: "array", elem: { kind: "string" } };
+          const keysVec = this.vecInfoFor(keysArrType, loc);
+          if (keysVec === null) return false;
+          const keys = this.wlocal(w, this.vecs.vecRef(keysVec));
+          c.localGet(0);
+          c.structGet(info.struct, info.fieldIndex.size);
+          c.call(this.maps.keysJsOrder(info.overflow, keysVec.struct, keysVec.bufType));
+          c.localSet(keys);
+          const oi = this.wlocal(w, I32);
+          const on = this.wlocal(w, I32);
+          const okey = this.wlocal(w, keysVec.elemVal);
+          const oval = this.wlocal(w, info.overflow.valVal);
+          c.localGet(keys);
+          c.structGet(keysVec.struct, 0);
+          c.localSet(on);
+          c.i32Const(0);
+          c.localSet(oi);
+          c.block();
+          c.loop();
+          c.localGet(oi);
+          c.localGet(on);
+          c.i32GeS();
+          c.brIf(1);
+          c.localGet(keys);
+          c.structGet(keysVec.struct, 1);
+          c.localGet(oi);
+          this.vecs.emitElemRead(c, keysVec);
+          c.localSet(okey);
+          // The found flag is always true here — okey came from this
+          // exact map's own keysJsOrder scan moments ago, and nothing
+          // else runs between that scan and this read to mutate it (same
+          // reasoning as the JSON writer's overflow loop).
+          c.localGet(0);
+          c.structGet(info.struct, info.fieldIndex.size);
+          c.localGet(okey);
+          c.call(this.maps.get(info.overflow));
+          c.localSet(oval);
+          c.drop();
+          c.localGet(o);
+          c.localGet(okey);
+          c.localGet(oval);
+          c.call(ovfFromHelper);
+          c.call(dyn.objPut());
+          c.localGet(oi);
+          c.i32Const(1);
+          c.i32Add();
+          c.localSet(oi);
+          c.br(0);
+          c.end();
+          c.end();
         }
         dyn.boxObj(c, (x) => x.localGet(o));
         return true;
@@ -2576,16 +2637,30 @@ class Assembler {
           // value holding undefined drops from the output entirely,
           // exactly like `JSON.stringify({a: undefined})` omits `a` — the
           // same rule the declared-field loop above applies via `utag`.
-          // TWO disjoint cases, both needed (a dyn-valued signature and a
-          // concretely-typed one with its own undefined arm, e.g. `[k:
-          // string]: number | undefined`, are different representations):
-          // a `dyn` slot carries no arm to test, so the drop reads runtime
-          // identity against the dyn undefined singleton; a union-typed
-          // slot tests its tag exactly like `utag` does above, off the
-          // shared union base struct.
+          // THREE disjoint cases (a `dyn`-valued signature, one with its
+          // own undefined arm e.g. `[k: string]: number | undefined`, and
+          // a plain required concrete type never need the drop):
+          //  - `dyn` ('unknown'): no static arm to test, so THIS site
+          //    peeks the entry's runtime KIND directly (UNDEF or FUNC —
+          //    json.ts's putDyn OBJ-arm applies the identical rule to its
+          //    own members, "no probe buffer needed" — decide from the
+          //    kind BEFORE writing anything, exactly like here) instead
+          //    of going through jsonWriteHelper (which refuses a bare
+          //    "dyn" arm — a fully general dyn-tree writer with its own
+          //    cycle detection already exists as json.ts's putDyn, so the
+          //    VALUE itself routes there directly rather than duplicating
+          //    it). A record↔dyn aliasing cycle cannot be CONSTRUCTED in
+          //    the first place (S014: crossing the dyn boundary always
+          //    deep-copies), so putDyn's own seen-stack — scoped to
+          //    cycles purely WITHIN dyn-space — is already complete here;
+          //    every call still checks the pending cell regardless of the
+          //    top-level kind, since a NESTED dyn cycle can still throw.
+          //  - a union-typed slot tests its tag exactly like `utag` does
+          //    above, off the shared union base struct.
           const ovfType = shape.indexValue!;
-          const ovfWriter = this.jsonWriteHelper(ovfType, loc);
-          if (ovfWriter === null) return false;
+          const ovfIsDyn = ovfType.kind === "dyn";
+          const ovfWriter = ovfIsDyn ? null : this.jsonWriteHelper(ovfType, loc);
+          if (!ovfIsDyn && ovfWriter === null) return false;
           const keysArrType: IrType = { kind: "array", elem: { kind: "string" } };
           const keysVec = this.vecInfoFor(keysArrType, loc);
           if (keysVec === null) return false;
@@ -2624,12 +2699,23 @@ class Assembler {
           c.call(this.maps.get(info.overflow));
           c.localSet(oval);
           c.drop();
-          const dropUndefined = ovfType.kind === "dyn";
           const ovfUtag = this.undefinedArmTag2(ovfType);
-          if (dropUndefined) {
+          if (ovfIsDyn) {
+            // putDyn's own absence rule (undefined OR function), read
+            // straight off the entry's kind tag — no side effects, so
+            // deciding this BEFORE writing the comma/key is exactly
+            // json.ts's OBJ-arm pattern for its own members.
+            const mk = this.wlocal(w, I32);
             c.localGet(oval);
-            c.globalGet(this.dyn.undefinedGlobal());
-            c.refEq();
+            c.structGet(this.dyn.dynT(), DYN_KIND);
+            c.localSet(mk);
+            c.localGet(mk);
+            c.i32Const(DK.UNDEF);
+            c.i32Eq();
+            c.localGet(mk);
+            c.i32Const(DK.FUNC);
+            c.i32Eq();
+            c.i32Or();
             c.i32Eqz();
             c.ifVoid();
           } else if (ovfUtag >= 0) {
@@ -2655,9 +2741,17 @@ class Assembler {
             c.localGet(okey);
             c.call(json.jbEdgeProp());
           }
-          c.localGet(oval);
-          c.call(ovfWriter);
-          if (dropUndefined || ovfUtag >= 0) c.end();
+          if (ovfIsDyn) {
+            c.localGet(oval);
+            c.call(json.putDyn());
+            c.drop();
+            this.emitWalkerPending(c, null);
+          } else {
+            c.localGet(oval);
+            if (ovfWriter === null) throw new Error("wasm emitter bug: overflow JSON writer missing for a concrete index value");
+            c.call(ovfWriter);
+          }
+          if (ovfIsDyn || ovfUtag >= 0) c.end();
           c.localGet(oi);
           c.i32Const(1);
           c.i32Add();
@@ -2829,12 +2923,6 @@ class Assembler {
       case "record": {
         const shape = this.recordShapes.get(t.shapeId);
         if (shape === undefined) return false;
-        if (shape.indexValue !== undefined) {
-          // Width CAPTURE needs the overflow map's runtime, a separate
-          // rock (recordInfo refuses the shape for the same reason).
-          this.refuse("dynMatch:record:index-signature", loc);
-          return false;
-        }
         const fields = this.tupleOrCanonical(shape);
         if (shape.tuple) {
           // Arity is part of a tuple's type: width tolerance is an
@@ -2904,6 +2992,63 @@ class Assembler {
             c.ifVoid();
             c.i32Const(0);
             c.return_();
+            c.end();
+            c.end();
+          }
+          // Width CAPTURE (increment 17 stage C): a hybrid shape's
+          // UNDECLARED entries must fit the index signature's value type
+          // too — the builder captures them, so matching them is what
+          // makes discriminated-union dispatch over hybrid arms sound.
+          // `dyn` value types accept anything (skip the scan entirely,
+          // matching the declared-field `dyn` short-circuit above); a
+          // MISSING declared field already returned false above, so this
+          // scan only ever needs the SKIP test, never an absence check.
+          if (shape.indexValue !== undefined && shape.indexValue.kind !== "dyn") {
+            const iv = shape.indexValue;
+            const inner = this.dynMatchHelper(iv, loc);
+            if (inner === null) return false;
+            const objT = dyn.objT();
+            const entries = dyn.entriesArrayType();
+            const entryT = dyn.entryT();
+            const oN = this.wlocal(w, I32);
+            const oI = this.wlocal(w, I32);
+            const oE = this.wlocal(w, dyn.entryRef());
+            c.localGet(o);
+            c.structGet(objT, OBJ_LEN);
+            c.localSet(oN);
+            c.i32Const(0);
+            c.localSet(oI);
+            c.block();
+            c.loop();
+            c.localGet(oI);
+            c.localGet(oN);
+            c.i32GeU();
+            c.brIf(1);
+            c.localGet(o);
+            c.structGet(objT, OBJ_ENTRIES);
+            c.localGet(oI);
+            c.arrayGet(entries);
+            c.localSet(oE);
+            this.emitDeclaredKeySkip(c, fields, (x) => {
+              x.localGet(oE);
+              x.structGet(entryT, ENTRY_KEY);
+            });
+            c.i32Eqz();
+            c.ifVoid();
+            c.localGet(oE);
+            c.structGet(entryT, ENTRY_VALUE);
+            c.call(inner);
+            c.i32Eqz();
+            c.ifVoid();
+            c.i32Const(0);
+            c.return_();
+            c.end();
+            c.end();
+            c.localGet(oI);
+            c.i32Const(1);
+            c.i32Add();
+            c.localSet(oI);
+            c.br(0);
             c.end();
             c.end();
           }
@@ -2984,11 +3129,37 @@ class Assembler {
     return t.kind === "union" ? this.undefinedArmTag(t.unionId) : -1;
   }
 
+  /** Push `true` iff a RUNTIME key (pushed by `pushKey`, repeatable —
+   * called once per declared field) names one of `fields`'s declared
+   * NAMES — the skip test width-CAPTURE's dynCheck/dynMatch record arms
+   * need when scanning a source dyn object's raw entries, so a declared
+   * field's own entry is validated once (by the declared-field loop
+   * above) rather than a second time as an overflow entry. Ports the C
+   * reference's `skip` memcmp OR-chain (emit-walkers.ts's dynCheck/
+   * dynMatch record cases) to a runtime string compare, since the loop
+   * key here is never a compile-time literal. No declared fields at all
+   * (a PURE `Record<string, V>` shape) pushes `false` — nothing to skip. */
+  private emitDeclaredKeySkip(c: Code, fields: readonly { name: string }[], pushKey: (c: Code) => void): void {
+    if (fields.length === 0) {
+      c.i32Const(0);
+      return;
+    }
+    fields.forEach((f, i) => {
+      pushKey(c);
+      this.pushStrLitInto(c, f.name);
+      c.call(this.strEqHelper());
+      if (i > 0) c.i32Or();
+    });
+  }
+
   /** %w.dyn.check:<typeKey> — the validating extractor (C's sc_dc_N):
    * validate the dyn tree against T and BUILD the typed value, or throw
-   * the catchable path-annotated TypeError. Records are WIDTH-TOLERANT
-   * (only declared fields are looked up; extras are never examined —
-   * this is check-and-extract, not shape equality). */
+   * the catchable path-annotated TypeError. Plain records are WIDTH-
+   * TOLERANT (only declared fields are looked up; extras are never
+   * examined — this is check-and-extract, not shape equality); a hybrid
+   * (index-signature) shape instead CAPTURES every undeclared key into
+   * the overflow map, validating each against the signature's value type
+   * (increment 17 stage C). */
   private dynCheckHelper(t: IrType, loc: SrcLoc | undefined): number | null {
     const key = typeKey(t);
     const hit = this.dynCheckFns.get(key);
@@ -3063,22 +3234,6 @@ class Assembler {
         const shape = this.recordShapes.get(t.shapeId);
         const info = this.recordInfo(t.shapeId, loc, false);
         if (shape === undefined || info === null) return false;
-        if (shape.indexValue !== undefined) {
-          // Increment-17 stage B lifted recordInfo's blanket refusal for
-          // hybrid shapes, but this walker only ever validated/built the
-          // DECLARED fields — a hybrid shape's dynCheck needs WIDTH
-          // CAPTURE (undeclared keys inserted into the overflow, values
-          // checked against indexValue), explicitly stage C's job
-          // ("dyn.ts CHECK/MATCH walkers gain index-signature arms").
-          // Without it this walker would leave the overflow field at its
-          // struct default and silently drop every extra dyn key instead
-          // of capturing it — a miscompile, not a refusal — so guard
-          // explicitly exactly like dynMatch's own
-          // `dynMatch:record:index-signature` precedent for the sibling
-          // walker (dynMatch:2349-2357).
-          this.refuse("dynCheck:record:index-signature", loc);
-          return false;
-        }
         if (shape.tuple) {
           const fields = this.tupleFieldOrder(shape);
           kindGuard(DK.ARR);
@@ -3126,6 +3281,15 @@ class Assembler {
           c.localSet(o);
           c.structNewDefault(info.struct);
           c.localSet(r);
+          if (info.overflow !== null) {
+            // Hybrid shape: a fresh empty overflow map at construction,
+            // exactly like recordLit's contract — the field's declared
+            // wasm type is nullable (structNewDefault needs every field
+            // defaultable) and this write is what keeps it non-null.
+            c.localGet(r);
+            c.call(this.maps.new_(info.overflow));
+            c.structSet(info.struct, info.fieldIndex.size);
+          }
           // CANONICAL order, matching the C and LLVM walkers: this is the
           // order that decides WHICH bad field a record with several
           // reports first, so it has to be the shape's identity rather
@@ -3184,6 +3348,80 @@ class Assembler {
             c.call(inner);
             c.structSet(info.struct, slot);
             this.emitWalkerPending(c, val);
+            c.end();
+          }
+          if (shape.indexValue !== undefined) {
+            if (info.overflow === null) {
+              throw new Error(`wasm emitter bug: shape ${t.shapeId} has an index signature but recordInfo built no overflow`);
+            }
+            // Width CAPTURE: every entry the declared-field loop above
+            // did NOT already consume inserts into the overflow map — a
+            // `dyn` value type retains the subtree as-is (nothing to
+            // validate, matching the declared `dyn`-field arm above and
+            // C's `ev = scr_dyn_retain(e->value)`); a concrete value type
+            // validates through dynCheckHelper with a path naming the
+            // RUNTIME key, exactly like a declared field's own path.
+            const iv = shape.indexValue;
+            const objT = dyn.objT();
+            const entries = dyn.entriesArrayType();
+            const entryT = dyn.entryT();
+            const oN = this.wlocal(w, I32);
+            const oI = this.wlocal(w, I32);
+            const oE = this.wlocal(w, dyn.entryRef());
+            c.localGet(o);
+            c.structGet(objT, OBJ_LEN);
+            c.localSet(oN);
+            c.i32Const(0);
+            c.localSet(oI);
+            c.block();
+            c.loop();
+            c.localGet(oI);
+            c.localGet(oN);
+            c.i32GeU();
+            c.brIf(1);
+            c.localGet(o);
+            c.structGet(objT, OBJ_ENTRIES);
+            c.localGet(oI);
+            c.arrayGet(entries);
+            c.localSet(oE);
+            this.emitDeclaredKeySkip(c, this.tupleOrCanonical(shape), (x) => {
+              x.localGet(oE);
+              x.structGet(entryT, ENTRY_KEY);
+            });
+            c.i32Eqz();
+            c.ifVoid();
+            if (iv.kind === "dyn") {
+              c.localGet(r);
+              c.structGet(info.struct, info.fieldIndex.size);
+              c.localGet(oE);
+              c.structGet(entryT, ENTRY_KEY);
+              c.localGet(oE);
+              c.structGet(entryT, ENTRY_VALUE);
+              c.call(this.maps.set(info.overflow));
+            } else {
+              const inner = this.dynCheckHelper(iv, loc);
+              if (inner === null) return false;
+              c.localGet(r);
+              c.structGet(info.struct, info.fieldIndex.size);
+              c.localGet(oE);
+              c.structGet(entryT, ENTRY_KEY);
+              c.localGet(oE);
+              c.structGet(entryT, ENTRY_VALUE);
+              dyn.pushPathKey(c, (x) => x.localGet(1), (x) => {
+                x.localGet(oE);
+                x.structGet(entryT, ENTRY_KEY);
+              });
+              c.call(inner);
+              c.call(this.maps.set(info.overflow));
+              this.emitWalkerPending(c, val);
+            }
+            c.end();
+            c.localGet(oI);
+            c.i32Const(1);
+            c.i32Add();
+            c.localSet(oI);
+            c.br(0);
+            c.end();
             c.end();
           }
           c.localGet(r);
@@ -6012,9 +6250,13 @@ class Assembler {
         // The unionDisc generalization: per arm, a statically-resolved
         // answer at the JOIN type — a declared literal field reads its
         // slot (wrapping an arm-typed answer into the join), a unit arm
-        // answers the join's interned undefined arm. Index-signature
-        // shapes refuse at recordInfo; runtime keys and array arms wait
-        // on their machinery.
+        // answers the join's interned undefined arm, and anything else
+        // (a runtime key, or a literal touching only an arm's overflow
+        // map) rides the SAME %w.rkg helper a single-record keyed read
+        // uses — recordKeyGetHelper already does declared-then-overflow-
+        // then-miss-policy generically per (shape, resultType), so this
+        // is routing, not reimplementing (increment 17 stage C). Array
+        // arms wait on their own machinery.
         const def = this.unionDef(e.unionId);
         const rt = this.mapType(e.type, e.loc);
         if (rt === null) {
@@ -6025,7 +6267,8 @@ class Assembler {
         const literal = e.key.kind === "strLit" ? e.key.value : null;
         type ArmPlan =
           | { kind: "unit"; global: number }
-          | { kind: "read"; struct: number; rec: number; field: number; wrap: { tag: number; struct: number } | null };
+          | { kind: "read"; struct: number; rec: number; field: number; wrap: { tag: number; struct: number } | null }
+          | { kind: "keyed"; struct: number; helper: number };
         const plan: ArmPlan[] = [];
         for (let i = 0; i < def.arms.length; i++) {
           const armT = def.arms[i]!;
@@ -6048,11 +6291,19 @@ class Assembler {
           if (shape === undefined) throw new Error(`unknown record shape ${armT.shapeId}`);
           const declared = literal !== null ? shape.fields.find((f) => f.name === literal) : undefined;
           if (declared === undefined) {
-            // A runtime key (or a literal touching only the overflow
-            // map) rides the keyed-read helper machinery.
-            this.refuse("unionKeyGet:keyed-read", e.loc);
-            code.unreachable();
-            return;
+            // A LITERAL key naming no declared field is known to touch
+            // only the overflow at compile time (overflowOnly = true, an
+            // optimization recordKeyGetHelper's own contract already
+            // supports); a genuinely runtime key must still check the
+            // declared chain, since the checker never proved it misses.
+            const helper = this.recordKeyGetHelper(armT.shapeId, e.type, literal !== null, e.loc);
+            const st2 = this.unionArmStruct(e.unionId, i, e.loc);
+            if (helper === null || st2 === null) {
+              code.unreachable();
+              return;
+            }
+            plan.push({ kind: "keyed", struct: st2, helper });
+            continue;
           }
           const info = this.recordInfo(armT.shapeId, e.loc, false);
           const st = this.unionArmStruct(e.unionId, i, e.loc);
@@ -6079,9 +6330,19 @@ class Assembler {
           plan.push({ kind: "read", struct: st, rec: info.struct, field, wrap: { tag: wtag, struct: wstruct } });
         }
         // The key evaluates ONCE, before the switch — its effects are
-        // owed even though every in-tier answer resolves statically.
-        this.walkExpr(e.key);
-        code.drop();
+        // owed even for a plan with no "keyed" entry. A "keyed" entry
+        // needs the VALUE too (recordKeyGetHelper's second parameter), so
+        // it survives in a scratch instead of dropping.
+        const needsKey = plan.some((p) => p.kind === "keyed");
+        let keyLocal = -1;
+        if (needsKey) {
+          keyLocal = this.acquireScratch(this.strRef);
+          this.walkExpr(e.key);
+          code.localSet(keyLocal);
+        } else {
+          this.walkExpr(e.key);
+          code.drop();
+        }
         const u = this.acquireScratch(this.unions.baseRef());
         this.walkExpr(e.value);
         code.localSet(u);
@@ -6096,13 +6357,19 @@ class Assembler {
           this.openIfResult(rt);
           if (p.kind === "unit") {
             code.globalGet(p.global);
-          } else {
+          } else if (p.kind === "read") {
             if (p.wrap !== null) code.i32Const(p.wrap.tag);
             code.localGet(u);
             code.refCast(p.struct);
             code.structGet(p.struct, 1);
             code.structGet(p.rec, p.field);
             if (p.wrap !== null) code.structNew(p.wrap.struct);
+          } else {
+            code.localGet(u);
+            code.refCast(p.struct);
+            code.structGet(p.struct, 1);
+            code.localGet(keyLocal);
+            code.call(p.helper);
           }
           code.else_();
         }
@@ -6110,6 +6377,7 @@ class Assembler {
         for (let i = 0; i < plan.length; i++) this.close();
         this.releaseScratch(I32, t);
         this.releaseScratch(this.unions.baseRef(), u);
+        if (needsKey) this.releaseScratch(this.strRef, keyLocal);
         return;
       }
 
