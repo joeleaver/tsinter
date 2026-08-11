@@ -1191,6 +1191,13 @@ const TIER_FLOOR: string[] = [
   // A record field union-arm (`Uint8Array | string`) plus `.length` on
   // the narrowed bytes arm — the union-arm plumbing's own claim.
   "1455-lambda-union-return-adoption.ts",
+  // Increment 18 stage B (bytes io, partial): the full encoding surface
+  // (typedarrays.ts's toStrHelper/fromStrHelper — hex, base64, base64url,
+  // latin1, ascii, utf16le, utf8, both directions) plus the 1-arg
+  // `toString(enc)` and `Buffer.from(string, enc)` wiring. 1401 needed
+  // `.toString("hex")` specifically, which stage A's own design doc
+  // flagged as blocked on this stage.
+  "1401-typedarray-slice-set.ts",
 ];
 
 interface RunResult {

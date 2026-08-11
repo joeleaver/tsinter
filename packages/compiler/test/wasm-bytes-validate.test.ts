@@ -50,6 +50,12 @@ test("typedarrays.ts: every BytesBuilder helper, every elem kind, emits a VALID 
     c.i32Const(0);
     return c.bytes();
   })());
+  const strSliceFn = mb.declareFunc(mb.funcType([strRef, F64, F64], [strRef]), "%stub.strSlice");
+  mb.setBody(strSliceFn, [], (() => {
+    const c = new Code();
+    c.localGet(0);
+    return c.bytes();
+  })());
   const lit = (c: Code, _s: string): void => c.refNull(strType);
 
   const vecs = new VecBuilder(mb, {
@@ -65,7 +71,9 @@ test("typedarrays.ts: every BytesBuilder helper, every elem kind, emits a VALID 
     f64ToStr: () => f64ToStrFn,
     lit,
     strRef: () => strRef,
+    strType: () => strType,
     toInt32: () => toInt32Fn,
+    strSlice: () => strSliceFn,
     f64Vec: () => f64VecInfo,
     f64VecNewLen: () => vecs.newLen(f64VecInfo),
     f64VecPush1: () => vecs.pushOne(f64VecInfo),
@@ -101,6 +109,28 @@ test("typedarrays.ts: every BytesBuilder helper, every elem kind, emits a VALID 
   bytesB.length();
   bytesB.byteOffset();
   bytesB.equalsHelper();
+  // Stage B: the encoding surface, both directions, every encoding â€”
+  // toString(enc) is u8-only at the lowering, but (like the elem sweep
+  // above) this file calls every combination unconditionally.
+  const encodings = ["hex", "base64", "base64url", "latin1", "ascii", "utf16le", "utf8"];
+  for (const enc of encodings) {
+    bytesB.toStrHelper(enc);
+    bytesB.fromStrHelper(enc);
+  }
+  // Stage B: the fixed-width integer readNum/writeNum family (f32/f64
+  // kinds are follow-up work â€” named-refused at the emitter, never built).
+  const numKinds = ["u8", "i8", "u16be", "u16le", "i16be", "i16le", "u32be", "u32le", "i32be", "i32le"];
+  for (const kind of numKinds) {
+    bytesB.readNumHelper(kind);
+    bytesB.writeNumHelper(kind);
+  }
+  // numReceivedHelper is only reached TRANSITIVELY today, through every
+  // error path above (boundsErrorHelper, writeNumHelper's range check) â€”
+  // if a future edit made any one of those paths conditional in a way
+  // that stops emitting the error branch, this sweep would silently lose
+  // coverage of numReceivedHelper without any test failing. Calling it
+  // directly pins its own presence independent of who currently reaches it.
+  bytesB.numReceivedHelper();
 
   const bytes = mb.emit();
   expect(WebAssembly.validate(bytes)).toBe(true);
@@ -148,6 +178,12 @@ test("S034: fromArrLit's allocation-cap guard traps for a u32 source claiming â‰
     c.i32Const(1);
     return c.bytes();
   })());
+  const strSliceFn = mb.declareFunc(mb.funcType([strRef, F64, F64], [strRef]), "%stub.strSlice");
+  mb.setBody(strSliceFn, [], (() => {
+    const c = new Code();
+    c.localGet(0);
+    return c.bytes();
+  })());
   const lit = (c: Code, _s: string): void => c.refNull(strType);
 
   const vecs = new VecBuilder(mb, {
@@ -163,7 +199,9 @@ test("S034: fromArrLit's allocation-cap guard traps for a u32 source claiming â‰
     f64ToStr: () => f64ToStrFn,
     lit,
     strRef: () => strRef,
+    strType: () => strType,
     toInt32: () => toInt32Fn,
+    strSlice: () => strSliceFn,
     f64Vec: () => f64VecInfo,
     f64VecNewLen: () => vecs.newLen(f64VecInfo),
     f64VecPush1: () => vecs.pushOne(f64VecInfo),

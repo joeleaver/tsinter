@@ -1379,7 +1379,96 @@ smaller one). Every other bytes value (`slice`, `subarray`, `with`,
 length from an already-valid receiver and never exceeds it, so these are
 the COMPLETE set of from-scratch allocation roots — guarding both is
 sufficient for the invariant `len * esize` never overflows i32 to hold
-everywhere `byteLength` (or any byte-address arithmetic) reads it.
+everywhere `byteLength` (or any byte-address arithmetic) reads it — this
+"complete set" claim is scoped to that ONE invariant (an out-of-thin-air
+NUMERIC length feeding a `$bytes` struct's `LEN` field directly, where a
+wrapped allocation could pair with a stale, mismatched length and REPORT
+a `byteLength` larger than its actual backing array — a silent structural
+miscompile). It is not a claim that every `arrayNewDefault` call site in
+`typedarrays.ts` is covered; see the stage-B amendment below for a
+different category the guard deliberately does not extend to.
+
+**Amendment (stage B, bytes io — the encoding surface):** `toStrHelper`/
+`fromStrHelper` (`Buffer.prototype.toString(enc)` / `Buffer.from(str, enc)`)
+add a SECOND category of from-scratch allocation, absent from stage A:
+output sizes computed as a MULTIPLE of an existing string or bytes length
+rather than an out-of-thin-air numeric argument — `toStr:hex`'s output is
+`byteLen * 2`, `fromStr:utf8`'s worst-case scratch is `strLen * 3`, and
+several other encodings compute their own exact or worst-case multiplier
+the same way. None of these 12 sites — a lexical count of new
+`arrayNewDefault` call sites added in this stage, confirmed against the
+stage-A commit via `git diff` — call `emitByteSizeGuard`, and per the
+reviewer's ruling this stays a PROSE fix, not a guard extension, because
+the failure mode here is categorically different from the one the guard
+exists to prevent: a `$bytes`/string VALUE feeding this tier already
+carries a length under 2^31 (bytes, by S034's own cap; strings, by the
+underlying WasmGC array's own i32 length field), so a multiplier like `×2`
+or `×3` overflowing i32 is the THEORETICAL failure mode this reasoning is
+built to survive — measured on the current toolchain, it never actually
+gets exercised (see below): V8's own WasmGC array-length ceiling is LOWER
+than the i32-overflow point for every site checked, so `array.new_default`
+itself rejects the oversized request first, every time. Either mechanism —
+i32 overflow, were a future engine's ceiling ever raised past it, or the
+engine's own inherent ceiling, as measured today — resolves the same way,
+because WasmGC arrays are bounds-checked by the engine on every access,
+not raw linear memory: `array.new_default` rejects an oversized length
+outright, or (in the i32-wrap scenario specifically, were it ever
+reachable) a decode loop's own bounds-checked `array.set` would trap the
+first time it wrote past an undersized array. Silent corruption is not
+reachable through this path the way it was through `newLen`/`fromArrLit`'s
+length-field mismatch, which is exactly why the guard is not extended
+here — extending it would harden a failure mode that was never soft,
+under either mechanism.
+
+This still creates a NEW observable divergence from Node, registered here
+per the S008 pattern (an uncatchable engine trap where Node has its own,
+catchable, size-limit error). **All figures below are V8 implementation
+limits measured on this toolchain (Node 24.18), not spec constants — a V8
+upgrade can move them. The entry's claim does not depend on the exact
+values, only on the engine cap binding before the i32 arithmetic on
+current toolchains, and on every failure mode being an honest trap
+regardless of which mechanism is the proximate cause.**
+
+Measured directly — binary search on `array.new_default`, cross-checked
+against the reviewer's own citation, both processes agreeing exactly: the
+i8-array ceiling is 1,073,741,799 elements/bytes (`0x3FFFFFE7`); the
+i16-array (string) ceiling is 536,870,899 units (`0x1FFFFFF3`). Both sit
+just under 2^30 — roughly HALF of S034's own 2^31-byte guard boundary
+(see the note added to the Rationale below). Driven through the REAL
+`toStrHelper("hex")`/`newLen("u8")` path directly, not the abstract
+ceiling alone: `byteLen` 268,435,443 / 268,435,444 / 268,435,449 all
+succeed; 268,435,450 traps with the engine's own message, `requested new
+array is too large`; a 300 MB buffer's `.toString("hex")` traps the same
+way. There is no size at which this tier's `toString("hex")` silently
+succeeds past its own ceiling, and no large "permissive middle zone" the
+way an earlier draft of this entry implied.
+
+Node's own ceiling (`buffer.constants.MAX_STRING_LENGTH` = 536,870,888,
+measured) is LOWER still, so the actual divergence window is narrow and
+exact, not the ~805 MB range this entry previously — wrongly — implied:
+for `byteLen` in `[268,435,445, 268,435,449]`, five values, Node throws
+(`Buffer.alloc(268_435_445).toString("hex")` throws immediately, message
+`Cannot create a string longer than 0x1fffffe8 characters`, `code:
+"ERR_STRING_TOO_LONG"`) while this tier still succeeds; at
+`byteLen ≥ 268,435,450` both sides fail — Node catchably, this tier by an
+uncatchable engine trap. THAT boundary, not a theoretical i32-overflow
+point, is where the real divergence sits. **Correction to the reviewer's
+citation:** the Node error is a plain `Error`, not a `RangeError` —
+measured directly (`e.constructor.name === "Error"`, `e instanceof
+RangeError === false`, `e.name === "Error"`); the reviewer's message text
+was exact, the class was not.
+
+`fromStr:utf8`'s worst-case scratch (`strLen * 3`) hits the SAME i8
+ceiling, at `strLen ≥ 357,913,934` (`1,073,741,799 / 3 = 357,913,933`
+exactly, the largest `strLen` that still fits — computed and independently
+re-derivable from the measured i8 ceiling above, not a separately-cited
+figure). This entry's earlier `715,827,883` figure was the i32-overflow
+point, which the engine ceiling makes UNREACHABLE on this toolchain — it
+never actually fires. **Tested by:** nothing, deliberately, the same call
+S008 makes — no corpus program can sit anywhere near these thresholds
+without a multi-hundred-megabyte-to-multi-gigabyte string or bytes value,
+which is the same "already extreme" reasoning this entry's original
+rationale gives for the construction cap itself.
 
 **Rationale:** an engineering limit of this tier's representation, not a
 deliberate semantic stance the way S003's typed-array-OOB amendment is —
@@ -1391,7 +1480,24 @@ worse than a trap: `elementCount * esize` computed in i32 arithmetic AFTER
 an incidental `i32.trunc_f64_s` (which only traps for element counts, not
 byte counts) silently WRAPS mod 2^32, producing a byte-mismatched
 allocation smaller than `byteLength` then reports — a miscompile, not an
-honest failure, which is what this entry exists to rule out. **Tested by:**
+honest failure, which is what this entry exists to rule out.
+
+The guard's own explicit trap is not the only thing standing in this
+range, and describing "a legal value up to 2^31 bytes" undersells it:
+measured on this toolchain (Node 24.18's V8, a WasmGC implementation
+limit, not a spec constant — it can move on a future V8), the underlying
+`array (mut i8)` storage has its OWN inherent length ceiling BELOW this
+guard's 2^31 boundary — 1,073,741,799 bytes, roughly HALF of 2^31 — so for
+byte sizes between that ceiling and 2^31, `array.new_default` itself
+already traps before the guard's own f64 check would have been the
+reason a program observes a failure. The guard's own trap is the
+proximate cause only at/above 2^31 exactly, where its check fires first,
+ahead of ever attempting the allocation. This does not change what the
+guard is FOR — it still makes the length-argument failure deterministic
+and rules out the length-field-mismatch miscompile at the boundary that
+matters (`i32.trunc_f64_s`'s own wrap point) — only which trap a program
+actually observes for requests below 2^31 but above the current engine
+ceiling. **Tested by:**
 the wasm emitter unit test pins the trap side through `newLen` (a length
 whose byte size is exactly the 2^31 boundary); a second, direct-
 ModuleBuilder test pins the SAME guard reached through `fromArrLit` — a
@@ -1399,9 +1505,12 @@ fake `vec(f64)` struct whose `LEN` field claims 2^29 elements (×4 bytes =
 exactly 2^31) over a REAL backing array of length 0, since the guard reads
 only `LEN` before ever touching the backing array, so this exercises the
 real instruction sequence without an actual multi-GB allocation. The
-just-under-cap SUCCESS path is deliberately untested on both roots, the
-same call S008 makes: a corpus program cannot exercise a ~2 GiB allocation
-without a multi-GB memory appetite.
+just-under-GUARD-cap path is deliberately untested on both roots — and,
+per the note above, a REAL just-under-2^31 request would now be expected
+to fail anyway, via the engine's own lower ceiling, before ever reaching
+the guard's own boundary — the same call S008 makes: a corpus program
+cannot exercise a multi-hundred-megabyte-to-multi-GB memory appetite
+either way.
 
 ## S035 — Pooled-Buffer `byteOffset` is always 0, where Node's is a nondeterministic pool offset *(wasm tier)*
 
@@ -1429,6 +1538,29 @@ own storage exactly like `Buffer.alloc`, so their `byteOffset` is always
 these two constructors specifically (not merely "untested"; Node's answer
 for them is `0` only when the allocation happens to land at a chunk start,
 an accident of prior allocation history the program cannot control).
+
+**The divergence is BOUNDED, not universal.** Node's pool only serves
+allocations strictly BELOW `Buffer.poolSize >>> 1` (`65536 >>> 1` =
+32768 bytes); at or above that size Node allocates its own buffer, sized
+exactly to the request, exactly like this tier always does. Re-measured
+independently on Node 24.18 (a second process, per this project's
+two-measurement standard for register numbers — the earlier 8-KiB
+misstatement in this same entry is why): `allocUnsafe(32767)` pools
+(`byteOffset` nonzero, `.buffer.byteLength` 65536); `allocUnsafe(32768)`
+and `allocUnsafe(32769)` both own their buffer (`byteOffset` 0,
+`.buffer.byteLength` exactly the requested size); `Buffer.from("x".repeat(32768))`
+owns its buffer (`byteOffset` 0, `.buffer.byteLength` 32768, matching
+this tier exactly) where `Buffer.from("x".repeat(32767))` pools
+(`.buffer.byteLength` 65536 — even though ITS `byteOffset` happened to
+read `0` this run, being the first slice of a fresh pool chunk: the
+RELIABLE pooled/own signal is `.buffer.byteLength` equalling
+`Buffer.poolSize` vs. the exact request, not `byteOffset` alone, which
+can coincidentally be `0` either way). Stage B consequence: `buffer.fromStr`'s
+results diverge on `byteOffset` only for encoded output STRICTLY BELOW
+32768 bytes; a program printing `byteOffset` of a `Buffer.from(largeString,
+enc)` result at or above that size is already Node-exact here, and
+stage-B tests should not assume the whole surface diverges just because
+short-string cases do.
 
 **Rationale:** implementing Node's pool would mean modeling a SECOND,
 shared allocator with its own chunk-boundary and remnant-fragment rules

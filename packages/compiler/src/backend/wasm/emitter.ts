@@ -7061,6 +7061,7 @@ class Assembler {
           code.call(this.dyn.typeOf());
           return;
         }
+        if (this.emitBufferLibCall(e)) return;
         if (this.emitTimerCall(e)) return;
         this.refuse(`libCall:${e.fn}`, e.loc);
         code.unreachable();
@@ -8501,6 +8502,57 @@ class Assembler {
             this.walkExpr(e.args[0]!);
             code.call(this.bytesB.equalsHelper());
             return;
+          case "toString": {
+            // The encoding is ALWAYS a compile-time strLit (nodes.ts's
+            // bufEncoding fence at the lowering) — the emitter reads it
+            // directly, no runtime dispatch. Stage B scope: the plain
+            // 1-arg form; the [start, end) range form (2-3 args) keeps a
+            // named refusal (its clamp rule is scr_bytes_to_str_range's
+            // OWN — negatives clamp to 0, no relative-to-end adjustment,
+            // unlike slice/subarray — measured against Node directly and
+            // deliberately NOT reusing subarrayHelper's emitRelIndex).
+            const encArg = e.args[0];
+            if (encArg === undefined || encArg.kind !== "strLit") {
+              throw new Error("emitter bug: bytesIntrinsic toString without a strLit encoding");
+            }
+            if (e.args.length > 1) {
+              this.refuse("bytesIntrinsic:toString:range", e.loc);
+              code.unreachable();
+              return;
+            }
+            this.walkExpr(e.receiver);
+            code.call(this.bytesB.toStrHelper(encArg.value));
+            return;
+          }
+          case "readNum":
+          case "writeNum": {
+            // The kind is ALWAYS a compile-time strLit (validate.ts's
+            // gate on this node). f32/f64 kinds are stage-B follow-up
+            // work (they need i64/f32-reinterpret machinery this file
+            // doesn't build yet) — named-refused per kind so the census
+            // stays honest, before ever calling into typedarrays.ts.
+            const kindArg = e.args[0];
+            if (kindArg === undefined || kindArg.kind !== "strLit") {
+              throw new Error(`emitter bug: bytesIntrinsic ${e.method} without a strLit kind`);
+            }
+            const kind = kindArg.value;
+            if (kind === "f32be" || kind === "f32le" || kind === "f64be" || kind === "f64le") {
+              this.refuse(`bytesIntrinsic:${e.method}:${kind}`, e.loc);
+              code.unreachable();
+              return;
+            }
+            this.walkExpr(e.receiver);
+            if (e.method === "readNum") {
+              this.walkExpr(e.args[1]!); // offset
+              code.call(this.bytesB.readNumHelper(kind));
+            } else {
+              this.walkExpr(e.args[1]!); // value
+              this.walkExpr(e.args[2]!); // offset
+              code.call(this.bytesB.writeNumHelper(kind));
+            }
+            this.emitPendingCheck();
+            return;
+          }
           default:
             this.refuse(`bytesIntrinsic:${e.method}`, e.loc);
             code.unreachable();
@@ -8664,11 +8716,14 @@ class Assembler {
       f64ToStr: () => this.f64ToStrHelper(),
       lit: (c, s) => this.pushStrLitInto(c, s),
       strRef: () => this.strRef,
+      strType: () => this.strType,
       toInt32: () => this.toInt32Helper(),
+      strSlice: () => this.strs.slice(),
       f64Vec: () => this.f64VecInfo(),
       f64VecNewLen: () => this.vecs.newLen(this.f64VecInfo()),
       f64VecPush1: () => this.vecs.pushOne(this.f64VecInfo()),
-      throwError: (c, className, name, pushMessage) => this.emitSetCellError(c, className, name, pushMessage, null),
+      throwError: (c, className, name, pushMessage, codeLit) =>
+        this.emitSetCellError(c, className, name, pushMessage, codeLit),
     });
     return this.bytesField;
   }
@@ -9651,6 +9706,27 @@ class Assembler {
    * closure would widen that type for every async program to serve the
    * one corpus program that asks — which asks in the `dyn` spelling
    * anyway. It keeps refusing by name. */
+  /** The Buffer static libCalls (typedarrays.ts's encoding surface,
+   * stage B). Split out like emitTimerCall's own cluster — one small
+   * dispatcher rather than growing the enormous e.fn if-chain above.
+   * Returns false (unhandled) for anything not listed here yet. */
+  private emitBufferLibCall(e: Extract<IrExpr, { kind: "libCall" }>): boolean {
+    const code = this.fn.code;
+    if (e.fn === "buffer.fromStr") {
+      // Buffer.from(string, enc) — enc is ALWAYS a compile-time strLit
+      // (nodes.ts's bufEncoding fence), so the concrete encode helper is
+      // picked here, at emit time; never throws.
+      const encArg = e.args[1];
+      if (encArg === undefined || encArg.kind !== "strLit") {
+        throw new Error("emitter bug: buffer.fromStr without a strLit encoding");
+      }
+      this.walkExpr(e.args[0]!);
+      code.call(this.bytesB.fromStrHelper(encArg.value));
+      return true;
+    }
+    return false;
+  }
+
   private emitTimerCall(e: Extract<IrExpr, { kind: "libCall" }>): boolean {
     const code = this.fn.code;
     const call1 = (idx: number): void => {

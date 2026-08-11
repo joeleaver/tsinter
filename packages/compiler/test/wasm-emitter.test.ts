@@ -4166,3 +4166,628 @@ test("bytes: every typed array is truthy, empty or not (`if (buf)` const-true)",
   const { stdout } = await runWasm(res.binaryPath);
   expect(stdout.toString("utf8")).toBe(["truthy truthy", "true true", ""].join("\n"));
 });
+
+test("bytes: encodings — toString/Buffer.from round-trip every direction, both ways", async () => {
+  // Every one of the 7 encodings, both directions, including bytes that
+  // are NOT valid UTF-8 (0xff, control chars) through toString("utf8")'s
+  // replacement path, and an astral character round-tripping through
+  // utf8 encode+decode. Expected bytes captured directly from Node
+  // 24.18 (process.stdout.write, not console.log, to keep this a pure
+  // byte comparison — no formatting).
+  const res = await buildWasm(
+    "bytes-encodings.ts",
+    [
+      "const a = Buffer.from([1, 2, 3, 4, 255, 0]);",
+      "console.log(a.toString('hex'));",
+      "console.log(a.toString('base64'));",
+      "console.log(a.toString('base64url'));",
+      "console.log(a.toString('latin1'));",
+      "console.log(a.toString('ascii'));",
+      "console.log(a.toString('utf16le'));",
+      "console.log(a.toString('utf8'));",
+      "console.log(a.toString());",
+      "",
+      "const s = Buffer.from('hello world', 'utf8');",
+      "console.log(s.toString('utf8'));",
+      "const h = Buffer.from('aabbcc', 'hex');",
+      "console.log(h.toString('hex'));",
+      "const b64 = Buffer.from('AQIDBAU=', 'base64');",
+      "console.log(b64.toString('hex'));",
+      "const b64u = Buffer.from('AQIDBAU', 'base64url');",
+      "console.log(b64u.toString('hex'));",
+      "const l1 = Buffer.from('hello', 'latin1');",
+      "console.log(l1.toString('hex'));",
+      "const asc = Buffer.from('hello', 'ascii');",
+      "console.log(asc.toString('hex'));",
+      "const u16 = Buffer.from('hi', 'utf16le');",
+      "console.log(u16.toString('hex'));",
+      "",
+      "const astral = Buffer.from('a\\u{1F600}b', 'utf8');",
+      "console.log(astral.toString('utf8'));",
+      "console.log(astral.toString('hex'));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("hex")).toBe(
+    "3031303230333034666630300a41514944425038410a41514944425038410a01020304c3bf000a010203047f000ac881d083c3bf0a01020304efbfbd000a01020304efbfbd000a68656c6c6f20776f726c640a6161626263630a303130323033303430350a303130323033303430350a363836353663366336660a363836353663366336660a36383030363930300a61f09f9880620a3631663039663938383036320a",
+  );
+});
+
+test("bytes: hex/base64/base64url — a length/pattern sweep round-trip plus Node-lenient decode edge cases", async () => {
+  // The design doc's mandatory hex/base64 fuzz round-trip, as a fixed
+  // vector set rather than a randomized run (deterministic, reviewable):
+  // varying lengths (0, 1, 2, 3-byte non-multiple-of-3, 8, 5, 10, 15),
+  // all-0x00 and all-0xff patterns (the base64 alphabet's own edges),
+  // PLUS the Node-lenient decode edges scr_bytes_from_str documents:
+  // an invalid pair/odd tail stopping hex decode early, uppercase hex,
+  // whitespace and punctuation skipped mid-base64, and a standard-
+  // alphabet string decoded WITHOUT its padding (Node accepts both).
+  const res = await buildWasm(
+    "bytes-hex-b64-fuzz.ts",
+    [
+      "const patterns: number[][] = [",
+      "  [],",
+      "  [0],",
+      "  [255],",
+      "  [0, 255],",
+      "  [1, 2, 3],",
+      "  [1, 2, 3, 4],",
+      "  [1, 2, 3, 4, 5],",
+      "  [0, 0, 0, 0, 0, 0, 0, 0],",
+      "  [255, 255, 255, 255, 255],",
+      "  [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],",
+      "  [16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240],",
+      "];",
+      "for (const p of patterns) {",
+      "  const b = Buffer.from(p);",
+      "  console.log(b.toString('hex'));",
+      "  console.log(b.toString('base64'));",
+      "  console.log(b.toString('base64url'));",
+      "}",
+      "console.log(Buffer.from('a1g2', 'hex').toString('hex'));",
+      "console.log(Buffer.from('a1b', 'hex').toString('hex'));",
+      "console.log(Buffer.from('A1B2C3', 'hex').toString('hex'));",
+      "console.log(Buffer.from('AQ ID BA U=', 'base64').toString('hex'));",
+      "console.log(Buffer.from('AQIDBAU', 'base64').toString('hex'));",
+      "console.log(Buffer.from('A!Q@I#D$B%A^U&=*', 'base64').toString('hex'));",
+      "console.log(Buffer.from('', 'hex').toString('hex'));",
+      "console.log(Buffer.from('', 'base64').toString('hex'));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("hex")).toBe(
+    "0a0a0a30300a41413d3d0a41410a66660a2f773d3d0a5f770a303066660a4150383d0a4150380a3031303230330a415149440a415149440a30313032303330340a4151494442413d3d0a4151494442410a303130323033303430350a415149444241553d0a415149444241550a303030303030303030303030303030300a41414141414141414141413d0a41414141414141414141410a666666666666666666660a2f2f2f2f2f2f383d0a5f5f5f5f5f5f380a30313032303330343035303630373038303930610a41514944424155474277674a43673d3d0a41514944424155474277674a43670a3130323033303430353036303730383039306130623063306430653066300a4543417751464267634943516f4c4441304f44770a4543417751464267634943516f4c4441304f44770a61310a61310a6131623263330a303130323033303430350a303130323033303430350a303130323033303430350a0a0a",
+  );
+});
+
+test("bytes: readNum/writeNum — every fixed integer width/endianness, plus Node-exact bounds and value-range errors", async () => {
+  // The design doc's mandatory Node-exact ERR_OUT_OF_RANGE messages,
+  // including the addNumericalSeparator underscore-grouping case
+  // (offset/value magnitudes past 2^32) — this is what actually
+  // exercises the shared numReceived/boundsError machinery.
+  const res = await buildWasm(
+    "bytes-readnum-writenum.ts",
+    [
+      "const caught = (fn: () => number): void => {",
+      "  try { console.log(fn()); }",
+      "  catch (e) {",
+      "    const err = e as Error;",
+      "    console.log('caught:' + err.name + ':' + err.message);",
+      "  }",
+      "};",
+      "const b = Buffer.from([0x01, 0x02, 0x03, 0x04, 0xff, 0xfe]);",
+      "console.log(b.readUInt8(0));",
+      "console.log(b.readInt8(4));",
+      "console.log(b.readUInt16BE(0));",
+      "console.log(b.readUInt16LE(0));",
+      "console.log(b.readInt16BE(4));",
+      "console.log(b.readInt16LE(4));",
+      "console.log(b.readUInt32BE(0));",
+      "console.log(b.readUInt32LE(0));",
+      "console.log(b.readInt32BE(0));",
+      "console.log(b.readInt32LE(0));",
+      "",
+      "const w = Buffer.alloc(8);",
+      "console.log(w.writeUInt8(255, 0));",
+      "console.log(w.writeInt8(-1, 1));",
+      "console.log(w.writeUInt16BE(0x1234, 2));",
+      "console.log(w.writeUInt32LE(0xdeadbeef, 4));",
+      "console.log(w.toString('hex'));",
+      "",
+      "caught(() => b.readUInt8(6));",
+      "caught(() => b.readUInt8(-1));",
+      "caught(() => b.readUInt8(1.5));",
+      "caught(() => b.readUInt32LE(3));",
+      "caught(() => w.writeUInt8(256, 0));",
+      "caught(() => w.writeUInt8(-1, 0));",
+      "caught(() => w.writeInt8(128, 0));",
+      "caught(() => w.writeInt8(-129, 0));",
+      "caught(() => w.writeUInt32BE(4294967296, 0));",
+      "caught(() => w.writeUInt8(1, 8));",
+      "caught(() => w.writeUInt8(1, -1));",
+      "caught(() => w.writeUInt8(1, 5e9));",
+      "caught(() => w.writeInt32LE(-5e9, 0));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "1",
+      "-1",
+      "258",
+      "513",
+      "-2",
+      "-257",
+      "16909060",
+      "67305985",
+      "16909060",
+      "67305985",
+      "1",
+      "2",
+      "4",
+      "8",
+      "ffff1234efbeadde",
+      'caught:RangeError:The value of "offset" is out of range. It must be >= 0 and <= 5. Received 6',
+      'caught:RangeError:The value of "offset" is out of range. It must be >= 0 and <= 5. Received -1',
+      'caught:RangeError:The value of "offset" is out of range. It must be an integer. Received 1.5',
+      'caught:RangeError:The value of "offset" is out of range. It must be >= 0 and <= 2. Received 3',
+      'caught:RangeError:The value of "value" is out of range. It must be >= 0 and <= 255. Received 256',
+      'caught:RangeError:The value of "value" is out of range. It must be >= 0 and <= 255. Received -1',
+      'caught:RangeError:The value of "value" is out of range. It must be >= -128 and <= 127. Received 128',
+      'caught:RangeError:The value of "value" is out of range. It must be >= -128 and <= 127. Received -129',
+      'caught:RangeError:The value of "value" is out of range. It must be >= 0 and <= 4294967295. Received 4294967296',
+      'caught:RangeError:The value of "offset" is out of range. It must be >= 0 and <= 7. Received 8',
+      'caught:RangeError:The value of "offset" is out of range. It must be >= 0 and <= 7. Received -1',
+      'caught:RangeError:The value of "offset" is out of range. It must be >= 0 and <= 7. Received 5_000_000_000',
+      'caught:RangeError:The value of "value" is out of range. It must be >= -2147483648 and <= 2147483647. Received -5_000_000_000',
+      "",
+    ].join("\n"),
+  );
+});
+
+test("bytes: utf8 decode — exhaustive 1-byte and 2-byte sequences", async () => {
+  const res = await buildWasm(
+    "bytes-utf8-sweep-1-2byte.ts",
+    [
+      "for (let a = 0; a < 256; a++) {",
+      "  const buf1 = Buffer.from([a]);",
+      "  const s1 = buf1.toString('utf8');",
+      "  let line1 = 'A' + a + ':' + s1.length;",
+      "  for (let i = 0; i < s1.length; i++) line1 += ':' + s1.charCodeAt(i);",
+      "  console.log(line1);",
+      "  for (let b = 0; b < 256; b++) {",
+      "    const buf2 = Buffer.from([a, b]);",
+      "    const s2 = buf2.toString('utf8');",
+      "    let line2 = 'B' + a + ':' + b + ':' + s2.length;",
+      "    for (let i = 0; i < s2.length; i++) line2 += ':' + s2.charCodeAt(i);",
+      "    console.log(line2);",
+      "  }",
+      "}",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  const expected: string[] = [];
+  for (let a = 0; a < 256; a++) {
+    const s1 = Buffer.from([a]).toString("utf8");
+    let line1 = `A${a}:${s1.length}`;
+    for (let i = 0; i < s1.length; i++) line1 += `:${s1.charCodeAt(i)}`;
+    expected.push(line1);
+    for (let b = 0; b < 256; b++) {
+      const s2 = Buffer.from([a, b]).toString("utf8");
+      let line2 = `B${a}:${b}:${s2.length}`;
+      for (let i = 0; i < s2.length; i++) line2 += `:${s2.charCodeAt(i)}`;
+      expected.push(line2);
+    }
+  }
+  expect(stdout.toString("utf8")).toBe(expected.join("\n") + "\n");
+}, 300_000);
+
+test("bytes: utf8 decode — exhaustive 3-byte sequences over the interesting leads (0xE0-0xEF x 65536 continuations)", async () => {
+  const res = await buildWasm(
+    "bytes-utf8-sweep-3byte.ts",
+    [
+      "for (let lead = 0xe0; lead <= 0xef; lead++) {",
+      "  for (let c1 = 0; c1 < 256; c1++) {",
+      "    for (let c2 = 0; c2 < 256; c2++) {",
+      "      const buf = Buffer.from([lead, c1, c2]);",
+      "      const s = buf.toString('utf8');",
+      "      let line = lead + ':' + c1 + ':' + c2 + ':' + s.length;",
+      "      for (let i = 0; i < s.length; i++) line += ':' + s.charCodeAt(i);",
+      "      console.log(line);",
+      "    }",
+      "  }",
+      "}",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  const expected: string[] = [];
+  for (let lead = 0xe0; lead <= 0xef; lead++) {
+    for (let c1 = 0; c1 < 256; c1++) {
+      for (let c2 = 0; c2 < 256; c2++) {
+        const s = Buffer.from([lead, c1, c2]).toString("utf8");
+        let line = `${lead}:${c1}:${c2}:${s.length}`;
+        for (let i = 0; i < s.length; i++) line += `:${s.charCodeAt(i)}`;
+        expected.push(line);
+      }
+    }
+  }
+  expect(stdout.toString("utf8")).toBe(expected.join("\n") + "\n");
+}, 300_000);
+
+test("bytes: utf8 decode — 4-byte leads truncated after 3 bytes (0xF0-0xF4 x 65536 continuations)", async () => {
+  const res = await buildWasm(
+    "bytes-utf8-sweep-4byte-trunc3.ts",
+    [
+      "for (let lead = 0xf0; lead <= 0xf4; lead++) {",
+      "  for (let c1 = 0; c1 < 256; c1++) {",
+      "    for (let c2 = 0; c2 < 256; c2++) {",
+      "      const buf = Buffer.from([lead, c1, c2]);",
+      "      const s = buf.toString('utf8');",
+      "      let line = lead + ':' + c1 + ':' + c2 + ':' + s.length;",
+      "      for (let i = 0; i < s.length; i++) line += ':' + s.charCodeAt(i);",
+      "      console.log(line);",
+      "    }",
+      "  }",
+      "}",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  const expected: string[] = [];
+  for (let lead = 0xf0; lead <= 0xf4; lead++) {
+    for (let c1 = 0; c1 < 256; c1++) {
+      for (let c2 = 0; c2 < 256; c2++) {
+        const s = Buffer.from([lead, c1, c2]).toString("utf8");
+        let line = `${lead}:${c1}:${c2}:${s.length}`;
+        for (let i = 0; i < s.length; i++) line += `:${s.charCodeAt(i)}`;
+        expected.push(line);
+      }
+    }
+  }
+  expect(stdout.toString("utf8")).toBe(expected.join("\n") + "\n");
+}, 300_000);
+
+test("bytes: utf8 decode — 4-byte structured sweep (0xF0-0xF4 leads x every c1 x boundary c2/c3 combinations)", async () => {
+  const res = await buildWasm(
+    "bytes-utf8-sweep-4byte-structured.ts",
+    [
+      "const bounds = [0x00, 0x7f, 0x80, 0xbf, 0xc0, 0xff];",
+      "for (let lead = 0xf0; lead <= 0xf4; lead++) {",
+      "  for (let c1 = 0; c1 < 256; c1++) {",
+      "    for (let bi = 0; bi < 6; bi++) {",
+      "      for (let bj = 0; bj < 6; bj++) {",
+      "        const c2 = bounds[bi];",
+      "        const c3 = bounds[bj];",
+      "        const buf = Buffer.from([lead, c1, c2, c3]);",
+      "        const s = buf.toString('utf8');",
+      "        let line = lead + ':' + c1 + ':' + c2 + ':' + c3 + ':' + s.length;",
+      "        for (let i = 0; i < s.length; i++) line += ':' + s.charCodeAt(i);",
+      "        console.log(line);",
+      "      }",
+      "    }",
+      "  }",
+      "}",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  const bounds = [0x00, 0x7f, 0x80, 0xbf, 0xc0, 0xff];
+  const expected: string[] = [];
+  for (let lead = 0xf0; lead <= 0xf4; lead++) {
+    for (let c1 = 0; c1 < 256; c1++) {
+      for (const c2 of bounds) {
+        for (const c3 of bounds) {
+          const s = Buffer.from([lead, c1, c2, c3]).toString("utf8");
+          let line = `${lead}:${c1}:${c2}:${c3}:${s.length}`;
+          for (let i = 0; i < s.length; i++) line += `:${s.charCodeAt(i)}`;
+          expected.push(line);
+        }
+      }
+    }
+  }
+  expect(stdout.toString("utf8")).toBe(expected.join("\n") + "\n");
+}, 300_000);
+
+test("bytes: utf16le — lone surrogate input round-trips through MY implementation, both directions", async () => {
+  const res = await buildWasm(
+    "bytes-utf16le-lone-surrogate.ts",
+    [
+      "const decHi = Buffer.from([0x00, 0xd8]).toString('utf16le');",
+      "console.log(decHi.length + ':' + decHi.charCodeAt(0));",
+      "const decLo = Buffer.from([0x00, 0xdc]).toString('utf16le');",
+      "console.log(decLo.length + ':' + decLo.charCodeAt(0));",
+      "const encHi = Buffer.from('\\ud800', 'utf16le');",
+      "console.log(encHi.toString('hex'));",
+      "const encLo = Buffer.from('\\udc00', 'utf16le');",
+      "console.log(encLo.toString('hex'));",
+      "console.log(Buffer.from('\\ud800', 'utf8').toString('hex'));",
+      "console.log(Buffer.from('\\udc00', 'utf8').toString('hex'));",
+      "const odd = Buffer.from([0x41, 0x00, 0xff]).toString('utf16le');",
+      "console.log(odd.length + ':' + odd.charCodeAt(0));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  const decHi = Buffer.from([0x00, 0xd8]).toString("utf16le");
+  const decLo = Buffer.from([0x00, 0xdc]).toString("utf16le");
+  const encHi = Buffer.from("\ud800", "utf16le");
+  const encLo = Buffer.from("\udc00", "utf16le");
+  const odd = Buffer.from([0x41, 0x00, 0xff]).toString("utf16le");
+  const expected = [
+    `${decHi.length}:${decHi.charCodeAt(0)}`,
+    `${decLo.length}:${decLo.charCodeAt(0)}`,
+    encHi.toString("hex"),
+    encLo.toString("hex"),
+    Buffer.from("\ud800", "utf8").toString("hex"),
+    Buffer.from("\udc00", "utf8").toString("hex"),
+    `${odd.length}:${odd.charCodeAt(0)}`,
+    "",
+  ].join("\n");
+  expect(stdout.toString("utf8")).toBe(expected);
+});
+
+test("bytes: utf8 encode — every code point 0..0x10FFFF through fromStr('utf8') -> hex, diffed vs Node", async () => {
+  const res = await buildWasm(
+    "bytes-utf8-encode-sweep.ts",
+    [
+      "for (let cp = 0; cp < 0x110000; cp++) {",
+      "  if (cp < 0x10000) {",
+      "    const b0 = cp & 0xff;",
+      "    const b1 = (cp >> 8) & 0xff;",
+      "    const s = Buffer.from([b0, b1]).toString('utf16le');",
+      "    const enc = Buffer.from(s, 'utf8');",
+      "    console.log(cp + ':' + enc.toString('hex'));",
+      "  } else {",
+      "    const cpp = cp - 0x10000;",
+      "    const hi = 0xd800 + (cpp >> 10);",
+      "    const lo = 0xdc00 + (cpp & 0x3ff);",
+      "    const b0 = hi & 0xff;",
+      "    const b1 = (hi >> 8) & 0xff;",
+      "    const b2 = lo & 0xff;",
+      "    const b3 = (lo >> 8) & 0xff;",
+      "    const s = Buffer.from([b0, b1, b2, b3]).toString('utf16le');",
+      "    const enc = Buffer.from(s, 'utf8');",
+      "    console.log(cp + ':' + enc.toString('hex'));",
+      "  }",
+      "}",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  const expected: string[] = [];
+  for (let cp = 0; cp < 0x110000; cp++) {
+    let s: string;
+    if (cp < 0x10000) {
+      s = String.fromCharCode(cp);
+    } else {
+      const cpp = cp - 0x10000;
+      const hi = 0xd800 + (cpp >> 10);
+      const lo = 0xdc00 + (cpp & 0x3ff);
+      s = String.fromCharCode(hi) + String.fromCharCode(lo);
+    }
+    expected.push(`${cp}:${Buffer.from(s, "utf8").toString("hex")}`);
+  }
+  expect(stdout.toString("utf8")).toBe(expected.join("\n") + "\n");
+}, 300_000);
+
+test("bytes: hex — exhaustive encode (256 byte values)", async () => {
+  const res = await buildWasm(
+    "bytes-hex-encode-sweep.ts",
+    [
+      "for (let b = 0; b < 256; b++) {",
+      "  console.log(b + ':' + Buffer.from([b]).toString('hex'));",
+      "}",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  const expected: string[] = [];
+  for (let b = 0; b < 256; b++) expected.push(`${b}:${Buffer.from([b]).toString("hex")}`);
+  expect(stdout.toString("utf8")).toBe(expected.join("\n") + "\n");
+});
+
+test("bytes: hex — exhaustive decode over length-1 (odd-length truncation, 256 char values) and length-2 (65536 pairs)", async () => {
+  const res = await buildWasm(
+    "bytes-hex-decode-sweep.ts",
+    [
+      "for (let v = 0; v < 256; v++) {",
+      "  const s1 = Buffer.from([v, 0]).toString('utf16le');",
+      "  const d1 = Buffer.from(s1, 'hex');",
+      "  console.log('L1:' + v + ':' + d1.toString('hex'));",
+      "}",
+      "for (let v1 = 0; v1 < 256; v1++) {",
+      "  for (let v2 = 0; v2 < 256; v2++) {",
+      "    const s2 = Buffer.from([v1, 0, v2, 0]).toString('utf16le');",
+      "    const d2 = Buffer.from(s2, 'hex');",
+      "    console.log('L2:' + v1 + ':' + v2 + ':' + d2.toString('hex'));",
+      "  }",
+      "}",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  const expected: string[] = [];
+  for (let v = 0; v < 256; v++) {
+    const s1 = String.fromCharCode(v);
+    expected.push(`L1:${v}:${Buffer.from(s1, "hex").toString("hex")}`);
+  }
+  for (let v1 = 0; v1 < 256; v1++) {
+    for (let v2 = 0; v2 < 256; v2++) {
+      const s2 = String.fromCharCode(v1) + String.fromCharCode(v2);
+      expected.push(`L2:${v1}:${v2}:${Buffer.from(s2, "hex").toString("hex")}`);
+    }
+  }
+  expect(stdout.toString("utf8")).toBe(expected.join("\n") + "\n");
+}, 300_000);
+
+test("bytes: base64/base64url — seeded xorshift32 fuzz over lengths 0-64, both directions (seed printed for reproducibility)", async () => {
+  const SEED = 0x2f6e2b1;
+  const res = await buildWasm(
+    "bytes-base64-fuzz.ts",
+    [
+      `let x = ${SEED};`,
+      "function nextByte(): number {",
+      "  x = x ^ (x << 13);",
+      "  x = x ^ (x >>> 17);",
+      "  x = x ^ (x << 5);",
+      "  return (x >>> 0) & 0xff;",
+      "}",
+      "for (let len = 0; len <= 64; len++) {",
+      "  const bytes: number[] = [];",
+      "  for (let i = 0; i < len; i++) bytes.push(nextByte());",
+      "  const buf = Buffer.from(bytes);",
+      "  const b64 = buf.toString('base64');",
+      "  const b64u = buf.toString('base64url');",
+      "  const back64 = Buffer.from(b64, 'base64');",
+      "  const back64u = Buffer.from(b64u, 'base64url');",
+      "  console.log(len + ':' + b64 + ':' + b64u + ':' + back64.toString('hex') + ':' + back64u.toString('hex'));",
+      "}",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+
+  // Same xorshift32 algorithm, run identically in plain JS (bitwise ops are
+  // exact 32-bit int semantics in JS too, so this matches the wasm i32 ops
+  // bit for bit — no Math.imul or float-precision concerns since xorshift32
+  // only uses ^, <<, >>>).
+  let xState = SEED;
+  function nextByte(): number {
+    xState = xState ^ (xState << 13);
+    xState = xState ^ (xState >>> 17);
+    xState = xState ^ (xState << 5);
+    return (xState >>> 0) & 0xff;
+  }
+  const expected: string[] = [];
+  for (let len = 0; len <= 64; len++) {
+    const bytes: number[] = [];
+    for (let i = 0; i < len; i++) bytes.push(nextByte());
+    const buf = Buffer.from(bytes);
+    const b64 = buf.toString("base64");
+    const b64u = buf.toString("base64url");
+    const back64 = Buffer.from(b64, "base64");
+    const back64u = Buffer.from(b64u, "base64url");
+    expected.push(
+      `${len}:${b64}:${b64u}:${back64.toString("hex")}:${back64u.toString("hex")}`,
+    );
+  }
+  expect(stdout.toString("utf8")).toBe(expected.join("\n") + "\n");
+});
+
+test("bytes: writeNum — fractional/NaN/Infinity value-range validation, measured against Node (raw value compared BEFORE truncation)", async () => {
+  // Node's checkInt/checkUInt family compares the RAW (possibly fractional)
+  // value against [min, max] BEFORE any truncation happens — NOT an
+  // integer-ness check. Measured directly (Node 24.18):
+  //   writeUInt8(-0.5)  throws (raw -0.5 < min 0, even though truncating
+  //                             toward zero would land in range at 0)
+  //   writeUInt8(1.9)   succeeds, writes 1 (raw in range, THEN truncates)
+  //   writeInt8(-1.9)   succeeds, writes 0xff (raw in [-128,127])
+  //   writeUInt8(NaN)   succeeds, writes 0 (every NaN comparison is false,
+  //                             so NaN passes the range gate, then the
+  //                             value->bits step maps NaN to 0)
+  //   writeUInt8(Infinity/-Infinity) always throws (a real out-of-range
+  //                             magnitude, not caught by the NaN carve-out)
+  // This test measures ALL 10 kinds against these exact axes and diffs the
+  // wasm-compiled implementation against Node computed the same way in
+  // this same process — not against a hand-transcribed expectation.
+  const kinds: { kind: string; method: string; width: number; signed: boolean; min: number; max: number }[] = [
+    { kind: "u8", method: "writeUInt8", width: 1, signed: false, min: 0, max: 255 },
+    { kind: "i8", method: "writeInt8", width: 1, signed: true, min: -128, max: 127 },
+    { kind: "u16be", method: "writeUInt16BE", width: 2, signed: false, min: 0, max: 65535 },
+    { kind: "u16le", method: "writeUInt16LE", width: 2, signed: false, min: 0, max: 65535 },
+    { kind: "i16be", method: "writeInt16BE", width: 2, signed: true, min: -32768, max: 32767 },
+    { kind: "i16le", method: "writeInt16LE", width: 2, signed: true, min: -32768, max: 32767 },
+    { kind: "u32be", method: "writeUInt32BE", width: 4, signed: false, min: 0, max: 4294967295 },
+    { kind: "u32le", method: "writeUInt32LE", width: 4, signed: false, min: 0, max: 4294967295 },
+    { kind: "i32be", method: "writeInt32BE", width: 4, signed: true, min: -2147483648, max: 2147483647 },
+    { kind: "i32le", method: "writeInt32LE", width: 4, signed: true, min: -2147483648, max: 2147483647 },
+  ];
+
+  const numLit = (v: number): string => {
+    if (Number.isNaN(v)) return "NaN";
+    if (v === Infinity) return "Infinity";
+    if (v === -Infinity) return "-Infinity";
+    return String(v);
+  };
+
+  const srcLines: string[] = [
+    "const caught = (fn: () => number): void => {",
+    "  try { console.log(fn()); }",
+    "  catch (e) {",
+    "    const err = e as Error;",
+    "    console.log('caught:' + err.name + ':' + err.message);",
+    "  }",
+    "};",
+  ];
+  for (const { kind, method, width, signed, min, max } of kinds) {
+    const fracIn = signed ? -1.9 : 1.9;
+    const fracBelow = min - 0.5;
+    const fracAbove = max + 0.5;
+    const intAbove = max + 1;
+    const intBelow = min - 1;
+    srcLines.push(`// ${kind} (${method})`);
+    srcLines.push(
+      `{ const b = Buffer.alloc(${width}); b.${method}(${numLit(fracIn)}, 0); console.log(b.toString('hex')); }`,
+    );
+    srcLines.push(
+      `{ const b = Buffer.alloc(${width}); b.${method}(NaN, 0); console.log(b.toString('hex')); }`,
+    );
+    srcLines.push(`caught(() => Buffer.alloc(${width}).${method}(${numLit(fracBelow)}, 0));`);
+    srcLines.push(`caught(() => Buffer.alloc(${width}).${method}(${numLit(fracAbove)}, 0));`);
+    srcLines.push(`caught(() => Buffer.alloc(${width}).${method}(Infinity, 0));`);
+    srcLines.push(`caught(() => Buffer.alloc(${width}).${method}(-Infinity, 0));`);
+    srcLines.push(`caught(() => Buffer.alloc(${width}).${method}(${numLit(intAbove)}, 0));`);
+    srcLines.push(`caught(() => Buffer.alloc(${width}).${method}(${numLit(intBelow)}, 0));`);
+  }
+  srcLines.push("");
+
+  const res = await buildWasm("bytes-writenum-fractional-sweep.ts", srcLines.join("\n"));
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+
+  // Expected: the exact same calls, against real Node Buffer, in this
+  // same process — never a hand-transcribed literal.
+  const expected: string[] = [];
+  const call = (method: string, width: number, value: number): void => {
+    const buf = Buffer.alloc(width);
+    try {
+      (buf as unknown as Record<string, (v: number, o: number) => number>)[method]!(value, 0);
+      expected.push(buf.toString("hex"));
+    } catch (e) {
+      const err = e as Error;
+      expected.push(`caught:${err.name}:${err.message}`);
+    }
+  };
+  for (const { method, width, signed, min, max } of kinds) {
+    const fracIn = signed ? -1.9 : 1.9;
+    call(method, width, fracIn);
+    call(method, width, NaN);
+    call(method, width, min - 0.5);
+    call(method, width, max + 0.5);
+    call(method, width, Infinity);
+    call(method, width, -Infinity);
+    call(method, width, max + 1);
+    call(method, width, min - 1);
+  }
+  expect(stdout.toString("utf8")).toBe(expected.join("\n") + "\n");
+});
