@@ -1640,6 +1640,1324 @@ export class BytesBuilder {
     });
   }
 
+  /* ── round B2, slice 1: swap16/32/64 and the indexOf/lastIndexOf/
+   * includes(+Num) search family (scr_bytes.c:1032-1162). Neither group
+   * needs validateOffHelper (search never throws; swap's only failure is
+   * a constant-message length check) — the substrate-sharing methods
+   * (compareBuf/fill/fillNum/fillStr/copy/writeStr) are round B2's next
+   * slice. ───────────────────────────────────────────────────────────── */
+
+  /** %w.bytes.swap:<width> — (bytes<u8>) → bytes<u8>; in-place group
+   * reversal, chains (returns the SAME ref — no struct.new; the backing
+   * array is mutated directly, unlike the copying helpers above). Node's
+   * CONSTANT ERR_INVALID_BUFFER_SIZE RangeError when len isn't a multiple
+   * of width (measured: "Buffer size must be a multiple of N-bits", N =
+   * width*8). */
+  swapHelper(width: number): number {
+    return this.cached(`swap:${width}`, () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.bytesRef()], [this.bytesRef()]), `%w.bytes.swap:${width}`);
+      const c = new Code();
+      const B = 0;
+      const LENI = 1, BUFL = 2, G = 3, I = 4, T = 5, IDXA = 6, IDXB = 7;
+      c.localGet(B);
+      c.structGet(this.bytesType(), BLEN);
+      c.localSet(LENI);
+      c.localGet(LENI);
+      c.i32Const(width);
+      c.i32RemS();
+      c.ifVoid();
+      {
+        this.deps.throwError(
+          c,
+          "%RangeError",
+          "RangeError",
+          (x) => this.deps.lit(x, `Buffer size must be a multiple of ${width * 8}-bits`),
+          "ERR_INVALID_BUFFER_SIZE",
+        );
+        c.refNull(this.bytesType());
+        c.return_();
+      }
+      c.end();
+      c.localGet(B);
+      c.structGet(this.bytesType(), STORAGE);
+      c.localSet(BUFL);
+      c.i32Const(0);
+      c.localSet(G);
+      c.block();
+      c.loop();
+      c.localGet(G);
+      c.localGet(LENI);
+      c.i32GeS();
+      c.brIf(1);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.i32Const(Math.floor(width / 2));
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(B);
+      c.structGet(this.bytesType(), OFF);
+      c.localGet(G);
+      c.i32Add();
+      c.localGet(I);
+      c.i32Add();
+      c.localSet(IDXA);
+      c.localGet(B);
+      c.structGet(this.bytesType(), OFF);
+      c.localGet(G);
+      c.i32Add();
+      c.i32Const(width - 1);
+      c.i32Add();
+      c.localGet(I);
+      c.i32Sub();
+      c.localSet(IDXB);
+      c.localGet(BUFL);
+      c.localGet(IDXA);
+      c.arrayGetU(this.bufType());
+      c.localSet(T);
+      c.localGet(BUFL);
+      c.localGet(IDXA);
+      c.localGet(BUFL);
+      c.localGet(IDXB);
+      c.arrayGetU(this.bufType());
+      c.arraySet(this.bufType());
+      c.localGet(BUFL);
+      c.localGet(IDXB);
+      c.localGet(T);
+      c.arraySet(this.bufType());
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(G);
+      c.i32Const(width);
+      c.i32Add();
+      c.localSet(G);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(B);
+      this.mb.setBody(idx, [I32, this.bufRefNN(), I32, I32, I32, I32, I32], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.bytes.indexOf:<fwd|bwd> — (b, needle, off, align) → f64; the
+   * shared search core (scr_bytes_index_of), never throws. `align`==2 is
+   * utf16le's even-offset stride; anything else steps by 1. Byte-compare
+   * is a hand-rolled inner loop (WasmGC has no memcmp) structured as a
+   * nested block/loop: the inner "all NLEN bytes matched" case returns
+   * directly (`return_()` works from any nesting depth, unlike `br`,
+   * which is why this needs no third branch target), a mismatch `br`s out
+   * of the inner block to advance the outer search by `step`. */
+  indexOfHelper(fwd: boolean): number {
+    return this.cached(`indexOf:${fwd ? "fwd" : "bwd"}`, () => {
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.bytesRef(), this.bytesRef(), F64, F64], [F64]),
+        `%w.bytes.indexOf:${fwd ? "fwd" : "bwd"}`,
+      );
+      const c = new Code();
+      // Push order matches the emitter's arg order (needle, align, then
+      // byteOffset — validate.ts's [BYTES_U8, F64, F64] contract), NOT
+      // alphabetical/mnemonic order — ALIGN is param 2, BOFF is param 3.
+      // BOFF (not OFF) to avoid shadowing the file-scope struct-field
+      // constant OFF=1 that structGet(bytesType(), OFF) below still needs.
+      const B = 0, NEEDLE = 1, ALIGN = 2, BOFF = 3;
+      const LENI = 4, NLEN = 5, STEP = 6, O = 7, START = 8, I = 9, J = 10, BUFL = 11, NBUFL = 12;
+      c.localGet(B);
+      c.structGet(this.bytesType(), BLEN);
+      c.localSet(LENI);
+      c.localGet(NEEDLE);
+      c.structGet(this.bytesType(), BLEN);
+      c.localSet(NLEN);
+      c.localGet(ALIGN);
+      c.f64Const(2);
+      c.f64Eq();
+      c.ifResult(I32);
+      c.i32Const(2);
+      c.else_();
+      c.i32Const(1);
+      c.end();
+      c.localSet(STEP);
+      // o = isNaN(off) ? (fwd ? 0 : len) : trunc(off)
+      c.localGet(BOFF);
+      c.localGet(BOFF);
+      c.f64Ne();
+      c.ifResult(F64);
+      if (fwd) {
+        c.f64Const(0);
+      } else {
+        c.localGet(LENI);
+        c.f64ConvertI32S();
+      }
+      c.else_();
+      c.localGet(BOFF);
+      c.f64Trunc();
+      c.end();
+      c.localSet(O);
+      // if (o < 0) { o += len; if (o < 0) { !fwd -> return -1; else o = 0; } }
+      c.localGet(O);
+      c.f64Const(0);
+      c.f64Lt();
+      c.ifVoid();
+      {
+        c.localGet(O);
+        c.localGet(LENI);
+        c.f64ConvertI32S();
+        c.f64Add();
+        c.localSet(O);
+        c.localGet(O);
+        c.f64Const(0);
+        c.f64Lt();
+        c.ifVoid();
+        {
+          if (!fwd) {
+            c.f64Const(-1);
+            c.return_();
+          } else {
+            c.f64Const(0);
+            c.localSet(O);
+          }
+        }
+        c.end();
+      }
+      c.end();
+      // if (nlen == 0) return o > len ? len : o
+      c.localGet(NLEN);
+      c.i32Eqz();
+      c.ifVoid();
+      {
+        c.localGet(O);
+        c.localGet(LENI);
+        c.f64ConvertI32S();
+        c.f64Gt();
+        c.ifResult(F64);
+        c.localGet(LENI);
+        c.f64ConvertI32S();
+        c.else_();
+        c.localGet(O);
+        c.end();
+        c.return_();
+      }
+      c.end();
+      // if (nlen > len) return -1
+      c.localGet(NLEN);
+      c.localGet(LENI);
+      c.i32GtS();
+      c.ifVoid();
+      {
+        c.f64Const(-1);
+        c.return_();
+      }
+      c.end();
+      c.localGet(B);
+      c.structGet(this.bytesType(), STORAGE);
+      c.localSet(BUFL);
+      c.localGet(NEEDLE);
+      c.structGet(this.bytesType(), STORAGE);
+      c.localSet(NBUFL);
+      if (fwd) {
+        c.localGet(O);
+        c.localGet(LENI);
+        c.f64ConvertI32S();
+        c.f64Gt();
+        c.ifResult(I32);
+        c.localGet(LENI);
+        c.else_();
+        c.localGet(O);
+        c.i32TruncF64S();
+        c.end();
+        c.localSet(START);
+        // Rounds DOWN to the nearest even offset — measured directly
+        // against Node (NOT the C reference's `start += start % 2`, which
+        // rounds UP for forward search and does not match: on
+        // Buffer.from("aXaY","utf16le"), indexOf("a", 1, "utf16le") is 0
+        // on Node, not 4 — a genuine scr_bytes.c divergence from Node,
+        // filed on the board, not ported here). Backward already rounded
+        // down and matched Node exactly at every offset tested.
+        c.localGet(STEP);
+        c.i32Const(2);
+        c.i32Eq();
+        c.ifVoid();
+        {
+          c.localGet(START);
+          c.localGet(START);
+          c.i32Const(2);
+          c.i32RemS();
+          c.i32Sub();
+          c.localSet(START);
+        }
+        c.end();
+      } else {
+        // start = o > (len - nlen) ? (len - nlen) : o; if (step==2) start -= start%2
+        c.localGet(O);
+        c.localGet(LENI);
+        c.localGet(NLEN);
+        c.i32Sub();
+        c.f64ConvertI32S();
+        c.f64Gt();
+        c.ifResult(I32);
+        c.localGet(LENI);
+        c.localGet(NLEN);
+        c.i32Sub();
+        c.else_();
+        c.localGet(O);
+        c.i32TruncF64S();
+        c.end();
+        c.localSet(START);
+        c.localGet(STEP);
+        c.i32Const(2);
+        c.i32Eq();
+        c.ifVoid();
+        {
+          c.localGet(START);
+          c.localGet(START);
+          c.i32Const(2);
+          c.i32RemS();
+          c.i32Sub();
+          c.localSet(START);
+        }
+        c.end();
+      }
+      c.localGet(START);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      if (fwd) {
+        c.localGet(I);
+        c.localGet(NLEN);
+        c.i32Add();
+        c.localGet(LENI);
+        c.i32GtS();
+        c.brIf(1);
+      } else {
+        c.localGet(I);
+        c.i32Const(0);
+        c.i32LtS();
+        c.brIf(1);
+      }
+      c.block();
+      c.i32Const(0);
+      c.localSet(J);
+      c.loop();
+      c.localGet(J);
+      c.localGet(NLEN);
+      c.i32GeS();
+      c.ifVoid();
+      {
+        c.localGet(I);
+        c.f64ConvertI32S();
+        c.return_();
+      }
+      c.end();
+      c.localGet(BUFL);
+      c.localGet(B);
+      c.structGet(this.bytesType(), OFF);
+      c.localGet(I);
+      c.i32Add();
+      c.localGet(J);
+      c.i32Add();
+      c.arrayGetU(this.bufType());
+      c.localGet(NBUFL);
+      c.localGet(NEEDLE);
+      c.structGet(this.bytesType(), OFF);
+      c.localGet(J);
+      c.i32Add();
+      c.arrayGetU(this.bufType());
+      c.i32Ne();
+      c.brIf(1);
+      c.localGet(J);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(J);
+      c.br(0);
+      c.end();
+      c.end();
+      if (fwd) {
+        c.localGet(I);
+        c.localGet(STEP);
+        c.i32Add();
+        c.localSet(I);
+      } else {
+        // backward: if (i < step) break (handled by the i<0 check above
+        // after this subtraction wraps negative — step<=2 and i>=0 here,
+        // so i-step can go to exactly -1 or -2, caught next iteration).
+        c.localGet(I);
+        c.localGet(STEP);
+        c.i32Sub();
+        c.localSet(I);
+      }
+      c.br(0);
+      c.end();
+      c.end();
+      c.f64Const(-1);
+      this.mb.setBody(
+        idx,
+        [I32, I32, I32, F64, I32, I32, I32, this.bufRefNN(), this.bufRefNN()],
+        c.bytes(),
+      );
+      return idx;
+    });
+  }
+
+  /** %w.bytes.indexOfNum:<fwd|bwd> — (b, f64 value, f64 off) → f64; builds
+   * a fresh 1-byte needle (`value` masked & 0xFF, the same coercion as an
+   * element write) and defers to indexOfHelper with align=1 — mirrors the
+   * C reference's stack-allocated single-byte `ScrBytes needle` (WasmGC
+   * has no stack allocation, so this heap-allocates a tiny array+struct
+   * per call instead; correctness over micro-optimization here). */
+  indexOfNumHelper(fwd: boolean): number {
+    return this.cached(`indexOfNum:${fwd ? "fwd" : "bwd"}`, () => {
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.bytesRef(), F64, F64], [F64]),
+        `%w.bytes.indexOfNum:${fwd ? "fwd" : "bwd"}`,
+      );
+      const c = new Code();
+      const B = 0, V = 1, OFF = 2;
+      const BYTE = 3, ARR = 4, NEEDLE = 5;
+      c.localGet(V);
+      c.call(this.deps.toInt32());
+      c.i32Const(0xff);
+      c.i32And();
+      c.localSet(BYTE);
+      c.i32Const(1);
+      c.arrayNewDefault(this.bufType());
+      c.localSet(ARR);
+      c.localGet(ARR);
+      c.i32Const(0);
+      c.localGet(BYTE);
+      c.arraySet(this.bufType());
+      c.localGet(ARR);
+      c.i32Const(0);
+      c.i32Const(1);
+      c.structNew(this.bytesType());
+      c.localSet(NEEDLE);
+      c.localGet(B);
+      c.localGet(NEEDLE);
+      c.f64Const(1); // align — indexOfHelper's param order is (b, needle, align, byteOffset)
+      c.localGet(OFF);
+      c.call(this.indexOfHelper(fwd));
+      this.mb.setBody(idx, [I32, this.bufRefNN(), this.bytesRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  /* ── round B2, slice 2: the validateOffHelper substrate and its first
+   * consumer, the fill family (scr_bytes.c:969-997, 1072-1117). ──────── */
+
+  /** %w.bytes.validateOff — (str name, f64 value, f64 max) → i32 (1 =
+   * valid, continue; 0 = already threw, the caller MUST bail); Node's
+   * validateOffset ladder (scr_bytes_validate_off) — a SECOND, distinctly
+   * spelled error family from readNum/writeNum's boundsErrorHelper, kept
+   * SEPARATE per measurement (not unified): this ladder renders "&&"
+   * between the two bound clauses where boundsErrorHelper renders "and",
+   * and classifies +/-Infinity as "not an integer" FIRST — measured
+   * directly against Node 24.18: `w.writeUInt8(1, Infinity)` (the
+   * boundsErrorHelper family) answers "It must be >= 0 and <= 7. Received
+   * Infinity" (Infinity falls through to the range check, since that
+   * ladder's own bad-integer test is only `trunc(v) != v`, which Infinity
+   * passes), but `b.fill(1, Infinity)` (this ladder) answers "It must be
+   * an integer. Received Infinity" — the SAME kind of value, two
+   * genuinely different Node error shapes depending on which method
+   * family reads it. Both are pinned by a dedicated test showing this
+   * exact contrast so a future refactor doesn't unify them by mistake.
+   *
+   * PUSH ORDER for every caller below: (name, value, max) — a strRef then
+   * two f64s, matching this function's own param order 0,1,2 exactly.
+   *
+   * `max` < 0 is copy's own "no upper bound" sentinel (renders only
+   * ">= 0", no upper-bound clause). Returns an EXPLICIT i32 rather than
+   * being void-and-rely-on-the-exception-cell (boundsErrorHelper's own
+   * pattern) because boundsErrorHelper's callers inline their OWN
+   * validity check first and only call in once ALREADY known invalid
+   * (readNumHelper/writeNumHelper's pattern) — this helper's whole point
+   * is to let callers skip duplicating the "&&"-ladder's validity logic,
+   * so it must report success/failure itself. EVERY caller below MUST
+   * check the returned i32 and bail (push its own dummy return value,
+   * `return_()`) when it is 0 — the exception cell is already set by
+   * then; continuing past a 0 with the (still invalid) value is exactly
+   * the bug this comment exists to prevent a repeat of (caught in this
+   * slice's own testing: an unchecked call let a negative offset reach
+   * the fill loop and trap on an out-of-bounds array access instead of
+   * throwing the catchable RangeError). */
+  validateOffHelper(): number {
+    return this.cached("validateOff", () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.strRefN(), F64, F64], [I32]), "%w.bytes.validateOff");
+      const c = new Code();
+      const NAME = 0, VALUE = 1, MAX = 2;
+      // bad_integer = floor(value) != value || value == +Infinity || value == -Infinity
+      c.localGet(VALUE);
+      c.f64Floor();
+      c.localGet(VALUE);
+      c.f64Ne();
+      c.localGet(VALUE);
+      c.f64Const(Infinity);
+      c.f64Eq();
+      c.i32Or();
+      c.localGet(VALUE);
+      c.f64Const(-Infinity);
+      c.f64Eq();
+      c.i32Or();
+      c.ifVoid();
+      {
+        this.deps.throwError(
+          c,
+          "%RangeError",
+          "RangeError",
+          (x) => {
+            this.deps.lit(x, 'The value of "');
+            x.localGet(NAME);
+            x.call(this.deps.concat());
+            this.deps.lit(x, '" is out of range. It must be an integer. Received ');
+            x.call(this.deps.concat());
+            x.localGet(VALUE);
+            x.call(this.numReceivedHelper());
+            x.call(this.deps.concat());
+          },
+          "ERR_OUT_OF_RANGE",
+        );
+        c.i32Const(0);
+        c.return_();
+      }
+      c.end();
+      // Past here VALUE is a finite integer. Range-check against
+      // [0, max], or [0, ∞) when max < 0 (copy's sentinel).
+      c.localGet(VALUE);
+      c.f64Const(0);
+      c.f64Lt();
+      c.localGet(MAX);
+      c.f64Const(0);
+      c.f64Ge();
+      c.localGet(VALUE);
+      c.localGet(MAX);
+      c.f64Gt();
+      c.i32And();
+      c.i32Or();
+      c.ifVoid();
+      {
+        c.localGet(MAX);
+        c.f64Const(0);
+        c.f64Lt();
+        c.ifVoid();
+        {
+          this.deps.throwError(
+            c,
+            "%RangeError",
+            "RangeError",
+            (x) => {
+              this.deps.lit(x, 'The value of "');
+              x.localGet(NAME);
+              x.call(this.deps.concat());
+              this.deps.lit(x, '" is out of range. It must be >= 0. Received ');
+              x.call(this.deps.concat());
+              x.localGet(VALUE);
+              x.call(this.numReceivedHelper());
+              x.call(this.deps.concat());
+            },
+            "ERR_OUT_OF_RANGE",
+          );
+          c.i32Const(0);
+          c.return_();
+        }
+        c.end();
+        this.deps.throwError(
+          c,
+          "%RangeError",
+          "RangeError",
+          (x) => {
+            this.deps.lit(x, 'The value of "');
+            x.localGet(NAME);
+            x.call(this.deps.concat());
+            this.deps.lit(x, '" is out of range. It must be >= 0 && <= ');
+            x.call(this.deps.concat());
+            x.localGet(MAX);
+            x.call(this.deps.f64ToStr());
+            x.call(this.deps.concat());
+            this.deps.lit(x, ". Received ");
+            x.call(this.deps.concat());
+            x.localGet(VALUE);
+            x.call(this.numReceivedHelper());
+            x.call(this.deps.concat());
+          },
+          "ERR_OUT_OF_RANGE",
+        );
+        c.i32Const(0);
+        c.return_();
+      }
+      c.end();
+      c.i32Const(1);
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.bytes.fillCore:<strict|lenient> — (b, pattern, i32 nargs, f64
+   * offset, f64 end) → b (chains, in-place — no struct.new, same as
+   * swapHelper); the shared body of scr_bytes_fill_core. "lenient" is
+   * fillStr's zero_ok (an EMPTY string pattern zero-fills); "strict" is
+   * fill/fillNum's (an empty Buffer pattern is the constant TypeError,
+   * measured: "The argument 'value' is invalid. Received <Buffer >",
+   * ERR_INVALID_ARG_VALUE) — fillNum's own 1-byte pattern is never empty,
+   * so it always takes "strict" without ever exercising that branch.
+   * `nargs` counts the PRESENT offset/end args (0-2), mirroring
+   * compareBuf's own omitted-arg convention. Push order for both callers
+   * below: (b, pattern, nargs, offset, end) — matches this function's own
+   * param order 0-4 exactly. */
+  private fillCoreHelper(zeroOk: boolean): number {
+    return this.cached(`fillCore:${zeroOk ? "lenient" : "strict"}`, () => {
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.bytesRef(), this.bytesRef(), I32, F64, F64], [this.bytesRef()]),
+        `%w.bytes.fillCore:${zeroOk ? "lenient" : "strict"}`,
+      );
+      const c = new Code();
+      const B = 0, PATTERN = 1, NARGS = 2, OFFSET = 3, END = 4;
+      const PATN = 5, LENI = 6, BUFL = 7, PATBUF = 8, O = 9, E = 10, I = 11;
+      c.localGet(PATTERN);
+      c.structGet(this.bytesType(), BLEN);
+      c.localSet(PATN);
+      if (!zeroOk) {
+        c.localGet(PATN);
+        c.i32Eqz();
+        c.ifVoid();
+        {
+          this.deps.throwError(
+            c,
+            "%TypeError",
+            "TypeError",
+            (x) => this.deps.lit(x, "The argument 'value' is invalid. Received <Buffer >"),
+            "ERR_INVALID_ARG_VALUE",
+          );
+          c.refNull(this.bytesType());
+          c.return_();
+        }
+        c.end();
+      }
+      c.localGet(B);
+      c.structGet(this.bytesType(), BLEN);
+      c.localSet(LENI);
+      c.localGet(NARGS);
+      c.i32Const(1);
+      c.i32LtS();
+      c.ifVoid();
+      {
+        c.f64Const(0);
+        c.localSet(OFFSET);
+      }
+      c.else_();
+      {
+        this.deps.lit(c, "offset");
+        c.localGet(OFFSET);
+        c.f64Const(9007199254740991);
+        c.call(this.validateOffHelper());
+        c.i32Eqz();
+        c.ifVoid();
+        {
+          c.refNull(this.bytesType());
+          c.return_();
+        }
+        c.end();
+      }
+      c.end();
+      c.localGet(NARGS);
+      c.i32Const(2);
+      c.i32LtS();
+      c.ifVoid();
+      {
+        c.localGet(LENI);
+        c.f64ConvertI32S();
+        c.localSet(END);
+      }
+      c.else_();
+      {
+        this.deps.lit(c, "end");
+        c.localGet(END);
+        c.localGet(LENI);
+        c.f64ConvertI32S();
+        c.call(this.validateOffHelper());
+        c.i32Eqz();
+        c.ifVoid();
+        {
+          c.refNull(this.bytesType());
+          c.return_();
+        }
+        c.end();
+      }
+      c.end();
+      c.localGet(OFFSET);
+      c.localGet(END);
+      c.f64Lt();
+      c.ifVoid();
+      {
+        c.localGet(OFFSET);
+        c.localGet(LENI);
+        c.f64ConvertI32S();
+        c.f64Gt();
+        c.ifResult(I32);
+        c.localGet(LENI);
+        c.else_();
+        c.localGet(OFFSET);
+        c.i32TruncF64S();
+        c.end();
+        c.localSet(O);
+        c.localGet(END);
+        c.i32TruncF64S();
+        c.localSet(E);
+        c.localGet(B);
+        c.structGet(this.bytesType(), STORAGE);
+        c.localSet(BUFL);
+        c.localGet(PATTERN);
+        c.structGet(this.bytesType(), STORAGE);
+        c.localSet(PATBUF);
+        c.localGet(O);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(E);
+        c.i32GeS();
+        c.brIf(1);
+        c.localGet(BUFL);
+        c.localGet(B);
+        c.structGet(this.bytesType(), OFF);
+        c.localGet(I);
+        c.i32Add();
+        c.localGet(PATN);
+        c.i32Eqz();
+        c.ifResult(I32);
+        c.i32Const(0);
+        c.else_();
+        {
+          c.localGet(PATBUF);
+          c.localGet(PATTERN);
+          c.structGet(this.bytesType(), OFF);
+          c.localGet(I);
+          c.localGet(O);
+          c.i32Sub();
+          c.localGet(PATN);
+          c.i32RemS();
+          c.i32Add();
+          c.arrayGetU(this.bufType());
+        }
+        c.end();
+        c.arraySet(this.bufType());
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+      }
+      c.end();
+      c.localGet(B);
+      this.mb.setBody(
+        idx,
+        [I32, I32, this.bufRefNN(), this.bufRefNN(), I32, I32, I32],
+        c.bytes(),
+      );
+      return idx;
+    });
+  }
+
+  /** %w.bytes.fill — (b, pattern, i32 nargs, f64 offset, f64 end) → b; a
+   * thin public alias for fillCoreHelper("strict") — `fill`'s pattern
+   * arg IS already a bytesRef, no construction step needed (unlike
+   * fillNum/fillStr), so this exists only to give the plain-Buffer-
+   * pattern case its own named entry point matching the other two. */
+  fillHelper(): number {
+    return this.fillCoreHelper(false);
+  }
+
+  /** %w.bytes.fillNum — (b, f64 value, i32 nargs, f64 offset, f64 end) →
+   * b; builds a fresh 1-byte pattern (value masked & 0xFF, same
+   * coercion as an element write and indexOfNumHelper's needle) and
+   * defers to fillCoreHelper("strict") — the pattern is never empty, so
+   * "strict" vs "lenient" is moot here. Push order into fillCoreHelper:
+   * (b, pattern, nargs, offset, end), matching ITS param order. */
+  fillNumHelper(): number {
+    return this.cached("fillNum", () => {
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.bytesRef(), F64, I32, F64, F64], [this.bytesRef()]),
+        "%w.bytes.fillNum",
+      );
+      const c = new Code();
+      const B = 0, V = 1, NARGS = 2, OFFSET = 3, END = 4;
+      const BYTE = 5, ARR = 6, PATTERN = 7;
+      c.localGet(V);
+      c.call(this.deps.toInt32());
+      c.i32Const(0xff);
+      c.i32And();
+      c.localSet(BYTE);
+      c.i32Const(1);
+      c.arrayNewDefault(this.bufType());
+      c.localSet(ARR);
+      c.localGet(ARR);
+      c.i32Const(0);
+      c.localGet(BYTE);
+      c.arraySet(this.bufType());
+      c.localGet(ARR);
+      c.i32Const(0);
+      c.i32Const(1);
+      c.structNew(this.bytesType());
+      c.localSet(PATTERN);
+      c.localGet(B);
+      c.localGet(PATTERN);
+      c.localGet(NARGS);
+      c.localGet(OFFSET);
+      c.localGet(END);
+      c.call(this.fillCoreHelper(false));
+      this.mb.setBody(idx, [I32, this.bufRefNN(), this.bytesRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.bytes.fillStr:<enc> — (b, str s, i32 nargs, f64 offset, f64 end) →
+   * b; builds the pattern via fromStrHelper(enc) (the SAME encode path
+   * `Buffer.from(str, enc)` uses) and defers to fillCoreHelper("lenient")
+   * — an empty string pattern zero-fills, measured (`Buffer.alloc(4).
+   * fill("")` succeeds and zero-fills, unlike `fill(Buffer.alloc(0))`,
+   * which throws). Push order into fillCoreHelper: (b, pattern, nargs,
+   * offset, end). */
+  fillStrHelper(enc: string): number {
+    return this.cached(`fillStr:${enc}`, () => {
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.bytesRef(), this.strRefN(), I32, F64, F64], [this.bytesRef()]),
+        `%w.bytes.fillStr:${enc}`,
+      );
+      const c = new Code();
+      const B = 0, S = 1, NARGS = 2, OFFSET = 3, END = 4;
+      const PATTERN = 5;
+      c.localGet(S);
+      c.call(this.fromStrHelper(enc));
+      c.localSet(PATTERN);
+      c.localGet(B);
+      c.localGet(PATTERN);
+      c.localGet(NARGS);
+      c.localGet(OFFSET);
+      c.localGet(END);
+      c.call(this.fillCoreHelper(true));
+      this.mb.setBody(idx, [this.bytesRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.bytes.compareBuf — (src, target, i32 nargs, f64 ts, f64 te, f64
+   * ss, f64 se) → f64 (-1/0/1); scr_bytes_compare, THROWS via
+   * validateOffHelper. `nargs` counts the PRESENT index args (0-4),
+   * skipping validation for omitted ones exactly like fillCoreHelper's
+   * own convention — an omitted arg's default (0 or a length) is always
+   * trivially valid, so skipping vs validating-the-default is
+   * observationally identical; `nargs` exists to pick the right skip,
+   * not because the defaults could ever fail. Push order for validateOff
+   * calls below: (name, value, max) as always. Byte-compare is the same
+   * hand-rolled loop shape as indexOfHelper's (no memcmp in WasmGC),
+   * returning the sign of the first mismatch directly via `return_()`. */
+  compareBufHelper(): number {
+    return this.cached("compareBuf", () => {
+      const idx = this.mb.declareFunc(
+        this.mb.funcType(
+          [this.bytesRef(), this.bytesRef(), I32, F64, F64, F64, F64],
+          [F64],
+        ),
+        "%w.bytes.compareBuf",
+      );
+      const c = new Code();
+      const SRC = 0, TARGET = 1, NARGS = 2, TS = 3, TE = 4, SS = 5, SE = 6;
+      const TLEN = 7, SLEN = 8, T0 = 9, S0 = 10, TN = 11, SN = 12, M = 13, I = 14, BUFS = 15, BUFT = 16;
+      c.localGet(TARGET);
+      c.structGet(this.bytesType(), BLEN);
+      c.localSet(TLEN);
+      c.localGet(SRC);
+      c.structGet(this.bytesType(), BLEN);
+      c.localSet(SLEN);
+      // ts: default 0, else validateOff("targetStart", ts, MAX_SAFE_INT)
+      c.localGet(NARGS);
+      c.i32Const(1);
+      c.i32LtS();
+      c.ifVoid();
+      {
+        c.f64Const(0);
+        c.localSet(TS);
+      }
+      c.else_();
+      {
+        this.deps.lit(c, "targetStart");
+        c.localGet(TS);
+        c.f64Const(9007199254740991);
+        c.call(this.validateOffHelper());
+        c.i32Eqz();
+        c.ifVoid();
+        {
+          c.f64Const(0);
+          c.return_();
+        }
+        c.end();
+      }
+      c.end();
+      // te: default target.len, else validateOff("targetEnd", te, target.len)
+      c.localGet(NARGS);
+      c.i32Const(2);
+      c.i32LtS();
+      c.ifVoid();
+      {
+        c.localGet(TLEN);
+        c.f64ConvertI32S();
+        c.localSet(TE);
+      }
+      c.else_();
+      {
+        this.deps.lit(c, "targetEnd");
+        c.localGet(TE);
+        c.localGet(TLEN);
+        c.f64ConvertI32S();
+        c.call(this.validateOffHelper());
+        c.i32Eqz();
+        c.ifVoid();
+        {
+          c.f64Const(0);
+          c.return_();
+        }
+        c.end();
+      }
+      c.end();
+      // ss: default 0, else validateOff("sourceStart", ss, MAX_SAFE_INT)
+      c.localGet(NARGS);
+      c.i32Const(3);
+      c.i32LtS();
+      c.ifVoid();
+      {
+        c.f64Const(0);
+        c.localSet(SS);
+      }
+      c.else_();
+      {
+        this.deps.lit(c, "sourceStart");
+        c.localGet(SS);
+        c.f64Const(9007199254740991);
+        c.call(this.validateOffHelper());
+        c.i32Eqz();
+        c.ifVoid();
+        {
+          c.f64Const(0);
+          c.return_();
+        }
+        c.end();
+      }
+      c.end();
+      // se: default src.len, else validateOff("sourceEnd", se, src.len)
+      c.localGet(NARGS);
+      c.i32Const(4);
+      c.i32LtS();
+      c.ifVoid();
+      {
+        c.localGet(SLEN);
+        c.f64ConvertI32S();
+        c.localSet(SE);
+      }
+      c.else_();
+      {
+        this.deps.lit(c, "sourceEnd");
+        c.localGet(SE);
+        c.localGet(SLEN);
+        c.f64ConvertI32S();
+        c.call(this.validateOffHelper());
+        c.i32Eqz();
+        c.ifVoid();
+        {
+          c.f64Const(0);
+          c.return_();
+        }
+        c.end();
+      }
+      c.end();
+      // if (ts >= te) return ss >= se ? 0 : 1
+      c.localGet(TS);
+      c.localGet(TE);
+      c.f64Ge();
+      c.ifVoid();
+      {
+        c.localGet(SS);
+        c.localGet(SE);
+        c.f64Ge();
+        c.ifResult(F64);
+        c.f64Const(0);
+        c.else_();
+        c.f64Const(1);
+        c.end();
+        c.return_();
+      }
+      c.end();
+      // if (ss >= se) return -1
+      c.localGet(SS);
+      c.localGet(SE);
+      c.f64Ge();
+      c.ifVoid();
+      {
+        c.f64Const(-1);
+        c.return_();
+      }
+      c.end();
+      // t0 = min(ts, tlen); s0 = min(ss, slen); tn = te(i32) - t0; sn = se(i32) - s0
+      c.localGet(TS);
+      c.localGet(TLEN);
+      c.f64ConvertI32S();
+      c.f64Gt();
+      c.ifResult(I32);
+      c.localGet(TLEN);
+      c.else_();
+      c.localGet(TS);
+      c.i32TruncF64S();
+      c.end();
+      c.localSet(T0);
+      c.localGet(SS);
+      c.localGet(SLEN);
+      c.f64ConvertI32S();
+      c.f64Gt();
+      c.ifResult(I32);
+      c.localGet(SLEN);
+      c.else_();
+      c.localGet(SS);
+      c.i32TruncF64S();
+      c.end();
+      c.localSet(S0);
+      c.localGet(TE);
+      c.i32TruncF64S();
+      c.localGet(T0);
+      c.i32Sub();
+      c.localSet(TN);
+      c.localGet(SE);
+      c.i32TruncF64S();
+      c.localGet(S0);
+      c.i32Sub();
+      c.localSet(SN);
+      c.localGet(SN);
+      c.localGet(TN);
+      c.i32LtS();
+      c.ifResult(I32);
+      c.localGet(SN);
+      c.else_();
+      c.localGet(TN);
+      c.end();
+      c.localSet(M);
+      c.localGet(SRC);
+      c.structGet(this.bytesType(), STORAGE);
+      c.localSet(BUFS);
+      c.localGet(TARGET);
+      c.structGet(this.bytesType(), STORAGE);
+      c.localSet(BUFT);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(M);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(BUFS);
+      c.localGet(SRC);
+      c.structGet(this.bytesType(), OFF);
+      c.localGet(S0);
+      c.i32Add();
+      c.localGet(I);
+      c.i32Add();
+      c.arrayGetU(this.bufType());
+      c.localGet(BUFT);
+      c.localGet(TARGET);
+      c.structGet(this.bytesType(), OFF);
+      c.localGet(T0);
+      c.i32Add();
+      c.localGet(I);
+      c.i32Add();
+      c.arrayGetU(this.bufType());
+      c.i32Ne();
+      c.ifVoid();
+      {
+        // Return the SIGN of the mismatch (unsigned byte compare).
+        c.localGet(BUFS);
+        c.localGet(SRC);
+        c.structGet(this.bytesType(), OFF);
+        c.localGet(S0);
+        c.i32Add();
+        c.localGet(I);
+        c.i32Add();
+        c.arrayGetU(this.bufType());
+        c.localGet(BUFT);
+        c.localGet(TARGET);
+        c.structGet(this.bytesType(), OFF);
+        c.localGet(T0);
+        c.i32Add();
+        c.localGet(I);
+        c.i32Add();
+        c.arrayGetU(this.bufType());
+        c.i32LtU();
+        c.ifResult(F64);
+        c.f64Const(-1);
+        c.else_();
+        c.f64Const(1);
+        c.end();
+        c.return_();
+      }
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(SN);
+      c.localGet(TN);
+      c.i32Eq();
+      c.ifResult(F64);
+      c.f64Const(0);
+      c.else_();
+      c.localGet(SN);
+      c.localGet(TN);
+      c.i32LtS();
+      c.ifResult(F64);
+      c.f64Const(-1);
+      c.else_();
+      c.f64Const(1);
+      c.end();
+      c.end();
+      this.mb.setBody(
+        idx,
+        [I32, I32, I32, I32, I32, I32, I32, I32, this.bufRefNN(), this.bufRefNN()],
+        c.bytes(),
+      );
+      return idx;
+    });
+  }
+
+  /** Floors VALUE and replaces a non-finite result with 0, leaving the
+   * normalized f64 on the stack — copy's OWN coercion (measured directly
+   * against Node, NOT the C reference's `trunc()`, which disagrees on
+   * two axes: `src.copy(d, -1.5)` reports "Received -2" in the thrown
+   * message, i.e. FLOOR not trunc-toward-zero; and `src.copy(d, Infinity
+   * | -Infinity | NaN)` never throws at all and behaves as if the
+   * argument were 0 — a full no-clamp copy from the start, not a
+   * validateOffHelper-style "must be an integer" rejection the way fill/
+   * compareBuf handle the exact same values). This is a REAL divergence
+   * from scr_bytes_copy_into's own comment, filed for the board alongside
+   * the utf16le alignment one. Once normalized, the result IS always a
+   * finite integer, so feeding it into validateOffHelper afterward only
+   * ever exercises that helper's range-check half, never its bad-integer
+   * branch — safe to reuse as-is. */
+  private emitFloorOrZero(c: Code, VALUE: number, TMP: number): void {
+    c.localGet(VALUE);
+    c.f64Floor();
+    c.localSet(TMP);
+    c.localGet(TMP);
+    c.localGet(TMP);
+    c.f64Ne();
+    c.localGet(TMP);
+    c.f64Const(Infinity);
+    c.f64Eq();
+    c.i32Or();
+    c.localGet(TMP);
+    c.f64Const(-Infinity);
+    c.f64Eq();
+    c.i32Or();
+    c.ifResult(F64);
+    c.f64Const(0);
+    c.else_();
+    c.localGet(TMP);
+    c.end();
+  }
+
+  /** %w.bytes.copy — (src, dst, i32 nargs, f64 ts, f64 ss, f64 se) → f64
+   * (bytes copied); scr_bytes_copy_into, overlap-capable (array.copy is
+   * memmove-safe in WasmGC, the same discipline setFromHelper already
+   * uses — measured: `buf.copy(buf, 1, 0, 3)` on a self-overlapping
+   * region matches Node exactly). THROWS via validateOffHelper for a
+   * genuinely out-of-range (negative, or a too-large sourceStart)
+   * argument; a `targetStart` at/past `dst.length`, or an empty/reversed
+   * source window, silently no-ops and returns 0 (Node's own behavior,
+   * not an error). Push order into validateOffHelper: (name, value, max)
+   * as always; `max` < 0 is the "no upper bound" sentinel for
+   * targetStart/sourceEnd, matching fill's own copy of this convention. */
+  copyHelper(): number {
+    return this.cached("copy", () => {
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.bytesRef(), this.bytesRef(), I32, F64, F64, F64], [F64]),
+        "%w.bytes.copy",
+      );
+      const c = new Code();
+      const SRC = 0, DST = 1, NARGS = 2, TS = 3, SS = 4, SE = 5;
+      const TMP = 6, SLEN = 7, DLEN = 8, T0 = 9, S0 = 10, E0 = 11, COUNT = 12;
+      c.localGet(SRC);
+      c.structGet(this.bytesType(), BLEN);
+      c.localSet(SLEN);
+      c.localGet(DST);
+      c.structGet(this.bytesType(), BLEN);
+      c.localSet(DLEN);
+      // ts: default 0, else floorOrZero(ts) then validateOff("targetStart", ts, -1)
+      c.localGet(NARGS);
+      c.i32Const(1);
+      c.i32LtS();
+      c.ifVoid();
+      {
+        c.f64Const(0);
+        c.localSet(TS);
+      }
+      c.else_();
+      {
+        this.emitFloorOrZero(c, TS, TMP);
+        c.localSet(TS);
+        this.deps.lit(c, "targetStart");
+        c.localGet(TS);
+        c.f64Const(-1);
+        c.call(this.validateOffHelper());
+        c.i32Eqz();
+        c.ifVoid();
+        {
+          c.f64Const(0);
+          c.return_();
+        }
+        c.end();
+      }
+      c.end();
+      // ss: default 0, else floorOrZero(ss) then validateOff("sourceStart", ss, src.len)
+      c.localGet(NARGS);
+      c.i32Const(2);
+      c.i32LtS();
+      c.ifVoid();
+      {
+        c.f64Const(0);
+        c.localSet(SS);
+      }
+      c.else_();
+      {
+        this.emitFloorOrZero(c, SS, TMP);
+        c.localSet(SS);
+        this.deps.lit(c, "sourceStart");
+        c.localGet(SS);
+        c.localGet(SLEN);
+        c.f64ConvertI32S();
+        c.call(this.validateOffHelper());
+        c.i32Eqz();
+        c.ifVoid();
+        {
+          c.f64Const(0);
+          c.return_();
+        }
+        c.end();
+      }
+      c.end();
+      // se: default src.len, else floorOrZero(se) then validateOff("sourceEnd", se, -1)
+      c.localGet(NARGS);
+      c.i32Const(3);
+      c.i32LtS();
+      c.ifVoid();
+      {
+        c.localGet(SLEN);
+        c.f64ConvertI32S();
+        c.localSet(SE);
+      }
+      c.else_();
+      {
+        this.emitFloorOrZero(c, SE, TMP);
+        c.localSet(SE);
+        this.deps.lit(c, "sourceEnd");
+        c.localGet(SE);
+        c.f64Const(-1);
+        c.call(this.validateOffHelper());
+        c.i32Eqz();
+        c.ifVoid();
+        {
+          c.f64Const(0);
+          c.return_();
+        }
+        c.end();
+      }
+      c.end();
+      // if (ts >= dst.len) return 0
+      c.localGet(TS);
+      c.localGet(DLEN);
+      c.f64ConvertI32S();
+      c.f64Ge();
+      c.ifVoid();
+      {
+        c.f64Const(0);
+        c.return_();
+      }
+      c.end();
+      c.localGet(TS);
+      c.i32TruncF64S();
+      c.localSet(T0);
+      c.localGet(SS);
+      c.i32TruncF64S();
+      c.localSet(S0);
+      // e0 = min(se, src.len)
+      c.localGet(SE);
+      c.localGet(SLEN);
+      c.f64ConvertI32S();
+      c.f64Gt();
+      c.ifResult(I32);
+      c.localGet(SLEN);
+      c.else_();
+      c.localGet(SE);
+      c.i32TruncF64S();
+      c.end();
+      c.localSet(E0);
+      // if (s0 >= e0) return 0
+      c.localGet(S0);
+      c.localGet(E0);
+      c.i32GeS();
+      c.ifVoid();
+      {
+        c.f64Const(0);
+        c.return_();
+      }
+      c.end();
+      // count = e0 - s0; if (count > dst.len - t0) count = dst.len - t0
+      c.localGet(E0);
+      c.localGet(S0);
+      c.i32Sub();
+      c.localSet(COUNT);
+      c.localGet(COUNT);
+      c.localGet(DLEN);
+      c.localGet(T0);
+      c.i32Sub();
+      c.i32GtS();
+      c.ifVoid();
+      {
+        c.localGet(DLEN);
+        c.localGet(T0);
+        c.i32Sub();
+        c.localSet(COUNT);
+      }
+      c.end();
+      c.localGet(DST);
+      c.structGet(this.bytesType(), STORAGE);
+      c.localGet(DST);
+      c.structGet(this.bytesType(), OFF);
+      c.localGet(T0);
+      c.i32Add();
+      c.localGet(SRC);
+      c.structGet(this.bytesType(), STORAGE);
+      c.localGet(SRC);
+      c.structGet(this.bytesType(), OFF);
+      c.localGet(S0);
+      c.i32Add();
+      c.localGet(COUNT);
+      c.arrayCopy(this.bufType(), this.bufType());
+      c.localGet(COUNT);
+      c.f64ConvertI32S();
+      this.mb.setBody(
+        idx,
+        [F64, I32, I32, I32, I32, I32, I32],
+        c.bytes(),
+      );
+      return idx;
+    });
+  }
+
   /* ── encodings (u8 only — the compiler routes only u8 receivers here);
    * stage B. Every encoding name arrives as a compile-time strLit (the
    * lowering never passes a runtime-computed encoding — nodes.ts's
@@ -3021,6 +4339,227 @@ export class BytesBuilder {
       c.end();
       this.emitBytesFromScratch(c, SCRATCH, O, TMP);
       this.mb.setBody(idx, [I32, this.bufRefNN(), I32, I32, I32, I32, I32, this.bufRefNN()], c.bytes());
+      return idx;
+    });
+  }
+
+  /** Walks K backward over UTF-8 CONTINUATION bytes (top two bits `10`)
+   * in ENCD[0..K), stopping at the lead byte of the last (possibly
+   * partial) sequence; if that sequence doesn't fully fit before K,
+   * backs K off to drop it entirely — scr_bytes_write_str's own
+   * boundary rule, ported directly (measured against Node: an astral
+   * character that doesn't fit is dropped whole, not split). Leaves the
+   * adjusted K in the same local. */
+  private emitUtf8WriteBackoff(c: Code, ENCBUF: number, K: number, LEAD: number, NEED: number): void {
+    c.localGet(K);
+    c.localSet(LEAD);
+    c.block();
+    c.loop();
+    c.localGet(LEAD);
+    c.i32Eqz();
+    c.brIf(1);
+    c.localGet(ENCBUF);
+    c.localGet(LEAD);
+    c.arrayGetU(this.bufType());
+    c.i32Const(0xc0);
+    c.i32And();
+    c.i32Const(0x80);
+    c.i32Ne();
+    c.brIf(1);
+    c.localGet(LEAD);
+    c.i32Const(1);
+    c.i32Sub();
+    c.localSet(LEAD);
+    c.br(0);
+    c.end();
+    c.end();
+    c.localGet(LEAD);
+    c.localGet(K);
+    c.i32LtS();
+    c.ifVoid();
+    {
+      c.localGet(ENCBUF);
+      c.localGet(LEAD);
+      c.arrayGetU(this.bufType());
+      c.localSet(NEED);
+      c.localGet(LEAD);
+      c.localGet(NEED);
+      c.i32Const(0xf8);
+      c.i32And();
+      c.i32Const(0xf0);
+      c.i32Eq();
+      c.ifResult(I32);
+      c.i32Const(4);
+      c.else_();
+      c.localGet(NEED);
+      c.i32Const(0xf0);
+      c.i32And();
+      c.i32Const(0xe0);
+      c.i32Eq();
+      c.ifResult(I32);
+      c.i32Const(3);
+      c.else_();
+      c.localGet(NEED);
+      c.i32Const(0xe0);
+      c.i32And();
+      c.i32Const(0xc0);
+      c.i32Eq();
+      c.ifResult(I32);
+      c.i32Const(2);
+      c.else_();
+      c.i32Const(1);
+      c.end();
+      c.end();
+      c.end();
+      c.i32Add();
+      c.localGet(K);
+      c.i32GtS();
+      c.ifVoid();
+      {
+        c.localGet(LEAD);
+        c.localSet(K);
+      }
+      c.end();
+    }
+    c.end();
+  }
+
+  /** %w.bytes.writeStr:<enc> — (b, str s, f64 offset, i32 hasLen, f64
+   * length) → f64 (bytes written); scr_bytes_write_str. THROWS via
+   * validateOffHelper for offset/length out of [0, b.len]. `hasLen` is a
+   * compile-time-known flag (the lowering always backfills `offset`, but
+   * `length` is only present when the source actually wrote it) — when
+   * false, the budget is simply the remaining space after offset, no
+   * length validation at all (measured: `buf.write(s, offset)` never
+   * throws ERR_OUT_OF_RANGE for "length"). The boundary truncation is
+   * ENCODING-SPECIFIC at COMPILE TIME: utf16le backs K off to an even
+   * count; utf8 uses emitUtf8WriteBackoff; every other encoding
+   * (hex/base64/base64url/latin1/ascii) never needs adjustment (measured
+   * — Node truncates those at any byte boundary). Push order into
+   * validateOffHelper: (name, value, max) as always. */
+  writeStrHelper(enc: string): number {
+    return this.cached(`writeStr:${enc}`, () => {
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.bytesRef(), this.strRefN(), F64, I32, F64], [F64]),
+        `%w.bytes.writeStr:${enc}`,
+      );
+      const c = new Code();
+      const B = 0, S = 1, OFFSET = 2, HASLEN = 3, LENGTH = 4;
+      const LENI = 5, BUDGET = 6, ENCD = 7, ENCBUF = 8, ENCLEN = 9, K = 10, LEAD = 11, NEED = 12, BUFL = 13;
+      c.localGet(B);
+      c.structGet(this.bytesType(), BLEN);
+      c.localSet(LENI);
+      this.deps.lit(c, "offset");
+      c.localGet(OFFSET);
+      c.localGet(LENI);
+      c.f64ConvertI32S();
+      c.call(this.validateOffHelper());
+      c.i32Eqz();
+      c.ifVoid();
+      {
+        c.f64Const(0);
+        c.return_();
+      }
+      c.end();
+      c.localGet(HASLEN);
+      c.ifVoid();
+      {
+        this.deps.lit(c, "length");
+        c.localGet(LENGTH);
+        c.localGet(LENI);
+        c.f64ConvertI32S();
+        c.call(this.validateOffHelper());
+        c.i32Eqz();
+        c.ifVoid();
+        {
+          c.f64Const(0);
+          c.return_();
+        }
+        c.end();
+      }
+      c.end();
+      // budget = min(hasLen ? length : remaining, remaining), remaining = len - offset
+      c.localGet(LENI);
+      c.f64ConvertI32S();
+      c.localGet(OFFSET);
+      c.f64Sub();
+      c.localSet(BUDGET); // BUDGET = remaining (f64, reused as scratch before truncation)
+      c.localGet(HASLEN);
+      c.ifVoid();
+      {
+        // budget = min(length, remaining) — BUDGET already holds
+        // "remaining"; only overwrite it when length is the smaller one.
+        c.localGet(LENGTH);
+        c.localGet(BUDGET);
+        c.f64Lt();
+        c.ifVoid();
+        {
+          c.localGet(LENGTH);
+          c.localSet(BUDGET);
+        }
+        c.end();
+      }
+      c.end();
+      c.localGet(S);
+      c.call(this.fromStrHelper(enc));
+      c.localSet(ENCD);
+      c.localGet(ENCD);
+      c.structGet(this.bytesType(), BLEN);
+      c.localSet(ENCLEN);
+      c.localGet(ENCD);
+      c.structGet(this.bytesType(), STORAGE);
+      c.localSet(ENCBUF);
+      // k = min(enclen, budget-as-i32)
+      c.localGet(ENCLEN);
+      c.f64ConvertI32S();
+      c.localGet(BUDGET);
+      c.f64Gt();
+      c.ifResult(I32);
+      c.localGet(BUDGET);
+      c.i32TruncF64S();
+      c.else_();
+      c.localGet(ENCLEN);
+      c.end();
+      c.localSet(K);
+      c.localGet(K);
+      c.localGet(ENCLEN);
+      c.i32LtS();
+      c.ifVoid();
+      {
+        if (enc === "utf16le") {
+          c.localGet(K);
+          c.localGet(K);
+          c.i32Const(2);
+          c.i32RemS();
+          c.i32Sub();
+          c.localSet(K);
+        } else if (enc === "utf8") {
+          this.emitUtf8WriteBackoff(c, ENCBUF, K, LEAD, NEED);
+        }
+        // hex/base64/base64url/latin1/ascii: no boundary adjustment.
+      }
+      c.end();
+      c.localGet(B);
+      c.structGet(this.bytesType(), STORAGE);
+      c.localSet(BUFL);
+      c.localGet(BUFL);
+      c.localGet(B);
+      c.structGet(this.bytesType(), OFF);
+      c.localGet(OFFSET);
+      c.i32TruncF64S();
+      c.i32Add();
+      c.localGet(ENCBUF);
+      c.localGet(ENCD);
+      c.structGet(this.bytesType(), OFF);
+      c.localGet(K);
+      c.arrayCopy(this.bufType(), this.bufType());
+      c.localGet(K);
+      c.f64ConvertI32S();
+      this.mb.setBody(
+        idx,
+        [I32, F64, this.bytesRef(), this.bufRefNN(), I32, I32, I32, I32, this.bufRefNN()],
+        c.bytes(),
+      );
       return idx;
     });
   }

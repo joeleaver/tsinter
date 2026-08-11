@@ -131,6 +131,26 @@ test("typedarrays.ts: every BytesBuilder helper, every elem kind, emits a VALID 
   // coverage of numReceivedHelper without any test failing. Calling it
   // directly pins its own presence independent of who currently reaches it.
   bytesB.numReceivedHelper();
+  // Round B2, slice 1: swap16/32/64 and the indexOf/lastIndexOf/includes
+  // (+Num) search family — u8-only at the lowering, forced here anyway.
+  bytesB.swapHelper(2);
+  bytesB.swapHelper(4);
+  bytesB.swapHelper(8);
+  bytesB.indexOfHelper(true);
+  bytesB.indexOfHelper(false);
+  bytesB.indexOfNumHelper(true);
+  bytesB.indexOfNumHelper(false);
+  // Round B2, slice 2: the validateOffHelper substrate and its consumers
+  // (compareBuf, fill/fillNum/fillStr, copy, writeStr).
+  bytesB.validateOffHelper();
+  bytesB.compareBufHelper();
+  bytesB.fillHelper();
+  bytesB.fillNumHelper();
+  bytesB.copyHelper();
+  for (const enc of encodings) {
+    bytesB.fillStrHelper(enc);
+    bytesB.writeStrHelper(enc);
+  }
 
   const bytes = mb.emit();
   expect(WebAssembly.validate(bytes)).toBe(true);

@@ -8553,6 +8553,138 @@ class Assembler {
             this.emitPendingCheck();
             return;
           }
+          case "indexOf":
+          case "lastIndexOf": {
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!); // needle
+            this.walkExpr(e.args[1]!); // align
+            if (e.args[2] !== undefined) this.walkExpr(e.args[2]);
+            else code.f64Const(NaN);
+            code.call(this.bytesB.indexOfHelper(e.method === "indexOf"));
+            return;
+          }
+          case "includes":
+            // Buffer.prototype.includes only ever searches forward — Node
+            // has no "lastIncludes" — so this always defers to the
+            // forward search, then narrows the f64 index to a bool.
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!); // needle
+            this.walkExpr(e.args[1]!); // align
+            if (e.args[2] !== undefined) this.walkExpr(e.args[2]);
+            else code.f64Const(NaN);
+            code.call(this.bytesB.indexOfHelper(true));
+            code.f64Const(-1);
+            code.f64Ne();
+            return;
+          case "indexOfNum":
+          case "lastIndexOfNum":
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!); // value
+            if (e.args[1] !== undefined) this.walkExpr(e.args[1]);
+            else code.f64Const(NaN);
+            code.call(this.bytesB.indexOfNumHelper(e.method === "indexOfNum"));
+            return;
+          case "includesNum":
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!); // value
+            if (e.args[1] !== undefined) this.walkExpr(e.args[1]);
+            else code.f64Const(NaN);
+            code.call(this.bytesB.indexOfNumHelper(true));
+            code.f64Const(-1);
+            code.f64Ne();
+            return;
+          case "swap16":
+          case "swap32":
+          case "swap64": {
+            this.walkExpr(e.receiver);
+            const width = e.method === "swap16" ? 2 : e.method === "swap32" ? 4 : 8;
+            code.call(this.bytesB.swapHelper(width));
+            this.emitPendingCheck();
+            return;
+          }
+          case "fill": {
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!); // pattern
+            code.i32Const(e.args.length - 1); // nargs: offset/end args present
+            if (e.args[1] !== undefined) this.walkExpr(e.args[1]);
+            else code.f64Const(0);
+            if (e.args[2] !== undefined) this.walkExpr(e.args[2]);
+            else code.f64Const(0);
+            code.call(this.bytesB.fillHelper());
+            this.emitPendingCheck();
+            return;
+          }
+          case "fillNum": {
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!); // value
+            code.i32Const(e.args.length - 1);
+            if (e.args[1] !== undefined) this.walkExpr(e.args[1]);
+            else code.f64Const(0);
+            if (e.args[2] !== undefined) this.walkExpr(e.args[2]);
+            else code.f64Const(0);
+            code.call(this.bytesB.fillNumHelper());
+            this.emitPendingCheck();
+            return;
+          }
+          case "fillStr": {
+            const encArg = e.args[1];
+            if (encArg === undefined || encArg.kind !== "strLit") {
+              throw new Error("emitter bug: bytesIntrinsic fillStr without a strLit encoding");
+            }
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!); // string
+            code.i32Const(e.args.length - 2);
+            if (e.args[2] !== undefined) this.walkExpr(e.args[2]);
+            else code.f64Const(0);
+            if (e.args[3] !== undefined) this.walkExpr(e.args[3]);
+            else code.f64Const(0);
+            code.call(this.bytesB.fillStrHelper(encArg.value));
+            this.emitPendingCheck();
+            return;
+          }
+          case "compareBuf": {
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!); // target
+            code.i32Const(e.args.length - 1); // nargs: index args present
+            for (const i of [1, 2, 3, 4]) {
+              if (e.args[i] !== undefined) this.walkExpr(e.args[i]);
+              else code.f64Const(0);
+            }
+            code.call(this.bytesB.compareBufHelper());
+            this.emitPendingCheck();
+            return;
+          }
+          case "copy": {
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!); // dst
+            code.i32Const(e.args.length - 1); // nargs: index args present
+            for (const i of [1, 2, 3]) {
+              if (e.args[i] !== undefined) this.walkExpr(e.args[i]);
+              else code.f64Const(0);
+            }
+            code.call(this.bytesB.copyHelper());
+            this.emitPendingCheck();
+            return;
+          }
+          case "writeStr": {
+            // args = [str, encStrLit, offset, length?] — the lowering
+            // always backfills offset (never omitted at this level), so
+            // only `length` needs a hasLen flag.
+            const encArg = e.args[1];
+            if (encArg === undefined || encArg.kind !== "strLit") {
+              throw new Error("emitter bug: bytesIntrinsic writeStr without a strLit encoding");
+            }
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!); // string
+            this.walkExpr(e.args[2]!); // offset
+            const hasLen = e.args[3] !== undefined;
+            code.i32Const(hasLen ? 1 : 0);
+            if (hasLen) this.walkExpr(e.args[3]!);
+            else code.f64Const(0);
+            code.call(this.bytesB.writeStrHelper(encArg.value));
+            this.emitPendingCheck();
+            return;
+          }
           default:
             this.refuse(`bytesIntrinsic:${e.method}`, e.loc);
             code.unreachable();

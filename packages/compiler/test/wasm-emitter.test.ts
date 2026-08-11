@@ -4791,3 +4791,458 @@ test("bytes: writeNum — fractional/NaN/Infinity value-range validation, measur
   }
   expect(stdout.toString("utf8")).toBe(expected.join("\n") + "\n");
 });
+
+test("bytes: swap16/32/64 — in-place reversal, chains, and Node's constant size-mismatch error", async () => {
+  const res = await buildWasm(
+    "bytes-swap.ts",
+    [
+      "const caught = (fn: () => Buffer): void => {",
+      "  try { console.log(fn().toString('hex')); }",
+      "  catch (e) {",
+      "    const err = e as Error;",
+      "    console.log('caught:' + err.name + ':' + err.message);",
+      "  }",
+      "};",
+      "console.log(Buffer.from([1, 2, 3, 4]).swap16().toString('hex'));",
+      "console.log(Buffer.from([1, 2, 3, 4]).swap32().toString('hex'));",
+      "console.log(Buffer.from([1, 2, 3, 4, 5, 6, 7, 8]).swap64().toString('hex'));",
+      "console.log(Buffer.alloc(0).swap16().toString('hex'));",
+      "const b = Buffer.from([1, 2, 3, 4]);",
+      "const r = b.swap16();",
+      "console.log(r === b);",
+      "caught(() => Buffer.from([1, 2, 3]).swap16());",
+      "caught(() => Buffer.from([1, 2, 3, 4, 5]).swap32());",
+      "caught(() => Buffer.from([1, 2, 3]).swap64());",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "02010403",
+      "04030201",
+      "0807060504030201",
+      "",
+      "true",
+      'caught:RangeError:Buffer size must be a multiple of 16-bits',
+      'caught:RangeError:Buffer size must be a multiple of 32-bits',
+      'caught:RangeError:Buffer size must be a multiple of 64-bits',
+      "",
+    ].join("\n"),
+  );
+});
+
+test("bytes: indexOf/lastIndexOf/includes(+Num) — search family, Node-measured across offsets, empty needle, and alignment", async () => {
+  const res = await buildWasm(
+    "bytes-indexof.ts",
+    [
+      "const b = Buffer.from('hello world hello');",
+      "console.log(b.indexOf('hello'));",
+      "console.log(b.lastIndexOf('hello'));",
+      "console.log(b.indexOf('hello', 1));",
+      "console.log(b.lastIndexOf('hello', 10));",
+      "console.log(b.indexOf('xyz'));",
+      "console.log(b.includes('world'));",
+      "console.log(b.includes('xyz'));",
+      "console.log(b.indexOf(''));",
+      "console.log(b.indexOf('', 100));",
+      "console.log(b.indexOf('hello', -100));",
+      "console.log(b.indexOf('hello', -5));",
+      "console.log(b.lastIndexOf('hello', -100));",
+      "console.log(b.indexOf('l', NaN));",
+      "console.log(b.indexOf(104));",
+      "console.log(b.lastIndexOf(104));",
+      "console.log(b.includes(122));",
+      "console.log(b.indexOf(104, 1));",
+      "const u = Buffer.from('aXaY', 'utf16le');",
+      "console.log(u.toString('hex'));",
+      "console.log(u.indexOf('a', 0, 'utf16le'));",
+      "console.log(u.indexOf('a', 1, 'utf16le'));",
+      "console.log(u.lastIndexOf('a', 'utf16le'));",
+      "console.log(u.lastIndexOf('a', 7, 'utf16le'));",
+      "console.log(u.includes('a', 0, 'utf16le'));",
+      "console.log(u.includes('Z', 0, 'utf16le'));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  const b = Buffer.from("hello world hello");
+  const u = Buffer.from("aXaY", "utf16le");
+  const expected = [
+    b.indexOf("hello"),
+    b.lastIndexOf("hello"),
+    b.indexOf("hello", 1),
+    b.lastIndexOf("hello", 10),
+    b.indexOf("xyz"),
+    b.includes("world"),
+    b.includes("xyz"),
+    b.indexOf(""),
+    b.indexOf("", 100),
+    b.indexOf("hello", -100),
+    b.indexOf("hello", -5),
+    b.lastIndexOf("hello", -100),
+    b.indexOf("l", NaN),
+    b.indexOf(104),
+    b.lastIndexOf(104),
+    b.includes(122),
+    b.indexOf(104, 1),
+    u.toString("hex"),
+    u.indexOf("a", 0, "utf16le"),
+    u.indexOf("a", 1, "utf16le"),
+    u.lastIndexOf("a", "utf16le"),
+    u.lastIndexOf("a", 7, "utf16le"),
+    u.includes("a", 0, "utf16le"),
+    u.includes("Z", 0, "utf16le"),
+    "",
+  ];
+  expect(stdout.toString("utf8")).toBe(expected.join("\n"));
+});
+
+test("bytes: indexOf/lastIndexOf utf16le alignment — every starting offset rounds DOWN to even, both directions (a scr_bytes.c divergence: the C reference rounds forward UP)", async () => {
+  const srcLines: string[] = ["const u = Buffer.from('aXaY', 'utf16le');"];
+  for (let off = 0; off <= 9; off++) {
+    srcLines.push(`console.log(u.indexOf('a', ${off}, 'utf16le'));`);
+    srcLines.push(`console.log(u.lastIndexOf('a', ${off}, 'utf16le'));`);
+  }
+  srcLines.push("");
+  const res = await buildWasm("bytes-indexof-align-sweep.ts", srcLines.join("\n"));
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  const u = Buffer.from("aXaY", "utf16le");
+  const expected: (string | number)[] = [];
+  for (let off = 0; off <= 9; off++) {
+    expected.push(u.indexOf("a", off, "utf16le"));
+    expected.push(u.lastIndexOf("a", off, "utf16le"));
+  }
+  expect(stdout.toString("utf8")).toBe(expected.join("\n") + "\n");
+});
+
+test("bytes: validateOff vs boundsErrorHelper — the SAME input produces two different Node error shapes, pinned explicitly", async () => {
+  // fill/compareBuf/copy/writeStr's validateOffset ladder ("&&", Infinity
+  // classified as "not an integer") is a DIFFERENT error family from
+  // readNum/writeNum's boundsErrorHelper ladder ("and", Infinity falls
+  // through to the range check) — measured directly, not unified. This
+  // test feeds the SAME value (Infinity) through one call from each
+  // family and asserts the two DIFFERENT resulting messages, so a future
+  // refactor can't accidentally merge the two helpers.
+  const res = await buildWasm(
+    "bytes-validateoff-vs-boundserror.ts",
+    [
+      "const caught = (fn: () => void): void => {",
+      "  try { fn(); console.log('no throw'); }",
+      "  catch (e) {",
+      "    const err = e as Error;",
+      "    console.log('caught:' + err.name + ':' + err.message);",
+      "  }",
+      "};",
+      "const w = Buffer.alloc(8);",
+      "caught(() => { w.writeUInt8(1, Infinity); });", // boundsErrorHelper family
+      "caught(() => { w.fill(1, Infinity); });", // validateOff family
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  const w1 = Buffer.alloc(8);
+  const boundsErrorMsg = (() => {
+    try {
+      w1.writeUInt8(1, Infinity);
+      return "no throw";
+    } catch (e) {
+      const err = e as Error;
+      return `caught:${err.name}:${err.message}`;
+    }
+  })();
+  const w2 = Buffer.alloc(8);
+  const validateOffMsg = (() => {
+    try {
+      w2.fill(1, Infinity);
+      return "no throw";
+    } catch (e) {
+      const err = e as Error;
+      return `caught:${err.name}:${err.message}`;
+    }
+  })();
+  // Confirm, in THIS process, that the two messages really do differ —
+  // otherwise this test would silently stop testing anything meaningful.
+  expect(boundsErrorMsg).not.toBe(validateOffMsg);
+  expect(boundsErrorMsg).toContain("It must be >= 0 and <= ");
+  expect(validateOffMsg).toContain("It must be an integer.");
+  expect(stdout.toString("utf8")).toBe([boundsErrorMsg, validateOffMsg, ""].join("\n"));
+});
+
+test("bytes: fill/fillNum/fillStr — pattern application, cycling, edge offsets, and Node-exact validateOff errors", async () => {
+  const res = await buildWasm(
+    "bytes-fill.ts",
+    [
+      "const caught = (fn: () => Buffer): void => {",
+      "  try { console.log(fn().toString('hex')); }",
+      "  catch (e) {",
+      "    const err = e as Error;",
+      "    console.log('caught:' + err.name + ':' + err.message);",
+      "  }",
+      "};",
+      "console.log(Buffer.alloc(5).fill(9).toString('hex'));",
+      "console.log(Buffer.from([1,2,3,4,5]).fill(9, 2, 2).toString('hex'));",
+      "console.log(Buffer.from([1,2,3,4,5]).fill(9, 3, 1).toString('hex'));",
+      "console.log(Buffer.from([1,2,3,4,5]).fill(9, 100).toString('hex'));",
+      "console.log(Buffer.alloc(0).fill(9).toString('hex'));",
+      "console.log(Buffer.alloc(7).fill(Buffer.from([1,2,3])).toString('hex'));",
+      "console.log(Buffer.alloc(2).fill(256 + 65).toString('hex'));",
+      "console.log(Buffer.alloc(2).fill(-1).toString('hex'));",
+      "console.log(Buffer.alloc(4).fill('').toString('hex'));",
+      "console.log(Buffer.alloc(8).fill('ab', 1, 5, 'utf8').toString('hex'));",
+      "const b = Buffer.alloc(4);",
+      "console.log(b.fill(1) === b);",
+      "caught(() => Buffer.from([1,2,3,4,5]).fill(9, -2));",
+      "caught(() => Buffer.from([1,2,3,4,5]).fill(9, 0, 100));",
+      "caught(() => Buffer.alloc(4).fill(Buffer.alloc(0)));",
+      "caught(() => Buffer.alloc(4).fill('a', 1.5));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+
+  const caughtJs = (fn: () => Buffer): string => {
+    try {
+      return fn().toString("hex");
+    } catch (e) {
+      const err = e as Error;
+      return `caught:${err.name}:${err.message}`;
+    }
+  };
+  const expected = [
+    Buffer.alloc(5).fill(9).toString("hex"),
+    Buffer.from([1, 2, 3, 4, 5]).fill(9, 2, 2).toString("hex"),
+    Buffer.from([1, 2, 3, 4, 5]).fill(9, 3, 1).toString("hex"),
+    Buffer.from([1, 2, 3, 4, 5]).fill(9, 100).toString("hex"),
+    Buffer.alloc(0).fill(9).toString("hex"),
+    Buffer.alloc(7).fill(Buffer.from([1, 2, 3])).toString("hex"),
+    Buffer.alloc(2).fill(256 + 65).toString("hex"),
+    Buffer.alloc(2).fill(-1).toString("hex"),
+    Buffer.alloc(4).fill("").toString("hex"),
+    Buffer.alloc(8).fill("ab", 1, 5, "utf8").toString("hex"),
+    "true",
+    caughtJs(() => Buffer.from([1, 2, 3, 4, 5]).fill(9, -2)),
+    caughtJs(() => Buffer.from([1, 2, 3, 4, 5]).fill(9, 0, 100)),
+    caughtJs(() => Buffer.alloc(4).fill(Buffer.alloc(0))),
+    caughtJs(() => Buffer.alloc(4).fill("a", 1.5)),
+    "",
+  ];
+  expect(stdout.toString("utf8")).toBe(expected.join("\n"));
+});
+
+test("bytes: compareBuf — sign of first mismatch, prefix ordering, windowed comparisons, empty windows, and Node-exact validateOff errors", async () => {
+  const res = await buildWasm(
+    "bytes-compare.ts",
+    [
+      "const caught = (fn: () => void): void => {",
+      "  try { fn(); console.log('no throw'); }",
+      "  catch (e) {",
+      "    const err = e as Error;",
+      "    console.log('caught:' + err.name + ':' + err.message);",
+      "  }",
+      "};",
+      "const a = Buffer.from([1,2,3,4]);",
+      "const b = Buffer.from([1,2,3,5]);",
+      "console.log(a.compare(b));",
+      "console.log(b.compare(a));",
+      "console.log(a.compare(Buffer.from([1,2,3,4])));",
+      "console.log(a.compare(b, 0, 3, 0, 3));",
+      "console.log(a.compare(b, 0, 3));",
+      "console.log(Buffer.from([1,2]).compare(Buffer.from([1,2,3])));",
+      "console.log(Buffer.from([1,2,3]).compare(Buffer.from([1,2])));",
+      "console.log(a.compare(b, 2, 2));",
+      "console.log(a.compare(b, 0, 4, 2, 2));",
+      "caught(() => { a.compare(b, 1.5); });",
+      "caught(() => { a.compare(b, -1); });",
+      "caught(() => { a.compare(b, 0, 100); });",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+
+  const a = Buffer.from([1, 2, 3, 4]);
+  const b = Buffer.from([1, 2, 3, 5]);
+  const caughtJs = (fn: () => unknown): string => {
+    try {
+      fn();
+      return "no throw";
+    } catch (e) {
+      const err = e as Error;
+      return `caught:${err.name}:${err.message}`;
+    }
+  };
+  const expected = [
+    a.compare(b),
+    b.compare(a),
+    a.compare(Buffer.from([1, 2, 3, 4])),
+    a.compare(b, 0, 3, 0, 3),
+    a.compare(b, 0, 3),
+    Buffer.from([1, 2]).compare(Buffer.from([1, 2, 3])),
+    Buffer.from([1, 2, 3]).compare(Buffer.from([1, 2])),
+    a.compare(b, 2, 2),
+    a.compare(b, 0, 4, 2, 2),
+    caughtJs(() => a.compare(b, 1.5)),
+    caughtJs(() => a.compare(b, -1)),
+    caughtJs(() => a.compare(b, 0, 100)),
+    "",
+  ];
+  expect(stdout.toString("utf8")).toBe(expected.join("\n"));
+});
+
+test("bytes: copy — overlap-safe memmove, floor-not-trunc coercion, non-finite-args-become-0 (a scr_bytes.c divergence), and Node-exact validateOff errors", async () => {
+  const res = await buildWasm(
+    "bytes-copy.ts",
+    [
+      "const caught = (fn: () => void): void => {",
+      "  try { fn(); console.log('no throw'); }",
+      "  catch (e) {",
+      "    const err = e as Error;",
+      "    console.log('caught:' + err.name + ':' + err.message);",
+      "  }",
+      "};",
+      "const src = Buffer.from([1,2,3,4,5]);",
+      "{ const d = Buffer.alloc(5); const n = src.copy(d); console.log(n + ':' + d.toString('hex')); }",
+      "{ const d = Buffer.alloc(5); const n = src.copy(d, 1.7); console.log(n + ':' + d.toString('hex')); }",
+      "{ const d = Buffer.alloc(5); const n = src.copy(d, 0, 1.7); console.log(n + ':' + d.toString('hex')); }",
+      "{ const d = Buffer.alloc(5); const n = src.copy(d, NaN); console.log(n + ':' + d.toString('hex')); }",
+      "{ const d = Buffer.alloc(5); const n = src.copy(d, Infinity); console.log(n + ':' + d.toString('hex')); }",
+      "{ const d = Buffer.alloc(5); const n = src.copy(d, -Infinity); console.log(n + ':' + d.toString('hex')); }",
+      "{ const d = Buffer.alloc(5); const n = src.copy(d, 0, Infinity); console.log(n + ':' + d.toString('hex')); }",
+      "{ const d = Buffer.alloc(5); const n = src.copy(d, 0, 0, Infinity); console.log(n + ':' + d.toString('hex')); }",
+      "{ const d = Buffer.alloc(5); const n = src.copy(d, 1e20); console.log(n + ':' + d.toString('hex')); }",
+      "{ const d = Buffer.alloc(5); const n = src.copy(d, 100); console.log(n + ':' + d.toString('hex')); }",
+      "{ const buf = Buffer.from([1,2,3,4,5]); const n = buf.copy(buf, 1, 0, 3); console.log(n + ':' + buf.toString('hex')); }",
+      "{ const buf = Buffer.from([1,2,3,4,5]); const n = buf.copy(buf, 0, 2, 5); console.log(n + ':' + buf.toString('hex')); }",
+      "caught(() => { src.copy(Buffer.alloc(5), -1); });",
+      "caught(() => { src.copy(Buffer.alloc(5), -1.5); });",
+      "caught(() => { src.copy(Buffer.alloc(5), 0, -1); });",
+      "caught(() => { src.copy(Buffer.alloc(5), 0, 0, -1); });",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+
+  const src = Buffer.from([1, 2, 3, 4, 5]);
+  const run = (fn: (d: Buffer) => number): string => {
+    const d = Buffer.alloc(5);
+    const n = fn(d);
+    return `${n}:${d.toString("hex")}`;
+  };
+  const caughtJs = (fn: () => unknown): string => {
+    try {
+      fn();
+      return "no throw";
+    } catch (e) {
+      const err = e as Error;
+      return `caught:${err.name}:${err.message}`;
+    }
+  };
+  const buf1 = Buffer.from([1, 2, 3, 4, 5]);
+  const n1 = buf1.copy(buf1, 1, 0, 3);
+  const buf2 = Buffer.from([1, 2, 3, 4, 5]);
+  const n2 = buf2.copy(buf2, 0, 2, 5);
+  const expected = [
+    run((d) => src.copy(d)),
+    run((d) => src.copy(d, 1.7)),
+    run((d) => src.copy(d, 0, 1.7)),
+    run((d) => src.copy(d, NaN)),
+    run((d) => src.copy(d, Infinity)),
+    run((d) => src.copy(d, -Infinity)),
+    run((d) => src.copy(d, 0, Infinity)),
+    run((d) => src.copy(d, 0, 0, Infinity)),
+    run((d) => src.copy(d, 1e20)),
+    run((d) => src.copy(d, 100)),
+    `${n1}:${buf1.toString("hex")}`,
+    `${n2}:${buf2.toString("hex")}`,
+    caughtJs(() => src.copy(Buffer.alloc(5), -1)),
+    caughtJs(() => src.copy(Buffer.alloc(5), -1.5)),
+    caughtJs(() => src.copy(Buffer.alloc(5), 0, -1)),
+    caughtJs(() => src.copy(Buffer.alloc(5), 0, 0, -1)),
+    "",
+  ];
+  expect(stdout.toString("utf8")).toBe(expected.join("\n"));
+});
+
+test("bytes: writeStr — budget clamping (validated length vs remaining-after-offset), utf8/utf16le boundary truncation, and Node-exact errors", async () => {
+  const res = await buildWasm(
+    "bytes-writestr.ts",
+    [
+      "const caught = (fn: () => void): void => {",
+      "  try { fn(); console.log('no throw'); }",
+      "  catch (e) {",
+      "    const err = e as Error;",
+      "    console.log('caught:' + err.name + ':' + err.message);",
+      "  }",
+      "};",
+      "{ const b = Buffer.alloc(8); const n = b.write('hi'); console.log(n + ':' + b.toString('hex')); }",
+      "{ const b = Buffer.alloc(8); const n = b.write('hi', 2); console.log(n + ':' + b.toString('hex')); }",
+      "{ const b = Buffer.alloc(8); const n = b.write('hello', 1, 3); console.log(n + ':' + b.toString('hex')); }",
+      "{ const b = Buffer.alloc(3); const n = b.write('hello', 1); console.log(n + ':' + b.toString('hex')); }",
+      "{ const b = Buffer.alloc(4); const n = b.write('hello', 2, 3); console.log(n + ':' + b.toString('hex')); }",
+      "{ const b = Buffer.alloc(4); const n = b.write('hello', 0, 4); console.log(n + ':' + b.toString('hex')); }",
+      "{ const b = Buffer.alloc(4); const n = b.write('hi', 4); console.log(n + ':' + b.toString('hex')); }",
+      "{ const b = Buffer.alloc(3); const n = b.write('a\\u{1F600}', 0); console.log(n + ':' + b.toString('hex')); }",
+      "{ const b = Buffer.alloc(3); const n = b.write('a\\u{1F600}', 0, 3, 'utf16le'); console.log(n + ':' + b.toString('hex')); }",
+      "{ const b = Buffer.alloc(8); const n = b.write('68656c6c6f', 'hex'); console.log(n + ':' + b.toString('hex')); }",
+      "{ const b = Buffer.alloc(2); const n = b.write('aabbcc', 0, 2, 'hex'); console.log(n + ':' + b.toString('hex')); }",
+      "caught(() => { Buffer.alloc(4).write('hi', 100); });",
+      "caught(() => { Buffer.alloc(4).write('hi', 1.5); });",
+      "caught(() => { Buffer.alloc(4).write('hi', 0, 100); });",
+      "caught(() => { Buffer.alloc(4).write('hi', 0, -1); });",
+      "caught(() => { Buffer.alloc(4).write('hi', 5); });",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+
+  const run = (len: number, fn: (b: Buffer) => number): string => {
+    const b = Buffer.alloc(len);
+    const n = fn(b);
+    return `${n}:${b.toString("hex")}`;
+  };
+  const caughtJs = (fn: () => unknown): string => {
+    try {
+      fn();
+      return "no throw";
+    } catch (e) {
+      const err = e as Error;
+      return `caught:${err.name}:${err.message}`;
+    }
+  };
+  const expected = [
+    run(8, (b) => b.write("hi")),
+    run(8, (b) => b.write("hi", 2)),
+    run(8, (b) => b.write("hello", 1, 3)),
+    run(3, (b) => b.write("hello", 1)),
+    run(4, (b) => b.write("hello", 2, 3)),
+    run(4, (b) => b.write("hello", 0, 4)),
+    run(4, (b) => b.write("hi", 4)),
+    run(3, (b) => b.write("a\u{1F600}", 0)),
+    run(3, (b) => b.write("a\u{1F600}", 0, 3, "utf16le")),
+    run(8, (b) => b.write("68656c6c6f", "hex")),
+    run(2, (b) => b.write("aabbcc", 0, 2, "hex")),
+    caughtJs(() => Buffer.alloc(4).write("hi", 100)),
+    caughtJs(() => Buffer.alloc(4).write("hi", 1.5)),
+    caughtJs(() => Buffer.alloc(4).write("hi", 0, 100)),
+    caughtJs(() => Buffer.alloc(4).write("hi", 0, -1)),
+    caughtJs(() => Buffer.alloc(4).write("hi", 5)),
+    "",
+  ];
+  expect(stdout.toString("utf8")).toBe(expected.join("\n"));
+});
