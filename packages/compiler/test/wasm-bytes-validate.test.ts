@@ -17,6 +17,9 @@
 import { expect, test } from "vitest";
 import { VecBuilder } from "../src/backend/wasm/arrays.js";
 import { Code } from "../src/backend/wasm/code.js";
+import { DynBuilder } from "../src/backend/wasm/dyn.js";
+import { InspectBuilder } from "../src/backend/wasm/inspect.js";
+import { JsonBuilder } from "../src/backend/wasm/json.js";
 import { F64, I32, ModuleBuilder, type ValType } from "../src/backend/wasm/module.js";
 import { BytesBuilder, type BytesElem } from "../src/backend/wasm/typedarrays.js";
 
@@ -305,4 +308,213 @@ test("S034: fromArrLit's allocation-cap guard traps for a u32 source claiming �
   // "unreachable"; asserting it is what proves this test is catching
   // `emitByteSizeGuard`'s own trap and not some other failure downstream.
   expect(() => ex.trap()).toThrow(/unreachable/);
+});
+
+/** Increment 18 stage C: the dyn↔bytes crossing grew a BYTES arm in seven
+ * dyn.ts functions, one json.ts function, and one inspect.ts function —
+ * every one of them a single function covering EVERY dyn KIND, built once
+ * and cached, so a structural bug in the BYTES arm specifically breaks the
+ * WHOLE function's validity even though a corpus program exercising only
+ * NUM/ARR/OBJ would never call it (exactly A1's shape, one level up: this
+ * round's own objWalk bug — a local declared as the ARR-payload type but
+ * fed a `$bytes` ref — passed `compile()` and was only caught when
+ * WebAssembly.instantiate() rejected the actual module). This sweep
+ * forces every one of those functions to build UNCONDITIONALLY, the same
+ * discipline the BytesBuilder sweep above applies to typedarrays.ts.
+ * Deps are structural stubs exactly as above — this checks shape, not
+ * semantics; wasm-bytes-flag.test.ts covers the BYTES arm's BEHAVIOR
+ * (including the isBuffer=true branches no compiled program can reach),
+ * wasm-emitter.test.ts covers the reachable (isBuffer=false) behavior
+ * through real compiled programs. */
+test("dyn.ts/json.ts/inspect.ts: every function with a BYTES arm emits a VALID module (direct, bypassing the frontend)", async () => {
+  const mb = new ModuleBuilder();
+  const strType = mb.arrayType("i16", true);
+  const strRef: ValType = { kind: "ref", nullable: true, typeIndex: strType };
+  const lit = (c: Code, _s: string): void => c.refNull(strType);
+
+  const strEqFn = mb.declareFunc(mb.funcType([strRef, strRef], [I32]), "%stub.strEq");
+  mb.setBody(strEqFn, [], (() => {
+    const c = new Code();
+    c.i32Const(1);
+    return c.bytes();
+  })());
+  const f64ToStrFn = mb.declareFunc(mb.funcType([F64], [strRef]), "%stub.f64ToStr");
+  mb.setBody(f64ToStrFn, [], (() => {
+    const c = new Code();
+    c.refNull(strType);
+    return c.bytes();
+  })());
+  const concatFn = mb.declareFunc(mb.funcType([strRef, strRef], [strRef]), "%stub.concat");
+  mb.setBody(concatFn, [], (() => {
+    const c = new Code();
+    c.localGet(0);
+    return c.bytes();
+  })());
+  const toInt32Fn = mb.declareFunc(mb.funcType([F64], [I32]), "%stub.toInt32");
+  mb.setBody(toInt32Fn, [], (() => {
+    const c = new Code();
+    c.i32Const(0);
+    return c.bytes();
+  })());
+  const strSliceFn = mb.declareFunc(mb.funcType([strRef, F64, F64], [strRef]), "%stub.strSlice");
+  mb.setBody(strSliceFn, [], (() => {
+    const c = new Code();
+    c.localGet(0);
+    return c.bytes();
+  })());
+  const strCpAtFn = mb.declareFunc(mb.funcType([strRef, I32], [I32]), "%stub.strCpAt");
+  mb.setBody(strCpAtFn, [], (() => {
+    const c = new Code();
+    c.i32Const(0);
+    return c.bytes();
+  })());
+  const strCmpU16Fn = mb.declareFunc(mb.funcType([strRef, strRef], [I32]), "%stub.strCmpU16");
+  mb.setBody(strCmpU16Fn, [], (() => {
+    const c = new Code();
+    c.i32Const(0);
+    return c.bytes();
+  })());
+  const strIndexOfFn = mb.declareFunc(mb.funcType([strRef, strRef, F64], [F64]), "%stub.strIndexOf");
+  mb.setBody(strIndexOfFn, [], (() => {
+    const c = new Code();
+    c.f64Const(-1);
+    return c.bytes();
+  })());
+  const strMatchAtFn = mb.declareFunc(mb.funcType([strRef, strRef, I32], [I32]), "%stub.strMatchAt");
+  mb.setBody(strMatchAtFn, [], (() => {
+    const c = new Code();
+    c.i32Const(0);
+    return c.bytes();
+  })());
+
+  const vecs = new VecBuilder(mb, { strEq: () => strEqFn, f64ToStr: () => f64ToStrFn, concat: () => concatFn, lit });
+  const f64VecInfo = vecs.info("vec(f64)", F64, F64, "f64");
+  const bytesB = new BytesBuilder(mb, {
+    concat: () => concatFn,
+    f64ToStr: () => f64ToStrFn,
+    lit,
+    strRef: () => strRef,
+    strType: () => strType,
+    toInt32: () => toInt32Fn,
+    strSlice: () => strSliceFn,
+    f64Vec: () => f64VecInfo,
+    f64VecNewLen: () => vecs.newLen(f64VecInfo),
+    f64VecPush1: () => vecs.pushOne(f64VecInfo),
+    bytesVec: () => vecs.info("vec(bytes:u8)", bytesB.bytesRef(), bytesB.bytesRef(), "ref"),
+    throwError: (c, _cn, _n, pushMessage) => {
+      pushMessage(c);
+      c.drop();
+    },
+  });
+
+  const errT = mb.structType([
+    { storage: I32, mutable: false },
+    { storage: strRef, mutable: true },
+    { storage: strRef, mutable: true },
+    { storage: strRef, mutable: false },
+  ]);
+  const excKindG = mb.addGlobal(I32, true, (w) => {
+    w.u8(0x41);
+    w.sleb(0);
+  });
+
+  let dyn!: DynBuilder;
+  const dynVecInfo = () => vecs.info("dyn", dyn.dynRef(), dyn.dynRef(), "ref");
+  dyn = new DynBuilder(mb, {
+    strRef: () => strRef,
+    strType: () => strType,
+    strEq: () => strEqFn,
+    concat: () => concatFn,
+    f64ToStr: () => f64ToStrFn,
+    lit,
+    throwTypeError: (c, pushMessage) => {
+      pushMessage(c);
+      c.drop();
+    },
+    arrVec: dynVecInfo,
+    arrPush: () => vecs.pushOne(dynVecInfo()),
+    arrNewLen: () => vecs.newLen(dynVecInfo()),
+    strCpAt: () => strCpAtFn,
+    errT: () => errT,
+    errName: () => 1,
+    errMessage: () => 2,
+    errCode: () => 3,
+    throwError: (c, _cn, _n, pushMessage) => {
+      pushMessage(c);
+      c.drop();
+    },
+    excKind: () => excKindG,
+    strCmpU16: () => strCmpU16Fn,
+    strSlice: () => strSliceFn,
+    strIndexOf: () => strIndexOfFn,
+    strMatchAt: () => strMatchAtFn,
+    bytesRefU8: () => bytesB.bytesRef(),
+    bytesTypeU8: () => bytesB.bytesType(),
+    bytesLen: () => bytesB.length(),
+    bytesGet: () => bytesB.get("u8"),
+    bytesSet: () => bytesB.setElem("u8"),
+    bytesToStrUtf8: () => bytesB.toStrHelper("utf8"),
+  });
+
+  const json = new JsonBuilder(mb, {
+    strRef: () => strRef,
+    strType: () => strType,
+    concat: () => concatFn,
+    f64ToStr: () => f64ToStrFn,
+    lit,
+    throwError: (c, _cn, _n, pushMessage) => {
+      pushMessage(c);
+      c.drop();
+    },
+    excKind: () => excKindG,
+    clearExc: (c) => {
+      c.i32Const(0);
+      c.globalSet(excKindG);
+    },
+    newDynVec: (c) => {
+      c.f64Const(0);
+      c.call(vecs.newLen(dynVecInfo()));
+    },
+    dyn: () => dyn,
+    bytesRefU8: () => bytesB.bytesRef(),
+    bytesGet: () => bytesB.get("u8"),
+  });
+
+  const insp = new InspectBuilder(mb, {
+    strRef: () => strRef,
+    strType: () => strType,
+    lit,
+    f64ToStr: () => f64ToStrFn,
+    errT: () => errT,
+    errName: () => 1,
+    errMessage: () => 2,
+    errCode: () => 3,
+    dyn: () => dyn,
+    inspF64: () => f64ToStrFn,
+    throwError: (c, _cn, _n, pushMessage) => {
+      pushMessage(c);
+      c.drop();
+    },
+    excKind: () => excKindG,
+    bytesRefU8: () => bytesB.bytesRef(),
+    bytesLen: () => bytesB.length(),
+    bytesGet: () => bytesB.get("u8"),
+  });
+
+  // Every dyn.ts function whose BYTES arm this increment added, plus
+  // json.ts's stringifyDyn (putDyn's entry point) and inspect.ts's dyn
+  // walker — forced UNCONDITIONALLY, the sweep's whole point.
+  dyn.strictEq();
+  dyn.hasOwn();
+  dyn.objWalk();
+  dyn.keyGet();
+  dyn.keySet();
+  dyn.toStr();
+  dyn.kindName();
+  json.stringifyDyn();
+  insp.dyn();
+
+  const bytes = mb.emit();
+  expect(WebAssembly.validate(bytes)).toBe(true);
+  await expect(WebAssembly.instantiate(bytes, {})).resolves.toBeDefined();
 });

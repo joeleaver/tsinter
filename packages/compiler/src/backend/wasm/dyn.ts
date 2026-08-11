@@ -197,6 +197,19 @@ const EQ_HEAP = -0x13;
 const VEC_LEN = 0;
 const VEC_BUF = 1;
 
+/** `$dynBytes`'s field indices. `isBuffer` is the flag C carries beside
+ * the kind (the header's rule: flags never become kind ids) — mirrors
+ * `$dynObj`'s `nullProto` exactly. Increment 18 stage C: the flag's
+ * value at the ONE generic crossing site is currently always `false`
+ * (SEMANTICS.md S037 — the IR has no surviving Buffer-vs-Uint8Array
+ * marker by the time a value reaches `dynFrom`, matching a pre-existing
+ * gap on the C/LLVM lanes' own generic crossing site), but every
+ * CONSUMER here reads the flag for real, so a future provenance fix is a
+ * one-line change at the construction site, not a second pass through
+ * every arm. */
+export const BYTES_PAYLOAD_REF = 0;
+export const BYTES_PAYLOAD_IS_BUFFER = 1;
+
 export interface DynDeps {
   /** The tier's string valtype — `(ref null (array (mut i16)))`. */
   strRef: () => ValType;
@@ -260,6 +273,33 @@ export interface DynDeps {
   /** %w.str.matchAt — (s, needle, i32 at) → i32. `lastIndexOf`'s backward
    * scan is a loop over it (the tier has no lastIndexOf of its own). */
   strMatchAt: () => number;
+  /** The tier's ONE bytes<u8> valtype (typedarrays.ts) — the SAME struct
+   * every elem kind shares, needed here as the DK.BYTES payload's element
+   * type. Non-u8 elems never reach this file (the emitter's dynFrom/
+   * dynMatch/dynCheck refuse them by name before calling in). */
+  bytesRefU8: () => ValType;
+  /** The bytes<u8> STRUCT type index (refCast on extraction). */
+  bytesTypeU8: () => number;
+  /** %w.bytes.length:u8 — (bytes<u8>) → f64 element count (== byte count
+   * for u8). Reused here rather than re-deriving a BLEN field read, since
+   * typedarrays.ts already owns that struct's layout privately. */
+  bytesLen: () => number;
+  /** %w.bytes.get:u8 — (bytes<u8>, f64 index) → f64 byte value. OOB
+   * TRAPS (S003) — every caller here bounds-checks first (canonIdx +
+   * bytesLen), matching the ARR/STR arms' own discipline. */
+  bytesGet: () => number;
+  /** %w.bytes.set:u8 — (bytes<u8>, f64 index, f64 value) → (); OOB TRAPS
+   * — every caller here bounds-checks first, same discipline as
+   * `bytesGet`. Coerces the value JS-exactly (stage A: modular ToUint8),
+   * matching a typed-array element assignment's own coercion. */
+  bytesSet: () => number;
+  /** %w.bytes.toStr:utf8 — (bytes<u8>) → str; Buffer's default
+   * `toString()`/`String(buf)` decode (stage B, already Node-exact WHATWG
+   * replacement behavior). Only the ISBUFFER arm of `toStr` calls this —
+   * a plain Uint8Array's default stringification joins ELEMENT VALUES
+   * with commas instead (measured: `String(new Uint8Array([1,2,3]))` is
+   * `"1,2,3"`, not a UTF-8 decode). */
+  bytesToStrUtf8: () => number;
 }
 
 export class DynBuilder {
@@ -268,6 +308,7 @@ export class DynBuilder {
   private entryType: number | null = null;
   private objType: number | null = null;
   private objEntriesType: number | null = null;
+  private bytesPayloadType: number | null = null;
   private fnType: number | null = null;
   private thunkSigType: number | null = null;
   private readonly consts = new Map<string, number>();
@@ -460,6 +501,77 @@ export class DynBuilder {
     pushDyn(c);
     c.structGet(this.dynT(), DYN_REF);
     c.refCast(this.objT());
+  }
+
+  /* ── the BYTES payload (increment 18 stage C) ──────────────────────────
+   * `$dynBytes` — { bytes: bytes<u8> ref, isBuffer: i32 } — mirrors
+   * `$dynObj`'s shape exactly (a payload struct wrapping the real value
+   * plus a flag). Unlike every OTHER composite payload, this one ALIASES:
+   * `bytes` holds the SAME `$bytes` struct reference the source value
+   * already had, never a copy (SEMANTICS.md S014's registered bytes
+   * exception — acyclic-by-construction, so the cycle-safety argument
+   * that keeps every OTHER composite copying does not apply here). ───── */
+
+  /** `$dynBytes`'s struct type — const fields (construction-complete like
+   * `$dyn` itself; nothing here ever needs a write after `struct.new`,
+   * since the flag is fixed at crossing time and the aliased ref never
+   * changes identity). */
+  bytesPayloadT(): number {
+    this.bytesPayloadType ??= this.mb.openStructType("dyn:bytes", [
+      { storage: this.deps.bytesRefU8(), mutable: false },
+      { storage: I32, mutable: false },
+    ]);
+    return this.bytesPayloadType;
+  }
+
+  bytesPayloadRef(): ValType {
+    return { kind: "ref", nullable: true, typeIndex: this.bytesPayloadT() };
+  }
+
+  /** A fresh BYTES payload wrapping the ALIASED `$bytes` ref the caller
+   * pushes — PUSH ORDER: (bytesRef, isBuffer already pushed by caller as
+   * i32). No copy anywhere in this file; the copy-vs-alias decision was
+   * already made by the caller choosing what to push. */
+  pushNewBytesPayload(c: Code, pushBytes: (c: Code) => void, pushIsBuffer: (c: Code) => void): void {
+    pushBytes(c);
+    pushIsBuffer(c);
+    c.structNew(this.bytesPayloadT());
+  }
+
+  /** Wrap a BYTES payload the caller pushes into a DK.BYTES box. */
+  boxBytes(c: Code, pushPayload: (c: Code) => void): void {
+    c.i32Const(DK.BYTES);
+    c.f64Const(0);
+    pushPayload(c);
+    c.structNew(this.dynT());
+  }
+
+  /** From a `$dyn` the caller pushes, its BYTES payload struct (the
+   * `{bytes, isBuffer}` wrapper — NOT the `$bytes` ref itself; callers
+   * needing the raw bytes value chain through `bytesPayloadBytes` too). */
+  bytesPayload(c: Code, pushDyn: (c: Code) => void): void {
+    pushDyn(c);
+    c.structGet(this.dynT(), DYN_REF);
+    c.refCast(this.bytesPayloadT());
+  }
+
+  /** From a `$dyn` the caller pushes, the ALIASED `$bytes` ref directly —
+   * the extraction-direction helper (`dynMatch`/`dynCheck`'s bytes<u8>
+   * arm): both directions of the boundary alias, so this returns the
+   * SAME reference `dynFrom` originally boxed, not a fresh struct. */
+  bytesPayloadBytes(c: Code, pushDyn: (c: Code) => void): void {
+    this.bytesPayload(c, pushDyn);
+    c.structGet(this.bytesPayloadT(), BYTES_PAYLOAD_REF);
+  }
+
+  /** The `$bytes` ref's element count as i32 — `deps.bytesLen` returns
+   * f64 (typedarrays.ts's own convention), truncated back down for the
+   * i32 index-bound comparisons every caller here needs. Public: json.ts's
+   * dyn-root stringify walk needs the same bound. */
+  bytesLenI32(c: Code, pushBytes: (c: Code) => void): void {
+    pushBytes(c);
+    c.call(this.deps.bytesLen());
+    c.i32TruncF64S();
   }
 
   /** %w.vec.push1:dyn — the ARR builders' append. */
@@ -915,6 +1027,25 @@ export class DynBuilder {
         c.structGet(dynT, DYN_REF);
         c.refEq();
       });
+      // BYTES compares the ALIASED `$bytes` PAYLOAD, never the `$dynBytes`
+      // WRAPPER and never the `$dyn` BOX — deliberately NOT the ARR/OBJ/
+      // BYTES box-identity default just below. Those two kinds always
+      // COPY on crossing (S014), so a box comparison and a payload
+      // comparison coincide for them (every crossing mints a fresh box
+      // AND a fresh payload together). BYTES is S014's registered
+      // exception: it ALIASES, so the SAME source value crossing `unknown`
+      // via two independent `dynFrom` calls produces two DIFFERENT boxes
+      // (and, since `pushNewBytesPayload` also runs per call, two
+      // different `$dynBytes` wrappers) around the IDENTICAL `$bytes`
+      // ref — Node's `u1 === u2` is true there (erased casts hand back
+      // the same object), so this must compare past both wrapper layers
+      // to the shared payload to agree (SEMANTICS.md's S014 bytes
+      // amendment, unit-pinned: "crossing twice is === through unknown").
+      this.arm(c, K, [DK.BYTES], () => {
+        this.bytesPayloadBytes(c, (x) => x.localGet(0));
+        this.bytesPayloadBytes(c, (x) => x.localGet(1));
+        c.refEq();
+      });
       // HANDLE and JSVAL have their OWN arms in C and do NOT fall into the
       // default: a handle compares its payload (tag + pointer,
       // scr_json.c:2297) and an island value routes to the ENGINE's
@@ -922,9 +1053,10 @@ export class DynBuilder {
       // this tier, so neither may borrow the box-identity answer below —
       // that would be a wrong answer rather than a loud one.
       this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => c.unreachable());
-      // ARR/OBJ/BYTES — and ONLY those three: C's `default: return a == b`
-      // (scr_json.c:2310). Node identity is the dyn tree's object identity
-      // because those kinds are never reboxed.
+      // ARR/OBJ — and ONLY those two now (BYTES has its own arm above):
+      // C's `default: return a == b` (scr_json.c:2310). Node identity is
+      // the dyn tree's object identity because those kinds are never
+      // reboxed.
       c.localGet(0);
       c.localGet(1);
       c.refEq();
@@ -1084,6 +1216,8 @@ export class DynBuilder {
       const A = 5;
       const E = 6;
       const O = 7;
+      const BP = 8;
+      const BR = 9;
       const concat = this.deps.concat();
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
@@ -1212,13 +1346,84 @@ export class DynBuilder {
         this.deps.lit(c, "() { [native code] }");
         c.call(concat);
       });
-      // BYTES' text depends on the Buffer flag, which lives in a payload
-      // that arrives with the typed-array work. Unconstructible until
-      // then.
+      // BYTES' text depends on the Buffer flag: a plain Uint8Array joins
+      // ELEMENT VALUES with commas (Array.prototype.toString's own rule,
+      // typed arrays inherit it — measured: `String(new Uint8Array([1,2,
+      // 3]))` is "1,2,3"); a Buffer instead runs its own `toString()`
+      // override, a UTF-8 decode (stage B's `toStrHelper("utf8")`,
+      // already Node-exact WHATWG replacement behavior) — measured:
+      // `String(Buffer.from([1,2,3]))` is three control characters, NOT
+      // "1,2,3". The isBuffer flag is currently always false at the one
+      // generic crossing site (SEMANTICS.md S037), so only the comma-join
+      // half is reachable TODAY — the branch is built anyway so the day
+      // the flag can be true, nothing here needs revisiting.
+      this.arm(c, K, [DK.BYTES], () => {
+        this.bytesPayload(c, (x) => x.localGet(0));
+        c.localTee(BP);
+        c.structGet(this.bytesPayloadT(), BYTES_PAYLOAD_IS_BUFFER);
+        c.ifResult(this.deps.strRef());
+        c.localGet(BP);
+        c.structGet(this.bytesPayloadT(), BYTES_PAYLOAD_REF);
+        c.call(this.deps.bytesToStrUtf8());
+        c.else_();
+        this.deps.lit(c, "");
+        c.localSet(OUT);
+        c.localGet(BP);
+        c.structGet(this.bytesPayloadT(), BYTES_PAYLOAD_REF);
+        c.localSet(BR);
+        this.bytesLenI32(c, (x) => x.localGet(BR));
+        c.localSet(N);
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(N);
+        c.i32GeU();
+        c.brIf(1);
+        c.localGet(I);
+        c.i32Const(0);
+        c.i32Ne();
+        c.ifVoid();
+        c.localGet(OUT);
+        this.deps.lit(c, ",");
+        c.call(concat);
+        c.localSet(OUT);
+        c.end();
+        c.localGet(OUT);
+        c.localGet(BR);
+        c.localGet(I);
+        c.f64ConvertI32U();
+        c.call(this.deps.bytesGet());
+        c.call(this.deps.f64ToStr());
+        c.call(concat);
+        c.localSet(OUT);
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        c.localGet(OUT);
+        c.end();
+      });
+      // HANDLE and JSVAL remain unconstructible on this tier.
+      this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => c.unreachable());
       c.unreachable();
       this.mb.setBody(
         idx,
-        [I32, this.deps.strRef(), I32, I32, this.arrRef(), this.dynRef(), this.objRef()],
+        [
+          I32,
+          this.deps.strRef(),
+          I32,
+          I32,
+          this.arrRef(),
+          this.dynRef(),
+          this.objRef(),
+          this.bytesPayloadRef(),
+          this.deps.bytesRefU8(),
+        ],
         c.bytes(),
       );
     });
@@ -1532,6 +1737,41 @@ export class DynBuilder {
           c.end();
           c.globalGet(this.undefinedGlobal());
         });
+        // BYTES: the ARR arm with the element source swapped. "length"
+        // still READS correctly here (this is keyGet, not hasOwn/objWalk
+        // — being own-key-absent doesn't make it unreadable, exactly
+        // like `"abc".length` reading fine despite string length also
+        // being non-own on primitives' boxed form).
+        this.arm(c, K, [DK.BYTES], () => {
+          this.pushIsLength(c, (x) => x.localGet(1));
+          c.ifVoid();
+          this.boxNum(c, (x) => {
+            this.bytesLenI32(x, (y) => this.bytesPayloadBytes(y, (z) => z.localGet(0)));
+            x.f64ConvertI32U();
+          });
+          c.return_();
+          c.end();
+          c.localGet(1);
+          c.call(this.canonIdx());
+          c.localTee(IDX);
+          c.i32Const(0);
+          c.i32GeS();
+          c.ifVoid();
+          c.localGet(IDX);
+          this.bytesLenI32(c, (x) => this.bytesPayloadBytes(x, (y) => y.localGet(0)));
+          c.i32LtU();
+          c.ifVoid();
+          this.boxNum(c, (x) => {
+            this.bytesPayloadBytes(x, (y) => y.localGet(0));
+            x.localGet(IDX);
+            x.f64ConvertI32U();
+            x.call(this.deps.bytesGet());
+          });
+          c.return_();
+          c.end();
+          c.end();
+          c.globalGet(this.undefinedGlobal());
+        });
         this.arm(c, K, [DK.STR], () => {
           this.pushIsLength(c, (x) => x.localGet(1));
           c.ifVoid();
@@ -1616,8 +1856,9 @@ export class DynBuilder {
           c.end();
           c.globalGet(this.undefinedGlobal());
         });
-        // BYTES, HANDLE and JSVAL are unconstructible on this tier.
-        this.arm(c, K, [DK.BYTES, DK.HANDLE, DK.JSVAL], () => c.unreachable());
+        // BYTES has its OWN arm above now; HANDLE and JSVAL are still
+        // unconstructible on this tier.
+        this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => c.unreachable());
         // NUM and BOOL have no own properties: JS reads undefined.
         c.globalGet(this.undefinedGlobal());
         this.mb.setBody(idx, [I32, I32, this.dynRef(), this.deps.strRef()], c.bytes());
@@ -1691,6 +1932,60 @@ export class DynBuilder {
         (x) => x.localGet(IDX),
         (x) => x.localGet(2),
       );
+      c.return_();
+      c.end();
+      c.end();
+      // BYTES takes index writes too, but UNLIKE ARR does not grow: a
+      // canonical numeric index at or past the current length is a
+      // SILENT NO-OP (measured: `u[10] = 5` on a length-3 Uint8Array
+      // changes nothing, no throw, no growth — typed arrays are FIXED-
+      // length, matching the spec's integer-indexed-exotic-object OOB
+      // rule; JS arrays instead auto-grow, which is why ARR's arm above
+      // pads with undefined and this one does not). A non-canonical key
+      // (canonIdx < 0) falls through to the shared throw below, same as
+      // ARR's own non-index fallthrough (S016's precedent: this tier's
+      // bytes payload has no property table any more than the array
+      // payload does, so a named expando write — which Node DOES allow
+      // on a real typed array, measured: `u.foo = "x"` becomes a real
+      // own property — cannot be represented here either).
+      c.localGet(K);
+      c.i32Const(DK.BYTES);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(1);
+      c.call(this.canonIdx());
+      c.localTee(IDX);
+      c.i32Const(0);
+      c.i32GeS();
+      c.ifVoid();
+      c.localGet(IDX);
+      this.bytesLenI32(c, (x) => this.bytesPayloadBytes(x, (y) => y.localGet(0)));
+      c.i32LtU();
+      c.ifVoid();
+      // The value must already be a NUM to coerce like a typed-array
+      // element write — this tier has no general dyn ToNumber (idxArg's
+      // own precedent, same file: "Node would ToNumber-coerce it and
+      // this tier has no coercion"), so anything else is the SAME loud
+      // runtime TypeError idxArg throws, not a silent wrong answer.
+      c.localGet(2);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.NUM);
+      c.i32Eq();
+      c.ifVoid();
+      this.bytesPayloadBytes(c, (x) => x.localGet(0));
+      c.localGet(IDX);
+      c.f64ConvertI32U();
+      c.localGet(2);
+      c.structGet(dynT, DYN_NUM);
+      c.call(this.deps.bytesSet());
+      c.else_();
+      this.deps.throwTypeError(c, (x) =>
+        this.deps.lit(x, "non-number values on a dynamic bytes write are not supported yet"),
+      );
+      c.end();
+      c.return_();
+      c.end();
+      // Numeric but out of range: silent no-op, matching Node exactly.
       c.return_();
       c.end();
       c.end();
@@ -1849,6 +2144,30 @@ export class DynBuilder {
         c.else_();
         c.i32Const(0);
         c.end();
+        c.end();
+      });
+      // BYTES: canonical in-range indices ONLY — NOT "length", unlike the
+      // ARR/STR arm just above. Measured directly: `Object.hasOwn([1,2],
+      // "length")` and `Object.hasOwn("ab", "length")` are both true
+      // (array/string length IS a real own property, non-enumerable but
+      // present), while `Object.hasOwn(new Uint8Array(2), "length")` is
+      // FALSE — `Object.getOwnPropertyNames(new Uint8Array(n))` lists only
+      // the numeric indices; TypedArray's `length` is an INHERITED
+      // prototype accessor, not an own slot. `keyGet`'s "length" handling
+      // is unaffected (reading `u["length"]` still answers correctly —
+      // this is only about OWN-ness, not readability).
+      this.arm(c, K, [DK.BYTES], () => {
+        c.localGet(1);
+        c.call(this.canonIdx());
+        c.localTee(IDX);
+        c.i32Const(0);
+        c.i32GeS();
+        c.ifResult(I32);
+        c.localGet(IDX);
+        this.bytesLenI32(c, (x) => this.bytesPayloadBytes(x, (y) => y.localGet(0)));
+        c.i32LtU();
+        c.else_();
+        c.i32Const(0);
         c.end();
       });
       // The two members a FUNC box owns — keyGet's arm, asked the other
@@ -2048,6 +2367,7 @@ export class DynBuilder {
       const A = 13;
       const S = 14;
       const CP = 15;
+      const AB = 16;
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
@@ -2055,10 +2375,9 @@ export class DynBuilder {
         this.pushToObjectFail(c);
         c.refNull(dynT);
       });
-      // The ENGINE walks its own object in C (own-key order, getters
-      // running); a BYTES receiver lists its byte indices. Neither is
+      // The ENGINE walks its own object in C. Neither JSVAL nor HANDLE is
       // constructible here.
-      this.arm(c, K, [DK.BYTES, DK.JSVAL, DK.HANDLE], () => c.unreachable());
+      this.arm(c, K, [DK.JSVAL, DK.HANDLE], () => c.unreachable());
       this.pushNewArr(c);
       c.localSet(OUT);
       this.arm(c, K, [DK.OBJ], () => {
@@ -2224,6 +2543,52 @@ export class DynBuilder {
         c.end();
         this.boxArr(c, (x) => x.localGet(OUT));
       });
+      // BYTES lists its byte indices, ARR's arm with the element source
+      // swapped — own keys are numeric indices ONLY (measured:
+      // `Object.getOwnPropertyNames(new Uint8Array(n))` never includes
+      // "length", unlike arrays/strings — hasOwn's arm has the same
+      // measurement).
+      this.arm(c, K, [DK.BYTES], () => {
+        this.bytesPayloadBytes(c, (x) => x.localGet(0));
+        c.localSet(AB);
+        this.bytesLenI32(c, (x) => x.localGet(AB));
+        c.localSet(N);
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(N);
+        c.i32GeU();
+        c.brIf(1);
+        this.walkPush(
+          c,
+          MODE,
+          OUT,
+          PAIR,
+          (x) => {
+            x.localGet(I);
+            x.f64ConvertI32U();
+            x.call(this.deps.f64ToStr());
+          },
+          (x) => {
+            this.boxNum(x, (y) => {
+              y.localGet(AB);
+              y.localGet(I);
+              y.f64ConvertI32U();
+              y.call(this.deps.bytesGet());
+            });
+          },
+        );
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        this.boxArr(c, (x) => x.localGet(OUT));
+      });
       this.arm(c, K, [DK.STR], () => {
         c.localGet(0);
         c.structGet(dynT, DYN_REF);
@@ -2289,6 +2654,7 @@ export class DynBuilder {
           this.arrRef(),
           this.deps.strRef(),
           this.deps.strRef(),
+          this.deps.bytesRefU8(),
         ],
         c.bytes(),
       );
@@ -2378,7 +2744,9 @@ export class DynBuilder {
       });
       // The index-keyed sources go through their own ENTRIES walk, which
       // is what makes the copied keys agree with Object.keys by
-      // construction. (BYTES belongs here in C; objWalk traps on one.)
+      // construction. (BYTES belongs here in C too; its own objWalk arm
+      // — increment 18 stage C — answers this correctly now, no special
+      // case needed here.)
       this.arm(c, K, [DK.ARR, DK.STR, DK.BYTES], () => {
         c.localGet(1);
         c.i32Const(2); // ENTRIES
@@ -2807,7 +3175,26 @@ export class DynBuilder {
       this.arm(c, K, [DK.ARR], () => this.deps.lit(c, "array"));
       this.arm(c, K, [DK.OBJ], () => this.deps.lit(c, "object"));
       this.arm(c, K, [DK.UNDEF], () => this.deps.lit(c, "undefined"));
-      this.arm(c, K, [DK.BYTES], () => this.deps.lit(c, "Uint8Array"));
+      // This function's OWN consumer (keySet's "Cannot create property
+      // 'x' on Y" fallthrough — a divergence to begin with, S016's
+      // precedent: Node never throws there for a real Buffer OR a plain
+      // Uint8Array, so there is nothing in Node to check either flavor's
+      // wording against) still needs the RIGHT noun, not just A noun —
+      // Node's broader convention of naming values by their EXACT
+      // constructor (measured elsewhere: `Buffer.compare(a, new
+      // Uint32Array(1))` → "...Received an instance of Uint32Array", a
+      // DIFFERENT message family kindName does not feed today — board
+      // #26) is what justifies making the flag decide "Buffer" vs
+      // "Uint8Array" here too, not a fixed literal.
+      this.arm(c, K, [DK.BYTES], () => {
+        this.bytesPayload(c, (x) => x.localGet(0));
+        c.structGet(this.bytesPayloadT(), BYTES_PAYLOAD_IS_BUFFER);
+        c.ifResult(this.deps.strRef());
+        this.deps.lit(c, "Buffer");
+        c.else_();
+        this.deps.lit(c, "Uint8Array");
+        c.end();
+      });
       this.arm(c, K, [DK.FUNC], () => this.deps.lit(c, "function"));
       this.arm(c, K, [DK.PROMISE], () => this.deps.lit(c, "Promise"));
       this.arm(c, K, [DK.JSVAL], () => this.deps.lit(c, "an island value"));

@@ -1238,6 +1238,18 @@ const TIER_FLOOR: string[] = [
   "1407-dataview-bounds.ts",
   "2560-arraybuffer-dataview-set.ts",
   "2625-bytes-views.ts",
+  // Increment 18 stage C, round R2: dyn↔bytes crossing (dynFrom/dynCheck/
+  // dynMatch/dynTest over bytes<u8>, SEMANTICS.md S014's bytes-aliasing
+  // amendment). 916 exercises extraction, the aliased keyed reads,
+  // String(), and JSON.stringify over a dyn-crossed Buffer/Uint8Array —
+  // the outer dynFrom/dynCheck dispatch-gate fix and the objWalk local-
+  // type fix (this round's two real bugs) both claim through it. 1451
+  // exercises the OTHER capture direction, `instanceof Uint8Array`
+  // narrowing (dynTest/dynMatch) over mixed dyn kinds including negated
+  // flow and a Buffer receiver — DYN_TEST_KINDS already had DK.BYTES
+  // wired from R1, so this one claimed without needing a fix of its own.
+  "916-unknown-bytes.ts",
+  "1451-instanceof-uint8array-unknown.ts",
 ];
 
 interface RunResult {
@@ -1496,13 +1508,32 @@ describe(`wasm differential corpus (${files.length} programs${shardSuffix()})`, 
     },
   );
 
-  test("tier floor: pinned programs stay claimed", () => {
-    // Under a shard, only the floor programs THIS slice ran can be
-    // asserted (same key as the corpus split above); the shard union
-    // covers the whole list.
-    for (const name of shardSelect(TIER_FLOOR, (n) => n)) {
-      expect(claimed, `${name} regressed out of the wasm tier`).toContain(name);
-    }
+  test("tier floor: EXACTLY the claimed set, both directions", () => {
+    // TIER_FLOOR is not a curated highlight subset — it is a complete
+    // mirror of the claimed set, one entry per claimed program (538 in,
+    // 538 pinned, checked below). A SUBSET check (every floor name is
+    // claimed) only catches a REGRESSION — a program falling out of the
+    // tier — and was blind to the opposite drift: a compiler change that
+    // newly claims a program nobody added to TIER_FLOOR passes a subset
+    // check identically at 537 pinned names or at 1, because it never
+    // looks at what claimed contains that the floor doesn't. That gap
+    // shipped three consecutive rounds with an unpinned claim sitting in
+    // the tier unnoticed. This is the real check: exact set equality,
+    // with a set-difference printout on mismatch naming every program on
+    // the wrong side, not just the count.
+    //
+    // Under a shard, only THIS slice's programs can be compared (same key
+    // as the corpus split above); the shard union covers the whole list.
+    const floorHere = new Set(shardSelect(TIER_FLOOR, (n) => n));
+    const claimedHere = new Set(claimed);
+    const missingFromClaimed = [...floorHere].filter((n) => !claimedHere.has(n)).sort();
+    const missingFromFloor = [...claimedHere].filter((n) => !floorHere.has(n)).sort();
+    expect(
+      { missingFromClaimed, missingFromFloor },
+      missingFromClaimed.length || missingFromFloor.length
+        ? `TIER_FLOOR and the claimed set disagree — pinned-but-not-claimed (regressions): ${JSON.stringify(missingFromClaimed)}; claimed-but-not-pinned (unpinned new claims): ${JSON.stringify(missingFromFloor)}`
+        : undefined,
+    ).toEqual({ missingFromClaimed: [], missingFromFloor: [] });
   });
 
   afterAll(() => {

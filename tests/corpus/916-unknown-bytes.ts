@@ -1,7 +1,9 @@
 // Uint8Array/Buffer values crossing into `unknown`: the checked-dynamic tree's bytes kind —
-// conversion on the way in (a copy, the boundary stance), checked-cast
-// extraction on the way out (another copy), Node-exact String() (elements
-// joined) and JSON.stringify (the index-keyed object form). The stdin
+// construction ALIASES the source's storage on the way in and a checked-
+// cast extraction on the way out hands back that SAME reference (S014's
+// bytes amendment, increment 18 stage C — every OTHER composite kind
+// still copies both ways), Node-exact String() (elements joined) and
+// JSON.stringify (the index-keyed object form). The stdin
 // toBytes(chunk: unknown) pattern.
 
 function toBytes(chunk: unknown): Uint8Array {
@@ -26,16 +28,20 @@ scratch.buf = new Uint8Array([1, 2, 3]);
 console.log(String(scratch.buf), (scratch.buf as Uint8Array).length);
 console.log(JSON.stringify(scratch));
 
-// Extraction is a fresh value each time (both directions copy — the
-// documented aliasing divergence is asserted in the dyncheck harness, not
-// against Node); the BYTES are value-exact.
+// Extraction hands back the SAME `$bytes` reference each time (S014's
+// bytes amendment: both directions of the boundary alias, never copy —
+// pinned by identity, not just value, in the wasm emitter unit test).
+// Nothing mutates `scratch.buf` between the two reads below, so the
+// printed sum is the same whether this tier aliases or copies; the
+// aliasing itself is what the unit test asserts, not this program.
 const again = scratch.buf as Uint8Array;
 console.log(again[0] + again[1] + again[2]);
 
 // Buffer is bytes<u8> too. (String() of an unknown holding a BUFFER joins
 // the elements like a Uint8Array — Node decodes UTF-8 there; the checked-dynamic tree
-// cannot tell the two apart. SEMANTICS.md documents it; not asserted here
-// where Node is the oracle.)
+// cannot tell the two apart, on any lane, at this generic crossing site.
+// SEMANTICS.md S037 documents it; not asserted here where Node is the
+// oracle.)
 const buf = Buffer.from("hi");
 const ub: unknown = buf;
 console.log((ub as Uint8Array).length, (ub as Uint8Array)[0]);

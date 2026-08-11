@@ -114,7 +114,17 @@
  * the whole exposure. (scr_inspect.c:142-143 attributes the difference to
  * NFC alone; fixing the C is not this increment's business.) */
 import { Code } from "./code.js";
-import { DK, DYN_KIND, DYN_NUM, DYN_REF, FN_NAME, OBJ_LEN, OBJ_NULL_PROTO, type DynBuilder } from "./dyn.js";
+import {
+  BYTES_PAYLOAD_IS_BUFFER,
+  DK,
+  DYN_KIND,
+  DYN_NUM,
+  DYN_REF,
+  FN_NAME,
+  OBJ_LEN,
+  OBJ_NULL_PROTO,
+  type DynBuilder,
+} from "./dyn.js";
 import { F64, I32, ModuleBuilder, type ValType } from "./module.js";
 
 /** Node's `ctx.maxStringLength` default (inspectDefaultOptions). */
@@ -186,6 +196,13 @@ export interface InspectDeps {
    * recursive step of the walker tests it, so a fence deep in a tree
    * unwinds instead of rendering the rest into a string nobody reads. */
   excKind: () => number;
+  /** The `$bytes` struct's wasm ref type, and its element accessors —
+   * `bufferForm`'s hex render and the dyn walker's BYTES arm need both,
+   * the same helpers typedarrays.ts's own accessors and json.ts's putDyn
+   * BYTES arm already use. */
+  bytesRefU8: () => ValType;
+  bytesLen: () => number;
+  bytesGet: () => number;
 }
 
 export class InspectBuilder {
@@ -1732,6 +1749,140 @@ export class InspectBuilder {
     });
   }
 
+  /** Pushes the lowercase hex digit CHARACTER for the i32 0-15 value in
+   * local D — typedarrays.ts's own `emitHexDigit`, repeated here for the
+   * same reason `kindArm` is: this file needs nothing from that one but
+   * the four-line computation. */
+  private hexDigit(c: Code, D: number): void {
+    c.localGet(D);
+    c.i32Const(10);
+    c.i32LtU();
+    c.ifResult(I32);
+    c.localGet(D);
+    c.i32Const(0x30);
+    c.i32Add();
+    c.else_();
+    c.localGet(D);
+    c.i32Const(0x61 - 10);
+    c.i32Add();
+    c.end();
+  }
+
+  /** `%w.insp.bufferForm(bytes)` → `<Buffer aa bb cc>` — `Buffer.prototype
+   * [util.inspect.custom]`'s own rendering, NOT the generic dyn walker's
+   * composite path: two lowercase hex digits per byte, space-joined, the
+   * first `Buffer.INSPECT_MAX_BYTES` (50, Node's default) shown and then
+   * `... N more byte(s)` before the closing `>` (measured against Node
+   * 24.18 at 50/51/52 bytes to pin the exact truncation boundary and the
+   * singular/plural split). An EMPTY buffer still prints the trailing
+   * space before `>` — `<Buffer >` — because the space is part of the
+   * fixed "<Buffer " prefix, not a separator the loop owns; nothing here
+   * special-cases zero length.
+   *
+   * UNLIKE a plain Uint8Array's rendering (this function's caller's OTHER
+   * arm), this ignores `ctx.depth` entirely — measured: a Buffer nested
+   * past the default inspect depth still prints its full form where a
+   * Uint8Array there substitutes `[Uint8Array]` (Buffer's custom-inspect
+   * override runs before the generic depth-cutoff check ever applies) —
+   * and needs none of the recursive machinery (`begin`/`entry`/`end`, the
+   * seen stack) a composite's rendering does: the bytes are numbers,
+   * never references, so a Buffer can never itself be part of a cycle. */
+  bufferForm(): number {
+    return this.cached("bufferForm", [this.deps.bytesRefU8()], [this.deps.strRef()], (idx) => {
+      const c = new Code();
+      const B = 0;
+      const N = 1;
+      const I = 2;
+      const SHOWN = 3;
+      const MARK = 4;
+      const BYTE = 5;
+      const NIB = 6;
+      const MAX_SHOWN = 50;
+      c.globalGet(this.len());
+      c.localSet(MARK);
+      this.deps.lit(c, "<Buffer ");
+      c.call(this.ibPuts());
+      c.localGet(B);
+      c.call(this.deps.bytesLen());
+      c.i32TruncF64S();
+      c.localSet(N);
+      c.localGet(N);
+      c.i32Const(MAX_SHOWN);
+      c.i32LtS();
+      c.ifResult(I32);
+      c.localGet(N);
+      c.else_();
+      c.i32Const(MAX_SHOWN);
+      c.end();
+      c.localSet(SHOWN);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(SHOWN);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(I);
+      c.ifVoid();
+      c.i32Const(0x20); // ' '
+      c.call(this.ibPutc());
+      c.end();
+      c.localGet(B);
+      c.localGet(I);
+      c.f64ConvertI32U();
+      c.call(this.deps.bytesGet());
+      c.i32TruncF64S(); // byte values are always 0..255, non-negative
+      c.localSet(BYTE);
+      c.localGet(BYTE);
+      c.i32Const(4);
+      c.i32ShrU();
+      c.localSet(NIB);
+      this.hexDigit(c, NIB);
+      c.call(this.ibPutc());
+      c.localGet(BYTE);
+      c.i32Const(0xf);
+      c.i32And();
+      c.localSet(NIB);
+      this.hexDigit(c, NIB);
+      c.call(this.ibPutc());
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(N);
+      c.i32Const(MAX_SHOWN);
+      c.i32GtS();
+      c.ifVoid();
+      this.deps.lit(c, " ... ");
+      c.call(this.ibPuts());
+      c.localGet(N);
+      c.i32Const(MAX_SHOWN);
+      c.i32Sub();
+      c.f64ConvertI32S();
+      c.call(this.deps.f64ToStr());
+      c.call(this.ibPuts());
+      this.deps.lit(c, " more byte");
+      c.call(this.ibPuts());
+      c.localGet(N);
+      c.i32Const(MAX_SHOWN + 1);
+      c.i32Ne();
+      c.ifVoid();
+      c.i32Const(0x73); // 's'
+      c.call(this.ibPutc());
+      c.end();
+      c.end();
+      c.i32Const(0x3e); // '>'
+      c.call(this.ibPutc());
+      c.localGet(MARK);
+      c.call(this.ibTake());
+      this.mb.setBody(idx, [I32, I32, I32, I32, I32, I32], c.bytes());
+    });
+  }
+
   /** `%w.insp.popFrame(baseIdx)` — drop the top frame, releasing the item
    * slots so a finished render stops pinning its strings (C releases each;
    * the flat stack has to null them or the module-global array keeps every
@@ -3153,6 +3304,8 @@ export class InspectBuilder {
       const R = 17; // the composite's rendering
       const ENTS = 18; // objWalk's result box
       const NAME = 19; // FN_NAME
+      const AB = 20; // BYTES: the aliased $bytes ref (S014's amendment)
+      const BASE = 21; // BYTES: the "Uint8Array(N) " prefix
       /** recurse + 1 — the depth children format at. */
       const deeper = (): void => {
         c.localGet(RECURSE);
@@ -3520,14 +3673,141 @@ export class InspectBuilder {
         c.return_();
       });
 
-      // BYTES, HANDLE and JSVAL: see the header — no producer on this tier
-      // can build one, so arriving here means a kind grew without an arm.
+      // BYTES has a real arm (increment 18 stage C: dyn↔bytes crossing made
+      // one constructible) — the isBuffer flag decides between TWO
+      // genuinely different renderings, not a shared shape with a tweak:
+      //  - Buffer: `bufferForm`'s own hex form, self-contained, no
+      //    recursion/depth/circular concerns (see that function's header).
+      //  - plain Uint8Array: array-shaped (grid grouping, the depth
+      //    cutoff, the S029 interrupted marker) — the SAME begin/entry/end
+      //    pipeline the ARR arm above uses, just sourcing elements from
+      //    bytes instead of a dyn vector, and skipping circCheck/seenPush/
+      //    refWrap because a `$bytes` payload holds only raw bytes and can
+      //    never itself be part of a cycle (S014's bytes amendment argues
+      //    the same acyclic-by-construction point).
+      this.kindArm(c, K, [DK.BYTES], () => {
+        dyn.bytesPayload(c, (x) => x.localGet(D));
+        c.structGet(dyn.bytesPayloadT(), BYTES_PAYLOAD_IS_BUFFER);
+        c.ifResult(strRef);
+        dyn.bytesPayloadBytes(c, (x) => x.localGet(D));
+        c.call(this.bufferForm());
+        c.else_();
+        dyn.bytesPayloadBytes(c, (x) => x.localGet(D));
+        c.localSet(AB);
+        dyn.bytesLenI32(c, (x) => x.localGet(AB));
+        c.localSet(N);
+        // An EMPTY typed array bypasses the depth cutoff entirely — same
+        // as a plain empty array (measured: `{a:{b:{c:[]}}}` at default
+        // depth still prints `[]`, not `[Array]`; `{a:{b:{c:new
+        // Uint8Array(0)}}}` still prints `Uint8Array(0) []`) — so this
+        // check, like the ARR arm's own N===0 shortcut above, comes
+        // BEFORE the depth check, not after.
+        c.localGet(N);
+        c.i32Eqz();
+        c.ifResult(strRef);
+        this.deps.lit(c, "Uint8Array(0) []");
+        c.else_();
+        c.localGet(RECURSE);
+        c.localGet(DEPTH);
+        c.f64Gt();
+        c.ifResult(strRef);
+        this.deps.lit(c, "[Uint8Array]");
+        c.else_();
+        c.localGet(RECURSE);
+        c.f64Const(MAX_DYN_DEPTH);
+        c.f64Gt();
+        c.ifResult(strRef);
+        this.deps.lit(c, `[Uint8Array${INTERRUPTED}`);
+        c.else_();
+        // The "Uint8Array(N)" prefix, built through the append buffer
+        // directly (there is no static literal for a runtime count). NO
+        // trailing space here — `end()`'s `emitBasePrefix` adds its own
+        // (`base ? \`${base} \` : ''`), so one baked in here would double
+        // it (measured against Node the hard way — the first build of
+        // this arm printed "Uint8Array(3)  [" and this comment is why).
+        c.globalGet(this.len());
+        c.localSet(MARK);
+        this.deps.lit(c, "Uint8Array(");
+        c.call(this.ibPuts());
+        c.localGet(N);
+        c.f64ConvertI32U();
+        c.call(this.deps.f64ToStr());
+        c.call(this.ibPuts());
+        c.i32Const(0x29); // ')'
+        c.call(this.ibPutc());
+        c.localGet(MARK);
+        c.call(this.ibTake());
+        c.localSet(BASE);
+        deeper();
+        c.call(this.begin());
+        c.localGet(N);
+        c.i32Const(MAX_ARRAY_LENGTH);
+        c.i32LtS();
+        c.ifResult(I32);
+        c.localGet(N);
+        c.else_();
+        c.i32Const(MAX_ARRAY_LENGTH);
+        c.end();
+        c.localSet(SHOWN);
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(SHOWN);
+        c.i32GeS();
+        c.brIf(1);
+        c.localGet(AB);
+        c.localGet(I);
+        c.f64ConvertI32U();
+        c.call(this.deps.bytesGet());
+        c.call(this.deps.f64ToStr());
+        c.i32Const(1); // isNum: every byte element is a number
+        c.call(this.entry());
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        c.localGet(N);
+        c.i32Const(MAX_ARRAY_LENGTH);
+        c.i32GtS();
+        c.localSet(MORE);
+        c.localGet(MORE);
+        c.ifVoid();
+        c.localGet(N);
+        c.i32Const(MAX_ARRAY_LENGTH);
+        c.i32Sub();
+        c.f64ConvertI32S();
+        c.call(this.moreItems());
+        c.i32Const(1); // the first-dropped element is numeric too
+        c.call(this.entry());
+        c.end();
+        c.localGet(BASE);
+        this.deps.lit(c, "[");
+        this.deps.lit(c, "]");
+        deeper();
+        c.i32Const(1); // arrayExtras: grid grouping applies
+        c.localGet(MORE);
+        c.call(this.end());
+        c.end(); // interrupted-check ifResult
+        c.end(); // depth-cutoff ifResult
+        c.end(); // N===0 ifResult
+        c.end(); // isBuffer ifResult
+        c.return_();
+      });
+
+      // HANDLE and JSVAL: see the header — no producer on this tier can
+      // build one, so arriving here means a kind grew without an arm.
       c.unreachable();
       this.mb.setBody(
         idx,
         [
           I32, I32, dyn.arrRef(), dyn.objRef(), I32, I32, I32, I32, I32, F64,
           dyn.dynRef(), dyn.arrRef(), strRef, strRef, strRef, dyn.dynRef(), strRef,
+          this.deps.bytesRefU8(), strRef,
         ],
         c.bytes(),
       );

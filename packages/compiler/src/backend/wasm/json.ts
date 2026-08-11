@@ -64,7 +64,7 @@
  * representable range, exact ties, long digit strings, and the exponent
  * overflow/underflow forms. */
 import { Code } from "./code.js";
-import { DK, DYN_KIND, DYN_NUM, DYN_REF, type DynBuilder } from "./dyn.js";
+import { BYTES_PAYLOAD_IS_BUFFER, DK, DYN_KIND, DYN_NUM, DYN_REF, type DynBuilder } from "./dyn.js";
 import { F64, I32, I64, ModuleBuilder, type ValType } from "./module.js";
 
 /** C's SCR_JSON_MAX_DEPTH. SEMANTICS.md S013. */
@@ -112,6 +112,12 @@ export interface JsonDeps {
    * at length 0. The vector machinery is the emitter's to intern. */
   newDynVec: (c: Code) => void;
   dyn: () => DynBuilder;
+  /** The `$bytes` struct's wasm ref type — needed for putDyn's BYTES arm
+   * local (the raw ref `dyn.bytesPayloadBytes` extracts). */
+  bytesRefU8: () => ValType;
+  /** %w.bytes.get:u8(bytes, f64 index) → f64 — the element read putDyn's
+   * BYTES arm walks, same helper typedarrays.ts's own accessors use. */
+  bytesGet: () => number;
 }
 
 export class JsonBuilder {
@@ -3708,9 +3714,14 @@ export class JsonBuilder {
    *    presence is only known once the engine has been asked. No dyn tree
    *    here can hold a JSVAL, so absence is exactly `kind is UNDEF or
    *    FUNC` and a kind test decides it before a byte is written.
-   *  - BYTES / HANDLE / JSVAL ARMS ARE `unreachable`. None is
-   *    constructible on this tier; an honest trap beats a silently wrong
-   *    answer if that ever stops being true.
+   *  - BYTES has a real arm (increment 18 stage C: dyn↔bytes crossing
+   *    made one constructible). It rides neither jbEnter's seen stack nor
+   *    its own depth frame — a $bytes payload holds only raw bytes and
+   *    can never point back into the tree, so it cannot itself be part of
+   *    a cycle (S014's bytes amendment argues the same acyclic-by-
+   *    construction point). HANDLE and JSVAL stay `unreachable`; neither
+   *    is constructible on this tier, and an honest trap beats a silently
+   *    wrong answer if that ever stops being true.
    *
    * CYCLES are detected HERE, through the same `jbEnter`/`jbLeave` pair
    * the type-directed walkers use — so a cyclic dyn tree throws V8's
@@ -3798,6 +3809,8 @@ export class JsonBuilder {
       const FIRST = 9;
       const PRESENT = 10;
       const OP = 11; // the OBJ payload — the seen stack's identity
+      const AB = 12; // BYTES: the aliased $bytes ref (S014's amendment)
+      const BUF = 13; // BYTES: the isBuffer flag read out of the payload
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
@@ -4011,14 +4024,113 @@ export class JsonBuilder {
         c.return_();
       });
 
-      // BYTES, HANDLE and JSVAL: no producer on this tier can build one
-      // (typed arrays, runtime handles and the island bridge all refuse
-      // upstream of here), so reaching this point means the dyn surface
-      // grew a kind without growing this walk.
+      // Buffer's own `toJSON` returns {type:"Buffer",data:[...]}; a plain
+      // Uint8Array has no toJSON and stringifies as its own enumerable
+      // own-keys — the numeric indices, exactly Object.keys' answer
+      // (measured: `JSON.stringify(Buffer.from([1,2,3]))` →
+      // `{"type":"Buffer","data":[1,2,3]}`;
+      // `JSON.stringify(new Uint8Array([1,2,3]))` → `{"0":1,"1":2,"2":3}`).
+      this.emitKindArm(c, K, [DK.BYTES], () => {
+        dyn.bytesPayloadBytes(c, (x) => x.localGet(0));
+        c.localSet(AB);
+        dyn.bytesLenI32(c, (x) => x.localGet(AB));
+        c.localSet(N);
+        dyn.bytesPayload(c, (x) => x.localGet(0));
+        c.structGet(dyn.bytesPayloadT(), BYTES_PAYLOAD_IS_BUFFER);
+        c.localSet(BUF);
+        c.localGet(BUF);
+        c.ifVoid();
+        this.deps.lit(c, '{"type":"Buffer","data":[');
+        c.call(this.jbPuts());
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(N);
+        c.i32GeU();
+        c.brIf(1);
+        c.localGet(I);
+        c.ifVoid();
+        c.i32Const(0x2c); // ','
+        c.call(this.jbPutc());
+        c.end();
+        c.localGet(AB);
+        c.localGet(I);
+        c.f64ConvertI32U();
+        c.call(this.deps.bytesGet());
+        c.call(this.jbPutF64());
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        this.deps.lit(c, "]}");
+        c.call(this.jbPuts());
+        c.else_();
+        c.i32Const(0x7b); // '{'
+        c.call(this.jbPutc());
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(N);
+        c.i32GeU();
+        c.brIf(1);
+        c.localGet(I);
+        c.ifVoid();
+        c.i32Const(0x2c); // ','
+        c.call(this.jbPutc());
+        c.end();
+        c.localGet(I);
+        c.f64ConvertI32U();
+        c.call(this.deps.f64ToStr());
+        c.call(this.jbPutStr());
+        c.i32Const(0x3a); // ':'
+        c.call(this.jbPutc());
+        c.localGet(AB);
+        c.localGet(I);
+        c.f64ConvertI32U();
+        c.call(this.deps.bytesGet());
+        c.call(this.jbPutF64());
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        c.i32Const(0x7d); // '}'
+        c.call(this.jbPutc());
+        c.end();
+        c.i32Const(1);
+        c.return_();
+      });
+      // HANDLE and JSVAL: no producer on this tier can build one (runtime
+      // handles and the island bridge both refuse upstream of here), so
+      // reaching this point means the dyn surface grew a kind without
+      // growing this walk.
       c.unreachable();
       this.mb.setBody(
         idx,
-        [I32, dyn.arrRef(), I32, I32, dyn.dynRef(), dyn.dynRef(), dyn.arrRef(), I32, I32, I32, dyn.objRef()],
+        [
+          I32,
+          dyn.arrRef(),
+          I32,
+          I32,
+          dyn.dynRef(),
+          dyn.dynRef(),
+          dyn.arrRef(),
+          I32,
+          I32,
+          I32,
+          dyn.objRef(),
+          this.deps.bytesRefU8(),
+          I32,
+        ],
         c.bytes(),
       );
     });

@@ -1904,6 +1904,12 @@ class Assembler {
       strSlice: () => this.strs.slice(),
       strIndexOf: () => this.strs.indexOf(),
       strMatchAt: () => this.strs.matchAt(),
+      bytesRefU8: () => this.bytesB.bytesRef(),
+      bytesTypeU8: () => this.bytesB.bytesType(),
+      bytesLen: () => this.bytesB.length(),
+      bytesGet: () => this.bytesB.get("u8"),
+      bytesSet: () => this.bytesB.setElem("u8"),
+      bytesToStrUtf8: () => this.bytesB.toStrHelper("utf8"),
     });
     return this.dynField;
   }
@@ -1930,6 +1936,8 @@ class Assembler {
         c.call(this.vecs.newLen(this.dynVecInfo()));
       },
       dyn: () => this.dyn,
+      bytesRefU8: () => this.bytesB.bytesRef(),
+      bytesGet: () => this.bytesB.get("u8"),
     });
     return this.jsonField;
   }
@@ -1958,6 +1966,9 @@ class Assembler {
       throwError: (c, className, name, pushMessage) =>
         this.emitSetCellError(c, className, name, pushMessage, null),
       excKind: () => this.exc().kindG,
+      bytesRefU8: () => this.bytesB.bytesRef(),
+      bytesLen: () => this.bytesB.length(),
+      bytesGet: () => this.bytesB.get("u8"),
     });
     return this.inspField;
   }
@@ -2161,6 +2172,33 @@ class Assembler {
         // Already dyn — C's retain, which the GC makes a no-op.
         c.localGet(0);
         return true;
+      case "bytes": {
+        // Non-u8 never crosses (the LLVM lane's own stance, dyn.ts:365/
+        // 582/1023 — there it's a compiler-internal crash; here it is a
+        // real, named refusal instead of inheriting either the crash or
+        // silently mishandling it).
+        if (t.elem !== "u8") {
+          this.refuse(`dynFrom:bytes:${t.elem}`, loc);
+          return false;
+        }
+        // SEMANTICS.md S014's bytes exception: ALIASES, never copies —
+        // the SAME `$bytes` ref the caller pushed becomes the payload's
+        // `bytes` field directly. The Buffer flag is `false` here
+        // unconditionally: the IR has no surviving Buffer-vs-Uint8Array
+        // marker by the time a value reaches this call (types.ts erases
+        // both to the identical `bytes<u8>` IR type before dynFrom ever
+        // sees them — measured, not assumed; SEMANTICS.md S037 has the
+        // full trace, including that the LLVM lane's own generic
+        // crossing site has the SAME gap today).
+        dyn.boxBytes(c, (x) => {
+          dyn.pushNewBytesPayload(
+            x,
+            (y) => y.localGet(0),
+            (y) => y.i32Const(0),
+          );
+        });
+        return true;
+      }
       case "object": {
         // The only class the boundary admits is an ERROR (the frontend's
         // canConvertToDyn gate), and it converts to the reserved-key
@@ -3070,6 +3108,19 @@ class Assembler {
         c.i32Const(1);
         return true;
       }
+      case "bytes": {
+        // Non-u8 never crosses — matches dynFrom's own refusal.
+        if (t.elem !== "u8") {
+          this.refuse(`dynMatch:bytes:${t.elem}`, loc);
+          return false;
+        }
+        // A membership TEST, not an extraction — the payload's own
+        // content (and the isBuffer flag) don't affect whether a dyn
+        // value's KIND is bytes<u8>, so this is exactly emitKindIs, like
+        // every other non-composite arm above.
+        this.emitKindIs(c, DK.BYTES);
+        return true;
+      }
       case "array": {
         const inner = this.dynMatchHelper(t.elem, loc);
         if (inner === null) return false;
@@ -3440,6 +3491,21 @@ class Assembler {
           }
           c.localGet(r);
         }
+        return true;
+      }
+      case "bytes": {
+        // Non-u8 never crosses — matches dynFrom's/dynMatch's own
+        // refusal.
+        if (t.elem !== "u8") {
+          this.refuse(`dynCheck:bytes:${t.elem}`, loc);
+          return false;
+        }
+        kindGuard(DK.BYTES);
+        // ALIASES (SEMANTICS.md S014's bytes exception): the SAME
+        // `$bytes` ref `dynFrom` boxed comes back out here, never a
+        // fresh copy — both directions of the boundary alias, matching
+        // Node's erased cast exactly.
+        dyn.bytesPayloadBytes(c, (x) => x.localGet(0));
         return true;
       }
       case "array": {
@@ -7364,11 +7430,14 @@ class Assembler {
           case "record":
           case "array":
           case "union":
-          case "promise": {
+          case "promise":
+          case "bytes": {
             // The composite conversion is a per-typeKey WALKER (the C
             // emitter's sc_td_N): a deep copy for the structured kinds, a
             // reference box for a promise, the `%error` encoding for an
-            // error instance.
+            // error instance — and, for bytes<u8> specifically, an ALIAS
+            // rather than a copy (SEMANTICS.md S014's registered
+            // exception; emitDynFromBody's own case has the full story).
             const h = this.dynFromHelper(vt, e.loc);
             if (h === null) {
               code.unreachable();
@@ -7431,13 +7500,22 @@ class Assembler {
           : t.kind === "string" ? { desc: "string", kind: DK.STR, val: this.strRef }
           : null;
         if (want === null) {
-          if (t.kind === "record" || t.kind === "array" || t.kind === "union" || t.kind === "func") {
+          if (
+            t.kind === "record" ||
+            t.kind === "array" ||
+            t.kind === "union" ||
+            t.kind === "func" ||
+            t.kind === "bytes"
+          ) {
             // The composite extraction is a per-typeKey WALKER (the C
             // emitter's sc_dc_N). It returns normally with the cell set on
             // failure — unlike the scalar path, which unwinds inline — so
             // the call site owns the pending check. A FUNC target rides
             // the same walker: it either unwraps the identical signature's
             // closure or mints the adapter, and only the kind guard throws.
+            // A bytes<u8> target ALIASES rather than copies (SEMANTICS.md
+            // S014's registered exception; emitDynCheckBody's own case has
+            // the full story).
             const h = this.dynCheckHelper(t, e.loc);
             if (h === null) {
               code.unreachable();

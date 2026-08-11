@@ -317,6 +317,95 @@ whose output depended on the aliasing would diverge from Node and fail
 the differential by construction, so the corpus can only contain
 programs that never look.
 
+**Amendment (increment 18 stage C, dyn crossing): `bytes<u8>` (Uint8Array/
+Buffer) is a REGISTERED EXCEPTION — on the wasm tier only, crossing
+`unknown` ALIASES, matching Node, not S014's body.** Measured directly
+(Node 24.18), three independent shapes, all agreeing: a Buffer/typed
+array crossing into an untyped (`any`/`unknown`) boundary and mutated
+from that side is observed as the SAME mutation from the originally-typed
+side — `function f(x){x[0]=99} const b=Buffer.alloc(4); f(b);` sees `99`
+back through `b`; the same holds crossing via an object property write
+and via array storage. Node's `unknown` is erased, not boxed, so this is
+just ordinary JS reference semantics, not anything buffer-specific — but
+it is the semantics, and S014's own body already grants that Node
+disagrees with the copy rule ("Node's casts are erased and hand back the
+SAME object... a program that mutates across the boundary observes the
+change there and does not here"). For bytes specifically, this tier now
+matches Node instead of accepting that gap.
+
+**Why the exception is sound and extends to nothing else.** S014's
+rationale is NOT "aliasing would be expensive" — it is that the wasm
+lane's representation must agree with the C/LLVM lanes, which structurally
+CANNOT alias (a `ScrDyn` owns its tree under refcounting; aliasing static
+storage would let a dyn value outlive what it borrowed from). That
+constraint is real and unchanged for every OTHER composite kind — records,
+arrays, tuples — which is exactly why they keep copying under this
+amendment too. Bytes is different in the one property that matters here:
+a `$bytes` struct is ACYCLIC BY CONSTRUCTION. It holds only raw storage
+bytes (an `array (mut i8)`, an offset, a length) — no field of it can ever
+point at a dyn box, a record, or anything else that could point back. The
+cycle-safety argument S014's copy rule protects (a record aliased into
+`unknown` could, if the language let it, produce a reference cycle through
+the boundary that the inspect walker's seen-stack machinery — S029 — has
+to detect) simply does not apply to a value that can never carry a
+reference in the first place. The exception costs the cycle-detection
+story nothing because there is no cycle it could ever need to detect.
+
+**The per-lane split is deliberate, not an oversight.** The C runtime and
+the LLVM lane that links it are TRANSITIONAL — AGENTS.md's own framing:
+"kept as executable semantics references until the wasm lane stands
+alone" — so they keep copying bytes across the boundary exactly as S014's
+body describes (board #23 tracks this as their own, now-explicitly-
+accepted divergence from Node, not a bug to fix on those lanes). The wasm
+lane, this project's future-primary target, boxes the SAME `$bytes` ref
+instead: `dynFrom` on a bytes value stores the existing struct reference
+directly, never a copy; `dynMatch`/`dynCheck` extraction hands back that
+SAME reference, not a fresh one — both directions alias, because Node's
+semantics have no one-directional copy to model. Locking the future-
+primary lane to a Node divergence whose only reason to exist is agreement
+with lanes this project intends to retire would invert the project's own
+stated direction; the acyclic argument above is what makes it safe to
+stop doing that for exactly this one payload kind.
+
+**The symmetry path, and why it is vacuous for bytes today.** S014's body
+names a second load-bearing property beside cross-lane agreement:
+boundary symmetry — "`dynCheck` must build a typed value it can hand out,
+and it has nothing to alias if the source was itself parsed." For every
+OTHER composite kind that sentence is live: a record extracted from a
+`JSON.parse` result was never a typed value to begin with, so `dynCheck`
+has no static storage to point at and must materialize one. Aliasing
+would need that same materialization fallback for bytes if a parsed dyn
+source could ever carry `DK.BYTES` — and it cannot, measured structurally
+rather than assumed: `boxBytes` (dyn.ts) is the ONLY constructor of a
+`DK.BYTES` box anywhere in the wasm backend, and it has exactly ONE call
+site — the `dynFrom` producer arm (`emitDynFromBody`'s `case "bytes":`,
+emitter.ts). JSON's grammar has no bytes/buffer literal, so the parser
+(json.ts) never calls it; nothing else in the tree constructs a `$dyn`
+box with kind `BYTES` either. Every `DK.BYTES` value that can exist,
+without exception, therefore already carries a real `$bytes` struct
+`dynFrom` boxed directly — `dynCheck`'s extraction always has something
+to alias, so the "nothing to alias" branch of S014's symmetry argument is
+UNREACHABLE for this one payload kind, not silently unhandled. This is
+not a permanent structural fact — a future dyn-producing construct could
+in principle synthesize bytes some other way — so this paragraph is the
+record of why today's amendment does not need a materialize-on-extract
+fallback, not a claim that one could never become necessary.
+
+**Corpus-unpinnable, same as S014's own convention, while the native
+lanes still live.** A program whose output depends on aliasing bytes
+across `unknown` diverges between lanes (wasm aliases, C/LLVM copy) and
+so cannot be a corpus program without breaking cross-lane agreement on
+some OTHER lane — the identical shape as S014's own "the corpus can only
+contain programs that never look." This is unit-pinned instead:
+`wasm-emitter.test.ts` asserts a byte written through the `unknown`-typed
+side is observed through the original typed side and vice versa, and
+that a value crossing `unknown` TWICE is `===` through `unknown` both
+times (dyn-space strict equality for `DK.BYTES` compares the PAYLOAD
+`$bytes` ref via `ref.eq`, never the `$dyn` box that wraps it — the
+increment-16 box-copying lesson, applied here so two independent crossings
+of the SAME source correctly identity-match exactly as Node's erased cast
+does).
+
 ## S015 — Keyed reads and `in` on `unknown` see OWN properties only *(inherited)*
 
 `u[k]` on a checked-dynamic value answers the receiver's OWN member, or
@@ -1769,3 +1858,147 @@ diffing raw byte counts between two otherwise-identical compiled
 binaries. Corpus program `1660-buffer-read-write-num.ts` pins the
 literal-fold case end-to-end through the differential harness
 (`tests/harness/wasm-differential.test.ts`'s `TIER_FLOOR`).
+
+## S037 — A `Buffer` crossing `unknown` through the generic path renders as `Uint8Array` on the far side, on every lane, including at construction *(wasm tier, shared with the LLVM lane)*
+
+Node distinguishes `Buffer` from a plain `Uint8Array` by the constructor
+that built it — `Buffer.isBuffer`, `instanceof Buffer`,
+`.constructor.name`, `String(x)`/`x.toString()` (Buffer decodes UTF-8;
+Uint8Array joins elements with commas), `util.inspect` (`<Buffer 01 02>`
+vs `Uint8Array(2) [ 1, 2 ]`), and `JSON.stringify` (`{"type":"Buffer",
+"data":[...]}` vs `{"0":1,...}`) all differ, all measured directly
+against Node 24.18. This tier's dyn tree models the distinction as a
+single flag bit on the BYTES payload (`$dynBytes.isBuffer`, increment 18
+stage C) and all FOUR consumer arms that need it — `kindName` (the
+"Received an instance of X" error text), `toStr` (`String()`),
+`json.ts`'s `putDyn` (`JSON.stringify`), and `inspect.ts`'s `dyn` walker
+(`util.inspect`/`console.log`, via the dedicated `bufferForm` hex
+renderer) — branch on it correctly. The flag itself, however, cannot be
+RECOVERED at the one generic construction site.
+
+**The root cause: `Buffer` and `Uint8Array` are ONE IR type before
+`dynFrom` ever runs, and the constructor is interned by that type, not by
+call site.** `bytes<u8>` is the IR's single runtime representation for
+both (`types.ts`'s `isStdlibInterface("Uint8Array")` and the
+`Buffer`-provenance check both resolve to `bytesOf("u8")`; nothing in the
+IR type carries which source interface produced it). The wasm emitter's
+`dynFrom` producer for a given IR type is a CACHED, type-keyed helper
+(`emitDynFromBody`'s `case "bytes":`, interned once per element kind) —
+every `bytes<u8>` value in the whole module, from every call site, shares
+the SAME one function. Even if the IR *did* somehow know at ONE call site
+that its source was a `Buffer`, the interning discipline would still
+average that fact away across every other `bytes<u8>` crossing in the
+program, because there is exactly one dynFrom-for-bytes-u8 function to
+share. The fix has to move the distinction into the type (or a sibling
+marker) the interning keys on — a call-site patch cannot survive it.
+
+**Construction is EQUALLY indistinguishable — this is not only a
+crossing-site gap.** `new Uint8Array(n)` and `Buffer.alloc(n)` both lower
+to the identical `bytesNew` IR node (`nodes.ts`) with `elem: "u8"`, and
+the wasm emitter's `case "bytesNew":` (emitter.ts) calls the SAME
+`bytesB.newLen("u8")` helper for both — no branch, no flag, nothing
+observes which source spelling the program used. This means the fix point
+for S037 is genuinely upstream of `dynFrom` — even a `dynFrom` node
+willing to carry a provenance argument has nothing to read it FROM, since
+construction itself already discarded the distinction. Recovering the
+flag needs a marker planted at `bytesNew` (or earlier, at the declaration
+site) and threaded through every place a `bytes<u8>` value can flow
+before it reaches a crossing — tracked as board item #25, filed with this
+root-cause trace attached.
+
+At the generic crossing site — a bare `const u: unknown = someBytes` with
+no hardcoded call-site knowledge of the source — the wasm emitter
+therefore pins the flag to `false` (plain `Uint8Array`) unconditionally,
+so a genuine `Buffer` that crosses through this path answers
+`Uint8Array`-flavored on every one of the four consumer surfaces once
+observed back through `unknown`: `String(buf)` joins elements with commas
+instead of UTF-8-decoding them; `util.inspect(buf)` prints the array-
+grid form (`Uint8Array(N) [ ... ]`, with the depth cutoff and grouping
+that implies) instead of the hex `<Buffer aa bb>` form (which is neither
+depth-limited nor grid-grouped); `JSON.stringify(buf)` answers the
+numeric-keyed object form instead of `{"type":"Buffer","data":[...]}`;
+and `kindName`'s error text says "Uint8Array" where Node would say
+"Buffer".
+
+**This is not a new divergence the wasm lane introduces.** The LLVM lane's
+own generic crossing site has the identical shape: `dyn.ts`'s `case
+"bytes":` (backend/llvm/dyn.ts) calls `scr_dyn_new_bytes_copy`
+unconditionally — never `scr_dyn_new_buffer_copy` — for every `bytes<u8>`
+value regardless of its source. Only hardcoded, special-purpose call sites
+that already know a value's flavor structurally (for example the stream-
+chunk delivery path, `scr_dyn_invoke.c`'s `recv->buffer ? ... :
+...`) get this right; the *generic* `unknown`-crossing surface has never
+been able to answer it, on any lane, because the information does not
+exist upstream of the crossing — construction itself already lost it,
+identically on every backend (the previous paragraph's `bytesNew`/
+`Buffer.alloc` finding is a frontend/IR fact, not a wasm-specific one).
+The wasm lane's flag-aware consumer arms are new (this increment); the
+upstream blindness they inherit is not.
+
+**Why pin `false` instead of refusing.** A loud refusal at every `bytes<
+u8>` → `unknown` crossing would take back all of R2's dyn-crossing work
+for the overwhelmingly common case (plain `Uint8Array`, and any `Buffer`
+crossing that a program never observes through a Buffer-specific surface
+on the far side) to guard a narrower case this tier cannot yet detect
+either way. Pinning `false` is the LLVM lane's own existing choice, not a
+new one invented for wasm — see above.
+
+**No corpus program can exercise Buffer-flavor through the generic
+crossing and pass, on ANY lane — this is structurally clean, not
+cherry-picked.** Because the blindness is shared by wasm, LLVM, and C
+alike (the previous two sections), a corpus program that crossed a real
+`Buffer` through the generic `unknown` path and then observed a
+Buffer-flavored surface would print the WRONG, Uint8Array-flavored text
+on every lane identically — which means it would never have been added as
+a passing corpus program in the first place, on any backend, at any point
+in this project's history. The corpus's silence on this exact case is not
+an oversight this entry is patching after the fact; it is what a
+byte-exact-against-Node differential harness necessarily produces when
+every lane shares one blind spot. `916-unknown-bytes.ts` DOES cross a
+`Buffer` through this exact generic path (`const buf = Buffer.from("hi");
+const ub: unknown = buf;`) but only reads `.length`/`[i]` off the
+extracted value — never `String()`, `util.inspect`, `JSON.stringify`, or
+a constructor-name check on that specific value — which is exactly the
+shape "a corpus program that never looks" has to take. A future corpus
+program that DID observe a Buffer-flavored surface after a generic
+`unknown` crossing would fail the differential visibly (wrong text, not a
+crash) on every lane, which is how this gap would be caught if it ever
+became reachable.
+
+**916's own comment already claimed this entry existed — it didn't, until
+now.** The corpus file's header (lines 35-38) reads: "String() of an
+unknown holding a BUFFER joins the elements like a Uint8Array — Node
+decodes UTF-8 there; the checked-dynamic tree cannot tell the two apart.
+SEMANTICS.md documents it." That claim was FALSE when written — no such
+entry existed anywhere in this register, checked directly before this
+entry was added. This is the honest history: S037 is what retroactively
+makes that comment true, not a citation the comment was correctly
+anticipating. The comment now points at a real numbered entry (updated to
+say "S037" explicitly) instead of a promise nothing had kept yet.
+
+**The fix is frontend work, not backend.** Recovering the flag means
+carrying Buffer-vs-Uint8Array provenance from `bytesNew` (or the
+declaration site) through the IR to the `dynFrom` node that boxes it — a
+distinct IR-level marker, since `bytesOf("u8")` itself cannot carry one
+without widening every other `bytes<u8>` consumer's match arms. Tracked
+as board item #25. Until that lands, this entry is the registered
+explanation for the gap; the wasm emitter's per-arm flag handling is
+already correct GIVEN an accurate flag — the gap is entirely upstream of
+it, and once board #25 lands, wiring the recovered flag through at the
+one `dynFrom` construction site is the whole remaining change on this
+side of the boundary.
+
+**Tested by:** nothing pins the gap itself (a test asserting "a Buffer
+crossing `unknown` wrongly prints as Uint8Array" would be a test that the
+tier is broken, not that it works) — this entry is the registration.
+The flag-TRUE branches of all four consumer arms ARE tested, though —
+directly at the builder level (constructing a `$dynBytes` payload with
+`isBuffer=true` by hand, bypassing the frontend's unreachable-today path)
+against Node's measured Buffer-flavored forms, so the day board #25 wires
+a real provenance flag through, these arms are proven correct in advance
+rather than merely "written and hoped." `wasm-bytes-flag.test.ts` has the
+builder-level flag-true assertions (kindName, toStr, json.ts's
+stringifyDyn, and inspect.ts's dyn walker, each checked both ways);
+`wasm-emitter.test.ts` has the flag-false-but-divergent assertion (for a
+real Buffer that DID cross generically) that pins THIS tier's answer with
+an explicit citation to this entry, never Node's.

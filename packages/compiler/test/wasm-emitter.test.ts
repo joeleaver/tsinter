@@ -3884,6 +3884,34 @@ test("S003 amendment: a non-integer typed-array index traps", async () => {
   expect(run.stdout.toString("utf8")).toBe("pre\n");
 });
 
+test("the OOB seam: the SAME buffer's out-of-range access is TYPED-traps (S003) through a statically bytes<u8> receiver, but undefined-read/silent-no-op-write (JS semantics) through the identical value crossed into `unknown` — a same-value-two-semantics split, pinned so nothing later 'unifies' the two contracts (the B2 Buffer/DataView ladder-difference precedent, same shape)", async () => {
+  // Dyn-space side first — Node's own answers (measured, node -e): an
+  // out-of-range READ through `unknown` answers `undefined`, and an
+  // out-of-range WRITE through `unknown` is a silent no-op (typed arrays
+  // are fixed-length; Node never grows one). Both print, then the SAME
+  // underlying buffer is read out of range through its ORIGINAL typed
+  // binding, which traps — S003's amendment, unchanged by this round,
+  // exercised here specifically to contrast it against the dyn-space
+  // answers on the identical storage rather than a fresh buffer.
+  const res = await buildWasm(
+    "bytes-oob-seam.js",
+    [
+      "'use strict';",
+      "function toU(b) { return b; }",
+      "const src = new Uint8Array([1, 2, 3]);",
+      "const u = toU(src);",
+      "console.log(String(u[10]));", // dyn OOB read: undefined
+      "u[10] = 99;", // dyn OOB write: silent no-op
+      "console.log(src.length, src[2]);", // unchanged: 3 3
+      "console.log(src[10]);", // the SAME buffer, typed access: TRAPS
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const run = await runWasmToTrap(res.binaryPath);
+  expect(run.stdout.toString("utf8")).toBe(["undefined", "3 3", ""].join("\n"));
+});
+
 test("bytes: subarray is a VIEW (aliases the owner), plain slice COPIES", async () => {
   // Measured against Node directly: subarray()/Buffer's slice() alias;
   // only the plain TypedArray slice() copies — the nodes.ts comment this
@@ -6476,4 +6504,165 @@ test("DataView: a view constructed over ANOTHER view's .buffer rebases against t
     "",
   ];
   expect(stdout.toString("utf8")).toBe(expected.join("\n"));
+});
+
+/* ── increment 18 stage C: dyn↔bytes crossing (SEMANTICS.md S014's bytes
+ * amendment) ──────────────────────────────────────────────────────────── */
+
+test("S014 bytes amendment: crossing `unknown` ALIASES a Uint8Array — write-after-crossing observed on BOTH sides, and identity survives two independent extractions", async () => {
+  // Node's own answers (measured, node -e): every line here is the SAME
+  // object reference under the erased `unknown`/`as` boundary, so a write
+  // through either side is visible through the other, and extracting
+  // twice from the same crossed value gives back the same object both to
+  // itself and to the original. The dyn tree models this by boxing the
+  // SAME `$bytes` struct ref at `dynFrom` and handing back that SAME ref
+  // at extraction (dynCheck) — never a copy — which is the S014
+  // amendment this file's header comment documents. `u === u2` is the
+  // pointed test: `unknown === unknown` is the one strict-equality shape
+  // a checked `.ts` program can form over composite dyn values (the
+  // frontend's dynScalarEq lowering), and it forces both sides through
+  // dyn.strictEq's dedicated BYTES arm (comparing the payload ref via
+  // ref.eq, not the `$dyn` box, which is a fresh box each crossing and
+  // would wrongly compare unequal without that arm).
+  const res = await buildWasm(
+    "dyn-bytes-alias.ts",
+    [
+      "function toU(b: Uint8Array): unknown { return b; }",
+      "function fromU(u: unknown): Uint8Array { return u as Uint8Array; }",
+      "const src = new Uint8Array([1, 2, 3]);",
+      "const u = toU(src);",
+      "src[0] = 99;", // mutate the ORIGINAL after crossing
+      "const out = fromU(u);",
+      "console.log(out[0]);", // sees the post-crossing mutation: aliased
+      "out[1] = 77;", // mutate the EXTRACTED value
+      "console.log(src[1]);", // the original sees it too: aliased back
+      "const back = fromU(u);",
+      "console.log(out === back);",
+      "const u2 = toU(back);",
+      "console.log(u === u2);",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(["99", "77", "true", "true", ""].join("\n"));
+});
+
+test("dyn↔bytes crossing: a non-u8 typed array refuses loudly, not a silent miscompile or a compiler crash", async () => {
+  // The frontend's dynConvertible gate fences this BEFORE it ever reaches
+  // the wasm backend's own (redundant, defense-in-depth) `dynFrom:bytes:
+  // u32`-style refusal — measured directly: SC1101 fires at lowering
+  // time, on every backend, not just wasm. The LLVM lane's generic
+  // crossing site (dyn.ts:365/582/1023 there) has a matching compiler-
+  // internal `throw` for the same non-u8 case, but it is unreachable
+  // from any real program for the identical reason — the frontend never
+  // lowers a non-u8 typed array INTO a dynFrom node in the first place.
+  // Either way: a named, loud refusal, never a crash or a wrong answer.
+  const res = await buildWasm(
+    "dyn-bytes-nonu8.ts",
+    ["function toU(b: Uint32Array): unknown { return b; }", "console.log(toU(new Uint32Array([1])));", ""].join(
+      "\n",
+    ),
+  );
+  expect(res.ok).toBe(false);
+  if (res.ok) throw new Error("expected a refusal");
+  expect(res.diagnostics[0]?.code).toBe("SC1101");
+  expect(res.diagnostics[0]?.message).toBe("converting typed values to 'unknown' is not supported yet");
+});
+
+test("dyn↔bytes crossing: Object.hasOwn/keys/values/entries see numeric indices ONLY — never 'length' (measured: a typed array's own-key list has no length entry, unlike arrays and strings)", async () => {
+  const res = await buildWasm(
+    "dyn-bytes-keys.js",
+    [
+      "'use strict';",
+      "function toU(b) { return b; }",
+      "function b(x) { return x ? 'T' : 'F'; }",
+      "const u = toU(new Uint8Array([10, 20, 30]));",
+      "console.log(b(Object.hasOwn(u, '0')) + b(Object.hasOwn(u, '3')) + b(Object.hasOwn(u, 'length')));",
+      "console.log(Object.keys(u).join(','));",
+      "console.log(Object.values(u).join(','));",
+      "console.log(JSON.stringify(Object.entries(u)));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    ["TFF", "0,1,2", "10,20,30", '[["0",10],["1",20],["2",30]]', ""].join("\n"),
+  );
+});
+
+test("dyn↔bytes crossing: keyed write through `unknown` — in-range numeric writes THROUGH to the shared storage, OOB numeric is a SILENT no-op (matches Node: typed arrays are fixed-length, unlike arrays which grow), a non-numeric key throws (S016's array precedent — no property table on this payload either)", async () => {
+  const res = await buildWasm(
+    "dyn-bytes-keyset.js",
+    [
+      "'use strict';",
+      "function toU(b) { return b; }",
+      "const src = new Uint8Array([1, 2, 3]);",
+      "const u = toU(src);",
+      "u[1] = 55;",
+      "console.log(src[1]);", // in-range: writes through
+      "u[10] = 99;", // OOB numeric: Node silently no-ops (fixed length)
+      "console.log(src.length + ' ' + String(u[10]));",
+      "try { u.nope = 1; console.log('no throw'); } catch (e) { console.log(/** @type {Error} */ (e).message); }",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    ["55", "3 undefined", "Cannot create property 'nope' on Uint8Array", ""].join("\n"),
+  );
+});
+
+test("dyn↔bytes crossing: JSON.stringify — a plain Uint8Array serializes as its own enumerable numeric keys, matching Object.keys exactly", async () => {
+  // Buffer's `{"type":"Buffer","data":[...]}` form is currently
+  // unreachable through the generic crossing path (SEMANTICS.md S037:
+  // the isBuffer flag is pinned false there), so only this half is
+  // reachable from a compiled program today; putDyn's Buffer branch is
+  // exercised structurally by WebAssembly.validate() on every build that
+  // reaches this function, not by an observable program. A dyn-rooted
+  // stringify (a bare `unknown` root, or a `Record<string, unknown>`
+  // member — corpus 916's own shape) is what actually reaches putDyn's
+  // runtime walker; an object LITERAL with a concrete `unknown`-typed
+  // property is a DIFFERENT, statically-typed stringify path this test
+  // is not aimed at.
+  const res = await buildWasm(
+    "dyn-bytes-json.ts",
+    [
+      "function toU(b: Uint8Array): unknown { return b; }",
+      "const u = toU(new Uint8Array([1, 2, 3]));",
+      "console.log(JSON.stringify(u));",
+      "const scratch: Record<string, unknown> = {};",
+      "scratch.buf = toU(new Uint8Array([1, 2, 3]));",
+      "console.log(JSON.stringify(scratch));",
+      "console.log(JSON.stringify(toU(new Uint8Array(0))));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(['{"0":1,"1":2,"2":3}', '{"buf":{"0":1,"1":2,"2":3}}', "{}", ""].join("\n"));
+});
+
+test("SEMANTICS.md S037: a real Buffer crossing the generic `unknown` path prints the WRONG (Uint8Array-flavored) answer on String() and JSON.stringify — pinning OUR tier's actual behavior, NOT Node's (Node: String(ub) is 'hi', JSON.stringify(ub) is {\"type\":\"Buffer\",\"data\":[104,105]} — measured, and deliberately NOT what this asserts)", async () => {
+  const res = await buildWasm(
+    "dyn-bytes-buffer-flag-false.ts",
+    [
+      "function toU(b: Uint8Array): unknown { return b; }",
+      "const ub = toU(Buffer.from('hi'));",
+      "console.log(String(ub));",
+      "console.log(JSON.stringify(ub));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  // OUR answer (S037): comma-joined elements, numeric-keyed JSON — the
+  // Uint8Array flavor, because the flag is pinned false at this generic
+  // crossing site. If this test ever starts asserting "hi" and
+  // {"type":"Buffer",...} instead, board #25 landed and S037's "Tested
+  // by" section needs updating to say so, not silent deletion.
+  expect(stdout.toString("utf8")).toBe(["104,105", '{"0":104,"1":105}', ""].join("\n"));
 });
