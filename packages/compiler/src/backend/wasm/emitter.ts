@@ -119,6 +119,7 @@ import {
   RACEE_SRC,
 } from "./promises.js";
 import { StrBuilder } from "./strings.js";
+import { BytesBuilder, type BytesElem } from "./typedarrays.js";
 import { TimerBuilder } from "./timers.js";
 import { UnionBuilder, type UnionArmRep } from "./unions.js";
 import { Code } from "./code.js";
@@ -4353,6 +4354,11 @@ class Assembler {
         const info = this.mapInfoFor(t, loc, false);
         return info === null ? null : this.maps.mapRef(info);
       }
+      case "bytes":
+        // ONE struct for every elem kind (typedarrays.ts) — this arm
+        // never fails; elem-kind-specific representation questions live
+        // at the bytesIntrinsic/bytesNew method sites, not here.
+        return this.bytesB.bytesRef();
       default:
         this.refuse(`type:${t.kind}`, loc);
         return null;
@@ -4406,6 +4412,7 @@ class Assembler {
           t.elem.kind === "dyn" ||
           t.elem.kind === "map" ||
           t.elem.kind === "set" ||
+          t.elem.kind === "bytes" ||
           (t.elem.kind === "object" && this.objectMappable(t.elem.className));
         if (!mappable) return I32;
         const kind =
@@ -4461,6 +4468,9 @@ class Assembler {
         const info = this.mapInfoFor(t, undefined, true);
         return info === null ? I32 : this.maps.mapRef(info);
       }
+      case "bytes":
+        // mapType never fails on bytes either — the consistency rule.
+        return this.bytesB.bytesRef();
       default:
         return I32;
     }
@@ -4977,11 +4987,17 @@ class Assembler {
         return;
       }
 
-      /* Stores into composites still waiting on the GC shape of the thing
-       * being written (bytes on the typed-array runtime). */
-      case "bytesSet":
-        this.refuse(`stmt:${s.kind}`, s.loc);
-        break;
+      /* Typed-array element write `b[i] = v` — OOB TRAPS (S003, amended
+       * for bytes), never a catchable exception, so no pending check. */
+      case "bytesSet": {
+        const rt = s.arr.type;
+        if (rt.kind !== "bytes") throw new Error("emitter bug: bytesSet on a non-bytes receiver");
+        this.walkExpr(s.arr);
+        this.walkExpr(s.index);
+        this.walkExpr(s.value);
+        code.call(this.bytesB.setElem(rt.elem));
+        return;
+      }
 
       case "runtimeFence":
         // SC9002 is the checker-proved-unreachable fallthrough trap
@@ -5678,10 +5694,11 @@ class Assembler {
           this.walkExpr(e.operand);
           return;
         }
-        if (k === "array" || k === "func" || k === "record" || k === "object" || k === "classval") {
+        if (k === "array" || k === "func" || k === "record" || k === "object" || k === "classval" || k === "bytes") {
           // Every object is truthy; evaluate for effects, answer true.
           // (A class-typed value is never null — null and undefined ride
-          // unions, whose own helper answers for them.)
+          // unions, whose own helper answers for them. map/set have the
+          // SAME gap — board #17, not this increment's.)
           this.walkExpr(e.operand);
           code.drop();
           code.i32Const(1);
@@ -8360,6 +8377,137 @@ class Assembler {
         return;
       }
 
+      /* Typed-array / Buffer construction (typedarrays.ts) — the four
+       * source forms (nodes.ts's bytesNew contract). Only the f64-length
+       * form can throw (Node's "Invalid typed array length" RangeError,
+       * may-throw.ts's seed). */
+      case "bytesNew": {
+        if (e.type.kind !== "bytes") throw new Error("emitter bug: bytesNew of non-bytes type");
+        const elem = e.type.elem;
+        if (e.source === null) {
+          code.f64Const(0);
+          code.call(this.bytesB.newLen(elem));
+          return;
+        }
+        if (e.source.type.kind === "f64") {
+          this.walkExpr(e.source);
+          code.call(this.bytesB.newLen(elem));
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.source.type.kind === "bytes") {
+          // Same-elem copy: slice(0, length) — a full-range slice IS a
+          // TypedArray copy constructor, so no separate "copy" helper.
+          const srcRef = this.bytesB.bytesRef();
+          const src = this.acquireScratch(srcRef);
+          this.walkExpr(e.source);
+          code.localSet(src);
+          code.localGet(src);
+          code.f64Const(0);
+          code.localGet(src);
+          code.call(this.bytesB.length());
+          code.call(this.bytesB.sliceHelper(elem));
+          this.releaseScratch(srcRef, src);
+          return;
+        }
+        if (e.source.type.kind === "array") {
+          this.walkExpr(e.source);
+          code.call(this.bytesB.fromArrLit(elem));
+          return;
+        }
+        throw new Error(`emitter bug: bytesNew source of kind ${e.source.type.kind}`);
+      }
+
+      /* Typed-array / Buffer method or property surface (typedarrays.ts).
+       * The stage-A subset; anything else keeps a named, per-method
+       * refusal (bytesIntrinsic:<method>) so the census stays honest. */
+      case "bytesIntrinsic": {
+        const rt = e.receiver.type;
+        if (rt.kind !== "bytes") throw new Error("emitter bug: bytesIntrinsic on a non-bytes receiver");
+        const elem = rt.elem;
+        switch (e.method) {
+          case "length":
+            this.walkExpr(e.receiver);
+            code.call(this.bytesB.length());
+            return;
+          case "byteLength":
+            this.walkExpr(e.receiver);
+            code.call(this.bytesB.byteLength(elem));
+            return;
+          case "byteOffset":
+            this.walkExpr(e.receiver);
+            code.call(this.bytesB.byteOffset());
+            return;
+          case "get":
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!);
+            code.call(this.bytesB.get(elem));
+            return;
+          case "slice":
+            this.walkExpr(e.receiver);
+            if (e.args[0] !== undefined) this.walkExpr(e.args[0]);
+            else code.f64Const(0);
+            if (e.args[1] !== undefined) this.walkExpr(e.args[1]);
+            else code.f64Const(Infinity);
+            code.call(this.bytesB.sliceHelper(elem));
+            return;
+          case "subarray":
+            this.walkExpr(e.receiver);
+            if (e.args[0] !== undefined) this.walkExpr(e.args[0]);
+            else code.f64Const(0);
+            if (e.args[1] !== undefined) this.walkExpr(e.args[1]);
+            else code.f64Const(Infinity);
+            code.call(this.bytesB.subarrayHelper(elem));
+            return;
+          case "setFrom":
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!);
+            if (e.args[1] !== undefined) this.walkExpr(e.args[1]);
+            else code.f64Const(0);
+            code.call(this.bytesB.setFromHelper(elem));
+            this.emitPendingCheck();
+            return;
+          case "toArray":
+            this.walkExpr(e.receiver);
+            code.call(this.bytesB.toArrayHelper(elem));
+            return;
+          case "join":
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!);
+            code.call(this.bytesB.joinHelper(elem));
+            return;
+          case "with":
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!);
+            this.walkExpr(e.args[1]!);
+            code.call(this.bytesB.withHelper(elem));
+            this.emitPendingCheck();
+            return;
+          case "toReversed":
+            this.walkExpr(e.receiver);
+            code.call(this.bytesB.toReversedHelper(elem));
+            return;
+          case "fillElem":
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!);
+            if (e.args[1] !== undefined) this.walkExpr(e.args[1]);
+            else code.f64Const(0);
+            if (e.args[2] !== undefined) this.walkExpr(e.args[2]);
+            else code.f64Const(Infinity);
+            code.call(this.bytesB.fillElemHelper(elem));
+            return;
+          case "equals":
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!);
+            code.call(this.bytesB.equalsHelper());
+            return;
+          default:
+            this.refuse(`bytesIntrinsic:${e.method}`, e.loc);
+            code.unreachable();
+            return;
+        }
+      }
+
       /* Unit values exist only inside unions (unionWrap intercepts them
        * before the walk, so a reached unitLit is refused loudly). */
       case "unitLit":
@@ -8368,9 +8516,6 @@ class Assembler {
       /* Regex — a whole engine, host-imported or compiled. */
       case "regexLit":
       case "regexIntrinsic":
-      /* Typed arrays. */
-      case "bytesNew":
-      case "bytesIntrinsic":
       /* Native FFI — a link-time C ABI, nothing to link against here. */
       case "ffiCall":
       /* Async, generators, promises. (awaitExpr/awaitUnionExpr never
@@ -8505,6 +8650,37 @@ class Assembler {
     return this.strsField;
   }
 
+  private bytesField: BytesBuilder | null = null;
+
+  /** Typed arrays / Buffer (typedarrays.ts), deps injected: number[]'s
+   * OWN interned vec(f64) info (bytesNew's array-literal source and
+   * toArray must produce/consume the SAME representation mapType(f64[])
+   * answers, not a second one), %w.toInt32 for JS-exact element coercion,
+   * and throwError wired to emitSetCellError — safe to call from a
+   * standalone helper (unlike emitUnwind, it takes no `this.fn` state). */
+  private get bytesB(): BytesBuilder {
+    this.bytesField ??= new BytesBuilder(this.mb, {
+      concat: () => this.concatHelper(),
+      f64ToStr: () => this.f64ToStrHelper(),
+      lit: (c, s) => this.pushStrLitInto(c, s),
+      strRef: () => this.strRef,
+      toInt32: () => this.toInt32Helper(),
+      f64Vec: () => this.f64VecInfo(),
+      f64VecNewLen: () => this.vecs.newLen(this.f64VecInfo()),
+      f64VecPush1: () => this.vecs.pushOne(this.f64VecInfo()),
+      throwError: (c, className, name, pushMessage) => this.emitSetCellError(c, className, name, pushMessage, null),
+    });
+    return this.bytesField;
+  }
+
+  /** The number[] vector info — the SAME interning a static `number[]`
+   * gets (vecKeyFor's default arm answers "f64" for an f64 element), so
+   * bytesNew's array-literal source and toArray never build a second,
+   * incompatible vec(f64) type. */
+  private f64VecInfo(): VecInfo {
+    return this.vecs.info("vec(f64)", F64, F64, "f64");
+  }
+
   /** The vector types for an IR array type; null (with the honest type
    * refusal already recorded) when the ELEMENT representation is out of
    * tier. The recursive key mirrors nesting: vec(vec(f64)) etc. */
@@ -8574,6 +8750,12 @@ class Assembler {
         return `map(${this.vecKeyFor(t.key)},${this.vecKeyFor(t.value)})`;
       case "set":
         return `set(${this.vecKeyFor(t.elem)})`;
+      case "bytes":
+        // Collision-proof: the default arm's bare `t.kind` would answer
+        // "bytes" for EVERY elem kind, colliding e.g. `Uint8Array[]` with
+        // `Uint32Array[]` into one (wrong) shared vector type (the
+        // increment-17 vecKeyFor bare-"map" bug, same class).
+        return `bytes:${t.elem}`;
       default:
         return t.kind;
     }
@@ -8740,7 +8922,7 @@ class Assembler {
         }
         if (
           k === "array" || k === "func" || k === "record" || k === "object" || k === "promise" ||
-          k === "classval" || k === "map" || k === "set"
+          k === "classval" || k === "map" || k === "set" || k === "bytes"
         ) {
           // Reference identity — JS object/function equality exactly.
           // Every one of these is a GC struct or array reference and
@@ -8760,7 +8942,14 @@ class Assembler {
           // Set<T>/Map<T,number> pair that happen to share one MapInfo
           // (maps.ts's "ONE representation" collapse) are still each
           // their OWN struct instance at CONSTRUCTION time, so identity
-          // stays honest even though their wasm TYPE is shared.
+          // stays honest even though their wasm TYPE is shared. Bytes:
+          // typedarrays.ts's $bytes struct is a plain GC ref like the
+          // others — a subarray() view is a FRESH struct (identity
+          // distinct from its owner even though it shares storage), and
+          // every elem kind shares the one struct type, so `Uint8Array ===
+          // Uint32Array`-typed comparisons still validate (never reached
+          // in practice — the checker types the operands apart — but the
+          // representation is honestly one ref type either way).
           //
           // The representation has to be REAL: an operand whose type the
           // tier cannot spell holds a placeholder i32, and `ref.eq` over

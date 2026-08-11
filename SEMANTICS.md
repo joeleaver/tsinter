@@ -52,6 +52,20 @@ semantic divergence from JS and the price of unboxed typed arrays.
 `T | undefined`. **Tested by:** diagnostics fixtures + corpus programs using
 `@exit:` lanes (cannot be differential-tested against Node by definition).
 
+**Amendment (increment 18, typed arrays):** the SAME discipline covers typed-
+array/Buffer element access. JS typed arrays read `undefined`/silently ignore
+a write outside `[0, length)`; neither is representable here (an unboxed f64
+read has no `undefined`, and a silently-ignored write is not a value at all),
+so `get`/the `bytesSet` statement TRAP on any out-of-bounds or non-integer
+index — an UNCATCHABLE abort on every tier that implements it, exactly S003's
+own stance and the same S007 exit-1 bridge on the wasm tier (the may-throw
+analysis counts runtime traps as aborts, so no pending check ever observes
+one). Unlike plain arrays, no corpus program can pin this for typed arrays
+either (a differential comparison against Node's `undefined`-returning read
+would fail by construction): the wasm emitter unit test covers it instead
+(OOB read, OOB write, and a non-integer index, per S003's own "cannot be
+differential-tested" note). **Tested by:** the wasm emitter unit test.
+
 ## S004 — Node platform APIs are refused, not emulated
 
 The static tier compiles the language and core stdlib (`Math`, `String`,
@@ -1334,3 +1348,103 @@ may-throw.ts's `!shape.indexValue` seed has required every native-lane
 caller to check the pending-exception cell after this call since
 index-signature records first shipped, so the wasm tier's implementation
 needed no NEW may-throw work, only matching the existing contract.
+
+## S034 — Wasm tier: typed-array/Buffer construction caps at 2^31 bytes *(wasm tier)*
+
+`new Uint8Array(n)` / `new Uint32Array(n)` / etc. and `new T([...])` TRAP
+(uncatchably) when the requested storage would be 2^31 BYTES or larger —
+`elementCount * elementSize ≥ 2^31`. Node has no such ceiling at this size:
+measured directly, `new Uint8Array(2147483648)` (exactly 2^31 bytes)
+succeeds under Node 24.18 (a real 2 GiB allocation). This tier's `$bytes`
+storage is one WasmGC `array (mut i8)`, whose length operand this backend
+truncates with a SIGNED i32 conversion (`i32.trunc_f64_s`, which itself
+traps outside `[-2^31, 2^31)`) — capping the guard at exactly that boundary
+keeps every byte-address computation inside signed-i32 arithmetic the rest
+of `typedarrays.ts` already assumes (index checks, `array.copy` lengths,
+`byteLength`'s `len * esize` multiply), rather than chasing a second,
+looser bound that would still need its own overflow story.
+
+The guard is ONE private helper, `BytesBuilder.emitByteSizeGuard` in
+`typedarrays.ts`, whose literal boundary constant — `2147483648` (2^31) —
+IS this entry's registered cap by construction (one source of truth, not
+two numbers that have to be kept in sync). It is called from the TWO
+construction sites that can produce an out-of-thin-air length — `newLen`
+(the ToIndex'd f64 argument, unbounded before this check) and `fromArrLit`
+(the source `number[]`'s element count, itself already capped below 2^31
+by arrays.ts's own vec-length guard, but a u32/i32/f32 element's
+`esize=4` multiplier can still carry the BYTE size past 2^31 even though
+the ELEMENT count alone would not, so it needs the identical check, not a
+smaller one). Every other bytes value (`slice`, `subarray`, `with`,
+`toReversed`, `fillElem`, the same-elem `bytesNew` copy form) derives its
+length from an already-valid receiver and never exceeds it, so these are
+the COMPLETE set of from-scratch allocation roots — guarding both is
+sufficient for the invariant `len * esize` never overflows i32 to hold
+everywhere `byteLength` (or any byte-address arithmetic) reads it.
+
+**Rationale:** an engineering limit of this tier's representation, not a
+deliberate semantic stance the way S003's typed-array-OOB amendment is —
+Node really does allow (memory permitting) requests past this boundary,
+and a program relying on that is depending on gigabytes of storage either
+way (the same "real programs in this zone are already extreme" reasoning
+as S008's size cap). Without the guard, the wasm-tier failure mode is
+worse than a trap: `elementCount * esize` computed in i32 arithmetic AFTER
+an incidental `i32.trunc_f64_s` (which only traps for element counts, not
+byte counts) silently WRAPS mod 2^32, producing a byte-mismatched
+allocation smaller than `byteLength` then reports — a miscompile, not an
+honest failure, which is what this entry exists to rule out. **Tested by:**
+the wasm emitter unit test pins the trap side through `newLen` (a length
+whose byte size is exactly the 2^31 boundary); a second, direct-
+ModuleBuilder test pins the SAME guard reached through `fromArrLit` — a
+fake `vec(f64)` struct whose `LEN` field claims 2^29 elements (×4 bytes =
+exactly 2^31) over a REAL backing array of length 0, since the guard reads
+only `LEN` before ever touching the backing array, so this exercises the
+real instruction sequence without an actual multi-GB allocation. The
+just-under-cap SUCCESS path is deliberately untested on both roots, the
+same call S008 makes: a corpus program cannot exercise a ~2 GiB allocation
+without a multi-GB memory appetite.
+
+## S035 — Pooled-Buffer `byteOffset` is always 0, where Node's is a nondeterministic pool offset *(wasm tier)*
+
+Node allocates `Buffer.from(...)` and `Buffer.allocUnsafe(...)` out of a
+shared, per-process pool (a `Buffer.poolSize`-sized backing `ArrayBuffer`
+— 65536 bytes, measured on Node 24.18 — that successive small allocations
+carve slices from), so their `.byteOffset` answers the CURSOR POSITION
+into that pool at allocation time — a value that climbs across calls
+within one process and resets to 0 when a fresh chunk starts. It is
+HISTORY-DEPENDENT, not merely varying: two Node 24.18 processes each ran
+`Buffer.from([1,2,3])` twice as their first pooled allocations and
+measured DIFFERENT second offsets (`0` then `16` in one process, `0` then
+`8` in another) — the cursor's step depends on allocation state the
+program neither sees nor controls.
+`Buffer.from("abc")` is pooled too — stage B relevance: `buffer.fromStr`'s
+eventual pooling story, if any, inherits this same divergence. `Buffer.alloc(...)` and
+`new Uint8Array(...)` do NOT pool — both measured `0` on every call,
+matching this tier's answer for them already (`bytesB.byteOffset()` on an
+OWNING, non-view bytes value is always `0`, since `off` starts at 0 and
+only view construction (`subarray`) ever advances it).
+
+This tier never pools: `Buffer.from`/`Buffer.allocUnsafe` allocate their
+own storage exactly like `Buffer.alloc`, so their `byteOffset` is always
+`0` here, unconditionally — a real, permanent divergence from Node for
+these two constructors specifically (not merely "untested"; Node's answer
+for them is `0` only when the allocation happens to land at a chunk start,
+an accident of prior allocation history the program cannot control).
+
+**Rationale:** implementing Node's pool would mean modeling a SECOND,
+shared allocator with its own chunk-boundary and remnant-fragment rules
+purely to make one property (`byteOffset`) match a value that is itself
+NONDETERMINISTIC even under Node — which is also why no corpus program
+could pin Node's side of this without being flaky against the real Node
+oracle it differentials against (the S008-style "why no corpus pin"
+argument: the divergent value isn't just hard to reach, it doesn't HOLD
+STILL on the reference implementation either, so byte-exact differential
+testing is not merely impractical here but definitionally impossible).
+Pooling exists in Node as a GC-pressure optimization with no OTHER
+observable effect (reads/writes/length/content are unaffected — only the
+numeric `byteOffset` and the fact that two small buffers may share one
+underlying `ArrayBuffer`, itself unobservable without `.buffer` identity
+comparison, a surface this tier doesn't expose). **Tested by:** the wasm
+emitter unit test's bytes validate-sweep prints `a.byteOffset` for a
+`Buffer.from(...)`-constructed value and pins `0` — that assertion is
+OUR answer, not Node's, and is commented as such with this citation so
+the test does not silently claim a Node-parity it does not have.

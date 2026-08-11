@@ -339,6 +339,26 @@ export class Code {
   f64ReinterpretI64(): void {
     this.w.u8(0xbf);
   }
+  /** f32.demote_f64 — round-to-nearest-even, exactly Float32Array's
+   * element-write coercion (the bytes runtime's f32 element store). */
+  f32DemoteF64(): void {
+    this.w.u8(0xb6);
+  }
+  /** f64.promote_f32 — exact (every f32 value is exactly representable in
+   * f64), the bytes runtime's f32 element-read widen. */
+  f64PromoteF32(): void {
+    this.w.u8(0xbb);
+  }
+  /** i32.reinterpret_f32 — the f32 bit pattern as i32, for scattering an
+   * f32 element into its 4 little-endian storage bytes. */
+  i32ReinterpretF32(): void {
+    this.w.u8(0xbc);
+  }
+  /** f32.reinterpret_i32 — the inverse: 4 assembled LE bytes' bit pattern
+   * read back as f32 (then f64PromoteF32 widens). */
+  f32ReinterpretI32(): void {
+    this.w.u8(0xbe);
+  }
   refEq(): void {
     this.w.u8(0xd3);
   }

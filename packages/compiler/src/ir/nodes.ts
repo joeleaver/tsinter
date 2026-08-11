@@ -62,14 +62,29 @@ export type IrType =
   /** A typed array / Node Buffer (Uint8Array, Uint32Array, Float32Array;
    * Buffer IS a Uint8Array subclass and shares the u8 kind) — heap,
    * refcounted, MUTABLE, fixed-length, with ONE runtime representation
-   * (ScrBytes) that OWNS its storage: no views exist — subarray()/slice()
-   * both COPY (documented divergence for subarray), `.buffer`/
-   * `.byteOffset`/DataView are frontend-fenced. Element reads widen to
-   * f64; writes coerce JS-exactly (ToUint8/ToUint32 modular truncation,
-   * double→float rounding). OOB element access traps like arrays. Allowed
-   * as array elements and union arms (tag-based narrowing, like url);
-   * fenced out of map keys/values, set elements, and JSON. Holds only raw
-   * bytes — never part of a cycle, no trace. */
+   * (ScrBytes) that OWNS-OR-VIEWS its storage: `subarray()` and Buffer's
+   * `slice()`/`subarray()` are real VIEWS aliasing the receiver's storage
+   * (mutations visible both ways, matching Node exactly — NOT a copy;
+   * an earlier draft of this comment claimed otherwise and was stale —
+   * measured against Node directly, increment 18); only the plain
+   * TypedArray's `slice()` copies. `.byteOffset`/DataView ride the same
+   * view machinery — DataView maps to this SAME bytes<u8> kind
+   * (frontend/types.ts:1420-1426: "the ONE view kind... The checker keeps
+   * the DataView and typed-array member surfaces apart; at the IR level
+   * both are bytes<u8>", direct confirmation this comment's old "no views
+   * exist" claim was stale, not just an inference from the lowering).
+   * `.buffer` stays frontend-fenced (peeled away syntactically at `new
+   * DataView(x.buffer, ...)`/`Buffer.from(x.buffer, ...)` call sites —
+   * ArrayBuffer/SharedArrayBuffer bare values are name-fenced by the
+   * frontend, lowerer.ts:2548-2549 + surfaces.ts:1407-1412 +
+   * lower-exprs.ts:3331-3338, so no free-standing ArrayBuffer value ever
+   * reaches a backend and none needs a representation OR a refusal).
+   * Element reads widen to f64; writes coerce JS-exactly (ToUint8/
+   * ToUint32 modular truncation, double→float rounding). OOB element
+   * access traps like arrays. Allowed as array elements and union arms
+   * (tag-based narrowing, like url); fenced out of map keys/values, set
+   * elements, and JSON. Holds only raw bytes — never part of a cycle, no
+   * trace. */
   | { kind: "bytes"; elem: IrBytesElem }
   /** A WHATWG URL instance (scr_url.c): heap, refcounted, IMMUTABLE — the
    * parsed components are frozen at construction, so getters are pure
@@ -1411,9 +1426,14 @@ export type IrStrIntrinsicMethod =
  * `setFrom` (`dst.set(src, offset?)`) takes a
  * same-elem bytes src and an optional f64 offset (omitted = 0) → void,
  * THROWS Node's RangeError on overflow (may-throw seed); `toString` takes
- * one string encoding arg (the frontend completes an omitted one to
- * "utf8" and fences non-literal / unsupported encodings; u8 receivers
- * only) → owned +1 string, never throws; the numeric families (u8
+ * a string encoding arg plus an OPTIONAL 0–2 f64 [start, end) byte window
+ * (the frontend completes an omitted encoding to "utf8", fences
+ * non-literal/unsupported encodings, and — this is the validated
+ * contract, not "one encoding arg only" as an earlier draft of this
+ * comment claimed — supplies the receiver's length for an omitted `end`
+ * of the 2-arg range form, since an explicit negative end clamps to empty
+ * in Node and no in-band sentinel can represent "omitted" safely; u8
+ * receivers only) → owned +1 string, never throws; the numeric families (u8
  * receivers only) carry their KIND as args[0], always a strLit the
  * backend maps to the runtime's tag: `readNum` [kind, offset] /
  * `writeNum` [kind, value, offset] cover the fixed widths (kind "u8",

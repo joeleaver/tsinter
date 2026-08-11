@@ -3807,3 +3807,362 @@ test("S009 amendment: a dynamic-keyed write validates a declared field's type on
   const { stdout } = await runWasm(res.binaryPath);
   expect(stdout.toString("utf8")).toBe("caught: expected number at $.known, got string 1\n");
 });
+
+test("bytes: construction forms, length/byteLength, and the element coercion matrix", async () => {
+  // The four bytesNew source forms (empty, ToIndex length, same-elem
+  // copy, number[] coerced copy) plus JS-exact element write coercion
+  // across every elem kind (increment 18 stage A's core surface).
+  const res = await buildWasm(
+    "bytes-core.ts",
+    [
+      "const a = new Uint8Array(4);",
+      "console.log(a.length, a.byteLength);",
+      "a[0] = 256; a[1] = -1; a[2] = 3.9; a[3] = NaN;",
+      "console.log(a[0], a[1], a[2], a[3]);",
+      "const u = new Uint32Array(2);",
+      "u[0] = 4294967296; u[1] = -1;",
+      "console.log(u[0], u[1], u.byteLength);",
+      "const i = new Int32Array(1);",
+      "i[0] = 4294967295;",
+      "console.log(i[0]);",
+      "const f = new Float32Array(1);",
+      "f[0] = 0.1;",
+      "console.log(f[0]);",
+      "console.log(new Uint8Array(3.7).length, new Uint8Array(NaN).length, new Uint8Array().length);",
+      "const seeded = new Uint8Array([1, 2.7, -1, 256]);",
+      "console.log(seeded[0], seeded[1], seeded[2], seeded[3]);",
+      "const copy = new Uint8Array(seeded);",
+      "copy[0] = 9;",
+      "console.log(seeded[0], copy[0]);",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "4 4",
+      "0 255 3 0",
+      "0 4294967295 8",
+      "-1",
+      "0.10000000149011612",
+      "3 0 0",
+      "1 2 255 0",
+      "1 9",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("S003 amendment: typed-array out-of-bounds get traps", async () => {
+  const res = await buildWasm(
+    "bytes-oob-get.ts",
+    ['console.log("pre");', 'const a = new Uint8Array(2);', "console.log(a[2]);", ""].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const run = await runWasmToTrap(res.binaryPath);
+  expect(run.stdout.toString("utf8")).toBe("pre\n");
+});
+
+test("S003 amendment: typed-array out-of-bounds set traps", async () => {
+  const res = await buildWasm(
+    "bytes-oob-set.ts",
+    ['console.log("pre");', 'const a = new Uint8Array(2);', "a[2] = 1;", 'console.log("unreached");', ""].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const run = await runWasmToTrap(res.binaryPath);
+  expect(run.stdout.toString("utf8")).toBe("pre\n");
+});
+
+test("S003 amendment: a non-integer typed-array index traps", async () => {
+  const res = await buildWasm(
+    "bytes-frac-index.ts",
+    ['console.log("pre");', 'const a = new Uint8Array(2);', "console.log(a[0.5]);", ""].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const run = await runWasmToTrap(res.binaryPath);
+  expect(run.stdout.toString("utf8")).toBe("pre\n");
+});
+
+test("bytes: subarray is a VIEW (aliases the owner), plain slice COPIES", async () => {
+  // Measured against Node directly: subarray()/Buffer's slice() alias;
+  // only the plain TypedArray slice() copies — the nodes.ts comment this
+  // increment fixed had it backwards.
+  const res = await buildWasm(
+    "bytes-views.ts",
+    [
+      "const a = new Uint8Array([1, 2, 3, 4]);",
+      "const sub = a.subarray(1, 3);",
+      "sub[0] = 99;",
+      "console.log(a[1], sub.length, sub[0] !== a[0]);",
+      "const cp = a.slice(1, 3);",
+      "cp[0] = 111;",
+      "console.log(a[1], cp[0]);",
+      "const inner = sub.subarray(1, 2);",
+      "inner[0] = 5;",
+      "console.log(a[2], inner.byteOffset, sub.byteOffset, a.byteOffset);",
+      "console.log(a.subarray(0) !== a, a.subarray(0).length === a.length);",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(["99 2 true", "99 111", "5 2 1 0", "true true", ""].join("\n"));
+});
+
+test("bytes: new Uint8Array(n)'s RangeError renders the ORIGINAL argument, not its truncation", async () => {
+  // Measured against Node directly (`new Uint8Array(-1.5)`): the message
+  // is "...length: -1.5", NOT the C runtime's trunc-first "...length: -1"
+  // — a genuine scr_bytes.c-vs-Node divergence this port does NOT
+  // replicate (reported to the PM as a C-lane correction, out of scope
+  // to fix there).
+  const res = await buildWasm(
+    "bytes-new-rangeerror.ts",
+    [
+      "try {",
+      "  new Uint8Array(-1.5);",
+      "  console.log('no-throw');",
+      "} catch (e) {",
+      "  if (e instanceof RangeError) console.log('caught:', (e as Error).message);",
+      "  else console.log('other');",
+      "}",
+      "try {",
+      "  new Uint8Array(Infinity);",
+      "} catch (e) {",
+      "  console.log('caught:', (e as Error).message);",
+      "}",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    ["caught: Invalid typed array length: -1.5", "caught: Invalid typed array length: Infinity", ""].join("\n"),
+  );
+});
+
+test("bytes: with()/setFrom()'s constant RangeError messages, and identity", async () => {
+  const res = await buildWasm(
+    "bytes-with-setfrom.ts",
+    [
+      "const a = new Uint8Array([1, 2, 3]);",
+      "const w = a.with(1, 9);",
+      "console.log(w !== a, w.join(','), a.join(','));",
+      "try {",
+      "  a.with(10, 0);",
+      "  console.log('no-throw');",
+      "} catch (e) {",
+      "  console.log('caught:', (e as Error).message);",
+      "}",
+      "const dst = new Uint8Array(2);",
+      "try {",
+      "  dst.set(new Uint8Array([1, 2, 3]));",
+      "  console.log('no-throw');",
+      "} catch (e) {",
+      "  console.log('caught:', (e as Error).message);",
+      "}",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "true 1,9,3 1,2,3",
+      "caught: Invalid typed array index",
+      "caught: offset is out of bounds",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("bytes: fillElem is per-element, clamping, never throws, and returns the receiver", async () => {
+  const res = await buildWasm(
+    "bytes-fillelem.ts",
+    [
+      "const u = new Uint32Array(5);",
+      "const r = u.fill(7);",
+      "console.log(r === u, u[0], u[4]);",
+      "u.fill(0x1_0000_0002, 1, 3);",
+      "console.log(u[0], u[1], u[2], u[3]);",
+      "u.fill(3, -2);",
+      "console.log(u[2], u[3], u[4]);",
+      "const i = new Int32Array(2);",
+      "i.fill(-5.9);",
+      "console.log(i[0], i[1]);",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(["true 7 7", "7 2 2 7", "2 3 3", "-5 -5", ""].join("\n"));
+});
+
+test("bytes: validate-sweep — every %w.bytes.* helper, every legal elem kind, emits a VALID module", async () => {
+  // A helper no test calls is a helper no test even validates
+  // (WebAssembly.validate, not just `compile()` reporting success) — the
+  // gap that let equalsHelper's local-type bug (A1) through review. This
+  // sweep force-emits every typedarrays.ts helper across every elem kind
+  // the lowering legally routes it to: bytesNew's four source forms,
+  // get/bytesSet, length/byteLength/byteOffset, slice/subarray, setFrom,
+  // toArray (reached only via spread — `[...x]` — never a callable
+  // member), and — u8-only, per the Buffer/TypedArray lowering gates —
+  // join/with/toReversed/equals; u32/i32/f32 additionally exercise
+  // fillElem (their non-u8 fill path). Grow this sweep as stages B/C add
+  // helpers.
+  const res = await buildWasm(
+    "bytes-validate-sweep.ts",
+    [
+      "function sweep(): void {",
+      "  const a = Buffer.from([1, 2, 3, 4]);",
+      "  const aCopy = Buffer.from(a);",
+      "  const aLen = Buffer.alloc(3);",
+      "  const aEmpty = new Uint8Array();",
+      "  console.log(a.length, a.byteLength, a.byteOffset);",
+      "  console.log(a[0]);",
+      "  a[0] = 9;",
+      "  console.log(a.slice(1, 3).length, a.subarray(1, 3).length);",
+      "  const dst = Buffer.alloc(4);",
+      "  dst.set(a, 0);",
+      "  console.log([...a].length, a.join(','), a.with(0, 5).length, a.toReversed().length, a.equals(aCopy));",
+      "  console.log(aLen.length, aEmpty.length, dst.length);",
+      "",
+      "  const u = new Uint32Array([1, 2, 3]);",
+      "  const uCopy = new Uint32Array(u);",
+      "  const uLen = new Uint32Array(2);",
+      "  const uEmpty = new Uint32Array();",
+      "  console.log(u.length, u.byteLength, u.byteOffset);",
+      "  console.log(u[0]);",
+      "  u[0] = 9;",
+      "  console.log(u.slice(1, 2).length, u.subarray(1, 2).length);",
+      "  const udst = new Uint32Array(3);",
+      "  udst.set(u, 0);",
+      "  console.log([...u].length);",
+      "  u.fill(7, 0, 1);",
+      "  console.log(uLen.length, uEmpty.length, uCopy.length, udst.length);",
+      "",
+      "  const i = new Int32Array([1, 2, 3]);",
+      "  const iCopy = new Int32Array(i);",
+      "  const iLen = new Int32Array(2);",
+      "  const iEmpty = new Int32Array();",
+      "  console.log(i.length, i.byteLength, i.byteOffset);",
+      "  console.log(i[0]);",
+      "  i[0] = -9;",
+      "  console.log(i.slice(1, 2).length, i.subarray(1, 2).length);",
+      "  const idst = new Int32Array(3);",
+      "  idst.set(i, 0);",
+      "  console.log([...i].length);",
+      "  i.fill(-7, 0, 1);",
+      "  console.log(iLen.length, iEmpty.length, iCopy.length, idst.length);",
+      "",
+      "  const f = new Float32Array([1.5, 2.5, 3.5]);",
+      "  const fCopy = new Float32Array(f);",
+      "  const fLen = new Float32Array(2);",
+      "  const fEmpty = new Float32Array();",
+      "  console.log(f.length, f.byteLength, f.byteOffset);",
+      "  console.log(f[0]);",
+      "  f[0] = 9.5;",
+      "  console.log(f.slice(1, 2).length, f.subarray(1, 2).length);",
+      "  const fdst = new Float32Array(3);",
+      "  fdst.set(f, 0);",
+      "  console.log([...f].length);",
+      "  f.fill(7.5, 0, 1);",
+      "  console.log(fLen.length, fEmpty.length, fCopy.length, fdst.length);",
+      "}",
+      "sweep();",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      // "4 4 0": the trailing 0 is `a.byteOffset` for a Buffer.from(...)
+      // value — OUR answer (we never pool), not Node's. Node pools
+      // Buffer.from/allocUnsafe out of a shared per-process buffer, so
+      // its byteOffset there is a NONDETERMINISTIC, climbing pool cursor
+      // (measured: 0 then 16 across two calls in one process) — SEMANTICS.md
+      // S035. The u32/i32/f32 sweep's own "...0" byteOffset answers below
+      // (plain `new TypedArray(...)`, never pooled by Node either) are
+      // genuine Node parity, not this same divergence.
+      "4 4 0",
+      "1",
+      "2 2",
+      "4 9,2,3,4 4 4 false",
+      "3 0 4",
+      "3 12 0",
+      "1",
+      "1 1",
+      "3",
+      "2 0 3 3",
+      "3 12 0",
+      "1",
+      "1 1",
+      "3",
+      "2 0 3 3",
+      "3 12 0",
+      "1.5",
+      "1 1",
+      "3",
+      "2 0 3 3",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("bytes: equals — length mismatch, content mismatch, self, empty, and a nonzero-offset VIEW", async () => {
+  const res = await buildWasm(
+    "bytes-equals.ts",
+    [
+      "const a = Buffer.from([1, 2, 3]);",
+      "const b = Buffer.from([1, 2, 3]);",
+      "const c = Buffer.from([1, 2, 4]);",
+      "const shorter = Buffer.from([1, 2]);",
+      "console.log(a.equals(b), a.equals(c), a.equals(shorter), a.equals(a));",
+      "const empty1 = Buffer.alloc(0);",
+      "const empty2 = Buffer.alloc(0);",
+      "console.log(empty1.equals(empty2));",
+      "const owner = Buffer.from([9, 1, 2, 3, 9]);",
+      "const view = owner.subarray(1, 4);",
+      "console.log(view.equals(a), view.equals(c));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(["true false false true", "true", "true false", ""].join("\n"));
+});
+
+test("S034: typed-array construction traps when the requested BYTE size is at or past 2^31", async () => {
+  // Node itself allows this (measured: `new Uint8Array(2147483648)`
+  // succeeds under Node 24.18 — a real 2 GiB allocation); this tier's
+  // WasmGC array length is bounded by a SIGNED i32 conversion, so the
+  // guard traps deterministically before that conversion can misbehave.
+  // The just-under-cap SUCCESS path is deliberately untested (S008's own
+  // precedent: no corpus program can carry a ~2 GiB appetite).
+  const res = await buildWasm(
+    "bytes-alloc-cap.ts",
+    ['console.log("pre");', "new Uint8Array(2147483648);", 'console.log("unreached");', ""].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const run = await runWasmToTrap(res.binaryPath);
+  expect(run.stdout.toString("utf8")).toBe("pre\n");
+});
+
+test("bytes: every typed array is truthy, empty or not (`if (buf)` const-true)", async () => {
+  const res = await buildWasm(
+    "bytes-truthy.ts",
+    [
+      "const empty = new Uint8Array();",
+      "const nonEmpty = new Uint8Array([1]);",
+      "console.log(empty ? 'truthy' : 'falsy', nonEmpty ? 'truthy' : 'falsy');",
+      "console.log(!!empty, !!nonEmpty);",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(["truthy truthy", "true true", ""].join("\n"));
+});

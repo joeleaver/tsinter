@@ -1177,6 +1177,20 @@ const TIER_FLOOR: string[] = [
   "1011-json-unknown-typeof.ts",
   "1525-unknown-typeof-validation.ts",
   "1575-unknown-assert-into-record.ts",
+  // Increment 18 stage A (typed arrays — the core): the $bytes struct
+  // (typedarrays.ts), all four bytesNew source forms, get/bytesSet with
+  // JS-exact element coercion, length/byteLength/byteOffset, slice
+  // (copy) vs subarray (VIEW — the design doc's owner-flattening-for-
+  // free stance), setFrom, toArray, join, with/toReversed, fillElem, and
+  // the union-arm/vecKeyFor/mapType plumbing bytes now rides. The array-
+  // iterator protocol for typed arrays (2668) needed NO new machinery
+  // beyond the representation existing — it was already generic over any
+  // indexable element type.
+  "1400-typedarray-basics.ts",
+  "2668-stored-number-array-iterator.ts",
+  // A record field union-arm (`Uint8Array | string`) plus `.length` on
+  // the narrowed bytes arm — the union-arm plumbing's own claim.
+  "1455-lambda-union-return-adoption.ts",
 ];
 
 interface RunResult {
