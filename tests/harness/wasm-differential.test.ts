@@ -1250,6 +1250,14 @@ const TIER_FLOOR: string[] = [
   // wired from R1, so this one claimed without needing a fix of its own.
   "916-unknown-bytes.ts",
   "1451-instanceof-uint8array-unknown.ts",
+  // Increment 18 stage C, round R3 (closing the increment): insp.buffer,
+  // the STATIC-typed-Buffer inspect path (lower-inspect.ts's own
+  // checker-type isBuffer gate — a real, non-dyn Buffer variable, not the
+  // dyn walker's flag-aware BYTES arm R2 built). The wasm backend had no
+  // dispatch for the "insp.buffer" libCall at all; it now calls the SAME
+  // `bufferForm` helper (inspect.ts) the dyn walker's Buffer arm already
+  // used, unmodified — no new runtime code, just the missing wire-up.
+  "1635-inspect-buffer.ts",
 ];
 
 interface RunResult {

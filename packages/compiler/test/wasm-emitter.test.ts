@@ -6666,3 +6666,70 @@ test("SEMANTICS.md S037: a real Buffer crossing the generic `unknown` path print
   // by" section needs updating to say so, not silent deletion.
   expect(stdout.toString("utf8")).toBe(["104,105", '{"0":104,"1":105}', ""].join("\n"));
 });
+
+test("union: `Buffer | string`.toString() — the bytes arm decodes UTF-8 through the SAME per-union %w.u.toStr helper the scalar arms use (corpus 1566's own construct), including the empty-buffer and multi-byte-UTF-8 edges", async () => {
+  const res = await buildWasm(
+    "union-tostring-bytes.ts",
+    [
+      "function pick(n: number): Buffer | string {",
+      "  return n > 0 ? Buffer.from([0xe2, 0x9c, 0x93]) : 'plain';",
+      "}",
+      "console.log(pick(1).toString());",
+      "console.log(pick(0).toString());",
+      "function pickEmpty(n: number): Buffer | string {",
+      "  return n > 0 ? Buffer.alloc(0) : '';",
+      "}",
+      "console.log(JSON.stringify(pickEmpty(1).toString()));",
+      "console.log(JSON.stringify(pickEmpty(0).toString()));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  // Buffer.from([0xe2,0x9c,0x93]) is the UTF-8 encoding of U+2713 (✓) —
+  // the union arm's UTF-8 decode, not a comma-joined element list. A
+  // plain (non-Buffer) Uint8Array arm would print "226,156,147" instead;
+  // SEMANTICS.md S038 registers that this tier answers Buffer-flavored
+  // UNCONDITIONALLY for every bytes union arm (matching the pre-existing
+  // C/LLVM stance), so that case is deliberately NOT asserted here.
+  //
+  // Note: `String(x)`/template-literal ToString on this SAME union type
+  // is a DIFFERENT frontend gate (ensureString's own `stringable` list,
+  // lower-exprs.ts) that does not admit bytes arms at all yet — a
+  // pre-existing, separate refusal (SC1090) untouched by this round; only
+  // the explicit `.toString()` method call (lowerUnionToStringCall) is in
+  // scope here, matching corpus 1566's own spelling.
+  expect(stdout.toString("utf8")).toBe(["✓", "plain", '""', '""', ""].join("\n"));
+});
+
+test("insp.buffer: the STATIC-typed-Buffer path (console.log of a real, non-dyn Buffer) — the 49/50/51/52 INSPECT_MAX_BYTES truncation seam pinned directly against Node (corpus 1635 covers 50/51/52/200 differentially; this adds 49, one below the boundary, with all four side by side), plus an explicit cross-check that this NEW call site's `bufferForm()` reuse is byte-identical to the dyn walker's EXISTING isBuffer=true consumer (wasm-bytes-flag.test.ts's own '<Buffer 01 02 03>' assertion for the SAME [1,2,3] content) — not merely inferred across files", async () => {
+  const { inspect } = await import("node:util");
+  const bytesOf = (n: number): number[] => Array.from({ length: n }, (_, i) => (i * 7 + 1) % 251);
+  const lengths = [49, 50, 51, 52];
+  const res = await buildWasm(
+    "insp-buffer-truncation.ts",
+    [
+      ...lengths.map((n) => `console.log(Buffer.from([${bytesOf(n).join(",")}]));`),
+      "console.log(Buffer.from([1, 2, 3]));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  const lines = stdout.toString("utf8").split("\n");
+  // Node itself is the oracle for the expected strings (real Buffer + real
+  // util.inspect) — no hand-rolled formatter, so a mistake in an
+  // expectation here can't cancel a mistake in the emitter.
+  lengths.forEach((n, i) => {
+    expect(lines[i]).toBe(inspect(Buffer.from(bytesOf(n))));
+  });
+  // The cross-path consistency check: this NEW static insp.buffer call
+  // site's output for [1,2,3] must be byte-identical to the dyn walker's
+  // EXISTING isBuffer=true consumer's own assertion for the same content
+  // (wasm-bytes-flag.test.ts, "inspect.ts's dyn walker" test) — both call
+  // the SAME `bufferForm()` (inspect.ts), so a divergence here would mean
+  // a second, subtly different renderer crept in despite the reuse claim.
+  expect(lines[4]).toBe("<Buffer 01 02 03>");
+});

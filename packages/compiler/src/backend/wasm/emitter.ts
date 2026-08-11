@@ -1865,6 +1865,7 @@ class Assembler {
     this.unionsField ??= new UnionBuilder(this.mb, {
       strEq: () => this.strEqHelper(),
       f64ToStr: () => this.f64ToStrHelper(),
+      bytesToStrUtf8: () => this.bytesB.toStrHelper("utf8"),
       strRef: () => this.strRef,
       lit: (c, s) => this.pushStrLitInto(c, s),
     });
@@ -3943,10 +3944,21 @@ class Assembler {
       }
       if (need === "toStr") {
         // The frontend fences union ToString to unit/string/f64/bool
-        // arms plus bytes (scr_bytes_to_str's surface — not in tier).
+        // arms plus bytes (lowerUnionToStringCall's own `elem === "u8"`
+        // gate, so a non-u8 arm reaching here would itself be a frontend
+        // fence breach — never observed, defended below). A bytes arm's
+        // rendering is the SAME utf8-decode `scr_bytes_to_str` gives every
+        // other backend UNCONDITIONALLY (no isBuffer distinction exists
+        // at this layer — see unions.ts's toStr doc): this tier's union
+        // ToString has never carried a Buffer-vs-plain-Uint8Array flag,
+        // on any backend, so wasm simply matches C/LLVM's existing,
+        // already-oracle-checked stance rather than inventing a new one.
         if (arm.kind === "bytes") {
-          this.refuse("toString:union-arm:bytes", loc);
-          return null;
+          if (arm.elem !== "u8") {
+            throw new Error(`ToString over a union bytes<${arm.elem}> arm (frontend fence breached)`);
+          }
+          reps.push({ kind: "bytes", struct: this.unionArmStruct(unionId, i, loc) });
+          continue;
         }
         // Class arms MAP now, so a breach here would build a helper with
         // no rendering for the arm instead of failing the fence. Object
@@ -6883,6 +6895,17 @@ class Assembler {
           // throws.
           this.walkExpr(e.args[0]!);
           code.call(this.insp.key());
+          return;
+        }
+        if (e.fn === "insp.buffer") {
+          // util.inspect/console.log of a STATICALLY-typed Buffer
+          // (lower-inspect.ts's isBuffer checker-type gate — only reaches
+          // here for a real, u8-elem Buffer): `bufferForm`'s own
+          // `<Buffer aa bb ..>` hex renderer, the SAME self-contained
+          // helper the dyn walker's BYTES/isBuffer arm calls (inspect.ts).
+          // Never throws.
+          this.walkExpr(e.args[0]!);
+          code.call(this.insp.bufferForm());
           return;
         }
         if (e.fn === "insp.dyn" || e.fn === "insp.dynS") {

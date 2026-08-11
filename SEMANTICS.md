@@ -2002,3 +2002,56 @@ stringifyDyn, and inspect.ts's dyn walker, each checked both ways);
 `wasm-emitter.test.ts` has the flag-false-but-divergent assertion (for a
 real Buffer that DID cross generically) that pins THIS tier's answer with
 an explicit citation to this entry, never Node's.
+
+## S038 — A `Buffer | string`-shaped union's `.toString()` treats the bytes arm as Buffer UNCONDITIONALLY, even when the runtime value is a plain `Uint8Array` *(wasm tier, shared with the LLVM and C lanes)*
+
+Node's `.toString()`/`String(x)` on a bytes value depends on the ACTUAL
+constructor: `Buffer.prototype.toString()` UTF-8-decodes (measured:
+`Buffer.from([0x61,0x62,0x63]).toString()` is `"abc"`); a plain
+`Uint8Array` inherits `Object.prototype.toString`'s array-like path and
+joins elements with commas (measured: `new Uint8Array([0x61,0x62,0x63])
+.toString()` is `"97,98,99"`) — two genuinely different renderings, not a
+formatting nuance. `lowerUnionToStringCall` (lower-calls.ts) admits a
+union arm into the shared per-union ToString helper whenever it is
+`bytes<u8>`, with no isBuffer test, because — same root cause S037 traces
+for the dyn-crossing boundary — `Buffer` and `Uint8Array` are ONE IR type
+(`bytes<u8>`) with no marker distinguishing them; nothing survives to
+read a provenance bit even if the call site wanted one. The per-union
+`%w.u.toStr:<id>` helper (unions.ts, wired in increment 18 R3) therefore
+renders EVERY bytes arm via the unconditional UTF-8 decode
+(`bytesToStrUtf8`/`scr_bytes_to_str`), matching Buffer exactly and
+diverging from Node for a plain-`Uint8Array` arm.
+
+**Not a new divergence this round introduces.** The C backend's `sc_us_N`
+generated switch (`emit-walkers.ts:219`) already calls
+`scr_bytes_to_str` unconditionally for a union's bytes arm, with no
+isBuffer branch — this stance predates increment 18 entirely. Wiring the
+wasm lane's `%w.u.toStr` the same way (this round) makes wasm consistent
+with the two lanes that already had this gap, rather than inventing a
+third, independently-wrong answer.
+
+**No corpus program can exercise the wrong case and pass, on any lane —
+S037's argument applies unchanged.** A program computing a genuinely
+plain (non-Buffer) `Uint8Array` into a `Uint8Array | string`-typed
+receiver and calling `.toString()`/`String()` on it would print the
+WRONG, Buffer-flavored (UTF-8-decoded) text on C, LLVM, and wasm alike —
+so it would never have passed the byte-exact-against-Node differential on
+any backend, at any point, and the corpus's silence on this exact shape
+is structural, not an oversight. The corpus's actual `Buffer | string`
+union-ToString program (1566-child-duck-interface.ts) only ever
+constructs the Buffer arm, which is why it passes cleanly under this
+entry's stance.
+
+**The fix is the same upstream frontend work S037 already tracks (board
+#25):** carrying Buffer-vs-Uint8Array provenance through `bytesNew` into
+the IR is the one change that would let `lowerUnionToStringCall` (and
+`lowerConsoleInspectArg`/`lowerInspectCall`'s static Buffer gate, and
+every dyn-crossing consumer S037 lists) discriminate correctly; nothing
+in this union ToString path needs its own separate fix once that lands.
+
+**Tested by:** nothing pins the wrong case itself, for the same reason
+S037 gives — a test asserting the divergent answer would be a test that
+the tier is broken, not that it works. `wasm-emitter.test.ts` pins the
+CORRECT (Buffer) case — a `Buffer | string` union rendering both arms —
+directly against Node, with an explicit citation to this entry for why a
+future `Uint8Array | string` variant is not also asserted there.

@@ -33,7 +33,7 @@ import { F64, I32, type FieldType, ModuleBuilder, type ValType } from "./module.
  * `struct` is the payload subtype when (and only when) that helper reads
  * the payload. */
 export interface UnionArmRep {
-  kind: "undefined" | "null" | "f64" | "bool" | "string" | "ref";
+  kind: "undefined" | "null" | "f64" | "bool" | "string" | "bytes" | "ref";
   struct: number | null;
 }
 
@@ -42,6 +42,10 @@ export interface UnionDeps {
   strEq: () => number;
   /** %w.f64ToStr's index (f64-arm ToString). */
   f64ToStr: () => number;
+  /** %w.bytes.toStr:utf8's index (bytes-arm ToString — the SAME
+   * unconditional utf8 decode C's sc_us_N gives a bytes union arm,
+   * Buffer or plain typed array alike; see toStr's own doc). */
+  bytesToStrUtf8: () => number;
   /** The string valtype (helpers returning strings). */
   strRef: () => ValType;
   /** Push an interned string literal onto `c`'s stack. */
@@ -297,9 +301,13 @@ export class UnionBuilder {
   }
 
   /** %w.u.toStr:<id> — the ARM value's ToString. The frontend fences
-   * union-operand string conversion to unit/string/f64/bool arms (plus
-   * bytes, which the emitter refuses before asking), so `ref` never
-   * arrives here. */
+   * union-operand string conversion to unit/string/f64/bool/bytes<u8>
+   * arms, so plain `ref` never arrives here. A bytes arm always takes the
+   * unconditional utf8 decode (`scr_bytes_to_str`'s own stance, ported
+   * unchanged): this layer has never carried a Buffer-vs-plain-typed-
+   * array distinction on ANY backend, u8-elem bytes reaching a union
+   * ToString decode the same way whether their runtime origin was a
+   * Buffer or a bare Uint8Array. */
   toStr(unionId: string, arms: UnionArmRep[]): number {
     return this.cached(`toStr:${unionId}`, () => {
       const idx = this.mb.declareFunc(
@@ -330,6 +338,10 @@ export class UnionBuilder {
             c.else_();
             this.deps.lit(c, "false");
             c.end();
+            return;
+          case "bytes":
+            this.payload(c, rep, 0);
+            c.call(this.deps.bytesToStrUtf8());
             return;
           case "ref":
             throw new Error("ToString over a ref union arm (frontend fence breached)");

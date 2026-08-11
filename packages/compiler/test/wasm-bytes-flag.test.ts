@@ -369,3 +369,33 @@ test("inspect.ts's dyn walker: the isBuffer flag forces bufferForm's <Buffer aa 
   expect(readers["inspect"]!(true)).toBe("<Buffer 01 02 03>");
   expect(readers["inspect"]!(false)).toBe("Uint8Array(3) [ 1, 2, 3 ]");
 });
+
+test("inspect.ts's dyn walker: the depth boundary, BOTH flavors, at the exact recurse values a real nested object would pass — measured against Node directly (util.inspect({a:{b:X}}) and {a:{b:{c:X}}} for X = Buffer.from([1,2,3]) and new Uint8Array([1,2,3])). Buffer stays depth-INSENSITIVE past the point where Uint8Array collapses to '[Uint8Array]' — the handoff's original 'Buffer ignores depth entirely' phrasing was corrected mid-round: the insensitivity is bufferForm's own, not a property of the surrounding walk, which still collapses ONE level further regardless of flavor (untestable through THIS direct-call harness, since that collapse belongs to the ENCLOSING object's own recurse/depth check, one level up from the bytes payload itself — see wasm-emitter.test.ts's object-nesting tests for that half)", async () => {
+  const readers = await buildHarness([1, 2, 3], {
+    // recurse=2, depth=2 (2 > 2 is false): the boundary itself. Node:
+    // { a: { b: <Buffer 01 02 03> } } / { a: { b: Uint8Array(3) [ 1, 2, 3 ] } }
+    // — neither flavor has collapsed yet.
+    atBoundary: (c, b, d) => {
+      c.localGet(d);
+      c.f64Const(2); // recurse
+      c.f64Const(2); // depth
+      c.call(b.insp.dyn());
+    },
+    // recurse=3, depth=2 (3 > 2 is true): ONE PAST the boundary. Node:
+    // Buffer still renders in full; Uint8Array collapses to "[Uint8Array]".
+    // This is the exact line the handoff's uncorrected claim would have
+    // gotten wrong for Uint8Array if "ignores depth" had been read as
+    // "the bytes payload never collapses" rather than "bufferForm alone
+    // never collapses" — the two flavors diverge exactly here.
+    pastBoundary: (c, b, d) => {
+      c.localGet(d);
+      c.f64Const(3); // recurse
+      c.f64Const(2); // depth
+      c.call(b.insp.dyn());
+    },
+  });
+  expect(readers["atBoundary"]!(true)).toBe("<Buffer 01 02 03>");
+  expect(readers["atBoundary"]!(false)).toBe("Uint8Array(3) [ 1, 2, 3 ]");
+  expect(readers["pastBoundary"]!(true)).toBe("<Buffer 01 02 03>");
+  expect(readers["pastBoundary"]!(false)).toBe("[Uint8Array]");
+});
