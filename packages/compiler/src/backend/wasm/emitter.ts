@@ -118,7 +118,7 @@ import {
   RACEE_DST,
   RACEE_SRC,
 } from "./promises.js";
-import { GeneratorBuilder } from "./generators.js";
+import { GEN_DONE, type GenInfo, GeneratorBuilder, INJECT_GENRET } from "./generators.js";
 import { StrBuilder } from "./strings.js";
 import { BytesBuilder, type BytesElem } from "./typedarrays.js";
 import { TimerBuilder } from "./timers.js";
@@ -362,6 +362,15 @@ const EXC_BOOL = 2;
 const EXC_STR = 3;
 const EXC_REF = 4;
 const EXC_OBJ = 5;
+/** Increment 19's own tag: a `.return(v)` injected into a suspended
+ * generator unwinds through this SAME cell (statemachine.ts's design doc,
+ * "GENRET is a new exception-cell KIND"), but carries no payload of its
+ * own — `$gen.retPark` holds the value, not `f64G`/`refG`. Written by
+ * `%gen.injectCheck`'s GENRET arm, read by `%gen.excIsGenret` (both in
+ * this file) and by `rethrow`'s ordinary snapshot-and-refill, which
+ * needs no GENRET-specific case: it moves whatever kind is already
+ * sitting in the cell, unchanged. */
+const EXC_GENRET = 6;
 
 /* `errT`'s field indices (see `exc()`): the vt, then %Error's three IR
  * fields. Named because the dyn surface reads them from outside this
@@ -1785,6 +1794,19 @@ class Assembler {
       mapTypeSoft: (t) => this.mapTypeSoft(t),
     });
     return this.gensField;
+  }
+
+  /** Every `%gen.*` seam op except `%gen.new` (which builds a GenInfo
+   * from its own `type` field directly — there is no `gen` expression
+   * yet at that point) reaches its generator's GenInfo the SAME way:
+   * through the STATIC type of the `gen: WExpr` operand every one of
+   * them carries (always `this.genRef()`'s own recordGet type at the
+   * pass level — statemachine.ts never builds one any other way). A
+   * non-generator type here is an emitter bug (the pass's own
+   * contract), never a generator shape to refuse. */
+  private genInfoFor(t: IrType, loc: SrcLoc): GenInfo {
+    if (t.kind !== "generator") throw new Error(`generator seam op with a non-generator type at ${loc.file}`);
+    return this.gens.info(t);
   }
 
   /* ── the top-level-await root (abi.ts's `_status`, SEMANTICS.md S010) ──
@@ -5463,26 +5485,60 @@ class Assembler {
         return;
       }
 
-      /* %gen.suspend / %gen.injectCheck / %gen.complete / %gen.markDone:
-       * the yield-lowering unit's new seams (statemachine.ts) — real
-       * emission is stage A2c's producer-side work, still pending as of
-       * this case (genResume/yieldExpr below stay stage A3's CONSUMER-side
-       * work regardless — the two are independent blockers, not the same
-       * step under two names). %gen.markDone is catchArm's real-exception
-       * exit (A2c slice 3) — its GENRET sibling reuses %gen.complete
-       * rather than growing a fifth kind here (see %gen.markDone's own doc
-       * comment in statemachine.ts). Refuses by name rather than falling
-       * to the generic default so the census names the right construct;
-       * behaviorally identical to the default either way (same string
-       * shape) — currently unreachable regardless, since the whole-
-       * function fn:generator gate (walkFunction) still blocks every
-       * generator before its body is ever walked. */
+      /* %gen.suspend / %gen.complete: the two ops that retag a raw
+       * yieldT/retT-typed value into $gen.out's V representation. Real
+       * emission needs V's tag scheme (which arm of the generator's
+       * IteratorResult union a concrete operand type lands on) resolved
+       * first — a correctness question, not a mechanical one: getting a
+       * tag wrong is a silent miscompile, never a loud refusal, so this
+       * stays deferred rather than guessed at. Refuses by name so the
+       * census keeps naming the right construct; currently unreachable
+       * regardless, since the whole-function fn:generator gate
+       * (walkFunction) still blocks every generator before its body is
+       * ever walked. */
       case "%gen.suspend":
-      case "%gen.injectCheck":
       case "%gen.complete":
-      case "%gen.markDone":
         this.refuse(`stmt:${s.kind}`, s.loc);
         return;
+
+      /** A generator re-entry's injection check (statemachine.ts's own
+       * doc comment has the full design). GENRET carries no payload of
+       * its own — unlike THROW, whose cell genResume pre-fills before
+       * calling resume — so this writes the tag itself, then both arms
+       * share ONE unwind: `emitPendingCheck()`, the SAME pending-flag
+       * check every may-throw call site already gets, reused rather than
+       * duplicated (NEXT leaves the cell at 0, so it is a no-op there —
+       * the three-way branch the design doc describes collapses to one
+       * conditional tag-write plus one always-run check). */
+      case "%gen.injectCheck": {
+        const info = this.genInfoFor(s.gen.type, s.loc);
+        const g = this.acquireScratch(this.gens.genRef(info));
+        this.walkExpr(s.gen);
+        code.localSet(g);
+        code.localGet(g);
+        code.structGet(info.struct, info.idx.inject);
+        code.i32Const(INJECT_GENRET);
+        code.i32Eq();
+        this.openIf();
+        code.i32Const(EXC_GENRET);
+        code.globalSet(this.exc().kindG);
+        this.close();
+        this.releaseScratch(this.gens.genRef(info), g);
+        this.emitPendingCheck();
+        return;
+      }
+
+      /** catchArm's real-exception exit (A2c slice 3): `$gen.state = DONE`
+       * alone, `out` untouched — the cell carries the value onward via
+       * `rethrow` right after this op in every caller, so there is
+       * nothing here for `out` to hold. */
+      case "%gen.markDone": {
+        const info = this.genInfoFor(s.gen.type, s.loc);
+        this.walkExpr(s.gen);
+        code.i32Const(GEN_DONE);
+        code.structSet(info.struct, info.idx.state);
+        return;
+      }
 
       default: {
         const rest: never = s;
@@ -8971,6 +9027,70 @@ class Assembler {
         }
       }
 
+      /** Read $gen.sent — the value a `.next(arg)` resume delivered
+       * (statemachine.ts's own doc comment has the full design). Never
+       * emitted when nextT is the undefined unit (the pass's own
+       * contract), so a negative index here is an emitter bug, not a
+       * generator shape to handle. */
+      case "%gen.sent": {
+        const info = this.genInfoFor(e.gen.type, e.loc);
+        if (info.idx.sent < 0) throw new Error("%gen.sent on a generator whose nextT has no sent slot");
+        this.walkExpr(e.gen);
+        code.structGet(info.struct, info.idx.sent);
+        return;
+      }
+
+      /** Read $gen.retPark — `.return(v)`'s parked value, always present
+       * (unlike `sent`, retT never has an "absent slot" case: an
+       * undefined-unit return channel still needs somewhere to park a
+       * `.return()` argument). */
+      case "%gen.retPark": {
+        const info = this.genInfoFor(e.gen.type, e.loc);
+        this.walkExpr(e.gen);
+        code.structGet(info.struct, info.idx.retPark);
+        return;
+      }
+
+      /** Is the routing table's own catch binding (`caught`) the GENRET
+       * sentinel rather than a real thrown value? A straight read of the
+       * snapshot's own kind field — the catch clause already took it
+       * (ordinary tryCatch semantics), so there is nothing left to fetch
+       * from the live cell. */
+      case "%gen.excIsGenret": {
+        const exc = this.exc();
+        this.walkExpr(e.caught);
+        code.structGet(exc.caughtT, 0);
+        code.i32Const(EXC_GENRET);
+        code.i32Eq();
+        return;
+      }
+
+      /** Allocate a fresh $gen<triple> (statemachine.ts's own doc comment
+       * has the mutual-reference rationale). Defaults every field
+       * (state=UNSTARTED, out/sent/inject/retPark at their type's zero —
+       * mapTypeSoft's universal defaultability, the same guarantee
+       * record literals already depend on for THEIR own
+       * structNewDefault), then overwrites just `frame`/`resume` with
+       * the real operands — the wrapper's own two-step build (frame
+       * first, $gen second, write-back third) never needs this op to
+       * pre-fill anything beyond those two. */
+      case "%gen.new": {
+        if (e.type.kind !== "generator") throw new Error("%gen.new with a non-generator type");
+        const info = this.gens.info(e.type);
+        const g = this.acquireScratch(this.gens.genRef(info));
+        code.structNewDefault(info.struct);
+        code.localSet(g);
+        code.localGet(g);
+        this.walkExpr(e.frame);
+        code.structSet(info.struct, info.idx.frame);
+        code.localGet(g);
+        this.walkExpr(e.resume);
+        code.structSet(info.struct, info.idx.resume);
+        code.localGet(g);
+        this.releaseScratch(this.gens.genRef(info), g);
+        return;
+      }
+
       /* Unit values exist only inside unions (unionWrap intercepts them
        * before the walk, so a reached unitLit is refused loudly). */
       case "unitLit":
@@ -8981,26 +9101,18 @@ class Assembler {
       case "regexIntrinsic":
       /* Native FFI — a link-time C ABI, nothing to link against here. */
       case "ffiCall":
-      /* Async, generators, promises. (awaitExpr/awaitUnionExpr never
-       * reach here in a function the lowering accepted — they are what it
-       * consumes; one that survives belongs to a REFUSED async function
-       * and reports as `fn:async` before its body is walked. %gen.sent/
-       * %gen.new/%gen.retPark/%gen.excIsGenret are the yield-lowering
-       * unit's own new seams — statemachine.ts DOES consume all four once
-       * emitted (the last two as of A2c slice 3's catchArm branch), but
-       * real emission is stage A2c's remaining producer-side work —
-       * genResume's consumer-side state ladder is the separate,
-       * independent A3 blocker, not the same step under two names.
-       * Currently unreachable regardless: fn:generator still gates every
-       * generator body before this ever runs.) */
+      /* Async, generators, promises. yieldExpr/genResume never reach here
+       * in a function the lowering accepted — they are what it consumes;
+       * one that survives belongs to a REFUSED async function and
+       * reports as `fn:async` before its body is walked (same for
+       * awaitExpr/awaitUnionExpr). genResume's own CONSUMER-side state
+       * ladder (stage A3) is the separate, independent blocker that
+       * keeps these two refusing regardless of the seam ops below being
+       * real now. */
       case "yieldExpr":
       case "genResume":
       case "awaitExpr":
       case "awaitUnionExpr":
-      case "%gen.sent":
-      case "%gen.new":
-      case "%gen.retPark":
-      case "%gen.excIsGenret":
       /* Widening promise<T> into promise<void> is representationally free
        * here (one struct), but the awaiting side then reads a payload it
        * has no type for — the void-await path is its own work. */

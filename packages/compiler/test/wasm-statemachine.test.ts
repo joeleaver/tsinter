@@ -11,6 +11,7 @@ import type { IrExpr, IrFunction, IrModule, IrRecordShape, IrStmt, IrType, IrUni
 import { BOOL, CAUGHT, DYN, F64, STRING, UNDEFINED_T, VOID } from "../src/ir/nodes.js";
 import {
   asIrModule,
+  FRAME_BASE,
   FunctionLowering,
   lowerResumableFunctions,
   type WFunction,
@@ -2360,5 +2361,143 @@ describe("yield lowering (stage A2b — FunctionLowering used directly)", () => 
     expect(defaultFork.kind).toBe("if");
     if (defaultFork.kind !== "if") throw new Error("unreachable");
     expect(prologue.then).toBe(defaultFork.then);
+  });
+});
+
+/* ── 12. A2c slice 4a: the six non-retag %gen.* seam-op emissions ────────
+ *
+ * `%gen.new`/`%gen.sent`/`%gen.retPark`/`%gen.markDone`/`%gen.injectCheck`/
+ * `%gen.excIsGenret` have real emitter implementations now — plain struct
+ * field reads/writes over generators.ts's $gen<triple>, none of them
+ * needing the value-into-V retag machinery `%gen.suspend`/`%gen.complete`
+ * still refuse pending (a separate, deferred design question — see the
+ * commit history around this test). The pass itself cannot reach any of
+ * these yet (fn:generator still gates every generator body before it is
+ * ever walked), so — exactly like S041 and the increment-18 bytes
+ * validate-sweep before it — this hand-builds a module that USES them
+ * directly, bypassing both the frontend and the pass, and runs it through
+ * the REAL wasm emitter (surveyWasmModule + emitWasmModule, never a mock).
+ *
+ * REACHABILITY NOTE (read before extending this test): nothing in the
+ * CURRENTLY BUILT op set can write `$gen.inject` — that is genResume's
+ * job, stage A3, not yet built — so `%gen.injectCheck`'s GENRET arm (the
+ * tag-write) and `%gen.excIsGenret`'s TRUE outcome are proven only
+ * STRUCTURALLY here (their bytecode is emitted and WebAssembly.validate
+ * checks it STATICALLY, regardless of which branch a given run actually
+ * takes) — not BEHAVIORALLY, since nothing can drive `$gen.inject` to
+ * GENRET yet. Stage A3's own tests are what will exercise that path for
+ * real. This is a fact about the dependency graph between these ops, not
+ * a gap in this test. */
+describe("A2c slice 4a: %gen.new / %gen.sent / %gen.retPark / %gen.markDone / %gen.injectCheck / %gen.excIsGenret", () => {
+  const g4Loc = loc;
+  const genT: IrType = { kind: "generator", yieldT: F64, retT: BOOL, nextT: F64 };
+  const frameShapeId = "%frame.g4a";
+  const frameT: IrType = { kind: "record", shapeId: frameShapeId };
+
+  function buildModule(): IrModule {
+    // %g.resume(frameBase) -> void: trivial and never invoked — there is
+    // no read-accessor for $gen.resume at the pass level (genResume,
+    // stage A3, is the only future consumer), so this test proves
+    // %gen.new emits VALID, correctly-typed bytecode STORING the
+    // closure, not that it is later called. %gen.new's own operand
+    // (frame/resume) type-correctness is exactly what WebAssembly.validate
+    // below checks: a wrongly-typed store into either field fails
+    // validation, not merely silently reading back wrong.
+    const resumeFn: IrFunction = {
+      name: "%g.resume",
+      params: [{ localId: "%f", name: "%f", type: FRAME_BASE }],
+      returnType: VOID,
+      locals: [],
+      body: [ret(null)],
+      loc: g4Loc,
+    };
+
+    const frameInit: IrExpr = {
+      kind: "recordLit",
+      fields: [{ name: "%l_x", value: num(99) }],
+      type: frameT,
+      loc: g4Loc,
+    };
+    const resumeClosure: IrExpr = {
+      kind: "closure",
+      fnName: "%g.resume",
+      captures: [],
+      type: { kind: "func", params: [FRAME_BASE], ret: VOID },
+      loc: g4Loc,
+    };
+
+    const body: IrStmt[] = [
+      varDecl("frame.0", frameInit),
+      varDecl("g.0", {
+        kind: "%gen.new",
+        frame: v("frame.0", frameT),
+        resume: resumeClosure,
+        type: genT,
+        loc: g4Loc,
+      } as unknown as IrExpr),
+      // Defaults: nothing has written sent/retPark yet.
+      log([{ kind: "%gen.sent", gen: v("g.0", genT), type: F64, loc: g4Loc } as unknown as IrExpr]),
+      log([{ kind: "%gen.retPark", gen: v("g.0", genT), type: BOOL, loc: g4Loc } as unknown as IrExpr]),
+      { kind: "%gen.markDone", gen: v("g.0", genT), loc: g4Loc } as unknown as IrStmt,
+      // NEXT (the struct's own default, 0) — the only dynamically
+      // reachable path today; see the describe block's REACHABILITY NOTE.
+      { kind: "%gen.injectCheck", gen: v("g.0", genT), loc: g4Loc } as unknown as IrStmt,
+      log([str("next-fell-through")]),
+      // excIsGenret's FALSE case: an ordinary real exception's kind
+      // (EXC_STR here) is never the GENRET tag.
+      tryCatch(
+        [{ kind: "throw", value: str("boom"), loc: g4Loc }],
+        "e.0",
+        [log([{ kind: "%gen.excIsGenret", caught: v("e.0", CAUGHT), type: BOOL, loc: g4Loc } as unknown as IrExpr])],
+      ),
+    ];
+
+    return {
+      irVersion: 3,
+      sourceFile: "g4a.ts",
+      entry: "%main",
+      records: [{ id: frameShapeId, fields: [{ name: "%l_x", type: F64 }] }],
+      functions: [
+        resumeFn,
+        {
+          name: "%main",
+          params: [],
+          returnType: VOID,
+          locals: [
+            local("frame.0", frameT),
+            local("g.0", genT),
+            local("e.0", CAUGHT),
+          ],
+          body,
+          loc: g4Loc,
+        },
+      ],
+    };
+  }
+
+  test("survey clean: none of the six ops refuse", () => {
+    expect(surveyWasmModule(buildModule())).toEqual([]);
+  });
+
+  test("emits a VALID module (WebAssembly.validate) and runs it: sent/retPark defaults, injectCheck's NEXT fallthrough, excIsGenret false", async () => {
+    const mod = buildModule();
+    const bytes = emitWasmModule(mod);
+    expect(WebAssembly.validate(bytes)).toBe(true);
+
+    const chunks: Buffer[] = [];
+    let memory: WebAssembly.Memory | null = null;
+    const { instance } = await WebAssembly.instantiate(bytes, {
+      tsinter: {
+        write(fd: number, ptr: number, len: number): void {
+          if (memory === null) throw new Error("write before instantiation completed");
+          if (fd === 1) chunks.push(Buffer.from(new Uint8Array(memory.buffer, ptr, len)));
+        },
+      },
+    });
+    memory = instance.exports["memory"] as WebAssembly.Memory;
+    (instance.exports["_start"] as () => void)();
+    const stdout = Buffer.concat(chunks).toString("utf8");
+
+    expect(stdout).toBe(["0", "false", "next-fell-through", "false", ""].join("\n"));
   });
 });
