@@ -2055,3 +2055,220 @@ the tier is broken, not that it works. `wasm-emitter.test.ts` pins the
 CORRECT (Buffer) case — a `Buffer | string` union rendering both arms —
 directly against Node, with an explicit citation to this entry for why a
 future `Uint8Array | string` variant is not also asserted there.
+
+## S039 — `yield*` suspended inside a delegation does not forward the outer generator's `.return()`/`.throw()` into the delegate *(frontend desugar, shared by all three lanes)*
+
+Node's `yield*` fully delegates the consumer surface, not only `.next()`:
+calling `.return(v)` or `.throw(e)` on the OUTER generator while it is
+suspended inside a `yield*` first calls the DELEGATE's own `.return`/
+`.throw` method — running the delegate's own `finally`/`catch` machinery —
+and only propagates the resulting completion into the outer generator's
+own `try`/`finally` afterward. Measured on Node 24.18.1 (two runs,
+identical output both times):
+
+```js
+function* inner() {
+  try { yield "a"; yield "b"; } finally { console.log("inner finally ran"); }
+}
+function* outer() {
+  try { yield* inner(); } finally { console.log("outer finally ran"); }
+}
+const g = outer();
+g.next();          // { value: "a", done: false }
+g.return("RV");    // logs "inner finally ran", THEN "outer finally ran"
+                    //   → { value: "RV", done: true }
+```
+
+With `.throw()` in place of `.return()` and no `catch` inside `inner`, the
+same order holds (`inner finally ran` then `outer finally ran`) and the
+SAME `Error` object propagates out of `g.throw()` to the caller — `inner`'s
+own uncaught throw, forwarded verbatim, not swallowed or re-wrapped. When
+`inner` DOES catch (a `catch` clause around its `yield`), the thrown value
+is caught INSIDE `inner`, which may itself `yield` again — the delegation
+is genuinely two-way, not a one-shot notification that the outer is
+closing.
+
+**This tier's `yield*` desugar cannot reproduce it — by construction.**
+`lowerYieldStarStatement` (lower-generators.ts) desugars `yield* e;` into
+a plain forwarding loop: `{ const %dele = <e>; let %dr = %dele.next();
+while (!%dr.done) { %dr = %dele.next(<yield %dr.value>); } }` — the ONLY
+operation it ever performs on `%dele` is `.next()`. The embedded `yield`
+(inside `%dele.next(<yield %dr.value>)`) is an ordinary suspension point of
+the OUTER generator like any other; a consumer `.return()`/`.throw()`
+arriving there is just an injection at that state — the same GENRET/THROW
+routing any other suspension point gets — so it unwinds the OUTER
+function exactly as it would anywhere else, with no code path that reaches
+back into `%dele` at all. The delegate is simply abandoned: never resumed,
+never closed, its own pending `try`/`finally` at its own suspended point
+never runs.
+
+**All three lanes diverge identically.** `lowerYieldStarStatement` is a
+FRONTEND desugar — the IR it emits is the input every backend (C, LLVM,
+wasm) lowers, so this is not a wasm-specific gap; whichever lane first
+implements generators inherits this exact stance from the shared IR. Not
+only by construction: the reviewer compiled the same shape through the C
+and LLVM backends and measured it directly (`lane-s039c.ts`, the bare
+`g.return()` case, and `lane-s039b.ts`, the explicit-return-value variant)
+— both native lanes print `outer finally ran` only, never `inner finally
+ran`, the identical non-forwarding this entry describes for wasm.
+`lane-s039b.ts` additionally shows the returned `{value, done}` PAIR still
+agreeing with Node's `{"value":"RV","done":true}` on all three lanes
+despite the non-forwarding — the divergence is confined to the delegate's
+silently-skipped side effects, not the outer's own reported completion
+value. A companion Node-only measurement, `s039-identity.mjs`, confirms
+the "forwarded verbatim, not swallowed or re-wrapped" claim above at the
+object-identity level, not just by matching message text: a `.throw()`
+forwarded from a non-catching delegate reaches the caller as the exact
+SAME `Error` instance (`caught === sentinel` is `true`), which is the
+stronger claim this entry's stance needs to eventually contrast against
+once generator lowering exists.
+
+**No corpus program can exercise the forwarding and pass, on any lane.**
+A program observing the delegate's own `finally`/`catch` running (or not)
+after an outer `.return()`/`.throw()` mid-`yield*` would print Node's
+extra delegate-side output on Node and NOT print it here — identically on
+every lane, since the gap sits upstream of all three backends — so such a
+program could never have passed the byte-exact differential and could not
+have entered the corpus. `2015-generators-yieldstar.ts` (the corpus's own
+yield*-delegation program) exercises `.next()` forwarding, chained
+delegation, and delegation into an exhausted generator, but never calls
+`.return()`/`.throw()` on the outer generator while suspended inside a
+`yield*` — exactly the shape "a corpus program that never looks" has to
+take, confirmed by direct reading, not assumption.
+
+**Not planned as a fix within this increment.** Closing it needs the
+`yield*` lowering to recognize its own suspension points specially — an
+injection landing on one of them would have to redirect into a genResume
+call on `%dele` before continuing the outer's own unwind — a second kind
+of delegation-aware state, genuinely new machinery beyond the finalizer
+linearization increment 19 stage B builds for ordinary `try`/`finally`.
+Left as registered debt.
+
+**Tested by:** no unit test yet — generator lowering does not exist before
+this increment's stage A. The Node-side claim above is independently
+triple-measured: this entry's own inline repro, `inc19-probes/
+probe-gen-ladder.ts`'s corner #11 (`11.delegate-log ["inner-finally"]`,
+run twice, identical both times), and `inc19-probes/
+s039-yieldstar-forward.mjs` (a third, separately-authored script) all
+agree. `s039-yieldstar-forward.mjs`'s THIRD scenario — an outer
+`.throw()` arriving while the DELEGATE has its own `catch` around the
+suspended `yield`, so the delegate genuinely catches the injected error
+and yields again (`{ value: "ic-caught-and-yielded-again", done: false }`)
+rather than merely rethrowing or running a `finally` — is this entry's
+strongest witness: a `finally`-only forward could in principle be
+explained by some simpler unwind-notification mechanism, but a `catch`
+binding the exact injected value and the delegate staying ALIVE
+afterward is only possible if `.throw()` is a real re-entry into the
+delegate's own suspended frame, exactly the two-way delegation Node's
+spec gives `yield*` and this tier's desugar cannot reach. Once `yield*`
+lowers, a unit test (statemachine-level or a builder-level generator test)
+should pin the CURRENT (non-forwarding) behavior directly, the same way
+S037/S038 pin their gaps' correct-branch behavior; no corpus program can
+pin the gap itself, per the previous paragraph.
+
+## S040 — A consumer `return`/`throw` abandoning a `for-of` over a generator does not `IteratorClose` (only `break` does) *(frontend desugar, shared by all three lanes)*
+
+Node's `for-of` protocol calls `IteratorClose` (`.return()` on the
+iterator) whenever the loop body's completion is anything other than a
+normal completion or a `continue` targeting the loop — this covers
+`break` AND a `return` statement in the body AND an uncaught `throw` in
+the body, not only `break`. Measured on Node 24.18.1 (two runs, identical
+output both times) with a generator whose `try`/`finally` wraps its
+yields, consumed by three separately-scoped loops that each abandon after
+the first value:
+
+```js
+function* gen() {
+  try { yield 1; yield 2; yield 3; } finally { console.log("finally ran"); }
+}
+function viaBreak()  { for (const x of gen()) { if (x === 1) break; } }
+function viaReturn() { for (const x of gen()) { if (x === 1) return; } }
+function viaThrow()  { try { for (const x of gen()) { if (x === 1) throw new Error("boom"); } } catch {} }
+viaBreak();   // logs "finally ran"
+viaReturn();  // logs "finally ran"
+viaThrow();   // logs "finally ran"
+```
+
+All three abandonment shapes print `finally ran` identically. (A naturally
+EXHAUSTED loop also logs it, but that is the generator's own function
+completion running its `finally` as ordinary control flow, independent of
+any close — the probe isolates the close-specific cases by stopping after
+the first value in each of the three abandonment shapes above.)
+
+**This tier's desugar closes on `break` only — by construction.**
+`lowerForOfGenerator` (lower-generators.ts) desugars into:
+
+```
+{ const %gof = <iterable>; let %gdone = false;
+  while (true) {
+    const %gr = %gof.next();
+    if (%gr.done) { %gdone = true; break; }
+    const x = <extract %gr.value>;
+    <body>
+  }
+  if (!%gdone) %gof.return();           // IteratorClose
+}
+```
+
+The close is a plain statement placed AFTER the `while` — reached only
+when control falls out of the loop normally (exhaustion setting `%gdone`
+before its own `break`, or a `break` inside `<body>` that skips the
+`%gdone = true` assignment but still falls to the same point). A `return`
+or `throw` inside `<body>` unwinds the ENCLOSING FUNCTION (or the nearest
+`catch`) directly, exactly as it would past any other `while` loop, and
+never reaches the close statement at all. Reaching it for those two
+completions would need the close wrapped in its own `finally` region —
+machinery this desugar does not build.
+
+**All three lanes diverge identically.** `lowerForOfGenerator` is a
+FRONTEND desugar — every backend compiles the identical IR it emits, so C,
+LLVM, and wasm inherit this exact stance uniformly; it is not specific to
+whichever lane implements generators first. Not only by construction: the
+reviewer compiled `lane-s040.ts` (the `viaBreak`/`viaReturn` pair) through
+the C and LLVM backends and measured it directly — both native lanes print
+`finally ran` for `break` (matching Node) and print NOTHING for `return`
+(matching this tier's `break`-only stance, diverging from Node exactly as
+this entry describes for wasm), the identical split on every lane this
+tier implements today.
+
+**No corpus program can exercise the wrong case and pass, on any lane.**
+A program whose generator has an observable `finally` (or any other
+release side effect at its suspension point) and whose consuming `for-of`
+is abandoned via `return`/`throw` rather than `break` would print Node's
+extra close-triggered output on Node and NOT print it here — identically
+on every lane, since the gap sits upstream of all three backends — so such
+a program could never have passed the byte-exact differential and could
+not be in the corpus today. `2011-generators-forof.ts` (the corpus's own
+for-of-over-generator program) exercises exhaustion, `break`, and
+`continue` — all three the CURRENT stance already gets right — never a
+`return`/`throw` abandonment, confirmed by direct reading; it does not
+conflict with this entry.
+
+**Not planned as a fix within this increment.** Making `return`/`throw`
+also close would need the desugar to route abrupt loop exits through a
+`finally`-like region that runs the close on every path out — real
+machinery, not a quick patch, and out of scope for what increment 19 stage
+0 registers. Left as registered debt.
+
+**Tested by:** no unit test yet — generator lowering does not exist before
+this increment's stage A. The Node-side claim above is independently
+quadruple-measured: this entry's own inline repro; `inc19-probes/
+probe-gen-ladder.ts`'s corner #12 (`12.break-closes ["gen-finally"]`,
+`12.return-closes ["gen2-finally"]`, run twice, identical both times);
+`inc19-probes/s040-forof-close.mjs` (a third, separately-authored script,
+covering `break`/`return`/`throw`/exhaustion in one run); and `inc19-
+probes/s040-close-vs-completion.mjs`, which closes the one gap the other
+three share — none of them can tell "the generator's `finally` ran
+because `.return()` was actually CALLED" apart from "the `finally` ran
+because the generator completed normally and exhaustion happens to log
+the same line." `s040-close-vs-completion.mjs` instruments `.return()`
+itself: for `break`/`return`/`throw` the instrumented log
+(`.return() CALLED (IteratorClose)`) fires before the generator's own
+`finally`; for exhaustion it never fires at all, even though the
+`finally` still runs. This is the exhaustion row's real evidence — not
+merely "no `.return()` needed," but "measured to never happen" — and
+directly supports the "exhaustion skips the close, independent of any
+close" parenthetical earlier in this entry. Once `for-of`-over-generator
+lowers, a unit test should pin the CURRENT (`break`-only) closing
+behavior directly. No corpus program can pin the gap itself, per the
+previous paragraph.

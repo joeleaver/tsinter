@@ -6,7 +6,7 @@
  * The other half of the contract is the refusal set: every async shape the
  * pass declines must name itself and leave the function untouched, which
  * is what keeps the emitter's own `fn:async` firing behind it. */
-import { describe, expect, test } from "vitest";
+import { beforeAll, describe, expect, test } from "vitest";
 import type { IrExpr, IrFunction, IrModule, IrStmt, IrType, SrcLoc } from "../src/ir/nodes.js";
 import { BOOL, CAUGHT, F64, STRING, VOID } from "../src/ir/nodes.js";
 import { asIrModule, lowerResumableFunctions, type WFunction, type WModule } from "../src/backend/wasm/statemachine.js";
@@ -1757,7 +1757,13 @@ describe("may-throw over a lowered module", () => {
 /* ── 8. the emitter accepts the shapes the pass produces ───────────────── */
 
 describe("the wasm survey over a lowered module", () => {
-  const survey = surveyWasmModule(asyncModule(twoAwaits()));
+  // Collection-time (module-body) execution would let a throw here fail
+  // the whole FILE's collection instead of one test — beforeAll defers it
+  // to run time, where a regression surfaces as a normal test failure.
+  let survey: string[];
+  beforeAll(() => {
+    survey = surveyWasmModule(asyncModule(twoAwaits()));
+  });
 
   test("the frame shape maps: no record refusal", () => {
     expect(survey).not.toContain("record:recursive");

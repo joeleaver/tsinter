@@ -4,8 +4,8 @@
  * async functions carry the INNER type as `returnType`, call sites of them
  * already carry promise<T>, and `await <non-thenable>` is the seqExpr
  * around a zero-argument `async.hop`. */
-import type { IrExpr, IrFunction, IrModule, IrStmt, IrType, SrcLoc } from "../../src/ir/nodes.js";
-import { BOOL, F64, STRING, VOID } from "../../src/ir/nodes.js";
+import type { IrClassDef, IrExpr, IrFunction, IrModule, IrStmt, IrType, SrcLoc } from "../../src/ir/nodes.js";
+import { BOOL, F64, RUNTIME_ERROR_CLASSES, STRING, VOID } from "../../src/ir/nodes.js";
 
 export const loc: SrcLoc = { file: "async.ts", start: 0, end: 0 };
 
@@ -60,6 +60,27 @@ export const local = (
   extra: { boxed?: true; tdz?: true; mutable?: boolean } = {},
 ): IrFunction["locals"][number] => ({ id, name: id, type, mutable: extra.mutable ?? true, ...extra });
 
+/** The five runtime-provided error classes (registerBuiltinErrorClasses's
+ * IrClassDef shape, lower-classes.ts:326-368), hand-mirrored since this
+ * fixture has no compileToIr to synthesize them: every real module
+ * carries these whether or not user code mentions Error (emitter.ts:25-
+ * 31's five-error-classes invariant), and the wasm emitter's
+ * emitErrIntervalTest reads %Error's preorder interval unconditionally —
+ * a module missing them throws "no %Error in the class graph" the moment
+ * ANY runtime helper touching errors (e.g. a promise's rejection report)
+ * is built, not only when user code constructs one. */
+export const runtimeErrorClasses: IrClassDef[] = [...RUNTIME_ERROR_CLASSES].map(([irName, rec]) => ({
+  name: irName,
+  runtime: true as const,
+  ...(rec.base ? { base: rec.base } : {}),
+  fields: [
+    { name: "name", type: STRING },
+    { name: "message", type: STRING },
+    { name: "%code", type: STRING },
+  ],
+  loc,
+}));
+
 /** A module around one async function: a promise SOURCE it can await
  * (`mkp`, an ordinary function returning Promise<number>) and an entry
  * that calls the async function so reachability finds everything. */
@@ -68,6 +89,7 @@ export function asyncModule(fn: IrFunction, extra: IrFunction[] = []): IrModule 
     irVersion: 3,
     sourceFile: "async.ts",
     entry: "%main",
+    classes: runtimeErrorClasses,
     functions: [
       // A promise SOURCE the async body can await. Its own body is
       // uninteresting (and out of tier — the point is the call site's

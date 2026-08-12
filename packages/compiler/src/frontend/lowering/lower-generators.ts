@@ -209,8 +209,8 @@ function extractYieldValue(
  * `break` exits the while and lands on the close check (probed: break
  * closes the generator — finallys run, the return value is discarded);
  * `continue` stays in the loop; exhaustion skips the close. A consumer
- * `return`/`throw` abandoning the loop does NOT close (numbered
- * divergence — the desugar cannot ride a finally, whose regions reject
+ * `return`/`throw` abandoning the loop does NOT close (SEMANTICS.md
+ * S040 — the desugar cannot ride a finally, whose regions reject
  * the loop's own break). */
 export function lowerForOfGenerator(
   L: Lowerer,
@@ -355,8 +355,8 @@ export function lowerForOfGenerator(
  * across the channels); the consumer's `.next(v)` argument forwards into
  * the delegate; the delegate's return value is this statement's dropped
  * result. Consumer `.return()`/`.throw()` while suspended here unwinds
- * the OUTER generator without forwarding to the delegate (numbered
- * divergence). Null when this is not a yield* statement. */
+ * the OUTER generator without forwarding to the delegate (SEMANTICS.md
+ * S039). Null when this is not a yield* statement. */
 export function lowerYieldStarStatement(L: Lowerer, expr: ts.Expression): IrStmt | null {
   if (!ts.isYieldExpression(expr) || expr.asteriskToken === undefined) return null;
   const gen = L.ctx.generator;
