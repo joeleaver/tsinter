@@ -2048,7 +2048,7 @@ describe("genResume hoists inside an async function (stage A2 opener)", () => {
   });
 });
 
-/* ── 12. increment 19 stage A2b: yield lowering ───────────────────────────
+/* ── 12. increment 19 stages A2b/A2c: yield lowering + completion ────────
  *
  * FunctionLowering is exported for this describe block ONLY (see its own
  * doc comment): lowerResumableFunctions' per-function skip still keeps
@@ -2059,16 +2059,21 @@ describe("genResume hoists inside an async function (stage A2 opener)", () => {
  * reach them yet.
  *
  * SCOPE NOTE (A2b gate's F2 finding — a GUARD, not documentation):
- * buildWrapper and catchArm (reached through buildResume) are BOTH
- * unconditionally async-shaped — buildWrapper's frameInit literal names
- * PROMISE_FIELD directly, and catchArm's "reject" default arm (embedded
- * in EVERY resume regardless of whether the body has a covering
- * try/catch — the routing table's fallback for "no protected region")
- * does too. Calling `.run()` on a generator would therefore construct
- * invalid IR (a field name the frame's own shape no longer declares) —
- * not a crash, since nothing cross-checks a recordLit's field names
- * against the shape, which is exactly why it has to be refused rather
- * than produced and trusted. `run()` now declines outright for any
+ * buildWrapper and catchArm (reached through buildResume) are BOTH STILL
+ * unconditionally async-shaped as of this comment — buildWrapper's
+ * frameInit literal names PROMISE_FIELD directly, and catchArm's
+ * "reject" default arm (embedded in EVERY resume regardless of whether
+ * the body has a covering try/catch — the routing table's fallback for
+ * "no protected region") does too. `completion()`/`fellThrough()` are
+ * NOT in that list anymore (stage A2c) — both now branch on genType and
+ * emit `%gen.complete` for a generator's return/fall-through, covered by
+ * the two tests below named for them; they are the reason those two
+ * bodies can now use an explicit `return`/fall off the end at all, where
+ * every A2b-era test had to avoid both. Calling `.run()` on a generator
+ * would still construct invalid IR through buildWrapper/catchArm — not a
+ * crash, since nothing cross-checks a recordLit's field names against
+ * the shape, which is exactly why it has to be refused rather than
+ * produced and trusted. `run()` still declines outright for any
  * generator (`this.genType !== null`), BEFORE doing any work — see its
  * own guard comment. These tests use `runFrameAndStatesForTest()`
  * instead: the frame fields and the raw per-state statement lists,
@@ -2178,5 +2183,43 @@ describe("yield lowering (stage A2b — FunctionLowering used directly)", () => 
     const { states } = new FunctionLowering(genModule(fn), fn, () => {}).runFrameAndStatesForTest();
     expect(nodesOfKind(states, "%gen.injectCheck")).toHaveLength(1);
     expect(nodesOfKind(states, "%gen.sent")).toHaveLength(0);
+  });
+
+  test("an explicit `return v;` retags into $gen.out via %gen.complete, never %async.settle", () => {
+    const fn: IrFunction = {
+      name: "g",
+      params: [],
+      returnType: F64,
+      generator: { yieldT: F64, nextT: F64 },
+      locals: [],
+      body: [ret(num(42))],
+      loc: genLoc,
+    };
+    const { states } = new FunctionLowering(genModule(fn), fn, () => {}).runFrameAndStatesForTest();
+    const complete = nodesOfKind(states, "%gen.complete");
+    expect(complete).toHaveLength(1);
+    expect(complete[0]).toMatchObject({ value: { kind: "numLit", value: 42 } });
+    expect(nodesOfKind(states, "%async.settle")).toEqual([]);
+  });
+
+  test("a void-returning body falling off the end completes via %gen.complete(value: null), never %async.settle", () => {
+    const fn: IrFunction = {
+      name: "g",
+      params: [],
+      returnType: VOID,
+      generator: { yieldT: F64, nextT: F64 },
+      locals: [],
+      // A yield with nothing after it: the resume state has no return of
+      // its own, so it falls off the end into fellThrough() — isolates
+      // fellThrough's generator branch from completion()'s (the explicit
+      // `return v;` case, covered by the test just above).
+      body: [exprStmt(yieldExpr(num(1), F64))],
+      loc: genLoc,
+    };
+    const { states } = new FunctionLowering(genModule(fn), fn, () => {}).runFrameAndStatesForTest();
+    const complete = nodesOfKind(states, "%gen.complete");
+    expect(complete).toHaveLength(1);
+    expect(complete[0]!["value"]).toBeNull();
+    expect(nodesOfKind(states, "%async.settle")).toEqual([]);
   });
 });

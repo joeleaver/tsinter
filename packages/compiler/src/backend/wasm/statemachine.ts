@@ -91,19 +91,34 @@
  * save, return; case k: restore, re-entry check, resumed value — with
  * `%gen.suspend`/`%gen.injectCheck`/`%gen.sent` (AsyncStmt/AsyncExpr
  * above, each documented at its own definition) standing in for
- * `%async.subscribe`/`%async.rejectCheck`/`%async.settled`. BUILD STATUS,
- * checked against the code below rather than assumed (the stale-header
- * lesson): the frame's `%gen` field and the yield-site suspend/resume
- * split (`lowerSuspension`'s "yield" case) are BUILT (stage A2b). The
- * lazy wrapper itself, `return v`'s retag-into-$gen.out-then-DONE
- * rewrite (completion()/fellThrough()'s generator branch), and
- * catch-region GENRET sentinel routing are NOT YET BUILT as of this
- * paragraph — buildWrapper/completion/fellThrough still unconditionally
- * assume async's promise-settling shape (see their own TODO markers) —
- * which is why lowerResumableFunctions' per-function skip (below) still
- * gates every real generator out: gate-widening is deliberately the LAST
- * step, once calling `.run()` on a generator function stops producing a
- * correct resume beside a wrong wrapper.
+ * `%async.subscribe`/`%async.rejectCheck`/`%async.settled`. `return v`
+ * retags into `$gen.out` and sets `$gen.state = DONE` through a fourth
+ * seam op, `%gen.complete` — mirrors `%async.settle` exactly, the
+ * return-statement counterpart to `%gen.suspend`'s yield-statement one
+ * (both documented at their own AsyncStmt definitions above).
+ *
+ * BUILD STATUS, checked against the code below rather than assumed (the
+ * stale-header lesson): the frame's `%gen` field, the yield-site
+ * suspend/resume split (`lowerSuspension`'s "yield" case), and
+ * `completion()`/`fellThrough()`'s generator branches are BUILT at the
+ * PASS level (stage A2b, A2c). `run()` still declines every generator
+ * outright, though (its own guard comment has the full story): building
+ * correct LOWERED IR is not the same as EMITTING it, and two more things
+ * are needed before `run()` can stop declining — buildWrapper's lazy
+ * generator branch (still unconditionally async's eager kick) and
+ * catchArm's genType branch (its routing-table default still
+ * unconditionally references PROMISE_FIELD, and needs the GENRET
+ * cell-kind fork the design doc's routing-default section describes) —
+ * and a THIRD, independent thing before any of this is reachable at all:
+ * the emitter has to implement `%gen.suspend`/`%gen.sent`/
+ * `%gen.injectCheck`/`%gen.complete` for real (currently four refusal
+ * arms, `stmt:%gen.*`/`expr:%gen.sent`) before generator bodies can pass
+ * survey clean, which is independent again from genResume's CONSUMER-side
+ * emission (the state ladder) — the two are separate blockers under
+ * different names, not one step twice. Gate-widening (below) is
+ * deliberately the LAST of all of this: it happens once `run()` can stop
+ * declining AND the emitter can accept what it produces, together, never
+ * one without the other.
  *
  * ONE RESUME SIGNATURE. Resume takes `%frameBase` — an empty OPEN struct
  * every concrete frame subtypes — and casts it down to its own shape in a
@@ -555,9 +570,12 @@ export type AsyncStmt =
    * mirroring yieldExpr's own `value: IrExpr | null`) — NOT pre-retagged
    * into $gen.out's V representation. Retagging (dyn wrap, or a union
    * tag the pass has no way to know without reaching into $gen's backend
-   * layout) is the emitter's job when it implements this op (stage A3),
-   * exactly how `%async.settled`'s reader never needed the pass to know
-   * promT's tag encoding either — same seam, same reason. */
+   * layout) is the emitter's job when it implements this op (the
+   * producer-side emission slice of stage A2c — genResume's CONSUMER-side
+   * emission, the state ladder, is stage A3; the two are independent
+   * blockers, not the same step under two names), exactly how
+   * `%async.settled`'s reader never needed the pass to know promT's tag
+   * encoding either — same seam, same reason. */
   | { kind: "%gen.suspend"; gen: WExpr; value: WExpr | null; loc: SrcLoc }
   /** A generator re-entry's injection check — mirrors `%async.rejectCheck`'s
    * role exactly, generalized to three cases instead of one: reads
@@ -579,7 +597,20 @@ export type AsyncStmt =
    * cell kind at its own catch entry, which is why the design doc calls
    * catch's GENRET handling a "sentinel re-unwind prologue" rather than a
    * generator-specific special case. */
-  | { kind: "%gen.injectCheck"; gen: WExpr; loc: SrcLoc };
+  | { kind: "%gen.injectCheck"; gen: WExpr; loc: SrcLoc }
+  /** A generator's completion — `return v`'s rewrite target, and the
+   * implicit `return;` a void-returning body falls off its end into.
+   * Retags `value` (retT-typed, `null` for a void/absent return — the
+   * SAME "raw operand, retagging is the emitter's job" contract
+   * `%gen.suspend` documents) into $gen.out and sets $gen.state = DONE —
+   * mirrors `%async.settle` exactly (write the completion value, mark
+   * the channel settled), the return-statement counterpart to
+   * `%gen.suspend`'s yield-statement one. Unlike suspend, there is no
+   * re-entry to prepare for: DONE has nothing to restore, so this needs
+   * no companion `frame.%state` write and no `%await<k>`-style slot —
+   * `completion()`/`fellThrough()`'s generator branches emit ONLY this
+   * plus a bare `return`, nothing else. */
+  | { kind: "%gen.complete"; gen: WExpr; value: WExpr | null; loc: SrcLoc };
 
 /** A statement of the lowered IR. SHALLOW by design — see the header:
  * nested bodies keep their `IrStmt[]` static type while carrying
@@ -1821,30 +1852,30 @@ export class FunctionLowering {
     }));
   }
 
-  /** Fulfil the wrapper's promise with `value` and leave resume.
-   *
-   * TODO(increment 19): unconditionally async-shaped — for a generator
-   * this should retag `value` into `$gen.out` and set `$gen.state = DONE`
-   * instead (the header's "A GENERATOR'S SIBLING PROTOCOL"), not settle a
-   * promise this function's frame no longer even carries a slot for.
-   * Not yet reachable: lowerResumableFunctions still gates every real
-   * generator out, and every stage-A2b test avoids a body with an
-   * explicit `return` for exactly this reason — see that describe
-   * block's own SCOPE NOTE. */
+  /** Fulfil my own completion channel with `value` and leave resume —
+   * `%async.settle` a promise, or (increment 19, stage A2c) `%gen.complete`
+   * a generator's `$gen.out`/state=DONE. One genType branch at the top,
+   * not two duplicated shapes: both channels share the identical "void
+   * body still runs its (dropped) value expression" rule below, so only
+   * the completion OP itself differs, never the surrounding logic. */
   private completion(value: IrExpr | null): WStmt[] {
     const out: WStmt[] = [];
+    const settle = (v: WExpr | null, loc: SrcLoc): WStmt =>
+      this.genType !== null
+        ? { kind: "%gen.complete", gen: this.genRef(), value: v, loc }
+        : { kind: "%async.settle", promise: this.get(PROMISE_FIELD, this.promiseType), value: v, loc };
     if (this.fn.returnType.kind === "void") {
       // A void `return f()` still has to RUN f(); only its (absent) value
       // is dropped.
       if (value !== null) out.push({ kind: "exprStmt", expr: value, loc: value.loc });
-      out.push({ kind: "%async.settle", promise: this.get(PROMISE_FIELD, this.promiseType), value: null, loc: this.loc });
+      out.push(settle(null, this.loc));
     } else {
-      out.push({
-        kind: "%async.settle",
-        promise: this.get(PROMISE_FIELD, this.promiseType),
-        value,
-        loc: value?.loc ?? this.loc,
-      });
+      // value can legitimately be null here too (a non-void function's
+      // return site with no operand is not this pass's business to
+      // second-guess — settle()/%gen.complete's own `value: WExpr | null`
+      // shape already carries it through unchanged, matching the
+      // pre-existing behavior this branch always had).
+      out.push(settle(value === null ? null : widenExpr(value), value?.loc ?? this.loc));
     }
     out.push(this.ret());
     return out;
@@ -1853,38 +1884,28 @@ export class FunctionLowering {
   /** Running off the end of a state. For a void body that is the implicit
    * `return;` — fulfil with undefined and leave.
    *
-   * For a NON-void body it is dead code. Such a body cannot fall off its
-   * end (the frontend appends an implicit return on every path —
-   * appendImplicitUndefinedReturn), and the states this reaches are the
-   * join/exit states nothing branched to; the bare `return` is there so
-   * the switch case ENDS, not because anything runs it. The tempting
-   * alternative — an SC9002 runtimeFence, which the wasm emitter turns
-   * into `unreachable` exactly like the trap it appends to every non-void
-   * sync body — is deliberately NOT used: computeMayThrow seeds on every
-   * runtimeFence regardless of code, so one defensive trap per resume
-   * would make every async function may-throw and put a pending check
-   * after every call to one. The state graph's closure is pinned by unit
-   * test instead, which is where a numbering bug actually shows up.
-   *
-   * TODO(increment 19): the void branch below is unconditionally
-   * async-shaped (references PROMISE_FIELD, a slot a generator's frame
-   * no longer carries — see buildFrameFields' %gen/%promise branch); it
-   * needs a generator arm settling `$gen` instead. The non-void branch
-   * just above needs no change (a bare `this.ret()`, no field reference
-   * either way) — every stage-A2b test relies on exactly that to stay
-   * clear of this gap; see completion()'s own TODO and that describe
-   * block's SCOPE NOTE. */
+   * For a NON-void body it is dead code, generator or async alike: such a
+   * body cannot fall off its end (the frontend appends an implicit return
+   * on every path — appendImplicitUndefinedReturn — a rule generators
+   * follow identically to ordinary functions), and the states this
+   * reaches are the join/exit states nothing branched to; the bare
+   * `return` is there so the switch case ENDS, not because anything runs
+   * it. The tempting alternative — an SC9002 runtimeFence, which the wasm
+   * emitter turns into `unreachable` exactly like the trap it appends to
+   * every non-void sync body — is deliberately NOT used: computeMayThrow
+   * seeds on every runtimeFence regardless of code, so one defensive trap
+   * per resume would make every async function may-throw and put a
+   * pending check after every call to one. The state graph's closure is
+   * pinned by unit test instead, which is where a numbering bug actually
+   * shows up. (This is why the non-void branch below needs no genType
+   * split at all — a bare `this.ret()` names no field either way.) */
   private fellThrough(): WStmt[] {
     if (this.fn.returnType.kind !== "void") return [this.ret()];
-    return [
-      {
-        kind: "%async.settle",
-        promise: this.get(PROMISE_FIELD, this.promiseType),
-        value: null,
-        loc: this.loc,
-      },
-      this.ret(),
-    ];
+    const settle: WStmt =
+      this.genType !== null
+        ? { kind: "%gen.complete", gen: this.genRef(), value: null, loc: this.loc }
+        : { kind: "%async.settle", promise: this.get(PROMISE_FIELD, this.promiseType), value: null, loc: this.loc };
+    return [settle, this.ret()];
   }
 
   /* ── state linearization ─────────────────────────────────────────────── */

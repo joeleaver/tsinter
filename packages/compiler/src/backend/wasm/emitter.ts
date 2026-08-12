@@ -5463,16 +5463,20 @@ class Assembler {
         return;
       }
 
-      /* %gen.suspend / %gen.injectCheck: the yield-lowering unit's new
-       * seams (statemachine.ts) — real emission is stage A3's work, same
-       * as genResume/yieldExpr below. Refuses by name rather than falling
-       * to the generic default so the census names the right construct;
+      /* %gen.suspend / %gen.injectCheck / %gen.complete: the yield-
+       * lowering unit's new seams (statemachine.ts) — real emission is
+       * stage A2c's producer-side work, still pending as of this case
+       * (genResume/yieldExpr below stay stage A3's CONSUMER-side work
+       * regardless — the two are independent blockers, not the same
+       * step under two names). Refuses by name rather than falling to
+       * the generic default so the census names the right construct;
        * behaviorally identical to the default either way (same string
        * shape) — currently unreachable regardless, since the whole-
        * function fn:generator gate (walkFunction) still blocks every
        * generator before its body is ever walked. */
       case "%gen.suspend":
       case "%gen.injectCheck":
+      case "%gen.complete":
         this.refuse(`stmt:${s.kind}`, s.loc);
         return;
 
@@ -5564,6 +5568,7 @@ class Assembler {
       case "%async.boxInit":
       case "%gen.suspend":
       case "%gen.injectCheck":
+      case "%gen.complete":
         break;
       default: {
         const rest: never = s;
