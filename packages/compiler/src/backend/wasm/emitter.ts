@@ -5463,13 +5463,16 @@ class Assembler {
         return;
       }
 
-      /* %gen.suspend / %gen.injectCheck / %gen.complete: the yield-
-       * lowering unit's new seams (statemachine.ts) — real emission is
-       * stage A2c's producer-side work, still pending as of this case
-       * (genResume/yieldExpr below stay stage A3's CONSUMER-side work
-       * regardless — the two are independent blockers, not the same
-       * step under two names). Refuses by name rather than falling to
-       * the generic default so the census names the right construct;
+      /* %gen.suspend / %gen.injectCheck / %gen.complete / %gen.markDone:
+       * the yield-lowering unit's new seams (statemachine.ts) — real
+       * emission is stage A2c's producer-side work, still pending as of
+       * this case (genResume/yieldExpr below stay stage A3's CONSUMER-side
+       * work regardless — the two are independent blockers, not the same
+       * step under two names). %gen.markDone is catchArm's real-exception
+       * exit (A2c slice 3) — its GENRET sibling reuses %gen.complete
+       * rather than growing a fifth kind here (see %gen.markDone's own doc
+       * comment in statemachine.ts). Refuses by name rather than falling
+       * to the generic default so the census names the right construct;
        * behaviorally identical to the default either way (same string
        * shape) — currently unreachable regardless, since the whole-
        * function fn:generator gate (walkFunction) still blocks every
@@ -5477,6 +5480,7 @@ class Assembler {
       case "%gen.suspend":
       case "%gen.injectCheck":
       case "%gen.complete":
+      case "%gen.markDone":
         this.refuse(`stmt:${s.kind}`, s.loc);
         return;
 
@@ -5569,6 +5573,7 @@ class Assembler {
       case "%gen.suspend":
       case "%gen.injectCheck":
       case "%gen.complete":
+      case "%gen.markDone":
         break;
       default: {
         const rest: never = s;
@@ -8980,19 +8985,22 @@ class Assembler {
        * reach here in a function the lowering accepted — they are what it
        * consumes; one that survives belongs to a REFUSED async function
        * and reports as `fn:async` before its body is walked. %gen.sent/
-       * %gen.new are the yield-lowering unit's own new seams —
-       * statemachine.ts DOES consume both once emitted, but real emission
-       * is stage A2c's remaining producer-side work — genResume's
-       * consumer-side state ladder is the separate, independent A3
-       * blocker, not the same step under two names. Currently unreachable
-       * regardless: fn:generator still gates every generator body before
-       * this ever runs.) */
+       * %gen.new/%gen.retPark/%gen.excIsGenret are the yield-lowering
+       * unit's own new seams — statemachine.ts DOES consume all four once
+       * emitted (the last two as of A2c slice 3's catchArm branch), but
+       * real emission is stage A2c's remaining producer-side work —
+       * genResume's consumer-side state ladder is the separate,
+       * independent A3 blocker, not the same step under two names.
+       * Currently unreachable regardless: fn:generator still gates every
+       * generator body before this ever runs.) */
       case "yieldExpr":
       case "genResume":
       case "awaitExpr":
       case "awaitUnionExpr":
       case "%gen.sent":
       case "%gen.new":
+      case "%gen.retPark":
+      case "%gen.excIsGenret":
       /* Widening promise<T> into promise<void> is representationally free
        * here (one struct), but the awaiting side then reads a payload it
        * has no type for — the void-await path is its own work. */

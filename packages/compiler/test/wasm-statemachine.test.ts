@@ -2059,32 +2059,35 @@ describe("genResume hoists inside an async function (stage A2 opener)", () => {
  * reach them yet.
  *
  * SCOPE NOTE (A2b gate's F2 finding — a GUARD, not documentation):
- * catchArm (reached through buildResume) is STILL unconditionally
- * async-shaped as of this comment — its "reject" default arm (embedded
- * in EVERY resume regardless of whether the body has a covering
- * try/catch — the routing table's fallback for "no protected region")
- * unconditionally references PROMISE_FIELD and emits %async.reject.
- * `completion()`/`fellThrough()` (stage A2c) and `buildWrapper()` (A2c
- * slice 2) are NOT in that list anymore — all three now branch on
- * genType: completion/fellThrough emit `%gen.complete` for a
- * generator's return/fall-through (covered by the two tests named for
- * them), and buildWrapper builds frame+$gen, writes the back-reference,
- * and returns $gen with no eager resume call and no promise-cache
- * protocol (covered by the "lazy wrapper" test below). Calling `.run()`
- * on a generator would still construct invalid IR through catchArm —
- * not a crash, since nothing cross-checks a recordLit's field names
- * against the shape, which is exactly why it has to be refused rather
- * than produced and trusted. `run()` still declines outright for any
- * generator (`this.genType !== null`), BEFORE doing any work — see its
- * own guard comment. Most of these tests use `runFrameAndStatesForTest()`
- * instead: the frame fields and the raw per-state statement lists,
- * built the identical way `run()` builds them internally, WITHOUT ever
- * reaching buildResume/buildWrapper/catchArm — structurally incapable of
- * producing the invalid IR, not merely a test that happens to avoid
- * triggering it. The "lazy wrapper" test uses the narrower
- * `buildWrapperForTest()` (checkEligible() + buildWrapper() only) for
- * the same reason: buildWrapper needs none of splitStates's work, and
- * this sibling method still cannot reach catchArm/buildResume either. */
+ * `completion()`/`fellThrough()` (stage A2c), `buildWrapper()` (A2c
+ * slice 2), and now `catchArm()` (A2c slice 3, reached through
+ * buildResume) ALL branch on genType — nothing left in the PASS
+ * unconditionally names PROMISE_FIELD or emits an async-only op for a
+ * generator: completion/fellThrough emit `%gen.complete` for a
+ * generator's return/fall-through, buildWrapper builds frame+$gen,
+ * writes the back-reference, and returns $gen with no eager resume call
+ * and no promise-cache protocol, and catchArm's routing-table default
+ * forks on the caught value's cell kind (GENRET completes the generator
+ * via %gen.complete+%gen.retPark, a real exception marks DONE and
+ * rethrows) with the SAME fork reused as every catch-region's sentinel
+ * prologue (see catchArm's own doc comment for the "single construction
+ * site" story) — covered by the tests named for each. Calling `.run()`
+ * on a generator STILL declines outright (`this.genType !== null`,
+ * BEFORE doing any work — see its own guard comment), but the reason has
+ * moved: every generator-shaped IR this pass can build is correct IR
+ * now, and what remains is purely the EMITTER, which still refuses
+ * every `%gen.*` seam kind by name (eight of them as of this slice —
+ * run()'s guard comment has the full list). Most of these tests use
+ * `runFrameAndStatesForTest()`: the frame fields and the raw per-state
+ * statement lists, built the identical way `run()` builds them
+ * internally, WITHOUT reaching buildResume/buildWrapper/catchArm at all
+ * — structurally incapable of depending on run()'s guard lifting, not
+ * merely a test that happens to avoid triggering it. The "lazy wrapper"
+ * test uses the narrower `buildWrapperForTest()`, and the two catchArm
+ * tests use `buildResumeForTest()` (checkEligible + buildFrameFields +
+ * splitStates + buildResume — the same sequence run() itself runs,
+ * minus the guard and minus buildWrapper) — same rationale, narrower
+ * surface, same reason none of them need the guard to lift first. */
 describe("yield lowering (stage A2b — FunctionLowering used directly)", () => {
   const genLoc = loc;
   const yieldExpr = (value: IrExpr | null, type: IrType): IrExpr => ({ kind: "yieldExpr", value, type, loc: genLoc });
@@ -2274,5 +2277,88 @@ describe("yield lowering (stage A2b — FunctionLowering used directly)", () => 
     // The final statement returns $gen, not a promise.
     const ret = wrapper.body[wrapper.body.length - 1];
     expect(ret).toMatchObject({ kind: "return", value: { kind: "varRef", localId: "%gen.wrapper" } });
+  });
+
+  test("catchArm, no protected region: the routing-table default forks on GENRET vs a real exception", () => {
+    const fn: IrFunction = {
+      name: "g",
+      params: [],
+      returnType: F64,
+      generator: { yieldT: F64, nextT: F64 },
+      locals: [],
+      body: [exprStmt(yieldExpr(num(1), F64))],
+      loc: genLoc,
+    };
+    const resume = new FunctionLowering(genModule(fn), fn, () => {}).buildResumeForTest();
+    const table = routing(resume);
+    expect(table).toHaveLength(1);
+    expect(table[0]!.test).toBeNull();
+
+    const arm = table[0]!.body;
+    expect(arm).toHaveLength(1);
+    const fork = arm[0]!;
+    expect(fork.kind).toBe("if");
+    if (fork.kind !== "if") throw new Error("unreachable");
+    expect(fork.cond).toMatchObject({ kind: "%gen.excIsGenret", caught: { localId: "%async.exc" } });
+
+    // GENRET: promote retPark into out and complete, through %gen.complete
+    // — never a bespoke write of its own (see %gen.retPark's doc comment).
+    const complete = nodesOfKind(fork.then, "%gen.complete");
+    expect(complete).toHaveLength(1);
+    expect(complete[0]).toMatchObject({ value: { kind: "%gen.retPark" } });
+    expect(fork.then[fork.then.length - 1]).toMatchObject({ kind: "return" });
+
+    // Real exception: state=DONE alone (out untouched) and rethrow — the
+    // cell stays set for genResume's own post-call pending check, never
+    // %async.reject (there is no promise to reject).
+    expect(fork.else_).not.toBeNull();
+    const elseBody = fork.else_!;
+    expect(nodesOfKind(elseBody, "%gen.markDone")).toHaveLength(1);
+    expect(elseBody[elseBody.length - 1]).toMatchObject({ kind: "rethrow", localId: "%async.exc" });
+    expect(nodesOfKind(resume.body, "%async.reject")).toEqual([]);
+  });
+
+  test("catchArm, a protected region: the sentinel prologue reuses the SAME genretExit as the default, never binds a GENRET", () => {
+    const fn: IrFunction = {
+      name: "g",
+      params: [],
+      returnType: F64,
+      generator: { yieldT: F64, nextT: F64 },
+      locals: [local("e.0", CAUGHT)],
+      body: [tryCatch([exprStmt(yieldExpr(num(1), F64))], "e.0", [log([str("caught")])])],
+      loc: genLoc,
+    };
+    const resume = new FunctionLowering(genModule(fn), fn, () => {}).buildResumeForTest();
+    const table = routing(resume);
+
+    // A real protected region exists now: more than just the default.
+    const defaultArm = table.find((c) => c.test === null)!;
+    const regionArm = table.find((c) => c.test !== null)!;
+    expect(defaultArm).toBeDefined();
+    expect(regionArm).toBeDefined();
+
+    // The sentinel prologue is the region arm's FIRST statement — before
+    // the binding, before the saves, before the state write. A GENRET
+    // reaching this arm returns from inside the prologue and never
+    // executes any of what follows.
+    const prologue = regionArm.body[0]!;
+    expect(prologue.kind).toBe("if");
+    if (prologue.kind !== "if") throw new Error("unreachable");
+    expect(prologue.cond).toMatchObject({ kind: "%gen.excIsGenret", caught: { localId: "%async.exc" } });
+    expect(prologue.else_).toBeNull();
+
+    // The binding still follows, for the NON-genret path that falls
+    // through the prologue's guard.
+    const bindingIndex = regionArm.body.findIndex((s) => s.kind === "assign" && s.localId === "e.0");
+    expect(bindingIndex).toBeGreaterThan(0);
+
+    // "Single construction site, consumed by both exits": the default
+    // arm's own GENRET branch and the region's sentinel prologue reuse
+    // the IDENTICAL statement array — not two copies that happen to
+    // match, the same object, proving genretExit was built once.
+    const defaultFork = defaultArm.body[0]!;
+    expect(defaultFork.kind).toBe("if");
+    if (defaultFork.kind !== "if") throw new Error("unreachable");
+    expect(prologue.then).toBe(defaultFork.then);
   });
 });

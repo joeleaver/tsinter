@@ -99,26 +99,25 @@
  *
  * BUILD STATUS, checked against the code below rather than assumed (the
  * stale-header lesson): the frame's `%gen` field, the yield-site
- * suspend/resume split (`lowerSuspension`'s "yield" case), and
- * `completion()`/`fellThrough()`'s generator branches are BUILT at the
- * PASS level (stage A2b, A2c). `run()` still declines every generator
- * outright, though (its own guard comment has the full story): building
- * correct LOWERED IR is not the same as EMITTING it, and two more things
- * are needed before `run()` can stop declining — buildWrapper's lazy
- * generator branch (still unconditionally async's eager kick) and
- * catchArm's genType branch (its routing-table default still
- * unconditionally references PROMISE_FIELD, and needs the GENRET
- * cell-kind fork the design doc's routing-default section describes) —
- * and a THIRD, independent thing before any of this is reachable at all:
- * the emitter has to implement `%gen.suspend`/`%gen.sent`/
- * `%gen.injectCheck`/`%gen.complete` for real (currently four refusal
- * arms, `stmt:%gen.*`/`expr:%gen.sent`) before generator bodies can pass
- * survey clean, which is independent again from genResume's CONSUMER-side
- * emission (the state ladder) — the two are separate blockers under
- * different names, not one step twice. Gate-widening (below) is
- * deliberately the LAST of all of this: it happens once `run()` can stop
- * declining AND the emitter can accept what it produces, together, never
- * one without the other.
+ * suspend/resume split (`lowerSuspension`'s "yield" case),
+ * `completion()`/`fellThrough()`'s generator branches, `buildWrapper`'s
+ * lazy generator branch, and `catchArm`'s genType branch (the GENRET
+ * routing-table fork AND the catch-region sentinel prologue, stage A2c
+ * slice 3) are ALL BUILT at the PASS level now — every generator-shaped
+ * IR this pass can produce is correct IR, not merely IR that survives
+ * until some later step notices it is wrong. `run()` still declines
+ * every generator outright regardless (its own guard comment has the
+ * full story): building correct LOWERED IR is not the same as EMITTING
+ * it, and the ONE thing left before `run()` can stop declining is the
+ * emitter — it has to implement `%gen.suspend`/`%gen.sent`/
+ * `%gen.injectCheck`/`%gen.complete`/`%gen.markDone`/`%gen.retPark`/
+ * `%gen.excIsGenret`/`%gen.new` for real (currently eight refusal arms,
+ * `stmt:%gen.*`/`expr:%gen.*`) before generator bodies can pass survey
+ * clean — independent again from genResume's CONSUMER-side emission (the
+ * state ladder), which is stage A3, not this. Gate-widening (below) is
+ * deliberately the LAST of all of this: it happens once the emitter can
+ * accept what the pass produces AND `run()` can stop declining, together,
+ * never one without the other.
  *
  * ONE RESUME SIGNATURE. Resume takes `%frameBase` — an empty OPEN struct
  * every concrete frame subtypes — and casts it down to its own shape in a
@@ -521,6 +520,34 @@ export type AsyncExpr =
    * undefined unit — nothing to read, same rule `%async.settled` follows
    * for a void await. */
   | { kind: "%gen.sent"; gen: WExpr; type: IrType; loc: SrcLoc }
+  /** Read $gen.retPark — `.return(v)`'s parked value, typed `retT`
+   * (`type` here). Mirrors `%gen.sent` exactly (same "pass hands over the
+   * expression and the static type, emitter does the field read" shape),
+   * with one caller: catchArm's GENRET exit (statemachine.ts's own
+   * "single construction site" — see catchArm's doc comment) feeds this
+   * straight into `%gen.complete`'s `value`, so promoting a parked
+   * `.return(v)` into `$gen.out` is "complete with this as the value",
+   * not a bespoke write — retagging retT→V happens exactly where
+   * `%gen.complete` already retags an ordinary `return v;`'s operand,
+   * never duplicated here. */
+  | { kind: "%gen.retPark"; gen: WExpr; type: IrType; loc: SrcLoc }
+  /** Is the exception `%async.exc` (the routing table's own catch binding,
+   * `caught` here) actually the GENRET sentinel rather than a real thrown
+   * value? Reads the SAME increment-10 cell-kind tag `%gen.injectCheck`'s
+   * doc comment describes `%gen.injectCheck` as WRITING before its GENRET
+   * unwind — the catch clause's own binding already snapshotted that tag
+   * into `%async.exc`'s own kind field (ordinary tryCatch semantics, ports
+   * for free), so this op reads a value that already exists rather than
+   * asking the runtime for anything new. Boolean-typed (`type` is always
+   * BOOL at construction, carried explicitly like every other seam op
+   * rather than hardcoded in the emitter, so the pass's own construction
+   * site stays the single place that decides it). The catch-region
+   * sentinel prologue and the routing-table default both test this, per
+   * the design doc's "GENRET re-routes to the enclosing finalizer/default
+   * instead of binding" — with stage B's finalizers not yet built, both
+   * routes land at the SAME generator exit today (catchArm's comment has
+   * the full story). */
+  | { kind: "%gen.excIsGenret"; caught: WExpr; type: IrType; loc: SrcLoc }
   /** Allocate a fresh $gen<triple>, given the frame it belongs to and the
    * resume closure the wrapper already built — mirrors `%async.mint`
    * (one-shot allocate, no pass-visible internal layout), but unlike a
@@ -627,7 +654,18 @@ export type AsyncStmt =
    * no companion `frame.%state` write and no `%await<k>`-style slot —
    * `completion()`/`fellThrough()`'s generator branches emit ONLY this
    * plus a bare `return`, nothing else. */
-  | { kind: "%gen.complete"; gen: WExpr; value: WExpr | null; loc: SrcLoc };
+  | { kind: "%gen.complete"; gen: WExpr; value: WExpr | null; loc: SrcLoc }
+  /** Set `$gen.state = DONE` alone — `out` UNTOUCHED, unlike `%gen.complete`.
+   * catchArm's ONLY caller: the routing-table default's real-exception exit
+   * (design doc: "real exception → state=DONE, LEAVE THE CELL SET, return"
+   * — the cell is what carries the value onward, via `rethrow` right after
+   * this op, so there is nothing for `out` to hold and writing it would be
+   * a value nobody asked for, not merely a wasted write). The GENRET exit
+   * needs no sibling of its own here: it reaches DONE through
+   * `%gen.complete` already (see `%gen.retPark`'s doc comment), which
+   * writes both `out` and `state` atomically the way a real `return v;`
+   * does. */
+  | { kind: "%gen.markDone"; gen: WExpr; loc: SrcLoc };
 
 /** A statement of the lowered IR. SHALLOW by design — see the header:
  * nested bodies keep their `IrStmt[]` static type while carrying
@@ -1287,22 +1325,28 @@ export class FunctionLowering {
   }
 
   run(): { wrapper: WFunction; resume: WFunction; frame: IrRecordShape } {
-    // GUARD, not documentation (the A2b gate's F2 finding): buildWrapper
-    // and catchArm (reached through buildResume) BOTH write/reference
-    // PROMISE_FIELD unconditionally — buildWrapper's frameInit literal
-    // names it directly, and catchArm's "reject" default arm (embedded in
-    // EVERY resume, whether or not the body has a covering try/catch —
-    // the routing table's fallback for "no protected region") does too.
-    // Neither checks genType. Until the lazy wrapper (buildWrapper) and
-    // the GENRET-aware routing default (catchArm) exist — the NEXT
-    // sub-unit's work, not this one's — calling this for a generator
-    // would construct a recordLit/resume body naming a "%promise" field
-    // the frame (buildFrameFields' own genType branch) no longer even
-    // declares: invalid IR, not a crash (nothing here cross-checks field
-    // names against the shape), which is exactly why it has to be
-    // refused HERE rather than produced and trusted downstream.
-    // runFrameAndStatesForTest() below is the narrower surface that
-    // stays clear of both broken paths, for exactly this reason.
+    // GUARD, not documentation (the A2b gate's F2 finding, still load-
+    // bearing after A2c slice 3): buildWrapper and catchArm (reached
+    // through buildResume) BOTH have their genType branches now — neither
+    // constructs invalid IR for a generator anymore, which is what made
+    // this guard necessary through A2c slices 1 and 2. What still blocks
+    // is ONE step further down: the emitter refuses every `%gen.*` seam
+    // kind by name (stmt:%gen.suspend/injectCheck/complete/markDone,
+    // expr:%gen.sent/new/retPark/excIsGenret) — real emission is
+    // unbuilt, so a generator body that reached the emitter today would
+    // survey clean as SHAPE but refuse on every seam op it actually
+    // contains. Lifting this guard before those exist would trade one
+    // failure mode for a worse one: instead of a single named
+    // `fn:async:generator-wrapper-not-built` refusal at the function
+    // boundary, callers would see the FIRST seam op inside the body
+    // refuse instead — technically still loud, never a miscompile, but
+    // the wrong granularity (a per-construct refusal standing in for a
+    // whole-function one) and a worse tier count in the meantime (the
+    // fn:generator bucket would fragment into partial per-body refusals
+    // rather than staying one clean bucket until the whole thing is
+    // ready). runFrameAndStatesForTest()/buildWrapperForTest()/
+    // buildResumeForTest() below are the narrower surfaces the pass-level
+    // tests use instead, structurally incapable of reaching this guard.
     if (this.genType !== null) this.decline("fn:async:generator-wrapper-not-built");
 
     this.checkEligible();
@@ -1340,17 +1384,17 @@ export class FunctionLowering {
   }
 
   /** TEST-ONLY (see the class's own export comment): the frame shape and
-   * the raw per-state statement lists, WITHOUT buildResume/catchArm — the
-   * one remaining path run()'s own guard above refuses generators from
-   * reaching (buildWrapper has its own generator branch now, stage A2c;
-   * catchArm's routing-table default is the sole survivor of the
-   * unconditionally-async-shaped problem this method was built to dodge).
-   * This is how the A2b yield-lowering tests verify the suspend/resume
-   * split (%gen.suspend/%gen.injectCheck/%gen.sent) without ever
-   * constructing the invalid IR catchArm would still produce for a
-   * generator. Callable for an async function too (nothing here is
-   * generator-specific), but the real entry point (run()) is the one
-   * that matters for async — this exists for generators specifically. */
+   * the raw per-state statement lists, WITHOUT buildResume/buildWrapper —
+   * run()'s own guard above still refuses every generator at the
+   * function boundary (the emitter's `%gen.*` seam ops are still unbuilt
+   * — see the guard's own comment), so this stays the surface the
+   * pass-level tests use rather than run() itself. This is how the A2b
+   * yield-lowering tests verify the suspend/resume split (%gen.suspend/
+   * %gen.injectCheck/%gen.sent) without depending on buildWrapper or
+   * buildResume being reachable at all. Callable for an async function
+   * too (nothing here is generator-specific), but the real entry point
+   * (run()) is the one that matters for async — this exists for
+   * generators specifically. */
   runFrameAndStatesForTest(): { frame: IrRecordShape; states: WStmt[][] } {
     this.checkEligible();
     this.buildFrameFields();
@@ -1359,17 +1403,35 @@ export class FunctionLowering {
   }
 
   /** TEST-ONLY, same rationale as runFrameAndStatesForTest() above: the
-   * wrapper alone, without ever reaching buildResume/catchArm. buildWrapper
-   * needs only checkEligible()'s side effects (bodyBoxedIds/boxInits/
-   * locals) — it references neither buildFrameFields()'s populated field
-   * list nor splitStates()'s state graph, so this is the minimal path to
-   * it. Exists because run() still declines every generator outright
-   * (catchArm's genType branch has not landed) — this is how the A2c
+   * wrapper alone. buildWrapper needs only checkEligible()'s side effects
+   * (bodyBoxedIds/boxInits/locals) — it references neither
+   * buildFrameFields()'s populated field list nor splitStates()'s state
+   * graph, so this is the minimal path to it. This is how the A2c
    * lazy-wrapper tests verify %gen.new/frame.%gen-writeback/return-$gen
-   * without constructing the invalid IR catchArm would still produce. */
+   * without depending on buildResume/catchArm or run()'s guard lifting. */
   buildWrapperForTest(): WFunction {
     this.checkEligible();
     return this.buildWrapper();
+  }
+
+  /** TEST-ONLY, same rationale again: resume alone (the routing table
+   * included — catchArm's genType branch, A2c slice 3). Needs the full
+   * checkEligible/buildFrameFields/splitStates sequence run() itself
+   * runs, since buildResume reads `this.states` (splitStates' own
+   * output) and catchArm reads `this.handlerOf`/`this.catchBindings`
+   * (populated while splitStates lowers the body). This is how the
+   * catchArm tests verify the GENRET fork (routing-table default) and
+   * the sentinel prologue (catch-region arms) without run()'s guard
+   * lifting — nothing about buildResume itself is unsafe for a generator
+   * anymore (unlike buildWrapper before A2c slice 2, catchArm before
+   * this slice), but the guard stays UP regardless: the emitter still
+   * refuses every %gen.* seam kind by name, so a generator body that
+   * reached the emitter today would still fail, just one level down. */
+  buildResumeForTest(): WFunction {
+    this.checkEligible();
+    this.buildFrameFields();
+    this.splitStates();
+    return this.buildResume();
   }
 
   /* ── eligibility and the hoisting rewrite ────────────────────────────── */
@@ -2409,18 +2471,68 @@ export class FunctionLowering {
    *
    * States sharing a handler share ONE case body: the cases ahead of it
    * have EMPTY bodies and fall through, exactly as a body-less case does
-   * in the switch this pass's own dispatch already relies on. */
+   * in the switch this pass's own dispatch already relies on.
+   *
+   * GENERATOR genType BRANCH (increment 19, A2c slice 3). Async's "reject
+   * my own promise" default has no generator analogue — a generator's
+   * uncaught exception propagates SYNCHRONOUSLY out of `.next()`/etc
+   * (genResume's post-call pending check, stage A3), never through a
+   * settle-style channel. The design doc's routing-table default forks on
+   * the caught value's cell KIND: GENRET (an injected `.return(v)`
+   * unwinding with nothing left to run) completes the generator with the
+   * parked value; anything else is a real exception, which the default
+   * arm re-arms (via `rethrow`) and leaves for the caller to observe —
+   * `%gen.markDone`'s own doc comment has the "why not `%gen.complete`
+   * here" reasoning. `genretExit` is built EXACTLY ONCE below and has TWO
+   * callers: this default arm's own fork, and — per the design doc's
+   * "routing-table arms for CATCH regions get the sentinel prologue" —
+   * every catch-region case, prepended, so a GENRET unwind reaching a
+   * region that would otherwise bind and dispatch to its handler instead
+   * completes the generator without ever entering the catch. (Stage B's
+   * finalizers do not exist yet, so "the enclosing finalizer" the design
+   * doc also names and "the default" are the SAME target for now; the
+   * sentinel prologue already routes correctly either way, since it reads
+   * `genretExit` by reference rather than assuming which target it is.) */
   private catchArm(): WStmt[] {
     const excRef: WExpr = { kind: "varRef", localId: EXC_LOCAL, type: CAUGHT, loc: this.loc };
-    const reject: WStmt[] = [
-      {
-        kind: "%async.reject",
-        promise: this.get(PROMISE_FIELD, this.promiseType),
-        caught: excRef,
-        loc: this.loc,
-      },
-      this.ret(),
-    ];
+    const genType = this.genType;
+    const isGenret: WExpr = { kind: "%gen.excIsGenret", caught: excRef, type: BOOL, loc: this.loc };
+    const genretExit: WStmt[] =
+      genType !== null
+        ? [
+            {
+              kind: "%gen.complete",
+              gen: this.genRef(),
+              value: { kind: "%gen.retPark", gen: this.genRef(), type: this.fn.returnType, loc: this.loc },
+              loc: this.loc,
+            },
+            this.ret(),
+          ]
+        : [];
+
+    const defaultArm: WStmt[] =
+      genType !== null
+        ? [
+            {
+              kind: "if",
+              cond: widenExpr(isGenret),
+              then: widenBody(genretExit),
+              else_: widenBody([
+                { kind: "%gen.markDone", gen: this.genRef(), loc: this.loc },
+                { kind: "rethrow", localId: EXC_LOCAL, loc: this.loc },
+              ]),
+              loc: this.loc,
+            },
+          ]
+        : [
+            {
+              kind: "%async.reject",
+              promise: this.get(PROMISE_FIELD, this.promiseType),
+              caught: excRef,
+              loc: this.loc,
+            },
+            this.ret(),
+          ];
     const byHandler = new Map<number, number[]>();
     this.handlerOf.forEach((handler, state) => {
       if (handler < 0) return;
@@ -2428,7 +2540,7 @@ export class FunctionLowering {
       if (group === undefined) byHandler.set(handler, [state]);
       else group.push(state);
     });
-    if (byHandler.size === 0) return reject;
+    if (byHandler.size === 0) return defaultArm;
 
     const cases: { test: IrExpr | null; body: IrStmt[] }[] = [];
     for (const handler of [...byHandler.keys()].sort((a, b) => a - b)) {
@@ -2438,6 +2550,24 @@ export class FunctionLowering {
       // wasm local agree about the caught value (the header's second
       // ordering fact). A bindingless `catch {}` has nothing to write.
       const body: WStmt[] = [
+        // The sentinel prologue (generator only — see this method's doc
+        // comment): a GENRET unwind never binds, never saves, never
+        // dispatches to the handler state. Checked ONCE per handler
+        // group, on the shared body every state in the group falls
+        // through to — exactly like the binding/saves/state-write below,
+        // which state actually threw does not matter once they share a
+        // handler.
+        ...(genType !== null
+          ? [
+              {
+                kind: "if" as const,
+                cond: widenExpr(isGenret),
+                then: widenBody(genretExit),
+                else_: null,
+                loc: this.loc,
+              },
+            ]
+          : []),
         ...(binding === null
           ? []
           : [{ kind: "assign" as const, localId: binding, value: widenExpr(excRef), loc: this.loc }]),
@@ -2450,7 +2580,7 @@ export class FunctionLowering {
         cases.push({ test: this.num(state), body: widenBody(i === states.length - 1 ? body : []) });
       });
     }
-    cases.push({ test: null, body: widenBody(reject) });
+    cases.push({ test: null, body: widenBody(defaultArm) });
     return [{ kind: "switch", disc: widenExpr(this.get(STATE_FIELD, F64)), cases, loc: this.loc }];
   }
 
