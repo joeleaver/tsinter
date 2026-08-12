@@ -8,10 +8,11 @@
  * is what keeps the emitter's own `fn:async` firing behind it. */
 import { beforeAll, describe, expect, test } from "vitest";
 import type { IrExpr, IrFunction, IrModule, IrStmt, IrType, SrcLoc } from "../src/ir/nodes.js";
-import { BOOL, CAUGHT, F64, STRING, VOID } from "../src/ir/nodes.js";
+import { BOOL, CAUGHT, DYN, F64, STRING, VOID } from "../src/ir/nodes.js";
 import { asIrModule, lowerResumableFunctions, type WFunction, type WModule } from "../src/backend/wasm/statemachine.js";
 import { computeMayThrow } from "../src/backend/emission/may-throw.js";
-import { surveyWasmModule } from "../src/backend/wasm/emitter.js";
+import { emitWasmModule, surveyWasmModule } from "../src/backend/wasm/emitter.js";
+import { genResultRecord, ShapeRegistry, UnionRegistry } from "../src/frontend/types.js";
 import {
   assign,
   asyncModule,
@@ -29,6 +30,7 @@ import {
   promiseGlobal,
   promiseOf,
   ret,
+  runtimeErrorClasses,
   str,
   twoAwaits,
   v,
@@ -1811,4 +1813,135 @@ test("an awaited `Promise<T> | undefined` surveys clean", () => {
   // re-entry check runs only on the promise arm. A VOID result emits no
   // settled read at all, so this shape needs the pair and nothing else.
   expect(survey).toEqual([]);
+});
+
+/* ── 10. S041: the IteratorResult record's declared order ────────────────
+ *
+ * SEMANTICS.md S041: declaredOrder is metadata, not identity, so a
+ * structurally-identical record shares ONE render order module-wide,
+ * first-seen-wins. These two tests cover exactly the scope S041 commits
+ * to pinning: the INTENT genResultRecord asserts (declaredOrder itself),
+ * and the BEHAVIORAL render in an UNCONTESTED module (nothing else in the
+ * module shares this exact shape, so there is no race to observe). Real
+ * generator lowering does not exist in the wasm backend yet (stage A is
+ * still building it), so "a real g.next() result" is reached the same way
+ * S037's flag-true tests reach an unreachable-today shape: directly, at
+ * the builder level — genResultRecord is a pure frontend function, fully
+ * callable today with fresh registries, and its output is fed through the
+ * REAL wasm emitter (emitWasmModule, not a mock) for the behavioral half.
+ * NEITHER test attempts to pin the race S041 itself documents — that is
+ * deliberately out of scope for an in-suite pin (S041's own argument:
+ * a corpus program observing the wrong order would be a program that
+ * could never pass the differential, which is exactly why a passing unit
+ * test can't demonstrate the WRONG order either — only the uncontested
+ * right one). */
+describe("S041: IteratorResult declared order", () => {
+  test("genResultRecord's declaredOrder is exactly [value, done] — intent", () => {
+    // Two representative channel shapes: an ordinary yielded-number
+    // generator (V becomes a real union, f64 | undefined) and a dyn
+    // channel (V collapses to DYN directly, genResultRecord's own first
+    // branch) — declaredOrder must be the literal ["value","done"] either
+    // way, since it is independent of what V turns out to be.
+    for (const yieldT of [F64, DYN]) {
+      const shapes = new ShapeRegistry();
+      const unions = new UnionRegistry();
+      const rec = genResultRecord(yieldT, VOID, shapes, unions);
+      if (rec === null) throw new Error("genResultRecord returned null");
+      const shape = shapes.get(rec.shapeId);
+      expect(shape?.declaredOrder).toEqual(["value", "done"]);
+    }
+  });
+
+  test("a genResultRecord-shaped value renders value-first — behavioral, uncontested module", async () => {
+    const shapes = new ShapeRegistry();
+    const unions = new UnionRegistry();
+    // yieldT = f64 (not dyn): V becomes a real union (f64 | undefined),
+    // exercising the SAME jsonWrite/declaredOrder path a real generator's
+    // result record uses — plain dyn fields hit their own SEPARATE,
+    // pre-existing "jsonWrite:dyn" gap (measured while writing this test,
+    // unrelated to declaredOrder), which would make this pin about the
+    // wrong thing. console.log of a raw record ALSO refuses on its own
+    // account today (`intrinsic:console.log:record` — real compiled
+    // console.log(obj) never reaches the emitter in this raw shape; the
+    // frontend's lowerConsoleInspectArg/formatValueExpr desugars it to a
+    // rendered STRING first, which this hand-built module has no frontend
+    // pass to run). Piping through JSON.stringify (a STRING result) is
+    // the same surface wasm-emitter.test.ts's own declaredOrder tests
+    // already use, and fully exercises declaredOrder either way — the
+    // console.log/inspect gap is real but orthogonal to what this test
+    // pins, so it is worked around here, not silently swallowed.
+    const rec = genResultRecord(F64, VOID, shapes, unions);
+    if (rec === null) throw new Error("genResultRecord returned null");
+    const recType: IrType = { kind: "record", shapeId: rec.shapeId };
+    const shape = shapes.get(rec.shapeId)!;
+    const valueField = shape.fields.find((f) => f.name === "value")!;
+    if (valueField.type.kind !== "union") throw new Error("expected value field to be a union");
+    const unionId = valueField.type.unionId;
+    const arms = unions.get(unionId)?.arms ?? [];
+    const f64Tag = arms.findIndex((a) => a.kind === "f64");
+    if (f64Tag < 0) throw new Error("expected an f64 arm in the value union");
+
+    const valueExpr: IrExpr = {
+      kind: "unionWrap",
+      unionId,
+      tag: f64Tag,
+      value: { kind: "numLit", value: 42, type: F64, loc },
+      type: valueField.type,
+      loc,
+    };
+    const doneExpr: IrExpr = { kind: "boolLit", value: false, type: BOOL, loc };
+    const litExpr: IrExpr = {
+      kind: "recordLit",
+      fields: [
+        { name: "value", value: valueExpr },
+        { name: "done", value: doneExpr },
+      ],
+      type: recType,
+      loc,
+    };
+    const rRef: IrExpr = { kind: "varRef", localId: "r.0", type: recType, loc };
+
+    const mod: IrModule = {
+      irVersion: 3,
+      sourceFile: "s041.ts",
+      entry: "%main",
+      classes: runtimeErrorClasses,
+      records: shapes.shapes,
+      unions: unions.unions,
+      functions: [
+        {
+          name: "%main",
+          params: [],
+          returnType: VOID,
+          locals: [{ id: "r.0", name: "r.0", type: recType, mutable: false }],
+          body: [varDecl("r.0", litExpr), log([{ kind: "jsonStringify", value: rRef, type: STRING, loc }])],
+          loc,
+        },
+      ],
+    };
+
+    // No refusals: the shape this test builds is exactly what stage A's
+    // mapType/mapTypeSoft generator arms already make representable.
+    expect(surveyWasmModule(mod)).toEqual([]);
+
+    const bytes = emitWasmModule(mod);
+    const chunks: Buffer[] = [];
+    let memory: WebAssembly.Memory | null = null;
+    const { instance } = await WebAssembly.instantiate(bytes, {
+      tsinter: {
+        write(fd: number, ptr: number, len: number): void {
+          if (memory === null) throw new Error("write before instantiation completed");
+          if (fd === 1) chunks.push(Buffer.from(new Uint8Array(memory.buffer, ptr, len)));
+        },
+      },
+    });
+    memory = instance.exports["memory"] as WebAssembly.Memory;
+    (instance.exports["_start"] as () => void)();
+    const stdout = Buffer.concat(chunks).toString("utf8");
+
+    // value-first via JSON.stringify piped through console.log — the
+    // exact surface declaredOrder controls, with nothing else in this
+    // module sharing the shape to race against.
+    expect(stdout).toBe(`{"value":42,"done":false}` + "\n");
+  });
 });

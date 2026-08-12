@@ -2723,10 +2723,28 @@ export function genResultRecord(
   }
   return {
     kind: "record",
-    shapeId: shapes.intern([
-      { name: "done", type: BOOL },
-      { name: "value", type: valueT },
-    ]),
+    // Storage order stays canonical (done < value, so the array below IS
+    // already sorted — validate.ts:1298-1301 enforces this for EVERY
+    // record, unconditionally; reordering the array itself would fail
+    // validation the moment any generator-bearing module validates).
+    // Node's CreateIterResultObject builds {value, done} — this is the
+    // declaredOrder lever every render path (JSON, inspect/console.log,
+    // Object.keys/for-in) already prefers over raw field order, the SAME
+    // mechanism hybrid records use for their own declared-vs-overflow
+    // split (S031). declaredOrder is metadata, not identity (excluded
+    // from ShapeRegistry.intern's key), so this is a free, non-breaking
+    // addition. SEMANTICS.md S041: this PINS INTENT — the actual render
+    // order a given module observes still depends on which structurally-
+    // identical shape interned FIRST (first-seen-wins, S041's subject).
+    shapeId: shapes.intern(
+      [
+        { name: "done", type: BOOL },
+        { name: "value", type: valueT },
+      ],
+      false,
+      undefined,
+      ["value", "done"],
+    ),
   };
 }
 

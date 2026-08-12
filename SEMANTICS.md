@@ -2272,3 +2272,128 @@ close" parenthetical earlier in this entry. Once `for-of`-over-generator
 lowers, a unit test should pin the CURRENT (`break`-only) closing
 behavior directly. No corpus program can pin the gap itself, per the
 previous paragraph.
+
+## S041 — Structurally-identical record shapes share ONE own-key render order — first construction site wins, module-wide *(pre-existing, all three lanes; first registered here because generators are the first feature whose INTENT a collision can silently defeat)*
+
+`declaredOrder` (`IrRecordShape`, `ShapeRegistry.intern`'s 4th argument,
+types.ts) controls the own-key order every render surface uses —
+`JSON.stringify`, `util.inspect`/`console.log`, `Object.keys`/`for...in`
+(S031's declared-then-overflow split rides the same field) — but it is
+explicitly EXCLUDED from `ShapeRegistry.keyOf`'s interning key ("metadata,
+NOT identity," types.ts's own comment on `intern`). Two structurally
+IDENTICAL shapes — same field names, same field TYPES, canonical
+(sorted) order — therefore intern to the SAME shapeId no matter how many
+times either is independently constructed, and a shape carries exactly
+ONE `declaredOrder`: whichever construction the frontend's type-mapping
+walk reaches FIRST for that exact shape. Every later structurally-equal
+value — regardless of ITS OWN source declaration order — renders in the
+first one's order, module-wide, for the rest of that module's lifetime.
+
+**Measured directly (two runs each, all three lanes, plus Node as the
+oracle — impl-inc19's own construction, independently reproducing the
+reviewer's earlier `f4-collision.ts`/`f4-collision-rev.ts` measurement
+exactly, no disagreement to reconcile):**
+
+```ts
+const alpha = { x: 10, y: 20, z: 30 };
+const beta = { z: 300, y: 200, x: 100 }; // same 3 fields, opposite order
+console.log(JSON.stringify(alpha), JSON.stringify(beta));
+console.log(Object.keys(alpha).join(","), Object.keys(beta).join(","));
+```
+
+Node: `alpha` prints `x,y,z` (its own order), `beta` prints `z,y,x` (ITS
+own order) — two independent objects, two independent insertion orders,
+exactly as JS defines. This tier, all three lanes identically: `beta`
+ALSO prints `x,y,z` — `alpha`'s order, borrowed, not its own. The
+causality control — the same two literals with their SOURCE POSITIONS
+swapped (`beta` declared first) — flips the divergence to match: now
+BOTH render `z,y,x`, `beta`'s order this time, proving the mechanism is
+first-seen-wins by construction site, not some property of either
+literal's name or content. wasm was run via `inc19-probes/wasm-host.mjs`
+(a standalone ABI host mirroring the differential harness's runWasm
+contract as of commit 4509e88 — a probe tool, never a load-bearing
+oracle, since it drifts silently if `abi.ts` changes); C and LLVM via
+ordinary `tsinter build --backend c|llvm` binaries. All three lanes
+agree with each other and diverge from Node identically, both directions.
+
+**The IteratorResult record is the generator-relevant instance of this
+general rule, not a special case of it.** `genResultRecord`'s shape
+(`{done: bool, value: V}`, this increment's `declaredOrder: ["value",
+"done"]` addition) collides with any OTHER record in the same module
+whose fields are ALSO exactly `done: bool` and `value: <the same
+canonicalized V>` — a real, if narrow, possibility: a hand-written
+manual-iterator object (`2252-class-iterators.ts`'s `Range`/`EvenIter`/
+`Letters` classes all return `{ value: v, done: ... }` literals) is
+EXACTLY this shape whenever its `value` slot's inferred type happens to
+canonicalize to the same union a real generator's channels would
+produce. **`declaredOrder` on `genResultRecord`'s own `intern` call PINS
+INTENT, not outcome.** It asserts "this shape should render value-first
+when nothing else has already claimed the shape" — correct and
+sufficient in an UNCONTESTED module (no other same-shaped construction
+anywhere in it, the common case), but in a module where some OTHER
+construction of the identical shape reaches the interner first, that
+other construction's declared order wins for the generator's
+IteratorResult too, module-wide, exactly as the measurement above shows
+for two ordinary object literals. Intent and outcome are genuinely
+different questions; this entry answers "what does the compiler assert
+the order SHOULD be" (the genResultRecord fix) and "what does a given
+module actually OBSERVE" (a first-seen-wins race this entry does not
+close) as two separate things on purpose.
+
+**`2252-class-iterators.ts` is harmless TODAY, confirmed by direct
+reading, not assumed.** It has no `function*` anywhere — `genResultRecord`
+never runs in that module at all, so there is no generator shape for its
+`{value, done}` literals to collide with. Its own three `next()` methods
+independently declare `{ value: ..., done: ... }` in the SAME (value-
+first) order as each other and, as it happens, the same order this
+increment's `declaredOrder` fix now asserts for generators — coincidence
+of authoring style (JS programmers write `value` before `done` almost
+universally), not a guarantee this entry is asserting for any future
+program that combines the two shapes with either literal declared
+`{done, value}` first.
+
+**No corpus program can exercise the collision and pass, on any lane —
+the S037/S038-family argument applies unchanged.** A program constructing
+two structurally-identical records in opposite declared order and
+observing BOTH their independent orders would print Node's TWO distinct
+orderings and this tier's ONE borrowed ordering identically wrong on
+every lane (the measurement above), so such a program could never have
+passed the byte-exact differential and could not be in the corpus today,
+generators or not. This is PRE-EXISTING debt: `declaredOrder`'s
+first-seen-wins interning predates generators entirely (hybrid records,
+S031, are the same mechanism) and applies to any two structurally-equal
+shapes tier-wide — this increment is what makes it relevant to a NEW
+family (generator results colliding with hand-written iterator-shaped
+literals), which is why it is registered now rather than being a defect
+newly introduced here.
+
+**Alternatives considered and rejected (design record).** An intern-FIRST
+guarantee — eagerly interning `genResultRecord`'s shape at module
+initialization, ahead of any user code, so a generator's own intent
+always wins the race — was rejected: it does not remove the divergence,
+it only moves WHICH construction loses it (an ordinary two-literal
+collision between unrelated user code would still exist, unwitnessed by
+any generator), so it trades one silent module-dependent race for
+another rather than closing the class. A distinguishing marker on
+`IteratorResult`'s shape (so it can never structurally collide with a
+hand-written iterator's return value) was also rejected: `2252`'s whole
+point is that a real generator and a manual `next()` implementation are
+STRUCTURALLY THE SAME THING to consumers (for-of, spreads, destructuring
+all work identically over either) — a marker that fractures that
+unification would be a bigger, unrelated behavior change to fix a
+render-order corner, not a proportionate response.
+
+**Tested by:** the measurement above (`inc19-probes/f4-collision.ts`/
+`f4-collision-rev.ts`, the reviewer's original construction, plus
+`f4-collision-impl.ts`/`f4-collision-impl-rev.ts`, this entry's own
+independently-authored reproduction with different field names/values —
+the two agree exactly, no disagreement to report) is Node-oracle and
+all-three-lane confirmed, twice each, both directions — but per the
+corpus-unpinnable argument, nothing IN THE SUITE pins the collision
+itself (a passing test asserting the wrong order would be a test that
+the tier is broken, not that it works). The generator-specific stage A
+unit pin (wasm-statemachine.test.ts) covers the UNCONTESTED case only —
+`genResultRecord`'s `declaredOrder` is exactly `["value","done"]`, and a
+value-first render for a generator result IN A MODULE WITH NO COMPETING
+SHAPE — deliberately not attempting to pin the race itself, which is
+what this entry registers instead.

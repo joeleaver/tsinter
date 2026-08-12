@@ -118,6 +118,7 @@ import {
   RACEE_DST,
   RACEE_SRC,
 } from "./promises.js";
+import { GeneratorBuilder } from "./generators.js";
 import { StrBuilder } from "./strings.js";
 import { BytesBuilder, type BytesElem } from "./typedarrays.js";
 import { TimerBuilder } from "./timers.js";
@@ -1771,6 +1772,19 @@ class Assembler {
    * node over a resume (the lowering types them the same way). */
   private resumeClosPair(): { clos: number; fn: number } {
     return this.closPairFor([{ kind: "ref", nullable: true, typeIndex: this.frameBaseType() }], []);
+  }
+
+  private gensField: GeneratorBuilder | null = null;
+
+  private get gens(): GeneratorBuilder {
+    this.gensField ??= new GeneratorBuilder(this.mb, {
+      frameBase: () => this.frameBaseType(),
+      resumeClos: () => this.resumeClosPair(),
+      dynRef: () => this.dyn.dynRef(),
+      unionBaseRef: () => this.unions.baseRef(),
+      mapTypeSoft: (t) => this.mapTypeSoft(t),
+    });
+    return this.gensField;
   }
 
   /* ── the top-level-await root (abi.ts's `_status`, SEMANTICS.md S010) ──
@@ -4402,6 +4416,12 @@ class Assembler {
         // the inner type is the READING side's business, never the
         // representation's.
         return this.proms.promRef();
+      case "generator":
+        // Unlike promise, ONE struct per CHANNEL TRIPLE — the value/sent/
+        // return slots are statically typed, no tag (generators.ts's
+        // header). Never fails (mapTypeSoft covers every channel type a
+        // record field could, and out/state/frame/resume never do).
+        return this.gens.genRef(this.gens.info(t));
       case "%frameBase":
         // The lowering's frame handle — resume's uniform parameter.
         return { kind: "ref", nullable: true, typeIndex: this.frameBaseType() };
@@ -4500,6 +4520,7 @@ class Assembler {
           t.elem.kind === "record" ||
           t.elem.kind === "union" ||
           t.elem.kind === "promise" ||
+          t.elem.kind === "generator" ||
           t.elem.kind === "dyn" ||
           t.elem.kind === "map" ||
           t.elem.kind === "set" ||
@@ -4536,6 +4557,10 @@ class Assembler {
       case "promise":
         // mapType never fails on promises either (one struct for all).
         return this.proms.promRef();
+      case "generator":
+        // mapType never fails on generators either — same arm, same
+        // consistency rule (generators.ts's header).
+        return this.gens.genRef(this.gens.info(t));
       case "%frameBase":
         return { kind: "ref", nullable: true, typeIndex: this.frameBaseType() };
       case "object": {
@@ -9183,6 +9208,20 @@ class Assembler {
         // `Uint32Array[]` into one (wrong) shared vector type (the
         // increment-17 vecKeyFor bare-"map" bug, same class).
         return `bytes:${t.elem}`;
+      case "generator":
+        // Collision-proof, same class as bytes/map/set above: the default
+        // arm's bare `t.kind` would answer "generator" for EVERY channel
+        // triple, colliding e.g. `Generator<number,void,unknown>[]` with
+        // `Generator<string,void,unknown>[]` into one (wrong) shared
+        // vector type. typeKey(t) already IS the full triple (nodes.ts),
+        // exactly the key mapType's own generator arm interns by
+        // (generators.ts) — reusing it here keeps the two from drifting
+        // apart, the BUG-CLASS WARNING's whole point. Dormant today (the
+        // frontend fences generators out of array elements, same as
+        // map/set — the "generator" arm just above), grown anyway per
+        // that same warning: a lagging arm here is a call-site vs global
+        // type clash the day the frontend fence lifts, not before.
+        return `gen:${typeKey(t)}`;
       default:
         return t.kind;
     }
