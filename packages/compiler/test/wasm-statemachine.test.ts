@@ -2059,28 +2059,32 @@ describe("genResume hoists inside an async function (stage A2 opener)", () => {
  * reach them yet.
  *
  * SCOPE NOTE (A2b gate's F2 finding — a GUARD, not documentation):
- * buildWrapper and catchArm (reached through buildResume) are BOTH STILL
- * unconditionally async-shaped as of this comment — buildWrapper's
- * frameInit literal names PROMISE_FIELD directly, and catchArm's
- * "reject" default arm (embedded in EVERY resume regardless of whether
- * the body has a covering try/catch — the routing table's fallback for
- * "no protected region") does too. `completion()`/`fellThrough()` are
- * NOT in that list anymore (stage A2c) — both now branch on genType and
- * emit `%gen.complete` for a generator's return/fall-through, covered by
- * the two tests below named for them; they are the reason those two
- * bodies can now use an explicit `return`/fall off the end at all, where
- * every A2b-era test had to avoid both. Calling `.run()` on a generator
- * would still construct invalid IR through buildWrapper/catchArm — not a
- * crash, since nothing cross-checks a recordLit's field names against
- * the shape, which is exactly why it has to be refused rather than
- * produced and trusted. `run()` still declines outright for any
+ * catchArm (reached through buildResume) is STILL unconditionally
+ * async-shaped as of this comment — its "reject" default arm (embedded
+ * in EVERY resume regardless of whether the body has a covering
+ * try/catch — the routing table's fallback for "no protected region")
+ * unconditionally references PROMISE_FIELD and emits %async.reject.
+ * `completion()`/`fellThrough()` (stage A2c) and `buildWrapper()` (A2c
+ * slice 2) are NOT in that list anymore — all three now branch on
+ * genType: completion/fellThrough emit `%gen.complete` for a
+ * generator's return/fall-through (covered by the two tests named for
+ * them), and buildWrapper builds frame+$gen, writes the back-reference,
+ * and returns $gen with no eager resume call and no promise-cache
+ * protocol (covered by the "lazy wrapper" test below). Calling `.run()`
+ * on a generator would still construct invalid IR through catchArm —
+ * not a crash, since nothing cross-checks a recordLit's field names
+ * against the shape, which is exactly why it has to be refused rather
+ * than produced and trusted. `run()` still declines outright for any
  * generator (`this.genType !== null`), BEFORE doing any work — see its
- * own guard comment. These tests use `runFrameAndStatesForTest()`
+ * own guard comment. Most of these tests use `runFrameAndStatesForTest()`
  * instead: the frame fields and the raw per-state statement lists,
  * built the identical way `run()` builds them internally, WITHOUT ever
  * reaching buildResume/buildWrapper/catchArm — structurally incapable of
  * producing the invalid IR, not merely a test that happens to avoid
- * triggering it. */
+ * triggering it. The "lazy wrapper" test uses the narrower
+ * `buildWrapperForTest()` (checkEligible() + buildWrapper() only) for
+ * the same reason: buildWrapper needs none of splitStates's work, and
+ * this sibling method still cannot reach catchArm/buildResume either. */
 describe("yield lowering (stage A2b — FunctionLowering used directly)", () => {
   const genLoc = loc;
   const yieldExpr = (value: IrExpr | null, type: IrType): IrExpr => ({ kind: "yieldExpr", value, type, loc: genLoc });
@@ -2221,5 +2225,54 @@ describe("yield lowering (stage A2b — FunctionLowering used directly)", () => 
     expect(complete).toHaveLength(1);
     expect(complete[0]!["value"]).toBeNull();
     expect(nodesOfKind(states, "%async.settle")).toEqual([]);
+  });
+
+  test("the lazy wrapper: %gen.new after the frame, frame.%gen written back, $gen returned, NO resume call", () => {
+    const genT: IrType = { kind: "generator", yieldT: F64, retT: F64, nextT: F64 };
+    const fn: IrFunction = {
+      name: "g",
+      params: [],
+      returnType: F64,
+      generator: { yieldT: F64, nextT: F64 },
+      locals: [],
+      body: [exprStmt(yieldExpr(num(1), F64))],
+      loc: genLoc,
+    };
+    const wrapper = new FunctionLowering(genModule(fn), fn, () => {}).buildWrapperForTest();
+
+    // Call sites see the generator type itself, never a promise.
+    expect(wrapper.returnType).toEqual(genT);
+
+    // %gen.new appears exactly once, and its "frame" operand names the
+    // SAME local the frame varDecl just bound — the ordering constraint
+    // (frame built first, since $gen.new needs the reference) is a
+    // property of construction, checked here as a value-level fact.
+    const genNew = nodesOfKind(wrapper.body, "%gen.new");
+    expect(genNew).toHaveLength(1);
+    expect(genNew[0]).toMatchObject({ frame: { kind: "varRef", localId: "%async.frame" } });
+
+    // The write-back: frame.%gen = the new $gen (a recordSet naming the
+    // %gen field on the frame shape).
+    const genFieldWrites = nodesOfKind(wrapper.body, "recordSet").filter((n) => n["field"] === "%gen");
+    expect(genFieldWrites).toHaveLength(1);
+
+    // NO eager kick: a generator body runs nothing until the first
+    // `.next()` — resumeClosure() only builds a closure VALUE ($gen's
+    // `resume` field), never invokes it, so neither call shape the async
+    // kick would have used ("call" the direct form, "callValue" the
+    // captures-through-a-closure form) should appear anywhere.
+    expect(nodesOfKind(wrapper.body, "call")).toEqual([]);
+    expect(nodesOfKind(wrapper.body, "callValue")).toEqual([]);
+
+    // NO async-only construction leaks in either: %async.mint (there is
+    // no promise to mint) and the module-initializer cache ops (a
+    // generator function is never a module initializer).
+    for (const kind of ["%async.mint", "%async.cacheCheck", "%async.markHandled"]) {
+      expect(nodesOfKind(wrapper.body, kind)).toEqual([]);
+    }
+
+    // The final statement returns $gen, not a promise.
+    const ret = wrapper.body[wrapper.body.length - 1];
+    expect(ret).toMatchObject({ kind: "return", value: { kind: "varRef", localId: "%gen.wrapper" } });
   });
 });

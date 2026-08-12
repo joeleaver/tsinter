@@ -515,10 +515,27 @@ export type AsyncExpr =
    * never touches $gen's own field layout (generators.ts's GeneratorBuilder
    * owns that, backend-side, same as promT for PromiseBuilder) — it hands
    * over the $gen expression and the static type it expects back, and the
-   * emitter's own implementation (stage A3) does the field read. Never
-   * emitted when nextT is the undefined unit — nothing to read, same rule
-   * `%async.settled` follows for a void await. */
-  | { kind: "%gen.sent"; gen: WExpr; type: IrType; loc: SrcLoc };
+   * emitter's own implementation (stage A2c's producer-side emission
+   * slice, genResume's consumer-side state ladder is the separate A3
+   * blocker) does the field read. Never emitted when nextT is the
+   * undefined unit — nothing to read, same rule `%async.settled` follows
+   * for a void await. */
+  | { kind: "%gen.sent"; gen: WExpr; type: IrType; loc: SrcLoc }
+  /** Allocate a fresh $gen<triple>, given the frame it belongs to and the
+   * resume closure the wrapper already built — mirrors `%async.mint`
+   * (one-shot allocate, no pass-visible internal layout), but unlike a
+   * promise, $gen genuinely needs both at CONSTRUCTION: the consumer side
+   * (genResume, stage A3) only ever holds the $gen VALUE, never the
+   * frame, so $gen.frame is how it finds its way back to resume — a real
+   * reference promT never needed (a promise settles through the FRAME
+   * that owns it, never the reverse). `state` starts UNSTARTED, `out`/
+   * `sent`/`retPark` at their type defaults — the emitter's job, same as
+   * `%async.mint` starting a promise pending needs no argument saying so.
+   * The wrapper still has to write `frame.%gen` back to the result
+   * afterward (an ordinary `recordSet` — GEN_FIELD is a real frame field,
+   * not part of this op) since the frame is built FIRST and $gen needs
+   * that frame reference to exist before $gen itself can. */
+  | { kind: "%gen.new"; frame: WExpr; resume: WExpr; type: IrType; loc: SrcLoc };
 
 /** Statement-position runtime seams: the two halves of a suspension
  * (register a waiter / enqueue the bare microtask hop), the two halves of
@@ -1169,6 +1186,12 @@ const FRAME_LOCAL = "%async.frame";
  * narrows into FRAME_LOCAL. */
 const FRAME_ANY_LOCAL = "%async.frameAny";
 const EXC_LOCAL = "%async.exc";
+/** The lazy generator wrapper's own $gen binding — built once the frame
+ * exists (so `%gen.new` has a frame reference to hand $gen), read twice
+ * (the frame.%gen write-back, then the return) — never inlined, since
+ * `%gen.new` allocates a fresh $gen on every evaluation and this value
+ * must be the SAME one both places name. */
+const GEN_LOCAL = "%gen.wrapper";
 /** The hoisting rewrite's temps (see the header). Guarded against a
  * source local wearing the same prefix, like the three bindings above. */
 const HOIST_PREFIX = "%hoist.";
@@ -1317,12 +1340,14 @@ export class FunctionLowering {
   }
 
   /** TEST-ONLY (see the class's own export comment): the frame shape and
-   * the raw per-state statement lists, WITHOUT buildResume/buildWrapper/
-   * catchArm — the two paths run()'s own guard above refuses generators
-   * from reaching, because both are unconditionally async-shaped today.
+   * the raw per-state statement lists, WITHOUT buildResume/catchArm — the
+   * one remaining path run()'s own guard above refuses generators from
+   * reaching (buildWrapper has its own generator branch now, stage A2c;
+   * catchArm's routing-table default is the sole survivor of the
+   * unconditionally-async-shaped problem this method was built to dodge).
    * This is how the A2b yield-lowering tests verify the suspend/resume
    * split (%gen.suspend/%gen.injectCheck/%gen.sent) without ever
-   * constructing the invalid IR those two paths would produce for a
+   * constructing the invalid IR catchArm would still produce for a
    * generator. Callable for an async function too (nothing here is
    * generator-specific), but the real entry point (run()) is the one
    * that matters for async — this exists for generators specifically. */
@@ -1331,6 +1356,20 @@ export class FunctionLowering {
     this.buildFrameFields();
     this.splitStates();
     return { frame: { id: this.frameShapeId, fields: this.frameFields }, states: [...this.states] };
+  }
+
+  /** TEST-ONLY, same rationale as runFrameAndStatesForTest() above: the
+   * wrapper alone, without ever reaching buildResume/catchArm. buildWrapper
+   * needs only checkEligible()'s side effects (bodyBoxedIds/boxInits/
+   * locals) — it references neither buildFrameFields()'s populated field
+   * list nor splitStates()'s state graph, so this is the minimal path to
+   * it. Exists because run() still declines every generator outright
+   * (catchArm's genType branch has not landed) — this is how the A2c
+   * lazy-wrapper tests verify %gen.new/frame.%gen-writeback/return-$gen
+   * without constructing the invalid IR catchArm would still produce. */
+  buildWrapperForTest(): WFunction {
+    this.checkEligible();
+    return this.buildWrapper();
   }
 
   /* ── eligibility and the hoisting rewrite ────────────────────────────── */
@@ -1355,6 +1394,7 @@ export class FunctionLowering {
           l.id === FRAME_LOCAL ||
           l.id === FRAME_ANY_LOCAL ||
           l.id === EXC_LOCAL ||
+          l.id === GEN_LOCAL ||
           l.id.startsWith(HOIST_PREFIX),
       )
     ) {
@@ -2492,18 +2532,23 @@ export class FunctionLowering {
     };
   }
 
-  /** TODO(increment 19): unconditionally builds ASYNC's eager wrapper
-   * (mint a promise, kick resume once, return the promise) — the
-   * header's "A GENERATOR'S SIBLING PROTOCOL" describes the LAZY
-   * alternative a generator needs instead (allocate frame + $gen, store
-   * params, boxInit, $gen.state = UNSTARTED, NO resume call, return the
-   * $gen), not yet built here. `run()` calling this unconditionally for
-   * a generator function today produces a WRONG wrapper beside a correct
-   * resume (frameInit literally names a "%promise" field the frame no
-   * longer carries) — this does not throw (recordLit construction never
-   * checks field names against the shape), it is just wrong IR, which is
-   * exactly why lowerResumableFunctions' gate (below) stays closed until
-   * this gets its generator branch. */
+  /** The spawn wrapper — EAGER for async (mint, store params, boxInit, kick
+   * resume once, return the promise), LAZY for a generator (allocate
+   * frame + $gen together, store params, boxInit, $gen.state=UNSTARTED,
+   * NO resume call, return the $gen — the header's "A GENERATOR'S SIBLING
+   * PROTOCOL"). One genType branch, not two copies: params/captures/
+   * boxInit selection (`keep`) and the boxInit statements themselves are
+   * IDENTICAL machinery either way, so only the frame literal's fields
+   * and the tail (kick+cache-publish+return-promise vs.
+   * build-$gen+write-back+return-$gen) differ. Module-initializer cache
+   * handling (`asyncCacheGlobal`/`asyncCycleCacheGlobal`) is
+   * unconditionally SKIPPED for a generator: those fields are an async
+   * concept the frontend never sets on a generator function, so the
+   * check simply never fires — no explicit generator exclusion needed.
+   *
+   * run()'s guard (above) still keeps every generator from reaching this
+   * method until catchArm also has its genType branch — this wrapper
+   * alone does not make `.run()` safe to call. */
   private buildWrapper(): WFunction {
     const frameLocal: IrLocal = { id: FRAME_LOCAL, name: FRAME_LOCAL, type: this.frameType, mutable: false };
     const captured = new Set((this.fn.captures ?? []).map((c) => c.localId));
@@ -2516,24 +2561,77 @@ export class FunctionLowering {
         this.bodyBoxedIds.has(l.id) ||
         this.fn.params.some((p) => p.localId === l.id),
     );
+    const paramFields = this.fn.params
+      .filter((p) => !this.bodyBoxedIds.has(p.localId))
+      .map((p) => ({
+        name: slotOf(p.localId),
+        value: { kind: "varRef" as const, localId: p.localId, type: p.type, loc: this.loc },
+      }));
     const frameInit: IrExpr = {
       kind: "recordLit",
       // Fields the literal omits take struct.new_default: %state is 0 (the
-      // entry state) and the %await/%l_ slots are filled at their first
-      // suspend. A BOXED param has no %l_ field to fill — it rides the env
-      // as a box ref like any other capture, not the frame as a value.
-      fields: [
-        { name: PROMISE_FIELD, value: widenExpr({ kind: "%async.mint", type: this.promiseType, loc: this.loc }) },
-        ...this.fn.params
-          .filter((p) => !this.bodyBoxedIds.has(p.localId))
-          .map((p) => ({
-            name: slotOf(p.localId),
-            value: { kind: "varRef" as const, localId: p.localId, type: p.type, loc: this.loc },
-          })),
-      ],
+      // entry state) and the %await/%l_/%gen slots are filled later — the
+      // %await<k> slots at their first suspend, %gen (generator only)
+      // right after this literal builds, once $gen itself exists to point
+      // at. A BOXED param has no %l_ field to fill either way — it rides
+      // the env as a box ref like any other capture, not the frame as a
+      // value.
+      fields:
+        this.genType !== null
+          ? paramFields
+          : [
+              { name: PROMISE_FIELD, value: widenExpr({ kind: "%async.mint", type: this.promiseType, loc: this.loc }) },
+              ...paramFields,
+            ],
       type: this.frameType,
       loc: this.loc,
     };
+
+    if (this.genType !== null) {
+      const genLocal: IrLocal = { id: GEN_LOCAL, name: GEN_LOCAL, type: this.genType, mutable: false };
+      const genRefLocal: WExpr = { kind: "varRef", localId: GEN_LOCAL, type: this.genType, loc: this.loc };
+      return {
+        name: this.fn.name,
+        params: this.fn.params,
+        // Call sites already carry the generator type (the validator's
+        // callSiteReturnType, same rule async's promise wrapping follows);
+        // the wrapper is where that becomes literal.
+        returnType: this.genType,
+        locals: [...keep, frameLocal, genLocal],
+        ...(this.fn.captures !== undefined ? { captures: this.fn.captures } : {}),
+        body: [
+          // Before the frame and before the closure %gen.new captures:
+          // resumeClosure() reads these slots, so the boxes must exist by
+          // the time $gen packs the env — the identical ordering
+          // constraint async's kick has, for the identical reason.
+          ...this.boxInits.map((l) => ({ kind: "%async.boxInit" as const, localId: l.id, loc: this.loc })),
+          { kind: "varDecl", localId: FRAME_LOCAL, init: frameInit, loc: this.loc },
+          // $gen needs the frame reference to exist (its own `frame`
+          // field), so it is built SECOND — then the frame's `%gen`
+          // back-reference (resume's own way to reach $gen, genRef()'s
+          // whole reason for existing) is written in as a separate step,
+          // since nothing can embed a reference to itself's future
+          // sibling in one literal. NO resume call: a generator body runs
+          // NOTHING until the first `.next()`.
+          {
+            kind: "varDecl",
+            localId: GEN_LOCAL,
+            init: widenExpr({
+              kind: "%gen.new",
+              frame: this.frameRef(),
+              resume: this.resumeClosure(),
+              type: this.genType,
+              loc: this.loc,
+            }),
+            loc: this.loc,
+          },
+          this.set(GEN_FIELD, genRefLocal),
+          { kind: "return", value: widenExpr(genRefLocal), loc: this.loc },
+        ],
+        loc: this.fn.loc,
+      };
+    }
+
     // JS runs an async body EAGERLY to its first await, so the wrapper
     // calls resume once before answering. A capturing resume must be
     // reached through its closure (its prologue casts arg0 down to the env

@@ -8979,17 +8979,20 @@ class Assembler {
       /* Async, generators, promises. (awaitExpr/awaitUnionExpr never
        * reach here in a function the lowering accepted — they are what it
        * consumes; one that survives belongs to a REFUSED async function
-       * and reports as `fn:async` before its body is walked. %gen.sent is
-       * the yield-lowering unit's own new seam — statemachine.ts DOES
-       * consume it once emitted, but real emission is stage A3's work,
-       * same as genResume; currently unreachable regardless, since
-       * fn:generator still gates every generator body before this ever
-       * runs.) */
+       * and reports as `fn:async` before its body is walked. %gen.sent/
+       * %gen.new are the yield-lowering unit's own new seams —
+       * statemachine.ts DOES consume both once emitted, but real emission
+       * is stage A2c's remaining producer-side work — genResume's
+       * consumer-side state ladder is the separate, independent A3
+       * blocker, not the same step under two names. Currently unreachable
+       * regardless: fn:generator still gates every generator body before
+       * this ever runs.) */
       case "yieldExpr":
       case "genResume":
       case "awaitExpr":
       case "awaitUnionExpr":
       case "%gen.sent":
+      case "%gen.new":
       /* Widening promise<T> into promise<void> is representationally free
        * here (one struct), but the awaiting side then reads a payload it
        * has no type for — the void-await path is its own work. */
