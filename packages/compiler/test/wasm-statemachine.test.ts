@@ -7,7 +7,7 @@
  * pass declines must name itself and leave the function untouched, which
  * is what keeps the emitter's own `fn:async` firing behind it. */
 import { beforeAll, describe, expect, test } from "vitest";
-import type { IrExpr, IrFunction, IrModule, IrStmt, IrType, SrcLoc } from "../src/ir/nodes.js";
+import type { IrExpr, IrFunction, IrModule, IrRecordShape, IrStmt, IrType, IrUnionDef, SrcLoc } from "../src/ir/nodes.js";
 import { BOOL, CAUGHT, DYN, F64, STRING, VOID } from "../src/ir/nodes.js";
 import { asIrModule, lowerResumableFunctions, type WFunction, type WModule } from "../src/backend/wasm/statemachine.js";
 import { computeMayThrow } from "../src/backend/emission/may-throw.js";
@@ -1829,12 +1829,16 @@ test("an awaited `Promise<T> | undefined` surveys clean", () => {
  * the builder level — genResultRecord is a pure frontend function, fully
  * callable today with fresh registries, and its output is fed through the
  * REAL wasm emitter (emitWasmModule, not a mock) for the behavioral half.
- * NEITHER test attempts to pin the race S041 itself documents — that is
- * deliberately out of scope for an in-suite pin (S041's own argument:
- * a corpus program observing the wrong order would be a program that
- * could never pass the differential, which is exactly why a passing unit
- * test can't demonstrate the WRONG order either — only the uncontested
- * right one). */
+ * NEITHER test attempts to pin the race S041 itself documents — not
+ * because it CAN'T be (a unit test can inspect the shape-registry state
+ * directly and pin the collision deterministically with no Node oracle
+ * needed at all — the corpus-unpinnable argument is about the
+ * differential corpus specifically, and does not transfer to an
+ * internals-inspecting unit test), but because a passing test asserting
+ * the WRONG order would be a test that the tier is broken, not that it
+ * works (SEMANTICS.md S041's own "Tested by" wording) — a policy choice
+ * about what belongs in a green suite, not a claim about what a test
+ * COULD show. */
 describe("S041: IteratorResult declared order", () => {
   test("genResultRecord's declaredOrder is exactly [value, done] — intent", () => {
     // Two representative channel shapes: an ordinary yielded-number
@@ -1867,9 +1871,12 @@ describe("S041: IteratorResult declared order", () => {
     // rendered STRING first, which this hand-built module has no frontend
     // pass to run). Piping through JSON.stringify (a STRING result) is
     // the same surface wasm-emitter.test.ts's own declaredOrder tests
-    // already use, and fully exercises declaredOrder either way — the
-    // console.log/inspect gap is real but orthogonal to what this test
-    // pins, so it is worked around here, not silently swallowed.
+    // already use, and exercises ONE of declaredOrder's three consumer
+    // paths (JSON, inspect/console.log, Object.keys/for-in — S041's own
+    // "every render path" list) — not all three, since the other two run
+    // through the same frontend inspect-lowering this raw module skips.
+    // The console.log/inspect gap is real but orthogonal to what this
+    // test pins, so it is worked around here, not silently swallowed.
     const rec = genResultRecord(F64, VOID, shapes, unions);
     if (rec === null) throw new Error("genResultRecord returned null");
     const recType: IrType = { kind: "record", shapeId: rec.shapeId };
@@ -1943,5 +1950,94 @@ describe("S041: IteratorResult declared order", () => {
     // exact surface declaredOrder controls, with nothing else in this
     // module sharing the shape to race against.
     expect(stdout).toBe(`{"value":42,"done":false}` + "\n");
+  });
+});
+
+/* ── 11. increment 19 stage A2 (opening unit): genResume hoists inside an
+ * ORDINARY async function ──────────────────────────────────────────────
+ *
+ * `genResume` is not itself generator-only — any function, async or not,
+ * may hold and drive a generator — so this is LIVE today even though
+ * yieldExpr recognition (isSuspensionNode) is not: a genResume node can
+ * appear in an async body the pass already lowers, and its `arg` can
+ * contain an ordinary await (2017's corpus shape puts one beside an
+ * await in the same async function). Before this HOIST_SLOTS entry, such
+ * a program refused at the HOISTING layer (`fn:async:await-position` —
+ * no entry for `genResume`'s kind at all). After it, hoisting succeeds
+ * and the refusal moves to the EMITTER's own `expr:genResume` arm
+ * (genResume emission itself is stage A3's work) — strictly more precise
+ * for the exact same not-yet-supported program, never a miscompile. */
+describe("genResume hoists inside an async function (stage A2 opener)", () => {
+  const genT: IrType = { kind: "generator", yieldT: F64, retT: VOID, nextT: F64 };
+
+  /** genResultRecord's shape lives in a FRESH registry per call — the
+   * module carrying `recT` must attach its `.shapes`/`.unions` arrays
+   * itself (asyncModule's own records/unions are empty by default), or
+   * the emitter's "unknown record shape" bug-check fires on a shapeId
+   * nothing declared. */
+  function genResultType(): { type: IrType; records: IrRecordShape[]; unions: IrUnionDef[] } {
+    const shapes = new ShapeRegistry();
+    const unions = new UnionRegistry();
+    const rec = genResultRecord(F64, VOID, shapes, unions);
+    if (rec === null) throw new Error("genResultRecord returned null");
+    return { type: { kind: "record", shapeId: rec.shapeId }, records: shapes.shapes, unions: unions.unions };
+  }
+
+  const awaitP = () => await_(call("mkp", [], promiseOf(F64)), F64);
+
+  test("a genResume argument that awaits hoists cleanly — no fn:async:await-position", () => {
+    const { type: recT, records, unions } = genResultType();
+    const fn: IrFunction = {
+      name: "f",
+      params: [],
+      returnType: VOID,
+      async: true,
+      locals: [local("g.0", genT), local("r.0", recT)],
+      body: [
+        varDecl(
+          "r.0",
+          { kind: "genResume", mode: "next", gen: v("g.0", genT), arg: awaitP(), type: recT, loc },
+        ),
+        log([v("r.0", recT)]),
+      ],
+      loc,
+    };
+    const { mod, refusals } = lower({ ...asyncModule(fn), records, unions });
+    // Hoisting itself declines nothing — the whole point of this entry.
+    expect(refusals).toEqual([]);
+    const lowered = fnNamed(mod, "%f.resume");
+    // The awaited operand split into its own state, ahead of the
+    // genResume call that consumes the hoisted temp — the ordinary
+    // "operand hoists before the statement's own suspension" shape any
+    // other HOIST_SLOTS entry already produces (order-preserving
+    // operand hoisting, section 6 above), not anything genResume-special.
+    expect(nodesOfKind(lowered.body, "genResume")).toHaveLength(1);
+    expect(nodesOfKind(lowered.body, "%async.subscribe")).toHaveLength(1);
+  });
+
+  test("the SAME module still refuses — at expr:genResume, in the emitter, not the hoister", () => {
+    // genResume emission is unimplemented (stage A3): the refusal must
+    // still happen, just at the right layer. Proves the HOIST_SLOTS entry
+    // moved WHERE the refusal fires, not WHETHER it fires.
+    const { type: recT, records, unions } = genResultType();
+    const fn: IrFunction = {
+      name: "f",
+      params: [],
+      returnType: VOID,
+      async: true,
+      locals: [local("g.0", genT), local("r.0", recT)],
+      body: [
+        varDecl(
+          "r.0",
+          { kind: "genResume", mode: "next", gen: v("g.0", genT), arg: awaitP(), type: recT, loc },
+        ),
+        log([v("r.0", recT)]),
+      ],
+      loc,
+    };
+    const survey = surveyWasmModule({ ...asyncModule(fn), records, unions });
+    expect(survey).toContain("expr:genResume");
+    expect(survey).not.toContain("fn:async:await-position");
+    expect(survey).not.toContain("fn:async");
   });
 });

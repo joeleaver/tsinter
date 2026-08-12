@@ -531,10 +531,24 @@ function widenExpr(e: WExpr): IrExpr {
  * <non-thenable>` (one microtask turn, no promise); `async.awaitDyn` is
  * the checked-dynamic sibling this pass declines; `module.await` is the
  * loader's dependency wait, which only suspends when the dependency is
- * still pending but is a state split either way. */
+ * still pending but is a state split either way.
+ *
+ * `yieldExpr` joins the set ahead of any generator lowering (increment
+ * 19's yield-lowering unit, staged before `classifySuspension`/
+ * `lowerSuspension` grow their own generator arms — see that unit's
+ * notes): currently INERT, not yet load-bearing. `yieldExpr` is
+ * frontend-fenced to generator bodies only (nodes.ts's own doc comment),
+ * and no generator body reaches this pass today (the per-function skip
+ * in `lowerResumableFunctions` below), so nothing walks a subtree
+ * containing one yet. Recognizing it here now (rather than alongside
+ * `classifySuspension`) is what lets `HOIST_SLOTS`'s new `genResume`
+ * entry actually find a NESTED yield inside a genResume argument once
+ * generators do reach this pass (yield*'s forwarding loop nests one
+ * exactly there) — `hasSuspension` has to see it before hoisting can act
+ * on it. */
 function isSuspensionNode(rec: Record<string, unknown>): boolean {
   const kind = rec["kind"];
-  if (kind === "awaitExpr" || kind === "awaitUnionExpr") return true;
+  if (kind === "awaitExpr" || kind === "awaitUnionExpr" || kind === "yieldExpr") return true;
   if (isModuleAwaitNode(rec)) return true;
   return kind === "libCall" && (rec["fn"] === "async.hop" || rec["fn"] === "async.awaitDyn");
 }
@@ -910,6 +924,31 @@ const HOIST_SLOTS: Partial<Record<IrExpr["kind"], HoistSlot[]>> = {
   awaitExpr: ["value"],
   awaitUnionExpr: ["value"],
   newPromise: ["executor"],
+  // `yield e` — a suspension ROOT (isSuspensionNode above), same as
+  // awaitExpr; this entry only matters for a yield NESTED under another
+  // hoistable position (mirrors "an await under an await"), since a root
+  // yield never reaches hoistParts at all (hoistRoot returns a root
+  // suspension unchanged — classifySuspension's job, not the hoister's).
+  // Currently unreachable (see isSuspensionNode's note): no generator body
+  // reaches this pass yet.
+  yieldExpr: ["value"],
+  // `g.next(arg)`/`g.return(arg)`/`g.throw(arg)` — NOT itself a suspension
+  // (a generator resume from the CONSUMER's side is synchronous; see the
+  // design doc's "no event loop" framing), but its `arg` can CONTAIN one:
+  // yield*'s forwarding loop nests a yield inside `.next(...)`'s argument
+  // (`%dele.next(<yield %dr.value>)`), and 2017's corpus shape puts a
+  // genResume beside an await in the same async function. Operand order
+  // is `gen` then `arg` — the generator reference evaluates before the
+  // sent value, matching a method call's receiver-then-arguments order.
+  // LIVE today, unlike the two entries above: `genResume` can appear
+  // inside an ORDINARY async function's body (any function may hold and
+  // drive a generator), so a genResume node whose `arg` awaits something
+  // no longer refuses at THIS layer (`fn:async:await-position`) — it
+  // hoists cleanly and meets the emitter's own `expr:genResume` refusal
+  // instead (genResume emission is unimplemented until stage A3), a
+  // strictly more precise refusal name for the same not-yet-supported
+  // program, never a miscompile either way.
+  genResume: ["gen", "arg"],
 };
 
 /** Statement kinds whose embedded expressions the rewrite may hoist —
