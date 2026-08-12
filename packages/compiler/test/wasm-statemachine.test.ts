@@ -8,8 +8,14 @@
  * is what keeps the emitter's own `fn:async` firing behind it. */
 import { beforeAll, describe, expect, test } from "vitest";
 import type { IrExpr, IrFunction, IrModule, IrRecordShape, IrStmt, IrType, IrUnionDef, SrcLoc } from "../src/ir/nodes.js";
-import { BOOL, CAUGHT, DYN, F64, STRING, VOID } from "../src/ir/nodes.js";
-import { asIrModule, lowerResumableFunctions, type WFunction, type WModule } from "../src/backend/wasm/statemachine.js";
+import { BOOL, CAUGHT, DYN, F64, STRING, UNDEFINED_T, VOID } from "../src/ir/nodes.js";
+import {
+  asIrModule,
+  FunctionLowering,
+  lowerResumableFunctions,
+  type WFunction,
+  type WModule,
+} from "../src/backend/wasm/statemachine.js";
 import { computeMayThrow } from "../src/backend/emission/may-throw.js";
 import { emitWasmModule, surveyWasmModule } from "../src/backend/wasm/emitter.js";
 import { genResultRecord, ShapeRegistry, UnionRegistry } from "../src/frontend/types.js";
@@ -2039,5 +2045,138 @@ describe("genResume hoists inside an async function (stage A2 opener)", () => {
     expect(survey).toContain("expr:genResume");
     expect(survey).not.toContain("fn:async:await-position");
     expect(survey).not.toContain("fn:async");
+  });
+});
+
+/* ── 12. increment 19 stage A2b: yield lowering ───────────────────────────
+ *
+ * FunctionLowering is exported for this describe block ONLY (see its own
+ * doc comment): lowerResumableFunctions' per-function skip still keeps
+ * every real generator out (B2 — gate-widening is deliberately the LAST
+ * step), so these tests construct one directly, the same way house rule
+ * #9 already covers a helper's flag-true branches by builder-level
+ * construction rather than waiting for a frontend path that doesn't
+ * reach them yet.
+ *
+ * SCOPE NOTE (A2b gate's F2 finding — a GUARD, not documentation):
+ * buildWrapper and catchArm (reached through buildResume) are BOTH
+ * unconditionally async-shaped — buildWrapper's frameInit literal names
+ * PROMISE_FIELD directly, and catchArm's "reject" default arm (embedded
+ * in EVERY resume regardless of whether the body has a covering
+ * try/catch — the routing table's fallback for "no protected region")
+ * does too. Calling `.run()` on a generator would therefore construct
+ * invalid IR (a field name the frame's own shape no longer declares) —
+ * not a crash, since nothing cross-checks a recordLit's field names
+ * against the shape, which is exactly why it has to be refused rather
+ * than produced and trusted. `run()` now declines outright for any
+ * generator (`this.genType !== null`), BEFORE doing any work — see its
+ * own guard comment. These tests use `runFrameAndStatesForTest()`
+ * instead: the frame fields and the raw per-state statement lists,
+ * built the identical way `run()` builds them internally, WITHOUT ever
+ * reaching buildResume/buildWrapper/catchArm — structurally incapable of
+ * producing the invalid IR, not merely a test that happens to avoid
+ * triggering it. */
+describe("yield lowering (stage A2b — FunctionLowering used directly)", () => {
+  const genLoc = loc;
+  const yieldExpr = (value: IrExpr | null, type: IrType): IrExpr => ({ kind: "yieldExpr", value, type, loc: genLoc });
+
+  function genModule(fn: IrFunction): IrModule {
+    return { irVersion: 3, sourceFile: "gen.ts", entry: "%main", functions: [fn] };
+  }
+
+  test("run() declines a generator outright, before doing any work — the guard itself", () => {
+    const fn: IrFunction = {
+      name: "g",
+      params: [],
+      returnType: F64,
+      generator: { yieldT: F64, nextT: F64 },
+      locals: [],
+      body: [exprStmt(yieldExpr(num(1), F64))],
+      loc: genLoc,
+    };
+    const refusals: string[] = [];
+    expect(() => new FunctionLowering(genModule(fn), fn, (kind) => refusals.push(kind)).run()).toThrow();
+    expect(refusals).toEqual(["fn:async:generator-wrapper-not-built"]);
+  });
+
+  test("the frame carries %gen (typed to the function's own triple), never %promise", () => {
+    const genT: IrType = { kind: "generator", yieldT: F64, retT: F64, nextT: F64 };
+    const fn: IrFunction = {
+      name: "g",
+      params: [],
+      returnType: F64,
+      generator: { yieldT: F64, nextT: F64 },
+      locals: [local("sent.0", F64)],
+      body: [varDecl("sent.0", yieldExpr(num(1), F64)), log([v("sent.0", F64)])],
+      loc: genLoc,
+    };
+    const { frame, states } = new FunctionLowering(genModule(fn), fn, () => {}).runFrameAndStatesForTest();
+    expect(frame.fields.find((f) => f.name === "%gen")).toMatchObject({ type: genT });
+    expect(frame.fields.some((f) => f.name === "%promise")).toBe(false);
+    // The positive half of the F2 guard: not just "run() throws" (the
+    // dedicated test above) but "the surface tests actually use never
+    // constructs the async-only nodes that named PROMISE_FIELD" —
+    // runFrameAndStatesForTest() never reaches catchArm/buildWrapper, so
+    // none of these should exist at all, on ANY generator body.
+    for (const kind of ["%async.reject", "%async.settle", "%async.mint", "%async.subscribe", "%async.hop"]) {
+      expect(nodesOfKind(states, kind)).toEqual([]);
+    }
+  });
+
+  test("a yield with a value and a real nextT: suspend carries the raw operand, injectCheck runs on re-entry, sent is read back", () => {
+    const fn: IrFunction = {
+      name: "g",
+      params: [],
+      returnType: F64,
+      generator: { yieldT: F64, nextT: F64 },
+      locals: [local("sent.0", F64)],
+      body: [varDecl("sent.0", yieldExpr(num(1), F64)), log([v("sent.0", F64)])],
+      loc: genLoc,
+    };
+    const { states } = new FunctionLowering(genModule(fn), fn, () => {}).runFrameAndStatesForTest();
+
+    const suspend = nodesOfKind(states, "%gen.suspend");
+    expect(suspend).toHaveLength(1);
+    // The raw yieldT-typed operand, un-retagged — %gen.suspend's own
+    // contract (retagging is stage A3's job, at emission time, not the
+    // pass's — see the seam's doc comment for why).
+    expect(suspend[0]).toMatchObject({ value: { kind: "numLit", value: 1 } });
+
+    expect(nodesOfKind(states, "%gen.injectCheck")).toHaveLength(1);
+
+    const sent = nodesOfKind(states, "%gen.sent");
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ type: F64 });
+  });
+
+  test("a bare `yield;` suspends with value: null", () => {
+    const fn: IrFunction = {
+      name: "g",
+      params: [],
+      returnType: F64,
+      generator: { yieldT: F64, nextT: UNDEFINED_T },
+      locals: [],
+      body: [exprStmt(yieldExpr(null, UNDEFINED_T))],
+      loc: genLoc,
+    };
+    const { states } = new FunctionLowering(genModule(fn), fn, () => {}).runFrameAndStatesForTest();
+    const suspend = nodesOfKind(states, "%gen.suspend");
+    expect(suspend).toHaveLength(1);
+    expect(suspend[0]!["value"]).toBeNull();
+  });
+
+  test("nextT the undefined unit omits %gen.sent entirely — mirrors generators.ts's hasSent rule", () => {
+    const fn: IrFunction = {
+      name: "g",
+      params: [],
+      returnType: F64,
+      generator: { yieldT: F64, nextT: UNDEFINED_T },
+      locals: [],
+      body: [exprStmt(yieldExpr(num(1), UNDEFINED_T))],
+      loc: genLoc,
+    };
+    const { states } = new FunctionLowering(genModule(fn), fn, () => {}).runFrameAndStatesForTest();
+    expect(nodesOfKind(states, "%gen.injectCheck")).toHaveLength(1);
+    expect(nodesOfKind(states, "%gen.sent")).toHaveLength(0);
   });
 });

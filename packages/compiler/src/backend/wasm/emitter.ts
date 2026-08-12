@@ -5463,6 +5463,19 @@ class Assembler {
         return;
       }
 
+      /* %gen.suspend / %gen.injectCheck: the yield-lowering unit's new
+       * seams (statemachine.ts) — real emission is stage A3's work, same
+       * as genResume/yieldExpr below. Refuses by name rather than falling
+       * to the generic default so the census names the right construct;
+       * behaviorally identical to the default either way (same string
+       * shape) — currently unreachable regardless, since the whole-
+       * function fn:generator gate (walkFunction) still blocks every
+       * generator before its body is ever walked. */
+      case "%gen.suspend":
+      case "%gen.injectCheck":
+        this.refuse(`stmt:${s.kind}`, s.loc);
+        return;
+
       default: {
         const rest: never = s;
         this.refuse(`stmt:${(rest as WStmt).kind}`, (rest as WStmt).loc);
@@ -5549,6 +5562,8 @@ class Assembler {
       case "%async.cacheCheck":
       case "%async.markHandled":
       case "%async.boxInit":
+      case "%gen.suspend":
+      case "%gen.injectCheck":
         break;
       default: {
         const rest: never = s;
@@ -8959,11 +8974,17 @@ class Assembler {
       /* Async, generators, promises. (awaitExpr/awaitUnionExpr never
        * reach here in a function the lowering accepted — they are what it
        * consumes; one that survives belongs to a REFUSED async function
-       * and reports as `fn:async` before its body is walked.) */
+       * and reports as `fn:async` before its body is walked. %gen.sent is
+       * the yield-lowering unit's own new seam — statemachine.ts DOES
+       * consume it once emitted, but real emission is stage A3's work,
+       * same as genResume; currently unreachable regardless, since
+       * fn:generator still gates every generator body before this ever
+       * runs.) */
       case "yieldExpr":
       case "genResume":
       case "awaitExpr":
       case "awaitUnionExpr":
+      case "%gen.sent":
       /* Widening promise<T> into promise<void> is representationally free
        * here (one struct), but the awaiting side then reads a payload it
        * has no type for — the void-await path is its own work. */

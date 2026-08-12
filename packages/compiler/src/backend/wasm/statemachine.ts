@@ -49,6 +49,25 @@
  * to the two `widen*` helpers below, the single spot where the two views
  * are reconciled.
  *
+ * GENERATORS RIDE THIS SAME SEAM, NOT A PARALLEL ONE (increment 19's
+ * yield-lowering unit). The `%gen.*` kinds (suspend/sent/injectCheck)
+ * grow the SAME AsyncStmt/AsyncExpr unions rather than a sibling
+ * GenStmt/GenExpr pair — deliberately, not merely for naming symmetry
+ * with async's own `%async.*` prefix. The emitter's six exhaustiveness
+ * sites (`const rest: never = e` / `= s`, paired with a loud named
+ * refusal — never a bare compile-time-only assertNever) are typed over
+ * WStmt/WExpr, so a kind added to AsyncStmt/AsyncExpr becomes a compile
+ * error at every one of those sites automatically, the moment it is
+ * added here — no separate union to widen, no site that could silently
+ * forget it. A parallel GenStmt/GenExpr pair would only inherit that
+ * protection if the emitter's own WStmt/WExpr unions AND all six sites
+ * were ALSO widened by hand alongside it — a second, easy-to-skip step
+ * this choice makes unnecessary. The upshot: the `%async.` PREFIX on the
+ * shared type names is a residue of async landing first in this file,
+ * not a claim that the seam mechanism itself is async-specific —
+ * `%gen.*` kinds living inside `AsyncStmt`/`AsyncExpr` is the seam
+ * working exactly as designed, not an awkward fit.
+ *
  * THE PROTOCOL. Each async `f(params) -> T` becomes three things: a frame
  * record shape ({ %state, one field per live local, one PER-AWAIT-SITE
  * field for the resumed value — typed by that site, so no dyn is needed
@@ -56,6 +75,35 @@
  * demoted to a spawn wrapper (allocate the frame, store the params, mint
  * the promise, call resume once — JS runs an async body EAGERLY to its
  * first await — and return the promise).
+ *
+ * A GENERATOR'S SIBLING PROTOCOL (increment 19). `function* f(): Generator
+ * <Y,R,N>` becomes the SAME three things with two deltas the design doc
+ * fixes precisely: the frame carries a `%gen` field (GEN_FIELD, mirroring
+ * `%promise`/PROMISE_FIELD, mutually exclusive with it — buildFrameFields'
+ * own branch) holding the function's `$gen<Y,R,N>` struct
+ * (generators.ts's GeneratorBuilder — a wasm-backend-owned struct, never
+ * an IR record, exactly like promT is for async); and the wrapper is
+ * LAZY, the opposite of async's eager kick — it allocates frame + $gen,
+ * stores params, runs boxInit, sets `$gen.state = UNSTARTED`, and returns
+ * the $gen WITHOUT calling resume at all (a generator body runs NOTHING
+ * until the first `.next()`). A `yield e` suspends through the exact
+ * SAME state-splitting machinery an `await` does — state field write,
+ * save, return; case k: restore, re-entry check, resumed value — with
+ * `%gen.suspend`/`%gen.injectCheck`/`%gen.sent` (AsyncStmt/AsyncExpr
+ * above, each documented at its own definition) standing in for
+ * `%async.subscribe`/`%async.rejectCheck`/`%async.settled`. BUILD STATUS,
+ * checked against the code below rather than assumed (the stale-header
+ * lesson): the frame's `%gen` field and the yield-site suspend/resume
+ * split (`lowerSuspension`'s "yield" case) are BUILT (stage A2b). The
+ * lazy wrapper itself, `return v`'s retag-into-$gen.out-then-DONE
+ * rewrite (completion()/fellThrough()'s generator branch), and
+ * catch-region GENRET sentinel routing are NOT YET BUILT as of this
+ * paragraph — buildWrapper/completion/fellThrough still unconditionally
+ * assume async's promise-settling shape (see their own TODO markers) —
+ * which is why lowerResumableFunctions' per-function skip (below) still
+ * gates every real generator out: gate-widening is deliberately the LAST
+ * step, once calling `.run()` on a generator function stops producing a
+ * correct resume beside a wrong wrapper.
  *
  * ONE RESUME SIGNATURE. Resume takes `%frameBase` — an empty OPEN struct
  * every concrete frame subtypes — and casts it down to its own shape in a
@@ -446,7 +494,16 @@ export type AsyncExpr =
    * a DIFFERENT interned union from `value`'s, with its own typeKey-sorted
    * numbering, so the consumer must map every arm by TYPE. Never emitted
    * when the result is void (there is nothing to read). */
-  | { kind: "%async.settledUnion"; value: WExpr; promiseTag: number; type: IrType; loc: SrcLoc };
+  | { kind: "%async.settledUnion"; value: WExpr; promiseTag: number; type: IrType; loc: SrcLoc }
+  /** Read $gen.sent — the value a `.next(arg)` resume delivered, typed
+   * `nextT` (`type` here). Mirrors `%async.settled` exactly: the pass
+   * never touches $gen's own field layout (generators.ts's GeneratorBuilder
+   * owns that, backend-side, same as promT for PromiseBuilder) — it hands
+   * over the $gen expression and the static type it expects back, and the
+   * emitter's own implementation (stage A3) does the field read. Never
+   * emitted when nextT is the undefined unit — nothing to read, same rule
+   * `%async.settled` follows for a void await. */
+  | { kind: "%gen.sent"; gen: WExpr; type: IrType; loc: SrcLoc };
 
 /** Statement-position runtime seams: the two halves of a suspension
  * (register a waiter / enqueue the bare microtask hop), the two halves of
@@ -488,7 +545,41 @@ export type AsyncStmt =
    * the one statement that lets a body box ride resume's env (see the
    * header). Its payload is struct.new_default's, which is bit for bit
    * what the sync `varDecl` of an uninitialized boxed local emits. */
-  | { kind: "%async.boxInit"; localId: string; loc: SrcLoc };
+  | { kind: "%async.boxInit"; localId: string; loc: SrcLoc }
+  /** A generator's suspend: write `value` into $gen.out and set
+   * $gen.state = SUSPENDED, ATOMICALLY (one seam, not two writes) — the
+   * design doc's "yield at site k: ...write out; ...gen.state=SUSPENDED"
+   * pair, combined the same way `%async.settle` combines "write the
+   * fulfillment value" and "the promise is now fulfilled" into one op.
+   * `value` is the RAW yieldT-typed operand (`null` for a bare `yield;`,
+   * mirroring yieldExpr's own `value: IrExpr | null`) — NOT pre-retagged
+   * into $gen.out's V representation. Retagging (dyn wrap, or a union
+   * tag the pass has no way to know without reaching into $gen's backend
+   * layout) is the emitter's job when it implements this op (stage A3),
+   * exactly how `%async.settled`'s reader never needed the pass to know
+   * promT's tag encoding either — same seam, same reason. */
+  | { kind: "%gen.suspend"; gen: WExpr; value: WExpr | null; loc: SrcLoc }
+  /** A generator re-entry's injection check — mirrors `%async.rejectCheck`'s
+   * role exactly, generalized to three cases instead of one: reads
+   * $gen.inject and branches. NEXT is a no-op (falls through — the
+   * caller's `%gen.sent` read, emitted separately right after this in
+   * lowerSuspension's resume state, is the whole observable effect).
+   * THROW copies the CALLER-PREFILLED exception cell payload and unwinds
+   * (the design doc: "the caller pre-filled the exception cell — mirror
+   * of %async.rejectCheck" — genResume's throw mode fills the SAME
+   * increment-10 pending-exception cell before calling resume, so this
+   * op's THROW arm is rejectCheck's unwind with the fill already done
+   * upstream, not repeated here). GENRET sets the GENRET cell KIND
+   * (increment 10's cell grows this tag — carries no payload, retPark
+   * already holds the value) and unwinds the SAME way. Both unwind arms
+   * land in resume's own catch and its static routing table exactly like
+   * any other exception — no new control-flow mechanism, just a new way
+   * to ARRIVE at the existing one. This is the op stage B's finalizer
+   * work builds on: a finalizer crossed by a GENRET unwind sees the SAME
+   * cell kind at its own catch entry, which is why the design doc calls
+   * catch's GENRET handling a "sentinel re-unwind prologue" rather than a
+   * generator-specific special case. */
+  | { kind: "%gen.injectCheck"; gen: WExpr; loc: SrcLoc };
 
 /** A statement of the lowered IR. SHALLOW by design — see the header:
  * nested bodies keep their `IrStmt[]` static type while carrying
@@ -791,6 +882,7 @@ function escapes(s: IrStmt): boolean {
 
 type AwaitNode = Extract<IrExpr, { kind: "awaitExpr" }>;
 type AwaitUnionNode = Extract<IrExpr, { kind: "awaitUnionExpr" }>;
+type YieldNode = Extract<IrExpr, { kind: "yieldExpr" }>;
 
 /** One suspension in a slot the pass can split at. `hop` covers the
  * frontend's `await <non-thenable>` lowering, which is a seqExpr around a
@@ -804,7 +896,11 @@ type Suspension =
   | { form: "hop"; before: IrStmt[]; result: IrExpr | null; type: IrType }
   /** `module.await(dep)` — void-valued, and only half a suspension (see
    * the header): `dep` is the dependency's evaluation promise. */
-  | { form: "moduleAwait"; dep: IrExpr; loc: SrcLoc };
+  | { form: "moduleAwait"; dep: IrExpr; loc: SrcLoc }
+  /** `yield e` (or bare `yield;`, `node.value === null`) — a generator's
+   * OWN suspension root, never present in an async body (yieldExpr is
+   * frontend-fenced to generator bodies). */
+  | { form: "yield"; node: YieldNode };
 
 function isHopCall(e: IrExpr): boolean {
   return e.kind === "libCall" && e.fn === "async.hop";
@@ -823,6 +919,11 @@ function classifySuspension(e: IrExpr): Suspension | null {
   }
   if (e.kind === "awaitUnionExpr") {
     return hasSuspension(e.value) ? null : { form: "awaitUnion", node: e };
+  }
+  if (e.kind === "yieldExpr") {
+    // hasSuspension(null) is false (anyNode's own null guard) — the bare
+    // `yield;` case (e.value === null) needs no special handling here.
+    return hasSuspension(e.value) ? null : { form: "yield", node: e };
   }
   if (e.kind !== "seqExpr") return null;
   const at = e.stmts.findIndex((st) => st.kind === "exprStmt" && isHopCall(st.expr));
@@ -1043,14 +1144,35 @@ const HOIST_PREFIX = "%hoist.";
 const DISPATCH_LABEL = "%dispatch";
 const STATE_FIELD = "%state";
 const PROMISE_FIELD = "%promise";
+/** A generator frame's back-reference to its own $gen<triple> struct —
+ * mirrors PROMISE_FIELD exactly: the wrapper allocates both frame and
+ * $gen together (the design doc's Representation section), and resume,
+ * given only the frame, needs a way back to $gen's own state/out/sent/
+ * inject/retPark slots. Only present on a generator's frame; async's
+ * carries PROMISE_FIELD instead — the two are mutually exclusive, same
+ * as fn.generator/fn.async themselves. */
+const GEN_FIELD = "%gen";
 
-class FunctionLowering {
+/** Exported for the test surface ONLY (increment 19's yield-lowering
+ * unit): lowerResumableFunctions' own gate keeps every real generator
+ * OUT of this class until the yield machinery is ready to receive one
+ * (see the file header and lowerResumableFunctions below) — widening
+ * that gate is deliberately its own, LAST step. Until then, nothing but
+ * a test can reach a generator-shaped FunctionLowering at all, and
+ * house rule #9 (increment 18: "force-emit what the lowering cannot
+ * reach, behaviorally test what it can") says that is exactly when a
+ * construction path needs to exist for tests to use directly. */
+export class FunctionLowering {
   private readonly loc: SrcLoc;
   private readonly frameShapeId: string;
   private readonly resumeName: string;
   private readonly frameType: IrType;
   private readonly resumeType: IrType;
   private readonly promiseType: IrType;
+  /** The function's OWN generator type (yieldT/retT/nextT), null for an
+   * async function. Mutually exclusive with promiseType's relevance,
+   * mirroring fn.generator/fn.async themselves. */
+  private readonly genType: IrType | null;
   /** The function's locals plus the hoisting rewrite's temps. */
   private readonly locals: IrLocal[];
   /** The body AFTER the hoisting rewrite — what the linearization walks. */
@@ -1097,6 +1219,10 @@ class FunctionLowering {
     // Base-typed, not frame-typed: the ONE signature every resume shares.
     this.resumeType = { kind: "func", params: [widenType(FRAME_BASE)], ret: VOID };
     this.promiseType = { kind: "promise", inner: fn.returnType };
+    this.genType =
+      fn.generator !== undefined
+        ? { kind: "generator", yieldT: fn.generator.yieldT, retT: fn.returnType, nextT: fn.generator.nextT }
+        : null;
     this.locals = [...fn.locals];
     this.body = fn.body;
   }
@@ -1107,9 +1233,37 @@ class FunctionLowering {
   }
 
   run(): { wrapper: WFunction; resume: WFunction; frame: IrRecordShape } {
+    // GUARD, not documentation (the A2b gate's F2 finding): buildWrapper
+    // and catchArm (reached through buildResume) BOTH write/reference
+    // PROMISE_FIELD unconditionally — buildWrapper's frameInit literal
+    // names it directly, and catchArm's "reject" default arm (embedded in
+    // EVERY resume, whether or not the body has a covering try/catch —
+    // the routing table's fallback for "no protected region") does too.
+    // Neither checks genType. Until the lazy wrapper (buildWrapper) and
+    // the GENRET-aware routing default (catchArm) exist — the NEXT
+    // sub-unit's work, not this one's — calling this for a generator
+    // would construct a recordLit/resume body naming a "%promise" field
+    // the frame (buildFrameFields' own genType branch) no longer even
+    // declares: invalid IR, not a crash (nothing here cross-checks field
+    // names against the shape), which is exactly why it has to be
+    // refused HERE rather than produced and trusted downstream.
+    // runFrameAndStatesForTest() below is the narrower surface that
+    // stays clear of both broken paths, for exactly this reason.
+    if (this.genType !== null) this.decline("fn:async:generator-wrapper-not-built");
+
     this.checkEligible();
     this.buildFrameFields();
+    this.splitStates();
 
+    const frame: IrRecordShape = { id: this.frameShapeId, fields: this.frameFields };
+    return { wrapper: this.buildWrapper(), resume: this.buildResume(), frame };
+  }
+
+  /** The state-splitting loop shared by run() and the test-only surface
+   * below: eligibility already checked, frame fields already built: walk
+   * the body into per-state statement lists and close every state that
+   * fell off its own end. */
+  private splitStates(): void {
     // State 0 restores like any other entry. The wrapper never calls
     // resume with the arguments — it parks them in the frame's %l_ slots
     // and hands over the frame — so a param is an UNINITIALIZED local
@@ -1129,9 +1283,23 @@ class FunctionLowering {
     for (const state of this.states) {
       if (!isTerminator(state[state.length - 1])) state.push(...this.fellThrough());
     }
+  }
 
-    const frame: IrRecordShape = { id: this.frameShapeId, fields: this.frameFields };
-    return { wrapper: this.buildWrapper(), resume: this.buildResume(), frame };
+  /** TEST-ONLY (see the class's own export comment): the frame shape and
+   * the raw per-state statement lists, WITHOUT buildResume/buildWrapper/
+   * catchArm — the two paths run()'s own guard above refuses generators
+   * from reaching, because both are unconditionally async-shaped today.
+   * This is how the A2b yield-lowering tests verify the suspend/resume
+   * split (%gen.suspend/%gen.injectCheck/%gen.sent) without ever
+   * constructing the invalid IR those two paths would produce for a
+   * generator. Callable for an async function too (nothing here is
+   * generator-specific), but the real entry point (run()) is the one
+   * that matters for async — this exists for generators specifically. */
+  runFrameAndStatesForTest(): { frame: IrRecordShape; states: WStmt[][] } {
+    this.checkEligible();
+    this.buildFrameFields();
+    this.splitStates();
+    return { frame: { id: this.frameShapeId, fields: this.frameFields }, states: [...this.states] };
   }
 
   /* ── eligibility and the hoisting rewrite ────────────────────────────── */
@@ -1554,7 +1722,15 @@ class FunctionLowering {
 
   private buildFrameFields(): void {
     this.frameFields.push({ name: STATE_FIELD, type: F64 });
-    this.frameFields.push({ name: PROMISE_FIELD, type: this.promiseType });
+    // A generator's frame carries the back-reference to its OWN $gen
+    // (GEN_FIELD); an async function's carries the promise it settles
+    // (PROMISE_FIELD) — mutually exclusive, mirroring fn.generator/
+    // fn.async themselves.
+    this.frameFields.push(
+      this.genType !== null
+        ? { name: GEN_FIELD, type: this.genType }
+        : { name: PROMISE_FIELD, type: this.promiseType },
+    );
     for (const l of this.saved) this.frameFields.push({ name: slotOf(l.id), type: l.type });
     // %await<k> slots are appended as linearization discovers the sites;
     // the emitter reads a shape's field order verbatim, so append order IS
@@ -1571,6 +1747,14 @@ class FunctionLowering {
 
   private frameRef(): WExpr {
     return { kind: "varRef", localId: FRAME_LOCAL, type: this.frameType, loc: this.loc };
+  }
+
+  /** `frame.%gen` — the generator's own $gen<triple> struct. Only valid
+   * where genType is non-null (a generator function), which every yield
+   * site is: yieldExpr is frontend-fenced to generator bodies, so
+   * reaching lowerSuspension's "yield" form already proves it. */
+  private genRef(): WExpr {
+    return this.get(GEN_FIELD, this.genType!);
   }
 
   private get(field: string, type: IrType): WExpr {
@@ -1637,7 +1821,16 @@ class FunctionLowering {
     }));
   }
 
-  /** Fulfil the wrapper's promise with `value` and leave resume. */
+  /** Fulfil the wrapper's promise with `value` and leave resume.
+   *
+   * TODO(increment 19): unconditionally async-shaped — for a generator
+   * this should retag `value` into `$gen.out` and set `$gen.state = DONE`
+   * instead (the header's "A GENERATOR'S SIBLING PROTOCOL"), not settle a
+   * promise this function's frame no longer even carries a slot for.
+   * Not yet reachable: lowerResumableFunctions still gates every real
+   * generator out, and every stage-A2b test avoids a body with an
+   * explicit `return` for exactly this reason — see that describe
+   * block's own SCOPE NOTE. */
   private completion(value: IrExpr | null): WStmt[] {
     const out: WStmt[] = [];
     if (this.fn.returnType.kind === "void") {
@@ -1671,7 +1864,16 @@ class FunctionLowering {
    * runtimeFence regardless of code, so one defensive trap per resume
    * would make every async function may-throw and put a pending check
    * after every call to one. The state graph's closure is pinned by unit
-   * test instead, which is where a numbering bug actually shows up. */
+   * test instead, which is where a numbering bug actually shows up.
+   *
+   * TODO(increment 19): the void branch below is unconditionally
+   * async-shaped (references PROMISE_FIELD, a slot a generator's frame
+   * no longer carries — see buildFrameFields' %gen/%promise branch); it
+   * needs a generator arm settling `$gen` instead. The non-void branch
+   * just above needs no change (a bare `this.ret()`, no field reference
+   * either way) — every stage-A2b test relies on exactly that to stay
+   * clear of this gap; see completion()'s own TODO and that describe
+   * block's SCOPE NOTE. */
   private fellThrough(): WStmt[] {
     if (this.fn.returnType.kind !== "void") return [this.ret()];
     return [
@@ -1831,68 +2033,126 @@ class FunctionLowering {
     // (%state is already k) — no microtask turn for a settled dependency.
     let tail: WStmt = this.ret();
 
-    if (susp.form === "moduleAwait") {
-      const slot = this.awaitSlot(susp.dep.type);
-      this.emit(cur, this.set(slot, susp.dep));
-      this.emit(cur, ...this.saves(), this.set(STATE_FIELD, this.num(resumeState)), {
-        kind: "%async.subscribeIfPending",
-        promise: this.get(slot, susp.dep.type),
-        frame: this.frameRef(),
-        resume: this.resumeClosure(),
-        loc: susp.loc,
-      });
-      tail = { kind: "continue", label: DISPATCH_LABEL, loc: susp.loc };
-      reentry.push({ kind: "%async.rejectCheck", promise: this.get(slot, susp.dep.type), loc: susp.loc });
-    } else if (susp.form === "hop") {
-      this.emit(cur, ...susp.before);
-      this.emit(cur, ...this.saves(), this.set(STATE_FIELD, this.num(resumeState)), {
-        kind: "%async.hop",
-        frame: this.frameRef(),
-        resume: this.resumeClosure(),
-        loc: susp.before[0]?.loc ?? this.loc,
-      });
-      resumed = susp.result;
-    } else if (susp.form === "await") {
-      const node = susp.node;
-      const slot = this.awaitSlot(node.value.type);
-      this.emit(cur, this.set(slot, node.value));
-      this.emit(cur, ...this.saves(), this.set(STATE_FIELD, this.num(resumeState)), {
-        kind: "%async.subscribe",
-        promise: this.get(slot, node.value.type),
-        frame: this.frameRef(),
-        resume: this.resumeClosure(),
-        loc: node.loc,
-      });
-      reentry.push({ kind: "%async.rejectCheck", promise: this.get(slot, node.value.type), loc: node.loc });
-      if (node.type.kind !== "void") {
-        resumed = { kind: "%async.settled", promise: this.get(slot, node.value.type), type: node.type, loc: node.loc };
+    // An exhaustive switch, not the if/else-if chain this used to be: a
+    // bare trailing `else` type-checked here only by accident (the type
+    // errors a missing arm produces are ordinary property-access errors
+    // in that branch, not an exhaustiveness failure — there was no
+    // `never`-check anywhere to trip). The `default` below is the guard;
+    // adding a Suspension form without a case here is now a compile
+    // error by construction, matching every other exhaustive dispatch in
+    // this file (emitter.ts's `const rest: never = e` idiom).
+    switch (susp.form) {
+      case "moduleAwait": {
+        const slot = this.awaitSlot(susp.dep.type);
+        this.emit(cur, this.set(slot, susp.dep));
+        this.emit(cur, ...this.saves(), this.set(STATE_FIELD, this.num(resumeState)), {
+          kind: "%async.subscribeIfPending",
+          promise: this.get(slot, susp.dep.type),
+          frame: this.frameRef(),
+          resume: this.resumeClosure(),
+          loc: susp.loc,
+        });
+        tail = { kind: "continue", label: DISPATCH_LABEL, loc: susp.loc };
+        reentry.push({ kind: "%async.rejectCheck", promise: this.get(slot, susp.dep.type), loc: susp.loc });
+        break;
       }
-    } else {
-      const node = susp.node;
-      const slot = this.awaitSlot(node.value.type);
-      this.emit(cur, this.set(slot, node.value));
-      this.emit(cur, ...this.saves(), this.set(STATE_FIELD, this.num(resumeState)), {
-        kind: "%async.subscribeUnion",
-        value: this.get(slot, node.value.type),
-        promiseTag: node.promiseTag,
-        frame: this.frameRef(),
-        resume: this.resumeClosure(),
-        loc: node.loc,
-      });
-      reentry.push({
-        kind: "%async.rejectCheckUnion",
-        value: this.get(slot, node.value.type),
-        promiseTag: node.promiseTag,
-        loc: node.loc,
-      });
-      if (node.type.kind !== "void") {
-        resumed = {
-          kind: "%async.settledUnion",
+      case "hop": {
+        this.emit(cur, ...susp.before);
+        this.emit(cur, ...this.saves(), this.set(STATE_FIELD, this.num(resumeState)), {
+          kind: "%async.hop",
+          frame: this.frameRef(),
+          resume: this.resumeClosure(),
+          loc: susp.before[0]?.loc ?? this.loc,
+        });
+        resumed = susp.result;
+        break;
+      }
+      case "await": {
+        const node = susp.node;
+        const slot = this.awaitSlot(node.value.type);
+        this.emit(cur, this.set(slot, node.value));
+        this.emit(cur, ...this.saves(), this.set(STATE_FIELD, this.num(resumeState)), {
+          kind: "%async.subscribe",
+          promise: this.get(slot, node.value.type),
+          frame: this.frameRef(),
+          resume: this.resumeClosure(),
+          loc: node.loc,
+        });
+        reentry.push({ kind: "%async.rejectCheck", promise: this.get(slot, node.value.type), loc: node.loc });
+        if (node.type.kind !== "void") {
+          resumed = { kind: "%async.settled", promise: this.get(slot, node.value.type), type: node.type, loc: node.loc };
+        }
+        break;
+      }
+      case "awaitUnion": {
+        const node = susp.node;
+        const slot = this.awaitSlot(node.value.type);
+        this.emit(cur, this.set(slot, node.value));
+        this.emit(cur, ...this.saves(), this.set(STATE_FIELD, this.num(resumeState)), {
+          kind: "%async.subscribeUnion",
           value: this.get(slot, node.value.type),
           promiseTag: node.promiseTag,
-          type: node.type,
+          frame: this.frameRef(),
+          resume: this.resumeClosure(),
           loc: node.loc,
-        };
+        });
+        reentry.push({
+          kind: "%async.rejectCheckUnion",
+          value: this.get(slot, node.value.type),
+          promiseTag: node.promiseTag,
+          loc: node.loc,
+        });
+        if (node.type.kind !== "void") {
+          resumed = {
+            kind: "%async.settledUnion",
+            value: this.get(slot, node.value.type),
+            promiseTag: node.promiseTag,
+            type: node.type,
+            loc: node.loc,
+          };
+        }
+        break;
+      }
+      case "yield": {
+        // No event loop, no settled-dependency fast path: EVERY yield
+        // suspends and returns — `tail` keeps its default (this.ret()).
+        const node = susp.node;
+        this.emit(cur, ...this.saves(), this.set(STATE_FIELD, this.num(resumeState)), {
+          kind: "%gen.suspend",
+          gen: this.genRef(),
+          // The RAW yieldT-typed operand, un-retagged (null for a bare
+          // `yield;`) — see %gen.suspend's own doc comment for why the
+          // pass never wraps this into V itself.
+          value: node.value === null ? null : widenExpr(node.value),
+          loc: node.loc,
+        });
+        // NEXT falls through as a no-op; THROW/GENRET unwind into the
+        // SAME per-iteration catch every other unwind already reaches
+        // (%gen.injectCheck's own doc comment has the full three-way
+        // story) — reentry order matters no differently than
+        // rejectCheck's: it runs AFTER restore, BEFORE the resumed read,
+        // exactly mirroring await's own reentry/resumed split below.
+        reentry.push({ kind: "%gen.injectCheck", gen: this.genRef(), loc: node.loc });
+        // nextT's "no value" spelling is the undefined-unit arm, not
+        // `void` (generators.ts's GeneratorBuilder draws this exact
+        // line for $gen's own `sent` field — mirrored here so the two
+        // never drift apart on what "no sent slot" means).
+        if (node.type.kind !== "undefinedT") {
+          resumed = { kind: "%gen.sent", gen: this.genRef(), type: node.type, loc: node.loc };
+        }
+        break;
+      }
+      default: {
+        // The never-check plus a LOUD, NAMED refusal — emitter.ts's own
+        // idiom (its six `const rest: never = e; this.refuse(...)` sites),
+        // not a bare compile-time-only assertNever: a future Suspension
+        // form added here without a case declines this ONE function by
+        // name (this.decline bails via AsyncBail, which
+        // lowerResumableFunctions already catches and moves on from) —
+        // never a hard crash of the whole compilation, matching "never
+        // miscompile, refuse loudly" everywhere else in this file.
+        const rest: never = susp;
+        this.decline(`fn:async:unhandled-suspension-${(rest as Suspension).form}`);
       }
     }
     this.emit(cur, tail);
@@ -2211,6 +2471,18 @@ class FunctionLowering {
     };
   }
 
+  /** TODO(increment 19): unconditionally builds ASYNC's eager wrapper
+   * (mint a promise, kick resume once, return the promise) — the
+   * header's "A GENERATOR'S SIBLING PROTOCOL" describes the LAZY
+   * alternative a generator needs instead (allocate frame + $gen, store
+   * params, boxInit, $gen.state = UNSTARTED, NO resume call, return the
+   * $gen), not yet built here. `run()` calling this unconditionally for
+   * a generator function today produces a WRONG wrapper beside a correct
+   * resume (frameInit literally names a "%promise" field the frame no
+   * longer carries) — this does not throw (recordLit construction never
+   * checks field names against the shape), it is just wrong IR, which is
+   * exactly why lowerResumableFunctions' gate (below) stays closed until
+   * this gets its generator branch. */
   private buildWrapper(): WFunction {
     const frameLocal: IrLocal = { id: FRAME_LOCAL, name: FRAME_LOCAL, type: this.frameType, mutable: false };
     const captured = new Set((this.fn.captures ?? []).map((c) => c.localId));
