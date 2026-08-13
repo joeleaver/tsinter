@@ -1276,6 +1276,17 @@ const TIER_FLOOR: string[] = [
   "2017-generators-async.ts",
   "2018-generators-uncaught.ts",
   "2457-private-members.js",
+  // Increment 19 stage A3-2: `dynCheck: ["value"]` — a single missing
+  // HOIST_SLOTS entry, not a linearization feature. `yield`'s own static
+  // type is the generator's nextT (unknown in 2013's `sum()`), so `(yield
+  // 1) as number` compiles to a REAL checked cast (S009) wrapping the
+  // yield, and hoistRoot could not see through it to find the suspension
+  // underneath — declined at the wrapper (fn:generator:yield-position)
+  // with the yield itself never reached. Overlooked originally, not a
+  // deliberate exclusion (dynFrom/dynFromJsval/upcast/downcast are the
+  // same "one operand, nothing to get wrong" shape and were already
+  // covered).
+  "2013-generators-sent-values.ts",
 ];
 
 interface RunResult {

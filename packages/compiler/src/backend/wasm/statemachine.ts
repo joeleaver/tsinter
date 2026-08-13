@@ -1117,6 +1117,15 @@ const HOIST_SLOTS: Partial<Record<IrExpr["kind"], HoistSlot[]>> = {
   // programs that reach them.
   dynFrom: ["value"],
   dynFromJsval: ["value"],
+  // A checked "as" cast crossing FROM dyn/unknown (S009) — one operand,
+  // same "nothing to get wrong" rationale as dynFrom/dynFromJsval above.
+  // Simply overlooked here originally, not a deliberate exclusion: found
+  // via 2013's `(yield 1) as number` (yield's own static type is the
+  // generator's nextT — unknown, in that program — so the cast is real,
+  // not erased), which wraps a yield/await and blocked hoistRoot from
+  // ever seeing the suspension underneath, declining at the wrapper
+  // instead (fn:generator:yield-position) with the yield never reached.
+  dynCheck: ["value"],
   // Type-only and tag-only nodes: one operand, nothing else to order.
   upcast: ["value"],
   downcast: ["value"],
@@ -1139,8 +1148,10 @@ const HOIST_SLOTS: Partial<Record<IrExpr["kind"], HoistSlot[]>> = {
   // hoistable position (mirrors "an await under an await"), since a root
   // yield never reaches hoistParts at all (hoistRoot returns a root
   // suspension unchanged — classifySuspension's job, not the hoister's).
-  // Currently unreachable (see isSuspensionNode's note): no generator body
-  // reaches this pass yet.
+  // LIVE since A2c slice 5's gate widening: a generator body reaches this
+  // pass through the ordinary compiled path now, the same as async always
+  // has (this entry's own comment used to say the opposite — stale as of
+  // that slice, corrected here).
   yieldExpr: ["value"],
   // `g.next(arg)`/`g.return(arg)`/`g.throw(arg)` — NOT itself a suspension
   // (a generator resume from the CONSUMER's side is synchronous; see the
