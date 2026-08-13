@@ -28,17 +28,24 @@
  *   frame:   mut (ref null %frameBase)
  *   resume:  mut (ref null $clos)        (frameBase) -> void, set once
  *
- * V's WASM REPRESENTATION NEVER NEEDS THE UNION'S ARMS. `out` holds the
+ * V's WASM STORAGE TYPE NEVER NEEDS THE UNION'S ARMS. `out` holds the
  * genResultRecord's `value` field type verbatim (mapType's "union" arm
  * answers ONE shared base ref for every union — dispatch lives at the
- * arm-wrap/narrow sites, never at the value's storage type — so V's own
- * arm set is irrelevant here); genResultRecord's OWN value-type rule is
- * "dyn if either channel is dyn, otherwise a union (possibly the
- * synthesized unit-only one for a no-value generator)" — this builder
- * reproduces exactly that TWO-WAY branch (dyn vs. union-base), never the
- * frontend's full arm-collection logic, and needs no ShapeRegistry/
- * UnionRegistry access to get it right: this backend has neither, and
- * does not need either.
+ * arm-wrap/narrow sites, never at the value's storage type), so `info()`
+ * still reproduces just the TWO-WAY branch (dyn vs. union-base) for
+ * `out`'s FIELD TYPE, no arm list involved. The ARM LIST is a different
+ * question this builder DOES answer now — `%gen.suspend`/`%gen.complete`
+ * (the emitter, stage A2c slice 4b) need V's actual arms to find a
+ * concrete operand's TAG, and getting that wrong is a silent miscompile,
+ * never a validation failure, so it is IMPORTED from `computeGenResultArms`
+ * (frontend/types.ts) rather than re-derived here — the same increment-
+ * 6/7/10 "shared by construction, never re-derive" lesson increment 13's
+ * vtable numbering already applies, in a new costume. This builder still
+ * holds no ShapeRegistry/UnionRegistry (a live, mutating registry) — the
+ * one thing it imports is a PURE function over IrTypes, satisfied by the
+ * `unionArms` read-only callback (GeneratorDeps), which the emitter wires
+ * to its own `unionDef(id).arms` (the same accessor unionWrap/unionNarrow/
+ * unionDisc already use for real modules). See `GenInfo.outArms`.
  *
  * SENT/RETPARK NEVER REFUSE, THE SAME WAY A RECORD FIELD NEVER DOES.
  * `recordInfo` maps every field through `mapTypeSoft` unconditionally and
@@ -54,6 +61,7 @@
  * as a refusal this builder should grow a null path for. */
 import type { IrType } from "../../ir/nodes.js";
 import { typeKey } from "../../ir/nodes.js";
+import { computeGenResultArms, type GenResultArms } from "../../frontend/types.js";
 import { I32, ModuleBuilder, type ValType } from "./module.js";
 
 /** `state` values. */
@@ -89,6 +97,12 @@ export interface GeneratorDeps {
    * for `sent`/`retPark` — nextT/retT are arbitrary channel types, never
    * V, and (see the header) never fail to place here. */
   mapTypeSoft: (t: IrType) => ValType;
+  /** A registered union's own arms, read off the COMPILED module (the
+   * emitter's `unionDef(id).arms` — the same read-only accessor
+   * `unionWrap`/`unionNarrow`/`unionDisc` already use for real programs).
+   * The one seam `computeGenResultArms` needs; never a registry, never a
+   * write. */
+  unionArms: (unionId: string) => readonly IrType[];
 }
 
 export interface GenInfo {
@@ -105,6 +119,20 @@ export interface GenInfo {
     frame: number;
     resume: number;
   };
+  /** V's arm list — `computeGenResultArms(yieldT, retT, deps.unionArms)`,
+   * the SAME pure algorithm `genResultRecord` (frontend/types.ts) interns
+   * through, imported rather than re-derived (the vecKeyFor/mapTypeSoft
+   * lockstep hazard in a new costume: two copies of a TAG NUMBERING
+   * scheme that must agree forever would disagree SILENTLY, not fail
+   * validation). `%gen.suspend`/`%gen.complete` are the consumers — a
+   * concrete operand type's tag is its position in `arms` (when `kind`
+   * is `"arms"`); `"dyn"` needs no tag at all (out is dyn-boxed, not
+   * union-tagged); `"degenerate"` is the two-arm `null | undefined`
+   * union every OTHER no-value-generator caller reaches through
+   * `unitOnlyUnion` — this builder never mints that id (no registry
+   * here), but the ARMS are `[NULL_T, UNDEFINED_T]` sorted the identical
+   * way regardless of which id ends up naming them. */
+  outArms: GenResultArms;
 }
 
 export class GeneratorBuilder {
@@ -126,11 +154,28 @@ export class GeneratorBuilder {
     const cached = this.byKey.get(key);
     if (cached !== undefined) return cached;
 
-    // V: dyn if EITHER channel is dyn, otherwise the one shared union
-    // base ref — genResultRecord's own first branch, reproduced exactly
-    // (see the header note: V's arm set is never needed here).
+    // V's STORAGE type: dyn if EITHER channel is dyn, otherwise the one
+    // shared union base ref, regardless of how many arms V turns out to
+    // have or what they are — a storage-type decision needs no arm list
+    // at all, which is why this stays the simple two-way branch it
+    // always was. V's ARM LIST (needed for %gen.suspend/%gen.complete's
+    // tag lookups, never for this) is `outArms` below — computed by the
+    // SAME shared algorithm regardless of whether this branch takes dyn
+    // or the union path, so the two never have to be kept in sync by
+    // hand: `computeGenResultArms` reports "dyn" itself when this does.
     const outVal: ValType =
       genT.yieldT.kind === "dyn" || genT.retT.kind === "dyn" ? this.deps.dynRef() : this.deps.unionBaseRef();
+    const outArms = computeGenResultArms(genT.yieldT, genT.retT, this.deps.unionArms);
+    if (outArms === null) {
+      // Unreachable in practice: mapType's own generator arm (types.ts)
+      // already calls genResultRecord and stays unmapped on null, so a
+      // generator IrType reaching this builder at all is proof the SAME
+      // algorithm already succeeded once, upstream, on the identical
+      // (yieldT, retT) pair. An assertion, not a refusal — see the
+      // header's "never fails" claim, which this preserves rather than
+      // quietly narrows.
+      throw new Error(`generators.ts bug: computeGenResultArms disagreed with mapType's own eligibility check for ${key}`);
+    }
 
     const hasSent = genT.nextT.kind !== "undefinedT";
     const sentVal = hasSent ? this.deps.mapTypeSoft(genT.nextT) : null;
@@ -163,7 +208,7 @@ export class GeneratorBuilder {
     const frame = i++;
     const resume = i++;
 
-    const info: GenInfo = { struct, idx: { state, out, sent, inject, retPark, frame, resume } };
+    const info: GenInfo = { struct, idx: { state, out, sent, inject, retPark, frame, resume }, outArms };
     this.byKey.set(key, info);
     return info;
   }

@@ -7,7 +7,7 @@
  * pass declines must name itself and leave the function untouched, which
  * is what keeps the emitter's own `fn:async` firing behind it. */
 import { beforeAll, describe, expect, test } from "vitest";
-import type { IrExpr, IrFunction, IrModule, IrRecordShape, IrStmt, IrType, IrUnionDef, SrcLoc } from "../src/ir/nodes.js";
+import type { IrExpr, IrFunction, IrLocal, IrModule, IrParam, IrRecordShape, IrStmt, IrType, IrUnionDef, SrcLoc } from "../src/ir/nodes.js";
 import { BOOL, CAUGHT, DYN, F64, STRING, UNDEFINED_T, VOID } from "../src/ir/nodes.js";
 import {
   asIrModule,
@@ -19,7 +19,7 @@ import {
 } from "../src/backend/wasm/statemachine.js";
 import { computeMayThrow } from "../src/backend/emission/may-throw.js";
 import { emitWasmModule, surveyWasmModule } from "../src/backend/wasm/emitter.js";
-import { genResultRecord, ShapeRegistry, UnionRegistry } from "../src/frontend/types.js";
+import { computeGenResultArms, genResultRecord, ShapeRegistry, UnionRegistry } from "../src/frontend/types.js";
 import {
   assign,
   asyncModule,
@@ -2499,5 +2499,229 @@ describe("A2c slice 4a: %gen.new / %gen.sent / %gen.retPark / %gen.markDone / %g
     const stdout = Buffer.concat(chunks).toString("utf8");
 
     expect(stdout).toBe(["0", "false", "next-fell-through", "false", ""].join("\n"));
+  });
+});
+
+/* ── 13. A2c slice 4b groundwork: computeGenResultArms, shared by
+ * construction with genResultRecord ──────────────────────────────────────
+ *
+ * The wasm backend's `%gen.suspend`/`%gen.complete` will need V's exact
+ * arm list to find a concrete operand's TAG — a wrong tag is a SILENT
+ * miscompile (a struct.new_default wraps the wrong arm; nothing traps),
+ * never a validation failure, so generators.ts imports this function
+ * rather than re-deriving genResultRecord's arm-computation locally (the
+ * increment-6/7/10 "keyed by the full triple, never twice" lesson,
+ * increment 13's vtable-numbering precedent — shared by construction).
+ * These tests pin that the FACTORED function still agrees with
+ * genResultRecord's own (unchanged) behavior for representative shapes,
+ * including the case that makes this non-optional: 2014-generators-
+ * values.ts's `mixed(): Generator<number | string, void, unknown>` — a
+ * REAL union yield channel in the 12-program target set, not a
+ * hypothetical corner. */
+describe("computeGenResultArms: shared by construction with genResultRecord", () => {
+  test("a concrete (f64, void) channel pair: arms are exactly [f64, undefined], matching genResultRecord's own union", () => {
+    const shapes = new ShapeRegistry();
+    const unions = new UnionRegistry();
+    const result = computeGenResultArms(F64, VOID, (id) => unions.get(id)?.arms ?? []);
+    expect(result?.kind).toBe("arms");
+    if (result?.kind !== "arms") throw new Error("unreachable");
+    expect(result.arms).toHaveLength(2);
+    expect(result.arms.some((a) => a.kind === "f64")).toBe(true);
+    expect(result.arms.some((a) => a.kind === "undefinedT")).toBe(true);
+
+    // Cross-check: genResultRecord's OWN interned union (built through the
+    // UNCHANGED path — unions.intern) has the identical arm set.
+    const rec = genResultRecord(F64, VOID, shapes, unions);
+    if (rec === null) throw new Error("genResultRecord returned null");
+    const shape = shapes.get(rec.shapeId)!;
+    const valueField = shape.fields.find((f) => f.name === "value")!;
+    if (valueField.type.kind !== "union") throw new Error("expected a union value field");
+    const realArms = unions.get(valueField.type.unionId)!.arms;
+    expect(realArms.map((a) => a.kind).sort()).toEqual(result.arms.map((a) => a.kind).sort());
+  });
+
+  test("either channel dyn: reports \"dyn\", matching genResultRecord's DYN short-circuit", () => {
+    const result = computeGenResultArms(DYN, F64, () => []);
+    expect(result).toEqual({ kind: "dyn" });
+
+    const shapes = new ShapeRegistry();
+    const unions = new UnionRegistry();
+    const rec = genResultRecord(DYN, F64, shapes, unions);
+    if (rec === null) throw new Error("genResultRecord returned null");
+    const shape = shapes.get(rec.shapeId)!;
+    expect(shape.fields.find((f) => f.name === "value")!.type).toEqual(DYN);
+  });
+
+  test("a UNION yield channel (2014-generators-values.ts's mixed(): Generator<number | string, void, unknown>): V flattens yieldT's own arms in, never nests the union", () => {
+    const unions = new UnionRegistry();
+    const yieldUnionArms = [F64, STRING].sort((a, b) => (a.kind < b.kind ? -1 : 1));
+    const yieldUnionId = unions.intern(yieldUnionArms);
+    const yieldT: IrType = { kind: "union", unionId: yieldUnionId };
+
+    const result = computeGenResultArms(yieldT, VOID, (id) => unions.get(id)?.arms ?? []);
+    expect(result?.kind).toBe("arms");
+    if (result?.kind !== "arms") throw new Error("unreachable");
+    // Three arms: f64, string (flattened out of yieldT's own union — never
+    // "yieldT" as one opaque arm), and the unconditional undefined arm
+    // (exhausted .next() answers undefined) — never fewer, never nested.
+    expect(result.arms).toHaveLength(3);
+    expect(result.arms.map((a) => a.kind).sort()).toEqual(["f64", "string", "undefinedT"]);
+
+    // Cross-check against genResultRecord's own real union, built through
+    // the SAME UnionRegistry (so a real .next() consumer's extractYieldValue
+    // would resolve tags against this exact union).
+    const shapes = new ShapeRegistry();
+    const rec = genResultRecord(yieldT, VOID, shapes, unions);
+    if (rec === null) throw new Error("genResultRecord returned null");
+    const shape = shapes.get(rec.shapeId)!;
+    const valueField = shape.fields.find((f) => f.name === "value")!;
+    if (valueField.type.kind !== "union") throw new Error("expected a union value field");
+    const realArms = unions.get(valueField.type.unionId)!.arms;
+    expect(realArms.map((a) => a.kind).sort()).toEqual(result.arms.map((a) => a.kind).sort());
+  });
+
+  test("a degenerate no-value generator (void yield, void return): reports \"degenerate\", matching genResultRecord's unitOnlyUnion", () => {
+    const result = computeGenResultArms(VOID, VOID, () => []);
+    expect(result).toEqual({ kind: "degenerate" });
+
+    const shapes = new ShapeRegistry();
+    const unions = new UnionRegistry();
+    const rec = genResultRecord(VOID, VOID, shapes, unions);
+    if (rec === null) throw new Error("genResultRecord returned null");
+    const shape = shapes.get(rec.shapeId)!;
+    const valueField = shape.fields.find((f) => f.name === "value")!;
+    if (valueField.type.kind !== "union") throw new Error("expected a union value field");
+    const realArms = unions.get(valueField.type.unionId)!.arms;
+    expect(realArms.map((a) => a.kind).sort()).toEqual(["nullT", "undefinedT"]);
+  });
+});
+
+/* ── 14. A2c slice 4b: %gen.suspend / %gen.complete real emission ────────
+ *
+ * The two ops that retag a raw yieldT/retT-typed operand into $gen.out's
+ * V representation — built on `emitGenOutValue` and the new
+ * `UnionBuilder.retag` dispatch helper (unions.ts). There is no read-
+ * accessor for $gen.out at the pass level (only genResume, stage A3,
+ * unbuilt, will ever read it), so these tests stay STRUCTURAL —
+ * survey-clean + WebAssembly.validate across the three representation
+ * shapes (concrete arm, union-channel retag, dyn-channel) — the SAME
+ * bar slice 4a's %gen.new held for the frame/resume fields it also could
+ * not read back. The retag MECHANISM's own correctness (tag numbers AND
+ * payloads, end to end through a real WebAssembly.instantiate) is
+ * covered independently in wasm-unions-validate.test.ts, which calls
+ * `UnionBuilder.retag` directly — the union-channel test below confirms
+ * this pass/emitter combination actually REACHES that mechanism for a
+ * real generator shape, not that the mechanism itself is correct. */
+describe("A2c slice 4b: %gen.suspend / %gen.complete real emission (retag)", () => {
+  const g4bLoc = loc;
+
+  /** Direct construction, the SAME pattern slice 4a's %gen.new/%gen.sent/
+   * etc. tests use — never through FunctionLowering/the pass. `gen:
+   * v("g.0", genT)` reads straight off the local %gen.new just filled;
+   * %gen.suspend/%gen.complete only care about that expression's STATIC
+   * TYPE, never how it was obtained, so there is no need for a frame
+   * shape, a frame local, or a write-back here at all (unlike the real
+   * wrapper, which threads $gen through `frame.%gen` because resume
+   * only ever holds the frame — irrelevant to what this file tests). */
+  function genModule4b(genT: IrType, resumeName: string, resumeParams: IrParam[], body: IrStmt[]): IrModule {
+    const resumeFn: IrFunction = {
+      name: resumeName,
+      params: resumeParams,
+      returnType: VOID,
+      locals: [],
+      body: [ret(null)],
+      loc: g4bLoc,
+    };
+    const genLocal: IrLocal = { id: "g.0", name: "g.0", type: genT, mutable: false };
+    // A FRAME_BASE-typed local, never assigned — wasm's own default-zero
+    // rule gives it `ref.null`, which is all %gen.new's `frame` operand
+    // needs to exist as HERE (it is stored, never dereferenced — no
+    // resume call happens in this file, so a real frame is never read).
+    const frameSlot: IrLocal = { id: "frameSlot", name: "frameSlot", type: FRAME_BASE, mutable: false };
+    return {
+      irVersion: 3,
+      sourceFile: "g4b.ts",
+      entry: "%main",
+      functions: [
+        resumeFn,
+        {
+          name: "%main",
+          params: [],
+          returnType: VOID,
+          locals: [genLocal, frameSlot],
+          body: [
+            varDecl("g.0", {
+              kind: "%gen.new",
+              frame: v("frameSlot", FRAME_BASE),
+              resume: { kind: "closure", fnName: resumeName, captures: [], type: { kind: "func", params: [FRAME_BASE], ret: VOID }, loc: g4bLoc },
+              type: genT,
+              loc: g4bLoc,
+            } as unknown as IrExpr),
+            ...body,
+          ],
+          loc: g4bLoc,
+        },
+      ],
+    };
+  }
+
+  test("concrete arm + a void return (null value): both survey clean and emit a VALID module", () => {
+    const genT: IrType = { kind: "generator", yieldT: F64, retT: VOID, nextT: F64 };
+    const mod = genModule4b(genT, "%stub.resume1", [{ localId: "%f", name: "%f", type: FRAME_BASE }], [
+      { kind: "%gen.suspend", gen: v("g.0", genT), value: num(1), loc: g4bLoc } as unknown as IrStmt,
+      { kind: "%gen.complete", gen: v("g.0", genT), value: null, loc: g4bLoc } as unknown as IrStmt,
+    ]);
+    expect(surveyWasmModule(mod)).toEqual([]);
+    expect(WebAssembly.validate(emitWasmModule(mod))).toBe(true);
+  });
+
+  test("a UNION yield channel (2014-generators-values.ts's mixed() shape): %gen.suspend reaches unions.ts's retag helper for a real generator", () => {
+    const unions = new UnionRegistry();
+    const yieldUnionArms = [F64, STRING].sort((a, b) => (a.kind < b.kind ? -1 : 1));
+    const yieldUnionId = unions.intern(yieldUnionArms);
+    const yieldT: IrType = { kind: "union", unionId: yieldUnionId };
+    const f64Tag = unions.get(yieldUnionId)!.arms.findIndex((a) => a.kind === "f64");
+    const strTag = unions.get(yieldUnionId)!.arms.findIndex((a) => a.kind === "string");
+    const genT: IrType = { kind: "generator", yieldT, retT: VOID, nextT: UNDEFINED_T };
+
+    const mod = genModule4b(genT, "%stub.resume2", [{ localId: "%f", name: "%f", type: FRAME_BASE }], [
+      {
+        kind: "%gen.suspend",
+        gen: v("g.0", genT),
+        value: { kind: "unionWrap", unionId: yieldUnionId, tag: f64Tag, value: num(1), type: yieldT, loc: g4bLoc },
+        loc: g4bLoc,
+      } as unknown as IrStmt,
+      {
+        kind: "%gen.suspend",
+        gen: v("g.0", genT),
+        value: { kind: "unionWrap", unionId: yieldUnionId, tag: strTag, value: str("two"), type: yieldT, loc: g4bLoc },
+        loc: g4bLoc,
+      } as unknown as IrStmt,
+    ]);
+    mod.unions = unions.unions;
+    expect(surveyWasmModule(mod)).toEqual([]);
+    const bytes = emitWasmModule(mod);
+    expect(WebAssembly.validate(bytes)).toBe(true);
+  });
+
+  test("a dyn channel (retT dyn): a concrete yield operand gets boxed via dynFrom, an already-dyn one passes through unchanged", () => {
+    // retT dyn (unlike yieldT, kept concrete here) makes $gen.out
+    // dyn-typed per genResultRecord's "dyn if EITHER channel is dyn"
+    // rule — exactly the case that needs dynFrom boxing
+    // (emitGenOutValue's first branch) for the concrete F64 operand.
+    const genT: IrType = { kind: "generator", yieldT: F64, retT: DYN, nextT: F64 };
+    const mod = genModule4b(genT, "%stub.resume3", [{ localId: "%f", name: "%f", type: FRAME_BASE }], [
+      { kind: "%gen.suspend", gen: v("g.0", genT), value: num(1), loc: g4bLoc } as unknown as IrStmt,
+      // An operand that is ALREADY dyn-typed (e.g. a return value on a
+      // dyn retT channel) should ride through unchanged — no double box.
+      {
+        kind: "%gen.complete",
+        gen: v("g.0", genT),
+        value: { kind: "dynFrom", value: num(2), type: DYN, loc: g4bLoc },
+        loc: g4bLoc,
+      } as unknown as IrStmt,
+    ]);
+    expect(surveyWasmModule(mod)).toEqual([]);
+    expect(WebAssembly.validate(emitWasmModule(mod))).toBe(true);
   });
 });

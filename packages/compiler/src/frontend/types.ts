@@ -2667,6 +2667,59 @@ export function unitOnlyUnion(unions: UnionRegistry): IrType {
   return { kind: "union", unionId: unions.intern(arms) };
 }
 
+/** What `genResultRecord`'s `value` field should be, computed but not yet
+ * MINTED (no `unions.intern`/`unions.get` — `getUnionArms` is the one
+ * seam, satisfied equally by a live `UnionRegistry` or a compiled
+ * module's own `unionDef` lookup). Factored out so the wasm backend can
+ * compute the SAME arm list `genResultRecord` interns — never a second,
+ * independently-maintained copy of this algorithm (the vecKeyFor/
+ * mapTypeSoft lockstep hazard, increments 6/7/10's lesson, in a new
+ * costume: two implementations of a TAG NUMBERING scheme that must agree
+ * forever, where disagreement is a SILENT miscompile, not a validation
+ * failure — strictly worse than the hazard's original shape). `"dyn"` and
+ * `"degenerate"` are the two cases with no real arm list of their own
+ * (dyn needs none; the no-value generator's `unitOnlyUnion` is minted by
+ * the same content-addressed `unions.intern` any other caller of it
+ * uses — a consumer that only needs ARMS, never a minted id, can still
+ * use `[NULL_T, UNDEFINED_T]` sorted the identical way). */
+export type GenResultArms = { kind: "dyn" } | { kind: "degenerate" } | { kind: "arms"; arms: IrType[] };
+
+export function computeGenResultArms(
+  yieldT: IrType,
+  retT: IrType,
+  getUnionArms: (unionId: string) => readonly IrType[],
+): GenResultArms | null {
+  if (yieldT.kind === "dyn" || retT.kind === "dyn") return { kind: "dyn" };
+  const byKey = new Map<string, IrType>();
+  const add = (t: IrType): boolean => {
+    if (t.kind === "void") return true; // no value on this channel
+    if (t.kind === "union") {
+      for (const a of getUnionArms(t.unionId)) byKey.set(typeKey(a), a);
+      return true;
+    }
+    if (t.kind === "map" || t.kind === "regex" || t.kind === "jsval" || t.kind === "generator") {
+      return false; // no legal union arm exists for these kinds
+    }
+    byKey.set(typeKey(t), t);
+    return true;
+  };
+  if (!add(yieldT) || !add(retT)) return null;
+  byKey.set(typeKey(UNDEFINED_T), UNDEFINED_T);
+  const arms = [...byKey.values()];
+  // func/set arms are legal only beside unit arms (no narrowing test
+  // against data siblings — the union rule).
+  if (arms.some((a) => (a.kind === "func" || a.kind === "set") && !arms.every((b) => b === a || isUnitType(b)))) {
+    return null;
+  }
+  if (arms.every(isUnitType) && arms.length < 2) {
+    // The degenerate no-value generator (never yields, void return): the
+    // slot still needs a readable undefined — the unit-only union.
+    return { kind: "degenerate" };
+  }
+  arms.sort((a, b) => (typeKey(a) < typeKey(b) ? -1 : 1));
+  return { kind: "arms", arms };
+}
+
 /** The IteratorResult record of a generator's value channels: `{ done:
  * boolean, value: V }` where V is dyn (an any/unknown channel) or the
  * canonical union of the yield arms, the return arms (when the return
@@ -2683,44 +2736,14 @@ export function genResultRecord(
   shapes: ShapeRegistry,
   unions: UnionRegistry,
 ): (IrType & { kind: "record" }) | null {
-  let valueT: IrType;
-  if (yieldT.kind === "dyn" || retT.kind === "dyn") {
-    valueT = DYN;
-  } else {
-    const byKey = new Map<string, IrType>();
-    const add = (t: IrType): boolean => {
-      if (t.kind === "void") return true; // no value on this channel
-      if (t.kind === "union") {
-        for (const a of unions.get(t.unionId)?.arms ?? []) byKey.set(typeKey(a), a);
-        return true;
-      }
-      if (t.kind === "map" || t.kind === "regex" || t.kind === "jsval" || t.kind === "generator") {
-        return false; // no legal union arm exists for these kinds
-      }
-      byKey.set(typeKey(t), t);
-      return true;
-    };
-    if (!add(yieldT) || !add(retT)) return null;
-    byKey.set(typeKey(UNDEFINED_T), UNDEFINED_T);
-    const arms = [...byKey.values()];
-    // func/set arms are legal only beside unit arms (no narrowing test
-    // against data siblings — the union rule).
-    if (
-      arms.some(
-        (a) => (a.kind === "func" || a.kind === "set") && !arms.every((b) => b === a || isUnitType(b)),
-      )
-    ) {
-      return null;
-    }
-    if (arms.every(isUnitType) && arms.length < 2) {
-      // The degenerate no-value generator (never yields, void return):
-      // the slot still needs a readable undefined — the unit-only union.
-      valueT = unitOnlyUnion(unions);
-    } else {
-      arms.sort((a, b) => (typeKey(a) < typeKey(b) ? -1 : 1));
-      valueT = { kind: "union", unionId: unions.intern(arms) };
-    }
-  }
+  const result = computeGenResultArms(yieldT, retT, (id) => unions.get(id)?.arms ?? []);
+  if (result === null) return null;
+  const valueT: IrType =
+    result.kind === "dyn"
+      ? DYN
+      : result.kind === "degenerate"
+        ? unitOnlyUnion(unions)
+        : { kind: "union", unionId: unions.intern(result.arms) };
   return {
     kind: "record",
     // Storage order stays canonical (done < value, so the array below IS

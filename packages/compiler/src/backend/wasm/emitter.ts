@@ -59,6 +59,9 @@ import {
   isUnitType,
   typeEquals,
   typeKey,
+  DYN,
+  NULL_T,
+  UNDEFINED_T,
   RUNTIME_ERROR_CLASSES,
 } from "../../ir/nodes.js";
 import { computeMayThrow } from "../emission/may-throw.js";
@@ -118,7 +121,7 @@ import {
   RACEE_DST,
   RACEE_SRC,
 } from "./promises.js";
-import { GEN_DONE, type GenInfo, GeneratorBuilder, INJECT_GENRET } from "./generators.js";
+import { GEN_DONE, GEN_SUSPENDED, type GenInfo, GeneratorBuilder, INJECT_GENRET } from "./generators.js";
 import { StrBuilder } from "./strings.js";
 import { BytesBuilder, type BytesElem } from "./typedarrays.js";
 import { TimerBuilder } from "./timers.js";
@@ -1792,6 +1795,7 @@ class Assembler {
       dynRef: () => this.dyn.dynRef(),
       unionBaseRef: () => this.unions.baseRef(),
       mapTypeSoft: (t) => this.mapTypeSoft(t),
+      unionArms: (id) => this.unionDef(id).arms,
     });
     return this.gensField;
   }
@@ -1807,6 +1811,75 @@ class Assembler {
   private genInfoFor(t: IrType, loc: SrcLoc): GenInfo {
     if (t.kind !== "generator") throw new Error(`generator seam op with a non-generator type at ${loc.file}`);
     return this.gens.info(t);
+  }
+
+  /** Wrap a yieldT/retT-typed operand into $gen.out's V representation —
+   * `%gen.suspend`'s suspend value and `%gen.complete`'s return value
+   * share this exactly, both retagging the SAME field through the SAME
+   * rules. `value` is the RAW, un-retagged operand (`null` for a bare
+   * `yield;`/void return), normalized here to the undefined literal —
+   * the same "no operand to evaluate" shape `unionWrap`'s own unit-arm
+   * case documents. Leaves the wrapped value on the stack; never writes
+   * `out` itself (the two callers differ on what ELSE they write
+   * alongside it — suspend also sets state=SUSPENDED, complete also
+   * sets state=DONE — so this stays a pure "compute the value" step).
+   *
+   * Three shapes, in order: (1) `out` is dyn (either channel is dyn) —
+   * the operand rides through unchanged if it is already dyn-typed
+   * itself (the frontend already boxed it, coercing into a dyn-typed
+   * channel), otherwise a fresh `dynFrom` box, reusing the emitter's own
+   * scalar-boxing machinery rather than a second one. (2) the operand's
+   * own static type is ALREADY a union (a union-typed yieldT/retT, or a
+   * value the frontend coerced into one) — `unions.retag` re-wraps it
+   * from ITS tag scheme into V's, the one case that genuinely needs the
+   * dispatch helper (2014-generators-values.ts's `mixed(): Generator<
+   * number | string, void, unknown>` is the corpus witness). (3) a
+   * concrete arm — a plain tag lookup and an `armStruct` wrap, exactly
+   * `unionWrap`'s own shape, with `genKey` standing in for a `unionId`
+   * that only needs to be a stable STRING (unions.ts's own doc: struct
+   * types unify structurally, not nominally, so this never has to match
+   * whatever unionId genResultRecord minted for V at frontend time). */
+  private emitGenOutValue(value: WExpr | null, info: GenInfo, genKey: string, loc: SrcLoc): void {
+    const code = this.fn.code;
+    const v: WExpr = value ?? { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc };
+    const vt = v.type;
+
+    if (info.outArms.kind === "dyn") {
+      if (vt.kind === "dyn") {
+        this.walkExpr(v);
+      } else {
+        // The yield/return operand is always ordinary frontend-emitted
+        // IR (never one of this file's own %async./%gen. seam kinds) —
+        // the cast matches statemachine.ts's own widenExpr exactly, just
+        // inlined: this is the one place that node gets embedded inside
+        // an ordinary IrExpr (dynFrom) rather than walked directly.
+        this.walkExpr({ kind: "dynFrom", value: v as IrExpr, type: DYN, loc });
+      }
+      return;
+    }
+
+    const vArms: readonly IrType[] =
+      info.outArms.kind === "arms" ? info.outArms.arms : [NULL_T, UNDEFINED_T].sort((a, b) => (typeKey(a) < typeKey(b) ? -1 : 1));
+
+    if (vt.kind === "union") {
+      const fromArms = this.unionDef(vt.unionId).arms;
+      const toTag = (t: IrType): number => vArms.findIndex((a) => typeEquals(a, t));
+      const helper = this.unions.retag(vt.unionId, fromArms, genKey, toTag, (t) => this.mapTypeSoft(t));
+      this.walkExpr(v);
+      code.call(helper);
+      return;
+    }
+
+    const tag = vArms.findIndex((a) => typeEquals(a, vt));
+    if (tag < 0) throw new Error(`emitGenOutValue: no V arm for operand type ${vt.kind} at ${loc.file}`);
+    if (isUnitType(vt)) {
+      code.globalGet(this.unions.unitGlobal(tag));
+      return;
+    }
+    const st = this.unions.armStruct(genKey, tag, this.mapTypeSoft(vt));
+    code.i32Const(tag);
+    this.walkExpr(v);
+    code.structNew(st);
   }
 
   /* ── the top-level-await root (abi.ts's `_status`, SEMANTICS.md S010) ──
@@ -5485,21 +5558,49 @@ class Assembler {
         return;
       }
 
-      /* %gen.suspend / %gen.complete: the two ops that retag a raw
-       * yieldT/retT-typed value into $gen.out's V representation. Real
-       * emission needs V's tag scheme (which arm of the generator's
-       * IteratorResult union a concrete operand type lands on) resolved
-       * first — a correctness question, not a mechanical one: getting a
-       * tag wrong is a silent miscompile, never a loud refusal, so this
-       * stays deferred rather than guessed at. Refuses by name so the
-       * census keeps naming the right construct; currently unreachable
-       * regardless, since the whole-function fn:generator gate
-       * (walkFunction) still blocks every generator before its body is
-       * ever walked. */
-      case "%gen.suspend":
-      case "%gen.complete":
-        this.refuse(`stmt:${s.kind}`, s.loc);
+      /** A generator's suspend: retag `value` into $gen.out
+       * (emitGenOutValue — shared with %gen.complete, see its own doc
+       * comment) and set $gen.state = SUSPENDED, ATOMICALLY (one seam,
+       * not two writes — the design doc's own framing, mirrored from
+       * `%async.settle`'s "write the value, mark the channel settled"
+       * pairing). `genKey` is a stable per-triple string, never a
+       * unionId genResultRecord minted — unions.ts's own doc has the
+       * "structural, not nominal" reasoning for why that is safe. */
+      case "%gen.suspend": {
+        const info = this.genInfoFor(s.gen.type, s.loc);
+        const g = this.acquireScratch(this.gens.genRef(info));
+        this.walkExpr(s.gen);
+        code.localSet(g);
+        code.localGet(g);
+        this.emitGenOutValue(s.value, info, `gen.out:${typeKey(s.gen.type)}`, s.loc);
+        code.structSet(info.struct, info.idx.out);
+        code.localGet(g);
+        code.i32Const(GEN_SUSPENDED);
+        code.structSet(info.struct, info.idx.state);
+        this.releaseScratch(this.gens.genRef(info), g);
         return;
+      }
+
+      /** A generator's completion — `return v`'s rewrite target and the
+       * implicit `return;` a void-returning body falls off its end into.
+       * Same retag as `%gen.suspend` (emitGenOutValue), state=DONE
+       * instead of SUSPENDED, no re-entry to prepare for (DONE has
+       * nothing to restore — statemachine.ts's own doc comment on this
+       * op). */
+      case "%gen.complete": {
+        const info = this.genInfoFor(s.gen.type, s.loc);
+        const g = this.acquireScratch(this.gens.genRef(info));
+        this.walkExpr(s.gen);
+        code.localSet(g);
+        code.localGet(g);
+        this.emitGenOutValue(s.value, info, `gen.out:${typeKey(s.gen.type)}`, s.loc);
+        code.structSet(info.struct, info.idx.out);
+        code.localGet(g);
+        code.i32Const(GEN_DONE);
+        code.structSet(info.struct, info.idx.state);
+        this.releaseScratch(this.gens.genRef(info), g);
+        return;
+      }
 
       /** A generator re-entry's injection check (statemachine.ts's own
        * doc comment has the full design). GENRET carries no payload of

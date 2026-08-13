@@ -103,21 +103,25 @@
  * `completion()`/`fellThrough()`'s generator branches, `buildWrapper`'s
  * lazy generator branch, and `catchArm`'s genType branch (the GENRET
  * routing-table fork AND the catch-region sentinel prologue, stage A2c
- * slice 3) are ALL BUILT at the PASS level now — every generator-shaped
- * IR this pass can produce is correct IR, not merely IR that survives
- * until some later step notices it is wrong. `run()` still declines
- * every generator outright regardless (its own guard comment has the
- * full story): building correct LOWERED IR is not the same as EMITTING
- * it, and the ONE thing left before `run()` can stop declining is the
- * emitter — it has to implement `%gen.suspend`/`%gen.sent`/
- * `%gen.injectCheck`/`%gen.complete`/`%gen.markDone`/`%gen.retPark`/
- * `%gen.excIsGenret`/`%gen.new` for real (currently eight refusal arms,
- * `stmt:%gen.*`/`expr:%gen.*`) before generator bodies can pass survey
- * clean — independent again from genResume's CONSUMER-side emission (the
- * state ladder), which is stage A3, not this. Gate-widening (below) is
- * deliberately the LAST of all of this: it happens once the emitter can
- * accept what the pass produces AND `run()` can stop declining, together,
- * never one without the other.
+ * slice 3) are ALL BUILT at the PASS level — every generator-shaped IR
+ * this pass can produce is correct IR, not merely IR that survives until
+ * some later step notices it is wrong. The EMITTER side is ALSO done now
+ * (stage A2c slice 4, in two parts: 4a's six plain field reads/writes,
+ * then 4b's `%gen.suspend`/`%gen.complete` — the two that retag a raw
+ * yieldT/retT-typed value into `$gen.out`'s V representation, built on
+ * `emitGenOutValue` and a new `UnionBuilder.retag` dispatch helper,
+ * mirroring `truthy`/`eq`/`toStr`'s existing pattern) — all eight
+ * `%gen.*` seam kinds have real implementations; none refuse by name
+ * anymore. `run()` STILL declines every generator outright regardless
+ * (its own guard comment has the full story, not yet updated to match —
+ * see that comment before trusting this paragraph over it): gate-
+ * widening is a DELIBERATE, SEPARATE decision with its own behavioral
+ * bar (Node-diffed wrapper laziness, generator identity, a census
+ * expectation, deferral language in both the commit message and this
+ * file's tests) — not something that flips as a side effect of the
+ * emitter catching up. Both preconditions the design doc names (a
+ * correct pass, an accepting emitter) are now true; lifting the guard is
+ * its own slice, done deliberately, never implicitly.
  *
  * ONE RESUME SIGNATURE. Resume takes `%frameBase` — an empty OPEN struct
  * every concrete frame subtypes — and casts it down to its own shape in a
@@ -1325,28 +1329,25 @@ export class FunctionLowering {
   }
 
   run(): { wrapper: WFunction; resume: WFunction; frame: IrRecordShape } {
-    // GUARD, not documentation (the A2b gate's F2 finding, still load-
-    // bearing after A2c slice 3): buildWrapper and catchArm (reached
-    // through buildResume) BOTH have their genType branches now — neither
-    // constructs invalid IR for a generator anymore, which is what made
-    // this guard necessary through A2c slices 1 and 2. What still blocks
-    // is ONE step further down: the emitter refuses every `%gen.*` seam
-    // kind by name (stmt:%gen.suspend/injectCheck/complete/markDone,
-    // expr:%gen.sent/new/retPark/excIsGenret) — real emission is
-    // unbuilt, so a generator body that reached the emitter today would
-    // survey clean as SHAPE but refuse on every seam op it actually
-    // contains. Lifting this guard before those exist would trade one
-    // failure mode for a worse one: instead of a single named
-    // `fn:async:generator-wrapper-not-built` refusal at the function
-    // boundary, callers would see the FIRST seam op inside the body
-    // refuse instead — technically still loud, never a miscompile, but
-    // the wrong granularity (a per-construct refusal standing in for a
-    // whole-function one) and a worse tier count in the meantime (the
-    // fn:generator bucket would fragment into partial per-body refusals
-    // rather than staying one clean bucket until the whole thing is
-    // ready). runFrameAndStatesForTest()/buildWrapperForTest()/
-    // buildResumeForTest() below are the narrower surfaces the pass-level
-    // tests use instead, structurally incapable of reaching this guard.
+    // GUARD, not documentation (the A2b gate's F2 finding). STATUS as of
+    // A2c slice 4b: both preconditions this guard used to name are now
+    // satisfied — buildWrapper/catchArm build correct IR (slices 1-3),
+    // and the emitter accepts every `%gen.*` seam kind for real (slice
+    // 4a's six plain field reads/writes, slice 4b's %gen.suspend/
+    // %gen.complete retag emission — see the header's BUILD STATUS
+    // paragraph). The guard STAYS UP anyway: gate-widening (the early
+    // return and per-function skip below) is a DELIBERATE, SEPARATE
+    // decision carrying its own behavioral bar — Node-diffed wrapper
+    // laziness, a generator identity check, a census expectation (tier
+    // holding with fn:generator's 12 programs relocating to
+    // expr:genResume, set-checked), and deferral language in both that
+    // slice's commit message and this file's tests (genResume's
+    // CONSUMER-side state ladder is stage A3, independent of everything
+    // built so far) — never something that flips as a side effect of an
+    // earlier slice finishing. runFrameAndStatesForTest()/
+    // buildWrapperForTest()/buildResumeForTest() below are the narrower
+    // surfaces the pass-level tests use instead, structurally incapable
+    // of reaching this guard.
     if (this.genType !== null) this.decline("fn:async:generator-wrapper-not-built");
 
     this.checkEligible();

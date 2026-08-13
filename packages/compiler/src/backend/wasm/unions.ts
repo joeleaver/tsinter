@@ -27,6 +27,7 @@
  * refuses; refusals for arms a helper genuinely must read stay at the
  * emitter where the census lives. */
 import { Code } from "./code.js";
+import { isUnitType, type IrType } from "../../ir/nodes.js";
 import { F64, I32, type FieldType, ModuleBuilder, type ValType } from "./module.js";
 
 /** One arm as a helper needs it: the KIND decides the dispatch answer,
@@ -140,8 +141,13 @@ export class UnionBuilder {
 
   /** Emits the per-arm dispatch skeleton shared by every helper: tag into
    * a local, one `if (tag == i) { ...; return }` per arm, and the
-   * corrupted-tag trap after the last (C's scr_trap default). */
-  private dispatch(c: Code, tagLocal: number, arms: UnionArmRep[], arm: (rep: UnionArmRep, i: number) => void): void {
+   * corrupted-tag trap after the last (C's scr_trap default). Generic
+   * over what per-arm DATA the caller carries (`UnionArmRep` for
+   * truthy/eq/toStr, a raw `IrType` for `retag` — this method never
+   * inspects `rep` itself, only threads it through to `arm`, so widening
+   * it past `UnionArmRep` is a pure type-level change, no behavior
+   * differs for the three existing callers). */
+  private dispatch<T>(c: Code, tagLocal: number, arms: readonly T[], arm: (rep: T, i: number) => void): void {
     c.localGet(0);
     c.structGet(this.base(), TAG);
     c.localSet(tagLocal);
@@ -346,6 +352,63 @@ export class UnionBuilder {
           case "ref":
             throw new Error("ToString over a ref union arm (frontend fence breached)");
         }
+      });
+      this.mb.setBody(idx, [I32], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.u.retag:<fromKey>-><toKey> — re-wrap a value of the FROM union
+   * into the TO union: same runtime family (every union shares this ONE
+   * base struct), so this is purely a re-TAG, never a value conversion —
+   * the payload itself passes through unchanged, only its wrapper's tag
+   * (and hence which arm-struct subtype it is) changes. `fromArms` is
+   * the FROM union's REAL arm list, in the SAME canonical order it was
+   * interned with (a compiled module's `unionDef(id).arms` already is —
+   * nothing here re-sorts); `toTag` is the caller's own lookup (typically
+   * `typeEquals` against the TO union's arms) from an arm's IrType to its
+   * position in the TO union — this method never assumes anything about
+   * that mapping beyond "it exists," so a caller whose TO union does not
+   * actually cover every FROM arm gets a thrown bug, not a silent
+   * mistag. Increment 19's own caller (generators.ts's
+   * %gen.suspend/%gen.complete, retagging a yieldT/retT-declared union
+   * operand into $gen.out's V) is the first, but nothing here is
+   * generator-specific. */
+  retag(
+    fromKey: string,
+    fromArms: readonly IrType[],
+    toKey: string,
+    toTag: (armType: IrType) => number,
+    mapTypeSoft: (t: IrType) => ValType,
+  ): number {
+    return this.cached(`retag:${fromKey}->${toKey}`, () => {
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.baseRef()], [this.baseRef()]),
+        `%w.u.retag:${fromKey}->${toKey}`,
+      );
+      const c = new Code();
+      const TAGL = 1;
+      this.dispatch(c, TAGL, fromArms, (armType, i) => {
+        const tTag = toTag(armType);
+        if (tTag < 0) {
+          throw new Error(`retag:${fromKey}->${toKey}: no TO arm for FROM arm ${i} (${armType.kind})`);
+        }
+        if (isUnitType(armType)) {
+          // No payload to move — the immortal instance for the TARGET
+          // tag IS the whole value, exactly like unionWrap's own unit
+          // path (statemachine's %gen.* seam ops never invent a second
+          // way to spell "wrap a unit arm").
+          c.globalGet(this.unitGlobal(tTag));
+          return;
+        }
+        const payload = mapTypeSoft(armType);
+        const fromStruct = this.armStruct(fromKey, i, payload);
+        const toStruct = this.armStruct(toKey, tTag, payload);
+        c.i32Const(tTag);
+        c.localGet(0);
+        c.refCast(fromStruct);
+        c.structGet(fromStruct, PAYLOAD);
+        c.structNew(toStruct);
       });
       this.mb.setBody(idx, [I32], c.bytes());
       return idx;
