@@ -129,6 +129,7 @@ import {
   GeneratorBuilder,
   INJECT_GENRET,
   INJECT_NEXT,
+  INJECT_THROW,
 } from "./generators.js";
 import { StrBuilder } from "./strings.js";
 import { BytesBuilder, type BytesElem } from "./typedarrays.js";
@@ -9289,10 +9290,8 @@ class Assembler {
         return;
       }
 
-      /** `.next(v)`/`.return(v)`/`.throw(e)` — genResume, stage A3.
-       * "next" and "return" are real emission; "throw" still refuses
-       * under its own name (`expr:genResume:throw`) until it lands — the
-       * state ladder is built mode by mode, never one big step, matching
+      /** `.next(v)`/`.return(v)`/`.throw(e)` — genResume, stage A3. All
+       * three modes are real emission now, built mode by mode, matching
        * every other stage of this increment. `.return()` is NOT an
        * optional extra alongside `.next()`: `for (const x of gen)`'s own
        * desugar (lower-generators.ts's `lowerForOfGenerator`) ALWAYS
@@ -9312,9 +9311,9 @@ class Assembler {
        * genResume's own call site, the caller's own exception cell,
        * never touching resume.
        *
-       * Both modes share the SAME shape: a FAST PATH answering directly
-       * without ever touching resume, and a RESUMING PATH that prepares
-       * $gen's fields, calls resume, and builds the result from
+       * All three modes share the SAME shape: a FAST PATH answering
+       * directly without ever touching resume, and a RESUMING PATH that
+       * prepares $gen's fields, calls resume, and builds the result from
        * whatever resume just left in `$gen.state`/`$gen.out` —
        * `emitResumeCallAndResult` below, the ONE construction site for
        * that tail (call through the stored closure — `callValue`'s own
@@ -9352,16 +9351,30 @@ class Assembler {
        * resume can only ever end in DONE in today's tier — the "a
        * finally yielded, state stays SUSPENDED" corner the design doc
        * names is provably unreachable until stage B exists, so this
-       * slice does not special-case it. */
+       * slice does not special-case it.
+       *
+       * "throw(e)": the frontend (lowerGenMethodCall, SC1071/SC1090)
+       * already guarantees `arg` is non-null and one of f64/bool/string/
+       * object — never dyn/void/caught/unit — so this reuses
+       * `emitThrowValue` VERBATIM, the exact write-side an ordinary
+       * `throw` statement already calls; no new cell-filling logic here.
+       * DONE OR UNSTARTED is the fast path — Node-probed: the body is
+       * NEVER entered, the caller's value rethrows AT genResume's OWN
+       * call site (exactly like a plain `throw e;`), and the generator
+       * becomes/stays DONE (the same idempotent-on-DONE shape "return"'s
+       * fast path already has). SUSPENDED fills the SAME exception cell
+       * ordinary throws use, inject=THROW, then resume — the body's own
+       * try/catch may take it and continue (Node-probed: the caught
+       * value is the real thrown value, never some GENRET-shaped
+       * wrapper, since `emitThrowValue` writes a real EXC_* kind), or an
+       * uncaught injection propagates out through the SAME
+       * `emitPendingCheck` `emitResumeCallAndResult` already calls
+       * unconditionally — no throw-specific branch needed in the shared
+       * tail, the same as GENRET needed none. */
       case "genResume": {
         if (e.type.kind !== "record") throw new Error("genResume with a non-record type");
         const recInfo = this.recordInfo(e.type.shapeId, e.loc, false);
         if (recInfo === null) {
-          code.unreachable();
-          return;
-        }
-        if (e.mode !== "next" && e.mode !== "return") {
-          this.refuse(`expr:genResume:${e.mode}`, e.loc);
           code.unreachable();
           return;
         }
@@ -9421,7 +9434,7 @@ class Assembler {
           code.structSet(info.struct, info.idx.inject);
           this.emitResumeCallAndResult(g, info, recInfo);
           this.close();
-        } else {
+        } else if (e.mode === "return") {
           // The fast path is "not SUSPENDED" — UNSTARTED or DONE, the
           // only two states left once the reentrancy check above has
           // already ruled out RUNNING.
@@ -9467,6 +9480,48 @@ class Assembler {
           code.structSet(info.struct, info.idx.inject);
           this.emitResumeCallAndResult(g, info, recInfo);
           this.close();
+        } else {
+          // e.mode === "throw" (TS narrows the exhaustive 3-way union).
+          // The frontend (lowerGenMethodCall, SC1071) never lets a
+          // throw-mode node reach here with a null arg — asserted, not
+          // silently trusted.
+          if (e.arg === null) {
+            throw new Error("genResume throw mode: arg is null (frontend must always supply one — SC1071)");
+          }
+          const arg = e.arg;
+
+          // The fast path is "not SUSPENDED" — UNSTARTED or DONE, the
+          // same two states "return"'s own fast path answers directly.
+          // Node-probed: the body is NEVER entered; the caller's value
+          // rethrows AT genResume's OWN call site, exactly like a plain
+          // `throw e;` statement, and the generator becomes/stays DONE
+          // (idempotent on an already-DONE generator).
+          code.localGet(g);
+          code.structGet(info.struct, info.idx.state);
+          code.i32Const(GEN_SUSPENDED);
+          code.i32Ne();
+          this.openIf();
+          code.localGet(g);
+          code.i32Const(GEN_DONE);
+          code.structSet(info.struct, info.idx.state);
+          this.emitThrowValue(arg);
+          this.emitUnwind();
+          this.close();
+
+          // SUSPENDED: fill the SAME exception cell an ordinary `throw`
+          // statement fills (emitThrowValue — the identical write side),
+          // then resume through the shared tail. Whether the body's own
+          // try/catch takes it and continues, or it propagates out
+          // uncaught, needs no throw-specific branch here — an injected
+          // throw and an ordinary body throw are indistinguishable once
+          // the cell is filled (emitResumeCallAndResult's own
+          // unconditional emitPendingCheck already carries the uncaught
+          // case, the same as every other may-throw call site).
+          this.emitThrowValue(arg);
+          code.localGet(g);
+          code.i32Const(INJECT_THROW);
+          code.structSet(info.struct, info.idx.inject);
+          this.emitResumeCallAndResult(g, info, recInfo);
         }
         this.releaseScratch(genRefT, g);
         return;
@@ -9486,9 +9541,8 @@ class Assembler {
        * accepted — it is what the pass consumes; one that survives
        * belongs to a REFUSED async function and reports as `fn:async`
        * before its body is walked (same for awaitExpr/awaitUnionExpr).
-       * genResume (stage A3) has its own case below now — "next" mode is
-       * real emission; "return"/"throw" still refuse by their OWN names
-       * until they land. */
+       * genResume (stage A3) has its own case below now — all three
+       * modes (next/return/throw) are real emission. */
       case "yieldExpr":
       case "awaitExpr":
       case "awaitUnionExpr":

@@ -6703,21 +6703,23 @@ test("union: `Buffer | string`.toString() — the bytes arm decodes UTF-8 throug
   expect(stdout.toString("utf8")).toBe(["✓", "plain", '""', '""', ""].join("\n"));
 });
 
-/* ── Increment 19 stage A3: genResume's "next"/"return" state ladder ──
+/* ── Increment 19 stage A3: genResume's next/return/throw state ladder ──
  * The differential census is the real behavioral bar (six corpus programs
  * — 2010/2015/2016/2017/2018/2457 — now byte-diff clean against Node
- * through the FULL for-of, yield-star, and async-composition surface).
- * These two tests pin two ladder corners no corpus program happens to
- * exercise:
- * reentrancy (a generator resuming ITSELF mid-body) and `.return()`'s
- * exact-value round-trip on UNSTARTED/DONE (never a stale `$gen.out`).
+ * through the FULL for-of, yield-star, and async-composition surface;
+ * separately, 2013 confirms the shared hoister entry — see A3-2). No
+ * corpus program calls `.throw()` outside a finally-gated one (stage B),
+ * so its census effect is nil today — these tests carry the weight for
+ * it, pinning ladder corners no corpus program happens to exercise:
+ * reentrancy (a generator resuming ITSELF mid-body, all three modes now
+ * that all three are built), `.return()`'s exact-value round-trip on
+ * UNSTARTED/DONE (never a stale `$gen.out`), and `.throw()`'s own four
+ * corners (UNSTARTED, DONE, SUSPENDED-caught, SUSPENDED-uncaught).
  * Expected strings are Node-measured directly (`node
  * --experimental-transform-types`) against the identical source below —
- * see inc19-probes/probe-a3-reentrancy.ts and
- * probe-a3-return-fastpath.ts. `.throw()` mode is unbuilt (still refuses
- * under `expr:genResume:throw`), so reentrancy is only exercised through
- * the two modes that exist. */
-test("genResume (A3): reentrancy throws Node's exact TypeError, both built modes", async () => {
+ * see inc19-probes/probe-a3-reentrancy.ts, probe-a3-return-fastpath.ts,
+ * and probe-a3-3-throw.ts. */
+test("genResume (A3): reentrancy throws Node's exact TypeError, all three modes", async () => {
   // `self` stays a bare (never-null) Generator binding — a `Generator |
   // null` union has no compiled home yet (a real, separate, pre-existing
   // gap: union arms don't support generator types), unrelated to A3
@@ -6743,6 +6745,12 @@ test("genResume (A3): reentrancy throws Node's exact TypeError, both built modes
       '    if (e instanceof TypeError) console.log("reentrant-return", e.name + ": " + e.message);',
       '    else console.log("reentrant-return wrong-kind");',
       "  }",
+      "  try {",
+      '    self.throw(new Error("x"));',
+      "  } catch (e) {",
+      '    if (e instanceof TypeError) console.log("reentrant-throw", e.name + ": " + e.message);',
+      '    else console.log("reentrant-throw wrong-kind");',
+      "  }",
       "  yield 1;",
       '  return "done";',
       "}",
@@ -6758,6 +6766,7 @@ test("genResume (A3): reentrancy throws Node's exact TypeError, both built modes
     [
       "reentrant-next TypeError: Generator is already running",
       "reentrant-return TypeError: Generator is already running",
+      "reentrant-throw TypeError: Generator is already running",
       "",
     ].join("\n"),
   );
@@ -6795,6 +6804,119 @@ test("genResume (A3): .return()'s value round-trips verbatim on UNSTARTED and DO
   // return), .return("R2") answers the NEW argument, not the "ret" the
   // body itself returned.
   expect(stdout.toString("utf8")).toBe(["true R", "true undefined", "true R2", ""].join("\n"));
+});
+
+test("genResume (A3): .throw() on UNSTARTED and DONE rethrows verbatim at the call site, body never entered, marks/keeps DONE", async () => {
+  const res = await buildWasm(
+    "gen-throw-fastpath.ts",
+    [
+      "function show(label: string, f: () => unknown): void {",
+      "  try {",
+      "    console.log(label, JSON.stringify(f()));",
+      "  } catch (e) {",
+      '    if (e instanceof Error) console.log(label, "THREW", e.name + ": " + e.message);',
+      '    else console.log(label, "THREW wrong-kind");',
+      "  }",
+      "}",
+      "function* g(): Generator<number, string, unknown> {",
+      '  console.log("body-entered (SHOULD NOT PRINT)");',
+      "  yield 1;",
+      '  return "ret";',
+      "}",
+      "const it = g();",
+      'show("unstarted-throw", () => it.throw(new Error("boom")));',
+      'show("unstarted-after", () => it.next());',
+      "",
+      "function* g2(): Generator<number, string, unknown> {",
+      "  yield 1;",
+      '  return "ret";',
+      "}",
+      "const it2 = g2();",
+      "it2.next();",
+      "it2.next(); // DONE",
+      'show("done-throw", () => it2.throw(new Error("post-done")));',
+      'show("done-after", () => it2.next());',
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  // Node-measured (probe-a3-3-throw.ts): body-entered never prints, the
+  // exact Error rethrows at the call site both times, and .next()
+  // afterward reports done:true in both cases (the DONE case is
+  // idempotent — .throw() on an already-DONE generator just rethrows,
+  // it does not "fail" or leave the generator in some other state).
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "unstarted-throw THREW Error: boom",
+      "unstarted-after {\"done\":true}",
+      "done-throw THREW Error: post-done",
+      "done-after {\"done\":true}",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("genResume (A3): .throw() on SUSPENDED — the body's own catch takes it and continues, or an uncaught injection propagates and marks DONE", async () => {
+  const res = await buildWasm(
+    "gen-throw-suspended.ts",
+    [
+      "function show(label: string, f: () => unknown): void {",
+      "  try {",
+      "    console.log(label, JSON.stringify(f()));",
+      "  } catch (e) {",
+      '    if (e instanceof Error) console.log(label, "THREW", e.name + ": " + e.message);',
+      '    else console.log(label, "THREW wrong-kind");',
+      "  }",
+      "}",
+      "function* g(): Generator<string, string, unknown> {",
+      "  try {",
+      '    yield "body";',
+      "  } catch (e) {",
+      '    const caught = yield "caught:" + (e as Error).message;',
+      '    console.log("sent-after-catch", JSON.stringify(caught));',
+      "  }",
+      '  return "normal-end";',
+      "}",
+      "const it = g();",
+      'show("caught-next", () => it.next());',
+      'show("caught-throw", () => it.throw(new Error("inj")));',
+      'show("caught-resume", () => it.next("SENT"));',
+      "",
+      "function* g2(): Generator<number, string, unknown> {",
+      "  yield 1;",
+      '  return "normal-end";',
+      "}",
+      "const it2 = g2();",
+      'show("uncaught-next", () => it2.next());',
+      'show("uncaught-throw", () => it2.throw(new Error("uncaught-boom")));',
+      'show("uncaught-after", () => it2.next());',
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  // Node-measured (probe-a3-3-throw.ts). The injected error's message
+  // ("inj") reaches the body's own `catch (e)` as the REAL error, not a
+  // GENRET-shaped wrapper (emitThrowValue writes a real EXC_* kind) — the
+  // body resumes past the catch and yields again. The second generator's
+  // injection has no surrounding try/catch, so it propagates straight
+  // through .throw()'s own call site (the SAME emitPendingCheck every
+  // other may-throw call site already gets) and marks the generator DONE.
+  expect(stdout.toString("utf8")).toBe(
+    [
+      'caught-next {"value":"body","done":false}',
+      'caught-throw {"value":"caught:inj","done":false}',
+      'sent-after-catch "SENT"',
+      'caught-resume {"value":"normal-end","done":true}',
+      'uncaught-next {"value":1,"done":false}',
+      "uncaught-throw THREW Error: uncaught-boom",
+      'uncaught-after {"done":true}',
+      "",
+    ].join("\n"),
+  );
 });
 
 test("insp.buffer: the STATIC-typed-Buffer path (console.log of a real, non-dyn Buffer) — the 49/50/51/52 INSPECT_MAX_BYTES truncation seam pinned directly against Node (corpus 1635 covers 50/51/52/200 differentially; this adds 49, one below the boundary, with all four side by side), plus an explicit cross-check that this NEW call site's `bufferForm()` reuse is byte-identical to the dyn walker's EXISTING isBuffer=true consumer (wasm-bytes-flag.test.ts's own '<Buffer 01 02 03>' assertion for the SAME [1,2,3] content) — not merely inferred across files", async () => {
