@@ -10,7 +10,8 @@
  * wrong arm-struct gets read back downstream), never a validation failure,
  * so "WebAssembly.validate passes" alone is not enough — this file also
  * calls the retag helper through a real WebAssembly.instantiate and reads
- * BOTH the resulting tag and the payload back, for every FROM arm. */
+ * the resulting tag back for every FROM arm (and the payload too, for
+ * the two that carry one — a unit arm has none to check, by design). */
 import { expect, test } from "vitest";
 import { Code } from "../src/backend/wasm/code.js";
 import { F64, I32, ModuleBuilder, type ValType } from "../src/backend/wasm/module.js";
@@ -45,15 +46,24 @@ test("unions.ts: retag re-tags every FROM arm into its TO position, tag AND payl
     },
   });
 
-  // FROM union: [f64, bool] — structurally the SAME shape as 2014-
-  // generators-values.ts's mixed(): Generator<number | string, void,
+  // FROM union: [f64, bool, undefined] — structurally the SAME shape as
+  // 2014-generators-values.ts's mixed(): Generator<number | string, void,
   // unknown> yield channel (two payload-carrying arms, each its own wasm
-  // VALUE TYPE), with bool substituted for string to skip unrelated
+  // VALUE TYPE, plus the unconditional undefined arm every generator
+  // channel gets), with bool substituted for string to skip unrelated
   // string-type scaffolding — the mechanism under test (dispatch, extract,
-  // re-wrap) does not care which concrete arm kinds it moves.
-  const fromArms: IrType[] = [F64_T, BOOL_T];
-  // TO union (V): [f64, bool, undefined] — the retT=void channel's
-  // unconditional undefined arm, exactly genResultRecord's own rule.
+  // re-wrap) does not care which concrete arm kinds it moves. The
+  // undefined arm exercises retag's OWN unit-arm branch (unions.ts's own
+  // "no payload to move" case) — otherwise unmeasured by any test, and
+  // the one path a degenerate (all-unit) V, stage B's own territory,
+  // leans on entirely.
+  const fromArms: IrType[] = [F64_T, BOOL_T, UNDEFINED_T];
+  // TO union (V): same three arms, same order — a real V for THIS
+  // channel pair would coincide with fromArms exactly (retT is void here,
+  // contributing nothing beyond the unconditional undefined arm already
+  // present), which is what makes this scenario realistic rather than
+  // synthetic; the mechanism does not require FROM and TO to agree, but
+  // this specific shape's DOES.
   const toArms: IrType[] = [F64_T, BOOL_T, UNDEFINED_T];
   const toTag = (t: IrType): number => toArms.findIndex((a) => a.kind === t.kind);
   const mapTypeSoft = (t: IrType): ValType => (t.kind === "f64" ? F64 : I32);
@@ -106,6 +116,18 @@ test("unions.ts: retag re-tags every FROM arm into its TO position, tag AND payl
     c.refCast(toBoolStruct);
     c.structGet(toBoolStruct, 1);
   });
+  // FROM tag 2 (undefined, no payload) -> retag -> read the TO tag. A
+  // unit arm's FROM value is just the shared base's own immortal
+  // instance for that tag (unitGlobal is keyed by TAG alone, never by
+  // union identity — unions.ts's own header: "the intern is per TAG, not
+  // per union" — so there is no FROM-specific struct to build here,
+  // unlike the payload-carrying arms above). This is retag's unit-arm
+  // branch (unions.ts:396) exercised for the first time by any test.
+  wrapperFn("test_undef_tag", I32, (c) => {
+    c.globalGet(unions.unitGlobal(2));
+    c.call(retagIdx);
+    c.structGet(unions.base(), 0);
+  });
 
   const bytes = mb.emit();
   expect(WebAssembly.validate(bytes)).toBe(true);
@@ -117,6 +139,7 @@ test("unions.ts: retag re-tags every FROM arm into its TO position, tag AND payl
   // computeGenResultArms, covered separately in wasm-statemachine.test.ts).
   expect((instance.exports["test_f64_tag"] as () => number)()).toBe(0);
   expect((instance.exports["test_bool_tag"] as () => number)()).toBe(1);
+  expect((instance.exports["test_undef_tag"] as () => number)()).toBe(2);
   // PAYLOAD: the value itself survives the re-wrap unchanged — the
   // silent-miscompile risk this file exists to rule out is a WRONG TAG,
   // not a corrupted payload, but pinning both leaves no gap.

@@ -99,29 +99,33 @@
  *
  * BUILD STATUS, checked against the code below rather than assumed (the
  * stale-header lesson): the frame's `%gen` field, the yield-site
- * suspend/resume split (`lowerSuspension`'s "yield" case),
- * `completion()`/`fellThrough()`'s generator branches, `buildWrapper`'s
- * lazy generator branch, and `catchArm`'s genType branch (the GENRET
- * routing-table fork AND the catch-region sentinel prologue, stage A2c
- * slice 3) are ALL BUILT at the PASS level — every generator-shaped IR
- * this pass can produce is correct IR, not merely IR that survives until
- * some later step notices it is wrong. The EMITTER side is ALSO done now
- * (stage A2c slice 4, in two parts: 4a's six plain field reads/writes,
- * then 4b's `%gen.suspend`/`%gen.complete` — the two that retag a raw
- * yieldT/retT-typed value into `$gen.out`'s V representation, built on
- * `emitGenOutValue` and a new `UnionBuilder.retag` dispatch helper,
- * mirroring `truthy`/`eq`/`toStr`'s existing pattern) — all eight
- * `%gen.*` seam kinds have real implementations; none refuse by name
- * anymore. `run()` STILL declines every generator outright regardless
- * (its own guard comment has the full story, not yet updated to match —
- * see that comment before trusting this paragraph over it): gate-
- * widening is a DELIBERATE, SEPARATE decision with its own behavioral
- * bar (Node-diffed wrapper laziness, generator identity, a census
- * expectation, deferral language in both the commit message and this
- * file's tests) — not something that flips as a side effect of the
- * emitter catching up. Both preconditions the design doc names (a
- * correct pass, an accepting emitter) are now true; lifting the guard is
- * its own slice, done deliberately, never implicitly.
+ * suspend/resume split, `completion()`/`fellThrough()`'s generator
+ * branches, `buildWrapper`'s lazy generator branch, `catchArm`'s genType
+ * branch (the GENRET routing-table fork AND the catch-region sentinel
+ * prologue), and all eight `%gen.*` seam kinds' real emitter
+ * implementations (`emitGenOutValue` and `UnionBuilder.retag` for the
+ * two that need a real value-into-V retag) are ALL BUILT — stage A2c is
+ * complete, both the pass and the emitter. `run()`'s guard is LIFTED
+ * (A2c slice 5, `lowerResumableFunctions`' gate widened to match): a
+ * real generator function now runs through this class for real.
+ *
+ * WHAT THAT DOES AND DOES NOT MEAN, stated exactly once here and
+ * matched verbatim at the guard's own former site: GENERATOR BODIES
+ * COMPILE AND THE WRAPPER IS LAZY. Generators do NOT WORK on this
+ * backend yet — genResume's CONSUMER-side state ladder (`.next()`/
+ * `.return()`/`.throw()`, stage A3) is wholly unbuilt, so nothing a
+ * generator body does once resumed is exercised by any compiled user
+ * program; `genResume`/`yieldExpr` still refuse by name at the emitter
+ * (expr:genResume, the pass's own consumer of yieldExpr never survives
+ * to be walked), which is what keeps `fn:generator`'s corpus programs
+ * from silently miscompiling — they relocate to `expr:genResume`
+ * instead, refusing at the correct, narrower point. AND yields in
+ * unhoistable/finalizer/switch/forof positions decline under NAMED
+ * `fn:generator:*` refusals (`linearizationRefusal` below) until their
+ * OWN machinery lands — stage B for finalizers, an optional switch-
+ * linearization lift, forOf-over-array — never under the `fn:async:*`
+ * names the shared hoisting/position-checking machinery would otherwise
+ * report, which would misname a construct with no `await` in it at all.
  *
  * ONE RESUME SIGNATURE. Resume takes `%frameBase` — an empty OPEN struct
  * every concrete frame subtypes — and casts it down to its own shape in a
@@ -378,29 +382,42 @@
  *     its dependency operand, never the wait itself. The frontend emits
  *     exactly the statement shape, and the two names are kept apart so
  *     the census keeps naming the construct that actually needs work.
- *   - `fn:async:await-in-finally` — a suspension anywhere inside a
- *     try/catch/FINALLY. A finalizer takes part in COMPLETION: a return, a
- *     break and plain fallthrough each have to run it before they leave,
- *     which the emitter does with three copies of the body and a
- *     pending-return path (finallyStack) — and across a suspension those
- *     copies are states that have to re-dispatch to different places
- *     depending on why the region was left. Real machinery, and its own
- *     stage; a plain try/catch needs none of it, which is why the two are
- *     told apart by name.
- *   - `fn:async:await-position` — an await in a slot the hoisting rewrite
- *     cannot move it out of: a loop or for header (hoisting would
- *     evaluate once what the loop evaluates per iteration), a statement
- *     kind whose operand order this pass has no contract for, or an
- *     expression kind absent from HOIST_SLOTS. Ordinary operand
- *     positions no longer refuse — they hoist (see ORDER-PRESERVING
- *     HOISTING above).
- *   - `fn:async:await-conditional` — an await under an operator that may
- *     not evaluate it: the right side of `&&`/`||`/`??`, a ternary arm,
- *     an optChain continuation, an orDefault default. A temp ahead of the
- *     statement would evaluate it unconditionally, so this is the one
- *     position where hoisting is a MISCOMPILE rather than a cost; making
- *     it a name of its own is what lets the census measure the
- *     conditional-await shapes on their own.
+ *   - `fn:async:await-in-finally` (generator: `fn:generator:yield-in-
+ *     finally`) — a suspension anywhere inside a try/catch/FINALLY. A
+ *     finalizer takes part in COMPLETION: a return, a break and plain
+ *     fallthrough each have to run it before they leave, which the
+ *     emitter does with three copies of the body and a pending-return
+ *     path (finallyStack) — and across a suspension those copies are
+ *     states that have to re-dispatch to different places depending on
+ *     why the region was left. Real machinery, and its own stage; a
+ *     plain try/catch needs none of it, which is why the two are told
+ *     apart by name.
+ *   - `fn:async:await-position` (generator: `fn:generator:yield-
+ *     position`) — an await in a slot the hoisting rewrite cannot move
+ *     it out of: a loop or for header (hoisting would evaluate once
+ *     what the loop evaluates per iteration), a statement kind whose
+ *     operand order this pass has no contract for, or an expression
+ *     kind absent from HOIST_SLOTS. Ordinary operand positions no
+ *     longer refuse — they hoist (see ORDER-PRESERVING HOISTING above).
+ *   - `fn:async:await-conditional` (generator: `fn:generator:yield-
+ *     conditional`) — an await under an operator that may not evaluate
+ *     it: the right side of `&&`/`||`/`??`, a ternary arm, an optChain
+ *     continuation, an orDefault default. A temp ahead of the statement
+ *     would evaluate it unconditionally, so this is the one position
+ *     where hoisting is a MISCOMPILE rather than a cost; making it a
+ *     name of its own is what lets the census measure the conditional-
+ *     await shapes on their own.
+ *
+ *   The four entries above FORK their census name on genType
+ *   (`linearizationRefusal`, A2c slice 5): the underlying hoisting/
+ *   position-checking machinery is fully shared between await and
+ *   yield, but a generator body containing no `await` at all reported
+ *   under an `fn:async:*` name would mislead a census reader — the
+ *   design doc's own "mirrored names" requirement, unobservable before
+ *   gate-widening (no generator ever reached these sites until then).
+ *   `fn:async:module-await-position`, above, stays UNFORKED on purpose:
+ *   `module.await` is frontend-fenced to async module initializers and
+ *   can never appear in a generator body.
  *   - `fn:async:hoist-void` — a hoist whose temp would be void-typed: the
  *     frame has no slot for one, and the operand position it came from
  *     still needs SOME expression back. The reachable shape is a recordLit
@@ -417,10 +434,12 @@
  *     extra microtask turns), and this tier has no adoption: settling
  *     with a promise payload would hand the inner promise back as the
  *     awaited value, which is a miscompile, not a slower answer.
- *   - `fn:async:await-in-forof` / `fn:async:await-in-switch` — a
- *     suspension inside a for-of or a switch. Both linearize, neither is
- *     free: for-of hides an index and a per-iteration binding, switch
- *     hides lazy test evaluation and fallthrough.
+ *   - `fn:async:await-in-forof` / `fn:async:await-in-switch` (generator:
+ *     `fn:generator:yield-in-forof` / `fn:generator:yield-in-switch` —
+ *     also forked via `linearizationRefusal`) — a suspension inside a
+ *     for-of or a switch. Both linearize, neither is free: for-of hides
+ *     an index and a per-iteration binding, switch hides lazy test
+ *     evaluation and fallthrough.
  *   - `fn:async:jump-out-of-<kind>` — a break/continue that leaves a
  *     construct this pass keeps verbatim (a for-of, a switch, or a try
  *     with a finalizer) for a construct it exploded. Keeping the jump
@@ -1192,15 +1211,26 @@ class AsyncBail extends Error {}
  * `refuse` first, so the emitter's own whole-function gate still reports
  * it. A module with nothing resumable in it comes back by identity. */
 export function lowerResumableFunctions(mod: IrModule, refuse: Refuse): WModule {
-  if (!mod.functions.some((fn) => fn.async === true)) return mod;
+  // Gate widened (A2c slice 5): a module with generators but no async
+  // functions used to skip this whole pass, which was fine only while
+  // FunctionLowering declined every generator immediately (run()'s own
+  // guard, now lifted below) — a decline still counts as "handled," so
+  // the early return never hid a real miscompile even then, but it WOULD
+  // have hidden one the moment the guard lifted without this line moving
+  // too. Both conditions now agree with the per-function check below.
+  if (!mod.functions.some((fn) => fn.async === true || fn.generator !== undefined)) return mod;
 
   const functions: WFunction[] = [];
   const records: IrRecordShape[] = [...(mod.records ?? [])];
   let changed = false;
 
   for (const fn of mod.functions) {
-    // Generators keep their own gate: nothing here understands yield.
-    if (fn.async !== true || fn.generator !== undefined) {
+    // A plain function (neither async nor generator) passes through
+    // unchanged — everything else (async, generator, or in principle
+    // both were the frontend ever to allow it, which it does not) goes
+    // through FunctionLowering.run(), which decides for itself whether
+    // it can produce a resumable lowering or must decline by name.
+    if (fn.async !== true && fn.generator === undefined) {
       functions.push(fn);
       continue;
     }
@@ -1249,15 +1279,18 @@ const PROMISE_FIELD = "%promise";
  * as fn.generator/fn.async themselves. */
 const GEN_FIELD = "%gen";
 
-/** Exported for the test surface ONLY (increment 19's yield-lowering
- * unit): lowerResumableFunctions' own gate keeps every real generator
- * OUT of this class until the yield machinery is ready to receive one
- * (see the file header and lowerResumableFunctions below) — widening
- * that gate is deliberately its own, LAST step. Until then, nothing but
- * a test can reach a generator-shaped FunctionLowering at all, and
- * house rule #9 (increment 18: "force-emit what the lowering cannot
- * reach, behaviorally test what it can") says that is exactly when a
- * construction path needs to exist for tests to use directly. */
+/** A real generator reaches this class now (A2c slice 5's gate widening,
+ * lowerResumableFunctions above) — through increment 19's stages A2b
+ * through A2c-4b this export existed for the test surface ONLY (house
+ * rule #9, increment 18: "force-emit what the lowering cannot reach,
+ * behaviorally test what it can"), since `run()`'s own guard declined
+ * every generator outright while the pass and the emitter caught up.
+ * That guard is lifted; this comment is what is left of the story, kept
+ * for the "why a test-only surface exists at all" question the three
+ * TEST-ONLY methods below (runFrameAndStatesForTest/buildWrapperForTest/
+ * buildResumeForTest) still answer — they remain useful for isolating
+ * ONE piece of the lowering from the rest, which `run()` itself, now
+ * reachable for real, does not offer. */
 export class FunctionLowering {
   private readonly loc: SrcLoc;
   private readonly frameShapeId: string;
@@ -1329,27 +1362,29 @@ export class FunctionLowering {
   }
 
   run(): { wrapper: WFunction; resume: WFunction; frame: IrRecordShape } {
-    // GUARD, not documentation (the A2b gate's F2 finding). STATUS as of
-    // A2c slice 4b: both preconditions this guard used to name are now
-    // satisfied — buildWrapper/catchArm build correct IR (slices 1-3),
-    // and the emitter accepts every `%gen.*` seam kind for real (slice
-    // 4a's six plain field reads/writes, slice 4b's %gen.suspend/
-    // %gen.complete retag emission — see the header's BUILD STATUS
-    // paragraph). The guard STAYS UP anyway: gate-widening (the early
-    // return and per-function skip below) is a DELIBERATE, SEPARATE
-    // decision carrying its own behavioral bar — Node-diffed wrapper
-    // laziness, a generator identity check, a census expectation (tier
-    // holding with fn:generator's 12 programs relocating to
-    // expr:genResume, set-checked), and deferral language in both that
-    // slice's commit message and this file's tests (genResume's
-    // CONSUMER-side state ladder is stage A3, independent of everything
-    // built so far) — never something that flips as a side effect of an
-    // earlier slice finishing. runFrameAndStatesForTest()/
-    // buildWrapperForTest()/buildResumeForTest() below are the narrower
-    // surfaces the pass-level tests use instead, structurally incapable
-    // of reaching this guard.
-    if (this.genType !== null) this.decline("fn:async:generator-wrapper-not-built");
-
+    // GATE LIFTED (A2c slice 5). The guard that used to sit here
+    // (`fn:async:generator-wrapper-not-built`, unconditional for every
+    // generator) is gone: buildWrapper/catchArm build correct IR
+    // (slices 1-3) and the emitter accepts every `%gen.*` seam kind for
+    // real (slices 4a-4b) — both preconditions the guard existed to wait
+    // on are satisfied, so a real generator now runs this method for
+    // real, the same as any async function always has.
+    //
+    // DEFERRAL, stated exactly (do not loosen this wording — it is the
+    // increment's own boundary): this slice means GENERATOR BODIES
+    // COMPILE AND THE WRAPPER IS LAZY. It does NOT mean generators WORK
+    // on this backend. `.next()`/`.return()`/`.throw()` — genResume's
+    // own CONSUMER-side state ladder — is stage A3, wholly unbuilt;
+    // nothing a generator's body does once resumed is exercised by
+    // anything reachable from compiled user code yet, only by the
+    // structural/isolated tests this file and wasm-unions-validate.test.ts
+    // already carry. AND yields in unhoistable/finalizer/switch/forof
+    // positions decline under named `fn:generator:*` refusals
+    // (`linearizationRefusal`) until their own machinery lands, never
+    // under the `fn:async:*` names the shared position-checking would
+    // otherwise report on a body with no `await` in it. Reading "gate
+    // lifted" as "generators work" is exactly the miswording this
+    // comment exists to prevent.
     this.checkEligible();
     this.buildFrameFields();
     this.splitStates();
@@ -1804,17 +1839,17 @@ export class FunctionLowering {
           this.checkPositions(s.body);
           break;
         case "forOf":
-          if (hasSuspension(s)) this.decline("fn:async:await-in-forof");
+          if (hasSuspension(s)) this.decline(this.linearizationRefusal("fn:async:await-in-forof", "fn:generator:yield-in-forof"));
           break;
         case "switch":
-          if (hasSuspension(s)) this.decline("fn:async:await-in-switch");
+          if (hasSuspension(s)) this.decline(this.linearizationRefusal("fn:async:await-in-switch", "fn:generator:yield-in-switch"));
           break;
         case "tryCatch":
           if (s.finallyBody !== null || s.catchBody === null) {
             // A finalizer is completion machinery, not a handler (the
             // header's refusal list). A catchless try always has one, so
             // the name stays accurate for every shape that reaches here.
-            if (hasSuspension(s)) this.decline("fn:async:await-in-finally");
+            if (hasSuspension(s)) this.decline(this.linearizationRefusal("fn:async:await-in-finally", "fn:generator:yield-in-finally"));
             break;
           }
           // Both bodies linearize, so both are checked like any list.
@@ -1846,10 +1881,31 @@ export class FunctionLowering {
   /** The census name for a suspension hoisting could not move: the
    * loader's dependency wait and a user `await` sit in the same positions
    * but are different constructs, and a CONDITIONAL position is a
-   * different rock again (the header's refusal list says why). */
+   * different rock again (the header's refusal list says why). Forked on
+   * genType (linearizationRefusal) below `module.await` — that one stays
+   * unforked: it is frontend-fenced to async module initializers and
+   * never reachable from a generator body, so it never needs a
+   * generator-flavored name. */
   private positionRefusal(node: unknown, conditional = false): string {
     if (hasModuleAwait(node)) return "fn:async:module-await-position";
-    return conditional ? "fn:async:await-conditional" : "fn:async:await-position";
+    return conditional
+      ? this.linearizationRefusal("fn:async:await-conditional", "fn:generator:yield-conditional")
+      : this.linearizationRefusal("fn:async:await-position", "fn:generator:yield-position");
+  }
+
+  /** The census name for a linearization refusal, forked on genType: a
+   * generator's YIELD in a position the pass cannot linearize is NOT an
+   * async function's AWAIT in that position, even though the underlying
+   * hoisting/position-checking machinery is fully shared between the
+   * two. A reader seeing `fn:async:await-in-finally` on a program that
+   * contains no `await` anywhere is misled — the design doc's own
+   * "Conditional/loop-header yield positions decline under mirrored
+   * names" requirement, which A2c slice 5's gate-widening is what
+   * finally makes OBSERVABLE (a generator could never reach any of
+   * these sites before the gate widened, so the wrong name never
+   * showed up in a census before now). */
+  private linearizationRefusal(asyncKind: string, genKind: string): string {
+    return this.genType !== null ? genKind : asyncKind;
   }
 
   /* ── the frame shape ─────────────────────────────────────────────────── */
@@ -2498,13 +2554,26 @@ export class FunctionLowering {
     const excRef: WExpr = { kind: "varRef", localId: EXC_LOCAL, type: CAUGHT, loc: this.loc };
     const genType = this.genType;
     const isGenret: WExpr = { kind: "%gen.excIsGenret", caught: excRef, type: BOOL, loc: this.loc };
+    // A void retT (`.return()` always argument-less on such a channel —
+    // lowerGenMethodCall's own frontend fence) has nothing real parked in
+    // $gen.retPark: its mapTypeSoft(VOID) storage is a placeholder ("SENT/
+    // RETPARK NEVER REFUSE" — generators.ts's own header), never a value
+    // this promotion should read back. `%gen.complete(value: null)` — the
+    // SAME normalize-to-undefined completion() already applies for an
+    // ordinary void return — is the correct promotion here, not a
+    // %gen.retPark read typed VOID (which is not a real V arm; only
+    // `undefinedT` spells "no value" as an arm — genResultRecord's own
+    // rule, computeGenResultArms's `add()` drops void arms entirely).
     const genretExit: WStmt[] =
       genType !== null
         ? [
             {
               kind: "%gen.complete",
               gen: this.genRef(),
-              value: { kind: "%gen.retPark", gen: this.genRef(), type: this.fn.returnType, loc: this.loc },
+              value:
+                this.fn.returnType.kind === "void"
+                  ? null
+                  : { kind: "%gen.retPark", gen: this.genRef(), type: this.fn.returnType, loc: this.loc },
               loc: this.loc,
             },
             this.ret(),

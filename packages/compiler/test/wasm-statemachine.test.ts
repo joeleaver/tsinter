@@ -1130,21 +1130,16 @@ describe("refusals leave the function untouched", () => {
     expectRefusal(plain([exprStmt(awaitCall())], [local("z.0", VOID)]), "fn:async:void-local");
   });
 
-  test("generators keep their own gate — the pass never touches them", () => {
-    const gen: IrFunction = {
-      name: "gf",
-      params: [],
-      returnType: VOID,
-      async: true,
-      generator: { yieldT: F64, nextT: VOID },
-      locals: [],
-      body: [exprStmt(awaitCall())],
-      loc,
-    };
-    const { mod, refusals } = lower(asyncModule(gen));
-    expect(refusals).toEqual([]);
-    expect(fnNamed(mod, "gf")).toEqual(gen);
-  });
+  // "generators keep their own gate — the pass never touches them" lived
+  // here through A2c slice 4b, pinning the OLD per-function skip
+  // (lowerResumableFunctions treated `fn.generator !== undefined` as an
+  // unconditional pass-through, regardless of `fn.async`). A2c slice 5
+  // widened that gate on purpose — a real generator now DOES reach this
+  // pass — so the test's own premise is gone, not merely its assertion;
+  // retired rather than inverted. The "yield lowering" describe block
+  // below (A2c slices 2/2b/3/4/5) is where generator-shaped `run()`
+  // coverage lives now, including what a real (non-async-flagged)
+  // generator does when it reaches this class for real.
 });
 
 /* ── 4a. order-preserving operand hoisting ─────────────────────────────── */
@@ -2049,46 +2044,44 @@ describe("genResume hoists inside an async function (stage A2 opener)", () => {
   });
 });
 
-/* ── 12. increment 19 stages A2b/A2c: yield lowering + completion ────────
+/* ── 12. increment 19 stages A2b through A2c-5: yield lowering,
+ * completion, and (as of A2c slice 5) `run()` itself ────────────────────
  *
- * FunctionLowering is exported for this describe block ONLY (see its own
- * doc comment): lowerResumableFunctions' per-function skip still keeps
- * every real generator out (B2 — gate-widening is deliberately the LAST
- * step), so these tests construct one directly, the same way house rule
- * #9 already covers a helper's flag-true branches by builder-level
- * construction rather than waiting for a frontend path that doesn't
- * reach them yet.
+ * FunctionLowering is exported beyond this describe block now (A2c
+ * slice 5's gate widening — see the class's own doc comment): a real
+ * generator reaches `lowerResumableFunctions`/`run()` through the
+ * ordinary compiled path today, the same as an async function always
+ * has. This describe block predates that and still constructs
+ * FunctionLowering directly for most of its tests, which stays valid —
+ * direct construction isolates ONE piece of the lowering the same way
+ * house rule #9 (increment 18) already established for builder-level
+ * flag-true branches; it is a CHOICE now, not the only way in.
  *
- * SCOPE NOTE (A2b gate's F2 finding — a GUARD, not documentation):
- * `completion()`/`fellThrough()` (stage A2c), `buildWrapper()` (A2c
- * slice 2), and now `catchArm()` (A2c slice 3, reached through
- * buildResume) ALL branch on genType — nothing left in the PASS
+ * DEFERRAL, restated exactly (statemachine.ts's own header/guard-site
+ * comments carry the canonical wording — this note must never drift
+ * from it): A2c slice 5 means GENERATOR BODIES COMPILE AND THE WRAPPER
+ * IS LAZY. It does not mean generators WORK — genResume's CONSUMER-side
+ * state ladder (stage A3) is unbuilt, and `expr:genResume` still refuses
+ * by name at the emitter for any program that actually drives one. AND
+ * yields in unhoistable/finalizer/switch/forof positions decline under
+ * named `fn:generator:*` refusals until their own machinery lands —
+ * never under the `fn:async:*` names the shared position-checking
+ * machinery would otherwise report on a body with no `await` in it.
+ *
+ * SCOPE NOTE (A2b gate's F2 finding — a GUARD, not documentation, now
+ * HISTORY): `completion()`/`fellThrough()`, `buildWrapper()`, and
+ * `catchArm()` all branch on genType — nothing in the PASS
  * unconditionally names PROMISE_FIELD or emits an async-only op for a
- * generator: completion/fellThrough emit `%gen.complete` for a
- * generator's return/fall-through, buildWrapper builds frame+$gen,
- * writes the back-reference, and returns $gen with no eager resume call
- * and no promise-cache protocol, and catchArm's routing-table default
- * forks on the caught value's cell kind (GENRET completes the generator
- * via %gen.complete+%gen.retPark, a real exception marks DONE and
- * rethrows) with the SAME fork reused as every catch-region's sentinel
- * prologue (see catchArm's own doc comment for the "single construction
- * site" story) — covered by the tests named for each. Calling `.run()`
- * on a generator STILL declines outright (`this.genType !== null`,
- * BEFORE doing any work — see its own guard comment), but the reason has
- * moved: every generator-shaped IR this pass can build is correct IR
- * now, and what remains is purely the EMITTER, which still refuses
- * every `%gen.*` seam kind by name (eight of them as of this slice —
- * run()'s guard comment has the full list). Most of these tests use
- * `runFrameAndStatesForTest()`: the frame fields and the raw per-state
- * statement lists, built the identical way `run()` builds them
- * internally, WITHOUT reaching buildResume/buildWrapper/catchArm at all
- * — structurally incapable of depending on run()'s guard lifting, not
- * merely a test that happens to avoid triggering it. The "lazy wrapper"
- * test uses the narrower `buildWrapperForTest()`, and the two catchArm
- * tests use `buildResumeForTest()` (checkEligible + buildFrameFields +
- * splitStates + buildResume — the same sequence run() itself runs,
- * minus the guard and minus buildWrapper) — same rationale, narrower
- * surface, same reason none of them need the guard to lift first. */
+ * generator. `run()`'s own guard (`fn:async:generator-wrapper-not-built`)
+ * is GONE as of this slice — the "run() declines a generator outright"
+ * test that used to pin it is retired below, replaced by a test pinning
+ * the opposite: `run()` now SUCCEEDS for an eligible generator, the same
+ * as it always has for async. Most of these tests still use
+ * `runFrameAndStatesForTest()`/`buildWrapperForTest()`/
+ * `buildResumeForTest()` where isolating ONE piece is the point of the
+ * test — that reasoning is unchanged by the guard's removal, since those
+ * methods were never ABOUT dodging the guard, only about narrowing scope
+ * (see each method's own doc comment). */
 describe("yield lowering (stage A2b — FunctionLowering used directly)", () => {
   const genLoc = loc;
   const yieldExpr = (value: IrExpr | null, type: IrType): IrExpr => ({ kind: "yieldExpr", value, type, loc: genLoc });
@@ -2097,7 +2090,7 @@ describe("yield lowering (stage A2b — FunctionLowering used directly)", () => 
     return { irVersion: 3, sourceFile: "gen.ts", entry: "%main", functions: [fn] };
   }
 
-  test("run() declines a generator outright, before doing any work — the guard itself", () => {
+  test("run() now succeeds for an eligible generator — the guard is gone (A2c slice 5)", () => {
     const fn: IrFunction = {
       name: "g",
       params: [],
@@ -2108,8 +2101,13 @@ describe("yield lowering (stage A2b — FunctionLowering used directly)", () => 
       loc: genLoc,
     };
     const refusals: string[] = [];
-    expect(() => new FunctionLowering(genModule(fn), fn, (kind) => refusals.push(kind)).run()).toThrow();
-    expect(refusals).toEqual(["fn:async:generator-wrapper-not-built"]);
+    const result = new FunctionLowering(genModule(fn), fn, (kind) => refusals.push(kind)).run();
+    expect(refusals).toEqual([]);
+    // The wrapper's own return type is the generator type itself, never
+    // a promise — buildWrapper's generator branch (A2c slice 2), now
+    // reached for real rather than only through buildWrapperForTest().
+    expect(result.wrapper.returnType).toEqual({ kind: "generator", yieldT: F64, retT: F64, nextT: F64 });
+    expect(result.frame.fields.some((f) => f.name === "%gen")).toBe(true);
   });
 
   test("the frame carries %gen (typed to the function's own triple), never %promise", () => {
@@ -2360,6 +2358,88 @@ describe("yield lowering (stage A2b — FunctionLowering used directly)", () => 
     const defaultFork = defaultArm.body[0]!;
     expect(defaultFork.kind).toBe("if");
     if (defaultFork.kind !== "if") throw new Error("unreachable");
+    expect(prologue.then).toBe(defaultFork.then);
+  });
+
+  // 2010-generators-basics.ts's two(): Generator<string, void, unknown> is
+  // the exact corpus shape both regression tests below isolate. void is
+  // not a real V arm (only undefinedT spells "no value" —
+  // computeGenResultArms's own add() drops void channels entirely), so
+  // genretExit's promotion must normalize to undefined the SAME way
+  // completion()'s own void branch already does, rather than reading
+  // %gen.retPark typed void — which crashed emitGenOutValue the moment
+  // gate-widening let a real void-retT generator reach it.
+  //
+  // TWO shapes, not one: genretExit is built ONCE and consumed by BOTH
+  // catchArm exits (the "single construction site" property its own
+  // tests above already pin) — the routing-table DEFAULT arm always
+  // contains it, with or without any try/catch in the body at all, since
+  // `byHandler.size === 0` still returns `defaultArm`. The bug's true
+  // trigger is void retT, full stop — a protected region was never
+  // required to reach it, only sufficient. The reviewer's own read of
+  // the fix (normalizing at genretExit's construction site, not per
+  // consumer) predicts both shapes are already covered by the ONE fix;
+  // these two tests are what PROVES that instead of assuming it.
+  test("catchArm's GENRET exit on a VOID retT, NO protected region — the common corpus shape, hits the routing default directly (regression)", () => {
+    const fn: IrFunction = {
+      name: "two",
+      params: [],
+      returnType: VOID,
+      generator: { yieldT: STRING, nextT: F64 },
+      locals: [],
+      body: [exprStmt(yieldExpr({ kind: "strLit", value: "x", type: STRING, loc: genLoc }, STRING))],
+      loc: genLoc,
+    };
+    const resume = new FunctionLowering(genModule(fn), fn, () => {}).buildResumeForTest();
+    const table = routing(resume);
+    // No protected region at all: routing() answers ONE entry, the
+    // default (see the "no protected region" test in section 11 above
+    // for the same shape without the void-retT angle).
+    expect(table).toHaveLength(1);
+    const defaultFork = table[0]!.body[0]!;
+    expect(defaultFork.kind).toBe("if");
+    if (defaultFork.kind !== "if") throw new Error("unreachable");
+
+    const complete = nodesOfKind(defaultFork.then, "%gen.complete");
+    expect(complete).toHaveLength(1);
+    expect(complete[0]!["value"]).toBeNull();
+    expect(nodesOfKind(defaultFork.then, "%gen.retPark")).toEqual([]);
+  });
+
+  test("catchArm's GENRET exit on a VOID retT, WITH a protected region — the sentinel prologue's own copy of genretExit (regression)", () => {
+    const fn: IrFunction = {
+      name: "two",
+      params: [],
+      returnType: VOID,
+      generator: { yieldT: STRING, nextT: F64 },
+      locals: [local("e.0", CAUGHT)],
+      body: [tryCatch([exprStmt(yieldExpr({ kind: "strLit", value: "x", type: STRING, loc: genLoc }, STRING))], "e.0", [
+        log([str("caught")]),
+      ])],
+      loc: genLoc,
+    };
+    const resume = new FunctionLowering(genModule(fn), fn, () => {}).buildResumeForTest();
+    const table = routing(resume);
+    const defaultArm = table.find((c) => c.test === null)!;
+    const defaultFork = defaultArm.body[0]!;
+    expect(defaultFork.kind).toBe("if");
+    if (defaultFork.kind !== "if") throw new Error("unreachable");
+
+    const complete = nodesOfKind(defaultFork.then, "%gen.complete");
+    expect(complete).toHaveLength(1);
+    expect(complete[0]!["value"]).toBeNull();
+    expect(nodesOfKind(defaultFork.then, "%gen.retPark")).toEqual([]);
+
+    // The region arm's own sentinel prologue is the SAME genretExit
+    // object (reference identity, per the "single construction site"
+    // test above) — so it is ALREADY covered by the assertions on
+    // defaultFork.then above; this just makes that coverage explicit for
+    // the void-retT shape specifically, rather than relying on the
+    // reader to trace the reference back to the default arm's test.
+    const regionArm = table.find((c) => c.test !== null)!;
+    const prologue = regionArm.body[0]!;
+    expect(prologue.kind).toBe("if");
+    if (prologue.kind !== "if") throw new Error("unreachable");
     expect(prologue.then).toBe(defaultFork.then);
   });
 });

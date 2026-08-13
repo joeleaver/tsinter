@@ -1871,7 +1871,11 @@ class Assembler {
     }
 
     const tag = vArms.findIndex((a) => typeEquals(a, vt));
-    if (tag < 0) throw new Error(`emitGenOutValue: no V arm for operand type ${vt.kind} at ${loc.file}`);
+    if (tag < 0) {
+      throw new Error(
+        `emitGenOutValue: no V arm for operand type ${vt.kind} (value kind ${v.kind}) at ${loc.file}`,
+      );
+    }
     if (isUnitType(vt)) {
       code.globalGet(this.unions.unitGlobal(tag));
       return;
