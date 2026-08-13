@@ -6703,6 +6703,100 @@ test("union: `Buffer | string`.toString() — the bytes arm decodes UTF-8 throug
   expect(stdout.toString("utf8")).toBe(["✓", "plain", '""', '""', ""].join("\n"));
 });
 
+/* ── Increment 19 stage A3: genResume's "next"/"return" state ladder ──
+ * The differential census is the real behavioral bar (six corpus programs
+ * — 2010/2015/2016/2017/2018/2457 — now byte-diff clean against Node
+ * through the FULL for-of, yield-star, and async-composition surface).
+ * These two tests pin two ladder corners no corpus program happens to
+ * exercise:
+ * reentrancy (a generator resuming ITSELF mid-body) and `.return()`'s
+ * exact-value round-trip on UNSTARTED/DONE (never a stale `$gen.out`).
+ * Expected strings are Node-measured directly (`node
+ * --experimental-transform-types`) against the identical source below —
+ * see inc19-probes/probe-a3-reentrancy.ts and
+ * probe-a3-return-fastpath.ts. `.throw()` mode is unbuilt (still refuses
+ * under `expr:genResume:throw`), so reentrancy is only exercised through
+ * the two modes that exist. */
+test("genResume (A3): reentrancy throws Node's exact TypeError, both built modes", async () => {
+  // `self` stays a bare (never-null) Generator binding — a `Generator |
+  // null` union has no compiled home yet (a real, separate, pre-existing
+  // gap: union arms don't support generator types), unrelated to A3
+  // itself, so the probe source is shaped to avoid it entirely. Same
+  // reason for `instanceof TypeError` + `.name`/`.message` over
+  // `.constructor.name`: `Function.name` (a caught error's own
+  // constructor) has no scriptc lowering yet — this file's established
+  // idiom elsewhere (e.g. the S018 test above) for the identical reason.
+  const res = await buildWasm(
+    "gen-reentrancy.ts",
+    [
+      "let self: Generator<number, string, unknown>;",
+      "function* g(): Generator<number, string, unknown> {",
+      "  try {",
+      "    self.next();",
+      "  } catch (e) {",
+      '    if (e instanceof TypeError) console.log("reentrant-next", e.name + ": " + e.message);',
+      '    else console.log("reentrant-next wrong-kind");',
+      "  }",
+      "  try {",
+      '    self.return("R" as never);',
+      "  } catch (e) {",
+      '    if (e instanceof TypeError) console.log("reentrant-return", e.name + ": " + e.message);',
+      '    else console.log("reentrant-return wrong-kind");',
+      "  }",
+      "  yield 1;",
+      '  return "done";',
+      "}",
+      "self = g();",
+      "self.next();",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "reentrant-next TypeError: Generator is already running",
+      "reentrant-return TypeError: Generator is already running",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("genResume (A3): .return()'s value round-trips verbatim on UNSTARTED and DONE, never a stale $gen.out", async () => {
+  const res = await buildWasm(
+    "gen-return-fastpath.ts",
+    [
+      "function* g(): Generator<number, string, unknown> {",
+      "  yield 1;",
+      '  return "ret";',
+      "}",
+      "const a = g();",
+      'const r1 = a.return("R" as never);',
+      "console.log(r1.done, r1.value);",
+      "const r2 = a.next();",
+      "console.log(r2.done, r2.value);",
+      "",
+      "const b = g();",
+      "b.next();",
+      "b.next();",
+      'const r3 = b.return("R2" as never);',
+      "console.log(r3.done, r3.value);",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  // r1: UNSTARTED, .return("R") answers {value:"R",done:true} verbatim.
+  // r2: the NEXT .next() call stays DONE, value undefined — never re-reads
+  // r1's "R" (there is no `out` write on the UNSTARTED/DONE fast path).
+  // r3: DONE (after two .next() calls drained the one yield and the
+  // return), .return("R2") answers the NEW argument, not the "ret" the
+  // body itself returned.
+  expect(stdout.toString("utf8")).toBe(["true R", "true undefined", "true R2", ""].join("\n"));
+});
+
 test("insp.buffer: the STATIC-typed-Buffer path (console.log of a real, non-dyn Buffer) — the 49/50/51/52 INSPECT_MAX_BYTES truncation seam pinned directly against Node (corpus 1635 covers 50/51/52/200 differentially; this adds 49, one below the boundary, with all four side by side), plus an explicit cross-check that this NEW call site's `bufferForm()` reuse is byte-identical to the dyn walker's EXISTING isBuffer=true consumer (wasm-bytes-flag.test.ts's own '<Buffer 01 02 03>' assertion for the SAME [1,2,3] content) — not merely inferred across files", async () => {
   const { inspect } = await import("node:util");
   const bytesOf = (n: number): number[] => Array.from({ length: n }, (_, i) => (i * 7 + 1) % 251);

@@ -1258,6 +1258,24 @@ const TIER_FLOOR: string[] = [
   // `bufferForm` helper (inspect.ts) the dyn walker's Buffer arm already
   // used, unmodified — no new runtime code, just the missing wire-up.
   "1635-inspect-buffer.ts",
+  // Increment 19 stage A3: genResume's "next" and "return" modes (the
+  // reentrancy TypeError, the DONE/UNSTARTED fast paths, the first-.next()
+  // argument discard, the SUSPENDED resume path through the shared
+  // emitResumeCallAndResult tail). All six programs the gate-widening
+  // (A2c slice 5) relocated to expr:genResume clear here — 2017 composes
+  // generators with async and claims too (no hoister gap found). The
+  // yield-* five (2011/2012/2013/2014/2019) and the private-method
+  // programs (2454/2456) stay declined under their own fn:generator:
+  // yield-in-finally/yield-position/yield-in-switch/yield-in-forof names
+  // until finalizer linearization (stage B) and the composition sweep
+  // (stage C) land — `.throw()` mode (expr:genResume:throw) is still
+  // unbuilt too.
+  "2010-generators-basics.ts",
+  "2015-generators-yieldstar.ts",
+  "2016-generators-rc-stress.ts",
+  "2017-generators-async.ts",
+  "2018-generators-uncaught.ts",
+  "2457-private-members.js",
 ];
 
 interface RunResult {

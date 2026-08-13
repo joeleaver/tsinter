@@ -2017,11 +2017,24 @@ describe("genResume hoists inside an async function (stage A2 opener)", () => {
     expect(nodesOfKind(lowered.body, "%async.subscribe")).toHaveLength(1);
   });
 
-  test("the SAME module still refuses — at expr:genResume, in the emitter, not the hoister", () => {
-    // genResume emission is unimplemented (stage A3): the refusal must
-    // still happen, just at the right layer. Proves the HOIST_SLOTS entry
-    // moved WHERE the refusal fires, not WHETHER it fires.
+  test("the SAME module now survives THROUGH the emitter too (A3's next-mode slice) — genResume beside an await, inside an ORDINARY async function's own resume", () => {
+    // Retired premise: through A2c slice 5, genResume emission was
+    // entirely unimplemented (stage A3), so this same module refused at
+    // expr:genResume — proving the HOIST_SLOTS entry moved WHERE the
+    // refusal fired, not WHETHER it fired. A3's first sub-slice (mode:
+    // "next") changes the answer: this exact shape — genResume beside an
+    // await, embedded in an ORDINARY ASYNC function's own resume body,
+    // never a generator's — now compiles clean end to end. `genResume`
+    // is not generator-only (the design doc's own framing): any
+    // function, async or not, may hold and drive a generator, and this
+    // is the proof that composition works at the EMITTER layer, not
+    // just the hoister. Logging `r.0.done` rather than `r.0` itself
+    // sidesteps a wholly unrelated, pre-existing limitation (console.log
+    // of a raw record needs the frontend's own inspect-lowering, which
+    // this hand-built module has no frontend pass to run — see the S041
+    // test's identical workaround).
     const { type: recT, records, unions } = genResultType();
+    const doneRead: IrExpr = { kind: "recordGet", obj: v("r.0", recT), shapeId: recT.shapeId, field: "done", type: BOOL, loc };
     const fn: IrFunction = {
       name: "f",
       params: [],
@@ -2033,14 +2046,12 @@ describe("genResume hoists inside an async function (stage A2 opener)", () => {
           "r.0",
           { kind: "genResume", mode: "next", gen: v("g.0", genT), arg: awaitP(), type: recT, loc },
         ),
-        log([v("r.0", recT)]),
+        log([doneRead]),
       ],
       loc,
     };
     const survey = surveyWasmModule({ ...asyncModule(fn), records, unions });
-    expect(survey).toContain("expr:genResume");
-    expect(survey).not.toContain("fn:async:await-position");
-    expect(survey).not.toContain("fn:async");
+    expect(survey).toEqual([]);
   });
 });
 

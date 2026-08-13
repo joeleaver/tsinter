@@ -121,7 +121,15 @@ import {
   RACEE_DST,
   RACEE_SRC,
 } from "./promises.js";
-import { GEN_DONE, GEN_SUSPENDED, type GenInfo, GeneratorBuilder, INJECT_GENRET } from "./generators.js";
+import {
+  GEN_DONE,
+  GEN_RUNNING,
+  GEN_SUSPENDED,
+  type GenInfo,
+  GeneratorBuilder,
+  INJECT_GENRET,
+  INJECT_NEXT,
+} from "./generators.js";
 import { StrBuilder } from "./strings.js";
 import { BytesBuilder, type BytesElem } from "./typedarrays.js";
 import { TimerBuilder } from "./timers.js";
@@ -1884,6 +1892,91 @@ class Assembler {
     code.i32Const(tag);
     this.walkExpr(v);
     code.structNew(st);
+  }
+
+  /** Build a genResume IteratorResult record `{value, done}` — recT's own
+   * interned shape (genResultRecord, shared with mapType's IteratorResult
+   * alias so a plain `const r = g.next()` binds and reads flow) — pushed
+   * fully formed, both fields always real, never dropped. `pushValue`/
+   * `pushDone` each push their OWN operand; this only SEQUENCES them into
+   * the struct's actual field order (index-ascending — canonical name-
+   * sorted storage, "done" < "value" today — read from `fieldIndex`
+   * rather than assumed, the same discipline `recordLit`'s own emission
+   * follows). */
+  private emitIterResult(recInfo: RecordInfo, pushValue: () => void, pushDone: () => void): void {
+    const valueIdx = recInfo.fieldIndex.get("value");
+    const doneIdx = recInfo.fieldIndex.get("done");
+    if (valueIdx === undefined || doneIdx === undefined) {
+      throw new Error("genResume: IteratorResult record missing a value/done field");
+    }
+    if (doneIdx < valueIdx) {
+      pushDone();
+      pushValue();
+    } else {
+      pushValue();
+      pushDone();
+    }
+    this.fn.code.structNew(recInfo.struct);
+  }
+
+  /** Call through `$gen.resume` and build the resulting IteratorResult —
+   * the ONE construction site genResume's "next" and "return" modes both
+   * share for their resuming path (see the case's own header comment).
+   * The call mirrors `callValue`'s protocol exactly (push the closure as
+   * arg0/env, the ONE explicit param resume's signature takes — the frame
+   * base, `resumeClosPair`'s own `(frameBase) -> void` — then the closure
+   * again to fetch the fn pointer for `callRef`); resume is never
+   * statically known here, so there is no direct-call shortcut the way
+   * `buildWrapper`'s captureless kick gets. The pending check afterward is
+   * UNCONDITIONAL — the design doc's own protocol, not gated on the
+   * generic may-throw table (never built with catchArm's generator-only
+   * "leave the cell set, return normally" exit in mind). `out` is read
+   * back verbatim (already V-shaped by construction — `emitGenOutValue`'s
+   * job, write side only); `done` reads the POST-resume state directly,
+   * never a value cached before the call. */
+  private emitResumeCallAndResult(g: number, info: GenInfo, recInfo: RecordInfo): void {
+    const code = this.fn.code;
+    const pair = this.resumeClosPair();
+    const closRef: ValType = { kind: "ref", nullable: true, typeIndex: pair.clos };
+    const c = this.acquireScratch(closRef);
+    // RUNNING is written HERE, nowhere else: `%gen.suspend`/`%gen.complete`
+    // write SUSPENDED/DONE at their own points (the exit side), and this
+    // call site is the ONE place resume is ever invoked (the entry side)
+    // — symmetric with those two. Without this write the reentrancy check
+    // above (case "genResume"'s own `state === RUNNING` test) can never
+    // fire: nothing else in the module ever produces GEN_RUNNING, so a
+    // generator resuming ITSELF from inside its own body would recurse
+    // through `resume` unchecked instead of throwing — caught by this
+    // slice's own reentrancy regression test (wasm-emitter.test.ts),
+    // which stack-overflowed before this write was added.
+    code.localGet(g);
+    code.i32Const(GEN_RUNNING);
+    code.structSet(info.struct, info.idx.state);
+    code.localGet(g);
+    code.structGet(info.struct, info.idx.resume);
+    code.localSet(c);
+    code.localGet(c); // arg0: the closure itself (selfRef, env)
+    code.localGet(g);
+    code.structGet(info.struct, info.idx.frame); // the ONE explicit arg: frame base
+    code.localGet(c);
+    code.structGet(pair.clos, 0);
+    code.callRef(pair.fn);
+    this.releaseScratch(closRef, c);
+    this.emitPendingCheck();
+
+    this.emitIterResult(
+      recInfo,
+      () => {
+        code.localGet(g);
+        code.structGet(info.struct, info.idx.out);
+      },
+      () => {
+        code.localGet(g);
+        code.structGet(info.struct, info.idx.state);
+        code.i32Const(GEN_DONE);
+        code.i32Eq();
+      },
+    );
   }
 
   /* ── the top-level-await root (abi.ts's `_status`, SEMANTICS.md S010) ──
@@ -9196,6 +9289,189 @@ class Assembler {
         return;
       }
 
+      /** `.next(v)`/`.return(v)`/`.throw(e)` — genResume, stage A3.
+       * "next" and "return" are real emission; "throw" still refuses
+       * under its own name (`expr:genResume:throw`) until it lands — the
+       * state ladder is built mode by mode, never one big step, matching
+       * every other stage of this increment. `.return()` is NOT an
+       * optional extra alongside `.next()`: `for (const x of gen)`'s own
+       * desugar (lower-generators.ts's `lowerForOfGenerator`) ALWAYS
+       * compiles an IteratorClose `.return()` call for the early-exit
+       * path, whether or not the loop ever actually breaks at runtime —
+       * so most of this increment's target corpus (any program using a
+       * generator for-of, not just an explicit `.return()` call) needs
+       * this mode to even survey clean, discovered when 2015/2016/2018/
+       * 2457 all reported `expr:genResume:return` despite only 2016
+       * calling `.return()` in its own source.
+       *
+       * REENTRANCY (Node-probed, all three modes give the IDENTICAL
+       * TypeError — so this check belongs OUTSIDE the mode switch, not
+       * duplicated per mode): `$gen.state === RUNNING` means this exact
+       * generator is already resuming somewhere up the call stack (the
+       * body itself calling back into its own iterator) — thrown at
+       * genResume's own call site, the caller's own exception cell,
+       * never touching resume.
+       *
+       * Both modes share the SAME shape: a FAST PATH answering directly
+       * without ever touching resume, and a RESUMING PATH that prepares
+       * $gen's fields, calls resume, and builds the result from
+       * whatever resume just left in `$gen.state`/`$gen.out` —
+       * `emitResumeCallAndResult` below, the ONE construction site for
+       * that tail (call through the stored closure — `callValue`'s own
+       * protocol, mirrored here since resume is never statically known;
+       * an UNCONDITIONAL pending check, "after every resume call" — the
+       * design doc's own protocol, never gated on the generic may-throw
+       * table, which was never built with catchArm's generator-only
+       * "leave the cell set, return normally" exit in mind; no retag
+       * reading `out` back — it is already V-shaped by construction,
+       * retagging only ever happens going IN, `emitGenOutValue`'s own
+       * job).
+       *
+       * "next": DONE is the fast path — `{value: undefined, done: true}`
+       * — never re-reads a stale `$gen.out` a PRIOR completion left
+       * there (Node: an exhausted `.next()` always answers undefined,
+       * not the last value). UNSTARTED and SUSPENDED both resume;
+       * UNSTARTED discards the argument entirely (Node-probed: the
+       * FIRST `.next(v)`'s v never reaches the body) by never writing
+       * `$gen.sent` — the state check that gates the write IS the
+       * discard. A bare `.next()` on a channel that still has a real
+       * sent slot can only mean a dyn nextT (lowerGenMethodCall's own
+       * frontend fence guarantees this), so it boxes a fresh `undefined`
+       * via `dynFrom` rather than skipping the write.
+       *
+       * "return(v)": DONE OR UNSTARTED is the fast path — `{value: v,
+       * done: true}`, using the CALLER'S value verbatim, body never
+       * runs (Node-probed: `.return()` on either state answers `v`
+       * immediately, and marks/keeps the generator DONE — the state
+       * write matters for UNSTARTED, a real transition; it is a no-op
+       * for an already-DONE generator). SUSPENDED resumes: retPark=v,
+       * inject=GENRET — catchArm's GENRET exit (A2c slice 3) is what
+       * promotes retPark into `out` and marks DONE, so the shared "after
+       * resume" tail needs no return-mode-specific branch at all; with
+       * no finalizer machinery built yet (stage B), a GENRET-injected
+       * resume can only ever end in DONE in today's tier — the "a
+       * finally yielded, state stays SUSPENDED" corner the design doc
+       * names is provably unreachable until stage B exists, so this
+       * slice does not special-case it. */
+      case "genResume": {
+        if (e.type.kind !== "record") throw new Error("genResume with a non-record type");
+        const recInfo = this.recordInfo(e.type.shapeId, e.loc, false);
+        if (recInfo === null) {
+          code.unreachable();
+          return;
+        }
+        if (e.mode !== "next" && e.mode !== "return") {
+          this.refuse(`expr:genResume:${e.mode}`, e.loc);
+          code.unreachable();
+          return;
+        }
+        const info = this.genInfoFor(e.gen.type, e.loc);
+        const genKey = `gen.out:${typeKey(e.gen.type)}`;
+        const genRefT = this.gens.genRef(info);
+        const recRefT: ValType = { kind: "ref", nullable: true, typeIndex: recInfo.struct };
+
+        const g = this.acquireScratch(genRefT);
+        this.walkExpr(e.gen);
+        code.localSet(g);
+
+        code.localGet(g);
+        code.structGet(info.struct, info.idx.state);
+        code.i32Const(GEN_RUNNING);
+        code.i32Eq();
+        this.openIf();
+        this.emitSetCellErrorLit("%TypeError", "TypeError", "Generator is already running", null);
+        this.emitUnwind();
+        this.close();
+
+        if (e.mode === "next") {
+          code.localGet(g);
+          code.structGet(info.struct, info.idx.state);
+          code.i32Const(GEN_DONE);
+          code.i32Eq();
+          this.openIfResult(recRefT);
+          this.emitIterResult(
+            recInfo,
+            () => this.emitGenOutValue(null, info, genKey, e.loc),
+            () => code.i32Const(1),
+          );
+          code.else_();
+
+          if (info.idx.sent >= 0) {
+            code.localGet(g);
+            code.structGet(info.struct, info.idx.state);
+            code.i32Const(GEN_SUSPENDED);
+            code.i32Eq();
+            this.openIf();
+            code.localGet(g);
+            if (e.arg !== null) {
+              this.walkExpr(e.arg);
+            } else {
+              this.walkExpr({
+                kind: "dynFrom",
+                value: { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc: e.loc },
+                type: DYN,
+                loc: e.loc,
+              });
+            }
+            code.structSet(info.struct, info.idx.sent);
+            this.close();
+          }
+          code.localGet(g);
+          code.i32Const(INJECT_NEXT);
+          code.structSet(info.struct, info.idx.inject);
+          this.emitResumeCallAndResult(g, info, recInfo);
+          this.close();
+        } else {
+          // The fast path is "not SUSPENDED" — UNSTARTED or DONE, the
+          // only two states left once the reentrancy check above has
+          // already ruled out RUNNING.
+          code.localGet(g);
+          code.structGet(info.struct, info.idx.state);
+          code.i32Const(GEN_SUSPENDED);
+          code.i32Ne();
+          this.openIfResult(recRefT);
+          // UNSTARTED-or-DONE fast path: {value: v, done: true}, marking
+          // DONE (a no-op if it already was — Node's own idempotence).
+          code.localGet(g);
+          code.i32Const(GEN_DONE);
+          code.structSet(info.struct, info.idx.state);
+          this.emitIterResult(
+            recInfo,
+            () => this.emitGenOutValue(e.arg, info, genKey, e.loc),
+            () => code.i32Const(1),
+          );
+          code.else_();
+
+          // A bare `.return()` (e.arg === null, "the runtime sends
+          // undefined" — lowerGenMethodCall's own framing, allowed for
+          // ANY retT since JS never enforces a return type at runtime)
+          // leaves $gen.retPark UNTOUCHED here: its raw storage
+          // (mapTypeSoft(retT)) has no representation for "undefined"
+          // when retT is concrete, and %gen.retPark's own reader has no
+          // way to learn "this was conceptually undefined" once it is
+          // retagged — a real gap, but an UNOBSERVED one for every
+          // program this slice claims: the for-of desugar's own
+          // IteratorClose call is the ONLY source of an argument-less
+          // `.return()` in the corpus today, and its result is always
+          // DISCARDED (lower-generators.ts's own comment: "the .return()
+          // result record is dropped"), never read, so this is not yet
+          // exercised where it would be visible. Flagged here rather
+          // than silently assumed correct.
+          if (e.arg !== null) {
+            code.localGet(g);
+            this.walkExpr(e.arg);
+            code.structSet(info.struct, info.idx.retPark);
+          }
+          code.localGet(g);
+          code.i32Const(INJECT_GENRET);
+          code.structSet(info.struct, info.idx.inject);
+          this.emitResumeCallAndResult(g, info, recInfo);
+          this.close();
+        }
+        this.releaseScratch(genRefT, g);
+        return;
+      }
+
       /* Unit values exist only inside unions (unionWrap intercepts them
        * before the walk, so a reached unitLit is refused loudly). */
       case "unitLit":
@@ -9206,16 +9482,14 @@ class Assembler {
       case "regexIntrinsic":
       /* Native FFI — a link-time C ABI, nothing to link against here. */
       case "ffiCall":
-      /* Async, generators, promises. yieldExpr/genResume never reach here
-       * in a function the lowering accepted — they are what it consumes;
-       * one that survives belongs to a REFUSED async function and
-       * reports as `fn:async` before its body is walked (same for
-       * awaitExpr/awaitUnionExpr). genResume's own CONSUMER-side state
-       * ladder (stage A3) is the separate, independent blocker that
-       * keeps these two refusing regardless of the seam ops below being
-       * real now. */
+      /* Async. yieldExpr never reaches here in a function the lowering
+       * accepted — it is what the pass consumes; one that survives
+       * belongs to a REFUSED async function and reports as `fn:async`
+       * before its body is walked (same for awaitExpr/awaitUnionExpr).
+       * genResume (stage A3) has its own case below now — "next" mode is
+       * real emission; "return"/"throw" still refuse by their OWN names
+       * until they land. */
       case "yieldExpr":
-      case "genResume":
       case "awaitExpr":
       case "awaitUnionExpr":
       /* Widening promise<T> into promise<void> is representationally free
