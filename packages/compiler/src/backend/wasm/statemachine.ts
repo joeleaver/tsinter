@@ -1986,6 +1986,19 @@ export class FunctionLowering {
         out.push({ ...s, cond, then: this.hoistList(s.then), else_: s.else_ === null ? null : this.hoistList(s.else_) });
         break;
       }
+      case "switch": {
+        // A FOURTH named position, alongside the header's if-condition: a
+        // switch DISCRIMINANT is if-cond-shaped, not while/for-header-
+        // shaped — it evaluates exactly once, unconditionally, before any
+        // test runs. The lazy/conditional part of a switch is the CASE
+        // TESTS (a test after the matching one never evaluates — nodes.ts's
+        // own contract), which is why THEY stay refused (checkPositions
+        // declines fn:async:await-in-switch-test / fn:generator:yield-in-
+        // switch-test) while the discriminant hoists.
+        const disc = hasSuspension(s.disc) ? this.hoistValue(s.disc, out) : s.disc;
+        out.push({ ...s, disc, cases: s.cases.map((c) => ({ ...c, body: this.hoistList(c.body) })) });
+        break;
+      }
       case "block":
         out.push({ ...s, body: this.hoistList(s.body) });
         break;
@@ -2000,6 +2013,66 @@ export class FunctionLowering {
         // binding an init hoist would move out of the loop's scope.
         out.push({ ...s, body: this.hoistList(s.body) });
         break;
+      case "forOf": {
+        // The frontend already desugars for-of over a GENERATOR into an
+        // ordinary while loop (lower-generators.ts's lowerForOfGenerator,
+        // unconditional — no "forOf" IR node survives for one), so a
+        // "forOf" reaching this pass is always over an array, a string,
+        // or some other iterable this backend does not yet walk.
+        // ARRAY is the one case with a static, re-readable length: it
+        // desugars here to an ordinary index-based "for" — the exact
+        // shape emitter.ts's own (non-suspending) array-forOf case
+        // already uses ("ascending index, length re-read each pass, JS-
+        // exact for arrays") — which the EXISTING for-machinery then
+        // hoists/lowers with no changes of its own. The iterable
+        // expression itself stays a "clean" (non-suspending) position,
+        // like every other header/cond slot in this pass — none of this
+        // increment's target programs need it to suspend, so it is left
+        // declined under the ordinary forOf name rather than built. (If
+        // a program ever needs it: post-desugar the iterable already
+        // sits in an ordinary varDecl root, exactly the position the
+        // hoister already splits suspensions out of — this may lift
+        // nearly for free, but is not built here — future latitude, not
+        // scope.) Every OTHER iterable kind (string, dyn, a future Map/
+        // Set forOf) stays declined under the existing name unchanged.
+        if (s.iterable.type.kind === "array" && !hasSuspension(s.iterable)) {
+          const arrId = `${HOIST_PREFIX}fof.arr.${++this.hoisted}`;
+          const idxId = `${HOIST_PREFIX}fof.i.${++this.hoisted}`;
+          this.locals.push({ id: arrId, name: arrId, type: s.iterable.type, mutable: false });
+          this.locals.push({ id: idxId, name: idxId, type: F64, mutable: true });
+          out.push({ kind: "varDecl", localId: arrId, init: s.iterable, loc: s.loc });
+          const arrRef: IrExpr = { kind: "varRef", localId: arrId, type: s.iterable.type, loc: s.loc };
+          const idxRef: IrExpr = { kind: "varRef", localId: idxId, type: F64, loc: s.loc };
+          const forNode: IrStmt = {
+            kind: "for",
+            init: { kind: "varDecl", localId: idxId, init: { kind: "numLit", value: 0, type: F64, loc: s.loc }, loc: s.loc },
+            cond: {
+              kind: "bin",
+              op: "<",
+              left: idxRef,
+              right: { kind: "arrIntrinsic", method: "length", receiver: arrRef, args: [], type: F64, loc: s.loc },
+              type: BOOL,
+              loc: s.loc,
+            },
+            update: {
+              kind: "assign",
+              localId: idxId,
+              value: { kind: "bin", op: "+", left: idxRef, right: { kind: "numLit", value: 1, type: F64, loc: s.loc }, type: F64, loc: s.loc },
+              loc: s.loc,
+            },
+            body: [
+              { kind: "varDecl", localId: s.localId, init: { kind: "arrayGet", arr: arrRef, index: idxRef, type: s.iterable.type.elem, loc: s.loc }, loc: s.loc },
+              ...s.body,
+            ],
+            ...(s.labels && { labels: s.labels }),
+            loc: s.loc,
+          };
+          out.push({ ...forNode, body: this.hoistList(forNode.body) });
+        } else {
+          out.push(s);
+        }
+        break;
+      }
       case "tryCatch":
         // Stage B: a finally's own body linearizes exactly like the try
         // and catch bodies already did — `hasSuspension(s)`'s own guard
@@ -2017,8 +2090,7 @@ export class FunctionLowering {
         });
         break;
       default:
-        // forOf / switch — suspensions inside them are their own refusals,
-        // and every other kind holds no expression that can suspend.
+        // Every remaining kind holds no expression that can suspend.
         out.push(s);
         break;
     }
@@ -2154,7 +2226,24 @@ export class FunctionLowering {
           if (hasSuspension(s)) this.decline(this.linearizationRefusal("fn:async:await-in-forof", "fn:generator:yield-in-forof"));
           break;
         case "switch":
-          if (hasSuspension(s)) this.decline(this.linearizationRefusal("fn:async:await-in-switch", "fn:generator:yield-in-switch"));
+          // The discriminant already hoisted (hoistStmt's own "switch"
+          // case, mirroring "if"'s cond) — this checkClean is a guard at
+          // the read site regardless (the F3 pattern: loud if the hoist
+          // ever fails to run, a no-op on correct output), not the
+          // primary enforcement.
+          this.checkClean(s.disc);
+          // A case TEST suspending is its own, narrower refusal: unlike
+          // the discriminant, tests are the CONDITIONAL part of a switch
+          // (a test after the matching one never evaluates — nodes.ts's
+          // own contract), so a suspension there would need a multi-state
+          // dispatch chain this pass does not build. Named apart from the
+          // switch-wide bucket so the census can tell the two apart.
+          for (const c of s.cases) {
+            if (c.test !== null && hasSuspension(c.test)) {
+              this.decline(this.linearizationRefusal("fn:async:await-in-switch-test", "fn:generator:yield-in-switch-test"));
+            }
+            this.checkPositions(c.body);
+          }
           break;
         case "tryCatch":
           // Stage B: a finalizer is completion machinery, not a handler
@@ -2266,6 +2355,17 @@ export class FunctionLowering {
     this.frameFields.push({ name: PENDING_EXC_FIELD, type: CAUGHT });
   }
 
+  /** A dedicated frame field for ONE suspension site's pre-suspend operand
+   * — shared machinery despite the "%awaitN" name (minted when only
+   * await used it; yield's own "yield" case in lowerSuspension reuses it
+   * too, stage C's fix for the same reason await already needed it: the
+   * operand must be EVALUATED, its side effects landed in a local
+   * `saves()` can see, BEFORE `saves()` runs, not re-embedded into the
+   * suspending op itself where it would evaluate AFTER the save already
+   * ran). Renaming the field prefix per-form was considered and rejected
+   * — it is an internal slot label several tests already assert on
+   * verbatim, and the field's OWN doc comments here explain what it is;
+   * a form-specific name would buy nothing a comment doesn't already. */
   private awaitSlot(type: IrType): string {
     const name = `%await${++this.awaitSites}`;
     this.frameFields.push({ name, type });
@@ -2831,15 +2931,23 @@ export class FunctionLowering {
         return this.lowerDoWhile(s, cur);
       case "for":
         return this.lowerFor(s, cur);
+      case "switch":
+        return this.lowerSwitch(s, cur);
       case "block":
         return this.lowerBlock(s, cur);
       case "tryCatch":
         return this.lowerTry(s, cur);
       default:
         // A construct with a jump out of it that the pass cannot explode
-        // (for-of, switch); suspensions inside these already refused
-        // during the eligibility scan.
-        return this.decline(`fn:async:jump-out-of-${s.kind.toLowerCase()}`);
+        // (for-of); suspensions inside it already refused during the
+        // eligibility scan. Forked on genType like every other census
+        // name in this file — the hardcoded "fn:async:" prefix used to
+        // fire here for a generator's escaping switch too, before switch
+        // got its own case above; kept forked now for whatever kind
+        // reaches this default next.
+        return this.decline(
+          this.linearizationRefusal(`fn:async:jump-out-of-${s.kind.toLowerCase()}`, `fn:generator:jump-out-of-${s.kind.toLowerCase()}`),
+        );
     }
   }
 
@@ -2999,13 +3107,34 @@ export class FunctionLowering {
         // No event loop, no settled-dependency fast path: EVERY yield
         // suspends and returns — `tail` keeps its default (this.ret()).
         const node = susp.node;
+        // The operand evaluates into its OWN frame slot BEFORE saves() —
+        // mirroring "await"'s own `this.set(slot, node.value)` ahead of
+        // its save block, for the identical reason: an operand with a
+        // side effect of its own (`yield i++`) must have that effect
+        // already landed in the local BY THE TIME saves() reads it.
+        // Embedding node.value straight into %gen.suspend's own value
+        // field (the pre-fix shape) evaluated it AFTER saves() had
+        // already run — the side effect happened too late to be saved,
+        // so a resumed generator restored the STALE pre-effect local and
+        // `while (true) yield i++;` yielded the same element forever.
+        // Found live during stage C (2454's Feed/#emit()/takeTwo(),
+        // Node-measured "0+1@2" vs this pass's then-"0+0@0"), but the
+        // bug is in stage A2c's own machinery, not this stage's own
+        // scope — every yield site was exposed to it, this is just the
+        // first program shape to combine a suspending loop with a
+        // side-effecting yield operand. Mutation-checked below.
+        const slot = node.value === null ? null : this.awaitSlot(node.value.type);
+        if (slot !== null) this.emit(cur, this.set(slot, node.value!));
         this.emit(cur, ...this.saves(), this.set(STATE_FIELD, this.num(resumeState)), {
           kind: "%gen.suspend",
           gen: this.genRef(),
           // The RAW yieldT-typed operand, un-retagged (null for a bare
           // `yield;`) — see %gen.suspend's own doc comment for why the
-          // pass never wraps this into V itself.
-          value: node.value === null ? null : widenExpr(node.value),
+          // pass never wraps this into V itself. Read back from the slot
+          // above, never node.value again — re-embedding it here would
+          // evaluate it a SECOND time, re-running any side effect (and,
+          // for a non-stable expression, changing what value ships).
+          value: slot === null ? null : this.get(slot, node.value!.type),
           loc: node.loc,
         });
         // NEXT falls through as a no-op; THROW/GENRET unwind into the
@@ -3169,6 +3298,63 @@ export class FunctionLowering {
     if (end !== null) this.emit(end, ...this.goto(updS));
     if (s.update !== null) this.emit(updS, s.update);
     this.emit(updS, ...this.goto(headS));
+    return exitS;
+  }
+
+  /** `switch` — the ONE construct this pass splits by reusing its own
+   * source shape as the dispatch, rather than building new comparison
+   * logic: `disc` and every `test` carry over VERBATIM, in source order,
+   * so the emitter's already-correct f64/bool/string comparison and
+   * laziness (a test after the matching one never evaluates) apply
+   * unchanged — the split only replaces each case's BODY with a `goto`
+   * into a dedicated new state. A source switch with no `default` gets a
+   * SYNTHETIC trailing `{test: null, body: goto(exitS)}` arm: falling out
+   * of the wasm-level switch construct in the split world does not reach
+   * "whatever comes after" the way it would in un-split code (there is no
+   * "after" in the same state) — without this arm, "no match, no default"
+   * would silently stall instead of reaching exitS. Caught at design time,
+   * mutation-checked below.
+   *
+   * FALLTHROUGH (including a real, mid-list `default`, and stacked case
+   * labels with empty bodies) comes for free from `lowerList`'s own
+   * contract: a non-null return means the list fell through, so chaining
+   * `goto(next case's state)` after each case's own end reproduces it
+   * exactly, IN SOURCE ORDER — the default's own STATE sits at its own
+   * source position in that chain like any other case, so a middle
+   * default falls through into whatever follows it textually, exactly as
+   * Node does; only the LAST case's fall-through lands at exitS.
+   *
+   * `break` binds to the switch (scopeFor's own `{loop:false,
+   * breakable:true}`); `continue` does not — `continueState: null` lets
+   * `resolveJump` walk past this switch to the enclosing loop unchanged
+   * (the pass-through rule). Both need the switch's OWN `labels`, not a
+   * hardcoded `[]` — a labeled break naming this switch must bind HERE,
+   * not to whatever outer construct happens to share a jump target. */
+  private lowerSwitch(s: Extract<IrStmt, { kind: "switch" }>, cur: number): number {
+    const exitS = this.newState();
+    const hasDefault = s.cases.some((c) => c.test === null);
+    const caseStates = s.cases.map(() => this.newState());
+    const dispatchCases = s.cases.map((c, i) => ({
+      test: c.test,
+      body: widenBody(this.goto(caseStates[i]!)),
+    }));
+    if (!hasDefault) dispatchCases.push({ test: null, body: widenBody(this.goto(exitS)) });
+    this.emit(cur, { kind: "switch", disc: s.disc, cases: dispatchCases, loc: s.loc });
+
+    this.jumps.push({
+      labels: s.labels ?? [],
+      loop: false,
+      breakable: true,
+      breakState: exitS,
+      continueState: null,
+    });
+    let prevEnd: number | null = null;
+    for (let i = 0; i < s.cases.length; i++) {
+      if (prevEnd !== null) this.emit(prevEnd, ...this.goto(caseStates[i]!));
+      prevEnd = this.lowerList(s.cases[i]!.body, caseStates[i]!);
+    }
+    this.jumps.pop();
+    if (prevEnd !== null) this.emit(prevEnd, ...this.goto(exitS));
     return exitS;
   }
 

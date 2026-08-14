@@ -1344,6 +1344,54 @@ const TIER_FLOOR: string[] = [
   // this arm call nearestOf too, same as catchArm already does.
   "2683-generators-finally-catch-between.ts",
   "2684-async-finally-catch-between.ts",
+  // Increment 19 stage C: switch linearization. lowerSwitch reuses the
+  // source "switch" shape itself as the dispatch — same disc, same tests,
+  // verbatim, in source order — replacing only each case's body with a
+  // goto into its own new state; fallthrough (including a MIDDLE default)
+  // comes for free from lowerList's own "non-null return falls through"
+  // contract. 2019's fromSwitch() is the direct claim (its own
+  // fn:generator:yield-in-switch clears); the async mirror
+  // (fn:async:await-in-switch) had no corpus program sitting on it today.
+  "2019-generators-loops.ts",
+  // Increment 19 stage C: for-of array desugar. hoistStmt's own "forOf"
+  // case rewrites an array-typed, suspension-containing for-of into an
+  // ordinary index-based "for" (a hidden array-hold local, a hidden index
+  // local, arrayGet/arrIntrinsic("length") — the same shape emitter.ts's
+  // own non-suspending array-forOf case already uses) BEFORE checkPositions
+  // ever runs, so the existing for-machinery does the rest with no changes
+  // of its own. A for-of over a GENERATOR was never this pass's problem —
+  // lower-generators.ts's lowerForOfGenerator already desugars it to a
+  // while loop at the FRONTEND, unconditionally, so no "forOf" IR node
+  // survives for one. Building this ALSO exposed a real, unrelated stage
+  // A2c bug live: lowerSuspension's "yield" case embedded a suspending
+  // yield's operand straight into %gen.suspend's own value field,
+  // evaluated AFTER saves() already ran (rather than into its own frame
+  // slot BEFORE saves(), the way "await"'s case already did) — a
+  // side-effecting operand (`yield i++`) lost its side effect on every
+  // suspend/resume round trip, so `while (true) yield i++;` silently
+  // yielded the same element forever. Fixed the same way await already
+  // handles it (evaluate into an awaitSlot first). 2454's own
+  // Feed/#emit()/takeTwo() (a private generator method whose finally
+  // observes IteratorClose on an early for-of break) is what exposed it —
+  // no existing corpus program had combined a suspending LOOP with a
+  // side-effecting yield operand before.
+  //
+  // 2454 and its own yield-in-forof clear; 1594 and 965 clear their own
+  // await-in-forof. 2456's first refusal RELOCATES rather than clearing —
+  // its pre-slice-5 blocker (strIntrinsic:toUpperCase) was always waiting
+  // one refusal further in, simply unreachable until yield-in-forof lifted
+  // — so it is NOT a new claim, deliberately left off this list. 1452 does
+  // NOT claim either, for an unrelated, pre-existing, documented reason:
+  // its OWN asyncThrough() for-of/await clears, but a SEPARATE nested
+  // function in the same file (asyncReplaced(), line ~140) independently
+  // trips fn:async:return-in-finally — a return crossing a finally that
+  // itself never suspends, the narrowed (not lifted) case the header's
+  // own comment on that decline describes ("still has no fix — the decline
+  // narrows to exactly that case rather than lifting outright"). Not
+  // forOf's scope; not fixed here.
+  "2454-private-generator-methods.ts",
+  "1594-js-async.js",
+  "965-generics-async.ts",
 ];
 
 interface RunResult {

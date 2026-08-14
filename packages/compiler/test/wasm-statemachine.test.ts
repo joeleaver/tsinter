@@ -1069,35 +1069,57 @@ describe("refusals leave the function untouched", () => {
     );
   });
 
-  test("await inside for-of", () => {
+  // "await inside for-of" over an ARRAY iterable lived here through stage
+  // B: forOf had no lowering at all, so ANY suspension inside one — over
+  // any iterable type — declined under this name. Stage C's forOf desugar
+  // (hoistStmt's own "forOf" case: an array-typed, suspension-containing
+  // forOf becomes an ordinary index-based "for", which the EXISTING for-
+  // machinery then linearizes with no changes of its own) means an array
+  // iterable no longer declines here — full positive coverage lives in
+  // the "stage C: forOf array desugar" describe block below. What STILL
+  // declines under this name is every OTHER iterable kind (the frontend
+  // already desugars a GENERATOR iterable away entirely — see
+  // lower-generators.ts's lowerForOfGenerator — so a "forOf" IR node
+  // reaching this pass is never over one); pinned below with a dyn
+  // iterable standing in for "not an array."
+  test("await inside for-of over a NON-array iterable stays declined", () => {
     expectRefusal(
       plain(
         [
           {
             kind: "forOf",
             localId: "e.0",
-            iterable: v("xs.0", { kind: "array", elem: F64 }),
+            iterable: v("xs.0", DYN),
             body: [exprStmt(awaitCall())],
             loc,
           },
         ],
-        [local("e.0", F64), local("xs.0", { kind: "array", elem: F64 })],
+        [local("e.0", DYN), local("xs.0", DYN)],
       ),
       "fn:async:await-in-forof",
     );
   });
 
-  test("await inside switch", () => {
+  // "await inside switch" (case BODY) lived here through stage B: switch
+  // used to have no lowering at all, so ANY suspension anywhere inside one
+  // declined under this name. Stage C built lowerSwitch — a case body's
+  // own suspension now lowers for real (full-source coverage in the
+  // "stage C: switch dispatch reuse" describe block below); the premise
+  // this pin tested is gone, not merely its assertion. What STILL declines
+  // under a switch-specific name is a suspension in a case TEST (the
+  // conditional, lazily-evaluated part of a switch) — a materially
+  // different position, pinned in its place.
+  test("await inside a switch CASE TEST", () => {
     expectRefusal(
       plain([
         {
           kind: "switch",
           disc: num(1),
-          cases: [{ test: num(1), body: [exprStmt(awaitCall())] }],
+          cases: [{ test: awaitCall(), body: [log([str("hit")])] }],
           loc,
         },
       ]),
-      "fn:async:await-in-switch",
+      "fn:async:await-in-switch-test",
     );
   });
 
@@ -1118,31 +1140,16 @@ describe("refusals leave the function untouched", () => {
     );
   });
 
-  test("a break out of a kept construct into an exploded one", () => {
-    expectRefusal(
-      plain(
-        [
-          {
-            kind: "while",
-            cond: bool(true),
-            body: [
-              {
-                kind: "switch",
-                disc: num(1),
-                // `continue` inside a switch binds to the enclosing LOOP,
-                // which the await below explodes.
-                cases: [{ test: num(1), body: [{ kind: "continue", loc }] }],
-                loc,
-              },
-              exprStmt(awaitCall()),
-            ],
-            loc,
-          },
-        ],
-      ),
-      "fn:async:jump-out-of-switch",
-    );
-  });
+  // "a break out of a kept construct into an exploded one" lived here
+  // through stage B: a switch with ZERO suspension of its own, but a
+  // continue escaping it into an enclosing loop that DOES suspend
+  // elsewhere, used to fall to lowerStmt's generic default arm (no
+  // "switch" case existed) and decline. Stage C's lowerSwitch handles
+  // this shape directly — the switch's own JumpScope lets `continue`
+  // pass through to the loop unchanged — so the premise is gone; full
+  // positive coverage (the reviewer's own "yields outside a switch that
+  // continues" shape) lives in the "stage C: switch dispatch reuse"
+  // describe block below.
 
   test("awaiting a promise OF a promise (JS would adopt it)", () => {
     // `await p` where p is Promise<Promise<T>>: JS flattens by adoption —
@@ -2194,7 +2201,19 @@ describe("yield lowering (stage A2b — FunctionLowering used directly)", () => 
     }
   });
 
-  test("a yield with a value and a real nextT: suspend carries the raw operand, injectCheck runs on re-entry, sent is read back", () => {
+  test("a yield with a value and a real nextT: suspend carries the operand through its own frame slot (evaluated before saves(), mirroring await), injectCheck runs on re-entry, sent is read back", () => {
+    // Stage C's fix (found live via 2454's Feed/#emit()/takeTwo() — Node
+    // "0+1@2", this pass then "0+0@0"): a suspending yield's operand must
+    // evaluate into its OWN frame slot BEFORE saves() runs, exactly like
+    // await's own `this.set(awaitSlot, node.value)` already did — a
+    // side-effecting operand (`yield i++`) embedded straight into
+    // %gen.suspend's own value field (the pre-fix shape this test used to
+    // assert) evaluates AFTER saves() already captured the frame, so the
+    // side effect never survives a suspend/resume round trip. This test's
+    // OWN operand (`num(1)`) has no side effect to lose, but the slot
+    // indirection is unconditional (matching await, which never
+    // special-cases a stable operand either) — so the assertion here
+    // checks the NEW shape, not merely a no-op-for-this-operand detail.
     const fn: IrFunction = {
       name: "g",
       params: [],
@@ -2206,12 +2225,19 @@ describe("yield lowering (stage A2b — FunctionLowering used directly)", () => 
     };
     const { states } = new FunctionLowering(genModule(fn), fn, () => {}).runFrameAndStatesForTest();
 
+    // The slot write happens before saves() — a recordSet into a fresh
+    // "%awaitN" frame field, holding the literal 1.
+    const slotWrite = nodesOfKind(states, "recordSet").find(
+      (r) => String(r["field"]).startsWith("%await") && (r["value"] as { kind?: string })?.kind === "numLit",
+    );
+    expect(slotWrite).toMatchObject({ value: { kind: "numLit", value: 1 } });
+    const slotName = slotWrite!["field"] as string;
+
     const suspend = nodesOfKind(states, "%gen.suspend");
     expect(suspend).toHaveLength(1);
-    // The raw yieldT-typed operand, un-retagged — %gen.suspend's own
-    // contract (retagging is stage A3's job, at emission time, not the
-    // pass's — see the seam's doc comment for why).
-    expect(suspend[0]).toMatchObject({ value: { kind: "numLit", value: 1 } });
+    // %gen.suspend's own value is now a READ of that same slot, not the
+    // raw operand re-embedded (which would evaluate it a second time).
+    expect(suspend[0]).toMatchObject({ value: { kind: "recordGet", field: slotName } });
 
     expect(nodesOfKind(states, "%gen.injectCheck")).toHaveLength(1);
 
@@ -3593,5 +3619,497 @@ describe("stage B: parkThrow write discipline (full-source regressions)", () => 
         "",
       ].join("\n"),
     );
+  });
+});
+
+describe("stage C: switch dispatch reuse (full-source regressions)", () => {
+  let scratch: string;
+  beforeAll(async () => {
+    scratch = await mkdtemp(join(tmpdir(), "tsinter-wasm-stagec-switch-"));
+  });
+  afterAll(async () => {
+    await rm(scratch, { recursive: true, force: true });
+  });
+
+  async function buildWasm(name: string, source: string) {
+    const entry = join(scratch, name);
+    await writeFile(entry, source);
+    return compile(entry, { outPath: join(scratch, `${name}.wasm`), outDir: scratch, backend: "wasm" });
+  }
+
+  /** Mirrors stage B's own helper (see that describe block's doc comment):
+   * `_start` runs inside its own try/catch and a trap is asserted NOT to
+   * have happened, so every pin below fails loudly rather than passing on
+   * a silently-truncated run. */
+  async function runWasmExpectNoTrap(modulePath: string): Promise<string> {
+    const chunks: Buffer[] = [];
+    let memory: WebAssembly.Memory | null = null;
+    const { instance } = await WebAssembly.instantiate(readFileSync(modulePath), {
+      tsinter: {
+        write(fd: number, ptr: number, len: number): void {
+          if (memory === null) throw new Error("write before instantiation completed");
+          if (fd === 1) chunks.push(Buffer.from(new Uint8Array(memory.buffer, ptr, len)));
+        },
+      },
+    });
+    memory = instance.exports["memory"] as WebAssembly.Memory;
+    const trap = await Promise.resolve()
+      .then(() => (instance.exports["_start"] as () => void)())
+      .then(
+        () => null,
+        (err: unknown) => err,
+      );
+    expect(trap).toBeNull();
+    return Buffer.concat(chunks).toString("utf8");
+  }
+
+  test("a middle default: Node enters at the default's SOURCE position and falls through into later cases — the silent-if-wrong state-chain property", async () => {
+    const res = await buildWasm(
+      "sc-switch-middle-default.ts",
+      [
+        "function* f64Mid(mode: number): Generator<string, void, unknown> {",
+        "  switch (mode) {",
+        "    case 0:",
+        '      yield "zero";',
+        "      break;",
+        "    default:",
+        '      yield "DEF";',
+        "    case 1:",
+        '      yield "one";',
+        "      break;",
+        "    case 2:",
+        '      yield "two";',
+        "      break;",
+        "  }",
+        '  yield "tail";',
+        "}",
+        "function drive(mode: number): string {",
+        "  const out: string[] = [];",
+        "  for (const s of f64Mid(mode)) out.push(s);",
+        '  return out.join(",");',
+        "}",
+        "console.log(drive(9));",
+        "console.log(drive(0));",
+        "console.log(drive(1));",
+        "console.log(drive(2));",
+        "",
+      ].join("\n"),
+    );
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+    expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+    const stdout = await runWasmExpectNoTrap(res.binaryPath);
+    // Node-measured (probe1-middle-default.ts, this session): mode 9
+    // matches nothing, enters the default AT ITS OWN SOURCE POSITION
+    // (between case 0 and case 1), and falls through into case 1.
+    expect(stdout).toBe(["DEF,one,tail", "zero,tail", "one,tail", "two,tail", ""].join("\n"));
+  });
+
+  test("last-case fallthrough lands at the switch's own exit, and a no-match falls straight through every case", async () => {
+    const res = await buildWasm(
+      "sc-switch-last-fallthrough.ts",
+      [
+        "function* f64Last(mode: number): Generator<string, void, unknown> {",
+        "  switch (mode) {",
+        "    case 0:",
+        '      yield "zero";',
+        "      break;",
+        "    case 1:",
+        '      yield "one";',
+        "    case 2:",
+        '      yield "two";',
+        "  }",
+        '  yield "tail";',
+        "}",
+        "function drive(mode: number): string {",
+        "  const out: string[] = [];",
+        "  for (const s of f64Last(mode)) out.push(s);",
+        '  return out.join(",");',
+        "}",
+        "console.log(drive(0));",
+        "console.log(drive(1));",
+        "console.log(drive(2));",
+        "console.log(drive(3));",
+        "",
+      ].join("\n"),
+    );
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+    expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+    const stdout = await runWasmExpectNoTrap(res.binaryPath);
+    // Node-measured (probe2-last-fallthrough.ts, this session).
+    expect(stdout).toBe(["zero,tail", "one,two,tail", "two,tail", "tail", ""].join("\n"));
+  });
+
+  test("no default clause, no match: reaches past the switch instead of silently stalling in the split world", async () => {
+    // The synthetic {test:null, body:goto(exitS)} arm this pin targets was
+    // mutation-checked directly against this exact shape (this session):
+    // disabling the arm turned drive(99) from "tail" into "" — the
+    // generator exhausted with zero yields rather than reaching the tail
+    // statement — while unrelated controls stayed green.
+    const res = await buildWasm(
+      "sc-switch-no-default.ts",
+      [
+        "function* noDefault(mode: number): Generator<string, void, unknown> {",
+        "  switch (mode) {",
+        "    case 0:",
+        '      yield "zero";',
+        "      break;",
+        "    case 1:",
+        '      yield "one";',
+        "      break;",
+        "  }",
+        '  yield "tail";',
+        "}",
+        "function drive(mode: number): string {",
+        "  const out: string[] = [];",
+        "  for (const s of noDefault(mode)) out.push(s);",
+        '  return out.join(",");',
+        "}",
+        "console.log(drive(0));",
+        "console.log(drive(1));",
+        "console.log(drive(99));",
+        "",
+      ].join("\n"),
+    );
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+    expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+    const stdout = await runWasmExpectNoTrap(res.binaryPath);
+    // Node-measured (probe4-no-default.ts, this session).
+    expect(stdout).toBe(["zero,tail", "one,tail", "tail", ""].join("\n"));
+  });
+
+  test("a labeled break naming the switch's OWN label binds there, not to whatever outer construct shares a jump target", async () => {
+    const res = await buildWasm(
+      "sc-switch-labeled-break.ts",
+      [
+        "function* labeled(mode: number): Generator<string, void, unknown> {",
+        "  outer: switch (mode) {",
+        "    case 0:",
+        '      yield "zero";',
+        "      if (mode === 0) break outer;",
+        '      yield "unreachable";',
+        "    case 1:",
+        '      yield "one";',
+        "      break;",
+        "  }",
+        '  yield "tail";',
+        "}",
+        "function drive1(mode: number): string {",
+        "  const out: string[] = [];",
+        "  for (const s of labeled(mode)) out.push(s);",
+        '  return out.join(",");',
+        "}",
+        "console.log(drive1(0));",
+        "console.log(drive1(1));",
+        "",
+        // The SAME label name reused on an outer loop — catches a switch's
+        // own JumpScope entry accidentally binding to the WRONG (outer)
+        // scope (the one type-correct wrong value is `labels: []`).
+        "function* nestedSameLabel(mode: number): Generator<string, void, unknown> {",
+        "  loop: for (let i = 0; i < 2; i++) {",
+        "    switch (mode) {",
+        "      case 0:",
+        "        yield `i${i}`;",
+        "        break;", // binds to the switch, NOT the loop
+        "      case 1:",
+        "        if (i === 0) continue loop;", // binds to the loop (pass-through)
+        "        yield `i${i}`;",
+        "        break;",
+        "    }",
+        "    yield `after${i}`;",
+        "  }",
+        "}",
+        "function drive2(mode: number): string {",
+        "  const out: string[] = [];",
+        "  for (const s of nestedSameLabel(mode)) out.push(s);",
+        '  return out.join(",");',
+        "}",
+        "console.log(drive2(0));",
+        "console.log(drive2(1));",
+        "",
+      ].join("\n"),
+    );
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+    expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+    const stdout = await runWasmExpectNoTrap(res.binaryPath);
+    // Node-measured (probe3-labeled-break.ts, this session).
+    expect(stdout).toBe(["zero,tail", "one,tail", "i0,after0,i1,after1", "i1,after1", ""].join("\n"));
+  });
+
+  test("a zero-suspension switch that a continue escapes, inside a loop whose body yields OUTSIDE the switch — the reviewer's own pre-read shape (the second decline site: escapes(s) with no suspension)", async () => {
+    // Before stage C, this fell to lowerStmt's generic default arm (no
+    // "switch" case existed) and declined fn:async:jump-out-of-switch even
+    // though NOTHING inside the switch itself suspends — see the retired
+    // "a break out of a kept construct into an exploded one" IR-level pin
+    // above. lowerSwitch's own JumpScope now handles it directly.
+    const res = await buildWasm(
+      "sc-switch-escape.ts",
+      [
+        "function* sc_switch_escape(): Generator<number, number, undefined> {",
+        "  let step = 0;",
+        "  while (true) {",
+        "    step++;",
+        "    switch (step) {",
+        "      case 1:",
+        "      case 3:",
+        "      case 5:",
+        "      case 7:",
+        "        continue;", // odd steps: escape the switch AND the while body, no yield
+        "      case 9:",
+        "        return 232;",
+        "      default:",
+        "        break;", // even steps: fall through to the yield below
+        "    }",
+        "    yield step;",
+        "  }",
+        "}",
+        "const it = sc_switch_escape();",
+        "for (let i = 0; i < 5; i++) {",
+        "  const r = it.next();",
+        "  console.log(r.value, r.done);",
+        "}",
+        "",
+      ].join("\n"),
+    );
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+    expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+    const stdout = await runWasmExpectNoTrap(res.binaryPath);
+    // Node-measured (probe6-sc-switch-escape.ts, this session): four
+    // yields (the even steps), then the case-9 return.
+    expect(stdout).toBe(["2 false", "4 false", "6 false", "8 false", "232 true", ""].join("\n"));
+  });
+
+  test("the discriminant itself suspends: hoists like an if's condition (evaluates exactly once, unconditionally, before any test) — generator and async lanes", async () => {
+    const res = await buildWasm(
+      "sc-switch-disc-suspends.ts",
+      [
+        "function* g(): Generator<string, void, string> {",
+        "  switch (yield \"which\") {",
+        "    case \"a\":",
+        '      yield "matched-a";',
+        "      break;",
+        "    case \"b\":",
+        '      yield "matched-b";',
+        "      break;",
+        "    default:",
+        '      yield "matched-default";',
+        "  }",
+        '  yield "tail";',
+        "}",
+        "function drive(input: string): string {",
+        "  const it = g();",
+        '  it.next("");', // priming call: the argument is always discarded
+        "  const out: string[] = [];",
+        "  let r = it.next(input);",
+        "  while (!r.done) {",
+        "    out.push(r.value);",
+        '    r = it.next("");',
+        "  }",
+        '  return out.join(",");',
+        "}",
+        'console.log(drive("a"));',
+        'console.log(drive("b"));',
+        'console.log(drive("z"));',
+        "",
+        "async function step(v: string): Promise<string> {",
+        "  return v;",
+        "}",
+        "async function h(input: string): Promise<string> {",
+        "  const out: string[] = [];",
+        "  switch (await step(input)) {",
+        "    case \"a\":",
+        '      out.push("matched-a");',
+        "      break;",
+        "    default:",
+        '      out.push("matched-default");',
+        "  }",
+        '  out.push("tail");',
+        '  return out.join(",");',
+        "}",
+        'h("a").then((v) => console.log(v));',
+        'h("z").then((v) => console.log(v));',
+        "",
+      ].join("\n"),
+    );
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+    expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+    const stdout = await runWasmExpectNoTrap(res.binaryPath);
+    // Node-measured (probe7-discriminant-suspends.ts, this session): the
+    // three sync generator drives print first, then the two async .then
+    // callbacks in scheduling order.
+    expect(stdout).toBe(
+      ["matched-a,tail", "matched-b,tail", "matched-default,tail", "matched-a,tail", "matched-default,tail", ""].join(
+        "\n",
+      ),
+    );
+  });
+});
+
+describe("stage C: forOf array desugar + the yield-operand slot fix (full-source regressions)", () => {
+  let scratch: string;
+  beforeAll(async () => {
+    scratch = await mkdtemp(join(tmpdir(), "tsinter-wasm-stagec-forof-"));
+  });
+  afterAll(async () => {
+    await rm(scratch, { recursive: true, force: true });
+  });
+
+  async function buildWasm(name: string, source: string) {
+    const entry = join(scratch, name);
+    await writeFile(entry, source);
+    return compile(entry, { outPath: join(scratch, `${name}.wasm`), outDir: scratch, backend: "wasm" });
+  }
+
+  /** Mirrors stage B's and stage C's own switch-block helper. */
+  async function runWasmExpectNoTrap(modulePath: string): Promise<string> {
+    const chunks: Buffer[] = [];
+    let memory: WebAssembly.Memory | null = null;
+    const { instance } = await WebAssembly.instantiate(readFileSync(modulePath), {
+      tsinter: {
+        write(fd: number, ptr: number, len: number): void {
+          if (memory === null) throw new Error("write before instantiation completed");
+          if (fd === 1) chunks.push(Buffer.from(new Uint8Array(memory.buffer, ptr, len)));
+        },
+      },
+    });
+    memory = instance.exports["memory"] as WebAssembly.Memory;
+    const trap = await Promise.resolve()
+      .then(() => (instance.exports["_start"] as () => void)())
+      .then(
+        () => null,
+        (err: unknown) => err,
+      );
+    expect(trap).toBeNull();
+    return Buffer.concat(chunks).toString("utf8");
+  }
+
+  test("array for-of inside a generator body, its async mirror, and a break with no IteratorClose needed", async () => {
+    const res = await buildWasm(
+      "sc-forof-basic.ts",
+      [
+        "function* doubleAll(xs: number[]): Generator<number, void, unknown> {",
+        "  for (const x of xs) {",
+        "    yield x * 2;",
+        "  }",
+        "  yield -1;",
+        "}",
+        "function drive(xs: number[]): string {",
+        "  const out: number[] = [];",
+        "  for (const v of doubleAll(xs)) out.push(v);",
+        '  return out.join(",");',
+        "}",
+        "console.log(drive([1, 2, 3]));",
+        "console.log(drive([]));",
+        "",
+        "async function step(v: number): Promise<number> {",
+        "  return v + 100;",
+        "}",
+        "async function sumSteps(xs: number[]): Promise<number> {",
+        "  let total = 0;",
+        "  for (const x of xs) {",
+        "    total += await step(x);",
+        "  }",
+        "  return total;",
+        "}",
+        'sumSteps([1, 2, 3]).then((v) => console.log("sum:", v));',
+        'sumSteps([]).then((v) => console.log("sum:", v));',
+        "",
+        "function* takeUntil(xs: number[], stop: number): Generator<number, void, unknown> {",
+        "  for (const x of xs) {",
+        "    if (x === stop) break;",
+        "    yield x;",
+        "  }",
+        "  yield -1;",
+        "}",
+        "function driveTake(xs: number[], stop: number): string {",
+        "  const out: number[] = [];",
+        "  for (const v of takeUntil(xs, stop)) out.push(v);",
+        '  return out.join(",");',
+        "}",
+        "console.log(driveTake([1, 2, 3, 4], 3));",
+        "",
+      ].join("\n"),
+    );
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+    expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+    const stdout = await runWasmExpectNoTrap(res.binaryPath);
+    // Node-measured (probe12-forof-basic.ts, this session).
+    expect(stdout).toBe(["2,4,6,-1", "-1", "1,2,-1", "sum: 0", "sum: 306", ""].join("\n"));
+  });
+
+  test("a suspending loop's yield operand with its OWN side effect (`yield i++`) survives a suspend/resume round trip — the bug 2454 exposed live (Node measured 0+1@2 for the shape below; this pass, pre-fix, silently produced 0+0@0)", async () => {
+    // lowerSuspension's "yield" case embedded the operand straight into
+    // %gen.suspend's own value field, evaluated AFTER saves() already ran
+    // (saves() ran first in emission order) — so a side effect from
+    // evaluating the operand (i++ incrementing i) landed in the local
+    // too late to be captured in the frame, and a resumed generator
+    // restored the STALE pre-effect value every time. Fixed by hoisting
+    // the operand into its own frame slot BEFORE saves(), mirroring how
+    // "await"'s own case already did this. Unrelated to forOf/switch —
+    // exposed by 2454's Feed/#emit()/takeTwo() (private generator method,
+    // for-of-driven IteratorClose on early break) simply being the first
+    // program to reach a suspending LOOP whose yield operand has a side
+    // effect of its own; this pin reproduces the exact shape.
+    const res = await buildWasm(
+      "sc-yield-operand-side-effect.ts",
+      [
+        "class Feed {",
+        "  closedAt = -1;",
+        "  *#emit(): Generator<number, void, undefined> {",
+        "    let i = 0;",
+        "    try {",
+        "      while (true) yield i++;",
+        "    } finally {",
+        "      this.closedAt = i;",
+        "    }",
+        "  }",
+        "  takeTwo(): string {",
+        "    const got: number[] = [];",
+        "    for (const v of this.#emit()) {",
+        "      got.push(v);",
+        "      if (got.length === 2) break;",
+        "    }",
+        '    return `${got.join("+")}@${this.closedAt}`;',
+        "  }",
+        "}",
+        "const f = new Feed();",
+        "console.log(f.takeTwo());",
+        "",
+        // A free-standing function control, isolating the fix from private-
+        // method machinery entirely.
+        "function* freeEmit(): Generator<number, void, undefined> {",
+        "  let i = 0;",
+        "  while (true) yield i++;",
+        "}",
+        "function driveFree(): string {",
+        "  const g = freeEmit();",
+        '  return `${g.next().value},${g.next().value},${g.next().value}`;',
+        "}",
+        'console.log("free:", driveFree());',
+        "",
+        // Controls proving the fix is scoped to the side-effecting case:
+        // a SEPARATE increment statement (no operand side effect to lose)
+        // and a for-loop's own update slot (already correct) both stay
+        // right either way.
+        "function* freeSeparate(): Generator<number, void, undefined> {",
+        "  let i = 0;",
+        "  while (true) {",
+        "    yield i;",
+        "    i++;",
+        "  }",
+        "}",
+        "function driveSeparate(): string {",
+        "  const g = freeSeparate();",
+        '  return `${g.next().value},${g.next().value},${g.next().value}`;',
+        "}",
+        'console.log("separate:", driveSeparate());',
+        "",
+      ].join("\n"),
+    );
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+    expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+    const stdout = await runWasmExpectNoTrap(res.binaryPath);
+    // Node-measured (probe8-iteratorclose-repro.ts / probe11-narrow2.ts,
+    // this session).
+    expect(stdout).toBe(["0+1@2", "free: 0,1,2", "separate: 0,1,2", ""].join("\n"));
   });
 });
