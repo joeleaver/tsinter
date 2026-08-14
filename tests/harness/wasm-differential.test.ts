@@ -1287,6 +1287,63 @@ const TIER_FLOOR: string[] = [
   // same "one operand, nothing to get wrong" shape and were already
   // covered).
   "2013-generators-sent-values.ts",
+  // Increment 19 stage B: finalizer linearization, built generically over
+  // BOTH lanes (statemachine.ts's TRY/CATCH section, "STAGE B ADDITION").
+  // A suspension — or a return/uncaught-throw/GENRET crossing — inside a
+  // try/catch/finally now linearizes instead of declining. 2011/2012/2014
+  // are the generator targets (all at fn:generator:yield-in-finally
+  // before this slice; 2011 needed only the normal/GENRET-crossing corner,
+  // 2012 exercised the fuller set including a finally that itself yields
+  // and a finally whose own throw replaces the parked completion, 2014's
+  // one finally is simply abandoned mid-drain and never runs, matching
+  // Node). 1022 is the async lift's own stretch claim (fn:async:
+  // await-in-finally), taken because it byte-diffed green, exactly the
+  // "acceptance test that the machinery is actually general" the design
+  // report proposed. 1452/2432 (fn:async:return-in-finally) are NOT
+  // claimed here: both cleared their own return-in-finally blocker but
+  // hit separate, unrelated pre-existing gaps next (1452:
+  // fn:async:await-in-forof, 2432: strIntrinsic:toUpperCase) — refusal-
+  // bucket movement only, never forced, per the design report's own
+  // "stretch riders taken only if green by the same bar" rule.
+  "2011-generators-forof.ts",
+  "2012-generators-return-throw.ts",
+  "2014-generators-values.ts",
+  "1022-async-exceptions.ts",
+  // Increment 19 stage B, round 3: the reviewer's substance gate found
+  // four blocking findings on the nested-finalizer/handler-boundary axis
+  // (F1 reraisePending's THROW arm never chaining through a still-open
+  // outer finally, F2 catchArm routing to a handler regardless of
+  // nesting depth, F3 a compiler crash reading completion fields the
+  // frame never allocated, F4 a GENRET handler-group sentinel using the
+  // wrong representative state's finallyOf) plus two more found mid-fix
+  // (F5 the mandated regression pin not actually discriminating a real
+  // crash from the intended trap, F6/F7 the true final exit skipping the
+  // lane's own completion — %gen.markDone / %async.reject — leaving a
+  // generator wrongly resumable or a promise silently unsettled forever).
+  // Ten programs, one per finding plus two permanent controls (2679 for
+  // RETURN's own chaining, which never needed a fix; 2682 for async's own
+  // ordinary resolving path) — every one Node-measured, all three lanes
+  // byte-exact before landing.
+  "2673-generators-finally-chain.ts",
+  "2674-generators-finally-plain-outer.ts",
+  "2675-generators-finally-plain-inner.ts",
+  "2676-generators-finally-catch-order.ts",
+  "2677-generators-finally-fallthrough.ts",
+  "2678-generators-finally-genret-group.ts",
+  "2679-generators-finally-return-chain.ts",
+  "2680-generators-finally-throw-done.ts",
+  "2681-async-finally-throw.ts",
+  "2682-async-finally-normal.ts",
+  // F8, found by the reviewer's re-gate on the round-3 fix itself:
+  // reraisePending's THROW arm gave finallyOf a fixed FIRST priority over
+  // handlerOf — the exact category-first mistake F2 already fixed inside
+  // catchArm's own grouping, reintroduced at the one site that never got
+  // routed through nearestOf. A catch nested BETWEEN a suspending inner
+  // finally and an outer finally is where this actually matters: the
+  // catch is nearer, but the fixed order skipped it. Fixed by having
+  // this arm call nearestOf too, same as catchArm already does.
+  "2683-generators-finally-catch-between.ts",
+  "2684-async-finally-catch-between.ts",
 ];
 
 interface RunResult {

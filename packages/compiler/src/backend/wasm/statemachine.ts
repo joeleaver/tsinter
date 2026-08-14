@@ -103,29 +103,28 @@
  * branches, `buildWrapper`'s lazy generator branch, `catchArm`'s genType
  * branch (the GENRET routing-table fork AND the catch-region sentinel
  * prologue), and all eight `%gen.*` seam kinds' real emitter
- * implementations (`emitGenOutValue` and `UnionBuilder.retag` for the
- * two that need a real value-into-V retag) are ALL BUILT — stage A2c is
- * complete, both the pass and the emitter. `run()`'s guard is LIFTED
- * (A2c slice 5, `lowerResumableFunctions`' gate widened to match): a
- * real generator function now runs through this class for real.
+ * implementations are ALL BUILT — stage A is complete, both the pass and
+ * the emitter. genResume's CONSUMER-side state ladder is ALSO built in
+ * full: `.next()`/`.return()`/`.throw()` all three real emission (stage
+ * A3), the reentrancy TypeError, and the fast/resuming paths for every
+ * state. Stage B adds finalizer linearization, GENERICALLY over both
+ * lanes (`completeOrPark`/`genretRouting`/`parkThrow`/`reraisePending`,
+ * the TRY/CATCH section's own "STAGE B ADDITION" above): a suspension —
+ * or a return/uncaught-throw/GENRET crossing — inside a try/catch/
+ * FINALLY now linearizes instead of declining, for either lane.
  *
- * WHAT THAT DOES AND DOES NOT MEAN, stated exactly once here and
- * matched verbatim at the guard's own former site: GENERATOR BODIES
- * COMPILE AND THE WRAPPER IS LAZY. Generators do NOT WORK on this
- * backend yet — genResume's CONSUMER-side state ladder (`.next()`/
- * `.return()`/`.throw()`, stage A3) is wholly unbuilt, so nothing a
- * generator body does once resumed is exercised by any compiled user
- * program; `genResume`/`yieldExpr` still refuse by name at the emitter
- * (expr:genResume, the pass's own consumer of yieldExpr never survives
- * to be walked), which is what keeps `fn:generator`'s corpus programs
- * from silently miscompiling — they relocate to `expr:genResume`
- * instead, refusing at the correct, narrower point. AND yields in
- * unhoistable/finalizer/switch/forof positions decline under NAMED
- * `fn:generator:*` refusals (`linearizationRefusal` below) until their
- * OWN machinery lands — stage B for finalizers, an optional switch-
- * linearization lift, forOf-over-array — never under the `fn:async:*`
- * names the shared hoisting/position-checking machinery would otherwise
- * report, which would misname a construct with no `await` in it at all.
+ * WHAT REMAINS UNBUILT, stated exactly once here: yield/await inside a
+ * SWITCH or a for-of both still decline by name
+ * (`fn:generator:yield-in-switch`/`yield-in-forof`, mirrored on the
+ * async side) — real linearization machinery neither lane has, not a
+ * simple lift. A break/continue LEAVING a finally-protected region also
+ * still declines (`fn:async:jump-out-of-trycatch`, narrowed by stage B
+ * to exactly that shape) — the completion-parking machinery stage B
+ * built covers return/throw/GENRET/normal completion, never a jump
+ * target. Conditional/loop-header yield positions decline under
+ * mirrored names (`linearizationRefusal` below) the same as async's own
+ * always have. None of these are oversights left implicit — every one
+ * refuses loudly under its own named construct, never silently.
  *
  * ONE RESUME SIGNATURE. Resume takes `%frameBase` — an empty OPEN struct
  * every concrete frame subtypes — and casts it down to its own shape in a
@@ -329,6 +328,47 @@
  * state was created before the region opened, so it already carries the
  * outer handler.
  *
+ * STAGE B ADDITION: that is still true for a NO-finalizer region — the
+ * paragraph above is unchanged for it. A finalizer is different: RETURN,
+ * an uncaught THROW, and (generator only) GENRET crossing a
+ * finally-protected region no longer complete/propagate directly —
+ * `completeOrPark`/the routing table's `genretRouting`/`parkThrow` park
+ * the completion (kind + value, in FRAME slots — `%pending.kind`/
+ * `%pending.value`, lazy per function) and detour into the finally's own
+ * linearized states instead; its natural end re-raises whatever got
+ * parked (`reraisePending`), chaining into a STILL-open OUTER finally if
+ * one exists (nested finallys — probe-gen-cell.ts's case C) rather than
+ * completing right there. `lowerTry`'s own doc comment has the region-
+ * nesting shape (a finally's region covers BOTH the try and catch
+ * bodies; the handler, if any, covers only the try body, nested inside).
+ * A break/continue LEAVING a finally-protected region is the ONE case
+ * this stage does NOT build (`fn:async:jump-out-of-trycatch`, narrowed
+ * to exactly that shape now rather than declining every finally-bearing
+ * try) — a named, accepted gap, not a silent one.
+ *
+ * ROUND 3 (the reviewer's substance gate, four findings, F1/F2/F3/F4):
+ * the paragraph above was only TRUE for RETURN and GENRET when it first
+ * shipped — THROW's own re-raise (`reraisePending`'s THROW arm) never
+ * consulted `finallyOf` at all, unwinding straight out instead of
+ * chaining into a still-open outer finally (F1). Separately, "the
+ * handler, if any, covers only the try body, nested inside [the
+ * finally's region]" is the nesting for a SINGLE full try/catch/finally
+ * — it does NOT generalize to "a handler always wins over a finally,"
+ * which is what catchArm's own routing assumed (F2: an inner
+ * try/finally wrapped by a SEPARATE outer try/catch nests the OTHER
+ * way, finally nearer, and must run before the outer catch ever sees
+ * the exception) and what let a shared handler-group's GENRET sentinel
+ * read the wrong representative state's `finallyOf` when the group
+ * spanned states with different finallyOf (F4). `protectionSeq`/
+ * `nearestOf` (below) are what F1/F2/F4 share: a genuine "which
+ * protection is closer" comparison, not a fixed handler-over-finally
+ * priority — RETURN/GENRET still never consult handlerOf (a return
+ * completion is never caught by a handler, only run through finally
+ * chains), so nothing about their OWN routing changed. F3 (a compiler
+ * crash: `reraisePending` reading `%pending.*` fields the frame
+ * shape might not carry if no park call happened to run first) is
+ * closed at the read site, unconditionally, independent of F1/F2/F4.
+ *
  * THE ONE AWAIT THAT DOES NOT HOP. `module.await` is ECMAScript's INTERNAL
  * module-dependency wait (the frontend emits it for an import edge inside
  * an async import CYCLE; an ordinary async dependency gets a real
@@ -383,15 +423,21 @@
  *     exactly the statement shape, and the two names are kept apart so
  *     the census keeps naming the construct that actually needs work.
  *   - `fn:async:await-in-finally` (generator: `fn:generator:yield-in-
- *     finally`) — a suspension anywhere inside a try/catch/FINALLY. A
- *     finalizer takes part in COMPLETION: a return, a break and plain
- *     fallthrough each have to run it before they leave, which the
- *     emitter does with three copies of the body and a pending-return
- *     path (finallyStack) — and across a suspension those copies are
- *     states that have to re-dispatch to different places depending on
- *     why the region was left. Real machinery, and its own stage; a
- *     plain try/catch needs none of it, which is why the two are told
- *     apart by name.
+ *     finally`) — STAGE B BUILT THIS: a suspension anywhere inside a
+ *     try/catch/FINALLY now linearizes (checkPositions/hoistStmt/
+ *     lowerTry, above the TRY/CATCH section's own "STAGE B ADDITION"),
+ *     so this name no longer fires for that shape at all — kept here
+ *     (not deleted) because it can still show up on OTHER unlowerable
+ *     positions the census may yet measure, and the entry documents
+ *     what the construct WAS, for anyone reading a stale trace. A
+ *     finalizer takes part in COMPLETION: a return, an uncaught throw,
+ *     and (generator only) a GENRET unwind each have to run it before
+ *     they leave, which `completeOrPark`/`genretRouting`/`parkThrow`
+ *     handle by parking the completion in frame slots and detouring
+ *     into the finally's own states, re-raising at its natural end. A
+ *     break/continue leaving a finally-protected region is the ONE
+ *     shape this stage still declines — see `fn:async:jump-out-of-
+ *     trycatch`, below, narrowed to exactly that case now.
  *   - `fn:async:await-position` (generator: `fn:generator:yield-
  *     position`) — an await in a slot the hoisting rewrite cannot move
  *     it out of: a loop or for header (hoisting would evaluate once
@@ -441,12 +487,18 @@
  *     an index and a per-iteration binding, switch hides lazy test
  *     evaluation and fallthrough.
  *   - `fn:async:jump-out-of-<kind>` — a break/continue that leaves a
- *     construct this pass keeps verbatim (a for-of, a switch, or a try
- *     with a finalizer) for a construct it exploded. Keeping the jump
- *     would retarget it at the dispatch switch; exploding the container
- *     is the same work as the two entries above. A plain try/catch is no
- *     longer in that set — it linearizes, and a jump out of one leaves
- *     nothing to run.
+ *     construct this pass keeps verbatim (a for-of, a switch) for a
+ *     construct it exploded. Keeping the jump would retarget it at the
+ *     dispatch switch; exploding the container is the same work as the
+ *     two entries above. A plain try/catch is not in that set — it
+ *     linearizes, and a jump out of one leaves nothing to run.
+ *     `fn:async:jump-out-of-trycatch` specifically (stage B) NARROWED
+ *     rather than widened: a try/finally that a break/continue leaves,
+ *     with nothing inside it suspending, still declines here (running
+ *     the finalizer on the way out needs jump-routing this stage did
+ *     not build — a named, accepted gap, not a silent one); a
+ *     SUSPENDING try/finally no longer reaches this name at all — see
+ *     `fn:async:await-in-finally`, above.
  *   - `fn:async:boxed-in-loop` — a body-boxed local whose declaration can
  *     run more than once: inside a loop, in a `for` header, or as a
  *     for-of binding. JS gives each execution a FRESH binding (the
@@ -470,11 +522,18 @@
  *   - `fn:async:self-ref` — `selfRef` in the body. It means "the running
  *     closure", and after the split the running closure is resume's, not
  *     the wrapper's; rewriting it to `closure(f)` is future work.
- *   - `fn:async:return-in-finally` — a `return` inside a try that has a
- *     finally. The emitter's PENDING-RETURN path runs the finally BEFORE
- *     the function returns, and the promise must settle after it, not
- *     before — so the naive settle-then-return rewrite is observably
- *     wrong and the finally has to take part in completion.
+ *   - `fn:async:return-in-finally` — NARROWED as of stage B: a `return`
+ *     inside a finally-bearing try still declines here ONLY when that
+ *     try has NO suspension anywhere in it (checkEligible's own
+ *     `!hasSuspension(rec)` check). For that verbatim-kept shape,
+ *     rewriteReturns' naive settle-then-return splice is still wrong —
+ *     the emitter's own PENDING-RETURN path (emitTryCatch) only
+ *     intercepts the BARE return that follows the spliced settle, by
+ *     which point the settle already ran, observably too early. A try/
+ *     finally that DOES suspend somewhere no longer reaches this name:
+ *     `completeOrPark` parks the return and detours through the
+ *     finally's own linearized states instead, settling only once it
+ *     genuinely completes — see `fn:async:await-in-finally`, above.
  *     (`fn:async:return-in-<kind>` is its open-ended sibling: a `return`
  *     inside a container the return rewrite has never met.)
  *   - `fn:async:void-local` / `fn:async:local-id-clash` — shapes the
@@ -612,6 +671,26 @@ export type AsyncStmt =
    * increment-10 exception cell and unwind (which lands in resume's own
    * catch, and so becomes this frame's rejection). Otherwise a no-op. */
   | { kind: "%async.rejectCheck"; promise: WExpr; loc: SrcLoc }
+  /** Restore a parked THROW's snapshot (parkThrow's own `%pending.exc`
+   * write — see its doc comment for why that snapshot is `excRef`
+   * itself, never a fresh cell read) back into the exception cell, then
+   * return UNCONDITIONALLY — no check needed, since this op just filled
+   * the cell itself, and the resume function is always void. This is
+   * `reraisePending`'s own THROW-kind re-raise, and it is NOT `rethrow`
+   * (which reads a CAUGHT-typed LOCAL a wasm catch clause bound) for a
+   * load-bearing reason: a finally that ITSELF suspends re-raises from a
+   * LATER, SEPARATE resume invocation than the one whose catch clause
+   * originally bound the exception — wasm locals are per-invocation, so
+   * that binding is gone by the time re-raise runs (the null-pointer
+   * crash this slice's own regression test caught). `snapshot` is
+   * frame-resident (`%pending.exc`, written by parkThrow before the
+   * suspend, read back here after) — a struct, not a local, so it
+   * survives the invocation boundary the same way every other frame
+   * field already does. The caller (genResume's own post-call
+   * `emitPendingCheck`, unconditional after every resume call) is what
+   * actually propagates the restored cell onward — this op's own job
+   * ends at "cell restored, function returned". */
+  | { kind: "%async.pendingUnwind"; snapshot: WExpr; loc: SrcLoc }
   /** rejectCheck for an awaited `Promise<T> | units` union: only the
    * `promiseTag` arm can carry a rejection. */
   | { kind: "%async.rejectCheckUnion"; value: WExpr; promiseTag: number; loc: SrcLoc }
@@ -1290,6 +1369,154 @@ const PROMISE_FIELD = "%promise";
  * as fn.generator/fn.async themselves. */
 const GEN_FIELD = "%gen";
 
+/** Stage B (finalizer linearization): a try/finally whose finally is
+ * itself entered from more than one path — normal fall-through, an
+ * uncaught exception, a `return`, or (generator only) a GENRET unwind —
+ * has to remember WHICH one, and (for RETURN) the value, across however
+ * many states the finally's own body splits into. Frame-resident, not
+ * $gen-resident, because a finally can suspend in EITHER lane (async's
+ * own await-in-finally lift rides the same fields) — generators.ts's
+ * `retPark` is a different slot for a different job (a GENRET's OWN
+ * parked value, read back once by genretExit; this is the completion a
+ * finally is currently running ON BEHALF OF). Only RETURN needs
+ * `%pending.value` (always present — mapTypeSoft's own never-refuses
+ * doctrine covers a void returnType exactly like retPark already does);
+ * THROW needs `%pending.exc` instead (below) — GENRET needs neither, its
+ * payload staying in `$gen.retPark` throughout.
+ *
+ * ONE SLOT, NO STACK (reviewer pre-read, measured — the inner-finalizer-
+ * return-override probe, built specifically to try to break this, shows
+ * REPLACEMENT never stacking): nested finallys process their parked
+ * completion sequentially, one at a time, so a single %pending.kind/
+ * %pending.value/%pending.exc set covers every finally region in the
+ * function.
+ *
+ * WRITE DISCIPLINE, the FULL requirement after the reviewer's pre-read
+ * AND two rounds of crashes/miscompiles a mandated pin test found in
+ * this exact corner (documented in full because both are the kind of
+ * bug that reappears in a slightly different shape if the reasoning
+ * behind the fix is lost): %pending.kind is written on EVERY park,
+ * unconditionally — parkNormal/parkThrow/genretRouting/completeOrPark
+ * ALL write it. That alone was NOT sufficient for THROW specifically:
+ * THROW's payload rides the shared, module-global exception cell
+ * (kindG/f64G/refG/preG), and the cell's own lifetime does NOT line up
+ * with a park that survives a suspend.
+ *
+ * ROUND 1 (the crash): leaving the cell set-but-unconsumed across the
+ * suspend a park causes is UNSAFE — `%gen.injectCheck` (pre-existing,
+ * every yield's own re-entry prologue) unconditionally checks that SAME
+ * cell on every resume call, regardless of that call's own inject mode,
+ * so a stale cell misroutes the very next resume before this finally
+ * even reaches its own natural end. Fixed by having parkThrow move the
+ * exception INTO frame storage before parking, rather than leaving it
+ * in the cell.
+ *
+ * ROUND 2 (the miscompile, found by the SAME pin once round 1's own fix
+ * was in place — the pin passed on "does it crash", not yet on "is the
+ * value right", which is exactly why outcome-asserting pins matter more
+ * than crash-only ones): the FIRST version of "move the exception into
+ * frame storage" tried to do it by reading the cell directly (an
+ * `%async.excSnapshot` op, since removed) — but parkThrow only ever
+ * runs from INSIDE catchArm()'s own routing table, which only ever runs
+ * AFTER the enclosing `guarded` tryCatch's generic `catch (e)` prologue
+ * has ALREADY built its own snapshot (`excRef`, buildResume's EXC_LOCAL
+ * binding) AND unconditionally cleared the cell. A second read of the
+ * cell at that point sees only the clear — a THROW park whose payload
+ * silently became "nothing", which reraisePending's own restore then
+ * propagated as "nothing pending" instead of the real exception. No
+ * trap, no wrong-shaped output even — just the generator quietly
+ * finishing as if nothing had been thrown. Fixed by having parkThrow
+ * reuse `excRef` directly (the routing table already has it, already
+ * correct, already built before the clear) instead of re-reading
+ * anything — see parkThrow's own doc comment for the full mechanism.
+ *
+ * THE INVARIANT, restated exactly: the completion record is never
+ * cleared, only replaced; the exception cell's CONTENTS move into frame
+ * storage via whatever snapshot the surrounding machinery has already
+ * built (never a fresh read taken after that machinery's own clear).
+ * Pinned by a regression test (a source-level `return` parks RETURN in
+ * an INNER finally that itself suspends; a CONSUMER `.throw()`
+ * injection then crosses into an OUTER finally also covering that point
+ * — the throw must propagate once the outer finally reaches ITS OWN
+ * natural end, the parked return value must never surface anywhere,
+ * and the propagated value must be the INJECTED error, not merely
+ * "some" error or an empty completion) — nested on purpose: a single,
+ * non-nested finally never actually reaches parkThrow at all (an
+ * injected throw with no outer finally to detour into hits the routing
+ * table's TRUE default directly), so nesting is what the mutation check
+ * needs to prove the pin is testing the real mechanism, not a
+ * coincidence.
+ *
+ * GENRET's CELL WRITE DISCIPLINE (this section's own topic — a stale
+ * kindG surviving a suspend) was measured SEPARATELY, by the SAME method
+ * (Node-diffed, with a tail statement after the finally's own yield to
+ * disambiguate "ran to completion" from "spuriously short-circuited") —
+ * no analogous drain fix needed there. `%gen.injectCheck`'s GENRET arm
+ * ALSO writes the shared cell (kindG=EXC_GENRET) before unwinding, and
+ * genretRouting's own park branch does not drain it either — the SAME
+ * shape THROW had for ITS write discipline specifically. Measured twice
+ * (a plain nested case and the tail-disambiguated one), both
+ * byte-identical to Node: no misroute observed for the cell-write half.
+ *
+ * THIS DOES NOT MEAN "GENRET needed no fix at all" — an unqualified
+ * version of that sentence shipped in this comment for one round and
+ * was wrong: GENRET's finally CHAINING (this section, sb3-varE) is and
+ * was always correct — genretRouting has read `finallyOf[state]`
+ * directly since it was written, never touching handlerOf, so nothing
+ * about round 3's F1/F2 fixes changes it. But GENRET's HANDLER-GROUP
+ * ROUTING was NOT correct (round 3's F4, sb3-varG): catchArm's own
+ * per-handler-group GENRET sentinel used to be computed from an
+ * arbitrary representative state's finallyOf, which could differ from
+ * the state actually GENRET'd if the group spanned states with
+ * different finallyOf — closed by the SAME (handlerOf, finallyOf) pair
+ * grouping fix F2 needed (catchArm's own doc comment has the full
+ * mechanism), not a separate patch to genretRouting itself. The
+ * takeaway, stated so it cannot drift back to the unqualified form: two
+ * genuinely different questions share the name "GENRET" here — cell
+ * write discipline (fine, measured) and handler-group routing (was
+ * broken, now fixed) — and a sentence about one is never evidence about
+ * the other. */
+const PENDING_KIND_FIELD = "%pending.kind";
+/** this.fn.returnType is the LANE's completion-value type, not
+ * necessarily the wrapper's own declared signature: for async it is the
+ * unwrapped settle payload T (`this.promiseType` is built by WRAPPING
+ * it — `{kind:"promise", inner: fn.returnType}` — so fn.returnType
+ * itself was never promise-typed to begin with); for a generator it is
+ * retT directly (genType's own construction reads `retT: fn.returnType`
+ * verbatim). completion() already relies on this exact fact for its own
+ * settle() value, never re-deriving against promiseType — this field's
+ * type does the same, deliberately, not by coincidence. */
+const PENDING_VALUE_FIELD = "%pending.value";
+/** THROW's own parked payload — a `caught`-typed struct, the SAME one
+ * buildResume's own `guarded` tryCatch already built into `excRef`
+ * (its `EXC_LOCAL` binding) before catchArm()'s routing table — and so
+ * parkThrow — ever runs. parkThrow writes THAT value here directly
+ * (PENDING_KIND_FIELD's own "write discipline" section has the full
+ * "why not re-read the cell" story: the cell is unconditionally clear
+ * by this point, drained by the SAME tryCatch prologue that built
+ * `excRef`, so a fresh read finds nothing). Read back exactly once, by
+ * reraisePending's own THROW arm, which restores it into the cell
+ * immediately before returning (`%async.pendingUnwind`'s own doc
+ * comment). Lazy like the others — pendingFields() adds it unconditionally
+ * alongside kind/value whenever ANY finally exists in the function,
+ * since a static build can't know in advance whether THIS specific
+ * finally will ever actually receive a parked throw. */
+const PENDING_EXC_FIELD = "%pending.exc";
+/** `%pending.kind` values — what a finally, once it reaches its own
+ * natural end, re-raises. NORMAL falls through to the join state;
+ * RETURN/GENRET either complete for real or, if ANOTHER finally still
+ * encloses this point, re-park and detour there (nested finallys chain,
+ * probe-gen-cell.ts's case C); THROW restores `%pending.exc` into the
+ * exception cell and unwinds unconditionally — never a value READ in
+ * the %pending.value sense, but very much NOT untouched (see
+ * PENDING_EXC_FIELD's own doc comment — this comment used to claim the
+ * cell was "never touched", true before the write-discipline fix, false
+ * after it). */
+const PENDING_NORMAL = 0;
+const PENDING_RETURN = 1;
+const PENDING_THROW = 2;
+const PENDING_GENRET = 3;
+
 /** A real generator reaches this class now (A2c slice 5's gate widening,
  * lowerResumableFunctions above) — through increment 19's stages A2b
  * through A2c-4b this export existed for the test surface ONLY (house
@@ -1339,13 +1566,62 @@ export class FunctionLowering {
    * needs no try-entry stack (see the header). */
   private readonly handlerOf: number[] = [];
   /** Protected regions open during linearization, innermost last. */
-  private readonly regions: { handler: number }[] = [];
+  private readonly regions: { handler: number; seq: number }[] = [];
   /** Each region's catch binding, by handler state — recorded when the
    * region opens, read when the catch arm's routing table is built. */
   private readonly catchBindings = new Map<number, string | null>();
+  /** Stage B: parallel to `handlerOf`, but a DIFFERENT nesting than the
+   * catch-region stack — a finally region covers BOTH the try body AND
+   * the catch body (a throw from inside catch still has to run the
+   * SAME finally; the catch body is not protected by its own try's
+   * catch, but IS protected by that try's finally), while `regions`
+   * (catch/handler) covers only the try body. `lowerTry` pushes/pops
+   * the two independently to get this right. -1 for "no enclosing
+   * finally", the same sentinel `handlerOf` uses. */
+  private readonly finallyOf: number[] = [];
+  /** Parallel to `handlerOf`/`finallyOf`: the push-order seq of whichever
+   * region entry each state's own handlerOf/finallyOf names, or -1 to
+   * match. `nearestOf()`'s only inputs — see `protectionSeq`'s own doc
+   * comment for why comparing these two answers "which is nearer". */
+  private readonly handlerSeq: number[] = [];
+  private readonly finallySeq: number[] = [];
+  /** Open finally regions, innermost last — each one's own entry state
+   * (where completion(), the GENRET default, and the uncaught-exception
+   * default detour to instead of completing directly, once they find an
+   * open region here). */
+  private readonly finallyRegions: { entry: number; seq: number }[] = [];
+  /** NEAREST-ENCLOSING-PROTECTION, stage B round 3 (F1/F2/F4): `regions`
+   * and `finallyRegions` are two SEPARATE stacks, but `lowerTry` pushes
+   * and pops both in the SAME temporal order it actually recurses through
+   * source nesting — a single monotonic counter, stamped onto each push
+   * (both stacks share it), turns "which stack's top entry is more
+   * recently pushed" into a plain integer comparison, which IS "which
+   * protection is more deeply nested" for real exceptions. RETURN/GENRET
+   * never need this: neither is ever caught by an enclosing handler (a
+   * `return`/`.return()` completion skips catch blocks entirely — only
+   * finally chains apply — completeOrPark/genretRouting read `finallyOf`
+   * alone, correctly, unchanged here). THROW is the one completion kind
+   * that genuinely can land in either an enclosing handler or an
+   * enclosing finally, and which one is nearer depends on nesting order,
+   * not a fixed priority: a full `try/catch/finally` nests its own catch
+   * INSIDE its own finally (handler pushed after, so handler wins for
+   * that try's own body — lowerTry's header comment), while an inner
+   * `try/finally` wrapped by a SEPARATE outer `try/catch` nests the
+   * other way (finally pushed after, so finally wins) — the same pair of
+   * fields, `handlerOf`/`finallyOf`, cannot answer "which one" without
+   * this. */
+  private protectionSeq = 0;
   /** Exploded break/continue targets, innermost last. */
   private readonly jumps: (JumpScope & { breakState: number; continueState: number | null })[] = [];
   private awaitSites = 0;
+  /** Lazy, like awaitSlot's %await<k> slots: most functions have no
+   * finally at all, so %pending.kind/%pending.value only join the frame
+   * the first time a suspending (or GENRET/return-crossed) finally is
+   * actually lowered. ONE pair serves every finally region in the
+   * function — nested finallys process their parked completion
+   * sequentially (probe-gen-cell.ts's case C), never concurrently, so
+   * there is only ever one pending completion in flight at a time. */
+  private pendingFieldsAdded = false;
 
   constructor(
     private readonly mod: IrModule,
@@ -1527,10 +1803,29 @@ export class FunctionLowering {
     const captured = new Set((fn.captures ?? []).map((c) => c.localId));
     this.planBoxes(captured);
     // A `return` crossing a finally settles AFTER the finally runs, which
-    // the settle-then-return rewrite gets backwards. Checked over the WHOLE
-    // body (not alongside the position scan) because the try may sit inside
-    // a construct the scan does not descend into.
-    if (anyNode(fn.body, (rec) => rec["kind"] === "tryCatch" && rec["finallyBody"] !== null && hasReturn(rec))) {
+    // the naive settle-then-return rewrite (rewriteReturns' own splice,
+    // for a construct kept VERBATIM) gets backwards — the emitter's own
+    // native finally desugar (emitTryCatch) only intercepts the bare
+    // `return` that follows the spliced settle, by which point the
+    // settle has ALREADY happened, observably too early. Stage B fixes
+    // this for a finally that ACTUALLY LINEARIZES (hasSuspension true
+    // somewhere in ITS OWN subtree — lowerTry's own machinery, via
+    // completeOrPark, correctly parks the return until the finally
+    // completes, for EVERY return inside try/catch/finally alike, not
+    // just ones that themselves suspend: lowerStmt's own `return` case
+    // runs completeOrPark unconditionally the moment ANYTHING routes a
+    // statement list through lowerList at all). A finally kept
+    // ENTIRELY verbatim (no suspension anywhere in it) still has no
+    // fix — rewriteReturns' splice is still wrong there — so the decline
+    // narrows to exactly that case rather than lifting outright. Checked
+    // over the WHOLE body (not alongside the position scan) because the
+    // try may sit inside a construct the scan does not descend into.
+    if (
+      anyNode(
+        fn.body,
+        (rec) => rec["kind"] === "tryCatch" && rec["finallyBody"] !== null && hasReturn(rec) && !hasSuspension(rec),
+      )
+    ) {
       this.decline("fn:async:return-in-finally");
     }
     // Order-preserving hoisting: after this, every suspension the pass
@@ -1706,14 +2001,20 @@ export class FunctionLowering {
         out.push({ ...s, body: this.hoistList(s.body) });
         break;
       case "tryCatch":
-        // A try WITH a finalizer comes back untouched, so checkPositions
-        // gets to name it `await-in-finally` rather than whatever position
-        // the hoist walk would have refused inside it first.
-        if (s.finallyBody !== null || s.catchBody === null) {
-          out.push(s);
-          break;
-        }
-        out.push({ ...s, tryBody: this.hoistList(s.tryBody), catchBody: this.hoistList(s.catchBody) });
+        // Stage B: a finally's own body linearizes exactly like the try
+        // and catch bodies already did — `hasSuspension(s)`'s own guard
+        // at the top of this method already proved SOMETHING in one of
+        // the three bodies suspends, and hoistList is a no-op on a body
+        // that does not. (Before stage B this arm left a finally-bearing
+        // try untouched so checkPositions could name it
+        // `await-in-finally`; that decline is gone now — lowerTry itself
+        // is what actually builds the finally's linearized states.)
+        out.push({
+          ...s,
+          tryBody: this.hoistList(s.tryBody),
+          catchBody: s.catchBody === null ? null : this.hoistList(s.catchBody),
+          finallyBody: s.finallyBody === null ? null : this.hoistList(s.finallyBody),
+        });
         break;
       default:
         // forOf / switch — suspensions inside them are their own refusals,
@@ -1856,16 +2157,15 @@ export class FunctionLowering {
           if (hasSuspension(s)) this.decline(this.linearizationRefusal("fn:async:await-in-switch", "fn:generator:yield-in-switch"));
           break;
         case "tryCatch":
-          if (s.finallyBody !== null || s.catchBody === null) {
-            // A finalizer is completion machinery, not a handler (the
-            // header's refusal list). A catchless try always has one, so
-            // the name stays accurate for every shape that reaches here.
-            if (hasSuspension(s)) this.decline(this.linearizationRefusal("fn:async:await-in-finally", "fn:generator:yield-in-finally"));
-            break;
-          }
-          // Both bodies linearize, so both are checked like any list.
+          // Stage B: a finalizer is completion machinery, not a handler
+          // (the header's TRY/CATCH section), but it linearizes the same
+          // way the try and catch bodies already did — lowerTry is what
+          // actually builds its states now. Every body present is
+          // checked like any other list; a null catchBody (a catchless
+          // try/finally) is simply skipped.
           this.checkPositions(s.tryBody);
-          this.checkPositions(s.catchBody);
+          if (s.catchBody !== null) this.checkPositions(s.catchBody);
+          if (s.finallyBody !== null) this.checkPositions(s.finallyBody);
           break;
         default:
           this.checkClean(s);
@@ -1935,7 +2235,35 @@ export class FunctionLowering {
     for (const l of this.saved) this.frameFields.push({ name: slotOf(l.id), type: l.type });
     // %await<k> slots are appended as linearization discovers the sites;
     // the emitter reads a shape's field order verbatim, so append order IS
-    // the layout and nothing later re-sorts it.
+    // the layout and nothing later re-sorts it. %pending.kind/%pending.value
+    // (stage B) join the same way, lazily, the first time a finally is
+    // actually lowered — see pendingFields()'s own doc comment.
+  }
+
+  /** Adds %pending.kind/%pending.value/%pending.exc to the frame on
+   * first use, a no-op after (mirrors awaitSlot's lazy append, but ONE
+   * set for the whole function rather than one per site — see
+   * PENDING_KIND_FIELD's own doc comment for why one set is enough).
+   * %pending.value's type is `this.fn.returnType` — ALREADY the lane's
+   * completion-value type, not the wrapper's own declared signature:
+   * `this.promiseType` above is built by WRAPPING `fn.returnType`
+   * (`{kind:"promise", inner: fn.returnType}`), so `fn.returnType`
+   * itself is the unwrapped settle payload for async and retT directly
+   * for a generator (genType's own construction reads `retT:
+   * fn.returnType`) — completion() already relies on this exact fact
+   * for its own settle() value, never re-deriving against promiseType.
+   * %pending.exc is added unconditionally alongside the other two
+   * (never independently lazy) — PENDING_EXC_FIELD's own doc comment
+   * has the reasoning: a static build cannot know in advance whether
+   * THIS specific finally will ever receive a parked throw, and
+   * reraisePending's own THROW arm is built the same way for every
+   * finally regardless. */
+  private pendingFields(): void {
+    if (this.pendingFieldsAdded) return;
+    this.pendingFieldsAdded = true;
+    this.frameFields.push({ name: PENDING_KIND_FIELD, type: F64 });
+    this.frameFields.push({ name: PENDING_VALUE_FIELD, type: this.fn.returnType });
+    this.frameFields.push({ name: PENDING_EXC_FIELD, type: CAUGHT });
   }
 
   private awaitSlot(type: IrType): string {
@@ -2051,6 +2379,328 @@ export class FunctionLowering {
     return out;
   }
 
+  /** Stage B: `completion()`'s own front door for a `return` reached
+   * during the REAL linearization walk (lowerStmt's own return case,
+   * and lowerSuspension's resumed continuation for `return await x`/
+   * `return yield x`) — NOT for `rewriteReturns`' rewrite of a `return`
+   * nested inside a construct kept VERBATIM, which stays on plain
+   * `completion()` unconditionally: nothing in a verbatim-kept subtree
+   * suspends (lowerStmt's own fast path proves it), so the ordinary
+   * WASM try/finally the emitter compiles it to ALREADY runs any
+   * finally correctly — there is no state to park into.
+   *
+   * `state` is the CURRENTLY-LOWERING state (whatever `cur`/`resumeState`
+   * this return's own statements are being emitted into) — its
+   * `finallyOf` entry, fixed the moment that state was created
+   * (newState's own read of the live finallyRegions stack), says
+   * whether a finally still has to run before this return can complete
+   * for real. No open region: identical to `completion(value)`. */
+  private completeOrPark(state: number, value: IrExpr | null): WStmt[] {
+    const entry = this.finallyOf[state] ?? -1;
+    if (entry < 0) return this.completion(value);
+    this.pendingFields();
+    const out: WStmt[] = [];
+    if (this.fn.returnType.kind === "void") {
+      // Same "run it for the effect, the value itself has nothing to
+      // park" rule completion()'s own void branch already applies.
+      if (value !== null) out.push({ kind: "exprStmt", expr: widenExpr(value), loc: value.loc });
+    } else if (value !== null) {
+      out.push(this.set(PENDING_VALUE_FIELD, widenExpr(value)));
+    }
+    out.push(this.set(PENDING_KIND_FIELD, this.num(PENDING_RETURN)));
+    out.push(...this.goto(entry));
+    return out;
+  }
+
+  /** The TRUE final GENRET completion — no finally left to run. Promote
+   * $gen.retPark into `out`, mark DONE (generator-only; called from
+   * BOTH catchArm's own sentinel prologue/bare-default AND a finally's
+   * own GENRET re-raise, whichever turns out to be the LAST stop). */
+  private genretExit(): WStmt[] {
+    return [
+      {
+        kind: "%gen.complete",
+        gen: this.genRef(),
+        value:
+          this.fn.returnType.kind === "void"
+            ? null
+            : { kind: "%gen.retPark", gen: this.genRef(), type: this.fn.returnType, loc: this.loc },
+        loc: this.loc,
+      },
+      this.ret(),
+    ];
+  }
+
+  /** GENRET's own routing AT a given state: complete for real if
+   * nothing encloses it, or park+detour into whatever finally does — the
+   * SAME choice a handler group's sentinel prologue and a finally's own
+   * GENRET re-raise both have to make. GENRET never needs a value write
+   * here: it already lives in $gen.retPark, untouched either way.
+   *
+   * TRAP FOR A FUTURE READER, mandated at this exact site (round 3's
+   * pre-read): this method reads `finallyOf[state]` directly, NEVER
+   * `nearestOf(state)` — do not "simplify" it to use nearestOf just
+   * because catchArm's own grouping now computes nearestOf right next to
+   * every genretRouting call and the two LOOK interchangeable there. They
+   * are not. `nearestOf` answers "handler or finally, whichever a REAL
+   * EXCEPTION reaches first" — a question that only makes sense because a
+   * thrown value genuinely CAN be caught by either. A `.return(v)`
+   * completion is never caught by a handler, full stop; a `return`
+   * statement never triggers a catch block reached from the same
+   * position. The moment a state's nearest protection is a handler
+   * (nearestOf would say "handler") while `finallyOf[state]` is STILL
+   * non-negative (a finally further out, past that handler), swapping in
+   * `nearestOf` here would wrongly treat the handler as GENRET's own
+   * destination — genretExit()'s "nothing encloses it" branch (or a
+   * detour to the WRONG place) instead of the correct behavior: skip the
+   * handler entirely (GENRET was never going there) and detour into the
+   * finally exactly as this method already does. */
+  private genretRouting(state: number): WStmt[] {
+    const entry = this.finallyOf[state] ?? -1;
+    if (entry < 0) return this.genretExit();
+    this.pendingFields();
+    return [this.set(PENDING_KIND_FIELD, this.num(PENDING_GENRET)), ...this.goto(entry)];
+  }
+
+  /** An uncaught real exception's routing at a state covered by a
+   * finally but no handler: park it into `%pending.exc` and detour.
+   * `caught` is the routing table's OWN `excRef` (buildResume's single
+   * `EXC_LOCAL` binding) — NOT a fresh read of the exception cell: by
+   * the time ANY of catchArm()'s switch cases run (this one included),
+   * the enclosing `guarded` tryCatch's generic catch prologue has
+   * ALREADY built `excRef` from the cell AND unconditionally cleared it
+   * (`case "tryCatch"`'s own `catch (e)` handling, emitter.ts — the
+   * clear runs whether or not a binding was requested, right before
+   * `catchBody` — catchArm()'s own switch — is ever reached). A second
+   * read of the cell at that point sees only the clear, not the
+   * exception: this was a real, shipped bug (an earlier `%async
+   * .excSnapshot` op tried exactly that "read the cell directly" shape,
+   * always observed a drained cell at its one and only call site here,
+   * and silently manufactured an empty completion — no crash, no wrong
+   * VALUE even, just a THROW park whose payload was NORMAL/nothing,
+   * which reraisePending's own restore-and-return then propagated as
+   * "nothing pending" instead of the real exception). `excRef` sidesteps
+   * the whole hazard: it is already the correct, already-built snapshot,
+   * the SAME one `%gen.excIsGenret`'s read uses one line above this
+   * call, so reusing it needs no new read of anything. No separate drain
+   * op is needed either — the SAME tryCatch prologue that built `excRef`
+   * already cleared the cell unconditionally, before catchArm's switch
+   * (and so before this method) ever runs; parkThrow has nothing left to
+   * drain. The finally's own re-raise (THROW kind, reraisePending)
+   * restores the parked snapshot into the cell immediately before
+   * returning (`%async.pendingUnwind`'s own doc comment) — never
+   * `rethrow`, which reads a per-invocation LOCAL a wasm catch clause
+   * bound, gone by the time a suspending finally's re-raise runs in its
+   * own, later, separate resume call. A NEW throw from inside the
+   * finally still needs no special handling to "replace" this park: it
+   * fills the cell itself and routes through the ordinary table,
+   * diverting control away from ever reaching the re-raise at all. */
+  private parkThrow(entry: number, caught: WExpr): WStmt[] {
+    this.pendingFields();
+    return [
+      this.set(PENDING_EXC_FIELD, widenExpr(caught)),
+      this.set(PENDING_KIND_FIELD, this.num(PENDING_THROW)),
+      ...this.goto(entry),
+    ];
+  }
+
+  /** Bind (if any), save every live local to the frame, and jump to
+   * `handler`'s own state — the exact operation BOTH catchArm's own
+   * per-group body (a state whose nearest enclosing protection IS this
+   * handler) and reraisePending's THROW arm (round 3's F1 fix: a
+   * re-raise that has exhausted every enclosing finally and finds this
+   * handler next) need, identically; only WHERE the caught value comes
+   * from differs — catchArm's own freshly-caught `excRef`, or
+   * reraisePending's frame-resident `%pending.exc` read — so `caught` is
+   * a parameter, the same shape `parkThrow` already established. Uses
+   * `goto()` (a LABELED continue to the dispatch loop), not a bare
+   * `break`: catchArm's OWN switch happens to sit directly in the loop
+   * body, where a break and a labeled continue coincide, but
+   * reraisePending's switch is nested inside a STATE's own body inside
+   * the states switch — a bare break there would only exit reraisePending's
+   * own switch and fall through into wasm's OWN case-fallthrough
+   * behavior, landing in whatever the NEXT case happens to be, never the
+   * dispatch loop. `goto()`'s labeled continue is what NORMAL/RETURN
+   * already use from this exact nesting depth (reraisePending's own
+   * first two cases), proven safe; this reuses the same mechanism rather
+   * than inventing a second "jump to a state" idiom that only works one
+   * level deep. */
+  private dispatchToHandler(handler: number, caught: WExpr): WStmt[] {
+    const binding = this.catchBindings.get(handler) ?? null;
+    return [
+      ...(binding === null ? [] : [{ kind: "assign" as const, localId: binding, value: widenExpr(caught), loc: this.loc }]),
+      ...this.saves(),
+      ...this.goto(handler),
+    ];
+  }
+
+  /** Normal completion of a try or catch body that a finally still has
+   * to run before the join state — lowerTry's own detour, used at both
+   * of its "this body fell through" points. */
+  private parkNormal(entry: number): WStmt[] {
+    this.pendingFields();
+    return [this.set(PENDING_KIND_FIELD, this.num(PENDING_NORMAL)), ...this.goto(entry)];
+  }
+
+  /** A finally's own natural end (lowerTry's finallyEnd): dispatch on
+   * `%pending.kind` and either complete the parked completion for real,
+   * detour into a STILL-open OUTER finally (nested finallys chain —
+   * probe-gen-cell.ts's case C; completeOrPark/genretRouting make this
+   * exact check against `state`'s own `finallyOf`, which — since this
+   * always runs AFTER lowerTry has already popped THIS finally's own
+   * region — correctly names the next one out, or none), or (NORMAL)
+   * simply fall through to the join state past the whole try/catch/
+   * finally. THROW restores `%pending.exc` (parkThrow's own snapshot)
+   * into the exception cell and unwinds via `%async.pendingUnwind`, NOT
+   * `rethrow`: `rethrow` reads a CAUGHT-typed LOCAL a wasm catch clause
+   * bound, and this finally may have suspended since then, meaning the
+   * re-raise runs in a LATER, SEPARATE resume invocation with its own
+   * fresh (never-bound, null) locals — `%async.pendingUnwind`'s own doc
+   * comment has the crash this produced before the fix (a real
+   * regression this slice's own test caught: a THROW park crossing a
+   * suspending OUTER finally trapped "dereferencing a null pointer" on
+   * `rethrow`'s stale EXC_LOCAL). `%pending.exc` is frame-resident, not
+   * a local — it survives the invocation boundary fine, which is why
+   * restoring it into the cell works.
+   *
+   * ROUND 3, F1: restoring the cell is not the end of the THROW arm's
+   * own job — RETURN and GENRET both consult `finallyOf[state]` before
+   * deciding whether they're actually done (completeOrPark/genretRouting
+   * detour into a STILL-open outer finally otherwise); THROW used to
+   * skip that check entirely and unwind unconditionally, which is wrong
+   * the moment a suspending finally is itself nested inside ANOTHER
+   * suspending finally (probe-sb3-chained-reraise.ts: a plain
+   * source-level `throw` parks at the inner finally, which suspends;
+   * resuming it reaches the inner finally's own natural end, which used
+   * to propagate straight out instead of running the STILL-open outer
+   * finally first — a real, shipped miscompile, silent in the "clean
+   * exit" variant since nothing crashes, just the wrong output).
+   *
+   * ROUND 3, F8 (found by the reviewer's re-gate, ONE substitution after
+   * F1's own first attempt): the F1 fix above gave THROW a `finallyOf`
+   * check, but hard-coded it FIRST with `handlerOf` only as a fallback —
+   * exactly the category-first mistake F2 already named and fixed inside
+   * catchArm's OWN grouping, reintroduced here at the one site that
+   * never got routed through `nearestOf` at all. The premise this
+   * comment used to state — "once THIS finally's own natural end is
+   * reached, a still-open OUTER finally is always what a real exception
+   * hits next, ahead of anything else" — is FALSE whenever a catch sits
+   * BETWEEN this finally and that outer one (sb3-varK.ts /
+   * sb3-varL.ts: `try { try { try { throw } finally {yields} } catch
+   * (e) {...} } finally {...}` — at the inner finally's own end state,
+   * handlerOf names the MIDDLE catch, finallyOf names the OUTER finally,
+   * and the middle catch is nearer — it was pushed after the outer
+   * finally, more deeply nested, exactly the same seq comparison
+   * `nearestOf`'s own doc comment already proves out for catchArm's
+   * grouping). Checking finallyOf unconditionally first skipped that
+   * catch entirely — JS delivers there, this arm delivered past it,
+   * silently reaching the outer finally and completing normally through
+   * it (generator: the exception escapes uncaught instead of being
+   * caught; async: the promise rejects instead of resolving, the exact
+   * "clean exit, inverted outcome" shape F7 already named as this
+   * increment's worst class). THE FIX: this arm now calls `nearestOf`
+   * — the SAME function, the SAME comparison, the SAME invariant
+   * catchArm's own grouping already relies on — rather than a
+   * hand-rolled ordering that happened to get RETURN/GENRET's own
+   * finally-only rule (correct for them) and applied it to THROW too
+   * (wrong for THROW, which — like catchArm's own routing — can land in
+   * either kind of protection depending on nesting, never a fixed
+   * priority). `dispatchToHandler` is the exact same bind+saves+goto
+   * operation catchArm's own handler groups use — this is genuinely the
+   * SAME destination a real exception reaching this lexical position
+   * from any other angle would land at, not a special case. Neither
+   * finallyOf nor handlerOf left (nearestOf answers "none"): THIS is the
+   * true final exit — `throwFinalExit()`, ROUND 3's F6/F7 fix (its own
+   * doc comment has the "what's missing without it" story;
+   * `%async.pendingUnwind` ALONE, as this arm used until F6/F7 was
+   * found, is NOT the true final exit — it restores the cell and
+   * returns, nothing more, which is silently wrong for both lanes). */
+  /** The true final exit for an uncaught THROW re-raise — neither an
+   * enclosing finally nor an enclosing handler is left to route into.
+   * ROUND 3, F6/F7 (the reviewer's pre-read, caught live during this
+   * round's own build): `%async.pendingUnwind` alone restores the
+   * exception cell and returns — that is the RIGHT thing for a state
+   * that's ABOUT to be caught by something else (parkThrow's detour
+   * cases), but it is NOT a complete exit on its own, and this arm
+   * briefly used it as one. catchArm's own `trueDefault` is what an
+   * uncaught exception ACTUALLY does at the routing table's own default
+   * — mirrored here exactly, per lane, using the frame-resident snapshot
+   * instead of `excRef` (the same substitution `parkThrow`/`dispatchToHandler`
+   * already make, for the same reason: this runs in whatever invocation
+   * resumed the finally, not the one that caught the exception).
+   *
+   * GENERATOR (F6, sb3-varH.ts): skipping `%gen.markDone` leaves
+   * `$gen.state` SUSPENDED — Node marks a generator that throws all the
+   * way out DONE (every `.next()` after answers `{value:undefined,
+   * done:true}` forever, the finally never runs a second time), but a
+   * SUSPENDED generator is, to this backend's own state machine, a
+   * generator with a valid resume point — the NEXT `.next()` call
+   * resumed `resume` at a state with nothing left to legitimately do:
+   * a trap, not a value. Marking DONE first, THEN restoring the cell and
+   * returning (unchanged from before) is the fix — the two together are
+   * what trueDefault's own generator branch does too, just reached from
+   * a different arm.
+   *
+   * ASYNC (F7, sb3-varI.ts): skipping `%async.reject` leaves the
+   * promise UNSETTLED forever — nothing rejects it, the awaiting caller
+   * never resumes, and the PROGRAM EXITS 0 WITH TRUNCATED OUTPUT instead
+   * of the rejection Node delivers. This is the worst divergence class
+   * this increment can produce: no trap, no wrong value at an
+   * identifiable point, just silence exactly where Node keeps running —
+   * indistinguishable from success by exit code alone. Async's own
+   * completion is entirely promise-based (no genResume-style caller-side
+   * cell check exists for it), so rejecting IS the whole exit — no cell
+   * restore needed here at all, unlike the generator branch. */
+  private throwFinalExit(): WStmt[] {
+    const snapshot = widenExpr(this.get(PENDING_EXC_FIELD, CAUGHT));
+    if (this.genType !== null) {
+      return [
+        { kind: "%gen.markDone", gen: this.genRef(), loc: this.loc },
+        { kind: "%async.pendingUnwind", snapshot, loc: this.loc },
+      ];
+    }
+    return [
+      { kind: "%async.reject", promise: this.get(PROMISE_FIELD, this.promiseType), caught: snapshot, loc: this.loc },
+      this.ret(),
+    ];
+  }
+
+  private reraisePending(state: number, joinState: number): WStmt[] {
+    // F3: reraisePending is the ONE place that reads %pending.* without
+    // necessarily having gone through a park call first on every path —
+    // a defensive, unconditional call, not a hopeful one; pendingFields()
+    // is idempotent, so this costs nothing when a park call already ran.
+    this.pendingFields();
+    const returnValue =
+      this.fn.returnType.kind === "void" ? null : widenExpr(this.get(PENDING_VALUE_FIELD, this.fn.returnType));
+    const outerFinally = this.finallyOf[state] ?? -1;
+    const outerHandler = this.handlerOf[state] ?? -1;
+    // F8: nearestOf, not a hand-rolled "finally first" order — see this
+    // method's own doc comment for the shape (a catch nested between
+    // this finally and an outer one) that a fixed priority gets wrong.
+    const nearest = this.nearestOf(state);
+    const throwArm: WStmt[] =
+      nearest === "finally"
+        ? // Kind is already THROW, %pending.exc already holds the right
+          // snapshot — nothing to rewrite, just detour to the next finally
+          // out, same as parkThrow's own goto half.
+          this.goto(outerFinally)
+        : nearest === "handler"
+          ? this.dispatchToHandler(outerHandler, widenExpr(this.get(PENDING_EXC_FIELD, CAUGHT)))
+          : this.throwFinalExit();
+    const cases: { test: IrExpr | null; body: IrStmt[] }[] = [
+      { test: this.num(PENDING_NORMAL), body: widenBody(this.goto(joinState)) },
+      { test: this.num(PENDING_RETURN), body: widenBody(this.completeOrPark(state, returnValue)) },
+      { test: this.num(PENDING_THROW), body: widenBody(throwArm) },
+    ];
+    if (this.genType !== null) {
+      cases.push({ test: this.num(PENDING_GENRET), body: widenBody(this.genretRouting(state)) });
+    }
+    // Unreachable: this pass is the only writer of %pending.kind.
+    cases.push({ test: null, body: widenBody([this.ret()]) });
+    return [{ kind: "switch", disc: widenExpr(this.get(PENDING_KIND_FIELD, F64)), cases, loc: this.loc }];
+  }
+
   /** Running off the end of a state. For a void body that is the implicit
    * `return;` — fulfil with undefined and leave.
    *
@@ -2082,8 +2732,49 @@ export class FunctionLowering {
 
   private newState(): number {
     this.states.push([]);
-    this.handlerOf.push(this.regions[this.regions.length - 1]?.handler ?? -1);
+    const region = this.regions[this.regions.length - 1];
+    const finallyRegion = this.finallyRegions[this.finallyRegions.length - 1];
+    this.handlerOf.push(region?.handler ?? -1);
+    this.finallyOf.push(finallyRegion?.entry ?? -1);
+    this.handlerSeq.push(region?.seq ?? -1);
+    this.finallySeq.push(finallyRegion?.seq ?? -1);
     return this.states.length - 1;
+  }
+
+  /** Which protection a real exception (THROW) reaches FIRST from `state`:
+   * whichever of handlerOf/finallyOf has the HIGHER (more recently
+   * pushed, so more deeply nested) seq wins; the one that's absent (-1)
+   * never wins over a present one; "none" when neither is set.
+   *
+   * THE LOAD-BEARING INVARIANT, verified by the reviewer's own pre-read
+   * (round 3) and restated here because it is what makes a bare integer
+   * comparison equivalent to "which is nested inside the other": all
+   * three `regions`/`finallyRegions` push sites live inside `lowerTry`,
+   * and `lowerTry` runs as one DFS pre-order walk over the source's own
+   * nesting — every push happens exactly when that walk first descends
+   * into the region it opens, every pop when it leaves. A future region
+   * KIND (if one is ever added) preserves this invariant only by pushing
+   * at ITS OWN "just descended into this protection" point and popping
+   * at ITS OWN "just left it" point — anything that pushes early, pops
+   * late, or batches multiple pushes out of the walk's own order breaks
+   * the comparison silently. The verification also confirmed the
+   * INTRA-STATEMENT order for a full try/catch/finally specifically:
+   * finally pushes before its own handler (so the handler is more
+   * recently pushed, hence nearer, for that try's own body states — JS's
+   * catch-before-finally rule, unaffected by this round), and the
+   * handler pops before the catch body lowers while the finally pops
+   * only after — exactly what `lowerTry`'s own header comment already
+   * described, now cross-checked against the seq numbers themselves
+   * rather than only against the region-stack shape. RETURN and GENRET
+   * never call this method — see `protectionSeq`'s doc comment for why
+   * they only ever consult `finallyOf` directly, and genretRouting's own
+   * doc comment for why calling `nearestOf` there specifically would be
+   * a real miscompile, not a redundant-but-harmless check. */
+  private nearestOf(state: number): "handler" | "finally" | "none" {
+    const hSeq = this.handlerSeq[state] ?? -1;
+    const fSeq = this.finallySeq[state] ?? -1;
+    if (hSeq < 0 && fSeq < 0) return "none";
+    return hSeq > fSeq ? "handler" : "finally";
   }
 
   private emit(state: number, ...stmts: WStmt[]): void {
@@ -2110,7 +2801,7 @@ export class FunctionLowering {
     if (s.kind === "return") {
       const susp = s.value === null ? null : classifySuspension(s.value);
       if (susp !== null) return this.lowerSuspension(s, cur, susp);
-      this.emit(cur, ...this.completion(s.value));
+      this.emit(cur, ...this.completeOrPark(cur, s.value));
       return null;
     }
     if (s.kind === "break" || s.kind === "continue") {
@@ -2365,7 +3056,7 @@ export class FunctionLowering {
         // whole observable effect.
         break;
       case "return":
-        this.emit(resumeState, ...this.completion(resumed === null ? null : widenExpr(resumed)));
+        this.emit(resumeState, ...this.completeOrPark(resumeState, resumed === null ? null : widenExpr(resumed)));
         break;
       default:
         throw new Error(`async lowering: suspension under ${s.kind}`);
@@ -2481,33 +3172,98 @@ export class FunctionLowering {
     return exitS;
   }
 
-  /** A try/catch a suspension crosses (or a jump leaves). Both bodies
-   * linearize; what makes an exception ROUTE is the region stack, open
-   * only while the try body is lowered — see the header's TRY/CATCH
-   * section for why that is the whole mechanism. */
+  /** A try/catch (no finally) a suspension crosses, or (stage B) a
+   * try/catch/finally or catchless try/finally one does. What makes an
+   * exception ROUTE is the region stack, open only while the try body
+   * (and, with a finally, the catch body too) is lowered — see the
+   * header's TRY/CATCH section for the no-finally mechanism, and its
+   * stage-B ADDITION for how a finally's own region nests around it.
+   *
+   * STAGE B shape: the finally's own region opens BEFORE either the try
+   * or catch body lowers and stays open across BOTH — a throw from
+   * inside catch still has to run the SAME finally (JS: a finally
+   * always runs, whether or not a catch handled anything first; the
+   * catch body is not protected by its own try's CATCH, but it IS
+   * protected by that try's FINALLY). The handler (if a catch exists)
+   * opens only around the try body, nested inside. Every path that
+   * would otherwise leave the try/catch pair for the join — normal
+   * fall-through from either body — detours through the finally
+   * (parkNormal) instead. The finally body itself lowers OUTSIDE both
+   * regions: nothing protects a finally from its own exceptions except
+   * whatever encloses the WHOLE try statement, which is exactly right —
+   * a throw inside it propagates PAST this try entirely, correctly
+   * "replacing" whatever was parked (parkThrow/completeOrPark/
+   * genretRouting's own doc comments have the "why no explicit
+   * clearing" argument: control simply never reaches reraisePending). */
   private lowerTry(s: Extract<IrStmt, { kind: "tryCatch" }>, cur: number): number | null {
-    if (s.finallyBody !== null || s.catchBody === null) {
-      // checkPositions refused every SUSPENDING try with a finalizer, so
-      // reaching here is a break/continue leaving one — and that jump has
-      // to run the finalizer on its way out, which is the same work.
+    if (s.finallyBody === null) {
+      if (s.catchBody === null) {
+        // Structurally unreachable (the validator's own grammar: a
+        // catchless try always has a finally) — a defensive decline
+        // rather than an assumption.
+        this.decline("fn:async:jump-out-of-trycatch");
+      }
+      // Created with the region still CLOSED: the catch body is not
+      // protected by its own try, and the join is past the region
+      // entirely.
+      const handlerState = this.newState();
+      const joinState = this.newState();
+      this.catchBindings.set(handlerState, s.catchLocalId);
+      this.regions.push({ handler: handlerState, seq: this.protectionSeq++ });
+      // The try body opens a state of its own — `cur` may already hold
+      // the statements that ran before the try, which this handler must
+      // not cover (the header's first ordering fact).
+      const bodyState = this.newState();
+      this.emit(cur, ...this.goto(bodyState));
+      const tried = this.lowerList(s.tryBody, bodyState);
+      this.regions.pop();
+      if (tried !== null) this.emit(tried, ...this.goto(joinState));
+      const caught = this.lowerList(s.catchBody, handlerState);
+      if (caught !== null) this.emit(caught, ...this.goto(joinState));
+      return joinState;
+    }
+
+    if (!hasSuspension(s)) {
+      // A break/continue leaves this finally-bearing try without
+      // anything inside it suspending — running the finally on the way
+      // out needs jump-routing stage B has not built (the design
+      // report's own named, accepted gap). A NAMED refusal, never a
+      // silent miscompile: the census keeps naming exactly this shape,
+      // same as before stage B existed at all.
       this.decline("fn:async:jump-out-of-trycatch");
     }
-    // Created with the region still CLOSED: the catch body is not
-    // protected by its own try, and the join is past the region entirely.
-    const handlerState = this.newState();
+
+    const finallyEntry = this.newState();
     const joinState = this.newState();
-    this.catchBindings.set(handlerState, s.catchLocalId);
-    this.regions.push({ handler: handlerState });
-    // The try body opens a state of its own — `cur` may already hold the
-    // statements that ran before the try, which this handler must not
-    // cover (the header's first ordering fact).
+    this.finallyRegions.push({ entry: finallyEntry, seq: this.protectionSeq++ });
+
+    let handlerState: number | null = null;
+    if (s.catchBody !== null) {
+      handlerState = this.newState();
+      this.catchBindings.set(handlerState, s.catchLocalId);
+      // Pushed AFTER the finally, above: for a full try/catch/finally the
+      // catch is nested INSIDE the finally's own protection (this
+      // method's own header comment), so its seq is correctly higher —
+      // nearestOf() sees the catch as nearer for this try body's states,
+      // matching JS (an exception in the try body hits ITS OWN catch
+      // first, not the finally).
+      this.regions.push({ handler: handlerState, seq: this.protectionSeq++ });
+    }
     const bodyState = this.newState();
     this.emit(cur, ...this.goto(bodyState));
     const tried = this.lowerList(s.tryBody, bodyState);
-    this.regions.pop();
-    if (tried !== null) this.emit(tried, ...this.goto(joinState));
-    const caught = this.lowerList(s.catchBody, handlerState);
-    if (caught !== null) this.emit(caught, ...this.goto(joinState));
+    if (handlerState !== null) this.regions.pop();
+    if (tried !== null) this.emit(tried, ...this.parkNormal(finallyEntry));
+
+    if (handlerState !== null) {
+      const caught = this.lowerList(s.catchBody!, handlerState);
+      if (caught !== null) this.emit(caught, ...this.parkNormal(finallyEntry));
+    }
+
+    this.finallyRegions.pop();
+    const finallyEnd = this.lowerList(s.finallyBody, finallyEntry);
+    if (finallyEnd !== null) this.emit(finallyEnd, ...this.reraisePending(finallyEnd, joinState));
+
     return joinState;
   }
 
@@ -2551,53 +3307,52 @@ export class FunctionLowering {
    * parked value; anything else is a real exception, which the default
    * arm re-arms (via `rethrow`) and leaves for the caller to observe —
    * `%gen.markDone`'s own doc comment has the "why not `%gen.complete`
-   * here" reasoning. `genretExit` is built EXACTLY ONCE below and has TWO
-   * callers: this default arm's own fork, and — per the design doc's
-   * "routing-table arms for CATCH regions get the sentinel prologue" —
-   * every catch-region case, prepended, so a GENRET unwind reaching a
-   * region that would otherwise bind and dispatch to its handler instead
-   * completes the generator without ever entering the catch. (Stage B's
-   * finalizers do not exist yet, so "the enclosing finalizer" the design
-   * doc also names and "the default" are the SAME target for now; the
-   * sentinel prologue already routes correctly either way, since it reads
-   * `genretExit` by reference rather than assuming which target it is.) */
+   * here" reasoning. `genretExit()` (its own method now — stage B needs
+   * it from lowerTry's finally re-raise too, which runs during
+   * LOWERING, well before this method even exists to build a local
+   * const) has THREE callers: this method's own true default, every
+   * catch-region case's sentinel prologue (below — a GENRET unwind
+   * reaching a region that would otherwise bind and dispatch to its
+   * handler instead completes the generator without ever entering the
+   * catch), and reraisePending's own GENRET case.
+   *
+   * STAGE B, ROUND 3 (F2+F4, one root cause): grouping used to be BY
+   * HANDLER ALONE — any state with a non-negative handlerOf went to a
+   * handler group, unconditionally, and the group's own GENRET sentinel
+   * read `finallyOf` off an arbitrary REPRESENTATIVE state (`states[0]`).
+   * Both were wrong. F2: handlerOf being set does not mean the handler is
+   * the NEAREST protection — an inner `try/finally` wrapped by a
+   * SEPARATE outer `try/catch` has its finally pushed AFTER (more
+   * deeply nested than) the outer handler, so a real exception must run
+   * the finally FIRST, same as JS; the old code sent it straight to the
+   * handler, skipping the finally entirely. F4: two states can share a
+   * handler while having DIFFERENT finallyOf (one covered by a nested
+   * finally the other isn't) — the representative's finallyOf is not
+   * necessarily the group's, so a GENRET at the OTHER state used the
+   * WRONG detour decision. Both are closed by ONE change: group by the
+   * PAIR (handlerOf[state], finallyOf[state]), not handlerOf alone —
+   * every state in a resulting group now shares an identical finallyOf
+   * (closing F4: `genretRouting(states[0])` is safe again, since GENRET
+   * only ever reads finallyOf, never handlerOf — untouched here) AND an
+   * identical handlerOf, so `nearestOf` (computed once per group, via
+   * either member) correctly decides whether a REAL exception's own
+   * routing is the handler (bind+saves+dispatch, `dispatchToHandler`) or
+   * the finally (`parkThrow`) — closing F2. A group with only one of the
+   * pair set needs no nearestOf call at all (the unambiguous cases,
+   * unchanged from before: handler-only routes to the handler,
+   * finally-only routes to parkThrow). */
   private catchArm(): WStmt[] {
     const excRef: WExpr = { kind: "varRef", localId: EXC_LOCAL, type: CAUGHT, loc: this.loc };
     const genType = this.genType;
     const isGenret: WExpr = { kind: "%gen.excIsGenret", caught: excRef, type: BOOL, loc: this.loc };
-    // A void retT (`.return()` always argument-less on such a channel —
-    // lowerGenMethodCall's own frontend fence) has nothing real parked in
-    // $gen.retPark: its mapTypeSoft(VOID) storage is a placeholder ("SENT/
-    // RETPARK NEVER REFUSE" — generators.ts's own header), never a value
-    // this promotion should read back. `%gen.complete(value: null)` — the
-    // SAME normalize-to-undefined completion() already applies for an
-    // ordinary void return — is the correct promotion here, not a
-    // %gen.retPark read typed VOID (which is not a real V arm; only
-    // `undefinedT` spells "no value" as an arm — genResultRecord's own
-    // rule, computeGenResultArms's `add()` drops void arms entirely).
-    const genretExit: WStmt[] =
-      genType !== null
-        ? [
-            {
-              kind: "%gen.complete",
-              gen: this.genRef(),
-              value:
-                this.fn.returnType.kind === "void"
-                  ? null
-                  : { kind: "%gen.retPark", gen: this.genRef(), type: this.fn.returnType, loc: this.loc },
-              loc: this.loc,
-            },
-            this.ret(),
-          ]
-        : [];
 
-    const defaultArm: WStmt[] =
+    const trueDefault: WStmt[] =
       genType !== null
         ? [
             {
               kind: "if",
               cond: widenExpr(isGenret),
-              then: widenBody(genretExit),
+              then: widenBody(this.genretExit()),
               else_: widenBody([
                 { kind: "%gen.markDone", gen: this.genRef(), loc: this.loc },
                 { kind: "rethrow", localId: EXC_LOCAL, loc: this.loc },
@@ -2614,54 +3369,70 @@ export class FunctionLowering {
             },
             this.ret(),
           ];
-    const byHandler = new Map<number, number[]>();
-    this.handlerOf.forEach((handler, state) => {
-      if (handler < 0) return;
-      const group = byHandler.get(handler);
-      if (group === undefined) byHandler.set(handler, [state]);
+
+    // Group by (handlerOf, finallyOf) — see this method's own doc
+    // comment for why the pair, not handlerOf alone.
+    const groups = new Map<string, number[]>();
+    for (let state = 0; state < this.states.length; state++) {
+      const handler = this.handlerOf[state] ?? -1;
+      const entry = this.finallyOf[state] ?? -1;
+      if (handler < 0 && entry < 0) continue; // trueDefault covers these
+      const key = `${handler}|${entry}`;
+      const group = groups.get(key);
+      if (group === undefined) groups.set(key, [state]);
       else group.push(state);
-    });
-    if (byHandler.size === 0) return defaultArm;
+    }
+    if (groups.size === 0) return trueDefault;
 
     const cases: { test: IrExpr | null; body: IrStmt[] }[] = [];
-    for (const handler of [...byHandler.keys()].sort((a, b) => a - b)) {
-      const states = byHandler.get(handler)!;
-      const binding = this.catchBindings.get(handler) ?? null;
-      // The binding is written BEFORE the saves so the frame slot and the
-      // wasm local agree about the caught value (the header's second
-      // ordering fact). A bindingless `catch {}` has nothing to write.
-      const body: WStmt[] = [
-        // The sentinel prologue (generator only — see this method's doc
-        // comment): a GENRET unwind never binds, never saves, never
-        // dispatches to the handler state. Checked ONCE per handler
-        // group, on the shared body every state in the group falls
-        // through to — exactly like the binding/saves/state-write below,
-        // which state actually threw does not matter once they share a
-        // handler.
-        ...(genType !== null
-          ? [
-              {
-                kind: "if" as const,
-                cond: widenExpr(isGenret),
-                then: widenBody(genretExit),
-                else_: null,
-                loc: this.loc,
-              },
-            ]
-          : []),
-        ...(binding === null
-          ? []
-          : [{ kind: "assign" as const, localId: binding, value: widenExpr(excRef), loc: this.loc }]),
-        ...this.saves(),
-        this.set(STATE_FIELD, this.num(handler)),
-        // Out of the switch, out of the catch, and the loop re-dispatches.
-        { kind: "break" as const, loc: this.loc },
-      ];
+    // Sorted by each group's own lowest state number — deterministic
+    // output, independent of Map insertion order.
+    const orderedGroups = [...groups.values()].sort((a, b) => a[0]! - b[0]!);
+    for (const states of orderedGroups) {
+      const rep = states[0]!;
+      const handler = this.handlerOf[rep] ?? -1;
+      const entry = this.finallyOf[rep] ?? -1;
+      const nearest = this.nearestOf(rep);
+      // The sentinel prologue (generator only — see this method's own
+      // doc comment): a GENRET unwind never binds, never saves, never
+      // dispatches to a handler — genretRouting checks finallyOf first,
+      // safe here because every state in this group shares one.
+      const genretSentinel = genType !== null ? widenBody(this.genretRouting(rep)) : null;
+      let body: WStmt[];
+      if (nearest === "handler") {
+        // The binding is written BEFORE the saves so the frame slot and
+        // the wasm local agree about the caught value (the header's
+        // second ordering fact). A bindingless `catch {}` has nothing to
+        // write.
+        body = [
+          ...(genretSentinel === null
+            ? []
+            : [{ kind: "if" as const, cond: widenExpr(isGenret), then: genretSentinel, else_: null, loc: this.loc }]),
+          ...this.dispatchToHandler(handler, excRef),
+        ];
+      } else {
+        // nearest === "finally" (never "none": a group only forms when
+        // at least one of handler/entry is non-negative, and nearestOf
+        // only answers "none" when BOTH are -1). JS: a finally always
+        // runs, even for an exception nothing (yet) catches.
+        body =
+          genretSentinel === null
+            ? this.parkThrow(entry, excRef)
+            : [
+                {
+                  kind: "if" as const,
+                  cond: widenExpr(isGenret),
+                  then: genretSentinel,
+                  else_: widenBody(this.parkThrow(entry, excRef)),
+                  loc: this.loc,
+                },
+              ];
+      }
       states.forEach((state, i) => {
         cases.push({ test: this.num(state), body: widenBody(i === states.length - 1 ? body : []) });
       });
     }
-    cases.push({ test: null, body: widenBody(defaultArm) });
+    cases.push({ test: null, body: widenBody(trueDefault) });
     return [{ kind: "switch", disc: widenExpr(this.get(STATE_FIELD, F64)), cases, loc: this.loc }];
   }
 

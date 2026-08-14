@@ -6919,6 +6919,107 @@ test("genResume (A3): .throw() on SUSPENDED — the body's own catch takes it an
   );
 });
 
+/* ── Increment 19 stage B: finalizer linearization ──
+ * A suspension — or a return/uncaught-throw/GENRET crossing — inside a
+ * try/catch/finally now linearizes (statemachine.ts's TRY/CATCH section,
+ * "STAGE B ADDITION"). The differential census (2011/2012/2014, plus the
+ * async stretch rider 1022) is the real behavioral bar; this test pins a
+ * corner no corpus program happens to exercise: the reviewer's own
+ * pre-read probe (probe-stageB-prereview.mjs) for the full injection-
+ * over-park 2x2 (all four cells Node-measured "newest wins" — the same
+ * corpus/probe pins genuine return-over-return, probe-gen-ladder.ts's
+ * corner #6).
+ *
+ * The ONE constructible stale-park shape the pre-read flagged — a
+ * source-level `return` parking RETURN in a finally that itself
+ * suspends, then a CONSUMER `.throw()` injection at that suspend point —
+ * is pinned in wasm-statemachine.test.ts's "stage B: parkThrow write
+ * discipline (full-source regressions)" describe block, NOT here. A
+ * single, non-nested finally (the shape this file used to carry under
+ * that name) never actually reaches parkThrow at all — with nothing
+ * enclosing it, the injected throw hits catchArm()'s TRUE default
+ * directly, so a test built on that shape and labeled "write-discipline
+ * pin" was never exercising write discipline; it was exercising the
+ * default path under a false name, and it is exactly the artifact that
+ * misled two reviewers into believing the mechanism was covered when it
+ * was not. The correctly-labeled control for that same non-nested shape,
+ * and the real nested pin that does reach parkThrow, both live in
+ * wasm-statemachine.test.ts now (full-source `compile()`-based, with the
+ * explicit no-trap assertion and the mutation-checked nested THROW
+ * regression this shape's own history — a crash, then a silent
+ * miscompile — showed a crash-only or stdout-only pin cannot catch).
+ * Deleted here rather than relabeled in place: duplicate coverage under
+ * a stale name in the wrong file serves nobody. */
+test("stage B: the injection-over-park 2x2, all four cells (reviewer pre-read, probe-stageB-prereview.mjs — genuine return-over-return is probe-gen-ladder.ts's corner #6, not this probe's mislabeled same-named line, which only performs the first return)", async () => {
+  const res = await buildWasm(
+    "gen-stageb-injectionmatrix.ts",
+    [
+      "function show(label: string, f: () => unknown): void {",
+      "  try {",
+      "    console.log(label, JSON.stringify(f()));",
+      "  } catch (e) {",
+      '    if (e instanceof Error) console.log(label, "THREW", e.name + ": " + e.message);',
+      '    else console.log(label, "THREW wrong-kind");',
+      "  }",
+      "}",
+      "function make(): Generator<string, string, unknown> {",
+      "  function* g(): Generator<string, string, unknown> {",
+      "    try {",
+      '      yield "body";',
+      "    } finally {",
+      '      yield "fin";',
+      "    }",
+      '    return "normal-end";',
+      "  }",
+      "  return g();",
+      "}",
+      "{",
+      "  const it = make();",
+      "  it.next();",
+      '  it.return("A"); // parks A, finalizer yields "fin" — corner #6\'s own first return',
+      '  show("return-over-return", () => it.return("B"));',
+      "}",
+      "{",
+      "  const it = make();",
+      "  it.next();",
+      '  it.return("A");',
+      '  show("throw-over-return", () => it.throw(new Error("T")));',
+      "}",
+      "{",
+      "  const it = make();",
+      "  it.next();",
+      '  it.throw(new Error("P"));',
+      '  show("return-over-throw", () => it.return("R"));',
+      "}",
+      "{",
+      "  const it = make();",
+      "  it.next();",
+      '  it.throw(new Error("P1"));',
+      '  show("throw-over-throw", () => it.throw(new Error("T2")));',
+      "}",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  // Node-measured (probe-stageB-prereview.mjs's A/B/C/D lines): every
+  // cell is "the newest injection wins" — return-over-return completes
+  // with the SECOND value, throw-over-return propagates the throw
+  // (discarding the parked return), return-over-throw completes with the
+  // return's value (discarding the parked throw), throw-over-throw
+  // propagates the SECOND throw.
+  expect(stdout.toString("utf8")).toBe(
+    [
+      'return-over-return {"value":"B","done":true}',
+      "throw-over-return THREW Error: T",
+      'return-over-throw {"value":"R","done":true}',
+      "throw-over-throw THREW Error: T2",
+      "",
+    ].join("\n"),
+  );
+});
+
 test("insp.buffer: the STATIC-typed-Buffer path (console.log of a real, non-dyn Buffer) — the 49/50/51/52 INSPECT_MAX_BYTES truncation seam pinned directly against Node (corpus 1635 covers 50/51/52/200 differentially; this adds 49, one below the boundary, with all four side by side), plus an explicit cross-check that this NEW call site's `bufferForm()` reuse is byte-identical to the dyn walker's EXISTING isBuffer=true consumer (wasm-bytes-flag.test.ts's own '<Buffer 01 02 03>' assertion for the SAME [1,2,3] content) — not merely inferred across files", async () => {
   const { inspect } = await import("node:util");
   const bytesOf = (n: number): number[] => Array.from({ length: n }, (_, i) => (i * 7 + 1) % 251);

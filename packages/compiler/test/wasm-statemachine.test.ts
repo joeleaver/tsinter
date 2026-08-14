@@ -6,7 +6,11 @@
  * The other half of the contract is the refusal set: every async shape the
  * pass declines must name itself and leave the function untouched, which
  * is what keeps the emitter's own `fn:async` firing behind it. */
-import { beforeAll, describe, expect, test } from "vitest";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import type { IrExpr, IrFunction, IrLocal, IrModule, IrParam, IrRecordShape, IrStmt, IrType, IrUnionDef, SrcLoc } from "../src/ir/nodes.js";
 import { BOOL, CAUGHT, DYN, F64, STRING, UNDEFINED_T, VOID } from "../src/ir/nodes.js";
 import {
@@ -19,6 +23,7 @@ import {
 } from "../src/backend/wasm/statemachine.js";
 import { computeMayThrow } from "../src/backend/emission/may-throw.js";
 import { emitWasmModule, surveyWasmModule } from "../src/backend/wasm/emitter.js";
+import { compile } from "../src/index.js";
 import { computeGenResultArms, genResultRecord, ShapeRegistry, UnionRegistry } from "../src/frontend/types.js";
 import {
   assign,
@@ -639,8 +644,15 @@ describe("awaits inside try/catch", () => {
     const stateAt = arm.findIndex((s) => s.kind === "recordSet" && s.field === "%state");
     expect(saveAt).toBeGreaterThan(0);
     expect(stateAt).toBeGreaterThan(saveAt);
-    // ...and falls out, so the dispatch loop's next turn is the handler.
-    expect(arm[arm.length - 1]).toMatchObject({ kind: "break" });
+    // ...and jumps to the dispatch loop's own label, so its next turn is
+    // the handler — a LABELED continue (dispatchToHandler, stage B round
+    // 3's F1 fix), not a bare break: reraisePending's own THROW arm
+    // reuses this exact same dispatch from a deeper nesting level (its
+    // own switch, inside a state's body, inside the states switch) where
+    // a bare break would only exit ITS OWN switch, never reach the
+    // dispatch loop — one proven-correct "jump to a state" mechanism
+    // (goto's own labeled continue), not two that only coincide here.
+    expect(arm[arm.length - 1]).toMatchObject({ kind: "continue", label: "%dispatch" });
     // The default is still the rejection of this frame's own promise.
     const def = routing(resume).find((c) => c.test === null)!.body;
     expect(def.map((s) => s.kind)).toEqual(["%async.reject", "return"]);
@@ -829,9 +841,16 @@ describe("refusals leave the function untouched", () => {
     ...extra,
   } as IrFunction);
 
-  test("await inside a try that has a FINALLY", () => {
-    // A plain try/catch linearizes (the "awaits inside try/catch" describe
-    // above); a finalizer takes part in completion, which is its own stage.
+  test("await inside a try that has a FINALLY now lowers (stage B: the async lift)", () => {
+    // Stage B builds finalizer linearization generically over BOTH lanes
+    // (generators' own target — 2011/2012/2014 — and, per the design
+    // report's acceptance test, whichever fn:async shapes ride free): a
+    // suspension in ANY of the three bodies of a finally-bearing try no
+    // longer refuses here. The differential census (2011/2012/2014/1022,
+    // all byte-diffed against Node) is the real behavioral bar; this
+    // pins the STRUCTURAL side stage A's own analogous "run() now
+    // succeeds" test (above, A2c slice 5) already established the
+    // pattern for: the shapes that used to decline now lower clean.
     const withFinally = (tryBody: IrStmt[], catchBody: IrStmt[] | null, finallyBody: IrStmt[]): IrStmt => ({
       kind: "tryCatch",
       tryBody,
@@ -841,11 +860,41 @@ describe("refusals leave the function untouched", () => {
       loc,
     });
     // The suspension in each of the three bodies in turn.
-    expectRefusal(plain([withFinally([exprStmt(awaitCall())], [], [log([str("f")])])]), "fn:async:await-in-finally");
-    expectRefusal(plain([withFinally([], [exprStmt(awaitCall())], [log([str("f")])])]), "fn:async:await-in-finally");
-    expectRefusal(plain([withFinally([], [], [exprStmt(awaitCall())])]), "fn:async:await-in-finally");
-    // Catchless try/finally is the same rock under the same name.
-    expectRefusal(plain([withFinally([exprStmt(awaitCall())], null, [log([str("f")])])]), "fn:async:await-in-finally");
+    const mod1 = lowerOne(plain([withFinally([exprStmt(awaitCall())], [], [log([str("f")])])]));
+    const mod2 = lowerOne(plain([withFinally([], [exprStmt(awaitCall())], [log([str("f")])])]));
+    const mod3 = lowerOne(plain([withFinally([], [], [exprStmt(awaitCall())])]));
+    // Catchless try/finally is the same shape under the same machinery.
+    const mod4 = lowerOne(plain([withFinally([exprStmt(awaitCall())], null, [log([str("f")])])]));
+    for (const mod of [mod1, mod2, mod3, mod4]) {
+      expect(mod.functions.some((f) => f.name === "%f.resume")).toBe(true);
+      // %pending.kind/%pending.value joined the frame — lazy allocation
+      // (pendingFields' own doc comment), so their PRESENCE here is
+      // itself evidence the finally path was actually taken, not just
+      // that lowering happened to succeed for an unrelated reason.
+      const fields = frameFields(mod, "f");
+      expect(fields).toContain("%pending.kind");
+      expect(fields).toContain("%pending.value");
+    }
+  });
+
+  test("a NON-suspending finally with a return still refuses — the settle-then-return bug is real for the verbatim-kept case", () => {
+    // The narrowed decline (checkEligible, stage B): a return inside a
+    // finally-bearing try that has NO suspension anywhere in it stays
+    // declined — rewriteReturns' naive splice would settle BEFORE the
+    // emitter's own native finally desugar runs it, observably too
+    // early. Only the ACTUALLY-suspending shape (above) gets the fix.
+    const withFinally = (tryBody: IrStmt[], finallyBody: IrStmt[]): IrStmt => ({
+      kind: "tryCatch",
+      tryBody,
+      catchBody: null,
+      catchLocalId: null,
+      finallyBody,
+      loc,
+    });
+    expectRefusal(
+      plain([withFinally([{ kind: "return", value: num(1), loc }], [log([str("f")])])], [], { returnType: F64 }),
+      "fn:async:return-in-finally",
+    );
   });
 
   test("await under an operator that may not evaluate it", () => {
@@ -2362,14 +2411,20 @@ describe("yield lowering (stage A2b — FunctionLowering used directly)", () => 
     const bindingIndex = regionArm.body.findIndex((s) => s.kind === "assign" && s.localId === "e.0");
     expect(bindingIndex).toBeGreaterThan(0);
 
-    // "Single construction site, consumed by both exits": the default
-    // arm's own GENRET branch and the region's sentinel prologue reuse
-    // the IDENTICAL statement array — not two copies that happen to
-    // match, the same object, proving genretExit was built once.
+    // "Single DEFINITION site, consumed by every exit": the default
+    // arm's own GENRET branch and the region's sentinel prologue produce
+    // STRUCTURALLY IDENTICAL statements — genretExit() is a method now
+    // (stage B), not a single shared local, because lowerTry's own
+    // finally re-raise (reraisePending) needs it too, from a DIFFERENT
+    // pass (lowering) than catchArm's (post-lowering, resume-building) —
+    // the two can never share one array reference across that boundary.
+    // Content equality is what the wasm output actually cares about;
+    // object identity was always an implementation detail, not the
+    // invariant this test means to pin.
     const defaultFork = defaultArm.body[0]!;
     expect(defaultFork.kind).toBe("if");
     if (defaultFork.kind !== "if") throw new Error("unreachable");
-    expect(prologue.then).toBe(defaultFork.then);
+    expect(prologue.then).toStrictEqual(defaultFork.then);
   });
 
   // 2010-generators-basics.ts's two(): Generator<string, void, unknown> is
@@ -2441,17 +2496,20 @@ describe("yield lowering (stage A2b — FunctionLowering used directly)", () => 
     expect(complete[0]!["value"]).toBeNull();
     expect(nodesOfKind(defaultFork.then, "%gen.retPark")).toEqual([]);
 
-    // The region arm's own sentinel prologue is the SAME genretExit
-    // object (reference identity, per the "single construction site"
-    // test above) — so it is ALREADY covered by the assertions on
-    // defaultFork.then above; this just makes that coverage explicit for
-    // the void-retT shape specifically, rather than relying on the
-    // reader to trace the reference back to the default arm's test.
+    // The region arm's own sentinel prologue is STRUCTURALLY IDENTICAL
+    // to the default arm's own genretExit (content equality — see the
+    // "single construction site" test above for why this is no longer
+    // reference identity as of stage B: genretExit() is a re-callable
+    // method now, needed from lowerTry's finally re-raise too, a
+    // DIFFERENT pass than catchArm's own) — so it is ALREADY covered by
+    // the assertions on defaultFork.then above; this just makes that
+    // coverage explicit for the void-retT shape specifically, rather
+    // than relying on the reader to trace it back to the default arm.
     const regionArm = table.find((c) => c.test !== null)!;
     const prologue = regionArm.body[0]!;
     expect(prologue.kind).toBe("if");
     if (prologue.kind !== "if") throw new Error("unreachable");
-    expect(prologue.then).toBe(defaultFork.then);
+    expect(prologue.then).toStrictEqual(defaultFork.then);
   });
 });
 
@@ -2814,5 +2872,726 @@ describe("A2c slice 4b: %gen.suspend / %gen.complete real emission (retag)", () 
     ]);
     expect(surveyWasmModule(mod)).toEqual([]);
     expect(WebAssembly.validate(emitWasmModule(mod))).toBe(true);
+  });
+});
+
+/* ── Stage B: the finalizer-park write-discipline regressions ───────────
+ *
+ * Full source, compiled through `compile()` — NOT hand-built IR like the
+ * rest of this file. The shape under test (a THROW injection parking at
+ * one finally, whose own suspend crosses into a SECOND, enclosing
+ * finally that ALSO suspends) depends on checkEligible/hoistStmt/lowerTry
+ * all agreeing with each other and with the frontend's own try/finally
+ * desugar in a way that hand-building the equivalent IR would only prove
+ * for whatever shape I happened to construct by hand, not for what real
+ * source actually produces — the exact gap that let TWO real bugs (one
+ * crash, one silent miscompile) ship past this file's own earlier,
+ * hand-built stage B coverage above. `compile()` is the only way to get
+ * the real pipeline running end to end.
+ *
+ * Every pin here follows the explicit unfreeze's three requirements:
+ * (1) assert the OUTCOME (the actual propagated value/error), never
+ * internal state like %pending.kind directly; (2) assert the absence of
+ * a trap EXPLICITLY, not merely by omission (board #49: the corpus
+ * harness's stdout+exit-code diff is blind to a trap that happens after
+ * partial, otherwise-correct-looking output — exactly the shape the
+ * silent-miscompile round of this bug could have hidden behind if the
+ * pin only checked stdout); (3) each was manually verified, before this
+ * file was finalized, to FAIL when the fix is disabled on a scratch copy
+ * (parkThrow reverted to reading the exception cell directly instead of
+ * `excRef`) — this is a verification step performed once by hand while
+ * writing these pins, not an automated check this suite re-runs. */
+describe("stage B: parkThrow write discipline (full-source regressions)", () => {
+  let scratch: string;
+  beforeAll(async () => {
+    scratch = await mkdtemp(join(tmpdir(), "tsinter-wasm-stageb-"));
+  });
+  afterAll(async () => {
+    await rm(scratch, { recursive: true, force: true });
+  });
+
+  async function buildWasm(name: string, source: string) {
+    const entry = join(scratch, name);
+    await writeFile(entry, source);
+    return compile(entry, { outPath: join(scratch, `${name}.wasm`), outDir: scratch, backend: "wasm" });
+  }
+
+  /** Runs to completion and returns stdout — but unlike wasm-emitter.test.ts's
+   * bare `runWasm`, this NEVER lets a trap pass silently: `_start` is
+   * called inside its own try/catch and a WebAssembly.RuntimeError is
+   * asserted NOT to have happened, explicitly, satisfying requirement
+   * (2) for every pin that expects a clean run (the run may still
+   * observe a THROWN JS Error, caught by the compiled program's OWN
+   * source-level try/catch — that is a normal return, not a trap). */
+  async function runWasmExpectNoTrap(modulePath: string): Promise<string> {
+    const chunks: Buffer[] = [];
+    let memory: WebAssembly.Memory | null = null;
+    const { instance } = await WebAssembly.instantiate(readFileSync(modulePath), {
+      tsinter: {
+        write(fd: number, ptr: number, len: number): void {
+          if (memory === null) throw new Error("write before instantiation completed");
+          if (fd === 1) chunks.push(Buffer.from(new Uint8Array(memory.buffer, ptr, len)));
+        },
+      },
+    });
+    memory = instance.exports["memory"] as WebAssembly.Memory;
+    const trap = await Promise.resolve()
+      .then(() => (instance.exports["_start"] as () => void)())
+      .then(
+        () => null,
+        (err: unknown) => err,
+      );
+    expect(trap).toBeNull();
+    return Buffer.concat(chunks).toString("utf8");
+  }
+
+  /** The inverse of the above: for the ONE shape that should propagate
+   * all the way to an uncaught, module-wide trap (mirroring Node's own
+   * uncaught-exception exit), assert the trap explicitly rather than
+   * treating "the await rejected" as incidental.
+   *
+   * F5 (round 3, reviewer's substance gate): `toBeInstanceOf(RuntimeError)`
+   * ALONE does not discriminate — the round-1 null-pointer crash (a
+   * `structGet` dereferencing a null ref, `rethrow`'s stale per-invocation
+   * EXC_LOCAL) is ALSO a WebAssembly.RuntimeError, with a DIFFERENT
+   * message ("null pointer" family, not "unreachable"); the reviewer ran
+   * this exact pin against the historical broken compiler and it PASSED
+   * for the wrong reason. `_start`'s own uncaught-exception bridge
+   * (S007) is a deliberate `c.unreachable()` opcode — V8/Node's own
+   * WebAssembly.RuntimeError for that specific trap reports the message
+   * "unreachable" — so asserting the message is what actually proves
+   * "this trapped because the exception legitimately reached `_start`'s
+   * own check", not "this trapped for some unrelated reason that merely
+   * also throws a RuntimeError". */
+  async function runWasmExpectTrap(modulePath: string): Promise<string> {
+    const chunks: Buffer[] = [];
+    let memory: WebAssembly.Memory | null = null;
+    const { instance } = await WebAssembly.instantiate(readFileSync(modulePath), {
+      tsinter: {
+        write(fd: number, ptr: number, len: number): void {
+          if (memory === null) throw new Error("write before instantiation completed");
+          if (fd === 1) chunks.push(Buffer.from(new Uint8Array(memory.buffer, ptr, len)));
+        },
+      },
+    });
+    memory = instance.exports["memory"] as WebAssembly.Memory;
+    const trap = await Promise.resolve()
+      .then(() => (instance.exports["_start"] as () => void)())
+      .then(
+        () => null,
+        (err: unknown) => err,
+      );
+    expect(trap).toBeInstanceOf(WebAssembly.RuntimeError);
+    expect((trap as WebAssembly.RuntimeError).message).toBe("unreachable");
+    return Buffer.concat(chunks).toString("utf8");
+  }
+
+  /** For a timer-bearing async body specifically (round 3's F7/varI/varJ):
+   * `runWasmExpectNoTrap`'s bare `write`-only import never pumps `_tick`,
+   * so a program with a real `setTimeout` inside an awaited chain simply
+   * stalls — the reviewer's own ad-hoc host hit exactly this and nearly
+   * produced a false finding. Mirrors the differential harness's own host
+   * contract (and inc19-probes/wasm-host.mjs, this session's standalone
+   * copy of it): a virtual `tsinter.now` clock, `_start` then `_tick`
+   * pumped to quiescence (a due time < 0 means nothing left pending), a
+   * trap is exit-code 1, `_status` (when present) is the real exit code
+   * otherwise. Programs with no `_tick` export (nothing timer-shaped
+   * survived lowering) skip the pump entirely, so this is safe to use
+   * even where the pump never actually engages. */
+  async function runWasmWithTimers(modulePath: string): Promise<{ stdout: string; exitCode: number }> {
+    const chunks: Buffer[] = [];
+    let memory: WebAssembly.Memory | null = null;
+    let clock = 0;
+    const { instance } = await WebAssembly.instantiate(readFileSync(modulePath), {
+      tsinter: {
+        write(fd: number, ptr: number, len: number): void {
+          if (memory === null) throw new Error("write before instantiation completed");
+          if (fd === 1) chunks.push(Buffer.from(new Uint8Array(memory.buffer, ptr, len)));
+        },
+        now: () => clock,
+      },
+    });
+    memory = instance.exports["memory"] as WebAssembly.Memory;
+    let exitCode = 0;
+    try {
+      (instance.exports["_start"] as () => void)();
+      const tick = instance.exports["_tick"] as ((now: number) => number) | undefined;
+      if (tick !== undefined) {
+        for (let turns = 0; ; turns++) {
+          if (turns > 1_000_000) throw new Error("pump did not settle");
+          const due = tick(clock);
+          if (due < 0) break;
+          clock = Math.max(clock, due);
+        }
+      }
+      const status = instance.exports["_status"] as (() => number) | undefined;
+      if (status !== undefined) exitCode = status();
+    } catch (err) {
+      if (!(err instanceof WebAssembly.RuntimeError)) throw err;
+      exitCode = 1;
+    }
+    return { stdout: Buffer.concat(chunks).toString("utf8"), exitCode };
+  }
+
+  test("a single finally never reaches parkThrow at all — the injected throw hits the routing table's TRUE default directly", async () => {
+    // NOT a write-discipline pin (relabeled per the explicit unfreeze's
+    // requirement (3)): with only ONE finally, the injected throw at its
+    // suspend point has nothing left to detour into, so it takes
+    // catchArm()'s trueDefault path (%gen.markDone + rethrow) — parkThrow
+    // is never called, %pending.kind/%pending.exc never get written. This
+    // pins THAT path stays correct on its own account, as a control for
+    // the nested pin below (which DOES reach parkThrow) rather than as
+    // evidence for the fix itself.
+    const res = await buildWasm(
+      "sb-single-finally.ts",
+      [
+        "function show(label: string, f: () => unknown): void {",
+        "  try {",
+        "    console.log(label, JSON.stringify(f()));",
+        "  } catch (e) {",
+        '    if (e instanceof Error) console.log(label, "THREW", e.name + ": " + e.message);',
+        '    else console.log(label, "THREW wrong-kind");',
+        "  }",
+        "}",
+        "function* g(): Generator<string, string, unknown> {",
+        "  try {",
+        '    return "returned-value";',
+        "  } finally {",
+        '    yield "fin";',
+        "  }",
+        "}",
+        "const it = g();",
+        // parks RETURN("returned-value"); the finally yields "fin". This
+        // park DOES go through completeOrPark, but the throw injected
+        // below arrives at the FINALLY's OWN suspend point — a state
+        // with no enclosing finally of its own — so it is the ROUTING,
+        // not the park, that must take the default path here.
+        'show("next", () => it.next());',
+        // hits catchArm's trueDefault directly: nothing encloses this
+        // finally, so there is nowhere for parkThrow to detour into.
+        'show("throw", () => it.throw(new Error("injected")));',
+        'show("after", () => it.next());',
+        "",
+      ].join("\n"),
+    );
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+    expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+    const stdout = await runWasmExpectNoTrap(res.binaryPath);
+    // Node-measured (probe-stageB-writediscipline.ts, this session).
+    expect(stdout).toBe(
+      ['next {"value":"fin","done":false}', "throw THREW Error: injected", 'after {"done":true}', ""].join("\n"),
+    );
+  });
+
+  test("a THROW injected over a parked RETURN, crossing a SECOND suspending finally, propagates the injected error — the parked return value never surfaces (parkThrow's own write discipline)", async () => {
+    // THE mandated pin: a source-level `return` parks RETURN in an INNER
+    // finally that itself suspends; a CONSUMER `.throw()` injection then
+    // crosses into an OUTER finally also covering that point, which
+    // ALSO suspends. Nested on purpose — a single, non-nested finally
+    // (above) never reaches parkThrow at all, so nesting is what proves
+    // this pin exercises parkThrow's real mechanism rather than
+    // coincidence. Outcome asserted directly: "resume" must show the
+    // INJECTED error, never "returned-value" (the parked-and-overwritten
+    // RETURN) surfacing anywhere, and the whole run must not trap (the
+    // throw is caught by the compiled program's OWN try/catch, `show`).
+    //
+    // This is the exact shape that caught BOTH bugs this session: round
+    // 1 (a null-pointer trap — parkThrow's snapshot rode a per-invocation
+    // local dead by the time a suspending finally's re-raise ran in a
+    // later call) and round 2 (a silent miscompile once round 1 was
+    // fixed — parkThrow's OWN snapshot read the exception cell AFTER the
+    // enclosing tryCatch's generic catch prologue had already drained
+    // it, so the parked payload was empty; "resume" reported a stale,
+    // wrong value instead of throwing, with no trap at all). Round 2 is
+    // exactly the failure shape board #49 is about, which is why this
+    // pin insists on the explicit no-trap check even for the ordinary,
+    // non-trapping tests in this file — a stdout match alone would have
+    // let round 2 ship.
+    const res = await buildWasm(
+      "sb-nested-throw.ts",
+      [
+        "function show(label: string, f: () => unknown): void {",
+        "  try {",
+        "    console.log(label, JSON.stringify(f()));",
+        "  } catch (e) {",
+        '    if (e instanceof Error) console.log(label, "THREW", e.name + ": " + e.message);',
+        '    else console.log(label, "THREW wrong-kind");',
+        "  }",
+        "}",
+        "function* g(): Generator<string, string, unknown> {",
+        "  try {",
+        "    try {",
+        '      return "returned-value";',
+        "    } finally {",
+        '      yield "inner-fin";',
+        "    }",
+        "  } finally {",
+        '    yield "outer-fin";',
+        "  }",
+        "}",
+        "const it = g();",
+        // parks RETURN("returned-value") at inner; inner finally yields.
+        'show("next", () => it.next());',
+        // must overwrite the park to THROW and cross into outer-fin's
+        // own coverage; outer finally yields.
+        'show("throw", () => it.throw(new Error("injected")));',
+        // outer finally's own natural end re-raises — must be the
+        // injected THROW, never the stale, overwritten RETURN.
+        'show("resume", () => it.next());',
+        "",
+      ].join("\n"),
+    );
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+    expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+    const stdout = await runWasmExpectNoTrap(res.binaryPath);
+    // Node-measured (probe-stageB-writediscipline-nested.ts, this session).
+    expect(stdout).toBe(
+      [
+        'next {"value":"inner-fin","done":false}',
+        'throw {"value":"outer-fin","done":false}',
+        "resume THREW Error: injected",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  test("the SAME nested shape, uncaught at the true top level, traps the module exactly where Node throws uncaught — proves the propagated value, not merely 'something' unwound", async () => {
+    // The strongest form of the pin above: with no source-level catch at
+    // all, the injected error must reach the true top level and trap
+    // `_start` (S007's own uncaught-exception bridge — a real wasm trap
+    // is this backend's exit-1 signal), at the SAME point in the output
+    // Node itself throws uncaught. Round 2's bug (the silent miscompile)
+    // produced a CLEAN run with a stale value here — this specific
+    // shape is what caught it during this session's own debugging, kept
+    // here as the regression rather than only the caught-and-shown form
+    // above, since a clean exit is the failure mode most likely to look
+    // like success at a glance.
+    const res = await buildWasm(
+      "sb-nested-throw-uncaught.ts",
+      [
+        "function* g(): Generator<string, string, unknown> {",
+        "  try {",
+        "    try {",
+        '      return "returned-value";',
+        "    } finally {",
+        '      console.log("inner-fin-start");',
+        '      yield "inner-fin";',
+        '      console.log("inner-fin-tail");',
+        "    }",
+        "  } finally {",
+        '    console.log("outer-fin-start");',
+        '    yield "outer-fin";',
+        '    console.log("outer-fin-tail");',
+        "  }",
+        '  return "normal-end";',
+        "}",
+        "const it = g();",
+        'console.log("A", JSON.stringify(it.next()));',
+        'console.log("B", JSON.stringify(it.throw(new Error("injected"))));',
+        'console.log("C", JSON.stringify(it.next()));',
+        "",
+      ].join("\n"),
+    );
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+    expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+    const stdout = await runWasmExpectTrap(res.binaryPath);
+    // Node-measured (probe-stageB-nested-diag2.ts, this session): output
+    // up to and including "outer-fin-tail" prints, then Node crashes
+    // uncaught before "C" ever runs — the wasm trap must land at the
+    // identical point, not one line later or earlier.
+    expect(stdout).toBe(
+      [
+        "inner-fin-start",
+        'A {"value":"inner-fin","done":false}',
+        "outer-fin-start",
+        'B {"value":"outer-fin","done":false}',
+        "outer-fin-tail",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  test("GENRET's finally CHAINING (not its handler-group routing — see the dedicated pin below for that, a genuinely different bug): a .return() crossing the SAME doubly-nested shape completes with the returned value, no cell write-discipline fix needed", async () => {
+    // PENDING_KIND_FIELD's own doc comment documents the CELL question
+    // (a stale kindG surviving a suspend) as measured, not proven: two
+    // independent Node-diffed probes found no misroute for GENRET across
+    // this exact shape, both before AND after the THROW fix
+    // (genretRouting never reads the exception cell at all — $gen.retPark
+    // carries the value, untouched either way). This pin exists to catch
+    // a REGRESSION on THAT specific question (some future change coupling
+    // GENRET's routing to the cell the way THROW's used to be coupled),
+    // not to assert GENRET had no bug anywhere — it did (round 3's F4,
+    // pinned separately below): a DIFFERENT part of GENRET's own routing
+    // (which handler-group a GENRET dispatches through) was broken by an
+    // unrelated mechanism (a group's shared sentinel using the wrong
+    // representative state's finallyOf), fixed as part of the SAME
+    // change that fixed F2. Two different questions, two different pins.
+    const res = await buildWasm(
+      "sb-nested-genret.ts",
+      [
+        "function show(label: string, f: () => unknown): void {",
+        "  try {",
+        "    console.log(label, JSON.stringify(f()));",
+        "  } catch (e) {",
+        '    if (e instanceof Error) console.log(label, "THREW", e.name + ": " + e.message);',
+        '    else console.log(label, "THREW wrong-kind");',
+        "  }",
+        "}",
+        "function* g(): Generator<string, string, unknown> {",
+        "  try {",
+        "    try {",
+        '      yield "inner-body";',
+        "    } finally {",
+        '      yield "inner-fin";',
+        "    }",
+        "  } finally {",
+        '    yield "outer-fin";',
+        "  }",
+        '  return "normal-end";',
+        "}",
+        "const it = g();",
+        'show("next1", () => it.next());',
+        'show("return", () => it.return("R" as never));',
+        'show("next2", () => it.next());',
+        'show("next3", () => it.next());',
+        "",
+      ].join("\n"),
+    );
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+    expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+    const stdout = await runWasmExpectNoTrap(res.binaryPath);
+    // Node-measured (probe-stageB-genret-drain.ts, this session).
+    expect(stdout).toBe(
+      [
+        'next1 {"value":"inner-body","done":false}',
+        'return {"value":"inner-fin","done":false}',
+        'next2 {"value":"outer-fin","done":false}',
+        'next3 {"value":"R","done":true}',
+        "",
+      ].join("\n"),
+    );
+  });
+
+  test("round 3, F1: a plain source-level throw parked at an inner finally chains through a STILL-open outer finally at the inner finally's own natural end — not merely at a consumer injection point", async () => {
+    // Distinct from the two pins above: those exercise a CONSUMER
+    // `.throw()` injection landing directly at a suspend point (routed
+    // by catchArm, which already worked). This shape has NO injection at
+    // all — an ordinary `throw` inside the innermost try parks at the
+    // inner finally via the normal path (already correct before round
+    // 3), the inner finally suspends normally, and on plain resume its
+    // own tail reaches reraisePending — THAT is where F1 lived:
+    // reraisePending's THROW arm never checked `finallyOf`, unlike its
+    // RETURN/GENRET siblings, so it unwound straight out instead of
+    // detouring into the still-open outer finally. Node-measured
+    // (probe-sb3-chained-reraise.ts, reviewer-supplied).
+    const res = await buildWasm(
+      "sb3-chained-reraise.ts",
+      [
+        "function* g(): Generator<string, string, unknown> {",
+        "  try {",
+        "    try {",
+        '      yield "a";',
+        '      throw new Error("boom");',
+        "    } finally {",
+        '      yield "inner-fin";',
+        "    }",
+        "  } finally {",
+        '    yield "outer-fin";',
+        "  }",
+        "}",
+        "const it = g();",
+        'console.log("1", JSON.stringify(it.next()));',
+        'console.log("2", JSON.stringify(it.next()));',
+        'console.log("3", JSON.stringify(it.next()));',
+        "try {",
+        '  console.log("4", JSON.stringify(it.next()));',
+        "} catch (e) {",
+        '  console.log("4 THREW", (e as Error).message);',
+        "}",
+        "",
+      ].join("\n"),
+    );
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+    expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+    const stdout = await runWasmExpectNoTrap(res.binaryPath);
+    expect(stdout).toBe(
+      [
+        '1 {"value":"a","done":false}',
+        '2 {"value":"inner-fin","done":false}',
+        '3 {"value":"outer-fin","done":false}',
+        "4 THREW boom",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  test("round 3, F2: a throw under an inner finally, wrapped by a SEPARATE outer try/catch (not a full try/catch/finally), runs the finally BEFORE reaching the outer catch", async () => {
+    // Nesting order matters, not just "a handler exists": here the inner
+    // try/finally is wrapped by an OUTER try/catch, two separate
+    // constructs — the finally is pushed AFTER (more deeply nested than)
+    // the outer handler, so it must run FIRST. Before round 3,
+    // catchArm's grouping sent any state with a non-negative handlerOf
+    // straight to the handler regardless of nesting, skipping the inner
+    // finally entirely — "yield inner-fin" would never print. Node-
+    // measured (sb3-varF.ts, reviewer-supplied).
+    const res = await buildWasm(
+      "sb3-varF.ts",
+      [
+        "function* g(): Generator<string, string, unknown> {",
+        "  try {",
+        "    try {",
+        '      yield "a";',
+        '      throw new Error("boom");',
+        "    } finally {",
+        '      yield "inner-fin";',
+        "    }",
+        '  } catch (e) { yield "caught:" + (e as Error).message; }',
+        '  return "end";',
+        "}",
+        "const it = g();",
+        'console.log("1", JSON.stringify(it.next()));',
+        'console.log("2", JSON.stringify(it.next()));',
+        'console.log("3", JSON.stringify(it.next()));',
+        'console.log("4", JSON.stringify(it.next()));',
+        "",
+      ].join("\n"),
+    );
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+    expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+    const stdout = await runWasmExpectNoTrap(res.binaryPath);
+    expect(stdout).toBe(
+      [
+        '1 {"value":"a","done":false}',
+        '2 {"value":"inner-fin","done":false}',
+        '3 {"value":"caught:boom","done":false}',
+        '4 {"value":"end","done":true}',
+        "",
+      ].join("\n"),
+    );
+  });
+
+  test("round 3, F4: a GENRET into a handler group whose REPRESENTATIVE state has no enclosing finally, while the state actually suspended does", async () => {
+    // Two yield sites share ONE outer catch — "before" (no finally of
+    // its own) and "inside" (wrapped by an inner finally, still under
+    // the SAME outer catch). Before round 3, catchArm grouped both
+    // states purely by handlerOf, and the group's shared GENRET sentinel
+    // read finallyOf off states[0] — if that happened to be "before"
+    // (finallyOf -1), a .return() actually delivered at "inside" wrongly
+    // skipped the inner finally instead of detouring into it. This is a
+    // DIFFERENT bug from the two above (GENRET's own routing, not a real
+    // exception's), closed by the SAME (handlerOf, finallyOf) pair
+    // grouping fix. Node-measured (sb3-varG.ts, reviewer-supplied).
+    const res = await buildWasm(
+      "sb3-varG.ts",
+      [
+        "function* g(): Generator<string, string, unknown> {",
+        "  try {",
+        '    yield "before";',
+        "    try {",
+        '      yield "inside";',
+        "    } finally {",
+        '      yield "fin";',
+        "    }",
+        '  } catch (e) { yield "caught"; }',
+        '  return "end";',
+        "}",
+        "const it = g();",
+        'console.log("1", JSON.stringify(it.next()));',
+        'console.log("2", JSON.stringify(it.next()));',
+        'console.log("3", JSON.stringify(it.return("early")));',
+        'console.log("4", JSON.stringify(it.next()));',
+        "",
+      ].join("\n"),
+    );
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+    expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+    const stdout = await runWasmExpectNoTrap(res.binaryPath);
+    expect(stdout).toBe(
+      [
+        '1 {"value":"before","done":false}',
+        '2 {"value":"inside","done":false}',
+        '3 {"value":"fin","done":false}',
+        '4 {"value":"early","done":true}',
+        "",
+      ].join("\n"),
+    );
+  });
+
+  test("round 3, F6: a generator that throws all the way out through a suspending finally is marked DONE, not left resumable — the fourth .next() must answer {done:true}, not trap", async () => {
+    // Before F6's fix, reraisePending's true final exit restored the
+    // exception cell and returned WITHOUT %gen.markDone — $gen.state
+    // stayed SUSPENDED, so a later .next() call resumed `resume` at a
+    // state with nothing valid left to run: a trap, not Node's own
+    // {value:undefined,done:true} steady state. Node-measured
+    // (sb3-varH.ts, reviewer-supplied).
+    const res = await buildWasm(
+      "sb3-varH.ts",
+      [
+        "function* g(): Generator<string, string, unknown> {",
+        "  try { yield \"a\"; throw new Error(\"boom\"); }",
+        '  finally { yield "fin"; }',
+        "}",
+        "const it = g();",
+        'console.log("1", JSON.stringify(it.next()));',
+        'console.log("2", JSON.stringify(it.next()));',
+        "try {",
+        '  console.log("3", JSON.stringify(it.next()));',
+        "} catch (e) {",
+        '  console.log("3 THREW", (e as Error).message);',
+        "}",
+        'console.log("4", JSON.stringify(it.next()));',
+        'console.log("5", JSON.stringify(it.next()));',
+        "",
+      ].join("\n"),
+    );
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+    expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+    const stdout = await runWasmExpectNoTrap(res.binaryPath);
+    expect(stdout).toBe(
+      [
+        '1 {"value":"a","done":false}',
+        '2 {"value":"fin","done":false}',
+        "3 THREW boom",
+        '4 {"done":true}',
+        '5 {"done":true}',
+        "",
+      ].join("\n"),
+    );
+  });
+
+  test("round 3, F7: an async function that throws all the way out through a suspending finally rejects its own promise — it must not hang forever unsettled", async () => {
+    // Before F7's fix, the SAME true final exit skipped %async.reject
+    // entirely for the async lane — the promise never settled, the
+    // awaiting caller never resumed, and the program exited 0 with
+    // silently truncated output instead of Node's own rejection. No
+    // trap, no wrong value at an identifiable point — the worst
+    // divergence class this increment can produce, invisible to a
+    // stdout-only or exit-code-only check. Requires the timer-pumping
+    // host (`runWasmWithTimers`) — a plain write-only import stalls a
+    // real `setTimeout` inside an awaited chain. Node-measured
+    // (sb3-varI.ts, reviewer-supplied).
+    const res = await buildWasm(
+      "sb3-varI.ts",
+      [
+        "function tick(): Promise<void> {",
+        "  return new Promise<void>((resolve) => { setTimeout(() => { resolve(); }, 1); });",
+        "}",
+        "async function f(): Promise<string> {",
+        "  try {",
+        "    await tick();",
+        '    throw new Error("boom");',
+        "  } finally {",
+        "    await tick();",
+        '    console.log("finally ran");',
+        "  }",
+        "}",
+        "async function main(): Promise<void> {",
+        "  try {",
+        "    const v = await f();",
+        '    console.log("resolved", v);',
+        "  } catch (e) {",
+        '    console.log("rejected", (e as Error).message);',
+        "  }",
+        '  console.log("main done");',
+        "}",
+        "main();",
+        'console.log("spawned");',
+        "",
+      ].join("\n"),
+    );
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+    expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+    const { stdout, exitCode } = await runWasmWithTimers(res.binaryPath);
+    expect(exitCode).toBe(0);
+    expect(stdout).toBe(["spawned", "finally ran", "rejected boom", "main done", ""].join("\n"));
+  });
+
+  test("round 3, F7's own control: the SAME async shape with NO throw — await-in-finally on the normal path settles the promise and resolves, proving F6/F7's fix didn't break the case that already worked", async () => {
+    // sb3-varJ.ts, reviewer-supplied — the near-miss this pin exists to
+    // guard against: it's easy for a "make the uncaught-exception exit
+    // more correct" fix to accidentally regress the ordinary resolving
+    // path if the true-final-exit change is scoped wrong. This shape is
+    // already green on all three lanes; it stays green here as a
+    // permanent regression guard, not evidence a bug was ever found.
+    const res = await buildWasm(
+      "sb3-varJ.ts",
+      [
+        "function tick(): Promise<void> {",
+        "  return new Promise<void>((resolve) => { setTimeout(() => { resolve(); }, 1); });",
+        "}",
+        "async function f(): Promise<string> {",
+        "  try {",
+        "    await tick();",
+        '    return "ok";',
+        "  } finally {",
+        "    await tick();",
+        '    console.log("finally ran");',
+        "  }",
+        "}",
+        "async function main(): Promise<void> {",
+        "  const v = await f();",
+        '  console.log("resolved", v);',
+        "}",
+        "main();",
+        'console.log("spawned");',
+        "",
+      ].join("\n"),
+    );
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+    expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+    const { stdout, exitCode } = await runWasmWithTimers(res.binaryPath);
+    expect(exitCode).toBe(0);
+    expect(stdout).toBe(["spawned", "finally ran", "resolved ok", ""].join("\n"));
+  });
+
+  test("round 3, F8: a catch nested BETWEEN a suspending inner finally and an outer finally — reraisePending's THROW arm must reach the NEARER catch, not skip it for a fixed 'finally always first' priority", async () => {
+    // The F1 fix gave THROW a finallyOf check, but hard-coded it FIRST
+    // with handlerOf only as a fallback — the exact category-first
+    // mistake F2 already named and fixed inside catchArm's own grouping,
+    // reintroduced here at the one site that never got routed through
+    // nearestOf. At the inner finally's own end state here, handlerOf
+    // names the MIDDLE catch and finallyOf names the OUTER finally, and
+    // the middle catch is nearer (pushed after the outer finally, more
+    // deeply nested) — Node delivers there. The unconditional
+    // "finallyOf first" order skipped it entirely: the exception (or,
+    // for the async analog, the promise's own outcome) reached the outer
+    // finally and completed as if nothing had ever caught it. Node-
+    // measured (sb3-varK.ts, reviewer-supplied).
+    const res = await buildWasm(
+      "sb3-varK.ts",
+      [
+        "function* g(): Generator<string, string, unknown> {",
+        "  try {",
+        "    try {",
+        "      try { yield \"a\"; throw new Error(\"boom\"); }",
+        '      finally { yield "inner-fin"; }',
+        '    } catch (e) { yield "caught:" + (e as Error).message; }',
+        "  } finally {",
+        '    yield "outer-fin";',
+        "  }",
+        '  return "end";',
+        "}",
+        "const it = g();",
+        'console.log("1", JSON.stringify(it.next()));',
+        'console.log("2", JSON.stringify(it.next()));',
+        'console.log("3", JSON.stringify(it.next()));',
+        'console.log("4", JSON.stringify(it.next()));',
+        'console.log("5", JSON.stringify(it.next()));',
+        "",
+      ].join("\n"),
+    );
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+    expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+    const stdout = await runWasmExpectNoTrap(res.binaryPath);
+    expect(stdout).toBe(
+      [
+        '1 {"value":"a","done":false}',
+        '2 {"value":"inner-fin","done":false}',
+        '3 {"value":"caught:boom","done":false}',
+        '4 {"value":"outer-fin","done":false}',
+        '5 {"value":"end","done":true}',
+        "",
+      ].join("\n"),
+    );
   });
 });

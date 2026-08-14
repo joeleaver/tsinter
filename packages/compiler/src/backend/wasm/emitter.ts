@@ -5727,6 +5727,57 @@ class Assembler {
         return;
       }
 
+      /** Stage B's finally re-raise (statemachine.ts's own doc comment
+       * has the full "why not rethrow" story): restore `snapshot`
+       * (parkThrow's own `%pending.exc` — the routing table's OWN
+       * `excRef`, moved into frame storage verbatim, never a fresh cell
+       * read; parkThrow's doc comment has the "why not" for that one)
+       * back into the exception cell — the same four globals a wasm
+       * catch's own binding reads, same order, mirroring `rethrow`'s own
+       * "read a snapshot, write the cell" shape exactly, just sourced
+       * from a frame field instead of EXC_LOCAL — then return directly:
+       * no check needed, since this op just filled the cell itself, and
+       * nothing here needs to re-enter catchArm's own routing (that
+       * decision is already made — see this op's own AsyncStmt doc
+       * comment for why a direct return, not `emitUnwind()`, is correct
+       * here specifically). */
+      case "%async.pendingUnwind": {
+        const exc = this.exc();
+        const snapshotRef: ValType = { kind: "ref", nullable: true, typeIndex: exc.caughtT };
+        const c = this.acquireScratch(snapshotRef);
+        this.walkExpr(s.snapshot);
+        code.localSet(c);
+        code.localGet(c);
+        code.structGet(exc.caughtT, 1);
+        code.globalSet(exc.f64G);
+        code.localGet(c);
+        code.structGet(exc.caughtT, 2);
+        code.globalSet(exc.refG);
+        code.localGet(c);
+        code.structGet(exc.caughtT, 3);
+        code.globalSet(exc.preG);
+        code.localGet(c);
+        code.structGet(exc.caughtT, 0);
+        code.globalSet(exc.kindG);
+        this.releaseScratch(snapshotRef, c);
+        // A DIRECT return, not `emitUnwind()`: this op only ever runs as
+        // PART OF reraisePending's own dispatch, which has ALREADY made
+        // the routing decision (there is nothing left for catchArm's
+        // table to decide by branching into it again) — `emitUnwind()`'s
+        // generic `tryStack`-aware branch is for a call site that MIGHT
+        // throw, checked afterward; here the cell is DEFINITELY pending,
+        // by construction, so the only correct next step is resume
+        // exiting immediately, leaving the JUST-RESTORED cell for
+        // genResume's own caller-side pending check (emitResumeCallAndResult's
+        // unconditional emitPendingCheck, after every resume call) to
+        // detect and propagate — the SAME two-step "callee sets the
+        // cell and returns, caller checks after" shape every other
+        // may-throw site in this file already uses. Resume is always
+        // VOID (resumeType's own signature), so no value to push.
+        code.return_();
+        return;
+      }
+
       /** catchArm's real-exception exit (A2c slice 3): `$gen.state = DONE`
        * alone, `out` untouched — the cell carries the value onward via
        * `rethrow` right after this op in every caller, so there is
@@ -5825,6 +5876,7 @@ class Assembler {
       case "%async.cacheCheck":
       case "%async.markHandled":
       case "%async.boxInit":
+      case "%async.pendingUnwind":
       case "%gen.suspend":
       case "%gen.injectCheck":
       case "%gen.complete":
