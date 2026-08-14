@@ -111,20 +111,44 @@
  * lanes (`completeOrPark`/`genretRouting`/`parkThrow`/`reraisePending`,
  * the TRY/CATCH section's own "STAGE B ADDITION" above): a suspension —
  * or a return/uncaught-throw/GENRET crossing — inside a try/catch/
- * FINALLY now linearizes instead of declining, for either lane.
+ * FINALLY now linearizes instead of declining, for either lane. Stage
+ * C-1 adds two more: `lowerSwitch` reuses the source "switch" shape
+ * itself as the dispatch (same disc, same tests, verbatim — only each
+ * case's body becomes a goto into its own new state), with the
+ * discriminant hoisting like an `if`'s condition (a fourth position
+ * worth naming, alongside the three below) and a synthetic
+ * `{test:null, goto(exitS)}` arm covering a missing default; and
+ * `hoistStmt`'s own "forOf" case desugars an array-typed, suspension-
+ * containing for-of into an ordinary index-based `for` BEFORE
+ * checkPositions ever runs, so the existing for-machinery does the rest
+ * with zero changes of its own — a for-of over a GENERATOR was never
+ * this pass's problem in the first place (lower-generators.ts's
+ * lowerForOfGenerator already desugars it to a while loop at the
+ * frontend, unconditionally, so no "forOf" IR node survives for one).
+ * Stage C-1 also fixed a latent stage A2c bug found live via 2454:
+ * lowerSuspension's "yield" case now hoists its operand into its own
+ * frame slot before saves() runs, mirroring "await"'s own pattern
+ * (`awaitSlot`) exactly — before the fix, a side-effecting yield operand
+ * (`yield i++`) lost its effect on every suspend/resume round trip.
  *
- * WHAT REMAINS UNBUILT, stated exactly once here: yield/await inside a
- * SWITCH or a for-of both still decline by name
- * (`fn:generator:yield-in-switch`/`yield-in-forof`, mirrored on the
- * async side) — real linearization machinery neither lane has, not a
- * simple lift. A break/continue LEAVING a finally-protected region also
- * still declines (`fn:async:jump-out-of-trycatch`, narrowed by stage B
- * to exactly that shape) — the completion-parking machinery stage B
- * built covers return/throw/GENRET/normal completion, never a jump
- * target. Conditional/loop-header yield positions decline under
- * mirrored names (`linearizationRefusal` below) the same as async's own
- * always have. None of these are oversights left implicit — every one
- * refuses loudly under its own named construct, never silently.
+ * WHAT REMAINS UNBUILT, stated exactly once here: a case TEST suspending
+ * inside a switch still declines by name
+ * (`fn:generator:yield-in-switch-test`/the async mirror) — the
+ * conditional, lazily-evaluated part of a switch, needing a multi-state
+ * dispatch chain neither lane builds. For-of over anything but an array
+ * — a string, a dyn value, any iterable this backend does not walk —
+ * still declines under the ordinary forOf name, as does a suspension IN
+ * the for-of's own iterable expression (the iterable stays a "clean"
+ * position, like every other header/cond slot below); a for-of over a
+ * GENERATOR was never in this bucket at all (see BUILD STATUS above). A
+ * break/continue LEAVING a finally-protected region also still declines
+ * (`fn:async:jump-out-of-trycatch`, narrowed by stage B to exactly that
+ * shape) — the completion-parking machinery stage B built covers
+ * return/throw/GENRET/normal completion, never a jump target.
+ * Conditional/loop-header yield positions decline under mirrored names
+ * (`linearizationRefusal` below) the same as async's own always have.
+ * None of these are oversights left implicit — every one refuses loudly
+ * under its own named construct, never silently.
  *
  * ONE RESUME SIGNATURE. Resume takes `%frameBase` — an empty OPEN struct
  * every concrete frame subtypes — and casts it down to its own shape in a
@@ -200,14 +224,19 @@
  * for the mirror-image reason — a hoist ahead of the loop would evaluate
  * once what the loop evaluates per iteration.
  *
- * Three positions are worth naming because they are not expressions in an
+ * Four positions are worth naming because they are not expressions in an
  * argument list: an `if` CONDITION hoists (it evaluates exactly once,
  * before either arm — the arms are statement lists the pass explodes); a
- * WRITE statement hoists every operand it has, because JS evaluates
- * `arr[i] = await p` as reference, then index, then value, and moving only
- * the value would put the other two behind the suspension; and a
- * `seqExpr` is SPLICED, its straight-line statements landing in the host
- * list at the point the expression itself would have run.
+ * switch DISCRIMINANT hoists the same way, for the same reason (stage
+ * C-1) — it is if-cond-shaped, not while/for-header-shaped, evaluating
+ * exactly once, unconditionally, before any test; the CASE TESTS are the
+ * switch's own conditional part and stay refused instead, alongside the
+ * conditional positions above. A WRITE statement hoists every operand it
+ * has, because JS evaluates `arr[i] = await p` as reference, then index,
+ * then value, and moving only the value would put the other two behind
+ * the suspension; and a `seqExpr` is SPLICED, its straight-line
+ * statements landing in the host list at the point the expression itself
+ * would have run.
  *
  * The rewrite runs BEFORE checkPositions, which is left as the checker of
  * what hoisting could not fix.
@@ -3047,6 +3076,16 @@ export class FunctionLowering {
         break;
       }
       case "hop": {
+        // susp.result is always null or a bare %awaited varRef — see the
+        // three construction sites in lower-exprs.ts (classifySuspension's
+        // own hop arm), no fourth shape exists. That is WHY reading it
+        // here, after saves(), is safe: a varRef has no side effect to
+        // lose, and the operand's real evaluation already ran inside
+        // `before`, emitted above, before saves(). Structural, not merely
+        // an artifact of emission order — a future frontend change that
+        // let result be a CALL (or anything else with a side effect)
+        // would need the same slot treatment await and yield use, and
+        // this comment is the trip wire for that change to reckon with.
         this.emit(cur, ...susp.before);
         this.emit(cur, ...this.saves(), this.set(STATE_FIELD, this.num(resumeState)), {
           kind: "%async.hop",

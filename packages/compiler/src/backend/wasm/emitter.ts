@@ -9448,132 +9448,151 @@ class Assembler {
         this.emitUnwind();
         this.close();
 
-        if (e.mode === "next") {
-          code.localGet(g);
-          code.structGet(info.struct, info.idx.state);
-          code.i32Const(GEN_DONE);
-          code.i32Eq();
-          this.openIfResult(recRefT);
-          this.emitIterResult(
-            recInfo,
-            () => this.emitGenOutValue(null, info, genKey, e.loc),
-            () => code.i32Const(1),
-          );
-          code.else_();
+        // An exhaustive switch, not the if/else-if chain this used to be —
+        // lowerSuspension's own Suspension dispatch drew this exact line
+        // first (see its header comment): a bare trailing `else` type-
+        // checks only by accident (a missing arm's errors are ordinary
+        // property-access errors in that branch, not an exhaustiveness
+        // failure), where the `default` below's `never` check makes
+        // adding a fourth genResume mode without a case here a compile
+        // error by construction, matching every exhaustive dispatch
+        // elsewhere in this file.
+        switch (e.mode) {
+          case "next": {
+            code.localGet(g);
+            code.structGet(info.struct, info.idx.state);
+            code.i32Const(GEN_DONE);
+            code.i32Eq();
+            this.openIfResult(recRefT);
+            this.emitIterResult(
+              recInfo,
+              () => this.emitGenOutValue(null, info, genKey, e.loc),
+              () => code.i32Const(1),
+            );
+            code.else_();
 
-          if (info.idx.sent >= 0) {
+            if (info.idx.sent >= 0) {
+              code.localGet(g);
+              code.structGet(info.struct, info.idx.state);
+              code.i32Const(GEN_SUSPENDED);
+              code.i32Eq();
+              this.openIf();
+              code.localGet(g);
+              if (e.arg !== null) {
+                this.walkExpr(e.arg);
+              } else {
+                this.walkExpr({
+                  kind: "dynFrom",
+                  value: { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc: e.loc },
+                  type: DYN,
+                  loc: e.loc,
+                });
+              }
+              code.structSet(info.struct, info.idx.sent);
+              this.close();
+            }
+            code.localGet(g);
+            code.i32Const(INJECT_NEXT);
+            code.structSet(info.struct, info.idx.inject);
+            this.emitResumeCallAndResult(g, info, recInfo);
+            this.close();
+            break;
+          }
+          case "return": {
+            // The fast path is "not SUSPENDED" — UNSTARTED or DONE, the
+            // only two states left once the reentrancy check above has
+            // already ruled out RUNNING.
             code.localGet(g);
             code.structGet(info.struct, info.idx.state);
             code.i32Const(GEN_SUSPENDED);
-            code.i32Eq();
+            code.i32Ne();
+            this.openIfResult(recRefT);
+            // UNSTARTED-or-DONE fast path: {value: v, done: true}, marking
+            // DONE (a no-op if it already was — Node's own idempotence).
+            code.localGet(g);
+            code.i32Const(GEN_DONE);
+            code.structSet(info.struct, info.idx.state);
+            this.emitIterResult(
+              recInfo,
+              () => this.emitGenOutValue(e.arg, info, genKey, e.loc),
+              () => code.i32Const(1),
+            );
+            code.else_();
+
+            // A bare `.return()` (e.arg === null, "the runtime sends
+            // undefined" — lowerGenMethodCall's own framing, allowed for
+            // ANY retT since JS never enforces a return type at runtime)
+            // leaves $gen.retPark UNTOUCHED here: its raw storage
+            // (mapTypeSoft(retT)) has no representation for "undefined"
+            // when retT is concrete, and %gen.retPark's own reader has no
+            // way to learn "this was conceptually undefined" once it is
+            // retagged — a real gap, but an UNOBSERVED one for every
+            // program this slice claims: the for-of desugar's own
+            // IteratorClose call is the ONLY source of an argument-less
+            // `.return()` in the corpus today, and its result is always
+            // DISCARDED (lower-generators.ts's own comment: "the .return()
+            // result record is dropped"), never read, so this is not yet
+            // exercised where it would be visible. Flagged here rather
+            // than silently assumed correct.
+            if (e.arg !== null) {
+              code.localGet(g);
+              this.walkExpr(e.arg);
+              code.structSet(info.struct, info.idx.retPark);
+            }
+            code.localGet(g);
+            code.i32Const(INJECT_GENRET);
+            code.structSet(info.struct, info.idx.inject);
+            this.emitResumeCallAndResult(g, info, recInfo);
+            this.close();
+            break;
+          }
+          case "throw": {
+            // The frontend (lowerGenMethodCall, SC1071) never lets a
+            // throw-mode node reach here with a null arg — asserted, not
+            // silently trusted.
+            if (e.arg === null) {
+              throw new Error("genResume throw mode: arg is null (frontend must always supply one — SC1071)");
+            }
+            const arg = e.arg;
+
+            // The fast path is "not SUSPENDED" — UNSTARTED or DONE, the
+            // same two states "return"'s own fast path answers directly.
+            // Node-probed: the body is NEVER entered; the caller's value
+            // rethrows AT genResume's OWN call site, exactly like a plain
+            // `throw e;` statement, and the generator becomes/stays DONE
+            // (idempotent on an already-DONE generator).
+            code.localGet(g);
+            code.structGet(info.struct, info.idx.state);
+            code.i32Const(GEN_SUSPENDED);
+            code.i32Ne();
             this.openIf();
             code.localGet(g);
-            if (e.arg !== null) {
-              this.walkExpr(e.arg);
-            } else {
-              this.walkExpr({
-                kind: "dynFrom",
-                value: { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc: e.loc },
-                type: DYN,
-                loc: e.loc,
-              });
-            }
-            code.structSet(info.struct, info.idx.sent);
+            code.i32Const(GEN_DONE);
+            code.structSet(info.struct, info.idx.state);
+            this.emitThrowValue(arg);
+            this.emitUnwind();
             this.close();
-          }
-          code.localGet(g);
-          code.i32Const(INJECT_NEXT);
-          code.structSet(info.struct, info.idx.inject);
-          this.emitResumeCallAndResult(g, info, recInfo);
-          this.close();
-        } else if (e.mode === "return") {
-          // The fast path is "not SUSPENDED" — UNSTARTED or DONE, the
-          // only two states left once the reentrancy check above has
-          // already ruled out RUNNING.
-          code.localGet(g);
-          code.structGet(info.struct, info.idx.state);
-          code.i32Const(GEN_SUSPENDED);
-          code.i32Ne();
-          this.openIfResult(recRefT);
-          // UNSTARTED-or-DONE fast path: {value: v, done: true}, marking
-          // DONE (a no-op if it already was — Node's own idempotence).
-          code.localGet(g);
-          code.i32Const(GEN_DONE);
-          code.structSet(info.struct, info.idx.state);
-          this.emitIterResult(
-            recInfo,
-            () => this.emitGenOutValue(e.arg, info, genKey, e.loc),
-            () => code.i32Const(1),
-          );
-          code.else_();
 
-          // A bare `.return()` (e.arg === null, "the runtime sends
-          // undefined" — lowerGenMethodCall's own framing, allowed for
-          // ANY retT since JS never enforces a return type at runtime)
-          // leaves $gen.retPark UNTOUCHED here: its raw storage
-          // (mapTypeSoft(retT)) has no representation for "undefined"
-          // when retT is concrete, and %gen.retPark's own reader has no
-          // way to learn "this was conceptually undefined" once it is
-          // retagged — a real gap, but an UNOBSERVED one for every
-          // program this slice claims: the for-of desugar's own
-          // IteratorClose call is the ONLY source of an argument-less
-          // `.return()` in the corpus today, and its result is always
-          // DISCARDED (lower-generators.ts's own comment: "the .return()
-          // result record is dropped"), never read, so this is not yet
-          // exercised where it would be visible. Flagged here rather
-          // than silently assumed correct.
-          if (e.arg !== null) {
+            // SUSPENDED: fill the SAME exception cell an ordinary `throw`
+            // statement fills (emitThrowValue — the identical write side),
+            // then resume through the shared tail. Whether the body's own
+            // try/catch takes it and continues, or it propagates out
+            // uncaught, needs no throw-specific branch here — an injected
+            // throw and an ordinary body throw are indistinguishable once
+            // the cell is filled (emitResumeCallAndResult's own
+            // unconditional emitPendingCheck already carries the uncaught
+            // case, the same as every other may-throw call site).
+            this.emitThrowValue(arg);
             code.localGet(g);
-            this.walkExpr(e.arg);
-            code.structSet(info.struct, info.idx.retPark);
+            code.i32Const(INJECT_THROW);
+            code.structSet(info.struct, info.idx.inject);
+            this.emitResumeCallAndResult(g, info, recInfo);
+            break;
           }
-          code.localGet(g);
-          code.i32Const(INJECT_GENRET);
-          code.structSet(info.struct, info.idx.inject);
-          this.emitResumeCallAndResult(g, info, recInfo);
-          this.close();
-        } else {
-          // e.mode === "throw" (TS narrows the exhaustive 3-way union).
-          // The frontend (lowerGenMethodCall, SC1071) never lets a
-          // throw-mode node reach here with a null arg — asserted, not
-          // silently trusted.
-          if (e.arg === null) {
-            throw new Error("genResume throw mode: arg is null (frontend must always supply one — SC1071)");
+          default: {
+            const rest: never = e.mode;
+            throw new Error(`genResume: unhandled mode "${rest}"`);
           }
-          const arg = e.arg;
-
-          // The fast path is "not SUSPENDED" — UNSTARTED or DONE, the
-          // same two states "return"'s own fast path answers directly.
-          // Node-probed: the body is NEVER entered; the caller's value
-          // rethrows AT genResume's OWN call site, exactly like a plain
-          // `throw e;` statement, and the generator becomes/stays DONE
-          // (idempotent on an already-DONE generator).
-          code.localGet(g);
-          code.structGet(info.struct, info.idx.state);
-          code.i32Const(GEN_SUSPENDED);
-          code.i32Ne();
-          this.openIf();
-          code.localGet(g);
-          code.i32Const(GEN_DONE);
-          code.structSet(info.struct, info.idx.state);
-          this.emitThrowValue(arg);
-          this.emitUnwind();
-          this.close();
-
-          // SUSPENDED: fill the SAME exception cell an ordinary `throw`
-          // statement fills (emitThrowValue — the identical write side),
-          // then resume through the shared tail. Whether the body's own
-          // try/catch takes it and continues, or it propagates out
-          // uncaught, needs no throw-specific branch here — an injected
-          // throw and an ordinary body throw are indistinguishable once
-          // the cell is filled (emitResumeCallAndResult's own
-          // unconditional emitPendingCheck already carries the uncaught
-          // case, the same as every other may-throw call site).
-          this.emitThrowValue(arg);
-          code.localGet(g);
-          code.i32Const(INJECT_THROW);
-          code.structSet(info.struct, info.idx.inject);
-          this.emitResumeCallAndResult(g, info, recInfo);
         }
         this.releaseScratch(genRefT, g);
         return;

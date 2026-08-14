@@ -2115,7 +2115,12 @@ ran`, the identical non-forwarding this entry describes for wasm.
 agreeing with Node's `{"value":"RV","done":true}` on all three lanes
 despite the non-forwarding — the divergence is confined to the delegate's
 silently-skipped side effects, not the outer's own reported completion
-value. A companion Node-only measurement, `s039-identity.mjs`, confirms
+value. The field ORDER match is via `genResultRecord`'s own
+`declaredOrder: ["value", "done"]` (F4, S041), not an inherent per-lane
+property — S041's own module-wide race (whichever construction reaches
+the interner first) still governs it in principle, empirically confirmed
+value-first on all three lanes as of increment 19 stage C-1, not
+guaranteed unconditionally for every construction order. A companion Node-only measurement, `s039-identity.mjs`, confirms
 the "forwarded verbatim, not swallowed or re-wrapped" claim above at the
 object-identity level, not just by matching message text: a `.throw()`
 forwarded from a non-catching delegate reaches the caller as the exact
@@ -2160,11 +2165,14 @@ explained by some simpler unwind-notification mechanism, but a `catch`
 binding the exact injected value and the delegate staying ALIVE
 afterward is only possible if `.throw()` is a real re-entry into the
 delegate's own suspended frame, exactly the two-way delegation Node's
-spec gives `yield*` and this tier's desugar cannot reach. Once `yield*`
-lowers, a unit test (statemachine-level or a builder-level generator test)
-should pin the CURRENT (non-forwarding) behavior directly, the same way
-S037/S038 pin their gaps' correct-branch behavior; no corpus program can
-pin the gap itself, per the previous paragraph.
+spec gives `yield*` and this tier's desugar cannot reach. **Pinned** (the
+increment 19 final unit's own citation read found this instruction
+unfulfilled at the time): `wasm-statemachine.test.ts`'s "register
+close-out: S039/S040 forward-instruction pins" describe block, the S039
+test — a full-source `yield*`-delegation program, `.return()` injected
+mid-delegation, asserting the CURRENT (non-forwarding) behavior directly,
+the same way S037/S038 pin their gaps' correct-branch behavior; no
+corpus program can pin the gap itself, per the previous paragraph.
 
 ## S040 — A consumer `return`/`throw` abandoning a `for-of` over a generator does not `IteratorClose` (only `break` does) *(frontend desugar, shared by all three lanes)*
 
@@ -2268,10 +2276,14 @@ itself: for `break`/`return`/`throw` the instrumented log
 `finally` still runs. This is the exhaustion row's real evidence — not
 merely "no `.return()` needed," but "measured to never happen" — and
 directly supports the "exhaustion skips the close, independent of any
-close" parenthetical earlier in this entry. Once `for-of`-over-generator
-lowers, a unit test should pin the CURRENT (`break`-only) closing
-behavior directly. No corpus program can pin the gap itself, per the
-previous paragraph.
+close" parenthetical earlier in this entry. **Pinned** (the increment 19
+final unit's own citation read found this instruction unfulfilled at the
+time): `wasm-statemachine.test.ts`'s "register close-out: S039/S040
+forward-instruction pins" describe block, the S040 test — a full-source
+program abandoning a for-of-over-generator all three ways (`break`,
+`return`, an uncaught `throw`), asserting the CURRENT (`break`-only)
+closing behavior directly. No corpus program can pin the gap itself, per
+the previous paragraph.
 
 ## S041 — Structurally-identical record shapes share ONE own-key render order — first construction site wins, module-wide *(pre-existing, all three lanes; first registered here because generators are the first feature whose INTENT a collision can silently defeat)*
 

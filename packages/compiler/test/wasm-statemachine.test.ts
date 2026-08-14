@@ -4113,3 +4113,137 @@ describe("stage C: forOf array desugar + the yield-operand slot fix (full-source
     expect(stdout).toBe(["0+1@2", "free: 0,1,2", "separate: 0,1,2", ""].join("\n"));
   });
 });
+
+describe("register close-out: S039/S040 forward-instruction pins", () => {
+  // Both entries' own "Tested by" sections instruct: "once [generator
+  // lowering / for-of-over-generator] lowers, a unit test should pin the
+  // CURRENT (divergent) behavior directly" — the S037/S038 pattern. This
+  // increment's independence citation read (the lead's own S039-S041
+  // read, closing the reviewer's self-flagged loop) found both
+  // instructions still unfulfilled at the final unit: zero S039/S040
+  // references existed anywhere in this file before these two tests.
+  let scratch: string;
+  beforeAll(async () => {
+    scratch = await mkdtemp(join(tmpdir(), "tsinter-wasm-register-close-"));
+  });
+  afterAll(async () => {
+    await rm(scratch, { recursive: true, force: true });
+  });
+
+  async function buildWasm(name: string, source: string) {
+    const entry = join(scratch, name);
+    await writeFile(entry, source);
+    return compile(entry, { outPath: join(scratch, `${name}.wasm`), outDir: scratch, backend: "wasm" });
+  }
+
+  async function runWasmExpectNoTrap(modulePath: string): Promise<string> {
+    const chunks: Buffer[] = [];
+    let memory: WebAssembly.Memory | null = null;
+    const { instance } = await WebAssembly.instantiate(readFileSync(modulePath), {
+      tsinter: {
+        write(fd: number, ptr: number, len: number): void {
+          if (memory === null) throw new Error("write before instantiation completed");
+          if (fd === 1) chunks.push(Buffer.from(new Uint8Array(memory.buffer, ptr, len)));
+        },
+      },
+    });
+    memory = instance.exports["memory"] as WebAssembly.Memory;
+    const trap = await Promise.resolve()
+      .then(() => (instance.exports["_start"] as () => void)())
+      .then(
+        () => null,
+        (err: unknown) => err,
+      );
+    expect(trap).toBeNull();
+    return Buffer.concat(chunks).toString("utf8");
+  }
+
+  test("SEMANTICS.md S039: a consumer .return() injected mid-yield*-delegation unwinds the OUTER generator directly, WITHOUT forwarding into the delegate — the delegate's own finally never runs, though the reported {value,done} pair still matches Node's (Node itself: the delegate's finally DOES run first, in this exact shape — NOT reproduced here, deliberately)", async () => {
+    const res = await buildWasm(
+      "s039-yieldstar-return.ts",
+      [
+        "function* inner(): Generator<string, string, unknown> {",
+        '  try { yield "a"; yield "b"; return "inner-ret"; } finally { console.log("inner finally ran"); }',
+        "}",
+        "function* outer(): Generator<string, string, unknown> {",
+        '  try { yield* inner(); return "outer-ret"; } finally { console.log("outer finally ran"); }',
+        "}",
+        "const g = outer();",
+        "console.log(JSON.stringify(g.next()));",
+        'console.log(JSON.stringify(g.return("RV")));',
+        "",
+      ].join("\n"),
+    );
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+    expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+    const stdout = await runWasmExpectNoTrap(res.binaryPath);
+    // OUR tier's own answer (S039), Node-diffed and NOT expected to match
+    // on the "inner finally ran" line: Node prints "inner finally ran"
+    // THEN "outer finally ran" (measured in the entry's own repro) —
+    // this pass reaches genResume's THROW/GENRET routing straight from
+    // the outer's own suspension point (yield* desugars %dele.next()'s
+    // own embedded yield as an ordinary suspension), never touching
+    // %dele at all, so ONLY "outer finally ran" prints. The {value,done}
+    // PAIR still agrees with Node's own {"value":"RV","done":true} — the
+    // divergence is confined to the delegate's silently-skipped side
+    // effect, exactly as the entry's own lane paragraph documents.
+    expect(stdout).toBe(['{"value":"a","done":false}', "outer finally ran", '{"value":"RV","done":true}', ""].join("\n"));
+  });
+
+  test("SEMANTICS.md S040: for-of over a generator closes on break (matches Node) but NOT on a return/throw abandonment (diverges from Node, which closes on all three)", async () => {
+    const res = await buildWasm(
+      "s040-forof-close.ts",
+      [
+        "function* gen(): Generator<number, void, unknown> {",
+        "  try {",
+        "    yield 1;",
+        "    yield 2;",
+        "    yield 3;",
+        "  } finally {",
+        '    console.log("finally ran");',
+        "  }",
+        "}",
+        "function viaBreak(): void {",
+        "  for (const x of gen()) {",
+        "    if (x === 1) break;",
+        "  }",
+        "}",
+        "function viaReturn(): void {",
+        "  for (const x of gen()) {",
+        "    if (x === 1) return;",
+        "  }",
+        "}",
+        "function viaThrow(): void {",
+        "  try {",
+        "    for (const x of gen()) {",
+        '      if (x === 1) throw new Error("boom");',
+        "    }",
+        "  } catch {",
+        "    // swallowed",
+        "  }",
+        "}",
+        'console.log("break:");',
+        "viaBreak();",
+        'console.log("return:");',
+        "viaReturn();",
+        'console.log("throw:");',
+        "viaThrow();",
+        'console.log("done");',
+        "",
+      ].join("\n"),
+    );
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+    expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+    const stdout = await runWasmExpectNoTrap(res.binaryPath);
+    // OUR tier's own answer (S040), Node-diffed and NOT expected to
+    // match on the "return"/"throw" sections: Node prints "finally ran"
+    // after EVERY one of the three abandonment shapes (measured in the
+    // entry's own repro — IteratorClose fires on break, return, AND an
+    // uncaught throw alike). lowerForOfGenerator's own desugar places the
+    // close statement AFTER the while loop, reached only when control
+    // falls out normally (exhaustion or a break inside the body) — a
+    // return/throw unwinds the enclosing function/catch directly and
+    // never reaches it, so only the break line logs here.
+    expect(stdout).toBe(["break:", "finally ran", "return:", "throw:", "done", ""].join("\n"));
+  });
+});
