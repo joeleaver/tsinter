@@ -39,8 +39,9 @@ and paid translation costs plus a documented lone-surrogate divergence;
 tsinter's WasmGC backend uses UTF-16-faithful representations, so this
 divergence class is *removed*, not inherited. **Tested by:** corpus string
 programs; the wasm emitter unit test pins lone-surrogate identity through
-`charCodeAt`/`split("")`/`isWellFormed`/`toWellFormed`/`toLowerCase`/
-`toUpperCase` (a corpus program cannot cover this — the native lanes
+`charCodeAt`/`split("")`/`isWellFormed`/`toWellFormed`, and the wasm
+casing unit test pins it through `toLowerCase`/`toUpperCase` (a corpus
+program cannot cover this — the native lanes
 still carry upstream's U+FFFD substitution, so the removal is observable
 on the wasm tier only). The `toLowerCase`/`toUpperCase` case is Node-
 matching, not a divergence in itself (Node's own case conversion is also
