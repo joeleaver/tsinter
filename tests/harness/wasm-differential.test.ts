@@ -1392,6 +1392,48 @@ const TIER_FLOOR: string[] = [
   "2454-private-generator-methods.ts",
   "1594-js-async.js",
   "965-generics-async.ts",
+  // Increment 20 stage B: toLowerCase/toUpperCase route through casing.ts
+  // (ECMA Default Case Conversion, the ported libunicode tables — stage A
+  // landed the builder gated behind emitter.ts's strIntrinsic refusal;
+  // this stage deletes that refusal). 29 programs claim, all first-
+  // refusing on strIntrinsic:toUpperCase/toLowerCase in stage A's own
+  // survey; 1113/1114 (expr:jsExit), 1528 (libCall:process.envSet), 1562
+  // (expr:regexIntrinsic), 1850 (libCall:global.undefRead), and 2042
+  // (libCall:math.random) sat behind the SAME first refusal but have a
+  // second, still-unclaimed blocker, so they do NOT join this list.
+  // 2456's own toUpperCase blocker RELOCATED here from increment 19's
+  // yield-in-forof lift (that increment's own TIER_FLOOR comment names
+  // this explicitly) — it is a new claim now, not a relisting. 2432
+  // next-blocks here from 19's return-in-finally clear the same way.
+  "605-closures-forward-capture-tdz.ts",
+  "1481-string-case-static.ts",
+  "1527-logical-mixed-operands.ts",
+  "1542-map-promise-values.ts",
+  "1560-forof-homogeneous-tuples.ts",
+  "1592-js-classes.js",
+  "1597-mjs-graph/main.mjs",
+  "1831-enum-string-const-reverse.ts",
+  "1950-generic-fn-values.ts",
+  "1951-generic-classes-basics.ts",
+  "1961-namespace-nested.ts",
+  "2000-generic-methods-basic.ts",
+  "2003-generic-methods-object-literal.ts",
+  "2020-generic-value-bindings.ts",
+  "2047-optional-class-fields.ts",
+  "2360-tuple-to-array.ts",
+  "2366-string-well-formed.ts",
+  "2369-promise-try.ts",
+  "2386-string-to-chars.ts",
+  "2432-generic-member-fields-async.ts",
+  "2450-private-instance-methods.ts",
+  "2452-private-statics.ts",
+  "2456-private-async-methods.ts",
+  "2520-private-statics-class-name-calls.ts",
+  "2521-private-statics-class-expression.ts",
+  "2538-destructuring-assign-class-source.ts",
+  "2554-generics-frontier-mix.ts",
+  "2558-index-signature-func-values.ts",
+  "2584-union-dyn-collapse.ts",
 ];
 
 interface RunResult {

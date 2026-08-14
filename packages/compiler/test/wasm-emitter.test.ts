@@ -3188,12 +3188,64 @@ test("S008: repeat's invalid count is the RangeError trap", async () => {
   expect(run.stdout.toString("utf8")).toBe("pre\n");
 });
 
-test("strIntrinsic: the lre-backed case pair refuses by member", async () => {
-  const res = await buildWasm("lower.ts", 'console.log("AbC".toLowerCase());\n');
-  expect(res.ok).toBe(false);
-  if (res.ok) return;
-  expect(res.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
-  expect(res.wasmSurvey).toContain("strIntrinsic:toLowerCase");
+test("strIntrinsic: the lre-backed case pair compiles and runs (increment 20 stage B — gate open)", async () => {
+  // Was "refuses by member" through stage A; the gate opened in stage B
+  // (emitter.ts's early-refuse deleted, casing.ts wired into the main
+  // strIntrinsic switch) — this now exercises the real end-to-end path,
+  // not just the builder-level pin suite in wasm-casing.test.ts.
+  const res = await buildWasm(
+    "lower.ts",
+    ['console.log("AbC".toLowerCase());', 'console.log("AbC".toUpperCase());', ""].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(["abc", "ABC", ""].join("\n"));
+});
+
+test("strIntrinsic: toUpperCase reaches the helper through a typeof-narrowed union receiver (2584 shape)", async () => {
+  // rev-preread.md §5's receiver-shape axis: the union collapses to the
+  // checked-dynamic representation wholesale, and a typeof guard narrows
+  // it back to a static string BEFORE the backend sees the receiver — the
+  // corpus 2584 shape verbatim. Verified against Node before writing in.
+  const res = await buildWasm(
+    "union-narrow.ts",
+    [
+      "type Thing = string | number | boolean;",
+      "function classify(v: Thing): string {",
+      '  if (typeof v === "string") return `str:${v.toUpperCase()}`;',
+      '  return "other";',
+      "}",
+      'console.log(classify("hi"));',
+      "console.log(classify(41));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(["str:HI", "other", ""].join("\n"));
+});
+
+test("strIntrinsic: optional-chain nullish receiver does NOT invoke toLowerCase (1562 shape, discriminating)", async () => {
+  // rev-preread.md §5/§10: the discriminating direction is x?.toLowerCase()
+  // with x nullish — must not invoke the helper and must not trap. A
+  // buggy short-circuit (invoking the helper on a null receiver) would
+  // trap here rather than print "undefined" — verified against Node
+  // before writing in (corpus 1562's own maybe()?.trim().toLowerCase()
+  // shape).
+  const res = await buildWasm(
+    "opt-chain-nullish.ts",
+    [
+      "function maybe(cond: boolean): string | undefined {",
+      '  return cond ? "  Hi  " : undefined;',
+      "}",
+      "console.log(`${maybe(true)?.trim().toLowerCase()}`);",
+      "console.log(`${maybe(false)?.trim().toLowerCase()}`);",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(["hi", "undefined", ""].join("\n"));
 });
 
 test("out-of-tier constructs refuse with SC3001 and ride the survey", async () => {

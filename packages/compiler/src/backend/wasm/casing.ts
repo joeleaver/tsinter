@@ -19,7 +19,7 @@
  * decoder live at libunicode.c:264-370 (get_le24, get_index_pos,
  * lre_is_in_table, lre_is_cased, lre_is_case_ignorable).
  *
- * Tables: six passive-data-segment arrays (casing-tables.ts, GENERATED
+ * Tables: seven passive-data-segment arrays (casing-tables.ts, GENERATED
  * from the vendored header), materialized ONCE into (ref null (array T))
  * globals on first use — numfmt.ts's buildF64ToStr precedent
  * (array.new_data is not a GC constexpr, increment-13 lesson). Unlike

@@ -132,6 +132,7 @@ import {
   INJECT_THROW,
 } from "./generators.js";
 import { StrBuilder } from "./strings.js";
+import { CasingBuilder } from "./casing.js";
 import { BytesBuilder, type BytesElem } from "./typedarrays.js";
 import { TimerBuilder } from "./timers.js";
 import { UnionBuilder, type UnionArmRep } from "./unions.js";
@@ -7528,16 +7529,19 @@ class Assembler {
 
       /* The UTF-16-exact string method surface, direct over the faithful
        * (array i16) storage (strings.ts — scr_string.c's clamps with the
-       * UTF-8 walking deleted). toLowerCase/toUpperCase refuse by MEMBER
-       * (like libCall names its fn): ECMA Default Case Conversion wants
-       * libunicode's tables, a separate rock. */
+       * UTF-8 walking deleted). toLowerCase/toUpperCase route through
+       * casing.ts — ECMA Default Case Conversion via the ported libunicode
+       * tables (increment 20 stage B; stage A landed the builder gated
+       * behind this same refusal, closed until the full surface's pin
+       * suite was green). */
       case "strIntrinsic": {
         const m = e.method;
-        if (m === "toLowerCase" || m === "toUpperCase") {
-          this.refuse(`strIntrinsic:${m}`, e.loc);
-          code.unreachable();
-          return;
-        }
+        // Captured before the switch: with every `m` member now handled
+        // by an explicit case (toLowerCase/toUpperCase joined the rest
+        // this stage), the switch is fully exhaustive over `e`'s
+        // discriminated-union type too, so `e` itself narrows to `never`
+        // in the default arm below — `e.loc` there would not typecheck.
+        const loc = e.loc;
         this.walkExpr(e.receiver);
         const argOr = (i: number, dflt: number): void => {
           const a = e.args[i];
@@ -7630,10 +7634,16 @@ class Assembler {
           case "toWellFormed":
             code.call(this.strs.toWellFormed());
             return;
+          case "toLowerCase":
+            code.call(this.casing.toLowerCase());
+            return;
+          case "toUpperCase":
+            code.call(this.casing.toUpperCase());
+            return;
           default: {
             const rest: never = m;
             void rest;
-            this.refuse(`strIntrinsic:${String(m)}`, e.loc);
+            this.refuse(`strIntrinsic:${String(m)}`, loc);
             code.unreachable();
             return;
           }
@@ -9739,6 +9749,16 @@ class Assembler {
       },
     });
     return this.strsField;
+  }
+
+  private casingField: CasingBuilder | null = null;
+
+  /** ECMA Default Case Conversion (casing.ts) — self-contained over
+   * mb + strType alone, no cross-builder deps (unlike strs above, it
+   * needs no vecStr-style injection). */
+  private get casing(): CasingBuilder {
+    this.casingField ??= new CasingBuilder(this.mb, this.strType);
+    return this.casingField;
   }
 
   private bytesField: BytesBuilder | null = null;
