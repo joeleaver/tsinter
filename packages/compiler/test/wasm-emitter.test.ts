@@ -3158,6 +3158,136 @@ test("dyn invoke: FUNC apply/call, and an object's OWN member", async () => {
   );
 });
 
+test("dyn.this: the ambient receiver — OBJ dispatch, apply/call, nesting, throw-restore", async () => {
+  // `this` in a plain (non-arrow, non-method) function in a JS source
+  // file is the checked-dynamic AMBIENT receiver (lower-exprs.ts's
+  // dyn.this libCall, scr_dyn_this_get ported): empty stack answers the
+  // strict-mode plain-call undefined; the OBJ-dispatch and FUNC
+  // apply/call arms of dyn.invoke (the ONLY wasm-reachable push sites —
+  // dynInvoke only exists for DYN_DISPATCH_METHODS names, so the
+  // receiver must be reached through one of those, not an arbitrary
+  // property name) bind it around their call window, C-exact
+  // (scr_dyn_invoke.c:358-397). Node-verified throughout.
+  const res = await buildWasm(
+    "dyn-this.js",
+    [
+      "function bare() {",
+      '  return this === undefined ? "bare-undefined" : "bare-bound";',
+      "}",
+      "const out = [];",
+      "out.push(bare());",
+      "",
+      "function readTag() {",
+      '  return this ? String(this.tag) : "no-this";',
+      "}",
+      "const obj = JSON.parse('{\"tag\":\"objtag\"}');",
+      "obj.forEach = readTag;",
+      "out.push('obj:' + obj.forEach());",
+      "",
+      "function outerRead() {",
+      "  const before = this.tag;",
+      "  const innerResult = obj2.push();",
+      "  const after = this.tag;",
+      "  return before + '/' + innerResult + '/' + after;",
+      "}",
+      "function innerRead() {",
+      "  return this.tag;",
+      "}",
+      "const obj1 = JSON.parse('{\"tag\":\"outer\"}');",
+      "obj1.forEach = outerRead;",
+      "const obj2 = JSON.parse('{\"tag\":\"inner\"}');",
+      "obj2.push = innerRead;",
+      "out.push('nested-obj:' + obj1.forEach());",
+      "",
+      "function throwing() {",
+      "  throw new Error('boom');",
+      "}",
+      "function wrapper() {",
+      "  const before = this.tag;",
+      "  let caught = null;",
+      "  try {",
+      "    thrower.on();",
+      "  } catch (e) {",
+      "    caught = e.message;",
+      "  }",
+      "  const after = this.tag;",
+      "  return before + '/' + caught + '/' + after;",
+      "}",
+      "const thrower = JSON.parse('{\"tag\":\"thrower\"}');",
+      "thrower.on = throwing;",
+      "const wrapperObj = JSON.parse('{\"tag\":\"wrapper\"}');",
+      "wrapperObj.on = wrapper;",
+      "out.push('throw:' + wrapperObj.on());",
+      "",
+      "const fnBag = JSON.parse('{}');",
+      "fnBag.fn = readTag;",
+      "out.push('call:' + fnBag.fn.call(JSON.parse('{\"tag\":\"viaCall\"}')));",
+      "out.push('apply:' + fnBag.fn.apply(JSON.parse('{\"tag\":\"viaApply\"}')));",
+      "out.push('call-none:' + fnBag.fn.call());",
+      "out.push('call-null:' + fnBag.fn.call(null));",
+      "out.push('call-undef:' + fnBag.fn.call(undefined));",
+      "",
+      "function outerCall() {",
+      "  const before = this ? this.tag : 'no-this';",
+      "  const innerResult = fnBag.fn.call(innerArg);",
+      "  const after = this ? this.tag : 'no-this';",
+      "  return before + '/' + innerResult + '/' + after;",
+      "}",
+      "const outerBag = JSON.parse('{}');",
+      "outerBag.fn = outerCall;",
+      "const innerArg = JSON.parse('{\"tag\":\"innerCall\"}');",
+      "out.push('nested-call:' + outerBag.fn.call(JSON.parse('{\"tag\":\"outerCall\"}')));",
+      "",
+      "console.log(out.join('\\n'));",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "bare-undefined",
+      "obj:objtag",
+      "nested-obj:outer/inner/outer",
+      "throw:wrapper/boom/wrapper",
+      "call:viaCall",
+      "apply:viaApply",
+      "call-none:no-this",
+      "call-null:no-this",
+      "call-undef:no-this",
+      "nested-call:outerCall/innerCall/outerCall",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("dyn.this: a suspendable body reading it refuses LOUD, not a silent post-await miscompile", async () => {
+  // statemachine.ts's checkEligible() fence: `dyn.this`'s ambient-receiver
+  // bracket (thisPush/thisPop around dyn.invoke's OBJ/apply/call arms) is
+  // a synchronous push-call-pop around ONE callFn() invocation, and this
+  // backend's async/generator lowering makes a suspending call RETURN at
+  // its first await (the wrapper/resume split) rather than blocking the
+  // way a native fiber does — so the pop would already have run by the
+  // time resumption (promises.ts's drain()) replays the rest of the body,
+  // and a `this` read after that point would silently see whatever the
+  // ambient stack holds at resume time, not the receiver the call bound.
+  // Every `this` read simply refused before this rider, so a suspendable
+  // body reaching one is a NEWLY OPENED window — fenced rather than left
+  // latent, unconditionally (before/after the first await undistinguished
+  // — this minimal body has no await at all, and still refuses).
+  const res = await buildWasm(
+    "dyn-this-suspending.js",
+    ["async function m() {", "  return this;", "}", "m();", ""].join("\n"),
+  );
+  expect(res.ok).toBe(false);
+  if (res.ok) return;
+  expect(res.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
+  expect(res.diagnostics[0]?.message).toContain("(libCall:dyn.this:suspending)");
+  expect(res.wasmSurvey).toBeDefined();
+  expect(res.wasmSurvey).toContain("libCall:dyn.this:suspending");
+});
+
 test("dyn own-key ORDER: integer-like keys first, and where that range ends", async () => {
   // Object.keys' own-key order is the one place the array-index predicate
   // has to be WIDER than the keyed read's: the ordering range is

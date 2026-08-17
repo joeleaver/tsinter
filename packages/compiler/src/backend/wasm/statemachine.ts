@@ -1794,6 +1794,43 @@ export class FunctionLowering {
    * verifier of the residue hoisting could not fix. */
   private checkEligible(): void {
     const fn = this.fn;
+    // FENCE: `dyn.this`'s ambient-receiver bracket (dyn.ts's
+    // thisPush/thisPop, wired around invoke()'s OBJ-dispatch and FUNC
+    // apply/call arms) is a synchronous push-call-pop around exactly ONE
+    // callFn() invocation — it assumes that call runs to completion
+    // before the pop. A SUSPENDING call breaks that assumption on this
+    // backend: calling a resumable function synchronously runs only
+    // state 0 (this file's own wrapper/resume split, `run()` below) and
+    // returns at the first await/yield, so the pop already ran by the
+    // time the driver resumes the rest of the body. Resumption
+    // (promises.ts's `drain()`) invokes the parked continuation
+    // directly, never back through invoke()/callFn(), so nothing
+    // re-establishes the receiver — a `dyn.this` read anywhere in a
+    // suspendable body would see whatever the ambient stack happens to
+    // hold at RESUME time, not the receiver its own call bound. That is
+    // a silent wrong answer no exact-value pin on the synchronous case
+    // would ever catch, and pre-this-fence every `this` read simply
+    // refused outright (`libCall:dyn.this`) — so a suspendable body
+    // reaching this point is a NEWLY OPENED miscompile window, not a
+    // pre-existing one, and gets a loud, named refusal instead.
+    //
+    // C's native lane has no equivalent gap: fibers suspend/resume by
+    // switching the OS stack under the call, so a fiber's own C call
+    // frame — and the push/pop bracket sitting in it — never returns
+    // until the async body is fully done, awaits included. There is
+    // nothing to port here; this fence exists only because THIS
+    // backend's suspension model (a materialized state machine driven
+    // from outside) cannot make the same promise.
+    //
+    // Refuse the WHOLE body rather than proving a given read sits
+    // before the first suspension point (conservative over clever, and
+    // simpler than reasoning about a body hoisting/linearization has not
+    // touched yet at this point in the pass): any `dyn.this` libCall
+    // anywhere in a suspendable function's body — async or generator —
+    // declines before any transformation runs.
+    if (anyNode(fn.body, (rec) => rec["kind"] === "libCall" && rec["fn"] === "dyn.this")) {
+      this.decline("libCall:dyn.this:suspending");
+    }
     // The initializer wrapper writes both caches by ASSIGNING the module
     // global (storeVar's "%g." namespace); a name that is not a global of
     // promise type would silently become a local write.

@@ -2434,3 +2434,54 @@ unit pin (wasm-statemachine.test.ts) covers the UNCONTESTED case only —
 value-first render for a generator result IN A MODULE WITH NO COMPETING
 SHAPE — deliberately not attempting to pin the race itself, which is
 what this entry registers instead.
+
+## S042 — Bare `this` in a dyn-called plain function binds only through the MODELED dispatch set *(inherited; newly observable on the wasm tier)*
+
+The ambient-receiver bracket — the stack `dyn.this` reads (C:
+`scr_dyn_this_push_dyn`/`_pop` in `scr_dyn_invoke.c:358-397`; wasm:
+`dyn.ts`'s `thisPush`/`thisPop` around `invoke()`'s OBJ and
+`apply`/`call` arms) — is threaded ONLY through the `dynInvoke` ladder,
+and the frontend synthesizes `dynInvoke` only when a dyn method call's
+NAME is in the fixed `DYN_DISPATCH_METHODS` set
+(`lower-calls.ts:4450-4466`: `apply`, `call`, `push`, `forEach`, `on`,
+… — inherited prototype and emitter/stream names, ~40 entries). A call
+through any OTHER own-member name — `const o = { x: 42, m: function ()
+{ … this.x … } }; o.m()` — lowers to a plain keyed-get + `dynCall`/
+`callFn` on every lane, and the bracket is architecturally unreachable
+for it: `this` inside the body reads the engine-strict `undefined`
+where Node binds `o`.
+
+Measured (2026-08-17, one probe, all three answers from the same
+program — `objmethod.mjs`, a strict-mode object-literal method called
+directly and through an indirection): Node prints `42`/`42`; the C
+lane prints `no-this`/`no-this` (generated C shows `sc_dyn_key_get` +
+`scr_dyn_call`, zero `scr_dyn_invoke` calls); the wasm lane
+post-`dyn.this` prints `no-this`/`no-this` — the two tiers agree
+exactly and both diverge from Node identically. The divergence is
+newly OBSERVABLE on the wasm tier: before the `dyn.this` landing every
+bare-`this` read refused (`libCall:dyn.this`), so nothing could
+witness the unbound receiver.
+
+**Rationale:** inherited — the C runtime brackets only the invoke
+ladder, and the wasm port transcribes that boundary rather than
+inventing a wider one. The real fix belongs at the LOWERING (thread
+the receiver into every dyn method call, not just the modeled names) —
+tracked as an open cross-lane bug, not registered away: this entry
+records the CURRENT shared behavior so the wasm lane is not silently
+"more bound" or "less bound" than its siblings while the lowering fix
+waits. Related: the suspension half of the same bracket is FENCED, not
+divergent — a suspendable body (async/generator) containing a
+`dyn.this` read refuses loudly at state-machine lowering
+(`libCall:dyn.this:suspending`), because the wasm state machine
+returns through the bracket at the first await where C's fibers do
+not; a silent post-await misread is the miscompile class increment 19
+documented, and the fence is the loud alternative.
+
+**Tested by:** the wasm emitter unit test's `dyn.this` pins (the
+AGREEING arms: modeled OBJ dispatch sees the receiver, `apply`/`call`
+bind their `thisArg` including `null`/`undefined`, nesting and the
+throw path restore, a bare call answers `undefined`) and the
+suspension-fence pin (exact kind string). No corpus program can pin
+the divergence itself — a program printing the unbound read would
+fail Node-vs-native on every lane, which is exactly why it survived
+unregistered until the wasm rider made it reachable.

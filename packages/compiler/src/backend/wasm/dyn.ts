@@ -313,6 +313,11 @@ export class DynBuilder {
   private thunkSigType: number | null = null;
   private readonly consts = new Map<string, number>();
   private readonly fns = new Map<string, number>();
+  /** The ambient-`this` stack (thisPush/thisPop/thisGet below): a
+   * nullable buffer global plus a separate length global, exactly
+   * json.ts's `seen`/`seenLen` circular-check stack shape. */
+  private thisStackBufG: number | null = null;
+  private thisStackLenG: number | null = null;
 
   constructor(
     private readonly mb: ModuleBuilder,
@@ -858,6 +863,179 @@ export class DynBuilder {
         this.mb.setBody(idx, [this.deps.strRef()], c.bytes());
       },
     );
+  }
+
+  /* ── the ambient receiver (dyn.this) ─────────────────────────────────
+   * scr_json.c:1005-1064's push/pop/get stack, ported: a strictly nested
+   * stack of dyn values over the SAME buffer shape json.ts's `seen`
+   * circular-check stack uses (nullable buffer global, doubling growth
+   * from 8, a separate length global) — one array shorter, since the
+   * stored value already IS the payload (no wrapper struct/entry type
+   * needed the way a "seen" frame's identity+edge bookkeeping does).
+   *
+   * PUSH SITES (measured against scr_dyn_invoke.c, matched exactly
+   * below): the OBJ arm's own-member call (`invoke()`'s DK.OBJ arm,
+   * scr_dyn_invoke.c:358-363 — `scr_dyn_this_push_dyn(recv)`) and FUNC's
+   * apply/call (scr_dyn_invoke.c:370-397 — the explicit thisArg,
+   * `args[0]` or undefined). C's third FUNC-kind push site — an own
+   * property on the FUNC box itself (scr_dyn_invoke.c:406-417, the
+   * defineProperties-expando case) — has no wasm arm to bracket: this
+   * backend's `invoke()` has no FUNC-own-property fallback at all
+   * (unrelated pre-existing gap, falls to the generic not-a-function
+   * tail), so there is nothing to wire there.
+   *
+   * Every push/pop pair below sits around exactly one `callFn()` call,
+   * unconditionally popped after it returns — C's shape too: the
+   * pending-flag exception protocol (never a wasm try/catch unwind)
+   * means `scr_dyn_this_pop()` already runs on the throw path in C
+   * because there IS no separate unwind edge, only the one fall-through
+   * after the call returns. The wasm port is bracket-for-bracket the
+   * same: `callFn()` returns (possibly null, exception pending) exactly
+   * like `scr_dyn_call` does, and the pop below runs on that single
+   * fall-through path regardless.
+   *
+   * SUSPENSION HAZARD, FENCED (not ported — statemachine.ts's
+   * `checkEligible()`, `libCall:dyn.this:suspending`): a dyn FUNC boxed
+   * from an async source function can suspend INSIDE `callFn()`'s
+   * `callRef` at its first await and return a pending Promise
+   * synchronously (statemachine.ts's wrapper/resume split — calling a
+   * resumable function runs only state 0, then returns) — the pop below
+   * then runs immediately, before the async body logically finishes.
+   * Resumption (promises.ts's `drain()`) calls the stored continuation
+   * directly, never through `invoke()`/`callFn()`, so a `dyn.this` read
+   * AFTER that first await would see whatever is on the stack when the
+   * microtask pump happens to run it, not the receiver this call bound
+   * — a silent wrong answer no exact-value pin on the synchronous case
+   * would catch. C's fiber-based lane has no such gap: a fiber
+   * suspend/resume switches the OS stack under the call rather than
+   * returning through it, so the C push/pop bracket really does span
+   * the whole async body, awaits included — there is nothing to port
+   * for that lane. Because every `this` read refused outright before
+   * this file existed, ANY suspendable body reaching a `dyn.this` read
+   * is a NEWLY OPENED window, so statemachine.ts's `checkEligible()`
+   * refuses the WHOLE body the moment one appears anywhere in it
+   * (before/after a suspension point undistinguished — conservative
+   * over clever), before any lowering transforms it. See that file for
+   * the fence itself; the bracket below stays exactly the C-matching
+   * shape for every body that clears it. */
+
+  private thisStackBufType(): number {
+    // Exactly arrVec()'s "dyn" element array, reused rather than
+    // re-declared: types intern BY SHAPE (module.ts), so a second
+    // declaration of `(array (mut (ref null $dyn)))` would collide with
+    // this one anyway — asking for it by name is just honest about that.
+    return this.deps.arrVec().bufType;
+  }
+
+  private thisStackBuf(): number {
+    this.thisStackBufG ??= this.mb.addGlobal(
+      { kind: "ref", nullable: true, typeIndex: this.thisStackBufType() },
+      true,
+      (w) => {
+        w.u8(0xd0); // ref.null
+        w.sleb(this.thisStackBufType());
+      },
+    );
+    return this.thisStackBufG;
+  }
+
+  private thisStackLen(): number {
+    this.thisStackLenG ??= this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41); // i32.const
+      w.sleb(0);
+    });
+    return this.thisStackLenG;
+  }
+
+  /** %w.dyn.thisPush(v) — `scr_dyn_this_push_dyn` ported: append v,
+   * growing the backing buffer by doubling from 8 on overflow (json.ts's
+   * `jbEnter` growth, one array shorter). */
+  thisPush(): number {
+    return this.cached("thisPush", [this.dynRef()], [], (idx) => {
+      const bufT = this.thisStackBufType();
+      const c = new Code();
+      const V = 0;
+      const N = 1;
+      const NB = 2;
+      c.globalGet(this.thisStackLen());
+      c.localSet(N);
+      c.globalGet(this.thisStackBuf());
+      c.refIsNull();
+      c.ifVoid();
+      c.i32Const(8);
+      c.arrayNewDefault(bufT);
+      c.globalSet(this.thisStackBuf());
+      c.end();
+      c.globalGet(this.thisStackBuf());
+      c.arrayLen();
+      c.localGet(N);
+      c.i32LeU();
+      c.ifVoid();
+      c.globalGet(this.thisStackBuf());
+      c.arrayLen();
+      c.i32Const(1);
+      c.i32Shl();
+      c.arrayNewDefault(bufT);
+      c.localSet(NB);
+      c.localGet(NB);
+      c.i32Const(0);
+      c.globalGet(this.thisStackBuf());
+      c.i32Const(0);
+      c.localGet(N);
+      c.arrayCopy(bufT, bufT);
+      c.localGet(NB);
+      c.globalSet(this.thisStackBuf());
+      c.end();
+      c.globalGet(this.thisStackBuf());
+      c.localGet(N);
+      c.localGet(V);
+      c.arraySet(bufT);
+      c.localGet(N);
+      c.i32Const(1);
+      c.i32Add();
+      c.globalSet(this.thisStackLen());
+      this.mb.setBody(idx, [I32, { kind: "ref", nullable: true, typeIndex: bufT }], c.bytes());
+    });
+  }
+
+  /** %w.dyn.thisPop() — `scr_dyn_this_pop` ported. The vacated slot is
+   * left in place (frames are reused across pushes, exactly the
+   * "seen" stack's rule) — nothing to release: WasmGC owns the entry,
+   * unlike C's manual retain/release pair around the same bracket. */
+  thisPop(): number {
+    return this.cached("thisPop", [], [], (idx) => {
+      const c = new Code();
+      c.globalGet(this.thisStackLen());
+      c.i32Const(1);
+      c.i32Sub();
+      c.globalSet(this.thisStackLen());
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** %w.dyn.thisGet() — `scr_dyn_this_get` ported: the top-of-stack dyn
+   * value, or the interned undefined singleton on an empty stack (the
+   * strict-mode plain-call constant lower-exprs.ts's `dyn.this` comment
+   * names). */
+  thisGet(): number {
+    return this.cached("thisGet", [], [this.dynRef()], (idx) => {
+      const bufT = this.thisStackBufType();
+      const c = new Code();
+      c.globalGet(this.thisStackLen());
+      c.i32Eqz();
+      c.ifResult(this.dynRef());
+      c.globalGet(this.undefinedGlobal());
+      c.else_();
+      c.globalGet(this.thisStackBuf());
+      c.refAsNonNull();
+      c.globalGet(this.thisStackLen());
+      c.i32Const(1);
+      c.i32Sub();
+      c.arrayGet(bufT);
+      c.refAsNonNull();
+      c.end();
+      this.mb.setBody(idx, [], c.bytes());
+    });
   }
 
   /* ── the interned constants ─────────────────────────────────────────── */
@@ -4313,10 +4491,12 @@ export class DynBuilder {
         bailIfPending();
 
         // OBJ: the OWN member calls — own properties shadow prototypes in
-        // JS too, so this arm exists for every name. C additionally binds
-        // the receiver through an ambient-`this` window; nothing on this
-        // tier can read one (the `dyn.this` libCall is refused), so the
-        // window would be write-only bookkeeping.
+        // JS too, so this arm exists for every name. C binds the
+        // receiver through the ambient-`this` window for the call
+        // (scr_dyn_invoke.c:358-363 — `scr_dyn_this_push_dyn(recv)`
+        // around `scr_dyn_call`, unconditionally popped after); ported
+        // below via thisPush/thisPop, R staging callFn()'s result across
+        // the pop the way C's local `r` does.
         this.arm(c, K, [DK.OBJ], () => {
           this.objPayload(c, (x) => x.localGet(0));
           this.deps.lit(c, method);
@@ -4330,10 +4510,15 @@ export class DynBuilder {
           c.i32Const(DK.FUNC);
           c.i32Eq();
           c.ifVoid();
+          c.localGet(0);
+          c.call(this.thisPush());
           c.localGet(M);
           c.localGet(1);
           c.localGet(2);
           c.call(this.callFn());
+          c.localSet(R);
+          c.call(this.thisPop());
+          c.localGet(R);
           c.return_();
           c.end();
           c.end();
@@ -4343,9 +4528,13 @@ export class DynBuilder {
         if (DynBuilder.FN_METHODS.has(method)) {
           this.arm(c, K, [DK.FUNC], () => {
             if (method === "apply") {
-              // `f.apply(thisArg, argsArray)`. The thisArg is evaluated
-              // by the caller and then dropped here for the same reason
-              // the OBJ arm drops its receiver binding.
+              // `f.apply(thisArg, argsArray)` — thisArg (`args[0]`, or
+              // undefined absent) binds the ambient receiver for the
+              // call window, C's scr_dyn_invoke.c:370-390 exactly: both
+              // the nullish/absent-argsArray branch below and the real
+              // array branch further down push it before their own
+              // `callFn()` and pop after, R staging the result across
+              // the pop the way C's local `r` does.
               argAt(1);
               c.localTee(M);
               c.structGet(dynT, DYN_KIND);
@@ -4358,10 +4547,15 @@ export class DynBuilder {
               c.i32Eq();
               c.i32Or();
               c.ifVoid();
+              argAt(0);
+              c.call(this.thisPush());
               c.localGet(0);
               this.pushNewArr(c);
               c.localGet(2);
               c.call(this.callFn());
+              c.localSet(R);
+              c.call(this.thisPop());
+              c.localGet(R);
               c.return_();
               c.end();
               // A non-array argsArray splits the way Node splits it. An
@@ -4406,13 +4600,20 @@ export class DynBuilder {
               c.end();
               // The array's own payload IS the argument vector — no copy,
               // exactly C's `list->v.arr.items, list->v.arr.len`.
+              argAt(0);
+              c.call(this.thisPush());
               c.localGet(0);
               this.arrPayload(c, (x) => x.localGet(M));
               c.localGet(2);
               c.call(this.callFn());
+              c.localSet(R);
+              c.call(this.thisPop());
+              c.localGet(R);
               return;
             }
-            // `f.call(thisArg, ...rest)` — the tail, repacked.
+            // `f.call(thisArg, ...rest)` — the tail, repacked. thisArg
+            // (`args[0]`, or undefined absent) binds the ambient
+            // receiver exactly like apply's, C's scr_dyn_invoke.c:392-396.
             this.pushNewArr(c);
             c.localSet(OUT);
             c.i32Const(1);
@@ -4425,10 +4626,15 @@ export class DynBuilder {
                 c.call(this.arrPush());
               },
             );
+            argAt(0);
+            c.call(this.thisPush());
             c.localGet(0);
             c.localGet(OUT);
             c.localGet(2);
             c.call(this.callFn());
+            c.localSet(R);
+            c.call(this.thisPop());
+            c.localGet(R);
           });
         }
 

@@ -7604,6 +7604,14 @@ class Assembler {
           code.call(this.dyn.typeOf());
           return;
         }
+        if (e.fn === "dyn.this") {
+          // The ambient receiver — `scr_dyn_this_get` ported
+          // (dyn.ts's thisGet/thisPush/thisPop, wired at the OBJ-method
+          // and FUNC apply/call dyn.invoke arms). No arguments: the
+          // read is a pure top-of-stack peek.
+          code.call(this.dyn.thisGet());
+          return;
+        }
         if (this.emitBufferLibCall(e)) return;
         if (this.emitTimerCall(e)) return;
         this.refuse(`libCall:${e.fn}`, e.loc);
