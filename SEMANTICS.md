@@ -411,6 +411,51 @@ increment-16 box-copying lesson, applied here so two independent crossings
 of the SAME source correctly identity-match exactly as Node's erased cast
 does).
 
+**Amendment (increment 21 stage A, island crossing): on the wasm tier,
+`jsMarshal` of a BARE `dyn`-typed OPERAND ALIASES rather than
+deep-copying — a SECOND registered exception to this entry's body,
+alongside bytes<u8>, and narrower: one jsMarshal source-type arm only.**
+Under the wasm backend's representation decision (jsval ≡ dyn:
+`mapType(jsval)` answers the identical `(ref null $dyn)` that
+`mapType(dyn)` does — there is no embedded engine on this tier, so an
+island value is an ordinary dyn payload from birth, never a wrapped
+handle), `jsMarshal` of a `dyn`-typed source is representationally the
+value already on hand. The native lanes deep-copy at this boundary (a
+`ScrJsval` is a distinct heap object from the `ScrDyn` it was built
+from); the wasm lane has nothing to copy FROM — source and "marshaled"
+result are the same wasm value. RECORD AND ARRAY COMPOSITES ARE NOT
+COVERED: a record/array whose own static type is record/array reuses
+`dynFromHelper`'s per-typeKey walker, a real deep copy, unchanged, on
+every lane — and that copy is now OBSERVABLE through identity on the
+island surface (measured: a record marshaled into two `any` slots
+compares `===` FALSE on wasm and C alike, TRUE on Node — both lanes
+agree, so it is this entry's own corpus-unpinnable shape, recorded so
+the next reader need not re-derive it).
+
+Why the exception is sound and extends to nothing else: unlike the
+bytes amendment (safe because `$bytes` is acyclic by construction),
+this arm is safe for a stronger reason — it introduces no NEW aliasing
+relationship at all; nothing points at anything it did not already
+point at, because there is no crossing at the representation level,
+only at the type system's bookkeeping. Cycle-safety is the same
+structural argument (labelled structural, not measured — no test
+constructs a cyclic dyn-into-island value): aliasing can only carry a
+cycle that already existed on the dyn side, and under identity
+representation there ARE no island-specific walker entry points that
+could skip a cycle guard — a jsval-reached inspect/stringify/dynCheck
+IS the plain-dyn entry point (S026's depth cap, S029's seen-stack),
+which already owns those cycles today.
+
+The arm is corpus-EXERCISED, not merely argued: four of stage A's
+claimed programs construct it (2579 ×1, 2583 ×4, 2585 ×4, 2632 ×6 —
+instrumented) and pass the byte-for-byte differential; the
+identity-vs-copy distinction is unit-pinned in wasm-emitter.test.ts
+("jsMarshal(dyn) aliasing": marshaled twice from one local, `===` both
+times on wasm matching Node, with the C lane's `false` pinned beside it
+so the per-lane split cannot be silently "fixed" toward the copying
+side). The reverse direction (dynFromJsval, identity by construction)
+has its own pin.
+
 ## S015 — Keyed reads and `in` on `unknown` see OWN properties only *(inherited)*
 
 `u[k]` on a checked-dynamic value answers the receiver's OWN member, or
@@ -2485,3 +2530,81 @@ suspension-fence pin (exact kind string). No corpus program can pin
 the divergence itself — a program printing the unbound read would
 fail Node-vs-native on every lane, which is exactly why it survived
 unregistered until the wasm rider made it reachable.
+
+## S043 — The wasm static island FENCES unmodeled surfaces at runtime, loudly, where the native island's engine is Node-exact *(wasm tier)*
+
+The wasm tier's island has no engine (jsval ≡ dyn, increment 21), so
+surfaces the native island gets from QuickJS for free are MODELED
+piecewise — and every reachable, unmodeled surface throws a loud
+catchable fence rather than answering silently wrong. S023 is the
+stance's precedent; the difference in domain is why this is its own
+entry: S023's dyn world has S015's registered leniency, while jsval's
+contract is JS-exact, and the native lanes ARE Node-exact on these
+surfaces — so a silent wrong answer here would be corpus-pinnable
+(passes native, fails wasm only), the class this tier never ships.
+
+The fenced surfaces, all three-lane measured (wasm fences / C = Node
+exact):
+- **Prototype-member reads** on island receivers: closed Node-measured
+  tables of the function-valued own members of Object.prototype (10,
+  annex-B definers included), Function.prototype (4), Array.prototype
+  (38), String.prototype (50), Boolean.prototype (2) — reads of a
+  tabled name (own property absent; own ALWAYS shadows, matching
+  Node's `({toString: 5}).toString === 5`) throw
+  `'<Ctor>.prototype.<name>' on an island value is not supported yet`.
+  Number.prototype's six ARE modeled (typeof/name/length-correct
+  per-name interned placeholder functions — `(5).toString === (6).toString`
+  answers Node's `true`, different names `false`; CALLING one is stage
+  B's surface and refuses at compile time today). Three non-function
+  names ride the same gate: `__proto__` (all kinds — an accessor, so
+  the function-shaped tables correctly cannot hold it), and
+  `caller`/`arguments` on functions (throwing accessors in Node; the
+  fence is one step short of Node's own TypeError, never a silent
+  undefined). Names in NO table keep the honest `undefined` of a
+  genuinely missing key, which IS Node-exact.
+- **Non-index keyed writes on island arrays**: `a["foo"] = 7`,
+  `a["1.5"] = 8`, `a[-1] = 7` throw "Cannot create property '<key>' on
+  array" where Node (and the native island's real engine array) adds an
+  expando — loud and catchable; UNCAUGHT, it aborts the program where
+  Node runs to completion. In-range and growth writes are exact
+  (`a[5] = 9` grows with holes, "1,2,3,,,9" — all three lanes agree).
+- **`__proto__` as an object-LITERAL key** refuses at COMPILE time
+  (`jsOp:objLit-proto-key`): JS's literal `__proto__:` is the
+  prototype-setter special form (a non-object value is a silent no-op
+  creating NO own property — Node and the native island both answer
+  "object" for the subsequent read; storing an own entry instead would
+  be a wasm-only silent divergence). The computed variant
+  `{["__proto__"]: v}` already refuses at the frontend.
+
+**Rationale:** the fence is the loudness contract applied inside a
+claimed program: a construct the tier cannot yet answer Node-exactly
+throws where it runs, instead of miscompiling. Every fence is
+reachable only on axes no corpus program exercises (the census is
+byte-stable across the fences' introduction — verified by full bucket
+membership diff); a future corpus program that hits one fails the
+differential loudly, which is the contract working, and the fix is to
+MODEL the surface (stage B's tables), never to widen the silent set.
+**Tested by:** the increment-21 unit pins — per-kind fence texts,
+own-shadow precedence, placeholder identity (per-name interned),
+FUNC-only scoping of caller/arguments with the negative control
+(other kinds keep Node's own undefined), the literal-key refusal with
+its near-miss-name negative control, and the review rigs' g1–g5 +
+h1–h6b probe set (session-15 gate, four rounds).
+
+## S044 — jsExit of `array<jsval>`: the SPINE aliases on the wasm tier (matching Node); the native island copies it *(per-lane split)*
+
+The validated exit of an `any[]`-declared slot crosses elements BY
+REFERENCE on every lane. The SPINE differs: the C island snapshots it
+at the exit (scr_island.c: "element IDENTITY crosses, THE SPINE IS A
+COPY"), so a post-exit write or push through the exited value is
+invisible through the original (`p[0] = 99` reads back "1"; `p.push(4)`
+leaves the original length 3). The wasm static island hands the dyn
+ARR payload's vector over whole — spine aliased — and matches Node on
+both probes ("99"; length 4). The wasm lane is the MORE Node-exact
+side; the split follows the S014 bytes-amendment framing (the
+transitional native lanes keep their structurally-forced copy; the
+wasm representation has nothing to copy). **Tested by:** the
+increment-21 unit pins covering both directions (write-through and
+push-through), with the C lane's divergent values pinned beside the
+wasm/Node values so the split is explicit and cannot be silently
+"aligned" in either direction.

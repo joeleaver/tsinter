@@ -31,6 +31,20 @@ async function buildWasm(name: string, source: string) {
   });
 }
 
+/** The --dynamic twin: jsval (`any` under --dynamic) exists ONLY under
+ * this flag (nodes.ts's own jsval doc) — every increment-21 island test
+ * below needs it. */
+async function buildWasmDyn(name: string, source: string) {
+  const entry = join(scratch, name);
+  await writeFile(entry, source);
+  return compile(entry, {
+    outPath: join(scratch, `${name}.wasm`),
+    outDir: scratch,
+    dynamic: true,
+    backend: "wasm",
+  });
+}
+
 async function runWasm(modulePath: string): Promise<{ stdout: Buffer; stderr: Buffer }> {
   const chunks: { 1: Buffer[]; 2: Buffer[] } = { 1: [], 2: [] };
   let memory: WebAssembly.Memory | null = null;
@@ -7323,4 +7337,583 @@ test("insp.buffer: the STATIC-typed-Buffer path (console.log of a real, non-dyn 
   // the SAME `bufferForm()` (inspect.ts), so a divergence here would mean
   // a second, subtly different renderer crept in despite the reuse claim.
   expect(lines[4]).toBe("<Buffer 01 02 03>");
+});
+
+/* ── increment 21 stage A: the static island's representation ──────────
+ * jsval ≡ dyn (mapType(jsval) is the SAME (ref null $dyn) mapType(dyn)
+ * answers), dynFromJsval is identity, and the NO-COERCION jsOps route
+ * through the existing dyn runtime. Every program below is verified
+ * against the real Node oracle (dynamic --experimental-transform-types
+ * runs, values transcribed by hand from that output — not guessed) or,
+ * where no Node oracle exists (jsExit's boundary-failure texts — a
+ * scriptc-only synthetic diagnostic, same footing as S009's dynCheck
+ * messages), against the reference C backend's OWN output, matching
+ * SEMANTICS.md's established convention for texts with no Node analog. */
+
+test("increment 21 stage A: the mapType canary — closures capturing `any` (jsval) locals, mutation through the shared box visible from every closure over it (the 1122-any-captures.ts shape, reduced to the no-coercion op surface: the full corpus program also needs callMethod, out of stage A's scope)", async () => {
+  const res = await buildWasmDyn(
+    "captures-canary.ts",
+    [
+      'const obj: any = { n: 10, label: "L" };',
+      "const captured: any = obj;",
+      "const read = (): string => `${captured.label}:${captured.n}`;",
+      "console.log(read());",
+      "captured.n = 11;",
+      "console.log(read());",
+      "",
+      "let mut: any = 1;",
+      "const bump = (): string => {",
+      "  mut = 2;",
+      "  return `${mut}`;",
+      "};",
+      "console.log(bump());",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  // Node-verified (node --experimental-transform-types): mutating `n`
+  // through the captured box is visible to every closure sharing it (the
+  // capture box's own share-not-copy contract), and reassigning `mut`
+  // inside `bump` demonstrates a bare scalar reassignment through
+  // jsMarshal, not just construction.
+  expect(stdout.toString("utf8")).toBe(["L:10", "L:11", "2", ""].join("\n"));
+});
+
+test("increment 21 stage A: dynFromJsval is IDENTITY — a jsval crossing to `unknown` TWICE from the same island local is === both times (no wrapping introduces distinctness; jsval ≡ dyn means both crossings push the SAME dyn ref)", async () => {
+  const res = await buildWasmDyn(
+    "dynfromjsval-identity.ts",
+    [
+      "function mint(): any {",
+      '  return { tag: "hi" };',
+      "}",
+      "const island: any = mint();",
+      "const a: unknown = island;",
+      "const b: unknown = island;",
+      "console.log(a === b);",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("true\n"); // Node-verified
+});
+
+test("increment 21 stage A: the NO-COERCION jsOp surface — objLit/arrLit/getProp/setProp/getIdx/setIdx/typeof/toStr/truthy/undefLit/nullLit over island values, byte-exact against Node (node --experimental-transform-types, type-stripped run of the identical source)", async () => {
+  const source = [
+    'const o: any = { a: 1, b: "two", list: [10, 20, 30] };',
+    "console.log(typeof o.a, typeof o.b, typeof o.list);",
+    "console.log(`${o.a} ${o.b}`);",
+    "console.log(`${o.list[0]} ${o.list[1]} ${o.list[2]}`);",
+    "o.list[1] = 99;",
+    "console.log(`${o.list[1]}`);",
+    "o.c = true;",
+    "console.log(`${o.c}`, typeof o.c);",
+    'console.log(o ? "truthy-obj" : "falsy-obj");',
+    "const zero: any = 0;",
+    'console.log(zero ? "truthy-zero" : "falsy-zero");',
+    'const arr: any = [1, "x", true];',
+    "console.log(`${arr[0]} ${arr[1]} ${arr[2]}`);",
+    "const nothing: any = undefined;",
+    "const nul: any = null;",
+    "console.log(typeof nothing, typeof nul);",
+    "console.log(`${o.a}-${o.b}-${o.list[0]}`);",
+    "",
+  ].join("\n");
+  const res = await buildWasmDyn("jsop-surface.ts", source);
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  // Node-verified transcription (node --experimental-transform-types on
+  // this EXACT source): every line below is copied from that real run,
+  // not hand-computed.
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "number string object",
+      "1 two",
+      "10 20 30",
+      "99",
+      "true boolean",
+      "truthy-obj",
+      "falsy-zero",
+      "1 x true",
+      "undefined object",
+      "1-two-10",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("increment 21 stage A: jsOp:getProp through undefined throws Node's own catchable TypeError, message-exact (2580's own construct: a missing member reads undefined; a read THROUGH it throws)", async () => {
+  const res = await buildWasmDyn(
+    "getprop-through-undefined.ts",
+    [
+      "function mint(): any {",
+      "  return { n: 5 };",
+      "}",
+      "const bag: any = mint();",
+      "try {",
+      "  console.log(`${bag.missing.x}`);",
+      "} catch (e) {",
+      '  console.log(`caught: ${e}`);',
+      "}",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  // Node's own text (V8's TypeError for a property read through
+  // undefined) — verified directly against node --experimental-
+  // transform-types on this exact source.
+  expect(stdout.toString("utf8")).toBe("caught: TypeError: Cannot read properties of undefined (reading 'x')\n");
+});
+
+test("increment 21 stage A: jsExit strict primitives — happy path reads the exact tag, a wrong-kind exit throws \"expected <want>, got <typeof>\" (scriptc-only synthetic diagnostic, ported verbatim from scr_island.c's isl_exit_fail — no Node oracle exists for this text since Node has no static/island boundary at all; verified against the reference C backend's OWN output on the identical source, matching SEMANTICS.md S009's convention for texts with no Node analog)", async () => {
+  const source = [
+    "function mint(): any {",
+    '  return { n: "not-a-number" };',
+    "}",
+    "const src: any = mint();",
+    "try {",
+    "  const { n }: { n: number } = src;",
+    "  console.log(n);",
+    "} catch (e) {",
+    '  console.log(`caught: ${e}`);',
+    "}",
+    'console.log("done");',
+    "",
+  ].join("\n");
+  const wasm = await buildWasmDyn("jsexit-scalar-fail.ts", source);
+  if (!wasm.ok) throw new Error(`refused: ${wasm.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(wasm.binaryPath);
+  const c = await compile(join(scratch, "jsexit-scalar-fail.ts"), {
+    outPath: join(scratch, "jsexit-scalar-fail.c.out"),
+    outDir: scratch,
+    dynamic: true,
+    backend: "c",
+  });
+  if (!c.ok) throw new Error(`c reference refused: ${c.diagnostics[0]?.message}`);
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const cOut = await promisify(execFile)(c.binaryPath);
+  expect(stdout.toString("utf8")).toBe(cOut.stdout);
+  expect(stdout.toString("utf8")).toBe("caught: TypeError: expected number, got string\ndone\n");
+});
+
+test("increment 21 stage A: jsExit array<jsval> — the sanctioned `any[]` exit form, Array.isArray-gated, elements BY REFERENCE (the dyn ARR payload's own vector handed over directly, no copy: module.ts's STRUCTURAL type interning already makes array<jsval>'s wasm struct index identical to dyn's own ARR-payload vector struct, whether or not vecKeyFor's jsval arm exists — that arm's real effect is sharing ONE helper-function family between array<jsval> and array<dyn>, a cache-dedup, not a type-compatibility requirement); a non-array exit throws \"expected an array, got <typeof>\", verified against the reference C backend the same way as the scalar case above", async () => {
+  const source = [
+    "function mintArr(): any {",
+    "  return [1, 2, 3];",
+    "}",
+    "function takeArr(p: any[]): string {",
+    "  return `${p[0]} ${p[1]} ${p[2]} ${p.length}`;",
+    "}",
+    "const held: any = mintArr();",
+    "console.log(takeArr(held));",
+    "",
+    "function mintNotArr(): any {",
+    "  return 5;",
+    "}",
+    "try {",
+    "  const bad: any = mintNotArr();",
+    "  console.log(takeArr(bad));",
+    "} catch (e) {",
+    '  console.log(`caught: ${e}`);',
+    "}",
+    'console.log("done");',
+    "",
+  ].join("\n");
+  const wasm = await buildWasmDyn("jsexit-array.ts", source);
+  if (!wasm.ok) throw new Error(`refused: ${wasm.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(wasm.binaryPath);
+  const c = await compile(join(scratch, "jsexit-array.ts"), {
+    outPath: join(scratch, "jsexit-array.c.out"),
+    outDir: scratch,
+    dynamic: true,
+    backend: "c",
+  });
+  if (!c.ok) throw new Error(`c reference refused: ${c.diagnostics[0]?.message}`);
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const cOut = await promisify(execFile)(c.binaryPath);
+  expect(stdout.toString("utf8")).toBe(cOut.stdout);
+  expect(stdout.toString("utf8")).toBe(
+    ["1 2 3 3", "caught: TypeError: expected an array, got number", "done", ""].join("\n"),
+  );
+});
+
+test("increment 21 stage A: insp.jsval — console.log of a composite holding jsval elements (`any[]`, the sanctioned corpus form) renders through the SAME dyn walker plain unknown values use, byte-exact against Node's util.inspect-flavored console.log", async () => {
+  const res = await buildWasmDyn("insp-jsval-array.ts", "const arr: any[] = [1, 'hi', true];\nconsole.log(arr);\n");
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("[ 1, 'hi', true ]\n"); // Node-verified
+});
+
+test("increment 21 stage A: an unimplemented jsOp (add — a coercion op, stage B) still refuses NAMED under the stable \"expr:jsOp\" bucket, exactly as the blanket refusal it replaces did — census bucket names are currency", async () => {
+  const res = await buildWasmDyn(
+    "jsop-add-refuses.ts",
+    ["const a: any = 1;", "const b: any = 2;", "const c: any = a + b;", "console.log(`${c}`);", ""].join("\n"),
+  );
+  if (res.ok) throw new Error("expected a refusal, got a compiled module");
+  expect(res.diagnostics[0]?.message).toContain("expr:jsOp");
+});
+
+test("increment 21 stage A: getProp's Number.prototype PLACEHOLDER six — export-destructured off a number literal, every name answers a real function (not the round-1 miss's silent undefined for toPrecision/toExponential/valueOf/toLocaleString); these six alone get placeholders, everything else in reach fences (see the fence-table tests below) rather than answering wrong", async () => {
+  const res = await buildWasmDyn(
+    "num-proto-surface.ts",
+    [
+      "export let { toString } = 1;",
+      "export const { toFixed } = 2.5;",
+      "export const { toExponential } = 3;",
+      "export const { toPrecision } = 4;",
+      "export const { valueOf } = 5;",
+      "console.log(`${typeof toString} ${typeof toFixed} ${typeof toExponential} ${typeof toPrecision} ${typeof valueOf}`);",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("function function function function function\n"); // Node-verified
+});
+
+test("increment 21 stage A gate fix F1: unmodeled prototype-member getProp reads fence LOUDLY (a plain, catchable Error — S023's own text family, never a TypeError, never silent undefined) — per-kind fence text over NUM/BOOL/STR/ARR, plus Object.prototype's own members on a NUM receiver outside its placeholder six (round-1's own gap: `typeof n.hasOwnProperty` silently answered undefined, Node answers a function)", async () => {
+  const res = await buildWasmDyn(
+    "getprop-fence-per-kind.ts",
+    [
+      "const n: any = 5;",
+      "try { console.log(typeof n.hasOwnProperty); } catch (e) { console.log(`caught-num: ${e}`); }",
+      "const b: any = true;",
+      "try { console.log(typeof b.toString); } catch (e) { console.log(`caught-bool: ${e}`); }",
+      'const s: any = "hi";',
+      "try { console.log(typeof s.charAt); } catch (e) { console.log(`caught-str: ${e}`); }",
+      "const arr: any = [1, 2, 3];",
+      "try { console.log(typeof arr.push); } catch (e) { console.log(`caught-arr: ${e}`); }",
+      'console.log("done");',
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  // No Node oracle for these texts (an unmodeled-member fence is a
+  // scriptc-only synthetic diagnostic — the construct itself compiles
+  // and runs fine in Node, since Node HAS these methods; this tier
+  // simply does not implement the method BODIES yet, S023's own
+  // "TODO marker, not a stance" framing). The plain-Error mechanism and
+  // text FAMILY are what's pinned, matching S023 exactly.
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "caught-num: Error: 'Object.prototype.hasOwnProperty' on an island value is not supported yet",
+      "caught-bool: Error: 'Boolean.prototype.toString' on an island value is not supported yet",
+      "caught-str: Error: 'String.prototype.charAt' on an island value is not supported yet",
+      "caught-arr: Error: 'Array.prototype.push' on an island value is not supported yet",
+      "done",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("increment 21 stage A gate fix F1: OWN property shadows the prototype fence on an OBJ receiver (Node-measured: `({toString: 5}).toString` is `5`, not a function — an own field of the SAME NAME as a fenced prototype member must win, never fence); a genuinely absent Object.prototype-named member on an empty object still fences", async () => {
+  const res = await buildWasmDyn(
+    "getprop-own-shadow.ts",
+    [
+      "const o: any = { toString: 5 };",
+      "console.log(typeof o.toString, `${o.toString}`);",
+      "const empty: any = {};",
+      "try { console.log(typeof empty.hasOwnProperty); } catch (e) { console.log(`caught: ${e}`); }",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    ["number 5", "caught: Error: 'Object.prototype.hasOwnProperty' on an island value is not supported yet", ""].join(
+      "\n",
+    ),
+  );
+});
+
+test("increment 21 stage A gate fix F2: native-method placeholder IDENTITY — ONE interned dyn FUNC per NAME, not per call site (Node-measured, reviewer's zz6a/zz6b/zz6c): different names never ===, the SAME name off DIFFERENT receivers always === (Number.prototype.toString IS one function object), and a placeholder never === a real closure", async () => {
+  const diffName = await buildWasmDyn(
+    "placeholder-diff-name.ts",
+    [
+      "const v: any = 5;",
+      "const w: any = 6;",
+      "const a: unknown = v.toString;",
+      "const b: unknown = w.toFixed;",
+      "console.log(a === b);",
+      "const c: unknown = w.toString;",
+      "console.log(a === c);",
+      "",
+    ].join("\n"),
+  );
+  if (!diffName.ok) throw new Error(`refused: ${diffName.diagnostics[0]?.message}`);
+  const r1 = await runWasm(diffName.binaryPath);
+  expect(r1.stdout.toString("utf8")).toBe("false\ntrue\n"); // Node-verified (zz6b)
+
+  const vsReal = await buildWasmDyn(
+    "placeholder-vs-real.ts",
+    [
+      "const f = (): number => 1;",
+      "const v: any = 5;",
+      "const u1: unknown = f;",
+      "const u3: unknown = v.toString;",
+      "console.log(u1 === u3);",
+      "",
+    ].join("\n"),
+  );
+  if (!vsReal.ok) throw new Error(`refused: ${vsReal.diagnostics[0]?.message}`);
+  const r2 = await runWasm(vsReal.binaryPath);
+  expect(r2.stdout.toString("utf8")).toBe("false\n"); // Node-verified (zz6c)
+});
+
+test("increment 21 stage A gate fix F3: island-array NON-INDEX keyed writes throw the S016 fence text, inherited unchanged through jsOp:setIdx's shared keySet() — but this is a NEW, wasm-lane-ONLY divergence, not an inherited one: a NEGATIVE or non-canonical-index string key is an ORDINARY property write in Node AND on the native lane (a REAL engine array under --dynamic, not a dyn tree — the C reference does NOT throw here, measured directly), so only the wasm lane inherits S016's dyn-array limitation (no expando map) by representing jsval as dyn; pinned so the lead's promised S016 island amendment registers the CORRECT (wasm-only) shape, not the S016 dyn-world shape verbatim", async () => {
+  const source = [
+    "const a: any = [1, 2, 3];",
+    "try { a[-1] = 7; console.log('no-throw'); } catch (e) { console.log(`caught: ${e}`); }",
+    'try { a["foo"] = 7; console.log("no-throw2"); } catch (e) { console.log(`caught2: ${e}`); }',
+    "console.log(`${a.length}`);",
+    "",
+  ].join("\n");
+  const wasm = await buildWasmDyn("setidx-nonindex-fence.ts", source);
+  if (!wasm.ok) throw new Error(`refused: ${wasm.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(wasm.binaryPath);
+  const c = await compile(join(scratch, "setidx-nonindex-fence.ts"), {
+    outPath: join(scratch, "setidx-nonindex-fence.c.out"),
+    outDir: scratch,
+    dynamic: true,
+    backend: "c",
+  });
+  if (!c.ok) throw new Error(`c reference refused: ${c.diagnostics[0]?.message}`);
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const cOut = await promisify(execFile)(c.binaryPath);
+  // The native island is a REAL engine array (matches Node: ordinary
+  // property write, no throw) — the wasm lane diverges from BOTH,
+  // pinned explicitly so nothing later assumes they agree.
+  expect(cOut.stdout).toBe("no-throw\nno-throw2\n3\n");
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "caught: TypeError: Cannot create property '-1' on array",
+      "caught2: TypeError: Cannot create property 'foo' on array",
+      "3",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("increment 21 stage A gate fix F4: jsExit array<jsval> SPINE aliasing — a write OR a push through the exited array is observed from the ORIGINAL jsval binding, byte-exact against Node (the whole dyn ARR vector hands over by reference, not just element identity); the reference C backend instead COPIES at the exit boundary and diverges from Node here — a per-lane split the wasm lane's aliasing avoids, registered separately", async () => {
+  const writeSource = [
+    "function mintArr(): any { return [1, 2, 3]; }",
+    "function poke(p: any[]): void { p[0] = 99; }",
+    "const held: any = mintArr();",
+    "poke(held);",
+    "console.log(`${held[0]} ${held[1]}`);",
+    "",
+  ].join("\n");
+  const wasmWrite = await buildWasmDyn("arrexit-alias-write.ts", writeSource);
+  if (!wasmWrite.ok) throw new Error(`refused: ${wasmWrite.diagnostics[0]?.message}`);
+  const rWrite = await runWasm(wasmWrite.binaryPath);
+  expect(rWrite.stdout.toString("utf8")).toBe("99 2\n"); // Node-verified
+  const cWrite = await compile(join(scratch, "arrexit-alias-write.ts"), {
+    outPath: join(scratch, "arrexit-alias-write.c.out"),
+    outDir: scratch,
+    dynamic: true,
+    backend: "c",
+  });
+  if (!cWrite.ok) throw new Error(`c reference refused: ${cWrite.diagnostics[0]?.message}`);
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const cWriteOut = await promisify(execFile)(cWrite.binaryPath);
+  // The registered per-lane split: C COPIES at the exit (the write is
+  // invisible on the original), wasm ALIASES (Node-exact). Pinned
+  // explicitly so nothing later "fixes" wasm to match C by accident.
+  expect(cWriteOut.stdout).toBe("1 2\n");
+
+  const growSource = [
+    "function mintArr(): any { return [1, 2, 3]; }",
+    "function grow(p: any[]): number { p.push(4); return p.length; }",
+    "const held: any = mintArr();",
+    "console.log(`${grow(held)} ${held.length}`);",
+    "",
+  ].join("\n");
+  const wasmGrow = await buildWasmDyn("arrexit-alias-grow.ts", growSource);
+  if (!wasmGrow.ok) throw new Error(`refused: ${wasmGrow.diagnostics[0]?.message}`);
+  const rGrow = await runWasm(wasmGrow.binaryPath);
+  expect(rGrow.stdout.toString("utf8")).toBe("4 4\n"); // Node-verified
+  const cGrow = await compile(join(scratch, "arrexit-alias-grow.ts"), {
+    outPath: join(scratch, "arrexit-alias-grow.c.out"),
+    outDir: scratch,
+    dynamic: true,
+    backend: "c",
+  });
+  if (!cGrow.ok) throw new Error(`c reference refused: ${cGrow.diagnostics[0]?.message}`);
+  const cGrowOut = await promisify(execFile)(cGrow.binaryPath);
+  expect(cGrowOut.stdout).toBe("4 3\n"); // C copies: held.length stays stale
+});
+
+test("increment 21 stage A gate round 2 fix D1: Function.prototype members on a FUNC-kind jsval receiver fence as 'Function.prototype.<name>', not 'Object.prototype.<name>' — reachable through F2's OWN placeholders (a placeholder IS a real FUNC-kind jsval): `const f: any = v.toString; typeof f.call` used to silently answer undefined (no table had 'call' at all); apply/bind/call/toString are the closed Function.prototype own-member set (Node-measured, caller/arguments excluded as throwing accessors)", async () => {
+  const res = await buildWasmDyn(
+    "getprop-fence-func.ts",
+    [
+      "const v: any = 5;",
+      "const f: unknown = v.toString;", // a FUNC-kind jsval placeholder, round-tripped through unknown only to hold it — read back below via a fresh jsval read
+      "const g: any = v.toString;",
+      "try { console.log(typeof g.call); } catch (e) { console.log(`caught-call: ${e}`); }",
+      "try { console.log(typeof g.apply); } catch (e) { console.log(`caught-apply: ${e}`); }",
+      "try { console.log(typeof g.bind); } catch (e) { console.log(`caught-bind: ${e}`); }",
+      "try { console.log(typeof g.hasOwnProperty); } catch (e) { console.log(`caught-hasown: ${e}`); }",
+      "console.log(typeof f);",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  // No Node oracle for the fence texts themselves (Node HAS these
+  // methods; this tier fences the unmodeled BODY, S023's own framing).
+  // 'call'/'apply'/'bind' attribute Function.prototype; 'hasOwnProperty'
+  // (present on Function.prototype's OWN chain via Object.prototype, not
+  // Function.prototype itself) still correctly attributes Object.
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "caught-call: Error: 'Function.prototype.call' on an island value is not supported yet",
+      "caught-apply: Error: 'Function.prototype.apply' on an island value is not supported yet",
+      "caught-bind: Error: 'Function.prototype.bind' on an island value is not supported yet",
+      "caught-hasown: Error: 'Object.prototype.hasOwnProperty' on an island value is not supported yet",
+      "function",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("increment 21 stage A gate round 2 fix D2: the four annex-B accessor-definer names (__defineGetter__/__defineSetter__/__lookupGetter__/__lookupSetter__) are function-valued on EVERY kind's prototype chain (Node-measured, reviewer's g4 probe) and must fence like any other Object.prototype member, not silently answer undefined", async () => {
+  const res = await buildWasmDyn(
+    "getprop-fence-annexb.ts",
+    [
+      "const n: any = 5;",
+      "try { console.log(typeof n.__defineGetter__); } catch (e) { console.log(`caught-num: ${e}`); }",
+      "const arr: any = [1, 2];",
+      "try { console.log(typeof arr.__lookupSetter__); } catch (e) { console.log(`caught-arr: ${e}`); }",
+      "const o: any = {};",
+      "try { console.log(typeof o.__defineSetter__); } catch (e) { console.log(`caught-obj: ${e}`); }",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "caught-num: Error: 'Object.prototype.__defineGetter__' on an island value is not supported yet",
+      "caught-arr: Error: 'Object.prototype.__lookupSetter__' on an island value is not supported yet",
+      "caught-obj: Error: 'Object.prototype.__defineSetter__' on an island value is not supported yet",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("increment 21 stage A gate round 2 fix D3: the NUM arm's fence attribution — a name Number.prototype does NOT itself carry (hasOwnProperty, only on Object.prototype) fences as 'Object.prototype.hasOwnProperty' on a NUM receiver, not 'Number.prototype.hasOwnProperty' (round 2's own catch: every sibling arm already spelled the generic-table name correctly, only NUM's copy-pasted the kind's own constructor name by mistake)", async () => {
+  const res = await buildWasmDyn(
+    "getprop-fence-num-attribution.ts",
+    ["const n: any = 5;", "try { console.log(typeof n.hasOwnProperty); } catch (e) { console.log(`${e}`); }", ""].join(
+      "\n",
+    ),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("Error: 'Object.prototype.hasOwnProperty' on an island value is not supported yet\n");
+});
+
+test("increment 21 stage A gate round 2 fix D7: jsMarshal(dyn) aliasing — a dyn-typed value marshaled into an island (`any`) slot TWICE from the SAME `unknown` local, then both round-tripped back to `unknown` (dynFromJsval, identity), are === to each other — the S014 island amendment's dyn-operand identity arm, mirrored for the marshal-IN direction the way the existing dynFromJsval-identity test covers marshal-OUT. Also asserts the reference C backend's OWN value (round 3 note 1): the native lane deep-COPIES at this same boundary (S014's DEFAULT rule, not the wasm-only exception), so C answers `false` where wasm/Node answer `true` — pinned explicitly so a later 'fix' can never silently align wasm to C's copy instead of Node's identity", async () => {
+  const source = [
+    'const u: unknown = JSON.parse(\'{"a":1}\');',
+    "const a: any = u;",
+    "const b: any = u;",
+    "const ua: unknown = a;",
+    "const ub: unknown = b;",
+    "console.log(ua === ub);",
+    "",
+  ].join("\n");
+  const res = await buildWasmDyn("jsmarshal-dyn-identity.ts", source);
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("true\n"); // Node-verified
+
+  const c = await compile(join(scratch, "jsmarshal-dyn-identity.ts"), {
+    outPath: join(scratch, "jsmarshal-dyn-identity.c.out"),
+    outDir: scratch,
+    dynamic: true,
+    backend: "c",
+  });
+  if (!c.ok) throw new Error(`c reference refused: ${c.diagnostics[0]?.message}`);
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  const cOut = await promisify(execFile)(c.binaryPath);
+  // The per-lane split: C copies at the jsMarshal(dyn) boundary (S014's
+  // default rule), so its two "marshaled" values are DIFFERENT objects
+  // and the round-trip identity check answers false — unlike wasm, which
+  // aliases and matches Node's true.
+  expect(cOut.stdout).toBe("false\n");
+});
+
+test("increment 21 stage A gate round 3 fix R1/R2: '__proto__' (every kind, an Object.prototype ACCESSOR — never function-valued, so it cannot live in the function-shaped tables) and 'caller'/'arguments' (FUNC only, Function.prototype's own THROWING accessors) fence loudly instead of silently answering undefined; both are catchable and the program survives, matching the reviewer's h1 shape", async () => {
+  const res = await buildWasmDyn(
+    "getprop-fence-accessors.ts",
+    [
+      "function mintObj(): any { return { a: 1 }; }",
+      "const o: any = mintObj();",
+      "try { console.log(typeof o.__proto__); } catch (e) { console.log(`1: ${e}`); }",
+      "try { console.log(`${o.__proto__}`); } catch (e) { console.log(`2: ${e}`); }",
+      "const v: any = 5;",
+      "const f: any = v.toString;",
+      "try { console.log(typeof f.caller); } catch (e) { console.log(`3: ${e}`); }",
+      "try { console.log(typeof f.arguments); } catch (e) { console.log(`4: ${e}`); }",
+      'console.log("done");',
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  // No Node oracle for the fence texts (Node answers the real prototype
+  // object for __proto__, and throws ITS OWN strict-mode TypeError for
+  // caller/arguments — this tier fences all three loudly instead of
+  // modeling either, S023's own "TODO marker" framing).
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "1: Error: 'Object.prototype.__proto__' on an island value is not supported yet",
+      "2: Error: 'Object.prototype.__proto__' on an island value is not supported yet",
+      "3: Error: 'Function.prototype.caller' on an island value is not supported yet",
+      "4: Error: 'Function.prototype.arguments' on an island value is not supported yet",
+      "done",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("increment 21 stage A gate round 3 fix R3: a LITERAL \"__proto__\" key in an island object literal refuses at COMPILE TIME (jsOp:objLit-proto-key) — a wasm-ALONE divergence otherwise: real JS treats `{__proto__: v}` as the prototype-setter special form (non-object v is a silent no-op, no own property is ever created, `typeof o.__proto__` reads the real prototype object, \"object\"), where this tier's objPut would silently store it as an ordinary own entry (\"number\") — Node-measured AND confirmed against the reference C backend, both answering \"object\" where the pre-fix wasm lane answered \"number\" (the reviewer's h6/h6b shape)", async () => {
+  const res = await buildWasmDyn(
+    "objlit-proto-key.ts",
+    [
+      "const o: any = { __proto__: 5, plain: 1 };",
+      "console.log(`${o.plain}`);",
+      "try { console.log(typeof o.__proto__); } catch (e) { console.log(`read: ${e}`); }",
+      'console.log("survived");',
+      "",
+    ].join("\n"),
+  );
+  if (res.ok) throw new Error("expected a refusal, got a compiled module");
+  expect(res.diagnostics[0]?.message).toContain("jsOp:objLit-proto-key");
+});
+
+test("increment 21 stage A gate round 3 fix R3 negative control: keys that merely CONTAIN \"proto\" (\"proto\", \"__proto\", \"a__proto__b\" — none is the EXACT string \"__proto__\") are ordinary own entries, unaffected by the compile-time refusal, byte-exact against Node", async () => {
+  const res = await buildWasmDyn(
+    "objlit-proto-key-negative.ts",
+    [
+      "const a: any = { proto: 1, __proto: 2, a__proto__b: 3 };",
+      "console.log(`${a.proto} ${a.__proto} ${a.a__proto__b}`);",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("1 2 3\n"); // Node-verified
 });

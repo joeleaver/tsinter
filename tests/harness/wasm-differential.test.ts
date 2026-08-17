@@ -1454,6 +1454,93 @@ const TIER_FLOOR: string[] = [
   "1431-caught-tostring.ts",
   "1434-async-never.ts",
   "2095-js-catch-unknown.js",
+  // Increment 21 stage A: the static island's representation. jsval ≡
+  // dyn at representation (mapType(jsval) = the SAME (ref null $dyn) as
+  // dyn; DK.JSVAL stays unconstructible — any-world values are ordinary
+  // dyn payloads from birth), dynFromJsval is identity, and the
+  // NO-COERCION jsOps (truthy/typeof/toStr/getProp/setProp/getIdx/
+  // setIdx/objLit/arrLit/undefLit/nullLit) route through the existing
+  // dyn runtime. 14 programs claim — the exact CLAIM-PREDICTION set
+  // computed BEFORE implementation (op-census.txt §4: every program
+  // whose jsOp set ⊆ that no-coercion list, cross-checked against
+  // needsets.txt for no other unimplemented needs).
+  //
+  // Two names the prediction MISSED on the first pass (2583/2585-dyn-
+  // nullish-coalesce.js): both hit a dynFrom:jsval refusal — NOT from a
+  // nested composite position (the first write-up here was wrong and
+  // was corrected before landing), but from emitDynFnThunkBody's boxed-
+  // CALLBACK RETURN conversion (emitter.ts ~4024: a dyn-invoke callback
+  // whose inferred/declared return type is jsval — 2583/2585's flatMap
+  // callback `(v) => (v === 1 ? [v, v] : v)` — calls dynFromHelper(t.ret)
+  // directly on its bare jsval return value). dynFromHelper's internal
+  // per-typeKey walker (emitDynFromBody) needed its OWN jsval arm
+  // (identity, same as its existing "dyn" arm) for this SECOND caller;
+  // the dynFrom NODE's own top-level switch correctly has no jsval arm
+  // (validate.ts's canConvertToDyn never admits a bare jsval operand
+  // there) and needed no change.
+  //
+  // A real correctness bug found and fixed rather than left as a silent
+  // wrong-output claim, in two rounds: 2086-destructuring-island-
+  // globals.ts's module-scope `{ toString } = 1` / `{ toFixed } = 2.5`
+  // needs getProp to answer a real FUNCTION for a NUM receiver's
+  // prototype method name (Node boxes primitives for property access).
+  // Round 1 (this agent) added a 2-name placeholder table — too narrow,
+  // silently wrong for `toPrecision` and the rest of Number.prototype.
+  // Round 2 (post-gate review) found the gap generalizes far past NUM:
+  // `typeof s.toString` (STR/BOOL/ARR/OBJ receivers) and any Number.
+  // prototype name outside the placeholder six ALSO silently answered
+  // undefined where Node answers a function — S015 ("keyed reads on
+  // `unknown` see OWN properties only") does NOT excuse this: S015 is a
+  // registered divergence for the checked-dynamic `dyn` world (where
+  // every operation is frontend-rejected by default), not for jsval
+  // (whose contract is JS-exact engine calls — nodes.ts's own jsval
+  // doc). dyn.keyGet's own NUM arm never existed because nothing could
+  // reach one before this increment — y3-dyn-num-read.js shows the
+  // UNCHANGED dyn-world case still answering S015's undefined today, on
+  // both lanes, correctly. jsOp:getProp now carries closed, Node-
+  // measured prototype-member tables (OBJECT_PROTO_MEMBERS — 10 names,
+  // annex-B accessor definers included — applies to every kind;
+  // ARRAY_/STRING_/BOOLEAN_/FUNCTION_PROTO_MEMBERS to their own kind,
+  // each checked BEFORE the Object.prototype fallback so an override
+  // like `toString` fences under its OWN constructor name, never
+  // "Object.prototype.toString") and a per-name S023-style runtime
+  // fence (protoFenceGetPropHelper) — a plain, catchable Error,
+  // "'<Ctor>.prototype.<name>' on an island value is not supported
+  // yet", never a silent wrong answer — for every tabled name outside
+  // the Number six, which alone still get real placeholders (F2:
+  // nativeMethodPlaceholderHelper interns ONE dyn FUNC per NAME in a
+  // module global, not a fresh struct per call site, so same-name-
+  // different-receiver stays `===` and different names never collide —
+  // reachable through those SAME placeholders too: a placeholder is a
+  // real FUNC-kind jsval, so `.call`/`.apply`/`.bind`/`.toString` on one
+  // fence as Function.prototype members, FUNCTION_PROTO_MEMBERS's own
+  // reason to exist). OBJ receivers check their OWN entries first (an
+  // own field shadows the prototype fence, matching Node). A name in
+  // NEITHER a fence table nor a modeled name (length, canonical
+  // indices, FUNC's name/length) keeps keyGet's plain undefined —
+  // Node-exact for a genuinely missing key. This fence-or-fallback
+  // dispatch is only ever BUILT for a getProp call site whose compile-
+  // time `name` matches at least one table; 13 of the 14 claimed
+  // programs' own getProp names never do, so those 13 still take the
+  // exact original keyGet path, unchanged — the 14th,
+  // 2086-destructuring-island-globals.ts, DOES match (its own
+  // "toString"/"toFixed" are in NUM_PROTO_METHOD_ARITY), so this
+  // dispatch IS built for it and resolves through the placeholder arm,
+  // not the fence — output stays Node-exact, that arm's whole point.
+  "1123-any-conditional-spread.ts",
+  "2086-destructuring-island-globals.ts",
+  "2130-overload-island-returns.ts",
+  "2579-jsval-object-param-crossing.js",
+  "2580-jsval-routed-keyed-ops.js",
+  "2582-jsval-object-statics.js",
+  "2582-jsval-routed-keyed-ops.js",
+  "2583-dyn-nullish-coalesce.js",
+  "2584-jsval-object-statics.js",
+  "2585-dyn-nullish-coalesce.js",
+  "2603-island-keyed-write-dyn.js",
+  "2632-dyn-jsval-iterate.js",
+  "767-string-literal-keys.ts",
+  "968-jsval-lift.ts",
 ];
 
 interface RunResult {

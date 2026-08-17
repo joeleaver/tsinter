@@ -410,6 +410,148 @@ const CANONICAL_NAN: number = new Float64Array(new BigUint64Array([0x7ff80000000
  * its reactions belong to the fiber machinery, not the dyn surface. */
 const PROMISE_REACTION_METHODS = new Set(["then", "catch", "finally"]);
 
+/** jsOp:getProp's PROTOTYPE-MEMBER surface (increment 21, stage A,
+ * post-review): an island receiver's property read can name a REAL
+ * prototype method Node answers a function for — S015's divergence
+ * ("keyed reads on `unknown` see OWN properties only") does NOT cover
+ * jsval: S015 is a REGISTERED divergence for the checked-dynamic `dyn`
+ * world, where every operation is frontend-rejected by DEFAULT and the
+ * missing-prototype-chain gap is the accepted, documented cost; jsval's
+ * contract is the OPPOSITE stance — "operations on jsval compile to
+ * engine calls with JS-exact semantics" (nodes.ts's own jsval doc) — so
+ * silently answering `undefined` where Node answers a function is not a
+ * registrable divergence here, it is a miscompile. dyn.ts's keyGet has
+ * no NUM/general-prototype arm because, pre-increment-21, NOTHING could
+ * reach one this way (S015 is reachable ONLY through the dyn world's
+ * OWN keyed-read node, dynKeyGet, which the frontend already routes
+ * around prototype members for `unknown` receivers by convention, not
+ * by a hard fence — y3-dyn-num-read.js reaches keyGet on a genuine dyn
+ * NUM today and gets S015's undefined, correctly, on BOTH lanes; that
+ * path is UNCHANGED by this increment). jsOp:getProp is the FIRST
+ * reader that can reach a NUM/BOOL/STR/ARR/OBJ/FUNC prototype name
+ * through a representation with no engine to ask, so it needs its own
+ * closed tables and a LOUD fence — S023 is the precedent (the dyn
+ * INVOKE surface already fences unmodeled (kind, method) pairs at
+ * RUNTIME with a plain, catchable Error, never a silent wrong answer).
+ *
+ * FIRST DRAFT of the Number table was bounded to 2086-destructuring-
+ * island-globals.ts's two measured names (toString, toFixed) — WRONG,
+ * caught before landing: TypeScript's own Number interface
+ * (lib.es5.d.ts) type-checks a destructure of ANY of Number.prototype's
+ * six own members off a number literal, not just the two 2086 happens
+ * to use (measured directly, `const { toPrecision } = 5;` — TS accepts
+ * it, Node answers "function", the two-name table silently answered
+ * "undefined"). SECOND DRAFT assumed the checker's admission bound the
+ * ENTIRE reachable surface to those six — ALSO WRONG (review finding
+ * p4b/p3): `export const { hasOwnProperty } = 5;` ALSO type-checks and
+ * ALSO answers "function" in Node (Object.prototype's own members apply
+ * through EVERY kind's prototype chain, not just the receiver's most-
+ * derived one). The tables below are Node-measured
+ * (`Object.getOwnPropertyNames(<Ctor>.prototype)` filtered to own
+ * function-valued members, `constructor` excluded as not a method-
+ * shaped destructure target) for every kind stage A's jsOp:getProp can
+ * receive: Object.prototype (every kind), Array.prototype (ARR),
+ * String.prototype (STR), Boolean.prototype (BOOL) — plus the six
+ * Number.prototype names, which alone get REAL placeholders (F2's
+ * interned-per-name globals, nativeMethodPlaceholderHelper) rather than
+ * a fence, since 2086 needs `typeof` on them to answer "function" and
+ * no stage-A program calls or identity-compares one. Everything else in
+ * these tables FENCES loudly (getProp's own dispatch helper) rather
+ * than answering undefined; a name in NO table keeps keyGet's own
+ * undefined, which is Node-exact for a genuinely missing key on every
+ * kind these tables cover. */
+const NUM_PROTO_METHOD_ARITY: ReadonlyMap<string, number> = new Map([
+  ["toString", 1],
+  ["toLocaleString", 0],
+  ["valueOf", 0],
+  ["toFixed", 1],
+  ["toExponential", 1],
+  ["toPrecision", 1],
+]);
+
+/** `Object.getOwnPropertyNames(Object.prototype)`, functions only,
+ * `constructor` and `__proto__` excluded (the latter is an ACCESSOR —
+ * `typeof ({}).__proto__` is "object", never "function", so it is not a
+ * getProp-fence candidate at all: reading it degrades to keyGet's own
+ * OBJ-kind catch-all, out of this table's business) — applies to EVERY
+ * jsOp:getProp receiver kind (own-property lookup takes precedence for
+ * OBJ; see the getProp dispatch helper). 10 names total (review round 2,
+ * D2: the round-1 table had 6 — the four annex-B accessor DEFINERS are
+ * function-valued too, Node-measured on every kind's chain: `typeof
+ * (5).__defineGetter__` is "function", same for string/boolean/array/
+ * object receivers). */
+const OBJECT_PROTO_MEMBERS: ReadonlySet<string> = new Set([
+  "hasOwnProperty",
+  "isPrototypeOf",
+  "propertyIsEnumerable",
+  "toString",
+  "valueOf",
+  "toLocaleString",
+  "__defineGetter__",
+  "__defineSetter__",
+  "__lookupGetter__",
+  "__lookupSetter__",
+]);
+
+/** `Object.getOwnPropertyNames(Function.prototype)`, functions only,
+ * `constructor` excluded — FUNC receivers only; checked BEFORE
+ * Object.prototype so `toString` attributes to Function.prototype, not
+ * Object.prototype (review round 2, D1: FUNC's own `toString` override
+ * matters the same way ARRAY_PROTO_MEMBERS' and STRING_PROTO_MEMBERS'
+ * do). Reachable via F2's own placeholders: `const f: any = v.toString;
+ * typeof f.call` — `f` is a FUNC-kind jsval (the Number-six placeholder),
+ * and `.call`/`.apply`/`.bind` on it are real Function.prototype members
+ * this tier does not implement. `name` and `length` stay modeled (S020),
+ * never in this table.
+ *
+ * `caller`/`arguments` are EXCLUDED from this table — CORRECTED (review
+ * round 3, R2: the first draft claimed they were "not reachable as plain
+ * getProp reads," false, disproven by compiling and running the
+ * reviewer's own h1 shape). They ARE reachable, real, Node-measured own
+ * members of Function.prototype; they are excluded from this SET
+ * specifically because they are THROWING ACCESSORS under strict mode
+ * (Node raises its own TypeError merely on ACCESS, before any value
+ * could be produced), not because nothing reaches them — the same
+ * function-valued-only contract that excludes `__proto__` from
+ * OBJECT_PROTO_MEMBERS. Fenced via the getProp case's own gate instead
+ * (`isFunctionFence` in protoFenceGetPropHelper), attributed
+ * "Function.prototype.caller"/"Function.prototype.arguments" — one step
+ * short of Node's own throw (a fence instead of modeling the accessor's
+ * exact TypeError), but never silent-undefined. */
+const FUNCTION_PROTO_MEMBERS: ReadonlySet<string> = new Set(["apply", "bind", "call", "toString"]);
+
+/** `Object.getOwnPropertyNames(Array.prototype)`, functions only,
+ * `constructor` excluded — ARR receivers only; checked BEFORE
+ * Object.prototype so an override (toString/toLocaleString) fences
+ * under the right constructor name. `length` and canonical indices stay
+ * modeled (keyGet's own ARR arm), never fenced. */
+const ARRAY_PROTO_MEMBERS: ReadonlySet<string> = new Set([
+  "at", "concat", "copyWithin", "fill", "find", "findIndex", "findLast", "findLastIndex",
+  "lastIndexOf", "pop", "push", "reverse", "shift", "unshift", "slice", "sort", "splice",
+  "includes", "indexOf", "join", "keys", "entries", "values", "forEach", "filter", "flat",
+  "flatMap", "map", "every", "some", "reduce", "reduceRight", "toReversed", "toSorted",
+  "toSpliced", "with", "toLocaleString", "toString",
+]);
+
+/** `Object.getOwnPropertyNames(String.prototype)`, functions only,
+ * `constructor` excluded — STR receivers only; checked BEFORE
+ * Object.prototype for the same override reason as ARRAY_PROTO_MEMBERS.
+ * `length` and canonical indices stay modeled, never fenced. */
+const STRING_PROTO_MEMBERS: ReadonlySet<string> = new Set([
+  "anchor", "at", "big", "blink", "bold", "charAt", "charCodeAt", "codePointAt", "concat",
+  "endsWith", "fontcolor", "fontsize", "fixed", "includes", "indexOf", "isWellFormed",
+  "italics", "lastIndexOf", "link", "localeCompare", "match", "matchAll", "normalize",
+  "padEnd", "padStart", "repeat", "replace", "replaceAll", "search", "slice", "small",
+  "split", "strike", "sub", "substr", "substring", "sup", "startsWith", "toString",
+  "toWellFormed", "trim", "trimStart", "trimLeft", "trimEnd", "trimRight",
+  "toLocaleLowerCase", "toLocaleUpperCase", "toLowerCase", "toUpperCase", "valueOf",
+]);
+
+/** `Object.getOwnPropertyNames(Boolean.prototype)`, functions only,
+ * `constructor` excluded — BOOL receivers only; checked BEFORE
+ * Object.prototype for the same override reason as the other two. */
+const BOOLEAN_PROTO_MEMBERS: ReadonlySet<string> = new Set(["toString", "valueOf"]);
+
 /** The abstract `any` heap type's s33 encoding — every struct/array ref
  * in the module is a subtype, so (ref null ANY_HEAP) is the one payload
  * slot every thrown ref shares. */
@@ -2379,6 +2521,22 @@ class Assembler {
         return true;
       case "dyn":
         // Already dyn — C's retain, which the GC makes a no-op.
+        c.localGet(0);
+        return true;
+      case "jsval":
+        // jsval ≡ dyn (increment 21): a jsval-typed value this walker is
+        // asked to convert is ALREADY a dyn box — same identity arm as
+        // "dyn" above. The dynFrom NODE's own operand can never be bare
+        // jsval (that is dynFromJsval's domain — validate.ts's
+        // canConvertToDyn has no jsval arm), but THIS internal walker is
+        // reached from a SECOND caller too: emitDynFnThunkBody's boxed-
+        // callback return conversion (`t.ret.kind === "jsval"` calls
+        // dynFromHelper(t.ret) directly, emitter.ts ~4024) — a dyn-
+        // invoke callback (e.g. the `flatMap` receiver's own callback)
+        // whose inferred/declared RETURN type is jsval hits this arm on
+        // its bare return value, not on a nested array/record position.
+        // Measured: 2583/2585-dyn-nullish-coalesce.js's flatMap callback
+        // `(v) => (v === 1 ? [v, v] : v)` is what surfaced the gap.
         c.localGet(0);
         return true;
       case "bytes": {
@@ -4635,6 +4793,17 @@ class Assembler {
         // arm never fails — a dyn value is one struct whatever it holds,
         // so refusal moves to the sites that BUILD or READ a payload.
         return this.dyn.dynRef();
+      case "jsval":
+        // Increment 21's representation decision: jsval ≡ dyn on this
+        // tier — there is no embedded engine, so an any-world value is an
+        // ordinary dyn payload from birth (NUM/STR/OBJ/ARR/... ), never a
+        // DK.JSVAL-tagged wrapper (dyn.ts:88–92's amended header). SAME
+        // wasm type as "dyn" above, not a sibling struct — this is what
+        // makes dynFromJsval free and lets jsval flow through every site
+        // that already answers "dyn" (captures, record/array-of-jsval
+        // element slots, the union/promise/caught arms' consistency
+        // rule) with no separate representation question to ask.
+        return this.dyn.dynRef();
       case "map":
       case "set": {
         // The KEY/VALUE representation is what can refuse (mapInfoFor).
@@ -4716,6 +4885,7 @@ class Assembler {
           t.elem.kind === "promise" ||
           t.elem.kind === "generator" ||
           t.elem.kind === "dyn" ||
+          t.elem.kind === "jsval" ||
           t.elem.kind === "map" ||
           t.elem.kind === "set" ||
           t.elem.kind === "bytes" ||
@@ -4772,6 +4942,10 @@ class Assembler {
       }
       case "dyn":
         // mapType never fails on dyn either — the consistency rule.
+        return this.dyn.dynRef();
+      case "jsval":
+        // mapType never fails on jsval either (jsval ≡ dyn, above) — same
+        // consistency rule.
         return this.dyn.dynRef();
       case "map":
       case "set": {
@@ -4852,6 +5026,16 @@ class Assembler {
     // initializers, so this is the FLOOR rather than the usual path; a
     // BOXED local is skipped because its box is minted at its varDecl and
     // because a tdz slot's null IS the before-initialization sentinel.
+    // jsval does NOT join dyn here (increment 21 review, mutation-proved
+    // unforced): every jsval local the frontend produces already arrives
+    // with an explicit initializer (jsMarshal/dynFromJsval/jsOp), unlike
+    // dyn's `let` floor. Measured, not assumed: deleting the jsval seed
+    // changed no PROGRAM's OUTPUT across the whole suite (bytes DID
+    // change on 7 of 14 shapes probed directly — the seed's own code
+    // executed and left its trace in the binary — but nothing ever
+    // DEPENDED on the value it wrote, so nothing observable moved). Re-add
+    // only if a real frontend-emitted uninitialized jsval local is found
+    // (measure first).
     for (const l of fn.locals) {
       if (l.type.kind !== "dyn" || l.boxed === true) continue;
       if (fn.params.some((p) => p.localId === l.id)) continue;
@@ -6937,11 +7121,15 @@ class Assembler {
         // the narrowed shape extracts the single non-unit arm's payload
         // under the checker's proof.
         const lt = e.left.type;
-        if (lt.kind === "dyn") {
-          // A checked-dynamic left: the RUNTIME KIND decides (only
-          // undefined and null take the default — 0, "" and false do
-          // not), and both sides are already dyn, so there is no
-          // narrowing to do and the box passes through.
+        if (lt.kind === "dyn" || lt.kind === "jsval") {
+          // A checked-dynamic OR island (jsval ≡ dyn, increment 21) left:
+          // the RUNTIME KIND decides (only undefined and null take the
+          // default — 0, "" and false do not), and both sides are already
+          // dyn-represented, so there is no narrowing to do and the box
+          // passes through. validate.ts's jsval and dyn nullish arms both
+          // require e.type to match e.left.type exactly, so one wasm shape
+          // serves both — the result's static kind never drives a branch
+          // here.
           const t = this.dyn.dynRef();
           this.walkExpr(e.left);
           const s = this.acquireScratch(t);
@@ -6956,7 +7144,6 @@ class Assembler {
           return;
         }
         if (lt.kind !== "union") {
-          // jsval lefts wait on the island representation.
           this.refuse(`nullish:${lt.kind}`, e.loc);
           code.unreachable();
           return;
@@ -7134,6 +7321,36 @@ class Assembler {
         // effects included); otherwise the narrowed receiver binds to the
         // chain id and the body produces the result.
         const recvT = e.receiver.type;
+        if (recvT.kind === "jsval") {
+          // An island-handle receiver (jsval ≡ dyn, increment 21): the
+          // nullish test is a runtime ask of the value's own dyn tag
+          // (there is no engine to ask separately), and body/result stay
+          // jsval unconditionally — validate.ts:1862–1873 admits NO void
+          // form here (unlike dyn below), since even a statement-position
+          // `o.m?.()` still answers the engine's own undefined, not a
+          // true void.
+          if (e.type.kind !== "jsval") {
+            // Unreachable on validated IR: validate.ts:1862–1873 REQUIRES
+            // e.type to be jsval whenever the receiver is jsval (no void
+            // form exists for this arm, unlike dyn below) — an internal
+            // invariant, not a census bucket a real program can hit.
+            throw new Error(`emitter bug: jsval optChain result is ${e.type.kind}, not jsval (validate.ts:1862-1873)`);
+          }
+          const t = this.dyn.dynRef();
+          const r = this.acquireScratch(t);
+          this.walkExpr(e.receiver);
+          code.localSet(r);
+          this.emitDynNullish(r);
+          this.openIfResult(t);
+          code.globalGet(this.dyn.undefinedGlobal());
+          code.else_();
+          this.fn.chainBinds.set(e.id, r);
+          this.walkExpr(e.body);
+          this.fn.chainBinds.delete(e.id);
+          this.close();
+          this.releaseScratch(t, r);
+          return;
+        }
         if (recvT.kind === "dyn") {
           // A checked-dynamic receiver: the kind tag is the short-circuit
           // test, the undefined immortal is the unit answer (dyn spells
@@ -7172,8 +7389,6 @@ class Assembler {
           return;
         }
         if (recvT.kind !== "union") {
-          // jsval receivers (the `any` chain forms) wait on the island
-          // representation.
           this.refuse(`optChain:${recvT.kind}`, e.loc);
           code.unreachable();
           return;
@@ -7349,17 +7564,22 @@ class Assembler {
           code.call(this.insp.bufferForm());
           return;
         }
-        if (e.fn === "insp.dyn" || e.fn === "insp.dynS") {
+        if (e.fn === "insp.dyn" || e.fn === "insp.dynS" || e.fn === "insp.jsval") {
           // The dyn walker (inspect.ts): the one runtime type whose shape
           // lives in the value, so the traversal is emitted code rather
           // than a synthesized helper. `dynS` is format's %s twin — a dyn
           // STRING passes verbatim there and quotes everywhere else.
+          // `insp.jsval` (increment 21: jsval ≡ dyn) is the SAME [value,
+          // f64, f64] → string shape as insp.dyn (validate.ts:970/972) —
+          // console.log of an any-typed value renders the ordinary
+          // payload exactly as Node inspects the plain value, so it
+          // routes to the identical dyn.dyn() walker, not a new one.
           //
-          // Both can throw: a PROMISE anywhere in the tree fences loudly
-          // (S030), which is why the two are may-throw seeded and why the
-          // site checks the cell.
+          // All three can throw: a PROMISE anywhere in the tree fences
+          // loudly (S030), which is why they are may-throw seeded and why
+          // the site checks the cell.
           for (const a of e.args) this.walkExpr(a);
-          code.call(e.fn === "insp.dyn" ? this.insp.dyn() : this.insp.dynS());
+          code.call(e.fn === "insp.dynS" ? this.insp.dynS() : this.insp.dyn());
           this.emitPendingCheck();
           return;
         }
@@ -8203,13 +8423,16 @@ class Assembler {
        * the two whole strings intern as literals and the kind picks. The
        * value passes through unchanged. */
       case "dynDestrCheck": {
-        if (e.value.type.kind !== "dyn") {
-          // The island's prelude guard is engine-thrown; its value is a
-          // jsval, which has no representation on this backend.
+        if (e.value.type.kind !== "dyn" && e.value.type.kind !== "jsval") {
           this.refuse(`dynDestrCheck:${e.value.type.kind}`, e.loc);
           code.unreachable();
           return;
         }
+        // jsval ≡ dyn (increment 21): the island's own destructuring
+        // guard is engine-thrown natively, but on this tier a jsval
+        // source IS already a dyn box — validate.ts:1785 admits it and
+        // requires e.type to match e.value.type, so the kind-tag test +
+        // V8 message build below (already dyn-generic) applies verbatim.
         const head =
           e.firstProp === undefined
             ? `Cannot destructure '${e.spelling}' as it is `
@@ -8252,12 +8475,15 @@ class Assembler {
        * the end. The empty pattern passes 0 and keeps only the
        * validation. Non-iterables throw V8's wording. */
       case "dynIterN": {
-        if (e.value.type.kind !== "dyn") {
-          // An island source runs the ENGINE's iterator protocol.
+        if (e.value.type.kind !== "dyn" && e.value.type.kind !== "jsval") {
           this.refuse(`dynIterN:${e.value.type.kind}`, e.loc);
           code.unreachable();
           return;
         }
+        // jsval ≡ dyn (increment 21): dyn.iterN() drains the source by
+        // its runtime kind tag, agnostic of the static "dyn" vs "jsval"
+        // label — an island-origin value iterates through the SAME
+        // dyn.iterN() family the checked-dynamic for-of desugar uses.
         this.walkExpr(e.value);
         code.i32Const(e.count);
         code.call(this.dyn.iterN());
@@ -9722,21 +9948,424 @@ class Assembler {
        * here (one struct), but the awaiting side then reads a payload it
        * has no type for — the void-await path is its own work. */
       case "promiseVoidWiden":
+      /* The island → static PROMISE bridge: stage C scope (increment 21).
+       * The re-wrap over a dyn PROMISE payload plus the settle:jsval /
+       * %async.settled:jsval payload family are a bridge-stage unit, not
+       * part of stage A's representation + no-coercion-op slice. */
       case "jsBridgePromise":
-      /* Classes: the class-as-a-VALUE surface (its own object type with a
-       * construct thunk) and virtual dispatch (vtables). */
-      /* Record shapes. */
-      /* The dyn surface past the scalar core: the composite converters,
-       * the keyed reads, and the invoke boundary. */
-      case "dynFromJsval":
-      /* The island bridge — an engine embedding, so likely never on this
-       * backend at all. */
-      case "jsMarshal":
-      case "jsOp":
-      case "jsExit":
         this.refuse(`expr:${e.kind}`, e.loc);
         code.unreachable();
         return;
+
+      /* Island value → dyn conversion (jsval ≡ dyn, increment 21): a
+       * pure identity. The operand is ALREADY the exact (ref null $dyn)
+       * the "dyn" target wants — dynFromJsval's native doc ("wraps BY
+       * REFERENCE as the checked-dynamic tree's SCR_DYN_JSVAL kind... a
+       * jsval crossing to unknown is aliasing-correct") is satisfied by
+       * construction: there is no separate wrapper kind to build, so
+       * "wrap" is "push what's already there." */
+      case "dynFromJsval":
+        this.walkExpr(e.value);
+        return;
+
+      /* Static → island marshal (jsval ≡ dyn, increment 21): design §5,
+       * "this IS dynFrom" — literally: jsval and dyn share ONE wasm
+       * representation, so "convert static T into a dyn tree" (the
+       * dynFrom case above / dynFromHelper) already IS "convert static T
+       * into a jsval." Scalars box directly (dynFrom's own scalar arms,
+       * ported verbatim); a dyn-typed operand is already the target
+       * representation (S014 island amendment below); JSON-safe
+       * composites reuse dynFromHelper's EXACT per-typeKey walker, no
+       * second walker family. */
+      case "jsMarshal": {
+        const vt = e.value.type;
+        switch (vt.kind) {
+          case "f64":
+            this.dyn.boxNum(code, () => this.walkExpr(e.value));
+            return;
+          case "bool":
+            // A literal boxes to the interned instance (dynFrom's own
+            // optimization, ported: BOOL identity is by VALUE).
+            if (e.value.kind === "boolLit") {
+              code.globalGet(this.dyn.boolGlobal(e.value.value));
+              return;
+            }
+            this.dyn.boxBool(code, () => this.walkExpr(e.value));
+            return;
+          case "string":
+            this.dyn.boxStr(code, () => this.walkExpr(e.value));
+            return;
+          case "undefinedT":
+          case "nullT": {
+            // A unit VALUE is the literal and nothing else (dynFrom's own
+            // reasoning, ported: unit kinds live in union arms, and bare
+            // they are unitLit — no operand to evaluate).
+            if (e.value.kind !== "unitLit") {
+              // Bucket names are currency (the jsOp case's own rule,
+              // three arms below): jsMarshal's unimplemented shapes all
+              // share the stable "expr:jsMarshal" aggregate, not a
+              // fragmented per-shape name.
+              this.refuse(`expr:${e.kind}`, e.loc);
+              code.unreachable();
+              return;
+            }
+            code.globalGet(vt.kind === "nullT" ? this.dyn.nullGlobal() : this.dyn.undefinedGlobal());
+            return;
+          }
+          case "dyn":
+            // THE S014 island amendment (draft — the lead finalizes at
+            // gate): the native island DEEP-COPIES a dyn operand across
+            // the marshal boundary; jsval ≡ dyn makes that boundary
+            // representationally free, so this tier ALIASES instead —
+            // matching the bytes-alias precedent (SEMANTICS.md S014's
+            // existing per-lane split) and, more importantly, matching
+            // NODE (no boundary exists in Node at all, so no aliasing
+            // question can arise there). No corpus program can observe
+            // the difference: doing so would require mutating through
+            // one reference and reading the mutation through the other
+            // AFTER the marshal, which is exactly the divergence the
+            // native-vs-Node byte-for-byte contract already rules out —
+            // any program that pinned it would already fail on native.
+            this.walkExpr(e.value);
+            return;
+          case "record":
+          case "array": {
+            // The composite conversion reuses dynFrom's per-typeKey
+            // walker verbatim (dynFromHelper) — see the case header.
+            const h = this.dynFromHelper(vt, e.loc);
+            if (h === null) {
+              code.unreachable();
+              return;
+            }
+            this.walkExpr(e.value);
+            code.call(h);
+            return;
+          }
+          default:
+            // union/promise/bytes/func/object: legal jsMarshal sources
+            // per canMarshalIntoIsland/validate.ts, but NOT exercised by
+            // any stage-A target program (op census: zero
+            // jsMarshal:in:<kind> hits across the 64 for these) — each
+            // needs its own semantics audit before landing (promise is
+            // the bridge, not a copy; the native lane's bytes marshal-IN
+            // is a COPY, not dynFromHelper's bytes ALIAS; func is the
+            // host-closure wrap). Unlike dynFrom (whose per-shape names
+            // are the established convention for THAT node), jsMarshal
+            // keeps the stable "expr:jsMarshal" aggregate bucket here —
+            // the census-currency rule.
+            this.refuse(`expr:${e.kind}`, e.loc);
+            code.unreachable();
+            return;
+        }
+      }
+
+      /* An operation on island values (jsval ≡ dyn, increment 21): the
+       * closed 37-op surface (nodes.ts:4897–4963), routed to the EXISTING
+       * dyn runtime for the NO-COERCION ops only (stage A scope) —
+       * everything else refuses NAMED under the stable "expr:jsOp"
+       * census bucket (the outer kind, not the op), exactly as the
+       * blanket refusal this replaces did. Exhaustive over IrJsOp: a
+       * missing arm is a compile error, not a silent fallthrough. */
+      case "jsOp": {
+        const op = e.op;
+        switch (op) {
+          case "truthy": {
+            // scr_dyn_truthy — total, never throws (the JSVAL arm dyn.ts
+            // carries is dead: no dyn box is ever tagged DK.JSVAL here).
+            this.walkExpr(e.args[0]!);
+            code.call(this.dyn.truthy());
+            return;
+          }
+          case "typeof": {
+            // scr_dyn_typeof — total, never throws (same dead-JSVAL-arm
+            // reasoning as truthy).
+            this.walkExpr(e.args[0]!);
+            code.call(this.dyn.typeOf());
+            return;
+          }
+          case "toStr": {
+            // `String(u)` over the dyn tree — total, never throws (no
+            // user toString ever runs: OBJ is the static "[object
+            // Object]" husk, ARR is Array.prototype.toString's join).
+            this.walkExpr(e.args[0]!);
+            code.call(this.dyn.toStr());
+            return;
+          }
+          case "getProp": {
+            // `name` carries the property (a compile-time string, not an
+            // arg — nodes.ts's jsOp doc). keyGet MAY THROW (a nullish
+            // receiver), so the call site owns the pending check —
+            // exactly the existing dynKeyGet route-through's shape.
+            //
+            // F1 (increment 21 review): `name` may ALSO be a real
+            // prototype member this tier does not model — protoFenceGet
+            // PropHelper's own header has the full per-kind rule. It is
+            // only reached when `name` matches at least one closed
+            // table; every OTHER name (the overwhelming majority — plain
+            // object fields, PLUS "length"/canonical indices on ARR/STR
+            // and "name"/"length" on FUNC, S020 — none of those are
+            // members of any table below) keeps this exact call shape,
+            // unchanged: the modeled names never even reach the fence
+            // helper, let alone need a runtime check for them there.
+            if (e.name === undefined) throw new Error("emitter bug: jsOp getProp without a name");
+            const name = e.name;
+            // "__proto__"/"caller"/"arguments" ride the gate as SPECIAL
+            // names rather than table members (review round 3, R1/R2):
+            // they are ACCESSORS (an own-property/proto pair, or a
+            // strict-mode throwing accessor), never function-valued, so
+            // the function-shaped tables below cannot correctly hold
+            // them without lying about what those tables mean. All three
+            // are real, Node-measured own/chain members that this tier
+            // does not model — S015 does not excuse silently answering
+            // undefined for jsval any more than it does for a tabled
+            // method name (this case's own header comment already makes
+            // that argument for the tables; it applies identically here).
+            const needsProtoFence =
+              NUM_PROTO_METHOD_ARITY.has(name) ||
+              OBJECT_PROTO_MEMBERS.has(name) ||
+              ARRAY_PROTO_MEMBERS.has(name) ||
+              STRING_PROTO_MEMBERS.has(name) ||
+              BOOLEAN_PROTO_MEMBERS.has(name) ||
+              FUNCTION_PROTO_MEMBERS.has(name) ||
+              name === "__proto__" ||
+              name === "caller" ||
+              name === "arguments";
+            this.walkExpr(e.args[0]!);
+            if (needsProtoFence) {
+              code.call(this.protoFenceGetPropHelper(name));
+            } else {
+              this.pushStrLit(name);
+              code.i32Const(0);
+              code.call(this.dyn.keyGet());
+            }
+            this.emitPendingCheck();
+            return;
+          }
+          case "setProp": {
+            if (e.name === undefined) throw new Error("emitter bug: jsOp setProp without a name");
+            this.walkExpr(e.args[0]!);
+            this.pushStrLit(e.name);
+            this.walkExpr(e.args[1]!);
+            code.call(this.dyn.keySet());
+            this.emitPendingCheck();
+            return;
+          }
+          case "getIdx": {
+            // The index is a full jsval (validate.ts: every jsOp arg is
+            // jsval-typed) — emitJsvalIndexKeyString reduces it to the
+            // strRef keyGet wants; keyGet's OWN canonIdx call handles the
+            // ARR-vs-OBJ dispatch, so no numeric special-case belongs
+            // here.
+            this.walkExpr(e.args[0]!);
+            this.emitJsvalIndexKeyString(e.args[1]!);
+            code.i32Const(0);
+            code.call(this.dyn.keyGet());
+            this.emitPendingCheck();
+            return;
+          }
+          case "setIdx": {
+            this.walkExpr(e.args[0]!);
+            this.emitJsvalIndexKeyString(e.args[1]!);
+            this.walkExpr(e.args[2]!);
+            code.call(this.dyn.keySet());
+            this.emitPendingCheck();
+            return;
+          }
+          case "objLit": {
+            // Args alternate key/value jsvals, keys ALREADY marshaled
+            // strings (nodes.ts's objLit doc) — unbox the key directly
+            // (STR-kind by frontend construction) rather than routing
+            // through the general index-key reducer. Never throws
+            // (pure construction; objPut/pushNewObj cannot fail).
+            //
+            // Review round 3, R3: a LITERAL "__proto__" key is NOT an
+            // ordinary own entry in real JS — `{__proto__: v}` is the
+            // spec's prototype-SETTER special form (a non-object `v` is
+            // a silent no-op; the object's prototype never changes and
+            // no own property named "__proto__" is ever created), where
+            // this tier's objPut would otherwise store it as a plain own
+            // entry (measured: `{__proto__: 5}.__proto__` answers
+            // "number" here, "object" on BOTH Node and the C reference —
+            // a wasm-ALONE divergence, unlike the R1 getProp-side
+            // "__proto__" fence, which matches C/Node's own silent-
+            // divergence-free need for a LOUD stance since S015 does not
+            // extend to jsval). Refused at COMPILE TIME, not a runtime
+            // fence: every objLit key is statically known here (every
+            // producer builds it as `jsMarshal(strLit(name))` — lower-
+            // exprs.ts's pushProp, lowerer.ts's recordToJsvalHelper,
+            // lower-island.ts's namespace/object-literal builders, all
+            // four checked), so the earliest possible loudness applies,
+            // and it collapses the read-side asymmetry a runtime-only
+            // fence would leave (`{__proto__:5}.__proto__` vs
+            // `{plain:1}.__proto__` behaving differently is exactly the
+            // shape a compile-time refusal on the WRITE side avoids by
+            // construction — the value never gets stored to begin with).
+            // The COMPUTED-key variant (`{[k]: v}` where the checker
+            // cannot see the key's runtime value at all, "__proto__"
+            // included) already refuses upstream, at the frontend
+            // (SC1090, lower-exprs.ts/lower-island.ts's own "this
+            // property form" fences on non-identifier/non-string-literal
+            // keys) — this is the LITERAL-key sibling of that same
+            // boundary, just enforced here because the literal form
+            // otherwise compiles fine as an ordinary key.
+            for (let i = 0; i + 1 < e.args.length; i += 2) {
+              const keyArg = e.args[i]!;
+              if (keyArg.kind === "jsMarshal" && keyArg.value.kind === "strLit" && keyArg.value.value === "__proto__") {
+                this.refuse("jsOp:objLit-proto-key", e.loc);
+                code.unreachable();
+                return;
+              }
+            }
+            const o = this.acquireScratch(this.dyn.objRef());
+            this.dyn.pushNewObj(code, false);
+            code.localSet(o);
+            const dynT = this.dyn.dynT();
+            for (let i = 0; i + 1 < e.args.length; i += 2) {
+              code.localGet(o);
+              this.walkExpr(e.args[i]!);
+              code.structGet(dynT, DYN_REF);
+              code.refCast(this.strType);
+              this.walkExpr(e.args[i + 1]!);
+              code.call(this.dyn.objPut());
+            }
+            this.dyn.boxObj(code, (c) => c.localGet(o));
+            this.releaseScratch(this.dyn.objRef(), o);
+            return;
+          }
+          case "arrLit": {
+            // Args are the elements, already jsvals. Never throws.
+            const a = this.acquireScratch(this.dyn.arrRef());
+            code.f64Const(0);
+            code.call(this.vecs.newLen(this.dynVecInfo()));
+            code.localSet(a);
+            for (const el of e.args) {
+              code.localGet(a);
+              this.walkExpr(el);
+              code.call(this.dyn.arrPush());
+            }
+            this.dyn.boxArr(code, (c) => c.localGet(a));
+            this.releaseScratch(this.dyn.arrRef(), a);
+            return;
+          }
+          case "undefLit":
+            code.globalGet(this.dyn.undefinedGlobal());
+            return;
+          case "nullLit":
+            code.globalGet(this.dyn.nullGlobal());
+            return;
+          // Everything below is UNIMPLEMENTED in stage A (coercion ops,
+          // the call family, globalGet, the literal-adjacent ops that
+          // need engine dispatch) — every arm shares the SAME refusal
+          // kind the blanket case used, "expr:jsOp": census bucket names
+          // are currency, and the aggregate "how much jsOp work is left"
+          // count must stay meaningful across increments regardless of
+          // which specific op a program happens to hit first.
+          case "add": case "sub": case "mul": case "div": case "mod": case "pow":
+          case "neg": case "plus":
+          case "lt": case "le": case "gt": case "ge": case "eq": case "neq":
+          case "instanceOf":
+          case "not":
+          case "callMethod": case "callFn": case "callSpread": case "construct":
+          case "globalGet":
+          case "tplStrings": case "objSpread": case "defineGetter":
+          case "iterNew": case "optCallMethod":
+            this.refuse(`expr:${e.kind}`, e.loc);
+            code.unreachable();
+            return;
+          default: {
+            const rest: never = op;
+            throw new Error(`jsOp: unhandled op "${rest}"`);
+          }
+        }
+      }
+
+      /* Island → static validated exit (jsval ≡ dyn, increment 21):
+       * STRICT tag reads for primitives (no coercion — a wrong-kind exit
+       * throws the catchable TypeError scr_jsval_exit_f64/bool/str throw
+       * natively, "expected <want>, got <typeof>" — ported verbatim, see
+       * isl_exit_fail in scr_island.c; this text has no Node oracle,
+       * scriptc-only synthetic diagnostic, same footing as S009's
+       * dynCheck messages), plus the array<jsval> reference exit
+       * (Array.isArray-gated, the dyn ARR payload's own vector handed
+       * over BY REFERENCE — vecKeyFor's jsval arm above makes that
+       * vector's wasm type identical to array<jsval>'s, so this is a
+       * plain read, no copy, no cast of the vector itself). */
+      case "jsExit": {
+        const t = e.type;
+        if (t.kind === "f64" || t.kind === "bool" || t.kind === "string") {
+          const wantDK = t.kind === "f64" ? DK.NUM : t.kind === "bool" ? DK.BOOL : DK.STR;
+          const wantDesc = t.kind === "f64" ? "number" : t.kind === "bool" ? "boolean" : "string";
+          const dynT = this.dyn.dynT();
+          const dynRef = this.dyn.dynRef();
+          const d = this.acquireScratch(dynRef);
+          this.walkExpr(e.value);
+          code.localSet(d);
+          code.localGet(d);
+          code.structGet(dynT, DYN_KIND);
+          code.i32Const(wantDK);
+          code.i32Eq();
+          const resT: ValType = t.kind === "f64" ? F64 : t.kind === "string" ? this.strRef : I32;
+          this.openIfResult(resT);
+          code.localGet(d);
+          if (t.kind === "string") {
+            code.structGet(dynT, DYN_REF);
+            code.refCast(this.strType);
+          } else {
+            code.structGet(dynT, DYN_NUM);
+            if (t.kind === "bool") {
+              code.f64Const(0);
+              code.f64Ne();
+            }
+          }
+          code.else_();
+          this.emitSetCellError(code, "%TypeError", "TypeError", (c) => {
+            this.pushStrLitInto(c, `expected ${wantDesc}, got `);
+            c.localGet(d);
+            c.call(this.dyn.typeOf());
+            c.call(this.concatHelper());
+          }, null);
+          this.emitUnwind();
+          this.close();
+          this.releaseScratch(dynRef, d);
+          return;
+        }
+        if (t.kind === "array" && t.elem.kind === "jsval") {
+          const vecInfo = this.vecInfoFor(t, e.loc);
+          if (vecInfo === null) {
+            code.unreachable();
+            return;
+          }
+          const dynT = this.dyn.dynT();
+          const dynRef = this.dyn.dynRef();
+          const d = this.acquireScratch(dynRef);
+          this.walkExpr(e.value);
+          code.localSet(d);
+          code.localGet(d);
+          code.structGet(dynT, DYN_KIND);
+          code.i32Const(DK.ARR);
+          code.i32Eq();
+          this.openIfResult(this.vecs.vecRef(vecInfo));
+          this.dyn.arrPayload(code, () => code.localGet(d));
+          code.else_();
+          this.emitSetCellError(code, "%TypeError", "TypeError", (c) => {
+            this.pushStrLitInto(c, "expected an array, got ");
+            c.localGet(d);
+            c.call(this.dyn.typeOf());
+            c.call(this.concatHelper());
+          }, null);
+          this.emitUnwind();
+          this.close();
+          this.releaseScratch(dynRef, d);
+          return;
+        }
+        // Bucket names are currency: jsExit's unimplemented targets
+        // (composite JSON-safe round-trips, bytes<u8>, undefined-armed
+        // unions) share the stable "expr:jsExit" aggregate, not a
+        // fragmented per-target-type name.
+        this.refuse(`expr:${e.kind}`, e.loc);
+        code.unreachable();
+        return;
+      }
 
       default: {
         const rest: never = e;
@@ -9986,6 +10615,34 @@ class Assembler {
         // that same warning: a lagging arm here is a call-site vs global
         // type clash the day the frontend fence lifts, not before.
         return `gen:${typeKey(t)}`;
+      // jsval ≡ dyn (mapType above): the array/struct TYPES themselves
+      // never needed this arm to unify — ModuleBuilder's arrayType/
+      // structType (module.ts:146–153) intern by STRUCTURAL SHAPE, not
+      // by the string key vecs.info() is handed, so `vecs.info("jsval",
+      // dyn.dynRef(), ...)` would already produce the identical wasm
+      // array/struct indices `vecs.info("dyn", dyn.dynRef(), ...)` does,
+      // key or no key — jsExit's array<jsval> arm handing the dyn ARR
+      // payload's vector over BY REFERENCE is legal EITHER WAY (measured:
+      // both interning routes land on the same struct index).
+      //
+      // CORRECTED (review round 2, D6): this arm does NOT actually make
+      // array<jsval> share dyn's OWN ARR-payload VecInfo — dynVecInfo()
+      // keys its cache entry bare `"dyn"`, but an ARRAY type's own key is
+      // built recursively (`vec(${vecKeyFor(elem)})`, this function's
+      // "array" arm above), so array<jsval> keys as `"vec(dyn)"` even
+      // WITH this arm — a DIFFERENT cache entry than dyn's `"dyn"`-keyed
+      // one, always (same struct index via structural interning, but a
+      // SECOND VecInfo object and a second push/newLen/etc. helper-
+      // function family, keyed by name strings that embed it). What this
+      // arm actually unifies: without it, array<jsval>'s default key
+      // would be `vec(jsval)` (vecKeyFor's own default arm, `t.kind`);
+      // WITH it, array<jsval> keys as `vec(dyn)` — the EXACT SAME key
+      // `array<dyn>` (a plain `unknown[]`) already uses. The real and
+      // only effect is sharing ONE helper-function family between
+      // array<jsval> and array<dyn>, not between array<jsval> and dyn's
+      // own internal ARR payload.
+      case "jsval":
+        return "dyn";
       default:
         return t.kind;
     }
@@ -10830,6 +11487,264 @@ class Assembler {
     code.i32Eq();
     code.i32Or();
     this.releaseScratch(I32, k);
+  }
+
+  /** F2 (increment 21 review): jsOp:getProp's Number.prototype-six
+   * placeholder, ONE interned dyn FUNC per NAME — never a fresh
+   * struct.new per call site. Node's own answer requires this:
+   * `Number.prototype.toString` IS one function object, and every NUM
+   * receiver reading "toString" sees the SAME one (zz6b's own probe:
+   * `(5).toString === (6).toString` is `true` in Node — same name,
+   * different receiver VALUES, still one function; `(5).toString !==
+   * (5).toFixed` — different names, never equal). A global lazily built
+   * on first use (checked null, built once, `global.set`, read every
+   * call after) gives same-name-different-receiver identity for free
+   * (the SAME box every time); it is NOT enough alone, though —
+   * strictEq's FUNC arm ORs box identity with FN_CLOS identity (dyn.ts),
+   * so two DIFFERENT names sharing a null FN_CLOS would still collide
+   * (`ref.eq(null, null)` is true) even with distinct boxes. The name's
+   * OWN interned string doubles as FN_CLOS: a real, non-null, per-name
+   * heap ref (an `arrayType("i16")` instance, a valid `eq` subtype,
+   * pushed where FN_CLOS's abstract `eq`-typed field expects one — no
+   * cast needed, upcasting into an abstract heap type validates without
+   * one), built exactly ONCE per name (inside the null-guard, so never
+   * rebuilt), and structurally never producible by a REAL closure's own
+   * boxing path (envTypeFor's struct family, never a bare string array)
+   * — so a placeholder can never coincidentally `===` a real function
+   * either (zz6c's own probe). */
+  private nativeMethodPlaceholderFns = new Map<string, number>();
+  private nativeMethodPlaceholderHelper(name: string, arity: number): number {
+    const hit = this.nativeMethodPlaceholderFns.get(name);
+    if (hit !== undefined) return hit;
+    const dynRef = this.dyn.dynRef();
+    const dynT = this.dyn.dynT();
+    const g = this.mb.addGlobal(dynRef, true, (w) => {
+      w.u8(0xd0); // ref.null $dyn
+      w.sleb(dynT);
+    });
+    const idx = this.mb.declareFunc(this.mb.funcType([], [dynRef]), `%w.jsval.nativeMethod:${name}`);
+    this.nativeMethodPlaceholderFns.set(name, idx);
+    const w = this.newWalker(0);
+    const c = w.c;
+    const nameLocal = this.wlocal(w, this.strRef);
+    c.globalGet(g);
+    c.refIsNull();
+    c.ifVoid();
+    this.pushStrLitInto(c, name);
+    c.localSet(nameLocal);
+    this.dyn.boxFn(
+      c,
+      (x) => x.localGet(nameLocal),
+      (x) => x.refNull(this.dyn.thunkSig()),
+      0,
+      (x) => x.localGet(nameLocal),
+      arity,
+    );
+    c.globalSet(g);
+    c.end();
+    c.globalGet(g);
+    this.mb.setBody(idx, w.locals, c.bytes());
+    return idx;
+  }
+
+  /** F1 (increment 21 review): jsOp:getProp's unmodeled-prototype-member
+   * fence, memoized PER NAME (like keyGet itself) — S023 is the
+   * precedent (the dyn INVOKE surface fences unmodeled (kind, method)
+   * pairs at RUNTIME with a plain, catchable Error, never a silent
+   * wrong answer); this is the same discipline applied to a PROPERTY
+   * READ instead of a method CALL. `name` is compile-time (nodes.ts's
+   * jsOp doc), so the CALLER only reaches for this helper when `name`
+   * matches at least one of the closed prototype tables (the gate lives
+   * at the call site — see jsOp's "getProp" case) — every other getProp
+   * call site keeps the plain keyGet() path untouched. 13 of stage A's
+   * 14 claimed programs' getProp names never match any table; the 14th,
+   * 2086-destructuring-island-globals.ts, DOES — its own "toString"/
+   * "toFixed" ARE in NUM_PROTO_METHOD_ARITY, so this helper IS built for
+   * both (measured: `%w.jsval.getProp:toString`/`:toFixed` appear in
+   * that program's binary) and resolves through the NUM arm's
+   * placeholder call below, never the fence — Node-exact output either
+   * way, since that arm's whole point is answering the six real
+   * placeholders instead of fencing them.
+   *
+   * Per-kind rule, Node-measured: OBJ checks its OWN entries FIRST
+   * (`({toString: 5}).toString` is `5` — an own field shadows the
+   * prototype exactly like a real object) via dyn.hasOwn(), which
+   * already throws ToObject's fail for a nullish receiver (dead here,
+   * OBJ is already confirmed) and answers false for anything genuinely
+   * absent. FUNC checks FUNCTION_PROTO_MEMBERS before OBJECT_PROTO_
+   * MEMBERS so an override (`toString`) attributes to Function.prototype,
+   * not Object.prototype — the same override-ordering ARRAY_PROTO_
+   * MEMBERS/STRING_PROTO_MEMBERS already use ahead of OBJECT_PROTO_
+   * MEMBERS. The kind-specific table is ALWAYS checked before the
+   * generic Object.prototype fallback-fence, for the SAME reason: a
+   * name only OBJECT_PROTO_MEMBERS carries (not the kind's own table)
+   * still fences as "Object.prototype.<name>", never the kind's own
+   * constructor name — round 2's own D3 finding: the NUM arm used to
+   * spell "Number.prototype.hasOwnProperty" for a name Number.prototype
+   * does not itself carry, wrong; fixed to "Object.prototype.…" like
+   * every sibling arm. `length`/canonical indices (ARR/STR) and `name`/
+   * `length` (FUNC, S020) stay modeled by keyGet's own arms — the
+   * CALLER's gate (jsOp's "getProp" case) already guarantees `name`
+   * is never one of those when it reaches this helper, since none of
+   * them are members of any table here; asserting it again per-kind
+   * inside this per-NAME-specialized helper would be dead code (the
+   * check's own name is a compile-time constant that can never equal
+   * "length"/"name" for an instance built under a table name — round 2's
+   * D8, the same unforced-code class the prologue-2 deletion already
+   * caught). A table hit that survives all of the above throws the
+   * S023-style fence; nothing left over reaches keyGet's own catch-all
+   * "undefined" WRONG — that undefined is Node-exact for every name
+   * this helper does not table. */
+  private protoFenceGetPropFns = new Map<string, number>();
+  private protoFenceGetPropHelper(name: string): number {
+    const hit = this.protoFenceGetPropFns.get(name);
+    if (hit !== undefined) return hit;
+    const dynRef = this.dyn.dynRef();
+    const dynT = this.dyn.dynT();
+    const idx = this.mb.declareFunc(this.mb.funcType([dynRef], [dynRef]), `%w.jsval.getProp:${name}`);
+    this.protoFenceGetPropFns.set(name, idx);
+    const w = this.newWalker(1);
+    const c = w.c;
+    const k = this.wlocal(w, I32);
+    c.localGet(0);
+    c.structGet(dynT, DYN_KIND);
+    c.localSet(k);
+    const fence = (ctor: string): void => {
+      this.emitSetCellError(c, "%Error", "Error", (x) => {
+        this.pushStrLitInto(x, `'${ctor}.prototype.${name}' on an island value is not supported yet`);
+      }, null);
+      c.refNull(dynT);
+      c.return_();
+    };
+    const fallback = (): void => {
+      c.localGet(0);
+      this.pushStrLitInto(c, name);
+      c.i32Const(0);
+      c.call(this.dyn.keyGet());
+      c.return_();
+    };
+    const numArity = NUM_PROTO_METHOD_ARITY.get(name);
+    // "__proto__" (review round 3, R1): an ACCESSOR on Object.prototype,
+    // never function-valued, so it cannot live in OBJECT_PROTO_MEMBERS
+    // (which promises function-valued members only) without lying about
+    // that table's own contract — it fences on EVERY kind, attributed
+    // "Object.prototype.__proto__" exactly like a tabled Object.prototype
+    // name would, via this OR rather than table membership.
+    const isObjectFence = OBJECT_PROTO_MEMBERS.has(name) || name === "__proto__";
+    // "caller"/"arguments" (R2): Function.prototype's own THROWING
+    // accessors (strict mode) — real, Node-measured, reachable members
+    // this tier does not model; excluded from FUNCTION_PROTO_MEMBERS for
+    // the same function-valued-only reason __proto__ is excluded from
+    // OBJECT_PROTO_MEMBERS, fenced the same way, FUNC-only (Number/
+    // String/etc. genuinely have no "caller" anywhere on their chain, so
+    // those kinds correctly fall to fallback() below, Node-exact).
+    const isFunctionFence = FUNCTION_PROTO_MEMBERS.has(name) || name === "caller" || name === "arguments";
+
+    c.localGet(k);
+    c.i32Const(DK.NUM);
+    c.i32Eq();
+    c.ifVoid();
+    if (numArity !== undefined) {
+      c.call(this.nativeMethodPlaceholderHelper(name, numArity));
+      c.return_();
+    } else if (isObjectFence) {
+      fence("Object");
+    } else {
+      fallback();
+    }
+    c.end();
+
+    c.localGet(k);
+    c.i32Const(DK.BOOL);
+    c.i32Eq();
+    c.ifVoid();
+    if (BOOLEAN_PROTO_MEMBERS.has(name)) fence("Boolean");
+    else if (isObjectFence) fence("Object");
+    else fallback();
+    c.end();
+
+    c.localGet(k);
+    c.i32Const(DK.STR);
+    c.i32Eq();
+    c.ifVoid();
+    if (STRING_PROTO_MEMBERS.has(name)) fence("String");
+    else if (isObjectFence) fence("Object");
+    else fallback();
+    c.end();
+
+    c.localGet(k);
+    c.i32Const(DK.ARR);
+    c.i32Eq();
+    c.ifVoid();
+    if (ARRAY_PROTO_MEMBERS.has(name)) fence("Array");
+    else if (isObjectFence) fence("Object");
+    else fallback();
+    c.end();
+
+    c.localGet(k);
+    c.i32Const(DK.OBJ);
+    c.i32Eq();
+    c.ifVoid();
+    if (isObjectFence) {
+      c.localGet(0);
+      this.pushStrLitInto(c, name);
+      c.call(this.dyn.hasOwn());
+      c.ifVoid();
+      fallback();
+      c.end();
+      fence("Object");
+    } else {
+      fallback();
+    }
+    c.end();
+
+    c.localGet(k);
+    c.i32Const(DK.FUNC);
+    c.i32Eq();
+    c.ifVoid();
+    if (isFunctionFence) fence("Function");
+    else if (isObjectFence) fence("Object");
+    else fallback();
+    c.end();
+
+    // Everything else (UNDEF/NULL/BYTES/PROMISE/HANDLE): plain keyGet,
+    // which owns the nullish-receiver throw itself (unchanged).
+    fallback();
+
+    this.mb.setBody(idx, w.locals, c.bytes());
+    return idx;
+  }
+
+  /** jsOp getIdx/setIdx's index operand, as the raw string key keyGet/
+   * keySet want (both take `strRef`, never a dyn box — canonIdx runs
+   * INSIDE them for the ARR/BYTES arms). Every jsOp arg is jsval-typed
+   * (validate.ts), so the index is a full dyn box that may hold ANY
+   * kind at runtime — JS's `o[k]` ToPropertyKey's it. Stage A's bounded
+   * need is STR (used verbatim) and NUM (JS's ToString-of-number, which
+   * is exactly dyn.toStr()'s NUM arm); anything else falls through to
+   * dyn.toStr() too, which is spec-honest for the "ToPrimitive already
+   * ran" object/array/etc. cases dyn.toStr() itself renders — untested
+   * by any stage-A target program, flagged rather than silently trusted. */
+  private emitJsvalIndexKeyString(indexExpr: WExpr): void {
+    const code = this.fn.code;
+    const dynT = this.dyn.dynT();
+    const dynRef = this.dyn.dynRef();
+    const d = this.acquireScratch(dynRef);
+    this.walkExpr(indexExpr);
+    code.localSet(d);
+    code.localGet(d);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.STR);
+    code.i32Eq();
+    this.openIfResult(this.strRef);
+    code.localGet(d);
+    code.structGet(dynT, DYN_REF);
+    code.refCast(this.strType);
+    code.else_();
+    code.localGet(d);
+    code.call(this.dyn.toStr());
+    this.close();
+    this.releaseScratch(dynRef, d);
   }
 
   /** JS-exact switch: the discriminant evaluates once into a scratch; the

@@ -85,11 +85,27 @@
  * ordinary garbage. A null path renders as the root `$`, which is what
  * every scalar call site passes.
  *
- * WHAT IS NOT HERE. HANDLE and JSVAL values are unconstructible on this
- * tier (they enter only through libCalls the wasm backend refuses), so
- * the arms that would read their payloads are `unreachable` rather than
- * guesses. BYTES arrives with the typed-array work; until then its arms
- * say so.
+ * WHAT IS NOT HERE. HANDLE values are unconstructible on this tier (they
+ * enter only through libCalls the wasm backend refuses), so the arms
+ * that would read their payload are `unreachable` rather than guesses.
+ * BYTES arrives with the typed-array work; until then its arms say so.
+ *
+ * JSVAL — the payload TAG (DK.JSVAL), not the IR type — stays
+ * unconstructible here too, but by DESIGN rather than by gap (increment
+ * 21's static island). There is no embedded engine on wasm and never
+ * will be, so no dyn box is ever built with kind DK.JSVAL, and the arms
+ * above that would read one stay `unreachable` PERMANENTLY — this is
+ * not a future producer's TODO the way HANDLE/BYTES are. A `jsval`-
+ * TYPED IR value, though, is a REAL, ordinary dyn payload from birth:
+ * `mapType(jsval)` answers this SAME `(ref null $dyn)` mapType(dyn)
+ * does, `dynFromJsval` is identity, and every any-world value a program
+ * builds already carries the NUM/BOOL/STR/NULL/UNDEF/OBJ/ARR/FUNC tag
+ * any other dyn value would — never a wrapper kind. Dyn operations on a
+ * jsval-origin value therefore hit the ordinary arms above, not a
+ * DK.JSVAL one, which is exactly what Node does too (Node has no
+ * provenance distinction between "came from the engine" and "was always
+ * data" at all — jsval ≡ dyn is Node-exactness by construction, not an
+ * approximation of the native lane's engine-handle representation).
  *
  * THE ERROR ENCODING is an OBJ carrying the reserved "%error" key beside
  * name/message (and code where stamped), and `fromError` below is its

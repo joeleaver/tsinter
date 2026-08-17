@@ -275,12 +275,19 @@ export type IrType =
    * representation is a refcounted cell (ScrJsval) owning one embedded-
    * engine value. Same deliberate NARROWNESS as dyn (locals/globals/
    * params/args/returns only — never record/class fields, array elements,
-   * union arms, or capture boxes), but the OPPOSITE operational stance:
-   * where every operation on dyn is frontend-rejected, operations on
-   * jsval compile to engine calls (jsOp) with JS-exact semantics, and
-   * exits back to static types are validated (jsExit). Exists only when
-   * the frontend runs with the dynamic option; static builds never see
-   * this kind. */
+   * or union arms), but the OPPOSITE operational stance: where every
+   * operation on dyn is frontend-rejected, operations on jsval compile to
+   * engine calls (jsOp) with JS-exact semantics, and exits back to static
+   * types are validated (jsExit). Exists only when the frontend runs with
+   * the dynamic option; static builds never see this kind.
+   *
+   * CAPTURE BOXES ARE NOT excluded (correcting this comment's earlier
+   * claim): the frontend carries jsval captures deliberately
+   * (lowerer.ts:6602–6656 — "jsval captures are fine: the box is an
+   * obj-box carrying the island handle's own retain/release,
+   * untraced like every jsval container position"). A captured `any`
+   * local's capture entry keeps `type: origin.type` verbatim, i.e. a
+   * real jsval-typed capture slot, not a fenced shape. */
   | { kind: "jsval" }
   /** A catch binding — the type of `catch (e)`'s local, and NOTHING else
    * (never params, returns, fields, arms, elements, globals, captures).

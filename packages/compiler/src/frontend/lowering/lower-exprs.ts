@@ -515,6 +515,11 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
           if (value && name && (ts.isIdentifier(name) || ts.isStringLiteral(name))) {
             pushProp(name, value, prop, [argsWithout, argsWith]);
           } else {
+            // A COMPUTED key (`{[k]: v}`) fences here regardless of what
+            // `k` evaluates to at runtime — "__proto__" included, so the
+            // wasm backend's own literal-key "__proto__" refusal
+            // (emitter.ts's jsOp:objLit-proto-key, review round 3 R3)
+            // never needs to worry about this form reaching it at all.
             L.unsupported(
               "SC1090",
               prop,
