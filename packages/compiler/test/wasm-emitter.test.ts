@@ -540,6 +540,98 @@ test("S009: a composite `as` names the PATH it failed at", async () => {
   );
 });
 
+test("toString:caught — String(e) over every exception-cell kind", async () => {
+  // scr_caught_to_string ported (nodes.ts's "toString" node doc, the
+  // exception cell's own snapshot — NOT the `unknown`-crossing sibling in
+  // the "dyn: String(unknown)" test below, and not `e.toString()` on a
+  // statically-typed Error, which was already reachable through the SAME
+  // errToStrHelper via the "error.toString" libCall). Every text here is
+  // measured against Node directly (`try { throw x } catch (e) {
+  // console.log(String(e)) }`), not transcribed from the C runtime:
+  //   throw 42        -> "42"            throw 3.14 -> "3.14"
+  //   throw true/false -> "true"/"false"
+  //   throw "hello"   -> "hello"
+  //   throw new Error("msg") -> "Error: msg"
+  //   throw new Error("")   -> "Error"          (message-less: name alone)
+  //   throw new MyError("boom") (this.name = "MyError") -> "MyError: boom"
+  //   throw {a:1} / throw [1,2,3] / throw function(){} -> all "[object
+  //     Object]" in THIS runtime, where Node answers "[object Object]",
+  //     "1,2,3", and the function's own source respectively — the exception
+  //     cell type-erases every non-scalar, non-Error payload to one
+  //     untyped ref with no shape to walk (S021/S022's family of
+  //     representation-limit divergences for this same snapshot, ported
+  //     from the C runtime's scr_caught_to_string, whose REF arm takes the
+  //     identical fallthrough — shared with the LLVM/C lanes already).
+  const res = await buildWasm(
+    "caught-tostring.ts",
+    [
+      "class MyError extends Error {",
+      "  constructor(msg: string) {",
+      "    super(msg);",
+      "    this.name = 'MyError';",
+      "  }",
+      "}",
+      "try { throw 42; } catch (e) { console.log('f64-int', String(e)); }",
+      "try { throw 3.14; } catch (e) { console.log('f64-frac', String(e)); }",
+      "try { throw true; } catch (e) { console.log('bool-true', String(e)); }",
+      "try { throw false; } catch (e) { console.log('bool-false', String(e)); }",
+      "try { throw 'hello'; } catch (e) { console.log('str', String(e)); }",
+      "try { throw new Error('msg'); } catch (e) { console.log('err', String(e)); }",
+      "try { throw new Error(''); } catch (e) { console.log('err-empty', String(e)); }",
+      "try { throw new MyError('boom'); } catch (e) { console.log('custom', String(e)); }",
+      "try { throw { a: 1 }; } catch (e) { console.log('obj', String(e)); }",
+      "try { throw [1, 2, 3]; } catch (e) { console.log('arr', String(e)); }",
+      "try { throw function named() {}; } catch (e) { console.log('fn', String(e)); }",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "f64-int 42",
+      "f64-frac 3.14",
+      "bool-true true",
+      "bool-false false",
+      "str hello",
+      "err Error: msg",
+      "err-empty Error",
+      "custom MyError: boom",
+      "obj [object Object]",
+      "arr [object Object]",
+      "fn [object Object]",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("toString:caught — the F64 arm's edge payloads", async () => {
+  // The gate probe's unvaried axes: the F64 arm formats through
+  // f64ToStrHelper, which the pins above only exercised on finite
+  // positives. Non-finite payloads and the negative zero take String()'s
+  // rules, not inspect's — String(-0) is "0" where console.log(-0) prints
+  // "-0" (%w.inspF64's signed-zero read never runs here). Every expected
+  // text measured against Node directly (`try { throw x } catch (e) {
+  // console.log(String(e)) }`).
+  const res = await buildWasm(
+    "caught-tostring-edge.ts",
+    [
+      "try { throw NaN; } catch (e) { console.log('nan', String(e)); }",
+      "try { throw Infinity; } catch (e) { console.log('inf', String(e)); }",
+      "try { throw -Infinity; } catch (e) { console.log('ninf', String(e)); }",
+      "try { throw -0; } catch (e) { console.log('negzero', String(e)); }",
+      "try { throw ''; } catch (e) { console.log('empty', JSON.stringify(String(e))); }",
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    ["nan NaN", "inf Infinity", "ninf -Infinity", "negzero 0", 'empty ""', ""].join("\n"),
+  );
+});
+
 test("dyn: ToBoolean over every constructible kind", async () => {
   // The truthiness ladder (scr_dyn_truthy) reached the only way a source
   // can reach it — a JS-lane implicit-any binding in a condition, since

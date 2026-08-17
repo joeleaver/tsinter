@@ -1434,6 +1434,26 @@ const TIER_FLOOR: string[] = [
   "2554-generics-frontier-mix.ts",
   "2558-index-signature-func-values.ts",
   "2584-union-dyn-collapse.ts",
+  // Increment 21, toString:caught rider: String(e) / `${e}` over a catch
+  // binding now lowers (emitter.ts's "toString" case, the "caught" arm) —
+  // scalars format directly, an %Error-rooted OBJ payload renders through
+  // the SAME errToStrHelper `e.toString()` on a statically-typed Error
+  // already used ("error.toString" libCall), and everything else (a
+  // thrown array/closure/record/union, or a non-Error class) is the
+  // "[object Object]" default the exception cell's type-erasure forces —
+  // scr_caught_to_string ported, verified against Node directly (not
+  // transcribed from the C runtime; see the wasm-emitter.test.ts pin's
+  // comment for the measured table). 4 programs first-refused here and
+  // now claim, all byte-verified against Node: 1302 and 2095 hit it
+  // through an UNNARROWED `${e}` inside a `typeof e === "string"` guard
+  // (the caught local's own type stays "caught" regardless of a
+  // surrounding narrow; only field/member reads narrow), 1431 is the
+  // dedicated corpus pin for this construct, and 1434 hits it through a
+  // `.catch()` handler parameter (the same catch-binding desugar).
+  "1302-errors-typed-catch.ts",
+  "1431-caught-tostring.ts",
+  "1434-async-never.ts",
+  "2095-js-catch-unknown.js",
 ];
 
 interface RunResult {

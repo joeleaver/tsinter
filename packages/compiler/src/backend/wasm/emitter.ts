@@ -6583,7 +6583,90 @@ class Assembler {
           code.call(this.dyn.toStr());
           return;
         }
-        // Caught operands snapshot — waits on the exception protocol.
+        if (k === "caught") {
+          // String(e) over the exception snapshot — scr_caught_to_string
+          // ported. Scalars format directly (the SAME arms as f64/bool/
+          // string above, over the snapshot's fields instead of a live
+          // value); an OBJ payload inside %Error's interval renders
+          // through the identical helper `e.toString()` on a statically
+          // -typed Error uses (errToStrHelper — the "error.toString"
+          // libCall, scr_error_to_string ported once already, verified
+          // against Node's own bracketed NodeError texts, e.g. Buffer.from
+          // (123)'s "TypeError [ERR_INVALID_ARG_TYPE]: ..."). Everything
+          // else — a thrown array/closure/record/union, or a class outside
+          // the %Error hierarchy (EXC_REF, and non-Error EXC_OBJ) — is the
+          // Object.prototype.toString default "[object Object]": the cell
+          // type-erases those payloads to one untyped ref with no shape to
+          // walk, the same representation limit S021/S022 document for the
+          // `unknown`-crossing sibling of this same snapshot.
+          const exc = this.exc();
+          const c = this.acquireScratch(this.caughtRef());
+          this.walkExpr(e.operand);
+          code.localSet(c);
+          const kind = this.acquireScratch(I32);
+          code.localGet(c);
+          code.structGet(exc.caughtT, 0);
+          code.localSet(kind);
+          const kindIs = (tag: number): void => {
+            code.localGet(kind);
+            code.i32Const(tag);
+            code.i32Eq();
+          };
+          kindIs(EXC_F64);
+          this.openIfResult(this.strRef);
+          code.localGet(c);
+          code.structGet(exc.caughtT, 1);
+          code.call(this.f64ToStrHelper());
+          code.else_();
+          kindIs(EXC_BOOL);
+          this.openIfResult(this.strRef);
+          code.localGet(c);
+          code.structGet(exc.caughtT, 1);
+          code.f64Const(0);
+          code.f64Ne();
+          this.openIfResult(this.strRef);
+          this.pushStrLit("true");
+          code.else_();
+          this.pushStrLit("false");
+          this.close();
+          code.else_();
+          kindIs(EXC_STR);
+          this.openIfResult(this.strRef);
+          code.localGet(c);
+          code.structGet(exc.caughtT, 2);
+          code.refCast(this.strType);
+          code.else_();
+          // OBJ AND inside %Error's interval — everything else (including
+          // REF) falls to the default text. The interval read is only
+          // valid once kind is confirmed OBJ (the same gating caughtToDyn
+          // uses): a REF payload's field 3 is whatever an EARLIER OBJ
+          // throw left behind (tryCatch's snapshot always copies all four
+          // cell globals), never meaningful on its own.
+          code.localGet(kind);
+          code.i32Const(EXC_OBJ);
+          code.i32Eq();
+          this.openIfResult(I32);
+          code.localGet(c);
+          code.structGet(exc.caughtT, 3);
+          this.emitErrIntervalTest(code);
+          code.else_();
+          code.i32Const(0);
+          this.close();
+          this.openIfResult(this.strRef);
+          code.localGet(c);
+          code.structGet(exc.caughtT, 2);
+          code.refCast(exc.errT);
+          code.call(this.errToStrHelper());
+          code.else_();
+          this.pushStrLit("[object Object]");
+          this.close();
+          this.close();
+          this.close();
+          this.close();
+          this.releaseScratch(I32, kind);
+          this.releaseScratch(this.caughtRef(), c);
+          return;
+        }
         this.refuse(`toString:${k}`, e.loc);
         code.unreachable();
         return;

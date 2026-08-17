@@ -794,6 +794,26 @@ differentially on the native lanes (its mode 7 `throw { a: 1 }` prints
 only "truthy other", which both worlds agree on). No corpus program can
 pin the divergence itself.
 
+**Amendment (direct `String(e)`, increment 21 rider):** the same
+erasure surfaces one step earlier than the crossing this entry names —
+`String(e)` / `` `${e}` `` DIRECTLY on the catch binding, without any
+`unknown` in between. The exception snapshot's own toString
+(`scr_caught_to_string`, now ported to the wasm tier's "caught"
+toString arm) renders every type-erased payload as `"[object Object]"`:
+a thrown array (Node: `"1,2,3"` via Array.prototype.toString), a thrown
+function (Node: its source text), a thrown object carrying a custom
+`toString` (Node: its result), and any class instance outside the
+%Error hierarchy. Scalars and %Error-rooted payloads are exact (the
+Error arm renders through the same helper as `e.toString()` on a
+statically-typed Error, brackets included). Same representation limit,
+same rationale, shared by all three lanes. **Tested by:** the wasm
+emitter unit test's `toString:caught` pins (the arr/fn rows pin the
+divergent texts beside a comment giving Node's answers);
+`1431-caught-tostring.ts` pins the AGREEING arms differentially —
+its thrown plain object and non-Error class instance print
+`"[object Object]"` in Node too, so no corpus program pins the
+divergence itself.
+
 ## S023 — The dyn INVOKE surface fences unmodeled (kind, method) pairs at RUNTIME *(inherited)*
 
 `recv.m(...)` on a checked-dynamic receiver dispatches on the receiver's
