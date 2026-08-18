@@ -157,6 +157,40 @@ export class JsonBuilder {
     return this.depthG;
   }
 
+  /** PUBLIC: point the number-parsing machinery's own input global at a
+   * caller-supplied string, for reuse OUTSIDE a `JSON.parse` call —
+   * StringToNumber (emitter.ts's decimalWhole/decimalPrefix) borrows
+   * `sdc()`'s correctly-rounded Simple-Decimal-Conversion fallback this
+   * way rather than re-deriving arbitrary-precision decimal-to-binary
+   * conversion a second time (10^k for k in [0,22] is exactly
+   * representable, so — same Clinger argument as the fast path above —
+   * ONE division is the only rounding step, and IEEE gives it correctly
+   * rounded; past that, or past 15 significant digits, `sdc`'s
+   * arbitrary-precision path is exact by construction).
+   *
+   * NARROWED (review round 2, rider R-a — the prior wording here, "no
+   * suspension point crosses a JSON.parse/sdc call on this tier," is no
+   * longer the true reason this is safe): `src`/`pos`/`depth` have NO
+   * save/restore, so what actually protects them is that `JSON.parse`
+   * itself calls no user code while they are live — the reviver
+   * argument, the one thing that could reenter mid-parse, is
+   * FRONTEND-fenced (lower-builtins.ts, "JSON.parse with a reviver") and
+   * never reaches this backend. `JSON.stringify`'s `toJSON` callback DOES
+   * call arbitrary user code now (review round 2, N1), which is why
+   * `putDyn` carries its own save/restore for jbBuf/seen/seenLen/
+   * jbDepth/circHit — but toJSON never touches `src`/`pos`/`depth`, so
+   * that reentrancy never reaches this bridge. THE DAY a reviver is
+   * implemented and allowed to run user code mid-parse, this bridge
+   * becomes UNSOUND: a reviver calling back into `JSON.parse`,
+   * `Number(str)`, or `parseFloat` would clobber the outer parse's
+   * position with no way to recover it. Whoever lands revivers must add
+   * save/restore for `src`/`pos`/`depth` here too, the same shape
+   * `putDyn` already has. */
+  setSrcForNumberParse(c: Code, pushStr: (c: Code) => void): void {
+    pushStr(c);
+    c.globalSet(this.src());
+  }
+
   /** The input's length, as an i32. */
   private pushLen(c: Code): void {
     c.globalGet(this.src());
@@ -2552,16 +2586,32 @@ export class JsonBuilder {
    * through these; `jbFinish` copies the filled prefix into an
    * exact-length string and hands it back.
    *
-   * NON-REENTRANCY is the same argument the parser makes, and it has to
-   * hold for the globals to be sound: no user code can run mid-walk. A
-   * `toJSON` method and a replacer function are the two things that
-   * could, and both are FRONTEND-fenced (lower-builtins.ts) — they never
-   * reach any backend. A closure sitting in a serialized composite is
-   * dropped UNCALLED. The one nesting that does occur —
-   * `JSON.stringify({ a: JSON.stringify(b) })` — is not reentrancy: the
-   * inner call finishes (and so resets the buffer) while evaluating the
-   * ARGUMENT, strictly before the outer call's prologue zeroes the
-   * length.
+   * NON-REENTRANCY is the same argument the parser makes, and it HELD
+   * for the globals to be sound as long as no user code could run
+   * mid-walk. That is STILL true of the type-directed serializers this
+   * section's own globals were built for: a `toJSON` method and a
+   * replacer function are the two things that could reenter, and for a
+   * STATIC record (a compile-time-known shape, never an arbitrary
+   * method) both stay FRONTEND-fenced (lower-builtins.ts) — they never
+   * reach any backend, and a closure sitting in a serialized composite
+   * is dropped UNCALLED, unconditionally.
+   *
+   * `putDyn` (below) is DIFFERENT and reuses these SAME globals anyway:
+   * a `dyn`/island OBJECT can genuinely carry an own, callable `toJSON`
+   * (review round 1, SB8/SB9), and calling it is calling ARBITRARY user
+   * code, which CAN reenter `JSON.stringify` — Node has no shared state
+   * for this to corrupt (each call owns its own local state); this tier
+   * does, so `putDyn`'s own toJSON dispatch explicitly SAVES this
+   * buffer's text (`jbFinish`, which snapshots-and-resets in one call)
+   * before the callback runs and REPLAYS it (`jbPuts`) after — see that
+   * method's own header for the full save/restore (buffer text, the
+   * seen-stack, depth, and the circular-hit flag). The one nesting that
+   * still needs NO special handling — `JSON.stringify({ a:
+   * JSON.stringify(b) })` — remains not-reentrancy for the reason it
+   * always was: the inner call finishes (and so resets the buffer)
+   * while evaluating the ARGUMENT, strictly before the outer call's
+   * prologue zeroes the length. Only a callback invoked FROM WITHIN an
+   * in-progress walk (`toJSON`) is the new, real reentrancy case.
    *
    * The buffer SURVIVES finish (a stringify loop then allocates once
    * rather than doubling its way up every round), which is C's size-hint
@@ -3743,6 +3793,47 @@ export class JsonBuilder {
    * `jbEnter` too, so both walkers share one counter. */
 
   private jbDepthG: number | null = null;
+  private jbToJsonKeyG: number | null = null;
+  private jbSkipToJsonG: number | null = null;
+
+  /** `putDyn`'s CALL-CHANNEL for the two values a real extra parameter
+   * would carry (review round 1, SB8/SB9) — a GLOBAL rather than a
+   * signature change, to avoid renumbering `putDyn`'s ~15 existing
+   * locals: the caller sets both immediately before `call`ing `putDyn`,
+   * and `putDyn` consumes them IMMEDIATELY at entry, before any nested
+   * call could overwrite them for an outer, still-pending frame — sound
+   * because wasm execution is single-threaded and nothing suspends
+   * mid-walk (this file's own NON-REENTRANCY argument, extended one
+   * step: a global is safe to use as a parameter EXACTLY when it is
+   * read-before-any-recursion, the same discipline `pos`/`src` already
+   * lean on for the parser side). `jbToJsonKey` is the property name /
+   * array index (as a string) / `""` at the root — SerializeJSONProperty's
+   * own `key` argument to a found `toJSON`. `jbSkipToJson` is 1 for
+   * EXACTLY one call shape: re-entering `putDyn` on a toJSON CALL's own
+   * RESULT — the spec runs SerializeJSONProperty's toJSON step ONCE per
+   * property (oracle-measured: `{toJSON:()=>({toJSON:()=>99})}`
+   * stringifies as `{}`, NOT `99` — the result's OWN "toJSON" member is
+   * just a dropped function property, never re-invoked); every OTHER
+   * call (children reached through the normal member/element walk) sets
+   * it 0, since those ARE fresh SerializeJSONProperty invocations.
+   * PUBLIC: the emitter's own hybrid-record overflow-map walker (a
+   * STATIC-record JSON writer whose `dyn`-typed index-signature values
+   * fall through to `putDyn`) sets both directly, the same way it
+   * already calls other json.ts globals/helpers by index. */
+  jbToJsonKey(): number {
+    this.jbToJsonKeyG ??= this.mb.addGlobal(this.deps.strRef(), true, (w) => {
+      w.u8(0xd0);
+      w.sleb(this.deps.strType());
+    });
+    return this.jbToJsonKeyG;
+  }
+  jbSkipToJson(): number {
+    this.jbSkipToJsonG ??= this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41);
+      w.sleb(0);
+    });
+    return this.jbSkipToJsonG;
+  }
 
   /** The stringify walker's recursion depth. Deliberately NOT the
    * parser's global: the two never run at once, but one counter serving
@@ -3811,6 +3902,23 @@ export class JsonBuilder {
       const OP = 11; // the OBJ payload — the seen stack's identity
       const AB = 12; // BYTES: the aliased $bytes ref (S014's amendment)
       const BUF = 13; // BYTES: the isBuffer flag read out of the payload
+      const TJ = 14; // OBJ: the own "toJSON" member, if any
+      const AV = 15; // OBJ: the toJSON call's args vector (one element: the key, SB8)
+      const TR = 16; // OBJ: the toJSON call's result, re-serialized via `idx`
+      // Reentrancy save/restore around the toJSON CALL (review round 1
+      // ruling): a toJSON that itself calls JSON.stringify shares this
+      // walker's own globals — the buffer TEXT, the cycle-detection
+      // stack, the recursion depth, and the circular-hit flag — with
+      // the OUTER, still-in-progress walk. Oracle-measured (Node has no
+      // such sharing — each JSON.stringify call owns its own local
+      // state): `JSON.stringify({a:{toJSON:k=>JSON.stringify({inner:k})},
+      // b:{toJSON:k=>\`k2=\${k}\`}})` → both members print correctly,
+      // independently, with the outer object's own punctuation intact.
+      const SAVEDBUF = 17; // the outer walk's progress so far, as text
+      const SAVEDSEEN = 18; // the outer walk's OWN seen-stack array (swapped out, not copied — jbEnter allocates fresh on a null array)
+      const SAVEDSEENLEN = 19;
+      const SAVEDDEPTH = 20;
+      const SAVEDCIRC = 21;
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
@@ -3900,6 +4008,13 @@ export class JsonBuilder {
         // `index N` line.
         c.localGet(I);
         c.call(this.jbEdgeIdx());
+        // SB8: the element's key is its INDEX, as a string.
+        c.localGet(I);
+        c.f64ConvertI32U();
+        c.call(this.deps.f64ToStr());
+        c.globalSet(this.jbToJsonKey());
+        c.i32Const(0);
+        c.globalSet(this.jbSkipToJson());
         dyn.arrAt(c, (x) => x.localGet(V), (x) => x.localGet(I));
         c.call(idx);
         c.localSet(PRESENT);
@@ -3933,6 +4048,128 @@ export class JsonBuilder {
       });
 
       this.emitKindArm(c, K, [DK.OBJ], () => {
+        // `toJSON`: SerializeJSONProperty's OWN first step is `Get(value,
+        // "toJSON")` — if it is callable, Node calls it (with the REAL
+        // key, review round 1 SB8: the property name / array index-as-
+        // string / `""` at the root, threaded via the `jbToJsonKey`
+        // global-channel every caller below sets) and REASSIGNS `value`
+        // to the RESULT — critically, BEFORE SerializeJSONObject's own
+        // cycle-stack push, which therefore only ever sees the
+        // POST-substitution value (review round 2, N1 continued —
+        // reviewer's sbJ7, three-lane-measured: `o.toJSON=()=>({wrap:o})`
+        // is Node's RangeError "Maximum call stack size exceeded", matched
+        // by the reference C lane too — GENUINE unbounded recursion, not
+        // a cycle, because EVERY toJSON call mints a FRESH wrapper object
+        // that never equals a prior one; `o` ITSELF never reaches the
+        // stack, only its ever-distinct wrapper results do). This is why
+        // `jbEnter` (below, the stack push) runs AFTER this whole check,
+        // on whichever value ends up serialized — putting it BEFORE (this
+        // arm's original order) pushed the PRE-toJSON `v` and left it on
+        // the stack for the ENTIRE toJSON+recursion, so a real cycle back
+        // through the wrapper chain to `v` itself falsely tripped circular
+        // detection instead of genuinely recursing into S026's depth cap.
+        // Newly REACHABLE (increment 21 gate 4 finding): jsMarshal's now-
+        // working func arm is the first thing able to build an object
+        // literal with an own FUNC-valued "toJSON" property at all —
+        // before that fix this shape could never compile, so the gap
+        // was unreachable and untested. `keyGet` cannot throw on this
+        // receiver (K is already OBJ, never nullish), so no pending
+        // check follows it, matching this file's own established
+        // reasoning for a receiver a preceding kind test already
+        // proved safe. The call binds `this` via the SAME thisPush/
+        // thisPop bracket a program-defined method call already uses
+        // (dyn.invoke's OBJ arm). SB9: `jbSkipToJson` gates the WHOLE
+        // check — 0 for a fresh SerializeJSONProperty invocation
+        // (every caller below except the one immediately following),
+        // 1 for the recursive call on THIS toJSON's own RESULT, which
+        // must NOT be re-checked for its own "toJSON" (oracle-measured:
+        // `{toJSON:()=>({toJSON:()=>99})}` stringifies `{}`, not `99` —
+        // the spec runs SerializeJSONProperty's toJSON step exactly
+        // once per property, then serializes the result STRUCTURALLY
+        // only). A result that is itself an object still walks its OWN
+        // members through the ordinary loop below, and THOSE recurse
+        // with skip=0 — a CHILD is always a fresh property, so its own
+        // toJSON (if any) still fires (oracle-measured:
+        // `{toJSON:()=>({x:{toJSON:()=>7}})}` → `{"x":7}`).
+        c.globalGet(this.jbSkipToJson());
+        c.i32Eqz();
+        c.ifVoid();
+        {
+          c.localGet(0);
+          this.deps.lit(c, "toJSON");
+          c.i32Const(0); // opt=false
+          c.call(dyn.keyGet());
+          c.localSet(TJ);
+          c.localGet(TJ);
+          c.structGet(dynT, DYN_KIND);
+          c.i32Const(DK.FUNC);
+          c.i32Eq();
+          c.ifVoid();
+          // SAVE: the outer walk's own progress, before handing control
+          // to arbitrary user code that may reenter this SAME machinery.
+          c.call(this.jbFinish()); // snapshots the text AND resets jbLen to 0
+          c.localSet(SAVEDBUF);
+          c.globalGet(this.seen());
+          c.localSet(SAVEDSEEN);
+          c.refNull(this.seenArr()); // isolate: the reentrant call gets a FRESH stack (jbEnter allocates on null), never touching the outer's frames
+          c.globalSet(this.seen());
+          c.globalGet(this.seenLen());
+          c.localSet(SAVEDSEENLEN);
+          c.globalGet(this.jbDepth());
+          c.localSet(SAVEDDEPTH);
+          c.globalGet(this.circHit());
+          c.localSet(SAVEDCIRC);
+          c.localGet(0);
+          c.call(dyn.thisPush());
+          c.localGet(TJ);
+          dyn.pushNewArr(c);
+          c.localSet(AV);
+          c.localGet(AV);
+          dyn.boxStr(c, (x) => x.globalGet(this.jbToJsonKey()));
+          c.call(dyn.arrPush());
+          c.localGet(AV);
+          this.deps.lit(c, "value");
+          c.call(dyn.callFn());
+          c.localSet(TR);
+          c.call(dyn.thisPop());
+          // RESTORE: unconditionally — on the throw path the outer walk
+          // is about to unwind anyway (nothing further reads this
+          // state), and on the success path this is EXACTLY what makes
+          // the container write that continues below pick up where it
+          // left off, byte for byte and cycle-detection-frame for frame
+          // (frame-for-frame is now LITERALLY true again: `v` itself was
+          // NEVER pushed in this branch, so there is nothing of THIS
+          // call's own to have leaked in the first place — N1's earlier
+          // "add jbLeave here" patch is GONE, not merely redundant: with
+          // jbEnter relocated below, this branch has no frame to leave).
+          c.localGet(SAVEDBUF);
+          c.call(this.jbPuts());
+          c.localGet(SAVEDSEEN);
+          c.globalSet(this.seen());
+          c.localGet(SAVEDSEENLEN);
+          c.globalSet(this.seenLen());
+          c.localGet(SAVEDDEPTH);
+          c.globalSet(this.jbDepth());
+          c.localGet(SAVEDCIRC);
+          c.globalSet(this.circHit());
+          c.globalGet(this.deps.excKind());
+          c.ifVoid();
+          c.i32Const(0);
+          c.return_();
+          c.end();
+          c.i32Const(1);
+          c.globalSet(this.jbSkipToJson());
+          c.localGet(TR);
+          c.call(idx);
+          c.return_();
+          c.end();
+        }
+        c.end();
+        // Reached with skip=1 (this `v` IS already a post-toJSON value —
+        // the recursive call just above) or skip=0 with no callable
+        // toJSON found (the ordinary case) — either way, `v` (param 0)
+        // is EXACTLY what SerializeJSONObject's own stack push and depth
+        // increment (jbEnter) must key on now.
         dyn.objPayload(c, (x) => x.localGet(0));
         c.localSet(OP);
         c.localGet(OP);
@@ -4001,6 +4238,13 @@ export class JsonBuilder {
         c.structGet(dynT, DYN_REF);
         c.refCast(strT);
         c.call(this.jbEdgeProp());
+        // SB8: the member's key is its OWN name.
+        dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(0));
+        c.structGet(dynT, DYN_REF);
+        c.refCast(strT);
+        c.globalSet(this.jbToJsonKey());
+        c.i32Const(0);
+        c.globalSet(this.jbSkipToJson());
         dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(1));
         c.call(idx);
         c.drop(); // present: the kind test above already established it
@@ -4130,6 +4374,14 @@ export class JsonBuilder {
           dyn.objRef(),
           this.deps.bytesRefU8(),
           I32,
+          dyn.dynRef(),
+          dyn.arrRef(),
+          dyn.dynRef(),
+          this.deps.strRef(),
+          { kind: "ref", nullable: true, typeIndex: this.seenArr() },
+          I32,
+          I32,
+          I32,
         ],
         c.bytes(),
       );
@@ -4164,6 +4416,13 @@ export class JsonBuilder {
       const c = new Code();
       const PRESENT = 1;
       c.call(this.jbBegin()); // buffer, seen stack and depth all reset here
+      // SB8: the ROOT's own key is "" (oracle-measured — SerializeJSONProperty's
+      // top-level call passes the empty string, wrapping the root value
+      // in a synthetic `{"": value}` holder).
+      this.deps.lit(c, "");
+      c.globalSet(this.jbToJsonKey());
+      c.i32Const(0);
+      c.globalSet(this.jbSkipToJson());
       c.localGet(0);
       c.call(this.putDyn());
       c.localSet(PRESENT);
@@ -4209,6 +4468,10 @@ export class JsonBuilder {
       const c = new Code();
       const PRESENT = 1;
       c.call(this.jbBegin());
+      this.deps.lit(c, ""); // SB8: root key, same as stringifyDyn's own entry
+      c.globalSet(this.jbToJsonKey());
+      c.i32Const(0);
+      c.globalSet(this.jbSkipToJson());
       c.localGet(0);
       c.call(this.putDyn());
       c.localSet(PRESENT);

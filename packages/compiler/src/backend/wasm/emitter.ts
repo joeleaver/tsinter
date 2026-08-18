@@ -405,6 +405,471 @@ const ERR_CODE = 3;
  * than passing through whatever bits our own fold computation produced. */
 const CANONICAL_NAN: number = new Float64Array(new BigUint64Array([0x7ff8000000000000n]).buffer)[0]!;
 
+/* ── increment 21 stage B, gate 3: the Function-eval recognizer ──────────
+ * (design note: scratchpad/function-helper-decision.md, Option A —
+ * approved). `construct(globalGet("Function"), ...strLit-marshals)` is
+ * the compiler's OWN synthesis (lower-island.ts's destructuring helpers
+ * and trap-fn producer) for a CLOSED, fully-derivable grammar — every
+ * leaf is a fixed keyword, a JSON.stringify-quoted string, or a digit-
+ * indexed `__N`/`__dN` identifier. Since every arg here is a compile-
+ * time strLit constant (never a runtime value), this parser is ORDINARY
+ * TypeScript string parsing over the IR's own literal text — no wasm
+ * bytecode, no runtime cost, and it runs ONCE per call site at emission
+ * time. A string that does not match this EXACT grammar refuses named,
+ * loudly — this recognizer NEVER attempts to interpret arbitrary
+ * `new Function(...)` source (a user's own dynamic eval, which the
+ * frontend never routes through these two synthesis sites at all, so
+ * this parser structurally never encounters non-compiler-generated
+ * text). PARSE SUCCESS ≠ SEMANTIC SUPPORT: a plan node type this file's
+ * emitter does not yet implement still refuses named, distinctly from a
+ * parse failure — see emitFnEvalPlan's own per-kind coverage. */
+
+type FnEvalValue =
+  | { kind: "num"; value: number }
+  | { kind: "str"; value: string }
+  | { kind: "bool"; value: boolean }
+  | { kind: "null" }
+  | { kind: "undefined" }
+  | { kind: "arrayLit"; items: (FnEvalValue | null)[] }
+  | { kind: "objectLit"; props: { key: string; value: FnEvalValue }[] }
+  | { kind: "temp"; n: number }
+  | { kind: "extra"; n: number }
+  | { kind: "call"; callee: FnEvalValue; args: FnEvalValue[] };
+
+type FnEvalSub = { kind: "temp"; n: number } | { kind: "nested"; pattern: FnEvalPattern };
+
+type FnEvalKey = { kind: "lit"; value: string } | { kind: "extra"; n: number } | { kind: "call"; callee: FnEvalValue; args: FnEvalValue[] };
+
+type FnEvalElem = { rest: boolean; sub: FnEvalSub; default: FnEvalValue | null };
+
+type FnEvalProp =
+  | { rest: false; key: FnEvalKey; sub: FnEvalSub; default: FnEvalValue | null }
+  | { rest: true; sub: FnEvalSub };
+
+type FnEvalPattern = { kind: "array"; elems: (FnEvalElem | null)[] } | { kind: "object"; props: FnEvalProp[] };
+
+type FnEvalPlan =
+  | { kind: "trap"; message: string }
+  | { kind: "pattern"; numExtras: number; numTemps: number; pattern: FnEvalPattern };
+
+/** The emitter's per-thunk scratch: `w` is the synthetic thunk's own
+ * walker (locals allocated via `wlocal` as the pattern walk discovers
+ * it needs them), `extraLocals`/`tempLocals` are the dyn-typed locals
+ * already holding each `__dN`/`__N` value, indexed by N. */
+interface FnEvalCtx {
+  w: WalkerCtx;
+  extraLocals: number[];
+  tempLocals: number[];
+}
+
+/** A tiny cursor-based recursive-descent parser over ONE synthesized
+ * body string. Every `parseX` either advances `pos` and returns a
+ * value, or returns `null` and leaves `pos` UNSPECIFIED (the caller
+ * always treats null as "the whole parse failed", never resumes). */
+class FnEvalBodyParser {
+  pos = 0;
+  binds: number[] = []; // just a count tracker; the "boundBefore" ordering rule doesn't need re-checking here (the frontend already enforced it when it built this text; the parser only needs to know which __N are IN RANGE at each point, and the closed grammar means the temp numbering is always 0..n-1 in first-bind order, which literal-matching the digits already verifies)
+  constructor(
+    private readonly s: string,
+    private readonly numExtras: number,
+  ) {}
+
+  private eof(): boolean {
+    return this.pos >= this.s.length;
+  }
+  private peek(): string {
+    return this.s[this.pos] ?? "";
+  }
+  private lit(text: string): boolean {
+    if (this.s.startsWith(text, this.pos)) {
+      this.pos += text.length;
+      return true;
+    }
+    return false;
+  }
+  /** `__N` — a temp reference already bound (N < the current bind
+   * count). Returns null on no match OR an out-of-range/malformed
+   * index — the grammar's own digit-only, no-leading-zero convention
+   * (`__0`, `__1`, ... `__10`) is exactly `\d+`, no ambiguity with a
+   * later multi-digit temp. */
+  private tryTemp(maxExclusive: number): number | null {
+    if (!this.s.startsWith("__", this.pos)) return null;
+    let i = this.pos + 2;
+    // `__d0` is a DIFFERENT token (an extra) — a temp never has a 'd'
+    // right after the double underscore.
+    if (this.s[i] === "d") return null;
+    const start = i;
+    while (i < this.s.length && this.s[i]! >= "0" && this.s[i]! <= "9") i++;
+    if (i === start) return null;
+    const n = Number(this.s.slice(start, i));
+    if (n >= maxExclusive) return null;
+    this.pos = i;
+    return n;
+  }
+  /** `__dN` — a compiled-scope extra, N < numExtras. */
+  private tryExtra(): number | null {
+    if (!this.s.startsWith("__d", this.pos)) return null;
+    const start = this.pos + 3;
+    let i = start;
+    while (i < this.s.length && this.s[i]! >= "0" && this.s[i]! <= "9") i++;
+    if (i === start) return null;
+    const n = Number(this.s.slice(start, i));
+    if (n >= this.numExtras) return null;
+    this.pos = i;
+    return n;
+  }
+  /** A JSON string literal at `pos` — `JSON.parse` over the LONGEST
+   * balanced `"..."` span found by scanning for the closing quote
+   * (respecting `\"` escapes), then re-serialize-checked so a decode
+   * that JSON permits but our own `JSON.stringify` would never PRODUCE
+   * (the grammar's own promise: every string leaf came from
+   * `JSON.stringify`) cannot silently pass. */
+  private tryJsonString(): string | null {
+    if (this.peek() !== '"') return null;
+    let i = this.pos + 1;
+    while (i < this.s.length) {
+      if (this.s[i] === "\\") {
+        i += 2;
+        continue;
+      }
+      if (this.s[i] === '"') break;
+      i++;
+    }
+    if (i >= this.s.length) return null;
+    const raw = this.s.slice(this.pos, i + 1);
+    let value: unknown;
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+    if (typeof value !== "string" || JSON.stringify(value) !== raw) return null;
+    this.pos = i + 1;
+    return value;
+  }
+  /** An unsigned integer literal (digits only, per `NumericLiteral.text`
+   * for the synthesized default forms — the grammar never emits a `+`
+   * sign, and a fraction like "3.14" is exactly `\d+\.\d+`, both
+   * covered by treating the WHOLE numeric run — digits and at most one
+   * '.' — as one Number() parse). */
+  private tryUnsignedNum(): number | null {
+    const start = this.pos;
+    let i = this.pos;
+    let sawDigit = false;
+    let sawDot = false;
+    while (i < this.s.length) {
+      const c = this.s[i]!;
+      if (c >= "0" && c <= "9") {
+        sawDigit = true;
+        i++;
+      } else if (c === "." && !sawDot) {
+        sawDot = true;
+        i++;
+      } else break;
+    }
+    if (!sawDigit) return null;
+    this.pos = i;
+    return Number(this.s.slice(start, i));
+  }
+
+  /** `Callable := Sub-shaped '__'N | '__d'N` — the callee of a computed-
+   * key or default CallText (exprText's own rule: the callee resolves
+   * through the SAME temp/extra grammar as any other identifier leaf,
+   * never a nested call or a literal). */
+  private parseCallableAsValue(): FnEvalValue | null {
+    const t = this.tryTemp(this.binds.length);
+    if (t !== null) return { kind: "temp", n: t };
+    const ex = this.tryExtra();
+    if (ex !== null) return { kind: "extra", n: ex };
+    return null;
+  }
+
+  /** `Default := NumLit | '-'NumLit | JSONString | 'true' | 'false' |
+   * 'null' | '(void 0)' | ArrayLit | ObjectLit | '__'N | '__d'N |
+   * CallText` — also KEY's grammar for a computed, non-foldable name
+   * (exprText serves both positions identically). */
+  private parseValue(): FnEvalValue | null {
+    if (this.lit("(void 0)")) return { kind: "undefined" };
+    if (this.lit("true")) return { kind: "bool", value: true };
+    if (this.lit("false")) return { kind: "bool", value: false };
+    if (this.lit("null")) return { kind: "null" };
+    if (this.peek() === "-") {
+      const save = this.pos;
+      this.pos++;
+      const n = this.tryUnsignedNum();
+      if (n !== null) return { kind: "num", value: -n };
+      this.pos = save;
+    }
+    {
+      const save = this.pos;
+      const n = this.tryUnsignedNum();
+      if (n !== null) return { kind: "num", value: n };
+      this.pos = save;
+    }
+    {
+      const save = this.pos;
+      const s = this.tryJsonString();
+      if (s !== null) return { kind: "str", value: s };
+      this.pos = save;
+    }
+    if (this.peek() === "[") return this.parseArrayLit();
+    if (this.peek() === "{") return this.parseObjectLit();
+    {
+      const save = this.pos;
+      const callee = this.parseCallableAsValue();
+      if (callee !== null) {
+        if (this.peek() === "(") {
+          this.pos++;
+          const args: FnEvalValue[] = [];
+          if (this.peek() !== ")") {
+            for (;;) {
+              const a = this.parseValue();
+              if (a === null) return null;
+              args.push(a);
+              if (this.lit(",")) continue;
+              break;
+            }
+          }
+          if (!this.lit(")")) return null;
+          return { kind: "call", callee, args };
+        }
+        return callee;
+      }
+      this.pos = save;
+    }
+    return null;
+  }
+
+  private parseArrayLit(): FnEvalValue | null {
+    if (!this.lit("[")) return null;
+    const items: (FnEvalValue | null)[] = [];
+    if (this.peek() !== "]") {
+      for (;;) {
+        if (this.peek() === "," || this.peek() === "]") {
+          items.push(null); // a hole (transportableDefaultText's own "" element)
+        } else {
+          const v = this.parseValue();
+          if (v === null) return null;
+          items.push(v);
+        }
+        if (this.lit(",")) continue;
+        break;
+      }
+    }
+    if (!this.lit("]")) return null;
+    return { kind: "arrayLit", items };
+  }
+
+  private parseObjectLit(): FnEvalValue | null {
+    if (!this.lit("{")) return null;
+    const props: { key: string; value: FnEvalValue }[] = [];
+    if (this.peek() !== "}") {
+      for (;;) {
+        if (!this.lit("[")) return null;
+        const key = this.tryJsonString();
+        if (key === null) return null;
+        if (!this.lit("]")) return null;
+        if (!this.lit(":")) return null;
+        const value = this.parseValue();
+        if (value === null) return null;
+        props.push({ key, value });
+        if (this.lit(",")) continue;
+        break;
+      }
+    }
+    if (!this.lit("}")) return null;
+    return { kind: "objectLit", props };
+  }
+
+  /** `Sub := '__'N | Pattern` — a bind target: either the NEXT fresh
+   * temp (assigns it, growing `binds`) or a nested pattern. The
+   * grammar's own invariant (enginePatternSpec's `binds.push`) is that
+   * a fresh `__N` at a Sub position is ALWAYS the next sequential
+   * index — checked here, not merely assumed, so a hand-edited or
+   * future-drifted synthesis that skips/reorders indices refuses
+   * instead of silently mis-binding. */
+  private parseSub(): FnEvalSub | null {
+    if (this.peek() === "[" || this.peek() === "{") {
+      const pattern = this.parsePattern();
+      if (pattern === null) return null;
+      return { kind: "nested", pattern };
+    }
+    const n = this.tryTemp(this.binds.length + 1);
+    if (n === null || n !== this.binds.length) return null;
+    this.binds.push(n);
+    return { kind: "temp", n };
+  }
+
+  private parseArrayPattern(): FnEvalPattern | null {
+    if (!this.lit("[")) return null;
+    const elems: (FnEvalElem | null)[] = [];
+    if (this.peek() !== "]") {
+      for (;;) {
+        if (this.peek() === "," || this.peek() === "]") {
+          elems.push(null); // a hole
+        } else if (this.lit("...")) {
+          const sub = this.parseSub();
+          if (sub === null) return null;
+          elems.push({ rest: true, sub, default: null });
+        } else {
+          const sub = this.parseSub();
+          if (sub === null) return null;
+          let def: FnEvalValue | null = null;
+          if (this.lit("=")) {
+            def = this.parseValue();
+            if (def === null) return null;
+          }
+          elems.push({ rest: false, sub, default: def });
+        }
+        if (this.lit(",")) continue;
+        break;
+      }
+    }
+    if (!this.lit("]")) return null;
+    return { kind: "array", elems };
+  }
+
+  private parseObjectPattern(): FnEvalPattern | null {
+    if (!this.lit("{")) return null;
+    const props: FnEvalProp[] = [];
+    if (this.peek() !== "}") {
+      for (;;) {
+        if (this.lit("...")) {
+          const sub = this.parseSub();
+          if (sub === null) return null;
+          props.push({ rest: true, sub });
+        } else {
+          let key: FnEvalKey;
+          if (this.lit("[")) {
+            const save = this.pos;
+            const litKey = this.tryJsonString();
+            if (litKey !== null && this.peek() === "]") {
+              key = { kind: "lit", value: litKey };
+            } else {
+              this.pos = save;
+              const ex = this.tryExtra();
+              if (ex !== null && this.peek() === "]") {
+                key = { kind: "extra", n: ex };
+              } else {
+                this.pos = save;
+                const callVal = this.parseValue();
+                if (callVal === null || callVal.kind !== "call") return null;
+                key = { kind: "call", callee: callVal.callee, args: callVal.args };
+              }
+            }
+            if (!this.lit("]")) return null;
+          } else return null;
+          // The CHAIN-pattern producer site (lowerJsvalDestructuringChain)
+          // spells this "]: __N" (a space after the colon); the DECL-
+          // pattern producer (enginePatternSpec's `build`) spells it
+          // "]:__N" (no space) — measured, both real (scratchpad/
+          // function-helper-decision.md §2). Try the more specific
+          // (space) form first so it isn't swallowed as part of `sub`.
+          if (!this.lit(": ") && !this.lit(":")) return null;
+          const sub = this.parseSub();
+          if (sub === null) return null;
+          let def: FnEvalValue | null = null;
+          if (this.lit("=")) {
+            def = this.parseValue();
+            if (def === null) return null;
+          }
+          props.push({ rest: false, key, sub, default: def });
+        }
+        if (this.lit(",")) continue;
+        break;
+      }
+    }
+    if (!this.lit("}")) return null;
+    return { kind: "object", props };
+  }
+
+  private parsePattern(): FnEvalPattern | null {
+    if (this.peek() === "[") return this.parseArrayPattern();
+    if (this.peek() === "{") return this.parseObjectPattern();
+    return null;
+  }
+
+  /** The whole body: `"use strict";` (`var __0,...;`)? `(<pattern> = v)
+   * ;return [<temps>];`. The declared `var` list and the final `return`
+   * list are BOTH re-derived from `binds` as the pattern parses (never
+   * trusted from the text) and compared against what's actually
+   * written, so a drifted synthesis (wrong temp order, a skipped
+   * index) refuses instead of silently mis-numbering. */
+  parseFull(): FnEvalPattern | null {
+    if (!this.lit('"use strict";')) return null;
+    const pattern = this.tryParseWithVarPrefix();
+    if (pattern === null) return null;
+    if (!this.lit(`;return [${this.binds.map((_, i) => `__${i}`).join(",")}];`)) return null;
+    if (!this.eof()) return null;
+    return pattern;
+  }
+
+  private tryParseWithVarPrefix(): FnEvalPattern | null {
+    // The `var` prefix appears IFF the pattern binds at least one temp.
+    // Its EXACT temp-list text can only be verified AFTER the pattern
+    // parses (bind count isn't known until then, but the var-list comes
+    // FIRST in the text) — so this skips past it speculatively (its own
+    // terminating ';' is unambiguous: nothing between "var " and it can
+    // itself contain a ';'), then compares the SAVED span verbatim
+    // against a reconstruction from the now-known `binds`.
+    const varStart = this.pos;
+    const hasVarKeyword = this.s.startsWith("var ", this.pos);
+    let varEnd = varStart;
+    if (hasVarKeyword) {
+      const semi = this.s.indexOf(";", this.pos);
+      if (semi < 0) return null;
+      varEnd = semi + 1;
+      this.pos = varEnd;
+    }
+    if (!this.lit("(")) return null;
+    const pattern = this.parsePattern();
+    if (pattern === null) return null;
+    if (!this.lit(" = v)")) return null;
+    // The ';' between '(<pattern> = v)' and 'return [...]' belongs to
+    // parseFull's own "`;return [...]`" check below — NOT consumed
+    // here, or it would be double-counted against that leading ';'.
+    if (hasVarKeyword !== this.binds.length > 0) return null;
+    if (hasVarKeyword) {
+      const expectedVarDecl = `var ${this.binds.map((_, i) => `__${i}`).join(",")};`;
+      if (this.s.slice(varStart, varEnd) !== expectedVarDecl) return null;
+    }
+    return pattern;
+  }
+}
+
+/** Recognizes ONE `construct(globalGet("Function"), ...)` call — see
+ * this section's own header. `paramTexts` are the compile-time strLit
+ * values of every arg AFTER the `globalGet("Function")` callee, in
+ * order (the last one is always the body; the rest are param names). */
+export function parseFnEvalConstruct(paramTexts: string[]): FnEvalPlan | null {
+  if (paramTexts.length === 0) return null;
+  const body = paramTexts[paramTexts.length - 1]!;
+  const paramNames = paramTexts.slice(0, -1);
+  if (paramNames.length === 0) {
+    // Trap form: islandTrapFnValue's `throw new TypeError(${JSON.stringify(message)})`.
+    const prefix = "throw new TypeError(";
+    if (!body.startsWith(prefix) || !body.endsWith(")")) return null;
+    const inner = body.slice(prefix.length, -1);
+    let message: unknown;
+    try {
+      message = JSON.parse(inner);
+    } catch {
+      return null;
+    }
+    if (typeof message !== "string" || JSON.stringify(message) !== inner) return null;
+    return { kind: "trap", message };
+  }
+  if (paramNames[0] !== "v") return null;
+  for (let i = 1; i < paramNames.length; i++) {
+    if (paramNames[i] !== `__d${i - 1}`) return null;
+  }
+  const numExtras = paramNames.length - 1;
+  const parser = new FnEvalBodyParser(body, numExtras);
+  const pattern = parser.parseFull();
+  if (pattern === null) return null;
+  return { kind: "pattern", numExtras, numTemps: parser.binds.length, pattern };
+}
+
 /** The three `dynInvoke` names whose real receiver is a PROMISE. They
  * refuse rather than dispatch: a promise box is constructible here, and
  * its reactions belong to the fiber machinery, not the dyn surface. */
@@ -2261,6 +2726,7 @@ class Assembler {
       bytesGet: () => this.bytesB.get("u8"),
       bytesSet: () => this.bytesB.setElem("u8"),
       bytesToStrUtf8: () => this.bytesB.toStrHelper("utf8"),
+      jsToNumber: () => this.jsToNumberHelper(),
     });
     return this.dynField;
   }
@@ -3161,6 +3627,11 @@ class Assembler {
             c.call(json.jbEdgeProp());
           }
           if (ovfIsDyn) {
+            // SB8: this overflow entry's own key, same one just written.
+            c.localGet(okey);
+            c.globalSet(json.jbToJsonKey());
+            c.i32Const(0);
+            c.globalSet(json.jbSkipToJson());
             c.localGet(oval);
             c.call(json.putDyn());
             c.drop();
@@ -4092,8 +4563,15 @@ class Assembler {
       c.globalGet(dyn.undefinedGlobal());
       c.end();
       c.localSet(ad);
-      if (p.kind === "dyn") {
-        // An `unknown` parameter takes the argument as it stands.
+      if (p.kind === "dyn" || p.kind === "jsval") {
+        // An `unknown`/`any` parameter takes the argument as it stands —
+        // jsval ≡ dyn (increment 21), and `isIslandCallbackParamType`
+        // explicitly admits a jsval-typed island callback PARAMETER
+        // (nodes.ts), reachable through THIS thunk when jsMarshal's
+        // func arm (gate 4) boxes such a closure — `dynCheckHelper` has
+        // no "jsval" case of its own (dyn's IS the identity conversion
+        // for both labels), so this arm must catch jsval here rather
+        // than falling through to a refusal.
         c.localGet(ad);
         c.localSet(slot);
         continue;
@@ -4129,7 +4607,12 @@ class Assembler {
     const r = this.wlocal(w, retVal);
     c.localSet(r);
     this.emitWalkerPending(c, dynRef);
-    if (t.ret.kind === "dyn") {
+    if (t.ret.kind === "dyn" || t.ret.kind === "jsval") {
+      // jsval ≡ dyn: `islandCallbackRet` admits a jsval-typed RETURN
+      // (the "jsval" tag) the same way as a `dyn` one — already the
+      // right wasm representation, nothing to convert. Without this arm
+      // a jsval return would fall to `dynFromHelper`, which has no
+      // "jsval" case either and would refuse.
       c.localGet(r);
       return true;
     }
@@ -4690,10 +5173,21 @@ class Assembler {
 
   private emitFieldSeed(c: Code, t: IrType): void {
     const code = c;
-    if (t.kind === "dyn") {
+    if (t.kind === "dyn" || t.kind === "jsval") {
       // Same reasoning as the undefined-armed union below, one layer
       // down: `undefined` is what JS reads from an unassigned field, and
-      // a null box would trap the first kind read to touch it.
+      // a null box would trap the first kind read to touch it. jsval ≡
+      // dyn (increment 21): a declared-but-unassigned `any` class field
+      // reads as the engine's own undefined on a fresh instance (Node's
+      // answer, and the native island's — scr_island.c seeds the SAME
+      // undefined cell) — this arm was previously MISSING (jsval fell
+      // through to the generic mapTypeSoft ref default, `ref.null`, a
+      // raw null the first read through it would trap on). Unreachable
+      // until stage B's coercion ops opened a real end-to-end path
+      // through a program with both an unassigned `any` field AND a
+      // consuming jsOp (1587-any-field-unassigned.ts: `String(h.x)`
+      // before `fill()` runs) — caught by an actual compile+run+diff
+      // against Node, not by tsc or a code read.
       code.globalGet(this.dyn.undefinedGlobal());
       return;
     }
@@ -6388,10 +6882,17 @@ class Assembler {
           this.releaseScratch(t, s);
           return;
         }
-        if (k === "dyn") {
+        if (k === "dyn" || k === "jsval") {
           // Same value semantics over the checked-dynamic tree, with the
           // runtime ToBoolean (scr_dyn_truthy) as the test: the deciding
           // operand IS the result, and the untaken side never runs.
+          // jsval ≡ dyn (increment 21): this arm was previously missing
+          // a jsval case (measured — 763-any-flow.ts's `zero || name`,
+          // `name && zero`, `zero && name` over `any`-typed operands all
+          // fell through to the bare `logical:jsval` refusal below).
+          // Structurally identical to the dyn arm — same dyn.truthy()
+          // test, same short-circuit shape — since a jsval operand IS a
+          // dyn box at runtime with no engine to ask separately.
           const t = this.dyn.dynRef();
           this.walkExpr(e.left);
           const s = this.acquireScratch(t);
@@ -10041,18 +10542,89 @@ class Assembler {
             code.call(h);
             return;
           }
+          case "bytes": {
+            // SEMANTICS.md S014's bytes exception (increment 18 stage C)
+            // extends to the island direction UNCHANGED, not re-derived:
+            // dynFromHelper's "bytes" arm (emitDynFromBody, the SAME
+            // walker record/array reuse above) already boxes the
+            // caller's `$bytes` struct ref directly — never a copy — and
+            // jsval ≡ dyn means marshaling a bytes<u8> value into the
+            // island is representationally the identical operation as
+            // marshaling one into `dyn`. This is NOT the "native lane's
+            // bytes marshal-IN is a COPY" case this file's own header
+            // comment used to warn about (stage-A prose, now corrected):
+            // that was a warning against transcribing the LLVM
+            // reference's copy behavior here, which would have
+            // CONTRADICTED S014's own registered per-lane split (wasm
+            // aliases bytes, matching Node; native copies, an accepted
+            // divergence). Measured directly (oracle probe,
+            // scratchpad/oracle/bytes-alias.mjs): Node's `any`/`unknown`
+            // erase to the SAME reference, so `f(x){x[0]=99}` on a value
+            // that later crosses into `any` is observed through every
+            // view — exactly S014's existing bytes measurement, and the
+            // island boundary is not a distinct boundary in Node at all
+            // (no corpus program can pin the alias-vs-copy choice here,
+            // same S014 argument: doing so would already fail on native).
+            const h = this.dynFromHelper(vt, e.loc);
+            if (h === null) {
+              code.unreachable();
+              return;
+            }
+            this.walkExpr(e.value);
+            code.call(h);
+            return;
+          }
+          case "func": {
+            // The host-closure wrap (increment 21 gate 4): a STATICALLY
+            // typed closure crossing INTO the island as a real callable
+            // dyn FUNC value — validate.ts only admits this shape when
+            // canMarshalTypedFuncIntoIsland(vt) holds (arity within the
+            // host-call buffer, every param/return classifies). Reuses
+            // `dynFnBox` UNCHANGED — the SAME per-signature box/thunk
+            // pair the checked-dynamic `unknown` boundary already builds
+            // (dynFromHelper's own "func" arm, right below the jsMarshal
+            // switch): boxed ANONYMOUSLY, matching that walker's own
+            // reasoning verbatim (jsMarshal's IR node carries no name
+            // field — the NAMED spelling belongs to the "dynFrom"
+            // EXPRESSION specifically, which has `fnName` at hand; this
+            // is a different node). The island-REST ABI form (a trailing
+            // `(...args) => ...` collecting surplus arguments as one
+            // jsval array — canMarshalTypedFuncIntoIsland's OWN
+            // `t.rest === true` branch) is NOT yet covered by
+            // `dynFnThunk`'s fixed-arity parameter loop; that shape
+            // refuses below rather than silently mis-binding the rest
+            // slot as an ordinary per-argument-converted parameter —
+            // under the SAME stable "expr:jsMarshal" aggregate bucket
+            // every other unimplemented jsMarshal shape uses (the
+            // census-currency rule this case's own `default` arm states
+            // two paragraphs down; a fragmented per-shape name here was
+            // this file's own mistake, not a deliberate exception like
+            // dynFrom's).
+            if (vt.rest === true) {
+              this.refuse(`expr:${e.kind}`, e.loc);
+              code.unreachable();
+              return;
+            }
+            const box = this.dynFnBox(vt, e.loc);
+            if (box === null) {
+              code.unreachable();
+              return;
+            }
+            this.walkExpr(e.value);
+            code.refNull(this.strType);
+            code.call(box);
+            return;
+          }
           default:
-            // union/promise/bytes/func/object: legal jsMarshal sources
-            // per canMarshalIntoIsland/validate.ts, but NOT exercised by
-            // any stage-A target program (op census: zero
-            // jsMarshal:in:<kind> hits across the 64 for these) — each
-            // needs its own semantics audit before landing (promise is
-            // the bridge, not a copy; the native lane's bytes marshal-IN
-            // is a COPY, not dynFromHelper's bytes ALIAS; func is the
-            // host-closure wrap). Unlike dynFrom (whose per-shape names
-            // are the established convention for THAT node), jsMarshal
-            // keeps the stable "expr:jsMarshal" aggregate bucket here —
-            // the census-currency rule.
+            // union/promise/object: legal jsMarshal sources per
+            // canMarshalIntoIsland/validate.ts, but NOT exercised by any
+            // stage-A target program (op census: zero jsMarshal:in:<kind>
+            // hits across the 64 for these) — each needs its own
+            // semantics audit before landing (promise is the bridge, not
+            // a copy). Unlike dynFrom (whose per-shape names are the
+            // established convention for THAT node), jsMarshal keeps the
+            // stable "expr:jsMarshal" aggregate bucket here — the
+            // census-currency rule.
             this.refuse(`expr:${e.kind}`, e.loc);
             code.unreachable();
             return;
@@ -10120,24 +10692,8 @@ class Assembler {
             // undefined for jsval any more than it does for a tabled
             // method name (this case's own header comment already makes
             // that argument for the tables; it applies identically here).
-            const needsProtoFence =
-              NUM_PROTO_METHOD_ARITY.has(name) ||
-              OBJECT_PROTO_MEMBERS.has(name) ||
-              ARRAY_PROTO_MEMBERS.has(name) ||
-              STRING_PROTO_MEMBERS.has(name) ||
-              BOOLEAN_PROTO_MEMBERS.has(name) ||
-              FUNCTION_PROTO_MEMBERS.has(name) ||
-              name === "__proto__" ||
-              name === "caller" ||
-              name === "arguments";
             this.walkExpr(e.args[0]!);
-            if (needsProtoFence) {
-              code.call(this.protoFenceGetPropHelper(name));
-            } else {
-              this.pushStrLit(name);
-              code.i32Const(0);
-              code.call(this.dyn.keyGet());
-            }
+            this.emitDynGetProp(code, name);
             this.emitPendingCheck();
             return;
           }
@@ -10253,22 +10809,661 @@ class Assembler {
           case "nullLit":
             code.globalGet(this.dyn.nullGlobal());
             return;
-          // Everything below is UNIMPLEMENTED in stage A (coercion ops,
-          // the call family, globalGet, the literal-adjacent ops that
-          // need engine dispatch) — every arm shares the SAME refusal
-          // kind the blanket case used, "expr:jsOp": census bucket names
-          // are currency, and the aggregate "how much jsOp work is left"
-          // count must stay meaningful across increments regardless of
-          // which specific op a program happens to hit first.
-          case "add": case "sub": case "mul": case "div": case "mod": case "pow":
-          case "neg": case "plus":
-          case "lt": case "le": case "gt": case "ge": case "eq": case "neq":
+          // Increment 21 stage B: the coercion ops, over jsval ≡ dyn
+          // payloads, JS-exact (ToPrimitive/ToNumber/ToString via
+          // jsToNumber/dyn.toStr, never engine hooks — this closed
+          // island world has none, so the "default"/"number" ToPrimitive
+          // hints land the SAME place, see jsToNumber's own header).
+          // None of these can throw in this backend's static semantics
+          // (no valueOf/toString hook exists to run user code, and
+          // strToNum's own grammar failures are NaN, not exceptions) —
+          // the sole exception is `pow`'s deliberate internal fence
+          // (jsPowHelper's header), which DOES need the pending-check
+          // protocol. Every op still seeds may-throw in the IR contract
+          // (nodes.ts:4864) for uniformity with the native/engine lanes;
+          // this static implementation is STRONGER (§8's "objLit cannot
+          // run engine getters" precedent, same shape here).
+          case "add": {
+            this.walkExpr(e.args[0]!);
+            const a = this.acquireScratch(this.dyn.dynRef());
+            code.localSet(a);
+            this.walkExpr(e.args[1]!);
+            const b = this.acquireScratch(this.dyn.dynRef());
+            code.localSet(b);
+            code.localGet(a);
+            code.call(this.jsIsStrLikeHelper());
+            code.localGet(b);
+            code.call(this.jsIsStrLikeHelper());
+            code.i32Or();
+            code.ifResult(this.dyn.dynRef());
+            this.dyn.boxStr(code, (c) => {
+              c.localGet(a);
+              c.call(this.dyn.toStr());
+              c.localGet(b);
+              c.call(this.dyn.toStr());
+              c.call(this.concatHelper());
+            });
+            code.else_();
+            this.dyn.boxNum(code, (c) => {
+              c.localGet(a);
+              c.call(this.jsToNumberHelper());
+              c.localGet(b);
+              c.call(this.jsToNumberHelper());
+              c.f64Add();
+            });
+            code.end();
+            this.releaseScratch(this.dyn.dynRef(), a);
+            this.releaseScratch(this.dyn.dynRef(), b);
+            return;
+          }
+          case "sub": case "mul": case "div": case "mod": {
+            this.walkExpr(e.args[0]!);
+            const a = this.acquireScratch(this.dyn.dynRef());
+            code.localSet(a);
+            this.walkExpr(e.args[1]!);
+            const b = this.acquireScratch(this.dyn.dynRef());
+            code.localSet(b);
+            this.dyn.boxNum(code, (c) => {
+              c.localGet(a);
+              c.call(this.jsToNumberHelper());
+              c.localGet(b);
+              c.call(this.jsToNumberHelper());
+              if (op === "sub") c.f64Sub();
+              else if (op === "mul") c.f64Mul();
+              else if (op === "div") c.f64Div();
+              else c.call(this.fmodHelper()); // JS % is C fmod, ported already
+            });
+            this.releaseScratch(this.dyn.dynRef(), a);
+            this.releaseScratch(this.dyn.dynRef(), b);
+            return;
+          }
+          case "pow": {
+            this.walkExpr(e.args[0]!);
+            const a = this.acquireScratch(this.dyn.dynRef());
+            code.localSet(a);
+            this.walkExpr(e.args[1]!);
+            const b = this.acquireScratch(this.dyn.dynRef());
+            code.localSet(b);
+            this.dyn.boxNum(code, (c) => {
+              c.localGet(a);
+              c.call(this.jsToNumberHelper());
+              c.localGet(b);
+              c.call(this.jsToNumberHelper());
+              c.call(this.jsPowHelper());
+            });
+            this.releaseScratch(this.dyn.dynRef(), a);
+            this.releaseScratch(this.dyn.dynRef(), b);
+            this.emitPendingCheck(); // jsPowHelper's runtime fence, only
+            return;
+          }
+          case "neg": case "plus": {
+            this.walkExpr(e.args[0]!);
+            const a = this.acquireScratch(this.dyn.dynRef());
+            code.localSet(a);
+            this.dyn.boxNum(code, (c) => {
+              c.localGet(a);
+              c.call(this.jsToNumberHelper());
+              if (op === "neg") c.f64Neg();
+            });
+            this.releaseScratch(this.dyn.dynRef(), a);
+            return;
+          }
+          // lt/le/gt/ge/eq/neq's RESULT KIND is "bool" (jsOpResultKind,
+          // nodes.ts:4986), NOT "jsval" — a raw unboxed i32 (mapType(bool)
+          // = I32), same representation `<` on typed numbers already
+          // uses. EARLIER DRAFT BUG (caught by actual compile+run, not
+          // just tsc): these arms originally routed their i32 result
+          // through `dyn.boxBool`, producing a boxed `$dyn` struct where
+          // the caller (whatever consumes this jsOp's "bool"-typed
+          // result — here, console.log's boolean formatter) expects a
+          // bare i32. WebAssembly's own validator caught it exactly
+          // ("local.set[0] expected type i32, found struct.new") — a
+          // real, if late, backstop for the "never miscompile" rule.
+          case "lt": case "le": case "gt": case "ge": {
+            this.walkExpr(e.args[0]!);
+            const a = this.acquireScratch(this.dyn.dynRef());
+            code.localSet(a);
+            this.walkExpr(e.args[1]!);
+            const b = this.acquireScratch(this.dyn.dynRef());
+            code.localSet(b);
+            // Abstract Relational Comparison (7.2.14): both operands are
+            // strings (post-ToPrimitive) → code-UNIT order (strCmpU16,
+            // S005's own comparator); otherwise numeric — IEEE f64
+            // compares already answer `false` for any NaN operand, which
+            // is JS's own "undefined → false" rule for relational ops,
+            // no separate check needed.
+            code.localGet(a);
+            code.call(this.jsIsStrLikeHelper());
+            code.localGet(b);
+            code.call(this.jsIsStrLikeHelper());
+            code.i32And();
+            code.ifResult(I32);
+            code.localGet(a);
+            code.call(this.dyn.toStr());
+            code.localGet(b);
+            code.call(this.dyn.toStr());
+            code.call(this.strCmpHelper(true));
+            code.i32Const(0);
+            if (op === "lt") code.i32LtS();
+            else if (op === "le") code.i32LeS();
+            else if (op === "gt") code.i32GtS();
+            else code.i32GeS();
+            code.else_();
+            code.localGet(a);
+            code.call(this.jsToNumberHelper());
+            code.localGet(b);
+            code.call(this.jsToNumberHelper());
+            if (op === "lt") code.f64Lt();
+            else if (op === "le") code.f64Le();
+            else if (op === "gt") code.f64Gt();
+            else code.f64Ge();
+            code.end();
+            this.releaseScratch(this.dyn.dynRef(), a);
+            this.releaseScratch(this.dyn.dynRef(), b);
+            return;
+          }
+          case "eq": case "neq": {
+            // CORRECTION against the design doc's draft (which called
+            // these "loose eq/neq" — WRONG, measured and now fixed):
+            // the C reference is authoritative here and unambiguous —
+            // scr_runtime.h's SCR_JSOP_EQ/NEQ are commented "strict ==="/
+            // "strict !==" verbatim, and scr_jsval_cmp/scr_jsval_eq call
+            // an engine helper closure at that op index. Empirically
+            // confirmed too: `a === b` on two jsval operands lowers to
+            // jsOp:eq (walkExpr dump), and every corpus program that
+            // reaches "eq"/"neq" spells `===`/`!==` in source (grepped
+            // all six: 1587/2074/2365/2578/2667/768 plus 2581/2583's
+            // `!==`) — none spell `==`/`!=`. Using loose equality here
+            // would have been a REAL correctness bug, not just extra
+            // unneeded generality: `x === undefined` must answer false
+            // when x is null (strict), which loose equality gets wrong
+            // (null == undefined is true). So this is a straight
+            // `dyn.strictEq()` call — the SAME, already-tested machinery
+            // the checked-dynamic world's own `===` already uses; no new
+            // coercion logic needed at all for this op.
+            this.walkExpr(e.args[0]!);
+            const a = this.acquireScratch(this.dyn.dynRef());
+            code.localSet(a);
+            this.walkExpr(e.args[1]!);
+            const b = this.acquireScratch(this.dyn.dynRef());
+            code.localSet(b);
+            code.localGet(a);
+            code.localGet(b);
+            code.call(this.dyn.strictEq());
+            if (op === "neq") code.i32Eqz();
+            this.releaseScratch(this.dyn.dynRef(), a);
+            this.releaseScratch(this.dyn.dynRef(), b);
+            return;
+          }
+          // Zero measured need across the 64 (op census: instanceOf/not/
+          // iterNew/optCallMethod all count=0) — named arms so a future
+          // producer cannot silently fall into a bare-else, but no
+          // machinery is built for them yet; same stable "expr:jsOp"
+          // bucket as every other still-unimplemented op below (bucket
+          // names are census currency — see the header this replaces).
           case "instanceOf":
           case "not":
-          case "callMethod": case "callFn": case "callSpread": case "construct":
+          case "iterNew":
+          case "optCallMethod":
+            this.refuse(`expr:${e.kind}`, e.loc);
+            code.unreachable();
+            return;
+          // The call family, gate 2: callMethod dispatches through the
+          // EXISTING S023-style `dyn.invoke(name)` ladder — built for
+          // the checked-dynamic world, reused verbatim under jsval ≡ dyn
+          // (its OBJ arm already does keyed-get + FUNC check +
+          // this-bracket via thisPush/thisPop around callFn(), which is
+          // the "program-defined method" dispatch stage B would
+          // otherwise have had to build from scratch; its ARR/STR/FUNC
+          // arms already model most of the census's 33-name inventory,
+          // extended this gate with STR replace/replaceAll and NUM
+          // toFixed/toString — see dyn.ts's NUM_METHODS/STR_METHODS).
+          // An unmodeled (kind, method) pair throws Node's own
+          // catchable "not a function" or (for names invoke() DOES
+          // gate but the receiver kind doesn't match) throwUnsupported
+          // — never a silent wrong answer, matching S023.
+          case "callMethod": {
+            if (e.name === undefined) throw new Error("emitter bug: jsOp callMethod without a name");
+            const name = e.name;
+            // globalGet's CLOSED TABLE (increment 21 stage B, gate 3):
+            // jsOp:globalGet never produces a real runtime "ambient
+            // object" value — it is recognized here as a STATIC IR
+            // SHAPE, `callMethod(globalGet("<Name>"), method, args)`,
+            // matched BEFORE walkExpr ever runs on the receiver
+            // sub-expression (a bare globalGet reached any other way —
+            // not the direct callee/receiver of construct/callMethod —
+            // still refuses named, in jsOp's own switch below). This is
+            // the design doc's own rule: "the wasm emitter pattern-
+            // serves the CLOSED table" rather than building a generic
+            // ambient-object representation nothing else needs.
+            const globalGetName =
+              e.args[0]!.kind === "jsOp" && e.args[0]!.op === "globalGet" ? e.args[0]!.name : undefined;
+            if (globalGetName === "JSON" && name === "stringify") {
+              // The engine's OWN JSON.stringify (2171's own header) —
+              // stringifyDyn is THE existing entry point a dyn-rooted
+              // `JSON.stringify` already lowers to (json.ts's own doc);
+              // jsval ≡ dyn makes it directly reusable, unchanged, for
+              // an island receiver. `replacer` (args[2]) is not a
+              // measured need (2171/2475 both pass `null` or omit it)
+              // and is not modeled — a non-null replacer function is a
+              // different, unmeasured shape. `space` (args[3]) IS
+              // measured (2171: `JSON.stringify(issue, null, 2)`) —
+              // built at RUNTIME from the space argument's own dyn kind
+              // (NUM → that many spaces, clamped [0,10] per spec; STR →
+              // its own text; anything else → no indent), unlike the
+              // static `jsonStringify` node's compile-time-folded
+              // `indent` field, since a jsOp arg is never a compile-time
+              // constant here.
+              this.walkExpr(e.args[1]!);
+              const v = this.acquireScratch(this.dyn.dynRef());
+              code.localSet(v);
+              code.localGet(v);
+              code.call(this.json.stringifyDyn());
+              this.emitPendingCheck();
+              const compact = this.acquireScratch(this.strRef);
+              code.localSet(compact);
+              if (e.args.length > 3) {
+                this.walkExpr(e.args[3]!);
+                const space = this.acquireScratch(this.dyn.dynRef());
+                code.localSet(space);
+                const indentStr = this.acquireScratch(this.strRef);
+                code.localGet(space);
+                code.structGet(this.dyn.dynT(), DYN_KIND);
+                code.i32Const(DK.NUM);
+                code.i32Eq();
+                code.ifResult(this.strRef);
+                {
+                  const n = this.acquireScratch(F64);
+                  code.localGet(space);
+                  code.structGet(this.dyn.dynT(), DYN_NUM);
+                  code.f64Trunc();
+                  code.f64Const(0);
+                  code.f64Max();
+                  code.f64Const(10);
+                  code.f64Min();
+                  code.localSet(n);
+                  this.pushStrLit(" ");
+                  code.localGet(n);
+                  code.call(this.strs.repeat());
+                  this.releaseScratch(F64, n);
+                }
+                code.else_();
+                {
+                  code.localGet(space);
+                  code.structGet(this.dyn.dynT(), DYN_KIND);
+                  code.i32Const(DK.STR);
+                  code.i32Eq();
+                  code.ifResult(this.strRef);
+                  code.localGet(space);
+                  code.structGet(this.dyn.dynT(), DYN_REF);
+                  code.refCast(this.strType);
+                  code.f64Const(0);
+                  code.f64Const(10);
+                  code.call(this.strs.slice());
+                  code.else_();
+                  this.pushStrLit("");
+                  code.end();
+                }
+                code.end();
+                code.localSet(indentStr);
+                this.dyn.boxStr(code, (c) => {
+                  c.localGet(compact);
+                  c.localGet(indentStr);
+                  c.call(this.json.indent());
+                });
+                this.releaseScratch(this.strRef, indentStr);
+                this.releaseScratch(this.dyn.dynRef(), space);
+              } else {
+                this.dyn.boxStr(code, (c) => c.localGet(compact));
+              }
+              this.releaseScratch(this.strRef, compact);
+              this.releaseScratch(this.dyn.dynRef(), v);
+              return;
+            }
+            if (globalGetName === "Number" && (name === "isInteger" || name === "isSafeInteger")) {
+              // Oracle-measured (2474's own need): NO coercion — a
+              // string that "looks numeric" answers false, same as a
+              // NaN/Infinite number. `isSafeInteger` is `isInteger` AND
+              // |x| <= 2^53-1 exactly (Number.MAX_SAFE_INTEGER).
+              this.walkExpr(e.args[1]!);
+              const x = this.acquireScratch(this.dyn.dynRef());
+              code.localSet(x);
+              this.dyn.boxBool(code, (c) => {
+                c.localGet(x);
+                c.structGet(this.dyn.dynT(), DYN_KIND);
+                c.i32Const(DK.NUM);
+                c.i32Eq();
+                c.ifResult(I32);
+                {
+                  c.localGet(x);
+                  c.structGet(this.dyn.dynT(), DYN_NUM);
+                  const n = this.acquireScratch(F64);
+                  c.localSet(n);
+                  c.localGet(n);
+                  c.f64Trunc();
+                  c.localGet(n);
+                  c.f64Eq();
+                  c.localGet(n);
+                  c.localGet(n);
+                  c.f64Sub();
+                  c.f64Const(0);
+                  c.f64Eq(); // finite: n - n === 0 (false for ±Infinity/NaN)
+                  c.i32And();
+                  if (name === "isSafeInteger") {
+                    c.localGet(n);
+                    c.i64ReinterpretF64();
+                    c.i64Const(0x7fffffffffffffffn);
+                    c.i64And();
+                    c.f64ReinterpretI64();
+                    c.f64Const(9007199254740991);
+                    c.f64Le();
+                    c.i32And();
+                  }
+                  this.releaseScratch(F64, n);
+                }
+                c.else_();
+                c.i32Const(0);
+                c.end();
+              });
+              this.releaseScratch(this.dyn.dynRef(), x);
+              return;
+            }
+            this.walkExpr(e.args[0]!);
+            const recv = this.acquireScratch(this.dyn.dynRef());
+            code.localSet(recv);
+            // toUpperCase/toLowerCase: casing.ts's EXISTING static
+            // case-mapping helpers (increment 20's libunicode port,
+            // already used for plain `string`-typed receivers,
+            // emitter.ts:7970) — dyn.invoke()'s ladder has no case-
+            // mapping arm of its own (measured: 1595/761/762/762's
+            // `.toUpperCase()` on `any`-typed receivers is the need;
+            // reusing the SAME tables rather than a second port).
+            // Receiver-kind checked at runtime (compile-time `name` is
+            // known, but the receiver's KIND is not); any OTHER kind
+            // (Node would throw "X.prototype.toUpperCase is not a
+            // function" or similar) falls through to the normal
+            // `dyn.invoke` path below, which answers Node's own
+            // catchable "not a function" — no measured corpus need
+            // exercises that mismatch, but it is not a silent wrong
+            // answer either way.
+            if (name === "toUpperCase" || name === "toLowerCase") {
+              code.localGet(recv);
+              code.structGet(this.dyn.dynT(), DYN_KIND);
+              code.i32Const(DK.STR);
+              code.i32Eq();
+              code.ifResult(this.dyn.dynRef());
+              this.dyn.boxStr(code, (c) => {
+                c.localGet(recv);
+                c.structGet(this.dyn.dynT(), DYN_REF);
+                c.refCast(this.strType);
+                c.call(name === "toUpperCase" ? this.casing.toUpperCase() : this.casing.toLowerCase());
+              });
+              code.else_();
+              {
+                const argsVec0 = this.acquireScratch(this.dyn.arrRef());
+                code.f64Const(0);
+                code.call(this.vecs.newLen(this.dynVecInfo()));
+                code.localSet(argsVec0);
+                code.localGet(recv);
+                code.localGet(argsVec0);
+                this.pushStrLit(name);
+                code.call(this.dyn.invoke(name));
+                this.releaseScratch(this.dyn.arrRef(), argsVec0);
+              }
+              code.end();
+              this.emitPendingCheck();
+              this.releaseScratch(this.dyn.dynRef(), recv);
+              return;
+            }
+            // split: strings.ts's EXISTING static `.split()` (761's
+            // measured need, `s.split(" ")` on an `any`-typed receiver
+            // — the STATIC-string form used elsewhere, e.g. 1113,
+            // already worked before this gate; only the island-routed
+            // form was missing). Its result is a vector of RAW strings
+            // (strings.ts's own vec(str) type), each boxed into a dyn
+            // STR to build the dyn ARR jsval callers expect. The
+            // separator gets `dyn.toStr()` (review round 1, SB6 —
+            // ECMA-262 String.prototype.split ToString's its separator
+            // argument; oracle-measured `"a1b2c1d".split(1)` →
+            // `["a","b2c","d"]`, a bare `refCast` on a non-STR argument
+            // would trap instead).
+            if (name === "split") {
+              const strValType: ValType = { kind: "ref", nullable: true, typeIndex: this.strType };
+              const vecInfo = this.vecs.info("vec(str)", strValType, strValType, "string");
+              const vecOfStrType: ValType = { kind: "ref", nullable: true, typeIndex: vecInfo.struct };
+              code.localGet(recv);
+              code.structGet(this.dyn.dynT(), DYN_KIND);
+              code.i32Const(DK.STR);
+              code.i32Eq();
+              code.ifResult(this.dyn.dynRef());
+              {
+                const vecOfStr = this.acquireScratch(vecOfStrType);
+                code.localGet(recv);
+                code.structGet(this.dyn.dynT(), DYN_REF);
+                code.refCast(this.strType);
+                this.walkExpr(e.args[1]!);
+                const sepRecv = this.acquireScratch(this.dyn.dynRef());
+                code.localSet(sepRecv);
+                code.localGet(sepRecv);
+                code.call(this.dyn.toStr());
+                code.call(this.strs.split());
+                code.localSet(vecOfStr);
+                const outArr = this.acquireScratch(this.dyn.arrRef());
+                code.f64Const(0);
+                code.call(this.vecs.newLen(this.dynVecInfo()));
+                code.localSet(outArr);
+                const i = this.acquireScratch(I32);
+                code.i32Const(0);
+                code.localSet(i);
+                code.block();
+                code.loop();
+                code.localGet(i);
+                code.localGet(vecOfStr);
+                code.structGet(vecInfo.struct, 0); // VEC_LEN
+                code.i32GeS();
+                code.brIf(1);
+                code.localGet(outArr);
+                this.dyn.boxStr(code, (c) => {
+                  c.localGet(vecOfStr);
+                  c.structGet(vecInfo.struct, 1); // VEC_BUF
+                  c.localGet(i);
+                  c.arrayGet(vecInfo.bufType);
+                });
+                code.call(this.dyn.arrPush());
+                code.localGet(i);
+                code.i32Const(1);
+                code.i32Add();
+                code.localSet(i);
+                code.br(0);
+                code.end();
+                code.end();
+                this.dyn.boxArr(code, (c) => c.localGet(outArr));
+                this.releaseScratch(I32, i);
+                this.releaseScratch(this.dyn.arrRef(), outArr);
+                this.releaseScratch(this.dyn.dynRef(), sepRecv);
+                this.releaseScratch(vecOfStrType, vecOfStr);
+              }
+              code.else_();
+              {
+                // Receiver is not a string at runtime (`(5 as
+                // any).split(...)`) — NOT a static-refusal case (the
+                // program compiles fine; this is a real, reachable JS
+                // scenario), so this must NOT call `this.refuse` (a
+                // compile-time census diagnostic) — it needs Node's own
+                // catchable "is not a function" instead. `dyn.invoke`
+                // does not model "split" for any kind, so routing
+                // through it here reuses its EXISTING throwNotFn tail
+                // rather than duplicating that message-building logic.
+                const argsVec0 = this.acquireScratch(this.dyn.arrRef());
+                code.f64Const(0);
+                code.call(this.vecs.newLen(this.dynVecInfo()));
+                code.localSet(argsVec0);
+                code.localGet(recv);
+                code.localGet(argsVec0);
+                this.pushStrLit(name);
+                code.call(this.dyn.invoke(name));
+                this.releaseScratch(this.dyn.arrRef(), argsVec0);
+              }
+              code.end();
+              this.emitPendingCheck();
+              this.releaseScratch(this.dyn.dynRef(), recv);
+              return;
+            }
+            const argsVec = this.acquireScratch(this.dyn.arrRef());
+            code.f64Const(0);
+            code.call(this.vecs.newLen(this.dynVecInfo()));
+            code.localSet(argsVec);
+            for (let i = 1; i < e.args.length; i++) {
+              code.localGet(argsVec);
+              this.walkExpr(e.args[i]!);
+              code.call(this.dyn.arrPush());
+            }
+            code.localGet(recv);
+            code.localGet(argsVec);
+            this.pushStrLit(name);
+            code.call(this.dyn.invoke(name));
+            this.emitPendingCheck();
+            this.releaseScratch(this.dyn.dynRef(), recv);
+            this.releaseScratch(this.dyn.arrRef(), argsVec);
+            return;
+          }
+          // callFn: `dyn.callFn()` — the SAME machinery `invoke`'s OBJ/
+          // FUNC arms already call internally (this is the direct
+          // `f(...)` form; those arms are `f.call/apply(...)` and
+          // `obj.method(...)`, which route back through this exact
+          // function). Now guarded against the placeholder-null-thunk
+          // trap (dyn.ts's callFn header — the review watch item).
+          case "callFn": {
+            // globalGet's CLOSED TABLE, continued: `Number.parseFloat`/
+            // `Number.parseInt` ARE the global `parseFloat`/`parseInt`
+            // functions (the spec aliases them — surfaces.ts's own
+            // note) — the frontend's member-access rewrite always
+            // routes THIS spelling through the island bridge (1421's
+            // measured shape, byte-compared against Node), regardless
+            // of a separate static `num.parseInt` path existing for the
+            // bare-global spelling. Recognized the same way as
+            // callMethod's globalGet patterns: a static IR-shape match
+            // on `e.args[0]`, never a real "parseFloat" ambient value.
+            const globalGetFnName =
+              e.args[0]!.kind === "jsOp" && e.args[0]!.op === "globalGet" ? e.args[0]!.name : undefined;
+            if (globalGetFnName === "parseFloat" || globalGetFnName === "parseInt") {
+              // Both ToString their first argument (review round 1, SB7
+              // — oracle-measured: `parseFloat(true)`/`parseInt(true,10)`
+              // are both NaN, `parseInt("ff", "16")` is 255 — a bare
+              // `refCast`/`DYN_NUM` read on a non-STR/non-NUM argument
+              // would trap or read garbage instead of coercing).
+              this.walkExpr(e.args[1]!);
+              const s = this.acquireScratch(this.dyn.dynRef());
+              code.localSet(s);
+              if (globalGetFnName === "parseFloat") {
+                this.dyn.boxNum(code, (c) => {
+                  c.localGet(s);
+                  c.call(this.dyn.toStr());
+                  c.call(this.parseFloatHelper());
+                });
+              } else {
+                const radix = this.acquireScratch(F64);
+                if (e.args.length > 2) {
+                  this.walkExpr(e.args[2]!);
+                  const r = this.acquireScratch(this.dyn.dynRef());
+                  code.localSet(r);
+                  code.localGet(r);
+                  code.call(this.jsToNumberHelper());
+                  code.localSet(radix);
+                  this.releaseScratch(this.dyn.dynRef(), r);
+                } else {
+                  code.f64Const(CANONICAL_NAN); // absent radix reads as ToNumber(undefined) = NaN, the "auto" trigger
+                  code.localSet(radix);
+                }
+                this.dyn.boxNum(code, (c) => {
+                  c.localGet(s);
+                  c.call(this.dyn.toStr());
+                  c.localGet(radix);
+                  c.call(this.parseIntHelper());
+                });
+                this.releaseScratch(F64, radix);
+              }
+              this.releaseScratch(this.dyn.dynRef(), s);
+              return;
+            }
+            this.walkExpr(e.args[0]!);
+            const fn = this.acquireScratch(this.dyn.dynRef());
+            code.localSet(fn);
+            const argsVec = this.acquireScratch(this.dyn.arrRef());
+            code.f64Const(0);
+            code.call(this.vecs.newLen(this.dynVecInfo()));
+            code.localSet(argsVec);
+            for (let i = 1; i < e.args.length; i++) {
+              code.localGet(argsVec);
+              this.walkExpr(e.args[i]!);
+              code.call(this.dyn.arrPush());
+            }
+            code.localGet(fn);
+            code.localGet(argsVec);
+            // `what`: callFn's own IR (nodes.ts jsOp doc) carries no
+            // source spelling for a bare call target (unlike getProp/
+            // callMethod's `name`) — no measured corpus call reaches
+            // the non-callable path through this op, so this is a
+            // reasonable placeholder, not a pinned text.
+            this.pushStrLit("value");
+            code.call(this.dyn.callFn());
+            this.emitPendingCheck();
+            this.releaseScratch(this.dyn.dynRef(), fn);
+            this.releaseScratch(this.dyn.arrRef(), argsVec);
+            return;
+          }
+          // `new X(...)`: the ONE recognized shape is the compiler's own
+          // Function-eval synthesis (this file's header comment above
+          // FnEvalValue) — `construct(globalGet("Function"), ...N
+          // strLit-marshaled params, 1 strLit-marshaled body)`. Every
+          // OTHER construct shape (a real package-exported class isn't
+          // reachable here — that's jsval's own "instanceOf"/native
+          // class path, not this engine-construct op) refuses named,
+          // same as before this gate.
+          case "construct": {
+            const callee = e.args[0]!;
+            if (callee.kind === "jsOp" && callee.op === "globalGet" && callee.name === "Function" && e.args.length >= 2) {
+              const paramTexts: string[] = [];
+              let allStrLit = true;
+              for (let i = 1; i < e.args.length; i++) {
+                const a = e.args[i]!;
+                if (a.kind === "jsMarshal" && a.value.kind === "strLit") {
+                  paramTexts.push(a.value.value);
+                } else {
+                  allStrLit = false;
+                  break;
+                }
+              }
+              if (allStrLit) {
+                const plan = parseFnEvalConstruct(paramTexts);
+                if (plan !== null) {
+                  const thunk = this.emitFnEvalThunk(plan, e.loc);
+                  if (thunk !== null) {
+                    this.mb.declareFuncRef(thunk);
+                    const arity = plan.kind === "pattern" ? 1 + plan.numExtras : 0;
+                    const sig = this.dynFnSigId(`%w.fnEval:${thunk}`);
+                    this.dyn.boxFn(
+                      code,
+                      (x) => x.structNew(this.fnEvalClosMarkerType()),
+                      (x) => x.refFunc(thunk),
+                      sig,
+                      (x) => x.refNull(this.strType),
+                      arity,
+                    );
+                    return;
+                  }
+                }
+              }
+            }
+            this.refuse(`expr:${e.kind}`, e.loc);
+            code.unreachable();
+            return;
+          }
+          // callSpread + globalGet + the literal-adjacent ops that need
+          // engine dispatch — later gates of stage B, not yet wired.
+          case "callSpread":
           case "globalGet":
           case "tplStrings": case "objSpread": case "defineGetter":
-          case "iterNew": case "optCallMethod":
             this.refuse(`expr:${e.kind}`, e.loc);
             code.unreachable();
             return;
@@ -10358,10 +11553,50 @@ class Assembler {
           this.releaseScratch(dynRef, d);
           return;
         }
-        // Bucket names are currency: jsExit's unimplemented targets
-        // (composite JSON-safe round-trips, bytes<u8>, undefined-armed
-        // unions) share the stable "expr:jsExit" aggregate, not a
-        // fragmented per-target-type name.
+        // Composite JSON-safe types (records, arrays of non-jsval
+        // elements, bytes<u8>, undefined-armed unions of JSON-safe arms
+        // — canExitIslandToType's domain past the two special cases
+        // above): the design doc's own §5 note frames the native lane's
+        // mechanism as an "engine-JSON round-trip", an IMPLEMENTATION
+        // DETAIL — the OBSERVABLE contract is "validate the dyn tree
+        // against T, building the typed value, or throw the catchable
+        // path-annotated TypeError", which is EXACTLY `dynCheckHelper`'s
+        // own existing contract (the `as`-cast / typed-parameter
+        // validator). Measured directly (scratchpad/oracle3/jsexit-
+        // composite.mjs): a missing OPTIONAL field builds the undefined
+        // arm (matches JSON.parse-of-a-stringify-that-dropped-the-key,
+        // AND matches a plain missing-property read); a WRONG-TYPE field
+        // throws a catchable TypeError either way (Node's `JSON.parse`
+        // would itself have produced a wrongly-typed value that a
+        // subsequent structural check rejects — this walker just skips
+        // the redundant text round-trip and checks the dyn tree
+        // directly, an unobservable mechanism change, same as bytes<u8>
+        // ALIASING here rather than copying, which S014's own precedent
+        // already covers for this exact walker). canExitIslandToType's
+        // domain never admits a function-or-undefined-valued FIELD TYPE
+        // in the first place (isJsonSafeType excludes them), so the
+        // "JSON.stringify silently drops/nulls a bad member" case this
+        // note worried about cannot arise: every field this walker reads
+        // is declared JSON-safe, and a value that doesn't match it is
+        // unconditionally a type error on BOTH lanes.
+        {
+          const inner = this.dynCheckHelper(t, e.loc);
+          if (inner !== null) {
+            const dynRef = this.dyn.dynRef();
+            const d = this.acquireScratch(dynRef);
+            this.walkExpr(e.value);
+            code.localSet(d);
+            code.localGet(d);
+            code.refNull(this.dyn.pathT());
+            code.call(inner);
+            this.emitPendingCheck();
+            this.releaseScratch(dynRef, d);
+            return;
+          }
+        }
+        // Bucket names are currency: whatever dynCheckHelper itself
+        // could not map (an unmappable inner type) shares the stable
+        // "expr:jsExit" aggregate, not a fragmented per-target-type name.
         this.refuse(`expr:${e.kind}`, e.loc);
         code.unreachable();
         return;
@@ -11595,6 +12830,36 @@ class Assembler {
    * S023-style fence; nothing left over reaches keyGet's own catch-all
    * "undefined" WRONG — that undefined is Node-exact for every name
    * this helper does not table. */
+  /** The receiver is ALREADY on the stack — dispatches to the closed
+   * prototype-member fence tables (protoFenceGetPropHelper) for a name
+   * they cover, else the plain keyGet own-property read. Extracted from
+   * jsOp:getProp's own case (increment 21 stage B, gate 3) so the
+   * Function-eval recognizer's synthesized property reads (e.g. `const
+   * {toString} = 1` — the SAME property name resolution the engine
+   * would do) share EXACTLY this dispatch rather than a second,
+   * possibly-drifting copy of the fence-table list. May throw
+   * (a nullish receiver, or the fence itself) — the caller owns the
+   * pending check. */
+  private emitDynGetProp(code: Code, name: string): void {
+    const needsProtoFence =
+      NUM_PROTO_METHOD_ARITY.has(name) ||
+      OBJECT_PROTO_MEMBERS.has(name) ||
+      ARRAY_PROTO_MEMBERS.has(name) ||
+      STRING_PROTO_MEMBERS.has(name) ||
+      BOOLEAN_PROTO_MEMBERS.has(name) ||
+      FUNCTION_PROTO_MEMBERS.has(name) ||
+      name === "__proto__" ||
+      name === "caller" ||
+      name === "arguments";
+    if (needsProtoFence) {
+      code.call(this.protoFenceGetPropHelper(name));
+    } else {
+      this.pushStrLitInto(code, name);
+      code.i32Const(0);
+      code.call(this.dyn.keyGet());
+    }
+  }
+
   private protoFenceGetPropFns = new Map<string, number>();
   private protoFenceGetPropHelper(name: string): number {
     const hit = this.protoFenceGetPropFns.get(name);
@@ -11713,6 +12978,604 @@ class Assembler {
 
     this.mb.setBody(idx, w.locals, c.bytes());
     return idx;
+  }
+
+  /* ── increment 21 stage B, gate 3: the Function-eval EMITTER ──────────
+   * The other half of parseFnEvalConstruct (this file's header comment
+   * above FnEvalValue): a recognized plan compiles to a REAL synthetic
+   * thunk of dyn.ts's uniform `thunkSig()` shape — boxed as an ordinary
+   * dyn FUNC value, called through the SAME `dyn.callFn()`/`invoke()`
+   * machinery as any other dyn-typed callable. PARSE SUCCESS ≠ SEMANTIC
+   * SUPPORT: a plan node this pass does not cover refuses NAMED here,
+   * distinctly from parseFnEvalConstruct's own parse failure.
+   *
+   * Covers the FULL closed grammar (§3 of the design doc): object and
+   * array patterns, nesting, holes, nested-pattern subs, rest (object —
+   * `dyn.objWalk(v, KEYS)`'s own-key enumeration with a runtime
+   * exclusion list, exactly the way `for-in`/`Object.keys` already
+   * walk; array — a second unbounded `dyn.iterPack` drain sliced from
+   * where the leading `iterN` left off), defaults (literal scalars,
+   * array/object literals recursively, `temp`/`extra` references,
+   * call-shaped via `dyn.callFn()` — the SAME call machinery gate 2's
+   * callFn jsOp uses), and property keys (literal — kept on the
+   * getProp proto-fence dispatch path; computed via extra/call —
+   * `dyn.toStr()`, ToPropertyKey reducing to ToString since this
+   * representation has no Symbol kind). The one KNOWN, narrow gap:
+   * computed keys do not route through the proto-fence tables (compile-
+   * time-keyed, not usable against a runtime string), so a computed key
+   * that happens to equal an unmodeled prototype member name on a
+   * receiver missing an OWN property of that name reads plain
+   * `keyGet`'s undefined rather than the real prototype function — not
+   * observed in any measured corpus shape, documented rather than
+   * registered as an S-entry (a scoped limitation, not a deliberate
+   * divergence). */
+
+  /** Each recognized `construct(Function, ...)` gets its OWN fresh
+   * identity object for the boxed FUNC's closure slot (dyn.ts's boxFn
+   * doc: two functions boxed with the SAME `eq` closure compare `===`
+   * true — `ref.eq(null, null)` is true, so a shared `ref.null` would be
+   * wrong). `struct.new` of a zero-field marker type, pushed fresh at
+   * EVERY execution of the construct site, actually matches real JS
+   * MORE precisely than an interned-per-callsite global would (Node's
+   * own `new Function(...)` mints a genuinely new function object on
+   * every call, not just every callsite) — and needs no lazy-init
+   * dance since freshness is exactly what is wanted here, unlike an
+   * ordinary capture-free closure value. */
+  private fnEvalClosMarkerT: number | null = null;
+  private fnEvalClosMarkerType(): number {
+    this.fnEvalClosMarkerT ??= this.mb.openStructType("fnEval:clos", []);
+    return this.fnEvalClosMarkerT;
+  }
+
+  private fnEvalSeq = 0;
+
+  /** Builds one synthetic thunk for a recognized plan. Returns the
+   * thunk's function index, or null (a named refusal already fired;
+   * the function is left as a published `unreachable` stub via
+   * `walkerDead`, per this file's established mid-build-failure
+   * convention — the caller must not reference the index further). */
+  private emitFnEvalThunk(plan: FnEvalPlan, loc: SrcLoc | undefined): number | null {
+    const idx = this.mb.declareFunc(this.dyn.thunkSig(), `%w.fnEval:${this.fnEvalSeq++}`);
+    const w = this.newWalker(2);
+    if (!this.emitFnEvalThunkBody(w, plan, loc)) return this.walkerDead(idx);
+    this.mb.setBody(idx, w.locals, w.c.bytes());
+    return idx;
+  }
+
+  /** Param 0 (the boxed closure, `eq`) is unused — this thunk captures
+   * nothing, everything it needs rides the args vector. Param 1 is the
+   * args vector itself: `[v, extra0, extra1, ...]`, exactly the
+   * parameter list `parseFnEvalConstruct` already validated. */
+  private emitFnEvalThunkBody(w: WalkerCtx, plan: FnEvalPlan, loc: SrcLoc | undefined): boolean {
+    const c = w.c;
+    const dyn = this.dyn;
+    const dynRef = dyn.dynRef();
+    if (plan.kind === "trap") {
+      // islandTrapFnValue's shape: unconditionally throw the compiler's
+      // own message (an abstract-class construction attempt, etc.) —
+      // the caller's `dyn.callFn()`/`invoke()` checks pending and never
+      // reads this value.
+      this.emitSetCellError(c, "%TypeError", "TypeError", (x) => this.pushStrLitInto(x, plan.message), null);
+      c.refNull(dyn.dynT());
+      return true;
+    }
+    const ARGS = 1;
+    const v = this.wlocal(w, dynRef);
+    dyn.arrAt(c, (x) => x.localGet(ARGS), (x) => x.i32Const(0));
+    c.localSet(v);
+    const extraLocals: number[] = [];
+    if (plan.numExtras > 0) {
+      const n = this.wlocal(w, I32);
+      dyn.arrLen(c, (x) => x.localGet(ARGS));
+      c.localSet(n);
+      for (let i = 0; i < plan.numExtras; i++) {
+        const slot = this.wlocal(w, dynRef);
+        c.i32Const(1 + i);
+        c.localGet(n);
+        c.i32LtU();
+        c.ifResult(dynRef);
+        dyn.arrAt(c, (x) => x.localGet(ARGS), (x) => x.i32Const(1 + i));
+        c.else_();
+        c.globalGet(dyn.undefinedGlobal());
+        c.end();
+        c.localSet(slot);
+        extraLocals.push(slot);
+      }
+    }
+    const tempLocals: number[] = [];
+    for (let i = 0; i < plan.numTemps; i++) tempLocals.push(this.wlocal(w, dynRef));
+    const ctx: FnEvalCtx = { w, extraLocals, tempLocals };
+    if (!this.emitFnEvalTopLevel(ctx, plan.pattern, v, loc)) return false;
+    // `return [__0, __1, ...]` — the temps, in bind order.
+    const out = this.wlocal(w, dyn.arrRef());
+    dyn.pushNewArr(c);
+    c.localSet(out);
+    for (const t of tempLocals) {
+      c.localGet(out);
+      c.localGet(t);
+      c.call(dyn.arrPush());
+    }
+    dyn.boxArr(c, (x) => x.localGet(out));
+    return true;
+  }
+
+  /** The top-level pattern gets its OWN entry check ahead of
+   * `emitFnEvalPattern`'s (shared, recursive) walk: an object pattern's
+   * RequireObjectCoercible carries V8's exact destructuring wording —
+   * oracle-measured (`new Function("v", body)(null/undefined)` against
+   * every observed body shape): ALWAYS `"Cannot destructure 'v' as it is
+   * null/undefined."`, the bare form, regardless of whether the pattern
+   * has properties (the "property 'x' of" variant dynDestrCheck's
+   * generic case carries never appears here — 'v' is always a bare
+   * parameter reference, never a member-expression RHS). An array
+   * pattern's iterability check has NO such special-casing (`dyn.iterN`
+   * throws the identical "not iterable" wording at any nesting depth,
+   * confirmed against Node), so array patterns route straight through
+   * to the shared walk with no separate top-level step. */
+  private emitFnEvalTopLevel(ctx: FnEvalCtx, pattern: FnEvalPattern, srcLocal: number, loc: SrcLoc | undefined): boolean {
+    if (pattern.kind === "object") {
+      const { w } = ctx;
+      const c = w.c;
+      const dyn = this.dyn;
+      const k = this.wlocal(w, I32);
+      c.localGet(srcLocal);
+      c.structGet(dyn.dynT(), DYN_KIND);
+      c.localTee(k);
+      c.i32Const(DK.UNDEF);
+      c.i32Eq();
+      c.localGet(k);
+      c.i32Const(DK.NULL);
+      c.i32Eq();
+      c.i32Or();
+      c.ifVoid();
+      c.localGet(k);
+      c.i32Const(DK.UNDEF);
+      c.i32Eq();
+      c.ifResult(this.strRef);
+      this.pushStrLitInto(c, "Cannot destructure 'v' as it is undefined.");
+      c.else_();
+      this.pushStrLitInto(c, "Cannot destructure 'v' as it is null.");
+      c.end();
+      const msg = this.wlocal(w, this.strRef);
+      c.localSet(msg);
+      this.emitSetCellError(c, "%TypeError", "TypeError", (x) => x.localGet(msg), null);
+      c.refNull(dyn.dynT());
+      c.return_();
+      c.end();
+    }
+    return this.emitFnEvalPattern(ctx, pattern, srcLocal, loc);
+  }
+
+  /** The shared, recursive pattern walk — every NESTED sub-pattern
+   * re-enters here directly (no RequireObjectCoercible re-check: a
+   * nested object sub-pattern reading from a null/undefined value gets
+   * whatever `keyGet`'s own nullish-receiver TypeError says, which IS
+   * Node's real answer for a non-empty nested pattern — oracle-measured
+   * — and an array sub-pattern gets `dyn.iterN`'s uniform wording either
+   * way). Rest (object or array) refuses named — unimplemented this
+   * gate. */
+  private emitFnEvalPattern(ctx: FnEvalCtx, pattern: FnEvalPattern, srcLocal: number, loc: SrcLoc | undefined): boolean {
+    if (pattern.kind === "object") return this.emitFnEvalObjectPattern(ctx, pattern, srcLocal, loc);
+    const { w } = ctx;
+    const c = w.c;
+    const dyn = this.dyn;
+    // JS's own grammar admits a rest element only in the LAST position
+    // (a syntax error anywhere else) — the frontend's synthesis never
+    // produces anything else, so the leading (non-rest) count is simply
+    // "all of them" unless the LAST slot is rest.
+    const lastElem = pattern.elems[pattern.elems.length - 1];
+    const hasRest = lastElem !== undefined && lastElem !== null && lastElem.rest;
+    const leadingCount = hasRest ? pattern.elems.length - 1 : pattern.elems.length;
+    // dyn.iterN(v, n): GetIterator plus n steps, ARRAY-DESTRUCTURING
+    // semantics (index/codepoint stepping, past-the-end undefined, the
+    // engine's own not-iterable wording) — no hand-rolled iterator
+    // protocol needed, this primitive already IS it.
+    const boxed = this.wlocal(w, dyn.dynRef());
+    c.localGet(srcLocal);
+    c.i32Const(leadingCount);
+    c.call(dyn.iterN());
+    this.emitWalkerPending(c, dyn.dynRef());
+    c.localSet(boxed);
+    const payload = this.wlocal(w, dyn.arrRef());
+    dyn.arrPayload(c, (x) => x.localGet(boxed));
+    c.localSet(payload);
+    if (!this.emitFnEvalArrayElems(ctx, pattern.elems.slice(0, leadingCount), payload, loc)) return false;
+    if (hasRest) return this.emitFnEvalArrayRest(ctx, lastElem!.sub, srcLocal, leadingCount, loc);
+    return true;
+  }
+
+  /** `[..., ...rest] = v`: `dyn.iterPack` is the SAME per-kind (ARR
+   * index / STR code point) drain `iterN` uses, unbounded — it answers
+   * the WHOLE source as a fresh array. The preceding `iterN` call (in
+   * `emitFnEvalPattern`, always run first) already proved `v` iterable
+   * (ARR or STR — the only two kinds either primitive supports), so
+   * `iterPack`'s own not-iterable check can never actually fire here;
+   * the empty message matches `iterN`'s own generic "not iterable"
+   * wording, consistent with the fact this recognizer's `v` never
+   * carries a distinguishable source spelling (the top-level check's
+   * own oracle-measured finding). `leadingCount` is where the rest
+   * slice starts — the elements ALREADY bound above are simply skipped
+   * here, no double-read (arrays/strings are index-stable, not one-shot
+   * iterators, so re-draining the same source twice is idempotent). */
+  private emitFnEvalArrayRest(
+    ctx: FnEvalCtx,
+    sub: FnEvalSub,
+    srcLocal: number,
+    leadingCount: number,
+    loc: SrcLoc | undefined,
+  ): boolean {
+    const { w } = ctx;
+    const c = w.c;
+    const dyn = this.dyn;
+    const dynRef = dyn.dynRef();
+    const full = this.wlocal(w, dynRef);
+    c.localGet(srcLocal);
+    this.pushStrLitInto(c, "");
+    c.call(dyn.iterPack());
+    this.emitWalkerPending(c, dynRef);
+    c.localSet(full);
+    const fullPayload = this.wlocal(w, dyn.arrRef());
+    dyn.arrPayload(c, (x) => x.localGet(full));
+    c.localSet(fullPayload);
+    const n = this.wlocal(w, I32);
+    dyn.arrLen(c, (x) => x.localGet(fullPayload));
+    c.localSet(n);
+    const restArr = this.wlocal(w, dyn.arrRef());
+    dyn.pushNewArr(c);
+    c.localSet(restArr);
+    const i = this.wlocal(w, I32);
+    c.i32Const(leadingCount);
+    c.localSet(i);
+    c.block();
+    c.loop();
+    c.localGet(i);
+    c.localGet(n);
+    c.i32GeU();
+    c.brIf(1);
+    c.localGet(restArr);
+    dyn.arrAt(c, (x) => x.localGet(fullPayload), (x) => x.localGet(i));
+    c.call(dyn.arrPush());
+    c.localGet(i);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(i);
+    c.br(0);
+    c.end();
+    c.end();
+    dyn.boxArr(c, (x) => x.localGet(restArr));
+    const restVal = this.wlocal(w, dynRef);
+    c.localSet(restVal);
+    return this.emitFnEvalBindSub(ctx, sub, restVal, loc);
+  }
+
+  private emitFnEvalObjectPattern(
+    ctx: FnEvalCtx,
+    pattern: FnEvalPattern & { kind: "object" },
+    srcLocal: number,
+    loc: SrcLoc | undefined,
+  ): boolean {
+    const { w } = ctx;
+    const c = w.c;
+    const dyn = this.dyn;
+    const dynRef = dyn.dynRef();
+    // Every NON-rest key this prop reads — literal AND computed alike —
+    // is recorded as a strRef local so a trailing rest (JS's grammar:
+    // only the LAST prop may be rest) can exclude exactly these from
+    // its own-keys walk, whether the key's actual runtime string was
+    // known at compile time or not.
+    const consumedKeys: number[] = [];
+    let restSub: FnEvalSub | null = null;
+    for (const prop of pattern.props) {
+      if (prop.rest) {
+        restSub = prop.sub;
+        continue;
+      }
+      const val = this.wlocal(w, dynRef);
+      const keyLocal = this.wlocal(w, this.strRef);
+      if (prop.key.kind === "lit") {
+        this.pushStrLitInto(c, prop.key.value);
+        c.localSet(keyLocal);
+        consumedKeys.push(keyLocal);
+        c.localGet(srcLocal);
+        // A LITERAL key keeps the getProp proto-fence dispatch (the same
+        // one jsOp:getProp itself uses) — a real prototype method (e.g.
+        // `const {toString} = v`) must read the real function, not
+        // `keyGet`'s own-properties-only undefined.
+        this.emitDynGetProp(c, prop.key.value);
+      } else {
+        // A COMPUTED key (extra or call-shaped): ToPropertyKey reduces
+        // to ToString here — this representation has no Symbol kind, so
+        // `dyn.toStr()` (String(v)) is exactly it. Known, narrow gap:
+        // this path does NOT route through the proto-fence tables (they
+        // are keyed by a COMPILE-TIME name, not a runtime string), so a
+        // computed key that happens to equal an unmodeled prototype
+        // member name on a receiver missing an OWN property of that
+        // name reads `keyGet`'s own-properties-only undefined rather
+        // than the real prototype function — not observed in any
+        // measured corpus shape (documented, not registered as an
+        // S-entry: a scoped limitation, not a deliberate divergence).
+        if (!this.emitFnEvalKeyString(ctx, prop.key, loc)) return false;
+        c.localSet(keyLocal);
+        consumedKeys.push(keyLocal);
+        c.localGet(srcLocal);
+        c.localGet(keyLocal);
+        c.i32Const(0); // opt=false
+        c.call(dyn.keyGet());
+      }
+      this.emitWalkerPending(c, dynRef);
+      c.localSet(val);
+      if (!this.emitFnEvalApplyDefault(ctx, val, prop.default, loc)) return false;
+      if (!this.emitFnEvalBindSub(ctx, prop.sub, val, loc)) return false;
+    }
+    if (restSub !== null) return this.emitFnEvalObjectRest(ctx, restSub, srcLocal, consumedKeys, loc);
+    return true;
+  }
+
+  /** `{...rest} = v` (or a trailing rest after other props): a fresh
+   * object holding every OWN enumerable key of `srcLocal` NOT in
+   * `consumedKeys` — `dyn.objWalk(v, KEYS)` is the SAME own-key
+   * enumeration `Object.keys` uses (index keys first, then insertion
+   * order), which is CopyDataProperties' own source-key order (the
+   * spec algorithm real destructuring rest uses); this tier's `objPut`
+   * preserves insertion order, so the rest object's OWN later
+   * `Object.keys` answers the same order. The preceding prop loop
+   * already proved `v` non-nullish (or this call is unreachable — a
+   * throw already unwound), so `keyGet` below cannot itself throw. */
+  private emitFnEvalObjectRest(
+    ctx: FnEvalCtx,
+    sub: FnEvalSub,
+    srcLocal: number,
+    consumedKeys: number[],
+    loc: SrcLoc | undefined,
+  ): boolean {
+    const { w } = ctx;
+    const c = w.c;
+    const dyn = this.dyn;
+    const dynRef = dyn.dynRef();
+    const restObj = this.wlocal(w, dyn.objRef());
+    dyn.pushNewObj(c, false);
+    c.localSet(restObj);
+    const keysBoxed = this.wlocal(w, dynRef);
+    c.localGet(srcLocal);
+    c.i32Const(0); // objWalk mode 0: KEYS
+    c.call(dyn.objWalk());
+    this.emitWalkerPending(c, dynRef);
+    c.localSet(keysBoxed);
+    const keysPayload = this.wlocal(w, dyn.arrRef());
+    dyn.arrPayload(c, (x) => x.localGet(keysBoxed));
+    c.localSet(keysPayload);
+    const n = this.wlocal(w, I32);
+    dyn.arrLen(c, (x) => x.localGet(keysPayload));
+    c.localSet(n);
+    const i = this.wlocal(w, I32);
+    c.i32Const(0);
+    c.localSet(i);
+    const k = this.wlocal(w, this.strRef);
+    const strEq = this.strEqHelper();
+    c.block();
+    c.loop();
+    c.localGet(i);
+    c.localGet(n);
+    c.i32GeU();
+    c.brIf(1);
+    dyn.arrAt(c, (x) => x.localGet(keysPayload), (x) => x.localGet(i));
+    c.structGet(dyn.dynT(), DYN_REF);
+    c.refCast(this.strType);
+    c.localSet(k);
+    if (consumedKeys.length === 0) {
+      c.i32Const(0);
+    } else {
+      for (let ci = 0; ci < consumedKeys.length; ci++) {
+        c.localGet(k);
+        c.localGet(consumedKeys[ci]!);
+        c.call(strEq);
+        if (ci > 0) c.i32Or();
+      }
+    }
+    c.ifVoid();
+    // excluded — an already-consumed key, skip.
+    c.else_();
+    c.localGet(restObj);
+    c.localGet(k);
+    c.localGet(srcLocal);
+    c.localGet(k);
+    c.i32Const(0);
+    c.call(dyn.keyGet());
+    c.call(dyn.objPut());
+    c.end();
+    c.localGet(i);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(i);
+    c.br(0);
+    c.end();
+    c.end();
+    dyn.boxObj(c, (x) => x.localGet(restObj));
+    const restVal = this.wlocal(w, dynRef);
+    c.localSet(restVal);
+    return this.emitFnEvalBindSub(ctx, sub, restVal, loc);
+  }
+
+  /** `payload` is the RAW arr vector `dyn.iterN` already sized to
+   * exactly `elems.length` — every index in range is safe to read
+   * UNCHECKED (past-the-source-end slots are `iterN`'s own undefined
+   * padding, holes just never get read at all). Never sees a `rest`
+   * element — `emitFnEvalPattern` slices one off (JS's grammar: rest is
+   * always last) before calling this. */
+  private emitFnEvalArrayElems(
+    ctx: FnEvalCtx,
+    elems: (FnEvalElem | null)[],
+    payload: number,
+    loc: SrcLoc | undefined,
+  ): boolean {
+    const { w } = ctx;
+    const c = w.c;
+    const dyn = this.dyn;
+    for (let i = 0; i < elems.length; i++) {
+      const elem = elems[i];
+      if (!elem) continue; // a hole (or an absent index): iterN already accounted for the slot, nothing binds
+      const val = this.wlocal(w, dyn.dynRef());
+      dyn.arrAt(c, (x) => x.localGet(payload), (x) => x.i32Const(i));
+      c.localSet(val);
+      if (!this.emitFnEvalApplyDefault(ctx, val, elem.default, loc)) return false;
+      if (!this.emitFnEvalBindSub(ctx, elem.sub, val, loc)) return false;
+    }
+    return true;
+  }
+
+  /** `val === undefined` (STRICTLY — JS's default-value trigger, never a
+   * general falsy test) evaluates `def` and overwrites `val`'s local. */
+  private emitFnEvalApplyDefault(ctx: FnEvalCtx, val: number, def: FnEvalValue | null, loc: SrcLoc | undefined): boolean {
+    if (def === null) return true;
+    const { w } = ctx;
+    const c = w.c;
+    const dyn = this.dyn;
+    c.localGet(val);
+    c.structGet(dyn.dynT(), DYN_KIND);
+    c.i32Const(DK.UNDEF);
+    c.i32Eq();
+    c.ifVoid();
+    if (!this.emitFnEvalValue(ctx, def, loc)) return false;
+    c.localSet(val);
+    c.end();
+    return true;
+  }
+
+  private emitFnEvalBindSub(ctx: FnEvalCtx, sub: FnEvalSub, val: number, loc: SrcLoc | undefined): boolean {
+    if (sub.kind === "temp") {
+      ctx.w.c.localGet(val);
+      ctx.w.c.localSet(ctx.tempLocals[sub.n]!);
+      return true;
+    }
+    return this.emitFnEvalPattern(ctx, sub.pattern, val, loc);
+  }
+
+  /** Evaluates a `call` FnEvalValue — the grammar's own CallText rule
+   * (`parseCallableAsValue`): the callee is ALWAYS a bare temp/extra
+   * reference, never a nested call or a literal, so `emitFnEvalValue` on
+   * it can only ever recurse into the "temp"/"extra" leaves (no risk of
+   * an unbounded/refusing recursion here). Dispatches through
+   * `dyn.callFn()` — the SAME call machinery gate 2's callFn jsOp uses —
+   * leaving the raw dyn result on the stack (a default-VALUE caller
+   * keeps it as-is; a computed-KEY caller ToString's it on top). The
+   * `what` spelling is a placeholder, like callFn's jsOp arm: every
+   * callee this grammar can produce is a compiler-synthesized extra
+   * built to BE callable, so the not-a-function path is not expected to
+   * be reachable by any measured corpus shape. */
+  private emitFnEvalCall(ctx: FnEvalCtx, callee: FnEvalValue, args: FnEvalValue[], loc: SrcLoc | undefined): boolean {
+    const { w } = ctx;
+    const c = w.c;
+    const dyn = this.dyn;
+    const dynRef = dyn.dynRef();
+    if (!this.emitFnEvalValue(ctx, callee, loc)) return false;
+    const fn = this.wlocal(w, dynRef);
+    c.localSet(fn);
+    const argsVec = this.wlocal(w, dyn.arrRef());
+    dyn.pushNewArr(c);
+    c.localSet(argsVec);
+    for (const a of args) {
+      c.localGet(argsVec);
+      if (!this.emitFnEvalValue(ctx, a, loc)) return false;
+      c.call(dyn.arrPush());
+    }
+    c.localGet(fn);
+    c.localGet(argsVec);
+    this.pushStrLitInto(c, "value");
+    c.call(dyn.callFn());
+    this.emitWalkerPending(c, dynRef);
+    return true;
+  }
+
+  /** Pushes ONE strRef for a Key position (an object pattern's computed
+   * property name). `lit` keys never reach here (the object-pattern
+   * walker keeps them on the proto-fence-dispatch path instead); `extra`
+   * ToString's the captured value directly, `call` evaluates through
+   * `emitFnEvalCall` first — both routes are ToPropertyKey exactly
+   * (`dyn.toStr()` IS ToString, and this representation has no Symbol
+   * kind for ToPropertyKey to special-case away from it). May throw (a
+   * `call` key's callee dispatch). */
+  private emitFnEvalKeyString(ctx: FnEvalCtx, key: FnEvalKey & { kind: "extra" | "call" }, loc: SrcLoc | undefined): boolean {
+    const { w } = ctx;
+    const c = w.c;
+    const dyn = this.dyn;
+    if (key.kind === "extra") {
+      c.localGet(ctx.extraLocals[key.n]!);
+      c.call(dyn.toStr());
+      return true;
+    }
+    if (!this.emitFnEvalCall(ctx, key.callee, key.args, loc)) return false;
+    c.call(dyn.toStr());
+    return true;
+  }
+
+  /** Pushes ONE dyn value for a Default/Key value-position leaf. Never
+   * throws EXCEPT the `call` arm (a compiled-scope extra's own
+   * dispatch — see `emitFnEvalCall`). */
+  private emitFnEvalValue(ctx: FnEvalCtx, v: FnEvalValue, loc: SrcLoc | undefined): boolean {
+    const { w } = ctx;
+    const c = w.c;
+    const dyn = this.dyn;
+    switch (v.kind) {
+      case "num":
+        dyn.boxNum(c, (x) => x.f64Const(v.value));
+        return true;
+      case "str":
+        dyn.boxStr(c, (x) => this.pushStrLitInto(x, v.value));
+        return true;
+      case "bool":
+        c.globalGet(dyn.boolGlobal(v.value));
+        return true;
+      case "null":
+        c.globalGet(dyn.nullGlobal());
+        return true;
+      case "undefined":
+        c.globalGet(dyn.undefinedGlobal());
+        return true;
+      case "temp":
+        c.localGet(ctx.tempLocals[v.n]!);
+        return true;
+      case "extra":
+        c.localGet(ctx.extraLocals[v.n]!);
+        return true;
+      case "arrayLit": {
+        const a = this.wlocal(w, dyn.arrRef());
+        dyn.pushNewArr(c);
+        c.localSet(a);
+        for (const item of v.items) {
+          c.localGet(a);
+          if (item === null) {
+            // A hole in an array-literal DEFAULT: `[,]`'s absent slot
+            // reads as `undefined` once boxed (this value is only ever
+            // consumed through the SAME `arrAt` read path an ordinary
+            // element uses, which cannot distinguish a hole from an
+            // explicit undefined — JS itself only tells them apart via
+            // `in`/enumeration, unreachable through this recognizer's
+            // own consumers).
+            c.globalGet(dyn.undefinedGlobal());
+          } else if (!this.emitFnEvalValue(ctx, item, loc)) {
+            return false;
+          }
+          c.call(dyn.arrPush());
+        }
+        dyn.boxArr(c, (x) => x.localGet(a));
+        return true;
+      }
+      case "objectLit": {
+        const o = this.wlocal(w, dyn.objRef());
+        dyn.pushNewObj(c, false);
+        c.localSet(o);
+        for (const prop of v.props) {
+          c.localGet(o);
+          this.pushStrLitInto(c, prop.key);
+          if (!this.emitFnEvalValue(ctx, prop.value, loc)) return false;
+          c.call(dyn.objPut());
+        }
+        dyn.boxObj(c, (x) => x.localGet(o));
+        return true;
+      }
+      case "call":
+        return this.emitFnEvalCall(ctx, v.callee, v.args, loc);
+    }
   }
 
   /** jsOp getIdx/setIdx's index operand, as the raw string key keyGet/
@@ -13582,6 +15445,1412 @@ class Assembler {
     this.mb.setBody(idx, [I64, I64, I32, I32, I64, I64, F64], c.bytes());
     return idx;
   }
+
+  /* ── increment 21 stage B: JS coercion arithmetic over jsOp/dyn payloads
+   * (add/sub/mul/div/mod/pow/neg/plus/lt/le/gt/ge/eq/neq). NEW ground —
+   * grep confirmed nothing on this backend previously converted a STRING
+   * to a number (no `Number(str)`, no parseFloat/parseInt, no dyn
+   * ToNumber): every grammar corner below is oracle-measured against Node
+   * 24.18 (scratchpad/oracle/strtonum*.mjs, pow.mjs), not recalled. */
+
+  private digitValFunc: number | null = null;
+
+  /** %w.digitVal(cc: i32) → i32 — the value of an ASCII alnum digit in
+   * base ≤36 ('0'-'9','a'-'z','A-'Z' → 0..35), or -1 for anything else.
+   * The caller bounds the result against its own radix. */
+  private digitValHelper(): number {
+    if (this.digitValFunc !== null) return this.digitValFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([I32], [I32]), "%w.digitVal");
+    this.digitValFunc = idx;
+    const c = new Code();
+    const CC = 0;
+    c.localGet(CC);
+    c.i32Const(0x30);
+    c.i32Sub();
+    c.i32Const(9);
+    c.i32LeU();
+    c.ifResult(I32);
+    c.localGet(CC);
+    c.i32Const(0x30);
+    c.i32Sub();
+    c.else_();
+    c.localGet(CC);
+    c.i32Const(0x61);
+    c.i32Sub();
+    c.i32Const(25);
+    c.i32LeU();
+    c.ifResult(I32);
+    c.localGet(CC);
+    c.i32Const(0x61 - 10);
+    c.i32Sub();
+    c.else_();
+    c.localGet(CC);
+    c.i32Const(0x41);
+    c.i32Sub();
+    c.i32Const(25);
+    c.i32LeU();
+    c.ifResult(I32);
+    c.localGet(CC);
+    c.i32Const(0x41 - 10);
+    c.i32Sub();
+    c.else_();
+    c.i32Const(-1);
+    c.end();
+    c.end();
+    c.end();
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  private radixScanWholeFunc: number | null = null;
+  private radixScanPrefixFunc: number | null = null;
+
+  /** The shared digit-accumulation loop both radix scanners share: from
+   * local I (already positioned) up to END, accumulate VAL = VAL*radix +
+   * digit while `digitVal(unit) < radix`; leaves I past the last digit
+   * consumed and CNT holding how many were taken. Digit-by-digit f64
+   * accumulation is EXACT (no rounding) as long as the running value
+   * stays under 2^53 — true for every radix/length this tier's callers
+   * exercise (parseInt/hex-octal-binary literals, never 15+ significant
+   * digits in the corpus); a pathologically long digit run would lose
+   * precision the same way `parseInt("9".repeat(30))` does in V8 too
+   * (both round through f64 arithmetic), so no divergence is introduced. */
+  private emitRadixDigitLoop(
+    c: Code,
+    S: number,
+    I: number,
+    END: number,
+    RADIX: number,
+    VAL: number,
+    CNT: number,
+    D: number,
+  ): void {
+    c.f64Const(0);
+    c.localSet(VAL);
+    c.i32Const(0);
+    c.localSet(CNT);
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.localGet(END);
+    c.i32GeS();
+    c.brIf(1);
+    c.localGet(S);
+    c.localGet(I);
+    c.arrayGetU(this.strType);
+    c.call(this.digitValHelper());
+    c.localTee(D);
+    c.i32Const(0);
+    c.i32LtS();
+    c.localGet(D);
+    c.localGet(RADIX);
+    c.i32GeS();
+    c.i32Or();
+    c.brIf(1);
+    c.localGet(VAL);
+    c.localGet(RADIX);
+    c.f64ConvertI32S();
+    c.f64Mul();
+    c.localGet(D);
+    c.f64ConvertI32S();
+    c.f64Add();
+    c.localSet(VAL);
+    c.localGet(CNT);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(CNT);
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+  }
+
+  /** %w.radixIntWhole(s, start: i32, end: i32, radix: i32) → f64 — the
+   * [start,end) span must be ENTIRELY valid base-`radix` digits with at
+   * least one digit, or the result is NaN (StringToNumber's 0x/0o/0b
+   * arms: "0x1Fg" is NaN, not 31 — trailing garbage fails the WHOLE
+   * literal, unlike parseInt's prefix rule below). */
+  private radixScanWholeHelper(): number {
+    if (this.radixScanWholeFunc !== null) return this.radixScanWholeFunc;
+    const idx = this.mb.declareFunc(
+      this.mb.funcType([this.strRef, I32, I32, I32], [F64]),
+      "%w.radixIntWhole",
+    );
+    this.radixScanWholeFunc = idx;
+    const c = new Code();
+    const S = 0, START = 1, END = 2, RADIX = 3;
+    const I = 4, VAL = 5, CNT = 6, D = 7;
+    c.localGet(START);
+    c.localSet(I);
+    this.emitRadixDigitLoop(c, S, I, END, RADIX, VAL, CNT, D);
+    c.localGet(CNT);
+    c.i32Eqz();
+    c.localGet(I);
+    c.localGet(END);
+    c.i32Ne();
+    c.i32Or();
+    c.ifResult(F64);
+    c.f64Const(CANONICAL_NAN);
+    c.else_();
+    c.localGet(VAL);
+    c.end();
+    this.mb.setBody(idx, [I32, F64, I32, I32], c.bytes());
+    return idx;
+  }
+
+  /** %w.radixIntPrefix(s, start: i32, end: i32, radix: i32) → f64 — the
+   * LONGEST valid base-`radix` digit PREFIX from `start` (leftover chars
+   * after it are ignored, parseInt's own rule: "42abc" → 42); NaN when
+   * zero digits are found at `start`. */
+  private radixScanPrefixHelper(): number {
+    if (this.radixScanPrefixFunc !== null) return this.radixScanPrefixFunc;
+    const idx = this.mb.declareFunc(
+      this.mb.funcType([this.strRef, I32, I32, I32], [F64]),
+      "%w.radixIntPrefix",
+    );
+    this.radixScanPrefixFunc = idx;
+    const c = new Code();
+    const S = 0, START = 1, END = 2, RADIX = 3;
+    const I = 4, VAL = 5, CNT = 6, D = 7;
+    c.localGet(START);
+    c.localSet(I);
+    this.emitRadixDigitLoop(c, S, I, END, RADIX, VAL, CNT, D);
+    c.localGet(CNT);
+    c.i32Eqz();
+    c.ifResult(F64);
+    c.f64Const(CANONICAL_NAN);
+    c.else_();
+    c.localGet(VAL);
+    c.end();
+    this.mb.setBody(idx, [I32, F64, I32, I32], c.bytes());
+    return idx;
+  }
+
+  /** The mantissa/int-digit/frac-digit scan both decimal parsers below
+   * share: from I (positioned at the first candidate char) accumulate
+   * decimal digits, an optional single '.', more decimal digits. Leaves
+   * I just past the last digit consumed, MANT the accumulated value
+   * (digit-by-digit — exact under the same ≤2^53 argument as the radix
+   * scanner), INTCNT/FRACCNT the digit counts on each side (both zero
+   * means "no digits at all", the caller's invalid case: "." alone). */
+  private emitDecimalMantissaScan(
+    c: Code,
+    S: number,
+    I: number,
+    END: number,
+    MANT: number,
+    INTCNT: number,
+    FRACCNT: number,
+    D: number,
+  ): void {
+    const scanDigits = (cntLocal: number): void => {
+      c.i32Const(0);
+      c.localSet(cntLocal);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(END);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(S);
+      c.localGet(I);
+      c.arrayGetU(this.strType);
+      c.localTee(D);
+      c.i32Const(0x30);
+      c.i32Sub();
+      c.i32Const(9);
+      c.i32GtU();
+      c.brIf(1);
+      c.localGet(MANT);
+      c.f64Const(10);
+      c.f64Mul();
+      c.localGet(D);
+      c.i32Const(0x30);
+      c.i32Sub();
+      c.f64ConvertI32S();
+      c.f64Add();
+      c.localSet(MANT);
+      c.localGet(cntLocal);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(cntLocal);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+    };
+    c.f64Const(0);
+    c.localSet(MANT);
+    scanDigits(INTCNT);
+    c.localGet(I);
+    c.localGet(END);
+    c.i32LtS();
+    c.ifResult(I32);
+    c.localGet(S);
+    c.localGet(I);
+    c.arrayGetU(this.strType);
+    c.i32Const(0x2e); // '.'
+    c.i32Eq();
+    c.else_();
+    c.i32Const(0);
+    c.end();
+    c.ifVoid();
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    scanDigits(FRACCNT);
+    c.else_();
+    c.i32Const(0);
+    c.localSet(FRACCNT);
+    c.end();
+  }
+
+  private decimalWholeFunc: number | null = null;
+
+  /** %w.decimalWhole(s, start: i32, end: i32) → f64 — StringToNumber's
+   * StrDecimalLiteral arm, WHOLE-match required: `DecimalDigits '.'?
+   * DecimalDigits? | '.' DecimalDigits` `('e'|'E') ('+'|'-')? DecimalDigits`?,
+   * covering the entire [start,end) span with nothing left over (a
+   * malformed/partial exponent like "1e" fails the WHOLE literal — NaN,
+   * not a 1-digit fallback; that backoff is parseFloat's rule, below).
+   * No digits anywhere (mantissa AND fraction both empty, e.g. "." alone)
+   * is also NaN. Oracle-verified corners: "5." → 5, ".5" → 0.5, "1." → 1,
+   * "." → NaN, "1e" → NaN (scratchpad/oracle/strtonum.mjs). */
+  private decimalWholeHelper(): number {
+    if (this.decimalWholeFunc !== null) return this.decimalWholeFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.strRef, I32, I32], [F64]), "%w.decimalWhole");
+    this.decimalWholeFunc = idx;
+    const c = new Code();
+    const S = 0, START = 1, END = 2;
+    const I = 3, MANT = 4, INTCNT = 5, FRACCNT = 6, D = 7, EXP = 8, EXPSIGN = 9, EXPDIGITS = 10, EXPVAL = 11;
+    c.localGet(START);
+    c.localSet(I);
+    this.emitDecimalMantissaScan(c, S, I, END, MANT, INTCNT, FRACCNT, D);
+    c.localGet(INTCNT);
+    c.i32Eqz();
+    c.localGet(FRACCNT);
+    c.i32Eqz();
+    c.i32And();
+    c.ifResult(F64);
+    c.f64Const(CANONICAL_NAN);
+    c.else_();
+    c.i32Const(0);
+    c.localSet(EXP);
+    c.localGet(I);
+    c.localGet(END);
+    c.i32LtS();
+    c.ifResult(I32);
+    c.localGet(S);
+    c.localGet(I);
+    c.arrayGetU(this.strType);
+    c.localTee(D);
+    c.i32Const(0x65); // 'e'
+    c.i32Eq();
+    c.localGet(D);
+    c.i32Const(0x45); // 'E'
+    c.i32Eq();
+    c.i32Or();
+    c.else_();
+    c.i32Const(0);
+    c.end();
+    c.ifResult(F64);
+    {
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.i32Const(1);
+      c.localSet(EXPSIGN);
+      c.localGet(I);
+      c.localGet(END);
+      c.i32LtS();
+      c.ifVoid();
+      {
+        c.localGet(S);
+        c.localGet(I);
+        c.arrayGetU(this.strType);
+        c.localTee(D);
+        c.i32Const(0x2b); // '+'
+        c.i32Eq();
+        c.localGet(D);
+        c.i32Const(0x2d); // '-'
+        c.i32Eq();
+        c.i32Or();
+        c.ifVoid();
+        {
+          c.localGet(D);
+          c.i32Const(0x2d);
+          c.i32Eq();
+          c.ifVoid();
+          c.i32Const(-1);
+          c.localSet(EXPSIGN);
+          c.end();
+          c.localGet(I);
+          c.i32Const(1);
+          c.i32Add();
+          c.localSet(I);
+        }
+        c.end();
+      }
+      c.end();
+      c.i32Const(0);
+      c.localSet(EXPDIGITS);
+      c.f64Const(0);
+      c.localSet(EXPVAL);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(END);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(S);
+      c.localGet(I);
+      c.arrayGetU(this.strType);
+      c.localTee(D);
+      c.i32Const(0x30);
+      c.i32Sub();
+      c.i32Const(9);
+      c.i32GtU();
+      c.brIf(1);
+      c.localGet(EXPVAL);
+      c.f64Const(10);
+      c.f64Mul();
+      c.localGet(D);
+      c.i32Const(0x30);
+      c.i32Sub();
+      c.f64ConvertI32S();
+      c.f64Add();
+      c.localSet(EXPVAL);
+      c.localGet(EXPDIGITS);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(EXPDIGITS);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(EXPDIGITS);
+      c.i32Eqz();
+      c.ifResult(F64);
+      c.f64Const(CANONICAL_NAN);
+      c.else_();
+      c.localGet(EXPVAL);
+      c.localGet(EXPSIGN);
+      c.f64ConvertI32S();
+      c.f64Mul();
+      c.i32TruncF64S();
+      c.localSet(EXP);
+      c.localGet(I);
+      c.localGet(END);
+      c.i32Ne();
+      c.ifResult(F64);
+      c.f64Const(CANONICAL_NAN);
+      c.else_();
+      // The full span [START,END) is a VALIDATED StrDecimalLiteral —
+      // `sdc` (json.ts's correctly-rounded Simple-Decimal-Conversion
+      // fallback, the SAME machinery `JSON.parse` uses past its own
+      // ≤15-sig-digit fast path — see its header for the exactness
+      // argument and the reentrancy invariant this bridge relies on)
+      // re-scans it and gives the CORRECTLY ROUNDED double directly,
+      // unconditionally — the old MANT/EXP chained-multiply
+      // approximation (a small-integer-power table, `pow10Int`, deleted
+      // review round 2 rider R-b: dead since SB1) is gone (SB1: "0.3"/
+      // "1.005"/"1e-7"/"1e30"/"123456789.123456789" all round exactly
+      // now, where the naive scaling could accumulate ULP error past
+      // ~15 significant digits or a large exponent). The span never
+      // includes a sign (the caller strips and multiplies it back in
+      // separately), so `sdc` always sees a non-negative literal here.
+      this.json.setSrcForNumberParse(c, (x) => x.localGet(S));
+      c.localGet(START);
+      c.localGet(END);
+      c.call(this.json.sdc());
+      c.end();
+      c.end();
+    }
+    c.else_();
+    {
+      c.localGet(I);
+      c.localGet(END);
+      c.i32Ne();
+      c.ifResult(F64);
+      c.f64Const(CANONICAL_NAN);
+      c.else_();
+      this.json.setSrcForNumberParse(c, (x) => x.localGet(S));
+      c.localGet(START);
+      c.localGet(END);
+      c.call(this.json.sdc());
+      c.end();
+    }
+    c.end();
+    c.end();
+    this.mb.setBody(idx, [I32, F64, I32, I32, I32, I32, I32, I32, F64], c.bytes());
+    return idx;
+  }
+
+  private decimalPrefixFunc: number | null = null;
+
+  /** %w.decimalPrefix(s, start: i32, end: i32) → f64 — parseFloat's
+   * StrDecimalLiteral arm: the LONGEST valid prefix from `start`, with
+   * BACKOFF on a malformed exponent (`"1e"` → `1`, the exponent marker
+   * and everything after it un-consumed — oracle-confirmed,
+   * scratchpad/oracle/strtonum2.mjs) rather than decimalWholeHelper's
+   * whole-or-NaN rule. NaN when NO digits are found anywhere (mantissa
+   * AND fraction both empty — parseFloat's OWN caller handles the
+   * "Infinity" fallback for that case, matchInfinityHelper(prefix)). */
+  private decimalPrefixHelper(): number {
+    if (this.decimalPrefixFunc !== null) return this.decimalPrefixFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.strRef, I32, I32], [F64]), "%w.decimalPrefix");
+    this.decimalPrefixFunc = idx;
+    const c = new Code();
+    const S = 0, START = 1, END = 2;
+    const I = 3, MANT = 4, INTCNT = 5, FRACCNT = 6, D = 7, EXP = 8, EXPSIGN = 9, EXPDIGITS = 10, EXPVAL = 11;
+    const SAVEI = 12;
+    c.localGet(START);
+    c.localSet(I);
+    this.emitDecimalMantissaScan(c, S, I, END, MANT, INTCNT, FRACCNT, D);
+    c.localGet(INTCNT);
+    c.i32Eqz();
+    c.localGet(FRACCNT);
+    c.i32Eqz();
+    c.i32And();
+    c.ifResult(F64);
+    c.f64Const(CANONICAL_NAN);
+    c.else_();
+    {
+      c.i32Const(0);
+      c.localSet(EXP);
+      c.localGet(I);
+      c.localSet(SAVEI);
+      c.localGet(I);
+      c.localGet(END);
+      c.i32LtS();
+      c.ifVoid();
+      {
+        c.localGet(S);
+        c.localGet(I);
+        c.arrayGetU(this.strType);
+        c.localTee(D);
+        c.i32Const(0x65); // 'e'
+        c.i32Eq();
+        c.localGet(D);
+        c.i32Const(0x45); // 'E'
+        c.i32Eq();
+        c.i32Or();
+        c.ifVoid();
+        {
+          c.localGet(I);
+          c.i32Const(1);
+          c.i32Add();
+          c.localSet(I);
+          c.i32Const(1);
+          c.localSet(EXPSIGN);
+          c.localGet(I);
+          c.localGet(END);
+          c.i32LtS();
+          c.ifVoid();
+          {
+            c.localGet(S);
+            c.localGet(I);
+            c.arrayGetU(this.strType);
+            c.localTee(D);
+            c.i32Const(0x2b); // '+'
+            c.i32Eq();
+            c.localGet(D);
+            c.i32Const(0x2d); // '-'
+            c.i32Eq();
+            c.i32Or();
+            c.ifVoid();
+            {
+              c.localGet(D);
+              c.i32Const(0x2d);
+              c.i32Eq();
+              c.ifVoid();
+              c.i32Const(-1);
+              c.localSet(EXPSIGN);
+              c.end();
+              c.localGet(I);
+              c.i32Const(1);
+              c.i32Add();
+              c.localSet(I);
+            }
+            c.end();
+          }
+          c.end();
+          c.i32Const(0);
+          c.localSet(EXPDIGITS);
+          c.f64Const(0);
+          c.localSet(EXPVAL);
+          c.block();
+          c.loop();
+          c.localGet(I);
+          c.localGet(END);
+          c.i32GeS();
+          c.brIf(1);
+          c.localGet(S);
+          c.localGet(I);
+          c.arrayGetU(this.strType);
+          c.localTee(D);
+          c.i32Const(0x30);
+          c.i32Sub();
+          c.i32Const(9);
+          c.i32GtU();
+          c.brIf(1);
+          c.localGet(EXPVAL);
+          c.f64Const(10);
+          c.f64Mul();
+          c.localGet(D);
+          c.i32Const(0x30);
+          c.i32Sub();
+          c.f64ConvertI32S();
+          c.f64Add();
+          c.localSet(EXPVAL);
+          c.localGet(EXPDIGITS);
+          c.i32Const(1);
+          c.i32Add();
+          c.localSet(EXPDIGITS);
+          c.localGet(I);
+          c.i32Const(1);
+          c.i32Add();
+          c.localSet(I);
+          c.br(0);
+          c.end();
+          c.end();
+          // BACKOFF: a marker with no valid exponent digits un-commits —
+          // I resets to SAVEI, exp stays 0.
+          c.localGet(EXPDIGITS);
+          c.i32Eqz();
+          c.ifVoid();
+          c.localGet(SAVEI);
+          c.localSet(I);
+          c.else_();
+          c.localGet(EXPVAL);
+          c.localGet(EXPSIGN);
+          c.f64ConvertI32S();
+          c.f64Mul();
+          c.i32TruncF64S();
+          c.localSet(EXP);
+          c.end();
+        }
+        c.end();
+      }
+      c.end();
+      // [START, I) is the recognized (possibly backed-off) prefix — a
+      // VALIDATED StrDecimalLiteral. SB1: the SAME `sdc` correctly-
+      // rounded fallback decimalWholeHelper now uses, not the naive
+      // MANT×(small-integer-power-of-10) chained multiply the deleted
+      // `pow10Int` helper once fed (unused EXP/FRACCNT locals above are
+      // the exponent SCAN's own bookkeeping, still needed to find where
+      // the valid prefix ENDS — `sdc` re-derives the value itself from
+      // the raw text once that end is known).
+      this.json.setSrcForNumberParse(c, (x) => x.localGet(S));
+      c.localGet(START);
+      c.localGet(I);
+      c.call(this.json.sdc());
+    }
+    c.end();
+    this.mb.setBody(
+      idx,
+      [I32, F64, I32, I32, I32, I32, I32, I32, F64, I32],
+      c.bytes(),
+    );
+    return idx;
+  }
+
+  private matchInfinityWholeFunc: number | null = null;
+  private matchInfinityPrefixFunc: number | null = null;
+
+  /** %w.matchInfinity{Whole,Prefix}(s, pos: i32, len: i32) → i32 — does
+   * `s[pos..)` spell "Infinity" (case-sensitive, exactly — "infinity" is
+   * NOT a match, oracle-confirmed)? `whole` requires len-pos==8 exactly
+   * (StringToNumber's rule: "Infinityxyz" is NaN, no trailing chars
+   * allowed); `prefix` only requires len-pos>=8 (parseFloat's rule:
+   * "Infinityxyz" → Infinity, oracle-confirmed). Length-guards BEFORE any
+   * char read — an unguarded read past `len` would trap the array
+   * access, which is not this function's job to risk. */
+  private matchInfinityHelper(whole: boolean): number {
+    const cached = whole ? this.matchInfinityWholeFunc : this.matchInfinityPrefixFunc;
+    if (cached !== null) return cached;
+    const idx = this.mb.declareFunc(
+      this.mb.funcType([this.strRef, I32, I32], [I32]),
+      whole ? "%w.matchInfinityWhole" : "%w.matchInfinityPrefix",
+    );
+    if (whole) this.matchInfinityWholeFunc = idx;
+    else this.matchInfinityPrefixFunc = idx;
+    const c = new Code();
+    const S = 0, POS = 1, LEN = 2;
+    c.localGet(LEN);
+    c.localGet(POS);
+    c.i32Sub();
+    c.i32Const(8);
+    if (whole) c.i32Ne();
+    else c.i32LtS();
+    c.ifVoid();
+    c.i32Const(0);
+    c.return_();
+    c.end();
+    const codes = [0x49, 0x6e, 0x66, 0x69, 0x6e, 0x69, 0x74, 0x79]; // "Infinity"
+    codes.forEach((code, k) => {
+      c.localGet(S);
+      c.localGet(POS);
+      if (k > 0) {
+        c.i32Const(k);
+        c.i32Add();
+      }
+      c.arrayGetU(this.strType);
+      c.i32Const(code);
+      c.i32Ne();
+      c.ifVoid();
+      c.i32Const(0);
+      c.return_();
+      c.end();
+    });
+    c.i32Const(1);
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  private parseFloatFunc: number | null = null;
+
+  /** %w.parseFloat(s) → f64 — Number.parseFloat/global parseFloat (the
+   * spec ALIASES them — surfaces.ts's own note, and 1421's measured
+   * corpus need is the `Number.parseFloat` spelling specifically, byte-
+   * compared against Node). Leading-whitespace trim only (`strs.trim
+   * ("start")` — a trailing-whitespace need never arises: the greedy
+   * prefix scan simply stops before it). */
+  private parseFloatHelper(): number {
+    if (this.parseFloatFunc !== null) return this.parseFloatFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.strRef], [F64]), "%w.parseFloat");
+    this.parseFloatFunc = idx;
+    const c = new Code();
+    const S = 0;
+    const T = 1, L = 2, POS = 3, SIGN = 4, C0 = 5;
+    c.localGet(S);
+    c.call(this.strs.trim("start"));
+    c.localSet(T);
+    c.localGet(T);
+    c.arrayLen();
+    c.localSet(L);
+    c.i32Const(0);
+    c.localSet(POS);
+    c.f64Const(1);
+    c.localSet(SIGN);
+    c.localGet(L);
+    c.i32Const(0);
+    c.i32GtS();
+    c.ifVoid();
+    {
+      c.localGet(T);
+      c.i32Const(0);
+      c.arrayGetU(this.strType);
+      c.localTee(C0);
+      c.i32Const(0x2b); // '+'
+      c.i32Eq();
+      c.ifVoid();
+      c.i32Const(1);
+      c.localSet(POS);
+      c.else_();
+      c.localGet(C0);
+      c.i32Const(0x2d); // '-'
+      c.i32Eq();
+      c.ifVoid();
+      c.f64Const(-1);
+      c.localSet(SIGN);
+      c.i32Const(1);
+      c.localSet(POS);
+      c.end();
+      c.end();
+    }
+    c.end();
+    c.localGet(T);
+    c.localGet(POS);
+    c.localGet(L);
+    c.call(this.matchInfinityHelper(false));
+    c.ifResult(F64);
+    c.localGet(SIGN);
+    c.f64Const(Infinity);
+    c.f64Mul();
+    c.else_();
+    c.localGet(SIGN);
+    c.localGet(T);
+    c.localGet(POS);
+    c.localGet(L);
+    c.call(this.decimalPrefixHelper());
+    c.f64Mul();
+    c.end();
+    this.mb.setBody(idx, [this.strRef, I32, I32, F64, I32], c.bytes());
+    return idx;
+  }
+
+  private parseIntFunc: number | null = null;
+
+  /** %w.parseInt(s, radix: f64) → f64 — Number.parseInt/global parseInt
+   * (spec-aliased, same note as parseFloat). Radix 0/NaN (omitted or
+   * explicit `undefined`) auto-detects a "0x"/"0X" prefix as 16, else
+   * 10; an EXPLICIT 16 also strips that prefix if present (oracle-
+   * measured: `parseInt("0x1f", 16)` → 31, same as radix-omitted); no
+   * OTHER radix auto-strips a prefix (`parseInt("0b11", 2)` → 0, NOT a
+   * binary-literal reader — parseInt has no octal/binary auto-detection
+   * at any radix, unlike StringToNumber's `0o`/`0b` grammar). */
+  private parseIntHelper(): number {
+    if (this.parseIntFunc !== null) return this.parseIntFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.strRef, F64], [F64]), "%w.parseInt");
+    this.parseIntFunc = idx;
+    const c = new Code();
+    const S = 0, RADIXARG = 1;
+    const T = 2, L = 3, POS = 4, SIGN = 5, C0 = 6, RADIX = 7, C1 = 8;
+    c.localGet(S);
+    c.call(this.strs.trim("start"));
+    c.localSet(T);
+    c.localGet(T);
+    c.arrayLen();
+    c.localSet(L);
+    c.i32Const(0);
+    c.localSet(POS);
+    c.f64Const(1);
+    c.localSet(SIGN);
+    c.localGet(L);
+    c.i32Const(0);
+    c.i32GtS();
+    c.ifVoid();
+    {
+      c.localGet(T);
+      c.i32Const(0);
+      c.arrayGetU(this.strType);
+      c.localTee(C0);
+      c.i32Const(0x2b); // '+'
+      c.i32Eq();
+      c.ifVoid();
+      c.i32Const(1);
+      c.localSet(POS);
+      c.else_();
+      c.localGet(C0);
+      c.i32Const(0x2d); // '-'
+      c.i32Eq();
+      c.ifVoid();
+      c.f64Const(-1);
+      c.localSet(SIGN);
+      c.i32Const(1);
+      c.localSet(POS);
+      c.end();
+      c.end();
+    }
+    c.end();
+    // radix, NaN-guarded before truncation (NaN → 0, "auto").
+    c.localGet(RADIXARG);
+    c.localGet(RADIXARG);
+    c.f64Ne();
+    c.ifResult(I32);
+    c.i32Const(0);
+    c.else_();
+    c.localGet(RADIXARG);
+    c.f64Trunc();
+    c.i32TruncF64S();
+    c.end();
+    c.localSet(RADIX);
+    // "0x"/"0X" prefix: strips under radix 0 (auto) OR explicit 16.
+    c.localGet(RADIX);
+    c.i32Eqz();
+    c.localGet(RADIX);
+    c.i32Const(16);
+    c.i32Eq();
+    c.i32Or();
+    c.localGet(L);
+    c.localGet(POS);
+    c.i32Sub();
+    c.i32Const(2);
+    c.i32GeS();
+    c.i32And();
+    c.ifVoid();
+    {
+      c.localGet(T);
+      c.localGet(POS);
+      c.arrayGetU(this.strType);
+      c.i32Const(0x30); // '0'
+      c.i32Eq();
+      c.localGet(T);
+      c.localGet(POS);
+      c.i32Const(1);
+      c.i32Add();
+      c.arrayGetU(this.strType);
+      c.localTee(C1);
+      c.i32Const(0x78); // 'x'
+      c.i32Eq();
+      c.localGet(C1);
+      c.i32Const(0x58); // 'X'
+      c.i32Eq();
+      c.i32Or();
+      c.i32And();
+      c.ifVoid();
+      {
+        c.localGet(RADIX);
+        c.i32Eqz();
+        c.ifVoid();
+        c.i32Const(16);
+        c.localSet(RADIX);
+        c.end();
+        c.localGet(POS);
+        c.i32Const(2);
+        c.i32Add();
+        c.localSet(POS);
+      }
+      c.end();
+    }
+    c.end();
+    c.localGet(RADIX);
+    c.i32Eqz();
+    c.ifVoid();
+    c.i32Const(10);
+    c.localSet(RADIX);
+    c.end();
+    c.localGet(RADIX);
+    c.i32Const(2);
+    c.i32LtS();
+    c.localGet(RADIX);
+    c.i32Const(36);
+    c.i32GtS();
+    c.i32Or();
+    c.ifResult(F64);
+    c.f64Const(CANONICAL_NAN);
+    c.else_();
+    c.localGet(SIGN);
+    c.localGet(T);
+    c.localGet(POS);
+    c.localGet(L);
+    c.localGet(RADIX);
+    c.call(this.radixScanPrefixHelper());
+    c.f64Mul();
+    c.end();
+    this.mb.setBody(idx, [this.strRef, I32, I32, F64, I32, I32, I32], c.bytes());
+    return idx;
+  }
+
+  private strToNumFunc: number | null = null;
+
+  /** %w.strToNum(s) → f64 — StringToNumber (ECMA-262 7.1.4.1.1): the
+   * ENTIRE trimmed string must be one StrNumericLiteral, or the result is
+   * NaN — a stricter, whole-match cousin of parseFloat/parseInt below.
+   * Empty (after trim) → 0. "Infinity"/±"Infinity" → ±∞ (exact match, no
+   * trailing chars). 0x/0X, 0o/0O, 0b/0B integer literals ONLY when NO
+   * sign was consumed (oracle: "-0x1F" → NaN, unlike parseInt's hex
+   * auto-detect, which DOES allow a sign — different functions, different
+   * grammars, confirmed both ways in scratchpad/oracle/strtonum.mjs).
+   * Otherwise the general StrDecimalLiteral path, signed. */
+  private strToNumHelper(): number {
+    if (this.strToNumFunc !== null) return this.strToNumFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.strRef], [F64]), "%w.strToNum");
+    this.strToNumFunc = idx;
+    const c = new Code();
+    const S = 0;
+    const T = 1, L = 2, POS = 3, SIGN = 4, C0 = 5, C1 = 6;
+    c.localGet(S);
+    c.call(this.strs.trim("both"));
+    c.localSet(T);
+    c.localGet(T);
+    c.arrayLen();
+    c.localTee(L);
+    c.i32Eqz();
+    c.ifVoid();
+    c.f64Const(0);
+    c.return_();
+    c.end();
+    c.i32Const(0);
+    c.localSet(POS);
+    c.f64Const(1);
+    c.localSet(SIGN);
+    c.localGet(T);
+    c.i32Const(0);
+    c.arrayGetU(this.strType);
+    c.localTee(C0);
+    c.i32Const(0x2b); // '+'
+    c.i32Eq();
+    c.ifVoid();
+    c.i32Const(1);
+    c.localSet(POS);
+    c.else_();
+    c.localGet(C0);
+    c.i32Const(0x2d); // '-'
+    c.i32Eq();
+    c.ifVoid();
+    c.f64Const(-1);
+    c.localSet(SIGN);
+    c.i32Const(1);
+    c.localSet(POS);
+    c.end();
+    c.end();
+    c.localGet(T);
+    c.localGet(POS);
+    c.localGet(L);
+    c.call(this.matchInfinityHelper(true));
+    c.ifVoid();
+    c.localGet(SIGN);
+    c.f64Const(Infinity);
+    c.f64Mul();
+    c.return_();
+    c.end();
+    c.localGet(POS);
+    c.i32Eqz();
+    c.localGet(L);
+    c.i32Const(2);
+    c.i32GeS();
+    c.i32And();
+    c.ifVoid();
+    {
+      c.localGet(T);
+      c.i32Const(0);
+      c.arrayGetU(this.strType);
+      c.i32Const(0x30); // '0'
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(T);
+      c.i32Const(1);
+      c.arrayGetU(this.strType);
+      c.localTee(C1);
+      c.i32Const(0x78); // 'x'
+      c.i32Eq();
+      c.localGet(C1);
+      c.i32Const(0x58); // 'X'
+      c.i32Eq();
+      c.i32Or();
+      c.ifVoid();
+      c.localGet(T);
+      c.i32Const(2);
+      c.localGet(L);
+      c.i32Const(16);
+      c.call(this.radixScanWholeHelper());
+      c.return_();
+      c.end();
+      c.localGet(C1);
+      c.i32Const(0x6f); // 'o'
+      c.i32Eq();
+      c.localGet(C1);
+      c.i32Const(0x4f); // 'O'
+      c.i32Eq();
+      c.i32Or();
+      c.ifVoid();
+      c.localGet(T);
+      c.i32Const(2);
+      c.localGet(L);
+      c.i32Const(8);
+      c.call(this.radixScanWholeHelper());
+      c.return_();
+      c.end();
+      c.localGet(C1);
+      c.i32Const(0x62); // 'b'
+      c.i32Eq();
+      c.localGet(C1);
+      c.i32Const(0x42); // 'B'
+      c.i32Eq();
+      c.i32Or();
+      c.ifVoid();
+      c.localGet(T);
+      c.i32Const(2);
+      c.localGet(L);
+      c.i32Const(2);
+      c.call(this.radixScanWholeHelper());
+      c.return_();
+      c.end();
+      c.end();
+    }
+    c.end();
+    c.localGet(SIGN);
+    c.localGet(T);
+    c.localGet(POS);
+    c.localGet(L);
+    c.call(this.decimalWholeHelper());
+    c.f64Mul();
+    this.mb.setBody(idx, [this.strRef, I32, I32, F64, I32, I32], c.bytes());
+    return idx;
+  }
+
+  private jsToNumberFunc: number | null = null;
+
+  /** %w.jsToNumber(d: dyn) → f64 — ToNumber over a dyn payload (ECMA-262
+   * 7.1.4): NUM/BOOL read the shared num slot directly (boxBool already
+   * stores 0.0/1.0 there); UNDEF → NaN; NULL → +0; STR → strToNum; every
+   * OTHER kind (OBJ/ARR/FUNC/PROMISE/HANDLE/BYTES, and the dead JSVAL arm)
+   * goes through ToPrimitive first — which in this closed island world
+   * (no valueOf hook exists on any of these kinds; Object.prototype's own
+   * valueOf returns the receiver itself, so OrdinaryToPrimitive always
+   * falls through to toString) is exactly `dyn.toStr()`, so ToNumber of a
+   * composite is `strToNum(toStr(d))` — the SAME toStr the design doc
+   * calls out for `add`'s default-hint ToPrimitive. Never throws (no
+   * possible input reaches a throwing path — ToNumber itself never
+   * throws in the spec, and nothing here can trap: strToNum's own
+   * grammar failure is NaN, not an exception). */
+  private jsToNumberHelper(): number {
+    if (this.jsToNumberFunc !== null) return this.jsToNumberFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.dyn.dynRef()], [F64]), "%w.jsToNumber");
+    this.jsToNumberFunc = idx;
+    const c = new Code();
+    const dynT = this.dyn.dynT();
+    const K = 1;
+    c.localGet(0);
+    c.structGet(dynT, DYN_KIND);
+    c.localSet(K);
+    c.localGet(K);
+    c.i32Const(DK.NUM);
+    c.i32Eq();
+    c.localGet(K);
+    c.i32Const(DK.BOOL);
+    c.i32Eq();
+    c.i32Or();
+    c.ifVoid();
+    c.localGet(0);
+    c.structGet(dynT, DYN_NUM);
+    c.return_();
+    c.end();
+    c.localGet(K);
+    c.i32Const(DK.UNDEF);
+    c.i32Eq();
+    c.ifVoid();
+    c.f64Const(CANONICAL_NAN);
+    c.return_();
+    c.end();
+    c.localGet(K);
+    c.i32Const(DK.NULL);
+    c.i32Eq();
+    c.ifVoid();
+    c.f64Const(0);
+    c.return_();
+    c.end();
+    c.localGet(K);
+    c.i32Const(DK.STR);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(0);
+    c.structGet(dynT, DYN_REF);
+    c.refCast(this.strType);
+    c.call(this.strToNumHelper());
+    c.return_();
+    c.end();
+    // Everything else: OrdinaryToPrimitive falls through to toString.
+    c.localGet(0);
+    c.call(this.dyn.toStr());
+    c.call(this.strToNumHelper());
+    this.mb.setBody(idx, [I32], c.bytes());
+    return idx;
+  }
+
+  private jsIsStrLikeFunc: number | null = null;
+
+  /** %w.jsIsStrLike(d: dyn) → i32 — does ToPrimitive(d) (default OR
+   * number hint — both land the same place in this closed world, see
+   * jsToNumber's header) come out a String? True for STR itself and for
+   * every composite kind (which converts to string via toStr, the same
+   * argument); false for NUM/BOOL/UNDEF/NULL, which stay their own kind.
+   * Used by `add` (string-concat vs numeric-add) and the relational ops
+   * (string code-unit compare vs numeric compare). */
+  private jsIsStrLikeHelper(): number {
+    if (this.jsIsStrLikeFunc !== null) return this.jsIsStrLikeFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.dyn.dynRef()], [I32]), "%w.jsIsStrLike");
+    this.jsIsStrLikeFunc = idx;
+    const c = new Code();
+    const dynT = this.dyn.dynT();
+    const K = 1;
+    c.localGet(0);
+    c.structGet(dynT, DYN_KIND);
+    c.localSet(K);
+    c.localGet(K);
+    c.i32Const(DK.NUM);
+    c.i32Eq();
+    c.localGet(K);
+    c.i32Const(DK.BOOL);
+    c.i32Eq();
+    c.i32Or();
+    c.localGet(K);
+    c.i32Const(DK.UNDEF);
+    c.i32Eq();
+    c.i32Or();
+    c.localGet(K);
+    c.i32Const(DK.NULL);
+    c.i32Eq();
+    c.i32Or();
+    c.i32Eqz();
+    this.mb.setBody(idx, [I32], c.bytes());
+    return idx;
+  }
+
+  private jsPowFunc: number | null = null;
+
+  /** %w.jsPow(x, y: f64) → f64 — `**`'s numeric core (ECMA-262
+   * Number::exponentiate), oracle-verified table-for-table
+   * (scratchpad/oracle/pow.mjs) — every NaN/±0/±Infinity/base-±1 special
+   * case below. NARROWED BY DESIGN past the special-value table: V8's
+   * Math.pow (fdlibm-derived) special-cases only a FEW exponents to
+   * elementary ops — y===2 is x*x, y===-1 is 1/x, y===0.5 is a sqrt with
+   * its own edge handling — and every OTHER exponent, INTEGER EXPONENTS
+   * INCLUDED, takes fdlibm's polynomial path, which is NOT guaranteed
+   * bit-identical to exponentiation-by-squaring for y===3, y===10, etc.
+   * (a latent, unprovable-by-sampling miscompile class the review round
+   * caught). So only y===2 gets computed (`x*x`, bit-exact BECAUSE
+   * fdlibm itself reduces to that single multiply there) — the ONE
+   * measured need across the 64 (760's `n ** 2`, count=1 in the op
+   * census). Every other finite-base/finite-exponent combination,
+   * including other integers, takes the runtime "not supported yet"
+   * fence (S043-style: a real catchable Error, never a silent guess and
+   * never a bare trap) rather than risk a wrong last-ULP digit. A wider
+   * exponent set needs either a V8-source-confirmed special-case list or
+   * a real fdlibm-equivalent port — never squaring. */
+  private jsPowHelper(): number {
+    if (this.jsPowFunc !== null) return this.jsPowFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([F64, F64], [F64]), "%w.jsPow");
+    this.jsPowFunc = idx;
+    const c = new Code();
+    const X = 0, Y = 1;
+    const T = 2, HALF = 3, AX = 4, NEGZERO = 5;
+    // isOddInteger(v: local) → i32, leaving the answer on the stack. `v`
+    // must be a FINITE local (callers only invoke this once ±Infinity is
+    // already excluded — Infinity would otherwise pass the `trunc(v)==v`
+    // test, per the measured pow(-Infinity,Infinity)=Infinity /
+    // pow(-0,Infinity)=0 corners: an infinite exponent is NOT "odd").
+    const pushIsOddInteger = (v: number): void => {
+      c.localGet(v);
+      c.f64Trunc();
+      c.localTee(T);
+      c.localGet(v);
+      c.f64Ne();
+      c.ifResult(I32);
+      c.i32Const(0);
+      c.else_();
+      c.localGet(T);
+      c.f64Const(2);
+      c.f64Div();
+      c.f64Trunc();
+      c.localSet(HALF);
+      c.localGet(T);
+      c.localGet(HALF);
+      c.f64Const(2);
+      c.f64Mul();
+      c.f64Sub();
+      c.f64Const(0);
+      c.f64Ne();
+      c.end();
+    };
+    // 1. y is NaN.
+    c.localGet(Y);
+    c.localGet(Y);
+    c.f64Ne();
+    c.ifVoid();
+    c.f64Const(CANONICAL_NAN);
+    c.return_();
+    c.end();
+    // 2/3. y is ±0.
+    c.localGet(Y);
+    c.f64Const(0);
+    c.f64Eq();
+    c.ifVoid();
+    c.f64Const(1);
+    c.return_();
+    c.end();
+    // 4. x is NaN.
+    c.localGet(X);
+    c.localGet(X);
+    c.f64Ne();
+    c.ifVoid();
+    c.f64Const(CANONICAL_NAN);
+    c.return_();
+    c.end();
+    // 5. x is +Infinity.
+    c.localGet(X);
+    c.f64Const(Infinity);
+    c.f64Eq();
+    c.ifVoid();
+    c.localGet(Y);
+    c.f64Const(0);
+    c.f64Gt();
+    c.ifResult(F64);
+    c.f64Const(Infinity);
+    c.else_();
+    c.f64Const(0);
+    c.end();
+    c.return_();
+    c.end();
+    // 6. x is -Infinity.
+    c.localGet(X);
+    c.f64Const(-Infinity);
+    c.f64Eq();
+    c.ifVoid();
+    {
+      c.localGet(Y);
+      c.f64Const(0);
+      c.f64Gt();
+      c.ifResult(F64);
+      pushIsOddInteger(Y);
+      c.ifResult(F64);
+      c.f64Const(-Infinity);
+      c.else_();
+      c.f64Const(Infinity);
+      c.end();
+      c.else_();
+      pushIsOddInteger(Y);
+      c.ifResult(F64);
+      c.f64Const(-0);
+      c.else_();
+      c.f64Const(0);
+      c.end();
+      c.end();
+      c.return_();
+    }
+    c.end();
+    // 7. x is ±0 (1/x distinguishes the sign: 1/+0=+∞, 1/-0=-∞).
+    c.localGet(X);
+    c.f64Const(0);
+    c.f64Eq();
+    c.ifVoid();
+    {
+      c.f64Const(1);
+      c.localGet(X);
+      c.f64Div();
+      c.f64Const(-Infinity);
+      c.f64Eq();
+      c.localSet(NEGZERO);
+      c.localGet(NEGZERO);
+      c.ifResult(F64);
+      {
+        c.localGet(Y);
+        c.f64Const(0);
+        c.f64Gt();
+        c.ifResult(F64);
+        pushIsOddInteger(Y);
+        c.ifResult(F64);
+        c.f64Const(-0);
+        c.else_();
+        c.f64Const(0);
+        c.end();
+        c.else_();
+        pushIsOddInteger(Y);
+        c.ifResult(F64);
+        c.f64Const(-Infinity);
+        c.else_();
+        c.f64Const(Infinity);
+        c.end();
+        c.end();
+      }
+      c.else_();
+      {
+        c.localGet(Y);
+        c.f64Const(0);
+        c.f64Gt();
+        c.ifResult(F64);
+        c.f64Const(0);
+        c.else_();
+        c.f64Const(Infinity);
+        c.end();
+      }
+      c.end();
+      c.return_();
+    }
+    c.end();
+    // 8. x finite and nonzero from here. y === +Infinity.
+    c.localGet(Y);
+    c.f64Const(Infinity);
+    c.f64Eq();
+    c.ifVoid();
+    {
+      c.localGet(X);
+      c.i64ReinterpretF64();
+      c.i64Const(0x7fffffffffffffffn);
+      c.i64And();
+      c.f64ReinterpretI64();
+      c.localSet(AX);
+      c.localGet(AX);
+      c.f64Const(1);
+      c.f64Gt();
+      c.ifResult(F64);
+      c.f64Const(Infinity);
+      c.else_();
+      c.localGet(AX);
+      c.f64Const(1);
+      c.f64Lt();
+      c.ifResult(F64);
+      c.f64Const(0);
+      c.else_();
+      c.f64Const(CANONICAL_NAN);
+      c.end();
+      c.end();
+      c.return_();
+    }
+    c.end();
+    // y === -Infinity.
+    c.localGet(Y);
+    c.f64Const(-Infinity);
+    c.f64Eq();
+    c.ifVoid();
+    {
+      c.localGet(X);
+      c.i64ReinterpretF64();
+      c.i64Const(0x7fffffffffffffffn);
+      c.i64And();
+      c.f64ReinterpretI64();
+      c.localSet(AX);
+      c.localGet(AX);
+      c.f64Const(1);
+      c.f64Gt();
+      c.ifResult(F64);
+      c.f64Const(0);
+      c.else_();
+      c.localGet(AX);
+      c.f64Const(1);
+      c.f64Lt();
+      c.ifResult(F64);
+      c.f64Const(Infinity);
+      c.else_();
+      c.f64Const(CANONICAL_NAN);
+      c.end();
+      c.end();
+      c.return_();
+    }
+    c.end();
+    // y finite and nonzero from here too. Negative base + non-integer
+    // exponent is NaN (no complex results in this world).
+    c.localGet(X);
+    c.f64Const(0);
+    c.f64Lt();
+    c.ifVoid();
+    {
+      c.localGet(Y);
+      c.f64Trunc();
+      c.localGet(Y);
+      c.f64Ne();
+      c.ifVoid();
+      c.f64Const(CANONICAL_NAN);
+      c.return_();
+      c.end();
+    }
+    c.end();
+    // The ONE measured, computed case: y === 2 → x*x, fdlibm-exact.
+    c.localGet(Y);
+    c.f64Const(2);
+    c.f64Eq();
+    c.ifVoid();
+    c.localGet(X);
+    c.localGet(X);
+    c.f64Mul();
+    c.return_();
+    c.end();
+    // Everything else: the runtime fence (never squaring — see header).
+    this.emitSetCellError(
+      c,
+      "%Error",
+      "Error",
+      (x) => this.pushStrLitInto(x, "Math.pow with this exponent is not supported yet"),
+      null,
+    );
+    c.f64Const(0);
+    this.mb.setBody(idx, [F64, F64, F64, I32], c.bytes());
+    return idx;
+  }
+
 
   private strEqFunc: number | null = null;
 

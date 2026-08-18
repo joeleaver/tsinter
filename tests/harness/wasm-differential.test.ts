@@ -1541,6 +1541,219 @@ const TIER_FLOOR: string[] = [
   "2632-dyn-jsval-iterate.js",
   "767-string-literal-keys.ts",
   "968-jsval-lift.ts",
+  // Increment 21 stage B, gate 1 (coercion ops over jsval ≡ dyn payloads):
+  // add/sub/mul/div/mod/pow/neg/plus/lt/le/gt/ge/eq/neq, all newly
+  // implemented (ToPrimitive/ToNumber/ToString via jsToNumber/dyn.toStr,
+  // a from-scratch StringToNumber grammar, and dyn.strictEq() reused
+  // directly for eq/neq — CORRECTED from the design doc's "loose
+  // equality" draft to the C reference's actual "strict ===/!=="
+  // semantics, scr_runtime.h SCR_JSOP_EQ/NEQ). Plus the logical:jsval
+  // route-through (763's `||`/`&&` over `any` operands — a small, pre-
+  // existing gap in the exhaustive `logical` dispatch, same shape as the
+  // adjacent `dyn` arm; validate.ts already admitted jsval there). Two
+  // real bugs found and fixed by actual compile+run+diff against Node,
+  // not by tsc alone: jsOpResultKind's bool-not-jsval result kind for
+  // the six relational/equality ops (WebAssembly's own validator caught
+  // the mismatch — a boxed dyn where a bare i32 was declared); and
+  // class-field default-seeding (emitFieldSeed) missing a jsval arm
+  // alongside its existing "dyn" one, so an unassigned `any` field
+  // defaulted to a raw null ref instead of the engine's own undefined
+  // (1587's `String(h.x)` before `.fill()` runs is what surfaced it —
+  // masked until this gate opened a real end-to-end path through the
+  // program). `pow` computes exactly y===2 (`x*x`, fdlibm-exact) plus
+  // the full ECMA-262 special-value table; every other exponent takes a
+  // runtime "not supported yet" fence — narrowed deliberately, see the
+  // op's own header comment (jsPowHelper).
+  "1587-any-field-unassigned.ts",
+  "2365-dyn-into-island.ts",
+  "2667-array-to-sorted-any.ts",
+  "760-any-arithmetic.ts",
+  "763-any-flow.ts",
+  "764-any-async.ts",
+  "768-any-uninitialized.ts",
+  // Increment 21 stage B, gate 2 (the call family: callMethod/callFn over
+  // jsval ≡ dyn payloads). callMethod reuses the EXISTING S023-style
+  // `dyn.invoke(name)` ladder wholesale — its OBJ arm already does keyed-
+  // get + FUNC check + this-bracket (thisPush/thisPop around callFn()),
+  // which is the "program-defined method" dispatch this gate would
+  // otherwise have had to build from scratch; extended with STR replace/
+  // replaceAll/at/charAt and NUM toFixed/toString (measured names:
+  // 1113/1114/2084/761/765). toUpperCase/toLowerCase and .split() route
+  // to the EXISTING static case-mapping (casing.ts, increment 20) and
+  // string-splitting (strings.ts) machinery directly — the SAME
+  // implementations plain `string`-typed receivers already used, now
+  // also reachable from an `any`-typed receiver. callFn is now guarded
+  // against a real trap the review round flagged: a FUNC value CAN be a
+  // `nativeMethodPlaceholderHelper` placeholder (one of the six
+  // Number.prototype names extracted via destructuring, e.g. `const {
+  // toFixed } = 5`) with a NULL thunk; calling it via the unconditional
+  // `callRef` path would trap. `dyn.callFn()` now rescues exactly the
+  // three measured names (toFixed/toString/valueOf) when the ambient
+  // `this` (dyn.this) is actually a Number, and throws Node's own exact
+  // "Number.prototype.<name> requires that 'this' be a Number" (oracle-
+  // measured, uniform across all six names) otherwise — never a bare
+  // trap. Zero regressions; the gate closed at exactly the 5 programs
+  // whose ONLY remaining need was the call family (1113, 1114, 1122,
+  // 1595, 761) — others needing callMethod/callFn (762, 765, 2084, 2170,
+  // 2449, 2474, 2475, ...) still refuse cleanly on a LATER gate's
+  // boundary (jsExit composites, jsMarshal's func arm, globalGet, or the
+  // Function-eval recognizer — none crash, all named diagnostics).
+  "1113-string-methods.ts",
+  "1114-string-unicode-island.ts",
+  "1122-any-captures.ts",
+  "1595-js-island-gap/main.js",
+  "761-any-objects.ts",
+  // Increment 21 stage B, gate 3 (globalGet's closed table, continued, plus
+  // the Function-eval recognizer). `Number.parseFloat`/`Number.parseInt`
+  // route through the SAME globalGet callFn dispatch JSON.stringify/
+  // Number.isInteger already used (1421) — a leftover claim from earlier
+  // gate-3 work not yet swept into a differential run. The Function-eval
+  // recognizer (this file's own header on FnEvalValue/FnEvalPlan,
+  // scratchpad/function-helper-decision.md, Option A) parses the compiler's
+  // OWN `construct(globalGet("Function"), ...strLit)` synthesis for
+  // destructuring assignment/declaration over island sources at EMISSION
+  // TIME (ordinary TypeScript string parsing over compile-time-constant
+  // strLit args, never runtime bytecode) into a plan, then compiles the
+  // plan into a real synthetic wasm thunk boxed as a dyn FUNC — reusing
+  // `dyn.iterN()` for array-pattern GetIterator/not-iterable semantics and
+  // `dyn.keyGet()`/the getProp proto-fence tables for object-pattern reads,
+  // rather than hand-rolling either. SCOPED for this gate (measured against
+  // the recognizer's own 15 observed body shapes): flat and nested object/
+  // array patterns, holes, defaults (literal scalars, array/object literals
+  // recursively, temp/extra references), and LITERAL property keys.
+  // Tier 625→631 (this first pass; 595 was the pre-increment-21 baseline,
+  // not the from-number here). Zero regressions; claims 2054, 2074 (a
+  // top-level uncaught TypeError after several caught ones — S007's trap
+  // bridge), 2084, 2101, 2196. 2083/2104 refused cleanly on
+  // `fnEval:arrayRest`/`fnEval:computedKey`; 2103 refused on an unrelated
+  // `expr:jsExit` gate-4 boundary — none crash, all named diagnostics.
+  //
+  // Prediction-reconciliation follow-up (same gate, closed before gate 4):
+  // rest (object — `dyn.objWalk(v, KEYS)`'s own-key enumeration with a
+  // runtime exclusion list, exactly the way `for-in`/`Object.keys` already
+  // walk; array — a second unbounded `dyn.iterPack` drain sliced from
+  // where the leading `iterN` left off), computed keys via extra/call
+  // (`dyn.toStr()` — ToPropertyKey reduces to ToString, no Symbol kind in
+  // this representation), and call-shaped default values (`dyn.callFn()`,
+  // gate 2's own call machinery) are ALL now implemented, oracle-verified.
+  // Tier 631→632: closes 2083 outright. 2104 still refuses (now on
+  // `expr:jsMarshal`, gate 4's own func-arm boundary — a captured closure
+  // marshaled in as a computed-key extra — confirming the fnEval gap
+  // itself is closed, not just relocated). One documented, narrow
+  // residual gap: computed keys do not route through the getProp
+  // proto-fence tables (compile-time-keyed, unusable against a runtime
+  // string) — not observed in any measured shape, not an S-entry (a
+  // scoped limitation, not a deliberate divergence).
+  "1421-number-parse-dynamic.ts",
+  "2054-destructuring-island-source.ts",
+  "2074-island-destructuring.ts",
+  "2083-destructuring-island-decl.ts",
+  "2084-destructuring-primitive-sources.ts",
+  "2101-dyn-param-defaults.ts",
+  "2196-island-computed-key-chain.ts",
+  // Gate 4, part 1: jsExit's COMPOSITE path (records, arrays of non-jsval
+  // elements, bytes<u8>, undefined-armed unions of JSON-safe arms — the
+  // domain past the two special cases (strict primitives, array<jsval> by
+  // reference) already covered). Reuses `dynCheckHelper` verbatim — the
+  // SAME validating extractor `as`-casts and typed function parameters
+  // already use. Measured DIRECTLY against the reference LLVM lane before
+  // landing (scratchpad/oracle3/jsexit-composite.ts: a missing optional
+  // field builds the undefined arm, a wrong-type field throws
+  // "expected <type> at $.<field>, got <type>" — wasm's output is
+  // byte-identical to the native lane's). No Node oracle exists for the
+  // type-check itself (Node erases TS types entirely, so it never throws
+  // here) — S009 ("trust-but-verify at every dynamic boundary") already
+  // covers exactly this shape for the checked-dynamic world; extending it
+  // to jsval's jsExit boundary is a drafted amendment for the close-out
+  // report, not yet registered. Tier 632→634: closes 2103 AND a bonus,
+  // 762-any-boundary.ts. Zero regressions.
+  "2103-optional-tuple-elements.ts",
+  "762-any-boundary.ts",
+  // Gate 4, part 2: jsMarshal's `func` arm (host-closure boxing — a
+  // STATICALLY typed closure crossing INTO the island as a real dyn FUNC
+  // value). Reuses `dynFnBox`/`dynFnThunk` verbatim, the SAME per-
+  // signature box/thunk pair the checked-dynamic `unknown` boundary
+  // already builds — boxed ANONYMOUSLY (jsMarshal's IR node carries no
+  // name field, matching `emitDynFromBody`'s own "func" walker arm, not
+  // the NAMED "dynFrom" expression arm). Two bugs found and fixed via
+  // this path reaching them for the FIRST time (all oracle-verified,
+  // native-lane-compared where no Node type-erasure applies):
+  //  - `emitDynFnThunkBody`'s param/return handling checked `p.kind ===
+  //    "dyn"` but not `"jsval"` — `isIslandCallbackParamType`/
+  //    `islandCallbackRet` explicitly admit jsval-typed callback
+  //    params/returns (jsval ≡ dyn, same wasm representation, just a
+  //    missing arm) — fixed by treating them identically.
+  //  - `dyn.keyGet`'s BYTES arm modeled "length" but not "byteLength";
+  //    this tier's bytes<u8> is always single-byte elements, so the two
+  //    are the same number by construction — fixed by treating
+  //    "byteLength" as a length synonym for BYTES receivers specifically
+  //    (unaffected: hasOwn/objWalk, measured against Node — neither name
+  //    is enumerable or own on a real Uint8Array either).
+  // The island-REST ABI form (`(...args) => ...` — canMarshalTypedFunc
+  // IntoIsland's `t.rest === true` branch, a trailing jsval param that
+  // must COLLECT every surplus argument rather than bind just one) is
+  // NOT yet implemented — `dynFnThunk`'s fixed-arity per-param loop
+  // would mis-bind it; refuses named. Review round 1 (SB11) reverted
+  // this refusal's OWN bucket from a fragmented `jsMarshal:func-rest`
+  // back to the stable `expr:jsMarshal` aggregate every other
+  // unimplemented jsMarshal shape uses — the fragmented name was this
+  // file's own mistake, not a deliberate per-shape exception. One more
+  // gap surfaced ONLY by this path becoming reachable: an island object
+  // literal's `toJSON` member (needs jsMarshal's func arm to exist AT
+  // ALL before `{toJSON: fn}` could ever compile) was previously
+  // unimplemented in the dyn JSON.stringify walker (`putDyn`) —
+  // SerializeJSONProperty's own first step, `Get`ting and, if callable,
+  // calling `toJSON` and re-serializing its result instead of walking
+  // the object structurally. Implemented via the SAME thisPush/thisPop
+  // bracket `dyn.invoke`'s program-defined-method dispatch already
+  // uses, and the SAME self-recursive `idx` call the array arm already
+  // makes per element. Review round 1 closed three further gaps in this
+  // FIRST toJSON landing, all oracle-measured: SB8 threads the REAL
+  // `key` argument (property name / array index-as-string / `""` at
+  // the root) through a global call-channel (`jbToJsonKey`/
+  // `jbSkipToJson`) rather than a `putDyn` signature change (avoids
+  // renumbering ~15 existing locals); SB9 makes the toJSON dispatch
+  // fire EXACTLY ONCE per property — the RESULT is serialized
+  // structurally, its OWN "toJSON" (if any) is never re-invoked
+  // (`{toJSON:()=>({toJSON:()=>99})}` stringifies `{}`, not `99`),
+  // while a composite result's OWN CHILDREN still get their own fresh
+  // dispatch (`{toJSON:()=>({x:{toJSON:()=>7}})}` → `{"x":7}`); and a
+  // genuine REENTRANCY bug the reviewer's probe caught — a `toJSON`
+  // that itself calls `JSON.stringify` shares this walker's buffer/
+  // seen-stack/depth/circular-flag globals with the OUTER, still-in-
+  // progress walk, corrupting it (Node has no such sharing — verified
+  // directly, `JSON.stringify({a:{toJSON:k=>JSON.stringify({inner:k})},
+  // b:{toJSON:k=>\`k2=\${k}\`}})` composes cleanly) — fixed by saving
+  // the outer's buffer text (via `jbFinish`, which snapshots-and-resets
+  // in one call), swapping the seen-stack ARRAY REFERENCE to null
+  // (`jbEnter` allocates fresh on null, so the reentrant call gets its
+  // own isolated stack, never touching the outer's frames), and saving
+  // depth/circular-flag as plain scalars — all restored unconditionally
+  // once the callback returns. Zero regressions; closes 2170, 765, 2578
+  // (the three directly targeted, non-rest programs) plus SEVEN bonus
+  // claims the jsval-identity/byteLength/toJSON fixes together unlocked:
+  // 2104 (computed-key destructuring's captured-closure extra), 2171
+  // (toJSON), 2449, 2510-2513 (the dyn-evolving-array family — closures
+  // pushed into an array, later mapped/filtered/foreach'd), 2581, 2583.
+  // RECONCILIATION: 2633-island-promise-crossing.js is NOT claimed here
+  // and never was — noted so its movement cannot read as a silent
+  // shrink. Before this fix it refused first on `expr:jsMarshal`
+  // (blocked by the SAME func-arm gap this section closes); it now
+  // refuses first on `dynFrom:promise:adapt` instead — a forward move
+  // into stage-C (island promise bridge) territory, not a regression
+  // and not a new claim.
+  "2104-computed-key-destructuring.ts",
+  "2170-island-array-exits.ts",
+  "2171-island-json-stringify.ts",
+  "2449-js-dyn-worlds/main.js",
+  "2510-dyn-evolving-array-map.ts",
+  "2511-dyn-evolving-array-filter-foreach.ts",
+  "2512-dyn-evolving-array-mixed-push.ts",
+  "2513-dyn-evolving-array-derived.ts",
+  "2578-jsval-into-unknown-rows.ts",
+  "2581-jsval-routed-calls.js",
+  "2583-jsval-routed-calls.js",
+  "765-any-optional-chain.ts",
 ];
 
 interface RunResult {

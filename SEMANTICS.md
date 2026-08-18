@@ -195,6 +195,20 @@ path since index-signature records first shipped there, so this note
 documents the wasm tier joining an ALREADY-registered divergence rather
 than opening a new one.
 
+**Amendment (increment 21 stage B, island exit):** on the wasm tier, an
+island (jsval) value crossing the `jsExit` boundary into a declared
+static COMPOSITE type — record, array-of-non-jsval, `bytes<u8>`,
+undefined-armed union — validates via the SAME dynCheckHelper this
+entry's body and the increment-17 amendment above already cover:
+width-tolerant records, path-annotated failures ("expected <type> at
+$.<field>, got <type>"), the undefined arm for missing optionals. Node
+erases TS types entirely, so no oracle exists for the check itself; the
+reference LLVM lane produces byte-identical output for the same source
+(measured directly). The primitive-target exits (strict tag-read, no
+coercion) landed in stage A. **Tested by:** the increment-21 unit pins
+(happy and failing composite exits diffed against the compiled C
+reference).
+
 ## S010 — Wasm tier: an unhandled promise rejection reports as a trap; stderr is not Node's
 
 A promise that is REJECTED and never observed — nothing awaited it, and no
@@ -409,7 +423,12 @@ times (dyn-space strict equality for `DK.BYTES` compares the PAYLOAD
 `$bytes` ref via `ref.eq`, never the `$dyn` box that wraps it — the
 increment-16 box-copying lesson, applied here so two independent crossings
 of the SAME source correctly identity-match exactly as Node's erased cast
-does).
+does). The island marshal direction reaches the same crossing through a
+second caller (increment 21 stage B: `jsMarshal` of a `bytes<u8>`-typed
+static value into an `any` slot routes through the identical dynFrom
+bytes arm) and takes the identical stance: wasm ALIASES, matching Node;
+the native island copies (`scr_jsval_from_bytes`). Same split, same
+rationale, no new entry.
 
 **Amendment (increment 21 stage A, island crossing): on the wasm tier,
 `jsMarshal` of a BARE `dyn`-typed OPERAND ALIASES rather than
@@ -2575,6 +2594,41 @@ exact):
   "object" for the subsequent read; storing an own entry instead would
   be a wasm-only silent divergence). The computed variant
   `{["__proto__"]: v}` already refuses at the frontend.
+
+The stage-B roster joins the same list (increment 21 stage B, all
+measured the same way):
+- **`Math.pow` / `**` beyond the exact set**: the ECMA-262 special-value
+  table (NaN, ±0, ±Infinity, base ±1, negative-base-non-integer)
+  computes exactly, and `y === 2` computes as `x*x` — the one form
+  fdlibm (V8's pow) itself special-cases to an elementary op, so
+  bit-exactness is by construction, and the only measured corpus need.
+  EVERY other exponent — other integers included — throws the catchable
+  "Math.pow with this exponent is not supported yet": fdlibm's
+  polynomial path is not reproducible by exponentiation-by-squaring at
+  last-ulp fidelity, and an unprovable answer is the miscompile class,
+  not a feature.
+- **`Number.prototype.toString(radix)` with radix ≠ 10** throws the
+  catchable "'Number.prototype.toString' with a radix other than 10 is
+  not supported yet" — V8's DoubleToRadixCString is unported; silently
+  answering base-10 digits under a false base claim was the alternative
+  this fence replaces.
+- **`Number.prototype.toFixed` beyond the verified window**: requests
+  whose significant-digit demand exceeds the conservatively-verified
+  bound (effective `intDigits + f <= 14`) throw the catchable
+  "'Number.prototype.toFixed' at this precision is not supported yet";
+  in-window results are byte-exact (120-cell independent differential:
+  56 exact, 64 fenced, 0 wrong). The designed trade, named so it is not
+  a surprise: the fence fires on ordinary-looking calls Node computes
+  fine — `(999999999999999).toFixed(0)`,
+  `(1234567890.12345).toFixed(5)` — fence-over-garbage, the pow
+  precedent.
+- **The unmodeled-name half of the Number-placeholder call surface**:
+  calling an extracted placeholder whose NAME is not modeled for real
+  dispatch (`toPrecision.call(5, 3)`, which Node computes) throws the
+  honest "'Number.prototype.toPrecision' on a dynamic value is not
+  supported yet" — while the WRONG-RECEIVER case keeps Node's own exact
+  "requires that 'this' be a Number" TypeError (the split replaced one
+  false message covering both situations).
 
 **Rationale:** the fence is the loudness contract applied inside a
 claimed program: a construct the tier cannot yet answer Node-exactly

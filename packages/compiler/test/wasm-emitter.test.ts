@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import { compile } from "../src/index.js";
 import { I32, ModuleBuilder } from "../src/backend/wasm/module.js";
+import { parseFnEvalConstruct } from "../src/backend/wasm/emitter.js";
 
 let scratch: string;
 beforeAll(async () => {
@@ -2684,8 +2685,11 @@ test("S023: the dyn invoke ladder — Node's refusals, and the fences that are o
       "TypeError: str.push is not a function",
       "TypeError: num.push is not a function",
       "TypeError: obj.push is not a function",
-      // Rung two, S023: real on String.prototype, unimplemented here.
-      "Error: 'String.prototype.at' on a dynamic value is not supported yet",
+      // Rung two, S023: `.at` is REAL now (increment 21 stage B, gate
+      // 2 — 1113's own measured need, shared here for free since
+      // dyn.invoke() is the SAME ladder jsval ≡ dyn routes through);
+      // `.indexOf` with a non-string needle stays the S023 fence.
+      "(no throw)",
       "Error: 'String.prototype.indexOf' on a dynamic value is not supported yet",
       "TypeError: arr.slice: non-number index arguments on a dynamic receiver are not supported yet",
       // Rung one: the implemented String pairs, exact.
@@ -7550,14 +7554,16 @@ test("increment 21 stage A: insp.jsval — console.log of a composite holding js
   expect(stdout.toString("utf8")).toBe("[ 1, 'hi', true ]\n"); // Node-verified
 });
 
-test("increment 21 stage A: an unimplemented jsOp (add — a coercion op, stage B) still refuses NAMED under the stable \"expr:jsOp\" bucket, exactly as the blanket refusal it replaces did — census bucket names are currency", async () => {
+test("increment 21 stage B gate 1: jsOp add (a coercion op) is now IMPLEMENTED — supersedes the stage-A pin that this refused NAMED under \"expr:jsOp\"; numeric `any + any` now compiles and answers Node's own sum", async () => {
   const res = await buildWasmDyn(
-    "jsop-add-refuses.ts",
+    "jsop-add-works.ts",
     ["const a: any = 1;", "const b: any = 2;", "const c: any = a + b;", "console.log(`${c}`);", ""].join("\n"),
   );
-  if (res.ok) throw new Error("expected a refusal, got a compiled module");
-  expect(res.diagnostics[0]?.message).toContain("expr:jsOp");
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("3\n");
 });
+
 
 test("increment 21 stage A: getProp's Number.prototype PLACEHOLDER six — export-destructured off a number literal, every name answers a real function (not the round-1 miss's silent undefined for toPrecision/toExponential/valueOf/toLocaleString); these six alone get placeholders, everything else in reach fences (see the fence-table tests below) rather than answering wrong", async () => {
   const res = await buildWasmDyn(
@@ -7916,4 +7922,138 @@ test("increment 21 stage A gate round 3 fix R3 negative control: keys that merel
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
   const { stdout } = await runWasm(res.binaryPath);
   expect(stdout.toString("utf8")).toBe("1 2 3\n"); // Node-verified
+});
+
+// ── increment 21 stage B, gate 3: the Function-eval recognizer's cross-
+// layer pins (review request) ─────────────────────────────────────────────
+
+test("increment 21 stage B gate 3: the Function-eval recognizer's PARSER — the closed grammar's own producer shapes all parse, and deliberately non-matching bodies (a genuinely DIFFERENT `new Function(...)` shape reaching this recognizer, never producible by the frontend's own two synthesis sites, but the recognizer must still refuse it rather than mis-parse) all return null. Backend non-match refusal pin, per review: exercises the recognizer's OWN fallback path directly, since a user's own `new Function(...)` is rejected upstream at the frontend (SC2020) and structurally never reaches this recognizer at all — this is the only way to reach a genuinely non-matching body.", () => {
+  // Positive: the closed grammar's own shapes (scratchpad/function-helper-
+  // decision.md §2's measured bodies) all parse to a non-null plan.
+  const positive: [string[], string][] = [
+    [["v"], '"use strict";({} = v);return [];'],
+    [["v"], '"use strict";([] = v);return [];'],
+    [["v"], '"use strict";var __0;({["x"]: __0} = v);return [__0];'],
+    [["v"], '"use strict";var __0;([__0] = v);return [__0];'],
+    [["v"], '"use strict";var __0,__1,__2;([__0,,__1,...__2] = v);return [__0,__1,__2];'],
+    [["v"], '"use strict";var __0;({["missing"]:__0=42} = v);return [__0];'],
+    [["v", "__d0"], '"use strict";({["p"]:{}=__d0} = v);return [];'],
+    [["v", "__d0"], '"use strict";var __0;({[__d0]:__0} = v);return [__0];'],
+    [[], 'throw new TypeError("a class")'],
+  ];
+  for (const [params, body] of positive) {
+    expect(parseFnEvalConstruct([...params, body]), JSON.stringify(body)).not.toBeNull();
+  }
+  // Negative: deliberately non-matching bodies MUST refuse (return null),
+  // never mis-parse. A bare identifier key (not JSON-string-quoted, never
+  // producible by JSON.stringify), extra whitespace (the grammar is exact,
+  // byte for byte), a wrong starting temp index (the grammar's own
+  // sequential-bind invariant), a wrong leading param name (not "v"), and a
+  // completely unrelated body (a user's hypothetical direct `new
+  // Function(...)` source, standing in for the "not this recognizer's own
+  // synthesis" case the design doc's §5 describes).
+  const negative: string[][] = [
+    ["v", '"use strict";({garbage} = v);return [];'],
+    ["v", "console.log('evil');"],
+    ["v", '"use strict";({} = v);return [] ;'],
+    ["v", '"use strict";var __1;({["x"]: __1} = v);return [__1];'],
+    ["notv", '"use strict";({} = v);return [];'],
+    ["x", "return x + 1"],
+    [],
+  ];
+  for (const paramTexts of negative) {
+    expect(parseFnEvalConstruct(paramTexts), JSON.stringify(paramTexts)).toBeNull();
+  }
+});
+
+test("increment 21 stage B gate 3: the Function-eval recognizer's EMITTER — end to end, byte-exact against Node: a nested object pattern with literal defaults, an array pattern with a hole and defaults, and the empty-pattern forms", async () => {
+  const res = await buildWasmDyn(
+    "fneval-emitter.ts",
+    [
+      "const src: any = { p: { q: 5 } };",
+      "const { p: { q = 1 } = {} } = src;",
+      "console.log(`${q}`);",
+      "const src2: any = {};",
+      "const { p: { q: q2 = 2 } = {} } = src2;",
+      "console.log(`${q2}`);",
+      "const arr: any = [10];",
+      "const [a1, , a2 = 42] = arr;",
+      "console.log(`${a1} ${a2}`);",
+      "({} = ({} as any));",
+      "([] = ([1, 2] as any));",
+      'console.log("done");',
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${JSON.stringify(res.diagnostics)}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("5\n2\n10 42\ndone\n");
+});
+
+test("increment 21 stage B gate 3: the frontend fixture pin — enginePatternSpec's synthesized body for a representative nested/computed/rest pattern is EXACTLY the text the recognizer's grammar expects (fails on template drift: a change to lower-stmts.ts's synthesis that this recognizer has not been updated for breaks HERE, in the IR, before it could silently desync from the backend)", async () => {
+  const scratchDir = await mkdtemp(join(tmpdir(), "tsinter-wasm-ir-"));
+  try {
+    const entry = join(scratchDir, "fneval-fixture.ts");
+    await writeFile(
+      entry,
+      [
+        "declare function use(x: unknown): void;",
+        "function f(src: any, extra: any) {",
+        '  const { ["missing"]: a = 42, ...rest } = src;',
+        "  use(a); use(rest); use(extra);",
+        "}",
+        "f({}, 1);",
+        "",
+      ].join("\n"),
+    );
+    // The wasm lane only writes the IR file on a SUCCESSFUL wasm build
+    // (index.ts's own `emitIr` gate sits after `emitWasmModule` succeeds);
+    // this pattern's rest clause refuses on wasm today (fnEval:objectRest,
+    // gate 3's own scoped-out surface), so the pin uses the DEFAULT
+    // backend (native, LLVM-or-C fallback) instead — the FRONTEND lowering
+    // that builds the `construct(Function, ...)` synthesis is identical
+    // regardless of which backend consumes the resulting IR afterward, and
+    // the native lanes accept this pattern today (they execute it through
+    // the real engine, which is the whole reason this synthesis exists).
+    const res = await compile(entry, {
+      outPath: join(scratchDir, "fneval-fixture"),
+      outDir: scratchDir,
+      dynamic: true,
+      emitIr: true,
+    });
+    if (!res.ok) throw new Error(`refused: ${JSON.stringify(res.diagnostics)}`);
+    const irFile = join(scratchDir, "fneval-fixture.ir.json");
+    const ir = readFileSync(irFile, "utf8");
+    // The IR is JSON, so the synthesized body string's own quotes come
+    // through backslash-escaped in the file's raw text.
+    expect(ir).toContain('[\\"missing\\"]:__0=42');
+    expect(ir).toContain("...__1");
+  } finally {
+    await rm(scratchDir, { recursive: true, force: true });
+  }
+});
+
+test("increment 21 stage B N2 gate-closing pin: dyn.ts's toFixed precision fence actually EXECUTES — review round 2's fence branch shipped as INVALID WASM once (a stack-imbalance compile error, `ifResult(strRef)`'s throw arm never pushed a value) and was caught only by a sweep script that ran it, never by anything that merely typechecked or asserted refusal without instantiating the module; this pins that a fenced call throws the exact named Error AND the program survives past the catch, alongside an in-window neighbour that computes Node's exact text in the SAME run, so the two together would have caught the original bug", async () => {
+  const res = await buildWasmDyn(
+    "tofixed-fence.ts",
+    [
+      "const x: any = 5;",
+      "try {",
+      "  console.log(`${x.toFixed(100)}`);",
+      "} catch (e) {",
+      "  console.log(`${(e as Error).message}`);",
+      "}",
+      "const y: any = 0.1;",
+      "console.log(`${y.toFixed(14)}`);",
+      'console.log("survived");',
+      "",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${JSON.stringify(res.diagnostics)}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    "'Number.prototype.toFixed' at this precision is not supported yet\n" +
+      "0.10000000000000\n" +
+      "survived\n",
+  );
 });

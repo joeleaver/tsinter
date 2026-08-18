@@ -420,6 +420,21 @@ test("dyn.ts/json.ts/inspect.ts: every function with a BYTES arm emits a VALID m
 
   let dyn!: DynBuilder;
   const dynVecInfo = () => vecs.info("dyn", dyn.dynRef(), dyn.dynRef(), "ref");
+  // Trivial structural stub (review round 1's DynDeps.jsToNumber
+  // addition) — right type, wrong (irrelevant) behavior, matching every
+  // other dep in this file.
+  let jsToNumberFn: number | null = null;
+  const jsToNumber = (): number => {
+    if (jsToNumberFn !== null) return jsToNumberFn;
+    const idx = mb.declareFunc(mb.funcType([dyn.dynRef()], [F64]), "%stub.jsToNumber");
+    jsToNumberFn = idx;
+    mb.setBody(idx, [], (() => {
+      const c = new Code();
+      c.f64Const(0);
+      return c.bytes();
+    })());
+    return idx;
+  };
   dyn = new DynBuilder(mb, {
     strRef: () => strRef,
     strType: () => strType,
@@ -454,6 +469,7 @@ test("dyn.ts/json.ts/inspect.ts: every function with a BYTES arm emits a VALID m
     bytesGet: () => bytesB.get("u8"),
     bytesSet: () => bytesB.setElem("u8"),
     bytesToStrUtf8: () => bytesB.toStrHelper("utf8"),
+    jsToNumber,
   });
 
   const json = new JsonBuilder(mb, {

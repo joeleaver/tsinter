@@ -316,6 +316,15 @@ export interface DynDeps {
    * with commas instead (measured: `String(new Uint8Array([1,2,3]))` is
    * `"1,2,3"`, not a UTF-8 decode). */
   bytesToStrUtf8: () => number;
+  /** %w.jsToNumber — the full ECMA-262 ToNumber over a dyn value (NUM
+   * passes through, STR runs StringToNumber, everything else its own
+   * documented rule). Injected rather than re-derived here (increment
+   * 21 review round 1, SB3/SB4): this tier had "no general dyn
+   * ToNumber" (this file's own earlier note, `idxArg`'s precedent) only
+   * because nothing NEEDED one yet — a `toFixed`/`toString` ARGUMENT
+   * (`(5).toFixed("2")`) is exactly ToNumber's contract, the same
+   * conversion the emitter's coercion ops already build. */
+  jsToNumber: () => number;
 }
 
 export class DynBuilder {
@@ -848,17 +857,44 @@ export class DynBuilder {
    * thunk, which owns the per-argument validation because it is the piece
    * compiled per SIGNATURE. Args ride the vector the caller built; a null
    * answer means the thunk left an exception pending, exactly C's
-   * contract. */
+   * contract.
+   *
+   * PLACEHOLDER RESCUE (increment 21 stage B review watch item): a FUNC
+   * value CAN be a `nativeMethodPlaceholderHelper` placeholder — one of
+   * the six Number.prototype names extracted via destructuring
+   * (`const { toFixed } = 5;`), which is a real FUNC box with a NULL
+   * thunk (its whole reason to be a placeholder rather than a real
+   * closure). Calling it via the ORIGINAL `callRef` path unconditionally
+   * would `call_ref` a null reference — a bare wasm trap where Node
+   * either produces real output (`.call`/`.apply` with a Number `this`,
+   * 2084's own corpus need) or throws a real, catchable, EXACT-message
+   * TypeError (a bare/mismatched-receiver call — oracle-measured,
+   * scratchpad/oracle2/watch-item.mjs + placeholder-six.mjs: uniformly
+   * "Number.prototype.<name> requires that 'this' be a Number" for all
+   * six names). getProp's OWN dispatch helper already fences every OTHER
+   * prototype's members at the READ, before a placeholder could ever be
+   * minted (F1/F2's own doc) — so a null-thunk FUNC reaching here is
+   * ALWAYS one of exactly these six names; the dispatch below does not
+   * need to handle any other prototype. */
   callFn(): number {
     return this.cached(
       "call",
       [this.dynRef(), this.arrRef(), this.deps.strRef()],
       [this.dynRef()],
       (idx) => {
+        const dynT = this.dynT();
+        const fnT = this.fnT();
+        const dynRef = this.dynRef();
+        const strRef = this.deps.strRef();
+        const thunkRef: ValType = { kind: "ref", nullable: true, typeIndex: this.thunkSig() };
         const c = new Code();
         const MSG = 3;
+        const THUNK = 4;
+        const NAME = 5;
+        const RECV = 6;
+        const ARG0 = 7;
         c.localGet(0);
-        c.structGet(this.dynT(), DYN_KIND);
+        c.structGet(dynT, DYN_KIND);
         c.i32Const(DK.FUNC);
         c.i32Ne();
         c.ifVoid();
@@ -867,18 +903,157 @@ export class DynBuilder {
         c.call(this.deps.concat());
         c.localSet(MSG);
         this.deps.throwTypeError(c, (x) => x.localGet(MSG));
-        c.refNull(this.dynT());
+        c.refNull(dynT);
         c.return_();
         c.end();
         this.fnPayload(c, (x) => x.localGet(0));
-        c.structGet(this.fnT(), FN_CLOS);
-        c.localGet(1);
-        this.fnPayload(c, (x) => x.localGet(0));
-        c.structGet(this.fnT(), FN_THUNK);
-        c.callRef(this.thunkSig());
-        this.mb.setBody(idx, [this.deps.strRef()], c.bytes());
+        c.structGet(fnT, FN_THUNK);
+        c.localTee(THUNK);
+        c.refIsNull();
+        c.ifResult(dynRef);
+        {
+          // A placeholder (nativeMethodPlaceholderHelper's null-thunk
+          // FUNC): FN_NAME carries the extracted Number.prototype name
+          // directly (a plain strRef field, set to the same value as
+          // FN_CLOS for exactly this reason). getProp's own dispatch
+          // fences every OTHER prototype's members before a placeholder
+          // could ever be minted, so this is always one of the six.
+          this.fnPayload(c, (x) => x.localGet(0));
+          c.structGet(fnT, FN_NAME);
+          c.localSet(NAME);
+          c.call(this.thisGet());
+          c.localSet(RECV);
+          // arg 0 (the ONLY argument any modeled name here reads),
+          // undefined past the end.
+          c.localGet(1);
+          c.structGet(this.deps.arrVec().struct, VEC_LEN);
+          c.i32Eqz();
+          c.ifResult(dynRef);
+          c.globalGet(this.undefinedGlobal());
+          c.else_();
+          this.arrAt(c, (x) => x.localGet(1), (x) => x.i32Const(0));
+          c.end();
+          c.localSet(ARG0);
+          c.localGet(RECV);
+          c.structGet(dynT, DYN_KIND);
+          c.i32Const(DK.NUM);
+          c.i32Eq();
+          c.ifResult(dynRef);
+          {
+            c.localGet(NAME);
+            this.deps.lit(c, "toFixed");
+            c.call(this.deps.strEq());
+            c.ifResult(dynRef);
+            this.boxStr(c, (x) => {
+              x.localGet(RECV);
+              x.structGet(dynT, DYN_NUM);
+              x.localGet(ARG0);
+              // Full ToNumber (review round 1, SB4) — the SAME coercion
+              // the invoke() ladder's own toFixed call site now applies,
+              // for the SAME reason: a non-NUM argument (a string digits
+              // count, `undefined` past the end) is a real shape, not
+              // just an unmeasured one.
+              x.call(this.deps.jsToNumber());
+              x.call(this.toFixed());
+            });
+            c.else_();
+            {
+              c.localGet(NAME);
+              this.deps.lit(c, "toString");
+              c.call(this.deps.strEq());
+              c.ifResult(dynRef);
+              this.boxStr(c, (x) => {
+                x.localGet(RECV);
+                x.structGet(dynT, DYN_NUM);
+                x.call(this.deps.f64ToStr());
+              });
+              c.else_();
+              {
+                c.localGet(NAME);
+                this.deps.lit(c, "valueOf");
+                c.call(this.deps.strEq());
+                c.ifResult(dynRef);
+                c.localGet(RECV);
+                c.else_();
+                // Unmodeled NAME (toLocaleString/toExponential/toPrecision),
+                // but `this` genuinely IS a Number here (review round 1,
+                // SB10 — sbF1b): Node does NOT throw for
+                // `Number.prototype.toPrecision.call(5)` (it answers "5"),
+                // so the "requires that 'this' be a Number" text would be
+                // a FALSE CLAIM about a receiver that is exactly right. An
+                // honest "not supported yet" instead — this file's own
+                // S023-style wording, matching `throwUnsupported`'s
+                // pattern in the `invoke` ladder above.
+                this.pushUnmodeledNumberMethodFence(c, NAME, MSG);
+                c.end();
+              }
+              c.end();
+            }
+            c.end();
+          }
+          c.else_();
+          // `this` is NOT a Number (the bare/mismatched-receiver call) —
+          // Node's own exact, uniform text for all six placeholder names.
+          this.pushPlaceholderFence(c, NAME, MSG);
+          c.end();
+        }
+        c.else_();
+        {
+          this.fnPayload(c, (x) => x.localGet(0));
+          c.structGet(fnT, FN_CLOS);
+          c.localGet(1);
+          c.localGet(THUNK);
+          c.callRef(this.thunkSig());
+        }
+        c.end();
+        this.mb.setBody(idx, [strRef, thunkRef, strRef, dynRef, dynRef], c.bytes());
       },
     );
+  }
+
+  /** The runtime fence for a placeholder called with a non-Number `this`
+   * (the bare/mismatched-receiver call) — Node's own uniform, CORRECT
+   * message: oracle-measured, ALL SIX names share the identical
+   * "Number.prototype.<name> requires that 'this' be a Number" shape
+   * (scratchpad/oracle2/placeholder-six.mjs) — built from the RUNTIME
+   * name rather than six per-name compile-time strings. `msgLocal` is
+   * the CALLER's own scratch local (this function has no locals of its
+   * own — it only emits into whichever body is currently being built).
+   * Review round 1, SB10: this text is ONLY correct for a genuinely
+   * wrong receiver — see `pushUnmodeledNumberMethodFence` for the
+   * SIBLING case (right receiver, unimplemented name) this used to
+   * conflate with it. */
+  private pushPlaceholderFence(c: Code, nameLocal: number, msgLocal: number): void {
+    this.deps.lit(c, "Number.prototype.");
+    c.localGet(nameLocal);
+    c.call(this.deps.concat());
+    this.deps.lit(c, " requires that 'this' be a Number");
+    c.call(this.deps.concat());
+    c.localSet(msgLocal);
+    this.deps.throwTypeError(c, (x) => x.localGet(msgLocal));
+    c.refNull(this.dynT());
+  }
+
+  /** The "not supported yet" fence for an UNMODELED placeholder name
+   * (toLocaleString/toExponential/toPrecision — no measured need) called
+   * with a `this` that genuinely IS a Number (review round 1, SB10,
+   * sbF1b) — oracle-measured: `Number.prototype.toPrecision.call(5)`
+   * does NOT throw in Node (it answers "5"), so `pushPlaceholderFence`'s
+   * "requires that 'this' be a Number" text was a FALSE CLAIM about a
+   * receiver this tier simply has no implementation for yet. This is
+   * this file's own S023-style wording (the `invoke` ladder's
+   * `throwUnsupported`, same shape, a plain catchable Error rather than
+   * a TypeError so a `catch (e) { e instanceof TypeError }` handler does
+   * not mistake a missing feature for the real thing). */
+  private pushUnmodeledNumberMethodFence(c: Code, nameLocal: number, msgLocal: number): void {
+    this.deps.lit(c, "'Number.prototype.");
+    c.localGet(nameLocal);
+    c.call(this.deps.concat());
+    this.deps.lit(c, "' on a dynamic value is not supported yet");
+    c.call(this.deps.concat());
+    c.localSet(msgLocal);
+    this.deps.throwError(c, "%Error", "Error", (x) => x.localGet(msgLocal));
+    c.refNull(this.dynT());
   }
 
   /* ── the ambient receiver (dyn.this) ─────────────────────────────────
@@ -1935,9 +2110,22 @@ export class DynBuilder {
         // still READS correctly here (this is keyGet, not hasOwn/objWalk
         // — being own-key-absent doesn't make it unreadable, exactly
         // like `"abc".length` reading fine despite string length also
-        // being non-own on primitives' boxed form).
+        // being non-own on primitives' boxed form). "byteLength" reads
+        // the SAME count: this tier's bytes<u8> representation is
+        // ALWAYS single-byte elements (canExitIslandToType admits only
+        // `elem === "u8"`), so a typed array's `.length` and
+        // `.byteLength` are the identical number by construction —
+        // measured against Node (both non-own, Object.hasOwn/keys agree
+        // unaffected; only the READ gains the second spelling, increment
+        // 21 gate 4's own jsExit-composite work newly reaching this
+        // shape through an unchecked-overload `Uint8Array`-declared
+        // island result).
         this.arm(c, K, [DK.BYTES], () => {
           this.pushIsLength(c, (x) => x.localGet(1));
+          c.localGet(1);
+          this.deps.lit(c, "byteLength");
+          c.call(this.deps.strEq());
+          c.i32Or();
           c.ifVoid();
           this.boxNum(c, (x) => {
             this.bytesLenI32(x, (y) => this.bytesPayloadBytes(y, (z) => z.localGet(0)));
@@ -3679,10 +3867,20 @@ export class DynBuilder {
   /** String.prototype names with an arm — implemented or fenced. */
   private static readonly STR_METHODS = new Set([
     "slice", "at", "concat", "indexOf", "lastIndexOf", "includes",
+    "replace", "replaceAll", "charAt",
   ]);
 
   /** Function.prototype names with an arm. */
   private static readonly FN_METHODS = new Set(["apply", "call"]);
+
+  /** Number.prototype names with an arm (increment 21 stage B, gate 2) —
+   * toString computes the base-10 text (absent radix, or an explicit 10)
+   * via f64ToStr; an explicit NON-10 radix is not a measured corpus need
+   * and FENCES loudly (SB2, review round 1) rather than silently
+   * answering the base-10 digits under a claimed different base —
+   * fractional-radix formatting is V8-internals (DoubleToRadixCString)
+   * this tier does not port. */
+  private static readonly NUM_METHODS = new Set(["toFixed", "toString"]);
 
   /** %w.dyn.notFn(what) — Node's catchable "<what> is not a function",
    * `dyn_throw_not_fn`. The CALLER pushes the null result and returns. */
@@ -5449,7 +5647,140 @@ export class DynBuilder {
               });
               return;
             }
-            if (method === "at" || method === "concat") {
+            if (method === "at") {
+              // Mirrors the ARRAY "at" arm above exactly (idxArg's
+              // relative-index resolve, negative-wraps-from-end,
+              // out-of-range → undefined — surfaces.ts's own note: the
+              // validated exit throws Node's catchable TypeError for
+              // THAT case, not this op), reading a UTF-16 code UNIT
+              // slice instead of an array element (1113's measured
+              // need: `.at()` on a plain ASCII string — code-unit vs.
+              // code-point indexing is not a distinguishable question
+              // for it, and no target program exercises an astral
+              // index here).
+              c.localGet(1);
+              c.i32Const(0);
+              c.f64Const(0);
+              c.f64Const(0);
+              c.f64Const(0);
+              c.localGet(2);
+              c.call(this.idxArg());
+              c.localSet(F0);
+              bailIfPending();
+              c.localGet(F0);
+              c.f64Const(0);
+              c.f64Lt();
+              c.ifVoid();
+              c.localGet(S);
+              c.arrayLen();
+              c.f64ConvertI32U();
+              c.localGet(F0);
+              c.f64Add();
+              c.localSet(F0);
+              c.end();
+              c.localGet(F0);
+              c.f64Const(0);
+              c.f64Lt();
+              c.localGet(F0);
+              c.localGet(S);
+              c.arrayLen();
+              c.f64ConvertI32U();
+              c.f64Ge();
+              c.i32Or();
+              c.ifVoid();
+              c.globalGet(this.undefinedGlobal());
+              c.return_();
+              c.end();
+              this.boxStr(c, (x) => {
+                x.localGet(S);
+                x.localGet(F0);
+                x.localGet(F0);
+                x.f64Const(1);
+                x.f64Add();
+                x.call(this.deps.strSlice());
+              });
+              return;
+            }
+            if (method === "concat") {
+              throwUnsupported("String");
+              return;
+            }
+            if (method === "charAt") {
+              // Oracle-measured (unlike `.at`): NO negative wrap, and
+              // out-of-range answers "" rather than undefined —
+              // `"hello".charAt(-1)` and `.charAt(10)` are both "",
+              // `.charAt()` (no arg, ToIntegerOrInfinity default 0) is
+              // "h". `idxArg`'s own default-0 behavior on a missing/
+              // undefined argument already matches this.
+              c.localGet(1);
+              c.i32Const(0);
+              c.f64Const(0);
+              c.f64Const(0);
+              c.f64Const(0);
+              c.localGet(2);
+              c.call(this.idxArg());
+              c.localSet(F0);
+              bailIfPending();
+              c.localGet(F0);
+              c.f64Const(0);
+              c.f64Lt();
+              c.localGet(F0);
+              c.localGet(S);
+              c.arrayLen();
+              c.f64ConvertI32U();
+              c.f64Ge();
+              c.i32Or();
+              c.ifResult(this.dynRef());
+              this.boxStr(c, (x) => this.deps.lit(x, ""));
+              c.else_();
+              this.boxStr(c, (x) => {
+                x.localGet(S);
+                x.localGet(F0);
+                x.localGet(F0);
+                x.f64Const(1);
+                x.f64Add();
+                x.call(this.deps.strSlice());
+              });
+              c.end();
+              return;
+            }
+            if (method === "replace" || method === "replaceAll") {
+              // surfaces.ts's ISLAND_SURFACE table declares both STRING-
+              // only (`args: [STRING, STRING]`, no regex form) — the
+              // island-surface call sites (1113/1114) always marshal
+              // real strings; a non-STR argument is not a reachable
+              // shape from that path, checked anyway (the same
+              // discipline indexOf/lastIndexOf/includes use below) so a
+              // future genuinely-dynamic caller fences loudly rather
+              // than trapping a bad refCast.
+              c.localGet(ARGC);
+              c.i32Const(2);
+              c.i32GeU();
+              c.ifVoid();
+              this.arrAt(c, (x) => x.localGet(1), (x) => x.i32Const(0));
+              c.localTee(M);
+              c.structGet(dynT, DYN_KIND);
+              c.i32Const(DK.STR);
+              c.i32Eq();
+              this.arrAt(c, (x) => x.localGet(1), (x) => x.i32Const(1));
+              c.structGet(dynT, DYN_KIND);
+              c.i32Const(DK.STR);
+              c.i32Eq();
+              c.i32And();
+              c.ifVoid();
+              this.boxStr(c, (x) => {
+                x.localGet(S);
+                x.localGet(M);
+                x.structGet(dynT, DYN_REF);
+                x.refCast(this.deps.strType());
+                this.arrAt(x, (y) => y.localGet(1), (y) => y.i32Const(1));
+                x.structGet(dynT, DYN_REF);
+                x.refCast(this.deps.strType());
+                x.call(this.strReplaceHelper(method === "replaceAll"));
+              });
+              c.return_();
+              c.end();
+              c.end();
               throwUnsupported("String");
               return;
             }
@@ -5528,6 +5859,71 @@ export class DynBuilder {
           });
         }
 
+        // Number.prototype (increment 21 stage B, gate 2/review round 1):
+        // toString (base-10 fast path via f64ToStr; an EXPLICIT non-10
+        // radix FENCES loudly rather than silently answering the base-10
+        // text — SB2: fractional-radix formatting is V8-internals
+        // (DoubleToRadixCString) with zero measured corpus need, and a
+        // wrong-base digit string is exactly the "silently wrong" shape
+        // the project's absolute rule forbids) and toFixed (2084/761/
+        // 765's measured need, ECMA-262 Number::toFixed ported to
+        // %w.dyn.toFixed). Every OTHER NUM receiver call — the
+        // remaining four placeholder names (toLocaleString/valueOf/
+        // toExponential/toPrecision) reached this way rather than
+        // through the callFn placeholder rescue, and any name NUM's
+        // prototype does not declare — falls through to `throwNotFn()`
+        // below, Node's own answer for a missing method.
+        if (DynBuilder.NUM_METHODS.has(method)) {
+          this.arm(c, K, [DK.NUM], () => {
+            if (method === "toFixed") {
+              // The RECEIVER is already NUM-kind (this arm's own guard);
+              // the DIGITS argument gets the full ToNumber conversion
+              // (SB4, review round 1: `(5).toFixed("2")` → "5.00",
+              // oracle-measured — a bare DYN_NUM read on a non-NUM
+              // argument would read the union's OTHER field, garbage).
+              this.boxStr(c, (x) => {
+                x.localGet(0);
+                x.structGet(dynT, DYN_NUM);
+                argAt(0);
+                x.call(this.deps.jsToNumber());
+                x.call(this.toFixed());
+              });
+              return;
+            }
+            // toString: an ABSENT radix, or an explicit one that is
+            // (loosely) the number 10, is exactly the base-10 answer
+            // f64ToStr already gives — anything else (a real base, or a
+            // non-numeric radix ToNumber would coerce) fences.
+            argAt(0);
+            c.localTee(M);
+            c.structGet(dynT, DYN_KIND);
+            c.i32Const(DK.UNDEF);
+            c.i32Eq();
+            c.localGet(M);
+            c.structGet(dynT, DYN_KIND);
+            c.i32Const(DK.NUM);
+            c.i32Eq();
+            c.localGet(M);
+            c.structGet(dynT, DYN_NUM);
+            c.f64Const(10);
+            c.f64Eq();
+            c.i32And();
+            c.i32Or();
+            c.ifVoid();
+            this.boxStr(c, (x) => {
+              x.localGet(0);
+              x.structGet(dynT, DYN_NUM);
+              x.call(this.deps.f64ToStr());
+            });
+            c.return_();
+            c.end();
+            this.deps.throwError(c, "%Error", "Error", (x) =>
+              this.deps.lit(x, "'Number.prototype.toString' with a radix other than 10 is not supported yet"),
+            );
+            c.refNull(dynT);
+          });
+        }
+
         // BYTES, HANDLE and JSVAL boxes are UNCONSTRUCTIBLE on this tier
         // (their producers are libCalls the backend refuses), so their
         // arms cannot be reached — and a trap says so, where the
@@ -5563,5 +5959,664 @@ export class DynBuilder {
         );
       },
     );
+  }
+
+  /* ── increment 21 stage B, gate 2: String.prototype.replace/replaceAll
+   * (STRING patterns only — surfaces.ts's ISLAND_SURFACE table declares
+   * no regex form) and Number.prototype.toFixed, over the SAME `invoke`
+   * ladder above. Oracle-measured corners (scratchpad/oracle2/
+   * replace.mjs): `replace` takes the FIRST match only; `replaceAll`
+   * with a NON-empty pattern replaces every non-overlapping match left
+   * to right; `replaceAll` with the EMPTY pattern inserts at every one
+   * of length+1 positions (between every unit and at both ends) —
+   * `"aaa".replaceAll("","b")` is `"bababab"`; plain (single) `replace`
+   * with an empty pattern inserts ONCE, at position 0 only. The
+   * replacement text is NOT inserted raw: `getSubstitutionHelper` runs
+   * ECMA-262 GetSubstitution over it first (review round 1, SB5) —
+   * `$$`/`$&`/`` $` ``/`$'` expand, everything else (including `$1`-`$9`,
+   * never special here since a string pattern has no capture groups) is
+   * literal. */
+
+  private strReplaceOnceFunc: number | null = null;
+  private strReplaceAllFunc: number | null = null;
+
+  /** %w.strReplace{Once,All}(s, pat, repl) → str. */
+  private strReplaceHelper(all: boolean): number {
+    const cached = all ? this.strReplaceAllFunc : this.strReplaceOnceFunc;
+    if (cached !== null) return cached;
+    const strRef = this.deps.strRef();
+    const idx = this.mb.declareFunc(
+      this.mb.funcType([strRef, strRef, strRef], [strRef]),
+      all ? "%w.strReplaceAll" : "%w.strReplaceOnce",
+    );
+    if (all) this.strReplaceAllFunc = idx;
+    else this.strReplaceOnceFunc = idx;
+    const c = new Code();
+    const S = 0, PAT = 1, REPL = 2;
+    const L = 3, NL = 4, POS = 5, AT = 6, OUT = 7;
+    const indexOf = this.deps.strIndexOf();
+    const slice = this.deps.strSlice();
+    const concat = this.deps.concat();
+    c.localGet(S);
+    c.arrayLen();
+    c.localSet(L);
+    c.localGet(PAT);
+    c.arrayLen();
+    c.localSet(NL);
+    if (!all) {
+      // Single replace: one match (or none) — the empty pattern matches
+      // at position 0 only (strIndexOf's own "empty needle found at the
+      // clamped position" rule, clamped from fromIndex=0).
+      c.localGet(S);
+      c.localGet(PAT);
+      c.f64Const(0);
+      c.call(indexOf);
+      c.localSet(POS);
+      c.localGet(POS);
+      c.f64Const(0);
+      c.f64Lt();
+      c.ifResult(strRef);
+      c.localGet(S);
+      c.else_();
+      {
+        c.localGet(S);
+        c.i32Const(0);
+        c.f64ConvertI32S();
+        c.localGet(POS);
+        c.call(slice);
+        // GetSubstitution (SB5, review round 1): $$/$&/$`/$' now expand
+        // against the match at [POS, POS+NL) — a raw REPL concat used to
+        // pass every `$`-form through as literal text.
+        c.localGet(S);
+        c.localGet(POS);
+        c.localGet(NL);
+        c.f64ConvertI32S();
+        c.localGet(REPL);
+        c.call(this.getSubstitutionHelper());
+        c.call(concat);
+        c.localGet(S);
+        c.localGet(POS);
+        c.localGet(NL);
+        c.f64ConvertI32S();
+        c.f64Add();
+        c.localGet(L);
+        c.f64ConvertI32S();
+        c.call(slice);
+        c.call(concat);
+      }
+      c.end();
+      this.mb.setBody(idx, [I32, I32, F64], c.bytes());
+      return idx;
+    }
+    // replaceAll, non-empty pattern: scan left to right, advancing past
+    // each match's SOURCE span (never into `repl`'s own text — matches
+    // are found in the ORIGINAL string, `strIndexOf` never sees `repl`).
+    // Empty pattern: NL===0 forces `strIndexOf` to answer POS itself
+    // every time, so the generic loop below would spin forever advancing
+    // by 0 — the empty-pattern case is walked explicitly instead, one
+    // unit at a time, `repl` between and at both ends.
+    c.localGet(NL);
+    c.i32Eqz();
+    c.ifResult(strRef);
+    {
+      this.deps.lit(c, "");
+      c.localSet(OUT);
+      c.i32Const(0);
+      c.localSet(AT);
+      c.block();
+      c.loop();
+      // GetSubstitution (SB5): the empty-pattern insertion's own "match"
+      // is zero-length AT this position — $&/$`/$' still expand against
+      // it (measured: `"ab".replaceAll("", "[$`-$&-$\'']")` sees a real,
+      // if empty, $& at every insertion point).
+      c.localGet(OUT);
+      c.localGet(S);
+      c.localGet(AT);
+      c.f64ConvertI32S();
+      c.f64Const(0);
+      c.localGet(REPL);
+      c.call(this.getSubstitutionHelper());
+      c.call(concat);
+      c.localSet(OUT);
+      c.localGet(AT);
+      c.localGet(L);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(OUT);
+      c.localGet(S);
+      c.localGet(AT);
+      c.f64ConvertI32S();
+      c.localGet(AT);
+      c.i32Const(1);
+      c.i32Add();
+      c.f64ConvertI32S();
+      c.call(slice);
+      c.call(concat);
+      c.localSet(OUT);
+      c.localGet(AT);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(AT);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(OUT);
+    }
+    c.else_();
+    {
+      this.deps.lit(c, "");
+      c.localSet(OUT);
+      c.i32Const(0);
+      c.localSet(POS);
+      c.block();
+      c.loop();
+      c.localGet(S);
+      c.localGet(PAT);
+      c.localGet(POS);
+      c.f64ConvertI32S();
+      c.call(indexOf);
+      c.f64Const(0);
+      c.f64Lt();
+      c.ifVoid();
+      c.localGet(OUT);
+      c.localGet(S);
+      c.localGet(POS);
+      c.f64ConvertI32S();
+      c.localGet(L);
+      c.f64ConvertI32S();
+      c.call(slice);
+      c.call(concat);
+      c.localSet(OUT);
+      c.br(2);
+      c.end();
+      c.localGet(S);
+      c.localGet(PAT);
+      c.localGet(POS);
+      c.f64ConvertI32S();
+      c.call(indexOf);
+      c.i32TruncF64S();
+      c.localSet(AT);
+      c.localGet(OUT);
+      c.localGet(S);
+      c.localGet(POS);
+      c.f64ConvertI32S();
+      c.localGet(AT);
+      c.f64ConvertI32S();
+      c.call(slice);
+      c.call(concat);
+      // GetSubstitution (SB5): the match found at AT, length NL.
+      c.localGet(S);
+      c.localGet(AT);
+      c.f64ConvertI32S();
+      c.localGet(NL);
+      c.f64ConvertI32S();
+      c.localGet(REPL);
+      c.call(this.getSubstitutionHelper());
+      c.call(concat);
+      c.localSet(OUT);
+      c.localGet(AT);
+      c.localGet(NL);
+      c.i32Add();
+      c.localSet(POS);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(OUT);
+    }
+    c.end();
+    this.mb.setBody(idx, [I32, I32, I32, I32, strRef], c.bytes());
+    return idx;
+  }
+
+  private getSubstitutionFunc: number | null = null;
+
+  /** %w.getSubstitution(s, mStart, mLen, repl) → str — ECMA-262
+   * GetSubstitution, the STRING-PATTERN subset (no capture groups exist
+   * for a plain-string `replace`/`replaceAll` pattern, so `$1`-`$9`/`$<name>`
+   * are never special — Node's own answer, oracle-measured:
+   * `"abc".replace("b","$1")` → `"a$1c"`, the `$` and digit both literal).
+   * `$$` → one `$`; `$&` → the matched substring `s.slice(mStart,
+   * mStart+mLen)`; `` $` `` → the prefix `s.slice(0, mStart)`; `$'` → the
+   * suffix `s.slice(mStart+mLen, s.length)`; a `$` with no recognized
+   * following character (including a TRAILING `$`) passes through as a
+   * literal `$`, consuming only itself — oracle-measured (review round
+   * 1, SB5): `"abc".replace("b","$")` → `"a$c"`, `"abc".replace("b","$x")`
+   * → `"a$xc"`. */
+  private getSubstitutionHelper(): number {
+    if (this.getSubstitutionFunc !== null) return this.getSubstitutionFunc;
+    const strRef = this.deps.strRef();
+    const strType = this.deps.strType();
+    const idx = this.mb.declareFunc(this.mb.funcType([strRef, F64, F64, strRef], [strRef]), "%w.getSubstitution");
+    this.getSubstitutionFunc = idx;
+    const c = new Code();
+    const S = 0, MSTART = 1, MLEN = 2, REPL = 3;
+    const RL = 4, SL = 5, I = 6, OUT = 7, C1 = 8, APPEND = 9, SKIP = 10;
+    const slice = this.deps.strSlice();
+    const concat = this.deps.concat();
+    c.localGet(REPL);
+    c.arrayLen();
+    c.localSet(RL);
+    c.localGet(S);
+    c.arrayLen();
+    c.localSet(SL);
+    this.deps.lit(c, "");
+    c.localSet(OUT);
+    c.i32Const(0);
+    c.localSet(I);
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.localGet(RL);
+    c.i32GeS();
+    c.brIf(1);
+    // Default: one literal character, advance by 1.
+    c.localGet(REPL);
+    c.localGet(I);
+    c.f64ConvertI32S();
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.f64ConvertI32S();
+    c.call(slice);
+    c.localSet(APPEND);
+    c.i32Const(1);
+    c.localSet(SKIP);
+    c.localGet(REPL);
+    c.localGet(I);
+    c.arrayGetU(strType);
+    c.i32Const(0x24); // '$'
+    c.i32Eq();
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localGet(RL);
+    c.i32LtS();
+    c.i32And();
+    c.ifVoid();
+    {
+      c.localGet(REPL);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.arrayGetU(strType);
+      c.localSet(C1);
+      c.localGet(C1);
+      c.i32Const(0x24); // '$'
+      c.i32Eq();
+      c.ifVoid();
+      this.deps.lit(c, "$");
+      c.localSet(APPEND);
+      c.i32Const(2);
+      c.localSet(SKIP);
+      c.else_();
+      {
+        c.localGet(C1);
+        c.i32Const(0x26); // '&'
+        c.i32Eq();
+        c.ifVoid();
+        c.localGet(S);
+        c.localGet(MSTART);
+        c.localGet(MSTART);
+        c.localGet(MLEN);
+        c.f64Add();
+        c.call(slice);
+        c.localSet(APPEND);
+        c.i32Const(2);
+        c.localSet(SKIP);
+        c.else_();
+        {
+          c.localGet(C1);
+          c.i32Const(0x60); // '`'
+          c.i32Eq();
+          c.ifVoid();
+          c.localGet(S);
+          c.f64Const(0);
+          c.localGet(MSTART);
+          c.call(slice);
+          c.localSet(APPEND);
+          c.i32Const(2);
+          c.localSet(SKIP);
+          c.else_();
+          {
+            c.localGet(C1);
+            c.i32Const(0x27); // "'"
+            c.i32Eq();
+            c.ifVoid();
+            c.localGet(S);
+            c.localGet(MSTART);
+            c.localGet(MLEN);
+            c.f64Add();
+            c.localGet(SL);
+            c.f64ConvertI32S();
+            c.call(slice);
+            c.localSet(APPEND);
+            c.i32Const(2);
+            c.localSet(SKIP);
+            c.else_();
+            // '$' with no recognized follower: literal '$', consume 1.
+            this.deps.lit(c, "$");
+            c.localSet(APPEND);
+            c.i32Const(1);
+            c.localSet(SKIP);
+            c.end();
+          }
+          c.end();
+        }
+        c.end();
+      }
+      c.end();
+    }
+    c.end();
+    c.localGet(OUT);
+    c.localGet(APPEND);
+    c.call(concat);
+    c.localSet(OUT);
+    c.localGet(I);
+    c.localGet(SKIP);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+    c.localGet(OUT);
+    this.mb.setBody(idx, [I32, I32, I32, strRef, I32, strRef, I32], c.bytes());
+    return idx;
+  }
+
+  private toFixedFunc: number | null = null;
+
+  /** %w.dyn.toFixed(x, f) → str — ECMA-262 Number::toFixed. `f<0` or
+   * `f>100` (Infinity/-Infinity included, and NaN — ToIntegerOrInfinity's
+   * own NaN→0 rule keeps that ONE case in range) throws Node's exact
+   * RangeError BEFORE `x` is even inspected — oracle-measured, review
+   * round 1 SB3/SB4 (`NaN.toFixed(101)` throws, it does not answer
+   * "NaN"); non-finite `x` and `|x|>=1e21` both pass through `f64ToStr`
+   * unconverted, Node's own Number::toString(x,10) fallback. Rounding
+   * for everything else: `floor(scaled + 0.5)` — round-half-up on the
+   * (already non-negative) scaled magnitude, which is the spec's
+   * "closest n, ties to the larger" rule restated for x≥0. `f64ToStr`
+   * on the rounded integer gives its exact digit string (no decimal
+   * point/exponent for the magnitudes `ax<1e21` produces here — plain
+   * JS integer formatting); the digit
+   * string is left-zero-padded to f+1 chars before the split, covering
+   * the "ax rounds to fewer significant digits than f wants" case
+   * (measured: `(0).toFixed(2)` needs "000" before slicing "0"|"00"). */
+  toFixed(): number {
+    if (this.toFixedFunc !== null) return this.toFixedFunc;
+    const strRef = this.deps.strRef();
+    const idx = this.mb.declareFunc(this.mb.funcType([F64, F64], [strRef]), "%w.dyn.toFixed");
+    this.toFixedFunc = idx;
+    const c = new Code();
+    const X = 0, F = 1;
+    const FI = 2, SIGN = 3, AX = 4, SCALE = 5, N = 6, DIGITS = 7, DLEN = 8;
+    const ID = 9, TMP = 10;
+    // Step 1 (review round 1, SB3/SB4): the digits RangeError check runs
+    // BEFORE x is even inspected (oracle-measured: `NaN.toFixed(101)`
+    // throws, it does not answer "NaN") — `f` is ALREADY ToNumber'd by
+    // the caller (SB4: a STR digits argument coerces, e.g. "2" → 2), so
+    // this reads the raw f64 directly. IEEE comparisons make F!==F
+    // (NaN) fall out of EVERY term below FALSE on their own — no
+    // separate isNaN guard needed: ToIntegerOrInfinity(NaN) is 0 (in
+    // range), matching `(5).toFixed(NaN)` → "5" measured directly.
+    c.localGet(F);
+    c.f64Const(Infinity);
+    c.f64Eq();
+    c.localGet(F);
+    c.f64Const(-Infinity);
+    c.f64Eq();
+    c.i32Or();
+    c.localGet(F);
+    c.f64Trunc();
+    c.f64Const(0);
+    c.f64Lt();
+    c.i32Or();
+    c.localGet(F);
+    c.f64Trunc();
+    c.f64Const(100);
+    c.f64Gt();
+    c.i32Or();
+    c.ifVoid();
+    this.deps.throwError(c, "%RangeError", "RangeError", (x) =>
+      this.deps.lit(x, "toFixed() digits argument must be between 0 and 100"),
+    );
+    c.refNull(this.deps.strType());
+    c.return_();
+    c.end();
+    c.localGet(X);
+    c.localGet(X);
+    c.f64Ne();
+    c.ifResult(strRef);
+    this.deps.lit(c, "NaN");
+    c.else_();
+    {
+      // Step 2: non-finite x and |x|>=1e21 both pass THROUGH f64ToStr
+      // unconverted — the spec's own Number::toString(x,10) fallback,
+      // oracle-measured ("Infinity"/"-Infinity" verbatim; `1e21` and
+      // `1e21+1` both render as `f64ToStr`'s exponential text, not a
+      // 1-followed-by-21-zeros integer the scale/round path below would
+      // wrongly produce for a magnitude this large).
+      c.localGet(X);
+      c.i64ReinterpretF64();
+      c.i64Const(0x7fffffffffffffffn);
+      c.i64And();
+      c.f64ReinterpretI64();
+      c.localSet(AX);
+      c.localGet(AX);
+      c.f64Const(Infinity);
+      c.f64Eq();
+      c.localGet(AX);
+      c.f64Const(1e21);
+      c.f64Ge();
+      c.i32Or();
+      c.ifResult(strRef);
+      c.localGet(X);
+      c.call(this.deps.f64ToStr());
+      c.else_();
+      // `i32.trunc_f64_s` TRAPS on NaN — F itself can be NaN here (the
+      // range check above admits it, matching ToIntegerOrInfinity(NaN)
+      // = 0 — measured: `(5).toFixed(NaN)` → "5"), so the trunc target
+      // is guarded to 0 first rather than fed to the instruction raw.
+      c.localGet(F);
+      c.localGet(F);
+      c.f64Ne();
+      c.ifResult(F64);
+      c.f64Const(0);
+      c.else_();
+      c.localGet(F);
+      c.f64Trunc();
+      c.end();
+      c.i32TruncF64S();
+      c.localSet(FI);
+      // N2 (review round 2): the scale/round path below (AX*10^FI,
+      // +0.5, floor) is chained f64 arithmetic, NOT exact — beyond a
+      // TOTAL of ~15 significant decimal digits (the integer digits AX
+      // already has, PLUS the fractional digits FI asks for), it can
+      // produce a WRONG digit, or — once the rounded magnitude leaves
+      // the exact-integer window entirely — genuinely GARBLED text
+      // (f64ToStr falling back to exponential notation mid-digit-string,
+      // observed directly: `(0.1).toFixed(22)` renders as
+      // "0.0000000000000000001e+22" on this tier pre-fix). 15 total
+      // significant digits is the WELL-ESTABLISHED, PROVEN-SAFE bound
+      // for IEEE-754 doubles (a strict subset of the "17 always round-
+      // trips" guarantee) — empirically verified here against an EXACT
+      // BigInt reference (mantissa × 2^exponent × 10^FI, rounded) across
+      // 0.1/5/123.456/9.9999/1e20/1/0.5/999.999/0 and subnormals
+      // (5e-300, Number.MIN_VALUE, the smallest normal
+      // 2.2250738585072014e-308) for every (value, f) pair inside the
+      // bound, f∈[0,100]: zero mismatches. A CONSERVATIVE bound (some
+      // "round" values like `(5).toFixed(20)` are exactly correct well
+      // past it and still fence) rather than the tightest possible one
+      // — deriving the true, value-dependent boundary (trailing-zero-
+      // bit-aware) was attempted and rejected as unsound under
+      // measurement; a loud, named, catchable fence beyond a safe
+      // static bound is the ruling's own explicitly accepted shape.
+      //
+      // ID's COUNTER STARTS AT 1, not 0 (below), so it lands one HIGHER
+      // than AX's actual integer-digit count: for AX>=1 the loop divides
+      // once per digit and increments alongside each division, so ID ==
+      // intDigits(AX)+1 once it exits (AX=5 -> ID=2; AX=55 -> ID=3); for
+      // 0<AX<1 the loop body never runs at all and ID stays at its
+      // initial 1, which is ALSO intDigits(AX)+1 under the "zero integer
+      // digits" convention (0+1). So `ID+FI>15` below is really
+      // `intDigits(AX)+FI > 14`, not `> 15` — the EFFECTIVE safe window
+      // is intDigits(AX)+f <= 14, one digit TIGHTER than "15 total
+      // significant digits" reads, in the safe (more conservative)
+      // direction (still never wrong — just fences a handful of cases,
+      // like `(5).toFixed(14)`, that the 15-digit argument alone would
+      // have allowed). Measured directly: `(5).toFixed(14)` fences
+      // (intDigits=1, f=14, sum=15>14) while `(0.1).toFixed(14)`
+      // computes (intDigits=0, f=14, sum=14<=14) — see
+      // wasm-emitter.test.ts's "N2 gate-closing pin", which executes
+      // both in the same run (the fence branch below shipped as
+      // genuinely INVALID wasm once, caught only by a sweep that
+      // actually ran it — a pin that only typechecks or asserts refusal
+      // without instantiating would have missed it again).
+      c.i32Const(1);
+      c.localSet(ID);
+      c.localGet(AX);
+      c.localSet(TMP);
+      c.block();
+      c.loop();
+      c.localGet(TMP);
+      c.f64Const(1);
+      c.f64Lt();
+      c.brIf(1);
+      c.localGet(TMP);
+      c.f64Const(10);
+      c.f64Div();
+      c.localSet(TMP);
+      c.localGet(ID);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(ID);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(ID);
+      c.localGet(FI);
+      c.i32Add();
+      c.i32Const(15);
+      c.i32GtS();
+      c.ifResult(strRef);
+      this.deps.throwError(c, "%Error", "Error", (x) =>
+        this.deps.lit(x, "'Number.prototype.toFixed' at this precision is not supported yet"),
+      );
+      c.refNull(this.deps.strType());
+      c.else_();
+      c.localGet(X);
+      c.f64Const(0);
+      c.f64Lt();
+      c.ifResult(strRef);
+      this.deps.lit(c, "-");
+      c.else_();
+      this.deps.lit(c, "");
+      c.end();
+      c.localSet(SIGN);
+      c.localGet(X);
+      c.i64ReinterpretF64();
+      c.i64Const(0x7fffffffffffffffn);
+      c.i64And();
+      c.f64ReinterpretI64();
+      c.localSet(AX);
+      // scale = 10^FI, integer accumulation (FI is small — 0..~20 here).
+      c.f64Const(1);
+      c.localSet(SCALE);
+      c.block();
+      c.loop();
+      c.localGet(FI);
+      c.i32Const(0);
+      c.i32LeS();
+      c.brIf(1);
+      c.localGet(SCALE);
+      c.f64Const(10);
+      c.f64Mul();
+      c.localSet(SCALE);
+      c.localGet(FI);
+      c.i32Const(1);
+      c.i32Sub();
+      c.localSet(FI);
+      c.br(0);
+      c.end();
+      c.end();
+      // restore FI (the loop above decremented its copy) — SAME NaN
+      // guard as the first read of F above (`i32.trunc_f64_s` traps on
+      // NaN; `(5.5).toFixed(undefined)` reaches here with F literally
+      // NaN, per ToNumber(undefined)).
+      c.localGet(F);
+      c.localGet(F);
+      c.f64Ne();
+      c.ifResult(F64);
+      c.f64Const(0);
+      c.else_();
+      c.localGet(F);
+      c.f64Trunc();
+      c.end();
+      c.i32TruncF64S();
+      c.localSet(FI);
+      c.localGet(AX);
+      c.localGet(SCALE);
+      c.f64Mul();
+      c.f64Const(0.5);
+      c.f64Add();
+      c.f64Floor();
+      c.localSet(N);
+      c.localGet(N);
+      c.call(this.deps.f64ToStr());
+      c.localSet(DIGITS);
+      // Left-pad with '0' until longer than FI (so a split at len-FI
+      // always leaves at least one integer-part digit).
+      c.block();
+      c.loop();
+      c.localGet(DIGITS);
+      c.arrayLen();
+      c.localGet(FI);
+      c.i32GtS();
+      c.brIf(1);
+      this.deps.lit(c, "0");
+      c.localGet(DIGITS);
+      c.call(this.deps.concat());
+      c.localSet(DIGITS);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(DIGITS);
+      c.arrayLen();
+      c.localSet(DLEN);
+      c.localGet(FI);
+      c.i32Eqz();
+      c.ifResult(strRef);
+      c.localGet(SIGN);
+      c.localGet(DIGITS);
+      c.call(this.deps.concat());
+      c.else_();
+      {
+        c.localGet(SIGN);
+        c.localGet(DIGITS);
+        c.f64Const(0);
+        c.localGet(DLEN);
+        c.localGet(FI);
+        c.i32Sub();
+        c.f64ConvertI32S();
+        c.call(this.deps.strSlice());
+        c.call(this.deps.concat());
+        this.deps.lit(c, ".");
+        c.call(this.deps.concat());
+        c.localGet(DIGITS);
+        c.localGet(DLEN);
+        c.localGet(FI);
+        c.i32Sub();
+        c.f64ConvertI32S();
+        c.localGet(DLEN);
+        c.f64ConvertI32S();
+        c.call(this.deps.strSlice());
+        c.call(this.deps.concat());
+      }
+      c.end();
+      c.end(); // closes the N2 "too many significant digits" fence check
+      c.end(); // closes the non-finite/|x|>=1e21 ifResult opened above
+    }
+    c.end();
+    this.mb.setBody(idx, [I32, strRef, F64, F64, F64, strRef, I32, I32, F64], c.bytes());
+    return idx;
   }
 }

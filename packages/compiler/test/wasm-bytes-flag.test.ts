@@ -22,7 +22,7 @@
 import { expect, test } from "vitest";
 import { VecBuilder } from "../src/backend/wasm/arrays.js";
 import { Code } from "../src/backend/wasm/code.js";
-import { DynBuilder } from "../src/backend/wasm/dyn.js";
+import { DynBuilder, DYN_NUM } from "../src/backend/wasm/dyn.js";
 import { InspectBuilder } from "../src/backend/wasm/inspect.js";
 import { JsonBuilder } from "../src/backend/wasm/json.js";
 import { F64, I32, ModuleBuilder, type ValType } from "../src/backend/wasm/module.js";
@@ -66,6 +66,22 @@ async function buildHarness(
   };
   let f2s: number | null = null;
   const f64ToStr = (): number => (f2s ??= buildF64ToStr(mb, strType, strRef));
+  // A minimal ToNumber stub (review round 1's DynDeps.jsToNumber
+  // addition): this driver never exercises toFixed/toString's OWN
+  // argument coercion, so a bare DYN_NUM read (the pre-fix behavior,
+  // correct for a NUM-kind operand) is a valid, sufficient body — not
+  // the full jsToNumberHelper this file has no need to duplicate.
+  let jtn: number | null = null;
+  const jsToNumberFn = (): number => {
+    if (jtn !== null) return jtn;
+    const idx = mb.declareFunc(mb.funcType([dyn.dynRef()], [F64]), "%real.jsToNumber");
+    jtn = idx;
+    const c = new Code();
+    c.localGet(0);
+    c.structGet(dyn.dynT(), DYN_NUM);
+    mb.setBody(idx, [], c.bytes());
+    return idx;
+  };
 
   // A trivial stub: a function of the given signature whose body is
   // structurally valid (default/zero results) but never meant to run —
@@ -201,6 +217,7 @@ async function buildHarness(
     bytesGet: () => bytesB.get("u8"),
     bytesSet: () => bytesB.setElem("u8"),
     bytesToStrUtf8: () => bytesB.toStrHelper("utf8"),
+    jsToNumber: jsToNumberFn,
   });
 
   const json = new JsonBuilder(mb, {
