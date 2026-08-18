@@ -2662,3 +2662,42 @@ increment-21 unit pins covering both directions (write-through and
 push-through), with the C lane's divergent values pinned beside the
 wasm/Node values so the split is explicit and cannot be silently
 "aligned" in either direction.
+
+## S045 — A dynamic-import namespace member with no compiled crossing is a TRAP FUNCTION, not the value *(inherited; newly reachable on the wasm tier)*
+
+The own-module dynamic-import namespace is a frontend-synthesized object
+builder (lower-island.ts's dynNsBuilderOf): each VALUE export marshals
+into the island if it can, and an export with NO island representation —
+a class, a generic function, an un-marshalable record shape — becomes a
+TRAP FUNCTION: a real function whose any USE throws the pointed
+compile-informed TypeError ("the '<name>' export is a value of type …
+cannot cross into dynamically-executed code yet"). The namespace still
+builds; only the use has no compiled story. Consequences, measured
+three-lane (increment 21 stage C review): for such an export,
+`typeof ns.member` answers "function" on BOTH compiled lanes where Node
+answers the value's own typeof (e.g. "object" for an exported record
+carrying a closure field), and CALLING it throws the compiler's teaching
+text where Node would throw its own ("t is not a function") or succeed
+outright.
+
+**Rationale:** inherited — the substitution is the frontend's design
+(both native lanes have shipped it since the island landed; the wasm
+tier joining the bridge in increment 21 is what made it REACHABLE there,
+which is why it is registered now, per the register-before-merge rule).
+The alternative — refusing the whole import when any export is
+un-marshalable — would break the dominant pattern (a module with one
+hard export and many easy ones, imported for the easy ones). Both
+compiled lanes agree and Node differs, so no corpus program can pin the
+divergence (a program observing it fails native-vs-Node by construction
+— the S015-family argument, valid here because the LANES AGREE). The
+loudness contract holds at the USE: touching the substituted member
+throws with the export's name and type spelled out, never a silent
+wrong value.
+
+**Tested by:** the frontend's own island tests exercise the trap-fn
+construction; the wasm lane's reachable half is covered by the eleven
+TLA/import claims (whose exports all marshal — no trap fn fires in a
+CLAIMED program's output, which the census's byte-exactness enforces
+structurally). The typeof divergence itself is corpus-unpinnable per
+the rationale; the increment-21 stage C review probes are the
+measurement of record.

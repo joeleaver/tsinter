@@ -5476,6 +5476,96 @@
    ],
    "diags": []
   },
+  "<repo>/tests/corpus/2672-http-request-response-callback.ts": {
+   "order": [
+    "<repo>/tests/corpus/2672-http-request-response-callback.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2673-generators-finally-chain.ts": {
+   "order": [
+    "<repo>/tests/corpus/2673-generators-finally-chain.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2674-generators-finally-plain-outer.ts": {
+   "order": [
+    "<repo>/tests/corpus/2674-generators-finally-plain-outer.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2675-generators-finally-plain-inner.ts": {
+   "order": [
+    "<repo>/tests/corpus/2675-generators-finally-plain-inner.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2676-generators-finally-catch-order.ts": {
+   "order": [
+    "<repo>/tests/corpus/2676-generators-finally-catch-order.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2677-generators-finally-fallthrough.ts": {
+   "order": [
+    "<repo>/tests/corpus/2677-generators-finally-fallthrough.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2678-generators-finally-genret-group.ts": {
+   "order": [
+    "<repo>/tests/corpus/2678-generators-finally-genret-group.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2679-generators-finally-return-chain.ts": {
+   "order": [
+    "<repo>/tests/corpus/2679-generators-finally-return-chain.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2680-generators-finally-throw-done.ts": {
+   "order": [
+    "<repo>/tests/corpus/2680-generators-finally-throw-done.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2681-async-finally-throw.ts": {
+   "order": [
+    "<repo>/tests/corpus/2681-async-finally-throw.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2682-async-finally-normal.ts": {
+   "order": [
+    "<repo>/tests/corpus/2682-async-finally-normal.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2683-generators-finally-catch-between.ts": {
+   "order": [
+    "<repo>/tests/corpus/2683-generators-finally-catch-between.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2684-async-finally-catch-between.ts": {
+   "order": [
+    "<repo>/tests/corpus/2684-async-finally-catch-between.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2685-dynamic-import-sync-throw/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2685-dynamic-import-sync-throw/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2686-dynamic-import-two-observers/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2686-dynamic-import-two-observers/main.ts"
+   ],
+   "diags": []
+  },
   "<repo>/tests/corpus/300-if-else.ts": {
    "order": [
     "<repo>/tests/corpus/300-if-else.ts"

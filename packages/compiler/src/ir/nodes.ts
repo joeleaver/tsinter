@@ -4892,8 +4892,14 @@ export type IrExpr =
    * crosses like a bridged exception (engine Errors become real static
    * Errors) and re-throws at the await or enters the unhandled ledger.
    * Bridging one engine promise twice makes two independent static
-   * observers of the same settlement — semantically equivalent, slightly
-   * redundant (SEMANTICS.md). Operand borrowed; result +1. MAY THROW
+   * observers of the same settlement — semantically equivalent to two
+   * independent `.then()`/`await` subscriptions on one Node promise
+   * (each observer gets its own reaction, both see the same eventual
+   * outcome), so this is NOT a registered divergence — no SEMANTICS.md
+   * entry covers it because there is nothing to register; the wasm
+   * backend's jsBridgePromise (increment 21 stage C) mints an
+   * independent destination promise and reaction per bridge, verified
+   * against this reading. Operand borrowed; result +1. MAY THROW
    * only on an engine-level surprise minting the subscription — backends
    * seed may-throw and emit the pending check like other island ops. */
   | { kind: "jsBridgePromise"; value: IrExpr; type: IrType; loc: SrcLoc };

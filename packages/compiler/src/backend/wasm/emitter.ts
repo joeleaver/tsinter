@@ -60,6 +60,7 @@ import {
   typeEquals,
   typeKey,
   DYN,
+  JSVAL,
   NULL_T,
   UNDEFINED_T,
   RUNTIME_ERROR_CLASSES,
@@ -3226,7 +3227,43 @@ class Assembler {
         // ScrPromise directly when the inner type is ALREADY dyn, and
         // otherwise builds an adapter promise whose settle callback
         // converts the payload; only the direct form lands here.
-        if (t.inner.kind !== "dyn") {
+        //
+        // jsval ≡ dyn (increment 21 stage C): a promise whose inner type
+        // is jsval settles through the SAME (kind=EXC_REF, ref=<dyn
+        // ref>) slot a promise<dyn> does — jsval's wasm representation
+        // IS dyn's — so boxing the promise struct directly, with no
+        // adapter, is representation-safe for this inner shape exactly
+        // as it already is for literal "dyn". This is what the dynamic-
+        // import bridge's own ASYNC builder closures need: their
+        // declared return is ALWAYS `promise<jsval>` (lower-island.ts:
+        // 371), boxed through THIS helper by their FUNC thunk's return
+        // conversion — exercised by every async member of the ten
+        // TLA/import claims below.
+        //
+        // array<jsval> (2633's `Promise<any[]>` shape) was DRAFTED here
+        // too — same representation argument, array<jsval>'s vector
+        // interns byte-identically to array<dyn>'s (vecKeyFor's jsval
+        // arm, §2b) — but PULLED before landing: no corpus program
+        // reaches it, and the corrected story is NOT "2633 refuses
+        // earlier, on jsMarshal" (an earlier draft's WRONG claim,
+        // measured false) — 2633's only diagnostic, as this tier
+        // stands, IS this pulled arm's own `expr:jsBridgePromise`
+        // refusal (emitJsBridgePromise's own doc has the full account);
+        // survey-accepting it hypothetically does not reach jsMarshal's
+        // unimplemented "promise" arm next either — the next gate is
+        // `expr:jsOp`, with jsMarshal's own gap surfacing only as a
+        // SEPARATE, non-blocking survey need alongside it. Landing this
+        // arm without a program to exercise it would still have shipped
+        // as unexecuted, unverified wasm bytecode — the stage-B
+        // "typechecks but never ran" lesson this increment's own brief
+        // warns against — so it stays pulled regardless of the order
+        // correction. Re-add under a program that actually reaches it.
+        //
+        // Any OTHER inner type (f64/bool/string/array/record/...) uses a
+        // differently-shaped slot a jsval/dyn reader would misread —
+        // those still need the adapter this tier does not build, and
+        // keep refusing.
+        if (t.inner.kind !== "dyn" && t.inner.kind !== "jsval") {
           this.refuse("dynFrom:promise:adapt", loc);
           return false;
         }
@@ -10449,13 +10486,15 @@ class Assembler {
        * here (one struct), but the awaiting side then reads a payload it
        * has no type for — the void-await path is its own work. */
       case "promiseVoidWiden":
-      /* The island → static PROMISE bridge: stage C scope (increment 21).
-       * The re-wrap over a dyn PROMISE payload plus the settle:jsval /
-       * %async.settled:jsval payload family are a bridge-stage unit, not
-       * part of stage A's representation + no-coercion-op slice. */
-      case "jsBridgePromise":
         this.refuse(`expr:${e.kind}`, e.loc);
         code.unreachable();
+        return;
+
+      /* The island → static PROMISE bridge (increment 21, stage C): a
+       * re-wrap over a dyn PROMISE payload — see emitJsBridgePromise's
+       * own doc. */
+      case "jsBridgePromise":
+        this.emitJsBridgePromise(e);
         return;
 
       /* Island value → dyn conversion (jsval ≡ dyn, increment 21): a
@@ -10514,19 +10553,23 @@ class Assembler {
             return;
           }
           case "dyn":
-            // THE S014 island amendment (draft — the lead finalizes at
-            // gate): the native island DEEP-COPIES a dyn operand across
-            // the marshal boundary; jsval ≡ dyn makes that boundary
-            // representationally free, so this tier ALIASES instead —
-            // matching the bytes-alias precedent (SEMANTICS.md S014's
-            // existing per-lane split) and, more importantly, matching
-            // NODE (no boundary exists in Node at all, so no aliasing
-            // question can arise there). No corpus program can observe
-            // the difference: doing so would require mutating through
+            // THE S014 island amendment — LANDED (SEMANTICS.md S014,
+            // "Amendment (increment 21 stage A, island crossing)"): the
+            // native island DEEP-COPIES a dyn operand across the marshal
+            // boundary; jsval ≡ dyn makes that boundary representationally
+            // free, so this tier ALIASES instead — matching the
+            // bytes-alias precedent (S014's own prior per-lane split) and,
+            // more importantly, matching NODE (no boundary exists in Node
+            // at all, so no aliasing question can arise there). The entry
+            // records the corpus evidence directly (2579/2583/2585/2632
+            // construct this arm and pass byte-for-byte) and the
+            // wasm-emitter.test.ts unit pin (identity, not a Node
+            // comparison — the aliasing-vs-copying CHOICE itself is not
+            // corpus-observable: doing so would require mutating through
             // one reference and reading the mutation through the other
-            // AFTER the marshal, which is exactly the divergence the
-            // native-vs-Node byte-for-byte contract already rules out —
-            // any program that pinned it would already fail on native.
+            // AFTER the marshal, which the native-vs-Node byte-for-byte
+            // contract already rules out on its own — any program that
+            // pinned it would already fail on native).
             this.walkExpr(e.value);
             return;
           case "record":
@@ -11038,6 +11081,49 @@ class Assembler {
             // ambient-object representation nothing else needs.
             const globalGetName =
               e.args[0]!.kind === "jsOp" && e.args[0]!.op === "globalGet" ? e.args[0]!.name : undefined;
+            if (globalGetName === "Promise" && name === "resolve") {
+              // The import bridge's spine (increment 21 stage C,
+              // lower-island.ts:365–366): `Promise.resolve()`, ALWAYS
+              // zero-arg — the compiler's own synthesis never calls it
+              // any other way (a user-visible `Promise.resolve(x)` never
+              // reaches jsOp at all: lower-calls.ts's own coercion routes
+              // a jsval receiver through jsBridgePromise + the static
+              // promise combinators BEFORE the method call lowers). Mint
+              // a promise, settle it FULFILLED with the engine's own
+              // undefined (spec: resolve() with no value resolves to
+              // undefined), and box it as a dyn PROMISE payload — the
+              // SAME struct jsOp:callMethod("then") and jsBridgePromise
+              // read back (DK.PROMISE's ref field IS the promise struct
+              // itself, an opaque `eq` handle from dyn's own vantage).
+              if (e.args.length !== 1) {
+                // Unreachable via the compiler's own synthesis (see
+                // above), but not validator-guaranteed — a refusal, not
+                // an ICE, and under the SAME stable `expr:jsOp` aggregate
+                // every other unmodeled jsOp shape uses (bucket names
+                // are census currency; a fragmented per-shape name here
+                // would be the same mistake jsMarshal's own case once
+                // made, F12/SB11's precedent).
+                this.refuse(`expr:${e.kind}`, e.loc);
+                code.unreachable();
+                return;
+              }
+              const p = this.acquireScratch(this.proms.promRef());
+              code.call(this.proms.mint());
+              code.localSet(p);
+              code.localGet(p);
+              code.i32Const(EXC_REF);
+              code.f64Const(0);
+              code.globalGet(this.dyn.undefinedGlobal());
+              code.i32Const(-1);
+              code.i32Const(1);
+              code.call(this.proms.settle());
+              code.i32Const(DK.PROMISE);
+              code.f64Const(0);
+              code.localGet(p);
+              code.structNew(this.dyn.dynT());
+              this.releaseScratch(this.proms.promRef(), p);
+              return;
+            }
             if (globalGetName === "JSON" && name === "stringify") {
               // The engine's OWN JSON.stringify (2171's own header) —
               // stringifyDyn is THE existing entry point a dyn-rooted
@@ -11303,6 +11389,93 @@ class Assembler {
                 this.pushStrLit(name);
                 code.call(this.dyn.invoke(name));
                 this.releaseScratch(this.dyn.arrRef(), argsVec0);
+              }
+              code.end();
+              this.emitPendingCheck();
+              this.releaseScratch(this.dyn.dynRef(), recv);
+              return;
+            }
+            // then: the import bridge's OTHER spine half
+            // (lower-island.ts:379) — `Promise.resolve().then(builder)`.
+            // Reached with a RUNTIME-kind check (not a static globalGet
+            // shape match, unlike resolve): the receiver here is
+            // `resolved`, an ordinary jsOp result, not a literal
+            // globalGet node. Any OTHER receiver kind — unreachable
+            // through the compiler's own synthesis, but not assumed —
+            // falls through to the SAME generic `dyn.invoke("then")`
+            // path below, which is NOT unconditionally Node's "is not a
+            // function": invoke's OBJ arm dispatches OWN members FIRST
+            // (own-property shadowing, matching JS), so an OBJ receiver
+            // with its OWN `then` FUNC member calls IT correctly —
+            // measured directly, `o.then(5)` on a plain object owning a
+            // `then` method answers Node's own result. "then" is in
+            // none of dyn.ts's *_METHODS tables, so it is ONLY a
+            // receiver with no own `then` (any non-OBJ kind, or an OBJ
+            // lacking the member) that reaches Node's catchable "is not
+            // a function" tail. May throw: the handler itself can
+            // throw, and that throw must reject the chained promise,
+            // never propagate through this call (a reaction runs inside
+            // the microtask drain loop, with no enclosing try to catch
+            // it otherwise).
+            if (name === "then") {
+              if (e.args.length !== 2) {
+                // Unreachable via the compiler's own synthesis, but not
+                // validator-guaranteed — a refusal, not an ICE, under
+                // the same stable `expr:jsOp` aggregate as resolve's
+                // arity guard above (F12/SB11's precedent: no fragmented
+                // per-shape bucket names).
+                this.refuse(`expr:${e.kind}`, e.loc);
+                code.unreachable();
+                return;
+              }
+              code.localGet(recv);
+              code.structGet(this.dyn.dynT(), DYN_KIND);
+              code.i32Const(DK.PROMISE);
+              code.i32Eq();
+              code.ifResult(this.dyn.dynRef());
+              {
+                this.walkExpr(e.args[1]!);
+                const handler = this.acquireScratch(this.dyn.dynRef());
+                code.localSet(handler);
+                const dst = this.acquireScratch(this.proms.promRef());
+                code.call(this.proms.mint());
+                code.localSet(dst);
+                const src = this.acquireScratch(this.proms.promRef());
+                code.localGet(recv);
+                code.structGet(this.dyn.dynT(), DYN_REF);
+                code.refCast(this.proms.promT);
+                code.localSet(src);
+                code.localGet(src);
+                this.pushReactionClosure(code, this.thenReactionFn(e.loc));
+                code.localGet(dst);
+                code.localGet(src);
+                code.localGet(handler);
+                code.structNew(this.thenEntryType());
+                code.call(this.proms.subscribeHandled());
+                code.i32Const(DK.PROMISE);
+                code.f64Const(0);
+                code.localGet(dst);
+                code.structNew(this.dyn.dynT());
+                this.releaseScratch(this.proms.promRef(), src);
+                this.releaseScratch(this.proms.promRef(), dst);
+                this.releaseScratch(this.dyn.dynRef(), handler);
+              }
+              code.else_();
+              {
+                const argsVecT = this.acquireScratch(this.dyn.arrRef());
+                code.f64Const(0);
+                code.call(this.vecs.newLen(this.dynVecInfo()));
+                code.localSet(argsVecT);
+                for (let i = 1; i < e.args.length; i++) {
+                  code.localGet(argsVecT);
+                  this.walkExpr(e.args[i]!);
+                  code.call(this.dyn.arrPush());
+                }
+                code.localGet(recv);
+                code.localGet(argsVecT);
+                this.pushStrLit(name);
+                code.call(this.dyn.invoke(name));
+                this.releaseScratch(this.dyn.arrRef(), argsVecT);
               }
               code.end();
               this.emitPendingCheck();
@@ -14776,6 +14949,274 @@ class Assembler {
     code.localGet(result);
     this.releaseScratch(promRef, result);
     for (const slot of held) this.releaseScratch(promRef, slot);
+  }
+
+  /* ── the import bridge's promise machinery (increment 21, stage C) ────
+   *
+   * `Promise.resolve().then(builder)` (lower-island.ts:365–380) and
+   * `jsBridgePromise` both need ONE new reaction shape beyond Promise.all
+   * /race's: "run a handler closure with the settled value, then settle a
+   * DESTINATION promise with whatever it returns — adopting a thenable
+   * result rather than nesting it." `raceReactionFor`'s "copy" path
+   * (typeEquals(from,to)) already IS the degenerate case of this — copy
+   * the WHOLE outcome, unread — which is exactly right for jsval-shaped
+   * promises: their fulfilment payload is ALWAYS (kind=EXC_REF, ref=<dyn
+   * box>), so a promise-of-jsval settling from ANOTHER promise-of-jsval
+   * is a plain field-wise copy, no conversion. Both the `then` reaction's
+   * adoption step and jsBridgePromise's jsval/dyn arm reuse it directly
+   * (`raceReactionFor(JSVAL, JSVAL, loc)`, forced onto the "copy" key)
+   * rather than duplicating settleFrom-over-raceEntryT a third time. */
+
+  private thenEntryField: number | null = null;
+
+  /** `%w.then.entry` — a `then` reaction's frame: the destination promise
+   * `.then()` itself minted, the SOURCE promise being awaited (the same
+   * shape as raceEntryT's pair, but a `then` reaction ALSO needs the
+   * handler closure the race/all reactions never carry — no user code
+   * runs inside THEIR reactions). */
+  private thenEntryType(): number {
+    this.thenEntryField ??= this.mb.subStructType(
+      "%w.then.entry",
+      [
+        { storage: this.proms.promRef(), mutable: false },
+        { storage: this.proms.promRef(), mutable: false },
+        { storage: this.dyn.dynRef(), mutable: false },
+      ],
+      this.frameBaseType(),
+    );
+    return this.thenEntryField;
+  }
+
+  private thenReactionField: number | null = null;
+
+  /** The `then` reaction (see the header above): on a REJECTED source,
+   * pass the rejection through unchanged (our modeled shape is always
+   * `.then(onFulfilled)` — one handler, fulfillment only, exactly what
+   * the import bridge's `Promise.resolve().then(builder)` is). On
+   * FULFILLED, call the handler with the settled value (JS arity: extra
+   * arguments a shorter-signature closure declares ride the vector and
+   * are simply never read — dyn.callFn()'s own contract) and either
+   * settle the destination directly (a plain value) or ADOPT (the
+   * handler itself returned a thenable — the async import builder's own
+   * shape when it awaits its module's %init: calling it always returns a
+   * jsval-boxed `promise<jsval>`, per its FUNC thunk's dynFromHelper
+   * return-conversion, increment 21 stage C). A handler throw is caught
+   * here (never propagated through the microtask drain loop, which has
+   * no enclosing try of its own) and rejects the destination instead —
+   * the same "reject my own promise" shape `%async.reject` gives an
+   * async function's implicit top-level catch. */
+  private thenReactionFn(loc: SrcLoc): number {
+    if (this.thenReactionField !== null) return this.thenReactionField;
+    const pair = this.resumeClosPair();
+    const idx = this.mb.declareFunc(pair.fn, "%w.async.thenRx");
+    this.thenReactionField = idx;
+    const entryT = this.thenEntryType();
+    const promT = this.proms.promT;
+    const dynT = this.dyn.dynT();
+    const dynRef = this.dyn.dynRef();
+    const c = new Code();
+    const E = 2, DST = 3, SRC = 4, HANDLER = 5, VAL = 6, ARGS = 7, RESULT = 8, INNER = 9;
+    c.localGet(1);
+    c.refCast(entryT);
+    c.localSet(E);
+    c.localGet(E);
+    c.structGet(entryT, 0);
+    c.localSet(DST);
+    c.localGet(E);
+    c.structGet(entryT, 1);
+    c.localSet(SRC);
+    c.localGet(E);
+    c.structGet(entryT, 2);
+    c.localSet(HANDLER);
+    // SRC is ALWAYS fulfilled here, by construction, not merely in
+    // practice: the ONLY producer that ever reaches a `then` reaction's
+    // SRC slot is `jsOp:callMethod("resolve")` (this file's own arm,
+    // above), which unconditionally settles FULFILLED with undefined —
+    // there is no rejection handler in the modeled shape (one handler,
+    // fulfillment only, exactly `Promise.resolve().then(builder)`) for
+    // the same reason: nothing here can ever produce one. Loud trap
+    // instead of an untested `settleFrom` pass-through — verified dead
+    // by disabling it and re-running the full ten-program differential
+    // (unchanged) rather than assumed; a future producer that CAN
+    // reject here must re-add the branch under a program that actually
+    // exercises it, not restore this comment's old code unverified.
+    c.localGet(SRC);
+    c.structGet(promT, PROM_STATE);
+    c.i32Const(1);
+    c.i32Ne();
+    c.ifVoid();
+    c.unreachable();
+    c.end();
+    // Fulfilled: the payload is ALWAYS a dyn ref (jsval-shaped promises
+    // only — the only kind this arm ever subscribes to).
+    c.localGet(SRC);
+    c.structGet(promT, PROM_REF);
+    c.refCast(dynT);
+    c.localSet(VAL);
+    c.f64Const(0);
+    c.call(this.vecs.newLen(this.dynVecInfo()));
+    c.localSet(ARGS);
+    c.localGet(ARGS);
+    c.localGet(VAL);
+    c.call(this.dyn.arrPush());
+    c.localGet(HANDLER);
+    c.localGet(ARGS);
+    this.pushStrLitInto(c, "value");
+    c.call(this.dyn.callFn());
+    c.localSet(RESULT);
+    // The handler threw: absorb it as DST's rejection (never propagate —
+    // there is no enclosing try inside the microtask drain loop) and
+    // clear the cell so nothing downstream re-observes it. Exercised by
+    // 2685 (a SYNCHRONOUS imported module's %init throwing at the
+    // builder call itself — verified load-bearing by disabling this
+    // branch and watching 2685 stop mid-output and trap instead of
+    // printing Node's "caught Error: boom").
+    c.globalGet(this.exc().kindG);
+    c.ifVoid();
+    c.localGet(DST);
+    c.globalGet(this.exc().kindG);
+    c.globalGet(this.exc().f64G);
+    c.globalGet(this.exc().refG);
+    c.globalGet(this.exc().preG);
+    c.i32Const(2);
+    c.call(this.proms.settle());
+    this.emitCellClearInto(c);
+    c.return_();
+    c.end();
+    // The handler's return is itself a thenable (DK.PROMISE): adopt —
+    // subscribe DST to settle when it does, rather than nesting it.
+    // Strongly load-bearing (verified by disabling it: five of the ten
+    // TLA/import claims below immediately diverge from Node) — every
+    // ASYNC builder (any imported module reached through a TLA-bearing
+    // chain) returns a jsval-boxed `promise<jsval>` from its OWN await
+    // on %init, per the dynFromHelper "promise" arm's jsval case above.
+    c.localGet(RESULT);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.PROMISE);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(RESULT);
+    c.structGet(dynT, DYN_REF);
+    c.refCast(promT);
+    c.localSet(INNER);
+    c.localGet(INNER);
+    this.pushReactionClosure(c, this.raceReactionForCopy(loc));
+    c.localGet(DST);
+    c.localGet(INNER);
+    c.structNew(this.proms.raceEntryT);
+    c.call(this.proms.subscribeHandled());
+    c.return_();
+    c.end();
+    // A plain value: fulfill DST with it directly.
+    c.localGet(DST);
+    c.i32Const(EXC_REF);
+    c.f64Const(0);
+    c.localGet(RESULT);
+    c.i32Const(-1);
+    c.i32Const(1);
+    c.call(this.proms.settle());
+    this.mb.setBody(
+      idx,
+      [
+        { kind: "ref", nullable: true, typeIndex: entryT },
+        this.proms.promRef(),
+        this.proms.promRef(),
+        dynRef,
+        dynRef,
+        this.dyn.arrRef(),
+        dynRef,
+        this.proms.promRef(),
+      ],
+      c.bytes(),
+    );
+    return idx;
+  }
+
+  /** `raceReactionFor(JSVAL, JSVAL, loc)`, forced onto the "copy" key —
+   * see this section's header. `loc` only matters on the adapter path,
+   * which `typeEquals(JSVAL, JSVAL)` never takes, so the call site's own
+   * loc (threaded through, never invented) is safe to pass unread. */
+  private raceReactionForCopy(loc: SrcLoc): number {
+    const rx = this.raceReactionFor(JSVAL, JSVAL, loc);
+    if (rx === null) throw new Error("emitter bug: the 'copy' race reaction path refused");
+    return rx;
+  }
+
+  /** Island → static PROMISE bridge (increment 21 stage C — the design
+   * doc's own §6: "close to a re-wrap"). `e.value` is a dyn PROMISE
+   * payload (by construction: the ONLY producers reaching this operand —
+   * `jsOp:callMethod("resolve"/"then")` and the (out-of-tier)
+   * `island.importDyn` libCall — always tag it DK.PROMISE); the result IS
+   * `this.proms.promRef()` directly, no dyn box (mapType(promise) is the
+   * ONE promise struct regardless of inner type). Only the `jsval`/`dyn`
+   * inner arm lands: it re-wraps via `raceReactionFor`'s "copy" path
+   * (typeEquals(JSVAL,JSVAL) forces the same-type key) — a promise-of-
+   * jsval settling from another promise-of-jsval is a plain field-wise
+   * copy of the (kind, f64, ref, pre, state) triple, fulfilment AND
+   * rejection alike (a thrown reason is never checked against the
+   * fulfilment type). This is the ONLY inner shape the ten TLA/import
+   * claims below need — the whole spine hardcodes `inner: JSVAL`
+   * (lower-island.ts:318, :380).
+   *
+   * `void` and `array<jsval>` (2633's `Promise<any[]>` shape, and a
+   * `Promise<void>`-typed await through a jsval boundary) were DRAFTED
+   * and PULLED before landing: no corpus program reaches either today
+   * (confirmed by disabling each in turn and re-running the full
+   * differential census — the claimed count and TIER_FLOOR were
+   * unchanged both times), so they would have shipped as unexecuted,
+   * unverified wasm bytecode — the stage-B "typechecks but never ran"
+   * lesson this increment's own brief warns against. MEASURED (not
+   * assumed): 2633's only diagnostic today IS this pulled arm's own
+   * refusal below — it is not gated any earlier by jsMarshal's own
+   * separate "promise" gap, and even survey-accepting this arm
+   * hypothetically does not reach jsMarshal next either; the next gate
+   * is `expr:jsOp` (a `Promise.all`-shaped island invoke need),
+   * jsMarshal's gap surfacing only as an ADDITIONAL, non-blocking
+   * survey need alongside it. Both pulled arms are straightforward to
+   * add back (void: settle the destination with a void payload on
+   * fulfilment, copy unread on rejection; array<jsval>: port
+   * scr_island.c's `isl_bridge_settle` SCR_ISLP_JSVAL_ARR arm +
+   * `scr_jsval_exit_jsval_arr` — Array.isArray-gated, elements BY
+   * REFERENCE, a non-array fulfillment rejecting with `isl_exit_fail`'s
+   * "expected an array, got <typeof>", S009's footing) — land each
+   * under a corpus program that actually exercises it end to end.
+   * Refuses under the stable `expr:jsBridgePromise` aggregate (bucket
+   * names are census currency; a fragmented per-shape name would sit
+   * where the aggregate should — F12/SB11's precedent). */
+  private emitJsBridgePromise(e: Extract<IrExpr, { kind: "jsBridgePromise" }>): void {
+    const code = this.fn.code;
+    if (e.type.kind !== "promise") throw new Error("jsBridgePromise result must be a promise (validator's contract)");
+    const inner = e.type.inner;
+    let rx: number;
+    if (inner.kind === "jsval" || inner.kind === "dyn") {
+      rx = this.raceReactionForCopy(e.loc);
+    } else {
+      this.refuse(`expr:${e.kind}`, e.loc);
+      code.unreachable();
+      return;
+    }
+    const dynRef = this.dyn.dynRef();
+    const src = this.acquireScratch(dynRef);
+    this.walkExpr(e.value);
+    code.localSet(src);
+    const srcP = this.acquireScratch(this.proms.promRef());
+    code.localGet(src);
+    code.structGet(this.dyn.dynT(), DYN_REF);
+    code.refCast(this.proms.promT);
+    code.localSet(srcP);
+    this.releaseScratch(dynRef, src);
+    const dst = this.acquireScratch(this.proms.promRef());
+    code.call(this.proms.mint());
+    code.localSet(dst);
+    code.localGet(srcP);
+    this.pushReactionClosure(code, rx);
+    code.localGet(dst);
+    code.localGet(srcP);
+    code.structNew(this.proms.raceEntryT);
+    code.call(this.proms.subscribeHandled());
+    code.localGet(dst);
+    this.releaseScratch(this.proms.promRef(), srcP);
+    this.releaseScratch(this.proms.promRef(), dst);
   }
 
   private scratchKey(t: ValType): string {

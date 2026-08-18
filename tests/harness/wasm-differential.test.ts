@@ -1754,6 +1754,80 @@ const TIER_FLOOR: string[] = [
   "2581-jsval-routed-calls.js",
   "2583-jsval-routed-calls.js",
   "765-any-optional-chain.ts",
+  // Increment 21, stage C (the import bridge — the closing stage): the
+  // TLA/dynamic-import family's `jsBridgePromise` needs, plus the two
+  // (PROMISE, method) invoke arms the spine's own synthesis calls
+  // (lower-island.ts:365–380 — `globalGet("Promise")` →
+  // `callMethod("resolve")` → `jsMarshal(builder closure)` →
+  // `callMethod("then")`, wrapped in `jsBridgePromise`). New machinery:
+  // (1) `dynFromHelper`'s "promise" arm now direct-boxes an inner
+  // `jsval` (not just literal "dyn") — needed by the async builder
+  // closures' OWN dyn-FUNC-thunk return conversion (their declared
+  // return is always `promise<jsval>`); (2) jsOp callMethod's
+  // globalGet-pattern table gains `(Promise, "resolve")` — always
+  // zero-arg, mints a promise fulfilled with the engine's own undefined
+  // and boxes it DK.PROMISE; (3) callMethod gains a runtime-kind-checked
+  // `(PROMISE, "then")` arm (the `%w.async.thenRx` reaction: fulfillment
+  // calls the handler, then either settles directly or ADOPTS when the
+  // handler itself returns a thenable — the async builder's own shape;
+  // a handler THROW is absorbed as the destination's rejection, never
+  // propagated) — any OTHER receiver kind falls through to the
+  // pre-existing `dyn.invoke("then")` fence unchanged; (4)
+  // `jsBridgePromise` re-wraps a dyn PROMISE payload as a fresh static
+  // promise, jsval/dyn inner only, reusing `raceReactionFor`'s "copy"
+  // path (`typeEquals` forces the same-type key: a promise-of-jsval
+  // settling from another promise-of-jsval is a plain field-wise copy).
+  //
+  // MUTATION-CHECKED per mechanism pin, not just typechecked (this
+  // increment's own fresh lesson): every non-trivial branch in the
+  // `%w.async.thenRx` reaction was individually forced off and the
+  // census re-run to confirm it is load-bearing, not merely present.
+  // Two were NOT — `then`'s SRC-rejected passthrough (unreachable by
+  // construction: the only producer feeding a `then` reaction's SRC is
+  // this file's own zero-arg `resolve`, which never rejects) is now a
+  // documented `unreachable()` trap instead of untested code; the
+  // handler-threw absorption WAS reachable in general (an imported
+  // module's own top-level throw) but unexercised by the nine TLA/import
+  // claims alone, so 2685 (new, this stage) pins it directly — a
+  // SYNCHRONOUS sibling module whose `%init` throws at the dynamic
+  // import's OWN builder call, distinct from 2660's shape (whose thrown
+  // module is ASYNC, surfacing through the adoption path instead).
+  // array<jsval> (2633's `Promise<any[]>` shape) and `void`-inner
+  // `jsBridgePromise` were drafted, found UNEXECUTED by the same
+  // per-branch check, and pulled rather than shipped unverified — see
+  // `emitJsBridgePromise`'s own doc for the native-reference port to
+  // restore each under a program that actually reaches it.
+  //
+  // Tier 646→657: 656 from the ten TLA/import claims measured against
+  // the design doc's own prediction, 657 with 2685 — the mutation-
+  // check's own pinning addition, found necessary AFTER that measurement
+  // by forcing each reaction branch off in turn. Zero regressions,
+  // exactly these eleven claims — no
+  // rider claims beyond them (2633 and 2210-dyn-promise-crossing.cjs,
+  // the pre-existing `dynFrom:promise:adapt` bucket's OTHER member,
+  // both stay refused: 2210 needs the checked-dynamic world's OWN
+  // `dynInvoke` "then"/"catch"/"finally" — a different, more general
+  // reaction-chaining feature `PROMISE_REACTION_METHODS` still fences —
+  // and 2633's only diagnostic is the pulled `expr:jsBridgePromise`
+  // array arm itself (emitJsBridgePromise's own doc has the full
+  // account); MEASURED, not assumed — survey-accepting that arm
+  // hypothetically does NOT reach jsMarshal's own separate unimplemented
+  // "promise" arm next either, the following gate is `expr:jsOp` (a
+  // `Promise.all`-shaped island invoke need), with jsMarshal's gap
+  // surfacing only as an additional, non-blocking survey need).
+  "2050-dynamic-import-own-module/main.ts",
+  "2051-dynamic-import-then/main.ts",
+  "2052-dynamic-import-self.ts",
+  "2606-dynamic-import-cycle/main.ts",
+  "2650-top-level-await-self-import.ts",
+  "2652-top-level-await-dynamic/main.ts",
+  "2657-top-level-await-cycle-dynamic/main.ts",
+  "2659-top-level-await-dynamic-cycle/main.ts",
+  "2660-top-level-await-cycle-rejection/main.ts",
+  "2661-top-level-await-dynamic-runtime-root/main.ts",
+  "2685-dynamic-import-sync-throw/main.ts",
+  // Pins the two-independent-observers equivalence nodes.ts:4887 asserts (two `.then()` subscriptions on ONE import promise, run-once init, both fire in order) — lead-side gate finding, previously unguarded.
+  "2686-dynamic-import-two-observers/main.ts",
 ];
 
 interface RunResult {
