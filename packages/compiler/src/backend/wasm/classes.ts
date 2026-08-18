@@ -67,6 +67,7 @@ import {
   RUNTIME_EMITTER_CLASS,
   RUNTIME_ERROR_CLASSES,
   RUNTIME_STREAM_CLASSES,
+  STRING,
 } from "../../ir/nodes.js";
 import { buildClassGraph, vtEntriesFor, type LlClassMeta, type LlVtSlot } from "../llvm/classes.js";
 import { type FieldType, I32, ModuleBuilder, type ValType } from "./module.js";
@@ -128,6 +129,13 @@ export interface ClassDeps {
    * supertype's exactly, and `%code` is immutable there while a mapped
    * field is not. */
   errStruct: () => { struct: number; fields: FieldType[] };
+  /** The emitter registry's own struct (events.ts's `$eeReg`), nullable —
+   * the WasmGC translation of C's ScrEmitter.reg pointer. Every emitter-
+   * rooted class's struct (root AND every descendant, exactly like `vt`
+   * itself) declares this as its OWN field so wasm subtyping's "repeat
+   * the prefix verbatim" rule holds; events.ts owns the struct's layout,
+   * classes.ts only spells its type. */
+  emitterRegRef: () => ValType;
 }
 
 export class ClassBuilder {
@@ -263,6 +271,16 @@ export class ClassBuilder {
     return meta !== undefined && this.rootKind(meta) === "error";
   }
 
+  /** Is this class emitter-rooted (the gate-lift family — %EventEmitter
+   * itself or a user subclass)? The allocation site's own question: an
+   * emitter-rooted struct carries the two injected prefix fields (registry,
+   * display name) that `plan()` pushed past `vt`, which `emitAlloc` must
+   * seed alongside the class's own declared fields. */
+  emitterRooted(className: string): boolean {
+    const meta = this.metaMap.get(className);
+    return meta !== undefined && this.rootKind(meta) === "emitter";
+  }
+
   /** The vtable struct for one hierarchy ROOT: $ci's {pre, post} head
    * repeated (so an instance's vt still reads as a plain interval — see
    * `vtGlobal`), then one nullable funcref per slot in `root.slots`
@@ -359,12 +377,17 @@ export class ClassBuilder {
   }
 
   /** Which family a class's base chain ends in — what decides whether a
-   * struct is emitted at all. */
-  private rootKind(meta: LlClassMeta): "user" | "error" | "runtime" {
+   * struct is emitted at all. STREAM classes are checked before EMITTER:
+   * every stream class's own base chain passes through %EventEmitter
+   * further up, so a stream-rooted class must be caught at the STREAM
+   * name it climbs through first — the gate lift is emitter-root ONLY,
+   * stream-rooted classes (including a stream's own subclasses) keep
+   * refusing `class:extends-runtime` exactly as before. */
+  private rootKind(meta: LlClassMeta): "user" | "error" | "emitter" | "runtime" {
     for (let m: LlClassMeta | null = meta; m !== null; m = m.base) {
       if (RUNTIME_ERROR_CLASSES.has(m.def.name)) return "error";
-      if (m.def.name === RUNTIME_EMITTER_CLASS) return "runtime";
       if (RUNTIME_STREAM_CLASSES.has(m.def.name)) return "runtime";
+      if (m.def.name === RUNTIME_EMITTER_CLASS) return "emitter";
       if (m.def.runtime === true) return "runtime";
     }
     return "user";
@@ -403,7 +426,14 @@ export class ClassBuilder {
       return settled;
     }
     const struct = this.mb.reserveType(`class:${name}`);
-    const fieldBase = meta.hierarchy ? 1 : 0;
+    // An emitter-rooted class (root AND every descendant — the SAME
+    // wasm-subtyping "repeat the prefix verbatim" rule `vt` itself
+    // follows) carries two extra fields past `vt`: the registry ref and
+    // the display-name slot (nodes.ts:945-957's contract, translated to a
+    // WasmGC nominal supertype rather than C's layout embedding).
+    const emitterRooted = this.rootKind(meta) === "emitter";
+    const prefixCount = (meta.hierarchy ? 1 : 0) + (emitterRooted ? 2 : 0);
+    const fieldBase = prefixCount;
     const info: ClassInfo = {
       meta,
       struct,
@@ -418,6 +448,10 @@ export class ClassBuilder {
     const errPrefix = this.rootKind(meta) === "error" ? this.deps.errStruct().fields : null;
     const fields: FieldType[] = [];
     if (meta.hierarchy) fields.push({ storage: this.ciRef(), mutable: false });
+    if (emitterRooted) {
+      fields.push({ storage: this.deps.emitterRegRef(), mutable: true });
+      fields.push({ storage: this.deps.softType(STRING), mutable: false });
+    }
     meta.def.fields.forEach((f, i) => {
       fields.push(errPrefix?.[i + 1] ?? { storage: this.deps.softType(f.type), mutable: true });
     });

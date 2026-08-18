@@ -64,6 +64,9 @@ import {
   NULL_T,
   UNDEFINED_T,
   RUNTIME_ERROR_CLASSES,
+  RUNTIME_EMITTER_CLASS,
+  arrayOf,
+  STRING,
 } from "../../ir/nodes.js";
 import { computeMayThrow } from "../emission/may-throw.js";
 import { buildClassGraph, type LlClassMeta, type LlVtSlot } from "../llvm/classes.js";
@@ -137,6 +140,7 @@ import { CasingBuilder } from "./casing.js";
 import { BytesBuilder, type BytesElem } from "./typedarrays.js";
 import { TimerBuilder } from "./timers.js";
 import { NextTickBuilder } from "./nexttick.js";
+import { EventsBuilder, EMITTER_REG, EMITTER_NAME } from "./events.js";
 import { UnionBuilder, type UnionArmRep } from "./unions.js";
 import { Code } from "./code.js";
 import { buildF64ToStr } from "./numfmt.js";
@@ -1024,6 +1028,12 @@ const BOOLEAN_PROTO_MEMBERS: ReadonlySet<string> = new Set(["toString", "valueOf
  * slot every thrown ref shares. */
 const ANY_HEAP = -0x12;
 const ANY_REF: ValType = { kind: "ref", nullable: true, typeIndex: ANY_HEAP };
+
+/** The abstract `eq` heap type's s33 encoding (events.ts/dyn.ts/json.ts's
+ * own EQ_HEAP) — the entry registry's `clos`/`thunk`/`orig` fields are
+ * `eq`-typed, so a plain (non-dyn-adapted) registration's `orig` push is
+ * `ref.null EQ_HEAP`. */
+const EQ_HEAP = -0x13;
 
 /** Record shapes the resumable lowering owns (statemachine.ts names them
  * `%frame.<fn>`): the ONLY shapes that declare a supertype. */
@@ -2738,6 +2748,72 @@ class Assembler {
       excKind: () => this.exc().kindG,
     });
     return this.nextTickField;
+  }
+
+  /* ── the EventEmitter registry (events.ts) ────────────────────────────
+   * Interned by the first emitter-rooted class/libCall — a module that
+   * never touches node:events pays nothing. See events.ts's own header
+   * for the ABI decision this reuses (dyn.ts's thunkSig/dynFnThunk). */
+
+  private eventsField: EventsBuilder | null = null;
+
+  private get events(): EventsBuilder {
+    this.eventsField ??= new EventsBuilder(this.mb, {
+      strRef: () => this.strRef,
+      strEq: () => this.strEqHelper(),
+      thunkSig: () => this.dyn.thunkSig(),
+      dynArrRef: () => this.dyn.arrRef(),
+      rootRef: () => this.classes.ref(this.classes.info(RUNTIME_EMITTER_CLASS, undefined, false)!),
+      rootStruct: () => this.classes.info(RUNTIME_EMITTER_CLASS, undefined, false)!.struct,
+      excKind: () => this.exc().kindG,
+      stringVecRef: () => this.vecs.vecRef(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
+      stringVecNewLen: () => this.vecs.newLen(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
+      stringVecPushOne: () => this.vecs.pushOne(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
+      errRef: () => ({ kind: "ref", nullable: true, typeIndex: this.exc().errT }),
+      f64ToStr: () => this.f64ToStrHelper(),
+      concat: () => this.concatHelper(),
+      lit: (c, s) => this.pushStrLitInto(c, s),
+      throwCoded: (c, className, name, pushMessage, code) => this.emitSetCellError(c, className, name, pushMessage, code),
+      boxStr: (c, pushValue) => this.dyn.boxStr(c, pushValue),
+      dynArrBufType: () => this.dynArgsBufType(),
+      dynArrStructType: () => this.dynArrStructType(),
+    });
+    return this.eventsField;
+  }
+
+  private errThunkFns = new Map<string, number>();
+
+  /** The 'error' bucket's own arity-adapting thunk (events.ts's
+   * errThunkSig: `(clos: eq, err: errRef) -> void`) for a listener whose
+   * declared type is `()->void` or `(Error)->void` (the only two arities
+   * the forced one-position tuple admits — lowerListenerArg's own prefix
+   * rule). Interned per listener signature, mirroring dynFnThunk: many
+   * registrations of the same shape share one thunk. No dyn box anywhere
+   * — the listener-abi decision's one exception (events.ts's header). */
+  private errThunkFor(t: IrType & { kind: "func" }, loc: SrcLoc | undefined): number | null {
+    const key = typeKey(t);
+    const hit = this.errThunkFns.get(key);
+    if (hit !== undefined) return hit;
+    const pair = this.closSigFor(t, loc);
+    if (pair === null) return null;
+    const idx = this.mb.declareFunc(this.events.errThunkSig(), `%w.ee.errThunk:${key}`);
+    this.errThunkFns.set(key, idx);
+    const c = new Code();
+    const CLOS = 0, ERR = 1, CL = 2;
+    const closRef: ValType = { kind: "ref", nullable: true, typeIndex: pair.clos };
+    c.localGet(CLOS);
+    c.refCast(pair.clos);
+    c.localSet(CL);
+    c.localGet(CL); // arg0: the closure itself (selfRef, env)
+    if (t.params.length === 1) {
+      c.localGet(ERR);
+    }
+    c.localGet(CL);
+    c.structGet(pair.clos, 0);
+    c.callRef(pair.fn);
+    if (t.ret.kind !== "void") c.drop(); // Node ignores listener return values
+    this.mb.setBody(idx, [closRef], c.bytes());
+    return idx;
   }
 
   /* ── unions ─────────────────────────────────────────────────────────────
@@ -5001,6 +5077,7 @@ class Assembler {
           const exc = this.exc();
           return { struct: exc.errT, fields: exc.errFields };
         },
+        emitterRegRef: () => this.events.regRef(),
       },
     );
     return this.classesField;
@@ -5257,8 +5334,24 @@ class Assembler {
    * through a class value would differ from one built with `new`. */
   private emitAlloc(c: Code, className: string, info: ClassInfo): void {
     if (info.meta.hierarchy) c.globalGet(this.classes.vtGlobal(className));
+    if (this.classes.emitterRooted(className)) {
+      // The ScrEmitter prefix past `vt` (nodes.ts:945-957): the registry
+      // starts absent (lazily allocated on first .on()/setMaxListeners()
+      // — events.ts's regEnsure), the display name is this CONCRETE
+      // class's own JS-visible spelling, stamped once and immutable.
+      c.refNull(this.eventsRegType());
+      this.pushStrLitInto(c, className.startsWith("%") ? className.slice(1) : className);
+    }
     for (const f of info.meta.def.fields) this.emitFieldSeed(c, f.type);
     c.structNew(info.struct);
+  }
+
+  /** The registry struct's own type index (events.ts's `$eeReg`) —
+   * `refNull` needs the raw index, not the `ValType` `regRef()` answers. */
+  private eventsRegType(): number {
+    const ref = this.events.regRef();
+    if (ref.kind !== "ref") throw new Error("wasm emitter bug: eeReg is not a ref type");
+    return ref.typeIndex;
   }
 
   /** A class's constructor function. Every class reaches the IR with one
@@ -8446,6 +8539,7 @@ class Assembler {
         }
         if (this.emitBufferLibCall(e)) return;
         if (this.emitTimerCall(e)) return;
+        if (this.emitEmitterLibCall(e)) return;
         this.refuse(`libCall:${e.fn}`, e.loc);
         code.unreachable();
         return;
@@ -14041,6 +14135,972 @@ class Assembler {
       return true;
     }
     return false;
+  }
+
+  /** node:events (events.ts's registry) — STAGE-A SCOPE: construction,
+   * plain on/addListener (no once/prepend yet), emit (the general
+   * dyn-array tuple, not 'error'/'data'), count/countFn, and the NAMED
+   * removeAllListeners form. Every other member refuses by its own name
+   * (never silently drops behavior) until a later pass — see events.ts's
+   * header and the stage-A final report for the exact list. */
+  private emitEmitterLibCall(e: Extract<IrExpr, { kind: "libCall" }>): boolean {
+    const code = this.fn.code;
+    switch (e.fn) {
+      case "emitter.new": {
+        const info = this.classInfo(RUNTIME_EMITTER_CLASS, e.loc);
+        if (info === null) {
+          code.unreachable();
+          return true;
+        }
+        this.emitAlloc(code, RUNTIME_EMITTER_CLASS, info);
+        return true;
+      }
+      case "emitter.ctor": {
+        // A no-op placeholder (scr_emitter_init): the allocation already
+        // seeded the prefix. The receiver still evaluates (JS argument
+        // evaluation order), its result simply unused — a bare upcast of
+        // a variable reference is effect-free, so dropping it is exact.
+        this.walkExpr(e.args[0]!);
+        code.drop();
+        return true;
+      }
+      case "emitter.on": {
+        const nameArg0 = e.args[1]!;
+        const onceArg = e.args[3]!;
+        const prependArg = e.args[4]!;
+        if (onceArg.kind !== "boolLit" || prependArg.kind !== "boolLit") {
+          this.refuse("libCall:emitter.on:dynamic-once-or-prepend", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const cbExpr = e.args[2]!;
+        if (cbExpr.type.kind !== "func") {
+          this.refuse("libCall:emitter.on:non-func", e.loc);
+          code.unreachable();
+          return true;
+        }
+        // 'error': the dedicated direct-reference bucket (the ABI note's
+        // one exception) — a SEPARATE registration path, never the
+        // general dyn-array thunk.
+        if (nameArg0.kind === "strLit" && nameArg0.value === "error") {
+          const errThunkIdx = this.errThunkFor(cbExpr.type, e.loc);
+          if (errThunkIdx === null) {
+            code.unreachable();
+            return true;
+          }
+          const recvT0 = e.args[0]!.type;
+          const recvVal0 = this.mapType(recvT0, e.loc);
+          if (recvVal0 === null) {
+            code.unreachable();
+            return true;
+          }
+          this.mb.declareFuncRef(errThunkIdx);
+          const recv0 = this.acquireScratch(recvVal0);
+          this.walkExpr(e.args[0]!);
+          code.localTee(recv0);
+          this.walkExpr(cbExpr);
+          code.refFunc(errThunkIdx);
+          code.i32Const(onceArg.value ? 1 : 0);
+          code.i32Const(prependArg.value ? 1 : 0);
+          code.call(this.events.errEntryAppend());
+          this.emitPendingCheck(); // a newListener meta handler may have thrown
+          code.localGet(recv0);
+          this.releaseScratch(recvVal0, recv0);
+          return true;
+        }
+        const thunkIdx = this.dynFnThunk(cbExpr.type, e.loc);
+        if (thunkIdx === null) {
+          code.unreachable();
+          return true;
+        }
+        const recvT = e.args[0]!.type;
+        const recvVal = this.mapType(recvT, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        this.mb.declareFuncRef(thunkIdx);
+        const recv = this.acquireScratch(recvVal);
+        this.walkExpr(e.args[0]!);
+        code.localTee(recv);
+        this.walkExpr(e.args[1]!); // name
+        this.walkExpr(cbExpr); // closure
+        code.refFunc(thunkIdx);
+        code.refNull(EQ_HEAP); // orig: null (identity is `clos` itself — the plain, non-dyn-adapted path)
+        code.i32Const(onceArg.value ? 1 : 0);
+        code.i32Const(prependArg.value ? 1 : 0);
+        code.call(this.events.entryAppend());
+        this.emitPendingCheck(); // a newListener meta handler may have thrown
+        code.localGet(recv); // chaining: `return this`
+        this.releaseScratch(recvVal, recv);
+        return true;
+      }
+      case "emitter.emit": {
+        const nameArg = e.args[1]!;
+        if (nameArg.kind !== "strLit") {
+          this.refuse("libCall:emitter.emit:dynamic-name", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const payload = e.args.slice(2);
+        const boxed: number[] = [];
+        for (const a of payload) {
+          const from = this.dynFromHelper(a.type, e.loc);
+          if (from === null) {
+            code.unreachable();
+            return true;
+          }
+          boxed.push(from);
+        }
+        const dynArrRef = this.dyn.arrRef();
+        const argsLocal = this.acquireScratch(dynArrRef);
+        const dynBufType = this.dynArgsBufType();
+        code.i32Const(payload.length);
+        for (let i = 0; i < payload.length; i++) {
+          this.walkExpr(payload[i]!);
+          code.call(boxed[i]!);
+        }
+        code.arrayNewFixed(dynBufType, payload.length);
+        code.structNew(this.dynArrStructType());
+        code.localSet(argsLocal);
+        this.walkExpr(e.args[0]!); // receiver
+        this.walkExpr(nameArg);
+        code.localGet(argsLocal);
+        code.call(this.events.emitDispatch());
+        this.releaseScratch(dynArrRef, argsLocal);
+        this.emitPendingCheck();
+        return true;
+      }
+      case "emitter.count": {
+        const nameArgC = e.args[1]!;
+        if (nameArgC.kind === "strLit" && nameArgC.value === "error") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.events.errCountOf());
+          return true;
+        }
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        code.call(this.events.countOf());
+        return true;
+      }
+      case "emitter.countFn": {
+        const cbExpr = e.args[2]!;
+        if (cbExpr.type.kind !== "func" && cbExpr.type.kind !== "dyn") {
+          this.refuse("libCall:emitter.countFn:non-func", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const nameArgCf = e.args[1]!;
+        if (nameArgCf.kind === "strLit" && nameArgCf.value === "error") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(cbExpr);
+          code.call(this.events.errCountFnOf());
+          return true;
+        }
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        this.walkExpr(cbExpr);
+        code.call(this.events.countFnOf());
+        return true;
+      }
+      case "emitter.off": {
+        const cbExpr = e.args[2]!;
+        if (cbExpr.type.kind !== "func" && cbExpr.type.kind !== "dyn") {
+          this.refuse("libCall:emitter.off:non-func", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const recvT = e.args[0]!.type;
+        const recvVal = this.mapType(recvT, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        const nameArgOff = e.args[1]!;
+        const recv = this.acquireScratch(recvVal);
+        if (nameArgOff.kind === "strLit" && nameArgOff.value === "error") {
+          this.walkExpr(e.args[0]!);
+          code.localTee(recv);
+          this.walkExpr(cbExpr);
+          code.call(this.events.errRemoveLast());
+          this.emitPendingCheck(); // a removeListener meta handler may have thrown
+          code.localGet(recv);
+          this.releaseScratch(recvVal, recv);
+          return true;
+        }
+        this.walkExpr(e.args[0]!);
+        code.localTee(recv);
+        this.walkExpr(e.args[1]!); // name
+        this.walkExpr(cbExpr); // closure identity
+        code.call(this.events.removeLast());
+        this.emitPendingCheck(); // a removeListener meta handler may have thrown
+        code.localGet(recv); // chaining
+        this.releaseScratch(recvVal, recv);
+        return true;
+      }
+      case "emitter.removeAll": {
+        const allArg = e.args[2]!;
+        if (allArg.kind !== "boolLit") {
+          this.refuse("libCall:emitter.removeAll:dynamic-all", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const recvT = e.args[0]!.type;
+        const recvVal = this.mapType(recvT, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        const nameArgRa = e.args[1]!;
+        const recv = this.acquireScratch(recvVal);
+        this.walkExpr(e.args[0]!);
+        code.localTee(recv);
+        if (allArg.value) {
+          // The whole-emitter wipe clears BOTH families — Node's
+          // `_events = Object.create(null)` takes 'error' with it too.
+          // NAMED GAP: errRemoveAll does not fire 'removeListener' for
+          // any error-family entries it wipes (a wholesale reset, no
+          // per-entry meta pass) — unexercised by any claim here (none
+          // register an 'error' listener before a whole-emitter
+          // removeAllListeners()), but a real simplification versus the
+          // general family's own meta-aware removeAllNamedMeta.
+          code.call(this.events.removeAllWhole());
+          this.emitPendingCheck(); // a removeListener meta handler may have thrown
+          code.localGet(recv);
+          code.call(this.events.errRemoveAll());
+        } else if (nameArgRa.kind === "strLit" && nameArgRa.value === "error") {
+          code.call(this.events.errRemoveAll());
+        } else {
+          this.walkExpr(e.args[1]!); // name
+          code.call(this.events.removeAllNamed());
+          this.emitPendingCheck(); // a removeListener meta handler may have thrown
+        }
+        code.localGet(recv);
+        this.releaseScratch(recvVal, recv);
+        return true;
+      }
+      case "emitter.names": {
+        this.walkExpr(e.args[0]!);
+        code.call(this.events.namesArr());
+        return true;
+      }
+      case "emitter.emitError": {
+        // scr_emitter_emit_error: no listener ⇒ the payload THROWS
+        // (catchable; uncaught exits 1 — S007's trap channel); a
+        // listener ⇒ dispatch through the direct-reference bucket.
+        // `emitThrowValue`+`emitUnwind()` is exactly the ordinary
+        // `throw` statement's own pair (emit-stmts.ts's ported "case
+        // throw"): `emitUnwind()`'s no-try-handler path does a REAL
+        // `return_()`, so the branch's stack shape is validator-
+        // polymorphic regardless of this expression's own BOOL type —
+        // the SAME reasoning genResume's throw-mode arm already relies
+        // on at an expression position (emitter.ts's genResume "throw").
+        const errExpr = e.args[2]!;
+        const recvT = e.args[0]!.type;
+        const recvVal = this.mapType(recvT, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        const recv = this.acquireScratch(recvVal);
+        this.walkExpr(e.args[0]!);
+        code.localTee(recv);
+        code.call(this.events.hasErrorListeners());
+        // TRACKED open/close (this.openIfResult/this.close), not the raw
+        // Code methods: emitUnwind()'s branch-to-try-handler computes its
+        // relative depth off `this.fn.depth`, which only the tracked
+        // open/close pair maintains — a raw `code.ifResult` here left
+        // that counter one short and mis-targeted the branch (caught by
+        // 1648's own try/catch around emit('error', ...), which a bare
+        // top-level call never would have exercised).
+        this.openIfResult(I32);
+        code.localGet(recv);
+        this.walkExpr(errExpr);
+        code.call(this.events.errDispatch());
+        code.i32Const(1);
+        code.else_();
+        this.emitThrowValue(errExpr);
+        this.emitUnwind();
+        this.close();
+        // Reached only via the THEN path (the ELSE path already
+        // returned or branched to a try handler): a listener inside
+        // errDispatch may itself have thrown — the ordinary post-call
+        // pending check.
+        this.emitPendingCheck();
+        this.releaseScratch(recvVal, recv);
+        return true;
+      }
+      case "emitter.getMax": {
+        this.walkExpr(e.args[0]!);
+        code.call(this.events.getMaxOf());
+        return true;
+      }
+      case "emitter.getDefaultMax": {
+        code.call(this.events.getDefaultMax());
+        return true;
+      }
+      case "emitter.setMax": {
+        const recvT = e.args[0]!.type;
+        const recvVal = this.mapType(recvT, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        const recv = this.acquireScratch(recvVal);
+        this.walkExpr(e.args[0]!);
+        code.localTee(recv);
+        this.walkExpr(e.args[1]!); // n
+        code.call(this.events.setMaxOf());
+        this.emitPendingCheck();
+        code.localGet(recv);
+        this.releaseScratch(recvVal, recv);
+        return true;
+      }
+      case "emitter.setDefaultMax": {
+        this.walkExpr(e.args[0]!);
+        code.call(this.events.setDefaultMax());
+        this.emitPendingCheck();
+        return true;
+      }
+      case "emitter.setMaxChk": {
+        const recvT = e.args[0]!.type;
+        const recvVal = this.mapType(recvT, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        // The static fast path covers 2574's own corpus shape (EVERY
+        // argument across every call — number included — is a literal
+        // expression, `dynFrom`-boxed): a determinable non-number kind
+        // always throws, rendered from the PRE-BOX value directly; a
+        // determinable NUMBER skips dyn entirely (unbox once, not
+        // box-then-unbox). Only a genuinely already-dyn value (no
+        // `dynFrom` wrapper — a real `unknown`-typed variable, which
+        // 2574 never has) falls to the runtime dispatch below, and ONLY
+        // that path carries emitMaxListenersArgCheck's unhandled-kind
+        // gap: building the runtime dispatch's exhaustive-but-not-
+        // exhaustive-enough branch set is a COMPILE-TIME refusal
+        // regardless of which arm the input would actually take, so a
+        // number reaching it through a genuinely dynamic value still
+        // refuses — a real, narrower gap than the one this fast path
+        // closes, left named rather than chased further this pass.
+        const innerKind1 = this.dynFromStaticKind(e.args[1]!);
+        if (innerKind1 === "f64") {
+          const inner = (e.args[1]! as Extract<IrExpr, { kind: "dynFrom" }>).value;
+          const recv = this.acquireScratch(recvVal);
+          this.walkExpr(e.args[0]!);
+          code.localTee(recv);
+          this.walkExpr(inner);
+          code.call(this.events.setMaxOf());
+          this.emitPendingCheck();
+          code.localGet(recv);
+          this.releaseScratch(recvVal, recv);
+          return true;
+        }
+        if (innerKind1 !== null) {
+          // Receiver evaluates FIRST (JS's own left-to-right order — a
+          // property-access target evaluates before the call's argument
+          // list), even though this path always throws and its value is
+          // never observed.
+          this.walkExpr(e.args[0]!);
+          code.drop();
+          this.emitMaxListenersArgCheckStatic(code, "setMaxListeners", e.args[1]!, e.loc);
+          this.emitPendingCheck();
+          code.unreachable(); // the static path always throws; nothing falls through
+          return true;
+        }
+        const recv = this.acquireScratch(recvVal);
+        const dynLocal = this.acquireScratch(this.dyn.dynRef());
+        this.walkExpr(e.args[0]!);
+        code.localTee(recv);
+        this.walkExpr(e.args[1]!);
+        code.localSet(dynLocal);
+        if (!this.emitMaxListenersArgCheck(code, "setMaxListeners", dynLocal, e.loc)) {
+          code.unreachable();
+          this.releaseScratch(recvVal, recv);
+          this.releaseScratch(this.dyn.dynRef(), dynLocal);
+          return true;
+        }
+        code.localGet(recv);
+        code.localGet(dynLocal);
+        code.structGet(this.dyn.dynT(), DYN_NUM);
+        code.call(this.events.setMaxOf());
+        this.emitPendingCheck();
+        code.localGet(recv);
+        this.releaseScratch(recvVal, recv);
+        this.releaseScratch(this.dyn.dynRef(), dynLocal);
+        return true;
+      }
+      case "emitter.setDefaultMaxChk": {
+        const nameArg = e.args[1]!;
+        if (nameArg.kind !== "strLit") {
+          this.refuse("libCall:emitter.setDefaultMaxChk:dynamic-name", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const innerKind0 = this.dynFromStaticKind(e.args[0]!);
+        if (innerKind0 === "f64") {
+          const inner = (e.args[0]! as Extract<IrExpr, { kind: "dynFrom" }>).value;
+          this.walkExpr(inner);
+          this.walkExpr(nameArg);
+          code.call(this.events.setDefaultMaxNamed());
+          this.emitPendingCheck();
+          return true;
+        }
+        if (innerKind0 !== null) {
+          this.emitMaxListenersArgCheckStatic(code, nameArg.value, e.args[0]!, e.loc);
+          this.emitPendingCheck();
+          code.unreachable();
+          return true;
+        }
+        const dynLocal = this.acquireScratch(this.dyn.dynRef());
+        this.walkExpr(e.args[0]!);
+        code.localSet(dynLocal);
+        if (!this.emitMaxListenersArgCheck(code, nameArg.value, dynLocal, e.loc)) {
+          code.unreachable();
+          this.releaseScratch(this.dyn.dynRef(), dynLocal);
+          return true;
+        }
+        code.localGet(dynLocal);
+        code.structGet(this.dyn.dynT(), DYN_NUM);
+        this.walkExpr(nameArg);
+        code.call(this.events.setDefaultMaxNamed());
+        this.emitPendingCheck();
+        this.releaseScratch(this.dyn.dynRef(), dynLocal);
+        return true;
+      }
+      case "emitter.checkListener": {
+        // scr_dyn_check_listener("listener") — a genuine, unnarrowable
+        // `dyn` value (the lifted onDyn helper's own parameter, SHARED
+        // across every registration site of one (receiver, adapter)
+        // shape — no dynFrom static-kind trick applies from inside it),
+        // so this dispatch must be EXHAUSTIVE over dyn's whole kind
+        // space with NO unhandled-kind refusal, or the mere ATTEMPT to
+        // build an unhandled arm fails the compile regardless of which
+        // kind the input actually is at runtime (measured directly:
+        // 2574's own valid-number case refused before the static fast
+        // path existed, even though it never took the throwing arm).
+        const dynLocal = this.acquireScratch(this.dyn.dynRef());
+        this.walkExpr(e.args[0]!);
+        code.localSet(dynLocal);
+        this.emitCheckListenerBody(code, dynLocal);
+        this.releaseScratch(this.dyn.dynRef(), dynLocal);
+        return true;
+      }
+      case "emitter.onDyn": {
+        // The lifted helper already ran emitter.checkListener AND built
+        // `a` (the adapter) via dynCheck before this call — this arm is
+        // purely the insert, structurally the plain path's twin except
+        // `orig` extracts the ORIGINAL closure out of `cb`'s FUNC
+        // payload (dyn.ts's fnPayload/FN_CLOS) rather than null, so off/
+        // removeListener and listenerCount(name, fn) match on Node's own
+        // identity (the box's underlying closure, never the adapter).
+        const nameArgD = e.args[1]!;
+        if (nameArgD.kind === "strLit" && (nameArgD.value === "newListener" || nameArgD.value === "removeListener")) {
+          this.refuse("libCall:emitter.onDyn:meta-event", e.loc);
+          code.unreachable();
+          return true;
+        }
+        if (nameArgD.kind === "strLit" && nameArgD.value === "error") {
+          // The 'error' bucket's direct-reference thunk has no dyn-
+          // adapted registration path built this pass — named gap.
+          this.refuse("libCall:emitter.onDyn:error", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const adapterExpr = e.args[3]!;
+        if (adapterExpr.type.kind !== "func") {
+          this.refuse("libCall:emitter.onDyn:non-func-adapter", e.loc);
+          code.unreachable();
+          return true;
+        }
+        // once/prepend are the LIFTED HELPER's own parameters (o.0/p.0)
+        // — the helper is shared across every registration site of one
+        // (receiver, adapter) shape, so these are genuinely RUNTIME
+        // values here (never boolLit), unlike the plain `emitter.on`
+        // path where the frontend bakes a literal at each call site.
+        const onceArgD = e.args[4]!;
+        const prependArgD = e.args[5]!;
+        if (onceArgD.type.kind !== "bool" || prependArgD.type.kind !== "bool") {
+          this.refuse("libCall:emitter.onDyn:non-bool-once-or-prepend", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const thunkIdxD = this.dynFnThunk(adapterExpr.type, e.loc);
+        if (thunkIdxD === null) {
+          code.unreachable();
+          return true;
+        }
+        const recvTD = e.args[0]!.type;
+        const recvValD = this.mapType(recvTD, e.loc);
+        if (recvValD === null) {
+          code.unreachable();
+          return true;
+        }
+        this.mb.declareFuncRef(thunkIdxD);
+        const recvD = this.acquireScratch(recvValD);
+        const cbLocalD = this.acquireScratch(this.dyn.dynRef());
+        this.walkExpr(e.args[0]!);
+        code.localTee(recvD);
+        this.walkExpr(nameArgD);
+        this.walkExpr(e.args[2]!); // cb: the original dyn value
+        code.localSet(cbLocalD);
+        this.walkExpr(adapterExpr); // clos: the adapter closure — what emit invokes
+        code.refFunc(thunkIdxD);
+        this.dyn.fnPayload(code, (x) => x.localGet(cbLocalD));
+        code.structGet(this.dyn.fnT(), FN_CLOS); // orig: the box's underlying closure — the entry's identity
+        this.walkExpr(onceArgD);
+        this.walkExpr(prependArgD);
+        code.call(this.events.entryAppend());
+        this.emitPendingCheck(); // a newListener meta handler may have thrown
+        code.localGet(recvD);
+        this.releaseScratch(recvValD, recvD);
+        this.releaseScratch(this.dyn.dynRef(), cbLocalD);
+        return true;
+      }
+      case "emitter.offDyn": {
+        // off/removeListener with a dyn-adapted listener: identity is
+        // the box's underlying closure (checkListener already ran) —
+        // the SAME extraction onDyn's registration uses, matching
+        // Node's own `cb->v.fn.clo` identity rule.
+        const nameArgOd = e.args[1]!;
+        if (nameArgOd.kind === "strLit" && nameArgOd.value === "error") {
+          this.refuse("libCall:emitter.offDyn:error", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const recvTOd = e.args[0]!.type;
+        const recvValOd = this.mapType(recvTOd, e.loc);
+        if (recvValOd === null) {
+          code.unreachable();
+          return true;
+        }
+        const recvOd = this.acquireScratch(recvValOd);
+        const cbLocalOd = this.acquireScratch(this.dyn.dynRef());
+        this.walkExpr(e.args[0]!);
+        code.localTee(recvOd);
+        this.walkExpr(nameArgOd);
+        this.walkExpr(e.args[2]!);
+        code.localSet(cbLocalOd);
+        this.dyn.fnPayload(code, (x) => x.localGet(cbLocalOd));
+        code.structGet(this.dyn.fnT(), FN_CLOS);
+        code.call(this.events.removeLast());
+        this.emitPendingCheck(); // a removeListener meta handler may have thrown
+        code.localGet(recvOd);
+        this.releaseScratch(recvValOd, recvOd);
+        this.releaseScratch(this.dyn.dynRef(), cbLocalOd);
+        return true;
+      }
+      default:
+        if (e.fn.startsWith("emitter.")) {
+          this.refuse(`libCall:${e.fn}`, e.loc);
+          code.unreachable();
+          return true;
+        }
+        return false;
+    }
+  }
+
+  /** Is `e` a `dynFrom`-boxed value whose PRE-BOX static type this
+   * method can render without a runtime dyn-kind dispatch? Pure — never
+   * emits. `dynFrom` only wraps a value whose static type ISN'T already
+   * "dyn" (lowerer.ts's own convention), and the setMaxListeners/
+   * defaultMaxListeners Chk call sites only ever wrap a value already
+   * PROVEN non-number (the caller routes statically-f64 arguments to
+   * the unchecked libCall instead) — so every kind reaching here is
+   * exactly one of the four this file measures against Node. */
+  private dynFromStaticKind(e: IrExpr): "string" | "bool" | "nullT" | "undefinedT" | "f64" | null {
+    if (e.kind !== "dynFrom") return null;
+    const k = e.value.type.kind;
+    return k === "string" || k === "bool" || k === "nullT" || k === "undefinedT" || k === "f64" ? k : null;
+  }
+
+  /** The static counterpart of `emitMaxListenersArgCheck`: when the
+   * argument is a `dynFrom`-boxed value of a KNOWN non-number kind (the
+   * corpus's own shape — literal expressions), this always throws,
+   * rendering the message from the PRE-BOX value directly (no dyn box,
+   * no runtime DK dispatch, none of that method's unhandled-kind gap).
+   * Caller's contract: check `dynFromStaticKind(dynExpr) !== null` FIRST
+   * (before evaluating anything, so a "no" costs nothing), then call
+   * this — which always succeeds when that check passed. */
+  private emitMaxListenersArgCheckStatic(code: Code, argName: string, dynExpr: IrExpr, loc: SrcLoc | undefined): void {
+    const kind = this.dynFromStaticKind(dynExpr);
+    if (kind === null) throw new Error("wasm emitter bug: emitMaxListenersArgCheckStatic called without dynFromStaticKind first");
+    const inner = (dynExpr as Extract<IrExpr, { kind: "dynFrom" }>).value;
+    const msgPrefix = (c: Code): void => {
+      this.pushStrLitInto(c, 'The "');
+      this.pushStrLitInto(c, argName);
+      c.call(this.concatHelper());
+      this.pushStrLitInto(c, '" argument must be of type number. Received ');
+      c.call(this.concatHelper());
+    };
+    switch (kind) {
+      case "string":
+        this.emitSetCellError(code, "%TypeError", "TypeError", (m) => {
+          msgPrefix(m);
+          this.pushStrLitInto(m, "type string ('");
+          m.call(this.concatHelper());
+          this.walkExpr(inner);
+          m.call(this.concatHelper());
+          this.pushStrLitInto(m, "')");
+          m.call(this.concatHelper());
+        }, "ERR_INVALID_ARG_TYPE");
+        return;
+      case "nullT":
+        this.emitSetCellErrorLit(
+          "%TypeError",
+          "TypeError",
+          `The "${argName}" argument must be of type number. Received null`,
+          "ERR_INVALID_ARG_TYPE",
+        );
+        return;
+      case "undefinedT":
+        this.emitSetCellErrorLit(
+          "%TypeError",
+          "TypeError",
+          `The "${argName}" argument must be of type number. Received undefined`,
+          "ERR_INVALID_ARG_TYPE",
+        );
+        return;
+      case "bool":
+        this.emitSetCellError(code, "%TypeError", "TypeError", (m) => {
+          msgPrefix(m);
+          this.pushStrLitInto(m, "type boolean (");
+          m.call(this.concatHelper());
+          this.walkExpr(inner);
+          m.ifResult(this.strRef);
+          this.pushStrLitInto(m, "true");
+          m.else_();
+          this.pushStrLitInto(m, "false");
+          m.end();
+          m.call(this.concatHelper());
+          this.pushStrLitInto(m, ")");
+          m.call(this.concatHelper());
+        }, "ERR_INVALID_ARG_TYPE");
+        return;
+    }
+  }
+
+  /** The setMaxListeners/defaultMaxListeners Chk ladder's TYPE half
+   * (errors.js's determineSpecificType, oracle-measured — node --
+   * experimental-transform-types, CJS require): non-number `dynLocal`
+   * throws Node's exact "The "<argName>" argument must be of type
+   * number. Received <specific>" TypeError, leaving `this.fn.depth`
+   * untouched (raw `ifVoid`/`end`, no branch escapes this construct) so
+   * it composes safely inside the caller's own scratch/branch context.
+   * Falls through (does nothing, leaves `dynLocal` a NUM) when the kind
+   * already checks out.
+   *
+   * COVERAGE: boolean/string/null/undefined are measured and implemented
+   * (string: single-quoted, truncated to the first 25 code units + "..."
+   * past 28 — the corpus's own strings never cross that boundary, so it
+   * is transcribed from the C runtime's documented rule, not indepen-
+   * dently measured at the boundary). Every OTHER dyn kind (object,
+   * array, function, bytes, handle, promise) is UNIMPLEMENTED here and
+   * traps (`unreachable`) rather than guessing Node's rendering — named
+   * as a gap because no corpus program this stage claims can reach it
+   * (setMaxListeners/defaultMaxListeners only ever see the four measured
+   * kinds across 1651/2321/2574), not because it is known safe in
+   * general. Returns false (having already emitted `refuse`) only when
+   * `mapType`/helpers themselves are unavailable. */
+  /** scr_dyn_check_listener("listener"): EXHAUSTIVE over dyn's whole
+   * kind space (DK has exactly 12 members; bigint/symbol have no dyn
+   * representation on this tier at all — the frontend refuses THOSE
+   * static types before a value ever reaches here, so this file never
+   * has to render them). FUNC is the one non-throwing arm (falls
+   * through). HANDLE and JSVAL are `unreachable()` with NO refuse call —
+   * the SAME precedent dyn.ts's own dispatch tables already use for
+   * these two together (dyn.ts: `this.arm(c, K, [DK.JSVAL, DK.HANDLE],
+   * () => c.unreachable())`): handles are unconstructible on this tier
+   * by construction, and jsval-kind values are represented AS whichever
+   * OTHER kind they actually hold (increment 21's jsval≡dyn unification
+   * means DK.JSVAL is never the tag a real box carries). ARR/OBJ/BYTES/
+   * PROMISE are oracle-measured ("an instance of <Ctor>" — Node's
+   * determineSpecificType); BYTES renders "Uint8Array" per S037 (a
+   * Buffer crossing `unknown` is indistinguishable from a plain
+   * Uint8Array on this tier — the ALREADY-registered divergence, not a
+   * new one), and OBJ renders "Object" UNCONDITIONALLY — a NAMED
+   * simplification: this tier's dyn OBJ payload (record shapes) carries
+   * no constructor-name tracking, so a user class instance boxed to dyn
+   * would render "an instance of Object" where Node names the class —
+   * unexercised by any corpus program this stage claims (none pass a
+   * class instance to a listener-family call). */
+  private emitCheckListenerBody(code: Code, dynLocal: number): void {
+    const dynT = this.dyn.dynT();
+    const argName = "listener";
+    const msgPrefix = (c: Code): void => {
+      this.pushStrLitInto(c, 'The "');
+      this.pushStrLitInto(c, argName);
+      c.call(this.concatHelper());
+      this.pushStrLitInto(c, '" argument must be of type function. Received ');
+      c.call(this.concatHelper());
+    };
+    const instanceOf = (className: string): void => {
+      this.emitSetCellErrorLit(
+        "%TypeError",
+        "TypeError",
+        `The "${argName}" argument must be of type function. Received an instance of ${className}`,
+        "ERR_INVALID_ARG_TYPE",
+      );
+      this.emitUnwind();
+    };
+    code.localGet(dynLocal);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.FUNC);
+    code.i32Eq();
+    code.i32Eqz();
+    this.openIf(); // #1 not-a-function
+    code.localGet(dynLocal);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.BOOL);
+    code.i32Eq();
+    this.openIf(); // #2 BOOL
+    this.emitSetCellError(code, "%TypeError", "TypeError", (m) => {
+      msgPrefix(m);
+      this.pushStrLitInto(m, "type boolean (");
+      m.call(this.concatHelper());
+      code.localGet(dynLocal);
+      code.structGet(dynT, DYN_NUM);
+      code.f64Const(0);
+      code.f64Ne();
+      m.ifResult(this.strRef);
+      this.pushStrLitInto(m, "true");
+      m.else_();
+      this.pushStrLitInto(m, "false");
+      m.end();
+      m.call(this.concatHelper());
+      this.pushStrLitInto(m, ")");
+      m.call(this.concatHelper());
+    }, "ERR_INVALID_ARG_TYPE");
+    this.emitUnwind();
+    code.else_();
+    code.localGet(dynLocal);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.NUM);
+    code.i32Eq();
+    this.openIf(); // #3 NUM
+    this.emitSetCellError(code, "%TypeError", "TypeError", (m) => {
+      msgPrefix(m);
+      this.pushStrLitInto(m, "type number (");
+      m.call(this.concatHelper());
+      code.localGet(dynLocal);
+      code.structGet(dynT, DYN_NUM);
+      m.call(this.f64ToStrHelper());
+      m.call(this.concatHelper());
+      this.pushStrLitInto(m, ")");
+      m.call(this.concatHelper());
+    }, "ERR_INVALID_ARG_TYPE");
+    this.emitUnwind();
+    code.else_();
+    code.localGet(dynLocal);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.STR);
+    code.i32Eq();
+    this.openIf(); // #4 STR
+    this.emitSetCellError(code, "%TypeError", "TypeError", (m) => {
+      msgPrefix(m);
+      this.pushStrLitInto(m, "type string ('");
+      m.call(this.concatHelper());
+      // SIMPLIFICATION (named): no 25/28-char truncation — see
+      // emitMaxListenersArgCheck's identical, already-documented note.
+      code.localGet(dynLocal);
+      code.structGet(dynT, DYN_REF);
+      code.refCast(this.strType);
+      m.call(this.concatHelper());
+      this.pushStrLitInto(m, "')");
+      m.call(this.concatHelper());
+    }, "ERR_INVALID_ARG_TYPE");
+    this.emitUnwind();
+    code.else_();
+    code.localGet(dynLocal);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.NULL);
+    code.i32Eq();
+    this.openIf(); // #5 NULL
+    this.emitSetCellErrorLit(
+      "%TypeError",
+      "TypeError",
+      `The "${argName}" argument must be of type function. Received null`,
+      "ERR_INVALID_ARG_TYPE",
+    );
+    this.emitUnwind();
+    code.else_();
+    code.localGet(dynLocal);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.UNDEF);
+    code.i32Eq();
+    this.openIf(); // #6 UNDEF
+    this.emitSetCellErrorLit(
+      "%TypeError",
+      "TypeError",
+      `The "${argName}" argument must be of type function. Received undefined`,
+      "ERR_INVALID_ARG_TYPE",
+    );
+    this.emitUnwind();
+    code.else_();
+    code.localGet(dynLocal);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.ARR);
+    code.i32Eq();
+    this.openIf(); // #7 ARR
+    instanceOf("Array");
+    code.else_();
+    code.localGet(dynLocal);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.BYTES);
+    code.i32Eq();
+    this.openIf(); // #8 BYTES
+    instanceOf("Uint8Array"); // S037: indistinguishable from Buffer on this tier
+    code.else_();
+    code.localGet(dynLocal);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.PROMISE);
+    code.i32Eq();
+    this.openIf(); // #9 PROMISE
+    instanceOf("Promise");
+    code.else_();
+    code.localGet(dynLocal);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.OBJ);
+    code.i32Eq();
+    this.openIf(); // #10 OBJ
+    instanceOf("Object"); // NAMED simplification — see the method doc
+    code.else_();
+    // HANDLE/JSVAL: provably unreachable on this tier (dyn.ts's own
+    // precedent) — `unreachable()`, no `refuse()`.
+    code.unreachable();
+    this.close(); // #10
+    this.close(); // #9
+    this.close(); // #8
+    this.close(); // #7
+    this.close(); // #6
+    this.close(); // #5
+    this.close(); // #4
+    this.close(); // #3
+    this.close(); // #2
+    this.close(); // #1
+  }
+
+  private emitMaxListenersArgCheck(code: Code, argName: string, dynLocal: number, loc: SrcLoc | undefined): boolean {
+    const dynT = this.dyn.dynT();
+    const msgPrefix = (c: Code): void => {
+      this.pushStrLitInto(c, 'The "');
+      this.pushStrLitInto(c, argName);
+      c.call(this.concatHelper());
+      this.pushStrLitInto(c, '" argument must be of type number. Received ');
+      c.call(this.concatHelper());
+    };
+    // An if/else-if CHAIN, every `openIf` here TRACKED (this.openIf/
+    // this.close, not the raw Code methods) — emitUnwind()'s branch-to-
+    // try-handler computes its relative depth off `this.fn.depth`, and
+    // 1648's own bug (see the rider's TIER_FLOOR comment) was exactly a
+    // raw open left untracked. Five opens, five closes, LIFO at the end.
+    code.localGet(dynLocal);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.NUM);
+    code.i32Eq();
+    code.i32Eqz();
+    this.openIf(); // #1 not-a-number
+    code.localGet(dynLocal);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.BOOL);
+    code.i32Eq();
+    this.openIf(); // #2 BOOL
+    this.emitSetCellError(code, "%TypeError", "TypeError", (m) => {
+      msgPrefix(m);
+      this.pushStrLitInto(m, "type boolean (");
+      m.call(this.concatHelper());
+      // A raw, SELF-CONTAINED value-picker (opens and closes within this
+      // one expression, no emitUnwind inside) — untracked is correct
+      // here, unlike the outer chain.
+      code.localGet(dynLocal);
+      code.structGet(dynT, DYN_NUM);
+      code.f64Const(0);
+      code.f64Ne();
+      m.ifResult(this.strRef);
+      this.pushStrLitInto(m, "true");
+      m.else_();
+      this.pushStrLitInto(m, "false");
+      m.end();
+      m.call(this.concatHelper());
+      this.pushStrLitInto(m, ")");
+      m.call(this.concatHelper());
+    }, "ERR_INVALID_ARG_TYPE");
+    this.emitUnwind();
+    code.else_();
+    code.localGet(dynLocal);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.STR);
+    code.i32Eq();
+    this.openIf(); // #3 STR
+    this.emitSetCellError(code, "%TypeError", "TypeError", (m) => {
+      msgPrefix(m);
+      this.pushStrLitInto(m, "type string ('");
+      m.call(this.concatHelper());
+      // SIMPLIFICATION (named, not silent): Node's real ladder truncates
+      // past 28 rendered chars to 25 + "..." (scr_dyn_check_listener's
+      // documented rule) — neither of the corpus's own strings
+      // ('and even this', 'nope') crosses that boundary, so the
+      // truncation itself is NOT implemented; every string renders in
+      // full. A future string long enough to need it would render
+      // un-truncated here, a real (named) divergence from Node.
+      code.localGet(dynLocal);
+      code.structGet(dynT, DYN_REF);
+      code.refCast(this.strType);
+      m.call(this.concatHelper());
+      this.pushStrLitInto(m, "')");
+      m.call(this.concatHelper());
+    }, "ERR_INVALID_ARG_TYPE");
+    this.emitUnwind();
+    code.else_();
+    code.localGet(dynLocal);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.NULL);
+    code.i32Eq();
+    this.openIf(); // #4 NULL
+    this.emitSetCellErrorLit(
+      "%TypeError",
+      "TypeError",
+      `The "${argName}" argument must be of type number. Received null`,
+      "ERR_INVALID_ARG_TYPE",
+    );
+    this.emitUnwind();
+    code.else_();
+    code.localGet(dynLocal);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.UNDEF);
+    code.i32Eq();
+    this.openIf(); // #5 UNDEF
+    this.emitSetCellErrorLit(
+      "%TypeError",
+      "TypeError",
+      `The "${argName}" argument must be of type number. Received undefined`,
+      "ERR_INVALID_ARG_TYPE",
+    );
+    this.emitUnwind();
+    code.else_();
+    // Named gap (see the method doc): object/array/function/bytes/
+    // handle/promise renderings are unmeasured and unimplemented — no
+    // corpus program this stage claims can reach this arm.
+    this.refuse(`libCall:emitter.setMaxListeners:unrendered-kind`, loc);
+    code.unreachable();
+    this.close(); // #5
+    this.close(); // #4
+    this.close(); // #3
+    this.close(); // #2
+    this.close(); // #1
+    return true;
+  }
+
+  /** The dyn args array's raw `array (mut dyn)` buffer type — dyn.ts's
+   * ARR payload uses the SAME shape (arrays.ts's vector), so this must
+   * be the identical interned type, not a second declaration: fetched
+   * through the dyn vector's own info rather than re-derived. */
+  private dynArgsBufType(): number {
+    return this.dynVecInfo().bufType;
+  }
+  private dynArrStructType(): number {
+    return this.dynVecInfo().struct;
   }
 
   private emitTimerCall(e: Extract<IrExpr, { kind: "libCall" }>): boolean {

@@ -1848,6 +1848,134 @@ const TIER_FLOOR: string[] = [
   "2311-next-tick-js-callbacks.js",
   "2323-timer-callback-returns.ts",
   "2656-top-level-await-cycle-order/main.ts",
+  // Increment 22 stage A (the EventEmitter core + the extends-runtime gate
+  // lift for the emitter root): classes.ts's rootKind now distinguishes
+  // "emitter" (liftable) from stream-rooted "runtime" (still refused) and
+  // plan() injects the two-field ScrEmitter prefix (registry ref, display
+  // name) past `vt` on every emitter-rooted class; events.ts is the new
+  // registry runtime — the general (dyn-array-thunk) bucket/entry family
+  // per the approved ABI decision (scratchpad/listener-abi-decision.md:
+  // every listener normalizes to dyn.ts's {clos, thunk: thunkSig} pair,
+  // reusing dynFnThunk/dynFromHelper wholesale). Tier 661→673, these
+  // twelve claims: construction (new/ctor, plain subclassing, namespace
+  // spellings), on/addListener/prependListener/prependOnceListener (once
+  // and prepend both landed — the entry's once/fired fields, the
+  // prepend-vs-append insert, and emitDispatch's fired-guard + re-find-
+  // and-unlink-before-invoke), emit over the general dyn tuple, off/
+  // removeListener (identity by `clos`; onDyn's `orig` split is not
+  // wired, so every claim here registers through the PLAIN typed path),
+  // listenerCount(name)/listenerCount(name,fn), eventNames() (the bucket
+  // chain IS insertion order — no shape-mode filter needed yet, since a
+  // bucket always drops the instant it empties), and removeAllListeners
+  // in BOTH forms (named: one bucket drop; whole-emitter: reg.head reset
+  // to null). Emit-override dispatch (2618/2619/2622/2623) needed ZERO
+  // new backend code — the vtable machinery already treats the emitter
+  // root as an ordinary hierarchy root once the gate lift plans it, so
+  // `%<class>.emit:<event>` virtualCalls just work.
+  "1644-ee-basics.ts",
+  "1645-ee-extends.ts",
+  "1646-ee-once-remove.ts",
+  "1649-ee-names-counts.ts",
+  "1650-ee-prepend.ts",
+  "1652-ee-snapshot.ts",
+  "1653-ee-cjs.cjs",
+  "1654-ee-namespace.ts",
+  "2618-ee-emit-override.ts",
+  "2619-ee-override-chain.ts",
+  "2622-ee-override-filter.ts",
+  "2623-ee-job-queue.ts",
+  // Increment 22 stage A, rider: the 'error' bucket. The approved
+  // exception to the ABI decision — dynCheckHelper has no "object" arm
+  // (it cannot unbox a dyn value back into a class instance), and the
+  // error-rooted dynFromHelper direction is S021's copy-and-cache
+  // encoding, wrong for what must be invisible internal marshaling — so
+  // 'error' listeners ride a SEPARATE bucket/entry pair (eeBucketErr/
+  // eeEntryErr) whose thunk takes the real error reference DIRECTLY, no
+  // dyn box, built by errThunkFor (the arity-0-or-1 adapter mirroring
+  // dynFnThunk, interned per listener signature). emitError reuses the
+  // ordinary `throw` statement's own emitThrowValue+emitUnwind pair for
+  // the no-listener case — caught one real depth-tracking bug doing
+  // this: a raw `code.ifResult`/`code.end()` (not the tracked
+  // `this.openIfResult`/`this.close()`) left `this.fn.depth` one short,
+  // so emitUnwind's branch-to-try-handler mistargeted under 1648's OWN
+  // try/catch around emit('error', ...) — a bare top-level emitError
+  // call would never have exercised the miscount; only running the
+  // actual differential caught it, not typechecking. Tier 673→675.
+  "1648-ee-error-event.ts",
+  "2621-ee-override-error-throw.ts",
+  // Increment 22 stage A, rider: the maxListeners family + onDyn/
+  // checkListener. setMax/getMax/setDefaultMax(Chk): the range half
+  // (`!(n>=0)`, catching NaN — IEEE754 comparisons against NaN are
+  // false either way, so `n<0` alone would miss it) is shared by the
+  // unchecked and checked forms; the Chk ladder's TYPE half needed TWO
+  // passes — a runtime dyn-kind dispatch first (correct but unusable:
+  // building even an UNREACHABLE arm's `refuse()` call fails the WHOLE
+  // compile regardless of whether that arm is dynamically reachable,
+  // measured directly on 2574's own valid-number case, which refused
+  // before ever taking the throwing branch), replaced by a static fast
+  // path reading the PRE-`dynFrom`-box value's own IR type (every
+  // argument across 1651/2321/2574 is a literal expression) — zero
+  // runtime dispatch, zero unhandled-kind exposure, for the corpus's
+  // actual shape. checkListener/onDyn/offDyn (1678/2624) hit the
+  // SAME "any unhandled arm fails the whole compile" wall from the
+  // OTHER side: the lifted onDyn helper's `cb` parameter is a genuine,
+  // unnarrowable `dyn` (shared across every call site of one adapter
+  // shape) — closed by building the FULL 12-member DK dispatch instead
+  // (dyn.ts's own established precedent: HANDLE/JSVAL are
+  // `unreachable()` with no `refuse()`, since a handle is
+  // unconstructible on this tier and a JSVAL-tagged box never actually
+  // exists post the jsval≡dyn unification — bigint/symbol have no dyn
+  // representation at all, so the frontend refuses those before a
+  // value ever reaches here). onDyn's `orig` extraction (dyn.ts's
+  // fnPayload/FN_CLOS) gives off/removeListener and
+  // listenerCount(name,fn) Node's own identity rule for dyn-registered
+  // listeners — 1678 pins the whole matrix (register-by-name-arity,
+  // remove-by-original-identity, count-by-original-identity, 0-param
+  // listeners taking the PLAIN typed path since a 0-param function type
+  // has no dyn-flavored parameter to trigger the adapter at all).
+  // Named, unmeasured simplifications carried forward (see the
+  // relevant methods' own doc comments): no 25/28-char string
+  // truncation in either ladder's rendering; a dyn OBJECT always
+  // renders "Object" (this tier's dyn OBJ payload carries no
+  // constructor-name tracking, so a boxed user-class instance would
+  // print the wrong name — unexercised by any claim here); dyn BYTES
+  // renders "Uint8Array" per S037 (this tier's OWN already-registered
+  // Buffer/Uint8Array conflation crossing `unknown`, not a new
+  // divergence). Tier 675→681.
+  "1651-ee-max-listeners.ts",
+  "1678-emitter-dyn-listeners.cjs",
+  "2321-emitter-static-setmax.cjs",
+  "2574-emitter-max-listeners-ladders.cjs",
+  "2620-ee-override-once-order.ts",
+  "2624-ee-override-js.cjs",
+  // Increment 22 stage A, rider: the meta events. newListener fires
+  // BEFORE the add (still reading the OLD listenerCount — entryAppend/
+  // errEntryAppend call fireMetaHelper right after regEnsure, before
+  // the actual insert) and removeListener fires AFTER each removal
+  // (unlinkEntry/errUnlinkEntry, name read BEFORE a possible bucket
+  // drop — Node's own scr_ee_remove_at order). Both ride the SAME
+  // general dispatch (fireMetaHelper just calls emitDispatch with a
+  // one-string tuple) — meta events are ordinary string-tuple events,
+  // never special-cased below the bucket/entry level. Caught one build-
+  // time bug closing this out: emitDispatch and unlinkEntry became
+  // MUTUALLY recursive through fireMetaHelper (emitDispatch's once-
+  // removal calls unlinkEntry, which fires 'removeListener' through
+  // fireMetaHelper, which calls emitDispatch again) — the existing
+  // `cached()` memoizer only records a function's index once its BODY
+  // finishes building, so the reentrant call during that same build
+  // recursed forever ("Maximum call stack size exceeded" at TS-compile
+  // time, before any wasm ran) — fixed by a `cachedRecursive` variant
+  // that records the index the moment `declareFunc` reserves it, before
+  // the body is built. removeAllListeners' meta-aware form (both the
+  // named and whole-emitter spellings) does the full LIFO-from-a-
+  // snapshot removal with entryPresent's re-check each step (a nested
+  // 'removeListener' handler may already have removed the next
+  // candidate) and, for the whole-emitter form, every other bucket
+  // before 'removeListener' itself last — Node's exact order. NAMED
+  // GAP: errRemoveAll (the error-bucket's whole-wipe) still does NOT
+  // fire per-entry 'removeListener' — unexercised by any claim here.
+  // Tier 681→682.
+  "1647-ee-meta-events.ts",
 ];
 
 interface RunResult {

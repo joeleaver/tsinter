@@ -3543,13 +3543,15 @@ test("classes: a type family that references itself in every direction", async (
   expect(stdout.toString("utf8")).toBe("root 1 leaf 3\ntrue false\n4 leaf\n");
 });
 
-test("classes: the EventEmitter family is the last one that refuses", async () => {
-  // Both of the rocks that used to sit here are gone: `extends Error`
-  // compiles since the error unification made a user subclass an ordinary
-  // subtype of the builtin error struct, and throwing a NON-error class
-  // compiles since the promise payload gained an interval slot. What is
-  // left is the runtime hierarchy whose C prefix embeds registry and
-  // stream state this tier has no port of.
+test("classes: increment 22 stage A lifts the gate for the emitter root ONLY — a stream root still refuses", async () => {
+  // The EventEmitter rock is gone: classes.ts's rootKind now answers
+  // "emitter" (liftable) rather than "runtime" for a %EventEmitter-rooted
+  // class, and plan() injects the two-field ScrEmitter prefix (registry
+  // ref, display name) past `vt`. A stream-rooted class's base chain
+  // passes through a RUNTIME_STREAM_CLASSES name first (checked before
+  // the emitter check in rootKind, exactly because every stream class's
+  // OWN base chain reaches %EventEmitter further up) — its C prefix embeds
+  // stream state this tier has no port of, so it keeps refusing unchanged.
   const ee = await buildWasm(
     "extends-ee.ts",
     [
@@ -3562,10 +3564,67 @@ test("classes: the EventEmitter family is the last one that refuses", async () =
       "",
     ].join("\n"),
   );
-  expect(ee.ok).toBe(false);
-  if (!ee.ok) {
-    expect(ee.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
-    expect(ee.wasmSurvey).toContain("class:extends-runtime");
+  expect(ee.ok).toBe(true);
+  if (ee.ok) {
+    expect(WebAssembly.validate(readFileSync(ee.binaryPath))).toBe(true);
+    const { stdout } = await runWasm(ee.binaryPath);
+    expect(stdout.toString("utf8")).toBe("0\n");
+  }
+
+  const stream = await buildWasm(
+    "extends-stream.ts",
+    [
+      'import { Readable } from "node:stream";',
+      "class R extends Readable {",
+      "  _read(): void {}",
+      "}",
+      "const r = new R();",
+      "console.log(r instanceof Readable);",
+      "",
+    ].join("\n"),
+  );
+  expect(stream.ok).toBe(false);
+  if (!stream.ok) {
+    expect(stream.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
+    expect(stream.wasmSurvey).toContain("class:extends-runtime");
+  }
+});
+
+test("events registry: own-key event names — '__proto__'/'toString'/'__defineGetter__'/'hasOwnProperty' behave as ORDINARY names, not inherited Object.prototype members (corpus 1761's own construct — the full corpus program cannot be claimed yet, since its second half needs real stream construction; this pins the EventEmitter-only half directly, byte-exact against Node)", async () => {
+  // bucketFind's own name comparison (events.ts) is a raw UTF-16 content
+  // walk through strEqHelper — the SAME equality every other string
+  // comparison in this backend uses — so it never touches a JS
+  // prototype chain at all and this holds by construction; pinned
+  // anyway per the standing rule that "holds by construction" is an
+  // argument, not a substitute for the guard.
+  const res = await buildWasm(
+    "own-key-names.cjs",
+    [
+      "'use strict';",
+      "const EventEmitter = require('events');",
+      "const ee = new EventEmitter();",
+      "ee.on('__proto__', (v) => { console.log('proto', v); });",
+      "ee.on('toString', (v) => { console.log('tostring', v); });",
+      "ee.on('__defineGetter__', (v) => { console.log('getter', v); });",
+      "ee.on('hasOwnProperty', (v) => { console.log('hop', v); });",
+      "ee.emit('__proto__', 1);",
+      "ee.emit('toString', 2);",
+      "ee.emit('__defineGetter__', 3);",
+      "ee.emit('hasOwnProperty', 4);",
+      "console.log(ee.eventNames().join(','));",
+      "console.log(ee.listenerCount('__proto__'));",
+      "",
+    ].join("\n"),
+  );
+  expect(res.ok).toBe(true);
+  if (res.ok) {
+    expect(WebAssembly.validate(readFileSync(res.binaryPath))).toBe(true);
+    const { stdout } = await runWasm(res.binaryPath);
+    // Node-measured (node --experimental-transform-types, CJS require —
+    // the require() form 1761 itself uses).
+    expect(stdout.toString("utf8")).toBe(
+      ["proto 1", "tostring 2", "getter 3", "hop 4", "__proto__,toString,__defineGetter__,hasOwnProperty", "1", ""].join("\n"),
+    );
   }
 });
 
