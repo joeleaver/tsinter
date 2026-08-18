@@ -1828,6 +1828,26 @@ const TIER_FLOOR: string[] = [
   "2685-dynamic-import-sync-throw/main.ts",
   // Pins the two-independent-observers equivalence nodes.ts:4887 asserts (two `.then()` subscriptions on ONE import promise, run-once init, both fire in order) — lead-side gate finding, previously unguarded.
   "2686-dynamic-import-two-observers/main.ts",
+  // Increment 22, stage 0 (the process.nextTick queue — the streams/
+  // events family's prerequisite): nexttick.ts's second FIFO beside
+  // promises.ts's microtask queue, and emitter.ts's checkpoint rebuilt as
+  // the two-queue fixpoint (ticks to exhaustion, then microtasks, repeat
+  // while either has new work) with a measured first-checkpoint swap
+  // (nexttick.ts's header has the full truth table against a live Node
+  // oracle). Tier 658→661, exactly these three claims, zero rider/other
+  // movement.
+  //
+  // NOT a claim, though its first refusal WAS `libCall:process.nextTick`
+  // before this stage (the census-bucket-vs-full-survey distinction this
+  // stage's own report corrects): 2310-process-next-tick.ts. Its `process.
+  // on("exit", cb)` call lowers to `libCall:process.onExit`, wholly
+  // unimplemented in the wasm backend (zero arms anywhere in emitter.ts,
+  // and 1444/1445/1446-exit-*.ts stay refused on the exact same gate) —
+  // the 2633 precedent: a plausible-looking claim that measurement
+  // disproved stays named here, not silently dropped.
+  "2311-next-tick-js-callbacks.js",
+  "2323-timer-callback-returns.ts",
+  "2656-top-level-await-cycle-order/main.ts",
 ];
 
 interface RunResult {

@@ -136,6 +136,7 @@ import { StrBuilder } from "./strings.js";
 import { CasingBuilder } from "./casing.js";
 import { BytesBuilder, type BytesElem } from "./typedarrays.js";
 import { TimerBuilder } from "./timers.js";
+import { NextTickBuilder } from "./nexttick.js";
 import { UnionBuilder, type UnionArmRep } from "./unions.js";
 import { Code } from "./code.js";
 import { buildF64ToStr } from "./numfmt.js";
@@ -1595,20 +1596,23 @@ class Assembler {
         c.unreachable();
         c.end();
       }
-      // The first checkpoint: run microtasks to quiescence, then answer
-      // for any rejection nobody ever looked at. Frames still parked on a
-      // promise that never settles are simply dropped — an empty queue IS
-      // exit 0, which is what Node does with a suspended await nothing
-      // will resolve (a suspended MODULE root is the one exception: that
-      // is exit 13, and `_status` is where the host reads it). Nothing is
-      // emitted at all when the module has no promise surface (the
-      // runtime interns on first use, so a null builder means nothing
-      // ever needed it).
+      // The first checkpoint: run microtasks (and, once a module calls
+      // process.nextTick anywhere, ticks — nexttick.ts) to quiescence,
+      // then answer for any rejection nobody ever looked at. Frames still
+      // parked on a promise that never settles are simply dropped — an
+      // empty queue IS exit 0, which is what Node does with a suspended
+      // await nothing will resolve (a suspended MODULE root is the one
+      // exception: that is exit 13, and `_status` is where the host reads
+      // it). Nothing is emitted at all when the module has no promise
+      // surface and no nextTick surface (the runtime interns on first
+      // use, so two null builders means neither was ever needed).
       //
       // Where the program can still have macrotasks left, that is only
       // the FIRST checkpoint: `_tick` carries the loop from here, and the
-      // host does the waiting (abi.ts).
-      this.emitCheckpoint(c);
+      // host does the waiting (abi.ts). emitFirstCheckpoint (not
+      // emitCheckpoint) — this ONE call site is the special first one
+      // (emitCheckpointCore's header).
+      this.emitFirstCheckpoint(c);
       this.mb.setBody(start, [], c.bytes());
     }
     this.mb.exportFunc(EXPORT_ENTRY, start);
@@ -2608,11 +2612,39 @@ class Assembler {
     return this.rootField;
   }
 
-  /** One microtask checkpoint: drain to quiescence, answer for a rejection
-   * nobody looked at, and — in a top-level-await program — stop the world
-   * on a rejected module root. `_start` runs it once after the entry
-   * returns and `_tick` after every macrotask callback, which is where
-   * Node decides all three (timers.ts's checkpoint dep).
+  /** One STEADY-STATE checkpoint — every later one: `_tick` after every
+   * macrotask callback, and any nextTick or microtask job settled from
+   * within one. `timers.ts`'s checkpoint dep routes here. See
+   * emitCheckpointCore for the two-queue fixpoint; `_start`'s own first
+   * checkpoint is emitFirstCheckpoint, below. */
+  private emitCheckpoint(c: Code): void {
+    this.emitCheckpointCore(c, false);
+  }
+
+  /** The FIRST checkpoint only — `_start`, once, right after the entry
+   * returns. See emitCheckpointCore's header for why this one differs. */
+  private emitFirstCheckpoint(c: Code): void {
+    this.emitCheckpointCore(c, true);
+  }
+
+  /** The checkpoint: drain to quiescence, answer for a rejection nobody
+   * looked at, and — in a top-level-await program — stop the world on a
+   * rejected module root, which is where Node decides all three.
+   *
+   * TWO QUEUES, once a module calls `process.nextTick` anywhere (nexttick.
+   * ts's queue exists): the tick queue drains to exhaustion, THEN the
+   * microtask queue to exhaustion, and back while either has new work —
+   * Node's `processTicksAndRejections`, scr_loop_run's shape (nexttick.ts's
+   * header has the measured truth table). A module with no promise surface
+   * at all skips every proms.* call (the queue nothing can ever populate);
+   * a module with no nextTick anywhere keeps the ORIGINAL single-queue
+   * checkpoint, byte-identical to before this existed.
+   *
+   * THE FIRST-CHECKPOINT SWAP (measured — nexttick.ts's probes b/e): an
+   * already-pending microtask beats an already-queued nextTick ONLY here,
+   * so the first checkpoint spends one extra, unpaired microtask drain
+   * before the steady-state loop begins; every later checkpoint (isFirst
+   * false) drains ticks first, plain.
    *
    * The root check comes AFTER the ledger report, where scr_loop_run puts
    * it FIRST. Both orders reach the same observable: the two verdicts are
@@ -2621,10 +2653,36 @@ class Assembler {
    * on a nonzero exit (S007's surviving half, S010's root paragraph). A
    * program with no module root emits exactly what it did before this
    * existed — the check is three instructions that only appear with one. */
-  private emitCheckpoint(c: Code): void {
-    if (this.promsField === null) return;
-    c.call(this.proms.drain());
-    c.call(this.proms.report());
+  private emitCheckpointCore(c: Code, isFirst: boolean): void {
+    const hasProms = this.promsField !== null;
+    const hasTicks = this.nextTickField !== null;
+    if (!hasProms && !hasTicks) return;
+    if (!hasTicks) {
+      c.call(this.proms.drain());
+      c.call(this.proms.report());
+      this.emitRootCheck(c);
+      return;
+    }
+    if (isFirst && hasProms) c.call(this.proms.drain());
+    c.loop();
+    c.call(this.nextTick.drain());
+    if (hasProms) c.call(this.proms.drain());
+    c.globalGet(this.nextTick.headGlobal());
+    c.refIsNull();
+    c.i32Eqz();
+    c.brIf(0);
+    c.end();
+    if (hasProms) {
+      c.call(this.proms.report());
+      this.emitRootCheck(c);
+    }
+  }
+
+  /** The top-level-await root's own stop, factored out of
+   * emitCheckpointCore so both the single-queue and two-queue paths share
+   * it verbatim. A no-op program with no module root (rootGlobal() null)
+   * emits nothing at all, as before. */
+  private emitRootCheck(c: Code): void {
     const root = this.rootGlobal();
     if (root === null) return;
     c.globalGet(root);
@@ -2664,6 +2722,22 @@ class Assembler {
       checkpoint: (c) => this.emitCheckpoint(c),
     });
     return this.timersField;
+  }
+
+  /* ── the process.nextTick queue (nexttick.ts) ─────────────────────────
+   * Interned by the first `process.nextTick` libCall (or, in stage B, the
+   * first internal raw-marker producer), so a module that never calls it
+   * emits neither the queue nor any extra checkpoint machinery — stays
+   * byte-identical to what it compiled to before this existed. */
+
+  private nextTickField: NextTickBuilder | null = null;
+
+  private get nextTick(): NextTickBuilder {
+    this.nextTickField ??= new NextTickBuilder(this.mb, {
+      voidClos: () => this.closPairFor([], []),
+      excKind: () => this.exc().kindG,
+    });
+    return this.nextTickField;
   }
 
   /* ── unions ─────────────────────────────────────────────────────────────
@@ -14026,6 +14100,12 @@ class Assembler {
         return true;
       case "timers.immediateHasRef":
         call1(this.timers.immHasRef());
+        return true;
+      // Not a "timers.*" name (it isn't node:timers surface), but the
+      // SAME call1-a-queue-target shape, so it lives in this cluster
+      // rather than growing its own dispatcher (nexttick.ts).
+      case "process.nextTick":
+        call1(this.nextTick.enqueue());
         return true;
       default:
         return false;
