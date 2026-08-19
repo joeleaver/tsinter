@@ -2053,6 +2053,85 @@ const TIER_FLOOR: string[] = [
   "1740-stream-extends-readable.ts",
   "1761-emitter-special-event-names.cjs",
   "2572-readable-emitted-readable-flag.cjs",
+  // Increment 22 stage B, pass 2 (setEncoding + the utf8 StringDecoder,
+  // Readable.from, for-await via readable.nextChunkDyn, stream/consumers).
+  // Predicted 6 (Phase 2's fixed table); landed all 6 AND a 7th, unpicked
+  // bonus claim (2594) that fell out of a PRE-EXISTING, unrelated-to-
+  // streams gap this pass had to close along the way (error.nodeThrow —
+  // 2628's ERR_UNKNOWN_ENCODING throws needed it and it was completely
+  // unimplemented in this backend; 2594's own null-binding TypeError
+  // throws ride the exact same libCall). Zero regressions across the full
+  // 1069-program run.
+  //
+  // TWO OTHER PRE-EXISTING, UNRELATED-TO-STREAMS GAPS closed along the
+  // way, both measured as genuinely load-bearing for the six targets, not
+  // scope creep: `dyn.toString` (a checked-dynamic `.toString(enc)` —
+  // 2628's 'data' listener calls it on the boxed chunk; the frontend had
+  // already special-cased BYTES-kind receivers to decode per the literal
+  // encoding argument, this backend just never implemented the libCall)
+  // and `error.code` (`err.code` on an Error-rooted receiver — 2630's
+  // `(e as NodeJS.ErrnoException).code`).
+  //
+  // THE DYN LANES, MEASURED NOT NEEDED: readable.newDyn/initDyn/pushDyn/
+  // pushU are UNCLAIMED by this pass — all six targets' construction/push
+  // call sites use compile-time-literal options and chunks throughout
+  // (verified by reading every one; dynOptionsValue's own contract routes
+  // an inline object literal through the STATIC path unconditionally), so
+  // none of the four ever get reached. Left refusing by name, unbuilt.
+  //
+  // THE DECODER'S SCOPE, MEASURED: only utf8 needed the STATEFUL
+  // StringDecoder (the held-back-incomplete-tail machinery, scr_bytes.c's
+  // scr_strdec_tail ported) — 2628 is entirely the OTHER direction
+  // (push(str,enc)/defaultEncoding = Buffer.from(str,enc), stateless,
+  // already covered by typedarrays.ts's existing fromStrHelper for all
+  // seven canonical encodings). setEncoding itself refuses by name for any
+  // spelling but "utf8" (readable.setEncoding's encoding argument is
+  // always a compile-time strLit, so the refusal is a compile-time name).
+  //
+  // A REAL CORRECTION TO THIS PASS'S OWN BRIEF, MEASURED: "concurrent
+  // for-await iteration throws" does NOT hold in real Node (two `for
+  // await` loops over one Readable share Node's cached async-iterator and
+  // interleave/chain rather than throwing) — the brief's assumption
+  // traced to scr_stream.c's own `next_waiter` model, itself now a
+  // C-lane divergence candidate (flagged, not fixed here). RS_WAITER
+  // (the single parked-continuation slot `readable.nextChunkDyn` uses)
+  // TRAPS LOUDLY on a second concurrent park (S049 — the gate's fix
+  // round replaced the original silent overwrite, whose user-visible
+  // shape was truncated output with exit 0) — unreachable by any of
+  // these seven claims (verified: none run concurrent iteration).
+  //
+  // THE GATE'S FIX ROUND (post-verdict, pre-landing, Joe's ruling on the
+  // four measured divergences): concurrent-park now traps (S049, above);
+  // a consumer registered on an ALREADY-closed stream settles at
+  // registration via the factored settleConsumerCore (Node-ward fix —
+  // previously its promise never settled and the program exited 0
+  // silently short; the pre-close registration orders, including 2629
+  // r7/r8's after-push(null)-before-'close', are untouched); encoded-
+  // stream byte-vs-code-unit length accounting is REGISTERED as S047
+  // (observable via push()'s return and readableLength, no claim reads
+  // either); for-await early exit (break) not destroying the stream is
+  // REGISTERED as S048 with a board item to build Node's destroy-on-
+  // early-exit in a later stage.
+  //
+  // Readable.from(array) answers Node's REAL construction defaults
+  // exactly (`{objectMode:true, highWaterMark:1}`, oracle-measured) for
+  // the two properties a claim reads (readableObjectMode,
+  // readableHighWaterMark) WITHOUT implementing true object-mode
+  // entry-count buffering internally — a named, scoped simplification
+  // (this file's own RS_OBJECT_MODE header carries the full argument for
+  // why it is safe for every access pattern these claims reach: for-await
+  // always drains the buffer to empty between chunks, so readCore's own
+  // `length===0` doRead clause forces the next `_read()` regardless of
+  // what hwm holds).
+  //
+  // Tier 691→698.
+  "1745-stream-encoding-js.cjs",
+  "1746-stream-for-await.ts",
+  "2594-nullish-generic-bindings.ts",
+  "2627-stream-ticks-are-nextticks.ts",
+  "2628-stream-push-encodings.cjs",
+  "2629-stream-consumers.ts",
+  "2630-stream-consumers-errors.ts",
 ];
 
 interface RunResult {

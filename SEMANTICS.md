@@ -2756,3 +2756,113 @@ negative arm's route split) was established by the increment-22
 stage-B review and is restated in full in this entry's own body — the
 entry, not a probe path, is the durable record. The in-code comments
 at both implementations' coercion sites cite this entry.
+
+## S047 — Encoded-stream buffered length counts utf8 BYTES, not Node's UTF-16 code units *(wasm tier; native columns unmeasured)*
+
+With `setEncoding('utf8')` (or the `encoding` construction option)
+active, this tier's Readable re-encodes decoded text back to utf8
+bytes for its single bytes-only chunk list (RS_DEC_PENDING's header),
+so RS_LENGTH — the value behind every highWaterMark-gated decision —
+counts utf8 BYTES. Node stores decoded STRINGS in string mode and
+counts UTF-16 code units. Two observables, both measured (increment-22
+stage-B gate, fix round): `push()`'s boolean backpressure return
+(`new Readable({read(){}, highWaterMark:4, encoding:"utf8"})` then
+`push("ééé")` answers false here, true in Node) and `readableLength`
+(6 vs Node's 3 for "ééé"; 5 vs 2 for "é世"). No claimed corpus program
+reads either observable — 1745/2627/2629 push on encoded streams but
+every call site discards the return, and none reads readableLength
+while encoded.
+
+**Rationale:** matching Node's accounting requires a second,
+string-typed chunk representation carrying per-chunk code-unit
+lengths beside the bytes-only list every other consumer of the pass-1
+machinery uses — real representation work with no corpus payoff
+today. The divergent direction is conservative: byte counts are ≥
+code-unit counts for non-ASCII, so push() reports "stop pushing"
+SOONER than Node, never fabricating capacity. The native lanes were
+NOT measured on these observables during the gate (no corpus program
+reaches them on any lane); this entry deliberately claims the wasm
+tier only — a future claim reading either observable must measure the
+native columns before citing this entry cross-lane (the S015-family
+reuse rule).
+
+**Tested by:** corpus-unpinnable today (nothing in tier reads the
+observables); the measurement of record is the increment-22 stage-B
+gate's probe pair (hwm-4 push-return + readableLength on "ééé"/"é世"),
+restated in full above — the entry is the durable record. The
+RS_DEC_PENDING header cites this entry.
+
+## S048 — for-await early exit (`break`) leaves the Readable ALIVE — Node's async iterator destroys it *(wasm tier)*
+
+Node's `Readable[Symbol.asyncIterator]` destroys the source stream
+when the loop exits early (break, return, or throw); the lowering
+compiles for-await over a Readable as an awaited
+`readable.nextChunkDyn` per iteration, so a `break` simply exits the
+compiled loop — no iterator-`return()` hook exists and no
+break-driven destroy ever fires. The observables SPLIT BY SHAPE
+(both measured, mini-gate MG-1). Shape A — the stream NOT yet ended
+at the break: this tier's stream stays fully ALIVE (`destroyed`
+false, no 'close', `push()` still answers true) where Node destroys
+it (`destroyed` true, 'close' fired, `push()` false); `readableEnded`
+is false on BOTH sides in this shape — not a divergence. Shape B —
+the stream already `push(null)`'d before the break: this tier's
+stream ends NATURALLY one turn later and auto-destroys by its own
+route, so `destroyed` and 'close' CONVERGE with Node and the durable
+divergence inverts to `readableEnded` (true here — the end actually
+ran; false in Node — destruction preempted it). The SHARPEST
+observable (measured in shape B): a SECOND for-await over the same
+stream after the break completes normally here (exit 0) where Node
+throws ERR_STREAM_PREMATURE_CLOSE uncaught (exit 1) — silent-continue
+vs crash. No claimed corpus program exits a for-await early (1746
+always drains to completion).
+
+**Rationale:** the fix is a lowering-level change (emit a destroy
+call on every abnormal exit edge of the compiled loop — frontend
+territory this backend-only pass deliberately did not touch);
+registered now rather than shipped silent, with the build tracked as
+a board item for a later streams stage. Divergence direction: in
+shape A the stream is left alive and intact, and in shape B it
+merely finishes by the route Node's destruction would have preempted
+— nothing is ever fabricated and no data is lost, but the
+re-iteration observable means this tier SUPPRESSES a crash Node
+would raise, which is why that observable leads this entry's list
+rather than the property reads.
+
+**Tested by:** corpus-unpinnable until the destroy lands (a pinning
+program would have to observe one of the divergent columns and would
+fail against Node by construction); the measurements of record are
+the increment-22 stage-B gate's g-break probe and the mini-gate's
+shape decomposition (mg-break-alive, mg-break-observables,
+mg-break-then-iterate), restated in full above.
+
+## S049 — Concurrent for-await over one Readable TRAPS; Node chains via its shared cached iterator *(wasm tier traps; C lane throws — split loud shapes)*
+
+Node caches ONE async iterator per stream, so two concurrent `for
+await` loops over the same Readable chain/interleave and both
+complete (measured — the increment's task brief wrongly said "throws";
+corrected during pass 2). This tier parks exactly one for-await
+continuation (RS_WAITER, a single slot) and builds no chaining: a
+second concurrent `nextChunkDyn` while one is parked TRAPS (exit 1
+per S007's uncaught-is-a-trap bridge) at the park site. The original pass-2 form
+silently OVERWROTE the slot — the first loop's promise was abandoned
+unsettled and the program printed truncated output with exit 0, the
+silent-wrong-output class rule 1 forbids — replaced with the loud
+trap in the gate's fix round. The C reference lane's `next_waiter`
+model THROWS on the same shape: also loud, differently shaped, its
+own Node divergence (board #69's list). No claimed corpus program
+runs concurrent iteration.
+
+**Rationale:** shared-iterator chaining is real scheduling machinery
+with no claim payoff; between silent truncation and a loud trap, the
+trap is the only shape consistent with rule 1. A synthesized throw
+mimicking the C lane was rejected: it would imitate Node-style
+failure for a case where Node does not fail, dressing the divergence
+as program behavior rather than a tier refusal.
+
+**Tested by:** corpus-unpinnable in the byte-exact contract (Node
+exits 0 with MORE output; this tier exits 1 — no fixture can match
+both), so the loud-trap behavior is pinned by the gate's fix-round
+probe (two concurrent loops → trap, exit 1, no silent truncation);
+the measurement of record is that probe plus Node's chaining output,
+restated above. The nextChunkDynCore park-site comment cites this
+entry.

@@ -67,6 +67,7 @@ import {
   RUNTIME_EMITTER_CLASS,
   arrayOf,
   STRING,
+  BYTES_U8,
 } from "../../ir/nodes.js";
 import { computeMayThrow } from "../emission/may-throw.js";
 import { buildClassGraph, type LlClassMeta, type LlVtSlot } from "../llvm/classes.js";
@@ -141,7 +142,19 @@ import { BytesBuilder, type BytesElem } from "./typedarrays.js";
 import { TimerBuilder } from "./timers.js";
 import { NextTickBuilder } from "./nexttick.js";
 import { EventsBuilder, EMITTER_REG, EMITTER_NAME } from "./events.js";
-import { StreamBuilder, RS_HWM, RS_AUTO_DESTROY, RS_EMIT_CLOSE, RS_READ_CLOS, RS_READ_THUNK } from "./stream.js";
+import {
+  StreamBuilder,
+  RS_HWM,
+  RS_AUTO_DESTROY,
+  RS_EMIT_CLOSE,
+  RS_READ_CLOS,
+  RS_READ_THUNK,
+  ENC_NAMES,
+  encTagOf,
+  SC_KIND_TEXT,
+  SC_KIND_BUFFER,
+  SC_KIND_JSON,
+} from "./stream.js";
 import { UnionBuilder, type UnionArmRep } from "./unions.js";
 import { Code } from "./code.js";
 import { buildF64ToStr } from "./numfmt.js";
@@ -2883,6 +2896,31 @@ class Assembler {
       },
       enqueueRaw: () => this.nextTick.enqueueRaw(),
       rawFnType: () => this.nextTick.rawFnType(),
+      dynRef: () => this.dyn.dynRef(),
+      toStrUtf8: () => this.bytesB.toStrHelper("utf8"),
+      fromStrByEnc: (encTag) => this.bytesB.fromStrHelper(ENC_NAMES[encTag]!),
+      boxStr: (c, pushValue) => this.dyn.boxStr(c, pushValue),
+      undefinedDynGlobal: () => this.dyn.undefinedGlobal(),
+      promRef: () => this.proms.promRef(),
+      promMint: () => this.proms.mint(),
+      promSettle: () => this.proms.settle(),
+      excTag: { f64: EXC_F64, bool: EXC_BOOL, str: EXC_STR, ref: EXC_REF, obj: EXC_OBJ },
+      errPreOf: (c, pushErr) => {
+        // The SAME generic vtable read setUncaughtError's inline body
+        // above uses — any Error-hierarchy struct (which is all RS_ERROR
+        // can ever hold) shares %Error's CLASS_VT/CI_PRE field layout
+        // prefix, so reading through %Error's own struct type index is
+        // valid for every dynamic subclass too.
+        const errInfo = this.classInfo("%Error", undefined);
+        if (errInfo === null) throw new Error("wasm emitter bug: %Error has no shape for stream.errPreOf");
+        pushErr(c);
+        c.structGet(errInfo.struct, CLASS_VT);
+        c.structGet(this.classes.ci(), CI_PRE);
+      },
+      jsonParse: () => this.json.parse(),
+      vecStruct: (strings) => this.vecInfoFor(arrayOf(strings ? STRING : BYTES_U8) as IrType & { kind: "array" }, undefined)!.struct,
+      vecBufType: (strings) => this.vecInfoFor(arrayOf(strings ? STRING : BYTES_U8) as IrType & { kind: "array" }, undefined)!.bufType,
+      vecElemVal: (strings) => this.vecInfoFor(arrayOf(strings ? STRING : BYTES_U8) as IrType & { kind: "array" }, undefined)!.elemVal,
     });
     return this.streamField;
   }
@@ -8703,6 +8741,126 @@ class Assembler {
           // and FUNC apply/call dyn.invoke arms). No arguments: the
           // read is a pure top-of-stack peek.
           code.call(this.dyn.thisGet());
+          return;
+        }
+        if (e.fn === "dyn.toString") {
+          // PASS 2 (stream increment 22): a dyn value's `.toString(enc?)`
+          // (lower-calls.ts:4352) — the SHARED-prototype method with its
+          // own receiver-kind dispatch, "a stream chunk's common
+          // consumption" per that file's own comment: a BYTES-kind
+          // receiver decodes per the (always compile-time-literal, per
+          // bufEncoding) encoding argument; every other kind answers
+          // exactly what the general ToString conversion (`dyn.toStr()`,
+          // already used everywhere else — template literals, String(),
+          // concatenation) already produces. The THIRD argument (the
+          // source spelling, for a null-prototype dictionary's Node-exact
+          // "<spelling> is not a function" TypeError) is NOT ported here
+          // — unexercised by any claim this stage reaches, named rather
+          // than silently approximated: a null-prototype receiver falls
+          // through to `dyn.toStr()`'s own general answer instead of
+          // throwing Node's exact error.
+          const encArg = e.args[1]!;
+          if (encArg.kind !== "strLit") {
+            throw new Error("wasm emitter bug: dyn.toString's encoding argument must be a compile-time literal (lower-calls.ts's own construction)");
+          }
+          const recvT = this.dyn.dynRef();
+          const recv = this.acquireScratch(recvT);
+          this.walkExpr(e.args[0]!);
+          code.localSet(recv);
+          code.localGet(recv);
+          code.structGet(this.dyn.dynT(), DYN_KIND);
+          code.i32Const(DK.BYTES);
+          code.i32Eq();
+          this.openIfResult(this.strRef);
+          this.dyn.bytesPayloadBytes(code, (c) => c.localGet(recv));
+          code.call(this.bytesB.toStrHelper(encArg.value));
+          code.else_();
+          code.localGet(recv);
+          code.call(this.dyn.toStr());
+          this.close();
+          this.releaseScratch(recvT, recv);
+          return;
+        }
+        if (e.fn === "error.code") {
+          // PASS 2 (stream increment 22): `err.code` on an Error-rooted
+          // receiver (lower-builtins.ts's lowerErrorCodeProperty) — the
+          // `%code` slot every Error-hierarchy struct shares at field
+          // index 3 (this.exc()'s own layout comment: "vt, name,
+          // message, and the %code slot (null = absent)" — an OPEN
+          // struct, so reading field 3 through the %Error base type
+          // works for any subclass value too, WasmGC's ordinary
+          // open-struct subtyping). 2630's `(e as NodeJS.ErrnoException).
+          // code` is the first claim this tier reaches it from. Boxes
+          // into the string|undefined union exactly like `readable.
+          // flowing`'s own nullable-to-union pattern (this file's
+          // established precedent), just a string arm instead of bool.
+          if (e.type.kind !== "union") {
+            this.refuse("libCall:error.code:non-union-type", e.loc);
+            code.unreachable();
+            return;
+          }
+          const unionId = e.type.unionId;
+          const def = this.unionDef(unionId);
+          const undefTag = def.arms.findIndex((a) => a.kind === "undefinedT");
+          const strTag = def.arms.findIndex((a) => a.kind === "string");
+          if (undefTag < 0 || strTag < 0) {
+            this.refuse("libCall:error.code:unexpected-union-shape", e.loc);
+            code.unreachable();
+            return;
+          }
+          const strSt = this.unionArmStruct(unionId, strTag, e.loc);
+          const unionVal = this.mapType(e.type, e.loc);
+          const errInfo = this.classInfo("%Error", e.loc);
+          if (strSt === null || unionVal === null || errInfo === null) {
+            code.unreachable();
+            return;
+          }
+          const recvVal = this.classes.ref(errInfo);
+          const recv = this.acquireScratch(recvVal);
+          this.walkExpr(e.args[0]!);
+          code.localSet(recv);
+          code.localGet(recv);
+          code.structGet(errInfo.struct, 3);
+          code.refIsNull();
+          this.openIfResult(unionVal);
+          code.globalGet(this.unions.unitGlobal(undefTag));
+          code.else_();
+          code.i32Const(strTag);
+          code.localGet(recv);
+          code.structGet(errInfo.struct, 3);
+          code.refAsNonNull();
+          code.structNew(strSt);
+          this.close();
+          this.releaseScratch(recvVal, recv);
+          return;
+        }
+        if (e.fn === "error.nodeThrow") {
+          // PASS 2 (stream increment 22): an always-throwing Node-parity
+          // error expression (lowerer.ts's `nodeThrowExpr` — kind 0/1/2 =
+          // Error/TypeError/RangeError, an empty code meaning no code
+          // slot). Previously unimplemented on this backend entirely (no
+          // corpus program claimed by this tier had reached it yet);
+          // 2628's construction-time and push-time ERR_UNKNOWN_ENCODING
+          // throws are the first to need it. Mirrors the STATEMENT-level
+          // "runtimeFence"/"throw" cases exactly (emitSetCellErrorLit +
+          // emitUnwind) — the wasm mechanics (branch to the innermost
+          // try-handler, or return a placeholder with no handler) are
+          // identical in expression position: nothing pushes a value here
+          // because the branch/return makes whatever the caller emits
+          // next unreachable code, which wasm's own validator accepts
+          // regardless of type (the SAME reasoning this file's `throw`
+          // statement case already relies on).
+          const kindArg = e.args[0]!;
+          const codeArg = e.args[1]!;
+          const msgArg = e.args[2]!;
+          if (kindArg.kind !== "numLit" || codeArg.kind !== "strLit" || msgArg.kind !== "strLit") {
+            throw new Error("wasm emitter bug: error.nodeThrow args must be compile-time literals (nodeThrowExpr's own construction)");
+          }
+          const className = kindArg.value === 0 ? "%Error" : kindArg.value === 1 ? "%TypeError" : "%RangeError";
+          const name = kindArg.value === 0 ? "Error" : kindArg.value === 1 ? "TypeError" : "RangeError";
+          const codeLit = codeArg.value === "" ? null : codeArg.value;
+          this.emitSetCellErrorLit(className, name, msgArg.value, codeLit);
+          this.emitUnwind();
           return;
         }
         if (this.emitBufferLibCall(e)) return;
@@ -14787,6 +14945,16 @@ class Assembler {
         this.releaseScratch(this.dyn.dynRef(), dynLocal);
         return true;
       }
+      // emitter.onDataDyn: PASS 2 (stream increment 22) — lower-emitter.
+      // ts:356's own stream-'data' special case for a checked-dynamic
+      // listener (an unannotated `.on('data', cb)` in a JS source): the
+      // SAME registration body as onDyn (below), plus the stream-rooted
+      // onDataAdded/onReadableAdded side effect `emitter.on`/`emitter.
+      // onData` already share (line 14525's own check) — mirrored here
+      // since 'data'/'readable' are the only two names a dyn-adapted
+      // registration on a stream-rooted receiver needs (streamRooted
+      // gates it exactly like the plain path).
+      case "emitter.onDataDyn":
       case "emitter.onDyn": {
         // The lifted helper already ran emitter.checkListener AND built
         // `a` (the adapter) via dynCheck before this call — this arm is
@@ -14853,6 +15021,39 @@ class Assembler {
         this.walkExpr(prependArgD);
         code.call(this.events.entryAppend());
         this.emitPendingCheck(); // a newListener meta handler may have thrown
+        // PASS 2 CORRECTION (found via execution, not assumed): unlike
+        // the plain `emitter.on`/`onData` path, `nameArgD` here is NEVER
+        // a strLit — lower-emitter.ts's `lowerDynListenerCall` compiles
+        // ONE lifted helper function PER (receiver, adapter) type SHAPE,
+        // shared across every literal event name that shape reaches, so
+        // the name arrives as a plain runtime string parameter (`n.0`)
+        // inside that helper, not a per-call-site literal. A compile-time
+        // `nameArgD.kind === "strLit"` check (mirroring emitter.on's own)
+        // silently never fires, which is why the FIRST wasm build of this
+        // (before this fix) compiled and ran clean but produced NO 'data'
+        // output at all — the stream never left paused mode. Runtime
+        // string-equality against "data"/"readable" is the correct form.
+        if (recvTD.kind === "object" && this.classes.streamRooted(recvTD.className)) {
+          const nameLocalD = this.acquireScratch(this.strRef);
+          this.walkExpr(nameArgD);
+          code.localSet(nameLocalD);
+          code.localGet(nameLocalD);
+          this.pushStrLitInto(code, "data");
+          code.call(this.strEqHelper());
+          this.openIf();
+          code.localGet(recvD);
+          code.call(this.stream.onDataAdded());
+          code.else_();
+          code.localGet(nameLocalD);
+          this.pushStrLitInto(code, "readable");
+          code.call(this.strEqHelper());
+          this.openIf();
+          code.localGet(recvD);
+          code.call(this.stream.onReadableAdded());
+          this.close();
+          this.close();
+          this.releaseScratch(this.strRef, nameLocalD);
+        }
         code.localGet(recvD);
         this.releaseScratch(recvValD, recvD);
         this.releaseScratch(this.dyn.dynRef(), cbLocalD);
@@ -15242,6 +15443,9 @@ class Assembler {
           readableLength: () => this.stream.lengthOf(),
           readableHighWaterMark: () => this.stream.hwmOf(),
           "rs:emittedReadable": () => this.stream.emittedReadableOf(),
+          readableEnded: () => this.stream.readableEndedOf(),
+          destroyed: () => this.stream.destroyedOf(),
+          readableObjectMode: () => this.stream.readableObjectModeOf(),
         };
         const target = propTarget[nameArg.value];
         if (target === undefined) {
@@ -15253,8 +15457,132 @@ class Assembler {
         code.call(target());
         return true;
       }
+      /* ── PASS 2 ─────────────────────────────────────────────────────── */
+      case "readable.fromArr": {
+        // `Readable.from(array)` — lower-stream.ts's own single-source
+        // special case (a bare string/Buffer) already arrives here
+        // pre-wrapped as a one-element array, so this ONE path serves
+        // both. `strings` is always a compile-time boolLit (lower-
+        // stream.ts's own construction).
+        const stringsArg = e.args[1]!;
+        if (stringsArg.kind !== "boolLit") {
+          this.refuse("libCall:readable.fromArr:dynamic-strings-flag", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const strings = stringsArg.value;
+        const info = this.classInfo("%Readable", e.loc);
+        if (info === null) {
+          code.unreachable();
+          return true;
+        }
+        const recvVal = this.classes.ref(info);
+        this.emitAlloc(code, "%Readable", info);
+        const recv = this.acquireScratch(recvVal);
+        code.localSet(recv);
+        code.localGet(recv);
+        this.walkExpr(e.args[0]!);
+        code.call(this.stream.fromArrCore(strings));
+        code.localGet(recv);
+        this.releaseScratch(recvVal, recv);
+        return true;
+      }
+      case "readable.setEncoding": {
+        // Always a compile-time strLit (lower-stream.ts's own
+        // construction, both the construction-chaining and method-call
+        // forms) — dispatched HERE, by literal value, rather than at
+        // runtime: utf8 is the only ported encoding (measured — see
+        // stream.ts's RS_ENCODING header), anything else refuses by its
+        // own exact name, a compile-time fact, never a runtime branch.
+        const encArg = e.args[1]!;
+        if (encArg.kind !== "strLit") {
+          this.refuse("libCall:readable.setEncoding:dynamic-encoding", e.loc);
+          code.unreachable();
+          return true;
+        }
+        if (encArg.value !== "utf8") {
+          this.refuse(`libCall:readable.setEncoding:${encArg.value}`, e.loc);
+          code.unreachable();
+          return true;
+        }
+        this.walkExpr(e.args[0]!);
+        code.call(this.stream.setEncodingUtf8Core());
+        return true;
+      }
+      case "readable.pushEncoding": {
+        // The `defaultEncoding` option's follow-up (construction-chaining
+        // or super()) — sets RS_PUSH_ENC. All seven canonical encodings
+        // are admitted (pushStrCore's own dispatcher is exhaustive over
+        // ENC_NAMES), not just the ones 2628 exercises.
+        const encArg = e.args[1]!;
+        if (encArg.kind !== "strLit") {
+          this.refuse("libCall:readable.pushEncoding:dynamic-encoding", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const tag = encTagOf(encArg.value);
+        if (tag === null) {
+          this.refuse(`libCall:readable.pushEncoding:${encArg.value}`, e.loc);
+          code.unreachable();
+          return true;
+        }
+        this.walkExpr(e.args[0]!);
+        code.i32Const(tag);
+        code.call(this.stream.setPushEncCore());
+        return true;
+      }
+      case "readable.pushStrEnc": {
+        // `push(str, enc)`'s explicit per-call encoding — always a
+        // compile-time literal (lower-stream.ts:1519's own construction).
+        const encArg = e.args[2]!;
+        if (encArg.kind !== "strLit") {
+          this.refuse("libCall:readable.pushStrEnc:dynamic-encoding", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const tag = encTagOf(encArg.value);
+        if (tag === null) {
+          this.refuse(`libCall:readable.pushStrEnc:${encArg.value}`, e.loc);
+          code.unreachable();
+          return true;
+        }
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        code.i32Const(tag);
+        code.i32Const(0); // front
+        code.call(this.stream.pushStrEncCore());
+        return true;
+      }
+      case "readable.nextChunkDyn": {
+        // for-await's own primitive (lowerForAwaitReadable) — the
+        // receiver's static type is ALWAYS a genuine object type there
+        // (its own signature guarantees it), never dyn/jsval.
+        this.walkExpr(e.args[0]!);
+        code.call(this.stream.nextChunkDynCore());
+        return true;
+      }
+      case "sc.text":
+      case "sc.buffer":
+      case "sc.json": {
+        // The receiver's static type: at this tier, %Readable is the
+        // ONLY constructible stream-rooted class (every other root still
+        // refuses at construction — pass 1's own scope note), so a
+        // stream-sided "object" type here is always %Readable-compatible;
+        // anything else (a dyn/jsval receiver — lower-stream.ts admits
+        // those too, per its own streamSidesOf check) has no lowering yet.
+        if (e.args[0]!.type.kind !== "object") {
+          this.refuse(`libCall:${e.fn}:non-static-stream-type`, e.loc);
+          code.unreachable();
+          return true;
+        }
+        const kind = e.fn === "sc.text" ? SC_KIND_TEXT : e.fn === "sc.buffer" ? SC_KIND_BUFFER : SC_KIND_JSON;
+        this.walkExpr(e.args[0]!);
+        code.i32Const(kind);
+        code.call(this.stream.scRegisterCore());
+        return true;
+      }
       default:
-        if (e.fn.startsWith("readable.") || e.fn.startsWith("stream.")) {
+        if (e.fn.startsWith("readable.") || e.fn.startsWith("stream.") || e.fn.startsWith("sc.")) {
           this.refuse(`libCall:${e.fn}`, e.loc);
           code.unreachable();
           return true;
