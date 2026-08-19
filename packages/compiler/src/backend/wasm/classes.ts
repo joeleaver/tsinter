@@ -136,6 +136,15 @@ export interface ClassDeps {
    * the prefix verbatim" rule holds; events.ts owns the struct's layout,
    * classes.ts only spells its type. */
   emitterRegRef: () => ValType;
+  /** The stream state struct (stream.ts's `$rState`), nullable — the
+   * WasmGC translation of C's ScrStream's lazily-allocated stream-state
+   * pointer. Every %Readable-rooted class's struct (root AND every
+   * descendant) declares this as ONE MORE field past the emitter prefix,
+   * the same "repeat the prefix verbatim" rule `vt` and the emitter
+   * fields already follow. stream.ts owns the struct's layout, classes.ts
+   * only spells its type. Stage B, %Readable only — Writable/Duplex/
+   * Transform/PassThrough stay `class:extends-runtime` (see `rootKind`). */
+  streamStateRef: () => ValType;
 }
 
 export class ClassBuilder {
@@ -275,10 +284,30 @@ export class ClassBuilder {
    * itself or a user subclass)? The allocation site's own question: an
    * emitter-rooted struct carries the two injected prefix fields (registry,
    * display name) that `plan()` pushed past `vt`, which `emitAlloc` must
-   * seed alongside the class's own declared fields. */
+   * seed alongside the class's own declared fields. A %Readable-rooted
+   * class is ALSO emitter-rooted (its base chain reaches %EventEmitter
+   * through %Readable) — it carries the emitter prefix AND the stream
+   * field, so this answers true for both "emitter" and "stream". */
   emitterRooted(className: string): boolean {
     const meta = this.metaMap.get(className);
-    return meta !== undefined && this.rootKind(meta) === "emitter";
+    if (meta === undefined) return false;
+    const k = this.rootKind(meta);
+    return k === "emitter" || k === "stream";
+  }
+
+  /** Is this class stream-rooted — stage B's gate lift, %Readable ONLY
+   * (a user `extends Readable` subclass, or %Readable itself if it were
+   * ever planned directly, which it isn't — %Readable has no fields of
+   * its own to instantiate outside a user subclass). %Writable/%Duplex/
+   * %Transform/%PassThrough are NOT stream-rooted by this predicate —
+   * they keep refusing `class:extends-runtime` (see `rootKind`). The
+   * allocation site's question: a stream-rooted struct carries ONE MORE
+   * injected prefix field (the stream-state ref) past the emitter pair,
+   * which `emitAlloc` must seed to null (lazily allocated on first
+   * stream-state touch, exactly like the emitter registry). */
+  streamRooted(className: string): boolean {
+    const meta = this.metaMap.get(className);
+    return meta !== undefined && this.rootKind(meta) === "stream";
   }
 
   /** The vtable struct for one hierarchy ROOT: $ci's {pre, post} head
@@ -377,15 +406,25 @@ export class ClassBuilder {
   }
 
   /** Which family a class's base chain ends in — what decides whether a
-   * struct is emitted at all. STREAM classes are checked before EMITTER:
-   * every stream class's own base chain passes through %EventEmitter
-   * further up, so a stream-rooted class must be caught at the STREAM
-   * name it climbs through first — the gate lift is emitter-root ONLY,
-   * stream-rooted classes (including a stream's own subclasses) keep
-   * refusing `class:extends-runtime` exactly as before. */
-  private rootKind(meta: LlClassMeta): "user" | "error" | "emitter" | "runtime" {
+   * struct is emitted at all. %Readable is checked BEFORE the general
+   * RUNTIME_STREAM_CLASSES test: stage B lifts the gate for %Readable
+   * ONLY, so a class whose walk hits %Readable first (a direct `extends
+   * Readable`, or a grandchild of one — the walk keeps climbing past
+   * ordinary user classes) returns "stream" and gets planned. A class
+   * whose walk hits %Writable/%Duplex/%Transform/%PassThrough FIRST
+   * (a direct `extends Writable`/`Duplex`/... ) still returns "runtime"
+   * and refuses — those roots are stage C's, even though %Duplex's OWN
+   * base chain passes through %Readable further up (never reached: the
+   * loop returns at the first stream-family name it meets, exactly the
+   * "must be caught at the name it climbs through first" discipline the
+   * original stream/emitter split already established). Every stream
+   * class's base chain also passes through %EventEmitter further up
+   * still — never reached for the same reason once %Readable or the
+   * general stream check has already answered. */
+  private rootKind(meta: LlClassMeta): "user" | "error" | "emitter" | "stream" | "runtime" {
     for (let m: LlClassMeta | null = meta; m !== null; m = m.base) {
       if (RUNTIME_ERROR_CLASSES.has(m.def.name)) return "error";
+      if (m.def.name === "%Readable") return "stream";
       if (RUNTIME_STREAM_CLASSES.has(m.def.name)) return "runtime";
       if (m.def.name === RUNTIME_EMITTER_CLASS) return "emitter";
       if (m.def.runtime === true) return "runtime";
@@ -430,9 +469,15 @@ export class ClassBuilder {
     // wasm-subtyping "repeat the prefix verbatim" rule `vt` itself
     // follows) carries two extra fields past `vt`: the registry ref and
     // the display-name slot (nodes.ts:945-957's contract, translated to a
-    // WasmGC nominal supertype rather than C's layout embedding).
-    const emitterRooted = this.rootKind(meta) === "emitter";
-    const prefixCount = (meta.hierarchy ? 1 : 0) + (emitterRooted ? 2 : 0);
+    // WasmGC nominal supertype rather than C's layout embedding). A
+    // %Readable-rooted class is emitter-rooted TOO (nodes.ts:960-973 —
+    // one shared ScrEmitter-shaped prefix) and carries ONE MORE field
+    // past that pair: the stream-state ref (lazily allocated, exactly
+    // like the registry itself).
+    const kind = this.rootKind(meta);
+    const emitterRooted = kind === "emitter" || kind === "stream";
+    const streamRooted = kind === "stream";
+    const prefixCount = (meta.hierarchy ? 1 : 0) + (emitterRooted ? 2 : 0) + (streamRooted ? 1 : 0);
     const fieldBase = prefixCount;
     const info: ClassInfo = {
       meta,
@@ -451,6 +496,9 @@ export class ClassBuilder {
     if (emitterRooted) {
       fields.push({ storage: this.deps.emitterRegRef(), mutable: true });
       fields.push({ storage: this.deps.softType(STRING), mutable: false });
+    }
+    if (streamRooted) {
+      fields.push({ storage: this.deps.streamStateRef(), mutable: true });
     }
     meta.def.fields.forEach((f, i) => {
       fields.push(errPrefix?.[i + 1] ?? { storage: this.deps.softType(f.type), mutable: true });

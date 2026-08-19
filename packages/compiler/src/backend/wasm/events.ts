@@ -41,8 +41,15 @@
  * libCall:emitter.listeners but it also needs node:assert behind that,
  * and the warning's pid-bearing text is unpinnable on exit-0 stderr —
  * the S-entry drafts for both native divergences sit unfiled in the
- * session archive until the code exists), and shape-mode reservation
- * (stage B's stream prerequisite).
+ * session archive until the code exists), and shape-mode reservation.
+ * STAGE-B UPDATE: stream construction does NOT reserve shape-mode keys
+ * either, despite REG_SHAPE existing for exactly that — stage B's claim
+ * set lost its only shape-mode-observing program (2626) to the Writable-
+ * contamination ruling (its `new Writable`/`new Duplex` siblings pushed
+ * it to stage C), so nothing left in-tier can execution-pin the
+ * reservation machinery or the eventNames() error-bucket merge shape
+ * mode needs. Both land together whenever 2626 becomes claimable (stage
+ * C, once Writable exists) — REG_SHAPE stays reserved-but-0 until then.
  *
  * SNAPSHOT DISPATCH NEEDS NO MANUAL REFCOUNTING under WasmGC: a snapshot
  * array of entry REFERENCES keeps every entry it holds alive regardless

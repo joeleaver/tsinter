@@ -1562,7 +1562,12 @@ export function lowerStreamMethodCall(L: Lowerer, call: ts.CallExpression,
     requireSide(readableSide, "read");
     if (args.length > 1) L.noLowering(`read with ${args.length} arguments`, call);
     const receiver = L.lowerExpr(access.expression);
-    const size = args[0] ? L.lowerExprExpecting(args[0], F64) : f64Lit(-1, loc);
+    // NaN, not -1 — Node's own absent-size convention (`n === undefined
+    // → n = NaN`, `Readable.prototype.read`'s own coercion), and NaN
+    // never collides with a real (even negative) size argument the way
+    // -1 did (D1: read(-1) was answering the WHOLE buffer instead of
+    // null — both compiled lanes shared this sentinel).
+    const size = args[0] ? L.lowerExprExpecting(args[0], F64) : f64Lit(NaN, loc);
     const type: IrType = unionOf(L, [BYTES, { kind: "nullT" }]);
     const read: IrExpr = { kind: "libCall", fn: "readable.read", args: [receiver, size], type, loc };
     return L.maybeNarrow(read, call);

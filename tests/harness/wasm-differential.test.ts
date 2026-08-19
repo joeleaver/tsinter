@@ -1976,6 +1976,83 @@ const TIER_FLOOR: string[] = [
   // fire per-entry 'removeListener' — unexercised by any claim here.
   // Tier 681→682.
   "1647-ee-meta-events.ts",
+  // Increment 22 stage B, pass 1 (the Readable state machine — classes.
+  // ts's stream-root gate lift for %Readable ONLY, stream.ts's $rState
+  // struct + private tick FIFO riding nexttick.ts's stage-0 raw-marker
+  // seam, construction/push/read/pause/resume/flow + the direct-emit
+  // fast path, destroy's default path, the underscore `_read` dispatch,
+  // and the scalar/flowing/errored property surface). Phase-2 predicted
+  // 9 claims, landed exactly 9 — zero net-new refusals anywhere else in
+  // the corpus (measured: the full 1069-program run's only failure was
+  // this list itself, before the addition).
+  //
+  // CONTAMINATION RULING (the Phase-2 correction): 12 more stream-family
+  // programs than pipe/unpipe (1692/1693) turned out to construct a
+  // Writable/Duplex ALONGSIDE their Readable content in the SAME file
+  // (source-verified real construction sites, not filename guesses) —
+  // 1694, 1695, 1699, 1744, 1747, 1810, 1811, 1812, 2100, 2312, 2313,
+  // 2626 — so they stay refused (`writable.new`/`writable.init`/etc)
+  // THIS stage regardless of Readable completeness; they move to stage
+  // C's pre-verified population alongside 1692/1693, 1743 (writable.init
+  // — its Readable-half vtable-dispatch mechanism is exercised and
+  // validated via 1740 instead), 1815 (writable.new), and 2634
+  // (passthrough.new). 2310 stays refused for an UNRELATED reason
+  // (libCall:process.onExit, issue #65 — not a stream/EE gap). 2599
+  // needs stream.finished + node:net + Duplex + Readable.toWeb, none in
+  // scope — stage D territory.
+  //
+  // SHAPE-MODE DEFERRAL: the stage-B brief's "shape-mode reservation
+  // lands NOW" line was written when 2626 was still a stage-B claim;
+  // once the contamination ruling moved 2626 to stage C, NOTHING left in
+  // this stage's claim set exercises the reservation machinery or
+  // events.ts's eventNames() error-bucket merge (grepped all 9 — only
+  // 1761 calls eventNames(), and only on a plain EventEmitter, never a
+  // Readable; 1761's own special-name-lookup story is frontend-fixed and
+  // needs neither). Both land together in stage C with 2626 as their
+  // pinner (events.ts's REG_SHAPE header carries this forward).
+  //
+  // TWO CORRECTIONS TO NODE DEFAULTS FOUND WHILE LANDING: (1) the
+  // frontend's "no explicit highWaterMark" sentinel is -1 (the head's
+  // hwm slot), resolved here to Node's REAL default — 65536 on non-
+  // Windows since node#52037 (measured directly against v24.18.1;
+  // win32's 16384 split is not modeled, no win32 target this tier) —
+  // storing the sentinel verbatim silently poisoned every `length < hwm`
+  // comparison downstream (a wrong-in-a-different-way bug the census
+  // alone would not have caught, since every claim here pushes far below
+  // either threshold). (2) `unshift()`'s EOF guard is NOT `push()`'s:
+  // Node's real `readableAddChunk` checks `state.endEmitted` for the
+  // FRONT path (ERR_STREAM_UNSHIFT_AFTER_END_EVENT) and `state.ended`/
+  // `state.destroyed` for the back path — DIFFERENT flags — so a push(){}
+  // -after-EOF path applied to unshift() would wrongly refuse a legal
+  // `unshift()` called from a 'readable'/'data' handler that runs after
+  // `push(null)` already set `ended` but before 'end' has emitted
+  // (1686's pin). unshift/unshiftStr RECLASSIFIED from the design doc's
+  // pass-2 grouping to pass 1: trivial once push's front parameter
+  // exists, and 1686 (a pass-1 target) needs it.
+  //
+  // TWO MORE Node-exact orderings measured directly (both diverge from
+  // this file's own first-draft assumptions, caught by the corpus, not
+  // predicted): a push() reached SYNCHRONOUSLY in the SAME top-level
+  // stack that registered a 'data'/'readable' listener does NOT take the
+  // direct-emit fast path even once `flowing` already reads `true`
+  // (Node's real per-instance `state.sync`, broader than "mid a `_read`
+  // call" — RS_SYNC, cleared by this stream's own first tick, 1687's
+  // pin); and `push(null)` reached from OUTSIDE a synchronous `_read`
+  // frame synchronously drains a flowing stream right there rather than
+  // waiting for the resume/readable tick (scr_stream.c's "outside a
+  // _read call it runs NOW" — gated by the SAME RS_SYNC, since the
+  // ungated version regressed 1685/1697 before the gate was added).
+  //
+  // Tier 682→691.
+  "1685-stream-readable-basics.ts",
+  "1686-stream-readable-paused.ts",
+  "1687-stream-readable-flow-control.ts",
+  "1696-stream-read-inside-read.ts",
+  "1697-stream-tick-vs-timer.ts",
+  "1698-stream-uncaught-error.ts",
+  "1740-stream-extends-readable.ts",
+  "1761-emitter-special-event-names.cjs",
+  "2572-readable-emitted-readable-flag.cjs",
 ];
 
 interface RunResult {

@@ -141,6 +141,7 @@ import { BytesBuilder, type BytesElem } from "./typedarrays.js";
 import { TimerBuilder } from "./timers.js";
 import { NextTickBuilder } from "./nexttick.js";
 import { EventsBuilder, EMITTER_REG, EMITTER_NAME } from "./events.js";
+import { StreamBuilder, RS_HWM, RS_AUTO_DESTROY, RS_EMIT_CLOSE, RS_READ_CLOS, RS_READ_THUNK } from "./stream.js";
 import { UnionBuilder, type UnionArmRep } from "./unions.js";
 import { Code } from "./code.js";
 import { buildF64ToStr } from "./numfmt.js";
@@ -2781,6 +2782,111 @@ class Assembler {
     return this.eventsField;
   }
 
+  /* ── the Readable stream state machine (stream.ts) ────────────────────
+   * Interned by the first %Readable-rooted class/libCall — a module that
+   * never touches node:stream pays nothing. See stream.ts's own header
+   * for the scheduling model (nexttick.ts's raw-marker seam) and the
+   * emitData ABI decision (events.ts's general dispatch, no new
+   * machinery). */
+
+  private streamField: StreamBuilder | null = null;
+
+  private get stream(): StreamBuilder {
+    this.streamField ??= new StreamBuilder(this.mb, {
+      rootRef: () => this.classes.ref(this.classes.info("%Readable", undefined, false)!),
+      rootStruct: () => this.classes.info("%Readable", undefined, false)!.struct,
+      bytesRef: () => this.bytesB.bytesRef(),
+      strRef: () => this.strRef,
+      bytesLength: () => this.bytesB.length(),
+      bytesSlice: () => this.bytesB.sliceHelper("u8"),
+      bytesFromStrUtf8: () => this.bytesB.fromStrHelper("utf8"),
+      bytesNewLen: () => this.bytesB.newLen("u8"),
+      bytesBufType: () => this.bytesB.bufType(),
+      bytesStructType: () => this.bytesB.bytesType(),
+      errRef: () => ({ kind: "ref", nullable: true, typeIndex: this.exc().errT }),
+      excKind: () => this.exc().kindG,
+      dynArrRef: () => this.dyn.arrRef(),
+      dynArrBufType: () => this.dynArgsBufType(),
+      dynArrStructType: () => this.dynArrStructType(),
+      boxBytes: (c, pushPayload) => this.dyn.boxBytes(c, pushPayload),
+      pushBytesPayload: (c, pushBytes) => this.dyn.pushNewBytesPayload(c, pushBytes, (cc) => cc.i32Const(1)),
+      emitDispatch: () => this.events.emitDispatch(),
+      countOf: () => this.events.countOf(),
+      hasErrorListeners: () => this.events.hasErrorListeners(),
+      errDispatch: () => this.events.errDispatch(),
+      lit: (c, s) => this.pushStrLitInto(c, s),
+      buildErrorLit: (c, className, name, pushMessage, codeLit) => {
+        // The construction half of emitSetCellError, WITHOUT the cell
+        // commit — leaves a fresh error VALUE on the stack (stream.ts's
+        // own errors, e.g. ERR_STREAM_PUSH_AFTER_EOF, which route through
+        // destroy rather than throwing at the push() call site).
+        const exc = this.exc();
+        c.globalGet(this.classes.vtGlobal(className));
+        this.pushStrLitInto(c, name);
+        pushMessage(c);
+        if (codeLit !== null) this.pushStrLitInto(c, codeLit);
+        else c.refNull(this.strType);
+        c.structNew(exc.errT);
+      },
+      setUncaughtError: (c, pushErr) => {
+        // Commits an already-DYNAMICALLY-typed error reference to the
+        // exception cell as an uncaught throw — emitDynamicPre's shape,
+        // hand-inlined (that method reads `this.fn.code` implicitly and
+        // cannot be reused from a standalone helper's own Code buffer).
+        // NO SCRATCH LOCAL: this dep is called from stream.ts's own
+        // hand-built functions (opError), which have their OWN Code
+        // buffer and local numbering — `acquireScratch` allocates against
+        // whatever `this.fn` happens to be at MODULE-BUILD time, an
+        // unrelated function, which is exactly the "invalid local index"
+        // bug this fixes. `pushErr` is always a cheap, side-effect-free
+        // field read at every call site (stream.ts's own contract), so
+        // evaluating it twice is both safe and avoids the local entirely.
+        const exc = this.exc();
+        const errInfo = this.classInfo("%Error", undefined);
+        if (errInfo === null) throw new Error("wasm emitter bug: %Error has no shape for stream.setUncaughtError");
+        pushErr(c);
+        c.structGet(errInfo.struct, CLASS_VT);
+        c.structGet(this.classes.ci(), CI_PRE);
+        c.globalSet(exc.preG);
+        pushErr(c);
+        c.globalSet(exc.refG);
+        c.i32Const(EXC_OBJ);
+        c.globalSet(exc.kindG);
+      },
+      tryCatchAsError: (c) => {
+        // D2: `callRead`'s try/catch equivalent — no scratch locals (the
+        // SAME gotcha `setUncaughtError` documents above: this runs
+        // inside stream.ts's own hand-built functions, whose local
+        // numbering is unrelated to `this.fn` at module-build time).
+        // Every intermediate value stays on the wasm operand stack; the
+        // cell-clearing globalSets below are self-contained (their own
+        // push+store pairs) and never disturb whatever's already
+        // sitting on the stack beneath them.
+        const exc = this.exc();
+        const errRefType: ValType = { kind: "ref", nullable: true, typeIndex: exc.errT };
+        c.globalGet(exc.kindG);
+        c.i32Const(EXC_OBJ);
+        c.i32Eq();
+        c.ifResult(I32);
+        c.globalGet(exc.preG);
+        this.emitErrIntervalTest(c);
+        c.else_();
+        c.i32Const(0);
+        c.end();
+        c.ifResult(errRefType);
+        c.globalGet(exc.refG);
+        c.refCast(exc.errT);
+        this.emitCellClearInto(c);
+        c.else_();
+        c.refNull(exc.errT);
+        c.end();
+      },
+      enqueueRaw: () => this.nextTick.enqueueRaw(),
+      rawFnType: () => this.nextTick.rawFnType(),
+    });
+    return this.streamField;
+  }
+
   private errThunkFns = new Map<string, number>();
 
   /** The 'error' bucket's own arity-adapting thunk (events.ts's
@@ -2812,6 +2918,53 @@ class Assembler {
     c.structGet(pair.clos, 0);
     c.callRef(pair.fn);
     if (t.ret.kind !== "void") c.drop(); // Node ignores listener return values
+    this.mb.setBody(idx, [closRef], c.bytes());
+    return idx;
+  }
+
+  private readThunkFns = new Map<string, number>();
+
+  /** The underscore `_read`'s own arity-adapting thunk (stream.ts's
+   * readThunkSig: `(clos: eq, size: f64) -> void`) — errThunkFor's exact
+   * pattern, for a `_read` declared `()` or `(size: number)` (the
+   * "declares any prefix of the Node signature" rule). */
+  private readThunkFor(t: IrType & { kind: "func" }, loc: SrcLoc | undefined): number | null {
+    const key = typeKey(t);
+    const hit = this.readThunkFns.get(key);
+    if (hit !== undefined) return hit;
+    const pair = this.closSigFor(t, loc);
+    if (pair === null) return null;
+    // streamMethodWrapper's own shape: `(this, ...prefix) => ret` — the
+    // receiver is params[0], a REAL declared parameter (not captured in
+    // the closure's environment), so the thunk must carry it across
+    // explicitly and downcast it from the generic %Readable root to the
+    // DECLARING class (this signature's own `this` type — a strict
+    // ancestor-or-self of every instance whose vtable/construction ever
+    // stores this exact thunk, so the cast never traps).
+    const thisParam = t.params[0];
+    if (thisParam === undefined) {
+      throw new Error("wasm emitter bug: a _read closure's lifted type has no `this` parameter");
+    }
+    const thisT = this.mapType(thisParam, loc);
+    if (thisT === null || thisT.kind !== "ref") return null;
+    const idx = this.mb.declareFunc(this.stream.readThunkSig(), `%w.rs.readThunk:${key}`);
+    this.readThunkFns.set(key, idx);
+    const c = new Code();
+    const CLOS = 0, THIS = 1, SIZE = 2, CL = 3;
+    const closRef: ValType = { kind: "ref", nullable: true, typeIndex: pair.clos };
+    c.localGet(CLOS);
+    c.refCast(pair.clos);
+    c.localSet(CL);
+    c.localGet(CL); // arg0: the closure itself (selfRef, env)
+    c.localGet(THIS);
+    c.refCast(thisT.typeIndex); // arg1: `this`, downcast to the declaring class
+    if (t.params.length === 2) {
+      c.localGet(SIZE); // arg2: the optional `size` param
+    }
+    c.localGet(CL);
+    c.structGet(pair.clos, 0);
+    c.callRef(pair.fn);
+    if (t.ret.kind !== "void") c.drop();
     this.mb.setBody(idx, [closRef], c.bytes());
     return idx;
   }
@@ -5078,6 +5231,7 @@ class Assembler {
           return { struct: exc.errT, fields: exc.errFields };
         },
         emitterRegRef: () => this.events.regRef(),
+        streamStateRef: () => this.stream.stateRef(),
       },
     );
     return this.classesField;
@@ -5342,6 +5496,12 @@ class Assembler {
       c.refNull(this.eventsRegType());
       this.pushStrLitInto(c, className.startsWith("%") ? className.slice(1) : className);
     }
+    if (this.classes.streamRooted(className)) {
+      // The stream-state prefix's own field (nodes.ts:960-973): starts
+      // absent, lazily allocated on first touch (stream.ts's stateEnsure)
+      // exactly like the emitter registry just above.
+      c.refNull(this.streamStateType());
+    }
     for (const f of info.meta.def.fields) this.emitFieldSeed(c, f.type);
     c.structNew(info.struct);
   }
@@ -5351,6 +5511,14 @@ class Assembler {
   private eventsRegType(): number {
     const ref = this.events.regRef();
     if (ref.kind !== "ref") throw new Error("wasm emitter bug: eeReg is not a ref type");
+    return ref.typeIndex;
+  }
+
+  /** The stream state struct's own type index (stream.ts's `$rState`) —
+   * `refNull` needs the raw index, the eventsRegType twin. */
+  private streamStateType(): number {
+    const ref = this.stream.stateRef();
+    if (ref.kind !== "ref") throw new Error("wasm emitter bug: rState is not a ref type");
     return ref.typeIndex;
   }
 
@@ -8540,6 +8708,7 @@ class Assembler {
         if (this.emitBufferLibCall(e)) return;
         if (this.emitTimerCall(e)) return;
         if (this.emitEmitterLibCall(e)) return;
+        if (this.emitStreamLibCall(e)) return;
         this.refuse(`libCall:${e.fn}`, e.loc);
         code.unreachable();
         return;
@@ -14164,6 +14333,15 @@ class Assembler {
         code.drop();
         return true;
       }
+      // emitter.onData: lower-emitter.ts's OWN special case for a
+      // stream-rooted receiver's 'data' listener (a chunk param typed
+      // `bytes<u8>` or `string`, never the general dyn-array tuple) —
+      // args are the IDENTICAL [receiver, "data" strLit, cb, once,
+      // prepend] shape `emitter.on` already takes (line 663's own
+      // construction), so it rides the exact same body; the stream-
+      // rooted 'data'-name hook below already keys off `nameArg0.value`
+      // generically and needs no separate case to find it.
+      case "emitter.onData":
       case "emitter.on": {
         const nameArg0 = e.args[1]!;
         const onceArg = e.args[3]!;
@@ -14231,6 +14409,28 @@ class Assembler {
         code.i32Const(prependArg.value ? 1 : 0);
         code.call(this.events.entryAppend());
         this.emitPendingCheck(); // a newListener meta handler may have thrown
+        // Readable's `.on('data'/'readable', cb)` side effect (Node's own
+        // `Readable.prototype.on` override) — a STREAM-rooted receiver
+        // only (classes.ts's gate-lift predicate; %Writable/%Duplex/...
+        // stay refused before ANY libCall reaches here, so this can only
+        // ever see %Readable or a subclass). A dynamic (non-literal) name
+        // on a stream receiver refuses by name rather than silently
+        // skipping the side effect — no claim needs it, and guessing
+        // would be a silent miscompile risk.
+        if (recvT.kind === "object" && this.classes.streamRooted(recvT.className)) {
+          if (nameArg0.kind !== "strLit") {
+            this.refuse("libCall:emitter.on:stream-dynamic-name", e.loc);
+            code.unreachable();
+            return true;
+          }
+          if (nameArg0.value === "data") {
+            code.localGet(recv);
+            code.call(this.stream.onDataAdded());
+          } else if (nameArg0.value === "readable") {
+            code.localGet(recv);
+            code.call(this.stream.onReadableAdded());
+          }
+        }
         code.localGet(recv); // chaining: `return this`
         this.releaseScratch(recvVal, recv);
         return true;
@@ -14693,6 +14893,368 @@ class Assembler {
       }
       default:
         if (e.fn.startsWith("emitter.")) {
+          this.refuse(`libCall:${e.fn}`, e.loc);
+          code.unreachable();
+          return true;
+        }
+        return false;
+    }
+  }
+
+  /** node:stream's Readable (stream.ts) — PASS 1 SCOPE: readable.new/init
+   * (STATIC literal-options form only — a dynamic `flags` operand or a
+   * present `destroy` closure both refuse by name, the file's own
+   * header), push/pushStr/pushNull/unshift/unshiftStr, read, pause/
+   * resume/isPaused, destroy/destroyErr, stream.prop's pass-1 names,
+   * readable.flowing, stream.errored. Every other `readable.*`/
+   * `stream.*` name refuses by its own name in the `default` arm —
+   * never silently mishandled. */
+  private emitStreamLibCall(e: Extract<IrExpr, { kind: "libCall" }>): boolean {
+    const code = this.fn.code;
+    switch (e.fn) {
+      case "readable.new":
+      case "readable.init": {
+        const isInit = e.fn === "readable.init";
+        const base = isInit ? 1 : 0;
+        const flagsArg = e.args[base + 3]!;
+        if (flagsArg.kind !== "numLit") {
+          this.refuse(`libCall:${e.fn}:dynamic-flags`, e.loc);
+          code.unreachable();
+          return true;
+        }
+        const flags = flagsArg.value;
+        const hasRead = (flags & 1) !== 0;
+        const hasDestroy = (flags & 2) !== 0;
+        if (!hasRead) {
+          this.refuse(`libCall:${e.fn}:no-read`, e.loc);
+          code.unreachable();
+          return true;
+        }
+        if (hasDestroy) {
+          this.refuse(`libCall:${e.fn}:destroy-cb`, e.loc);
+          code.unreachable();
+          return true;
+        }
+        const readCbExpr = e.args[base + 4]!;
+        if (readCbExpr.type.kind !== "func") {
+          this.refuse(`libCall:${e.fn}:non-func-read`, e.loc);
+          code.unreachable();
+          return true;
+        }
+        const readThunkIdx = this.readThunkFor(readCbExpr.type, e.loc);
+        if (readThunkIdx === null) {
+          code.unreachable();
+          return true;
+        }
+        this.mb.declareFuncRef(readThunkIdx);
+        let recvVal: ValType;
+        if (isInit) {
+          const rv = this.mapType(e.args[0]!.type, e.loc);
+          if (rv === null) {
+            code.unreachable();
+            return true;
+          }
+          recvVal = rv;
+          this.walkExpr(e.args[0]!);
+        } else {
+          const info = this.classInfo("%Readable", e.loc);
+          if (info === null) {
+            code.unreachable();
+            return true;
+          }
+          recvVal = this.classes.ref(info);
+          this.emitAlloc(code, "%Readable", info);
+        }
+        const recv = this.acquireScratch(recvVal);
+        code.localSet(recv);
+        code.localGet(recv);
+        code.call(this.stream.stateEnsure());
+        const st = this.acquireScratch(this.stream.stateRef());
+        code.localSet(st);
+        code.localGet(st);
+        // hwm: lower-stream.ts's OWN "no explicit highWaterMark" sentinel
+        // is -1 (measured: the head's hwm slot carries -1 when the
+        // options record omits the field) — this file resolves it to
+        // Node's real default (65536 on non-Windows since node#52037,
+        // v24's own runtime default — measured directly:
+        // `new Readable({read(){}}).readableHighWaterMark === 65536`;
+        // objectMode is always-false per the frontend's own fence, so the
+        // object-mode default of 16 never applies) rather than storing
+        // the sentinel verbatim, which would otherwise poison every
+        // `length < hwm` comparison downstream. Windows' 16384 is a
+        // platform split this tier does not model (no win32 target).
+        const hwmLocal = this.acquireScratch(F64);
+        this.walkExpr(e.args[base + 0]!);
+        code.localSet(hwmLocal);
+        code.localGet(hwmLocal);
+        code.f64Const(0);
+        code.f64Lt();
+        this.openIfResult(F64);
+        code.f64Const(65536);
+        code.else_();
+        code.localGet(hwmLocal);
+        this.close();
+        this.releaseScratch(F64, hwmLocal);
+        code.structSet(this.stream.stateT(), RS_HWM);
+        code.localGet(st);
+        this.walkExpr(e.args[base + 1]!); // autoDestroy
+        code.structSet(this.stream.stateT(), RS_AUTO_DESTROY);
+        code.localGet(st);
+        this.walkExpr(e.args[base + 2]!); // emitClose
+        code.structSet(this.stream.stateT(), RS_EMIT_CLOSE);
+        code.localGet(st);
+        this.walkExpr(readCbExpr);
+        code.structSet(this.stream.stateT(), RS_READ_CLOS);
+        code.localGet(st);
+        code.refFunc(readThunkIdx);
+        code.structSet(this.stream.stateT(), RS_READ_THUNK);
+        if (isInit) {
+          this.releaseScratch(this.stream.stateRef(), st);
+          this.releaseScratch(recvVal, recv);
+          return true; // void
+        }
+        code.localGet(recv);
+        this.releaseScratch(this.stream.stateRef(), st);
+        this.releaseScratch(recvVal, recv);
+        return true;
+      }
+      case "readable.push":
+      case "readable.pushStr": {
+        const recvT = e.args[0]!.type;
+        const recvVal = this.mapType(recvT, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        code.i32Const(0); // front
+        code.call(e.fn === "readable.push" ? this.stream.pushCore() : this.stream.pushStrCore());
+        return true;
+      }
+      case "readable.pushNull": {
+        this.walkExpr(e.args[0]!);
+        code.call(this.stream.pushNullCore());
+        return true;
+      }
+      case "readable.unshift":
+      case "readable.unshiftStr": {
+        const recvT = e.args[0]!.type;
+        const recvVal = this.mapType(recvT, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        code.i32Const(1); // front
+        code.call(e.fn === "readable.unshift" ? this.stream.pushCore() : this.stream.pushStrCore());
+        code.drop(); // VOID return — the push-more answer is not observed
+        return true;
+      }
+      case "readable.read": {
+        // `Buffer | null` is a genuine 2-arm union on this backend (not a
+        // bare nullable ref — the null arm is its own tagged unit, the
+        // bytes arm its own tagged payload struct), so readCore's raw
+        // nullable-bytes answer needs boxing here, the exact readable.
+        // flowing pattern with a bytes payload arm instead of bool.
+        if (e.type.kind !== "union") {
+          this.refuse("libCall:readable.read:non-union-type", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const unionId = e.type.unionId;
+        const def = this.unionDef(unionId);
+        const nullTag = def.arms.findIndex((a) => a.kind === "nullT");
+        const bytesTag = def.arms.findIndex((a) => a.kind === "bytes");
+        if (nullTag < 0 || bytesTag < 0) {
+          this.refuse("libCall:readable.read:unexpected-union-shape", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const bytesSt = this.unionArmStruct(unionId, bytesTag, e.loc);
+        if (bytesSt === null) {
+          code.unreachable();
+          return true;
+        }
+        const unionVal = this.mapType(e.type, e.loc);
+        if (unionVal === null) {
+          code.unreachable();
+          return true;
+        }
+        const recvVal = this.mapType(e.args[0]!.type, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        const recv = this.acquireScratch(recvVal);
+        this.walkExpr(e.args[0]!);
+        code.localSet(recv);
+        const n = this.acquireScratch(F64);
+        this.walkExpr(e.args[1]!);
+        code.localSet(n);
+        code.localGet(recv);
+        code.localGet(n);
+        // ABSENT = isNaN(n), i.e. n !== n — Node's own absent-size
+        // sentinel (lower-stream.ts's `f64Lit(NaN, ...)` for a bare
+        // `.read()`), NOT `n < 0` (D1: the old sentinel collided with a
+        // real negative `.read(-1)`, wrongly answering the whole buffer
+        // instead of null — a real negative size is never NaN, so this
+        // check never fires for it).
+        code.localGet(n);
+        code.localGet(n);
+        code.f64Ne();
+        code.call(this.stream.readCore());
+        const raw = this.acquireScratch(this.bytesB.bytesRef());
+        code.localSet(raw);
+        code.localGet(raw);
+        code.refIsNull();
+        this.openIfResult(unionVal);
+        code.globalGet(this.unions.unitGlobal(nullTag));
+        code.else_();
+        code.i32Const(bytesTag);
+        code.localGet(raw);
+        code.structNew(bytesSt);
+        this.close();
+        this.releaseScratch(this.bytesB.bytesRef(), raw);
+        this.releaseScratch(F64, n);
+        this.releaseScratch(recvVal, recv);
+        return true;
+      }
+      case "readable.pause":
+      case "readable.resume":
+      case "readable.isPaused": {
+        const recvT = e.args[0]!.type;
+        const recvVal = this.mapType(recvT, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        if (e.fn === "readable.isPaused") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.stream.isPausedCore());
+          return true;
+        }
+        const recv = this.acquireScratch(recvVal);
+        this.walkExpr(e.args[0]!);
+        code.localTee(recv);
+        code.call(e.fn === "readable.pause" ? this.stream.pauseCore() : this.stream.resumeCore());
+        code.localGet(recv); // chaining: `return this`
+        this.releaseScratch(recvVal, recv);
+        return true;
+      }
+      case "stream.destroy":
+      case "stream.destroyErr": {
+        const recvT = e.args[0]!.type;
+        const recvVal = this.mapType(recvT, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        const recv = this.acquireScratch(recvVal);
+        this.walkExpr(e.args[0]!);
+        code.localTee(recv);
+        if (e.fn === "stream.destroyErr") {
+          this.walkExpr(e.args[1]!);
+          code.call(this.stream.destroyErrCore());
+        } else {
+          // destroyCore's own signature is ONE param (root) — it fills
+          // the null error itself internally (see stream.ts). Feeding it
+          // an extra refNull here (the bug: an unconditional refNull
+          // shared with the destroyErr arm) left a dangling stack value
+          // destroyCore's 1-param signature never consumes — invalid
+          // wasm, the N2 lesson recurring: an emitted branch with no
+          // execution pin (no pass-1 claim calls the no-arg `destroy()`
+          // form) shipped unvalidated.
+          code.call(this.stream.destroyCore());
+        }
+        code.localGet(recv);
+        this.releaseScratch(recvVal, recv);
+        return true;
+      }
+      case "readable.flowing": {
+        // -1/0/1 -> null/false/true, boxed into the declared `boolean |
+        // null` union (readableFlowing's own IR return type carries the
+        // union id — the SAME box/tag machinery every other nullable
+        // union on this backend uses, unions.ts's unitGlobal for the
+        // payload-less null arm, structNew for the bool payload arm).
+        if (e.type.kind !== "union") {
+          this.refuse("libCall:readable.flowing:non-union-type", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const unionId = e.type.unionId;
+        const def = this.unionDef(unionId);
+        const nullTag = def.arms.findIndex((a) => a.kind === "nullT");
+        const boolTag = def.arms.findIndex((a) => a.kind === "bool");
+        if (nullTag < 0 || boolTag < 0) {
+          this.refuse("libCall:readable.flowing:unexpected-union-shape", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const boolSt = this.unionArmStruct(unionId, boolTag, e.loc);
+        if (boolSt === null) {
+          code.unreachable();
+          return true;
+        }
+        const unionVal = this.mapType(e.type, e.loc);
+        if (unionVal === null) {
+          code.unreachable();
+          return true;
+        }
+        this.walkExpr(e.args[0]!);
+        code.call(this.stream.flowingRaw());
+        const raw = this.acquireScratch(I32);
+        code.localSet(raw);
+        code.localGet(raw);
+        code.i32Const(-1);
+        code.i32Eq();
+        this.openIfResult(unionVal);
+        code.globalGet(this.unions.unitGlobal(nullTag));
+        code.else_();
+        code.i32Const(boolTag);
+        code.localGet(raw);
+        code.i32Const(1);
+        code.i32Eq();
+        code.structNew(boolSt);
+        this.close();
+        this.releaseScratch(I32, raw);
+        return true;
+      }
+      case "stream.errored": {
+        this.walkExpr(e.args[0]!);
+        code.call(this.stream.erroredOf());
+        return true;
+      }
+      case "stream.prop": {
+        const nameArg = e.args[1]!;
+        if (nameArg.kind !== "strLit") {
+          this.refuse("libCall:stream.prop:dynamic-name", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const recvVal = this.mapType(e.args[0]!.type, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        const propTarget: Record<string, () => number> = {
+          readableLength: () => this.stream.lengthOf(),
+          readableHighWaterMark: () => this.stream.hwmOf(),
+          "rs:emittedReadable": () => this.stream.emittedReadableOf(),
+        };
+        const target = propTarget[nameArg.value];
+        if (target === undefined) {
+          this.refuse(`libCall:stream.prop:${nameArg.value}`, e.loc);
+          code.unreachable();
+          return true;
+        }
+        this.walkExpr(e.args[0]!);
+        code.call(target());
+        return true;
+      }
+      default:
+        if (e.fn.startsWith("readable.") || e.fn.startsWith("stream.")) {
           this.refuse(`libCall:${e.fn}`, e.loc);
           code.unreachable();
           return true;

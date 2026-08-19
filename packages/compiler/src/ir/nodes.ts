@@ -3320,8 +3320,11 @@ export type IrLibFn =
    *
    * readable.push / readable.pushStr / readable.pushNull: Node's push —
    * buffers or delivers (bytes chunk borrowed; string converted utf8);
-   * returns the below-hwm answer. readable.read: (recv, size — -1 for
-   * absent) → Buffer|null union. pause/resume return recv +1 (`this`);
+   * returns the below-hwm answer. readable.read: (recv, size — NaN for
+   * absent, Node's own convention: `n === undefined` becomes NaN before
+   * either backend ever sees it — a real negative size stays a real
+   * negative size, D1) → Buffer|null union. pause/resume return recv +1
+   * (`this`);
    * isPaused answers the flag. readable.pipe: (recv, dst, end) → dst +1,
    * fires 'pipe' on dst; readable.unpipe (recv[, dst]) → recv +1.
    * writable.write/writeStr: (recv, chunk[, cb]) → below-hwm bool (cb

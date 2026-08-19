@@ -3543,15 +3543,22 @@ test("classes: a type family that references itself in every direction", async (
   expect(stdout.toString("utf8")).toBe("root 1 leaf 3\ntrue false\n4 leaf\n");
 });
 
-test("classes: increment 22 stage A lifts the gate for the emitter root ONLY — a stream root still refuses", async () => {
+test("classes: increment 22 stage A lifts the gate for the emitter root; stage B lifts it again for %Readable ONLY — every OTHER stream root still refuses", async () => {
   // The EventEmitter rock is gone: classes.ts's rootKind now answers
   // "emitter" (liftable) rather than "runtime" for a %EventEmitter-rooted
   // class, and plan() injects the two-field ScrEmitter prefix (registry
-  // ref, display name) past `vt`. A stream-rooted class's base chain
-  // passes through a RUNTIME_STREAM_CLASSES name first (checked before
-  // the emitter check in rootKind, exactly because every stream class's
-  // OWN base chain reaches %EventEmitter further up) — its C prefix embeds
-  // stream state this tier has no port of, so it keeps refusing unchanged.
+  // ref, display name) past `vt`. Stage B (this increment's stage B)
+  // lifts the gate a second time, %Readable ONLY: rootKind's walk checks
+  // the literal name "%Readable" BEFORE the general RUNTIME_STREAM_
+  // CLASSES test, so a class whose walk hits %Readable first (a direct
+  // `extends Readable`, or a grandchild of one) answers "stream" and
+  // plans — one MORE injected field past the emitter pair (the lazily-
+  // allocated stream-state ref, stream.ts's $rState). %Writable (and,
+  // by the same "caught at the name it climbs through first" discipline,
+  // %Duplex/%Transform/%PassThrough, even though their OWN base chains
+  // pass through %Readable further up) still answer "runtime" and refuse
+  // unchanged — their C prefix embeds writable-side state this tier has
+  // no port of yet (stage C).
   const ee = await buildWasm(
     "extends-ee.ts",
     [
@@ -3574,19 +3581,42 @@ test("classes: increment 22 stage A lifts the gate for the emitter root ONLY —
   const stream = await buildWasm(
     "extends-stream.ts",
     [
+      'import { EventEmitter } from "node:events";',
       'import { Readable } from "node:stream";',
       "class R extends Readable {",
-      "  _read(): void {}",
+      "  _read(): void { this.push(null); }",
       "}",
       "const r = new R();",
       "console.log(r instanceof Readable);",
+      "console.log(r instanceof EventEmitter);",
+      'r.on("end", () => console.log("end"));',
+      "r.resume();", // drive it — a Readable no one reads never calls _read at all
       "",
     ].join("\n"),
   );
-  expect(stream.ok).toBe(false);
-  if (!stream.ok) {
-    expect(stream.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
-    expect(stream.wasmSurvey).toContain("class:extends-runtime");
+  expect(stream.ok).toBe(true);
+  if (stream.ok) {
+    expect(WebAssembly.validate(readFileSync(stream.binaryPath))).toBe(true);
+    const { stdout } = await runWasm(stream.binaryPath);
+    expect(stdout.toString("utf8")).toBe("true\ntrue\nend\n");
+  }
+
+  const writableStream = await buildWasm(
+    "extends-writable.ts",
+    [
+      'import { Writable } from "node:stream";',
+      "class W extends Writable {",
+      "  _write(chunk: unknown, enc: string, cb: () => void): void { cb(); }",
+      "}",
+      "const w = new W();",
+      "console.log(w instanceof Writable);",
+      "",
+    ].join("\n"),
+  );
+  expect(writableStream.ok).toBe(false);
+  if (!writableStream.ok) {
+    expect(writableStream.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
+    expect(writableStream.wasmSurvey).toContain("class:extends-runtime");
   }
 });
 

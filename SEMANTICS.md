@@ -2701,3 +2701,58 @@ CLAIMED program's output, which the census's byte-exactness enforces
 structurally). The typeof divergence itself is corpus-unpinnable per
 the rationale; the increment-21 stage C review probes are the
 measurement of record.
+
+## S046 — `read(n)` size coercion parses the NUMBER, not Node's STRING: sub-microscopic fractional sizes diverge *(all three lanes)*
+
+Node coerces a non-integer `read()` size with `parseInt(n, 10)` — which
+stringifies FIRST, so a nonzero fractional below 1e-6 goes exponential
+("1e-7") and parses to its leading MANTISSA digit: `read(1e-7)` is
+`read(1)` in Node. This tier coerces numerically (truncate toward zero;
+±Infinity → absent), so the same call is `read(0)` → null. Both
+compiled implementations agree (the wasm readCore and
+scr_stream_read_n, the latter shared by the C and LLVM lanes — two
+implementation sites, three observable lanes, all measured); Node
+differs.
+
+The OBSERVABLE set is narrower than a bare "|n| < 1e-6" reads
+(measured, 4-byte buffer): a finite non-integer with nonzero
+|n| < 1e-6 diverges ONLY when the exponential form's leading mantissa
+digit is ≤ the buffered byte count (or the stream has ended) —
+`read(1e-7)` on 4 buffered bytes reads "a" in Node and nothing here;
+`read(5e-7)` on the same buffer agrees BY ACCIDENT (parseInt gives 5,
+which exceeds the 4 buffered on an unended stream, so both answer
+null). `read(0.000001)` itself agrees (plain stringification, parseInt
+0). The NEGATIVE arm agrees in output but by DIFFERENT ROUTES: this
+tier truncates -1e-7 to -0 and takes the n === 0 path; Node parses to
+-1 and takes the n !== 0 path — the two differ in whether
+emittedReadable is cleared, a mechanism split this entry deliberately
+does NOT assert equivalent (no probe has surfaced it; a future
+'readable'-flag shape could).
+
+**Rationale:** implementing parseInt's stringify-then-parse for
+numbers only reachable through sub-microscopic fractional read sizes
+would mean porting number-to-exponential-string formatting into the
+read path for a corner no real program occupies; the numeric
+truncation is exact everywhere else — the full AGREEING coercion
+matrix (negative, zero, fractional, near-integer-fractional,
+±Infinity, NaN, variable, and absent sizes) is pinned in the CORPUS
+by 1686-stream-readable-paused.ts's coercion-matrix section, run
+differentially against Node on every lane, which is the regression
+net the size-coercion fixes otherwise lacked (the census could not
+see them: nothing else in tier reaches the coercion clause beyond
+read(3) and read(0)). Corpus-unpinnable in the S015-family sense for
+the corner alone: the lanes agree, so a program observing the
+divergence fails native-vs-Node by construction. Loudness: the
+divergence returns null (reads nothing) rather than fabricating data
+— the conservative direction.
+
+**Tested by:** 1686-stream-readable-paused.ts's coercion-matrix
+section (the agreeing matrix, corpus-differential on every lane —
+added at this entry's registration precisely so the coercion clause
+has a permanent net). The DIVERGENT corner itself is corpus-unpinnable
+per the rationale; its boundary measurement of record (the
+leading-mantissa-digit condition, the agrees-by-accident cases, the
+negative arm's route split) was established by the increment-22
+stage-B review and is restated in full in this entry's own body — the
+entry, not a probe path, is the durable record. The in-code comments
+at both implementations' coercion sites cite this entry.

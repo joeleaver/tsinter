@@ -39,14 +39,30 @@
  * cell (scr_emitter_emit_error) — the loop's dispatch surfaces it as the
  * uncaught crash, Node's contract.
  *
- * DOCUMENTED DIVERGENCES (SEMANTICS.md, the stream block): tick-vs-
- * microtask interleaving (Node runs nextTick callbacks before promise
- * jobs; this queue drains after the fiber ready-queue), pipe() without
- * registry-visible listeners (listenerCount('data') does not count the
- * C-side pipe hookup), and Transform completing writes without read-side
- * backpressure. */
+ * KNOWN DIVERGENCES, NOT YET REGISTERED (P3's own fix: this paragraph
+ * used to cite "SEMANTICS.md, the stream block" as their home — that
+ * block has never existed; `grep -n "EventEmitter\|stream" SEMANTICS.md`
+ * confirms it, the same false-citation shape s-entry-drafts.md's own
+ * header already caught for the emitter side. Landing real S### entries
+ * for these is board #66's extended scope, not this file's): pipe()
+ * without registry-visible listeners (listenerCount('data') does not
+ * count the C-side pipe hookup), and Transform completing writes without
+ * read-side backpressure. Tick-vs-microtask interleaving is NOT a divergence —
+ * this paragraph used to claim one (stream ticks draining after the
+ * fiber ready-queue, backwards from Node), which predates the increment-
+ * 22 stage-0 nextTick queue: before that queue existed, stream ticks had
+ * nowhere to ride but the fiber-ready queue directly, which really was
+ * backwards. Now they post through scr_next_tick_raw onto the SAME
+ * queue user process.nextTick() uses (scr_async.c's checkpoint: the tick
+ * queue drains to exhaustion, THEN the microtask queue, repeating while
+ * either has new work — Node's processTicksAndRejections, matching
+ * scr_loop_run exactly), so stream emissions and user nextTicks
+ * interleave in true FIFO enqueue order, Node's own order. Left as found
+ * for whoever next touches this file: the implementation already
+ * matched Node — only this sentence was stale. */
 #include "scr_runtime.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -687,9 +703,42 @@ static void scr_stream_maybe_read_more(ScrStream *s) {
  * size argument then count JS string units, Node's encoded accounting). */
 static void *scr_stream_read_n(ScrStream *s, double size) {
   ScrStreamState *st = s->st;
-  bool absent = size < 0;
+  /* D4: Node's OTHER size-coercion clause — `!Number.isInteger(n) ->
+   * n=parseInt(n,10)`. A finite non-integer truncates toward zero
+   * (parseInt's stringify-then-parse stops at the decimal point); a
+   * non-finite value (+-Infinity) stringifies to a leading non-digit
+   * ("Infinity"/"-Infinity"), so parseInt answers NaN — which folds
+   * into the SAME absent path below, kept in lockstep with the wasm
+   * lane's fix rather than minting a fresh wasm-vs-C split on Infinity
+   * (f10's pin: read(Infinity) reads the whole buffer). Lands before
+   * `absent` is even computed, matching Node's own placement (before
+   * `nOrig` is captured) — NOT at the take site, which would corrupt
+   * the length for a fractional size instead of truncating it (the
+   * coercion-matrix pin in 1686). NOT exact for one sub-microscopic
+   * fractional corner — SEMANTICS.md S046 carries the measured
+   * boundary and the rationale; this comment deliberately does not
+   * restate it (the entry is the single source). */
+  if (isinf(size)) {
+    size = NAN;
+  } else if (!isnan(size) && trunc(size) != size) {
+    size = trunc(size);
+  }
+  /* D1: NaN, not `size < 0` — Node's OWN absent sentinel (a bare
+   * `.read()` becomes n=NaN before either backend ever sees it, lower-
+   * stream.ts). The old `size < 0` check swallowed every real negative
+   * size as "absent" too (g1/g3's pin: `read(-1)`/`read(0 - 1)` must
+   * answer null and leave readableLength untouched, not hand back the
+   * whole buffer). A real negative size is never NaN, so it now falls
+   * through to the `size <= 0` branches below instead — which is also
+   * why `n` (the size_t byte count) is cast ONLY for `size > 0`: casting
+   * a negative double to size_t is undefined behavior, and Node's own
+   * `howMuchToRead` never needs the byte count for a non-positive size
+   * anyway (its `n <= 0` gate answers 0 immediately). Any comparison
+   * that needs the ORIGINAL argument value (not the clamped byte count)
+   * reads `size` directly, never `n` — `n`/`want` are pure byte counts. */
+  bool absent = isnan(size);
   size_t n = 0;
-  if (!absent) {
+  if (!absent && size > 0) {
     n = (size_t)size;
     if (n > st->r.hwm) {
       /* Node grows hwm to the next power of two above n */
@@ -700,8 +749,8 @@ static void *scr_stream_read_n(ScrStream *s, double size) {
   }
   /* Node's read(): `if (n !== 0) state.emittedReadable = false` — the
    * absent form is NaN there, which also clears; only read(0) keeps it. */
-  if (absent || n != 0) st->r.emitted_readable = false;
-  if (!absent && n == 0 && st->r.need_readable &&
+  if (absent || size != 0) st->r.emitted_readable = false;
+  if (!absent && size == 0 && st->r.need_readable &&
       (st->r.length >= st->r.hwm || st->r.ended)) {
     if (st->r.length == 0 && st->r.ended) scr_stream_end_readable(s);
     else scr_stream_emit_readable_nt(s);
@@ -716,6 +765,10 @@ static void *scr_stream_read_n(ScrStream *s, double size) {
     want = st->r.flowing == 1 && st->r.n > 0
         ? scr_stream_entry_len(st, st->r.buf[0]) - st->r.head_off
         : st->r.length;
+  } else if (size <= 0) {
+    /* Node's `n <= 0` gate: a non-positive explicit size never reads
+     * anything, ended or not (g1/g3's pin). */
+    want = 0;
   } else {
     want = n <= st->r.length ? n : (st->r.ended ? st->r.length : 0);
   }
@@ -738,6 +791,8 @@ static void *scr_stream_read_n(ScrStream *s, double size) {
         want = st->r.flowing == 1 && st->r.n > 0
             ? scr_stream_entry_len(st, st->r.buf[0]) - st->r.head_off
             : st->r.length;
+      } else if (size <= 0) {
+        want = 0;
       } else {
         want = n <= st->r.length ? n : (st->r.ended ? st->r.length : 0);
       }
@@ -751,7 +806,7 @@ static void *scr_stream_read_n(ScrStream *s, double size) {
   }
   if (st->r.length == 0) {
     if (!st->r.ended) st->r.need_readable = true;
-    if (st->r.ended && !absent && n != want) scr_stream_end_readable(s);
+    if (st->r.ended && !absent && size != (double)want) scr_stream_end_readable(s);
     if (st->r.ended && absent) scr_stream_end_readable(s);
   }
   if (ret != NULL && !st->error_emitted && !st->close_emitted) {
@@ -767,7 +822,10 @@ static void *scr_stream_read_n(ScrStream *s, double size) {
 static void scr_stream_flow(ScrStream *s) {
   ScrStreamState *st = s->st;
   while (st->r.flowing == 1 && !scr_exc_pending()) {
-    void *b = scr_stream_read_n(s, -1);
+    /* D1: the internal absent-read sentinel moved from -1 to NaN in
+     * lockstep with `scr_stream_read_n`'s own check (a stale `-1` here
+     * would no longer register as absent). */
+    void *b = scr_stream_read_n(s, NAN);
     if (b == NULL) break;
     scr_stream_entry_release(st, b);
   }
