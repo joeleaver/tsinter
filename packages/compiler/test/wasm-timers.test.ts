@@ -248,8 +248,13 @@ test("a throw out of an interval callback keeps the output, traps, and kills the
     "}, 3);",
     "console.log('armed');",
   ]);
-  const { stdout } = await runWasmToTrap(path);
+  const { stdout, stderr } = await runWasmToTrap(path);
   expect(stdout).toBe(["armed", "tick 1", "tick 2", ""].join("\n"));
+  // GATE FIX C5 (SEMANTICS.md S007's amendment): `_tick`'s death check
+  // reports before it traps too — timers.ts's emitDeathCheck now calls
+  // the same %w.err.reportUncaught emitter.ts's `_start` check does.
+  // Exact equality is the double-print pin.
+  expect(stderr).toBe("Uncaught Error: interval boom\n");
 });
 
 test("an unhandled rejection from a timer stops the next same-deadline timer", async () => {

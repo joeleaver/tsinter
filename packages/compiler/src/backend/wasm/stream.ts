@@ -229,6 +229,127 @@ export const RS_CHECKING_WAITER = 29; // i32 bool
 export const RS_CLOSE_EMITTED = 30; // i32 bool
 export const RS_FIELD_COUNT = 31;
 
+/* STAGE C fields (Writable's own half — construction/write/end/cork,
+ * underscore _write/_final/_destroy dispatch, WS-prefixed internal-state
+ * compat view). Kept on the SAME $rState struct as the readable-side
+ * fields above (append-only, matching pass 1/2's own convention) rather
+ * than a second struct type: the C reference's ScrStreamState already
+ * carries both `r` and `w` sub-structs unconditionally (gated by
+ * readable_side/writable_side booleans, not by which fields physically
+ * exist), and emitAlloc (emitter.ts) seeds STREAM_STATE as one nullable
+ * ref regardless of which sides a class has — a second struct type would
+ * need a second nullable prefix field and a compile-time-known "which
+ * struct" branch at every site that touches state, for no benefit: a
+ * Readable-only instance's WS_* fields simply stay at their construction
+ * default and nothing ever reads them (the frontend's own STREAM_API_
+ * MEMBERS/requireSide gate keeps a pure Readable's writable-side members
+ * from ever lowering in the first place). */
+/** The write-request queue's own highWaterMark (Node's real
+ * writableHighWaterMark; RS_HWM is the readable-side default 65536,
+ * duplicated here rather than shared because Readable/Writable hwm are
+ * INDEPENDENTLY defaultable — a Duplex may set readableHighWaterMark and
+ * writableHighWaterMark to different values, lower-stream.ts's own
+ * `streamCtorArgs` head shape already carries them as two separate
+ * arguments for the duplex-shaped constructors). */
+export const WS_HWM = 31; // f64
+export const WS_LENGTH = 32; // f64 — buffered byte length (queued + in-flight)
+export const WS_HEAD = 33; // $wReq ref, nullable — the buffered/corked write-request queue
+export const WS_TAIL = 34; // $wReq ref, nullable
+/** Node's real `state.corked` — a COUNT, not a bool (nested cork() calls
+ * stack; writableCorked reads this number directly). */
+export const WS_CORKED = 35; // f64
+/** A `_write`/`_writev` call is currently in flight (between calling it
+ * and its callback running) — Node's real `state.writing`, gates whether
+ * `clearBuffer`'s queue-drain loop may pull the next entry synchronously
+ * or must wait for `afterWrite`. */
+export const WS_WRITING = 36; // i32 bool
+/** Node's real `state.sync` on the WRITABLE side — mirrors RS_SYNC's
+ * exact role and header: true for the synchronous bracket around a
+ * `_write` call (`doWrite`'s own set-true/call/set-false), used by
+ * `afterWrite` to decide whether completing synchronously may drain the
+ * next queued entry inline (`sync` true: defer via a tick — Node never
+ * recurses `_write` synchronously from within another `_write`'s own
+ * callback) or immediately (`sync` false: the callback fired on a LATER
+ * turn, so calling straight back into `_write` cannot recurse). */
+export const WS_SYNC = 37; // i32 bool
+/** `end()` was called — Node's real `state.ending` (distinct from
+ * `ended`: `ending` flips at the `end()` call itself; `ended` flips once
+ * every queued write has actually reached `_write`/`_writev`). */
+export const WS_ENDING = 38; // i32 bool
+export const WS_ENDED = 39; // i32 bool
+export const WS_FINISHED = 40; // i32 bool
+export const WS_NEED_DRAIN = 41; // i32 bool
+/** Node's real `state.prefinished` — flips once `_final` has run (or was
+ * skipped, no override), gating `finishMaybe`'s 'finish' emission exactly
+ * like `prefinish` gates it in the lifted source. */
+export const WS_PREFINISHED = 42; // i32 bool
+export const WS_WRITE_CLOS = 43; // eq, nullable — the bound `_write`/option closure
+export const WS_WRITE_THUNK = 44; // writeThunkSig ref, nullable
+export const WS_FINAL_CLOS = 45; // eq, nullable
+export const WS_FINAL_THUNK = 46; // finalThunkSig ref, nullable
+/** `end(cb)`'s own completion callback — fires once (Node's real
+ * `state.writable` "finish" listener attached ad hoc by `end`), BEFORE
+ * 'finish' listeners run (1688/1741/1811's pin). Not reused across
+ * multiple `end()` calls (Node's `end()` after the first is a no-op that
+ * still eventually calls a SECOND cb with ERR_STREAM_WRITE_AFTER_END —
+ * unbuilt this stage, unclaimed). */
+/** `end(cb)`'s own completion callback closure directly (`voidClos().clos`
+ * typed, exactly like WREQ_CB_CLOS below — no separate thunk field; see
+ * wReqT's header for why the zero-arg shape needs no adapter). */
+export const WS_END_CLOS = 47; // voidClos().clos ref, nullable
+/** The `_destroy(err, callback)` override/option binding — SHARED across
+ * every stream side (Node's `_destroy` is one method regardless of r/w/
+ * rw; RS_DESTROYED/RS_ERROR/OP_ERROR/OP_CLOSE are already shared for the
+ * exact same reason). Absent (both null): the default path (pass 1's
+ * `destroyErrCore` body, now factored into `destroyErrDefaultCore`) runs
+ * with no user hook, unchanged. */
+export const RS_DESTROY_CLOS = 48; // eq, nullable
+export const RS_DESTROY_THUNK = 49; // destroyThunkSig ref, nullable
+/** GATE FIX C2/C4: a FIFO of `$wReq` entries whose own per-write callback
+ * still needs firing but whose CHUNK was never (and will never be) handed
+ * to `_write` — Node discards a destroyed stream's still-queued writes
+ * (C4, lifted+measured: `clearBuffer`'s destroyed-path calls each
+ * discarded entry's callback with the destroy error) and a write() call
+ * that lands on an already-`ending` stream never queues at all (C2,
+ * lifted: `_write`'s `kEnding`-check builds `ERR_STREAM_WRITE_AFTER_END`
+ * and schedules the callback directly, never touching `writeOrBuffer`).
+ * Both routes land here rather than on WS_HEAD/WS_TAIL, which stay
+ * reserved for entries that WILL reach `_write`. Fired by OP_FIRE_
+ * DISCARDED, scheduled AFTER 'close' (C4's own measured ordering:
+ * "_write one / err / close / cb one / cb two"). The error itself is
+ * NOT threaded through the call — every callback this tier can compile
+ * for `write(chunk, cb)` is the frontend's own zero-arg `() => void`
+ * shape (lower-stream.ts fences any callback declaring the error
+ * parameter), so Node's real `cb(err)` and this tier's `cb()` agree on
+ * every OBSERVABLE a zero-arg JS callback could read (none) — a
+ * dyn-valued (JS-lane, checked-dynamic) write callback is a DIFFERENT
+ * shape entirely, refused by name before ever reaching this queue
+ * (writable.write's own dyn-callback-value guard, gate fix C5). */
+export const WS_DISCARDED = 50; // $wReq ref, nullable
+/** GATE FIX F2: which of the two ways a stream became destroyed governs
+ * where a LATER write() call's own callback lands relative to 'close' —
+ * measured, not assumed (three consistent probes: c-err-queue3.ts vs
+ * f-write-after-destroy.ts vs f-mech-explicit-vs-autoDestroy.ts, the last
+ * pair identical except for the trigger). TRUE only when an in-flight
+ * write's OWN error is what destroyed the stream (afterWriteCore's F1
+ * branch sets it, nowhere else) — Node fires a LATER same-shape write's
+ * callback SYNCHRONOUSLY then, before 'error'/'close' (matches F1's own
+ * queue-drain, which is already synchronous). FALSE (the default, and
+ * every EXPLICIT `.destroy()` call whether or not it carries an error)
+ * means a later write's callback DEFERS past 'close' — writeCore's own
+ * F2 branch schedules it via WS_DISCARDED/OP_FIRE_DISCARDED instead of
+ * firing inline. One-way like RS_DESTROYED itself: set at most once, at
+ * the same moment, never reset. */
+export const WS_DESTROY_SYNC = 51; // i32 bool
+export const WS_FIELD_COUNT = 52;
+
+/** `$wReq`'s field indices — one queued write entry (a chunk plus its
+ * own completion callback; `cb` is nullable since a plain `write(chunk)`
+ * with no callback is common). Mirrors `$rChunk`'s shape. */
+export const WREQ_BYTES = 0;
+export const WREQ_CB_CLOS = 1;
+export const WREQ_NEXT = 2;
+
 export const SC_KIND_TEXT = 1;
 export const SC_KIND_BUFFER = 2;
 export const SC_KIND_JSON = 3;
@@ -276,6 +397,21 @@ export const OP_READMORE = 5;
  * runs, which flips `onEofChunk`'s branch and produces an extra
  * 'readable' cycle Node never fires; Node genuinely defers this one). */
 export const OP_PRIME_READ = 6;
+/** STAGE C: 'drain' (writeCore's below-hwm answer having gone false and
+ * the buffered length having drained back to zero — Node's real
+ * `onwriteDrain`/`afterWrite` condition). */
+export const OP_DRAIN = 7;
+/** STAGE C: 'finish' — scheduled once `_final` (or its absence) has
+ * called back, mirroring 'end'/'close''s own tick-deferred emission (the
+ * whole file's convention: every deferred stream event schedules, never
+ * fires inline off a completion callback that might itself be sync). */
+export const OP_FINISH = 8;
+/** GATE FIX C2/C4: fires every WS_DISCARDED entry's per-write callback
+ * (zero-arg — see WS_DISCARDED's own header for why no error value is
+ * threaded through) and clears the list. Scheduled AFTER OP_CLOSE
+ * (C4's own measured ordering places both discarded callbacks after
+ * 'close'). */
+export const OP_FIRE_DISCARDED = 9;
 
 export interface StreamDeps {
   /** The %Readable hierarchy ROOT's own struct — every general helper's
@@ -426,6 +562,16 @@ export interface StreamDeps {
   vecStruct: (strings: boolean) => number;
   vecBufType: (strings: boolean) => number;
   vecElemVal: (strings: boolean) => ValType;
+
+  /* ── STAGE C additions ────────────────────────────────────────────── */
+
+  /** The shared zero-arg void closure pair (emitter.ts's own
+   * `closPairFor([], [])`, the SAME identity every `() => void`-typed
+   * value in the whole program maps to) — every `write(chunk, cb)`/
+   * `end(cb)` user callback lowers to exactly this shape (wReqT's own
+   * header), so this file calls it back directly rather than building a
+   * second, redundant closure-pair machinery of its own. */
+  voidClos: () => { clos: number; fn: number };
 }
 
 // $bytes's field indices (typedarrays.ts's own private layout, mirrored
@@ -438,8 +584,13 @@ export class StreamBuilder {
   private readonly fns = new Map<string, number>();
   private stateTField: number | null = null;
   private chunkTField: number | null = null;
+  private wReqTField: number | null = null;
   private tickTField: number | null = null;
   private readThunkSigField: number | null = null;
+  private writeThunkSigField: number | null = null;
+  private finalThunkSigField: number | null = null;
+  private destroyThunkSigField: number | null = null;
+  private voidClosFnField: number | null = null;
   private tickQueue: { head: number; tail: number } | null = null;
 
   constructor(
@@ -485,6 +636,60 @@ export class StreamBuilder {
     return this.readThunkSigField;
   }
 
+  /** `writeThunkSig` — `_write`'s glue: `(clos, this, chunk: bytes,
+   * encoding: str, wreq: $wReq) -> void`. The wreq (NOT a pre-built
+   * callback closure) is the last argument: emitter.ts's `writeThunkFor`
+   * adapter — built once per DECLARED callback signature, exactly like
+   * `readThunkFor` refCasts `this` to the declaring class — is the one
+   * place that knows the user's declared callback type, so IT builds the
+   * matching done-closure (env: this wreq) and calls the user's `_write`
+   * with it; this file only ever needs to hand over which request is in
+   * flight. The encoding is always the literal "buffer" (decodeStrings'
+   * real default — 1688's own comment: chunks are Buffers, so Node's
+   * true encoding argument is always that one string) — passed as a
+   * plain interned string rather than threaded per-call, since it never
+   * varies on this tier (no `decodeStrings: false` support). Every
+   * `_write` override may declare any PREFIX of (chunk, encoding, cb) —
+   * the option-callback rule (readThunkFor's own precedent). */
+  writeThunkSig(): number {
+    if (this.writeThunkSigField === null) {
+      const rootRef = this.deps.rootRef();
+      this.writeThunkSigField = this.mb.funcType(
+        [EQ_REF, rootRef, this.deps.bytesRef(), this.deps.strRef(), this.wReqRef()],
+        [],
+      );
+    }
+    return this.writeThunkSigField;
+  }
+
+  /** `finalThunkSig` — `_final`'s glue: `(clos, this) -> void`. No wreq:
+   * `_final` has no per-request identity, and its done-closure's env is
+   * just `this` (already a parameter) — `finalThunkFor` (emitter.ts,
+   * mirroring `writeThunkFor`) builds it directly. May declare a 0-arg
+   * prefix (no `this`-only form exists for option callbacks — every
+   * stream callback's OWN first bound parameter is always `this` itself,
+   * per lower-stream.ts's uniform shape; the declared-prefix axis is the
+   * completion callback alone here, which is never itself a DECLARED
+   * parameter of `finalThunkSig` — it is built fresh by the adapter). */
+  finalThunkSig(): number {
+    if (this.finalThunkSigField === null) {
+      const rootRef = this.deps.rootRef();
+      this.finalThunkSigField = this.mb.funcType([EQ_REF, rootRef], []);
+    }
+    return this.finalThunkSigField;
+  }
+
+  /** `destroyThunkSig` — `_destroy(err, callback)`'s glue: `(clos, this,
+   * err: errRef) -> void`. Mirrors `finalThunkSig` — no wreq (destroy has
+   * no per-request identity either), env is just `this`. */
+  destroyThunkSig(): number {
+    if (this.destroyThunkSigField === null) {
+      const rootRef = this.deps.rootRef();
+      this.destroyThunkSigField = this.mb.funcType([EQ_REF, rootRef, this.deps.errRef()], []);
+    }
+    return this.destroyThunkSigField;
+  }
+
   chunkT(): number {
     if (this.chunkTField !== null) return this.chunkTField;
     // Every OTHER type the fields need is resolved BEFORE the call
@@ -503,9 +708,39 @@ export class StreamBuilder {
     return { kind: "ref", nullable: true, typeIndex: this.chunkT() };
   }
 
+  /** `$wReq`'s struct type — one queued write-request node (WREQ_* field
+   * indices above). `WREQ_CB_CLOS` is the user's own `write(chunk, cb)`
+   * callback, nullable (a callback-less `write(chunk)` is common) —
+   * exactly `this.deps.voidClos().clos`, which needs NO adapter/thunk
+   * beside it: lower-stream.ts fences any write/end callback declaring
+   * the error parameter ("write completion callbacks taking the error
+   * argument" has no lowering — `() => void` is the only supported
+   * shape), so calling one back is a direct `structGet(clos, code);
+   * callRef` against the ONE shared zero-arg signature, no per-signature
+   * adapter needed (unlike RS_READ_CLOS/RS_READ_THUNK's split, which
+   * exists because `_read`'s declared prefix genuinely varies). */
+  wReqT(): number {
+    if (this.wReqTField !== null) return this.wReqTField;
+    const bytesRef = this.deps.bytesRef();
+    const cbRef: ValType = { kind: "ref", nullable: true, typeIndex: this.deps.voidClos().clos };
+    this.wReqTField = this.mb.selfStructType("%w.ws.wreq", (self) => [
+      { storage: bytesRef, mutable: false }, // WREQ_BYTES
+      { storage: cbRef, mutable: false }, // WREQ_CB_CLOS
+      { storage: { kind: "ref", nullable: true, typeIndex: self }, mutable: true }, // WREQ_NEXT
+    ]);
+    return this.wReqTField;
+  }
+
+  wReqRef(): ValType {
+    return { kind: "ref", nullable: true, typeIndex: this.wReqT() };
+  }
+
   stateT(): number {
     if (this.stateTField !== null) return this.stateTField;
     const readThunkRef: ValType = { kind: "ref", nullable: true, typeIndex: this.readThunkSig() };
+    const writeThunkRef: ValType = { kind: "ref", nullable: true, typeIndex: this.writeThunkSig() };
+    const finalThunkRef: ValType = { kind: "ref", nullable: true, typeIndex: this.finalThunkSig() };
+    const destroyThunkRef: ValType = { kind: "ref", nullable: true, typeIndex: this.destroyThunkSig() };
     this.stateTField = this.mb.structType([
       { storage: F64, mutable: true }, // RS_HWM
       { storage: F64, mutable: true }, // RS_LENGTH
@@ -538,6 +773,27 @@ export class StreamBuilder {
       { storage: I32, mutable: true }, // RS_OBJECT_MODE
       { storage: I32, mutable: true }, // RS_CHECKING_WAITER
       { storage: I32, mutable: true }, // RS_CLOSE_EMITTED
+      { storage: F64, mutable: true }, // WS_HWM
+      { storage: F64, mutable: true }, // WS_LENGTH
+      { storage: this.wReqRef(), mutable: true }, // WS_HEAD
+      { storage: this.wReqRef(), mutable: true }, // WS_TAIL
+      { storage: F64, mutable: true }, // WS_CORKED
+      { storage: I32, mutable: true }, // WS_WRITING
+      { storage: I32, mutable: true }, // WS_SYNC
+      { storage: I32, mutable: true }, // WS_ENDING
+      { storage: I32, mutable: true }, // WS_ENDED
+      { storage: I32, mutable: true }, // WS_FINISHED
+      { storage: I32, mutable: true }, // WS_NEED_DRAIN
+      { storage: I32, mutable: true }, // WS_PREFINISHED
+      { storage: EQ_REF, mutable: true }, // WS_WRITE_CLOS
+      { storage: writeThunkRef, mutable: true }, // WS_WRITE_THUNK
+      { storage: EQ_REF, mutable: true }, // WS_FINAL_CLOS
+      { storage: finalThunkRef, mutable: true }, // WS_FINAL_THUNK
+      { storage: { kind: "ref", nullable: true, typeIndex: this.deps.voidClos().clos }, mutable: true }, // WS_END_CLOS
+      { storage: EQ_REF, mutable: true }, // RS_DESTROY_CLOS
+      { storage: destroyThunkRef, mutable: true }, // RS_DESTROY_THUNK
+      { storage: this.wReqRef(), mutable: true }, // WS_DISCARDED
+      { storage: I32, mutable: true }, // WS_DESTROY_SYNC
     ]);
     return this.stateTField;
   }
@@ -610,6 +866,27 @@ export class StreamBuilder {
       c.i32Const(0); // object_mode
       c.i32Const(0); // checking_waiter
       c.i32Const(0); // close_emitted
+      c.f64Const(65536); // ws_hwm default (overwritten by construction)
+      c.f64Const(0); // ws_length
+      c.refNull(this.wReqT()); // ws_head
+      c.refNull(this.wReqT()); // ws_tail
+      c.f64Const(0); // ws_corked
+      c.i32Const(0); // ws_writing
+      c.i32Const(1); // ws_sync — Node's real default: true from construction (WS_SYNC mirrors RS_SYNC)
+      c.i32Const(0); // ws_ending
+      c.i32Const(0); // ws_ended
+      c.i32Const(0); // ws_finished
+      c.i32Const(0); // ws_need_drain
+      c.i32Const(0); // ws_prefinished
+      c.refNull(EQ_HEAP); // ws_write_clos
+      c.refNull(this.writeThunkSig()); // ws_write_thunk
+      c.refNull(EQ_HEAP); // ws_final_clos
+      c.refNull(this.finalThunkSig()); // ws_final_thunk
+      c.refNull(this.deps.voidClos().clos); // ws_end_clos
+      c.refNull(EQ_HEAP); // rs_destroy_clos
+      c.refNull(this.destroyThunkSig()); // rs_destroy_thunk
+      c.refNull(this.wReqT()); // ws_discarded
+      c.i32Const(0); // ws_destroy_sync
       c.structNew(this.stateT());
       c.localSet(N);
       c.localGet(R);
@@ -780,10 +1057,34 @@ export class StreamBuilder {
         c.localGet(ROOT);
         c.call(this.opReadMore());
         c.else_();
+        c.localGet(OP);
+        c.i32Const(OP_DRAIN);
+        c.i32Eq();
+        c.ifVoid();
+        c.localGet(ROOT);
+        c.call(this.opDrain());
+        c.else_();
+        c.localGet(OP);
+        c.i32Const(OP_FINISH);
+        c.i32Eq();
+        c.ifVoid();
+        c.localGet(ROOT);
+        c.call(this.opFinish());
+        c.else_();
+        c.localGet(OP);
+        c.i32Const(OP_FIRE_DISCARDED);
+        c.i32Eq();
+        c.ifVoid();
+        c.localGet(ROOT);
+        c.call(this.opFireDiscarded());
+        c.else_();
         // OP_PRIME_READ, exhaustive: the op codes are this file's own
         // closed enum, never a runtime-supplied value.
         c.localGet(ROOT);
         c.call(this.opPrimeRead());
+        c.end();
+        c.end();
+        c.end();
         c.end();
         c.end();
         c.end();
@@ -3024,12 +3325,14 @@ export class StreamBuilder {
 
   /* ── destroy ───────────────────────────────────────────────────────── */
 
-  /** `(root, err: errRef|null) -> void` — the NO-USER-`_destroy`-OVERRIDE
-   * default path only (this pass — see the file header): idempotent
-   * (`destroyed` guards the whole function, matching Node's `if
-   * (state.destroyed) return`), schedules 'error' THEN 'close' as two
-   * SEPARATE ticks in that order (scr_stream_do_destroy — FIFO dispatch
-   * makes 'error' always land before 'close', 1694/1698's pin). */
+  /** `(root, err: errRef|null) -> void` — `destroy()`'s ONE entry point,
+   * every caller's (STAGE C: now gates on a user `_destroy` override
+   * FIRST — the NO-OVERRIDE default path this was pass 1's whole scope
+   * moved into `destroyErrDefaultCore` below, called directly here when
+   * no override exists, or from the override's own done-closure landing
+   * site otherwise): idempotent (`destroyed` guards the whole function,
+   * matching Node's `if (state.destroyed) return`, and is set BEFORE
+   * dispatching to an override — Node's own `destroy()` order). */
   destroyErrCore(): number {
     // PASS 2: cachedRecursive, NOT plain cached — this function's own
     // body now reaches checkWaiterCore -> readCore -> callRead ->
@@ -3051,46 +3354,146 @@ export class StreamBuilder {
     const ROOT = 0, ERR = 1, ST = 2;
     c.localGet(ROOT);
     c.call(this.stateEnsure());
+    c.localSet(ST);
+    c.localGet(ST);
+    c.structGet(this.stateT(), RS_DESTROYED);
+    c.ifVoid();
+    c.return_();
+    c.end();
+    c.localGet(ST);
+    c.i32Const(1);
+    c.structSet(this.stateT(), RS_DESTROYED);
+    c.localGet(ST);
+    c.structGet(this.stateT(), RS_DESTROY_CLOS);
+    c.refIsNull();
+    c.ifVoid();
+    c.localGet(ROOT);
+    c.localGet(ERR);
+    c.call(this.destroyErrDefaultCore());
+    c.else_();
+    // call_ref wants [args..., funcref] — the closure itself, `this`,
+    // the error, THEN the funcref last (the adapter builds ITS OWN
+    // done-closure from `this` and calls the user's `_destroy`).
+    c.localGet(ST);
+    c.structGet(this.stateT(), RS_DESTROY_CLOS);
+    c.localGet(ROOT);
+    c.localGet(ERR);
+    c.localGet(ST);
+    c.structGet(this.stateT(), RS_DESTROY_THUNK);
+    c.callRef(this.destroyThunkSig());
+    c.end();
+    this.mb.setBody(idx, [this.stateRef()], c.bytes());
+  }
+
+  /** `(root, err: errRef|null) -> void` — the NO-USER-`_destroy`-OVERRIDE
+   * body (pass 1's original `destroyErrCore`, factored out): schedules
+   * 'error' THEN 'close' as two SEPARATE ticks in that order
+   * (scr_stream_do_destroy — FIFO dispatch makes 'error' always land
+   * before 'close', 1694/1698's pin). Does NOT re-check/re-set
+   * `destroyed` — `destroyErrCore` (the gate, above) already did, before
+   * ever deciding whether to dispatch to an override, Node's own order.
+   * Called directly when no override exists, or from the override's own
+   * done-closure landing site (emitter.ts's `doneClosFor`) with
+   * whatever error the override's callback actually received — which
+   * may differ from (or clear) the error `_destroy` was originally
+   * called with, Node's own contract. */
+  destroyErrDefaultCore(): number {
+    return this.cachedRecursive(
+      "destroyErrDefaultCore",
+      () => this.mb.declareFunc(this.mb.funcType([this.deps.rootRef(), this.deps.errRef()], []), "%w.rs.destroyErrDefault"),
+      (idx) => {
+        const c = new Code();
+        const ROOT = 0, ERR = 1, ST = 2;
+        c.localGet(ROOT);
+        c.call(this.stateEnsure());
+        c.localSet(ST);
+        c.localGet(ERR);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(ST);
+        c.localGet(ERR);
+        c.structSet(this.stateT(), RS_ERROR);
+        c.localGet(ROOT);
+        c.i32Const(OP_ERROR);
+        c.call(this.scheduleTick());
+        c.end();
+        c.localGet(ST);
+        c.structGet(this.stateT(), RS_EMIT_CLOSE);
+        c.ifVoid();
+        c.localGet(ROOT);
+        c.i32Const(OP_CLOSE);
+        c.call(this.scheduleTick());
+        c.end();
+        // GATE FIX C4 (BLOCKING, measured: c-destroy-cbfate2.cjs / the
+        // reviewer's own pinned oracle answer — "_write one / err /
+        // close / cb one / cb two"): stop dispatching whatever is still
+        // QUEUED (never touch `doWriteCore` again post-destroy — nothing
+        // here calls it), and discard the queue STRUCTURALLY now
+        // (synchronous — nothing may reach `_write` for a discarded
+        // entry even one turn later).
+        c.localGet(ROOT);
+        c.call(this.discardQueueCore());
+        // GATE FIX C4 v2 (BLOCKING, measured: c-destroy-cbfate.ts — Node's
+        // real order is "cb one" THEN "cb two", the genuinely in-flight
+        // entry's OWN eventual completion callback BEFORE the discarded
+        // ones, never an independent earlier tick): only fire
+        // OP_FIRE_DISCARDED immediately here when NOTHING was in flight
+        // at destroy time (WS_WRITING false — discardQueueCore's own
+        // "nothing ever dispatched" branch, nothing to defer for, moved
+        // the WHOLE chain into WS_DISCARDED). When something WAS in
+        // flight, discardQueueCore kept WS_HEAD as that exact entry and
+        // this function must NOT race ahead of its real completion —
+        // afterWriteCore's own tail schedules OP_FIRE_DISCARDED itself,
+        // once that entry's own callback has already fired (this file's
+        // other half of the same fix).
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_WRITING);
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(ROOT);
+        c.i32Const(OP_FIRE_DISCARDED);
+        c.call(this.scheduleTick());
+        c.end();
+        // PASS 2 CORRECTION (found via execution — a real trap, not a
+        // review catch): do NOT settle a parked for-await waiter HERE.
+        // opError()'s own "is this handled" check reads RS_WAITER!=null
+        // to decide whether an error with no real 'error' listener may
+        // skip the uncaught-crash path (this file's own opError
+        // comment) — if THIS function already rejected and cleared
+        // RS_WAITER before OP_ERROR's tick ever runs, opError sees a
+        // NULL waiter and wrongly concludes nothing was watching,
+        // crashing the program (nexttick.ts's drain loop traps on the
+        // resulting uncaught exception). The settle now happens from
+        // opError/opClose themselves, AFTER they have already used
+        // RS_WAITER's presence to decide they're handled — see those
+        // functions' own comments.
+        this.mb.setBody(idx, [this.stateRef()], c.bytes());
+      },
+    );
+  }
+
+  /** `(root) -> void` — sets the `_destroy` override/option binding
+   * (construction, `stream.setDestroy` underscore-assign). */
+  setDestroyCore(): number {
+    return this.cached("setDestroyCore", () => {
+      const root = this.deps.rootRef();
+      const destroyThunkRef: ValType = { kind: "ref", nullable: true, typeIndex: this.destroyThunkSig() };
+      const idx = this.mb.declareFunc(this.mb.funcType([root, EQ_REF, destroyThunkRef], []), "%w.rs.setDestroy");
+      const c = new Code();
+      const ROOT = 0, CLOS = 1, THUNK = 2, ST = 3;
+      c.localGet(ROOT);
+      c.call(this.stateEnsure());
       c.localSet(ST);
       c.localGet(ST);
-      c.structGet(this.stateT(), RS_DESTROYED);
-      c.ifVoid();
-      c.return_();
-      c.end();
+      c.localGet(CLOS);
+      c.structSet(this.stateT(), RS_DESTROY_CLOS);
       c.localGet(ST);
-      c.i32Const(1);
-      c.structSet(this.stateT(), RS_DESTROYED);
-      c.localGet(ERR);
-      c.refIsNull();
-      c.i32Eqz();
-      c.ifVoid();
-      c.localGet(ST);
-      c.localGet(ERR);
-      c.structSet(this.stateT(), RS_ERROR);
-      c.localGet(ROOT);
-      c.i32Const(OP_ERROR);
-      c.call(this.scheduleTick());
-      c.end();
-      c.localGet(ST);
-      c.structGet(this.stateT(), RS_EMIT_CLOSE);
-      c.ifVoid();
-      c.localGet(ROOT);
-      c.i32Const(OP_CLOSE);
-      c.call(this.scheduleTick());
-      c.end();
-      // PASS 2 CORRECTION (found via execution — a real trap, not a
-      // review catch): do NOT settle a parked for-await waiter HERE.
-      // opError()'s own "is this handled" check reads RS_WAITER!=null to
-      // decide whether an error with no real 'error' listener may skip
-      // the uncaught-crash path (this file's own opError comment) — if
-      // THIS function already rejected and cleared RS_WAITER before
-      // OP_ERROR's tick ever runs, opError sees a NULL waiter and
-      // wrongly concludes nothing was watching, crashing the program
-      // (nexttick.ts's drain loop traps on the resulting uncaught
-      // exception). The settle now happens from opError/opClose
-      // themselves, AFTER they have already used RS_WAITER's presence to
-      // decide they're handled — see those functions' own comments.
+      c.localGet(THUNK);
+      c.structSet(this.stateT(), RS_DESTROY_THUNK);
       this.mb.setBody(idx, [this.stateRef()], c.bytes());
+      return idx;
+    });
   }
 
   /** `(root) -> void` — `destroy()` with no error, destroyErrCore's
@@ -3713,6 +4116,22 @@ export class StreamBuilder {
     });
   }
 
+  /** `(root) -> i32` — `_readableState.ended` (RS_ENDED, distinct from
+   * the top-level `readableEnded`/`_readableState.endEmitted`, which
+   * both read RS_END_EMITTED — Node's real two-bit split, mirrored). */
+  readableEndedInternalOf(): number {
+    return this.cached("readableEndedInternalOf", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root], [I32]), "%w.rs.endedInternal");
+      const c = new Code();
+      c.localGet(0);
+      c.call(this.stateEnsure());
+      c.structGet(this.stateT(), RS_ENDED);
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
   /** `(root) -> errRef|null` — `stream.errored`. */
   erroredOf(): number {
     return this.cached("erroredOf", () => {
@@ -3724,6 +4143,1252 @@ export class StreamBuilder {
       c.call(this.stateEnsure());
       c.structGet(this.stateT(), RS_ERROR);
       this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  /* ══════════════════════════════════════════════════════════════════════
+   * STAGE C — the writable side (scr_stream.c's "── writable internals ──"
+   * section ported). Shares this file's state struct/tick FIFO/scheduler
+   * wholesale (this file's own header explains why: one struct, one
+   * dispatcher, for every stream-rooted class regardless of which sides
+   * it has). The queue (`$wReq`, WS_HEAD/WS_TAIL) represents EVERY
+   * pending write UNIFORMLY, including the one currently in flight — it
+   * is simply the head of the same list, never popped until ITS OWN
+   * completion callback runs (Node's real `clearBuffer`/`doWrite`
+   * shape). `writeThunkFor`/`finalThunkFor` (emitter.ts, mirroring
+   * `readThunkFor`) build the done-closures user overrides receive and
+   * call back into `afterWriteCore`/`finalDoneCore` below — this file
+   * never constructs a per-signature closure itself (it doesn't know the
+   * user's declared callback type; the emitter does). */
+
+  /** `(state, wreq) -> void` — appends one write-request node to the
+   * queue's tail (appendChunk's own append-only half, no `front` case:
+   * writes never jump the queue). */
+  private wsAppend(): number {
+    return this.cached("wsAppend", () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.stateRef(), this.wReqRef()], []), "%w.ws.append");
+      const c = new Code();
+      const ST = 0, N = 1;
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_TAIL);
+      c.refIsNull();
+      c.ifVoid();
+      c.localGet(ST);
+      c.localGet(N);
+      c.structSet(this.stateT(), WS_HEAD);
+      c.else_();
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_TAIL);
+      c.localGet(N);
+      c.structSet(this.wReqT(), WREQ_NEXT);
+      c.end();
+      c.localGet(ST);
+      c.localGet(N);
+      c.structSet(this.stateT(), WS_TAIL);
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  /** `(root, chunk, cbClos: voidClos|null) -> bool` — `write()`'s core
+   * (Node's real `writeOrBuffer`): always enqueues (the queue IS the
+   * in-flight slot too), bumps `length`, kicks `doWriteCore` (a no-op if
+   * already writing/corked), and returns `length < hwm` READ AFTER that
+   * kick — if the kick completed SYNCHRONOUSLY (the user's `_write`
+   * calls its callback inline, as every one of this stage's claims
+   * does), `afterWriteCore` has already run and decremented `length`
+   * back down by the time this reads it, matching Node's own observed
+   * behavior (1688's own comment: "the below-hwm answer computed AFTER a
+   * synchronous completion"). */
+  writeCore(): number {
+    return this.cachedRecursive(
+      "writeCore",
+      () =>
+        this.mb.declareFunc(
+          this.mb.funcType(
+            [this.deps.rootRef(), this.deps.bytesRef(), { kind: "ref", nullable: true, typeIndex: this.deps.voidClos().clos }],
+            [I32],
+          ),
+          "%w.ws.write",
+        ),
+      (idx) => {
+        const c = new Code();
+        const ROOT = 0, CHUNK = 1, CB = 2, ST = 3, N = 4, RETB = 5;
+        c.localGet(ROOT);
+        c.call(this.stateEnsure());
+        c.localSet(ST);
+        // GATE FIX C2 (BLOCKING, lifted verbatim from Node's real
+        // internal/streams/_write): "if ((state[kState] & kEnding) !== 0)
+        // { err = new ERR_STREAM_WRITE_AFTER_END(); } ... if (err) {
+        // process.nextTick(cb, err); errorOrDestroy(stream, err, true);
+        // return err; }" — a write() on an already-ending stream never
+        // reaches `writeOrBuffer` at all: no enqueue, no `_write` call,
+        // just the error + (if present) the per-write callback + destroy
+        // (errorOrDestroy calls `stream.destroy(err)` when autoDestroy is
+        // set, this tier's own default). The callback's OWN nextTick is
+        // enqueued BEFORE `destroy()`'s error/close ticks in the lifted
+        // source, so it is scheduled first here too (WS_DISCARDED/
+        // OP_FIRE_DISCARDED, the SAME zero-arg-callback machinery C4
+        // uses — see that field's own header for why no error value
+        // threads through). Measured (c-after-end.ts, this tier's own
+        // oracle run): `write-after-end ret: false` prints BEFORE the
+        // deferred `err event:` line — confirming the error is NOT
+        // synchronous, matching the lifted source's own tick-based path.
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_ENDING);
+        c.ifResult(I32);
+        c.localGet(CB);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(CHUNK);
+        c.localGet(CB);
+        c.refNull(this.wReqT());
+        c.structNew(this.wReqT());
+        c.localSet(N);
+        c.localGet(ST);
+        c.localGet(N);
+        c.call(this.wsDiscardAppend());
+        c.localGet(ROOT);
+        c.i32Const(OP_FIRE_DISCARDED);
+        c.call(this.scheduleTick());
+        c.end();
+        c.localGet(ROOT);
+        this.deps.buildErrorLit(
+          c,
+          "%Error",
+          "Error",
+          (cc) => this.deps.lit(cc, "write after end"),
+          "ERR_STREAM_WRITE_AFTER_END",
+        );
+        c.call(this.destroyErrCore());
+        c.i32Const(0);
+        c.else_();
+        // GATE FIX F1/F2 (bug c, BLOCKING, lifted verbatim from Node's
+        // real internal/streams/_write's OWN sibling branch to the
+        // WS_ENDING/WRITE_AFTER_END check just above: "else if
+        // ((state[kState] & kDestroyed) !== 0) { err = new
+        // ERR_STREAM_DESTROYED('write') }"): a write() call landing
+        // AFTER the stream is already destroyed must NOT enqueue or
+        // dispatch to `_write` at all — this tier used to fall through
+        // to the normal append+dispatch path below and call `_write`
+        // anyway, which Node never does (bug c). WHERE the callback
+        // lands relative to 'error'/'close' is NOT uniform, though —
+        // measured across three probes (c-err-queue3.ts vs
+        // f-write-after-destroy.ts vs f-mech-explicit-vs-autoDestroy.ts,
+        // the last pair identical except for the trigger): a stream
+        // destroyed by an in-flight write's OWN error fires a later
+        // same-shape write's callback SYNCHRONOUSLY, before 'error'/
+        // 'close' (c-err-queue3.ts: "cb two" before "err event"); a
+        // stream destroyed by an EXPLICIT `.destroy()` call — with or
+        // without an error — defers it PAST 'close' instead
+        // (f-write-after-destroy.ts, f-mech-explicit-vs-autoDestroy.ts).
+        // WS_DESTROY_SYNC (its own header, set only by afterWriteCore's
+        // F1 branch) is the measured signal, not RS_DESTROYED alone.
+        c.localGet(ST);
+        c.structGet(this.stateT(), RS_DESTROYED);
+        c.ifResult(I32);
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_DESTROY_SYNC);
+        c.ifResult(I32);
+        // F1's shape: fire now — whatever destroyed the stream already
+        // scheduled OP_ERROR/OP_CLOSE (or will, on its own eventual
+        // completion), and this fires before those ticks run.
+        c.localGet(CB);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(CB); // arg0: the closure itself (call_ref wants args, THEN the funcref)
+        c.localGet(CB);
+        c.structGet(this.deps.voidClos().clos, 0);
+        c.callRef(this.deps.voidClos().fn);
+        c.end();
+        c.i32Const(0);
+        c.else_();
+        // F2's shape: defer past the already-scheduled OP_CLOSE (and
+        // OP_ERROR, if any) — append to the SAME discard queue C4/C2
+        // use and schedule its fire, landing AFTER them in FIFO order
+        // exactly because they were scheduled first, at destroy() time,
+        // strictly before this write() call could ever run.
+        c.localGet(CHUNK);
+        c.localGet(CB);
+        c.refNull(this.wReqT());
+        c.structNew(this.wReqT());
+        c.localSet(N);
+        c.localGet(ST);
+        c.localGet(N);
+        c.call(this.wsDiscardAppend());
+        c.localGet(ROOT);
+        c.i32Const(OP_FIRE_DISCARDED);
+        c.call(this.scheduleTick());
+        c.i32Const(0);
+        c.end();
+        c.else_();
+        c.localGet(CHUNK);
+        c.localGet(CB);
+        c.refNull(this.wReqT());
+        c.structNew(this.wReqT());
+        c.localSet(N);
+        c.localGet(ST);
+        c.localGet(N);
+        c.call(this.wsAppend());
+        c.localGet(ST);
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_LENGTH);
+        c.localGet(CHUNK);
+        c.structGet(this.deps.bytesStructType(), BYTES_LEN);
+        c.f64ConvertI32S();
+        c.f64Add();
+        c.structSet(this.stateT(), WS_LENGTH);
+        c.localGet(ROOT);
+        c.call(this.doWriteCore());
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_LENGTH);
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_HWM);
+        c.f64Lt();
+        c.localSet(RETB);
+        // GATE FIX C3 (the needDrain BIT half — lifted from Node's real
+        // internal/streams/writable.js, `writeOrBuffer`: "if (!ret)
+        // state[kState] |= kNeedDrain"): a false return marks the bit;
+        // `afterWriteCore`'s drain-emission gate below reads it back
+        // (the SAME lifted source's `afterWrite`, the OTHER half of the
+        // conjunction). Every claim's own return-value computation stays
+        // exactly as before (this file's own hwm-comparison, unchanged) —
+        // only the bit-tracking is new.
+        c.localGet(RETB);
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(ST);
+        c.i32Const(1);
+        c.structSet(this.stateT(), WS_NEED_DRAIN);
+        c.end();
+        c.localGet(RETB);
+        c.end(); // closes the RS_DESTROYED ifResult(I32)/else_ (GATE FIX F1/F2) — WS_DESTROY_SYNC's own inner ifResult(I32) already closed above, before this branch's else_
+        c.end(); // closes the WS_ENDING ifResult(I32)/else_ opened at the top
+        this.mb.setBody(idx, [this.stateRef(), this.wReqRef(), I32], c.bytes());
+      },
+    );
+  }
+
+  /** `(root) -> void` — dispatches the head-of-queue request to `_write`
+   * if nothing is already in flight and the stream isn't corked; a no-op
+   * otherwise (Node's real `clearBuffer`/`doWrite` idempotency — every
+   * call site here calls this unconditionally and lets the guard decide,
+   * rather than duplicating the condition at each call site). */
+  doWriteCore(): number {
+    return this.cachedRecursive(
+      "doWriteCore",
+      () => this.mb.declareFunc(this.mb.funcType([this.deps.rootRef()], []), "%w.ws.doWrite"),
+      (idx) => {
+        const c = new Code();
+        const ROOT = 0, ST = 1, HEAD = 2;
+        c.localGet(ROOT);
+        c.call(this.stateEnsure());
+        c.localSet(ST);
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_WRITING);
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_CORKED);
+        c.f64Const(0);
+        c.f64Gt();
+        c.i32Or();
+        c.ifVoid();
+        c.return_();
+        c.end();
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_HEAD);
+        c.localTee(HEAD);
+        c.refIsNull();
+        c.ifVoid();
+        c.return_();
+        c.end();
+        c.localGet(ST);
+        c.i32Const(1);
+        c.structSet(this.stateT(), WS_WRITING);
+        c.localGet(ST);
+        c.i32Const(1);
+        c.structSet(this.stateT(), WS_SYNC);
+        // call_ref wants [args..., funcref] — the closure ITSELF (arg0),
+        // `this`, chunk, encoding, wreq, THEN the funcref last.
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_WRITE_CLOS);
+        c.localGet(ROOT);
+        c.localGet(HEAD);
+        c.structGet(this.wReqT(), WREQ_BYTES);
+        this.deps.lit(c, "buffer");
+        c.localGet(HEAD);
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_WRITE_THUNK);
+        c.callRef(this.writeThunkSig());
+        c.localGet(ST);
+        c.i32Const(0);
+        c.structSet(this.stateT(), WS_SYNC);
+        this.mb.setBody(idx, [this.stateRef(), this.wReqRef()], c.bytes());
+      },
+    );
+  }
+
+  /** `(root, errRef|null) -> void` — the done-closure's landing site
+   * (Node's real `afterWrite`): pops the completed head, subtracts its
+   * length, fires its own per-write callback (if any), routes a real
+   * error to `destroyErrCore` (Node's `errorOrDestroy`), fires 'drain'
+   * once the queue empties past a prior below-hwm write, and either
+   * continues draining the queue or tries to finish. */
+  afterWriteCore(): number {
+    return this.cachedRecursive(
+      "afterWriteCore",
+      () => this.mb.declareFunc(this.mb.funcType([this.deps.rootRef(), this.deps.errRef()], []), "%w.ws.afterWrite"),
+      (idx) => {
+        const c = new Code();
+        const ROOT = 0, ERR = 1, ST = 2, HEAD = 3, CBCLOS = 4, ARGS = 5;
+        c.localGet(ROOT);
+        c.call(this.stateEnsure());
+        c.localSet(ST);
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_HEAD);
+        c.localTee(HEAD);
+        c.refIsNull();
+        c.ifVoid();
+        c.return_(); // defensive: no in-flight request (should not happen for any built path)
+        c.end();
+        c.localGet(ST);
+        c.localGet(HEAD);
+        c.structGet(this.wReqT(), WREQ_NEXT);
+        c.structSet(this.stateT(), WS_HEAD);
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_HEAD);
+        c.refIsNull();
+        c.ifVoid();
+        c.localGet(ST);
+        c.refNull(this.wReqT());
+        c.structSet(this.stateT(), WS_TAIL);
+        c.end();
+        c.localGet(ST);
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_LENGTH);
+        c.localGet(HEAD);
+        c.structGet(this.wReqT(), WREQ_BYTES);
+        c.structGet(this.deps.bytesStructType(), BYTES_LEN);
+        c.f64ConvertI32S();
+        c.f64Sub();
+        c.structSet(this.stateT(), WS_LENGTH);
+        c.localGet(ST);
+        c.i32Const(0);
+        c.structSet(this.stateT(), WS_WRITING);
+        c.localGet(ERR);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        // GATE FIX F1 (BLOCKING, C2's lost-continuation class — measured:
+        // c-err-queue2.ts async, c-err-queue3.ts sync). Two shapes reach
+        // here with ERR non-null, and they need OPPOSITE tail behavior:
+        //
+        //  - A FRESH error (RS_DESTROYED still false — nothing has
+        //    destroyed this stream yet, so THIS is what does it): Node's
+        //    measured order is every already-queued write's callback —
+        //    this entry's own, then each queued one in order, NONE
+        //    dispatched to `_write` — BEFORE 'error'/'close'. Fire them
+        //    SYNCHRONOUSLY (this entry's own callback, then
+        //    discardQueueCore + a DIRECT opFireDiscarded call, not a
+        //    scheduled one), THEN call destroyErrCore — by the time its
+        //    OP_ERROR/OP_CLOSE ticks actually run (the next checkpoint),
+        //    everything above has already printed. The exact opposite
+        //    of C4's own shape below, and correctly so: C4 is an
+        //    EXTERNAL destroy() landing while a write is in flight
+        //    (afterWriteCore never observes an error there — the real
+        //    completion's own ERR is null), never this branch.
+        //
+        //  - A COLLISION (RS_DESTROYED already true — measured:
+        //    c-err-destroy-collide.ts, an explicit destroy() already won
+        //    the race before this stale error arrived): Node discards
+        //    the stale error entirely (only the explicit destroy's own
+        //    message ever reaches 'error') and this completion behaves
+        //    EXACTLY like a normal one for ordering — close first, this
+        //    entry's callback after, matching C4's shape exactly (the
+        //    explicit destroy already did C4's own discardQueueCore +
+        //    deferred-OP_FIRE_DISCARDED half). Do NOT return here — fall
+        //    through to the shared tail below unchanged, and do NOT call
+        //    destroyErrCore again (its own idempotency guard would
+        //    no-op it, but the point is this branch never touches it).
+        c.localGet(ST);
+        c.structGet(this.stateT(), RS_DESTROYED);
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(HEAD);
+        c.structGet(this.wReqT(), WREQ_CB_CLOS);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(HEAD);
+        c.structGet(this.wReqT(), WREQ_CB_CLOS);
+        c.localSet(CBCLOS);
+        c.localGet(CBCLOS); // arg0 (call_ref wants args, THEN the funcref)
+        c.localGet(CBCLOS);
+        c.structGet(this.deps.voidClos().clos, 0);
+        c.callRef(this.deps.voidClos().fn);
+        c.end();
+        // GATE FIX F2: record that THIS destroy is the "in-flight write's
+        // own error" kind — writeCore's own RS_DESTROYED branch reads
+        // this back to pick synchronous-fire (this shape) vs deferred
+        // (an explicit `.destroy()` call, WS_DESTROY_SYNC's own header).
+        c.localGet(ST);
+        c.i32Const(1);
+        c.structSet(this.stateT(), WS_DESTROY_SYNC);
+        c.localGet(ROOT);
+        c.call(this.discardQueueCore());
+        c.localGet(ROOT);
+        c.call(this.opFireDiscarded());
+        c.localGet(ROOT);
+        c.localGet(ERR);
+        c.call(this.destroyErrCore());
+        c.return_();
+        c.end();
+        c.end();
+        // Node's REAL order (measured against 1689: completing a queued
+        // write DISPATCHES the next one, or fires 'drain', BEFORE the
+        // just-completed entry's OWN per-write callback runs — "write:
+        // bbbb" prints before "cb a" when a second write was queued
+        // behind the first; "drain" prints before "cb b" when the queue
+        // empties past a below-hwm write). Both 'drain' and dispatching
+        // the next entry are SYNCHRONOUS here (Node's own `afterWrite`
+        // calls `stream.emit('drain')` directly, not through a tick —
+        // unlike 'finish', which always defers).
+        //
+        // GATE FIX C3 (BLOCKING precondition, lifted verbatim from Node's
+        // real internal/streams/writable.js's `afterWrite`, dumped via
+        // internalBinding("builtins").natives): `const needDrain =
+        // (state[kState] & (kEnding | kNeedDrain | kDestroyed)) ===
+        // kNeedDrain && state.length === 0;` — a bitmask conjunction, NOT
+        // length-alone: the needDrain BIT must be set (a prior write()
+        // call answered false — writeCore's own new WS_NEED_DRAIN write,
+        // this gate's other half) AND `ending`/`destroyed` must BOTH be
+        // clear. `destroyed` is unreached by any path that reaches this
+        // point in THIS file (destroyErrCore short-circuits before ever
+        // calling back in here — see its own `return_()` above), so the
+        // clause is carried for fidelity to the lifted source, not
+        // because a claim or probe exercises it; `ending` is what 1693's/
+        // 1743's/the reviewer's own two probes (c-order.ts,
+        // c-backpressure.ts, both call end() before the queue drains)
+        // measure — 1689 (byte-exact, unaffected) is the control that
+        // proves a NOT-yet-ending stream still fires 'drain' correctly.
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_HEAD);
+        c.refIsNull();
+        c.ifVoid();
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_NEED_DRAIN);
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_ENDING);
+        c.i32Eqz();
+        c.i32And();
+        c.localGet(ST);
+        c.structGet(this.stateT(), RS_DESTROYED);
+        c.i32Eqz();
+        c.i32And();
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_LENGTH);
+        c.f64Const(0);
+        c.f64Eq();
+        c.i32And();
+        c.ifVoid();
+        c.localGet(ST);
+        c.i32Const(0);
+        c.structSet(this.stateT(), WS_NEED_DRAIN);
+        this.emitNoArgFrom(c, ROOT, "drain", ARGS);
+        c.end();
+        c.localGet(ROOT);
+        c.call(this.maybeFinishCore());
+        c.else_();
+        c.localGet(ROOT);
+        c.call(this.doWriteCore());
+        c.end();
+        c.localGet(HEAD);
+        c.structGet(this.wReqT(), WREQ_CB_CLOS);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(HEAD);
+        c.structGet(this.wReqT(), WREQ_CB_CLOS);
+        c.localSet(CBCLOS);
+        c.localGet(CBCLOS); // arg0: the closure itself (call_ref wants args, THEN the funcref)
+        c.localGet(CBCLOS);
+        c.structGet(this.deps.voidClos().clos, 0);
+        c.callRef(this.deps.voidClos().fn);
+        c.end();
+        // GATE FIX C4 v2: this completed entry may be the exact one
+        // discardQueueCore left in flight when a destroy() call landed
+        // mid-write (destroyErrDefaultCore's own half of this fix, above
+        // — it deliberately skipped scheduling OP_FIRE_DISCARDED THEN so
+        // as not to race ahead of this real completion). Its own
+        // callback has just fired, immediately above — chain the
+        // discarded queue's fire onto THIS tick, after it, exactly
+        // matching Node's measured order (c-destroy-cbfate.ts: "cb one"
+        // then "cb two"). A destroy() that never caught anything in
+        // flight leaves WS_DISCARDED null here — nothing to do; the
+        // OTHER half already fired it immediately in that case.
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_DISCARDED);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(ROOT);
+        c.i32Const(OP_FIRE_DISCARDED);
+        c.call(this.scheduleTick());
+        c.end();
+        this.mb.setBody(
+          idx,
+          [
+            this.stateRef(),
+            this.wReqRef(),
+            { kind: "ref", nullable: true, typeIndex: this.deps.voidClos().clos },
+            this.deps.dynArrRef(),
+          ],
+          c.bytes(),
+        );
+      },
+    );
+  }
+
+  /** `(root, op: i32) -> void` — the public face of `scheduleTick` for
+   * callers outside this file's own tick-op handlers (emitter.ts's
+   * done-closure bodies need to reach `afterWriteCore`/`finalDoneCore`
+   * directly, but 'drain'/'finish' themselves still always schedule). */
+  private scheduleTickPublic(): number {
+    return this.scheduleTick();
+  }
+
+  /** `(root) -> void` — Node's real `finishMaybe`: nothing to finish
+   * unless `end()` was called, the queue is empty, nothing is in flight,
+   * and it hasn't already finished; runs `_final` (if any) or proceeds
+   * straight to the prefinished state. */
+  maybeFinishCore(): number {
+    return this.cachedRecursive(
+      "maybeFinishCore",
+      () => this.mb.declareFunc(this.mb.funcType([this.deps.rootRef()], []), "%w.ws.maybeFinish"),
+      (idx) => {
+        const c = new Code();
+        const ROOT = 0, ST = 1;
+        c.localGet(ROOT);
+        c.call(this.stateEnsure());
+        c.localSet(ST);
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_ENDING);
+        c.i32Eqz();
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_FINISHED);
+        c.i32Or();
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_HEAD);
+        c.refIsNull();
+        c.i32Eqz();
+        c.i32Or();
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_WRITING);
+        c.i32Or();
+        c.localGet(ST);
+        c.structGet(this.stateT(), RS_DESTROYED);
+        c.i32Or();
+        c.ifVoid();
+        c.return_();
+        c.end();
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_ENDED);
+        c.ifVoid();
+        c.return_(); // already ran the final step once (idempotency guard)
+        c.end();
+        c.localGet(ST);
+        c.i32Const(1);
+        c.structSet(this.stateT(), WS_ENDED);
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_FINAL_CLOS);
+        c.refIsNull();
+        c.ifVoid();
+        c.localGet(ROOT);
+        c.refNull(this.errType());
+        c.call(this.finalDoneCore());
+        c.else_();
+        // call_ref wants [args..., funcref] — the closure itself, `this`,
+        // THEN the funcref last.
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_FINAL_CLOS);
+        c.localGet(ROOT);
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_FINAL_THUNK);
+        c.callRef(this.finalThunkSig());
+        c.end();
+        this.mb.setBody(idx, [this.stateRef()], c.bytes());
+      },
+    );
+  }
+
+  /** `(root, errRef|null) -> void` — the `_final` done-closure's landing
+   * site (or `maybeFinishCore`'s own direct call when no `_final` is
+   * bound): a real error routes to `destroyErrCore` (Node's own
+   * `errorOrDestroy`); otherwise flips `prefinished` and schedules
+   * 'finish'. */
+  finalDoneCore(): number {
+    return this.cachedRecursive(
+      "finalDoneCore",
+      () => this.mb.declareFunc(this.mb.funcType([this.deps.rootRef(), this.deps.errRef()], []), "%w.ws.finalDone"),
+      (idx) => {
+        const c = new Code();
+        const ROOT = 0, ERR = 1, ST = 2, ARGS = 3;
+        c.localGet(ROOT);
+        c.call(this.stateEnsure());
+        c.localSet(ST);
+        c.localGet(ERR);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(ROOT);
+        c.localGet(ERR);
+        c.call(this.destroyErrCore());
+        c.return_();
+        c.end();
+        c.localGet(ST);
+        c.i32Const(1);
+        c.structSet(this.stateT(), WS_PREFINISHED);
+        // 'prefinish' fires SYNCHRONOUSLY here (Node's real `finishMaybe`
+        // — unlike 'finish', which always defers a tick): 1688/1741's own
+        // pin, "prefinish" printing between the user's `_final` body and
+        // whatever code runs right after `end()` returns.
+        this.emitNoArgFrom(c, ROOT, "prefinish", ARGS);
+        c.localGet(ROOT);
+        c.i32Const(OP_FINISH);
+        c.call(this.scheduleTickPublic());
+        this.mb.setBody(idx, [this.stateRef(), this.deps.dynArrRef()], c.bytes());
+      },
+    );
+  }
+
+  /** 'drain' — OP_DRAIN's tick body (Node's real `onwriteDrain`, folded
+   * into the scheduled form every deferred emission here uses). */
+  private opDrain(): number {
+    return this.cached("opDrain", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root], []), "%w.ws.opDrain");
+      const c = new Code();
+      const ROOT = 0, ARGS = 1;
+      c.localGet(ROOT);
+      c.call(this.stateEnsure());
+      c.structGet(this.stateT(), WS_LENGTH);
+      c.f64Const(0);
+      c.f64Eq();
+      c.ifVoid();
+      this.emitNoArgFrom(c, ROOT, "drain", ARGS);
+      c.end();
+      this.mb.setBody(idx, [this.deps.dynArrRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  /** 'finish' — OP_FINISH's tick body: the `end(cb)` callback (BEFORE
+   * 'finish' listeners — 1688/1741/1811's pin), the 'finish' event
+   * itself, then autoDestroy's own default-path destroy (already built —
+   * pass 1's `destroyCore`, which drives 'close' exactly as a Readable's
+   * does). */
+  private opFinish(): number {
+    return this.cached("opFinish", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root], []), "%w.ws.opFinish");
+      const c = new Code();
+      const ROOT = 0, ST = 1, ARGS = 2, CB = 3;
+      c.localGet(ROOT);
+      c.call(this.stateEnsure());
+      c.localSet(ST);
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_FINISHED);
+      c.ifVoid();
+      c.return_();
+      c.end();
+      c.localGet(ST);
+      c.i32Const(1);
+      c.structSet(this.stateT(), WS_FINISHED);
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_END_CLOS);
+      c.localTee(CB);
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(CB); // arg0: the closure itself (call_ref wants args, THEN the funcref)
+      c.localGet(CB);
+      c.structGet(this.deps.voidClos().clos, 0);
+      c.callRef(this.deps.voidClos().fn);
+      c.end();
+      this.emitNoArgFrom(c, ROOT, "finish", ARGS);
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_AUTO_DESTROY);
+      c.ifVoid();
+      c.localGet(ROOT);
+      c.call(this.destroyCore());
+      c.end();
+      this.mb.setBody(idx, [this.stateRef(), this.deps.dynArrRef(), { kind: "ref", nullable: true, typeIndex: this.deps.voidClos().clos }], c.bytes());
+      return idx;
+    });
+  }
+
+  /** `(state, sublist) -> void` — GATE FIX C2/C4: appends an already-
+   * linked `$wReq` chain (possibly one node) to WS_DISCARDED's tail,
+   * walking to find it (no separate tail field — this list is a rare,
+   * deferred-maintenance path, unlike WS_HEAD/TAIL's O(1) append). A
+   * null `sublist` is a safe no-op. */
+  private wsDiscardAppend(): number {
+    return this.cached("wsDiscardAppend", () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.stateRef(), this.wReqRef()], []), "%w.ws.discardAppend");
+      const c = new Code();
+      const ST = 0, SUB = 1, CUR = 2;
+      c.localGet(SUB);
+      c.refIsNull();
+      c.ifVoid();
+      c.return_();
+      c.end();
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_DISCARDED);
+      c.refIsNull();
+      c.ifVoid();
+      c.localGet(ST);
+      c.localGet(SUB);
+      c.structSet(this.stateT(), WS_DISCARDED);
+      c.return_();
+      c.end();
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_DISCARDED);
+      c.localSet(CUR);
+      c.block();
+      c.loop();
+      c.localGet(CUR);
+      c.structGet(this.wReqT(), WREQ_NEXT);
+      c.refIsNull();
+      c.brIf(1);
+      c.localGet(CUR);
+      c.structGet(this.wReqT(), WREQ_NEXT);
+      c.localSet(CUR);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(CUR);
+      c.localGet(SUB);
+      c.structSet(this.wReqT(), WREQ_NEXT);
+      this.mb.setBody(idx, [this.wReqRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  /** `(root) -> void` — GATE FIX C4: on destroy, stop dispatching and
+   * discard whatever is QUEUED (not yet in flight): if a write IS
+   * currently in flight (WS_WRITING), its own already-running `_write`
+   * call is left alone (Node cannot un-call a JS function that already
+   * started — c-destroy-cbfate2.cjs's own "one"'s callback still fires,
+   * with no error, exactly as its own `setTimeout` scheduled) — only
+   * WS_HEAD's OWN `next` chain (the genuinely queued entries) transfers
+   * to WS_DISCARDED. If nothing is in flight, WS_HEAD itself was never
+   * dispatched, so the WHOLE chain discards. Either way WS_HEAD/TAIL end
+   * up describing only what remains eligible to reach `_write` (nothing,
+   * post-destroy — `doWriteCore`'s own `RS_DESTROYED`-adjacent callers
+   * never fire again once destroyed). Called from `destroyErrDefaultCore`
+   * AFTER it schedules OP_CLOSE. GATE FIX C4 v2 (BLOCKING, measured:
+   * c-destroy-cbfate.ts — "cb one" THEN "cb two", never the reverse):
+   * the discarded entries' own callbacks fire from OP_FIRE_DISCARDED,
+   * but WHEN it gets scheduled now depends on which branch ran here —
+   * immediately (still after OP_CLOSE) when NOTHING was in flight
+   * (nothing to wait for), or deferred to `afterWriteCore`'s own tail
+   * when something WAS (chained after that entry's real, eventual
+   * completion callback — never an independently-scheduled tick racing
+   * ahead of it). See `destroyErrDefaultCore`'s and `afterWriteCore`'s
+   * own comments for the two halves. */
+  private discardQueueCore(): number {
+    return this.cached("discardQueueCore", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root], []), "%w.ws.discardQueue");
+      const c = new Code();
+      const ROOT = 0, ST = 1, SUB = 2;
+      c.localGet(ROOT);
+      c.call(this.stateEnsure());
+      c.localSet(ST);
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_HEAD);
+      c.refIsNull();
+      c.ifVoid();
+      c.return_(); // nothing queued at all
+      c.end();
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_WRITING);
+      c.ifVoid();
+      // In flight: keep WS_HEAD, discard its `next` onward.
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_HEAD);
+      c.structGet(this.wReqT(), WREQ_NEXT);
+      c.localSet(SUB);
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_HEAD);
+      c.refNull(this.wReqT());
+      c.structSet(this.wReqT(), WREQ_NEXT);
+      c.localGet(ST);
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_HEAD);
+      c.structSet(this.stateT(), WS_TAIL); // tail is now the (still in-flight) head
+      c.else_();
+      // Nothing in flight: the whole chain was never dispatched.
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_HEAD);
+      c.localSet(SUB);
+      c.localGet(ST);
+      c.refNull(this.wReqT());
+      c.structSet(this.stateT(), WS_HEAD);
+      c.localGet(ST);
+      c.refNull(this.wReqT());
+      c.structSet(this.stateT(), WS_TAIL);
+      c.end();
+      c.localGet(ST);
+      c.localGet(SUB);
+      c.call(this.wsDiscardAppend());
+      this.mb.setBody(idx, [this.stateRef(), this.wReqRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  /** OP_FIRE_DISCARDED's tick body — see WS_DISCARDED's own header for
+   * why no error value is threaded through the (zero-arg) callback. */
+  private opFireDiscarded(): number {
+    return this.cached("opFireDiscarded", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root], []), "%w.ws.opFireDiscarded");
+      const c = new Code();
+      const ROOT = 0, ST = 1, CUR = 2, CBCLOS = 3;
+      c.localGet(ROOT);
+      c.call(this.stateEnsure());
+      c.localSet(ST);
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_DISCARDED);
+      c.localSet(CUR);
+      c.localGet(ST);
+      c.refNull(this.wReqT());
+      c.structSet(this.stateT(), WS_DISCARDED);
+      c.block();
+      c.loop();
+      c.localGet(CUR);
+      c.refIsNull();
+      c.brIf(1);
+      c.localGet(CUR);
+      c.structGet(this.wReqT(), WREQ_CB_CLOS);
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(CUR);
+      c.structGet(this.wReqT(), WREQ_CB_CLOS);
+      c.localSet(CBCLOS);
+      c.localGet(CBCLOS); // arg0 (call_ref wants args, THEN the funcref)
+      c.localGet(CBCLOS);
+      c.structGet(this.deps.voidClos().clos, 0);
+      c.callRef(this.deps.voidClos().fn);
+      c.end();
+      c.localGet(CUR);
+      c.structGet(this.wReqT(), WREQ_NEXT);
+      c.localSet(CUR);
+      c.br(0);
+      c.end();
+      c.end();
+      this.mb.setBody(
+        idx,
+        [this.stateRef(), this.wReqRef(), { kind: "ref", nullable: true, typeIndex: this.deps.voidClos().clos }],
+        c.bytes(),
+      );
+      return idx;
+    });
+  }
+
+  /** `(root) -> void` — `cork()`: bumps the (count, not bool) cork
+   * level. */
+  corkCore(): number {
+    return this.cached("corkCore", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root], []), "%w.ws.cork");
+      const c = new Code();
+      const ROOT = 0, ST = 1;
+      c.localGet(ROOT);
+      c.call(this.stateEnsure());
+      c.localSet(ST);
+      c.localGet(ST);
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_CORKED);
+      c.f64Const(1);
+      c.f64Add();
+      c.structSet(this.stateT(), WS_CORKED);
+      // GATE FIX C1 (BLOCKING): the locals array was `[]`, but the body
+      // declares/uses local 1 (ST) via localSet/localGet — an undeclared
+      // local, invalid wasm ("invalid local index: 1" at instantiate
+      // time, board #20's class). ST is a `stateRef()`-typed scratch, the
+      // one extra local this function actually needs.
+      this.mb.setBody(idx, [this.stateRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  /** `(root) -> void` — `uncork()`: drops the cork level (floored at 0 —
+   * an extra uncork() past the last cork() is a harmless no-op, Node's
+   * own behavior) and, once it reaches 0, kicks the queue. */
+  uncorkCore(): number {
+    return this.cachedRecursive(
+      "uncorkCore",
+      () => this.mb.declareFunc(this.mb.funcType([this.deps.rootRef()], []), "%w.ws.uncork"),
+      (idx) => {
+        const c = new Code();
+        const ROOT = 0, ST = 1;
+        c.localGet(ROOT);
+        c.call(this.stateEnsure());
+        c.localSet(ST);
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_CORKED);
+        c.f64Const(0);
+        c.f64Gt();
+        c.ifVoid();
+        c.localGet(ST);
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_CORKED);
+        c.f64Const(1);
+        c.f64Sub();
+        c.structSet(this.stateT(), WS_CORKED);
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_CORKED);
+        c.f64Const(0);
+        c.f64Eq();
+        c.ifVoid();
+        c.localGet(ROOT);
+        c.call(this.doWriteCore());
+        c.end();
+        c.end();
+        this.mb.setBody(idx, [this.stateRef()], c.bytes());
+      },
+    );
+  }
+
+  /** `(root, flags: i32, chunk?, cb?: voidClos|null) -> void` — `end()`'s
+   * core: an optional tail chunk rides `writeCore` (Node's own `end()`
+   * calls `write()` for the tail), an optional callback binds as
+   * WS_END_CLOS, then `ending` flips and `maybeFinishCore` tries to
+   * finish immediately (the common case: nothing was ever in flight). */
+  endCore(): number {
+    return this.cachedRecursive(
+      "endCore",
+      () =>
+        this.mb.declareFunc(
+          this.mb.funcType(
+            [
+              this.deps.rootRef(),
+              this.deps.bytesRef(),
+              I32, // hasChunk
+              { kind: "ref", nullable: true, typeIndex: this.deps.voidClos().clos },
+              I32, // hasCb
+            ],
+            [],
+          ),
+          "%w.ws.end",
+        ),
+      (idx) => {
+        const c = new Code();
+        const ROOT = 0, CHUNK = 1, HAS_CHUNK = 2, CB = 3, HAS_CB = 4, ST = 5;
+        c.localGet(HAS_CHUNK);
+        c.ifVoid();
+        c.localGet(ROOT);
+        c.localGet(CHUNK);
+        c.refNull(this.deps.voidClos().clos);
+        c.call(this.writeCore());
+        c.drop();
+        c.end();
+        c.localGet(ROOT);
+        c.call(this.stateEnsure());
+        c.localSet(ST);
+        c.localGet(HAS_CB);
+        c.ifVoid();
+        c.localGet(ST);
+        c.localGet(CB);
+        c.structSet(this.stateT(), WS_END_CLOS);
+        c.end();
+        c.localGet(ST);
+        c.i32Const(1);
+        c.structSet(this.stateT(), WS_ENDING);
+        c.localGet(ROOT);
+        c.call(this.maybeFinishCore());
+        this.mb.setBody(idx, [this.stateRef()], c.bytes());
+      },
+    );
+  }
+
+  /* ── writable-side state getters (stream.prop's WS_* names) ─────────── */
+
+  wsLengthOf(): number {
+    return this.cached("wsLengthOf", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root], [F64]), "%w.ws.length");
+      const c = new Code();
+      c.localGet(0);
+      c.call(this.stateEnsure());
+      c.structGet(this.stateT(), WS_LENGTH);
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  wsHwmOf(): number {
+    return this.cached("wsHwmOf", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root], [F64]), "%w.ws.hwm");
+      const c = new Code();
+      c.localGet(0);
+      c.call(this.stateEnsure());
+      c.structGet(this.stateT(), WS_HWM);
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  wsCorkedOf(): number {
+    return this.cached("wsCorkedOf", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root], [F64]), "%w.ws.corked");
+      const c = new Code();
+      c.localGet(0);
+      c.call(this.stateEnsure());
+      c.structGet(this.stateT(), WS_CORKED);
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  /** `(root) -> i32` — the queued-request COUNT (Node's real
+   * `bufferedRequestCount`): the head-of-queue entry that's actually IN
+   * FLIGHT (WS_WRITING) does not count (Node's `state.buffered` excludes
+   * it — only the entries BEHIND it do), so this walks past one entry
+   * first when writing is true. */
+  wsBufferedRequestCountOf(): number {
+    return this.cached("wsBufferedRequestCountOf", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root], [F64]), "%w.ws.bufferedRequestCount");
+      const c = new Code();
+      const ROOT = 0, ST = 1, CUR = 2, N = 3;
+      c.localGet(ROOT);
+      c.call(this.stateEnsure());
+      c.localSet(ST);
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_HEAD);
+      c.localSet(CUR);
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_WRITING);
+      c.ifVoid();
+      c.localGet(CUR);
+      c.refIsNull();
+      c.ifVoid();
+      c.else_();
+      c.localGet(CUR);
+      c.structGet(this.wReqT(), WREQ_NEXT);
+      c.localSet(CUR);
+      c.end();
+      c.end();
+      c.f64Const(0);
+      c.localSet(N);
+      c.block();
+      c.loop();
+      c.localGet(CUR);
+      c.refIsNull();
+      c.brIf(1);
+      c.localGet(N);
+      c.f64Const(1);
+      c.f64Add();
+      c.localSet(N);
+      c.localGet(CUR);
+      c.structGet(this.wReqT(), WREQ_NEXT);
+      c.localSet(CUR);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(N);
+      this.mb.setBody(idx, [this.stateRef(), this.wReqRef(), F64], c.bytes());
+      return idx;
+    });
+  }
+
+  writableEndingOf(): number {
+    return this.cached("writableEndingOf", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root], [I32]), "%w.ws.ending");
+      const c = new Code();
+      c.localGet(0);
+      c.call(this.stateEnsure());
+      c.structGet(this.stateT(), WS_ENDING);
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  writableEndedInternalOf(): number {
+    return this.cached("writableEndedInternalOf", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root], [I32]), "%w.ws.endedInternal");
+      const c = new Code();
+      c.localGet(0);
+      c.call(this.stateEnsure());
+      c.structGet(this.stateT(), WS_ENDED);
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  writableFinishedOf(): number {
+    return this.cached("writableFinishedOf", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root], [I32]), "%w.ws.finished");
+      const c = new Code();
+      c.localGet(0);
+      c.call(this.stateEnsure());
+      c.structGet(this.stateT(), WS_FINISHED);
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  writableNeedDrainOf(): number {
+    return this.cached("writableNeedDrainOf", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root], [I32]), "%w.ws.needDrain");
+      const c = new Code();
+      // Node's real `writableNeedDrain` getter: `length >= highWaterMark`
+      // (a live recomputation, not a stored bit — this tier doesn't keep
+      // a separate needDrain flag observable from JS; OP_DRAIN's own
+      // scheduling condition, `length === 0`, is a DIFFERENT internal
+      // trigger and not what this getter reports).
+      c.localGet(0);
+      c.call(this.stateEnsure());
+      c.structGet(this.stateT(), WS_LENGTH);
+      c.localGet(0);
+      c.call(this.stateEnsure());
+      c.structGet(this.stateT(), WS_HWM);
+      c.f64Ge();
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  /** `(root) -> i32` — the top-level `.writable` getter (Node's real
+   * shape: alive, not destroyed/errored, and not yet ending/ended). */
+  writableOf(): number {
+    return this.cached("writableOf", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root], [I32]), "%w.ws.writable");
+      const c = new Code();
+      const ROOT = 0, ST = 1;
+      c.localGet(ROOT);
+      c.call(this.stateEnsure());
+      c.localSet(ST);
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_DESTROYED);
+      c.i32Eqz();
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_ERROR);
+      c.refIsNull();
+      c.i32And();
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_ENDING);
+      c.i32Eqz();
+      c.i32And();
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_ENDED);
+      c.i32Eqz();
+      c.i32And();
+      this.mb.setBody(idx, [this.stateRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  /** `(root) -> i32` — the top-level `.readable` getter (Node's real
+   * shape: alive, not destroyed/errored, and not yet end-emitted). */
+  readableAliveOf(): number {
+    return this.cached("readableAliveOf", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root], [I32]), "%w.rs.readableAlive");
+      const c = new Code();
+      const ROOT = 0, ST = 1;
+      c.localGet(ROOT);
+      c.call(this.stateEnsure());
+      c.localSet(ST);
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_DESTROYED);
+      c.i32Eqz();
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_ERROR);
+      c.refIsNull();
+      c.i32And();
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_END_EMITTED);
+      c.i32Eqz();
+      c.i32And();
+      this.mb.setBody(idx, [this.stateRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  /* ── underscore-assign setters (stream.setRead/setWrite/setFinal/...) ── */
+
+  setReadCore(): number {
+    return this.cached("setReadCore", () => {
+      const root = this.deps.rootRef();
+      const readThunkRef: ValType = { kind: "ref", nullable: true, typeIndex: this.readThunkSig() };
+      const idx = this.mb.declareFunc(this.mb.funcType([root, EQ_REF, readThunkRef], []), "%w.rs.setRead");
+      const c = new Code();
+      const ROOT = 0, CLOS = 1, THUNK = 2, ST = 3;
+      c.localGet(ROOT);
+      c.call(this.stateEnsure());
+      c.localSet(ST);
+      c.localGet(ST);
+      c.localGet(CLOS);
+      c.structSet(this.stateT(), RS_READ_CLOS);
+      c.localGet(ST);
+      c.localGet(THUNK);
+      c.structSet(this.stateT(), RS_READ_THUNK);
+      this.mb.setBody(idx, [this.stateRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  setWriteCore(): number {
+    return this.cached("setWriteCore", () => {
+      const root = this.deps.rootRef();
+      const writeThunkRef: ValType = { kind: "ref", nullable: true, typeIndex: this.writeThunkSig() };
+      const idx = this.mb.declareFunc(this.mb.funcType([root, EQ_REF, writeThunkRef], []), "%w.ws.setWrite");
+      const c = new Code();
+      const ROOT = 0, CLOS = 1, THUNK = 2, ST = 3;
+      c.localGet(ROOT);
+      c.call(this.stateEnsure());
+      c.localSet(ST);
+      c.localGet(ST);
+      c.localGet(CLOS);
+      c.structSet(this.stateT(), WS_WRITE_CLOS);
+      c.localGet(ST);
+      c.localGet(THUNK);
+      c.structSet(this.stateT(), WS_WRITE_THUNK);
+      this.mb.setBody(idx, [this.stateRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  setFinalCore(): number {
+    return this.cached("setFinalCore", () => {
+      const root = this.deps.rootRef();
+      const finalThunkRef: ValType = { kind: "ref", nullable: true, typeIndex: this.finalThunkSig() };
+      const idx = this.mb.declareFunc(this.mb.funcType([root, EQ_REF, finalThunkRef], []), "%w.ws.setFinal");
+      const c = new Code();
+      const ROOT = 0, CLOS = 1, THUNK = 2, ST = 3;
+      c.localGet(ROOT);
+      c.call(this.stateEnsure());
+      c.localSet(ST);
+      c.localGet(ST);
+      c.localGet(CLOS);
+      c.structSet(this.stateT(), WS_FINAL_CLOS);
+      c.localGet(ST);
+      c.localGet(THUNK);
+      c.structSet(this.stateT(), WS_FINAL_THUNK);
+      this.mb.setBody(idx, [this.stateRef()], c.bytes());
       return idx;
     });
   }

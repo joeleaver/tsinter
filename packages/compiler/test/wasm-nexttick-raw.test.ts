@@ -60,9 +60,26 @@ test("nexttick.ts: enqueueRaw + drain emit a VALID module and dispatch the bare 
   ]);
   const closT = pairBase;
   const fnT = pairBase + 1;
+  // GATE FIX C5's reportUncaught dep: drain()'s death-check branch now
+  // CALLS it (emitter.ts's %w.err.reportUncaught, unreachable here since
+  // excKindGlobal is pinned to 0) rather than emitting a bare
+  // `unreachable` inline — the death check still never trips in this
+  // test (see below), so the stub's body is never actually reached; it
+  // only needs to exist and type-check as `() -> ()` for drain() to
+  // compile the call.
+  let reportUncaughtStub: number | null = null;
   const nextTick = new NextTickBuilder(mb, {
     voidClos: () => ({ clos: closT, fn: fnT }),
     excKind: () => excKindGlobal,
+    reportUncaught: () => {
+      if (reportUncaughtStub === null) {
+        reportUncaughtStub = mb.declareFunc(mb.funcType([], []), "%test.reportUncaughtStub");
+        const c = new Code();
+        c.unreachable();
+        mb.setBody(reportUncaughtStub, [], c.bytes());
+      }
+      return reportUncaughtStub;
+    },
   });
 
   // The exception cell stub: always 0 (never "an uncaught throw"), so the

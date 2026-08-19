@@ -275,6 +275,12 @@ test("S007: an uncaught throw exits through the _start trap", async () => {
   expect(WebAssembly.validate(readFileSync(lit.binaryPath))).toBe(true);
   const litRun = await runWasmToTrap(lit.binaryPath);
   expect(litRun.stdout.toString("utf8")).toBe("before\n");
+  // GATE FIX C5 (SEMANTICS.md S007's amendment): the trap now REPORTS
+  // first — reportUncaughtHelper's %w.err.reportUncaught, S010's
+  // "print the reason, then trap" ported to the throw side. Exact
+  // string equality doubles as the double-print pin: two labeled lines
+  // would fail this just as surely as zero would.
+  expect(litRun.stderr.toString("utf8")).toBe("Uncaught Error: boom\n");
 
   // An effectful thrown expression evaluates in Node's order FIRST — its
   // side effects land before the trap.
@@ -293,6 +299,10 @@ test("S007: an uncaught throw exits through the _start trap", async () => {
   if (!eff.ok) throw new Error(`refused: ${eff.diagnostics[0]?.message}`);
   const effRun = await runWasmToTrap(eff.binaryPath);
   expect(effRun.stdout.toString("utf8")).toBe("before\nside effect first\n");
+  // `boom()` throws the STRING "thrown" (its return type), not an Error
+  // instance — EXC_STR, rendered raw with no "name:" label, exactly like
+  // Node's own `throw "thrown"` (a bare string, no stack-trace framing).
+  expect(effRun.stderr.toString("utf8")).toBe("Uncaught thrown\n");
 });
 
 test("string intrinsics: UTF-16-exact surface, surrogate fidelity", async () => {
@@ -3543,22 +3553,35 @@ test("classes: a type family that references itself in every direction", async (
   expect(stdout.toString("utf8")).toBe("root 1 leaf 3\ntrue false\n4 leaf\n");
 });
 
-test("classes: increment 22 stage A lifts the gate for the emitter root; stage B lifts it again for %Readable ONLY — every OTHER stream root still refuses", async () => {
+test("classes: increment 22 stage A lifts the gate for the emitter root; stage B lifts it again for %Readable; stage C lifts it a THIRD time, at the CLASS level, for all five stream roots — %Duplex/%Transform/%PassThrough still refuse, but downstream of planning now, at their own construction libCalls", async () => {
   // The EventEmitter rock is gone: classes.ts's rootKind now answers
   // "emitter" (liftable) rather than "runtime" for a %EventEmitter-rooted
   // class, and plan() injects the two-field ScrEmitter prefix (registry
-  // ref, display name) past `vt`. Stage B (this increment's stage B)
-  // lifts the gate a second time, %Readable ONLY: rootKind's walk checks
-  // the literal name "%Readable" BEFORE the general RUNTIME_STREAM_
-  // CLASSES test, so a class whose walk hits %Readable first (a direct
-  // `extends Readable`, or a grandchild of one) answers "stream" and
-  // plans — one MORE injected field past the emitter pair (the lazily-
-  // allocated stream-state ref, stream.ts's $rState). %Writable (and,
-  // by the same "caught at the name it climbs through first" discipline,
-  // %Duplex/%Transform/%PassThrough, even though their OWN base chains
-  // pass through %Readable further up) still answer "runtime" and refuse
-  // unchanged — their C prefix embeds writable-side state this tier has
-  // no port of yet (stage C).
+  // ref, display name) past `vt`. Stage B (increment 22's stage B) lifts
+  // the gate a second time, %Readable ONLY: rootKind's walk checks the
+  // literal name "%Readable" BEFORE the general RUNTIME_STREAM_CLASSES
+  // test, so a class whose walk hits %Readable first (a direct `extends
+  // Readable`, or a grandchild of one) answers "stream" and plans — one
+  // MORE injected field past the emitter pair (the lazily-allocated
+  // stream-state ref, stream.ts's $rState).
+  //
+  // Stage C (this increment's own stage, the Writable/Duplex/Transform/
+  // PassThrough side) lifts rootKind's "stream" answer for EVERY
+  // RUNTIME_STREAM_CLASSES name, not %Readable alone — classes.ts's own
+  // comment at rootKind now spells it: "every RUNTIME_STREAM_CLASSES name
+  // ... is checked BEFORE the general runtime-class test". A subclass of
+  // any of the five roots plans and its class-level machinery (the
+  // struct, the field prefix, instanceof) is sound end to end — %Writable
+  // is claimed all the way through construction AND use (pass 1's own
+  // claims, 1688 onward). %Duplex/%Transform/%PassThrough are NOT yet
+  // claimed, but the refusal moved: it no longer fires at PLANNING
+  // (class:extends-runtime is gone from this shape entirely — the
+  // wasmSurvey no longer contains it), it fires downstream, at each
+  // root's own construction libCall (duplex.init/transform.init/
+  // passthrough.init — the super() call into the base constructor,
+  // measured directly against compile() below, not assumed from the
+  // corpus bucket names, which fold multiple constructs from one program
+  // into a single first-refusal bucket).
   const ee = await buildWasm(
     "extends-ee.ts",
     [
@@ -3601,22 +3624,88 @@ test("classes: increment 22 stage A lifts the gate for the emitter root; stage B
     expect(stdout.toString("utf8")).toBe("true\ntrue\nend\n");
   }
 
+  // `chunk: Buffer` — corpus 1741's own claimed shape (bytes-typed, not
+  // `unknown`): a `_write(chunk: unknown, ...)` override compiles (ok:
+  // true) but produces an INVALID module (WebAssembly.validate false,
+  // a call_ref[2] type mismatch in %w.ws.writeThunk — the C1 class of
+  // bug, found while writing THIS pin, not fixed here; reported
+  // separately, out of this round's C5 scope).
   const writableStream = await buildWasm(
     "extends-writable.ts",
     [
       'import { Writable } from "node:stream";',
       "class W extends Writable {",
-      "  _write(chunk: unknown, enc: string, cb: () => void): void { cb(); }",
+      "  _write(chunk: Buffer, enc: string, cb: () => void): void { cb(); }",
       "}",
       "const w = new W();",
       "console.log(w instanceof Writable);",
       "",
     ].join("\n"),
   );
-  expect(writableStream.ok).toBe(false);
-  if (!writableStream.ok) {
-    expect(writableStream.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
-    expect(writableStream.wasmSurvey).toContain("class:extends-runtime");
+  expect(writableStream.ok).toBe(true);
+  if (writableStream.ok) {
+    expect(WebAssembly.validate(readFileSync(writableStream.binaryPath))).toBe(true);
+    const { stdout } = await runWasm(writableStream.binaryPath);
+    expect(stdout.toString("utf8")).toBe("true\n");
+  }
+
+  // %Duplex/%Transform/%PassThrough: the CLASS plans (no class:extends-
+  // runtime refusal anywhere in the survey below), but construction still
+  // refuses — downstream, at each root's own libCall, named and loud.
+  const duplexStream = await buildWasm(
+    "extends-duplex.ts",
+    [
+      'import { Duplex } from "node:stream";',
+      "class D extends Duplex {",
+      "  _read(): void {}",
+      "  _write(chunk: unknown, enc: string, cb: () => void): void { cb(); }",
+      "}",
+      "const d = new D();",
+      "console.log(d instanceof Duplex);",
+      "",
+    ].join("\n"),
+  );
+  expect(duplexStream.ok).toBe(false);
+  if (!duplexStream.ok) {
+    expect(duplexStream.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
+    expect(duplexStream.diagnostics[0]?.message).toContain("libCall:duplex.init");
+    expect(duplexStream.wasmSurvey).not.toContain("class:extends-runtime");
+  }
+
+  const transformStream = await buildWasm(
+    "extends-transform.ts",
+    [
+      'import { Transform } from "node:stream";',
+      "class T extends Transform {",
+      "  _transform(chunk: unknown, enc: string, cb: () => void): void { cb(); }",
+      "}",
+      "const t = new T();",
+      "console.log(t instanceof Transform);",
+      "",
+    ].join("\n"),
+  );
+  expect(transformStream.ok).toBe(false);
+  if (!transformStream.ok) {
+    expect(transformStream.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
+    expect(transformStream.diagnostics[0]?.message).toContain("libCall:transform.init");
+    expect(transformStream.wasmSurvey).not.toContain("class:extends-runtime");
+  }
+
+  const passThroughStream = await buildWasm(
+    "extends-passthrough.ts",
+    [
+      'import { PassThrough } from "node:stream";',
+      "class P extends PassThrough {}",
+      "const p = new P();",
+      "console.log(p instanceof PassThrough);",
+      "",
+    ].join("\n"),
+  );
+  expect(passThroughStream.ok).toBe(false);
+  if (!passThroughStream.ok) {
+    expect(passThroughStream.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
+    expect(passThroughStream.diagnostics[0]?.message).toContain("libCall:passthrough.init");
+    expect(passThroughStream.wasmSurvey).not.toContain("class:extends-runtime");
   }
 });
 

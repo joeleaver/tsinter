@@ -154,6 +154,13 @@ import {
   SC_KIND_TEXT,
   SC_KIND_BUFFER,
   SC_KIND_JSON,
+  WS_HWM,
+  WS_WRITE_CLOS,
+  WS_WRITE_THUNK,
+  WS_FINAL_CLOS,
+  WS_FINAL_THUNK,
+  RS_DESTROY_CLOS,
+  RS_DESTROY_THUNK,
 } from "./stream.js";
 import { UnionBuilder, type UnionArmRep } from "./unions.js";
 import { Code } from "./code.js";
@@ -1381,6 +1388,114 @@ class Assembler {
     c.globalSet(exc.kindG);
   }
 
+  private reportUncaughtFunc: number | null = null;
+
+  /** %w.err.reportUncaught() — the wasm tier's missing half of S010's
+   * pattern: an unhandled promise rejection already prints "Unhandled
+   * promise rejection: <reason>" to fd 2 before its trap (promises.ts's
+   * emitReport); an uncaught THROW (S007) only ever traps, bare, no
+   * report at all — the native tier's own uncaught printer ("name:
+   * message") has no wasm-side counterpart. GATE FIX C5 (BLOCKING):
+   * confirmed general, not stream-specific — a bare unrelated fence
+   * (`debugger;` in a JS source) swallows identically, so this is the
+   * shared uncaught-report site, not a per-construct patch. Renders the
+   * pending exception cell exactly like emitReport renders a rejection
+   * reason — same tag encoding (EXC_F64/EXC_BOOL/EXC_STR/EXC_OBJ IS
+   * PROM_KIND's f64/bool/str/obj, wired from the same constants), same
+   * fallback spellings ("[object Object]" / "[object]") — labeled
+   * "Uncaught " instead of "Unhandled promise rejection: ". Both
+   * `_start`'s post-entry check (run(), below) and `_tick`'s per-callback
+   * death check (timers.ts's emitDeathCheck, via `deps.reportUncaught`)
+   * call this instead of a bare `unreachable` — a fence's pre-rendered,
+   * SC-coded message (e.g. "union types must match exactly: ... [SC2003
+   * at ...]") is exactly as worth printing as an unhandled rejection's
+   * reason already is, and a genuine user throw gets the same courtesy
+   * the native tier already extends it. Never returns. */
+  private reportUncaughtHelper(): number {
+    if (this.reportUncaughtFunc !== null) return this.reportUncaughtFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([], []), "%w.err.reportUncaught");
+    this.reportUncaughtFunc = idx;
+    const exc = this.exc();
+    const out = this.ensureHelpers();
+    const c = new Code();
+    const K = 0;
+    this.pushStrLitInto(c, "Uncaught ");
+    c.call(out.stage);
+    c.globalGet(exc.kindG);
+    c.localSet(K);
+    c.localGet(K);
+    c.i32Const(EXC_F64);
+    c.i32Eq();
+    c.ifVoid();
+    c.globalGet(exc.f64G);
+    c.call(this.f64ToStrHelper());
+    c.call(out.stage);
+    c.else_();
+    c.localGet(K);
+    c.i32Const(EXC_BOOL);
+    c.i32Eq();
+    c.ifVoid();
+    c.globalGet(exc.f64G);
+    c.f64Const(0);
+    c.f64Ne();
+    c.ifVoid();
+    this.pushStrLitInto(c, "true");
+    c.call(out.stage);
+    c.else_();
+    this.pushStrLitInto(c, "false");
+    c.call(out.stage);
+    c.end();
+    c.else_();
+    c.localGet(K);
+    c.i32Const(EXC_STR);
+    c.i32Eq();
+    c.ifVoid();
+    c.globalGet(exc.refG);
+    c.refCast(this.strType);
+    c.call(out.stage);
+    c.else_();
+    c.localGet(K);
+    c.i32Const(EXC_OBJ);
+    c.i32Eq();
+    c.ifVoid();
+    // %Error may be absent from the class graph entirely (a low-level
+    // unit test's hand-built IR with no error hierarchy at all — real
+    // frontend-emitted programs always have it, %Error is a builtin);
+    // emitErrIntervalTest would throw an emitter-bug Error asking for a
+    // class that was never planned, so skip straight to the same
+    // fallback an unrelated OBJ payload gets when the interval test
+    // itself answers false.
+    if (this.classes.meta("%Error") !== undefined) {
+      c.globalGet(exc.preG);
+      this.emitErrIntervalTest(c);
+    } else {
+      c.i32Const(0);
+    }
+    c.ifVoid();
+    c.globalGet(exc.refG);
+    c.refCast(exc.errT);
+    c.call(this.errToStrHelper());
+    c.call(out.stage);
+    c.else_();
+    this.pushStrLitInto(c, "[object Object]");
+    c.call(out.stage);
+    c.end();
+    c.else_();
+    this.pushStrLitInto(c, "[object]");
+    c.call(out.stage);
+    c.end(); // closes EXC_OBJ's ifVoid [E]
+    c.end(); // closes EXC_STR's ifVoid [D]
+    c.end(); // closes EXC_BOOL's ifVoid [B]
+    c.end(); // closes EXC_F64's ifVoid [A]
+    c.i32Const(0x0a);
+    c.call(out.putc);
+    c.i32Const(FD_STDERR);
+    c.call(out.flush);
+    c.unreachable();
+    this.mb.setBody(idx, [I32], c.bytes());
+    return idx;
+  }
+
   /** A builtin error class's interval global — errT's `vt` operand. */
   private pushErrVt(className: string): void {
     this.fn.code.globalGet(this.classes.vtGlobal(className));
@@ -1615,9 +1730,16 @@ class Assembler {
         // exits — SEMANTICS.md S007's surviving half). BEFORE the drain,
         // deliberately: a synchronous uncaught throw exits without
         // running a single microtask, which is Node's order.
+        // GATE FIX C5 (BLOCKING): the bare `unreachable` used to be the
+        // whole story — no report at all, unlike S010's unhandled-
+        // rejection trap a few lines below, which already prints its
+        // reason first. reportUncaughtHelper is that same "print, then
+        // trap" shape for the throw side (fd 2 only — S007's stderr
+        // exemption on a nonzero exit means this is never a differential
+        // requirement, only a loudness one CLAUDE.md already asks for).
         c.globalGet(this.exc().kindG);
         c.ifVoid();
-        c.unreachable();
+        c.call(this.reportUncaughtHelper());
         c.end();
       }
       // The first checkpoint: run microtasks (and, once a module calls
@@ -2743,6 +2865,7 @@ class Assembler {
         return this.nowFunc;
       },
       excKind: () => this.exc().kindG,
+      reportUncaught: () => this.reportUncaughtHelper(),
       checkpoint: (c) => this.emitCheckpoint(c),
     });
     return this.timersField;
@@ -2760,6 +2883,7 @@ class Assembler {
     this.nextTickField ??= new NextTickBuilder(this.mb, {
       voidClos: () => this.closPairFor([], []),
       excKind: () => this.exc().kindG,
+      reportUncaught: () => this.reportUncaughtHelper(),
     });
     return this.nextTickField;
   }
@@ -2921,6 +3045,7 @@ class Assembler {
       vecStruct: (strings) => this.vecInfoFor(arrayOf(strings ? STRING : BYTES_U8) as IrType & { kind: "array" }, undefined)!.struct,
       vecBufType: (strings) => this.vecInfoFor(arrayOf(strings ? STRING : BYTES_U8) as IrType & { kind: "array" }, undefined)!.bufType,
       vecElemVal: (strings) => this.vecInfoFor(arrayOf(strings ? STRING : BYTES_U8) as IrType & { kind: "array" }, undefined)!.elemVal,
+      voidClos: () => this.closPairFor([], []),
     });
     return this.streamField;
   }
@@ -2983,6 +3108,27 @@ class Assembler {
     if (thisParam === undefined) {
       throw new Error("wasm emitter bug: a _read closure's lifted type has no `this` parameter");
     }
+    // STAGE C FIX (authorized at the checkpoint): a checked-dynamic VALUE
+    // (`read: wrap(fn)`, lowerStreamCallbackValue's "thisless" adapterT —
+    // every position dyn-boxed, no leading `this` param) is a DIFFERENT
+    // lifted shape this thunk was never built for — `thisParam.kind ===
+    // "dyn"` in that case, and the OLD code proceeded anyway (mapType(dyn)
+    // answers a "ref"-kind ValType too, so the `thisT.kind !== "ref"`
+    // guard below never caught it), refCasting the REAL `this` (a
+    // %Readable-rooted ref) down to a dyn-box struct type — wasm accepts
+    // the refCast as valid (both are heap types) but the cast FAILS at
+    // RUNTIME, trapping — a silent-wrong-shape bug, not a compile error,
+    // found via execution (an isolated repro: node exit 0 with real
+    // output, wasm exit 1) — writeThunkFor/finalThunkFor/destroyThunkFor
+    // (stage C, same file) already guard this; this closes the same gap
+    // on pass 1's `_read` side. Refusing here is CENSUS-NEUTRAL: no
+    // corpus program claimed this shape before (it only ever trapped),
+    // so nothing claimed can regress — the trap becomes a loud refusal
+    // instead of a silent wrong exit code.
+    if (thisParam.kind === "dyn") {
+      this.refuse("libCall:readable.new:dyn-callback-value", loc);
+      return null;
+    }
     const thisT = this.mapType(thisParam, loc);
     if (thisT === null || thisT.kind !== "ref") return null;
     const idx = this.mb.declareFunc(this.stream.readThunkSig(), `%w.rs.readThunk:${key}`);
@@ -2998,6 +3144,380 @@ class Assembler {
     c.refCast(thisT.typeIndex); // arg1: `this`, downcast to the declaring class
     if (t.params.length === 2) {
       c.localGet(SIZE); // arg2: the optional `size` param
+    }
+    c.localGet(CL);
+    c.structGet(pair.clos, 0);
+    c.callRef(pair.fn);
+    if (t.ret.kind !== "void") c.drop();
+    this.mb.setBody(idx, [closRef], c.bytes());
+    return idx;
+  }
+
+  private readonly doneClosFns = new Map<string, { struct: number; fn: number } | null>();
+
+  /** The `_write`/`_final` completion callback the RUNTIME hands to a
+   * user override — the reverse of `readThunkFor`: instead of adapting a
+   * user closure to a uniform runtime signature, this builds a runtime-
+   * authored closure of the USER's own declared signature (env-subtype
+   * of `closSigFor(cbType).clos`, `dynFnAdapter`'s exact pattern reused
+   * for a non-dyn purpose), one per distinct declared signature (cached
+   * by key — different override sites may still agree, since Node's
+   * ambient types give this parameter one canonical shape almost always).
+   * Supports exactly the two shapes that shape produces: zero declared
+   * params (every completion is treated as error-free — 1688/1689/1741/
+   * 1811 all call back with no arguments), or one param mapping to a
+   * 2-arm union with a nullish arm (`nullT`/`undefinedT`, TypeScript's
+   * `?` erasure — S020) and an object arm (any Error-rooted class, since
+   * a user's own error subclass is a legal `Error` value too) — read off
+   * the union's tag (unions.ts: field 0), never assumed. Any other
+   * declared shape refuses by name rather than guessing at a shape no
+   * claim this stage exercises. */
+  private doneClosFor(
+    cbType: IrType & { kind: "func" },
+    kind: "write" | "final" | "destroy",
+    loc: SrcLoc | undefined,
+  ): { struct: number; fn: number } | null {
+    const key = `${kind}:${typeKey(cbType)}`;
+    const hit = this.doneClosFns.get(key);
+    if (hit !== undefined) return hit;
+    const pair = this.closSigFor(cbType, loc);
+    if (pair === null) {
+      this.doneClosFns.set(key, null);
+      return null;
+    }
+    const rootInfo = this.classInfo("%Readable", loc);
+    if (rootInfo === null) {
+      this.doneClosFns.set(key, null);
+      return null;
+    }
+    const rootRef = this.classes.ref(rootInfo);
+    const ROOT_FIELD = 1;
+    const WREQ_FIELD = 2; // write only
+    const fields: FieldType[] = [
+      { storage: { kind: "ref", nullable: false, typeIndex: pair.fn }, mutable: false },
+      { storage: rootRef, mutable: false },
+    ];
+    if (kind === "write") fields.push({ storage: this.stream.wReqRef(), mutable: false });
+    const struct = this.mb.subStructType(`doneclos:${key}`, fields, pair.clos);
+    const idx = this.mb.declareFunc(pair.fn, `%w.ws.doneClos:${key}`);
+    const made = { struct, fn: idx };
+    this.doneClosFns.set(key, made);
+    const c = new Code();
+    const SELF = 0;
+    const SELFT = cbType.params.length + 1;
+    c.localGet(SELF);
+    c.refCast(struct);
+    c.localSet(SELFT);
+    c.localGet(SELFT);
+    c.structGet(struct, ROOT_FIELD);
+    // NOTE: `afterWriteCore`/`finalDoneCore` take (root, errRef) only —
+    // WHICH request just completed is `state.head` itself (the FIFO
+    // invariant: exactly one write is ever in flight, always the queue's
+    // current head), so the env's WREQ_FIELD (kept for a future need) is
+    // never pushed as a call argument here.
+    const errRefType: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+    if (cbType.params.length === 0) {
+      c.refNull(this.exc().errT);
+    } else if (cbType.params.length === 1) {
+      const pType = cbType.params[0]!;
+      let ok = false;
+      if (pType.kind === "union") {
+        // Node's ambient error-first callback type is `(error?: Error |
+        // null) => void` — the `?` erasure (S020) ADDS `undefined` on top
+        // of the already-nullable `Error | null`, so this is a 3-arm
+        // union in practice (measured: nullT + object(%Error) +
+        // undefinedT). Generalized over arm COUNT: exactly one "object"
+        // arm (the error) and every other arm nullish (nullT/undefinedT)
+        // — anything else is an unmeasured shape this stage refuses by
+        // name rather than guesses at.
+        const def = this.unionDef(pType.unionId);
+        const errIdx = def.arms.findIndex((a) => a.kind === "object");
+        const allOthersNullish =
+          errIdx >= 0 && def.arms.every((a, i) => i === errIdx || a.kind === "nullT" || a.kind === "undefinedT");
+        if (errIdx >= 0 && allOthersNullish) {
+          const errArmStruct = this.unionArmStruct(pType.unionId, errIdx, loc);
+          if (errArmStruct !== null) {
+            c.localGet(1);
+            c.structGet(this.unions.base(), 0); // TAG
+            c.i32Const(errIdx);
+            c.i32Eq();
+            c.ifResult(errRefType);
+            c.localGet(1);
+            c.refCast(errArmStruct);
+            c.structGet(errArmStruct, 1); // PAYLOAD
+            c.else_();
+            c.refNull(this.exc().errT);
+            c.end();
+            ok = true;
+          }
+        }
+      }
+      if (!ok) {
+        this.refuse(`libCall:writable.${kind}-callback:unsupported-shape`, loc);
+        return this.doneClosDead(idx, made);
+      }
+    } else {
+      this.refuse(`libCall:writable.${kind}-callback:arity-${cbType.params.length}`, loc);
+      return this.doneClosDead(idx, made);
+    }
+    c.call(
+      kind === "write"
+        ? this.stream.afterWriteCore()
+        : kind === "final"
+          ? this.stream.finalDoneCore()
+          : this.stream.destroyErrDefaultCore(),
+    );
+    this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: struct }], c.bytes());
+    return made;
+  }
+
+  /** A `doneClosFor` refusal already recorded a diagnostic — the function
+   * was DECLARED (its index is live, possibly already referenced by a
+   * cached `struct`) so it still needs a valid (if dead) body: an
+   * `unreachable` walker body, `walkerDead`'s own precedent. */
+  private doneClosDead(idx: number, made: { struct: number; fn: number }): { struct: number; fn: number } | null {
+    this.walkerDead(idx);
+    return made; // struct/fn indices stay valid wasm even though the body traps
+  }
+
+  /** `_write`'s adapter (mirrors `readThunkFor`): builds the done-closure
+   * for the DECLARED prefix's trailing callback slot (when present) and
+   * calls the user's lifted `_write` closure with whatever prefix it
+   * declared. `t` is the LIFTED type (`this` first, per
+   * `streamMethodWrapper`'s own shape — the readThunkFor precedent). */
+  private writeThunkFor(t: IrType & { kind: "func" }, loc: SrcLoc | undefined): number | null {
+    const key = typeKey(t);
+    const hit = this.writeThunkFns.get(key);
+    if (hit !== undefined) return hit;
+    const pair = this.closSigFor(t, loc);
+    if (pair === null) return null;
+    const thisParam = t.params[0];
+    if (thisParam === undefined) throw new Error("wasm emitter bug: a _write closure's lifted type has no `this` parameter");
+    // A checked-dynamic VALUE (`write: wrap(fn)`, lowerStreamCallbackValue's
+    // "thisless" adapterT — every position dyn-boxed, no leading `this`
+    // param at all) is a DIFFERENT lifted shape this thunk does not build
+    // for (it would need dyn-boxing the chunk/encoding and unboxing a dyn
+    // return, real new machinery) — refuse by name rather than emit a
+    // static-type mismatch (found via execution: readThunkFor's PRE-
+    // EXISTING equivalent doesn't guard this either and instead produces
+    // wasm that validates but TRAPS at runtime on the bad refCast — worse
+    // than a loud refusal; reported, not silently matched here).
+    if (thisParam.kind === "dyn") {
+      this.refuse("libCall:writable.write:dyn-callback-value", loc);
+      return null;
+    }
+    // GATE FIX (chunk:unknown invalid-wasm, C1's class — found writing
+    // stage C's own test coverage, NOT reachable by any claim): stream.
+    // ts's writeThunkSig is a FIXED generic dispatch signature — chunk is
+    // always `bytes`, encoding is always the literal "buffer" string (its
+    // own doc comment) — so a `_write` override that declares chunk or
+    // encoding as `unknown` (dyn) lifts to a per-instance closure type
+    // (`pair.fn`, built from the OVERRIDE's own declared signature) whose
+    // matching slot expects a dyn box, while the values this thunk
+    // actually has on hand are the fixed bytes/string locals. Pushing one
+    // into a call_ref built for the other is a genuine operand-type
+    // mismatch — WebAssembly.validate false, not a soft coercion (found
+    // via execution: compiled ok:true, instantiate threw "call_ref[2]
+    // expected type ... found local.get of type ..."). Real dyn-chunk/
+    // dyn-encoding support needs the override's own value dyn-boxed
+    // before the call — pass 2's adapter-machinery family, the same
+    // shape as the dyn-callback-value guards immediately above and
+    // below, not this round's.
+    if (t.params[1]?.kind === "dyn") {
+      this.refuse("libCall:writable.write:dyn-chunk-override", loc);
+      return null;
+    }
+    if (t.params[2]?.kind === "dyn") {
+      this.refuse("libCall:writable.write:dyn-encoding-override", loc);
+      return null;
+    }
+    const thisT = this.mapType(thisParam, loc);
+    if (thisT === null || thisT.kind !== "ref") return null;
+    const idx = this.mb.declareFunc(this.stream.writeThunkSig(), `%w.ws.writeThunk:${key}`);
+    this.writeThunkFns.set(key, idx);
+    const c = new Code();
+    const CLOS = 0, THIS = 1, CHUNK = 2, ENC = 3, WREQ = 4, CL = 5;
+    const closRef: ValType = { kind: "ref", nullable: true, typeIndex: pair.clos };
+    c.localGet(CLOS);
+    c.refCast(pair.clos);
+    c.localSet(CL);
+    c.localGet(CL); // arg0: the closure itself
+    c.localGet(THIS);
+    c.refCast(thisT.typeIndex); // arg1: `this`, downcast to the declaring class
+    if (t.params.length >= 2) c.localGet(CHUNK);
+    if (t.params.length >= 3) c.localGet(ENC);
+    if (t.params.length >= 4) {
+      const cbType = t.params[3];
+      if (cbType === undefined || cbType.kind !== "func") {
+        this.refuse("libCall:writable.write:non-func-callback", loc);
+        c.unreachable();
+        this.mb.setBody(idx, [closRef], c.bytes());
+        return idx;
+      }
+      const dc = this.doneClosFor(cbType, "write", loc);
+      if (dc === null) {
+        c.unreachable();
+        this.mb.setBody(idx, [closRef], c.bytes());
+        return idx;
+      }
+      this.mb.declareFuncRef(dc.fn);
+      c.refFunc(dc.fn);
+      c.localGet(THIS);
+      c.localGet(WREQ);
+      c.structNew(dc.struct);
+    }
+    c.localGet(CL);
+    c.structGet(pair.clos, 0);
+    c.callRef(pair.fn);
+    if (t.ret.kind !== "void") c.drop();
+    this.mb.setBody(idx, [closRef], c.bytes());
+    return idx;
+  }
+
+  private readonly writeThunkFns = new Map<string, number>();
+  private readonly finalThunkFns = new Map<string, number>();
+
+  /** `_final`'s adapter — `writeThunkFor`'s exact shape, one parameter
+   * narrower (no chunk/encoding, only the declared-prefix axis over the
+   * completion callback itself). */
+  private finalThunkFor(t: IrType & { kind: "func" }, loc: SrcLoc | undefined): number | null {
+    const key = typeKey(t);
+    const hit = this.finalThunkFns.get(key);
+    if (hit !== undefined) return hit;
+    const pair = this.closSigFor(t, loc);
+    if (pair === null) return null;
+    const thisParam = t.params[0];
+    if (thisParam === undefined) throw new Error("wasm emitter bug: a _final closure's lifted type has no `this` parameter");
+    if (thisParam.kind === "dyn") {
+      // writeThunkFor's own guard, same reasoning: a thisless dyn-boxed
+      // value shape this thunk does not build for.
+      this.refuse("libCall:writable.final:dyn-callback-value", loc);
+      return null;
+    }
+    const thisT = this.mapType(thisParam, loc);
+    if (thisT === null || thisT.kind !== "ref") return null;
+    const idx = this.mb.declareFunc(this.stream.finalThunkSig(), `%w.ws.finalThunk:${key}`);
+    this.finalThunkFns.set(key, idx);
+    const c = new Code();
+    const CLOS = 0, THIS = 1, CL = 2;
+    const closRef: ValType = { kind: "ref", nullable: true, typeIndex: pair.clos };
+    c.localGet(CLOS);
+    c.refCast(pair.clos);
+    c.localSet(CL);
+    c.localGet(CL);
+    c.localGet(THIS);
+    c.refCast(thisT.typeIndex);
+    if (t.params.length >= 2) {
+      const cbType = t.params[1];
+      if (cbType === undefined || cbType.kind !== "func") {
+        this.refuse("libCall:writable.final:non-func-callback", loc);
+        c.unreachable();
+        this.mb.setBody(idx, [closRef], c.bytes());
+        return idx;
+      }
+      const dc = this.doneClosFor(cbType, "final", loc);
+      if (dc === null) {
+        c.unreachable();
+        this.mb.setBody(idx, [closRef], c.bytes());
+        return idx;
+      }
+      this.mb.declareFuncRef(dc.fn);
+      c.refFunc(dc.fn);
+      c.localGet(THIS);
+      c.structNew(dc.struct);
+    }
+    c.localGet(CL);
+    c.structGet(pair.clos, 0);
+    c.callRef(pair.fn);
+    if (t.ret.kind !== "void") c.drop();
+    this.mb.setBody(idx, [closRef], c.bytes());
+    return idx;
+  }
+
+  private readonly destroyThunkFns = new Map<string, number>();
+
+  /** `_destroy`'s adapter — `writeThunkFor`'s shape with `err` where
+   * chunk/encoding sit (the declared prefix is `(this, err?, cb?)`,
+   * `cbTuples`'s own `destroy: [errorOrNull(L), "fn"]` tuple). */
+  private destroyThunkFor(t: IrType & { kind: "func" }, loc: SrcLoc | undefined): number | null {
+    const key = typeKey(t);
+    const hit = this.destroyThunkFns.get(key);
+    if (hit !== undefined) return hit;
+    const pair = this.closSigFor(t, loc);
+    if (pair === null) return null;
+    const thisParam = t.params[0];
+    if (thisParam === undefined) throw new Error("wasm emitter bug: a _destroy closure's lifted type has no `this` parameter");
+    if (thisParam.kind === "dyn") {
+      this.refuse("libCall:stream.destroy:dyn-callback-value", loc);
+      return null;
+    }
+    const thisT = this.mapType(thisParam, loc);
+    if (thisT === null || thisT.kind !== "ref") return null;
+    const idx = this.mb.declareFunc(this.stream.destroyThunkSig(), `%w.rs.destroyThunk:${key}`);
+    this.destroyThunkFns.set(key, idx);
+    const c = new Code();
+    const CLOS = 0, THIS = 1, ERR = 2, CL = 3;
+    const closRef: ValType = { kind: "ref", nullable: true, typeIndex: pair.clos };
+    c.localGet(CLOS);
+    c.refCast(pair.clos);
+    c.localSet(CL);
+    c.localGet(CL);
+    c.localGet(THIS);
+    c.refCast(thisT.typeIndex);
+    if (t.params.length >= 2) {
+      // The lifted `_destroy(err, cb)`'s `err` parameter is `errorOrNull`
+      // (lower-stream.ts's `cbTuples`) — a real 2-arm TAGGED union
+      // (Error-rooted object | nullT), not a bare nullable ref, so the
+      // runtime's plain `errRef` (destroyThunkSig's own param) must be
+      // BOXED into that shape before this call — the readable.read()
+      // union-construction precedent (raw nullable value -> tagged
+      // union), one arm wide.
+      const errParamType = t.params[1];
+      if (errParamType === undefined || errParamType.kind !== "union") {
+        this.refuse("libCall:stream.destroy:unsupported-err-param", loc);
+        c.unreachable();
+        this.mb.setBody(idx, [closRef], c.bytes());
+        return idx;
+      }
+      const def = this.unionDef(errParamType.unionId);
+      const nullTag = def.arms.findIndex((a) => a.kind === "nullT");
+      const errTag = def.arms.findIndex((a) => a.kind === "object");
+      const errArmSt = errTag >= 0 ? this.unionArmStruct(errParamType.unionId, errTag, loc) : null;
+      const unionVal = this.mapType(errParamType, loc);
+      if (nullTag < 0 || errTag < 0 || errArmSt === null || unionVal === null) {
+        this.refuse("libCall:stream.destroy:unsupported-err-param", loc);
+        c.unreachable();
+        this.mb.setBody(idx, [closRef], c.bytes());
+        return idx;
+      }
+      c.localGet(ERR);
+      c.refIsNull();
+      c.ifResult(unionVal);
+      c.globalGet(this.unions.unitGlobal(nullTag));
+      c.else_();
+      c.i32Const(errTag);
+      c.localGet(ERR);
+      c.structNew(errArmSt);
+      c.end();
+    }
+    if (t.params.length >= 3) {
+      const cbType = t.params[2];
+      if (cbType === undefined || cbType.kind !== "func") {
+        this.refuse("libCall:stream.destroy:non-func-callback", loc);
+        c.unreachable();
+        this.mb.setBody(idx, [closRef], c.bytes());
+        return idx;
+      }
+      const dc = this.doneClosFor(cbType, "destroy", loc);
+      if (dc === null) {
+        c.unreachable();
+        this.mb.setBody(idx, [closRef], c.bytes());
+        return idx;
+      }
+      this.mb.declareFuncRef(dc.fn);
+      c.refFunc(dc.fn);
+      c.localGet(THIS);
+      c.structNew(dc.struct);
     }
     c.localGet(CL);
     c.structGet(pair.clos, 0);
@@ -15126,28 +15646,50 @@ class Assembler {
         const flags = flagsArg.value;
         const hasRead = (flags & 1) !== 0;
         const hasDestroy = (flags & 2) !== 0;
-        if (!hasRead) {
-          this.refuse(`libCall:${e.fn}:no-read`, e.loc);
-          code.unreachable();
-          return true;
+        // Construct-WITHOUT-read (2312/2313's underscore-assign shape,
+        // 1810's bare `new Readable(undefined)`): `_read`/`stream.
+        // setRead` binds it later, or it's never bound at all — Node's
+        // OWN default `_read` throws ERR_METHOD_NOT_IMPLEMENTED, but
+        // `callRead`'s existing null-RS_READ_CLOS guard is a silent
+        // no-op instead (a NAMED divergence, unexercised by any claim:
+        // every claim this stage either binds `_read` before the stream
+        // could ever need one, or never triggers a real read cycle at
+        // all — `push(null)` before any `.read()`/'data' consumption).
+        let readCbExpr: Extract<IrExpr, { kind: "libCall" }>["args"][number] | null = null;
+        let readThunkIdx: number | null = null;
+        if (hasRead) {
+          readCbExpr = e.args[base + 4]!;
+          if (readCbExpr.type.kind !== "func") {
+            this.refuse(`libCall:${e.fn}:non-func-read`, e.loc);
+            code.unreachable();
+            return true;
+          }
+          readThunkIdx = this.readThunkFor(readCbExpr.type, e.loc);
+          if (readThunkIdx === null) {
+            code.unreachable();
+            return true;
+          }
+          this.mb.declareFuncRef(readThunkIdx);
         }
+        // streamCtorShape("%Readable").accepted = ["read", "destroy"] —
+        // destroy trails read in the cbs tail when both are present; its
+        // index shifts left by one when `read` itself is absent.
+        let destroyCbExpr: Extract<IrExpr, { kind: "libCall" }>["args"][number] | null = null;
+        let destroyThunkIdx: number | null = null;
         if (hasDestroy) {
-          this.refuse(`libCall:${e.fn}:destroy-cb`, e.loc);
-          code.unreachable();
-          return true;
+          destroyCbExpr = e.args[base + 4 + (hasRead ? 1 : 0)]!;
+          if (destroyCbExpr.type.kind !== "func") {
+            this.refuse(`libCall:${e.fn}:non-func-destroy`, e.loc);
+            code.unreachable();
+            return true;
+          }
+          destroyThunkIdx = this.destroyThunkFor(destroyCbExpr.type, e.loc);
+          if (destroyThunkIdx === null) {
+            code.unreachable();
+            return true;
+          }
+          this.mb.declareFuncRef(destroyThunkIdx);
         }
-        const readCbExpr = e.args[base + 4]!;
-        if (readCbExpr.type.kind !== "func") {
-          this.refuse(`libCall:${e.fn}:non-func-read`, e.loc);
-          code.unreachable();
-          return true;
-        }
-        const readThunkIdx = this.readThunkFor(readCbExpr.type, e.loc);
-        if (readThunkIdx === null) {
-          code.unreachable();
-          return true;
-        }
-        this.mb.declareFuncRef(readThunkIdx);
         let recvVal: ValType;
         if (isInit) {
           const rv = this.mapType(e.args[0]!.type, e.loc);
@@ -15203,12 +15745,22 @@ class Assembler {
         code.localGet(st);
         this.walkExpr(e.args[base + 2]!); // emitClose
         code.structSet(this.stream.stateT(), RS_EMIT_CLOSE);
-        code.localGet(st);
-        this.walkExpr(readCbExpr);
-        code.structSet(this.stream.stateT(), RS_READ_CLOS);
-        code.localGet(st);
-        code.refFunc(readThunkIdx);
-        code.structSet(this.stream.stateT(), RS_READ_THUNK);
+        if (readCbExpr !== null && readThunkIdx !== null) {
+          code.localGet(st);
+          this.walkExpr(readCbExpr);
+          code.structSet(this.stream.stateT(), RS_READ_CLOS);
+          code.localGet(st);
+          code.refFunc(readThunkIdx);
+          code.structSet(this.stream.stateT(), RS_READ_THUNK);
+        }
+        if (destroyCbExpr !== null && destroyThunkIdx !== null) {
+          code.localGet(st);
+          this.walkExpr(destroyCbExpr);
+          code.structSet(this.stream.stateT(), RS_DESTROY_CLOS);
+          code.localGet(st);
+          code.refFunc(destroyThunkIdx);
+          code.structSet(this.stream.stateT(), RS_DESTROY_THUNK);
+        }
         if (isInit) {
           this.releaseScratch(this.stream.stateRef(), st);
           this.releaseScratch(recvVal, recv);
@@ -15218,6 +15770,339 @@ class Assembler {
         this.releaseScratch(this.stream.stateRef(), st);
         this.releaseScratch(recvVal, recv);
         return true;
+      }
+      /* ── STAGE C ────────────────────────────────────────────────────── */
+      case "writable.new":
+      case "writable.init": {
+        const isInit = e.fn === "writable.init";
+        const base = isInit ? 1 : 0;
+        const flagsArg = e.args[base + 3]!;
+        if (flagsArg.kind !== "numLit") {
+          this.refuse(`libCall:${e.fn}:dynamic-flags`, e.loc);
+          code.unreachable();
+          return true;
+        }
+        const flags = flagsArg.value;
+        // streamCtorShape("%Writable").accepted = ["write", "final", "destroy"].
+        const hasWrite = (flags & 1) !== 0;
+        const hasFinal = (flags & 2) !== 0;
+        const hasDestroy = (flags & 4) !== 0;
+        // Construct-WITHOUT-write (2313's underscore-assign shape,
+        // readable.new's `no-read` precedent exactly): `stream.setWrite`
+        // binds it later, always BEFORE any claimed program's first real
+        // `write()` call — `doWriteCore`'s `callRef` against a still-null
+        // WS_WRITE_THUNK would trap otherwise, unexercised by any claim.
+        let cbIdx = base + 4;
+        let writeCbExpr: Extract<IrExpr, { kind: "libCall" }>["args"][number] | null = null;
+        let writeThunkIdx: number | null = null;
+        if (hasWrite) {
+          writeCbExpr = e.args[cbIdx]!;
+          cbIdx++;
+          if (writeCbExpr.type.kind !== "func") {
+            this.refuse(`libCall:${e.fn}:non-func-write`, e.loc);
+            code.unreachable();
+            return true;
+          }
+          writeThunkIdx = this.writeThunkFor(writeCbExpr.type, e.loc);
+          if (writeThunkIdx === null) {
+            code.unreachable();
+            return true;
+          }
+          this.mb.declareFuncRef(writeThunkIdx);
+        }
+        let finalCbExpr: Extract<IrExpr, { kind: "libCall" }>["args"][number] | null = null;
+        let finalThunkIdx: number | null = null;
+        if (hasFinal) {
+          finalCbExpr = e.args[cbIdx]!;
+          cbIdx++;
+          if (finalCbExpr.type.kind !== "func") {
+            this.refuse(`libCall:${e.fn}:non-func-final`, e.loc);
+            code.unreachable();
+            return true;
+          }
+          finalThunkIdx = this.finalThunkFor(finalCbExpr.type, e.loc);
+          if (finalThunkIdx === null) {
+            code.unreachable();
+            return true;
+          }
+          this.mb.declareFuncRef(finalThunkIdx);
+        }
+        let destroyCbExpr: Extract<IrExpr, { kind: "libCall" }>["args"][number] | null = null;
+        let destroyThunkIdx: number | null = null;
+        if (hasDestroy) {
+          destroyCbExpr = e.args[cbIdx]!;
+          cbIdx++;
+          if (destroyCbExpr.type.kind !== "func") {
+            this.refuse(`libCall:${e.fn}:non-func-destroy`, e.loc);
+            code.unreachable();
+            return true;
+          }
+          destroyThunkIdx = this.destroyThunkFor(destroyCbExpr.type, e.loc);
+          if (destroyThunkIdx === null) {
+            code.unreachable();
+            return true;
+          }
+          this.mb.declareFuncRef(destroyThunkIdx);
+        }
+        let recvVal: ValType;
+        if (isInit) {
+          const rv = this.mapType(e.args[0]!.type, e.loc);
+          if (rv === null) {
+            code.unreachable();
+            return true;
+          }
+          recvVal = rv;
+          this.walkExpr(e.args[0]!);
+        } else {
+          const info = this.classInfo("%Writable", e.loc);
+          if (info === null) {
+            code.unreachable();
+            return true;
+          }
+          recvVal = this.classes.ref(info);
+          this.emitAlloc(code, "%Writable", info);
+        }
+        const recv = this.acquireScratch(recvVal);
+        code.localSet(recv);
+        code.localGet(recv);
+        code.call(this.stream.stateEnsure());
+        const st = this.acquireScratch(this.stream.stateRef());
+        code.localSet(st);
+        code.localGet(st);
+        // hwm: the readable.new/init precedent exactly, WS_HWM's own slot.
+        const hwmLocal = this.acquireScratch(F64);
+        this.walkExpr(e.args[base + 0]!);
+        code.localSet(hwmLocal);
+        code.localGet(hwmLocal);
+        code.f64Const(0);
+        code.f64Lt();
+        this.openIfResult(F64);
+        code.f64Const(65536);
+        code.else_();
+        code.localGet(hwmLocal);
+        this.close();
+        this.releaseScratch(F64, hwmLocal);
+        code.structSet(this.stream.stateT(), WS_HWM);
+        code.localGet(st);
+        this.walkExpr(e.args[base + 1]!); // autoDestroy
+        code.structSet(this.stream.stateT(), RS_AUTO_DESTROY);
+        code.localGet(st);
+        this.walkExpr(e.args[base + 2]!); // emitClose
+        code.structSet(this.stream.stateT(), RS_EMIT_CLOSE);
+        if (writeCbExpr !== null && writeThunkIdx !== null) {
+          code.localGet(st);
+          this.walkExpr(writeCbExpr);
+          code.structSet(this.stream.stateT(), WS_WRITE_CLOS);
+          code.localGet(st);
+          code.refFunc(writeThunkIdx);
+          code.structSet(this.stream.stateT(), WS_WRITE_THUNK);
+        }
+        if (finalCbExpr !== null && finalThunkIdx !== null) {
+          code.localGet(st);
+          this.walkExpr(finalCbExpr);
+          code.structSet(this.stream.stateT(), WS_FINAL_CLOS);
+          code.localGet(st);
+          code.refFunc(finalThunkIdx);
+          code.structSet(this.stream.stateT(), WS_FINAL_THUNK);
+        }
+        if (destroyCbExpr !== null && destroyThunkIdx !== null) {
+          code.localGet(st);
+          this.walkExpr(destroyCbExpr);
+          code.structSet(this.stream.stateT(), RS_DESTROY_CLOS);
+          code.localGet(st);
+          code.refFunc(destroyThunkIdx);
+          code.structSet(this.stream.stateT(), RS_DESTROY_THUNK);
+        }
+        if (isInit) {
+          this.releaseScratch(this.stream.stateRef(), st);
+          this.releaseScratch(recvVal, recv);
+          return true; // void
+        }
+        code.localGet(recv);
+        this.releaseScratch(this.stream.stateRef(), st);
+        this.releaseScratch(recvVal, recv);
+        return true;
+      }
+      case "writable.write":
+      case "writable.writeStr": {
+        const recvT = e.args[0]!.type;
+        const recvVal = this.mapType(recvT, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        if (e.fn === "writable.writeStr") code.call(this.bytesB.fromStrHelper("utf8"));
+        if (e.args[2] !== undefined) {
+          this.walkExpr(e.args[2]!);
+        } else {
+          code.refNull(this.closPairFor([], []).clos);
+        }
+        code.call(this.stream.writeCore());
+        return true;
+      }
+      case "writable.cork":
+      case "writable.uncork": {
+        const recvT = e.args[0]!.type;
+        const recvVal = this.mapType(recvT, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        this.walkExpr(e.args[0]!);
+        code.call(e.fn === "writable.cork" ? this.stream.corkCore() : this.stream.uncorkCore());
+        return true; // VOID
+      }
+      case "writable.end": {
+        const flagsArg = e.args[1]!;
+        if (flagsArg.kind !== "numLit") {
+          this.refuse("libCall:writable.end:dynamic-flags", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const flags = flagsArg.value;
+        const hasBytes = (flags & 1) !== 0;
+        const hasStr = (flags & 2) !== 0;
+        const hasCb = (flags & 4) !== 0;
+        const hasDyn = (flags & 8) !== 0;
+        if (hasDyn) {
+          this.refuse("libCall:writable.end:dyn-chunk", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const recvT = e.args[0]!.type;
+        const recvVal = this.mapType(recvT, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        const recv = this.acquireScratch(recvVal);
+        this.walkExpr(e.args[0]!);
+        code.localSet(recv);
+        let tailIdx = 2;
+        code.localGet(recv);
+        if (hasBytes || hasStr) {
+          this.walkExpr(e.args[tailIdx]!);
+          if (hasStr) code.call(this.bytesB.fromStrHelper("utf8"));
+          tailIdx++;
+          code.i32Const(1);
+        } else {
+          code.refNull(this.bytesB.bytesType());
+          code.i32Const(0);
+        }
+        if (hasCb) {
+          this.walkExpr(e.args[tailIdx]!);
+          tailIdx++;
+          code.i32Const(1);
+        } else {
+          code.refNull(this.closPairFor([], []).clos);
+          code.i32Const(0);
+        }
+        code.call(this.stream.endCore());
+        code.localGet(recv);
+        this.releaseScratch(recvVal, recv);
+        return true;
+      }
+      case "stream.setRead": {
+        const recvT = e.args[0]!.type;
+        const recvVal = this.mapType(recvT, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        const cbExpr = e.args[1]!;
+        if (cbExpr.type.kind !== "func") {
+          this.refuse("libCall:stream.setRead:non-func", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const thunkIdx = this.readThunkFor(cbExpr.type, e.loc);
+        if (thunkIdx === null) {
+          code.unreachable();
+          return true;
+        }
+        this.mb.declareFuncRef(thunkIdx);
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(cbExpr);
+        code.refFunc(thunkIdx);
+        code.call(this.stream.setReadCore());
+        return true; // VOID
+      }
+      case "stream.setWrite": {
+        const recvT = e.args[0]!.type;
+        const recvVal = this.mapType(recvT, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        const cbExpr = e.args[1]!;
+        if (cbExpr.type.kind !== "func") {
+          this.refuse("libCall:stream.setWrite:non-func", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const thunkIdx = this.writeThunkFor(cbExpr.type, e.loc);
+        if (thunkIdx === null) {
+          code.unreachable();
+          return true;
+        }
+        this.mb.declareFuncRef(thunkIdx);
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(cbExpr);
+        code.refFunc(thunkIdx);
+        code.call(this.stream.setWriteCore());
+        return true; // VOID
+      }
+      case "stream.setFinal": {
+        const recvT = e.args[0]!.type;
+        const recvVal = this.mapType(recvT, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        const cbExpr = e.args[1]!;
+        if (cbExpr.type.kind !== "func") {
+          this.refuse("libCall:stream.setFinal:non-func", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const thunkIdx = this.finalThunkFor(cbExpr.type, e.loc);
+        if (thunkIdx === null) {
+          code.unreachable();
+          return true;
+        }
+        this.mb.declareFuncRef(thunkIdx);
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(cbExpr);
+        code.refFunc(thunkIdx);
+        code.call(this.stream.setFinalCore());
+        return true; // VOID
+      }
+      case "stream.setDestroy": {
+        const recvT = e.args[0]!.type;
+        const recvVal = this.mapType(recvT, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        const cbExpr = e.args[1]!;
+        if (cbExpr.type.kind !== "func") {
+          this.refuse("libCall:stream.setDestroy:non-func", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const thunkIdx = this.destroyThunkFor(cbExpr.type, e.loc);
+        if (thunkIdx === null) {
+          code.unreachable();
+          return true;
+        }
+        this.mb.declareFuncRef(thunkIdx);
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(cbExpr);
+        code.refFunc(thunkIdx);
+        code.call(this.stream.setDestroyCore());
+        return true; // VOID
       }
       case "readable.push":
       case "readable.pushStr": {
@@ -15236,6 +16121,97 @@ class Assembler {
       case "readable.pushNull": {
         this.walkExpr(e.args[0]!);
         code.call(this.stream.pushNullCore());
+        return true;
+      }
+      case "readable.pushU": {
+        // `push(cond ? x : null)` — a genuine union chunk arriving at
+        // runtime: tag-dispatch (unions.ts: field 0) to whichever of
+        // pushNullCore/pushCore/pushStrCore the arm needs, each already
+        // built (pass 1). Exhaustive over the union's OWN arm list — a
+        // shape outside {nullish, bytes, string} refuses by name.
+        const recvT = e.args[0]!.type;
+        const recvVal = this.mapType(recvT, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        const chunkT = e.args[1]!.type;
+        if (chunkT.kind !== "union") {
+          this.refuse("libCall:readable.pushU:non-union-chunk", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const def = this.unionDef(chunkT.unionId);
+        const nullTag = def.arms.findIndex((a) => a.kind === "nullT" || a.kind === "undefinedT");
+        const bytesTag = def.arms.findIndex((a) => a.kind === "bytes");
+        const strTag = def.arms.findIndex((a) => a.kind === "string");
+        const exhaustive = def.arms.every((_a, i) => i === nullTag || i === bytesTag || i === strTag);
+        if (!exhaustive) {
+          this.refuse("libCall:readable.pushU:unexpected-union-shape", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const chunkVal = this.mapType(chunkT, e.loc);
+        if (chunkVal === null) {
+          code.unreachable();
+          return true;
+        }
+        const recv = this.acquireScratch(recvVal);
+        this.walkExpr(e.args[0]!);
+        code.localSet(recv);
+        const chunk = this.acquireScratch(chunkVal);
+        this.walkExpr(e.args[1]!);
+        code.localSet(chunk);
+        const bytesSt = bytesTag >= 0 ? this.unionArmStruct(chunkT.unionId, bytesTag, e.loc) : null;
+        const strSt = strTag >= 0 ? this.unionArmStruct(chunkT.unionId, strTag, e.loc) : null;
+        if ((bytesTag >= 0 && bytesSt === null) || (strTag >= 0 && strSt === null)) {
+          code.unreachable();
+          return true;
+        }
+        const tagLocal = this.acquireScratch(I32);
+        code.localGet(chunk);
+        code.structGet(this.unions.base(), 0);
+        code.localSet(tagLocal);
+        // `if (tag==arms[0]) {A0} else if (tag==arms[1]) {A1} else {A2}`
+        // — the LAST present arm rides the unconditional else (every tag
+        // is already proven to be one of these three, `exhaustive`
+        // above), so no separate trap default is needed.
+        const arms = def.arms
+          .map((a, i) => ({ i, kind: a.kind }))
+          .filter((a) => a.i === nullTag || a.i === bytesTag || a.i === strTag);
+        const emitArm = (armIdx: number): void => {
+          if (armIdx === nullTag) {
+            code.localGet(recv);
+            code.call(this.stream.pushNullCore());
+          } else if (armIdx === bytesTag) {
+            code.localGet(recv);
+            code.localGet(chunk);
+            code.refCast(bytesSt!);
+            code.structGet(bytesSt!, 1); // PAYLOAD: the bytes ref
+            code.i32Const(0); // front
+            code.call(this.stream.pushCore());
+          } else {
+            code.localGet(recv);
+            code.localGet(chunk);
+            code.refCast(strSt!);
+            code.structGet(strSt!, 1); // PAYLOAD: the string ref
+            code.i32Const(0); // front
+            code.call(this.stream.pushStrCore());
+          }
+        };
+        for (let k = 0; k < arms.length - 1; k++) {
+          code.localGet(tagLocal);
+          code.i32Const(arms[k]!.i);
+          code.i32Eq();
+          this.openIfResult(I32);
+          emitArm(arms[k]!.i);
+          code.else_();
+        }
+        emitArm(arms[arms.length - 1]!.i);
+        for (let k = 0; k < arms.length - 1; k++) this.close();
+        this.releaseScratch(I32, tagLocal);
+        this.releaseScratch(chunkVal, chunk);
+        this.releaseScratch(recvVal, recv);
         return true;
       }
       case "readable.unshift":
@@ -15423,8 +16399,53 @@ class Assembler {
         return true;
       }
       case "stream.errored": {
+        // `stream.errored`'s DECLARED type (lowerStreamProperty/
+        // lowerStreamStateProperty) is `%Error | null` — a real 2-arm
+        // TAGGED union (the readable.read() precedent, one arm wide) —
+        // but `erroredOf()` answers the RAW RS_ERROR field, a plain
+        // nullable ref. A latent pre-existing gap (found via 1694's
+        // execution, not review: nothing before this stage read
+        // `.errored` non-null, so returning the raw ref unwrapped never
+        // surfaced) — wrap it here, same as every other nullable-to-
+        // union backend site.
+        if (e.type.kind !== "union") {
+          this.refuse("libCall:stream.errored:non-union-type", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const unionId = e.type.unionId;
+        const def = this.unionDef(unionId);
+        const nullTag = def.arms.findIndex((a) => a.kind === "nullT");
+        const errTag = def.arms.findIndex((a) => a.kind === "object");
+        if (nullTag < 0 || errTag < 0) {
+          this.refuse("libCall:stream.errored:unexpected-union-shape", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const errArmSt = this.unionArmStruct(unionId, errTag, e.loc);
+        if (errArmSt === null) {
+          code.unreachable();
+          return true;
+        }
+        const unionVal = this.mapType(e.type, e.loc);
+        if (unionVal === null) {
+          code.unreachable();
+          return true;
+        }
+        const raw = this.acquireScratch(({ kind: "ref", nullable: true, typeIndex: this.exc().errT } as ValType));
         this.walkExpr(e.args[0]!);
         code.call(this.stream.erroredOf());
+        code.localSet(raw);
+        code.localGet(raw);
+        code.refIsNull();
+        this.openIfResult(unionVal);
+        code.globalGet(this.unions.unitGlobal(nullTag));
+        code.else_();
+        code.i32Const(errTag);
+        code.localGet(raw);
+        code.structNew(errArmSt);
+        this.close();
+        this.releaseScratch(({ kind: "ref", nullable: true, typeIndex: this.exc().errT } as ValType), raw);
         return true;
       }
       case "stream.prop": {
@@ -15446,6 +16467,30 @@ class Assembler {
           readableEnded: () => this.stream.readableEndedOf(),
           destroyed: () => this.stream.destroyedOf(),
           readableObjectMode: () => this.stream.readableObjectModeOf(),
+          /* ── STAGE C ──────────────────────────────────────────────── */
+          readable: () => this.stream.readableAliveOf(),
+          writable: () => this.stream.writableOf(),
+          writableLength: () => this.stream.wsLengthOf(),
+          writableHighWaterMark: () => this.stream.wsHwmOf(),
+          writableCorked: () => this.stream.wsCorkedOf(),
+          // Node's real `.writableEnded` getter reads `state.ending`
+          // (true the instant end() is called, not once fully flushed —
+          // `_writableState.ended`, WS_ENDED, is the OTHER bit, below).
+          writableEnded: () => this.stream.writableEndingOf(),
+          writableFinished: () => this.stream.writableFinishedOf(),
+          writableNeedDrain: () => this.stream.writableNeedDrainOf(),
+          "rs:length": () => this.stream.lengthOf(),
+          "rs:highWaterMark": () => this.stream.hwmOf(),
+          "rs:ended": () => this.stream.readableEndedInternalOf(),
+          "rs:endEmitted": () => this.stream.readableEndedOf(),
+          "ws:length": () => this.stream.wsLengthOf(),
+          "ws:highWaterMark": () => this.stream.wsHwmOf(),
+          "ws:corked": () => this.stream.wsCorkedOf(),
+          "ws:ending": () => this.stream.writableEndingOf(),
+          "ws:ended": () => this.stream.writableEndedInternalOf(),
+          "ws:finished": () => this.stream.writableFinishedOf(),
+          "ws:needDrain": () => this.stream.writableNeedDrainOf(),
+          "ws:bufferedRequestCount": () => this.stream.wsBufferedRequestCountOf(),
         };
         const target = propTarget[nameArg.value];
         if (target === undefined) {

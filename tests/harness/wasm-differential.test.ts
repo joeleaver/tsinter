@@ -2132,6 +2132,67 @@ const TIER_FLOOR: string[] = [
   "2628-stream-push-encodings.cjs",
   "2629-stream-consumers.ts",
   "2630-stream-consumers-errors.ts",
+
+  // Increment 22 stage C, checkpoint (gate-lift + Writable core + the
+  // "easy half" — CHECKPOINT, not the stage's full claim set; more
+  // programs land before this stage closes). classes.ts's extends-
+  // runtime gate lifted for all five RUNTIME_STREAM_CLASSES (was
+  // %Readable-only); %Writable's own base chain (nodes.ts's map) goes
+  // straight to %EventEmitter, a SIBLING of %Readable — unlike %Duplex/
+  // %Transform/%PassThrough, whose base chains already run through
+  // %Readable — so %Writable alone needed a struct-sharing fix in
+  // classes.ts's plan() (share the wasm STRUCT index with %Readable,
+  // keep %Writable's OWN `meta` for instanceof/vtGlobal's preorder
+  // interval — the first attempt shared the whole ClassInfo and broke
+  // `instanceof`, caught via 1741's own execution). New machinery: the
+  // Writable write/end/cork/drain/finish/prefinish core (stream.ts,
+  // mirroring the Readable side's tick-scheduled pattern), writeThunkFor/
+  // finalThunkFor/destroyThunkFor + a runtime-synthesized completion-
+  // callback closure per declared signature (doneClosFor, the
+  // dynFnAdapter env-subtype pattern reused for a non-dyn purpose), the
+  // SHARED destroy-override gate (destroyErrCore now checks a user
+  // `_destroy` first, on every stream side, before the pass-1 default
+  // path), readable.pushU (union-chunk push, tag-dispatched to the
+  // existing pushNullCore/pushCore/pushStrCore), and the readable.new:
+  // no-read / writable.new:no-write lifts (construct without the
+  // callback, bind later via stream.setRead/setWrite).
+  //
+  // TWO PRE-EXISTING, UNRELATED-TO-THIS-STAGE'S-OWN-SCOPE GAPS closed
+  // along the way, both measured load-bearing for these targets: (1)
+  // `stream.errored`'s dispatch returned RS_ERROR's raw nullable ref
+  // where the declared IR type is a tagged union (`%Error | null`) —
+  // nobody had read `.errored` non-null before 1694; fixed by wrapping
+  // into the union, mirroring readable.read()'s established pattern. (2)
+  // `readThunkFor` (pass 1) had no guard against a checked-dynamic VALUE
+  // option callback (`read: wrap(fn)` — lowerStreamCallbackValue's
+  // thisless, all-dyn-boxed shape): it built wasm that VALIDATED but
+  // TRAPPED AT RUNTIME (an isolated repro measured node exit 0 with real
+  // output vs wasm exit 1 — a silent-wrong-exit-code bug, never reached
+  // by any prior claim). Fixed with the same named-refusal guard this
+  // stage's own writeThunkFor/finalThunkFor/destroyThunkFor carry from
+  // the start; CENSUS-NEUTRAL (the bucket diff below has zero
+  // regressions — nothing was ever claiming that shape, only trapping).
+  //
+  // STILL REFUSING BY NAME, not this checkpoint's scope: dyn-VALUE
+  // option/underscore-assign callbacks generally (`libCall:writable.
+  // write:dyn-callback-value` and its final/destroy/read siblings — 1811,
+  // 2313 need this: real dyn-boxing/unboxing machinery, sized but not
+  // built this checkpoint); readable.initDyn/writable.initDyn (1812 —
+  // the runtime dyn-option-walk twins, sized but not built);
+  // readable.pipe (1743, 1692, 1693 — board #71's flagged hazard);
+  // duplex.new/transform.new (2626, 1747); passthrough.new (1695, 1692);
+  // shape-mode event-key reservation (2626).
+  //
+  // Tier 698→707.
+  "1688-stream-writable-basics.ts",
+  "1689-stream-writable-async-drain.ts",
+  "1694-stream-destroy.ts",
+  "1699-stream-callback-shapes.ts",
+  "1741-stream-extends-writable.ts",
+  "1810-stream-options-const-record.ts",
+  "1815-stream-state-reads.cjs",
+  "2100-stream-default-hwm.ts",
+  "2312-stream-underscore-assign.ts",
 ];
 
 interface RunResult {

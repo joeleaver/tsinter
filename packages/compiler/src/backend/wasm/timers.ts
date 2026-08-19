@@ -77,6 +77,11 @@ export interface TimerDeps {
   /** The exception cell's kind tag: nonzero after a callback means the
    * throw was UNCAUGHT and the program is over (SEMANTICS.md S007). */
   excKind: () => number;
+  /** %w.err.reportUncaught() — prints "Uncaught <rendered cell>" to fd 2
+   * then traps; never returns. GATE FIX C5's shared reporter (emitter.ts),
+   * the same one `_start`'s post-entry check calls — S007's macrotask
+   * half gets the identical treatment as its synchronous half. */
+  reportUncaught: () => number;
   /** One microtask checkpoint — drain, then the unhandled-rejection
    * report — emitted inline. A module with no promise surface emits
    * nothing here, which is what keeps a timer-only program free of the
@@ -1099,11 +1104,14 @@ export class TimerBuilder {
   }
 
   /** An uncaught throw out of a callback ends the program: the trap IS
-   * this tier's exit-1 channel (SEMANTICS.md S007). */
+   * this tier's exit-1 channel (SEMANTICS.md S007). GATE FIX C5: reports
+   * before it traps, same as `_start`'s own post-entry check — the two
+   * are `_tick`'s and %main's halves of the same S007 uncaught path, and
+   * now share the same reporter. */
   private emitDeathCheck(c: Code): void {
     c.globalGet(this.deps.excKind());
     c.ifVoid();
-    c.unreachable();
+    c.call(this.deps.reportUncaught());
     c.end();
   }
 

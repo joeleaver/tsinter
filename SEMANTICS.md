@@ -125,22 +125,50 @@ landed — real throw/catch/finally/rethrow via a pending-flag unwind, the
 native backends' model — so thrown values are always evaluated and
 catchable. What survives is the UNCAUGHT half.)*
 
+*(Amended increment 22 stage C, gate fix C5: the trap used to be bare —
+zero stderr for ANY uncaught exception, JS-lane compile fences (a
+`runtimeFence` IR node — see lower-stmts.ts's per-statement PoisonError
+catch) included. That made a fenced-but-otherwise-valid construct like a
+per-write stream callback with the wrong arity, or even a plain
+`debugger;` statement, compile clean and then die with NO indication why
+— worse than a compile-time refusal, and a real "never miscompile,
+never fall back silently" gap even though the harness could never see it
+(stderr is skipped on nonzero exit — see below). `_start`/`_tick`/the
+process.nextTick drain now call ONE shared reporter
+(`%w.err.reportUncaught`, emitter.ts) before they trap — S010's own
+"print the reason, then trap" shape, ported to the throw side. What
+changed and what didn't:*
+
 An exception that unwinds out of `%main` is uncaught: `_start` tests the
-pending cell and traps, which the harness bridge reports as exit code 1 —
-Node's uncaught-exception exit — while stderr carries only what the program
-itself wrote to fd 2, with no Node-style uncaught-exception report (stack
-traces are not captured; the native tier's uncaught printer writes "name:
-message" where Node writes a trace, so stderr already diverges there too).
-The same holds for an exception out of a MACROTASK callback: `_tick` tests
-the cell after every timer and every immediate callback and traps there,
-and a repeating interval whose callback threw does not re-arm — the process
-is already dead, exactly as it is in Node. **Rationale:** the artifact ABI
-has no exit-code channel; the trap IS the nonzero exit. **Tested by:**
-corpus uncaught-throw programs and `1442-interval-throw` (stdout before the
-throw plus exit code must match Node; the harness skips the stderr compare
-for nonzero-exit programs); the wasm emitter unit test pins the
-evaluation-order-then-trap case and the wasm timers unit test the
-interval-callback one.
+pending cell, prints `"Uncaught " + <cell rendered like S010's rejection
+reason>` to fd 2 (a number through ToString, a bool as `true`/`false`, a
+string raw, an Error-shaped object as `name: message` via the SAME
+renderer S010's `errToStr` and the native tier's own uncaught printer
+already use, anything else as `[object Object]`/`[object]`), and THEN
+traps — which the harness bridge reports as exit code 1, Node's
+uncaught-exception exit. Node's own stderr instead carries a full stack
+trace, so stderr still diverges (stack traces are still not captured;
+this only closes the gap between the wasm tier and the native tier's own
+uncaught printer, which already wrote this same "name: message" shape —
+they render alike now instead of wasm alone staying silent). The same
+holds for an exception out of a MACROTASK callback (`_tick` tests the
+cell after every timer and every immediate callback and reports-then-
+traps there, and a repeating interval whose callback threw does not
+re-arm — the process is already dead, exactly as it is in Node) and for
+one out of a `process.nextTick` callback (the drain loop's identical
+per-entry check). **Rationale:** the artifact ABI has no exit-code
+channel; the trap IS the nonzero exit — printing first costs nothing
+the differential suite can see (the harness skips the stderr compare on
+a nonzero exit, unchanged) but stops a fenced construct from dying
+silent. **Tested by:** corpus uncaught-throw programs and
+`1442-interval-throw` (stdout before the throw plus exit code must match
+Node; the harness skips the stderr compare for nonzero-exit programs);
+the wasm emitter unit test pins the evaluation-order-then-trap case and
+now also its printed report; the wasm timers unit test the
+interval-callback one; the wasm nexttick unit test pins the
+`process.nextTick` death-check's identical report and a same-shape
+double-print sweep across all three uncaught sites plus S010's rejection
+path (never more than one labeled line each).
 
 ## S008 — Wasm tier: string `repeat`/`pad` size cap is 2^31 units
 

@@ -295,16 +295,18 @@ export class ClassBuilder {
     return k === "emitter" || k === "stream";
   }
 
-  /** Is this class stream-rooted — stage B's gate lift, %Readable ONLY
-   * (a user `extends Readable` subclass, or %Readable itself if it were
-   * ever planned directly, which it isn't — %Readable has no fields of
-   * its own to instantiate outside a user subclass). %Writable/%Duplex/
-   * %Transform/%PassThrough are NOT stream-rooted by this predicate —
-   * they keep refusing `class:extends-runtime` (see `rootKind`). The
-   * allocation site's question: a stream-rooted struct carries ONE MORE
-   * injected prefix field (the stream-state ref) past the emitter pair,
-   * which `emitAlloc` must seed to null (lazily allocated on first
-   * stream-state touch, exactly like the emitter registry). */
+  /** Is this class stream-rooted — STAGE C: any of the five runtime
+   * stream classes' base chain (a user `extends Readable`/`Writable`/
+   * `Duplex`/`Transform`/`PassThrough` subclass, or one of the five
+   * roots itself if it were ever planned directly, which none are — none
+   * of the five have fields of their own to instantiate outside a user
+   * subclass). The allocation site's question: a stream-rooted struct
+   * carries ONE MORE injected prefix field (the stream-state ref) past
+   * the emitter pair, which `emitAlloc` must seed to null (lazily
+   * allocated on first stream-state touch, exactly like the emitter
+   * registry) — ONE struct-state slot serves every side (readable-only,
+   * writable-only, or both: stream.ts's own header explains why one
+   * struct type, not one per side). */
   streamRooted(className: string): boolean {
     const meta = this.metaMap.get(className);
     return meta !== undefined && this.rootKind(meta) === "stream";
@@ -406,26 +408,23 @@ export class ClassBuilder {
   }
 
   /** Which family a class's base chain ends in — what decides whether a
-   * struct is emitted at all. %Readable is checked BEFORE the general
-   * RUNTIME_STREAM_CLASSES test: stage B lifts the gate for %Readable
-   * ONLY, so a class whose walk hits %Readable first (a direct `extends
-   * Readable`, or a grandchild of one — the walk keeps climbing past
-   * ordinary user classes) returns "stream" and gets planned. A class
-   * whose walk hits %Writable/%Duplex/%Transform/%PassThrough FIRST
-   * (a direct `extends Writable`/`Duplex`/... ) still returns "runtime"
-   * and refuses — those roots are stage C's, even though %Duplex's OWN
-   * base chain passes through %Readable further up (never reached: the
-   * loop returns at the first stream-family name it meets, exactly the
-   * "must be caught at the name it climbs through first" discipline the
-   * original stream/emitter split already established). Every stream
-   * class's base chain also passes through %EventEmitter further up
-   * still — never reached for the same reason once %Readable or the
-   * general stream check has already answered. */
+   * struct is emitted at all. Every RUNTIME_STREAM_CLASSES name (stage C:
+   * %Readable/%Writable/%Duplex/%Transform/%PassThrough, all five now)
+   * is checked BEFORE the general runtime-class test, so a class whose
+   * walk hits ANY of them first (a direct `extends Writable`/`Duplex`/
+   * ..., or a grandchild of one — the walk keeps climbing past ordinary
+   * user classes) returns "stream" and gets planned — the WasmGC
+   * nominal-supertype translation of the C reference's layout embedding
+   * (§1 of the design doc): `streamRooted()`/`emitAlloc` (emitter.ts)
+   * already read this generically off `rootKind`, so lifting the gate
+   * here is the WHOLE lift for the struct-layout side — no change needed
+   * at either call site. Every stream class's base chain also passes
+   * through %EventEmitter further up still — never reached for the same
+   * reason once the stream check has already answered. */
   private rootKind(meta: LlClassMeta): "user" | "error" | "emitter" | "stream" | "runtime" {
     for (let m: LlClassMeta | null = meta; m !== null; m = m.base) {
       if (RUNTIME_ERROR_CLASSES.has(m.def.name)) return "error";
-      if (m.def.name === "%Readable") return "stream";
-      if (RUNTIME_STREAM_CLASSES.has(m.def.name)) return "runtime";
+      if (RUNTIME_STREAM_CLASSES.has(m.def.name)) return "stream";
       if (m.def.name === RUNTIME_EMITTER_CLASS) return "emitter";
       if (m.def.runtime === true) return "runtime";
     }
@@ -447,6 +446,62 @@ export class ClassBuilder {
    * a reserved index instead of recursing. */
   private plan(meta: LlClassMeta): ClassInfo {
     const name = meta.def.name;
+    // STAGE C: `%Writable` is the ONE runtime stream root whose OWN base
+    // chain (RUNTIME_STREAM_CLASSES' `base` field, nodes.ts) does NOT
+    // already pass through `%Readable` — `%Duplex`/`%Transform`/
+    // `%PassThrough` all do (their own `base` entries chain
+    // Duplex->Readable->EventEmitter already), so the NORMAL base-chain
+    // walk below already gives them the right wasm supertype for free.
+    // `%Readable` and `%Writable` are SIBLINGS under `%EventEmitter` in
+    // that map — which is semantically correct (Node's Writable does not
+    // extend Readable) but wasm-WRONG for this tier's design: StreamDeps.
+    // rootRef()/rootStruct() (stream.ts's whole generic-function contract)
+    // hardcode `%Readable`'s struct as the ONE parameter type every
+    // stream.ts function takes, the WasmGC translation of the C
+    // reference's single ScrStream layout (design doc §1: "$emitterBase
+    // <: $streamBase <: user classes" — ONE shared stream base, not one
+    // per side). `%Readable` IS that shared base by construction (pass
+    // B's gate lift never needed to distinguish "the stream base" from
+    // "%Readable" because nothing else existed yet) — so `%Writable`,
+    // having zero fields of its own beyond the shared prefix (identical
+    // to %Readable's own bare shape), simply REUSES %Readable's info
+    // wholesale rather than declaring a second, wasm-nominally-distinct
+    // struct with an identical layout (which is what produced a real
+    // validation failure: two singleton struct entries with the same
+    // field list are NOT the same wasm type, so a %Writable instance
+    // failed every `call` into a stream.ts function typed for
+    // %Readable's struct specifically — found via execution, not
+    // review). Every runtime vtable/instanceof answer still comes from
+    // the PER-CLASS `vt`/preorder-interval GLOBAL stamped at allocation
+    // (`emitAlloc`, `vtGlobal(className)`), which is keyed by class NAME
+    // and entirely independent of which wasm struct type backs it — so
+    // sharing the struct changes nothing observable about `instanceof`
+    // or dynamic dispatch. A future user-facing `%Writable`-only field
+    // would break this reuse (it isn't structurally identical anymore);
+    // none exists today, and RUNTIME_STREAM_CLASSES' own five entries are
+    // fixed, so this is a stable fact of THIS tier, not a coincidence to
+    // re-check per corpus program.
+    if (name === "%Writable") {
+      // Reuse %Readable's STRUCT (the wasm-level identity StreamDeps.
+      // rootRef() needs) but keep %WRITABLE'S OWN `meta` — its preorder
+      // interval (`meta.pre`/`meta.post`) is what `instanceof`/vtGlobal
+      // read (emitter.ts's `instanceOf` case reads `target.meta.pre`/
+      // `.post` directly), and %Writable's interval is NOT %Readable's:
+      // reusing the whole ClassInfo (meta included) silently made every
+      // `x instanceof Writable` test %Readable's range instead — found
+      // via execution (1741's own pin), not review. fieldIndex/fieldType
+      // stay empty, matching %Readable's own (zero user-declared fields
+      // on any bare runtime stream root).
+      const readableInfo = this.classOf(this.metaMap.get("%Readable")!);
+      const info: ClassInfo = {
+        meta,
+        struct: readableInfo.struct,
+        fieldIndex: new Map(),
+        fieldType: new Map(),
+      };
+      this.infos.set(name, info);
+      return info;
+    }
     // Nothing inside a plan may refuse (field storage comes from the SOFT
     // map), so the span is closed on the normal path only: an exception
     // escaping here is an emitter bug, and a `finally` would replace it

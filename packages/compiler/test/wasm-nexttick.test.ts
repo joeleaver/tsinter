@@ -185,7 +185,13 @@ test("an uncaught throw inside a nextTick callback traps (SEMANTICS.md S007)", a
   ]);
   const { stdout, stderr } = await runWasmToTrap(path);
   expect(stdout).toBe(["before", ""].join("\n"));
-  expect(stderr).toBe("");
+  // GATE FIX C5: S007's uncaught-throw trap now REPORTS before it traps
+  // (emitter.ts's reportUncaughtHelper, %w.err.reportUncaught) — the
+  // missing half of S010's already-loud unhandled-rejection trap. Stderr
+  // is still not Node's (no stack trace, and the corpus differential
+  // still skips the stderr compare on this nonzero exit — S007's own
+  // exemption, unchanged), but it is no longer silent.
+  expect(stderr).toBe("Uncaught Error: boom\n");
 });
 
 test("a parameterized callback fired with no trailing arguments reads undefined (the dyn-boundary shape)", async () => {

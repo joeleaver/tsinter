@@ -115,6 +115,10 @@ export interface NextTickDeps {
    * throw was UNCAUGHT and the program is over (SEMANTICS.md S007) —
    * timers.ts's identical dep. */
   excKind: () => number;
+  /** %w.err.reportUncaught() — prints "Uncaught <rendered cell>" to fd 2
+   * then traps; never returns. GATE FIX C5's shared reporter (emitter.ts)
+   * — timers.ts's identical dep. */
+  reportUncaught: () => number;
 }
 
 /* ntT's fields. Exactly one of CB/RAW is non-null per entry — the C
@@ -341,7 +345,7 @@ export class NextTickBuilder {
       c.end();
       c.globalGet(this.deps.excKind());
       c.ifVoid();
-      c.unreachable();
+      c.call(this.deps.reportUncaught());
       c.end();
       c.br(0);
       c.end();
