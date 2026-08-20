@@ -57,11 +57,30 @@
  * readable.nextChunkDyn, and stream/consumers (sc.text/buffer/json).
  * STILL REFUSING by their own libCall name at the emitter.ts dispatch
  * site, never silently mishandled: the dyn lanes (newDyn/initDyn/
- * pushDyn/pushU — measured not needed by any pass-2 claim, unbuilt). */
+ * pushDyn/pushU — measured not needed by any pass-2 claim, unbuilt).
+ *
+ * STAGE C PASS 2 (banked claims 1692, 1693, 1695, 1743, 1744, 1747, 1811,
+ * 1812, 2313, 2626 — the remaining 10 of pass 1's 19, landed as commit
+ * 03a9f78 on main, tier 698→707). Build order (dependency-driven):
+ * (1) STRUCTURAL — pipe/unpipe (board #71's flowing-seam note read
+ * first), Duplex/Transform/PassThrough construction (.new, direct) AND
+ * init (.init, subclass super() — the class-level gate already lifted
+ * for all five roots; construction itself still refuses by libCall name,
+ * this pass's own job), Transform's _transform/_flush dispatch,
+ * shape-mode for 2626 (events.ts's REG_SHAPE scaffolding), 1744's hex
+ * decode-out (toStrHelper('hex')). (2) DYN ADAPTERS for 1811/2313 (and
+ * the now-loud #73 family) — dyn.callFn + boxFunc/boxBytes/boxStr, plus
+ * the pending-check call-graph audit every dispatch site transitively
+ * reaching an adapter needs. (3) initDyn (1812) — scalar half
+ * independent, callback half after the adapters. (4) listeners()/
+ * rawListeners() + the Draft B S-entry (board #66's wasm half). Each
+ * lands only when its own pins say so — this header updates as the
+ * pass's own claims land, same discipline as pass 1's. */
 import type { ByteWriter } from "./bytes.js";
 import { Code } from "./code.js";
 import { F64, I32, ModuleBuilder, type ValType } from "./module.js";
 import { LEN, BUF } from "./arrays.js";
+import { DK, DYN_KIND, DYN_REF } from "./dyn.js";
 
 const EQ_HEAP = -0x13;
 const EQ_REF: ValType = { kind: "ref", nullable: true, typeIndex: EQ_HEAP };
@@ -341,7 +360,69 @@ export const WS_DISCARDED = 50; // $wReq ref, nullable
  * firing inline. One-way like RS_DESTROYED itself: set at most once, at
  * the same moment, never reset. */
 export const WS_DESTROY_SYNC = 51; // i32 bool
-export const WS_FIELD_COUNT = 52;
+/** STAGE C PASS 2, pipe(): ONE active pipe relationship per source — no
+ * list (S050, registered before this landed: a second simultaneous
+ * `.pipe()` call TRAPS rather than silently overwriting or fanning out).
+ * RS_PIPE_DEST null means "not currently piping"; the three closure
+ * fields are pipeCore's own internal 'data'/'drain'/'end' listeners
+ * (events.ts's entryAppend/removeLast — ordinary registered entries,
+ * findable later by IDENTITY, exactly Node's own removeListener
+ * mechanism), non-null together with RS_PIPE_DEST and null together
+ * without it. unpipeCore nulls all four back out after removing them. */
+export const RS_PIPE_DEST = 52; // root ref, nullable
+export const RS_PIPE_ONDATA = 53; // eq, nullable — the 'data' listener on THIS (the source)
+export const RS_PIPE_ONDRAIN = 54; // eq, nullable — the 'drain' listener on RS_PIPE_DEST
+export const RS_PIPE_ONEND = 55; // eq, nullable — the 'end' listener on THIS, once=true
+/** STAGE C PASS 2, Transform, GATE FIX C2S-1 (remedy iteration 3 — the
+ * FINAL truth, after two remedies that came back out): the
+ * `allowHalfOpen` OPTION's value (duplex.new/transform.new/
+ * passthrough.new's own construction), stored FAITHFULLY — literal or
+ * runtime, `true` or `false`, no gate of any kind — so `stream.prop:
+ * allowHalfOpen` reads back exactly what the program passed, AND fully
+ * WIRED: `false` auto-ends the writable side once the readable side
+ * ends, matching Node's real `endReadableNT` (opEnd's own branch-
+ * selection guard + OP_AUTO_END's tick body, that header has the full
+ * mechanism story — measured directly against v24.18.1's
+ * `internal/streams/readable.js`, not assumed). Node's own default is
+ * `true`; this file initializes it that way too (stateEnsure's own
+ * default-fields precedent) so a plain Readable/Writable (never touched
+ * by duplex/transform/passthrough construction at all) still answers the
+ * property correctly if ever read on a non-duplex-shaped instance (Node's
+ * own `readable.allowHalfOpen` on a plain Readable answers `undefined`, a
+ * DIFFERENT, unmeasured shape — STREAM_PROP_MEMBERS's own dispatch is
+ * scoped to duplex-shaped classes only, so this field's value is simply
+ * never read for a plain Readable/Writable).
+ *
+ * HISTORY (worth stating plainly — three remedy iterations on one gate
+ * finding, each forced by measured evidence): (1) a compile-time refusal
+ * for a literal `false`, cheap while it cost nothing; (2) extended to a
+ * runtime trap for the non-literal case, landed alongside; both came OUT
+ * once the reviewer's gate measured that they unclaim 1742 (this pass's
+ * own claim, whose entire exercised surface — construct-with-false,
+ * write/end, flag read-back — this tier already handles byte-exactly,
+ * since its own execution trace never reaches the auto-end mechanism at
+ * all). SEMANTICS.md briefly carried a draft S051 for the trap; it never
+ * merged, so it was withdrawn rather than left registered for a
+ * divergence that no longer exists — the number is free for reuse (the
+ * landing record, not this file, is where that decision lives). */
+export const WS_ALLOW_HALF_OPEN = 56; // i32 bool
+/** CORRECTION (1690, both-sides autoDestroy): TRUE only for a stream
+ * constructed via duplex.new/transform.new/passthrough.new (set
+ * alongside WS_ALLOW_HALF_OPEN at those three construction sites, same
+ * lockstep) — FALSE (the default) for readable.new/writable.new's own
+ * single-sided construction. Node's real autoDestroy waits for BOTH
+ * `_writableState.finished` AND `_readableState.endEmitted` before
+ * actually destroying a duplex-shaped stream (measured directly,
+ * ORDER-INDEPENDENT — p6a: end() then push(null); p6b: push(null) then
+ * end() — `destroyed` stays false through BOTH 'finish' and 'end' either
+ * way, only flipping true once both have fired, right before 'close').
+ * A single-sided Writable/Readable has no "other side" to wait for at
+ * all, so it keeps today's behavior (destroy immediately once ITS own
+ * side completes) — this flag is what lets opFinish/opEnd tell the two
+ * cases apart at runtime, since all five classes share one struct with
+ * no other type tag. */
+export const WS_DUPLEX_SHAPED = 57; // i32 bool
+export const WS_FIELD_COUNT = 58;
 
 /** `$wReq`'s field indices — one queued write entry (a chunk plus its
  * own completion callback; `cb` is nullable since a plain `write(chunk)`
@@ -412,6 +493,28 @@ export const OP_FINISH = 8;
  * (C4's own measured ordering places both discarded callbacks after
  * 'close'). */
 export const OP_FIRE_DISCARDED = 9;
+/** GATE FIX (C2S-1, remedy iteration 3 — the refuse/trap remedies from
+ * iterations 1-2 came back OUT once measurement showed 1742's own claim
+ * exercises exactly the shape they broke): Node's real `endWritableNT`
+ * (lift2.cjs's `internal/streams/readable.js`, v24.18.1, fetched
+ * directly) — `allowHalfOpen: false`'s auto-end-the-writable-side-when-
+ * the-readable-side-ends mechanism. NOT a listener (measured: it is
+ * INLINE code in `endReadableNT`, the SAME internal function that fires
+ * 'end', scheduling this AS ITS OWN SEPARATE `process.nextTick` call —
+ * confirmed both by reading the source directly and by an ordering probe
+ * showing a THIRD, later-queued nextTick printing before 'end' itself,
+ * i.e. 'end' takes multiple tick-hops from whatever triggered it, ruling
+ * out a same-tick synchronous listener, which is what `entryAppend`-ing a
+ * real 'end' listener would have produced instead). `opEnd`'s own
+ * branch-selection guard decides whether to schedule this tick AT ALL
+ * (mirroring `stream.writable && allowHalfOpen === false`); this tick's
+ * OWN body re-checks the same four flags at RUN time (mirroring
+ * `endWritableNT`'s own `stream.writable && !writableEnded &&
+ * !destroyed` — state can move in the tick that separates scheduling
+ * from firing), then calls `endCore` exactly like `pipeOnendThunk`'s own
+ * `dest.end()` does (this pass's own precedent, verbatim null-chunk/
+ * null-cb shape). */
+export const OP_AUTO_END = 10;
 
 export interface StreamDeps {
   /** The %Readable hierarchy ROOT's own struct — every general helper's
@@ -572,6 +675,41 @@ export interface StreamDeps {
    * header), so this file calls it back directly rather than building a
    * second, redundant closure-pair machinery of its own. */
   voidClos: () => { clos: number; fn: number };
+
+  /* ── STAGE C PASS 2 additions: pipe() ─────────────────────────────── */
+
+  /** events.ts's `(root, name, clos, thunk, orig, once, prepend) -> void`
+   * — the SAME registration path a user `.on()`/`.once()` call goes
+   * through (emitter.ts's own dispatch), reused directly for pipe()'s
+   * three internal 'data'/'drain'/'end' listeners rather than inventing
+   * a parallel registry. */
+  entryAppend: () => number;
+  /** events.ts's `(root, name, cb) -> void` — off/removeListener by
+   * IDENTITY (the LAST matching entry), the exact mechanism Node's own
+   * unpipe() uses (its `src.removeListener('data', ondata)`). */
+  removeLast: () => number;
+  /** dyn.ts's `$dyn` struct type index — needed raw (not the `dynRef()`
+   * ValType wrapper already above) wherever this file reads a dyn
+   * value's OWN kind tag directly (pipe's ondata thunk: Node forwards
+   * whatever 'data' delivers — bytes normally, a STRING on an
+   * encoding'd source, 1744's own shape — to `dest.write()` unchanged;
+   * this tier's write() only accepts bytes, so ondata re-encodes a
+   * STR-kind chunk back rather than assuming BYTES). */
+  dynT: () => number;
+  /** dyn.ts's raw `$str` type index (mirrors `bytesStructType`/
+   * `bytesBufType` above — a type a `refCast` needs by number, not the
+   * `strRef()` ValType wrapper). */
+  strType: () => number;
+  /** dyn.ts's `bytesPayloadBytes` — from a `$dyn` the caller pushes
+   * (already known BYTES-kind), the raw `$bytes` ref (unwraps the
+   * `{bytes, isBuffer}` box `pushBytesPayload` builds, the inverse
+   * operation). */
+  bytesPayloadBytes: (c: Code, pushDyn: (c: Code) => void) => void;
+  /** events.ts's/dyn.ts's uniform listener-thunk call-glue type index —
+   * `(clos: eq, args: dynArr) -> dyn` — needed raw to DECLARE pipe()'s
+   * own three internal thunks with the exact type `entryAppend`'s THUNK
+   * parameter expects. */
+  thunkSig: () => number;
 }
 
 // $bytes's field indices (typedarrays.ts's own private layout, mirrored
@@ -579,6 +717,11 @@ export interface StreamDeps {
 const BYTES_STORAGE = 0;
 const BYTES_OFF = 1;
 const BYTES_LEN = 2;
+
+// pipeClosT's own field indices (STAGE C PASS 2 — pipe()'s shared
+// src/dst closure shape, see its own header).
+const PIPE_SRC = 0;
+const PIPE_DST = 1;
 
 export class StreamBuilder {
   private readonly fns = new Map<string, number>();
@@ -591,6 +734,7 @@ export class StreamBuilder {
   private finalThunkSigField: number | null = null;
   private destroyThunkSigField: number | null = null;
   private voidClosFnField: number | null = null;
+  private pipeClosTField: number | null = null;
   private tickQueue: { head: number; tail: number } | null = null;
 
   constructor(
@@ -794,6 +938,12 @@ export class StreamBuilder {
       { storage: destroyThunkRef, mutable: true }, // RS_DESTROY_THUNK
       { storage: this.wReqRef(), mutable: true }, // WS_DISCARDED
       { storage: I32, mutable: true }, // WS_DESTROY_SYNC
+      { storage: this.deps.rootRef(), mutable: true }, // RS_PIPE_DEST
+      { storage: EQ_REF, mutable: true }, // RS_PIPE_ONDATA
+      { storage: EQ_REF, mutable: true }, // RS_PIPE_ONDRAIN
+      { storage: EQ_REF, mutable: true }, // RS_PIPE_ONEND
+      { storage: I32, mutable: true }, // WS_ALLOW_HALF_OPEN
+      { storage: I32, mutable: true }, // WS_DUPLEX_SHAPED
     ]);
     return this.stateTField;
   }
@@ -887,6 +1037,12 @@ export class StreamBuilder {
       c.refNull(this.destroyThunkSig()); // rs_destroy_thunk
       c.refNull(this.wReqT()); // ws_discarded
       c.i32Const(0); // ws_destroy_sync
+      c.refNull(this.deps.rootStruct()); // rs_pipe_dest
+      c.refNull(EQ_HEAP); // rs_pipe_ondata
+      c.refNull(EQ_HEAP); // rs_pipe_ondrain
+      c.refNull(EQ_HEAP); // rs_pipe_onend
+      c.i32Const(1); // ws_allow_half_open — Node's real default: true (overwritten by construction)
+      c.i32Const(0); // ws_duplex_shaped — default false (overwritten by construction, duplex/transform/passthrough only)
       c.structNew(this.stateT());
       c.localSet(N);
       c.localGet(R);
@@ -1078,10 +1234,18 @@ export class StreamBuilder {
         c.localGet(ROOT);
         c.call(this.opFireDiscarded());
         c.else_();
+        c.localGet(OP);
+        c.i32Const(OP_AUTO_END);
+        c.i32Eq();
+        c.ifVoid();
+        c.localGet(ROOT);
+        c.call(this.opAutoEnd());
+        c.else_();
         // OP_PRIME_READ, exhaustive: the op codes are this file's own
         // closed enum, never a runtime-supplied value.
         c.localGet(ROOT);
         c.call(this.opPrimeRead());
+        c.end();
         c.end();
         c.end();
         c.end();
@@ -1419,6 +1583,108 @@ export class StreamBuilder {
     });
   }
 
+  /** `(nibble: i32) -> void` — pushes ONE ASCII hex-digit char code
+   * (lowercase, Node's own `hex` StringDecoder spelling) for a 0-15
+   * value already on `nibbleLocal`. */
+  private pushHexDigit(c: Code, nibbleLocal: number): void {
+    c.localGet(nibbleLocal);
+    c.i32Const(10);
+    c.i32LtU();
+    c.ifResult(I32);
+    c.localGet(nibbleLocal);
+    c.i32Const(0x30); // '0'
+    c.i32Add();
+    c.else_();
+    c.localGet(nibbleLocal);
+    c.i32Const(0x57); // 'a' - 10
+    c.i32Add();
+    c.end();
+  }
+
+  /** `(bytes) -> bytes` — STAGE C PASS 2, hex: every input byte becomes
+   * exactly TWO output bytes (the ASCII hex digits), unconditionally —
+   * Node's real `hex` StringDecoder has NO held-back/incomplete state at
+   * all (measured directly: `write([0xde,0xad,0xbe])` — an ODD byte
+   * count — answers the full "deadbe" immediately, no held nibble;
+   * neither does splitting across multiple `write()` calls change this),
+   * unlike `utf8`'s variable-width sequences — so this is a pure,
+   * stateless bytes→bytes transform, no RS_DEC_PENDING analog needed.
+   * The result is ASCII (trivially valid utf8), so emitDataFrom's
+   * existing string-boxing path (`toStrUtf8`) decodes it back to a JS
+   * string correctly with no changes there. */
+  private hexEncodeStep(): number {
+    return this.cached("hexEncodeStep", () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.deps.bytesRef()], [this.deps.bytesRef()]), "%w.rs.hexEncode");
+      const c = new Code();
+      const IN = 0, N = 1, OUT = 2, I = 3, B = 4, HI = 5, LO = 6;
+      c.localGet(IN);
+      c.structGet(this.deps.bytesStructType(), BYTES_LEN);
+      c.localSet(N);
+      c.localGet(N);
+      c.i32Const(2);
+      c.i32Mul();
+      c.arrayNewDefault(this.deps.bytesBufType());
+      c.localSet(OUT);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(IN);
+      c.structGet(this.deps.bytesStructType(), BYTES_STORAGE);
+      c.localGet(IN);
+      c.structGet(this.deps.bytesStructType(), BYTES_OFF);
+      c.localGet(I);
+      c.i32Add();
+      c.arrayGetU(this.deps.bytesBufType());
+      c.localSet(B);
+      c.localGet(B);
+      c.i32Const(4);
+      c.i32ShrU();
+      c.localSet(HI);
+      c.localGet(B);
+      c.i32Const(0xf);
+      c.i32And();
+      c.localSet(LO);
+      c.localGet(OUT);
+      c.localGet(I);
+      c.i32Const(2);
+      c.i32Mul();
+      this.pushHexDigit(c, HI);
+      c.arraySet(this.deps.bytesBufType());
+      c.localGet(OUT);
+      c.localGet(I);
+      c.i32Const(2);
+      c.i32Mul();
+      c.i32Const(1);
+      c.i32Add();
+      this.pushHexDigit(c, LO);
+      c.arraySet(this.deps.bytesBufType());
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(OUT);
+      c.i32Const(0);
+      c.localGet(N);
+      c.i32Const(2);
+      c.i32Mul();
+      c.structNew(this.deps.bytesStructType());
+      this.mb.setBody(
+        idx,
+        [I32, { kind: "ref", nullable: false, typeIndex: this.deps.bytesBufType() }, I32, I32, I32, I32],
+        c.bytes(),
+      );
+      return idx;
+    });
+  }
+
   /** `(root) -> root` — `readable.setEncoding('utf8')` (the ONLY encoding
    * this pass ports — any other literal refuses BY NAME at the emitter
    * dispatch site, never reaching here): flips RS_ENCODING on, and if
@@ -1458,6 +1724,59 @@ export class StreamBuilder {
       c.localGet(ST);
       c.localGet(EXISTING);
       c.call(this.decodeUtf8Step());
+      c.localSet(DECODED);
+      c.localGet(DECODED);
+      c.structGet(this.deps.bytesStructType(), BYTES_LEN);
+      c.i32Const(0);
+      c.i32GtS();
+      c.ifVoid();
+      c.localGet(ST);
+      c.localGet(DECODED);
+      c.i32Const(0);
+      c.call(this.appendChunk());
+      c.end();
+      c.end();
+      c.end();
+      c.localGet(ROOT);
+      this.mb.setBody(idx, [this.stateRef(), this.deps.bytesRef(), this.deps.bytesRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  /** `(root) -> root` — `readable.setEncoding('hex')`. `setEncodingUtf8Core`'s
+   * exact shape (flip RS_ENCODING on, redecode any already-buffered
+   * content as ONE combined re-pushed chunk) with `hexEncodeStep` in
+   * place of `decodeUtf8Step` — no `state` param needed there (hex is
+   * stateless, `hexEncodeStep`'s own header), and RS_ENCODING is set to
+   * 2, not 1. */
+  setEncodingHexCore(): number {
+    return this.cached("setEncodingHexCore", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root], [root]), "%w.rs.setEncodingHex");
+      const c = new Code();
+      const ROOT = 0, ST = 1, EXISTING = 2, DECODED = 3;
+      c.localGet(ROOT);
+      c.call(this.stateEnsure());
+      c.localSet(ST);
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_ENCODING);
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(ST);
+      c.i32Const(2);
+      c.structSet(this.stateT(), RS_ENCODING);
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_LENGTH);
+      c.f64Const(0);
+      c.f64Gt();
+      c.ifVoid();
+      c.localGet(ST);
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_LENGTH);
+      c.call(this.takeFromChunks());
+      c.localSet(EXISTING);
+      c.localGet(EXISTING);
+      c.call(this.hexEncodeStep());
       c.localSet(DECODED);
       c.localGet(DECODED);
       c.structGet(this.deps.bytesStructType(), BYTES_LEN);
@@ -1601,19 +1920,24 @@ export class StreamBuilder {
       c.localGet(ST);
       c.i32Const(0);
       c.structSet(this.stateT(), RS_READING);
-      // PASS 2: the utf8 StringDecoder choke point — Node's real
+      // PASS 2: the encoder/decoder choke point — Node's real
       // `readableAddChunk` decodes a non-front chunk through `state.
       // decoder` BEFORE it ever reaches `addChunk` (so the direct-emit
       // fast path below sees the DECODED form too), never on the front
       // (unshift) path, which this `else` branch (the back/push path) is
-      // the only place this runs. A decode that yields nothing yet (a
-      // still-incomplete multi-byte sequence) skips addChunk entirely —
-      // `maybeReadMore` still runs, matching Node's own `else
-      // maybeReadMore(...)` arm — WITHOUT scheduling 'readable' or
-      // touching the buffer, so a lone split byte produces no observable
-      // event at all (1745/2627's mechanism).
+      // the only place this runs. utf8 (RS_ENCODING===1): a decode that
+      // yields nothing yet (a still-incomplete multi-byte sequence) skips
+      // addChunk entirely — `maybeReadMore` still runs, matching Node's
+      // own `else maybeReadMore(...)` arm — WITHOUT scheduling 'readable'
+      // or touching the buffer, so a lone split byte produces no
+      // observable event at all (1745/2627's mechanism). hex
+      // (RS_ENCODING===2): STAGE C PASS 2 — `hexEncodeStep`'s own header,
+      // no held-back state, no early-return arm needed (measured: hex
+      // never yields "nothing yet").
       c.localGet(ST);
       c.structGet(this.stateT(), RS_ENCODING);
+      c.i32Const(1);
+      c.i32Eq();
       c.ifVoid();
       c.localGet(ST);
       c.localGet(BYTES);
@@ -1631,6 +1955,16 @@ export class StreamBuilder {
       c.end();
       c.localGet(DECODED);
       c.localSet(BYTES);
+      c.else_();
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_ENCODING);
+      c.i32Const(2);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(BYTES);
+      c.call(this.hexEncodeStep());
+      c.localSet(BYTES);
+      c.end();
       c.end();
       c.end();
       // addChunk(stream, state, chunk, front) — lift.cjs's own condition
@@ -3210,6 +3544,325 @@ export class StreamBuilder {
     });
   }
 
+  /* ── pipe() (STAGE C PASS 2) ──────────────────────────────────────── */
+
+  /** pipe()'s own shared closure shape — one instance per pipe() call,
+   * referenced by all three internal listeners (ondata/ondrain/onend);
+   * each routes to different behavior through its OWN thunk, not a
+   * different closure. Keyed (not shape-interned): a coincidental match
+   * with some unrelated two-root-ref struct elsewhere must never alias. */
+  private pipeClosT(): number {
+    if (this.pipeClosTField !== null) return this.pipeClosTField;
+    const root = this.deps.rootRef();
+    this.pipeClosTField = this.mb.openStructType("stream.pipeClos", [
+      { storage: root, mutable: false }, // PIPE_SRC
+      { storage: root, mutable: false }, // PIPE_DST
+    ]);
+    return this.pipeClosTField;
+  }
+
+  private pipeClosRef(): ValType {
+    return { kind: "ref", nullable: true, typeIndex: this.pipeClosT() };
+  }
+
+  /** `(dyn) -> bytes` — Node forwards whatever 'data' delivers to
+   * `dest.write()` unchanged; this tier's chunk list is always bytes
+   * internally, but the DYN box a 'data' emission builds is bytes-kind
+   * normally and STR-kind when the source is `setEncoding`'d (1744's own
+   * shape: an encoded source still piping bytes-exactly into a
+   * Writable) — re-encode a STR-kind chunk back rather than assuming
+   * BYTES (which would `bytesPayloadBytes`'s own ref.cast trap on it). */
+  private chunkDynToBytesCore(): number {
+    return this.cached("chunkDynToBytesCore", () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.deps.dynRef()], [this.deps.bytesRef()]), "%w.rs.chunkDynToBytes");
+      const c = new Code();
+      const D = 0;
+      c.localGet(D);
+      c.structGet(this.deps.dynT(), DYN_KIND);
+      c.i32Const(DK.STR);
+      c.i32Eq();
+      c.ifResult(this.deps.bytesRef());
+      c.localGet(D);
+      c.structGet(this.deps.dynT(), DYN_REF);
+      c.refCast(this.deps.strType());
+      c.call(this.deps.bytesFromStrUtf8());
+      c.else_();
+      this.deps.bytesPayloadBytes(c, (cc) => cc.localGet(D));
+      c.end();
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  /** pipe()'s 'data' listener thunk (events.ts's uniform `(clos: eq,
+   * args: dynArr) -> dyn`): `dest.write(chunk)`; a false return pauses
+   * the source (Node's own `ondata`/backpressure pair, 1693's shape). */
+  private pipeOndataThunk(): number {
+    return this.cached("pipeOndataThunk", () => {
+      const idx = this.mb.declareFunc(this.deps.thunkSig(), "%w.rs.pipeOndata");
+      const c = new Code();
+      const CLOS = 0, ARGS = 1, CL = 2, CHUNK = 3, BYTES = 4, RETB = 5;
+      c.localGet(CLOS);
+      c.refCast(this.pipeClosT());
+      c.localSet(CL);
+      c.localGet(ARGS);
+      c.structGet(this.deps.dynArrStructType(), BUF);
+      c.i32Const(0);
+      c.arrayGet(this.deps.dynArrBufType());
+      c.localSet(CHUNK);
+      c.localGet(CHUNK);
+      c.call(this.chunkDynToBytesCore());
+      c.localSet(BYTES);
+      c.localGet(CL);
+      c.structGet(this.pipeClosT(), PIPE_DST);
+      c.localGet(BYTES);
+      c.refNull(this.deps.voidClos().clos);
+      c.call(this.writeCore());
+      c.localSet(RETB);
+      c.localGet(RETB);
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(CL);
+      c.structGet(this.pipeClosT(), PIPE_SRC);
+      c.call(this.pauseCore());
+      c.end();
+      c.globalGet(this.deps.undefinedDynGlobal());
+      this.mb.setBody(idx, [this.pipeClosRef(), this.deps.dynRef(), this.deps.bytesRef(), I32], c.bytes());
+      return idx;
+    });
+  }
+
+  /** pipe()'s 'drain' listener thunk on the DESTINATION: resumes the
+   * SOURCE (Node's own `ondrain`). Zero-arg in spirit (drain carries no
+   * payload); the uniform thunk sig still takes the args vector, unread. */
+  private pipeOndrainThunk(): number {
+    return this.cached("pipeOndrainThunk", () => {
+      const idx = this.mb.declareFunc(this.deps.thunkSig(), "%w.rs.pipeOndrain");
+      const c = new Code();
+      const CLOS = 0, CL = 2;
+      c.localGet(CLOS);
+      c.refCast(this.pipeClosT());
+      c.localSet(CL);
+      c.localGet(CL);
+      c.structGet(this.pipeClosT(), PIPE_SRC);
+      c.call(this.resumeCore());
+      c.globalGet(this.deps.undefinedDynGlobal());
+      this.mb.setBody(idx, [this.pipeClosRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  /** pipe()'s 'end' listener thunk on the SOURCE (registered `once`):
+   * `dest.end()` (Node's own `onend`, gated by the `{end}` option at the
+   * REGISTRATION site — this thunk itself is only ever wired up when
+   * pipe()'s own `end` argument is true). */
+  private pipeOnendThunk(): number {
+    return this.cached("pipeOnendThunk", () => {
+      const idx = this.mb.declareFunc(this.deps.thunkSig(), "%w.rs.pipeOnend");
+      const c = new Code();
+      const CLOS = 0, CL = 2;
+      c.localGet(CLOS);
+      c.refCast(this.pipeClosT());
+      c.localSet(CL);
+      c.localGet(CL);
+      c.structGet(this.pipeClosT(), PIPE_DST);
+      c.refNull(this.deps.bytesStructType());
+      c.i32Const(0); // hasChunk
+      c.refNull(this.deps.voidClos().clos);
+      c.i32Const(0); // hasCb
+      c.call(this.endCore());
+      c.globalGet(this.deps.undefinedDynGlobal());
+      this.mb.setBody(idx, [this.pipeClosRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  /** `(root: src, dst, endFlag) -> root` — `pipe()` itself: registers the
+   * shared closure's three internal listeners, emits 'pipe' on `dst`
+   * synchronously (Node's own order — before the first byte can flow),
+   * and returns `dst` (Node's `pipe()` return value, lower-stream.ts's
+   * own `type: dst.type`). S050 (registered before this landed): a
+   * SECOND simultaneous pipe destination TRAPS rather than silently
+   * overwriting or fanning out — this tier tracks one relationship per
+   * source, by construction. */
+  pipeCore(): number {
+    return this.cachedRecursive(
+      "pipeCore",
+      () => this.mb.declareFunc(this.mb.funcType([this.deps.rootRef(), this.deps.rootRef(), I32], [this.deps.rootRef()]), "%w.rs.pipe"),
+      (idx) => {
+        this.mb.declareFuncRef(this.pipeOndataThunk());
+        this.mb.declareFuncRef(this.pipeOndrainThunk());
+        this.mb.declareFuncRef(this.pipeOnendThunk());
+        const c = new Code();
+        const ROOT = 0, DST = 1, ENDFLAG = 2, ST = 3, CLOS = 4, ARGS = 5;
+        c.localGet(ROOT);
+        c.call(this.stateEnsure());
+        c.localSet(ST);
+        c.localGet(ST);
+        c.structGet(this.stateT(), RS_PIPE_DEST);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifResult(this.deps.rootRef());
+        // S050: already piping — loud named trap, not a silent overwrite.
+        this.deps.setUncaughtError(c, (cc) => {
+          this.deps.buildErrorLit(
+            cc,
+            "%Error",
+            "Error",
+            (ccc) => this.deps.lit(ccc, "multiple simultaneous pipe() destinations are not supported yet (SEMANTICS.md S050)"),
+            null,
+          );
+        });
+        c.localGet(DST);
+        c.else_();
+        c.localGet(ROOT);
+        c.localGet(DST);
+        c.structNew(this.pipeClosT());
+        c.localSet(CLOS);
+        c.localGet(ST);
+        c.localGet(DST);
+        c.structSet(this.stateT(), RS_PIPE_DEST);
+        // 'data' on the source.
+        c.localGet(ROOT);
+        this.deps.lit(c, "data");
+        c.localGet(CLOS);
+        c.refFunc(this.pipeOndataThunk());
+        c.localGet(CLOS);
+        c.i32Const(0); // once
+        c.i32Const(0); // prepend
+        c.call(this.deps.entryAppend());
+        c.localGet(ST);
+        c.localGet(CLOS);
+        c.structSet(this.stateT(), RS_PIPE_ONDATA);
+        // Registering 'data' directly via entryAppend (not the frontend's
+        // own `.on('data', cb)` dispatch) bypasses the hook that call
+        // site normally fires afterward — replicate it explicitly:
+        // Node's real pipe() calls `src.resume()` itself (this IS that
+        // call, `onDataAdded`'s own "auto-resume unless explicitly
+        // paused" gate already matching Node's `flowing !== false`).
+        c.localGet(ROOT);
+        c.call(this.onDataAdded());
+        // 'drain' on the destination.
+        c.localGet(DST);
+        this.deps.lit(c, "drain");
+        c.localGet(CLOS);
+        c.refFunc(this.pipeOndrainThunk());
+        c.localGet(CLOS);
+        c.i32Const(0);
+        c.i32Const(0);
+        c.call(this.deps.entryAppend());
+        c.localGet(ST);
+        c.localGet(CLOS);
+        c.structSet(this.stateT(), RS_PIPE_ONDRAIN);
+        // 'end' on the source, ONCE — only when the caller asked for it
+        // (the default; lower-stream.ts's own `end` argument, always a
+        // compile-time literal per its lowering — a literal `false`
+        // refuses at the emitter dispatch site, never reaches here).
+        c.localGet(ENDFLAG);
+        c.ifVoid();
+        c.localGet(ROOT);
+        this.deps.lit(c, "end");
+        c.localGet(CLOS);
+        c.refFunc(this.pipeOnendThunk());
+        c.localGet(CLOS);
+        c.i32Const(1); // once
+        c.i32Const(0);
+        c.call(this.deps.entryAppend());
+        c.localGet(ST);
+        c.localGet(CLOS);
+        c.structSet(this.stateT(), RS_PIPE_ONEND);
+        c.end();
+        // 'pipe' on the destination — synchronous, zero-arg (the file
+        // header's own scoped-down decision: no existing primitive boxes
+        // a class instance into dyn, and no claim this pass reads the
+        // argument — see the pipe design report for the measured sibling
+        // evidence).
+        this.emitNoArgFrom(c, DST, "pipe", ARGS);
+        c.localGet(DST);
+        c.end();
+        this.mb.setBody(idx, [this.stateRef(), this.pipeClosRef(), this.deps.dynArrRef()], c.bytes());
+      },
+    );
+  }
+
+  /** `(root: src, dst: root|null, hasDst) -> root` — `unpipe()`: removes
+   * the three listeners BY IDENTITY (events.ts's `removeLast`, Node's own
+   * mechanism), emits 'unpipe' on the destination, and clears the pipe
+   * state — a no-op when not currently piping, or when `dst` is given
+   * and does not match the active destination (Node's own semantics: an
+   * unpipe naming an uninvolved stream does nothing). Always returns
+   * `src` (lower-stream.ts's own `type: receiver.type`). */
+  unpipeCore(): number {
+    return this.cachedRecursive(
+      "unpipeCore",
+      () =>
+        this.mb.declareFunc(
+          this.mb.funcType([this.deps.rootRef(), this.deps.rootRef(), I32], [this.deps.rootRef()]),
+          "%w.rs.unpipe",
+        ),
+      (idx) => {
+        const c = new Code();
+        const ROOT = 0, DST = 1, HASDST = 2, ST = 3, DSTVAL = 4, ARGS = 5;
+        c.localGet(ROOT);
+        c.call(this.stateEnsure());
+        c.localSet(ST);
+        c.localGet(ST);
+        c.structGet(this.stateT(), RS_PIPE_DEST);
+        c.refIsNull();
+        c.i32Eqz(); // is piping
+        c.localGet(HASDST);
+        c.i32Eqz(); // no dst arg given -> always matches
+        c.localGet(HASDST);
+        c.localGet(ST);
+        c.structGet(this.stateT(), RS_PIPE_DEST);
+        c.localGet(DST);
+        c.refEq();
+        c.i32And(); // has dst arg AND it matches
+        c.i32Or();
+        c.i32And(); // is-piping AND (no-arg OR matches)
+        c.ifVoid();
+        c.localGet(ST);
+        c.structGet(this.stateT(), RS_PIPE_DEST);
+        c.localSet(DSTVAL);
+        c.localGet(ROOT);
+        this.deps.lit(c, "data");
+        c.localGet(ST);
+        c.structGet(this.stateT(), RS_PIPE_ONDATA);
+        c.call(this.deps.removeLast());
+        c.localGet(DSTVAL);
+        this.deps.lit(c, "drain");
+        c.localGet(ST);
+        c.structGet(this.stateT(), RS_PIPE_ONDRAIN);
+        c.call(this.deps.removeLast());
+        // RS_PIPE_ONEND may be null (endFlag was false at pipe() time, or
+        // it already self-removed via its own `once`) — removeLast's own
+        // no-match-is-a-no-op contract (its header) makes this safe
+        // unconditionally, no extra null check needed.
+        c.localGet(ROOT);
+        this.deps.lit(c, "end");
+        c.localGet(ST);
+        c.structGet(this.stateT(), RS_PIPE_ONEND);
+        c.call(this.deps.removeLast());
+        this.emitNoArgFrom(c, DSTVAL, "unpipe", ARGS);
+        c.localGet(ST);
+        c.refNull(this.deps.rootStruct());
+        c.structSet(this.stateT(), RS_PIPE_DEST);
+        c.localGet(ST);
+        c.refNull(EQ_HEAP);
+        c.structSet(this.stateT(), RS_PIPE_ONDATA);
+        c.localGet(ST);
+        c.refNull(EQ_HEAP);
+        c.structSet(this.stateT(), RS_PIPE_ONDRAIN);
+        c.localGet(ST);
+        c.refNull(EQ_HEAP);
+        c.structSet(this.stateT(), RS_PIPE_ONEND);
+        c.end();
+        c.localGet(ROOT);
+        this.mb.setBody(idx, [this.stateRef(), this.deps.rootRef(), this.deps.dynArrRef()], c.bytes());
+      },
+    );
+  }
+
   /** `(root) -> void` — the `.on('data', cb)` side effect (Node's
    * `Readable.prototype.on` override): auto-resumes UNLESS the stream is
    * explicitly paused (`flowing === false` exactly — an unset/-1 stream
@@ -3639,6 +4292,17 @@ export class StreamBuilder {
     });
   }
 
+  /** CORRECTION (1690, both-sides autoDestroy): `opFinish`'s own header
+   * has the full story — this is its mirror-image half. A single-sided
+   * Readable destroys immediately once 'end' fires (unchanged); a
+   * duplex-shaped stream (WS_DUPLEX_SHAPED) only destroys here once the
+   * writable side has ALSO finished (WS_FINISHED) — otherwise `opFinish`
+   * (running later) is the one that will.
+   *
+   * GATE FIX (C2S-1, remedy iteration 3): `allowHalfOpen === false`'s
+   * auto-end wiring branches IN PLACE of the autoDestroy check above
+   * (OP_AUTO_END's own header has the full mechanism story) — Node's
+   * real `endReadableNT` is an if/else-if between the two, never both. */
   private opEnd(): number {
     return this.cached("opEnd", () => {
       const root = this.deps.rootRef();
@@ -3673,12 +4337,66 @@ export class StreamBuilder {
       c.i32Const(1);
       c.structSet(this.stateT(), RS_END_EMITTED);
       this.emitNoArgFrom(c, ROOT, "end", ARGS);
+      // GATE FIX (C2S-1, remedy iteration 3 — build the wiring, refuse/
+      // trap came back out): branch selection mirroring Node's real
+      // `endReadableNT` — `if (stream.writable && allowHalfOpen ===
+      // false) { schedule endWritableNT } else if (autoDestroy) { ...
+      // existing check, unchanged ... }`. "stream.writable" here is the
+      // four-flag guard OP_AUTO_END's own header/body re-checks (state
+      // can move in the tick gap between scheduling and firing) —
+      // WS_ENDING/WS_ENDED/RS_DESTROYED/RS_ERROR, matching Node's real
+      // getter's `kEnding|kEnded|kDestroyed|kErrored` exactly. Measured
+      // (not assumed): an explicit end() already called before 'end'
+      // fires leaves WS_ENDING set here, correctly falling through to
+      // the unchanged autoDestroy branch instead (m3's own probe — no
+      // double-end, no error, matching Node's own quiet no-op); a
+      // Transform's _flush-driven push(null) can never reach this guard
+      // TRUE either, since Transform's readable 'end' is structurally
+      // always a downstream consequence of its OWN end() already having
+      // been called (m2's own probe — 'finish' here is the ordinary
+      // explicit-end sequence, unrelated to this new branch, which never
+      // fires for a bare Transform).
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_DUPLEX_SHAPED);
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_ALLOW_HALF_OPEN);
+      c.i32Eqz();
+      c.i32And();
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_ENDING);
+      c.i32Eqz();
+      c.i32And();
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_ENDED);
+      c.i32Eqz();
+      c.i32And();
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_DESTROYED);
+      c.i32Eqz();
+      c.i32And();
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_ERROR);
+      c.refIsNull();
+      c.i32And();
+      c.ifVoid();
+      c.localGet(ROOT);
+      c.i32Const(OP_AUTO_END);
+      c.call(this.scheduleTick());
+      c.else_();
       c.localGet(ST);
       c.structGet(this.stateT(), RS_AUTO_DESTROY);
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_DUPLEX_SHAPED);
+      c.i32Eqz();
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_FINISHED);
+      c.i32Or();
+      c.i32And();
       c.ifVoid();
       c.localGet(ROOT);
       c.refNull(this.errType());
       c.call(this.destroyErrCore());
+      c.end();
       c.end();
       // PASS 2: covers autoDestroy:false too (destroyErrCore's own call,
       // just above, already does this on the common/default path — a
@@ -4007,17 +4725,97 @@ export class StreamBuilder {
 
   /* ── the scalar property surface ──────────────────────────────────── */
 
-  /** `(root) -> f64` — `readableLength`. */
+  /** `(root) -> f64` — STAGE C PASS 2, hex/utf8: `readableLength` UNDER
+   * an active encoding counts STRING UNITS (Node's own `readableLength`
+   * over a string-mode stream is `state.length` measured in JS string
+   * `.length` terms, NOT bytes — 1744's own "wörld" pin: 11 units, not
+   * the 12 utf8 bytes `ö` costs), not RS_LENGTH's raw byte count. hex
+   * needs NO special counting (`hexEncodeStep`'s own header: 1 input
+   * byte → 1 ASCII output byte, so RS_LENGTH already IS the string-unit
+   * count for a hex-mode buffer) — only utf8 diverges, walked here
+   * NON-DESTRUCTIVELY (a property read must not consume the buffer):
+   * each chunk's own remaining slice (respecting CHUNK_OFF, same
+   * addressing `takeFromChunks` uses) decodes independently and its
+   * length sums in — sound because every STORED chunk is already a
+   * complete, self-contained decoded-then-reencoded utf8 sequence
+   * (pushCore's own decode-choke-point never stores a split tail, that
+   * lives in RS_DEC_PENDING instead), so no cross-chunk boundary could
+   * ever split a surrogate pair the walk needs to re-join. */
   lengthOf(): number {
     return this.cached("lengthOf", () => {
       const root = this.deps.rootRef();
       const idx = this.mb.declareFunc(this.mb.funcType([root], [F64]), "%w.rs.length");
       const c = new Code();
-      const ROOT = 0;
+      const ROOT = 0, ST = 1;
       c.localGet(ROOT);
       c.call(this.stateEnsure());
+      c.localSet(ST);
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_ENCODING);
+      c.i32Const(1);
+      c.i32Eq();
+      c.ifResult(F64);
+      c.localGet(ROOT);
+      c.call(this.stringUnitsLengthOf());
+      c.else_();
+      c.localGet(ST);
       c.structGet(this.stateT(), RS_LENGTH);
-      this.mb.setBody(idx, [], c.bytes());
+      c.end();
+      this.mb.setBody(idx, [this.stateRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  /** `(root) -> f64` — `lengthOf`'s own utf8 arm, factored out: the
+   * non-destructive per-chunk decode-and-sum walk, `lengthOf`'s own
+   * header has the full story. */
+  private stringUnitsLengthOf(): number {
+    return this.cached("stringUnitsLengthOf", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root], [F64]), "%w.rs.stringUnitsLength");
+      const c = new Code();
+      const ROOT = 0, ST = 1, CUR = 2, TOTAL = 3, SLICE = 4, STR = 5;
+      c.localGet(ROOT);
+      c.call(this.stateEnsure());
+      c.localSet(ST);
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_HEAD);
+      c.localSet(CUR);
+      c.f64Const(0);
+      c.localSet(TOTAL);
+      c.block();
+      c.loop();
+      c.localGet(CUR);
+      c.refIsNull();
+      c.brIf(1);
+      c.localGet(CUR);
+      c.structGet(this.chunkT(), CHUNK_BYTES);
+      c.localGet(CUR);
+      c.structGet(this.chunkT(), CHUNK_OFF);
+      c.f64ConvertI32S();
+      c.localGet(CUR);
+      c.structGet(this.chunkT(), CHUNK_BYTES);
+      c.structGet(this.deps.bytesStructType(), BYTES_LEN);
+      c.f64ConvertI32S();
+      c.call(this.deps.bytesSlice());
+      c.localSet(SLICE);
+      c.localGet(SLICE);
+      c.call(this.deps.toStrUtf8());
+      c.localSet(STR);
+      c.localGet(TOTAL);
+      c.localGet(STR);
+      c.arrayLen();
+      c.f64ConvertI32U();
+      c.f64Add();
+      c.localSet(TOTAL);
+      c.localGet(CUR);
+      c.structGet(this.chunkT(), CHUNK_NEXT);
+      c.localSet(CUR);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(TOTAL);
+      this.mb.setBody(idx, [this.stateRef(), this.chunkRef(), F64, this.deps.bytesRef(), this.deps.strRef()], c.bytes());
       return idx;
     });
   }
@@ -4763,6 +5561,193 @@ export class StreamBuilder {
     );
   }
 
+  /** `(root, errRef|null, bytesRef|null) -> void` — STAGE C PASS 2,
+   * Transform: `_transform`'s completion-callback landing site
+   * (emitter.ts's `doneClosFor` "transform" kind). `data` arrives here
+   * ALREADY EXTRACTED — doneClosFor's own union-arm read (the completion
+   * callback's real declared type, per the project-local ambient, is a
+   * CONCRETE `Buffer | string | undefined` union, never `dyn` — corrected
+   * after the original dyn-based design was found wrong by execution),
+   * so a real wasm `null` here means "no data" directly, no dyn-UNDEF
+   * sentinel needed. Measured directly against Node (p3a/p3c/p3d/p3g):
+   * an error skips data entirely and takes the SAME path a plain
+   * `_write` callback error already does — `afterWriteCore`, F1's
+   * fresh-vs-collision gate, unchanged; success pushes `data` (if
+   * non-null — `cb()`/`cb(null, undefined)` pushes nothing, T5's own
+   * pin) SYNCHRONOUSLY via the ordinary push() path, already bytes-
+   * shaped (no further coercion — the string-arm case was already
+   * converted inside doneClosFor), then falls into `afterWriteCore`
+   * exactly like a data-less completion would (drain/queue-continuation
+   * unchanged). Whether a data-bearing error (`cb(err, data)`) should
+   * still push before erroring is UNMEASURED — this skips data on any
+   * error, named per the sibling rule, not exercised by any claim. */
+  afterTransformCore(): number {
+    return this.cached("afterTransformCore", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root, this.deps.errRef(), this.deps.bytesRef()], []), "%w.ws.afterTransform");
+      const c = new Code();
+      const ROOT = 0, ERR = 1, DATA = 2;
+      c.localGet(ERR);
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(ROOT);
+      c.localGet(ERR);
+      c.call(this.afterWriteCore());
+      c.return_();
+      c.end();
+      c.localGet(DATA);
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(ROOT);
+      c.localGet(DATA);
+      c.i32Const(0); // front: false — an ordinary tail push
+      c.call(this.pushCore());
+      c.drop(); // the should-push-more answer is not observed here — write-side backpressure/drain is afterWriteCore's own job below, unrelated to push()'s own return
+      c.end();
+      c.localGet(ROOT);
+      c.refNull(this.errType()); // still null — the error branch above already returned
+      c.call(this.afterWriteCore());
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  /** `(root, errRef|null, bytesRef|null) -> void` — STAGE C PASS 2,
+   * Transform: `_flush`'s completion-callback landing site. `data`
+   * arrives already-extracted, `afterTransformCore`'s own header has the
+   * full correction story. Measured directly against Node (p3b/p3f/p3g/
+   * p3h — your own trace, `T6.final [as _final]`): `_flush` interposes
+   * as Transform's OWN internal `_final` (the construction side
+   * populates WS_FINAL_CLOS/THUNK with a bridge to the user's `_flush`,
+   * NOT an event listener), so its error takes `_final`'s existing error
+   * path (`finalDoneCore`'s own `destroyErrCore` branch), unchanged.
+   * Success: push `data` if present (same shape as `afterTransformCore`
+   * — already bytes, no coercion here), UNCONDITIONALLY push(null) (ends
+   * the readable side — Node does this whether or not `_flush` was even
+   * defined, p3e's PassThrough-with-no-_flush pin), THEN `finalDoneCore`
+   * — which is what fires 'prefinish' AND schedules 'finish'. Ordering
+   * measured, not assumed: p3g shows the flush-pushed 'data' event
+   * landing BEFORE 'prefinish' in real Node, and `finalDoneCore` firing
+   * 'prefinish' only AFTER this function's own push-then-null-then-call
+   * sequence reproduces that order for free — no divergence to name
+   * here. */
+  flushDoneCore(): number {
+    return this.cached("flushDoneCore", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root, this.deps.errRef(), this.deps.bytesRef()], []), "%w.ws.flushDone");
+      const c = new Code();
+      const ROOT = 0, ERR = 1, DATA = 2;
+      c.localGet(ERR);
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(ROOT);
+      c.localGet(ERR);
+      c.call(this.finalDoneCore());
+      c.return_();
+      c.end();
+      c.localGet(DATA);
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(ROOT);
+      c.localGet(DATA);
+      c.i32Const(0);
+      c.call(this.pushCore());
+      c.drop();
+      c.end();
+      c.localGet(ROOT);
+      c.call(this.pushNullCore());
+      c.drop(); // pushNullCore's own i32 answer is always false (its own header) — nothing to observe
+      c.localGet(ROOT);
+      c.refNull(this.errType());
+      c.call(this.finalDoneCore());
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  /** `(clos, this, chunk, encoding, wreq) -> void` — `writeThunkSig()`'s
+   * exact shape (WS_WRITE_THUNK's slot): PassThrough's OWN identity
+   * `_transform` when the construction site provides no user override
+   * (Node's real `PassThrough` — checked directly against @types/node's
+   * structural shape, and p3d/p3e's own pin — is exactly `_transform(c,
+   * e, cb) { cb(null, c); }`). `chunk` is ALREADY bytes (this file's own
+   * chunk representation), so this pushes it straight through — no
+   * dyn-boxing round trip needed at all, unlike a real user override's
+   * dyn-typed completion-callback data slot. */
+  identityTransformThunk(): number {
+    return this.cached("identityTransformThunk", () => {
+      const idx = this.mb.declareFunc(this.writeThunkSig(), "%w.ws.identityTransformThunk");
+      const c = new Code();
+      const CLOS = 0, THIS = 1, CHUNK = 2, ENC = 3, WREQ = 4;
+      c.localGet(THIS);
+      c.localGet(CHUNK);
+      c.i32Const(0); // front: false
+      c.call(this.pushCore());
+      c.drop();
+      c.localGet(THIS);
+      c.refNull(this.errType());
+      c.refNull(this.deps.bytesStructType());
+      c.call(this.afterTransformCore());
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  /** `(clos, this) -> void` — `finalThunkSig()`'s exact shape
+   * (WS_FINAL_THUNK's slot): every Transform/PassThrough construction
+   * needs SOME bridge here regardless of whether the program supplied a
+   * `_flush` override — Node's real internal `_final` (`final` in
+   * transform.js) ALWAYS runs the push(null)-then-finish sequence, with
+   * or without a `_flush` (measured directly, p3e: a bare `PassThrough`
+   * with no `_flush` at all still cycles prefinish→end→finish cleanly,
+   * nothing extra pushed). Reuses `flushDoneCore` directly with a null
+   * error and null data — its own "no data to push" branch already skips
+   * straight to the unconditional push(null) + `finalDoneCore` tail. */
+  identityFlushThunk(): number {
+    return this.cached("identityFlushThunk", () => {
+      const idx = this.mb.declareFunc(this.finalThunkSig(), "%w.ws.identityFlushThunk");
+      const c = new Code();
+      const CLOS = 0, THIS = 1;
+      c.localGet(THIS);
+      c.refNull(this.errType());
+      c.refNull(this.deps.bytesStructType());
+      c.call(this.flushDoneCore());
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  /** `(clos, argsVec) -> dyn` — `deps.thunkSig()`'s exact shape: the
+   * BUILD RULING's genuine no-op 'prefinish' listener Transform/
+   * PassThrough construction registers on itself, ported from Node's
+   * real `internal/streams/transform.js` (fetched directly, v24.18.1,
+   * matching this environment's own `node -v`): `this.on('prefinish',
+   * prefinish)`, a backward-compat shim for pre-`_flush` code that
+   * overrode `_final` directly. `prefinish()`'s body — `if (this._final
+   * !== final) { final.call(this); }` — is PROVABLY dead in this tier
+   * (lower-classes.ts's own underscore-method fence hard-refuses any
+   * Transform/PassThrough subclass declaring `_final`, since "final" is
+   * not in either class's `accepted` list, SC1090) — so this thunk does
+   * nothing at all, ever; it exists ONLY so eventNames()/listenerCount/
+   * rawListeners/removeAllListeners('prefinish') see the SAME single
+   * real entry Node's own construction leaves behind (p3j/p3k's own
+   * measurements — a fresh instance's eventNames() === ["prefinish"],
+   * listenerCount === 1, and removeAllListeners('prefinish') empties it
+   * exactly like any other real entry, matching Node byte-for-byte). */
+  prefinishShimThunk(): number {
+    return this.cached("prefinishShimThunk", () => {
+      const idx = this.mb.declareFunc(this.deps.thunkSig(), "%w.rs.prefinishShim");
+      const c = new Code();
+      c.globalGet(this.deps.undefinedDynGlobal());
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
   /** 'drain' — OP_DRAIN's tick body (Node's real `onwriteDrain`, folded
    * into the scheduled form every deferred emission here uses). */
   private opDrain(): number {
@@ -4788,7 +5773,18 @@ export class StreamBuilder {
    * 'finish' listeners — 1688/1741/1811's pin), the 'finish' event
    * itself, then autoDestroy's own default-path destroy (already built —
    * pass 1's `destroyCore`, which drives 'close' exactly as a Readable's
-   * does). */
+   * does).
+   *
+   * CORRECTION (1690, both-sides autoDestroy): pass 1 built this for the
+   * single-sided Writable only, where 'finish' is the WHOLE lifecycle —
+   * destroying immediately after is correct there and stays unchanged.
+   * A duplex-shaped stream (WS_DUPLEX_SHAPED) has a second, independent
+   * half that may still be open; Node's real autoDestroy waits for BOTH
+   * `_writableState.finished` AND `_readableState.endEmitted` before
+   * actually destroying (measured, order-independent — WS_DUPLEX_SHAPED's
+   * own header, p6a/p6b). `opEnd`'s own mirror check is the other half
+   * of this same gate — whichever side completes SECOND is the one that
+   * actually fires the destroy. */
   private opFinish(): number {
     return this.cached("opFinish", () => {
       const root = this.deps.rootRef();
@@ -4820,11 +5816,64 @@ export class StreamBuilder {
       this.emitNoArgFrom(c, ROOT, "finish", ARGS);
       c.localGet(ST);
       c.structGet(this.stateT(), RS_AUTO_DESTROY);
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_DUPLEX_SHAPED);
+      c.i32Eqz();
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_END_EMITTED);
+      c.i32Or();
+      c.i32And();
       c.ifVoid();
       c.localGet(ROOT);
       c.call(this.destroyCore());
       c.end();
       this.mb.setBody(idx, [this.stateRef(), this.deps.dynArrRef(), { kind: "ref", nullable: true, typeIndex: this.deps.voidClos().clos }], c.bytes());
+      return idx;
+    });
+  }
+
+  /** `(root) -> void` — OP_AUTO_END's tick body: Node's real
+   * `endWritableNT`, ported (OP_AUTO_END's own header has the full
+   * mechanism story). Re-checks the SAME four flags `opEnd`'s branch-
+   * selection guard already tested (state can move in the tick gap:
+   * user code, or another already-queued tick, running between
+   * scheduling and this firing), then calls `endCore` exactly like
+   * `pipeOnendThunk`'s own `dest.end()` — null chunk, no callback, the
+   * SAME "just end it" shape. A guard failure here is a quiet no-op,
+   * matching Node's own `if (writable) { stream.end(); }` — there is
+   * nothing to report, `.end()` simply never runs a second time. */
+  private opAutoEnd(): number {
+    return this.cached("opAutoEnd", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root], []), "%w.ws.opAutoEnd");
+      const c = new Code();
+      const ROOT = 0, ST = 1;
+      c.localGet(ROOT);
+      c.call(this.stateEnsure());
+      c.localSet(ST);
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_ENDING);
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_ENDED);
+      c.i32Or();
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_DESTROYED);
+      c.i32Or();
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_ERROR);
+      c.refIsNull();
+      c.i32Eqz();
+      c.i32Or();
+      c.ifVoid();
+      c.return_();
+      c.end();
+      c.localGet(ROOT);
+      c.refNull(this.deps.bytesStructType());
+      c.i32Const(0); // hasChunk
+      c.refNull(this.deps.voidClos().clos);
+      c.i32Const(0); // hasCb
+      c.call(this.endCore());
+      this.mb.setBody(idx, [this.stateRef()], c.bytes());
       return idx;
     });
   }
@@ -5296,6 +6345,28 @@ export class StreamBuilder {
       c.structGet(this.stateT(), WS_ENDED);
       c.i32Eqz();
       c.i32And();
+      this.mb.setBody(idx, [this.stateRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  /** `(root) -> i32` — STAGE C PASS 2, Transform (CORRECTION ruling C):
+   * `.allowHalfOpen`, read back TRUTHFULLY from WS_ALLOW_HALF_OPEN
+   * (duplex.new/transform.new/passthrough.new's own construction stores
+   * whatever the program actually passed — WS_ALLOW_HALF_OPEN's own
+   * header). The BEHAVIOR the flag governs stays unwired (named gap,
+   * unchanged) — this is read-back fidelity only. */
+  allowHalfOpenOf(): number {
+    return this.cached("allowHalfOpenOf", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root], [I32]), "%w.ws.allowHalfOpen");
+      const c = new Code();
+      const ROOT = 0, ST = 1;
+      c.localGet(ROOT);
+      c.call(this.stateEnsure());
+      c.localSet(ST);
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_ALLOW_HALF_OPEN);
       this.mb.setBody(idx, [this.stateRef()], c.bytes());
       return idx;
     });

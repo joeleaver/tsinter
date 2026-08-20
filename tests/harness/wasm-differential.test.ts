@@ -2193,6 +2193,258 @@ const TIER_FLOOR: string[] = [
   "1815-stream-state-reads.cjs",
   "2100-stream-default-hwm.ts",
   "2312-stream-underscore-assign.ts",
+  //
+  // STAGE C PASS 2, structural (pipe()/unpipe()): entryAppend/removeLast-
+  // registered internal 'data'/'drain'/'end' listeners (Node's own real
+  // mechanism, ported directly — not a parallel fast path), backpressure
+  // via writeCore's existing return-value/pauseCore, resumeCore on
+  // 'drain', end propagation via endCore on the source's 'end' (once).
+  // A second simultaneous pipe() destination TRAPS (SEMANTICS.md S050,
+  // registered before this landed) rather than silently overwriting or
+  // fanning out — this tier tracks one relationship per source. Board
+  // #71's flowing-seam note read and cleared: none of this pass's own
+  // pipe claims register a 'readable' listener alongside pipe(), so the
+  // hazard stays unobserved and unfixed, named in the pass-2 report.
+  //
+  // STILL REFUSING BY NAME: passthrough.new/transform.new (1692, 1695 —
+  // construction itself, this pass's own next structural item); dyn-VALUE
+  // option/underscore-assign callbacks (1811, 2313); readable.initDyn/
+  // writable.initDyn (1812); readable.setEncoding:hex (1744 — needs BOTH
+  // hex decode-out AND this pipe machinery, hex not yet built).
+  "1693-stream-pipe-backpressure.ts",
+  "1743-stream-extends-vt-dispatch.ts",
+  //
+  // STAGE C PASS 2, structural (Duplex construction + shape-mode):
+  // duplex.new/init (readable.new/writable.new precedents, fused —
+  // allowHalfOpen consumed and, after gate C2S-1's third remedy
+  // iteration, fully WIRED: opEnd/OP_AUTO_END auto-ends the writable
+  // side when the readable side ends under `allowHalfOpen: false`,
+  // matching Node's real endReadableNT — that header has the full
+  // mechanism story and the remedy history). Unblocking Duplex let 2626 compile, which then FAILED
+  // the differential run — not this pass's build failing, the harness
+  // doing its job — exposing TWO gaps, both fixed together: (1) a
+  // pre-existing, general (non-stream) bug where eventNames() excluded
+  // 'error' entirely for ANY EventEmitter (REG_SEQ/BUCKET_SEQ/
+  // BUCKETERR_SEQ monotonic-stamp merge-walk, events.ts's own header —
+  // the ten-case regression pin, p2-error-eventnames-measure.ts,
+  // permanent); (2) shape-mode itself — streams pre-create their
+  // canonical reserved-name buckets at construction (BUCKET_RESERVED/
+  // BUCKETERR_RESERVED, events.ts's own headers), invisible until a real
+  // listener lands, surviving a removeListener-emptying at their own
+  // rank (unlinkEntry's honorReserved=true), but NOT surviving a named
+  // removeAllListeners's fast (no-'removeListener'-meta-listener) path,
+  // which deletes even a reserved key (measured directly against Node,
+  // 2626's own r3/r4 cases). 'error' rides the DEDICATED err-bucket for
+  // its own reservation, never the main chain (errBucketEnsure's own
+  // reserved param) — the design's one named hole, closed before
+  // building. Two audit-discovered fixes beyond the reviewed design,
+  // both verified: removeAllWhole()'s meta-aware bucket-picking walk
+  // gained a BUCKET_N>0 filter (a reserved-but-empty bucket sitting in
+  // the chain would otherwise never be skipped nor ever get dropped,
+  // an infinite loop, not just a wrong answer — unreachable by any
+  // claim here but a real hang risk once BUCKET_RESERVED buckets exist
+  // at all); removeAllNamedMeta's own per-entry unlinkEntry() calls now
+  // pass honorReserved=true, matching a single removeListener(name,cb)
+  // (measured: p2-shapemode-removeall-meta.ts's "with-meta" reserved-
+  // name case matches Node exactly). NAMED, UNRESOLVED GAP (not fixed,
+  // not silently miscompiled — flagged in the pass-2 report): the SAME
+  // probe's "plain-with-meta" case shows a NON-reserved custom name on a
+  // reserved-name-bearing stream ALSO preserving its position across
+  // removeAllListeners+re-add when a 'removeListener' meta-listener is
+  // present — Node does this too, but BUCKET_RESERVED does not model it
+  // (the name itself is never reserved) and root cause is not
+  // understood; verified unreachable by 2626 and by all seven other
+  // eventNames()-exercising claims in this corpus, so left as a true,
+  // execution-confirmed corner rather than guessed at further.
+  "2626-stream-event-names.ts",
+  //
+  // STAGE C PASS 2, structural (Transform/PassThrough construction, the
+  // pass's own closing item): the write-bridge-to-_transform and final-
+  // bridge-to-_flush (writeThunkFor/finalThunkFor generalized with a
+  // `kind` param — "transform"/"flush" sit alongside "write"/"final",
+  // same struct-arity/cache-key discipline as the originals, doneClosFor
+  // gained matching 2-param arms reading a REAL union tag, not dyn — see
+  // the ambient-file correction below), RS_SYNC cleared at construction
+  // (Node's real `_readableState.sync = false` runs INSIDE Transform's
+  // own constructor, not waiting for a first `_read()` like a plain
+  // Readable/Duplex — pushCore's direct-emit fast path needs it on the
+  // very first push, not just later ones), PassThrough's canned identity
+  // `_transform`/`_flush` bridges (no `_transform` override anywhere ⇒
+  // pass the chunk straight through; no `_flush` ⇒ still push(null) and
+  // finish, nothing extra — both measured directly against Node, not
+  // assumed). Bare `%Transform` with NEITHER an option nor an override
+  // refuses by name (`libCall:transform.new:missing-transform`) rather
+  // than an unverified silent path — Node's own throws
+  // ERR_METHOD_NOT_IMPLEMENTED lazily on first write, machinery this
+  // tier does not have.
+  //
+  // THREE BUGS FOUND BY EXECUTION, ALL FIXED, NONE ANTICIPATED BY THE
+  // REVIEWED DESIGN:
+  // (1) doneClosFor's struct-field arity — "transform" kind shares
+  // writeThunkFor's own structNew call site (which always pushes a wreq
+  // value regardless of kind), but the struct's OWN field list only grew
+  // a wreq slot for kind==="write" — caught immediately by wasm
+  // validation ("struct.new[0] expected type... found local.get"), not
+  // silently wrong.
+  // (2) The completion callback's data parameter is NOT `dyn` for a
+  // TYPED override (the design paragraph's own grounding error, self-
+  // corrected mid-build): the project's OWN ambient
+  // (scriptc-node-fallback.d.ts) declares `_transform`/`_flush`'s
+  // callback as `(error?: Error|null, data?: Buffer|string) => void` — a
+  // CONCRETE union, never dyn, for any TYPE-ANNOTATED override (matching
+  // this backend's "chunks are bytes-or-string, never any" stance
+  // everywhere else). doneClosFor's "transform"/"flush" arm reads this
+  // union directly (dynFromHelper's own per-arm-by-kind pattern, reused
+  // rather than re-derived) instead of dyn-unboxing — chunkDynToBytesCore
+  // (pipe()'s own function) ended up UNUSED for this specific purpose.
+  // BUT: an UNANNOTATED `.cjs` override (no JSDoc at all — 1747's own
+  // shape, this pass's one deferred claim) infers ALL THREE params
+  // (chunk/encoding/callback) as checked-dynamic, not just data — chunk
+  // and encoding get boxed bytes/string→dyn at the call site
+  // (writeThunkFor's own new chunkIsDyn/encIsDyn arms, "transform" kind
+  // only), but `callback` itself being dyn needs real dyn-function/dyn-
+  // invoke machinery this pass does not build — 1747 stays refused by
+  // name (`libCall:transform.transform:non-func-callback`), parked for
+  // the dyn-adapter phase rather than force-built here.
+  // (3) `maybeFinishCore` (pass-1, shared, UNCHANGED by this pass)
+  // branches on WS_FINAL_CLOS being null to decide whether ANY `_final`
+  // exists at all, calling `finalDoneCore` directly and skipping
+  // WS_FINAL_THUNK entirely when null — correct for a plain Writable/
+  // Duplex with no `_final`. PassThrough/Transform's own "no `_flush`
+  // override" construction populated WS_FINAL_THUNK with the identity
+  // bridge but left WS_FINAL_CLOS null (mirroring the write side's own
+  // "CLOS unused" pattern, which has NO such fast path — doWriteCore
+  // always calls through WS_WRITE_THUNK unconditionally) — silently
+  // routing every one of THOSE constructions around
+  // identityFlushThunk/flushDoneCore/pushNullCore entirely.
+  // 'prefinish'/'finish' still fired correctly (finalDoneCore ran either
+  // way, from the OTHER branch), which is exactly why only the readable
+  // side's 'end' went missing. Root-caused via temporary, fully-stripped
+  // instrumentation (a `dbgLine` helper over the existing stage/putc/
+  // flush console.log primitives, verified working via a stateEnsure-
+  // only sanity print BEFORE trusting silence elsewhere as signal) after
+  // static tracing through readCore/howMuchToRead/endReadableCore found
+  // nothing wrong on paper — the actual break was one level further up
+  // the call chain than any measurement had looked yet. Fixed by giving
+  // WS_FINAL_CLOS a harmless non-null placeholder (`recv`, the instance
+  // itself) alongside WS_FINAL_THUNK in that branch.
+  //
+  // A SECOND, INDEPENDENT INSTANCE OF THE SAME "DESTROYED BLOCKS A
+  // STILL-OWED EVENT" PATTERN, found verifying the fix above against the
+  // full suite (1690's own bonus-rider failure, below) — NOT a Transform
+  // bug, PURE pass-1 Writable/Duplex machinery: `opFinish`'s own
+  // autoDestroy trigger (`destroyCore` right after 'finish', built when
+  // pass 1 only had single-sided Writable, where 'finish' IS the whole
+  // lifecycle) fires unconditionally, with no notion that a duplex-
+  // shaped stream has a second, independent half that may still be
+  // open. Node's real autoDestroy waits for BOTH
+  // `_writableState.finished` AND `_readableState.endEmitted` before
+  // actually destroying — measured directly, ORDER-INDEPENDENT (p6a:
+  // end() then push(null); p6b: push(null) then end() — `destroyed`
+  // stays false through BOTH 'finish' and 'end' firing either way, only
+  // flipping true once both are done, right before 'close'). Fixed with
+  // a new WS_DUPLEX_SHAPED flag (set at duplex.new/transform.new/
+  // passthrough.new construction, alongside WS_ALLOW_HALF_OPEN, same
+  // lockstep) gating BOTH `opFinish`'s and `opEnd`'s autoDestroy calls:
+  // a single-sided stream destroys immediately once its own side
+  // completes (unchanged, 1688/1689/1694/the readable family stay the
+  // control); a duplex-shaped one only destroys once ITS OWN side is
+  // done AND the other side's own completion flag is already set —
+  // whichever side finishes SECOND is the one that actually fires it.
+  // Re-verified the FULL destroy-family pin set this shared machinery
+  // touches (F1/F2/C4's own stabilization): c-destroy-cbfate/-midqueue,
+  // c-err-queue2/3, c-err-destroy-collide, f-write-after-destroy,
+  // f-mech-explicit-vs-autoDestroy — all still MATCH, zero regressions.
+  //
+  // readableLength UNDER utf8 fix, discovered running 1744 itself (SEE
+  // SEMANTICS.md S047, corrected in the same landing): Node counts
+  // STRING UNITS (JS `.length`), not RS_LENGTH's raw utf8-byte count
+  // ("wörld": 11 units vs 12 bytes) — a NEW, non-destructive per-chunk
+  // walk (`stringUnitsLengthOf`) decodes each buffered chunk's own
+  // remaining slice independently and sums lengths, sound because every
+  // STORED chunk is already a complete decoded-then-reencoded sequence
+  // (pushCore's own decode choke point never stores a split tail — that
+  // lives in RS_DEC_PENDING instead, so no chunk boundary could ever
+  // split what the walk needs to re-join). RS_LENGTH's own internal
+  // representation is UNCHANGED (still bytes) — only the property GETTER
+  // now computes the Node-true answer on demand; `push()`'s own
+  // highWaterMark-gated boolean return still shares the byte-counted
+  // internal comparison and remains genuinely divergent, S047's own
+  // remaining half. hex needed NO equivalent fix (`hexEncodeStep`'s own
+  // header: one input byte becomes exactly one ASCII output byte, so
+  // RS_LENGTH already IS the string-unit count for a hex-mode buffer).
+  //
+  // hex ITSELF (1744's own second half, `readable.setEncoding('hex')`):
+  // a NEW RS_ENCODING tag (2, alongside 0=off/1=utf8) and
+  // `hexEncodeStep` — pure, stateless bytes→bytes, no held-back tail at
+  // all (measured directly against Node's real `hex` StringDecoder: an
+  // ODD byte count, or a byte split across separate `write()` calls,
+  // both answer the FULL hex text immediately every time — unlike
+  // utf8's variable-width sequences, which genuinely can hold a trailing
+  // incomplete char). `setEncodingHexCore` mirrors
+  // `setEncodingUtf8Core`'s own "flip on, redecode anything already
+  // buffered" shape exactly, minus the decoder-step complexity hex
+  // never needs. emitDataFrom/emitBoxChunkAsDyn/pushNullCore's decoder-
+  // flush-at-EOF needed ZERO changes for hex — verified by reading each
+  // site, not assumed: the first two already branch on "is ANY encoding
+  // on" (a plain nonzero check, generalizing for free), and the third's
+  // own RS_DEC_PENDING-null gate already skips a no-op for hex (which
+  // never populates that field) without an explicit encoding check at
+  // all.
+  //
+  // BONUS RIDERS (2594's own precedent: unpicked claims that fell out of
+  // this pass's own targeted work, not independently pursued) — 1690,
+  // 1691, 1742, all landing clean once the bugs above were fixed:
+  // 1690-stream-duplex.ts is the SOURCE of the both-sides-autoDestroy
+  // bug's own discovery (a plain Duplex, `.end()` before `.push(null)`,
+  // no Transform involved at all — the full-suite run's own harness
+  // doing its job, not a build failure). 1691-stream-transform.ts and
+  // 1742-stream-extends-duplex-transform.ts exercise the SAME Transform/
+  // Duplex-extends construction and write/final-bridge machinery this
+  // pass built for other reasons, MATCHing without any claim-specific
+  // work. 1742 in particular is `super({ allowHalfOpen: false })` through
+  // a Duplex subclass, read back via `e.allowHalfOpen` — see the
+  // GATE C2S-1 paragraph below for why that shape's own history is worth
+  // a second look.
+  //
+  // GATE C2S-1 (found at the pass-2 structural gate, post-freeze):
+  // allowHalfOpen's own BEHAVIOR (auto-ending the writable side when the
+  // readable side ends under `allowHalfOpen: false`) was stored but
+  // silently unwired — a real, silent divergence (rule 1). THREE remedy
+  // iterations, each forced by measured evidence: (1) a compile-time
+  // refusal for a literal `false`; (2) extended to a runtime trap for a
+  // non-literal `false`; both came OUT once the reviewer's gate measured
+  // that they UNCLAIM 1742 — its entire exercised surface (construct-
+  // with-false, write/end, flag read-back) this tier already handled
+  // byte-exactly, because its own execution trace never reaches the
+  // readable side's 'end' at all (a no-op `_read`), so the missing
+  // wiring never had a chance to diverge for that specific program. (3)
+  // the wiring itself, built: opEnd/OP_AUTO_END, Node's real
+  // `endReadableNT`/`endWritableNT` ported (NOT a `once('end', ...)`
+  // listener — measured directly against v24.18.1's own
+  // `internal/streams/readable.js` source AND an ordering probe showing
+  // 'end' takes multiple tick-hops to fire, ruling out a same-tick
+  // listener; opEnd/OP_AUTO_END's own headers have the full mechanism
+  // and measurement story, including the two reentrancy siblings
+  // measured before wiring — a Transform's _flush-driven push(null)
+  // during writable finish, and an explicit end() called before 'end'
+  // fires — both no-op cleanly via the SAME four-flag guard Node's own
+  // `endWritableNT` uses, matching byte-for-byte). SEMANTICS.md briefly
+  // carried a draft S051 for remedy (2)'s trap; withdrawn once (2) came
+  // out — no divergence remains to register. The number is free for a
+  // future entry (a permanent gap in the sequence would misread as a
+  // suppressed entry; reusing it is the deliberate call, not an
+  // accident). No claim movement across all three iterations: 716
+  // throughout, 1742 claimed throughout.
+  //
+  // Tier 710→716 (six claims, one shared-machinery fix touching every
+  // duplex-shaped construction already landed).
+  "1690-stream-duplex.ts",
+  "1691-stream-transform.ts",
+  "1692-stream-pipe.ts",
+  "1695-stream-props.ts",
+  "1742-stream-extends-duplex-transform.ts",
+  "1744-stream-set-encoding.ts",
 ];
 
 interface RunResult {

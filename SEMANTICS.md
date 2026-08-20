@@ -2785,40 +2785,59 @@ stage-B review and is restated in full in this entry's own body — the
 entry, not a probe path, is the durable record. The in-code comments
 at both implementations' coercion sites cite this entry.
 
-## S047 — Encoded-stream buffered length counts utf8 BYTES, not Node's UTF-16 code units *(wasm tier; native columns unmeasured)*
+## S047 — Encoded-stream `push()` backpressure return counts utf8 BYTES, not Node's UTF-16 code units *(wasm tier; native columns unmeasured)*
 
 With `setEncoding('utf8')` (or the `encoding` construction option)
 active, this tier's Readable re-encodes decoded text back to utf8
 bytes for its single bytes-only chunk list (RS_DEC_PENDING's header),
-so RS_LENGTH — the value behind every highWaterMark-gated decision —
-counts utf8 BYTES. Node stores decoded STRINGS in string mode and
-counts UTF-16 code units. Two observables, both measured (increment-22
-stage-B gate, fix round): `push()`'s boolean backpressure return
-(`new Readable({read(){}, highWaterMark:4, encoding:"utf8"})` then
-`push("ééé")` answers false here, true in Node) and `readableLength`
-(6 vs Node's 3 for "ééé"; 5 vs 2 for "é世"). No claimed corpus program
-reads either observable — 1745/2627/2629 push on encoded streams but
-every call site discards the return, and none reads readableLength
-while encoded.
+so RS_LENGTH — the value behind `push()`'s highWaterMark-gated boolean
+return — counts utf8 BYTES. Node stores decoded STRINGS in string
+mode and counts UTF-16 code units for this same comparison. Measured
+(increment-22 stage-B gate, fix round): `push()`'s boolean
+backpressure return (`new Readable({read(){}, highWaterMark:4,
+encoding:"utf8"})` then `push("ééé")` answers false here, true in
+Node). No claimed corpus program reads this observable — 1745/2627/
+2629/1744 all push on encoded streams but every call site discards
+the return.
 
-**Rationale:** matching Node's accounting requires a second,
-string-typed chunk representation carrying per-chunk code-unit
-lengths beside the bytes-only list every other consumer of the pass-1
-machinery uses — real representation work with no corpus payoff
-today. The divergent direction is conservative: byte counts are ≥
-code-unit counts for non-ASCII, so push() reports "stop pushing"
-SOONER than Node, never fabricating capacity. The native lanes were
-NOT measured on these observables during the gate (no corpus program
-reaches them on any lane); this entry deliberately claims the wasm
-tier only — a future claim reading either observable must measure the
-native columns before citing this entry cross-lane (the S015-family
-reuse rule).
+STAGE C PASS 2 CORRECTION: this entry ORIGINALLY also covered
+`readableLength` (6 vs Node's 3 for "ééé"; 5 vs 2 for "é世") — that
+half is RETIRED, not still divergent. 1744 (this pass's own claim)
+reads `readableLength` directly on an encoded stream (`"wörld"`:
+Node's 11 string units vs this tier's then-12 utf8-byte count) —
+exactly the corpus payoff this entry's own Rationale said didn't
+exist yet when it was written, so it got built: a new NON-destructive
+per-chunk decode-and-sum walk (`stringUnitsLengthOf`, stream.ts's
+`lengthOf`) answers `readableLength` in true string units without
+changing RS_LENGTH's own byte-counted representation (still exactly
+what this entry's Rationale describes below — the internal
+accounting stayed unbuilt on purpose, only the GETTER computes the
+Node-true answer on demand). The `push()` return above shares that
+SAME internal RS_LENGTH/highWaterMark comparison and is UNTOUCHED —
+it still answers bytes-not-units, exactly as originally registered.
 
-**Tested by:** corpus-unpinnable today (nothing in tier reads the
-observables); the measurement of record is the increment-22 stage-B
-gate's probe pair (hwm-4 push-return + readableLength on "ééé"/"é世"),
-restated in full above — the entry is the durable record. The
-RS_DEC_PENDING header cites this entry.
+**Rationale:** matching Node's INTERNAL accounting (not just the
+`readableLength` getter) would require a second, string-typed chunk
+representation carrying per-chunk code-unit lengths beside the
+bytes-only list every other consumer of the pass-1 machinery uses —
+real representation work `push()`'s own return still has no corpus
+payoff for today. The divergent direction is conservative: byte
+counts are ≥ code-unit counts for non-ASCII, so `push()` reports "stop
+pushing" SOONER than Node, never fabricating capacity. The native
+lanes were NOT measured on this observable during the gate (no corpus
+program reaches it on any lane); this entry deliberately claims the
+wasm tier only — a future claim reading it must measure the native
+columns before citing this entry cross-lane (the S015-family reuse
+rule).
+
+**Tested by:** corpus-unpinnable today for `push()`'s own return
+(nothing in tier reads it); the measurement of record is the
+increment-22 stage-B gate's probe pair (hwm-4 push-return + the
+"ééé"/"é世" readableLength case, the latter now historical since
+`readableLength` itself closed), restated in full above — the entry
+is the durable record. `readableLength` itself IS now pinned: 1744's
+own "wörld" case (11 units), corpus-verified. The RS_DEC_PENDING
+header cites this entry.
 
 ## S048 — for-await early exit (`break`) leaves the Readable ALIVE — Node's async iterator destroys it *(wasm tier)*
 
@@ -2894,3 +2913,32 @@ probe (two concurrent loops → trap, exit 1, no silent truncation);
 the measurement of record is that probe plus Node's chaining output,
 restated above. The nextChunkDynCore park-site comment cites this
 entry.
+
+## S050 — A second simultaneous `pipe()` destination TRAPS; Node fans out to every destination *(wasm tier)*
+
+Node's real `pipe()` appends to an internal list (`state.pipes`) and a
+single Readable can stream to any number of simultaneous Writable
+destinations — every one receives every chunk, 'end' calls `.end()` on
+each, and `unpipe(dest)` removes exactly one without disturbing the
+rest. This tier tracks ONE active pipe relationship per source (four
+scalar/ref fields on the readable-side state: destination, and the
+three internal listener closures pipe() itself registers) — no list,
+by construction. A second `.pipe()` call on a source that is already
+piping TRAPS (exit 1 per S007's uncaught-is-a-trap bridge) at the
+call site rather than either silently overwriting the first
+relationship (abandoning its destination mid-stream with no error,
+the silent-wrong-output class rule 1 forbids) or silently fanning out
+without ever having built the list machinery to do it correctly.
+
+**Rationale:** true multi-destination fan-out is real scheduling
+machinery (a list, not a single slot, threaded through every one of
+pipe's own listener closures and unpipe's own removal) with no claim
+payoff this pass — none of the five claims this pass's pipe() work
+targets pipes one source to more than one destination. Between a
+silent overwrite and a loud trap, only the trap is rule-1-consistent,
+S049's own reasoning exactly.
+
+**Tested by:** corpus-unpinnable in the byte-exact contract (Node
+exits 0 and both destinations observe every chunk; this tier exits 1
+— no fixture can match both). pipeCore's second-pipe guard cites this
+entry at its trap site.

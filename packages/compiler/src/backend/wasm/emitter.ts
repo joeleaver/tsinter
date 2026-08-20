@@ -161,6 +161,9 @@ import {
   WS_FINAL_THUNK,
   RS_DESTROY_CLOS,
   RS_DESTROY_THUNK,
+  RS_SYNC,
+  WS_ALLOW_HALF_OPEN,
+  WS_DUPLEX_SHAPED,
 } from "./stream.js";
 import { UnionBuilder, type UnionArmRep } from "./unions.js";
 import { Code } from "./code.js";
@@ -3046,6 +3049,12 @@ class Assembler {
       vecBufType: (strings) => this.vecInfoFor(arrayOf(strings ? STRING : BYTES_U8) as IrType & { kind: "array" }, undefined)!.bufType,
       vecElemVal: (strings) => this.vecInfoFor(arrayOf(strings ? STRING : BYTES_U8) as IrType & { kind: "array" }, undefined)!.elemVal,
       voidClos: () => this.closPairFor([], []),
+      entryAppend: () => this.events.entryAppend(),
+      removeLast: () => this.events.removeLast(),
+      dynT: () => this.dyn.dynT(),
+      strType: () => this.strType,
+      bytesPayloadBytes: (c, pushDyn) => this.dyn.bytesPayloadBytes(c, pushDyn),
+      thunkSig: () => this.dyn.thunkSig(),
     });
     return this.streamField;
   }
@@ -3155,26 +3164,43 @@ class Assembler {
 
   private readonly doneClosFns = new Map<string, { struct: number; fn: number } | null>();
 
-  /** The `_write`/`_final` completion callback the RUNTIME hands to a
-   * user override — the reverse of `readThunkFor`: instead of adapting a
-   * user closure to a uniform runtime signature, this builds a runtime-
-   * authored closure of the USER's own declared signature (env-subtype
-   * of `closSigFor(cbType).clos`, `dynFnAdapter`'s exact pattern reused
-   * for a non-dyn purpose), one per distinct declared signature (cached
-   * by key — different override sites may still agree, since Node's
-   * ambient types give this parameter one canonical shape almost always).
-   * Supports exactly the two shapes that shape produces: zero declared
-   * params (every completion is treated as error-free — 1688/1689/1741/
-   * 1811 all call back with no arguments), or one param mapping to a
-   * 2-arm union with a nullish arm (`nullT`/`undefinedT`, TypeScript's
-   * `?` erasure — S020) and an object arm (any Error-rooted class, since
-   * a user's own error subclass is a legal `Error` value too) — read off
-   * the union's tag (unions.ts: field 0), never assumed. Any other
-   * declared shape refuses by name rather than guessing at a shape no
+  /** The `_write`/`_final`/`_transform`/`_flush` completion callback the
+   * RUNTIME hands to a user override — the reverse of `readThunkFor`:
+   * instead of adapting a user closure to a uniform runtime signature,
+   * this builds a runtime-authored closure of the USER's own declared
+   * signature (env-subtype of `closSigFor(cbType).clos`, `dynFnAdapter`'s
+   * exact pattern reused for a non-dyn purpose), one per distinct
+   * declared signature (cached by key — different override sites may
+   * still agree, since Node's ambient types give this parameter one
+   * canonical shape almost always). Supports: zero declared params
+   * (every completion is treated as error-free — 1688/1689/1741/1811 all
+   * call back with no arguments), one param mapping to a 2-arm union with
+   * a nullish arm (`nullT`/`undefinedT`, TypeScript's `?` erasure —
+   * S020) and an object arm (any Error-rooted class, since a user's own
+   * error subclass is a legal `Error` value too) — read off the union's
+   * tag (unions.ts: field 0), never assumed — and, for `kind` "transform"
+   * /"flush" ONLY (STAGE C PASS 2, Transform), a SECOND param: THE BINDING
+   * TYPE for a declared signature here is the PROJECT-LOCAL ambient
+   * (`packages/compiler/ambient/scriptc-node-fallback.d.ts`), NOT
+   * whatever @types/node ships — found the hard way, by execution: this
+   * project's own `_transform`/`_flush` declare the completion callback
+   * as `(error?: Error | null, data?: Buffer | string) => void`, a
+   * CONCRETE 3-arm union (bytes + string + the `?` erasure's undefinedT),
+   * never `dyn` — matching this backend's own "chunks are bytes-or-
+   * string, never arbitrary any" typing stance everywhere else. Read off
+   * the SAME union tag mechanism as the error param, generalized over
+   * arm COUNT and KIND (dynFromHelper's own per-arm union-unboxing
+   * pattern, emitter.ts's existing "union" case, reused here rather than
+   * re-derived): a "bytes" arm's payload is already the right shape for
+   * push(); a "string" arm's payload converts via `bytesFromStrUtf8`;
+   * every other arm (nullT/undefinedT) means no data to push. Any other
+   * declared shape (including a 2-param callback on a non-transform/
+   * flush kind, or a data union with a concrete arm that is neither
+   * bytes nor string) refuses by name rather than guessing at a shape no
    * claim this stage exercises. */
   private doneClosFor(
     cbType: IrType & { kind: "func" },
-    kind: "write" | "final" | "destroy",
+    kind: "write" | "final" | "destroy" | "transform" | "flush",
     loc: SrcLoc | undefined,
   ): { struct: number; fn: number } | null {
     const key = `${kind}:${typeKey(cbType)}`;
@@ -3197,7 +3223,12 @@ class Assembler {
       { storage: { kind: "ref", nullable: false, typeIndex: pair.fn }, mutable: false },
       { storage: rootRef, mutable: false },
     ];
-    if (kind === "write") fields.push({ storage: this.stream.wReqRef(), mutable: false });
+    // "transform" shares writeThunkFor's OWN structNew call site verbatim
+    // (it always pushes [fn, THIS, WREQ] regardless of write-vs-transform
+    // kind — the wReq identity is the SAME write-queue request either
+    // way, doWriteCore's own FIFO invariant), so it needs the SAME third
+    // field write does, not final/flush/destroy's two-field shape.
+    if (kind === "write" || kind === "transform") fields.push({ storage: this.stream.wReqRef(), mutable: false });
     const struct = this.mb.subStructType(`doneclos:${key}`, fields, pair.clos);
     const idx = this.mb.declareFunc(pair.fn, `%w.ws.doneClos:${key}`);
     const made = { struct, fn: idx };
@@ -3205,20 +3236,26 @@ class Assembler {
     const c = new Code();
     const SELF = 0;
     const SELFT = cbType.params.length + 1;
+    const extraLocals: ValType[] = [{ kind: "ref", nullable: true, typeIndex: struct }]; // SELFT
     c.localGet(SELF);
     c.refCast(struct);
     c.localSet(SELFT);
     c.localGet(SELFT);
     c.structGet(struct, ROOT_FIELD);
-    // NOTE: `afterWriteCore`/`finalDoneCore` take (root, errRef) only —
-    // WHICH request just completed is `state.head` itself (the FIFO
-    // invariant: exactly one write is ever in flight, always the queue's
-    // current head), so the env's WREQ_FIELD (kept for a future need) is
-    // never pushed as a call argument here.
+    // NOTE: `afterWriteCore`/`finalDoneCore`/`afterTransformCore`/
+    // `flushDoneCore` take (root, errRef[, dataRef]) only — WHICH request
+    // just completed is `state.head` itself (the FIFO invariant: exactly
+    // one write is ever in flight, always the queue's current head), so
+    // the env's WREQ_FIELD (kept for a future need) is never pushed as a
+    // call argument here.
     const errRefType: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+    const bytesRefType = this.bytesB.bytesRef();
+    const isTransformish = kind === "transform" || kind === "flush";
+    const diagBase = isTransformish ? "transform" : "writable";
+    let dataPushed = false;
     if (cbType.params.length === 0) {
       c.refNull(this.exc().errT);
-    } else if (cbType.params.length === 1) {
+    } else if (cbType.params.length >= 1) {
       const pType = cbType.params[0]!;
       let ok = false;
       if (pType.kind === "union") {
@@ -3253,21 +3290,102 @@ class Assembler {
         }
       }
       if (!ok) {
-        this.refuse(`libCall:writable.${kind}-callback:unsupported-shape`, loc);
+        this.refuse(`libCall:${diagBase}.${kind}-callback:unsupported-shape`, loc);
         return this.doneClosDead(idx, made);
       }
-    } else {
-      this.refuse(`libCall:writable.${kind}-callback:arity-${cbType.params.length}`, loc);
-      return this.doneClosDead(idx, made);
+      if (cbType.params.length === 2) {
+        // The declared-PREFIX rule cuts both ways: a transform/flush
+        // override MAY drop the data param (arity 1, handled above like
+        // any other completion callback — the tail below supplies a null
+        // data value for it) or declare it (arity 2, here). No OTHER kind
+        // ever has two declared params.
+        if (!isTransformish) {
+          this.refuse(`libCall:writable.${kind}-callback:arity-2`, loc);
+          return this.doneClosDead(idx, made);
+        }
+        const dType = cbType.params[1]!;
+        let dataOk = false;
+        if (dType.kind === "union") {
+          const ddef = this.unionDef(dType.unionId);
+          const bytesIdx = ddef.arms.findIndex((a) => a.kind === "bytes");
+          const stringIdx = ddef.arms.findIndex((a) => a.kind === "string");
+          const allOthersNullish = ddef.arms.every(
+            (a, i) => i === bytesIdx || i === stringIdx || a.kind === "nullT" || a.kind === "undefinedT",
+          );
+          if ((bytesIdx >= 0 || stringIdx >= 0) && allOthersNullish) {
+            const bytesArmStruct = bytesIdx >= 0 ? this.unionArmStruct(dType.unionId, bytesIdx, loc) : null;
+            const stringArmStruct = stringIdx >= 0 ? this.unionArmStruct(dType.unionId, stringIdx, loc) : null;
+            if ((bytesIdx < 0 || bytesArmStruct !== null) && (stringIdx < 0 || stringArmStruct !== null)) {
+              const TAG = SELFT + extraLocals.length;
+              extraLocals.push(I32);
+              c.localGet(2);
+              c.structGet(this.unions.base(), 0);
+              c.localSet(TAG);
+              // Nested if/else-chain, innermost-out: default null, then
+              // wrap with the string arm's check (if present), then the
+              // bytes arm's check (if present) — either or both may be
+              // absent from a narrower override, `allOthersNullish`
+              // above already guarantees nothing ELSE is concrete.
+              const emitDefault = (): void => c.refNull(this.bytesB.bytesType());
+              const emitString = (inner: () => void): void => {
+                if (stringIdx < 0) return inner();
+                c.localGet(TAG);
+                c.i32Const(stringIdx);
+                c.i32Eq();
+                c.ifResult(bytesRefType);
+                c.localGet(2);
+                c.refCast(stringArmStruct!);
+                c.structGet(stringArmStruct!, 1); // PAYLOAD: strRef
+                c.call(this.bytesB.fromStrHelper("utf8"));
+                c.else_();
+                inner();
+                c.end();
+              };
+              const emitBytes = (inner: () => void): void => {
+                if (bytesIdx < 0) return inner();
+                c.localGet(TAG);
+                c.i32Const(bytesIdx);
+                c.i32Eq();
+                c.ifResult(bytesRefType);
+                c.localGet(2);
+                c.refCast(bytesArmStruct!);
+                c.structGet(bytesArmStruct!, 1); // PAYLOAD: bytesRef, already the right shape
+                c.else_();
+                inner();
+                c.end();
+              };
+              emitBytes(() => emitString(emitDefault));
+              dataPushed = true;
+              dataOk = true;
+            }
+          }
+        }
+        if (!dataOk) {
+          this.refuse(`libCall:${diagBase}.${kind}-callback:unsupported-data-shape`, loc);
+          return this.doneClosDead(idx, made);
+        }
+      } else if (cbType.params.length > 2) {
+        this.refuse(`libCall:${diagBase}.${kind}-callback:arity-${cbType.params.length}`, loc);
+        return this.doneClosDead(idx, made);
+      }
+    }
+    if (isTransformish && !dataPushed) {
+      // A transform/flush callback declared 0 or 1 params (no data slot
+      // reachable through it at all) — the tail still needs a value.
+      c.refNull(this.bytesB.bytesType());
     }
     c.call(
       kind === "write"
         ? this.stream.afterWriteCore()
         : kind === "final"
           ? this.stream.finalDoneCore()
-          : this.stream.destroyErrDefaultCore(),
+          : kind === "destroy"
+            ? this.stream.destroyErrDefaultCore()
+            : kind === "transform"
+              ? this.stream.afterTransformCore()
+              : this.stream.flushDoneCore(),
     );
-    this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: struct }], c.bytes());
+    this.mb.setBody(idx, extraLocals, c.bytes());
     return made;
   }
 
@@ -3285,8 +3403,19 @@ class Assembler {
    * calls the user's lifted `_write` closure with whatever prefix it
    * declared. `t` is the LIFTED type (`this` first, per
    * `streamMethodWrapper`'s own shape — the readThunkFor precedent). */
-  private writeThunkFor(t: IrType & { kind: "func" }, loc: SrcLoc | undefined): number | null {
-    const key = typeKey(t);
+  /** `kind` (STAGE C PASS 2, Transform): "write" (default, every existing
+   * call site) builds the ordinary `_write` bridge; "transform" builds
+   * the IDENTICAL bridge shape over the user's `_transform` instead —
+   * SAME `writeThunkSig()` slot (WS_WRITE_THUNK), same param layout
+   * (chunk/encoding are `_transform`'s own first two, matching `_write`'s
+   * exactly), the only difference is which `doneClosFor` kind gets built
+   * for the completion callback. Cached (and diagnosed) separately per
+   * kind — `${kind}:${typeKey}` — so a `_write` and a same-shaped
+   * `_transform` never collide and silently share the wrong completion
+   * semantics. */
+  private writeThunkFor(t: IrType & { kind: "func" }, loc: SrcLoc | undefined, kind: "write" | "transform" = "write"): number | null {
+    const key = `${kind}:${typeKey(t)}`;
+    const diagBase = kind === "write" ? "writable.write" : "transform.transform";
     const hit = this.writeThunkFns.get(key);
     if (hit !== undefined) return hit;
     const pair = this.closSigFor(t, loc);
@@ -3303,7 +3432,7 @@ class Assembler {
     // wasm that validates but TRAPS at runtime on the bad refCast — worse
     // than a loud refusal; reported, not silently matched here).
     if (thisParam.kind === "dyn") {
-      this.refuse("libCall:writable.write:dyn-callback-value", loc);
+      this.refuse(`libCall:${diagBase}:dyn-callback-value`, loc);
       return null;
     }
     // GATE FIX (chunk:unknown invalid-wasm, C1's class — found writing
@@ -3320,20 +3449,46 @@ class Assembler {
     // via execution: compiled ok:true, instantiate threw "call_ref[2]
     // expected type ... found local.get of type ..."). Real dyn-chunk/
     // dyn-encoding support needs the override's own value dyn-boxed
-    // before the call — pass 2's adapter-machinery family, the same
-    // shape as the dyn-callback-value guards immediately above and
-    // below, not this round's.
-    if (t.params[1]?.kind === "dyn") {
-      this.refuse("libCall:writable.write:dyn-chunk-override", loc);
+    // before the call.
+    //
+    // STAGE C PASS 2, Transform (CORRECTION ruling B, revised): for kind
+    // "transform" ONLY, a dyn-typed chunk is NOT refused — it's the
+    // ORDINARY case (the project ambient's `_transform(chunk: any, ...)`
+    // — ungrounded in any Buffer-narrowing precedent, verified directly,
+    // real Node's own ambient matches). The direction is BOX, not unbox:
+    // doWriteCore's own contract hands this bridge real bytes (the SAME
+    // CHUNK local every other kind already uses), and the user's dyn-
+    // typed override parameter expects a dyn value, so this boxes bytes→
+    // dyn (`dyn.boxBytes`/`pushNewBytesPayload`, stage B's own primitive,
+    // isBuffer=true — every stream chunk this file ever boxes is a real
+    // Buffer) before the call, mirroring emitDataFrom's identical box for
+    // the 'data' event's own tuple. `dyn.toString(enc?)`'s BYTES-kind arm
+    // (this file, "a stream chunk's common consumption") was ALREADY
+    // built anticipating exactly this receiver shape — verified by
+    // reading its body, not assumed. write/final/destroy kinds still
+    // refuse (their own machinery genuinely doesn't exist yet). ENCODING:
+    // an unannotated `.cjs` `_transform` override (1747's own shape — no
+    // JSDoc types at all) lands BOTH params checked-dynamic, not just
+    // chunk — the established stance for JS sources this tier already
+    // has (the dyn-callback-value family, onDataDyn, every other *Dyn
+    // variant the cjs lane produces; observed directly via 1747's own
+    // refusal name, not separately traced beyond that). `encoding` is
+    // boxed the same way, `dyn.boxStr` over the FIXED "buffer" literal
+    // ENC already carries (writeThunkSig's own contract — encoding never
+    // varies on this tier), same transform-kind-only scoping.
+    const chunkIsDyn = t.params[1]?.kind === "dyn";
+    if (chunkIsDyn && kind !== "transform") {
+      this.refuse(`libCall:${diagBase}:dyn-chunk-override`, loc);
       return null;
     }
-    if (t.params[2]?.kind === "dyn") {
-      this.refuse("libCall:writable.write:dyn-encoding-override", loc);
+    const encIsDyn = t.params[2]?.kind === "dyn";
+    if (encIsDyn && kind !== "transform") {
+      this.refuse(`libCall:${diagBase}:dyn-encoding-override`, loc);
       return null;
     }
     const thisT = this.mapType(thisParam, loc);
     if (thisT === null || thisT.kind !== "ref") return null;
-    const idx = this.mb.declareFunc(this.stream.writeThunkSig(), `%w.ws.writeThunk:${key}`);
+    const idx = this.mb.declareFunc(this.stream.writeThunkSig(), `%w.ws.${kind}Thunk:${typeKey(t)}`);
     this.writeThunkFns.set(key, idx);
     const c = new Code();
     const CLOS = 0, THIS = 1, CHUNK = 2, ENC = 3, WREQ = 4, CL = 5;
@@ -3344,17 +3499,29 @@ class Assembler {
     c.localGet(CL); // arg0: the closure itself
     c.localGet(THIS);
     c.refCast(thisT.typeIndex); // arg1: `this`, downcast to the declaring class
-    if (t.params.length >= 2) c.localGet(CHUNK);
-    if (t.params.length >= 3) c.localGet(ENC);
+    if (t.params.length >= 2) {
+      if (chunkIsDyn) {
+        this.dyn.boxBytes(c, (cc) => this.dyn.pushNewBytesPayload(cc, (ccc) => ccc.localGet(CHUNK), (ccc) => ccc.i32Const(1)));
+      } else {
+        c.localGet(CHUNK);
+      }
+    }
+    if (t.params.length >= 3) {
+      if (encIsDyn) {
+        this.dyn.boxStr(c, (cc) => cc.localGet(ENC));
+      } else {
+        c.localGet(ENC);
+      }
+    }
     if (t.params.length >= 4) {
       const cbType = t.params[3];
       if (cbType === undefined || cbType.kind !== "func") {
-        this.refuse("libCall:writable.write:non-func-callback", loc);
+        this.refuse(`libCall:${diagBase}:non-func-callback`, loc);
         c.unreachable();
         this.mb.setBody(idx, [closRef], c.bytes());
         return idx;
       }
-      const dc = this.doneClosFor(cbType, "write", loc);
+      const dc = this.doneClosFor(cbType, kind, loc);
       if (dc === null) {
         c.unreachable();
         this.mb.setBody(idx, [closRef], c.bytes());
@@ -3379,9 +3546,15 @@ class Assembler {
 
   /** `_final`'s adapter — `writeThunkFor`'s exact shape, one parameter
    * narrower (no chunk/encoding, only the declared-prefix axis over the
-   * completion callback itself). */
-  private finalThunkFor(t: IrType & { kind: "func" }, loc: SrcLoc | undefined): number | null {
-    const key = typeKey(t);
+   * completion callback itself). `kind` (STAGE C PASS 2, Transform):
+   * "final" (default) or "flush" — SAME `finalThunkSig()` slot
+   * (WS_FINAL_THUNK), "flush" builds the bridge to the user's `_flush`
+   * instead of `_final` (your confirmed wiring: `_flush` interposes
+   * through the FINAL slot, not a 'prefinish' listener). Cached/
+   * diagnosed per kind, `writeThunkFor`'s own collision reasoning. */
+  private finalThunkFor(t: IrType & { kind: "func" }, loc: SrcLoc | undefined, kind: "final" | "flush" = "final"): number | null {
+    const key = `${kind}:${typeKey(t)}`;
+    const diagBase = kind === "final" ? "writable.final" : "transform.flush";
     const hit = this.finalThunkFns.get(key);
     if (hit !== undefined) return hit;
     const pair = this.closSigFor(t, loc);
@@ -3391,12 +3564,12 @@ class Assembler {
     if (thisParam.kind === "dyn") {
       // writeThunkFor's own guard, same reasoning: a thisless dyn-boxed
       // value shape this thunk does not build for.
-      this.refuse("libCall:writable.final:dyn-callback-value", loc);
+      this.refuse(`libCall:${diagBase}:dyn-callback-value`, loc);
       return null;
     }
     const thisT = this.mapType(thisParam, loc);
     if (thisT === null || thisT.kind !== "ref") return null;
-    const idx = this.mb.declareFunc(this.stream.finalThunkSig(), `%w.ws.finalThunk:${key}`);
+    const idx = this.mb.declareFunc(this.stream.finalThunkSig(), `%w.ws.${kind}Thunk:${typeKey(t)}`);
     this.finalThunkFns.set(key, idx);
     const c = new Code();
     const CLOS = 0, THIS = 1, CL = 2;
@@ -3410,12 +3583,12 @@ class Assembler {
     if (t.params.length >= 2) {
       const cbType = t.params[1];
       if (cbType === undefined || cbType.kind !== "func") {
-        this.refuse("libCall:writable.final:non-func-callback", loc);
+        this.refuse(`libCall:${diagBase}:non-func-callback`, loc);
         c.unreachable();
         this.mb.setBody(idx, [closRef], c.bytes());
         return idx;
       }
-      const dc = this.doneClosFor(cbType, "final", loc);
+      const dc = this.doneClosFor(cbType, kind, loc);
       if (dc === null) {
         c.unreachable();
         this.mb.setBody(idx, [closRef], c.bytes());
@@ -15622,6 +15795,68 @@ class Assembler {
     }
   }
 
+  /** STAGE C PASS 2, shape-mode: each stream class's OWN canonical
+   * reserved `eventNames()` order, measured directly against Node
+   * (reverse-registration probes, p2-shapemode-measure.ts/-measure2.ts) —
+   * construction pre-creates these keys (invisible until a real listener
+   * lands, surviving a later removeListener at their own rank —
+   * BUCKET_RESERVED/BUCKETERR_RESERVED's own headers in events.ts).
+   * `err: true` marks 'error' specifically, which rides the DEDICATED
+   * err-bucket (errBucketEnsure), never the main chain — every other
+   * name here goes through the ordinary bucketEnsure(reg, name, true). */
+  private static readonly READABLE_RESERVED: ReadonlyArray<{ name: string; err: boolean }> = [
+    { name: "close", err: false },
+    { name: "error", err: true },
+    { name: "data", err: false },
+    { name: "end", err: false },
+    { name: "readable", err: false },
+  ];
+  private static readonly WRITABLE_RESERVED: ReadonlyArray<{ name: string; err: boolean }> = [
+    { name: "close", err: false },
+    { name: "error", err: true },
+    { name: "prefinish", err: false },
+    { name: "finish", err: false },
+    { name: "drain", err: false },
+  ];
+  /** The union — writable trio before the readable trio (2626's own
+   * comment), i.e. Writable's full reserved list first, then Readable's
+   * OWN four non-'error' names (its 'error' slot is shared, already
+   * created by the writable-side pass). Transform/PassThrough are
+   * ASSUMED to share this same list (both construct atop the identical
+   * duplex-shaped state per stream.ts's header) but this is UNMEASURED
+   * against Node directly — named per the standing sibling-shapes rule,
+   * not yet built (Transform/PassThrough construction itself is later
+   * in this pass). */
+  private static readonly DUPLEX_RESERVED: ReadonlyArray<{ name: string; err: boolean }> =
+    Assembler.WRITABLE_RESERVED.concat(Assembler.READABLE_RESERVED.filter((r) => !r.err));
+
+  /** `(recv) -> void` (stack-neutral) — eagerly ensures every reserved
+   * bucket in `list`'s canonical order, main-chain names via
+   * bucketEnsure(reg, name, reserved=true), 'error' via errBucketEnsure
+   * (root, reserved=true) directly. Called once from each stream class's
+   * OWN construction site (readable.new/init, writable.new/init,
+   * duplex.new/init) — `recv` is that constructor's already-`localSet`
+   * receiver local. regEnsure() is idempotent, so no scratch local is
+   * needed to cache `reg` across the main-chain calls — one extra
+   * cheap null-check per name, construction-only. */
+  private emitReservedShapeCreate(code: Code, recv: number, list: ReadonlyArray<{ name: string; err: boolean }>): void {
+    for (const { name, err } of list) {
+      if (err) {
+        code.localGet(recv);
+        code.i32Const(1); // reserved
+        code.call(this.events.errBucketEnsure());
+        code.drop();
+      } else {
+        code.localGet(recv);
+        code.call(this.events.regEnsure());
+        this.pushStrLitInto(code, name);
+        code.i32Const(1); // reserved
+        code.call(this.events.bucketEnsure());
+        code.drop();
+      }
+    }
+  }
+
   /** node:stream's Readable (stream.ts) — PASS 1 SCOPE: readable.new/init
    * (STATIC literal-options form only — a dynamic `flags` operand or a
    * present `destroy` closure both refuse by name, the file's own
@@ -15761,6 +15996,10 @@ class Assembler {
           code.refFunc(destroyThunkIdx);
           code.structSet(this.stream.stateT(), RS_DESTROY_THUNK);
         }
+        // STAGE C PASS 2, shape-mode: pre-create Readable's own reserved
+        // eventNames() keys, canonical order (Assembler.READABLE_RESERVED's
+        // own header).
+        this.emitReservedShapeCreate(code, recv, Assembler.READABLE_RESERVED);
         if (isInit) {
           this.releaseScratch(this.stream.stateRef(), st);
           this.releaseScratch(recvVal, recv);
@@ -15913,6 +16152,542 @@ class Assembler {
           code.refFunc(destroyThunkIdx);
           code.structSet(this.stream.stateT(), RS_DESTROY_THUNK);
         }
+        // STAGE C PASS 2, shape-mode: pre-create Writable's own reserved
+        // eventNames() keys, canonical order (Assembler.WRITABLE_RESERVED's
+        // own header).
+        this.emitReservedShapeCreate(code, recv, Assembler.WRITABLE_RESERVED);
+        if (isInit) {
+          this.releaseScratch(this.stream.stateRef(), st);
+          this.releaseScratch(recvVal, recv);
+          return true; // void
+        }
+        code.localGet(recv);
+        this.releaseScratch(this.stream.stateRef(), st);
+        this.releaseScratch(recvVal, recv);
+        return true;
+      }
+      case "duplex.new":
+      case "duplex.init": {
+        // STAGE C PASS 2: the combined-sides construction — Duplex needs
+        // BOTH readable-side (RS_*) and writable-side (WS_*) state
+        // initialized together (readable.new/writable.new precedents,
+        // fused), not the single-sided cases pass 1 built. Args
+        // (streamCtorArgs's own duplexShape head): [hwmR, hwmW,
+        // autoDestroy, emitClose, allowHalfOpen, readableSide,
+        // writableSide, flags, ...cbs] — streamCtorShape("%Duplex").
+        // accepted = ["read", "write", "final", "destroy"].
+        const isInit = e.fn === "duplex.init";
+        const base = isInit ? 1 : 0;
+        const readableSideArg = e.args[base + 5]!;
+        const writableSideArg = e.args[base + 6]!;
+        // readableSide/writableSide are ALWAYS compile-time literals
+        // (lower-stream.ts's own `boolean`-typed parse, never a general
+        // expression — only Duplex even parses these, the frontend's own
+        // "Duplex option toggles: compile-time literals only" gate).
+        // `{readable: false}`/`{writable: false}` (a one-sided Duplex) is
+        // real Node machinery this round never measured — refuse by name
+        // rather than silently build a normal two-sided instance a
+        // one-sided caller never asked for.
+        if (
+          readableSideArg.kind !== "boolLit" || !readableSideArg.value ||
+          writableSideArg.kind !== "boolLit" || !writableSideArg.value
+        ) {
+          this.refuse(`libCall:${e.fn}:one-sided`, e.loc);
+          code.unreachable();
+          return true;
+        }
+        // GATE FIX (C2S-1, remedy iteration 3 — built, not refused): a
+        // literal OR non-literal `allowHalfOpen: false` is fully
+        // supported now — stored truthfully and wired to a real auto-end
+        // mechanism (opEnd/OP_AUTO_END's own header has the full story).
+        // No compile-time gate on this value at all any more.
+        const allowHalfOpenArg = e.args[base + 4]!;
+        const flagsArg = e.args[base + 7]!;
+        if (flagsArg.kind !== "numLit") {
+          this.refuse(`libCall:${e.fn}:dynamic-flags`, e.loc);
+          code.unreachable();
+          return true;
+        }
+        const flags = flagsArg.value;
+        const hasRead = (flags & 1) !== 0;
+        const hasWrite = (flags & 2) !== 0;
+        const hasFinal = (flags & 4) !== 0;
+        const hasDestroy = (flags & 8) !== 0;
+        let cbIdx = base + 8;
+        let readCbExpr: Extract<IrExpr, { kind: "libCall" }>["args"][number] | null = null;
+        let readThunkIdx: number | null = null;
+        if (hasRead) {
+          readCbExpr = e.args[cbIdx]!;
+          cbIdx++;
+          if (readCbExpr.type.kind !== "func") {
+            this.refuse(`libCall:${e.fn}:non-func-read`, e.loc);
+            code.unreachable();
+            return true;
+          }
+          readThunkIdx = this.readThunkFor(readCbExpr.type, e.loc);
+          if (readThunkIdx === null) {
+            code.unreachable();
+            return true;
+          }
+          this.mb.declareFuncRef(readThunkIdx);
+        }
+        let writeCbExpr: Extract<IrExpr, { kind: "libCall" }>["args"][number] | null = null;
+        let writeThunkIdx: number | null = null;
+        if (hasWrite) {
+          writeCbExpr = e.args[cbIdx]!;
+          cbIdx++;
+          if (writeCbExpr.type.kind !== "func") {
+            this.refuse(`libCall:${e.fn}:non-func-write`, e.loc);
+            code.unreachable();
+            return true;
+          }
+          writeThunkIdx = this.writeThunkFor(writeCbExpr.type, e.loc);
+          if (writeThunkIdx === null) {
+            code.unreachable();
+            return true;
+          }
+          this.mb.declareFuncRef(writeThunkIdx);
+        }
+        let finalCbExpr: Extract<IrExpr, { kind: "libCall" }>["args"][number] | null = null;
+        let finalThunkIdx: number | null = null;
+        if (hasFinal) {
+          finalCbExpr = e.args[cbIdx]!;
+          cbIdx++;
+          if (finalCbExpr.type.kind !== "func") {
+            this.refuse(`libCall:${e.fn}:non-func-final`, e.loc);
+            code.unreachable();
+            return true;
+          }
+          finalThunkIdx = this.finalThunkFor(finalCbExpr.type, e.loc);
+          if (finalThunkIdx === null) {
+            code.unreachable();
+            return true;
+          }
+          this.mb.declareFuncRef(finalThunkIdx);
+        }
+        let destroyCbExpr: Extract<IrExpr, { kind: "libCall" }>["args"][number] | null = null;
+        let destroyThunkIdx: number | null = null;
+        if (hasDestroy) {
+          destroyCbExpr = e.args[cbIdx]!;
+          cbIdx++;
+          if (destroyCbExpr.type.kind !== "func") {
+            this.refuse(`libCall:${e.fn}:non-func-destroy`, e.loc);
+            code.unreachable();
+            return true;
+          }
+          destroyThunkIdx = this.destroyThunkFor(destroyCbExpr.type, e.loc);
+          if (destroyThunkIdx === null) {
+            code.unreachable();
+            return true;
+          }
+          this.mb.declareFuncRef(destroyThunkIdx);
+        }
+        let recvVal: ValType;
+        if (isInit) {
+          const rv = this.mapType(e.args[0]!.type, e.loc);
+          if (rv === null) {
+            code.unreachable();
+            return true;
+          }
+          recvVal = rv;
+          this.walkExpr(e.args[0]!);
+        } else {
+          const info = this.classInfo("%Duplex", e.loc);
+          if (info === null) {
+            code.unreachable();
+            return true;
+          }
+          recvVal = this.classes.ref(info);
+          this.emitAlloc(code, "%Duplex", info);
+        }
+        const recv = this.acquireScratch(recvVal);
+        code.localSet(recv);
+        code.localGet(recv);
+        code.call(this.stream.stateEnsure());
+        const st = this.acquireScratch(this.stream.stateRef());
+        code.localSet(st);
+        // RS_HWM (readable.new/init's own -1-sentinel resolution).
+        code.localGet(st);
+        const hwmRLocal = this.acquireScratch(F64);
+        this.walkExpr(e.args[base + 0]!);
+        code.localSet(hwmRLocal);
+        code.localGet(hwmRLocal);
+        code.f64Const(0);
+        code.f64Lt();
+        this.openIfResult(F64);
+        code.f64Const(65536);
+        code.else_();
+        code.localGet(hwmRLocal);
+        this.close();
+        this.releaseScratch(F64, hwmRLocal);
+        code.structSet(this.stream.stateT(), RS_HWM);
+        // WS_HWM — the SAME resolution, the second hwm slot.
+        code.localGet(st);
+        const hwmWLocal = this.acquireScratch(F64);
+        this.walkExpr(e.args[base + 1]!);
+        code.localSet(hwmWLocal);
+        code.localGet(hwmWLocal);
+        code.f64Const(0);
+        code.f64Lt();
+        this.openIfResult(F64);
+        code.f64Const(65536);
+        code.else_();
+        code.localGet(hwmWLocal);
+        this.close();
+        this.releaseScratch(F64, hwmWLocal);
+        code.structSet(this.stream.stateT(), WS_HWM);
+        code.localGet(st);
+        this.walkExpr(e.args[base + 2]!); // autoDestroy
+        code.structSet(this.stream.stateT(), RS_AUTO_DESTROY);
+        code.localGet(st);
+        this.walkExpr(e.args[base + 3]!); // emitClose
+        code.structSet(this.stream.stateT(), RS_EMIT_CLOSE);
+        // allowHalfOpen: STORED (WS_ALLOW_HALF_OPEN) so `stream.prop:
+        // allowHalfOpen` answers truthfully, AND fully wired — a `false`
+        // value (literal or runtime) auto-ends the writable side once the
+        // readable side ends, matching Node (opEnd/OP_AUTO_END's own
+        // header has the full mechanism story; GATE FIX C2S-1, remedy
+        // iteration 3 — refuse/trap came out once measurement showed the
+        // wiring itself was cheap, the pipe()-onend-shaped machinery this
+        // pass already built and proved).
+        code.localGet(st);
+        this.walkExpr(allowHalfOpenArg);
+        code.structSet(this.stream.stateT(), WS_ALLOW_HALF_OPEN);
+        // CORRECTION (1690, both-sides autoDestroy): duplex-shaped —
+        // WS_DUPLEX_SHAPED's own header.
+        code.localGet(st);
+        code.i32Const(1);
+        code.structSet(this.stream.stateT(), WS_DUPLEX_SHAPED);
+        if (readCbExpr !== null && readThunkIdx !== null) {
+          code.localGet(st);
+          this.walkExpr(readCbExpr);
+          code.structSet(this.stream.stateT(), RS_READ_CLOS);
+          code.localGet(st);
+          code.refFunc(readThunkIdx);
+          code.structSet(this.stream.stateT(), RS_READ_THUNK);
+        }
+        if (writeCbExpr !== null && writeThunkIdx !== null) {
+          code.localGet(st);
+          this.walkExpr(writeCbExpr);
+          code.structSet(this.stream.stateT(), WS_WRITE_CLOS);
+          code.localGet(st);
+          code.refFunc(writeThunkIdx);
+          code.structSet(this.stream.stateT(), WS_WRITE_THUNK);
+        }
+        if (finalCbExpr !== null && finalThunkIdx !== null) {
+          code.localGet(st);
+          this.walkExpr(finalCbExpr);
+          code.structSet(this.stream.stateT(), WS_FINAL_CLOS);
+          code.localGet(st);
+          code.refFunc(finalThunkIdx);
+          code.structSet(this.stream.stateT(), WS_FINAL_THUNK);
+        }
+        if (destroyCbExpr !== null && destroyThunkIdx !== null) {
+          code.localGet(st);
+          this.walkExpr(destroyCbExpr);
+          code.structSet(this.stream.stateT(), RS_DESTROY_CLOS);
+          code.localGet(st);
+          code.refFunc(destroyThunkIdx);
+          code.structSet(this.stream.stateT(), RS_DESTROY_THUNK);
+        }
+        // STAGE C PASS 2, shape-mode: pre-create Duplex's own reserved
+        // eventNames() keys — the union, writable trio before readable
+        // trio (Assembler.DUPLEX_RESERVED's own header; UNMEASURED for
+        // Transform/PassThrough, named there and deferred).
+        this.emitReservedShapeCreate(code, recv, Assembler.DUPLEX_RESERVED);
+        if (isInit) {
+          this.releaseScratch(this.stream.stateRef(), st);
+          this.releaseScratch(recvVal, recv);
+          return true; // void
+        }
+        code.localGet(recv);
+        this.releaseScratch(this.stream.stateRef(), st);
+        this.releaseScratch(recvVal, recv);
+        return true;
+      }
+      case "transform.new":
+      case "transform.init":
+      case "passthrough.new":
+      case "passthrough.init": {
+        // STAGE C PASS 2, Transform: duplex.new's own combined-sides
+        // construction, fused with the write-bridge-to-_transform and
+        // final-bridge-to-_flush (this file's design paragraph — measured
+        // against Node directly, p3a-p3k). Args (streamCtorArgs's own
+        // duplexShape head, unchanged): [hwmR, hwmW, autoDestroy,
+        // emitClose, allowHalfOpen, readableSide, writableSide, flags,
+        // ...cbs] — readableSide/writableSide are ALWAYS true for these
+        // two classes (only Duplex's own options ever set them false;
+        // parseStreamOptions's default), so unlike duplex.new this never
+        // reads or validates them. streamCtorShape("%Transform"/
+        // "%PassThrough").accepted = ["transform", "flush", "destroy"].
+        const isInit = e.fn === "transform.init" || e.fn === "passthrough.init";
+        const isPassThrough = e.fn.startsWith("passthrough");
+        const clsName = isPassThrough ? "%PassThrough" : "%Transform";
+        const base = isInit ? 1 : 0;
+        // GATE FIX (C2S-1, remedy iteration 3): duplex.new's own header —
+        // fully supported, no compile-time gate.
+        const allowHalfOpenArg = e.args[base + 4]!;
+        const flagsArg = e.args[base + 7]!;
+        if (flagsArg.kind !== "numLit") {
+          this.refuse(`libCall:${e.fn}:dynamic-flags`, e.loc);
+          code.unreachable();
+          return true;
+        }
+        const flags = flagsArg.value;
+        const hasTransform = (flags & 1) !== 0;
+        const hasFlush = (flags & 2) !== 0;
+        const hasDestroy = (flags & 4) !== 0;
+        // A bare `%Transform` with NEITHER an override NOR an option
+        // callback has no `_transform` at all — Node's real one THROWS
+        // ERR_METHOD_NOT_IMPLEMENTED lazily, on the first write (machinery
+        // this tier does not have); refuse loudly at compile time instead
+        // of an unverified silent path (BUILD RULING: the standard
+        // conservative treatment — "constructs but never writes" is a
+        // corner no claim occupies, named in the report). `%PassThrough`
+        // is DIFFERENT: Node's own class always has a working identity
+        // `_transform` (checked against @types/node's structural shape
+        // and measured, p3d/p3e), so it never needs this refusal.
+        if (!hasTransform && !isPassThrough) {
+          this.refuse(`libCall:transform.new:missing-transform`, e.loc);
+          code.unreachable();
+          return true;
+        }
+        let cbIdx = base + 8;
+        let transformCbExpr: Extract<IrExpr, { kind: "libCall" }>["args"][number] | null = null;
+        let transformThunkIdx: number | null = null;
+        if (hasTransform) {
+          transformCbExpr = e.args[cbIdx]!;
+          cbIdx++;
+          if (transformCbExpr.type.kind !== "func") {
+            this.refuse(`libCall:${e.fn}:non-func-transform`, e.loc);
+            code.unreachable();
+            return true;
+          }
+          transformThunkIdx = this.writeThunkFor(transformCbExpr.type, e.loc, "transform");
+          if (transformThunkIdx === null) {
+            code.unreachable();
+            return true;
+          }
+          this.mb.declareFuncRef(transformThunkIdx);
+        }
+        let flushCbExpr: Extract<IrExpr, { kind: "libCall" }>["args"][number] | null = null;
+        let flushThunkIdx: number | null = null;
+        if (hasFlush) {
+          flushCbExpr = e.args[cbIdx]!;
+          cbIdx++;
+          if (flushCbExpr.type.kind !== "func") {
+            this.refuse(`libCall:${e.fn}:non-func-flush`, e.loc);
+            code.unreachable();
+            return true;
+          }
+          flushThunkIdx = this.finalThunkFor(flushCbExpr.type, e.loc, "flush");
+          if (flushThunkIdx === null) {
+            code.unreachable();
+            return true;
+          }
+          this.mb.declareFuncRef(flushThunkIdx);
+        }
+        let destroyCbExpr: Extract<IrExpr, { kind: "libCall" }>["args"][number] | null = null;
+        let destroyThunkIdx: number | null = null;
+        if (hasDestroy) {
+          destroyCbExpr = e.args[cbIdx]!;
+          cbIdx++;
+          if (destroyCbExpr.type.kind !== "func") {
+            this.refuse(`libCall:${e.fn}:non-func-destroy`, e.loc);
+            code.unreachable();
+            return true;
+          }
+          destroyThunkIdx = this.destroyThunkFor(destroyCbExpr.type, e.loc);
+          if (destroyThunkIdx === null) {
+            code.unreachable();
+            return true;
+          }
+          this.mb.declareFuncRef(destroyThunkIdx);
+        }
+        let recvVal: ValType;
+        if (isInit) {
+          const rv = this.mapType(e.args[0]!.type, e.loc);
+          if (rv === null) {
+            code.unreachable();
+            return true;
+          }
+          recvVal = rv;
+          this.walkExpr(e.args[0]!);
+        } else {
+          const info = this.classInfo(clsName, e.loc);
+          if (info === null) {
+            code.unreachable();
+            return true;
+          }
+          recvVal = this.classes.ref(info);
+          this.emitAlloc(code, clsName, info);
+        }
+        const recv = this.acquireScratch(recvVal);
+        code.localSet(recv);
+        code.localGet(recv);
+        code.call(this.stream.stateEnsure());
+        const st = this.acquireScratch(this.stream.stateRef());
+        code.localSet(st);
+        // RS_SYNC: Node's real Transform constructor (fetched directly,
+        // v24.18.1's lib/internal/streams/transform.js) explicitly clears
+        // this EARLY — "We have implemented the _read method, and done
+        // the other things that Readable wants before the first _read
+        // call, so unset the sync guard flag" (`this._readableState.sync
+        // = false`) — RIGHT after `Duplex.call(this, options)`, well
+        // before any real `_read()` ever runs. A plain Readable/Duplex
+        // only clears RS_SYNC inside its OWN first `callRead()` (this
+        // file's existing behavior, unchanged there) — Transform/
+        // PassThrough is the one class that does it at CONSTRUCTION,
+        // enabling pushCore's direct-emit fast path (RS_SYNC's own gate)
+        // on the very FIRST push from the very first write, not just
+        // subsequent ones. Found by execution (p3a/p3e/p3f/p3g all
+        // showed 'data' deferred past its correct synchronous position
+        // until this landed), not anticipated by the design paragraph.
+        code.localGet(st);
+        code.i32Const(0);
+        code.structSet(this.stream.stateT(), RS_SYNC);
+        // RS_HWM (readable.new/init's own -1-sentinel resolution).
+        code.localGet(st);
+        const hwmRLocal = this.acquireScratch(F64);
+        this.walkExpr(e.args[base + 0]!);
+        code.localSet(hwmRLocal);
+        code.localGet(hwmRLocal);
+        code.f64Const(0);
+        code.f64Lt();
+        this.openIfResult(F64);
+        code.f64Const(65536);
+        code.else_();
+        code.localGet(hwmRLocal);
+        this.close();
+        this.releaseScratch(F64, hwmRLocal);
+        code.structSet(this.stream.stateT(), RS_HWM);
+        // WS_HWM — the SAME resolution, the second hwm slot.
+        code.localGet(st);
+        const hwmWLocal = this.acquireScratch(F64);
+        this.walkExpr(e.args[base + 1]!);
+        code.localSet(hwmWLocal);
+        code.localGet(hwmWLocal);
+        code.f64Const(0);
+        code.f64Lt();
+        this.openIfResult(F64);
+        code.f64Const(65536);
+        code.else_();
+        code.localGet(hwmWLocal);
+        this.close();
+        this.releaseScratch(F64, hwmWLocal);
+        code.structSet(this.stream.stateT(), WS_HWM);
+        code.localGet(st);
+        this.walkExpr(e.args[base + 2]!); // autoDestroy
+        code.structSet(this.stream.stateT(), RS_AUTO_DESTROY);
+        code.localGet(st);
+        this.walkExpr(e.args[base + 3]!); // emitClose
+        code.structSet(this.stream.stateT(), RS_EMIT_CLOSE);
+        // allowHalfOpen: STORED (duplex.new's own header — ruling C),
+        // fully supported and wired (opEnd/OP_AUTO_END).
+        code.localGet(st);
+        this.walkExpr(allowHalfOpenArg);
+        code.structSet(this.stream.stateT(), WS_ALLOW_HALF_OPEN);
+        // CORRECTION (1690, both-sides autoDestroy): duplex-shaped —
+        // WS_DUPLEX_SHAPED's own header (stream.ts).
+        code.localGet(st);
+        code.i32Const(1);
+        code.structSet(this.stream.stateT(), WS_DUPLEX_SHAPED);
+        // WS_WRITE_CLOS/THUNK: the write-bridge-to-_transform. hasTransform
+        // ⇒ the user's own override/option (writeThunkFor's "transform"
+        // kind, doneClosFor's new 2-param arm). !hasTransform ⇒ only
+        // reachable for PassThrough (the refusal above already excluded
+        // bare Transform) — the canned identity bridge; WS_WRITE_CLOS is
+        // left at stateEnsure's own default null (identityTransformThunk's
+        // own body never reads its CLOS param at all, so there is nothing
+        // for it to point at).
+        if (transformCbExpr !== null && transformThunkIdx !== null) {
+          code.localGet(st);
+          this.walkExpr(transformCbExpr);
+          code.structSet(this.stream.stateT(), WS_WRITE_CLOS);
+          code.localGet(st);
+          code.refFunc(transformThunkIdx);
+          code.structSet(this.stream.stateT(), WS_WRITE_THUNK);
+        } else {
+          this.mb.declareFuncRef(this.stream.identityTransformThunk());
+          code.localGet(st);
+          code.refFunc(this.stream.identityTransformThunk());
+          code.structSet(this.stream.stateT(), WS_WRITE_THUNK);
+        }
+        // WS_FINAL_CLOS/THUNK: the final-bridge-to-_flush — ALWAYS
+        // populated (unlike a plain Writable/Duplex's optional `_final`):
+        // Node's own internal `_final` (`final` in transform.js) always
+        // runs the push(null)-then-finish sequence, with or without a
+        // user `_flush` (p3e's own pin). hasFlush ⇒ the user's bridge
+        // (finalThunkFor's "flush" kind); !hasFlush ⇒ the canned identity
+        // bridge (flushDoneCore with null data — pushes nothing extra,
+        // still ends the readable side and finishes).
+        //
+        // CORRECTION (A), root-caused via instrumentation: WS_FINAL_CLOS
+        // must be NON-NULL here too, unlike the write side — maybeFinishCore
+        // (this file's OWN shared dispatch, unchanged, used by every
+        // Writable/Duplex/Transform/PassThrough) branches on WS_FINAL_CLOS
+        // being null to decide "is there a _final AT ALL", calling
+        // finalDoneCore(root,null) DIRECTLY and skipping WS_FINAL_THUNK
+        // entirely when it's null (the correct, EXISTING behavior for a
+        // plain Writable/Duplex with no user _final at all). Leaving it
+        // null here (matching the write side's own "CLOS unused" pattern,
+        // which has NO such fast-path check — doWriteCore always calls
+        // through WS_WRITE_THUNK unconditionally) silently routed EVERY
+        // Transform/PassThrough's own end() around identityFlushThunk/
+        // flushDoneCore/pushNullCore entirely — 'prefinish'/'finish' still
+        // fired (finalDoneCore ran either way), but the readable side's
+        // 'end' never did (p3o/p3t/p3u/p3w's own shared symptom — none of
+        // them ever reached pushNullCore's synchronous branch, confirmed
+        // by instrumentation, not the RS_SYNC-consumed-flag hypothesis).
+        // `recv` (the instance itself) is a harmless non-null placeholder
+        // — identityFlushThunk's own body never reads its CLOS param.
+        if (flushCbExpr !== null && flushThunkIdx !== null) {
+          code.localGet(st);
+          this.walkExpr(flushCbExpr);
+          code.structSet(this.stream.stateT(), WS_FINAL_CLOS);
+          code.localGet(st);
+          code.refFunc(flushThunkIdx);
+          code.structSet(this.stream.stateT(), WS_FINAL_THUNK);
+        } else {
+          this.mb.declareFuncRef(this.stream.identityFlushThunk());
+          code.localGet(st);
+          code.localGet(recv);
+          code.structSet(this.stream.stateT(), WS_FINAL_CLOS);
+          code.localGet(st);
+          code.refFunc(this.stream.identityFlushThunk());
+          code.structSet(this.stream.stateT(), WS_FINAL_THUNK);
+        }
+        if (destroyCbExpr !== null && destroyThunkIdx !== null) {
+          code.localGet(st);
+          this.walkExpr(destroyCbExpr);
+          code.structSet(this.stream.stateT(), RS_DESTROY_CLOS);
+          code.localGet(st);
+          code.refFunc(destroyThunkIdx);
+          code.structSet(this.stream.stateT(), RS_DESTROY_THUNK);
+        }
+        // STAGE C PASS 2, shape-mode: pre-create Transform/PassThrough's
+        // own reserved eventNames() keys — MEASURED (not assumed) against
+        // Node directly (p3i, the reverse-registration technique): IDENTICAL
+        // order to Duplex's, close/error/prefinish/finish/drain/data/end/
+        // readable.
+        this.emitReservedShapeCreate(code, recv, Assembler.DUPLEX_RESERVED);
+        // BUILD RULING: the genuine no-op 'prefinish' listener Node's own
+        // construction registers (internal/streams/transform.js's own
+        // backward-compat shim — stream.ts's `prefinishShimThunk` header
+        // has the full story, PROVABLY dead code in this tier, built
+        // anyway so eventNames()/listenerCount/removeAllListeners('prefinish')
+        // all agree with Node for free). Registered AFTER the reserved-
+        // shape creation so it lands in the pre-created bucket at its
+        // reserved rank, not a fresh one.
+        this.mb.declareFuncRef(this.stream.prefinishShimThunk());
+        code.localGet(recv);
+        this.pushStrLitInto(code, "prefinish");
+        code.refNull(EQ_HEAP);
+        code.refFunc(this.stream.prefinishShimThunk());
+        code.refNull(EQ_HEAP);
+        code.i32Const(0); // once
+        code.i32Const(0); // prepend
+        code.call(this.events.entryAppend());
         if (isInit) {
           this.releaseScratch(this.stream.stateRef(), st);
           this.releaseScratch(recvVal, recv);
@@ -16320,6 +17095,36 @@ class Assembler {
         this.releaseScratch(recvVal, recv);
         return true;
       }
+      case "readable.pipe": {
+        const recvT = e.args[0]!.type;
+        const recvVal = this.mapType(recvT, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        this.walkExpr(e.args[2]!);
+        code.call(this.stream.pipeCore());
+        return true;
+      }
+      case "readable.unpipe": {
+        const recvT = e.args[0]!.type;
+        const recvVal = this.mapType(recvT, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        this.walkExpr(e.args[0]!);
+        if (e.args[1] !== undefined) {
+          this.walkExpr(e.args[1]!);
+        } else {
+          code.refNull(this.classes.info("%Readable", undefined, false)!.struct);
+        }
+        code.i32Const(e.args[1] !== undefined ? 1 : 0);
+        code.call(this.stream.unpipeCore());
+        return true;
+      }
       case "stream.destroy":
       case "stream.destroyErr": {
         const recvT = e.args[0]!.type;
@@ -16491,6 +17296,10 @@ class Assembler {
           "ws:finished": () => this.stream.writableFinishedOf(),
           "ws:needDrain": () => this.stream.writableNeedDrainOf(),
           "ws:bufferedRequestCount": () => this.stream.wsBufferedRequestCountOf(),
+          // STAGE C PASS 2, Transform (CORRECTION ruling C): read-back
+          // fidelity, not the auto-end behavior — WS_ALLOW_HALF_OPEN's
+          // own header.
+          allowHalfOpen: () => this.stream.allowHalfOpenOf(),
         };
         const target = propTarget[nameArg.value];
         if (target === undefined) {
@@ -16536,22 +17345,23 @@ class Assembler {
         // Always a compile-time strLit (lower-stream.ts's own
         // construction, both the construction-chaining and method-call
         // forms) — dispatched HERE, by literal value, rather than at
-        // runtime: utf8 is the only ported encoding (measured — see
-        // stream.ts's RS_ENCODING header), anything else refuses by its
-        // own exact name, a compile-time fact, never a runtime branch.
+        // runtime: utf8 and hex are the two ported encodings (1744's own
+        // pin — measured — see stream.ts's RS_ENCODING header), anything
+        // else refuses by its own exact name, a compile-time fact, never
+        // a runtime branch.
         const encArg = e.args[1]!;
         if (encArg.kind !== "strLit") {
           this.refuse("libCall:readable.setEncoding:dynamic-encoding", e.loc);
           code.unreachable();
           return true;
         }
-        if (encArg.value !== "utf8") {
+        if (encArg.value !== "utf8" && encArg.value !== "hex") {
           this.refuse(`libCall:readable.setEncoding:${encArg.value}`, e.loc);
           code.unreachable();
           return true;
         }
         this.walkExpr(e.args[0]!);
-        code.call(this.stream.setEncodingUtf8Core());
+        code.call(encArg.value === "hex" ? this.stream.setEncodingHexCore() : this.stream.setEncodingUtf8Core());
         return true;
       }
       case "readable.pushEncoding": {

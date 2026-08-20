@@ -72,6 +72,14 @@ export const REG_HEAD = 0;
 export const REG_ERRBUCKET = 1;
 export const REG_MAX = 2;
 export const REG_SHAPE = 3;
+/** STAGE C PASS 2: the eventNames()/'error' fix — a monotonic
+ * insertion-sequence counter, read-then-incremented every time a NEW
+ * name bucket (general OR the dedicated 'error' one) is created, never
+ * on reuse. namesArr()'s own header has the full story (measured
+ * against ten Node cases): the general bucket chain and the SEPARATE
+ * error bucket carry no relative-order information between them today
+ * — REG_SEQ plus each bucket's own stamp is what recovers it. */
+export const REG_SEQ = 4;
 
 /** `$eeBucketErr`'s field indices — the 'error' event's dedicated,
  * direct-reference family (no `name`/`next`: at most one per registry,
@@ -80,6 +88,20 @@ export const BUCKETERR_EHEAD = 0;
 export const BUCKETERR_ETAIL = 1;
 export const BUCKETERR_N = 2;
 export const BUCKETERR_WARNED = 3;
+/** This bucket's OWN stamp off REG_SEQ, taken once at CREATION
+ * (errBucketEnsure's own "REG_ERRBUCKET was null" branch) — namesArr()'s
+ * own header. */
+export const BUCKETERR_SEQ = 4;
+/** STAGE C PASS 2, shape-mode: TRUE for the err-bucket a stream's OWN
+ * construction pre-creates ('error' is reserved rank 2 in every measured
+ * canonical order, but rides the err-bucket, not the main chain — the
+ * gate's own named hole in the first design). A reserved bucket LINGERS
+ * empty (errUnlinkEntry/errRemoveAll skip the null-out) so its seq/
+ * position survives a later re-add; an ordinary `.on('error', ...)`-
+ * created bucket (this field FALSE, the default) keeps the plain
+ * gone-on-empty/fresh-on-re-add semantic already shipped — namesArr()'s
+ * own header, the composition measurement. */
+export const BUCKETERR_RESERVED = 5;
 
 /** `$eeEntryErr`'s field indices. */
 export const ENTRYERR_CLOS = 0;
@@ -96,6 +118,16 @@ export const BUCKET_ETAIL = 2;
 export const BUCKET_N = 3;
 export const BUCKET_WARNED = 4;
 export const BUCKET_NEXT = 5;
+/** This bucket's OWN stamp off REG_SEQ, taken once at CREATION
+ * (bucketEnsure's own "not found" branch) — namesArr()'s own header. */
+export const BUCKET_SEQ = 6;
+/** STAGE C PASS 2, shape-mode: TRUE for a stream's own construction-
+ * created reserved-name bucket — unlinkEntry skips bucketDrop() on this
+ * one when it empties (lingers, keeps its seq/position for a later
+ * re-add); FALSE (the default) keeps the existing plain gone-on-empty
+ * behavior. BUCKETERR_RESERVED's own header, the same mechanism split
+ * onto the main chain's bucket family. */
+export const BUCKET_RESERVED = 7;
 
 /** `$eeEntry`'s field indices. */
 export const ENTRY_CLOS = 0;
@@ -237,6 +269,8 @@ export class EventsBuilder {
       { storage: I32, mutable: true }, // BUCKET_N
       { storage: I32, mutable: true }, // BUCKET_WARNED
       { storage: { kind: "ref", nullable: true, typeIndex: self }, mutable: true }, // BUCKET_NEXT
+      { storage: F64, mutable: false }, // BUCKET_SEQ
+      { storage: I32, mutable: false }, // BUCKET_RESERVED
     ]);
     return this.bucketTField;
   }
@@ -279,6 +313,8 @@ export class EventsBuilder {
       { storage: entryRef, mutable: true }, // BUCKETERR_ETAIL
       { storage: I32, mutable: true }, // BUCKETERR_N
       { storage: I32, mutable: true }, // BUCKETERR_WARNED
+      { storage: F64, mutable: false }, // BUCKETERR_SEQ
+      { storage: I32, mutable: false }, // BUCKETERR_RESERVED
     ]);
     return this.bucketErrTField;
   }
@@ -294,6 +330,7 @@ export class EventsBuilder {
       { storage: this.bucketErrRef(), mutable: true }, // REG_ERRBUCKET
       { storage: F64, mutable: true }, // REG_MAX
       { storage: I32, mutable: true }, // REG_SHAPE
+      { storage: F64, mutable: true }, // REG_SEQ
     ]);
     return this.regTField;
   }
@@ -305,8 +342,8 @@ export class EventsBuilder {
   /* ── registry / bucket lookup ──────────────────────────────────────── */
 
   /** `(root) -> reg` — lazily allocates {head:null, errBucket:null,
-   * max:-1, shape:0} and stores it back into the root's own registry
-   * field, matching scr_ee_reg_ensure. */
+   * max:-1, shape:0, seq:0} and stores it back into the root's own
+   * registry field, matching scr_ee_reg_ensure. */
   regEnsure(): number {
     return this.cached("regEnsure", () => {
       const root = this.deps.rootRef();
@@ -321,6 +358,7 @@ export class EventsBuilder {
       c.refNull(this.bucketErrT());
       c.f64Const(-1);
       c.i32Const(0);
+      c.f64Const(0);
       c.structNew(this.regT());
       c.localSet(N);
       c.localGet(R);
@@ -330,6 +368,31 @@ export class EventsBuilder {
       c.localGet(R);
       c.structGet(this.deps.rootStruct(), EMITTER_REG);
       this.mb.setBody(idx, [this.regRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  /** `(reg) -> f64` — the NEXT insertion-sequence stamp: reads REG_SEQ,
+   * writes back the incremented value, returns the PRE-increment one
+   * (the stamp this call's own new bucket gets). Called exactly once per
+   * NEW name bucket (general OR error), never on reuse — bucketEnsure's
+   * and errBucketEnsure's own "not found, create" branches, the only two
+   * call sites. namesArr()'s own header has the full design story. */
+  private nextSeq(): number {
+    return this.cached("nextSeq", () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.regRef()], [F64]), "%w.ee.nextSeq");
+      const c = new Code();
+      const REG = 0, S = 1;
+      c.localGet(REG);
+      c.structGet(this.regT(), REG_SEQ);
+      c.localSet(S);
+      c.localGet(REG);
+      c.localGet(S);
+      c.f64Const(1);
+      c.f64Add();
+      c.structSet(this.regT(), REG_SEQ);
+      c.localGet(S);
+      this.mb.setBody(idx, [F64], c.bytes());
       return idx;
     });
   }
@@ -381,14 +444,20 @@ export class EventsBuilder {
 
   /** `(reg, name) -> bucket` — find-or-create, appending at the tail of
    * `reg.head` (bucket order IS eventNames() order — scr_ee_bucket_ensure). */
+  /** `(reg, name, reserved) -> bucket` — find-or-create. `reserved` only
+   * matters on CREATE (an already-found bucket keeps whatever it was
+   * created with): a stream's own construction pre-creates its reserved-
+   * name buckets with `reserved=true` (BUCKET_RESERVED's own header);
+   * every ordinary `.on()`/`.once()` registration (entryAppend's call
+   * site) passes `false`, unchanged from before this existed. */
   bucketEnsure(): number {
     return this.cached("bucketEnsure", () => {
       const idx = this.mb.declareFunc(
-        this.mb.funcType([this.regRef(), this.deps.strRef()], [this.bucketRef()]),
+        this.mb.funcType([this.regRef(), this.deps.strRef(), I32], [this.bucketRef()]),
         "%w.ee.bucketEnsure",
       );
       const c = new Code();
-      const REG = 0, NAME = 1, B = 2, N = 3;
+      const REG = 0, NAME = 1, RESERVED = 2, B = 3, N = 4;
       c.localGet(REG);
       c.localGet(NAME);
       c.call(this.bucketFind());
@@ -401,6 +470,9 @@ export class EventsBuilder {
       c.i32Const(0);
       c.i32Const(0);
       c.refNull(this.bucketT());
+      c.localGet(REG);
+      c.call(this.nextSeq());
+      c.localGet(RESERVED);
       c.structNew(this.bucketT());
       c.localSet(N);
       // Append at the tail: an empty list makes N the new head.
@@ -542,6 +614,7 @@ export class EventsBuilder {
       c.call(this.fireMetaHelper("newListener"));
       c.localGet(REG);
       c.localGet(NAME);
+      c.i32Const(0); // reserved: ordinary registration never creates one
       c.call(this.bucketEnsure());
       c.localSet(B);
       c.localGet(CLOS);
@@ -603,20 +676,31 @@ export class EventsBuilder {
   }
 
   /** Unlinks ONE entry (known present, matched by IDENTITY) from its
-   * bucket's live list — the once-wrapper's own removal (scr_ee_remove_
-   * at): unlink, drop the bucket if it emptied (shape mode is not yet
-   * built — see the file header — so this ALWAYS drops, matching a plain
-   * emitter), THEN fire 'removeListener' with the bucket's name — read
-   * BEFORE the possible drop, Node's own order (scr_ee_remove_at retains
-   * the name before `scr_ee_bucket_drop`, fires the meta after). */
+   * bucket's live list — single removeListener/off AND the once-
+   * wrapper's own auto-removal (scr_ee_remove_at): unlink, drop the
+   * bucket if it emptied, THEN fire 'removeListener' with the bucket's
+   * name — read BEFORE the possible drop, Node's own order (scr_ee_
+   * remove_at retains the name before `scr_ee_bucket_drop`, fires the
+   * meta after).
+   *
+   * `honorReserved` (STAGE C PASS 2, shape-mode): removeListener(name,cb)
+   * and once's auto-removal LEAVE a reserved bucket lingering, empty, at
+   * its own rank when it empties (Node writes `events[type] = undefined`
+   * rather than deleting the key — the corpus's own "removeListener
+   * KEEPS an emptied name's rank" comment, 2626) — pass `true` (both
+   * call sites below do). removeAllListeners(name)'s meta-aware walk
+   * (removeAllNamedMeta, which reaches here once per entry) must instead
+   * ALWAYS drop, matching Node's own `delete _events[type]` even for a
+   * reserved name (2626's "the named removeAllListeners deletes a
+   * POPULATED key even in shape mode") — passes `false`. */
   unlinkEntry(): number {
     return this.cached("unlinkEntry", () => {
       const idx = this.mb.declareFunc(
-        this.mb.funcType([this.deps.rootRef(), this.regRef(), this.bucketRef(), this.entryRef()], []),
+        this.mb.funcType([this.deps.rootRef(), this.regRef(), this.bucketRef(), this.entryRef(), I32], []),
         "%w.ee.unlinkEntry",
       );
       const c = new Code();
-      const ROOT = 0, REG = 1, B = 2, TARGET = 3, CUR = 4, PREV = 5, N = 6, NAME = 7;
+      const ROOT = 0, REG = 1, B = 2, TARGET = 3, HONOR_RESERVED = 4, CUR = 5, PREV = 6, N = 7, NAME = 8;
       c.localGet(B);
       c.structGet(this.bucketT(), BUCKET_NAME);
       c.localSet(NAME);
@@ -673,6 +757,19 @@ export class EventsBuilder {
       c.structSet(this.bucketT(), BUCKET_N);
       c.localGet(N);
       c.i32Eqz();
+      // STAGE C PASS 2, shape-mode: a RESERVED bucket lingers, empty, in
+      // its own chain position (its seq/rank must survive a later
+      // re-add) — skip bucketDrop() for it, but ONLY when the caller
+      // wants that (HONOR_RESERVED — the function's own header). When
+      // the caller is removeAllListeners(name)'s meta-aware walk, it
+      // always drops regardless of BUCKET_RESERVED.
+      c.localGet(HONOR_RESERVED);
+      c.i32Eqz();
+      c.localGet(B);
+      c.structGet(this.bucketT(), BUCKET_RESERVED);
+      c.i32Eqz();
+      c.i32Or();
+      c.i32And();
       c.ifVoid();
       c.localGet(REG);
       c.localGet(B);
@@ -811,6 +908,8 @@ export class EventsBuilder {
       c.localGet(REG);
       c.localGet(LB);
       c.localGet(E);
+      c.i32Const(1); // honorReserved: once's auto-removal is a plain
+      // removal, not removeAllListeners — a reserved bucket lingers.
       c.call(this.unlinkEntry());
       c.end();
       // A 'removeListener' meta listener may have just thrown (fired
@@ -964,6 +1063,9 @@ export class EventsBuilder {
       c.localGet(REG);
       c.localGet(B);
       c.localGet(MATCH);
+      c.i32Const(1); // honorReserved: explicit removeListener(name,cb) —
+      // a reserved bucket lingers (2626's own "removeListener KEEPS an
+      // emptied name's rank").
       c.call(this.unlinkEntry());
       this.mb.setBody(idx, [this.regRef(), this.bucketRef(), this.entryRef(), this.entryRef()], c.bytes());
       return idx;
@@ -1136,6 +1238,28 @@ export class EventsBuilder {
       c.localGet(REG);
       c.localGet(LIVE);
       c.localGet(E);
+      // honorReserved=true. UNMEASURED/UNCERTAIN CORNER, named rather
+      // than guessed silently: this call site is removeAllNamedMeta's
+      // per-entry LIFO walk, reached ONLY when a 'removeListener' meta-
+      // listener exists (the "!events.removeListener" fast path — 2626's
+      // own no-meta-listener r3 case — bypasses unlinkEntry entirely via
+      // removeAllNamed's own direct, unconditional bucketDrop() below,
+      // already correct and unchanged). No banked claim registers a
+      // 'removeListener' listener AND calls removeAllListeners on a
+      // stream's reserved name, so this exact branch is UNEXERCISED by
+      // anything claimed. A direct measurement (p2-shapemode-removeall-
+      // meta.ts) found the reserved name's rank SURVIVES removeAllListeners
+      // when a 'removeListener' listener is present — matching the plain
+      // removeListener(name,cb) semantic, not the no-meta-listener fast
+      // path's unconditional delete — hence honorReserved=true here,
+      // matching the other two call sites. Flagged to the lead rather
+      // than trusted blind: the same probe showed an OUT-OF-STREAM-SCOPE
+      // surprise (a non-reserved custom name ALSO preserving rank in this
+      // same combination on a Readable, which a parallel plain-
+      // EventEmitter control did NOT reproduce) that this file's
+      // BUCKET_RESERVED mechanism does not model at all — true root
+      // cause not yet understood, does not affect any banked claim.
+      c.i32Const(1);
       c.call(this.unlinkEntry());
       c.end();
       c.end();
@@ -1157,11 +1281,17 @@ export class EventsBuilder {
 
   /** `(root, name) -> void` — removeAllListeners(name): the plain
    * wholesale bucket drop when nothing observes 'removeListener' (scr_
-   * ee_remove_all_named's `!meta` arm), else the meta-aware LIFO removal
-   * (this file has no shape mode, so unlike the C reference there is no
-   * separate "were all buckets already empty" wholesale-wipe corner to
-   * chase — a bucket here is NEVER present at n==0, so there is nothing
-   * extra left to sweep once the named bucket's own entries are gone). */
+   * ee_remove_all_named's `!meta` arm), else the meta-aware LIFO removal.
+   * STAGE C PASS 2, shape-mode: the plain arm's `bucketDrop()` below is
+   * deliberately UNCONDITIONAL — measured directly against Node (2626's
+   * r3 case), the no-'removeListener'-listener fast path DELETES a
+   * reserved name's key outright, same as any other name, unlike a
+   * single removeListener(name,cb) or the meta-aware LIFO arm (which
+   * route through unlinkEntry's own honorReserved=true and DO linger a
+   * reserved bucket). `bucketFind` can now return a bucket with n===0
+   * (a reserved-but-empty one) even in THIS arm — dropping it
+   * unconditionally is still correct (there is nothing to preserve; the
+   * fast path never lingers, reserved or not). */
   removeAllNamed(): number {
     return this.cached("removeAllNamed", () => {
       const idx = this.mb.declareFunc(this.mb.funcType([this.deps.rootRef(), this.deps.strRef()], []), "%w.ee.removeAllNamed");
@@ -1255,11 +1385,24 @@ export class EventsBuilder {
       c.localGet(RL);
       c.refIsNull();
       c.brIf(1);
+      // SHAPE-MODE HAZARD: a RESERVED-but-currently-empty bucket can sit
+      // in the chain (BUCKET_N === 0) — skip it too, not just the
+      // 'removeListener' bucket itself, or PICK re-selects it forever
+      // (removeAllNamedMeta on an N===0 bucket removes nothing and never
+      // drops it, since dropping only happens as a side effect of the
+      // LAST entry's own removal) — an infinite loop, not just a wrong
+      // answer. The final unconditional REG_HEAD=null below still wipes
+      // it along with everything else once this walk is done.
+      c.localGet(RL);
+      c.structGet(this.bucketT(), BUCKET_N);
+      c.i32Const(0);
+      c.i32GtS();
       c.localGet(RL);
       c.structGet(this.bucketT(), BUCKET_NAME);
       this.deps.lit(c, "removeListener");
       c.call(this.deps.strEq());
       c.i32Eqz();
+      c.i32And();
       c.ifVoid();
       c.localGet(RL);
       c.localSet(PICK);
@@ -1303,17 +1446,32 @@ export class EventsBuilder {
     });
   }
 
-  /** `(root) -> string[]` — eventNames(): the bucket chain IS
-   * first-registration order already (scr_emitter_event_names). Every
-   * bucket in the chain has n>0 today — this file drops a bucket the
-   * instant it empties (no shape-mode reserved-but-empty buckets yet),
-   * so no `n>0` filter is needed here (unlike the C reference, which
-   * DOES need one once reserved buckets exist — a stage-B note). */
+  /** `(root) -> stringVec` — `eventNames()`: the ordering contract this
+   * implements (measured directly against Node, ten cases — a top-level
+   * script in the pass-2 report and the permanent regression pin,
+   * p2-error-eventnames-measure.ts) is PLAIN INSERTION ORDER across
+   * every name, 'error' included, with ZERO special-casing — 'error'
+   * registered first sorts first, re-added after removal moves to the
+   * end exactly like any other name, a single entry regardless of
+   * listener count, `once()` participates identically to `on()`, and
+   * both `removeAllListeners('error')` and the no-arg wipe behave like
+   * they would for any other name. The general bucket chain (REG_HEAD)
+   * and the SEPARATE dedicated 'error' bucket (REG_ERRBUCKET, the file's
+   * own "direct-reference family" — no `name`/`next`, so it was never
+   * part of the chain at all) carry NO relative-order information
+   * between them by construction; REG_SEQ (a monotonic counter) plus
+   * each bucket's own creation-time stamp (BUCKET_SEQ / BUCKETERR_SEQ)
+   * is what recovers it — a merge-walk of the main chain against the
+   * AT-MOST-ONE error bucket by stamp, inserting "error" at the point
+   * its stamp falls. Correctness depends on an emptied bucket being
+   * genuinely GONE so a later re-add stamps FRESH (errUnlinkEntry's and
+   * errRemoveAll's own fix, this same change — a lingering bucket would
+   * reuse its OLD, now-wrong-for-reordering stamp). */
   namesArr(): number {
     return this.cached("namesArr", () => {
       const idx = this.mb.declareFunc(this.mb.funcType([this.deps.rootRef()], [this.deps.stringVecRef()]), "%w.ee.namesArr");
       const c = new Code();
-      const ROOT = 0, REG = 1, OUT = 2, B = 3;
+      const ROOT = 0, REG = 1, OUT = 2, B = 3, EB = 4, ERRSEQ = 5, ERRELIGIBLE = 6, ERRPUSHED = 7;
       c.localGet(ROOT);
       c.structGet(this.deps.rootStruct(), EMITTER_REG);
       c.localSet(REG);
@@ -1326,6 +1484,31 @@ export class EventsBuilder {
       c.localGet(OUT);
       c.return_();
       c.end();
+      // ERRELIGIBLE: is there a NONEMPTY error bucket right now? (a
+      // lingering-but-empty one cannot exist post-fix, but BUCKETERR_N is
+      // still the honest check, matching hasErrorListeners's own gate.)
+      c.localGet(REG);
+      c.structGet(this.regT(), REG_ERRBUCKET);
+      c.localTee(EB);
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifResult(I32);
+      c.localGet(EB);
+      c.structGet(this.bucketErrT(), BUCKETERR_N);
+      c.i32Const(0);
+      c.i32GtS();
+      c.else_();
+      c.i32Const(0);
+      c.end();
+      c.localSet(ERRELIGIBLE);
+      c.localGet(ERRELIGIBLE);
+      c.ifVoid();
+      c.localGet(EB);
+      c.structGet(this.bucketErrT(), BUCKETERR_SEQ);
+      c.localSet(ERRSEQ);
+      c.end();
+      c.i32Const(0);
+      c.localSet(ERRPUSHED);
       c.localGet(REG);
       c.structGet(this.regT(), REG_HEAD);
       c.localSet(B);
@@ -1334,18 +1517,57 @@ export class EventsBuilder {
       c.localGet(B);
       c.refIsNull();
       c.brIf(1);
+      c.localGet(ERRELIGIBLE);
+      c.localGet(ERRPUSHED);
+      c.i32Eqz();
+      c.i32And();
+      c.ifVoid();
+      c.localGet(ERRSEQ);
+      c.localGet(B);
+      c.structGet(this.bucketT(), BUCKET_SEQ);
+      c.f64Lt();
+      c.ifVoid();
+      c.localGet(OUT);
+      this.deps.lit(c, "error");
+      c.call(this.deps.stringVecPushOne());
+      c.i32Const(1);
+      c.localSet(ERRPUSHED);
+      c.end();
+      c.end();
+      // A RESERVED bucket that never landed a real listener yet (or was
+      // emptied and is lingering for its rank) is present in the chain
+      // but must stay INVISIBLE — BUCKET_RESERVED's own header.
+      c.localGet(B);
+      c.structGet(this.bucketT(), BUCKET_N);
+      c.i32Const(0);
+      c.i32GtS();
+      c.ifVoid();
       c.localGet(OUT);
       c.localGet(B);
       c.structGet(this.bucketT(), BUCKET_NAME);
       c.call(this.deps.stringVecPushOne());
+      c.end();
       c.localGet(B);
       c.structGet(this.bucketT(), BUCKET_NEXT);
       c.localSet(B);
       c.br(0);
       c.end();
       c.end();
+      c.localGet(ERRELIGIBLE);
+      c.localGet(ERRPUSHED);
+      c.i32Eqz();
+      c.i32And();
+      c.ifVoid();
       c.localGet(OUT);
-      this.mb.setBody(idx, [this.regRef(), this.deps.stringVecRef(), this.bucketRef()], c.bytes());
+      this.deps.lit(c, "error");
+      c.call(this.deps.stringVecPushOne());
+      c.end();
+      c.localGet(OUT);
+      this.mb.setBody(
+        idx,
+        [this.regRef(), this.deps.stringVecRef(), this.bucketRef(), this.bucketErrRef(), F64, I32, I32],
+        c.bytes(),
+      );
       return idx;
     });
   }
@@ -1359,13 +1581,22 @@ export class EventsBuilder {
    * ACTUAL stage-A corpus claim needs over 'error' (on/off/emit/
    * emitError/removeAllListeners, both forms) IS implemented here. */
 
-  /** `(root) -> bucketErr` — lazily creates the registry AND the one
-   * error bucket (scr_ee_reg_ensure + the bucket's own first-touch). */
+  /** `(root, reserved) -> bucketErr` — lazily creates the registry AND
+   * the one error bucket (scr_ee_reg_ensure + the bucket's own first-
+   * touch). `reserved` only matters on CREATE, mirroring bucketEnsure's
+   * own header exactly: a stream's own construction pre-creates the
+   * err-bucket with `reserved=true` (BUCKETERR_RESERVED's own header —
+   * 'error' rides the err-bucket, not the main chain, for its own
+   * reserved-rank story); every ordinary `.on('error', ...)`/`.once(...)`
+   * registration (errEntryAppend's call site) passes `false`. */
   errBucketEnsure(): number {
     return this.cached("errBucketEnsure", () => {
-      const idx = this.mb.declareFunc(this.mb.funcType([this.deps.rootRef()], [this.bucketErrRef()]), "%w.ee.errBucketEnsure");
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.deps.rootRef(), I32], [this.bucketErrRef()]),
+        "%w.ee.errBucketEnsure",
+      );
       const c = new Code();
-      const ROOT = 0, REG = 1, EB = 2;
+      const ROOT = 0, RESERVED = 1, REG = 2;
       c.localGet(ROOT);
       c.call(this.regEnsure());
       c.localSet(REG);
@@ -1378,12 +1609,15 @@ export class EventsBuilder {
       c.refNull(this.entryErrT());
       c.i32Const(0);
       c.i32Const(0);
+      c.localGet(REG);
+      c.call(this.nextSeq());
+      c.localGet(RESERVED);
       c.structNew(this.bucketErrT());
       c.structSet(this.regT(), REG_ERRBUCKET);
       c.end();
       c.localGet(REG);
       c.structGet(this.regT(), REG_ERRBUCKET);
-      this.mb.setBody(idx, [this.regRef(), this.bucketErrRef()], c.bytes());
+      this.mb.setBody(idx, [this.regRef()], c.bytes());
       return idx;
     });
   }
@@ -1405,6 +1639,7 @@ export class EventsBuilder {
       this.deps.lit(c, "error");
       c.call(this.fireMetaHelper("newListener"));
       c.localGet(ROOT);
+      c.i32Const(0); // reserved: ordinary registration never creates one
       c.call(this.errBucketEnsure());
       c.localSet(EB);
       c.localGet(CLOS);
@@ -1497,6 +1732,7 @@ export class EventsBuilder {
       );
       const c = new Code();
       const ROOT = 0, EB = 1, TARGET = 2, CUR = 3, PREV = 4, N = 5;
+      const REG = 6;
       c.localGet(EB);
       c.structGet(this.bucketErrT(), BUCKETERR_EHEAD);
       c.localSet(CUR);
@@ -1546,10 +1782,41 @@ export class EventsBuilder {
       c.localGet(EB);
       c.localGet(N);
       c.structSet(this.bucketErrT(), BUCKETERR_N);
+      // STAGE C PASS 2: the emptied bucket must be genuinely GONE (null
+      // REG_ERRBUCKET), mirroring bucketDrop's own main-chain behavior —
+      // otherwise a LATER re-add reuses this lingering struct instead of
+      // creating a fresh one (errBucketEnsure's own "already non-null"
+      // check), and inherits this bucket's STALE seq stamp instead of a
+      // current one. namesArr()'s own header, the ten-case measurement
+      // this fixes (found via execution: the ORIGINAL fix attempt kept
+      // the bucket alive on empty, and the re-add-after-remove case
+      // still failed — not a review catch). No claim tests THIS ROOT's
+      // "was there ever a reg" case, so a fresh regEnsure()-free
+      // structGet on ROOT is always safe here (errUnlinkEntry is only
+      // ever called with an already-non-null EB, hence an already-
+      // non-null REG).
+      // SHAPE-MODE: a RESERVED bucket (a stream's own construction pre-
+      // create) is the one exception — it LINGERS empty instead, keeping
+      // its seq/rank for a later re-add (BUCKETERR_RESERVED's own
+      // header). Only a plain (non-reserved) bucket nulls out here.
+      c.localGet(N);
+      c.i32Eqz();
+      c.localGet(EB);
+      c.structGet(this.bucketErrT(), BUCKETERR_RESERVED);
+      c.i32Eqz();
+      c.i32And();
+      c.ifVoid();
+      c.localGet(ROOT);
+      c.structGet(this.deps.rootStruct(), EMITTER_REG);
+      c.localSet(REG);
+      c.localGet(REG);
+      c.refNull(this.bucketErrT());
+      c.structSet(this.regT(), REG_ERRBUCKET);
+      c.end();
       c.localGet(ROOT);
       this.deps.lit(c, "error");
       c.call(this.fireMetaHelper("removeListener"));
-      this.mb.setBody(idx, [this.entryErrRef(), this.entryErrRef(), I32], c.bytes());
+      this.mb.setBody(idx, [this.entryErrRef(), this.entryErrRef(), I32, this.regRef()], c.bytes());
       return idx;
     });
   }
@@ -1741,12 +2008,17 @@ export class EventsBuilder {
       c.ifVoid();
       c.return_();
       c.end();
+      // STAGE C PASS 2: null it out — genuinely GONE, matching
+      // errUnlinkEntry's own last-listener fix and bucketDrop's
+      // main-chain precedent — rather than replacing it with a fresh
+      // struct that stays non-null (the OLD behavior here). A lingering
+      // non-null bucket is invisible to namesArr() only because it
+      // checks BUCKETERR_N too, but a LATER re-add would still reuse it
+      // (errBucketEnsure's own "already non-null" check) and inherit a
+      // stale seq stamped at THIS removeAllListeners('error') call
+      // instead of a fresh one at the actual re-registration.
       c.localGet(REG);
-      c.refNull(this.entryErrT());
-      c.refNull(this.entryErrT());
-      c.i32Const(0);
-      c.i32Const(0);
-      c.structNew(this.bucketErrT());
+      c.refNull(this.bucketErrT());
       c.structSet(this.regT(), REG_ERRBUCKET);
       this.mb.setBody(idx, [this.regRef()], c.bytes());
       return idx;
