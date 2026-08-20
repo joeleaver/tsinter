@@ -3078,3 +3078,91 @@ mix of full/once entries — but stays blocked on `assert.deepStrictEqual`
 today; the eventual claim reuses its own listeners()/rawListeners()
 assertions once `libCall:assert.deepResult` lands, per this entry's own
 deferred-adapter note above).
+
+## S053 — `pipeline()` skips its pre-flight already-destroyed check; a stage destroyed before the call settles via the ordinary premature-close route instead of a synchronous throw *(wasm tier)*
+
+Node's real `pipeline()` validates every stage before wiring anything:
+a stage already `destroyed` at call time makes `pipeline()` throw
+SYNCHRONOUSLY, before returning — measured directly (node v24.18.1,
+`t.destroy()` on the MIDDLE stage of a 3-stage `pipeline(s, t, w, cb)`,
+called before `pipeline()`): `Error: Cannot pipe to a closed or
+destroyed stream`, `code: ERR_STREAM_UNABLE_TO_PIPE`, `name: Error`,
+thrown from the `pipeline()` call itself — the callback is never
+invoked at all. This tier has no such pre-flight check: `pipeline()`
+always returns normally, wires the pairwise pipes and the cascade
+watchers exactly as if every stage were live, and the already-destroyed
+stage's own idempotent `destroyErrCore` guard makes its OWN cascade
+call a no-op — so the pipeline settles later through the SAME
+premature-close mechanism M1 uses for a stage destroyed DURING the
+pipeline (not before it): the callback fires (asynchronously, on the
+ordinary tick machinery) with `Error: Premature close`, `code:
+ERR_STREAM_PREMATURE_CLOSE` (measured directly against the compiled
+build, the identical shape M1's own pin exercises).
+
+The SHARPEST observable is the exit path for an uncaught case: Node's
+synchronous throw means an unhandled instance crashes the process
+IMMEDIATELY, at the `pipeline()` call site itself, before any stage's
+own machinery ever runs; this tier's async settle means the SAME
+program runs its full script body first, and only crashes (if nothing
+catches the callback's error) on a LATER tick, after the cascade and
+teardown have already executed — sync-throw-catchable-at-callsite vs.
+async-settle-then-maybe-crash-later, not merely a different error
+identity.
+
+Measured shape (original): the MIDDLE stage (position 2 of a 3-stage
+pipeline, role RW) pre-destroyed with no error — the r3a probe cited
+above.
+
+AMENDMENT (re-gate, all three positions now measured — the entry's own
+"register by shape" caveat above is CLOSED, not left open): the
+SOURCE position is NOT a divergence — measured directly (node v24.18.1
+and the compiled build, both sides, a fresh `s.destroy()`-before-
+`pipeline()` probe): Node itself returns `pipeline()` NORMALLY for a
+pre-destroyed SOURCE, settling the callback asynchronously with `Error:
+Premature close`, `code: ERR_STREAM_PREMATURE_CLOSE` — the EXACT same
+observable this tier already produces there, byte-for-byte, no fix
+needed. The MIDDLE and DESTINATION positions both carry the registered
+divergence — measured directly (node v24.18.1 and the compiled build,
+both sides, a fresh `w.destroy()`-before-`pipeline()` probe for
+DESTINATION): Node throws SYNCHRONOUSLY, `ERR_STREAM_UNABLE_TO_PIPE`,
+at BOTH positions, where this tier settles asynchronously via the SAME
+premature-close route at both.
+
+MECHANISM (why the split by position, not incidental): Node's own
+error message is exact and load-bearing — "Cannot pipe **to** a closed
+or destroyed stream". The pre-flight check fires on whether a stage is
+a pipe DESTINATION — every stage in a chain except the source is piped
+TO by its predecessor, so source is structurally exempt, never a
+divergence to fix; middle and destination both ARE piped-to positions,
+both need the check. This is the reason board item #81's eventual fix
+must NOT be a blanket "any stage destroyed" pre-flight check — a
+blanket check would make source throw synchronously too, CREATING a
+new divergence at the one position that is currently correct, while
+fixing the two that are not. The check belongs on the destination side
+of each `pipeCore()` pairwise wiring call specifically, mirroring
+Node's own "to" framing, not on `PCTX_STAGES` as an undifferentiated
+list.
+
+**Rationale:** the fix is a genuine pre-flight validation this tier's
+`pipeline()` lowering does not build at all (checking each PIPE-TO
+stage's own destroyed state — every stage except the source — before
+ever calling `pipeCore`/registering a single watcher for it, then
+throwing synchronously if already true) — registered now, landing P2's
+fix round KNOWING this gap exists, rather than shipped silent; the
+build is tracked as a lead-side board item (#81) for a later pass, now
+scoped correctly by the amendment above (destination-side check, not a
+blanket one). Divergence direction: nothing is fabricated or lost — the
+pipeline still fails, with the same eventual `ERR_STREAM_PREMATURE_
+CLOSE` identity M1's own mechanism already produces for the "destroyed
+during" case — but the FAILURE MODE (sync-throw-before-any-side-effect
+vs. async-settle-after-full-wiring) diverges at the middle and
+destination positions, and an uncaught-error program's observable exit
+timing diverges with it there.
+
+**Tested by:** corpus-unpinnable today (no claimed program pre-destroys
+a pipeline stage before calling `pipeline()`); the measurements of
+record are this fix round's own r3a probe (stage-D P2-1 close-out,
+middle position) plus the re-gate amendment's own source/destination
+probes (both freshly re-measured against live Node and the compiled
+build, both sides, not assumed from the reviewer's report), restated in
+full above.

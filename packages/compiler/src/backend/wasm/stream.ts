@@ -518,7 +518,46 @@ export const RS_SIDES = 58; // i32: FIN_SIDE_R/W/RW
  * happened (mirrors Node's own always-schedule-never-sync eos()
  * contract, probe01/probe12). */
 export const FIN_HEAD = 59; // ref $w.rs.finEntry, nullable
-export const WS_FIELD_COUNT = 60;
+/** FIX ROUND (P2-1, gate finding) — a TRANSIENT, per-write bit: did the
+ * write that JUST landed (inside THIS `write()` call, via `doWriteCore`)
+ * error SYNCHRONOUSLY? Node's real `write()` return-value formula
+ * reflects `state.errored`/`state.writable` becoming false the INSTANT
+ * a synchronous `_write` callback errors (measured directly: `const ret
+ * = w.write('x')` over a synchronously-erroring `_write` gives `ret ===
+ * false` and `w.errored` a real Error, both readable immediately after
+ * `write()` returns — well before `destroy()`'s own deferred `destroyed
+ * = true` / 'error' / 'close'). `writeCore`'s own formula (GATE FIX C3's
+ * `WS_LENGTH < WS_HWM`, otherwise unchanged) needs this ONE extra
+ * signal to match — nothing else.
+ *
+ * DELIBERATELY NOT `RS_ERROR` (set early): Node's `state.errored` really
+ * IS synchronous, and stamping RS_ERROR early would be the CLOSER port —
+ * but RS_ERROR already has readers (checkWaiterCore's consumer-settle
+ * path, opError's own dispatch, finComputeErr) built and gate-tested
+ * against the LATE (deferred-destroy) stamp; moving its own timing would
+ * be an unaudited-sibling hazard across all of them for a fix this
+ * narrow. This flag is a proxy for `state.errored`'s role in `write()`'s
+ * return formula ONLY — no other reader may ever consult it. If some
+ * FUTURE divergence traces to a reader genuinely needing early
+ * errored-state, that is the signal for a full RS_ERROR-timing audit,
+ * not for widening this flag's use.
+ *
+ * RESET DISCIPLINE: `writeCore`'s own entry resets this to false before
+ * dispatching (never carried across calls — a stale true would force
+ * every SUBSEQUENT healthy write's return to false, a spurious-pause/
+ * hang-class bug of exactly the kind this whole round is about).
+ * `writeDoneLandingCore` sets it true, unconditionally, whenever `err`
+ * is non-null — BEFORE the WS_SYNC-gated defer decision, so it is
+ * visible the instant `doWriteCore()` returns back into `writeCore`,
+ * regardless of whether the callback landed synchronously or not (an
+ * async-landing error is caught by the SAME check just as correctly —
+ * `writeCore` has already returned its OWN answer for THAT call by
+ * then, so the flag is simply unread until the NEXT `write()` resets
+ * it). No claim exercises write-after-a-sync-error-without-destroy (a
+ * synchronous error always routes to `destroyErrCore` on the SAME
+ * stream), so this pass does not pin that combination separately. */
+export const WS_SYNC_ERRORED = 60; // i32 bool, transient
+export const WS_FIELD_COUNT = 61;
 
 /** RS_SIDES's own values — a bare Readable's finished() watches ONLY the
  * readable side (a pure Writable never reaches RS_END_EMITTED, so
@@ -559,17 +598,59 @@ export const FIN_SIDE_UNSET = 3;
 export const FIN_KIND_CB = 0;
 export const FIN_KIND_DYN = 1;
 export const FIN_KIND_PROMISE = 2;
+/** STAGE D P2 (pipeline, board #77). A pipeline() stage's own destroyer-
+ * style watcher (rD-node's own `destroyer(stream, reading, writing)` —
+ * one per STAGE, not one per adjacent pipe() pair; distinct from
+ * pipeCore()'s own byte-transfer wiring, which has no eos()/premature-
+ * close logic of its own). FE_CLOS holds the pipeline ctx (`eq`, cast at
+ * use time — the SAME "shared field, per-kind cast" convention
+ * FIN_KIND_PROMISE already established for a promRef); FE_ROLE (a NEW
+ * field, see below) carries which side(s) THIS stage watches — POSITION-
+ * derived (stage 0 = R, last stage = W, middle = RW), computed by the
+ * backend from the stage's place in ITS OWN pipeline() call, never from
+ * any call-site's static TypeScript type — carries none of the
+ * finished()/eos() upcast divergence risk RS_SIDES's own header
+ * documents, since pipeline's role assignment has no analogous "declared
+ * type vs runtime object" axis at all. */
+export const FIN_KIND_PIPELINE = 3;
 
 /** `$w.rs.finEntry`'s field indices (the struct type itself lives on
  * `StreamBuilder.finEntryT()`, below — needs `destroyThunkSig()`
  * resolved first, so it can't be declared at module scope like the
- * chunk/tick structs are). No per-entry sides field: RS_SIDES lives on
- * the STREAM (construction-stamped), not the watcher — every entry on
- * one stream shares it. */
+ * chunk/tick structs are). No per-entry sides field for CB/DYN/PROMISE:
+ * RS_SIDES lives on the STREAM (construction-stamped), not the watcher —
+ * every entry on one stream shares it. FE_ROLE is the one exception —
+ * meaningful ONLY for FIN_KIND_PIPELINE entries (ignored/zero for the
+ * other three kinds), see FIN_KIND_PIPELINE's own header for why this
+ * one legitimately needs a per-entry field where CB/DYN/PROMISE do not. */
 const FE_NEXT = 0;
 const FE_KIND = 1;
 const FE_CLOS = 2;
 const FE_THUNK = 3;
+const FE_ROLE = 4;
+
+/** `$w.rs.pipelineCtx`'s field indices — one per `pipeline()`/
+ * `pipelineDyn()`/`sp.pipeline()` call, GC-allocated, shared by every
+ * per-stage watcher/listener that call registers (captured via
+ * FIN_KIND_PIPELINE's own FE_CLOS, and via the raw per-stage 'error'
+ * listener closures pipelineRegisterCore builds). No LAST_STAGE field:
+ * `STAGES[N-1]` already holds it, and Node's own contract IS the final
+ * destination stage, no separate bookkeeping needed. FINAL_THUNK reuses
+ * `destroyThunkSig()`'s exact ABI, same as FE_THUNK — lower-stream.ts's
+ * own `lowerEosCallback` tuple is `[errorOrNull(L)]` for pipeline's
+ * callback exactly like finished()'s (confirmed by reading the actual
+ * lowering, not assumed), so the lifted closure never has more than one
+ * extra param beyond `this` — `finThunkFor` (P1) is reused VERBATIM for
+ * pipeline's own typed callback, no new thunk-building function. */
+const PCTX_N = 0;
+const PCTX_CLOSED_COUNT = 1;
+const PCTX_ERRORSET = 2;
+const PCTX_ERROR_IS_PLACEHOLDER = 3;
+const PCTX_ERROR = 4;
+const PCTX_FINAL_KIND = 5;
+const PCTX_FINAL_CLOS = 6;
+const PCTX_FINAL_THUNK = 7;
+const PCTX_STAGES = 8;
 
 /** `$wReq`'s field indices — one queued write entry (a chunk plus its
  * own completion callback; `cb` is nullable since a plain `write(chunk)`
@@ -607,6 +688,47 @@ export const CHUNK_NEXT = 2;
 const RT_ROOT = 0;
 const RT_OP = 1;
 const RT_NEXT = 2;
+
+/** STAGE D P2's OWN private FIFO node — `$w.rs.pipelineTick` (the extra
+ * nextTick hop probe12 measured for pipeline's final callback, mirroring
+ * `$rTick`'s own shape exactly, deliberately SEPARATE from it rather
+ * than reusing it: `$rTick`'s own RT_ROOT field is declared as
+ * `rootRef()` — a %Readable-hierarchy class — and every existing op
+ * body structGets it as that exact type with no cast; widening it to
+ * carry an unrelated pipeline-ctx struct would mean touching every
+ * existing op's dispatch (P1's own committed, gate-approved code) for a
+ * P2-only need. A dedicated single-purpose queue costs one small struct
+ * + one pair of globals and touches nothing already landed. Only ONE
+ * kind of work item ever rides this queue (fire this ctx's final
+ * callback), so there is no op-code field at all — PT_NEXT is the only
+ * other field. */
+const PT_CTX = 0;
+const PT_NEXT = 1;
+
+/** FIX ROUND (P2-1, gate finding) — `$w.ws.writeCompletion`'s own field
+ * indices: a deferred `_write`/`_transform` completion-callback landing,
+ * mirroring Node's real `onwrite`'s `state.sync` check (measured
+ * directly: a plain synchronous `_write` callback's continuation —
+ * success OR error — fires strictly on a LATER turn than the script's
+ * own synchronous continuation, interleaved with `process.nextTick`
+ * order, never inline). `writeDoneLandingCore`'s own header has the
+ * full mechanism story and why this is a SEPARATE mini-queue rather
+ * than reusing `$rTick`/`pipelineTick` (the SAME "one dedicated queue
+ * per genuinely distinct work-item shape" precedent `pipelineTick`'s
+ * own header already established). */
+const WCT_ROOT = 0;
+const WCT_ERR = 1;
+/** LAYER 5 (afterWriteCore split): the completed write's own per-write
+ * callback closure, captured by `afterWriteHeadCore` at pop time and
+ * carried through the queue to whichever tail eventually fires it —
+ * mirrors Node's own `cb` LOCAL PARAMETER capture (`process.nextTick
+ * (afterWrite, stream, state, 1, cb)`/`onwriteError(stream, state, er,
+ * cb)`): each completion's own `cb` is captured independently, per call,
+ * never a single shared mutable field a NESTED completion (dispatched by
+ * this same layer's always-immediate queue-continuation) could clobber
+ * before the outer one's tail reads it back. */
+const WCT_CB_CLOS = 2;
+const WCT_NEXT = 3;
 
 export const OP_READABLE = 0;
 export const OP_RESUME = 1;
@@ -864,6 +986,25 @@ export interface StreamDeps {
    * own three internal thunks with the exact type `entryAppend`'s THUNK
    * parameter expects. */
   thunkSig: () => number;
+  /** LAYER 6 (P2-1 fix round, bounded diagnosis): events.ts's DEDICATED
+   * 'error'-bucket call-glue type index — `(clos: eq, err: errRef) ->
+   * void`, a real error reference directly, no dyn box at all (events.ts
+   * own "one exception"). `errDispatch()`/`hasErrorListeners()` read
+   * ONLY `reg.errBucket` (confirmed by reading both bodies) — a listener
+   * registered through the GENERAL family (`entryAppend`, `thunkSig()`)
+   * lands in `reg.head` instead, under a bucket literally named "error",
+   * structurally invisible to both. `pipelineErrThunk` MUST be declared
+   * against THIS signature, not `thunkSig()`, to be reachable at all. */
+  errThunkSig: () => number;
+  /** events.ts's `(root, clos, thunk, once, prepend) -> void` — the
+   * err-bucket's OWN registration door (mirrors `entryAppend` for the
+   * general family, no `name` param since the bucket IS "error" by
+   * definition, no `orig` param since internal registrations have no
+   * wrapped-listener identity to track — events.ts's own errEntryAppend
+   * header). `pipelineErrThunk`'s own registration (pipelineRegister
+   * OneStage) MUST call THIS, not `entryAppend`, or `errDispatch` never
+   * sees it (this dep's own header has the full measured story). */
+  errEntryAppend: () => number;
 
   /* ── STAGE C dyn-adapter phase: pending-check hardening ────────────── */
 
@@ -885,6 +1026,41 @@ export interface StreamDeps {
    * separately via d13b/d13c — the sibling rule's own lesson: don't
    * assume symmetry). */
   reportUncaught: () => number;
+
+  /* ── STAGE D P2 additions: pipeline()'s FIN_KIND_DYN final callback ── */
+
+  /** dyn.ts's `(fn: dyn, args: dynArr, name: str) -> dyn` call machinery
+   * — the SAME path `emitFnEvalCall`'s bare `f(...)` form and the
+   * `callFn` jsOp both dispatch through. Needed for `firePipelineFinal`'s
+   * DYN branch: 1814's `wrap(fn)` helper returns a value the frontend
+   * cannot pin to a static func type, so `pipeline`'s lowering routes
+   * through `stream.pipelineDyn` and the final callback has to be called
+   * THIS way rather than through a typed thunk. A pending exception left
+   * behind (the callee itself throwing) is NOT checked here — the SAME
+   * "caller already checks" contract `jsonParse` documents above:
+   * `firePipelineFinal` only ever runs via `dispatchPipelineFinal`,
+   * itself always reached through `enqueueRaw()`, so nexttick.ts's own
+   * drain loop checks `excKind()` right after this function returns. */
+  callFn: () => number;
+  /** dyn.ts's `(e: errRef nullable) -> dyn` — boxes a real Error value
+   * into the SAME dyn OBJ box `String(e)`/JSON.stringify would see
+   * (S021's enumerable-name/message/code shape), for the DYN callback's
+   * first argument. Live-measured (`node -e ...pipeline(...)`, both the
+   * success and mid-stream-error shapes): Node calls the pipeline
+   * callback with TWO arguments always — `(err, val)` — and `val` is
+   * observed `undefined` in every shape this tier's corpus exercises
+   * (including an async-generator final stage that itself returns a
+   * value), so the DYN dispatch's second element is a fixed
+   * `undefinedDynGlobal`, never threaded from anywhere. */
+  fromError: () => number;
+  /** dyn.ts's `(d: dyn) -> errRef nullable` — the REVERSE of `fromError`,
+   * for pipeline's own internal 'error' listener thunk: `errDispatch()`'s
+   * emit path boxes the stage's real RS_ERROR through `fromError()`
+   * before any registered thunk sees it (dyn.ts's own header — every
+   * real errRef crossing into dyn is minted through that ONE box), so
+   * unboxing back through the SAME cache scan recovers the identical
+   * instance `pipelineFinishImpl` needs (an errRef, not a dyn box). */
+  toError: () => number;
 }
 
 // $bytes's field indices (typedarrays.ts's own private layout, mirrored
@@ -912,6 +1088,12 @@ export class StreamBuilder {
   private voidClosFnField: number | null = null;
   private pipeClosTField: number | null = null;
   private tickQueue: { head: number; tail: number } | null = null;
+  private pipelineCtxTField: number | null = null;
+  private pipelineStagesArrTField: number | null = null;
+  private pipelineTickTField: number | null = null;
+  private pipelineTickQueue: { head: number; tail: number } | null = null;
+  private writeCompletionTField: number | null = null;
+  private writeCompletionQueueField: { head: number; tail: number } | null = null;
 
   constructor(
     private readonly mb: ModuleBuilder,
@@ -1122,6 +1304,7 @@ export class StreamBuilder {
       { storage: I32, mutable: true }, // WS_DUPLEX_SHAPED
       { storage: I32, mutable: true }, // RS_SIDES
       { storage: this.finEntryRef(), mutable: true }, // FIN_HEAD
+      { storage: I32, mutable: true }, // WS_SYNC_ERRORED
     ]);
     return this.stateTField;
   }
@@ -1162,15 +1345,175 @@ export class StreamBuilder {
     const thunkRef: ValType = { kind: "ref", nullable: true, typeIndex: this.destroyThunkSig() };
     this.finEntryTField = this.mb.selfStructType("%w.rs.finEntry", (self) => [
       { storage: { kind: "ref", nullable: true, typeIndex: self }, mutable: true }, // FE_NEXT
-      { storage: I32, mutable: false }, // FE_KIND — FIN_KIND_CB/DYN/PROMISE
-      { storage: EQ_REF, mutable: false }, // FE_CLOS — closure (typed or dyn) OR promise ref, per KIND
+      { storage: I32, mutable: false }, // FE_KIND — FIN_KIND_CB/DYN/PROMISE/PIPELINE
+      { storage: EQ_REF, mutable: false }, // FE_CLOS — closure (typed or dyn), promise ref, or pipeline ctx, per KIND
       { storage: thunkRef, mutable: false }, // FE_THUNK — only used for FIN_KIND_CB
+      { storage: I32, mutable: false }, // FE_ROLE — only used for FIN_KIND_PIPELINE (FIN_SIDE_R/W/RW)
     ]);
     return this.finEntryTField;
   }
 
   private finEntryRef(): ValType {
     return { kind: "ref", nullable: true, typeIndex: this.finEntryT() };
+  }
+
+  /** STAGE D P2 `$w.rs.pipelineStages` — a fixed-length GC array of stage
+   * roots, sized N at construction (`array.new_fixed`, N always a
+   * compile-time literal per lower-stream.ts's own `f64Lit(streams.
+   * length, loc)` convention — no runtime-variable sizing needed).
+   * Immutable elements: the stage list never changes after `pipeline()`
+   * itself returns. PUBLIC (not `private`, unlike this file's other type
+   * getters): emitter.ts's own pipeline dispatch case builds this array
+   * ITSELF, one raw `array.new_fixed` after walking each stage argument
+   * expression inline (the SAME reason `dynArrBufType`/`dynArrStructType`
+   * flow the OPPOSITE direction, through `StreamDeps` — here emitter.ts
+   * is the one doing the low-level Code emission, not this file). */
+  pipelineStagesArrT(): number {
+    if (this.pipelineStagesArrTField !== null) return this.pipelineStagesArrTField;
+    this.pipelineStagesArrTField = this.mb.arrayType(this.deps.rootRef(), false);
+    return this.pipelineStagesArrTField;
+  }
+
+  private pipelineStagesArrRef(): ValType {
+    return { kind: "ref", nullable: true, typeIndex: this.pipelineStagesArrT() };
+  }
+
+  /** STAGE D P2 `$w.rs.pipelineCtx` — one per `pipeline()`/`pipelineDyn`/
+   * `sp.pipeline` call (PCTX_* field indices, above, have the full
+   * mechanism story). PUBLIC for the same reason `pipelineStagesArrT` is:
+   * emitter.ts's dispatch case `structNew`s this directly, pushing all 9
+   * fields itself in order (N, CLOSED_COUNT=0, ERRORSET=0,
+   * ERROR_IS_PLACEHOLDER=0, ERROR=null, FINAL_KIND, FINAL_CLOS,
+   * FINAL_THUNK, STAGES) — the three FINAL_* fields differ per call
+   * shape (stream.pipeline/pipelineDyn/sp.pipeline), which only the
+   * dispatch case itself, not a shared builder here, has the context to
+   * assemble. */
+  pipelineCtxT(): number {
+    if (this.pipelineCtxTField !== null) return this.pipelineCtxTField;
+    // Resolve dependent types first — selfStructType/structType's own
+    // contract (finEntryT's own header, above).
+    const thunkRef: ValType = { kind: "ref", nullable: true, typeIndex: this.destroyThunkSig() };
+    const stagesRef = this.pipelineStagesArrRef();
+    this.pipelineCtxTField = this.mb.structType([
+      { storage: I32, mutable: false }, // PCTX_N
+      { storage: I32, mutable: true }, // PCTX_CLOSED_COUNT
+      { storage: I32, mutable: true }, // PCTX_ERRORSET
+      { storage: I32, mutable: true }, // PCTX_ERROR_IS_PLACEHOLDER
+      { storage: this.deps.errRef(), mutable: true }, // PCTX_ERROR
+      { storage: I32, mutable: false }, // PCTX_FINAL_KIND
+      { storage: EQ_REF, mutable: false }, // PCTX_FINAL_CLOS
+      { storage: thunkRef, mutable: false }, // PCTX_FINAL_THUNK
+      { storage: stagesRef, mutable: false }, // PCTX_STAGES
+    ]);
+    return this.pipelineCtxTField;
+  }
+
+  /** PUBLIC — emitter.ts's dispatch case needs this ValType both to
+   * declare its own scratch local for the freshly-built ctx and to know
+   * `destroyThunkSig()`'s companion thunk-ref shape for PCTX_FINAL_THUNK
+   * (the CB path's `finThunkFor`-built adapter). */
+  pipelineCtxRef(): ValType {
+    return { kind: "ref", nullable: true, typeIndex: this.pipelineCtxT() };
+  }
+
+  /* ── pipeline's own private final-callback FIFO (STAGE D P2) ────────── */
+
+  private pipelineTickT(): number {
+    if (this.pipelineTickTField !== null) return this.pipelineTickTField;
+    const ctxRef = this.pipelineCtxRef();
+    this.pipelineTickTField = this.mb.selfStructType("%w.rs.pipelineTick", (self) => [
+      { storage: ctxRef, mutable: false }, // PT_CTX
+      { storage: { kind: "ref", nullable: true, typeIndex: self }, mutable: true }, // PT_NEXT
+    ]);
+    return this.pipelineTickTField;
+  }
+
+  private pipelineTickRef(): ValType {
+    return { kind: "ref", nullable: true, typeIndex: this.pipelineTickT() };
+  }
+
+  private pipelineQ(): { head: number; tail: number } {
+    if (this.pipelineTickQueue === null) {
+      const t = this.pipelineTickRef();
+      const init = (w: ByteWriter): void => {
+        w.u8(0xd0); // ref.null $w.rs.pipelineTick
+        w.sleb(this.pipelineTickT());
+      };
+      this.pipelineTickQueue = { head: this.mb.addGlobal(t, true, init), tail: this.mb.addGlobal(t, true, init) };
+    }
+    return this.pipelineTickQueue;
+  }
+
+  /** `(ctx) -> void` — schedules ctx's final callback ONE tick from now
+   * (probe12's own extra hop), via the SAME `enqueueRaw()`/nexttick.ts
+   * seam `scheduleTick()` uses, so it interleaves correctly against
+   * user nextTicks and every OTHER deferred stream tick. */
+  private schedulePipelineFinal(): number {
+    return this.cachedRecursive(
+      "schedulePipelineFinal",
+      () => this.mb.declareFunc(this.mb.funcType([this.pipelineCtxRef()], []), "%w.rs.schedulePipelineFinal"),
+      (idx) => {
+        const q = this.pipelineQ();
+        const c = new Code();
+        const CTX = 0, N = 1;
+        c.localGet(CTX);
+        c.refNull(this.pipelineTickT());
+        c.structNew(this.pipelineTickT());
+        c.localSet(N);
+        c.globalGet(q.tail);
+        c.refIsNull();
+        c.ifVoid();
+        c.localGet(N);
+        c.globalSet(q.head);
+        c.else_();
+        c.globalGet(q.tail);
+        c.localGet(N);
+        c.structSet(this.pipelineTickT(), PT_NEXT);
+        c.end();
+        c.localGet(N);
+        c.globalSet(q.tail);
+        this.mb.declareFuncRef(this.dispatchPipelineFinal());
+        c.refFunc(this.dispatchPipelineFinal());
+        c.call(this.deps.enqueueRaw());
+        this.mb.setBody(idx, [this.pipelineTickRef()], c.bytes());
+      },
+    );
+  }
+
+  /** `() -> ()` — the raw marker's target: pops ONE ctx off the queue
+   * and fires its final callback. Only one kind of work item ever rides
+   * this queue, so there is no op-code dispatch at all (PT_NEXT's own
+   * header explains why this queue is not shared with $rTick). */
+  private dispatchPipelineFinal(): number {
+    return this.cachedRecursive(
+      "dispatchPipelineFinal",
+      () => this.mb.declareFunc(this.deps.rawFnType(), "%w.rs.dispatchPipelineFinal"),
+      (idx) => {
+        const q = this.pipelineQ();
+        const c = new Code();
+        const N = 0, CTX = 1;
+        c.globalGet(q.head);
+        c.localSet(N);
+        c.localGet(N);
+        c.structGet(this.pipelineTickT(), PT_NEXT);
+        c.globalSet(q.head);
+        c.globalGet(q.head);
+        c.refIsNull();
+        c.ifVoid();
+        c.refNull(this.pipelineTickT());
+        c.globalSet(q.tail);
+        c.end();
+        c.localGet(N);
+        c.refNull(this.pipelineTickT());
+        c.structSet(this.pipelineTickT(), PT_NEXT);
+        c.localGet(N);
+        c.structGet(this.pipelineTickT(), PT_CTX);
+        c.localSet(CTX);
+        c.localGet(CTX);
+        c.call(this.firePipelineFinal());
+        this.mb.setBody(idx, [this.pipelineTickRef(), this.pipelineCtxRef()], c.bytes());
+      },
+    );
   }
 
   /* ── state lookup ──────────────────────────────────────────────────── */
@@ -1251,6 +1594,7 @@ export class StreamBuilder {
       c.i32Const(0); // ws_duplex_shaped — default false (overwritten by construction, duplex/transform/passthrough only)
       c.i32Const(FIN_SIDE_UNSET); // rs_sides — the sentinel (FIN_SIDE_UNSET's own header): every real construction path MUST overwrite this explicitly; finComputeErr refuses by name if it ever observes UNSET
       c.refNull(this.finEntryT()); // fin_head — the finished()/eos() watcher list, empty at construction
+      c.i32Const(0); // ws_sync_errored — FIX ROUND (P2-1): reset false at construction; write()'s own entry resets it again per-call (its own header)
       c.structNew(this.stateT());
       c.localSet(N);
       c.localGet(R);
@@ -4832,6 +5176,9 @@ export class StreamBuilder {
   private buildOpClose(idx: number): void {
       const c = new Code();
       const ROOT = 0, ARGS = 1, ST = 2;
+      c.localGet(ROOT);
+      c.call(this.stateEnsure());
+      c.localSet(ST);
       this.emitNoArgFrom(c, ROOT, "close", ARGS);
       // FIX ROUND (gate finding 6): mark close-emitted, then settle any
       // armed consumer via settleConsumerCore — factored out of this
@@ -5264,9 +5611,24 @@ export class StreamBuilder {
       c.localGet(CUR);
       c.structGet(this.finEntryT(), FE_NEXT);
       c.localSet(NEXT);
+      // STAGE D P2: dispatch by KIND before firing — FIN_KIND_PIPELINE
+      // entries go through firePipelineStageWatcher (role-based, real-
+      // vs-placeholder-aware, distinct from fireOneFin's own RS_SIDES-
+      // based CB/PROMISE computation) rather than fireOneFin itself,
+      // keeping fireOneFin's own already-gate-approved P1 body untouched.
+      c.localGet(CUR);
+      c.structGet(this.finEntryT(), FE_KIND);
+      c.i32Const(FIN_KIND_PIPELINE);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(ROOT);
+      c.localGet(CUR);
+      c.call(this.firePipelineStageWatcher());
+      c.else_();
       c.localGet(ROOT);
       c.localGet(CUR);
       c.call(this.fireOneFin());
+      c.end();
       c.localGet(NEXT);
       c.localSet(CUR);
       c.br(0);
@@ -5293,6 +5655,569 @@ export class StreamBuilder {
       this.mb.setBody(idx, [], c.bytes());
       return idx;
     });
+  }
+
+  /* ── pipeline() (STAGE D P2, board #77) ──────────────────────────────
+   *
+   * Byte transfer reuses pipeCore() pairwise, untouched — pipeCore is
+   * PURE data/drain/end wiring with no eos()/premature-close logic of
+   * its own (confirmed by reading its body before this section was
+   * written). Everything below is NEW: the destroy-cascade + finishCount
+   * bookkeeping Node's own pipeline.js layers ON TOP of pipe()+eos(),
+   * via a `destroyer(stream, reading, writing)`-style watcher — ONE per
+   * STAGE (not one per adjacent pipe() pair) — that this file builds as
+   * a NEW FIN_KIND_PIPELINE entry on each stage's OWN existing FIN_HEAD,
+   * reusing P1's list/detach/fire/OP_FIN machinery verbatim. */
+
+  /** `(ctx, err, isPlaceholder: i32) -> void` — Node's own `finishImpl`,
+   * ported (rD-node §1b, re-verified against probe09 for the
+   * supersession rule): overwrites the captured error when NOTHING is
+   * captured yet, OR when whatever IS captured is itself a placeholder
+   * (premature-close synthesized by a stage's own destroyer watcher, NOT
+   * a real 'error' event) — regardless of whether the NEW error is
+   * itself real or a placeholder; a captured REAL error is never
+   * overwritten by anything. Then, UNCONDITIONALLY (every call, not just
+   * the one that just overwrote), destroys every stage with whatever
+   * ctx.ERROR now holds — this mirrors Node's own "drain the [already-
+   * emptied-or-not] destroys queue on every call where an error is
+   * captured" behavior exactly, and relies entirely on destroyErrCore's
+   * OWN existing RS_DESTROYED idempotency guard to make a repeat or
+   * self-destroy call a free no-op — the SAME guard that already makes a
+   * naturally-finished stage's own subsequent destroy() call harmless.
+   * This is what reproduces 1814's own asserted teardown order
+   * (t-close,s-err,s-close,w-err,w-close) with ZERO ordering logic of
+   * its own: t's own destroy() (from its own _transform callback error)
+   * already has [OP_ERROR(t), OP_CLOSE(t)] queued on the SHARED tick
+   * FIFO before this cascade even runs (this function is called
+   * SYNCHRONOUSLY from t's own 'error' event handler, itself firing
+   * from inside t's own OP_ERROR tick); the cascade's destroy(s) and
+   * destroy(w) calls append FRESH [OP_ERROR, OP_CLOSE] pairs onto the
+   * SAME queue, after t's already-pending OP_CLOSE — the observed order
+   * is a race that falls out of the existing FIFO, not a rule, and must
+   * not be restated as one. */
+  private pipelineFinishImpl(): number {
+    return this.cachedRecursive(
+      "pipelineFinishImpl",
+      () => this.mb.declareFunc(this.mb.funcType([this.pipelineCtxRef(), this.deps.errRef(), I32], []), "%w.rs.pipelineFinishImpl"),
+      (idx) => {
+        const c = new Code();
+        const CTX = 0, ERR = 1, ISPLACEHOLDER = 2, I = 3, N = 4;
+        c.localGet(CTX);
+        c.structGet(this.pipelineCtxT(), PCTX_ERRORSET);
+        c.i32Eqz();
+        c.localGet(CTX);
+        c.structGet(this.pipelineCtxT(), PCTX_ERROR_IS_PLACEHOLDER);
+        c.i32Or();
+        c.ifVoid();
+        c.localGet(CTX);
+        c.localGet(ERR);
+        c.structSet(this.pipelineCtxT(), PCTX_ERROR);
+        c.localGet(CTX);
+        c.localGet(ISPLACEHOLDER);
+        c.structSet(this.pipelineCtxT(), PCTX_ERROR_IS_PLACEHOLDER);
+        c.localGet(CTX);
+        c.i32Const(1);
+        c.structSet(this.pipelineCtxT(), PCTX_ERRORSET);
+        c.end();
+        // Unconditional cascade, construction order, using whatever
+        // ctx.ERROR now holds (this call's own error, or an earlier
+        // real one this call did NOT overwrite).
+        c.i32Const(0);
+        c.localSet(I);
+        c.localGet(CTX);
+        c.structGet(this.pipelineCtxT(), PCTX_N);
+        c.localSet(N);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(N);
+        c.i32GeS();
+        c.brIf(1);
+        c.localGet(CTX);
+        c.structGet(this.pipelineCtxT(), PCTX_STAGES);
+        c.localGet(I);
+        c.arrayGet(this.pipelineStagesArrT());
+        c.localGet(CTX);
+        c.structGet(this.pipelineCtxT(), PCTX_ERROR);
+        c.call(this.destroyErrCore());
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        this.mb.setBody(idx, [I32, I32], c.bytes());
+      },
+    );
+  }
+
+  /** `(root, entry) -> void` — a pipeline stage's OWN destroyer-style
+   * watcher fire (FIN_KIND_PIPELINE, dispatched from fireFinListCore's
+   * own walk, NOT fireOneFin — see fireFinListCore's own comment on
+   * why). Computes real-vs-placeholder-vs-clean using the SAME two-check
+   * shape `finComputeErr` already established for CB/PROMISE (real
+   * RS_ERROR wins; else a role-based premature-close synthesis), but
+   * role-based (FE_ROLE, this stage's POSITION in ITS pipeline) rather
+   * than RS_SIDES-based (this stream's OWN construction-time kind) —
+   * pipeline's role assignment has no call-site-static-type axis at all,
+   * so there is nothing here analogous to RS_SIDES's own upcast
+   * divergence risk. GATE MOD 1: a non-clean status routes through the
+   * SAME `pipelineFinishImpl` the raw 'error' listener uses (captures
+   * the error, runs the cascade) — a stage destroyed prematurely mid-
+   * pipeline (dst.destroy(), every construct in-tier once this lands)
+   * must FAIL the pipeline, not just silently count as closed; a clean
+   * status only counts. Every fire (clean or not) increments
+   * CLOSED_COUNT and, once it reaches N, schedules the final callback
+   * (the extra hop, probe12). */
+  private firePipelineStageWatcher(): number {
+    return this.cachedRecursive(
+      "firePipelineStageWatcher",
+      () => this.mb.declareFunc(this.mb.funcType([this.deps.rootRef(), this.finEntryRef()], []), "%w.rs.firePipelineStageWatcher"),
+      (idx) => {
+        const c = new Code();
+        const ROOT = 0, ENTRY = 1, ST = 2, CTX = 3, ROLE = 4;
+        c.localGet(ROOT);
+        c.call(this.stateEnsure());
+        c.localSet(ST);
+        c.localGet(ENTRY);
+        c.structGet(this.finEntryT(), FE_CLOS);
+        c.refCast(this.pipelineCtxT());
+        c.localSet(CTX);
+        c.localGet(ENTRY);
+        c.structGet(this.finEntryT(), FE_ROLE);
+        c.localSet(ROLE);
+        c.localGet(ST);
+        c.structGet(this.stateT(), RS_ERROR);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        // Real error: this stage's OWN RS_ERROR is set.
+        c.localGet(CTX);
+        c.localGet(ST);
+        c.structGet(this.stateT(), RS_ERROR);
+        c.i32Const(0); // isPlaceholder = false
+        c.call(this.pipelineFinishImpl());
+        c.else_();
+        // Role-based premature-close synthesis — finComputeErr's own
+        // two conditions, ported for FE_ROLE instead of RS_SIDES.
+        c.localGet(ROLE);
+        c.i32Const(FIN_SIDE_W);
+        c.i32Ne();
+        c.localGet(ST);
+        c.structGet(this.stateT(), RS_END_EMITTED);
+        c.i32Eqz();
+        c.i32And();
+        c.localGet(ROLE);
+        c.i32Const(FIN_SIDE_R);
+        c.i32Ne();
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_FINISHED);
+        c.i32Eqz();
+        c.i32And();
+        c.i32Or();
+        c.ifVoid();
+        c.localGet(CTX);
+        this.deps.buildErrorLit(c, "%Error", "Error", (cc) => this.deps.lit(cc, "Premature close"), "ERR_STREAM_PREMATURE_CLOSE");
+        c.i32Const(1); // isPlaceholder = true
+        c.call(this.pipelineFinishImpl());
+        c.end();
+        c.end();
+        c.localGet(CTX);
+        c.localGet(CTX);
+        c.structGet(this.pipelineCtxT(), PCTX_CLOSED_COUNT);
+        c.i32Const(1);
+        c.i32Add();
+        c.structSet(this.pipelineCtxT(), PCTX_CLOSED_COUNT);
+        c.localGet(CTX);
+        c.structGet(this.pipelineCtxT(), PCTX_CLOSED_COUNT);
+        c.localGet(CTX);
+        c.structGet(this.pipelineCtxT(), PCTX_N);
+        c.i32Eq();
+        c.ifVoid();
+        c.localGet(CTX);
+        c.call(this.schedulePipelineFinal());
+        c.end();
+        this.mb.setBody(idx, [this.stateRef(), this.pipelineCtxRef(), I32], c.bytes());
+      },
+    );
+  }
+
+  /** `(ctx) -> void` — the terminal dispatcher: fires ONCE, when
+   * PCTX_CLOSED_COUNT reaches PCTX_N (scheduled by
+   * schedulePipelineFinal/dispatchPipelineFinal's own extra-hop tick
+   * queue, probe12's own extra hop). Dispatches on PCTX_FINAL_KIND
+   * exactly like fireOneFin dispatches on FE_KIND, but `this` is fixed
+   * to the LAST stage (STAGES[N-1] — lower-stream.ts's own `thisType =
+   * last.type` contract) rather than ROOT: pipeline()'s callback/promise
+   * resolves against the destination stream, not any one watcher's own
+   * stream.
+   *
+   * FIN_KIND_CB: PCTX_FINAL_THUNK is a `finThunkFor(...)`-built adapter,
+   * the SAME destroyThunkSig() ABI fireOneFin's own CB branch calls
+   * through — finThunkFor is reused VERBATIM (lower-stream.ts's own
+   * contract: pipeline's callback tuple is `[errorOrNull(L)]`, IDENTICAL
+   * to finished()'s own shape, so no second thunk-building function was
+   * needed).
+   *
+   * FIN_KIND_DYN: 1814's own `wrap(fn)` shape — the frontend cannot pin
+   * the callback to a static func type, so PCTX_FINAL_CLOS holds a raw
+   * dyn FUNC value instead of a closure struct, called through
+   * `dyn.callFn()` with a 2-element args array. Live-measured (this
+   * file's `fromError` dep doc, above): Node always calls the pipeline
+   * callback with TWO arguments, `(err, val)`, and `val` is undefined in
+   * every shape this tier's corpus reaches — so the second element is a
+   * fixed `undefinedDynGlobal`, never threaded from anywhere else. A
+   * pending exception the callee itself raises is NOT checked here — the
+   * same "caller already checks" contract `jsonParse` documents: this
+   * function only ever runs via `dispatchPipelineFinal`, itself always
+   * reached through `enqueueRaw()`, so nexttick.ts's own drain loop
+   * checks `excKind()` right after this returns (fireOneFin's own CB
+   * branch leans on the identical contract for its own `callRef`).
+   *
+   * FIN_KIND_PROMISE (sp.pipeline): settles PCTX_FINAL_CLOS (a promRef)
+   * directly — fireOneFin's own PROMISE branch, ported verbatim (a void
+   * success resolves with the same fixed f64/0-kind payload, never read
+   * back). */
+  private firePipelineFinal(): number {
+    return this.cachedRecursive(
+      "firePipelineFinal",
+      () => this.mb.declareFunc(this.mb.funcType([this.pipelineCtxRef()], []), "%w.rs.firePipelineFinal"),
+      (idx) => {
+        const c = new Code();
+        const CTX = 0, ERR = 1, LAST = 2, P = 3, FN = 4, ARGS = 5;
+        c.localGet(CTX);
+        c.structGet(this.pipelineCtxT(), PCTX_ERROR);
+        c.localSet(ERR);
+        c.localGet(CTX);
+        c.structGet(this.pipelineCtxT(), PCTX_STAGES);
+        c.localGet(CTX);
+        c.structGet(this.pipelineCtxT(), PCTX_N);
+        c.i32Const(1);
+        c.i32Sub();
+        c.arrayGet(this.pipelineStagesArrT());
+        c.localSet(LAST);
+
+        c.localGet(CTX);
+        c.structGet(this.pipelineCtxT(), PCTX_FINAL_KIND);
+        c.i32Const(FIN_KIND_CB);
+        c.i32Eq();
+        c.ifVoid();
+        c.localGet(CTX);
+        c.structGet(this.pipelineCtxT(), PCTX_FINAL_CLOS);
+        c.localGet(LAST);
+        c.localGet(ERR);
+        c.localGet(CTX);
+        c.structGet(this.pipelineCtxT(), PCTX_FINAL_THUNK);
+        c.callRef(this.destroyThunkSig());
+        c.else_();
+        c.localGet(CTX);
+        c.structGet(this.pipelineCtxT(), PCTX_FINAL_KIND);
+        c.i32Const(FIN_KIND_DYN);
+        c.i32Eq();
+        c.ifVoid();
+        c.localGet(CTX);
+        c.structGet(this.pipelineCtxT(), PCTX_FINAL_CLOS);
+        c.refCast(this.deps.dynT());
+        c.localSet(FN);
+        c.i32Const(2); // the dyn-vec's own `len` field, ahead of `buf` (emitDataFrom's own precedent)
+        c.localGet(ERR);
+        c.refIsNull();
+        c.ifResult(this.deps.dynRef());
+        c.globalGet(this.deps.undefinedDynGlobal());
+        c.else_();
+        c.localGet(ERR);
+        c.call(this.deps.fromError());
+        c.end();
+        c.globalGet(this.deps.undefinedDynGlobal());
+        c.arrayNewFixed(this.deps.dynArrBufType(), 2);
+        c.structNew(this.deps.dynArrStructType());
+        c.localSet(ARGS);
+        c.localGet(FN);
+        c.localGet(ARGS);
+        this.deps.lit(c, "value");
+        c.call(this.deps.callFn());
+        c.drop();
+        c.else_();
+        // FIN_KIND_PROMISE (sp.pipeline) — fireOneFin's own promise-
+        // settle shape, ported verbatim.
+        c.localGet(CTX);
+        c.structGet(this.pipelineCtxT(), PCTX_FINAL_CLOS);
+        c.refCast(this.promType());
+        c.localSet(P);
+        c.localGet(ERR);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(P);
+        c.i32Const(this.deps.excTag.obj);
+        c.f64Const(0);
+        c.localGet(ERR);
+        this.deps.errPreOf(c, (cc) => cc.localGet(ERR));
+        c.i32Const(2);
+        c.call(this.deps.promSettle());
+        c.else_();
+        c.localGet(P);
+        c.i32Const(this.deps.excTag.f64);
+        c.f64Const(0);
+        c.refNull(this.errType());
+        c.i32Const(-1);
+        c.i32Const(1);
+        c.call(this.deps.promSettle());
+        c.end();
+        c.end();
+        c.end();
+        this.mb.setBody(
+          idx,
+          [this.deps.errRef(), this.deps.rootRef(), this.deps.promRef(), this.deps.dynRef(), this.deps.dynArrRef()],
+          c.bytes(),
+        );
+      },
+    );
+  }
+
+  /** pipeline()'s own internal 'error' listener thunk, registered on
+   * EVERY stage — Node's own pipeline() registers a real 'error'
+   * listener on each stream as a side effect of being called (`opError`'s
+   * own STAGE D note: this is why pipeline "owns" the error and no
+   * unhandled-'error' crash occurs — 1814's own header comment). Calls
+   * `pipelineFinishImpl` SYNCHRONOUSLY — from inside the erroring
+   * stage's own OP_ERROR tick, which is what reproduces Node's own
+   * teardown order as an emergent FIFO property (`pipelineFinishImpl`'s
+   * own header explains why, in detail, and it must not be restated as
+   * a rule here either).
+   *
+   * LAYER 6 (P2-1 fix round, bounded diagnosis, err-bucket hypothesis
+   * CONFIRMED by reading events.ts): this thunk MUST be declared against
+   * `errThunkSig()` (`(clos: eq, err: errRef) -> void`, a real error
+   * reference directly — no dyn box, no `toError()` unboxing needed at
+   * all) and registered via `errEntryAppend`, NOT the general family
+   * (`thunkSig()`/`entryAppend`) this used before. `errDispatch()`/
+   * `hasErrorListeners()` read ONLY `reg.errBucket` (confirmed reading
+   * both bodies) — the general family's own `entryAppend(root, "error",
+   * ...)` creates a bucket named "error" inside `reg.head` instead, a
+   * DIFFERENT storage, structurally invisible to both. That was the
+   * actual root cause of probe08's residual (measured via direct
+   * instrumentation, prior pass of this fix round): this thunk was
+   * confirmed REGISTERED on every stage but never actually INVOKED when
+   * `errDispatch()` ran for the erroring stage, so the cascade this
+   * thunk is supposed to trigger only ever happened LATER in practice,
+   * via `firePipelineStageWatcher`'s own FIN_HEAD-list dispatch from
+   * `buildOpClose`'s `fireFinListCore()` call — after 'close' already
+   * emitted, exactly probe08's observed w-close-before-t-_destroy
+   * divergence. */
+  private pipelineErrThunk(): number {
+    return this.cached("pipelineErrThunk", () => {
+      const idx = this.mb.declareFunc(this.deps.errThunkSig(), "%w.rs.pipelineErrThunk");
+      const c = new Code();
+      const CLOS = 0, ERR = 1, CTX = 2;
+      c.localGet(CLOS);
+      c.refCast(this.pipelineCtxT());
+      c.localSet(CTX);
+      c.localGet(CTX);
+      c.localGet(ERR);
+      c.i32Const(0); // isPlaceholder = false
+      c.call(this.pipelineFinishImpl());
+      this.mb.setBody(idx, [this.pipelineCtxRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  /** `(root, ctx, role: i32) -> void` — registers ONE stage's own
+   * FIN_KIND_PIPELINE watcher (`finRegisterCbCore`'s own already-closed
+   * fast path + emitClose:false trap, ported: pipeline's watchers ride
+   * the SAME FIN_HEAD list finished()/eos() use, so the SAME "this
+   * mechanism can only ever fire from opClose" constraint applies — no
+   * new failure class, the existing one) AND the raw 'error' listener
+   * (`pipelineErrThunk`, above). LAYER 6: registration goes through
+   * `errEntryAppend` — the err-bucket's OWN door — NOT the general
+   * `entryAppend` this used before (`pipelineErrThunk`'s own header has
+   * the full measured story: the general family's bucket, even one
+   * literally named "error", is invisible to `errDispatch`). */
+  private pipelineRegisterOneStage(): number {
+    return this.cachedRecursive(
+      "pipelineRegisterOneStage",
+      () => this.mb.declareFunc(this.mb.funcType([this.deps.rootRef(), this.pipelineCtxRef(), I32], []), "%w.rs.pipelineRegisterOneStage"),
+      (idx) => {
+        this.mb.declareFuncRef(this.pipelineErrThunk());
+        const c = new Code();
+        const ROOT = 0, CTX = 1, ROLE = 2, ST = 3, ENTRY = 4;
+        c.localGet(ROOT);
+        c.call(this.stateEnsure());
+        c.localSet(ST);
+        c.localGet(ST);
+        c.structGet(this.stateT(), RS_EMIT_CLOSE);
+        c.ifVoid();
+        c.localGet(ST);
+        c.structGet(this.stateT(), FIN_HEAD);
+        c.i32Const(FIN_KIND_PIPELINE);
+        c.localGet(CTX);
+        c.refNull(this.destroyThunkSig()); // FE_THUNK — unused for FIN_KIND_PIPELINE
+        c.localGet(ROLE);
+        c.structNew(this.finEntryT());
+        c.localSet(ENTRY);
+        c.localGet(ST);
+        c.localGet(ENTRY);
+        c.structSet(this.stateT(), FIN_HEAD);
+        c.localGet(ST);
+        c.structGet(this.stateT(), RS_CLOSE_EMITTED);
+        c.ifVoid();
+        c.localGet(ROOT);
+        c.i32Const(OP_FIN);
+        c.call(this.scheduleTick());
+        c.end();
+        c.else_();
+        this.deps.setUncaughtError(c, (cc) => {
+          this.deps.buildErrorLit(
+            cc,
+            "%Error",
+            "Error",
+            (ccc) => this.deps.lit(ccc, "pipeline() over a stream constructed with emitClose:false is not supported yet"),
+            null,
+          );
+        });
+        c.end();
+        // The raw 'error' listener — errEntryAppend's own (root, clos,
+        // thunk, once, prepend) ABI: no `name` (the bucket IS "error" by
+        // definition), no `orig` (an internal registration has no
+        // wrapped-listener identity to track) — errEntryAppend's own
+        // header in events.ts.
+        c.localGet(ROOT);
+        c.localGet(CTX);
+        c.refFunc(this.pipelineErrThunk());
+        c.i32Const(0); // once
+        c.i32Const(0); // prepend
+        c.call(this.deps.errEntryAppend());
+        this.mb.setBody(idx, [this.stateRef(), this.finEntryRef()], c.bytes());
+      },
+    );
+  }
+
+  /** `(ctx) -> void` — pipeline()'s own top-level registration: pairwise
+   * `pipeCore()` byte-transfer wiring (untouched machinery, `end: true`
+   * always — Node's own pipeline.js default for every adjacent pair,
+   * this section's own header) plus each stage's OWN destroyer-style
+   * watcher and raw 'error' listener (`pipelineRegisterOneStage`).
+   * Role-by-POSITION, live-measured (not assumed): the SOURCE (i=0) is
+   * FIN_SIDE_R, the DESTINATION (i=N-1) is FIN_SIDE_W, and every MIDDLE
+   * stage is FIN_SIDE_RW — confirmed directly against real Node (a
+   * middle Transform stage, destroyed after its OWN read side had ended
+   * but before its OWN write side had finished, DOES report
+   * ERR_STREAM_PREMATURE_CLOSE; an R-only role would not have). N==1 is
+   * unreachable: `stream.pipeline`/`stream.pipelineDyn`/`sp.pipeline`
+   * all refuse below 2/3 arguments respectively at lowering (lower-
+   * stream.ts), so `i===0 && i===N-1` never both hold here.
+   *
+   * Emitter.ts's pipeline dispatch case builds the fully-populated ctx
+   * (PCTX_N/STAGES/FINAL_KIND/FINAL_CLOS/FINAL_THUNK) BEFORE calling
+   * this — this function only wires, never allocates.
+   *
+   * S053 (registered, NOT built): Node's real `pipeline()` validates
+   * every PIPE-TO stage BEFORE wiring anything — the error message is
+   * exact and load-bearing ("Cannot pipe TO a closed or destroyed
+   * stream"): every stage except the SOURCE is piped-to by its
+   * predecessor, so a MIDDLE or DESTINATION stage already destroyed at
+   * call time makes `pipeline()` throw SYNCHRONOUSLY (ERR_STREAM_
+   * UNABLE_TO_PIPE), the callback never invoked — but a pre-destroyed
+   * SOURCE is NOT a divergence at all (measured both sides: Node itself
+   * settles that case asynchronously via premature-close, matching this
+   * tier already). This function has no pre-flight check at any
+   * position — every stage wires normally and settles later via the
+   * ordinary premature-close route (S053's own header has the full
+   * three-position measured story). Board item #81 (lead-side) is this
+   * check, scoped correctly by S053's own mechanism note: NOT a blanket
+   * walk over PCTX_STAGES (that would wrongly make source throw too,
+   * creating a new divergence at the one position that's currently
+   * correct) — the check belongs on the DESTINATION side of each
+   * `pipeCore()` pairwise call, i.e. stages `1..N-1`, never stage `0`. */
+  pipelineRegisterCore(): number {
+    return this.cachedRecursive(
+      "pipelineRegisterCore",
+      () => this.mb.declareFunc(this.mb.funcType([this.pipelineCtxRef()], []), "%w.rs.pipelineRegister"),
+      (idx) => {
+        this.mb.declareFuncRef(this.pipelineErrThunk());
+        const c = new Code();
+        const CTX = 0, N = 1, STAGES = 2, I = 3, ROLE = 4;
+        c.localGet(CTX);
+        c.structGet(this.pipelineCtxT(), PCTX_N);
+        c.localSet(N);
+        c.localGet(CTX);
+        c.structGet(this.pipelineCtxT(), PCTX_STAGES);
+        c.localSet(STAGES);
+
+        // Pairwise: pipeCore(STAGES[i], STAGES[i+1], end=true), i in [0, N-2].
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(N);
+        c.i32Const(1);
+        c.i32Sub();
+        c.i32GeS();
+        c.brIf(1);
+        c.localGet(STAGES);
+        c.localGet(I);
+        c.arrayGet(this.pipelineStagesArrT());
+        c.localGet(STAGES);
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.arrayGet(this.pipelineStagesArrT());
+        c.i32Const(1); // end = true, always (pipeline.js's own default)
+        c.call(this.pipeCore());
+        c.drop();
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+
+        // Per-stage: role by position, then FIN_KIND_PIPELINE watcher +
+        // raw 'error' listener.
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(N);
+        c.i32GeS();
+        c.brIf(1);
+        c.localGet(I);
+        c.i32Eqz();
+        c.ifResult(I32);
+        c.i32Const(FIN_SIDE_R);
+        c.else_();
+        c.localGet(I);
+        c.localGet(N);
+        c.i32Const(1);
+        c.i32Sub();
+        c.i32Eq();
+        c.ifResult(I32);
+        c.i32Const(FIN_SIDE_W);
+        c.else_();
+        c.i32Const(FIN_SIDE_RW);
+        c.end();
+        c.end();
+        c.localSet(ROLE);
+        c.localGet(STAGES);
+        c.localGet(I);
+        c.arrayGet(this.pipelineStagesArrT());
+        c.localGet(CTX);
+        c.localGet(ROLE);
+        c.call(this.pipelineRegisterOneStage());
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        this.mb.setBody(idx, [I32, this.pipelineStagesArrRef(), I32, I32], c.bytes());
+      },
+    );
   }
 
   /** finished()'s own return value (the callback form ONLY — Node's real
@@ -5436,6 +6361,7 @@ export class StreamBuilder {
       c.localGet(KIND);
       c.localGet(CLOS);
       c.localGet(THUNK);
+      c.i32Const(0); // FE_ROLE — unused for FIN_KIND_CB
       c.structNew(this.finEntryT());
       c.localSet(ENTRY);
       c.localGet(ST);
@@ -5495,6 +6421,7 @@ export class StreamBuilder {
       c.i32Const(FIN_KIND_PROMISE);
       c.localGet(P);
       c.refNull(this.destroyThunkSig());
+      c.i32Const(0); // FE_ROLE — unused for FIN_KIND_PROMISE
       c.structNew(this.finEntryT());
       c.localSet(ENTRY);
       c.localGet(ST);
@@ -5818,6 +6745,12 @@ export class StreamBuilder {
         c.localGet(ROOT);
         c.call(this.stateEnsure());
         c.localSet(ST);
+        // FIX ROUND (P2-1): reset the transient sync-error bit at every
+        // write() entry — WS_SYNC_ERRORED's own header has the full
+        // "never carried across calls" reset-discipline story.
+        c.localGet(ST);
+        c.i32Const(0);
+        c.structSet(this.stateT(), WS_SYNC_ERRORED);
         // GATE FIX C2 (BLOCKING, lifted verbatim from Node's real
         // internal/streams/_write): "if ((state[kState] & kEnding) !== 0)
         // { err = new ERR_STREAM_WRITE_AFTER_END(); } ... if (err) {
@@ -5943,11 +6876,23 @@ export class StreamBuilder {
         c.structSet(this.stateT(), WS_LENGTH);
         c.localGet(ROOT);
         c.call(this.doWriteCore());
+        // FIX ROUND (P2-1): the return formula gains ONE more term —
+        // WS_SYNC_ERRORED, set by writeDoneLandingCore (possibly just
+        // now, synchronously, inside the doWriteCore() call above) the
+        // instant this write's own callback reported an error, mirroring
+        // Node's real state.errored role in write()'s own return value
+        // (WS_SYNC_ERRORED's own header has the full measured story —
+        // this is the ONLY reader). Every OTHER term is exactly as
+        // before (GATE FIX C3's own hwm-comparison, unchanged).
         c.localGet(ST);
         c.structGet(this.stateT(), WS_LENGTH);
         c.localGet(ST);
         c.structGet(this.stateT(), WS_HWM);
         c.f64Lt();
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_SYNC_ERRORED);
+        c.i32Eqz();
+        c.i32And();
         c.localSet(RETB);
         // GATE FIX C3 (the needDrain BIT half — lifted from Node's real
         // internal/streams/writable.js, `writeOrBuffer`: "if (!ret)
@@ -6059,19 +7004,91 @@ export class StreamBuilder {
     );
   }
 
-  /** `(root, errRef|null) -> void` — the done-closure's landing site
-   * (Node's real `afterWrite`): pops the completed head, subtracts its
-   * length, fires its own per-write callback (if any), routes a real
-   * error to `destroyErrCore` (Node's `errorOrDestroy`), fires 'drain'
-   * once the queue empties past a prior below-hwm write, and either
-   * continues draining the queue or tries to finish. */
-  afterWriteCore(): number {
+  /* ── LAYER 5 (afterWriteCore split, Joe-ruled fix): queue-continuation
+   * vs completion-tail ── MEASURED (node v24.18.1, internal/streams/
+   * writable.js via internalBinding("builtins").natives, `onwrite`):
+   * Node's own per-write completion callback (`state.onwrite`, invoked
+   * the instant `_write`'s cb fires — SYNCHRONOUSLY, unconditionally,
+   * regardless of `state.sync`) does its bookkeeping (`state.length -=
+   * state.writelen`, clear `kWriting`) UNCONDITIONALLY at the top, then
+   * for the SUCCESS case calls `clearBuffer(stream, state)` — which
+   * dispatches the NEXT buffered write, if any — ALSO unconditionally,
+   * BEFORE any sync/defer decision exists in the source at all. Only
+   * THEN does `onwrite` decide whether to defer `afterWrite`/
+   * `afterWriteTick` (drain + the completed write's OWN callback +
+   * `finishMaybe`) via `process.nextTick` — and even then, only when
+   * `sync && needTick`, where (lines 655-656 of the extracted source):
+   *   const needDrain = (state[kState] & kNeedDrain) !== 0 && state.length === 0;
+   *   const needTick = needDrain || (state[kState] & kDestroyed !== 0) || cb !== nop;
+   * (the middle clause is quoted VERBATIM — its own parenthesization
+   * makes `!==` bind before `&`, so it literally tests `state[kState] &
+   * true`, i.e. bit 0 of an unrelated flag word, not "is destroyed" —
+   * almost certainly an unintentional quirk in Node's own source, not
+   * behavior worth replicating bit-for-bit since it depends on Node's
+   * OWN private bit layout I have no way to fault-for-fault reproduce.
+   * Ported here by INTENT instead — RS_DESTROYED, the semantically
+   * obvious reading — flagged as an approximated, not measured, clause;
+   * none of this round's target shapes are destroyed at the point this
+   * decision is made, so the term is inert for every banked/pinned
+   * result, verified by the full battery this layer's own freeze
+   * package cites). For the ERROR case, `onwrite` has NO needTick
+   * refinement at all — `onwriteError` (the whole error path, including
+   * eventual destroy) defers WHOLESALE whenever `sync`, exactly this
+   * file's PRE-EXISTING (unchanged by this layer) WS_SYNC-only gate.
+   *
+   * `writeDoneLandingCore`, below, is what implements this split now:
+   * it calls `afterWriteHeadCore` — the ALWAYS-IMMEDIATE half (pop head,
+   * decrement length, clear WS_WRITING, and for a NON-fresh-error
+   * completion, dispatch the next queued entry via `doWriteCore()`) —
+   * unconditionally, BEFORE making any defer decision at all. Only the
+   * REMAINING tail (this function, `afterWriteCore`, now taking the
+   * ALREADY-POPPED entry's own callback closure as a parameter instead
+   * of re-popping WS_HEAD itself) is what gets deferred, and only per
+   * the needTick-ported condition above (success) or the unchanged
+   * bare-WS_SYNC gate (error).
+   *
+   * THIS IS THE ROOT CAUSE of the gate's remaining probe08 divergence:
+   * this file previously deferred `afterWriteCore` — bookkeeping AND
+   * queue-continuation-dispatch INCLUDED — as one unit whenever WS_SYNC
+   * was true. That kept `WS_WRITING` incorrectly true past the point
+   * Node would already have cleared it, so a SUBSEQUENT synchronous
+   * `write()` call on the SAME stream (arriving before the deferred tick
+   * ran) found it still "writing" and wrongly QUEUED instead of
+   * dispatching immediately — introducing an extra deferred hop that
+   * lost a race it should have won. Nothing here is a new ordering RULE:
+   * the corrected order is what falls out of clearing `WS_WRITING`
+   * (and dispatching the next entry, if the completion wasn't a fresh
+   * error) at the SAME point in the call graph Node does. */
+
+  /** `(root, errRef|null) -> cbClosRef|null` — ALWAYS IMMEDIATE, never
+   * gated on WS_SYNC (this section's own header has the measured
+   * mechanism): pops WS_HEAD, updates WS_TAIL/WS_LENGTH/WS_WRITING, and
+   * — unless this completion is a FRESH error (mirrors `afterWriteCore`'s
+   * OWN F1 fresh-vs-collision test exactly: RS_DESTROYED is read here,
+   * not written, so its value is identical to what F1's later check
+   * would see) — dispatches the next queued entry via `doWriteCore()` if
+   * one exists (Node's `clearBuffer`). Returns the popped entry's own
+   * per-write callback closure so the caller can carry it into whichever
+   * `afterWriteCore` call eventually fires (immediate or, via
+   * `scheduleWriteCompletion`'s own WCT_CB_CLOS field, deferred) — a
+   * captured VALUE, not a shared state field, exactly so a NESTED
+   * completion this function's own `doWriteCore()` call may trigger
+   * (the next entry ALSO completing synchronously) can never clobber
+   * it before the outer completion's own tail reads it back. */
+  private afterWriteHeadCore(): number {
     return this.cachedRecursive(
-      "afterWriteCore",
-      () => this.mb.declareFunc(this.mb.funcType([this.deps.rootRef(), this.deps.errRef()], []), "%w.ws.afterWrite"),
+      "afterWriteHeadCore",
+      () =>
+        this.mb.declareFunc(
+          this.mb.funcType(
+            [this.deps.rootRef(), this.deps.errRef()],
+            [{ kind: "ref", nullable: true, typeIndex: this.deps.voidClos().clos }],
+          ),
+          "%w.ws.afterWriteHead",
+        ),
       (idx) => {
         const c = new Code();
-        const ROOT = 0, ERR = 1, ST = 2, HEAD = 3, CBCLOS = 4, ARGS = 5;
+        const ROOT = 0, ERR = 1, ST = 2, HEAD = 3, CBCLOS = 4, FRESH = 5;
         c.localGet(ROOT);
         c.call(this.stateEnsure());
         c.localSet(ST);
@@ -6080,6 +7097,7 @@ export class StreamBuilder {
         c.localTee(HEAD);
         c.refIsNull();
         c.ifVoid();
+        c.refNull(this.deps.voidClos().clos);
         c.return_(); // defensive: no in-flight request (should not happen for any built path)
         c.end();
         c.localGet(ST);
@@ -6106,6 +7124,72 @@ export class StreamBuilder {
         c.localGet(ST);
         c.i32Const(0);
         c.structSet(this.stateT(), WS_WRITING);
+        c.localGet(HEAD);
+        c.structGet(this.wReqT(), WREQ_CB_CLOS);
+        c.localSet(CBCLOS);
+        // FRESH = (err != null) && (RS_DESTROYED == false) — the SAME
+        // clause afterWriteCore's own F1 branch tests; a fresh error
+        // discards the queue instead of draining it (Node's
+        // onwriteError, not clearBuffer), so this skips the dispatch —
+        // a collision (err != null but already destroyed) falls through
+        // to dispatch exactly like a clean success, matching the
+        // ORIGINAL undivided function's own fall-through shape (the
+        // collision case never returned early there either).
+        c.localGet(ERR);
+        c.refIsNull();
+        c.i32Eqz();
+        c.localGet(ST);
+        c.structGet(this.stateT(), RS_DESTROYED);
+        c.i32Eqz();
+        c.i32And();
+        c.localSet(FRESH);
+        c.localGet(FRESH);
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_HEAD);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(ROOT);
+        c.call(this.doWriteCore());
+        c.end();
+        c.end();
+        c.localGet(CBCLOS);
+        this.mb.setBody(
+          idx,
+          [this.stateRef(), this.wReqRef(), { kind: "ref", nullable: true, typeIndex: this.deps.voidClos().clos }, I32],
+          c.bytes(),
+        );
+      },
+    );
+  }
+
+  /** `(root, errRef|null, cbClosRef|null) -> void` — the done-closure's
+   * landing TAIL (Node's real `afterWrite`/`onwriteError`): fires the
+   * completed entry's own per-write callback (now a parameter — the
+   * bookkeeping that used to pop it here already ran in
+   * `afterWriteHeadCore`), routes a real error to `destroyErrCore`
+   * (Node's `errorOrDestroy`), fires 'drain' once the queue empties past
+   * a prior below-hwm write, and tries to finish. This section's own
+   * header has the full measured mechanism story. */
+  afterWriteCore(): number {
+    return this.cachedRecursive(
+      "afterWriteCore",
+      () =>
+        this.mb.declareFunc(
+          this.mb.funcType(
+            [this.deps.rootRef(), this.deps.errRef(), { kind: "ref", nullable: true, typeIndex: this.deps.voidClos().clos }],
+            [],
+          ),
+          "%w.ws.afterWrite",
+        ),
+      (idx) => {
+        const c = new Code();
+        const ROOT = 0, ERR = 1, CBCLOS = 2, ST = 3, ARGS = 4;
+        c.localGet(ROOT);
+        c.call(this.stateEnsure());
+        c.localSet(ST);
         c.localGet(ERR);
         c.refIsNull();
         c.i32Eqz();
@@ -6145,14 +7229,10 @@ export class StreamBuilder {
         c.structGet(this.stateT(), RS_DESTROYED);
         c.i32Eqz();
         c.ifVoid();
-        c.localGet(HEAD);
-        c.structGet(this.wReqT(), WREQ_CB_CLOS);
+        c.localGet(CBCLOS);
         c.refIsNull();
         c.i32Eqz();
         c.ifVoid();
-        c.localGet(HEAD);
-        c.structGet(this.wReqT(), WREQ_CB_CLOS);
-        c.localSet(CBCLOS);
         c.localGet(CBCLOS); // arg0 (call_ref wants args, THEN the funcref)
         c.localGet(CBCLOS);
         c.structGet(this.deps.voidClos().clos, 0);
@@ -6180,10 +7260,12 @@ export class StreamBuilder {
         // just-completed entry's OWN per-write callback runs — "write:
         // bbbb" prints before "cb a" when a second write was queued
         // behind the first; "drain" prints before "cb b" when the queue
-        // empties past a below-hwm write). Both 'drain' and dispatching
-        // the next entry are SYNCHRONOUS here (Node's own `afterWrite`
-        // calls `stream.emit('drain')` directly, not through a tick —
-        // unlike 'finish', which always defers).
+        // empties past a below-hwm write). LAYER 5: dispatching the next
+        // entry now happens in `afterWriteHeadCore`, ALWAYS immediately,
+        // before this tail (deferred or not) ever runs — 'drain' stays
+        // here, in the tail, exactly matching Node's OWN split (`drain`
+        // lives inside `afterWrite`, deferred alongside the completed
+        // write's own callback, NOT inside `clearBuffer`).
         //
         // GATE FIX C3 (BLOCKING precondition, lifted verbatim from Node's
         // real internal/streams/writable.js's `afterWrite`, dumped via
@@ -6229,18 +7311,11 @@ export class StreamBuilder {
         c.end();
         c.localGet(ROOT);
         c.call(this.maybeFinishCore());
-        c.else_();
-        c.localGet(ROOT);
-        c.call(this.doWriteCore());
         c.end();
-        c.localGet(HEAD);
-        c.structGet(this.wReqT(), WREQ_CB_CLOS);
+        c.localGet(CBCLOS);
         c.refIsNull();
         c.i32Eqz();
         c.ifVoid();
-        c.localGet(HEAD);
-        c.structGet(this.wReqT(), WREQ_CB_CLOS);
-        c.localSet(CBCLOS);
         c.localGet(CBCLOS); // arg0: the closure itself (call_ref wants args, THEN the funcref)
         c.localGet(CBCLOS);
         c.structGet(this.deps.voidClos().clos, 0);
@@ -6266,16 +7341,7 @@ export class StreamBuilder {
         c.i32Const(OP_FIRE_DISCARDED);
         c.call(this.scheduleTick());
         c.end();
-        this.mb.setBody(
-          idx,
-          [
-            this.stateRef(),
-            this.wReqRef(),
-            { kind: "ref", nullable: true, typeIndex: this.deps.voidClos().clos },
-            this.deps.dynArrRef(),
-          ],
-          c.bytes(),
-        );
+        this.mb.setBody(idx, [this.stateRef(), this.deps.dynArrRef()], c.bytes());
       },
     );
   }
@@ -6418,70 +7484,406 @@ export class StreamBuilder {
     );
   }
 
-  /** `(root, errRef|null, bytesRef|null) -> void` — STAGE C PASS 2,
-   * Transform: `_transform`'s completion-callback landing site
-   * (emitter.ts's `doneClosFor` "transform" kind). `data` arrives here
-   * ALREADY EXTRACTED — doneClosFor's own union-arm read (the completion
-   * callback's real declared type, per the project-local ambient, is a
-   * CONCRETE `Buffer | string | undefined` union, never `dyn` — corrected
-   * after the original dyn-based design was found wrong by execution),
-   * so a real wasm `null` here means "no data" directly, no dyn-UNDEF
-   * sentinel needed. Measured directly against Node (p3a/p3c/p3d/p3g):
+  /* STAGE C PASS 2, Transform's `_transform` completion-callback landing
+   * (emitter.ts's `doneClosFor`/`dynDoneClosFor` "transform" kind) used
+   * to live here as its own `afterTransformCore` function: `data`
+   * arrives ALREADY EXTRACTED (doneClosFor's own union-arm read — the
+   * completion callback's real declared type, per the project-local
+   * ambient, is a CONCRETE `Buffer | string | undefined` union, never
+   * `dyn`, so a real wasm `null` means "no data" directly, no dyn-UNDEF
+   * sentinel needed); measured directly against Node (p3a/p3c/p3d/p3g):
    * an error skips data entirely and takes the SAME path a plain
-   * `_write` callback error already does — `afterWriteCore`, F1's
-   * fresh-vs-collision gate, unchanged; success pushes `data` (if
+   * `_write` callback error already does; success pushes `data` (if
    * non-null — `cb()`/`cb(null, undefined)` pushes nothing, T5's own
-   * pin) SYNCHRONOUSLY via the ordinary push() path, already bytes-
-   * shaped (no further coercion — the string-arm case was already
-   * converted inside doneClosFor), then falls into `afterWriteCore`
-   * exactly like a data-less completion would (drain/queue-continuation
-   * unchanged). Whether a data-bearing error (`cb(err, data)`) should
-   * still push before erroring is UNMEASURED — this skips data on any
-   * error, named per the sibling rule, not exercised by any claim. */
-  afterTransformCore(): number {
-    return this.cached("afterTransformCore", () => {
-      const root = this.deps.rootRef();
-      const idx = this.mb.declareFunc(this.mb.funcType([root, this.deps.errRef(), this.deps.bytesRef()], []), "%w.ws.afterTransform");
-      const c = new Code();
-      const ROOT = 0, ERR = 1, DATA = 2;
-      c.localGet(ERR);
-      c.refIsNull();
-      c.i32Eqz();
-      c.ifVoid();
-      c.localGet(ROOT);
-      c.localGet(ERR);
-      c.call(this.afterWriteCore());
-      c.return_();
-      c.end();
-      c.localGet(DATA);
-      c.refIsNull();
-      c.i32Eqz();
-      c.ifVoid();
-      c.localGet(ROOT);
-      c.localGet(DATA);
-      c.i32Const(0); // front: false — an ordinary tail push
-      c.call(this.pushCore());
-      c.drop(); // the should-push-more answer is not observed here — write-side backpressure/drain is afterWriteCore's own job below, unrelated to push()'s own return
-      c.end();
-      c.localGet(ROOT);
-      c.refNull(this.errType()); // still null — the error branch above already returned
-      c.call(this.afterWriteCore());
-      this.mb.setBody(idx, [], c.bytes());
-      return idx;
-    });
+   * pin), then falls into the SAME completion `_write` uses. FIX ROUND
+   * CONTINUATION (P2-1, probe08) folded this directly into
+   * `writeDoneLandingCore`, below, rather than calling it as a separate
+   * step — the push must happen BEFORE the WS_SYNC-gated defer decision,
+   * not bundled with the (possibly deferred) completion the way this
+   * function bundled them; `writeDoneLandingCore`'s own header has the
+   * measured mechanism. Whether a data-bearing error (`cb(err, data)`)
+   * should still push before erroring is UNMEASURED — this (like the
+   * function it replaced) skips data on any error, named per the
+   * sibling rule, not exercised by any claim. */
+
+  /* ── FIX ROUND (P2-1, gate finding): the sync-write-completion defer ──
+   *
+   * MEASURED (node v24.18.1, `node -e`), not assumed: a `_write`
+   * callback invoked SYNCHRONOUSLY — before `_write` itself returns —
+   * does NOT continue synchronously into the stream's own completion
+   * handling (drain/'error'/'close' etc). Node's real `onwrite` checks
+   * `state.sync` and, when true, defers via `process.nextTick` instead
+   * of calling `afterWrite`/the error path inline:
+   *   w.write('x', () => console.log('write-cb'));  // sync _write, sync cb(err|undefined)
+   *   console.log('after write() returns');
+   * prints "after write() returns" BEFORE "write-cb" every time — the
+   * completion is on a LATER turn, never inline, for BOTH the success
+   * and error shapes (re-measured for the error shape too — an 'error'
+   * listener attached to a stream whose `_write` calls `cb(err)`
+   * synchronously fires strictly after the script's own synchronous
+   * continuation, interleaved with `process.nextTick` order).
+   *
+   * This file's OWN `doWriteCore` already tracks the identical window
+   * via WS_SYNC (set true immediately before `callRef(writeThunkSig())`,
+   * reset false immediately after) — it was write-only state until this
+   * fix; nothing ever read it back. `writeDoneLandingCore`, below, is
+   * the SHARED landing `doneClosFor`'s own "write"/"transform" kinds
+   * now call (emitter.ts) INSTEAD OF `afterWriteCore` directly: WS_SYNC
+   * true (still inside the synchronous `_write`/
+   * `_transform` window) defers by ONE tick via `scheduleWriteCompletion`;
+   * WS_SYNC false (the callback fired on some LATER turn, having
+   * already yielded control back to the event loop on its own) calls
+   * the target directly, Node's own `else` branch, this file's
+   * pre-existing behavior unchanged.
+   *
+   * THIS IS THE ROOT CAUSE of the gate's teardown-order finding, not a
+   * pipeline-specific bug: `_read()` pushing a chunk then `push(null)`
+   * (ONE synchronous call, both statements back to back) drove the
+   * WHOLE downstream chain — pipe's ondata thunk, a Transform's
+   * `_transform`, a Writable's `_write`, an erroring `cb(err)` —
+   * synchronously to completion (destroy, `scheduleTick(OP_ERROR)`,
+   * `scheduleTick(OP_CLOSE)`) BEFORE `push(null)` itself ever ran, so
+   * the erroring stage's own teardown got appended to the shared $rTick
+   * FIFO ahead of the clean-finishing source's OWN `opEnd`-triggered
+   * `OP_CLOSE` — even though the source's natural completion is
+   * chronologically FIRST in the user's own source order. With this
+   * fix, the erroring stage's `_write`/`_transform` callback (itself
+   * invoked synchronously, from deep inside that same nested call)
+   * defers its OWN continuation by a tick, letting `push(null)`'s own
+   * `opEnd` run and schedule the source's `OP_CLOSE` FIRST — exactly
+   * mirroring Node. Nothing here is a pipeline mechanism at all: no
+   * ordering RULE was added anywhere in stream.ts for this — the
+   * corrected relative order is an emergent property of restoring the
+   * ONE missing tick Node's own write path has, the same "let the real
+   * mechanism produce the order" discipline `pipelineFinishImpl`'s own
+   * header already documents for the OTHER half of this file.
+   *
+   * FIX ROUND CONTINUATION (still P2-1, gate finding probe08): the
+   * defer above is necessary but was not SUFFICIENT — it was deferring
+   * TWO things Node keeps separate. MEASURED (node v24.18.1, `node -e`,
+   * a Transform piped to an instrumented Writable): a `_transform`
+   * callback's PUSH to the readable side (and that push's own
+   * synchronous flow to whatever consumes it — e.g. a piped downstream
+   * `write()`) happens IMMEDIATELY, inside the `cb(err, data)` call
+   * itself, before `cb()` even returns. Only the WRITE-COMPLETION
+   * notification (the thing that signals backpressure/drain back to
+   * whoever wrote INTO the transform) defers via nextTick — the SAME
+   * `state.sync` check documented above, but scoped to completion only.
+   * `afterTransformCore` (removed by this continuation) bundled push
+   * and completion into one call, so deferring "the completion" via
+   * `scheduleWriteCompletion`/`dispatchWriteCompletion` deferred the
+   * push too — giving an upstream source room to race ahead with its
+   * OWN next `_read()` before a downstream Writable ever saw the
+   * transformed chunk (probe08's exact divergence: Node's real
+   * interleave is `...t._transform:p1, w._write#1:p1, s._read#3...`;
+   * this file's pre-continuation interleave was
+   * `...t._transform:p1, s._read#3, w._write#1:p1...`). `writeDoneLandingCore`,
+   * below, now does the push UNCONDITIONALLY and IMMEDIATELY (guarded
+   * only on `data != null` — a `cb(null)` filtering transform with no
+   * data must never `push(null)`, which means EOF, not "nothing to
+   * push"; NAMED SIBLING: no corpus claim exercises a filtering
+   * transform that drops a chunk this way — see
+   * wasm-stream-pipeline.test.ts's own filtering-transform pin, added
+   * alongside this fix specifically because the guard's correctness
+   * otherwise rides on the Node measurement alone, unexercised) —
+   * BEFORE the WS_SYNC-gated defer decision, which now governs ONLY the
+   * completion notification, identical for the write and transform
+   * kinds (both are just `afterWriteCore(root, err)` now — no kind
+   * branch survives on the completion side at all, which is why
+   * `afterTransformCore` has no remaining callers and was deleted
+   * rather than left as dead code). Two OTHER call sites bundled
+   * push+completion the same way `afterTransformCore` did and needed
+   * the same correction: `dynDoneClosFor`'s "transform" kind
+   * (emitter.ts) now routes through `writeDoneLandingCore` too, exactly
+   * mirroring `doneClosFor`'s own already-fixed "transform" kind — it
+   * was NOT fixed when `doneClosFor` was, a gap discovered only while
+   * removing `afterTransformCore`'s last callers. NAMED SIBLING, NOT
+   * FIXED HERE: `dynDoneClosFor`'s "write" kind still calls
+   * `afterWriteCore()` directly, ungated by WS_SYNC, exactly as before
+   * this whole fix round — a dyn-typed `write(chunk, enc, cb)` override
+   * may have the SAME q9/q10-class teardown-order bug the typed write
+   * path had before the WS_SYNC_ERRORED fix; out of this round's
+   * authorized scope, reported not silently patched. NAMED SIBLING, NOT
+   * FIXED HERE: `identityTransformThunk` (PassThrough's own default
+   * `_transform`, below) already pushed synchronously before this
+   * continuation (never needed the push-timing fix) but its completion
+   * call was NEVER routed through the WS_SYNC-gated defer at all —
+   * it calls `afterWriteCore` directly, unconditionally, same as
+   * before. A bare PassThrough's completion is therefore never
+   * deferred even when called synchronously; 1814's own `mid` stage
+   * IS a bare PassThrough and stays byte-exact regardless (verified),
+   * so this is a real but currently-unexercised gap, not a known
+   * failure — left untouched, out of scope. */
+
+  private writeCompletionT(): number {
+    if (this.writeCompletionTField !== null) return this.writeCompletionTField;
+    const rootRef = this.deps.rootRef();
+    const errRef = this.deps.errRef();
+    // FIX ROUND (P2-1 continuation, layer 3): this record used to also
+    // carry DATA/IS_TRANSFORM so the dequeue side could re-dispatch to
+    // `afterTransformCore` — removed along with that function. The push
+    // half now happens synchronously at `writeDoneLandingCore`'s OWN
+    // call time (never deferred, per this section's header).
+    //
+    // LAYER 5 (afterWriteCore split): re-added WCT_CB_CLOS — the bare
+    // (root, err) landing above stopped being enough once the completed
+    // write's own bookkeeping (pop/decrement/clear-writing) moved to the
+    // ALWAYS-IMMEDIATE `afterWriteHeadCore`, which now runs BEFORE this
+    // record is even enqueued and captures the completed WREQ's own
+    // callback closure — the tail (whichever of `afterWriteCore`'s two
+    // call sites eventually fires) needs that value threaded through,
+    // since it no longer has the WREQ itself to read it from.
+    this.writeCompletionTField = this.mb.selfStructType("%w.ws.writeCompletion", (self) => [
+      { storage: rootRef, mutable: false }, // WCT_ROOT
+      { storage: errRef, mutable: false }, // WCT_ERR
+      { storage: { kind: "ref", nullable: true, typeIndex: this.deps.voidClos().clos }, mutable: false }, // WCT_CB_CLOS
+      { storage: { kind: "ref", nullable: true, typeIndex: self }, mutable: true }, // WCT_NEXT
+    ]);
+    return this.writeCompletionTField;
+  }
+
+  private writeCompletionRef(): ValType {
+    return { kind: "ref", nullable: true, typeIndex: this.writeCompletionT() };
+  }
+
+  private writeCompletionQueue(): { head: number; tail: number } {
+    if (this.writeCompletionQueueField === null) {
+      const t = this.writeCompletionRef();
+      const init = (w: ByteWriter): void => {
+        w.u8(0xd0); // ref.null $w.ws.writeCompletion
+        w.sleb(this.writeCompletionT());
+      };
+      this.writeCompletionQueueField = { head: this.mb.addGlobal(t, true, init), tail: this.mb.addGlobal(t, true, init) };
+    }
+    return this.writeCompletionQueueField;
+  }
+
+  /** `(root, err, cbClos) -> void` — appends a deferred completion
+   * record and posts the SAME `enqueueRaw()`/nexttick.ts seam
+   * `scheduleTick()`/`schedulePipelineFinal()` use, so it interleaves
+   * correctly against user nextTicks and every OTHER deferred stream
+   * tick — `pipelineTick`'s own precedent, ported for this file's other
+   * genuinely distinct work-item shape. */
+  private scheduleWriteCompletion(): number {
+    return this.cachedRecursive(
+      "scheduleWriteCompletion",
+      () =>
+        this.mb.declareFunc(
+          this.mb.funcType(
+            [this.deps.rootRef(), this.deps.errRef(), { kind: "ref", nullable: true, typeIndex: this.deps.voidClos().clos }],
+            [],
+          ),
+          "%w.ws.scheduleWriteCompletion",
+        ),
+      (idx) => {
+        const q = this.writeCompletionQueue();
+        const c = new Code();
+        const ROOT = 0, ERR = 1, CBCLOS = 2, N = 3;
+        c.localGet(ROOT);
+        c.localGet(ERR);
+        c.localGet(CBCLOS);
+        c.refNull(this.writeCompletionT());
+        c.structNew(this.writeCompletionT());
+        c.localSet(N);
+        c.globalGet(q.tail);
+        c.refIsNull();
+        c.ifVoid();
+        c.localGet(N);
+        c.globalSet(q.head);
+        c.else_();
+        c.globalGet(q.tail);
+        c.localGet(N);
+        c.structSet(this.writeCompletionT(), WCT_NEXT);
+        c.end();
+        c.localGet(N);
+        c.globalSet(q.tail);
+        this.mb.declareFuncRef(this.dispatchWriteCompletion());
+        c.refFunc(this.dispatchWriteCompletion());
+        c.call(this.deps.enqueueRaw());
+        this.mb.setBody(idx, [this.writeCompletionRef()], c.bytes());
+      },
+    );
+  }
+
+  /** `() -> ()` — the raw marker's target: pops ONE completion record
+   * and lands it on `afterWriteCore` (the tail — bookkeeping already ran
+   * in `afterWriteHeadCore` before this record was even enqueued, this
+   * section's own header has the full measured mechanism story). */
+  private dispatchWriteCompletion(): number {
+    return this.cachedRecursive(
+      "dispatchWriteCompletion",
+      () => this.mb.declareFunc(this.deps.rawFnType(), "%w.ws.dispatchWriteCompletion"),
+      (idx) => {
+        const q = this.writeCompletionQueue();
+        const c = new Code();
+        const N = 0, ROOT = 1, ERR = 2, CBCLOS = 3;
+        c.globalGet(q.head);
+        c.localSet(N);
+        c.localGet(N);
+        c.structGet(this.writeCompletionT(), WCT_NEXT);
+        c.globalSet(q.head);
+        c.globalGet(q.head);
+        c.refIsNull();
+        c.ifVoid();
+        c.refNull(this.writeCompletionT());
+        c.globalSet(q.tail);
+        c.end();
+        c.localGet(N);
+        c.refNull(this.writeCompletionT());
+        c.structSet(this.writeCompletionT(), WCT_NEXT);
+        c.localGet(N);
+        c.structGet(this.writeCompletionT(), WCT_ROOT);
+        c.localSet(ROOT);
+        c.localGet(N);
+        c.structGet(this.writeCompletionT(), WCT_ERR);
+        c.localSet(ERR);
+        c.localGet(N);
+        c.structGet(this.writeCompletionT(), WCT_CB_CLOS);
+        c.localSet(CBCLOS);
+        c.localGet(ROOT);
+        c.localGet(ERR);
+        c.localGet(CBCLOS);
+        c.call(this.afterWriteCore());
+        this.mb.setBody(
+          idx,
+          [this.writeCompletionRef(), this.deps.rootRef(), this.deps.errRef(), { kind: "ref", nullable: true, typeIndex: this.deps.voidClos().clos }],
+          c.bytes(),
+        );
+      },
+    );
+  }
+
+  /** `(root, err, data, isTransform: i32) -> void` — PUBLIC: the shared
+   * landing `doneClosFor`'s "write"/"transform" kinds call instead of
+   * `afterWriteCore` directly (emitter.ts). This section's own header
+   * has the full measured mechanism story — the WS_SYNC_ERRORED flag,
+   * the push/completion split, and (afterWriteCore's own header) the
+   * queue-continuation/completion-tail split. */
+  writeDoneLandingCore(): number {
+    return this.cachedRecursive(
+      "writeDoneLandingCore",
+      () => this.mb.declareFunc(this.mb.funcType([this.deps.rootRef(), this.deps.errRef(), this.deps.bytesRef(), I32], []), "%w.ws.writeDoneLanding"),
+      (idx) => {
+        const c = new Code();
+        const ROOT = 0, ERR = 1, DATA = 2, ISXFORM = 3, ST = 4, CBCLOS = 5, NEEDTICK = 6;
+        c.localGet(ROOT);
+        c.call(this.stateEnsure());
+        c.localSet(ST);
+        // FIX ROUND (P2-1): mark WS_SYNC_ERRORED IMMEDIATELY, before the
+        // WS_SYNC-gated defer decision below — visible to writeCore's own
+        // return-value formula the instant doWriteCore() returns, exactly
+        // mirroring Node's own state.errored (WS_SYNC_ERRORED's own
+        // header has the full measured story).
+        c.localGet(ERR);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(ST);
+        c.i32Const(1);
+        c.structSet(this.stateT(), WS_SYNC_ERRORED);
+        c.end();
+        // FIX ROUND CONTINUATION (P2-1, probe08): the push half of a
+        // transform's completion is NEVER deferred — Node's own
+        // `_transform` callback pushes to the readable side (and flows
+        // synchronously to whatever consumes it) inside the callback
+        // itself, decoupled from the write-completion notification below
+        // (this section's own header has the measured A/B probe). Guard
+        // on `data != null`: a `cb(null)` filtering transform with no
+        // data must fall through to nothing here, NOT `pushCore(null)` —
+        // that means EOF, not "no chunk this time" (wasm-stream-pipeline
+        // .test.ts's filtering-transform pin exercises exactly this).
+        c.localGet(ISXFORM);
+        c.ifVoid();
+        c.localGet(ERR);
+        c.refIsNull();
+        c.ifVoid();
+        c.localGet(DATA);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(ROOT);
+        c.localGet(DATA);
+        c.i32Const(0); // front: false — an ordinary tail push
+        c.call(this.pushCore());
+        c.drop(); // same as the old afterTransformCore: the should-push-more answer is not observed here
+        c.end();
+        c.end();
+        c.end();
+        // LAYER 5 (afterWriteCore split): the ALWAYS-IMMEDIATE half —
+        // bookkeeping + (unless this is a fresh error) the next queued
+        // entry's own dispatch — runs UNCONDITIONALLY here, before any
+        // defer decision. afterWriteHeadCore's own header has the
+        // measured mechanism; this is what fixes probe08's residual.
+        c.localGet(ROOT);
+        c.localGet(ERR);
+        c.call(this.afterWriteHeadCore());
+        c.localSet(CBCLOS);
+        // The REMAINING tail (afterWriteCore) is what stays behind a
+        // defer gate — for an ERROR, the SAME bare WS_SYNC gate as
+        // before (Node's onwriteError: wholesale-deferred whenever
+        // sync, no needTick refinement — afterWriteCore's own header).
+        // For SUCCESS, the gate is WS_SYNC && needTick, the ported
+        // condition (afterWriteCore's own header cites the source lines
+        // and flags the RS_DESTROYED clause as approximated-by-intent).
+        c.localGet(ERR);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        c.i32Const(1); // error: needTick is moot, the gate is bare WS_SYNC
+        c.localSet(NEEDTICK);
+        c.else_();
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_NEED_DRAIN);
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_LENGTH);
+        c.f64Const(0);
+        c.f64Eq();
+        c.i32And();
+        c.localGet(ST);
+        c.structGet(this.stateT(), RS_DESTROYED);
+        c.i32Or();
+        c.localGet(CBCLOS);
+        c.refIsNull();
+        c.i32Eqz();
+        c.i32Or();
+        c.localSet(NEEDTICK);
+        c.end();
+        c.localGet(ST);
+        c.structGet(this.stateT(), WS_SYNC);
+        c.localGet(NEEDTICK);
+        c.i32And();
+        c.ifVoid();
+        c.localGet(ROOT);
+        c.localGet(ERR);
+        c.localGet(CBCLOS);
+        c.call(this.scheduleWriteCompletion());
+        c.else_();
+        c.localGet(ROOT);
+        c.localGet(ERR);
+        c.localGet(CBCLOS);
+        c.call(this.afterWriteCore());
+        c.end();
+        this.mb.setBody(
+          idx,
+          [this.stateRef(), { kind: "ref", nullable: true, typeIndex: this.deps.voidClos().clos }, I32],
+          c.bytes(),
+        );
+      },
+    );
   }
 
   /** `(root, errRef|null, bytesRef|null) -> void` — STAGE C PASS 2,
    * Transform: `_flush`'s completion-callback landing site. `data`
-   * arrives already-extracted, `afterTransformCore`'s own header has the
-   * full correction story. Measured directly against Node (p3b/p3f/p3g/
-   * p3h — your own trace, `T6.final [as _final]`): `_flush` interposes
-   * as Transform's OWN internal `_final` (the construction side
-   * populates WS_FINAL_CLOS/THUNK with a bridge to the user's `_flush`,
-   * NOT an event listener), so its error takes `_final`'s existing error
-   * path (`finalDoneCore`'s own `destroyErrCore` branch), unchanged.
-   * Success: push `data` if present (same shape as `afterTransformCore`
-   * — already bytes, no coercion here), UNCONDITIONALLY push(null) (ends
+   * arrives already-extracted (doneClosFor's own union-arm read — see
+   * `writeDoneLandingCore`'s own header for the full correction story on
+   * the sibling "transform" kind). Measured directly against Node
+   * (p3b/p3f/p3g/p3h — your own trace, `T6.final [as _final]`): `_flush`
+   * interposes as Transform's OWN internal `_final` (the construction
+   * side populates WS_FINAL_CLOS/THUNK with a bridge to the user's
+   * `_flush`, NOT an event listener), so its error takes `_final`'s
+   * existing error path (`finalDoneCore`'s own `destroyErrCore` branch),
+   * unchanged. Success: push `data` if present (already bytes, no
+   * coercion here), UNCONDITIONALLY push(null) (ends
    * the readable side — Node does this whether or not `_flush` was even
    * defined, p3e's PassThrough-with-no-_flush pin), THEN `finalDoneCore`
    * — which is what fires 'prefinish' AND schedules 'finish'. Ordering
@@ -6545,11 +7947,33 @@ export class StreamBuilder {
       c.i32Const(0); // front: false
       c.call(this.pushCore());
       c.drop();
+      // NAMED SIBLING (P2-1 continuation, NOT fixed here): this already
+      // pushed synchronously above (never needed the push-timing fix —
+      // it never bundled push with completion the way afterTransformCore
+      // did), so the removal of that function is a pure mechanical
+      // substitution here — err/data were always null on this path
+      // (afterTransformCore's own null-data branch was a no-op). LAYER 5:
+      // afterWriteCore no longer does its own bookkeeping (pop/decrement
+      // /clear-writing) — that moved to afterWriteHeadCore — so this MUST
+      // call both now, or a bare PassThrough would silently stop
+      // advancing its own write queue at all. Both calls stay
+      // UNCONDITIONAL/immediate here, UNGATED by WS_SYNC — a bare
+      // PassThrough's completion is still never deferred, unlike a
+      // user-supplied _write/_transform's (routed through
+      // writeDoneLandingCore, emitter.ts's doneClosFor). Out of this
+      // round's authorized scope; this section's own header has the full
+      // note (1814's own `mid` stage IS a bare PassThrough and stays
+      // byte-exact regardless — verified, not just assumed).
+      const CBCLOS = 5;
       c.localGet(THIS);
       c.refNull(this.errType());
-      c.refNull(this.deps.bytesStructType());
-      c.call(this.afterTransformCore());
-      this.mb.setBody(idx, [], c.bytes());
+      c.call(this.afterWriteHeadCore());
+      c.localSet(CBCLOS);
+      c.localGet(THIS);
+      c.refNull(this.errType());
+      c.localGet(CBCLOS);
+      c.call(this.afterWriteCore());
+      this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: this.deps.voidClos().clos }], c.bytes());
       return idx;
     });
   }

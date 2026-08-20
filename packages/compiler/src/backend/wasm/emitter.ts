@@ -171,6 +171,8 @@ import {
   FIN_SIDE_W,
   FIN_SIDE_RW,
   FIN_KIND_CB,
+  FIN_KIND_DYN,
+  FIN_KIND_PROMISE,
 } from "./stream.js";
 import { UnionBuilder, type UnionArmRep } from "./unions.js";
 import { Code } from "./code.js";
@@ -3067,6 +3069,11 @@ class Assembler {
       bytesPayloadBytes: (c, pushDyn) => this.dyn.bytesPayloadBytes(c, pushDyn),
       thunkSig: () => this.dyn.thunkSig(),
       reportUncaught: () => this.reportUncaughtHelper(),
+      callFn: () => this.dyn.callFn(),
+      fromError: () => this.dyn.fromError(),
+      toError: () => this.dyn.toError(),
+      errThunkSig: () => this.events.errThunkSig(),
+      errEntryAppend: () => this.events.errEntryAppend(),
     });
     return this.streamField;
   }
@@ -3305,7 +3312,7 @@ class Assembler {
     c.localSet(SELFT);
     c.localGet(SELFT);
     c.structGet(struct, ROOT_FIELD);
-    // NOTE: `afterWriteCore`/`finalDoneCore`/`afterTransformCore`/
+    // NOTE: `afterWriteCore`/`finalDoneCore`/`writeDoneLandingCore`/
     // `flushDoneCore` take (root, errRef[, dataRef]) only — WHICH request
     // just completed is `state.head` itself (the FIFO invariant: exactly
     // one write is ever in flight, always the queue's current head), so
@@ -3437,17 +3444,29 @@ class Assembler {
       // reachable through it at all) — the tail still needs a value.
       c.refNull(this.bytesB.bytesType());
     }
-    c.call(
-      kind === "write"
-        ? this.stream.afterWriteCore()
-        : kind === "final"
+    if (kind === "write" || kind === "transform") {
+      // FIX ROUND (P2-1, gate finding): `_write`/`_transform`'s own
+      // completion lands through `writeDoneLandingCore` rather than
+      // `afterWriteCore`/`afterTransformCore` directly — its own header
+      // has the measured mechanism (Node's real `onwrite`'s `state.sync`
+      // check: a callback invoked SYNCHRONOUSLY defers its continuation
+      // by one tick; an already-async one continues immediately, this
+      // file's existing behavior, unchanged). `kind === "write"` never
+      // pushed a data value above (only transform/flush are
+      // `isTransformish`), so it needs an explicit null here — the
+      // shared landing's signature is uniform over both kinds.
+      if (kind === "write") c.refNull(this.bytesB.bytesType());
+      c.i32Const(kind === "transform" ? 1 : 0);
+      c.call(this.stream.writeDoneLandingCore());
+    } else {
+      c.call(
+        kind === "final"
           ? this.stream.finalDoneCore()
           : kind === "destroy"
             ? this.stream.destroyErrDefaultCore()
-            : kind === "transform"
-              ? this.stream.afterTransformCore()
-              : this.stream.flushDoneCore(),
-    );
+            : this.stream.flushDoneCore(),
+      );
+    }
     this.mb.setBody(idx, extraLocals, c.bytes());
     return made;
   }
@@ -3610,21 +3629,38 @@ class Assembler {
       c.end();
       c.localSet(DATA);
     }
-    c.localGet(ENVL);
-    c.structGet(env, ROOT_FIELD);
-    c.localGet(ERR);
-    if (isTransformish) c.localGet(DATA);
-    c.call(
-      kind === "write"
-        ? this.stream.afterWriteCore()
-        : kind === "final"
-          ? this.stream.finalDoneCore()
-          : kind === "destroy"
-            ? this.stream.destroyErrDefaultCore()
-            : kind === "transform"
-              ? this.stream.afterTransformCore()
-              : this.stream.flushDoneCore(),
-    );
+    if (kind === "transform" || kind === "write") {
+      // FIX ROUND (P2-1) CONTINUATION: mirrors doneClosFor's OWN
+      // already-fixed "write"/"transform" kinds (this function's typed
+      // sibling, ~line 3467). "transform": afterTransformCore was
+      // removed because it bundled a Transform's synchronous
+      // readable-side push together with its (sometimes-deferred)
+      // write-completion notification, which is NOT how Node behaves
+      // (writeDoneLandingCore's own header has the measured mechanism).
+      // Neither dyn-typed sibling was fixed when doneClosFor was — gaps
+      // found only while removing afterTransformCore's last callers
+      // (afterWriteCore itself is one, LAYER 5's own split — it no
+      // longer does its own bookkeeping, so a bare 2-arg call here is
+      // now a malformed-module bug, not just a missed-defer one) — not
+      // new scope. "write" riding here too means a dyn-typed
+      // `write(chunk, enc, cb)` override's completion is now ALSO
+      // correctly deferred when synchronous, matching the typed path,
+      // rather than being left calling afterWriteCore's bookkeeping-free
+      // tail directly with no bookkeeping ever having run.
+      c.localGet(ENVL);
+      c.structGet(env, ROOT_FIELD);
+      c.localGet(ERR);
+      if (kind === "transform") c.localGet(DATA);
+      else c.refNull(this.bytesB.bytesType()); // "write" has no data slot at all
+      c.i32Const(kind === "transform" ? 1 : 0); // isTransform
+      c.call(this.stream.writeDoneLandingCore());
+    } else {
+      c.localGet(ENVL);
+      c.structGet(env, ROOT_FIELD);
+      c.localGet(ERR);
+      if (isTransformish) c.localGet(DATA); // "flush" still needs DATA; "final"/"destroy" don't
+      c.call(kind === "final" ? this.stream.finalDoneCore() : kind === "destroy" ? this.stream.destroyErrDefaultCore() : this.stream.flushDoneCore());
+    }
     c.globalGet(this.dyn.undefinedGlobal());
     const extraLocals: ValType[] = [envRef, I32, dynRef, errRefType];
     if (isTransformish) extraLocals.push(dynRef, bytesRefType);
@@ -4135,35 +4171,82 @@ class Assembler {
     c.localGet(THIS);
     c.refCast(thisT.typeIndex);
     if (t.params.length >= 2) {
-      // errorOrNull(L)'s own 2-arm tagged union (Error-rooted object |
-      // nullT) — destroyThunkFor's identical box, ported verbatim.
       const errParamType = t.params[1];
-      if (errParamType === undefined || errParamType.kind !== "union") {
-        this.refuse("libCall:stream.finished:unsupported-err-param", loc);
-        c.unreachable();
-        this.mb.setBody(idx, [closRef], c.bytes());
-        return idx;
+      if (errParamType?.kind === "dyn") {
+        // STAGE D P2 — MEASURED, not assumed (`node -e` + isolated
+        // tsinter smoke compiles, both re-run right before this
+        // branch landed): @types/node's `pipeline()` overload set (2
+        // through 7+ stream arities, generic Duplex/Transform
+        // combinations) does not thread a clean contextual type
+        // through an IMPLICITLY-TYPED JS callback parameter the way
+        // `finished()`'s single, simple overload does. A bare `(err)
+        // => {...}` in a .cjs file (1814's own first pipeline()
+        // callback, no annotation) resolves `err`'s contextual type to
+        // `any` for `pipeline()` — while the IDENTICAL untyped shape
+        // passed to `finished()` was tested ABSENT this branch (an
+        // isolated `finished(r, (err) => {...})` .cjs compile) and
+        // resolved CLEANLY to the `ErrnoException | null | undefined`
+        // union instead, taking the branch below. This is a live
+        // TypeScript overload-resolution behavior this pass measured
+        // for THESE two call shapes, not a permanent guarantee about
+        // either function's typings — if some future finished() claim
+        // ever hits the same shape, this branch already covers it,
+        // since it dispatches on the closure's own lowered param kind,
+        // not on `which`. Reachable ONLY through `finThunkFor`'s
+        // pipeline() call site today (finThunkFor's own header still
+        // holds for finished()'s receiver/this side; this is the ERR
+        // param, a separate axis).
+        //
+        // `lowerStreamCallback`'s own per-param dyn skip (lower-
+        // stream.ts, the SAME machinery option callbacks already use
+        // for their own implicitly-any params) is what lets an
+        // untyped param reach here typed `dyn` at all — nothing new on
+        // the frontend side, just a backend consumer that never
+        // existed for it before.
+        //
+        // Boxes ERR the SAME way `firePipelineFinal`'s own FIN_KIND_
+        // DYN branch boxes it for this identical callback (null → dyn
+        // undefined, which is what Node's OWN measured success arg is
+        // — `undefined`, never a dyn-boxed null; else → dyn.fromError)
+        // — one boxed value, then the SAME shared callRef tail below.
+        c.localGet(ERR);
+        c.refIsNull();
+        c.ifResult(this.dyn.dynRef());
+        c.globalGet(this.dyn.undefinedGlobal());
+        c.else_();
+        c.localGet(ERR);
+        c.call(this.dyn.fromError());
+        c.end();
+      } else {
+        // errorOrNull(L)'s own 2-arm tagged union (Error-rooted object |
+        // nullT) — destroyThunkFor's identical box, ported verbatim.
+        if (errParamType === undefined || errParamType.kind !== "union") {
+          this.refuse("libCall:stream.finished:unsupported-err-param", loc);
+          c.unreachable();
+          this.mb.setBody(idx, [closRef], c.bytes());
+          return idx;
+        }
+        const def = this.unionDef(errParamType.unionId);
+        const nullTag = def.arms.findIndex((a) => a.kind === "nullT");
+        const errTag = def.arms.findIndex((a) => a.kind === "object");
+        const errArmSt = errTag >= 0 ? this.unionArmStruct(errParamType.unionId, errTag, loc) : null;
+        const unionVal = this.mapType(errParamType, loc);
+        if (nullTag < 0 || errTag < 0 || errArmSt === null || unionVal === null) {
+          this.refuse("libCall:stream.finished:unsupported-err-param", loc);
+          c.unreachable();
+          this.mb.setBody(idx, [closRef], c.bytes());
+          return idx;
+        }
+        c.localGet(ERR);
+        c.refIsNull();
+        c.ifResult(unionVal);
+        c.globalGet(this.unions.unitGlobal(nullTag));
+        c.else_();
+        c.i32Const(errTag);
+        c.localGet(ERR);
+        c.structNew(errArmSt);
+        c.end();
       }
-      const def = this.unionDef(errParamType.unionId);
-      const nullTag = def.arms.findIndex((a) => a.kind === "nullT");
-      const errTag = def.arms.findIndex((a) => a.kind === "object");
-      const errArmSt = errTag >= 0 ? this.unionArmStruct(errParamType.unionId, errTag, loc) : null;
-      const unionVal = this.mapType(errParamType, loc);
-      if (nullTag < 0 || errTag < 0 || errArmSt === null || unionVal === null) {
-        this.refuse("libCall:stream.finished:unsupported-err-param", loc);
-        c.unreachable();
-        this.mb.setBody(idx, [closRef], c.bytes());
-        return idx;
-      }
-      c.localGet(ERR);
-      c.refIsNull();
-      c.ifResult(unionVal);
-      c.globalGet(this.unions.unitGlobal(nullTag));
-      c.else_();
-      c.i32Const(errTag);
-      c.localGet(ERR);
-      c.structNew(errArmSt);
-      c.end();
     }
     c.localGet(CL);
     c.structGet(pair.clos, 0);
@@ -18579,6 +18662,125 @@ class Assembler {
         // read from the receiver's own state (see stream.finished above).
         this.walkExpr(e.args[0]!);
         code.call(this.stream.finRegisterPromiseCore());
+        return true;
+      }
+      case "stream.pipeline":
+      case "stream.pipelineDyn": {
+        // args: [count(numLit), stage_0, ..., stage_{n-1}, cb] —
+        // lower-stream.ts's own convention (`f64Lit(streams.length,
+        // loc)`, count ALWAYS a compile-time literal — validate.ts's own
+        // structural check already enforces `n >= 2` and the exact
+        // arity, so this trusts it the same way stream.finished trusts
+        // its own two-arg shape). Builds the fixed stages array and the
+        // fully-populated ctx struct itself — this file's own
+        // established pattern for the OTHER fixed-arity dyn arrays
+        // (emitData's single-element construction is the template) —
+        // `pipelineRegisterCore` only WIRES an already-built ctx, never
+        // allocates (its own header).
+        const nArg = e.args[0]!;
+        if (nArg.kind !== "numLit") {
+          this.refuse(`libCall:${e.fn}:dynamic-stage-count`, e.loc);
+          code.unreachable();
+          return true;
+        }
+        const n = nArg.value;
+        const stageExprs = e.args.slice(1, 1 + n);
+        const cbExpr = e.args[e.args.length - 1]!;
+        const isDyn = e.fn === "stream.pipelineDyn";
+        let thunkIdx: number | null = null;
+        if (!isDyn) {
+          if (cbExpr.type.kind !== "func") {
+            this.refuse(`libCall:${e.fn}:non-func-callback`, e.loc);
+            code.unreachable();
+            return true;
+          }
+          // finThunkFor is REUSED VERBATIM — pipeline's callback tuple is
+          // `[errorOrNull(L)]`, IDENTICAL to finished()'s own shape
+          // (lower-stream.ts's own contract), so no second thunk-
+          // building function was needed.
+          thunkIdx = this.finThunkFor(cbExpr.type, e.loc);
+          if (thunkIdx === null) {
+            code.unreachable();
+            return true;
+          }
+          this.mb.declareFuncRef(thunkIdx);
+        } else if (cbExpr.type.kind !== "dyn") {
+          this.refuse(`libCall:${e.fn}:non-dyn-callback`, e.loc);
+          code.unreachable();
+          return true;
+        }
+        const stagesArrRef: ValType = { kind: "ref", nullable: true, typeIndex: this.stream.pipelineStagesArrT() };
+        for (const s of stageExprs) this.walkExpr(s);
+        code.arrayNewFixed(this.stream.pipelineStagesArrT(), n);
+        const stagesLocal = this.acquireScratch(stagesArrRef);
+        code.localSet(stagesLocal);
+        code.i32Const(n); // PCTX_N
+        code.i32Const(0); // PCTX_CLOSED_COUNT
+        code.i32Const(0); // PCTX_ERRORSET
+        code.i32Const(0); // PCTX_ERROR_IS_PLACEHOLDER
+        code.refNull(this.exc().errT); // PCTX_ERROR
+        code.i32Const(isDyn ? FIN_KIND_DYN : FIN_KIND_CB); // PCTX_FINAL_KIND
+        this.walkExpr(cbExpr); // PCTX_FINAL_CLOS — evaluated LAST (Node's own left-to-right arg order)
+        if (isDyn) {
+          code.refNull(this.stream.destroyThunkSig()); // PCTX_FINAL_THUNK — unused for DYN
+        } else {
+          code.refFunc(thunkIdx!); // PCTX_FINAL_THUNK
+        }
+        code.localGet(stagesLocal); // PCTX_STAGES
+        code.structNew(this.stream.pipelineCtxT());
+        const ctxLocal = this.acquireScratch(this.stream.pipelineCtxRef());
+        code.localSet(ctxLocal);
+        code.localGet(ctxLocal);
+        code.call(this.stream.pipelineRegisterCore());
+        // Return value: the destination (last) stage — Node's own
+        // pipeline() return, lower-stream.ts's own `type: last.type`.
+        // Re-read from the SAME stagesLocal rather than keeping a
+        // separate live copy of the last-walked stage.
+        code.localGet(stagesLocal);
+        code.i32Const(n - 1);
+        code.arrayGet(this.stream.pipelineStagesArrT());
+        this.releaseScratch(stagesArrRef, stagesLocal);
+        this.releaseScratch(this.stream.pipelineCtxRef(), ctxLocal);
+        return true;
+      }
+      case "sp.pipeline": {
+        // args: [count(numLit), stage_0, ..., stage_{n-1}] — no
+        // callback; the promise form settles instead (sp.finished's own
+        // shape, ported to N stages).
+        const nArg = e.args[0]!;
+        if (nArg.kind !== "numLit") {
+          this.refuse("libCall:sp.pipeline:dynamic-stage-count", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const n = nArg.value;
+        const stageExprs = e.args.slice(1, 1 + n);
+        const stagesArrRef: ValType = { kind: "ref", nullable: true, typeIndex: this.stream.pipelineStagesArrT() };
+        for (const s of stageExprs) this.walkExpr(s);
+        code.arrayNewFixed(this.stream.pipelineStagesArrT(), n);
+        const stagesLocal = this.acquireScratch(stagesArrRef);
+        code.localSet(stagesLocal);
+        code.call(this.proms.mint());
+        const promLocal = this.acquireScratch(this.proms.promRef());
+        code.localSet(promLocal);
+        code.i32Const(n); // PCTX_N
+        code.i32Const(0); // PCTX_CLOSED_COUNT
+        code.i32Const(0); // PCTX_ERRORSET
+        code.i32Const(0); // PCTX_ERROR_IS_PLACEHOLDER
+        code.refNull(this.exc().errT); // PCTX_ERROR
+        code.i32Const(FIN_KIND_PROMISE); // PCTX_FINAL_KIND
+        code.localGet(promLocal); // PCTX_FINAL_CLOS
+        code.refNull(this.stream.destroyThunkSig()); // PCTX_FINAL_THUNK — unused
+        code.localGet(stagesLocal); // PCTX_STAGES
+        code.structNew(this.stream.pipelineCtxT());
+        const ctxLocal = this.acquireScratch(this.stream.pipelineCtxRef());
+        code.localSet(ctxLocal);
+        code.localGet(ctxLocal);
+        code.call(this.stream.pipelineRegisterCore());
+        code.localGet(promLocal);
+        this.releaseScratch(stagesArrRef, stagesLocal);
+        this.releaseScratch(this.proms.promRef(), promLocal);
+        this.releaseScratch(this.stream.pipelineCtxRef(), ctxLocal);
         return true;
       }
       default:

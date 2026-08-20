@@ -2636,6 +2636,32 @@ const TIER_FLOOR: string[] = [
   // close — 720 → 722.
   "1813-stream-finished.ts",
   "2564-stream-promises-finished.ts",
+  //
+  // STAGE D P2 (increment 22, board #77): pipeline() — a per-stage
+  // FIN_KIND_PIPELINE destroyer watcher (role by POSITION: source=R,
+  // dest=W, every middle stage=RW, live-measured against real Node
+  // rather than assumed from the stream's own Readable/Writable/Duplex-
+  // ness), reusing P1's list/detach/fire/OP_FIN machinery verbatim
+  // (fireFinListCore's own dispatch learned FIN_KIND_PIPELINE), plus a
+  // raw internal 'error' listener per stage (the SAME real-listener path
+  // Node's own pipeline() takes — no unhandled-'error' crash) feeding
+  // pipelineFinishImpl's own placeholder-vs-real supersession rule
+  // (Node's finishImpl, ported; a durable builder-level pin covers the
+  // supersession shape no corpus claim exercises — wasm-stream-
+  // pipeline.test.ts). 1814's own untyped .cjs callback (`(err) =>
+  // {...}`, no annotation) required extending finThunkFor with a dyn-
+  // param branch: @types/node's pipeline() overload set does not thread
+  // a clean contextual type through an implicitly-typed JS callback
+  // parameter the way finished()'s simpler overload does (live-measured;
+  // finThunkFor's own comment on the branch has the full story) — boxes
+  // the error through dyn.fromError/dyn.undefinedGlobal and calls
+  // through the SAME closure-call tail every other branch shares. Full
+  // 1069-program run, both instruments: TIER_FLOOR set-equality (this
+  // addition) and the full non-claimed bucket diff (zero net-new
+  // refusals elsewhere) both close — 722 → 725.
+  "1814-stream-pipeline.cjs",
+  "2563-stream-promises-pipeline.ts",
+  "2565-stream-promises-js.cjs",
 ];
 
 interface RunResult {
