@@ -195,6 +195,16 @@ export interface EventsDeps {
    * after, matching every other may-throw helper's contract in this
    * backend. */
   throwCoded: (c: Code, className: string, name: string, pushMessage: (c: Code) => void, code: string) => void;
+  /** DYN-ADAPTER PHASE: the LOUD, UNCATCHABLE trap S050/S051's own
+   * family uses — fills the cell then calls the shared
+   * `%w.err.reportUncaught` (renders "Uncaught <message>" to fd 2, then
+   * traps unconditionally, "never returns" — emitter.ts's own header on
+   * that helper). Distinct from `throwCoded` (a CATCHABLE JS exception,
+   * the caller unwinds normally): this is for a genuinely unbuilt
+   * shape reached at runtime, matching `listenersOf`'s own
+   * declared-prefix guard — the caller's own body ends right there,
+   * no `return_()`/unwind bookkeeping needed. */
+  reportUncaught: (c: Code, className: string, name: string, pushMessage: (c: Code) => void) => void;
 }
 
 export class EventsBuilder {
@@ -983,7 +993,7 @@ export class EventsBuilder {
 
   /** `(entry) -> eq` — the entry's IDENTITY closure (scr_ee_entry_fn):
    * `orig` when a dyn-adapted registration set it, `clos` otherwise. */
-  private entryIdentity(): number {
+  entryIdentity(): number {
     return this.cached("entryIdentity", () => {
       const idx = this.mb.declareFunc(this.mb.funcType([this.entryRef()], [EQ_REF]), "%w.ee.entryIdentity");
       const c = new Code();
@@ -999,6 +1009,117 @@ export class EventsBuilder {
       c.structGet(this.entryT(), ENTRY_ORIG);
       c.end();
       this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  /** DYN-ADAPTER PHASE: `listeners(name)`/`rawListeners(name)` — the
+   * frontend already unifies both into ONE libCall (`emitter.listeners`,
+   * lower-emitter.ts's own header: "Both members answer the ORIGINALS")
+   * because `entryIdentity()` (above) is what BOTH would read regardless
+   * — the once-wrapper is runtime-internal on this tier (events.ts's own
+   * file header), so there is nothing DIFFERENT for `rawListeners` to
+   * expose. This is Draft B's own S-entry made real (SEMANTICS.md, filed
+   * alongside this method). A fresh array, list order, each element the
+   * SAME `entryIdentity()` (`orig ?? clos`) `countFnOf`/`removeLast`
+   * already use — reused, not reimplemented. SCOPED to the general
+   * bucket only (`bucketFind`): the DEDICATED 'error' bucket family (a
+   * different representation entirely, no `name`/`next` chain — this
+   * file's own "direct-reference family") is a genuinely different walk
+   * this method does not build; no claim in this phase's scope calls
+   * `.listeners('error')` (checked: 1677's own three calls are 'evt',
+   * 'plain', 'never-registered', none of them 'error') — the CALLER
+   * (emitter.ts) is responsible for refusing that shape by name until a
+   * claim needs it, this method's own contract is general-bucket-only.
+   * `vecRef`/`vecNewLen`/`vecPushOne` are the CALLER's own per-event-
+   * tuple VecInfo (`vecInfoFor`'s own answer for THIS event's declared
+   * element type) — unlike `stringVecRef` (fixed for eventNames()), the
+   * listeners() element type varies by event, so it cannot live in the
+   * fixed EventsDeps shape; passed in per call instead.
+   *
+   * GATE FIX (board item, filed at the gate — the declared-prefix gap):
+   * a listener registered with a signature NARROWER than the event's
+   * own canonical tuple (`ee.on('evt', (a: string) => {...})` against a
+   * `(string, number)` event — legal Node, JS's own "extra args ignored"
+   * rule, lower-emitter.ts's own header names this exact shape) needs a
+   * closure ADAPTED to the full tuple to be a valid element of THIS
+   * array's own uniform element type — `entryIdentity()`'s existing
+   * consumers (`countFnOf`/`removeLast`) never needed that adaptation,
+   * since `ref.eq` compares ANY two eq-typed refs regardless of their
+   * more specific type. Building that adapter (a THIRD closure-minting
+   * family, `streamMethodWrapper`'s own shape ported to events.ts) is
+   * DEFERRED to the assert era (#37 — Draft B's own "Tested by" already
+   * anticipated `.listeners()`/`.rawListeners()` needing BOTH this and
+   * `assert.deepStrictEqual` before any claim reaches it, and 1677 is
+   * the ONLY corpus program that calls either method today, itself
+   * still blocked by the assert gap regardless — census-invisible until
+   * both land). What ships NOW: `ref.test` checks the shape BEFORE the
+   * cast a bare `refCast` would otherwise trap on — a NAMED, attributed
+   * loud trap (S050/S051's own reportUncaught pattern) instead, the
+   * ordinary out-of-tier contract, not a silent miscompile. */
+  listenersOf(vecRef: ValType, vecNewLen: number, vecPushOne: number, elemType: number): number {
+    return this.cached(`listenersOf:${vecNewLen}`, () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.deps.rootRef(), this.deps.strRef()], [vecRef]), "%w.ee.listenersOf");
+      const c = new Code();
+      const ROOT = 0, NAME = 1, REG = 2, OUT = 3, B = 4, E = 5, ID = 6;
+      c.localGet(ROOT);
+      c.structGet(this.deps.rootStruct(), EMITTER_REG);
+      c.localSet(REG);
+      c.f64Const(0);
+      c.call(vecNewLen);
+      c.localSet(OUT);
+      c.localGet(REG);
+      c.refIsNull();
+      c.ifVoid();
+      c.localGet(OUT);
+      c.return_();
+      c.end();
+      c.localGet(REG);
+      c.localGet(NAME);
+      c.call(this.bucketFind());
+      c.localSet(B);
+      c.localGet(B);
+      c.refIsNull();
+      c.ifVoid();
+      c.localGet(OUT);
+      c.return_();
+      c.end();
+      c.localGet(B);
+      c.structGet(this.bucketT(), BUCKET_EHEAD);
+      c.localSet(E);
+      c.block();
+      c.loop();
+      c.localGet(E);
+      c.refIsNull();
+      c.brIf(1);
+      c.localGet(E);
+      c.call(this.entryIdentity());
+      c.localSet(ID);
+      c.localGet(ID);
+      c.refTest(elemType);
+      c.ifVoid();
+      c.localGet(OUT);
+      c.localGet(ID);
+      c.refCast(elemType);
+      c.call(vecPushOne);
+      c.else_();
+      // GATE FIX (board item): a declared-prefix listener's own identity
+      // isn't shaped like the event's full tuple — `ref.test` caught it
+      // BEFORE the cast that would otherwise bare-trap (this method's
+      // own header has the full story). Loud and attributed, S050/
+      // S051's own reportUncaught pattern — never returns.
+      this.deps.reportUncaught(c, "%TypeError", "TypeError", (cc) =>
+        this.deps.lit(cc, "listeners()/rawListeners() over a narrower-arity listener is not supported yet"),
+      );
+      c.end();
+      c.localGet(E);
+      c.structGet(this.entryT(), ENTRY_NEXT);
+      c.localSet(E);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(OUT);
+      this.mb.setBody(idx, [this.regRef(), vecRef, this.bucketRef(), this.entryRef(), EQ_REF], c.bytes());
       return idx;
     });
   }

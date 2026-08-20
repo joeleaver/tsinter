@@ -60,6 +60,8 @@ import {
   typeEquals,
   typeKey,
   DYN,
+  VOID,
+  funcOf,
   JSVAL,
   NULL_T,
   UNDEFINED_T,
@@ -92,7 +94,7 @@ import {
   IMPORT_NOW,
   IMPORT_WRITE,
 } from "./abi.js";
-import { VecBuilder, type VecInfo } from "./arrays.js";
+import { LEN, VecBuilder, type VecInfo } from "./arrays.js";
 import {
   DK,
   DYN_KIND,
@@ -2918,6 +2920,10 @@ class Assembler {
       boxStr: (c, pushValue) => this.dyn.boxStr(c, pushValue),
       dynArrBufType: () => this.dynArgsBufType(),
       dynArrStructType: () => this.dynArrStructType(),
+      reportUncaught: (c, className, name, pushMessage) => {
+        this.emitSetCellError(c, className, name, pushMessage, null);
+        c.call(this.reportUncaughtHelper());
+      },
     });
     return this.eventsField;
   }
@@ -3055,6 +3061,7 @@ class Assembler {
       strType: () => this.strType,
       bytesPayloadBytes: (c, pushDyn) => this.dyn.bytesPayloadBytes(c, pushDyn),
       thunkSig: () => this.dyn.thunkSig(),
+      reportUncaught: () => this.reportUncaughtHelper(),
     });
     return this.streamField;
   }
@@ -3117,26 +3124,62 @@ class Assembler {
     if (thisParam === undefined) {
       throw new Error("wasm emitter bug: a _read closure's lifted type has no `this` parameter");
     }
-    // STAGE C FIX (authorized at the checkpoint): a checked-dynamic VALUE
-    // (`read: wrap(fn)`, lowerStreamCallbackValue's "thisless" adapterT —
-    // every position dyn-boxed, no leading `this` param) is a DIFFERENT
-    // lifted shape this thunk was never built for — `thisParam.kind ===
-    // "dyn"` in that case, and the OLD code proceeded anyway (mapType(dyn)
-    // answers a "ref"-kind ValType too, so the `thisT.kind !== "ref"`
-    // guard below never caught it), refCasting the REAL `this` (a
-    // %Readable-rooted ref) down to a dyn-box struct type — wasm accepts
-    // the refCast as valid (both are heap types) but the cast FAILS at
-    // RUNTIME, trapping — a silent-wrong-shape bug, not a compile error,
-    // found via execution (an isolated repro: node exit 0 with real
-    // output, wasm exit 1) — writeThunkFor/finalThunkFor/destroyThunkFor
-    // (stage C, same file) already guard this; this closes the same gap
-    // on pass 1's `_read` side. Refusing here is CENSUS-NEUTRAL: no
-    // corpus program claimed this shape before (it only ever trapped),
-    // so nothing claimed can regress — the trap becomes a loud refusal
-    // instead of a silent wrong exit code.
+    // DYN-ADAPTER PHASE (1811): a checked-dynamic VALUE (`read: wrap(fn)`,
+    // lowerStreamCallbackValue's "thisless" adapterT — every position
+    // dyn-boxed, no leading `this` param at all) is a DIFFERENT lifted
+    // shape than a typed override — `thisParam.kind === "dyn"` marks it.
+    // Node calls option-callbacks with `this` UNDEFINED (2313's own
+    // comment: "the lexical binding reaches the stream", not a bound
+    // receiver), so this thunk carries no receiver downcast at all,
+    // unlike the typed branch below.
+    //
+    // `readCbExpr` (what construction walks into RS_READ_CLOS) is NOT a
+    // raw `$dyn` value, despite crossing a checked-dynamic boundary —
+    // found by execution (d1-read-only.cjs's first cut traced a raw
+    // `dyn.callFn()` dispatch here, wasm exit 1 with EMPTY stderr — a
+    // bare trap, no "wrapped:" log ever printing, meaning the failure
+    // was BEFORE the JS-level closure ever ran). `lowerStreamCallbackValue`
+    // (lower-stream.ts) wraps the raw dyn value in a `dynCheck` targeting
+    // `adapterT = funcOf([DYN], VOID)` (a FUNC-kind type — `read`'s own
+    // tuple arity is 1, cbTuples' own table). `dynCheck`'s FUNC arm
+    // (emitDynCheckBody, `case "func"`) MINTS A REAL CLOSURE via
+    // `dynFnAdapter` — env holds the raw dyn value, `pair.fn`'s own body
+    // already bridges to `dyn.callFn()` internally. So `t` (this
+    // function's own parameter) IS a func-kind type whose params are
+    // uniformly DYN, and `pair` (already computed above via
+    // `closSigFor(t, loc)`, the SAME line the static branch below
+    // reuses) is the identical closSigFor pair a static override would
+    // get for this same `t` — refCasting CLOS to `pair.clos` and
+    // `callRef`-ing `pair.fn` is EXACTLY the static branch's own call
+    // shape, just with every position (INCLUDING position 0) treated as
+    // a plain dyn-boxed ARGUMENT rather than [this, ...prefix] — no
+    // separate `dyn.callFn()` dispatch of my own needed at all, the
+    // minted adapter already owns that.
+    //
+    // NO inline pending-check needed either: `callRead()` (stream.ts)
+    // already wraps ITS OWN `callRef(readThunkSig())` in `tryCatchAsError`
+    // (D2's fix, pre-existing, generic — it does not care what kind of
+    // thunk sat in the slot), so an Error-shaped throw from the
+    // dyn-adapted body is caught there exactly like a static `_read`'s
+    // own synchronous throw already is — verified, not assumed (see the
+    // phase's own dyn-callback probes).
     if (thisParam.kind === "dyn") {
-      this.refuse("libCall:readable.new:dyn-callback-value", loc);
-      return null;
+      const idx = this.mb.declareFunc(this.stream.readThunkSig(), `%w.rs.dynReadThunk:${key}`);
+      this.readThunkFns.set(key, idx);
+      const c = new Code();
+      const CLOS = 0, SIZE = 2, CL = 3;
+      const closRef: ValType = { kind: "ref", nullable: true, typeIndex: pair.clos };
+      c.localGet(CLOS);
+      c.refCast(pair.clos);
+      c.localSet(CL);
+      c.localGet(CL); // arg0: the closure itself (selfRef, env)
+      this.dyn.boxNum(c, (cc) => cc.localGet(SIZE)); // arg1: size, boxed dyn (adapterT's ONE param)
+      c.localGet(CL);
+      c.structGet(pair.clos, 0);
+      c.callRef(pair.fn);
+      // adapterT's own return is VOID — nothing to drop.
+      this.mb.setBody(idx, [closRef], c.bytes());
+      return idx;
     }
     const thisT = this.mapType(thisParam, loc);
     if (thisT === null || thisT.kind !== "ref") return null;
@@ -3152,7 +3195,22 @@ class Assembler {
     c.localGet(THIS);
     c.refCast(thisT.typeIndex); // arg1: `this`, downcast to the declaring class
     if (t.params.length === 2) {
-      c.localGet(SIZE); // arg2: the optional `size` param
+      // GATE FIX (1812, found by execution: "call_ref[2] expected type
+      // (ref null dyn), found local.get of type f64" — a wasm compile
+      // error, not a runtime trap, so caught before any claim could
+      // silently miscompile): an untyped `_read(n)` override (1812's own
+      // MyReader shape, no JSDoc at all) lifts `n` to DYN, same as
+      // writeThunkFor's own chunk/encoding gap this pass already fixed
+      // (chunkIsDyn/encIsDyn) — pushing the raw F64 SIZE local directly
+      // only worked because no PRE-1812 claim ever declared `_read`
+      // with an untyped size param (every prior one either omitted it
+      // or typed it `number`). Box, don't push raw, when the lifted
+      // param says dyn.
+      if (t.params[1]?.kind === "dyn") {
+        this.dyn.boxNum(c, (cc) => cc.localGet(SIZE));
+      } else {
+        c.localGet(SIZE); // arg2: the optional `size` param
+      }
     }
     c.localGet(CL);
     c.structGet(pair.clos, 0);
@@ -3398,6 +3456,177 @@ class Assembler {
     return made; // struct/fn indices stay valid wasm even though the body traps
   }
 
+  private readonly dynDoneClosFns = new Map<string, { env: number; fn: number } | null>();
+
+  /** DYN-ADAPTER PHASE: the completion-callback slot in a "thisless"
+   * adapterT (write/final/destroy/transform/flush) is uniformly DYN too
+   * — `doneClosFor`'s own typed-closure mint has no `cbType` to match
+   * against here, so this mints a REAL dyn FUNC value instead (via
+   * `dyn.boxFn` at the call site below), whose thunk matches
+   * `dyn.thunkSig()` exactly: `(closEq, argsVec) -> dyn`. The env struct
+   * carries (root[, wreq] — write/transform only, mirroring doneClosFor's
+   * own WREQ_FIELD: kept for a future need, never read as a call
+   * argument, same FIFO reasoning its header gives). Cached by KIND
+   * alone (no signature variance to key on — every dyn callback of one
+   * kind has the identical env/thunk shape, unlike doneClosFor's
+   * per-cbType cache).
+   *
+   * The err argument's dispatch (MEASURED, m-cb-err-matrix.cjs against
+   * real Node — 9 values, string/num0/num1/true/false/plainobj/
+   * realError/undefined/null): Node's onwriteError path is PURE JS
+   * TRUTHINESS on the raw callback argument, no type coercion — a
+   * truthy string/number/bool/plain-object fires 'error' with that
+   * EXACT value, unchanged. `RS_ERROR`/`destroyErrCore`/the whole
+   * error-dispatch pipeline is typed to a real `%Error`-rooted class
+   * ref, which has no representation for a non-Error truthy value — a
+   * genuine, deliberate, expressible divergence (a `.cjs` program can
+   * write `cb("oops")` today and it compiles): registered as
+   * SEMANTICS.md S051 (reused — the number the withdrawn allowHalfOpen
+   * trap vacated), a loud runtime trap, S050's own mold. `dyn.truthy()`
+   * (pre-existing, ToBoolean over any dyn kind) decides falsy vs truthy;
+   * `dyn.isError()` + the phase's own new `dyn.toError()` (dyn.ts, the
+   * `fromError()` cache's reverse scan) decide Error vs the S051 trap. */
+  private dynDoneClosFor(
+    kind: "write" | "final" | "destroy" | "transform" | "flush",
+    loc: SrcLoc | undefined,
+  ): { env: number; fn: number } | null {
+    const hit = this.dynDoneClosFns.get(kind);
+    if (hit !== undefined) return hit;
+    const rootInfo = this.classInfo("%Readable", loc);
+    if (rootInfo === null) {
+      this.dynDoneClosFns.set(kind, null);
+      return null;
+    }
+    const rootRef = this.classes.ref(rootInfo);
+    const needsWreq = kind === "write" || kind === "transform";
+    const isTransformish = kind === "transform" || kind === "flush";
+    const ROOT_FIELD = 0;
+    const fields: FieldType[] = [{ storage: rootRef, mutable: false }];
+    if (needsWreq) fields.push({ storage: this.stream.wReqRef(), mutable: false });
+    const env = this.mb.openStructType(`dynDoneEnv:${kind}`, fields);
+    const idx = this.mb.declareFunc(this.dyn.thunkSig(), `%w.dyn.doneThunk:${kind}`);
+    const made = { env, fn: idx };
+    this.dynDoneClosFns.set(kind, made);
+    const c = new Code();
+    const CLOS = 0, ARGS = 1, ENVL = 2, N = 3, ARG0 = 4, ERR = 5, ARG1 = 6, DATA = 7;
+    const envRef: ValType = { kind: "ref", nullable: true, typeIndex: env };
+    const dynRef = this.dyn.dynRef();
+    const errRefType: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+    const bytesRefType = this.bytesB.bytesRef();
+    c.localGet(CLOS);
+    c.refCast(env);
+    c.localSet(ENVL);
+    c.localGet(ARGS);
+    c.structGet(this.dynVecInfo().struct, LEN);
+    c.localSet(N);
+    // ERR: absent (N < 1) or falsy -> null; truthy + isError() -> the
+    // real errRef (toError()'s reverse lookup); truthy, not an Error ->
+    // S051's own trap (named, registered — this method's own header).
+    c.localGet(N);
+    c.i32Const(1);
+    c.i32GeS();
+    c.ifResult(errRefType);
+    c.localGet(ARGS);
+    c.f64Const(0);
+    c.call(this.vecs.get(this.dynVecInfo()));
+    c.localSet(ARG0);
+    c.localGet(ARG0);
+    c.call(this.dyn.truthy());
+    c.ifResult(errRefType);
+    c.localGet(ARG0);
+    c.call(this.dyn.isError());
+    c.ifResult(errRefType);
+    c.localGet(ARG0);
+    c.call(this.dyn.toError());
+    c.else_();
+    // NOT emitSetCellErrorLit(): that writes to `this.fn.code` (the
+    // NORMAL walker's own tracked current function) — found by
+    // execution exactly like the design notes' §2 warned, but caught
+    // here fresh: the trap fired from wherever `this.fn` happened to
+    // point at BUILD time (this thunk being a hand-built Code buffer,
+    // called from writeThunkFor's own hand-built body during
+    // construction-time compilation), not from THIS thunk when actually
+    // INVOKED — no reachability probe ever printed, because the
+    // corrupted code landed in an unrelated function entirely.
+    // `emitSetCellError(c, ...)` — the explicit-buffer variant — is the
+    // correct call here, mirroring `emitSetCellErrorLit`'s own internal
+    // delegation with MY `c` instead of `this.fn.code`.
+    this.emitSetCellError(
+      c,
+      "%Error",
+      "Error",
+      (cc) => this.pushStrLitInto(cc, "a non-Error completion-callback argument is not supported yet (SEMANTICS.md S051)"),
+      null,
+    );
+    c.call(this.reportUncaughtHelper());
+    c.unreachable(); // reportUncaughtHelper never returns; satisfies the ifResult's errRefType arm
+    c.end();
+    c.else_();
+    c.refNull(this.exc().errT);
+    c.end();
+    c.else_();
+    c.refNull(this.exc().errT);
+    c.end();
+    c.localSet(ERR);
+    if (isTransformish) {
+      // DATA: absent (N < 2) or not BYTES/STR -> null; BYTES -> the
+      // payload directly; STR -> converted to bytes (utf8, matching
+      // doneClosFor's OWN string-arm conversion for the typed path).
+      c.localGet(N);
+      c.i32Const(2);
+      c.i32GeS();
+      c.ifResult(bytesRefType);
+      c.localGet(ARGS);
+      c.f64Const(1);
+      c.call(this.vecs.get(this.dynVecInfo()));
+      c.localSet(ARG1);
+      c.localGet(ARG1);
+      c.structGet(this.dyn.dynT(), DYN_KIND);
+      c.i32Const(DK.BYTES);
+      c.i32Eq();
+      c.ifResult(bytesRefType);
+      this.dyn.bytesPayloadBytes(c, (cc) => cc.localGet(ARG1));
+      c.else_();
+      c.localGet(ARG1);
+      c.structGet(this.dyn.dynT(), DYN_KIND);
+      c.i32Const(DK.STR);
+      c.i32Eq();
+      c.ifResult(bytesRefType);
+      c.localGet(ARG1);
+      c.structGet(this.dyn.dynT(), DYN_REF);
+      c.refCast(this.strType);
+      c.call(this.bytesB.fromStrHelper("utf8"));
+      c.else_();
+      c.refNull(this.bytesB.bytesType());
+      c.end();
+      c.end();
+      c.else_();
+      c.refNull(this.bytesB.bytesType());
+      c.end();
+      c.localSet(DATA);
+    }
+    c.localGet(ENVL);
+    c.structGet(env, ROOT_FIELD);
+    c.localGet(ERR);
+    if (isTransformish) c.localGet(DATA);
+    c.call(
+      kind === "write"
+        ? this.stream.afterWriteCore()
+        : kind === "final"
+          ? this.stream.finalDoneCore()
+          : kind === "destroy"
+            ? this.stream.destroyErrDefaultCore()
+            : kind === "transform"
+              ? this.stream.afterTransformCore()
+              : this.stream.flushDoneCore(),
+    );
+    c.globalGet(this.dyn.undefinedGlobal());
+    const extraLocals: ValType[] = [envRef, I32, dynRef, errRefType];
+    if (isTransformish) extraLocals.push(dynRef, bytesRefType);
+    this.mb.setBody(idx, extraLocals, c.bytes());
+    return made;
+  }
+
   /** `_write`'s adapter (mirrors `readThunkFor`): builds the done-closure
    * for the DECLARED prefix's trailing callback slot (when present) and
    * calls the user's lifted `_write` closure with whatever prefix it
@@ -3422,18 +3651,57 @@ class Assembler {
     if (pair === null) return null;
     const thisParam = t.params[0];
     if (thisParam === undefined) throw new Error("wasm emitter bug: a _write closure's lifted type has no `this` parameter");
-    // A checked-dynamic VALUE (`write: wrap(fn)`, lowerStreamCallbackValue's
-    // "thisless" adapterT — every position dyn-boxed, no leading `this`
-    // param at all) is a DIFFERENT lifted shape this thunk does not build
-    // for (it would need dyn-boxing the chunk/encoding and unboxing a dyn
-    // return, real new machinery) — refuse by name rather than emit a
-    // static-type mismatch (found via execution: readThunkFor's PRE-
-    // EXISTING equivalent doesn't guard this either and instead produces
-    // wasm that validates but TRAPS at runtime on the bad refCast — worse
-    // than a loud refusal; reported, not silently matched here).
+    // DYN-ADAPTER PHASE (1811/2313): a checked-dynamic VALUE (`write:
+    // wrap(fn)`, lowerStreamCallbackValue's "thisless" adapterT — every
+    // position dyn-boxed, no leading `this` param) — readThunkFor's own
+    // header has the full corrected-design story (`pair` is already the
+    // dynCheck-FUNC-arm-minted adapter closure; call it like any other
+    // closure, no separate dyn.callFn() dispatch of my own). Chunk/
+    // encoding box via the SAME `dyn.boxBytes`/`dyn.boxStr` the
+    // "transform" kind already uses below (chunkIsDyn/encIsDyn) — a
+    // "thisless" callback value ALWAYS wants both boxed (adapterT's own
+    // params are uniformly DYN, kind-independent), so this branch does
+    // not consult chunkIsDyn/encIsDyn at all, it boxes unconditionally.
+    // The completion callback is `dynDoneClosFor(kind, loc)`'s own mint
+    // (that method's header has the DK-dispatch/S051 story) —
+    // `dyn.boxFn` wraps it as a real dyn FUNC value the user's `cb(...)`
+    // call can invoke like any other.
     if (thisParam.kind === "dyn") {
-      this.refuse(`libCall:${diagBase}:dyn-callback-value`, loc);
-      return null;
+      const dc = this.dynDoneClosFor(kind, loc);
+      if (dc === null) {
+        this.refuse(`libCall:${diagBase}:dyn-callback-value`, loc);
+        return null;
+      }
+      this.mb.declareFuncRef(dc.fn);
+      const idx = this.mb.declareFunc(this.stream.writeThunkSig(), `%w.ws.dyn${kind === "write" ? "Write" : "Transform"}Thunk:${key}`);
+      this.writeThunkFns.set(key, idx);
+      const c = new Code();
+      const CLOS = 0, THIS = 1, CHUNK = 2, ENC = 3, WREQ = 4, CL = 5;
+      const closRef: ValType = { kind: "ref", nullable: true, typeIndex: pair.clos };
+      c.localGet(CLOS);
+      c.refCast(pair.clos);
+      c.localSet(CL);
+      c.localGet(CL); // arg0: the closure itself
+      this.dyn.boxBytes(c, (cc) => this.dyn.pushNewBytesPayload(cc, (ccc) => ccc.localGet(CHUNK), (ccc) => ccc.i32Const(1)));
+      this.dyn.boxStr(c, (cc) => cc.localGet(ENC));
+      this.dyn.boxFn(
+        c,
+        (cc) => {
+          cc.localGet(THIS);
+          if (kind === "write" || kind === "transform") cc.localGet(WREQ);
+          cc.structNew(dc.env);
+        },
+        (cc) => cc.refFunc(dc.fn),
+        this.dynFnSigId(`%w.dyn.doneCb:${kind}`),
+        (cc) => cc.refNull(this.strType),
+        1,
+      );
+      c.localGet(CL);
+      c.structGet(pair.clos, 0);
+      c.callRef(pair.fn);
+      // adapterT's own return is VOID — nothing to drop.
+      this.mb.setBody(idx, [closRef], c.bytes());
+      return idx;
     }
     // GATE FIX (chunk:unknown invalid-wasm, C1's class — found writing
     // stage C's own test coverage, NOT reachable by any claim): stream.
@@ -3452,9 +3720,9 @@ class Assembler {
     // before the call.
     //
     // STAGE C PASS 2, Transform (CORRECTION ruling B, revised): for kind
-    // "transform" ONLY, a dyn-typed chunk is NOT refused — it's the
-    // ORDINARY case (the project ambient's `_transform(chunk: any, ...)`
-    // — ungrounded in any Buffer-narrowing precedent, verified directly,
+    // "transform", a dyn-typed chunk is NOT refused — it's the ORDINARY
+    // case (the project ambient's `_transform(chunk: any, ...)` —
+    // ungrounded in any Buffer-narrowing precedent, verified directly,
     // real Node's own ambient matches). The direction is BOX, not unbox:
     // doWriteCore's own contract hands this bridge real bytes (the SAME
     // CHUNK local every other kind already uses), and the user's dyn-
@@ -3465,24 +3733,33 @@ class Assembler {
     // the 'data' event's own tuple. `dyn.toString(enc?)`'s BYTES-kind arm
     // (this file, "a stream chunk's common consumption") was ALREADY
     // built anticipating exactly this receiver shape — verified by
-    // reading its body, not assumed. write/final/destroy kinds still
-    // refuse (their own machinery genuinely doesn't exist yet). ENCODING:
-    // an unannotated `.cjs` `_transform` override (1747's own shape — no
-    // JSDoc types at all) lands BOTH params checked-dynamic, not just
-    // chunk — the established stance for JS sources this tier already
-    // has (the dyn-callback-value family, onDataDyn, every other *Dyn
-    // variant the cjs lane produces; observed directly via 1747's own
-    // refusal name, not separately traced beyond that). `encoding` is
-    // boxed the same way, `dyn.boxStr` over the FIXED "buffer" literal
-    // ENC already carries (writeThunkSig's own contract — encoding never
-    // varies on this tier), same transform-kind-only scoping.
+    // reading its body, not assumed. ENCODING: an unannotated `.cjs`
+    // override (1747's own `_transform` shape — no JSDoc types at all)
+    // lands BOTH params checked-dynamic, not just chunk — the
+    // established stance for JS sources this tier already has (the
+    // dyn-callback-value family, onDataDyn, every other *Dyn variant the
+    // cjs lane produces). `encoding` is boxed the same way, `dyn.boxStr`
+    // over the FIXED "buffer" literal ENC already carries (writeThunkSig's
+    // own contract — encoding never varies on this tier).
+    //
+    // DYN-ADAPTER PHASE (1812): extended to kind "write" too — MyWriter's
+    // own `_write(chunk, enc, cb)` (unannotated .cjs, riding
+    // `.initDyn`'s fallback-closure path, `thisParam` is REAL/typed
+    // here, only chunk/encoding are dyn) hits the exact same shape
+    // "transform" already solved; the boxing machinery is kind-
+    // independent (doWriteCore hands EVERY kind the same real
+    // bytes/"buffer" locals), so the restriction was never load-bearing
+    // — it was scoped to "transform" only because that was the only
+    // claim that needed it at the time, not because "write" is
+    // structurally different. `final`/`destroy` still refuse: their own
+    // tuples have no chunk/encoding position to box at all.
     const chunkIsDyn = t.params[1]?.kind === "dyn";
-    if (chunkIsDyn && kind !== "transform") {
+    if (chunkIsDyn && kind !== "transform" && kind !== "write") {
       this.refuse(`libCall:${diagBase}:dyn-chunk-override`, loc);
       return null;
     }
     const encIsDyn = t.params[2]?.kind === "dyn";
-    if (encIsDyn && kind !== "transform") {
+    if (encIsDyn && kind !== "transform" && kind !== "write") {
       this.refuse(`libCall:${diagBase}:dyn-encoding-override`, loc);
       return null;
     }
@@ -3515,23 +3792,57 @@ class Assembler {
     }
     if (t.params.length >= 4) {
       const cbType = t.params[3];
-      if (cbType === undefined || cbType.kind !== "func") {
+      // DYN-ADAPTER PHASE (1747): an unannotated `.cjs` override (no
+      // JSDoc at all) infers ALL its params checked-dynamic, including
+      // the callback specifically — a DIFFERENT shape than the
+      // "thisless" branch above (chunk/encoding/callback all dyn, no
+      // receiver at all): here `this` IS real and typed (thisParam.kind
+      // !== "dyn", this whole branch's own precondition), only the
+      // callback position is dyn. `dynDoneClosFor(kind, loc)` mints the
+      // SAME boxFn-wrapped done-callback the thisless branch uses — its
+      // env's root field takes `THIS` RAW (writeThunkSig's own rootRef
+      // param, BEFORE the refCast a few lines up narrows the local
+      // COPY pushed as pair.fn's arg1 — the local itself is untouched,
+      // still rootRef-typed, exactly what dc.env's field expects).
+      if (cbType !== undefined && cbType.kind === "dyn") {
+        const dc = this.dynDoneClosFor(kind, loc);
+        if (dc === null) {
+          this.refuse(`libCall:${diagBase}:non-func-callback`, loc);
+          c.unreachable();
+          this.mb.setBody(idx, [closRef], c.bytes());
+          return idx;
+        }
+        this.mb.declareFuncRef(dc.fn);
+        this.dyn.boxFn(
+          c,
+          (cc) => {
+            cc.localGet(THIS);
+            if (kind === "write" || kind === "transform") cc.localGet(WREQ);
+            cc.structNew(dc.env);
+          },
+          (cc) => cc.refFunc(dc.fn),
+          this.dynFnSigId(`%w.dyn.doneCb:${kind}`),
+          (cc) => cc.refNull(this.strType),
+          1,
+        );
+      } else if (cbType === undefined || cbType.kind !== "func") {
         this.refuse(`libCall:${diagBase}:non-func-callback`, loc);
         c.unreachable();
         this.mb.setBody(idx, [closRef], c.bytes());
         return idx;
+      } else {
+        const dc = this.doneClosFor(cbType, kind, loc);
+        if (dc === null) {
+          c.unreachable();
+          this.mb.setBody(idx, [closRef], c.bytes());
+          return idx;
+        }
+        this.mb.declareFuncRef(dc.fn);
+        c.refFunc(dc.fn);
+        c.localGet(THIS);
+        c.localGet(WREQ);
+        c.structNew(dc.struct);
       }
-      const dc = this.doneClosFor(cbType, kind, loc);
-      if (dc === null) {
-        c.unreachable();
-        this.mb.setBody(idx, [closRef], c.bytes());
-        return idx;
-      }
-      this.mb.declareFuncRef(dc.fn);
-      c.refFunc(dc.fn);
-      c.localGet(THIS);
-      c.localGet(WREQ);
-      c.structNew(dc.struct);
     }
     c.localGet(CL);
     c.structGet(pair.clos, 0);
@@ -3561,11 +3872,45 @@ class Assembler {
     if (pair === null) return null;
     const thisParam = t.params[0];
     if (thisParam === undefined) throw new Error("wasm emitter bug: a _final closure's lifted type has no `this` parameter");
+    // DYN-ADAPTER PHASE: `final`/`flush`'s own tuple arity is 1 (just
+    // the callback — cbTuples' own table), so adapterT = funcOf([DYN],
+    // VOID) — the SAME "thisless" shape readThunkFor's own corrected
+    // design already covers (that header has the full story), one
+    // position narrower than write/transform's three. No chunk/encoding
+    // to box, just the completion callback.
     if (thisParam.kind === "dyn") {
-      // writeThunkFor's own guard, same reasoning: a thisless dyn-boxed
-      // value shape this thunk does not build for.
-      this.refuse(`libCall:${diagBase}:dyn-callback-value`, loc);
-      return null;
+      const dc = this.dynDoneClosFor(kind, loc);
+      if (dc === null) {
+        this.refuse(`libCall:${diagBase}:dyn-callback-value`, loc);
+        return null;
+      }
+      this.mb.declareFuncRef(dc.fn);
+      const idx = this.mb.declareFunc(this.stream.finalThunkSig(), `%w.ws.dyn${kind === "final" ? "Final" : "Flush"}Thunk:${key}`);
+      this.finalThunkFns.set(key, idx);
+      const c = new Code();
+      const CLOS = 0, THIS = 1, CL = 2;
+      const closRef: ValType = { kind: "ref", nullable: true, typeIndex: pair.clos };
+      c.localGet(CLOS);
+      c.refCast(pair.clos);
+      c.localSet(CL);
+      c.localGet(CL); // arg0: the closure itself
+      this.dyn.boxFn(
+        c,
+        (cc) => {
+          cc.localGet(THIS);
+          cc.structNew(dc.env);
+        },
+        (cc) => cc.refFunc(dc.fn),
+        this.dynFnSigId(`%w.dyn.doneCb:${kind}`),
+        (cc) => cc.refNull(this.strType),
+        1,
+      );
+      c.localGet(CL);
+      c.structGet(pair.clos, 0);
+      c.callRef(pair.fn);
+      // adapterT's own return is VOID — nothing to drop.
+      this.mb.setBody(idx, [closRef], c.bytes());
+      return idx;
     }
     const thisT = this.mapType(thisParam, loc);
     if (thisT === null || thisT.kind !== "ref") return null;
@@ -3620,9 +3965,55 @@ class Assembler {
     if (pair === null) return null;
     const thisParam = t.params[0];
     if (thisParam === undefined) throw new Error("wasm emitter bug: a _destroy closure's lifted type has no `this` parameter");
+    // DYN-ADAPTER PHASE: `destroy`'s own tuple is `[errorOrNull(L),
+    // "fn"]` (cbTuples) — TWO dyn positions, unlike final/flush's one.
+    // Position 0 is the INCOMING err this thunk's OWN signature already
+    // has as a real (nullable) errRef (destroyThunkSig's ERR param) —
+    // box it null->`dyn.nullGlobal()`, non-null->`dyn.fromError()`
+    // (dynFromHelper's own "object" case, reused directly: an errRef IS
+    // exactly what that case expects). Position 1 is the completion
+    // callback, `dynDoneClosFor("destroy", loc)`'s own mint.
     if (thisParam.kind === "dyn") {
-      this.refuse("libCall:stream.destroy:dyn-callback-value", loc);
-      return null;
+      const dc = this.dynDoneClosFor("destroy", loc);
+      if (dc === null) {
+        this.refuse("libCall:stream.destroy:dyn-callback-value", loc);
+        return null;
+      }
+      this.mb.declareFuncRef(dc.fn);
+      const idx = this.mb.declareFunc(this.stream.destroyThunkSig(), `%w.rs.dynDestroyThunk:${key}`);
+      this.destroyThunkFns.set(key, idx);
+      const c = new Code();
+      const CLOS = 0, THIS = 1, ERR = 2, CL = 3;
+      const closRef: ValType = { kind: "ref", nullable: true, typeIndex: pair.clos };
+      c.localGet(CLOS);
+      c.refCast(pair.clos);
+      c.localSet(CL);
+      c.localGet(CL); // arg0: the closure itself
+      c.localGet(ERR);
+      c.refIsNull();
+      c.ifResult(this.dyn.dynRef());
+      c.globalGet(this.dyn.nullGlobal());
+      c.else_();
+      c.localGet(ERR);
+      c.call(this.dyn.fromError());
+      c.end();
+      this.dyn.boxFn(
+        c,
+        (cc) => {
+          cc.localGet(THIS);
+          cc.structNew(dc.env);
+        },
+        (cc) => cc.refFunc(dc.fn),
+        this.dynFnSigId("%w.dyn.doneCb:destroy"),
+        (cc) => cc.refNull(this.strType),
+        1,
+      );
+      c.localGet(CL);
+      c.structGet(pair.clos, 0);
+      c.callRef(pair.fn);
+      // adapterT's own return is VOID — nothing to drop.
+      this.mb.setBody(idx, [closRef], c.bytes());
+      return idx;
     }
     const thisT = this.mapType(thisParam, loc);
     if (thisT === null || thisT.kind !== "ref") return null;
@@ -3698,6 +4089,287 @@ class Assembler {
     if (t.ret.kind !== "void") c.drop();
     this.mb.setBody(idx, [closRef], c.bytes());
     return idx;
+  }
+
+  /** i32 TRUE iff the dyn value `pushVal` produces is null, DK.UNDEF, or
+   * DK.NULL — GATE FIX, found by execution (a bare wasm trap, empty
+   * stderr, on 1812's own zero-arg `new MyReader()`): the FIRST cut
+   * wrote this as `refIsNull() || DK==UNDEF || DK==NULL` via `i32.or`
+   * over an UNCONDITIONAL `structGet` on the possibly-null value —
+   * wasm's `i32.or`/`i32.and` never short-circuit (both operands always
+   * evaluate, unlike JS `||`/`&&`), so `structGet` on a genuinely-null
+   * ref traps immediately instead of the OR ever getting a chance to
+   * short it out. `pushVal` is called up to twice (locals are safe to
+   * re-read; this is never handed a stack value), and the second/third
+   * reads only happen INSIDE the `else_` arm, where nullness has
+   * already been excluded — the fix IS the short-circuit, via a real
+   * `ifResult` branch instead of a bitwise OR. */
+  private emitDynIsAbsentish(code: Code, pushVal: (code: Code) => void): void {
+    const dynT = this.dyn.dynT();
+    pushVal(code);
+    code.refIsNull();
+    code.ifResult(I32);
+    code.i32Const(1);
+    code.else_();
+    pushVal(code);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.UNDEF);
+    code.i32Eq();
+    pushVal(code);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.NULL);
+    code.i32Eq();
+    code.i32Or();
+    code.end();
+  }
+
+  /** `dynOpts[key]` if `hasOpts`, else a dyn NULL (never traps on a
+   * missing key — `objGet`'s own null answer, matching a genuinely
+   * absent options record). Shared by `emitInitDynScalars` and
+   * `emitInitDynSlot` so the "is there even a record" guard is written
+   * once. */
+  private emitInitDynGet(code: Code, hasOpts: number, dynOpts: number, key: string): void {
+    const dynRefT = this.dyn.dynRef();
+    code.localGet(hasOpts);
+    code.ifResult(dynRefT);
+    this.dyn.objPayload(code, (cc) => cc.localGet(dynOpts));
+    this.pushStrLitInto(code, key);
+    code.call(this.dyn.objGet());
+    code.else_();
+    code.refNull(this.dyn.dynT());
+    code.end();
+  }
+
+  /** DYN-ADAPTER PHASE (1812): the scalar half of a `.initDyn`
+   * construction — highWaterMark/encoding/autoDestroy, measured
+   * directly against Node (m-initdyn-scalars.cjs). SCOPED: 1812's own
+   * three constructions only ever pass undefined-or-valid-integer hwm
+   * and the single valid encoding 'utf8' — the throwing edge cases
+   * (Node validates hwm strictly and throws for non-integer/negative/
+   * non-number; an unrecognized encoding name also throws) are NOT
+   * replicated here (Node's own message needs util.inspect-quality
+   * value rendering, zero corpus payoff right now) — a loud named
+   * runtime trap instead, never a silent default. autoDestroy is built
+   * to the FULL measured rule (`!== false`, not truthiness) despite
+   * zero exercise, since it reuses the exact DK-check shape already on
+   * hand. emitClose is defaulted true unconditionally — no claim reads
+   * the record for it at all. */
+  private emitInitDynScalars(code: Code, root: number, st: number, hasOpts: number, dynOpts: number, hwmField: number, loc: SrcLoc | undefined): void {
+    const dynRefT = this.dyn.dynRef();
+    const dynT = this.dyn.dynT();
+    // highWaterMark.
+    const HWM = this.acquireScratch(dynRefT);
+    this.emitInitDynGet(code, hasOpts, dynOpts, "highWaterMark");
+    code.localSet(HWM);
+    code.localGet(st);
+    this.emitDynIsAbsentish(code, (cc) => cc.localGet(HWM));
+    code.ifResult(F64);
+    code.f64Const(65536);
+    code.else_();
+    code.localGet(HWM);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.NUM);
+    code.i32Eq();
+    code.ifResult(F64);
+    // A valid hwm: non-negative, integer-valued, not NaN (f64Trunc(NaN)
+    // is NaN, and NaN never equals itself, so the trunc-equality check
+    // excludes NaN for free without a separate self-compare).
+    const HWMVAL = this.acquireScratch(F64);
+    code.localGet(HWM);
+    code.structGet(dynT, DYN_NUM);
+    code.localSet(HWMVAL);
+    code.localGet(HWMVAL);
+    code.f64Const(0);
+    code.f64Ge();
+    code.localGet(HWMVAL);
+    code.localGet(HWMVAL);
+    code.f64Trunc();
+    code.f64Eq();
+    code.i32And();
+    code.ifResult(F64);
+    code.localGet(HWMVAL);
+    code.else_();
+    this.emitSetCellError(code, "%TypeError", "TypeError", (cc) => this.pushStrLitInto(cc, "the highWaterMark value for this dyn options record is not supported yet (out of scope: only a valid non-negative integer is built)"), null);
+    code.call(this.reportUncaughtHelper());
+    code.unreachable();
+    code.end();
+    this.releaseScratch(F64, HWMVAL);
+    code.else_();
+    this.emitSetCellError(code, "%TypeError", "TypeError", (cc) => this.pushStrLitInto(cc, "a non-numeric highWaterMark for this dyn options record is not supported yet"), null);
+    code.call(this.reportUncaughtHelper());
+    code.unreachable();
+    code.end();
+    code.end();
+    code.structSet(this.stream.stateT(), hwmField);
+    this.releaseScratch(dynRefT, HWM);
+    // encoding.
+    const ENC = this.acquireScratch(dynRefT);
+    this.emitInitDynGet(code, hasOpts, dynOpts, "encoding");
+    code.localSet(ENC);
+    this.emitDynIsAbsentish(code, (cc) => cc.localGet(ENC));
+    code.ifVoid();
+    // absent: no setEncoding call at all, matches the default off state.
+    code.else_();
+    code.localGet(ENC);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.STR);
+    code.i32Eq();
+    code.ifVoid();
+    const ENCVAL = this.acquireScratch(this.strRef);
+    code.localGet(ENC);
+    code.structGet(dynT, DYN_REF);
+    code.refCast(this.strType);
+    code.localSet(ENCVAL);
+    code.localGet(ENCVAL);
+    this.pushStrLitInto(code, "utf8");
+    code.call(this.strEqHelper());
+    code.ifVoid();
+    code.localGet(root);
+    code.call(this.stream.setEncodingUtf8Core());
+    code.drop();
+    code.else_();
+    code.localGet(ENCVAL);
+    this.pushStrLitInto(code, "hex");
+    code.call(this.strEqHelper());
+    code.ifVoid();
+    code.localGet(root);
+    code.call(this.stream.setEncodingHexCore());
+    code.drop();
+    code.else_();
+    this.emitSetCellError(code, "%TypeError", "TypeError", (cc) => this.pushStrLitInto(cc, "this dyn options record's encoding name is not supported yet (only 'utf8'/'hex' are built)"), null);
+    code.call(this.reportUncaughtHelper());
+    code.unreachable();
+    code.end();
+    code.end();
+    this.releaseScratch(this.strRef, ENCVAL);
+    code.else_();
+    this.emitSetCellError(code, "%TypeError", "TypeError", (cc) => this.pushStrLitInto(cc, "a non-string encoding for this dyn options record is not supported yet"), null);
+    code.call(this.reportUncaughtHelper());
+    code.unreachable();
+    code.end();
+    code.end();
+    this.releaseScratch(dynRefT, ENC);
+    // autoDestroy: measured `!== false`, not truthiness (m-initdyn-
+    // scalars.cjs: a truthy string, and 0, both still leave it true;
+    // only the literal boolean false flips it).
+    const AD = this.acquireScratch(dynRefT);
+    this.emitInitDynGet(code, hasOpts, dynOpts, "autoDestroy");
+    code.localSet(AD);
+    code.localGet(st);
+    code.localGet(AD);
+    code.refIsNull();
+    code.ifResult(I32);
+    code.i32Const(1); // absent -> never the literal false -> true
+    code.else_();
+    code.localGet(AD);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.BOOL);
+    code.i32Eq();
+    code.ifResult(I32);
+    code.localGet(AD);
+    code.structGet(dynT, DYN_NUM);
+    code.f64Const(0);
+    code.f64Eq(); // BOOL false is stored with num=0 (boxBool's own widening)
+    code.i32Eqz(); // NOT false -> true
+    code.else_();
+    code.i32Const(1); // not a bool at all -> never the literal false -> true
+    code.end();
+    code.end();
+    code.structSet(this.stream.stateT(), RS_AUTO_DESTROY);
+    this.releaseScratch(dynRefT, AD);
+    // emitClose: unconditional default, no claim reads it from the record.
+    code.localGet(st);
+    code.i32Const(1);
+    code.structSet(this.stream.stateT(), RS_EMIT_CLOSE);
+  }
+
+  /** DYN-ADAPTER PHASE (1812): binds ONE callback slot (read/write/
+   * final/destroy) for a `.initDyn` construction. Unlike readable.new/
+   * writable.new's compile-time cbExpr, the options record is RUNTIME
+   * data, so the choice (dyn-adapter / class fallback / nothing) is
+   * made AT RUNTIME per Node's own instance-property-over-prototype
+   * rule: a same-named options VALUE that is a real function shadows
+   * the class's own declared override (1812's own `{ read:
+   * identity(shadowRead) }`); a non-function value (1812's own `{
+   * write: 1 }`, Node's own typeof guard) or an absent key falls back
+   * to the class's declared method, if any; absent with no declared
+   * method leaves the slot unbound (readable.new's own construct-
+   * WITHOUT precedent). `dynAdapterThunkIdx` is NOT a new adapter
+   * family — it is a thunk ALREADY built by readThunkFor/writeThunkFor/
+   * finalThunkFor/destroyThunkFor (1811/2313/1747's own family),
+   * reused here by constructing the SAME adapterT shape those call
+   * sites' own `dynCheck` already produces (typeKey-identical, so this
+   * is a cache hit whenever the SAME slot kind was already built
+   * elsewhere in the module, a fresh build otherwise). `fallbackExpr`
+   * is walked AT MOST ONCE (the two conditions that route to it —
+   * absent, or present-but-not-a-function — are combined into one
+   * `isDynFunc` flag first) since a closure literal's own construction
+   * may not be side-effect-free to duplicate. */
+  private emitInitDynSlot(
+    code: Code,
+    st: number,
+    hasOpts: number,
+    dynOpts: number,
+    slotName: string,
+    fallbackExpr: IrExpr | null,
+    closField: number,
+    thunkField: number,
+    dynAdapterThunkIdx: number,
+    dynAdapterFn: number,
+    dynAdapterEnv: number,
+    fallbackThunkIdx: number | null,
+  ): void {
+    const dynRef = this.dyn.dynRef();
+    const OPTVAL = this.acquireScratch(dynRef);
+    this.emitInitDynGet(code, hasOpts, dynOpts, slotName);
+    code.localSet(OPTVAL);
+    code.localGet(OPTVAL);
+    code.refIsNull();
+    code.ifResult(I32);
+    code.i32Const(0); // absent -> never DK.FUNC
+    code.else_();
+    code.localGet(OPTVAL);
+    code.structGet(this.dyn.dynT(), DYN_KIND);
+    code.i32Const(DK.FUNC);
+    code.i32Eq();
+    code.end(); // present AND DK.FUNC (short-circuit-safe: structGet only runs when non-null)
+    code.ifVoid();
+    // GATE FIX, found by execution (a bare wasm trap during `_read`'s
+    // own re-entry, empty stderr — 1812's own THIRD construction, the
+    // shadowing case): `closField` must hold a `pair.clos`-SHAPED value
+    // (whatever `dynAdapterThunkIdx`'s own body refCasts against), not
+    // the raw `$dyn` OPTVAL directly — 1811's own construction reaches
+    // this shape via the FRONTEND's `dynCheck` (its FUNC arm mints
+    // EXACTLY this wrapper via `dynFnAdapter`, emitDynCheckBody's own
+    // "case func" — readThunkFor's header has the trace). Reading
+    // straight from `dyn.objGet()` here skips that conversion entirely,
+    // so refCasting the bare dyn struct against `pair.clos` at CALL time
+    // trapped (a genuine type mismatch, wasm validates it but the two
+    // struct shapes are unrelated). Fixed: mint the SAME wrapper here —
+    // `dynAdapterFn`/`dynAdapterEnv` (this method's own new params, from
+    // `dynFnAdapter(adapterT, loc)`, called once per slot by the two
+    // `.initDyn` case bodies) — `refFunc(dynAdapterFn); OPTVAL;
+    // structNew(dynAdapterEnv)`, a `pair.clos` subtype by construction
+    // (dynFnAdapter's own env is declared as exactly that subtype).
+    code.localGet(st);
+    code.refFunc(dynAdapterFn);
+    code.localGet(OPTVAL);
+    code.structNew(dynAdapterEnv);
+    code.structSet(this.stream.stateT(), closField);
+    code.localGet(st);
+    code.refFunc(dynAdapterThunkIdx);
+    code.structSet(this.stream.stateT(), thunkField);
+    code.else_();
+    if (fallbackThunkIdx !== null && fallbackExpr !== null) {
+      code.localGet(st);
+      this.walkExpr(fallbackExpr);
+      code.structSet(this.stream.stateT(), closField);
+      code.localGet(st);
+      code.refFunc(fallbackThunkIdx);
+      code.structSet(this.stream.stateT(), thunkField);
+    }
+    code.end();
+    this.releaseScratch(dynRef, OPTVAL);
   }
 
   /* ── unions ─────────────────────────────────────────────────────────────
@@ -15334,6 +16006,39 @@ class Assembler {
         code.call(this.events.countOf());
         return true;
       }
+      /* ── DYN-ADAPTER PHASE: listeners()/rawListeners() ─────────────────
+       * lower-emitter.ts's own header: BOTH members lower to this ONE
+       * libCall (`entryIdentity()` answers the SAME thing for either —
+       * events.ts's `listenersOf` header has the Draft B / SEMANTICS.md
+       * story). SCOPED to the general bucket (matching `listenersOf`'s
+       * own contract): `.listeners('error')`/`.rawListeners('error')`
+       * refuse by name — the dedicated error-bucket family is a
+       * genuinely different representation this method does not walk,
+       * and no claim in this phase's scope reaches it (1677's own three
+       * calls are 'evt'/'plain'/'never-registered'). */
+      case "emitter.listeners": {
+        const nameArgL = e.args[1]!;
+        if (nameArgL.kind === "strLit" && nameArgL.value === "error") {
+          this.refuse("libCall:emitter.listeners:error-bucket", e.loc);
+          code.unreachable();
+          return true;
+        }
+        if (e.type.kind !== "array") {
+          this.refuse("libCall:emitter.listeners:non-array-type", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const vecInfo = this.vecInfoFor(e.type, e.loc);
+        if (vecInfo === null || vecInfo.elemVal.kind !== "ref" || vecInfo.elemVal.typeIndex === undefined) {
+          code.unreachable();
+          return true;
+        }
+        const fn = this.events.listenersOf(this.vecs.vecRef(vecInfo), this.vecs.newLen(vecInfo), this.vecs.pushOne(vecInfo), vecInfo.elemVal.typeIndex);
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        code.call(fn);
+        return true;
+      }
       case "emitter.countFn": {
         const cbExpr = e.args[2]!;
         if (cbExpr.type.kind !== "func" && cbExpr.type.kind !== "dyn") {
@@ -16010,6 +16715,139 @@ class Assembler {
         this.releaseScratch(recvVal, recv);
         return true;
       }
+      /* ── DYN-ADAPTER PHASE (1812) ─────────────────────────────────────
+       * `super(options)` where `options` is checked-dynamic (a subclass
+       * constructor parameter forwarded, not an inline literal) —
+       * lowerStreamSuperCall's `.initDyn` twin. Args: [thisRef, dynOpts,
+       * flagsLit, ...fallbackCbs] — `flags`/the cbs tail carry ONLY the
+       * class's OWN declared fallback overrides (streamCtorShape's
+       * `accepted` order), never the options record's own values, which
+       * are runtime data read via `dyn.objGet` below. emitInitDynSlot's
+       * own header has the full per-slot dispatch story. Scalars (hwm/
+       * encoding/autoDestroy) measured directly against Node
+       * (m-initdyn-scalars.cjs): hwm undefined/null defaults to 65536
+       * (matching readable.new's own resolved sentinel), a valid
+       * non-negative integer is used as-is, anything else (string/bool/
+       * negative/non-integer/object) THROWS in real Node — scoped OUT
+       * here (1812's own three constructions never pass an invalid
+       * value) to a named runtime trap, not Node's own catchable
+       * TypeError+util.inspect-rendered message, which has zero corpus
+       * payoff to replicate exactly right now. encoding: undefined
+       * skips; an unrecognized name ALSO throws in real Node — same
+       * scope cut, same reasoning (1812 only ever passes 'utf8').
+       * autoDestroy: built to the FULL measured rule despite zero
+       * exercise (`!== false`, not truthiness — a literal `false` is
+       * the only value that flips it) since it is cheap, reusing the
+       * exact DK-check shape the err-truthiness work already needed.
+       * emitClose is never read from the record at all — no claim
+       * touches it, defaulted true unconditionally, matching
+       * parseStreamOptions' own STATIC default. */
+      case "readable.initDyn": {
+        const flagsArg = e.args[2]!;
+        if (flagsArg.kind !== "numLit") {
+          this.refuse("libCall:readable.initDyn:dynamic-flags", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const flags = flagsArg.value;
+        // streamCtorShape("%Readable").accepted = ["read", "destroy"].
+        const hasReadFallback = (flags & 1) !== 0;
+        const hasDestroyFallback = (flags & 2) !== 0;
+        let cbIdx = 3;
+        let readFallbackExpr: Extract<IrExpr, { kind: "libCall" }>["args"][number] | null = null;
+        if (hasReadFallback) {
+          readFallbackExpr = e.args[cbIdx]!;
+          cbIdx++;
+        }
+        let destroyFallbackExpr: Extract<IrExpr, { kind: "libCall" }>["args"][number] | null = null;
+        if (hasDestroyFallback) {
+          destroyFallbackExpr = e.args[cbIdx]!;
+          cbIdx++;
+        }
+        let readFallbackThunkIdx: number | null = null;
+        if (readFallbackExpr !== null) {
+          if (readFallbackExpr.type.kind !== "func") {
+            this.refuse("libCall:readable.initDyn:non-func-read", e.loc);
+            code.unreachable();
+            return true;
+          }
+          readFallbackThunkIdx = this.readThunkFor(readFallbackExpr.type, e.loc);
+          if (readFallbackThunkIdx === null) {
+            code.unreachable();
+            return true;
+          }
+          this.mb.declareFuncRef(readFallbackThunkIdx);
+        }
+        let destroyFallbackThunkIdx: number | null = null;
+        if (destroyFallbackExpr !== null) {
+          if (destroyFallbackExpr.type.kind !== "func") {
+            this.refuse("libCall:readable.initDyn:non-func-destroy", e.loc);
+            code.unreachable();
+            return true;
+          }
+          destroyFallbackThunkIdx = this.destroyThunkFor(destroyFallbackExpr.type, e.loc);
+          if (destroyFallbackThunkIdx === null) {
+            code.unreachable();
+            return true;
+          }
+          this.mb.declareFuncRef(destroyFallbackThunkIdx);
+        }
+        const readAdapterT: IrType & { kind: "func" } = { kind: "func", params: [DYN], ret: VOID };
+        const readAdapterThunkIdx = this.readThunkFor(readAdapterT, e.loc);
+        if (readAdapterThunkIdx === null) {
+          code.unreachable();
+          return true;
+        }
+        this.mb.declareFuncRef(readAdapterThunkIdx);
+        const readAdapter = this.dynFnAdapter(readAdapterT, e.loc);
+        if (readAdapter === null) {
+          code.unreachable();
+          return true;
+        }
+        const destroyAdapterT: IrType & { kind: "func" } = { kind: "func", params: [DYN, DYN], ret: VOID };
+        const destroyAdapterThunkIdx = this.destroyThunkFor(destroyAdapterT, e.loc);
+        if (destroyAdapterThunkIdx === null) {
+          code.unreachable();
+          return true;
+        }
+        this.mb.declareFuncRef(destroyAdapterThunkIdx);
+        const destroyAdapter = this.dynFnAdapter(destroyAdapterT, e.loc);
+        if (destroyAdapter === null) {
+          code.unreachable();
+          return true;
+        }
+        const recvVal = this.mapType(e.args[0]!.type, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        this.walkExpr(e.args[0]!);
+        const recv = this.acquireScratch(recvVal);
+        code.localSet(recv);
+        code.localGet(recv);
+        code.call(this.stream.stateEnsure());
+        const st = this.acquireScratch(this.stream.stateRef());
+        code.localSet(st);
+        const dynRefT = this.dyn.dynRef();
+        const dynOpts = this.acquireScratch(dynRefT);
+        this.walkExpr(e.args[1]!);
+        code.localSet(dynOpts);
+        const hasOpts = this.acquireScratch(I32);
+        code.localGet(dynOpts);
+        code.structGet(this.dyn.dynT(), DYN_KIND);
+        code.i32Const(DK.OBJ);
+        code.i32Eq();
+        code.localSet(hasOpts);
+        this.emitInitDynScalars(code, recv, st, hasOpts, dynOpts, RS_HWM, e.loc);
+        this.emitInitDynSlot(code, st, hasOpts, dynOpts, "read", readFallbackExpr, RS_READ_CLOS, RS_READ_THUNK, readAdapterThunkIdx, readAdapter.fn, readAdapter.env, readFallbackThunkIdx);
+        this.emitInitDynSlot(code, st, hasOpts, dynOpts, "destroy", destroyFallbackExpr, RS_DESTROY_CLOS, RS_DESTROY_THUNK, destroyAdapterThunkIdx, destroyAdapter.fn, destroyAdapter.env, destroyFallbackThunkIdx);
+        this.releaseScratch(I32, hasOpts);
+        this.releaseScratch(dynRefT, dynOpts);
+        this.emitReservedShapeCreate(code, recv, Assembler.READABLE_RESERVED);
+        this.releaseScratch(this.stream.stateRef(), st);
+        this.releaseScratch(recvVal, recv);
+        return true; // void
+      }
       /* ── STAGE C ────────────────────────────────────────────────────── */
       case "writable.new":
       case "writable.init": {
@@ -16165,6 +17003,154 @@ class Assembler {
         this.releaseScratch(this.stream.stateRef(), st);
         this.releaseScratch(recvVal, recv);
         return true;
+      }
+      /* ── DYN-ADAPTER PHASE (1812) ─────────────────────────────────────
+       * `writable.initDyn` — readable.initDyn's own header has the full
+       * mechanism story (emitInitDynSlot's per-slot dispatch,
+       * emitInitDynScalars' measured scalar rules). Three slots this
+       * time (streamCtorShape("%Writable").accepted = ["write", "final",
+       * "destroy"]) instead of two; `destroyAdapterT` is the SAME
+       * `funcOf([DYN, DYN], VOID)` shape readable.initDyn already
+       * builds — destroy's own tuple arity does not vary by class, so
+       * this is a guaranteed cache hit against that SAME thunk, not a
+       * second build. */
+      case "writable.initDyn": {
+        const flagsArg = e.args[2]!;
+        if (flagsArg.kind !== "numLit") {
+          this.refuse("libCall:writable.initDyn:dynamic-flags", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const flags = flagsArg.value;
+        const hasWriteFallback = (flags & 1) !== 0;
+        const hasFinalFallback = (flags & 2) !== 0;
+        const hasDestroyFallback = (flags & 4) !== 0;
+        let cbIdx = 3;
+        let writeFallbackExpr: Extract<IrExpr, { kind: "libCall" }>["args"][number] | null = null;
+        if (hasWriteFallback) {
+          writeFallbackExpr = e.args[cbIdx]!;
+          cbIdx++;
+        }
+        let finalFallbackExpr: Extract<IrExpr, { kind: "libCall" }>["args"][number] | null = null;
+        if (hasFinalFallback) {
+          finalFallbackExpr = e.args[cbIdx]!;
+          cbIdx++;
+        }
+        let destroyFallbackExpr: Extract<IrExpr, { kind: "libCall" }>["args"][number] | null = null;
+        if (hasDestroyFallback) {
+          destroyFallbackExpr = e.args[cbIdx]!;
+          cbIdx++;
+        }
+        let writeFallbackThunkIdx: number | null = null;
+        if (writeFallbackExpr !== null) {
+          if (writeFallbackExpr.type.kind !== "func") {
+            this.refuse("libCall:writable.initDyn:non-func-write", e.loc);
+            code.unreachable();
+            return true;
+          }
+          writeFallbackThunkIdx = this.writeThunkFor(writeFallbackExpr.type, e.loc);
+          if (writeFallbackThunkIdx === null) {
+            code.unreachable();
+            return true;
+          }
+          this.mb.declareFuncRef(writeFallbackThunkIdx);
+        }
+        let finalFallbackThunkIdx: number | null = null;
+        if (finalFallbackExpr !== null) {
+          if (finalFallbackExpr.type.kind !== "func") {
+            this.refuse("libCall:writable.initDyn:non-func-final", e.loc);
+            code.unreachable();
+            return true;
+          }
+          finalFallbackThunkIdx = this.finalThunkFor(finalFallbackExpr.type, e.loc);
+          if (finalFallbackThunkIdx === null) {
+            code.unreachable();
+            return true;
+          }
+          this.mb.declareFuncRef(finalFallbackThunkIdx);
+        }
+        let destroyFallbackThunkIdx: number | null = null;
+        if (destroyFallbackExpr !== null) {
+          if (destroyFallbackExpr.type.kind !== "func") {
+            this.refuse("libCall:writable.initDyn:non-func-destroy", e.loc);
+            code.unreachable();
+            return true;
+          }
+          destroyFallbackThunkIdx = this.destroyThunkFor(destroyFallbackExpr.type, e.loc);
+          if (destroyFallbackThunkIdx === null) {
+            code.unreachable();
+            return true;
+          }
+          this.mb.declareFuncRef(destroyFallbackThunkIdx);
+        }
+        const writeAdapterT: IrType & { kind: "func" } = { kind: "func", params: [DYN, DYN, DYN], ret: VOID };
+        const writeAdapterThunkIdx = this.writeThunkFor(writeAdapterT, e.loc);
+        if (writeAdapterThunkIdx === null) {
+          code.unreachable();
+          return true;
+        }
+        this.mb.declareFuncRef(writeAdapterThunkIdx);
+        const writeAdapter = this.dynFnAdapter(writeAdapterT, e.loc);
+        if (writeAdapter === null) {
+          code.unreachable();
+          return true;
+        }
+        const finalAdapterT: IrType & { kind: "func" } = { kind: "func", params: [DYN], ret: VOID };
+        const finalAdapterThunkIdx = this.finalThunkFor(finalAdapterT, e.loc);
+        if (finalAdapterThunkIdx === null) {
+          code.unreachable();
+          return true;
+        }
+        this.mb.declareFuncRef(finalAdapterThunkIdx);
+        const finalAdapter = this.dynFnAdapter(finalAdapterT, e.loc);
+        if (finalAdapter === null) {
+          code.unreachable();
+          return true;
+        }
+        const destroyAdapterT: IrType & { kind: "func" } = { kind: "func", params: [DYN, DYN], ret: VOID };
+        const destroyAdapterThunkIdx = this.destroyThunkFor(destroyAdapterT, e.loc);
+        if (destroyAdapterThunkIdx === null) {
+          code.unreachable();
+          return true;
+        }
+        this.mb.declareFuncRef(destroyAdapterThunkIdx);
+        const destroyAdapter = this.dynFnAdapter(destroyAdapterT, e.loc);
+        if (destroyAdapter === null) {
+          code.unreachable();
+          return true;
+        }
+        const recvVal = this.mapType(e.args[0]!.type, e.loc);
+        if (recvVal === null) {
+          code.unreachable();
+          return true;
+        }
+        this.walkExpr(e.args[0]!);
+        const recv = this.acquireScratch(recvVal);
+        code.localSet(recv);
+        code.localGet(recv);
+        code.call(this.stream.stateEnsure());
+        const st = this.acquireScratch(this.stream.stateRef());
+        code.localSet(st);
+        const dynRefT = this.dyn.dynRef();
+        const dynOpts = this.acquireScratch(dynRefT);
+        this.walkExpr(e.args[1]!);
+        code.localSet(dynOpts);
+        const hasOpts = this.acquireScratch(I32);
+        code.localGet(dynOpts);
+        code.structGet(this.dyn.dynT(), DYN_KIND);
+        code.i32Const(DK.OBJ);
+        code.i32Eq();
+        code.localSet(hasOpts);
+        this.emitInitDynScalars(code, recv, st, hasOpts, dynOpts, WS_HWM, e.loc);
+        this.emitInitDynSlot(code, st, hasOpts, dynOpts, "write", writeFallbackExpr, WS_WRITE_CLOS, WS_WRITE_THUNK, writeAdapterThunkIdx, writeAdapter.fn, writeAdapter.env, writeFallbackThunkIdx);
+        this.emitInitDynSlot(code, st, hasOpts, dynOpts, "final", finalFallbackExpr, WS_FINAL_CLOS, WS_FINAL_THUNK, finalAdapterThunkIdx, finalAdapter.fn, finalAdapter.env, finalFallbackThunkIdx);
+        this.emitInitDynSlot(code, st, hasOpts, dynOpts, "destroy", destroyFallbackExpr, RS_DESTROY_CLOS, RS_DESTROY_THUNK, destroyAdapterThunkIdx, destroyAdapter.fn, destroyAdapter.env, destroyFallbackThunkIdx);
+        this.releaseScratch(I32, hasOpts);
+        this.releaseScratch(dynRefT, dynOpts);
+        this.emitReservedShapeCreate(code, recv, Assembler.WRITABLE_RESERVED);
+        this.releaseScratch(this.stream.stateRef(), st);
+        this.releaseScratch(recvVal, recv);
+        return true; // void
       }
       case "duplex.new":
       case "duplex.init": {

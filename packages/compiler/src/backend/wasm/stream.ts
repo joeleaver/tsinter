@@ -401,10 +401,14 @@ export const RS_PIPE_ONEND = 55; // eq, nullable — the 'end' listener on THIS,
  * own claim, whose entire exercised surface — construct-with-false,
  * write/end, flag read-back — this tier already handles byte-exactly,
  * since its own execution trace never reaches the auto-end mechanism at
- * all). SEMANTICS.md briefly carried a draft S051 for the trap; it never
- * merged, so it was withdrawn rather than left registered for a
- * divergence that no longer exists — the number is free for reuse (the
- * landing record, not this file, is where that decision lives). */
+ * all). SEMANTICS.md briefly carried a draft S051 for THIS trap; it
+ * never merged, so it was withdrawn rather than left registered for a
+ * divergence that no longer exists here. The number was NOT left
+ * permanently retired, though — it is now S051 for a genuinely
+ * different divergence (the dyn-adapter phase's completion-callback
+ * truthiness gap, `dynDoneClosFor`'s own trap) — a real reuse, not a
+ * dangling citation; SEMANTICS.md S051 is live again, just for
+ * something else entirely than what this comment used to point at. */
 export const WS_ALLOW_HALF_OPEN = 56; // i32 bool
 /** CORRECTION (1690, both-sides autoDestroy): TRUE only for a stream
  * constructed via duplex.new/transform.new/passthrough.new (set
@@ -710,6 +714,27 @@ export interface StreamDeps {
    * own three internal thunks with the exact type `entryAppend`'s THUNK
    * parameter expects. */
   thunkSig: () => number;
+
+  /* ── STAGE C dyn-adapter phase: pending-check hardening ────────────── */
+
+  /** %w.err.reportUncaught() — emitter.ts's shared bare-uncaught-throw
+   * reporter (S007's trap-report bridge), exposed as a raw function
+   * index (matching timers.ts's/nexttick.ts's own `reportUncaught`
+   * convention) for the ONE call site here that needs a genuine
+   * immediate crash rather than a caught-and-routed error:
+   * `doWriteCore`'s `_write`/`_writev` dispatch. Node's own `doWrite`
+   * (internal/streams/writable.js) wraps neither in a try/catch —
+   * measured via d13-sync-throw-write.cjs, a synchronous throw crashes
+   * real Node immediately, before any later script statement runs.
+   * Call after confirming `excKind()` is nonzero:
+   * `globalGet(excKind()); ifVoid(); call(reportUncaught()); end();` —
+   * never returns. `_final`/`_destroy` do NOT use this — Node wraps
+   * those internally and routes a thrown error through the ordinary
+   * async completion-callback landing instead (maybeFinishCore/
+   * buildDestroyErrCore's own `tryCatchAsError`-based fixes, measured
+   * separately via d13b/d13c — the sibling rule's own lesson: don't
+   * assume symmetry). */
+  reportUncaught: () => number;
 }
 
 // $bytes's field indices (typedarrays.ts's own private layout, mirrored
@@ -2220,6 +2245,34 @@ export class StreamBuilder {
       c.localGet(ROOT);
       c.call(this.opReadable());
       c.end();
+      // GATE FIX (1747's mandatory dig — found by source reading, not
+      // instrumentation): `pushCore`'s own tail settles a parked
+      // for-await waiter (checkWaiterCore's own header lists "pushCore's
+      // tail, opEnd, destroyErrCore" as its three non-creation triggers)
+      // but `pushNullCore` — a DIFFERENT function, EOF's own push —
+      // never did. A waiter parked BEFORE any real data ever arrives,
+      // then answered by push(null) with nothing else to drive a
+      // subsequent read()/resume() (Transform's own internal _final ->
+      // flushDoneCore -> pushNullCore chain when NOTHING was ever
+      // written is exactly this shape, and the ONLY thing this pass's
+      // own Transform construction can do to a for-await consumer that
+      // parked first), had nothing left to re-examine it: `readCore`
+      // (called from checkWaiterCore's own first, parking invocation)
+      // sees RS_ENDED still false at that moment (correctly stays
+      // parked), and NOTHING calls checkWaiterCore again afterward — no
+      // trap, no error, the tick pump simply runs dry with the waiter's
+      // promise never settled (d11-park-then-end.ts: the minimal
+      // repro, zero concurrency, zero data, park-then-immediately-end;
+      // d7's own "two concurrent for-await loops" framing was a RED
+      // HERRING — d10 confirmed the SAME hang exists with no second
+      // loop involved at all, once isolated far enough). Same discipline
+      // as pushCore's own tail: settle a parked waiter whenever this
+      // function's own effects (here, RS_ENDED flipping true) could
+      // newly answer it. checkWaiterCore's own idempotent no-op-when-
+      // nothing-parked guard makes this safe to call unconditionally,
+      // matching every one of its other four call sites.
+      c.localGet(ROOT);
+      c.call(this.checkWaiterCore());
       c.i32Const(0);
       this.mb.setBody(idx, [this.stateRef(), this.deps.bytesRef()], c.bytes());
       return idx;
@@ -4004,7 +4057,7 @@ export class StreamBuilder {
 
   private buildDestroyErrCore(idx: number): void {
     const c = new Code();
-    const ROOT = 0, ERR = 1, ST = 2;
+    const ROOT = 0, ERR = 1, ST = 2, NEWERR = 3;
     c.localGet(ROOT);
     c.call(this.stateEnsure());
     c.localSet(ST);
@@ -4034,8 +4087,34 @@ export class StreamBuilder {
     c.localGet(ST);
     c.structGet(this.stateT(), RS_DESTROY_THUNK);
     c.callRef(this.destroyThunkSig());
+    // GATE FIX (pending-check audit, destroy-side — d13c-sync-throw-
+    // destroy.cjs, measured BEFORE wiring). Node's real internal
+    // `_destroy` (internal/streams/destroy.js) wraps `stream._destroy()`
+    // in a try/catch whose catch arm calls the exact same `onDestroy(err)`
+    // its own completion-callback argument reaches on a normal call —
+    // measured: the resulting 'error' event fires ASYNCHRONOUSLY (a later
+    // tick, same as an ordinary destroy error), and an unhandled instance
+    // crashes via the standard "Unhandled 'error' event" path, not an
+    // immediate synchronous trap — the SAME deferred shape as final's own
+    // fix just above, genuinely NOT symmetric with doWriteCore's
+    // immediate-crash shape (Node does not wrap `_write` at all). A thunk
+    // that throws INSTEAD OF calling its own completion callback needs
+    // the identical landing: extract the pending Error-shaped exception
+    // and hand it to `destroyErrDefaultCore`, the exact function the
+    // done-closure's own landing already calls (this function's own
+    // header comment on that function, above).
+    this.deps.tryCatchAsError(c);
+    c.localSet(NEWERR);
+    c.localGet(NEWERR);
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    c.localGet(ROOT);
+    c.localGet(NEWERR);
+    c.call(this.destroyErrDefaultCore());
     c.end();
-    this.mb.setBody(idx, [this.stateRef()], c.bytes());
+    c.end();
+    this.mb.setBody(idx, [this.stateRef(), this.deps.errRef()], c.bytes());
   }
 
   /** `(root, err: errRef|null) -> void` — the NO-USER-`_destroy`-OVERRIDE
@@ -5220,6 +5299,35 @@ export class StreamBuilder {
         c.localGet(ST);
         c.structGet(this.stateT(), WS_WRITE_THUNK);
         c.callRef(this.writeThunkSig());
+        // GATE FIX (pending-check audit, write-side — d13-sync-throw-
+        // write.cjs): Node's real `doWrite` (internal/streams/writable.js)
+        // wraps NEITHER `_write` NOR `_writev` in a try/catch — a
+        // synchronous throw from a dyn-adapted override propagates
+        // immediately, uncaught, crashing AT this call, before Node ever
+        // reaches a later script statement (measured: real Node never
+        // prints past `w.write('x')` when `_write` throws synchronously).
+        // Prior to this fix, this function had no analogous check at all
+        // — the thunk's throw left the exception cell set but execution
+        // simply continued (WS_SYNC's reset below, then back out through
+        // writeCore to the user's own next script statement), so the
+        // eventual report landed at some LATER, unrelated checkpoint —
+        // genuinely miscompile-adjacent (the #49 blind spot): a program
+        // prints output BETWEEN the throw and the report that Node itself
+        // never produces at all, invisible to a byte-for-byte harness
+        // that only compares output once a divergence is already known.
+        // Report-and-trap HERE, immediately, via the same bare-uncaught
+        // path (S007) every other unwrapped synchronous throw already
+        // uses — never falls through to the WS_SYNC reset below, exactly
+        // matching Node's own "nothing after this point ever runs".
+        // Contrast maybeFinishCore/buildDestroyErrCore just below in this
+        // file: Node DOES wrap `_final`/`_destroy` internally, so THEIR
+        // synchronous throws route through the ordinary async error path
+        // instead — measured separately (d13b/d13c), not assumed
+        // symmetric with this one.
+        c.globalGet(this.deps.excKind());
+        c.ifVoid();
+        c.call(this.deps.reportUncaught());
+        c.end();
         c.localGet(ST);
         c.i32Const(0);
         c.structSet(this.stateT(), WS_SYNC);
@@ -5467,7 +5575,7 @@ export class StreamBuilder {
       () => this.mb.declareFunc(this.mb.funcType([this.deps.rootRef()], []), "%w.ws.maybeFinish"),
       (idx) => {
         const c = new Code();
-        const ROOT = 0, ST = 1;
+        const ROOT = 0, ST = 1, ERR = 2;
         c.localGet(ROOT);
         c.call(this.stateEnsure());
         c.localSet(ST);
@@ -5515,8 +5623,34 @@ export class StreamBuilder {
         c.localGet(ST);
         c.structGet(this.stateT(), WS_FINAL_THUNK);
         c.callRef(this.finalThunkSig());
+        // GATE FIX (pending-check audit, final-side — d13b-sync-throw-
+        // final.cjs, measured BEFORE wiring, per the sibling rule: do not
+        // assume write's shape). Node's real `callFinal` DOES wrap
+        // `stream._final()` in a try/catch, whose catch arm calls the
+        // exact same `onFinish(err)` its own completion-callback argument
+        // reaches on a normal call — measured: the resulting 'error'
+        // event fires ASYNCHRONOUSLY (well after a 'sync' marker
+        // statement already ran), the same deferred shape the callback
+        // path already produces via `finalDoneCore`'s own `destroyErrCore`
+        // call. So a thunk that throws INSTEAD OF calling its own
+        // completion callback needs the IDENTICAL landing, not an
+        // immediate crash (contrast doWriteCore just above — genuinely
+        // different, not symmetric): extract the pending Error-shaped
+        // exception (`tryCatchAsError`, D2's own established idiom, reused
+        // verbatim) and hand it to `finalDoneCore`, exactly as if the
+        // callback itself had been invoked with it.
+        this.deps.tryCatchAsError(c);
+        c.localSet(ERR);
+        c.localGet(ERR);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(ROOT);
+        c.localGet(ERR);
+        c.call(this.finalDoneCore());
         c.end();
-        this.mb.setBody(idx, [this.stateRef()], c.bytes());
+        c.end();
+        this.mb.setBody(idx, [this.stateRef(), this.deps.errRef()], c.bytes());
       },
     );
   }

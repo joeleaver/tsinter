@@ -2942,3 +2942,139 @@ S049's own reasoning exactly.
 exits 0 and both destinations observe every chunk; this tier exits 1
 — no fixture can match both). pipeCore's second-pipe guard cites this
 entry at its trap site.
+
+## S051 — A truthy non-Error completion-callback argument TRAPS; Node accepts it as the error, unchanged *(wasm tier)*
+
+Node's real `_write`/`_final`/`_transform`/`_flush`/`_destroy`
+completion callback (`cb(err)`) decides "is this an error" by PURE JS
+TRUTHINESS on the raw argument — no type check, no coercion. Measured
+directly (m-cb-err-matrix.cjs, 9 values against real Node): a truthy
+string, a nonzero number, `true`, and a plain (non-Error) object all
+fire `'error'` with that EXACT value, unchanged — a plain `{}` stays a
+plain `Object` on `.errored`, never wrapped or coerced into an `Error`
+instance. In real Node, `0`, `false`, `undefined`, and an absent
+argument are all falsy alike — no error, the operation succeeds,
+uniformly across all four shapes. THIS TIER's own boundary is
+narrower, and sits one layer BELOW this entry's own dispatch, not
+inside it: the completion-callback parameter's static type is the
+union `(%Error|null|undefined)`, and only the two falsy shapes that
+are actually REPRESENTABLE in that union — `null` and `undefined`
+(an absent argument boxes to the same `undefined`) — ever reach
+S051's own truthiness check at all. `0` and `false` are NOT
+representable in `(%Error|null|undefined)` at all, so they fail
+LOUDLY first, at the adapter's general union-exactness coercion layer
+(the same mechanism S049/S050's own C5 family already established for
+every other out-of-union dyn value — "a 'number'/'boolean' value is
+not representable in the target union" — a DIFFERENT trap site and
+message than S051's own `dynDoneClosFor` check below), before this
+entry's own dispatch ever runs. Measured directly (the reviewer's own
+five-shape isolation, z-falsy-{0,null,false,noarg,undefined}.cjs):
+`cb(null)`/`cb(undefined)`/`cb()` all MATCH Node (falsy,
+union-representable, no error); `cb(0)`/`cb(false)` both TRAP, but via
+the general coercion layer's own message, not this entry's. This tier's
+whole error-dispatch pipeline (`RS_ERROR`, `destroyErrCore`, the
+`'error'` event itself) is typed to a real `%Error`-rooted class
+reference; it has no representation for a non-Error value at all. A
+truthy dyn value that genuinely IS an `%Error` instance (`dyn.isError()`, `dyn.toError()` —
+the reverse of `dyn.fromError()`'s own identity-preserving cache)
+extracts and proceeds normally, matching Node exactly. A truthy dyn
+value that is NOT an `%Error` instance — a string, a number, `true`, a
+plain object, anything else JS would accept — TRAPS loudly instead
+(`dynDoneClosFor`'s own completion-callback thunk, the DYN-ADAPTER
+phase's boxFn-minted "done" callback for a checked-dynamic
+`_write`/`_transform`/etc. override).
+
+**Rationale:** representing "any truthy value" for `RS_ERROR` would
+require extending the WHOLE error-dispatch pipeline — the typed field
+itself, `destroyErrCore`, the `'error'` event's own dispatch — to hold
+an arbitrary dyn value instead of a typed class reference, real
+invasive machinery with zero claim payoff today (checked: none of
+1811/2313/1747/1812's own dyn-boundary callbacks, this phase's own
+claim set, ever passes a non-Error truthy value as the completion
+argument). Between silently coercing/dropping it and a loud trap, only
+the trap is rule-1-consistent — S049/S050's own reasoning, one gate
+further down the same completion-callback machinery.
+
+**Tested by:** corpus-unpinnable in the byte-exact contract (Node
+exits 0, having accepted the raw value as the error; this tier exits 1
+— no fixture can match both). A probe trio: a real `Error` (MATCH — the
+ordinary, exercised path), a falsy zero-arg `cb()` (MATCH — no error),
+and a truthy non-Error string `cb('oops')` (the divergence itself,
+node exit 0 / wasm exit 1). `dynDoneClosFor`'s own trap site cites this
+entry.
+
+Boundary pins, the reviewer's own five-shape isolation (measured
+against real Node directly, then against this tier —
+`z-falsy-{0,null,false,noarg,undefined}.cjs`): `cb(null)`,
+`cb(undefined)`, and a bare `cb()` all MATCH (falsy, representable in
+`(%Error|null|undefined)`, no error either side). `cb(0)` and
+`cb(false)` both TRAP on this tier — but at the general union-exactness
+coercion layer, NOT here: `Uncaught TypeError: a 'number'/'boolean'
+value is not representable in the target union`, not this entry's own
+"non-Error completion-callback argument" message. The two pins mark
+the real edge this entry's own subject stops at.
+
+## S052 — `rawListeners()` answers the same array `listeners()` does — the once-wrapper has no separate identity here *(wasm tier; native lanes ship the same divergence)*
+
+Node's `emitter.once(name, fn)` registers an internal WRAPPER closure
+(the thing that actually lives in the registry, which unregisters
+itself and then calls `fn`); `listeners(name)` unwraps back to the
+original `fn` for each once-registered entry, while `rawListeners
+(name)` deliberately answers the wrapper objects themselves (each
+carrying a `.listener` property pointing back at the original — Node's
+own once-wrapper introspection tests exercise exactly this). This
+tier's once semantics are built entirely at the RUNTIME level
+(events.ts's entry `{once, fired}` fields plus the dispatch loop's own
+unlink-before-invoke step) — there is no compiler-visible "wrapper
+closure" object at all, only the original listener closure stored
+directly in the entry. Consequently `rawListeners()` has nothing
+DIFFERENT to answer than `listeners()` — both read the SAME entry
+array of original identities (`entryIdentity()`'s `orig ?? clos`, the
+SAME helper `listenerCount`/`removeListener` already used before this
+phase — reused, not reimplemented), so the frontend lowers both
+methods to the identical libCall (`emitter.listeners`,
+lower-emitter.ts's own header) rather than merely computing an equal
+answer by coincidence.
+
+Two further boundaries this same mechanism names rather than silently
+narrows: (1) `.listeners('error')`/`.rawListeners('error')` refuse by
+name at compile time — the dedicated `'error'` bucket (this file's own
+"direct-reference family", no `name`/`next` chain at all) is a
+genuinely different representation `listenersOf`'s general-bucket walk
+does not traverse; no claim in this phase's scope ever calls either
+method with `'error'`. (2) a listener registered with a signature
+NARROWER than the event's own canonical tuple (`ee.on('evt', (a:
+string) => {...})` against a `(string, number)` event — legal Node,
+the ordinary "extra arguments ignored" rule) needs a closure ADAPTED to
+the full tuple to be a valid element of the returned array's own
+uniform element type; `entryIdentity()`'s pre-existing consumers never
+needed that adaptation (`ref.eq` compares any two eq-typed refs
+regardless of their more specific type), so building it is deferred to
+the assert era (board item filed at this gate; Draft B's own
+"Tested by" sketch already anticipated `.listeners()`/`.rawListeners()`
+needing BOTH this adapter AND `assert.deepStrictEqual` before any claim
+can reach either — 1677 is the only corpus program calling either
+method today, and it is already blocked by the assert gap regardless).
+A `ref.test` guard catches this shape before the cast that would
+otherwise bare-trap, and reports it loudly and by name instead
+(S050/S051's own reportUncaught pattern) — the ordinary out-of-tier
+contract, not a second observable divergence needing its own entry.
+
+**Rationale:** inherited from the native lanes' identical
+representation choice (this backend's own C emitter comments already
+claimed "SEMANTICS.md documents both [the leak-warning and
+rawListeners divergences]" before either was actually filed — a stale
+citation this entry now makes true) — building a separate,
+corpus-invisible wrapper OBJECT purely to give `rawListeners()`
+something different to point at would be representation work with no
+other consumer anywhere in this tier's EventEmitter surface, so the
+divergence is accepted rather than manufactured machinery to avoid it.
+
+**Tested by:** a corpus program registering via `.once()`, calling
+BOTH `listeners(name)` and `rawListeners(name)` afterward and asserting
+they answer `===`-identical elements (1677-emitter-listeners.ts already
+exercises adjacent territory — `listeners()`/`rawListeners()` over a
+mix of full/once entries — but stays blocked on `assert.deepStrictEqual`
+today; the eventual claim reuses its own listeners()/rawListeners()
+assertions once `libCall:assert.deepResult` lands, per this entry's own
+deferred-adapter note above).

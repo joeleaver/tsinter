@@ -2431,11 +2431,13 @@ const TIER_FLOOR: string[] = [
   // fires — both no-op cleanly via the SAME four-flag guard Node's own
   // `endWritableNT` uses, matching byte-for-byte). SEMANTICS.md briefly
   // carried a draft S051 for remedy (2)'s trap; withdrawn once (2) came
-  // out — no divergence remains to register. The number is free for a
-  // future entry (a permanent gap in the sequence would misread as a
-  // suppressed entry; reusing it is the deliberate call, not an
-  // accident). No claim movement across all three iterations: 716
-  // throughout, 1742 claimed throughout.
+  // out — no divergence remained to register FOR THIS FINDING (a
+  // permanent gap in the sequence would have misread as a suppressed
+  // entry). The number was reused, not permanently retired: S051 is now
+  // registered for a genuinely different divergence, the dyn-adapter
+  // phase's completion-callback truthiness gap — a live entry again, an
+  // unrelated one. No claim movement across all three C2S-1 iterations:
+  // 716 throughout, 1742 claimed throughout.
   //
   // Tier 710→716 (six claims, one shared-machinery fix touching every
   // duplex-shaped construction already landed).
@@ -2445,6 +2447,176 @@ const TIER_FLOOR: string[] = [
   "1695-stream-props.ts",
   "1742-stream-extends-duplex-transform.ts",
   "1744-stream-set-encoding.ts",
+  //
+  // STAGE C, DYN-ADAPTER PHASE (the pass's final unit — landed 08ad661
+  // freezes the structural half at 716; this phase's own gate closes
+  // stage C). Scope, staked out before the first line of build:
+  // 1811 (readable.new:dyn-callback-value — the `{ read: wrap(fn) }`
+  // checked-dynamic option-callback shape), 2313
+  // (writable.write:dyn-callback-value — the JS-lane underscore-method-
+  // assignment sibling of the same boundary), 1812 (readable.initDyn —
+  // the scalar options walk first, the callback half rides the SAME
+  // adapters 1811 builds), 1747 (transform.transform:non-func-callback —
+  // the boxFunc-minted done-callback, parked at pass 2's own gate for
+  // exactly this phase), listeners()/rawListeners() (the Draft B
+  // S-entry filed at
+  // ~/.claude/projects/-home-joe-dev-tsinter/memory/inc22_unfiled_s_drafts.md,
+  // adapted to whatever this phase actually builds — resolves board #66's
+  // wasm half), and 1677's next-refusal measurement (report the advance,
+  // don't force a claim it doesn't earn). EXPLICITLY NOT in scope: 1814
+  // (stream.pipelineDyn) — stream/promises is stage D's own unit, not
+  // this one. Design basis: `inc22-stageC-pass2-design-notes.md`'s
+  // re-verified dyn-call trace and `pending-check-audit-sitelist.md`
+  // (both scratchpad, both read-only prep from the pass-2 gate) — the
+  // audit's 8 sites plus the third-layer reentrancy flag are this
+  // phase's own deliverable, not just planning: every site gets its
+  // verdict written in the closing report.
+  //
+  // AS LANDED: all four predicted claims land — 1811, 2313, 1812, 1747
+  // — via one shared adapter family, exactly the "shared machinery,
+  // multiple claims" shape 1690's own both-sides fix had. 1677 advances
+  // (libCall:emitter.listeners -> libCall:assert.deepResult, exactly as
+  // predicted) but does not claim; listeners()/rawListeners() are built
+  // and real, Draft B is filed for real as SEMANTICS.md S052. No
+  // regressions anywhere; the full consolidated report (scratchpad) has
+  // the audit site-list's own per-site verdicts, the pending-check
+  // findings, and every bug found along the way in full — this block is
+  // the mechanism-story summary TIER_FLOOR itself wants.
+  //
+  // THE CORE ADAPTER (1811, 2313, 1747's shared half): readThunkFor/
+  // writeThunkFor/finalThunkFor/destroyThunkFor's `thisParam.kind ===
+  // "dyn"` branches, ALL sharing one corrected design found by
+  // execution — the FIRST cut assumed the walked closure-slot value was
+  // a raw `$dyn` struct and dispatched via `dyn.callFn()` directly;
+  // wrong (a bare wasm trap, empty stderr, before the user's own
+  // closure body ever ran). Traced to source: `lowerStreamCallbackValue`
+  // wraps the raw dyn value in a `dynCheck` targeting a "thisless"
+  // `adapterT = funcOf([DYN,...], VOID)`, and `dynCheck`'s own FUNC arm
+  // (`emitDynCheckBody`) MINTS a real closure via `dynFnAdapter` — `t`
+  // is func-kind with uniformly-dyn params, `pair = closSigFor(t, loc)`
+  // is the identical pair a static override gets. Corrected shape:
+  // refCast CLOS to `pair.clos`, `callRef(pair.fn)` — the static
+  // branch's own call shape, every position (including 0) a plain
+  // dyn-boxed argument, no receiver at all (Node calls option-callbacks
+  // with `this` undefined). No inline pending-check needed at any of
+  // the four thunks: `callRead()`'s pre-existing `tryCatchAsError`
+  // wrapper (D2's own fix) already catches whatever the callRef'd thunk
+  // leaves pending, generic regardless of thunk kind — the ONE
+  // dispatch-site gap the pending-check audit had flagged as needing
+  // NEW coverage turned out to already be covered by pass-1 machinery,
+  // verified not assumed.
+  //
+  // THE DONE-CALLBACK (write/final/destroy/transform/flush's shared
+  // completion-callback slot, ALSO uniformly dyn in adapterT):
+  // `dynDoneClosFor` mints a REAL dyn FUNC value via `dyn.boxFn`
+  // directly (not the typed `doneClosFor` — no `cbType` to match
+  // against a uniformly-dyn slot), whose thunk matches `dyn.thunkSig()`.
+  // The err-argument dispatch is MEASURED (m-cb-err-matrix.cjs, 9
+  // values): Node's own truthiness rule, no coercion — `dyn.truthy()`
+  // (pre-existing) decides falsy-vs-truthy, `dyn.isError()` + the new
+  // `dyn.toError()` (dyn.ts — the reverse of `fromError()`'s own
+  // identity-preserving cache, a genuine reuse of that cache's existing
+  // entries rather than new state) decide Error-vs-trap; SEMANTICS.md
+  // S051 registers the non-Error-truthy trap for real. A GENUINELY
+  // GENERALIZABLE bug, caught here and worth naming for whatever hand-
+  // built dyn adapter comes next: `emitSetCellErrorLit` writes to
+  // `this.fn.code` (the NORMAL walker's own tracked current function),
+  // not to a hand-built function's own Code buffer — using it inside
+  // `dynDoneClosFor` (itself hand-built, exactly the class the pass-2
+  // design notes' own §2 warned about) silently injected the trap into
+  // whatever function the walker happened to be compiling at THAT
+  // moment (construction-time compilation of `writable.new`), not into
+  // the done-callback thunk at all — no probe ever caught it reachable,
+  // because the corrupted code ran somewhere else entirely.
+  // `emitSetCellError(c, ...)` — the explicit-buffer variant that
+  // already existed for exactly this situation — is the fix; any FUTURE
+  // hand-built dyn adapter needing the exception cell must use it too.
+  //
+  // 1812 (readable.initDyn/writable.initDyn) is a genuinely THIRD
+  // dispatch shape, not an extension of the two above — a from-scratch
+  // dyn-record walk (`emitInitDynScalars`/`emitInitDynSlot`,
+  // `dyn.objGet`) with RUNTIME branching per callback slot between the
+  // dyn-adapter above and the class's own declared fallback
+  // (`streamMethodWrapper`'s pre-existing wrappers), matching Node's
+  // instance-property-over-prototype rule. THREE bugs found building
+  // it: (1) the wasm `i32.or`/`i32.and` no-short-circuit trap — a bare
+  // `structGet` on a possibly-null dyn value computed as ONE operand of
+  // an OR whose OTHER operand was the null-check itself; wasm never
+  // short-circuits, so the null case trapped before the OR ever ran.
+  // Hit in FOUR places (hwm/encoding/autoDestroy scalar reads, the slot
+  // dispatch's own DK.FUNC check); fixed with a shared
+  // `emitDynIsAbsentish` helper using a real `ifResult` branch instead
+  // of a bitwise OR. (2) A pre-existing gap in readThunkFor's STATIC
+  // branch: an untyped `_read(n)` override (MyReader's own shape, no
+  // JSDoc at all) lifts `n` to dyn, but the code pushed the raw f64
+  // SIZE local into a call_ref built for a dyn param — a wasm COMPILE
+  // error, caught immediately, never reachable by any claim before 1812
+  // since no prior one declared `_read` with an untyped size param.
+  // Fixed with the same boxNum-when-dyn pattern writeThunkFor's own
+  // chunk/encoding gap already used. (3) The real one: `emitInitDynSlot`
+  // stored the RAW `$dyn` struct straight from `dyn.objGet()` into
+  // RS_READ_CLOS/etc — but the adapter thunk's own refCast expects the
+  // `pair.clos`-shaped wrapper 1811's construction gets for free via
+  // the frontend's `dynCheck`; reading straight from `objGet` skips
+  // that conversion. Fixed by calling `dynFnAdapter(adapterT, loc)`
+  // directly in both `.initDyn` case bodies and building `refFunc(fn);
+  // OPTVAL; structNew(env)` as the stored closure. Also extended
+  // writeThunkFor's existing chunk/encoding dyn-boxing (pass 2's own
+  // "transform"-only scoping) to "write" too — MyWriter's own untyped
+  // `_write(chunk,enc,cb)` needed it, and the restriction was never
+  // load-bearing, just scoped to whichever claim needed it at the time.
+  //
+  // 1747's own mandatory dig (the coordinator's own ruling, after the
+  // async-consumer mismatch surfaced mid-phase): the "two concurrent
+  // for-await loops" framing from the FIRST investigation was a RED
+  // HERRING, fully dissolved by isolation. The true minimal repro
+  // (d11-park-then-end.ts, scratchpad) has ZERO concurrency: park a
+  // for-await waiter on an EMPTY Transform, then `.end()` it with
+  // nothing ever written — Node settles the waiter with EOF, this tier
+  // hangs (no trap, exit 0, the tick pump just runs dry). Root cause,
+  // found by reading `checkWaiterCore`'s own header against
+  // `pushNullCore`'s actual body: `checkWaiterCore`'s three
+  // non-creation re-check triggers are named explicitly as "pushCore's
+  // tail, opEnd, destroyErrCore" — `pushNullCore` (the EOF-specific
+  // push, a DIFFERENT function from `pushCore`) was never one of them.
+  // A waiter parked before any real data exists, then answered only by
+  // `push(null)` with nothing else to drive a subsequent read()/
+  // resume() discovery of EOF — exactly Transform's own internal
+  // `_final -> flushDoneCore -> pushNullCore` chain when nothing was
+  // ever written, and the ONLY way this pass's own Transform
+  // construction can produce the shape — has nothing left to
+  // re-examine it. One-line fix: `pushNullCore`'s own tail now calls
+  // `checkWaiterCore`, mirroring `pushCore`'s own pre-existing
+  // precedent exactly (same idempotent-no-op-when-nothing-parked
+  // safety). Diagnosed entirely via source reading, no instrumentation
+  // needed — the minimal repro came from bisecting the ORIGINAL
+  // concurrent-loops probe down to nothing, not from guessing.
+  //
+  // listeners()/rawListeners(): lower-emitter.ts ALREADY unifies both
+  // into one libCall (`emitter.listeners`) because `entryIdentity()`
+  // (pre-existing, `listenerCount`/`removeListener`'s own `orig ??
+  // clos`) answers the same thing for either — Draft B's own core claim
+  // confirmed directly from source, not assumed. New `listenersOf`
+  // (events.ts) walks the general bucket into a fresh per-event-tuple
+  // array (`vecInfoFor`'s own VecInfo, parameterized in since the
+  // element type varies by event). Two named boundaries, both in
+  // SEMANTICS.md S052's own body: the dedicated 'error' bucket refuses
+  // by name (a different representation entirely, unexercised by any
+  // claim); a declared-prefix listener (narrower arity than the event's
+  // canonical tuple) needs an adapter this phase does not build —
+  // FIRST cut bare-`refCast`-trapped on it (the #73 class, cannot ship
+  // bare), fixed to a `ref.test`-guarded NAMED loud trap instead
+  // (S050/S051's own reportUncaught pattern) per the gate's own ruling.
+  // Census-invisible either way: 1677 is the only corpus program
+  // calling either method, and it is independently blocked by
+  // `libCall:assert.deepResult` regardless.
+  "1747-stream-for-await-js.cjs",
+  "1811-stream-option-value-callbacks.cjs",
+  "1812-stream-super-options-forwarding.cjs",
+  "2313-stream-underscore-assign-js.cjs",
+  //
+  // Tier 716→720 (four claims, one shared adapter family plus one
+  // genuinely third dispatch shape for 1812, all landing together).
 ];
 
 interface RunResult {

@@ -3822,6 +3822,64 @@ export class DynBuilder {
     );
   }
 
+  /** %w.dyn.toError(d) → the errRef `d` was boxed from, or NULL — the
+   * REVERSE of `fromError()`, new for the dyn-adapter phase's completion-
+   * callback done-mint (a `cb(err)` err argument arrives as a plain dyn
+   * value; `afterWriteCore`/`finalDoneCore`/etc. all take a typed errRef,
+   * so a truthy-and-`isError()` argument needs to unbox back to the
+   * SAME real instance, not a reconstruction — Node's own `cb(existingErr)`
+   * observably preserves identity, e.g. a later `err === original`
+   * check). Only `caughtToDyn`/the error-rooted `dynFrom` ever mint the
+   * `$errDyn` cache entries `fromError()` builds (its own header), and
+   * BOTH of those run at the boxing call site whenever a real errRef
+   * crosses INTO dyn — including the ordinary case this phase's own
+   * adapters produce it: the user's `cb(new Error(...))` argument is a
+   * concrete `%Error`-typed expression at the CALL site (inside their
+   * own dyn-boundary closure), so the frontend's normal `dynFrom` lowering
+   * already boxes it via `fromError()` before it ever reaches `arrPush` —
+   * meaning the cache entry this scan needs already exists by construction,
+   * not something this method has to create. The SAME linear scan
+   * `fromError()` runs, comparing the OTHER field (dynRef here, errRef
+   * there) — mirrored, not reimplemented independently, so a future
+   * change to the entry shape only has one scan pattern to keep in sync. */
+  toError(): number {
+    return this.cached(
+      "toError",
+      [this.dynRef()],
+      [{ kind: "ref", nullable: true, typeIndex: this.deps.errT() }],
+      (idx) => {
+        const entryT = this.errDynT();
+        const head = this.errDynHead();
+        const c = new Code();
+        const N = 1;
+        c.globalGet(head);
+        c.localSet(N);
+        c.block();
+        c.loop();
+        c.localGet(N);
+        c.refIsNull();
+        c.brIf(1);
+        c.localGet(N);
+        c.structGet(entryT, 1); // dynRef
+        c.localGet(0);
+        c.refEq();
+        c.ifVoid();
+        c.localGet(N);
+        c.structGet(entryT, 0); // errRef
+        c.return_();
+        c.end();
+        c.localGet(N);
+        c.structGet(entryT, 2);
+        c.localSet(N);
+        c.br(0);
+        c.end();
+        c.end();
+        c.refNull(this.deps.errT());
+        this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: entryT }], c.bytes());
+      },
+    );
+  }
+
   /* ── prototype-method DISPATCH (scr_dyn_invoke) ───────────────────────
    *
    * `recv.m(args)` where `m` is a name more than one dyn-representable
