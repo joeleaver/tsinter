@@ -75,10 +75,26 @@
  * independent, callback half after the adapters. (4) listeners()/
  * rawListeners() + the Draft B S-entry (board #66's wasm half). Each
  * lands only when its own pins say so — this header updates as the
- * pass's own claims land, same discipline as pass 1's. */
+ * pass's own claims land, same discipline as pass 1's.
+ *
+ * STAGE D (increment 22 close, board #77). finished()/pipeline() land as
+ * NEW methods on THIS class, not a separate module: the settle contract
+ * they need (three-way error/end/premature-close dispatch, the
+ * already-closed-at-registration fast path) is settleConsumerCore's own
+ * shape, and that method is private to StreamBuilder — reusing it beats
+ * re-deriving it behind a file boundary. Pass plan: P1 finished/eos
+ * (stream.finished/finishedDyn, sp.finished — a per-stream watcher LIST,
+ * RS_WAITER's single-slot precedent generalized since finished()/eos()
+ * allow concurrent registrations Node itself supports); P2 pipeline
+ * (stream.pipeline/pipelineDyn, sp.pipeline — pairwise pipe() composition
+ * + cross-stage destroy propagation, the largest new machine of the
+ * stage); P3 rides lower-assert.ts's contract into a new assert.ts file
+ * (genuinely separate concern, no StreamBuilder coupling) plus events.ts's
+ * listenersOf adapter closures (#75); P4 riders (#72 for-await
+ * destroy-on-exit, frontend-only; #76 repro derivation) + close-out. */
 import type { ByteWriter } from "./bytes.js";
 import { Code } from "./code.js";
-import { F64, I32, ModuleBuilder, type ValType } from "./module.js";
+import { F64, I32, ModuleBuilder, type FieldType, type ValType } from "./module.js";
 import { LEN, BUF } from "./arrays.js";
 import { DK, DYN_KIND, DYN_REF } from "./dyn.js";
 
@@ -426,7 +442,134 @@ export const WS_ALLOW_HALF_OPEN = 56; // i32 bool
  * cases apart at runtime, since all five classes share one struct with
  * no other type tag. */
 export const WS_DUPLEX_SHAPED = 57; // i32 bool
-export const WS_FIELD_COUNT = 58;
+/** STAGE D (finished()/eos(), board #77). Which side(s) a finished()/
+ * eos() watcher on THIS instance should watch for premature-close —
+ * Node's own `readable`/`writable` eos() option booleans, defaulted from
+ * `isReadableNodeStream`/`isWritableNodeStream`, which read the RUNTIME
+ * OBJECT's actual interface, not any call-site's declared type. Gate
+ * review caught a real divergence in the first cut of this field (a
+ * compile-time strLit threaded through the IR from the call site's
+ * static TypeScript type): `finished(d, cb)` where `d`'s STATIC type is
+ * narrowed/upcast to `Writable` but the RUNTIME object is a Duplex —
+ * Node still waits for BOTH sides (measured directly: a Duplex whose
+ * writable side finishes but whose readable side never ends does not
+ * fire `finished()`'s callback at all, even after the writable side is
+ * long done); a static-type mechanism would have fired early. STAMPED
+ * AT CONSTRUCTION instead — every $rState-minting path unconditionally
+ * knows its own root kind, so the stamped value tracks the OBJECT the
+ * way Node's own runtime check does, upcasts included, with ZERO
+ * frontend/IR change (the original `[recv, cb]` / `[recv]` libCall
+ * shapes are unchanged — this field is backend-only, so the LLVM/C
+ * lanes, which already handle those exact shapes today, see no diff at
+ * all). SEVEN stamp sites (gate finding v4/v5 — a first pass found only
+ * the FOUR static-literal construction blocks plus fromArrCore and
+ * missed the two `.initDyn` blocks, which mint their own state
+ * independently and are the exactly-two classes with DIFFERENT
+ * sidedness, so the WS_DUPLEX_SHAPED covering-set precedent — safe
+ * because no duplex/transform/passthrough `.initDyn` form exists — does
+ * NOT transfer): readable.new/init, readable.initDyn, writable.new/init,
+ * writable.initDyn, duplex.new/init, transform.new/init+passthrough.
+ * new/init, fromArrCore (Readable.from). FIN_SIDE_UNSET's own header
+ * explains the sentinel-default/refuse-by-name net for a missed site.
+ *
+ * UPCAST REACHABILITY — split by branch, not a blanket "unreachable"
+ * (an earlier draft of this comment claimed the whole upcast angle was
+ * SC1090-fenced; that was FALSE PROSE, corrected here after the gate
+ * measured otherwise — do not restate the blanket version). Two
+ * DIFFERENT upcast shapes exist relative to RUNTIME_STREAM_CLASSES'
+ * hierarchy (ir/nodes.ts): SAME-branch (%Duplex's own base class IS
+ * %Readable — Transform and PassThrough both root at %Duplex, so they
+ * inherit this too) is fully EXPRESSIBLE AND OBSERVABLE TODAY —
+ * `const r: Readable = someDuplex;` compiles and runs, and DOES produce
+ * the static-vs-runtime sidedness divergence this field exists to
+ * avoid (measured directly against Node: a Duplex held through a
+ * Readable-typed binding, readable side ended, writable side never
+ * finished, then destroyed — finished() reports
+ * ERR_STREAM_PREMATURE_CLOSE, never "clean"; `wasm-stream-finished.
+ * test.ts`'s Readable-binding pin pins this exact shape end to end,
+ * compiled and run, not just argued). CROSS-branch (`finished(w, cb)`
+ * where `w`'s static type is `Writable` but the constructed object is a
+ * Duplex — Writable sits on its own branch off the emitter class, never
+ * a base of Duplex) is the ONLY angle still SC1090-fenced ("'Duplex'
+ * values where 'Writable' is expected is not supported yet"),
+ * independent of finished() entirely; no compiled pin of THAT specific
+ * angle is possible until cross-branch upcasting lands. Same-branch
+ * siblings not separately pinned (one mechanism, the Readable-binding
+ * pin carries the class): Transform→Readable, PassThrough→Readable,
+ * Transform→Duplex, PassThrough→Duplex, and user subclasses of any
+ * duplex-shaped root held through a Readable- or Duplex-typed binding —
+ * all correct for the identical reason (RS_SIDES tracks the
+ * CONSTRUCTED OBJECT, never the binding's static type, no matter which
+ * root or how many subclass layers sit in between). */
+export const RS_SIDES = 58; // i32: FIN_SIDE_R/W/RW
+/** The watcher LIST head — every `stream.finished`/`finishedDyn`/
+ * `sp.finished` registration on this instance appends one
+ * `$w.rs.finEntry` node here (a real list, not a single slot like
+ * RS_WAITER: a pipeline's own middle stage gets TWO independent
+ * registrations — one writable-only from being piped into, one
+ * readable-only from piping out, Node's real pairwise `pipe()` +
+ * `eos()` composition — so P1 builds the list even though its own two
+ * claims never register more than one watcher per stream). Fired (and
+ * the list detached-then-cleared FIRST, for reentrancy — mirrors the
+ * native lane's `scr_stream_notify_finished`) from `opClose`, right
+ * after `RS_CLOSE_EMITTED` is set — the willEmitClose:true default path
+ * (probe13). A registration arriving AFTER `RS_CLOSE_EMITTED` is already
+ * true schedules OP_FIN instead of waiting for a 'close' that already
+ * happened (mirrors Node's own always-schedule-never-sync eos()
+ * contract, probe01/probe12). */
+export const FIN_HEAD = 59; // ref $w.rs.finEntry, nullable
+export const WS_FIELD_COUNT = 60;
+
+/** RS_SIDES's own values — a bare Readable's finished() watches ONLY the
+ * readable side (a pure Writable never reaches RS_END_EMITTED, so
+ * watching it there would wrongly report premature-close on every clean
+ * Writable finish — 1813's own `w` case pins exactly this); a Duplex/
+ * Transform/PassThrough watches both (the upcast probe above pins the
+ * "both, unconditionally" half). Pipeline's OWN internal per-stage
+ * watchers (P2) do NOT read this field — they're role-based (source=R-
+ * only, dest=W-only) regardless of the stage's own RS_SIDES, fixed by
+ * the backend itself. */
+export const FIN_SIDE_R = 0;
+export const FIN_SIDE_W = 1;
+export const FIN_SIDE_RW = 2;
+/** FIX ROUND (gate finding, v3/v4): stateEnsure's DEFAULT before any
+ * construction site stamps a real value. Deliberately NOT a plausible
+ * value (R/W/RW) — every construction site MUST overwrite this, and
+ * unlike WS_DUPLEX_SHAPED's bool default (false is safe unstamped: no
+ * duplex/transform/passthrough .initDyn form exists, so the covering
+ * set is genuinely complete for it), RS_SIDES has NO safe default: the
+ * two `.initDyn` classes (readable/writable) are exactly the two with
+ * DIFFERENT sidedness, so whichever single value was chosen, one of
+ * them would be silently wrong (RW breaks a dyn Readable's clean end;
+ * R breaks a dyn Writable's clean finish; W breaks the Readable case) —
+ * a demonstrated property, not a precaution. `finComputeErr` refuses BY
+ * NAME on UNSET rather than guessing, converting any missed stamp site
+ * (now or in a future construction path) into a loud diagnostic instead
+ * of a silent miscompile. */
+export const FIN_SIDE_UNSET = 3;
+
+/** FE_KIND — how to fire this watcher. CB: a genuine typed closure,
+ * called through FE_THUNK (destroyThunkSig's ABI). DYN: a dyn-boxed
+ * function value, called through dyn.callFn with zero args on success
+ * (Node's own `callback.call(stream)`, no args) or one boxed-error arg
+ * on failure. PROMISE: FE_CLOS is actually a promRef (structs are `eq`
+ * subtypes in WasmGC, so the shared field just gets ref.cast at use
+ * time) — sp.finished's own form, settled via promSettle directly, no
+ * user closure at all. */
+export const FIN_KIND_CB = 0;
+export const FIN_KIND_DYN = 1;
+export const FIN_KIND_PROMISE = 2;
+
+/** `$w.rs.finEntry`'s field indices (the struct type itself lives on
+ * `StreamBuilder.finEntryT()`, below — needs `destroyThunkSig()`
+ * resolved first, so it can't be declared at module scope like the
+ * chunk/tick structs are). No per-entry sides field: RS_SIDES lives on
+ * the STREAM (construction-stamped), not the watcher — every entry on
+ * one stream shares it. */
+const FE_NEXT = 0;
+const FE_KIND = 1;
+const FE_CLOS = 2;
+const FE_THUNK = 3;
 
 /** `$wReq`'s field indices — one queued write entry (a chunk plus its
  * own completion callback; `cb` is nullable since a plain `write(chunk)`
@@ -519,6 +662,13 @@ export const OP_FIRE_DISCARDED = 9;
  * `dest.end()` does (this pass's own precedent, verbatim null-chunk/
  * null-cb shape). */
 export const OP_AUTO_END = 10;
+/** STAGE D: a `finished()`/`eos()` registration arriving AFTER
+ * `RS_CLOSE_EMITTED` is already true — Node's eos() always schedules
+ * (`process.nextTick`), even for an already-terminal stream (probe01,
+ * probe12); this tick's body just re-runs the same fire-and-clear pass
+ * `opClose` uses (`fireFinListCore`), which is a correct no-op if nothing
+ * new landed in FIN_HEAD between scheduling and dispatch. */
+export const OP_FIN = 11;
 
 export interface StreamDeps {
   /** The %Readable hierarchy ROOT's own struct — every general helper's
@@ -758,6 +908,7 @@ export class StreamBuilder {
   private writeThunkSigField: number | null = null;
   private finalThunkSigField: number | null = null;
   private destroyThunkSigField: number | null = null;
+  private finEntryTField: number | null = null;
   private voidClosFnField: number | null = null;
   private pipeClosTField: number | null = null;
   private tickQueue: { head: number; tail: number } | null = null;
@@ -969,6 +1120,8 @@ export class StreamBuilder {
       { storage: EQ_REF, mutable: true }, // RS_PIPE_ONEND
       { storage: I32, mutable: true }, // WS_ALLOW_HALF_OPEN
       { storage: I32, mutable: true }, // WS_DUPLEX_SHAPED
+      { storage: I32, mutable: true }, // RS_SIDES
+      { storage: this.finEntryRef(), mutable: true }, // FIN_HEAD
     ]);
     return this.stateTField;
   }
@@ -990,6 +1143,34 @@ export class StreamBuilder {
 
   private tickRef(): ValType {
     return { kind: "ref", nullable: true, typeIndex: this.tickT() };
+  }
+
+  /** STAGE D `$w.rs.finEntry`'s field indices — one `finished()`/`eos()`
+   * watcher list node (FIN_HEAD's own header has the full mechanism
+   * story). THUNK reuses `destroyThunkSig()`'s ABI verbatim — `(clos: eq,
+   * this: root, err: errRef|null) -> void` — Node's own eos() callback
+   * shape (a single nullable-error argument, bound to the stream) is
+   * exactly `_destroy(err, cb)`'s completion-callback shape already
+   * built here; a per-closure-type adapter thunk (`finThunkFor`,
+   * emitter.ts, mirroring `destroyThunkFor`'s own template) is what
+   * actually calls the user's specific typed closure through it. */
+  private finEntryT(): number {
+    if (this.finEntryTField !== null) return this.finEntryTField;
+    // selfStructType's own contract (chunkT's header, above): every OTHER
+    // type a field needs must resolve BEFORE the call, since `make`
+    // itself must not intern anything (the reserved index would move).
+    const thunkRef: ValType = { kind: "ref", nullable: true, typeIndex: this.destroyThunkSig() };
+    this.finEntryTField = this.mb.selfStructType("%w.rs.finEntry", (self) => [
+      { storage: { kind: "ref", nullable: true, typeIndex: self }, mutable: true }, // FE_NEXT
+      { storage: I32, mutable: false }, // FE_KIND — FIN_KIND_CB/DYN/PROMISE
+      { storage: EQ_REF, mutable: false }, // FE_CLOS — closure (typed or dyn) OR promise ref, per KIND
+      { storage: thunkRef, mutable: false }, // FE_THUNK — only used for FIN_KIND_CB
+    ]);
+    return this.finEntryTField;
+  }
+
+  private finEntryRef(): ValType {
+    return { kind: "ref", nullable: true, typeIndex: this.finEntryT() };
   }
 
   /* ── state lookup ──────────────────────────────────────────────────── */
@@ -1068,6 +1249,8 @@ export class StreamBuilder {
       c.refNull(EQ_HEAP); // rs_pipe_onend
       c.i32Const(1); // ws_allow_half_open — Node's real default: true (overwritten by construction)
       c.i32Const(0); // ws_duplex_shaped — default false (overwritten by construction, duplex/transform/passthrough only)
+      c.i32Const(FIN_SIDE_UNSET); // rs_sides — the sentinel (FIN_SIDE_UNSET's own header): every real construction path MUST overwrite this explicitly; finComputeErr refuses by name if it ever observes UNSET
+      c.refNull(this.finEntryT()); // fin_head — the finished()/eos() watcher list, empty at construction
       c.structNew(this.stateT());
       c.localSet(N);
       c.localGet(R);
@@ -1266,10 +1449,18 @@ export class StreamBuilder {
         c.localGet(ROOT);
         c.call(this.opAutoEnd());
         c.else_();
+        c.localGet(OP);
+        c.i32Const(OP_FIN);
+        c.i32Eq();
+        c.ifVoid();
+        c.localGet(ROOT);
+        c.call(this.opFin());
+        c.else_();
         // OP_PRIME_READ, exhaustive: the op codes are this file's own
         // closed enum, never a runtime-supplied value.
         c.localGet(ROOT);
         c.call(this.opPrimeRead());
+        c.end();
         c.end();
         c.end();
         c.end();
@@ -3518,6 +3709,13 @@ export class StreamBuilder {
       c.localGet(ST);
       c.i32Const(1);
       c.structSet(this.stateT(), RS_EMIT_CLOSE);
+      // STAGE D: RS_SIDES — Readable.from always produces a readable-only
+      // object (Node's own contract; RS_SIDES's own header). fromArrCore
+      // mints its OWN state directly (never routes through readable.new's
+      // emitter.ts block), so it needs this stamp too.
+      c.localGet(ST);
+      c.i32Const(FIN_SIDE_R);
+      c.structSet(this.stateT(), RS_SIDES);
       c.localGet(ST);
       c.localGet(VEC);
       c.i32Const(0);
@@ -4530,12 +4728,25 @@ export class StreamBuilder {
       // necessary directly: 2630's r1 (destroy(err) with no user 'error'
       // listener, only a pending text() consumer) must reject the
       // promise, not crash the program.
+      // STAGE D: a finished()/eos() watcher joins the SAME "handled" set
+      // — Node's own eos()/pipeline() internally register a real 'error'
+      // listener as a side effect of being called (rD-wasm's own note on
+      // this exact gate). The error stays pending in RS_ERROR; FIN_HEAD's
+      // own watchers fire later from opClose, same as RS_WAITER/
+      // RS_CONSUMER_KIND above — measured necessary directly (2564's r2:
+      // destroy(new Error) with only a pending sp.finished promise, no
+      // user 'error' listener, must reject the promise, not crash).
       c.localGet(ST);
       c.structGet(this.stateT(), RS_WAITER);
       c.refIsNull();
       c.i32Eqz();
       c.localGet(ST);
       c.structGet(this.stateT(), RS_CONSUMER_KIND);
+      c.i32Or();
+      c.localGet(ST);
+      c.structGet(this.stateT(), FIN_HEAD);
+      c.refIsNull();
+      c.i32Eqz();
       c.i32Or();
       c.ifVoid();
       c.else_();
@@ -4639,6 +4850,11 @@ export class StreamBuilder {
       c.structSet(this.stateT(), RS_CLOSE_EMITTED);
       c.localGet(ROOT);
       c.call(this.settleConsumerCore());
+      // STAGE D: fire every finished()/eos() watcher — willEmitClose:true
+      // default path (probe13), right after 'close' and RS_CLOSE_EMITTED
+      // (FIN_HEAD's own header). Harmless no-op when nothing is parked.
+      c.localGet(ROOT);
+      c.call(this.fireFinListCore());
       // A parked for-await waiter can ALSO still be here (a bare
       // destroy() with no error never schedules OP_ERROR at all, so
       // opClose is the only tick that ever gets a chance to settle it —
@@ -4798,6 +5014,513 @@ export class StreamBuilder {
         ],
         c.bytes(),
       );
+      return idx;
+    });
+  }
+
+  /* ── finished()/eos() (STAGE D, board #77) ───────────────────────────
+   *
+   * FIN_HEAD's own header has the mechanism story (watcher LIST, fire-
+   * and-clear from opClose, OP_FIN for late registration). This section:
+   * the premature-close gate, the per-entry fire dispatch, the fire-all
+   * pass, the CB/PROMISE registration entry points, and the cleanup
+   * closure 1813's r3 claim needs. FIN_KIND_DYN is a real, reserved
+   * value (stream.finishedDyn's own libCall name exists) but no entry
+   * with that KIND is ever constructed this pass — no P1 claim needs a
+   * dyn-boxed finished() callback, and dyn.callFn's zero/one-arg calling
+   * convention for it is unbuilt; stream.finishedDyn's own emitter
+   * dispatch refuses by name rather than passing FIN_KIND_DYN here. */
+
+  /** `(state) -> errRef|null` — Node's own eos() premature-close gate
+   * (rD-node §1a), computed ONCE at fire time: a real error always wins;
+   * absent one, ANY side RS_SIDES says to watch (a construction-time
+   * stamp — RS_SIDES's own header has the full upcast-vs-runtime-object
+   * story; every watcher on one stream shares it, so this reads STATE,
+   * never the entry) that hasn't reached its own natural completion
+   * (RS_END_EMITTED / WS_FINISHED) synthesizes ERR_STREAM_PREMATURE_
+   * CLOSE — settleConsumerCore's own literal (name "Error", code
+   * "ERR_STREAM_PREMATURE_CLOSE", message "Premature close"),
+   * finished()'s own contract. The two side-checks are OR'd rather than
+   * sequenced like Node's own source: both produce the IDENTICAL error
+   * shape, so which one "wins" on a duplex-shaped watcher with both
+   * sides incomplete is not an observable difference (unlike Node's
+   * source, which returns from the readable check first — a control-flow
+   * detail with no output consequence here). */
+  private finComputeErr(): number {
+    return this.cached("finComputeErr", () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.stateRef()], [this.deps.errRef()]), "%w.rs.finComputeErr");
+      const c = new Code();
+      const ST = 0, SIDES = 1;
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_ERROR);
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifResult(this.deps.errRef());
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_ERROR);
+      c.else_();
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_SIDES);
+      c.localSet(SIDES);
+      // FIX ROUND (gate finding, v3/v4/v5): FIN_SIDE_UNSET means a
+      // construction path missed its stamp — FIN_SIDE_UNSET's own header
+      // explains why no plausible fallback value is safe here. Loud
+      // named trap (a wasm-backend bug report, not a "not supported yet"
+      // user-facing refusal — this is an internal-consistency failure,
+      // never something a real Node program could trigger).
+      c.localGet(SIDES);
+      c.i32Const(FIN_SIDE_UNSET);
+      c.i32Eq();
+      c.ifResult(this.deps.errRef());
+      this.deps.setUncaughtError(c, (cc) => {
+        this.deps.buildErrorLit(
+          cc,
+          "%Error",
+          "Error",
+          (ccc) =>
+            this.deps.lit(
+              ccc,
+              "wasm backend bug: finished()/eos() reached a stream with no RS_SIDES stamp (a construction path is missing one) — please report this",
+            ),
+          null,
+        );
+      });
+      c.refNull(this.errType());
+      c.else_();
+      // readable-premature: RS_SIDES watches R or RW, and the readable
+      // side hasn't reached 'end'.
+      c.localGet(SIDES);
+      c.i32Const(FIN_SIDE_W);
+      c.i32Ne();
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_END_EMITTED);
+      c.i32Eqz();
+      c.i32And();
+      // writable-premature: RS_SIDES watches W or RW, and the writable
+      // side hasn't reached 'finish'.
+      c.localGet(SIDES);
+      c.i32Const(FIN_SIDE_R);
+      c.i32Ne();
+      c.localGet(ST);
+      c.structGet(this.stateT(), WS_FINISHED);
+      c.i32Eqz();
+      c.i32And();
+      c.i32Or();
+      c.ifResult(this.deps.errRef());
+      this.deps.buildErrorLit(c, "%Error", "Error", (cc) => this.deps.lit(cc, "Premature close"), "ERR_STREAM_PREMATURE_CLOSE");
+      c.else_();
+      c.refNull(this.errType());
+      c.end();
+      c.end();
+      c.end();
+      this.mb.setBody(idx, [I32], c.bytes());
+      return idx;
+    });
+  }
+
+  /** `(root, entry) -> void` — dispatch ONE watcher: FIN_KIND_CB calls
+   * through FE_THUNK (destroyThunkSig's ABI, mirroring destroyErrCore's
+   * own call_ref site verbatim — closure, this, error, thunk last);
+   * FIN_KIND_PROMISE (sp.finished) settles directly, reusing
+   * settleConsumerCore's own reject-with-error shape and a plain
+   * f64/0-kind fulfill for the void success case (an awaited
+   * `promise<VOID>` never reads the payload back — confirmed directly,
+   * not assumed: a minimal repro of the exact 2564 shape, `const p =
+   * f(); ...; await p;` where `f(): Promise<void>`, compiles AND runs
+   * correctly against the current wasm backend today). Exhaustive over
+   * {CB, PROMISE} this pass — see this section's own header on
+   * FIN_KIND_DYN. */
+  private fireOneFin(): number {
+    return this.cached("fireOneFin", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root, this.finEntryRef()], []), "%w.rs.fireOneFin");
+      const c = new Code();
+      const ROOT = 0, ENTRY = 1, ST = 2, ERR = 3, P = 4;
+      c.localGet(ROOT);
+      c.call(this.stateEnsure());
+      c.localSet(ST);
+      c.localGet(ST);
+      c.call(this.finComputeErr());
+      c.localSet(ERR);
+      c.localGet(ENTRY);
+      c.structGet(this.finEntryT(), FE_KIND);
+      c.i32Const(FIN_KIND_CB);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(ENTRY);
+      c.structGet(this.finEntryT(), FE_CLOS);
+      c.localGet(ROOT);
+      c.localGet(ERR);
+      c.localGet(ENTRY);
+      c.structGet(this.finEntryT(), FE_THUNK);
+      c.callRef(this.destroyThunkSig());
+      c.else_();
+      // FIN_KIND_PROMISE, exhaustive this pass (see header — DYN is
+      // never constructed).
+      c.localGet(ENTRY);
+      c.structGet(this.finEntryT(), FE_CLOS);
+      c.refCast(this.promType());
+      c.localSet(P);
+      c.localGet(ERR);
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(P);
+      c.i32Const(this.deps.excTag.obj);
+      c.f64Const(0);
+      c.localGet(ERR);
+      this.deps.errPreOf(c, (cc) => cc.localGet(ERR));
+      c.i32Const(2);
+      c.call(this.deps.promSettle());
+      c.else_();
+      // sp.finished resolves with undefined — no value; the settled
+      // kind/payload here is never read back (this section's own header
+      // note above).
+      c.localGet(P);
+      c.i32Const(this.deps.excTag.f64);
+      c.f64Const(0);
+      c.refNull(this.errType());
+      c.i32Const(-1);
+      c.i32Const(1);
+      c.call(this.deps.promSettle());
+      c.end();
+      c.end();
+      this.mb.setBody(idx, [this.stateRef(), this.deps.errRef(), this.deps.promRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  /** `(root) -> void` — fire and clear the WHOLE watcher list: detach
+   * FIN_HEAD FIRST (nulled before any watcher runs), THEN walk the
+   * detached list firing each entry — the native lane's own documented
+   * reentrancy guard (scr_stream_notify_finished: a watcher whose own
+   * invocation re-registers another finished() call, or runs its own
+   * cleanup, cannot corrupt this walk since it is no longer reachable
+   * from the struct's own field by the time any watcher runs). Called
+   * from `opClose` (the willEmitClose:true default path, right after
+   * 'close' — probe13) and from `opFin` (a late registration on an
+   * already-closed stream — probe01/probe12, always async).
+   *
+   * FIX ROUND (gate finding, v3): FIRES IN REGISTRATION ORDER, not list
+   * order. `finRegisterCbCore`/`finRegisterPromiseCore` PREPEND (O(1)
+   * insert), which puts the list in LIFO order relative to registration
+   * — a plain head-to-tail walk would fire LAST-registered-first. A
+   * live-Node re-measurement (three `finished()` calls on one stream,
+   * registered A/B/C) falsifies the earlier "no ordering guarantee"
+   * claim this file used to carry: Node fires strictly in REGISTRATION
+   * order (A, B, C), deterministically. Fixed by reversing the detached
+   * list in place before firing (cheaper than a tail pointer paid on
+   * every registration, since this reversal runs once per fire, not
+   * once per registration — and P1's own two claims never register more
+   * than one watcher per stream, so this pass never measured it; P2's
+   * pipeline middle stages register two independently and WOULD have
+   * silently reordered output without this fix). */
+  private fireFinListCore(): number {
+    return this.cached("fireFinListCore", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root], []), "%w.rs.fireFinList");
+      const c = new Code();
+      const ROOT = 0, ST = 1, CUR = 2, NEXT = 3, PREV = 4;
+      c.localGet(ROOT);
+      c.call(this.stateEnsure());
+      c.localSet(ST);
+      c.localGet(ST);
+      c.structGet(this.stateT(), FIN_HEAD);
+      c.localSet(CUR);
+      c.localGet(ST);
+      c.refNull(this.finEntryT());
+      c.structSet(this.stateT(), FIN_HEAD);
+      // Reverse the detached list in place: CUR walks the OLD (prepend/
+      // LIFO) order; PREV accumulates the reversed (registration/FIFO)
+      // order by re-pointing each node's own FE_NEXT as it's visited.
+      c.refNull(this.finEntryT());
+      c.localSet(PREV);
+      c.block();
+      c.loop();
+      c.localGet(CUR);
+      c.refIsNull();
+      c.brIf(1);
+      c.localGet(CUR);
+      c.structGet(this.finEntryT(), FE_NEXT);
+      c.localSet(NEXT);
+      c.localGet(CUR);
+      c.localGet(PREV);
+      c.structSet(this.finEntryT(), FE_NEXT);
+      c.localGet(CUR);
+      c.localSet(PREV);
+      c.localGet(NEXT);
+      c.localSet(CUR);
+      c.br(0);
+      c.end();
+      c.end();
+      // Fire from PREV (the reversed head = registration order) to null.
+      c.localGet(PREV);
+      c.localSet(CUR);
+      c.block();
+      c.loop();
+      c.localGet(CUR);
+      c.refIsNull();
+      c.brIf(1);
+      c.localGet(CUR);
+      c.structGet(this.finEntryT(), FE_NEXT);
+      c.localSet(NEXT);
+      c.localGet(ROOT);
+      c.localGet(CUR);
+      c.call(this.fireOneFin());
+      c.localGet(NEXT);
+      c.localSet(CUR);
+      c.br(0);
+      c.end();
+      c.end();
+      this.mb.setBody(
+        idx,
+        [this.stateRef(), this.finEntryRef(), this.finEntryRef(), this.finEntryRef()],
+        c.bytes(),
+      );
+      return idx;
+    });
+  }
+
+  /** `(root) -> void` — OP_FIN's tick body (FIN_HEAD's own header). */
+  private opFin(): number {
+    return this.cached("opFin", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root], []), "%w.rs.opFin");
+      const c = new Code();
+      const ROOT = 0;
+      c.localGet(ROOT);
+      c.call(this.fireFinListCore());
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  /** finished()'s own return value (the callback form ONLY — Node's real
+   * eos() cancel/cleanup function): a genuine `() => void` closure
+   * (`closPairFor([],[])`'s shape, `this.deps.voidClos()`) capturing
+   * {root, entry}, whose body walks FIN_HEAD and splices this exact
+   * entry out BY IDENTITY (ref.eq) — idempotent by construction: calling
+   * it after the entry already fired (fireFinListCore already detached
+   * and cleared FIN_HEAD) or calling it twice both land on an empty/
+   * already-spliced list, a correct no-op (Node's own cleanup() is
+   * documented idempotent). ONE shared struct type + ONE shared thunk
+   * function serve every registration (doneClosFor's own template,
+   * emitter.ts:3259 — captures differ per INSTANCE via struct.new's
+   * fields, not per function). */
+  private finCleanupStructField: number | null = null;
+  private finCleanupFnField: number | null = null;
+  private finCleanupStruct(): { struct: number; fn: number } {
+    if (this.finCleanupStructField !== null && this.finCleanupFnField !== null) {
+      return { struct: this.finCleanupStructField, fn: this.finCleanupFnField };
+    }
+    const pair = this.deps.voidClos();
+    const rootRef = this.deps.rootRef();
+    const fields: FieldType[] = [
+      { storage: { kind: "ref", nullable: false, typeIndex: pair.fn }, mutable: false }, // code
+      { storage: rootRef, mutable: false }, // CLEAN_ROOT
+      { storage: this.finEntryRef(), mutable: false }, // CLEAN_ENTRY
+    ];
+    const struct = this.mb.subStructType("stream.finCleanup", fields, pair.clos);
+    const idx = this.mb.declareFunc(pair.fn, "%w.rs.finCleanup");
+    this.finCleanupStructField = struct;
+    this.finCleanupFnField = idx;
+    const c = new Code();
+    const SELF = 0, SELFT = 1, ROOT = 2, ENTRY = 3, ST = 4, CUR = 5, PREV = 6;
+    c.localGet(SELF);
+    c.refCast(struct);
+    c.localSet(SELFT);
+    c.localGet(SELFT);
+    c.structGet(struct, 1); // CLEAN_ROOT
+    c.localSet(ROOT);
+    c.localGet(SELFT);
+    c.structGet(struct, 2); // CLEAN_ENTRY
+    c.localSet(ENTRY);
+    c.localGet(ROOT);
+    c.call(this.stateEnsure());
+    c.localSet(ST);
+    c.localGet(ST);
+    c.structGet(this.stateT(), FIN_HEAD);
+    c.localSet(CUR);
+    c.refNull(this.finEntryT());
+    c.localSet(PREV);
+    // Walk once; on a match, splice it out and set CUR null (the loop's
+    // own top-of-body null check then exits on the NEXT pass) — avoids
+    // an extra branch depth out through the enclosing `if`.
+    c.block();
+    c.loop();
+    c.localGet(CUR);
+    c.refIsNull();
+    c.brIf(1);
+    c.localGet(CUR);
+    c.localGet(ENTRY);
+    c.refEq();
+    c.ifVoid();
+    c.localGet(PREV);
+    c.refIsNull();
+    c.ifVoid();
+    c.localGet(ST);
+    c.localGet(CUR);
+    c.structGet(this.finEntryT(), FE_NEXT);
+    c.structSet(this.stateT(), FIN_HEAD);
+    c.else_();
+    c.localGet(PREV);
+    c.localGet(CUR);
+    c.structGet(this.finEntryT(), FE_NEXT);
+    c.structSet(this.finEntryT(), FE_NEXT);
+    c.end();
+    c.refNull(this.finEntryT());
+    c.localSet(CUR);
+    c.else_();
+    c.localGet(CUR);
+    c.localSet(PREV);
+    c.localGet(CUR);
+    c.structGet(this.finEntryT(), FE_NEXT);
+    c.localSet(CUR);
+    c.end();
+    c.br(0);
+    c.end();
+    c.end();
+    this.mb.setBody(
+      idx,
+      [{ kind: "ref", nullable: true, typeIndex: struct }, rootRef, this.finEntryRef(), this.stateRef(), this.finEntryRef(), this.finEntryRef()],
+      c.bytes(),
+    );
+    return { struct, fn: idx };
+  }
+
+  /** `(root, kind: i32, clos: eq nullable, thunk) -> () => void` —
+   * `stream.finished`'s own registration (KIND is always FIN_KIND_CB
+   * this pass, see this section's own header — kept as a real parameter,
+   * not hardcoded, so a future stream.finishedDyn build reuses this
+   * verbatim). Prepends the new entry (O(1) — `fireFinListCore`'s own
+   * reversal-before-fire is what actually delivers Node's REGISTRATION-
+   * order firing guarantee, re-measured directly: three finished() calls
+   * on one stream fire strictly A, B, C, never reordered — the "no
+   * ordering guarantee" claim this comment used to carry was falsified
+   * by that measurement and has been corrected here). Already-
+   * closed fast path: RS_CLOSE_EMITTED true at registration time
+   * schedules OP_FIN instead of waiting for a 'close' that already ran —
+   * Node's eos() ALWAYS schedules, even for an already-terminal stream
+   * (probe01/probe12), never fires synchronously. Returns the cleanup
+   * closure (1813's own r3 claim: `finished()`'s real return value,
+   * called BEFORE the stream finishes, to prove the watcher never
+   * fires). GATE FINDING: emitClose:false traps loudly by name (S050's
+   * own `setUncaughtError`+`buildErrorLit` template) rather than
+   * silently registering a watcher that could NEVER fire — this tier's
+   * only path to firing a finished()/eos() watcher is `opClose`, and
+   * `OP_CLOSE` itself is only ever scheduled when RS_EMIT_CLOSE is true
+   * (destroyErrDefaultCore's own pre-existing gate); without this trap
+   * the watcher would silently hang forever instead of loudly refusing —
+   * the compiled-clean-zero-output class this tier's whole loudness
+   * contract exists to prevent. No P1 claim exercises the "fire directly
+   * on end/finish" mechanism willEmitClose:false actually needs (probe13
+   * has the measured shape), so this traps rather than builds an
+   * unpinned branch. */
+  finRegisterCbCore(): number {
+    return this.cached("finRegisterCbCore", () => {
+      const root = this.deps.rootRef();
+      const thunkRef: ValType = { kind: "ref", nullable: true, typeIndex: this.destroyThunkSig() };
+      const retRef: ValType = { kind: "ref", nullable: true, typeIndex: this.deps.voidClos().clos };
+      const idx = this.mb.declareFunc(this.mb.funcType([root, I32, EQ_REF, thunkRef], [retRef]), "%w.rs.finRegisterCb");
+      const c = new Code();
+      const ROOT = 0, KIND = 1, CLOS = 2, THUNK = 3, ST = 4, ENTRY = 5;
+      const cleanup = this.finCleanupStruct();
+      c.localGet(ROOT);
+      c.call(this.stateEnsure());
+      c.localSet(ST);
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_EMIT_CLOSE);
+      c.ifResult(retRef);
+      c.localGet(ST);
+      c.structGet(this.stateT(), FIN_HEAD);
+      c.localGet(KIND);
+      c.localGet(CLOS);
+      c.localGet(THUNK);
+      c.structNew(this.finEntryT());
+      c.localSet(ENTRY);
+      c.localGet(ST);
+      c.localGet(ENTRY);
+      c.structSet(this.stateT(), FIN_HEAD);
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_CLOSE_EMITTED);
+      c.ifVoid();
+      c.localGet(ROOT);
+      c.i32Const(OP_FIN);
+      c.call(this.scheduleTick());
+      c.end();
+      this.mb.declareFuncRef(cleanup.fn);
+      c.refFunc(cleanup.fn);
+      c.localGet(ROOT);
+      c.localGet(ENTRY);
+      c.structNew(cleanup.struct);
+      c.else_();
+      this.deps.setUncaughtError(c, (cc) => {
+        this.deps.buildErrorLit(
+          cc,
+          "%Error",
+          "Error",
+          (ccc) => this.deps.lit(ccc, "finished()/eos() on a stream constructed with emitClose:false is not supported yet"),
+          null,
+        );
+      });
+      c.refNull(this.deps.voidClos().clos);
+      c.end();
+      this.mb.setBody(idx, [this.stateRef(), this.finEntryRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  /** `(root) -> promise<void>` — `sp.finished`'s own registration:
+   * always FIN_KIND_PROMISE, no user closure at all. Mirrors
+   * `finRegisterCbCore`'s own already-closed fast path, prepend-list
+   * shape, and emitClose:false trap; returns the minted promise directly
+   * (no cleanup value — `stream/promises` exposes no unhook, Node's own
+   * contract). */
+  finRegisterPromiseCore(): number {
+    return this.cached("finRegisterPromiseCore", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root], [this.deps.promRef()]), "%w.rs.finRegisterPromise");
+      const c = new Code();
+      const ROOT = 0, ST = 1, ENTRY = 2, P = 3;
+      c.localGet(ROOT);
+      c.call(this.stateEnsure());
+      c.localSet(ST);
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_EMIT_CLOSE);
+      c.ifResult(this.deps.promRef());
+      c.call(this.deps.promMint());
+      c.localSet(P);
+      c.localGet(ST);
+      c.structGet(this.stateT(), FIN_HEAD);
+      c.i32Const(FIN_KIND_PROMISE);
+      c.localGet(P);
+      c.refNull(this.destroyThunkSig());
+      c.structNew(this.finEntryT());
+      c.localSet(ENTRY);
+      c.localGet(ST);
+      c.localGet(ENTRY);
+      c.structSet(this.stateT(), FIN_HEAD);
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_CLOSE_EMITTED);
+      c.ifVoid();
+      c.localGet(ROOT);
+      c.i32Const(OP_FIN);
+      c.call(this.scheduleTick());
+      c.end();
+      c.localGet(P);
+      c.else_();
+      this.deps.setUncaughtError(c, (cc) => {
+        this.deps.buildErrorLit(
+          cc,
+          "%Error",
+          "Error",
+          (ccc) => this.deps.lit(ccc, "finished()/eos() on a stream constructed with emitClose:false is not supported yet"),
+          null,
+        );
+      });
+      c.refNull(this.promType());
+      c.end();
+      this.mb.setBody(idx, [this.stateRef(), this.finEntryRef(), this.deps.promRef()], c.bytes());
       return idx;
     });
   }

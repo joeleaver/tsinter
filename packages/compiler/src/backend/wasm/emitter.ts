@@ -166,6 +166,11 @@ import {
   RS_SYNC,
   WS_ALLOW_HALF_OPEN,
   WS_DUPLEX_SHAPED,
+  RS_SIDES,
+  FIN_SIDE_R,
+  FIN_SIDE_W,
+  FIN_SIDE_RW,
+  FIN_KIND_CB,
 } from "./stream.js";
 import { UnionBuilder, type UnionArmRep } from "./unions.js";
 import { Code } from "./code.js";
@@ -4091,6 +4096,83 @@ class Assembler {
     return idx;
   }
 
+  private readonly finThunkFns = new Map<string, number>();
+
+  /** STAGE D — `stream.finished`'s adapter: `destroyThunkFor`'s exact
+   * shape (same `destroyThunkSig()` ABI, same "box the raw errRef into
+   * the lifted closure's `errorOrNull` union" step), one param position
+   * narrower — finished()'s own tuple (lowerEosCallback/`lowerStream
+   * Callback`) is `[errorOrNull(L)]` alone, no second completion-callback
+   * position `_destroy`'s tuple carries. The dyn-`this` branch
+   * `destroyThunkFor` needs is NOT mirrored here: finished()'s receiver
+   * has already passed `lowerStreamArg`'s own isNodeStream fence by the
+   * time a callback reaches this point (`streamSidesOf` non-null), so
+   * `thisParam` is never dyn in practice — refuses by name rather than
+   * assume, if that ever proves wrong. */
+  private finThunkFor(t: IrType & { kind: "func" }, loc: SrcLoc | undefined): number | null {
+    const key = typeKey(t);
+    const hit = this.finThunkFns.get(key);
+    if (hit !== undefined) return hit;
+    const pair = this.closSigFor(t, loc);
+    if (pair === null) return null;
+    const thisParam = t.params[0];
+    if (thisParam === undefined) throw new Error("wasm emitter bug: a finished() closure's lifted type has no `this` parameter");
+    if (thisParam.kind === "dyn") {
+      this.refuse("libCall:stream.finished:dyn-this", loc);
+      return null;
+    }
+    const thisT = this.mapType(thisParam, loc);
+    if (thisT === null || thisT.kind !== "ref") return null;
+    const idx = this.mb.declareFunc(this.stream.destroyThunkSig(), `%w.rs.finThunk:${key}`);
+    this.finThunkFns.set(key, idx);
+    const c = new Code();
+    const CLOS = 0, THIS = 1, ERR = 2, CL = 3;
+    const closRef: ValType = { kind: "ref", nullable: true, typeIndex: pair.clos };
+    c.localGet(CLOS);
+    c.refCast(pair.clos);
+    c.localSet(CL);
+    c.localGet(CL);
+    c.localGet(THIS);
+    c.refCast(thisT.typeIndex);
+    if (t.params.length >= 2) {
+      // errorOrNull(L)'s own 2-arm tagged union (Error-rooted object |
+      // nullT) — destroyThunkFor's identical box, ported verbatim.
+      const errParamType = t.params[1];
+      if (errParamType === undefined || errParamType.kind !== "union") {
+        this.refuse("libCall:stream.finished:unsupported-err-param", loc);
+        c.unreachable();
+        this.mb.setBody(idx, [closRef], c.bytes());
+        return idx;
+      }
+      const def = this.unionDef(errParamType.unionId);
+      const nullTag = def.arms.findIndex((a) => a.kind === "nullT");
+      const errTag = def.arms.findIndex((a) => a.kind === "object");
+      const errArmSt = errTag >= 0 ? this.unionArmStruct(errParamType.unionId, errTag, loc) : null;
+      const unionVal = this.mapType(errParamType, loc);
+      if (nullTag < 0 || errTag < 0 || errArmSt === null || unionVal === null) {
+        this.refuse("libCall:stream.finished:unsupported-err-param", loc);
+        c.unreachable();
+        this.mb.setBody(idx, [closRef], c.bytes());
+        return idx;
+      }
+      c.localGet(ERR);
+      c.refIsNull();
+      c.ifResult(unionVal);
+      c.globalGet(this.unions.unitGlobal(nullTag));
+      c.else_();
+      c.i32Const(errTag);
+      c.localGet(ERR);
+      c.structNew(errArmSt);
+      c.end();
+    }
+    c.localGet(CL);
+    c.structGet(pair.clos, 0);
+    c.callRef(pair.fn);
+    if (t.ret.kind !== "void") c.drop();
+    this.mb.setBody(idx, [closRef], c.bytes());
+    return idx;
+  }
+
   /** i32 TRUE iff the dyn value `pushVal` produces is null, DK.UNDEF, or
    * DK.NULL — GATE FIX, found by execution (a bare wasm trap, empty
    * stderr, on 1812's own zero-arg `new MyReader()`): the FIRST cut
@@ -4154,7 +4236,7 @@ class Assembler {
    * zero exercise, since it reuses the exact DK-check shape already on
    * hand. emitClose is defaulted true unconditionally — no claim reads
    * the record for it at all. */
-  private emitInitDynScalars(code: Code, root: number, st: number, hasOpts: number, dynOpts: number, hwmField: number, loc: SrcLoc | undefined): void {
+  private emitInitDynScalars(code: Code, root: number, st: number, hasOpts: number, dynOpts: number, hwmField: number, sides: number, loc: SrcLoc | undefined): void {
     const dynRefT = this.dyn.dynRef();
     const dynT = this.dyn.dynT();
     // highWaterMark.
@@ -4281,6 +4363,17 @@ class Assembler {
     code.localGet(st);
     code.i32Const(1);
     code.structSet(this.stream.stateT(), RS_EMIT_CLOSE);
+    // STAGE D FIX ROUND (gate finding, v4/v5): RS_SIDES — a compile-time
+    // constant per call site (readable.initDyn passes R, writable.
+    // initDyn passes W), same "kind-parameterized like hwmField" shape
+    // this function already uses. Board #78's PRE-EXISTING, separately-
+    // tracked emitClose:false dyn divergence (this function's own
+    // unconditional RS_EMIT_CLOSE=1 above) means the .initDyn path can
+    // never actually hit the emitClose:false trap — self-consistent,
+    // not this fix's concern.
+    code.localGet(st);
+    code.i32Const(sides);
+    code.structSet(this.stream.stateT(), RS_SIDES);
   }
 
   /** DYN-ADAPTER PHASE (1812): binds ONE callback slot (read/write/
@@ -16685,6 +16778,14 @@ class Assembler {
         code.localGet(st);
         this.walkExpr(e.args[base + 2]!); // emitClose
         code.structSet(this.stream.stateT(), RS_EMIT_CLOSE);
+        // STAGE D: RS_SIDES — a %Readable-rooted construction (new OR a
+        // subclass's init) is readable-only, unconditionally (RS_SIDES's
+        // own header: construction-time stamp, tracks the RUNTIME
+        // object like Node's isReadableNodeStream/isWritableNodeStream
+        // do, not any call-site's declared type).
+        code.localGet(st);
+        code.i32Const(FIN_SIDE_R);
+        code.structSet(this.stream.stateT(), RS_SIDES);
         if (readCbExpr !== null && readThunkIdx !== null) {
           code.localGet(st);
           this.walkExpr(readCbExpr);
@@ -16838,7 +16939,7 @@ class Assembler {
         code.i32Const(DK.OBJ);
         code.i32Eq();
         code.localSet(hasOpts);
-        this.emitInitDynScalars(code, recv, st, hasOpts, dynOpts, RS_HWM, e.loc);
+        this.emitInitDynScalars(code, recv, st, hasOpts, dynOpts, RS_HWM, FIN_SIDE_R, e.loc);
         this.emitInitDynSlot(code, st, hasOpts, dynOpts, "read", readFallbackExpr, RS_READ_CLOS, RS_READ_THUNK, readAdapterThunkIdx, readAdapter.fn, readAdapter.env, readFallbackThunkIdx);
         this.emitInitDynSlot(code, st, hasOpts, dynOpts, "destroy", destroyFallbackExpr, RS_DESTROY_CLOS, RS_DESTROY_THUNK, destroyAdapterThunkIdx, destroyAdapter.fn, destroyAdapter.env, destroyFallbackThunkIdx);
         this.releaseScratch(I32, hasOpts);
@@ -16966,6 +17067,12 @@ class Assembler {
         code.localGet(st);
         this.walkExpr(e.args[base + 2]!); // emitClose
         code.structSet(this.stream.stateT(), RS_EMIT_CLOSE);
+        // STAGE D: RS_SIDES — a %Writable-rooted construction (new OR a
+        // subclass's init) is writable-only, unconditionally (readable.
+        // new/init's own RS_SIDES stamp, mirror-imaged).
+        code.localGet(st);
+        code.i32Const(FIN_SIDE_W);
+        code.structSet(this.stream.stateT(), RS_SIDES);
         if (writeCbExpr !== null && writeThunkIdx !== null) {
           code.localGet(st);
           this.walkExpr(writeCbExpr);
@@ -17141,7 +17248,7 @@ class Assembler {
         code.i32Const(DK.OBJ);
         code.i32Eq();
         code.localSet(hasOpts);
-        this.emitInitDynScalars(code, recv, st, hasOpts, dynOpts, WS_HWM, e.loc);
+        this.emitInitDynScalars(code, recv, st, hasOpts, dynOpts, WS_HWM, FIN_SIDE_W, e.loc);
         this.emitInitDynSlot(code, st, hasOpts, dynOpts, "write", writeFallbackExpr, WS_WRITE_CLOS, WS_WRITE_THUNK, writeAdapterThunkIdx, writeAdapter.fn, writeAdapter.env, writeFallbackThunkIdx);
         this.emitInitDynSlot(code, st, hasOpts, dynOpts, "final", finalFallbackExpr, WS_FINAL_CLOS, WS_FINAL_THUNK, finalAdapterThunkIdx, finalAdapter.fn, finalAdapter.env, finalFallbackThunkIdx);
         this.emitInitDynSlot(code, st, hasOpts, dynOpts, "destroy", destroyFallbackExpr, RS_DESTROY_CLOS, RS_DESTROY_THUNK, destroyAdapterThunkIdx, destroyAdapter.fn, destroyAdapter.env, destroyFallbackThunkIdx);
@@ -17344,6 +17451,13 @@ class Assembler {
         code.localGet(st);
         code.i32Const(1);
         code.structSet(this.stream.stateT(), WS_DUPLEX_SHAPED);
+        // STAGE D: RS_SIDES — a Duplex watches BOTH sides, unconditionally
+        // (the upcast probe in RS_SIDES's own header pins this exactly:
+        // Node waits for both even when the call site's static type only
+        // exposes one).
+        code.localGet(st);
+        code.i32Const(FIN_SIDE_RW);
+        code.structSet(this.stream.stateT(), RS_SIDES);
         if (readCbExpr !== null && readThunkIdx !== null) {
           code.localGet(st);
           this.walkExpr(readCbExpr);
@@ -17578,6 +17692,11 @@ class Assembler {
         code.localGet(st);
         code.i32Const(1);
         code.structSet(this.stream.stateT(), WS_DUPLEX_SHAPED);
+        // STAGE D: RS_SIDES — Transform/PassThrough are duplex-shaped too
+        // (duplex.new/init's own RS_SIDES stamp, same reasoning).
+        code.localGet(st);
+        code.i32Const(FIN_SIDE_RW);
+        code.structSet(this.stream.stateT(), RS_SIDES);
         // WS_WRITE_CLOS/THUNK: the write-bridge-to-_transform. hasTransform
         // ⇒ the user's own override/option (writeThunkFor's "transform"
         // kind, doneClosFor's new 2-param arm). !hasTransform ⇒ only
@@ -18420,6 +18539,46 @@ class Assembler {
         this.walkExpr(e.args[0]!);
         code.i32Const(kind);
         code.call(this.stream.scRegisterCore());
+        return true;
+      }
+      case "stream.finished": {
+        // args: [recv, cb] — RS_SIDES is a construction-time stamp on
+        // the receiver's OWN state (RS_SIDES's own header: gate review
+        // caught the upcast divergence a call-site-static sides literal
+        // would have had), not threaded through the libCall args at all.
+        const cbExpr = e.args[1]!;
+        if (cbExpr.type.kind !== "func") {
+          this.refuse("libCall:stream.finished:non-func-callback", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const thunkIdx = this.finThunkFor(cbExpr.type, e.loc);
+        if (thunkIdx === null) {
+          code.unreachable();
+          return true;
+        }
+        this.mb.declareFuncRef(thunkIdx);
+        this.walkExpr(e.args[0]!);
+        code.i32Const(FIN_KIND_CB);
+        this.walkExpr(cbExpr);
+        code.refFunc(thunkIdx);
+        code.call(this.stream.finRegisterCbCore());
+        return true;
+      }
+      case "stream.finishedDyn":
+        // STAGE D SCOPE CUT: no P1 claim exercises a dyn-boxed finished()
+        // callback (1813/2564 are both plain typed closures / the
+        // promise form) — dyn.callFn's zero/one-arg calling convention
+        // for FIN_KIND_DYN is unbuilt this pass (finEntryT's own header).
+        // Refuses by name, never silently mishandled.
+        this.refuse("libCall:stream.finishedDyn", e.loc);
+        code.unreachable();
+        return true;
+      case "sp.finished": {
+        // args: [recv] — the promise form, no callback at all; RS_SIDES
+        // read from the receiver's own state (see stream.finished above).
+        this.walkExpr(e.args[0]!);
+        code.call(this.stream.finRegisterPromiseCore());
         return true;
       }
       default:

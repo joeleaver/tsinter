@@ -2617,6 +2617,25 @@ const TIER_FLOOR: string[] = [
   //
   // Tier 716→720 (four claims, one shared adapter family plus one
   // genuinely third dispatch shape for 1812, all landing together).
+  //
+  // STAGE D P1 (increment 22, board #77): finished()/eos() — a per-
+  // stream watcher LIST (FIN_HEAD), fired from opClose right after
+  // 'close' (the willEmitClose:true default path), plus an already-
+  // closed-at-registration fast path (OP_FIN). The frontend threads a
+  // static "r"/"w"/"rw" sidedness literal into the libCall args ($rState
+  // is one shared struct for every Readable/Writable/Duplex-rooted
+  // class, so the backend cannot recover which side(s) a premature-
+  // close check should watch from the struct alone) — 1813's own `w`
+  // case (a bare Writable) pins this directly. opError's "is this
+  // handled" gate also learned FIN_HEAD (a finished()/eos() watcher
+  // joins RS_WAITER/RS_CONSUMER_KIND's existing set) — 2564's r2
+  // (destroy(new Error), no user 'error' listener, only a pending
+  // sp.finished promise) pins that. Full 1069-program run, both
+  // instruments: TIER_FLOOR set-equality (this addition) and the full
+  // non-claimed bucket diff (zero net-new refusals elsewhere) both
+  // close — 720 → 722.
+  "1813-stream-finished.ts",
+  "2564-stream-promises-finished.ts",
 ];
 
 interface RunResult {
