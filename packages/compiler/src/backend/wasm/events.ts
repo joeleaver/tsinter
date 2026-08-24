@@ -205,6 +205,29 @@ export interface EventsDeps {
    * declared-prefix guard — the caller's own body ends right there,
    * no `return_()`/unwind bookkeeping needed. */
   reportUncaught: (c: Code, className: string, name: string, pushMessage: (c: Code) => void) => void;
+  /** Board #75's identity-transparency rule: the ONE universal `(eqref)
+   * -> eqref` unwrap function (emitter.ts's `universalUnwrapFn` —
+   * cascades every distinct listener-adapter marker type minted
+   * anywhere in the whole module, disjoint by construction, order
+   * irrelevant), returning an adapter's captured original or the value
+   * unchanged. `removeLast`/`countFnOf` are SHARED, single-instance,
+   * IrType-free runtime functions — this is how they reach the SAME
+   * unwrap every other identity site (bin "===", the incoming argument)
+   * uses, without ever needing to know a func type themselves. Declared
+   * lazily on first reference (from ANY identity site, in any order);
+   * its BODY is finalized once, after the whole module has been walked
+   * (emitter.ts's `finalizeListenerUnwrap`, called from `Assembler.run`
+   * right after the main per-function walk loop) — by then every
+   * `.listeners()`/`.rawListeners()` call site has had its chance to
+   * register a marker type, so the cascade this function's body builds
+   * is complete. A module that references this (an `.off()`/
+   * `.listenerCount(fn)` call site exists) but never calls `.listeners()`/
+   * `.rawListeners()` at all still finalizes correctly — as a pure
+   * identity function, the cascade's own empty-list base case; a
+   * declared-but-never-finalized function is invalid wasm (this
+   * project's own board #20 class), so finalization is unconditional
+   * once the function was ever referenced. */
+  listenerUnwrap: () => number;
 }
 
 export class EventsBuilder {
@@ -1037,27 +1060,36 @@ export class EventsBuilder {
    * listeners() element type varies by event, so it cannot live in the
    * fixed EventsDeps shape; passed in per call instead.
    *
-   * GATE FIX (board item, filed at the gate — the declared-prefix gap):
-   * a listener registered with a signature NARROWER than the event's
-   * own canonical tuple (`ee.on('evt', (a: string) => {...})` against a
-   * `(string, number)` event — legal Node, JS's own "extra args ignored"
-   * rule, lower-emitter.ts's own header names this exact shape) needs a
-   * closure ADAPTED to the full tuple to be a valid element of THIS
-   * array's own uniform element type — `entryIdentity()`'s existing
-   * consumers (`countFnOf`/`removeLast`) never needed that adaptation,
-   * since `ref.eq` compares ANY two eq-typed refs regardless of their
-   * more specific type. Building that adapter (a THIRD closure-minting
-   * family, `streamMethodWrapper`'s own shape ported to events.ts) is
-   * DEFERRED to the assert era (#37 — Draft B's own "Tested by" already
-   * anticipated `.listeners()`/`.rawListeners()` needing BOTH this and
-   * `assert.deepStrictEqual` before any claim reaches it, and 1677 is
-   * the ONLY corpus program that calls either method today, itself
-   * still blocked by the assert gap regardless — census-invisible until
-   * both land). What ships NOW: `ref.test` checks the shape BEFORE the
-   * cast a bare `refCast` would otherwise trap on — a NAMED, attributed
-   * loud trap (S050/S051's own reportUncaught pattern) instead, the
-   * ordinary out-of-tier contract, not a silent miscompile. */
-  listenersOf(vecRef: ValType, vecNewLen: number, vecPushOne: number, elemType: number): number {
+   * BOARD #75 BUILT (stage D P3): a listener registered with a signature
+   * NARROWER than the event's own canonical tuple (`ee.on('evt', (a:
+   * string) => {...})` against a `(string, number)` event — legal Node,
+   * JS's own "extra args ignored" rule) gets a closure ADAPTED to the
+   * full tuple, minted by the CALLER (emitter.ts's `listenerAdapterFn` —
+   * the closure-minting family this header used to defer) and passed in
+   * as `adapters`: one `{prefixClos, adapterFn}` pair per possible
+   * declared-prefix arity, WIDEST FIRST (index 0 = arity N-1, down to
+   * arity 0), cascaded below via `refTest` exactly like the exact-match
+   * arm above it. `adapterBase` is the shared marker struct type
+   * (`listenerAdapterBase`, emitter.ts) every minted adapter's env
+   * subtypes — this method stays IrType-free per its own file header
+   * (it never chooses a type, only tests/casts against numbers the
+   * caller already resolved). `entryIdentity()`'s OTHER consumers
+   * (`countFnOf`/`removeLast`) compare a stored identity against a
+   * user-supplied value — an adapter can appear on EITHER side of that
+   * comparison once this method can produce one, so those two ALSO
+   * unwrap now (their own headers have the story). The residual trap
+   * below is genuinely narrower than before: only a dyn/onDyn-registered
+   * entry or the dedicated 'error' bucket family (neither ever reaches
+   * the general bucket's plain-registration path this method walks) can
+   * still hit it. */
+  listenersOf(
+    vecRef: ValType,
+    vecNewLen: number,
+    vecPushOne: number,
+    elemType: number,
+    adapterBase: number,
+    adapters: readonly { prefixClos: number; adapterFn: number }[],
+  ): number {
     return this.cached(`listenersOf:${vecNewLen}`, () => {
       const idx = this.mb.declareFunc(this.mb.funcType([this.deps.rootRef(), this.deps.strRef()], [vecRef]), "%w.ee.listenersOf");
       const c = new Code();
@@ -1103,14 +1135,7 @@ export class EventsBuilder {
       c.refCast(elemType);
       c.call(vecPushOne);
       c.else_();
-      // GATE FIX (board item): a declared-prefix listener's own identity
-      // isn't shaped like the event's full tuple — `ref.test` caught it
-      // BEFORE the cast that would otherwise bare-trap (this method's
-      // own header has the full story). Loud and attributed, S050/
-      // S051's own reportUncaught pattern — never returns.
-      this.deps.reportUncaught(c, "%TypeError", "TypeError", (cc) =>
-        this.deps.lit(cc, "listeners()/rawListeners() over a narrower-arity listener is not supported yet"),
-      );
+      this.emitListenerAdapterCascade(c, adapterBase, adapters, 0, OUT, ID, vecPushOne);
       c.end();
       c.localGet(E);
       c.structGet(this.entryT(), ENTRY_NEXT);
@@ -1124,6 +1149,44 @@ export class EventsBuilder {
     });
   }
 
+  /** The declared-prefix cascade `listenersOf` falls into once the
+   * exact-match `refTest` fails: try each `adapters[i]`'s own prefix
+   * shape (widest first, matching the caller's own ordering), mint+push
+   * an adapter on the first match, else recurse to the next-narrower
+   * entry. Exhausting `adapters` reaches the residual, now-genuinely-
+   * narrow trap (`listenersOf`'s own header names exactly what's left:
+   * a dyn/onDyn-registered entry, or the dedicated 'error' bucket family
+   * — neither reaches the general bucket's plain-registration path this
+   * whole method walks). */
+  private emitListenerAdapterCascade(
+    c: Code,
+    adapterBase: number,
+    adapters: readonly { prefixClos: number; adapterFn: number }[],
+    i: number,
+    OUT: number,
+    ID: number,
+    vecPushOne: number,
+  ): void {
+    if (i >= adapters.length) {
+      this.deps.reportUncaught(c, "%TypeError", "TypeError", (cc) =>
+        this.deps.lit(cc, "listeners()/rawListeners() over a dyn-registered or 'error'-bucket listener is not supported yet"),
+      );
+      return;
+    }
+    const { prefixClos, adapterFn } = adapters[i]!;
+    c.localGet(ID);
+    c.refTest(prefixClos);
+    c.ifVoid();
+    c.localGet(OUT);
+    c.refFunc(adapterFn);
+    c.localGet(ID);
+    c.structNew(adapterBase);
+    c.call(vecPushOne);
+    c.else_();
+    this.emitListenerAdapterCascade(c, adapterBase, adapters, i + 1, OUT, ID, vecPushOne);
+    c.end();
+  }
+
   /** `(root, name, cb) -> void` — off/removeListener: the LAST matching
    * occurrence leaves (Node searches from the end — scr_emitter_off).
    * `cb` borrowed, matched by identity. A no-match is a silent no-op
@@ -1132,7 +1195,7 @@ export class EventsBuilder {
     return this.cached("removeLast", () => {
       const idx = this.mb.declareFunc(this.mb.funcType([this.deps.rootRef(), this.deps.strRef(), EQ_REF], []), "%w.ee.removeLast");
       const c = new Code();
-      const ROOT = 0, NAME = 1, CB = 2, REG = 3, B = 4, E = 5, MATCH = 6;
+      const ROOT = 0, NAME = 1, CB = 2, REG = 3, B = 4, E = 5, MATCH = 6, CBU = 7;
       c.localGet(ROOT);
       c.structGet(this.deps.rootStruct(), EMITTER_REG);
       c.localTee(REG);
@@ -1148,6 +1211,16 @@ export class EventsBuilder {
       c.ifVoid();
       c.return_();
       c.end();
+      // Board #75's identity-transparency rule, BOTH-SIDES half: `cb`
+      // may itself be a listeners()/rawListeners() snapshot adapter (the
+      // caller's own type-directed half already unwrapped whatever it
+      // could know statically — this is the SAME universal unwrap,
+      // applied here because this function is generic over every event/
+      // type in the module and never knows a func type itself), unwrap
+      // it ONCE before the loop.
+      c.localGet(CB);
+      c.call(this.deps.listenerUnwrap());
+      c.localSet(CBU);
       // Walk the whole list; the LAST match wins (a later match simply
       // overwrites an earlier candidate — one forward pass answers the
       // same question a backward scan would).
@@ -1163,7 +1236,12 @@ export class EventsBuilder {
       c.brIf(1);
       c.localGet(E);
       c.call(this.entryIdentity());
-      c.localGet(CB);
+      c.call(this.deps.listenerUnwrap());
+      // The STORED side: an entry's own identity can ALSO be an adapter
+      // (re-registering a snapshot element via `.on()` stores it
+      // verbatim, e.g. `ee.on("x", ee.listeners("evt")[1])`) — the exact
+      // combo `removeListener(name, original)` needs to still match.
+      c.localGet(CBU);
       c.refEq();
       c.ifVoid();
       c.localGet(E);
@@ -1188,7 +1266,7 @@ export class EventsBuilder {
       // a reserved bucket lingers (2626's own "removeListener KEEPS an
       // emptied name's rank").
       c.call(this.unlinkEntry());
-      this.mb.setBody(idx, [this.regRef(), this.bucketRef(), this.entryRef(), this.entryRef()], c.bytes());
+      this.mb.setBody(idx, [this.regRef(), this.bucketRef(), this.entryRef(), this.entryRef(), EQ_REF], c.bytes());
       return idx;
     });
   }
@@ -1199,7 +1277,7 @@ export class EventsBuilder {
     return this.cached("countFnOf", () => {
       const idx = this.mb.declareFunc(this.mb.funcType([this.deps.rootRef(), this.deps.strRef(), EQ_REF], [F64]), "%w.ee.countFnOf");
       const c = new Code();
-      const ROOT = 0, NAME = 1, CB = 2, B = 3, E = 4, N = 5;
+      const ROOT = 0, NAME = 1, CB = 2, B = 3, E = 4, N = 5, CBU = 6;
       c.localGet(ROOT);
       c.structGet(this.deps.rootStruct(), EMITTER_REG);
       c.localGet(NAME);
@@ -1213,6 +1291,11 @@ export class EventsBuilder {
       c.f64Const(0);
       c.return_();
       c.end();
+      // Board #75's identity-transparency rule, both-sides half — same
+      // reasoning as removeLast above.
+      c.localGet(CB);
+      c.call(this.deps.listenerUnwrap());
+      c.localSet(CBU);
       c.localGet(B);
       c.structGet(this.bucketT(), BUCKET_EHEAD);
       c.localSet(E);
@@ -1223,7 +1306,8 @@ export class EventsBuilder {
       c.brIf(1);
       c.localGet(E);
       c.call(this.entryIdentity());
-      c.localGet(CB);
+      c.call(this.deps.listenerUnwrap());
+      c.localGet(CBU);
       c.refEq();
       c.ifVoid();
       c.localGet(N);
@@ -1239,7 +1323,7 @@ export class EventsBuilder {
       c.end();
       c.localGet(N);
       c.f64ConvertI32U();
-      this.mb.setBody(idx, [this.bucketRef(), this.entryRef(), I32], c.bytes());
+      this.mb.setBody(idx, [this.bucketRef(), this.entryRef(), I32, EQ_REF], c.bytes());
       return idx;
     });
   }

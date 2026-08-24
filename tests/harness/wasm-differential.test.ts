@@ -2707,6 +2707,44 @@ const TIER_FLOOR: string[] = [
   // non-claimed bucket diff (zero net-new refusals elsewhere) both
   // close — 725 → 726.
   "2634-stream-pipeline-arg-ladders.cjs",
+  // Stage D P3 (node:assert board #37 + board #75 listeners()/
+  // rawListeners() narrower-arity adapters): assert.deepResult/
+  // refEqBytes/bytesDeepEq (emitAssertLibCall, emitter.ts) unblock
+  // 1680's Buffer/Uint8Array strict+deep equality family, byte-exact
+  // against the Node oracle including every generated-header branch and
+  // the custom-message override. 1677's own remaining blocker (the
+  // narrower-arity listener snapshot trap) is resolved by board #75's
+  // adapter cascade (events.ts's listenersOf, emitter.ts's
+  // listenerAdapterBase/listenerAdapterFn/universalUnwrapFn) with
+  // identity transparency: EVERY func-typed reference-identity site in
+  // this backend (bin "===", removeLast/countFnOf's both sides) unwraps
+  // an adapter back to its captured original through ONE universal
+  // cascading function (not a per-type one — the gate's own second-round
+  // ruling, closing the re-register-then-remove combo on both sides),
+  // verified against 1677's own line 25 identity comparisons AND the
+  // dedicated wasm-listener-adapters.test.ts pin suite (mutation-checked
+  // at both the cascade and stored-side granularity). Full 1069-program
+  // run, both instruments: TIER_FLOOR set-equality (this addition) and
+  // the full non-claimed bucket diff (predicted movers: 1604/2487 move
+  // from libCall:assert.deepResult to a new named refusal, nothing else
+  // moves) both close — 726 → 728.
+  "1677-emitter-listeners.ts",
+  "1680-assert-bytes.ts",
+  // Stage D P3's own 1681 stretch (timeboxed, per the lead's own GO
+  // under Joe's scoped upside-with-verification allowance):
+  // assert.refEqFn (bare-function strictEqual/notStrictEqual) — SIMPLER
+  // than refEqBytes, no "same structure" branch is possible (deep-
+  // equality over functions IS reference identity, so a strictEqual
+  // FAILURE can never also be deep-equal — measured directly, not
+  // inherited from the earlier design-note prediction). 1681's own
+  // deepStrictEqual/notDeepStrictEqual calls over bare functions and
+  // function arrays were ALREADY covered by board #75's generic
+  // deepResult/deepEqHelper path (identical machinery 1677 needed) —
+  // refEqFn was the only genuinely new case. Byte-exact against the
+  // Node oracle; force-pinned custom-message branches 1681 itself never
+  // exercises (Node-measured first, wasm-assert.test.ts). Both
+  // instruments close — 728 → 729.
+  "1681-assert-funcs.ts",
 ];
 
 interface RunResult {

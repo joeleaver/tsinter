@@ -1216,7 +1216,9 @@ and a stack-walking runtime, which is a different project.
 
 Note this is a rendering divergence only: `err.stack` is a separate
 question (the property does not carry frames either), and `err.message`,
-`err.name`, `err.code` and `instanceof` are all exact.
+`err.name`, `err.code` and `instanceof` are all exact. **Amended by
+S054:** a thrown `AssertionError`'s `.message` is the ONE exception to
+the "exact" claim above — see S054 for the full boundary.
 
 **Tested by:** the wasm inspect unit tests — the five bracket shapes above,
 the `code` property through the frame engine, the multi-line message
@@ -3166,3 +3168,83 @@ middle position) plus the re-gate amendment's own source/destination
 probes (both freshly re-measured against live Node and the compiled
 build, both sides, not assumed from the reviewer's report), restated in
 full above.
+
+## S054 — A thrown `AssertionError`'s `.message` carries ONLY the header/custom text — Node's trailing multi-line diff never renders *(wasm tier)*
+
+`assert.strictEqual`/`notStrictEqual`/`deepStrictEqual`/`notDeepStrictEqual`
+over Buffer/Uint8Array operands (`assert.refEqBytes`/`assert.deepResult`)
+OR bare-function operands (`assert.refEqFn` — the stage D P3 1681 stretch,
+landed after this entry's first draft; SAME divergence, same mechanism,
+extending this entry's scope rather than drafting a new one) —
+emitter.ts's `emitAssertLibCall` — throw a catchable `AssertionError` whose
+`.name`/`.code` are byte-exact to Node (`"AssertionError"`/
+`"ERR_ASSERTION"`) and whose `.message` is the SAME first line Node
+produces (one of a small set of static header strings, or the verbatim
+custom message when one is passed) — but nothing after it. Node's real
+`.message` continues past that header with a blank line and a rendered
+diff of the two operands (`util.inspect`-shaped: `+ actual - expected`
+markers, an indented value dump). This tier's `.message` stops at the
+header, full stop — no blank line, no diff, no trailing newline.
+
+**Amendment to S027:** S027 states tier-wide that "`err.message`, `err.name`,
+`err.code` and `instanceof` are all exact" for every error this tier
+throws — true everywhere else, but this entry is the ONE exception:
+`AssertionError.message` is exact only on its FIRST LINE, not its full
+value. S027's own `.stack` disclaimer ("a separate question") is
+unaffected and unrelated — this is about `.message` itself, a property
+S027 declared exact without qualification because nothing before this
+pass ever diverged there.
+
+**Measured boundary (Node v24.18.1, own probe, re-run at this draft's
+own time — not transcribed from an earlier stage of this pass):** for
+`assert.deepStrictEqual(Buffer.from([1,2,3]), Buffer.from([1,2,4]))`,
+Node's real `e.message` is `"Expected values to be strictly deep-equal:\n+
+actual - expected\n\n  Buffer(3) [Uint8Array] [\n    1,\n    2,\n+   3\n-
+4\n  ]\n"` — 10 lines, 121 characters. This tier's compiled build
+(re-measured against the same shape via the actual host, not asserted)
+produces `e.message === "Expected values to be strictly deep-equal:"` —
+1 line, 42 characters, byte-identical to Node's FIRST line only. The
+SAME shape holds for `assert.refEqFn`, re-measured independently at the
+1681 stretch's own draft time: for `assert.strictEqual(f, g)` over two
+bare functions, Node's real `e.message` is 7 lines, 123 characters
+(header, a blank-separated `+ actual - expected` diff, `[Function: f]`/
+`[Function: g]` lines, a caret marker) — this tier's compiled build
+produces the 54-character header alone, 1 line. A program reading
+`.message.split("\n")[0]` (1680 and 1681, this pass's other two named
+claims, both do exactly this — 1677's own asserts all PASS, so it never
+constructs or reads a message at all) observes no divergence at all; a
+program reading `.message` whole, `.message.length`, or
+`.message.split("\n").length` would observe the difference immediately.
+`e.stack` carries no frames on this tier regardless (S027), so it is not
+an independent way to recover the missing lines.
+
+**Rationale:** reproducing Node's trailing diff requires porting a real
+structural-diff renderer over `util.inspect`-shaped output (the `+`/`-`
+marker walk, indentation, the composite-value dump) — genuinely new
+machinery this pass does not build, named in its own design note as
+explicitly out of scope. None of the three named claims (1677, 1680,
+1681) ever observes past the first line — but not for the same reason
+in every case: 1680 and 1681 both use a `try { ... } catch (e) { ...
+e.message.split("\n")[0] ... }` pattern that reads only the header;
+1677's own three `assert.deepStrictEqual` calls all PASS (their
+verdicts are true), so 1677 has NO try/catch around any assert call at
+all and reads `.message` ZERO times — its own AssertionError machinery
+never even constructs a message, let alone observes one.
+Truncating rather than fabricating a plausible-looking diff keeps the
+divergence HONEST and NAMED rather than a silent approximation that
+could look right by accident on some inputs and wrong on others.
+
+**Tested by:** `packages/compiler/test/wasm-assert.test.ts` — the
+`.message.split("\n")[0]` pin mirrors 1677/1680's own corpus pattern
+directly; every header-string branch across BOTH families (same-
+structure, reference-equal, not-reference-equal, deep-equal, not-deep-
+equal, custom message — refEqBytes's set; reference-equal, not-
+reference-equal, custom message — refEqFn's own, force-pinned since
+1681 itself never passes a custom message) has its own execution pin
+asserting `.message`'s EXACT (whole) value, which is what makes the
+truncation-not-fabrication claim durable — a pin asserting only the
+split first line would not distinguish "truncated" from "correctly
+reproduced the whole thing." No corpus program can pin the truncation
+itself (1677/1680/1681 never read past line 0 by construction, and no
+claimed program constructs a full-message read against this family) —
+the unit pins are the only instrument for this entry.

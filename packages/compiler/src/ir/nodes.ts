@@ -6936,4 +6936,16 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "crypto.x509ValidFromStr",
   "crypto.x509ValidTo",
   "crypto.x509ValidToStr",
+  // assert.strictEqual/notStrictEqual/deepStrictEqual/notDeepStrictEqual
+  // (lower-assert.ts): a failing comparison throws Node's catchable
+  // AssertionError (ERR_ASSERTION). assert.bytesDeepEq is deliberately
+  // NOT here — it is a pure boolean computation (Buffer/Uint8Array
+  // brand+content check), never a throw site itself; it only ever
+  // appears nested inside a deepResult call (never refEqBytes, which
+  // compares its own operands directly via ref.eq — lower-assert.ts's
+  // own dispatch), whose own may-throw seed already covers the
+  // statement.
+  "assert.deepResult",
+  "assert.refEqBytes",
+  "assert.refEqFn",
 ]);

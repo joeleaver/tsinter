@@ -1,4 +1,9 @@
-/* IR → WebAssembly (WasmGC). The wasm backend consumes the SAME in-memory
+/* STAGE D P3 SCOPE NOTE (worktree stage-d-p3, base f1f7c12): node:assert +
+ * board #75 (listeners()/rawListeners() narrower-arity adapters). Named
+ * claims: tests/corpus/1677-emitter-listeners.ts, 1680-assert-bytes.ts,
+ * 1681-assert-funcs.ts.
+ *
+ * IR → WebAssembly (WasmGC). The wasm backend consumes the SAME in-memory
  * IrModule the C and LLVM backends do (never the JSON dump) and produces a
  * binary module — bytes, not text, and not a translation unit: nothing on
  * this lane reaches clang. A .wasm has no scr_* runtime linked beside it
@@ -1067,6 +1072,10 @@ const ANY_REF: ValType = { kind: "ref", nullable: true, typeIndex: ANY_HEAP };
  * `eq`-typed, so a plain (non-dyn-adapted) registration's `orig` push is
  * `ref.null EQ_HEAP`. */
 const EQ_HEAP = -0x13;
+/** events.ts's own local, reused here for board #75's adapter/unwrap
+ * machinery (the marker struct's captured-original field, the shared
+ * unwrap function signature). */
+const EQ_REF: ValType = { kind: "ref", nullable: true, typeIndex: EQ_HEAP };
 
 /** Record shapes the resumable lowering owns (statemachine.ts names them
  * `%frame.<fn>`): the ONLY shapes that declare a supertype. */
@@ -1708,6 +1717,12 @@ class Assembler {
     for (const fn of this.mod.functions) {
       if (reachable.has(fn.name)) this.walkFunction(fn);
     }
+    // Board #75's universal unwrap: every reachable function has now been
+    // walked, so every `.listeners()`/`.rawListeners()` call site has had
+    // its chance to grow the marker-base cascade — finalize its body now
+    // (a no-op if nothing ever referenced it). See this file's own
+    // "board #75" section header for the deferred-finalization story.
+    this.finalizeListenerUnwrap();
 
     const entry = this.funcIndexByName.get(this.mod.entry);
     const entryFn = this.funcByName.get(this.mod.entry);
@@ -1902,6 +1917,228 @@ class Assembler {
     const params = fn.params.map((p) => this.mapTypeSoft(p.type));
     const results = fn.returnType.kind === "void" ? [] : [this.mapTypeSoft(fn.returnType)];
     return this.closPairFor(params, results);
+  }
+
+  /* ── board #75: listeners()/rawListeners() narrower-arity adapters ────
+   *
+   * A listener registered with a signature NARROWER than its event's own
+   * unified tuple (`ee.on('evt', (a: string) => {...})` against a
+   * `(string, number)` event — legal Node, JS's own "extra args ignored"
+   * rule) is stored, on the plain `.on()`/`.once()` path, as a REAL
+   * closure of ITS OWN declared type (events.ts's entryAppend: `orig`
+   * is always null for that path, so `entryIdentity()` answers
+   * `ENTRY_CLOS` — the actual closure `walkExpr(cbExpr)` pushed, not a
+   * dyn box). `listeners()`/`rawListeners()` needs every element of its
+   * returned array to be of ONE uniform type — the event's FULL tuple
+   * signature — so a narrower-arity entry needs a closure ADAPTED to
+   * that shape. `stage-d-p3/plan.txt`'s design note has the full
+   * grounding; this is the summary the code needs.
+   *
+   * IDENTITY TRANSPARENCY (the gate's own required revision, TWICE
+   * refined): a freshly minted adapter is a DIFFERENT reference from the
+   * original closure it wraps, which would silently break every
+   * reference-identity site a snapshot element can reach (`arr[i] ===
+   * original`, `deepStrictEqual` over an array containing one,
+   * `removeListener`/`listenerCount` after a snapshot round-trip in
+   * EITHER direction — an adapter can be the STORED side too, via
+   * `ee.on(name, ee.listeners(other)[i])` storing the snapshot element
+   * verbatim as ENTRY_CLOS) — behavior that was simply INEXPRESSIBLE
+   * before this build (mixed-arity snapshots trapped), so no comparison
+   * site ever needed to know about it. Every adapter's env struct
+   * subtypes ONE marker base per elemType (`listenerAdapterBase`) that
+   * carries the ORIGINAL matched closure as a plain `eqref` field —
+   * `dynFnAdapter`'s own env-building shape (below, `subStructType` off
+   * `pair.clos`) reused, generalized: ONE marker struct serves every k
+   * (0..N-1) for a given elemType, since the per-k adapter FUNCTION
+   * alone needs to know which prefix type to `refCast` the captured
+   * field down to — the marker's own shape never varies by k.
+   *
+   * THE UNWRAP IS UNIVERSAL, not per-type (the gate's second-round
+   * ruling): a single `(eqref) -> eqref` function (`universalUnwrapFn`)
+   * cascades `refTest` across EVERY distinct marker base minted ANYWHERE
+   * in the whole module, applied UNIFORMLY at every identity site — bin
+   * "===" /"!==" 's func branch, the incoming argument of `emitter.off`/
+   * `emitter.countFn`, AND the STORED side of events.ts's own
+   * removeLast/countFnOf comparison loops (threaded through via
+   * `EventsDeps.listenerUnwrap`, keeping events.ts itself IrType-free —
+   * its own header story). A single call-site-local (per-type) unwrap
+   * would leave the re-register-then-remove combo open whenever the
+   * incoming argument's OWN static type is narrower than the STORED
+   * adapter's type (`removeListener("evt", prefix)` against an entry
+   * re-registered as `ee.listeners("evt")[1]`'s own wider adapter type —
+   * `prefix`'s narrow-type unwrap would never recognize it); the
+   * universal version makes the question moot, and "every identity site
+   * calls the one unwrap" is a greppable invariant instead of N separate
+   * type-reasoning arguments a reviewer would otherwise have to redo.
+   *
+   * DISJOINTNESS BY CONSTRUCTION (why cascade order never matters):
+   * `listenerAdapterBase` is cached per `clos` — one marker struct per
+   * DISTINCT elemType, each a `sub` of that (and only that) `clos`. Two
+   * different elemTypes' markers can never both match the same value (a
+   * struct has exactly one nominal supertype chain), so trying them in
+   * any order reaches the same, unique answer. This is the SAME
+   * soundness argument `closPairFor`'s own `ref.eq` comment already
+   * makes for reference identity generally, one level up.
+   *
+   * DEFERRED FINALIZATION: `universalUnwrapFn` may be REFERENCED (its
+   * function index handed to a `call`) by any identity site in any
+   * order, but its BODY is not known until every `.listeners()`/
+   * `.rawListeners()` call site has run (each may grow the cascade). Its
+   * `setBody` therefore happens ONCE, in `finalizeListenerUnwrap`,
+   * called from `Assembler.run()` immediately after the main per-
+   * function walk loop — by construction every reachable function has
+   * been walked by then, so the accumulated base list is complete. A
+   * module that references the unwrap (an `.off()`/`.listenerCount(fn)`
+   * call site exists) but never calls `.listeners()`/`.rawListeners()`
+   * at all still finalizes correctly, as a pure identity function (the
+   * cascade's own empty-list base case) — finalization runs
+   * unconditionally once the function was ever declared, because a
+   * declared-but-never-finalized function is invalid wasm (this
+   * project's own board #20 class, wearing the deferred-setBody
+   * costume). */
+
+  private readonly listenerAdapterBases = new Map<number, number>();
+  private readonly listenerAdapterFns = new Map<string, number>();
+  /** Every distinct marker struct type, in first-encountered order — the
+   * universal unwrap's own cascade list, grown by `listenerAdapterBase`
+   * and consumed once by `finalizeListenerUnwrap`. Order is provably
+   * irrelevant (see this section's own DISJOINTNESS note); kept as
+   * first-encountered purely so the generated cascade is deterministic
+   * across otherwise-identical compiles. */
+  private readonly universalUnwrapBases: number[] = [];
+  private universalUnwrapFnField: number | null = null;
+  private universalUnwrapFinalized = false;
+  private listenerUnwrapSigField: number | null = null;
+
+  /** `(eqref) -> eqref` — the universal unwrap's own function TYPE. */
+  private listenerUnwrapSig(): number {
+    if (this.listenerUnwrapSigField === null) {
+      this.listenerUnwrapSigField = this.mb.funcType([EQ_REF], [EQ_REF]);
+    }
+    return this.listenerUnwrapSigField;
+  }
+
+  /** The marker struct: a `sub` of `clos` (so a marker instance IS a
+   * valid element of the event's own array type, no cast needed to push
+   * it) adding one field — the funcref inherited exactly from `clos`'s
+   * own field 0, then the captured original as `eqref`. Keyed by `clos`
+   * alone (it 1:1-determines `fn`, `closPairFor`'s own invariant). Every
+   * NEW marker grows `universalUnwrapBases` — the one place the cascade
+   * list is populated. */
+  private listenerAdapterBase(clos: number, fn: number): number {
+    const hit = this.listenerAdapterBases.get(clos);
+    if (hit !== undefined) return hit;
+    const made = this.mb.subStructType(
+      `eeAdapterBase:${clos}`,
+      [
+        { storage: { kind: "ref", nullable: false, typeIndex: fn }, mutable: false },
+        { storage: EQ_REF, mutable: false },
+      ],
+      clos,
+    );
+    this.listenerAdapterBases.set(clos, made);
+    this.universalUnwrapBases.push(made);
+    return made;
+  }
+
+  /** The per-k adapter FUNCTION: a closure of the FULL elemType
+   * signature (`fn`) whose body reads the marker's captured original
+   * (refCast down to the k-ary prefix's own closure type — the ONLY
+   * place that needs to know it), calls it via the ordinary closure-call
+   * convention (self as arg0, then only the FIRST k of the incoming
+   * args — `callValue`'s own idiom above), and returns whatever it
+   * returns. Standalone helper body (own `Code`, hand-counted depths,
+   * `this.fn` untouched) — the same convention `equalsHelper`/
+   * `entryIdentity`/`dynFnAdapter` already use for self-contained
+   * runtime functions with no unwind of their own. */
+  private listenerAdapterFn(
+    clos: number,
+    fn: number,
+    fullParams: ValType[],
+    results: ValType[],
+    k: number,
+  ): number {
+    const key = `${clos}:${k}`;
+    const hit = this.listenerAdapterFns.get(key);
+    if (hit !== undefined) return hit;
+    const base = this.listenerAdapterBase(clos, fn);
+    const prefix = this.closPairFor(fullParams.slice(0, k), results);
+    const idx = this.mb.declareFunc(fn, `%w.ee.adapter:${clos}:${k}`);
+    this.listenerAdapterFns.set(key, idx);
+    const w = this.newWalker(1 + fullParams.length);
+    const c = w.c;
+    const origRef: ValType = { kind: "ref", nullable: false, typeIndex: prefix.clos };
+    const orig = this.wlocal(w, origRef);
+    c.localGet(0); // env, statically typed (ref null clos) by `fn`'s own signature
+    c.refCast(base);
+    c.structGet(base, 1);
+    c.refCast(prefix.clos);
+    c.localSet(orig);
+    c.localGet(orig); // arg0: self (the original's own closure-call convention)
+    for (let i = 0; i < k; i++) c.localGet(1 + i);
+    c.localGet(orig);
+    c.structGet(prefix.clos, 0);
+    c.callRef(prefix.fn);
+    this.mb.setBody(idx, w.locals, c.bytes());
+    this.mb.declareFuncRef(idx);
+    return idx;
+  }
+
+  /** The universal unwrap's function INDEX — declared lazily on first
+   * reference, from ANY identity site, in any order (this method is
+   * idempotent and cheap to call repeatedly; only the FIRST call
+   * actually reserves the index). Safe to reference before a single
+   * `.listeners()` call site has run: the body isn't built yet, only
+   * the index is reserved, exactly like any other forward-called
+   * function in this backend (`funcIndexByName`'s own two-pass
+   * discipline, `run()`'s own comment: "so bodies can call forward"). */
+  private universalUnwrapFn(): number {
+    if (this.universalUnwrapFnField === null) {
+      this.universalUnwrapFnField = this.mb.declareFunc(this.listenerUnwrapSig(), "%w.ee.unwrapAny");
+    }
+    return this.universalUnwrapFnField;
+  }
+
+  /** Builds the universal unwrap's BODY: `v` unchanged, unless it is an
+   * instance of ANY marker base ever minted (cascaded, disjoint by
+   * construction — see this section's own header), in which case that
+   * one's captured ORIGINAL comes back instead. Called exactly once,
+   * from `Assembler.run()` right after the main per-function walk loop
+   * — see this section's own DEFERRED FINALIZATION note for why that
+   * point, and why finalization is unconditional (once referenced) even
+   * with zero accumulated bases. A no-op if `universalUnwrapFn` was
+   * never called by anything (no identity site anywhere in the module
+   * needed it) — nothing to finalize, and declaring the type/function
+   * eagerly for a module that never uses it would be pure waste. */
+  private finalizeListenerUnwrap(): void {
+    if (this.universalUnwrapFnField === null || this.universalUnwrapFinalized) return;
+    this.universalUnwrapFinalized = true;
+    const c = new Code();
+    this.emitUniversalUnwrapCascade(c, this.universalUnwrapBases, 0);
+    this.mb.setBody(this.universalUnwrapFnField, [], c.bytes());
+  }
+
+  /** `bases[i..]` tried in order (irrelevant which, per this section's
+   * own DISJOINTNESS note) — the LAST arm (`i >= bases.length`) is the
+   * cascade's own base case: plain identity, reached always when
+   * `bases` is empty (the zero-adapters-anywhere-in-the-module edge the
+   * gate required pinned by execution, not just validation). Standalone
+   * helper body (own `Code`, hand-counted depths, `this.fn` untouched —
+   * `equalsHelper`/`entryIdentity`/`dynFnAdapter`'s own convention). */
+  private emitUniversalUnwrapCascade(c: Code, bases: readonly number[], i: number): void {
+    if (i >= bases.length) {
+      c.localGet(0);
+      return;
+    }
+    c.localGet(0);
+    c.refTest(bases[i]!);
+    c.ifResult(EQ_REF);
+    c.localGet(0);
+    c.refCast(bases[i]!);
+    c.structGet(bases[i]!, 1);
+    c.else_();
+    this.emitUniversalUnwrapCascade(c, bases, i + 1);
+    c.end();
   }
 
   /* ── records ────────────────────────────────────────────────────────────
@@ -2931,6 +3168,7 @@ class Assembler {
         this.emitSetCellError(c, className, name, pushMessage, null);
         c.call(this.reportUncaughtHelper());
       },
+      listenerUnwrap: () => this.universalUnwrapFn(),
     });
     return this.eventsField;
   }
@@ -10458,6 +10696,7 @@ class Assembler {
         if (this.emitTimerCall(e)) return;
         if (this.emitEmitterLibCall(e)) return;
         if (this.emitStreamLibCall(e)) return;
+        if (this.emitAssertLibCall(e)) return;
         this.refuse(`libCall:${e.fn}`, e.loc);
         code.unreachable();
         return;
@@ -14382,8 +14621,38 @@ class Assembler {
           else code.i32Ne();
           return;
         }
+        if (k === "func") {
+          // Board #75's identity-transparency rule: a func-typed operand
+          // may be an adapter-wrapped listener()/rawListeners() snapshot
+          // element (this pass's own new machinery — see the "board #75"
+          // section above for the full grounding, including WHY the
+          // unwrap is the UNIVERSAL one, not a per-type lookup). Unwrap
+          // BOTH operands through the ONE universal function — every
+          // identity site in this backend calls the same helper, a
+          // greppable invariant. This fix DOES make the frontend's
+          // synthesized `%assert.deq.N` deep-equality helper correct for
+          // both a direct `bin "==="` over two snapshot-derived operands
+          // AND an array-of-functions comparison where BOTH sides came
+          // from a listeners() snapshot (deepEqHelper's own `case
+          // "func"` lowers to exactly this node, measured for both
+          // shapes) — it does NOT cover a WIDENED-comparand shape (one
+          // side is an adapter, the other a bare narrower-arity original
+          // that was never itself snapshotted); that residual gap is
+          // board #85, not fixed here.
+          if (this.mapType(e.left.type, e.loc) === null || this.mapType(e.right.type, e.loc) === null) {
+            code.unreachable();
+            return;
+          }
+          this.walkExpr(e.left);
+          code.call(this.universalUnwrapFn());
+          this.walkExpr(e.right);
+          code.call(this.universalUnwrapFn());
+          code.refEq();
+          if (e.op === "!==") code.i32Eqz();
+          return;
+        }
         if (
-          k === "array" || k === "func" || k === "record" || k === "object" || k === "promise" ||
+          k === "array" || k === "record" || k === "object" || k === "promise" ||
           k === "classval" || k === "map" || k === "set" || k === "bytes"
         ) {
           // Reference identity — JS object/function equality exactly.
@@ -16259,7 +16528,60 @@ class Assembler {
           code.unreachable();
           return true;
         }
-        const fn = this.events.listenersOf(this.vecs.vecRef(vecInfo), this.vecs.newLen(vecInfo), this.vecs.pushOne(vecInfo), vecInfo.elemVal.typeIndex);
+        // Board #75: the array's element IS the event's own unified
+        // tuple func type (checked here, not assumed — vecInfoFor above
+        // already proved it maps to a real ref type; this recovers the
+        // ORIGINAL IrType so the per-k adapter cascade can be built —
+        // events.ts's own listenersOf stays IrType-free, this is the
+        // one call site that resolves types for it, same division of
+        // labor the file's header already documents).
+        const elemFuncType = e.type.elem;
+        if (elemFuncType.kind !== "func") {
+          this.refuse("libCall:emitter.listeners:non-func-elem", e.loc);
+          code.unreachable();
+          return true;
+        }
+        const elemClosPair = this.closSigFor(elemFuncType, e.loc);
+        if (elemClosPair === null) {
+          code.unreachable();
+          return true;
+        }
+        const adapterParams: ValType[] = [];
+        for (const p of elemFuncType.params) {
+          const v = this.mapType(p, e.loc);
+          if (v === null) {
+            code.unreachable();
+            return true;
+          }
+          adapterParams.push(v);
+        }
+        let adapterResults: ValType[];
+        if (elemFuncType.ret.kind === "void") {
+          adapterResults = [];
+        } else {
+          const r = this.mapType(elemFuncType.ret, e.loc);
+          if (r === null) {
+            code.unreachable();
+            return true;
+          }
+          adapterResults = [r];
+        }
+        const N = adapterParams.length;
+        const adapterBase = this.listenerAdapterBase(elemClosPair.clos, elemClosPair.fn);
+        const adapters: { prefixClos: number; adapterFn: number }[] = [];
+        for (let k = N - 1; k >= 0; k--) {
+          const prefixPair = this.closPairFor(adapterParams.slice(0, k), adapterResults);
+          const adapterFn = this.listenerAdapterFn(elemClosPair.clos, elemClosPair.fn, adapterParams, adapterResults, k);
+          adapters.push({ prefixClos: prefixPair.clos, adapterFn });
+        }
+        const fn = this.events.listenersOf(
+          this.vecs.vecRef(vecInfo),
+          this.vecs.newLen(vecInfo),
+          this.vecs.pushOne(vecInfo),
+          vecInfo.elemVal.typeIndex,
+          adapterBase,
+          adapters,
+        );
         this.walkExpr(e.args[0]!);
         this.walkExpr(e.args[1]!);
         code.call(fn);
@@ -16282,6 +16604,14 @@ class Assembler {
         this.walkExpr(e.args[0]!);
         this.walkExpr(e.args[1]!);
         this.walkExpr(cbExpr);
+        // Board #75's identity-transparency rule: `countFnOf` (events.ts)
+        // now unwraps BOTH the incoming cb and each stored entry's own
+        // identity internally, through the universal unwrap threaded via
+        // EventsDeps.listenerUnwrap — nothing to do at this call site.
+        // (A `dyn`-typed cb, the checked-dynamic path, is a DIFFERENT
+        // representation an adapter can never be — the universal unwrap
+        // is a no-op on it either way, so no branch is needed here for
+        // that case specifically.)
         code.call(this.events.countFnOf());
         return true;
       }
@@ -16314,6 +16644,11 @@ class Assembler {
         code.localTee(recv);
         this.walkExpr(e.args[1]!); // name
         this.walkExpr(cbExpr); // closure identity
+        // Board #75's identity-transparency rule: `removeLast` (events.ts)
+        // now unwraps BOTH the incoming cb and each stored entry's own
+        // identity internally, through the universal unwrap threaded via
+        // EventsDeps.listenerUnwrap — nothing to do at this call site
+        // (same reasoning as emitter.countFn above).
         code.call(this.events.removeLast());
         this.emitPendingCheck(); // a removeListener meta handler may have thrown
         code.localGet(recv); // chaining
@@ -18835,6 +19170,262 @@ class Assembler {
       }
       default:
         if (e.fn.startsWith("readable.") || e.fn.startsWith("stream.") || e.fn.startsWith("sc.")) {
+          this.refuse(`libCall:${e.fn}`, e.loc);
+          code.unreachable();
+          return true;
+        }
+        return false;
+    }
+  }
+
+  /** node:assert (lower-assert.ts) — four cases. Buffer/Uint8Array
+   * strict+deep equality (assert.refEqBytes / assert.bytesDeepEq);
+   * bare-function strict equality (assert.refEqFn — the 1681 stretch,
+   * simpler than refEqBytes since no "same structure" branch is ever
+   * possible for functions, deep-equality over functions being
+   * reference identity by construction); and the generic pass/throw
+   * wrapper (assert.deepResult) that ALSO serves the frontend's
+   * synthesized per-type deep-equality helpers (deepEqHelper's
+   * `%assert.deq.N` functions are ordinary `call` IR, not a libCall of
+   * their own — their bodies use plain `bin "==="` and
+   * `arrIntrinsic:length`, already built, so a func-element array's deep
+   * equality reaches wasm-side support through THIS one wrapper alone).
+   *
+   * MESSAGE SCOPE (deliberate, registered — SEMANTICS.md S054): this
+   * pass's three named claims (1677/1680/1681) only ever read
+   * `e.message.split("\n")[0]` — never Node's later diff lines. The
+   * thrown AssertionError's `.message` therefore carries ONLY the header
+   * string (or the verbatim custom message) — never Node's full
+   * multi-line `util.inspect` diff block. `.name`/`.code` are byte-exact
+   * ("AssertionError"/"ERR_ASSERTION") regardless.
+   *
+   * Every header string below is a STATIC string, measured directly
+   * against the Node v24.18.1 oracle (own probes, stage D P3's design
+   * note) — never interpolated data. The primitive single-line inline
+   * form Node also has ("Expected \"actual\" to be strictly unequal to:
+   * 1") is UNREACHABLE from any of these four libCalls: primitives get
+   * their own dedicated eqF64/eqStr/eqBool/eqSym libCalls upstream in
+   * lower-assert.ts, unbuilt and out of this pass's scope — deepResult's
+   * callers (the bytes-deep path and the generic composite path) are
+   * always "object-shaped" operands, refEqBytes/refEqFn are bytes/func-
+   * typed by construction, and none of the four can ever see a
+   * primitive operand. */
+  private emitAssertLibCall(e: Extract<IrExpr, { kind: "libCall" }>): boolean {
+    const code = this.fn.code;
+    const REF_EQ_HEADER = 'Expected "actual" to be reference-equal to "expected":';
+    const NOT_REF_EQ_HEADER = 'Expected "actual" not to be reference-equal to "expected":';
+    const SAME_STRUCTURE_HEADER = "Values have same structure but are not reference-equal:";
+    const DEEP_EQUAL_HEADER = "Expected values to be strictly deep-equal:";
+    const NOT_DEEP_EQUAL_HEADER = 'Expected "actual" not to be strictly deep-equal to:';
+    switch (e.fn) {
+      // (a, b, brandsEq) -> bool. Brand-first (Node compares prototypes
+      // before content — a Buffer is never deep-equal to a plain
+      // Uint8Array even at zero length, measured): brandsEq is a STATIC
+      // fact from the checker types (lower-assert.ts), so content only
+      // needs checking once it already agrees. Reuses the existing
+      // Buffer#equals content check (typedarrays.ts's equalsHelper,
+      // length + per-byte, u8-only — exactly this call's domain).
+      case "assert.bytesDeepEq": {
+        this.walkExpr(e.args[0]!); // a
+        this.walkExpr(e.args[1]!); // b
+        code.call(this.bytesB.equalsHelper());
+        this.walkExpr(e.args[2]!); // brandsEq
+        code.i32And();
+        return true;
+      }
+      // (a, b, negated, brandsEq, msg, hasMsg) -> void. strictEqual /
+      // notStrictEqual over same-bytes-typed operands: reference
+      // identity (`ref.eq`, JS-exact for objects), with Node's
+      // "same structure" vs "reference-equal" header choice keyed on
+      // brand+content equality (measured: brand alone can suppress
+      // "same structure" even when content matches, e.g. Buffer vs
+      // same-content Uint8Array). Every argument is evaluated EAGERLY
+      // into a scratch local in IR order before any branch runs — Node
+      // evaluates every call argument (msg included) before its own
+      // logic, regardless of whether the assertion later throws; a
+      // side-effecting message expression must still run exactly once,
+      // unconditionally (this diverges from an earlier draft that
+      // deferred msg's evaluation into the failure branch only — fixed
+      // before this landed).
+      case "assert.refEqBytes": {
+        const bytesRefType = this.bytesB.bytesRef();
+        const aLocal = this.acquireScratch(bytesRefType);
+        const bLocal = this.acquireScratch(bytesRefType);
+        const negatedLocal = this.acquireScratch(I32);
+        const brandsEqLocal = this.acquireScratch(I32);
+        const msgLocal = this.acquireScratch(this.strRef);
+        const hasMsgLocal = this.acquireScratch(I32);
+        this.walkExpr(e.args[0]!);
+        code.localSet(aLocal);
+        this.walkExpr(e.args[1]!);
+        code.localSet(bLocal);
+        this.walkExpr(e.args[2]!);
+        code.localSet(negatedLocal);
+        this.walkExpr(e.args[3]!);
+        code.localSet(brandsEqLocal);
+        this.walkExpr(e.args[4]!);
+        code.localSet(msgLocal);
+        this.walkExpr(e.args[5]!);
+        code.localSet(hasMsgLocal);
+        code.localGet(aLocal);
+        code.localGet(bLocal);
+        code.refEq(); // sameRef
+        code.localGet(negatedLocal);
+        code.i32Xor(); // holds = sameRef XOR negated
+        code.i32Eqz(); // !holds
+        // EVERY structural if/end below goes through openIf()/close(),
+        // never raw code.ifVoid()/code.end() — those bypass fn.depth,
+        // which brTo (inside emitUnwind, below) needs exact to compute
+        // its relative br immediate. A raw ifVoid here silently produces
+        // a WRONG branch target: the module still validates (any depth
+        // is a legal target) but unwinds to the wrong block, so the
+        // pending exception survives past the intended catch and
+        // surfaces at the top-level uncaught handler instead — caught by
+        // this pass's own pin suite (a direct top-level try/catch around
+        // an assert call), not by typechecking or WebAssembly.validate.
+        this.openIf();
+        code.localGet(hasMsgLocal);
+        this.openIf();
+        this.emitSetCellError(this.fn.code, "%Error", "AssertionError", () => code.localGet(msgLocal), "ERR_ASSERTION");
+        code.else_();
+        code.localGet(negatedLocal);
+        this.openIf();
+        this.emitSetCellErrorLit("%Error", "AssertionError", NOT_REF_EQ_HEADER, "ERR_ASSERTION");
+        code.else_();
+        code.localGet(brandsEqLocal);
+        this.openIf();
+        code.localGet(aLocal);
+        code.localGet(bLocal);
+        code.call(this.bytesB.equalsHelper());
+        this.openIf();
+        this.emitSetCellErrorLit("%Error", "AssertionError", SAME_STRUCTURE_HEADER, "ERR_ASSERTION");
+        code.else_();
+        this.emitSetCellErrorLit("%Error", "AssertionError", REF_EQ_HEADER, "ERR_ASSERTION");
+        this.close();
+        code.else_();
+        this.emitSetCellErrorLit("%Error", "AssertionError", REF_EQ_HEADER, "ERR_ASSERTION");
+        this.close();
+        this.close();
+        this.close();
+        this.emitUnwind();
+        this.close();
+        this.releaseScratch(bytesRefType, aLocal);
+        this.releaseScratch(bytesRefType, bLocal);
+        this.releaseScratch(I32, negatedLocal);
+        this.releaseScratch(I32, brandsEqLocal);
+        this.releaseScratch(this.strRef, msgLocal);
+        this.releaseScratch(I32, hasMsgLocal);
+        return true;
+      }
+      // (verdict, negated, msg, hasMsg) -> void. The generic pass/throw
+      // wrapper: verdict is EITHER assert.bytesDeepEq's own call (the
+      // bytes-deep path) or an ordinary `call` to a synthesized
+      // `%assert.deq.N` helper (the composite path: arrays/records/
+      // maps/sets/unions/unit types with byte-identical static types on
+      // both sides) — `walkExpr` handles both uniformly, this case
+      // never needs to know which. Same eager-evaluation discipline as
+      // refEqBytes above.
+      case "assert.deepResult": {
+        const verdictLocal = this.acquireScratch(I32);
+        const negatedLocal = this.acquireScratch(I32);
+        const msgLocal = this.acquireScratch(this.strRef);
+        const hasMsgLocal = this.acquireScratch(I32);
+        this.walkExpr(e.args[0]!);
+        code.localSet(verdictLocal);
+        this.walkExpr(e.args[1]!);
+        code.localSet(negatedLocal);
+        this.walkExpr(e.args[2]!);
+        code.localSet(msgLocal);
+        this.walkExpr(e.args[3]!);
+        code.localSet(hasMsgLocal);
+        code.localGet(verdictLocal);
+        code.localGet(negatedLocal);
+        code.i32Xor(); // holds
+        code.i32Eqz(); // !holds
+        // openIf()/close(), not raw ifVoid()/end() — see refEqBytes's own
+        // comment above (fn.depth must stay exact for emitUnwind's brTo).
+        this.openIf();
+        code.localGet(hasMsgLocal);
+        this.openIf();
+        this.emitSetCellError(this.fn.code, "%Error", "AssertionError", () => code.localGet(msgLocal), "ERR_ASSERTION");
+        code.else_();
+        code.localGet(negatedLocal);
+        this.openIf();
+        this.emitSetCellErrorLit("%Error", "AssertionError", NOT_DEEP_EQUAL_HEADER, "ERR_ASSERTION");
+        code.else_();
+        this.emitSetCellErrorLit("%Error", "AssertionError", DEEP_EQUAL_HEADER, "ERR_ASSERTION");
+        this.close();
+        this.close();
+        this.emitUnwind();
+        this.close();
+        this.releaseScratch(I32, verdictLocal);
+        this.releaseScratch(I32, negatedLocal);
+        this.releaseScratch(this.strRef, msgLocal);
+        this.releaseScratch(I32, hasMsgLocal);
+        return true;
+      }
+      // (a, b, negated, msg, hasMsg) -> void. Bare-function strictEqual/
+      // notStrictEqual (lower-assert.ts: `!deep && a.type.kind ===
+      // "func" && b.type.kind === "func"` — array-of-function DEEP
+      // comparisons route through the generic deepResult/deepEqHelper
+      // path above instead, already built for board #75's own needs).
+      // SIMPLER than refEqBytes: no "same structure" branch is possible
+      // — deep-equality over functions IS reference identity
+      // (deepEqHelper's own `case "func"`), so a strictEqual FAILURE
+      // (meaning not-reference-equal) can never ALSO be deep-equal.
+      // Measured directly (node v24.18.1, own probe, fresh — not
+      // inherited from this pass's earlier design-note prediction):
+      // strictEqual(f,g) failing -> 'Expected "actual" to be reference-
+      // equal to "expected":' always; notStrictEqual(f,alias) failing ->
+      // 'Expected "actual" not to be reference-equal to "expected":'
+      // always; both custom-message forms pass the message through
+      // verbatim, identical shape to refEqBytes. Unwraps BOTH operands
+      // through the universal unwrap (board #75) before comparing — the
+      // uniform-usage invariant applies here too, even though neither
+      // 1681 nor any other claim reaches a listener-snapshot value
+      // through this specific libCall today.
+      case "assert.refEqFn": {
+        if (this.mapType(e.args[0]!.type, e.loc) === null || this.mapType(e.args[1]!.type, e.loc) === null) {
+          code.unreachable();
+          return true;
+        }
+        const negatedLocal = this.acquireScratch(I32);
+        const msgLocal = this.acquireScratch(this.strRef);
+        const hasMsgLocal = this.acquireScratch(I32);
+        this.walkExpr(e.args[0]!);
+        code.call(this.universalUnwrapFn());
+        this.walkExpr(e.args[1]!);
+        code.call(this.universalUnwrapFn());
+        code.refEq(); // sameRef
+        this.walkExpr(e.args[2]!);
+        code.localTee(negatedLocal);
+        code.i32Xor(); // holds = sameRef XOR negated
+        this.walkExpr(e.args[3]!);
+        code.localSet(msgLocal);
+        this.walkExpr(e.args[4]!);
+        code.localSet(hasMsgLocal);
+        code.i32Eqz(); // !holds
+        this.openIf();
+        code.localGet(hasMsgLocal);
+        this.openIf();
+        this.emitSetCellError(this.fn.code, "%Error", "AssertionError", () => code.localGet(msgLocal), "ERR_ASSERTION");
+        code.else_();
+        code.localGet(negatedLocal);
+        this.openIf();
+        this.emitSetCellErrorLit("%Error", "AssertionError", NOT_REF_EQ_HEADER, "ERR_ASSERTION");
+        code.else_();
+        this.emitSetCellErrorLit("%Error", "AssertionError", REF_EQ_HEADER, "ERR_ASSERTION");
+        this.close();
+        this.close();
+        this.emitUnwind();
+        this.close();
+        this.releaseScratch(I32, negatedLocal);
+        this.releaseScratch(this.strRef, msgLocal);
+        this.releaseScratch(I32, hasMsgLocal);
+        return true;
+      }
+      default:
+        if (e.fn.startsWith("assert.")) {
           this.refuse(`libCall:${e.fn}`, e.loc);
           code.unreachable();
           return true;
