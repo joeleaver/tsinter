@@ -289,6 +289,11 @@ export interface DynDeps {
   /** %w.str.matchAt — (s, needle, i32 at) → i32. `lastIndexOf`'s backward
    * scan is a loop over it (the tier has no lastIndexOf of its own). */
   strMatchAt: () => number;
+  /** %w.json.quoteStr — (s) → str, `JSON.stringify(s)` for a plain
+   * string: json.ts's own escaper (`jbPutStr`), injected rather than
+   * reimplemented here. `specificType`'s embedded-quote string fallback
+   * (board #26) is the only caller. */
+  jsonQuoteStr: () => number;
   /** The tier's ONE bytes<u8> valtype (typedarrays.ts) — the SAME struct
    * every elem kind shares, needed here as the DK.BYTES payload's element
    * type. Non-u8 elems never reach this file (the emitter's dynFrom/
@@ -3585,6 +3590,184 @@ export class DynBuilder {
       // this tier.
       c.unreachable();
       this.mb.setBody(idx, [I32], c.bytes());
+    });
+  }
+
+  /** %w.dyn.specificType(d) → the ERR_INVALID_ARG_TYPE "Received ..."
+   * clause, `determineSpecificType` (internal/errors.js) ported verbatim
+   * — board #26, `error.argTypeThrow`'s renderer. A NULL box answers
+   * "undefined" (kindName's own missing-member convention); this
+   * function is never actually fed one — `got` is always an evaluated
+   * expression — but the guard costs nothing and matches the template.
+   *
+   * Two of Node's switch arms are UNREACHABLE through this representation
+   * and are not built: `bigint` and `symbol` have no DK kind at all (this
+   * tier boxes neither), so no dyn value can ever carry one in. A class
+   * instance never reaches here as an OBJ either — `emitDynFromBody`'s
+   * object case refuses BY NAME for any class not rooted in `%Error`,
+   * before `argTypeThrow`'s libCall node is even built — so OBJ here is
+   * always a plain record, which is always "an instance of Object".
+   *
+   * HANDLE and JSVAL fall to the trailing BARE `unreachable` — no name,
+   * code, or message, unlike `refuse`'s diagnosed refusals elsewhere in
+   * this file; there is nothing to grep. kindName() answers JSVAL "an
+   * island value" for ITS OWN consumer (checkFail's message, an already-
+   * approximate internal diagnostic with no Node scenario to match in the
+   * first place) — but THIS function feeds a message the corpus compares
+   * to live Node byte-for-byte, and neither kind has a Node-exact answer
+   * to target: no real TS source Node also compiles can hand either one
+   * to this libCall's `got`. No Node-exact render, no approximation — the
+   * trap is the loud answer, not a placeholder. */
+  specificType(): number {
+    return this.cached("specificType", [this.dynRef()], [this.deps.strRef()], (idx) => {
+      const dynT = this.dynT();
+      const c = new Code();
+      const K = 1;
+      const NUMV = 2;
+      const S = 3;
+      c.localGet(0);
+      c.refIsNull();
+      c.ifVoid();
+      this.deps.lit(c, "undefined");
+      c.return_();
+      c.end();
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.localSet(K);
+      this.arm(c, K, [DK.NULL], () => this.deps.lit(c, "null"));
+      this.arm(c, K, [DK.UNDEF], () => this.deps.lit(c, "undefined"));
+      this.arm(c, K, [DK.ARR], () => this.deps.lit(c, "an instance of Array"));
+      this.arm(c, K, [DK.OBJ], () => this.deps.lit(c, "an instance of Object"));
+      this.arm(c, K, [DK.PROMISE], () => this.deps.lit(c, "an instance of Promise"));
+      this.arm(c, K, [DK.BOOL], () => {
+        c.localGet(0);
+        c.structGet(dynT, DYN_NUM);
+        c.f64Const(0);
+        c.f64Ne();
+        c.ifResult(this.deps.strRef());
+        this.deps.lit(c, "type boolean (true)");
+        c.else_();
+        this.deps.lit(c, "type boolean (false)");
+        c.end();
+      });
+      this.arm(c, K, [DK.NUM], () => {
+        c.localGet(0);
+        c.structGet(dynT, DYN_NUM);
+        c.localSet(NUMV);
+        // `value === 0` catches BOTH zeros; `1 / value` sorts them the
+        // same way Node's own check does (`-0` divides to `-Infinity`).
+        c.localGet(NUMV);
+        c.f64Const(0);
+        c.f64Eq();
+        c.ifVoid();
+        c.f64Const(1);
+        c.localGet(NUMV);
+        c.f64Div();
+        c.f64Const(Number.NEGATIVE_INFINITY);
+        c.f64Eq();
+        c.ifResult(this.deps.strRef());
+        this.deps.lit(c, "type number (-0)");
+        c.else_();
+        this.deps.lit(c, "type number (0)");
+        c.end();
+        c.return_();
+        c.end();
+        // `value !== value` — NaN is the only f64 that fails self-equality.
+        c.localGet(NUMV);
+        c.localGet(NUMV);
+        c.f64Ne();
+        c.ifVoid();
+        this.deps.lit(c, "type number (NaN)");
+        c.return_();
+        c.end();
+        c.localGet(NUMV);
+        c.f64Const(Number.POSITIVE_INFINITY);
+        c.f64Eq();
+        c.ifVoid();
+        this.deps.lit(c, "type number (Infinity)");
+        c.return_();
+        c.end();
+        c.localGet(NUMV);
+        c.f64Const(Number.NEGATIVE_INFINITY);
+        c.f64Eq();
+        c.ifVoid();
+        this.deps.lit(c, "type number (-Infinity)");
+        c.return_();
+        c.end();
+        this.deps.lit(c, "type number (");
+        c.localGet(NUMV);
+        c.call(this.deps.f64ToStr());
+        c.call(this.deps.concat());
+        this.deps.lit(c, ")");
+        c.call(this.deps.concat());
+      });
+      this.arm(c, K, [DK.STR], () => {
+        c.localGet(0);
+        c.structGet(dynT, DYN_REF);
+        c.refCast(this.deps.strType());
+        c.localSet(S);
+        // `value.length > 28 && (value = value.slice(0, 25) + "...")` —
+        // the quote check below runs on this (possibly truncated) value,
+        // exactly Node's order, never the original.
+        c.localGet(S);
+        c.arrayLen();
+        c.i32Const(28);
+        c.i32GtU();
+        c.ifVoid();
+        c.localGet(S);
+        c.f64Const(0);
+        c.f64Const(25);
+        c.call(this.deps.strSlice());
+        this.deps.lit(c, "...");
+        c.call(this.deps.concat());
+        c.localSet(S);
+        c.end();
+        c.localGet(S);
+        this.deps.lit(c, "'");
+        c.f64Const(0);
+        c.call(this.deps.strIndexOf());
+        c.f64Const(-1);
+        c.f64Eq();
+        c.ifResult(this.deps.strRef());
+        this.deps.lit(c, "type string ('");
+        c.localGet(S);
+        c.call(this.deps.concat());
+        this.deps.lit(c, "')");
+        c.call(this.deps.concat());
+        c.else_();
+        this.deps.lit(c, "type string (");
+        c.localGet(S);
+        c.call(this.deps.jsonQuoteStr());
+        c.call(this.deps.concat());
+        this.deps.lit(c, ")");
+        c.call(this.deps.concat());
+        c.end();
+      });
+      this.arm(c, K, [DK.FUNC], () => {
+        this.deps.lit(c, "function ");
+        this.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(this.fnT(), FN_NAME);
+        c.localTee(S);
+        c.refIsNull();
+        c.ifResult(this.deps.strRef());
+        this.deps.lit(c, "");
+        c.else_();
+        c.localGet(S);
+        c.end();
+        c.call(this.deps.concat());
+      });
+      this.arm(c, K, [DK.BYTES], () => {
+        this.bytesPayload(c, (x) => x.localGet(0));
+        c.structGet(this.bytesPayloadT(), BYTES_PAYLOAD_IS_BUFFER);
+        c.ifResult(this.deps.strRef());
+        this.deps.lit(c, "an instance of Buffer");
+        c.else_();
+        this.deps.lit(c, "an instance of Uint8Array");
+        c.end();
+      });
+      // HANDLE and JSVAL are what's left — see the header note.
+      c.unreachable();
+      this.mb.setBody(idx, [I32, F64, this.deps.strRef()], c.bytes());
     });
   }
 

@@ -419,6 +419,10 @@ test("dyn.ts/json.ts/inspect.ts: every function with a BYTES arm emits a VALID m
   });
 
   let dyn!: DynBuilder;
+  // Self-referencing closure (this file's own established pattern, see
+  // bytesVec above): json is only ever CALLED later, never during dyn's
+  // own construction, so capturing it here — before it exists — is safe.
+  let json!: JsonBuilder;
   const dynVecInfo = () => vecs.info("dyn", dyn.dynRef(), dyn.dynRef(), "ref");
   // Trivial structural stub (review round 1's DynDeps.jsToNumber
   // addition) — right type, wrong (irrelevant) behavior, matching every
@@ -470,9 +474,10 @@ test("dyn.ts/json.ts/inspect.ts: every function with a BYTES arm emits a VALID m
     bytesSet: () => bytesB.setElem("u8"),
     bytesToStrUtf8: () => bytesB.toStrHelper("utf8"),
     jsToNumber,
+    jsonQuoteStr: () => json.quoteStr(),
   });
 
-  const json = new JsonBuilder(mb, {
+  json = new JsonBuilder(mb, {
     strRef: () => strRef,
     strType: () => strType,
     concat: () => concatFn,
@@ -527,6 +532,7 @@ test("dyn.ts/json.ts/inspect.ts: every function with a BYTES arm emits a VALID m
   dyn.keySet();
   dyn.toStr();
   dyn.kindName();
+  dyn.specificType();
   json.stringifyDyn();
   insp.dyn();
 

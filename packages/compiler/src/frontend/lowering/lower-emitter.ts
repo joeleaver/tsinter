@@ -38,7 +38,7 @@
  * super.emit as the prototype chain). */
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
-import { dynFallbackType, newFnCtx } from "./lowerer.js";
+import { dynFallbackType, jsFuncNameOf, newFnCtx } from "./lowerer.js";
 import type { ClassInfo } from "./lower-classes.js";
 import { isJsSourceFile, locOf } from "../program.js";
 import { arrayOf, BOOL, canBoxFuncIntoDyn, canConvertToDyn, DYN, F64, IrExpr, IrFunction, IrLocal, IrParam, IrStmt, IrType, isUnitType, STRING, SrcLoc, typeEquals, typeKey, VOID } from "../../ir/nodes.js";
@@ -560,8 +560,25 @@ export function lowerEmitterMethodCall(L: Lowerer, call: ts.CallExpression,
           !(tT.kind === "object");
         if (nT?.kind === "f64" && nPure && targetNotEmitter) {
           const raw = L.lowerExpr(args[1]!);
-          if (raw.type.kind === "dyn" || raw.kind === "unitLit" || L.dynConvertible(raw.type)) {
-            const got: IrExpr = raw.type.kind === "dyn" ? raw : { kind: "dynFrom", value: raw, type: DYN, loc };
+          // A null/undefined LITERAL target (raw.kind === "unitLit") is
+          // deliberately EXCLUDED here, not merely unadmitted by
+          // dynConvertible: Node's real per-target loop null-derefs
+          // ("Cannot read properties of null/undefined (reading
+          // 'setMaxListeners')") before ERR_INVALID_ARG_TYPE ever applies
+          // to a nullish entry — live-measured, board #83 — so routing it
+          // through argTypeThrow would render a WRONG error rather than
+          // Node's real one. Falling through to noLowering below is the
+          // safe, loud, pre-board-#26 behavior this ONE shape keeps; every
+          // other admitted type (number/string/boolean/array/object/bytes/
+          // function) is unaffected — none of those was ever a unitLit.
+          if (raw.type.kind === "dyn" || (raw.kind !== "unitLit" && L.dynConvertible(raw.type))) {
+            // A boxed closure takes its best-effort JS name from the source
+            // node (lower-assert.ts's coerceInto convention, S020) — without
+            // this, specificType()'s FUNC arm would report every target
+            // anonymously regardless of how the caller named it.
+            const fnName = raw.type.kind === "func" ? jsFuncNameOf(args[1]!) : null;
+            const got: IrExpr =
+              raw.type.kind === "dyn" ? raw : { kind: "dynFrom", value: raw, ...(fnName !== null ? { fnName } : {}), type: DYN, loc };
             return {
               kind: "libCall",
               fn: "error.argTypeThrow",

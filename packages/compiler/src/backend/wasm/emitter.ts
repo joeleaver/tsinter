@@ -4603,6 +4603,7 @@ class Assembler {
       strSlice: () => this.strs.slice(),
       strIndexOf: () => this.strs.indexOf(),
       strMatchAt: () => this.strs.matchAt(),
+      jsonQuoteStr: () => this.json.quoteStr(),
       bytesRefU8: () => this.bytesB.bytesRef(),
       bytesTypeU8: () => this.bytesB.bytesType(),
       bytesLen: () => this.bytesB.length(),
@@ -10402,6 +10403,55 @@ class Assembler {
           const codeLit = codeArg.value === "" ? null : codeArg.value;
           this.emitSetCellErrorLit(className, name, msgArg.value, codeLit);
           this.emitUnwind();
+          return;
+        }
+        if (e.fn === "error.argTypeThrow") {
+          // PASS 2b (stream increment 22, board #26): the compiler-
+          // resolved ERR_INVALID_ARG_TYPE throw with a RUNTIME-rendered
+          // "Received" tail — lowerStreamArg's argTypeThrow closure
+          // (lower-stream.ts, pipeline/finished's stage-arg ladders) and
+          // lower-emitter.ts's EventEmitter target-type check are both
+          // reachable here; lower-server.ts's two call sites sit behind
+          // Joe's standing net.* deferral and have never reached this
+          // arm in practice. Same mechanics as error.nodeThrow just
+          // above: the branch/return makes whatever follows unreachable
+          // code, which wasm's validator accepts regardless of type.
+          // name/expected are compile-time literals (lowerStreamArg's own
+          // construction — PIPELINE_STAGE_EXPECTED etc. are fixed per
+          // call site); `got` is the one runtime piece, rendered by
+          // dyn.ts's specificType(). The C lane's scr_throw_arg_type is
+          // the byte-for-byte template this ports: `The "%s" argument
+          // must be %s. Received %s` (scr_json.c).
+          const nameArg = e.args[0]!;
+          const expectedArg = e.args[1]!;
+          const gotArg = e.args[2]!;
+          if (nameArg.kind !== "strLit" || expectedArg.kind !== "strLit") {
+            throw new Error("wasm emitter bug: error.argTypeThrow's name/expected args must be compile-time literals (lowerStreamArg's own construction)");
+          }
+          this.emitSetCellError(
+            code,
+            "%TypeError",
+            "TypeError",
+            (c) => {
+              this.pushStrLitInto(c, `The "${nameArg.value}" argument must be ${expectedArg.value}. Received `);
+              this.walkExpr(gotArg);
+              c.call(this.dyn.specificType());
+              c.call(this.concatHelper());
+            },
+            "ERR_INVALID_ARG_TYPE",
+          );
+          this.emitUnwind();
+          return;
+        }
+        if (e.fn === "error.propTypeThrow") {
+          // net.createServer's option-bag validation (lower-server.ts)
+          // ONLY — both call sites sit behind Joe's standing net.*
+          // deferral, so this arm has no in-tier execution path today.
+          // Condition 3's ruling: defer rather than build without real
+          // coverage. Refuses BY NAME rather than silently falling
+          // through to argTypeThrow's shape or miscompiling.
+          this.refuse(`libCall:${e.fn}`, e.loc);
+          code.unreachable();
           return;
         }
         if (this.emitBufferLibCall(e)) return;

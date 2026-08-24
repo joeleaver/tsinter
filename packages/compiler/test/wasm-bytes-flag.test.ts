@@ -182,6 +182,8 @@ async function buildHarness(
   // CALLED once dyn's own ARR-adjacent arms build, by which time `dyn` is
   // assigned below.
   let dyn!: DynBuilder;
+  // Forward-referenced the same way — json is only ever CALLED later.
+  let json!: JsonBuilder;
   const dynVecInfo = () => vecs.info("dyn", dyn.dynRef(), dyn.dynRef(), "ref");
   dyn = new DynBuilder(mb, {
     strRef: () => strRef,
@@ -218,9 +220,10 @@ async function buildHarness(
     bytesSet: () => bytesB.setElem("u8"),
     bytesToStrUtf8: () => bytesB.toStrHelper("utf8"),
     jsToNumber: jsToNumberFn,
+    jsonQuoteStr: () => json.quoteStr(),
   });
 
-  const json = new JsonBuilder(mb, {
+  json = new JsonBuilder(mb, {
     strRef: () => strRef,
     strType: () => strType,
     concat: () => concatFn,

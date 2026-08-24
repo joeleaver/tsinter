@@ -2662,6 +2662,51 @@ const TIER_FLOOR: string[] = [
   "1814-stream-pipeline.cjs",
   "2563-stream-promises-pipeline.ts",
   "2565-stream-promises-js.cjs",
+  //
+  // STAGE D P2b (increment 22, board #26): error.argTypeThrow's
+  // "Received ..." tail — dyn.ts's specificType(), determineSpecificType
+  // (internal/errors.js) ported verbatim. NULL/UNDEF/ARR/OBJ/PROMISE
+  // hardcoded literals, NUM (general plus the four -0/NaN/±Infinity
+  // specials, `1 / value === -Infinity` sorting the zeros exactly like
+  // Node's own check), BOOL, STR (>28-char truncation THEN the quote
+  // check on the possibly-truncated value, embedded-single-quote falling
+  // to json.ts's own quoteStr() — a thin jbBegin/jbPutStr/jbFinish
+  // wrapper reusing the ALREADY-correct escaper rather than porting the
+  // C lane's #82 quote bug), FUNC (fnT's FN_NAME field, null-safe, S020's
+  // approximations inherited as-is), BYTES (kindName's own proven
+  // Buffer/Uint8Array flag branch, inheriting S014/S037's pre-existing
+  // no-surviving-marker gap rather than introducing a new one). HANDLE
+  // and JSVAL hit a BARE `unreachable` trap (no name, code, or message —
+  // there is nothing to grep; unconstructible on this tier, no Node-exact
+  // answer exists to approximate) — wasm-dyn-specifictype.test.ts force-
+  // emits both directly, since no real source can reach them, and cause-
+  // pins each with a sentinel global written immediately before the
+  // specificType() call so the trap is tied to THAT call rather than
+  // merely "the run threw something". Same-session frontend fix
+  // alongside the renderer: lower-emitter.ts's EventEmitter.
+  // setMaxListeners per-target argTypeThrow construction was dropping
+  // every FUNC target's name (a bare dynFrom node with no fnName field);
+  // threaded jsFuncNameOf through it, mirroring lower-assert.ts's own
+  // established pattern — verified against a fresh Node oracle across
+  // four function shapes. Board #83 (a nullish null/undefined target at
+  // that same call site diverging from Node's real property-read crash,
+  // confirmed live on the already-shipping LLVM lane too before this
+  // session touched anything — pre-existing, not introduced by board
+  // #26) is RESOLVED for THIS lane: lower-emitter.ts now excludes a
+  // unitLit target from the argTypeThrow-admitting condition, falling
+  // through to the SAME generic noLowering("EventEmitter.setMaxListeners
+  // with N arguments", ...) every other unhandled setMaxListeners shape
+  // already uses — a RUNTIME exception (SC2020, arity-worded message,
+  // catchable) fired when the expression is REACHED, not a compile-time
+  // build failure. LLVM/C are UNTOUCHED and still render the wrong
+  // ERR_INVALID_ARG_TYPE for this one shape — #83 stays open for the
+  // native lanes. 2570 (Buffer.compare's *Chk family) is NOT unblocked by
+  // this renderer alone — it refuses at the separate, still-unbuilt
+  // `buffer.compareChk` compound libCall. Full 1069-program run, both
+  // instruments: TIER_FLOOR set-equality (this addition) and the full
+  // non-claimed bucket diff (zero net-new refusals elsewhere) both
+  // close — 725 → 726.
+  "2634-stream-pipeline-arg-ladders.cjs",
 ];
 
 interface RunResult {

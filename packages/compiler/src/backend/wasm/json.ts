@@ -3076,6 +3076,28 @@ export class JsonBuilder {
     });
   }
 
+  /** `%w.json.quoteStr(s)` → `s` rendered as a JSON string LITERAL —
+   * `JSON.stringify(s)` for a value ALREADY a plain string, which is
+   * exactly `jbPutStr`'s own escaping bracketed by a throwaway buffer
+   * session rather than a second escaper. `determineSpecificType`'s
+   * truncated-string fallback (board #26) is the only caller: none of
+   * `error.argTypeThrow`'s three call sites (stream-arg validation,
+   * EventEmitter target validation, net.createServer's option bag) runs
+   * from inside an in-progress `JSON.stringify` walk, so this throwaway
+   * session never collides with `stringifyDyn`'s own use of the SAME
+   * globals — but it is NOT reentrant, and a future caller reached from
+   * mid-walk would need its own buffer rather than this one. */
+  quoteStr(): number {
+    return this.cached("quoteStr", [this.deps.strRef()], [this.deps.strRef()], (idx) => {
+      const c = new Code();
+      c.call(this.jbBegin());
+      c.localGet(0);
+      c.call(this.jbPutStr());
+      c.call(this.jbFinish());
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
   /* ── JSON.stringify: the pretty-print re-indenter ───────────────────────
    * `JSON.stringify(v, null, space)` as a REWRITE of the compact text —
    * C's sc_ji (emit-walkers.ts jsonIndentHelper) ported unit for unit,
