@@ -5690,6 +5690,11 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
             E.usesTimers = true;
             return finish(`scr_stream_uncork((ScrStream *)${arg(0)})`);
           case "stream.destroy":
+          // STAGE D P4: stream.destroyAborted is the wasm-only rider
+          // #72 sibling (a synthesized AbortError, opError's unhandled-
+          // crash suppression) — out of scope on this lane, aliased to
+          // plain stream.destroy (SEMANTICS.md S048's amendment).
+          case "stream.destroyAborted":
             E.usesTimers = true;
             return finish(`(${cType(e.type).trim()})scr_stream_destroy((ScrStream *)${arg(0)}, NULL)`);
           case "stream.destroyErr":

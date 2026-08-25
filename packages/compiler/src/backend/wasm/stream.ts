@@ -557,7 +557,30 @@ export const FIN_HEAD = 59; // ref $w.rs.finEntry, nullable
  * synchronous error always routes to `destroyErrCore` on the SAME
  * stream), so this pass does not pin that combination separately. */
 export const WS_SYNC_ERRORED = 60; // i32 bool, transient
-export const WS_FIELD_COUNT = 61;
+/** STAGE D P4 (rider #72): set by `destroyAbortedCore` right before the
+ * synthesized AbortError it builds reaches `opError` — Node's real
+ * async-iterator break-destroy stores that AbortError as the stream's
+ * OWN error (measured: `stream.errored` reads it immediately, and an
+ * attached 'error' listener DOES fire) but NEVER crashes the process
+ * merely because nothing was watching at that instant (measured: a bare
+ * `break` with no listener/consumer/waiter attached completes silently
+ * — no uncaught-error crash at any point until something LATER actually
+ * observes the error). Node's own mechanism is an internal `eos()`
+ * listener the async generator registers as a side effect of its own
+ * setup, permanently counting as "handled" — this tier does not model
+ * that listener, so this flag reproduces its ONE externally-observable
+ * consequence (opError's unhandled-crash fallback never fires for THIS
+ * error) directly. RESET DISCIPLINE: single-use, exactly like
+ * RS_CHECKING_WAITER's reentrancy guard — `opError` reads it into a
+ * local and clears it to false in the SAME pass, before making its
+ * handled/unhandled decision, so a stream destroyed a SECOND time (via
+ * this same path or a plain error) never accidentally inherits a stale
+ * suppression (destroy is idempotent past the first call regardless,
+ * per destroyErrCore's own RS_DESTROYED gate, so in practice this only
+ * ever fires once per stream — the explicit clear is defensive, not
+ * load-bearing, and documented as such). */
+export const RS_ERROR_ABORT_SILENT = 61; // i32 bool, transient
+export const WS_FIELD_COUNT = 62;
 
 /** RS_SIDES's own values — a bare Readable's finished() watches ONLY the
  * readable side (a pure Writable never reaches RS_END_EMITTED, so
@@ -1305,6 +1328,7 @@ export class StreamBuilder {
       { storage: I32, mutable: true }, // RS_SIDES
       { storage: this.finEntryRef(), mutable: true }, // FIN_HEAD
       { storage: I32, mutable: true }, // WS_SYNC_ERRORED
+      { storage: I32, mutable: true }, // RS_ERROR_ABORT_SILENT
     ]);
     return this.stateTField;
   }
@@ -1595,6 +1619,7 @@ export class StreamBuilder {
       c.i32Const(FIN_SIDE_UNSET); // rs_sides — the sentinel (FIN_SIDE_UNSET's own header): every real construction path MUST overwrite this explicitly; finComputeErr refuses by name if it ever observes UNSET
       c.refNull(this.finEntryT()); // fin_head — the finished()/eos() watcher list, empty at construction
       c.i32Const(0); // ws_sync_errored — FIX ROUND (P2-1): reset false at construction; write()'s own entry resets it again per-call (its own header)
+      c.i32Const(0); // rs_error_abort_silent — STAGE D P4: reset false at construction; destroyAbortedCore sets it, opError clears it (RS_ERROR_ABORT_SILENT's own header)
       c.structNew(this.stateT());
       c.localSet(N);
       c.localGet(R);
@@ -3715,11 +3740,16 @@ export class StreamBuilder {
    * path a bare `for await` in Node itself takes) settles fulfilled with
    * the boxed chunk; an observed RS_ERROR settles rejected with it
    * (`errPreOf` restores the dynamic class a `catch (e) { e instanceof
-   * Error }` needs); a stream that has nothing left to give — cleanly
-   * ended-and-drained, OR destroyed without an error (the hang-avoidance
-   * fallback RS_WAITER's own header names) — settles fulfilled with the
-   * dyn `undefined` EOF sentinel. Otherwise leaves it parked; a no-op
-   * when nothing is parked at all. */
+   * Error }` needs). "Nothing left to give" SPLITS in two (STAGE D P4,
+   * rider #72's mechanism 2): cleanly ended-and-drained settles fulfilled
+   * with the dyn `undefined` EOF sentinel (Node-exact, unchanged); a
+   * no-error destroy that did NOT reach that clean end — the
+   * hang-avoidance fallback RS_WAITER's own header names, now including
+   * rider #72's own destroy-on-early-exit path — instead settles
+   * REJECTED with an AbortError (name/code/message measured directly
+   * against Node, buildCheckWaiterCore's own comment has the full
+   * matrix). Otherwise leaves it parked; a no-op when nothing is parked
+   * at all. */
   private checkWaiterCore(): number {
     // cachedRecursive, NOT plain cached: checkWaiterCore -> readCore ->
     // callRead -> destroyErrCore -> checkWaiterCore is a genuine cycle
@@ -3737,7 +3767,7 @@ export class StreamBuilder {
 
   private buildCheckWaiterCore(idx: number): void {
     const c = new Code();
-    const ROOT = 0, ST = 1, W = 2, CHUNK = 3;
+    const ROOT = 0, ST = 1, W = 2, CHUNK = 3, ERR = 4;
     const clearAndReturn = (): void => {
       c.localGet(ST);
       c.i32Const(0);
@@ -3817,9 +3847,39 @@ export class StreamBuilder {
     c.call(this.deps.promSettle());
     clearAndReturn();
     c.end();
-    // "nothing left to give": cleanly ended-and-drained, or destroyed
-    // with no error (the hang-avoidance fallback — RS_WAITER's own
-    // header names this a named gap, not a Node-measured shape).
+    // Two DIFFERENT "nothing left to give" shapes, SPLIT (STAGE D P4,
+    // rider #72's mechanism 2 — CORRECTED design, after a lead-caught
+    // STOP-class review round: the first draft rejected EVERY destroyed-
+    // no-error stream with an AbortError uniformly, which is wrong for
+    // this branch specifically — measured directly against Node, an
+    // EXTERNALLY destroyed stream (no for-await abort involved at all —
+    // a plain `.destroy()` call, checked both while a loop is parked
+    // AND before any loop starts) throws ERR_STREAM_PREMATURE_CLOSE, not
+    // AbortError; only re-iterating a stream a PRIOR for-await loop's own
+    // break destroyed throws AbortError. That AbortError shape does NOT
+    // reach this branch at all any more: destroyAbortedCore (the
+    // synthetic finally's own libCall, stream.destroyAborted) stores the
+    // AbortError directly into RS_ERROR before ever parking a NEW waiter,
+    // so a fresh for-await's own nextChunkDynCore->checkWaiterCore call
+    // hits the EXISTING RS_ERROR-is-set branch above unchanged — no
+    // provenance tracking needed for that half after all, exactly as
+    // hypothesized and then confirmed: Node's real async-iterator break-
+    // destroy substitutes a synthesized AbortError as the stream's OWN
+    // error (measured: `stream.errored` reads it immediately after
+    // break, and a real attached 'error' listener fires with it).
+    // Cleanly ended-and-drained still settles FULFILLED with the EOF
+    // sentinel (Node really does complete silently there, unchanged).
+    // Destroyed with NO error and WITHOUT having reached that clean end
+    // — an external `.destroy()` with nothing else watching, parked or
+    // not — now REJECTS with Node's own ERR_STREAM_PREMATURE_CLOSE
+    // shape (name "Error", code "ERR_STREAM_PREMATURE_CLOSE", message
+    // "Premature close" — settleConsumerCore's own literal, reused
+    // verbatim: the stream/consumers path already builds this exact
+    // shape for the identical stream state, confirmed by reading the
+    // source, not assumed). destroy(err) is untouched by this split —
+    // that's the RS_ERROR-is-set branch above, already correct (Node
+    // just rethrows the given error verbatim; 1746's own "mid-iter" pin
+    // already covers it).
     //
     // RS_END_EMITTED, NOT RS_ENDED (found via execution — a real
     // ordering bug, not a review catch): RS_ENDED flips synchronously
@@ -3844,13 +3904,6 @@ export class StreamBuilder {
     c.f64Const(0);
     c.f64Eq();
     c.i32And();
-    c.localGet(ST);
-    c.structGet(this.stateT(), RS_DESTROYED);
-    c.localGet(ST);
-    c.structGet(this.stateT(), RS_ERROR);
-    c.refIsNull();
-    c.i32And();
-    c.i32Or();
     c.ifVoid();
     c.localGet(ST);
     c.structGet(this.stateT(), RS_WAITER);
@@ -3866,9 +3919,44 @@ export class StreamBuilder {
     c.i32Const(-1);
     c.i32Const(1);
     c.call(this.deps.promSettle());
+    c.else_();
+    c.localGet(ST);
+    c.structGet(this.stateT(), RS_DESTROYED);
+    c.localGet(ST);
+    c.structGet(this.stateT(), RS_ERROR);
+    c.refIsNull();
+    c.i32And();
+    c.ifVoid();
+    c.localGet(ST);
+    c.structGet(this.stateT(), RS_WAITER);
+    c.refAsNonNull();
+    c.localSet(W);
+    c.localGet(ST);
+    c.refNull(this.promType());
+    c.structSet(this.stateT(), RS_WAITER);
+    this.deps.buildErrorLit(
+      c,
+      "%Error",
+      "Error",
+      (cc) => this.deps.lit(cc, "Premature close"),
+      "ERR_STREAM_PREMATURE_CLOSE",
+    );
+    c.localSet(ERR);
+    c.localGet(W);
+    c.i32Const(this.deps.excTag.obj);
+    c.f64Const(0);
+    c.localGet(ERR);
+    this.deps.errPreOf(c, (cc) => cc.localGet(ERR));
+    c.i32Const(2);
+    c.call(this.deps.promSettle());
+    c.end();
     c.end();
     clearAndReturn();
-    this.mb.setBody(idx, [this.stateRef(), this.deps.promRef(), this.deps.bytesRef()], c.bytes());
+    this.mb.setBody(
+      idx,
+      [this.stateRef(), this.deps.promRef(), this.deps.bytesRef(), this.deps.errRef()],
+      c.bytes(),
+    );
   }
 
   /** `(root) -> promise<dyn>` — `readable.nextChunkDyn`, the for-await
@@ -4786,6 +4874,51 @@ export class StreamBuilder {
     });
   }
 
+  /** `(root) -> void` — the synthetic for-await-abort destroy
+   * (lowerForAwaitReadable's own finally block, libCall
+   * stream.destroyAborted): mirrors Node's real async-iterator break-
+   * destroy, which stores a SYNTHESIZED AbortError as the stream's OWN
+   * error (measured directly — RS_ERROR_ABORT_SILENT's own header has
+   * the full matrix: `stream.errored` reads the AbortError immediately
+   * after break, and an attached 'error' listener fires with it, but
+   * nothing crashes the process when NOTHING is watching). Builds that
+   * AbortError, arms RS_ERROR_ABORT_SILENT so opError's own unhandled-
+   * crash fallback stays silent for THIS specific error, then reuses
+   * destroyErrCore ENTIRELY — its own RS_DESTROYED idempotent gate, its
+   * `_destroy` override dispatch, its OP_CLOSE scheduling, and its
+   * OP_ERROR scheduling (which now, thanks to the flag, settles quietly
+   * instead of crashing when unhandled) all apply exactly as they do
+   * for a user's own destroy(err) call — this function's ENTIRE
+   * contribution is "which error, and arm the one flag opError needs
+   * to treat it as pre-handled". */
+  destroyAbortedCore(): number {
+    return this.cached("destroyAbortedCore", () => {
+      const root = this.deps.rootRef();
+      const idx = this.mb.declareFunc(this.mb.funcType([root], []), "%w.rs.destroyAborted");
+      const c = new Code();
+      const ROOT = 0, ST = 1, ERR = 2;
+      c.localGet(ROOT);
+      c.call(this.stateEnsure());
+      c.localSet(ST);
+      c.localGet(ST);
+      c.i32Const(1);
+      c.structSet(this.stateT(), RS_ERROR_ABORT_SILENT);
+      this.deps.buildErrorLit(
+        c,
+        "%Error",
+        "AbortError",
+        (cc) => this.deps.lit(cc, "The operation was aborted"),
+        "ABORT_ERR",
+      );
+      c.localSet(ERR);
+      c.localGet(ROOT);
+      c.localGet(ERR);
+      c.call(this.destroyErrCore());
+      this.mb.setBody(idx, [this.stateRef(), this.deps.errRef()], c.bytes());
+      return idx;
+    });
+  }
+
   /* ── the tick op handlers ─────────────────────────────────────────── */
 
   /** Emits a NO-ARGUMENT event ('pause'/'resume'/'end'/'close') through
@@ -5045,7 +5178,7 @@ export class StreamBuilder {
 
   private buildOpError(idx: number): void {
       const c = new Code();
-      const ROOT = 0, ST = 1;
+      const ROOT = 0, ST = 1, SILENT = 2;
       c.localGet(ROOT);
       c.call(this.stateEnsure());
       c.localSet(ST);
@@ -5053,6 +5186,20 @@ export class StreamBuilder {
       // — nothing in this file's own scope reads it back; Node's real
       // `errorEmitted` only gates the far-side 'data'/'error' re-entrancy
       // checks this file doesn't model, per readCore's own header note).
+      //
+      // STAGE D P4: read+clear RS_ERROR_ABORT_SILENT FIRST (single-use,
+      // RS_CHECKING_WAITER's own reentrancy-guard idiom — claimed before
+      // anything below can observe it) — destroyAbortedCore's own marker
+      // that THIS error is the synthesized for-await-abort AbortError,
+      // which must join the "handled" set below (RS_ERROR_ABORT_SILENT's
+      // own header has the full measured story: Node's real break-
+      // destroy never crashes the process from lack of listeners).
+      c.localGet(ST);
+      c.structGet(this.stateT(), RS_ERROR_ABORT_SILENT);
+      c.localSet(SILENT);
+      c.localGet(ST);
+      c.i32Const(0);
+      c.structSet(this.stateT(), RS_ERROR_ABORT_SILENT);
       c.localGet(ROOT);
       c.call(this.deps.hasErrorListeners());
       c.ifVoid();
@@ -5080,6 +5227,9 @@ export class StreamBuilder {
       // RS_CONSUMER_KIND above — measured necessary directly (2564's r2:
       // destroy(new Error) with only a pending sp.finished promise, no
       // user 'error' listener, must reject the promise, not crash).
+      // STAGE D P4: SILENT joins the SAME "handled" set — the for-await
+      // abort's own synthesized error, treated as always-handled exactly
+      // like Node's internal (unmodeled) eos() listener always is.
       c.localGet(ST);
       c.structGet(this.stateT(), RS_WAITER);
       c.refIsNull();
@@ -5091,6 +5241,8 @@ export class StreamBuilder {
       c.structGet(this.stateT(), FIN_HEAD);
       c.refIsNull();
       c.i32Eqz();
+      c.i32Or();
+      c.localGet(SILENT);
       c.i32Or();
       c.ifVoid();
       c.else_();
@@ -5107,7 +5259,7 @@ export class StreamBuilder {
       // decision.
       c.localGet(ROOT);
       c.call(this.checkWaiterCore());
-      this.mb.setBody(idx, [this.stateRef()], c.bytes());
+      this.mb.setBody(idx, [this.stateRef(), I32], c.bytes());
   }
 
   /** `(root, kind: i32) -> promise` — `sc.text`/`sc.buffer`/`sc.json`'s

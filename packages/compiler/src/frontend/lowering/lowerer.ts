@@ -6306,6 +6306,22 @@ export class Lowerer {
     return local;
   }
 
+  /** `declareHiddenLocal`'s mutable twin — a hidden ABI-only slot no
+   * source symbol names, but one the lowering itself needs to REASSIGN
+   * (e.g. lowerForAwaitReadable's own `%faNormal` completion flag, STAGE
+   * D P4). `declareHiddenLocal` hardcodes `mutable: false` because every
+   * prior hidden slot is write-once (a `varDecl` init, never an `assign`
+   * after); this twin exists rather than widening that one so every
+   * OTHER hidden-slot call site keeps its immutability guarantee. */
+  declareHiddenMutableLocal(name: string, type: IrType): IrLocal {
+    const ctx = this.ctx;
+    const count = ctx.localCounters.get(name) ?? 0;
+    ctx.localCounters.set(name, count + 1);
+    const local: IrLocal = { id: `${name}.${count}`, name, type, mutable: true };
+    ctx.locals.push(local);
+    return local;
+  }
+
   /** Declares a callee's parameter locals from its ParamShapes and builds
    * the DEFAULT-PARAM PROLOGUE. Required/optional/rest params bind their
    * symbol directly (one local of the ABI type). A defaulted param `x: T = e`

@@ -3431,6 +3431,7 @@ export type IrLibFn =
   | "writable.cork"
   | "writable.uncork"
   | "stream.destroy"
+  | "stream.destroyAborted"
   | "stream.destroyErr"
   | "stream.prop"
   | "stream.errored"
@@ -5770,7 +5771,8 @@ export function moduleUsesStream(mod: IrModule): boolean {
       (node.fn.startsWith("readable.") || node.fn.startsWith("writable.") ||
         node.fn.startsWith("duplex.") || node.fn.startsWith("transform.") ||
         node.fn.startsWith("passthrough.") ||
-        node.fn === "stream.destroy" || node.fn === "stream.destroyErr" ||
+        node.fn === "stream.destroy" || node.fn === "stream.destroyAborted" ||
+        node.fn === "stream.destroyErr" ||
         node.fn === "stream.prop" || node.fn === "stream.errored" ||
         node.fn === "sp.finished" || node.fn === "sp.pipeline" ||
         node.fn.startsWith("sc.") ||
@@ -6700,6 +6702,7 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "writable.end",
   "writable.uncork",
   "stream.destroy",
+  "stream.destroyAborted",
   "stream.destroyErr",
   // setMaxListeners(n) throws Node's ERR_OUT_OF_RANGE RangeError for
   // negative/NaN arguments; the static form's default-max write validates

@@ -2884,6 +2884,189 @@ the increment-22 stage-B gate's g-break probe and the mini-gate's
 shape decomposition (mg-break-alive, mg-break-observables,
 mg-break-then-iterate), restated in full above.
 
+**STAGE D P4 AMENDMENT (rider #72 BUILT — this entry's own deferred
+build landed):** the wasm-tier divergence above is RESOLVED. The
+lowering (`lowerForAwaitReadable`, frontend territory as this entry's
+own Rationale anticipated) now wraps the compiled loop in a
+try/finally keyed off a `normalCompletion` flag — the standard for-of/
+for-await IteratorClose desugar, using the IR `"for"` node (not
+`"while"`) specifically because its continue-runs-update-first
+semantics is what keeps a user `continue` from tripping the destroy
+(measured directly against Node: it never does). Every abrupt exit of
+the loop BODY — `break`, a cross-function `return`, and an uncaught
+`throw` — now destroys the stream, and does so SYNCHRONOUSLY (zero
+turns elapsed), matching Node exactly. Re-measuring the shape
+decomposition above against current Node (v24.18.1) directly, before
+building, found it needed two corrections, both stated plainly here
+per the register's own discipline (the original text was wrong, not
+merely superseded):
+
+1. **Shape A and shape B no longer diverge in kind.** The original
+   split described two DIFFERENT convergence timings for `destroyed`/
+   `close` (shape A: never converges pre-fix; shape B: converges "one
+   turn later" via the stream's own natural-end machinery). Fresh
+   measurement found this description was itself incomplete even for
+   the PRE-fix tier: shape B's "converges one turn later" claim held
+   only for the fully-synchronous-merge sub-shape (every `push()` call,
+   including the trailing `push(null)`, landing before the for-await
+   loop's first read) — an async-delivered variant of shape B (the
+   final real chunk and `push(null)` arriving together, but on a LATER
+   turn than the loop's first read) stayed alive forever pre-fix,
+   never converging at all. Moot now regardless: post-fix, both shapes
+   destroy identically and synchronously, matching Node's own uniform
+   synchronous-destroy behavior in every variant measured (one push,
+   two pushes, `Readable.from`, with/without an intervening delay,
+   already-ended-before-break) — the shape split itself no longer has
+   observable consequence on the DESTROY timing (it still matters for
+   whether more real data existed, which is not itself divergent).
+2. **The re-iteration crash's identity was mis-registered.** The
+   original text cited Node's crash as `ERR_STREAM_PREMATURE_CLOSE`.
+   Fresh, repeated measurement (six independent shape variants, all
+   unanimous) found this WRONG for the observable this entry actually
+   describes: re-iterating a stream a PRIOR loop's own `break` already
+   destroyed throws `AbortError` (`.name`), code `ABORT_ERR` (`.code`),
+   message "The operation was aborted". `ERR_STREAM_PREMATURE_CLOSE` is
+   real Node behavior too, just for a DIFFERENT, adjacent trigger this
+   entry does not describe: an EXTERNAL `destroy()` (no error) while a
+   for-await loop is actively parked awaiting a chunk, or before any
+   loop has started consuming at all — Node's `eos` utility synthesizing
+   its own premature-close error for whichever loop is watching at that
+   moment. Measured directly (`stream.errored`, and whether an attached
+   'error' listener fires): Node's real async-iterator break-destroy
+   SUBSTITUTES a synthesized AbortError as the stream's OWN error
+   (`stream.errored` reads it immediately after break; an attached
+   'error' listener fires with it; but nothing crashes the process when
+   NOTHING is watching, unlike an ordinary `destroy(err)` with no
+   listener, which DOES crash on the next tick — Node's own async
+   generator registers a persistent internal `eos()` listener that
+   always counts as "handled", a mechanism this tier does not model but
+   whose one externally-observable consequence it now reproduces
+   directly). Once this substitution is understood, ALL of a/a2/b/b2/c/d
+   fall out of a SINGLE model: the synthetic for-await-abort destroy
+   (a new libCall, `stream.destroyAborted`, emitted ONLY from this
+   lowering's own finally block — never from a user-written bare
+   `.destroy()`, which keeps using plain `stream.destroy`) builds the
+   AbortError and stores it as the stream's real error BEFORE any fresh
+   waiter ever parks, so a LATER for-await's own `nextChunkDynCore` hits
+   the EXISTING RS_ERROR-is-set branch in `checkWaiterCore` and
+   rethrows it unchanged — no branching on THAT half at all. The
+   SEPARATE "nothing left to give, no error" branch (RS_DESTROYED with
+   RS_ERROR still null — an externally, plainly destroyed stream) now
+   rejects `ERR_STREAM_PREMATURE_CLOSE` (settleConsumerCore's own
+   literal, reused verbatim) instead of the ORIGINAL fulfilled-EOF
+   silent-continue. `destroy(err)` (an explicit user error) is
+   untouched by any of this — the RS_ERROR-is-set branch was already
+   correct (Node rethrows the given error verbatim; 1746's own
+   "mid-iter" pin already covers it). One new field WAS needed after
+   all, narrowly scoped: `RS_ERROR_ABORT_SILENT`, a single-use flag
+   `destroyAbortedCore` arms and `opError` reads-then-clears, existing
+   ONLY to suppress the unhandled-error-crash fallback for this one
+   synthesized error (matching Node's own internal-listener-always-
+   handled behavior) — it carries no "how was this destroyed" meaning
+   beyond that one crash/no-crash decision, and every OTHER consequence
+   of the substitution (the stored error itself, 'error' listener
+   dispatch, promise rejection) rides the EXISTING RS_ERROR machinery
+   unchanged.
+
+**The full cell table (all six re-measured against Node AND the built
+tree, byte-exact on every one FOR THE SHAPE ACTUALLY VARIED;
+wasm-stream-forawait.test.ts names the covering pin per row — gate
+finding R1 narrowed cells a/a2 below, they were measured on an EMPTY
+stream only, not a general "plain destroy()" claim):**
+
+| cell | shape | Node throws | settles via |
+|---|---|---|---|
+| a  | EMPTY stream (nothing ever pushed), plain `.destroy()`, never iterated, then fresh `for await` | `Error` / `ERR_STREAM_PREMATURE_CLOSE` / "Premature close" | `checkWaiterCore`'s destroyed-clean branch, called SYNCHRONOUSLY from the fresh loop's own `nextChunkDynCore` |
+| a2 | EMPTY stream, plain `.destroy()` while a loop is ALREADY PARKED | same as a | the SAME branch, but reached via `opClose`'s own trailing `checkWaiterCore` call — `destroy(null)` never schedules `OP_ERROR` at all |
+| b  | `.destroy(err)`, never iterated | the GIVEN `err`, verbatim (`.name`/`.code` whatever the caller set) | the pre-existing RS_ERROR-is-set branch, unaffected by this rider |
+| b2 | `.destroy(err)` while parked | same as b | same branch, reached via `opError` (a non-null error DOES schedule `OP_ERROR`) — 1746's own "mid-iter" pin already covers this shape |
+| c  | re-iterate after a prior loop's own `break` | `AbortError` / `ABORT_ERR` / "The operation was aborted" | the SAME RS_ERROR-is-set branch as b — `destroyAbortedCore` stored the AbortError BEFORE this fresh waiter ever parked |
+| d  | a THIRD attempt after the second already threw | identical AbortError, again | same branch, idempotent — no attempt-counting |
+
+The buffered-data axis (one chunk pushed BEFORE the `.destroy()` in
+cells a/a2) was never varied by this rider and is NOT covered by the
+table above: gate finding R1 measured it and found a separate,
+PRE-EXISTING, UNREGISTERED divergence — Node's `destroy()` DISCARDS a
+buffered chunk before a consumer ever reads it, while this tier still
+delivers it to a subsequent `for await`. Reproduces identically on the
+unmodified base (not introduced by this rider). Filed as board #88;
+not fixed here.
+
+**New, narrow tier-shape change from this build:** a LABELED `break`
+out of a for-await loop to a statement OUTSIDE it now refuses
+`SC1090` ("'break' crossing a 'finally' block is not supported yet")
+— the SAME pre-existing fence every other try/finally construct in
+this tier already has (verified directly: a plain user-written
+`try {} finally {}` with a labeled break crossing it already refused
+before this build, unrelated to rider #72), now reachable through the
+synthetic try/finally this lowering introduces. Gate finding R3
+sharpened what "previously COMPILED" gives up: on the base tier the
+divergence this entry registers was present in the stream's STATE
+(not destroyed) but UNOBSERVED by a program that never checks
+`destroyed`/`readableEnded` or re-iterates — measured directly (a
+labeled-break probe matched Node BYTE-FOR-BYTE on its own printed
+observables, on base). So the boundary this build adds does not only
+trade away programs that would have SHOWN the divergence; it also
+refuses programs that were Node-correct on everything they actually
+observed. Refusing over a possible miscompile is still the rule-1-
+correct direction (and the divergence stays registered either way) —
+this is an accuracy correction to the entry's own text, not a change
+in verdict. Zero corpus impact verified directly (no corpus program
+combines for-await with any labeled break or continue). Plain
+unlabeled `break`/`continue` are unaffected (their
+target is the loop itself, contained within the synthetic try, never a
+crossing); `return` is unaffected too (the pending-return path, exempt
+from the break/continue crossing rule).
+
+**New native-lane note (C, measured, NOT fixed by this build — C is
+the transitional semantics reference, out of scope for a wasm-tier
+rider):** the C runtime picks up "destroy fires" for free — the new
+`stream.destroyAborted` libCall is aliased to plain `stream.destroy`'s
+own C codegen (`emit-exprs.ts`/`llvm/emitter.ts`), since the AbortError
+substitution and the crash-suppression flag are wasm-backend-only
+machinery (`stream.ts`). `break`/`return`/`throw` now destroy on C too
+(same as wasm). The re-iteration crash does NOT: C never stores the
+AbortError. Gate finding R2 corrected this paragraph's own prior
+"unchanged from before this build" claim, which was measurably
+backwards — the build DID change the C-lane observable, just not to
+Node's shape. Measured, both trees, `--backend c`: on BASE (before
+this rider), `break` never destroys at all (mechanism 1 did not exist
+yet), so the stream is still alive when the second loop starts — it
+PARKS, waiting for a chunk that never arrives, and the program exits
+with that second loop unfinished (nothing printed for it). On the
+FROZEN tree, mechanism 1 DOES destroy on C (shared/aliased), so the
+second loop now reaches C's own destroyed-with-no-error path and
+COMPLETES NORMALLY — the loop body yields no chunks, but
+the statements AFTER the loop now run and print (`"C: second loop
+completed normally"` / `"C: done"`), where
+BASE printed neither because its loop never returned control at all.
+That printed-output difference IS the changed observable this build
+introduces on C; both eras still exit 0, so exit code alone does not
+distinguish them. Node throws `AbortError`/`ABORT_ERR` in this shape;
+neither C era reproduces that throw — both C states diverge from Node,
+but they diverge DIFFERENTLY: base hangs the loop forever with no
+further output at all, frozen completes it and prints those two lines
+instead.
+
+Separately, C's own natural-end machinery reacts to the shared
+`destroy()` call differently from wasm's: for the async-delivered
+shape-B variant above, C's `readableEnded` flips to `true` as a side
+effect of the destroy call (still diverging from Node's `false`,
+measured both before and after this build — NOT resolved by rider
+#72, a standing C-lane-only divergence from Node this entry does not
+claim to cover).
+
+**PRE-EXISTING BUG FOUND DURING VERIFICATION, NOT caused by and NOT
+fixed by this build:** a `destroy(err)` issued in the SAME TICK that a
+`for await` then starts crashes the wasm tier where Node stays silent.
+The same-tick qualifier is load-bearing: let a tick elapse before the
+loop starts, or attach no iterator at all, and NODE crashes too — and
+this tier matches it in both of those shapes (measured, reproducing on
+the unmodified fe0ea5c baseline).
+Board #87 carries the full observer rule and the full measured record;
+not registered as an S-entry here since disposition is not this
+rider's call.
+
 ## S049 — Concurrent for-await over one Readable TRAPS; Node chains via its shared cached iterator *(wasm tier traps; C lane throws — split loud shapes)*
 
 Node caches ONE async iterator per stream, so two concurrent `for

@@ -18699,6 +18699,7 @@ class Assembler {
         return true;
       }
       case "stream.destroy":
+      case "stream.destroyAborted":
       case "stream.destroyErr": {
         const recvT = e.args[0]!.type;
         const recvVal = this.mapType(recvT, e.loc);
@@ -18712,6 +18713,12 @@ class Assembler {
         if (e.fn === "stream.destroyErr") {
           this.walkExpr(e.args[1]!);
           code.call(this.stream.destroyErrCore());
+        } else if (e.fn === "stream.destroyAborted") {
+          // STAGE D P4: rider #72's synthetic for-await-abort destroy —
+          // destroyAbortedCore's own signature is ONE param (root), like
+          // destroyCore's; it builds the AbortError and arms the silent
+          // flag internally (see stream.ts).
+          code.call(this.stream.destroyAbortedCore());
         } else {
           // destroyCore's own signature is ONE param (root) — it fills
           // the null error itself internally (see stream.ts). Feeding it

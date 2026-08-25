@@ -7394,8 +7394,16 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
    * (encoded streams fence at the runtime entry); in the JS lane the
    * chunk is checked-dynamic and boxes by runtime tag (dyn strings once
    * an encoding applies, dyn undefined as the sentinel — chunks are
-   * never undefined). Early exit leaves the stream alive (Node's
-   * iterator return() would destroy it — a documented divergence). */
+   * never undefined).
+   *
+   * STAGE D P4 (rider #72, S048's deferred build): early exit (break/
+   * return/throw sourced from the LOOP BODY, not from our own EOF
+   * check) now destroys the stream, matching Node's iterator return()
+   * path. Measure-first, build lands after the Phase 1/2 sync point;
+   * see stageD-p4/plan.txt for the try/finally + normalCompletion-flag
+   * design (mirrors the standard for-of IteratorClose desugaring, using
+   * the IR "for" node's continue-runs-update-first semantics so a user
+   * `continue` does NOT trip the destroy). */
   function lowerForAwaitReadable(L: Lowerer, stmt: ts.ForOfStatement, recvT: IrType & { kind: "object" }): IrStmt {
     if (!L.ctx.isAsync) {
       L.unsupported("SC1090", stmt, "top-level 'for await' (await outside async functions)");
@@ -7438,7 +7446,16 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
       };
       const p = L.declareHiddenLocal("%streamNext", promiseT);
       const chunk = L.declareLocal(decl.name, decl.name.text, chunkT, isLet);
-      const body = L.inCtl("loop", () => L.lowerScopedBlock(stmt.statement));
+      // STAGE D P4: the body now lowers INSIDE a "tryFinally" ctl entry
+      // (lowerTry's own pattern, `L.inCtl("tryFinally", ...)`), nested
+      // around the existing "loop" entry — without this, a break/continue
+      // lowered from the user's body never learns it is inside the
+      // synthetic try/finally this function builds below, and
+      // rejectJumpCrossingFinally never fires: the labeled-break-crossing
+      // case would then reach the IR VALIDATOR undetected and ICE instead
+      // of refusing cleanly with SC1090 (found via execution, not
+      // review — p14's own probe hit exactly this).
+      const body = L.inCtl("tryFinally", () => L.inCtl("loop", () => L.lowerScopedBlock(stmt.statement)));
       const chunkRef: IrExpr = { kind: "varRef", localId: chunk.id, type: chunkT, loc };
       const eofCond: IrExpr = dynLane
         ? { kind: "dynTest", test: "undefined", value: chunkRef, type: BOOL, loc }
@@ -7450,6 +7467,44 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
             type: BOOL,
             loc,
           };
+      // STAGE D P4 (rider #72): `normalCompletion` mirrors the standard
+      // for-of/for-await IteratorClose desugar (Babel's own
+      // `_iteratorNormalCompletion`, adapted to this file's head/body
+      // split): true everywhere EXCEPT the window while BODY (the user's
+      // own statements) is actually executing. Node's real async
+      // generator destroys the stream in its own `finally` on any ABRUPT
+      // completion of the loop body specifically (break/return/throw
+      // sourced from body) — never when the iterator's own next()/await
+      // itself rejects (that's treated as if next() threw; no destroy —
+      // measured directly, matching the EOF check and the head statements
+      // staying OUTSIDE this flag's protected window).
+      const normalCompletion = L.declareHiddenMutableLocal("%faNormal", BOOL);
+      const normalDecl: IrStmt = {
+        kind: "varDecl",
+        localId: normalCompletion.id,
+        init: { kind: "boolLit", value: true, type: BOOL, loc },
+        loc,
+      };
+      const markAbnormal: IrStmt = {
+        kind: "assign",
+        localId: normalCompletion.id,
+        value: { kind: "boolLit", value: false, type: BOOL, loc },
+        loc,
+      };
+      // The IR "for" node's own update clause: runs after BODY falls off
+      // its own end (lowerFor's normal-completion goto) AND on `continue`
+      // (lowerFor's own `continueState: updS` — "continue in a for runs
+      // the UPDATE first", statemachine.ts) — NOT on `break`, which jumps
+      // straight to the loop's exit, skipping this. That asymmetry is
+      // exactly what's needed: `continue` must NOT trip the destroy
+      // (measured directly against Node — it never does), while `break`
+      // must leave `normalCompletion` false so the finally below destroys.
+      const markNormal: IrStmt = {
+        kind: "assign",
+        localId: normalCompletion.id,
+        value: { kind: "boolLit", value: true, type: BOOL, loc },
+        loc,
+      };
       const head: IrStmt[] = [
         {
           kind: "varDecl",
@@ -7474,19 +7529,86 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
           },
           loc,
         },
+        // Natural EOF exit: this `break` lives in HEAD, before
+        // `markAbnormal` ever flips the flag, so `normalCompletion`
+        // retains whatever the PRIOR pass's own update left it (true) —
+        // no destroy on a clean, Node-matching end.
         { kind: "if", cond: eofCond, then: [{ kind: "break", loc }], else_: null, loc },
+        markAbnormal,
       ];
-      return {
-        kind: "block",
-        body: [
-          recvDecl,
+      const forLoop: IrStmt = {
+        kind: "for",
+        init: null,
+        cond: null,
+        update: markNormal,
+        body: [...head, ...body],
+        loc,
+      };
+      // `stream.destroyAborted(recv)` — a for-await-only sibling of the
+      // `stream.destroy` libCall a user-written bare `.destroy()` lowers
+      // to (lower-stream.ts). NOT plain `stream.destroy`: Node's real
+      // async-iterator destroy stores a SYNTHESIZED AbortError as the
+      // stream's own error (measured directly — `stream.errored` reads
+      // an AbortError immediately after break, and an attached 'error'
+      // listener FIRES with it), which is what makes a FRESH for-await's
+      // own re-park (nextChunkDynCore -> checkWaiterCore) hit the
+      // EXISTING RS_ERROR-is-set branch and rethrow it — no new field
+      // needed for THAT half. A plain external `.destroy()` (no error)
+      // is a genuinely different Node shape (measured: `stream.errored`
+      // stays null there) and must keep using `stream.destroy` unchanged
+      // — see SEMANTICS.md's S048 amendment for the full cell matrix.
+      // destroyErrCore's own RS_DESTROYED gate still makes this
+      // idempotent (a no-op if the body already destroyed the stream).
+      const destroyStmt: IrStmt = {
+        kind: "exprStmt",
+        expr: {
+          kind: "libCall",
+          fn: "stream.destroyAborted",
+          args: [{ kind: "varRef", localId: recvLocal.id, type: recvT, loc }],
+          type: recvT,
+          loc,
+        },
+        loc,
+      };
+      // NOTE (recorded, not a defect this pass introduces): the IR
+      // validator forbids ANY break/continue from crossing a try-with-
+      // finally region (pre-existing, general — verified directly: a
+      // plain user-written `try {} finally {}` with a labeled break
+      // crossing it already refuses today, SC1090). A LABELED break out
+      // of THIS loop to a statement outside it will hit that same,
+      // pre-existing refusal now that this lowering introduces a
+      // try/finally where none existed before — a genuine but narrow
+      // tier-shape change (zero corpus impact, verified: no corpus
+      // program combines for-await with any labeled break/continue).
+      // Plain unlabeled break/continue are unaffected (their target, this
+      // "for" node, is contained within tryBody, not a crossing); `return`
+      // from the enclosing function is unaffected too (the pending-return
+      // path, not subject to the break/continue crossing rule).
+      const guarded: IrStmt = {
+        kind: "tryCatch",
+        tryBody: [forLoop],
+        catchBody: null,
+        catchLocalId: null,
+        finallyBody: [
           {
-            kind: "while",
-            cond: { kind: "boolLit", value: true, type: BOOL, loc },
-            body: [...head, ...body],
+            kind: "if",
+            cond: {
+              kind: "unary",
+              op: "!",
+              operand: { kind: "varRef", localId: normalCompletion.id, type: BOOL, loc },
+              type: BOOL,
+              loc,
+            },
+            then: [destroyStmt],
+            else_: null,
             loc,
           },
         ],
+        loc,
+      };
+      return {
+        kind: "block",
+        body: [recvDecl, normalDecl, guarded],
         loc,
       };
     } finally {

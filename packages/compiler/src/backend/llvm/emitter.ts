@@ -765,7 +765,7 @@ const USES_TIMERS_LIB_FNS = new Set<string>([
   "readable.pipe", "readable.unpipe",
   "writable.write", "writable.writeStr", "writable.writeU", "writable.writeDyn",
   "writable.end", "writable.uncork",
-  "stream.destroy", "stream.destroyErr",
+  "stream.destroy", "stream.destroyAborted", "stream.destroyErr",
   "stream.setRead", "stream.setWrite", "stream.setFinal", "stream.setDestroy",
   "stream.setTransform", "stream.setFlush",
   "process.activeResources",
@@ -11130,7 +11130,11 @@ class LlEmitter {
       this.emitPendingCheck();
       return out;
     }
-    if (e.fn === "stream.destroy") {
+    // STAGE D P4: stream.destroyAborted is the wasm-only rider #72
+    // sibling (a synthesized AbortError, opError's unhandled-crash
+    // suppression) — out of scope on this lane, aliased to plain
+    // stream.destroy (SEMANTICS.md S048's amendment).
+    if (e.fn === "stream.destroy" || e.fn === "stream.destroyAborted") {
       const args = e.args.map((a) => this.emitExpr(a));
       this.declare(`declare ptr @scr_stream_destroy(ptr, ptr)`);
       const t = B.tmp();
