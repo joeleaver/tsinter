@@ -441,8 +441,14 @@ static void scr_ee_remove_at(ScrEmitter *em, ScrEeBucket *b, size_t i) {
 ScrEmitter *scr_emitter_off(ScrEmitter *em, ScrStr *name, ScrClosure *cb) {
   ScrEeBucket *b = em->reg ? scr_ee_bucket_find(em->reg, name->data, name->len) : NULL;
   if (b) {
+    /* Board #89: the incoming cb OR the stored entry may be an
+     * identity-transparent wrapper (a funcCoerceAdapter/85-D4 mint
+     * registered directly, or handed back for removal by its true
+     * original) — chain-walk both sides, matching wasm's own
+     * universalUnwrapFn coverage of this exact site. */
+    ScrClosure *want = scr_closure_true(cb);
     for (size_t i = b->n; i-- > 0;) {
-      if (scr_ee_entry_fn(b->ls[i]) == cb) {
+      if (scr_closure_true(scr_ee_entry_fn(b->ls[i])) == want) {
         scr_ee_remove_at(em, b, i);
         break;
       }
@@ -678,8 +684,9 @@ double scr_emitter_listener_count_fn(ScrEmitter *em, ScrStr *name, ScrClosure *f
   ScrEeBucket *b = em->reg ? scr_ee_bucket_find(em->reg, name->data, name->len) : NULL;
   if (!b) return 0;
   size_t count = 0;
+  ScrClosure *want = scr_closure_true(fn); /* board #89, same chain-walk as scr_emitter_off */
   for (size_t i = 0; i < b->n; i++) {
-    if (scr_ee_entry_fn(b->ls[i]) == fn) count++;
+    if (scr_closure_true(scr_ee_entry_fn(b->ls[i])) == want) count++;
   }
   return (double)count;
 }

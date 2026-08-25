@@ -4491,8 +4491,16 @@ export class Lowerer {
    * predicate FIRST and emit the identity-preserving `arityWiden` node
    * instead, per Joe's ruling that a pure arity-drop is an invocation
    * rule in JS — Node mints no new value for it, so this compiler must
-   * not either. The residual identity loss on THIS function's remaining
-   * (conversion-bearing / stranded) shapes is board #89, not this one. */
+   * not either.
+   *
+   * BOARD #89 (landed): the mint above still happens on every call — a
+   * NEW closure value is unavoidable here, since these dispositions
+   * genuinely change what a call does. What changed is what that new
+   * value ANSWERS AT IDENTITY SITES: the closure literal below carries
+   * `identityOriginal: "f.0"`, letting each backend make the mint
+   * transparent to ===/!==/refEqFn/deepStrictEqual/EventEmitter's
+   * off()-family without altering calling behavior at all — see
+   * ir/nodes.ts's closure-node doc for the field's contract. */
   funcCoerceAdapter(fromT: IrType & { kind: "func" }, toT: IrType & { kind: "func" }, loc: SrcLoc): string | null {
     if (fromT.rest === true || toT.rest === true) return null;
     if (fromT.params.length > toT.params.length) return null;
@@ -4622,7 +4630,12 @@ export class Lowerer {
       body: [
         {
           kind: "return",
-          value: { kind: "closure", fnName: impl, captures: ["f.0"], type: toT, loc },
+          // BOARD #89: identityOriginal marks "f.0" (the wrapped
+          // ORIGINAL — every disposition above closes over exactly this
+          // and nothing else) as this closure's true reference identity.
+          // See ir/nodes.ts's own field doc for what each backend does
+          // with it; this line never changes CALLING behavior.
+          value: { kind: "closure", fnName: impl, captures: ["f.0"], identityOriginal: "f.0", type: toT, loc },
           loc,
         },
       ],

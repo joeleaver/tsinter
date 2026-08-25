@@ -383,7 +383,10 @@ void scr_assert_ref_eq_bytes(const ScrBytes *a, const ScrBytes *b, bool negated,
  * always takes the reference-equality expectation header. */
 void scr_assert_ref_eq_fn(const ScrClosure *a, const ScrClosure *b, bool negated,
                           ScrStr *msg, bool has_msg) {
-  bool same = a == b;
+  /* Board #89: chain-walk past any identity-transparent wrapper (a and b
+   * are borrowed here, so scr_closure_true's non-const read is safe —
+   * it never mutates, only follows trueOrig). */
+  bool same = scr_closure_true((ScrClosure *)a) == scr_closure_true((ScrClosure *)b);
   if ((negated && !same) || (!negated && same)) return;
   if (has_msg && (negated || msg->len > 0)) {
     scr_assert_fail_msg(scr_str_retain(msg));

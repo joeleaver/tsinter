@@ -77,8 +77,18 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           case "**":
             return E.newTemp(e.type, `pow(${l.name}, ${r.name})`);
           case "===":
+            // Board #89: func identity chain-walks past any
+            // identity-transparent wrapper (funcCoerceAdapter's
+            // conversion/stranded mints, the 85-D4 trampoline) — every
+            // OTHER ref kind stays a bare pointer compare, unaffected.
+            if (e.left.type.kind === "func") {
+              return E.newTemp(e.type, `scr_closure_true(${l.name}) == scr_closure_true(${r.name})`);
+            }
             return E.newTemp(e.type, `${l.name} == ${r.name}`);
           case "!==":
+            if (e.left.type.kind === "func") {
+              return E.newTemp(e.type, `scr_closure_true(${l.name}) != scr_closure_true(${r.name})`);
+            }
             return E.newTemp(e.type, `${l.name} != ${r.name}`);
           // The bitwise six ride runtime helpers (ToInt32/ToUint32 wrap,
           // 5-bit shift masks, exact C-portable arithmetic shifts).
@@ -1538,6 +1548,13 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
         e.captures.forEach((localId, i) => {
           E.line(`${t.name}->caps[${i}] = scr_box_retain(${mangleLocal(localId)});`);
         });
+        // Board #89: construction above is COMPLETELY UNCHANGED — this
+        // is purely additive. scr_box_get_ref already retains (+1); no
+        // separate scr_closure_retain on top (matches every other
+        // `/* +1 */` box-unwrap site in this runtime).
+        if (e.identityOriginal !== undefined) {
+          E.line(`${t.name}->trueOrig = (ScrClosure *)scr_box_get_ref(${mangleLocal(e.identityOriginal)});`);
+        }
         return t;
       }
       case "callValue": {
@@ -1650,13 +1667,13 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
         // grounding). When any dropped param IS refcounted, this mints
         // an ABSORBING TRAMPOLINE instead — a real parameter for every
         // wide-type param, forwarding the first k and releasing the
-        // rest. IDENTITY IS LOST on this path (a new ScrClosure IS
-        // minted) — this matches the lane's OWN pre-#85 behavior
-        // exactly (funcCoerceAdapter always wrapped too), so it is a
-        // named residual (board #89), not a regression; wasm's marker
-        // family stays correct for this exact shape via a completely
-        // different mechanism (GC avoids this leak class by
-        // construction) — a real, permanent cross-lane split.
+        // rest. A NEW ScrClosure IS minted on this path — but board #89
+        // (landed) makes it identity-TRANSPARENT: trueOrig (set below)
+        // is what scr_closure_true chain-walks through at every native
+        // identity site, so this trampoline answers as `v` there while
+        // still doing its own leak-safe ownership work when CALLED.
+        // Matches wasm's own marker family, which was already correct
+        // here via a completely different (GC) mechanism.
         if (e.value.type.kind !== "func" || e.type.kind !== "func") {
           throw new Error("emitter bug: arityWiden operand/result must both be func-typed");
         }
@@ -1671,6 +1688,7 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
         const wrap = E.newTemp(e.type, `scr_closure_new((void *)&${trampoline}, 1)`);
         E.line(`${wrap.name}->caps[0] = scr_box_new(SCR_BOX_FUNC);`);
         E.line(`scr_box_set_ref(${wrap.name}->caps[0], ${v.name});`);
+        E.line(`${wrap.name}->trueOrig = scr_closure_retain(${v.name});`);
         return wrap;
       }
       case "upcast":

@@ -171,9 +171,11 @@ static void scr_closure_trace(void *o, ScrTraceVisit visit, void *ctx) {
 }
 
 static void scr_closure_gcfree(void *o) {
-  /* Caps are all boxes — all traced. The own-property table (props) is
-   * an untraced box: released here like any external owned edge. */
+  /* Caps are all boxes — all traced. The own-property table (props) and
+   * trueOrig (board #89) are untraced: released here like any other
+   * external owned edge. */
   scr_box_release(((ScrClosure *)o)->props);
+  scr_closure_release(((ScrClosure *)o)->trueOrig);
 #ifdef SCR_RC_AUDIT
   scr_live_closures--;
 #endif
@@ -187,6 +189,7 @@ ScrClosure *scr_closure_new(void *fn, size_t ncaps) {
   c->fn = fn;
   c->ncaps = ncaps;
   c->props = NULL; /* lazily allocated by Object.defineProperties */
+  c->trueOrig = NULL; /* board #89: set once by a wrapper mint, never an ordinary closure */
 #ifdef SCR_RC_AUDIT
   scr_live_closures++;
 #endif
@@ -199,6 +202,7 @@ void scr_closure_release(ScrClosure *c) {
     scr_cyc_on_dead(c);
     for (size_t i = 0; i < c->ncaps; i++) scr_box_release(c->caps[i]);
     scr_box_release(c->props); /* NULL-tolerant */
+    scr_closure_release(c->trueOrig); /* board #89: NULL-tolerant, own guard above */
 #ifdef SCR_RC_AUDIT
     scr_live_closures--;
 #endif
@@ -210,4 +214,9 @@ void scr_closure_release(ScrClosure *c) {
 
 void scr_closure_trace_v(void *c, ScrTraceVisit visit, void *ctx) {
   scr_closure_trace(c, visit, ctx);
+}
+
+ScrClosure *scr_closure_true(ScrClosure *c) {
+  while (c->trueOrig) c = c->trueOrig;
+  return c;
 }

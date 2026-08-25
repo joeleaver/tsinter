@@ -4326,8 +4326,23 @@ export type IrExpr =
    * in the callee's captures[] order). The result is owned (+1); the closure
    * itself retains each captured box. A reference to a top-level declared
    * function lowers to a zero-capture closure — backends must intern that
-   * case so `f === f` is true (JS function identity). */
-  | { kind: "closure"; fnName: string; captures: string[]; type: IrType; loc: SrcLoc }
+   * case so `f === f` is true (JS function identity).
+   *
+   * BOARD #89: `identityOriginal`, when present, names ONE entry of
+   * `captures` (func-typed) whose VALUE is what this closure's reference
+   * identity should transparently answer as at every func-identity site
+   * (bin ===/!==, assert.refEqFn, deepStrictEqual's func case, and the
+   * EventEmitter off()/listenerCount() family) — funcCoerceAdapter's own
+   * wrapper (lowerer.ts's `funcCoerceAdapter`) sets this to its sole
+   * capture unconditionally, since every one of its dispositions
+   * (param coercion, return coercion, stranded/trap-only) closes over
+   * EXACTLY the wrapped original and nothing else. CALLING is completely
+   * unaffected — this field changes NOTHING about how the closure is
+   * built or invoked (see each backend's own consumer for why: wasm
+   * REGISTERS the already-built env struct into the universal-unwrap
+   * cascade rather than minting a different struct; C/LLVM populate a
+   * new field alongside, never replacing, the ordinary construction). */
+  | { kind: "closure"; fnName: string; captures: string[]; identityOriginal?: string; type: IrType; loc: SrcLoc }
   /** Indirect call of a func-typed value. Args follow `call`'s convention
    * (callee owns its params, callers pass +1). The callee expression is an
    * ordinary owned temp, released at statement end. */

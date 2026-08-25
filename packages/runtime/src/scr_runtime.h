@@ -1169,6 +1169,50 @@ void scr_box_set_f64(ScrBox *b, double v);
 void scr_box_set_bool(ScrBox *b, bool v);
 void scr_box_set_ref(ScrBox *b, void *v); /* releases old, owns new */
 
+/* LAYOUT LOCKSTEP (board #89's own lesson, recorded so the next field-
+ * adder finds this by reading rather than by SIGSEGV — the mapType-
+ * lockstep discipline wearing a struct-layout costume): every site
+ * below assumes this struct's exact field list/order and must be
+ * updated in the SAME change that adds, removes, or reorders a field.
+ * TWO hand-rolled MIRRORS of this layout (adding a field here breaks
+ * them silently — no compiler catches a mismatched struct-literal
+ * field COUNT in C, and LLVM only catches an aggregate-initializer
+ * ARITY mismatch, not a semantic one):
+ *   - packages/compiler/src/backend/emission/emitter.ts, the anonymous
+ *     `static struct { size_t rc; void *fn; size_t ncaps; ScrBox
+ *     *props; ScrClosure *trueOrig; }` for immortal/interned zero-
+ *     capture closures (the `sc_fc_*` globals).
+ *   - packages/compiler/src/backend/llvm/emitter.ts, the matching
+ *     `%ScrClosure`-typed `internal global` initializer for the SAME
+ *     `sc_fc_*` globals.
+ * FIVE sites compute `caps[]`'s start as a raw byte-offset GEP literal
+ * (LLVM only — the C lane always uses named field access, `->caps[i]`,
+ * automatically lockstepped by the C compiler):
+ *   - packages/compiler/src/backend/llvm/emitter.ts: the general
+ *     captures-unpacking prologue (every lifted function with captures
+ *     reads them at its own entry); the general "closure" case's own
+ *     caps[] WRITE loop (construction); the 85-D4 arityWiden
+ *     trampoline's caps[0] WRITE (refcounted-drop path).
+ *   - packages/compiler/src/backend/llvm/dyn.ts: the checked-dynamic
+ *     function-boundary adapter's (`dynFuncAdapterHelper`) own caps[0]
+ *     WRITE at construction, and its own captures-read PROLOGUE —
+ *     found ONLY by running the full suite (board #89's own
+ *     regression: the original offset audit grepped emitter.ts alone
+ *     and missed this entire file, see fix-89/FINDINGS.txt §2 bug 3).
+ * ONE more site is the layout's own SOURCE OF TRUTH on the LLVM side,
+ * counted separately from the five GEP sites above because it is not
+ * itself an offset computation — it is what every one of those five
+ * offsets (and the two mirrors) must stay consistent WITH:
+ *   - packages/compiler/src/backend/llvm/emitter.ts: the `%ScrClosure
+ *     = type { i64, ptr, i64, ptr, ptr }` type declaration itself —
+ *     arguably the single most layout-critical line in the LLVM lane,
+ *     since every other LLVM site either mirrors it (the two mirrors
+ *     above) or is expressed as a byte offset into it (the five GEP
+ *     sites above).
+ * EIGHT sites total (two mirrors + five GEP offsets + the type
+ * declaration itself). All eight carry a one-line comment pointing
+ * back to THIS struct; grep `LAYOUT LOCKSTEP` from any of them to
+ * reach this list. */
 typedef struct ScrClosure {
   size_t rc; /* SIZE_MAX = immortal (interned top-level function value) */
   void *fn;
@@ -1185,6 +1229,49 @@ typedef struct ScrClosure {
    * (like the dyn→closure edge): a cycle through it is merely never
    * collected. */
   ScrBox *props;
+  /* BOARD #89: NULL, or the value THIS closure is transparently the
+   * SAME identity as — every wrapper mint (funcCoerceAdapter's
+   * conversion/stranded wrappers, the 85-D4 arity-drop trampoline)
+   * populates this with a retained (+1) reference to what it wraps,
+   * set ONCE at construction and never reassigned after (so the chain
+   * `c->trueOrig->trueOrig->...` is strictly monotonic in construction
+   * order — acyclic by construction, the same argument wasm's own
+   * marker-unwrap cascade rests on). `scr_closure_true()` walks this
+   * chain to fixpoint at every native func-identity site. OWNED,
+   * exactly like `props` above and released alongside it on BOTH
+   * teardown paths — and, like `props`, UNTRACED by the cycle
+   * collector: "a cycle through it is merely never collected" is the
+   * SAME accepted class `props` already lives in, not a new hazard —
+   * a genuine cycle would need the wrapped ORIGINAL to (transitively)
+   * capture the WRAPPER via some OTHER mutable path after the fact,
+   * exactly as already possible today between any two ordinary
+   * closures sharing a mutable captured variable.
+   *
+   * RECURSION DEPTH AT TEARDOWN (rev-89 F3a): scr_closure_release
+   * recurses into itself along the trueOrig chain (`scr_closure_release
+   * (c->trueOrig)` in its own rc==0 branch), so releasing a depth-N
+   * chain is N native stack frames deep. The acyclicity argument above
+   * establishes TERMINATION — the recursion cannot loop forever — but
+   * says nothing about STACK DEPTH; that is bounded only by however
+   * deeply real programs nest wrapper-of-wrapper chains, and this is
+   * measured to depth 3 only (board #89's own d1/d2/rF pins), not
+   * proven for arbitrary N.
+   *
+   * PRECISE SCOPE OF THE "MIRRORS props" CLAIM (rev-89 F3b): true of
+   * the OWNERSHIP PATTERN (owned, NULL-initialized, released on both
+   * teardown paths) and BOTH teardown SITES (scr_closure.c's
+   * scr_closure_gcfree and scr_closure_release's own rc==0 branch) —
+   * verified precisely at both. The call TARGET at each site
+   * necessarily DIFFERS from props's, because the field types differ:
+   * props releases through scr_box_release, trueOrig through
+   * scr_closure_release. In scr_closure_gcfree specifically, that
+   * routes trueOrig's release through scr_cyc_on_dead (the cycle-
+   * collector's own bookkeeping, inside scr_closure_release's rc==0
+   * branch) — a step props's own scr_box_release call never takes,
+   * since a box is not itself a cycle-collected allocation. This is an
+   * asymmetry in what "mirrors" covers, not a defect: the OWNERSHIP
+   * PATTERN is identical: the CALL SHAPE, unavoidably, is not. */
+  struct ScrClosure *trueOrig; /* self-referential: the typedef isn't complete yet here */
   ScrBox *caps[];
 } ScrClosure;
 
@@ -1199,6 +1286,19 @@ static inline ScrClosure *scr_closure_retain(ScrClosure *c) {
 }
 
 void scr_closure_release(ScrClosure *c); /* releases the boxes; NULL-tolerant */
+
+/* BOARD #89: the chain-walking identity resolver — every native
+ * func-identity site (bin ===/!==, assert.refEqFn,
+ * scr_emitter_off/scr_emitter_listener_count_fn) calls this on BOTH
+ * operands before comparing pointers, so a wrapper answers as its true
+ * original at any depth (wrapper-of-wrapper, mixed classes) with no
+ * per-site chain logic. Terminates: trueOrig always points to a value
+ * that existed BEFORE the wrapper (see the field's own doc above). A
+ * REAL exported symbol (not `static inline` like scr_closure_retain
+ * above) — the LLVM lane's `declare`d calls need an actual linkable
+ * name, and this isn't a hot-path retain worth the "_v"-twin ceremony
+ * that pattern exists for. */
+ScrClosure *scr_closure_true(ScrClosure *c);
 
 /* ── unions ─────────────────────────────────────────────────────────
  * A union value (`A | B`) is an IMMUTABLE tagged box: a refcounted header,

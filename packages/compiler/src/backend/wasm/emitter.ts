@@ -2019,13 +2019,42 @@ class Assembler {
 
   private readonly listenerAdapterBases = new Map<number, number>();
   private readonly listenerAdapterFns = new Map<string, number>();
-  /** Every distinct marker struct type, in first-encountered order — the
-   * universal unwrap's own cascade list, grown by `listenerAdapterBase`
-   * and consumed once by `finalizeListenerUnwrap`. Order is provably
+  /** Every distinct marker/wrapper struct TYPE the universal unwrap's
+   * cascade tries, in first-encountered order, grown by
+   * `listenerAdapterBase` (board #75/#85 — `unbox: null`, field 1 is
+   * already a bare eqref) and by `registerClosureIdentityOriginal`
+   * (board #89 — `unbox` non-null, since a closure's OWN env struct
+   * stores each capture as a BOX ref: `envTypeFor`'s own convention,
+   * `boxRefFor`/`boxRefForLocal`). `field` names which struct field
+   * holds the (possibly boxed) original — 1 for every board-#75/#85
+   * marker (their only capture), `1 + captureIndex` for a board-#89
+   * env struct (identityOriginal's own position among that closure's
+   * OTHER captures, today always 0 since funcCoerceAdapter's wrapper
+   * captures nothing else, but the general form costs nothing).
+   * Consumed once by `finalizeListenerUnwrap`. Order is provably
    * irrelevant (see this section's own DISJOINTNESS note); kept as
    * first-encountered purely so the generated cascade is deterministic
    * across otherwise-identical compiles. */
-  private readonly universalUnwrapBases: number[] = [];
+  private readonly universalUnwrapBases: { base: number; field: number; unbox: number | null }[] = [];
+  /** `(env, field)` pairs already registered into `universalUnwrapBases`
+   * — `registerClosureIdentityOriginal` is idempotent per pair (many
+   * closure-literal call sites can share one interned `impl`/env, board
+   * #89's own funcCoerceAdapter interning; pushing twice would make the
+   * cascade redundant, not wrong, but the dedupe keeps it minimal).
+   * Keyed on the PAIR, not env alone: funcCoerceAdapter is the only
+   * producer today, always sets "f.0" on a closure with exactly one
+   * capture, so env alone would never actually collide — but the
+   * cascade entry itself already carries a per-node `field` index (the
+   * general form), and keying the dedupe to match is the difference
+   * between "provably correct for every producer this method could
+   * ever have" and "correct only because the one producer that exists
+   * happens not to exercise the gap." UNREACHABLE TODAY, NO PIN
+   * POSSIBLE: a second producer sharing one env type with a DIFFERENT
+   * identityOriginal capture doesn't exist in this codebase, so there
+   * is no source program that could distinguish the two keying
+   * schemes — this is a defensive fix for a shape nothing can
+   * construct yet, not a measured regression. */
+  private readonly registeredIdentityBases = new Set<string>();
   private universalUnwrapFnField: number | null = null;
   private universalUnwrapFinalized = false;
   private listenerUnwrapSigField: number | null = null;
@@ -2057,8 +2086,59 @@ class Assembler {
       clos,
     );
     this.listenerAdapterBases.set(clos, made);
-    this.universalUnwrapBases.push(made);
+    this.universalUnwrapBases.push({ base: made, field: 1, unbox: null });
     return made;
+  }
+
+  /** BOARD #89: registers an ORDINARY closure's env struct (built by the
+   * general "closure" case below, UNCHANGED — see the case's own
+   * comment for why nothing about construction or invocation moves)
+   * into the SAME cascade `listenerAdapterBase` feeds, so the closure's
+   * `identityOriginal` capture becomes what every func-identity site
+   * answers for it. `envTypeFor` is cached per function name (verified:
+   * called both here and at the callee's own captures prologue,
+   * `walkFunction` below, and #75/#85 are known-correct today — only
+   * possible if `mb.subStructType` dedupes by name), so this ALWAYS
+   * reaches the exact struct type construction already built, never a
+   * new one. Idempotent per (env, field) pair (`registeredIdentityBases`).
+   *
+   * FALSIFIED FIRST DESIGN, kept here because it is exactly why this
+   * function looks the way it does: the obvious approach is "build the
+   * closure literal as a #75-style marker (2-field: funcref + bare
+   * eqref) instead of an ordinary env struct." That fails — a marker's
+   * fields differ in BOTH count and TYPE from `envTypeFor`'s own shape
+   * (env fields are BOX refs, one per real capture; a marker's field 1
+   * is a bare eqref, no box). The callee (`impl`)'s own prologue
+   * INDEPENDENTLY `refCast`s its arg0 down to `envTypeFor(callee)` to
+   * unpack its captures (`walkFunction` below) — completely unaware of
+   * whatever struct type the CALLER used to construct the value. Swap
+   * only the construction site to a marker and that refCast traps: a
+   * marker and an env struct are SIBLING subtypes of `clos`, neither a
+   * subtype of the other, so `impl`'s own body can no longer read its
+   * own capture. This function's actual approach — leave construction
+   * AND invocation bytecode completely untouched, only REGISTER the
+   * already-correct env struct into the cascade with an extra "unbox"
+   * step — has zero risk to calling correctness by construction, which
+   * a struct-type swap could never claim. */
+  private registerClosureIdentityOriginal(callee: WFunction, identityOriginal: string): void {
+    const env = this.envTypeFor(callee);
+    const captures = callee.captures ?? [];
+    const captureIndex = captures.findIndex((c) => c.localId === identityOriginal);
+    if (captureIndex < 0) {
+      throw new Error(`wasm emitter bug: identityOriginal "${identityOriginal}" is not a capture of ${callee.name}`);
+    }
+    const field = 1 + captureIndex;
+    const key = `${env}:${field}`;
+    if (this.registeredIdentityBases.has(key)) return;
+    this.registeredIdentityBases.add(key);
+    const capture = captures[captureIndex]!;
+    // Mirrors envTypeFor's OWN storage-type derivation exactly (the
+    // local's tdz-aware box if the capture has a LOCAL twin, else the
+    // capture's own declared type) — the field type I assume when
+    // UNBOXING at the cascade must be what construction actually wrote.
+    const local = callee.locals.find((l) => l.id === identityOriginal);
+    const unbox = local !== undefined ? this.boxTypeForLocal(local) : this.boxTypeFor(this.mapTypeSoft(capture.type));
+    this.universalUnwrapBases.push({ base: env, field, unbox });
   }
 
   /** The per-k adapter FUNCTION: a closure of the FULL elemType
@@ -2230,16 +2310,28 @@ class Assembler {
    * `dynFnAdapter`'s own convention); VOID-typed throughout now (no
    * `ifResult`/stack-threaded value anywhere) since the loop
    * communicates purely through local 0 across iterations. */
-  private emitUniversalUnwrapCascade(c: Code, bases: readonly number[], i: number): void {
+  private emitUniversalUnwrapCascade(
+    c: Code,
+    bases: readonly { base: number; field: number; unbox: number | null }[],
+    i: number,
+  ): void {
     if (i >= bases.length) {
       return;
     }
+    const entry = bases[i]!;
     c.localGet(0);
-    c.refTest(bases[i]!);
+    c.refTest(entry.base);
     c.ifVoid();
     c.localGet(0);
-    c.refCast(bases[i]!);
-    c.structGet(bases[i]!, 1);
+    c.refCast(entry.base);
+    c.structGet(entry.base, entry.field);
+    // BOARD #89: an env-struct base's field is a BOX ref (envTypeFor's
+    // own capture convention), not a bare eqref — one extra unbox read
+    // recovers the value, matching the box type construction actually
+    // wrote (registerClosureIdentityOriginal's own derivation). `null`
+    // (every board-#75/#85 marker) skips this — their field is already
+    // the bare captured value.
+    if (entry.unbox !== null) c.structGet(entry.unbox, 0);
     c.localSet(0);
     c.br(i + 1); // escapes this if + i enclosing ifs, reaching the loop
     c.else_();
@@ -8963,6 +9055,11 @@ class Assembler {
         code.refFunc(index);
         for (const capturedId of e.captures) code.localGet(this.localIndex(capturedId));
         code.structNew(env);
+        // BOARD #89: construction above is COMPLETELY UNCHANGED — this
+        // registration is purely additive, teaching universalUnwrapFn's
+        // cascade about an env struct that already exists so identity
+        // sites answer THROUGH it; it emits no bytecode of its own here.
+        if (e.identityOriginal !== undefined) this.registerClosureIdentityOriginal(callee, e.identityOriginal);
         return;
       }
 

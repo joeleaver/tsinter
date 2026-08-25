@@ -671,8 +671,17 @@ export class CEmitter {
         `  (void)sc_env;`,
         fn.returnType.kind === "void" && !fn.async && !fn.generator ? `  ${call};` : `  return ${call};`,
         `}`,
-        `static struct { size_t rc; void *fn; size_t ncaps; ScrBox *props; } ${mangleFnClosure(name)} =`,
-        `    { SIZE_MAX, (void *)&${mangleWrapper(name)}, 0, NULL };`,
+        // LAYOUT LOCKSTEP (see ScrClosure's own definition, scr_runtime.h
+        // — grep "LAYOUT LOCKSTEP" there for the full site list): mirrors
+        // ScrClosure's field list EXACTLY (rc, fn, ncaps, props,
+        // trueOrig) — every site that casts &this struct to
+        // (ScrClosure *) reads straight through it, so a stale field
+        // list here reads PAST this struct's real end the moment any
+        // new ScrClosure field is added (measured: the immortal-closure
+        // identity comparison SIGSEGV'd on trueOrig garbage before this
+        // fix — a real closure has trueOrig=NULL, this one must too).
+        `static struct { size_t rc; void *fn; size_t ncaps; ScrBox *props; ScrClosure *trueOrig; } ${mangleFnClosure(name)} =`,
+        `    { SIZE_MAX, (void *)&${mangleWrapper(name)}, 0, NULL, NULL };`,
       );
     }
     // Construct-thunk definitions (prototyped with the class objects

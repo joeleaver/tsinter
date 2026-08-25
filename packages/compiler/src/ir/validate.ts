@@ -2594,6 +2594,20 @@ function validateFunction(
             err(`closure capture "${id}" type ${local.type.kind} != ${want.type.kind}`, e.loc);
           }
         });
+        // Board #89: identityOriginal must name an ACTUAL capture, and
+        // that capture's value must itself be func-typed — the field
+        // only ever marks "this closure IS transparently the value
+        // captured here", meaningful for func identity alone.
+        if (e.identityOriginal !== undefined) {
+          if (!e.captures.includes(e.identityOriginal)) {
+            err(`closure identityOriginal "${e.identityOriginal}" is not one of its own captures`, e.loc);
+          } else {
+            const local = locals.get(e.identityOriginal);
+            if (local && local.type.kind !== "func") {
+              err(`closure identityOriginal "${e.identityOriginal}" is not func-typed`, e.loc);
+            }
+          }
+        }
         // Result func type must match the target's signature. A VARIADIC
         // (rest-marked) type hides one synthetic trailing dyn-array param
         // in the lifted function (the thunk fills it) — the type's

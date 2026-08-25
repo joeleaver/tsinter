@@ -1280,7 +1280,18 @@ class LlEmitter {
       `%ScrLogArg = type { i32, i64 }`,
       `%ScrVt = type { i64, i64, ptr }`,
       `%ScrUnion = type { i64, i32, ptr, ptr, ptr, i64 }`,
-      `%ScrClosure = type { i64, ptr, i64, ptr }`,
+      // LAYOUT LOCKSTEP (see ScrClosure's own definition, scr_runtime.h
+      // — grep "LAYOUT LOCKSTEP" there for the full, corrected site
+      // list): a 5th field, trueOrig (ptr), appended after props —
+      // mirrors scr_runtime.h exactly. caps[] now starts at byte 40, not
+      // 32; every raw i8-GEP reaching for caps[i] must use the new
+      // offset. CORRECTION: this comment originally claimed "three
+      // sites, all in this file" — that count was WRONG, produced by a
+      // grep scoped to this file alone; llvm/dyn.ts has TWO MORE (its
+      // own caps[]-offset math is not visible from here), found only by
+      // running the full suite after this landed (board #89's own
+      // regression, see fix-89/FINDINGS.txt §2 bug 3). Five sites total.
+      `%ScrClosure = type { i64, ptr, i64, ptr, ptr }`,
       `%ScrRegex = type { i64, ptr, ptr, ptr }`,
       // ScrArr mirror { rc, len, cap, elem(i32+pad), elem_retain,
       // elem_release, elem_trace, data } — the immortal tagged-template
@@ -1906,7 +1917,13 @@ class LlEmitter {
         ret === "void" ? `  ${call}` : `  %r = ${call}`,
         ret === "void" ? `  ret void` : `  ret ${ret} %r`,
         `}`,
-        `@${mangleFnClosure(name)} = internal global %ScrClosure { i64 -1, ptr @${mangleWrapper(name)}, i64 0, ptr null }`,
+        // LAYOUT LOCKSTEP (see ScrClosure's own definition, scr_runtime.h):
+        // %ScrClosure grew a 5th field (trueOrig) — every struct-constant
+        // initializer of this type needs the matching value count or
+        // LLVM rejects the module outright (the C emitter's twin site,
+        // emission/emitter.ts, has the SAME shape, same fix, same
+        // measured failure without it).
+        `@${mangleFnClosure(name)} = internal global %ScrClosure { i64 -1, ptr @${mangleWrapper(name)}, i64 0, ptr null, ptr null }`,
         ``,
       );
     }
@@ -2975,7 +2992,10 @@ class LlEmitter {
     (fn.captures ?? []).forEach((c, i) => {
       const p = B.tmp();
       const box = B.tmp();
-      B.line(`${p} = getelementptr inbounds i8, ptr %sc_env, i64 ${32 + 8 * i} ; caps[${i}]`);
+      // LAYOUT LOCKSTEP (see ScrClosure's own definition, scr_runtime.h):
+      // caps[] starts at byte 40 now (%ScrClosure grew one field,
+      // trueOrig, at index 4 — see this file's own type decl above).
+      B.line(`${p} = getelementptr inbounds i8, ptr %sc_env, i64 ${40 + 8 * i} ; caps[${i}]`);
       B.line(`${box} = load ptr, ptr ${p}`);
       B.line(`store ptr ${box}, ptr %${mangleLocal(c.localId)} ; captured ${c.name}`);
     });
@@ -3951,6 +3971,17 @@ class LlEmitter {
         };
         if ((e.op === "===" || e.op === "!==") && e.left.type.kind === "bool") {
           B.line(`${t} = icmp ${e.op === "===" ? "eq" : "ne"} i1 ${l.name}, ${r.name}`);
+        } else if ((e.op === "===" || e.op === "!==") && e.left.type.kind === "func") {
+          // Board #89: chain-walk past any identity-transparent wrapper
+          // (funcCoerceAdapter's conversion/stranded mints, the 85-D4
+          // trampoline) BEFORE the pointer compare — every OTHER ref
+          // kind below stays a bare `icmp eq/ne ptr`, unaffected.
+          this.declare(`declare ptr @scr_closure_true(ptr)`);
+          const lt = B.tmp();
+          B.line(`${lt} = call ptr @scr_closure_true(ptr ${l.name})`);
+          const rt = B.tmp();
+          B.line(`${rt} = call ptr @scr_closure_true(ptr ${r.name})`);
+          B.line(`${t} = icmp ${e.op === "===" ? "eq" : "ne"} ptr ${lt}, ${rt}`);
         } else if ((e.op === "===" || e.op === "!==") && this.llType(e.left.type) === "ptr") {
           // Reference identity (JS object equality) — closures, arrays,
           // records compared as pointers, exactly the C `==`.
@@ -5010,9 +5041,24 @@ class LlEmitter {
           const box = this.loadBox(`%${mangleLocal(localId)}`);
           const retained = this.retainBox(box);
           const capp = B.tmp();
-          B.line(`${capp} = getelementptr inbounds i8, ptr ${c}, i64 ${32 + 8 * i} ; caps[${i}]`);
+          // LAYOUT LOCKSTEP (see ScrClosure's own definition,
+          // scr_runtime.h): caps[] starts at byte 40 (this file's type
+          // decl above).
+          B.line(`${capp} = getelementptr inbounds i8, ptr ${c}, i64 ${40 + 8 * i} ; caps[${i}]`);
           B.line(`store ptr ${retained}, ptr ${capp}`);
         });
+        // Board #89: construction above is COMPLETELY UNCHANGED — this
+        // is purely additive (C emitter's twin case has the full
+        // rationale). scr_box_get_ref already retains (+1).
+        if (e.identityOriginal !== undefined) {
+          this.declare(`declare ptr @scr_box_get_ref(ptr)`);
+          const obox = this.loadBox(`%${mangleLocal(e.identityOriginal)}`);
+          const orig = B.tmp();
+          B.line(`${orig} = call ptr @scr_box_get_ref(ptr ${obox})`);
+          const top = B.tmp();
+          B.line(`${top} = getelementptr inbounds %ScrClosure, ptr ${c}, i64 0, i32 4 ; trueOrig`);
+          B.line(`store ptr ${orig}, ptr ${top}`);
+        }
         return out;
       }
       case "callValue": {
@@ -6563,9 +6609,14 @@ class LlEmitter {
         // TRAMPOLINE instead — modeled on emitterFixedAdapter's own
         // capture-read + forward + release shape (board #75's own LLVM
         // adapter) — a real parameter for every wide-type param,
-        // forwarding the first k and releasing the rest. Identity is
-        // lost on this path (matches this lane's pre-#85 behavior
-        // exactly — board #89's residual, not a regression).
+        // forwarding the first k and releasing the rest. A NEW
+        // ScrClosure IS minted on this path — but board #89 (landed)
+        // makes it identity-TRANSPARENT: trueOrig (set below) is what
+        // scr_closure_true chain-walks through at every native identity
+        // site, so this trampoline answers as `v` there while still
+        // doing its own leak-safe ownership work when CALLED. Matches
+        // wasm's own marker family, already correct here via a
+        // completely different (GC) mechanism.
         if (e.value.type.kind !== "func" || e.type.kind !== "func") {
           throw new Error("llvm emitter bug: arityWiden operand/result must both be func-typed");
         }
@@ -6581,11 +6632,18 @@ class LlEmitter {
         const c = B.tmp();
         B.line(`${c} = call ptr @scr_closure_new(ptr @${trampoline}, i64 1)`);
         const capp = B.tmp();
-        B.line(`${capp} = getelementptr inbounds i8, ptr ${c}, i64 32 ; caps[0]`);
+        // LAYOUT LOCKSTEP (see ScrClosure's own definition,
+        // scr_runtime.h): caps[] starts at byte 40 (this file's type
+        // decl above) — the 85-D4 trampoline's own caps[0] write.
+        B.line(`${capp} = getelementptr inbounds i8, ptr ${c}, i64 40 ; caps[0]`);
         const box = B.tmp();
         B.line(`${box} = ${boxNewCall(this, e.value.type)}`);
         this.boxSet(box, e.value.type, v.name);
         B.line(`store ptr ${box}, ptr ${capp}`);
+        const trueOrigVal = this.retainValue(v.name, e.value.type);
+        const trueOrigP = B.tmp();
+        B.line(`${trueOrigP} = getelementptr inbounds %ScrClosure, ptr ${c}, i64 0, i32 4 ; trueOrig`);
+        B.line(`store ptr ${trueOrigVal}, ptr ${trueOrigP}`);
         return this.own({ name: c, type: e.type });
       }
       default: {
