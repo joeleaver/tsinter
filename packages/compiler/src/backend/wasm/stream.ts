@@ -419,12 +419,13 @@ export const RS_PIPE_ONEND = 55; // eq, nullable — the 'end' listener on THIS,
  * since its own execution trace never reaches the auto-end mechanism at
  * all). SEMANTICS.md briefly carried a draft S051 for THIS trap; it
  * never merged, so it was withdrawn rather than left registered for a
- * divergence that no longer exists here. The number was NOT left
- * permanently retired, though — it is now S051 for a genuinely
- * different divergence (the dyn-adapter phase's completion-callback
- * truthiness gap, `dynDoneClosFor`'s own trap) — a real reuse, not a
- * dangling citation; SEMANTICS.md S051 is live again, just for
- * something else entirely than what this comment used to point at. */
+ * divergence that no longer exists here. Because that draft never
+ * merged, the number was never occupied under the register's own
+ * permanence rule — so S051 was assigned normally, not reused, when a
+ * genuinely different divergence (the dyn-adapter phase's
+ * completion-callback truthiness gap, `dynDoneClosFor`'s own trap)
+ * needed an entry. SEMANTICS.md S051 is live, just for something else
+ * entirely than what this comment used to point at. */
 export const WS_ALLOW_HALF_OPEN = 56; // i32 bool
 /** CORRECTION (1690, both-sides autoDestroy): TRUE only for a stream
  * constructed via duplex.new/transform.new/passthrough.new (set

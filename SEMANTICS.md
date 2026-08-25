@@ -3456,3 +3456,48 @@ reproduced the whole thing." No corpus program can pin the truncation
 itself (1677/1680/1681 never read past line 0 by construction, and no
 claimed program constructs a full-message read against this family) —
 the unit pins are the only instrument for this entry.
+
+## S055 — `MaxListenersExceededWarning`: the native lanes print it SYNCHRONOUSLY with their OWN pid; the wasm tier does not print it at all yet *(per-lane; filed at the increment-22 close from the stage-A draft)*
+
+Node's leak warning ("(node:pid) MaxListenersExceededWarning: Possible
+EventEmitter memory leak detected. 11 evt listeners added to
+[EventEmitter]. MaxListeners is 10. Use emitter.setMaxListeners() to
+increase limit") carries the CALLING process's pid and is emitted via
+`process.emitWarning`, which defers the stderr write past the current
+synchronous section (measured at filing: the warning prints AFTER a
+marker logged after the 11th `.on()` and BEFORE a `setTimeout(0)`
+callback). The lanes here diverge two ways, both unavoidable or
+unbuilt:
+
+- **C/LLVM (shipping today):** the warning prints SYNCHRONOUSLY at the
+  `.on()` call that crosses the threshold — between the two markers
+  Node prints it after — and stamps THIS process's own pid (never the
+  oracle's; no two processes ever share one). Measured at filing: the
+  C binary reproduces Node's text byte-for-byte including the
+  "(node:pid)" prefix format and the "(Use `node --trace-warnings
+  ...`)" hint line; only the pid value and the position differ.
+- **wasm (current state):** the warning is UNBUILT — crossing the
+  threshold prints nothing at all. When it lands, it inherits the
+  synchronous-print stance below rather than inventing a third timing.
+
+**Rationale:** matching Node's pid is definitionally impossible (this
+process is never that process); matching the deferred-tick timing would
+route the warning through the stage-0 nextTick queue for zero corpus
+payoff, because NO lane can ever host a threshold-crossing corpus
+program under the byte-exact contract: the pid alone makes exit-0
+stderr matching impossible on the native lanes, and the wasm lane's
+current silence mismatches Node's stderr from the other direction. The
+C lane took the simpler synchronous print; the wasm lane inherits that
+stance when built (an `@exit:1` fixture — stderr excluded on nonzero
+exit, the S007/S010 bridge — is the only future corpus-pinnable shape,
+pinning that the warning FIRES and the process continues).
+
+**Tested by:** corpus-unpinnable in the exit-0 contract (above). The
+measurements of record are the filing-day probe (11 no-op listeners on
+one event, markers before/after the loop and on a `setTimeout(0)`):
+Node = deferred + its pid; C binary = synchronous + its own pid, text
+otherwise byte-identical to Node's including the hint line; wasm =
+silent. `scr_events_emitter.c`'s leak-warning comment ("SEMANTICS.md
+documents both" — the pid and the timing) cites THIS entry; filing it
+closes the leak-warning half of board #66 (the rawListeners half closed
+with S052).
