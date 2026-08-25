@@ -402,8 +402,9 @@ story nothing because there is no cycle it could ever need to detect.
 the LLVM lane that links it are TRANSITIONAL — AGENTS.md's own framing:
 "kept as executable semantics references until the wasm lane stands
 alone" — so they keep copying bytes across the boundary exactly as S014's
-body describes (board #23 tracks this as their own, now-explicitly-
-accepted divergence from Node, not a bug to fix on those lanes). The wasm
+body describes (board #23 — closed at increment 18 — recorded this as their
+own, explicitly-accepted divergence from Node, not a bug to fix on
+those lanes). The wasm
 lane, this project's future-primary target, boxes the SAME `$bytes` ref
 instead: `dynFrom` on a bytes value stores the existing struct reference
 directly, never a copy; `dynMatch`/`dynCheck` extraction hands back that
@@ -1285,8 +1286,10 @@ of kilobytes and full NFC is a Unicode-data-sized dependency, against a
 divergence that needs exotic input in a grid to observe at all. Node's own
 non-ICU builds behave the same way modulo normalization, so this is a
 stance Node itself ships. Removing the divergence means an NFC
-implementation plus current EAW data, best done once, shared with the case
-tables `toLowerCase`/`toUpperCase` are also waiting on.
+implementation plus current EAW data. (An earlier revision framed this
+as shared work with the then-unbuilt `toLowerCase`/`toUpperCase` case
+tables; increment 20 shipped those — `casing-tables.ts`/`casing.ts` —
+so the NFC/EAW work now stands alone.)
 
 **Tested by:** the wasm inspect unit tests pin `insp_width` by value
 against a 99-entry hand-checked table, including the code points where ICU
@@ -1859,8 +1862,8 @@ distinction V8 is actually making lives at a RAW-SOURCE level (was this
 token literally digits-and-exponent syntax, or an identifier lookup) that
 this tier's IR does not preserve past lowering; fixing it would mean
 carrying a provenance bit through `numLit` specifically for this case,
-which is frontend surgery out of scope for this fix round (see the
-board's #22 disposition). **Measured against the differential harness's
+which is frontend surgery out of scope for this fix round (board #90
+tracks the residue; #22 — this entry's own rewrite task — is closed). **Measured against the differential harness's
 REAL oracle invocation specifically — `node --experimental-transform-types`
 (`tests/harness/wasm-differential.test.ts`), not a third-party
 transpiler:** a naive verification via `tsx` (the popular esbuild-backed
@@ -1928,7 +1931,10 @@ currently measured to diverge:**
    canonical — a real, currently-unfixed residue of the leaf-Infinity-
    poisons rule, not a hypothetical. Out of scope for this fix round
    (frontend surgery to carry literal-vs-identifier provenance through
-   `numLit`); tracked for a future increment.
+   `numLit`); tracked as board #90 (filed at the increment-22 close —
+   the entry's only disposition citation, in the body paragraph above,
+   pointed at the closed rewrite task #22, leaving this residue
+   untracked).
 1. **Our folding boundary vs. V8's, otherwise.** This tier's boundary is:
    literal IR operands, recursively, with Infinity-as-leaf poisoned — an
    exact, testable rule. V8's is whatever V8's parser/optimizer actually
@@ -2268,8 +2274,9 @@ of delegation-aware state, genuinely new machinery beyond the finalizer
 linearization increment 19 stage B builds for ordinary `try`/`finally`.
 Left as registered debt.
 
-**Tested by:** no unit test yet — generator lowering does not exist before
-this increment's stage A. The Node-side claim above is independently
+**Tested by:** (written before increment 19 stage A built the generator
+lowering; the "Pinned" paragraph below records the pins that landed at
+the register close-out.) The Node-side claim above is independently
 triple-measured: this entry's own inline repro, `inc19-probes/
 probe-gen-ladder.ts`'s corner #11 (`11.delegate-log ["inner-finally"]`,
 run twice, identical both times), and `inc19-probes/
@@ -2377,8 +2384,9 @@ also close would need the desugar to route abrupt loop exits through a
 machinery, not a quick patch, and out of scope for what increment 19 stage
 0 registers. Left as registered debt.
 
-**Tested by:** no unit test yet — generator lowering does not exist before
-this increment's stage A. The Node-side claim above is independently
+**Tested by:** (written before increment 19 stage A built the generator
+lowering; the "Pinned" paragraph below records the pins that landed at
+the register close-out.) The Node-side claim above is independently
 quadruple-measured: this entry's own inline repro; `inc19-probes/
 probe-gen-ladder.ts`'s corner #12 (`12.break-closes ["gen-finally"]`,
 `12.return-closes ["gen2-finally"]`, run twice, identical both times);
@@ -2560,7 +2568,9 @@ witness the unbound receiver.
 ladder, and the wasm port transcribes that boundary rather than
 inventing a wider one. The real fix belongs at the LOWERING (thread
 the receiver into every dyn method call, not just the modeled names) —
-tracked as an open cross-lane bug, not registered away: this entry
+tracked as board #91 (filed at the increment-22 close; the "open
+cross-lane bug" this sentence promised had no item until then), not
+registered away: this entry
 records the CURRENT shared behavior so the wasm lane is not silently
 "more bound" or "less bound" than its siblings while the lowering fix
 waits. Related: the suspension half of the same bracket is FENCED, not
@@ -2841,7 +2851,7 @@ is the durable record. `readableLength` itself IS now pinned: 1744's
 own "wörld" case (11 units), corpus-verified. The RS_DEC_PENDING
 header cites this entry.
 
-## S048 — for-await early exit (`break`) leaves the Readable ALIVE — Node's async iterator destroys it *(wasm tier)*
+## S048 — for-await early exit (`break`) originally left the Readable ALIVE where Node's async iterator destroys it — RESOLVED by the stage D P4 build *(wasm tier; historical body below, current behavior in the P4 amendment)*
 
 Node's `Readable[Symbol.asyncIterator]` destroys the source stream
 when the loop exits early (break, return, or throw); the lowering
@@ -2877,12 +2887,15 @@ re-iteration observable means this tier SUPPRESSES a crash Node
 would raise, which is why that observable leads this entry's list
 rather than the property reads.
 
-**Tested by:** corpus-unpinnable until the destroy lands (a pinning
-program would have to observe one of the divergent columns and would
-fail against Node by construction); the measurements of record are
-the increment-22 stage-B gate's g-break probe and the mini-gate's
-shape decomposition (mg-break-alive, mg-break-observables,
-mg-break-then-iterate), restated in full above.
+**Tested by (HISTORICAL — superseded by the P4 amendment below):**
+while the divergence stood it was corpus-unpinnable (a pinning program
+would have failed against Node by construction); the measurements of
+record were the increment-22 stage-B gate's g-break probe and the
+mini-gate's shape decomposition (mg-break-alive, mg-break-observables,
+mg-break-then-iterate). Since the P4 build, the durable instruments are
+`wasm-stream-forawait.test.ts` (16 tests, two of them S049 regression
+guards — S048's own durable pins are the other 14) and the six-cell
+table in the amendment below.
 
 **STAGE D P4 AMENDMENT (rider #72 BUILT — this entry's own deferred
 build landed):** the wasm-tier divergence above is RESOLVED. The
@@ -3148,10 +3161,11 @@ are actually REPRESENTABLE in that union — `null` and `undefined`
 S051's own truthiness check at all. `0` and `false` are NOT
 representable in `(%Error|null|undefined)` at all, so they fail
 LOUDLY first, at the adapter's general union-exactness coercion layer
-(the same mechanism S049/S050's own C5 family already established for
-every other out-of-union dyn value — "a 'number'/'boolean' value is
-not representable in the target union" — a DIFFERENT trap site and
-message than S051's own `dynDoneClosFor` check below), before this
+(the FRONTEND's own checks in lowerer.ts — "a 'number'/'boolean' value
+is not representable in the target union (a value narrowed or asserted
+past it still held it)" — reported through S007's C5 `reportUncaught`
+machinery; a DIFFERENT trap site and message than S051's own
+`dynDoneClosFor` check below), before this
 entry's own dispatch ever runs. Measured directly (the reviewer's own
 five-shape isolation, z-falsy-{0,null,false,noarg,undefined}.cjs):
 `cb(null)`/`cb(undefined)`/`cb()` all MATCH Node (falsy,
@@ -3234,35 +3248,46 @@ the ordinary "extra arguments ignored" rule) needs a closure ADAPTED to
 the full tuple to be a valid element of the returned array's own
 uniform element type; `entryIdentity()`'s pre-existing consumers never
 needed that adaptation (`ref.eq` compares any two eq-typed refs
-regardless of their more specific type), so building it is deferred to
-the assert era (board item filed at this gate; Draft B's own
-"Tested by" sketch already anticipated `.listeners()`/`.rawListeners()`
-needing BOTH this adapter AND `assert.deepStrictEqual` before any claim
-can reach either — 1677 is the only corpus program calling either
-method today, and it is already blocked by the assert gap regardless).
-A `ref.test` guard catches this shape before the cast that would
-otherwise bare-trap, and reports it loudly and by name instead
-(S050/S051's own reportUncaught pattern) — the ordinary out-of-tier
-contract, not a second observable divergence needing its own entry.
+regardless of their more specific type). Building it was deferred to
+the assert era as board #75 — since BUILT (increment 22 stage D P3):
+`listenersOf`'s adapter cascade now mints identity-transparent adapter
+closures for narrower-arity entries (events.ts's own BOARD #75 header;
+the universal unwrap keeps `===` and removal-by-original answering the
+REAL listener), and 1677 claims. The `ref.test` guard's residual trap
+now covers only what the cascade genuinely cannot adapt — dyn-registered
+(`onDyn`-path) entries and the dedicated `'error'` bucket — reported
+loudly and by name (S007's C5 reportUncaught pattern, S050/S051's own
+use of it), the
+ordinary out-of-tier contract, not a second observable divergence
+needing its own entry.
 
 **Rationale:** inherited from the native lanes' identical
-representation choice (this backend's own C emitter comments already
-claimed "SEMANTICS.md documents both [the leak-warning and
-rawListeners divergences]" before either was actually filed — a stale
-citation this entry now makes true) — building a separate,
+representation choice. Two separate C-emitter comments claimed register
+coverage before anything was filed: `scr_events_emitter.c`'s
+rawListeners comment ("SEMANTICS.md documents the rawListeners
+divergence") — a stale citation THIS entry now makes true — and its
+leak-warning comment ("SEMANTICS.md documents both", where "both" means
+the warning's pid AND its synchronous timing), which still resolves to
+nothing (board #66; the drafted entry awaits filing). Building a separate,
 corpus-invisible wrapper OBJECT purely to give `rawListeners()`
 something different to point at would be representation work with no
 other consumer anywhere in this tier's EventEmitter surface, so the
 divergence is accepted rather than manufactured machinery to avoid it.
 
-**Tested by:** a corpus program registering via `.once()`, calling
-BOTH `listeners(name)` and `rawListeners(name)` afterward and asserting
-they answer `===`-identical elements (1677-emitter-listeners.ts already
-exercises adjacent territory — `listeners()`/`rawListeners()` over a
-mix of full/once entries — but stays blocked on `assert.deepStrictEqual`
-today; the eventual claim reuses its own listeners()/rawListeners()
-assertions once `libCall:assert.deepResult` lands, per this entry's own
-deferred-adapter note above).
+**Tested by:** the identity claim's coverage is a COMPOSITE of two
+instruments — no single one covers it: `wasm-listener-adapters.test.ts`'s
+"rawListeners() rides the identical adapter machinery (S052: no separate
+identity from listeners())" pin asserts `rawListeners('evt')[1] === bare`
+for an ADAPTED entry (registered `.on` with a narrower signature — board
+#75's shape, not the once-wrapper); the ONCE-registered half rides
+1677's own `listeners("evt")[2] === bare` (corpus line 25, claimed).
+Both methods lower to the single `emitter.listeners` libCall
+(lower-emitter.ts), so the two halves compose to cover this entry's
+claim. 1677-emitter-listeners.ts is CLAIMED (stage D P3,
+`libCall:assert.deepResult` + the board #75 adapter both landed) and
+exercises the adjacent surface — `listeners()`/`rawListeners()` over a
+mix of full/once entries — but reads only `rawListeners('evt').length`,
+never element identity, so the corpus alone does not pin this entry.
 
 ## S053 — `pipeline()` skips its pre-flight already-destroyed check; a stage destroyed before the call settles via the ordinary premature-close route instead of a synchronous throw *(wasm tier)*
 
