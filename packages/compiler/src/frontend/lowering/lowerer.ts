@@ -50,7 +50,7 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "../../ir/nodes.js";
-import { arrayOf, BOOL, canAdaptDynFuncTo, canConvertToDyn, canCrossIslandBoundary, canExitIslandToType, canMarshalTypedFuncIntoIsland, DYN, F64, isJsonSafeType, isUndefinedArmedUnion, isUnitType, JSVAL, RUNTIME_ERROR_CLASSES, STRING, typeEquals, UNDEFINED_T, VOID } from "../../ir/nodes.js";
+import { arrayOf, BOOL, canAdaptDynFuncTo, canConvertToDyn, canCrossIslandBoundary, canExitIslandToType, canMarshalTypedFuncIntoIsland, DYN, F64, isJsonSafeType, isUndefinedArmedUnion, isUnitType, JSVAL, pureArityDrop, RUNTIME_ERROR_CLASSES, STRING, typeEquals, UNDEFINED_T, VOID } from "../../ir/nodes.js";
 import { type DynamicImportResolution, type NpmBuiltinUse, type NpmLazyTrap } from "../npm.js";
 import { provenanceActive } from "../provenance-registry.js";
 import {
@@ -130,7 +130,8 @@ export type WidthLift =
   | { how: "narrow" }
   | { how: "dynIn" }
   | { how: "upcast" }
-  | { how: "funcAdapt" };
+  | { how: "funcAdapt" }
+  | { how: "arityWiden" };
 
 export class PoisonError extends Error {}
 
@@ -3155,6 +3156,15 @@ export class Lowerer {
         return { kind: "call", callee: adapter, args: [expr], type: expected, loc: expr.loc };
       }
     }
+    // Board #85: a PURE arity-drop (nothing but trailing params differ —
+    // see pureArityDrop's own doc) is an INVOCATION rule in JS, not a
+    // value-shape coercion — Node mints no new function object for it, so
+    // this must not either. Runs BEFORE funcCoerceAdapter so the identity-
+    // preserving path wins whenever it applies; anything needing real
+    // param/return conversion still falls through to the wrapper below.
+    if (expected.kind === "func" && expr.type.kind === "func" && pureArityDrop(expr.type, expected)) {
+      return { kind: "arityWiden", value: expr, type: expected, loc: expr.loc };
+    }
     // The GENERAL function-value adapter (funcCoerceAdapter): a function
     // whose signature differs from the slot's only by coercible pieces —
     // fewer parameters (JS ignores extras: `load(function () {})` into an
@@ -3493,6 +3503,13 @@ export class Lowerer {
     ) {
       return { how: "upcast" };
     }
+    // Board #85: a PURE arity-drop (nothing but trailing params differ)
+    // wins BEFORE the general funcAdapt check — identity-preserving, no
+    // wrapper minted (see pureArityDrop's own doc, coerceToExpected's
+    // twin check).
+    if (dst.kind === "func" && src.kind === "func" && pureArityDrop(src, dst)) {
+      return { how: "arityWiden" };
+    }
     // A FUNCTION into a slot whose signature differs only by CLEAN
     // mechanical conversions (fewer params — JS ignores extras — and
     // coercibleValue pieces): the general function-value adapter, plan-
@@ -3624,6 +3641,13 @@ export class Lowerer {
         const adapter = this.funcCoerceAdapter(value.type, dst, loc);
         if (!adapter) throw new Error("lowerer bug: planned funcAdapt lift failed to intern");
         return { kind: "call", callee: adapter, args: [value], type: dst, loc };
+      }
+      case "arityWiden": {
+        // Board #85: identity-preserving, no adapter to intern — the plan
+        // already proved pureArityDrop(value.type, dst) at widthLiftPlan
+        // time (the validator re-checks it too).
+        if (dst.kind !== "func" || value.type.kind !== "func") throw new Error("lowerer bug: arityWiden lift shape");
+        return { kind: "arityWiden", value, type: dst, loc };
       }
       default: {
         const _exhaustive: never = lift;
@@ -4453,7 +4477,22 @@ export class Lowerer {
    * result wraps as the slot union's undefined arm). Rest signatures on
    * either side decline (the pack shapes don't line up mechanically).
    * Null when any piece is outside coercibleValue — the exactness fences
-   * stay. */
+   * stay.
+   *
+   * BOARD #85 (landed): this always mints a new closure value — sound
+   * for every shape it still handles (real param/return coercibleValue
+   * conversion, or a STRANDED trap-only disposition the checker's loose
+   * function compatibility admitted), since those genuinely change what
+   * a call does and have no JS-level counterpart to preserve identity
+   * against. It no longer handles the PURE arity-drop subset (fewer
+   * params, every shared param/return type EXACT — pureArityDrop in
+   * ir/nodes.ts): both producers (this function's own callers in
+   * coerceToExpected and widthLiftPlan's funcAdapt arm) check that
+   * predicate FIRST and emit the identity-preserving `arityWiden` node
+   * instead, per Joe's ruling that a pure arity-drop is an invocation
+   * rule in JS — Node mints no new value for it, so this compiler must
+   * not either. The residual identity loss on THIS function's remaining
+   * (conversion-bearing / stranded) shapes is board #89, not this one. */
   funcCoerceAdapter(fromT: IrType & { kind: "func" }, toT: IrType & { kind: "func" }, loc: SrcLoc): string | null {
     if (fromT.rest === true || toT.rest === true) return null;
     if (fromT.params.length > toT.params.length) return null;

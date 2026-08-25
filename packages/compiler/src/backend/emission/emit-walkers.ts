@@ -1708,6 +1708,102 @@ export function jsonWriteHelper(E: CEmitter, t: IrType): string {
     return name;
   }
 
+/** Board #85 (85-D4, the fix round's own amendment): the arity-drop
+   * widening's ABSORBING TRAMPOLINE — built ONLY when at least one of
+   * the widening's DROPPED (trailing) params is refcounted.
+   *
+   * WHY THIS EXISTS (the leak the plain relabel path cannot avoid): every
+   * C-lane call site treats each argument as ownership-transferred to
+   * the callee (`callValue`'s own `moveTemp` per arg), regardless of
+   * whether the real underlying function reads it — a scalar dropped
+   * argument costs nothing to lose track of, but a REFCOUNTED one (a
+   * fresh string, array, union, object, ...) needs SOMEWHERE to be
+   * released, and the plain relabel (arityWiden's OTHER path — same
+   * pointer, no new value) leaves no parameter slot to hold it: the
+   * REAL function's own C signature only has ITS OWN (narrower) params.
+   * Measured directly (board #85 gate round): 2253-union-coercions.ts's
+   * own `Callback = (x?: string) => void` shape leaks exactly 1 union
+   * per call to the widened slot under RC_AUDIT; a computed (non-
+   * literal) trailing string leaks the same way — literals are compile-
+   * time interned/immortal here, so only NON-literal, non-scalar
+   * arguments reveal it.
+   *
+   * This trampoline has a REAL parameter for every one of the WIDE
+   * type's params — the SAME per-param ownership discipline any ordinary
+   * function gets — forwards the first `fromT.params.length` (the
+   * narrow source's own arity) to the real closure UNCHANGED (a pure
+   * arity-drop needs no value conversion, only fewer of them), and
+   * releases whatever refcounted params beyond that point it received
+   * but never forwards.
+   *
+   * IDENTITY, NAMED (not silently absorbed): this DOES mint a new
+   * ScrClosure — reference identity is LOST for this widening on this
+   * lane, exactly matching this lane's PRE-#85 behavior (funcCoerceAdapter
+   * always minted a wrapper too), so this is not a regression, just a
+   * residual — board #89 tracks it, merged with its own native-identity
+   * question. wasm's marker family (a different mechanism entirely —
+   * GC lets it avoid this class of leak by construction) stays correct
+   * for this exact shape: a real, permanent cross-lane split, recorded
+   * at landing, not implied by silence here.
+   *
+   * BUILD MECHANISM, LOAD-BEARING (per board #20's builder-ergonomics
+   * lesson — an invariant a future refactorer could break innocently):
+   * this function's body is HAND-WRITTEN TEXT pushed straight onto
+   * E.walkerProtos/E.walkerDefs, the SAME bucket dynFuncBoxHelper (just
+   * above) and the board #75 listener adapters use — it is deliberately
+   * NOT built by calling back into emitFunction/emitStmt. This helper
+   * can run WHILE the emitter is mid-walk of the enclosing function that
+   * triggered the arityWiden coercion (E's per-function locals/temp
+   * counters and CEmitter's shared mutable emission state are live at
+   * the call site); reentering the general statement/expression walker
+   * here would stomp that live state instead of appending a fully
+   * separate top-level function. If this trampoline ever needs to grow
+   * real control flow, build it as hand-written text like the rest of
+   * this function, not via a nested emitFunction call. */
+  export function arityDropTrampolineHelper(
+    E: CEmitter,
+    fromT: IrType & { kind: "func" },
+    toT: IrType & { kind: "func" },
+  ): string {
+    const key = `${typeKey(fromT)}=>${typeKey(toT)}`;
+    const existing = E.arityDropTrampolines.get(key);
+    if (existing) return existing;
+    const name = `sc_ad_${E.arityDropTrampolines.size}`;
+    E.arityDropTrampolines.set(key, name);
+    const k = fromT.params.length;
+    const paramDecls = toT.params.map((p, i) => cDecl(p, `a${i}`).trim());
+    const retC = cType(toT.ret).trim();
+    const sig = `static ${retC} ${name}(ScrClosure *c, ${paramDecls.join(", ")})`;
+    E.walkerProtos.push(`${sig}; /* board #85 arity-drop trampoline ${key} */`);
+    const d: string[] = [`${sig} { /* board #85 arity-drop trampoline ${key} */`];
+    // The captured original: a fresh +1 out of its box, borrowed for the
+    // call's duration, released right after — the box itself (c->caps[0])
+    // is borrowed for the whole call like any capture (emitFunction's own
+    // convention: "never released here").
+    d.push(`  ScrClosure *f = (ScrClosure *)scr_box_get_ref(c->caps[0]);`);
+    const castParams = ["ScrClosure *", ...fromT.params.map((p) => cType(p).trim())].join(", ");
+    const innerArgs = ["f", ...Array.from({ length: k }, (_, i) => `a${i}`)].join(", ");
+    const innerCall = `((${cType(fromT.ret).trim()} (*)(${castParams}))f->fn)(${innerArgs})`;
+    if (toT.ret.kind === "void") {
+      d.push(`  ${innerCall};`);
+    } else {
+      d.push(`  ${cDecl(toT.ret, "r")} = ${innerCall};`);
+    }
+    d.push(`  scr_closure_release(f);`);
+    // The DROPPED trailing params: release exactly the refcounted ones —
+    // this IS the fix (the plain relabel path has no parameter slot to
+    // do this in at all).
+    for (let i = k; i < toT.params.length; i++) {
+      if (isRefCounted(toT.params[i]!)) {
+        d.push(`  ${releaseCallC(toT.params[i]!, `a${i}`)};`);
+      }
+    }
+    if (toT.ret.kind !== "void") d.push(`  return r;`);
+    d.push(`}`, ``);
+    E.walkerDefs.push(...d);
+    return name;
+  }
+
 /** The adapter closure body for one TARGET signature: the emitted C
    * function a func-targeted dynCheck wraps a non-identical boxed
    * signature in. caps[0] is an untraced obj-box owning the dyn function

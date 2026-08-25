@@ -625,6 +625,39 @@ export function typeEquals(a: IrType, b: IrType): boolean {
   return a.kind === b.kind;
 }
 
+/** Board #85's scope predicate: true exactly when widening a `src`
+ * function type into a `dst` slot is a PURE arity-drop — `dst` has
+ * STRICTLY MORE params than `src`, every param `src` DOES declare is
+ * typeEquals-IDENTICAL to `dst`'s same-position param (not merely
+ * coercible — no wrap, no narrow, no dyn crossing), and the return
+ * types are typeEquals-IDENTICAL (or both void). No rest on either
+ * side (packs don't line up mechanically — the existing funcCoerceAdapter
+ * fence). This is deliberately NARROWER than cleanFuncAdaptable/
+ * coercibleValue: those admit real value-shape coercion on shared
+ * params/results (union wraps, dyn boundary crossings, checked narrows)
+ * and the "stranded" trap-only dispositions bivariant checker slack
+ * admits — none of which correspond to any real JS runtime behavior, so
+ * a wrapper still gets minted for them (board #89 tracks their identity
+ * residual). ONLY the shape covered here — where NOTHING besides the
+ * trailing param count differs — is the invocation-arity fact Node's own
+ * "extra arguments ignored" rule already covers with zero JS-level value
+ * conversion, which is why it alone gets the identity-preserving
+ * `arityWiden` node instead of a funcCoerceAdapter wrapper. Single
+ * source of truth for both producers (lowerer.ts's coerceToExpected and
+ * widthLiftPlan) and the validator (validate.ts) — never reimplement
+ * this check inline. */
+export function pureArityDrop(src: IrType, dst: IrType): boolean {
+  return (
+    src.kind === "func" &&
+    dst.kind === "func" &&
+    src.rest !== true &&
+    dst.rest !== true &&
+    src.params.length < dst.params.length &&
+    src.params.every((p, i) => typeEquals(p, dst.params[i]!)) &&
+    typeEquals(src.ret, dst.ret)
+  );
+}
+
 /** True for types whose values are heap-allocated and reference-counted.
  * The single dispatch point for the backend's RC machinery: retains,
  * releases, frame/scope tracking, and NULL-initialized locals all key off
@@ -4405,6 +4438,29 @@ export type IrExpr =
    * fulfillment payload (scr_await_void) and rejections flow untyped.
    * Ownership of the operand transfers to the result, like upcast. */
   | { kind: "promiseVoidWiden"; value: IrExpr; type: IrType; loc: SrcLoc }
+  /** A PURE ARITY-DROP function widening (board #85): `value`'s func type
+   * has STRICTLY FEWER params than `type`, every SHARED param position and
+   * the return type are typeEquals-IDENTICAL (no rest on either side) —
+   * the ONLY difference is trailing params `value` never sees. This is an
+   * INVOCATION rule in JS (extra call arguments are simply ignored), not a
+   * value-shape coercion — Node mints no new function object for it, so
+   * this node must not either: `value`'s reference identity survives
+   * through it. Distinct from `upcast`/`promiseVoidWiden` in that NO
+   * SINGLE representation covers every arity in the wasm backend (closure
+   * struct/func-ref pairs are exact-arity-typed there — see closSigFor);
+   * per-backend meaning: C/LLVM (uniformly-typed opaque closure pointer,
+   * calling-signature chosen fresh per call site) treat this as a literal
+   * type-only reinterpret exactly like upcast, zero runtime cost. wasm
+   * builds an identity-transparent marker adapter (board #75's
+   * listenerAdapterBase/listenerAdapterFn/universalUnwrapFn family,
+   * generalized) — a thin wrapper is unavoidable there (WasmGC func-refs
+   * require exact arity), but every identity-observing wasm op already
+   * consulting universalUnwrapFn sees straight through it. Never produced
+   * for the param/return-COERCING or STRANDED (trap-only) funcCoerceAdapter
+   * dispositions — those keep minting a real wrapper (board #89 tracks
+   * their own residual identity loss). Ownership of the operand transfers
+   * to the result, like upcast. */
+  | { kind: "arityWiden"; value: IrExpr; type: IrType; loc: SrcLoc }
   /** Checker-trusted narrowing of a base-class value to a subclass (`type`
    * is the subclass). The frontend emits this only where tsc's control-flow
    * narrowing has already proven the dynamic class (an `instanceof` guard)

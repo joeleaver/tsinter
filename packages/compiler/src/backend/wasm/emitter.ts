@@ -1970,6 +1970,26 @@ class Assembler {
    * universal version makes the question moot, and "every identity site
    * calls the one unwrap" is a greppable invariant instead of N separate
    * type-reasoning arguments a reviewer would otherwise have to redo.
+   * GREPPABLE INVARIANT, restated for grep: EVERY wasm-side identity
+   * comparison over a func-typed operand MUST call `universalUnwrapFn()`
+   * on that operand first — bin "==="/"!==" (func case), assert.refEqFn,
+   * and (transitively, via %assert.deq.N's plain bin "===") array-of-
+   * func deep-equality already do; a NEW identity site must too, or it
+   * silently reads the WRAPPER's own identity instead of the value a
+   * marker represents. Board #85 (arityWiden, its own section below)
+   * is a SECOND caller of this exact family — listenerAdapterBase/
+   * listenerAdapterFn/universalUnwrapFn take no listener-specific
+   * assumptions (verified by reading, not asserted): the marker struct
+   * is keyed by `clos` alone, the trampoline is parameterized by
+   * (clos, fn, fullParams, results, k), and `universalUnwrapBases`/
+   * `finalizeListenerUnwrap` are populated and read purely by STRUCT
+   * TYPE INDEX, with no reference anywhere to WHO minted a given base
+   * or WHEN relative to other callers (the DEFERRED FINALIZATION note
+   * below already establishes any-caller-any-order for board #75 alone;
+   * a second, unrelated caller changes nothing about that argument —
+   * it is exactly one more entry in the same list). This is the
+   * caller-agnostic audit board #85's own gate required as a named
+   * build-time verification rather than an assumption.
    *
    * DISJOINTNESS BY CONSTRUCTION (why cascade order never matters):
    * `listenerAdapterBase` is cached per `clos` — one marker struct per
@@ -2101,41 +2121,127 @@ class Assembler {
 
   /** Builds the universal unwrap's BODY: `v` unchanged, unless it is an
    * instance of ANY marker base ever minted (cascaded, disjoint by
-   * construction — see this section's own header), in which case that
-   * one's captured ORIGINAL comes back instead. Called exactly once,
-   * from `Assembler.run()` right after the main per-function walk loop
-   * — see this section's own DEFERRED FINALIZATION note for why that
-   * point, and why finalization is unconditional (once referenced) even
-   * with zero accumulated bases. A no-op if `universalUnwrapFn` was
-   * never called by anything (no identity site anywhere in the module
-   * needed it) — nothing to finalize, and declaring the type/function
-   * eagerly for a module that never uses it would be pure waste. */
+   * construction — see this section's own header), in which case the
+   * cascade ITERATES TO FIXPOINT (board #85's F1 fix, rev-85's finding):
+   * a v whose extracted capture is ITSELF a marker (a widening chained
+   * on top of another widening — `narrow` -> `mid` -> `wide`, each step
+   * a genuine pureArityDrop) re-enters the SAME cascade against the
+   * newly-extracted value, repeating until a non-marker is reached. A
+   * SINGLE PASS (the pre-fix shape) answered the intermediate marker
+   * instead of the true original — sound only for board #75 alone,
+   * whose adapters ever only captured real user closures; #85's
+   * producer can capture ANOTHER marker (arityWiden's source expression
+   * may itself be the runtime result of an earlier arityWiden), so
+   * depth > 1 is a real, reachable shape once #85 exists in the marker
+   * family, not a hypothetical.
+   *
+   * TERMINATION (falsifiable — read this before trusting the loop
+   * terminates): a marker's captured field is ALWAYS a value that
+   * EXISTED BEFORE the marker did — `listenerAdapterBase`/`arityWiden`'s
+   * own emission both capture an ALREADY-EVALUATED operand into a
+   * FRESHLY `struct.new`'d marker; nothing in this module ever mutates
+   * a marker's captured field after construction (it is declared
+   * immutable at the struct-type level, `mutable: false`, both fields).
+   * So the chain `v -> v.captured -> v.captured.captured -> ...` is
+   * STRICTLY MONOTONIC in construction order and therefore ACYCLIC BY
+   * CONSTRUCTION — a value can never (directly or transitively) capture
+   * itself, so the loop below cannot spin forever; it terminates the
+   * first time it reaches a value that fails every `ref.test` (a real,
+   * non-marker closure, which — per the DISJOINTNESS note below — is
+   * the loop's own only exit condition on any finite input).
+   *
+   * NESTED-TRAMPOLINE CORRECTNESS (why CALLING a chained marker already
+   * worked before this fix, and why only THIS unwrap needed changing):
+   * `listenerAdapterBase(clos, fn)` declares the marker struct as a
+   * `sub` of `clos` — the DESTINATION type of whichever widening minted
+   * it. So a marker built for `mid` (`narrow` -> `mid`) is itself a
+   * valid `mid`-typed value by ordinary WasmGC struct subtyping; a
+   * SECOND widening's trampoline (`mid` -> `wide`) that `refCast`s its
+   * captured field down to `mid`'s own clos type and `callRef`s it
+   * therefore succeeds on a marker EXACTLY as it would on a real
+   * `mid`-typed closure — dispatching into the marker's OWN trampoline,
+   * which does its own extract-and-call one level further down. Nested
+   * trampolines cascade correctly through ordinary subtyping with ZERO
+   * extra work, at any depth, and never needed fixing — only IDENTITY
+   * COMPARISON (this function) ever answered the wrong value, because
+   * it is the one place a marker's presence is observed rather than
+   * dispatched through.
+   *
+   * CROSS-FAMILY COMPOSITION (no pin exists for this — read before
+   * lifting the fence that currently blocks it): a board #75 listener
+   * adapter capturing a board #85 arityWiden marker (or the reverse) is
+   * SC1090-unreachable today (rev-85 confirmed, base-identical) — no
+   * corpus or hand-written program can currently construct that shape.
+   * This loop is PROVENANCE-AGNOSTIC by construction (every `ref.test`
+   * below runs against `universalUnwrapBases`, one list shared by every
+   * marker-minting call site regardless of which board's code minted a
+   * given base — see the DISJOINTNESS note), so it already covers the
+   * composed shape correctly; if that SC1090 fence is ever lifted, this
+   * loop needs NO change, but board #75/#85's own gates should still
+   * confirm it with a real pin at that time, not just infer it from
+   * this note.
+   *
+   * Called exactly once, from `Assembler.run()` right after the main
+   * per-function walk loop — see this section's own DEFERRED
+   * FINALIZATION note for why that point, and why finalization is
+   * unconditional (once referenced) even with zero accumulated bases. A
+   * no-op if `universalUnwrapFn` was never called by anything (no
+   * identity site anywhere in the module needed it) — nothing to
+   * finalize, and declaring the type/function eagerly for a module that
+   * never uses it would be pure waste. */
   private finalizeListenerUnwrap(): void {
     if (this.universalUnwrapFnField === null || this.universalUnwrapFinalized) return;
     this.universalUnwrapFinalized = true;
     const c = new Code();
+    c.loop();
     this.emitUniversalUnwrapCascade(c, this.universalUnwrapBases, 0);
+    c.end(); // closes the loop — no-match falls through to here, exiting it
+    c.localGet(0); // the fixpoint: local 0 has been overwritten on every
+    // match, so this is either the original param (zero matches ever, incl.
+    // the zero-bases edge) or the last extracted, now-non-marker value.
     this.mb.setBody(this.universalUnwrapFnField, [], c.bytes());
   }
 
   /** `bases[i..]` tried in order (irrelevant which, per this section's
    * own DISJOINTNESS note) — the LAST arm (`i >= bases.length`) is the
-   * cascade's own base case: plain identity, reached always when
-   * `bases` is empty (the zero-adapters-anywhere-in-the-module edge the
-   * gate required pinned by execution, not just validation). Standalone
-   * helper body (own `Code`, hand-counted depths, `this.fn` untouched —
-   * `equalsHelper`/`entryIdentity`/`dynFnAdapter`'s own convention). */
+   * cascade's own base case: NO match at this iteration, so the whole
+   * nested void-`if`/`else` structure falls through with no instruction
+   * emitted, which falls through the enclosing `loop` (a `loop` never
+   * repeats on natural fallthrough — only an explicit `br` back to it
+   * does, which is exactly what the MATCH arm below performs, and
+   * exactly what the no-match arm does NOT), exiting to
+   * `finalizeListenerUnwrap`'s trailing `local.get 0`. Reached always
+   * when `bases` is empty (the zero-adapters-anywhere-in-the-module
+   * edge the gate required pinned by execution, not just validation) —
+   * an empty `loop` body still executes its zero iterations cleanly and
+   * falls through immediately, so this edge needs no special case.
+   *
+   * The MATCH arm (bases[i] matched) OVERWRITES local 0 with the
+   * captured field and `br`s back to the enclosing `loop` instead of
+   * producing a stack value — depth `i + 1` because the branch sits
+   * inside exactly `i + 1` nested `if` blocks (this level's own, plus
+   * one per base already tried and not matched) with the `loop`
+   * immediately outside all of them; re-entering the loop re-runs this
+   * SAME cascade against the newly-extracted (possibly-still-a-marker)
+   * value, which is the iterate-to-fixpoint step (see
+   * `finalizeListenerUnwrap`'s own TERMINATION note for why this always
+   * ends). Standalone helper body (own `Code`, hand-counted depths,
+   * `this.fn` untouched — `equalsHelper`/`entryIdentity`/
+   * `dynFnAdapter`'s own convention); VOID-typed throughout now (no
+   * `ifResult`/stack-threaded value anywhere) since the loop
+   * communicates purely through local 0 across iterations. */
   private emitUniversalUnwrapCascade(c: Code, bases: readonly number[], i: number): void {
     if (i >= bases.length) {
-      c.localGet(0);
       return;
     }
     c.localGet(0);
     c.refTest(bases[i]!);
-    c.ifResult(EQ_REF);
+    c.ifVoid();
     c.localGet(0);
     c.refCast(bases[i]!);
     c.structGet(bases[i]!, 1);
+    c.localSet(0);
+    c.br(i + 1); // escapes this if + i enclosing ifs, reaching the loop
     c.else_();
     this.emitUniversalUnwrapCascade(c, bases, i + 1);
     c.end();
@@ -11704,6 +11810,74 @@ class Assembler {
         return;
       }
 
+      case "arityWiden": {
+        // Board #85: a PURE arity-drop (predicate + full grounding in
+        // ir/nodes.ts's pureArityDrop, validator-enforced) needs a marker
+        // wrapper here — unlike object "upcast" above, WasmGC closure
+        // struct/func-ref pairs are EXACT-ARITY-typed (closSigFor), so
+        // there is no subtype relation a bare relabel could ride.
+        // Generalizes board #75's listener-snapshot adapter family
+        // (listenerAdapterBase/listenerAdapterFn): the SAME marker-
+        // struct-subtypes-clos + universalUnwrapFn cascade this backend
+        // already consults at every identity site it has (bin ===/!==,
+        // assert.refEqFn, and — via %assert.deq.N's own plain bin "===" —
+        // assert.deepStrictEqual over function-element arrays) makes this
+        // wrapper INVISIBLE at all three with ZERO new identity-site
+        // code: the cascade is keyed purely off marker STRUCT TYPE,
+        // agnostic to who minted it (see the section's own DEFERRED
+        // FINALIZATION note — any caller, any order). The trampoline
+        // body IS listenerAdapterFn's existing k-of-N shape (drop the
+        // trailing params, call the captured original with the rest) —
+        // that shape already IS the arity-drop invocation rule; board
+        // #75 just reached it from a different producer (a listener()
+        // snapshot's heterogeneous-arity array) than this single
+        // statically-known coercion site does. Soundness of reusing
+        // listenerAdapterFn's OWN destParams-sliced-to-k prefix (rather
+        // than deriving the prefix from `from` directly): pureArityDrop
+        // requires every shared param typeEquals-identical, and mapType
+        // is a deterministic type-directed mapping (the mapType-lockstep
+        // invariant), so slicing `to`'s own params to the first k
+        // produces the IDENTICAL wasm type `closSigFor(from)` would —
+        // the same content-addressed closPairFor key either way.
+        const from = e.value.type;
+        const to = e.type;
+        if (from.kind !== "func" || to.kind !== "func") {
+          throw new Error("wasm emitter bug: arityWiden operand/result must both be func-typed");
+        }
+        const destPair = this.closSigFor(to, e.loc);
+        if (destPair === null) {
+          code.unreachable();
+          return;
+        }
+        const destParams: ValType[] = [];
+        for (const p of to.params) {
+          const v = this.mapType(p, e.loc);
+          if (v === null) {
+            code.unreachable();
+            return;
+          }
+          destParams.push(v);
+        }
+        let destResults: ValType[];
+        if (to.ret.kind === "void") {
+          destResults = [];
+        } else {
+          const r = this.mapType(to.ret, e.loc);
+          if (r === null) {
+            code.unreachable();
+            return;
+          }
+          destResults = [r];
+        }
+        const k = from.params.length;
+        const base = this.listenerAdapterBase(destPair.clos, destPair.fn);
+        const adapterFn = this.listenerAdapterFn(destPair.clos, destPair.fn, destParams, destResults, k);
+        code.refFunc(adapterFn);
+        this.walkExpr(e.value);
+        code.structNew(base);
+        return;
+      }
+
       /* `obj.n++` — read, write ±1, yield old (postfix) or new (prefix),
        * the incDec discipline over a struct slot. The receiver evaluates
        * ONCE (JS's MemberExpression evaluation), so it is parked in a
@@ -14622,23 +14796,30 @@ class Assembler {
           return;
         }
         if (k === "func") {
-          // Board #75's identity-transparency rule: a func-typed operand
-          // may be an adapter-wrapped listener()/rawListeners() snapshot
-          // element (this pass's own new machinery — see the "board #75"
-          // section above for the full grounding, including WHY the
-          // unwrap is the UNIVERSAL one, not a per-type lookup). Unwrap
-          // BOTH operands through the ONE universal function — every
-          // identity site in this backend calls the same helper, a
-          // greppable invariant. This fix DOES make the frontend's
-          // synthesized `%assert.deq.N` deep-equality helper correct for
-          // both a direct `bin "==="` over two snapshot-derived operands
-          // AND an array-of-functions comparison where BOTH sides came
-          // from a listeners() snapshot (deepEqHelper's own `case
-          // "func"` lowers to exactly this node, measured for both
-          // shapes) — it does NOT cover a WIDENED-comparand shape (one
-          // side is an adapter, the other a bare narrower-arity original
-          // that was never itself snapshotted); that residual gap is
-          // board #85, not fixed here.
+          // Board #75's identity-transparency rule, EXTENDED by board #85:
+          // a func-typed operand may be an adapter-wrapped listener()/
+          // rawListeners() snapshot element (board #75 — see the "board
+          // #75" section above for the full grounding, including WHY the
+          // unwrap is the UNIVERSAL one, not a per-type lookup) OR a
+          // pure-arity-drop widening's marker (board #85's arityWiden —
+          // see finalizeListenerUnwrap's own header for the shared
+          // marker family, the iterate-to-fixpoint loop that answers a
+          // CHAINED widening's true original rather than an intermediate
+          // marker, and the termination/nested-trampoline/cross-family
+          // notes there). Unwrap BOTH operands through the ONE universal
+          // function — every identity site in this backend calls the
+          // same helper, a greppable invariant. This fix DOES make the
+          // frontend's synthesized `%assert.deq.N` deep-equality helper
+          // correct for both a direct `bin "==="` over two snapshot- or
+          // widened-derived operands AND an array-of-functions comparison
+          // where either side came from a listeners() snapshot or a pure
+          // arity-drop (deepEqHelper's own `case "func"` lowers to
+          // exactly this node, measured for these shapes) — it does NOT
+          // cover funcCoerceAdapter's CONVERSION-BEARING or STRANDED
+          // (trap-only) wrappers (real param/return value coercion, not
+          // an invocation-arity fact — those still mint an ordinary
+          // closure, never a marker); that residual is board #89, not
+          // fixed here.
           if (this.mapType(e.left.type, e.loc) === null || this.mapType(e.right.type, e.loc) === null) {
             code.unreachable();
             return;

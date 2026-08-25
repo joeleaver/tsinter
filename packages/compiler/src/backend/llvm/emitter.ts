@@ -6541,6 +6541,53 @@ class LlEmitter {
         this.moveTemp(v);
         return this.own({ name: v.name, type: e.type });
       }
+      case "arityWiden": {
+        // Board #85: every func type is one opaque `ptr` here (no LLVM
+        // type distinguishes signatures — callValue declares its own
+        // arg types fresh at each call instruction, never reading
+        // anything off the closure's construction), so a pure arity-
+        // drop widening is the SAME pointer, ownership transfers,
+        // type-only — identical to upcast/promiseVoidWiden. See the C
+        // emitter's twin case for the full ABI-safety grounding (board
+        // #85 gate 1, measured under this project's actual toolchain
+        // and sanitized-lane flags).
+        // TRIPWIRE: relies on unread-trailing-args through the uniform
+        // closure ABI — see fix-85 gate1 record; would need revisiting
+        // if UBSan function-type checks or CFI are ever enabled.
+        //
+        // 85-D4 SPLIT (see the C emitter's twin case for the full
+        // grounding — arityDropTrampolineHelper there, arityDropTrampolineFor
+        // here): the relabel above leaks whenever a DROPPED (trailing)
+        // param is refcounted (measured: 2253-union-coercions.ts's own
+        // Callback shape). When that's the case, mint an ABSORBING
+        // TRAMPOLINE instead — modeled on emitterFixedAdapter's own
+        // capture-read + forward + release shape (board #75's own LLVM
+        // adapter) — a real parameter for every wide-type param,
+        // forwarding the first k and releasing the rest. Identity is
+        // lost on this path (matches this lane's pre-#85 behavior
+        // exactly — board #89's residual, not a regression).
+        if (e.value.type.kind !== "func" || e.type.kind !== "func") {
+          throw new Error("llvm emitter bug: arityWiden operand/result must both be func-typed");
+        }
+        const k = e.value.type.params.length;
+        const droppedRefcounted = e.type.params.slice(k).some((p) => isRefCounted(p));
+        const v = this.emitExpr(e.value);
+        this.moveTemp(v);
+        if (!droppedRefcounted) {
+          return this.own({ name: v.name, type: e.type });
+        }
+        const trampoline = this.arityDropTrampolineFor(e.value.type, e.type);
+        this.declare(`declare ptr @scr_closure_new(ptr, i64)`);
+        const c = B.tmp();
+        B.line(`${c} = call ptr @scr_closure_new(ptr @${trampoline}, i64 1)`);
+        const capp = B.tmp();
+        B.line(`${capp} = getelementptr inbounds i8, ptr ${c}, i64 32 ; caps[0]`);
+        const box = B.tmp();
+        B.line(`${box} = ${boxNewCall(this, e.value.type)}`);
+        this.boxSet(box, e.value.type, v.name);
+        B.line(`store ptr ${box}, ptr ${capp}`);
+        return this.own({ name: c, type: e.type });
+      }
       default: {
         // Exhaustive: phase 6 claimed the last IR expression kinds.
         const _exhaustive: never = e;
@@ -7920,6 +7967,77 @@ class LlEmitter {
     d.push(`  call void @scr_closure_release(ptr %orig)`, `  ret void`, `}`, ``);
     this.resolveThunkDefs.push(...d);
     return { fn: sym, shim };
+  }
+
+  /** Board #85 (85-D4): the arity-drop widening's ABSORBING TRAMPOLINE —
+   * see emit-exprs.ts's twin C-lane comment and emit-walkers.ts's
+   * arityDropTrampolineHelper for the full grounding (the leak the plain
+   * relabel path cannot avoid, measured on 2253-union-coercions.ts).
+   * Modeled directly on emitterFixedAdapter's own shape immediately
+   * above (board #75's LLVM listener adapter: read the one capture box,
+   * dispatch through the closure's own `fn`, release what isn't
+   * forwarded) — the STATICALLY-TYPED case of that same pattern: every
+   * argument here already has its real, declared type (no va_list
+   * boundary to cross, unlike the listener adapter's C-shim-fed
+   * slots), so params are declared and forwarded directly, and the
+   * TRAILING (dropped) ones beyond the narrow source's own arity are
+   * released — exactly the parameter slots the plain relabel path has
+   * no function to put them in. Interned per `fromT=>toT` typeKey pair,
+   * sharing the resolveThunks/-Defs registries (this file's own generic
+   * "interned helper, defined once, referenced anywhere" bucket —
+   * despite the name, it is not resolve-thunk-specific; see its own
+   * declaration site).
+   *
+   * BUILD MECHANISM, LOAD-BEARING (same durability note as the C-lane
+   * twin in emit-walkers.ts — per board #20's builder-ergonomics lesson):
+   * this method assembles its body as HAND-WRITTEN LLVM IR TEXT pushed
+   * onto `d`/`resolveThunkDefs`, exactly like `emitterFixedAdapter`
+   * above it, and deliberately does NOT walk back through this class's
+   * general statement/expression emission path. It can run WHILE the
+   * caller is mid-emission of the enclosing function that triggered the
+   * arityWiden coercion — that function's own `B` builder and this
+   * emitter's shared temp/label counters are live at the call site;
+   * reentering the general walker here would stomp that live state
+   * instead of appending an independent top-level `define`. If this
+   * trampoline ever needs real control flow, keep building it as
+   * hand-written text, not via a nested walk. */
+  private arityDropTrampolineFor(fromT: IrType & { kind: "func" }, toT: IrType & { kind: "func" }): string {
+    const key = `ad:${typeKey(fromT)}=>${typeKey(toT)}`;
+    const existing = this.resolveThunks.get(key);
+    if (existing) return existing;
+    const sym = `sc_ad_${this.resolveThunks.size}`;
+    this.resolveThunks.set(key, sym);
+    this.declare(`declare ptr @scr_box_get_ref(ptr)`);
+    this.declare(`declare void @scr_closure_release(ptr)`);
+    const k = fromT.params.length;
+    const paramDecls = toT.params.map((p, i) => `${this.llType(p)} %a${i}`).join(", ");
+    const retTy = this.llType(toT.ret);
+    const d: string[] = [
+      `define internal ${retTy} @${sym}(ptr %cb${paramDecls ? ", " + paramDecls : ""}) ${FN_ATTRS} { ; board #85 arity-drop trampoline ${typeKey(fromT)}=>${typeKey(toT)}`,
+      `entry:`,
+      `  %capsp = getelementptr inbounds %ScrClosure, ptr %cb, i64 1`,
+      `  %bx = load ptr, ptr %capsp`,
+      `  %orig = call ptr @scr_box_get_ref(ptr %bx) ; the narrow closure, +1`,
+      `  %fnp = getelementptr inbounds %ScrClosure, ptr %orig, i64 0, i32 1`,
+      `  %fn = load ptr, ptr %fnp`,
+    ];
+    const innerArgs = ["ptr %orig", ...Array.from({ length: k }, (_, i) => `${this.llType(toT.params[i]!)} %a${i}`)].join(", ");
+    const innerRetTy = this.llType(fromT.ret);
+    if (innerRetTy === "void") {
+      d.push(`  call void %fn(${innerArgs})`);
+    } else {
+      d.push(`  %r = call ${innerRetTy} %fn(${innerArgs})`);
+    }
+    d.push(`  call void @scr_closure_release(ptr %orig)`);
+    for (let i = k; i < toT.params.length; i++) {
+      const p = toT.params[i]!;
+      if (isRefCounted(p)) {
+        d.push(`  call void ${releaseSym(this, p)}(ptr %a${i})`);
+      }
+    }
+    d.push(retTy === "void" ? `  ret void` : `  ret ${retTy} %r`, `}`, ``);
+    this.resolveThunkDefs.push(...d);
+    return sym;
   }
 
   /** The wrapper closure a fixed-arity adapter dispatches through: fn =

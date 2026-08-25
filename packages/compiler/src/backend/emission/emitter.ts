@@ -214,6 +214,13 @@ export class CEmitter {
   readonly promiseDynAdapters = new Map<string, string>();
   readonly recordKeyGetFns = new Map<string, string>();
   readonly recordKeySetFns = new Map<string, string>();
+  /** Board #85 (85-D4): the arity-drop widening's ABSORBING TRAMPOLINE,
+   * per `fromT=>toT` typeKey pair — see arityDropTrampolineHelper
+   * (emit-walkers.ts) for the full grounding. Only interned when at
+   * least one of the widening's DROPPED (trailing) params is refcounted
+   * (sc_ad_*); the plain relabel path (no dropped param refcounted)
+   * never touches this map. */
+  readonly arityDropTrampolines = new Map<string, string>();
   readonly walkerProtos: string[] = [];
   readonly walkerDefs: string[] = [];
   /** Island host-call adapters, interned per (arity, void-ness): the one

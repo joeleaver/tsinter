@@ -6,7 +6,7 @@ import { arrayOf, BOOL, BYTES_U8, bytesOf, canMarshalFuncIntoIsland, CHILDSTREAM
 import { boxAccess, BYTES_NUM_KIND_C, BYTES_NUM_VAR_C, bytesElemKindC, cDecl, cFnPtrCast, cNumberLiteral, cStringLiteral, cType, DV_GET_KIND_C, DV_SET_KIND_C, elemAccess, mapKeyAccess, mapKeyKindC, mapValKindC, retainCallC, vAdapters } from "./emit-types.js";
 import { mangleClassNew, mangleClassRetain, mangleClassStruct, mangleField, mangleFnClosure, mangleFunction, mangleGlobal, mangleLocal, mangleRecordNew, mangleRecordStruct, mangleVtStruct } from "../mangle.js";
 import { OVERFLOW_MEMBER } from "./emit-shapes.js";
-import { dynDestrCheckHelper, dynIterNHelper, dynKeyGetHelper } from "./emit-walkers.js";
+import { arityDropTrampolineHelper, dynDestrCheckHelper, dynIterNHelper, dynKeyGetHelper } from "./emit-walkers.js";
 import { genResultThunkFor } from "./emit-async.js";
 
 
@@ -1620,6 +1620,58 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
         const v = E.emitExpr(e.value);
         E.moveTemp(v);
         return E.newTemp(e.type, v.name);
+      }
+      case "arityWiden": {
+        // Board #85: every func type compiles to ONE C representation
+        // (ScrClosure*, cType's "func" case) whose callable-code field is
+        // untyped (void *fn) and cast fresh to the desired signature at
+        // EACH CALL SITE (cFnPtrCast, keyed off the callee expression's
+        // own static type — never off anything baked into the closure's
+        // construction). A pure arity-drop widening therefore needs no
+        // new value at all — same pointer, ownership transfers, type-only,
+        // exactly like upcast/promiseVoidWiden. Calling this value later
+        // through the wider signature passes extra trailing arguments the
+        // real function never reads; measured safe under this project's
+        // actual toolchain and sanitized-lane flags (board #85 gate 1;
+        // see packages/compiler/test/board85-arity-widen.test.ts's
+        // mixed-register-class pins for the cross-lane behavioral half).
+        // TRIPWIRE: relies on unread-trailing-args through the uniform
+        // closure ABI — see fix-85 gate1 record; would need revisiting
+        // if UBSan function-type checks or CFI are ever enabled.
+        //
+        // 85-D4 SPLIT: the relabel above is safe ONLY when every DROPPED
+        // (trailing) param is a plain scalar — a refcounted one has no
+        // parameter slot in the real (narrower) function to be released
+        // through, so the caller's ownership transfer at the call site
+        // is silently lost (measured: 2253-union-coercions.ts's own
+        // Callback shape leaks exactly 1 union per call under RC_AUDIT;
+        // any non-literal/non-scalar dropped argument does the same —
+        // see arityDropTrampolineHelper's own header for the full
+        // grounding). When any dropped param IS refcounted, this mints
+        // an ABSORBING TRAMPOLINE instead — a real parameter for every
+        // wide-type param, forwarding the first k and releasing the
+        // rest. IDENTITY IS LOST on this path (a new ScrClosure IS
+        // minted) — this matches the lane's OWN pre-#85 behavior
+        // exactly (funcCoerceAdapter always wrapped too), so it is a
+        // named residual (board #89), not a regression; wasm's marker
+        // family stays correct for this exact shape via a completely
+        // different mechanism (GC avoids this leak class by
+        // construction) — a real, permanent cross-lane split.
+        if (e.value.type.kind !== "func" || e.type.kind !== "func") {
+          throw new Error("emitter bug: arityWiden operand/result must both be func-typed");
+        }
+        const k = e.value.type.params.length;
+        const droppedRefcounted = e.type.params.slice(k).some((p) => isRefCounted(p));
+        const v = E.emitExpr(e.value);
+        E.moveTemp(v);
+        if (!droppedRefcounted) {
+          return E.newTemp(e.type, v.name);
+        }
+        const trampoline = arityDropTrampolineHelper(E, e.value.type, e.type);
+        const wrap = E.newTemp(e.type, `scr_closure_new((void *)&${trampoline}, 1)`);
+        E.line(`${wrap.name}->caps[0] = scr_box_new(SCR_BOX_FUNC);`);
+        E.line(`scr_box_set_ref(${wrap.name}->caps[0], ${v.name});`);
+        return wrap;
       }
       case "upcast":
       case "downcast": {
