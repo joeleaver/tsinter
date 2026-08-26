@@ -2745,6 +2745,24 @@ const TIER_FLOOR: string[] = [
   // exercises (Node-measured first, wasm-assert.test.ts). Both
   // instruments close — 728 → 729.
   "1681-assert-funcs.ts",
+  // Task #94 (board #94): six re-derived corpus programs, one gated unit —
+  // the corpus-scan census's own candidates, re-measured at 43f71a7 (post
+  // board #89) rather than transcribed from the 0f991c2 sketches. All six
+  // claim on wasm with zero movement among the pre-existing 729; both
+  // instruments (this set-equality addition and the full non-claimed
+  // bucket diff) close — 729 → 735. The arity-widen-identity program
+  // (formerly labeled g1 during the corpus-scan re-derivation) widened in
+  // place (not merely ported) once board #89 made its refcounted-trailing-
+  // drop axis byte-exact — see that file's own header for the provenance
+  // chain. Numbered 2687-2692 (94-D1's fix round: the corpus is
+  // numerically keyed, and ts7/order-parity.test.ts's baseline is
+  // path-keyed — the g-prefixed names never should have shipped).
+  "2687-arity-widen-identity.ts",
+  "2688-forawait-early-exit.ts",
+  "2689-pipeline-stage-shapes.ts",
+  "2690-finished-watcher-list.ts",
+  "2691-received-tail-specific-types.cjs",
+  "2692-finished-duplex-sides.ts",
 ];
 
 interface RunResult {

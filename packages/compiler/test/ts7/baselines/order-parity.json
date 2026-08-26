@@ -5566,6 +5566,42 @@
    ],
    "diags": []
   },
+  "<repo>/tests/corpus/2687-arity-widen-identity.ts": {
+   "order": [
+    "<repo>/tests/corpus/2687-arity-widen-identity.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2688-forawait-early-exit.ts": {
+   "order": [
+    "<repo>/tests/corpus/2688-forawait-early-exit.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2689-pipeline-stage-shapes.ts": {
+   "order": [
+    "<repo>/tests/corpus/2689-pipeline-stage-shapes.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2690-finished-watcher-list.ts": {
+   "order": [
+    "<repo>/tests/corpus/2690-finished-watcher-list.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2691-received-tail-specific-types.cjs": {
+   "order": [
+    "<repo>/tests/corpus/2691-received-tail-specific-types.cjs"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2692-finished-duplex-sides.ts": {
+   "order": [
+    "<repo>/tests/corpus/2692-finished-duplex-sides.ts"
+   ],
+   "diags": []
+  },
   "<repo>/tests/corpus/300-if-else.ts": {
    "order": [
     "<repo>/tests/corpus/300-if-else.ts"

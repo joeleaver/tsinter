@@ -29,7 +29,7 @@ SCRIPTC_TEST_WORKERS=4 SCRIPTC_SAN=1 pnpm test  # sanitized lane
 contend for cores; full local suites also queue behind an advisory lock per
 lane.
 
-Corpus programs are differential tests against Node: every program runs under Node and as a compiled native binary, and stdout, stderr, and exit codes must match byte-for-byte. A new feature lands with corpus programs that pin its behavior both ways. The wasm lane (`tests/harness/wasm-differential.test.ts`) attempts every corpus program under `--backend wasm` and histograms refusals into the work queue; out-of-tier programs must refuse loudly with a named diagnostic, never miscompile.
+Corpus programs are differential tests against Node: every program runs under Node and as a compiled native binary, and stdout, stderr, and exit codes must match byte-for-byte. A new feature lands with corpus programs that pin its behavior both ways. The wasm lane (`tests/harness/wasm-differential.test.ts`) attempts every corpus program under `--backend wasm` and histograms refusals into the work queue; out-of-tier programs must refuse loudly with a named diagnostic, never miscompile. Adding a corpus program may require re-recording `packages/compiler/test/ts7/baselines/order-parity.json` (always for `.js`/`.mjs`/`.cjs` and `*/main.ts` entries), and the full plain lane is what proves it.
 
 ## Semantics register
 
