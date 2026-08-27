@@ -930,9 +930,12 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "assert.eqBool": { argTypes: [BOOL, BOOL, BOOL, BOOL, STRING, BOOL], result: VOID },
   "assert.deepResult": { argTypes: [BOOL, BOOL, STRING, BOOL], result: VOID },
   "assert.sameValue": { argTypes: [F64, F64], result: BOOL },
-  // The deep-equality pair memo: both slots are program-dependent
-  // (any cycle-capable record/array/map type).
-  "assert.deqEnter": { argTypes: [null, null], result: BOOL },
+  // The deep-equality cycle memo: both slots are program-dependent
+  // (any cycle-capable record/array/map type). Result is a 3-way F64
+  // verdict (0=WALK/1=EQUAL/2=UNEQUAL), not a bool — see nodes.ts's own
+  // doc comment on "assert.deqEnter" for why a plain bool undershoots
+  // Node's real set-of-values memo.
+  "assert.deqEnter": { argTypes: [null, null], result: F64 },
   "assert.deqLeave": { argTypes: [], result: VOID },
   "assert.match": { argTypes: [STRING, REGEX, BOOL, STRING, BOOL], result: VOID },
   "assert.throwsNone": { argTypes: [BOOL, STRING, BOOL, STRING, BOOL], result: VOID },

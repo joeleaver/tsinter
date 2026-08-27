@@ -5602,6 +5602,18 @@
    ],
    "diags": []
   },
+  "<repo>/tests/corpus/2693-deep-equal-cycle-period.ts": {
+   "order": [
+    "<repo>/tests/corpus/2693-deep-equal-cycle-period.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2694-deep-equal-cycle-crossed.ts": {
+   "order": [
+    "<repo>/tests/corpus/2694-deep-equal-cycle-crossed.ts"
+   ],
+   "diags": []
+  },
   "<repo>/tests/corpus/300-if-else.ts": {
    "order": [
     "<repo>/tests/corpus/300-if-else.ts"

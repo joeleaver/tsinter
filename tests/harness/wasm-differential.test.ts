@@ -2763,6 +2763,56 @@ const TIER_FLOOR: string[] = [
   "2690-finished-watcher-list.ts",
   "2691-received-tail-specific-types.cjs",
   "2692-finished-duplex-sides.ts",
+  // Increment 23, pass P1 (node:assert static core — the Group A build:
+  // ok/eqF64/eqStr/eqBool/sameValue/deqEnter+Leave/throwsNone/
+  // throwsMismatch/unwantedRejection/shapeBegin+Str+End/ifErrorErr+F64+
+  // Str+Bool/ifErrorDyn's scalar+%error arms). Ten programs claim, all
+  // verified byte-exact against the live Node oracle (own scratch host,
+  // not merely "compiles") before this addition landed; both instruments
+  // (TIER_FLOOR set-equality here, plus the full non-claimed bucket diff
+  // against census-753640d.log) close — 735 -> 745, exactly the
+  // predicted movers and nothing else (see FINDINGS.txt for the table).
+  // eqFail/neqFail (scr_assert_eq_fail/neq_fail) and the deqEnter/
+  // deqLeave pair memo are new standalone wasm helpers; shapeEnd's
+  // Comparison-diff LCS walk is a faithful DP-table port (a simpler
+  // per-key-order shortcut was tried first and DISPROVED by direct Node
+  // measurement before this landed — the walk genuinely reorders +/-
+  // lines). KNOWN, MEASURED, REPORTED gap (not a new S-entry — see
+  // FINDINGS.txt and wasm-assert-core.test.ts's own header comment on
+  // the pin that documents it): the pair memo answers "equal" for
+  // same-label cyclic structures of MISMATCHED period, where Node's real
+  // position-tracking memo throws; no claimed program here or elsewhere
+  // constructs such a shape. ifErrorDyn's FUNC-kind dyn value is grouped
+  // with the named-trap composite arm (P2's job) — the brief's own arm
+  // enumeration did not name it either way; a judgment call, flagged for
+  // the gate.
+  "1601-assert-fail-exit.ts",
+  "1602-assert-caught-error.ts",
+  "1603-assert-scalar-messages.ts",
+  "1604-assert-deep-structures.ts",
+  "1605-assert-import-forms.ts",
+  "1609-assert-async.ts",
+  "1724-assert-iferror.ts",
+  "1727-assert-throws-shape-exit.ts",
+  "2285-iferror-dyn.cjs",
+  "2487-recursive-deep-equal.ts",
+  // Increment 23, F1 fix round item 5: the deqEnter/deqLeave cross-lane
+  // fix (Node's real set-of-values cycle memo, not a pair memo — a
+  // same-labeled cyclic structure of mismatched period now correctly
+  // throws instead of wrongly comparing equal; FINDINGS.txt §3 has the
+  // full record). 745 -> 746, exactly this one new claim, nothing else
+  // moves (both instruments verified before this addition — see the
+  // freeze/checkpoint message for the closing sums).
+  "2693-deep-equal-cycle-period.ts",
+  // Increment 23, F2 fix round: the depth-2/depth-3 two-rule memo fix
+  // (gate finding F-1 — F1's own set-of-values-from-depth-1 rule wrongly
+  // answered UNEQUAL on a crossed depth-2 pair that Node's real a/b
+  // two-slot fast path walks; SEMANTICS.md S056 has the full measured
+  // record, including the registered depth-3 divergence from a truly
+  // fresh Node process that this file's own trigger-then-measure shape
+  // avoids exercising against the oracle). 746 -> 747, exactly this one
+  // new claim.
+  "2694-deep-equal-cycle-crossed.ts",
 ];
 
 interface RunResult {

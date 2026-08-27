@@ -1463,12 +1463,23 @@ function deepEqHelper(L: Lowerer, t: IrType, loc: SrcLoc): string {
   }
 
   // CYCLE-CAPABLE containers (recursive record types and their arrays/
-  // maps) wrap the structural walk in the runtime PAIR MEMO: identical
-  // references are deep-equal without walking, and a (a, b) pair already
-  // being compared answers equal — Node's memoization, so equal cyclic
-  // structures compare true instead of recursing forever. The walk moves
-  // into a sibling function; `name` becomes the memo wrapper every caller
-  // (recursion included) enters through.
+  // maps) wrap the structural walk in the runtime CYCLE MEMO: identical
+  // references are deep-equal without walking (Node's own val1===val2
+  // shortcut, innerDeepEqual's first line), and deqEnter's 3-way
+  // verdict decides the rest — Node's REAL two-phase memo
+  // (lib/internal/util/comparisons.js handleCycles, lifted directly;
+  // SEMANTICS.md S056 has the full measured record), not a simple
+  // "this pair is already open" memo (undershoots: cannot tell a
+  // genuine cycle-of-cycles match from two same-labeled cyclic
+  // structures of DIFFERENT period, where Node throws) and not a
+  // single set-of-values rule applied from the first comparison either
+  // (nodes.ts's own doc comment on "assert.deqEnter" has the full
+  // phase table and the fix-round history). This wrapper's own shape —
+  // enter, fast-return on a definitive verdict, else walk then leave —
+  // is unchanged by that history; only deqEnter/deqLeave's internal
+  // state machine carries the phases. The walk moves into a sibling
+  // function; `name` becomes the memo wrapper every caller (recursion
+  // included) enters through.
   if ((t.kind === "record" || t.kind === "array" || t.kind === "map") && typeReachesItself(L, t)) {
     const walkName = `${name}.walk`;
     L.liftedFns.push({
@@ -1485,14 +1496,28 @@ function deepEqHelper(L: Lowerer, t: IrType, loc: SrcLoc): string {
     locals = [
       { id: "a.0", name: "a", type: t, mutable: false },
       { id: "b.0", name: "b", type: t, mutable: false },
+      { id: "dq.0", name: "dq", type: F64, mutable: false },
       { id: "eq.0", name: "eq", type: BOOL, mutable: false },
     ];
     body = [
       { kind: "if", cond: { kind: "bin", op: "===", left: a(), right: b(), type: BOOL, loc }, then: [ret(boolLit(true))], else_: null, loc },
       {
+        kind: "varDecl",
+        localId: "dq.0",
+        init: { kind: "libCall", fn: "assert.deqEnter", args: [a(), b()], type: F64, loc },
+        loc,
+      },
+      {
         kind: "if",
-        cond: { kind: "libCall", fn: "assert.deqEnter", args: [a(), b()], type: BOOL, loc },
+        cond: { kind: "bin", op: "===", left: ref("dq.0", F64), right: num(1), type: BOOL, loc },
         then: [ret(boolLit(true))],
+        else_: null,
+        loc,
+      },
+      {
+        kind: "if",
+        cond: { kind: "bin", op: "===", left: ref("dq.0", F64), right: num(2), type: BOOL, loc },
+        then: [ret(boolLit(false))],
         else_: null,
         loc,
       },

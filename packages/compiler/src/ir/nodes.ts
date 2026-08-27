@@ -3555,9 +3555,46 @@ export type IrLibFn =
   | "assert.eqDyn"
   | "assert.deepResult"
   | "assert.sameValue"
-  /* deepStrictEqual's pair memo over cycle-capable types: enter answers
-   * true for a pair already being compared (Node's memo — equal cyclic
-   * structures compare true); leave pops. */
+  /* deepStrictEqual's cycle memo over cycle-capable types — Node's REAL
+   * memo (lib/internal/util/comparisons.js, handleCycles, lifted
+   * directly; SEMANTICS.md S056 has the full measured record). It is
+   * NOT one rule but TWO, gated by phase within the CURRENT top-level
+   * comparison — increment 23's fix round F1 got this wrong (a single
+   * "set of values" rule applied from the first comparison), which F2
+   * corrected after the gate caught it (F1 fixed a real bug — a plain
+   * pair-memo answering equal for same-labeled cyclic structures of
+   * DIFFERENT period — but introduced a new one, this doc comment's own
+   * prior text having wrongly called the unported fast path "a pure
+   * allocation optimization with identical semantics"; it is not: it is
+   * part of the memo's semantics and changes the verdict on a crossed
+   * depth-2 pair). The two rules: depth 1 (Node: memos===undefined)
+   * records the pair (a,b) as "top" and WALKS unconditionally — nothing
+   * to compare against yet. Depth 2 (set===undefined, deep===false) is
+   * PAIR rules against the top pair ONLY: a===top.a → answer
+   * (b===top.b); b===top.b → UNEQUAL; otherwise record (c,d) as "mid",
+   * deep=true, WALK. Depth ≥3, on the FIRST call reached while deep
+   * (set still undefined) — PROMOTE: seed one Set with {a,b,c,d}, then
+   * for THIS call and EVERY later one in the comparison, regardless of
+   * nominal depth, apply the 3-way SET rule: both present → 1
+   * (definitively EQUAL, the coinductive step); exactly one present →
+   * 2 (definitively UNEQUAL — the arm a plain pair-memo lacks
+   * entirely); neither → push both, answer 0 (WALK), popped by the
+   * matching deqLeave. deqEnter(a,b) → F64 (0=WALK/1=EQUAL/2=UNEQUAL —
+   * an F64-carried small enum, the shapeStr keyId precedent) carries
+   * this state across calls; deqLeave undoes exactly its matching
+   * deqEnter (see the wasm backend's own doc comment on the state
+   * fields for the depth-classified cleanup) and resets everything when
+   * the outermost frame closes, so a thrown assertion never leaks state
+   * into the next comparison. Node's PUBLIC entry (detectCycles) also
+   * gates this whole memo behind a stack-overflow catch — a fresh
+   * process runs NO memo at all until one genuinely overflows, then
+   * rebinds itself to always use the memo for the rest of the process.
+   * That gate is NOT portable (S056: it fires on V8's real, unobservable
+   * stack limit) and is NOT ported here — Joe's ruling, option A: this
+   * memo runs on every comparison, deterministically, matching Node's
+   * OWN post-overflow behavior exactly and diverging from a truly fresh
+   * Node process on one narrow, unreachable-by-the-corpus shape (S056
+   * has the table). */
   | "assert.deqEnter"
   | "assert.deqLeave"
   | "assert.match"

@@ -19502,6 +19502,16 @@ class Assembler {
     const SAME_STRUCTURE_HEADER = "Values have same structure but are not reference-equal:";
     const DEEP_EQUAL_HEADER = "Expected values to be strictly deep-equal:";
     const NOT_DEEP_EQUAL_HEADER = 'Expected "actual" not to be strictly deep-equal to:';
+    // Increment 23 P1 (node:assert static core, board #37's continuation):
+    // the scalar equality family's own headers — Node's
+    // assertion_error.js createErrDiff/notDeepEqual wording, distinct
+    // from the object-reference family's four headers above (measured,
+    // own probe; scr_assert_eq_header(false)/scr_assert_neq_header(false)
+    // port verbatim). The deep=true headers reuse DEEP_EQUAL_HEADER/
+    // NOT_DEEP_EQUAL_HEADER already declared above — byte-identical to
+    // scr_assert_eq_header(true)/scr_assert_neq_header(true).
+    const EQ_HEADER_STRICT = "Expected values to be strictly equal:";
+    const NEQ_HEADER_STRICT = 'Expected "actual" to be strictly unequal to:';
     switch (e.fn) {
       // (a, b, brandsEq) -> bool. Brand-first (Node compares prototypes
       // before content — a Buffer is never deep-equal to a plain
@@ -19709,6 +19719,828 @@ class Assembler {
         this.releaseScratch(I32, hasMsgLocal);
         return true;
       }
+      // Increment 23 P1 (node:assert static core) begins here — the
+      // Group A build (board #37's scoping package): ok/eqF64/eqStr/
+      // eqBool/sameValue/deqEnter+Leave/throwsNone/throwsMismatch/
+      // unwantedRejection/shapeBegin+Str+End/ifErrorErr+F64+Str+Bool+Dyn.
+      // Every case below follows the SAME discipline as the four P3
+      // cases above: eager argument evaluation into scratch locals in IR
+      // order, openIf()/close() only for structural ifs (never raw
+      // ifVoid()/end() — the fn.depth hazard documented on refEqBytes
+      // above applies identically here), emitUnwind() called once inside
+      // the failing branch. Shared message-assembly logic (eqFail/
+      // neqFail/sameValueF64/the deq pair-memo/shapeEnd) lives in
+      // standalone interned wasm helper functions below emitAssertLibCall
+      // — those use BARE Code methods (c.ifVoid()/c.block()/c.loop()/
+      // c.end()), never this.openIf()/this.close(), since they build a
+      // DIFFERENT function's body with its own local numbering and depth
+      // tracking, unrelated to `this.fn`.
+      //
+      // (pass, msg) -> void. assert(value)/assert.ok(value[, message])/
+      // assert.fail([message]) — the frontend ALWAYS supplies the WHOLE
+      // message (source-text form, user string, or "Failed"); nothing to
+      // compute beyond the throw itself (scr_assert_ok ported verbatim —
+      // no header, no hasMsg, unlike every other assert.* entry point).
+      case "assert.ok": {
+        const passLocal = this.acquireScratch(I32);
+        const msgLocal = this.acquireScratch(this.strRef);
+        this.walkExpr(e.args[0]!);
+        code.localSet(passLocal);
+        this.walkExpr(e.args[1]!);
+        code.localSet(msgLocal);
+        code.localGet(passLocal);
+        code.i32Eqz();
+        this.openIf();
+        this.emitSetCellError(code, "%Error", "AssertionError", () => code.localGet(msgLocal), "ERR_ASSERTION");
+        this.emitUnwind();
+        this.close();
+        this.releaseScratch(I32, passLocal);
+        this.releaseScratch(this.strRef, msgLocal);
+        return true;
+      }
+      // (a, b) -> bool. Object.is over doubles — deepEqHelper's "f64"
+      // leaf AND 1604's own direct array/record uses. NEVER throws (not
+      // in the may-throw seed set). The shared %w.assert.sameValueF64
+      // helper below also backs eqF64's own `same` computation.
+      case "assert.sameValue": {
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        code.call(this.sameValueF64Helper());
+        return true;
+      }
+      // (a, b) -> F64 (3-way verdict) / () -> void. deepStrictEqual's
+      // cycle-safe memo (deepEqHelper's own wrapper, lower-assert.ts) —
+      // NEVER throws (not in the may-throw seed set; every deepEqHelper
+      // walk body is straight-line, no suspension or throw mid-compare).
+      // Modeled on inspect.ts's circCheck/seenPush eqref-stack
+      // machinery, doubled into a two-column stack (%w.assert.deqEnter/
+      // deqLeave below): concrete record/array/map struct refs are
+      // subtypes of `eq` in WasmGC by construction, so no cast is
+      // needed at the call site (the SAME fact inspect.ts's own
+      // circular quartet already relies on). deqEnter's result is
+      // Node's REAL set-of-values memo verdict, not a bool — see
+      // ir/nodes.ts's own doc comment on "assert.deqEnter".
+      case "assert.deqEnter": {
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        code.call(this.deqEnterHelper());
+        return true;
+      }
+      case "assert.deqLeave": {
+        code.call(this.deqLeaveHelper());
+        return true;
+      }
+      // (a, b, negated, deep, msg, hasMsg) -> void. strictEqual/
+      // notStrictEqual/deepStrictEqual/notDeepStrictEqual over numbers —
+      // Object.is (sameValueF64Helper, shared with assert.sameValue
+      // above), Node's exact scalar message forms (eqFailHelper/
+      // neqFailHelper below, porting scr_assert_eq_fail/neq_fail; own
+      // Node measurements, plan.txt §1a, confirm numbers take the SAME
+      // caret/stacked machinery strings do — every scalar caller passes
+      // what C calls `strings` as true, so the ported helpers below have
+      // no such parameter). Same eager-argument-evaluation discipline as
+      // refEqBytes/deepResult above.
+      case "assert.eqF64": {
+        const aLocal = this.acquireScratch(F64);
+        const bLocal = this.acquireScratch(F64);
+        const negatedLocal = this.acquireScratch(I32);
+        const deepLocal = this.acquireScratch(I32);
+        const msgLocal = this.acquireScratch(this.strRef);
+        const hasMsgLocal = this.acquireScratch(I32);
+        this.walkExpr(e.args[0]!);
+        code.localSet(aLocal);
+        this.walkExpr(e.args[1]!);
+        code.localSet(bLocal);
+        this.walkExpr(e.args[2]!);
+        code.localSet(negatedLocal);
+        this.walkExpr(e.args[3]!);
+        code.localSet(deepLocal);
+        this.walkExpr(e.args[4]!);
+        code.localSet(msgLocal);
+        this.walkExpr(e.args[5]!);
+        code.localSet(hasMsgLocal);
+        code.localGet(aLocal);
+        code.localGet(bLocal);
+        code.call(this.sameValueF64Helper());
+        code.localGet(negatedLocal);
+        code.i32Xor(); // holds
+        code.i32Eqz(); // !holds
+        this.openIf();
+        const iaLocal = this.acquireScratch(this.strRef);
+        code.localGet(aLocal);
+        code.call(this.inspF64Helper());
+        code.localSet(iaLocal);
+        const msgResultLocal = this.acquireScratch(this.strRef);
+        code.localGet(negatedLocal);
+        this.openIf();
+        this.pushHeaderFor(code, deepLocal, NEQ_HEADER_STRICT, NOT_DEEP_EQUAL_HEADER);
+        code.localGet(iaLocal);
+        code.localGet(msgLocal);
+        code.localGet(hasMsgLocal);
+        code.call(this.neqFailHelper());
+        code.localSet(msgResultLocal);
+        code.else_();
+        const ibLocal = this.acquireScratch(this.strRef);
+        code.localGet(bLocal);
+        code.call(this.inspF64Helper());
+        code.localSet(ibLocal);
+        code.localGet(iaLocal);
+        code.localGet(ibLocal);
+        code.i32Const(0); // quotes
+        code.localGet(aLocal);
+        code.f64Const(0);
+        code.f64Eq();
+        code.localGet(bLocal);
+        code.f64Const(0);
+        code.f64Eq();
+        code.i32And(); // bothZero — safe: both sides are cheap pure f64Eq compares
+        this.pushHeaderFor(code, deepLocal, EQ_HEADER_STRICT, DEEP_EQUAL_HEADER);
+        code.localGet(msgLocal);
+        code.localGet(hasMsgLocal);
+        code.call(this.eqFailHelper());
+        code.localSet(msgResultLocal);
+        this.releaseScratch(this.strRef, ibLocal);
+        this.close();
+        this.emitSetCellError(code, "%Error", "AssertionError", () => code.localGet(msgResultLocal), "ERR_ASSERTION");
+        this.emitUnwind();
+        this.releaseScratch(this.strRef, msgResultLocal);
+        this.releaseScratch(this.strRef, iaLocal);
+        this.close();
+        this.releaseScratch(F64, aLocal);
+        this.releaseScratch(F64, bLocal);
+        this.releaseScratch(I32, negatedLocal);
+        this.releaseScratch(I32, deepLocal);
+        this.releaseScratch(this.strRef, msgLocal);
+        this.releaseScratch(I32, hasMsgLocal);
+        return true;
+      }
+      // Same shape as eqF64 above; `same` is byte equality (strEqHelper
+      // — the SAME helper the IR's `strEq` node compiles through),
+      // inspection is Node's real strEscape ladder via %w.insp.str (NOT
+      // scr_assert_inspect_str's ASCII-only escaper — measured, plan.txt
+      // §1a's backtick-quoting case), quotes=2 (both sides are strings,
+      // excluding 2 chars each from the 12-unit budget), bothZero=false
+      // always. UNIQUE to eqStr among the scalar family: a string's
+      // inspection can SPAN LINES (des-23 D.9 / the lead's own
+      // measurement — eqF64/eqBool cannot: inspF64's output alphabet has
+      // no newline, neither does "true"/"false", pinned explicitly
+      // below), which moves createErrDiff onto Node's real myers-diff
+      // assembler entirely — NOT the simple/stacked machinery eqFail
+      // ports. P1 does not port that assembler (P2's job, D.9's boxing-
+      // shim recommendation); a multi-line RENDERED inspection (tested
+      // on the rendered text via %w.insp.str, never the raw input — a
+      // 10002-unit string whose only "\n" sits past the 10000-unit cap
+      // renders on ONE line and must NOT trap) hits a named runtime
+      // trap instead, force-pinned via runWasmToTrap, the SAME pattern
+      // ifErrorDyn's composite arm already uses. No P1 corpus program
+      // reaches it — 1603's own "a\nb" is 3 units, far under the
+      // 76-unit (indentGlobal=0) split threshold.
+      case "assert.eqStr": {
+        const strRefT = this.strRef;
+        const aLocal = this.acquireScratch(strRefT);
+        const bLocal = this.acquireScratch(strRefT);
+        const negatedLocal = this.acquireScratch(I32);
+        const deepLocal = this.acquireScratch(I32);
+        const msgLocal = this.acquireScratch(strRefT);
+        const hasMsgLocal = this.acquireScratch(I32);
+        this.walkExpr(e.args[0]!);
+        code.localSet(aLocal);
+        this.walkExpr(e.args[1]!);
+        code.localSet(bLocal);
+        this.walkExpr(e.args[2]!);
+        code.localSet(negatedLocal);
+        this.walkExpr(e.args[3]!);
+        code.localSet(deepLocal);
+        this.walkExpr(e.args[4]!);
+        code.localSet(msgLocal);
+        this.walkExpr(e.args[5]!);
+        code.localSet(hasMsgLocal);
+        code.localGet(aLocal);
+        code.localGet(bLocal);
+        code.call(this.strEqHelper());
+        code.localGet(negatedLocal);
+        code.i32Xor();
+        code.i32Eqz();
+        this.openIf();
+        // ia via %w.insp.str (Node's REAL string formatPrimitive: the
+        // quote ladder AND the 10000-unit cap AND the multi-line split —
+        // superset of the old hand-rolled quoteInto mark/take, byte-
+        // identical to it in the single-line case since str() calls
+        // quoteInto internally for an unsplit chunk).
+        const iaLocal = this.acquireScratch(strRefT);
+        code.localGet(aLocal);
+        code.call(this.insp.str());
+        code.localSet(iaLocal);
+        // The multi-line sentinel: P2's myers assembler owns this shape
+        // (des-23 D.9) — a bare, deliberately silent sentinel trap (a
+        // plain `unreachable`, no diagnostic — NOT rule 1's "refuse
+        // loudly with a named diagnostic"; the pins tell it apart from
+        // an ordinary uncaught AssertionError by empty stderr), reachable
+        // by real source and force-pinned rather than a silent wrong
+        // render. P2b replaces it with the real renderer. Tested on the
+        // RENDERED text.
+        this.emitStrHasNewline(code, iaLocal);
+        this.openIf();
+        code.unreachable();
+        this.close();
+        const msgResultLocal = this.acquireScratch(strRefT);
+        code.localGet(negatedLocal);
+        this.openIf();
+        this.pushHeaderFor(code, deepLocal, NEQ_HEADER_STRICT, NOT_DEEP_EQUAL_HEADER);
+        code.localGet(iaLocal);
+        code.localGet(msgLocal);
+        code.localGet(hasMsgLocal);
+        code.call(this.neqFailHelper());
+        code.localSet(msgResultLocal);
+        code.else_();
+        const ibLocal = this.acquireScratch(strRefT);
+        code.localGet(bLocal);
+        code.call(this.insp.str());
+        code.localSet(ibLocal);
+        this.emitStrHasNewline(code, ibLocal);
+        this.openIf();
+        code.unreachable();
+        this.close();
+        code.localGet(iaLocal);
+        code.localGet(ibLocal);
+        code.i32Const(2); // quotes
+        code.i32Const(0); // bothZero
+        this.pushHeaderFor(code, deepLocal, EQ_HEADER_STRICT, DEEP_EQUAL_HEADER);
+        code.localGet(msgLocal);
+        code.localGet(hasMsgLocal);
+        code.call(this.eqFailHelper());
+        code.localSet(msgResultLocal);
+        this.releaseScratch(strRefT, ibLocal);
+        this.close();
+        this.emitSetCellError(code, "%Error", "AssertionError", () => code.localGet(msgResultLocal), "ERR_ASSERTION");
+        this.emitUnwind();
+        this.releaseScratch(strRefT, msgResultLocal);
+        this.releaseScratch(strRefT, iaLocal);
+        this.close();
+        this.releaseScratch(strRefT, aLocal);
+        this.releaseScratch(strRefT, bLocal);
+        this.releaseScratch(I32, negatedLocal);
+        this.releaseScratch(I32, deepLocal);
+        this.releaseScratch(strRefT, msgLocal);
+        this.releaseScratch(I32, hasMsgLocal);
+        return true;
+      }
+      // Same shape again; `same` is i32 ===, inspection is a STATIC
+      // "true"/"false" literal (never escaped — booleans need no
+      // quoting), quotes=0, bothZero=false. The short form ALWAYS
+      // applies here (max combined length 4+5=10<=12 — measured, no
+      // bool pair can reach eqFailHelper's stacked/caret branch); still
+      // routed through the shared helper for architectural uniformity
+      // with the C reference, and that unreachability is a recorded fact
+      // (FINDINGS), not a special case coded around.
+      case "assert.eqBool": {
+        const aLocal = this.acquireScratch(I32);
+        const bLocal = this.acquireScratch(I32);
+        const negatedLocal = this.acquireScratch(I32);
+        const deepLocal = this.acquireScratch(I32);
+        const msgLocal = this.acquireScratch(this.strRef);
+        const hasMsgLocal = this.acquireScratch(I32);
+        this.walkExpr(e.args[0]!);
+        code.localSet(aLocal);
+        this.walkExpr(e.args[1]!);
+        code.localSet(bLocal);
+        this.walkExpr(e.args[2]!);
+        code.localSet(negatedLocal);
+        this.walkExpr(e.args[3]!);
+        code.localSet(deepLocal);
+        this.walkExpr(e.args[4]!);
+        code.localSet(msgLocal);
+        this.walkExpr(e.args[5]!);
+        code.localSet(hasMsgLocal);
+        code.localGet(aLocal);
+        code.localGet(bLocal);
+        code.i32Eq();
+        code.localGet(negatedLocal);
+        code.i32Xor();
+        code.i32Eqz();
+        this.openIf();
+        const boolStr = (local: number): void => {
+          code.localGet(local);
+          this.openIfResult(this.strRef);
+          this.pushStrLitInto(code, "true");
+          code.else_();
+          this.pushStrLitInto(code, "false");
+          this.close();
+        };
+        const iaLocal = this.acquireScratch(this.strRef);
+        boolStr(aLocal);
+        code.localSet(iaLocal);
+        const msgResultLocal = this.acquireScratch(this.strRef);
+        code.localGet(negatedLocal);
+        this.openIf();
+        this.pushHeaderFor(code, deepLocal, NEQ_HEADER_STRICT, NOT_DEEP_EQUAL_HEADER);
+        code.localGet(iaLocal);
+        code.localGet(msgLocal);
+        code.localGet(hasMsgLocal);
+        code.call(this.neqFailHelper());
+        code.localSet(msgResultLocal);
+        code.else_();
+        const ibLocal = this.acquireScratch(this.strRef);
+        boolStr(bLocal);
+        code.localSet(ibLocal);
+        code.localGet(iaLocal);
+        code.localGet(ibLocal);
+        code.i32Const(0);
+        code.i32Const(0);
+        this.pushHeaderFor(code, deepLocal, EQ_HEADER_STRICT, DEEP_EQUAL_HEADER);
+        code.localGet(msgLocal);
+        code.localGet(hasMsgLocal);
+        code.call(this.eqFailHelper());
+        code.localSet(msgResultLocal);
+        this.releaseScratch(this.strRef, ibLocal);
+        this.close();
+        this.emitSetCellError(code, "%Error", "AssertionError", () => code.localGet(msgResultLocal), "ERR_ASSERTION");
+        this.emitUnwind();
+        this.releaseScratch(this.strRef, msgResultLocal);
+        this.releaseScratch(this.strRef, iaLocal);
+        this.close();
+        this.releaseScratch(I32, aLocal);
+        this.releaseScratch(I32, bLocal);
+        this.releaseScratch(I32, negatedLocal);
+        this.releaseScratch(I32, deepLocal);
+        this.releaseScratch(this.strRef, msgLocal);
+        this.releaseScratch(I32, hasMsgLocal);
+        return true;
+      }
+      // (rejection, ename, hasEname, msg, hasMsg) -> void. The "Missing
+      // expected exception|rejection" throw of assert.throws/rejects
+      // whose callback returned/fulfilled normally (scr_assert_
+      // throws_none ported verbatim). Inlined (single call-site pattern,
+      // matches refEqBytes's own style) rather than a standalone
+      // function — used at most once per synthesized %assert.throws.N
+      // helper.
+      case "assert.throwsNone": {
+        const rejectionLocal = this.acquireScratch(I32);
+        const enameLocal = this.acquireScratch(this.strRef);
+        const hasEnameLocal = this.acquireScratch(I32);
+        const msgLocal = this.acquireScratch(this.strRef);
+        const hasMsgLocal = this.acquireScratch(I32);
+        this.walkExpr(e.args[0]!);
+        code.localSet(rejectionLocal);
+        this.walkExpr(e.args[1]!);
+        code.localSet(enameLocal);
+        this.walkExpr(e.args[2]!);
+        code.localSet(hasEnameLocal);
+        this.walkExpr(e.args[3]!);
+        code.localSet(msgLocal);
+        this.walkExpr(e.args[4]!);
+        code.localSet(hasMsgLocal);
+        const markLocal = this.acquireScratch(I32);
+        this.insp.pushMark(code);
+        code.localSet(markLocal);
+        code.localGet(rejectionLocal);
+        this.openIfResult(this.strRef);
+        this.pushStrLitInto(code, "Missing expected rejection");
+        code.else_();
+        this.pushStrLitInto(code, "Missing expected exception");
+        this.close();
+        code.call(this.insp.ibPuts());
+        code.localGet(hasEnameLocal);
+        this.openIf();
+        this.pushStrLitInto(code, " (");
+        code.call(this.insp.ibPuts());
+        code.localGet(enameLocal);
+        code.call(this.insp.ibPuts());
+        code.i32Const(0x29); // ')'
+        code.call(this.insp.ibPutc());
+        this.close();
+        code.localGet(hasMsgLocal);
+        this.openIf();
+        this.pushStrLitInto(code, ": ");
+        code.call(this.insp.ibPuts());
+        code.localGet(msgLocal);
+        code.call(this.insp.ibPuts());
+        code.else_();
+        code.i32Const(0x2e); // '.'
+        code.call(this.insp.ibPutc());
+        this.close();
+        const resultLocal = this.acquireScratch(this.strRef);
+        code.localGet(markLocal);
+        code.call(this.insp.ibTake());
+        code.localSet(resultLocal);
+        this.releaseScratch(I32, markLocal);
+        this.emitSetCellError(code, "%Error", "AssertionError", () => code.localGet(resultLocal), "ERR_ASSERTION");
+        this.emitUnwind();
+        this.releaseScratch(this.strRef, resultLocal);
+        this.releaseScratch(I32, rejectionLocal);
+        this.releaseScratch(this.strRef, enameLocal);
+        this.releaseScratch(I32, hasEnameLocal);
+        this.releaseScratch(this.strRef, msgLocal);
+        this.releaseScratch(I32, hasMsgLocal);
+        return true;
+      }
+      // (expectedName, err, msg, hasMsg) -> void. assert.throws(fn,
+      // ErrorClass) where the thrown Error mismatches (scr_assert_
+      // throws_mismatch ported verbatim). `err` is a caughtNarrow'd
+      // %Error value, backed by exc().errT exactly like insp.error()/
+      // errToStrHelper read it (structGet ERR_NAME/ERR_MESSAGE directly
+      // — no cast needed). C reads the `name` SLOT where Node reads
+      // `constructor.name` — board #66 close-out item (measured,
+      // FINDINGS; P1 inherits this, does not introduce it; F-5 widened
+      // its reach — an ordinary Error subclass with an empty message
+      // and no `.name` override is enough, no adversarial shape
+      // needed — recorded in FINDINGS' #66 section per the brief).
+      case "assert.throwsMismatch": {
+        const errT = this.exc().errT;
+        const errRefT: ValType = { kind: "ref", nullable: true, typeIndex: errT };
+        const expectedNameLocal = this.acquireScratch(this.strRef);
+        const errLocal = this.acquireScratch(errRefT);
+        const msgLocal = this.acquireScratch(this.strRef);
+        const hasMsgLocal = this.acquireScratch(I32);
+        this.walkExpr(e.args[0]!);
+        code.localSet(expectedNameLocal);
+        this.walkExpr(e.args[1]!);
+        code.localSet(errLocal);
+        this.walkExpr(e.args[2]!);
+        code.localSet(msgLocal);
+        this.walkExpr(e.args[3]!);
+        code.localSet(hasMsgLocal);
+        const resultLocal = this.acquireScratch(this.strRef);
+        code.localGet(hasMsgLocal);
+        this.openIf();
+        code.localGet(msgLocal);
+        code.localSet(resultLocal);
+        code.else_();
+        const markLocal = this.acquireScratch(I32);
+        this.insp.pushMark(code);
+        code.localSet(markLocal);
+        this.pushStrLitInto(code, 'The error is expected to be an instance of "');
+        code.call(this.insp.ibPuts());
+        code.localGet(expectedNameLocal);
+        code.call(this.insp.ibPuts());
+        this.pushStrLitInto(code, '". Received "');
+        code.call(this.insp.ibPuts());
+        code.localGet(errLocal);
+        code.structGet(errT, ERR_NAME);
+        code.call(this.insp.ibPuts());
+        code.i32Const(0x22); // '"'
+        code.call(this.insp.ibPutc());
+        code.localGet(errLocal);
+        code.structGet(errT, ERR_MESSAGE);
+        code.arrayLen();
+        this.openIf();
+        this.pushStrLitInto(code, "\n\nError message:\n\n");
+        code.call(this.insp.ibPuts());
+        code.localGet(errLocal);
+        code.structGet(errT, ERR_MESSAGE);
+        code.call(this.insp.ibPuts());
+        this.close();
+        code.localGet(markLocal);
+        code.call(this.insp.ibTake());
+        code.localSet(resultLocal);
+        this.releaseScratch(I32, markLocal);
+        this.close();
+        this.emitSetCellError(code, "%Error", "AssertionError", () => code.localGet(resultLocal), "ERR_ASSERTION");
+        this.emitUnwind();
+        this.releaseScratch(this.strRef, resultLocal);
+        this.releaseScratch(this.strRef, expectedNameLocal);
+        this.releaseScratch(errRefT, errLocal);
+        this.releaseScratch(this.strRef, msgLocal);
+        this.releaseScratch(I32, hasMsgLocal);
+        return true;
+      }
+      // (err, msg, hasMsg) -> void. doesNotReject's "Got unwanted
+      // rejection" throw (scr_assert_unwanted_rejection ported
+      // verbatim). No P1 corpus program reaches it (brief: build if
+      // cheap) — cheap given the ib-buffer machinery above; force-pinned.
+      case "assert.unwantedRejection": {
+        const errT = this.exc().errT;
+        const errRefT: ValType = { kind: "ref", nullable: true, typeIndex: errT };
+        const errLocal = this.acquireScratch(errRefT);
+        const msgLocal = this.acquireScratch(this.strRef);
+        const hasMsgLocal = this.acquireScratch(I32);
+        this.walkExpr(e.args[0]!);
+        code.localSet(errLocal);
+        this.walkExpr(e.args[1]!);
+        code.localSet(msgLocal);
+        this.walkExpr(e.args[2]!);
+        code.localSet(hasMsgLocal);
+        const markLocal = this.acquireScratch(I32);
+        this.insp.pushMark(code);
+        code.localSet(markLocal);
+        this.pushStrLitInto(code, "Got unwanted rejection");
+        code.call(this.insp.ibPuts());
+        code.localGet(hasMsgLocal);
+        this.openIf();
+        this.pushStrLitInto(code, ": ");
+        code.call(this.insp.ibPuts());
+        code.localGet(msgLocal);
+        code.call(this.insp.ibPuts());
+        code.else_();
+        code.i32Const(0x2e); // '.'
+        code.call(this.insp.ibPutc());
+        this.close();
+        this.pushStrLitInto(code, '\nActual message: "');
+        code.call(this.insp.ibPuts());
+        code.localGet(errLocal);
+        code.structGet(errT, ERR_MESSAGE);
+        code.call(this.insp.ibPuts());
+        code.i32Const(0x22); // '"'
+        code.call(this.insp.ibPutc());
+        const resultLocal = this.acquireScratch(this.strRef);
+        code.localGet(markLocal);
+        code.call(this.insp.ibTake());
+        code.localSet(resultLocal);
+        this.releaseScratch(I32, markLocal);
+        this.emitSetCellError(code, "%Error", "AssertionError", () => code.localGet(resultLocal), "ERR_ASSERTION");
+        this.emitUnwind();
+        this.releaseScratch(this.strRef, resultLocal);
+        this.releaseScratch(errRefT, errLocal);
+        this.releaseScratch(this.strRef, msgLocal);
+        this.releaseScratch(I32, hasMsgLocal);
+        return true;
+      }
+      // (err) -> void. The static shape accumulator's reset — 7 module
+      // globals (an err ref + 3 present/val slot pairs), the direct
+      // analogue of C's static `scr_shape` (scr_assert_shape_begin).
+      case "assert.shapeBegin": {
+        const errT = this.exc().errT;
+        this.walkExpr(e.args[0]!);
+        code.globalSet(this.shapeErrGlobal(errT));
+        for (let slot = 0; slot < 3; slot++) {
+          code.i32Const(0);
+          code.globalSet(this.shapePresentGlobal(slot));
+          code.refNull(this.strType);
+          code.globalSet(this.shapeValGlobal(slot));
+        }
+        return true;
+      }
+      // (keyId, value) -> void. One string-valued expected key
+      // (scr_assert_shape_str). keyId is ALWAYS a compile-time literal
+      // (lower-assert.ts's shapeSlotStmts constructs it as `num(k.id)`)
+      // — the same "compile-time literal argument" contract
+      // error.argTypeThrow's name/expected already require, so the
+      // specific global is picked directly with NO runtime dispatch.
+      case "assert.shapeStr": {
+        const keyArg = e.args[0]!;
+        if (keyArg.kind !== "numLit") {
+          throw new Error(
+            "wasm emitter bug: assert.shapeStr's keyId must be a compile-time literal (lower-assert.ts's own construction)",
+          );
+        }
+        const slot = keyArg.value;
+        this.walkExpr(e.args[1]!);
+        code.globalSet(this.shapeValGlobal(slot));
+        code.i32Const(1);
+        code.globalSet(this.shapePresentGlobal(slot));
+        return true;
+      }
+      // (msg, hasMsg) -> void. Node's expectedException Comparison diff
+      // over the 3-slot accumulator (scr_assert_shape_end/scr_shape_
+      // matches/scr_shape_diff_fail, 1216-1394, ported as ONE standalone
+      // function — genuinely generic over however many of the 3 slots
+      // got a shapeStr call, which THIS call site cannot know at codegen
+      // time: that information lives one level up, in whichever
+      // %assert.throws.N helper happens to be calling it).
+      case "assert.shapeEnd": {
+        const msgLocal = this.acquireScratch(this.strRef);
+        const hasMsgLocal = this.acquireScratch(I32);
+        this.walkExpr(e.args[0]!);
+        code.localSet(msgLocal);
+        this.walkExpr(e.args[1]!);
+        code.localSet(hasMsgLocal);
+        code.localGet(msgLocal);
+        code.localGet(hasMsgLocal);
+        code.call(this.shapeEndHelper());
+        this.emitPendingCheck();
+        this.releaseScratch(this.strRef, msgLocal);
+        this.releaseScratch(I32, hasMsgLocal);
+        return true;
+      }
+      // (v) -> void. assert.ifError over an %Error-hierarchy value: the
+      // error's message, or its name when the message is empty
+      // (scr_assert_iferror_err). Both fields are NON-NULLABLE str
+      // arrays on exc().errT (errToStrHelper's own stance: "a reached
+      // error always carries two real arrays") — no null check needed.
+      case "assert.ifErrorErr": {
+        const errT = this.exc().errT;
+        const errRefT: ValType = { kind: "ref", nullable: true, typeIndex: errT };
+        const vLocal = this.acquireScratch(errRefT);
+        this.walkExpr(e.args[0]!);
+        code.localSet(vLocal);
+        this.emitIfErrorFail(code, () => {
+          code.localGet(vLocal);
+          code.structGet(errT, ERR_MESSAGE);
+          code.arrayLen();
+          this.openIfResult(this.strRef);
+          code.localGet(vLocal);
+          code.structGet(errT, ERR_MESSAGE);
+          code.else_();
+          code.localGet(vLocal);
+          code.structGet(errT, ERR_NAME);
+          this.close();
+        });
+        this.releaseScratch(errRefT, vLocal);
+        return true;
+      }
+      case "assert.ifErrorF64": {
+        const vLocal = this.acquireScratch(F64);
+        this.walkExpr(e.args[0]!);
+        code.localSet(vLocal);
+        this.emitIfErrorFail(code, () => {
+          code.localGet(vLocal);
+          code.call(this.inspF64Helper());
+        });
+        this.releaseScratch(F64, vLocal);
+        return true;
+      }
+      case "assert.ifErrorStr": {
+        const vLocal = this.acquireScratch(this.strRef);
+        this.walkExpr(e.args[0]!);
+        code.localSet(vLocal);
+        const quotedLocal = this.acquireScratch(this.strRef);
+        this.emitInspectStrInto(code, () => code.localGet(vLocal), quotedLocal);
+        this.emitIfErrorFail(code, () => code.localGet(quotedLocal));
+        this.releaseScratch(this.strRef, quotedLocal);
+        this.releaseScratch(this.strRef, vLocal);
+        return true;
+      }
+      case "assert.ifErrorBool": {
+        const vLocal = this.acquireScratch(I32);
+        this.walkExpr(e.args[0]!);
+        code.localSet(vLocal);
+        this.emitIfErrorFail(code, () => {
+          code.localGet(vLocal);
+          this.openIfResult(this.strRef);
+          this.pushStrLitInto(code, "true");
+          code.else_();
+          this.pushStrLitInto(code, "false");
+          this.close();
+        });
+        this.releaseScratch(I32, vLocal);
+        return true;
+      }
+      // (v) -> void. assert.ifError over a checked-dynamic value
+      // (test/common's mustSucceed idiom): UNDEF/NULL pass quietly, an
+      // OBJ carrying the reserved "%error" key throws with its message
+      // (name when empty — LEANS on fromError() being the marker's ONLY
+      // producer, always stamping both as non-null strings per dyn.ts's
+      // own header doc: a violated invariant traps at the refCast below
+      // rather than silently answering wrong), other SCALAR kinds
+      // (BOOL/NUM/STR) throw with the value's inspection (the SAME
+      // machinery the static ifErrorF64/Str/Bool arms use — confirmed
+      // Node-identical by plan.txt's dyncheck.mjs probe). Composite
+      // kinds this pass does not model (ARR, OBJ without "%error",
+      // BYTES, HANDLE, PROMISE, JSVAL, AND FUNC — the brief's own arm
+      // enumeration did not name FUNC either way; grouped here as a
+      // judgment call, RULED ACCEPTED for P1) hit a bare, deliberately
+      // silent sentinel trap (a plain `unreachable`, no diagnostic —
+      // NOT rule 1's "refuse loudly with a named diagnostic"; the pins
+      // tell it apart from an ordinary uncaught AssertionError by empty
+      // stderr) — ALL OF THEM P2b's job (design-p2.txt D.8: once P2's compact:false
+      // renderer lands, this whole trap becomes one line, a plain
+      // `cfInspect(v)` call — a retired sentinel, not a rewrite): the
+      // increment-22 P2b HANDLE/JSVAL sentinel precedent's own style
+      // (bare unreachable, no refuse() — this arm IS reachable by real
+      // source, just not by any program this pass claims; force-pinned
+      // via wasm-host.ts's runWasmToTrap, no hand-built dyn box needed
+      // since ordinary source can produce e.g. `assert.ifError([1,2,3])`
+      // directly). 2285 (this pass's one ifErrorDyn claim) never reaches
+      // this arm — verified by reading the program: its only dyn shapes
+      // are undefined/null/a message-bearing Error/a plain string/a
+      // plain number.
+      case "assert.ifErrorDyn": {
+        const dynRefT = this.dyn.dynRef();
+        const dynT = this.dyn.dynT();
+        const objRefT = this.dyn.objRef();
+        const vLocal = this.acquireScratch(dynRefT);
+        this.walkExpr(e.args[0]!);
+        code.localSet(vLocal);
+        const kLocal = this.acquireScratch(I32);
+        code.localGet(vLocal);
+        code.structGet(dynT, DYN_KIND);
+        code.localSet(kLocal);
+
+        code.localGet(kLocal);
+        code.i32Const(DK.UNDEF);
+        code.i32Eq();
+        this.openIf(); // #1 UNDEF: no-op
+        code.else_();
+        code.localGet(kLocal);
+        code.i32Const(DK.NULL);
+        code.i32Eq();
+        this.openIf(); // #2 NULL: no-op
+        code.else_();
+        code.localGet(kLocal);
+        code.i32Const(DK.OBJ);
+        code.i32Eq();
+        this.openIf(); // #3 OBJ
+        {
+          const oLocal = this.acquireScratch(objRefT);
+          this.dyn.objPayload(code, (c) => c.localGet(vLocal));
+          code.localSet(oLocal);
+          code.localGet(oLocal);
+          this.pushStrLitInto(code, "%error");
+          code.call(this.dyn.objGet());
+          code.refIsNull();
+          code.i32Eqz();
+          this.openIf(); // #3a has "%error"
+          {
+            const detailLocal = this.acquireScratch(this.strRef);
+            const msgMemberLocal = this.acquireScratch(dynRefT);
+            const nameMemberLocal = this.acquireScratch(dynRefT);
+            code.localGet(oLocal);
+            this.pushStrLitInto(code, "message");
+            code.call(this.dyn.objGet());
+            code.localSet(msgMemberLocal);
+            code.localGet(msgMemberLocal);
+            code.structGet(dynT, DYN_REF);
+            code.refCast(this.strType);
+            code.arrayLen();
+            this.openIf(); // #3a-i message.length>0
+            code.localGet(msgMemberLocal);
+            code.structGet(dynT, DYN_REF);
+            code.refCast(this.strType);
+            code.localSet(detailLocal);
+            code.else_();
+            code.localGet(oLocal);
+            this.pushStrLitInto(code, "name");
+            code.call(this.dyn.objGet());
+            code.localSet(nameMemberLocal);
+            code.localGet(nameMemberLocal);
+            code.structGet(dynT, DYN_REF);
+            code.refCast(this.strType);
+            code.localSet(detailLocal);
+            this.close(); // #3a-i
+            this.emitIfErrorFail(code, () => code.localGet(detailLocal));
+            this.releaseScratch(this.strRef, detailLocal);
+            this.releaseScratch(dynRefT, msgMemberLocal);
+            this.releaseScratch(dynRefT, nameMemberLocal);
+          }
+          code.else_();
+          // OBJ without "%error": groups with the composite trap below —
+          // P2's compact:false renderer's job.
+          code.unreachable();
+          this.close(); // #3a
+          this.releaseScratch(objRefT, oLocal);
+        }
+        code.else_();
+        code.localGet(kLocal);
+        code.i32Const(DK.BOOL);
+        code.i32Eq();
+        this.openIf(); // #4 BOOL
+        this.emitIfErrorFail(code, () => {
+          code.localGet(vLocal);
+          code.structGet(dynT, DYN_NUM);
+          code.f64Const(0);
+          code.f64Ne();
+          this.openIfResult(this.strRef);
+          this.pushStrLitInto(code, "true");
+          code.else_();
+          this.pushStrLitInto(code, "false");
+          this.close();
+        });
+        code.else_();
+        code.localGet(kLocal);
+        code.i32Const(DK.NUM);
+        code.i32Eq();
+        this.openIf(); // #5 NUM
+        this.emitIfErrorFail(code, () => {
+          code.localGet(vLocal);
+          code.structGet(dynT, DYN_NUM);
+          code.call(this.inspF64Helper());
+        });
+        code.else_();
+        code.localGet(kLocal);
+        code.i32Const(DK.STR);
+        code.i32Eq();
+        this.openIf(); // #6 STR
+        {
+          const strValLocal = this.acquireScratch(this.strRef);
+          code.localGet(vLocal);
+          code.structGet(dynT, DYN_REF);
+          code.refCast(this.strType);
+          code.localSet(strValLocal);
+          const quotedLocal = this.acquireScratch(this.strRef);
+          this.emitInspectStrInto(code, () => code.localGet(strValLocal), quotedLocal);
+          this.emitIfErrorFail(code, () => code.localGet(quotedLocal));
+          this.releaseScratch(this.strRef, quotedLocal);
+          this.releaseScratch(this.strRef, strValLocal);
+        }
+        code.else_();
+        // ARR, OBJ-without-"%error" (handled above), BYTES, FUNC,
+        // HANDLE, PROMISE, JSVAL: P2b's compact:false renderer's job — a
+        // bare, deliberately silent sentinel trap (no diagnostic — NOT
+        // rule 1's "refuse loudly with a named diagnostic"), reachable
+        // (by real, just unclaimed, source) and force-pinned (the
+        // increment-22 P2b HANDLE/JSVAL sentinel precedent's own
+        // bare-unreachable style).
+        code.unreachable();
+        this.close(); // #6
+        this.close(); // #5
+        this.close(); // #4
+        this.close(); // #3
+        this.close(); // #2
+        this.close(); // #1
+        this.releaseScratch(I32, kLocal);
+        this.releaseScratch(dynRefT, vLocal);
+        return true;
+      }
       default:
         if (e.fn.startsWith("assert.")) {
           this.refuse(`libCall:${e.fn}`, e.loc);
@@ -19717,6 +20549,1594 @@ class Assembler {
         }
         return false;
     }
+  }
+
+  /* ── increment 23 P1's standalone helpers ───────────────────────────
+   * Every function below builds a DIFFERENT wasm function's own body (a
+   * fresh `Code` instance, own local numbering) — they use BARE
+   * `c.ifVoid()/c.block()/c.loop()/c.end()`, NEVER `this.openIf()`/
+   * `this.close()` (those track `this.fn`, the CURRENTLY-COMPILING
+   * PROGRAM function's own depth — unrelated to a standalone helper's
+   * structure), and never `this.acquireScratch`/`this.emitUnwind` for
+   * the same reason (scratch pooling and the try-stack both live on
+   * `this.fn`). `this.insp.*` (InspectBuilder), `this.strEqHelper()`,
+   * `this.exc()`, `emitSetCellError` (explicit `c` param), and
+   * `pushStrLitInto` (explicit `c` param) are all module-level and safe
+   * to call from anywhere, exactly like inspect.ts's own growEq/
+   * circCheck/seenPush already do. */
+
+  private sameValueF64Func: number | null = null;
+
+  /** %w.assert.sameValueF64(a, b) → i32 — Object.is over doubles
+   * (scr_assert_same_value_f64 ported): `assert.sameValue`'s own body
+   * AND eqF64's `same` computation share this. The ±0 case compares BIT
+   * PATTERNS rather than extracting signbits separately — the same
+   * i64ReinterpretF64 trick inspF64Helper already uses to detect -0,
+   * which is equivalent (the only bit difference between two
+   * EQUAL-BY-VALUE zeros is the sign bit). */
+  private sameValueF64Helper(): number {
+    if (this.sameValueF64Func !== null) return this.sameValueF64Func;
+    const idx = this.mb.declareFunc(this.mb.funcType([F64, F64], [I32]), "%w.assert.sameValueF64");
+    this.sameValueF64Func = idx;
+    const c = new Code();
+    const A = 0;
+    const B = 1;
+    c.localGet(A);
+    c.localGet(B);
+    c.f64Eq();
+    c.ifResult(I32);
+    c.localGet(A);
+    c.f64Const(0);
+    c.f64Ne();
+    c.ifResult(I32);
+    c.i32Const(1);
+    c.else_();
+    c.localGet(A);
+    c.i64ReinterpretF64();
+    c.localGet(B);
+    c.i64ReinterpretF64();
+    c.i64Eq();
+    c.end();
+    c.else_();
+    c.localGet(A);
+    c.localGet(A);
+    c.f64Ne();
+    c.localGet(B);
+    c.localGet(B);
+    c.f64Ne();
+    c.i32And();
+    c.end();
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  private eqFailFunc: number | null = null;
+
+  /** %w.assert.eqFail(ia, ib, quotes, bothZero, header, msg, hasMsg) →
+   * str — scr_assert_eq_fail ported verbatim: msg-as-header when
+   * non-empty else the CALLER-SUPPLIED default header, the
+   * <=12-code-unit short form ("ia !== ib") unless bothZero, else the
+   * stacked "+ actual - expected" form with a `^` first-difference
+   * caret over the INSPECTED text (own Node measurements, plan.txt
+   * §1a, confirm every P1 caller wants this — the C's `strings`
+   * parameter is always true here, so it is dropped rather than
+   * threaded through as a dead flag). `ia`/`ib` are ALREADY-INSPECTED
+   * (quoted-if-string) text; `quotes` is the number of string-typed
+   * SIDES (0 for eqF64/eqBool, 2 for eqStr), used only to exclude
+   * their 2 quote characters each from the 12-unit budget. `header` is
+   * a STRING, not a `deep` flag (des-23's D.5, adopted per the lead:
+   * the caller picks EQ_HEADER_STRICT/DEEP_EQUAL_HEADER today, and P2's
+   * dyn simple arm reuses this exact assembler with its own
+   * strictEqualObject/notStrictEqualObject headers — no second
+   * assembler, and 1603's scalar pins double as P2's simple-arm pins).
+   * Referred to as `eqFailSimple` in design-p2.txt; kept as `eqFail`
+   * here since nothing else in P1 needs the distinction yet. */
+  private eqFailHelper(): number {
+    if (this.eqFailFunc !== null) return this.eqFailFunc;
+    const strT = this.strType;
+    const idx = this.mb.declareFunc(
+      this.mb.funcType([this.strRef, this.strRef, I32, I32, this.strRef, this.strRef, I32], [this.strRef]),
+      "%w.assert.eqFail",
+    );
+    this.eqFailFunc = idx;
+    const c = new Code();
+    const IA = 0;
+    const IB = 1;
+    const QUOTES = 2;
+    const BOTHZERO = 3;
+    const HEADER = 4;
+    const MSG = 5;
+    const HASMSG = 6;
+    const MARK = 7;
+    const STRLEN = 8;
+    const I = 9;
+    const LA = 10;
+    const LB = 11;
+    this.insp.pushMark(c);
+    c.localSet(MARK);
+    c.localGet(HASMSG);
+    c.ifVoid();
+    c.localGet(MSG);
+    c.arrayLen();
+    c.ifVoid();
+    c.localGet(MSG);
+    c.call(this.insp.ibPuts());
+    c.else_();
+    c.localGet(HEADER);
+    c.call(this.insp.ibPuts());
+    c.end();
+    c.else_();
+    c.localGet(HEADER);
+    c.call(this.insp.ibPuts());
+    c.end();
+    c.localGet(IA);
+    c.arrayLen();
+    c.localSet(LA);
+    c.localGet(IB);
+    c.arrayLen();
+    c.localSet(LB);
+    // stringsLen = la + lb - quotes - quotes (avoids needing i32.mul for
+    // a value that is always 0 or 2 anyway).
+    c.localGet(LA);
+    c.localGet(LB);
+    c.i32Add();
+    c.localGet(QUOTES);
+    c.i32Sub();
+    c.localGet(QUOTES);
+    c.i32Sub();
+    c.localSet(STRLEN);
+    c.localGet(STRLEN);
+    c.i32Const(12);
+    c.i32LeS();
+    c.localGet(BOTHZERO);
+    c.i32Eqz();
+    c.i32And(); // safe: both sides are pure compares, no effects
+    c.ifVoid();
+    // short form: "\n\n" + ia + " !== " + ib + "\n"
+    this.pushStrLitInto(c, "\n\n");
+    c.call(this.insp.ibPuts());
+    c.localGet(IA);
+    c.call(this.insp.ibPuts());
+    this.pushStrLitInto(c, " !== ");
+    c.call(this.insp.ibPuts());
+    c.localGet(IB);
+    c.call(this.insp.ibPuts());
+    c.i32Const(0x0a);
+    c.call(this.insp.ibPutc());
+    c.else_();
+    // stacked form
+    this.pushStrLitInto(c, "\n+ actual - expected\n\n+ ");
+    c.call(this.insp.ibPuts());
+    c.localGet(IA);
+    c.call(this.insp.ibPuts());
+    this.pushStrLitInto(c, "\n- ");
+    c.call(this.insp.ibPuts());
+    c.localGet(IB);
+    c.call(this.insp.ibPuts());
+    // the caret: only when la+lb<=80 (Node's 80-column non-TTY default)
+    c.localGet(LA);
+    c.localGet(LB);
+    c.i32Add();
+    c.i32Const(80);
+    c.i32LeS();
+    c.ifVoid();
+    // i = the shared-prefix length over the inspected text, bounded by
+    // min(la, lb) — the SAME loop shape pickQuote/escapeInto already
+    // use (block/loop + brIf(1) to break).
+    c.i32Const(0);
+    c.localSet(I);
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.localGet(LA);
+    c.i32LtS();
+    c.localGet(I);
+    c.localGet(LB);
+    c.i32LtS();
+    c.i32And();
+    c.i32Eqz();
+    c.brIf(1);
+    c.localGet(IA);
+    c.localGet(I);
+    c.arrayGetU(strT);
+    c.localGet(IB);
+    c.localGet(I);
+    c.arrayGetU(strT);
+    c.i32Eq();
+    c.i32Eqz();
+    c.brIf(1);
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+    // suppressed when i<3 or i>=la (matches C exactly — see plan.txt
+    // §1a for why i>=la could not be reached by measurement, kept
+    // anyway).
+    c.localGet(I);
+    c.i32Const(3);
+    c.i32GeS();
+    c.localGet(I);
+    c.localGet(LA);
+    c.i32LtS();
+    c.i32And();
+    c.ifVoid();
+    c.i32Const(0x0a);
+    c.call(this.insp.ibPutc());
+    c.localGet(I);
+    c.i32Const(2);
+    c.i32Add();
+    c.call(this.insp.ibSpaces());
+    c.i32Const(0x5e); // '^'
+    c.call(this.insp.ibPutc());
+    c.end();
+    c.end();
+    c.i32Const(0x0a);
+    c.call(this.insp.ibPutc());
+    c.end();
+    c.localGet(MARK);
+    c.call(this.insp.ibTake());
+    this.mb.setBody(idx, [I32, I32, I32, I32, I32], c.bytes());
+    return idx;
+  }
+
+  private neqFailFunc: number | null = null;
+
+  /** %w.assert.neqFail(base, insp, msg, hasMsg) → str — scr_assert_
+   * neq_fail ported verbatim: msg ALONE (even "") when hasMsg, else
+   * `base` + insp, inline (" ") under insp.length<=5, block ("\n\n")
+   * above (own measurements, plan.txt §1a). `base` is a STRING, not a
+   * `deep` flag (des-23's D.5 / the lead's own instruction — matches
+   * eqFailHelper's own header-as-string change; param order here is
+   * `(base, insp, ...)`, matching design-p2.txt's own naming exactly,
+   * NOT `(insp, base, ...)` — the two functions' HEADER-like param
+   * lands in a different position, so double-check at each call site).
+   * ONLY ever called with a single-line `insp` — a multi-line
+   * inspection is caught by eqStr's OWN sentinel before this is
+   * reached (E-11: Node's real inline-vs-block rule is LINE COUNT, not
+   * length, and this function's `length<=5` test only agrees with that
+   * rule when the rendering is single-line, which is now guaranteed by
+   * the caller). */
+  private neqFailHelper(): number {
+    if (this.neqFailFunc !== null) return this.neqFailFunc;
+    const idx = this.mb.declareFunc(
+      this.mb.funcType([this.strRef, this.strRef, this.strRef, I32], [this.strRef]),
+      "%w.assert.neqFail",
+    );
+    this.neqFailFunc = idx;
+    const c = new Code();
+    const BASE = 0;
+    const INSP = 1;
+    const MSG = 2;
+    const HASMSG = 3;
+    const MARK = 4;
+    c.localGet(HASMSG);
+    c.ifVoid();
+    c.localGet(MSG);
+    c.return_();
+    c.end();
+    this.insp.pushMark(c);
+    c.localSet(MARK);
+    c.localGet(BASE);
+    c.call(this.insp.ibPuts());
+    c.localGet(INSP);
+    c.arrayLen();
+    c.i32Const(5);
+    c.i32GtS();
+    c.ifVoid();
+    this.pushStrLitInto(c, "\n\n");
+    c.call(this.insp.ibPuts());
+    c.else_();
+    this.pushStrLitInto(c, " ");
+    c.call(this.insp.ibPuts());
+    c.end();
+    c.localGet(INSP);
+    c.call(this.insp.ibPuts());
+    c.localGet(MARK);
+    c.call(this.insp.ibTake());
+    this.mb.setBody(idx, [I32], c.bytes());
+    return idx;
+  }
+
+  /** Shared by ifErrorErr/F64/Str/Bool/Dyn's scalar+error arms
+   * (scr_assert_iferror_fail ported): one fixed prefix, one detail
+   * piece from the caller, always throws (the caller has already
+   * decided whether to call this at all). Emits into `this.fn.code`
+   * (the CURRENT program function) — unlike the standalone helpers
+   * above, this uses `this.insp.*` but NOT a fresh `Code`, so it is a
+   * plain private method rather than an interned wasm function (each
+   * call site's `pushDetail` differs). */
+  private emitIfErrorFail(code: Code, pushDetail: () => void): void {
+    const markLocal = this.acquireScratch(I32);
+    this.insp.pushMark(code);
+    code.localSet(markLocal);
+    this.pushStrLitInto(code, "ifError got unwanted exception: ");
+    code.call(this.insp.ibPuts());
+    pushDetail();
+    code.call(this.insp.ibPuts());
+    const resultLocal = this.acquireScratch(this.strRef);
+    code.localGet(markLocal);
+    code.call(this.insp.ibTake());
+    code.localSet(resultLocal);
+    this.releaseScratch(I32, markLocal);
+    this.emitSetCellError(code, "%Error", "AssertionError", () => code.localGet(resultLocal), "ERR_ASSERTION");
+    this.emitUnwind();
+    this.releaseScratch(this.strRef, resultLocal);
+  }
+
+  /** Node's real strEscape rendering (quoteInto) of a string into a
+   * fresh local — `pushStr` MUST be side-effect-free (called twice:
+   * once for quoteInto's `s` argument, once more for its own `to` bound
+   * via arrayLen); every call site here passes a bare localGet. Shared
+   * by eqStr's ia/ib and ifErrorStr/ifErrorDyn's STR arm. Emits into
+   * `this.fn.code`, like emitIfErrorFail above. */
+  private emitInspectStrInto(code: Code, pushStr: () => void, destLocal: number): void {
+    const markLocal = this.acquireScratch(I32);
+    this.insp.pushMark(code);
+    code.localSet(markLocal);
+    pushStr();
+    code.i32Const(0);
+    pushStr();
+    code.arrayLen();
+    code.call(this.insp.quoteInto());
+    code.localGet(markLocal);
+    code.call(this.insp.ibTake());
+    code.localSet(destLocal);
+    this.releaseScratch(I32, markLocal);
+  }
+
+  /** Pushes ONE str: `deepLocal ? deepText : strictText` — the eq/deep
+   * header selection eqFail/neqFail's callers make now that both take
+   * the header as a STRING (des-23 D.5 / the lead's instruction).
+   * Inline-pushing (not a local) since it is consumed immediately as
+   * the next call argument at every site. */
+  private pushHeaderFor(code: Code, deepLocal: number, strictText: string, deepText: string): void {
+    code.localGet(deepLocal);
+    this.openIfResult(this.strRef);
+    this.pushStrLitInto(code, deepText);
+    code.else_();
+    this.pushStrLitInto(code, strictText);
+    this.close();
+  }
+
+  /** i32 boolean: does `strLocal` contain a 0x0a code unit? eqStr's OWN
+   * multi-line-sentinel predicate (des-23 D.9 / the lead's own
+   * instruction) — tests the RENDERED inspection, never the raw input
+   * (measured to differ: a 10002-unit string whose only "\n" sits past
+   * the 10000-unit cap renders on ONE line). Scans the whole string
+   * rather than breaking early on the first hit — simpler control flow,
+   * and this only ever runs on an ALREADY-FAILING assert path. Uses
+   * `this.openBlock()`/`this.openLoop()`/`this.close()` (fn-tracked),
+   * so `code` must be `this.fn.code` — a case-arm helper, not a
+   * standalone function builder. */
+  private emitStrHasNewline(code: Code, strLocal: number): void {
+    const iLocal = this.acquireScratch(I32);
+    const lenLocal = this.acquireScratch(I32);
+    const foundLocal = this.acquireScratch(I32);
+    code.localGet(strLocal);
+    code.arrayLen();
+    code.localSet(lenLocal);
+    code.i32Const(0);
+    code.localSet(foundLocal);
+    code.i32Const(0);
+    code.localSet(iLocal);
+    this.openBlock();
+    this.openLoop();
+    code.localGet(iLocal);
+    code.localGet(lenLocal);
+    code.i32GeS();
+    code.brIf(1);
+    code.localGet(strLocal);
+    code.localGet(iLocal);
+    code.arrayGetU(this.strType);
+    code.i32Const(0x0a);
+    code.i32Eq();
+    this.openIf();
+    code.i32Const(1);
+    code.localSet(foundLocal);
+    this.close();
+    code.localGet(iLocal);
+    code.i32Const(1);
+    code.i32Add();
+    code.localSet(iLocal);
+    code.br(0);
+    this.close();
+    this.close();
+    code.localGet(foundLocal);
+    this.releaseScratch(I32, iLocal);
+    this.releaseScratch(I32, lenLocal);
+    this.releaseScratch(I32, foundLocal);
+  }
+
+  /* ── the deepStrictEqual cycle memo (assert.deqEnter/deqLeave) ───────
+   * Node's REAL memo (lib/internal/util/comparisons.js, handleCycles —
+   * SEMANTICS.md S056 has the full measured record and why the exact
+   * gate is not portable) is not one rule but TWO, gated by which of
+   * three phases the memo is in for the CURRENT top-level comparison:
+   *   depth 1 (memos===undefined): record the pair (a,b) as top; WALK
+   *     unconditionally — nothing to compare against yet.
+   *   depth 2 (set===undefined, deep===false): PAIR rules against the
+   *     top pair ONLY — a===top.a -> answer (b===top.b); b===top.b ->
+   *     UNEQUAL; otherwise record (c,d) as "mid", deep=true, WALK.
+   *   depth ≥3 (deep===true, set still undefined on the FIRST such
+   *     call): promote — seed one Set with {a,b,c,d} — then and for
+   *     EVERY later call in this comparison, regardless of nominal
+   *     depth, apply the 3-way SET rule: both present -> EQUAL, exactly
+   *     one -> UNEQUAL, neither -> push both and WALK.
+   * detectCycles's stack-overflow gate (fresh Node runs NO memo at all
+   * until a real overflow) is NOT ported — S056, Joe's option A: this
+   * memo runs on every comparison, deterministically.
+   * State: a `depth` counter (counts open WALK frames only — a frame
+   * opens exactly when a call returns WALK and its matching deqLeave
+   * fires when that frame's own walk returns); the top pair (a,b) and
+   * the mid pair (c,d), one slot each — Node's memos object holds
+   * exactly one of each, never stacked, because the pair-rule phase is
+   * reachable only until the FIRST promotion anywhere in the tree, and
+   * a fresh mid slot is only opened after the previous one's frame has
+   * fully closed; a `deep`/`setActive` flag pair mirroring memos.deep /
+   * (memos.set !== undefined); and the promoted set itself, kept as the
+   * two parallel growable eqref arrays below (modeled on inspect.ts's
+   * circCheck/seenPush precedent, doubled for pairs) — a flat scan of
+   * both columns for a value is exactly Set-membership, since every
+   * push adds both sides. deqLeave classifies its own cleanup by the
+   * PRE-decrement depth value alone (1 -> full reset, matching a fresh
+   * memos next call; 2 -> the mid-pair/deep cleanup; ≥3 -> pop one set
+   * entry) — this is safe even for a later sibling that nominally lands
+   * at depth 2 through the set rule (once promoted, setActive is
+   * permanently true, so its "conditional pop" degenerates to exactly
+   * the ordinary pop; see FINDINGS for the traced proof). Called only
+   * from deepEqHelper's cycle wrapper (lower-assert.ts), strictly LIFO,
+   * never across a suspension. InspectBuilder's own growEq/eqArr/EQ_REF
+   * are private to that class — EQ_REF/EQ_HEAP are already module-scope
+   * consts in THIS file — so this is its own small copy of the array
+   * shape rather than threading a public accessor through for one
+   * caller. */
+
+  private deqArrT: number | null = null;
+  private deqAG: number | null = null;
+  private deqBG: number | null = null;
+  private deqLenG: number | null = null;
+  private deqTopAG: number | null = null;
+  private deqTopBG: number | null = null;
+  private deqMidAG: number | null = null;
+  private deqMidBG: number | null = null;
+  private deqDeepG: number | null = null;
+  private deqSetActiveG: number | null = null;
+  private deqDepthG: number | null = null;
+
+  private deqArrType(): number {
+    this.deqArrT ??= this.mb.arrayType(EQ_REF, true);
+    return this.deqArrT;
+  }
+
+  private deqArrRef(): ValType {
+    return { kind: "ref", nullable: true, typeIndex: this.deqArrType() };
+  }
+
+  private deqSideGlobal(field: "deqAG" | "deqBG"): number {
+    if (this[field] === null) {
+      const t = this.deqArrType();
+      this[field] = this.mb.addGlobal({ kind: "ref", nullable: true, typeIndex: t }, true, (w) => {
+        w.u8(0xd0);
+        w.sleb(t);
+      });
+    }
+    return this[field]!;
+  }
+
+  private deqLenGlobal(): number {
+    this.deqLenG ??= this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41);
+      w.sleb(0);
+    });
+    return this.deqLenG;
+  }
+
+  /** The four scalar memo slots — Node's memos.a/b/c/d, one live value
+   * each (never stacked; see the memo doc comment above for why). */
+  private deqScalarGlobal(field: "deqTopAG" | "deqTopBG" | "deqMidAG" | "deqMidBG"): number {
+    if (this[field] === null) {
+      this[field] = this.mb.addGlobal(EQ_REF, true, (w) => {
+        w.u8(0xd0);
+        w.sleb(EQ_HEAP);
+      });
+    }
+    return this[field]!;
+  }
+
+  private deqDeepGlobal(): number {
+    this.deqDeepG ??= this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41);
+      w.sleb(0);
+    });
+    return this.deqDeepG;
+  }
+
+  private deqSetActiveGlobal(): number {
+    this.deqSetActiveG ??= this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41);
+      w.sleb(0);
+    });
+    return this.deqSetActiveG;
+  }
+
+  /** Open-WALK-frame counter — see the memo doc comment for what each
+   * pre-decrement value at deqLeave means. */
+  private deqDepthGlobal(): number {
+    this.deqDepthG ??= this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41);
+      w.sleb(0);
+    });
+    return this.deqDepthG;
+  }
+
+  private growDeqAFunc: number | null = null;
+  private growDeqBFunc: number | null = null;
+
+  /** Grow one deq pair-memo side to hold `need` slots, preserving
+   * `keep` — the exact shape of inspect.ts's growEq. */
+  private growDeqSide(cacheField: "growDeqAFunc" | "growDeqBFunc", global: number): number {
+    if (this[cacheField] !== null) return this[cacheField]!;
+    const arrT = this.deqArrType();
+    const idx = this.mb.declareFunc(
+      this.mb.funcType([I32, I32], []),
+      cacheField === "growDeqAFunc" ? "%w.assert.growDeqA" : "%w.assert.growDeqB",
+    );
+    this[cacheField] = idx;
+    const c = new Code();
+    const NEED = 0;
+    const KEEP = 1;
+    const CAP = 2;
+    const NA = 3;
+    c.globalGet(global);
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    c.localGet(NEED);
+    c.globalGet(global);
+    c.arrayLen();
+    c.i32LeU();
+    c.ifVoid();
+    c.return_();
+    c.end();
+    c.globalGet(global);
+    c.arrayLen();
+    c.localSet(CAP);
+    c.end();
+    c.localGet(CAP);
+    c.i32Const(8);
+    c.i32LtU();
+    c.ifVoid();
+    c.i32Const(8);
+    c.localSet(CAP);
+    c.end();
+    c.block();
+    c.loop();
+    c.localGet(CAP);
+    c.localGet(NEED);
+    c.i32GeU();
+    c.brIf(1);
+    c.localGet(CAP);
+    c.i32Const(1);
+    c.i32Shl();
+    c.localSet(CAP);
+    c.localGet(CAP);
+    c.i32Eqz();
+    c.ifVoid();
+    c.unreachable();
+    c.end();
+    c.br(0);
+    c.end();
+    c.end();
+    c.localGet(CAP);
+    c.arrayNewDefault(arrT);
+    c.localSet(NA);
+    c.localGet(KEEP);
+    c.ifVoid();
+    c.localGet(NA);
+    c.i32Const(0);
+    c.globalGet(global);
+    c.i32Const(0);
+    c.localGet(KEEP);
+    c.arrayCopy(arrT, arrT);
+    c.end();
+    c.localGet(NA);
+    c.globalSet(global);
+    this.mb.setBody(idx, [I32, this.deqArrRef()], c.bytes());
+    return idx;
+  }
+
+  private pushDeqPairFunc: number | null = null;
+
+  /** %w.assert.deqPushPair(a, b) → void — append (a,b) as a new row of
+   * the promoted set's two-column storage (Set.add(a); Set.add(b), one
+   * push). Shared by deqEnter's promotion seeding (called twice, for
+   * the top pair then the mid pair) and its own set-rule push. */
+  private pushDeqPairHelper(): number {
+    if (this.pushDeqPairFunc !== null) return this.pushDeqPairFunc;
+    const arrT = this.deqArrType();
+    const aGlobal = this.deqSideGlobal("deqAG");
+    const bGlobal = this.deqSideGlobal("deqBG");
+    const lenGlobal = this.deqLenGlobal();
+    const idx = this.mb.declareFunc(this.mb.funcType([EQ_REF, EQ_REF], []), "%w.assert.deqPushPair");
+    this.pushDeqPairFunc = idx;
+    const c = new Code();
+    const A = 0;
+    const B = 1;
+    c.globalGet(lenGlobal);
+    c.i32Const(1);
+    c.i32Add();
+    c.globalGet(lenGlobal);
+    c.call(this.growDeqSide("growDeqAFunc", aGlobal));
+    c.globalGet(lenGlobal);
+    c.i32Const(1);
+    c.i32Add();
+    c.globalGet(lenGlobal);
+    c.call(this.growDeqSide("growDeqBFunc", bGlobal));
+    c.globalGet(aGlobal);
+    c.globalGet(lenGlobal);
+    c.localGet(A);
+    c.arraySet(arrT);
+    c.globalGet(bGlobal);
+    c.globalGet(lenGlobal);
+    c.localGet(B);
+    c.arraySet(arrT);
+    c.globalGet(lenGlobal);
+    c.i32Const(1);
+    c.i32Add();
+    c.globalSet(lenGlobal);
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  private deqEnterFunc: number | null = null;
+
+  /** %w.assert.deqEnter(a, b) → F64 — scr_assert_deq_enter ported: the
+   * 3-way F64 verdict (0=WALK/1=EQUAL/2=UNEQUAL) is unchanged from F1,
+   * but the RULE is now Node's real two-phase memo — see the doc
+   * comment above the deq state fields for the full phase table and
+   * SEMANTICS.md S056 for the measured record (comparisons.js's
+   * detectCycles/handleCycles). Never throws. */
+  private deqEnterHelper(): number {
+    if (this.deqEnterFunc !== null) return this.deqEnterFunc;
+    const arrT = this.deqArrType();
+    const aGlobal = this.deqSideGlobal("deqAG");
+    const bGlobal = this.deqSideGlobal("deqBG");
+    const lenGlobal = this.deqLenGlobal();
+    const topA = this.deqScalarGlobal("deqTopAG");
+    const topB = this.deqScalarGlobal("deqTopBG");
+    const midA = this.deqScalarGlobal("deqMidAG");
+    const midB = this.deqScalarGlobal("deqMidBG");
+    const deepG = this.deqDeepGlobal();
+    const setActiveG = this.deqSetActiveGlobal();
+    const depthG = this.deqDepthGlobal();
+    const push = this.pushDeqPairHelper();
+    const idx = this.mb.declareFunc(this.mb.funcType([EQ_REF, EQ_REF], [F64]), "%w.assert.deqEnter");
+    this.deqEnterFunc = idx;
+    const c = new Code();
+    const A = 0;
+    const B = 1;
+    const I = 2;
+    const APRESENT = 3;
+    const BPRESENT = 4;
+
+    // depth 1 (Node: memos === undefined) — record the top pair, WALK
+    // unconditionally.
+    c.globalGet(depthG);
+    c.i32Eqz();
+    c.ifVoid();
+    c.localGet(A);
+    c.globalSet(topA);
+    c.localGet(B);
+    c.globalSet(topB);
+    c.i32Const(0);
+    c.globalSet(deepG);
+    c.i32Const(0);
+    c.globalSet(setActiveG);
+    c.i32Const(1);
+    c.globalSet(depthG);
+    c.f64Const(0);
+    c.return_();
+    c.end();
+
+    c.globalGet(setActiveG);
+    c.i32Eqz();
+    c.ifVoid();
+    // set not yet promoted (Node: memos.set === undefined)
+    c.globalGet(deepG);
+    c.i32Eqz();
+    c.ifVoid();
+    // depth 2 (Node: memos.deep === false) — PAIR rules against the
+    // top pair only.
+    c.localGet(A);
+    c.globalGet(topA);
+    c.refEq();
+    c.ifVoid();
+    c.localGet(B);
+    c.globalGet(topB);
+    c.refEq();
+    c.ifVoid();
+    c.f64Const(1);
+    c.return_();
+    c.end();
+    c.f64Const(2);
+    c.return_();
+    c.end();
+    c.localGet(B);
+    c.globalGet(topB);
+    c.refEq();
+    c.ifVoid();
+    c.f64Const(2);
+    c.return_();
+    c.end();
+    // else: record the mid pair, open the depth-2 frame, WALK.
+    c.localGet(A);
+    c.globalSet(midA);
+    c.localGet(B);
+    c.globalSet(midB);
+    c.i32Const(1);
+    c.globalSet(deepG);
+    c.globalGet(depthG);
+    c.i32Const(1);
+    c.i32Add();
+    c.globalSet(depthG);
+    c.f64Const(0);
+    c.return_();
+    c.end();
+    // depth ≥3, first call while deep (Node: memos.deep === true) —
+    // PROMOTE: seed the set with {top, mid}, then fall through to the
+    // set rule below for (a,b) itself.
+    c.globalGet(topA);
+    c.globalGet(topB);
+    c.call(push);
+    c.globalGet(midA);
+    c.globalGet(midB);
+    c.call(push);
+    c.i32Const(1);
+    c.globalSet(setActiveG);
+    c.end();
+
+    // the set rule (Node: `const { set } = memos; ...`) — reached
+    // either because setActive was already true, or just became true
+    // above. Scans BOTH columns for BOTH a and b — a value can be
+    // present in EITHER column from an earlier push, not just its own.
+    const markPresent = (side: number, target: number, into: number): void => {
+      c.globalGet(side);
+      c.localGet(I);
+      c.arrayGet(arrT);
+      c.localGet(target);
+      c.refEq();
+      c.ifVoid();
+      c.i32Const(1);
+      c.localSet(into);
+      c.end();
+    };
+    c.i32Const(0);
+    c.localSet(APRESENT);
+    c.i32Const(0);
+    c.localSet(BPRESENT);
+    c.i32Const(0);
+    c.localSet(I);
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.globalGet(lenGlobal);
+    c.i32GeS();
+    c.brIf(1);
+    markPresent(aGlobal, A, APRESENT);
+    markPresent(bGlobal, A, APRESENT);
+    markPresent(aGlobal, B, BPRESENT);
+    markPresent(bGlobal, B, BPRESENT);
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+    // both present -> EQUAL (1)
+    c.localGet(APRESENT);
+    c.localGet(BPRESENT);
+    c.i32And();
+    c.ifVoid();
+    c.f64Const(1);
+    c.return_();
+    c.end();
+    // exactly one present -> UNEQUAL (2)
+    c.localGet(APRESENT);
+    c.localGet(BPRESENT);
+    c.i32Ne();
+    c.ifVoid();
+    c.f64Const(2);
+    c.return_();
+    c.end();
+    // neither present -> push both, open a set-rule frame, WALK (0)
+    c.localGet(A);
+    c.localGet(B);
+    c.call(push);
+    c.globalGet(depthG);
+    c.i32Const(1);
+    c.i32Add();
+    c.globalSet(depthG);
+    c.f64Const(0);
+    this.mb.setBody(idx, [I32, I32, I32], c.bytes());
+    return idx;
+  }
+
+  private deqLeaveFunc: number | null = null;
+
+  /** %w.assert.deqLeave() → void — scr_assert_deq_leave ported.
+   * Classifies its own cleanup by the PRE-decrement depth value alone:
+   * 1 -> the outermost frame closed, full reset (kept as belt-and-
+   * braces hygiene for the NEXT top-level comparison — the "no stale
+   * state survives a THROWN comparison" property this is pinned
+   * against already holds independently of this reset: the wrapper's
+   * own walk always returns its boolean and unwinds through deqLeave
+   * BEFORE the assert libCall ever raises, so depth is already back to
+   * 0 by the time anything throws; this reset is the only code that
+   * ever clears the top pair at all, so it stays, it just isn't what
+   * makes the pin pass); 2 -> the depth-2 frame closed (clear deep, and
+   * if the set was
+   * promoted during its walk, pop the mid seed back off); ≥3 -> an
+   * ordinary set-rule frame closed, pop one entry. A later sibling that
+   * nominally lands at "depth 2" through the set rule (setActive
+   * already permanently true from an earlier promotion) still takes
+   * the depth-2 branch here, but setActive being true makes its
+   * "conditional pop" unconditional — the same single pop the ordinary
+   * branch would have done; see the memo doc comment above. */
+  private deqLeaveHelper(): number {
+    if (this.deqLeaveFunc !== null) return this.deqLeaveFunc;
+    const lenGlobal = this.deqLenGlobal();
+    const topA = this.deqScalarGlobal("deqTopAG");
+    const topB = this.deqScalarGlobal("deqTopBG");
+    const midA = this.deqScalarGlobal("deqMidAG");
+    const midB = this.deqScalarGlobal("deqMidBG");
+    const deepG = this.deqDeepGlobal();
+    const setActiveG = this.deqSetActiveGlobal();
+    const depthG = this.deqDepthGlobal();
+    const idx = this.mb.declareFunc(this.mb.funcType([], []), "%w.assert.deqLeave");
+    this.deqLeaveFunc = idx;
+    const c = new Code();
+    const D = 0;
+    c.globalGet(depthG);
+    c.localSet(D);
+    c.localGet(D);
+    c.i32Const(1);
+    c.i32Sub();
+    c.globalSet(depthG);
+
+    // D == 1: outermost frame -> full reset.
+    c.localGet(D);
+    c.i32Const(1);
+    c.i32Eq();
+    c.ifVoid();
+    c.refNull(EQ_HEAP);
+    c.globalSet(topA);
+    c.refNull(EQ_HEAP);
+    c.globalSet(topB);
+    c.refNull(EQ_HEAP);
+    c.globalSet(midA);
+    c.refNull(EQ_HEAP);
+    c.globalSet(midB);
+    c.i32Const(0);
+    c.globalSet(deepG);
+    c.i32Const(0);
+    c.globalSet(setActiveG);
+    c.i32Const(0);
+    c.globalSet(lenGlobal);
+    c.return_();
+    c.end();
+
+    // D == 2: the depth-2 frame -> clear deep; pop the mid seed if a
+    // promotion happened during its walk.
+    c.localGet(D);
+    c.i32Const(2);
+    c.i32Eq();
+    c.ifVoid();
+    c.i32Const(0);
+    c.globalSet(deepG);
+    c.globalGet(setActiveG);
+    c.ifVoid();
+    c.globalGet(lenGlobal);
+    c.i32Const(1);
+    c.i32Sub();
+    c.globalSet(lenGlobal);
+    c.end();
+    c.refNull(EQ_HEAP);
+    c.globalSet(midA);
+    c.refNull(EQ_HEAP);
+    c.globalSet(midB);
+    c.return_();
+    c.end();
+
+    // D >= 3: an ordinary set-rule frame -> pop one entry.
+    c.globalGet(lenGlobal);
+    c.i32Const(0);
+    c.i32GtS();
+    c.ifVoid();
+    c.globalGet(lenGlobal);
+    c.i32Const(1);
+    c.i32Sub();
+    c.globalSet(lenGlobal);
+    c.end();
+    this.mb.setBody(idx, [I32], c.bytes());
+    return idx;
+  }
+
+  /* ── assert.throws(fn, {name/code/message}) — the 3-slot shape
+   * accumulator ────────────────────────────────────────────────────── */
+
+  private shapeErrG: number | null = null;
+  private shapeVal0G: number | null = null;
+  private shapeVal1G: number | null = null;
+  private shapeVal2G: number | null = null;
+  private shapePresent0G: number | null = null;
+  private shapePresent1G: number | null = null;
+  private shapePresent2G: number | null = null;
+
+  private shapeErrGlobal(errT: number): number {
+    if (this.shapeErrG === null) {
+      this.shapeErrG = this.mb.addGlobal({ kind: "ref", nullable: true, typeIndex: errT }, true, (w) => {
+        w.u8(0xd0);
+        w.sleb(errT);
+      });
+    }
+    return this.shapeErrG;
+  }
+
+  private shapeValGlobal(slot: number): number {
+    const field = (["shapeVal0G", "shapeVal1G", "shapeVal2G"] as const)[slot]!;
+    if (this[field] === null) {
+      this[field] = this.mb.addGlobal(this.strRef, true, (w) => {
+        w.u8(0xd0);
+        w.sleb(this.strType);
+      });
+    }
+    return this[field]!;
+  }
+
+  private shapePresentGlobal(slot: number): number {
+    const field = (["shapePresent0G", "shapePresent1G", "shapePresent2G"] as const)[slot]!;
+    if (this[field] === null) {
+      this[field] = this.mb.addGlobal(I32, true, (w) => {
+        w.u8(0x41);
+        w.sleb(0);
+      });
+    }
+    return this[field]!;
+  }
+
+  private shapeEndFunc: number | null = null;
+
+  /** %w.assert.shapeEnd(msg, hasMsg) → void — Node's expectedException
+   * Comparison diff over the 3-slot accumulator (scr_assert_shape_end /
+   * scr_shape_matches / scr_shape_diff_fail, scr_assert.c 1216-1394,
+   * ported verbatim including the <=5-line LCS table and its tie-break
+   * — measured against Node directly (own probes) BEYOND 1727's own
+   * single shape: the walk genuinely REORDERS +/- lines relative to
+   * naive per-key emission (a code-absent key plus a later
+   * value-mismatched key renders "+laterKey, -code, -laterKey", NOT
+   * "-code, +laterKey, -laterKey" — a simpler per-key-order shortcut
+   * was tried first and DISPROVED by this measurement before this
+   * function was written the way it is now). shapeRe never runs in P1
+   * (stays refusing by name), so every slot here is string-valued:
+   * `inspect` is unconditionally true, matching C's own hardcoded
+   * `true` for the actual side and the `!is_re` simplification for the
+   * expected side. Sets the exception cell itself (unlike eqFail/
+   * neqFail, which only build a string) because the "match vs mismatch"
+   * decision lives entirely inside this one generic function — the
+   * caller (assert.shapeEnd's case arm) just calls this then
+   * `emitPendingCheck()`, the ordinary may-throw-call discipline. */
+  private shapeEndHelper(): number {
+    if (this.shapeEndFunc !== null) return this.shapeEndFunc;
+    const errT = this.exc().errT;
+    const strArrT = this.mb.arrayType(this.strRef, true);
+    const i32ArrT = this.mb.arrayType(I32, true);
+    const idx = this.mb.declareFunc(this.mb.funcType([this.strRef, I32], []), "%w.assert.shapeEnd");
+    this.shapeEndFunc = idx;
+    const errGlobal = this.shapeErrGlobal(errT);
+    const val0 = this.shapeValGlobal(0);
+    const val1 = this.shapeValGlobal(1);
+    const val2 = this.shapeValGlobal(2);
+    const present0 = this.shapePresentGlobal(0);
+    const present1 = this.shapePresentGlobal(1);
+    const present2 = this.shapePresentGlobal(2);
+    const c = new Code();
+    const MSG = 0;
+    const HASMSG = 1;
+    const P0 = 2;
+    const P1_ = 3;
+    const P2 = 4;
+    const AP0 = 5;
+    const EQ0 = 6;
+    const EQ1 = 7;
+    const EQ2 = 8;
+    const CODEACT = 9;
+    const MATCH = 10;
+    const ALINES = 11;
+    const ELINES = 12;
+    const AN = 13;
+    const EN = 14;
+    const LTAB = 15;
+    const I = 16;
+    const J = 17;
+    const A1 = 18;
+    const A2 = 19;
+    const LINEMARK = 20;
+    const DIFFMARK = 21;
+    const RESULT = 22;
+
+    // ── stage 1: present flags + per-key equality ──
+    c.globalGet(present0);
+    c.localSet(P0);
+    c.globalGet(present1);
+    c.localSet(P1_);
+    c.globalGet(present2);
+    c.localSet(P2);
+    c.i32Const(0);
+    c.localSet(AP0);
+    c.i32Const(0);
+    c.localSet(EQ0);
+    c.localGet(P0);
+    c.ifVoid();
+    c.globalGet(errGlobal);
+    c.structGet(errT, ERR_CODE);
+    c.localSet(CODEACT);
+    c.localGet(CODEACT);
+    c.refIsNull();
+    c.i32Eqz();
+    c.localSet(AP0);
+    c.localGet(AP0);
+    c.ifVoid();
+    c.localGet(CODEACT);
+    c.globalGet(val0);
+    c.call(this.strEqHelper());
+    c.localSet(EQ0);
+    c.end();
+    c.end();
+    c.i32Const(0);
+    c.localSet(EQ1);
+    c.localGet(P1_);
+    c.ifVoid();
+    c.globalGet(errGlobal);
+    c.structGet(errT, ERR_MESSAGE);
+    c.globalGet(val1);
+    c.call(this.strEqHelper());
+    c.localSet(EQ1);
+    c.end();
+    c.i32Const(0);
+    c.localSet(EQ2);
+    c.localGet(P2);
+    c.ifVoid();
+    c.globalGet(errGlobal);
+    c.structGet(errT, ERR_NAME);
+    c.globalGet(val2);
+    c.call(this.strEqHelper());
+    c.localSet(EQ2);
+    c.end();
+
+    // ── MATCH = every present key is actual-present AND value-equal ──
+    c.i32Const(1);
+    c.localSet(MATCH);
+    c.localGet(P0);
+    c.ifVoid();
+    c.localGet(AP0);
+    c.i32Eqz();
+    c.localGet(EQ0);
+    c.i32Eqz();
+    c.i32Or();
+    c.ifVoid();
+    c.i32Const(0);
+    c.localSet(MATCH);
+    c.end();
+    c.end();
+    c.localGet(P1_);
+    c.ifVoid();
+    c.localGet(EQ1);
+    c.i32Eqz();
+    c.ifVoid();
+    c.i32Const(0);
+    c.localSet(MATCH);
+    c.end();
+    c.end();
+    c.localGet(P2);
+    c.ifVoid();
+    c.localGet(EQ2);
+    c.i32Eqz();
+    c.ifVoid();
+    c.i32Const(0);
+    c.localSet(MATCH);
+    c.end();
+    c.end();
+
+    const clearAll = (): void => {
+      c.refNull(errT);
+      c.globalSet(errGlobal);
+      c.i32Const(0);
+      c.globalSet(present0);
+      c.i32Const(0);
+      c.globalSet(present1);
+      c.i32Const(0);
+      c.globalSet(present2);
+      c.refNull(this.strType);
+      c.globalSet(val0);
+      c.refNull(this.strType);
+      c.globalSet(val1);
+      c.refNull(this.strType);
+      c.globalSet(val2);
+    };
+
+    c.localGet(MATCH);
+    c.ifVoid();
+    clearAll();
+    c.return_();
+    c.end();
+
+    c.localGet(HASMSG);
+    c.ifVoid();
+    clearAll();
+    this.emitSetCellError(c, "%Error", "AssertionError", (m) => m.localGet(MSG), "ERR_ASSERTION");
+    c.return_();
+    c.end();
+
+    // ── the diff: build alines/elines (>=1 present key guaranteed —
+    // MATCH would have been trivially true otherwise) ──
+    c.i32Const(5);
+    c.arrayNewDefault(strArrT);
+    c.localSet(ALINES);
+    c.i32Const(5);
+    c.arrayNewDefault(strArrT);
+    c.localSet(ELINES);
+    c.i32Const(0);
+    c.localSet(AN);
+    c.i32Const(0);
+    c.localSet(EN);
+
+    const buildLine = (keyName: string, pushValue: () => void, pushIsLast: () => void): void => {
+      this.insp.pushMark(c);
+      c.localSet(LINEMARK);
+      this.pushStrLitInto(c, "  ");
+      c.call(this.insp.ibPuts());
+      this.pushStrLitInto(c, keyName);
+      c.call(this.insp.ibPuts());
+      this.pushStrLitInto(c, ": ");
+      c.call(this.insp.ibPuts());
+      pushValue();
+      c.i32Const(0);
+      pushValue();
+      c.arrayLen();
+      c.call(this.insp.quoteInto());
+      pushIsLast();
+      c.i32Eqz();
+      c.ifVoid();
+      c.i32Const(0x2c); // ','
+      c.call(this.insp.ibPutc());
+      c.end();
+      c.localGet(LINEMARK);
+      c.call(this.insp.ibTake());
+    };
+    const isLastFrom = (k: 0 | 1 | 2): (() => void) => {
+      if (k === 2) return () => c.i32Const(1);
+      if (k === 1) return () => { c.localGet(P2); c.i32Eqz(); };
+      return () => {
+        c.localGet(P1_);
+        c.i32Eqz();
+        c.localGet(P2);
+        c.i32Eqz();
+        c.i32And();
+      };
+    };
+
+    // key 0 = code
+    c.localGet(P0);
+    c.ifVoid();
+    c.localGet(ELINES);
+    c.localGet(EN);
+    c.i32Const(1);
+    c.i32Add();
+    buildLine("code", () => c.globalGet(val0), isLastFrom(0));
+    c.arraySet(strArrT);
+    c.localGet(EN);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(EN);
+    c.localGet(AP0);
+    c.ifVoid();
+    c.localGet(ALINES);
+    c.localGet(AN);
+    c.i32Const(1);
+    c.i32Add();
+    buildLine("code", () => c.localGet(CODEACT), isLastFrom(0));
+    c.arraySet(strArrT);
+    c.localGet(AN);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(AN);
+    c.end();
+    c.end();
+    // key 1 = message (always actual-present when present — errT.message
+    // is non-nullable, errToStrHelper's own stance)
+    c.localGet(P1_);
+    c.ifVoid();
+    c.localGet(ELINES);
+    c.localGet(EN);
+    c.i32Const(1);
+    c.i32Add();
+    buildLine("message", () => c.globalGet(val1), isLastFrom(1));
+    c.arraySet(strArrT);
+    c.localGet(EN);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(EN);
+    c.localGet(ALINES);
+    c.localGet(AN);
+    c.i32Const(1);
+    c.i32Add();
+    buildLine(
+      "message",
+      () => {
+        c.globalGet(errGlobal);
+        c.structGet(errT, ERR_MESSAGE);
+      },
+      isLastFrom(1),
+    );
+    c.arraySet(strArrT);
+    c.localGet(AN);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(AN);
+    c.end();
+    // key 2 = name (same non-nullable stance)
+    c.localGet(P2);
+    c.ifVoid();
+    c.localGet(ELINES);
+    c.localGet(EN);
+    c.i32Const(1);
+    c.i32Add();
+    buildLine("name", () => c.globalGet(val2), isLastFrom(2));
+    c.arraySet(strArrT);
+    c.localGet(EN);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(EN);
+    c.localGet(ALINES);
+    c.localGet(AN);
+    c.i32Const(1);
+    c.i32Add();
+    buildLine(
+      "name",
+      () => {
+        c.globalGet(errGlobal);
+        c.structGet(errT, ERR_NAME);
+      },
+      isLastFrom(2),
+    );
+    c.arraySet(strArrT);
+    c.localGet(AN);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(AN);
+    c.end();
+
+    // finalize elines: "Comparison {" .. "}" (EN >= 1 already)
+    c.localGet(ELINES);
+    c.i32Const(0);
+    this.pushStrLitInto(c, "Comparison {");
+    c.arraySet(strArrT);
+    c.localGet(ELINES);
+    c.localGet(EN);
+    c.i32Const(1);
+    c.i32Add();
+    this.pushStrLitInto(c, "}");
+    c.arraySet(strArrT);
+    c.localGet(EN);
+    c.i32Const(2);
+    c.i32Add();
+    c.localSet(EN);
+
+    // finalize alines: the "Comparison {}" single-line collapse when no
+    // key survived on the actual side, else "Comparison {" .. "}".
+    c.localGet(AN);
+    c.i32Eqz();
+    c.ifVoid();
+    c.localGet(ALINES);
+    c.i32Const(0);
+    this.pushStrLitInto(c, "Comparison {}");
+    c.arraySet(strArrT);
+    c.i32Const(1);
+    c.localSet(AN);
+    c.else_();
+    c.localGet(ALINES);
+    c.i32Const(0);
+    this.pushStrLitInto(c, "Comparison {");
+    c.arraySet(strArrT);
+    c.localGet(ALINES);
+    c.localGet(AN);
+    c.i32Const(1);
+    c.i32Add();
+    this.pushStrLitInto(c, "}");
+    c.arraySet(strArrT);
+    c.localGet(AN);
+    c.i32Const(2);
+    c.i32Add();
+    c.localSet(AN);
+    c.end();
+
+    // ── the LCS table: L[i][j] over alines[i..an), elines[j..en) —
+    // C's L[6][6], flattened to one 36-cell array (index i*6+j). ──
+    c.i32Const(36);
+    c.arrayNewDefault(i32ArrT);
+    c.localSet(LTAB);
+    c.localGet(AN);
+    c.i32Const(1);
+    c.i32Sub();
+    c.localSet(I);
+    c.block(); // outer break
+    c.loop(); // outer continue
+    c.localGet(I);
+    c.i32Const(0);
+    c.i32LtS();
+    c.brIf(1);
+    c.localGet(EN);
+    c.i32Const(1);
+    c.i32Sub();
+    c.localSet(J);
+    c.block(); // inner break
+    c.loop(); // inner continue
+    c.localGet(J);
+    c.i32Const(0);
+    c.i32LtS();
+    c.brIf(1);
+    c.localGet(ALINES);
+    c.localGet(I);
+    c.arrayGet(strArrT);
+    c.localGet(ELINES);
+    c.localGet(J);
+    c.arrayGet(strArrT);
+    c.call(this.strEqHelper());
+    c.ifVoid();
+    c.localGet(LTAB);
+    c.localGet(I);
+    c.i32Const(6);
+    c.i32Mul();
+    c.localGet(J);
+    c.i32Add();
+    c.localGet(LTAB);
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.i32Const(6);
+    c.i32Mul();
+    c.localGet(J);
+    c.i32Const(1);
+    c.i32Add();
+    c.i32Add();
+    c.arrayGet(i32ArrT);
+    c.i32Const(1);
+    c.i32Add();
+    c.arraySet(i32ArrT);
+    c.else_();
+    c.localGet(LTAB);
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.i32Const(6);
+    c.i32Mul();
+    c.localGet(J);
+    c.i32Add();
+    c.arrayGet(i32ArrT);
+    c.localSet(A1);
+    c.localGet(LTAB);
+    c.localGet(I);
+    c.i32Const(6);
+    c.i32Mul();
+    c.localGet(J);
+    c.i32Const(1);
+    c.i32Add();
+    c.i32Add();
+    c.arrayGet(i32ArrT);
+    c.localSet(A2);
+    c.localGet(LTAB);
+    c.localGet(I);
+    c.i32Const(6);
+    c.i32Mul();
+    c.localGet(J);
+    c.i32Add();
+    c.localGet(A1);
+    c.localGet(A2);
+    c.i32GeS();
+    c.ifResult(I32);
+    c.localGet(A1);
+    c.else_();
+    c.localGet(A2);
+    c.end();
+    c.arraySet(i32ArrT);
+    c.end();
+    c.localGet(J);
+    c.i32Const(1);
+    c.i32Sub();
+    c.localSet(J);
+    c.br(0);
+    c.end();
+    c.end();
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Sub();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+
+    // ── the walk: banner, then the myers-tie-break line-by-line print
+    // (L[i+1][j] >= L[i][j+1] prefers actual — C's own tie-break,
+    // MEASURED to genuinely reorder +/- lines, plan.txt §4). ──
+    this.insp.pushMark(c);
+    c.localSet(DIFFMARK);
+    this.pushStrLitInto(c, "Expected values to be strictly deep-equal:\n+ actual - expected\n");
+    c.call(this.insp.ibPuts());
+    c.i32Const(0);
+    c.localSet(I);
+    c.i32Const(0);
+    c.localSet(J);
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.localGet(AN);
+    c.i32LtS();
+    c.localGet(J);
+    c.localGet(EN);
+    c.i32LtS();
+    c.i32And();
+    c.i32Eqz();
+    c.brIf(1);
+    c.localGet(ALINES);
+    c.localGet(I);
+    c.arrayGet(strArrT);
+    c.localGet(ELINES);
+    c.localGet(J);
+    c.arrayGet(strArrT);
+    c.call(this.strEqHelper());
+    c.ifVoid();
+    this.pushStrLitInto(c, "\n  ");
+    c.call(this.insp.ibPuts());
+    c.localGet(ALINES);
+    c.localGet(I);
+    c.arrayGet(strArrT);
+    c.call(this.insp.ibPuts());
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.localGet(J);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(J);
+    c.else_();
+    c.localGet(LTAB);
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.i32Const(6);
+    c.i32Mul();
+    c.localGet(J);
+    c.i32Add();
+    c.arrayGet(i32ArrT);
+    c.localGet(LTAB);
+    c.localGet(I);
+    c.i32Const(6);
+    c.i32Mul();
+    c.localGet(J);
+    c.i32Const(1);
+    c.i32Add();
+    c.i32Add();
+    c.arrayGet(i32ArrT);
+    c.i32GeS();
+    c.ifVoid();
+    this.pushStrLitInto(c, "\n+ ");
+    c.call(this.insp.ibPuts());
+    c.localGet(ALINES);
+    c.localGet(I);
+    c.arrayGet(strArrT);
+    c.call(this.insp.ibPuts());
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.else_();
+    this.pushStrLitInto(c, "\n- ");
+    c.call(this.insp.ibPuts());
+    c.localGet(ELINES);
+    c.localGet(J);
+    c.arrayGet(strArrT);
+    c.call(this.insp.ibPuts());
+    c.localGet(J);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(J);
+    c.end();
+    c.end();
+    c.br(0);
+    c.end();
+    c.end();
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.localGet(AN);
+    c.i32LtS();
+    c.i32Eqz();
+    c.brIf(1);
+    this.pushStrLitInto(c, "\n+ ");
+    c.call(this.insp.ibPuts());
+    c.localGet(ALINES);
+    c.localGet(I);
+    c.arrayGet(strArrT);
+    c.call(this.insp.ibPuts());
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+    c.block();
+    c.loop();
+    c.localGet(J);
+    c.localGet(EN);
+    c.i32LtS();
+    c.i32Eqz();
+    c.brIf(1);
+    this.pushStrLitInto(c, "\n- ");
+    c.call(this.insp.ibPuts());
+    c.localGet(ELINES);
+    c.localGet(J);
+    c.arrayGet(strArrT);
+    c.call(this.insp.ibPuts());
+    c.localGet(J);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(J);
+    c.br(0);
+    c.end();
+    c.end();
+    c.i32Const(0x0a);
+    c.call(this.insp.ibPutc());
+    c.localGet(DIFFMARK);
+    c.call(this.insp.ibTake());
+    c.localSet(RESULT);
+
+    clearAll();
+    this.emitSetCellError(c, "%Error", "AssertionError", (m) => m.localGet(RESULT), "ERR_ASSERTION");
+
+    this.mb.setBody(
+      idx,
+      [
+        I32, // P0
+        I32, // P1_
+        I32, // P2
+        I32, // AP0
+        I32, // EQ0
+        I32, // EQ1
+        I32, // EQ2
+        this.strRef, // CODEACT
+        I32, // MATCH
+        { kind: "ref", nullable: true, typeIndex: strArrT }, // ALINES
+        { kind: "ref", nullable: true, typeIndex: strArrT }, // ELINES
+        I32, // AN
+        I32, // EN
+        { kind: "ref", nullable: true, typeIndex: i32ArrT }, // LTAB
+        I32, // I
+        I32, // J
+        I32, // A1
+        I32, // A2
+        I32, // LINEMARK
+        I32, // DIFFMARK
+        this.strRef, // RESULT
+      ],
+      c.bytes(),
+    );
+    return idx;
   }
 
   /** Is `e` a `dynFrom`-boxed value whose PRE-BOX static type this
@@ -23634,12 +26054,15 @@ class Assembler {
   /** %w.err.toStr(errT) → str — scr_error_to_string ported: ECMA-262
    * Error.prototype.toString over the two fields, except that a code
    * starting "ERR_" renders Node's own "name [code]: message" (the
-   * AssertionError / NodeError spelling). Two arms of the C are dead on
-   * this tier and transcribed anyway, so they land right when they become
-   * reachable: nothing in tier mints an ERR_ code yet (the fences stamp
-   * SC#### codes, and the assert surface still refuses), and the NULL
-   * field tests cannot fire because the IR types name and message
-   * `string` — a reached error always carries two real arrays. */
+   * AssertionError / NodeError spelling). One arm of the C landed dead
+   * and transcribed anyway, right when it became reachable: increment 23
+   * P1's assert.ok/eqF64/eqStr/eqBool/etc. (emitAssertLibCall) are the
+   * FIRST mint of a real "ERR_" code on this tier (every AssertionError's
+   * "ERR_ASSERTION"), so the "ERR_" arm above is now live — 1602's own
+   * `e.toString()` read exercises it directly ("AssertionError
+   * [ERR_ASSERTION]: ..."). The fences still stamp SC#### codes only.
+   * The NULL field tests still cannot fire — the IR types name and
+   * message `string` — a reached error always carries two real arrays. */
   private errToStrHelper(): number {
     if (this.errToStrFunc !== null) return this.errToStrFunc;
     const exc = this.exc();

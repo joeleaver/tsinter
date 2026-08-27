@@ -151,21 +151,76 @@ void scr_assert_ok(bool pass, ScrStr *message) {
 /* SameValue over doubles — Object.is, the comparison of strictEqual AND
  * deepStrictEqual for numbers (NaN equals NaN; +0 and -0 differ). */
 /* ── deepStrictEqual over cyclic values ────────────────────────────────
- * RECURSIVE record types permit reference cycles; Node's deep equality
- * memoizes (value1, value2) pairs so equal cyclic structures compare
- * true instead of recursing forever. The compiler-emitted per-type
- * helpers over cycle-capable types wrap their walks in enter/leave: a
- * PAIR already being compared answers equal (the coinductive step —
- * Node's memo behavior exactly). The stack is global (comparisons never
- * interleave; the emitted walks cannot throw mid-compare). */
+ * RECURSIVE record types permit reference cycles; Node's REAL cycle
+ * memo (lib/internal/util/comparisons.js handleCycles, lifted directly;
+ * SEMANTICS.md S056 has the full measured record) is NOT one rule but
+ * TWO, gated by which phase the memo is in for the CURRENT top-level
+ * comparison — fix round F1 (increment 23) applied a single "set of
+ * values" rule from the very first comparison, which is measurably
+ * wrong: it answers UNEQUAL on a crossed depth-2 pair (one operand of a
+ * nested pair reusing a value from the OTHER column of an earlier pair)
+ * where Node walks it and finds it equal. F1 DID correctly fix an
+ * earlier, plainer bug (a bare pair-memo answering equal for two
+ * same-labeled cyclic structures of DIFFERENT period, where Node
+ * throws); F2 keeps that fix while porting the real two-phase rule:
+ *   depth 1  (Node: memos === undefined) — record the pair (a,b) as
+ *     "top"; WALK unconditionally, nothing to compare against yet.
+ *   depth 2  (set === undefined, deep === false) — PAIR rules against
+ *     the top pair ONLY: a===top.a -> answer (b===top.b); b===top.b ->
+ *     UNEQUAL; otherwise record (c,d) as "mid", deep=true, WALK.
+ *   depth ≥3, first call reached while deep (set still undefined) —
+ *     PROMOTE: seed one set with {a,b,c,d}; then for THIS call and
+ *     EVERY later one in the comparison, regardless of nominal depth,
+ *     apply the 3-way SET rule: both present -> EQUAL(1); exactly one
+ *     -> UNEQUAL(2); neither -> push both, WALK(0), popped by the
+ *     matching leave.
+ * The promoted set is the two-column array below (a value can appear
+ * in EITHER column from an earlier push, so both columns are scanned
+ * for both a and b — a flat scan is exactly Set-membership, since
+ * every push adds both sides); global, not per-call, because
+ * comparisons never interleave and the emitted walks cannot throw
+ * mid-compare. g_deq_depth counts open WALK frames (one deqEnter
+ * returning WALK, one matching deqLeave); scr_assert_deq_leave
+ * classifies its own cleanup by the PRE-decrement depth value alone: 1
+ * -> the outermost frame closed, full reset (belt-and-braces hygiene
+ * for the NEXT top-level comparison — the walk always returns its
+ * verdict and unwinds through this function BEFORE the assert call
+ * ever raises, so a thrown comparison already cannot leak state by the
+ * time anything throws; this reset is the only code that clears the
+ * top pair at all, kept regardless); 2 -> the
+ * depth-2 frame closed (clear deep; pop the mid seed back off if a
+ * promotion happened during its walk); ≥3 -> an ordinary set-rule
+ * frame closed, pop one entry. A later sibling that nominally lands at
+ * "depth 2" through the set rule (set_active already permanently true
+ * from an earlier promotion) still takes the depth-2 branch here, but
+ * set_active being true makes its conditional pop unconditional — the
+ * same single pop the ordinary branch would have done.
+ * Node's PUBLIC entry (detectCycles) also gates this whole memo behind
+ * a stack-overflow catch — a fresh process runs NO memo until one
+ * genuinely overflows, then rebinds to always use the memo for the
+ * rest of the process. That gate is NOT portable (S056: it fires on
+ * V8's real, unobservable stack limit) and is NOT ported — Joe's
+ * ruling, option A: this memo runs on every comparison,
+ * deterministically, matching Node's own post-overflow behavior
+ * exactly and diverging from a truly fresh Node process on one narrow
+ * shape the corpus cannot reach (S056 has the table). */
 static struct { const void *a, *b; } *g_deq_stack;
 static size_t g_deq_len;
 static size_t g_deq_cap;
+static const void *g_deq_top_a, *g_deq_top_b;
+static const void *g_deq_mid_a, *g_deq_mid_b;
+static bool g_deq_deep;
+static bool g_deq_set_active;
+static size_t g_deq_depth;
 
-bool scr_assert_deq_enter(const void *a, const void *b) {
+static bool scr_deq_present(const void *v) {
   for (size_t i = 0; i < g_deq_len; i++) {
-    if (g_deq_stack[i].a == a && g_deq_stack[i].b == b) return true;
+    if (g_deq_stack[i].a == v || g_deq_stack[i].b == v) return true;
   }
+  return false;
+}
+
+static void scr_deq_push_pair(const void *a, const void *b) {
   if (g_deq_len == g_deq_cap) {
     g_deq_cap = g_deq_cap ? g_deq_cap * 2 : 8;
     g_deq_stack = realloc(g_deq_stack, g_deq_cap * sizeof *g_deq_stack);
@@ -174,10 +229,65 @@ bool scr_assert_deq_enter(const void *a, const void *b) {
   g_deq_stack[g_deq_len].a = a;
   g_deq_stack[g_deq_len].b = b;
   g_deq_len++;
-  return false;
+}
+
+double scr_assert_deq_enter(const void *a, const void *b) {
+  if (g_deq_depth == 0) {
+    /* depth 1: Node's memos === undefined. */
+    g_deq_top_a = a;
+    g_deq_top_b = b;
+    g_deq_deep = false;
+    g_deq_set_active = false;
+    g_deq_depth = 1;
+    return 0.0; /* WALK */
+  }
+  if (!g_deq_set_active) {
+    if (!g_deq_deep) {
+      /* depth 2: Node's set === undefined, deep === false — PAIR
+       * rules against the top pair only. */
+      if (a == g_deq_top_a) return b == g_deq_top_b ? 1.0 : 2.0;
+      if (b == g_deq_top_b) return 2.0; /* UNEQUAL */
+      g_deq_mid_a = a;
+      g_deq_mid_b = b;
+      g_deq_deep = true;
+      g_deq_depth++;
+      return 0.0; /* WALK */
+    }
+    /* depth ≥3, first call while deep: PROMOTE. */
+    scr_deq_push_pair(g_deq_top_a, g_deq_top_b);
+    scr_deq_push_pair(g_deq_mid_a, g_deq_mid_b);
+    g_deq_set_active = true;
+  }
+  /* the set rule. */
+  bool a_present = scr_deq_present(a);
+  bool b_present = scr_deq_present(b);
+  if (a_present && b_present) return 1.0; /* EQUAL */
+  if (a_present != b_present) return 2.0; /* UNEQUAL */
+  scr_deq_push_pair(a, b);
+  g_deq_depth++;
+  return 0.0; /* WALK */
 }
 
 void scr_assert_deq_leave(void) {
+  size_t d = g_deq_depth;
+  g_deq_depth = d - 1;
+  if (d == 1) {
+    /* the outermost frame closed: full reset. */
+    g_deq_top_a = g_deq_top_b = NULL;
+    g_deq_mid_a = g_deq_mid_b = NULL;
+    g_deq_deep = false;
+    g_deq_set_active = false;
+    g_deq_len = 0;
+    return;
+  }
+  if (d == 2) {
+    /* the depth-2 frame closed. */
+    g_deq_deep = false;
+    if (g_deq_set_active && g_deq_len > 0) g_deq_len--;
+    g_deq_mid_a = g_deq_mid_b = NULL;
+    return;
+  }
+  /* d >= 3: an ordinary set-rule frame closed. */
   if (g_deq_len > 0) g_deq_len--;
 }
 

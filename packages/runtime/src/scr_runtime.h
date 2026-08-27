@@ -5847,10 +5847,29 @@ void scr_assert_fail_msg(ScrStr *message); /* takes ownership; always throws */
 ScrStr *scr_assert_inspect_str(const ScrStr *s); /* util.inspect quoting; +1 */
 void scr_assert_ok(bool pass, ScrStr *message);
 bool scr_assert_same_value_f64(double a, double b); /* Object.is */
-/* deepStrictEqual over cyclic values: pair memo (enter answers true for
- * a pair already being compared — Node's coinductive memo; leave pops).
- * The compiler-emitted helpers over cycle-capable types wrap with these. */
-bool scr_assert_deq_enter(const void *a, const void *b);
+/* deepStrictEqual over cyclic values: the cycle memo, Node's REAL
+ * two-phase rule (lib/internal/util/comparisons.js handleCycles,
+ * lifted directly; SEMANTICS.md S056 has the full measured record) —
+ * NOT a simple "this pair is already open" memo (too permissive: two
+ * same-labeled cyclic structures of different period wrongly compare
+ * equal under it) and NOT a single set-of-values rule applied from the
+ * first comparison either (fix round F1's own bug: wrongly answers
+ * UNEQUAL on a crossed depth-2 pair that Node walks and finds equal).
+ * Depth 1 records the pair as "top" and WALKS unconditionally; depth 2
+ * applies PAIR rules against the top pair only (an exact match ->
+ * compare the other side; a cross match -> UNEQUAL; otherwise record a
+ * "mid" pair and WALK); depth ≥3 promotes to a Set seeded with all four
+ * remembered values and applies the general 3-way rule from there on,
+ * for the rest of the comparison regardless of nominal depth. Returns
+ * a 3-way verdict as a double (0=WALK/1=EQUAL/2=UNEQUAL, matching the
+ * wasm/IR F64 result type). scr_assert_deq_leave undoes exactly its
+ * matching deqEnter, classified by the pre-decrement depth alone (see
+ * scr_assert.c's own doc comment on the state), and resets everything
+ * when the outermost frame closes. Node's stack-overflow gate around
+ * this whole memo (a fresh process runs no memo until one genuinely
+ * overflows) is NOT ported — not portable, S056, Joe's ruling. The
+ * compiler-emitted helpers over cycle-capable types wrap with these. */
+double scr_assert_deq_enter(const void *a, const void *b);
 void scr_assert_deq_leave(void);
 void scr_assert_eq_f64(double a, double b, bool negated, bool deep, ScrStr *msg, bool has_msg);
 void scr_assert_eq_str(ScrStr *a, ScrStr *b, bool negated, bool deep, ScrStr *msg, bool has_msg);

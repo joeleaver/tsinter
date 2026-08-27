@@ -3377,34 +3377,68 @@ probes (both freshly re-measured against live Node and the compiled
 build, both sides, not assumed from the reviewer's report), restated in
 full above.
 
-## S054 — A thrown `AssertionError`'s `.message` carries ONLY the header/custom text — Node's trailing multi-line diff never renders *(wasm tier)*
+## S054 — A thrown `AssertionError`'s `.message` carries ONLY the header/custom text for the STATIC-COMPOSITE families — Node's trailing multi-line diff never renders there; the SCALAR family is exact whole-message (increment 23 P1 amendment below) *(wasm tier)*
 
 `assert.strictEqual`/`notStrictEqual`/`deepStrictEqual`/`notDeepStrictEqual`
 over Buffer/Uint8Array operands (`assert.refEqBytes`/`assert.deepResult`)
-OR bare-function operands (`assert.refEqFn` — the stage D P3 1681 stretch,
-landed after this entry's first draft; SAME divergence, same mechanism,
-extending this entry's scope rather than drafting a new one) —
-emitter.ts's `emitAssertLibCall` — throw a catchable `AssertionError` whose
-`.name`/`.code` are byte-exact to Node (`"AssertionError"`/
+OR bare-function operands (`assert.refEqFn` — the stage D P3 1681
+stretch, landed after this entry's first draft; SAME divergence, same
+mechanism, extending this entry's scope rather than drafting a new
+one) — i.e. the STATIC-COMPOSITE family (bytes, functions, and the
+arrays/records/maps/sets/unions `assert.deepResult` covers via the
+synthesized structural-equality helpers), all routed through
+emitter.ts's `emitAssertLibCall` — throw a catchable `AssertionError`
+whose `.name`/`.code` are byte-exact to Node (`"AssertionError"`/
 `"ERR_ASSERTION"`) and whose `.message` is the SAME first line Node
 produces (one of a small set of static header strings, or the verbatim
 custom message when one is passed) — but nothing after it. Node's real
 `.message` continues past that header with a blank line and a rendered
 diff of the two operands (`util.inspect`-shaped: `+ actual - expected`
-markers, an indented value dump). This tier's `.message` stops at the
-header, full stop — no blank line, no diff, no trailing newline.
+markers, an indented value dump). This tier's `.message`, for THIS
+family only, stops at the header, full stop — no blank line, no diff,
+no trailing newline.
+
+**Amendment (increment 23 P1):** the SCALAR family — `assert.eqF64`/
+`eqStr`/`eqBool` (numbers, strings, booleans; `eqSym` when symbols
+land) — is NOT covered by the header-only divergence above. Built
+after this entry's first draft, emitter.ts's `emitAssertLibCall` ports
+Node's real scalar diff assembler (`assertion_error.js`'s short/
+stacked forms, the `+ actual - expected` markers, the `^`
+first-difference caret, the 80-column caret gate, the inline-vs-block
+split for `notStrictEqual`) directly — `.message` for this family is
+EXACT, WHOLE, byte-for-byte, including the trailing diff S054's
+original text said never renders. Own re-measurement (node v24.18.1,
+`assert.strictEqual(1111111, 1111112)`), quoted in full, both sides
+byte-identical: `"Expected values to be strictly equal:\n+ actual -
+expected\n\n+ 1111111\n- 1111112\n        ^\n"`. The ONE exception
+inside the scalar family itself is not a message-content divergence at
+all: `eqStr`'s multi-line-inspection case (either operand's rendered
+text spans lines) is a bare, deliberately silent SENTINEL TRAP — a
+plain `unreachable`, no message ever constructed — documented at
+emitter.ts's own comment on the sentinel (the eqStr case in
+`emitAssertLibCall`); P2b's diff assembler replaces it. No corpus
+program reaches it (1603's longest operand pair is far too short); it
+is not a false `.message` the way header-only truncation is, so it
+gets no S-number of its own.
 
 **Amendment to S027:** S027 states tier-wide that "`err.message`, `err.name`,
 `err.code` and `instanceof` are all exact" for every error this tier
-throws — true everywhere else, but this entry is the ONE exception:
-`AssertionError.message` is exact only on its FIRST LINE, not its full
-value. S027's own `.stack` disclaimer ("a separate question") is
+throws — true everywhere else, but this entry is the ONE exception, and
+(per the increment 23 P1 amendment above) only for the STATIC-COMPOSITE
+operand families specifically, not AssertionError messages in general:
+for THOSE families, `.message` is exact only on its FIRST LINE, not its
+full value. S027's own `.stack` disclaimer ("a separate question") is
 unaffected and unrelated — this is about `.message` itself, a property
 S027 declared exact without qualification because nothing before this
 pass ever diverged there.
 
 **Measured boundary (Node v24.18.1, own probe, re-run at this draft's
-own time — not transcribed from an earlier stage of this pass):** for
+own time — not transcribed from an earlier stage of this pass; historical
+record for the STATIC-COMPOSITE family, re-confirmed still current at the
+increment 23 P1 amendment above — own re-check, `assert.refEqBytes`,
+`Buffer.from([1,2,3])` vs `Buffer.from([1,2,4])`, this tier's compiled
+build still answers the single 42-character header line, unaffected by
+the scalar-family work):** for
 `assert.deepStrictEqual(Buffer.from([1,2,3]), Buffer.from([1,2,4]))`,
 Node's real `e.message` is `"Expected values to be strictly deep-equal:\n+
 actual - expected\n\n  Buffer(3) [Uint8Array] [\n    1,\n    2,\n+   3\n-
@@ -3442,7 +3476,8 @@ Truncating rather than fabricating a plausible-looking diff keeps the
 divergence HONEST and NAMED rather than a silent approximation that
 could look right by accident on some inputs and wrong on others.
 
-**Tested by:** `packages/compiler/test/wasm-assert.test.ts` — the
+**Tested by:** for the STATIC-COMPOSITE family (the header-only
+divergence): `packages/compiler/test/wasm-assert.test.ts` — the
 `.message.split("\n")[0]` pin mirrors 1677/1680's own corpus pattern
 directly; every header-string branch across BOTH families (same-
 structure, reference-equal, not-reference-equal, deep-equal, not-deep-
@@ -3456,6 +3491,16 @@ reproduced the whole thing." No corpus program can pin the truncation
 itself (1677/1680/1681 never read past line 0 by construction, and no
 claimed program constructs a full-message read against this family) —
 the unit pins are the only instrument for this entry.
+For the SCALAR family (the increment 23 P1 amendment — exact whole-
+message): `tests/corpus/1603-assert-scalar-messages.ts` pins the whole
+`.message` for every scalar strictEqual/deepStrictEqual header and diff
+form as a claimed corpus program, byte-exact against Node;
+`packages/compiler/test/wasm-assert-core.test.ts` covers every
+branch the corpus does not vary (the numeric-prefix caret guard, the
+80-unit caret gate straddle, the ±0 case, custom-message overrides, the
+inline-vs-block `notStrictEqual` split, the eqStr sentinel's own trap —
+proven a TRAP and not a wrong message via the stderr-empty pins
+described at that file's own header).
 
 ## S055 — `MaxListenersExceededWarning`: the native lanes print it SYNCHRONOUSLY with their OWN pid; the wasm tier does not print it at all yet *(per-lane; filed at the increment-22 close from the stage-A draft)*
 
@@ -3501,3 +3546,212 @@ silent. `scr_events_emitter.c`'s leak-warning comment ("SEMANTICS.md
 documents both" — the pid and the timing) cites THIS entry; filing it
 closes the leak-warning half of board #66 (the rawListeners half closed
 with S052).
+
+## S056 — `deepStrictEqual`'s cycle memo runs ALWAYS; Node runs it only after a stack overflow, so a fresh Node process can answer EQUAL where this tier throws on one class of terminating cyclic shape *(all three lanes)*
+
+`assert.deepStrictEqual`/`notDeepStrictEqual` over cycle-capable static
+types (recursive records and their arrays/maps — `lower-assert.ts`'s
+`deepEqHelper` cycle wrapper, `assert.deqEnter`/`deqLeave`) consult
+Node's real cycle memo on EVERY comparison. Node does not. Its public
+entry (`lib/internal/util/comparisons.js`'s `detectCycles`) first runs
+the whole comparison with NO memo at all — plain structural recursion,
+where `val1 === val2` terminates aliases — and only if that throws (a
+genuine stack overflow on a non-terminating cycle) re-runs it WITH the
+memo, then rebinds itself so every LATER comparison in that same
+process uses the memo directly, permanently, for the rest of the
+process's life. The memo itself (`handleCycles`) is two rules, not one:
+at depth 1 the pair `(a,b)` is recorded and the comparison WALKS
+unconditionally; at depth 2 (the immediate child of the top pair,
+before any promotion), `val1===a` answers `val2===b`; `val2===b`
+(without `val1===a`) answers UNEQUAL; anything else records `(c,d)` as
+a second pair and WALKS. From depth 3 — the first call reached while
+that second pair's own walk is in progress — the four remembered
+values seed ONE Set, and from there for the rest of the comparison
+(regardless of nominal depth) the rule is: both present → EQUAL,
+exactly one present → UNEQUAL, neither → walk, then remove both. This
+tier ports that two-rule memo exactly (all three lanes, one contract —
+`packages/runtime/src/scr_assert.c`'s `scr_assert_deq_enter`/
+`scr_assert_deq_leave`, mirrored in the wasm backend's own state
+machine) but applies it UNCONDITIONALLY — Node's stack-overflow gate
+around the whole memo is not ported.
+
+**Where the two disagree (measured, node v24.18.1, plain objects,
+`interface Y { x: Y | null }`; `y.x=y`; `b={x:y}`; `a={x:b}`;
+`c={x:a}`; own probes, `scratchpad/inc23/lead-probe/table.mjs` run
+`--pre` for a fresh process and `--post` after forcing an unrelated
+overflow, re-run at filing):**
+
+    shape                     fresh Node   Node after any overflow   this tier
+    crossed depth-2 (a,b)     EQUAL        EQUAL                     EQUAL
+    crossed depth-3 (c,a)     EQUAL        UNEQUAL                   UNEQUAL
+    period 1v2 / 2v4 / 2v3    UNEQUAL      UNEQUAL                   UNEQUAL
+    period 1v1 / 2v2 / 3v3    EQUAL        EQUAL                     EQUAL
+    shared leaf, self vs {x:self}, two self-loops: EQUAL everywhere
+    the genuine val2===b arm (b={x:b} vs a left operand whose field is
+      some OTHER object): UNEQUAL everywhere, both Node modes
+      (regression net, not a disagreement — own re-measure,
+      rev/probe/val2.ts)
+    stale state after a THROWN cyclic assertion (reusing the FAILED
+      comparison's own operands immediately afterward): no leak —
+      EQUAL where genuinely equal, in every lane, holding even on the
+      PRE-F2 tree (own re-measure, rev/probe/stale.ts, 7 rows) — this
+      entry's memo change PRESERVES the property, it does not build it
+
+**A second route into the SAME class — a SIBLING'S promotion, not
+nesting depth (own re-measure, `interface T { p: T | null; q: T | null
+}`; own probes `scratchpad/inc23/rev/probe/sib2.ts` for a fresh process
+and `sib2post.mjs` — the same shapes preceded by a period-2-vs-4 primer
+that forces the overflow — for the POST-overflow column; both re-run at
+filing, not transcribed):**
+
+    shape (both siblings are depth-2 children of one top pair)   fresh Node   Node POST   this tier
+    A  sibling 1 shallow (no promotion); sibling 2 = (tb, w)      EQUAL        EQUAL       EQUAL
+    B  sibling 1 PROMOTES; sibling 2 = (tb, w), same as A          EQUAL        UNEQUAL     UNEQUAL
+    C  no sibling at all — the plain crossed-depth-2 shape         EQUAL        EQUAL       EQUAL
+    D  the val1===a arm reached via a sibling, both self-cyclic    EQUAL        EQUAL       EQUAL
+    E  the val2===b arm reached via a sibling                      UNEQUAL      UNEQUAL     UNEQUAL
+
+Row B is the second route: sibling 2's pair `(tb, w)` — `tb` the
+depth-1 right operand, `w` a fresh object structurally equal to it —
+disagrees with row A's IDENTICAL pair only in whether sibling 1's OWN
+walk happened to promote the set first. Both siblings sit at the SAME
+nominal depth (2, immediate children of the top pair); nesting depth
+does not change between A and B. Rows C–E are regression-net rows
+(every mode and lane already agree) confirming the ordinary crossed-d2
+shape, the `val1===a` arm, and the genuine `val2===b` arm are each
+unaffected by a sibling's presence.
+
+The divergence class: a TERMINATING structure in which one operand of
+a pair aliases a value from the other column of an earlier pair, ONCE
+THE SET EXISTS — reached either by nesting to depth 3 (the "crossed
+depth-3" row above) or, at depth 2, by an EARLIER SIBLING's walk having
+promoted it (row B). Both routes land in the same class because the set
+rule, once the set exists, applies "for the rest of the comparison
+regardless of nominal depth" (this entry's own mechanism paragraph,
+above) — row B is simply that sentence's own consequence at the
+nearest depth it can occur. A fresh Node process (no overflow yet in
+that process) answers EQUAL on every shape above by plain recursion;
+this tier answers UNEQUAL wherever Node's OWN post-overflow column does
+— a thrown `AssertionError`, never silent output. After the first stack
+overflow anywhere in a Node process, its own answer flips and agrees
+with this tier on every shape measured. Node's own answer is therefore
+order-dependent
+within a single process: the identical assertion, run twice with the
+identical arguments, passes the first time and throws the second if an
+unrelated comparison overflowed in between (witness, own probe,
+`scratchpad/inc23/rev/probe/witness.mjs`, re-run at filing: crossed
+depth-3 BEFORE any overflow → EQUAL; a period 2-vs-4 ring pair forces a
+real overflow and the permanent rebind → THREW; the SAME crossed
+depth-3 shape, freshly built, immediately after → THREW, and again
+THREW on a third fresh instance — the rebind is process-wide and
+permanent, not shape-specific).
+
+**Rationale (Joe's ruling, 2026-08-26, OPTION A over OPTION B):** the
+exact overflow behavior is not portable — Node's switch fires on V8's
+real stack limit (platform, `--stack-size`, the caller's own call
+depth, frame sizes), which no runtime here can observe. Option B
+(emulate `detectCycles` with a depth budget standing in for the
+overflow, then rebind a process-wide flag) was considered and
+REJECTED: any depth budget would replace one measurable, narrow
+divergence with an unlocatable boundary that could fire at a different
+point than V8's real one on every platform, and the process-wide
+rebind would make an assertion's verdict depend on unrelated EARLIER
+comparisons elsewhere in the same run — a corpus program's own output
+would then depend on execution order in a way this tier's contract
+does not otherwise permit. Option A (this entry): the memo runs
+always, deterministically, matching Node's own POST-overflow behavior
+exactly and diverging from a truly FRESH Node process on exactly the
+one narrow, terminating shape class above.
+
+**Provenance of the bug this entry supersedes:** before increment 23
+the memo on all three lanes answered EQUAL for ANY pair already being
+compared (a plain pair-memo), which wrongly made a 2-node ring compare
+equal to a 4-node ring (Node throws on every period mismatch, including
+exact multiples). Fix round F1 replaced that with the general
+set-of-values rule — correct for the period shapes — but applied it
+from the FIRST comparison, which wrongly answers UNEQUAL on the crossed
+depth-2 shape above (gate finding F-1): Node is still on its `a`/`b`
+two-slot pair check there and has not promoted to a set, so it WALKS
+that pair instead of consulting set membership. Fix round F2 ported the
+two-rule memo exactly, fixing the crossed depth-2 regression while
+keeping the period fix. The "crossed depth-2" row above is EQUAL in
+BOTH of Node's own modes and is the regression net for that history;
+the "crossed depth-3" row and sibling row B are the rows where this
+tier's deterministic choice and a truly fresh Node process disagree —
+two reachable ROUTES into the one divergence CLASS this entry
+registers, not two separate divergences (fix round F3, gate re-cert
+finding R-1: an earlier draft of this paragraph and the scope sentence
+above named depth-3 nesting as the only route, which its own mechanism
+paragraph already contradicted — corrected here, row B added).
+
+**Tested by:** `tests/corpus/2693-deep-equal-cycle-period.ts` (the six
+period shapes plus a shared-subtree case, three lanes — the F1
+regression net) and `tests/corpus/2694-deep-equal-cycle-crossed.ts`
+(the crossed shapes on a DIRECT record field, both depth-2 orders and
+both depth-3 orders, PLUS — fix round F3 — sibling shape B and its
+shape-A control on a two-field `T`-typed record, the second route into
+this same class; depth/sibling-promotion is the axis 2693 never varies,
+since its cycles sit behind an array field; 2694 opens with a period-mismatched
+trigger pair so Node's OWN process has already overflowed-and-rebound
+by the time it reaches the crossed-depth-3 checks, making the
+byte-exact comparison against the oracle genuine rather than a
+workaround — see 2694's own header). `packages/compiler/test/
+wasm-assert-core.test.ts` pins every row of the "this tier" column
+including both crossed-depth-2 orders, both crossed-depth-3 orders
+(must-stay-THREW regression pins), the genuine `val2===top.b` depth-2
+arm AND its `val1===top.a`-mismatch sibling as their own code paths
+(rev/probe/val2.ts's exact shapes — a self-cyclic operand paired with
+an UNRELATED plain leaf on the other side, not the first attempt's
+flawed shape, which resolved via an unrelated type mismatch one level
+down and would have passed even with that arm removed), a depth-≥3
+exactly-one-present case (the crossed-depth-3 pin doubles as this), and
+the stale-state PROPERTY (rev/probe/stale.ts's 7-row shape, reusing the
+FAILED comparison's own operands — holds already on the pre-F2 tree by
+construction, per scr_assert.c's own invariant that the emitted walks
+cannot throw mid-compare; F2 preserves it, it does not build it).
+Fix round F3 adds: sibling row B, both orders, as its own must-stay-
+THREW regression pin, plus rows A/C/D/E as regression-net pins (the
+T-typed `p`/`q` fields on the SAME record type as the top pair are what
+make the pair-check arms reachable at all — a `Y`-typed field, as an
+earlier probe used, makes `val1===memos.a`/`val2===memos.b` unreachable
+by construction and tests nothing about this axis); and the depth-2
+SET-POP's own dedicated pin (rev/probe/sib4.ts's two pop-observable
+rows plus its no-promotion control) — gate re-cert finding R-2: this
+mechanism (Node's `set.delete(c); set.delete(d)` on depth-2 exit,
+mirrored in both scr_assert.c and the wasm helper) was LIVE and
+correctly implemented but had NO pin; removing it left every existing
+pin green.
+Mutation-confirmed, own checks, reverted before freeze (re-run against
+the FULL post-F3 pin set, not assumed to carry over from F2's own
+narrower set): applying the general set rule at depth 2 turns the
+crossed-depth-2 pin red AND, within the sibling A/C/D/E regression-net
+pin, its A and C rows specifically — under that mutation the TOP-LEVEL
+pair itself is pushed into the set immediately, so sibling 2's reused
+top-level operand (`tb`) is wrongly "present" from the very first
+comparison in A and C's shapes (a genuinely different failure mode from
+crossed-depth-2's own, sharing only the root cause); D and E, and the
+val2===b/val1===a-mismatch pin, are unaffected (their sibling-2 pair
+does not reuse a bare top-level operand the same way). Treating
+"exactly one present" as WALK turns the period-mismatch pins, the
+crossed-depth-3 pin, the stale-state pin, AND sibling row B red (all
+four resolve through that one arm); dropping ONLY the depth-2 set-pop
+turns ONLY sib4's two pop-observable rows red, its no-promotion control
+and every sibling A–E row unaffected (R-2, confirmed). Two DISTINCT
+`deqLeave`-adjacent mutations, precisely: dropping only the final
+depth-counter decrement (so depth never returns toward 0) turns TWO of
+the 31 pins red — the crossed-depth-2 pin, AND the sibling A/C/D/E
+pin's own A and C rows specifically (D and E untouched) — the corrected
+mapping (gate re-cert finding, P5, itself corrected a second time at
+fix round F4 after an F3-round draft undercounted it as "ONLY" the
+crossed-depth-2 pin): the NEXT top-level comparison is wrongly treated
+as a depth-2 child of the stale prior top pair, and A/C's own
+sibling-2 pair reuses a bare top-level operand the SAME way
+crossed-depth-2's own pair does, so the identical root cause surfaces
+in both places, not just one; it does not surface on the leak pin;
+dropping only the depth-1 full reset's length-zeroing
+line ("leak-no-len-reset") turns ONLY the pre-existing leak pin red by
+name, confirming that pin still discriminates under F2's depth-counter
+design. Nothing
+pins the fresh-Node column — it is Node's own pre-overflow behavior,
+unreachable by a deterministic port by construction; `lead-probe/
+table.mjs` and `rev/probe/witness.mjs` are the record.
