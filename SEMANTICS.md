@@ -856,6 +856,35 @@ line of it, verified by running both. No corpus program can pin it — one
 whose output observed the divergence would fail the differential on
 every lane by construction.
 
+**Amendment (increment 23 P2b): the `assert` failure renderer is a
+surface where this parts company visibly.** `assert.eqDyn`'s renderer
+(`cfInspect`/`cfValue`) has NO special case for the `%error` marker —
+an Error VALUE reached as an assert operand renders as this entry's own
+raw encoding, a plain object dump over its OWN own-enumerable members,
+not Node's real Error rendering (which shows `name: message` followed
+by the FULL STACK TRACE, since `util.inspect` special-cases
+`instanceof Error`). Own re-measurement, `assert.deepStrictEqual({e:
+err, y: 1}, {e: err, y: 2})` where `err` is a caught `TypeError("boom")`
+crossed to `unknown`: Node's real message renders `e: TypeError:
+boom\n    at ...(the full stack)...` (itself long enough to trigger the
+`... Skipped lines` >50-line collapse in Node's own case); this tier's
+compiled build renders `e: {\n  '%error': true,\n  message: 'boom',\n
+name: 'TypeError'\n}` — the marker ITSELF is visible as a rendered key,
+which Node's own output never shows under ANY circumstance (S021's own
+main text already establishes this key is invisible to every OTHER
+enumeration surface — `Object.keys`, `JSON.stringify`, `for...in`; the
+assert renderer is simply another consumer of the SAME dyn
+representation, inheriting the SAME visibility). No corpus program
+constructs an Error-valued assert operand (D.7's own `expectsErrDyn`
+compares the THROWN error's OWN key walk directly, never renders it via
+`cfInspect`), so this is unclaimed by the six; registered here as the
+assert-specific instance of S021's own general rule rather than as a
+separate S-number, per H-3's own recommended split (design-p2.txt).
+**Tested by:** own re-measurement above (not a standing pin — the
+six do not reach it, and a dedicated pin would duplicate S021's own
+already-covered "the marker enumerates" finding at one more call
+site rather than establish anything new).
+
 ## S022 — A non-Error exception payload crossing into `unknown` becomes an EMPTY object *(inherited)*
 
 The exception cell type-erases everything that is not a scalar, an error
@@ -3377,7 +3406,7 @@ probes (both freshly re-measured against live Node and the compiled
 build, both sides, not assumed from the reviewer's report), restated in
 full above.
 
-## S054 — A thrown `AssertionError`'s `.message` carries ONLY the header/custom text for the STATIC-COMPOSITE families — Node's trailing multi-line diff never renders there; the SCALAR family is exact whole-message (increment 23 P1 amendment below) *(wasm tier)*
+## S054 — A thrown `AssertionError`'s `.message` carries ONLY the header/custom text for the STATIC-COMPOSITE families — Node's trailing multi-line diff never renders there; the SCALAR family (P1) and the DYN family (P2b) are BOTH exact whole-message *(wasm tier)*
 
 `assert.strictEqual`/`notStrictEqual`/`deepStrictEqual`/`notDeepStrictEqual`
 over Buffer/Uint8Array operands (`assert.refEqBytes`/`assert.deepResult`)
@@ -3416,10 +3445,13 @@ all: `eqStr`'s multi-line-inspection case (either operand's rendered
 text spans lines) is a bare, deliberately silent SENTINEL TRAP — a
 plain `unreachable`, no message ever constructed — documented at
 emitter.ts's own comment on the sentinel (the eqStr case in
-`emitAssertLibCall`); P2b's diff assembler replaces it. No corpus
-program reaches it (1603's longest operand pair is far too short); it
-is not a false `.message` the way header-only truncation is, so it
-gets no S-number of its own.
+`emitAssertLibCall`); P2b's diff assembler replaces it (RETIRED as of
+the P2b amendment below — the sentinel no longer exists; this
+paragraph is P1-era history, kept for the record of what the tier used
+to do, not a description of current behavior). No corpus program
+reaches it (1603's longest operand pair is far too short); it is not a
+false `.message` the way header-only truncation is, so it gets no
+S-number of its own.
 
 **Amendment to S027:** S027 states tier-wide that "`err.message`, `err.name`,
 `err.code` and `instanceof` are all exact" for every error this tier
@@ -3501,6 +3533,87 @@ branch the corpus does not vary (the numeric-prefix caret guard, the
 inline-vs-block `notStrictEqual` split, the eqStr sentinel's own trap —
 proven a TRAP and not a wrong message via the stderr-empty pins
 described at that file's own header).
+
+**Amendment (increment 23 P2b):** the DYN family — `assert.eqDyn`
+(strictEqual/notStrictEqual/deepStrictEqual/notDeepStrictEqual over
+CHECKED-DYNAMIC operands, values that crossed the `unknown` boundary)
+— is ALSO now exact whole-message, joining the scalar family above and
+narrowing S054's own remaining scope to the static-composite family
+only (bytes, functions, and the array/record/map/set/union shapes
+`assert.deepResult` covers). `emitAssertLibCall`'s `assert.eqDyn` case
+ports Node's real `createErrDiff` decision tree (showSimpleDiff/
+notIdentical/the myers branch — design-p2.txt D.1-D.9) via
+`dynEqFailHelper`/`dynNeqFailHelper`, reusing P1's own `eqFail`/
+`neqFail` for the simple/stacked and neq-single-line forms (D.5). D.9's
+own "boxing shim" additionally routes `assert.eqStr`'s failure path
+through the SAME dyn assemblers unconditionally (not gated on a
+multi-line check), retiring that sentinel trap entirely — the trap
+S054's own P1 amendment named above is GONE as of this pass, not
+merely unreached.
+
+Six corpus programs now claim on this family byte-exact against Node
+(1770-1773/2161/2165, tier 747->753) and 14 force-emit pins
+(`packages/compiler/test/wasm-assert.test.ts`, the "F.2" pins) cover
+every mechanism F.1's own claim-coverage map found the six do not
+reach — the notIdentical/neq >50-line collapses, the printer's
+nopCount 6/7 arms, the 80-unit caret boundary, the indent-dependent
+split threshold at both nesting levels, the 10000-unit cap (singular
+and plural), the UTF-16 sort axis, custom messages on both families
+(including the neq family's own `hasMsg`-alone bypass — see the FOUND
+BUG note below), and `expectsErrDyn` (D.7)'s positive control.
+
+**A real bug this pass's own differential caught, not review:**
+`dynNeqFailHelper`'s first draft assembled a diff under a custom
+message for the notStrictEqual/notDeepStrictEqual family whenever the
+comparison spanned multiple lines — wrong: real Node's own
+`AssertionError` constructor (`assertion_error.js:269-274`) takes
+`super(String(message))` WHOLESALE whenever `message != null` for this
+family (`notStrictEqual`/`notDeepStrictEqual` are NOT in
+`kMethodsWithCustomMessageDiff`, unlike `strictEqual`/
+`deepStrictEqual`), bypassing the diff/collapse/inline-vs-block
+machinery entirely — not just replacing a header line, the way the EQ
+family's own `getErrorMessage` does. `tests/harness/wasm-differential.
+test.ts`'s own run against `1771-assert-dyn-deep.ts`'s "custom ndse"
+line failed with the diff still attached before this was found and
+fixed (a top-of-function early return on `hasMsg`, before `splitLines`
+even runs) — re-verified clean afterward, both by the corpus (six-for-
+six) and by mutation (reverting the fix reddens both the corpus line
+and this file's own "F.2 assembler: custom message" pin by name).
+
+**Two genuine gaps found while building the F.2 pins, neither fixed
+here (both cost the six nothing):**
+  (a) a Buffer value boxed across the `unknown` boundary renders as a
+      PLAIN `Uint8Array` — `assert.deepStrictEqual(Buffer.from([1,2]),
+      new Uint8Array([1,2]))` over `unknown`-typed operands does NOT
+      throw, own re-confirmation of D.9's own already-registered "the
+      dyn copy cannot carry the Buffer/Uint8Array brand" — the "Buffer
+      flavour" rendering form is UNREACHABLE via checked-dynamic
+      operands, not merely unbuilt; the brand stays observable only
+      through the static-composite family (this file's own earlier
+      `refEqBytes`/`bytesDeepEq` pins).
+  (b) `expectsErrDyn`'s "errValue" classification (`lower-assert.ts`)
+      tests `expectedT.className === "%Error"` by EXACT string
+      equality rather than `inErrorHierarchy` (the hierarchy-aware
+      helper the SAME file uses one branch up for the "class" form) —
+      so `assert.throws(fn, new Error(...))` reaches `expectsErrDyn`
+      but `assert.throws(fn, new TypeError(...))` (or any other
+      subclass instance) refuses by name
+      ("assert.throws with this expected-error shape... has no scriptc
+      lowering yet"). A pre-existing frontend limitation in a file this
+      pass does not otherwise touch — named here rather than fixed
+      under this freeze's own time budget.
+
+**Tested by (P2b):** `tests/harness/wasm-differential.test.ts`'s six
+new `TIER_FLOOR` claims (byte-exact against live Node, both instruments
+— the differential run and the tier-floor set-equality check);
+`packages/compiler/test/wasm-assert.test.ts`'s 14 "F.2" pins (every
+literal measured directly against live Node v24.18.1,
+`scratchpad/inc23/impl-p2b/measure-f2.mjs`, not hand-derived — an
+earlier hand-derivation pass for several of these literals miscounted
+more than once before being replaced with parsed, measured values);
+the mutation check on the FOUND BUG above (`dynNeqFailHelper`'s early
+`hasMsg` return, reverted and re-confirmed both instruments red, then
+green again).
 
 ## S055 — `MaxListenersExceededWarning`: the native lanes print it SYNCHRONOUSLY with their OWN pid; the wasm tier does not print it at all yet *(per-lane; filed at the increment-22 close from the stage-A draft)*
 
@@ -3887,6 +4000,49 @@ pin below); and by mutation, which needs no raised stack and runs
 everywhere (F-3's own pattern, kept as a second, independent proof
 that the constant is genuinely read).
 
+**P-4 (increment 23 P2b checkpoint-2 addendum): near this SAME seam, a
+THIRD outcome exists, and it is NOT confined to bare `inspect()`
+calls.** For a deep-but-finite operand, real Node yields one of {the
+full message; the "Inspection interrupted" message; an UNCAUGHT
+`SyntaxError` ("Invalid regular expression: … Stack overflow") from
+`RegExp.exec` inside `formatProperty`'s own `keyStrRegExp` check —
+Node's `handleMaxCallStackSize` catch recognizes only `RangeError`, so
+this escapes uncaught} — and this third outcome can escape
+`assert.deepStrictEqual` ITSELF, not just a standalone `inspect` call.
+Own re-measurement, TWO independent constructions calling
+`assert.deepStrictEqual(deepChain, {x:1})` wrapped in `k` extra JS call
+frames, swept over n=880..936 × frames=0..3: the lead's own
+`lead-probe/crash-assert2.mjs` (sha256 `a3da9bdb2f2ec0c8…`, a
+ternary-recursion frame-adder over a `for`-built chain) and this
+entry's own, deliberately differently-shaped
+`impl-p2b/my-crash-assert.mjs` (sha256 `988e8cd0f33041b8…`, a
+`wrap(k,f)` recursion over an `Array.prototype.reduce`-built chain)
+agree that EVERY tested frame count renders full through n=927 and
+interrupts from n=929, but disagree on which SINGLE frame count lands
+the `SyntaxError` at n=928 — frames=1 for crash-assert2.mjs, frames=0
+for my-crash-assert.mjs, on the SAME machine, same session, same node
+binary. (Reconciling with the bare-`inspect()` sweep this entry's own
+P-4 discussion started from — `impl-p2a/depth-search.mjs`'s
+`frames-outcome` mode, sha256 `4af41ecfd5663f6d…`, and rev-23's
+`rev/p2a/probe/frames.mjs`, sha256 `46a281d36fae6de2…`, at frames
+0/1/2/5 over a bare `inspect()` call: the SAME
+three-outcome shape and the SAME non-linear frame-count instability —
+one phenomenon observed at two different call-chain depths, not two.)
+An earlier, single-script measurement (never filed) suggested `assert`
+avoids this window because its own deeper call chain sits past the
+narrow crash band; that does not hold in general — the seam CAN fall
+inside `assert.deepStrictEqual`'s own call chain, and exactly WHERE
+depends non-linearly on the CALLING SCRIPT's own baseline stack
+footprint, not on `n` alone, as the frames=0-vs-1 disagreement above
+demonstrates without even changing machines. No corpus program
+approaches n≈928 (this entry's own default-stack boundary above is
+already unreachable by a wide margin), so this remains unreachable in
+the corpus; filed here rather than as a new S-number because the
+underlying mechanism is the SAME "V8's own stack-exhaustion point is
+not a fixed, reproducible depth" finding S029/S057 already register,
+merely observed one call-chain layer deeper (inside `assert`'s own
+frames, not only inside `inspect`'s).
+
 **Tested by:** `packages/compiler/test/wasm-assert-dyn.test.ts`'s
 "cfInspect: depth elision fires past rt=1000" pin (spec-derived
 oracle, own construction, run-everywhere) — a WASM-SIDE LOOP (not JS
@@ -3916,3 +4072,222 @@ check (not dead code). Reverted before this entry was filed both
 times; the constant is `1000` in the merged code, and the wasm call
 stack itself is confirmed to survive 1002+ levels of `cfValue`
 recursion without overflowing (the same spec-derived pin, un-mutated).
+
+## S058 — `assert.eqDyn`'s renderer traps by name on a cyclic operand instead of rendering Node's `<ref *N>`/`[Circular *N]` protocol *(wasm tier)*
+
+Node's `util.inspect` (and therefore `assert`'s own failure-message
+renderer, which calls the same machinery) detects a value that
+references itself — directly or through intermediate objects/arrays —
+and renders it with a `<ref *N>` marker at the first occurrence and
+`[Circular *N]` at each re-entry, both at top level and inside an
+assert failure diff. This tier's renderer (`cfValue`, `inspect.ts`)
+does NOT implement that protocol. Instead, re-entering a value already
+on the CURRENT render path traps — a bare `unreachable` at a
+documented call site (`cfSeenCheck`'s own arm in the ARR and OBJ kind
+checks), not a placeholder and not the P2a-era depth-elision
+degradation (a merely-very-deep, non-cyclic structure still elides
+normally at `rt > 1000`, unchanged — the trap fires on RE-ENTRANCY,
+never on depth alone).
+
+**Reach: zero in the corpus.** None of increment 23's six claimed
+programs (1770/1771/1772/1773/2161/2165) constructs a cyclic operand
+to a failing `assert.eqDyn` comparison — the comparison SIDE already
+handles equal cycles correctly via the memo (S056, B.4), so a cyclic
+value that COMPARES EQUAL never reaches the renderer at all; only a
+cyclic value on the losing side of a FAILING comparison would reach
+this trap, and no such program exists yet.
+
+**Amendment (increment 23 P2b close, the memo-rows ruling) — the exact
+reach statement, and the trap is now NAMED:** any FAILING `eqDyn`
+assertion (`strictEqual`/`deepStrictEqual`/their negations) whose
+operand is cyclic reaches the renderer and traps BY NAME — an uncaught
+wasm trap with this entry's own diagnostic on stderr
+(`"Uncaught cfValue: cyclic value encountered while rendering an
+assert.eqDyn failure message (SEMANTICS.md S058)"`), non-zero exit —
+where Node throws a catchable `AssertionError` rendered with
+`<ref *N>`/`[Circular *N]`. **Try/catch cannot observe it.** Passing
+assertions over cyclic operands are unaffected (no render ever runs,
+whatever the memo's verdict). That is the honest tier boundary until
+the `<ref *N>` protocol is built.
+
+The trap itself changed this pass from a bare `unreachable` (what the
+paragraph above described, and what CLAIM 0's own pin still confirms
+at the wasm-trap level — the underlying instruction is still
+`unreachable`, un-catchably) to one that PRINTS first: `InspectDeps`'
+new `namedTrap(c, message)` stashes `message` on the shared uncaught-
+exception cell as an `EXC_STR` value and calls the SAME
+`%w.err.reportUncaught` reporter S007's own uncaught-throw path uses
+(`"Uncaught " + <rendered cell>`, then `unreachable`) — directly, not
+through the normal pending-cell unwind (no caller anywhere checks or
+rethrows; the call sits deep inside `cfValue`'s own recursion and
+simply ends the program right there), which is exactly why it stays
+uncatchable despite reusing the "print the reason" reporter a genuine
+uncaught throw does. Both `cfSeenCheck` call sites (the ARR and OBJ
+arms) now call `namedTrap` with the identical message text. This was a
+P2b defect fixed at register time, not a new divergence: rule 1 (out-
+of-tier constructs refuse loudly, never bare) already required it, and
+the memo-rows pins below are what makes the trap REACHABLE at all
+(previously zero corpus/pin reach, per the paragraph above) —
+confirmed end to end (six pins, five reaching the trap under the
+inverted-arms mutation, one correctly not reaching it — see "Tested
+by" below) and confirmed uncatchable by direct construction (a
+`try`/`catch` wrapped around the failing comparison never runs its
+`catch` block; own probe, not transcribed).
+
+**Why a named trap and not the full protocol:** design-p2.txt's own
+A.6 estimates the `<ref *N>` protocol at ~120 emitter lines and a
+two-pass (or backpatching) design — the marker has to be PREPENDED to
+a value whose cycle is only discovered after its children are already
+formatted, which this renderer's single streaming append buffer cannot
+do without a second pass. That is a disproportionate share of the
+pass for zero corpus claims, and a loud, distinct trap is preferable
+to either (a) silently reusing the SAME text a genuinely-deep-but-
+finite structure gets (which would make a cycle indistinguishable from
+an ordinary deep value in the rendered output — a wrong answer, not
+merely an incomplete one) or (b) recursing until the wasm call stack
+overflows (an UNCATCHABLE trap, per the S003/S007 abort family, with
+no diagnostic at all).
+
+**The mechanism reuses, unchanged, the console.log dyn walker's own
+growable seen-stack storage** (`seen()`/`nseen()`/`growEq`, already
+built for that walker's OWN `<ref *N>`/`[Circular *N]` protocol,
+`circCheck`/`seenPush`/`refWrap`) via two new, deliberately SIMPLER
+methods — `cfSeenCheck` (a plain existence test against the current
+path, no circular-id bookkeeping) and `cfSeenPop` (a plain pop, no
+`<ref *N>` labeling). Sharing the storage is safe because the two
+walkers (console.log's and assert's) are never active on the same
+native call stack simultaneously, and the shared `nseen` counter
+returns to 0 between any two independent top-level walks — confirmed
+by running the full pre-existing wasm-inspect.test.ts suite (the
+console.log walker's own 40 pins, including its own cycle-rendering
+pins) unchanged alongside this addition.
+
+**Rationale:** consistent with `%w.dyn.strictEq`'s and `deepEqDyn`'s
+own precedent for HANDLE/JSVAL (dyn.ts's own established idiom: "no
+Node-exact render, no approximation — the trap is the loud answer, not
+a placeholder") and with rule 1 (out-of-tier constructs refuse loudly,
+never miscompile) applied to a shape that is IN tier for the
+comparison side but has no cheap, correct rendering this pass.
+
+**Tested by:** `packages/compiler/test/wasm-assert-dyn.test.ts`'s
+CLAIM 0 pin — a self-referencing OBJECT (`{self: <itself>}`) and a
+self-referencing ARRAY (`[<itself>]`), each built via the SAME box
+stored back into its own single entry, both confirmed to trap with
+`/unreachable/` rather than complete. A companion pin proves the
+seen-stack's own scoping is correct — NOT "ever seen at all" but
+"currently on this path": a single shared (non-cyclic) COMPOSITE
+value referenced from two SIBLING keys of one object renders normally
+(live-Node-compared, byte-exact), confirming the trap fires on
+re-entrancy and not on any repeated reference. Mutation-confirmed
+(own hand-verification, reverted, hashes equal before/after): removing
+BOTH `cfSeenCheck`-arm traps (a no-op in their place) turns the CLAIM 0
+pin red by name — the mutated build completes normally instead of
+throwing, falling through to the pre-existing depth-elision path after
+~1000 recursive dives, exactly the degradation this entry exists to
+retire — while every other pin in the file (including the shared-
+reference control and the ordinary depth-elision pins) stays green.
+
+**Tested by (P2b close, the memo-rows ruling):**
+`packages/compiler/test/wasm-assert-core.test.ts`'s seven "assert.eqDyn
+memo row" pins — S056's OWN measured shapes (period 1v2/2v4/2v3,
+period-match, crossed depth-2/depth-3 both orders on the same y/b/a/c
+chain, SIBLING shape B both orders, non-promoting SIBLING shape A),
+ported to plain UNTYPED `.cjs` (dyn-native from birth) and observed
+through the COMPLEMENTARY assertion that passes silently for each
+row's own verdict (`notDeepStrictEqual` for the UNEQUAL rows,
+`deepStrictEqual` for the EQUAL ones — see the pins' own header
+comment for the two construction hazards found and worked around: a
+function-returned or array-cross-assigned ring misinfers its own
+static shape and throws a boundary TypeError; independently-
+constructed cyclic shapes sharing one compiled program corrupt each
+other's inference). Mutation-confirmed (own hand-verification,
+reverted, hash of `emitter.ts` equal before/after): swapping the two
+verdict constants at all five `deqEnterHelper` return sites (the
+"inverted arms") flips every row's verdict, so the previously-silent
+complementary assertion now FAILS on six of the seven — the render
+runs, `cfValue` reaches a cyclic operand, and `%w.err.reportUncaught`
+fires (confirmed in every reddened stack trace), reddening those six
+BY NAME; the seventh (non-promoting sibling A) stays green under the
+SAME mutation, exactly as it must — S056's own text already establishes
+shape A never nests deep enough or gets promoted by a sibling to reach
+either mutated arm, so it is compared by ordinary structural walking
+throughout, the ARM-REACHABILITY control this trap's own reach
+statement needs. Confirmed uncatchable directly: a `try`/`catch`
+wrapped around a reddened comparison's own call never reaches its
+`catch` block (own probe, not transcribed) — stdout and the absence of
+a caught-branch print are identical with or without the wrapper.
+
+## S059 — the assert renderer emits the NO-COLOR, FIXED-80-COLUMN configuration unconditionally — real Node's colored character-diff path and its terminal-width-dependent caret budget are both out of scope *(wasm tier)*
+
+Node's real `assert` failure-message renderer branches on
+`colors.hasColors` (true only when `process.stderr` is a color-capable
+TTY) in TWO independent places, and this tier ports NEITHER branch —
+it always renders the configuration Node itself renders when piped
+(which every compiled program's own stdio always is):
+
+  (a) **THE COLORED PATH IS A DIFFERENT RENDERER, NOT A DECORATED ONE.**
+      `getColoredMyersDiff`/`printSimpleMyersDiff` (myers_diff.js) are
+      NOT character-level decorations of the plain stacked/myers forms
+      this tier ports (design-p2.txt D.1-D.9) — they are a WHOLLY
+      SEPARATE character-by-character diff over
+      `StringPrototypeSplit(s, '')` (individual characters, not lines),
+      under an `actual`/`expected` header with no `+`/`-` markers at
+      all. Own re-measurement (`node --force-color`, live process,
+      re-run this pass): `assert.strictEqual("abcdef", "abcdef!")`
+      under color becomes `"…strictly equal:\n\x1b[32mactual\x1b[39m
+      \x1b[31mexpected\x1b[39m\n\n'…\x1b[31m!\x1b[39m…'\n"` — a
+      character-granular insert marker over the literal quoted string,
+      structurally unrelated to the LINE-granular stacked/myers forms
+      this tier's own D.1-D.9 machinery produces. Porting "the colored
+      form" is therefore not an incremental addition on top of what
+      exists; it is a second, parallel assembler this pass does not
+      build.
+  (b) **THE 80-COLUMN CARET BUDGET IS A CONSTANT, NOT A TERMINAL READ.**
+      Real Node's own `maxTerminalLength` is
+      `process.stderr.isTTY ? process.stderr.columns : 80` — under any
+      NON-TTY stderr (every compiled program's own stdio, own
+      re-confirmation via the harness's own pipe) this is always
+      exactly `80`, so this tier's own `eqFailHelper`/`dynEqFailHelper`
+      caret gate (`LA+LB<=80`, D.2/S054's own P1-era code) is Node-exact
+      for every reachable case — but it is a literal `80`, not a read
+      of an actual terminal width, so a program whose own stdout/stderr
+      genuinely IS a TTY with a different column count would diverge
+      from Node under THAT specific circumstance. No corpus program (or
+      any program compiled by this tier, since the ABI's own stdio
+      contract is a pipe — `abi.ts`) can construct that circumstance.
+
+Both halves are the SAME underlying fact — the emitted program renders
+the configuration Node renders "when it has no stderr to interrogate,"
+unconditionally, because it never has one — so they are registered
+together rather than as two entries. This is scr_assert.c's own
+dangling "SEMANTICS.md 103" citation (its header comment named a
+divergence and cited a section number that never got a matching entry
+— board #66's own remainder from an earlier increment's stage-A draft)
+made real at this freeze; that citation is corrected to `SEMANTICS.md
+S059` in the same commit as this entry, per the increment 23 P2b
+close's own §3(b) item.
+
+**Rationale:** both the colored renderer and a live terminal-width read
+require information (`process.stderr`'s own TTY-ness and column count)
+this tier's ABI does not model at all — every emitted program's own
+stdio is a pipe by construction (`abi.ts`), so `process.stderr.isTTY`
+is always false and `colors.hasColors` is always false for any program
+this tier could ever run. Porting either branch would add a full
+second assembler and a terminal-width import for a configuration no
+compiled program can ever reach — the DEFAULT (no-color, 80-column)
+configuration is not an approximation of Node's behavior here, it is
+Node's own real behavior under the EXACT stdio shape this tier's own
+programs always have.
+
+**Tested by:** no corpus program or unit pin distinguishes this from
+"Node's own real behavior" (that is the entry's own point — under a
+pipe, this IS Node's real behavior, not a divergence in the OBSERVABLE
+sense corpus programs could ever exercise) — filed as a registered
+scope statement per rule 2, matching board #66's own outstanding item,
+not as a claim any pin exercises a difference. The 80-column caret
+GATE's own VALUE is exercised (both directions) by
+`packages/compiler/test/wasm-assert.test.ts`'s "F.2 assembler: the
+caret's 80-unit boundary" pin (increment 23 P2b) and by
+`wasm-assert-core.test.ts`'s own P1-era straddle; neither pin claims to
+test the constant-vs-terminal-read distinction itself, only the
+constant's own correct value.

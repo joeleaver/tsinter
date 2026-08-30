@@ -236,6 +236,24 @@ export interface InspectDeps {
    * A.4: the assert renderer's entry sort is this, not a byte compare —
    * S002 stores UTF-16 code units, so no special case is needed). */
   strCmpU16: () => number;
+  /** `%w.str.trim:end(s) -> str` — JS's REAL `trimEnd` (the full ECMA
+   * White_Space + LineTerminator scan `strings.ts`'s `trim` already
+   * implements for the frontend's own `.trimEnd()` lowering), reused
+   * verbatim by `printMyersDiff` (design-p2.txt C.7 note (b)) rather
+   * than inheriting C's narrower "strip '\n' and ' ' only" loop. */
+  strTrimEnd: () => number;
+  /** Prints "Uncaught " + `message` to fd 2 — S007's own reporter
+   * (`%w.err.reportUncaught`) invoked DIRECTLY on a fresh EXC_STR cell
+   * rather than through the normal pending-cell unwind (setUncaughtError
+   * followed by every caller's own check-and-propagate) — and then
+   * traps. UNCATCHABLE (nothing rethrows it; the current wasm function
+   * halts right here) and NEVER RETURNS. For a refusal so deep inside a
+   * recursive render that wiring a genuine catchable throw back out
+   * through the whole walker is not worth building this pass
+   * (SEMANTICS.md S058's own cycle trap, increment 23 P2b: previously a
+   * bare `unreachable`, now named on stderr per the register's own
+   * "reachable runtime refusals are named" rule). */
+  namedTrap: (c: Code, message: string) => void;
 }
 
 export class InspectBuilder {
@@ -412,6 +430,45 @@ export class InspectBuilder {
       c.globalGet(this.len());
       c.localGet(0);
       c.i32Const(0);
+      c.localGet(N);
+      c.arrayCopy(strT, strT);
+      c.globalGet(this.len());
+      c.localGet(N);
+      c.i32Add();
+      c.globalSet(this.len());
+      this.mb.setBody(idx, [I32], c.bytes());
+    });
+  }
+
+  /** `%w.insp.ibPutRange(s, from, to)` — the `[from, to)` slice of `s`,
+   * VERBATIM — `ibPuts`'s own shape with a range instead of the whole
+   * string, added for `printMyersDiff` (design-p2.txt C.7), which
+   * renders individual LINES sliced out of the two full rendered
+   * strings rather than whole-string values. */
+  ibPutRange(): number {
+    return this.cached("ibPutRange", [this.deps.strRef(), I32, I32], [], (idx) => {
+      const strT = this.deps.strType();
+      const c = new Code();
+      const FROM = 1;
+      const TO = 2;
+      const N = 3;
+      c.localGet(TO);
+      c.localGet(FROM);
+      c.i32Sub();
+      c.localSet(N);
+      // array.copy null-traps on either side whatever the length, and an
+      // empty range would otherwise force a first allocation.
+      c.localGet(N);
+      c.i32Eqz();
+      c.ifVoid();
+      c.return_();
+      c.end();
+      c.localGet(N);
+      c.call(this.ibEnsure());
+      c.globalGet(this.buf());
+      c.globalGet(this.len());
+      c.localGet(0);
+      c.localGet(FROM);
       c.localGet(N);
       c.arrayCopy(strT, strT);
       c.globalGet(this.len());
@@ -1470,7 +1527,12 @@ export class InspectBuilder {
     return this.strArrT;
   }
 
-  private i32Arr(): number {
+  /** `(array (mut i32))` — public since increment 23 P2b: `splitLines`'s
+   * own offsets array type, which force-emit pins need to name
+   * directly (`arrayGet`/`arraySet`'s own typeIndex argument) the same
+   * way dyn.ts makes every struct/array type index public for exactly
+   * this reason. */
+  i32Arr(): number {
     this.i32ArrT ??= this.mb.arrayType(I32, true);
     return this.i32ArrT;
   }
@@ -1479,8 +1541,31 @@ export class InspectBuilder {
     return { kind: "ref", nullable: true, typeIndex: this.strArr() };
   }
 
-  private i32ArrRef(): ValType {
+  i32ArrRef(): ValType {
     return { kind: "ref", nullable: true, typeIndex: this.i32Arr() };
+  }
+
+  private traceArrT: number | null = null;
+
+  /** `(array (mut (ref null (array (mut i32)))))` — the myers windowed
+   * trace's own storage (design-p2.txt C.4): one nullable slot per
+   * `diffLevel` reached, holding that level's own small window (an
+   * `i32Arr()` of length `2*diffLevel+3`). Pre-sized ONCE to `max+1`
+   * slots (the forward walk's own outer-loop bound is `0..max`
+   * inclusive) — no growable-array machinery needed, since the exact
+   * worst-case slot count is known before the walk starts.
+   *
+   * Public since increment 23 P2b (same reason as `i32Arr`/`i32ArrRef`
+   * above): `myersForward`'s own `trace` return value flows into
+   * `myersBacktrack`'s params, and force-emit pins wiring that call by
+   * hand need to name the type directly for `setBody`'s locals list. */
+  traceArr(): number {
+    this.traceArrT ??= this.mb.arrayType(this.i32ArrRef(), true);
+    return this.traceArrT;
+  }
+
+  traceArrRef(): ValType {
+    return { kind: "ref", nullable: true, typeIndex: this.traceArr() };
   }
 
   private nullArrGlobal(field: "itemsG" | "fbaseG" | "fnumG", arrType: () => number): number {
@@ -2991,6 +3076,76 @@ export class InspectBuilder {
     });
   }
 
+  /** `%w.insp.cfSeenCheck(v)` -> i32 — TRUE iff `v` is already on the
+   * SHARED seen stack (the SAME `seen()`/`nseen()` the console.log dyn
+   * walker's own circCheck/seenPush/refWrap protocol uses — safe to
+   * share since the two walkers are never active on the same native
+   * call stack simultaneously, and `nseen` returns to 0 between
+   * independent top-level walks: whichever one starts next finds it
+   * already at 0). Unlike `circCheck`, this assigns NO circular id and
+   * mutates NOTHING — it is exactly the "is this value already being
+   * rendered" existence test `cfValue`'s own NAMED cycle trap (A.6)
+   * needs, deliberately WITHOUT `circCheck`'s own `<ref *N>`
+   * bookkeeping (design-p2.txt A.6: a named trap for the assert
+   * renderer, not the full `<ref *N>`/`[Circular *N]` protocol that
+   * console.log's own lane already owns and keeps). */
+  cfSeenCheck(): number {
+    return this.cached("cfSeenCheck", [EQ_REF], [I32], (idx) => {
+      const c = new Code();
+      const V = 0;
+      const I = 1;
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.globalGet(this.nseen());
+      c.i32GeS();
+      c.brIf(1);
+      c.globalGet(this.seen());
+      c.localGet(I);
+      c.arrayGet(this.eqArr());
+      c.localGet(V);
+      c.refEq();
+      c.ifVoid();
+      c.i32Const(1);
+      c.return_();
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.i32Const(0);
+      this.mb.setBody(idx, [I32], c.bytes());
+    });
+  }
+
+  /** `%w.insp.cfSeenPop()` -> void — the PLAIN pop half of the SHARED
+   * seen stack, for `cfValue`'s own named-trap protocol: no `<ref *N>`
+   * labeling (that is `refWrap`'s own job for the OTHER walker, which
+   * this trap deliberately does not build). Every ARR/OBJ arm of
+   * `cfValue` that pushes via `seenPush()` must call this on EVERY
+   * exit path — B.4's own discipline (deqEnter/deqLeave), one level
+   * up, for the renderer's own re-entrancy guard instead of the
+   * comparison memo. */
+  cfSeenPop(): number {
+    return this.cached("cfSeenPop", [], [], (idx) => {
+      const c = new Code();
+      c.globalGet(this.nseen());
+      c.i32Const(1);
+      c.i32Sub();
+      c.globalSet(this.nseen());
+      c.globalGet(this.seen());
+      c.globalGet(this.nseen());
+      c.refNull(EQ_HEAP);
+      c.arraySet(this.eqArr());
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
   /** `%w.insp.refWrap(v, s)` — pops the seen stack and prefixes `<ref *N> `
    * when the walk found `v` circular. */
   refWrap(): number {
@@ -4176,6 +4331,28 @@ export class InspectBuilder {
       c.i32Const(DK.ARR);
       c.i32Eq();
       c.ifVoid();
+      // CLAIM 0 (A.6, increment 23 P2b): a NAMED cycle trap. Re-entering
+      // a value already on the CURRENT render path (the shared seen
+      // stack cfValue and the console.log walker's own protocol both
+      // use, never active on the same native stack at once) traps
+      // loudly instead of recursing forever or silently degrading
+      // through depth elision — a cyclic operand is a DIFFERENT shape
+      // than a merely-very-deep one, and gets a different, honest
+      // answer. Pushed here, popped on EVERY exit below (B.4's own
+      // discipline, one level up). Named on stderr (S058's own amended
+      // reach statement, memo-rows ruling): `deps.namedTrap` prints
+      // "Uncaught " + this text via S007's shared reporter and traps —
+      // UNCATCHABLE, never a bare `unreachable`.
+      c.localGet(D);
+      c.call(this.cfSeenCheck());
+      c.ifVoid();
+      this.deps.namedTrap(
+        c,
+        "cfValue: cyclic value encountered while rendering an assert.eqDyn failure message (SEMANTICS.md S058)",
+      );
+      c.end();
+      c.localGet(D);
+      c.call(this.seenPush());
       dyn.arrPayload(c, (x) => x.localGet(D));
       c.localSet(AVEC);
       dyn.arrLen(c, (x) => x.localGet(AVEC));
@@ -4184,6 +4361,7 @@ export class InspectBuilder {
       c.i32Eqz();
       c.ifVoid();
       putLit("[]");
+      c.call(this.cfSeenPop());
       c.return_();
       c.end();
       c.localGet(RT);
@@ -4191,6 +4369,7 @@ export class InspectBuilder {
       c.i32GtS();
       c.ifVoid();
       putLit("[Array]");
+      c.call(this.cfSeenPop());
       c.return_();
       c.end();
       putc("[");
@@ -4234,6 +4413,7 @@ export class InspectBuilder {
       putc("\n");
       spaces(() => c.localGet(INDENT));
       putc("]");
+      c.call(this.cfSeenPop());
       c.return_();
       c.end();
 
@@ -4245,6 +4425,18 @@ export class InspectBuilder {
       c.i32Const(DK.OBJ);
       c.i32Eq();
       c.ifVoid();
+      // CLAIM 0 (A.6) — see the ARR arm's own comment; identical
+      // discipline, the SAME shared seen stack, the SAME named trap.
+      c.localGet(D);
+      c.call(this.cfSeenCheck());
+      c.ifVoid();
+      this.deps.namedTrap(
+        c,
+        "cfValue: cyclic value encountered while rendering an assert.eqDyn failure message (SEMANTICS.md S058)",
+      );
+      c.end();
+      c.localGet(D);
+      c.call(this.seenPush());
       dyn.objPayload(c, (x) => x.localGet(D));
       c.localSet(OP);
       c.localGet(OP);
@@ -4262,6 +4454,7 @@ export class InspectBuilder {
       c.else_();
       putLit("{}");
       c.end();
+      c.call(this.cfSeenPop());
       c.return_();
       c.end();
       c.localGet(RT);
@@ -4274,6 +4467,7 @@ export class InspectBuilder {
       c.else_();
       putLit("[Object]");
       c.end();
+      c.call(this.cfSeenPop());
       c.return_();
       c.end();
       c.localGet(OP);
@@ -4433,6 +4627,7 @@ export class InspectBuilder {
       putc("\n");
       spaces(() => c.localGet(INDENT));
       putc("}");
+      c.call(this.cfSeenPop());
       c.return_();
       c.end();
 
@@ -4473,5 +4668,1312 @@ export class InspectBuilder {
       c.call(this.ibTake());
       this.mb.setBody(idx, [I32], c.bytes());
     });
+  }
+
+  /** `%w.assert.splitLines(s) -> (offsets, n)` (design-p2.txt C.1) —
+   * Node does `StringPrototypeSplit(inspected, '\n')`; N newlines give
+   * N+1 pieces. WASM LAYOUT: no substrings — `offsets` holds n+1 START
+   * positions (`offsets[0] = 0`; `offsets[n] = len+1` is a SENTINEL),
+   * so line i spans `[offsets[i], offsets[i+1]-1)`. Two passes: count
+   * newlines, then fill. Every downstream consumer (`linesEq`, the
+   * printer's own line emission, notIdentical's 50-line slice, neq's
+   * 47-line collapse) wants a (str, from, to) triple computed from two
+   * adjacent offsets — this function hands back the RAW offsets array
+   * and count, not materialized substrings, per C.1's own layout. */
+  splitLines(): number {
+    const offsetsRefT = this.i32ArrRef();
+    return this.cached("splitLines", [this.deps.strRef()], [offsetsRefT, I32], (idx) => {
+      const strT = this.deps.strType();
+      const c = new Code();
+      const S = 0;
+      const LEN = 1;
+      const I = 2;
+      const NL = 3;
+      const OFFSETS = 4;
+      const OI = 5;
+      c.localGet(S);
+      c.arrayLen();
+      c.localSet(LEN);
+      // Pass 1: count newlines.
+      c.i32Const(0);
+      c.localSet(NL);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(LEN);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(S);
+      c.localGet(I);
+      c.arrayGetU(strT);
+      c.i32Const(10); // '\n'
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(NL);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(NL);
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      // Allocate offsets[0..NL+1] — NL+2 entries (n = NL+1 lines, plus
+      // the sentinel).
+      c.localGet(NL);
+      c.i32Const(2);
+      c.i32Add();
+      c.arrayNewDefault(this.i32Arr());
+      c.localSet(OFFSETS);
+      c.localGet(OFFSETS);
+      c.i32Const(0);
+      c.i32Const(0);
+      c.arraySet(this.i32Arr());
+      // Pass 2: fill offsets[1..NL] with the position right after each
+      // newline.
+      c.i32Const(1);
+      c.localSet(OI);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(LEN);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(S);
+      c.localGet(I);
+      c.arrayGetU(strT);
+      c.i32Const(10);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(OFFSETS);
+      c.localGet(OI);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.arraySet(this.i32Arr());
+      c.localGet(OI);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(OI);
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      // Sentinel: offsets[NL+1] = len+1.
+      c.localGet(OFFSETS);
+      c.localGet(NL);
+      c.i32Const(1);
+      c.i32Add();
+      c.localGet(LEN);
+      c.i32Const(1);
+      c.i32Add();
+      c.arraySet(this.i32Arr());
+      c.localGet(OFFSETS);
+      c.localGet(NL);
+      c.i32Const(1);
+      c.i32Add();
+      // Locals beyond the 1 param (S=0): LEN=1, I=2, NL=3 (all i32),
+      // OFFSETS=4 (the array REF — own first-pass bug, caught by
+      // running this function's own pin: declared as I32 here
+      // originally, which a validator rejects the moment
+      // `array.new_default`'s result tries to `local.set` into it),
+      // OI=5 (i32).
+      this.mb.setBody(idx, [I32, I32, I32, offsetsRefT, I32], c.bytes());
+    });
+  }
+
+  /** `%w.assert.linesEq(sa, fa, ta, sb, fb, tb, comma) -> i32` — C.2's
+   * port of `areLinesEqual` (myers_diff.js:24-31): `a === b || (comma
+   * && ((a+',') === b || a === (b+',')))`, as a range compare over the
+   * SAME shared rendered string(s) `sa`/`sb` (which may be the SAME
+   * string ref for two lines of one side, or different refs across
+   * actual/expected) at `[fX, tX)`. HAZARD (own re-derivation of C.2's
+   * own warning, confirmed against dyn.ts:3514-3517's `iterPack`
+   * precedent): the three-way conjunction MUST nest as `if` blocks —
+   * `i32.and` does not short-circuit, so `len-1 == other && s[t-1] ==
+   * ','` evaluated flat would `array.get` at index -1 on a
+   * zero-length line and TRAP. */
+  linesEq(): number {
+    return this.cached(
+      "linesEq",
+      [this.deps.strRef(), I32, I32, this.deps.strRef(), I32, I32, I32],
+      [I32],
+      (idx) => {
+        const strT = this.deps.strType();
+        const c = new Code();
+        const SA = 0;
+        const FA = 1;
+        const TA = 2;
+        const SB = 3;
+        const FB = 4;
+        const TB = 5;
+        const COMMA = 6;
+        const LA = 7;
+        const LB = 8;
+        const I = 9;
+        c.localGet(TA);
+        c.localGet(FA);
+        c.i32Sub();
+        c.localSet(LA);
+        c.localGet(TB);
+        c.localGet(FB);
+        c.i32Sub();
+        c.localSet(LB);
+        // a === b: same length, same units.
+        c.localGet(LA);
+        c.localGet(LB);
+        c.i32Eq();
+        c.ifVoid();
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(LA);
+        c.i32GeS();
+        c.brIf(1);
+        c.localGet(SA);
+        c.localGet(FA);
+        c.localGet(I);
+        c.i32Add();
+        c.arrayGetU(strT);
+        c.localGet(SB);
+        c.localGet(FB);
+        c.localGet(I);
+        c.i32Add();
+        c.arrayGetU(strT);
+        c.i32Ne();
+        c.ifVoid();
+        c.i32Const(0);
+        c.return_();
+        c.end();
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        c.i32Const(1);
+        c.return_();
+        c.end();
+        c.localGet(COMMA);
+        c.i32Eqz();
+        c.ifVoid();
+        c.i32Const(0);
+        c.return_();
+        c.end();
+        // (a+',') === b: LA+1 == LB, b's last unit is ',', and the
+        // shared prefix (length LA) is equal.
+        c.localGet(LA);
+        c.i32Const(1);
+        c.i32Add();
+        c.localGet(LB);
+        c.i32Eq();
+        c.ifVoid();
+        c.localGet(SB);
+        c.localGet(TB);
+        c.i32Const(1);
+        c.i32Sub();
+        c.arrayGetU(strT);
+        c.i32Const(44); // ','
+        c.i32Eq();
+        c.ifVoid();
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(LA);
+        c.i32GeS();
+        c.brIf(1);
+        c.localGet(SA);
+        c.localGet(FA);
+        c.localGet(I);
+        c.i32Add();
+        c.arrayGetU(strT);
+        c.localGet(SB);
+        c.localGet(FB);
+        c.localGet(I);
+        c.i32Add();
+        c.arrayGetU(strT);
+        c.i32Ne();
+        c.ifVoid();
+        c.i32Const(0);
+        c.return_();
+        c.end();
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        c.i32Const(1);
+        c.return_();
+        c.end();
+        c.end();
+        // a === (b+','): LB+1 == LA, a's last unit is ',', shared
+        // prefix (length LB) equal.
+        c.localGet(LB);
+        c.i32Const(1);
+        c.i32Add();
+        c.localGet(LA);
+        c.i32Eq();
+        c.ifVoid();
+        c.localGet(SA);
+        c.localGet(TA);
+        c.i32Const(1);
+        c.i32Sub();
+        c.arrayGetU(strT);
+        c.i32Const(44);
+        c.i32Eq();
+        c.ifVoid();
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(LB);
+        c.i32GeS();
+        c.brIf(1);
+        c.localGet(SA);
+        c.localGet(FA);
+        c.localGet(I);
+        c.i32Add();
+        c.arrayGetU(strT);
+        c.localGet(SB);
+        c.localGet(FB);
+        c.localGet(I);
+        c.i32Add();
+        c.arrayGetU(strT);
+        c.i32Ne();
+        c.ifVoid();
+        c.i32Const(0);
+        c.return_();
+        c.end();
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        c.i32Const(1);
+        c.return_();
+        c.end();
+        c.end();
+        c.i32Const(0);
+        this.mb.setBody(idx, [I32, I32, I32], c.bytes());
+      },
+    );
+  }
+
+  /** `%w.assert.myersForward(strA, offA, nA, strB, offB, nB, comma) ->
+   * (trace, traceLen, max)` — Node's `myersDiff`'s own forward walk
+   * (myers_diff.js:34-78), producing the WINDOWED trace C.4 proves is
+   * output-identical to Node's own full-array clone per level.
+   *
+   * PADDING (C.3's own two hazards, BOTH fixed the same way): `v`'s
+   * PHYSICAL array has length `2*max+3`; a LOGICAL offset `o` (which
+   * ranges -1..2max+1 in Node's own algorithm, since `previousOffset`/
+   * `nextOffset` read one past either end at the extremes) lives at
+   * PHYSICAL index `o+1` (0..2max+2) — so both the neighbour-read
+   * hazard (an out-of-range read that Node's own JS gets `undefined`
+   * from, provably never USED — C.3's own worked proof) and the
+   * window's own boundary at `diffLevel === max` (whose logical range
+   * [max-max-1, max+max+1] = [-1, 2max+1] is EXACTLY v's own logical
+   * range) are resolved by the identical `+1` adjustment. The inner
+   * diagonal loop's own guard (`k !== d && prev < next`) reads BOTH
+   * operands unconditionally either way (matching Node's own EAGER
+   * read, C.3(ii)) — a flat `i32.and` is safe here specifically
+   * because neither operand is an array read gated by the other. */
+  myersForward(): number {
+    const traceRefT = this.traceArrRef();
+    return this.cached(
+      "myersForward",
+      [this.deps.strRef(), this.i32ArrRef(), I32, this.deps.strRef(), this.i32ArrRef(), I32, I32],
+      [traceRefT, I32, I32],
+      (idx) => {
+        const c = new Code();
+        const STRA = 0;
+        const OFFA = 1;
+        const NA = 2;
+        const STRB = 3;
+        const OFFB = 4;
+        const NB = 5;
+        const COMMA = 6;
+        const MAXV = 7;
+        const V = 8;
+        const TRACE = 9;
+        const DIFFLEVEL = 10;
+        const DIAGIDX = 11;
+        const OFFSET = 12;
+        const PREVOFF = 13;
+        const NEXTOFF = 14;
+        const XV = 15;
+        const YV = 16;
+        const WIN = 17;
+        const WINBASE = 18;
+        const WINLEN = 19;
+        const TMPI = 20;
+        const TRACELEN = 21;
+        const i32ArrT = this.i32Arr();
+        const traceArrT = this.traceArr();
+
+        // physV(logicalOffset) -> pushes the PHYSICAL v-index.
+        const pushPhysV = (pushLogical: (c: Code) => void): void => {
+          pushLogical(c);
+          c.i32Const(1);
+          c.i32Add();
+        };
+        const pushVGet = (pushLogical: (c: Code) => void): void => {
+          c.localGet(V);
+          pushPhysV(pushLogical);
+          c.arrayGet(i32ArrT);
+        };
+        const pushLineFrom = (off: number, pushIdx: (c: Code) => void): void => {
+          c.localGet(off);
+          pushIdx(c);
+          c.arrayGet(i32ArrT);
+        };
+        const pushLineTo = (off: number, pushIdx: (c: Code) => void): void => {
+          c.localGet(off);
+          pushIdx(c);
+          c.i32Const(1);
+          c.i32Add();
+          c.arrayGet(i32ArrT);
+          c.i32Const(1);
+          c.i32Sub();
+        };
+        const pushLinesEqual = (pushX: (c: Code) => void, pushY: (c: Code) => void): void => {
+          c.localGet(STRA);
+          pushLineFrom(OFFA, pushX);
+          pushLineTo(OFFA, pushX);
+          c.localGet(STRB);
+          pushLineFrom(OFFB, pushY);
+          pushLineTo(OFFB, pushY);
+          c.localGet(COMMA);
+          c.call(this.linesEq());
+        };
+
+        c.localGet(NA);
+        c.localGet(NB);
+        c.i32Add();
+        c.localSet(MAXV);
+        c.localGet(MAXV);
+        c.i32Const(2);
+        c.i32Mul();
+        c.i32Const(3);
+        c.i32Add();
+        c.arrayNewDefault(i32ArrT);
+        c.localSet(V);
+        c.localGet(MAXV);
+        c.i32Const(1);
+        c.i32Add();
+        c.arrayNewDefault(traceArrT);
+        c.localSet(TRACE);
+        c.i32Const(0);
+        c.localSet(TRACELEN);
+
+        c.i32Const(0);
+        c.localSet(DIFFLEVEL);
+        c.block(); // 3: outer break
+        c.loop(); // 2: outer continue
+        c.localGet(DIFFLEVEL);
+        c.localGet(MAXV);
+        c.i32GtS();
+        c.brIf(1); // break outer block (from loop depth: loop=0 relative here, block=1)
+
+        // Snapshot this level's window BEFORE the diagonal loop writes.
+        c.localGet(DIFFLEVEL);
+        c.i32Const(2);
+        c.i32Mul();
+        c.i32Const(3);
+        c.i32Add();
+        c.localSet(WINLEN);
+        c.localGet(MAXV);
+        c.localGet(DIFFLEVEL);
+        c.i32Sub();
+        c.localSet(WINBASE);
+        c.localGet(WINLEN);
+        c.arrayNewDefault(i32ArrT);
+        c.localSet(WIN);
+        c.i32Const(0);
+        c.localSet(TMPI);
+        c.block();
+        c.loop();
+        c.localGet(TMPI);
+        c.localGet(WINLEN);
+        c.i32GeS();
+        c.brIf(1);
+        c.localGet(WIN);
+        c.localGet(TMPI);
+        c.localGet(V);
+        c.localGet(WINBASE);
+        c.localGet(TMPI);
+        c.i32Add();
+        c.arrayGet(i32ArrT);
+        c.arraySet(i32ArrT);
+        c.localGet(TMPI);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(TMPI);
+        c.br(0);
+        c.end();
+        c.end();
+        c.localGet(TRACE);
+        c.localGet(DIFFLEVEL);
+        c.localGet(WIN);
+        c.arraySet(traceArrT);
+
+        // The diagonal loop.
+        c.localGet(DIFFLEVEL);
+        c.i32Const(-1);
+        c.i32Mul();
+        c.localSet(DIAGIDX);
+        c.block(); // 1: inner break
+        c.loop(); // 0: inner continue
+        c.localGet(DIAGIDX);
+        c.localGet(DIFFLEVEL);
+        c.i32GtS();
+        c.brIf(1);
+        c.localGet(DIAGIDX);
+        c.localGet(MAXV);
+        c.i32Add();
+        c.localSet(OFFSET);
+        pushVGet((x) => {
+          x.localGet(OFFSET);
+          x.i32Const(1);
+          x.i32Sub();
+        });
+        c.localSet(PREVOFF);
+        pushVGet((x) => {
+          x.localGet(OFFSET);
+          x.i32Const(1);
+          x.i32Add();
+        });
+        c.localSet(NEXTOFF);
+        c.localGet(DIAGIDX);
+        c.localGet(DIFFLEVEL);
+        c.i32Const(-1);
+        c.i32Mul();
+        c.i32Eq();
+        c.ifResult(I32);
+        c.localGet(NEXTOFF);
+        c.else_();
+        c.localGet(DIAGIDX);
+        c.localGet(DIFFLEVEL);
+        c.i32Ne();
+        c.localGet(PREVOFF);
+        c.localGet(NEXTOFF);
+        c.i32LtS();
+        c.i32And();
+        c.ifResult(I32);
+        c.localGet(NEXTOFF);
+        c.else_();
+        c.localGet(PREVOFF);
+        c.i32Const(1);
+        c.i32Add();
+        c.end();
+        c.end();
+        c.localSet(XV);
+        c.localGet(XV);
+        c.localGet(DIAGIDX);
+        c.i32Sub();
+        c.localSet(YV);
+        c.block();
+        c.loop();
+        c.localGet(XV);
+        c.localGet(NA);
+        c.i32LtS();
+        c.ifResult(I32);
+        c.localGet(YV);
+        c.localGet(NB);
+        c.i32LtS();
+        c.else_();
+        c.i32Const(0);
+        c.end();
+        c.i32Eqz();
+        c.brIf(1);
+        pushLinesEqual(
+          (x) => x.localGet(XV),
+          (x) => x.localGet(YV),
+        );
+        c.i32Eqz();
+        c.brIf(1);
+        c.localGet(XV);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(XV);
+        c.localGet(YV);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(YV);
+        c.br(0);
+        c.end();
+        c.end();
+        c.localGet(V);
+        c.localGet(OFFSET);
+        c.i32Const(1);
+        c.i32Add();
+        c.localGet(XV);
+        c.arraySet(i32ArrT);
+        c.localGet(XV);
+        c.localGet(NA);
+        c.i32GeS();
+        c.ifResult(I32);
+        c.localGet(YV);
+        c.localGet(NB);
+        c.i32GeS();
+        c.else_();
+        c.i32Const(0);
+        c.end();
+        c.ifVoid();
+        c.localGet(DIFFLEVEL);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(TRACELEN);
+        // Break the OUTER block. Nesting at this point, innermost
+        // first: this ifVoid(0), inner loop(1), inner block(2), outer
+        // loop(3), outer block(4) — own first-pass bug, caught by
+        // running this function's own pin: an off-by-one here (br(3),
+        // targeting the OUTER LOOP as a "continue" instead of the
+        // OUTER BLOCK as a "break") re-ran the same diffLevel forever
+        // since DIFFLEVEL is only incremented at the BOTTOM of the
+        // outer loop body, past this branch — an infinite loop, not a
+        // validation error, since br(3) was still a STRUCTURALLY
+        // valid (if wrong) target.
+        c.br(4);
+        c.end();
+        c.localGet(DIAGIDX);
+        c.i32Const(2);
+        c.i32Add();
+        c.localSet(DIAGIDX);
+        c.br(0);
+        c.end();
+        c.end();
+        c.localGet(DIFFLEVEL);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(DIFFLEVEL);
+        c.br(0);
+        c.end();
+        c.end();
+
+        c.localGet(TRACE);
+        c.localGet(TRACELEN);
+        c.localGet(MAXV);
+        this.mb.setBody(
+          idx,
+          [
+            I32 /* MAXV=7 */,
+            this.i32ArrRef() /* V=8 */,
+            traceRefT /* TRACE=9 */,
+            I32 /* DIFFLEVEL=10 */,
+            I32 /* DIAGIDX=11 */,
+            I32 /* OFFSET=12 */,
+            I32 /* PREVOFF=13 */,
+            I32 /* NEXTOFF=14 */,
+            I32 /* XV=15 */,
+            I32 /* YV=16 */,
+            this.i32ArrRef() /* WIN=17 */,
+            I32 /* WINBASE=18 */,
+            I32 /* WINLEN=19 */,
+            I32 /* TMPI=20 */,
+            I32 /* TRACELEN=21 */,
+          ],
+          c.bytes(),
+        );
+      },
+    );
+  }
+
+  /** `%w.assert.myersBacktrack(strA, offA, nA, strB, offB, nB, comma,
+   * trace, traceLen, max) -> (ops, sides, idxs, resultLen)` — C.6's
+   * port of `backtrack` (myers_diff.js:80-125), walking `diffLevel`
+   * from `traceLen-1` down to 0 in REVERSE document order (the caller
+   * — `printMyersDiff` — walks it back to front to recover forward
+   * order, exactly as Node's own printer does).
+   *
+   * REPRESENTATION: rather than push JS-style `[op, value]` pairs (a
+   * STRING per NOP/INSERT/DELETE), this stores three parallel
+   * `array i32`s — `ops` ({-1,0,1} = DELETE/NOP/INSERT), `sides` (0 =
+   * slice from the actual/`strA` side, 1 = expected/`strB`), `idxs`
+   * (the LINE INDEX within that side) — deferring the actual byte
+   * slice to `printMyersDiff`, which already needs strA/offA/strB/offB
+   * to render. Pre-sized to `max` entries: NOP+INSERT sum to exactly
+   * `nA` (x's total descent from nA to 0) and NOP+DELETE sum to
+   * exactly `nB`, so total pushes = nA+nB-NOP <= nA+nB = max — same
+   * "exact safe upper bound, no growable array" style as `myersForward`'s
+   * own `trace`.
+   *
+   * THE NOP-VALUE RULE (C.6's own citation, MEASURED reachable BOTH
+   * directions in the corpus): `value = comma && !actualItem.endsWith(',')
+   * ? expected[y-1] : actual[x-1]` — a NOP can render EITHER side's
+   * line. 1771 L4 (`{a:1,b:2}` vs `{a:1}`) takes the actual side (its
+   * own comma-suffixed `a: 1,`); 1771 L16 (`{a:1}` vs `{a:1,b:undefined}`)
+   * takes the expected side, because the ACTUAL line there has no
+   * trailing comma. `endsWithComma` is read EAGERLY regardless of
+   * `comma`'s own value (a pure, always-in-bounds read of the actual
+   * line at index x-1, x>=1 guaranteed by the while-loop's own guard)
+   * and ANDed flat with `comma` — safe for the same reason `myersForward`'s
+   * own flat `i32And` is safe: neither operand is an array read gated
+   * by the other.
+   *
+   * WINDOWED-TRACE READS: `trace[diffLevel]` is the SAME 2L+3-windowed
+   * snapshot `myersForward` writes (C.4's own base = `max-diffLevel-1`,
+   * i.e. physical = logical - (max-diffLevel-1) via the SAME "+1"
+   * shift myersForward's own `pushPhysV` uses for the live `v`,
+   * substituting `max-diffLevel` for myersForward's plain `max`).
+   * C.4's own proof explicitly covers backtrack's three reads here
+   * (`v[offset-1]`, `v[offset+1]`, `v[prevDiagonalIndex+max]`) as
+   * "all three indices lie in [max-L-1, max+L+1]" — i.e. ALWAYS within
+   * the window's own allocated bounds (no trap), even at the diagIdx
+   * extremes where Node's own `||`/`&&` would have short-circuited
+   * past reading them — so, exactly as in `myersForward`, eager reads
+   * plus a selection that matches Node's short-circuit STRUCTURE
+   * (not its evaluation order) reproduce the same result. */
+  myersBacktrack(): number {
+    const i32ArrRefT = this.i32ArrRef();
+    return this.cached(
+      "myersBacktrack",
+      [
+        this.deps.strRef(),
+        i32ArrRefT,
+        I32,
+        this.deps.strRef(),
+        i32ArrRefT,
+        I32,
+        I32,
+        this.traceArrRef(),
+        I32,
+        I32,
+      ],
+      [i32ArrRefT, i32ArrRefT, i32ArrRefT, I32],
+      (idx) => {
+        const c = new Code();
+        const STRA = 0;
+        const OFFA = 1;
+        const NA = 2;
+        const STRB = 3;
+        const OFFB = 4;
+        const NB = 5;
+        const COMMA = 6;
+        const TRACE = 7;
+        const TRACELEN = 8;
+        const MAXV = 9;
+        const X = 10;
+        const Y = 11;
+        const RESLEN = 12;
+        const OPS = 13;
+        const SIDES = 14;
+        const IDXS = 15;
+        const DIFFLEVEL = 16;
+        const V = 17;
+        const DIAGIDX = 18;
+        const OFFSET = 19;
+        const PREVDIAGIDX = 20;
+        const PREVOFF = 21;
+        const NEXTOFF = 22;
+        const PREVX = 23;
+        const PREVY = 24;
+        const ENDSCOMMA = 25;
+        const USEEXP = 26;
+        const i32ArrT = this.i32Arr();
+        const traceArrT = this.traceArr();
+        const strT = this.deps.strType();
+        void OFFB;
+        void STRB;
+        void NB;
+
+        const pushLineFrom = (off: number, pushIdx: (c: Code) => void): void => {
+          c.localGet(off);
+          pushIdx(c);
+          c.arrayGet(i32ArrT);
+        };
+        const pushLineTo = (off: number, pushIdx: (c: Code) => void): void => {
+          c.localGet(off);
+          pushIdx(c);
+          c.i32Const(1);
+          c.i32Add();
+          c.arrayGet(i32ArrT);
+          c.i32Const(1);
+          c.i32Sub();
+        };
+        // 1 iff the ACTUAL line at pushIdx is non-empty and its last
+        // unit is ','  (matches ''.endsWith(',') === false for empty).
+        const pushEndsWithComma = (pushIdx: (c: Code) => void): void => {
+          pushLineTo(OFFA, pushIdx);
+          pushLineFrom(OFFA, pushIdx);
+          c.i32GtS();
+          c.ifResult(I32);
+          c.localGet(STRA);
+          pushLineTo(OFFA, pushIdx);
+          c.i32Const(1);
+          c.i32Sub();
+          c.arrayGetU(strT);
+          c.i32Const(44); // ','
+          c.i32Eq();
+          c.else_();
+          c.i32Const(0);
+          c.end();
+        };
+        // physical window index = logical - (max-diffLevel) + 1, the
+        // SAME "+1" shift myersForward's own physV uses, with the
+        // window's base (max-diffLevel) standing in for myersForward's
+        // plain max (C.4).
+        const pushWinGet = (pushLogical: (c: Code) => void): void => {
+          c.localGet(V);
+          pushLogical(c);
+          c.localGet(MAXV);
+          c.i32Sub();
+          c.localGet(DIFFLEVEL);
+          c.i32Add();
+          c.i32Const(1);
+          c.i32Add();
+          c.arrayGet(i32ArrT);
+        };
+
+        c.localGet(NA);
+        c.localSet(X);
+        c.localGet(NB);
+        c.localSet(Y);
+        c.i32Const(0);
+        c.localSet(RESLEN);
+        c.localGet(MAXV);
+        c.arrayNewDefault(i32ArrT);
+        c.localSet(OPS);
+        c.localGet(MAXV);
+        c.arrayNewDefault(i32ArrT);
+        c.localSet(SIDES);
+        c.localGet(MAXV);
+        c.arrayNewDefault(i32ArrT);
+        c.localSet(IDXS);
+
+        c.localGet(TRACELEN);
+        c.i32Const(1);
+        c.i32Sub();
+        c.localSet(DIFFLEVEL);
+        c.block(); // outer break
+        c.loop(); // outer continue
+        c.localGet(DIFFLEVEL);
+        c.i32Const(0);
+        c.i32LtS();
+        c.brIf(1); // break outer block (loop=0 here, block=1)
+
+        c.localGet(TRACE);
+        c.localGet(DIFFLEVEL);
+        c.arrayGet(traceArrT);
+        c.localSet(V);
+
+        c.localGet(X);
+        c.localGet(Y);
+        c.i32Sub();
+        c.localSet(DIAGIDX);
+        c.localGet(DIAGIDX);
+        c.localGet(MAXV);
+        c.i32Add();
+        c.localSet(OFFSET);
+
+        pushWinGet((x) => {
+          x.localGet(OFFSET);
+          x.i32Const(1);
+          x.i32Sub();
+        });
+        c.localSet(PREVOFF);
+        pushWinGet((x) => {
+          x.localGet(OFFSET);
+          x.i32Const(1);
+          x.i32Add();
+        });
+        c.localSet(NEXTOFF);
+        c.localGet(DIAGIDX);
+        c.localGet(DIFFLEVEL);
+        c.i32Const(-1);
+        c.i32Mul();
+        c.i32Eq();
+        c.ifResult(I32);
+        c.localGet(DIAGIDX);
+        c.i32Const(1);
+        c.i32Add();
+        c.else_();
+        c.localGet(DIAGIDX);
+        c.localGet(DIFFLEVEL);
+        c.i32Ne();
+        c.localGet(PREVOFF);
+        c.localGet(NEXTOFF);
+        c.i32LtS();
+        c.i32And();
+        c.ifResult(I32);
+        c.localGet(DIAGIDX);
+        c.i32Const(1);
+        c.i32Add();
+        c.else_();
+        c.localGet(DIAGIDX);
+        c.i32Const(1);
+        c.i32Sub();
+        c.end();
+        c.end();
+        c.localSet(PREVDIAGIDX);
+
+        pushWinGet((x) => {
+          x.localGet(PREVDIAGIDX);
+          x.localGet(MAXV);
+          x.i32Add();
+        });
+        c.localSet(PREVX);
+        c.localGet(PREVX);
+        c.localGet(PREVDIAGIDX);
+        c.i32Sub();
+        c.localSet(PREVY);
+
+        // The NOP while-loop: while (x>prevX && y>prevY).
+        c.block(); // NOP break
+        c.loop(); // NOP continue
+        c.localGet(X);
+        c.localGet(PREVX);
+        c.i32GtS();
+        c.localGet(Y);
+        c.localGet(PREVY);
+        c.i32GtS();
+        c.i32And();
+        c.i32Eqz();
+        c.brIf(1); // break NOP block (loop=0, block=1 here)
+
+        pushEndsWithComma((x) => {
+          x.localGet(X);
+          x.i32Const(1);
+          x.i32Sub();
+        });
+        c.localSet(ENDSCOMMA);
+        c.localGet(COMMA);
+        c.localGet(ENDSCOMMA);
+        c.i32Eqz();
+        c.i32And();
+        c.localSet(USEEXP);
+
+        c.localGet(OPS);
+        c.localGet(RESLEN);
+        c.i32Const(0); // NOP
+        c.arraySet(i32ArrT);
+        c.localGet(USEEXP);
+        c.ifVoid();
+        c.localGet(SIDES);
+        c.localGet(RESLEN);
+        c.i32Const(1); // expected side
+        c.arraySet(i32ArrT);
+        c.localGet(IDXS);
+        c.localGet(RESLEN);
+        c.localGet(Y);
+        c.i32Const(1);
+        c.i32Sub();
+        c.arraySet(i32ArrT);
+        c.else_();
+        c.localGet(SIDES);
+        c.localGet(RESLEN);
+        c.i32Const(0); // actual side
+        c.arraySet(i32ArrT);
+        c.localGet(IDXS);
+        c.localGet(RESLEN);
+        c.localGet(X);
+        c.i32Const(1);
+        c.i32Sub();
+        c.arraySet(i32ArrT);
+        c.end();
+
+        c.localGet(RESLEN);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(RESLEN);
+        c.localGet(X);
+        c.i32Const(1);
+        c.i32Sub();
+        c.localSet(X);
+        c.localGet(Y);
+        c.i32Const(1);
+        c.i32Sub();
+        c.localSet(Y);
+        c.br(0); // continue NOP loop (loop=0 here, directly inside it)
+        c.end();
+        c.end();
+
+        // diffLevel > 0: exactly one INSERT or DELETE.
+        c.localGet(DIFFLEVEL);
+        c.i32Const(0);
+        c.i32GtS();
+        c.ifVoid();
+        c.localGet(X);
+        c.localGet(PREVX);
+        c.i32GtS();
+        c.ifVoid();
+        c.localGet(X);
+        c.i32Const(1);
+        c.i32Sub();
+        c.localSet(X);
+        c.localGet(OPS);
+        c.localGet(RESLEN);
+        c.i32Const(1); // INSERT
+        c.arraySet(i32ArrT);
+        c.localGet(SIDES);
+        c.localGet(RESLEN);
+        c.i32Const(0); // actual side
+        c.arraySet(i32ArrT);
+        c.localGet(IDXS);
+        c.localGet(RESLEN);
+        c.localGet(X);
+        c.arraySet(i32ArrT);
+        c.localGet(RESLEN);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(RESLEN);
+        c.else_();
+        c.localGet(Y);
+        c.i32Const(1);
+        c.i32Sub();
+        c.localSet(Y);
+        c.localGet(OPS);
+        c.localGet(RESLEN);
+        c.i32Const(-1); // DELETE
+        c.arraySet(i32ArrT);
+        c.localGet(SIDES);
+        c.localGet(RESLEN);
+        c.i32Const(1); // expected side
+        c.arraySet(i32ArrT);
+        c.localGet(IDXS);
+        c.localGet(RESLEN);
+        c.localGet(Y);
+        c.arraySet(i32ArrT);
+        c.localGet(RESLEN);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(RESLEN);
+        c.end();
+        c.end();
+
+        c.localGet(DIFFLEVEL);
+        c.i32Const(1);
+        c.i32Sub();
+        c.localSet(DIFFLEVEL);
+        c.br(0); // continue outer loop (loop=0 here, directly inside it)
+        c.end();
+        c.end();
+
+        c.localGet(OPS);
+        c.localGet(SIDES);
+        c.localGet(IDXS);
+        c.localGet(RESLEN);
+        this.mb.setBody(
+          idx,
+          [
+            I32 /* X=10 */,
+            I32 /* Y=11 */,
+            I32 /* RESLEN=12 */,
+            i32ArrRefT /* OPS=13 */,
+            i32ArrRefT /* SIDES=14 */,
+            i32ArrRefT /* IDXS=15 */,
+            I32 /* DIFFLEVEL=16 */,
+            this.i32ArrRef() /* V=17 */,
+            I32 /* DIAGIDX=18 */,
+            I32 /* OFFSET=19 */,
+            I32 /* PREVDIAGIDX=20 */,
+            I32 /* PREVOFF=21 */,
+            I32 /* NEXTOFF=22 */,
+            I32 /* PREVX=23 */,
+            I32 /* PREVY=24 */,
+            I32 /* ENDSCOMMA=25 */,
+            I32 /* USEEXP=26 */,
+          ],
+          c.bytes(),
+        );
+      },
+    );
+  }
+
+  /** `%w.assert.printMyersDiff(strA, offA, strB, offB, ops, sides, idxs,
+   * resultLen) -> (message, skipped)` — C.7's port of `printMyersDiff`
+   * (myers_diff.js:146-189). `operator` is NOT a parameter: D.6 (design-
+   * p2.txt) already rules `partialDeepStrictEqual`'s gray/space INSERT
+   * variant and all of `colors` out of scope — this tier renders the
+   * NO-COLOR configuration unconditionally (no stderr to interrogate),
+   * so every `colors.X` in Node's own source is the empty string here,
+   * and INSERT always takes the plain `"+ "` form.
+   *
+   * Walks `diffIdx` from `resultLen-1` down to 0 — DOCUMENT order,
+   * since `myersBacktrack` pushed in REVERSE document order (C.6).
+   *
+   * TWO faithfully-ported quirks (both MEASURED in the corpus, C.7's
+   * own notes): (a) a trailing common (NOP) run past 5 lines at the
+   * very END of the diff is silently DROPPED — there is no flush after
+   * the loop, only a transition out of a NOP run triggers the collapse
+   * arms, and the loop simply ends while still inside one; (b) the
+   * final trim is JS's REAL `trimEnd` (`deps.strTrimEnd`, the full
+   * ECMA White_Space + LineTerminator scan `strings.ts` already
+   * implements), not the narrower "strip '\n'/' ' only" a C-shaped
+   * port would suggest. */
+  printMyersDiff(): number {
+    const i32ArrRefT = this.i32ArrRef();
+    const strRefT = this.deps.strRef();
+    return this.cached(
+      "printMyersDiff",
+      [strRefT, i32ArrRefT, strRefT, i32ArrRefT, i32ArrRefT, i32ArrRefT, i32ArrRefT, I32],
+      [strRefT, I32],
+      (idx) => {
+        const c = new Code();
+        const STRA = 0;
+        const OFFA = 1;
+        const STRB = 2;
+        const OFFB = 3;
+        const OPS = 4;
+        const SIDES = 5;
+        const IDXS = 6;
+        const RESLEN = 7;
+        const MARK = 8;
+        const DIFFIDX = 9;
+        const NOPCOUNT = 10;
+        const SKIPPED = 11;
+        const OPVAL = 12;
+        const PREVOP = 13;
+        const TRIMMED = 14;
+        const i32ArrT = this.i32Arr();
+        const NULL_SENTINEL = -2; // outside {-1,0,1} — Node's `null`.
+        const NOP = 0;
+        const INSERT = 1;
+        const DELETE = -1;
+
+        const pushLineFrom = (off: number, pushIdx: (c: Code) => void): void => {
+          c.localGet(off);
+          pushIdx(c);
+          c.arrayGet(i32ArrT);
+        };
+        const pushLineTo = (off: number, pushIdx: (c: Code) => void): void => {
+          c.localGet(off);
+          pushIdx(c);
+          c.i32Const(1);
+          c.i32Add();
+          c.arrayGet(i32ArrT);
+          c.i32Const(1);
+          c.i32Sub();
+        };
+        const pushOpAt = (pushK: (c: Code) => void): void => {
+          c.localGet(OPS);
+          pushK(c);
+          c.arrayGet(i32ArrT);
+        };
+        const pushIdxAt = (pushK: (c: Code) => void): ((c: Code) => void) => {
+          return (x) => {
+            x.localGet(IDXS);
+            pushK(x);
+            x.arrayGet(i32ArrT);
+          };
+        };
+        // strRef/from/to for the line at `pushK`, selecting actual
+        // (side=0) vs expected (side=1) — three independent reads of
+        // `sides[pushK]` (a pure array read, safe to repeat).
+        const pushEmitLine = (pushK: (c: Code) => void): void => {
+          const idxAt = pushIdxAt(pushK);
+          const pushSide = (): void => {
+            c.localGet(SIDES);
+            pushK(c);
+            c.arrayGet(i32ArrT);
+          };
+          pushSide();
+          c.ifResult(strRefT);
+          c.localGet(STRB);
+          c.else_();
+          c.localGet(STRA);
+          c.end();
+          pushSide();
+          c.ifResult(I32);
+          pushLineFrom(OFFB, idxAt);
+          c.else_();
+          pushLineFrom(OFFA, idxAt);
+          c.end();
+          pushSide();
+          c.ifResult(I32);
+          pushLineTo(OFFB, idxAt);
+          c.else_();
+          pushLineTo(OFFA, idxAt);
+          c.end();
+          c.call(this.ibPutRange());
+        };
+        const putLit = (s: string): void => {
+          this.deps.lit(c, s);
+          c.call(this.ibPuts());
+        };
+
+        c.i32Const(0);
+        c.localSet(NOPCOUNT);
+        c.i32Const(0);
+        c.localSet(SKIPPED);
+        this.pushMark(c);
+        c.localSet(MARK);
+
+        c.localGet(RESLEN);
+        c.i32Const(1);
+        c.i32Sub();
+        c.localSet(DIFFIDX);
+        c.block(); // outer break
+        c.loop(); // outer continue
+        c.localGet(DIFFIDX);
+        c.i32Const(0);
+        c.i32LtS();
+        c.brIf(1); // break outer block (loop=0 here, block=1)
+
+        pushOpAt((x) => x.localGet(DIFFIDX));
+        c.localSet(OPVAL);
+
+        c.localGet(DIFFIDX);
+        c.localGet(RESLEN);
+        c.i32Const(1);
+        c.i32Sub();
+        c.i32LtS();
+        c.ifResult(I32);
+        pushOpAt((x) => {
+          x.localGet(DIFFIDX);
+          x.i32Const(1);
+          x.i32Add();
+        });
+        c.else_();
+        c.i32Const(NULL_SENTINEL);
+        c.end();
+        c.localSet(PREVOP);
+
+        // previousOperation === NOP && operation !== previousOperation
+        c.localGet(PREVOP);
+        c.i32Const(NOP);
+        c.i32Eq();
+        c.localGet(OPVAL);
+        c.localGet(PREVOP);
+        c.i32Ne();
+        c.i32And();
+        c.ifVoid();
+        c.localGet(NOPCOUNT);
+        c.i32Const(6);
+        c.i32Eq();
+        c.ifVoid();
+        putLit("  ");
+        pushEmitLine((x) => {
+          x.localGet(DIFFIDX);
+          x.i32Const(1);
+          x.i32Add();
+        });
+        putLit("\n");
+        c.else_();
+        c.localGet(NOPCOUNT);
+        c.i32Const(7);
+        c.i32Eq();
+        c.ifVoid();
+        putLit("  ");
+        pushEmitLine((x) => {
+          x.localGet(DIFFIDX);
+          x.i32Const(2);
+          x.i32Add();
+        });
+        putLit("\n");
+        putLit("  ");
+        pushEmitLine((x) => {
+          x.localGet(DIFFIDX);
+          x.i32Const(1);
+          x.i32Add();
+        });
+        putLit("\n");
+        c.else_();
+        c.localGet(NOPCOUNT);
+        c.i32Const(8);
+        c.i32GeS();
+        c.ifVoid();
+        putLit("...\n");
+        putLit("  ");
+        pushEmitLine((x) => {
+          x.localGet(DIFFIDX);
+          x.i32Const(1);
+          x.i32Add();
+        });
+        putLit("\n");
+        c.i32Const(1);
+        c.localSet(SKIPPED);
+        c.end();
+        c.end();
+        c.end();
+        c.i32Const(0);
+        c.localSet(NOPCOUNT);
+        c.end();
+
+        c.localGet(OPVAL);
+        c.i32Const(INSERT);
+        c.i32Eq();
+        c.ifVoid();
+        putLit("+ ");
+        pushEmitLine((x) => x.localGet(DIFFIDX));
+        putLit("\n");
+        c.else_();
+        c.localGet(OPVAL);
+        c.i32Const(DELETE);
+        c.i32Eq();
+        c.ifVoid();
+        putLit("- ");
+        pushEmitLine((x) => x.localGet(DIFFIDX));
+        putLit("\n");
+        c.else_();
+        c.localGet(NOPCOUNT);
+        c.i32Const(5);
+        c.i32LtS();
+        c.ifVoid();
+        putLit("  ");
+        pushEmitLine((x) => x.localGet(DIFFIDX));
+        putLit("\n");
+        c.end();
+        c.localGet(NOPCOUNT);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(NOPCOUNT);
+        c.end();
+        c.end();
+
+        c.localGet(DIFFIDX);
+        c.i32Const(1);
+        c.i32Sub();
+        c.localSet(DIFFIDX);
+        c.br(0); // continue outer loop (loop=0 here, directly inside it)
+        c.end();
+        c.end();
+
+        c.localGet(MARK);
+        c.call(this.ibTake());
+        c.call(this.deps.strTrimEnd());
+        c.localSet(TRIMMED);
+        putLit("\n");
+        c.localGet(TRIMMED);
+        c.call(this.ibPuts());
+        c.localGet(MARK);
+        c.call(this.ibTake());
+        c.localGet(SKIPPED);
+        this.mb.setBody(
+          idx,
+          [
+            I32 /* MARK=8 */,
+            I32 /* DIFFIDX=9 */,
+            I32 /* NOPCOUNT=10 */,
+            I32 /* SKIPPED=11 */,
+            I32 /* OPVAL=12 */,
+            I32 /* PREVOP=13 */,
+            strRefT /* TRIMMED=14 */,
+          ],
+          c.bytes(),
+        );
+      },
+    );
   }
 }

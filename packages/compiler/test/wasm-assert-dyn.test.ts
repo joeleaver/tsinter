@@ -36,6 +36,7 @@ import { F64, I32, ModuleBuilder, type ValType } from "../src/backend/wasm/modul
 import { buildF64ToStr } from "../src/backend/wasm/numfmt.js";
 import { BytesBuilder } from "../src/backend/wasm/typedarrays.js";
 import { VecBuilder } from "../src/backend/wasm/arrays.js";
+import { StrBuilder } from "../src/backend/wasm/strings.js";
 
 /** assertion_error.js's own inspect options (design-p2.txt A.0) — the
  * SAME literal object every renderer pin's own Node-side expectation
@@ -629,6 +630,25 @@ function makeHarness(): Harness {
     bytesLen: () => bytesB.length(),
     bytesGet: () => bytesB.get("u8"),
     strCmpU16: () => strCmpU16Fn,
+    // REAL (per this file's own header note: every dep printMyersDiff
+    // actually calls is real, not a stub) — `strings.ts`'s own
+    // `%w.str.trim:end`, the ECMA White_Space + LineTerminator scan
+    // (C.7 note (b)). `vecStr` is unreached: trim never touches split.
+    strTrimEnd: () =>
+      new StrBuilder(mb, realStrType, {
+        vecStr: () => {
+          throw new Error("trim does not touch vecStr");
+        },
+      }).trim("end"),
+    // This harness has no fd-write import at all (no host/ABI wiring),
+    // so there is nowhere to print `message` to — a bare `unreachable`
+    // is the faithful stand-in here; CLAIM 0's own pin below asserts
+    // `/unreachable/` regardless of what got (not) printed, and the real
+    // emitter's own `namedTrap` (which DOES print) is exercised by the
+    // corpus/end-to-end memo-row pins instead.
+    namedTrap: (c) => {
+      c.unreachable();
+    },
   };
   const insp = new InspectBuilder(mb, inspDeps);
 
@@ -2465,4 +2485,829 @@ test("deepEqDyn: memo exhaustion (verdict 2) reached and correctly consumed on B
   // fires before either walk can find the (genuinely equal) leaves.
   expect(out["objExhausted"], "OBJ arm's verdict-2 consumption").toBe(0);
   expect(out["arrExhausted"], "ARR arm's verdict-2 consumption").toBe(0);
+});
+
+/* ── cfValue: CLAIM 0 (increment 23 P2b) — the renderer's SEEN-STACK
+ * NAMED cycle trap (design-p2.txt A.6) ───────────────────────────────
+ * Reach: a cyclic OPERAND to a FAILING deep-equal (corpus-zero — none
+ * of the six P2b programs constructs one), but design-p2.txt's own
+ * A.6 recommends building it anyway rather than leaving the renderer
+ * to recurse forever on a shape the comparison side already handles
+ * correctly (B.4's memo). This is a NAMED trap (a bare `unreachable`
+ * at a documented, distinct call site — cfSeenCheck's own arm — not
+ * the full `<ref *N>`/`[Circular *N]` protocol console.log's own lane
+ * already owns and keeps unchanged), not a placeholder. BOTH ARR and
+ * OBJ get their own case: a self-referencing OBJECT (`{self:
+ * <itself>}`) and a self-referencing ARRAY (`[<itself>]`). */
+test("cfInspect: CLAIM 0 — a self-referencing OBJ or ARR traps by name (A.6), not the P2a depth-elision degradation", async () => {
+  const h = makeHarness();
+  {
+    const idx = h.mb.declareFunc(h.mb.funcType([], [h.strRef]), "objCycle");
+    const c = new Code();
+    const O = 0,
+      CUR = 1;
+    h.dyn.pushNewObj(c, false);
+    c.localSet(O);
+    h.dyn.boxObj(c, (x) => x.localGet(O));
+    c.localSet(CUR);
+    c.localGet(O);
+    h.pushStr(c, "self");
+    c.localGet(CUR);
+    c.call(h.dyn.objPut());
+    c.localGet(CUR);
+    c.call(h.insp.cfInspect());
+    h.mb.setBody(idx, [h.dyn.objRef(), h.dyn.dynRef()], c.bytes());
+    h.mb.exportFunc("objCycle", idx);
+  }
+  {
+    const idx = h.mb.declareFunc(h.mb.funcType([], [h.strRef]), "arrCycle");
+    const c = new Code();
+    const V = 0,
+      CUR = 1;
+    h.dyn.pushNewArr(c);
+    c.localSet(V);
+    h.dyn.boxArr(c, (x) => x.localGet(V));
+    c.localSet(CUR);
+    c.localGet(V);
+    c.localGet(CUR);
+    c.call(h.dyn.arrPush());
+    c.localGet(CUR);
+    c.call(h.insp.cfInspect());
+    h.mb.setBody(idx, [h.dyn.arrRef(), h.dyn.dynRef()], c.bytes());
+    h.mb.exportFunc("arrCycle", idx);
+  }
+  const bytes = h.emit();
+  expect(WebAssembly.validate(bytes)).toBe(true);
+  const { instance } = await WebAssembly.instantiate(bytes);
+  const ex = instance.exports as { objCycle: () => unknown; arrCycle: () => unknown };
+  expect(() => ex.objCycle()).toThrow(/unreachable/);
+  expect(() => ex.arrCycle()).toThrow(/unreachable/);
+});
+
+/* A non-cyclic control, live-Node-compared: the seen-stack's push/pop
+ * must be SCOPED TO THE CURRENT PATH, not "ever seen at all" —
+ * sibling (non-nested) reuse of the IDENTICAL boxed COMPOSITE value
+ * (an OBJ, so it genuinely goes through cfSeenCheck/seenPush/
+ * cfSeenPop, unlike a scalar) on two different keys is merely
+ * SHARING, not a cycle, and Node itself renders it with no `<ref *N>`
+ * marker (own re-measure: plain util.inspect never emits the ref
+ * protocol for a shared-but-acyclic reference under `sorted:true`,
+ * which is what a genuinely-shared, non-circular value looks like).
+ * Proves the trap fires on RE-ENTRANCY (finding oneself already on
+ * the CURRENT path), not on any repeated reference ever rendered. */
+test("cfInspect: a shared (non-cyclic) COMPOSITE reference on two sibling keys renders normally, does not trap (A.6's own scoping)", async () => {
+  const out = await buildAndRunStr([
+    {
+      name: "shared",
+      locals: (h) => [h.dyn.objRef(), h.dyn.objRef(), h.dyn.dynRef()],
+      build: (c: Code, h: Harness) => {
+        const O = 0,
+          INNER = 1,
+          SHARED = 2;
+        h.dyn.pushNewObj(c, false);
+        c.localSet(INNER);
+        c.localGet(INNER);
+        h.pushStr(c, "x");
+        h.dyn.boxNum(c, (x) => x.f64Const(1));
+        c.call(h.dyn.objPut());
+        h.dyn.boxObj(c, (x) => x.localGet(INNER));
+        c.localSet(SHARED);
+        h.dyn.pushNewObj(c, false);
+        c.localSet(O);
+        c.localGet(O);
+        h.pushStr(c, "a");
+        c.localGet(SHARED);
+        c.call(h.dyn.objPut());
+        c.localGet(O);
+        h.pushStr(c, "b");
+        c.localGet(SHARED);
+        c.call(h.dyn.objPut());
+        h.dyn.boxObj(c, (x) => x.localGet(O));
+        c.call(h.insp.cfInspect());
+      },
+    },
+  ]);
+  expect(out["shared"]).toBe(inspect({ a: { x: 1 }, b: { x: 1 } }, ASSERT_INSPECT_OPTS));
+});
+
+/* ── splitLines (design-p2.txt C.1) — own re-measure: Node's
+ * StringPrototypeSplit(s, '\n') piece count is newlines+1. Pinned by
+ * having the WASM CODE ITSELF assert against known-good offsets/count
+ * and return a single pass/fail i32 — the offsets array's own type is
+ * internal machinery, not something a test needs to marshal back to
+ * JS piece by piece. */
+test("splitLines: line count and START offsets for zero/one/multiple newlines", async () => {
+  const h = makeHarness();
+  const idx = h.mb.declareFunc(h.mb.funcType([], [I32]), "check");
+  const c = new Code();
+  const OFF = 0;
+  const N = 1;
+  const assertEq = (pushActual: (c: Code) => void, expected: number): void => {
+    pushActual(c);
+    c.i32Const(expected);
+    c.i32Ne();
+    c.ifVoid();
+    c.i32Const(0);
+    c.return_();
+    c.end();
+  };
+  // "abc" — no newline: 1 line, offsets = [0, 4] (len=3, sentinel=len+1).
+  h.pushStr(c, "abc");
+  c.call(h.insp.splitLines());
+  c.localSet(N);
+  c.localSet(OFF);
+  assertEq((x) => x.localGet(N), 1);
+  assertEq((x) => {
+    x.localGet(OFF);
+    x.i32Const(0);
+    x.arrayGet(h.insp.i32Arr());
+  }, 0);
+  assertEq((x) => {
+    x.localGet(OFF);
+    x.i32Const(1);
+    x.arrayGet(h.insp.i32Arr());
+  }, 4);
+  // "ab\ncd" — one newline at index 2: 2 lines, offsets = [0, 3, 6].
+  h.pushStr(c, "ab\ncd");
+  c.call(h.insp.splitLines());
+  c.localSet(N);
+  c.localSet(OFF);
+  assertEq((x) => x.localGet(N), 2);
+  assertEq((x) => {
+    x.localGet(OFF);
+    x.i32Const(0);
+    x.arrayGet(h.insp.i32Arr());
+  }, 0);
+  assertEq((x) => {
+    x.localGet(OFF);
+    x.i32Const(1);
+    x.arrayGet(h.insp.i32Arr());
+  }, 3);
+  assertEq((x) => {
+    x.localGet(OFF);
+    x.i32Const(2);
+    x.arrayGet(h.insp.i32Arr());
+  }, 6);
+  // "a\n\nb" — two ADJACENT newlines (an empty middle line): 3 lines,
+  // offsets = [0, 2, 3, 5].
+  h.pushStr(c, "a\n\nb");
+  c.call(h.insp.splitLines());
+  c.localSet(N);
+  c.localSet(OFF);
+  assertEq((x) => x.localGet(N), 3);
+  assertEq((x) => {
+    x.localGet(OFF);
+    x.i32Const(1);
+    x.arrayGet(h.insp.i32Arr());
+  }, 2);
+  assertEq((x) => {
+    x.localGet(OFF);
+    x.i32Const(2);
+    x.arrayGet(h.insp.i32Arr());
+  }, 3);
+  c.i32Const(1);
+  h.mb.setBody(idx, [h.insp.i32ArrRef(), I32], c.bytes());
+  h.mb.exportFunc("check", idx);
+  const bytes = h.emit();
+  expect(WebAssembly.validate(bytes)).toBe(true);
+  const { instance } = await WebAssembly.instantiate(bytes);
+  expect((instance.exports as { check: () => number }).check()).toBe(1);
+});
+
+/* ── linesEq (design-p2.txt C.2) — own re-measure of Node's
+ * areLinesEqual, including the comma-disparity rule BOTH directions
+ * and the zero-length-line hazard (C.2's own warning: a flat i32.and
+ * would `array.get` at index -1 on an empty line). */
+test("linesEq: equal, unequal, comma-disparity both directions, and the empty-line hazard", async () => {
+  const h = makeHarness();
+  const idx = h.mb.declareFunc(h.mb.funcType([], [I32]), "check");
+  const c = new Code();
+  const assertEq = (build: (c: Code) => void, expected: number): void => {
+    build(c);
+    c.i32Const(expected);
+    c.i32Ne();
+    c.ifVoid();
+    c.i32Const(0);
+    c.return_();
+    c.end();
+  };
+  // Two full strings sharing storage per range: build ONE string
+  // holding several "lines" back to back and compare SUB-RANGES —
+  // linesEq takes (str, from, to) triples, exactly like a real
+  // multi-line rendered string's own ranges.
+  const s = "abc,ab,xy,,q";
+  //          0123456789ab   (indices)
+  // ranges: [0,3)="abc" [4,6)="ab" [7,9)="xy" [10,10)="" [11,12)="q"
+  h.pushStr(c, s);
+  const S = 0;
+  c.localSet(S);
+  // equal: "abc" vs "abc" (same range twice)
+  assertEq(
+    (x) => {
+      x.localGet(S);
+      x.i32Const(0);
+      x.i32Const(3);
+      x.localGet(S);
+      x.i32Const(0);
+      x.i32Const(3);
+      x.i32Const(0);
+      x.call(h.insp.linesEq());
+    },
+    1,
+  );
+  // unequal, same length: "abc" vs "xy?" -- use "xy" range extended... just compare "abc" vs "ab,"
+  assertEq(
+    (x) => {
+      x.localGet(S);
+      x.i32Const(0);
+      x.i32Const(3);
+      x.localGet(S);
+      x.i32Const(4);
+      x.i32Const(7); // "ab," (indices 4,5,6 = 'a','b',',')
+      x.i32Const(0);
+      x.call(h.insp.linesEq());
+    },
+    0,
+  );
+  // comma disparity, (a+',') === b: "ab" vs "ab," with comma=true -> 1
+  assertEq(
+    (x) => {
+      x.localGet(S);
+      x.i32Const(4);
+      x.i32Const(6); // "ab"
+      x.localGet(S);
+      x.i32Const(4);
+      x.i32Const(7); // "ab,"
+      x.i32Const(1);
+      x.call(h.insp.linesEq());
+    },
+    1,
+  );
+  // same shape but comma=false -> 0 (design's own C.2 gate)
+  assertEq(
+    (x) => {
+      x.localGet(S);
+      x.i32Const(4);
+      x.i32Const(6);
+      x.localGet(S);
+      x.i32Const(4);
+      x.i32Const(7);
+      x.i32Const(0);
+      x.call(h.insp.linesEq());
+    },
+    0,
+  );
+  // comma disparity, a === (b+','): reverse of the above.
+  assertEq(
+    (x) => {
+      x.localGet(S);
+      x.i32Const(4);
+      x.i32Const(7); // "ab,"
+      x.localGet(S);
+      x.i32Const(4);
+      x.i32Const(6); // "ab"
+      x.i32Const(1);
+      x.call(h.insp.linesEq());
+    },
+    1,
+  );
+  // THE ZERO-LENGTH HAZARD: an EMPTY line (range [10,10)) compared with
+  // comma=true must not trap on an out-of-bounds array.get at index -1
+  // — it should cleanly answer unequal (an empty line can never be
+  // "x+','" for any non-empty x, and can never itself be "y+','"
+  // since it has no characters at all).
+  assertEq(
+    (x) => {
+      x.localGet(S);
+      x.i32Const(10);
+      x.i32Const(10); // "" (empty)
+      x.localGet(S);
+      x.i32Const(11);
+      x.i32Const(12); // "q"
+      x.i32Const(1);
+      x.call(h.insp.linesEq());
+    },
+    0,
+  );
+  assertEq(
+    (x) => {
+      x.localGet(S);
+      x.i32Const(11);
+      x.i32Const(12); // "q"
+      x.localGet(S);
+      x.i32Const(10);
+      x.i32Const(10); // ""
+      x.i32Const(1);
+      x.call(h.insp.linesEq());
+    },
+    0,
+  );
+  // THE SHARP EDGE OF THE HAZARD: an empty line at the VERY START of a
+  // string ([0,0)) — under an UNGUARDED flat `i32.and`, checking "is
+  // THIS line's own last char a ','" would read `s[TA-1]` = `s[-1]`,
+  // an out-of-bounds array.get that TRAPS, even though the length
+  // check alone already determines the answer is false. A correctly
+  // NESTED implementation never reaches that read at all. If this
+  // assertion's own `check()` call throws instead of returning 0, the
+  // nesting has regressed to the flat, trapping form.
+  assertEq(
+    (x) => {
+      x.localGet(S);
+      x.i32Const(0);
+      x.i32Const(0); // "" at position 0 — TA-1 would be -1
+      x.localGet(S);
+      x.i32Const(0);
+      x.i32Const(3); // "abc"
+      x.i32Const(1);
+      x.call(h.insp.linesEq());
+    },
+    0,
+  );
+  assertEq(
+    (x) => {
+      x.localGet(S);
+      x.i32Const(0);
+      x.i32Const(3); // "abc"
+      x.localGet(S);
+      x.i32Const(0);
+      x.i32Const(0); // "" at position 0
+      x.i32Const(1);
+      x.call(h.insp.linesEq());
+    },
+    0,
+  );
+  c.i32Const(1);
+  h.mb.setBody(idx, [h.strRef], c.bytes());
+  h.mb.exportFunc("check", idx);
+  const bytes = h.emit();
+  expect(WebAssembly.validate(bytes)).toBe(true);
+  const { instance } = await WebAssembly.instantiate(bytes);
+  expect((instance.exports as { check: () => number }).check()).toBe(1);
+});
+
+
+/* ── myersForward (design-p2.txt C.3/C.4) — own hand-traced worked
+ * examples, INCLUDING the design's own padding-hazard trigger. Lines
+ * come from `splitLines` over a plain (no-newline) string, so `nA`/
+ * `nB` are 1 and `offA`/`offB` are the SAME arrays that arm produces —
+ * exercising the real integration, not synthetic offsets. The `trace`
+ * return value is dropped (not stored) — this pin only checks `max`/
+ * `traceLen`; `myersBacktrack`'s own pins are what actually consume
+ * trace contents. ────────────────────────────────────────────────── */
+test("myersForward: max/traceLen for a mismatched single-line pair (the C.3 padding-hazard trigger) and an identical pair", async () => {
+  const h = makeHarness();
+  const idx = h.mb.declareFunc(h.mb.funcType([], [I32]), "check");
+  const c = new Code();
+  const OFFA = 0,
+    NA = 1,
+    OFFB = 2,
+    NB = 3,
+    TRACELEN = 4,
+    MAXV = 5;
+  const assertEq = (pushActual: (c: Code) => void, expected: number): void => {
+    pushActual(c);
+    c.i32Const(expected);
+    c.i32Ne();
+    c.ifVoid();
+    c.i32Const(0);
+    c.return_();
+    c.end();
+  };
+  // "a" vs "b": own hand-trace (done before writing this pin) — the
+  // match is found at diffLevel=2, diagonalIndex=0, but level 2's OWN
+  // diagonal loop visits diagonalIndex=-2 FIRST, which reads v at
+  // LOGICAL offset -1 — exactly the padding-hazard trigger C.3 names.
+  // max=1+1=2, traceLen=diffLevel_found+1=3.
+  h.pushStr(c, "a");
+  c.call(h.insp.splitLines());
+  c.localSet(NA);
+  c.localSet(OFFA);
+  h.pushStr(c, "b");
+  c.call(h.insp.splitLines());
+  c.localSet(NB);
+  c.localSet(OFFB);
+  h.pushStr(c, "a");
+  c.localGet(OFFA);
+  c.localGet(NA);
+  h.pushStr(c, "b");
+  c.localGet(OFFB);
+  c.localGet(NB);
+  c.i32Const(0);
+  c.call(h.insp.myersForward());
+  c.localSet(MAXV);
+  c.localSet(TRACELEN);
+  c.drop(); // the trace array itself — unused by this pin
+  assertEq((x) => x.localGet(MAXV), 2);
+  assertEq((x) => x.localGet(TRACELEN), 3);
+  // "abc" vs "abc": identical single line, found immediately at
+  // diffLevel=0 (own hand-trace). max=1+1=2, traceLen=1.
+  h.pushStr(c, "abc");
+  c.call(h.insp.splitLines());
+  c.localSet(NA);
+  c.localSet(OFFA);
+  h.pushStr(c, "abc");
+  c.call(h.insp.splitLines());
+  c.localSet(NB);
+  c.localSet(OFFB);
+  h.pushStr(c, "abc");
+  c.localGet(OFFA);
+  c.localGet(NA);
+  h.pushStr(c, "abc");
+  c.localGet(OFFB);
+  c.localGet(NB);
+  c.i32Const(0);
+  c.call(h.insp.myersForward());
+  c.localSet(MAXV);
+  c.localSet(TRACELEN);
+  c.drop();
+  assertEq((x) => x.localGet(MAXV), 2);
+  assertEq((x) => x.localGet(TRACELEN), 1);
+  c.i32Const(1);
+  h.mb.setBody(idx, [h.insp.i32ArrRef(), I32, h.insp.i32ArrRef(), I32, I32, I32], c.bytes());
+  h.mb.exportFunc("check", idx);
+  const bytes = h.emit();
+  expect(WebAssembly.validate(bytes)).toBe(true);
+  const { instance } = await WebAssembly.instantiate(bytes);
+  expect((instance.exports as { check: () => number }).check()).toBe(1);
+});
+
+test("myersBacktrack: a 1-vs-1 mismatch (DELETE+INSERT), and the C.6 NOP-value rule in BOTH comma-disparity directions", async () => {
+  const h = makeHarness();
+  const idx = h.mb.declareFunc(h.mb.funcType([], [I32]), "check");
+  const c = new Code();
+  const OFFA = 0,
+    NA = 1,
+    OFFB = 2,
+    NB = 3,
+    TRACE = 4,
+    TRACELEN = 5,
+    MAXV = 6,
+    OPS = 7,
+    SIDES = 8,
+    IDXS = 9,
+    RESLEN = 10;
+  const i32ArrT = h.insp.i32Arr();
+  const assertEq = (pushActual: (c: Code) => void, expected: number): void => {
+    pushActual(c);
+    c.i32Const(expected);
+    c.i32Ne();
+    c.ifVoid();
+    c.i32Const(0);
+    c.return_();
+    c.end();
+  };
+  const pushOp = (arr: number, i: number): ((c: Code) => void) => {
+    return (x) => {
+      x.localGet(arr);
+      x.i32Const(i);
+      x.arrayGet(i32ArrT);
+    };
+  };
+  const runCase = (a: string, b: string, comma: number): void => {
+    h.pushStr(c, a);
+    c.call(h.insp.splitLines());
+    c.localSet(NA);
+    c.localSet(OFFA);
+    h.pushStr(c, b);
+    c.call(h.insp.splitLines());
+    c.localSet(NB);
+    c.localSet(OFFB);
+    h.pushStr(c, a);
+    c.localGet(OFFA);
+    c.localGet(NA);
+    h.pushStr(c, b);
+    c.localGet(OFFB);
+    c.localGet(NB);
+    c.i32Const(comma);
+    c.call(h.insp.myersForward());
+    c.localSet(MAXV);
+    c.localSet(TRACELEN);
+    c.localSet(TRACE);
+    h.pushStr(c, a);
+    c.localGet(OFFA);
+    c.localGet(NA);
+    h.pushStr(c, b);
+    c.localGet(OFFB);
+    c.localGet(NB);
+    c.i32Const(comma);
+    c.localGet(TRACE);
+    c.localGet(TRACELEN);
+    c.localGet(MAXV);
+    c.call(h.insp.myersBacktrack());
+    c.localSet(RESLEN);
+    c.localSet(IDXS);
+    c.localSet(SIDES);
+    c.localSet(OPS);
+  };
+
+  // "a" vs "b", comma=0: own hand-trace (done before writing this pin,
+  // matching myersForward's own trace of this SAME pair) — backtrack
+  // walks diffLevel 2,1,0, pushing DELETE "b" (diffLevel=2) then
+  // INSERT "a" (diffLevel=1), in REVERSE document order.
+  runCase("a", "b", 0);
+  assertEq((x) => x.localGet(RESLEN), 2);
+  assertEq(pushOp(OPS, 0), -1); // DELETE
+  assertEq(pushOp(SIDES, 0), 1); // expected side
+  assertEq(pushOp(IDXS, 0), 0);
+  assertEq(pushOp(OPS, 1), 1); // INSERT
+  assertEq(pushOp(SIDES, 1), 0); // actual side
+  assertEq(pushOp(IDXS, 1), 0);
+
+  // "x," vs "x", comma=1: areLinesEqual via a===(b+',') is FALSE and
+  // (a+',')===b is also not the match here — actually the match is
+  // a===(b+',')? "x,"===("x"+",") -> TRUE. So actual's OWN line (which
+  // already carries the comma) is a NOP against expected's shorter
+  // line. C.6's rule: actualItem="x," DOES end with ',', so
+  // !endsWith(',') is false -> value=actual[x-1] -> renders from the
+  // ACTUAL side (direction A).
+  runCase("x,", "x", 1);
+  assertEq((x) => x.localGet(RESLEN), 1);
+  assertEq(pushOp(OPS, 0), 0); // NOP
+  assertEq(pushOp(SIDES, 0), 0); // actual side retained
+  assertEq(pushOp(IDXS, 0), 0);
+
+  // "x" vs "x,", comma=1: (a+',')===b -> ("x"+",")==="x," TRUE, a NOP.
+  // actualItem="x" does NOT end with ',', so the rule takes
+  // expected[y-1] instead -> renders from the EXPECTED side
+  // (direction B) — the other half of C.6's own bidirectional rule.
+  runCase("x", "x,", 1);
+  assertEq((x) => x.localGet(RESLEN), 1);
+  assertEq(pushOp(OPS, 0), 0); // NOP
+  assertEq(pushOp(SIDES, 0), 1); // expected side retained
+  assertEq(pushOp(IDXS, 0), 0);
+
+  c.i32Const(1);
+  h.mb.setBody(
+    idx,
+    [
+      h.insp.i32ArrRef(),
+      I32,
+      h.insp.i32ArrRef(),
+      I32,
+      h.insp.traceArrRef(),
+      I32,
+      I32,
+      h.insp.i32ArrRef(),
+      h.insp.i32ArrRef(),
+      h.insp.i32ArrRef(),
+      I32,
+    ],
+    c.bytes(),
+  );
+  h.mb.exportFunc("check", idx);
+  const bytes = h.emit();
+  expect(WebAssembly.validate(bytes)).toBe(true);
+  const { instance } = await WebAssembly.instantiate(bytes);
+  expect((instance.exports as { check: () => number }).check()).toBe(1);
+});
+
+/** Wires the full pipeline (`splitLines` x2 -> `myersForward` ->
+ * `myersBacktrack` -> `printMyersDiff`, comma=false) for one (a,b) line
+ * pair, dropping `skipped` so the function's single return matches
+ * `buildAndRunStr`'s own `[strRef]` shape — ground truth for every
+ * expected string below was computed by an independent, primordial-free
+ * re-implementation of myers_diff.js run directly under `node`
+ * (scratchpad/inc23/impl-p2b/myers-groundtruth{,3}.mjs), not hand-traced. */
+function buildDiffCase(aLines: string[], bLines: string[]): {
+  build: (c: Code, h: Harness) => void;
+  locals: (h: Harness) => ValType[];
+} {
+  const OFFA = 0,
+    NA = 1,
+    OFFB = 2,
+    NB = 3,
+    TRACE = 4,
+    TRACELEN = 5,
+    MAXV = 6,
+    OPS = 7,
+    SIDES = 8,
+    IDXS = 9,
+    RESLEN = 10,
+    SKIPPED = 11;
+  const aStr = aLines.join("\n");
+  const bStr = bLines.join("\n");
+  return {
+    build: (c: Code, h: Harness) => {
+      h.pushStr(c, aStr);
+      c.call(h.insp.splitLines());
+      c.localSet(NA);
+      c.localSet(OFFA);
+      h.pushStr(c, bStr);
+      c.call(h.insp.splitLines());
+      c.localSet(NB);
+      c.localSet(OFFB);
+      h.pushStr(c, aStr);
+      c.localGet(OFFA);
+      c.localGet(NA);
+      h.pushStr(c, bStr);
+      c.localGet(OFFB);
+      c.localGet(NB);
+      c.i32Const(0); // comma=false
+      c.call(h.insp.myersForward());
+      c.localSet(MAXV);
+      c.localSet(TRACELEN);
+      c.localSet(TRACE);
+      h.pushStr(c, aStr);
+      c.localGet(OFFA);
+      c.localGet(NA);
+      h.pushStr(c, bStr);
+      c.localGet(OFFB);
+      c.localGet(NB);
+      c.i32Const(0);
+      c.localGet(TRACE);
+      c.localGet(TRACELEN);
+      c.localGet(MAXV);
+      c.call(h.insp.myersBacktrack());
+      c.localSet(RESLEN);
+      c.localSet(IDXS);
+      c.localSet(SIDES);
+      c.localSet(OPS);
+      h.pushStr(c, aStr);
+      c.localGet(OFFA);
+      h.pushStr(c, bStr);
+      c.localGet(OFFB);
+      c.localGet(OPS);
+      c.localGet(SIDES);
+      c.localGet(IDXS);
+      c.localGet(RESLEN);
+      c.call(h.insp.printMyersDiff());
+      c.localSet(SKIPPED); // drop skipped; message stays on the stack.
+    },
+    locals: (h: Harness) => [
+      h.insp.i32ArrRef(),
+      I32,
+      h.insp.i32ArrRef(),
+      I32,
+      h.insp.traceArrRef(),
+      I32,
+      I32,
+      h.insp.i32ArrRef(),
+      h.insp.i32ArrRef(),
+      h.insp.i32ArrRef(),
+      I32,
+      I32,
+    ],
+  };
+}
+
+test("printMyersDiff: message text across untriggered / ==6 / ==7 / >=8 collapse arms, and the silent trailing-drop quirk (C.7)", async () => {
+  const case1 = buildDiffCase(["a", "b", "c", "d", "e", "f", "g", "h"], ["a", "x", "c", "d", "e", "f", "g", "h"]);
+  const case2 = buildDiffCase(
+    Array.from({ length: 9 }, (_, i) => String(i)),
+    ["z", ...Array.from({ length: 9 }, (_, i) => String(i))],
+  );
+  const prefix6 = ["p0", "p1", "p2", "p3", "p4", "p5"];
+  const case6 = buildDiffCase([...prefix6, "X"], [...prefix6, "Y"]);
+  const prefix7 = [...prefix6, "p6"];
+  const case7 = buildDiffCase([...prefix7, "X"], [...prefix7, "Y"]);
+  // nopCount===8 EXACTLY — the >=8 threshold's own boundary against
+  // case7's ==7 (own straddle: an off-by-one here (>=9 instead of >=8)
+  // would NOT be caught by a nopCount=10 case, since 10 satisfies
+  // either threshold — only the exact boundary value does).
+  const prefix8 = [...prefix7, "p7"];
+  const case8 = buildDiffCase([...prefix8, "X"], [...prefix8, "Y"]);
+  const prefix10 = Array.from({ length: 10 }, (_, i) => "p" + i);
+  const case10 = buildDiffCase([...prefix10, "X"], [...prefix10, "Y"]);
+
+  const out = await buildAndRunStr([
+    { name: "case1", build: case1.build, locals: case1.locals },
+    { name: "case2", build: case2.build, locals: case2.locals },
+    { name: "case6", build: case6.build, locals: case6.locals },
+    { name: "case7", build: case7.build, locals: case7.locals },
+    { name: "case8", build: case8.build, locals: case8.locals },
+    { name: "case10", build: case10.build, locals: case10.locals },
+  ]);
+
+  // untriggered collapse (no run past 5 lines mid-document): a plain
+  // NOP/INSERT/DELETE/NOP sequence.
+  expect(out["case1"]).toBe("\n  a\n+ b\n- x\n  c\n  d\n  e\n  f\n  g");
+  // the trailing common run past 5 lines is dropped SILENTLY (no "..."):
+  // C.7 note (a) — there is no flush after the loop.
+  expect(out["case2"]).toBe("\n- z\n  0\n  1\n  2\n  3\n  4");
+  // nopCount===6: one held-back line un-collapses, no "..." (identical
+  // in effect to no collapse at all — this pins the BRANCH, not a
+  // visibly different shape from case1's kind of output).
+  expect(out["case6"]).toBe("\n  p0\n  p1\n  p2\n  p3\n  p4\n  p5\n+ X\n- Y");
+  // nopCount===7: TWO held-back lines un-collapse, still no "...".
+  expect(out["case7"]).toBe("\n  p0\n  p1\n  p2\n  p3\n  p4\n  p5\n  p6\n+ X\n- Y");
+  // nopCount===8, the >=8 threshold's OWN boundary against case7: the
+  // first real "..." collapse, one line earlier than case10's own.
+  expect(out["case8"]).toBe("\n  p0\n  p1\n  p2\n  p3\n  p4\n...\n  p7\n+ X\n- Y");
+  // nopCount>=8: a REAL collapse — "..." plus exactly one held-back
+  // line, with p5..p8 genuinely dropped.
+  expect(out["case10"]).toBe("\n  p0\n  p1\n  p2\n  p3\n  p4\n...\n  p9\n+ X\n- Y");
+});
+
+test("printMyersDiff: the `skipped` flag — false through the ==6/==7 arms, true only once >=8 fires", async () => {
+  const h = makeHarness();
+  const idx = h.mb.declareFunc(h.mb.funcType([], [I32]), "check");
+  const c = new Code();
+  const assertEq = (pushActual: (c: Code) => void, expected: number): void => {
+    pushActual(c);
+    c.i32Const(expected);
+    c.i32Ne();
+    c.ifVoid();
+    c.i32Const(0);
+    c.return_();
+    c.end();
+  };
+  const OFFA = 0,
+    NA = 1,
+    OFFB = 2,
+    NB = 3,
+    TRACE = 4,
+    TRACELEN = 5,
+    MAXV = 6,
+    OPS = 7,
+    SIDES = 8,
+    IDXS = 9,
+    RESLEN = 10,
+    SKIPPED = 11;
+  const runInto = (aLines: string[], bLines: string[]): void => {
+    const aStr = aLines.join("\n");
+    const bStr = bLines.join("\n");
+    h.pushStr(c, aStr);
+    c.call(h.insp.splitLines());
+    c.localSet(NA);
+    c.localSet(OFFA);
+    h.pushStr(c, bStr);
+    c.call(h.insp.splitLines());
+    c.localSet(NB);
+    c.localSet(OFFB);
+    h.pushStr(c, aStr);
+    c.localGet(OFFA);
+    c.localGet(NA);
+    h.pushStr(c, bStr);
+    c.localGet(OFFB);
+    c.localGet(NB);
+    c.i32Const(0);
+    c.call(h.insp.myersForward());
+    c.localSet(MAXV);
+    c.localSet(TRACELEN);
+    c.localSet(TRACE);
+    h.pushStr(c, aStr);
+    c.localGet(OFFA);
+    c.localGet(NA);
+    h.pushStr(c, bStr);
+    c.localGet(OFFB);
+    c.localGet(NB);
+    c.i32Const(0);
+    c.localGet(TRACE);
+    c.localGet(TRACELEN);
+    c.localGet(MAXV);
+    c.call(h.insp.myersBacktrack());
+    c.localSet(RESLEN);
+    c.localSet(IDXS);
+    c.localSet(SIDES);
+    c.localSet(OPS);
+    h.pushStr(c, aStr);
+    c.localGet(OFFA);
+    h.pushStr(c, bStr);
+    c.localGet(OFFB);
+    c.localGet(OPS);
+    c.localGet(SIDES);
+    c.localGet(IDXS);
+    c.localGet(RESLEN);
+    c.call(h.insp.printMyersDiff());
+    c.localSet(SKIPPED);
+    c.drop(); // message text — the OTHER pin already covers it.
+  };
+  const prefix6 = ["p0", "p1", "p2", "p3", "p4", "p5"];
+  runInto([...prefix6, "X"], [...prefix6, "Y"]);
+  assertEq((x) => x.localGet(SKIPPED), 0);
+  const prefix7 = [...prefix6, "p6"];
+  runInto([...prefix7, "X"], [...prefix7, "Y"]);
+  assertEq((x) => x.localGet(SKIPPED), 0);
+  // The >=8 threshold's own boundary — same straddle as the message
+  // pin's own case7/case8 pair, checked here for the OTHER observable.
+  const prefix8 = [...prefix7, "p7"];
+  runInto([...prefix8, "X"], [...prefix8, "Y"]);
+  assertEq((x) => x.localGet(SKIPPED), 1);
+  const prefix10 = Array.from({ length: 10 }, (_, i) => "p" + i);
+  runInto([...prefix10, "X"], [...prefix10, "Y"]);
+  assertEq((x) => x.localGet(SKIPPED), 1);
+  c.i32Const(1);
+  h.mb.setBody(
+    idx,
+    [
+      h.insp.i32ArrRef(),
+      I32,
+      h.insp.i32ArrRef(),
+      I32,
+      h.insp.traceArrRef(),
+      I32,
+      I32,
+      h.insp.i32ArrRef(),
+      h.insp.i32ArrRef(),
+      h.insp.i32ArrRef(),
+      I32,
+      I32,
+    ],
+    c.bytes(),
+  );
+  h.mb.exportFunc("check", idx);
+  const bytes = h.emit();
+  expect(WebAssembly.validate(bytes)).toBe(true);
+  const { instance } = await WebAssembly.instantiate(bytes);
+  expect((instance.exports as { check: () => number }).check()).toBe(1);
 });

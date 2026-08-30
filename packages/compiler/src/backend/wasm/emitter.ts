@@ -5114,6 +5114,20 @@ class Assembler {
       bytesLen: () => this.bytesB.length(),
       bytesGet: () => this.bytesB.get("u8"),
       strCmpU16: () => this.strCmpHelper(true),
+      strTrimEnd: () => this.strs.trim("end"),
+      namedTrap: (c, message) => {
+        // S058's cycle trap (increment 23 P2b): reuse S007's own
+        // "print the reason, then trap" reporter directly on a fresh
+        // EXC_STR cell — never returns, uncatchable (nothing checks or
+        // rethrows; this call sits deep inside cfValue's own recursion
+        // and simply ends the program right here).
+        const exc = this.exc();
+        this.pushStrLitInto(c, message);
+        c.globalSet(exc.refG);
+        c.i32Const(EXC_STR);
+        c.globalSet(exc.kindG);
+        c.call(this.reportUncaughtHelper());
+      },
     });
     return this.inspField;
   }
@@ -19886,23 +19900,39 @@ class Assembler {
       // — the SAME helper the IR's `strEq` node compiles through),
       // inspection is Node's real strEscape ladder via %w.insp.str (NOT
       // scr_assert_inspect_str's ASCII-only escaper — measured, plan.txt
-      // §1a's backtick-quoting case), quotes=2 (both sides are strings,
-      // excluding 2 chars each from the 12-unit budget), bothZero=false
-      // always. UNIQUE to eqStr among the scalar family: a string's
-      // inspection can SPAN LINES (des-23 D.9 / the lead's own
-      // measurement — eqF64/eqBool cannot: inspF64's output alphabet has
-      // no newline, neither does "true"/"false", pinned explicitly
-      // below), which moves createErrDiff onto Node's real myers-diff
-      // assembler entirely — NOT the simple/stacked machinery eqFail
-      // ports. P1 does not port that assembler (P2's job, D.9's boxing-
-      // shim recommendation); a multi-line RENDERED inspection (tested
-      // on the rendered text via %w.insp.str, never the raw input — a
-      // 10002-unit string whose only "\n" sits past the 10000-unit cap
-      // renders on ONE line and must NOT trap) hits a named runtime
-      // trap instead, force-pinned via runWasmToTrap, the SAME pattern
-      // ifErrorDyn's composite arm already uses. No P1 corpus program
-      // reaches it — 1603's own "a\nb" is 3 units, far under the
-      // 76-unit (indentGlobal=0) split threshold.
+      // §1a's backtick-quoting case). UNIQUE to eqStr among the scalar
+      // family: a string's inspection can SPAN LINES (des-23 D.9 / the
+      // lead's own measurement — eqF64/eqBool cannot: inspF64's output
+      // alphabet has no newline, neither does "true"/"false", pinned
+      // explicitly below), which moves createErrDiff onto Node's real
+      // myers-diff assembler entirely for that case — NOT the
+      // simple/stacked machinery eqFail ports alone.
+      //
+      // Increment 23 P2b (D.9's own "boxing shim" recommendation,
+      // adopted UNCONDITIONALLY rather than gated on a multi-line
+      // check): box `a` into dyn and call `dynNeqFail`/`dynEqFail`
+      // directly for BOTH the single-line and multi-line case — never
+      // re-enter `eqDyn`, since the byte compare above has ALREADY
+      // decided the result. This is behavior-preserving even in the
+      // single-line case (D.9's own "WHY IT IS BEHAVIOUR-PRESERVING,
+      // arm by arm" proof): `dynNeqFail`'s own `res.n===1` branch calls
+      // `neqFailHelper(base, ia, msg, hasMsg)` — the EXACT call the old
+      // direct path made; `dynEqFail`'s own `showSimpleDiff` branch
+      // calls `eqFailHelper(ia, ib, quotes, bothZero, header, msg,
+      // hasMsg)` with `quotes` = isStrA+isStrB (=2 for two STR sides,
+      // matching the old hard-coded `2`), `bothZero` always false for
+      // STR (matching the old hard-coded `0`), and the plain STRICT/
+      // DEEP header (STR is never `isDynObject`, so `checkOperatorMorph`
+      // never fires) — the SAME three arguments the old direct call
+      // passed. `ia`/`ib` are computed ONCE via `%w.insp.str` (the
+      // scalar path's own inspector, BYTE-IDENTICAL to `cfInspect` on a
+      // boxed STR per D.9's own "rendering" arm) and passed straight
+      // into the dyn assemblers rather than recomputed — no double
+      // inspection. This DELETES both multi-line sentinel traps AND
+      // their trap-predicate helper, `emitStrHasNewline` (no P1 corpus
+      // program ever reached either trap; the increment-23-P1 comment
+      // that used to sit above this case describes history now, not
+      // live code).
       case "assert.eqStr": {
         const strRefT = this.strRef;
         const aLocal = this.acquireScratch(strRefT);
@@ -19939,50 +19969,43 @@ class Assembler {
         code.localGet(aLocal);
         code.call(this.insp.str());
         code.localSet(iaLocal);
-        // The multi-line sentinel: P2's myers assembler owns this shape
-        // (des-23 D.9) — a bare, deliberately silent sentinel trap (a
-        // plain `unreachable`, no diagnostic — NOT rule 1's "refuse
-        // loudly with a named diagnostic"; the pins tell it apart from
-        // an ordinary uncaught AssertionError by empty stderr), reachable
-        // by real source and force-pinned rather than a silent wrong
-        // render. P2b replaces it with the real renderer. Tested on the
-        // RENDERED text.
-        this.emitStrHasNewline(code, iaLocal);
-        this.openIf();
-        code.unreachable();
-        this.close();
+        const daLocal = this.acquireScratch(this.dyn.dynRef());
+        this.dyn.boxStr(code, () => code.localGet(aLocal));
+        code.localSet(daLocal);
         const msgResultLocal = this.acquireScratch(strRefT);
         code.localGet(negatedLocal);
         this.openIf();
-        this.pushHeaderFor(code, deepLocal, NEQ_HEADER_STRICT, NOT_DEEP_EQUAL_HEADER);
+        code.localGet(daLocal);
         code.localGet(iaLocal);
+        code.localGet(deepLocal);
         code.localGet(msgLocal);
         code.localGet(hasMsgLocal);
-        code.call(this.neqFailHelper());
+        code.call(this.dynNeqFailHelper());
         code.localSet(msgResultLocal);
         code.else_();
         const ibLocal = this.acquireScratch(strRefT);
         code.localGet(bLocal);
         code.call(this.insp.str());
         code.localSet(ibLocal);
-        this.emitStrHasNewline(code, ibLocal);
-        this.openIf();
-        code.unreachable();
-        this.close();
+        const dbLocal = this.acquireScratch(this.dyn.dynRef());
+        this.dyn.boxStr(code, () => code.localGet(bLocal));
+        code.localSet(dbLocal);
+        code.localGet(daLocal);
+        code.localGet(dbLocal);
         code.localGet(iaLocal);
         code.localGet(ibLocal);
-        code.i32Const(2); // quotes
-        code.i32Const(0); // bothZero
-        this.pushHeaderFor(code, deepLocal, EQ_HEADER_STRICT, DEEP_EQUAL_HEADER);
+        code.localGet(deepLocal);
         code.localGet(msgLocal);
         code.localGet(hasMsgLocal);
-        code.call(this.eqFailHelper());
+        code.call(this.dynEqFailHelper());
         code.localSet(msgResultLocal);
+        this.releaseScratch(this.dyn.dynRef(), dbLocal);
         this.releaseScratch(strRefT, ibLocal);
         this.close();
         this.emitSetCellError(code, "%Error", "AssertionError", () => code.localGet(msgResultLocal), "ERR_ASSERTION");
         this.emitUnwind();
         this.releaseScratch(strRefT, msgResultLocal);
+        this.releaseScratch(this.dyn.dynRef(), daLocal);
         this.releaseScratch(strRefT, iaLocal);
         this.close();
         this.releaseScratch(strRefT, aLocal);
@@ -20481,9 +20504,14 @@ class Assembler {
             this.releaseScratch(dynRefT, nameMemberLocal);
           }
           code.else_();
-          // OBJ without "%error": groups with the composite trap below —
-          // P2's compact:false renderer's job.
-          code.unreachable();
+          // OBJ without "%error": increment 23 P2b, D.8's own "one line"
+          // rider — the real `cfInspect` call, retiring the named trap
+          // (P1's brief had this as a runtime trap since 2285 never
+          // reached it; P2's renderer makes it real).
+          this.emitIfErrorFail(code, () => {
+            code.localGet(vLocal);
+            code.call(this.insp.cfInspect());
+          });
           this.close(); // #3a
           this.releaseScratch(objRefT, oLocal);
         }
@@ -20531,14 +20559,15 @@ class Assembler {
           this.releaseScratch(this.strRef, strValLocal);
         }
         code.else_();
-        // ARR, OBJ-without-"%error" (handled above), BYTES, FUNC,
-        // HANDLE, PROMISE, JSVAL: P2b's compact:false renderer's job — a
-        // bare, deliberately silent sentinel trap (no diagnostic — NOT
-        // rule 1's "refuse loudly with a named diagnostic"), reachable
-        // (by real, just unclaimed, source) and force-pinned (the
-        // increment-22 P2b HANDLE/JSVAL sentinel precedent's own
-        // bare-unreachable style).
-        code.unreachable();
+        // ARR, BYTES, FUNC, HANDLE, PROMISE, JSVAL: D.8's own "one line"
+        // rider, same as the OBJ-without-"%error" arm above — the real
+        // `cfInspect` call. ARR/BYTES/FUNC render properly; HANDLE/
+        // PROMISE/JSVAL still trap, but INSIDE cfInspect's own A.5 trap
+        // (already registered), not a second, duplicate trap here.
+        this.emitIfErrorFail(code, () => {
+          code.localGet(vLocal);
+          code.call(this.insp.cfInspect());
+        });
         this.close(); // #6
         this.close(); // #5
         this.close(); // #4
@@ -20549,14 +20578,268 @@ class Assembler {
         this.releaseScratch(dynRefT, vLocal);
         return true;
       }
+      // (a, b, negated, deep, msg, hasMsg) -> void. strictEqual/
+      // notStrictEqual/deepStrictEqual/notDeepStrictEqual over dyn
+      // values (increment 23 P2b, retiring the P2a refusal). Same
+      // eager-IR-order argument-evaluation shape as eqF64/eqStr above;
+      // `same` branches on `deep` FIRST to pick the comparison
+      // algorithm (P2a's own `deepEqDyn`/`sameValueDyn`), THEN xors
+      // with `negated`. On failure, `ia = cfInspect(a)` is computed
+      // ONCE (both the eq and neq assemblers need it; only eq also
+      // needs `ib`), then routed to `dynNeqFailHelper`/`dynEqFailHelper`
+      // (D.1-D.5) exactly as D.9's own boxing shim routes eqStr's own
+      // failure path — `assert.eqDyn` itself never re-enters here, the
+      // comparison above has already decided.
+      case "assert.eqDyn": {
+        const dynRefT = this.dyn.dynRef();
+        const strRefT = this.strRef;
+        const aLocal = this.acquireScratch(dynRefT);
+        const bLocal = this.acquireScratch(dynRefT);
+        const negatedLocal = this.acquireScratch(I32);
+        const deepLocal = this.acquireScratch(I32);
+        const msgLocal = this.acquireScratch(strRefT);
+        const hasMsgLocal = this.acquireScratch(I32);
+        this.walkExpr(e.args[0]!);
+        code.localSet(aLocal);
+        this.walkExpr(e.args[1]!);
+        code.localSet(bLocal);
+        this.walkExpr(e.args[2]!);
+        code.localSet(negatedLocal);
+        this.walkExpr(e.args[3]!);
+        code.localSet(deepLocal);
+        this.walkExpr(e.args[4]!);
+        code.localSet(msgLocal);
+        this.walkExpr(e.args[5]!);
+        code.localSet(hasMsgLocal);
+
+        const sameLocal = this.acquireScratch(I32);
+        code.localGet(deepLocal);
+        this.openIfResult(I32);
+        code.localGet(aLocal);
+        code.localGet(bLocal);
+        code.call(this.dyn.deepEqDyn());
+        code.else_();
+        code.localGet(aLocal);
+        code.localGet(bLocal);
+        code.call(this.dyn.sameValueDyn());
+        this.close();
+        code.localSet(sameLocal);
+
+        code.localGet(sameLocal);
+        code.localGet(negatedLocal);
+        code.i32Xor();
+        code.i32Eqz();
+        this.openIf();
+        const iaLocal = this.acquireScratch(strRefT);
+        code.localGet(aLocal);
+        code.call(this.insp.cfInspect());
+        code.localSet(iaLocal);
+        const msgResultLocal = this.acquireScratch(strRefT);
+        code.localGet(negatedLocal);
+        this.openIf();
+        code.localGet(aLocal);
+        code.localGet(iaLocal);
+        code.localGet(deepLocal);
+        code.localGet(msgLocal);
+        code.localGet(hasMsgLocal);
+        code.call(this.dynNeqFailHelper());
+        code.localSet(msgResultLocal);
+        code.else_();
+        const ibLocal = this.acquireScratch(strRefT);
+        code.localGet(bLocal);
+        code.call(this.insp.cfInspect());
+        code.localSet(ibLocal);
+        code.localGet(aLocal);
+        code.localGet(bLocal);
+        code.localGet(iaLocal);
+        code.localGet(ibLocal);
+        code.localGet(deepLocal);
+        code.localGet(msgLocal);
+        code.localGet(hasMsgLocal);
+        code.call(this.dynEqFailHelper());
+        code.localSet(msgResultLocal);
+        this.releaseScratch(strRefT, ibLocal);
+        this.close();
+        this.emitSetCellError(code, "%Error", "AssertionError", () => code.localGet(msgResultLocal), "ERR_ASSERTION");
+        this.emitUnwind();
+        this.releaseScratch(strRefT, msgResultLocal);
+        this.releaseScratch(strRefT, iaLocal);
+        this.close();
+        this.releaseScratch(I32, sameLocal);
+        this.releaseScratch(dynRefT, aLocal);
+        this.releaseScratch(dynRefT, bLocal);
+        this.releaseScratch(I32, negatedLocal);
+        this.releaseScratch(I32, deepLocal);
+        this.releaseScratch(strRefT, msgLocal);
+        this.releaseScratch(I32, hasMsgLocal);
+        return true;
+      }
+      // (actual, expected, msg, hasMsg) -> void. `assert.throws`'s own
+      // object-shape matcher (increment 23 P2b, D.7 — scr_assert_
+      // expects_err_dyn ported): when BOTH sides are OBJ, walk
+      // EXPECTED's own keys (skipping the reserved "%error" marker) and
+      // require each to `deepEqDyn` against ACTUAL's value at the same
+      // key — extra ACTUAL keys are fine, Node walks expected's keys
+      // ONLY. On the first mismatch, on a missing key, or when EITHER
+      // side is not an OBJ, fall through to the full `deepStrictEqual`
+      // (deep=true, negated=false) via the SAME `dynEqFailHelper` path
+      // `assert.eqDyn` above uses (never re-entering `eqDyn` itself,
+      // matching D.9's own "never re-enter eqDyn" discipline: the walk
+      // here has already decided, so it goes straight to the failure
+      // assembler when it fails, and returns silently when it does not).
+      // Claims NOTHING in the six-corpus set (its only known consumer,
+      // 1722, is regex-blocked to a later increment) — built anyway per
+      // D.7's own recommendation: cheap on top of machinery this pass
+      // already builds, and it retires a name from the refusal
+      // histogram now rather than re-loading this context later.
+      case "assert.expectsErrDyn": {
+        const dynRefT = this.dyn.dynRef();
+        const objRefT = this.dyn.objRef();
+        const objT = this.dyn.objT();
+        const entryT = this.dyn.entryT();
+        const entriesArrT = this.dyn.entriesArrayType();
+        const strRefT = this.strRef;
+        const actualLocal = this.acquireScratch(dynRefT);
+        const expectedLocal = this.acquireScratch(dynRefT);
+        const msgLocal = this.acquireScratch(strRefT);
+        const hasMsgLocal = this.acquireScratch(I32);
+        this.walkExpr(e.args[0]!);
+        code.localSet(actualLocal);
+        this.walkExpr(e.args[1]!);
+        code.localSet(expectedLocal);
+        this.walkExpr(e.args[2]!);
+        code.localSet(msgLocal);
+        this.walkExpr(e.args[3]!);
+        code.localSet(hasMsgLocal);
+
+        // matched = both OBJ && every expected-OWN-entry (except the
+        // "%error" key) deep-equals actual's own value at that key —
+        // walking expected's own `entries` array directly, the SAME
+        // representation `deepEqDyn`'s own OBJ arm walks (dyn.ts), NOT
+        // the heavier `objWalk` (that produces a user-visible
+        // `Object.keys()` dyn array; this needs only the raw entries).
+        const matchedLocal = this.acquireScratch(I32);
+        code.i32Const(0);
+        code.localSet(matchedLocal);
+        code.localGet(actualLocal);
+        code.call(this.dyn.isObject());
+        code.localGet(expectedLocal);
+        code.call(this.dyn.isObject());
+        code.i32And();
+        this.openIf();
+        code.i32Const(1);
+        code.localSet(matchedLocal);
+        const eoLocal = this.acquireScratch(objRefT);
+        const aoLocal = this.acquireScratch(objRefT);
+        this.dyn.objPayload(code, (c) => c.localGet(expectedLocal));
+        code.localSet(eoLocal);
+        this.dyn.objPayload(code, (c) => c.localGet(actualLocal));
+        code.localSet(aoLocal);
+        const nLocal = this.acquireScratch(I32);
+        const iLocal = this.acquireScratch(I32);
+        code.localGet(eoLocal);
+        code.structGet(objT, OBJ_LEN);
+        code.localSet(nLocal);
+        code.i32Const(0);
+        code.localSet(iLocal);
+        const breakPos = this.openBlock();
+        const continuePos = this.openLoop();
+        code.localGet(iLocal);
+        code.localGet(nLocal);
+        code.i32GeS();
+        this.brTo(breakPos, true);
+        const entryLocal = this.acquireScratch(this.dyn.entryRef());
+        const keyLocal = this.acquireScratch(strRefT);
+        code.localGet(eoLocal);
+        code.structGet(objT, OBJ_ENTRIES);
+        code.localGet(iLocal);
+        code.arrayGet(entriesArrT);
+        code.localSet(entryLocal);
+        code.localGet(entryLocal);
+        code.structGet(entryT, ENTRY_KEY);
+        code.localSet(keyLocal);
+        code.localGet(keyLocal);
+        this.pushStrLitInto(code, "%error");
+        code.call(this.strEqHelper());
+        code.i32Eqz();
+        this.openIf(); // skip the reserved marker entirely
+        const bvLocal = this.acquireScratch(dynRefT);
+        code.localGet(aoLocal);
+        code.localGet(keyLocal);
+        code.call(this.dyn.objGet());
+        code.localTee(bvLocal);
+        code.refIsNull();
+        this.openIf();
+        code.i32Const(0);
+        code.localSet(matchedLocal);
+        this.brTo(breakPos, false);
+        code.else_();
+        code.localGet(entryLocal);
+        code.structGet(entryT, ENTRY_VALUE);
+        code.localGet(bvLocal);
+        code.call(this.dyn.deepEqDyn());
+        code.i32Eqz();
+        this.openIf();
+        code.i32Const(0);
+        code.localSet(matchedLocal);
+        this.brTo(breakPos, false);
+        this.close();
+        this.close();
+        this.releaseScratch(dynRefT, bvLocal);
+        this.close();
+        this.releaseScratch(strRefT, keyLocal);
+        this.releaseScratch(this.dyn.entryRef(), entryLocal);
+        code.localGet(iLocal);
+        code.i32Const(1);
+        code.i32Add();
+        code.localSet(iLocal);
+        this.brTo(continuePos, false);
+        this.close();
+        this.close();
+        this.releaseScratch(I32, iLocal);
+        this.releaseScratch(I32, nLocal);
+        this.releaseScratch(objRefT, aoLocal);
+        this.releaseScratch(objRefT, eoLocal);
+        this.close();
+        code.localGet(matchedLocal);
+        code.i32Eqz();
+        this.openIf();
+        const iaLocal = this.acquireScratch(strRefT);
+        code.localGet(actualLocal);
+        code.call(this.insp.cfInspect());
+        code.localSet(iaLocal);
+        const ibLocal = this.acquireScratch(strRefT);
+        code.localGet(expectedLocal);
+        code.call(this.insp.cfInspect());
+        code.localSet(ibLocal);
+        const msgResultLocal = this.acquireScratch(strRefT);
+        code.localGet(actualLocal);
+        code.localGet(expectedLocal);
+        code.localGet(iaLocal);
+        code.localGet(ibLocal);
+        code.i32Const(1); // deep=true
+        code.localGet(msgLocal);
+        code.localGet(hasMsgLocal);
+        code.call(this.dynEqFailHelper());
+        code.localSet(msgResultLocal);
+        this.emitSetCellError(code, "%Error", "AssertionError", () => code.localGet(msgResultLocal), "ERR_ASSERTION");
+        this.emitUnwind();
+        this.releaseScratch(strRefT, msgResultLocal);
+        this.releaseScratch(strRefT, ibLocal);
+        this.releaseScratch(strRefT, iaLocal);
+        this.close();
+        this.releaseScratch(I32, matchedLocal);
+        this.releaseScratch(dynRefT, actualLocal);
+        this.releaseScratch(dynRefT, expectedLocal);
+        this.releaseScratch(strRefT, msgLocal);
+        this.releaseScratch(I32, hasMsgLocal);
+        return true;
+      }
       default:
-        // P2a scope (increment 23, in progress): `assert.eqDyn` falls
-        // through to this generic refusal deliberately — its
-        // comparison walk and renderer are being built as their own
-        // named helpers this pass, but the libCall wiring itself (and
-        // the removal of this refusal) is P2b's job, not P2a's. The
-        // census must therefore stay byte-identical to the post-P1
-        // baseline (747/1077) for the whole of P2a.
+        // Increment 23 P2b close: every `assert.*` libCall this tier
+        // claims now has its own case above — this default only ever
+        // fires for a name not yet in scope at all (never `eqDyn`/
+        // `expectsErrDyn`, both wired this pass).
         if (e.fn.startsWith("assert.")) {
           this.refuse(`libCall:${e.fn}`, e.loc);
           code.unreachable();
@@ -20855,6 +21138,464 @@ class Assembler {
     return idx;
   }
 
+  private dynEqFailFunc: number | null = null;
+
+  /** %w.assert.dynEqFail(a, b, ia, ib, deep, msg, hasMsg) → str —
+   * increment 23 P2b, design-p2.txt D.1-D.2/D.5: `createErrDiff`'s
+   * decision tree for `assert.eqDyn`'s FAILURE side (strictEqual/
+   * deepStrictEqual only — the caller has already confirmed the
+   * comparison failed). `ia`/`ib` are `cfInspect(a)`/`cfInspect(b)`,
+   * computed ONCE by the caller (both branches below need `ia`; only
+   * the simple/myers branches need `ib`, but the caller always has it
+   * cheaply available since P1's `eqF64` shares the identical shape).
+   *
+   * showSimpleDiff (D.1: la.n<=1 && lb.n<=1 && (!isObject(a) ||
+   * !isObject(b))) delegates WHOLESALE to P1's `eqFailHelper` — D.5's
+   * own finding that it already implements the readable-header-or-msg
+   * wrap AND the short/stacked+caret body, so nothing else is built
+   * for that arm. The other two branches (D.3 notIdentical, D.1's
+   * myers branch) have NO scalar equivalent and are assembled here
+   * directly, reproducing `createErrDiff`'s own OUTER wrap
+   * (`getErrorMessage + "\n" + header + skippedMarker + "\n" +
+   * message + "\n"`) by hand for each of their own fixed `header`
+   * values ("" for notIdentical, "+ actual - expected" for myers). */
+  private dynEqFailHelper(): number {
+    if (this.dynEqFailFunc !== null) return this.dynEqFailFunc;
+    const strRefT = this.strRef;
+    const i32ArrRefT = this.insp.i32ArrRef();
+    const traceArrRefT = this.insp.traceArrRef();
+    const idx = this.mb.declareFunc(
+      this.mb.funcType([this.dyn.dynRef(), this.dyn.dynRef(), strRefT, strRefT, I32, strRefT, I32], [strRefT]),
+      "%w.assert.dynEqFail",
+    );
+    this.dynEqFailFunc = idx;
+    const c = new Code();
+    const A = 0;
+    const B = 1;
+    const IA = 2;
+    const IB = 3;
+    const DEEP = 4;
+    const MSG = 5;
+    const HASMSG = 6;
+    const LA_OFF = 7;
+    const LA_N = 8;
+    const LB_OFF = 9;
+    const LB_N = 10;
+    const MORPH = 11;
+    const QUOTES = 12;
+    const BOTHZERO = 13;
+    const MARK = 14;
+    const COMMA = 15;
+    const TRACE = 16;
+    const TRACELEN = 17;
+    const MAXV = 18;
+    const OPS = 19;
+    const SIDES = 20;
+    const IDXS = 21;
+    const RESLEN = 22;
+    const SKIPPED = 23;
+    const RESULT = 24;
+    const dynT = this.dyn.dynT();
+
+    // Node's readable-operator text, given `deep`/`morph` — B.5's own
+    // morph text only applies when !deep (deep never morphs, D.5).
+    const pushReadableHeader = (): void => {
+      c.localGet(DEEP);
+      c.ifResult(strRefT);
+      this.pushStrLitInto(c, "Expected values to be strictly deep-equal:");
+      c.else_();
+      c.localGet(MORPH);
+      c.ifResult(strRefT);
+      this.pushStrLitInto(c, 'Expected "actual" to be reference-equal to "expected":');
+      c.else_();
+      this.pushStrLitInto(c, "Expected values to be strictly equal:");
+      c.end();
+      c.end();
+    };
+    // `hasMsg && msg.len>0 ? msg : pushHeader()` — the SAME selection
+    // eqFailHelper does internally, needed here for the two branches
+    // that do NOT go through eqFailHelper.
+    const writeMsgOrHeader = (pushHeader: () => void): void => {
+      c.localGet(HASMSG);
+      c.ifVoid();
+      c.localGet(MSG);
+      c.arrayLen();
+      c.ifVoid();
+      c.localGet(MSG);
+      c.call(this.insp.ibPuts());
+      c.else_();
+      pushHeader();
+      c.call(this.insp.ibPuts());
+      c.end();
+      c.else_();
+      pushHeader();
+      c.call(this.insp.ibPuts());
+      c.end();
+    };
+
+    c.localGet(IA);
+    c.call(this.insp.splitLines());
+    c.localSet(LA_N);
+    c.localSet(LA_OFF);
+    c.localGet(IB);
+    c.call(this.insp.splitLines());
+    c.localSet(LB_N);
+    c.localSet(LB_OFF);
+    c.localGet(A);
+    c.localGet(B);
+    c.localGet(DEEP);
+    c.call(this.dyn.checkOperatorMorph());
+    c.localSet(MORPH);
+
+    // showSimpleDiff = la.n<=1 && lb.n<=1 && (!isObject(a)||!isObject(b))
+    c.localGet(LA_N);
+    c.i32Const(1);
+    c.i32LeS();
+    c.localGet(LB_N);
+    c.i32Const(1);
+    c.i32LeS();
+    c.i32And();
+    c.localGet(A);
+    c.call(this.dyn.isObject());
+    c.i32Eqz();
+    c.localGet(B);
+    c.call(this.dyn.isObject());
+    c.i32Eqz();
+    c.i32Or();
+    c.i32And(); // safe: every operand above is a pure compare/call with no shared hazard
+    c.ifVoid();
+    c.localGet(A);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.STR);
+    c.i32Eq();
+    c.localGet(B);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.STR);
+    c.i32Eq();
+    c.i32Add(); // QUOTES = isStrA + isStrB (0, 1, or 2 — D.2's own
+    // per-side rule; eqFailHelper's `QUOTES` param, subtracted TWICE
+    // as `stringsLen -= QUOTES; stringsLen -= QUOTES`, ends up
+    // subtracting exactly 2*isStrA + 2*isStrB either way).
+    c.localSet(QUOTES);
+    c.localGet(A);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.NUM);
+    c.i32Eq();
+    c.localGet(B);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.NUM);
+    c.i32Eq();
+    c.i32And();
+    c.localGet(A);
+    c.structGet(dynT, DYN_NUM);
+    c.f64Const(0);
+    c.f64Eq();
+    c.localGet(B);
+    c.structGet(dynT, DYN_NUM);
+    c.f64Const(0);
+    c.f64Eq();
+    c.i32And();
+    c.i32And(); // safe: kind==NUM gates nothing that traps — f64Eq on a
+    // non-NUM's own DYN_NUM slot is still a valid f64 read (a shared
+    // union-like struct slot, never uninitialized memory).
+    c.localSet(BOTHZERO);
+    c.localGet(IA);
+    c.localGet(IB);
+    c.localGet(QUOTES);
+    c.localGet(BOTHZERO);
+    pushReadableHeader();
+    c.localGet(MSG);
+    c.localGet(HASMSG);
+    c.call(this.eqFailHelper());
+    c.return_();
+    c.end();
+
+    // D.3: the two renderings are byte-equal but a/b are not the same
+    // reference (checkCommaDisparity does not apply — that flag lives
+    // only inside the myers branch below).
+    c.localGet(IA);
+    c.localGet(IB);
+    c.call(this.strEqHelper());
+    c.ifVoid();
+    this.insp.pushMark(c);
+    c.localSet(MARK);
+    writeMsgOrHeader(() =>
+      this.pushStrLitInto(c, "Values have same structure but are not reference-equal:"),
+    );
+    c.i32Const(0x0a);
+    c.call(this.insp.ibPutc()); // header="" contributes exactly this \n
+    c.localGet(LA_N);
+    c.i32Const(50);
+    c.i32GtS();
+    c.localSet(SKIPPED);
+    c.localGet(SKIPPED);
+    c.ifVoid();
+    this.pushStrLitInto(c, "\n... Skipped lines");
+    c.call(this.insp.ibPuts());
+    c.end();
+    c.i32Const(0x0a);
+    c.call(this.insp.ibPutc());
+    c.localGet(SKIPPED);
+    c.ifVoid();
+    // join(lines[0..49], "\n") + "\n...}" — lines 0..49 are the
+    // CONTIGUOUS substring [0, LA_OFF[50]-1) of `ia` (splitLines' own
+    // offsets already include the joining newlines between them).
+    c.localGet(IA);
+    c.i32Const(0);
+    c.localGet(LA_OFF);
+    c.i32Const(50);
+    c.arrayGet(this.insp.i32Arr());
+    c.i32Const(1);
+    c.i32Sub();
+    c.call(this.insp.ibPutRange());
+    this.pushStrLitInto(c, "\n...}");
+    c.call(this.insp.ibPuts());
+    c.else_();
+    c.localGet(IA);
+    c.call(this.insp.ibPuts());
+    c.end();
+    c.i32Const(0x0a);
+    c.call(this.insp.ibPutc());
+    c.localGet(MARK);
+    c.call(this.insp.ibTake());
+    c.return_();
+    c.end();
+
+    // The myers branch (D.1's own default header, "+ actual - expected").
+    c.localGet(A);
+    c.call(this.dyn.isObject());
+    c.localSet(COMMA);
+    c.localGet(IA);
+    c.localGet(LA_OFF);
+    c.localGet(LA_N);
+    c.localGet(IB);
+    c.localGet(LB_OFF);
+    c.localGet(LB_N);
+    c.localGet(COMMA);
+    c.call(this.insp.myersForward());
+    c.localSet(MAXV);
+    c.localSet(TRACELEN);
+    c.localSet(TRACE);
+    c.localGet(IA);
+    c.localGet(LA_OFF);
+    c.localGet(LA_N);
+    c.localGet(IB);
+    c.localGet(LB_OFF);
+    c.localGet(LB_N);
+    c.localGet(COMMA);
+    c.localGet(TRACE);
+    c.localGet(TRACELEN);
+    c.localGet(MAXV);
+    c.call(this.insp.myersBacktrack());
+    c.localSet(RESLEN);
+    c.localSet(IDXS);
+    c.localSet(SIDES);
+    c.localSet(OPS);
+    c.localGet(IA);
+    c.localGet(LA_OFF);
+    c.localGet(IB);
+    c.localGet(LB_OFF);
+    c.localGet(OPS);
+    c.localGet(SIDES);
+    c.localGet(IDXS);
+    c.localGet(RESLEN);
+    c.call(this.insp.printMyersDiff());
+    c.localSet(SKIPPED);
+    c.localSet(RESULT);
+
+    this.insp.pushMark(c);
+    c.localSet(MARK);
+    writeMsgOrHeader(pushReadableHeader);
+    this.pushStrLitInto(c, "\n+ actual - expected");
+    c.call(this.insp.ibPuts());
+    c.localGet(SKIPPED);
+    c.ifVoid();
+    this.pushStrLitInto(c, "\n... Skipped lines");
+    c.call(this.insp.ibPuts());
+    c.end();
+    c.i32Const(0x0a);
+    c.call(this.insp.ibPutc());
+    c.localGet(RESULT);
+    c.call(this.insp.ibPuts());
+    c.i32Const(0x0a);
+    c.call(this.insp.ibPutc());
+    c.localGet(MARK);
+    c.call(this.insp.ibTake());
+    this.mb.setBody(
+      idx,
+      [
+        i32ArrRefT /* LA_OFF=7 */,
+        I32 /* LA_N=8 */,
+        i32ArrRefT /* LB_OFF=9 */,
+        I32 /* LB_N=10 */,
+        I32 /* MORPH=11 */,
+        I32 /* QUOTES=12 */,
+        I32 /* BOTHZERO=13 */,
+        I32 /* MARK=14 */,
+        I32 /* COMMA=15 */,
+        traceArrRefT /* TRACE=16 */,
+        I32 /* TRACELEN=17 */,
+        I32 /* MAXV=18 */,
+        i32ArrRefT /* OPS=19 */,
+        i32ArrRefT /* SIDES=20 */,
+        i32ArrRefT /* IDXS=21 */,
+        I32 /* RESLEN=22 */,
+        I32 /* SKIPPED=23 */,
+        strRefT /* RESULT=24 */,
+      ],
+      c.bytes(),
+    );
+    return idx;
+  }
+
+  private dynNeqFailFunc: number | null = null;
+
+  /** %w.assert.dynNeqFail(a, ia, deep, msg, hasMsg) → str — increment
+   * 23 P2b, design-p2.txt D.4/D.5: the AssertionError constructor's
+   * `notStrictEqual`/`notDeepStrictEqual` branch for `assert.eqDyn`'s
+   * FAILURE side (the caller has already confirmed a "equals" b under
+   * the relevant notion, which is exactly the case Node's own neq
+   * family renders). The `notStrictEqualObject` morph tests ONLY `a`
+   * (not `b`, unlike B.5's own strictEqual morph) and ONLY when
+   * `!deep` (real Node source, assertion_error.js:301-305 — re-lifted
+   * and read this pass, not re-derived from the design doc alone).
+   * P1's `neqFailHelper` is reused ONLY for the single-line
+   * (`res.n===1`) case (its own documented scope); the multi-line and
+   * `>50`-collapse forms (D.5's own "the dyn side owns... the neq >50
+   * collapse") are assembled here directly. */
+  private dynNeqFailHelper(): number {
+    if (this.dynNeqFailFunc !== null) return this.dynNeqFailFunc;
+    const strRefT = this.strRef;
+    const i32ArrRefT = this.insp.i32ArrRef();
+    const idx = this.mb.declareFunc(
+      this.mb.funcType([this.dyn.dynRef(), strRefT, I32, strRefT, I32], [strRefT]),
+      "%w.assert.dynNeqFail",
+    );
+    this.dynNeqFailFunc = idx;
+    const c = new Code();
+    const A = 0;
+    const IA = 1;
+    const DEEP = 2;
+    const MSG = 3;
+    const HASMSG = 4;
+    const RES_OFF = 5;
+    const RES_N = 6;
+    const MORPH = 7;
+    const MARK = 8;
+    const dynT = this.dyn.dynT();
+
+    const pushBaseHeader = (): void => {
+      c.localGet(DEEP);
+      c.ifResult(strRefT);
+      this.pushStrLitInto(c, 'Expected "actual" not to be strictly deep-equal to:');
+      c.else_();
+      c.localGet(MORPH);
+      c.ifResult(strRefT);
+      this.pushStrLitInto(c, 'Expected "actual" not to be reference-equal to "expected":');
+      c.else_();
+      this.pushStrLitInto(c, 'Expected "actual" to be strictly unequal to:');
+      c.end();
+      c.end();
+    };
+
+    // BUG FOUND BY THE DIFFERENTIAL (1771's own "custom ndse" line, not
+    // caught by review): unlike the EQ family (`kMethodsWithCustomMessageDiff`
+    // includes strictEqual/deepStrictEqual, so createErrDiff ALWAYS runs
+    // and only its LEADING LABEL is msg-or-readable), the NEQ family
+    // (notStrictEqual/notDeepStrictEqual) is NOT in that set — real
+    // Node's own AssertionError constructor (assertion_error.js:269-274)
+    // takes `super(String(message))` WHOLESALE whenever `message != null`,
+    // bypassing `res`/the morph/the >50 collapse/the inline-vs-block
+    // choice ENTIRELY, not just replacing a header line. So `hasMsg`
+    // alone (regardless of length, D.0/D.4's own "neq family uses hasMsg
+    // alone") must short-circuit the WHOLE function, before even
+    // `splitLines` runs.
+    c.localGet(HASMSG);
+    c.ifVoid();
+    c.localGet(MSG);
+    c.return_();
+    c.end();
+
+    c.localGet(IA);
+    c.call(this.insp.splitLines());
+    c.localSet(RES_N);
+    c.localSet(RES_OFF);
+    // notStrictEqualObject: !deep && (isObject(a) || a.kind==FUNC) —
+    // ONLY `a`, unlike checkOperator's own strictEqual morph.
+    c.localGet(DEEP);
+    c.i32Eqz();
+    c.localGet(A);
+    c.call(this.dyn.isObject());
+    c.localGet(A);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.FUNC);
+    c.i32Eq();
+    c.i32Or();
+    c.i32And(); // safe: every operand is a pure compare/call
+    c.localSet(MORPH);
+
+    c.localGet(RES_N);
+    c.i32Const(1);
+    c.i32Eq();
+    c.ifVoid();
+    pushBaseHeader();
+    c.localGet(IA);
+    c.localGet(MSG);
+    c.localGet(HASMSG);
+    c.call(this.neqFailHelper());
+    c.return_();
+    c.end();
+
+    this.insp.pushMark(c);
+    c.localSet(MARK);
+    c.localGet(HASMSG);
+    c.ifVoid();
+    c.localGet(MSG);
+    c.call(this.insp.ibPuts());
+    c.else_();
+    pushBaseHeader();
+    c.call(this.insp.ibPuts());
+    c.end();
+    this.pushStrLitInto(c, "\n\n");
+    c.call(this.insp.ibPuts());
+    c.localGet(RES_N);
+    c.i32Const(50);
+    c.i32GtS();
+    c.ifVoid();
+    // lines[0..45] (46 lines) + "...", 47 total — `res[46]:="...";
+    // truncate to 47`. Lines 0..45 are `ia`'s own contiguous substring
+    // [0, RES_OFF[46]-1).
+    c.localGet(IA);
+    c.i32Const(0);
+    c.localGet(RES_OFF);
+    c.i32Const(46);
+    c.arrayGet(this.insp.i32Arr());
+    c.i32Const(1);
+    c.i32Sub();
+    c.call(this.insp.ibPutRange());
+    this.pushStrLitInto(c, "\n...");
+    c.call(this.insp.ibPuts());
+    c.else_();
+    c.localGet(IA);
+    c.call(this.insp.ibPuts());
+    c.end();
+    c.i32Const(0x0a);
+    c.call(this.insp.ibPutc());
+    c.localGet(MARK);
+    c.call(this.insp.ibTake());
+    this.mb.setBody(
+      idx,
+      [
+        i32ArrRefT /* RES_OFF=5 */,
+        I32 /* RES_N=6 */,
+        I32 /* MORPH=7 */,
+        I32 /* MARK=8 */,
+      ],
+      c.bytes(),
+    );
+    return idx;
+  }
+
   /** Shared by ifErrorErr/F64/Str/Bool/Dyn's scalar+error arms
    * (scr_assert_iferror_fail ported): one fixed prefix, one detail
    * piece from the caller, always throws (the caller has already
@@ -20914,55 +21655,6 @@ class Assembler {
     code.else_();
     this.pushStrLitInto(code, strictText);
     this.close();
-  }
-
-  /** i32 boolean: does `strLocal` contain a 0x0a code unit? eqStr's OWN
-   * multi-line-sentinel predicate (des-23 D.9 / the lead's own
-   * instruction) — tests the RENDERED inspection, never the raw input
-   * (measured to differ: a 10002-unit string whose only "\n" sits past
-   * the 10000-unit cap renders on ONE line). Scans the whole string
-   * rather than breaking early on the first hit — simpler control flow,
-   * and this only ever runs on an ALREADY-FAILING assert path. Uses
-   * `this.openBlock()`/`this.openLoop()`/`this.close()` (fn-tracked),
-   * so `code` must be `this.fn.code` — a case-arm helper, not a
-   * standalone function builder. */
-  private emitStrHasNewline(code: Code, strLocal: number): void {
-    const iLocal = this.acquireScratch(I32);
-    const lenLocal = this.acquireScratch(I32);
-    const foundLocal = this.acquireScratch(I32);
-    code.localGet(strLocal);
-    code.arrayLen();
-    code.localSet(lenLocal);
-    code.i32Const(0);
-    code.localSet(foundLocal);
-    code.i32Const(0);
-    code.localSet(iLocal);
-    this.openBlock();
-    this.openLoop();
-    code.localGet(iLocal);
-    code.localGet(lenLocal);
-    code.i32GeS();
-    code.brIf(1);
-    code.localGet(strLocal);
-    code.localGet(iLocal);
-    code.arrayGetU(this.strType);
-    code.i32Const(0x0a);
-    code.i32Eq();
-    this.openIf();
-    code.i32Const(1);
-    code.localSet(foundLocal);
-    this.close();
-    code.localGet(iLocal);
-    code.i32Const(1);
-    code.i32Add();
-    code.localSet(iLocal);
-    code.br(0);
-    this.close();
-    this.close();
-    code.localGet(foundLocal);
-    this.releaseScratch(I32, iLocal);
-    this.releaseScratch(I32, lenLocal);
-    this.releaseScratch(I32, foundLocal);
   }
 
   /* ── the deepStrictEqual cycle memo (assert.deqEnter/deqLeave) ───────

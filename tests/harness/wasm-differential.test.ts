@@ -2813,6 +2813,24 @@ const TIER_FLOOR: string[] = [
   // avoids exercising against the oracle). 746 -> 747, exactly this one
   // new claim.
   "2694-deep-equal-cycle-crossed.ts",
+  // Increment 23 P2b: `assert.eqDyn`'s libCall wired for real (D.1-D.5's
+  // decision tree — showSimpleDiff/notIdentical/the myers branch —
+  // reusing P1's eqFail/neqFail per D.5; D.9's boxing shim retiring
+  // eqStr's own multi-line sentinel trap). Six programs claim, all
+  // verified byte-exact against the live Node oracle before this
+  // addition landed (a real bug caught by this SAME differential run,
+  // not by review: dynNeqFailHelper's multi-line branch was still
+  // assembling a diff under a custom message for the notStrictEqual/
+  // notDeepStrictEqual family, where real Node's own AssertionError
+  // constructor bypasses the WHOLE assembler via `super(String(message))`
+  // whenever `message != null` — fixed as a top-of-function early
+  // return, re-verified). 747 -> 753, exactly the predicted movers.
+  "1770-assert-dyn-strict.ts",
+  "1771-assert-dyn-deep.ts",
+  "1772-assert-dyn-js.cjs",
+  "1773-assert-dyn-exit.ts",
+  "2161-js-object-literal-identity.cjs",
+  "2165-js-throw-dyn.cjs",
 ];
 
 interface RunResult {

@@ -112,6 +112,12 @@ async function buildHelpers(): Promise<Helpers> {
     strCmpU16: () => {
       throw new Error("harness 1 does not build the composite renderer's entry sort");
     },
+    strTrimEnd: () => {
+      throw new Error("harness 1 does not build printMyersDiff");
+    },
+    namedTrap: () => {
+      throw new Error("harness 1 does not build cfValue's cycle trap");
+    },
   });
 
   const simple = (name: string, params: ValType[], results: ValType[], body: (c: Code) => void): void => {

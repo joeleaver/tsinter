@@ -281,6 +281,12 @@ async function buildHarness(
     bytesLen: () => bytesB.length(),
     bytesGet: () => bytesB.get("u8"),
     strCmpU16: () => stub([strRef, strRef], [I32], "%stub.strCmpU16"),
+    // Unused: this harness never reaches printMyersDiff.
+    strTrimEnd: () => stub([strRef], [strRef], "%stub.strTrimEnd"),
+    // Unused: this harness never reaches cfValue's cycle-trap arm.
+    namedTrap: () => {
+      throw new Error("harness does not build cfValue's cycle trap");
+    },
   });
 
   const simple = (name: string, params: ValType[], results: ValType[], body: (c: Code) => void): void => {

@@ -285,34 +285,24 @@ test("assert.eqF64/eqBool: no operand's inspection can span lines — extreme va
   expect(stderr).toBe("");
 });
 
-/* ── eqStr's multi-line-inspection sentinel (des-23 D.9 / the lead's own
- * measurement + refinement): once EITHER inspection spans lines, Node's
- * real createErrDiff leaves the simple/stacked machinery entirely for
- * the myers line-diff assembler, which P1 does not port (P2's job,
- * D.9's boxing-shim recommendation) — a named, reachable-by-real-
- * source, force-pinned trap instead. No P1 corpus program reaches it
- * (1603's own "a\nb" is 3 units, far under the 76-unit split
- * threshold). The predicate is on the RENDERED text, not the input —
- * a companion pin below proves a string whose only newline sits past
- * the 10000-unit cap does NOT trip the sentinel (it renders on one
- * line, same as Node).
- *
- * `runWasmToTrap` alone does NOT distinguish the sentinel from an
- * ORDINARY uncaught AssertionError trap — BOTH are a genuine
- * WebAssembly.RuntimeError (an uncaught throw also traps, via
- * reportUncaughtHelper, once assert.strictEqual actually decides to
- * fail — this pass's own MUTATION CHECK caught exactly this: disabling
- * emitStrHasNewline still traps, just later and for the ordinary
- * reason, and both pins below would have stayed GREEN without the
- * stderr assertion). The distinguishing signal is stderr: the
- * sentinel's bare `unreachable()` fires BEFORE emitSetCellError/
- * emitUnwind/reportUncaughtHelper ever run, so stderr is EMPTY; the
- * ordinary uncaught path prints "Uncaught AssertionError ..." first
- * (measured directly, own probe, both ways). Both pins assert
- * `stderr === ""` for exactly this reason — a comment alone would not
- * have caught the mutation; the assertion does. ───────────────────── */
+/* ── eqStr's multi-line-inspection case, POST-P2b (des-23 D.9): what
+ * USED to be a named sentinel trap here (P1's own scope, before P2b
+ * landed) is GONE — D.9's own boxing shim boxes the failing operand
+ * into dyn and calls `dynEqFail`/`dynNeqFail` directly, so a
+ * multi-line rendering now produces Node's REAL myers-diff message,
+ * uncaught (this test never wraps the call in try/catch, matching
+ * 1773's own "simple/stacked, UNCAUGHT, exit 1" shape), not a silent
+ * trap. These two pins are the DIRECT DESCENDANTS of the P1-era
+ * sentinel pins that lived here (same shapes, same eq/neq split) —
+ * updated rather than deleted, since "the trap is GONE, replaced by
+ * real rendering" is itself worth a standing regression pin, distinct
+ * from wasm-assert.test.ts's own "D.9 scalar routing" pin (which
+ * checks the CAUGHT `.message` value directly; these two check the
+ * UNCAUGHT stderr path specifically, confirming `emitSetCellError`/
+ * `emitUnwind`/`reportUncaughtHelper` all still run normally — nothing
+ * about the OLD sentinel's own early-exit survives). ───────────────── */
 
-test("assert.eqStr's multi-line sentinel: a long string containing a newline traps (eq path) — everything before it still runs, and stderr is EMPTY (proves the SENTINEL fired, not an ordinary uncaught AssertionError — see the header comment's own mutation-check story)", async () => {
+test("assert.eqStr's multi-line case (eq path), POST-P2b: no longer a trap — a real, uncaught AssertionError with Node's own myers-diff message on stderr, exit non-zero", async () => {
   const path = await build("eqstr-multiline-trap-eq.ts", [
     "import assert from 'node:assert';",
     "const long = 'abcdefghij'.repeat(8) + '\\nsecond line here';",
@@ -322,10 +312,12 @@ test("assert.eqStr's multi-line sentinel: a long string containing a newline tra
   ]);
   const { stdout, stderr } = await runWasmToTrap(path);
   expect(stdout).toBe(["before-trap", ""].join("\n"));
-  expect(stderr).toBe("");
+  expect(stderr).toBe(
+    "Uncaught AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n+ actual - expected\n\n+ 'abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij\\n' +\n+   'second line here'\n- 'x'\n\n",
+  );
 });
 
-test("assert.eqStr's multi-line sentinel: the SAME shape traps on the neq path too (E-11's own scope: a multi-line rendering never reaches neqFail's length-based inline/block choice), stderr EMPTY", async () => {
+test("assert.eqStr's multi-line case (neq path), POST-P2b: no longer a trap — Node's real inline-vs-block neq form on stderr (E-11's own scope: a multi-line rendering never reaches neqFail's length-based choice, it goes through dynNeqFail instead)", async () => {
   const path = await build("eqstr-multiline-trap-neq.ts", [
     "import assert from 'node:assert';",
     "const long = 'abcdefghij'.repeat(8) + '\\nsecond line here';",
@@ -335,7 +327,9 @@ test("assert.eqStr's multi-line sentinel: the SAME shape traps on the neq path t
   ]);
   const { stdout, stderr } = await runWasmToTrap(path);
   expect(stdout).toBe(["before-neq-trap", ""].join("\n"));
-  expect(stderr).toBe("");
+  expect(stderr).toBe(
+    "Uncaught AssertionError [ERR_ASSERTION]: Expected \"actual\" to be strictly unequal to:\n\n'abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij\\n' +\n  'second line here'\n\n",
+  );
 });
 
 test("assert.eqStr's multi-line sentinel: a SHORT string containing a newline stays on the ordinary simple form (under the 16/76-unit split gate — no trap)", async () => {
@@ -783,6 +777,178 @@ test("assert.deqEnter/deqLeave: the depth-2 SET-POP (Node's set.delete(c,d) on d
       "",
     ].join("\n"),
   );
+  expect(stderr).toBe("");
+});
+
+/* ── S056's REAL memo matrix, end to end through COMPILED `assert.eqDyn`
+ * programs (increment 23 P2b, the memo-rows ruling) — the P-3 debt from
+ * P2a's own gate: every static-side shape above is ALSO ported here as
+ * plain, UNTYPED `.cjs` objects (dyn-native from birth, never crossing
+ * a static-to-dyn boundary — a `w.q = w` field write on a STATIC TS
+ * variable REBOXES per S014 and never builds a genuine cycle, confirmed
+ * this pass; the false-premise pins built on that mistake were deleted,
+ * not fixed — see FINDINGS), routed through `deepEqDyn`'s SHARED
+ * deqEnter/deqLeave state machine (dyn.ts: "the dyn walk wants the
+ * IDENTICAL coinductive step — no second memo").
+ *
+ * THE COMPLEMENTARY-ASSERTION CONSTRUCTION (Lead's ruling, 2026-08-30):
+ * S058's cycle trap only fires on the RENDER path, which only runs on a
+ * FAILING comparison — so every row below is observed through the
+ * assertion that PASSES SILENTLY for that row's own verdict: an UNEQUAL
+ * row uses `assert.notDeepStrictEqual` (Node — and this tier — pass
+ * without ever rendering); an EQUAL row uses `assert.deepStrictEqual`.
+ * Under the INVERTED-ARMS mutation below (deqEnterHelper's five
+ * f64Const(1)/f64Const(2) verdict sites swapped), every verdict flips,
+ * the now-WRONG complementary assertion FAILS, the renderer runs, and
+ * S058's cycle trap fires — reddening every row BY NAME (a non-zero
+ * exit plus the S058 diagnostic on stderr, not a bare `unreachable`).
+ *
+ * TWO CONSTRUCTION HAZARDS FOUND BUILDING THESE (own re-derivation,
+ * neither a divergence — board #109 covers the first as a REGISTERED
+ * finding, the second is this pin file's own mistake, not tsinter's):
+ *   (a) a RING built via an array of nodes plus a cross-assignment
+ *       loop (`nodes[i].next = nodes[(i+1)%n]`) — OR even a plain
+ *       object-field ring wrapped in a FUNCTION that RETURNS it —
+ *       misinfers the node's own static shape and throws a boundary
+ *       TypeError crossing into `assert`'s `unknown` parameters ("a
+ *       value narrowed or asserted past it still held it"); avoided
+ *       throughout by building every ring as INLINE, top-level (or
+ *       block-scoped, never function-scoped) `const` declarations.
+ *   (b) MULTIPLE, INDEPENDENTLY-CONSTRUCTED cyclic shapes in ONE
+ *       compiled program corrupt each OTHER's inferred type even when
+ *       neither alone is a ring at all (confirmed: two unrelated
+ *       `{x:null}` self-loops in one file fail the same way) — every
+ *       row below is therefore its OWN compiled program; rows that
+ *       share ONE already-built chain (crossed-d2/d3 reusing the same
+ *       y/b/a/c) coexist fine, confirming the hazard is INDEPENDENT
+ *       construction sites, not object count.
+ *
+ * A third, unrelated hazard (accidentally SHARING one leaf object
+ * across sibling-B's three "deep" copies short-circuits the walk via
+ * reference equality before it ever reaches the promoting depth) was
+ * caught and fixed in this file's own construction, not tsinter's. */
+
+test("assert.eqDyn memo row: period 1-vs-2 (UNEQUAL family) — notDeepStrictEqual passes silently, no render", async () => {
+  const path = await build("memo-period-1v2.cjs", [
+    "const assert = require('node:assert');",
+    "const a0 = { x: null }; a0.x = a0;",
+    "const b0 = { x: null }; const b1 = { x: null };",
+    "b0.x = b1; b1.x = b0;",
+    "assert.notDeepStrictEqual(a0, b0);",
+    "console.log('period-1v2-ok');",
+  ]);
+  const { stdout, stderr } = await runWasm(path);
+  expect(stdout).toBe(["period-1v2-ok", ""].join("\n"));
+  expect(stderr).toBe("");
+});
+
+test("assert.eqDyn memo row: period 2-vs-4 (UNEQUAL family) — notDeepStrictEqual passes silently, no render", async () => {
+  const path = await build("memo-period-2v4.cjs", [
+    "const assert = require('node:assert');",
+    "const b0 = { x: null }; const b1 = { x: null };",
+    "b0.x = b1; b1.x = b0;",
+    "const d0 = { x: null }; const d1 = { x: null }; const d2 = { x: null }; const d3 = { x: null };",
+    "d0.x = d1; d1.x = d2; d2.x = d3; d3.x = d0;",
+    "assert.notDeepStrictEqual(b0, d0);",
+    "console.log('period-2v4-ok');",
+  ]);
+  const { stdout, stderr } = await runWasm(path);
+  expect(stdout).toBe(["period-2v4-ok", ""].join("\n"));
+  expect(stderr).toBe("");
+});
+
+test("assert.eqDyn memo row: period 2-vs-3 (UNEQUAL family) — notDeepStrictEqual passes silently, no render", async () => {
+  const path = await build("memo-period-2v3.cjs", [
+    "const assert = require('node:assert');",
+    "const b0 = { x: null }; const b1 = { x: null };",
+    "b0.x = b1; b1.x = b0;",
+    "const c0 = { x: null }; const c1 = { x: null }; const c2 = { x: null };",
+    "c0.x = c1; c1.x = c2; c2.x = c0;",
+    "assert.notDeepStrictEqual(b0, c0);",
+    "console.log('period-2v3-ok');",
+  ]);
+  const { stdout, stderr } = await runWasm(path);
+  expect(stdout).toBe(["period-2v3-ok", ""].join("\n"));
+  expect(stderr).toBe("");
+});
+
+test("assert.eqDyn memo row: period-match, 2-vs-2 (EQUAL family) — deepStrictEqual passes silently, no render", async () => {
+  const path = await build("memo-period-match.cjs", [
+    "const assert = require('node:assert');",
+    "const e0 = { x: null }; const e1 = { x: null };",
+    "e0.x = e1; e1.x = e0;",
+    "const f0 = { x: null }; const f1 = { x: null };",
+    "f0.x = f1; f1.x = f0;",
+    "assert.deepStrictEqual(e0, f0);",
+    "console.log('period-match-ok');",
+  ]);
+  const { stdout, stderr } = await runWasm(path);
+  expect(stdout).toBe(["period-match-ok", ""].join("\n"));
+  expect(stderr).toBe("");
+});
+
+test("assert.eqDyn memo row: crossed depth-2 (EQUAL, both orders) and crossed depth-3 (UNEQUAL, both orders) — the SAME y/b/a/c chain S056 measures", async () => {
+  const path = await build("memo-crossed.cjs", [
+    "const assert = require('node:assert');",
+    "const y = { x: null }; y.x = y;",
+    "const b = { x: y };",
+    "const a = { x: b };",
+    "const c = { x: a };",
+    "assert.deepStrictEqual(a, b);",
+    "console.log('crossed-d2-a-vs-b-ok');",
+    "assert.deepStrictEqual(b, a);",
+    "console.log('crossed-d2-b-vs-a-ok');",
+    "assert.notDeepStrictEqual(c, a);",
+    "console.log('crossed-d3-c-vs-a-ok');",
+    "assert.notDeepStrictEqual(a, c);",
+    "console.log('crossed-d3-a-vs-c-ok');",
+  ]);
+  const { stdout, stderr } = await runWasm(path);
+  expect(stdout).toBe(
+    [
+      "crossed-d2-a-vs-b-ok",
+      "crossed-d2-b-vs-a-ok",
+      "crossed-d3-c-vs-a-ok",
+      "crossed-d3-a-vs-c-ok",
+      "",
+    ].join("\n"),
+  );
+  expect(stderr).toBe("");
+});
+
+test("assert.eqDyn memo row: SIBLING shape B, both orders (UNEQUAL family) — an earlier sibling's OWN nesting promotes the set (no primer needed: this tier's memo runs unconditionally, SEMANTICS.md S056)", async () => {
+  const path = await build("memo-sib-b.cjs", [
+    "const assert = require('node:assert');",
+    "const leafW = { p: null, q: null }; const deepW = { p: leafW, q: null };",
+    "const w = { p: deepW, q: null }; w.q = w;",
+    "const leafTb = { p: null, q: null }; const deepTb = { p: leafTb, q: null };",
+    "const tb = { p: deepTb, q: w };",
+    "const leafTa = { p: null, q: null }; const deepTa = { p: leafTa, q: null };",
+    "const ta = { p: deepTa, q: tb };",
+    "assert.notDeepStrictEqual(ta, tb);",
+    "console.log('sibling-B-a-vs-b-ok');",
+    "assert.notDeepStrictEqual(tb, ta);",
+    "console.log('sibling-B-b-vs-a-ok');",
+  ]);
+  const { stdout, stderr } = await runWasm(path);
+  expect(stdout).toBe(["sibling-B-a-vs-b-ok", "sibling-B-b-vs-a-ok", ""].join("\n"));
+  expect(stderr).toBe("");
+});
+
+test("assert.eqDyn memo row: non-promoting SIBLING shape A (EQUAL family) — sibling 1 stays shallow, never promotes", async () => {
+  const path = await build("memo-sib-a.cjs", [
+    "const assert = require('node:assert');",
+    "const leaf1 = { p: null, q: null };",
+    "const w = { p: leaf1, q: null }; w.q = w;",
+    "const leaf2 = { p: null, q: null };",
+    "const tb = { p: leaf2, q: w };",
+    "const leaf3 = { p: null, q: null };",
+    "const ta = { p: leaf3, q: tb };",
+    "assert.deepStrictEqual(ta, tb);",
+    "console.log('non-promoting-sibling-ok');",
+  ]);
+  const { stdout, stderr } = await runWasm(path);
+  expect(stdout).toBe(["non-promoting-sibling-ok", ""].join("\n"));
   expect(stderr).toBe("");
 });
 

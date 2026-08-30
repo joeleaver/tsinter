@@ -10,7 +10,7 @@
  * the stacked `+ actual - expected` diff above it — including the `^`
  * first-difference indicator for string pairs — and the inline-vs-block
  * split of the not-equal operators (single-line inspect over 5 chars goes
- * on its own block). One deliberate divergence (SEMANTICS.md 103): Node
+ * on its own block). One deliberate divergence (SEMANTICS.md S059): Node
  * renders a COLORED character diff for string pairs when stderr is a
  * color TTY; this runtime always emits the plain stacked form (the
  * message text itself would be terminal-dependent in Node).

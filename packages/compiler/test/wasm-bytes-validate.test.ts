@@ -374,6 +374,13 @@ test("dyn.ts/json.ts/inspect.ts: every function with a BYTES arm emits a VALID m
     c.i32Const(0);
     return c.bytes();
   })());
+  // Unused: this harness never reaches printMyersDiff — identity stub.
+  const strTrimEndFn = mb.declareFunc(mb.funcType([strRef], [strRef]), "%stub.strTrimEnd");
+  mb.setBody(strTrimEndFn, [], (() => {
+    const c = new Code();
+    c.localGet(0);
+    return c.bytes();
+  })());
   const strIndexOfFn = mb.declareFunc(mb.funcType([strRef, strRef, F64], [F64]), "%stub.strIndexOf");
   mb.setBody(strIndexOfFn, [], (() => {
     const c = new Code();
@@ -558,6 +565,11 @@ test("dyn.ts/json.ts/inspect.ts: every function with a BYTES arm emits a VALID m
     // the renderer's own entry-sort arm, so the WRONG comparator
     // semantics (equality, not a -1/0/1 order) are never observed.
     strCmpU16: () => strEqFn,
+    strTrimEnd: () => strTrimEndFn,
+    // Unused: this harness never reaches cfValue's cycle-trap arm.
+    namedTrap: () => {
+      throw new Error("harness does not build cfValue's cycle trap");
+    },
   });
 
   // Every dyn.ts function whose BYTES arm this increment added, plus
