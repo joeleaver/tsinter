@@ -274,12 +274,19 @@ async function buildHandleJsvalTrap(kind: number): Promise<string> {
     strMatchAt: () => strMatchAtFn,
     bytesRefU8: () => strRef,
     bytesTypeU8: () => strType,
+    bytesEquals: () => strEqFn,
     bytesLen: () => noopFn,
     bytesGet: () => noopFn,
     bytesSet: () => noopFn,
     bytesToStrUtf8: () => noopFn,
     jsToNumber: () => noopFn,
     jsonQuoteStr: () => json.quoteStr(),
+    // Increment 23 P2a's own DynDeps additions — specificType()'s
+    // HANDLE/JSVAL arm never reaches sameValueDyn/deepEqDyn, so only the
+    // SHAPE needs to satisfy DynDeps, matching every other dep here.
+    sameValueF64: () => noopFn,
+    deqEnter: () => noopFn,
+    deqLeave: () => noopFn,
   });
   json = new JsonBuilder(mb, {
     strRef: () => strRef,

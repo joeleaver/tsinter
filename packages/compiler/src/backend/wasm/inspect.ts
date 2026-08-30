@@ -120,7 +120,10 @@ import {
   DYN_KIND,
   DYN_NUM,
   DYN_REF,
+  ENTRY_KEY,
+  ENTRY_VALUE,
   FN_NAME,
+  OBJ_ENTRIES,
   OBJ_LEN,
   OBJ_NULL_PROTO,
   type DynBuilder,
@@ -140,6 +143,29 @@ const MAX_ARRAY_LENGTH = 100;
  * 929 and 1421 levels; 1000 sits inside that band and matches the two
  * other capped walks (S013's parser, S026's stringifier). */
 const MAX_DYN_DEPTH = 1000;
+
+/** `assertion_error.js`'s own `depth: 1000` OPTION (increment 23 P2a,
+ * design-p2.txt A.1) — cfValue's elision threshold, ported FAITHFULLY as
+ * `rt > 1000` (Node's `recurseTimes > ctx.depth`). Deliberately a
+ * SEPARATE constant from `MAX_DYN_DEPTH` even though both are 1000
+ * today: that one is this tier's OWN substitute for Node's unbounded,
+ * stack-dependent crash point (S029 — a divergence chosen to land near
+ * Node's observed 929-2450 range), while this one is a literal port of
+ * a real Node OPTION VALUE — the two numbers coincide by accident, not
+ * because they mean the same thing, and must not be merged into one
+ * constant on the strength of that coincidence. OWN RE-MEASUREMENT
+ * (own probe, scratchpad/inc23/impl-p2a/renderer-depth.mjs): on THIS
+ * Node build, `inspect(nestObj(1000, leaf), { depth: 1000, ...
+ * assertion_error's other options })` already hits Node's own V8
+ * stack-exhaustion safety net (the SAME phenomenon S029 documents for
+ * the OTHER walker) before ever reaching the `rt > 1000` boundary this
+ * option would otherwise draw — so the four elision forms below are, on
+ * this measured Node, unreachable via ordinary nesting. The threshold
+ * is implemented anyway, faithfully, because the OPTION is real (S029's
+ * own reasoning: reproduce the mechanism Node documents, not the exact
+ * unreproducible crash point) — see the pending P2a S-entry (drafted in
+ * plan.txt, filed at freeze) for the full account. */
+const ASSERT_RENDER_DEPTH_OPTION = 1000;
 
 /** Node's `handleMaxCallStackSize` text, whose `constructorName` is the
  * composite's own — `Object`, `Array`, or (Node's own doubled-bracket
@@ -203,12 +229,20 @@ export interface InspectDeps {
   bytesRefU8: () => ValType;
   bytesLen: () => number;
   bytesGet: () => number;
+  /** `%w.strCmpU16(a,b) -> -1|0|1` — Array.prototype.sort's default
+   * comparator over strings (UTF-16 code-unit lexicographic order), the
+   * SAME helper the frontend's own `.sort()` lowering and the OBJ-key
+   * width-widening walk already use (increment 23 P2a, design-p2.txt
+   * A.4: the assert renderer's entry sort is this, not a byte compare —
+   * S002 stores UTF-16 code units, so no special case is needed). */
+  strCmpU16: () => number;
 }
 
 export class InspectBuilder {
   private bufG: number | null = null;
   private lenG: number | null = null;
   private indentG: number | null = null;
+  private cfEntryStrArrType: number | null = null;
   private readonly fns = new Map<string, number>();
 
   constructor(
@@ -3839,6 +3873,605 @@ export class InspectBuilder {
       c.localGet(DEPTH);
       c.call(this.dyn());
       this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** The scratch array type for the OBJ arm's entry sort (A.4) — a plain
+   * `array (mut ref null $str)`, allocated fresh per rendered object,
+   * holding each entry's ALREADY-FORMATTED text (`key + ": " + value`)
+   * before `%w.strCmpU16` sorts it into Node's own full-ENTRY-TEXT
+   * UTF-16 order — NOT a key-only sort (A.4's own ndse-51 measurement:
+   * the value participates, because the comparator sees the whole
+   * rendered line, colon and all). */
+  private cfEntryStrArr(): number {
+    this.cfEntryStrArrType ??= this.mb.arrayType(this.deps.strRef(), true);
+    return this.cfEntryStrArrType;
+  }
+
+  /** `%w.assert.cfValue(d, indent, rt) -> void` — increment 23 P2a's
+   * dedicated recursive printer for `assert.eqDyn`'s failure message
+   * (design-p2.txt A.1-A.6). Deliberately NOT inspect.ts's own layout
+   * engine (`begin`/`entry`/`moreItems`/`end`, the frame stack, the
+   * `<ref *N>` protocol): under assertion_error.js's `compact: false`,
+   * `reduceToSingleString` collapses to a five-line layout rule with
+   * BOTH grouping and single-lining dead, so threading that mode
+   * through the shared layout engine would add a live branch to every
+   * OTHER call site (console.log, `%o`/`%O`) for a mechanism only this
+   * caller needs — design-p2.txt A.0's own verdict. What IS reused,
+   * unchanged: `pushMark`/`ibPutc`/`ibPuts`/`ibSpaces`/`ibTake`/
+   * `indentGlobal` (the append-buffer leaf pieces), `%w.insp.str` (the
+   * string arm, INCLUDING its 10000-cap and multi-line split),
+   * `%w.insp.key` (the key ladder), and `%w.strCmpU16` (the entry
+   * sort comparator). `indent` is the column this value's OWN
+   * continuation lines start at; `rt` is Node's own `recurseTimes`, 0
+   * at the top level — the two move together in THIS design but are
+   * not interchangeable (A.1: the `insp.str` handoff needs `indent`,
+   * the elision gate needs `rt`).
+   *
+   * CYCLES — A SCOPED-DOWN DECISION FROM A.6's OWN RECOMMENDATION
+   * (flagged at freeze, not silently taken): design-p2.txt A.6
+   * recommends a dedicated SEEN STACK with a NAMED TRAP on re-entering
+   * a value already being rendered, distinct from ordinary depth
+   * elision — reach is "zero in the six" either way, since `eqDyn`
+   * itself still refuses by name through the whole of P2 (H-2's
+   * split: P2b, not P2a, wires the libCall), so NO compiled program
+   * can reach this renderer AT ALL yet, cyclic or not. This pass
+   * builds the cheaper property instead: RT alone is already a hard
+   * bound on recursion (every ARR/OBJ arm increments it before
+   * recursing, and the elision gate below fires by RT > 1000
+   * regardless of WHY the nesting is that deep), so a genuine cycle
+   * degrades to the SAME `[Object]`/`[Array]` elision text an
+   * ordinary very-deep-but-finite structure would get, rather than a
+   * distinct named trap — no crash, no wrong-but-silent divergence
+   * from the elision path's own already-registered behavior, just a
+   * COARSER signal than A.6's own ideal. The dedicated seen-stack
+   * (a growable dyn-ref vector, push on ARR/OBJ entry, pop on every
+   * exit — B.4's OWN discipline, one level up) is real, understood,
+   * and deferred to whenever `eqDyn` actually becomes reachable (P2b
+   * or later), where a cycle first becomes an observable shape rather
+   * than a hypothetical one. */
+  cfValue(): number {
+    const dyn = this.deps.dyn();
+    return this.cached("cfValue", [dyn.dynRef(), I32, I32], [], (idx) => {
+      const dynT = dyn.dynT();
+      const strRefT = this.deps.strRef();
+      const entriesRefT: ValType = { kind: "ref", nullable: true, typeIndex: dyn.entriesArrayType() };
+      const strArrRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.cfEntryStrArr() };
+      const D = 0;
+      const INDENT = 1;
+      const RT = 2;
+      const K = 3;
+      const FNAME = 4;
+      const BREF = 5;
+      const ISBUF = 6;
+      const BLEN = 7;
+      const BI = 8;
+      const AVEC = 9;
+      const ALEN = 10;
+      const AI = 11;
+      const OP = 12;
+      const ONULLP = 13;
+      const OLEN = 14;
+      const OENTRIES = 15;
+      const OI = 16;
+      const OENTRY = 17;
+      const OMARK = 18;
+      const OSTRARR = 19;
+      const SJ = 20;
+      const SIDX = 21;
+      const STMP = 22;
+      const c = new Code();
+      const putLit = (s: string): void => {
+        this.deps.lit(c, s);
+        c.call(this.ibPuts());
+      };
+      const putc = (ch: string): void => {
+        c.i32Const(ch.charCodeAt(0));
+        c.call(this.ibPutc());
+      };
+      const spaces = (pushN: () => void): void => {
+        pushN();
+        c.call(this.ibSpaces());
+      };
+
+      c.localGet(D);
+      c.structGet(dynT, DYN_KIND);
+      c.localSet(K);
+
+      // UNDEF, NULL
+      c.localGet(K);
+      c.i32Const(DK.UNDEF);
+      c.i32Eq();
+      c.ifVoid();
+      putLit("undefined");
+      c.return_();
+      c.end();
+      c.localGet(K);
+      c.i32Const(DK.NULL);
+      c.i32Eq();
+      c.ifVoid();
+      putLit("null");
+      c.return_();
+      c.end();
+
+      // BOOL — the shared num slot, exact (0/1).
+      c.localGet(K);
+      c.i32Const(DK.BOOL);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(D);
+      c.structGet(dynT, DYN_NUM);
+      c.f64Const(0);
+      c.f64Ne();
+      c.ifVoid();
+      putLit("true");
+      c.else_();
+      putLit("false");
+      c.end();
+      c.return_();
+      c.end();
+
+      // NUM — Number::toString via the shared %w.inspF64 (the -0 exception
+      // included; numericSeparator is false so no grouping ever applies).
+      c.localGet(K);
+      c.i32Const(DK.NUM);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(D);
+      c.structGet(dynT, DYN_NUM);
+      c.call(this.deps.inspF64());
+      c.call(this.ibPuts());
+      c.return_();
+      c.end();
+
+      // STR — A.3's handoff: set indentGlobal to THIS value's own indent
+      // before calling insp.str, which reads it for both the 10000-cap-
+      // independent split gate and the continuation indent.
+      c.localGet(K);
+      c.i32Const(DK.STR);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(INDENT);
+      c.globalSet(this.indentGlobal());
+      c.localGet(D);
+      c.structGet(dynT, DYN_REF);
+      c.refCast(this.deps.strType());
+      c.call(this.str());
+      c.call(this.ibPuts());
+      c.return_();
+      c.end();
+
+      // FUNC — name = fnPayload(d).FN_NAME; NEVER renders own properties
+      // (dyn.defineProps is P4/board #98 — on THIS backend the slot is
+      // ABSENT rather than always-null, so "[Function: name]" is exact
+      // here where Node's own-property form would not be).
+      c.localGet(K);
+      c.i32Const(DK.FUNC);
+      c.i32Eq();
+      c.ifVoid();
+      dyn.fnPayload(c, (x) => x.localGet(D));
+      c.structGet(dyn.fnT(), FN_NAME);
+      c.localSet(FNAME);
+      c.localGet(FNAME);
+      c.refIsNull();
+      c.ifVoid();
+      putLit("[Function (anonymous)]");
+      c.return_();
+      c.end();
+      c.localGet(FNAME);
+      c.arrayLen();
+      c.i32Eqz();
+      c.ifVoid();
+      putLit("[Function (anonymous)]");
+      c.return_();
+      c.end();
+      putLit("[Function: ");
+      c.localGet(FNAME);
+      c.call(this.ibPuts());
+      putLit("]");
+      c.return_();
+      c.end();
+
+      // BYTES — the isBuffer prototype gate, then content (A.2). EMPTY
+      // is checked before the depth gate (matching ARR's own MEASURED
+      // order — emptyarr1001 "a: []" — generalized here to BYTES/OBJ by
+      // structural analogy, since real Node cannot reach rt=1001 via
+      // ordinary nesting on this build to re-confirm it directly; see
+      // ASSERT_RENDER_DEPTH_OPTION's own comment).
+      c.localGet(K);
+      c.i32Const(DK.BYTES);
+      c.i32Eq();
+      c.ifVoid();
+      dyn.bytesPayloadBytes(c, (x) => x.localGet(D));
+      c.localSet(BREF);
+      dyn.bytesPayload(c, (x) => x.localGet(D));
+      c.structGet(dyn.bytesPayloadT(), BYTES_PAYLOAD_IS_BUFFER);
+      c.localSet(ISBUF);
+      c.localGet(BREF);
+      c.call(this.deps.bytesLen());
+      c.i32TruncF64S();
+      c.localSet(BLEN);
+      c.localGet(BLEN);
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(ISBUF);
+      c.ifVoid();
+      putLit("Buffer(0) [Uint8Array] []");
+      c.else_();
+      putLit("Uint8Array(0) []");
+      c.end();
+      c.return_();
+      c.end();
+      c.localGet(RT);
+      c.i32Const(ASSERT_RENDER_DEPTH_OPTION);
+      c.i32GtS();
+      c.ifVoid();
+      c.localGet(ISBUF);
+      c.ifVoid();
+      putLit("[Buffer]");
+      c.else_();
+      putLit("[Uint8Array]");
+      c.end();
+      c.return_();
+      c.end();
+      c.localGet(ISBUF);
+      c.ifVoid();
+      putLit("Buffer(");
+      c.else_();
+      putLit("Uint8Array(");
+      c.end();
+      c.localGet(BLEN);
+      c.f64ConvertI32S();
+      c.call(this.deps.inspF64());
+      c.call(this.ibPuts());
+      putLit(")");
+      c.localGet(ISBUF);
+      c.ifVoid();
+      putLit(" [Uint8Array]");
+      c.end();
+      putLit(" [");
+      c.i32Const(0);
+      c.localSet(BI);
+      c.block();
+      c.loop();
+      c.localGet(BI);
+      c.localGet(BLEN);
+      c.i32GeS();
+      c.brIf(1);
+      putc("\n");
+      spaces(() => {
+        c.localGet(INDENT);
+        c.i32Const(2);
+        c.i32Add();
+      });
+      c.localGet(BREF);
+      c.localGet(BI);
+      c.f64ConvertI32S();
+      c.call(this.deps.bytesGet());
+      c.call(this.deps.inspF64());
+      c.call(this.ibPuts());
+      c.localGet(BI);
+      c.i32Const(1);
+      c.i32Add();
+      c.localGet(BLEN);
+      c.i32Ne();
+      c.ifVoid();
+      putc(",");
+      c.end();
+      c.localGet(BI);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(BI);
+      c.br(0);
+      c.end();
+      c.end();
+      putc("\n");
+      spaces(() => c.localGet(INDENT));
+      putc("]");
+      c.return_();
+      c.end();
+
+      // ARR — empty checked before the depth gate (MEASURED, A.2).
+      c.localGet(K);
+      c.i32Const(DK.ARR);
+      c.i32Eq();
+      c.ifVoid();
+      dyn.arrPayload(c, (x) => x.localGet(D));
+      c.localSet(AVEC);
+      dyn.arrLen(c, (x) => x.localGet(AVEC));
+      c.localSet(ALEN);
+      c.localGet(ALEN);
+      c.i32Eqz();
+      c.ifVoid();
+      putLit("[]");
+      c.return_();
+      c.end();
+      c.localGet(RT);
+      c.i32Const(ASSERT_RENDER_DEPTH_OPTION);
+      c.i32GtS();
+      c.ifVoid();
+      putLit("[Array]");
+      c.return_();
+      c.end();
+      putc("[");
+      c.i32Const(0);
+      c.localSet(AI);
+      c.block();
+      c.loop();
+      c.localGet(AI);
+      c.localGet(ALEN);
+      c.i32GeS();
+      c.brIf(1);
+      putc("\n");
+      spaces(() => {
+        c.localGet(INDENT);
+        c.i32Const(2);
+        c.i32Add();
+      });
+      dyn.arrAt(c, (x) => x.localGet(AVEC), (x) => x.localGet(AI));
+      c.localGet(INDENT);
+      c.i32Const(2);
+      c.i32Add();
+      c.localGet(RT);
+      c.i32Const(1);
+      c.i32Add();
+      c.call(this.cfValue());
+      c.localGet(AI);
+      c.i32Const(1);
+      c.i32Add();
+      c.localGet(ALEN);
+      c.i32Ne();
+      c.ifVoid();
+      putc(",");
+      c.end();
+      c.localGet(AI);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(AI);
+      c.br(0);
+      c.end();
+      c.end();
+      putc("\n");
+      spaces(() => c.localGet(INDENT));
+      putc("]");
+      c.return_();
+      c.end();
+
+      // OBJ — empty and null-proto forms, then the depth gate, then
+      // entries (A.4's sort). Every entry's TEXT (key + ": " + value) is
+      // rendered into its own region and taken BEFORE the sort — the
+      // sort compares full lines, not keys (A.4's own ndse-51 proof).
+      c.localGet(K);
+      c.i32Const(DK.OBJ);
+      c.i32Eq();
+      c.ifVoid();
+      dyn.objPayload(c, (x) => x.localGet(D));
+      c.localSet(OP);
+      c.localGet(OP);
+      c.structGet(dyn.objT(), OBJ_NULL_PROTO);
+      c.localSet(ONULLP);
+      c.localGet(OP);
+      c.structGet(dyn.objT(), OBJ_LEN);
+      c.localSet(OLEN);
+      c.localGet(OLEN);
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(ONULLP);
+      c.ifVoid();
+      putLit("[Object: null prototype] {}");
+      c.else_();
+      putLit("{}");
+      c.end();
+      c.return_();
+      c.end();
+      c.localGet(RT);
+      c.i32Const(ASSERT_RENDER_DEPTH_OPTION);
+      c.i32GtS();
+      c.ifVoid();
+      c.localGet(ONULLP);
+      c.ifVoid();
+      putLit("[Object: null prototype]");
+      c.else_();
+      putLit("[Object]");
+      c.end();
+      c.return_();
+      c.end();
+      c.localGet(OP);
+      c.structGet(dyn.objT(), OBJ_ENTRIES);
+      c.localSet(OENTRIES);
+      c.localGet(OLEN);
+      c.arrayNewDefault(this.cfEntryStrArr());
+      c.localSet(OSTRARR);
+      // Build each entry's TEXT (key + ": " + value) into its own
+      // region and take it — the sort below compares these full lines,
+      // not keys alone (A.4's own ndse-51 proof: the VALUE participates
+      // because the comparator sees the whole rendered line).
+      c.i32Const(0);
+      c.localSet(OI);
+      c.block();
+      c.loop();
+      c.localGet(OI);
+      c.localGet(OLEN);
+      c.i32GeS();
+      c.brIf(1);
+      this.pushMark(c);
+      c.localSet(OMARK);
+      c.localGet(OENTRIES);
+      c.localGet(OI);
+      c.arrayGet(dyn.entriesArrayType());
+      c.localSet(OENTRY);
+      c.localGet(OENTRY);
+      c.structGet(dyn.entryT(), ENTRY_KEY);
+      c.call(this.key());
+      c.call(this.ibPuts());
+      putLit(": ");
+      c.localGet(OENTRY);
+      c.structGet(dyn.entryT(), ENTRY_VALUE);
+      c.localGet(INDENT);
+      c.i32Const(2);
+      c.i32Add();
+      c.localGet(RT);
+      c.i32Const(1);
+      c.i32Add();
+      c.call(this.cfValue());
+      c.localGet(OMARK);
+      c.call(this.ibTake());
+      c.localSet(STMP);
+      c.localGet(OSTRARR);
+      c.localGet(OI);
+      c.localGet(STMP);
+      c.arraySet(this.cfEntryStrArr());
+      c.localGet(OI);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(OI);
+      c.br(0);
+      c.end();
+      c.end();
+      // Insertion sort over OSTRARR[0..OLEN) by %w.strCmpU16 — stability
+      // is unreachable (two entries can only tie if their full rendered
+      // texts are equal, which needs two equal keys), so any
+      // deterministic sort is correct and this is the smallest one
+      // (A.4's own recommendation).
+      c.i32Const(1);
+      c.localSet(SJ);
+      c.block();
+      c.loop();
+      c.localGet(SJ);
+      c.localGet(OLEN);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(OSTRARR);
+      c.localGet(SJ);
+      c.arrayGet(this.cfEntryStrArr());
+      c.localSet(STMP);
+      c.localGet(SJ);
+      c.i32Const(1);
+      c.i32Sub();
+      c.localSet(SIDX);
+      c.block();
+      c.loop();
+      c.localGet(SIDX);
+      c.i32Const(0);
+      c.i32LtS();
+      c.brIf(1);
+      c.localGet(OSTRARR);
+      c.localGet(SIDX);
+      c.arrayGet(this.cfEntryStrArr());
+      c.localGet(STMP);
+      c.call(this.deps.strCmpU16());
+      c.i32Const(0);
+      c.i32LeS();
+      c.brIf(1);
+      c.localGet(OSTRARR);
+      c.localGet(SIDX);
+      c.i32Const(1);
+      c.i32Add();
+      c.localGet(OSTRARR);
+      c.localGet(SIDX);
+      c.arrayGet(this.cfEntryStrArr());
+      c.arraySet(this.cfEntryStrArr());
+      c.localGet(SIDX);
+      c.i32Const(1);
+      c.i32Sub();
+      c.localSet(SIDX);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(OSTRARR);
+      c.localGet(SIDX);
+      c.i32Const(1);
+      c.i32Add();
+      c.localGet(STMP);
+      c.arraySet(this.cfEntryStrArr());
+      c.localGet(SJ);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(SJ);
+      c.br(0);
+      c.end();
+      c.end();
+      // Emit: the null-proto prefix, the braces, and every SORTED entry.
+      c.localGet(ONULLP);
+      c.ifVoid();
+      putLit("[Object: null prototype] ");
+      c.end();
+      putc("{");
+      c.i32Const(0);
+      c.localSet(OI);
+      c.block();
+      c.loop();
+      c.localGet(OI);
+      c.localGet(OLEN);
+      c.i32GeS();
+      c.brIf(1);
+      putc("\n");
+      spaces(() => {
+        c.localGet(INDENT);
+        c.i32Const(2);
+        c.i32Add();
+      });
+      c.localGet(OSTRARR);
+      c.localGet(OI);
+      c.arrayGet(this.cfEntryStrArr());
+      c.call(this.ibPuts());
+      c.localGet(OI);
+      c.i32Const(1);
+      c.i32Add();
+      c.localGet(OLEN);
+      c.i32Ne();
+      c.ifVoid();
+      putc(",");
+      c.end();
+      c.localGet(OI);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(OI);
+      c.br(0);
+      c.end();
+      c.end();
+      putc("\n");
+      spaces(() => c.localGet(INDENT));
+      putc("}");
+      c.return_();
+      c.end();
+
+      // Exhaustive over DK's 12 kinds; every arm above returns. The
+      // remaining three (HANDLE, PROMISE, JSVAL) trap — A.5's own
+      // recommendation, a BARE unreachable with no placeholder: none is
+      // constructible on this tier reaching this call (JSVAL never,
+      // 0.1; HANDLE has no producer; PROMISE's producer cannot reach
+      // eqDyn — none of the six does), and a knowingly-wrong placeholder
+      // string would need an S-entry to authorize a divergence that buys
+      // no claim, which A.5 explicitly rejects porting C's forms for.
+      c.unreachable();
+
+      this.mb.setBody(
+        idx,
+        [I32, strRefT, this.deps.bytesRefU8(), I32, I32, I32, dyn.arrRef(), I32, I32, dyn.objRef(), I32, I32, entriesRefT, I32, dyn.entryRef(), I32, strArrRefT, I32, I32, strRefT],
+        c.bytes(),
+      );
+    });
+  }
+
+  /** `%w.assert.cfInspect(d) -> strref` — A.1's entry point: mark, render
+   * from the top (`indent`/`rt` both 0), take. The whole of `assert.
+   * eqDyn`'s failure-message renderer funnels through this one call. */
+  cfInspect(): number {
+    const dyn = this.deps.dyn();
+    return this.cached("cfInspect", [dyn.dynRef()], [this.deps.strRef()], (idx) => {
+      const c = new Code();
+      const D = 0;
+      const MARK = 1;
+      this.pushMark(c);
+      c.localSet(MARK);
+      c.localGet(D);
+      c.i32Const(0);
+      c.i32Const(0);
+      c.call(this.cfValue());
+      c.localGet(MARK);
+      c.call(this.ibTake());
+      this.mb.setBody(idx, [I32], c.bytes());
     });
   }
 }

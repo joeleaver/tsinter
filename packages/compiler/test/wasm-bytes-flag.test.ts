@@ -103,6 +103,16 @@ async function buildHarness(
 
   const toInt32Fn = stub([F64], [I32], "%stub.toInt32");
   const strSliceFn = stub([strRef, F64, F64], [strRef], "%stub.strSlice");
+  // Increment 23 P2a's own DynDeps additions — this BYTES-only driver
+  // never reaches sameValueDyn/deepEqDyn, so only the SHAPE needs to
+  // satisfy DynDeps. EQ_HEAP (-0x13) directly for deqEnter/deqLeave's
+  // params: their REAL signature is `eq`-typed (dyn.ts's own header
+  // note), not the concrete dyn struct — avoids needing `dyn` to exist
+  // yet at this point in construction.
+  const EQ_REF_STUB: ValType = { kind: "ref", nullable: true, typeIndex: -0x13 };
+  const sameValueF64Fn = stub([F64, F64], [I32], "%stub.sameValueF64");
+  const deqEnterFn = stub([EQ_REF_STUB, EQ_REF_STUB], [F64], "%stub.deqEnter");
+  const deqLeaveFn = stub([], [], "%stub.deqLeave");
   // REAL, not a stub: toStr's comma-join branch (the isBuffer=false half,
   // already exercised by real corpus programs) genuinely calls this at
   // runtime, unlike the deps below that only need to resolve to SOME
@@ -215,12 +225,16 @@ async function buildHarness(
     strMatchAt: () => strMatchAtFn,
     bytesRefU8: () => bytesB.bytesRef(),
     bytesTypeU8: () => bytesB.bytesType(),
+    bytesEquals: () => bytesB.equalsHelper(),
     bytesLen: () => bytesB.length(),
     bytesGet: () => bytesB.get("u8"),
     bytesSet: () => bytesB.setElem("u8"),
     bytesToStrUtf8: () => bytesB.toStrHelper("utf8"),
     jsToNumber: jsToNumberFn,
     jsonQuoteStr: () => json.quoteStr(),
+    sameValueF64: () => sameValueF64Fn,
+    deqEnter: () => deqEnterFn,
+    deqLeave: () => deqLeaveFn,
   });
 
   json = new JsonBuilder(mb, {
@@ -266,6 +280,7 @@ async function buildHarness(
     bytesRefU8: () => bytesB.bytesRef(),
     bytesLen: () => bytesB.length(),
     bytesGet: () => bytesB.get("u8"),
+    strCmpU16: () => stub([strRef, strRef], [I32], "%stub.strCmpU16"),
   });
 
   const simple = (name: string, params: ValType[], results: ValType[], body: (c: Code) => void): void => {

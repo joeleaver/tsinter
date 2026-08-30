@@ -3755,3 +3755,164 @@ design. Nothing
 pins the fresh-Node column — it is Node's own pre-overflow behavior,
 unreachable by a deterministic port by construction; `lead-probe/
 table.mjs` and `rev/probe/witness.mjs` are the record.
+
+## S057 — `assert.eqDyn`'s renderer implements a real `depth: 1000` elision option whose boundary real Node cannot reach via ordinary nesting AT THE DEFAULT STACK SIZE *(wasm tier)*
+
+`assert.eqDyn`'s failure-message renderer (`%w.insp.cfValue`,
+`inspect.ts`, increment 23 P2a) elides a composite past 1000 levels of
+`recurseTimes` (`rt`), rendering `[Object]` / `[Array]` / `[Uint8Array]`
+/ `[Object: null prototype]` in place of its content instead of
+recursing further. This is a literal, faithful port of a REAL Node
+option — lifted VERBATIM this pass via `process.binding("natives")
+["internal/assert/assertion_error"]` (14267 bytes, sha256
+`41ebb0538f7707b1…`, since the earlier design-doc citation did not
+survive a scratchpad purge), `inspectValue`'s own option block at
+that source's line 78:
+
+    { compact: false, customInspect: false, depth: 1000,
+      maxArrayLength: Infinity, showHidden: false, showProxy: false,
+      sorted: true, getters: true }
+
+`depth: 1000` is `inspectValue`'s own `recurseTimes > ctx.depth` gate.
+The wasm arm implements this gate exactly as `rt > 1000`
+(`ASSERT_RENDER_DEPTH_OPTION`, `inspect.ts` — see below for why this is
+a SEPARATE constant from S029's `MAX_DYN_DEPTH`).
+
+**CHAIN CONVENTION** (stated explicitly, per fix round F2-p2a, so this
+entry's numbers and any other record of the same phenomenon reconcile
+by convention rather than by apparent disagreement): `n` counts WRAPPER
+objects placed AROUND a leaf object —
+
+    let o = { leaf: 1 }; for (let i = 0; i < n; i++) o = { a: o };
+
+— so the leaf sits at depth `n`, and `inspect` is called on the
+outermost wrapper. A convention that counts the leaf as one of the `n`
+wrappers reads the identical physical structure ONE HIGHER for the
+same boundary; neither convention is wrong, they merely start counting
+from a different place.
+
+**Node cannot reach this boundary via ordinary nesting AT THE DEFAULT
+V8 STACK SIZE** (own probe, `scratchpad/inc23/impl-p2a/depth-search.
+mjs`, sha256 `600e04d169ef508d…` — the file that actually PERFORMS the
+search below; an earlier citation to `renderer-depth.mjs` was wrong: that
+file is a flat sequence of `inspect` calls in ONE process with no
+binary search and no per-process isolation, and does not contain the
+measurement it was cited for). A clean, ISOLATED binary search — a
+FRESH `node` process per probe point, ONE `inspect` per process, three
+independent launches — converged identically across all three:
+
+    run 1: full at n=928, interrupted at n=929
+    run 2: full at n=928, interrupted at n=929
+    run 3: full at n=928, interrupted at n=929
+
+**n=928 renders in full, n=929 interrupts, reproducibly, on this
+machine.** (This entry previously recorded n=1249/1250 from a search
+that was, on inspection, ALSO run correctly in isolation but whose
+result does not reproduce under re-measurement: direct spot checks at
+n=1248/1249/1250/1251 now all show INTERRUPTED, at the identical
+saturated output length — 1249/1250 was never a boundary, and the
+number this entry once called "cruder and superseded" — n≈928/930 — was
+the one closer to correct. Both the discarded number and this one
+demonstrate the same underlying instability S029 already documents:
+Node's own V8 stack-exhaustion point is not a fixed depth and can shift
+between re-measurements, machines, or even library/runtime versions —
+"there is no fixed depth to state" is S029's own phrase for exactly
+this, at a wider observed spread, 929-2450.) Node hits this stack
+exhaustion BEFORE the `depth: 1000` option's own `rt > 1000` check is
+ever evaluated, at the default stack size — this is the SAME family
+S029 registers for the console.log dyn walker; S029's own resolution
+(a FIXED cap reproducing Node's degradation SHAPE, not its exact
+unreproducible boundary) is the direct precedent for this entry, at a
+different call site with a DIFFERENT marker text (S029's own text is
+Node's stack-overflow-RECOVERY string; this renderer's four forms are
+what Node's OPTION would produce if Node's own implementation could
+reach it) — filed separately rather than amending S029 for that reason.
+
+**AT A RAISED STACK SIZE, NODE REACHES THE REAL GATE CLEANLY — the
+unreachability above is scoped to the DEFAULT stack, not to Node in
+general.** Own probe, same file, `node --stack-size=1200`, ONE PROCESS
+PER ROW:
+
+    n=999   full,   elided=false, leaf present
+    n=1000  full,   elided=false, leaf present
+    n=1001  elided (renders "[Object]"), leaf absent
+    n=1002  elided (renders "[Object]"), leaf absent
+
+This is `depth: 1000`'s own `recurseTimes > ctx.depth` boundary,
+reached exactly where the option says it should be — Node CAN serve as
+a byte-exact oracle for the real threshold, given enough stack; the
+wasm-side pin below exercises exactly this comparison, not merely a
+spec-derived one.
+
+**The FORMS are confirmed genuine, per-process isolated, at the raised
+stack, at the real n=1001 boundary** (own probe, same file): each of
+`[Object]` / `[Array]` / `[Uint8Array]` / `[Object: null prototype]`
+renders correctly when its own shape is inspected ALONE in its own
+process. Isolation matters: running the SAME check sequentially in one
+process (own probe, `sequential-warmup` mode, default stack, three
+back-to-back inspects of the identical n=1000 object shape) gives
+`INTERRUPTED, INTERRUPTED, FULL` — the process's available stack
+changes as it warms up, so a sequential probe's later rows can look
+like they "confirm" elision forms that are really just artifacts of
+call order, not of the shapes. This is exactly the defect the earlier
+citation to `renderer-depth.mjs` had: its rows are internally
+inconsistent for precisely this reason.
+
+**`ASSERT_RENDER_DEPTH_OPTION` vs. S029's `MAX_DYN_DEPTH`:** kept as
+TWO SEPARATE constants (both currently `1000`) rather than one shared
+value. They mean different things: `MAX_DYN_DEPTH` is this tier's OWN
+substitute for Node's unbounded, stack-dependent crash point under
+`depth: null` (a divergence, chosen to land near Node's observed
+range); `ASSERT_RENDER_DEPTH_OPTION` is a literal port of a real
+Node OPTION VALUE that assertion_error.js actually passes. The two
+numbers coincide today by accident, not because the mechanisms are
+the same, and must not be collapsed into one constant on the strength
+of that coincidence — a future change to either walker's own number
+(S029's own cap, chosen to approximate a moving stack-dependent
+target, is the more likely one to ever move) must not silently drag
+the other along.
+
+**Rationale:** reproduce the documented MECHANISM (a real, named
+option every `assert.deepStrictEqual`/`assert.deepEqual` failure
+message already passes to `inspect`) rather than either leaving the
+renderer's recursion unbounded (S013/S026/S029 already establish this
+is unsafe on the wasm stack) or inventing a divergent threshold with
+no basis in Node's own source. At the DEFAULT stack size Node cannot
+be the byte-exact oracle for the real boundary — the divergence this
+entry registers is scoped to that ordinary case, matching how any
+compiled program actually runs `assert`. At a RAISED stack size Node
+reaches the real gate cleanly, so the threshold is verified two ways:
+against Node directly, at the real value, under a raised stack (the
+pin below); and by mutation, which needs no raised stack and runs
+everywhere (F-3's own pattern, kept as a second, independent proof
+that the constant is genuinely read).
+
+**Tested by:** `packages/compiler/test/wasm-assert-dyn.test.ts`'s
+"cfInspect: depth elision fires past rt=1000" pin (spec-derived
+oracle, own construction, run-everywhere) — a WASM-SIDE LOOP (not JS
+recursion, so only the wasm call stack is exercised, never Node's)
+builds a 1002-level object chain around a NUM leaf (NUM never elides
+regardless of depth, so the INNERMOST OBJECT itself must be the one
+evaluated past the boundary) and confirms `[Object]` appears with the
+leaf absent; a 1001-level chain (one wrap fewer) confirms the leaf
+renders in full. THE REAL-BOUNDARY PIN, "cfInspect: real Node boundary
+at a raised stack size" — gated on the OS thread stack limit (SKIPPED
+by name unless comfortably above the chosen `--stack-size`, since
+`--stack-size` above the OS limit crashes the child with SIGSEGV rather
+than raising a catchable error; positive-controlled by running the
+gate itself under a lowered `ulimit -s` and confirming it SKIPS rather
+than segfaults) — spawns `node --stack-size=1200` as the oracle, one
+process per row, asserts the child exited 0 with parseable output
+BEFORE interpreting it, and compares the wasm renderer's own output for
+the identical chain byte-for-byte against Node at n=1001 (elides) and
+n=1002 (elides) against the real threshold, not a mutated one. Own
+hand-verified mutation (F-3's straddle pattern, NOT a standing pin —
+temporarily lowering `ASSERT_RENDER_DEPTH_OPTION` from 1000 to 2 and
+comparing a wasm-built 4-level and 3-level chain against REAL Node's
+`inspect(x, {...options, depth: 2})`, re-run this fix round): both
+matched Node BYTE-FOR-BYTE at the mutated, genuinely reachable
+threshold, confirming the constant is actually READ by the elision
+check (not dead code). Reverted before this entry was filed both
+times; the constant is `1000` in the merged code, and the wasm call
+stack itself is confirmed to survive 1002+ levels of `cfValue`
+recursion without overflowing (the same spec-derived pin, un-mutated).

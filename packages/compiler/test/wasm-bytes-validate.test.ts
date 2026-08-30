@@ -439,6 +439,36 @@ test("dyn.ts/json.ts/inspect.ts: every function with a BYTES arm emits a VALID m
     })());
     return idx;
   };
+  // Increment 23 P2a's own DynDeps additions — trivial structural stubs,
+  // matching every other dep in this file: this test never reaches
+  // sameValueDyn/deepEqDyn, so only the SHAPE needs to satisfy DynDeps.
+  // EQ_HEAP (-0x13) directly, not dyn.dynRef(), for deqEnter/deqLeave's
+  // params: their REAL signature is `eq`-typed (dyn.ts's own header
+  // note), not the concrete dyn struct.
+  const EQ_HEAP_STUB = -0x13;
+  const sameValueF64Fn = mb.declareFunc(mb.funcType([F64, F64], [I32]), "%stub.sameValueF64");
+  mb.setBody(sameValueF64Fn, [], (() => {
+    const c = new Code();
+    c.i32Const(1);
+    return c.bytes();
+  })());
+  const deqEnterFn = mb.declareFunc(
+    mb.funcType(
+      [
+        { kind: "ref", nullable: true, typeIndex: EQ_HEAP_STUB },
+        { kind: "ref", nullable: true, typeIndex: EQ_HEAP_STUB },
+      ],
+      [F64],
+    ),
+    "%stub.deqEnter",
+  );
+  mb.setBody(deqEnterFn, [], (() => {
+    const c = new Code();
+    c.f64Const(0);
+    return c.bytes();
+  })());
+  const deqLeaveFn = mb.declareFunc(mb.funcType([], []), "%stub.deqLeave");
+  mb.setBody(deqLeaveFn, [], new Code().bytes());
   dyn = new DynBuilder(mb, {
     strRef: () => strRef,
     strType: () => strType,
@@ -469,12 +499,16 @@ test("dyn.ts/json.ts/inspect.ts: every function with a BYTES arm emits a VALID m
     strMatchAt: () => strMatchAtFn,
     bytesRefU8: () => bytesB.bytesRef(),
     bytesTypeU8: () => bytesB.bytesType(),
+    bytesEquals: () => bytesB.equalsHelper(),
     bytesLen: () => bytesB.length(),
     bytesGet: () => bytesB.get("u8"),
     bytesSet: () => bytesB.setElem("u8"),
     bytesToStrUtf8: () => bytesB.toStrHelper("utf8"),
     jsToNumber,
     jsonQuoteStr: () => json.quoteStr(),
+    sameValueF64: () => sameValueF64Fn,
+    deqEnter: () => deqEnterFn,
+    deqLeave: () => deqLeaveFn,
   });
 
   json = new JsonBuilder(mb, {
@@ -520,6 +554,10 @@ test("dyn.ts/json.ts/inspect.ts: every function with a BYTES arm emits a VALID m
     bytesRefU8: () => bytesB.bytesRef(),
     bytesLen: () => bytesB.length(),
     bytesGet: () => bytesB.get("u8"),
+    // Right-shaped stub ((strRef,strRef)->i32) — this file never forces
+    // the renderer's own entry-sort arm, so the WRONG comparator
+    // semantics (equality, not a -1/0/1 order) are never observed.
+    strCmpU16: () => strEqFn,
   });
 
   // Every dyn.ts function whose BYTES arm this increment added, plus

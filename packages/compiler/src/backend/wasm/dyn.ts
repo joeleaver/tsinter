@@ -301,6 +301,11 @@ export interface DynDeps {
   bytesRefU8: () => ValType;
   /** The bytes<u8> STRUCT type index (refCast on extraction). */
   bytesTypeU8: () => number;
+  /** %w.bytes.equals — (bytes<u8>, bytes<u8>) → i32, length + content.
+   * Increment 23 P2a's `deepEqDyn`'s own BYTES arm (typedarrays.ts's
+   * existing helper, injected rather than re-derived — the exact same
+   * question `assert.bytesDeepEq`'s content check already answers). */
+  bytesEquals: () => number;
   /** %w.bytes.length:u8 — (bytes<u8>) → f64 element count (== byte count
    * for u8). Reused here rather than re-deriving a BLEN field read, since
    * typedarrays.ts already owns that struct's layout privately. */
@@ -330,6 +335,19 @@ export interface DynDeps {
    * (`(5).toFixed("2")`) is exactly ToNumber's contract, the same
    * conversion the emitter's coercion ops already build. */
   jsToNumber: () => number;
+  /** %w.assert.sameValueF64 — Object.is over f64 (increment 23 P1's own
+   * helper). `sameValueDyn`'s NUM arm routes here rather than through
+   * `strictEq`'s `f64.eq` (0.3: NaN!==NaN and +0===-0 are both wrong for
+   * SameValue). */
+  sameValueF64: () => number;
+  /** %w.assert.deqEnter / deqLeave — increment 23 P1's own cycle memo
+   * (Node's REAL two-rule handleCycles, SEMANTICS.md S056), reused
+   * UNCHANGED for `deepEqDyn`'s ARR/OBJ arms (design-p2.txt B.4: "the
+   * dyn walk wants the IDENTICAL coinductive step" — no second memo).
+   * `$dyn` struct refs are `eq` subtypes (this file's own EQ_HEAP
+   * header note), so they cross this boundary with no cast needed. */
+  deqEnter: () => number;
+  deqLeave: () => number;
 }
 
 export class DynBuilder {
@@ -1484,6 +1502,484 @@ export class DynBuilder {
       c.end();
       c.i32Const(0);
       this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** %w.dyn.isObject(d) → i32 — B.3's shared predicate (increment 23
+   * P2a, design-p2.txt): Node's `actual != null && typeof actual ===
+   * 'object'` over a dyn value. ARR/OBJ/BYTES/PROMISE/HANDLE → true
+   * (Node's real typeof answers "object" for all five); NULL/UNDEF/
+   * BOOL/NUM/STR/FUNC → false — FUNC excluded because typeof is
+   * "function" (own re-measure, matching 1770's own line 22 shape).
+   * Drives both the comma-disparity line rule (P2b) and
+   * checkOperatorMorph below. */
+  isObject(): number {
+    return this.cached("isObject", [this.dynRef()], [I32], (idx) => {
+      const dynT = this.dynT();
+      const c = new Code();
+      const K = 1;
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.localSet(K);
+      c.localGet(K);
+      c.i32Const(DK.ARR);
+      c.i32Eq();
+      c.localGet(K);
+      c.i32Const(DK.OBJ);
+      c.i32Eq();
+      c.i32Or();
+      c.localGet(K);
+      c.i32Const(DK.BYTES);
+      c.i32Eq();
+      c.i32Or();
+      c.localGet(K);
+      c.i32Const(DK.PROMISE);
+      c.i32Eq();
+      c.i32Or();
+      c.localGet(K);
+      c.i32Const(DK.HANDLE);
+      c.i32Eq();
+      c.i32Or();
+      this.mb.setBody(idx, [I32], c.bytes());
+    });
+  }
+
+  /** %w.dyn.checkOperatorMorph(a, b, deep) → i32 — B.5's header morph
+   * (increment 23 P2a), assertion_error.js:92-105 ported: `deep` NEVER
+   * morphs (Node's own gate is `operator === 'strictEqual'`, exactly
+   * the non-deep strictEqual family — own re-measure: deep-fn keeps
+   * the deep header regardless); otherwise morphs when BOTH operands
+   * are dyn-objects (isObject) OR both are FUNC. Own re-measure:
+   * fn-vs-fn morphs (the reference-equal header), fn-vs-obj does not
+   * (the plain header), arr-vs-obj morphs the same as obj-vs-obj. */
+  checkOperatorMorph(): number {
+    return this.cached("checkOperatorMorph", [this.dynRef(), this.dynRef(), I32], [I32], (idx) => {
+      const dynT = this.dynT();
+      const isObj = this.isObject();
+      const c = new Code();
+      const DEEP = 2;
+      c.localGet(DEEP);
+      c.ifVoid();
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      c.localGet(0);
+      c.call(isObj);
+      c.localGet(1);
+      c.call(isObj);
+      c.i32And();
+      c.ifVoid();
+      c.i32Const(1);
+      c.return_();
+      c.end();
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.FUNC);
+      c.i32Eq();
+      c.localGet(1);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.FUNC);
+      c.i32Eq();
+      c.i32And();
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** %w.dyn.sameValueDyn(a, b) → i32 — 0.3/B.1 (increment 23 P2a):
+   * SameValue over dyn values reuses strictEq for every kind EXCEPT
+   * NUM, where strictEq's `f64.eq` gives NaN!==NaN and +0===-0, both
+   * wrong for SameValue — routed instead to the injected sameValueF64
+   * (increment 23 P1's own helper). Do NOT port C's re-implemented
+   * switch (own re-measure, 0.3): its BYTES default arm compares the
+   * BOX, wrong for this tier's aliasing semantics (S014) — reusing
+   * strictEq inherits every already-measured, already-pinned decision
+   * instead (bytes payload aliasing, the FUNC closure identity through
+   * the universal unwrap, board #89, B.1a). */
+  sameValueDyn(): number {
+    return this.cached("sameValueDyn", [this.dynRef(), this.dynRef()], [I32], (idx) => {
+      const dynT = this.dynT();
+      const sameF64 = this.deps.sameValueF64();
+      const strictEqFn = this.strictEq();
+      const c = new Code();
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.NUM);
+      c.i32Eq();
+      c.localGet(1);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.NUM);
+      c.i32Eq();
+      c.i32And();
+      c.ifVoid();
+      c.localGet(0);
+      c.structGet(dynT, DYN_NUM);
+      c.localGet(1);
+      c.structGet(dynT, DYN_NUM);
+      c.call(sameF64);
+      c.return_();
+      c.end();
+      c.localGet(0);
+      c.localGet(1);
+      c.call(strictEqFn);
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** %w.dyn.deepEqDyn(a, b) → i32 — B.2's kind-wise deep walk
+   * (increment 23 P2a), wired to P1's OWN deqEnter/deqLeave cycle memo
+   * for the ARR and OBJ arms (B.4: "the dyn walk wants the IDENTICAL
+   * coinductive step" — no second memo; injected via DynDeps). The
+   * ref.eq fast path is Node's own `val1===val2` (innerDeepEqual's
+   * first line), checked BEFORE the memo is ever consulted, exactly
+   * like the static per-type deepEqHelper's own wrapper. JSVAL is
+   * `unreachable` alongside HANDLE (0.1, dyn.ts:93-108 — no island
+   * fence, no pending check, no placeholder: the ~40 C lines that
+   * exist only to serve JSVAL are simply not ported).
+   * B.4's CAVEAT, honored on every exit of the ARR/OBJ walk: deqEnter
+   * is matched by deqLeave on EVERY path out, not just the final
+   * success return — the length gate, the null-proto gate, the
+   * key-absent gate, and each per-element/per-value mismatch all pop
+   * before returning false; only a genuine WALK verdict (0) reaches
+   * the recursive walk at all, matching the wrapper shape P1's own
+   * deepEqHelper uses for the static composite types. */
+  deepEqDyn(): number {
+    return this.cached("deepEqDyn", [this.dynRef(), this.dynRef()], [I32], (idx) => {
+      const dynT = this.dynT();
+      const fnT = this.fnT();
+      const objT = this.objT();
+      const bytesPayloadT = this.bytesPayloadT();
+      const entryT = this.entryT();
+      const entriesArrT = this.entriesArrayType();
+      const arrRefT = this.arrRef();
+      const objRefT = this.objRef();
+      const entryRefT = this.entryRef();
+      const sameF64 = this.deps.sameValueF64();
+      const strEqFn = this.deps.strEq();
+      const equalsBytes = this.deps.bytesEquals();
+      const deqEnter = this.deps.deqEnter();
+      const deqLeave = this.deps.deqLeave();
+      const objGetFn = this.objGet();
+      const c = new Code();
+      const A = 0;
+      const B = 1;
+      const KA = 2;
+      const KB = 3;
+      const DQ = 4;
+      const ARRA = 5;
+      const ARRB = 6;
+      const AI = 7;
+      const AN = 8;
+      const OBJA = 9;
+      const OBJB = 10;
+      const OI = 11;
+      const ON = 12;
+      const ENTRY = 13;
+      const KEY = 14;
+      const BV = 15;
+
+      // Node's val1===val2, innerDeepEqual's own first line — BEFORE the
+      // memo is ever consulted.
+      c.localGet(A);
+      c.localGet(B);
+      c.refEq();
+      c.ifVoid();
+      c.i32Const(1);
+      c.return_();
+      c.end();
+
+      c.localGet(A);
+      c.structGet(dynT, DYN_KIND);
+      c.localTee(KA);
+      c.localGet(B);
+      c.structGet(dynT, DYN_KIND);
+      c.localTee(KB);
+      c.i32Ne();
+      c.ifVoid();
+      c.i32Const(0);
+      c.return_();
+      c.end();
+
+      // UNDEF, NULL -> 1
+      c.localGet(KA);
+      c.i32Const(DK.UNDEF);
+      c.i32Eq();
+      c.localGet(KA);
+      c.i32Const(DK.NULL);
+      c.i32Eq();
+      c.i32Or();
+      c.ifVoid();
+      c.i32Const(1);
+      c.return_();
+      c.end();
+
+      // BOOL -> the shared num slot, exact (0/1)
+      c.localGet(KA);
+      c.i32Const(DK.BOOL);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(A);
+      c.structGet(dynT, DYN_NUM);
+      c.localGet(B);
+      c.structGet(dynT, DYN_NUM);
+      c.f64Eq();
+      c.return_();
+      c.end();
+
+      // NUM -> SameValue (Object.is: NaN==NaN, +0 != -0)
+      c.localGet(KA);
+      c.i32Const(DK.NUM);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(A);
+      c.structGet(dynT, DYN_NUM);
+      c.localGet(B);
+      c.structGet(dynT, DYN_NUM);
+      c.call(sameF64);
+      c.return_();
+      c.end();
+
+      // STR -> content
+      c.localGet(KA);
+      c.i32Const(DK.STR);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(A);
+      c.structGet(dynT, DYN_REF);
+      c.refCast(this.deps.strType());
+      c.localGet(B);
+      c.structGet(dynT, DYN_REF);
+      c.refCast(this.deps.strType());
+      c.call(strEqFn);
+      c.return_();
+      c.end();
+
+      // FUNC -> FN_CLOS ref.eq (B.1a: the box is a boundary artifact, never the identity)
+      c.localGet(KA);
+      c.i32Const(DK.FUNC);
+      c.i32Eq();
+      c.ifVoid();
+      this.fnPayload(c, (x) => x.localGet(A));
+      c.structGet(fnT, FN_CLOS);
+      this.fnPayload(c, (x) => x.localGet(B));
+      c.structGet(fnT, FN_CLOS);
+      c.refEq();
+      c.return_();
+      c.end();
+
+      // PROMISE -> payload identity (B.6: Node-exact, not an approximation)
+      c.localGet(KA);
+      c.i32Const(DK.PROMISE);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(A);
+      c.structGet(dynT, DYN_REF);
+      c.localGet(B);
+      c.structGet(dynT, DYN_REF);
+      c.refEq();
+      c.return_();
+      c.end();
+
+      // HANDLE, JSVAL -> unconstructible here; trap rather than borrow an answer (A.5/0.1)
+      c.localGet(KA);
+      c.i32Const(DK.HANDLE);
+      c.i32Eq();
+      c.localGet(KA);
+      c.i32Const(DK.JSVAL);
+      c.i32Eq();
+      c.i32Or();
+      c.ifVoid();
+      c.unreachable();
+      c.end();
+
+      // BYTES -> the prototype gate (isBuffer), then content
+      c.localGet(KA);
+      c.i32Const(DK.BYTES);
+      c.i32Eq();
+      c.ifVoid();
+      this.bytesPayload(c, (x) => x.localGet(A));
+      c.structGet(bytesPayloadT, BYTES_PAYLOAD_IS_BUFFER);
+      this.bytesPayload(c, (x) => x.localGet(B));
+      c.structGet(bytesPayloadT, BYTES_PAYLOAD_IS_BUFFER);
+      c.i32Eq();
+      c.ifVoid();
+      this.bytesPayloadBytes(c, (x) => x.localGet(A));
+      this.bytesPayloadBytes(c, (x) => x.localGet(B));
+      c.call(equalsBytes);
+      c.return_();
+      c.end();
+      c.i32Const(0);
+      c.return_();
+      c.end();
+
+      // ARR -> the cycle memo, then length + per-index deepEqDyn
+      c.localGet(KA);
+      c.i32Const(DK.ARR);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(A);
+      c.localGet(B);
+      c.call(deqEnter);
+      c.localSet(DQ);
+      c.localGet(DQ);
+      c.f64Const(1);
+      c.f64Eq();
+      c.ifVoid();
+      c.i32Const(1);
+      c.return_();
+      c.end();
+      c.localGet(DQ);
+      c.f64Const(2);
+      c.f64Eq();
+      c.ifVoid();
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      this.arrPayload(c, (x) => x.localGet(A));
+      c.localSet(ARRA);
+      this.arrPayload(c, (x) => x.localGet(B));
+      c.localSet(ARRB);
+      this.arrLen(c, (x) => x.localGet(ARRA));
+      c.localSet(AN);
+      this.arrLen(c, (x) => x.localGet(ARRB));
+      c.localGet(AN);
+      c.i32Ne();
+      c.ifVoid();
+      c.call(deqLeave);
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      c.i32Const(0);
+      c.localSet(AI);
+      c.block();
+      c.loop();
+      c.localGet(AI);
+      c.localGet(AN);
+      c.i32GeS();
+      c.brIf(1);
+      this.arrAt(c, (x) => x.localGet(ARRA), (x) => x.localGet(AI));
+      this.arrAt(c, (x) => x.localGet(ARRB), (x) => x.localGet(AI));
+      c.call(this.deepEqDyn());
+      c.i32Eqz();
+      c.ifVoid();
+      c.call(deqLeave);
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      c.localGet(AI);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(AI);
+      c.br(0);
+      c.end();
+      c.end();
+      c.call(deqLeave);
+      c.i32Const(1);
+      c.return_();
+      c.end();
+
+      // OBJ -> the cycle memo, the null-proto gate, key-count + a-into-b value walk
+      c.localGet(KA);
+      c.i32Const(DK.OBJ);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(A);
+      c.localGet(B);
+      c.call(deqEnter);
+      c.localSet(DQ);
+      c.localGet(DQ);
+      c.f64Const(1);
+      c.f64Eq();
+      c.ifVoid();
+      c.i32Const(1);
+      c.return_();
+      c.end();
+      c.localGet(DQ);
+      c.f64Const(2);
+      c.f64Eq();
+      c.ifVoid();
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      this.objPayload(c, (x) => x.localGet(A));
+      c.localSet(OBJA);
+      this.objPayload(c, (x) => x.localGet(B));
+      c.localSet(OBJB);
+      c.localGet(OBJA);
+      c.structGet(objT, OBJ_NULL_PROTO);
+      c.localGet(OBJB);
+      c.structGet(objT, OBJ_NULL_PROTO);
+      c.i32Ne();
+      c.ifVoid();
+      c.call(deqLeave);
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      c.localGet(OBJA);
+      c.structGet(objT, OBJ_LEN);
+      c.localSet(ON);
+      c.localGet(OBJB);
+      c.structGet(objT, OBJ_LEN);
+      c.localGet(ON);
+      c.i32Ne();
+      c.ifVoid();
+      c.call(deqLeave);
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      c.i32Const(0);
+      c.localSet(OI);
+      c.block();
+      c.loop();
+      c.localGet(OI);
+      c.localGet(ON);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(OBJA);
+      c.structGet(objT, OBJ_ENTRIES);
+      c.localGet(OI);
+      c.arrayGet(entriesArrT);
+      c.localTee(ENTRY);
+      c.structGet(entryT, ENTRY_KEY);
+      c.localSet(KEY);
+      c.localGet(OBJB);
+      c.localGet(KEY);
+      c.call(objGetFn);
+      c.localTee(BV);
+      c.refIsNull();
+      c.ifVoid();
+      c.call(deqLeave);
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      c.localGet(ENTRY);
+      c.structGet(entryT, ENTRY_VALUE);
+      c.localGet(BV);
+      c.call(this.deepEqDyn());
+      c.i32Eqz();
+      c.ifVoid();
+      c.call(deqLeave);
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      c.localGet(OI);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(OI);
+      c.br(0);
+      c.end();
+      c.end();
+      c.call(deqLeave);
+      c.i32Const(1);
+      c.return_();
+      c.end();
+
+      // Exhaustive over DK's 12 kinds; every arm above returns or traps.
+      c.unreachable();
+      this.mb.setBody(
+        idx,
+        [I32, I32, F64, arrRefT, arrRefT, I32, I32, objRefT, objRefT, I32, I32, entryRefT, this.deps.strRef(), this.dynRef()],
+        c.bytes(),
+      );
     });
   }
 

@@ -109,6 +109,9 @@ async function buildHelpers(): Promise<Helpers> {
     excKind: () => {
       throw new Error("harness 1 has no exception cell");
     },
+    strCmpU16: () => {
+      throw new Error("harness 1 does not build the composite renderer's entry sort");
+    },
   });
 
   const simple = (name: string, params: ValType[], results: ValType[], body: (c: Code) => void): void => {

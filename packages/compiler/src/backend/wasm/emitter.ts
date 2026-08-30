@@ -101,6 +101,7 @@ import {
 } from "./abi.js";
 import { LEN, VecBuilder, type VecInfo } from "./arrays.js";
 import {
+  BYTES_PAYLOAD_IS_BUFFER,
   DK,
   DYN_KIND,
   DYN_NUM,
@@ -109,9 +110,11 @@ import {
   ENTRY_KEY,
   ENTRY_VALUE,
   FN_CLOS,
+  FN_NAME,
   FN_SIG,
   OBJ_ENTRIES,
   OBJ_LEN,
+  OBJ_NULL_PROTO,
 } from "./dyn.js";
 import { InspectBuilder } from "./inspect.js";
 import { MapBuilder, type MapInfo, type MapKeyKind, type MapValKind } from "./maps.js";
@@ -5042,11 +5045,15 @@ class Assembler {
       jsonQuoteStr: () => this.json.quoteStr(),
       bytesRefU8: () => this.bytesB.bytesRef(),
       bytesTypeU8: () => this.bytesB.bytesType(),
+      bytesEquals: () => this.bytesB.equalsHelper(),
       bytesLen: () => this.bytesB.length(),
       bytesGet: () => this.bytesB.get("u8"),
       bytesSet: () => this.bytesB.setElem("u8"),
       bytesToStrUtf8: () => this.bytesB.toStrHelper("utf8"),
       jsToNumber: () => this.jsToNumberHelper(),
+      sameValueF64: () => this.sameValueF64Helper(),
+      deqEnter: () => this.deqEnterHelper(),
+      deqLeave: () => this.deqLeaveHelper(),
     });
     return this.dynField;
   }
@@ -5106,6 +5113,7 @@ class Assembler {
       bytesRefU8: () => this.bytesB.bytesRef(),
       bytesLen: () => this.bytesB.length(),
       bytesGet: () => this.bytesB.get("u8"),
+      strCmpU16: () => this.strCmpHelper(true),
     });
     return this.inspField;
   }
@@ -20542,6 +20550,13 @@ class Assembler {
         return true;
       }
       default:
+        // P2a scope (increment 23, in progress): `assert.eqDyn` falls
+        // through to this generic refusal deliberately — its
+        // comparison walk and renderer are being built as their own
+        // named helpers this pass, but the libCall wiring itself (and
+        // the removal of this refusal) is P2b's job, not P2a's. The
+        // census must therefore stay byte-identical to the post-P1
+        // baseline (747/1077) for the whole of P2a.
         if (e.fn.startsWith("assert.")) {
           this.refuse(`libCall:${e.fn}`, e.loc);
           code.unreachable();
