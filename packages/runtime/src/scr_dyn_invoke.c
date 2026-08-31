@@ -708,8 +708,14 @@ ScrDyn *scr_dyn_invoke(ScrDyn *recv, const char *method, ScrDyn *const *args, si
 
 /* Object.defineProperties over dyn values (see scr_runtime.h). Value
  * descriptors only: writable/enumerable/configurable accepted and IGNORED
- * (dyn properties are plain data properties — SEMANTICS.md); get/set
- * throw the loud unsupported Error, never a silent drop. */
+ * on THIS lane (dyn properties are plain data properties — the wasm lane
+ * disagrees since increment 23 P4/board #98: it HONOURS `enumerable` on
+ * a FUNC target via a side table, and refuses a non-enumerable OBJ
+ * target by name instead of storing it visibly, SEMANTICS.md S062 — a
+ * deliberate cross-lane split, not a bug on either side); get/set throw
+ * the loud unsupported Error on BOTH lanes, never a silent drop
+ * (SEMANTICS.md S061, ported verbatim into the wasm lane's own
+ * `dyn.defineProps`). */
 ScrDyn *scr_dyn_define_props(ScrDyn *target, ScrDyn *descs) {
   /* Island-held operands ARE objects to Node — the non-object TypeError
    * below would be a wrong claim. Loud fence (lane dyn-routing-ops). */

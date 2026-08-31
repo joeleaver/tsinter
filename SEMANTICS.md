@@ -593,14 +593,35 @@ for the presence form) with Node's in a comment.
 
 The checked-dynamic tree stores objects as an own-entry table and arrays
 as a DENSE vector, with no expando map beside either and no hole bit
-inside the vector — and a boxed function carries no property table at
-all. Six observable consequences follow — four loud, and two that say
-nothing at all. What is exact first, so the boundary is
-clear: object writes (insertion order, later writes winning, the
-surviving entry keeping its original key), array index writes within the
-allocatable range (`length` and every read match Node), and the refusals
-on nullish, number and boolean receivers, which are V8's own texts
-character for character.
+inside the vector. Five observable consequences follow from THAT shape —
+three loud, and two that say nothing at all. What is exact first, so the
+boundary is clear: object writes (insertion order, later writes winning,
+the surviving entry keeping its original key), array index writes within
+the allocatable range (`length` and every read match Node), the
+refusals on nullish, number and boolean receivers (V8's own texts
+character for character), and — since increment 23 P4 (board #98,
+Amendment below) — keyed writes on a boxed FUNCTION, which now succeed
+through a side property table keyed on closure identity rather than
+being a member of this entry's own array/object storage shape at all.
+
+**Amendment (increment 23 P4, board #98) — the FUNC-write arm is
+RETIRED; the remaining arms are unchanged.** `Object.defineProperties`
+gave a boxed function its own property table (dyn.ts, the `$fnProps`
+side structure keyed on `FN_CLOS`, one entry per closure identity — NOT
+per box, since `===` and the property table must agree and a box does
+not survive S014's copy-on-crossing); `f.x = 1` was wired into the SAME
+table (an ordinary keyed write creates an ENUMERABLE property, Node's
+own default), which is what actually retires this arm rather than
+merely giving it a narrower write path. MEASURED, byte-exact against
+Node: `function g(){} g.x = 1; console.log(g)` now answers
+`[Function: g] { x: 1 }` on both, where before this round the wasm tier
+threw. This is a CLEAN retirement, not a partial one — the write
+succeeds, the value reads back through every surface (`f.x`, `hasOwn`,
+`Object.keys`, both inspect renderers), exactly matching Node's own
+default-enumerable, default-writable, default-configurable shape for an
+ordinary assignment. The four OTHER consequences below (object/array
+padding, non-index array writes, string receivers) are UNCHANGED —
+board #98 touched the FUNC receiver only.
 
 **Padded slots are OWN PROPERTIES, where Node leaves HOLES.** Growing a
 dyn array by index fills the gap with real `undefined` members instead of
@@ -635,17 +656,23 @@ refusal. Out-of-range indices and named keys agree exactly ("Cannot
 create property '9' on string 'abc'"), so only the read-only pair
 diverges.
 
-**A write on a boxed FUNCTION throws where Node stores it.** Functions
-are objects in JS, so `f.x = 1` succeeds there and reads back; here it
-raises the same catchable "Cannot create property 'x' on function" the
-primitive receivers get. A boxed function's payload carries the closure,
-its call thunk, its signature, its name and its arity — and no property
-table: the one the C runtime hangs off the closure is written only by
-`Object.defineProperties`, which this backend refuses, so there is
-nothing a write could land in. The PRESENCE forms over the two members
-Node does define are exact — `"name" in f` and `Object.hasOwn(f, "name")`
-are both true, as in Node — so this arm is about the write alone; what
-those two members ANSWER when read is S020's, not this entry's.
+**RETIRED (increment 23 P4, board #98) — a write on a boxed FUNCTION no
+longer throws.** This entry ORIGINALLY registered `f.x = 1` throwing the
+same catchable "Cannot create property 'x' on function" the primitive
+receivers get, where Node succeeds and reads it back — a boxed
+function's payload carried the closure, its call thunk, its signature,
+its name and its arity, and NO property table, so there was nothing a
+write could land in. P4 gave it one (see the Amendment above): the write
+now succeeds, and every read-shaped surface agrees with Node over it —
+`f.x`, `Object.hasOwn(f, "x")`, `Object.keys(f)`, and both inspect
+renderers now show an ENUMERABLE property in an appended block (a stale
+code comment claiming neither renderer's FUNC arm ever would is
+corrected alongside this entry, not a divergence of its own). The two
+members Node ALWAYS defines (`name`, `length`) are UNCHANGED and still
+answered by keyGet's built-in fallback beneath the table — S020 covers
+what those two answer when read (a SEPARATE, unrelated divergence: a
+compile-time approximation of the DEFINED name/arity, not about
+property storage), unaffected by this retirement.
 
 **`Object.assign` onto a non-object target copies NOTHING, silently.**
 `Object.assign(arrTarget, {k: 7})` writes `k` through in Node and lists
@@ -4556,3 +4583,76 @@ and confirmed via the wasm-differential corpus (2385 claims; 1356/1611
 advance to their predicted next refusal, not this one; census table
 unchanged by this fix round — nothing here is reachable before
 `url.href`/`process.cwd` clear).
+
+## S061 — `Object.defineProperties`: an accessor (`get`/`set`) descriptor throws a loud Error, on BOTH lanes *(inherited)*
+
+Node accepts a `get`/`set` descriptor on any target (MEASURED: `Object.
+defineProperties(o, {x: {get: () => 42, enumerable: true}})` then `o.x`
+answers 42, `Object.keys(o)` answers `["x"]` — an ordinary accessor
+property, indistinguishable from a hand-written one). Following that
+would mean modelling accessor properties in the dyn tree — a getter
+that runs on every read, a setter on every write, threaded through
+`keyGet`/`keySet`/`objWalk`/every inspect renderer — a build far larger
+than the rest of this feature combined, for a shape no claimed corpus
+program uses. Both lanes refuse it instead, by name, as a plain
+(non-Type) `Error`: `"accessor (get/set) property descriptors on a
+dynamic value are not supported yet"`. The wasm lane's wording is the C
+runtime's own (`scr_dyn_define_props`, `SCR_ERR_ERROR`), ported
+verbatim rather than independently chosen — an inherited divergence,
+not a wasm-tier one. `get`/`set` PRESENCE is the trigger, not validity:
+`{get: 1}` throws exactly the same way `{get: () => 42}` does, even
+though Node itself would separately reject `{get: 1}` for a different
+reason ("Getter must be a function") — this tier's own check runs
+before any such distinction would matter, and no corpus program probes
+the difference.
+
+**Rationale:** a deliberate, permanent scope boundary rather than an
+oversight — see board #98's own H-3 ruling. The two members every
+function already carries (`name`, `length`, S020) and the plain-value
+members `Object.defineProperties` (SEMANTICS.md S016's amendment,
+increment 23 P4) actually stores are unaffected; only a descriptor that
+carries `get` or `set` at all is rejected. **Tested by:**
+`packages/compiler/test/wasm-dyn-defineprops.test.ts` — the accessor
+descriptor pin (both a callable and a non-callable `get`/`set` value,
+both an OBJ and a FUNC target), confirmed as `instanceof Error` and NOT
+`instanceof TypeError`, with the message text byte-exact; no corpus
+program can pin this directly (claim 0 — every consumer's descriptors
+are plain `value`/`enumerable` pairs).
+
+## S062 — `Object.defineProperties`: a non-enumerable property on an OBJ target refuses by name *(wasm tier)*
+
+Node gives a plain object a genuine non-enumerable own property
+(MEASURED: `Object.defineProperties(o, {x: {value: 1, enumerable:
+false}})` then `o.x` answers 1, `Object.hasOwn(o, "x")` answers true,
+`Object.keys(o)` answers `[]`, and `Object.getOwnPropertyDescriptor(o,
+"x")` shows the full descriptor). A dyn OBJ node has no hidden plane —
+its own-entry table (S016) is the ONLY storage a member can occupy, and
+every entry in it enumerates. Routing a hidden OBJ property through the
+SAME side table `Object.defineProperties` gives boxed FUNCTIONS
+(SITE A, keyed on `FN_CLOS`) was considered and rejected: an OBJ box
+COPIES across the `unknown` boundary (S014), while the side table would
+not follow the copy, silently dropping the hidden property on the far
+side — a WORSE, silent divergence traded for a louder one. The wasm
+lane refuses instead, by name, at the `Object.defineProperties` call
+itself: a plain (non-Type) `Error`, `"Object.defineProperties: a
+non-enumerable property descriptor on a plain-object dynamic value is
+not supported yet"`. This is a WASM-TIER divergence, not an inherited
+one — the C lane takes the THIRD option Node itself does not (store the
+property visibly regardless of the flag, S016's amendment's own "C lane
+still... accepted and ignored" note), so C and wasm disagree with each
+other here as well as with Node, in two different directions.
+
+**Rationale:** loud beats silent, and the corpus never reaches this —
+every one of the 1700/1701/1703 consumers this board exists for targets
+a FUNCTION, never a plain object, with `Object.defineProperties`; board
+#98's own H-1 ruling records the three options considered and why this
+one was chosen. Should a program ever need a genuinely non-enumerable
+OBJ member, the fix is a second OBJ storage plane (S016's own
+Rationale: "a feature, not a fix"), not a special case here.
+**Tested by:** `packages/compiler/test/wasm-dyn-defineprops.test.ts` —
+the OBJ-target `enumerable:false` refusal pin (confirmed `instanceof
+Error`, not `TypeError`, message byte-exact) beside its OWN positive
+control (`enumerable:true` on an OBJ target succeeds and reads back,
+proving the refusal is keyed on the flag and not the target kind); no
+corpus program can pin this directly (claim 0, the same reason S061
+gives).

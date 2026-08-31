@@ -7192,9 +7192,16 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
     // Object.defineProperties over a CHECKED-DYNAMIC target (test/common's
     // _mustCallInner copying name/length onto the mustCall wrapper): the
     // runtime turns each descriptor's `value` into a plain own property on
-    // the dyn node (OBJ members; FUNC nodes carry an own-property table) —
-    // flags accepted and ignored, accessors throw loudly (SEMANTICS.md).
-    // The result is the target, like JS. Typed targets keep the fence:
+    // the dyn node (OBJ members; FUNC nodes carry an own-property table,
+    // increment 23 P4/board #98) — accessors throw loudly on BOTH lanes
+    // (SEMANTICS.md S061, C's own behavior, ported verbatim). `enumerable`
+    // is a CROSS-LANE SPLIT, not a shared answer: the C lane still stores
+    // every descriptor visibly regardless of the flag ("accepted and
+    // ignored", unchanged); the wasm lane HONOURS it on a FUNC target (a
+    // two-table split keyed on closure identity) and instead REFUSES a
+    // non-enumerable write on an OBJ target by name (SEMANTICS.md S062 —
+    // corpus-unreachable; every claimed consumer targets a FUNC). The
+    // result is the target, like JS. Typed targets keep the fence:
     // static shapes have no property table to extend.
     if (member === "defineProperties" && call.arguments.length === 2 &&
         !call.arguments.some((a) => ts.isSpreadElement(a))) {

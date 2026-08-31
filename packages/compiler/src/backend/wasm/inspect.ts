@@ -122,7 +122,7 @@ import {
   DYN_REF,
   ENTRY_KEY,
   ENTRY_VALUE,
-  FN_NAME,
+  FN_CLOS,
   OBJ_ENTRIES,
   OBJ_LEN,
   OBJ_NULL_PROTO,
@@ -3492,9 +3492,11 @@ export class InspectBuilder {
       const VS = 16; // the value's rendering
       const R = 17; // the composite's rendering
       const ENTS = 18; // objWalk's result box
-      const NAME = 19; // FN_NAME
+      const NAME = 19; // the render name: keyGet(D,"name",0), tables-then-FN_NAME
       const AB = 20; // BYTES: the aliased $bytes ref (S014's amendment)
       const BASE = 21; // BYTES: the "Uint8Array(N) " prefix
+      const CLOS = 22; // P4 SITE D: FUNC's FN_CLOS, the circCheck/seenPush/refWrap key
+      const PREFIX = 23; // P4 SITE D: the "[Function: name]" piece, built before the block
       /** recurse + 1 — the depth children format at. */
       const deeper = (): void => {
         c.localGet(RECURSE);
@@ -3567,24 +3569,43 @@ export class InspectBuilder {
         c.return_();
       });
       this.kindArm(c, K, [DK.FUNC], () => {
-        // The boxed name is the compiler's best-effort static spelling
-        // (S020). C's `name && name[0]`: null OR EMPTY is anonymous.
-        dyn.fnPayload(c, (x) => x.localGet(D));
-        c.structGet(dyn.fnT(), FN_NAME);
+        // NAME: keyGet's OWN precedence (tables, THEN FN_NAME's built-in
+        // fallback — a null FN_NAME already reads back as "" through
+        // that path: C's `name && name[0]`, ported once, in keyGet, not
+        // twice) answers BOTH "what name to render" and "is this
+        // anonymous" in one call — a REDEFINED `name` entry (the
+        // mustCall shape) is reflected here for free. P4 §3's own
+        // closing note: "should be ONE helper, not two."
+        c.localGet(D);
+        this.deps.lit(c, "name");
+        c.i32Const(0);
+        c.call(dyn.keyGet());
+        c.structGet(dynT, DYN_REF);
+        c.refCast(strT);
         c.localSet(NAME);
-        c.localGet(NAME);
-        c.refIsNull();
-        c.ifResult(I32);
-        c.i32Const(1);
-        c.else_();
+
+        // properties: ENUMERABLE-only (H-4), insertion order — LOG's
+        // own compact:3 walk does not sort (the SAME asymmetry P2
+        // measured for plain objects; CF's own arm below sorts).
+        c.localGet(D);
+        c.i32Const(2); // Object.entries mode
+        c.call(dyn.objWalk());
+        c.localSet(ENTS);
+        dyn.arrPayload(c, (x) => x.localGet(ENTS));
+        c.localSet(V);
+        dyn.arrLen(c, (x) => x.localGet(V));
+        c.localSet(N);
+
+        // The base "[Function: name]" / "[Function (anonymous)]" piece
+        // — UNCHANGED shape, fed by NAME above instead of a raw FN_NAME
+        // read (this substitution alone is what makes a REDEFINED name
+        // render, since keyGet already prefers the table entry).
         c.localGet(NAME);
         c.arrayLen();
         c.i32Eqz();
-        c.end();
-        c.ifVoid();
+        c.ifResult(strRef);
         this.deps.lit(c, "[Function (anonymous)]");
-        c.return_();
-        c.end();
+        c.else_();
         c.globalGet(this.len());
         c.localSet(MARK);
         this.deps.lit(c, "[Function: ");
@@ -3595,6 +3616,148 @@ export class InspectBuilder {
         c.call(this.ibPutc());
         c.localGet(MARK);
         c.call(this.ibTake());
+        c.end();
+        c.localSet(PREFIX);
+
+        // No own enumerable properties: the base alone — CURRENT
+        // BEHAVIOUR, untouched. Comes BEFORE circCheck, matching the
+        // OBJ/ARR arms' own N===0 shortcut ("an empty [thing] cannot be
+        // on the traversal path"): the two negative rows named-0props
+        // and mustCall-name-length (H-4's own required negatives) both
+        // depend on this returning bare, and MEASURED — a non-enumerable
+        // self-reference (`defineProperties(g,{self:{value:g,
+        // enumerable:false}})`) renders plain "[Function: g]" with NO
+        // circular marker, because Node's own renderer never visits a
+        // hidden property either.
+        c.localGet(N);
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(PREFIX);
+        c.return_();
+        c.end();
+
+        // A function WITH own enumerable properties fully joins the
+        // SAME identity tracking OBJ/ARR use — MEASURED: `g.self = g`
+        // renders "<ref *1> [Function: g] { self: [Circular *1] }",
+        // byte-exact shape to the OBJ/ARR case. Keyed on FN_CLOS, the
+        // SAME identity `===`/SITE A's own property table use, NOT the
+        // fnPayload struct — SITE A's own reason (a payload struct is
+        // not stable across two boxings of the same function) applies
+        // to circularity identity identically.
+        dyn.fnPayload(c, (x) => x.localGet(D));
+        c.structGet(dyn.fnT(), FN_CLOS);
+        c.localSet(CLOS);
+        c.localGet(CLOS);
+        c.call(this.circCheck());
+        c.localSet(ID);
+        circularAnswer();
+
+        // Depth cutoffs. MEASURED: a BARE function ignores `depth`
+        // entirely (the N===0 return above, unchanged from before P4),
+        // but a function WITH properties collapses to the fully-generic
+        // "[Function]" once beyond it — Node drops the NAME too here,
+        // unlike OBJ/ARR's bare markers (which never carried one to
+        // begin with). `RECURSE > DEPTH` mirrors the OBJ arm's own gate
+        // exactly. `RECURSE > MAX_DYN_DEPTH`'s INTERRUPTED form is
+        // mirrored STRUCTURALLY from the sibling arms rather than
+        // independently Node-measured — this exact combination (a
+        // FUNC-with-props reached only through display-depth:null-scale
+        // nesting) could not be reproduced in native Node within any
+        // practical probe; flagged in FINDINGS, not silently assumed.
+        c.localGet(RECURSE);
+        c.localGet(DEPTH);
+        c.f64Gt();
+        c.ifVoid();
+        this.deps.lit(c, "[Function]");
+        c.return_();
+        c.end();
+        c.localGet(RECURSE);
+        c.f64Const(MAX_DYN_DEPTH);
+        c.f64Gt();
+        c.ifVoid();
+        this.deps.lit(c, `[Function${INTERRUPTED}`);
+        c.return_();
+        c.end();
+
+        // The property block itself: OBJ's own begin/entry/end pipeline
+        // (compact:3 grouping, EXTRAS=0/MORE=0 — properties never
+        // grid-group, the same as OBJ's own call), fed by objWalk's
+        // [key,value] pairs instead of a raw entries array — P4 §3's
+        // own instruction: "laid out by each renderer's ORDINARY OBJECT
+        // MACHINERY."
+        deeper();
+        c.call(this.begin());
+        c.localGet(CLOS);
+        c.call(this.seenPush());
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(N);
+        c.i32GeS();
+        c.brIf(1);
+        dyn.arrAt(c, (x) => x.localGet(V), (x) => x.localGet(I));
+        c.localSet(E);
+        dyn.arrPayload(c, (x) => x.localGet(E));
+        c.localSet(P);
+        dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(0));
+        c.structGet(dynT, DYN_REF);
+        c.refCast(strT);
+        c.call(this.key());
+        c.localSet(KS);
+        dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(1));
+        deeper();
+        c.localGet(DEPTH);
+        c.call(idx);
+        c.localSet(VS);
+        bailIfPending();
+        c.globalGet(this.len());
+        c.localSet(MARK);
+        c.localGet(KS);
+        c.call(this.ibPuts());
+        this.deps.lit(c, ": ");
+        c.call(this.ibPuts());
+        c.localGet(VS);
+        c.call(this.ibPuts());
+        c.localGet(MARK);
+        c.call(this.ibTake());
+        c.i32Const(0); // a property entry is never the grid's number case
+        c.call(this.entry());
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        // BASE: PREFIX itself — F-3's own fix (rev-23's gate finding).
+        // `end()` already implements Node's reduceToSingleString break
+        // arithmetic (start = output.length + indentationLvl +
+        // braces[0].length + base.length + 10 vs breakLength), reading
+        // base.length OFF THIS ARGUMENT (emitBasePrefix, called from
+        // BOTH end()'s single-line and multi-line paths) — the SAME
+        // mechanism cfValue's own break arithmetic already uses
+        // correctly (P2b's BREAK_LENGTH work). Passing "" here, then
+        // combining PREFIX+" "+block OUTSIDE end() afterward (the
+        // ORIGINAL shape), fed base.length as ZERO into the break
+        // decision regardless of the prefix's real length — LOG-only;
+        // CF's own cfValue arm was never built this way and needs no
+        // change.
+        c.localGet(PREFIX);
+        this.deps.lit(c, "{");
+        this.deps.lit(c, "}");
+        deeper();
+        c.i32Const(0); // no array extras: properties never grid-group
+        c.i32Const(0);
+        c.call(this.end());
+        c.localSet(R);
+        // refWrap for the `<ref *N> ` marker — MEASURED, comes first of
+        // all ("<ref *1> [Function: g] {...}"); end()'s own result R is
+        // ALREADY the full "PREFIX {...}" string, no separate combine.
+        c.localGet(CLOS);
+        c.localGet(R);
+        c.call(this.refWrap());
         c.return_();
       });
       this.kindArm(c, K, [DK.PROMISE], () => {
@@ -3996,7 +4159,7 @@ export class InspectBuilder {
         [
           I32, I32, dyn.arrRef(), dyn.objRef(), I32, I32, I32, I32, I32, F64,
           dyn.dynRef(), dyn.arrRef(), strRef, strRef, strRef, dyn.dynRef(), strRef,
-          this.deps.bytesRefU8(), strRef,
+          this.deps.bytesRefU8(), strRef, EQ_REF, strRef,
         ],
         c.bytes(),
       );
@@ -4096,7 +4259,8 @@ export class InspectBuilder {
       const INDENT = 1;
       const RT = 2;
       const K = 3;
-      const FNAME = 4;
+      // local 4: unused since P4 (was FN_NAME's raw read; the FUNC arm
+      // now sources its render name through keyGet — see FNM below).
       const BREF = 5;
       const ISBUF = 6;
       const BLEN = 7;
@@ -4115,6 +4279,24 @@ export class InspectBuilder {
       const SJ = 20;
       const SIDX = 21;
       const STMP = 22;
+      // P4 SITE D: the FUNC arm's own locals — a separate namespace from
+      // the OBJ arm's O*/S* locals above (FUNC's entries come from
+      // objWalk's [key,value] PAIRS, not a raw $entry array, so the
+      // unwrapping shape differs even though the sort/emit pipeline is
+      // the same one, reused).
+      const FNM = 23; // the render name: keyGet(D,"name",0)
+      const FCLOS = 24; // FN_CLOS — the cfSeenCheck/seenPush key
+      const FENTS = 25; // objWalk's boxed ARR result
+      const FVEC = 26; // FENTS unwrapped to its raw ARR payload
+      const FLEN = 27;
+      const FI = 28;
+      const FPAIR = 29; // one [key,value] pair, as a dyn ARR value
+      const FPP = 30; // FPAIR unwrapped to its raw ARR payload
+      const FMARK = 31;
+      const FSTRARR = 32;
+      const FSJ = 33;
+      const FSIDX = 34;
+      const FSTMP = 35;
       const c = new Code();
       const putLit = (s: string): void => {
         this.deps.lit(c, s);
@@ -4196,34 +4378,245 @@ export class InspectBuilder {
       c.return_();
       c.end();
 
-      // FUNC — name = fnPayload(d).FN_NAME; NEVER renders own properties
-      // (dyn.defineProps is P4/board #98 — on THIS backend the slot is
-      // ABSENT rather than always-null, so "[Function: name]" is exact
-      // here where Node's own-property form would not be).
+      // FUNC — P4/board #98: name = keyGet(d,"name",0) (tables THEN
+      // FN_NAME's fallback — the SAME ONE-helper precedence the LOG
+      // renderer's own FUNC arm uses, so a REDEFINED `name` renders
+      // here too), plus an optional SORTED, multi-line property block
+      // for the ENUMERABLE own properties (H-4) — compact:false+sorted,
+      // laid out through the SAME sort/emit pipeline the OBJ arm below
+      // uses (A.4's own ndse-51 proof: the sort compares full rendered
+      // lines, not keys alone), fed by objWalk's pairs instead of a raw
+      // $entry array.
       c.localGet(K);
       c.i32Const(DK.FUNC);
       c.i32Eq();
       c.ifVoid();
-      dyn.fnPayload(c, (x) => x.localGet(D));
-      c.structGet(dyn.fnT(), FN_NAME);
-      c.localSet(FNAME);
-      c.localGet(FNAME);
-      c.refIsNull();
+      c.localGet(D);
+      this.deps.lit(c, "name");
+      c.i32Const(0);
+      c.call(dyn.keyGet());
+      c.structGet(dynT, DYN_REF);
+      c.refCast(this.deps.strType());
+      c.localSet(FNM);
+
+      c.localGet(D);
+      c.i32Const(2); // Object.entries mode
+      c.call(dyn.objWalk());
+      c.localSet(FENTS);
+      dyn.arrPayload(c, (x) => x.localGet(FENTS));
+      c.localSet(FVEC);
+      dyn.arrLen(c, (x) => x.localGet(FVEC));
+      c.localSet(FLEN);
+
+      // No own enumerable properties: the base alone — CURRENT
+      // BEHAVIOUR, unchanged, no cycle tracking either (MEASURED: a
+      // non-enumerable self-reference never surfaces a cycle at all,
+      // the same finding the LOG renderer's own arm carries — Node's
+      // real walker never visits a hidden property either).
+      c.localGet(FLEN);
+      c.i32Eqz();
       c.ifVoid();
-      putLit("[Function (anonymous)]");
-      c.return_();
-      c.end();
-      c.localGet(FNAME);
+      c.localGet(FNM);
       c.arrayLen();
       c.i32Eqz();
       c.ifVoid();
       putLit("[Function (anonymous)]");
-      c.return_();
-      c.end();
+      c.else_();
       putLit("[Function: ");
-      c.localGet(FNAME);
+      c.localGet(FNM);
       c.call(this.ibPuts());
       putLit("]");
+      c.end();
+      c.return_();
+      c.end();
+
+      // A function WITH own enumerable properties joins the SAME named
+      // cycle-trap discipline (A.6) ARR/OBJ use, keyed on FN_CLOS — NOT
+      // the dyn box, which is not stable across two boxings of the same
+      // function (SITE A's own reason for keying its table on FN_CLOS
+      // applies to this identity check identically).
+      dyn.fnPayload(c, (x) => x.localGet(D));
+      c.structGet(dyn.fnT(), FN_CLOS);
+      c.localSet(FCLOS);
+      c.localGet(FCLOS);
+      c.call(this.cfSeenCheck());
+      c.ifVoid();
+      this.deps.namedTrap(
+        c,
+        "cfValue: cyclic value encountered while rendering an assert.eqDyn failure message (SEMANTICS.md S058)",
+      );
+      c.end();
+      c.localGet(FCLOS);
+      c.call(this.seenPush());
+
+      c.localGet(RT);
+      c.i32Const(ASSERT_RENDER_DEPTH_OPTION);
+      c.i32GtS();
+      c.ifVoid();
+      putLit("[Function]");
+      c.call(this.cfSeenPop());
+      c.return_();
+      c.end();
+
+      // Build each entry's TEXT (key + ": " + value) into its own
+      // region and take it BEFORE the sort — identical discipline to
+      // the OBJ arm below.
+      c.localGet(FLEN);
+      c.arrayNewDefault(this.cfEntryStrArr());
+      c.localSet(FSTRARR);
+      c.i32Const(0);
+      c.localSet(FI);
+      c.block();
+      c.loop();
+      c.localGet(FI);
+      c.localGet(FLEN);
+      c.i32GeS();
+      c.brIf(1);
+      this.pushMark(c);
+      c.localSet(FMARK);
+      dyn.arrAt(c, (x) => x.localGet(FVEC), (x) => x.localGet(FI));
+      c.localSet(FPAIR);
+      dyn.arrPayload(c, (x) => x.localGet(FPAIR));
+      c.localSet(FPP);
+      dyn.arrAt(c, (x) => x.localGet(FPP), (x) => x.i32Const(0));
+      c.structGet(dynT, DYN_REF);
+      c.refCast(this.deps.strType());
+      c.call(this.key());
+      c.call(this.ibPuts());
+      putLit(": ");
+      dyn.arrAt(c, (x) => x.localGet(FPP), (x) => x.i32Const(1));
+      c.localGet(INDENT);
+      c.i32Const(2);
+      c.i32Add();
+      c.localGet(RT);
+      c.i32Const(1);
+      c.i32Add();
+      c.call(this.cfValue());
+      c.localGet(FMARK);
+      c.call(this.ibTake());
+      c.localSet(FSTMP);
+      c.localGet(FSTRARR);
+      c.localGet(FI);
+      c.localGet(FSTMP);
+      c.arraySet(this.cfEntryStrArr());
+      c.localGet(FI);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(FI);
+      c.br(0);
+      c.end();
+      c.end();
+      // Insertion sort, IDENTICAL to the OBJ arm's own below (A.4's own
+      // recommendation: stability is unreachable, so any deterministic
+      // sort is correct and this is the smallest one).
+      c.i32Const(1);
+      c.localSet(FSJ);
+      c.block();
+      c.loop();
+      c.localGet(FSJ);
+      c.localGet(FLEN);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(FSTRARR);
+      c.localGet(FSJ);
+      c.arrayGet(this.cfEntryStrArr());
+      c.localSet(FSTMP);
+      c.localGet(FSJ);
+      c.i32Const(1);
+      c.i32Sub();
+      c.localSet(FSIDX);
+      c.block();
+      c.loop();
+      c.localGet(FSIDX);
+      c.i32Const(0);
+      c.i32LtS();
+      c.brIf(1);
+      c.localGet(FSTRARR);
+      c.localGet(FSIDX);
+      c.arrayGet(this.cfEntryStrArr());
+      c.localGet(FSTMP);
+      c.call(this.deps.strCmpU16());
+      c.i32Const(0);
+      c.i32LeS();
+      c.brIf(1);
+      c.localGet(FSTRARR);
+      c.localGet(FSIDX);
+      c.i32Const(1);
+      c.i32Add();
+      c.localGet(FSTRARR);
+      c.localGet(FSIDX);
+      c.arrayGet(this.cfEntryStrArr());
+      c.arraySet(this.cfEntryStrArr());
+      c.localGet(FSIDX);
+      c.i32Const(1);
+      c.i32Sub();
+      c.localSet(FSIDX);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(FSTRARR);
+      c.localGet(FSIDX);
+      c.i32Const(1);
+      c.i32Add();
+      c.localGet(FSTMP);
+      c.arraySet(this.cfEntryStrArr());
+      c.localGet(FSJ);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(FSJ);
+      c.br(0);
+      c.end();
+      c.end();
+      // Emit: the name prefix, then the SORTED block.
+      c.localGet(FNM);
+      c.arrayLen();
+      c.i32Eqz();
+      c.ifVoid();
+      putLit("[Function (anonymous)] ");
+      c.else_();
+      putLit("[Function: ");
+      c.localGet(FNM);
+      c.call(this.ibPuts());
+      putLit("] ");
+      c.end();
+      putc("{");
+      c.i32Const(0);
+      c.localSet(FI);
+      c.block();
+      c.loop();
+      c.localGet(FI);
+      c.localGet(FLEN);
+      c.i32GeS();
+      c.brIf(1);
+      putc("\n");
+      spaces(() => {
+        c.localGet(INDENT);
+        c.i32Const(2);
+        c.i32Add();
+      });
+      c.localGet(FSTRARR);
+      c.localGet(FI);
+      c.arrayGet(this.cfEntryStrArr());
+      c.call(this.ibPuts());
+      c.localGet(FI);
+      c.i32Const(1);
+      c.i32Add();
+      c.localGet(FLEN);
+      c.i32Ne();
+      c.ifVoid();
+      putc(",");
+      c.end();
+      c.localGet(FI);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(FI);
+      c.br(0);
+      c.end();
+      c.end();
+      putc("\n");
+      spaces(() => c.localGet(INDENT));
+      putc("}");
+      c.call(this.cfSeenPop());
       c.return_();
       c.end();
 
@@ -4643,7 +5036,13 @@ export class InspectBuilder {
 
       this.mb.setBody(
         idx,
-        [I32, strRefT, this.deps.bytesRefU8(), I32, I32, I32, dyn.arrRef(), I32, I32, dyn.objRef(), I32, I32, entriesRefT, I32, dyn.entryRef(), I32, strArrRefT, I32, I32, strRefT],
+        [
+          I32, strRefT, this.deps.bytesRefU8(), I32, I32, I32, dyn.arrRef(), I32, I32, dyn.objRef(), I32, I32,
+          entriesRefT, I32, dyn.entryRef(), I32, strArrRefT, I32, I32, strRefT,
+          // P4 SITE D — the FUNC arm's own locals (FNM..FSTMP, 23-35).
+          strRefT, EQ_REF, dyn.dynRef(), dyn.arrRef(), I32, I32, dyn.dynRef(), dyn.arrRef(), I32, strArrRefT, I32,
+          I32, strRefT,
+        ],
         c.bytes(),
       );
     });

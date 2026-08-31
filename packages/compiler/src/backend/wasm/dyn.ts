@@ -2531,6 +2531,8 @@ export class DynBuilder {
         const IDX = 4;
         const M = 5;
         const MSG = 6;
+        const FP = 7;
+        const RESULT = 8;
         c.localGet(0);
         c.structGet(dynT, DYN_KIND);
         c.localSet(K);
@@ -2700,17 +2702,54 @@ export class DynBuilder {
           c.end();
           c.globalGet(this.undefinedGlobal());
         });
-        // A FUNC box answers the two function-instance members Node
-        // defines, `scr_dyn_fn_get` ported: `name` (the empty string when
-        // the value is anonymous — C's `d->v.fn.name ? : ""`) and
-        // `length` (the declared arity). BOTH are compile-time
-        // approximations of Node's answers rather than equal to them —
-        // SEMANTICS.md S020 has the cases. C consults an own-property
-        // table FIRST, but its only writer is Object.defineProperties,
-        // which this backend refuses — so there is no table to consult
-        // and no key that could shadow these two. Everything else falls
-        // through to undefined, C's NULL answer reaching the same place.
+        // A FUNC box answers its own-property table FIRST (P4: the
+        // FN_CLOS-keyed side table above), then the two function-
+        // instance members Node defines, `scr_dyn_fn_get` ported: `name`
+        // (the empty string when the value is anonymous — C's
+        // `d->v.fn.name ? : ""`) and `length` (the declared arity). BOTH
+        // are compile-time approximations of Node's answers rather than
+        // equal to them — SEMANTICS.md S020 has the cases. A `name`
+        // entry IN THE TABLE wins over FN_NAME — the same precedence the
+        // rendering side (inspect.ts) needs for a redefined name.
+        // Everything else falls through to undefined, C's NULL answer
+        // reaching the same place.
         this.arm(c, K, [DK.FUNC], () => {
+          this.fnPayload(c, (x) => x.localGet(0));
+          c.structGet(this.fnT(), FN_CLOS);
+          c.call(this.fnPropsFind());
+          c.localTee(FP);
+          c.refIsNull();
+          c.i32Eqz();
+          c.ifVoid();
+          // enumT first, then hidT — get-shaped surfaces ignore
+          // enumerability (design §4's own measured split).
+          this.objPayload(c, (x) => {
+            x.localGet(FP);
+            x.structGet(this.fnPropsT(), 1);
+          });
+          c.localGet(1);
+          c.call(this.objGet());
+          c.localTee(RESULT);
+          c.refIsNull();
+          c.i32Eqz();
+          c.ifVoid();
+          c.localGet(RESULT);
+          c.return_();
+          c.end();
+          this.objPayload(c, (x) => {
+            x.localGet(FP);
+            x.structGet(this.fnPropsT(), 2);
+          });
+          c.localGet(1);
+          c.call(this.objGet());
+          c.localTee(RESULT);
+          c.refIsNull();
+          c.i32Eqz();
+          c.ifVoid();
+          c.localGet(RESULT);
+          c.return_();
+          c.end();
+          c.end();
           c.localGet(1);
           this.deps.lit(c, "name");
           c.call(this.deps.strEq());
@@ -2744,7 +2783,18 @@ export class DynBuilder {
         this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => c.unreachable());
         // NUM and BOOL have no own properties: JS reads undefined.
         c.globalGet(this.undefinedGlobal());
-        this.mb.setBody(idx, [I32, I32, this.dynRef(), this.deps.strRef()], c.bytes());
+        this.mb.setBody(
+          idx,
+          [
+            I32 /* K=3 */,
+            I32 /* IDX=4 */,
+            this.dynRef() /* M=5 */,
+            this.deps.strRef() /* MSG=6 */,
+            { kind: "ref", nullable: true, typeIndex: this.fnPropsT() } /* FP=7 */,
+            this.dynRef() /* RESULT=8 */,
+          ],
+          c.bytes(),
+        );
       },
     );
   }
@@ -2772,6 +2822,7 @@ export class DynBuilder {
       const IDX = 4;
       const A = 5;
       const MSG = 6;
+      const FP = 7;
       const concat = this.deps.concat();
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
@@ -2877,6 +2928,25 @@ export class DynBuilder {
       // borrow the throw below (that would be a wrong answer, not a loud
       // one).
       this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => c.unreachable());
+      // P4 / H-2: FUNC RETIRES S016's own write-throw — `f.x = 1` now
+      // lands in the enum table (a PLAIN assignment is enumerable,
+      // measured — the same table `Object.defineProperties({enumerable:
+      // true})` writes to, so a later `defineProps` redefining the SAME
+      // key sees and can overwrite this). ensure(), never find() — a
+      // write is the ONE place this table is allowed to allocate lazily.
+      this.arm(c, K, [DK.FUNC], () => {
+        this.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(this.fnT(), FN_CLOS);
+        c.call(this.fnPropsEnsure());
+        c.localSet(FP);
+        this.objPayload(c, (x) => {
+          x.localGet(FP);
+          x.structGet(this.fnPropsT(), 1);
+        });
+        c.localGet(1);
+        c.localGet(2);
+        c.call(this.objPut());
+      });
       c.localGet(K);
       c.i32Const(DK.UNDEF);
       c.i32Eq();
@@ -2955,7 +3025,17 @@ export class DynBuilder {
       });
       c.end();
       this.deps.throwTypeError(c, (x) => x.localGet(MSG));
-      this.mb.setBody(idx, [I32, I32, this.arrRef(), this.deps.strRef()], c.bytes());
+      this.mb.setBody(
+        idx,
+        [
+          I32 /* K=3 */,
+          I32 /* IDX=4 */,
+          this.arrRef() /* A=5 */,
+          this.deps.strRef() /* MSG=6 */,
+          { kind: "ref", nullable: true, typeIndex: this.fnPropsT() } /* FP=7 */,
+        ],
+        c.bytes(),
+      );
     });
   }
 
@@ -2986,6 +3066,7 @@ export class DynBuilder {
       const c = new Code();
       const K = 2;
       const IDX = 3;
+      const FP = 4;
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
@@ -3054,19 +3135,53 @@ export class DynBuilder {
         c.end();
       });
       // The two members a FUNC box owns — keyGet's arm, asked the other
-      // way round. Every other key falls through to false.
+      // way round — OR'd with the P4 table (BOTH enum and hidden: get-
+      // shaped surfaces ignore enumerability). Every other key falls
+      // through to false.
       this.arm(c, K, [DK.FUNC], () => {
         c.localGet(1);
         this.deps.lit(c, "name");
         c.call(this.deps.strEq());
         this.pushIsLength(c, (x) => x.localGet(1));
         c.i32Or();
+        this.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(this.fnT(), FN_CLOS);
+        c.call(this.fnPropsFind());
+        c.localTee(FP);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifResult(I32);
+        this.objPayload(c, (x) => {
+          x.localGet(FP);
+          x.structGet(this.fnPropsT(), 1);
+        });
+        c.localGet(1);
+        c.call(this.objGet());
+        c.refIsNull();
+        c.i32Eqz();
+        this.objPayload(c, (x) => {
+          x.localGet(FP);
+          x.structGet(this.fnPropsT(), 2);
+        });
+        c.localGet(1);
+        c.call(this.objGet());
+        c.refIsNull();
+        c.i32Eqz();
+        c.i32Or();
+        c.else_();
+        c.i32Const(0);
+        c.end();
+        c.i32Or();
       });
       // C routes an island receiver to the ENGINE's own Object.hasOwn;
       // unconstructible here, and `false` would be a silent wrong answer.
       this.arm(c, K, [DK.JSVAL], () => c.unreachable());
       c.i32Const(0);
-      this.mb.setBody(idx, [I32, I32], c.bytes());
+      this.mb.setBody(
+        idx,
+        [I32 /* K=2 */, I32 /* IDX=3 */, { kind: "ref", nullable: true, typeIndex: this.fnPropsT() } /* FP=4 */],
+        c.bytes(),
+      );
     });
   }
 
@@ -3167,6 +3282,157 @@ export class DynBuilder {
     });
   }
 
+  /** The SAME two-pass ordered walk `objWalk`'s OBJ arm runs (array-index
+   * keys ascending first, then everything else in insertion order),
+   * extracted so the P4 FUNC arm can point it at an `enumTable`'s own
+   * payload without duplicating the algorithm. `O` must already hold the
+   * OBJ payload to walk; every other parameter is a local INDEX in the
+   * caller's own function (this method emits into the caller's `c`, it
+   * has no locals of its own — the same convention `walkPush` already
+   * uses for `mode`/`out`/`pair`). */
+  private walkOrderedEntries(
+    c: Code,
+    O: number,
+    N: number,
+    I: number,
+    E: number,
+    BEST: number,
+    BESTV: number,
+    LAST: number,
+    IV: number,
+    MODE: number,
+    OUT: number,
+    PAIR: number,
+  ): void {
+    const objT = this.objT();
+    const entries = this.entriesArrayType();
+    const entryT = this.entryT();
+    c.localGet(O);
+    c.structGet(objT, OBJ_LEN);
+    c.localSet(N);
+    // Pass 1: index keys, ascending. Each round picks the smallest
+    // index strictly greater than the last one emitted.
+    c.f64Const(-1);
+    c.localSet(LAST);
+    c.block();
+    c.loop();
+    c.i32Const(-1);
+    c.localSet(BEST);
+    c.i32Const(0);
+    c.localSet(I);
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.localGet(N);
+    c.i32GeU();
+    c.brIf(1);
+    c.localGet(O);
+    c.structGet(objT, OBJ_ENTRIES);
+    c.localGet(I);
+    c.arrayGet(entries);
+    c.structGet(entryT, ENTRY_KEY);
+    c.call(this.idxKey());
+    c.localTee(IV);
+    c.localGet(LAST);
+    c.f64Gt();
+    c.ifVoid();
+    // `best < 0 || iv < bestv` — BESTV is only meaningful once BEST
+    // is set, so the two tests nest rather than `or`.
+    c.localGet(BEST);
+    c.i32Const(0);
+    c.i32LtS();
+    c.ifResult(I32);
+    c.i32Const(1);
+    c.else_();
+    c.localGet(IV);
+    c.localGet(BESTV);
+    c.f64Lt();
+    c.end();
+    c.ifVoid();
+    c.localGet(I);
+    c.localSet(BEST);
+    c.localGet(IV);
+    c.localSet(BESTV);
+    c.end();
+    c.end();
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+    c.localGet(BEST);
+    c.i32Const(0);
+    c.i32LtS();
+    c.brIf(1);
+    c.localGet(BESTV);
+    c.localSet(LAST);
+    c.localGet(O);
+    c.structGet(objT, OBJ_ENTRIES);
+    c.localGet(BEST);
+    c.arrayGet(entries);
+    c.localSet(E);
+    this.walkPush(
+      c,
+      MODE,
+      OUT,
+      PAIR,
+      (x) => {
+        x.localGet(E);
+        x.structGet(entryT, ENTRY_KEY);
+      },
+      (x) => {
+        x.localGet(E);
+        x.structGet(entryT, ENTRY_VALUE);
+      },
+    );
+    c.br(0);
+    c.end();
+    c.end();
+    // Pass 2: everything else, in insertion order.
+    c.i32Const(0);
+    c.localSet(I);
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.localGet(N);
+    c.i32GeU();
+    c.brIf(1);
+    c.localGet(O);
+    c.structGet(objT, OBJ_ENTRIES);
+    c.localGet(I);
+    c.arrayGet(entries);
+    c.localTee(E);
+    c.structGet(entryT, ENTRY_KEY);
+    c.call(this.idxKey());
+    c.f64Const(0);
+    c.f64Lt();
+    c.ifVoid();
+    this.walkPush(
+      c,
+      MODE,
+      OUT,
+      PAIR,
+      (x) => {
+        x.localGet(E);
+        x.structGet(entryT, ENTRY_KEY);
+      },
+      (x) => {
+        x.localGet(E);
+        x.structGet(entryT, ENTRY_VALUE);
+      },
+    );
+    c.end();
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+  }
+
   /** One `objWalk` step, per mode: KEYS pushes the key, VALUES the value,
    * ENTRIES a fresh two-element pair. `pair` is the caller's scratch. */
   private walkPush(
@@ -3231,9 +3497,6 @@ export class DynBuilder {
   objWalk(): number {
     return this.cached("objWalk", [this.dynRef(), I32], [this.dynRef()], (idx) => {
       const dynT = this.dynT();
-      const objT = this.objT();
-      const entries = this.entriesArrayType();
-      const entryT = this.entryT();
       const c = new Code();
       const MODE = 1; // the walk selector, parameter 1
       const K = 2;
@@ -3251,6 +3514,7 @@ export class DynBuilder {
       const S = 14;
       const CP = 15;
       const AB = 16;
+      const FP = 17;
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
@@ -3266,129 +3530,28 @@ export class DynBuilder {
       this.arm(c, K, [DK.OBJ], () => {
         this.objPayload(c, (x) => x.localGet(0));
         c.localSet(O);
-        c.localGet(O);
-        c.structGet(objT, OBJ_LEN);
-        c.localSet(N);
-        // Pass 1: index keys, ascending. Each round picks the smallest
-        // index strictly greater than the last one emitted.
-        c.f64Const(-1);
-        c.localSet(LAST);
-        c.block();
-        c.loop();
-        c.i32Const(-1);
-        c.localSet(BEST);
-        c.i32Const(0);
-        c.localSet(I);
-        c.block();
-        c.loop();
-        c.localGet(I);
-        c.localGet(N);
-        c.i32GeU();
-        c.brIf(1);
-        c.localGet(O);
-        c.structGet(objT, OBJ_ENTRIES);
-        c.localGet(I);
-        c.arrayGet(entries);
-        c.structGet(entryT, ENTRY_KEY);
-        c.call(this.idxKey());
-        c.localTee(IV);
-        c.localGet(LAST);
-        c.f64Gt();
+        this.walkOrderedEntries(c, O, N, I, E, BEST, BESTV, LAST, IV, MODE, OUT, PAIR);
+        this.boxArr(c, (x) => x.localGet(OUT));
+      });
+      // P4, SITE C: enumTable entries ONLY (get-shaped surfaces read both
+      // tables; LIST-shaped surfaces — this one — read enum only, H-4's
+      // ruling). No table (defineProps never called on this function) ->
+      // the empty array OUT already holds. SAME ordered walk the OBJ arm
+      // just ran, pointed at the enum table's own payload.
+      this.arm(c, K, [DK.FUNC], () => {
+        this.fnPayload(c, (x) => x.localGet(0));
+        c.structGet(this.fnT(), FN_CLOS);
+        c.call(this.fnPropsFind());
+        c.localTee(FP);
+        c.refIsNull();
+        c.i32Eqz();
         c.ifVoid();
-        // `best < 0 || iv < bestv` — BESTV is only meaningful once BEST
-        // is set, so the two tests nest rather than `or`.
-        c.localGet(BEST);
-        c.i32Const(0);
-        c.i32LtS();
-        c.ifResult(I32);
-        c.i32Const(1);
-        c.else_();
-        c.localGet(IV);
-        c.localGet(BESTV);
-        c.f64Lt();
-        c.end();
-        c.ifVoid();
-        c.localGet(I);
-        c.localSet(BEST);
-        c.localGet(IV);
-        c.localSet(BESTV);
-        c.end();
-        c.end();
-        c.localGet(I);
-        c.i32Const(1);
-        c.i32Add();
-        c.localSet(I);
-        c.br(0);
-        c.end();
-        c.end();
-        c.localGet(BEST);
-        c.i32Const(0);
-        c.i32LtS();
-        c.brIf(1);
-        c.localGet(BESTV);
-        c.localSet(LAST);
-        c.localGet(O);
-        c.structGet(objT, OBJ_ENTRIES);
-        c.localGet(BEST);
-        c.arrayGet(entries);
-        c.localSet(E);
-        this.walkPush(
-          c,
-          MODE,
-          OUT,
-          PAIR,
-          (x) => {
-            x.localGet(E);
-            x.structGet(entryT, ENTRY_KEY);
-          },
-          (x) => {
-            x.localGet(E);
-            x.structGet(entryT, ENTRY_VALUE);
-          },
-        );
-        c.br(0);
-        c.end();
-        c.end();
-        // Pass 2: everything else, in insertion order.
-        c.i32Const(0);
-        c.localSet(I);
-        c.block();
-        c.loop();
-        c.localGet(I);
-        c.localGet(N);
-        c.i32GeU();
-        c.brIf(1);
-        c.localGet(O);
-        c.structGet(objT, OBJ_ENTRIES);
-        c.localGet(I);
-        c.arrayGet(entries);
-        c.localTee(E);
-        c.structGet(entryT, ENTRY_KEY);
-        c.call(this.idxKey());
-        c.f64Const(0);
-        c.f64Lt();
-        c.ifVoid();
-        this.walkPush(
-          c,
-          MODE,
-          OUT,
-          PAIR,
-          (x) => {
-            x.localGet(E);
-            x.structGet(entryT, ENTRY_KEY);
-          },
-          (x) => {
-            x.localGet(E);
-            x.structGet(entryT, ENTRY_VALUE);
-          },
-        );
-        c.end();
-        c.localGet(I);
-        c.i32Const(1);
-        c.i32Add();
-        c.localSet(I);
-        c.br(0);
-        c.end();
+        this.objPayload(c, (x) => {
+          x.localGet(FP);
+          x.structGet(this.fnPropsT(), 1);
+        });
+        c.localSet(O);
+        this.walkOrderedEntries(c, O, N, I, E, BEST, BESTV, LAST, IV, MODE, OUT, PAIR);
         c.end();
         this.boxArr(c, (x) => x.localGet(OUT));
       });
@@ -3518,7 +3681,9 @@ export class DynBuilder {
         c.end();
         this.boxArr(c, (x) => x.localGet(OUT));
       });
-      // NUM, BOOL, FUNC, PROMISE: no own enumerable string keys.
+      // NUM, BOOL, PROMISE: no own enumerable string keys. FUNC has its
+      // OWN arm above now (P4) — the empty array here is only for the
+      // truly key-less kinds.
       this.boxArr(c, (x) => x.localGet(OUT));
       this.mb.setBody(
         idx,
@@ -3538,6 +3703,7 @@ export class DynBuilder {
           this.deps.strRef(),
           this.deps.strRef(),
           this.deps.bytesRefU8(),
+          { kind: "ref", nullable: true, typeIndex: this.fnPropsT() } /* FP=17 */,
         ],
         c.bytes(),
       );
@@ -4557,6 +4723,482 @@ export class DynBuilder {
         this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: entryT }], c.bytes());
       },
     );
+  }
+
+  /* ── P4: dyn.defineProps's OWN identity-keyed side table ──────────────
+   *
+   * C hangs an own-property table off `ScrClosure.props` (the closure,
+   * never the box: boxing the same function twice yields distinct boxes
+   * sharing one closure, and JS has ONE function object — a property
+   * write must be visible through every box). On this tier there is no
+   * single closure struct TYPE to widen — FN_CLOS is stored as `eq`
+   * precisely because its wasm type is per-SIGNATURE (the box cannot
+   * name it) — so a field cannot be added to "the closure struct"
+   * because there are many. The answer is the SAME shape `$errDyn`
+   * above already runs for the identical problem: a MODULE-GLOBAL side
+   * table keyed by FN_CLOS identity, scanned with `ref.eq`, alive for
+   * the process, deliberately not hung off the payload type.
+   *
+   * WHY FN_CLOS IS THE KEY, and why this needs no new invariant:
+   * FN_CLOS-equality is DEFINITIONALLY the relation `%w.dyn.strictEq`
+   * uses for `===` on functions — a table keyed on it cannot disagree
+   * with `===`; if two `===`-equal functions ever carried different
+   * FN_CLOS, `===` would break FIRST and this table would inherit the
+   * bug rather than create one. Keying on the dyn BOX instead (easier
+   * to reach at some call sites) IS THE BUG this design rules out by
+   * construction: a box-keyed table would diverge from `===` identity
+   * and — since OBJ/box values COPY across the `unknown` boundary
+   * (S014) while a box-keyed table entry would not follow the copy —
+   * silently vanish on exactly the crossing S014 already measures.
+   *
+   * TWO TABLES, not one flag-carrying table (H-4's ruling: `enumerable`
+   * IS honoured). `enumerable` needs a per-entry bit; widening the
+   * shared `$dynEntry` (every dyn OBJ in the program pays for one rare
+   * shape) or a parallel bitset (two structures to keep in step) both
+   * lose to the simplest option: an ENTIRELY SEPARATE table for each
+   * flag state. `enumT`/`hidT` are ordinary dyn OBJ values — the exact
+   * `objPut`/`objGet`/`objWalk` machinery every other OBJ already uses,
+   * unchanged. get/hasOwn consult BOTH (enum first); keys/render/
+   * for-in/objWalk consult enumT ONLY.
+   *
+   * LAZY, like C: `fnPropsFind` returning null is the fast path every
+   * FUNC read takes today (a program that never calls defineProps
+   * allocates nothing); `fnPropsEnsure` is the ONLY thing that ever
+   * conses a new entry, and only on a genuine miss. */
+
+  private fnPropsType: number | null = null;
+  private fnPropsHeadGlobal: number | null = null;
+
+  /** `$fnProps` — one cache entry: the function's closure identity, its
+   * two property tables, and the next link. Mirrors `$errDyn`'s own
+   * shape field-for-field, one field wider. */
+  private fnPropsT(): number {
+    if (this.fnPropsType !== null) return this.fnPropsType;
+    const closRef: ValType = { kind: "ref", nullable: true, typeIndex: EQ_HEAP };
+    const dynRef = this.dynRef();
+    this.fnPropsType = this.mb.selfStructType("dyn:fnProps", (self) => [
+      { storage: closRef, mutable: false },
+      { storage: dynRef, mutable: false },
+      { storage: dynRef, mutable: false },
+      { storage: { kind: "ref", nullable: true, typeIndex: self }, mutable: false },
+    ]);
+    return this.fnPropsType;
+  }
+
+  private fnPropsHead(): number {
+    if (this.fnPropsHeadGlobal !== null) return this.fnPropsHeadGlobal;
+    const t = this.fnPropsT();
+    this.fnPropsHeadGlobal = this.mb.addGlobal({ kind: "ref", nullable: true, typeIndex: t }, true, (w) => {
+      w.u8(0xd0); // ref.null $fnProps
+      w.sleb(t);
+    });
+    return this.fnPropsHeadGlobal;
+  }
+
+  /** %w.dyn.fnPropsFind(clos) -> $fnProps? — the scan alone, no build:
+   * `fnPropsEnsure` is the ONLY writer, so every ordinary READ site
+   * (keyGet/hasOwn/objWalk) calls THIS, never `fnPropsEnsure`, and pays
+   * nothing beyond the scan on the fast (no-defineProps-ever-called)
+   * path. */
+  fnPropsFind(): number {
+    return this.cached(
+      "fnPropsFind",
+      [{ kind: "ref", nullable: true, typeIndex: EQ_HEAP }],
+      [{ kind: "ref", nullable: true, typeIndex: this.fnPropsT() }],
+      (idx) => {
+        const entryT = this.fnPropsT();
+        const head = this.fnPropsHead();
+        const c = new Code();
+        const N = 1;
+        c.globalGet(head);
+        c.localSet(N);
+        c.block();
+        c.loop();
+        c.localGet(N);
+        c.refIsNull();
+        c.brIf(1);
+        c.localGet(N);
+        c.structGet(entryT, 0); // clos
+        c.localGet(0);
+        c.refEq();
+        c.ifVoid();
+        c.localGet(N);
+        c.return_();
+        c.end();
+        c.localGet(N);
+        c.structGet(entryT, 3); // next
+        c.localSet(N);
+        c.br(0);
+        c.end();
+        c.end();
+        c.refNull(entryT);
+        this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: entryT }], c.bytes());
+      },
+    );
+  }
+
+  /** %w.dyn.fnPropsEnsure(clos) -> $fnProps — find, else cons a fresh
+   * entry with two EMPTY OBJ tables and publish it as the new head
+   * before returning (the SAME "publish before answering, so the next
+   * crossing finds it" discipline `fromError` uses). The only call
+   * site is `defineProps` itself. */
+  fnPropsEnsure(): number {
+    return this.cached(
+      "fnPropsEnsure",
+      [{ kind: "ref", nullable: true, typeIndex: EQ_HEAP }],
+      [{ kind: "ref", nullable: true, typeIndex: this.fnPropsT() }],
+      (idx) => {
+        const entryT = this.fnPropsT();
+        const head = this.fnPropsHead();
+        const c = new Code();
+        const HIT = 1;
+        const ENUM_T = 2;
+        const HID_T = 3;
+        c.localGet(0);
+        c.call(this.fnPropsFind());
+        c.localTee(HIT);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifResult({ kind: "ref", nullable: true, typeIndex: entryT });
+        c.localGet(HIT);
+        c.else_();
+        this.pushNewObj(c, false);
+        c.localSet(ENUM_T);
+        this.pushNewObj(c, false);
+        c.localSet(HID_T);
+        c.localGet(0);
+        this.boxObj(c, (x) => x.localGet(ENUM_T));
+        this.boxObj(c, (x) => x.localGet(HID_T));
+        c.globalGet(head);
+        c.structNew(entryT);
+        c.globalSet(head);
+        c.globalGet(head);
+        c.end();
+        this.mb.setBody(
+          idx,
+          [
+            { kind: "ref", nullable: true, typeIndex: entryT },
+            this.objRef(),
+            this.objRef(),
+          ],
+          c.bytes(),
+        );
+      },
+    );
+  }
+
+  /** %w.dyn.defineProps(target, descs) -> target — `Object.
+   * defineProperties(target, descs)`, `scr_dyn_define_props` ported —
+   * WHAT C GETS RIGHT kept verbatim (the target-check text, the
+   * ToString-not-inspect descriptor message, a missing `value` ->
+   * undefined, the return-target identity, the loud non-Type accessor
+   * Error's exact wording); FOUR places this rewrites C's OWN shape to
+   * match NODE instead (measured, not ported):
+   *   - C-3: C throws on a non-OBJECT `descs`; Node no-ops (ToObject on
+   *     a primitive has no own keys to iterate). A NULLISH descs is
+   *     DIFFERENT again — Node's own ToObject(null/undefined) throws
+   *     BEFORE defineProperties' own body ever runs, own measurement —
+   *     so nullish still throws (ToObject's own text), non-nullish
+   *     non-object no-ops.
+   *   - C-4: C requires `kind == OBJ` for EVERY descriptor value; Node's
+   *     own ToPropertyDescriptor just does ordinary property GETS on
+   *     it, which works on anything Type()===Object — `isObject()`
+   *     (P2's own predicate) OR'd with FUNC, exactly the design's own
+   *     phrasing. The four field reads (value/get/set/enumerable) go
+   *     through the GENERIC `keyGet` dispatch, not `objGet` directly, so
+   *     an ARR or FUNC descriptor value reads its fields the same way
+   *     Node's own property gets would (answering undefined for all
+   *     four on an ordinary array/function, which is what makes C-4's
+   *     "defines undefined" observable behavior fall out for free
+   *     rather than needing its own special case).
+   *   - H-1: an OBJ target's NON-enumerable case REFUSES BY NAME (a
+   *     new, loud, REGISTERED divergence where Node succeeds — S-entry
+   *     cites this exact reach) rather than silently storing it
+   *     visibly, C's own behavior.
+   *   - H-4: `enumerable` IS HONOURED for a FUNC target (C-2's own gap)
+   *     — the SITE A table split, not a single visible-only table.
+   * NOT PORTED: the two `scr_dyn_isl_fence` calls C opens with, and any
+   * pending-check between them — DK.JSVAL is permanently unreachable on
+   * this tier (dyn.ts:93-108's own deletion), so an island fence here
+   * would be dead code, the same omission P2 already made elsewhere. */
+  defineProps(): number {
+    return this.cached("defineProps", [this.dynRef(), this.dynRef()], [this.dynRef()], (idx) => {
+      const dynT = this.dynT();
+      const c = new Code();
+      const TK = 2;
+      const DSK = 3;
+      const DENTS = 4;
+      const DVEC = 5;
+      const N = 6;
+      const I = 7;
+      const PAIR = 8;
+      const PP = 9;
+      const KEY = 10;
+      const DV = 11;
+      const DVK = 12;
+      const GETV = 13;
+      const SETV = 14;
+      const VALUE = 15;
+      const ENUMD = 16;
+      const ENUMB = 17;
+      const FP = 18;
+
+      // Target: OBJ or FUNC, else Node's own TypeError (verbatim from C).
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.localSet(TK);
+      c.localGet(TK);
+      c.i32Const(DK.OBJ);
+      c.i32Eq();
+      c.localGet(TK);
+      c.i32Const(DK.FUNC);
+      c.i32Eq();
+      c.i32Or();
+      c.i32Eqz();
+      c.ifVoid();
+      this.deps.throwTypeError(c, (x) => this.deps.lit(x, "Object.defineProperties called on non-object"));
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+
+      // Descs: nullish throws ToObject's own text (measured — this is a
+      // DIFFERENT throw than the non-object one above, reached before
+      // defineProperties' own body ever inspects descs). EVERY OTHER
+      // shape is handed to objWalk's own per-kind dispatch (mode 2,
+      // entries) — Node's own defineProperties does ToObject(descs)
+      // then walks ITS OWN ENUMERABLE KEYS, and objWalk already answers
+      // exactly that for every kind on this tier, so there is no
+      // separate OBJ-only gate to write:
+      //   - OBJ/ARR/BYTES walk their real own-enumerable entries — an
+      //     ARR entry `[{value:1,enumerable:true}]` defines key "0"
+      //     (MEASURED); a BYTES entry's own elements are raw numbers,
+      //     so C-4's own object-like check below throws on the FIRST
+      //     one for any non-empty typed array (MEASURED: `new
+      //     Uint8Array([9,8])` throws "...: 9").
+      //   - FUNC walks its OWN `$fnProps` enumT (P4's own table) — a
+      //     bare function has none and no-ops (objWalk's own empty
+      //     fallback); a function WITH an enumerable own property
+      //     process it as a real descriptor (MEASURED).
+      //   - STRING walks its OWN characters, each one immediately
+      //     failing the object-like check below — reproducing Node's
+      //     real "Property description must be an object: <char>"
+      //     BYTE-FOR-BYTE, including WHICH character: the loop below
+      //     processes entries IN ORDER and throws on the first bad
+      //     one, so `"ab"` names `"a"` (MEASURED) and `""` walks zero
+      //     entries, i.e. no-ops (MEASURED — the length-0 boundary a
+      //     naive `typeof` check cannot see).
+      //   - NUM/BOOL/PROMISE/HANDLE (no own enumerable keys, no
+      //     producer, or both) answer objWalk's own EMPTY-array
+      //     fallback, so the loop below does nothing — Node's own
+      //     no-op for exactly these kinds (MEASURED: 5, true, 0, -0,
+      //     Symbol(), a boxed Number all no-op).
+      c.localGet(1);
+      c.structGet(dynT, DYN_KIND);
+      c.localSet(DSK);
+      c.localGet(DSK);
+      c.i32Const(DK.UNDEF);
+      c.i32Eq();
+      c.localGet(DSK);
+      c.i32Const(DK.NULL);
+      c.i32Eq();
+      c.i32Or();
+      c.ifVoid();
+      this.deps.throwTypeError(c, (x) => this.deps.lit(x, "Cannot convert undefined or null to object"));
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      c.localGet(1);
+      c.i32Const(2); // Object.entries mode
+      c.call(this.objWalk());
+      c.localSet(DENTS);
+      this.arrPayload(c, (x) => x.localGet(DENTS));
+      c.localSet(DVEC);
+      this.arrLen(c, (x) => x.localGet(DVEC));
+      c.localSet(N);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeU();
+      c.brIf(1);
+      this.arrAt(c, (x) => x.localGet(DVEC), (x) => x.localGet(I));
+      c.localSet(PAIR);
+      this.arrPayload(c, (x) => x.localGet(PAIR));
+      c.localSet(PP);
+      this.arrAt(c, (x) => x.localGet(PP), (x) => x.i32Const(0));
+      c.structGet(dynT, DYN_REF);
+      c.refCast(this.deps.strType());
+      c.localSet(KEY);
+      this.arrAt(c, (x) => x.localGet(PP), (x) => x.i32Const(1));
+      c.localTee(DV);
+      c.structGet(dynT, DYN_KIND);
+      c.localSet(DVK);
+      // C-4: object-LIKE, not kind==OBJ — isObject() (ARR/OBJ/BYTES/
+      // PROMISE/HANDLE) OR FUNC (isObject() excludes FUNC by design,
+      // typeof "function" not "object" — the SAME reason keyGet's own
+      // FUNC arm is separate from its OBJ arm).
+      c.localGet(DV);
+      c.call(this.isObject());
+      c.localGet(DVK);
+      c.i32Const(DK.FUNC);
+      c.i32Eq();
+      c.i32Or();
+      c.i32Eqz();
+      c.ifVoid();
+      this.deps.throwTypeError(c, (x) => {
+        this.deps.lit(x, "Property description must be an object: ");
+        x.localGet(DV);
+        x.call(this.toStr());
+        x.call(this.deps.concat());
+      });
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      // Accessors: the loud, non-Type Error, C's own wording verbatim
+      // (H-3 — Node accepts get/set, this tier does not model them).
+      // "Present" is a KIND check against DK.UNDEF, not identity against
+      // the canonical undefined global — keyGet's missing-key answer is
+      // not guaranteed to be that exact singleton on every path, but
+      // every undefined value carries DK.UNDEF (truthy()'s own arm, and
+      // every DSK/TK gate above, all key off the tag the same way).
+      c.localGet(DV);
+      this.deps.lit(c, "get");
+      c.i32Const(1);
+      c.call(this.keyGet());
+      c.localSet(GETV);
+      c.localGet(DV);
+      this.deps.lit(c, "set");
+      c.i32Const(1);
+      c.call(this.keyGet());
+      c.localSet(SETV);
+      c.localGet(GETV);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.UNDEF);
+      c.i32Ne();
+      c.localGet(SETV);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.UNDEF);
+      c.i32Ne();
+      c.i32Or();
+      c.ifVoid();
+      this.deps.throwError(
+        c,
+        "%Error",
+        "Error",
+        (x) => this.deps.lit(x, "accessor (get/set) property descriptors on a dynamic value are not supported yet"),
+      );
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      // value: a missing key already reads undefined through keyGet.
+      c.localGet(DV);
+      this.deps.lit(c, "value");
+      c.i32Const(1);
+      c.call(this.keyGet());
+      c.localSet(VALUE);
+      // enumerable: H-4 — which table this entry lands in (FUNC target
+      // only; the OBJ target's own H-1 gate runs below). `truthy()`
+      // already answers a plain i32 0/1 — no ladder needed.
+      c.localGet(DV);
+      this.deps.lit(c, "enumerable");
+      c.i32Const(1);
+      c.call(this.keyGet());
+      c.localSet(ENUMD);
+      c.localGet(ENUMD);
+      c.call(this.truthy());
+      c.localSet(ENUMB);
+      // Target dispatch.
+      c.localGet(TK);
+      c.i32Const(DK.OBJ);
+      c.i32Eq();
+      c.ifVoid();
+      // H-1: a non-enumerable OBJ-target property REFUSES BY NAME — a
+      // new, loud, REGISTERED divergence (Node succeeds silently; the
+      // S-entry names this exact reach). enumerable:true works normally
+      // through the ordinary OBJ path (measured: OBJ has no hidden
+      // plane, and unlike FUNC there is no closure to hang one off).
+      c.localGet(ENUMB);
+      c.i32Eqz();
+      c.ifVoid();
+      this.deps.throwError(
+        c,
+        "%Error",
+        "Error",
+        (x) =>
+          this.deps.lit(
+            x,
+            "Object.defineProperties: a non-enumerable property descriptor on a plain-object dynamic value is not supported yet",
+          ),
+      );
+      c.refNull(dynT);
+      c.return_();
+      c.else_();
+      this.objPayload(c, (x) => x.localGet(0));
+      c.localGet(KEY);
+      c.localGet(VALUE);
+      c.call(this.objPut());
+      c.end();
+      c.else_();
+      this.fnPayload(c, (x) => x.localGet(0));
+      c.structGet(this.fnT(), FN_CLOS);
+      c.call(this.fnPropsEnsure());
+      c.localSet(FP);
+      // H-4: enumerable selects which of fnProps' TWO tables (field 1 =
+      // enumT, field 2 = hidT — fnPropsT's own layout) receives this
+      // entry; both branches otherwise do the identical objPut.
+      c.localGet(ENUMB);
+      c.ifVoid();
+      this.objPayload(c, (x) => {
+        x.localGet(FP);
+        x.structGet(this.fnPropsT(), 1);
+      });
+      c.localGet(KEY);
+      c.localGet(VALUE);
+      c.call(this.objPut());
+      c.else_();
+      this.objPayload(c, (x) => {
+        x.localGet(FP);
+        x.structGet(this.fnPropsT(), 2);
+      });
+      c.localGet(KEY);
+      c.localGet(VALUE);
+      c.call(this.objPut());
+      c.end();
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(0);
+      this.mb.setBody(
+        idx,
+        [
+          I32 /* TK=2 */,
+          I32 /* DSK=3 */,
+          this.dynRef() /* DENTS=4 */,
+          this.arrRef() /* DVEC=5 */,
+          I32 /* N=6 */,
+          I32 /* I=7 */,
+          this.dynRef() /* PAIR=8 */,
+          this.arrRef() /* PP=9 */,
+          this.deps.strRef() /* KEY=10 */,
+          this.dynRef() /* DV=11 */,
+          I32 /* DVK=12 */,
+          this.dynRef() /* GETV=13 */,
+          this.dynRef() /* SETV=14 */,
+          this.dynRef() /* VALUE=15 */,
+          this.dynRef() /* ENUMD=16 */,
+          I32 /* ENUMB=17 */,
+          { kind: "ref", nullable: true, typeIndex: this.fnPropsT() } /* FP=18 */,
+        ],
+        c.bytes(),
+      );
+    });
   }
 
   /* ── prototype-method DISPATCH (scr_dyn_invoke) ───────────────────────

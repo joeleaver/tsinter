@@ -10701,6 +10701,19 @@ class Assembler {
           this.emitPendingCheck();
           return;
         }
+        if (e.fn === "dyn.defineProps") {
+          // Object.defineProperties(target, descs) — P4 (board #98). The
+          // helper throws Node's TypeErrors (non-object target, nullish
+          // descs, a non-object-like descriptor value), the loud
+          // not-yet-supported Errors (an accessor descriptor; H-1's
+          // non-enumerable OBJ-target write), or answers the target —
+          // every path is may-throw, so the site owns the pending check.
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.dyn.defineProps());
+          this.emitPendingCheck();
+          return;
+        }
         if (e.fn === "dyn.iterPack") {
           // The for-of / rest drain over a dyn source. The second
           // argument is the compile-time refusal text (empty where the

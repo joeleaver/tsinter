@@ -2337,15 +2337,17 @@ test("S018: the not-a-function TypeError names the callee's SOURCE text", async 
   );
 });
 
-test("S019/S016: a boxed function's members, its String() and the write it refuses", async () => {
-  // What a FUNC box answers, and the three places that is not Node.
-  // `typeof` and the PRESENCE forms are exact — the last two being where
-  // this lane deliberately leaves the C runtime behind (scr_dyn_has_own
-  // has no FUNC arm, so the C lane answers false for all six). String()
-  // is S019: the source is gone in a compiled program, so this is the
-  // native-code form Node itself prints for its builtins. The WRITE is
-  // S016: functions are objects in Node and `f.x = 1` sticks there,
-  // while a FUNC payload here has no table to put it in.
+test("S019/S016: a boxed function's members, its String() and the write it (no longer) refuses", async () => {
+  // What a FUNC box answers, and the two remaining places that is not
+  // Node. `typeof` and the PRESENCE forms are exact — the last two
+  // being where this lane deliberately leaves the C runtime behind
+  // (scr_dyn_has_own has no FUNC arm, so the C lane answers false for
+  // all six). String() is S019: the source is gone in a compiled
+  // program, so this is the native-code form Node itself prints for
+  // its builtins. The WRITE was S016's own FUNC-write arm — RETIRED as
+  // of increment 23 P4 (board #98): a boxed function now carries a
+  // real property table (dyn.ts's `$fnProps`), so `f.x = 1` succeeds
+  // and reads back exactly like Node, matching S016's own amendment.
   //
   // The `name` and `length` READS happen to agree with Node on both
   // functions here — each is defined AT the binding it is boxed from and
@@ -2384,7 +2386,7 @@ test("S019/S016: a boxed function's members, its String() and the write it refus
       // the type annotations are blanked to SPACES rather than removed:
       //   "function named(a        , b        )         { return a + b; }"
       "function named() { [native code] }",
-      "Cannot create property 'x' on function", // S016 — Node writes it
+      "wrote", // S016's FUNC-write arm is RETIRED (P4, board #98) — matches Node
       "",
     ].join("\n"),
   );
@@ -3553,7 +3555,7 @@ test("classes: a type family that references itself in every direction", async (
   expect(stdout.toString("utf8")).toBe("root 1 leaf 3\ntrue false\n4 leaf\n");
 });
 
-test("classes: increment 22 stage A lifts the gate for the emitter root; stage B lifts it again for %Readable; stage C lifts it a THIRD time, at the CLASS level, for all five stream roots — %Duplex/%Transform/%PassThrough still refuse, but downstream of planning now, at their own construction libCalls", async () => {
+test("classes: increment 22 stage A lifts the gate for the emitter root; stage B lifts it again for %Readable; stage C lifts it a THIRD time, at the CLASS level, for all five stream roots — %Duplex/%Transform/%PassThrough already construct AND report `instanceof` correctly (MEASURED at 753640d, the commit BEFORE increment 23 began — this pin's own assertion was STALE since at or before that point, not something increment 23 P4 changed; rev-23's own measurement, re-confirmed independently: a clean checkout at 753640d builds, validates, and runs all three byte-exact against Node on this exact shape). P4 (board #98) did not unblock this — it only SURFACED the stale pin while touching an adjacent area; the actual cause (what lifted duplex.init/transform.init/passthrough.init, and whether it was deliberate) is an increment-22 question this pin does not answer. Their OWN read/write stream behavior beyond construction remains unverified and is NOT claimed by this pin", async () => {
   // The EventEmitter rock is gone: classes.ts's rootKind now answers
   // "emitter" (liftable) rather than "runtime" for a %EventEmitter-rooted
   // class, and plan() injects the two-field ScrEmitter prefix (registry
@@ -3650,8 +3652,17 @@ test("classes: increment 22 stage A lifts the gate for the emitter root; stage B
   }
 
   // %Duplex/%Transform/%PassThrough: the CLASS plans (no class:extends-
-  // runtime refusal anywhere in the survey below), but construction still
-  // refuses — downstream, at each root's own libCall, named and loud.
+  // runtime refusal anywhere in the survey below), and construction
+  // SUCCEEDS too — but this is NOT increment 23 P4's doing. MEASURED at
+  // 753640d (the commit before increment 23 began): a clean checkout
+  // there already builds, validates, and runs all three byte-exact
+  // against Node on this exact shape (own construction, separate from
+  // this file). This test's own OLD assertion (`.ok === false`, an
+  // SC3001 refusal naming duplex.init/transform.init/passthrough.init)
+  // was already stale at that point — P4 never touched it; P4 only
+  // surfaced the staleness while building an adjacent feature. What
+  // actually lifted these libCalls, and whether it was deliberate, is
+  // an increment-22 question this pin does not answer.
   const duplexStream = await buildWasm(
     "extends-duplex.ts",
     [
@@ -3665,11 +3676,11 @@ test("classes: increment 22 stage A lifts the gate for the emitter root; stage B
       "",
     ].join("\n"),
   );
-  expect(duplexStream.ok).toBe(false);
-  if (!duplexStream.ok) {
-    expect(duplexStream.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
-    expect(duplexStream.diagnostics[0]?.message).toContain("libCall:duplex.init");
-    expect(duplexStream.wasmSurvey).not.toContain("class:extends-runtime");
+  expect(duplexStream.ok).toBe(true);
+  if (duplexStream.ok) {
+    expect(WebAssembly.validate(readFileSync(duplexStream.binaryPath))).toBe(true);
+    const { stdout } = await runWasm(duplexStream.binaryPath);
+    expect(stdout.toString("utf8")).toBe("true\n");
   }
 
   const transformStream = await buildWasm(
@@ -3684,11 +3695,11 @@ test("classes: increment 22 stage A lifts the gate for the emitter root; stage B
       "",
     ].join("\n"),
   );
-  expect(transformStream.ok).toBe(false);
-  if (!transformStream.ok) {
-    expect(transformStream.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
-    expect(transformStream.diagnostics[0]?.message).toContain("libCall:transform.init");
-    expect(transformStream.wasmSurvey).not.toContain("class:extends-runtime");
+  expect(transformStream.ok).toBe(true);
+  if (transformStream.ok) {
+    expect(WebAssembly.validate(readFileSync(transformStream.binaryPath))).toBe(true);
+    const { stdout } = await runWasm(transformStream.binaryPath);
+    expect(stdout.toString("utf8")).toBe("true\n");
   }
 
   const passThroughStream = await buildWasm(
@@ -3701,11 +3712,11 @@ test("classes: increment 22 stage A lifts the gate for the emitter root; stage B
       "",
     ].join("\n"),
   );
-  expect(passThroughStream.ok).toBe(false);
-  if (!passThroughStream.ok) {
-    expect(passThroughStream.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
-    expect(passThroughStream.diagnostics[0]?.message).toContain("libCall:passthrough.init");
-    expect(passThroughStream.wasmSurvey).not.toContain("class:extends-runtime");
+  expect(passThroughStream.ok).toBe(true);
+  if (passThroughStream.ok) {
+    expect(WebAssembly.validate(readFileSync(passThroughStream.binaryPath))).toBe(true);
+    const { stdout } = await runWasm(passThroughStream.binaryPath);
+    expect(stdout.toString("utf8")).toBe("true\n");
   }
 });
 
