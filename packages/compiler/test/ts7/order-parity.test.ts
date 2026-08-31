@@ -33,10 +33,15 @@
  * Frontend-only (no lowering, no clang), so an entry costs one tsgo
  * program. The default lane runs a deterministic subset weighted toward
  * the risky shapes (every JS/CJS/MJS entry, every multi-file directory
- * case, every diagnostics fixture, the npm and strictness fixtures);
- * SCRIPTC_TS7_ALL=1 widens to the ENTIRE recorded set — the acceptance
- * sweep and the upgrade playbook's step 2. */
+ * case, every diagnostics fixture, the npm and strictness fixtures), plus
+ * a hash-keyed slice of the plain-TS corpus (picked by a stable hash of
+ * each file's own repo-relative path, so membership is a property of the
+ * file, not of its neighbors — adding or removing other corpus files
+ * elsewhere never rotates who's sampled); SCRIPTC_TS7_ALL=1 widens to the
+ * ENTIRE recorded set — the acceptance sweep and the upgrade playbook's
+ * step 2. */
 
+import { createHash } from "node:crypto";
 import { globSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -96,15 +101,33 @@ function allEntries(): string[] {
   ];
 }
 
+/** Selects a stable ~1/40 slice of a list of REPO-RELATIVE paths, keyed by
+ * each path's own hash — membership is a property of the path itself, not
+ * of its neighbors, so it is invariant under inserting or removing OTHER
+ * paths in the list (unlike `i % 40 === 0`, which shifts every downstream
+ * index whenever the list changes and so rotates ~1-4 members on every
+ * corpus add). Input and output are both repo-relative paths; callers that
+ * hold absolute paths (e.g. `pickEntries` below) must map to relative
+ * before calling and back to absolute after. */
+function pickHashSlice(relpaths: string[]): string[] {
+  return relpaths.filter(
+    (relpath) => createHash("sha256").update(relpath).digest().readUInt32BE(0) % 40 === 0,
+  );
+}
+
 function pickEntries(): string[] {
   const all = allEntries();
   if (FULL) return all;
   // The default subset: everything whose SHAPE is order/preflight-sensitive,
-  // plus a deterministic slice of the plain-TS corpus.
+  // plus a hash-keyed slice of the plain-TS corpus — selection keys off each
+  // file's own path (not its position in the sorted list), so it can't
+  // rotate when corpus files are added or removed elsewhere.
   const corpus = entriesUnder("tests/corpus");
   const rest = all.filter((f) => !corpus.includes(f));
   const risky = corpus.filter((f) => !f.endsWith(".ts") || f.endsWith("/main.ts"));
-  const plain = corpus.filter((f) => !risky.includes(f)).filter((_, i) => i % 40 === 0);
+  const plainCandidates = corpus.filter((f) => !risky.includes(f));
+  const picked = new Set(pickHashSlice(plainCandidates.map((f) => f.slice(repoRoot.length + 1))));
+  const plain = plainCandidates.filter((f) => picked.has(f.slice(repoRoot.length + 1)));
   return [...risky, ...plain, ...rest];
 }
 
@@ -173,4 +196,36 @@ test("harness sanity: the subset always covers the order-sensitive shapes", () =
   expect(entries.some((f) => f.endsWith(".js"))).toBe(true);
   expect(entries.some((f) => f.includes("/main."))).toBe(true);
   expect(entries.some((f) => readFileSync(f, "utf8").includes("require("))).toBe(true);
+});
+
+test("plain-corpus hash slice is per-path stable (inserting a corpus file must not rotate existing picks)", () => {
+  const corpus = entriesUnder("tests/corpus");
+  const risky = corpus.filter((f) => !f.endsWith(".ts") || f.endsWith("/main.ts"));
+  const plainRel = corpus.filter((f) => !risky.includes(f)).map((f) => f.slice(repoRoot.length + 1));
+  const picks = new Set(pickHashSlice(plainRel));
+
+  // The real corpus is numerically prefixed end to end (001-…998-, then
+  // 1000-…), so an ALPHABETIC synthetic name would sort to the very end,
+  // shift no index, and let an index-keyed mutation through undetected.
+  // Use a numerically low name and assert it actually lands at the front —
+  // so a later rename of this constant can't silently defang the pin.
+  const synthetic = "tests/corpus/0000-synthetic-probe.ts";
+  const withInsertion = [...plainRel, synthetic].sort();
+  expect(withInsertion.indexOf(synthetic)).toBe(0);
+
+  const picksAfterInsertion = new Set(pickHashSlice(withInsertion));
+  for (const p of picks) {
+    expect(picksAfterInsertion.has(p), `${p}: dropped after inserting a new corpus file`).toBe(true);
+  }
+});
+
+test("plain-corpus hash slice density stays in a sane band (guards against a degenerate hash)", () => {
+  const corpus = entriesUnder("tests/corpus");
+  const risky = corpus.filter((f) => !f.endsWith(".ts") || f.endsWith("/main.ts"));
+  const plainRel = corpus.filter((f) => !risky.includes(f)).map((f) => f.slice(repoRoot.length + 1));
+  const picks = pickHashSlice(plainRel);
+  // ~1/40 of ~858 plain files lands ~21-25; this is a guard against an
+  // all-in/all-out degenerate hash, not a precise-count oracle.
+  expect(picks.length).toBeGreaterThanOrEqual(15);
+  expect(picks.length).toBeLessThanOrEqual(45);
 });
