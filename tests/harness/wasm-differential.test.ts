@@ -2831,6 +2831,21 @@ const TIER_FLOOR: string[] = [
   "1773-assert-dyn-exit.ts",
   "2161-js-object-literal-identity.cjs",
   "2165-js-throw-dyn.cjs",
+  // Increment 23 P3 — the three riders (predicted then confirmed, per
+  // the freeze's own predictions.txt): expr:fieldIncDec:dyn (a checked-
+  // dynamic class field's `++`/`--`, dynCheck-out/±1/box-back, SEMANTICS.
+  // md S009's third amendment); url.fileURLToPathStr (the file-scheme
+  // subset of scr_url.c's parser, its own new file url.ts, SEMANTICS.md
+  // S060's two scope traps — dot-segments, non-ASCII bytes); timers.
+  // queueMicrotask + Dyn (a `mtFrame <: frameBase` subtype answering the
+  // "a plain closure widens the waiter queue" objection, ZERO type
+  // widening, the SAME `%w.async.hop` enqueue the bare `await` turn
+  // already uses). 753 -> 756, exactly the predicted movers; the three
+  // bucket-advance predictions (1730 -> libCall:sym.new, 1356 ->
+  // libCall:url.href, 1611 -> libCall:process.cwd) confirmed exactly.
+  "1710-cjs-export-class/main.js",
+  "2385-builtin-reexport-facade/main.ts",
+  "2282-queue-microtask.cjs",
 ];
 
 interface RunResult {

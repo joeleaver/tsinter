@@ -170,6 +170,25 @@ interval-callback one; the wasm nexttick unit test pins the
 double-print sweep across all three uncaught sites plus S010's rejection
 path (never more than one labeled line each).
 
+**Amendment (increment 23 P3, `queueMicrotask`):** a FOURTH site reaches
+this SAME "report, then trap" reporter — a queued microtask's own
+callback throwing uncaught. `%w.async.mtResume` (the shared resume
+closure `timers.queueMicrotask`'s own frame-subtype design mints —
+design note in FINDINGS) checks the pending cell immediately after
+calling the user's closure and, on a throw, calls `%w.err.
+reportUncaught` directly — the SAME reporter, the SAME "Uncaught " +
+rendered-reason text, never through `_tick`'s own per-callback check
+(a queueMicrotask-only program has no `_tick` at all — its OWN drain
+runs once from `_start`). Node's real behavior matches exactly: an
+uncaught throw from inside a microtask callback crashes the process
+the same as any other uncaught exception. **Tested by:** `packages/
+compiler/test/wasm-queuemicrotask.test.ts`'s throw-inside-microtask
+pin (exit code + stderr byte-exact, via `runWasmToTrap` — the harness
+skips the stderr compare on nonzero exit, unchanged); mutation-
+confirmed (own hand-verification, reverted, hash equal before/after):
+routing the pending check to a dead condition reddens that pin by
+name.
+
 ## S008 — Wasm tier: string `repeat`/`pad` size cap is 2^31 units
 
 `String.prototype.repeat` with a negative or infinite count traps (the
@@ -236,6 +255,43 @@ reference LLVM lane produces byte-identical output for the same source
 coercion) landed in stage A. **Tested by:** the increment-21 unit pins
 (happy and failing composite exits diffed against the compiled C
 reference).
+
+**Amendment (increment 23 P3, `++`/`--` on a checked-dynamic field):** a
+THIRD site reaches the SAME dynCheck-validates-instead-of-erasing
+mechanism — `expr:fieldIncDec:dyn` (`obj.field++`/`--obj.field`/the
+symbol-keyed spelling `--this[kSym]`, both prefix and postfix) over a
+class field whose declared type is `unknown` (a "CHECKED-DYNAMIC"
+field: an implicit-any assignment in a plain JS constructor —
+`isJsSourceFile`-gated; a TS file with an explicit `unknown` field
+type does not reach this arm). Real JS `++`/`--` NEVER throws on a
+non-number operand — it performs `ToNumber()` coercion silently
+(`"abc"++` evaluates to `NaN`, no throw, in real Node); this tier
+instead dynChecks the number OUT of the field (the identical
+`dynCheckHelper`/root-path/`emitPendingCheck` machinery the entry's
+body and both prior amendments already use), computes `±1`, and boxes
+the result back — a catchable `TypeError` on a non-number, never a
+silent `NaN`. Measured (own construction, node v24.18.1 vs this tier,
+byte-identical message shape to the two existing amendments):
+
+    class C { constructor(n) { this.n = n; } inc() { return this.n++; } }
+    const c = new C('abc');
+    try { c.inc(); } catch (e) { /* this tier: TypeError, "expected number at $, got string" */ }
+
+Node's own `c.inc()` above returns `NaN` silently and never throws —
+this is NOT a Node divergence being matched; it is this tier's OWN
+established checked-dynamic boundary stance, extended to a third
+reachable site. **Tested by:** the wasm emitter/corpus pins in
+`packages/compiler/test/wasm-fieldincdec.test.ts` — prefix/postfix
+`++`/`--`, the non-number `TypeError` arm (confirmed `instanceof
+TypeError`, message byte-identical to the entry's own established
+format), and corpus 1710 (claimed, runs) and 1730 (the symbol-keyed
+spelling, `countdown.js` verbatim, COMPILES — its own first refusal
+moved off `expr:fieldIncDec:dyn` onto `libCall:sym.new`, so `--this
+[kLimit]` is confirmed to compile clean, not confirmed to run; 1730 is
+not claimed by this rider). Mutation-confirmed (own hand-verification,
+reverted, hash of `emitter.ts` equal before/after): breaking the `±1`
+arithmetic or skipping the box-back step reddens the arithmetic pin by
+name.
 
 ## S010 — Wasm tier: an unhandled promise rejection reports as a trap; stderr is not Node's
 
@@ -4291,3 +4347,212 @@ caret's 80-unit boundary" pin (increment 23 P2b) and by
 `wasm-assert-core.test.ts`'s own P1-era straddle; neither pin claims to
 test the constant-vs-terminal-read distinction itself, only the
 constant's own correct value.
+
+## S060 — `url.fileURLToPathStr`'s file-scheme parser is narrower than Node's WHATWG parser on three axes: dot-segment resolution, percent-DECODED non-ASCII path bytes, and malformed percent-escapes — each traps by NAME rather than a silent wrong answer *(wasm tier)*
+
+Increment 23 P3's rider 2 builds `url.fileURLToPath(str)`'s posix arm
+(reference: `scr_url.c:344-709` — `scr_url_new` + `parse_rooted_path` +
+`scr_url_to_path_impl`) narrower than both the C reference and Node's
+own WHATWG parser on three axes, each a NAMED runtime trap (rule 1:
+never a silently wrong path) rather than a ported behavior.
+
+**Amendment (increment 23 P3 fix round F2-p3, rev-23's axis-D sweep,
+finding F-1) — REAL gaps closed, not just documented; genuine scope-
+boundary bugs fixed:** rev-23 found the parser silently returned a
+WRONG path (not merely an incomplete one) on FOUR input classes, none
+registered anywhere — and one of them is corpus-reachable TODAY: 1356
+line 9 is `fileURLToPath('file:///tmp/%C3%A9')`, and the subject printed
+`/tmp/Ã©` where Node prints `/tmp/café` (a byte-wise decode of café's
+UTF-8 bytes — mojibake, not merely "not yet supported"). THREE of the
+four classes are FIXED this round (query/fragment stripping, backslash
+normalization; and, from a follow-up class-4 ruling that measured the
+RAW half of the fourth class separately, raw non-ASCII code units too
+— all no longer divergences, see below). Only the malformed-escape
+class and the ENCODED half of the non-ASCII class remain this entry's
+named traps, (b) and (c) below.
+
+**FIXED this round (no longer divergences from Node — measured,
+node v24.18.1):**
+  - *Query and fragment stripping.* The path is truncated at the first
+    UNESCAPED `?` or `#` before decoding — this IS Node's own pathname
+    extraction, not a scope choice: `file:///tmp/x?q=1` -> `/tmp/x`;
+    `file:///tmp/x#frag` -> `/tmp/x`. A percent-escaped `%3F`/`%23`
+    stays literal (`file:///tmp/%3F` -> `/tmp/?`). The truncation cuts
+    the WHOLE remainder — including what would otherwise be the
+    AUTHORITY span — not just the path: `file://localhost?x/foo` ->
+    `/` (the `?` is chopped before the host scan ever runs, so the
+    host is exactly `localhost`, not a `localhost?x` mismatch); an
+    empty-authority edge case round-trips too: `file://?x/tmp` -> `/`.
+  - *Backslash as a path separator.* `file:` is a WHATWG SPECIAL
+    scheme, where a raw `\` is a path separator exactly like `/` —
+    everywhere a raw `/` is tested (slash-counting, authority-end
+    scan, dot-segment split, rooting) and in the OUTPUT itself (Node
+    never emits a literal `\` in a posix path): `file:///tmp/a\b` ->
+    `/tmp/a/b`; `file:\tmp\x` -> `/tmp/x`; mixed/interleaved runs match
+    too (`file:/\/tmp/x` -> `/tmp/x`; `file:\/\/tmp/x` -> `//tmp/x`).
+    In SCHEME position (the count of leading `/`-or-`\` characters
+    right after `file:`) the equivalence is LOUD, not invisible: it
+    changes which slash-count bucket the parser lands in, so
+    `file:\/tmp/x` and `file:\\tmp/x` (both exactly TWO leading
+    delimiters, one or both a backslash) land in the 2-slash AUTHORITY
+    form and THROW the ordinary File-URL-host `TypeError` (host
+    `"tmp"`, not `"localhost"`/empty) — the same throw the all-forward-
+    slash `file://tmp/x` already produces, not a new error shape. A
+    percent-ESCAPED backslash (`%5C`/`%5c`) is a decoded BYTE, not this
+    normalization's concern, and is untouched (`file:///tmp/a%5cb` ->
+    `/tmp/a\b`, a literal backslash IN the output); the two mechanisms
+    are provably independent, not just adjacent (`file:///tmp/a\b%5Cc`
+    -> `/tmp/a/b\c` — ONE raw `\` normalizes to ONE `/`, the escaped
+    `%5C` survives untouched right after it).
+  - *Non-ASCII path bytes, THE RAW HALF* **(amendment, class-4 ruling,
+    rev-23's fresh oracle measurements)**. This entry's ORIGINAL text
+    (below) claimed a raw UTF-16 code unit `>= 0x80` anywhere in the
+    path was a divergence needing a trap — measured fresh, this was
+    ITSELF the divergence: Node's own parser percent-encodes-then-
+    decodes a raw non-ASCII code unit LOSSLESSLY on the way through
+    (`file:///t/é` -> `/t/é`; a REAL, paired astral character round-
+    trips as its own intact surrogate pair: `file:///t/🌍` -> `/t/🌍`,
+    `u16=[...,d83c,df0d]`; even a raw `U+0080` control byte passes
+    through unencoded: `file:///t/` -> the same code unit back).
+    The ONE exception is an UNPAIRED (lone) surrogate — Node's own
+    WHATWG percent-encode step substitutes `U+FFFD` for it (measured:
+    `file:///t/\uD800` -> `U+FFFD`, not the lone surrogate itself).
+    Fixed by DROPPING the raw-code-unit trap entirely: every raw code
+    unit copies through unchanged, EXCEPT an unpaired surrogate (either
+    a high surrogate with no valid following low surrogate, or a low
+    surrogate reached without one) substitutes `U+FFFD` — this needs no
+    byte-level UTF-8 machinery at all, just the one surrogate-pairing
+    check, since a raw code unit is already the UTF-16 value Node's own
+    encode-then-decode round trip would produce.
+
+**(a) Dot-segment resolution.** Node's own parser collapses `.`/`..`
+path segments AT PARSE TIME (own measurement, node v24.18.1):
+
+    file:///a/../b   -> /b
+    file:///a/./b    -> /a/b
+    file:///a/b/../../c -> /c
+    file:///./a      -> /a
+    file:///../a     -> /a
+    file:///a/..     -> /
+    file:///a/.      -> /a/
+
+This tier's parser does NOT collapse them: a path containing a BARE
+`.`/`..` segment (a `/`-delimited component matching exactly one or two
+literal dots) throws a catchable `TypeError` naming the gap, rather
+than returning the uncollapsed path (which would be a silently WRONG
+answer, not merely an incomplete one — Node never observes the
+uncollapsed form) or attempting to port `parse_rooted_path`'s own
+segment-stack algorithm, which needs a genuinely different (stateful,
+growable-stack) shape from this rider's otherwise single-pass byte
+scan.
+
+**Amendment (F-3) — the percent-encoded spellings now trap too.** This
+entry's own heading always claimed "traps by NAME", but the trap's
+FIRST implementation scanned RAW bytes only, so `%2e`/`%2E` (and their
+combinations) passed straight through undetected and returned the
+UNCOLLAPSED, percent-decoded segment — the heading was false of its
+own body. Fixed by moving the check to run on the fully percent-DECODED
+segment instead of the raw one (decoding is guaranteed to never produce
+a `/` — that throws separately — so `/` stays the one and only segment
+delimiter post-decode, and the identical exact-match-on-"."-or-".."
+test applies unchanged). Measured: `file:///a/%2e%2e/b`, `file:///a/
+.%2e/b`, `file:///a/%2e./b` now all throw, matching the pre-existing
+raw `file:///a/../b` throw; `file:///a/%2eb/c` (Node: `/a/.b/c`) and
+`file:///a/%2e%2e%2e/b` (Node: `/a/.../b`) do NOT throw — `.b` and
+`...` are ordinary segments, not dot-segments, exactly like the
+pre-existing `a..b` case.
+
+**(b) Non-ASCII path bytes, THE ENCODED HALF ONLY.** Node's own parser
+percent-decodes a `file:` path's percent-escapes as genuine UTF-8 bytes
+on conversion — a decode-with-surrogate-emission step this tier's
+parser does not implement. **The raw half of this same-looking
+divergence is FIXED, not narrowed — see above; raw and encoded are
+Node's own two DIFFERENT mechanisms (parse-time percent-ENCODE vs.
+`fileURLToPath`'s own percent-DECODE) and this tier's fix tracks that
+asymmetry exactly, rather than treating "non-ASCII" as one axis.** A
+percent-DECODED byte `>= 0x80` traps: e.g. `file:///tmp/%C3%A9` decodes
+to bytes that ARE valid UTF-8 for 'é' (this is 1356's own line 9,
+byte-for-byte — `fileURLToPath("file:///tmp/%C3%A9")`), and
+`file:///tmp/%F0%9F%8C%8D` decodes to a valid 4-byte astral sequence
+(U+1F30D, 1611's own shape), but this tier traps rather than silently
+emitting the raw decoded bytes (mojibake — the ORIGINAL F-1 bug:
+`file:///tmp/%C3%A9` used to silently return `/tmp/Ã©`). A genuine
+UTF-8 decoder with surrogate-pair emission was considered and
+explicitly NOT built this round: neither 1356 nor 1611 is CLAIMED by
+this rider either way — both refuse earlier, at `libCall:url.href`/
+`libCall:process.cwd` respectively — so the choice between "byte-wise
+trap" and "real UTF-8 decode" is invisible to the corpus census
+regardless; the trap is the cheaper, lower-risk one to land correctly
+in a bounded fix round — and, per the class-4 ruling, a decoder that
+covered only VALID sequences would be worse than this trap: Node
+throws `URIError: URI malformed` on every one of a measured set of
+invalid encoded sequences too (a bad lead byte, a truncated multi-byte
+sequence, an overlong encoding, an encoded surrogate, a bad
+continuation byte, a stray continuation byte with no lead — see (c)),
+so a future decoder MUST cover all of those under this SAME named trap
+or it reintroduces F-1's own silent-garbage bug on exactly the inputs
+this round closed. Real UTF-8 decoding (valid AND invalid sequences
+both) remains open for a future rider. **This trap already SUBSUMES
+those seven invalid classes today, with no extra code**: every one of
+them necessarily contains at least one byte `>= 0x80` (pure ASCII
+cannot form a malformed UTF-8 sequence), so the FIRST such byte trips
+this trap before any actual sequence validation would ever run —
+measured with a witness input, `file:///t/%C3%28` (`%C3` is a
+well-formed hex escape decoding to a valid UTF-8 lead byte, but `%28`
+is not a valid continuation byte for it — an INVALID sequence, not
+merely an unsupported valid one; Node throws `URIError: URI malformed`
+on it): this tier throws THIS trap (not the (c) malformed-escape one
+below) the moment `%C3` alone decodes to `0xC3`, never inspecting `%28`
+at all.
+
+**(c) Malformed percent-escapes** *(new, F-1(4b))*. A `%` not
+immediately followed by exactly two valid hex digits (a lone `%`, one
+at the very end of the path, or followed by non-hex characters) used to
+fall through and copy the literal `%` character through unchanged.
+Node throws a catchable `URIError: URI malformed` for EVERY case
+measured: `file:///tmp/a%zzb`, `file:///tmp/a%` (trailing), `file:///
+tmp/a%2` (truncated) — no exception. This tier has no `URIError` class
+(`RUNTIME_ERROR_CLASSES`: `%Error`/`%TypeError`/`%RangeError`/
+`%SyntaxError`/`%DOMException` only — adding a fifth runtime error
+class is not cheap in a bounded fix round) so it throws a catchable
+`TypeError` naming the gap instead, same style/class as (a) and (b).
+
+**Rationale:** the two remaining gaps ((b)'s encoded half and (c)) are
+SCOPE narrowings of a rider whose own contract claims exactly one
+corpus program (2385, ASCII paths, no dot segments, well-formed
+escapes) — rule 1 (out-of-tier constructs refuse loudly, never
+silently miscompile) applied to a parser subset, the same discipline
+S016/S029/S057's own "we deliberately did not build the general case"
+entries already establish for other constructs this tier. Neither is
+reachable by 2385's own claim; 1356/1611 (the two OTHER corpus
+programs that reach `url.fileURLToPathStr` as their own first blocker)
+exercise the ENCODED-non-ASCII and malformed-input classes (1356's own
+line 9, 1611's astral case), but neither program is claimed by this
+rider (both advance to a DIFFERENT, unrelated `url.*`/`process.*`
+construct as their own next refusal — `libCall:url.href`/`libCall:
+process.cwd` respectively — confirmed empirically in P3's own freeze,
+again unchanged in F2-p3's own re-run census, and a third time in the
+class-4 follow-up round via a standalone `compile()` call on both real
+corpus files). The dot-segment gap (a) is a genuinely incomplete
+algorithm (Node's collapsing needs a growable segment stack this
+rider's single-pass scan does not have), not a corpus-input-alphabet
+gap like (b)/(c) — it is listed here for the same "trap by name, never
+silent" discipline, not the same root cause.
+
+**Tested by:** `packages/compiler/test/wasm-url.test.ts` — the dot-
+segment trap (bare `.`/`..`, both raw and the F-3 percent-encoded
+spellings, plus the non-dot-segment near-misses that must NOT trap),
+the F-1(4) percent-decoded non-ASCII trap (including 1356's and 1611's
+own literal inputs), the F-1(4b) malformed-escape trap, and the
+F-1(1)/(2)/(3)-plus-class-4-raw-non-ASCII fixes (now plain byte-exact-
+vs-Node pins, not divergence pins — including the surrogate-pair and
+lone-surrogate-to-U+FFFD cases) — all confirmed `instanceof TypeError`
+where applicable with the exact message text above; every OTHER corner
+case this rider DOES claim (localhost, `%20` decode, `%2F` rejection, the
+0/1/2/3-slash host-less forms, the "Invalid URL"/"must be of scheme
+file"/host-rejection messages, the scheme case-fold) is pinned
+byte-exact against a live Node v24.18.1 measurement in the same file,
+and confirmed via the wasm-differential corpus (2385 claims; 1356/1611
+advance to their predicted next refusal, not this one; census table
+unchanged by this fix round — nothing here is reachable before
+`url.href`/`process.cwd` clear).

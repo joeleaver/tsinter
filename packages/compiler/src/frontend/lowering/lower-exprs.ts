@@ -6854,8 +6854,8 @@ export function lowerPrefixUnary(L: Lowerer, expr: ts.PrefixUnaryExpression): Ir
       // like the local form. f64 fields are JS-exact; CHECKED-DYNAMIC
       // fields (implicit-any ctor assignments in JS) take the dyn
       // arithmetic stance — the number validates out (dynCheck's
-      // catchable TypeError, never a silent ToNumber; SEMANTICS.md),
-      // computes, and boxes back. Array elements, record fields, and
+      // catchable TypeError, never a silent ToNumber; SEMANTICS.md
+      // S009's third amendment). Array elements, record fields, and
       // accessor-backed names keep the fence.
       if (
         (ts.isPropertyAccessExpression(expr.operand) || ts.isElementAccessExpression(expr.operand)) &&

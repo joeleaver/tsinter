@@ -117,6 +117,7 @@ import {
   OBJ_NULL_PROTO,
 } from "./dyn.js";
 import { InspectBuilder } from "./inspect.js";
+import { UrlBuilder } from "./url.js";
 import { MapBuilder, type MapInfo, type MapKeyKind, type MapValKind } from "./maps.js";
 import { JsonBuilder, jsonQuote } from "./json.js";
 import {
@@ -5130,6 +5131,32 @@ class Assembler {
       },
     });
     return this.inspField;
+  }
+
+  private urlField: UrlBuilder | null = null;
+
+  /** increment 23 P3, rider 2's own builder (a fresh file, per the lead's
+   * ruling: the force-emit testability paid for itself twice already this
+   * increment). */
+  private get url(): UrlBuilder {
+    this.urlField ??= new UrlBuilder(this.mb, {
+      strRef: () => this.strRef,
+      strType: () => this.strType,
+      lit: (c, s) => this.pushStrLitInto(c, s),
+      // NO `emitUnwind()` here (the SAME gotcha stream.ts's own
+      // `setUncaughtError` documents): url.ts's own functions are
+      // hand-built via `mb.declareFunc`/`mb.setBody`, never walked as an
+      // IrFunction, so `this.fn` is whatever UNRELATED function happens
+      // to be "current" at module-build time — `emitUnwind`'s own
+      // placeholder-push reads `this.fn.fn.returnType`, the wrong type
+      // entirely. `emitSetCellError` alone has no such dependency (pure
+      // globals + the passed `c`); url.ts pushes its OWN return-type-
+      // correct placeholder and `return_`s itself, right where it is
+      // already about to for every other may-throw site in that file.
+      setCellError: (c, className, name, pushMessage, codeLit) =>
+        this.emitSetCellError(c, className, name, pushMessage, codeLit),
+    });
+    return this.urlField;
   }
 
   /** The ARR payload's vector info — the SAME interning a static
@@ -10922,6 +10949,7 @@ class Assembler {
         if (this.emitEmitterLibCall(e)) return;
         if (this.emitStreamLibCall(e)) return;
         if (this.emitAssertLibCall(e)) return;
+        if (this.emitUrlLibCall(e)) return;
         this.refuse(`libCall:${e.fn}`, e.loc);
         code.unreachable();
         return;
@@ -12003,9 +12031,55 @@ class Assembler {
        * local rather than walked twice. */
       case "fieldIncDec": {
         if (e.fieldDyn) {
-          // A computed member target (`obj[k]++`) rides the dyn surface.
-          this.refuse("expr:fieldIncDec:dyn", e.loc);
-          code.unreachable();
+          // A CHECKED-DYNAMIC field (increment 23 P3, SEMANTICS.md
+          // S009's third amendment): the field's declared type is
+          // `unknown` (an implicit-any JS class-field assignment,
+          // lower-exprs.ts's own gate) — the field NAME is still
+          // always statically resolved (property or symbol-keyed
+          // access), never a computed key. LLVM reference (llvm/
+          // emitter.ts's fieldIncDec fieldDyn arm): dynCheck the
+          // number OUT (catchable TypeError — the SAME dynCheckHelper
+          // S009's two prior amendments already use), ±1, box back.
+          // No manual release: WasmGC's own GC owns the old box.
+          if (RUNTIME_ERROR_CLASSES.has(e.className)) {
+            this.refuse("expr:fieldIncDec:error", e.loc);
+            code.unreachable();
+            return;
+          }
+          const dynField = this.classField(e.className, e.field, e.loc);
+          if (dynField === null) {
+            code.unreachable();
+            return;
+          }
+          const check = this.dynCheckHelper({ kind: "f64" }, e.loc);
+          if (check === null) {
+            code.unreachable();
+            return;
+          }
+          const objRef = this.classes.ref(dynField.info);
+          const o = this.acquireScratch(objRef);
+          const old = this.acquireScratch(F64);
+          const next = this.acquireScratch(F64);
+          this.walkExpr(e.obj);
+          code.localSet(o);
+          code.localGet(o);
+          code.structGet(dynField.info.struct, dynField.index);
+          code.refNull(this.dyn.pathT()); // the ROOT path: `$`
+          code.call(check);
+          this.emitPendingCheck();
+          code.localSet(old);
+          code.localGet(o);
+          code.localGet(old);
+          code.f64Const(1);
+          if (e.op === "+") code.f64Add();
+          else code.f64Sub();
+          code.localSet(next);
+          this.dyn.boxNum(code, (c) => c.localGet(next));
+          code.structSet(dynField.info.struct, dynField.index);
+          code.localGet(e.prefix ? next : old);
+          this.releaseScratch(F64, next);
+          this.releaseScratch(F64, old);
+          this.releaseScratch(objRef, o);
           return;
         }
         if (RUNTIME_ERROR_CLASSES.has(e.className)) {
@@ -16618,6 +16692,22 @@ class Assembler {
       this.walkExpr(e.args[0]!); // list
       this.walkExpr(e.args[1]!); // total
       code.call(this.bytesB.concatLenHelper());
+      this.emitPendingCheck();
+      return true;
+    }
+    return false;
+  }
+
+  /** node:url — increment 23 P3, rider 2. `url.fileURLToPathStr` is the
+   * ONLY member this pass builds (the file-scheme subset, url.ts) — the
+   * URL-VALUE receiver form (`url.fileURLToPathUrl`) and the rest of the
+   * url.* surface (href/pathname/pathToFileURL/...) stay refused by
+   * name, out of this rider's scope. */
+  private emitUrlLibCall(e: Extract<IrExpr, { kind: "libCall" }>): boolean {
+    const code = this.fn.code;
+    if (e.fn === "url.fileURLToPathStr") {
+      this.walkExpr(e.args[0]!);
+      code.call(this.url.fileURLToPathStr());
       this.emitPendingCheck();
       return true;
     }
@@ -23248,6 +23338,193 @@ class Assembler {
     return this.dynVecInfo().struct;
   }
 
+  /* ── increment 23 P3, rider 3: timers.queueMicrotask — the objection
+   * emitter.ts's own timer-surface doc comment records ("admitting a
+   * plain closure would widen [the microtask queue's] type for every
+   * async program") answered by a FRAME SUBTYPE, per Joe's "build what
+   * is needed to do it right": `mtFrame <: frameBase { clos }` (one
+   * field, never on a struct cycle — the ordinary, non-rec-group
+   * `recordInfo` path already knows to declare a `%frame.`-prefixed
+   * shape's supertype automatically, emitter.ts:2622's own established
+   * rule) plus ONE shared, zero-capture "resume" closure
+   * (`%w.async.mtResume`) whose function frame-casts, unwraps `clos`,
+   * and calls the user's real zero-arg closure — `resumeClosPair()`'s
+   * OWN type (an ORDINARY closure like any other in this language, per
+   * emitter.ts:3000's own doc comment: "the waiter queue's call_ref
+   * goes through this pair, and so does every `closure` node over a
+   * resume"). `%w.async.hop(clos, frame)` (promises.ts) is the SAME
+   * enqueue the bare `await <non-thenable>` turn already uses — SAME
+   * queue, ZERO type widening, exactly the brief's own claim. */
+  private static readonly MT_FRAME_SHAPE_ID = "%frame.mtResume";
+
+  /** The user's zero-arg, void-returning closure type — the ONE shape
+   * `adaptZeroArgTimerCallback` (lower-calls.ts) ever hands `timers.
+   * queueMicrotask`, and the ONE shape `timers.queueMicrotaskDyn`'s own
+   * FUNC-kind unwrap produces too (dyn.ts's own closure-unwrap idiom
+   * for a boxed function value never carries parameters). */
+  private static readonly MT_CLOS_TYPE: IrType & { kind: "func" } = { kind: "func", params: [], ret: VOID };
+
+  /** `mtFrame`'s own `RecordInfo` — registered lazily (this shape is
+   * synthesized entirely by this backend; nothing in the frontend's own
+   * IR ever mentions it, so `mod.records`' own startup registration
+   * loop never sees it — the SAME reason `this.recordShapes` is a plain
+   * mutable `Map`, not a frozen snapshot: a late `.set()` here, BEFORE
+   * the shape is ever looked up, is exactly as valid as an early one). */
+  private mtFrameInfoCache: RecordInfo | null = null;
+  private mtFrameInfo(): RecordInfo {
+    if (this.mtFrameInfoCache !== null) return this.mtFrameInfoCache;
+    const id = Assembler.MT_FRAME_SHAPE_ID;
+    if (!this.recordShapes.has(id)) {
+      this.recordShapes.set(id, { id, fields: [{ name: "clos", type: Assembler.MT_CLOS_TYPE }] });
+    }
+    const info = this.recordInfo(id, undefined, false);
+    if (info === null) throw new Error("wasm emitter bug: mtFrame's own synthesized shape failed to resolve");
+    this.mtFrameInfoCache = info;
+    return info;
+  }
+
+  private mtResumeFunc: number | null = null;
+
+  /** `%w.async.mtResume(self, frame)` — `resumeClosPair()`'s own
+   * signature exactly (drain()'s own call convention, promises.ts:571-
+   * 581: `self` is the closure's own env, arg0; `frame` the parked
+   * frame). Zero captures: `self` is never read. Frame-casts, unwraps
+   * `clos`, calls it; a throw is drain's OWN invariant violation
+   * ("a resume never returns with the exception cell set") answered
+   * exactly like S007/S010's own uncaught report — a queued
+   * microtask's throw IS genuinely Node's uncaughtException, not an
+   * internal refusal, so this reuses `reportUncaughtHelper` directly
+   * (NOT `emitPendingCheck`/`emitUnwind` — the SAME "own Code buffer,
+   * own local numbering" hazard url.ts's own `throwTypeError` dep
+   * comment documents: `reportUncaughtHelper` has no `this.fn`
+   * dependency at all, safe to call from here; `emitUnwind` does). */
+  private mtResumeHelper(): number {
+    if (this.mtResumeFunc !== null) return this.mtResumeFunc;
+    const resumePair = this.resumeClosPair();
+    const frameInfo = this.mtFrameInfo();
+    const userPair = this.closSigFor(Assembler.MT_CLOS_TYPE, undefined);
+    if (userPair === null) throw new Error("wasm emitter bug: mtFrame's own clos field type has no closure representation");
+    // `resumePair.fn`'s OWN type index — NOT a fresh `funcType([selfRef,
+    // frameRef], [])`: `closPairFor` builds `clos`/`fn` as a mutually-
+    // recursive pair via `recGroup2`, a DIFFERENT interning table than
+    // `funcType`'s own, so a structurally-identical-looking fresh type
+    // is NOT the same type-section entry `struct.new`'s field-0 check
+    // (a NOMINAL match, not structural) actually needs.
+    const idx = this.mb.declareFunc(resumePair.fn, "%w.async.mtResume");
+    this.mtResumeFunc = idx;
+    const c = new Code();
+    // arg0 ("self", the resume closure's own env) is never read — the
+    // resume closure has zero captures, so its own env carries nothing
+    // this function needs (unlike doneClos:*'s SELF at ~3747, which IS
+    // read to unwrap real captured state). No local constant for it
+    // (F-2: this file's lint config has no unused-var ignore pattern —
+    // `_SELF` still flags — so slot 0 is just a comment, not a name).
+    const FRAME = 1;
+    const USERCLOS = 2;
+    const userClosRef: ValType = { kind: "ref", nullable: true, typeIndex: userPair.clos };
+    c.localGet(FRAME);
+    c.refCast(frameInfo.struct);
+    const closField = frameInfo.fieldIndex.get("clos");
+    if (closField === undefined) throw new Error("wasm emitter bug: mtFrame has no 'clos' field");
+    c.structGet(frameInfo.struct, closField);
+    c.localSet(USERCLOS);
+    c.localGet(USERCLOS); // arg0: the user closure itself
+    c.localGet(USERCLOS);
+    c.structGet(userPair.clos, 0);
+    c.callRef(userPair.fn);
+    // drain's invariant: never return with the cell set. Print + trap
+    // (S007's own reporter) instead of the normal catchable unwind. NOT
+    // `this.openIf()`/`this.close()` (the SAME "own Code buffer" hazard
+    // url.ts's own throwTypeError dep comment documents — those helpers
+    // emit into `this.fn.code`, whatever function is "current" at
+    // module-build time, never this hand-built function's own `c`):
+    // plain, direct calls on `c` instead.
+    c.globalGet(this.exc().kindG);
+    c.ifVoid();
+    c.call(this.reportUncaughtHelper());
+    c.end();
+    this.mb.setBody(idx, [userClosRef], c.bytes());
+    return idx;
+  }
+
+  /** `%w.async.mtEnqueue(clos: <the user's zero-arg closure>) -> void`
+   * — wraps `clos` in a fresh `mtFrame`, mints the ONE shared resume
+   * closure (zero-capture, so a fresh `struct.new` per call is as cheap
+   * as an interned global would be — no captures to distinguish one
+   * call site's resume from another's), and calls `%w.async.hop`
+   * (promises.ts) exactly like the bare `await <non-thenable>` turn
+   * already does. */
+  private mtEnqueueFunc: number | null = null;
+  private mtEnqueueHelper(): number {
+    if (this.mtEnqueueFunc !== null) return this.mtEnqueueFunc;
+    const userPair = this.closSigFor(Assembler.MT_CLOS_TYPE, undefined);
+    if (userPair === null) throw new Error("wasm emitter bug: mtFrame's own clos field type has no closure representation");
+    const userClosRef: ValType = { kind: "ref", nullable: true, typeIndex: userPair.clos };
+    const resumePair = this.resumeClosPair();
+    const frameInfo = this.mtFrameInfo();
+    const idx = this.mb.declareFunc(this.mb.funcType([userClosRef], []), "%w.async.mtEnqueue");
+    this.mtEnqueueFunc = idx;
+    const c = new Code();
+    const CLOS = 0;
+    const resumeIdx = this.mtResumeHelper();
+    this.mb.declareFuncRef(resumeIdx); // a ref.func target must be pre-declared (the "closure" IR case's own precedent)
+    c.refFunc(resumeIdx);
+    c.structNew(resumePair.clos);
+    c.localGet(CLOS);
+    c.structNew(frameInfo.struct);
+    c.call(this.proms.hop());
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  /** `%w.async.mtEnqueueDyn(v: dyn) -> void, may-throw` — the Dyn form's
+   * OWN kind check first (a byte-exact `ERR_INVALID_ARG_TYPE`, NOT
+   * `dynCheckHelper`'s generic "expected X at $, got Y" — Node's real
+   * queueMicrotask message is its OWN shape, matching `error.
+   * argTypeThrow`'s ALREADY-established rendering, increment 22 board
+   * #26, not a P2b invention), THEN delegates the actual extraction to
+   * `dynCheckHelper`'s own "func" arm (the SAME sig-compare-or-adapter
+   * unwrap `u as typeof someClosure` already uses) — trivially
+   * satisfied once the kind check above has already passed, so its OWN
+   * (unreachable in practice) throw path is dead code here, never the
+   * one Node's message needs to match. */
+  private mtEnqueueDynFunc: number | null = null;
+  private mtEnqueueDynHelper(): number {
+    if (this.mtEnqueueDynFunc !== null) return this.mtEnqueueDynFunc;
+    const dynT = this.dyn.dynT();
+    const idx = this.mb.declareFunc(this.mb.funcType([this.dyn.dynRef()], []), "%w.async.mtEnqueueDyn");
+    this.mtEnqueueDynFunc = idx;
+    const c = new Code();
+    const V = 0;
+    c.localGet(V);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.FUNC);
+    c.i32Ne();
+    c.ifVoid();
+    this.emitSetCellError(
+      c,
+      "%TypeError",
+      "TypeError",
+      (cc) => {
+        this.pushStrLitInto(cc, 'The "callback" argument must be of type function. Received ');
+        cc.localGet(V);
+        cc.call(this.dyn.specificType());
+        cc.call(this.concatHelper());
+      },
+      "ERR_INVALID_ARG_TYPE",
+    );
+    c.return_();
+    c.end();
+    const check = this.dynCheckHelper(Assembler.MT_CLOS_TYPE, undefined);
+    if (check === null) throw new Error("wasm emitter bug: mtFrame's own clos field type has no dynCheck representation");
+    c.localGet(V);
+    c.refNull(this.dyn.pathT());
+    c.call(check);
+    c.call(this.mtEnqueueHelper());
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
   private emitTimerCall(e: Extract<IrExpr, { kind: "libCall" }>): boolean {
     const code = this.fn.code;
     const call1 = (idx: number): void => {
@@ -23287,6 +23564,14 @@ class Assembler {
         return true;
       case "timers.hasRef":
         call1(this.timers.hasRef());
+        return true;
+      case "timers.queueMicrotask":
+        call1(this.mtEnqueueHelper());
+        return true;
+      case "timers.queueMicrotaskDyn":
+        this.walkExpr(e.args[0]!);
+        code.call(this.mtEnqueueDynHelper());
+        this.emitPendingCheck();
         return true;
       case "timers.refresh":
         call1(this.timers.refresh());
