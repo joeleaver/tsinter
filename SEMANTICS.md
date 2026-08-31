@@ -4656,3 +4656,140 @@ control (`enumerable:true` on an OBJ target succeeds and reads back,
 proving the refusal is keyed on the flag and not the target kind); no
 corpus program can pin this directly (claim 0, the same reason S061
 gives).
+
+## S063 — assert's error-identification messages (`assert.throws`'s class-mismatch text, `assert.ifError`'s empty-message fallback) substitute the error's stored `name` SLOT for Node's `constructor.name`, so a CUSTOM subclass without its own `this.name` override reports its BASE class, not its true derived class *(inherited)*
+
+`e.constructor.name` cannot be written at all on this tier —
+`Function.name` (reading `.name` off a function/constructor value) "has
+no scriptc lowering yet" (SC2020, identical refusal on every backend
+including native), so no corpus program can even ATTEMPT the literal
+construct this entry is about. The observable surface is narrower:
+Node's own `assert.throws(fn, ErrorClass)` mismatch text ("...Received
+\"<name>\"") and `assert.ifError(err)`'s empty-message fallback both
+read `err.constructor.name` — this runtime instead answers whatever
+`err`'s own `name` SLOT holds (`scr_assert.c`'s own comment: "this
+runtime carries the `name` slot"). For every BUILT-IN error kind
+(`Error`, `TypeError`, `RangeError`, …, and any subclass of one that
+never overrides `name` itself, e.g. `class EmptyTypeError extends
+TypeError {}`) the two answers coincide, because Node pre-seeds
+`TypeError.prototype.name = "TypeError"` etc. at the class level, so the
+slot this runtime tracks already holds the right per-kind string. For a
+CUSTOM subclass of `Error` (`class Weird extends Error {}`) that never
+sets `this.name` itself, Node's real `constructor.name` is the truly
+derived class ("Weird", or "WeirdDeep" three levels down a subclass
+chain) while `.name` is the INHERITED `Error.prototype.name` ("Error")
+— this runtime has no per-class name slot for user-defined subclasses,
+so it answers the base "Error" (or "TypeError" for a user subclass of a
+built-in) regardless of how deep the chain runs.
+
+MEASURED, all four fixtures (`class Weird extends Error {}`, `new
+Weird()` [empty message] and `new Weird("boom")` [with message], `class
+WeirdDeep extends Weird {}`, `new TypeError("bad type")` as the
+built-in control), on all reachable lanes:
+
+- **Node (oracle):** `assert.throws` mismatch answers "Weird" /
+  "Weird" / "WeirdDeep" / "TypeError" respectively; `assert.ifError`'s
+  empty-message fallback (only reached when the error's OWN `.message`
+  is empty — the with-message and built-in-with-message fixtures report
+  their message text instead, unrelated to this entry) answers "Weird"
+  for the bare `new Weird()` and "EmptyTypeError" for a bare `class
+  EmptyTypeError extends TypeError {}` instance.
+- **C, LLVM (identical to each other, byte-exact, native = "the output
+  that ships" — `scriptc run --backend c` / `--backend llvm` on the
+  identical source):** `assert.throws` mismatch answers "Error" /
+  "Error" / "Error" / "TypeError"; `assert.ifError`'s empty-message
+  fallback answers "Error" for `new Weird()` and "TypeError" for the
+  bare `EmptyTypeError` instance — the derived name is LOST for every
+  custom subclass, RETAINED for every built-in one.
+- **wasm:** `assert.throws`'s class-constructor form IS wasm-reachable
+  and witnesses this divergence DIRECTLY — `class Weird extends Error
+  {} assert.throws(() => { throw new Weird("boom"); }, RangeError)`
+  builds and runs, answering `The error is expected to be an instance
+  of "RangeError". Received "Error"` (message trailer: `Error message:
+  boom`); Node answers the SAME program `Received "Weird"` instead.
+  (CORRECTION, this round: an earlier draft of this entry claimed the
+  identical shape "refuses to build" — WRONG, confirmed by direct
+  reproduction; the refusal that misled the original probe was an
+  UNRELATED construct — an `unknown`-typed caught value passed as an
+  ARGUMENT into a separate helper function that narrows it via
+  `instanceof` INSIDE the callee, nothing to do with `assert.throws`,
+  custom subclasses, or this entry's own mechanism — isolated by
+  removing exactly that one element while holding everything else
+  fixed, confirmed both ways.) `assert.ifError`'s own empty-message
+  fallback answers "Error" for `new Weird()` and "TypeError" for the
+  bare `EmptyTypeError` instance — IDENTICAL to C/LLVM on BOTH assert
+  surfaces, confirming the divergence is the SAME one mechanism across
+  the whole backend family and reachable through either entry point,
+  not a wasm-specific narrowing or widening of it.
+
+THE FOUR FIXTURES ABOVE NEVER ASSIGN `.name` — every one leaves the
+slot holding its INHERITED value, so on their own they cannot separate
+this entry's own claim ("assert reads the `name` SLOT") from a WEAKER
+story ("assert reports the base CLASS name"), which predicts the
+identical "Error" answer for every one of them. This is narrower than
+it sounds: the mechanism itself already has authorial testimony —
+`scr_assert.c`'s own comment ("this runtime carries the `name` slot")
+predates this entry and is UNCHANGED by it, only its citation moved
+(§ above) — so the gap is that S063's OWN FOUR FIXTURES never
+WITNESSED S063's OWN claim, not that the claim was in doubt. Three
+further fixtures close exactly that witnessing gap — `class Weird
+extends Error {}`, then an EXPLICIT post-construction `.name`
+assignment before the same `assert.ifError` empty-message-fallback
+path, MEASURED on Node + C + LLVM + wasm:
+
+- **`.name = "NotWeird"`, message PRESENT** (`new Weird("boom")`):
+  Node and every lane alike answer "boom" — a present message always
+  wins over the fallback, unrelated to the `.name` axis; included only
+  to confirm the override does not accidentally disturb that ordering.
+- **`.name = "NotWeird"`, EMPTY message:** Node still answers "Weird"
+  — `constructor.name` is a class-level property, entirely unaffected
+  by an instance-level `.name` assignment. C, LLVM, and wasm
+  (byte-identical to each other) answer "NotWeird" — the OVERRIDDEN
+  slot value, verbatim.
+- **`.name = ""`, EMPTY message:** Node still answers "Weird". C,
+  LLVM, and wasm answer the EMPTY STRING, verbatim — the case that
+  actually decides the question: a base-class-name fallback CANNOT
+  answer "" (there is no class named ""), so only a raw, unconditional
+  read of the `name` slot explains this result. This entry's own
+  mechanism claim is now WITNESSED by its own fixtures, not merely
+  attested by the C source's comment; the weaker "reports the base
+  class" story is FALSIFIED by this one case.
+
+**Rationale:** general `constructor.name` reflection is unbuilt tier-
+wide (the `Function.name` SC2020 refusal above) — modeling it fully
+would mean tracking a per-INSTANCE (or per-prototype-chain) runtime
+identity distinct from the `name` slot assert already carries for
+every error value, for a construct with no other tier-wide reachability
+today. The `name`-slot substitution is the smaller, already-necessary
+mechanism (assert needs SOME string for its message regardless) that
+happens to agree with Node exactly on the reachable built-in hierarchy
+and diverges only on the class of program this tier does not yet let
+users observe `constructor.name` on directly. C and LLVM share one
+runtime (`scr_assert.c`) and so trivially agree; wasm's OWN, separately
+built assert machinery was MEASURED to answer identically rather than
+assumed to (the probes above), which is why this entry is *(inherited)*
+— the same observable behavior across the whole backend family — rather
+than a per-lane split; this filing does not claim the wasm and C/LLVM
+implementations share code, only that they agree on this output.
+
+**Tested by:** the filing-day probes (`ctorname-probe3.ts` through
+`ctorname-probe6.ts`, the discriminating-fixture probe
+`s063-discrim2.ts`, and the throws-surface reproduction/isolation
+probes, all run directly via `scriptc run --backend c`/`--backend
+llvm` and via the wasm compile+host harness) — no corpus program
+reaches this today (grep-confirmed: the corpus's one custom-subclass-
+plus-`assert.throws`/`assert.ifError` file,
+`1721-assert-throws-regex-class.ts`'s `AppError`, only appears in a
+bare-pass and a no-throw "missing exception" scenario, neither of which
+routes through the mismatch/ifError constructor-name text this entry
+describes) — claim 0, the same reason S061/S062 give. TWO PINS are
+landed in `wasm-assert-core.test.ts`, beside the existing `ifErrorDyn`
+composite-kind trap tests, using the file's own established
+`build()`/`runWasm()`/`MESSAGE_OF_HELPER` patterns: the `assert.
+ifError` empty-message-fallback pin (a custom `class Weird extends
+Error {}`, empty-message instance, "Error" answer byte-exact) and the
+`assert.throws` class-mismatch pin (the same `Weird` class thrown
+against a `RangeError` expectation, `Received "Error"` answer
+byte-exact) — each stating BOTH the current wasm answer and, in its own
+comment, Node's differing answer for the identical program, so each is
+demonstrably a divergence guard rather than a tautology.

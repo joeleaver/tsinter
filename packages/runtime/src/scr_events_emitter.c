@@ -312,7 +312,7 @@ static void scr_ee_warn_maybe(ScrEmitter *em, ScrEeBucket *b) {
   b->warned = true;
   /* Node's message byte for byte — except the pid, which is OURS (it can
    * never match another process's), and the synchronous timing (Node
-   * defers the print by a tick). SEMANTICS.md documents both. */
+   * defers the print by a tick). SEMANTICS.md S055 documents both. */
   fprintf(stderr,
           "(node:%ld) MaxListenersExceededWarning: Possible EventEmitter memory leak "
           "detected. %zu %s listeners added to [%s]. MaxListeners is %g. Use "
@@ -706,7 +706,7 @@ ScrArr *scr_emitter_event_names(ScrEmitter *em) {
 
 /* listeners(name) / rawListeners(name): +1 closure array in list order.
  * The once wrapper is runtime-internal here, so BOTH forms answer the
- * original listeners (SEMANTICS.md documents the rawListeners
+ * original listeners (SEMANTICS.md S052 documents the rawListeners
  * divergence). */
 ScrArr *scr_emitter_listeners(ScrEmitter *em, ScrStr *name) {
   ScrArr *out = scr_arr_new_ref(&scr_closure_retain_v, &scr_closure_release_v,

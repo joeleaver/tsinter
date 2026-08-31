@@ -1273,7 +1273,7 @@ void scr_assert_throws_none(bool rejection, ScrStr *ename, bool has_ename,
  * of the expected class: Node's mismatch AssertionError, built from the
  * received error's name and message. (Node prefers constructor.name; this
  * runtime carries the `name` slot — identical for the builtin hierarchy,
- * SEMANTICS.md 105 for subclasses whose constructor name differs.)
+ * SEMANTICS.md S063 for subclasses whose constructor name differs.)
  * Borrows both. */
 void scr_assert_throws_mismatch(ScrStr *expected_name, ScrError *err,
                                 ScrStr *msg, bool has_msg) {

@@ -1156,3 +1156,45 @@ test("assert.ifErrorDyn's composite-kind (OBJ without '%error') arm: the SAME na
   const { stdout } = await runWasmToTrap(path);
   expect(stdout).toBe(["before-obj-trap", ""].join("\n"));
 });
+
+test("assert.ifError's empty-message fallback answers the error's `name` SLOT, not Node's true `constructor.name` — a custom Error subclass reports its BASE class (S063)", async () => {
+  const path = await build("iferror-ctorname-s063.ts", [
+    "import assert from 'node:assert';",
+    "class Weird extends Error {}",
+    "function check(): void { assert.ifError(new Weird()); }",
+    "try { check(); } catch (e) { if (e instanceof Error) console.log(e.message); }",
+  ]);
+  const { stdout, stderr } = await runWasm(path);
+  // MEASURED wasm/C/LLVM answer (S063): "Error" (the `name` slot this
+  // runtime carries), not Node's own "Weird" (constructor.name on the
+  // true derived class) — this pin guards the CURRENT, registered
+  // divergence, not Node's real behavior.
+  expect(stdout).toBe(["ifError got unwanted exception: Error", ""].join("\n"));
+  expect(stderr).toBe("");
+});
+
+test("assert.throws' class-mismatch text answers the error's `name` SLOT, not Node's true `constructor.name` — the SAME divergence ifError's fallback shows, on the OTHER assert surface (S063)", async () => {
+  const path = await build("throws-ctorname-s063.ts", [
+    "import assert from 'node:assert';",
+    ...MESSAGE_OF_HELPER,
+    "class Weird extends Error {}",
+    "console.log(JSON.stringify(messageOf(() => assert.throws(() => { throw new Weird('boom'); }, RangeError))));",
+  ]);
+  const { stdout, stderr } = await runWasm(path);
+  // MEASURED wasm/C/LLVM answer (S063): 'Received "Error"' (the `name`
+  // slot this runtime carries), not Node's own 'Received "Weird"'
+  // (constructor.name on the true derived class) — assert.throws IS
+  // wasm-reachable with a custom-subclass-thrown value against a raw
+  // class expectation (CR/F-2's own correction: the entry's earlier
+  // "refuses to build" claim was wrong, caused by an unrelated
+  // construct this program does not use).
+  expect(stdout).toBe(
+    [
+      JSON.stringify(
+        'The error is expected to be an instance of "RangeError". Received "Error"\n\nError message:\n\nboom',
+      ),
+      "",
+    ].join("\n"),
+  );
+  expect(stderr).toBe("");
+});
