@@ -1,0 +1,140 @@
+ab+c	
+hello	i
+^b	
+^b	m
+a$	
+a$	m
+a.b	
+a.b	s
+\p{L}	u
+^.$	u
+^.$	
+^[a-f]+$	
+cat|dog	
+\d{3}-\d{4}	
+t(a)g	gim
+x	
+\d+	u
+[aeiou]	
+[^aeiou]	
+z$	
+^[A-Z][a-z]+$	
+^\d+$	
+\.	
+\.	g
+z	
+z	g
+bob	gi
+^	gm
+b	y
+b	gy
+b	
+\d+	g
+\d+	
+a|b	g
+world	
+%	
+(\w+)=(\w+)	
+(b)	
+a(x)?c	
+\d	g
+(a)(b)(c)(d)(e)(f)(g)(h)(i)(j)	
+\d	
+\s*,\s*	
+(?:)	
+,	
+b*	
+X*	
+;	
+a	
+a*	g
+(?:)	g
+(?:)	gu
+(?:)	u
+😀	gu
+😀	u
+😀	
+^[a-z]+-\d+$	
+^\w+$	
+-\d+$	
+-	
+o	
+q	
+[^\w\s]	g
+[-_\s]	
+a	g
+Signature Algorithm:\s*(\S+)	i
+:(\d+)$	
+^(\w+) = "(.+)"$	
+-----BEGIN [\w\s]*PRIVATE KEY-----	
+(☕) (\w+)	u
+:	
+<string>([\s\S]*?)<\/string>	g
+<key>([\s\S]*?)<\/key>\s*<string>([\s\S]*?)<\/string>	g
+x	g
+z?	g
+([ab])(\d)?	g
+never-global	
+^https?:\/\/	
+^@[^/]+\/	
+^@([^/]+)\/	
+[a-z](\d+)	g
+\d\d	g
+https:\/\/[^\s]+	g
+^dif	
+xyz	
+\/\/ Flags:\s+--	
+\/\/ Env:\s+	
+\/\/ Missing:\s+	
+b	g
+x	i
+x*	
+$	
+a	u
+x	u
+a+(b)?	
+dog|cat	
+^line2$	m
+\s+	
+(?<y>\d{4})-(?<m>\d{2})-(?<d>\d{2})	
+(?<digit>\d)	g
+(?<first>\w+) (\w+)	
+(?<x>a)	
+(?<a>a)|(?<b>b)	g
+(?<n>\d+)px|(?<n>\d+)em	g
+(?<mid>y)	
+(?<q>['"]).*?\k<q>	
+(?<tag>[a-z]+)-\k<tag>	i
+(?<tag>[a-z]+)-\k<tag>	
+(?<c>[a-z])\k<c>	g
+(?<w>\wö\w+)	u
+(?<a>x)\k<a>	gi
+town	
+Range	
+Type	
+no such file	
+RangeError: boom	
+BOOM	i
+trouble	
+city	
+nope	im
+nope	
+oo	
+anything	
+(?<year>\d{4})-(?<month>\d{2})-(?<day>\d{2})	
+(?<maj>\d+)\.(?<min>\d+)\.(?<pat>\d+)	
+(\d+)-(\d+)	
+(?<m>\d+)\.(?<n>\d+)\.(?<p>\d+)	
+(?<word>\w+)-(?<num>\d+)	
+(?<len>\d+)px|(?<len>\d+)em	
+(?<one>1)(?<two>2)(?<three>3)	
+(?<head>x)(?<tail>y)?	
+(?<key>\w)=(?<val>\d)	g
+(?<letter>[a-z])(?<digit>\d)	g
+(?<year>\d{4})-(?<day>\d{2})	
+(?<key>\w+)=(?<val>\w+)	
+(?<name>\w+):(?<port>\d+)	
+wor	
+^\d+$	m
+zzz	
+^release-\d	

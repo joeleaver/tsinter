@@ -4793,3 +4793,173 @@ against a `RangeError` expectation, `Received "Error"` answer
 byte-exact) — each stating BOTH the current wasm answer and, in its own
 comment, Node's differing answer for the identical program, so each is
 demonstrably a divergence guard rather than a tautology.
+
+## S064 — a NONPARTICIPATING capture reads "" where Node holds `undefined` *(wasm tier; native lanes ship the same divergence)*
+
+A capture group that did not participate in the match reads as the
+empty string in every result this tier produces — `match`'s slice,
+`matchAll`'s rows, the `.groups` projection, and `split()`'s spliced
+slots (S066) — where Node's slot holds `undefined`. This is
+UNAVOIDABLE, not a design choice with an alternative: the IR types
+these results `string[]` (`ir/validate.ts:55-76`), which has no
+representable absent element, and widening it to `(string |
+undefined)[]` would poison every consumer of every regex result in the
+language. Only an IR change could fix it, and that is out of scope —
+there is no board to track, because there is no fix to track.
+
+It COLLAPSES a distinction Node really makes: `/(a*)*/.exec("b")` is
+`["", null]` in Node and `/(a*)+/.exec("b")` is `["", ""]`; on this
+tier both render `["", ""]`. Corpus programs stay comparable by
+guarding the slot (`2608` uses `opt.tail ? opt.tail : "(none)"`,
+`1544` uses `?? ""`), which works because `""` and `undefined` are
+both falsy.
+
+**Rationale:** forced by the IR result contract (`string[]`, no
+absent-element representation); shared with the native lanes, which
+carry the identical limitation for the identical reason — all three
+lanes render `""`, only Node holds `undefined`.
+
+**Tested by:** `1544` and `2608` (the guarded spellings, which stay
+byte-exact because both empty and undefined satisfy the guard); the
+wasm emitter unit test pins the UNGUARDED slot directly, since no
+corpus program can pin it — the differential would fail by
+construction on the unguarded shape, S003's "cannot be differential-
+tested" case.
+
+## S065 — an invalid pattern: the WASM tier reports at compile time and throws Node's catchable `SyntaxError` from `new RegExp`; the NATIVE lanes abort at first use *(per-lane split)*
+
+Two axes, one entry (S055 is the precedent for a single entry carrying
+both): WHEN the failure is reported, and WHAT TEXT the thrown error
+carries.
+
+TIMING, three arms by how the pattern reaches the compiler. A bad
+LITERAL such as `/(/`: Node is a parse error (MEASURED — not one
+module statement runs, no program output at all); wasm is a compile-
+time diagnostic (no binary, so likewise no program output); the
+NATIVE lanes are the ones that diverge, and diverge loudly in the
+worst way — the program STARTS, runs, produces output, and THEN
+aborts uncatchably at first use of the regex (`ir/nodes.ts:4177-
+4186`). wasm and Node agree on the only thing that matters
+observably (zero output); only WHERE the failure is reported differs,
+which is the refusal contract, not a behavioral divergence. A bad
+COMPILE-TIME-CONSTANT argument such as `new RegExp('(')`: Node throws
+a CATCHABLE runtime `SyntaxError` at the construction point; wasm
+does the same — the compiler knows the pattern is invalid and knows
+V8's message, so it emits a THROW of that exact `SyntaxError` there, a
+constant-folded throw rather than a runtime parser (`2284`'s
+`assert.throws(() => new RegExp('('), SyntaxError)` depends on this
+catchable behavior and is the witness — refusing here, the natural
+reflex for an invalid construct, would fail `2284`); native aborts
+uncatchably at first use, same as the literal arm. A NON-CONSTANT
+argument refuses by name (`libCall:regex.new:dynamic-pattern` /
+`:dynamic-flags`) — a refusal, not itself a divergence.
+
+MESSAGE TEXT, the second arm. `ir/nodes.ts:3282` documents
+`regex.new`'s error as "Node's message shape with libregexp's detail
+text (APPROXIMATE FIDELITY; `e.name` exact)". Node's own text: e.g.
+`"Invalid regular expression: /(/: Unterminated group"`. wasm emits
+the SAME string exactly — the compiler knows the pattern at compile
+time, so the message is a CONSTANT, with no runtime parser to
+approximate it with (compiling early makes this tier MORE exact than
+the reference it was ported from, not less). native carries
+libregexp's own detail text in Node's message shape — approximate,
+not exact. REACH: latent — no corpus program distinguishes the two;
+`2284`'s `assert.throws` asserts the error CLASS only and never reads
+the message, so this axis is recorded here rather than caught by a
+test.
+
+**Rationale:** wasm compiles the pattern at compile time and so KNOWS
+both the SyntaxError-vs-abort question and V8's exact message text up
+front, letting it reproduce Node byte-exactly on both axes as a
+constant; the native lanes parse at runtime with no compile-time
+knowledge of the pattern's validity, so they abort rather than throw
+catchably, and approximate rather than reproduce the message.
+
+**Tested by:** `2284` (`assert.throws(() => new RegExp('('),
+SyntaxError)`) is the corpus witness for the TIMING/catchability axis
+only; the message-text axis is corpus-unpinnable (latent, per REACH
+above) and is recorded here as the measurement of record rather than
+guarded by a test.
+
+**Board #117** tracks the native fix: make the native lanes throw a
+catchable `SyntaxError` at construction rather than aborting at first
+use, bring their message text to V8's, and rewrite the doc comment at
+`ir/nodes.ts:4177-4185` (the repoint itself is a P1 deliverable — the
+comment goes false when the WASM behavior lands, not when board #117
+does).
+
+## S066 — `split()` with capture groups: the WASM tier SPLICES as Node does; the NATIVE lanes throw a `TypeError` *(per-lane split)*
+
+On `"a1b".split(/(\d)/)`: Node answers `["a","1","b"]`; wasm answers
+the same, `["a","1","b"]` (Node-exact); the native lanes throw
+`Uncaught TypeError: split() with capture groups in the pattern is not
+supported (JS splices the captured values into the result); use a
+non-capturing group (?:...)`, then exit 1 (`evidence/splitcap-t.ts`).
+The entry exists even though the wasm tier conforms, because the
+lanes cannot be silently aligned: a reader comparing lanes must see
+that one splices and one throws — S044's own reason for existing. The
+splice fits the IR's `string[]` result contract: the capture count is
+compile-time known and every spliced element is a string, except
+NONPARTICIPATING slots, which are `undefined` in Node and ride S064's
+`""` rendering here.
+
+**Rationale:** the wasm tier's compile-time knowledge of the pattern's
+capture structure makes an exact splice straightforward; the native
+lanes' `split()` predates capture-splicing support and refuses rather
+than risk a wrong splice — matching S044's own aliasing precedent
+(the more capable side conforms, the less capable side keeps its
+existing, honest refusal rather than a masked approximation).
+
+**Tested by:** `evidence/splitcap-t.ts` is the native-lane witness;
+the wasm tier's own splice shapes are measured in the P3 build that
+lands it (§7.3), against `1544`-family corpus programs using
+`split()` with capturing patterns.
+
+**Board #118** (NATIVE SIDE ONLY) tracks making the native lanes
+splice; the native lanes' `string[]` result has the same
+representability limit S064 already names, so #118's fix inherits
+S064 rather than needing anything new. THE COMMENT REPOINT IS NOT ON
+THIS BOARD — it is a P3 deliverable: `ir/nodes.ts:1634` (inside doc-
+comment block `1627-1637`) states the throw as an ALL-LANE contract,
+and it goes false the moment the WASM tier splices in P3, whether or
+not board #118 ever lands, so the repoint is tied to P3's own landing
+rather than to the native fix's timing.
+
+## S067 — `.flags`: the WASM tier renders Node's CANONICAL order; the NATIVE lanes render SOURCE order *(per-lane split)*
+
+`RegExp.prototype.flags` reads the flag getters in a fixed order, so
+Node answers `"gimsuy"` for a regex written `/b/yusmig`. MEASURED on
+five literals (`evidence/flagorder-t.ts`) — all five differ between
+Node and the native lanes:
+
+| literal      | Node   | wasm (designed) | native (today) |
+|--------------|--------|------------------|-----------------|
+| `/b/yusmig`  | gimsuy | gimsuy           | yusmig          |
+| `/x/mig`     | gim    | gim              | mig             |
+| `/y/us`      | su     | su               | us              |
+| `/z/ym`      | my     | my               | ym              |
+| `/q/sg`      | gs     | gs               | sg              |
+
+The native lanes return `scr_regex_flags`' stored SOURCE-order string.
+The wasm tier sorts into canonical order at compile time (design §3.2,
+§5.6 — roughly five lines), strictly Node-exact. This also governs
+`assert.match`'s message rendering and `util.inspect` of a regex, both
+of which render `/source/flags`.
+
+REACH OF THE NATIVE BUG: latent, not live. Scanning all 1077 corpus
+programs, all 10 multi-flag literals are already written in canonical
+order, so no corpus program can currently catch it — that is why
+board #119 is a fix board and not a failing test.
+
+**Rationale:** the wasm tier's compile-time flag-string construction
+makes canonical ordering a five-line sort with no cost; the native
+lanes store the SOURCE-order string as-is with no reordering step,
+which is a real bug (Node's own contract is canonical order,
+unconditionally) rather than a deliberate design difference — hence a
+fix board, not a permanent divergence.
+
+**Tested by:** `evidence/flagorder-t.ts` (the five-literal table
+above) is the measurement of record; corpus-unpinnable per REACH
+(latent), so board #119 tracks the fix without a corpus witness.
+
+**Board #119** tracks canonicalizing `.flags` on the native lanes.

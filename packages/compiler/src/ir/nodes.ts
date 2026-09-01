@@ -1641,7 +1641,7 @@ export const MAY_THROW_BYTES_METHODS: ReadonlySet<IrBytesIntrinsicMethod> = new 
  * `string[] | null` union: the matched slice [whole, ...captures] wrapped
  * into the array arm, or the interned null-arm instance for no match. A
  * NONPARTICIPATING capture holds "" where Node's slot is undefined
- * (SEMANTICS.md divergence). Never throws. */
+ * (SEMANTICS.md S064). Never throws. */
 export type IrRegexIntrinsicMethod =
   | "test"
   | "match"
@@ -4179,10 +4179,13 @@ export type IrExpr =
    * `flags` the trailing flags in source order (alphabet fenced to gimsuy by
    * the frontend). Backends intern ONE immortal static per (pattern, flags)
    * pair — like string literals, so repeated evaluation is free and
-   * `re === re` would hold — and compile the pattern lazily at first use
-   * (a pattern the engine rejects aborts with a clear message; Node throws
-   * SyntaxError at parse time — documented divergence). Result is +1 (a
-   * no-op retain on the immortal). */
+   * `re === re` would hold. WHAT HAPPENS WHEN THE ENGINE REJECTS THE PATTERN
+   * is PER-LANE, not shared (SEMANTICS.md S065): the wasm tier compiles at
+   * COMPILE TIME and reports there (no binary emitted — zero program
+   * output, matching Node's own parse-time failure); the native lanes
+   * compile lazily at first use and ABORT UNCATCHABLY there, after any
+   * side effects already run. Node itself throws a catchable SyntaxError
+   * at parse time. Result is +1 (a no-op retain on the immortal). */
   | { kind: "regexLit"; pattern: string; flags: string; type: IrType; loc: SrcLoc }
   /** The strings object of a tagged template `tag\`a${x}b\`` — the COOKED
    * span texts. `key` is a per-SITE identity (the spec canonicalizes the

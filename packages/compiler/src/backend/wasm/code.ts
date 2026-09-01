@@ -64,6 +64,17 @@ export class Code {
     this.w.u8(0x0d);
     this.w.uleb(depth);
   }
+  /** br_table — an indexed branch: the top-of-stack i32 selects an entry in
+   * `labels` by position (out-of-range selects `defaultLabel`, per the
+   * br_table spec — no separate bounds check needed at a call site). Every
+   * label is a RAW relative depth, same convention as br/brIf above — the
+   * regex interpreter's opcode dispatch is this method's first caller. */
+  brTable(labels: number[], defaultLabel: number): void {
+    this.w.u8(0x0e);
+    this.w.uleb(labels.length);
+    for (const l of labels) this.w.uleb(l);
+    this.w.uleb(defaultLabel);
+  }
   return_(): void {
     this.w.u8(0x0f);
   }

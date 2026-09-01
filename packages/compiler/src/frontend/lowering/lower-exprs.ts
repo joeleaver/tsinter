@@ -7587,6 +7587,24 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         if (DYN_HANDLE_KINDS.has(idLeft.type.kind) && typeEquals(idLeft.type, idRight.type)) {
           return { kind: "bin", op: negated ? "!==" : "===", left: idLeft, right: idRight, type: BOOL, loc };
         }
+        // FORWARD DEPENDENCY (regex): a regex-vs-regex `===`/`!==` falls
+        // through to here today (SC1043's own refusal), not to the
+        // DYN_HANDLE_KINDS check above. If SC1043 is ever lifted for
+        // regex, this identity becomes OBSERVABLE — regex values are
+        // IMMUTABLE and INTERNED, one immortal per (pattern, flags) pair
+        // per module (the regex engine's own value struct doc, "one
+        // immortal... `re === re` would hold"), so a lift must give this
+        // fall-through its own arm before that identity is real. WHERE
+        // THE LIFT WOULD ACTUALLY HAPPEN: adding regex's type kind to
+        // DYN_HANDLE_KINDS above is the concrete edit — that map already
+        // carries the {tag, cls} pair each of its kinds needs for by-
+        // reference dyn-boxing, and a regex value crossing into dyn would
+        // need the identical shape (a GC struct reference, tagged for
+        // runtime discrimination) — so joining that set gets BOTH the
+        // dyn-boxing support AND this `===` check's own admission in one
+        // edit, not two. And literal interning would then need its own
+        // register entry (§7.5's own forward dependency this note exists
+        // to make findable).
         L.unsupported("SC1043", expr);
         break;
       }
