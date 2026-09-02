@@ -3501,16 +3501,79 @@ test("strIntrinsic: optional-chain nullish receiver does NOT invoke toLowerCase 
 });
 
 test("out-of-tier constructs refuse with SC3001 and ride the survey", async () => {
-  // Regex — a whole engine — sits far past every near-term increment, so
-  // this example won't rot into the tier the way arithmetic and arrays
-  // did. If it ever compiles, congratulations: pick whatever is furthest
-  // out then.
-  const res = await buildWasm("refused.ts", 'const re = /a+b/; console.log(re.test("aab"));\n');
+  // A regex MODIFIER GROUP: a POLICY refusal (design §5.1 — the parser
+  // structurally handles `(?i:...)` transparently; §6.2's class-case-
+  // closure just assumes a CONSTANT ignoreCase per pattern, which a
+  // scoped modifier group violates in ways never verified), chosen to
+  // be durable against exactly the kind of rot this test warns about:
+  // its PREVIOUS example (`/a+b/.test(...)`, plain regexLit + test())
+  // rotted the moment INC-24 P2 opened plain regex literals/test() —
+  // this replacement is picked NOT to repeat that (a policy refusal
+  // outlives an implementation-gap refusal).
+  const res = await buildWasm("refused.ts", 'const re = /(?i:a)/; console.log(re.test("A"));\n');
   expect(res.ok).toBe(false);
   if (res.ok) return;
   expect(res.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
   expect(res.wasmSurvey).toBeDefined();
-  expect(res.wasmSurvey).toContain("expr:regexLit");
+  expect(res.wasmSurvey).toContain("expr:regexLit:modifiers");
+});
+
+/* INC-24 P2's eight refusal keys — each needs a pin that REACHES it
+ * through a real compiled program (runWasm-level; the parser-level
+ * detector tests already exist in wasm-regex-disposition.test.ts).
+ * The regexLit-side unicode-casefold pin doubles as the regression
+ * pin for a real bug this same pass caught: regex-parser.ts's own
+ * assertNoUnicodeCasefold THROWS (not returns null) if a real parse
+ * with ignoreCase+isUnicode both true ever reaches char/class
+ * compilation — the emitter must rule that combination out BEFORE
+ * calling parsePattern with the pattern's own real flags, not after. */
+test("expr:regexLit:annexb refuses through a real program", async () => {
+  const res = await buildWasm("refused.ts", 'const re = /a{,2}/; console.log(re.test("a"));\n');
+  expect(res.ok).toBe(false);
+  if (res.ok) return;
+  expect(res.wasmSurvey).toContain("expr:regexLit:annexb");
+});
+
+test("expr:regexLit:unicode-casefold refuses through a real program (not a parser crash)", async () => {
+  const res = await buildWasm("refused.ts", 'const re = /a/iu; console.log(re.test("A"));\n');
+  expect(res.ok).toBe(false);
+  if (res.ok) return;
+  expect(res.wasmSurvey).toContain("expr:regexLit:unicode-casefold");
+});
+
+test("expr:regexLit:unported-unicode-property refuses through a real program", async () => {
+  const res = await buildWasm("refused.ts", 'const re = /\\p{Script=Greek}/u; console.log(re.test("α"));\n');
+  expect(res.ok).toBe(false);
+  if (res.ok) return;
+  expect(res.wasmSurvey).toContain("expr:regexLit:unported-unicode-property");
+});
+
+test("libCall:regex.new:modifiers refuses through a real program", async () => {
+  const res = await buildWasm("refused.ts", 'const re = new RegExp("(?i:a)"); console.log(re.test("A"));\n');
+  expect(res.ok).toBe(false);
+  if (res.ok) return;
+  expect(res.wasmSurvey).toContain("libCall:regex.new:modifiers");
+});
+
+test("libCall:regex.new:dynamic-pattern refuses through a real program", async () => {
+  const res = await buildWasm("refused.ts", 'const p = "a" + "b"; const re = new RegExp(p); console.log(re.test("ab"));\n');
+  expect(res.ok).toBe(false);
+  if (res.ok) return;
+  expect(res.wasmSurvey).toContain("libCall:regex.new:dynamic-pattern");
+});
+
+test("libCall:regex.new:dynamic-flags refuses through a real program", async () => {
+  const res = await buildWasm("refused.ts", 'const f = "i" + ""; const re = new RegExp("a", f); console.log(re.test("A"));\n');
+  expect(res.ok).toBe(false);
+  if (res.ok) return;
+  expect(res.wasmSurvey).toContain("libCall:regex.new:dynamic-flags");
+});
+
+test("libCall:regex.new:unported-unicode-property refuses through a real program", async () => {
+  const res = await buildWasm("refused.ts", 'const re = new RegExp("\\\\p{Script=Greek}", "u"); console.log(re.test("α"));\n');
+  expect(res.ok).toBe(false);
+  if (res.ok) return;
+  expect(res.wasmSurvey).toContain("libCall:regex.new:unported-unicode-property");
 });
 
 test("classes: a type family that references itself in every direction", async () => {

@@ -53,7 +53,13 @@ export class RegexBuilder {
   private readonly literals = new Map<string, number>();
 
   readonly regexType: number;
-  private readonly bcType: number;
+  // Public: the ONE nominal bytecode array type this module's regex
+  // values are built with. RegexInterpreterBuilder needs the SAME type
+  // index (not a structurally-identical second one) to accept a
+  // bytecode ref pulled via struct.get on a %w.re.Regex value — its own
+  // constructor's injectedBcType param exists for exactly this (mirrors
+  // the injectedCasing precedent already there).
+  readonly bcType: number;
   private readonly strArrType: number;
 
   constructor(

@@ -179,9 +179,20 @@ export class RegexInterpreterBuilder {
     private readonly mb: ModuleBuilder,
     private readonly strType: number, // (array (mut i16)), S002's shared subject-string type
     injectedCasing?: CasingBuilder,
+    // Same shape as injectedCasing just above: every existing (2- or
+    // 3-arg) test-harness call site builds its own standalone bytecode
+    // array and is unaffected. The production path (emitter.ts's own
+    // `get regexInterp()`) injects RegexBuilder's OWN bcType here — a
+    // bytecode ref read off a %w.re.Regex struct's `bytecode` field is
+    // otherwise a DIFFERENT nominal type than this class's self-built
+    // one, despite the identical (array (mut i8)) shape, and fails
+    // WasmGC validation the moment the two meet in the same module
+    // (never silent — but only surfaces once something actually wires
+    // both builders together, which nothing did before P2).
+    injectedBcType?: number,
   ) {
     this.casingField = injectedCasing ?? null;
-    this.bcType = mb.arrayType("i8", false);
+    this.bcType = injectedBcType ?? mb.arrayType("i8", false);
     this.capType = mb.arrayType(I32, true);
     // classRangeDSW("s")/("S") is the SAME \s/\S CharRange this port's
     // own charclass machinery already uses (and has already had

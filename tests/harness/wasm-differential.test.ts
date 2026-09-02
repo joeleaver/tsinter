@@ -2846,6 +2846,22 @@ const TIER_FLOOR: string[] = [
   "1710-cjs-export-class/main.js",
   "2385-builtin-reexport-facade/main.ts",
   "2282-queue-microtask.cjs",
+  // Increment 24 P2 — the predicate surface: expr:regexLit, type:regex,
+  // and the three regexIntrinsic predicates (test/source/flags) wired
+  // end to end (RegexBuilder + RegexInterpreterBuilder, dormant since
+  // P1, into the actual emitter). 1200 is the acceptance test (\p{L}
+  // under /u, astral matching, canonical .flags ordering, regexes as
+  // ordinary values); 1628 exercises a checked-dynamic STRING argument
+  // to a static regex's .test(); 2472/2476 are the type:regex surface
+  // (Map<string, RegExp> values, a string|RegExp union narrowed by
+  // instanceof) — the generic type:regex/expr:regexLit/expr:
+  // regexIntrinsic buckets all dissolve with this addition; the seven
+  // unopened regexIntrinsic methods now refuse by their own per-method
+  // name instead. 756 -> 760, exactly the predicted movers.
+  "1200-regex-test-basics.ts",
+  "1628-checked-dynamic-builtin-args.cjs",
+  "2472-string-regexp-union.ts",
+  "2476-map-regex-values.ts",
 ];
 
 interface RunResult {

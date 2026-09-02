@@ -101,9 +101,13 @@ test("assemble() vs lre_compile: byte-identical over the FULL generated pattern 
   );
 
   expect(mismatches, `first mismatches: ${firstFew.join("; ")}`).toBe(0);
-  // A basic sanity floor (not the precise 400-600 prediction check,
-  // which is a REPORTING requirement carried in prose, not a hardcoded
-  // assertion bound here — the exact post-dedup, post-parse-filter size
-  // depends on how much of the raw corpus survives both steps).
-  expect(accepted.length).toBeGreaterThan(300);
+  // F1 tighten (INC-24 P2 carried gate item, brief §4): buildCorpus()'s
+  // two inputs (loadClaimPatterns(), generatedCorpus()) and the parser-
+  // acceptance filter above are both deterministic, so this count is a
+  // FIXED property of the corpus, not a moving target — measured directly
+  // from this test's own console.log ("deduped corpus=810 accepted-by-
+  // parser(byte-compared)=748"), not estimated. A drift either way means
+  // the corpus generators or the parser's acceptance surface changed
+  // (matching the sweeps' own exact-count convention elsewhere).
+  expect(accepted.length).toBe(748);
 });

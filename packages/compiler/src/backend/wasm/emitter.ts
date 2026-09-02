@@ -149,6 +149,13 @@ import {
 } from "./generators.js";
 import { StrBuilder } from "./strings.js";
 import { CasingBuilder } from "./casing.js";
+import { RegexBuilder } from "./regex-value.js";
+import { RegexInterpreterBuilder } from "./regex-interpreter.js";
+import { parsePattern } from "./regex-parser.js";
+import { assemble, collectGroupNames, type AssembleFlags } from "./regex-assembler.js";
+import { classifyRegexLitRefusal, usesUnicodeCasefold } from "./regex-disposition.js";
+import type { RegexAst } from "./regex-ast.js";
+import { RE_HEADER_REGISTER_COUNT } from "./regex-opcodes.js";
 import { BytesBuilder, type BytesElem } from "./typedarrays.js";
 import { TimerBuilder } from "./timers.js";
 import { NextTickBuilder } from "./nexttick.js";
@@ -7764,6 +7771,19 @@ class Assembler {
         // never fails; elem-kind-specific representation questions live
         // at the bytesIntrinsic/bytesNew method sites, not here.
         return this.bytesB.bytesRef();
+      case "regex":
+        // ONE immutable interned struct whatever the pattern (regex-
+        // value.ts's %w.re.Regex, §3.2) — never fails, mirroring bytes
+        // just above and mapTypeSoft's OWN "regex" arm. THIS mapType (a
+        // narrower, refusing-capable sibling of mapTypeSoft, private to
+        // this file — not frontend/types.ts's mapType) is what locals/
+        // params/map-values actually consult for "does this type have a
+        // representation," so a value seen ONLY here (never through an
+        // expr walk) — e.g. `matches(r: RegExp, ...)`'s own parameter,
+        // or a `Map<string, RegExp>`'s value slot — needs this arm too;
+        // mapTypeSoft's addition alone left this one still refusing
+        // (the LOCKSTEP LAW's own recurring bug class, brief §1).
+        return { kind: "ref", nullable: true, typeIndex: this.regex.regexType };
       default:
         this.refuse(`type:${t.kind}`, loc);
         return null;
@@ -7820,6 +7840,7 @@ class Assembler {
           t.elem.kind === "map" ||
           t.elem.kind === "set" ||
           t.elem.kind === "bytes" ||
+          t.elem.kind === "regex" ||
           (t.elem.kind === "object" && this.objectMappable(t.elem.className));
         if (!mappable) return I32;
         const kind =
@@ -7886,6 +7907,14 @@ class Assembler {
       case "bytes":
         // mapType never fails on bytes either — the consistency rule.
         return this.bytesB.bytesRef();
+      case "regex":
+        // mapType never fails on regex either — same consistency rule,
+        // same shape as bytes/promise/dyn/caught: ONE struct (%w.re.Regex,
+        // regex-value.ts) for every regex value regardless of pattern —
+        // literal interning lives INSIDE that struct's own construction
+        // (regexLiteral()'s per-(source,flags) guard), not in a per-
+        // pattern wasm type.
+        return { kind: "ref", nullable: true, typeIndex: this.regex.regexType };
       default:
         return I32;
     }
@@ -10957,6 +10986,69 @@ class Assembler {
           code.unreachable();
           return;
         }
+        if (e.fn === "regex.new") {
+          // Four REFINEMENTS of the still-fully-refusing libCall:
+          // regex.new (item-8 sibling ruling — regex.new construction
+          // itself opens in P5, nothing regresses, these names just get
+          // earlier/sharper). Both args are always present and string-
+          // typed by construction (lower-classes.ts's own strArg: a
+          // missing flags argument becomes an explicit `""` strLit,
+          // never "dynamic"; a non-string arg is already refused at
+          // LOWERING time via noLowering, never reaches here).
+          const patternArg = e.args[0]!;
+          const flagsArg = e.args[1]!;
+          if (patternArg.kind !== "strLit") {
+            this.refuse("libCall:regex.new:dynamic-pattern", e.loc);
+            code.unreachable();
+            return;
+          }
+          if (flagsArg.kind !== "strLit") {
+            this.refuse("libCall:regex.new:dynamic-flags", e.loc);
+            code.unreachable();
+            return;
+          }
+          // Both statically known: the SAME disposition analysis
+          // regexLit runs, but only its "modifiers" and "unported-
+          // unicode-property" verdicts get their own regex.new-side
+          // name — annexb/unicode-casefold (and a clean or genuinely
+          // invalid pattern) fall through to the generic bucket below,
+          // since regex.new construction itself isn't implemented
+          // regardless of pattern content; sharpening those two is
+          // P5's own concern when regex.new actually opens.
+          const flags: AssembleFlags = {
+            global: flagsArg.value.includes("g"),
+            ignoreCase: flagsArg.value.includes("i"),
+            multiLine: flagsArg.value.includes("m"),
+            dotAll: flagsArg.value.includes("s"),
+            unicode: flagsArg.value.includes("u"),
+            sticky: flagsArg.value.includes("y"),
+          };
+          // Same /iu guard as regexLit's own case, same reason
+          // (assertNoUnicodeCasefold THROWS, not refuses): must not
+          // reach parsePattern with the pattern's own real flags before
+          // ruling out ignoreCase+unicode. unicode-casefold isn't one
+          // of THIS site's two named keys, but the parse crash it would
+          // otherwise cause happens regardless of which key eventually
+          // gets reported — the guard is about parsePattern, not about
+          // which refusal name fires afterward.
+          let ast: RegexAst | null = null;
+          if (!usesUnicodeCasefold(flags.ignoreCase, flags.unicode)) {
+            const parsed = parsePattern(patternArg.value, 0, flags.unicode, flags.ignoreCase, flags.multiLine, flags.dotAll);
+            ast = parsed !== null && parsed.next === patternArg.value.length ? parsed.ast : null;
+          }
+          const refusal = classifyRegexLitRefusal(patternArg.value, ast, flags.ignoreCase, flags.multiLine, flags.dotAll, flags.unicode, parsePattern);
+          if (refusal === "modifiers") {
+            this.refuse("libCall:regex.new:modifiers", e.loc);
+            code.unreachable();
+            return;
+          }
+          if (refusal === "unported-unicode-property") {
+            this.refuse("libCall:regex.new:unported-unicode-property", e.loc);
+            code.unreachable();
+            return;
+          }
+          // Falls through to the generic libCall:regex.new refusal below.
+        }
         if (this.emitBufferLibCall(e)) return;
         if (this.emitTimerCall(e)) return;
         if (this.emitEmitterLibCall(e)) return;
@@ -13168,14 +13260,179 @@ class Assembler {
         return;
       }
 
+      /* Regex literal: parse (P1's own already-gate-verified parser),
+       * classify against the four regexLit-side refusal keys (design
+       * §5.1/§2.5 — regex-disposition.ts's own paper trace), assemble +
+       * intern via RegexBuilder.regexLiteral() on the supported path.
+       * ENGINE UNTOUCHED beyond the two signature exports this needs
+       * (regex-assembler.ts's own collectGroupNames; emitRange was P1's
+       * own precedent for this exact kind of minimal export). */
+      case "regexLit": {
+        const flags: AssembleFlags = {
+          global: e.flags.includes("g"),
+          ignoreCase: e.flags.includes("i"),
+          multiLine: e.flags.includes("m"),
+          dotAll: e.flags.includes("s"),
+          unicode: e.flags.includes("u"),
+          sticky: e.flags.includes("y"),
+        };
+        // usesUnicodeCasefold checked BEFORE any parse attempt with the
+        // pattern's own real flags: regex-parser.ts's own
+        // assertNoUnicodeCasefold THROWS (a "should never happen"
+        // internal invariant, design §6.3), not returns null, the
+        // moment ignoreCase+isUnicode both reach char/class compilation
+        // — which almost any non-trivial pattern does. /iu must never
+        // reach parsePattern here. classifyRegexLitRefusal's own
+        // precedence checks this FIRST too (never touches ast for it),
+        // so skipping the parse and handing it ast:null matches exactly.
+        let ast: RegexAst | null = null;
+        if (!usesUnicodeCasefold(flags.ignoreCase, flags.unicode)) {
+          const parsed = parsePattern(e.pattern, 0, flags.unicode, flags.ignoreCase, flags.multiLine, flags.dotAll);
+          ast = parsed !== null && parsed.next === e.pattern.length ? parsed.ast : null;
+        }
+        const refusal = classifyRegexLitRefusal(e.pattern, ast, flags.ignoreCase, flags.multiLine, flags.dotAll, flags.unicode, parsePattern);
+        if (refusal !== null) {
+          this.refuse(`expr:regexLit:${refusal}`, e.loc);
+          code.unreachable();
+          return;
+        }
+        if (ast === null) {
+          // A genuine syntax error (Node would ALSO reject) — S065's own
+          // "compile-time diagnostic naming Node's exact error" is a
+          // SEPARATE, not-yet-built mechanism (no claim needs it; none
+          // of the four use an invalid pattern). Refuse by NAME rather
+          // than let a null ast reach assemble() — never silently wrong.
+          this.refuse("expr:regexLit:invalid-pattern", e.loc);
+          code.unreachable();
+          return;
+        }
+        const asm = assemble(ast, flags);
+        const groupNamesMap = collectGroupNames(ast);
+        const hasNamed = [...groupNamesMap.values()].some((v) => v.name !== null);
+        // .flags is ALWAYS canonical getter order (d g i m s u y), NEVER
+        // source order (design §5.6 — THE named trap, 1200 reads this
+        // back directly, S067's own register contract).
+        const canonicalFlags = "dgimsuy"
+          .split("")
+          .filter((c) => e.flags.includes(c))
+          .join("");
+        const groupNames = hasNamed
+          ? Array.from({ length: asm.captureCount - 1 }, (_, i) => groupNamesMap.get(i + 1)?.name ?? "")
+          : null;
+        const fnIdx = this.regex.regexLiteral(e.pattern, canonicalFlags, asm.bytes, asm.captureCount, groupNames);
+        code.call(fnIdx);
+        return;
+      }
+
+      /* regexIntrinsic: P2 opens the three PREDICATE members (test,
+       * source, flags — design §7.2); the other seven wait for P3/P4
+       * and refuse by their own per-method name (design §2.5's
+       * expr:<kind>:<feature> convention, item-8 ruling). */
+      case "regexIntrinsic": {
+        switch (e.method) {
+          case "source":
+            this.walkExpr(e.receiver);
+            code.structGet(this.regex.regexType, 0); // source
+            return;
+          case "flags":
+            this.walkExpr(e.receiver);
+            code.structGet(this.regex.regexType, 1); // flags — already CANONICAL order, baked in at regexLiteral() time
+            return;
+          case "test": {
+            const regexRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.regexType };
+            const bcRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.bcType };
+            // Receiver evaluated ONCE into a local — it may be an
+            // arbitrary expression (a call, a property read); reading
+            // its bytecode/captureCount fields twice by re-walking it
+            // would re-run any side effect a second time.
+            const reLocal = this.acquireScratch(regexRefT);
+            this.walkExpr(e.receiver);
+            code.localSet(reLocal);
+            const bcLocal = this.acquireScratch(bcRefT);
+            code.localGet(reLocal);
+            code.structGet(this.regex.regexType, 2); // bytecode
+            code.localSet(bcLocal);
+            // newCaptureArray's own unit is 2*count i32 slots, sized to
+            // hold BOTH the real capture slots (captureCount, a struct
+            // field baked in at regexLiteral() time) AND the bounded-
+            // quantifier register family's slots, which share the same
+            // array but aren't a struct field — read back from the
+            // bytecode's own header byte instead (RE_HEADER_REGISTER_
+            // COUNT; wasm-regex-interpreter-exec.test.ts's own
+            // captureArrayCountFor established this exact ceil-div-2
+            // padding unit at the TS level; here it's the same
+            // arithmetic done in wasm since the receiver isn't a
+            // compile-time-known literal in general).
+            code.localGet(bcLocal);
+            code.i32Const(RE_HEADER_REGISTER_COUNT);
+            code.call(this.regexInterp.readU8());
+            code.i32Const(1);
+            code.i32Add();
+            code.i32Const(1);
+            code.i32ShrU();
+            code.localGet(reLocal);
+            code.structGet(this.regex.regexType, 3); // captureCount
+            code.i32Add();
+            this.releaseScratch(regexRefT, reLocal);
+            const countLocal = this.acquireScratch(I32);
+            code.localSet(countLocal);
+            code.localGet(bcLocal);
+            this.walkExpr(e.args[0]!); // subject
+            // startIndex is always 0: SC1121 (lower-containers.ts) fences
+            // every g/y regex literal receiver at compile time, and P2's
+            // only construction path for a RegExp value IS a literal
+            // (regex.new stays refused until P5) — so no runtime value
+            // reaching this case can carry a stateful lastIndex a
+            // constant 0 would get wrong (design §4.7).
+            // P5 FORWARD-CHECK: this argument's second premise (regex.new
+            // fully refused) stops holding once P5 opens it — a runtime-
+            // constructed g/y regex could then flow into .test() through
+            // a variable, a route SC1121's own compile-time literal
+            // check may not see (its own comment already names a
+            // "runtime fence" for exactly this, not yet built). RE-VERIFY
+            // THEN: does something catch that path, or does P5 need to
+            // build the fence SC1121 anticipates. Not a P2 gap — P2's
+            // own construction surface has no route to it — but re-check
+            // before trusting this constant 0 past P5's own landing.
+            code.i32Const(0);
+            code.localGet(countLocal);
+            code.call(this.regexInterp.newCaptureArray());
+            this.releaseScratch(bcRefT, bcLocal);
+            this.releaseScratch(I32, countLocal);
+            code.call(this.regexInterp.exec()); // -> i32, 1/0 — already BOOL's own representation, no conversion needed
+            return;
+          }
+          case "match":
+          case "matchAll":
+          case "matchAllInto":
+          case "replace":
+          case "replaceAll":
+          case "split":
+          case "search":
+            // matchAllInto mints this SAME per-method name but currently
+            // has no census bucket of its own — zero corpus programs
+            // reach the into-target overload as their first regex
+            // refusal (rider-2 finding, findings-p2-v1.txt).
+            this.refuse(`expr:regexIntrinsic:${e.method}`, e.loc);
+            code.unreachable();
+            return;
+          default: {
+            // Every IrRegexIntrinsicMethod member has a case above (3
+            // real, 7 refused) — this switch is PROVABLY exhaustive (TS
+            // narrows `e` to `never` here), so this is dead code by
+            // construction, matching bytesIntrinsic's own identical
+            // nested-switch precedent just above.
+            const exhaustive: never = e;
+            throw new Error(`emitter bug: unhandled regexIntrinsic case (should be unreachable): ${String(exhaustive)}`);
+          }
+        }
+      }
+
       /* Unit values exist only inside unions (unionWrap intercepts them
        * before the walk, so a reached unitLit is refused loudly). */
       case "unitLit":
       /* templateStrings is the tagged-template strings OBJECT (string[]). */
       case "templateStrings":
-      /* Regex — a whole engine, host-imported or compiled. */
-      case "regexLit":
-      case "regexIntrinsic":
       /* Native FFI — a link-time C ABI, nothing to link against here. */
       case "ffiCall":
       /* Async. yieldExpr never reaches here in a function the lowering
@@ -14592,6 +14849,35 @@ class Assembler {
   private get casing(): CasingBuilder {
     this.casingField ??= new CasingBuilder(this.mb, this.strType);
     return this.casingField;
+  }
+
+  private regexField: RegexBuilder | null = null;
+
+  /** The regex VALUE struct + literal interning (regex-value.ts, P1's
+   * own dormant builder — P2's first wiring step per the recorded
+   * scoping ruling). Self-contained over mb + strType, matching
+   * casing's own shape. */
+  private get regex(): RegexBuilder {
+    this.regexField ??= new RegexBuilder(this.mb, this.strType);
+    return this.regexField;
+  }
+
+  private regexInterpField: RegexInterpreterBuilder | null = null;
+
+  /** The regex INTERPRETER (regex-interpreter.ts, P1's own dormant
+   * engine) — exec()'s own home. Shares ONE CasingBuilder instance
+   * with `casing` above via the injectedCasing constructor param (P1's
+   * own dedup ruling, MEASURED at 978 bytes of duplicated code
+   * avoided — regex-interpreter.ts's own constructor doc). */
+  private get regexInterp(): RegexInterpreterBuilder {
+    // this.regex.bcType FIRST (forces RegexBuilder's construction if it
+    // hasn't happened yet) — the interpreter must accept the SAME
+    // nominal bytecode array type the builder's %w.re.Regex struct
+    // stores, or a struct.get'd bytecode ref fails WasmGC validation
+    // against the interpreter's own self-built type. See
+    // RegexInterpreterBuilder's own injectedBcType doc comment.
+    this.regexInterpField ??= new RegexInterpreterBuilder(this.mb, this.strType, this.casing, this.regex.bcType);
+    return this.regexInterpField;
   }
 
   private bytesField: BytesBuilder | null = null;

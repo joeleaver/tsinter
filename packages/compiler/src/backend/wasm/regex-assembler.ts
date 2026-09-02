@@ -466,7 +466,7 @@ function captureIndexRange(node: RegexAst): [number, number] | null {
  * each capturing group's {name, nameScope} keyed by its capture index,
  * so assemble() can rebuild the trailer in capture-index order without
  * needing the original pattern string. */
-function collectGroupNames(node: RegexAst): Map<number, { name: string | null; nameScope: number }> {
+export function collectGroupNames(node: RegexAst): Map<number, { name: string | null; nameScope: number }> {
   const result = new Map<number, { name: string | null; nameScope: number }>();
   function walk(n: RegexAst): void {
     switch (n.kind) {
