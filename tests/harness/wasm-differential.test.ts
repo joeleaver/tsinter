@@ -2862,6 +2862,31 @@ const TIER_FLOOR: string[] = [
   "1628-checked-dynamic-builtin-args.cjs",
   "2472-string-regexp-union.ts",
   "2476-map-regex-values.ts",
+  // Increment 24 P3 — the string-producing surface, the increment's own
+  // hard pass: regexIntrinsic{replace, replaceAll, split, search} and
+  // GetSubstitution (transcribed from quickjs.c's own js_string___Get
+  // Substitution + js_regexp_Symbol_replace/_split), plus split()'s
+  // Node-exact capture splice (S066, board #118). 1202 is GetSubstitution's
+  // own acceptance test (every $-rule); 2609 is the named-group workout
+  // ($<name> templates and \k<name> backreferences both ways, including
+  // the case-insensitive backreference); 1204 exercises the empty-match
+  // advance under astral subjects, with and without /u. The four opened
+  // per-method buckets (:replace, :replaceAll, :split, :search) all
+  // dissolve; 1206 and 1306 advance to their own non-regex blockers
+  // (libCall:island.eval, libCall:fs.readFileSync). 760 -> 772, exactly
+  // the predicted movers.
+  "1201-regex-replace.ts",
+  "1202-regex-substitutions.ts",
+  "1203-regex-split.ts",
+  "1204-regex-empty-unicode.ts",
+  "1205-regex-rc-stress.ts",
+  "1483-array-slice.ts",
+  "1546-union-element-reads.ts",
+  "1551-dyn-receiver-methods.ts",
+  "1558-any-joins-and-dyn-validation.ts",
+  "1641-string-search.ts",
+  "1643-metadata-dyn-return.cjs",
+  "2609-regex-named-replace.ts",
 ];
 
 interface RunResult {

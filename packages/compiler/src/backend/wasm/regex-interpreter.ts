@@ -152,7 +152,12 @@ const RE_EXEC_STATE_NEGATIVE_LOOKAHEAD = 2;
 
 export class RegexInterpreterBuilder {
   private readonly bcType: number; // (array (mut i8)) — the bytecode
-  private readonly capType: number; // (array (mut i32)) — capture[] and the backtrack stack (same element shape, different arrays)
+  // Public, mirroring RegexBuilder.bcType's own P2 precedent (a visibility-
+  // only change, no new wasm behavior): callers that already have a
+  // captureOut ref (from newCaptureArray()/exec()) need the concrete type
+  // index to arrayGet a slot directly — search's own match-start read
+  // (P3) is the first such caller.
+  readonly capType: number; // (array (mut i32)) — capture[] and the backtrack stack (same element shape, different arrays)
   private readonly fns = new Map<string, number>();
   // CASINGBUILDER DEDUP RULING (CP4 back half, measured at embedding):
   // an INJECTED CasingBuilder, when the caller already has one (as

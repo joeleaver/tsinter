@@ -4835,10 +4835,28 @@ carries.
 TIMING, three arms by how the pattern reaches the compiler. A bad
 LITERAL such as `/(/`: Node is a parse error (MEASURED — not one
 module statement runs, no program output at all); wasm is a compile-
-time diagnostic (no binary, so likewise no program output); the
-NATIVE lanes are the ones that diverge, and diverge loudly in the
-worst way — the program STARTS, runs, produces output, and THEN
-aborts uncatchably at first use of the regex (`ir/nodes.ts:4177-
+time diagnostic (no binary, so likewise no program output) — MEASURED
+(INC-24 P3, gate finding F1) to be TSC's OWN preflight passthrough
+(`SC0001`), common to every backend, not this tier's own regex
+machinery: TSC's regex-literal handling does real ECMAScript-grammar
+validation at parse time (confirmed against bracket-BALANCED invalid
+patterns like `a{2,1}`, which a shallow lexer bracket-check would not
+catch, and TSC still rejects), so an invalid literal never reaches the
+wasm backend's own `expr:regexLit:invalid-pattern` check at all. That
+check still exists and still fires correctly when reached (a hand-
+built IR fixture proves it, bypassing TSC's own lexer — packages/
+compiler/test/wasm-emitter.test.ts) — it is a BACKSTOP against TSC's
+own validation specifically (a third-party dependency this project
+does not control and that changes across versions; a future TSC
+version accepting something design-regex-v6.txt §5.1 doesn't handle
+would otherwise flow a bad literal into parse/assemble undefined, the
+silent-wrong class this project refuses to risk), not the mechanism
+that fires in today's actual toolchain. The observable claim below is
+unchanged either way — no binary, no program output, same as Node's
+own parse-error behavior — only WHICH gate produces it is corrected
+here. The NATIVE lanes are the ones that diverge, and diverge loudly
+in the worst way — the program STARTS, runs, produces output, and
+THEN aborts uncatchably at first use of the regex (`ir/nodes.ts:4177-
 4186`). wasm and Node agree on the only thing that matters
 observably (zero output); only WHERE the failure is reported differs,
 which is the refusal contract, not a behavioral divergence. A bad
@@ -4875,7 +4893,12 @@ constant; the native lanes parse at runtime with no compile-time
 knowledge of the pattern's validity, so they abort rather than throw
 catchably, and approximate rather than reproduce the message.
 
-**Tested by:** `2284` (`assert.throws(() => new RegExp('('),
+**Tested by:** the literal arm's own backstop (`expr:regexLit:invalid-
+pattern`, both mint sites) is proven live by two hand-built IrModule
+fixtures (INC-24 P3 gate finding F1) that bypass TSC's own lexer
+entirely — the ONLY way to reach it, since TSC's preflight gate makes
+it structurally unreachable through real source (above). `2284`
+(`assert.throws(() => new RegExp('('),
 SyntaxError)`) is the corpus witness for the TIMING/catchability axis
 only; the message-text axis is corpus-unpinnable (latent, per REACH
 above) and is recorded here as the measurement of record rather than

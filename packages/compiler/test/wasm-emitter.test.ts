@@ -12,7 +12,8 @@ import { join } from "node:path";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import { compile } from "../src/index.js";
 import { I32, ModuleBuilder } from "../src/backend/wasm/module.js";
-import { parseFnEvalConstruct } from "../src/backend/wasm/emitter.js";
+import { parseFnEvalConstruct, surveyWasmModule } from "../src/backend/wasm/emitter.js";
+import { arrayOf, STRING, VOID, type IrExpr, type IrModule, type SrcLoc } from "../src/ir/nodes.js";
 
 let scratch: string;
 beforeAll(async () => {
@@ -8308,4 +8309,251 @@ test("increment 21 stage B N2 gate-closing pin: dyn.ts's toFixed precision fence
       "0.10000000000000\n" +
       "survived\n",
   );
+});
+
+/* INC-24 P3's own two REQUIRED pins, neither reachable through the
+ * corpus (design §7.3's own "ADDED WORK" block, lead ruling R4; the
+ * replaceAll message text, per §6.4). */
+
+test("split() capture splice — R4's own four-shape minimum, verbatim, ELEMENT level", async () => {
+  // ELEMENT level, not join(): a join collapses a genuinely-empty
+  // participating capture and a nonparticipating undefined slot to the
+  // SAME "" either way, so a join-level assertion can't discriminate
+  // "correctly produced '' per S064" from "wrongly produced an empty
+  // match" — the design's own pin language ("a nonparticipating slot
+  // (S064's \"\" rendering)") means exactly this element-level
+  // discrimination (lead ruling, this pass's own CP). JSON.stringify
+  // shows the divergence directly: Node's OWN JSON.stringify of a
+  // nonparticipating slot is `null` (from an actual `undefined`
+  // element) — measured live this session — while this tier's `string
+  // []` cannot hold undefined at all, so it renders "" per S064
+  // instead (registered, not a bug). The assertions below are this
+  // TIER's own expected S064-aware output, not Node's raw JSON (which
+  // would never match by construction) — every `null` in the live-
+  // measured Node JSON becomes "" here, nothing else changes.
+  //
+  // (a) a nonparticipating slot — index 1 is S064's own divergence
+  //     (Node: null; here: ""). (b) a nested group (both levels
+  //     spliced, no S064 exposure — no index is ever nonparticipating).
+  //     (c) a no-match subject (no splice at all, no S064 exposure).
+  //     (d) one zero-length-advance interaction (js_regexp_Symbol_
+  //     split's own `e === p` check — a zero-length match landing
+  //     exactly at the current segment's own start is treated as no-
+  //     match, not a splice point; no S064 exposure).
+  const res = await buildWasm(
+    "split-splice-r4.ts",
+    [
+      'console.log(JSON.stringify("ab".split(/(x)?b/)));', // (a) nonparticipating
+      'console.log(JSON.stringify("a1b".split(/((\\d))/)));', // (b) nested group
+      'console.log(JSON.stringify("abc".split(/(z)/)));', // (c) no-match subject
+      'console.log(JSON.stringify("ab".split(/b*/)));', // (d) zero-length-advance interaction
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    ['["a","",""]', '["a","1","1","b"]', '["abc"]', '["a",""]', ""].join("\n"),
+  );
+});
+
+test("split() stale-capture-reuse regression: two alternatives, different capture indices toggling", async () => {
+  // NAMED after the bug (the lead's own convention): this session's
+  // captureOut array was allocated ONCE before split's own while loop
+  // and reused across every exec() call inside it — but exec() never
+  // resets a slot it doesn't touch (newCaptureArray()'s own -1 fill is
+  // ONE-TIME, at creation — "captureOut is caller-owned", its own doc
+  // comment), so a capture that participated in an EARLIER segment and
+  // is simply never touched by a LATER one retained its stale value.
+  // Fixed by re-creating the array fresh before every exec() call
+  // inside the loop. No R4 shape above happens to toggle a group's own
+  // participation across segments (each pattern there has either one
+  // group, always-together nested groups, or none) — this pin is that
+  // exact toggling shape, element-level, S064-aware (Node: null for
+  // whichever alternative's group didn't participate that segment).
+  const res = await buildWasm(
+    "split-stale-capture.ts",
+    ['console.log(JSON.stringify("1a2b3".split(/(\\d)|([a-z])/)));'].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    '["","1","","","","a","","2","","","","b","","3","",""]\n',
+  );
+});
+
+test("replace() stale-capture-reuse regression: duplicate-named-group global replace", async () => {
+  // The SAME bug, replace's own side: captureOut allocated once before
+  // the match-collect loop, reused across matches. Exposed directly by
+  // a genuine ES2025 duplicate-named-group pattern (two alternatives
+  // sharing one name, different capture indices) — the SECOND match's
+  // own $<n> read back the FIRST match's stale value ("[14] [14]"
+  // instead of "[14] [9]") until fixed the same way as split's own
+  // instance: a fresh array before every exec() call inside the loop.
+  const res = await buildWasm(
+    "replace-stale-capture.ts",
+    ['console.log("14px 9em".replace(/(?<n>\\d+)px|(?<n>\\d+)em/g, "[$<n>]"));'].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("[14] [9]\n");
+});
+
+test("split() with a non-literal pattern refuses under its own pre-existing name — proving the refuse path fires", async () => {
+  // split's own scoping (this pass's own findings entry): only a
+  // LITERAL regex receiver gets the sticky-forced-bytecode treatment —
+  // a regex flowing through a variable has no compile-time pattern
+  // text to re-assemble sticky, so it stays on split's OWN pre-
+  // existing refusal name rather than minting a new one (nothing in
+  // the corpus needs the non-literal shape; a future pass can widen
+  // this without renaming anything). Proven, not asserted: a real
+  // program that reaches this exact path.
+  const res = await buildWasm(
+    "split-non-literal.ts",
+    ['function s(r: RegExp, str: string): string[] { return str.split(r); }', "console.log(s(/,/, 'a,b'));"].join(
+      "\n",
+    ),
+  );
+  expect(res.ok).toBe(false);
+  if (res.ok) return;
+  expect(res.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
+  expect(res.wasmSurvey).toContain("expr:regexIntrinsic:split");
+});
+
+/* Gate F1 (p3): expr:regexLit:invalid-pattern is minted at TWO
+ * independent sites — the ordinary regexLit case (P2) and split's own
+ * literal-twin classify route (P3's re-assembly path for the sticky-
+ * forced bytecode) — and neither had a pin reaching it.
+ *
+ * UNREACHABLE THROUGH SOURCE, MEASURED: TSC's own regex-literal
+ * handling does REAL ECMAScript-grammar-level validation at parse
+ * time, not just bracket matching — measured directly against four
+ * candidates ("(", "[", "(?<>a)", "a{2,1}"), the last two chosen
+ * specifically because they are BRACKET-BALANCED (no shallow lexer
+ * check would catch them) yet TSC still rejects all four with SC0001
+ * before either wasm-backend site is ever reached. Cross-checked
+ * against design §5.1's own disposition table in full: every REFUSE
+ * row is exactly one of the four ALREADY-named-and-detected keys
+ * (modifiers/annexb/unicode-casefold/unported-unicode-property); every
+ * other row is IMPLEMENT. So a pattern TSC accepts should, by the
+ * design's own completeness argument (§5.7's own mechanical guard),
+ * land on a correct IMPLEMENT path or one of those four — never on
+ * this undetected branch. This key is a BACKSTOP against a THIRD-PARTY
+ * validator (TSC's own grammar checking, not this project's own code,
+ * and not stable across versions — see the repo's own tsgo upgrade
+ * playbook) — removing the backstop would mean a future TSC accepting
+ * something §5.1 doesn't handle flows a bad literal into parse/
+ * assemble undefined, the silent-wrong class this project refuses to
+ * risk. Per this build's own unreachable-by-construction precedent
+ * (char32_i, REOP_prev, wasm-regex-interpreter-core.test.ts): a hand-
+ * built IrModule, bypassing TSC's own lexer entirely (the pattern
+ * string is written directly into the IR node, never lexed as TS
+ * source), proves each site's own handler fires correctly WHEN
+ * reached — defense-in-depth's own obligation, not a claim that real
+ * source can reach it. The two sites are DISJOINT reach paths (proven
+ * by reading both call sites: split's own case never calls walkExpr on
+ * its args[0] regexLit at all — it reads patArg.pattern/patArg.flags
+ * directly off the IR node — so no single fixture can exercise both;
+ * this needs two, per rev's own form (b)). */
+
+const invalidPatternLoc: SrcLoc = { file: "invalid-pattern.ts", start: 0, end: 0 };
+const invalidPatternRegexLit: IrExpr = {
+  kind: "regexLit",
+  pattern: "a{2,1}",
+  flags: "",
+  type: { kind: "regex" },
+  loc: invalidPatternLoc,
+};
+
+test("expr:regexLit:invalid-pattern fires at the ORDINARY regexLit site (hand-built IrModule, bypassing TSC)", () => {
+  const mod: IrModule = {
+    irVersion: 3,
+    sourceFile: "invalid-pattern-plain.ts",
+    entry: "%main",
+    functions: [
+      {
+        name: "%main",
+        params: [],
+        returnType: VOID,
+        locals: [],
+        body: [{ kind: "exprStmt", expr: invalidPatternRegexLit, loc: invalidPatternLoc }],
+        loc: invalidPatternLoc,
+      },
+    ],
+  };
+  expect(surveyWasmModule(mod)).toEqual(["expr:regexLit:invalid-pattern"]);
+});
+
+test("expr:regexLit:invalid-pattern fires at split()'s own literal-twin classify site (hand-built IrModule, bypassing TSC)", () => {
+  const mod: IrModule = {
+    irVersion: 3,
+    sourceFile: "invalid-pattern-split.ts",
+    entry: "%main",
+    functions: [
+      {
+        name: "%main",
+        params: [],
+        returnType: VOID,
+        locals: [],
+        body: [
+          {
+            kind: "exprStmt",
+            expr: {
+              kind: "regexIntrinsic",
+              method: "split",
+              receiver: { kind: "strLit", value: "a", type: STRING, loc: invalidPatternLoc },
+              args: [invalidPatternRegexLit],
+              type: arrayOf(STRING),
+              loc: invalidPatternLoc,
+            },
+            loc: invalidPatternLoc,
+          },
+        ],
+        loc: invalidPatternLoc,
+      },
+    ],
+  };
+  expect(surveyWasmModule(mod)).toEqual(["expr:regexLit:invalid-pattern"]);
+});
+
+test("replaceAll non-global regex: Node's exact TypeError, message verified live", async () => {
+  // design §6.4's own byte-exact message target, measured directly
+  // against live Node this session (not trusted from the citation
+  // alone, per the lead's own rider): TypeError, no .code property.
+  const res = await buildWasm(
+    "replaceall-throw.ts",
+    [
+      'try {',
+      '  "abc".replaceAll(/b/, "x");',
+      '  console.log("unreachable");',
+      "} catch (e) {",
+      "  console.log((e as Error).name, (e as Error).message);",
+      "}",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    "TypeError String.prototype.replaceAll called with a non-global RegExp argument\n",
+  );
+});
+
+test("empty-match advance at the subject's own end, without /u: splits the surrogate pair, never traps", async () => {
+  // §4.6's own "a<astral>b".replace(/(?:)/g,"-") -> "-a-\ud83d-\ude00-b-"
+  // example, WITHOUT /u — a real bug this session caught: a global
+  // pattern's LAST match, an empty match landing exactly at subject.
+  // length, called getChar() unconditionally to compute the next probe
+  // position; getChar() has no bounds guard (nothing in the regex
+  // MATCHER itself ever calls it at idx===length, by construction), so
+  // it read one past the array's end and trapped. Fixed to match
+  // string_advance_index's OWN guard (quickjs.c:46647-46657): `!unicode
+  // || index >= len` takes a plain +1, never touching getChar at all.
+  // No claim exercises this shape (every claim's own empty-matching
+  // pattern is either non-global or never reaches the subject's own
+  // end) — verified byte-exact at the raw stdout level, since a lone
+  // surrogate's UTF-8 encoding (U+FFFD) isn't distinguishable from a
+  // real U+FFFD character through a plain string comparison.
+  const res = await buildWasm("astral-boundary.ts", 'console.log("a\\u{1F600}b".replace(/(?:)/g, "-"));');
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("hex")).toBe("2d612defbfbd2defbfbd2d622d0a");
 });

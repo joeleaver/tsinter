@@ -60,7 +60,12 @@ export class RegexBuilder {
   // constructor's injectedBcType param exists for exactly this (mirrors
   // the injectedCasing precedent already there).
   readonly bcType: number;
-  private readonly strArrType: number;
+  // Public, same reasoning as bcType above: GetSubstitution (P3) needs
+  // the exact nominal type of the groupNames field to declare its own
+  // function parameter — a struct.get pulls the FIELD fine regardless,
+  // but a function signature naming that field's element type needs the
+  // concrete index, not a structurally-identical second one.
+  readonly strArrType: number;
 
   constructor(
     private readonly mb: ModuleBuilder,

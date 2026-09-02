@@ -155,7 +155,7 @@ import { parsePattern } from "./regex-parser.js";
 import { assemble, collectGroupNames, type AssembleFlags } from "./regex-assembler.js";
 import { classifyRegexLitRefusal, usesUnicodeCasefold } from "./regex-disposition.js";
 import type { RegexAst } from "./regex-ast.js";
-import { RE_HEADER_REGISTER_COUNT } from "./regex-opcodes.js";
+import { RE_HEADER_REGISTER_COUNT, RE_HEADER_FLAGS, LRE_FLAG_GLOBAL, LRE_FLAG_UNICODE } from "./regex-opcodes.js";
 import { BytesBuilder, type BytesElem } from "./typedarrays.js";
 import { TimerBuilder } from "./timers.js";
 import { NextTickBuilder } from "./nexttick.js";
@@ -8054,7 +8054,24 @@ class Assembler {
    * fn.depth stays exact — a raw code.block()/ifVoid() here would skew the
    * relative immediate of every br crossing it. (The self-contained runtime
    * helpers below emit their own Code with hand-counted depths and never
-   * touch fn state.) Each open* returns the new label's position for brTo. */
+   * touch fn state.) Each open* returns the new label's position for brTo.
+   *
+   * THE FAILURE MODE, NAMED (INC-24 P3 caught it live): a raw code.ifVoid()/
+   * code.end() used INSIDE a walkExpr case (as opposed to a self-contained
+   * helper's own hand-counted Code) desynchronizes fn.depth from the
+   * ACTUAL nesting without erroring anywhere — the module still validates,
+   * because the branch target is still a legal (just wrong) depth. If that
+   * mis-tracked region also calls emitUnwind() (any throw), brTo()'s own
+   * `this.fn.depth - 1 - pos` computes a branch ONE LEVEL TOO SHALLOW: it
+   * exits only the raw if, never reaching the real try/catch handler. The
+   * exception cell gets set correctly (a caught message would print byte-
+   * exact if anything read it) but is never consumed, so it surfaces as
+   * UNCAUGHT at the top level — which reads exactly like "the try/catch
+   * itself is broken," not "one if inside it used the wrong helper," and
+   * bisects expensively for that reason. If new code inside a walkExpr case
+   * needs an if/block/loop AND can reach emitUnwind() anywhere inside it —
+   * even indirectly, through another call — use openIf()/openBlock()/
+   * openLoop()/close() here, not the raw code.* methods. */
 
   private openBlock(): number {
     this.fn.code.block();
@@ -13402,13 +13419,679 @@ class Assembler {
             code.call(this.regexInterp.exec()); // -> i32, 1/0 — already BOOL's own representation, no conversion needed
             return;
           }
+          case "search": {
+            // Symbol.search: ONE exec() at position 0, same shape as
+            // "test" above, but returns the match's own START INDEX
+            // (captureOut[0]) as f64, or -1 on no match — never a
+            // boolean. No g/y fence needed: Symbol.search neither reads
+            // nor writes lastIndex (js_regexp_Symbol_search read
+            // directly — it saves/restores lastIndex around one exec,
+            // net effect zero; design §4.7's own measured claim, now
+            // doubly confirmed against the reference).
+            // NOTE the operand shape is the OPPOSITE of "test": here the
+            // receiver is the SUBJECT STRING (`str.search(re)`) and the
+            // regex is args[0] — lower-containers.ts's own construction,
+            // confirmed by reading it directly (a real bug caught by the
+            // smoke test below: the first draft had these swapped, which
+            // WasmGC validation caught immediately as a local.set type
+            // mismatch — a subject string handed to a regex-typed local).
+            // EVALUATION ORDER, separately: JS evaluates the RECEIVER
+            // (the subject) before the argument (the regex) — `str.
+            // search(re)` reads `str` first. The regex's own bytecode/
+            // captureCount fields are needed EARLY here (to size
+            // captureOut before exec()'s own operand push), so the
+            // subject is stashed in its own scratch local FIRST (correct
+            // JS order) and consumed LATER as exec()'s operand, rather
+            // than re-walking e.receiver at that later point (which
+            // would evaluate it a second time, doubling any side effect,
+            // AND out of order).
+            const strRefT = this.strRef;
+            const regexRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.regexType };
+            const bcRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.bcType };
+            const capRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regexInterp.capType };
+            const subjLocal = this.acquireScratch(strRefT);
+            this.walkExpr(e.receiver); // the subject string, evaluated FIRST (JS order)
+            code.localSet(subjLocal);
+            const reLocal = this.acquireScratch(regexRefT);
+            this.walkExpr(e.args[0]!); // the regex, evaluated SECOND (JS order)
+            code.localSet(reLocal);
+            const bcLocal = this.acquireScratch(bcRefT);
+            code.localGet(reLocal);
+            code.structGet(this.regex.regexType, 2); // bytecode
+            code.localSet(bcLocal);
+            // captureArrayCount — same computation as "test" above.
+            code.localGet(bcLocal);
+            code.i32Const(RE_HEADER_REGISTER_COUNT);
+            code.call(this.regexInterp.readU8());
+            code.i32Const(1);
+            code.i32Add();
+            code.i32Const(1);
+            code.i32ShrU();
+            code.localGet(reLocal);
+            code.structGet(this.regex.regexType, 3); // captureCount
+            code.i32Add();
+            this.releaseScratch(regexRefT, reLocal);
+            const countLocal = this.acquireScratch(I32);
+            code.localSet(countLocal);
+            const capLocal = this.acquireScratch(capRefT);
+            code.localGet(countLocal);
+            code.call(this.regexInterp.newCaptureArray());
+            code.localSet(capLocal);
+            this.releaseScratch(I32, countLocal);
+            code.localGet(bcLocal);
+            code.localGet(subjLocal); // the subject, already evaluated above
+            code.i32Const(0); // startIndex — always 0, same SC1121/regex.new-refused reasoning as "test"
+            code.localGet(capLocal);
+            code.call(this.regexInterp.exec());
+            this.releaseScratch(strRefT, subjLocal);
+            this.releaseScratch(bcRefT, bcLocal);
+            // stack: i32 1/0 — branch directly, no local needed.
+            code.ifResult(F64);
+            code.localGet(capLocal);
+            code.i32Const(0);
+            code.arrayGet(this.regexInterp.capType); // captureOut[0] = the whole match's start offset
+            code.f64ConvertI32S();
+            code.else_();
+            code.f64Const(-1);
+            code.end();
+            this.releaseScratch(capRefT, capLocal);
+            return;
+          }
+          case "split": {
+            // Node's own splitter clones the regex with 'y' forced on
+            // (js_regexp_Symbol_split, read directly) — sticky-anchored
+            // exec is what makes "the probe position IS the match start
+            // when it matches" hold, which the whole segment-building
+            // loop below depends on. This tier's regex values carry ONE
+            // compiled bytecode, matching their own literal's actual
+            // flags — there's no second, sticky-forced variant stored
+            // anywhere. SCOPED to literal receivers only (both actual
+            // claims, 1203/1483, pass a regex literal directly at every
+            // .split() call site, no exceptions — checked by reading
+            // both programs, not assumed): a literal's pattern text is
+            // available at compile time, so a FRESH, sticky-forced
+            // assembly can be built and interned right here, under the
+            // canonical flags with "y" added — the SAME public
+            // RegexBuilder.regexLiteral() API every other case already
+            // calls, not an engine edit. A non-literal pattern (e.g. a
+            // regex variable) refuses under split's own PRE-EXISTING
+            // bucket name — split simply doesn't open for that shape
+            // yet; nothing in the corpus needs it, and a future pass can
+            // widen this without renaming anything.
+            const patArg = e.args[0]!;
+            if (patArg.kind !== "regexLit") {
+              this.refuse("expr:regexIntrinsic:split", e.loc);
+              code.unreachable();
+              return;
+            }
+            const flags: AssembleFlags = {
+              global: patArg.flags.includes("g"),
+              ignoreCase: patArg.flags.includes("i"),
+              multiLine: patArg.flags.includes("m"),
+              dotAll: patArg.flags.includes("s"),
+              unicode: patArg.flags.includes("u"),
+              sticky: true, // FORCED regardless of the literal's own /y
+            };
+            // Same /iu guard as regexLit's own case (assertNoUnicodeCasefold
+            // THROWS, not refuses, on a real parse with both true).
+            let ast: RegexAst | null = null;
+            if (!usesUnicodeCasefold(flags.ignoreCase, flags.unicode)) {
+              const parsed = parsePattern(patArg.pattern, 0, flags.unicode, flags.ignoreCase, flags.multiLine, flags.dotAll);
+              ast = parsed !== null && parsed.next === patArg.pattern.length ? parsed.ast : null;
+            }
+            const refusal = classifyRegexLitRefusal(patArg.pattern, ast, flags.ignoreCase, flags.multiLine, flags.dotAll, flags.unicode, parsePattern);
+            if (refusal !== null) {
+              // Grammar disposition doesn't depend on sticky — the SAME
+              // regexLit-side key this pattern would refuse under as an
+              // ordinary literal.
+              this.refuse(`expr:regexLit:${refusal}`, e.loc);
+              code.unreachable();
+              return;
+            }
+            if (ast === null) {
+              this.refuse("expr:regexLit:invalid-pattern", e.loc);
+              code.unreachable();
+              return;
+            }
+            const asm = assemble(ast, flags);
+            const groupNamesMap = collectGroupNames(ast);
+            const hasNamed = [...groupNamesMap.values()].some((v) => v.name !== null);
+            const canonicalFlags = "dgimsuy"
+              .split("")
+              .filter((c) => c === "y" || patArg.flags.includes(c))
+              .join("");
+            const groupNames = hasNamed
+              ? Array.from({ length: asm.captureCount - 1 }, (_, i) => groupNamesMap.get(i + 1)?.name ?? "")
+              : null;
+            const stickyFnIdx = this.regex.regexLiteral(patArg.pattern, canonicalFlags, asm.bytes, asm.captureCount, groupNames);
+            // captureCount/registerCount are COMPILE-TIME known here
+            // (unlike test/search, whose receiver can be an arbitrary
+            // expression) — no runtime header read needed.
+            const registerCount = asm.bytes[RE_HEADER_REGISTER_COUNT]!;
+            const captureArrayCount = asm.captureCount + Math.ceil(registerCount / 2);
+            const captureCount = asm.captureCount;
+
+            const strRefT = this.strRef;
+            const bcRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.bcType };
+            const capRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regexInterp.capType };
+            const vecInfo = this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!;
+            const vecRefT = this.vecs.vecRef(vecInfo);
+
+            const subjLocal = this.acquireScratch(strRefT);
+            this.walkExpr(e.receiver); // the subject string
+            code.localSet(subjLocal);
+
+            const bcLocal = this.acquireScratch(bcRefT);
+            code.call(stickyFnIdx);
+            code.structGet(this.regex.regexType, 2); // bytecode
+            code.localSet(bcLocal);
+
+            const capLocal = this.acquireScratch(capRefT);
+            code.i32Const(captureArrayCount);
+            code.call(this.regexInterp.newCaptureArray());
+            code.localSet(capLocal);
+
+            const resultLocal = this.acquireScratch(vecRefT);
+            code.f64Const(0);
+            code.call(this.vecs.newLen(vecInfo));
+            code.localSet(resultLocal);
+
+            const sizeLocal = this.acquireScratch(I32);
+            code.localGet(subjLocal);
+            code.arrayLen();
+            code.localSet(sizeLocal);
+
+            const pLocal = this.acquireScratch(I32);
+            const qLocal = this.acquireScratch(I32);
+            code.i32Const(0);
+            code.localSet(pLocal);
+            code.i32Const(0);
+            code.localSet(qLocal);
+
+            // size === 0 (js_regexp_Symbol_split's own early branch): one
+            // exec at position 0 — a match means "no pieces at all", no
+            // match means "one empty piece".
+            code.localGet(sizeLocal);
+            code.i32Eqz();
+            code.ifVoid();
+            {
+              code.localGet(bcLocal);
+              code.localGet(subjLocal);
+              code.i32Const(0);
+              code.localGet(capLocal);
+              code.call(this.regexInterp.exec());
+              code.ifVoid();
+              // matched: result stays empty.
+              code.else_();
+              code.localGet(resultLocal);
+              this.pushStrLitInto(code, "");
+              code.call(this.vecs.pushOne(vecInfo));
+              code.end();
+            }
+            code.else_();
+            {
+              // Main probe loop: while (q < size).
+              code.block();
+              code.loop();
+              code.localGet(qLocal);
+              code.localGet(sizeLocal);
+              code.i32GeS();
+              code.brIf(1); // q >= size: done
+              // FRESH captureOut every iteration: exec() does NOT reset
+              // untouched slots itself (newCaptureArray()'s own -1 fill
+              // is a ONE-TIME thing at creation, per its own doc
+              // comment — "captureOut is caller-owned") — a slot a
+              // PREVIOUS match set but this one's own taken branch
+              // never touches would otherwise leak forward. A REAL bug
+              // this session caught via a duplicate-named-group replace
+              // case (the SAME array-reuse shape split has here); no
+              // corpus split pattern happens to toggle a group's own
+              // participation across segments, so this exact instance
+              // was silent until traced deliberately.
+              code.i32Const(captureArrayCount);
+              code.call(this.regexInterp.newCaptureArray());
+              code.localSet(capLocal);
+              code.localGet(bcLocal);
+              code.localGet(subjLocal);
+              code.localGet(qLocal);
+              code.localGet(capLocal);
+              code.call(this.regexInterp.exec());
+              code.ifVoid();
+              {
+                // Matched — sticky, so the match starts exactly at q.
+                // e = captureOut[1] (match end).
+                const eLocal = this.acquireScratch(I32);
+                code.localGet(capLocal);
+                code.i32Const(1);
+                code.arrayGet(this.regexInterp.capType);
+                code.localSet(eLocal);
+                code.localGet(eLocal);
+                code.localGet(pLocal);
+                code.i32Eq();
+                code.ifVoid();
+                {
+                  // A zero-length match right at the current segment's
+                  // own start: R4's own "zero-length-advance interaction"
+                  // shape (js_regexp_Symbol_split's own `e === p` check,
+                  // read directly) — treated as no-match, q advances.
+                  code.localGet(subjLocal);
+                  code.localGet(qLocal);
+                  code.i32Const(flags.unicode ? 1 : 0);
+                  code.call(this.regexInterp.getChar());
+                  code.localSet(qLocal); // newIdx (getChar's own result order — see its doc comment)
+                  code.drop(); // discard the codePoint
+                }
+                code.else_();
+                {
+                  // Push subject[p, q) — the pre-match segment.
+                  code.localGet(resultLocal);
+                  code.localGet(subjLocal);
+                  code.localGet(pLocal);
+                  code.f64ConvertI32S();
+                  code.localGet(qLocal);
+                  code.f64ConvertI32S();
+                  code.call(this.strs.slice()); // F64 args, but p/q are always non-negative and in-bounds — the clamp is a no-op
+                  code.call(this.vecs.pushOne(vecInfo));
+                  code.localGet(eLocal);
+                  code.localSet(pLocal);
+                  // Splice user captures 1..captureCount-1 — S066. A
+                  // nonparticipating slot (start === -1) renders "" per
+                  // S064, exactly matching match's own convention.
+                  for (let gi = 1; gi < captureCount; gi++) {
+                    code.localGet(resultLocal);
+                    const startLocal = this.acquireScratch(I32);
+                    code.localGet(capLocal);
+                    code.i32Const(2 * gi);
+                    code.arrayGet(this.regexInterp.capType);
+                    code.localSet(startLocal);
+                    code.localGet(startLocal);
+                    code.i32Const(-1);
+                    code.i32Eq();
+                    code.ifResult(strRefT);
+                    this.pushStrLitInto(code, "");
+                    code.else_();
+                    code.localGet(subjLocal);
+                    code.localGet(startLocal);
+                    code.f64ConvertI32S();
+                    code.localGet(capLocal);
+                    code.i32Const(2 * gi + 1);
+                    code.arrayGet(this.regexInterp.capType);
+                    code.f64ConvertI32S();
+                    code.call(this.strs.slice());
+                    code.end();
+                    code.call(this.vecs.pushOne(vecInfo));
+                    this.releaseScratch(I32, startLocal);
+                  }
+                  code.localGet(pLocal);
+                  code.localSet(qLocal); // q = p
+                }
+                code.end(); // e === p ifVoid
+                this.releaseScratch(I32, eLocal);
+              }
+              code.else_();
+              {
+                // No match at q: advance.
+                code.localGet(subjLocal);
+                code.localGet(qLocal);
+                code.i32Const(flags.unicode ? 1 : 0);
+                code.call(this.regexInterp.getChar());
+                code.localSet(qLocal);
+                code.drop();
+              }
+              code.end(); // matched ifVoid
+              code.br(0);
+              code.end(); // loop
+              code.end(); // block
+
+              // Trailing piece: subject[p, size).
+              code.localGet(resultLocal);
+              code.localGet(subjLocal);
+              code.localGet(pLocal);
+              code.f64ConvertI32S();
+              code.localGet(sizeLocal);
+              code.f64ConvertI32S();
+              code.call(this.strs.slice());
+              code.call(this.vecs.pushOne(vecInfo));
+            }
+            code.end(); // size === 0 ifVoid/else
+
+            code.localGet(resultLocal);
+            this.releaseScratch(strRefT, subjLocal);
+            this.releaseScratch(bcRefT, bcLocal);
+            this.releaseScratch(capRefT, capLocal);
+            this.releaseScratch(vecRefT, resultLocal);
+            this.releaseScratch(I32, sizeLocal);
+            this.releaseScratch(I32, pLocal);
+            this.releaseScratch(I32, qLocal);
+            return;
+          }
+          case "replace":
+          case "replaceAll": {
+            // The receiver is the SUBJECT (`str.replace(re, tpl)`); args
+            // are [regex, template] (SC1120 already fenced out function
+            // replacers and split's own limit argument at the frontend —
+            // args[1] is always a string, confirmed by reading lower-
+            // containers.ts directly). Unlike split, replace/replaceAll
+            // work over an ARBITRARY regex expression, not just a
+            // literal — there is no sticky-forced-bytecode need here,
+            // since a genuine SEARCH (not a sticky anchor) is exactly
+            // what the regex's own already-interned bytecode already
+            // does at each probe position (its own non-sticky prelude,
+            // P2's own discovery).
+            const strRefT = this.strRef;
+            const regexRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.regexType };
+            const bcRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.bcType };
+            const capRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regexInterp.capType };
+            const gnRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.strArrType };
+            const vecInfo = this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!;
+            const vecRefT = this.vecs.vecRef(vecInfo);
+
+            // JS evaluation order: receiver (subject), then args[0]
+            // (regex), then args[1] (template).
+            const subjLocal = this.acquireScratch(strRefT);
+            this.walkExpr(e.receiver);
+            code.localSet(subjLocal);
+            const reLocal = this.acquireScratch(regexRefT);
+            this.walkExpr(e.args[0]!);
+            code.localSet(reLocal);
+            const templateLocal = this.acquireScratch(strRefT);
+            this.walkExpr(e.args[1]!);
+            code.localSet(templateLocal);
+
+            const bcLocal = this.acquireScratch(bcRefT);
+            code.localGet(reLocal);
+            code.structGet(this.regex.regexType, 2); // bytecode
+            code.localSet(bcLocal);
+
+            // isGlobal/isUnicode: read straight from the bytecode's own
+            // header bits — no runtime .flags string search needed,
+            // since regexLiteral()'s own construction already baked
+            // both into the assembled header (flagsToBits, regex-
+            // assembler.ts).
+            const isGlobalLocal = this.acquireScratch(I32);
+            code.localGet(bcLocal);
+            code.i32Const(RE_HEADER_FLAGS);
+            code.call(this.regexInterp.readU16());
+            code.i32Const(LRE_FLAG_GLOBAL);
+            code.i32And();
+            code.localSet(isGlobalLocal);
+
+            if (e.method === "replaceAll") {
+              // Non-global regex passed to replaceAll: Node's exact
+              // TypeError (design §6.4's own byte-exact target,
+              // verified live against Node this session: TypeError,
+              // no .code property).
+              //
+              // openIf()/close() here, NOT the raw code.ifVoid()/code.
+              // end() this whole file's helper functions otherwise use:
+              // emitUnwind() -> brTo() computes its branch depth from
+              // this.fn.depth, which ONLY the open*/close wrappers keep
+              // synchronized with the actual nesting. A raw ifVoid here
+              // (a REAL bug this session caught: the exception cell got
+              // set correctly — the message printed byte-exact — but
+              // the branch landed one level too shallow, only exiting
+              // this if rather than reaching the try's own catch
+              // handler, so it fell through to the rest of this case
+              // and was reported UNCAUGHT at top level instead).
+              code.localGet(isGlobalLocal);
+              code.i32Eqz();
+              this.openIf();
+              this.emitSetCellErrorLit(
+                "%TypeError",
+                "TypeError",
+                "String.prototype.replaceAll called with a non-global RegExp argument",
+                null,
+              );
+              this.emitUnwind();
+              this.close();
+            }
+
+            // Normalized to EXACTLY 0 or 1, not the raw masked bit (LRE_
+            // FLAG_UNICODE = 1<<4 = 16) — a real bug this session caught:
+            // getChar()'s own internal "is this a surrogate pair" check
+            // composes IS_UNICODE with other 0/1 conditions via i32And
+            // (bitwise), and 16 AND 1 = 0 — passing the raw 16 silently
+            // made every astral-with-/u empty-match advance behave as if
+            // /u were ABSENT, splitting the pair (Node prints the whole
+            // astral char; wasm printed two lone-surrogate replacement
+            // chars instead). split's own isUnicode is a compile-time
+            // ternary (already exactly 0/1) and never hit this; only
+            // this RUNTIME bit-masked read needed the fix.
+            const isUnicodeLocal = this.acquireScratch(I32);
+            code.localGet(bcLocal);
+            code.i32Const(RE_HEADER_FLAGS);
+            code.call(this.regexInterp.readU16());
+            code.i32Const(LRE_FLAG_UNICODE);
+            code.i32And();
+            code.i32Const(0);
+            code.i32Ne();
+            code.localSet(isUnicodeLocal);
+
+            // captureArrayCount is a RUNTIME read here (unlike split,
+            // the regex isn't necessarily a literal) — same computation
+            // as "test"/"search" above.
+            const captureCountLocal = this.acquireScratch(I32);
+            code.localGet(reLocal);
+            code.structGet(this.regex.regexType, 3); // captureCount
+            code.localSet(captureCountLocal);
+            // The COUNT is fixed across every iteration (the regex's own
+            // capture/register shape doesn't change match to match) —
+            // stashed once. The ARRAY, though, must be re-created FRESH
+            // before every exec() call inside the loop below: exec()
+            // does not itself reset a slot it never touches, and
+            // newCaptureArray()'s own -1 fill only happens once, at
+            // creation ("captureOut is caller-owned", its own doc
+            // comment) — reusing one array across matches would leak a
+            // capture's stale value from an earlier match into a later
+            // one that doesn't set it (a real bug this session caught
+            // via a duplicate-named-group global replace: the second
+            // match's own $<n> read back the FIRST match's value).
+            const captureArrayCountLocal = this.acquireScratch(I32);
+            code.localGet(bcLocal);
+            code.i32Const(RE_HEADER_REGISTER_COUNT);
+            code.call(this.regexInterp.readU8());
+            code.i32Const(1);
+            code.i32Add();
+            code.i32Const(1);
+            code.i32ShrU();
+            code.localGet(captureCountLocal);
+            code.i32Add();
+            code.localSet(captureArrayCountLocal);
+            const capLocal = this.acquireScratch(capRefT);
+
+            const groupNamesLocal = this.acquireScratch(gnRefT);
+            code.localGet(reLocal);
+            code.structGet(this.regex.regexType, 4); // groupNames
+            code.localSet(groupNamesLocal);
+
+            const sizeLocal = this.acquireScratch(I32);
+            code.localGet(subjLocal);
+            code.arrayLen();
+            code.localSet(sizeLocal);
+
+            const pieces = this.acquireScratch(vecRefT);
+            code.f64Const(0);
+            code.call(this.vecs.newLen(vecInfo));
+            code.localSet(pieces);
+
+            const posLocal = this.acquireScratch(I32);
+            const flushedLocal = this.acquireScratch(I32);
+            code.i32Const(0);
+            code.localSet(posLocal);
+            code.i32Const(0);
+            code.localSet(flushedLocal);
+
+            // Match-collect-and-substitute loop (js_regexp_Symbol_
+            // replace, read directly — the two-phase collect-then-build
+            // structure collapses into one pass here since this tier's
+            // regex values have no lastIndex object to mutate, so each
+            // match is processed as it's found rather than buffered).
+            code.block();
+            code.loop();
+            {
+              // Defensive bound check (never fires for well-formed
+              // input; matches RegExpExec's own natural null-on-past-
+              // end behavior rather than trusting exec() with an
+              // out-of-range startIndex).
+              code.localGet(posLocal);
+              code.localGet(sizeLocal);
+              code.i32GtS();
+              code.brIf(1);
+
+              // Fresh captureOut every iteration — see this local's own
+              // acquisition comment above for why reusing one across
+              // matches is wrong.
+              code.localGet(captureArrayCountLocal);
+              code.call(this.regexInterp.newCaptureArray());
+              code.localSet(capLocal);
+
+              code.localGet(bcLocal);
+              code.localGet(subjLocal);
+              code.localGet(posLocal);
+              code.localGet(capLocal);
+              code.call(this.regexInterp.exec());
+              code.i32Eqz();
+              code.brIf(1); // no match: done
+
+              const matchStartLocal = this.acquireScratch(I32);
+              const matchEndLocal = this.acquireScratch(I32);
+              code.localGet(capLocal);
+              code.i32Const(0);
+              code.arrayGet(this.regexInterp.capType);
+              code.localSet(matchStartLocal);
+              code.localGet(capLocal);
+              code.i32Const(1);
+              code.arrayGet(this.regexInterp.capType);
+              code.localSet(matchEndLocal);
+
+              // "ignore substitution if going backward" (the reference's
+              // own guard against a custom regexp object; always true
+              // for this tier's own exec(), kept for parity).
+              code.localGet(matchStartLocal);
+              code.localGet(flushedLocal);
+              code.i32GeS();
+              code.ifVoid();
+              {
+                code.localGet(pieces);
+                code.localGet(subjLocal);
+                code.localGet(flushedLocal);
+                code.f64ConvertI32S();
+                code.localGet(matchStartLocal);
+                code.f64ConvertI32S();
+                code.call(this.strs.slice());
+                code.call(this.vecs.pushOne(vecInfo));
+
+                code.localGet(pieces);
+                code.localGet(subjLocal);
+                code.localGet(matchStartLocal);
+                code.localGet(matchEndLocal);
+                code.localGet(capLocal);
+                code.localGet(captureCountLocal);
+                code.localGet(groupNamesLocal);
+                code.localGet(templateLocal);
+                code.call(this.getSubstitutionHelper());
+                code.call(this.vecs.pushOne(vecInfo));
+
+                code.localGet(matchEndLocal);
+                code.localSet(flushedLocal);
+              }
+              code.end();
+
+              // Single match only for a plain (non-/g) replace.
+              code.localGet(isGlobalLocal);
+              code.i32Eqz();
+              code.brIf(1);
+
+              // Empty-match advance (§4.6): the next probe must move
+              // forward by at least one char/codepoint.
+              code.localGet(matchEndLocal);
+              code.localGet(matchStartLocal);
+              code.i32Eq();
+              code.ifVoid();
+              {
+                // string_advance_index's OWN guard (quickjs.c:46647-
+                // 46657, read directly), not just getChar() blindly: "if
+                // (!unicode || index >= p->len...) index++;" — ELSE
+                // combine. getChar() itself has no such guard (nothing
+                // in the regex MATCHER ever calls it at idx===len by
+                // construction), so calling it unconditionally here traps
+                // out-of-bounds the moment a global pattern's LAST match
+                // is an EMPTY match landing exactly at the subject's own
+                // end (e.g. "a<astral>b".replace(/(?:)/g,"-") — a real
+                // bug this session caught: 1204's own case, unexercised
+                // until deliberately probed since no other line in any
+                // claim has a pattern that can match empty at the string's
+                // end AND is global).
+                code.localGet(isUnicodeLocal);
+                code.i32Eqz();
+                code.localGet(matchEndLocal);
+                code.localGet(sizeLocal);
+                code.i32GeS();
+                code.i32Or();
+                code.ifVoid();
+                {
+                  code.localGet(matchEndLocal);
+                  code.i32Const(1);
+                  code.i32Add();
+                  code.localSet(posLocal);
+                }
+                code.else_();
+                {
+                  code.localGet(subjLocal);
+                  code.localGet(matchEndLocal);
+                  code.localGet(isUnicodeLocal);
+                  code.call(this.regexInterp.getChar());
+                  code.localSet(posLocal); // newIdx
+                  code.drop(); // codePoint, unused
+                }
+                code.end();
+              }
+              code.else_();
+              {
+                code.localGet(matchEndLocal);
+                code.localSet(posLocal);
+              }
+              code.end();
+              this.releaseScratch(I32, matchStartLocal);
+              this.releaseScratch(I32, matchEndLocal);
+            }
+            code.br(0);
+            code.end(); // loop
+            code.end(); // block
+
+            // Trailing unchanged suffix.
+            code.localGet(pieces);
+            code.localGet(subjLocal);
+            code.localGet(flushedLocal);
+            code.f64ConvertI32S();
+            code.localGet(sizeLocal);
+            code.f64ConvertI32S();
+            code.call(this.strs.slice());
+            code.call(this.vecs.pushOne(vecInfo));
+
+            code.localGet(pieces);
+            this.pushStrLitInto(code, "");
+            code.call(this.vecs.join(vecInfo, strRefT));
+
+            this.releaseScratch(strRefT, subjLocal);
+            this.releaseScratch(regexRefT, reLocal);
+            this.releaseScratch(strRefT, templateLocal);
+            this.releaseScratch(bcRefT, bcLocal);
+            this.releaseScratch(I32, isGlobalLocal);
+            this.releaseScratch(I32, isUnicodeLocal);
+            this.releaseScratch(I32, captureCountLocal);
+            this.releaseScratch(I32, captureArrayCountLocal);
+            this.releaseScratch(capRefT, capLocal);
+            this.releaseScratch(gnRefT, groupNamesLocal);
+            this.releaseScratch(I32, sizeLocal);
+            this.releaseScratch(vecRefT, pieces);
+            this.releaseScratch(I32, posLocal);
+            this.releaseScratch(I32, flushedLocal);
+            return;
+          }
           case "match":
           case "matchAll":
           case "matchAllInto":
-          case "replace":
-          case "replaceAll":
-          case "split":
-          case "search":
             // matchAllInto mints this SAME per-method name but currently
             // has no census bucket of its own — zero corpus programs
             // reach the into-target overload as their first regex
@@ -14878,6 +15561,565 @@ class Assembler {
     // RegexInterpreterBuilder's own injectedBcType doc comment.
     this.regexInterpField ??= new RegexInterpreterBuilder(this.mb, this.strType, this.casing, this.regex.bcType);
     return this.regexInterpField;
+  }
+
+  private getSubstitutionField: number | null = null;
+
+  /** GetSubstitution (ECMA-262 21.2.5.11), transcribed directly from
+   * quickjs.c's own js_string___GetSubstitution (packages/runtime/
+   * vendor/quickjs-ng/quickjs.c:46945-47051) — not reconstructed from
+   * spec prose. Scans `template` for `$`-rules, pushing each literal
+   * span or substituted piece onto a growable string[] (this.vecs' own
+   * newLen/pushOne, the SAME infra split()'s own case already uses),
+   * then join("")s them into one result. matchStart/matchEnd/
+   * captureOut/captureCount/groupNames all come from ONE already-
+   * completed exec() call — this function only READS them, never
+   * calls exec() itself, so it is shared by both replace's per-match
+   * loop and any other future caller with a completed match in hand.
+   *
+   * $<name> RESOLUTION, the one rule the C reference's flat captures-
+   * array signature hides: a genuine ES2025 duplicate-named-group
+   * pattern (`(?<n>x)|(?<n>y)`, exercised by 2609's own "14px 9em"
+   * case) can have TWO capture indices sharing one name; Node's own
+   * `groups` object resolves to whichever one PARTICIPATED (measured
+   * directly against live Node: "14px 9em".replace(/(?<n>\d+)px|(?<n>
+   * \d+)em/g, "[$<n>]") -> "[14] [9]", never blank) — the SAME "find
+   * the SET candidate among n possible indices" search P1's own
+   * backRefCompare already uses for \k<name> (its own doc comment),
+   * mirrored here for $<name>. An UNDECLARED name (no groupNames entry
+   * matches at all) substitutes EMPTY, not literal — measured directly
+   * too ("a".replace(/(?<x>a)/, "[$<x>][$<nope>]") -> "[a][]"): the
+   * pattern HAS named groups (so $< is not a blanket literal), the
+   * name just isn't a key on the `groups` object, and JS property
+   * lookup answers `undefined` -> empty, same as a real nonparticipating
+   * group. Literal fallback for `$<...>` is ONLY for a pattern with NO
+   * named groups at all (groupNames itself null) or an UNTERMINATED
+   * $<name (no closing >) — never for a merely-unknown name. */
+  private getSubstitutionHelper(): number {
+    if (this.getSubstitutionField !== null) return this.getSubstitutionField;
+    const strRefT = this.strRef;
+    const capRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regexInterp.capType };
+    const gnRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.strArrType };
+    const vecInfo = this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!;
+    const vecRefT = this.vecs.vecRef(vecInfo);
+    const idx = this.mb.declareFunc(
+      this.mb.funcType([strRefT, I32, I32, capRefT, I32, gnRefT, strRefT], [strRefT]),
+      "%w.re.getSubstitution",
+    );
+    this.getSubstitutionField = idx;
+    const SUBJECT = 0;
+    const MATCH_START = 1;
+    const MATCH_END = 2;
+    const CAPTURE_OUT = 3;
+    const CAPTURE_COUNT = 4;
+    const GROUP_NAMES = 5;
+    const TEMPLATE = 6;
+    const PIECES = 7;
+    const LEN = 8;
+    const I = 9;
+    const J = 10;
+    const CH = 11;
+    const CONSUMED = 12;
+    const K = 13;
+    const C1 = 14;
+    const K1 = 15;
+    const GI = 16;
+    const NAME_END = 17;
+    const NAME_STR = 18;
+    const START = 19; // capture start (both digit- and name-rule resolution); the matching end offset is read inline where needed, never stashed in its own local
+    const c = new Code();
+
+    c.f64Const(0);
+    c.call(this.vecs.newLen(vecInfo));
+    c.localSet(PIECES);
+    c.localGet(TEMPLATE);
+    c.arrayLen();
+    c.localSet(LEN);
+    c.i32Const(0);
+    c.localSet(I);
+
+    // Main scan loop: find the next '$', handle its rule, repeat.
+    c.block();
+    c.loop();
+    {
+      // J = indexOf('$', I) — a raw char scan (the SAME shape as the
+      // reference's own string_indexof_char, not a general substring
+      // search: this is a single-character probe).
+      c.localGet(I);
+      c.localSet(J);
+      c.block();
+      c.loop();
+      c.localGet(J);
+      c.localGet(LEN);
+      c.i32GeS();
+      c.brIf(1); // J >= LEN: stop, not found
+      c.localGet(TEMPLATE);
+      c.localGet(J);
+      c.arrayGetU(this.strType);
+      c.i32Const(0x24); // '$'
+      c.i32Eq();
+      c.brIf(1); // found
+      c.localGet(J);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(J);
+      c.br(0);
+      c.end(); // inner loop
+      c.end(); // inner block
+
+      // Not found, OR '$' is the LAST character (nothing to dispatch
+      // on): stop the main loop — the trailing literal flush after it
+      // handles both cases identically (concat(rp, i, rp.len)).
+      c.localGet(J);
+      c.localGet(LEN);
+      c.i32GeS();
+      c.localGet(J);
+      c.i32Const(1);
+      c.i32Add();
+      c.localGet(LEN);
+      c.i32GeS();
+      c.i32Or();
+      c.brIf(1);
+
+      // Flush template[I, J) as a literal piece (may be empty — skip
+      // the push when so, matching concat's own no-op on a zero span).
+      c.localGet(J);
+      c.localGet(I);
+      c.i32GtS();
+      c.ifVoid();
+      c.localGet(PIECES);
+      c.localGet(TEMPLATE);
+      c.localGet(I);
+      c.f64ConvertI32S();
+      c.localGet(J);
+      c.f64ConvertI32S();
+      c.call(this.strs.slice());
+      c.call(this.vecs.pushOne(vecInfo));
+      c.end();
+
+      // Read the rule character right after '$'; default CONSUMED is
+      // past both '$' and this character — every rule below either
+      // keeps that or extends it further.
+      c.localGet(TEMPLATE);
+      c.localGet(J);
+      c.i32Const(1);
+      c.i32Add();
+      c.arrayGetU(this.strType);
+      c.localSet(CH);
+      c.localGet(J);
+      c.i32Const(2);
+      c.i32Add();
+      c.localSet(CONSUMED);
+
+      c.localGet(CH);
+      c.i32Const(0x24); // '$'
+      c.i32Eq();
+      c.ifVoid();
+      {
+        c.localGet(PIECES);
+        this.pushStrLitInto(c, "$");
+        c.call(this.vecs.pushOne(vecInfo));
+        c.localGet(CONSUMED);
+        c.localSet(I);
+      }
+      c.else_();
+      c.localGet(CH);
+      c.i32Const(0x26); // '&'
+      c.i32Eq();
+      c.ifVoid();
+      {
+        c.localGet(PIECES);
+        c.localGet(SUBJECT);
+        c.localGet(MATCH_START);
+        c.f64ConvertI32S();
+        c.localGet(MATCH_END);
+        c.f64ConvertI32S();
+        c.call(this.strs.slice());
+        c.call(this.vecs.pushOne(vecInfo));
+        c.localGet(CONSUMED);
+        c.localSet(I);
+      }
+      c.else_();
+      c.localGet(CH);
+      c.i32Const(0x60); // '`'
+      c.i32Eq();
+      c.ifVoid();
+      {
+        c.localGet(PIECES);
+        c.localGet(SUBJECT);
+        c.f64Const(0);
+        c.localGet(MATCH_START);
+        c.f64ConvertI32S();
+        c.call(this.strs.slice());
+        c.call(this.vecs.pushOne(vecInfo));
+        c.localGet(CONSUMED);
+        c.localSet(I);
+      }
+      c.else_();
+      c.localGet(CH);
+      c.i32Const(0x27); // "'"
+      c.i32Eq();
+      c.ifVoid();
+      {
+        c.localGet(PIECES);
+        c.localGet(SUBJECT);
+        c.localGet(MATCH_END);
+        c.f64ConvertI32S();
+        c.localGet(SUBJECT);
+        c.arrayLen();
+        c.f64ConvertI32S();
+        c.call(this.strs.slice());
+        c.call(this.vecs.pushOne(vecInfo));
+        c.localGet(CONSUMED);
+        c.localSet(I);
+      }
+      c.else_();
+      c.localGet(CH);
+      c.i32Const(0x30); // '0'
+      c.i32GeU();
+      c.localGet(CH);
+      c.i32Const(0x3a); // '9'+1
+      c.i32LtU();
+      c.i32And();
+      c.ifVoid();
+      {
+        // Digit rule — one digit, with a validated two-digit lookahead.
+        c.localGet(CH);
+        c.i32Const(0x30);
+        c.i32Sub();
+        c.localSet(K);
+        c.localGet(CONSUMED);
+        c.localGet(LEN);
+        c.i32LtS();
+        c.ifVoid();
+        c.localGet(TEMPLATE);
+        c.localGet(CONSUMED);
+        c.arrayGetU(this.strType);
+        c.localSet(C1);
+        c.localGet(C1);
+        c.i32Const(0x30);
+        c.i32GeU();
+        c.localGet(C1);
+        c.i32Const(0x3a);
+        c.i32LtU();
+        c.i32And();
+        c.ifVoid();
+        c.localGet(K);
+        c.i32Const(10);
+        c.i32Mul();
+        c.localGet(C1);
+        c.i32Const(0x30);
+        c.i32Sub();
+        c.i32Add();
+        c.localSet(K1);
+        c.localGet(K1);
+        c.i32Const(1);
+        c.i32GeS();
+        c.localGet(K1);
+        c.localGet(CAPTURE_COUNT);
+        c.i32LtS();
+        c.i32And();
+        c.ifVoid();
+        c.localGet(K1);
+        c.localSet(K);
+        c.localGet(CONSUMED);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(CONSUMED);
+        c.end(); // k1 in-range
+        c.end(); // c1 is a digit
+        c.end(); // consumed < len
+
+        c.localGet(K);
+        c.i32Const(1);
+        c.i32GeS();
+        c.localGet(K);
+        c.localGet(CAPTURE_COUNT);
+        c.i32LtS();
+        c.i32And();
+        c.ifVoid();
+        {
+          c.localGet(PIECES);
+          c.localGet(CAPTURE_OUT);
+          c.localGet(K);
+          c.i32Const(2);
+          c.i32Mul();
+          c.arrayGet(this.regexInterp.capType);
+          c.localSet(START);
+          c.localGet(START);
+          c.i32Const(-1);
+          c.i32Eq();
+          c.ifResult(strRefT);
+          this.pushStrLitInto(c, "");
+          c.else_();
+          c.localGet(SUBJECT);
+          c.localGet(START);
+          c.f64ConvertI32S();
+          c.localGet(CAPTURE_OUT);
+          c.localGet(K);
+          c.i32Const(2);
+          c.i32Mul();
+          c.i32Const(1);
+          c.i32Add();
+          c.arrayGet(this.regexInterp.capType);
+          c.f64ConvertI32S();
+          c.call(this.strs.slice());
+          c.end();
+          c.call(this.vecs.pushOne(vecInfo));
+        }
+        c.else_();
+        {
+          // norep: out of range (or 0) — the '$' plus digit(s) literally.
+          c.localGet(PIECES);
+          c.localGet(TEMPLATE);
+          c.localGet(J);
+          c.f64ConvertI32S();
+          c.localGet(CONSUMED);
+          c.f64ConvertI32S();
+          c.call(this.strs.slice());
+          c.call(this.vecs.pushOne(vecInfo));
+        }
+        c.end();
+        // Both the in-range and norep arms above consume exactly
+        // through CONSUMED (the norep arm's own literal span ALSO ends
+        // there — it only differs in what gets pushed, not how far the
+        // scan advances).
+        c.localGet(CONSUMED);
+        c.localSet(I);
+      }
+      c.else_();
+      c.localGet(CH);
+      c.i32Const(0x3c); // '<'
+      c.i32Eq();
+      c.localGet(GROUP_NAMES);
+      c.refIsNull();
+      c.i32Eqz();
+      c.i32And();
+      c.ifVoid();
+      {
+        // $<name> — find the closing '>' from CONSUMED (right after '<').
+        c.localGet(CONSUMED);
+        c.localSet(NAME_END);
+        c.block();
+        c.loop();
+        c.localGet(NAME_END);
+        c.localGet(LEN);
+        c.i32GeS();
+        c.brIf(1); // unterminated: NAME_END lands at LEN
+        c.localGet(TEMPLATE);
+        c.localGet(NAME_END);
+        c.arrayGetU(this.strType);
+        c.i32Const(0x3e); // '>'
+        c.i32Eq();
+        c.brIf(1); // found
+        c.localGet(NAME_END);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(NAME_END);
+        c.br(0);
+        c.end();
+        c.end();
+
+        c.localGet(NAME_END);
+        c.localGet(LEN);
+        c.i32GeS();
+        c.ifVoid();
+        {
+          // Unterminated $<name — norep: literal "$<".
+          c.localGet(PIECES);
+          c.localGet(TEMPLATE);
+          c.localGet(J);
+          c.f64ConvertI32S();
+          c.localGet(CONSUMED);
+          c.f64ConvertI32S();
+          c.call(this.strs.slice());
+          c.call(this.vecs.pushOne(vecInfo));
+          c.localGet(CONSUMED);
+          c.localSet(I);
+        }
+        c.else_();
+        {
+          c.localGet(TEMPLATE);
+          c.localGet(CONSUMED);
+          c.f64ConvertI32S();
+          c.localGet(NAME_END);
+          c.f64ConvertI32S();
+          c.call(this.strs.slice());
+          c.localSet(NAME_STR);
+          // Scan groupNames (length CAPTURE_COUNT-1, entry k names
+          // capture index k+1) for a match, preferring a PARTICIPATING
+          // duplicate over a nonparticipating one — backRefCompare's
+          // own "find the SET candidate" shape, mirrored per this
+          // function's own doc comment.
+          c.i32Const(-1);
+          c.localSet(K); // -1: no matching name found at all
+          c.i32Const(0);
+          c.localSet(GI);
+          c.block();
+          c.loop();
+          c.localGet(GI);
+          c.localGet(CAPTURE_COUNT);
+          c.i32Const(1);
+          c.i32Sub();
+          c.i32GeS();
+          c.brIf(1); // GI >= captureCount-1: done scanning
+          c.localGet(GROUP_NAMES);
+          c.localGet(GI);
+          c.arrayGet(this.regex.strArrType);
+          c.localGet(NAME_STR);
+          c.call(this.strEqHelper());
+          c.ifVoid();
+          {
+            c.localGet(CAPTURE_OUT);
+            c.localGet(GI);
+            c.i32Const(1);
+            c.i32Add();
+            c.i32Const(2);
+            c.i32Mul();
+            c.arrayGet(this.regexInterp.capType);
+            c.localSet(START);
+            c.localGet(START);
+            c.i32Const(-1);
+            c.i32Eq();
+            c.ifVoid();
+            {
+              // Nonparticipating candidate: remember only if nothing
+              // else has been remembered yet (a LATER duplicate might
+              // still be the participating one).
+              c.localGet(K);
+              c.i32Const(-1);
+              c.i32Eq();
+              c.ifVoid();
+              c.localGet(GI);
+              c.i32Const(1);
+              c.i32Add();
+              c.localSet(K);
+              c.end();
+            }
+            c.else_();
+            {
+              // Participating: definitive, stop scanning.
+              c.localGet(GI);
+              c.i32Const(1);
+              c.i32Add();
+              c.localSet(K);
+              c.br(3); // out of both the name-scan loop and its block
+            }
+            c.end();
+          }
+          c.end();
+          c.localGet(GI);
+          c.i32Const(1);
+          c.i32Add();
+          c.localSet(GI);
+          c.br(0);
+          c.end(); // name-scan loop
+          c.end(); // name-scan block
+
+          c.localGet(PIECES);
+          c.localGet(K);
+          c.i32Const(-1);
+          c.i32Eq();
+          c.ifResult(strRefT);
+          this.pushStrLitInto(c, "");
+          c.else_();
+          c.localGet(CAPTURE_OUT);
+          c.localGet(K);
+          c.i32Const(2);
+          c.i32Mul();
+          c.arrayGet(this.regexInterp.capType);
+          c.localSet(START);
+          c.localGet(START);
+          c.i32Const(-1);
+          c.i32Eq();
+          c.ifResult(strRefT);
+          this.pushStrLitInto(c, "");
+          c.else_();
+          c.localGet(SUBJECT);
+          c.localGet(START);
+          c.f64ConvertI32S();
+          c.localGet(CAPTURE_OUT);
+          c.localGet(K);
+          c.i32Const(2);
+          c.i32Mul();
+          c.i32Const(1);
+          c.i32Add();
+          c.arrayGet(this.regexInterp.capType);
+          c.f64ConvertI32S();
+          c.call(this.strs.slice());
+          c.end();
+          c.end();
+          c.call(this.vecs.pushOne(vecInfo));
+
+          c.localGet(NAME_END);
+          c.i32Const(1);
+          c.i32Add();
+          c.localSet(I);
+        }
+        c.end(); // unterminated / found
+      }
+      c.else_();
+      {
+        // norep: everything else ('$' followed by a char no rule
+        // claims, or '<' with no named groups at all) — literal.
+        c.localGet(PIECES);
+        c.localGet(TEMPLATE);
+        c.localGet(J);
+        c.f64ConvertI32S();
+        c.localGet(CONSUMED);
+        c.f64ConvertI32S();
+        c.call(this.strs.slice());
+        c.call(this.vecs.pushOne(vecInfo));
+        c.localGet(CONSUMED);
+        c.localSet(I);
+      }
+      c.end(); // '<' dispatch
+      c.end(); // digit dispatch
+      c.end(); // "'" dispatch
+      c.end(); // '`' dispatch
+      c.end(); // '&' dispatch
+      c.end(); // '$' dispatch
+
+      // INVARIANT: every one of the seven branches above sets I on its
+      // OWN exit path before falling out here — the four single-char
+      // rules and the digit rule's own two arms all set I = CONSUMED;
+      // the $<name> rule sets I = CONSUMED (unterminated) or I =
+      // NAME_END + 1 (found, past the closing '>'); the final norep
+      // sets I = CONSUMED too. Nothing further to do here.
+    }
+    c.br(0);
+    c.end(); // main loop
+    c.end(); // main block
+
+    // Flush the remainder of the template literally.
+    c.localGet(I);
+    c.localGet(LEN);
+    c.i32LtS();
+    c.ifVoid();
+    c.localGet(PIECES);
+    c.localGet(TEMPLATE);
+    c.localGet(I);
+    c.f64ConvertI32S();
+    c.localGet(LEN);
+    c.f64ConvertI32S();
+    c.call(this.strs.slice());
+    c.call(this.vecs.pushOne(vecInfo));
+    c.end();
+
+    c.localGet(PIECES);
+    this.pushStrLitInto(c, "");
+    c.call(this.vecs.join(vecInfo, strRefT));
+
+    this.mb.setBody(
+      // Indices 7-19: PIECES(vecRefT), LEN/I/J/CH/CONSUMED/K/C1/K1/GI/
+      // NAME_END(I32 x10), NAME_STR(strRefT), START(I32) — MUST match
+      // the const declarations above position for position, since
+      // setBody assigns this array to locals 7.. in order.
+      idx,
+      [vecRefT, I32, I32, I32, I32, I32, I32, I32, I32, I32, I32, strRefT, I32],
+      c.bytes(),
+    );
+    return idx;
   }
 
   private bytesField: BytesBuilder | null = null;

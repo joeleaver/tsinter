@@ -1631,10 +1631,14 @@ export const MAY_THROW_BYTES_METHODS: ReadonlySet<IrBytesIntrinsicMethod> = new 
  * regex and (for the replaces) args[1] the replacement template — string
  * replacements only, function replacements are checker-rejected (the
  * ambient overloads accept only strings). `replaceAll` THROWS Node's
- * TypeError when the regex lacks /g and `split` THROWS on a pattern with
- * capture groups (JS would splice the captured values into the result) —
- * both catchable: backends' may-throw analyses must seed on these two
- * methods like a `throw`. */
+ * TypeError when the regex lacks /g (catchable, every lane). `split` on a
+ * pattern with capture groups is PER-LANE (S066): the wasm tier SPLICES
+ * the captured values into the result, Node-exact; the native lanes THROW
+ * a catchable TypeError instead (capture-splicing predates their own
+ * split() support). Backends' may-throw analyses must still seed on both
+ * `replaceAll` and `split` like a `throw` — a wasm backend that never
+ * throws on split is a harmless over-approximation there, not a
+ * mismatch. */
 /** `match` takes a STRING receiver with args[0] the regex (non-g/y — the
  * frontend fences literal g/y flags; a g-flagged value reaching the
  * runtime aborts like test()) and produces the PROGRAM-DEPENDENT
