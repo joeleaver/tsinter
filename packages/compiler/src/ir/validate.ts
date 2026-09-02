@@ -53,9 +53,11 @@ export const STR_INTRINSIC_SIGS: Record<
 };
 
 /** Per-method signature for regexIntrinsic. test/source/flags take the
- * regex as receiver; replace/replaceAll/split take the STRING as receiver
- * with the regex as args[0] (mirroring the source syntax). All positions
- * are required — the surface has no optionals. */
+ * regex as receiver; replace/replaceAll/split/match/matchAll/matchAllInto/
+ * search all take the STRING as receiver with the regex as args[0]
+ * (mirroring the source syntax — exec(s) lowers to match with the operands
+ * swapped, so it shares match's own row rather than getting its own). All
+ * positions are required — the surface has no optionals. */
 export const REGEX_INTRINSIC_SIGS: Record<
   IrRegexIntrinsicMethod,
   { receiver: IrType; argTypes: IrType[]; result: IrType }

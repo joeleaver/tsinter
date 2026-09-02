@@ -2887,6 +2887,33 @@ const TIER_FLOOR: string[] = [
   "1641-string-search.ts",
   "1643-metadata-dyn-return.cjs",
   "2609-regex-named-replace.ts",
+  // Increment 24 P4 — the match surface: regexIntrinsic{match, matchAll,
+  // matchAllInto}, the program-dependent `string[] | null` union result
+  // (validate.ts's own REGEX_INTRINSIC_SIGS comment — "the regexIntrinsic
+  // case checks the union's arms"), the honest-slice rule applied to
+  // match's own array arm (S064), and the for-of-over-matchAll companion-
+  // index desugar (lower-stmts.ts's own lowerForOfMatchAll). Ruled:
+  // match serves the NON-GLOBAL exec-shaped form only (design §3, R1,
+  // retracting the v2 draft's F9) — a literal g/y receiver is fenced at
+  // compile time (SC1120/SC1121) before it ever reaches here; the
+  // value-path g/y gap stays open, unreachable by any claim in this set
+  // (findings-p4-v1.txt entries 1-2, a named P5-forward deliverable, not
+  // a new key). 1544 prints the matchAll-on-non-global TypeError
+  // (String.prototype.matchAll called with a non-global RegExp argument,
+  // measured live against Node); 1562/1574 are the optional-chaining
+  // third observable (undefined?.match(re) is undefined, riding the
+  // pre-existing general chain machinery, not anything match-specific).
+  // The three opened per-method buckets (:match, :matchAll,
+  // :matchAllInto) all dissolve; 1579/2611 stay on their own non-regex
+  // blockers per Joe's B ruling (libCall:math.max, libCall:math.random);
+  // 2608 advances to libCall:regex.new (P5's own construction surface,
+  // its pattern clean and static, no P2 refinement key applies).
+  // 772 -> 777, exactly the predicted movers.
+  "1467-string-match.ts",
+  "1544-string-matchall.ts",
+  "1562-optional-chain-tails.ts",
+  "1574-dyn-optional-method-number-keys.ts",
+  "2610-regex-named-matchall.ts",
 ];
 
 interface RunResult {

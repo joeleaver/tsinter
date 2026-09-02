@@ -187,6 +187,12 @@ export function computeMayThrow(mod: IrModule): { fns: Set<string>; indirect: bo
         case "regexIntrinsic":
           // replaceAll and matchAll without /g throw Node's TypeError;
           // split throws on a pattern with capture groups — all catchable.
+          // test/match's own global-value-regex fence (GATE FIX F1/F1b,
+          // INC-24 P4) is DELIBERATELY ABSENT here: it TRAPS (a bare
+          // unreachable, the S003 bridge — same stance as OOB array
+          // access, "never throws," see emitGlobalRegexValueGuard's own
+          // doc comment), which never touches the pending-exception
+          // system this table feeds at all.
           if (rec["method"] === "replaceAll" || rec["method"] === "split" || rec["method"] === "matchAll" || rec["method"] === "matchAllInto") {
             f.throws = true;
           }

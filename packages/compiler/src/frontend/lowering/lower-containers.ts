@@ -4874,7 +4874,10 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
       if (ts.isRegularExpressionLiteral(recv)) {
         const flags = recv.text.slice(recv.text.lastIndexOf("/") + 1);
         if (flags.includes("g") || flags.includes("y")) {
-          L.unsupported("SC1121", call);
+          // A1: name the construct the user actually wrote — SC1121's
+          // default feature text says "'.test()'", wrong here without an
+          // override (the hint stays accurate for exec too, unchanged).
+          L.unsupported("SC1121", call, "'.exec()' on a regex with the 'g' or 'y' flag");
         }
       }
       const re = L.lowerExpr(access.expression);

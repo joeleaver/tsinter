@@ -4986,3 +4986,123 @@ above) is the measurement of record; corpus-unpinnable per REACH
 (latent), so board #119 tracks the fix without a corpus witness.
 
 **Board #119** tracks canonicalizing `.flags` on the native lanes.
+
+**Amendment (increment 24 P4, a regex VALUE reaching a lastIndex-consulting method with a stateful flag):**
+a FOURTH site reaches the SAME "representation-impossible, trap rather than lie" stance — a regex reaching
+`.test()`/`.exec()`/`.match()` (one group: `.exec()` lowers to `.match()`'s own IR node, operands swapped,
+so all three are genuinely ONE mechanism) or `.replace()`'s own NON-GLOBAL branch, as a VALUE (bound
+through a `const`, returned from a function, any receiver that is not a literal directly at the call site),
+TRAPS on this tier when the regex carries a flag that makes `RegExpBuiltinExec` consult `lastIndex` — where
+Node instead tracks it across calls and answers statefully. This tier's `%w.re.Regex` value has no
+`lastIndex` field at all (design §3.2 — no refcounting, no mutable per-value state); every risky call site
+here starts at a constant position 0, and implementing real statefulness would need a mutable field on
+every regex value, a representation change outside this fix's own scope — exactly S003's own "cannot be
+represented, so trap instead of lying" shape, not a new kind of divergence. Measured on Node 24.18 (own
+construction; FIVE counterexamples across two gate rounds — the fix's own scope changed TWICE under
+measurement, both times by disproving a claim this same amendment had made in an earlier draft, not by
+extending it):
+
+    const re = /ab/g;
+    "abab".match(re);                                    // Node: ["ab","ab"]; here: traps (F1)
+    re.test("ab"); re.test("ab");                         // Node: true, false;  here: traps (F1b)
+    function mk(): RegExp { return /ab/g; }
+    "abab".match(mk());                                   // Node: ["ab","ab"]; here: traps (dynamic, not even const-bound)
+    const sticky = /ab/y;
+    "ab".match(sticky); "ab".match(sticky);                // Node: ["ab"], null; here: traps (F5)
+    "abab".replace(sticky, "X"); "abab".replace(sticky, "X"); // Node: "Xab","abX"; here: traps (F5, a THIRD site)
+
+A LITERAL `g`/`y` receiver at `.test()`/`.exec()`/`.match()`'s own call site is fenced at COMPILE TIME
+(SC1120/SC1121, `ts.isRegularExpressionLiteral`-gated) — but that check cannot see what a VARIABLE's own
+initializer was or what a function returns, so a value carrying a stateful flag reached these methods
+completely unchecked. `.replace()` has NO such frontend fence at all (by design — it accepts an arbitrary
+regex expression, literal or value, at every call site), so ITS OWN guard must itself distinguish literal
+from value (see below).
+
+MASK IS METHOD-SPECIFIC, corrected TWICE under measurement, not once: the `{test, exec, match}` group traps
+on `GLOBAL|STICKY`; `.replace()`'s own non-global branch traps on `STICKY` alone (its global branch forces
+its own fresh `lastIndex=0` reset every call — Symbol.replace's own spec algorithm — and is measured safe,
+untouched). AN EARLIER DRAFT OF THIS AMENDMENT CLAIMED "sticky is safe for match" — built on a
+NON-DISCRIMINATING WITNESS (`/a/y` repeated on "aaa": "a" occurs at every offset, so the printed result
+looks identical whether `lastIndex` is tracked correctly or not). A witness that matches EXACTLY ONCE in
+its own subject (`/ab/y` on "ab") exposes the real, stateful answer — the vacuity was caught by the SAME
+review process that minted the claim, re-deriving the matrix with discriminating witnesses specifically
+because a non-discriminating one can certify a live defect as closed. SEPARATELY, a FIRST BUILD of
+`.replace()`'s own guard applied unconditionally to EVERY sticky regex reaching the non-global branch —
+including LITERAL receivers, which corpus program 1201-regex-replace.ts's own line 19 (two independent
+`/b/y` literal expressions) exercises directly — and BROKE that already-landed claim: a regex LITERAL is
+freshly constructed on EVERY evaluation (ES2015+ semantics, never cached/shared the way ES5 sometimes
+allowed), so it can never carry a stale nonzero `lastIndex` the way a reused VALUE can; the guard now checks
+`e.args[0].kind !== "regexLit"` before firing, exactly mirroring why `.test()`/`.match()` never needed this
+check themselves (their own literal case is refused upstream at compile time, so their runtime guard
+structurally never sees one). Caught by running the full corpus after the fix landed, not assumed safe from
+the code's own shape.
+
+WHY THE EXCLUSION IS SAFE — the MECHANISM, not the regression-fixed-1201 observation (that only shows the
+exclusion restores a passing corpus program, not that the excluded case is itself correct): Node builds a
+FRESH `RegExp` object on every evaluation of a literal — a literal expression inside a loop, or one
+re-evaluated at a second call site, never shares state with a prior evaluation. This tier interns regex
+LITERALS as one immortal per (pattern, flags) per module (design §3.2) and carries NO `lastIndex` field on
+any regex value at all. Both sides therefore start every call at position 0 — not by any observational
+luck, but because NEITHER representation has state left over to carry between calls: Node's because each
+literal evaluation is a genuinely new object, this tier's because there is nowhere on the value to put it.
+
+THE CONDITION THIS RELIES ON, named as a forward dependency (the same shape design §7.5's own "NAMED
+NON-REQUIREMENT: DO NOT INTERN regex.new RESULTS" already registers for the closely related regex.new
+interning question, and cites verbatim): regex identity comparison does not compile today — `SC1043:
+comparing non-number, non-string values are not supported yet` (measured there: `function mk(): RegExp {
+return /a/; } ... mk() === mk()` refuses at compile time) — so a program can never OBSERVE that this tier's
+literal is one immortal object where Node's is a fresh one each time. IF SC1043 is ever lifted to admit
+reference comparison on regex values, BOTH the regex.new-interning question §7.5 already names AND this
+literal-exclusion's own safety become observable at once (Node also creates a fresh object per literal
+evaluation: `const f = () => /a/; f() === f()` is `false` there, `true` under this tier's own interning).
+At that point this exclusion needs its own re-examination — not because the lastIndex argument above stops
+holding (it does not; that argument is about state, not identity), but because a NEW angle opens: an
+identity-observing program could, in principle, distinguish "the same immortal literal object, reused
+across calls" from "a fresh object every time," which is a different question from whether either one
+carries lastIndex. Revisit this exclusion's own safety argument if SC1043 lifts; do not assume the
+lastIndex argument alone still settles it once identity is observable.
+
+THE TRAP IS CLASS-WIDE, AND THAT IS DELIBERATE, NOT AN OVER-REACH: the value-path guard fires on the WHOLE
+`GLOBAL|STICKY` flag class for a value receiver — it does not, and structurally CANNOT, distinguish an
+input that would actually diverge from Node from one that happens to answer correctly anyway. rev's own
+pre-arm measurement (rev/prearm-p4v6-guardsites-v1.txt, f4d68540…) names four such probes: inputs where
+the pattern matches at every offset in its own subject (so a wrongly-reset `lastIndex` never changes the
+printed answer), a sticky value `.replace()` on its own no-match arm (a FAILED sticky match resets
+`lastIndex` to 0 in Node too, so there is nothing to carry either way), and two further shapes with no
+second-call divergence at all — every one of these was Node-exact on this tier BEFORE this fix and now
+TRAPS. Each was correct only by COINCIDENCE, on a witness where the underlying divergence does not happen
+to show; this tier has no `lastIndex` field to consult on any regex value, so it cannot tell "lucky, this
+particular subject never exposed the bug" apart from "actually wrong" without modeling state it does not
+have. Refusing the WHOLE class loudly, rather than trying to special-case the coincidentally-fine inputs
+(which would require exactly the state this tier does not carry), is rule 1's own stance applied
+consistently — silent-wrong is never acceptable, even where a specific input happened not to show it. THE
+READER-FACING CONSEQUENCE, stated plainly: a program in this class that "used to work" on this tier —
+printed Node's own exact answer, for whatever specific subject it happened to run against — now TRAPS BY
+NAME. That is the fence's own intended reach, not a narrower one limited to the five wrong-answer
+counterexamples this amendment measures above; a reader who hits this trap on a previously-working program
+should find their own case named here, not conclude the trap over-fired.
+
+Confirmed-safe with NO guard needed anywhere (measured, every flag combination): `search()` (saves, forces
+position 0, and restores `lastIndex` around every call, regardless of flags); `replaceAll()`/`matchAll()`/
+`matchAllInto()` (all REQUIRE global to avoid the F2 TypeError, and every global operation forces its own
+fresh `lastIndex=0` reset, matching what these methods' own loops already do); `split()` (refuses at compile
+time for any non-literal receiver, regardless of flags — safe by construction, not a guarded cell at all).
+
+**Tested by:** the wasm emitter unit tests "F1," "F1b," "F1/F1b dynamic value," "F5" (match/test/exec,
+three pins, one per source form — `.exec()` measured directly with its own syntax, not inferred from
+`.match()`'s own pin, since the two are reached from different source spellings even though they share one
+IR node), "F5" (replace's own non-global branch), "F5 safe controls" (replace's own global branch, both
+`gy` and no-flags), and the "value-path-flag matrix completion" pins — match's own `/gy` cell (BOTH failure
+axes at once: shape, an all-matches array vs the single-match answer; and statefulness, sticky's own
+lastIndex advance — match needs a witness for EACH axis separately, since a single-match subject is blind
+to the shape axis and a multi-match subject is blind to the statefulness axis), search (all four flags),
+matchAll (`g`/`gy`, TWO-CALL), replaceAll (`g`/`gy`, TWO-CALL), and matchAllInto (`g`/`gy`, TWO-CALL, its
+own for-of-desugar mechanism, a method an earlier draft of this matrix left out entirely) — all `packages/
+compiler/test/wasm-emitter.test.ts`, REACHING pins at the `runWasmToTrap`/`runWasm` level (S003's own
+bridge for the trap cells, byte-exact assertions for the safe cells). THE DISCRIMINATION RULE, stated
+precisely (an earlier draft of this Tested-by paragraph said "matches exactly once," which is a heuristic,
+not the actual property, and is WRONG in general — replace's own witness matches TWICE and still
+discriminates fine): a witness is valid when the SECOND call's answer would DIFFER depending on whether
+`lastIndex` had advanced, or when the flag changes the result SHAPE (match's own `g`) — never the
+"abab"/"aaa" shape that reads identically whether the defect exists or not, REGARDLESS of how many times
+the pattern happens to match.

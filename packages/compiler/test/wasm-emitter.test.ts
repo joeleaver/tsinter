@@ -8557,3 +8557,512 @@ test("empty-match advance at the subject's own end, without /u: splits the surro
   const { stdout } = await runWasm(res.binaryPath);
   expect(stdout.toString("hex")).toBe("2d612defbfbd2defbfbd2d622d0a");
 });
+
+/* Increment 24 P4 — the match surface: regexIntrinsic{match, matchAll,
+ * matchAllInto}. Pin shapes (a)-(e) per the brief's own §1, plus the two
+ * required TypeError pins (F2). */
+
+test("match()/exec() nonparticipating capture — S064's own honest-slice rule, ELEMENT level: two DIFFERENT Node shapes collapse to the SAME tier answer", async () => {
+  // The design's own ready witness, measured live this session:
+  // "b".match(/(a*)*/) leaves capture[1] genuinely UNSET (`1 in m` is
+  // true, `m[1]` is the VALUE undefined, unquoted — JSON.stringify
+  // shows ["",null]), while /(a*)+/.exec("b") leaves it PARTICIPATING-
+  // EMPTY (`e[1]` is the string ""). Node tells these apart; this tier's
+  // `string[]` cannot hold `undefined` at all, so S064 renders BOTH as
+  // "" — the two calls answer IDENTICALLY here where Node's own answers
+  // differ. Asserted at raw stdout (element) level, not JSON.stringify
+  // (which would print "null" for the first on Node but this tier can
+  // never produce — the whole point is what THIS tier answers).
+  const res = await buildWasm(
+    "match-honest-slice.ts",
+    ['console.log("b".match(/(a*)*/));', 'console.log(/(a*)+/.exec("b"));'].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(["[ '', '' ]", "[ '', '' ]", ""].join("\n"));
+});
+
+test("match() null arm — no match answers null, never []", async () => {
+  const res = await buildWasm("match-null-arm.ts", 'console.log("abc".match(/z/));');
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("null\n");
+});
+
+test("match()/exec() array arm — captures, byte-exact against Node (both operand orientations construct the identical IR, one emitter case). NOTE: a general `.index` read on a plain match()/exec() result correctly REFUSES (SC2020, 'RegExpMatchArray.index' has no lowering) — this pass's own .index support is scoped to matchAllInto's for-of companion only (design §7.4's own naming), not a general match()/exec() member; found empirically writing this pin, not assumed.", async () => {
+  const res = await buildWasm(
+    "match-array-arm.ts",
+    [
+      'const m = "2024-07-15".match(/(\\d{4})-(\\d{2})-(\\d{2})/);',
+      "if (m) console.log(JSON.stringify(m));",
+      'const e = /(\\d{4})-(\\d{2})-(\\d{2})/.exec("2024-07-15");',
+      "if (e) console.log(JSON.stringify(e));",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      '["2024-07-15","2024","07","15"]',
+      '["2024-07-15","2024","07","15"]',
+      "",
+    ].join("\n"),
+  );
+});
+
+test("match() named-groups projection — .groups reads the groupNames trailer P1 built, byte-exact against Node", async () => {
+  const res = await buildWasm(
+    "match-groups.ts",
+    [
+      'const m = "2024-07".match(/(?<year>\\d{4})-(?<month>\\d{2})/);',
+      "if (m) console.log(JSON.stringify(m.groups));",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe('{"year":"2024","month":"07"}\n');
+});
+
+test("match() optional-chaining third observable — undefined?.match(re) is undefined, a VALUE receiver flowing through a variable (rides the pre-existing general chain machinery, nothing match-specific)", async () => {
+  const res = await buildWasm(
+    "match-optional-chain.ts",
+    [
+      "function f(s: string | undefined): string[] | null | undefined {",
+      "  return s?.match(/x/);",
+      "}",
+      "console.log(f(undefined));",
+      'console.log(f("y"));',
+      'console.log(f("x"));',
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(["undefined", "null", "[ 'x' ]", ""].join("\n"));
+});
+
+test("matchAll() non-global regex: Node's exact TypeError, message verified live (the direct-call path; 1544 covers this at corpus level too — this pins the artifact contract at the API level, this file's own stated purpose)", async () => {
+  const res = await buildWasm(
+    "matchall-throw.ts",
+    [
+      "try {",
+      '  [..."abc".matchAll(/b/)];',
+      '  console.log("unreachable");',
+      "} catch (e) {",
+      "  console.log((e as Error).name, (e as Error).message);",
+      "}",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    "TypeError String.prototype.matchAll called with a non-global RegExp argument\n",
+  );
+});
+
+test("matchAllInto() non-global regex, through the for-of-over-matchAll desugar: the SAME TypeError, through its own desugared path (F2 — no claim exercises this throw shape, so it needs its own byte-exact unit pin)", async () => {
+  const res = await buildWasm(
+    "matchallinto-throw.ts",
+    [
+      "try {",
+      '  for (const m of "abc".matchAll(/b/)) {',
+      "    console.log(m);",
+      "  }",
+      '  console.log("unreachable");',
+      "} catch (e) {",
+      "  console.log((e as Error).name, (e as Error).message);",
+      "}",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    "TypeError String.prototype.matchAll called with a non-global RegExp argument\n",
+  );
+});
+
+/* GATE FIX F1/F1b (INC-24 P4, BLOCKING) — a LIVE silent miscompile, caught
+ * by rev COMPILING the two-line counterexample the original "unreachable
+ * this pass" disposition only reasoned about: `const re = /ab/g;
+ * "abab".match(re)` compiled to `["ab"]` (Node: `["ab","ab"]`), and
+ * `const re = /ab/g; re.test("ab"), re.test("ab")` compiled to `true true`
+ * (Node: `true false`) — both silent, no diagnostic. rev added a THIRD
+ * counterexample mid-round to settle a compile-time-vs-runtime fork the
+ * first two left open: `function mk(): RegExp { return /ab/g; }
+ * "abab".match(mk())` — a genuinely DYNAMIC value, not even const-bound —
+ * compiled the SAME wrong way, ruling out any compile-time (const-fold)
+ * fix outright. Fixed by emitGlobalRegexValueGuard (shared by test() and
+ * match()): a RUNTIME check off RE_HEADER_FLAGS, uniform over all three
+ * shapes. MECHANISM-ATTRIBUTION (rev's own sealed criterion): this TRAPS
+ * — a bare `unreachable`, the SAME S003 stance/bridge every other
+ * representation-impossible condition on this tier uses (OOB array
+ * access) — NEVER throws, NEVER a compile-time refuse() key (the program
+ * compiles cleanly; only a genuinely global VALUE traps at runtime, so F1
+ * mints no census key and needs no F2-style reconciliation). See its own
+ * doc comment and SEMANTICS.md's S003 amendment. GLOBAL only, by rev's
+ * own explicit scoping (verified: sticky-only value receivers are
+ * unaffected). Pins mirror the S003-class trap pins already in this file
+ * (e.g. "S003 amendment: typed-array out-of-bounds get traps") — stdout
+ * up to the trap only, via runWasmToTrap; nothing to catch, so no
+ * try/catch in the source and no stderr assertion (a bare trap prints no
+ * scriptc message, exactly like every other S003-class trap here). */
+
+test("F1: match() on a global-flagged regex VALUE (no regex.new needed — an ordinary literal bound to a const) TRAPS instead of silently answering Node's FIRST match only", async () => {
+  const res = await buildWasm(
+    "f1-match-global-value.ts",
+    ["const re = /ab/g;", 'console.log("before");', '"abab".match(re);', 'console.log("after");'].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasmToTrap(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("before\n");
+});
+
+test("F1b: test() on a global-flagged regex VALUE — the SAME pre-existing (P2) unfenced bug, the SAME shared guard, the SAME trap", async () => {
+  const res = await buildWasm(
+    "f1b-test-global-value.ts",
+    ["const re = /ab/g;", 'console.log("before");', 're.test("ab");', 'console.log("after");'].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasmToTrap(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("before\n");
+});
+
+test("F1/F1b dynamic value: a genuinely DYNAMIC global regex (a function's own return, not even const-bound) TRAPS too — rev's own third measurement, the one that ruled out a compile-time-only fix", async () => {
+  const res = await buildWasm(
+    "f1-dynamic-value.ts",
+    [
+      "function mk(): RegExp { return /ab/g; }",
+      'console.log("before");',
+      '"abab".match(mk());',
+      'console.log("after");',
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasmToTrap(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("before\n");
+});
+
+test("F1 hard constraint: a NON-global value regex (1574's own re() shape) still compiles and runs byte-exact — the fence must discriminate, not blanket-refuse every value receiver", async () => {
+  const res = await buildWasm(
+    "f1-nonglobal-value-control.ts",
+    [
+      "function re(): RegExp { return /x/; }",
+      "const missing: { nope?: string } = {};",
+      "console.log((missing.nope as string | undefined)?.match(re()));",
+      'console.log(JSON.stringify("y".match(re())));',
+      'console.log(JSON.stringify("x".match(re())));',
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(["undefined", "null", '["x"]', ""].join("\n"));
+});
+
+/* GATE FIX F2 — two keys minted this pass (match's own defensive
+ * backstops, checked BEFORE any receiver/args emission: a program-
+ * dependent union result with the wrong shape) had zero pins and were
+ * absent from the declaration/findings/predictions, which all carried a
+ * bare "count NINE" forward rather than re-deriving it. Both are
+ * structurally unreachable through real TS source (lower-containers.ts's
+ * own TWO construction sites always build the EXACT `string[] | null`
+ * union shape — nothing in the frontend can produce e.type outside it) —
+ * the SAME "backstop against a defensive check nothing legitimate can
+ * trip" class as expr:regexLit:invalid-pattern (P3's own ninth key).
+ * ALSO CONFIRMED (measured, not assumed): ir/validate.ts's OWN checkExpr
+ * for regexIntrinsic:match separately enforces "exactly 2 arms, one
+ * array-of-string, one nullT" (line ~2110-2116) — STRICTER than this
+ * defensive backstop's own arm search (which tolerates extra unit arms,
+ * built for a hypothetical optional-chain-widened 3-arm union that never
+ * actually reaches this node in practice, since the chain wrapper is a
+ * separate, later step). So a MALFORMED match node is caught TWICE over
+ * on any path that runs validate() — these two emitter-level checks are
+ * pure defense in depth, reachable only by bypassing the frontend AND
+ * validate() entirely, exactly what surveyWasmModule on a hand-built
+ * IrModule does (the P3 char32_i/REOP_prev/regexLit:invalid-pattern
+ * precedent, confirmed to still apply here by directly running these two
+ * fixtures before writing this comment, not assumed from precedent alone). */
+
+test("expr:regexIntrinsic:match:non-union-result fires at the defensive backstop (hand-built IrModule, e.type is NOT a union)", () => {
+  const loc: SrcLoc = { file: "non-union-match.ts", start: 0, end: 0 };
+  const mod: IrModule = {
+    irVersion: 3,
+    sourceFile: "non-union-match.ts",
+    entry: "%main",
+    functions: [
+      {
+        name: "%main",
+        params: [],
+        returnType: VOID,
+        locals: [],
+        body: [
+          {
+            kind: "exprStmt",
+            expr: {
+              kind: "regexIntrinsic",
+              method: "match",
+              receiver: { kind: "strLit", value: "a", type: STRING, loc },
+              args: [{ kind: "regexLit", pattern: "a", flags: "", type: { kind: "regex" }, loc }],
+              type: STRING, // NOT a union — the defensive backstop's own trigger
+              loc,
+            },
+            loc,
+          },
+        ],
+        loc,
+      },
+    ],
+  };
+  expect(surveyWasmModule(mod)).toEqual(["expr:regexIntrinsic:match:non-union-result"]);
+});
+
+test("expr:regexIntrinsic:match:unexpected-arms fires at the defensive backstop (hand-built IrModule, a union with neither an array-of-string arm nor a nullT arm)", () => {
+  const loc: SrcLoc = { file: "unexpected-arms-match.ts", start: 0, end: 0 };
+  const unionId = "u0";
+  const mod: IrModule = {
+    irVersion: 3,
+    sourceFile: "unexpected-arms-match.ts",
+    entry: "%main",
+    unions: [{ id: unionId, arms: [{ kind: "f64" }, { kind: "bool" }] }],
+    functions: [
+      {
+        name: "%main",
+        params: [],
+        returnType: VOID,
+        locals: [],
+        body: [
+          {
+            kind: "exprStmt",
+            expr: {
+              kind: "regexIntrinsic",
+              method: "match",
+              receiver: { kind: "strLit", value: "a", type: STRING, loc },
+              args: [{ kind: "regexLit", pattern: "a", flags: "", type: { kind: "regex" }, loc }],
+              type: { kind: "union", unionId },
+              loc,
+            },
+            loc,
+          },
+        ],
+        loc,
+      },
+    ],
+  };
+  expect(surveyWasmModule(mod)).toEqual(["expr:regexIntrinsic:match:unexpected-arms"]);
+});
+
+/* GATE FIX F5 (INC-24 P4, second fix round, BLOCKING) — a SECOND live
+ * silent miscompile of the SAME F1/F1b class, found by rev following the
+ * S003 amendment's own justification for its logic: "sticky-only value
+ * receivers are unaffected" is TRUE for match... and FALSE for test/exec
+ * on the repeated-call axis the sentence itself names. rev's own first
+ * witness (`/a/y` repeated on "aaa") did NOT discriminate — "a" occurs at
+ * every offset in "aaa", so the printed result looks identical whether
+ * lastIndex is tracked correctly or not. Rebuilding the matrix with
+ * DISCRIMINATING witnesses — the SECOND call's answer must DIFFER
+ * depending on whether lastIndex actually advanced, or (match's own g)
+ * whether the flag changes the result SHAPE; "matches exactly once" is
+ * just one way to reach that for the single-exec family, not the
+ * property itself — replace's own witness below matches TWICE and
+ * still discriminates fine ("Xab" then "abX", genuinely different
+ * strings) — found the SAME vacuity trap had ALSO hidden a match()-
+ * specific hole (sticky alone, no global, is stateful there too — the
+ * "match stays GLOBAL-only" framing was itself built on the
+ * non-discriminating witness) and an UNRELATED third site: replace()'s
+ * own non-global branch. Corrected mask, per method group:
+ *   - single-exec group {test, exec, match} (exec lowers to match's own
+ *     IR node, operands swapped — genuinely ONE group, not two): traps
+ *     on GLOBAL|STICKY.
+ *   - replace()'s own NON-GLOBAL branch: traps on STICKY alone (its
+ *     global branch forces its own lastIndex=0 reset every call, safe,
+ *     untouched — measured, see the safe-control pins below).
+ * All pins below are REACHING pins (runWasmToTrap / runWasm, S003-class
+ * style — stdout up to the trap only, no message assertion) using
+ * DISCRIMINATING subjects (a pattern matching exactly once), never the
+ * "abab"/"aaa" shape that reads identically whether the defect exists or
+ * not. */
+
+test("F5: match() on a sticky-ONLY (no global) value regex TRAPS — the corrected hole rev's own non-discriminating witness first missed", async () => {
+  const res = await buildWasm(
+    "f5-match-sticky.ts",
+    ["const re = /ab/y;", 'console.log("before");', '"ab".match(re);', 'console.log("after");'].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasmToTrap(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("before\n");
+});
+
+test("F5: test() on a sticky-ONLY value regex TRAPS — the original finding", async () => {
+  const res = await buildWasm(
+    "f5-test-sticky.ts",
+    ["const re = /ab/y;", 'console.log("before");', 're.test("ab");', 'console.log("after");'].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasmToTrap(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("before\n");
+});
+
+test("F5: exec() on a sticky-ONLY value regex TRAPS — MEASURED with actual .exec() syntax, not inferred from match()'s own pin (exec lowers to match's IR node, but the source form is a different reaching path and must be proven separately)", async () => {
+  const res = await buildWasm(
+    "f5-exec-sticky.ts",
+    ["const re = /ab/y;", 'console.log("before");', 're.exec("ab");', 'console.log("after");'].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasmToTrap(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("before\n");
+});
+
+test("F5: replace()'s own NON-GLOBAL branch on a sticky-ONLY value regex TRAPS — a THIRD site, not in the original gate verdict, found building this fix's own matrix", async () => {
+  const res = await buildWasm(
+    "f5-replace-sticky.ts",
+    ["const re = /ab/y;", 'console.log("before");', '"abab".replace(re, "X");', 'console.log("after");'].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasmToTrap(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("before\n");
+});
+
+test("F5 safe controls: replace()'s GLOBAL branch is UNAFFECTED regardless of sticky (forces its own lastIndex=0 reset every call, matching Symbol.replace's own spec algorithm) — byte-exact against Node for both /gy and no-flags, repeated calls", async () => {
+  const res = await buildWasm(
+    "f5-replace-safe.ts",
+    [
+      "const gy = /ab/gy;",
+      'console.log("abab".replace(gy, "X"));',
+      'console.log("abab".replace(gy, "X"));',
+      "const none = /ab/;",
+      'console.log("abab".replace(none, "X"));',
+      'console.log("abab".replace(none, "X"));',
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(["XX", "XX", "Xab", "Xab", ""].join("\n"));
+});
+
+test("F5 hard constraint: a LITERAL sticky-only regex at replace()'s own non-global branch is UNGUARDED BY DESIGN (the literal-exclusion fix) and is Node-exact — the MATCH-at-0 arm, the NO-MATCH-at-0 arm WITH its own non-sticky control (proving the no-match IS anchoring, not a generally-broken sticky path that coincidentally echoes the subject), corroborating 1201-regex-replace.ts's own line 19", async () => {
+  const res = await buildWasm(
+    "f5-literal-sticky-replace.ts",
+    [
+      // MATCH-at-0 arm: "bab" starts with 'b', /b/y matches immediately.
+      'console.log("bab".replace(/b/y, "X"));',
+      // NO-MATCH-at-0 arm: "abb" starts with 'a', /b/y requires the match
+      // to start EXACTLY at position 0 (sticky) — no forward search, no
+      // replacement, Node answers the string UNCHANGED. ALONE this is
+      // vacuous (rev's own arm-axis finding): a failed sticky match
+      // resets lastIndex to 0 in Node too, so "abb" unchanged is also
+      // what a COMPLETELY BROKEN sticky path would print by coincidence.
+      // The NON-STICKY CONTROL right after proves "b" (or "ab") really
+      // is findable in the same subject by ordinary search — so the
+      // no-match arm's own "" is specifically an ANCHORING refusal, not
+      // a general failure to search at all.
+      'console.log("abb".replace(/b/y, "X"));',
+      'console.log("abb".replace(/b/, "X"));', // non-sticky control: "aXb" — "b" IS there, ordinary search finds it
+      // A second discriminating pair on a different pattern, matching
+      // team-lead's own two-arm framing verbatim, WITH its own control.
+      'console.log("xab".replace(/ab/y, "X"));',
+      'console.log("xab".replace(/ab/, "X"));', // non-sticky control: "xX" — "ab" IS there at index 1
+      'console.log("abab".replace(/ab/y, "X"));',
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(["Xab", "abb", "aXb", "xab", "xX", "Xab", ""].join("\n"));
+});
+
+test("value-path-flag matrix completion: search() is safe across ALL FOUR flag combinations (Symbol.search saves/forces-0/restores lastIndex every call regardless of flags — measured against Node for none/g/y/gy, byte-exact here too)", async () => {
+  const res = await buildWasm(
+    "matrix-search.ts",
+    [
+      "const none = /ab/;",
+      "const g = /ab/g;",
+      "const y = /ab/y;",
+      "const gy = /ab/gy;",
+      'console.log("ab".search(none), "ab".search(none));',
+      'console.log("ab".search(g), "ab".search(g));',
+      'console.log("ab".search(y), "ab".search(y));',
+      'console.log("ab".search(gy), "ab".search(gy));',
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(["0 0", "0 0", "0 0", "0 0", ""].join("\n"));
+});
+
+test("value-path-flag matrix completion: matchAll()'s own g and gy cells are safe, EVERY cell TWO-CALL (both REQUIRE global to avoid the F2 TypeError, and every global operation forces its own fresh lastIndex=0 reset, matching what this method's own loop already does) — byte-exact against Node", async () => {
+  const res = await buildWasm(
+    "matrix-matchall.ts",
+    [
+      "const g = /ab/g;",
+      'console.log(JSON.stringify([...("abab".matchAll(g))].map((m) => m[0])));',
+      'console.log(JSON.stringify([...("abab".matchAll(g))].map((m) => m[0])));',
+      "const gy = /ab/gy;",
+      'console.log(JSON.stringify([...("abab".matchAll(gy))].map((m) => m[0])));',
+      'console.log(JSON.stringify([...("abab".matchAll(gy))].map((m) => m[0])));',
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    ['["ab","ab"]', '["ab","ab"]', '["ab","ab"]', '["ab","ab"]', ""].join("\n"),
+  );
+});
+
+test("value-path-flag matrix completion: replaceAll()'s own g and gy cells are safe, EVERY cell TWO-CALL (same self-resetting mechanism as matchAll) — byte-exact against Node", async () => {
+  const res = await buildWasm(
+    "matrix-replaceall.ts",
+    [
+      "const g = /ab/g;",
+      'console.log("abab".replaceAll(g, "X"));',
+      'console.log("abab".replaceAll(g, "X"));',
+      "const gy = /ab/gy;",
+      'console.log("abab".replaceAll(gy, "X"));',
+      'console.log("abab".replaceAll(gy, "X"));',
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(["XX", "XX", "XX", "XX", ""].join("\n"));
+});
+
+test("value-path-flag matrix completion: matchAllInto (the for-of-over-matchAll desugar) was ABSENT from the matrix entirely — its own g and gy cells are safe, TWO-CALL, byte-exact against Node (same forced-reset mechanism as matchAll, its own separate emitter case)", async () => {
+  const res = await buildWasm(
+    "matrix-matchallinto.ts",
+    [
+      "const g = /ab/g;",
+      'for (const m of "abab".matchAll(g)) console.log(m[0], m.index);',
+      'console.log("---");',
+      'for (const m of "abab".matchAll(g)) console.log(m[0], m.index);',
+      "const gy = /ab/gy;",
+      'console.log("---");',
+      'for (const m of "abab".matchAll(gy)) console.log(m[0], m.index);',
+      'console.log("---");',
+      'for (const m of "abab".matchAll(gy)) console.log(m[0], m.index);',
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "ab 0",
+      "ab 2",
+      "---",
+      "ab 0",
+      "ab 2",
+      "---",
+      "ab 0",
+      "ab 2",
+      "---",
+      "ab 0",
+      "ab 2",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("value-path-flag matrix completion: match()'s own /gy cell traps too — BOTH failure axes present at once (shape: an all-matches array vs the single-match answer; statefulness: sticky's own lastIndex advance), confirming the shared guard fires regardless of which axis a caller happens to be thinking about", async () => {
+  const res = await buildWasm(
+    "matrix-match-gy.ts",
+    ["const re = /ab/gy;", 'console.log("before");', '"abab".match(re);', 'console.log("after");'].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasmToTrap(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("before\n");
+});

@@ -49,3 +49,12 @@ regex.ts:15:22 - error SC2020: 'RegExpExecArray.groups' is part of the standard 
   16 | }
 
   hint: '.groups' lowers when the match's regex is STATICALLY known — a regex literal, or a const initialized with one (the group-name table is built at compile time) — and the read is not an optional-chain step: narrow the match instead (if (m) { m.groups } or m!.groups)
+
+regex.ts:20:15 - error SC1121: '.exec()' on a regex with the 'g' or 'y' flag is not supported yet
+
+  19 | // test()'s default feature text.
+  20 | const execG = /ab/g.exec("abab");
+     |               ^~~~~~~~~~~~~~~~~~
+  21 | 
+
+  hint: g/y regexes carry mutable lastIndex state between calls, which is not modeled; drop the flag for a plain match test, or use replace/replaceAll/split (their iteration is internal)

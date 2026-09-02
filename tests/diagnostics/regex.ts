@@ -1,4 +1,4 @@
-// The regex slice fences. test() on a g/y-flagged literal is the
+// The regex slice fences. test()/exec() on a g/y-flagged literal are the
 // statefulness fence (lastIndex is not modeled); the d/v flags are
 // outside the slice; .groups needs a statically-known regex (named
 // capture groups themselves compile — corpus 2604); method-as-value has
@@ -15,3 +15,6 @@ function readGroups(re: RegExp): void {
   if (m) console.log(m.groups);
 }
 readGroups(/(?<year>\d{4})/);
+// A1 (INC-24 P4): exec's own fence must name '.exec()', not fall back to
+// test()'s default feature text.
+const execG = /ab/g.exec("abab");
