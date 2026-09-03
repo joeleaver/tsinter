@@ -2914,6 +2914,61 @@ const TIER_FLOOR: string[] = [
   "1562-optional-chain-tails.ts",
   "1574-dyn-optional-method-number-keys.ts",
   "2610-regex-named-matchall.ts",
+  // Increment 24 P5 — regex.new construction: THE CONSTANT-FOLDER (strLit,
+  // strConcat, a varRef to a PROVABLY-const global gated on BOTH
+  // mutable===false AND design-regex-v6-errata-1.txt item 3's own
+  // ordering condition — the assign and the fold site both inside the
+  // same module-init function, assign preceding site — closing a TDZ
+  // hole mutable===false alone cannot), regexp.escape over an already-
+  // folded argument), non-interned construction (design §7.5's own named
+  // non-requirement — new RegExp("a") !== new RegExp("a")), the §5.5(B)
+  // constant-folded catchable SyntaxError (invalid flags; the three
+  // structurally-decidable pattern reasons), EscapeRegExpPattern (§5.6,
+  // .source normalisation for new RegExp(str) specifically), canonical
+  // .flags order, the general runtime regexp.escape libCall (%w.re.escape,
+  // a genuinely dynamic string — 2367's own `dyn` case), and insp.regex
+  // (`/source/flags`, scr_inspect.c:618-625).
+  //
+  // 2284-regexp-constructor.cjs advances HERE, not in the first P5 round:
+  // fixing a real misclassification bug (classifyRegexLitRefusal's four-
+  // way disposition — modifiers/unported-unicode-property/unicode-
+  // casefold/annexb — only had the first two special-cased pre-fix)
+  // surfaced that 2284's own pattern (`\-` outside a character class)
+  // depends on Annex-B legacy grammar leniency (the SourceCharacter-
+  // IdentityEscape production, ECMA-262 B.1.2, "family 6" in des-24's own
+  // nine-family enumeration — findings/annexb-enumeration.txt, sha256
+  // 17a97f4c...). Joe's own scope ruling (relayed by team-lead) pulled
+  // Annex-B's family-6-outside-a-class slice INTO P5 rather than leaving
+  // 2284 refused: the shared classifyRegexLitRefusal gate (BOTH surfaces —
+  // regexLit AND regex.new; no asymmetry) now IMPLEMENTS family 6 outside
+  // a class (family 6 inside a class was already IMPLEMENT, errata item
+  // 1's own sibling fix) via an ELIMINATION classifier (classifyAnnexBFamily,
+  // regex-disposition.ts) — eight positive detectors rule OUT families
+  // 1,2,3,4,5,7,8,9 (each REFUSES by its own name now, splitting the old
+  // blanket "annexb" key so the census shows which legacy construct a
+  // program actually needs); a pattern that's Annex-B-only but matches
+  // none of the eight is family 6 by elimination, sound because
+  // usesAnnexBOnly's own precondition guarantees a real, correctly-parsed
+  // AST already exists (the ported parser — real QuickJS libregexp.c
+  // machinery — implements the FULL Annex-B grammar already; opening this
+  // slice is a POLICY narrowing, not new parser code) and des-24
+  // separately proved the nine-family enumeration EXHAUSTIVE (a
+  // 2352-position × form sweep against live Node, zero unassigned
+  // results). Census re-measured after landing: EXACTLY 2284 moves (des's
+  // own independent measurement — all 235 corpus regex literals plus all
+  // six of 2284's own constructor sites swept — and this harness's own
+  // differential run agree: missingFromClaimed stays empty, missingFromFloor
+  // is exactly this one name, confirmed by two instruments).
+  // The §4 discrimination requirement (the F5 value-path-flag guard fires
+  // for a regex.new-constructed value exactly as it does for a literal)
+  // is additionally proven by two standalone unit pins (wasm-emitter.
+  // test.ts's own "§4 must-not-trap" / "§4 covered-by-construction" —
+  // neither depends on the Annex-B slice at all).
+  // 777 -> 781, all four originally-scoped claims.
+  "1634-inspect-classes.ts",
+  "2284-regexp-constructor.cjs",
+  "2367-regexp-escape.ts",
+  "2608-regex-named-groups.ts",
 ];
 
 interface RunResult {

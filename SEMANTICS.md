@@ -4872,9 +4872,9 @@ uncatchably at first use, same as the literal arm. A NON-CONSTANT
 argument refuses by name (`libCall:regex.new:dynamic-pattern` /
 `:dynamic-flags`) — a refusal, not itself a divergence.
 
-MESSAGE TEXT, the second arm. `ir/nodes.ts:3282` documents
-`regex.new`'s error as "Node's message shape with libregexp's detail
-text (APPROXIMATE FIDELITY; `e.name` exact)". Node's own text: e.g.
+MESSAGE TEXT, the second arm. `ir/nodes.ts` documents `regex.new`'s
+NATIVE error as "Node's message shape with libregexp's detail text
+(APPROXIMATE FIDELITY; `e.name` exact)". Node's own text: e.g.
 `"Invalid regular expression: /(/: Unterminated group"`. wasm emits
 the SAME string exactly — the compiler knows the pattern at compile
 time, so the message is a CONSTANT, with no runtime parser to
@@ -4885,6 +4885,29 @@ not exact. REACH: latent — no corpus program distinguishes the two;
 `2284`'s `assert.throws` asserts the error CLASS only and never reads
 the message, so this axis is recorded here rather than caught by a
 test.
+
+**P5's actual coverage of this arm (added INC-24 P5 — this claim is
+narrower than "the SAME string exactly" reads unqualified):**
+design-regex-v6.txt §5.5(B)'s own message table names nine distinct
+INVALID-PATTERN reasons; P5 built exact-message coverage for the
+THREE a structural balanced-bracket/character-class scan can decide
+with certainty (Unterminated group / Unmatched ')' / Unterminated
+character class) plus invalid-flags (fully general — the message is
+just the flags string echoed back, no reason-classification needed).
+The other six (a bad quantifier range, a duplicate capture group name,
+an unresolvable `\p{}` property, an invalid named-capture reference,
+and the rest of the table) are NOT approximated and are NOT guessed —
+they refuse by name (`libCall:regex.new:unclassified-syntax-error`),
+this project's standing "never guess" rule, same as a non-constant
+argument refusing rather than miscompiling. This is still Node-safe on
+every reachable path (a refusal is never itself a divergence, per this
+entry's own TIMING arm above) — the gap is only that "wasm emits the
+SAME string exactly" should be read as "for every reason it has exact-
+message coverage for," not as a claim that the tier fully implements
+design-regex-v6.txt §5.5(B)'s whole table yet. No claim in P5's own
+set (1634/2367/2608; 2284 needs only Unterminated group and invalid-
+flags, both covered) reaches the six-reason gap. A future increment
+closing it needs no new S-entry, only removing this note.
 
 **Rationale:** wasm compiles the pattern at compile time and so KNOWS
 both the SyntaxError-vs-abort question and V8's exact message text up

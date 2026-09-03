@@ -13,7 +13,7 @@ import { afterAll, beforeAll, expect, test } from "vitest";
 import { compile } from "../src/index.js";
 import { I32, ModuleBuilder } from "../src/backend/wasm/module.js";
 import { parseFnEvalConstruct, surveyWasmModule } from "../src/backend/wasm/emitter.js";
-import { arrayOf, STRING, VOID, type IrExpr, type IrModule, type SrcLoc } from "../src/ir/nodes.js";
+import { arrayOf, REGEX, STRING, VOID, type IrExpr, type IrGlobal, type IrModule, type IrStmt, type SrcLoc } from "../src/ir/nodes.js";
 
 let scratch: string;
 beforeAll(async () => {
@@ -3528,11 +3528,11 @@ test("out-of-tier constructs refuse with SC3001 and ride the survey", async () =
  * with ignoreCase+isUnicode both true ever reaches char/class
  * compilation — the emitter must rule that combination out BEFORE
  * calling parsePattern with the pattern's own real flags, not after. */
-test("expr:regexLit:annexb refuses through a real program", async () => {
+test("expr:regexLit:annexb-brace-literal refuses through a real program (des's own primary F3 witness — a{,2}, clean: no family-6 adjacency, no group-context dependency, unlike \\1 which becomes a strict backref the moment the pattern gains a group)", async () => {
   const res = await buildWasm("refused.ts", 'const re = /a{,2}/; console.log(re.test("a"));\n');
   expect(res.ok).toBe(false);
   if (res.ok) return;
-  expect(res.wasmSurvey).toContain("expr:regexLit:annexb");
+  expect(res.wasmSurvey).toContain("expr:regexLit:annexb-brace-literal");
 });
 
 test("expr:regexLit:unicode-casefold refuses through a real program (not a parser crash)", async () => {
@@ -3556,18 +3556,403 @@ test("libCall:regex.new:modifiers refuses through a real program", async () => {
   expect(res.wasmSurvey).toContain("libCall:regex.new:modifiers");
 });
 
-test("libCall:regex.new:dynamic-pattern refuses through a real program", async () => {
-  const res = await buildWasm("refused.ts", 'const p = "a" + "b"; const re = new RegExp(p); console.log(re.test("ab"));\n');
+/* P5 (design §7.6): THE CONSTANT-FOLDER superseded these two pins' own
+ * ORIGINAL source (a top-level `"a" + "b"` strConcat-of-literals, and a
+ * top-level `"i" + ""` varRef-to-a-trivially-initialised-const) — both
+ * shapes are now exactly what foldRegexArg resolves, so both now
+ * COMPILE instead of refusing (confirmed by running the ORIGINAL source
+ * through this pass's own build: `res.ok` flipped from false to true).
+ * That is the CORRECT, intended effect of landing the folder, not a
+ * regression — the two pins below now use a genuinely UNFOLDABLE shape
+ * (a function PARAMETER, mirroring 2448's own pragmas.0 shape — team-
+ * lead's GO condition's own named witness for why a local/parameter
+ * must never fold) to keep pinning that the refusal keys themselves
+ * still exist and still fire for what's actually still out of tier;
+ * the fold-SUCCESS coverage those two pins used to carry moved to the
+ * two "folds and constructs" pins immediately below. */
+test("libCall:regex.new:dynamic-pattern refuses through a real program (a function parameter — 2448's pragmas.0 shape, never provably const)", async () => {
+  const res = await buildWasm(
+    "refused.ts",
+    'function f(p: string): void { const re = new RegExp(p); console.log(re.test("ab")); } f("ab");\n',
+  );
   expect(res.ok).toBe(false);
   if (res.ok) return;
   expect(res.wasmSurvey).toContain("libCall:regex.new:dynamic-pattern");
 });
 
-test("libCall:regex.new:dynamic-flags refuses through a real program", async () => {
-  const res = await buildWasm("refused.ts", 'const f = "i" + ""; const re = new RegExp("a", f); console.log(re.test("A"));\n');
+test("libCall:regex.new:dynamic-flags refuses through a real program (a function parameter, same shape)", async () => {
+  const res = await buildWasm(
+    "refused.ts",
+    'function f(fl: string): void { const re = new RegExp("a", fl); console.log(re.test("A")); } f("i");\n',
+  );
   expect(res.ok).toBe(false);
   if (res.ok) return;
   expect(res.wasmSurvey).toContain("libCall:regex.new:dynamic-flags");
+});
+
+test("THE CONSTANT-FOLDER: a strConcat-of-literals pattern arg folds and constructs, byte-exact against Node (the exact shape libCall:regex.new:dynamic-pattern's OWN pin used to refuse, before P5)", async () => {
+  const res = await buildWasm("fold-strconcat.ts", 'const p = "a" + "b"; const re = new RegExp(p); console.log(re.test("ab"), re.test("xy"));\n');
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("true false\n");
+});
+
+test("THE CONSTANT-FOLDER: a varRef-to-a-const-global flags arg folds and constructs, byte-exact against Node (the exact shape libCall:regex.new:dynamic-flags's OWN pin used to refuse, before P5)", async () => {
+  const res = await buildWasm("fold-varref.ts", 'const f = "i" + ""; const re = new RegExp("a", f); console.log(re.test("A"), re.test("b"));\n');
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("true false\n");
+});
+
+test("THE CONSTANT-FOLDER: a MUTABLE global (let, reassigned) never folds — dynamic-pattern, even though the value happens to be assigned only once on this path (IrGlobal.mutable is the gate, not whether a reassignment actually runs)", async () => {
+  const res = await buildWasm(
+    "fold-mutable-global.ts",
+    ["let p = \"a\" + \"b\";", "if (false) { p = \"c\"; }", "const re = new RegExp(p);", 'console.log(re.test("ab"));'].join("\n"),
+  );
+  expect(res.ok).toBe(false);
+  if (res.ok) return;
+  expect(res.wasmSurvey).toContain("libCall:regex.new:dynamic-pattern");
+});
+
+test("THE CONSTANT-FOLDER, errata item 3's own TDZ witness: a regex.new site inside a FUNCTION BODY that reads a module-scope const never folds, even though the const IS mutable===false and IS assigned exactly once — proving order needs a call graph this design does not build, so a function-body site refuses unconditionally rather than risk a used-before-init read (TSC itself does NOT reject this shape at compile time — verified directly, `tsc --noEmit` exits 0 — while real Node throws `ReferenceError: Cannot access 'pat' before initialization` at runtime; a folder gated on mutable===false ALONE would resolve pat->'b' and construct a WORKING regex here, a silent wrong answer against Node's own throw)", async () => {
+  const res = await buildWasm(
+    "fold-tdz-function-body.ts",
+    [
+      "function early(): boolean { return new RegExp(pat).test(\"abc\"); }",
+      "const r = early();",
+      "const pat = \"b\";",
+      "console.log(r);",
+    ].join("\n"),
+  );
+  expect(res.ok).toBe(false);
+  if (res.ok) return;
+  expect(res.wasmSurvey).toContain("libCall:regex.new:dynamic-pattern");
+});
+
+test("THE CONSTANT-FOLDER, errata item 3's own ORDERING clause specifically (hand-built IrModule, bypassing TSC — real TS syntax cannot place a regex.new BEFORE its own target's textual declaration at module scope; this isolates the statement-order half of the gate from the module-init/function-body half the previous pin already covers): a %init function whose body reads a global at statement 0 and assigns it at statement 1 — SAME function, mutable===false, but the assign does NOT precede the site — must refuse dynamic-pattern, not fold", () => {
+  const loc: SrcLoc = { file: "tdz-ordering.ts", start: 0, end: 0 };
+  const patGlobal: IrGlobal = { id: "%g.e.pat", name: "pat", type: STRING, mutable: false };
+  const siteStmt: IrStmt = {
+    kind: "exprStmt",
+    loc,
+    expr: {
+      kind: "libCall",
+      fn: "regex.new",
+      type: REGEX,
+      loc,
+      args: [
+        { kind: "varRef", localId: "%g.e.pat", type: STRING, loc },
+        { kind: "strLit", value: "", type: STRING, loc },
+      ],
+    },
+  };
+  const assignStmt: IrStmt = {
+    kind: "assign",
+    localId: "%g.e.pat",
+    value: { kind: "strLit", value: "b", type: STRING, loc },
+    loc,
+  };
+  const mod: IrModule = {
+    irVersion: 3,
+    sourceFile: "tdz-ordering.ts",
+    entry: "%init.0",
+    globals: [patGlobal],
+    functions: [
+      {
+        name: "%init.0",
+        params: [],
+        returnType: VOID,
+        locals: [],
+        body: [siteStmt, assignStmt], // SITE FIRST, assign SECOND — reversed
+        loc,
+      },
+    ],
+  };
+  expect(surveyWasmModule(mod)).toEqual(["libCall:regex.new:dynamic-pattern"]);
+});
+
+test("THE CONSTANT-FOLDER, ORDERING clause POSITIVE control (same hand-built shape, assign BEFORE site): confirms the pin above is discriminating the ORDER, not just failing on the fixture's own shape generally — swap the two statements and the SAME module NOW folds and constructs, hitting NO refusal at all", () => {
+  const loc: SrcLoc = { file: "tdz-ordering-ok.ts", start: 0, end: 0 };
+  const patGlobal: IrGlobal = { id: "%g.e.pat", name: "pat", type: STRING, mutable: false };
+  const siteStmt: IrStmt = {
+    kind: "exprStmt",
+    loc,
+    expr: {
+      kind: "libCall",
+      fn: "regex.new",
+      type: REGEX,
+      loc,
+      args: [
+        { kind: "varRef", localId: "%g.e.pat", type: STRING, loc },
+        { kind: "strLit", value: "", type: STRING, loc },
+      ],
+    },
+  };
+  const assignStmt: IrStmt = {
+    kind: "assign",
+    localId: "%g.e.pat",
+    value: { kind: "strLit", value: "b", type: STRING, loc },
+    loc,
+  };
+  const mod: IrModule = {
+    irVersion: 3,
+    sourceFile: "tdz-ordering-ok.ts",
+    entry: "%init.0",
+    globals: [patGlobal],
+    functions: [
+      {
+        name: "%init.0",
+        params: [],
+        returnType: VOID,
+        locals: [],
+        body: [assignStmt, siteStmt], // assign FIRST, site SECOND — in order
+        loc,
+      },
+    ],
+  };
+  expect(surveyWasmModule(mod)).toEqual([]);
+});
+
+test("THE CONSTANT-FOLDER: regexp.escape(<folded string>) as a regex.new pattern arg folds through — same algorithm as the general runtime case, evaluated at fold time", async () => {
+  const res = await buildWasm(
+    "fold-escape.ts",
+    ["const needle = \"a.b\";", "const re = new RegExp(RegExp.escape(needle));", 'console.log(re.test("a.b"), re.test("axb"));'].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("true false\n");
+});
+
+/* §5.5(B): a bad CONSTANT argument to new RegExp is NOT refusable — 2284's
+ * own assert.throws(..., SyntaxError) requires an ACTUAL catchable throw.
+ * These four pins isolate that mechanism at the API level (2284 already
+ * proves it end to end at corpus level; these pin the SPECIFIC message
+ * text and the catch-and-continue shape directly). */
+test("§5.5(B): new RegExp('(') throws a real, catchable SyntaxError with V8's exact message (Unterminated group)", async () => {
+  const res = await buildWasm(
+    "syntaxerr-unterminated-group.ts",
+    [
+      "try {",
+      '  new RegExp("(");',
+      "} catch (e) {",
+      "  if (e instanceof SyntaxError) console.log(true, e.message);",
+      "}",
+      'console.log("after");',
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("true Invalid regular expression: /(/: Unterminated group\nafter\n");
+});
+
+test("§5.5(B): new RegExp('a)') throws V8's exact message (Unmatched ')')", async () => {
+  const res = await buildWasm(
+    "syntaxerr-unmatched-paren.ts",
+    ["try {", '  new RegExp("a)");', "} catch (e) {", "  if (e instanceof SyntaxError) console.log(e.message);", "}"].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("Invalid regular expression: /a)/: Unmatched ')'\n");
+});
+
+test("§5.5(B): new RegExp('[') throws V8's exact message (Unterminated character class)", async () => {
+  const res = await buildWasm(
+    "syntaxerr-unterminated-class.ts",
+    ["try {", '  new RegExp("[");', "} catch (e) {", "  if (e instanceof SyntaxError) console.log(e.message);", "}"].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("Invalid regular expression: /[/: Unterminated character class\n");
+});
+
+test("§5.5(B): new RegExp('a','x') throws V8's exact message (Invalid flags), the flags text echoed back verbatim, including a duplicate-flag case ('gg')", async () => {
+  const res = await buildWasm(
+    "syntaxerr-invalid-flags.ts",
+    [
+      "try {",
+      '  new RegExp("a", "x");',
+      "} catch (e) {",
+      "  if (e instanceof SyntaxError) console.log(true, e.message);",
+      "}",
+      "try {",
+      '  new RegExp("a", "gg");',
+      "} catch (e) {",
+      "  if (e instanceof SyntaxError) console.log(e.message);",
+      "}",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    "true Invalid flags supplied to RegExp constructor 'x'\nInvalid flags supplied to RegExp constructor 'gg'\n",
+  );
+});
+
+test("libCall:regex.new:unclassified-syntax-error refuses (never guesses) for a genuine syntax error outside the three structurally-decidable reasons — a bad quantifier range", async () => {
+  const res = await buildWasm("refused.ts", 'const re = new RegExp("a{2,1}"); console.log(re.test("a"));\n');
+  expect(res.ok).toBe(false);
+  if (res.ok) return;
+  expect(res.wasmSurvey).toContain("libCall:regex.new:unclassified-syntax-error");
+});
+
+test("libCall:regex.new:unicode-casefold refuses through a real program (not a mis-thrown SyntaxError) — /iu together is a VALID V8 combination (new RegExp('a','iu') never throws in real Node), so this must be a POLICY refusal, never routed through the ast===null syntax-error path this pass just added (the §5.6 canonical-flags pin's own regression: 'yusmig' first misrouted here)", async () => {
+  const res = await buildWasm("refused.ts", 'const re = new RegExp("a", "iu"); console.log(re.test("A"));\n');
+  expect(res.ok).toBe(false);
+  if (res.ok) return;
+  expect(res.wasmSurvey).toContain("libCall:regex.new:unicode-casefold");
+});
+
+test("libCall:regex.new:annexb-brace-literal refuses through a real program — des's own primary F3 witness, via new RegExp", async () => {
+  const res = await buildWasm("refused.ts", 'const re = new RegExp("a{,2}"); console.log(re.test("a"));\n');
+  expect(res.ok).toBe(false);
+  if (res.ok) return;
+  expect(res.wasmSurvey).toContain("libCall:regex.new:annexb-brace-literal");
+});
+
+test("family-6-outside-a-class CONSTRUCTS via regex.new (INC-24 P5's own Annex-B slice, both surfaces) — 2284's OWN specific escape shape (\\- outside a character class, lenient IdentityEscape), byte-exact against Node. This SUPERSEDES an earlier draft of this pin, which asserted this exact source REFUSED as annexb before the shared classifyRegexLitRefusal gate was narrowed to BOTH surfaces (design-regex-v6-errata-1.txt item 4) — the flip from refuse to construct is the INTENDED effect of landing the slice, not a regression: the equivalent LITERAL (/\\-\\-\\-\\-\\-BEGIN X\\-\\-\\-\\-\\-/) now ALSO constructs (see the regexLit-side pin), dissolving the asymmetry rather than documenting it, per team-lead's own explicit correction", async () => {
+  const res = await buildWasm(
+    "family6-construct.ts",
+    [
+      'const label = "X";',
+      'const re = new RegExp(`\\\\-\\\\-\\\\-\\\\-\\\\-BEGIN ${label}\\\\-\\\\-\\\\-\\\\-\\\\-`);',
+      'console.log(re.test("-----BEGIN X-----"), re.test("nope"));',
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("true false\n");
+});
+
+test("family-6-outside-a-class CONSTRUCTS via a regex LITERAL too (both surfaces, the asymmetry-dissolving half) — /\\-\\-\\-\\-\\-BEGIN X\\-\\-\\-\\-\\-/, byte-exact against Node, the SAME escape a pre-P5 build refused as expr:regexLit:annexb", async () => {
+  const res = await buildWasm(
+    "family6-literal.ts",
+    ['const re = /\\-\\-\\-\\-\\-BEGIN X\\-\\-\\-\\-\\-/;', 'console.log(re.test("-----BEGIN X-----"), re.test("nope"));'].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("true false\n");
+});
+
+test("libCall:regex.new:unicode-sets-flag refuses (never miscompiles) — /v is a LEGAL V8 flag (no throw in real Node), but this tier builds no /v-mode regex yet", async () => {
+  const res = await buildWasm("refused.ts", 'const re = new RegExp("a", "v"); console.log(re.test("a"));\n');
+  expect(res.ok).toBe(false);
+  if (res.ok) return;
+  expect(res.wasmSurvey).toContain("libCall:regex.new:unicode-sets-flag");
+});
+
+test("libCall:regexp.escape — the GENERAL RUNTIME case (a genuinely dynamic string, array-indexed at runtime, never foldable) matches Node's own RegExp.escape byte-exact across the full classification: leading-alnum \\xHH, SyntaxCharacters, the ControlEscape five, hex-escaped punctuators/whitespace both <0x100 and >=0x100, an astral code point passed through unsplit even as the string's own first character, and plain pass-through — the SAME classification foldRegexArg's compile-time regexp.escape branch already pins at fold time, now proven through %w.re.escape's own wasm-instruction reimplementation (the one-pass upper-bound-scratch construction, casing.ts's own toLower/toUpper shape). Regression pin for a real bug this pin's own first run caught: every escape arm's br(0) exited only the immediately-enclosing `if`, not the outer UNIT dispatch block, so every escaped character ALSO fell through to the unconditional pass-through arm and got duplicated ('a.b' came out '\\x61a\\..b') — fixed to br(1) (an `if` is itself one branch-target level, so exiting UNIT from directly inside one needs the next label out)", async () => {
+  const res = await buildWasm(
+    "escape-general.ts",
+    [
+      'function pick(i: number): string {',
+      '  const arr = ["a.b", "The Quick Brown Fox", "(*.*)", "2 dollars, 50 cents", "", "^$\\\\.*+?()[]{}|/", ",-=<>#&!%:;@~\'`\\"", "\\t\\n\\v\\f\\r \\u00a0", "\\u{1D306}abc", "Zz09"];',
+      '  return arr[i]!;',
+      '}',
+      'for (let i = 0; i < 10; i++) {',
+      '  console.log(RegExp.escape(pick(i)));',
+      '}',
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      "\\x61\\.b",
+      "\\x54he\\x20Quick\\x20Brown\\x20Fox",
+      "\\(\\*\\.\\*\\)",
+      "\\x32\\x20dollars\\x2c\\x2050\\x20cents",
+      "",
+      "\\^\\$\\\\\\.\\*\\+\\?\\(\\)\\[\\]\\{\\}\\|\\/",
+      "\\x2c\\x2d\\x3d\\x3c\\x3e\\x23\\x26\\x21\\x25\\x3a\\x3b\\x40\\x7e\\x27\\x60\\x22",
+      "\\t\\n\\v\\f\\r\\x20\\xa0",
+      "𝌆abc",
+      "\\x5az09",
+      "",
+    ].join("\n"),
+  );
+});
+
+test("libCall:insp.regex — console.log of a regex value renders `/source/flags` (scr_inspect.c:618-625's own scr_insp_regex), both for a LITERAL (source text unchanged) and a regex.new value (source EscapeRegExpPattern-normalised — the empty-pattern '(?:)' case), plus nested inside a plain object (util.inspect's own recursive descent, not insp.regex-specific)", async () => {
+  const res = await buildWasm(
+    "insp-regex.ts",
+    [
+      "console.log(/ab+c/gi);",
+      "console.log(/^\\d{3}-\\d{4}$/);",
+      'console.log(new RegExp("a.b"));',
+      'console.log(new RegExp(""));',
+      "console.log({ deep: { deeper: { pattern: /x/m } } });",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    ["/ab+c/gi", "/^\\d{3}-\\d{4}$/", "/a.b/", "/(?:)/", "{ deep: { deeper: { pattern: /x/m } } }", ""].join("\n"),
+  );
+});
+
+test("§5.6: .flags is ALWAYS canonical getter order for a regex.new value, never source order — new RegExp('a','ysgm').flags === 'gmsy' (design §5.6's own illustrative 'yusmig' example pairs i+u, which THIS TIER refuses as libCall:regex.new:unicode-casefold regardless of order — a real, already-registered policy limit, not a bug in this pin's own reordering claim, so this uses a non-iu permutation that still exercises every reordered position)", async () => {
+  const res = await buildWasm("flags-canonical.ts", 'console.log(new RegExp("a", "ysgm").flags);\n');
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("gmsy\n");
+});
+
+test("§5.6: .source of new RegExp('') is EscapeRegExpPattern-normalised to '(?:)' — 2284's own empty-pattern case, isolated", async () => {
+  const res = await buildWasm("source-empty.ts", 'console.log(String(new RegExp("").source));\n');
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("(?:)\n");
+});
+
+test("§5.6: .source of new RegExp('a/b') escapes the raw '/' — a literal could never spell this pattern at all, so only regex.new's own normaliser is exercised here", async () => {
+  const res = await buildWasm("source-slash.ts", 'console.log(String(new RegExp("a/b").source));\n');
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("a\\/b\n");
+});
+
+/* §4 (team-lead's GO condition 2): the F5 value-path-flag guard
+ * discriminates by the VALUE's own runtime flags, not by which emitter
+ * case produced the value — a regex.new-constructed value must inherit
+ * EXACTLY the same coverage a regexLit-derived value already has,
+ * proven the SAME way the existing literal-derived matrix pins are
+ * proven (mirroring "value-path-flag matrix completion: match()'s own
+ * /gy cell traps too", line ~9060, substituting regex.new for a
+ * literal). Two pins, both REQUIRED by the GO condition: */
+test("§4 must-not-trap: a non-g/y regex.new value on test(), called twice, is byte-exact against Node and does NOT trap (2284's own shape, isolated: re.test() twice on 'a+b'/'i')", async () => {
+  const res = await buildWasm(
+    "guard-nontrap.ts",
+    ['const re = new RegExp("a+b", "i");', 'console.log(re.test("AAB"), re.test("AAB"));'].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  // Node: /a+b/i.test("AAB") is true both times (no lastIndex involved
+  // without g/y) — a DISCRIMINATING witness against the OTHER failure
+  // mode (a guard that fires when it must NOT): if the guard wrongly
+  // fired here, this would trap instead of printing, not merely print a
+  // wrong value — so a normal completion is itself the falsification of
+  // "the guard is too broad."
+  expect(stdout.toString("utf8")).toBe("true true\n");
+});
+
+test("§4 covered-by-construction: a HAND-BUILT g/y regex.new value reaches match() and TRAPS — the SAME guard a regexLit-derived value already trips, now proven for the regex.new producer specifically (NOT a formality: a non-firing guard here would silently answer Node's FIRST match only, a DIFFERENT, WRONG value — 'abab'.match(/ab/g) is Node's own [\"ab\",\"ab\"], not a single match, so a silently-succeeding tier would need to visibly diverge, not coincidentally agree)", async () => {
+  const res = await buildWasm(
+    "guard-covered.ts",
+    ['const re = new RegExp("ab", "gy");', 'console.log("before");', '"abab".match(re);', 'console.log("after");'].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasmToTrap(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("before\n");
+});
+
+test("§4 covered-by-construction, test() variant (2284's own method): a hand-built sticky-only regex.new value on test() TRAPS too, same guard, same producer-independence", async () => {
+  const res = await buildWasm(
+    "guard-covered-test.ts",
+    ['const re = new RegExp("ab", "y");', 'console.log("before");', 're.test("ab");', 'console.log("after");'].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasmToTrap(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("before\n");
 });
 
 test("libCall:regex.new:unported-unicode-property refuses through a real program", async () => {

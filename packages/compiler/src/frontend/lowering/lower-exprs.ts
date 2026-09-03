@@ -7591,20 +7591,46 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         // through to here today (SC1043's own refusal), not to the
         // DYN_HANDLE_KINDS check above. If SC1043 is ever lifted for
         // regex, this identity becomes OBSERVABLE — regex values are
-        // IMMUTABLE and INTERNED, one immortal per (pattern, flags) pair
-        // per module (the regex engine's own value struct doc, "one
-        // immortal... `re === re` would hold"), so a lift must give this
-        // fall-through its own arm before that identity is real. WHERE
-        // THE LIFT WOULD ACTUALLY HAPPEN: adding regex's type kind to
-        // DYN_HANDLE_KINDS above is the concrete edit — that map already
-        // carries the {tag, cls} pair each of its kinds needs for by-
-        // reference dyn-boxing, and a regex value crossing into dyn would
-        // need the identical shape (a GC struct reference, tagged for
-        // runtime discrimination) — so joining that set gets BOTH the
-        // dyn-boxing support AND this `===` check's own admission in one
-        // edit, not two. And literal interning would then need its own
-        // register entry (§7.5's own forward dependency this note exists
-        // to make findable).
+        // IMMUTABLE, and a LITERAL is INTERNED (one immortal per
+        // (pattern, flags) pair per module — the regex engine's own value
+        // struct doc, "one immortal... `re === re` would hold"), while a
+        // regex.new-CONSTRUCTED value (INC-24 P5) is DELIBERATELY NOT
+        // interned (`new RegExp("a") !== new RegExp("a")`, matching
+        // Node) — so a lift must give this fall-through its own arm
+        // before that identity is real, honoring BOTH producers' own
+        // contracts, not just the literal's. WHERE THE LIFT WOULD
+        // ACTUALLY HAPPEN: adding regex's type kind to DYN_HANDLE_KINDS
+        // above is the concrete edit — that map already carries the
+        // {tag, cls} pair each of its kinds needs for by-reference dyn-
+        // boxing, and a regex value crossing into dyn would need the
+        // identical shape (a GC struct reference, tagged for runtime
+        // discrimination) — so joining that set gets BOTH the dyn-boxing
+        // support AND this `===` check's own admission in one edit, not
+        // two. And literal interning would then need its own register
+        // entry (§7.5's own forward dependency this note exists to make
+        // findable).
+        //
+        // THIS PARAGRAPH IS A TRIPWIRE, NOT A STATUS REPORT — do not
+        // delete it as "stale" once regex IS added to DYN_HANDLE_KINDS
+        // for some UNRELATED dyn-boxing reason that has nothing to do
+        // with ===. If that happens, the identity admission above rides
+        // in SILENTLY as a side effect, and THIS note is the only thing
+        // that flags a new observable divergence is now live with no
+        // S-entry behind it (literal interning becomes a real, watchable
+        // behavior the moment === admits regex — CLAUDE.md's own
+        // absolute rule, "divergences are registered first," is what
+        // breaks if this note is gone and nobody notices the join).
+        // Verified this is CURRENTLY a note, not an edit, before P5's own
+        // freeze (INC-24 P5 finding, des-24 on-call): all four of P5's
+        // own claims (2608/2284/2367/1634) were swept for dyn machinery
+        // and found to use NONE at all — not merely no regex-into-dyn
+        // crossing — positive-controlled against corpus programs that DO
+        // trip the same detector (1551, 2286), so the zero is real, not
+        // an instrument that can't see a hit. Confirm that sweep again,
+        // the same way, before ever editing DYN_HANDLE_KINDS for regex —
+        // if some future claim's own dyn machinery forces the edit, that
+        // is the scope escalation this note exists to catch, and it is a
+        // Joe-scope decision, not a drive-by convenience.
         L.unsupported("SC1043", expr);
         break;
       }

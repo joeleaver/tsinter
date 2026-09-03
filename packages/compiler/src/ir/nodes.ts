@@ -49,15 +49,37 @@ export type IrType =
    * of sets, not JSON-safe) and never cycle-capable: elements are scalars
    * or strings, which cannot point back. */
   | { kind: "set"; elem: IrType }
-  /** A regular expression — heap, refcounted, IMMUTABLE. No lastIndex
-   * statefulness exists: /g and /y are supported only inside
-   * replace/replaceAll/split (where the iteration is internal), and test()
-   * on them is rejected. Every regex value today originates from a literal,
-   * which backends intern as ONE immortal static per (pattern, flags) pair
-   * — bytecode compiles lazily at first use, is never freed, and the RC
-   * audit ignores immortals. Deliberately narrower than string: no array
-   * elements, no map keys/values, no union arms (a regex arm would have no
-   * narrowing test), not JSON-safe. */
+  /** A regular expression — IMMUTABLE, no lastIndex field: the value
+   * itself carries no statefulness (repoint, INC-24 P5 — this comment
+   * used to say "heap, refcounted" unconditionally, which held for the C
+   * lane's ScrRegex but is already false for the wasm lane's %w.re.Regex,
+   * a WasmGC struct with no refcounting at all; representation is a
+   * per-backend concern this type does not pin).
+   *
+   * A regex value originates from EITHER a LITERAL (interned by backends
+   * that choose to: the wasm lane's own regexLiteral() builds ONE
+   * immortal static per (pattern, flags) pair per module) OR, since P5,
+   * `new RegExp(...)` construction (regex.new), which is DELIBERATELY
+   * NOT interned — `new RegExp("a") !== new RegExp("a")`, matching
+   * Node, so two distinct call sites (or the same one evaluated twice)
+   * never share a struct. This comment previously claimed "every regex
+   * value today originates from a literal," which P5 made false.
+   *
+   * /g and /y are NOT "supported only inside replace/replaceAll/split,
+   * with test() rejected" — that was already stale before P5 (P4's own
+   * F5 fix): a regex VALUE (as opposed to a literal used directly at its
+   * own call site, which the wasm lane can specialize at compile time)
+   * carrying a runtime GLOBAL or STICKY flag TRAPS on test/exec/match
+   * (any flag) or replace's non-global branch (sticky alone) — the S003
+   * bridge, uncatchable, standing in for the lastIndex tracking this
+   * value shape cannot represent. A non-stateful value (no g, no y) works
+   * on every method, unconditionally, regardless of whether it came from
+   * a literal or regex.new — the guard keys on the VALUE's own runtime
+   * flags, never on which expression produced it.
+   *
+   * Deliberately narrower than string: no array elements, no map
+   * keys/values, no union arms (a regex arm would have no narrowing
+   * test), not JSON-safe. */
   | { kind: "regex" }
   /** A typed array / Node Buffer (Uint8Array, Uint32Array, Float32Array;
    * Buffer IS a Uint8Array subclass and shares the u8 kind) — heap,
@@ -3279,15 +3301,36 @@ export type IrLibFn =
    * own (verbatim, doubly-wrapped) message. */
   | "dyn.structuredClone"
   | "dyn.cloneMissing"
-  /** `new RegExp(pattern, flags?)` (scr_regex.c): a heap regex over the
-   * same libregexp engine the literals use. The pattern compiles EAGERLY
+  /** `new RegExp(pattern, flags?)`: NATIVE (scr_regex.c) — a heap regex
+   * over the same libregexp engine the literals use, compiled EAGERLY,
    * so an invalid pattern (or an unknown flag letter) throws Node's
    * catchable SyntaxError at construction — Node's message shape with
    * libregexp's detail text (approximate fidelity; e.name exact). An
    * empty pattern stores the spec's "(?:)" source. Both args borrowed
    * strings (the lowering completes an absent flags to ""); result +1.
    * The result TYPE is the regex kind, so the link switch pulls the
-   * engine exactly like a literal. */
+   * engine exactly like a literal.
+   *
+   * WASM (repoint, INC-24 P5 — SEMANTICS.md S065 is now the full,
+   * two-lane picture; this paragraph describes native only): the
+   * pattern/flags must be COMPILE-TIME CONSTANT (a literal, a strConcat
+   * chain, a provably-const global, or `regexp.escape(...)` over one of
+   * those — refuses by name, `libCall:regex.new:dynamic-pattern` /
+   * `:dynamic-flags`, otherwise). A CONSTANT-INVALID pattern or flag
+   * string does NOT approximate — S065's MESSAGE TEXT arm: the compiler
+   * knows the pattern at compile time, so an invalid-flags string gets
+   * V8's exact "Invalid flags supplied to RegExp constructor '<flags>'"
+   * unconditionally, and an invalid PATTERN gets V8's exact message for
+   * the three reasons a structural scan can decide with certainty
+   * (Unterminated group / Unmatched ')' / Unterminated character class)
+   * — any OTHER invalid-pattern reason (a bad quantifier range, a
+   * duplicate capture name, an unresolvable \p{} property, and the rest
+   * of design-regex-v6.txt §5.5(B)'s own message table) refuses by name
+   * (`libCall:regex.new:unclassified-syntax-error`) rather than emit an
+   * approximate or guessed message — never S065's "approximate fidelity"
+   * shape, which is native-only. Unlike native, wasm does NOT intern
+   * (design §7.5's own named non-requirement — `new RegExp("a") !==
+   * new RegExp("a")`, matching Node). */
   | "regex.new"
   /** structuredClone with a NON-EMPTY transfer array of static values:
    * nothing static is transferable, so the call always throws Node's

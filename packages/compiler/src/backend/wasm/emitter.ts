@@ -154,6 +154,17 @@ import { RegexInterpreterBuilder } from "./regex-interpreter.js";
 import { parsePattern } from "./regex-parser.js";
 import { assemble, collectGroupNames, type AssembleFlags } from "./regex-assembler.js";
 import { classifyRegexLitRefusal, usesUnicodeCasefold } from "./regex-disposition.js";
+import { classifyRegexSyntaxErrorReason, escapeRegExpPattern } from "./regex-syntax-reason.js";
+import { escapeRegExpText } from "./regexp-escape.js";
+
+/** THE CONSTANT-FOLDER's own termination bound (design §7.6) — a belt-
+ * and-braces cap on how many varRef-to-global hops foldRegexArg will
+ * chase before refusing, independent of the visited-set cycle guard. A
+ * real program's own const chain (2284's own two-level `head`-over-
+ * `label` shape) is a handful deep at most; this is generous, never a
+ * practical limit, purely a safety net against a pathological or
+ * unanticipated shape hanging the compiler. */
+const FOLD_DEPTH_CAP = 32;
 import type { RegexAst } from "./regex-ast.js";
 import { RE_HEADER_REGISTER_COUNT, RE_HEADER_FLAGS, LRE_FLAG_GLOBAL, LRE_FLAG_STICKY, LRE_FLAG_UNICODE } from "./regex-opcodes.js";
 import { BytesBuilder, type BytesElem } from "./typedarrays.js";
@@ -406,6 +417,18 @@ interface FnState {
   /** The parked return value's local (lazily allocated; null until a
    * return actually crosses a finally, and never for void returns). */
   pretLocal: number | null;
+  /** THE CURRENT FUNCTION's own TOP-LEVEL statement index (design-regex-
+   * v6-errata-1.txt item 3 — THE CONSTANT-FOLDER's varRef ordering
+   * condition). Set ONLY around the single top-level `walkBody(fn.body)`
+   * call (not the generic walkBody helper itself, which nested block/
+   * loop/if bodies also call — updating it there would corrupt the
+   * count with nested-statement positions). -1 before the top-level walk
+   * starts; foldRegexArg's own ordering check reads this to compare the
+   * regex.new SITE's own enclosing top-level statement against a
+   * candidate global's single-assign statement index, BOTH inside the
+   * SAME "%init." module-init function — never meaningful, and never
+   * read, outside one. */
+  topStmtIndex: number;
 }
 
 /** A resolved record shape's wasm representation: `struct` and per-
@@ -7969,6 +7992,7 @@ class Assembler {
       tryStack: [],
       finallyStack: [],
       pretLocal: null,
+      topStmtIndex: -1,
     };
 
     // Prologue 1: re-box captured params.
@@ -8021,7 +8045,14 @@ class Assembler {
       this.releaseScratch({ kind: "ref", nullable: true, typeIndex: env }, envScratch);
     }
 
-    this.walkBody(fn.body);
+    // NOT this.walkBody(fn.body) — that generic helper is also what
+    // nested if/for/while/block bodies call, and this loop's own
+    // topStmtIndex tracking must count ONLY this function's own TOP-
+    // LEVEL statements (errata item 3's ordering condition).
+    fn.body.forEach((s, i) => {
+      this.fn.topStmtIndex = i;
+      this.walkStmt(s);
+    });
     // Non-void functions never fall off the end (the frontend appends the
     // implicit return on every path — see appendImplicitUndefinedReturn),
     // but wasm validation can't see that guarantee. A trailing unreachable
@@ -10553,6 +10584,16 @@ class Assembler {
           code.call(this.insp.bufferForm());
           return;
         }
+        if (e.fn === "insp.regex") {
+          // util.inspect/console.log of a STATICALLY-typed regex value
+          // (scr_inspect.c:618-625's own scr_insp_regex): `/source/flags`
+          // unconditionally — regexes "never carry extra own properties"
+          // (that file's own comment) and render fully at any depth.
+          // Never throws.
+          this.walkExpr(e.args[0]!);
+          code.call(this.regex.inspectHelper());
+          return;
+        }
         if (e.fn === "insp.dyn" || e.fn === "insp.dynS" || e.fn === "insp.jsval") {
           // The dyn walker (inspect.ts): the one runtime type whose shape
           // lives in the value, so the traversal is emitted code rather
@@ -11004,56 +11045,111 @@ class Assembler {
           return;
         }
         if (e.fn === "regex.new") {
-          // Four REFINEMENTS of the still-fully-refusing libCall:
-          // regex.new (item-8 sibling ruling — regex.new construction
-          // itself opens in P5, nothing regresses, these names just get
-          // earlier/sharper). Both args are always present and string-
-          // typed by construction (lower-classes.ts's own strArg: a
-          // missing flags argument becomes an explicit `""` strLit,
-          // never "dynamic"; a non-string arg is already refused at
-          // LOWERING time via noLowering, never reaches here).
+          // P5 (design §7.6): THE CONSTANT-FOLDER first — both args are
+          // always present and string-typed by construction (lower-
+          // classes.ts's own strArg: a missing flags argument becomes an
+          // explicit `""` strLit, never "dynamic"; a non-string arg is
+          // already refused at LOWERING time via noLowering, never
+          // reaches here), but need not be strLit THEMSELVES any more —
+          // foldRegexArg additionally resolves strConcat, a provably-
+          // const global varRef, and regexp.escape(<foldable>).
           const patternArg = e.args[0]!;
           const flagsArg = e.args[1]!;
-          if (patternArg.kind !== "strLit") {
+          const foldedPattern = this.foldRegexArg(patternArg);
+          if (!foldedPattern.ok) {
             this.refuse("libCall:regex.new:dynamic-pattern", e.loc);
             code.unreachable();
             return;
           }
-          if (flagsArg.kind !== "strLit") {
+          const foldedFlags = this.foldRegexArg(flagsArg);
+          if (!foldedFlags.ok) {
             this.refuse("libCall:regex.new:dynamic-flags", e.loc);
             code.unreachable();
             return;
           }
-          // Both statically known: the SAME disposition analysis
-          // regexLit runs, but only its "modifiers" and "unported-
-          // unicode-property" verdicts get their own regex.new-side
-          // name — annexb/unicode-casefold (and a clean or genuinely
-          // invalid pattern) fall through to the generic bucket below,
-          // since regex.new construction itself isn't implemented
-          // regardless of pattern content; sharpening those two is
-          // P5's own concern when regex.new actually opens.
+          const patternText = foldedPattern.value;
+          const flagsText = foldedFlags.value;
+
+          // §5.5(B) flags LEGALITY — ECMA-262's own legal RegExp flag
+          // set (d g i m s u v y), independent of which of those this
+          // TIER can actually build (that's the unicode-sets-flag
+          // refusal just below): an illegal character, or a duplicate
+          // of a legal one, is ALWAYS a V8 SyntaxError — "Invalid flags
+          // supplied to RegExp constructor '<flags>'", the flags text
+          // echoed back verbatim (MEASURED: design §5.5's own "'x'" /
+          // "'gg'" pair) — regardless of tier support, so this check
+          // runs before any tier-capability question.
+          const LEGAL_FLAG_CHARS = "dgimsuvy";
+          const seenFlags = new Set<string>();
+          let flagsInvalid = false;
+          for (const c of flagsText) {
+            if (!LEGAL_FLAG_CHARS.includes(c) || seenFlags.has(c)) {
+              flagsInvalid = true;
+              break;
+            }
+            seenFlags.add(c);
+          }
+          if (flagsInvalid) {
+            this.emitSetCellError(
+              code,
+              "%SyntaxError",
+              "SyntaxError",
+              (c) => this.pushStrLitInto(c, `Invalid flags supplied to RegExp constructor '${flagsText}'`),
+              null,
+            );
+            this.emitUnwind();
+            return;
+          }
+          if (flagsText.includes("v")) {
+            // /v (unicodeSets) is a LEGAL flag V8 accepts — this tier
+            // does not build /v-mode regexes at all yet (no claim needs
+            // it; regex-disposition.ts/regex-parser.ts have no 'v'
+            // handling anywhere, confirmed by direct search). Refuse,
+            // never miscompile a mode this tier cannot actually honor.
+            this.refuse("libCall:regex.new:unicode-sets-flag", e.loc);
+            code.unreachable();
+            return;
+          }
+
+          // Both resolved to concrete text: the SAME disposition
+          // analysis regexLit runs, over the FOLDED text rather than a
+          // strLit's own .value.
           const flags: AssembleFlags = {
-            global: flagsArg.value.includes("g"),
-            ignoreCase: flagsArg.value.includes("i"),
-            multiLine: flagsArg.value.includes("m"),
-            dotAll: flagsArg.value.includes("s"),
-            unicode: flagsArg.value.includes("u"),
-            sticky: flagsArg.value.includes("y"),
+            global: flagsText.includes("g"),
+            ignoreCase: flagsText.includes("i"),
+            multiLine: flagsText.includes("m"),
+            dotAll: flagsText.includes("s"),
+            unicode: flagsText.includes("u"),
+            sticky: flagsText.includes("y"),
           };
           // Same /iu guard as regexLit's own case, same reason
           // (assertNoUnicodeCasefold THROWS, not refuses): must not
           // reach parsePattern with the pattern's own real flags before
-          // ruling out ignoreCase+unicode. unicode-casefold isn't one
-          // of THIS site's two named keys, but the parse crash it would
-          // otherwise cause happens regardless of which key eventually
-          // gets reported — the guard is about parsePattern, not about
-          // which refusal name fires afterward.
+          // ruling out ignoreCase+unicode.
           let ast: RegexAst | null = null;
           if (!usesUnicodeCasefold(flags.ignoreCase, flags.unicode)) {
-            const parsed = parsePattern(patternArg.value, 0, flags.unicode, flags.ignoreCase, flags.multiLine, flags.dotAll);
-            ast = parsed !== null && parsed.next === patternArg.value.length ? parsed.ast : null;
+            const parsed = parsePattern(patternText, 0, flags.unicode, flags.ignoreCase, flags.multiLine, flags.dotAll);
+            ast = parsed !== null && parsed.next === patternText.length ? parsed.ast : null;
           }
-          const refusal = classifyRegexLitRefusal(patternArg.value, ast, flags.ignoreCase, flags.multiLine, flags.dotAll, flags.unicode, parsePattern);
+          const refusal = classifyRegexLitRefusal(patternText, ast, flags.ignoreCase, flags.multiLine, flags.dotAll, flags.unicode, parsePattern);
+          // classifyRegexLitRefusal's own return type has FOUR members
+          // (regex-disposition.ts's own RegexLitRefusal union), not just
+          // the two this case used to special-case: "modifiers" and
+          // "unported-unicode-property" got their own regex.new-side
+          // names pre-P5 (item-8 sibling ruling); "unicode-casefold" and
+          // "annexb" did NOT, because construction itself didn't exist
+          // yet — everything else fell through to the ONE generic
+          // refusal bucket regardless of reason. Now that ast===null
+          // triggers REAL, DIFFERENT behavior (a constant-folded THROW,
+          // §5.5(B)), the distinction matters: /iu-casefold and
+          // AnnexB-only are POLICY refusals with ast===null for a
+          // reason that has NOTHING to do with pattern validity ("a","iu")
+          // is perfectly valid; this tier just can't parse it safely) —
+          // conflating them with a genuine syntax error would either
+          // wrongly refuse-as-unclassified (found by this pass's own
+          // §5.6 canonical-flags pin: "yusmig" contains i+u and got
+          // misrouted to unclassified-syntax-error before this fix) or,
+          // worse, wrongly THROW a SyntaxError Node never throws at all.
           if (refusal === "modifiers") {
             this.refuse("libCall:regex.new:modifiers", e.loc);
             code.unreachable();
@@ -11064,7 +11160,91 @@ class Assembler {
             code.unreachable();
             return;
           }
-          // Falls through to the generic libCall:regex.new refusal below.
+          if (refusal === "unicode-casefold") {
+            this.refuse("libCall:regex.new:unicode-casefold", e.loc);
+            code.unreachable();
+            return;
+          }
+          if (refusal !== null && refusal.startsWith("annexb-")) {
+            // INC-24 P5, per-family split (design-regex-v6-errata-1.txt
+            // item 4): the old blanket "annexb" key retired into eight —
+            // one per Annex-B production family — so the census shows
+            // WHICH legacy construct a program actually needs. Family 6
+            // OUTSIDE a class no longer reaches here at all (classifyAnnexBFamily's
+            // own elimination resolves it to null, "fully supported" —
+            // see classifyRegexLitRefusal's own doc); every OTHER family
+            // still refuses, now by its own specific name.
+            this.refuse(`libCall:regex.new:${refusal}`, e.loc);
+            code.unreachable();
+            return;
+          }
+          if (ast === null) {
+            // A genuine pattern syntax error — §5.5(B): this is NOT
+            // refusable (2284's own assert.throws(..., SyntaxError)
+            // requires the throw to actually happen and be caught).
+            // Constant-folded: the compiler knows the pattern, knows it
+            // is invalid, and (for the structurally-decidable reasons)
+            // knows V8's exact message — so it emits code that THROWS
+            // at this point, rather than a runtime parser.
+            const reason = classifyRegexSyntaxErrorReason(patternText);
+            if (reason === null) {
+              // A real syntax error this narrow classifier isn't
+              // certain of the V8 wording for (an unsupported quantifier
+              // range, a bad \p{} name, etc — the design's own "sweep").
+              // Refuse by name rather than guess at a message.
+              this.refuse("libCall:regex.new:unclassified-syntax-error", e.loc);
+              code.unreachable();
+              return;
+            }
+            this.emitSetCellError(
+              code,
+              "%SyntaxError",
+              "SyntaxError",
+              (c) => this.pushStrLitInto(c, `Invalid regular expression: /${patternText}/${flagsText}: ${reason}`),
+              null,
+            );
+            this.emitUnwind();
+            return;
+          }
+
+          // Fully folded, fully valid: CONSTRUCT. Not interned (design
+          // §7.5's own named non-requirement) — regexConstruct emits a
+          // fresh %w.re.Regex struct on every evaluation, matching
+          // `new RegExp("a") !== new RegExp("a")`.
+          const asm = assemble(ast, flags);
+          const groupNamesMap = collectGroupNames(ast);
+          const hasNamed = [...groupNamesMap.values()].some((v) => v.name !== null);
+          // .source is EscapeRegExpPattern-normalised for new RegExp(str)
+          // specifically (design §5.6) — NOT the raw patternText (that's
+          // what parsePattern/assemble above ran over; storage and
+          // matching are separate concerns here).
+          const storedSource = escapeRegExpPattern(patternText);
+          // .flags is ALWAYS canonical getter order (d g i m s u y),
+          // same as regexLit's own canonicalFlags (§5.6) — 'v' is
+          // already ruled out above, so the 7-char filter set matches.
+          const canonicalFlags = "dgimsuy"
+            .split("")
+            .filter((c) => flagsText.includes(c))
+            .join("");
+          const groupNames = hasNamed
+            ? Array.from({ length: asm.captureCount - 1 }, (_, i) => groupNamesMap.get(i + 1)?.name ?? "")
+            : null;
+          this.regex.regexConstruct(code, storedSource, canonicalFlags, asm.bytes, asm.captureCount, groupNames);
+          return;
+        }
+        if (e.fn === "regexp.escape") {
+          // The GENERAL runtime case (design §7.6's own "not a second
+          // algorithm"): foldRegexArg's own libCall branch already
+          // handles regexp.escape(<foldable string>) at COMPILE TIME
+          // (regexp-escape.ts's escapeRegExpText) when it appears as a
+          // regex.new argument — this case is the one that actually
+          // reaches a DYNAMIC string value at runtime (2367's own `dyn`
+          // usage: `RegExp.escape(dyn)` over an array-indexed string,
+          // never foldable), via %w.re.escape's own wasm-instruction
+          // reimplementation of the identical classification.
+          this.walkExpr(e.args[0]!);
+          code.call(this.regex.escapeHelper());
+          return;
         }
         if (this.emitBufferLibCall(e)) return;
         if (this.emitTimerCall(e)) return;
@@ -16105,6 +16285,133 @@ class Assembler {
     code.ifVoid();
     code.unreachable();
     code.end();
+  }
+
+  /** THE CONSTANT-FOLDER (design §7.6, ruled in; the varRef arm CORRECTED
+   * by design-regex-v6-errata-1.txt item 3) — a CONSERVATIVE compile-time
+   * resolver for regex.new's own pattern/flags arguments. Handles exactly
+   * four shapes: strLit (trivially foldable already), strConcat
+   * (recursive, both sides), varRef to a GLOBAL that is BOTH (a)
+   * IrGlobal.mutable === false — never a local, never a parameter, never
+   * a mutable global; 2448's own fn-param pattern is the canonical
+   * witness for why locals/params never fold — AND (b) whose single
+   * assign and this FOLD SITE are BOTH in the SAME module-init ("%init.")
+   * function, with the assign PRECEDING the site in top-level statement
+   * order, and libCall regexp.escape over an already-folded argument
+   * (calls escapeRegExpText at FOLD TIME — the SAME algorithm the general
+   * runtime regexp.escape libCall case emits as wasm code, not a second
+   * algorithm, per §7.6's own requirement). Anything else — a genuinely
+   * dynamic expression, a local, a mutable global, a fold site inside an
+   * ordinary function body (errata item 3: proving order there needs a
+   * call graph, which this design does not build), a global whose assign
+   * is in a DIFFERENT module-init function, an unresolvable global, a
+   * cycle, or a fold chain past the depth cap — returns {ok:false}: the
+   * caller refuses BY NAME (dynamic-pattern / dynamic-flags), never
+   * guesses.
+   *
+   * WHY (a) ALONE IS UNSOUND (errata item 3's own witness, measured):
+   *   function early(): boolean { return new RegExp(pat).test("abc"); }
+   *   const r = early();
+   *   const pat = "b";
+   * `pat` is mutable===false with exactly one assign, and is READ before
+   * that assign runs — Node throws `ReferenceError: Cannot access 'pat'
+   * before initialization` (TDZ). mutable===false proves "assigned AT
+   * MOST once," never "assigned BEFORE THIS USE" — a folder gated on (a)
+   * alone would resolve `pat`→"b" and construct a WORKING regex, a
+   * silent wrong answer where the language specifies a throw. Condition
+   * (b) is what rules this out: `early`'s own regex.new site is inside a
+   * FUNCTION BODY, not module-init, so it refuses on (b) regardless of
+   * (a) — and even a same-shaped TDZ case written directly at module
+   * scope would refuse on (b)'s ordering half (the assign's own statement
+   * index would not precede the site's).
+   *
+   * TERMINATION: `visited` is a set of global ids already entered on THIS
+   * fold chain — re-entering one (a cyclic const chain, which cannot
+   * happen from valid TS but must not be trusted blindly) refuses rather
+   * than looping. `FOLD_DEPTH_CAP` bounds the chain length independently
+   * (a belt-and-braces cap; a real program's own const chain, per 2284's
+   * own two-level `head`-over-`label` shape, is a handful deep at most). */
+  private foldRegexArg(expr: WExpr, visited: ReadonlySet<string> = new Set()): { ok: true; value: string } | { ok: false } {
+    switch (expr.kind) {
+      case "strLit":
+        return { ok: true, value: expr.value };
+      case "strConcat": {
+        const left = this.foldRegexArg(expr.left, visited);
+        if (!left.ok) return { ok: false };
+        const right = this.foldRegexArg(expr.right, visited);
+        if (!right.ok) return { ok: false };
+        return { ok: true, value: left.value + right.value };
+      }
+      case "varRef": {
+        const id = expr.localId;
+        // Globals live in the "%g." namespace (IrGlobal's own doc,
+        // emitter.ts's own globalById construction) — anything else is a
+        // local or a parameter, which is NEVER provably immutable at
+        // this level (2448's own fn-param pattern is exactly this shape
+        // and must refuse, not fold).
+        if (!id.startsWith("%g.")) return { ok: false };
+        const global = this.globalById.get(id);
+        if (global === undefined || global.mutable !== false) return { ok: false };
+        if (visited.has(id) || visited.size >= FOLD_DEPTH_CAP) return { ok: false };
+        // errata item 3's ORDERING condition — this fold SITE must
+        // itself be inside a module-init function (a fold site inside an
+        // ordinary function body has no call-graph-free way to prove
+        // ordering, so it refuses unconditionally here, before even
+        // looking up the global).
+        if (!this.fn.fn.name.startsWith("%init.")) return { ok: false };
+        const resolved = this.resolveGlobalInit(id);
+        if (resolved === null) return { ok: false };
+        // Both halves of (b): SAME module-init function, and the
+        // assign's own top-level statement index strictly precedes the
+        // fold site's current one (this.fn.topStmtIndex — tracked ONLY
+        // around the top-level walkBody(fn.body) call, never by the
+        // generic nested-block walkBody helper).
+        if (resolved.fnName !== this.fn.fn.name) return { ok: false };
+        if (!(resolved.stmtIndex < this.fn.topStmtIndex)) return { ok: false };
+        const nextVisited = new Set(visited);
+        nextVisited.add(id);
+        return this.foldRegexArg(resolved.init, nextVisited);
+      }
+      case "libCall": {
+        if (expr.fn !== "regexp.escape") return { ok: false };
+        const arg = this.foldRegexArg(expr.args[0]!, visited);
+        if (!arg.ok) return { ok: false };
+        return { ok: true, value: escapeRegExpText(arg.value) };
+      }
+      default:
+        return { ok: false };
+    }
+  }
+
+  /** The global's own initializing expression, its CONTAINING function's
+   * name, and its TOP-LEVEL statement index within that function's body
+   * — or null if none is found. Globals carry NO `init` field on
+   * IrGlobal itself (checked directly — source/flags/bytecode/
+   * captureCount/groupNames is %w.re.Regex's own struct, a different
+   * thing entirely; IrGlobal is id/name/type/mutable only) — the actual
+   * write is an ordinary `assign` or (non-boxed) `varDecl` statement
+   * living inside whichever function's own body runs it (storeVar's own
+   * doc comment: "Globals live in the '%g.' namespace... get their wasm
+   * slot lazily, right here at first use"). Scanned at TOP LEVEL of
+   * every function's own body only — a global initializer has never been
+   * observed nested inside a conditional in any claim this pass measured
+   * against; if a future program needs one, this returns null (refuse),
+   * never a wrong guess. The fnName/stmtIndex pair is errata item 3's own
+   * ORDERING evidence — foldRegexArg's varRef arm is the only caller,
+   * and it is the one that turns "found" into "found AND provably
+   * initialized before this use." */
+  private resolveGlobalInit(globalId: string): { init: WExpr; fnName: string; stmtIndex: number } | null {
+    for (const fn of this.mod.functions) {
+      for (let i = 0; i < fn.body.length; i++) {
+        const s = fn.body[i]!;
+        if (s.kind === "varDecl" && s.localId === globalId) {
+          if (s.init === null) return null;
+          return { init: s.init, fnName: fn.name, stmtIndex: i };
+        }
+        if (s.kind === "assign" && s.localId === globalId) return { init: s.value, fnName: fn.name, stmtIndex: i };
+      }
+    }
+    return null;
   }
 
   /** Builds one honest match-slice row — [wholeMatch, cap1, cap2, ...],
