@@ -1537,7 +1537,11 @@ declare module "node:util/types" {
  * from "node:assert"` and `const assert = require("assert")` bind the
  * callable; named imports take the members. Failures throw
  * AssertionError (name "AssertionError", code "ERR_ASSERTION" — catch and
- * read .name/.message/.code). strictEqual/deepStrictEqual compare with
+ * read .name/.message off an `Error` narrow; `.code` is NOT a member of
+ * `Error`, so it reads through the `NodeJS.ErrnoException` narrow, the
+ * same one fs errors use — a bare `Error` narrow fails typecheck with
+ * SC0001, and casting the catch binding to `any` to dodge that refuses
+ * with SC1063). strictEqual/deepStrictEqual compare with
  * Object.is over scalars; deepStrictEqual compares composites
  * structurally per their static types. The messages here are plain
  * strings (Node accepts Errors — that form fences per site), and the
