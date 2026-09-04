@@ -480,6 +480,16 @@ interface ThrowsShapeKey {
   kind: "str" | "re";
   value: IrExpr;
   enameBake: string | null;
+  // INC-24 P6: was THIS key's value spelled as a regex literal directly
+  // at the call site? The generated helper is DEDUPED/SHARED across
+  // every call site with the same (id, kind, enameBake) signature — its
+  // own body sees `value` only as a wrapper PARAMETER ref, never as the
+  // original expression, so this can't be recovered inside the helper
+  // the way assert.match's own (non-wrapper-mediated) literal check can.
+  // Threaded through as an EXTRA runtime argument instead (see
+  // expectedArgs/shapeSlotStmts below), exactly like msg/hasMsg already
+  // are. Only meaningful for kind "re".
+  isLiteral: boolean;
 }
 
 /** The classified expected argument of throws/rejects/doesNotReject.
@@ -489,7 +499,11 @@ type ThrowsExpected =
   | { form: "bare" }
   | { form: "message"; msg: IrExpr; hasMsg: IrExpr }
   | { form: "class"; className: string; displayName: string }
-  | { form: "regex"; value: IrExpr }
+  // isLiteral: same rationale as ThrowsShapeKey's own field above — the
+  // helper is deduped/shared, so this must be threaded as an extra
+  // runtime argument, not recovered from `value`'s own IrExpr kind
+  // inside the (possibly-shared) helper body.
+  | { form: "regex"; value: IrExpr; isLiteral: boolean }
   | { form: "shape"; keys: ThrowsShapeKey[] }
   // An error-INSTANCE expected (Node compares name, message, and the
   // expected's own enumerable keys with isDeepStrictEqual): the value
@@ -532,7 +546,7 @@ function classifyThrowsExpected(
     return { form: "message", msg: m.msg, hasMsg: m.hasMsg };
   }
   if (expectedT?.kind === "regex") {
-    return { form: "regex", value: L.lowerExpr(node) };
+    return { form: "regex", value: L.lowerExpr(node), isLiteral: ts.isRegularExpressionLiteral(node) };
   }
   const sym = ts.isIdentifier(node) ? L.resolveValueSymbol(node) : null;
   const info = (sym && L.builtinErrorInfoOf(sym)) ?? (sym && L.classBySymbol.get(sym)) ?? null;
@@ -588,15 +602,16 @@ function classifyThrowsExpected(
       const valueNode = ts.isPropertyAssignment(named) ? named.initializer : named.name;
       const value = L.lowerExpr(valueNode);
       if (value.type.kind === "string") {
-        byId.set(id, { id, kind: "str", value, enameBake: null });
+        byId.set(id, { id, kind: "str", value, enameBake: null, isLiteral: false });
       } else if (value.type.kind === "regex") {
+        const isLit = ts.isRegularExpressionLiteral(valueNode);
         let bake: string | null = null;
-        if (ts.isRegularExpressionLiteral(valueNode)) {
+        if (isLit) {
           const text = valueNode.text;
           const cut = text.lastIndexOf("/");
           bake = `/${text.slice(1, cut)}/${regexFlagsGetterOrder(text.slice(cut + 1))}`;
         }
-        byId.set(id, { id, kind: "re", value, enameBake: bake });
+        byId.set(id, { id, kind: "re", value, enameBake: bake, isLiteral: isLit });
       } else {
         L.noLowering(
           `${surface} expected-object values of type '${L.fmt(value.type)}'`,
@@ -674,7 +689,7 @@ function lowerAssertThrows(L: Lowerer, expr: ts.CallExpression, loc: SrcLoc): Ir
   }
   const { expected, msg, hasMsg } = throwsArguments(L, "assert.throws", expr, loc);
   const helper = assertThrowsHelper(L, "throws", fn.type, false, expected, loc);
-  return { kind: "call", callee: helper, args: [fn, msg, hasMsg, ...expectedArgs(expected)], type: VOID, loc };
+  return { kind: "call", callee: helper, args: [fn, msg, hasMsg, ...expectedArgs(expected, loc)], type: VOID, loc };
 }
 
 /** assert.rejects / assert.doesNotReject: the async twins. The first
@@ -729,7 +744,7 @@ function lowerAssertRejects(
   return {
     kind: "call",
     callee: helper,
-    args: [recv, msg, hasMsg, ...expectedArgs(expected)],
+    args: [recv, msg, hasMsg, ...expectedArgs(expected, loc)],
     type: { kind: "promise", inner: VOID },
     loc,
   };
@@ -766,10 +781,21 @@ function throwsArguments(
 }
 
 /** The extra call-site arguments a form carries into its helper, in the
- * helper's own parameter order. */
-function expectedArgs(expected: ThrowsExpected): IrExpr[] {
-  if (expected.form === "regex") return [expected.value];
-  if (expected.form === "shape") return expected.keys.map((k) => k.value);
+ * helper's own parameter order. A "re" value additionally carries an
+ * isLiteral flag right after its own value (INC-24 P6 — see
+ * ThrowsShapeKey/ThrowsExpected's own comments on why this can't be
+ * recovered inside the, possibly call-site-shared, helper body). */
+function expectedArgs(expected: ThrowsExpected, loc: SrcLoc): IrExpr[] {
+  const flag = (value: boolean): IrExpr => ({ kind: "boolLit", value, type: BOOL, loc });
+  if (expected.form === "regex") return [expected.value, flag(expected.isLiteral)];
+  if (expected.form === "shape") {
+    const out: IrExpr[] = [];
+    for (const k of expected.keys) {
+      out.push(k.value);
+      if (k.kind === "re") out.push(flag(k.isLiteral));
+    }
+    return out;
+  }
   if (expected.form === "errValue") return [expected.value];
   return [];
 }
@@ -848,14 +874,29 @@ function assertThrowsHelper(
     { localId: "m.0", name: "m", type: STRING },
     { localId: "hm.0", name: "hm", type: BOOL },
   ];
+  // reLitParamId: the "regex" form's own isLiteral flag (INC-24 P6),
+  // paired with re.0 below the same way shapeLiteralParamIds pairs with
+  // shapeParamIds for the shape form's own "re" keys.
+  const reLitParamId = "reLit.0";
   const shapeParamIds: string[] = [];
-  if (expected.form === "regex") params.push({ localId: "re.0", name: "re", type: REGEX });
+  const shapeLiteralParamIds: (string | null)[] = [];
+  if (expected.form === "regex") {
+    params.push({ localId: "re.0", name: "re", type: REGEX });
+    params.push({ localId: reLitParamId, name: "reLit", type: BOOL });
+  }
   if (expected.form === "errValue") params.push({ localId: "ev.0", name: "ev", type: DYN });
   if (expected.form === "shape") {
     expected.keys.forEach((k, i) => {
       const localId = `k${i}.0`;
       shapeParamIds.push(localId);
       params.push({ localId, name: `k${i}`, type: k.kind === "str" ? STRING : REGEX });
+      if (k.kind === "re") {
+        const litId = `k${i}lit.0`;
+        shapeLiteralParamIds.push(litId);
+        params.push({ localId: litId, name: `k${i}lit`, type: BOOL });
+      } else {
+        shapeLiteralParamIds.push(null);
+      }
     });
   }
   const locals: { id: string; name: string; type: IrType; mutable: boolean }[] = params.map(
@@ -864,17 +905,23 @@ function assertThrowsHelper(
   locals.push({ id: "e.0", name: "e", type: CAUGHT, mutable: false });
 
   /** shapeBegin + one slot call per key (never throw; shapeEnd consumes
-   * the accumulator). */
+   * the accumulator). A "re" key's assert.shapeRe call carries its own
+   * isLiteral flag as a third argument (INC-24 P6). */
   const shapeSlotStmts = (): IrStmt[] => {
     if (expected.form !== "shape") return [];
     const stmts: IrStmt[] = [lib("assert.shapeBegin", [narrowed()])];
     expected.keys.forEach((k, i) => {
-      stmts.push(
-        lib(k.kind === "str" ? "assert.shapeStr" : "assert.shapeRe", [
-          num(k.id),
-          ref(shapeParamIds[i]!, k.kind === "str" ? STRING : REGEX),
-        ]),
-      );
+      if (k.kind === "str") {
+        stmts.push(lib("assert.shapeStr", [num(k.id), ref(shapeParamIds[i]!, STRING)]));
+      } else {
+        stmts.push(
+          lib("assert.shapeRe", [
+            num(k.id),
+            ref(shapeParamIds[i]!, REGEX),
+            ref(shapeLiteralParamIds[i]!, BOOL),
+          ]),
+        );
+      }
     });
     return stmts;
   };
@@ -921,7 +968,7 @@ function assertThrowsHelper(
               {
                 kind: "libCall",
                 fn: "assert.regexErrTest",
-                args: [ref("re.0", REGEX), narrowed()],
+                args: [ref("re.0", REGEX), narrowed(), ref(reLitParamId, BOOL)],
                 type: BOOL,
                 loc,
               },
@@ -957,7 +1004,7 @@ function assertThrowsHelper(
       case "regex":
         catchBody = [
           ifStmt(isInstance("%Error"), [
-            lib("assert.throwsRegex", [ref("re.0", REGEX), narrowed(), m(), hm()]),
+            lib("assert.throwsRegex", [ref("re.0", REGEX), narrowed(), m(), hm(), ref(reLitParamId, BOOL)]),
             doReturn,
           ]),
           rethrow,

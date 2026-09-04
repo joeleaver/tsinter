@@ -2969,6 +2969,49 @@ const TIER_FLOOR: string[] = [
   "2284-regexp-constructor.cjs",
   "2367-regexp-escape.ts",
   "2608-regex-named-groups.ts",
+  // Increment 24 P6 — the assert surface, THE INCREMENT'S LAST PASS:
+  // assert.match/doesNotMatch (ONE libCall, both spellings — a
+  // compile-time boolLit negate arg selects the lead-in text),
+  // assert.throwsRegex (assert.throws/rejects's regex-expectation
+  // mismatch — Node tests `regex.test(String(error))`; String(error) is
+  // built inline from the caught %Error's name/message fields, NOT
+  // errToStrHelper's own format, which appends a "[CODE]" bracket that
+  // Error.prototype.toString() never does), assert.shapeRe (a shape
+  // key's expected value can be a regex, on ANY of code/message/name —
+  // measured directly, not message-only as first assumed; shapeEndHelper's
+  // own EQ-computation and expected-side diff rendering now branch per
+  // slot on a runtime isRegexN flag, since one generic function serves
+  // every shapeBegin/shapeStr/shapeRe/shapeEnd call site), and
+  // assert.regexErrTest (doesNotReject's own regex-form predicate — pure
+  // boolean, no throw, shares String(error) and the regex-exec pattern
+  // with throwsRegex verbatim).
+  //
+  // BOTH of the brief's originally-scoped "corrected error arms" for
+  // assert.match (a non-string input; a non-regex pattern) turned out
+  // STRUCTURALLY UNREACHABLE through this backend — measured directly
+  // (four distinct source shapes): lower-assert.ts's own pre-existing
+  // lowerAssertMatch refuses both at the frontend, by name (SC1090/
+  // SC2020), before any libCall reaches this switch — a scope reduction,
+  // not a gap.
+  //
+  // F5-CONSISTENT VALUE-PATH TRAP, extended to all three new reaching
+  // methods (SEMANTICS.md S003's own amendment, extended not
+  // re-registered — a NEW reaching path into an ALREADY-registered
+  // divergence class): assert.match/doesNotMatch, assert.throwsRegex,
+  // and assert.shapeRe each MEASURED stateful for a value-bound
+  // GLOBAL/STICKY regex (assert.regexErrTest's own guard is identical in
+  // shape — measured via the same per-intrinsic discipline, condition
+  // #2 of P6's own GO). Literal receivers are excluded exactly as
+  // replace()'s own non-global guard excludes them.
+  //
+  // 781 -> 788, all seven originally-scoped claims.
+  "1600-assert-passing.ts",
+  "1606-assert-strict-module.ts",
+  "1607-assert-throws-match.ts",
+  "1608-cjs-assert/main.js",
+  "1721-assert-throws-regex-class.ts",
+  "1722-assert-rejects.ts",
+  "1723-assert-does-not-reject.ts",
 ];
 
 interface RunResult {

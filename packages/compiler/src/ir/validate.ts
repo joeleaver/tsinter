@@ -942,7 +942,18 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "assert.match": { argTypes: [STRING, REGEX, BOOL, STRING, BOOL], result: VOID },
   "assert.throwsNone": { argTypes: [BOOL, STRING, BOOL, STRING, BOOL], result: VOID },
   "assert.throwsMismatch": { argTypes: [STRING, { kind: "object", className: "%Error" }, STRING, BOOL], result: VOID },
-  "assert.throwsRegex": { argTypes: [REGEX, { kind: "object", className: "%Error" }, STRING, BOOL], result: VOID },
+  // The trailing BOOL is isLiteral (INC-24 P6) — was this call's own
+  // regex spelled as a literal at ITS OWN call site? The generated
+  // %assert.throws.N helper is deduped/shared across call sites with
+  // the same signature, so this can't be recovered from the regex
+  // argument's own IrExpr kind inside the helper body (a wrapper
+  // parameter ref there always, regardless of what the caller passed) —
+  // it must be threaded through as an explicit extra argument, computed
+  // per call site by lower-assert.ts's own classifyThrowsExpected.
+  "assert.throwsRegex": {
+    argTypes: [REGEX, { kind: "object", className: "%Error" }, STRING, BOOL, BOOL],
+    result: VOID,
+  },
   // Symbol strict equality (pointer identity; scr_symbol.c).
   "assert.eqSym": { argTypes: [{ kind: "symbol" }, { kind: "symbol" }, BOOL, BOOL, STRING, BOOL], result: VOID },
   // The equality quartet over checked-dynamic operands (the frontend
@@ -953,9 +964,14 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   // %Error-narrowed caught value.
   "assert.shapeBegin": { argTypes: [{ kind: "object", className: "%Error" }], result: VOID },
   "assert.shapeStr": { argTypes: [F64, STRING], result: VOID },
-  "assert.shapeRe": { argTypes: [F64, REGEX], result: VOID },
+  // Trailing BOOL is isLiteral, same rationale as assert.throwsRegex's
+  // own comment above.
+  "assert.shapeRe": { argTypes: [F64, REGEX, BOOL], result: VOID },
   "assert.shapeEnd": { argTypes: [STRING, BOOL], result: VOID },
-  "assert.regexErrTest": { argTypes: [REGEX, { kind: "object", className: "%Error" }], result: BOOL },
+  "assert.regexErrTest": {
+    argTypes: [REGEX, { kind: "object", className: "%Error" }, BOOL],
+    result: BOOL,
+  },
   "assert.unwantedRejection": { argTypes: [{ kind: "object", className: "%Error" }, STRING, BOOL], result: VOID },
   "assert.expectsErrDyn": { argTypes: [DYN, DYN, STRING, BOOL], result: VOID },
   // assert.ifError's typed entries (always throw; unit args never

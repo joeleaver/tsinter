@@ -9352,6 +9352,307 @@ test("F5 hard constraint: a LITERAL sticky-only regex at replace()'s own non-glo
   expect(stdout.toString("utf8")).toBe(["Xab", "abb", "aXb", "xab", "xX", "Xab", ""].join("\n"));
 });
 
+/* INC-24 P6: the assert surface reaches the SAME S003-amendment class
+ * through FOUR new sites — assert.match/doesNotMatch (ONE libCall/case,
+ * covers both spellings — the guard fires before the compile-time
+ * negate literal is even read, so one pin covers both), assert.
+ * throwsRegex (regex is the FIRST arg here, not the second), assert.
+ * shapeRe (a shape key's regex-valued expected side), and assert.
+ * regexErrTest (doesNotReject's own predicate). MEASURED directly for
+ * each (team-lead's GO condition #2 — statefulness is not carried by
+ * analogy): all four are stateful for a value-bound GLOBAL/STICKY
+ * regex. The guard fires unconditionally on ANY value-path GLOBAL/
+ * STICKY regex reaching these sites, before any exec runs.
+ *
+ * DISCRIMINATION, stated precisely (a real bug this pass's own first
+ * draft of these pins had): the trap-pin's own regex/subject pair MUST
+ * actually MATCH — a NON-matching sticky pattern (an earlier draft used
+ * `/boom/y` against `String(error)` = "Error: boom", which /boom/y
+ * never matches AT POSITION 0 regardless of any lastIndex state) throws
+ * a NORMAL, catchable AssertionError for an ORDINARY reason, and this
+ * tier ALSO implements an uncaught AssertionError as a wasm trap
+ * (%w.err.reportUncaught) — so `runWasmToTrap`'s bare "did a
+ * RuntimeError happen" check cannot tell "the guard fired" apart from
+ * "the program just genuinely threw something uncaught," and a pin
+ * built on a non-matching pair passes for the WRONG reason regardless
+ * of whether the guard exists at all. Every pin below uses a MATCHING
+ * pair instead: absent the guard, the call would succeed SILENTLY (or,
+ * for regexErrTest, hit a CATCHABLE outcome this pin explicitly
+ * catches) — so reaching "after" is impossible unless the guard is
+ * missing, and a trap can only mean the guard fired. */
+
+test("F5 (INC-24 P6): assert.match()/doesNotMatch() TRAPS for a sticky-ONLY value regex — ONE case handles both spellings (a compile-time negate literal), so this pin covers the shared guard site", async () => {
+  const res = await buildWasm(
+    "f5-assert-match-sticky.ts",
+    [
+      'import assert from "node:assert";',
+      "const re = /ab/y;", // matches "ab" at position 0 — absent the guard, succeeds silently
+      'console.log("before");',
+      'assert.match("ab", re);',
+      'console.log("after");',
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasmToTrap(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("before\n");
+});
+
+test("F5 (INC-24 P6): assert.throws()'s regex form TRAPS for a sticky-ONLY value regex — regex is the FIRST arg here (assert.match's own is the second), a genuinely different reaching path", async () => {
+  const res = await buildWasm(
+    "f5-assert-throws-regex-sticky.ts",
+    [
+      'import assert from "node:assert";',
+      // /Error: boom/y matches String(error) = "Error: boom" AT POSITION
+      // 0 — absent the guard, assert.throws succeeds silently (no throw
+      // at all), reaching "after" cleanly.
+      "const re = /Error: boom/y;",
+      'console.log("before");',
+      'assert.throws(() => { throw new Error("boom"); }, re);',
+      'console.log("after");',
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasmToTrap(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("before\n");
+});
+
+test("F5 (INC-24 P6): assert.throws()'s shape form TRAPS for a sticky-ONLY value regex bound to a shape key's expected value — MEASURED directly that Node itself is stateful here too (the shape comparator's own regex.test(), same class), not inferred from the other three", async () => {
+  const res = await buildWasm(
+    "f5-assert-shape-re-sticky.ts",
+    [
+      'import assert from "node:assert";',
+      // The shape comparator's "message" key tests the RAW err.message
+      // field ("boom"), NOT String(error) ("Error: boom") — a genuinely
+      // different comparator from assert.throwsRegex's own (found
+      // building this pin's own safe control below, a real bug in an
+      // earlier draft's choice of pattern). /boom/y matches "boom" at
+      // position 0 — absent the guard, succeeds silently.
+      "const re = /boom/y;",
+      'console.log("before");',
+      'assert.throws(() => { throw new Error("boom"); }, { message: re });',
+      'console.log("after");',
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasmToTrap(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("before\n");
+});
+
+test("F5 (INC-24 P6): assert.doesNotReject()'s regex form (assert.regexErrTest, a pure predicate) TRAPS for a sticky-ONLY value regex", async () => {
+  const res = await buildWasm(
+    "f5-assert-regexerrtest-sticky.ts",
+    [
+      'import assert from "node:assert";',
+      // Matching, so absent the guard doesNotReject would reach its own
+      // "Got unwanted rejection" arm — a CATCHABLE AssertionError, which
+      // this pin's own try/catch swallows (the callback here MUST throw
+      // to reach assert.regexErrTest's case at all, so EVERY no-guard
+      // outcome is some catchable exception — this wrapping is what
+      // makes "reaches after" mean "the guard is missing," not the bare
+      // trap-or-not check alone).
+      "const re = /Error: boom/y;",
+      "async function main(): Promise<void> {",
+      '  console.log("before");',
+      "  try {",
+      '    await assert.doesNotReject(async () => { throw new Error("boom"); }, re);',
+      "  } catch {",
+      '    console.log("caught (guard absent)");',
+      "  }",
+      '  console.log("after");',
+      "}",
+      "main();",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasmToTrap(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("before\n");
+});
+
+test("F5 safe controls (INC-24 P6): LITERAL sticky regexes at ALL FOUR new sites — assert.match, assert.throws's regex form, assert.throws's shape form, AND assert.doesNotReject's regex form (regexErrTest) — are UNGUARDED BY DESIGN and Node-exact, each spelled fresh at its own call site, matching the same literal-exclusion argument as the {test,exec,match,replace} pins above. (rev-24's own P6 gate, advisory 1: the first draft's title and this findings line both claimed all four sites while the body exercised only three — doesNotReject/regexErrTest, one of the two sites in emitter.ts's own dropsIsLiteral list, appeared zero times, and no corpus claim covers it either since no P6 claim passes a g/y regex to any assert. Fixed by adding the fourth block below, rev's own witness taken verbatim.)", async () => {
+  const res = await buildWasm(
+    "f5-assert-literal-safe.ts",
+    [
+      'import assert from "node:assert";',
+      // match: literal /ab/y re-spelled at each call, both PASS (fresh
+      // RegExp per literal evaluation, lastIndex never carried).
+      'assert.match("ab", /ab/y);',
+      'assert.match("ab", /ab/y);',
+      'console.log("match ok");',
+      // throws regex form: literal /Error: boom/y re-spelled, both PASS
+      // (matches String(error) = "Error: boom" at position 0 every time).
+      'assert.throws(() => { throw new Error("boom"); }, /Error: boom/y);',
+      'assert.throws(() => { throw new Error("boom"); }, /Error: boom/y);',
+      'console.log("throws ok");',
+      // shape form: literal /boom/y re-spelled, both PASS — the shape
+      // comparator's "message" key tests the RAW err.message ("boom"),
+      // not String(error) (see the shape trap pin's own comment above).
+      'assert.throws(() => { throw new Error("boom"); }, { message: /boom/y });',
+      'assert.throws(() => { throw new Error("boom"); }, { message: /boom/y });',
+      'console.log("shape ok");',
+      // doesNotReject's regex form (assert.regexErrTest) — the block rev
+      // found missing. A LITERAL sticky regex reaching the "unwanted
+      // rejection" arm: the callback matches, doesNotReject throws its
+      // own CATCHABLE AssertionError (caught here), and — since it is a
+      // literal, unguarded by design — execution reaches "after" cleanly
+      // instead of trapping. rev's own witness, verbatim.
+      "async function main(): Promise<void> {",
+      '  console.log("before");',
+      "  try {",
+      '    await assert.doesNotReject(async () => { throw new Error("boom"); }, /Error: boom/y);',
+      "  } catch {",
+      '    console.log("caught (guard absent)");',
+      "  }",
+      '  console.log("after");',
+      "}",
+      "main();",
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    ["match ok", "throws ok", "shape ok", "before", "caught (guard absent)", "after", ""].join("\n"),
+  );
+});
+
+test("assert.match/doesNotMatch (INC-24 P6): the custom-message arm (3rd argument) replaces the generated text on failure — no corpus claim exercises this arm; MEASURED against Node, byte-exact, both spellings; also closes the class+code identity requirement (AssertionError/ERR_ASSERTION) — team-lead's own P6 ruling — since a custom message alone does not distinguish an AssertionError from any other thrown Error by TEXT, this pin reads .name/.code directly off the caught value (NodeJS.ErrnoException — the static Error type has no .code; a plain `any` cast REFUSES here by name, SC1090, matching the earlier operator/generatedMessage finding's own shape)", async () => {
+  const res = await buildWasm(
+    "assert-match-custom-msg.ts",
+    [
+      'import assert from "node:assert";',
+      "function checkIdentity(f: () => void): void {",
+      "  try {",
+      "    f();",
+      '    console.log("DID NOT THROW");',
+      "  } catch (e) {",
+      "    const err = e as NodeJS.ErrnoException;",
+      '    console.log(JSON.stringify(err.message), err.name, err.code);',
+      "  }",
+      "}",
+      'checkIdentity(() => assert.match("abc", /xyz/, "custom message here"));',
+      'checkIdentity(() => assert.doesNotMatch("abc", /b/, "custom dnm"));',
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      '"custom message here" AssertionError ERR_ASSERTION',
+      '"custom dnm" AssertionError ERR_ASSERTION',
+      "",
+    ].join("\n"),
+  );
+});
+
+test("assert.match/doesNotMatch (INC-24 P6): the generated message renders a regex.new-constructed regex through the SAME normalization P5 already built — an empty pattern (/(?:)/) and an escaped-slash source (/a\\/b/) — reused, not re-derived, for the regex embedded in this message", async () => {
+  const res = await buildWasm(
+    "assert-match-regexnew-normalize.ts",
+    [
+      'import assert from "node:assert";',
+      "function msg(f: () => void): string {",
+      "  try {",
+      "    f();",
+      '    return "NO THROW";',
+      "  } catch (e) {",
+      '    return e instanceof Error ? e.message : "not an Error";',
+      "  }",
+      "}",
+      'console.log(JSON.stringify(msg(() => assert.doesNotMatch("abc", new RegExp("")))));',
+      'console.log(JSON.stringify(msg(() => assert.match("xyz", new RegExp("a/b")))));',
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    [
+      JSON.stringify("The input was expected to not match the regular expression /(?:)/. Input:\n\n'abc'\n"),
+      JSON.stringify("The input did not match the regular expression /a\\/b/. Input:\n\n'xyz'\n"),
+      "",
+    ].join("\n"),
+  );
+});
+
+test("assert.shapeRe (INC-24 P6): a regex-valued shape key that did NOT match renders as the RAW regex (not quoted) in the Comparison diff — 1720-assert-throws-shape.ts's own \"C\" case (a corpus claim currently out of THIS pass's own scope for unrelated reasons — the fs errno code slots — but its own regex-diff mechanism is exactly what assert.shapeRe builds here), byte-exact against Node", async () => {
+  const res = await buildWasm(
+    "shape-re-mismatch-render.ts",
+    [
+      'import assert from "node:assert";',
+      "function msg(f: () => void): string {",
+      "  try {",
+      "    f();",
+      '    return "NO THROW";',
+      "  } catch (e) {",
+      '    return e instanceof Error ? e.message : "not an Error";',
+      "  }",
+      "}",
+      'console.log(JSON.stringify(msg(() => assert.throws(() => { throw new RangeError("boom"); }, { name: /Type/ }))));',
+    ].join("\n"),
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(
+    JSON.stringify(
+      "Expected values to be strictly deep-equal:\n+ actual - expected\n\n  Comparison {\n+   name: 'RangeError'\n-   name: /Type/\n  }\n",
+    ) + "\n",
+  );
+});
+
+/* INC-24 P6: assert.match's brief originally scoped TWO "corrected error
+ * arms" as runtime cases this backend would need (a non-string input; a
+ * non-regex pattern). MEASURED directly (stop-and-report, team-lead
+ * confirmed): BOTH are structurally unreachable — lower-assert.ts's own
+ * pre-existing lowerAssertMatch (built in an earlier increment)
+ * type-checks the input to STRING and the pattern to REGEX BEFORE any
+ * libCall reaches this switch at all, so no runtime check belongs in
+ * this case. These pins assert the BUILT-subject diagnostics — a
+ * masking hazard team-lead's own review caught: at the P6 BASE (before
+ * this case existed), the blanket "libCall:assert.match" refusal
+ * (SC3001, the case doesn't exist yet) would have masked whatever fires
+ * downstream, so a base-measured diagnostic here would be asserting the
+ * MASK, not the real frontend refusal — these pins run against the
+ * compiler with this case actually landed, exactly the subject a reader
+ * will build against from here on. */
+
+test("assert.match (INC-24 P6, error-arm reachability): a non-string input refuses at the FRONTEND, before this case ever runs — SC1090, measured on the BUILT subject", async () => {
+  const res = await buildWasm(
+    "nonstring-refusal.ts",
+    ['import assert from "node:assert";', "assert.match(42 as unknown as string, /x/);"].join("\n"),
+  );
+  expect(res.ok).toBe(false);
+  if (res.ok) return;
+  expect(res.diagnostics[0]?.code).toBe("SC1090");
+  expect(res.diagnostics[0]?.message).toBe("'number' values where 'string' is expected is not supported yet");
+});
+
+test("assert.match (INC-24 P6, error-arm reachability): a non-regex pattern refuses at the FRONTEND, before this case ever runs — SC2020, measured on the BUILT subject", async () => {
+  const res = await buildWasm(
+    "nonregex-refusal.ts",
+    ['import assert from "node:assert";', 'assert.match("abc", "notregex" as unknown as RegExp);'].join("\n"),
+  );
+  expect(res.ok).toBe(false);
+  if (res.ok) return;
+  expect(res.diagnostics[0]?.code).toBe("SC2020");
+  expect(res.diagnostics[0]?.message).toBe(
+    "'assert.match with a non-regex pattern' is part of the standard library types but has no scriptc lowering yet",
+  );
+});
+
+test("assert.match (INC-24 P6, error-arm reachability): an any-typed flow (both arguments any, at a call site that would otherwise be well-typed) refuses TWICE — SC2020 AND SC1101 together — measured on the BUILT subject; a base-measured probe here would have reported ONLY the mask (SC3001), which is exactly what happened before this case landed and had to be reconciled with rev's own independent measurement", async () => {
+  const res = await buildWasm(
+    "anyflow-refusal.ts",
+    [
+      'import assert from "node:assert";',
+      "function f(x: any, y: any): void {",
+      "  assert.match(x, y);",
+      "}",
+      "f(42, /x/);",
+    ].join("\n"),
+  );
+  expect(res.ok).toBe(false);
+  if (res.ok) return;
+  const codes = res.diagnostics.map((d) => d.code).sort();
+  expect(codes).toEqual(["SC1101", "SC2020"]);
+});
+
 test("value-path-flag matrix completion: search() is safe across ALL FOUR flag combinations (Symbol.search saves/forces-0/restores lastIndex every call regardless of flags — measured against Node for none/g/y/gy, byte-exact here too)", async () => {
   const res = await buildWasm(
     "matrix-search.ts",

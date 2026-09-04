@@ -22842,6 +22842,10 @@ class Assembler {
           code.globalSet(this.shapePresentGlobal(slot));
           code.refNull(this.strType);
           code.globalSet(this.shapeValGlobal(slot));
+          code.i32Const(0);
+          code.globalSet(this.shapeIsRegexGlobal(slot));
+          code.refNull(this.regex.regexType);
+          code.globalSet(this.shapeRegexValGlobal(slot));
         }
         return true;
       }
@@ -22861,6 +22865,65 @@ class Assembler {
         const slot = keyArg.value;
         this.walkExpr(e.args[1]!);
         code.globalSet(this.shapeValGlobal(slot));
+        code.i32Const(1);
+        code.globalSet(this.shapePresentGlobal(slot));
+        return true;
+      }
+      // (keyId, regex) -> void. One regex-valued expected key
+      // (`{ code/message/name: /pattern/ }` — MEASURED directly: Node
+      // accepts a regex on ANY of the 3 keys, not just message; the
+      // ACTUAL side always renders as a plain quoted string regardless
+      // — only the EXPECTED side's rendering and comparator branch on
+      // this). keyId is compile-time-literal exactly as shapeStr's own.
+      //
+      // F5-CONSISTENT VALUE-PATH TRAP: MEASURED directly — a value-bound
+      // GLOBAL/STICKY regex reused across repeated assert.throws calls
+      // in a shape key is stateful on the Node side too (2nd/3rd calls
+      // diverge from the 1st), same S003-amendment class as assert.
+      // match/throwsRegex above; literal-spelled regexes are excluded
+      // exactly the same way (fresh RegExp per literal evaluation, no
+      // lastIndex to carry).
+      case "assert.shapeRe": {
+        const keyArg = e.args[0]!;
+        if (keyArg.kind !== "numLit") {
+          throw new Error(
+            "wasm emitter bug: assert.shapeRe's keyId must be a compile-time literal (lower-assert.ts's own construction)",
+          );
+        }
+        const slot = keyArg.value;
+        const regexRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.regexType };
+        const reLocal = this.acquireScratch(regexRefT);
+        this.walkExpr(e.args[1]!);
+        code.localSet(reLocal);
+        // isLiteral (arg 2) is a RUNTIME i32 here, not a compile-time
+        // regexLit check — this call sits inside a %assert.throws.N
+        // helper the frontend DEDUPES/SHARES across every call site with
+        // the same (mode, recvType, sig) key, so the wasm case can never
+        // see the original call site's own expression kind (lower-
+        // assert.ts's own ThrowsShapeKey/expectedArgs comments). A REAL
+        // bug this pass's own F5 safe-controls unit pin caught directly
+        // (a literal /boom/y traps regardless of the dead compile-time
+        // check) before this fix.
+        const isLiteralLocal = this.acquireScratch(I32);
+        this.walkExpr(e.args[2]!);
+        code.localSet(isLiteralLocal);
+        const bcRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.bcType };
+        const bcLocal = this.acquireScratch(bcRefT);
+        code.localGet(reLocal);
+        code.structGet(this.regex.regexType, 2); // bytecode
+        code.localSet(bcLocal);
+        code.localGet(isLiteralLocal);
+        this.releaseScratch(I32, isLiteralLocal);
+        code.i32Eqz();
+        this.openIf(); // !isLiteral -> value path, guard needed
+        this.emitRegexValueFlagGuard(code, bcLocal, LRE_FLAG_GLOBAL | LRE_FLAG_STICKY);
+        this.close();
+        this.releaseScratch(bcRefT, bcLocal);
+        code.localGet(reLocal);
+        code.globalSet(this.shapeRegexValGlobal(slot));
+        this.releaseScratch(regexRefT, reLocal);
+        code.i32Const(1);
+        code.globalSet(this.shapeIsRegexGlobal(slot));
         code.i32Const(1);
         code.globalSet(this.shapePresentGlobal(slot));
         return true;
@@ -23377,6 +23440,409 @@ class Assembler {
         this.releaseScratch(dynRefT, expectedLocal);
         this.releaseScratch(strRefT, msgLocal);
         this.releaseScratch(I32, hasMsgLocal);
+        return true;
+      }
+      // (input, regex, negate, msg, hasMsg) -> void. assert.match/
+      // doesNotMatch — ONE libCall for both spellings (lower-assert.ts's
+      // own lowerAssertMatch, ALREADY LANDED in an earlier increment;
+      // only this wasm case was ever missing): `negate` selects the
+      // generated lead-in text and is ALWAYS a compile-time boolLit (the
+      // ONE producer of this libCall bakes it in directly), matching the
+      // SAME "must be compile-time" contract assert.shapeStr's own keyId
+      // arg already established.
+      //
+      // BOTH of INC-24 P6's own "corrected error arms" (a non-string
+      // input; a non-regex pattern) are STRUCTURALLY UNREACHABLE here —
+      // measured directly (three source shapes: an explicit cast on the
+      // pattern, an explicit cast on the input, and an any-typed flow
+      // wrapper — the last refuses TWICE, SC2020 AND SC1101 together):
+      // lowerAssertMatch's own `lowerExprExpecting(..., STRING)` and
+      // `re.type.kind !== "regex"` checks refuse at the frontend, by
+      // name, before any libCall reaches this switch at all. MEASURED ON
+      // THE BUILT SUBJECT (this case landed) — the base's own blanket
+      // "libCall:assert.match" refusal (the case didn't exist yet) masks
+      // these frontend diagnostics, a hazard caught by team-lead's own
+      // review; the refusal pins below assert the built-subject codes,
+      // not the masked ones. BY DESIGN, this case therefore emits NO
+      // runtime type check for either arm — it relies entirely on the
+      // frontend's own type-level guarantee that input is STRING and
+      // pattern is REGEX by the time a call reaches here. If that
+      // frontend boundary ever moves, THIS case is what silently breaks
+      // (no handler, no diagnostic) — the refusal pins below exist to
+      // notice exactly that, not to document dead code.
+      //
+      // F5-CONSISTENT VALUE-PATH TRAP (INC-24 P6, brief-p6-v2 §5):
+      // MEASURED directly against live Node — assert.match/doesNotMatch
+      // DOES advance lastIndex for a value-path GLOBAL or STICKY regex
+      // (a second call with the SAME regex value fails where the first
+      // passed; the discriminating shape, not just lastIndex moving).
+      // This tier has no lastIndex field on any regex value, so the
+      // SAME S003-amendment class this pass's own {test,exec,match}
+      // guard already covers applies here too — a NEW reaching path
+      // into an ALREADY-registered divergence, not a new one. LITERAL
+      // receivers are EXCLUDED exactly as replace()'s own non-global
+      // guard excludes them (`e.args[1]!.kind !== "regexLit"` below,
+      // mirroring SEMANTICS.md's own S003 amendment text precisely,
+      // including its own reasoning: Node builds a fresh RegExp per
+      // literal evaluation, this tier interns one immortal with no
+      // lastIndex field, so NEITHER side has state to carry between two
+      // literal-spelled calls even in a loop).
+      case "assert.match": {
+        const strRefT = this.strRef;
+        const regexRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.regexType };
+        const bcRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.bcType };
+
+        const inputLocal = this.acquireScratch(strRefT);
+        this.walkExpr(e.args[0]!);
+        code.localSet(inputLocal);
+
+        const reLocal = this.acquireScratch(regexRefT);
+        this.walkExpr(e.args[1]!);
+        code.localSet(reLocal);
+
+        const bcLocal = this.acquireScratch(bcRefT);
+        code.localGet(reLocal);
+        code.structGet(this.regex.regexType, 2); // bytecode
+        code.localSet(bcLocal);
+
+        if (e.args[1]!.kind !== "regexLit") {
+          this.emitRegexValueFlagGuard(code, bcLocal, LRE_FLAG_GLOBAL | LRE_FLAG_STICKY);
+        }
+
+        // registerCount+captureCount sizing, exactly regexIntrinsic:test's
+        // own pattern (emitter.ts's own "test" case, above).
+        const countLocal = this.acquireScratch(I32);
+        code.localGet(bcLocal);
+        code.i32Const(RE_HEADER_REGISTER_COUNT);
+        code.call(this.regexInterp.readU8());
+        code.i32Const(1);
+        code.i32Add();
+        code.i32Const(1);
+        code.i32ShrU();
+        code.localGet(reLocal);
+        code.structGet(this.regex.regexType, 3); // captureCount
+        code.i32Add();
+        code.localSet(countLocal);
+
+        const matchedLocal = this.acquireScratch(I32);
+        code.localGet(bcLocal);
+        code.localGet(inputLocal);
+        // startIndex is always 0 — exactly regexIntrinsic:test's own
+        // rationale (that case's own doc comment above): a value-path
+        // regex carrying a stateful flag now traps via the guard just
+        // emitted, so nothing reaching this point could have a runtime
+        // lastIndex a constant 0 would get wrong.
+        code.i32Const(0);
+        code.localGet(countLocal);
+        code.call(this.regexInterp.newCaptureArray());
+        code.call(this.regexInterp.exec());
+        code.localSet(matchedLocal);
+        this.releaseScratch(I32, countLocal);
+        this.releaseScratch(bcRefT, bcLocal);
+
+        const negateExpr = e.args[2]!;
+        if (negateExpr.kind !== "boolLit") {
+          throw new Error(
+            "wasm emitter bug: assert.match's negate arg must be a compile-time literal (lower-assert.ts's own construction)",
+          );
+        }
+        const negated = negateExpr.value;
+
+        // holds = matched !== negated (negated false: holds means
+        // MATCHED; negated true: holds means it did NOT match).
+        code.localGet(matchedLocal);
+        code.i32Const(negated ? 1 : 0);
+        code.i32Xor(); // holds
+        code.i32Eqz(); // !holds
+        this.releaseScratch(I32, matchedLocal);
+        this.openIf(); // !holds -> assertion failure
+        const msgLocal = this.acquireScratch(strRefT);
+        this.walkExpr(e.args[3]!);
+        code.localSet(msgLocal);
+        const hasMsgLocal = this.acquireScratch(I32);
+        this.walkExpr(e.args[4]!);
+        code.localSet(hasMsgLocal);
+
+        code.localGet(hasMsgLocal);
+        this.releaseScratch(I32, hasMsgLocal);
+        this.openIfResult(strRefT);
+        code.localGet(msgLocal);
+        code.else_();
+        // The generated message (§6.4, byte-exact): lead-in text
+        // (selected by `negated`, compile-time) + the regex rendered
+        // /source/flags (RegexBuilder.inspectHelper(), P5's own
+        // insp.regex mechanism — REUSED, not re-derived) + the literal
+        // ". Input:\n\n" + the input rendered through Node's own quote
+        // ladder (%w.insp.str — REUSED) + a trailing "\n".
+        this.pushStrLitInto(
+          code,
+          negated
+            ? "The input was expected to not match the regular expression "
+            : "The input did not match the regular expression ",
+        );
+        code.localGet(reLocal);
+        code.call(this.regex.inspectHelper());
+        code.call(this.concatHelper());
+        this.pushStrLitInto(code, ". Input:\n\n");
+        code.call(this.concatHelper());
+        code.localGet(inputLocal);
+        code.call(this.insp.str());
+        code.call(this.concatHelper());
+        this.pushStrLitInto(code, "\n");
+        code.call(this.concatHelper());
+        this.close();
+        const finalMsgLocal = this.acquireScratch(strRefT);
+        code.localSet(finalMsgLocal);
+        this.releaseScratch(strRefT, msgLocal);
+        this.emitSetCellError(code, "%Error", "AssertionError", (c) => c.localGet(finalMsgLocal), "ERR_ASSERTION");
+        this.emitUnwind();
+        this.releaseScratch(strRefT, finalMsgLocal);
+        this.close();
+
+        this.releaseScratch(regexRefT, reLocal);
+        this.releaseScratch(strRefT, inputLocal);
+        return true;
+      }
+      // (regex, err, msg, hasMsg, isLiteral) -> void. assert.throws(fn,
+      // regex) / assert.rejects(fn, regex) mismatch — the caught error
+      // did not match. Node tests `regex.test(String(error))`, so this
+      // REUSES EXACTLY assert.match's own regex-exec-and-message
+      // machinery (case above) against a COMPUTED "input" — String
+      // (error), built inline below from the caught %Error struct's own
+      // name/message fields (`${name}: ${message}`, or bare `${name}`
+      // when message is empty — MEASURED against live Node, confirmed
+      // .name-based not .constructor.name-based, matching throwsMismatch's
+      // own comment above; NOT errToStrHelper's format below, which
+      // appends a "[CODE]" bracket that Error.prototype.toString() itself
+      // never does — that helper renders a DIFFERENT thing, util.inspect's
+      // own header line, not this).
+      //
+      // ALWAYS a "must match" test — this libCall has no negate arg (no
+      // regex form of assert.doesNotThrow exists in this tier's IR).
+      //
+      // Same F5-consistent value-path trap as assert.match (comment
+      // above); the regex is arg 0 here, not arg 1. UNLIKE assert.match,
+      // this call sits inside a %assert.throws.N helper the frontend
+      // DEDUPES/SHARES across every call site with the same (mode,
+      // recvType, "regex") signature — the wasm case can never recover
+      // "was THIS call site's regex a literal" from e.args[0]'s own IR
+      // kind (always a wrapper-parameter ref there). isLiteral (arg 4)
+      // carries that fact through as an explicit RUNTIME i32 instead,
+      // computed per call site by lower-assert.ts. A REAL bug this
+      // pass's own F5 safe-controls unit pin caught directly (the
+      // original `e.args[0]!.kind !== "regexLit"` compile-time check was
+      // always true here, over-trapping every literal call) before this
+      // fix.
+      case "assert.throwsRegex": {
+        const errT = this.exc().errT;
+        const errRefT: ValType = { kind: "ref", nullable: true, typeIndex: errT };
+        const strRefT = this.strRef;
+        const regexRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.regexType };
+        const bcRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.bcType };
+
+        const reLocal = this.acquireScratch(regexRefT);
+        this.walkExpr(e.args[0]!);
+        code.localSet(reLocal);
+
+        const errLocal = this.acquireScratch(errRefT);
+        this.walkExpr(e.args[1]!);
+        code.localSet(errLocal);
+
+        const msgLocal = this.acquireScratch(strRefT);
+        this.walkExpr(e.args[2]!);
+        code.localSet(msgLocal);
+        const hasMsgLocal = this.acquireScratch(I32);
+        this.walkExpr(e.args[3]!);
+        code.localSet(hasMsgLocal);
+
+        // String(error): name, or "name: message" when message is
+        // non-empty (mirrors throwsMismatch's own ERR_MESSAGE/arrayLen
+        // emptiness check above; concatHelper REUSED as in assert.match).
+        const stringifiedLocal = this.acquireScratch(strRefT);
+        code.localGet(errLocal);
+        code.structGet(errT, ERR_MESSAGE);
+        code.arrayLen();
+        this.openIfResult(strRefT);
+        code.localGet(errLocal);
+        code.structGet(errT, ERR_NAME);
+        this.pushStrLitInto(code, ": ");
+        code.call(this.concatHelper());
+        code.localGet(errLocal);
+        code.structGet(errT, ERR_MESSAGE);
+        code.call(this.concatHelper());
+        code.else_();
+        code.localGet(errLocal);
+        code.structGet(errT, ERR_NAME);
+        this.close();
+        code.localSet(stringifiedLocal);
+
+        const isLiteralLocal = this.acquireScratch(I32);
+        this.walkExpr(e.args[4]!);
+        code.localSet(isLiteralLocal);
+
+        const bcLocal = this.acquireScratch(bcRefT);
+        code.localGet(reLocal);
+        code.structGet(this.regex.regexType, 2); // bytecode
+        code.localSet(bcLocal);
+
+        code.localGet(isLiteralLocal);
+        this.releaseScratch(I32, isLiteralLocal);
+        code.i32Eqz();
+        this.openIf(); // !isLiteral -> value path, guard needed
+        this.emitRegexValueFlagGuard(code, bcLocal, LRE_FLAG_GLOBAL | LRE_FLAG_STICKY);
+        this.close();
+
+        const countLocal = this.acquireScratch(I32);
+        code.localGet(bcLocal);
+        code.i32Const(RE_HEADER_REGISTER_COUNT);
+        code.call(this.regexInterp.readU8());
+        code.i32Const(1);
+        code.i32Add();
+        code.i32Const(1);
+        code.i32ShrU();
+        code.localGet(reLocal);
+        code.structGet(this.regex.regexType, 3); // captureCount
+        code.i32Add();
+        code.localSet(countLocal);
+
+        const matchedLocal = this.acquireScratch(I32);
+        code.localGet(bcLocal);
+        code.localGet(stringifiedLocal);
+        // startIndex is always 0 — same rationale as assert.match's own
+        // case above (the value-path guard just emitted rules out any
+        // carried lastIndex reaching this point).
+        code.i32Const(0);
+        code.localGet(countLocal);
+        code.call(this.regexInterp.newCaptureArray());
+        code.call(this.regexInterp.exec());
+        code.localSet(matchedLocal);
+        this.releaseScratch(I32, countLocal);
+        this.releaseScratch(bcRefT, bcLocal);
+
+        code.localGet(matchedLocal);
+        code.i32Eqz(); // !matched -> failure (no negate arg on this libCall)
+        this.releaseScratch(I32, matchedLocal);
+        this.openIf();
+
+        code.localGet(hasMsgLocal);
+        this.releaseScratch(I32, hasMsgLocal);
+        this.openIfResult(strRefT);
+        code.localGet(msgLocal);
+        code.else_();
+        // Same generated-message shape as assert.match's own failure
+        // message (comment above) — always the "did not match" lead-in
+        // (no negated form exists here), against the COMPUTED
+        // String(error) instead of a plain input.
+        this.pushStrLitInto(code, "The input did not match the regular expression ");
+        code.localGet(reLocal);
+        code.call(this.regex.inspectHelper());
+        code.call(this.concatHelper());
+        this.pushStrLitInto(code, ". Input:\n\n");
+        code.call(this.concatHelper());
+        code.localGet(stringifiedLocal);
+        code.call(this.insp.str());
+        code.call(this.concatHelper());
+        this.pushStrLitInto(code, "\n");
+        code.call(this.concatHelper());
+        this.close();
+        const finalMsgLocal = this.acquireScratch(strRefT);
+        code.localSet(finalMsgLocal);
+        this.releaseScratch(strRefT, msgLocal);
+        this.emitSetCellError(code, "%Error", "AssertionError", (c) => c.localGet(finalMsgLocal), "ERR_ASSERTION");
+        this.emitUnwind();
+        this.releaseScratch(strRefT, finalMsgLocal);
+        this.close();
+
+        this.releaseScratch(strRefT, stringifiedLocal);
+        this.releaseScratch(errRefT, errLocal);
+        this.releaseScratch(regexRefT, reLocal);
+        return true;
+      }
+      // (regex, err, isLiteral) -> bool. doesNotReject's own regex-form
+      // predicate (`re.test(String(error))`, no throw — doesNotReject's
+      // own control flow decides "unwanted rejection" vs "rethrow raw"
+      // from the result, lower-assert.ts's own ifStmt above). Shares
+      // String(error) construction and the regex-exec pattern with
+      // assert.throwsRegex verbatim (comment above) — the ONLY
+      // difference is this leaves the matched i32 on the stack as the
+      // BOOL result instead of throwing on failure. isLiteral (arg 2) is
+      // the SAME runtime-threaded flag assert.throwsRegex's own comment
+      // explains — this call is ALSO wrapper-shared, not call-site
+      // specific, so e.args[0]'s own IR kind can never answer "was this
+      // call site's regex a literal" here either.
+      case "assert.regexErrTest": {
+        const errT = this.exc().errT;
+        const errRefT: ValType = { kind: "ref", nullable: true, typeIndex: errT };
+        const strRefT = this.strRef;
+        const regexRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.regexType };
+        const bcRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.bcType };
+
+        const reLocal = this.acquireScratch(regexRefT);
+        this.walkExpr(e.args[0]!);
+        code.localSet(reLocal);
+
+        const errLocal = this.acquireScratch(errRefT);
+        this.walkExpr(e.args[1]!);
+        code.localSet(errLocal);
+
+        const isLiteralLocal = this.acquireScratch(I32);
+        this.walkExpr(e.args[2]!);
+        code.localSet(isLiteralLocal);
+
+        const stringifiedLocal = this.acquireScratch(strRefT);
+        code.localGet(errLocal);
+        code.structGet(errT, ERR_MESSAGE);
+        code.arrayLen();
+        this.openIfResult(strRefT);
+        code.localGet(errLocal);
+        code.structGet(errT, ERR_NAME);
+        this.pushStrLitInto(code, ": ");
+        code.call(this.concatHelper());
+        code.localGet(errLocal);
+        code.structGet(errT, ERR_MESSAGE);
+        code.call(this.concatHelper());
+        code.else_();
+        code.localGet(errLocal);
+        code.structGet(errT, ERR_NAME);
+        this.close();
+        code.localSet(stringifiedLocal);
+        this.releaseScratch(errRefT, errLocal);
+
+        const bcLocal = this.acquireScratch(bcRefT);
+        code.localGet(reLocal);
+        code.structGet(this.regex.regexType, 2); // bytecode
+        code.localSet(bcLocal);
+
+        code.localGet(isLiteralLocal);
+        this.releaseScratch(I32, isLiteralLocal);
+        code.i32Eqz();
+        this.openIf(); // !isLiteral -> value path, guard needed
+        this.emitRegexValueFlagGuard(code, bcLocal, LRE_FLAG_GLOBAL | LRE_FLAG_STICKY);
+        this.close();
+
+        const countLocal = this.acquireScratch(I32);
+        code.localGet(bcLocal);
+        code.i32Const(RE_HEADER_REGISTER_COUNT);
+        code.call(this.regexInterp.readU8());
+        code.i32Const(1);
+        code.i32Add();
+        code.i32Const(1);
+        code.i32ShrU();
+        code.localGet(reLocal);
+        code.structGet(this.regex.regexType, 3); // captureCount
+        code.i32Add();
+        code.localSet(countLocal);
+
+        code.localGet(bcLocal);
+        code.localGet(stringifiedLocal);
+        code.i32Const(0); // startIndex — same rationale as assert.match/throwsRegex above
+        code.localGet(countLocal);
+        code.call(this.regexInterp.newCaptureArray());
+        code.call(this.regexInterp.exec()); // -> i32, 1/0 — the BOOL result, left on the stack
+        this.releaseScratch(I32, countLocal);
+        this.releaseScratch(bcRefT, bcLocal);
+        this.releaseScratch(strRefT, stringifiedLocal);
+        this.releaseScratch(regexRefT, reLocal);
         return true;
       }
       default:
@@ -24726,6 +25192,19 @@ class Assembler {
   private shapePresent0G: number | null = null;
   private shapePresent1G: number | null = null;
   private shapePresent2G: number | null = null;
+  // INC-24 P6: a shape key's expected value can be a regex, per-key
+  // (lower-assert.ts's own `k.kind === "str" ? shapeStr : shapeRe`
+  // dispatch — measured directly, ALL THREE of code/message/name accept
+  // a regex on the Node side, not just message). isRegexNG discriminates
+  // which val the slot actually holds; regexVal0/1/2G is the PARALLEL
+  // regex-typed storage (shapeValNG stays string-typed and unused for a
+  // regex-carrying slot).
+  private shapeIsRegex0G: number | null = null;
+  private shapeIsRegex1G: number | null = null;
+  private shapeIsRegex2G: number | null = null;
+  private shapeRegexVal0G: number | null = null;
+  private shapeRegexVal1G: number | null = null;
+  private shapeRegexVal2G: number | null = null;
 
   private shapeErrGlobal(errT: number): number {
     if (this.shapeErrG === null) {
@@ -24759,6 +25238,28 @@ class Assembler {
     return this[field]!;
   }
 
+  private shapeIsRegexGlobal(slot: number): number {
+    const field = (["shapeIsRegex0G", "shapeIsRegex1G", "shapeIsRegex2G"] as const)[slot]!;
+    if (this[field] === null) {
+      this[field] = this.mb.addGlobal(I32, true, (w) => {
+        w.u8(0x41);
+        w.sleb(0);
+      });
+    }
+    return this[field]!;
+  }
+
+  private shapeRegexValGlobal(slot: number): number {
+    const field = (["shapeRegexVal0G", "shapeRegexVal1G", "shapeRegexVal2G"] as const)[slot]!;
+    if (this[field] === null) {
+      this[field] = this.mb.addGlobal({ kind: "ref", nullable: true, typeIndex: this.regex.regexType }, true, (w) => {
+        w.u8(0xd0);
+        w.sleb(this.regex.regexType);
+      });
+    }
+    return this[field]!;
+  }
+
   private shapeEndFunc: number | null = null;
 
   /** %w.assert.shapeEnd(msg, hasMsg) → void — Node's expectedException
@@ -24771,15 +25272,20 @@ class Assembler {
    * value-mismatched key renders "+laterKey, -code, -laterKey", NOT
    * "-code, +laterKey, -laterKey" — a simpler per-key-order shortcut
    * was tried first and DISPROVED by this measurement before this
-   * function was written the way it is now). shapeRe never runs in P1
-   * (stays refusing by name), so every slot here is string-valued:
-   * `inspect` is unconditionally true, matching C's own hardcoded
-   * `true` for the actual side and the `!is_re` simplification for the
-   * expected side. Sets the exception cell itself (unlike eqFail/
-   * neqFail, which only build a string) because the "match vs mismatch"
-   * decision lives entirely inside this one generic function — the
-   * caller (assert.shapeEnd's case arm) just calls this then
-   * `emitPendingCheck()`, the ordinary may-throw-call discipline. */
+   * function was written the way it is now). INC-24 P6: a slot can now
+   * carry a regex expected value (assert.shapeRe, above) — per slot,
+   * `shapeIsRegexGlobal` picks the comparator (regex .test() vs
+   * strEqHelper) AND the expected-side render (raw `/src/flags` via
+   * regex.inspectHelper() vs the quoted-string ladder); the ACTUAL side
+   * is unaffected either way — MEASURED against Node directly: the
+   * actual value always renders as a plain quoted string regardless of
+   * what the expected side is. The LCS/diff-walk stage below this needs
+   * NO knowledge of any of this — it operates purely on the already
+   * fully-rendered alines/elines strings. Sets the exception cell itself
+   * (unlike eqFail/neqFail, which only build a string) because the
+   * "match vs mismatch" decision lives entirely inside this one generic
+   * function — the caller (assert.shapeEnd's case arm) just calls this
+   * then `emitPendingCheck()`, the ordinary may-throw-call discipline. */
   private shapeEndHelper(): number {
     if (this.shapeEndFunc !== null) return this.shapeEndFunc;
     const errT = this.exc().errT;
@@ -24794,6 +25300,12 @@ class Assembler {
     const present0 = this.shapePresentGlobal(0);
     const present1 = this.shapePresentGlobal(1);
     const present2 = this.shapePresentGlobal(2);
+    const isRegex0 = this.shapeIsRegexGlobal(0);
+    const isRegex1 = this.shapeIsRegexGlobal(1);
+    const isRegex2 = this.shapeIsRegexGlobal(2);
+    const regexVal0 = this.shapeRegexValGlobal(0);
+    const regexVal1 = this.shapeRegexValGlobal(1);
+    const regexVal2 = this.shapeRegexValGlobal(2);
     const c = new Code();
     const MSG = 0;
     const HASMSG = 1;
@@ -24818,6 +25330,35 @@ class Assembler {
     const LINEMARK = 20;
     const DIFFMARK = 21;
     const RESULT = 22;
+    const REBC = 23;
+    const RECNT = 24;
+
+    // pushes an i32 (1/0) — regexValG's own compiled pattern tested
+    // against the actual field named by structField. Reused per slot;
+    // REBC/RECNT are scratch, never live across two calls of this.
+    const emitRegexEq = (structField: number, regexValG: number): void => {
+      c.globalGet(regexValG);
+      c.structGet(this.regex.regexType, 2); // bytecode
+      c.localSet(REBC);
+      c.localGet(REBC);
+      c.i32Const(RE_HEADER_REGISTER_COUNT);
+      c.call(this.regexInterp.readU8());
+      c.i32Const(1);
+      c.i32Add();
+      c.i32Const(1);
+      c.i32ShrU();
+      c.globalGet(regexValG);
+      c.structGet(this.regex.regexType, 3); // captureCount
+      c.i32Add();
+      c.localSet(RECNT);
+      c.localGet(REBC);
+      c.globalGet(errGlobal);
+      c.structGet(errT, structField);
+      c.i32Const(0); // startIndex
+      c.localGet(RECNT);
+      c.call(this.regexInterp.newCaptureArray());
+      c.call(this.regexInterp.exec());
+    };
 
     // ── stage 1: present flags + per-key equality ──
     c.globalGet(present0);
@@ -24841,31 +25382,49 @@ class Assembler {
     c.localSet(AP0);
     c.localGet(AP0);
     c.ifVoid();
+    c.globalGet(isRegex0);
+    c.ifVoid();
+    emitRegexEq(ERR_CODE, regexVal0);
+    c.localSet(EQ0);
+    c.else_();
     c.localGet(CODEACT);
     c.globalGet(val0);
     c.call(this.strEqHelper());
     c.localSet(EQ0);
     c.end();
     c.end();
+    c.end();
     c.i32Const(0);
     c.localSet(EQ1);
     c.localGet(P1_);
     c.ifVoid();
+    c.globalGet(isRegex1);
+    c.ifVoid();
+    emitRegexEq(ERR_MESSAGE, regexVal1);
+    c.localSet(EQ1);
+    c.else_();
     c.globalGet(errGlobal);
     c.structGet(errT, ERR_MESSAGE);
     c.globalGet(val1);
     c.call(this.strEqHelper());
     c.localSet(EQ1);
     c.end();
+    c.end();
     c.i32Const(0);
     c.localSet(EQ2);
     c.localGet(P2);
     c.ifVoid();
+    c.globalGet(isRegex2);
+    c.ifVoid();
+    emitRegexEq(ERR_NAME, regexVal2);
+    c.localSet(EQ2);
+    c.else_();
     c.globalGet(errGlobal);
     c.structGet(errT, ERR_NAME);
     c.globalGet(val2);
     c.call(this.strEqHelper());
     c.localSet(EQ2);
+    c.end();
     c.end();
 
     // ── MATCH = every present key is actual-present AND value-equal ──
@@ -24917,6 +25476,18 @@ class Assembler {
       c.globalSet(val1);
       c.refNull(this.strType);
       c.globalSet(val2);
+      c.i32Const(0);
+      c.globalSet(isRegex0);
+      c.i32Const(0);
+      c.globalSet(isRegex1);
+      c.i32Const(0);
+      c.globalSet(isRegex2);
+      c.refNull(this.regex.regexType);
+      c.globalSet(regexVal0);
+      c.refNull(this.regex.regexType);
+      c.globalSet(regexVal1);
+      c.refNull(this.regex.regexType);
+      c.globalSet(regexVal2);
     };
 
     c.localGet(MATCH);
@@ -24945,7 +25516,19 @@ class Assembler {
     c.i32Const(0);
     c.localSet(EN);
 
-    const buildLine = (keyName: string, pushValue: () => void, pushIsLast: () => void): void => {
+    // regexBranch is non-null ONLY on the expected (elines) side, where a
+    // slot's value may be a regex — MEASURED: that renders RAW `/src/
+    // flags` (regex.inspectHelper(), no quote ladder), picked at RUNTIME
+    // via the slot's own isRegexN flag (shapeEndHelper is ONE generic
+    // function serving every call, so this can't be a compile-time
+    // choice). The actual side never needs this — MEASURED: it always
+    // renders as a plain quoted string regardless of the expected side.
+    const buildLine = (
+      keyName: string,
+      pushStrValue: () => void,
+      pushIsLast: () => void,
+      regexBranch: { isRegexG: number; pushRegexValue: () => void } | null,
+    ): void => {
       this.insp.pushMark(c);
       c.localSet(LINEMARK);
       this.pushStrLitInto(c, "  ");
@@ -24954,11 +25537,26 @@ class Assembler {
       c.call(this.insp.ibPuts());
       this.pushStrLitInto(c, ": ");
       c.call(this.insp.ibPuts());
-      pushValue();
-      c.i32Const(0);
-      pushValue();
-      c.arrayLen();
-      c.call(this.insp.quoteInto());
+      if (regexBranch !== null) {
+        c.globalGet(regexBranch.isRegexG);
+        c.ifVoid();
+        regexBranch.pushRegexValue();
+        c.call(this.regex.inspectHelper());
+        c.call(this.insp.ibPuts());
+        c.else_();
+        pushStrValue();
+        c.i32Const(0);
+        pushStrValue();
+        c.arrayLen();
+        c.call(this.insp.quoteInto());
+        c.end();
+      } else {
+        pushStrValue();
+        c.i32Const(0);
+        pushStrValue();
+        c.arrayLen();
+        c.call(this.insp.quoteInto());
+      }
       pushIsLast();
       c.i32Eqz();
       c.ifVoid();
@@ -24987,7 +25585,10 @@ class Assembler {
     c.localGet(EN);
     c.i32Const(1);
     c.i32Add();
-    buildLine("code", () => c.globalGet(val0), isLastFrom(0));
+    buildLine("code", () => c.globalGet(val0), isLastFrom(0), {
+      isRegexG: isRegex0,
+      pushRegexValue: () => c.globalGet(regexVal0),
+    });
     c.arraySet(strArrT);
     c.localGet(EN);
     c.i32Const(1);
@@ -24999,7 +25600,7 @@ class Assembler {
     c.localGet(AN);
     c.i32Const(1);
     c.i32Add();
-    buildLine("code", () => c.localGet(CODEACT), isLastFrom(0));
+    buildLine("code", () => c.localGet(CODEACT), isLastFrom(0), null);
     c.arraySet(strArrT);
     c.localGet(AN);
     c.i32Const(1);
@@ -25015,7 +25616,10 @@ class Assembler {
     c.localGet(EN);
     c.i32Const(1);
     c.i32Add();
-    buildLine("message", () => c.globalGet(val1), isLastFrom(1));
+    buildLine("message", () => c.globalGet(val1), isLastFrom(1), {
+      isRegexG: isRegex1,
+      pushRegexValue: () => c.globalGet(regexVal1),
+    });
     c.arraySet(strArrT);
     c.localGet(EN);
     c.i32Const(1);
@@ -25032,6 +25636,7 @@ class Assembler {
         c.structGet(errT, ERR_MESSAGE);
       },
       isLastFrom(1),
+      null,
     );
     c.arraySet(strArrT);
     c.localGet(AN);
@@ -25046,7 +25651,10 @@ class Assembler {
     c.localGet(EN);
     c.i32Const(1);
     c.i32Add();
-    buildLine("name", () => c.globalGet(val2), isLastFrom(2));
+    buildLine("name", () => c.globalGet(val2), isLastFrom(2), {
+      isRegexG: isRegex2,
+      pushRegexValue: () => c.globalGet(regexVal2),
+    });
     c.arraySet(strArrT);
     c.localGet(EN);
     c.i32Const(1);
@@ -25063,6 +25671,7 @@ class Assembler {
         c.structGet(errT, ERR_NAME);
       },
       isLastFrom(2),
+      null,
     );
     c.arraySet(strArrT);
     c.localGet(AN);
@@ -25384,6 +25993,8 @@ class Assembler {
         I32, // LINEMARK
         I32, // DIFFMARK
         this.strRef, // RESULT
+        { kind: "ref", nullable: true, typeIndex: this.regex.bcType }, // REBC
+        I32, // RECNT
       ],
       c.bytes(),
     );

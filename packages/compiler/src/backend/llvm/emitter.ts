@@ -12030,9 +12030,18 @@ class LlEmitter {
       B.line(`${t} = load ptr, ptr ${slot}`);
       return this.own({ name: t, type: e.type });
     }
+    // assert.throwsRegex/regexErrTest's trailing arg (INC-24 P6) is
+    // isLiteral — a WASM-LANE-ONLY concern (the wasm regex value has no
+    // lastIndex field, so a value-path stateful regex must trap; this
+    // native lane's regex engine carries real state and needs no such
+    // guard at all, exactly like shapeRe/shapeStr's own key-int special
+    // case above already drops what it doesn't need). Dropped here,
+    // before the generic dispatcher below — never forwarded to the C
+    // runtime, same shape as that existing precedent.
+    const dropsIsLiteral = e.fn === "assert.throwsRegex" || e.fn === "assert.regexErrTest";
     const sym = LIB_FN_SYMS[e.fn];
     if (sym === undefined) throw new LlvmUnsupportedError(`libCall:${e.fn}`, e.loc);
-    const args = e.args.map((a) => this.emitExpr(a));
+    const args = (dropsIsLiteral ? e.args.slice(0, -1) : e.args).map((a) => this.emitExpr(a));
     const argDecls = args.map((a) => {
       const ty = this.llType(a.type);
       return ty === "i1" ? "i1 zeroext" : ty;

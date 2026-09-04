@@ -71,6 +71,18 @@ would fail by construction): the wasm emitter unit test covers it instead
 (OOB read, OOB write, and a non-integer index, per S003's own "cannot be
 differential-tested" note). **Tested by:** the wasm emitter unit test.
 
+**FORWARD POINTER (added at INC-24's own close-out, rev-24's own gate finding on the P6 freeze):**
+two further amendments to THIS entry — a regex VALUE reaching a lastIndex-consulting method with a
+stateful GLOBAL/STICKY flag (increment 24 P4) and the assert surface reaching the same class
+through four new sites (increment 24 P6) — are filed roughly 5,000 lines below, immediately after
+S067's own "Board #119" line, not here. They are S003's own by content (both amendments cite this
+entry explicitly) but sit in S067's own document position by structure, unlike every other
+amendment in this file, which lives inside its own entry. That placement is PRE-EXISTING from P4
+(P6 simply followed it) and is left as-is here — relocating ~5,000 lines of content carries more
+risk than the reader problem it would solve — but a reader arriving at S003 looking for the
+class-wide value-path regex trap should search this file for "Amendment (increment 24" rather than
+assume this entry's own text above is the complete account.
+
 ## S004 — Node platform APIs are refused, not emulated
 
 The static tier compiles the language and core stdlib (`Math`, `String`,
@@ -5129,3 +5141,48 @@ discriminates fine): a witness is valid when the SECOND call's answer would DIFF
 `lastIndex` had advanced, or when the flag changes the result SHAPE (match's own `g`) — never the
 "abab"/"aaa" shape that reads identically whether the defect exists or not, REGARDLESS of how many times
 the pattern happens to match.
+
+**Amendment (increment 24 P6, the assert surface reaches the same class through FOUR new sites):**
+`assert.match`/`assert.doesNotMatch` (ONE libCall/case handles both spellings — a compile-time boolLit
+selects the lead-in text only, downstream of the guard, so a value-path GLOBAL/STICKY regex traps
+identically for either spelling), `assert.throws`/`assert.rejects`'s regex form (`assert.throwsRegex` —
+Node tests `regex.test(String(error))`, the SAME `.test()`-shaped mechanism as the original four sites, just
+against a computed subject instead of a plain one), `assert.throws`'s shape form's own regex-valued keys
+(`assert.shapeRe` — `{ code/message/name: /pattern/ }`; MEASURED directly that Node's own shape comparator
+is ALSO stateful for a value-bound GLOBAL/STICKY regex here, not inferred from the other three), and
+`assert.doesNotReject`'s regex form (`assert.regexErrTest`, a pure boolean predicate with no throw of its
+own — `doesNotReject`'s OWN control flow decides "unwanted rejection" vs "rethrow raw" from the result).
+MASK is the SAME `GLOBAL|STICKY` combination as the original four sites for all four of these (measured per
+site, not carried by analogy — team-lead's own GO condition for this pass).
+
+A GENUINELY NEW MECHANICAL WRINKLE, not present in the original four sites: `assert.throwsRegex`/
+`assert.shapeRe`/`assert.regexErrTest` (NOT `assert.match`, which lowers directly at its own call site) run
+inside a `%assert.throws.N`/`%assert.rejects.N`/`%assert.dnr.N` helper the frontend DEDUPES and SHARES
+across every call site with the same (mode, receiver-type, expected-signature) key — for the "regex" and
+"shape" forms that key does not depend on what a given call site's own regex expression was, so MULTIPLE
+call sites, some literal, some value-bound, can and do funnel into the exact same generated helper body. The
+literal-exclusion check the original four sites use (`e.args[N].kind !== "regexLit"`, read directly off the
+libCall's own IR argument) is a COMPILE-TIME fact about THAT expression at THAT position — but inside a
+shared helper, the regex argument is always a wrapper PARAMETER reference, never the original call site's
+own expression, for every invocation regardless of what the caller actually passed. isLiteral is threaded
+through as an EXPLICIT extra runtime argument instead (computed per call site by lower-assert.ts's own
+`classifyThrowsExpected`/shape-key classification, carried as a wrapper parameter exactly like `msg`/
+`hasMsg` already are, and consumed as a RUNTIME i32 branch in the wasm case rather than a compile-time IR-
+kind check). A FIRST BUILD of these three cases used the ORIGINAL compile-time-kind pattern verbatim,
+copied from `assert.match`'s own case — WHICH IS ALWAYS TRUE for a wrapper-parameter reference, so the
+guard fired UNCONDITIONALLY on every call, literal or not, over-trapping a literal `/pattern/y` that Node
+(and the original four sites' own exclusion) handles fine. Caught by this pass's own "F5 safe controls" unit
+pin — which called the LITERAL forms of `assert.throws`'s regex and shape forms and asserted they complete
+Node-exact, exactly the same shape as the original "F5 hard constraint" pin already does for `replace()`'s
+own literal receiver — not assumed safe from the code's own shape.
+
+**Tested by:** the wasm emitter unit tests "F5 (INC-24 P6)" — one pin per site (`assert.match`/
+`doesNotMatch`, `assert.throwsRegex`, `assert.shapeRe`, `assert.regexErrTest`), each using a regex/subject
+pair that Node ITSELF matches (so, absent the guard, the call would succeed silently or hit a catchable
+outcome the pin's own try/catch swallows) — a non-matching pair cannot discriminate here, since this tier
+implements an uncaught `AssertionError` as a wasm trap too (`%w.err.reportUncaught`), so a bare "did a trap
+happen" check passes for a genuine mismatch exactly as readily as for the guard firing; an earlier draft of
+these pins used a non-matching pair for three of the four and could not have caught the wrapper-sharing bug
+above even though all four appeared to pass — and "F5 safe controls (INC-24 P6)" (the literal forms at all
+four sites, byte-exact, the pin that actually found that bug) — all `packages/compiler/test/wasm-emitter.
+test.ts`.
