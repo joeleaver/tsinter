@@ -11246,6 +11246,44 @@ class Assembler {
           code.call(this.regex.escapeHelper());
           return;
         }
+        if (e.fn === "global.undefRead") {
+          // INC-25 rider R0 (design-number-v4.txt f7327c29, §7.2/§6.5): a
+          // read of an ambient `declare`d binding NOTHING defines — Node
+          // erases the declaration entirely, so the access throws Node's
+          // own catchable ReferenceError "<name> is not defined". args[0]
+          // is always a compile-time strLit (the four frontend sites
+          // that construct this libCall — lower-exprs.ts, lower-
+          // namespaces.ts's nsUndefRead, lower-enums.ts's two sites —
+          // never build it any other way). Exactly the TDZ site's shape
+          // (:9121) at a different message: emitSetCellErrorLit + a
+          // literal message, then emitUnwind. Nothing is pushed for the
+          // typed-dummy result (nodes.ts:3199-3204, "the value never
+          // exists") — the SAME never-materialized precedent as
+          // error.nodeThrow (:10969): emitUnwind's branch/return makes
+          // whatever the caller emits next unreachable code, which
+          // wasm's validator accepts regardless of stack shape. Axis 4
+          // (the callee throws before its call's arguments evaluate)
+          // needs no special handling here either, but not for the
+          // reason a first read of callValue suggests: for a call
+          // rooted at an ambient name (`mystery(arg())`), lower-calls.ts
+          // ambientUndefVarRootOf's check at the TOP of lowerCall
+          // (:2725) fires FIRST and replaces the WHOLE call expression
+          // with this libCall directly — `arg()` is never lowered into
+          // IR at all, so there is no argument-walking code for the
+          // backend to ever run (measured directly: disabling the
+          // LATER ambientUndefinedFnSymbolOf shortcut at lower-calls.ts
+          // :3698 changes nothing, because ambientUndefVarRootOf already
+          // claimed the call before that point is ever reached).
+          const nameArg = e.args[0]!;
+          if (nameArg.kind !== "strLit") {
+            throw new Error(
+              "wasm emitter bug: global.undefRead's name arg must be a compile-time literal (the frontend's own construction)",
+            );
+          }
+          this.emitSetCellErrorLit("%Error", "ReferenceError", `${nameArg.value} is not defined`, null);
+          this.emitUnwind();
+          return;
+        }
         if (this.emitBufferLibCall(e)) return;
         if (this.emitTimerCall(e)) return;
         if (this.emitEmitterLibCall(e)) return;

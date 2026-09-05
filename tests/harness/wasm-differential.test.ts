@@ -3012,6 +3012,34 @@ const TIER_FLOOR: string[] = [
   "1721-assert-throws-regex-class.ts",
   "1722-assert-rejects.ts",
   "1723-assert-does-not-reject.ts",
+  // Increment 25, rider R0 (the ambient `declare` read): a read of an
+  // ambient `declare`d binding NOTHING defines — Node erases the
+  // declaration entirely, so the access throws Node's own catchable
+  // ReferenceError "<name> is not defined" — the TDZ site's shape
+  // (emitter.ts:9121) at a different message, reached through four
+  // pre-existing frontend sites that already lowered to
+  // `libCall:global.undefRead` (ir/nodes.ts:3199-3204's typed dummy).
+  // The largest single first-refusal bucket in the tier: one intrinsic,
+  // pure language, no ABI, no register entry, no IR signature widened.
+  // All eight axes of design-number-v4.txt §6.5 pinned in
+  // wasm-undefread.test.ts (six original plus the two rev-25 found: a
+  // default-parameter initializer, and a class-field initializer).
+  // 788 -> 803.
+  "1581-declare-const-read.ts",
+  "1832-enum-modules/main.ts",
+  "1850-overload-basics.ts",
+  "1854-ambient-declare-fn.ts",
+  "1855-ambient-declare-fn-uncaught.ts",
+  "1965-namespace-ambient.ts",
+  "1967-namespace-alias-typeonly.ts",
+  "2194-ambient-undef-chains.ts",
+  "2353-decorators-member-ambient.ts",
+  "2354-decorators-expression-ambient.ts",
+  "2591-ambient-generic-traps.ts",
+  "2592-ambient-trap-uncaught.ts",
+  "2614-trap-binding-later-writes.ts",
+  "2635-trap-binding-unmappable-written.ts",
+  "2636-trap-binding-ambient-rooted-rewrite.ts",
 ];
 
 interface RunResult {
