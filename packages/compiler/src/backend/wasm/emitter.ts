@@ -11618,6 +11618,28 @@ class Assembler {
           return;
         }
         // ── end INC-25 P2 ────────────────────────────────────────────
+        // ── INC-25 pass P3: the parsers (design-number-v6.txt §2.4/
+        // §7.4) — each arm calls the EXISTING helper the island path
+        // already reaches, now fixed on every radix (board #123/#123b).
+        // F-1 (the alphabet sweep's own transfer condition): these are
+        // the ONLY three call sites, verified by this very source read. */
+        if (e.fn === "num.parseInt") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.parseIntHelper());
+          return;
+        }
+        if (e.fn === "num.parseFloat") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.parseFloatHelper());
+          return;
+        }
+        if (e.fn === "num.fromString") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.strToNumHelper());
+          return;
+        }
+        // ── end INC-25 P3 ────────────────────────────────────────────
         if (this.emitBufferLibCall(e)) return;
         if (this.emitTimerCall(e)) return;
         if (this.emitEmitterLibCall(e)) return;
@@ -29167,19 +29189,547 @@ class Assembler {
     return idx;
   }
 
+  private radixIntPow2Func: number | null = null;
+
+  /** %w.radixIntPow2(s, start, end, log2radix) -> (f64 value, i32 endPos) —
+   * INC-25 P3 arm (b): `InternalStringToIntDouble<log2radix>`, transcribed
+   * from V8's conversions.cc (nodejs/node tag v24.18.1, deps/v8/src/
+   * numbers/conversions.cc, sha256 723ff7b60237b16d194cc66418cee6179435
+   * c63ceb7f5ab923f4fd2406cb9114, lines 192-288 on the vendored copy at
+   * impl-p3/vendor/conversions.cc): skip leading zeros; accumulate into an
+   * i64 until bit 53 would be set; round HALF-TO-EVEN against the dropped
+   * bits with a `zero_tail` STICKY flag over the remaining digits; handle
+   * the carry a round-up can push back over 2^53; scale by 2^exponent (no
+   * wasm ldexp instruction, so this builds the power of two directly from
+   * its IEEE754 bit pattern, clamped to +Infinity once the true exponent
+   * cannot fit any finite double). `log2radix` is a RUNTIME value (1..5)
+   * here, not a C++ template parameter — every shift/mask below already
+   * works with a runtime shift amount. SIGN is the CALLER's business
+   * (parseIntHelper multiplies by SIGN afterward, exactly as it already
+   * does for the old radixScanPrefixHelper's result): this function always
+   * returns a NON-NEGATIVE magnitude, 0, or NaN. `endPos` (the second
+   * result, reusing local I) is `start` when nothing was consumed;
+   * radixScanWholeHelper (0x/0o/0b) checks it against `end` for the
+   * "trailing garbage invalidates the WHOLE literal" rule — a PREFIX
+   * caller (parseInt) simply drops it. */
+  private radixIntPow2Helper(): number {
+    if (this.radixIntPow2Func !== null) return this.radixIntPow2Func;
+    const idx = this.mb.declareFunc(
+      this.mb.funcType([this.strRef, I32, I32, I32], [F64, I32]),
+      "%w.radixIntPow2",
+    );
+    this.radixIntPow2Func = idx;
+    const c = new Code();
+    const S = 0,
+      START = 1,
+      END = 2,
+      LOG2RADIX = 3;
+    const RADIX = 4,
+      I = 5,
+      D = 6,
+      NUMBER = 7,
+      EXPONENT = 8,
+      OVERFLOW = 9,
+      OVERFLOW_BITS = 10,
+      DROPPED = 11,
+      ZEROTAIL = 12,
+      MIDDLE = 13;
+
+    c.i32Const(1);
+    c.localGet(LOG2RADIX);
+    c.i32Shl();
+    c.localSet(RADIX);
+    c.localGet(START);
+    c.localSet(I);
+
+    c.localGet(START);
+    c.localGet(END);
+    c.i32Eq();
+    c.ifResult(F64);
+    c.f64Const(CANONICAL_NAN);
+    c.else_();
+    {
+      c.localGet(S);
+      c.localGet(I);
+      c.arrayGetU(this.strType);
+      c.call(this.digitValHelper());
+      c.localSet(D);
+      c.localGet(D);
+      c.i32Const(0);
+      c.i32LtS();
+      c.localGet(D);
+      c.localGet(RADIX);
+      c.i32GeS();
+      c.i32Or();
+      c.ifResult(F64);
+      c.f64Const(CANONICAL_NAN);
+      c.else_();
+      {
+        // Skip leading zeros.
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(END);
+        c.i32GeS();
+        c.brIf(1);
+        c.localGet(S);
+        c.localGet(I);
+        c.arrayGetU(this.strType);
+        c.i32Const(0x30);
+        c.i32Ne();
+        c.brIf(1);
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+
+        c.localGet(I);
+        c.localGet(END);
+        c.i32Eq();
+        c.ifResult(F64);
+        c.f64Const(0);
+        c.else_();
+        {
+          c.i64Const(0n);
+          c.localSet(NUMBER);
+          c.i32Const(0);
+          c.localSet(EXPONENT);
+          // Main accumulation loop: consume digits into NUMBER until
+          // overflow (bit 53) or a non-digit/end is reached.
+          c.block(); // label 1: done accumulating
+          c.loop(); // label 0: next digit
+          c.localGet(I);
+          c.localGet(END);
+          c.i32GeS();
+          c.brIf(1);
+          c.localGet(S);
+          c.localGet(I);
+          c.arrayGetU(this.strType);
+          c.call(this.digitValHelper());
+          c.localSet(D);
+          c.localGet(D);
+          c.i32Const(0);
+          c.i32LtS();
+          c.localGet(D);
+          c.localGet(RADIX);
+          c.i32GeS();
+          c.i32Or();
+          c.brIf(1);
+          // NUMBER = (NUMBER << log2radix) | D; I++.
+          c.localGet(NUMBER);
+          c.localGet(LOG2RADIX);
+          c.i64ExtendI32S();
+          c.i64Shl();
+          c.localGet(D);
+          c.i64ExtendI32S();
+          c.i64Or();
+          c.localSet(NUMBER);
+          c.localGet(I);
+          c.i32Const(1);
+          c.i32Add();
+          c.localSet(I);
+          // Overflow check: NUMBER >> 53 (unsigned) != 0.
+          c.localGet(NUMBER);
+          c.i64Const(53n);
+          c.i64ShrU();
+          c.localTee(OVERFLOW);
+          c.i64Eqz();
+          c.brIf(0); // no overflow yet: keep accumulating
+          // Overflow: compute the excess bit count V8's own way (a
+          // shift-count loop, not a derived clz formula).
+          c.i32Const(1);
+          c.localSet(OVERFLOW_BITS);
+          c.block();
+          c.loop();
+          c.localGet(OVERFLOW);
+          c.i64Const(1n);
+          c.i64GtU();
+          c.i32Eqz();
+          c.brIf(1);
+          c.localGet(OVERFLOW_BITS);
+          c.i32Const(1);
+          c.i32Add();
+          c.localSet(OVERFLOW_BITS);
+          c.localGet(OVERFLOW);
+          c.i64Const(1n);
+          c.i64ShrU();
+          c.localSet(OVERFLOW);
+          c.br(0);
+          c.end();
+          c.end();
+          // DROPPED = NUMBER & ((1<<OVERFLOW_BITS)-1); NUMBER >>=
+          // OVERFLOW_BITS; EXPONENT = OVERFLOW_BITS.
+          c.localGet(NUMBER);
+          c.i64Const(1n);
+          c.localGet(OVERFLOW_BITS);
+          c.i64ExtendI32S();
+          c.i64Shl();
+          c.i64Const(1n);
+          c.i64Sub();
+          c.i64And();
+          c.localSet(DROPPED);
+          c.localGet(NUMBER);
+          c.localGet(OVERFLOW_BITS);
+          c.i64ExtendI32S();
+          c.i64ShrU();
+          c.localSet(NUMBER);
+          c.localGet(OVERFLOW_BITS);
+          c.localSet(EXPONENT);
+          // Keep consuming digits WITHOUT touching NUMBER: track
+          // zero_tail and grow EXPONENT by log2radix per digit.
+          c.i32Const(1);
+          c.localSet(ZEROTAIL);
+          c.block();
+          c.loop();
+          c.localGet(I);
+          c.localGet(END);
+          c.i32GeS();
+          c.brIf(1);
+          c.localGet(S);
+          c.localGet(I);
+          c.arrayGetU(this.strType);
+          c.call(this.digitValHelper());
+          c.localSet(D);
+          c.localGet(D);
+          c.i32Const(0);
+          c.i32LtS();
+          c.localGet(D);
+          c.localGet(RADIX);
+          c.i32GeS();
+          c.i32Or();
+          c.brIf(1);
+          c.localGet(D);
+          c.i32Const(0);
+          c.i32Ne();
+          c.ifVoid();
+          c.i32Const(0);
+          c.localSet(ZEROTAIL);
+          c.end();
+          c.localGet(EXPONENT);
+          c.localGet(LOG2RADIX);
+          c.i32Add();
+          c.localSet(EXPONENT);
+          c.localGet(I);
+          c.i32Const(1);
+          c.i32Add();
+          c.localSet(I);
+          c.br(0);
+          c.end();
+          c.end();
+          // Round half-to-even against MIDDLE = 1 << (OVERFLOW_BITS-1).
+          c.i64Const(1n);
+          c.localGet(OVERFLOW_BITS);
+          c.i32Const(1);
+          c.i32Sub();
+          c.i64ExtendI32S();
+          c.i64Shl();
+          c.localSet(MIDDLE);
+          c.localGet(DROPPED);
+          c.localGet(MIDDLE);
+          c.i64GtU();
+          c.ifVoid();
+          c.localGet(NUMBER);
+          c.i64Const(1n);
+          c.i64Add();
+          c.localSet(NUMBER);
+          c.else_();
+          c.localGet(DROPPED);
+          c.localGet(MIDDLE);
+          c.i64Eq();
+          c.ifVoid();
+          c.localGet(NUMBER);
+          c.i64Const(1n);
+          c.i64And();
+          c.i64Eqz();
+          c.i32Eqz(); // (NUMBER & 1) != 0
+          c.localGet(ZEROTAIL);
+          c.i32Eqz(); // !zero_tail
+          c.i32Or();
+          c.ifVoid();
+          c.localGet(NUMBER);
+          c.i64Const(1n);
+          c.i64Add();
+          c.localSet(NUMBER);
+          c.end();
+          c.end();
+          c.end();
+          // Post-round carry into bit 53.
+          c.localGet(NUMBER);
+          c.i64Const(1n << 53n);
+          c.i64And();
+          c.i64Eqz();
+          c.i32Eqz();
+          c.ifVoid();
+          c.localGet(EXPONENT);
+          c.i32Const(1);
+          c.i32Add();
+          c.localSet(EXPONENT);
+          c.localGet(NUMBER);
+          c.i64Const(1n);
+          c.i64ShrU();
+          c.localSet(NUMBER);
+          c.end();
+          c.br(1); // done: overflow branch complete
+          c.end(); // end loop
+          c.end(); // end block (main accumulation)
+
+          // Result: NUMBER is exact (< 2^53); scale by 2^EXPONENT if set.
+          c.localGet(EXPONENT);
+          c.i32Eqz();
+          c.ifResult(F64);
+          c.localGet(NUMBER);
+          c.f64ConvertI64U();
+          c.else_();
+          c.localGet(NUMBER);
+          c.f64ConvertI64U();
+          c.localGet(EXPONENT);
+          c.i32Const(1024);
+          c.i32GeS();
+          c.ifResult(F64);
+          c.f64Const(Infinity);
+          c.else_();
+          c.i64Const(1023n);
+          c.localGet(EXPONENT);
+          c.i64ExtendI32S();
+          c.i64Add();
+          c.i64Const(52n);
+          c.i64Shl();
+          c.f64ReinterpretI64();
+          c.end();
+          c.f64Mul();
+          c.end();
+        }
+        c.end();
+      }
+      c.end();
+    }
+    c.end();
+    c.localGet(I);
+    this.mb.setBody(
+      idx,
+      [I32, I32, I32, I64, I32, I64, I32, I64, I32, I64],
+      c.bytes(),
+    );
+    return idx;
+  }
+
+  private radixIntGenericFunc: number | null = null;
+
+  /** %w.radixIntGeneric(s, start, end, radix) -> (f64 value, i32 endPos) —
+   * INC-25 P3 arm (c): `NumberParseIntHelper::HandleGenericCase`,
+   * transcribed from V8's conversions.cc (nodejs/node tag v24.18.1,
+   * deps/v8/src/numbers/conversions.cc, sha256 723ff7b6..., lines 596-655
+   * on the vendored copy at impl-p3/vendor/conversions.cc): uint32 CHUNKS
+   * — accumulate `part`/`multiplier` while `multiplier*radix <=
+   * kMaximumMultiplier` (0xFFFFFFFF/36 = 119304647, an integer division
+   * truncated once at compile time, matching V8's own C++ constant
+   * exactly); the digit that would overflow the multiplier is NOT
+   * consumed and starts the next chunk; then EXACTLY ONE f64 multiply-add
+   * per chunk, `result = result*multiplier + part`. V8's own comment
+   * calls the resulting rounding error past ~2^56 deliberate and spec-
+   * sanctioned ("if R is not 2,4,8,10,16,32, mathInt may be an
+   * implementation-dependent approximation") — this is transcribed AS
+   * DRIFT, not "fixed". Leading zeros need NO special handling: a leading
+   * '0' digit is `part*radix+0`/`result*1+0`, both no-ops arithmetically,
+   * so it costs one wasted digit slot in whichever chunk it falls into
+   * and never changes the result — DELIBERATELY DIFFERENT from arm (b)'s
+   * explicit skip, because HandleGenericCase's own source has none. SIGN
+   * is the caller's business, exactly as arm (b). A span with ZERO valid
+   * digits (empty, or an immediate invalid character) returns NaN — V8's
+   * own callers only ever reach this function after confirming at least
+   * one digit exists; this transcription checks it itself instead, so it
+   * is safe to call directly. */
+  private radixIntGenericHelper(): number {
+    if (this.radixIntGenericFunc !== null) return this.radixIntGenericFunc;
+    const idx = this.mb.declareFunc(
+      this.mb.funcType([this.strRef, I32, I32, I32], [F64, I32]),
+      "%w.radixIntGeneric",
+    );
+    this.radixIntGenericFunc = idx;
+    const c = new Code();
+    const S = 0,
+      START = 1,
+      END = 2,
+      RADIX = 3;
+    const I = 4,
+      RESULT = 5,
+      DONE = 6,
+      PART = 7,
+      MULTIPLIER = 8,
+      D = 9,
+      M = 10,
+      CONSUMED_ANY = 11,
+      COND = 12;
+
+    c.localGet(START);
+    c.localSet(I);
+    c.f64Const(0);
+    c.localSet(RESULT);
+    c.i32Const(0);
+    c.localSet(DONE);
+    c.i32Const(0);
+    c.localSet(CONSUMED_ANY);
+
+    // Skip leading zeros — V8's OWN `DetectRadixInternal` does this BEFORE
+    // ParseInternal/HandleGenericCase ever runs (conversions.cc's own
+    // "Skip leading zeros" loop, shared by every radix, not just the
+    // power-of-two path). MISSING THIS is a real bug this pass's own
+    // build-side sweep caught (row "0010020011101020221120020011100001
+    // 112221" radix 3: wasm gave …800, Node gives …700) — omitting it
+    // changes which digits land in the FIRST 32-bit chunk (a leading zero
+    // still costs one digit-slot toward the chunk's capacity even though
+    // it contributes nothing to the value), which shifts every later
+    // chunk boundary and therefore the accumulated f64 rounding pattern.
+    // A leading zero found here ALSO counts as "at least one valid digit"
+    // (CONSUMED_ANY), matching DetectRadixInternal's own kZero state for
+    // an all-zero span.
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.localGet(END);
+    c.i32GeS();
+    c.brIf(1);
+    c.localGet(S);
+    c.localGet(I);
+    c.arrayGetU(this.strType);
+    c.i32Const(0x30);
+    c.i32Ne();
+    c.brIf(1);
+    c.i32Const(1);
+    c.localSet(CONSUMED_ANY);
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+
+    c.block(); // A: outer break target (chunk loop done)
+    c.loop(); // B: outer chunk loop
+    c.i32Const(0);
+    c.localSet(PART);
+    c.i32Const(1);
+    c.localSet(MULTIPLIER);
+    c.block(); // C: inner break target (chunk boundary reached)
+    c.loop(); // D: inner digit loop
+    c.localGet(I);
+    c.localGet(END);
+    c.i32GeS();
+    c.localTee(COND);
+    c.ifVoid();
+    c.i32Const(1);
+    c.localSet(DONE);
+    c.end();
+    c.localGet(COND);
+    c.brIf(1); // break to C: end of string
+    c.localGet(S);
+    c.localGet(I);
+    c.arrayGetU(this.strType);
+    c.call(this.digitValHelper());
+    c.localSet(D);
+    c.localGet(D);
+    c.i32Const(0);
+    c.i32LtS();
+    c.localGet(D);
+    c.localGet(RADIX);
+    c.i32GeS();
+    c.i32Or();
+    c.localTee(COND);
+    c.ifVoid();
+    c.i32Const(1);
+    c.localSet(DONE);
+    c.end();
+    c.localGet(COND);
+    c.brIf(1); // break to C: invalid digit, not consumed
+    c.localGet(MULTIPLIER);
+    c.localGet(RADIX);
+    c.i32Mul();
+    c.localSet(M);
+    c.localGet(M);
+    c.i32Const(119304647); // kMaximumMultiplier = 0xFFFFFFFF / 36
+    c.i32GtU();
+    c.brIf(1); // break to C: this digit would overflow the multiplier
+    c.i32Const(1);
+    c.localSet(CONSUMED_ANY);
+    c.localGet(PART);
+    c.localGet(RADIX);
+    c.i32Mul();
+    c.localGet(D);
+    c.i32Add();
+    c.localSet(PART);
+    c.localGet(M);
+    c.localSet(MULTIPLIER);
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.localGet(I);
+    c.localGet(END);
+    c.i32Eq();
+    c.localTee(COND);
+    c.ifVoid();
+    c.i32Const(1);
+    c.localSet(DONE);
+    c.end();
+    c.localGet(COND);
+    c.brIf(1); // break to C: end of string, digit consumed
+    c.br(0); // continue D: same chunk, next digit
+    c.end(); // end D
+    c.end(); // end C
+    // result = result*multiplier + part (multiplier/part read as UNSIGNED).
+    c.localGet(RESULT);
+    c.localGet(MULTIPLIER);
+    c.f64ConvertI32U();
+    c.f64Mul();
+    c.localGet(PART);
+    c.f64ConvertI32U();
+    c.f64Add();
+    c.localSet(RESULT);
+    c.localGet(DONE);
+    c.brIf(1); // break to A: no more chunks
+    c.br(0); // continue B: next chunk
+    c.end(); // end B
+    c.end(); // end A
+
+    c.localGet(CONSUMED_ANY);
+    c.i32Eqz();
+    c.ifResult(F64);
+    c.f64Const(CANONICAL_NAN);
+    c.else_();
+    c.localGet(RESULT);
+    c.end();
+    c.localGet(I);
+    this.mb.setBody(idx, [I32, F64, I32, I32, I32, I32, I32, I32, I32], c.bytes());
+    return idx;
+  }
+
   private radixScanWholeFunc: number | null = null;
   private radixScanPrefixFunc: number | null = null;
 
-  /** The shared digit-accumulation loop both radix scanners share: from
-   * local I (already positioned) up to END, accumulate VAL = VAL*radix +
-   * digit while `digitVal(unit) < radix`; leaves I past the last digit
-   * consumed and CNT holding how many were taken. Digit-by-digit f64
-   * accumulation is EXACT (no rounding) as long as the running value
-   * stays under 2^53 — true for every radix/length this tier's callers
-   * exercise (parseInt/hex-octal-binary literals, never 15+ significant
-   * digits in the corpus); a pathologically long digit run would lose
-   * precision the same way `parseInt("9".repeat(30))` does in V8 too
-   * (both round through f64 arithmetic), so no divergence is introduced. */
+  /** A digit-accumulation loop: from local I (already positioned) up to
+   * END, accumulate VAL = VAL*radix + digit while `digitVal(unit) <
+   * radix`; leaves I past the last digit consumed and CNT holding how
+   * many were taken. THIS HEADER USED TO CLAIM "no divergence is
+   * introduced" — THAT WAS FALSE (board #123, INC-25 P3): digit-by-digit
+   * f64 accumulation is measurably wrong on every radix once the running
+   * value needs more than 53 significant bits (`parseInt("9".repeat(30))`
+   * diverges from Node; V8 does NOT "round through f64 arithmetic" the
+   * same way — non-power-of-two radices go through
+   * `NumberParseIntHelper::HandleGenericCase`'s chunked uint32 multiply-
+   * add, and power-of-two radices go through the correctly-rounded
+   * `InternalStringToIntDouble`; neither is this loop). As of P3, this
+   * function survives ONLY as arm (a)'s boundary-finder for radix 10 (its
+   * OWN VAL output is discarded there — only the resulting I/CNT are
+   * used, and `%w.decimalWhole` values the determined span correctly) and
+   * as unreachable defensive fallback code inside radixScanWholeHelper/
+   * radixScanPrefixHelper for a radix their real callers never pass (every
+   * radix 2..36 other than 10 is routed to `%w.radixIntPow2` or
+   * `%w.radixIntGeneric` before reaching here). It is NOT used to compute
+   * any VALUE parseInt/StringToNumber actually returns anymore. */
   private emitRadixDigitLoop(
     c: Code,
     S: number,
@@ -29233,11 +29783,68 @@ class Assembler {
     c.end();
   }
 
+  private log2Pow2RadixFunc: number | null = null;
+
+  /** %w.log2Pow2Radix(radix) -> i32 — log2(radix) for radix in {2,4,8,16,
+   * 32}, or -1 for any other radix. The dispatch key both radix scanners
+   * below use to route into arm (b)'s InternalStringToIntDouble
+   * transcription. */
+  private log2Pow2RadixHelper(): number {
+    if (this.log2Pow2RadixFunc !== null) return this.log2Pow2RadixFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([I32], [I32]), "%w.log2Pow2Radix");
+    this.log2Pow2RadixFunc = idx;
+    const c = new Code();
+    const RADIX = 0;
+    c.localGet(RADIX);
+    c.i32Const(2);
+    c.i32Eq();
+    c.ifResult(I32);
+    c.i32Const(1);
+    c.else_();
+    c.localGet(RADIX);
+    c.i32Const(4);
+    c.i32Eq();
+    c.ifResult(I32);
+    c.i32Const(2);
+    c.else_();
+    c.localGet(RADIX);
+    c.i32Const(8);
+    c.i32Eq();
+    c.ifResult(I32);
+    c.i32Const(3);
+    c.else_();
+    c.localGet(RADIX);
+    c.i32Const(16);
+    c.i32Eq();
+    c.ifResult(I32);
+    c.i32Const(4);
+    c.else_();
+    c.localGet(RADIX);
+    c.i32Const(32);
+    c.i32Eq();
+    c.ifResult(I32);
+    c.i32Const(5);
+    c.else_();
+    c.i32Const(-1);
+    c.end();
+    c.end();
+    c.end();
+    c.end();
+    c.end();
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
   /** %w.radixIntWhole(s, start: i32, end: i32, radix: i32) → f64 — the
    * [start,end) span must be ENTIRELY valid base-`radix` digits with at
    * least one digit, or the result is NaN (StringToNumber's 0x/0o/0b
    * arms: "0x1Fg" is NaN, not 31 — trailing garbage fails the WHOLE
-   * literal, unlike parseInt's prefix rule below). */
+   * literal, unlike parseInt's prefix rule below). INC-25 P3 arm (b):
+   * this helper is called ONLY for 0x/0o/0b (radix always 16/8/2 in
+   * practice — every caller checked), so the pow2 branch below is the
+   * live path; the non-pow2 fallback (still the OLD f64 accumulation
+   * loop) is defensive dead code for a radix this helper's real callers
+   * never pass. */
   private radixScanWholeHelper(): number {
     if (this.radixScanWholeFunc !== null) return this.radixScanWholeFunc;
     const idx = this.mb.declareFunc(
@@ -29246,30 +29853,70 @@ class Assembler {
     );
     this.radixScanWholeFunc = idx;
     const c = new Code();
-    const S = 0, START = 1, END = 2, RADIX = 3;
-    const I = 4, VAL = 5, CNT = 6, D = 7;
-    c.localGet(START);
-    c.localSet(I);
-    this.emitRadixDigitLoop(c, S, I, END, RADIX, VAL, CNT, D);
-    c.localGet(CNT);
-    c.i32Eqz();
-    c.localGet(I);
-    c.localGet(END);
-    c.i32Ne();
-    c.i32Or();
+    const S = 0,
+      START = 1,
+      END = 2,
+      RADIX = 3;
+    const LOG2 = 4,
+      ENDPOS = 5,
+      VALPOW2 = 6,
+      I = 7,
+      VAL = 8,
+      CNT = 9,
+      D = 10;
+    c.localGet(RADIX);
+    c.call(this.log2Pow2RadixHelper());
+    c.localSet(LOG2);
+    c.localGet(LOG2);
+    c.i32Const(0);
+    c.i32GeS();
     c.ifResult(F64);
-    c.f64Const(CANONICAL_NAN);
+    {
+      c.localGet(S);
+      c.localGet(START);
+      c.localGet(END);
+      c.localGet(LOG2);
+      c.call(this.radixIntPow2Helper());
+      c.localSet(ENDPOS);
+      c.localSet(VALPOW2);
+      c.localGet(ENDPOS);
+      c.localGet(END);
+      c.i32Ne();
+      c.ifResult(F64);
+      c.f64Const(CANONICAL_NAN);
+      c.else_();
+      c.localGet(VALPOW2);
+      c.end();
+    }
     c.else_();
-    c.localGet(VAL);
+    {
+      c.localGet(START);
+      c.localSet(I);
+      this.emitRadixDigitLoop(c, S, I, END, RADIX, VAL, CNT, D);
+      c.localGet(CNT);
+      c.i32Eqz();
+      c.localGet(I);
+      c.localGet(END);
+      c.i32Ne();
+      c.i32Or();
+      c.ifResult(F64);
+      c.f64Const(CANONICAL_NAN);
+      c.else_();
+      c.localGet(VAL);
+      c.end();
+    }
     c.end();
-    this.mb.setBody(idx, [I32, F64, I32, I32], c.bytes());
+    this.mb.setBody(idx, [I32, I32, F64, I32, F64, I32, I32], c.bytes());
     return idx;
   }
 
   /** %w.radixIntPrefix(s, start: i32, end: i32, radix: i32) → f64 — the
    * LONGEST valid base-`radix` digit PREFIX from `start` (leftover chars
    * after it are ignored, parseInt's own rule: "42abc" → 42); NaN when
-   * zero digits are found at `start`. */
+   * zero digits are found at `start`. INC-25 P3: routes to arm (b) for a
+   * power-of-two radix (endPos dropped — a prefix scan never cares where
+   * it stopped); radix 10 and every other radix still fall through to the
+   * OLD f64 loop here, TEMPORARILY, until arms (a) and (c) are wired. */
   private radixScanPrefixHelper(): number {
     if (this.radixScanPrefixFunc !== null) return this.radixScanPrefixFunc;
     const idx = this.mb.declareFunc(
@@ -29278,19 +29925,79 @@ class Assembler {
     );
     this.radixScanPrefixFunc = idx;
     const c = new Code();
-    const S = 0, START = 1, END = 2, RADIX = 3;
-    const I = 4, VAL = 5, CNT = 6, D = 7;
-    c.localGet(START);
-    c.localSet(I);
-    this.emitRadixDigitLoop(c, S, I, END, RADIX, VAL, CNT, D);
-    c.localGet(CNT);
-    c.i32Eqz();
+    const S = 0,
+      START = 1,
+      END = 2,
+      RADIX = 3;
+    const LOG2 = 4,
+      ENDPOS = 5,
+      I = 6,
+      VAL = 7,
+      CNT = 8,
+      D = 9;
+    c.localGet(RADIX);
+    c.call(this.log2Pow2RadixHelper());
+    c.localSet(LOG2);
+    c.localGet(LOG2);
+    c.i32Const(0);
+    c.i32GeS();
     c.ifResult(F64);
-    c.f64Const(CANONICAL_NAN);
+    {
+      c.localGet(S);
+      c.localGet(START);
+      c.localGet(END);
+      c.localGet(LOG2);
+      c.call(this.radixIntPow2Helper());
+      c.localSet(ENDPOS); // dropped: a prefix scan ignores where it stopped
+      // value is left on the stack
+    }
     c.else_();
-    c.localGet(VAL);
+    {
+      // arm (a), radix 10 (radix 0 already resolved to 10 by parseIntHelper
+      // before this call): scan the decimal-digit PREFIX with
+      // emitRadixDigitLoop's own SCANNING half (its VAL output is the OLD
+      // f64 accumulation and is DISCARDED — only the resulting I/CNT are
+      // used), then value the determined span through %w.decimalWhole,
+      // which owns its own bridge (B1's condition: no new
+      // setSrcForNumberParse site is added here). Narrowing decimalWhole's
+      // END to the digit run's own end (not the original string's end)
+      // is what keeps a trailing "e5"/"." out of its exponent scanner —
+      // parseInt("123e5",10) must stay 123, and it does because
+      // decimalWhole never sees past the digit run at all.
+      // arm (c), every other radix: HandleGenericCase's own transcription.
+      c.localGet(RADIX);
+      c.i32Const(10);
+      c.i32Eq();
+      c.ifResult(F64);
+      {
+        c.localGet(START);
+        c.localSet(I);
+        this.emitRadixDigitLoop(c, S, I, END, RADIX, VAL, CNT, D);
+        c.localGet(CNT);
+        c.i32Eqz();
+        c.ifResult(F64);
+        c.f64Const(CANONICAL_NAN);
+        c.else_();
+        c.localGet(S);
+        c.localGet(START);
+        c.localGet(I);
+        c.call(this.decimalWholeHelper());
+        c.end();
+      }
+      c.else_();
+      {
+        c.localGet(S);
+        c.localGet(START);
+        c.localGet(END);
+        c.localGet(RADIX);
+        c.call(this.radixIntGenericHelper());
+        c.localSet(ENDPOS); // dropped: a prefix scan ignores where it stopped
+        // value is left on the stack
+      }
+      c.end();
+    }
     c.end();
-    this.mb.setBody(idx, [I32, F64, I32, I32], c.bytes());
+    this.mb.setBody(idx, [I32, I32, I32, F64, I32, I32], c.bytes());
     return idx;
   }
 
@@ -29872,7 +30579,7 @@ class Assembler {
     this.parseIntFunc = idx;
     const c = new Code();
     const S = 0, RADIXARG = 1;
-    const T = 2, L = 3, POS = 4, SIGN = 5, C0 = 6, RADIX = 7, C1 = 8;
+    const T = 2, L = 3, POS = 4, SIGN = 5, C0 = 6, RADIX = 7, C1 = 8, RTRUNC = 9;
     c.localGet(S);
     c.call(this.strs.trim("start"));
     c.localSet(T);
@@ -29910,16 +30617,36 @@ class Assembler {
       c.end();
     }
     c.end();
-    // radix, NaN-guarded before truncation (NaN → 0, "auto").
-    c.localGet(RADIXARG);
-    c.localGet(RADIXARG);
-    c.f64Ne();
+    // radix, ToInt32's MODULAR WRAP (INC-25 P3 arm (d) — replaces a signed
+    // i32 truncation that TRAPPED for |x| >= 2^31, board #123b). Not-finite
+    // (NaN or +-Infinity — emitIsFiniteCheck covers both, where the OLD
+    // guard here only caught NaN) maps to 0 ("auto") per spec's ToInt32;
+    // otherwise truncate toward zero, reduce into [0, 2^32) via an f64
+    // floor-based remainder (t - floor(t/2^32)*2^32 — EXACT for every
+    // finite double: verified directly against 1e21 (remainder
+    // 3735027712), 2^63, 2^64 and MAX_VALUE (all remainder 0, since a
+    // double that large has already lost every bit below its own ULP,
+    // which exceeds 2^32), and every finite int32-range value), then let
+    // i32.trunc_f64_u's raw bit pattern stand as the signed i32 result
+    // DIRECTLY — a remainder in [2^31, 2^32) truncates to the identical
+    // 32-bit pattern ToInt32's own "subtract 2^32" step would produce, so
+    // no further sign adjustment is needed.
+    this.emitIsFiniteCheck(c, RADIXARG);
     c.ifResult(I32);
-    c.i32Const(0);
-    c.else_();
     c.localGet(RADIXARG);
     c.f64Trunc();
-    c.i32TruncF64S();
+    c.localSet(RTRUNC);
+    c.localGet(RTRUNC);
+    c.localGet(RTRUNC);
+    c.f64Const(4294967296);
+    c.f64Div();
+    c.f64Floor();
+    c.f64Const(4294967296);
+    c.f64Mul();
+    c.f64Sub();
+    c.i32TruncF64U();
+    c.else_();
+    c.i32Const(0);
     c.end();
     c.localSet(RADIX);
     // "0x"/"0X" prefix: strips under radix 0 (auto) OR explicit 16.
@@ -29995,7 +30722,7 @@ class Assembler {
     c.call(this.radixScanPrefixHelper());
     c.f64Mul();
     c.end();
-    this.mb.setBody(idx, [this.strRef, I32, I32, F64, I32, I32, I32], c.bytes());
+    this.mb.setBody(idx, [this.strRef, I32, I32, F64, I32, I32, I32, F64], c.bytes());
     return idx;
   }
 

@@ -3080,6 +3080,28 @@ const TIER_FLOOR: string[] = [
   // already compiled before this pass. No register entry: the tier now
   // matches Node exactly on Object.is over every kind. 820 -> 821.
   "2561-object-is.ts",
+  // Increment 25, pass P3 (the parsers: num.parseInt/num.parseFloat/num.
+  // fromString) — and board #123's fix on EVERY radix (a live silent
+  // miscompile: digit-at-a-time f64 accumulation, replaced by V8's own
+  // three transcribed branches — the correctly-rounded decimal helper for
+  // radix 10, InternalStringToIntDouble for power-of-two radices,
+  // HandleGenericCase's chunked multiply-add for every other radix) plus
+  // board #123b's fix (the radix argument now uses ToInt32's modular
+  // wrap instead of a trapping signed truncation). No register entry
+  // (S069 withdrawn, design §9.2): the tier now matches Node exactly on
+  // every radix. 1523 is the P1 leftover this pass finally closes
+  // ({num.isNaN, math.floor} landed in P1; num.parseInt was the missing
+  // third key). 821 -> 831.
+  "1115-parse-globals.ts",
+  "1520-string-split-static.ts",
+  "1522-parseint-static.ts",
+  "1523-isnan-floor-static.ts",
+  "1534-union-as-arm-cast.ts",
+  "1636-util-format.ts",
+  "1991-for-in-loops.ts",
+  "2388-tonumber-grammar-zoo.ts",
+  "2389-tonumber-unary-plus.ts",
+  "2431-primitive-ctor-values.ts",
 ];
 
 interface RunResult {

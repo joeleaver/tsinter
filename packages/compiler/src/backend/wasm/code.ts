@@ -439,10 +439,22 @@ export class Code {
   i32TruncF64S(): void {
     this.w.u8(0xaa);
   }
+  /** Traps on NaN/negative/out-of-range — callers bound-check first (INC-25
+   * P3's own arm (d): the ToInt32 radix conversion reduces to a NON-
+   * NEGATIVE f64 remainder in [0, 2^32) before this call, which is exactly
+   * this instruction's safe domain — i32TruncF64S would trap on any
+   * remainder >= 2^31). */
+  i32TruncF64U(): void {
+    this.w.u8(0xab);
+  }
   /** Traps on NaN/out-of-range — callers bound-check (or explicitly zero
    * NaN) first, same discipline as i32TruncF64S. */
   i64TruncF64S(): void {
     this.w.u8(0xb0);
+  }
+  /** Traps on NaN/negative/out-of-range — same discipline as i32TruncF64U. */
+  i64TruncF64U(): void {
+    this.w.u8(0xb1);
   }
   arrayNewDefault(typeIndex: number): void {
     this.w.u8(0xfb);
