@@ -9,7 +9,16 @@
  * THE CLOCK IS VIRTUAL: `tsinter.now` answers the deadline the pump last
  * jumped to, so nothing ever sleeps and a five-second timer costs
  * nothing. Timer programs are order-only by construction, so that is not
- * an approximation of anything observable. */
+ * an approximation of anything observable.
+ *
+ * `tsinter.seed` (INC-25 P1, abi.ts §8.1) is serviced from a CSPRNG, same
+ * as the differential harness's own host — so no test using this shared
+ * instantiate() can depend on a fixed Math.random sequence. The seed pin
+ * (wasm-random.test.ts) forces a specific seed with its OWN host instead,
+ * a copy of this file's instantiate with `seed: () => BigInt(N)` — this
+ * shared host must stay random precisely so nothing here can accidentally
+ * pin a value Node would never produce. */
+import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { expect } from "vitest";
 
@@ -34,6 +43,7 @@ async function instantiate(modulePath: string) {
         chunks[fd === 2 ? 2 : 1].push(Buffer.from(new Uint8Array(memory.buffer, ptr, len)));
       },
       now: (): number => clock,
+      seed: (): bigint => randomBytes(8).readBigUInt64BE(),
     },
   });
   memory = instance.exports["memory"] as WebAssembly.Memory;

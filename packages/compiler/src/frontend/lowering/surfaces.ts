@@ -476,7 +476,7 @@ export const ISLAND_SURFACE = {
 /** Math members with a STATIC lowering — each is one C call that IS the
  * JS operation, at the tabled arity (floor: libm's floor; min/max: the
  * NaN-poisoning ±0-ordered scalar folds; random: arc4random-backed
- * uniform [0,1) — SEMANTICS.md 62). Checked BEFORE the island table
+ * uniform [0,1) — SEMANTICS.md S068). Checked BEFORE the island table
  * (lowerIslandMethodCall), so the tabled arities compile statically and
  * other arities keep the island/fence story — except min/max, whose
  * variadic spelling lowers at ANY plain arity (the n-ary left fold of

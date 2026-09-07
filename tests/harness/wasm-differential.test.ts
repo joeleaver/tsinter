@@ -32,7 +32,7 @@
  * top-level-await program whose module evaluation promise never settled:
  * `_status()` answers Node's 13 (abi.ts). */
 import { execFile } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { globSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -3040,6 +3040,38 @@ const TIER_FLOOR: string[] = [
   "2614-trap-binding-later-writes.ts",
   "2635-trap-binding-unmappable-written.ts",
   "2636-trap-binding-ambient-rooted-rewrite.ts",
+  // Increment 25, pass P1 (the scalar unit: math.abs/ceil/floor/trunc/
+  // round/max/min/maxArr/minArr/random, num.isNaN, number.isFinite/isNaN/
+  // isInteger/isSafeInteger): the instructions ARE the operations for the
+  // first ten (f64.abs/ceil/floor/trunc direct; f64.min/f64.max propagate
+  // NaN and order ±0 the JS way, measured — the opposite of C's fmin/
+  // fmax; maxArr/minArr fold seeded with ∓Infinity so the empty array
+  // falls out of the seed; Math.round ports scr_math_round, scr_lib.c:
+  // 2505); Math.random transcribes V8's xorshift128+ (SEMANTICS.md S068)
+  // behind a new `seed` ABI import, minted by the same reachable-function
+  // prescan `now` uses, present only in modules that reach Math.random.
+  // 803 -> 820, NOT 821: the survey's nesting hole (board #124) hid that
+  // 1523-isnan-floor-static.ts ALSO needs num.parseInt (a P3 key) inside
+  // one of its five isNaN(...) calls — 18 keys close but 17 claim; 1523
+  // stays out of the tier until the parsers pass lands. Design-number-v6.
+  // txt §2.1-§2.3/§2.6/§7.3, CP1 ack R1 (lead-ruled, rev-25 pre-read).
+  "1111-math-random.ts",
+  "1121-infinity-number-tostring.ts",
+  "1420-number-statics.ts",
+  "1435-math-spread.ts",
+  "1437-pad-default.ts",
+  "1538-math-static-scalar.ts",
+  "1579-matchall-index.ts",
+  "1590-js-unannotated.js",
+  "2042-any-flow-loops.ts",
+  "2046-objlit-accessors-effects.ts",
+  "2112-array-at-findlast.ts",
+  "2350-nan-global.ts",
+  "2445-math-minmax-nary.ts",
+  "2453-private-accessors.ts",
+  "2488-ast-walker.ts",
+  "2577-builtin-global-destructuring.js",
+  "2611-regex-named-groups-js.cjs",
 ];
 
 interface RunResult {
@@ -3179,6 +3211,10 @@ async function runWasm(modulePath: string): Promise<RunResult> {
       },
       // Timer modules only; wasm ignores an import it never declared.
       now: (): number => clock,
+      // Math.random modules only (INC-25 P1, abi.ts §8.1). Serviced from
+      // a CSPRNG so NO corpus program can depend on a fixed sequence —
+      // the seed pin (wasm-random.test.ts) uses its own host instead.
+      seed: (): bigint => randomBytes(8).readBigUInt64BE(),
     },
   });
   memory = instance.exports["memory"] as WebAssembly.Memory;

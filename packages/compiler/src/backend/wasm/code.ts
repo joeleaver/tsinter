@@ -287,6 +287,9 @@ export class Code {
   i64Or(): void {
     this.w.u8(0x84);
   }
+  i64Xor(): void {
+    this.w.u8(0x85);
+  }
   i64Shl(): void {
     this.w.u8(0x86);
   }
@@ -296,11 +299,24 @@ export class Code {
   i64ShrU(): void {
     this.w.u8(0x88);
   }
+  f64Abs(): void {
+    this.w.u8(0x99);
+  }
   f64Neg(): void {
     this.w.u8(0x9a);
   }
+  f64Ceil(): void {
+    this.w.u8(0x9b);
+  }
   f64Floor(): void {
     this.w.u8(0x9c);
+  }
+  /** IEEE754-2008 roundToIntegralTiesToEven — round-HALF-TO-EVEN, NOT JS's
+   * Math.round (half-toward-+Infinity). A naive port of Math.round onto
+   * this instruction reddens on 2.5/-1.5 (INC-25 P1's own negative
+   * control — see wasm-math.test.ts). */
+  f64Nearest(): void {
+    this.w.u8(0x9e);
   }
   f64Sqrt(): void {
     this.w.u8(0x9f);

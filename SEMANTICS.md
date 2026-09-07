@@ -5186,3 +5186,56 @@ these pins used a non-matching pair for three of the four and could not have cau
 above even though all four appeared to pass — and "F5 safe controls (INC-24 P6)" (the literal forms at all
 four sites, byte-exact, the pin that actually found that bug) — all `packages/compiler/test/wasm-emitter.
 test.ts`.
+
+## S068 — `Math.random`: the same distribution on every lane, deliberately different SEQUENCES; the wasm tier draws once from a host seed *(per-lane split)*
+
+Every lane answers a uniform double in [0,1) at the spec's 53-bit granularity, and no lane reproduces
+another's sequence. The native lanes call `arc4random_buf` PER DRAW (`scr_lib.c`'s `scr_math_random`,
+`(r >> 11) * 0x1.0p-53`), so the sequence is the platform CSPRNG's and nothing seeds it. The wasm tier has
+no CSPRNG of its own: it imports `(import "tsinter" "seed" (func (result i64)))` — present ONLY in modules
+that reach `Math.random`, the conditional shape `now` already uses for timer modules — reads it ONCE on the
+first draw, and steps V8's xorshift128+ from there. MurmurHash3 of the seed and of its complement give the
+two states; ToDouble is the top 53 bits scaled by 2^-53, which is the same value construction the C lane
+uses.
+
+THIS ENTRY PINS A V8 VERSION, DELIBERATELY. The transcription mirrors `src/numbers/math-random.cc` (with
+`src/builtins/math.tq` for the consuming side) as shipped in V8 13.6.233.17 — Node 24.18.1's V8, verified by
+reading that file at nodejs/node tag v24.18.1 (vendored+hashed under `impl-p1/vendor/`: `math-random.cc`
+sha256 `594dd4d1…`, `math-random.h` sha256 `f497d4d6…`, `random-number-generator.h` sha256 `1a300df4…`,
+`random-number-generator.cc` sha256 `71d1cac5…`, `math.tq` sha256 `a877efef…`). At that version the cache is
+refilled FORWARD over 64 entries (`kCacheSize`, `math-random.h:24`), the index is set to 64 and decremented
+per draw (so each block is consumed in REVERSE — `math.tq`'s `MathRandom` builtin reads `cache[--index]`),
+ToDouble takes the POST-step state0, and the seeding is `MurmurHash3(seed)` / `MurmurHash3(~seed)` IN
+`math-random.cc` — NOT the generator class's own `SetSeed` (`random-number-generator.cc:218-223`), which
+hashes `~state0_` and is a different thing. A Node upgrade that moves any of the four RETIRES the pin
+without making the tier wrong — the toolchain-versioned framing S036 already uses.
+
+WHY A SEED IMPORT RATHER THAN PER-CALL ENTROPY: per-draw entropy is the wrong cost model for a game loop,
+V8 itself seeds once, and the ABI's standing position is that the origin of nondeterminism is the host's
+business. The differential harness services `seed` from a CSPRNG so that no corpus program can depend on a
+fixed sequence; an embedder passing a fixed seed gets a reproducible one (the `node --random-seed=N`
+contract).
+
+OBSERVABLE: the VALUES, in order, for a given seed. Nothing else — range, granularity and distribution
+agree across lanes by construction. NOT OBSERVABLE, and therefore not part of this entry: whether two lanes
+started from the same seed. No tier path can read it.
+
+**Tested by:** 1111's invariant pins (every draw in [0,1), `typeof "number"`, `isFinite`), plus the
+seed-to-sequence pin in `packages/compiler/test/wasm-random.test.ts` — with the host seed forced to N, the
+module's first 320 draws equal `node --random-seed=N`'s first 320 values exactly, measured across eight
+seeds including the int32 edges and -1 (V8 sign-extends the flag into the uint64 seed; seed 0 is
+UNSEENED by V8 itself — `--random-seed=0` is indistinguishable from no flag at all, measured directly, two
+runs differ — and is therefore excluded from the pin set, not a gap this entry can close). That pin is
+possible only because the module replicates V8's 64-entry refill cache, generated forward and consumed in
+reverse within each block; it is negative-controlled by a shift mutation, by removing the reversal, by
+reading the wrong state slot, by seeding from the wrong half (the generator class's `SetSeed` shape), and
+by a v8/main-shaped rewrite (no cache, no reversal, `ToDouble` of the step's return value) — all five must
+score 0 (or, for the shift, ~0) against the real oracle.
+
+(The two stale "SEMANTICS.md 62" pointers for randomness — `ir/nodes.ts:1893` and
+`packages/runtime/src/scr_runtime.h:804` — cite an entry number that has never described randomness in a
+67-entry register, and three more source sites carry the same stale text (`packages/runtime/src/scr_lib.c:
+2483`, `packages/compiler/src/frontend/lowering/surfaces.ts:479`,
+`packages/compiler/src/backend/emission/emit-exprs.ts:2736`). All five repoint here in the same hunk; a
+sixth site, `tests/corpus/1538-math-static-scalar.ts:3`, is a corpus file and stays untouched — recorded as
+a residual.)

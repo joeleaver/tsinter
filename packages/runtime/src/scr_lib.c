@@ -2480,7 +2480,7 @@ void scr_fs_scandir_free(ScrScandir *s) {
  * leave the ±0 order unspecified). Math.random(): a uniform double in
  * [0,1) at the spec's 53-bit granularity, drawn from arc4random_buf —
  * the same CSPRNG behind the crypto lowerings. Same distribution as
- * Node's, necessarily a different sequence (SEMANTICS.md 62); range and
+ * Node's, necessarily a different sequence (SEMANTICS.md S068); range and
  * granularity are pinned differentially by invariant, not by bytes. */
 
 double scr_math_min(double a, double b) {

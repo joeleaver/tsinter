@@ -97,9 +97,10 @@ import {
   FD_STDOUT,
   IMPORT_MODULE,
   IMPORT_NOW,
+  IMPORT_SEED,
   IMPORT_WRITE,
 } from "./abi.js";
-import { LEN, VecBuilder, type VecInfo } from "./arrays.js";
+import { BUF, LEN, VecBuilder, type VecInfo } from "./arrays.js";
 import {
   BYTES_PAYLOAD_IS_BUFFER,
   DK,
@@ -335,6 +336,37 @@ function timerSurfaceReachable(mod: WModule): boolean {
     if (found) return;
     if (typeof node === "string") {
       if (node.startsWith("timers.")) found = true;
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      for (const value of Object.values(node)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn.body);
+  }
+  return found;
+}
+
+/** Does any reachable function call `math.random`? The `seed` twin of
+ * timerSurfaceReachable above, EXACT-match rather than prefix-match —
+ * math.random is the only key that draws, where the timers family has
+ * many member keys sharing one prefix. Same over-approximation stance and
+ * the same reason: a module that never draws must not declare `seed`
+ * (INC-25 P1, design-number-v6.txt §8.1), and under-approximating would be
+ * an emitter bug the runtime should say so by name for, not a silent
+ * miscompile. */
+function mathRandomReachable(mod: WModule): boolean {
+  const reachable = reachableFunctionNames(mod);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (typeof node === "string") {
+      if (node === "math.random") found = true;
       return;
     }
     if (Array.isArray(node)) {
@@ -1158,6 +1190,27 @@ class Assembler {
   /** `tsinter.now`'s index, or null in a module that cannot arm a timer
    * (see the prescan in the constructor). */
   private readonly nowFunc: number | null;
+  /** `tsinter.seed`'s index, or null in a module that never reaches
+   * `Math.random` (mathRandomReachable's prescan, INC-25 P1 — the exact
+   * `now`/timerSurfaceReachable shape). */
+  private readonly seedFunc: number | null;
+  /** Math.random generator state (design-number-v6.txt §2.3/S068): two
+   * lazily-seeded xorshift128+ states, a 64-slot ToDouble cache generated
+   * FORWARD and consumed in REVERSE, and the index into it. The cache is a
+   * mutable GC array (not linear memory — this backend already uses GC
+   * arrays for fixed-shape mutable buffers, e.g. strType below), null
+   * until the first draw allocates it; nullness doubles as the "not yet
+   * seeded" flag so no separate sentinel is needed. All four fields are
+   * built lazily by randomHelper() the first time a module actually
+   * reaches math.random — a module that reaches it not at all pays
+   * nothing (mirrors this.timers's lazy interning). */
+  private randS0Global: number | null = null;
+  private randS1Global: number | null = null;
+  private randIndexGlobal: number | null = null;
+  private randCacheType: number | null = null;
+  private randCacheGlobal: number | null = null;
+  private murmur3FuncIdx: number | null = null;
+  private randomHelperFuncIdx: number | null = null;
   private helpers: { stage: number; putc: number; flush: number } | null = null;
   private fn!: FnState;
 
@@ -1192,6 +1245,12 @@ class Assembler {
     // and the runtime says so by name if it ever happens.
     this.nowFunc = timerSurfaceReachable(mod)
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_NOW, this.mb.funcType([], [F64]))
+      : null;
+    // `seed`'s twin decision (INC-25 P1, abi.ts §8.1): present only in
+    // modules that reach Math.random, minted by the same front-of-the-
+    // function-index-space prescan `now` uses.
+    this.seedFunc = mathRandomReachable(mod)
+      ? this.mb.importFunc(IMPORT_MODULE, IMPORT_SEED, this.mb.funcType([], [I64]))
       : null;
     this.mb.ensureMemory(1);
     this.cursorGlobal = this.mb.addGlobal(I32, true, (w) => {
@@ -11284,6 +11343,241 @@ class Assembler {
           this.emitUnwind();
           return;
         }
+        // ── INC-25 pass P1: the scalar unit (design-number-v6.txt §2.1-
+        // §2.3/§2.6/§7.3) ─────────────────────────────────────────────
+        // f64.abs/ceil/floor/trunc ARE the JS operations — no helper, one
+        // instruction each (§2.1: "the instructions ARE the operations").
+        if (e.fn === "math.abs") {
+          this.walkExpr(e.args[0]!);
+          code.f64Abs();
+          return;
+        }
+        if (e.fn === "math.ceil") {
+          this.walkExpr(e.args[0]!);
+          code.f64Ceil();
+          return;
+        }
+        if (e.fn === "math.floor") {
+          this.walkExpr(e.args[0]!);
+          code.f64Floor();
+          return;
+        }
+        if (e.fn === "math.trunc") {
+          this.walkExpr(e.args[0]!);
+          code.f64Trunc();
+          return;
+        }
+        // f64.min/f64.max are ALSO direct — measured (§2.1, 198 rows) to
+        // propagate NaN and order ±0 the JS way already, the OPPOSITE of
+        // C's fmin/fmax (which drop NaN and leave ±0 unspecified — the
+        // negative control this key's pin exists to redden). The
+        // frontend already desugars n-ary Math.max/min into nested
+        // BINARY math.max/math.min libCalls (lower-island.ts's fold, one
+        // per pair, left to right), so this arm's only job is the two-
+        // operand instruction; argument evaluation ORDER (args[0] before
+        // args[1], the axis 2445's pin discriminates) is exactly the
+        // order these two walkExpr calls run in.
+        if (e.fn === "math.max") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.f64Max();
+          return;
+        }
+        if (e.fn === "math.min") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.f64Min();
+          return;
+        }
+        if (e.fn === "math.maxArr" || e.fn === "math.minArr") {
+          // The runtime fold over a number[], seeded with -Infinity
+          // (max) / +Infinity (min) UNCONDITIONALLY — never the first
+          // element as a seed-avoiding "optimization": that shortcut is
+          // wrong on the empty array, which is exactly the case the seed
+          // exists to answer for free (1435's own empty-array pin).
+          const isMax = e.fn === "math.maxArr";
+          const arrType = e.args[0]!.type as IrType & { kind: "array" };
+          const vecInfo = this.vecInfoFor(arrType, e.loc);
+          if (vecInfo === null) {
+            code.unreachable();
+            return;
+          }
+          const structRef = this.acquireScratch(this.vecs.vecRef(vecInfo));
+          const bufRef = this.acquireScratch({ kind: "ref", nullable: false, typeIndex: vecInfo.bufType });
+          const idxLocal = this.acquireScratch(I32);
+          const lenLocal = this.acquireScratch(I32);
+          const acc = this.acquireScratch(F64);
+          this.walkExpr(e.args[0]!);
+          code.localSet(structRef);
+          code.localGet(structRef);
+          code.structGet(vecInfo.struct, LEN);
+          code.localSet(lenLocal);
+          code.localGet(structRef);
+          code.structGet(vecInfo.struct, BUF);
+          code.localSet(bufRef);
+          code.f64Const(isMax ? -Infinity : Infinity);
+          code.localSet(acc);
+          code.i32Const(0);
+          code.localSet(idxLocal);
+          code.block();
+          code.loop();
+          code.localGet(idxLocal);
+          code.localGet(lenLocal);
+          code.i32GeS();
+          code.brIf(1);
+          code.localGet(acc);
+          code.localGet(bufRef);
+          code.localGet(idxLocal);
+          this.vecs.emitElemRead(code, vecInfo);
+          if (isMax) code.f64Max();
+          else code.f64Min();
+          code.localSet(acc);
+          code.localGet(idxLocal);
+          code.i32Const(1);
+          code.i32Add();
+          code.localSet(idxLocal);
+          code.br(0);
+          code.end();
+          code.end();
+          code.localGet(acc);
+          this.releaseScratch(this.vecs.vecRef(vecInfo), structRef);
+          this.releaseScratch({ kind: "ref", nullable: false, typeIndex: vecInfo.bufType }, bufRef);
+          this.releaseScratch(I32, idxLocal);
+          this.releaseScratch(I32, lenLocal);
+          this.releaseScratch(F64, acc);
+          return;
+        }
+        if (e.fn === "math.round") {
+          // Port of scr_math_round (packages/runtime/src/scr_lib.c:2505,
+          // SEMANTICS.md S068's registered sibling text): NaN/Infinity/
+          // zero pass through; f = floor(x); the fraction compare
+          // `x - f < 0.5` decides the arm; results in (-0.5, 0] keep the
+          // sign (Math.round(-0.3) is -0, pinned by the -0 row).
+          // NOT "exact by Sterbenz" on x in (-0.5, 0) — rev-25's finding
+          // (CP1 ack R3): at x = -0.49999999999999994 the TRUE fraction
+          // x - f is 0.5 + 2^-54 (f = -1 there) while the STORED double
+          // result of the subtraction rounds to exactly 0.5; the port is
+          // still correct because BOTH values are compared against 0.5
+          // with the same `<` and land in the SAME (else) arm — the
+          // guard doesn't need the subtraction to be exact, only that
+          // rounding error can't cross the 0.5 threshold it's compared
+          // against, which holds because the true and stored fractions
+          // differ by at most one ULP here and 0.5 is not on that ULP's
+          // boundary for this magnitude.
+          const x = this.acquireScratch(F64);
+          const f = this.acquireScratch(F64);
+          const r = this.acquireScratch(F64);
+          this.walkExpr(e.args[0]!);
+          code.localSet(x);
+          // cond = isNaN(x) || x==+Inf || x==-Inf || x==0
+          code.localGet(x);
+          code.localGet(x);
+          code.f64Ne();
+          code.localGet(x);
+          code.f64Const(Infinity);
+          code.f64Eq();
+          code.i32Or();
+          code.localGet(x);
+          code.f64Const(-Infinity);
+          code.f64Eq();
+          code.i32Or();
+          code.localGet(x);
+          code.f64Const(0);
+          code.f64Eq();
+          code.i32Or();
+          code.ifResult(F64);
+          code.localGet(x);
+          code.else_();
+          code.localGet(x);
+          code.f64Floor();
+          code.localSet(f);
+          code.localGet(x);
+          code.localGet(f);
+          code.f64Sub();
+          code.f64Const(0.5);
+          code.f64Lt();
+          code.ifResult(F64);
+          code.localGet(f);
+          code.else_();
+          code.localGet(f);
+          code.f64Const(1);
+          code.f64Add();
+          code.end();
+          code.localSet(r);
+          code.localGet(r);
+          code.f64Const(0);
+          code.f64Eq();
+          code.localGet(x);
+          code.f64Const(0);
+          code.f64Lt();
+          code.i32And();
+          code.ifResult(F64);
+          code.f64Const(-0);
+          code.else_();
+          code.localGet(r);
+          code.end();
+          code.end();
+          this.releaseScratch(F64, x);
+          this.releaseScratch(F64, f);
+          this.releaseScratch(F64, r);
+          return;
+        }
+        if (e.fn === "math.random") {
+          code.call(this.randomHelper());
+          return;
+        }
+        if (e.fn === "num.isNaN" || e.fn === "number.isNaN") {
+          // Already a number by construction (IR doc contract, ir/nodes.
+          // ts): no ToNumber. NaN is the only f64 unequal to itself.
+          this.walkExpr(e.args[0]!);
+          const x = this.acquireScratch(F64);
+          code.localSet(x);
+          code.localGet(x);
+          code.localGet(x);
+          code.f64Ne();
+          this.releaseScratch(F64, x);
+          return;
+        }
+        if (e.fn === "number.isFinite") {
+          const x = this.acquireScratch(F64);
+          this.walkExpr(e.args[0]!);
+          code.localSet(x);
+          this.emitIsFiniteCheck(code, x);
+          this.releaseScratch(F64, x);
+          return;
+        }
+        if (e.fn === "number.isInteger") {
+          const x = this.acquireScratch(F64);
+          this.walkExpr(e.args[0]!);
+          code.localSet(x);
+          this.emitIsFiniteCheck(code, x);
+          code.localGet(x);
+          code.f64Floor();
+          code.localGet(x);
+          code.f64Eq();
+          code.i32And();
+          this.releaseScratch(F64, x);
+          return;
+        }
+        if (e.fn === "number.isSafeInteger") {
+          const x = this.acquireScratch(F64);
+          this.walkExpr(e.args[0]!);
+          code.localSet(x);
+          this.emitIsFiniteCheck(code, x);
+          code.localGet(x);
+          code.f64Floor();
+          code.localGet(x);
+          code.f64Eq();
+          code.i32And();
+          code.localGet(x);
+          code.f64Abs();
+          code.f64Const(9007199254740991); // 2^53 - 1
+          code.f64Le();
+          code.i32And();
+          this.releaseScratch(F64, x);
+          return;
+        }
+        // ── end INC-25 P1 ────────────────────────────────────────────
         if (this.emitBufferLibCall(e)) return;
         if (this.emitTimerCall(e)) return;
         if (this.emitEmitterLibCall(e)) return;
@@ -27911,6 +28205,223 @@ class Assembler {
     const pool = this.fn.scratchFree.get(key);
     if (pool === undefined) this.fn.scratchFree.set(key, [index]);
     else pool.push(index);
+  }
+
+  /** `isFinite(x)` with `x` already snapshotted into the scratch local
+   * `xLocal`: not NaN (x==x) and not ±Infinity (abs(x)!=Infinity). Shared
+   * by number.isFinite/isInteger/isSafeInteger (INC-25 P1) so the three
+   * predicates' common half is written once. Leaves one i32 on the stack;
+   * does not touch xLocal. */
+  private emitIsFiniteCheck(code: Code, xLocal: number): void {
+    code.localGet(xLocal);
+    code.localGet(xLocal);
+    code.f64Eq(); // false iff NaN
+    code.localGet(xLocal);
+    code.f64Abs();
+    code.f64Const(Infinity);
+    code.f64Ne();
+    code.i32And();
+  }
+
+  /** MurmurHash3's 64-bit finalizer, byte-exact (random-number-generator.
+   * cc:228-234, vendored+hashed at impl-p1/vendor/random-number-generator.
+   * cc sha256 71d1cac5bd0c040b0e5f88d0917e3f72a9efb63dbebd2f69bd575e3de07
+   * 0109c): h^=h>>33; h*=0xFF51AFD7ED558CCD; h^=h>>33;
+   * h*=0xC4CEB9FE1A85EC53; h^=h>>33. NOT the generator CLASS's own
+   * SetSeed (random-number-generator.cc:218-223), which is a different
+   * function that also calls this finalizer but on a different argument
+   * (~state0_ rather than ~seed) — see randomHelper's seeding, and CP1's
+   * negative control 4. Built once per module; called twice (the two
+   * seeding calls) the first time a module draws. */
+  private murmur3Helper(): number {
+    if (this.murmur3FuncIdx !== null) return this.murmur3FuncIdx;
+    const idx = this.mb.declareFunc(this.mb.funcType([I64], [I64]), "%w.math.murmur3");
+    this.murmur3FuncIdx = idx;
+    const c = new Code();
+    const H = 0;
+    const xorShift33 = (): void => {
+      c.localGet(H);
+      c.localGet(H);
+      c.i64Const(33n);
+      c.i64ShrU();
+      c.i64Xor();
+      c.localSet(H);
+    };
+    const mulConst = (v: bigint): void => {
+      c.localGet(H);
+      c.i64Const(BigInt.asIntN(64, v));
+      c.i64Mul();
+      c.localSet(H);
+    };
+    xorShift33();
+    mulConst(0xff51afd7ed558ccdn);
+    xorShift33();
+    mulConst(0xc4ceb9fe1a85ec53n);
+    xorShift33();
+    c.localGet(H);
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  /** `Math.random()`'s wasm-tier body (design-number-v6.txt §2.3/§9.1 =
+   * SEMANTICS.md S068): V8's xorshift128+, transcribed from
+   * src/numbers/math-random.cc + src/base/utils/random-number-generator.
+   * {h,cc} at Node v24.18.1's V8 13.6.233.17 (vendored+hashed under
+   * impl-p1/vendor/). Lazily seeds from `this.seedFunc` on the FIRST
+   * draw only (the ABI's "at most once" contract — CP1 ack R5's counting-
+   * host control is what proves this, not a citation), MurmurHash3(seed)
+   * / MurmurHash3(~seed) — math-random.cc's OWN seeding, not the
+   * generator class's SetSeed (murmur3Helper's own doc) — into two i64
+   * globals, then refills a 64-entry f64 cache FORWARD (index 0..63) and
+   * consumes it in REVERSE (index set to 64, decremented per draw),
+   * mirroring math.tq's MathRandom builtin exactly. The cache's nullness
+   * doubles as the "not yet seeded" sentinel, so no separate flag global
+   * is needed: allocated once, on the same branch that seeds. */
+  private randomHelper(): number {
+    if (this.randomHelperFuncIdx !== null) return this.randomHelperFuncIdx;
+    const seedFuncIdx = this.seedFunc;
+    if (seedFuncIdx === null) {
+      throw new Error(
+        "emitter bug: Math.random was emitted but tsinter.seed was never imported (mathRandomReachable's prescan and the walk disagreed)",
+      );
+    }
+    const idx = this.mb.declareFunc(this.mb.funcType([], [F64]), "%w.math.random");
+    this.randomHelperFuncIdx = idx;
+
+    const cacheType = this.mb.arrayType(F64, true);
+    this.randCacheType = cacheType;
+    const s0 = this.mb.addGlobal(I64, true, (w) => {
+      w.u8(0x42); // i64.const
+      w.sleb64(0n);
+    });
+    const s1 = this.mb.addGlobal(I64, true, (w) => {
+      w.u8(0x42);
+      w.sleb64(0n);
+    });
+    const idxG = this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41); // i32.const
+      w.sleb(0);
+    });
+    const cacheG = this.mb.addGlobal({ kind: "ref", nullable: true, typeIndex: cacheType }, true, (w) => {
+      w.u8(0xd0); // ref.null
+      w.sleb(cacheType);
+    });
+    this.randS0Global = s0;
+    this.randS1Global = s1;
+    this.randIndexGlobal = idxG;
+    this.randCacheGlobal = cacheG;
+    const murmur3 = this.murmur3Helper();
+
+    const c = new Code();
+    const SEED = 0,
+      A = 1,
+      B = 2,
+      MIXED = 3,
+      I = 4;
+
+    c.globalGet(idxG);
+    c.i32Eqz();
+    c.ifVoid();
+    c.globalGet(cacheG);
+    c.refIsNull();
+    c.ifVoid();
+    // s0 = MurmurHash3(seed); s1 = MurmurHash3(~seed) — math-random.cc's
+    // OWN seeding (NOT SetSeed's ~state0_).
+    c.call(seedFuncIdx);
+    c.localSet(SEED);
+    c.localGet(SEED);
+    c.call(murmur3);
+    c.globalSet(s0);
+    c.localGet(SEED);
+    c.i64Const(-1n); // ~seed via XOR with all-ones
+    c.i64Xor();
+    c.call(murmur3);
+    c.globalSet(s1);
+    c.i32Const(64);
+    c.arrayNewDefault(cacheType);
+    c.globalSet(cacheG);
+    c.end();
+    // Refill: for (i = 0; i < 64; i++) { XorShift128(&s0,&s1); cache[i] =
+    // ToDouble(s0) }. Runs on EVERY refill (not only the first-ever one):
+    // once the 64-slot block is exhausted, the SAME (already-seeded) s0/
+    // s1 state keeps advancing forward, exactly as V8's RefillCache does
+    // on a second, third, ... call.
+    c.i32Const(0);
+    c.localSet(I);
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.i32Const(64);
+    c.i32GeS();
+    c.brIf(1);
+    // XorShift128: a=s0, b=s1; s0'=b; mixed=a; mixed^=mixed<<23;
+    // mixed^=mixed>>17(u); mixed^=b; mixed^=b>>26(u); s1'=mixed.
+    // (random-number-generator.h:121-130 — the source's own local names
+    // are misleadingly swapped; renamed here to avoid propagating that.)
+    c.globalGet(s0);
+    c.localSet(A);
+    c.globalGet(s1);
+    c.localSet(B);
+    c.localGet(B);
+    c.globalSet(s0);
+    c.localGet(A);
+    c.localSet(MIXED);
+    c.localGet(MIXED);
+    c.localGet(MIXED);
+    c.i64Const(23n);
+    c.i64Shl();
+    c.i64Xor();
+    c.localSet(MIXED);
+    c.localGet(MIXED);
+    c.localGet(MIXED);
+    c.i64Const(17n);
+    c.i64ShrU();
+    c.i64Xor();
+    c.localSet(MIXED);
+    c.localGet(MIXED);
+    c.localGet(B);
+    c.i64Xor();
+    c.localSet(MIXED);
+    c.localGet(MIXED);
+    c.localGet(B);
+    c.i64Const(26n);
+    c.i64ShrU();
+    c.i64Xor();
+    c.localSet(MIXED);
+    c.localGet(MIXED);
+    c.globalSet(s1);
+    // cache[i] = ToDouble(s0) = (f64)(s0 >>u 11) * 2^-53 — the POST-step
+    // s0 (the prime V8's own header comment marks "load-bearing").
+    c.globalGet(cacheG);
+    c.localGet(I);
+    c.globalGet(s0);
+    c.i64Const(11n);
+    c.i64ShrU();
+    c.f64ConvertI64U();
+    c.f64Const(Math.pow(2, -53));
+    c.f64Mul();
+    c.arraySet(cacheType);
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end(); // loop
+    c.end(); // block
+    c.i32Const(64);
+    c.globalSet(idxG);
+    c.end(); // outer if (index==0)
+
+    c.globalGet(idxG);
+    c.i32Const(1);
+    c.i32Sub();
+    c.globalSet(idxG);
+    c.globalGet(cacheG);
+    c.globalGet(idxG);
+    c.arrayGet(cacheType);
+
+    this.mb.setBody(idx, [I64, I64, I64, I64, I32], c.bytes());
+    return idx;
   }
 
   /** The output runtime, emitted once per module on first console use:

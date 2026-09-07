@@ -801,7 +801,7 @@ double scr_math_min_arr(ScrArr *a);
 /* The scalar Math statics (scr_lib.c): min/max are the ECMA two-argument
  * folds (NaN poisons; max prefers +0, min prefers -0 — NOT C's fmin/fmax);
  * random is a uniform [0,1) double at 53-bit granularity from
- * arc4random_buf (SEMANTICS.md 62: Node's distribution, not its sequence). */
+ * arc4random_buf (SEMANTICS.md S068: Node's distribution, not its sequence). */
 double scr_math_min(double a, double b);
 double scr_math_round(double x);
 double scr_math_max(double a, double b);

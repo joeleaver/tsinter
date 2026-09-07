@@ -18,6 +18,47 @@
  *     reads it when it arms a timer, so the two must agree; the origin is
  *     the host's business (monotonic, epoch, virtual — any of them).
  *
+ *   (import "tsinter" "seed" (func (result i64)))   [Math.random modules only]
+ *     ONE 64-bit value, read AT MOST ONCE per module instance, on the
+ *     first `Math.random()` call. Present only in modules that reach
+ *     `Math.random`. The module owns the generator: it seeds V8's
+ *     xorshift128+ from this value (SEMANTICS.md S068) and every later
+ *     draw is computed in-module, so the host is asked for entropy exactly
+ *     once no matter how many numbers the program draws. THE HOST DECIDES
+ *     WHAT RANDOMNESS MEANS HERE — a CSPRNG-backed host gets an
+ *     unpredictable sequence, a fixed-value host gets a reproducible one
+ *     (the `node --random-seed=N` contract). All 64 bits are used whole; a
+ *     host returning a small nonnegative integer is legal.
+ *     THIS IMPORT'S ENFORCEMENT SPLITS THREE WAYS, not the usual two —
+ *     measured directly against the engine (WebAssembly.instantiate /
+ *     WebAssembly.Module.imports):
+ *       PRESENCE AND CALLABILITY — ENFORCED BY THE ENGINE, at
+ *         instantiation, exactly like `write`/`now`: a missing or
+ *         non-callable `seed` is a LinkError before a single instruction
+ *         runs ("function import requires a callable").
+ *       THE RESULT'S TYPE (an actual BigInt) — ALSO ENFORCED BY THE
+ *         ENGINE, but LATER: not at instantiation (an i64-returning
+ *         import is not type-checked against its declared signature until
+ *         it is actually called), but at the FIRST DRAW. A host whose
+ *         `seed` returns a `number` throws `TypeError: Cannot convert
+ *         12345 to a BigInt` the moment `Math.random()` first calls it —
+ *         `now`'s f64 result has no such backstop (§8.3's own text: a
+ *         wrong-typed `now` runs to completion and prints different
+ *         output with no error at all). This is the one place this ABI's
+ *         usual two-tier split (engine-enforced shape vs. unenforced
+ *         value) does not hold: `seed`'s KIND is engine-enforced, just not
+ *         until first use, while `now`'s KIND is not enforced at all.
+ *       THE VALUE ITSELF (origin, quality, range) — ENFORCED BY NOTHING,
+ *         same as every other value contract in this file: a host may
+ *         return whatever 64-bit pattern it likes, including one from a
+ *         BigInt outside the signed i64 range some source produced by
+ *         mistake — WebAssembly reduces any BigInt mod 2^64 silently (a
+ *         measured example: 2**70n + 5n arrives in the module as 5n).
+ *         Whether that pattern came from a CSPRNG or a predictable counter
+ *         is the host's business, exactly as `now`'s origin is — the
+ *         guarantee here is the same shape as `now`'s, but it covers only
+ *         this VALUE tier, not the result-type tier above it.
+ *
  *   (export "_start" (func))            — the program; run it once.
  *   (export "_tick" (func (param f64) (result f64)))  [timer modules only]
  *   (export "_status" (func (result i32)))  [top-level-await modules only]
@@ -67,6 +108,7 @@
 export const IMPORT_MODULE = "tsinter";
 export const IMPORT_WRITE = "write";
 export const IMPORT_NOW = "now";
+export const IMPORT_SEED = "seed";
 export const EXPORT_ENTRY = "_start";
 export const EXPORT_TICK = "_tick";
 export const EXPORT_STATUS = "_status";

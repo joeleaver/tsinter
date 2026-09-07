@@ -1888,9 +1888,13 @@ export type IrLibFn =
   | "math.min"
   | "math.max"
   /** `Math.random()` — a uniform double in [0,1) with the spec's 53-bit
-   * granularity, drawn from arc4random_buf (the CSPRNG behind the crypto
-   * lowerings). Same distribution as Node, NECESSARILY different sequence
-   * (SEMANTICS.md 62 — no seeded sequence exists to match). Never throws. */
+   * granularity. Same distribution on every lane, deliberately different
+   * SEQUENCES per lane (SEMANTICS.md S068) — the mechanism is PER-LANE,
+   * not this key's own: the native lanes draw from arc4random_buf per
+   * call, while the wasm lane seeds V8's xorshift128+ once from a host
+   * import and steps it in-module, so a wasm-lane sequence CAN be
+   * pinned against `node --random-seed=N` even though no lane's sequence
+   * matches another's. Never throws. */
   | "math.random"
   /** Math.abs (C fabs — IS the JS operation) and Math.round (scr_lib.c:
    * ECMA half-toward-+Infinity with the exact-fraction comparison — C

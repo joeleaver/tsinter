@@ -2733,7 +2733,7 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
             return finish(`scr_math_round(${arg(0)})`);
           // The scalar Math.min/max (scr_lib.c — fmin/fmax drop NaN, so
           // these are the JS folds) and Math.random (arc4random-backed
-          // uniform [0,1), SEMANTICS.md 62). Borrow nothing; no throw.
+          // uniform [0,1), SEMANTICS.md S068). Borrow nothing; no throw.
           case "math.min":
             return finish(`scr_math_min(${arg(0)}, ${arg(1)})`);
           case "math.max":
