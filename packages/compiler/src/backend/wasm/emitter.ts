@@ -11578,6 +11578,46 @@ class Assembler {
           return;
         }
         // ── end INC-25 P1 ────────────────────────────────────────────
+        // ── INC-25 pass P2: num.sameValue, the F64 SameValue (design-
+        // number-v6.txt §2.6/§7.3) ───────────────────────────────────
+        // A direct port of the existing, already-tested union-payload
+        // SameValue shape (unions.ts's own "f64"+sameValue arm):
+        // (x!=x && y!=y) | (bits(x)==bits(y)) — the NaN clause first
+        // (NaN payloads can differ in bits, e.g. a folded 0/0's
+        // canonical 0x7ff8... vs an unfolded Infinity-Infinity's
+        // sign-bit 0xfff8... — SEMANTICS.md not touched, this key
+        // closes the tier's last Object.is divergence, nothing to
+        // register), bits second (splits +0 from -0, which compare
+        // equal under f64.eq but differ under i64.reinterpret_f64).
+        // Only ever reached for a statically-both-f64 pair
+        // (lower-calls.ts's lowerObjectStaticCall, `lk==="f64" &&
+        // rk==="f64"`); every other operand-kind pair is a DIFFERENT
+        // IR node and never reaches here.
+        if (e.fn === "num.sameValue") {
+          const x = this.acquireScratch(F64);
+          const y = this.acquireScratch(F64);
+          this.walkExpr(e.args[0]!);
+          code.localSet(x);
+          this.walkExpr(e.args[1]!);
+          code.localSet(y);
+          code.localGet(x);
+          code.localGet(x);
+          code.f64Ne();
+          code.localGet(y);
+          code.localGet(y);
+          code.f64Ne();
+          code.i32And();
+          code.localGet(x);
+          code.i64ReinterpretF64();
+          code.localGet(y);
+          code.i64ReinterpretF64();
+          code.i64Eq();
+          code.i32Or();
+          this.releaseScratch(F64, x);
+          this.releaseScratch(F64, y);
+          return;
+        }
+        // ── end INC-25 P2 ────────────────────────────────────────────
         if (this.emitBufferLibCall(e)) return;
         if (this.emitTimerCall(e)) return;
         if (this.emitEmitterLibCall(e)) return;

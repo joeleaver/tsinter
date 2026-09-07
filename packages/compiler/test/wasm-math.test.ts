@@ -363,3 +363,113 @@ describe("wasm the five predicates — pinned against the IR doc's own contract,
     expect(true).toBe(true);
   });
 });
+
+describe("wasm num.sameValue — Object.is over two f64 operands, the tier's last divergence from === (INC-25 P2, design-number-v6.txt §2.6/§7.3, CP1 ack R1/R2/R4)", () => {
+  test("the pin table: every row computed from THIS session's Node at test time, never hand-typed, including the R1 addition that rules out a one-sided NaN-clause arm", async () => {
+    const pairs: [string, string][] = [
+      ["NaN", "NaN"],
+      ["0/0", "NaN"],
+      ["NaN", "1"],
+      ["1", "NaN"], // CP1 ack R1: without this row a `y!=y || bits==` arm
+      // (NaN-clause on the SECOND operand only) passes every OTHER row here,
+      // since NaN sits in the second position in every NaN-true row — this
+      // row is (1, NaN), NaN SECOND, and reddens exactly that wrong arm.
+      ["0", "-0"],
+      ["-0", "0"],
+      ["-0", "-0"],
+      ["0", "0"],
+      ["1", "1"],
+      ["1", "2"],
+      ["1.5", "3/2"],
+      ["1/0", "1/0"],
+      ["1/0", "-1/0"],
+    ];
+    const exprs = pairs.map(([a, b]) => `Object.is(${a},${b})`);
+    const res = await buildWasm("samevalue-pins.ts", `console.log(${exprs.join(", ")});`);
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+    const { stdout } = await runWasm(res.binaryPath);
+    // eslint-disable-next-line no-eval
+    const nodeVals = pairs.map(([a, b]) => Object.is(eval(a), eval(b)));
+    expect(stdout).toBe(nodeVals.join(" ") + "\n");
+  });
+
+  test("the differing-NaN-PAYLOAD row (CP1 ack R2): 0/0 FOLDS to the canonical NaN bit pattern at compile time (tryFoldFloatConst — a numLit reached directly folds unless it IS a bare +/-Infinity leaf), while `Infinity - Infinity` does NOT fold (a bare Infinity leaf poisons the fold) and is computed at RUNTIME by the wasm engine's own f64.sub, which yields the SIGN-BIT NaN pattern — a bits-equal-only arm would answer these two operands unequal; Object.is must still say true", async () => {
+    const res = await buildWasm(
+      "samevalue-nan-payload.ts",
+      `console.log(Object.is(0 / 0, Infinity - Infinity), Object.is(Infinity - Infinity, 0 / 0));`,
+    );
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+    const { stdout } = await runWasm(res.binaryPath);
+    expect(stdout).toBe(`${Object.is(0 / 0, Infinity - Infinity)} ${Object.is(Infinity - Infinity, 0 / 0)}\n`);
+    expect(stdout).toBe("true true\n");
+  });
+
+  test("operand ORDER and SINGLE evaluation: Object.is(tap(1), tap(2)) prints 1 then 2, once each, before the boolean (mirrors P1's 2445 math.max order pin — this is NOT 2561's own line 18, which exercises the disjoint-kind routing, a different IR path that already compiles)", async () => {
+    const res = await buildWasm(
+      "samevalue-order.ts",
+      `
+        function tap(n: number): number { console.log(n); return n; }
+        console.log(Object.is(tap(1), tap(2)));
+      `,
+    );
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+    const { stdout } = await runWasm(res.binaryPath);
+    expect(stdout).toBe("1\n2\nfalse\n");
+  });
+
+  test("NEGATIVE CONTROL 1 — plain f64.eq (the === shape, no NaN clause, no bits path): must redden Object.is(NaN,NaN) and Object.is(0,-0)", async () => {
+    const run = await standaloneRun2(
+      standaloneModule([F64, F64], [F64], (c) => {
+        c.localGet(0);
+        c.localGet(1);
+        c.f64Eq();
+        c.f64ConvertI32U();
+      }),
+    );
+    expect(run(NaN, NaN)).toBe(0); // Node: true — REDDENS
+    expect(Object.is(NaN, NaN)).toBe(true);
+    expect(run(0, -0)).toBe(1); // Node: false — REDDENS
+    expect(Object.is(0, -0)).toBe(false);
+  });
+
+  test("NEGATIVE CONTROL 2 — bits-equal ONLY, no NaN clause: must redden the differing-payload NaN row (0/0 vs Infinity-Infinity — CP1 ack R2's own row)", async () => {
+    const run = await standaloneRun2(
+      standaloneModule([F64, F64], [F64], (c) => {
+        c.localGet(0);
+        c.i64ReinterpretF64();
+        c.localGet(1);
+        c.i64ReinterpretF64();
+        c.i64Eq();
+        c.f64ConvertI32U();
+      }),
+    );
+    const a = 0 / 0;
+    const b = Infinity - Infinity;
+    expect(run(a, b)).toBe(0); // Node: true — REDDENS
+    expect(Object.is(a, b)).toBe(true);
+  });
+
+  test("NEGATIVE CONTROL 3 — a NaN clause written on the SECOND operand ONLY (CP1 ack R1's own counterexample arm): `y!=y || bits==` passes every row this pin listed except (1,NaN) — must redden exactly that row", async () => {
+    const run = await standaloneRun2(
+      standaloneModule([F64, F64], [F64], (c) => {
+        c.localGet(1);
+        c.localGet(1);
+        c.f64Ne(); // isNaN(y) only
+        c.localGet(0);
+        c.i64ReinterpretF64();
+        c.localGet(1);
+        c.i64ReinterpretF64();
+        c.i64Eq();
+        c.i32Or();
+        c.f64ConvertI32U();
+      }),
+    );
+    expect(run(1, NaN)).toBe(1); // Node: false — REDDENS
+    expect(Object.is(1, NaN)).toBe(false);
+    // ...but it PASSES the (NaN,1) row and the all-true NaN rows, which is
+    // exactly why (1,NaN) had to be added (CP1 ack R1) — recorded here so
+    // this control's own limits are visible, not just its one red row.
+    expect(run(NaN, 1)).toBe(0);
+    expect(Object.is(NaN, 1)).toBe(false);
+  });
+});

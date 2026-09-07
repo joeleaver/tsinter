@@ -3072,6 +3072,14 @@ const TIER_FLOOR: string[] = [
   "2488-ast-walker.ts",
   "2577-builtin-global-destructuring.js",
   "2611-regex-named-groups-js.cjs",
+  // Increment 25, pass P2 (num.sameValue — Object.is's F64 SameValue, the
+  // tier's last divergence from ===): (x!=x && y!=y) | (bits(x)==bits(y)),
+  // a direct port of unions.ts's own already-tested union-payload
+  // SameValue shape. Reached only for a statically-both-f64 operand pair
+  // (lower-calls.ts's lowerObjectStaticCall); every other kind pair
+  // already compiled before this pass. No register entry: the tier now
+  // matches Node exactly on Object.is over every kind. 820 -> 821.
+  "2561-object-is.ts",
 ];
 
 interface RunResult {
