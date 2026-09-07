@@ -2499,9 +2499,14 @@ double scr_math_max(double a, double b) {
  * zero: round(-1.5) is -2 where JS answers -1) and NOT floor(x + 0.5)
  * (the float ADD drifts at the epsilon boundary: 0.49999999999999994 +
  * 0.5 == 1.0 in doubles where the exact sum is below one — JS answers
- * 0). x - floor(x) is EXACT for doubles (Sterbenz), so the fraction
- * comparison decides losslessly; results in (-0.5, 0] keep the sign (JS:
- * Math.round(-0.3) is -0). */
+ * 0). x - floor(x) is exact for doubles EXCEPT on (-0.5, 0), where
+ * Sterbenz does not apply (floor is -1, |x| < 0.5): there the exact
+ * fraction is in (0.5, 1) and the rounded one in [0.5, 1] (it is exactly
+ * 1 for most of the doubles in the interval — every x in [-2^-54, 0),
+ * e.g. -5e-324), so both take the same `< 0.5` else-arm and the
+ * comparison still decides correctly (at -0.49999999999999994 the stored
+ * fraction is exactly 0.5); results
+ * in (-0.5, 0] keep the sign (JS: Math.round(-0.3) is -0). */
 double scr_math_round(double x) {
   if (isnan(x) || isinf(x) || x == 0.0) return x;
   double f = floor(x);

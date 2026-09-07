@@ -1897,9 +1897,11 @@ export type IrLibFn =
    * matches another's. Never throws. */
   | "math.random"
   /** Math.abs (C fabs — IS the JS operation) and Math.round (scr_lib.c:
-   * ECMA half-toward-+Infinity with the exact-fraction comparison — C
-   * round() is half-away-from-zero and floor(x+0.5) drifts at the
-   * epsilon boundary). Borrow nothing; never throw. */
+   * ECMA half-toward-+Infinity via floor and a fraction comparison that is
+   * exact except on (-0.5, 0), where the rounded fraction stays at or above
+   * 0.5 and so cannot cross the `< 0.5` branch — C round() is
+   * half-away-from-zero and floor(x+0.5) drifts at the epsilon boundary).
+   * Borrow nothing; never throw. */
   | "math.abs"
   | "math.round"
   /** Math.trunc / Math.ceil — C trunc()/ceil() ARE the JS operations

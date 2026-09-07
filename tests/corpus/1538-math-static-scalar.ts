@@ -1,6 +1,6 @@
 // The STATIC scalar Math members: min/max at two arguments (the ECMA
 // folds — NaN poisons, max prefers +0 over -0, min the reverse) and
-// random() (uniform [0,1); SEMANTICS.md 62 — Node's distribution, not
+// random() (uniform [0,1); SEMANTICS.md S068 — Node's distribution, not
 // its sequence, so the corpus pins invariants, never bytes). No @dynamic:
 // this whole program compiles statically.
 console.log(Math.min(2, -9), Math.max(2, -9), Math.min(1.5, 1.5), Math.max(-3, -3));

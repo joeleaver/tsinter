@@ -473,10 +473,12 @@ export const ISLAND_SURFACE = {
   } as Record<string, IslandFnEntry | undefined>,
 };
 
-/** Math members with a STATIC lowering — each is one C call that IS the
- * JS operation, at the tabled arity (floor: libm's floor; min/max: the
- * NaN-poisoning ±0-ordered scalar folds; random: arc4random-backed
- * uniform [0,1) — SEMANTICS.md S068). Checked BEFORE the island table
+/** Math members with a STATIC lowering — each is one libCall that IS the
+ * JS operation, at the tabled arity, on every lane (native: libm's floor,
+ * scr_lib.c's NaN-poisoning ±0-ordered min/max folds, arc4random-backed
+ * random; wasm: the f64 instructions, a port of scr_math_round, and a
+ * seeded V8 xorshift128+ — random's per-lane split is SEMANTICS.md S068).
+ * Checked BEFORE the island table
  * (lowerIslandMethodCall), so the tabled arities compile statically and
  * other arities keep the island/fence story — except min/max, whose
  * variadic spelling lowers at ANY plain arity (the n-ary left fold of
