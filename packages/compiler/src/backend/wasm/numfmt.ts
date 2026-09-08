@@ -44,9 +44,25 @@ function litUnits(s: string): Uint8Array {
 }
 
 /** Declares and emits the %w.f64ToStr(f64) → (ref null str) family into
- * `mb`, returning f64ToStr's function index. Call at most once per
- * module (the emitter caches). */
-export function buildF64ToStr(mb: ModuleBuilder, strType: number, strRef: ValType): number {
+ * `mb`, returning f64ToStr's function index (UNCHANGED return shape —
+ * wasm-numfmt.test.ts calls this directly and expects a plain number).
+ * `extrasOut`, if given, is filled with %w.d2d's index and %w.
+ * ensureRyuTables's index (INC-25 P4: toExponential() reuses d2d
+ * directly — the shortest round-trip digit core — rather than running a
+ * second digit algorithm; f64ToStr's own "d2d_small_int" fast path is a
+ * SPEED optimization for exact small integers, whose digits d2d itself
+ * already produces identically, so toExponential calls d2d
+ * unconditionally and skips that shortcut; ensureRyuTables is the lazy
+ * pow5-table init d2d itself assumes already ran, factored out of
+ * f64ToStr's own body so a caller that never runs f64ToStr's BODY at
+ * runtime — only toExponential's own d2d call — can still trigger it).
+ * Call at most once per module (the emitter caches). */
+export function buildF64ToStr(
+  mb: ModuleBuilder,
+  strType: number,
+  strRef: ValType,
+  extrasOut?: { d2d: number; ensureTables: number },
+): number {
   const i64Arr = mb.arrayType(I64, false);
   const tableRef: ValType = { kind: "ref", nullable: true, typeIndex: i64Arr };
 
@@ -70,6 +86,41 @@ export function buildF64ToStr(mb: ModuleBuilder, strType: number, strRef: ValTyp
     w.u8(0xd0);
     w.sleb(strType);
   });
+
+  /** %w.ensureRyuTables() — the lazy one-time materialization of the two
+   * power-of-five tables (gInv/gPow, which %w.d2d itself reads directly,
+   * assuming them already populated) plus the digit/output scratch
+   * (gDig/gOut, f64ToStr's own placement buffers). Factored out (INC-25
+   * P4) so toExponential() — which calls %w.d2d DIRECTLY, never through
+   * f64ToStr's body — can ensure the SAME tables exist before its first
+   * call: f64ToStr's own inline check only ran when f64ToStr ITSELF
+   * executed, which toExponential() never does (declaring/interning the
+   * function is a compile-time link, not a runtime call). Every other
+   * caller of d2d still goes through this ONE function; there is no
+   * second materialization anywhere. */
+  const ensureTables = mb.declareFunc(mb.funcType([], []), "%w.ensureRyuTables");
+  {
+    const c = new Code();
+    c.globalGet(gInv);
+    c.refIsNull();
+    c.ifVoid();
+    c.i32Const(invOffset);
+    c.i32Const(DOUBLE_POW5_INV_SPLIT.length);
+    c.arrayNewData(i64Arr, 0);
+    c.globalSet(gInv);
+    c.i32Const(powOffset);
+    c.i32Const(DOUBLE_POW5_SPLIT.length);
+    c.arrayNewData(i64Arr, 0);
+    c.globalSet(gPow);
+    c.i32Const(18);
+    c.arrayNewDefault(strType);
+    c.globalSet(gDig);
+    c.i32Const(32);
+    c.arrayNewDefault(strType);
+    c.globalSet(gOut);
+    c.end();
+    mb.setBody(ensureTables, [], c.bytes());
+  }
 
   /* ── %w.mulShift64(m, mulLo, mulHi, j) → i64 ─────────────────────────
    * (m × the 128-bit table entry) >> j, exactly d2s_intrinsics.h's plain-C
@@ -808,24 +859,7 @@ export function buildF64ToStr(mb: ModuleBuilder, strType: number, strRef: ValTyp
       });
 
     // Lazy one-time materialization of tables and scratch.
-    c.globalGet(gInv);
-    c.refIsNull();
-    c.ifVoid();
-    c.i32Const(invOffset);
-    c.i32Const(DOUBLE_POW5_INV_SPLIT.length);
-    c.arrayNewData(i64Arr, 0);
-    c.globalSet(gInv);
-    c.i32Const(powOffset);
-    c.i32Const(DOUBLE_POW5_SPLIT.length);
-    c.arrayNewData(i64Arr, 0);
-    c.globalSet(gPow);
-    c.i32Const(18);
-    c.arrayNewDefault(strType);
-    c.globalSet(gDig);
-    c.i32Const(32);
-    c.arrayNewDefault(strType);
-    c.globalSet(gOut);
-    c.end();
+    c.call(ensureTables);
 
     // Specials, in scr_number.c's order.
     c.localGet(X);
@@ -1207,5 +1241,9 @@ export function buildF64ToStr(mb: ModuleBuilder, strType: number, strRef: ValTyp
     mb.setBody(f64ToStr, locals, c.bytes());
   }
 
+  if (extrasOut) {
+    extrasOut.d2d = d2d;
+    extrasOut.ensureTables = ensureTables;
+  }
   return f64ToStr;
 }

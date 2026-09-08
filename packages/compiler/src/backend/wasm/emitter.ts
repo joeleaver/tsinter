@@ -5133,6 +5133,9 @@ class Assembler {
       strIndexOf: () => this.strs.indexOf(),
       strMatchAt: () => this.strs.matchAt(),
       jsonQuoteStr: () => this.json.quoteStr(),
+      toPrecision: () => this.json.toPrecision(),
+      toFixed: () => this.json.toFixed(),
+      toRadix: () => this.toRadixHelper(),
       bytesRefU8: () => this.bytesB.bytesRef(),
       bytesTypeU8: () => this.bytesB.bytesType(),
       bytesEquals: () => this.bytesB.equalsHelper(),
@@ -11640,6 +11643,37 @@ class Assembler {
           return;
         }
         // ── end INC-25 P3 ────────────────────────────────────────────
+        // ── INC-25 pass P4: the formatters (design-number-v6.txt §2.5/
+        // §7.5) — toFixed/toFixed0 REUSE json.ts's exact sdc expansion
+        // (ASSIGN+ROUND-AT(mode 1, ties away)+READER, CP1 §2); toExponential
+        // is digit-free-only (v6 §7.8: `toExponential(d)` would widen the
+        // key, not built) and reuses numfmt.ts's Ryū digits directly. ── */
+        if (e.fn === "num.toFixed0") {
+          // toFixed0(f=0) can still RangeError (it cannot here, in fact,
+          // since 0 is always in [0,100] — but it calls the SAME shared
+          // toFixed() that can, for f != 0, so the site owns the check
+          // uniformly, exactly json.parse's own precedent above).
+          this.walkExpr(e.args[0]!);
+          code.call(this.json.toFixed0());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "num.toFixed") {
+          // The digits RangeError sets the exception cell and returns
+          // null (json.ts's own throwError shape) — the call site owns
+          // the pending check, json.parse's own precedent above.
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.json.toFixed());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "num.toExponential") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.toExponentialHelper());
+          return;
+        }
+        // ── end INC-25 P4 ────────────────────────────────────────────
         if (this.emitBufferLibCall(e)) return;
         if (this.emitTimerCall(e)) return;
         if (this.emitEmitterLibCall(e)) return;
@@ -15379,6 +15413,27 @@ class Assembler {
             // helper, let alone need a runtime check for them there.
             if (e.name === undefined) throw new Error("emitter bug: jsOp getProp without a name");
             const name = e.name;
+            // Math.PI / Math.E (D4-i, INC-25 P4): globalGet's CLOSED
+            // TABLE shape, matched BEFORE walkExpr ever runs on the
+            // receiver sub-expression — the SAME structural check the
+            // callMethod arm's own Promise/JSON precedent uses (~line
+            // 15737's own comment). ONLY these two: ISLAND_SURFACE.
+            // math.props (surfaces.ts) is measured to be exactly
+            // `{ PI: F64, E: F64 }`, and every OTHER Math data property
+            // (LN10, LN2, ...) refuses at the FRONTEND (SC2020, measured
+            // this pass) before any backend ever sees it — tabling them
+            // here would be genuinely unreachable code (CP1 §8, R10).
+            // A bare globalGet reached any other way still refuses
+            // named (case "globalGet" below, `expr:${e.kind}`).
+            if (
+              (name === "PI" || name === "E") &&
+              e.args[0]!.kind === "jsOp" &&
+              e.args[0]!.op === "globalGet" &&
+              e.args[0]!.name === "Math"
+            ) {
+              this.dyn.boxNum(code, (x) => x.f64Const(name === "PI" ? Math.PI : Math.E));
+              return;
+            }
             // "__proto__"/"caller"/"arguments" ride the gate as SPECIAL
             // names rather than table members (review round 3, R1/R2):
             // they are ACCESSORS (an own-property/proto pair, or a
@@ -28768,12 +28823,586 @@ class Assembler {
    * code-point stance or the utf16 flag's raw unit order. */
 
   private f64ToStrFunc: number | null = null;
+  private d2dFunc: number | null = null;
+  private ensureRyuTablesFunc: number | null = null;
 
   /** %w.f64ToStr — the Ryū digit core + ECMA placement, built in
    * numfmt.ts (its own module: ~the largest single helper family). */
   private f64ToStrHelper(): number {
-    this.f64ToStrFunc ??= buildF64ToStr(this.mb, this.strType, this.strRef);
+    if (this.f64ToStrFunc === null) {
+      const extras = { d2d: -1, ensureTables: -1 };
+      this.f64ToStrFunc = buildF64ToStr(this.mb, this.strType, this.strRef, extras);
+      this.d2dFunc = extras.d2d;
+      this.ensureRyuTablesFunc = extras.ensureTables;
+    }
     return this.f64ToStrFunc;
+  }
+
+  /** %w.d2d(ieeeMantissa, ieeeExponent) → [mantissa digits as I64,
+   * decimal exponent as I32] — Ryū's shortest/closest/ties-even digit
+   * generator alone, exposed for toExponential() (INC-25 P4, v6 §2.5):
+   * the shortest round-trip digits f64ToStr's OWN placement logic
+   * already produces are exactly what DTOA_SHORTEST asks for; this
+   * calls the SAME instance f64ToStrHelper interns (declareFunc twice
+   * under the same name would be the P6/CACHED hazard), never a second
+   * copy of the digit algorithm. CALLERS MUST ALSO CALL
+   * `ensureRyuTablesHelper()` at runtime before their first call here
+   * (measured: d2d reads the gInv/gPow power-of-five tables directly,
+   * assuming them already materialized — f64ToStr's OWN body used to be
+   * the only thing that ran that lazy init, which toExponential() never
+   * triggers by merely referencing this function's index; a real, live
+   * "null reference" trap on the first non-small-int input, caught by
+   * this pass's own smoke test before it ever reached a pin file). */
+  private d2dHelper(): number {
+    this.f64ToStrHelper(); // interns both functions together, first call
+    return this.d2dFunc!;
+  }
+
+  /** %w.ensureRyuTables() — see d2dHelper's own note: call this ONCE at
+   * runtime, at the top of any function that calls d2dHelper() WITHOUT
+   * also calling f64ToStrHelper()'s function body first. Idempotent
+   * (numfmt.ts's own null-check), so calling it redundantly is free. */
+  private ensureRyuTablesHelper(): number {
+    this.f64ToStrHelper();
+    return this.ensureRyuTablesFunc!;
+  }
+
+  private toExponentialFunc: number | null = null;
+
+  /** %w.toExponential(x) → str — `num.toExponential` [F64]->STRING
+   * (ir/validate.ts:218; INC-25 P4, v6 §2.5/§7.5). The KEY carries only
+   * the digit-FREE form (`toExponential(d)` is a real JS form the key
+   * cannot express — v6 §7.8, not built). Order from the CALLER
+   * (builtins-number.cc NumberPrototypeToExponential): NaN -> "NaN"
+   * first; then sign extracted and value negated to |x|; ±0 -> "0e+0"
+   * UNCONDITIONALLY (matching numfmt.ts's own f64ToStr convention of
+   * checking zero before ever decoding bits — the sign is dropped here,
+   * -0 is not < 0 so it never sets NEG in the first place); Infinity ->
+   * "Infinity"/"-Infinity". Finite nonzero: DoubleToExponentialStringView
+   * with f=-1 (DTOA_SHORTEST) is Ryū's own shortest digits, so this
+   * calls %w.d2d DIRECTLY (never a second digit algorithm) rather than
+   * going through the sdc exact-decimal expansion — d2d's (M, E) pair
+   * gives value == M * 10^E with M an EXACT-decimal-digit integer that
+   * can need up to 17 significant digits and so must be rendered from
+   * the I64 directly (never round-tripped through f64 — a 17-digit
+   * integer can exceed 2^53 and would silently lose a digit). The printed
+   * exponent (EXPO = E + digitCount(M) - 1) is always small (|EXPO| well
+   * under 2^11), so THAT one safely renders via %w.f64ToStr on a
+   * converted i32 — only M itself needs the direct-from-I64 digit loop
+   * (numfmt.ts's own "dig[k-1..0] <- M's digits" shape, copied here
+   * because it is glue around the digit algorithm, not the algorithm). */
+  private toExponentialHelper(): number {
+    if (this.toExponentialFunc !== null) return this.toExponentialFunc;
+    const strRef = this.strRef;
+    const strType = this.strType;
+    const idx = this.mb.declareFunc(this.mb.funcType([F64], [strRef]), "%w.toExponential");
+    this.toExponentialFunc = idx;
+    const c = new Code();
+    const X = 0;
+    const NEG = 1, BITS = 2, MANTF = 3, M = 4, E = 5, K = 6, T = 7, N = 8, EXPO = 9, I = 10, EXPMAG = 11;
+    const DIGSTR = 12;
+    const locals: ValType[] = [I32, I64, I64, I64, I32, I32, I64, I32, I32, I32, I32, strRef];
+
+    c.localGet(X);
+    c.localGet(X);
+    c.f64Ne();
+    c.ifVoid();
+    this.pushStrLitInto(c, "NaN");
+    c.return_();
+    c.end();
+    c.localGet(X);
+    c.f64Const(0);
+    c.f64Eq();
+    c.ifVoid();
+    this.pushStrLitInto(c, "0e+0");
+    c.return_();
+    c.end();
+    c.localGet(X);
+    c.f64Const(0);
+    c.f64Lt();
+    c.localSet(NEG);
+    c.localGet(NEG);
+    c.ifVoid();
+    c.localGet(X);
+    c.f64Neg();
+    c.localSet(X);
+    c.end();
+    c.localGet(X);
+    c.f64Const(Infinity);
+    c.f64Eq();
+    c.ifVoid();
+    c.localGet(NEG);
+    c.ifResult(strRef);
+    this.pushStrLitInto(c, "-Infinity");
+    c.else_();
+    this.pushStrLitInto(c, "Infinity");
+    c.end();
+    c.return_();
+    c.end();
+
+    // Finite, nonzero, positive here.
+    c.call(this.ensureRyuTablesHelper()); // d2d's own precondition — see d2dHelper's note.
+    c.localGet(X);
+    c.i64ReinterpretF64();
+    c.localSet(BITS);
+    c.localGet(BITS);
+    c.i64Const(0xf_ffff_ffff_ffffn);
+    c.i64And();
+    c.localSet(MANTF);
+    c.localGet(MANTF);
+    c.localGet(BITS);
+    c.i64Const(52n);
+    c.i64ShrU();
+    c.i32WrapI64();
+    c.call(this.d2dHelper());
+    c.localSet(E);
+    c.localSet(M);
+
+    // k = decimal digit count of M.
+    c.i32Const(1);
+    c.localSet(K);
+    c.localGet(M);
+    c.localSet(T);
+    c.block();
+    c.loop();
+    c.localGet(T);
+    c.i64Const(10n);
+    c.i64LtU();
+    c.brIf(1);
+    c.localGet(T);
+    c.i64Const(10n);
+    c.i64DivU();
+    c.localSet(T);
+    c.localGet(K);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(K);
+    c.br(0);
+    c.end();
+    c.end();
+    // decimal_point = E + k; exponent = decimal_point - 1 (CreateExponentialRepresentation's own formula).
+    c.localGet(E);
+    c.localGet(K);
+    c.i32Add();
+    c.localSet(N);
+    c.localGet(N);
+    c.i32Const(1);
+    c.i32Sub();
+    c.localSet(EXPO);
+
+    // DIGSTR[k-1..0] <- M's digits, ASCII, low to high (numfmt.ts's own shape).
+    c.localGet(K);
+    c.arrayNewDefault(strType);
+    c.localSet(DIGSTR);
+    c.localGet(K);
+    c.localSet(I);
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.i32Eqz();
+    c.brIf(1);
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Sub();
+    c.localSet(I);
+    c.localGet(DIGSTR);
+    c.localGet(I);
+    c.i32Const(0x30);
+    c.localGet(M);
+    c.i64Const(10n);
+    c.i64RemU();
+    c.i32WrapI64();
+    c.i32Add();
+    c.arraySet(strType);
+    c.localGet(M);
+    c.i64Const(10n);
+    c.i64DivU();
+    c.localSet(M);
+    c.br(0);
+    c.end();
+    c.end();
+
+    // sign
+    c.localGet(NEG);
+    c.ifResult(strRef);
+    this.pushStrLitInto(c, "-");
+    c.else_();
+    this.pushStrLitInto(c, "");
+    c.end();
+    // + mantissa: significant_digits == 1 ? DIGSTR : DIGSTR[0:1] + "." + DIGSTR[1:k]
+    c.localGet(K);
+    c.i32Const(1);
+    c.i32Eq();
+    c.ifResult(strRef);
+    c.localGet(DIGSTR);
+    c.f64Const(0);
+    c.f64Const(1);
+    c.call(this.strs.slice());
+    c.else_();
+    c.localGet(DIGSTR);
+    c.f64Const(0);
+    c.f64Const(1);
+    c.call(this.strs.slice());
+    this.pushStrLitInto(c, ".");
+    c.call(this.concatHelper());
+    c.localGet(DIGSTR);
+    c.f64Const(1);
+    c.localGet(K);
+    c.f64ConvertI32S();
+    c.call(this.strs.slice());
+    c.call(this.concatHelper());
+    c.end();
+    c.call(this.concatHelper());
+    // + "e"
+    this.pushStrLitInto(c, "e");
+    c.call(this.concatHelper());
+    // + exponent sign
+    c.localGet(EXPO);
+    c.i32Const(0);
+    c.i32LtS();
+    c.ifResult(strRef);
+    this.pushStrLitInto(c, "-");
+    c.else_();
+    this.pushStrLitInto(c, "+");
+    c.end();
+    c.call(this.concatHelper());
+    // + exponent magnitude — always small, safe through f64ToStr.
+    c.localGet(EXPO);
+    c.i32Const(0);
+    c.i32LtS();
+    c.ifResult(I32);
+    c.i32Const(0);
+    c.localGet(EXPO);
+    c.i32Sub();
+    c.else_();
+    c.localGet(EXPO);
+    c.end();
+    c.localSet(EXPMAG);
+    c.localGet(EXPMAG);
+    c.f64ConvertI32S();
+    c.call(this.f64ToStrHelper());
+    c.call(this.concatHelper());
+
+    this.mb.setBody(idx, locals, c.bytes());
+    return idx;
+  }
+
+  private toRadixFunc: number | null = null;
+
+  /** `%w.toRadix(x, radix)` → str — `Number.prototype.toString(radix)`
+   * for radix != 10 (D4-iii, INC-25 P4): a TRANSCRIPTION of
+   * DoubleToRadixStringView (conversions.cc 723ff7b6:1230-1319, def as
+   * measured on the vendored bytes — the design's "DoubleToRadixCString"
+   * is this routine's pre-rename name). PRECONDITION, enforced by the
+   * CALLER (dyn.ts's toString arm): x is finite and nonzero (NaN/
+   * Infinity/±0 are the caller's own special cases), radix is an
+   * integer in [2, 36] (the caller's own RangeError). Sign, unlike this
+   * pass's OTHER formatters, is computed INSIDE this function — matching
+   * the vendored routine's own shape exactly, for fidelity to the bytes.
+   * delta = half the ULP at |x|; the `delta <= 0` arm is the loop's
+   * TERMINATION GUARANTEE (CP1 ack R13, not a subnormal nicety): live for
+   * every subnormal AND the whole smallest-normal binade [2^-1022,
+   * 2^-1021) — without it, delta stays 0 and `fraction >= delta` is true
+   * even at fraction == 0, so the fraction loop never ends. The
+   * FPU-flush branch is dead here (wasm has no flush-to-zero mode); only
+   * the else arm (delta = the smallest denormal, `5e-324`) is ever live.
+   * Round-to-even in the fraction loop can BACK-TRACE through
+   * already-written digits (carrying past radix-1 digits) or carry into
+   * the integer part — the integer-carry sub-arm is UNCOVERED by any
+   * pin (rev-25's 1.87M-pair search could not reach it), not proven
+   * unreachable, and is transcribed faithfully anyway (V8 CHECKs there).
+   * The integer loop's remainder is `%w.fmod` (CP1 ack R2: `x -
+   * trunc(x/r)*r` in f64 is NOT the same operation as C's `Modulo`/
+   * `std::fmod` — 21444 of 102544 model rows differed). Buffer sized
+   * from `kDoubleToRadixMaxChars` = 2200 (conversions.h 4dd79f7c:86),
+   * cursors starting at the middle exactly as the vendored routine's
+   * own `buffer.size() / 2`. */
+  private toRadixHelper(): number {
+    if (this.toRadixFunc !== null) return this.toRadixFunc;
+    const strRef = this.strRef;
+    const strType = this.strType;
+    const idx = this.mb.declareFunc(this.mb.funcType([F64, I32], [strRef]), "%w.toRadix");
+    this.toRadixFunc = idx;
+    const c = new Code();
+    const X = 0, RADIX = 1;
+    const NEG = 2, INTEGER = 3, FRACTION = 4, DELTA = 5, BUF = 6, ICUR = 7, FCUR = 8;
+    const DIGIT = 9, RADIXF = 10, REM = 11, CH = 12, T = 13;
+    const locals: ValType[] = [I32, F64, F64, F64, strRef, I32, I32, I32, F64, F64, I32, I32];
+
+    /** Consumes a digit VALUE (0..35) already on the stack, pushes its
+     * ASCII char — V8's `chars[digit]` table, as a branch instead of a
+     * lookup array (avoids a second interned table for 36 bytes). */
+    const digitToChar = (): void => {
+      c.localSet(T);
+      c.localGet(T);
+      c.i32Const(10);
+      c.i32LtS();
+      c.ifResult(I32);
+      c.i32Const(0x30);
+      c.localGet(T);
+      c.i32Add();
+      c.else_();
+      c.i32Const(0x61);
+      c.localGet(T);
+      c.i32Const(10);
+      c.i32Sub();
+      c.i32Add();
+      c.end();
+    };
+
+    c.localGet(X);
+    c.f64Const(0);
+    c.f64Lt();
+    c.localSet(NEG);
+    c.localGet(NEG);
+    c.ifVoid();
+    c.localGet(X);
+    c.f64Neg();
+    c.localSet(X);
+    c.end();
+
+    c.localGet(X);
+    c.f64Floor();
+    c.localSet(INTEGER);
+    c.localGet(X);
+    c.localGet(INTEGER);
+    c.f64Sub();
+    c.localSet(FRACTION);
+
+    // delta = 0.5 * (NextDouble(x) - x); x is positive and finite here,
+    // so NextDouble is a plain bit-increment.
+    c.localGet(X);
+    c.i64ReinterpretF64();
+    c.i64Const(1n);
+    c.i64Add();
+    c.f64ReinterpretI64();
+    c.localGet(X);
+    c.f64Sub();
+    c.f64Const(0.5);
+    c.f64Mul();
+    c.localSet(DELTA);
+    c.localGet(DELTA);
+    c.f64Const(0);
+    c.f64Le();
+    c.ifVoid();
+    c.f64Const(5e-324); // smallest denormal — the FPU-flush arm is dead in wasm.
+    c.localSet(DELTA);
+    c.end();
+
+    c.localGet(RADIX);
+    c.f64ConvertI32S();
+    c.localSet(RADIXF);
+
+    c.i32Const(2200);
+    c.arrayNewDefault(strType);
+    c.localSet(BUF);
+    c.i32Const(1100);
+    c.localSet(ICUR);
+    c.localGet(ICUR);
+    c.localSet(FCUR);
+
+    // Fraction loop.
+    c.localGet(FRACTION);
+    c.localGet(DELTA);
+    c.f64Ge();
+    c.ifVoid();
+    c.localGet(BUF);
+    c.localGet(FCUR);
+    c.i32Const(0x2e);
+    c.arraySet(strType);
+    c.localGet(FCUR);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(FCUR);
+    c.block(); // OUTER — the do-while's exit target (depth 1 inside DOWHILE)
+    c.loop(); // DOWHILE
+    c.localGet(FRACTION);
+    c.localGet(RADIXF);
+    c.f64Mul();
+    c.localSet(FRACTION);
+    c.localGet(DELTA);
+    c.localGet(RADIXF);
+    c.f64Mul();
+    c.localSet(DELTA);
+    c.localGet(FRACTION);
+    c.i32TruncF64S();
+    c.localSet(DIGIT);
+    c.localGet(BUF);
+    c.localGet(FCUR);
+    c.localGet(DIGIT);
+    digitToChar();
+    c.arraySet(strType);
+    c.localGet(FCUR);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(FCUR);
+    c.localGet(FRACTION);
+    c.localGet(DIGIT);
+    c.f64ConvertI32S();
+    c.f64Sub();
+    c.localSet(FRACTION);
+    // round-to-even: fraction>0.5 || (fraction==0.5 && digit odd)
+    c.localGet(FRACTION);
+    c.f64Const(0.5);
+    c.f64Gt();
+    c.localGet(FRACTION);
+    c.f64Const(0.5);
+    c.f64Eq();
+    c.localGet(DIGIT);
+    c.i32Const(1);
+    c.i32And();
+    c.i32And();
+    c.i32Or();
+    c.ifVoid();
+    c.localGet(FRACTION);
+    c.localGet(DELTA);
+    c.f64Add();
+    c.f64Const(1);
+    c.f64Gt();
+    c.ifVoid();
+    c.block(); // BACKTRACE — the inner `while (true)`'s break target
+    c.loop();
+    c.localGet(FCUR);
+    c.i32Const(1);
+    c.i32Sub();
+    c.localSet(FCUR);
+    c.localGet(FCUR);
+    c.i32Const(1100);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(INTEGER);
+    c.f64Const(1);
+    c.f64Add();
+    c.localSet(INTEGER);
+    c.br(2); // break BACKTRACE (if=0, loop=1, block=2)
+    c.end();
+    c.localGet(BUF);
+    c.localGet(FCUR);
+    c.arrayGetU(strType);
+    c.localSet(CH);
+    c.localGet(CH);
+    c.i32Const(0x39);
+    c.i32GtS();
+    c.ifResult(I32);
+    c.localGet(CH);
+    c.i32Const(0x61);
+    c.i32Sub();
+    c.i32Const(10);
+    c.i32Add();
+    c.else_();
+    c.localGet(CH);
+    c.i32Const(0x30);
+    c.i32Sub();
+    c.end();
+    c.localSet(DIGIT);
+    c.localGet(DIGIT);
+    c.i32Const(1);
+    c.i32Add();
+    c.localGet(RADIX);
+    c.i32LtS();
+    c.ifVoid();
+    c.localGet(BUF);
+    c.localGet(FCUR);
+    c.localGet(DIGIT);
+    c.i32Const(1);
+    c.i32Add();
+    digitToChar();
+    c.arraySet(strType);
+    c.localGet(FCUR);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(FCUR);
+    c.br(2); // break BACKTRACE (if=0, loop=1, block=2)
+    c.end();
+    c.br(0); // continue BACKTRACE
+    c.end();
+    c.end(); // end BACKTRACE loop/block
+    c.br(3); // break OUTER do-while entirely (if=0, roundUp-if=1, DOWHILE=2, OUTER=3)
+    c.end(); // end "fraction+delta>1" if
+    c.end(); // end round-to-even if
+    c.localGet(FRACTION);
+    c.localGet(DELTA);
+    c.f64Ge();
+    c.brIf(0); // continue DOWHILE
+    c.end(); // end DOWHILE
+    c.end(); // end OUTER
+    c.end(); // end "fraction>=delta" if
+
+    // Integer part: zero-fill (R5: `integer/radix >= 2^53` is the same
+    // test as `Double(integer/radix).Exponent() > 0`), then digits.
+    c.block();
+    c.loop();
+    c.localGet(INTEGER);
+    c.localGet(RADIXF);
+    c.f64Div();
+    c.f64Const(9007199254740992);
+    c.f64Lt();
+    c.brIf(1);
+    c.localGet(INTEGER);
+    c.localGet(RADIXF);
+    c.f64Div();
+    c.localSet(INTEGER);
+    c.localGet(ICUR);
+    c.i32Const(1);
+    c.i32Sub();
+    c.localSet(ICUR);
+    c.localGet(BUF);
+    c.localGet(ICUR);
+    c.i32Const(0x30);
+    c.arraySet(strType);
+    c.br(0);
+    c.end();
+    c.end();
+
+    c.block();
+    c.loop();
+    c.localGet(INTEGER);
+    c.localGet(RADIXF);
+    c.call(this.fmodHelper());
+    c.localSet(REM);
+    c.localGet(ICUR);
+    c.i32Const(1);
+    c.i32Sub();
+    c.localSet(ICUR);
+    c.localGet(BUF);
+    c.localGet(ICUR);
+    c.localGet(REM);
+    c.i32TruncF64S();
+    digitToChar();
+    c.arraySet(strType);
+    c.localGet(INTEGER);
+    c.localGet(REM);
+    c.f64Sub();
+    c.localGet(RADIXF);
+    c.f64Div();
+    c.localSet(INTEGER);
+    c.localGet(INTEGER);
+    c.f64Const(0);
+    c.f64Gt();
+    c.brIf(0);
+    c.end();
+    c.end();
+
+    c.localGet(NEG);
+    c.ifVoid();
+    c.localGet(ICUR);
+    c.i32Const(1);
+    c.i32Sub();
+    c.localSet(ICUR);
+    c.localGet(BUF);
+    c.localGet(ICUR);
+    c.i32Const(0x2d);
+    c.arraySet(strType);
+    c.end();
+
+    c.localGet(BUF);
+    c.localGet(ICUR);
+    c.f64ConvertI32S();
+    c.localGet(FCUR);
+    c.f64ConvertI32S();
+    c.call(this.strs.slice());
+    this.mb.setBody(idx, locals, c.bytes());
+    return idx;
   }
 
   private inspF64Func: number | null = null;

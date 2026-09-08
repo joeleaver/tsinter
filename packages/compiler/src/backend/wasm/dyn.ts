@@ -294,6 +294,22 @@ export interface DynDeps {
    * reimplemented here. `specificType`'s embedded-quote string fallback
    * (board #26) is the only caller. */
   jsonQuoteStr: () => number;
+  /** %w.toPrecision(x, p) — json.ts's own formatter (INC-25 P4, CP1 §7,
+   * D4-ii): dyn-path-only, `p` already known non-undefined by the
+   * caller here (both the invoke ladder's own NUM_METHODS arm and the
+   * placeholder-call site check that first, per R11's own note). */
+  toPrecision: () => number;
+  /** %w.toFixed(x, f) — json.ts's own formatter, THE SAME ONE the
+   * static `num.toFixed` key calls (INC-25 P4, CP1 ack R12, the MERGE):
+   * this file's OWN `toFixed()` port (below, the `intDigits+f<=14`
+   * fenced one) is RETIRED by this — every caller here now goes through
+   * the shared, unfenced helper, so the fence fires nowhere. */
+  toFixed: () => number;
+  /** %w.toRadix(x, radix) — DoubleToRadixStringView (D4-iii, INC-25 P4);
+   * see emitter.ts's toRadixHelper for the transcription's own notes.
+   * PRECONDITION enforced by the caller: x finite nonzero, radix in
+   * [2,36]. */
+  toRadix: () => number;
   /** The tier's ONE bytes<u8> valtype (typedarrays.ts) — the SAME struct
    * every elem kind shares, needed here as the DK.BYTES payload's element
    * type. Non-u8 elems never reach this file (the emitter's dynFrom/
@@ -977,7 +993,7 @@ export class DynBuilder {
               // count, `undefined` past the end) is a real shape, not
               // just an unmeasured one.
               x.call(this.deps.jsToNumber());
-              x.call(this.toFixed());
+              x.call(this.deps.toFixed());
             });
             c.else_();
             {
@@ -998,16 +1014,57 @@ export class DynBuilder {
                 c.ifResult(dynRef);
                 c.localGet(RECV);
                 c.else_();
-                // Unmodeled NAME (toLocaleString/toExponential/toPrecision),
-                // but `this` genuinely IS a Number here (review round 1,
-                // SB10 — sbF1b): Node does NOT throw for
-                // `Number.prototype.toPrecision.call(5)` (it answers "5"),
-                // so the "requires that 'this' be a Number" text would be
-                // a FALSE CLAIM about a receiver that is exactly right. An
-                // honest "not supported yet" instead — this file's own
-                // S023-style wording, matching `throwUnsupported`'s
-                // pattern in the `invoke` ladder above.
-                this.pushUnmodeledNumberMethodFence(c, NAME, MSG);
+                {
+                  // toPrecision (INC-25 P4, CP1 ack R11): ROUTED, closing
+                  // what WAS S043 (c)'s own example (`toPrecision.call(5,
+                  // 3)`) before this pass narrowed that bullet's clause to
+                  // {toLocaleString, toExponential} — toPrecision no
+                  // longer belongs there. ARG0 undefined -> f64ToStr(x)
+                  // (`toPrecision.call(5)`
+                  // = "5"), the SAME rule the invoke ladder's own
+                  // undefined-p check applies; else ToNumber(ARG0) then
+                  // the shared helper.
+                  c.localGet(NAME);
+                  this.deps.lit(c, "toPrecision");
+                  c.call(this.deps.strEq());
+                  c.ifResult(dynRef);
+                  this.boxStr(c, (x) => {
+                    x.localGet(ARG0);
+                    x.structGet(dynT, DYN_KIND);
+                    x.i32Const(DK.UNDEF);
+                    x.i32Eq();
+                    x.ifResult(strRef);
+                    x.localGet(RECV);
+                    x.structGet(dynT, DYN_NUM);
+                    x.call(this.deps.f64ToStr());
+                    x.else_();
+                    x.localGet(RECV);
+                    x.structGet(dynT, DYN_NUM);
+                    x.localGet(ARG0);
+                    x.call(this.deps.jsToNumber());
+                    x.call(this.deps.toPrecision());
+                    x.end();
+                  });
+                  c.else_();
+                  // Unmodeled NAME (toLocaleString/toExponential — R11:
+                  // BOTH toExponential spellings stay fenced this pass,
+                  // "not built this pass", not "the path always passes
+                  // digits" — the zero-arg spelling IS the digit-free
+                  // form P4 builds for the static key and COULD be
+                  // routed; not done because no corpus program reaches
+                  // either spelling here), but `this` genuinely IS a
+                  // Number here (review round 1, SB10 — sbF1b): Node
+                  // does NOT throw for `Number.prototype.toPrecision.
+                  // call(5)` — that case is handled above now — so the
+                  // "requires that 'this' be a Number" text would be a
+                  // FALSE CLAIM about a receiver that is exactly right
+                  // for whatever remains unmodeled. An honest "not
+                  // supported yet" instead — this file's own S023-style
+                  // wording, matching `throwUnsupported`'s pattern in
+                  // the `invoke` ladder above.
+                  this.pushUnmodeledNumberMethodFence(c, NAME, MSG);
+                  c.end();
+                }
                 c.end();
               }
               c.end();
@@ -5252,14 +5309,11 @@ export class DynBuilder {
   /** Function.prototype names with an arm. */
   private static readonly FN_METHODS = new Set(["apply", "call"]);
 
-  /** Number.prototype names with an arm (increment 21 stage B, gate 2) —
-   * toString computes the base-10 text (absent radix, or an explicit 10)
-   * via f64ToStr; an explicit NON-10 radix is not a measured corpus need
-   * and FENCES loudly (SB2, review round 1) rather than silently
-   * answering the base-10 digits under a claimed different base —
-   * fractional-radix formatting is V8-internals (DoubleToRadixCString)
-   * this tier does not port. */
-  private static readonly NUM_METHODS = new Set(["toFixed", "toString"]);
+  /** Number.prototype names with an arm (increment 21 stage B, gate 2;
+   * INC-25 P4 gains "toPrecision" and toString's non-10 radix, D4 ii/iii
+   * — the header comment below the OLD radix-fence framing is corrected
+   * at its own site, not here). */
+  private static readonly NUM_METHODS = new Set(["toFixed", "toString", "toPrecision"]);
 
   /** %w.dyn.notFn(what) — Node's catchable "<what> is not a function",
    * `dyn_throw_not_fn`. The CALLER pushes the null result and returns. */
@@ -7265,29 +7319,55 @@ export class DynBuilder {
                 x.structGet(dynT, DYN_NUM);
                 argAt(0);
                 x.call(this.deps.jsToNumber());
-                x.call(this.toFixed());
+                x.call(this.deps.toFixed());
               });
               return;
             }
-            // toString: an ABSENT radix, or an explicit one that is
-            // (loosely) the number 10, is exactly the base-10 answer
-            // f64ToStr already gives — anything else (a real base, or a
-            // non-numeric radix ToNumber would coerce) fences.
+            if (method === "toPrecision") {
+              // p undefined -> f64ToStr(x) (`(5).toPrecision()` = "5"),
+              // the SAME rule the placeholder-call site's own toPrecision
+              // branch applies (D4-ii, INC-25 P4); else ToNumber(p) then
+              // the shared helper.
+              argAt(0);
+              c.localTee(M);
+              c.structGet(dynT, DYN_KIND);
+              c.i32Const(DK.UNDEF);
+              c.i32Eq();
+              c.ifResult(this.dynRef());
+              this.boxStr(c, (x) => {
+                x.localGet(0);
+                x.structGet(dynT, DYN_NUM);
+                x.call(this.deps.f64ToStr());
+              });
+              c.else_();
+              this.boxStr(c, (x) => {
+                x.localGet(0);
+                x.structGet(dynT, DYN_NUM);
+                x.localGet(M);
+                x.call(this.deps.jsToNumber());
+                x.call(this.deps.toPrecision());
+              });
+              c.end();
+              return;
+            }
+            // toString (D4-iii, INC-25 P4): an ABSENT radix defaults to
+            // 10 BEFORE any ToNumber coercion (ECMA-262's own default
+            // parameter, not `ToNumber(undefined)` which would be NaN) —
+            // f64ToStr directly. Otherwise ToNumber + ToIntegerOrInfinity
+            // the radix ONCE; a coerced value of exactly 10 (however
+            // spelled — `"10"`, `10.0`, the receiver's own fast path)
+            // ALSO takes the f64ToStr route, matching Torque's
+            // Number.prototype.toString, which never enters
+            // DoubleToRadixCString for radix 10 by any spelling. Range
+            // check [2,36] next; then NaN(x)->"NaN", Infinity(x)->its
+            // text, ±0(x)->"0" (measured: `(-0).toString(2)` = "0" — the
+            // caller's own special cases, `%w.toRadix` itself REQUIRES a
+            // finite nonzero `x`); else `%w.toRadix(x, ri)`.
             argAt(0);
             c.localTee(M);
             c.structGet(dynT, DYN_KIND);
             c.i32Const(DK.UNDEF);
             c.i32Eq();
-            c.localGet(M);
-            c.structGet(dynT, DYN_KIND);
-            c.i32Const(DK.NUM);
-            c.i32Eq();
-            c.localGet(M);
-            c.structGet(dynT, DYN_NUM);
-            c.f64Const(10);
-            c.f64Eq();
-            c.i32And();
-            c.i32Or();
             c.ifVoid();
             this.boxStr(c, (x) => {
               x.localGet(0);
@@ -7296,10 +7376,89 @@ export class DynBuilder {
             });
             c.return_();
             c.end();
-            this.deps.throwError(c, "%Error", "Error", (x) =>
-              this.deps.lit(x, "'Number.prototype.toString' with a radix other than 10 is not supported yet"),
+            c.localGet(M);
+            c.call(this.deps.jsToNumber());
+            c.localSet(F0);
+            c.localGet(F0);
+            c.localGet(F0);
+            c.f64Ne();
+            c.ifResult(F64);
+            c.f64Const(0);
+            c.else_();
+            c.localGet(F0);
+            c.f64Trunc();
+            c.end();
+            c.localSet(F0);
+            c.localGet(F0);
+            c.f64Const(10);
+            c.f64Eq();
+            c.ifVoid();
+            this.boxStr(c, (x) => {
+              x.localGet(0);
+              x.structGet(dynT, DYN_NUM);
+              x.call(this.deps.f64ToStr());
+            });
+            c.return_();
+            c.end();
+            c.localGet(F0);
+            c.f64Const(2);
+            c.f64Lt();
+            c.localGet(F0);
+            c.f64Const(36);
+            c.f64Gt();
+            c.i32Or();
+            c.ifVoid();
+            this.deps.throwError(c, "%RangeError", "RangeError", (x) =>
+              this.deps.lit(x, "toString() radix argument must be between 2 and 36"),
             );
             c.refNull(dynT);
+            c.return_();
+            c.end();
+            c.localGet(F0);
+            c.i32TruncF64S();
+            c.localSet(J);
+            c.localGet(0);
+            c.structGet(dynT, DYN_NUM);
+            c.localSet(F1);
+            c.localGet(F1);
+            c.localGet(F1);
+            c.f64Ne();
+            c.ifVoid();
+            this.boxStr(c, (x) => this.deps.lit(x, "NaN"));
+            c.return_();
+            c.end();
+            c.localGet(F1);
+            c.i64ReinterpretF64();
+            c.i64Const(0x7fffffffffffffffn);
+            c.i64And();
+            c.f64ReinterpretI64();
+            c.f64Const(Infinity);
+            c.f64Eq();
+            c.ifVoid();
+            this.boxStr(c, (x) => {
+              x.localGet(F1);
+              x.f64Const(0);
+              x.f64Lt();
+              x.ifResult(this.deps.strRef());
+              this.deps.lit(x, "-Infinity");
+              x.else_();
+              this.deps.lit(x, "Infinity");
+              x.end();
+            });
+            c.return_();
+            c.end();
+            c.localGet(F1);
+            c.f64Const(0);
+            c.f64Eq();
+            c.ifVoid();
+            this.boxStr(c, (x) => this.deps.lit(x, "0"));
+            c.return_();
+            c.end();
+            this.boxStr(c, (x) => {
+              x.localGet(F1);
+              x.localGet(J);
+              x.call(this.deps.toRadix());
+            });
           });
         }
 
@@ -7699,303 +7858,6 @@ export class DynBuilder {
     c.end();
     c.localGet(OUT);
     this.mb.setBody(idx, [I32, I32, I32, strRef, I32, strRef, I32], c.bytes());
-    return idx;
-  }
-
-  private toFixedFunc: number | null = null;
-
-  /** %w.dyn.toFixed(x, f) → str — ECMA-262 Number::toFixed. `f<0` or
-   * `f>100` (Infinity/-Infinity included, and NaN — ToIntegerOrInfinity's
-   * own NaN→0 rule keeps that ONE case in range) throws Node's exact
-   * RangeError BEFORE `x` is even inspected — oracle-measured, review
-   * round 1 SB3/SB4 (`NaN.toFixed(101)` throws, it does not answer
-   * "NaN"); non-finite `x` and `|x|>=1e21` both pass through `f64ToStr`
-   * unconverted, Node's own Number::toString(x,10) fallback. Rounding
-   * for everything else: `floor(scaled + 0.5)` — round-half-up on the
-   * (already non-negative) scaled magnitude, which is the spec's
-   * "closest n, ties to the larger" rule restated for x≥0. `f64ToStr`
-   * on the rounded integer gives its exact digit string (no decimal
-   * point/exponent for the magnitudes `ax<1e21` produces here — plain
-   * JS integer formatting); the digit
-   * string is left-zero-padded to f+1 chars before the split, covering
-   * the "ax rounds to fewer significant digits than f wants" case
-   * (measured: `(0).toFixed(2)` needs "000" before slicing "0"|"00"). */
-  toFixed(): number {
-    if (this.toFixedFunc !== null) return this.toFixedFunc;
-    const strRef = this.deps.strRef();
-    const idx = this.mb.declareFunc(this.mb.funcType([F64, F64], [strRef]), "%w.dyn.toFixed");
-    this.toFixedFunc = idx;
-    const c = new Code();
-    const X = 0, F = 1;
-    const FI = 2, SIGN = 3, AX = 4, SCALE = 5, N = 6, DIGITS = 7, DLEN = 8;
-    const ID = 9, TMP = 10;
-    // Step 1 (review round 1, SB3/SB4): the digits RangeError check runs
-    // BEFORE x is even inspected (oracle-measured: `NaN.toFixed(101)`
-    // throws, it does not answer "NaN") — `f` is ALREADY ToNumber'd by
-    // the caller (SB4: a STR digits argument coerces, e.g. "2" → 2), so
-    // this reads the raw f64 directly. IEEE comparisons make F!==F
-    // (NaN) fall out of EVERY term below FALSE on their own — no
-    // separate isNaN guard needed: ToIntegerOrInfinity(NaN) is 0 (in
-    // range), matching `(5).toFixed(NaN)` → "5" measured directly.
-    c.localGet(F);
-    c.f64Const(Infinity);
-    c.f64Eq();
-    c.localGet(F);
-    c.f64Const(-Infinity);
-    c.f64Eq();
-    c.i32Or();
-    c.localGet(F);
-    c.f64Trunc();
-    c.f64Const(0);
-    c.f64Lt();
-    c.i32Or();
-    c.localGet(F);
-    c.f64Trunc();
-    c.f64Const(100);
-    c.f64Gt();
-    c.i32Or();
-    c.ifVoid();
-    this.deps.throwError(c, "%RangeError", "RangeError", (x) =>
-      this.deps.lit(x, "toFixed() digits argument must be between 0 and 100"),
-    );
-    c.refNull(this.deps.strType());
-    c.return_();
-    c.end();
-    c.localGet(X);
-    c.localGet(X);
-    c.f64Ne();
-    c.ifResult(strRef);
-    this.deps.lit(c, "NaN");
-    c.else_();
-    {
-      // Step 2: non-finite x and |x|>=1e21 both pass THROUGH f64ToStr
-      // unconverted — the spec's own Number::toString(x,10) fallback,
-      // oracle-measured ("Infinity"/"-Infinity" verbatim; `1e21` and
-      // `1e21+1` both render as `f64ToStr`'s exponential text, not a
-      // 1-followed-by-21-zeros integer the scale/round path below would
-      // wrongly produce for a magnitude this large).
-      c.localGet(X);
-      c.i64ReinterpretF64();
-      c.i64Const(0x7fffffffffffffffn);
-      c.i64And();
-      c.f64ReinterpretI64();
-      c.localSet(AX);
-      c.localGet(AX);
-      c.f64Const(Infinity);
-      c.f64Eq();
-      c.localGet(AX);
-      c.f64Const(1e21);
-      c.f64Ge();
-      c.i32Or();
-      c.ifResult(strRef);
-      c.localGet(X);
-      c.call(this.deps.f64ToStr());
-      c.else_();
-      // `i32.trunc_f64_s` TRAPS on NaN — F itself can be NaN here (the
-      // range check above admits it, matching ToIntegerOrInfinity(NaN)
-      // = 0 — measured: `(5).toFixed(NaN)` → "5"), so the trunc target
-      // is guarded to 0 first rather than fed to the instruction raw.
-      c.localGet(F);
-      c.localGet(F);
-      c.f64Ne();
-      c.ifResult(F64);
-      c.f64Const(0);
-      c.else_();
-      c.localGet(F);
-      c.f64Trunc();
-      c.end();
-      c.i32TruncF64S();
-      c.localSet(FI);
-      // N2 (review round 2): the scale/round path below (AX*10^FI,
-      // +0.5, floor) is chained f64 arithmetic, NOT exact — beyond a
-      // TOTAL of ~15 significant decimal digits (the integer digits AX
-      // already has, PLUS the fractional digits FI asks for), it can
-      // produce a WRONG digit, or — once the rounded magnitude leaves
-      // the exact-integer window entirely — genuinely GARBLED text
-      // (f64ToStr falling back to exponential notation mid-digit-string,
-      // observed directly: `(0.1).toFixed(22)` renders as
-      // "0.0000000000000000001e+22" on this tier pre-fix). 15 total
-      // significant digits is the WELL-ESTABLISHED, PROVEN-SAFE bound
-      // for IEEE-754 doubles (a strict subset of the "17 always round-
-      // trips" guarantee) — empirically verified here against an EXACT
-      // BigInt reference (mantissa × 2^exponent × 10^FI, rounded) across
-      // 0.1/5/123.456/9.9999/1e20/1/0.5/999.999/0 and subnormals
-      // (5e-300, Number.MIN_VALUE, the smallest normal
-      // 2.2250738585072014e-308) for every (value, f) pair inside the
-      // bound, f∈[0,100]: zero mismatches. A CONSERVATIVE bound (some
-      // "round" values like `(5).toFixed(20)` are exactly correct well
-      // past it and still fence) rather than the tightest possible one
-      // — deriving the true, value-dependent boundary (trailing-zero-
-      // bit-aware) was attempted and rejected as unsound under
-      // measurement; a loud, named, catchable fence beyond a safe
-      // static bound is the ruling's own explicitly accepted shape.
-      //
-      // ID's COUNTER STARTS AT 1, not 0 (below), so it lands one HIGHER
-      // than AX's actual integer-digit count: for AX>=1 the loop divides
-      // once per digit and increments alongside each division, so ID ==
-      // intDigits(AX)+1 once it exits (AX=5 -> ID=2; AX=55 -> ID=3); for
-      // 0<AX<1 the loop body never runs at all and ID stays at its
-      // initial 1, which is ALSO intDigits(AX)+1 under the "zero integer
-      // digits" convention (0+1). So `ID+FI>15` below is really
-      // `intDigits(AX)+FI > 14`, not `> 15` — the EFFECTIVE safe window
-      // is intDigits(AX)+f <= 14, one digit TIGHTER than "15 total
-      // significant digits" reads, in the safe (more conservative)
-      // direction (still never wrong — just fences a handful of cases,
-      // like `(5).toFixed(14)`, that the 15-digit argument alone would
-      // have allowed). Measured directly: `(5).toFixed(14)` fences
-      // (intDigits=1, f=14, sum=15>14) while `(0.1).toFixed(14)`
-      // computes (intDigits=0, f=14, sum=14<=14) — see
-      // wasm-emitter.test.ts's "N2 gate-closing pin", which executes
-      // both in the same run (the fence branch below shipped as
-      // genuinely INVALID wasm once, caught only by a sweep that
-      // actually ran it — a pin that only typechecks or asserts refusal
-      // without instantiating would have missed it again).
-      c.i32Const(1);
-      c.localSet(ID);
-      c.localGet(AX);
-      c.localSet(TMP);
-      c.block();
-      c.loop();
-      c.localGet(TMP);
-      c.f64Const(1);
-      c.f64Lt();
-      c.brIf(1);
-      c.localGet(TMP);
-      c.f64Const(10);
-      c.f64Div();
-      c.localSet(TMP);
-      c.localGet(ID);
-      c.i32Const(1);
-      c.i32Add();
-      c.localSet(ID);
-      c.br(0);
-      c.end();
-      c.end();
-      c.localGet(ID);
-      c.localGet(FI);
-      c.i32Add();
-      c.i32Const(15);
-      c.i32GtS();
-      c.ifResult(strRef);
-      this.deps.throwError(c, "%Error", "Error", (x) =>
-        this.deps.lit(x, "'Number.prototype.toFixed' at this precision is not supported yet"),
-      );
-      c.refNull(this.deps.strType());
-      c.else_();
-      c.localGet(X);
-      c.f64Const(0);
-      c.f64Lt();
-      c.ifResult(strRef);
-      this.deps.lit(c, "-");
-      c.else_();
-      this.deps.lit(c, "");
-      c.end();
-      c.localSet(SIGN);
-      c.localGet(X);
-      c.i64ReinterpretF64();
-      c.i64Const(0x7fffffffffffffffn);
-      c.i64And();
-      c.f64ReinterpretI64();
-      c.localSet(AX);
-      // scale = 10^FI, integer accumulation (FI is small — 0..~20 here).
-      c.f64Const(1);
-      c.localSet(SCALE);
-      c.block();
-      c.loop();
-      c.localGet(FI);
-      c.i32Const(0);
-      c.i32LeS();
-      c.brIf(1);
-      c.localGet(SCALE);
-      c.f64Const(10);
-      c.f64Mul();
-      c.localSet(SCALE);
-      c.localGet(FI);
-      c.i32Const(1);
-      c.i32Sub();
-      c.localSet(FI);
-      c.br(0);
-      c.end();
-      c.end();
-      // restore FI (the loop above decremented its copy) — SAME NaN
-      // guard as the first read of F above (`i32.trunc_f64_s` traps on
-      // NaN; `(5.5).toFixed(undefined)` reaches here with F literally
-      // NaN, per ToNumber(undefined)).
-      c.localGet(F);
-      c.localGet(F);
-      c.f64Ne();
-      c.ifResult(F64);
-      c.f64Const(0);
-      c.else_();
-      c.localGet(F);
-      c.f64Trunc();
-      c.end();
-      c.i32TruncF64S();
-      c.localSet(FI);
-      c.localGet(AX);
-      c.localGet(SCALE);
-      c.f64Mul();
-      c.f64Const(0.5);
-      c.f64Add();
-      c.f64Floor();
-      c.localSet(N);
-      c.localGet(N);
-      c.call(this.deps.f64ToStr());
-      c.localSet(DIGITS);
-      // Left-pad with '0' until longer than FI (so a split at len-FI
-      // always leaves at least one integer-part digit).
-      c.block();
-      c.loop();
-      c.localGet(DIGITS);
-      c.arrayLen();
-      c.localGet(FI);
-      c.i32GtS();
-      c.brIf(1);
-      this.deps.lit(c, "0");
-      c.localGet(DIGITS);
-      c.call(this.deps.concat());
-      c.localSet(DIGITS);
-      c.br(0);
-      c.end();
-      c.end();
-      c.localGet(DIGITS);
-      c.arrayLen();
-      c.localSet(DLEN);
-      c.localGet(FI);
-      c.i32Eqz();
-      c.ifResult(strRef);
-      c.localGet(SIGN);
-      c.localGet(DIGITS);
-      c.call(this.deps.concat());
-      c.else_();
-      {
-        c.localGet(SIGN);
-        c.localGet(DIGITS);
-        c.f64Const(0);
-        c.localGet(DLEN);
-        c.localGet(FI);
-        c.i32Sub();
-        c.f64ConvertI32S();
-        c.call(this.deps.strSlice());
-        c.call(this.deps.concat());
-        this.deps.lit(c, ".");
-        c.call(this.deps.concat());
-        c.localGet(DIGITS);
-        c.localGet(DLEN);
-        c.localGet(FI);
-        c.i32Sub();
-        c.f64ConvertI32S();
-        c.localGet(DLEN);
-        c.f64ConvertI32S();
-        c.call(this.deps.strSlice());
-        c.call(this.deps.concat());
-      }
-      c.end();
-      c.end(); // closes the N2 "too many significant digits" fence check
-      c.end(); // closes the non-finite/|x|>=1e21 ifResult opened above
-    }
-    c.end();
-    this.mb.setBody(idx, [I32, strRef, F64, F64, F64, strRef, I32, I32, F64], c.bytes());
     return idx;
   }
 }

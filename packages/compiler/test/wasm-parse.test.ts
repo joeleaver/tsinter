@@ -29,8 +29,18 @@ import { readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { compile } from "../src/index.js";
+
+/* Board #126 (INC-25 P4 CP1 ack R8): this used to be a hardcoded absolute
+ * path into P3's OWN implementer worktree
+ * (/home/joe/dev/tsinter/.claude/worktrees/inc25-impl-p3/...), which
+ * existed at P3's freeze and was torn down after landing — a test whose
+ * green depended on a path outside the repository, invisible at its own
+ * gate by construction. Resolved relative to THIS file via import.meta.url
+ * instead, so it is correct in every worktree and after every teardown. */
+const CORPUS_1522 = fileURLToPath(new URL("../../../tests/corpus/1522-parseint-static.ts", import.meta.url));
 
 let scratch: string;
 beforeAll(async () => {
@@ -185,7 +195,7 @@ describe("wasm num.parseInt/parseFloat/fromString — the 10-candidate corpus re
   });
 
   test("1522's own regression: the full corpus program compiles, claims, and matches Node byte-exact", async () => {
-    const res = await compile("/home/joe/dev/tsinter/.claude/worktrees/inc25-impl-p3/tests/corpus/1522-parseint-static.ts", {
+    const res = await compile(CORPUS_1522, {
       outPath: join(scratch, "1522.wasm"),
       outDir: scratch,
       dynamic: false,
@@ -195,7 +205,7 @@ describe("wasm num.parseInt/parseFloat/fromString — the 10-candidate corpus re
     const { stdout } = await runWasm(res.binaryPath);
     const nodeOut = execFileSync(
       process.execPath,
-      ["/home/joe/dev/tsinter/.claude/worktrees/inc25-impl-p3/tests/corpus/1522-parseint-static.ts"],
+      [CORPUS_1522],
       { encoding: "utf8" },
     );
     expect(stdout).toBe(nodeOut);

@@ -393,6 +393,28 @@ test("dyn.ts/json.ts/inspect.ts: every function with a BYTES arm emits a VALID m
     c.i32Const(0);
     return c.bytes();
   })());
+  // Structural stubs for the three INC-25 P4 formatter deps (this
+  // harness's BYTES arms never reach a toFixed/toPrecision/toString
+  // (radix) call — right signature, right result type, nothing about
+  // BYTES to get wrong).
+  const toFixedFn = mb.declareFunc(mb.funcType([F64, F64], [strRef]), "%stub.toFixed");
+  mb.setBody(toFixedFn, [], (() => {
+    const c = new Code();
+    c.refNull(strType);
+    return c.bytes();
+  })());
+  const toPrecisionFn = mb.declareFunc(mb.funcType([F64, F64], [strRef]), "%stub.toPrecision");
+  mb.setBody(toPrecisionFn, [], (() => {
+    const c = new Code();
+    c.refNull(strType);
+    return c.bytes();
+  })());
+  const toRadixFn = mb.declareFunc(mb.funcType([F64, I32], [strRef]), "%stub.toRadix");
+  mb.setBody(toRadixFn, [], (() => {
+    const c = new Code();
+    c.refNull(strType);
+    return c.bytes();
+  })());
 
   const vecs = new VecBuilder(mb, { strEq: () => strEqFn, f64ToStr: () => f64ToStrFn, concat: () => concatFn, lit });
   const f64VecInfo = vecs.info("vec(f64)", F64, F64, "f64");
@@ -513,6 +535,9 @@ test("dyn.ts/json.ts/inspect.ts: every function with a BYTES arm emits a VALID m
     bytesToStrUtf8: () => bytesB.toStrHelper("utf8"),
     jsToNumber,
     jsonQuoteStr: () => json.quoteStr(),
+    toPrecision: () => toPrecisionFn,
+    toFixed: () => toFixedFn,
+    toRadix: () => toRadixFn,
     sameValueF64: () => sameValueF64Fn,
     deqEnter: () => deqEnterFn,
     deqLeave: () => deqLeaveFn,

@@ -3102,6 +3102,18 @@ const TIER_FLOOR: string[] = [
   "2388-tonumber-grammar-zoo.ts",
   "2389-tonumber-unary-plus.ts",
   "2431-primitive-ctor-values.ts",
+  // Increment 25, pass P4 (the formatters: num.toFixed/num.toFixed0/
+  // num.toExponential, plus D4's three dyn-path options — Math.PI/Math.E
+  // via the getProp closed-table shape, toPrecision on a dyn NUM
+  // receiver, toString(radix) for radix != 10 via a transcription of
+  // V8's DoubleToRadixStringView). Board #125 closes (the toPrecision
+  // placeholder-call and direct-call texts are now Node's own).
+  // SEMANTICS.md S043's three fenced bullets are amended as landed
+  // hunks (a/radix, b/toFixed-window, c/placeholder-name) — the fences
+  // fire nowhere. 831 -> 834.
+  "1112-number-methods.ts",
+  "1116-island-static-mix.ts",
+  "1980-primitive-proto-statics.ts",
 ];
 
 interface RunResult {

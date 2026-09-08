@@ -6597,14 +6597,203 @@ test("bin: a variable-sourced division is NOT folded away — proves no over-fol
   // varRef, no arithmetic); the test program assigns `c = a / b` (a
   // REAL division over two `const`-bound variables — provably constant-
   // valued by a human reader, but NOT IR numLit nodes, so emitBin's fold
-  // check must not touch it). Any 0xa3 bytes contributed by unrelated
-  // stdlib code (e.g. number formatting) are identical in both binaries
-  // and cancel out of the diff — only the count DELTA is asserted, not
-  // an absolute count, so this doesn't assume anything about baseline
-  // noise elsewhere in the module.
+  // check must not touch it).
+  //
+  // INC-25 P4 FINDING: a raw whole-module byte scan for 0xa3 is NOT
+  // robust to an unrelated module-wide structural change — factoring
+  // numfmt.ts's lazy pow5-table init into its own function (%w.
+  // ensureRyuTables, called from f64ToStr's body, needed so
+  // toExponential() can trigger the SAME init without ever running
+  // f64ToStr's own body) inserts one new type + one new function + one
+  // new code entry into EVERY module that formats a number at all —
+  // both programs here do, via `.toString()`. That shifts every LATER
+  // LEB128-encoded index by a module-wide constant, and — MEASURED
+  // directly — the baseline program's raw byte count went 37 -> 38 while
+  // the withDivision program's stayed at 38, because the shift
+  // coincidentally created a NEW byte equal to 0xa3 inside a
+  // LEB128-encoded operand in the baseline binary specifically (not a
+  // real f64.div), breaking the "identical stdlib noise cancels out of
+  // the diff" assumption stated above: THAT assumption holds only while
+  // nothing shifts index encodings asymmetrically between the two
+  // otherwise-identical programs, which this refactor does. The runtime
+  // behavior is UNCHANGED (measured: `4/2` still prints "2" from the
+  // unfolded division, exactly as the cross-check below already
+  // checks) — this is a counting-methodology fix, not a folding fix.
+  // FIX: parse the CODE SECTION properly and count only genuine
+  // `f64.div` OPCODE bytes (0xa3 at an instruction boundary), skipping
+  // every operand (LEB128 indices, f64/i32/i64 immediates, blocktypes,
+  // GC sub-opcodes' own immediates) so a coincidental operand byte can
+  // never be mistaken for the instruction — closing the exact class of
+  // fragility this finding exposed, rather than just re-tuning the
+  // expected number for one particular module-wide shift.
+  // C1 amendment D-P4-1a/R15 (g): rebuilt from a DIRECT read of code.ts's
+  // own emission methods (every `this.w.u8(0xNN)` call cross-checked
+  // against whatever immediate write follows it — not a generic/assumed
+  // GC-opcode table), which found THREE real gaps in the walker's own
+  // former 0xfb sub-opcode table (sub 5/structSet needs 2 ulebs, sub
+  // 11/arrayGet needs 1, sub 20/refTest needs 1 — all THREE previously
+  // fell through as "zero immediates" and would have desynced `p` on any
+  // module using them) and SIX missing top-level opcodes this backend
+  // also emits (0x0e br_table — variable-length; 0x14 call_ref; 0x3a the
+  // i32.store8 memory op; 0x3f memory.size; 0x40 memory.grow; 0xd0
+  // ref.null; 0xd2 ref.func — none previously in the switch at all,
+  // meaning any module using them was ALREADY silently misparsed before
+  // this fix, undetected because nothing checked `p` against `bodyEnd`).
+  // rev-25's own claim that this backend emits an 0xfc-prefixed
+  // instruction (P3's "trunc_sat") does NOT hold under direct measurement
+  // (grep of every `u8(0x...)` call site in code.ts) — no 0xfc or 0xfd
+  // byte is ever pushed as an opcode anywhere in this file (the few
+  // `0xfc`-looking bytes in the source are unrelated: `i32Const(0xfc00)`
+  // operand VALUES in json.ts/emitter.ts/strings.ts/typedarrays.ts, and
+  // literal DATA in casing-tables.ts/regex-unicode-tables.ts) — recorded
+  // as a measured, disclosed contradiction of the relayed claim rather
+  // than silently building unreachable coverage for it. The walker below
+  // instead THROWS on any top-level opcode or 0xfb sub-opcode it does not
+  // explicitly recognize (the amendment's own alternative to enumerating
+  // every prefix), so a FUTURE unmodeled instruction is loud immediately
+  // rather than silently miscounting.
   const countF64Div = (bytes: Uint8Array): number => {
+    let p = 0;
     let n = 0;
-    for (const b of bytes) if (b === 0xa3) n++;
+    const u8 = () => bytes[p++]!;
+    const uleb = (): number => {
+      let result = 0, shift = 0, byte;
+      do {
+        byte = bytes[p++]!;
+        result |= (byte & 0x7f) << shift;
+        shift += 7;
+      } while (byte & 0x80);
+      return result >>> 0;
+    };
+    const skipBlockType = (): void => {
+      const b = bytes[p];
+      if (b === 0x40 || b === 0x7f || b === 0x7e || b === 0x7d || b === 0x7c || b === 0x7b) {
+        p++;
+        return;
+      }
+      if (b === 0x63 || b === 0x64) {
+        p++;
+        uleb();
+        return;
+      }
+      uleb(); // a positive s33 type index (multi-value blocktype)
+    };
+    // Every opcode this backend's code.ts emits with ZERO immediate bytes
+    // (confirmed directly: every `this.w.u8(0xNN)` call site in code.ts
+    // for these values has no `uleb`/`sleb`/`f64` write immediately
+    // after it) — comparisons, arithmetic, conversions, reinterprets,
+    // drop/else/end/return/unreachable, and the zero-immediate ref ops.
+    const ZERO_IMM = new Set([
+      0x00, 0x05, 0x0b, 0x0f, 0x1a, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f, 0x50, 0x51, 0x52,
+      0x53, 0x54, 0x56, 0x58, 0x59, 0x5a, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x6a, 0x6b, 0x6c, 0x6d, 0x6f, 0x71, 0x72,
+      0x73, 0x74, 0x75, 0x76, 0x7c, 0x7d, 0x7e, 0x7f, 0x80, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x99, 0x9a, 0x9b,
+      0x9c, 0x9d, 0x9e, 0x9f, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa7, 0xaa, 0xab, 0xac, 0xad, 0xb0, 0xb1, 0xb6, 0xb7,
+      0xb8, 0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf, 0xd1, 0xd3, 0xd4,
+    ]);
+    // 0xfb sub-opcode -> extra uleb-shaped immediate count (each entry is
+    // the EXACT set code.ts's own GC methods emit — structNew/
+    // structNewDefault(1), structGet(2), structSet(2, the sub-5 gap
+    // above), arrayNewFixed(2), arrayNewDefault(1), arrayNewData(2),
+    // arrayGet(1, the sub-11 gap above), arrayGetU(1), arraySet(1),
+    // arrayCopy(2), arrayLen(0), refTest(1, the sub-20 gap above),
+    // refCast(1)); anything else THROWS.
+    const FB_SUB_IMM = new Map<number, number>([
+      [0x00, 1], [0x01, 1], [0x02, 2], [0x05, 2], [0x07, 1], [0x08, 2], [0x09, 2], [0x0b, 1], [0x0d, 1], [0x0e, 1],
+      [0x0f, 0], [0x11, 2], [0x14, 1], [0x16, 1],
+    ]);
+    // Section header: magic(4) + version(4), then id/len pairs.
+    let cur = 8;
+    while (cur < bytes.length) {
+      p = cur;
+      const secId = u8();
+      const secLen = uleb();
+      const secStart = p;
+      if (secId === 10) {
+        // Code section: vec(func body), each = size + locals + instrs + 0x0b.
+        const count = uleb();
+        for (let i = 0; i < count; i++) {
+          const bodyLen = uleb();
+          const bodyEnd = p + bodyLen;
+          const numGroups = uleb();
+          for (let g = 0; g < numGroups; g++) {
+            uleb(); // count
+            const t = u8(); // type
+            if (t === 0x63 || t === 0x64) uleb(); // GC heaptype index
+          }
+          while (p < bodyEnd) {
+            const op = u8();
+            if (op === 0xa3) n++;
+            switch (op) {
+              case 0x0c: // br
+              case 0x0d: // br_if
+              case 0x10: // call
+              case 0x14: // call_ref
+              case 0x20: // local.get
+              case 0x21: // local.set
+              case 0x22: // local.tee
+              case 0x23: // global.get
+              case 0x24: // global.set
+              case 0x3f: // memory.size
+              case 0x40: // memory.grow
+              case 0xd0: // ref.null (sleb heaptype; byte-skip identical to uleb)
+              case 0xd2: // ref.func
+                uleb();
+                break;
+              case 0x0e: {
+                // br_table: vec(label) + one default label.
+                const labelCount = uleb();
+                for (let k = 0; k < labelCount; k++) uleb();
+                uleb();
+                break;
+              }
+              case 0x3a: // i32.store8 (align, offset)
+                uleb();
+                uleb();
+                break;
+              case 0x41: // i32.const
+                uleb();
+                break;
+              case 0x42: // i64.const
+                uleb();
+                break;
+              case 0x44: // f64.const
+                p += 8;
+                break;
+              case 0x02: // block
+              case 0x03: // loop
+              case 0x04: // if
+                skipBlockType();
+                break;
+              case 0x11: // call_indirect
+                uleb();
+                uleb();
+                break;
+              case 0xfb: {
+                const sub = uleb();
+                const extra = FB_SUB_IMM.get(sub);
+                if (extra === undefined) {
+                  throw new Error(`countF64Div: unmodeled 0xfb sub-opcode ${sub} (0x${sub.toString(16)}) at byte ${p - 2}`);
+                }
+                for (let k = 0; k < extra; k++) uleb();
+                break;
+              }
+              default:
+                if (!ZERO_IMM.has(op)) {
+                  throw new Error(`countF64Div: unmodeled top-level opcode 0x${op.toString(16)} at byte ${p - 1}`);
+                }
+            }
+          }
+          // (g)(1), C1 amendment D-P4-1a/R15: any opcode with an
+          // unmodeled immediate shape would previously desync `p` from
+          // the instruction stream silently, then get RESNAPPED to
+          // `bodyEnd` on the next line with no evidence anything went
+          // wrong. Asserting exact landing FIRST makes that loud.
+          expect(p).toBe(bodyEnd);
+          p = bodyEnd;
+        }
+      }
+      cur = secStart + secLen;
+    }
     return n;
   };
   const baseline = await buildWasm(
@@ -6627,6 +6816,16 @@ test("bin: a variable-sourced division is NOT folded away — proves no over-fol
   if (!withDivision.ok) throw new Error(`refused: ${withDivision.diagnostics[0]?.message}`);
   const baselineCount = countF64Div(readFileSync(baseline.binaryPath));
   const withDivisionCount = countF64Div(readFileSync(withDivision.binaryPath));
+  // C1 amendment D-P4-1a/R15 (g)(2): the DELTA alone is uninterpretable —
+  // a symmetric mis-parse across two near-identical modules (e.g. every
+  // f64.div in BOTH miscounted the same way, or a shared prefix/suffix
+  // both walkers desync on identically) keeps delta 1 and passes without
+  // proving either absolute count is actually right. Pin the ABSOLUTE
+  // counts too (measured directly against this worktree's own build,
+  // findings-p4-v2.txt §4): baseline has none, withDivision has exactly
+  // the one real division this program's own source writes.
+  expect(baselineCount).toBe(0);
+  expect(withDivisionCount).toBe(1);
   expect(withDivisionCount).toBe(baselineCount + 1);
   // Behavioral cross-check: the (unfolded) division still computes the
   // right answer at runtime.
@@ -8671,16 +8870,12 @@ test("increment 21 stage B gate 3: the frontend fixture pin — enginePatternSpe
   }
 });
 
-test("increment 21 stage B N2 gate-closing pin: dyn.ts's toFixed precision fence actually EXECUTES — review round 2's fence branch shipped as INVALID WASM once (a stack-imbalance compile error, `ifResult(strRef)`'s throw arm never pushed a value) and was caught only by a sweep script that ran it, never by anything that merely typechecked or asserted refusal without instantiating the module; this pins that a fenced call throws the exact named Error AND the program survives past the catch, alongside an in-window neighbour that computes Node's exact text in the SAME run, so the two together would have caught the original bug", async () => {
+test("increment 21 stage B N2 gate, RETIRED by INC-25 P4's merge (CP1 ack R12): the SAME two rows the original gate-closing pin used — 5.toFixed(100) (outside the old intDigits+f<=14 window) and 0.1.toFixed(14) (inside it) — now BOTH compute Node's exact digits through the ONE shared, unfenced json.ts helper (SEMANTICS.md S043 bullet (b), now amended: the fence fires nowhere). The ORIGINAL pin (git history) proved the fence's own bytes were valid and reachable; THIS pin proves those same bytes are gone from the emitted module (the fence's own message string is absent) and that the call that used to hit it now answers exactly what Node answers.", async () => {
   const res = await buildWasmDyn(
-    "tofixed-fence.ts",
+    "tofixed-nofence.ts",
     [
       "const x: any = 5;",
-      "try {",
-      "  console.log(`${x.toFixed(100)}`);",
-      "} catch (e) {",
-      "  console.log(`${(e as Error).message}`);",
-      "}",
+      "console.log(`${x.toFixed(100)}`);",
       "const y: any = 0.1;",
       "console.log(`${y.toFixed(14)}`);",
       'console.log("survived");',
@@ -8688,9 +8883,26 @@ test("increment 21 stage B N2 gate-closing pin: dyn.ts's toFixed precision fence
     ].join("\n"),
   );
   if (!res.ok) throw new Error(`refused: ${JSON.stringify(res.diagnostics)}`);
+  // Interned string data is raw UTF-16LE (pushStrLitInto's own encoding),
+  // so the search needle must be too — a latin1/utf8 decode of the whole
+  // module would insert spurious 0x00 gaps and never match even when the
+  // text IS present.
+  const moduleBytes = readFileSync(res.binaryPath);
+  // POSITIVE CONTROL (C1 amendment D-P4-1a/R15): a negative-only assertion
+  // is uninterpretable on its own — a wrong needle encoding (or a wrong
+  // search altogether) would ALSO report "not found" and this pin would
+  // pass vacuously while reading as proven. A needle for a string the
+  // module CERTAINLY contains (the program's own `"survived"` literal,
+  // interned the SAME UTF-16LE way pushStrLitInto encodes every string
+  // literal) must be FOUND, proving the search method itself works on
+  // THIS module before its absence result is trusted.
+  const positiveNeedle = Buffer.from("survived", "utf16le");
+  expect(Buffer.from(moduleBytes).includes(positiveNeedle)).toBe(true);
+  const fenceNeedle = Buffer.from("at this precision is not supported yet", "utf16le");
+  expect(Buffer.from(moduleBytes).includes(fenceNeedle)).toBe(false);
   const { stdout } = await runWasm(res.binaryPath);
   expect(stdout.toString("utf8")).toBe(
-    "'Number.prototype.toFixed' at this precision is not supported yet\n" +
+    "5.0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000\n" +
       "0.10000000000000\n" +
       "survived\n",
   );

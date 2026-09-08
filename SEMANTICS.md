@@ -2771,28 +2771,29 @@ measured the same way):
   polynomial path is not reproducible by exponentiation-by-squaring at
   last-ulp fidelity, and an unprovable answer is the miscompile class,
   not a feature.
-- **`Number.prototype.toString(radix)` with radix ≠ 10** throws the
-  catchable "'Number.prototype.toString' with a radix other than 10 is
-  not supported yet" — V8's DoubleToRadixCString is unported; silently
-  answering base-10 digits under a false base claim was the alternative
-  this fence replaces.
-- **`Number.prototype.toFixed` beyond the verified window**: requests
-  whose significant-digit demand exceeds the conservatively-verified
-  bound (effective `intDigits + f <= 14`) throw the catchable
-  "'Number.prototype.toFixed' at this precision is not supported yet";
-  in-window results are byte-exact (120-cell independent differential:
-  56 exact, 64 fenced, 0 wrong). The designed trade, named so it is not
-  a surprise: the fence fires on ordinary-looking calls Node computes
-  fine — `(999999999999999).toFixed(0)`,
-  `(1234567890.12345).toFixed(5)` — fence-over-garbage, the pow
-  precedent.
 - **The unmodeled-name half of the Number-placeholder call surface**:
   calling an extracted placeholder whose NAME is not modeled for real
-  dispatch (`toPrecision.call(5, 3)`, which Node computes) throws the
-  honest "'Number.prototype.toPrecision' on a dynamic value is not
-  supported yet" — while the WRONG-RECEIVER case keeps Node's own exact
-  "requires that 'this' be a Number" TypeError (the split replaced one
-  false message covering both situations).
+  dispatch (`toLocaleString.call(5)`, or `toExponential.call(5, 2)` — the
+  DIGITS-taking form, an IR signature this tier's key cannot express;
+  INC-25 P4 §7.8) throws the honest "'Number.prototype.<name>' on a
+  dynamic value is not supported yet" — while the WRONG-RECEIVER case
+  keeps Node's own exact "requires that 'this' be a Number" TypeError
+  (the split replaced one false message covering both situations).
+  `toPrecision` and `toFixed`/`toFixed0`/`toExponential()` (the
+  digit-free form) left this clause in INC-25 P4: every one of them now
+  answers Node's own text through the same shared, unfenced expansion —
+  see the two amendments this replaced, below.
+  (INC-25 P4: the entry's own former first two bullets —
+  `Number.prototype.toString(radix)` with radix != 10, and
+  `Number.prototype.toFixed` beyond the `intDigits + f <= 14` window —
+  are DELETED here, not narrowed: `%w.toRadix` now ports
+  DoubleToRadixStringView exactly for every radix 2..36 including the
+  fractional part, and toFixed/toFixed0's implementation — called by
+  both the static key and the dyn NUM receiver — is exact across the
+  whole 0..100 digits domain, so neither fence
+  fires on any input. The 120-cell independent differential this entry
+  used to cite is superseded by a >=100000-row Node-oracle sweep at the
+  freeze; that number belongs to the findings, not the register.)
 
 **Rationale:** the fence is the loudness contract applied inside a
 claimed program: a construct the tier cannot yet answer Node-exactly

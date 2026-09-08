@@ -66,6 +66,38 @@ async function buildHarness(
   };
   let f2s: number | null = null;
   const f64ToStr = (): number => (f2s ??= buildF64ToStr(mb, strType, strRef));
+  // Structural stubs for the three INC-25 P4 formatter deps (this
+  // driver's BYTES arms never reach a toFixed/toPrecision/toString(radix)
+  // call — a NAME-only stub, same shape as jsToNumber below, is a valid
+  // sufficient body: right signature, right result type, nothing about
+  // BYTES to get wrong).
+  let toFixedIdx: number | null = null;
+  const toFixedStub = (): number =>
+    (toFixedIdx ??= (() => {
+      const idx = mb.declareFunc(mb.funcType([F64, F64], [strRef]), "%w.stub.toFixed");
+      const c = new Code();
+      lit(c, "");
+      mb.setBody(idx, [], c.bytes());
+      return idx;
+    })());
+  let toPrecisionIdx: number | null = null;
+  const toPrecisionStub = (): number =>
+    (toPrecisionIdx ??= (() => {
+      const idx = mb.declareFunc(mb.funcType([F64, F64], [strRef]), "%w.stub.toPrecision");
+      const c = new Code();
+      lit(c, "");
+      mb.setBody(idx, [], c.bytes());
+      return idx;
+    })());
+  let toRadixIdx: number | null = null;
+  const toRadixStub = (): number =>
+    (toRadixIdx ??= (() => {
+      const idx = mb.declareFunc(mb.funcType([F64, I32], [strRef]), "%w.stub.toRadix");
+      const c = new Code();
+      lit(c, "");
+      mb.setBody(idx, [], c.bytes());
+      return idx;
+    })());
   // A minimal ToNumber stub (review round 1's DynDeps.jsToNumber
   // addition): this driver never exercises toFixed/toString's OWN
   // argument coercion, so a bare DYN_NUM read (the pre-fix behavior,
@@ -232,6 +264,9 @@ async function buildHarness(
     bytesToStrUtf8: () => bytesB.toStrHelper("utf8"),
     jsToNumber: jsToNumberFn,
     jsonQuoteStr: () => json.quoteStr(),
+    toPrecision: toPrecisionStub,
+    toFixed: toFixedStub,
+    toRadix: toRadixStub,
     sameValueF64: () => sameValueF64Fn,
     deqEnter: () => deqEnterFn,
     deqLeave: () => deqLeaveFn,

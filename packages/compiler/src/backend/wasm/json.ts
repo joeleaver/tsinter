@@ -31,6 +31,21 @@
  * is FRONTEND-fenced (lower-builtins.ts, "JSON.parse with a reviver") and
  * never reaches any backend.
  *
+ * INC-25 P4 EXTENDS THIS WARNING: the formatters (toFixed/toFixed0/
+ * toPrecision) REUSE the sdc exact-decimal buffer below for their own
+ * expansion (ASSIGN+ROUND-AT+READER), so the shared, non-reentrant state
+ * a future reviver would corrupt is no longer just source/pos/depth — it
+ * is the WHOLE digit buffer: `sdcBuf` (the 800-byte array) PLUS the four
+ * scalars `nd`, `dp`, `trunc`, `neg`. A `JSON.parse` reviver that calls a
+ * formatter mid-walk would mutate this shared state out from under the
+ * parse (a formatter's in-buffer round is destructive). `putDyn`'s own
+ * save/restore (below, SAVEDBUF/SAVEDSEEN/...) is the precedent for what
+ * a reviver would need to do: a DEEP COPY of the digit array plus the
+ * four scalars, saved on entry and restored on exit — not a saved
+ * reference, since the buffer is mutated in place. UNREACHABLE TODAY:
+ * revivers are frontend-fenced (the same fence named above), so this
+ * text exists for whoever lifts that fence, not for a live hazard.
+ *
  * THE DEPTH CAP IS A CATCHABLE ERROR, NOT A TRAP. Nesting deeper than
  * SCR_JSON_MAX_DEPTH (1000) throws a catchable RangeError through the
  * exception cell, exactly as `scr_throw_error` does natively — it is
@@ -185,7 +200,19 @@ export class JsonBuilder {
    * `Number(str)`, or `parseFloat` would clobber the outer parse's
    * position with no way to recover it. Whoever lands revivers must add
    * save/restore for `src`/`pos`/`depth` here too, the same shape
-   * `putDyn` already has. */
+   * `putDyn` already has.
+   *
+   * INC-25 P4 EXTENDS THIS: the formatters (toFixed/toFixed0/
+   * toPrecision) call `sdcAssignF64`/`sdcRoundInBuffer` on the SAME
+   * exact-decimal buffer this bridge's own `sdc()` uses, and a
+   * formatter's round is DESTRUCTIVE (in-place, carry-propagating) — so
+   * the reentrancy hazard above is now bigger than `src`/`pos`/`depth`:
+   * a reviver calling `(x).toFixed(f)` (or `.toPrecision`) mid-parse
+   * would ALSO clobber the outer parse's digit buffer (`sdcBuf`, `nd`,
+   * `dp`, `trunc`, `neg`), not just its position. Whoever lands
+   * revivers must save/restore that whole buffer too — a deep copy of
+   * the 800-byte array plus the four scalars, `putDyn`'s own precedent
+   * again. Still unreachable today, same fence. */
   setSrcForNumberParse(c: Code, pushStr: (c: Code) => void): void {
     pushStr(c);
     c.globalSet(this.src());
@@ -1976,15 +2003,28 @@ export class JsonBuilder {
     });
   }
 
-  /** Round-half-even at digit position `n`: the digit there decides,
-   * except an exact tie, which goes to the even neighbour — UNLESS the
-   * sticky bit says digits were dropped, in which case the value is
-   * strictly above the tie and rounds up. That consultation is what makes
-   * truncation safe (see the exactness argument above). */
+  /** Round-up decision at digit position `n`, under a RUNTIME mode
+   * (INC-25 P4, CP1 §2 / CACHED hazard, v6 §2.5/§11.2): mode 0 is
+   * round-half-EVEN with the sticky consultation — json.ts's original,
+   * unchanged rule, the one JSON.parse needs (sdcRoundedInt's own call
+   * passes 0, below); mode 1 is round-half-UP ON THE MAGNITUDE — ties
+   * AWAY FROM ZERO, ECMA-262's "pick the larger n" — the rule M-20
+   * measured the formatters need (100312 rows, 0 mismatches at mode 1;
+   * 31 mismatches at mode 0). The digit there decides UNLESS it is an
+   * EXACT tie (digit == 5 and nothing stored after it): a sticky bit from
+   * digits shifted out past the buffer means the true value is strictly
+   * above the tie regardless of mode (round up, unconditionally); a
+   * genuine exact tie is where the two modes diverge — mode 0 goes to
+   * the even neighbour, mode 1 always rounds up. THREADED, NEVER a
+   * second registration: this is still the ONE `cached("sdcRoundUp", ...)`
+   * builder (json.ts's own hazard, §11.2 CACHED — a same-named second
+   * builder with a different signature would silently return the FIRST
+   * function index), now `[I32, I32] -> [I32]`. */
   private sdcRoundUp(): number {
-    return this.cached("sdcRoundUp", [I32], [I32], (idx) => {
+    return this.cached("sdcRoundUp", [I32, I32], [I32], (idx) => {
       const ND = this.i32Global("nd");
       const c = new Code();
+      const MODE = 1;
       c.localGet(0);
       c.i32Const(0);
       c.i32LtS();
@@ -2011,13 +2051,23 @@ export class JsonBuilder {
       c.i32Const(1);
       c.return_();
       c.end();
-      // `n > 0 && d[n-1] is odd`, GUARDED. The reference spells this with
-      // a short-circuiting &&; i32.and evaluates both sides, so the
-      // literal transcription reads d[-1] at n == 0. That is reachable on
-      // real input — exactly 2^-1075, the midpoint between zero and the
-      // smallest subnormal, arrives here with n == 0 — and the read is an
-      // UNCATCHABLE abort at the one place a program hands us untrusted
-      // bytes. Fourth instance of this class in this file; see pushCurOr0.
+      // GENUINE exact tie (trunc == 0): the two modes diverge HERE, and
+      // only here.
+      c.localGet(MODE);
+      c.i32Const(1);
+      c.i32Eq();
+      c.ifVoid();
+      c.i32Const(1); // mode 1: ties away from zero, always round up
+      c.return_();
+      c.end();
+      // mode 0: `n > 0 && d[n-1] is odd`, GUARDED. The reference spells
+      // this with a short-circuiting &&; i32.and evaluates both sides, so
+      // the literal transcription reads d[-1] at n == 0. That is
+      // reachable on real input — exactly 2^-1075, the midpoint between
+      // zero and the smallest subnormal, arrives here with n == 0 — and
+      // the read is an UNCATCHABLE abort at the one place a program hands
+      // us untrusted bytes. Fourth instance of this class in this file;
+      // see pushCurOr0.
       c.localGet(0);
       c.i32Const(0);
       c.i32GtS();
@@ -2103,10 +2153,251 @@ export class JsonBuilder {
       c.end();
       c.localGet(N);
       c.globalGet(DP);
+      c.i32Const(0); // mode 0: JSON.parse's own rule, half-even + sticky — UNCHANGED
       c.call(this.sdcRoundUp());
       c.i64ExtendI32U();
       c.i64Add();
       this.mb.setBody(idx, [I32, I64], c.bytes());
+    });
+  }
+
+  /** `%w.json.sdcAssignF64(x)` — the ASSIGN operation (INC-25 P4, CP1 §2 /
+   * v6 §2.5): the formatters' own writer, decomposing an already-decoded
+   * f64 mantissa into the exact decimal buffer, where `sdcInit` only ever
+   * decomposes a decimal STRING (a different operation entirely — this is
+   * NOT a second registration of that name, `cached()`'s NAME hazard
+   * discharged by a genuinely new name). PRECONDITION, enforced by every
+   * caller, not by this function: `x` is POSITIVE, FINITE and NONZERO —
+   * NaN/Infinity/±0/sign are the CALLER's job (mirroring numfmt.ts's own
+   * f64ToStr convention of checking those before ever decoding bits).
+   * Sets nd = dp = the mantissa's own decimal digit count (<=16), trunc =
+   * 0, neg = 0 UNCONDITIONALLY (the formatter's sign comes from `x < 0`
+   * alone, never from this buffer's `neg`), then `sdcShift(exp2)` — the
+   * ALREADY-EXISTING general binary shift — applies the binary exponent
+   * exactly. The result is the double's EXACT decimal expansion: at most
+   * 767 significant digits (json.ts's own governing bound, CP1 ack R4),
+   * so `trunc` can never be set by a formatter input through this path —
+   * asserted by a pin reading the two 767/751/309-digit witnesses. */
+  private sdcAssignF64(): number {
+    return this.cached("sdcAssignF64", [F64], [], (idx) => {
+      const ND = this.i32Global("nd");
+      const DP = this.i32Global("dp");
+      const c = new Code();
+      const X = 0;
+      const BITS = 1, MANTF = 2, EXPF = 3, M = 4, K = 5, T = 6, EXP2 = 7, I = 8;
+      c.i32Const(0);
+      c.globalSet(this.i32Global("trunc"));
+      c.i32Const(0);
+      c.globalSet(this.i32Global("neg"));
+
+      c.localGet(X);
+      c.i64ReinterpretF64();
+      c.localSet(BITS);
+      c.localGet(BITS);
+      c.i64Const(0xf_ffff_ffff_ffffn);
+      c.i64And();
+      c.localSet(MANTF);
+      c.localGet(BITS);
+      c.i64Const(52n);
+      c.i64ShrU();
+      c.i32WrapI64();
+      c.localSet(EXPF);
+
+      // M = subnormal ? mantissaField : mantissaField | 2^52; exp2 =
+      // subnormal ? -1074 : expField - 1075 (standard IEEE754 double
+      // decomposition, the SAME formula numfmt.ts's own d2d_small_int
+      // fast path uses — E2S there, exp2 here).
+      c.localGet(EXPF);
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(MANTF);
+      c.localSet(M);
+      c.i32Const(-1074);
+      c.localSet(EXP2);
+      c.else_();
+      c.localGet(MANTF);
+      c.i64Const(1n << 52n);
+      c.i64Or();
+      c.localSet(M);
+      c.localGet(EXPF);
+      c.i32Const(1075);
+      c.i32Sub();
+      c.localSet(EXP2);
+      c.end();
+
+      // k = decimal digit count of M (M is a positive integer < 2^53,
+      // so k <= 16, well within the buffer).
+      c.i32Const(1);
+      c.localSet(K);
+      c.localGet(M);
+      c.localSet(T);
+      c.block();
+      c.loop();
+      c.localGet(T);
+      c.i64Const(10n);
+      c.i64LtU();
+      c.brIf(1);
+      c.localGet(T);
+      c.i64Const(10n);
+      c.i64DivU();
+      c.localSet(T);
+      c.localGet(K);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(K);
+      c.br(0);
+      c.end();
+      c.end();
+
+      c.localGet(K);
+      c.globalSet(ND);
+      c.localGet(K);
+      c.globalSet(DP); // M is an integer: the point sits after all its digits.
+
+      // buffer[k-1..0] <- M's digits, RAW VALUES (0-9, this buffer's own
+      // convention — NOT ASCII, unlike numfmt.ts's ASCII gDig).
+      c.localGet(K);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.i32Eqz();
+      c.brIf(1);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Sub();
+      c.localSet(I);
+      this.setDigit(c, (x) => x.localGet(I), (x) => {
+        x.localGet(M);
+        x.i64Const(10n);
+        x.i64RemU();
+        x.i32WrapI64();
+      });
+      c.localGet(M);
+      c.i64Const(10n);
+      c.i64DivU();
+      c.localSet(M);
+      c.br(0);
+      c.end();
+      c.end();
+
+      c.localGet(EXP2);
+      c.call(this.sdcShift());
+      this.mb.setBody(idx, [I64, I64, I32, I64, I32, I64, I32, I32], c.bytes());
+    });
+  }
+
+  /** `%w.json.sdcRoundInBuffer(position, mode)` — the CARRY-PROPAGATING
+   * in-buffer round (INC-25 P4, CP1 §2 / v6 §2.5): the genuinely absent
+   * operation `sdcRoundedInt` did NOT need, because it rounds into an
+   * external u64 accumulator rather than the buffer itself. A toFixed
+   * result can run to ~121 digits, past any accumulator, so the round
+   * must happen IN the buffer, propagating a carry through the digit
+   * array (Go decimal.go's `RoundUp(nd)` shape). `sdcRoundUp(position,
+   * mode)` ALREADY answers "round up or not" correctly for every
+   * position, including position < 0 (PROVABLY always round-down there:
+   * position = dp+f < 0 implies dp < -f <= 0, so |x| < 10^dp <=
+   * 10^(-f-1) < 0.5 * 10^-f, strictly below the tie at the kept
+   * precision) and position >= nd (nothing stored past nd, reads as a
+   * conceptual 0, never a tie) — sdcRoundUp's own early guard returns 0
+   * for both, so this function never special-cases those itself.
+   * ROUND DOWN: truncate `nd` to `position` (clamped into [0, nd], since
+   * `position` can be negative) and `sdcTrim()` (truncating mid-buffer
+   * can expose a NEW trailing zero the original sdcTrim pass never saw).
+   * ROUND UP: walk LEFTWARD from `position - 1`; the first digit < 9
+   * increments in place and truncates `nd` there; if EVERY digit down to
+   * 0 is 9, they collapse to a single '1' with `dp` incremented (999.995
+   * -> the buffer becomes "1" with dp bumped, matching "1000.00"'s own
+   * shape once placed). */
+  private sdcRoundInBuffer(): number {
+    return this.cached("sdcRoundInBuffer", [I32, I32], [], (idx) => {
+      const ND = this.i32Global("nd");
+      const DP = this.i32Global("dp");
+      const c = new Code();
+      const POS = 0, MODE = 1, DECIDE = 2, KEEPPOS = 3, I = 4, D = 5, FOUND = 6;
+      c.localGet(POS);
+      c.localGet(MODE);
+      c.call(this.sdcRoundUp());
+      c.localSet(DECIDE);
+
+      c.localGet(DECIDE);
+      c.ifVoid();
+      // ROUND UP.
+      c.i32Const(0);
+      c.localSet(FOUND);
+      c.localGet(POS);
+      c.i32Const(1);
+      c.i32Sub();
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.i32Const(0);
+      c.i32LtS();
+      c.localGet(FOUND);
+      c.i32Or();
+      c.brIf(1);
+      this.pushDigit(c, (x) => x.localGet(I));
+      c.localSet(D);
+      c.localGet(D);
+      c.i32Const(9);
+      c.i32Ne();
+      c.ifVoid();
+      this.setDigit(c, (x) => x.localGet(I), (x) => {
+        x.localGet(D);
+        x.i32Const(1);
+        x.i32Add();
+      });
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.globalSet(ND);
+      c.i32Const(1);
+      c.localSet(FOUND);
+      c.else_();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Sub();
+      c.localSet(I);
+      c.end();
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(FOUND);
+      c.i32Eqz();
+      c.ifVoid();
+      // All nines collapsed.
+      this.setDigit(c, (x) => x.i32Const(0), (x) => x.i32Const(1));
+      c.i32Const(1);
+      c.globalSet(ND);
+      c.globalGet(DP);
+      c.i32Const(1);
+      c.i32Add();
+      c.globalSet(DP);
+      c.end();
+      c.else_();
+      // ROUND DOWN: clamp position into [0, nd] (POS can be negative or
+      // past nd; a value stored outside that range would make ND
+      // negative or grow it, both wrong) and truncate.
+      c.localGet(POS);
+      c.i32Const(0);
+      c.i32GtS();
+      c.ifResult(I32);
+      c.localGet(POS);
+      c.else_();
+      c.i32Const(0);
+      c.end();
+      c.localSet(KEEPPOS);
+      c.localGet(KEEPPOS);
+      c.globalGet(ND);
+      c.i32LtS();
+      c.ifVoid();
+      c.localGet(KEEPPOS);
+      c.globalSet(ND);
+      c.end();
+      c.call(this.sdcTrim());
+      c.end();
+      this.mb.setBody(idx, [I32, I32, I32, I32, I32], c.bytes());
     });
   }
 
@@ -2518,6 +2809,738 @@ export class JsonBuilder {
       c.localGet(BITS);
       c.f64ReinterpretI64();
       this.mb.setBody(idx, [I32, I64, I32, I64], c.bytes());
+    });
+  }
+
+  /** `%w.json.sdcDigitAt(position)` → the RAW digit value (0-9) at that
+   * buffer position, or 0 outside `[0, nd)` — the READER (INC-25 P4, CP1
+   * §2), the one piece of the expansion that reads OUT of the buffer
+   * rather than into it. `position` can be negative (leading zeros
+   * before the first significant digit) or `>= nd` (trailing zeros in
+   * the integer part, or past the fractional digits requested) — both
+   * are the SAME "outside the stored data" case, no separate handling. */
+  private sdcDigitAt(): number {
+    return this.cached("sdcDigitAt", [I32], [I32], (idx) => {
+      const ND = this.i32Global("nd");
+      const c = new Code();
+      c.localGet(0);
+      c.i32Const(0);
+      c.i32LtS();
+      c.localGet(0);
+      c.globalGet(ND);
+      c.i32GeS();
+      c.i32Or();
+      c.ifResult(I32);
+      c.i32Const(0);
+      c.else_();
+      this.pushDigit(c, (x) => x.localGet(0));
+      c.end();
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** `%w.toFixed(x, f)` → str — `num.toFixed` [F64,F64]->STRING
+   * (ir/validate.ts:220), and (INC-25 P4 CP1 ack R12, the MERGE) the
+   * SAME function `%w.dyn.toFixed`'s thin wrapper calls, so the fence at
+   * dyn.ts's own port fires nowhere and there is exactly one
+   * implementation of this method. `num.toFixed0` (f == 0) is a THIN
+   * WRAPPER, below.
+   * ORDER, from the CALLER (builtins-number.cc NumberPrototypeToFixed):
+   * (1) `f`'s ToIntegerOrInfinity, RangeError [0,100] BEFORE `x` is
+   * inspected at all; (2) NaN -> "NaN"; (3) sign from `x < 0` ALONE,
+   * extracted and `x` negated to its magnitude — UNCONDITIONALLY, before
+   * any zero/1e21 check, so the sign is never lost on any later branch;
+   * (4) `|x| >= 1e21` (this ALSO catches ±Infinity, since Infinity >=
+   * 1e21) -> `f64ToStr` on the ORIGINAL SIGNED value (reconstructed from
+   * the extracted sign + the now-abs `x`, since `f64ToStr` re-derives
+   * its own sign from `x < 0` and must see the true value); (5) `x == 0`
+   * (the LITERAL-zero special case, distinct from "rounds to zero" —
+   * that path is (6) below reaching an empty buffer) -> sign + "0" +
+   * padding; (6) else ASSIGN(x) + `sdcRoundInBuffer(dp + fi, mode 1)`
+   * (ties away from zero) + READ. */
+  toFixed(): number {
+    return this.cached("toFixed", [F64, F64], [this.deps.strRef()], (idx) => {
+      const ND = this.i32Global("nd");
+      const DP = this.i32Global("dp");
+      const strRef = this.deps.strRef();
+      const strType = this.deps.strType();
+      const c = new Code();
+      const X = 0, F = 1;
+      const FI = 2, NEG = 3, FII = 4, POS = 5, DPV = 6, INTCOUNT = 7, INTSTART = 8, TOTALLEN = 9;
+      const OUT = 10, IDX = 11, I = 12;
+      const locals: ValType[] = [F64, I32, I32, I32, I32, I32, I32, I32, strRef, I32, I32];
+
+      // (1) ToIntegerOrInfinity(F), then the RangeError, BEFORE X is examined.
+      c.localGet(F);
+      c.localGet(F);
+      c.f64Ne();
+      c.ifResult(F64);
+      c.f64Const(0);
+      c.else_();
+      c.localGet(F);
+      c.f64Trunc();
+      c.end();
+      c.localSet(FI);
+      c.localGet(FI);
+      c.f64Const(0);
+      c.f64Lt();
+      c.localGet(FI);
+      c.f64Const(100);
+      c.f64Gt();
+      c.i32Or();
+      c.ifVoid();
+      this.deps.throwError(c, "%RangeError", "RangeError", (x) =>
+        this.deps.lit(x, "toFixed() digits argument must be between 0 and 100"),
+      );
+      c.refNull(strType);
+      c.return_();
+      c.end();
+      c.localGet(FI);
+      c.i32TruncF64S();
+      c.localSet(FII);
+
+      // (2) NaN.
+      c.localGet(X);
+      c.localGet(X);
+      c.f64Ne();
+      c.ifVoid();
+      this.deps.lit(c, "NaN");
+      c.return_();
+      c.end();
+
+      // (3) sign, unconditional and first.
+      c.localGet(X);
+      c.f64Const(0);
+      c.f64Lt();
+      c.localSet(NEG);
+      c.localGet(NEG);
+      c.ifVoid();
+      c.localGet(X);
+      c.f64Neg();
+      c.localSet(X);
+      c.end();
+
+      // (4) |x| >= 1e21 (Infinity included).
+      c.localGet(X);
+      c.f64Const(1e21);
+      c.f64Ge();
+      c.ifVoid();
+      c.localGet(NEG);
+      c.ifResult(F64);
+      c.localGet(X);
+      c.f64Neg();
+      c.else_();
+      c.localGet(X);
+      c.end();
+      c.call(this.deps.f64ToStr());
+      c.return_();
+      c.end();
+
+      // (5) literal zero.
+      c.localGet(X);
+      c.f64Const(0);
+      c.f64Eq();
+      c.ifVoid();
+      c.localGet(NEG);
+      c.i32Const(1);
+      c.i32Add();
+      c.localGet(FII);
+      c.i32Const(0);
+      c.i32GtS();
+      c.ifResult(I32);
+      c.localGet(FII);
+      c.i32Const(1);
+      c.i32Add();
+      c.else_();
+      c.i32Const(0);
+      c.end();
+      c.i32Add();
+      c.localSet(TOTALLEN);
+      c.localGet(TOTALLEN);
+      c.arrayNewDefault(strType);
+      c.localSet(OUT);
+      c.i32Const(0);
+      c.localSet(IDX);
+      c.localGet(NEG);
+      c.ifVoid();
+      c.localGet(OUT);
+      c.localGet(IDX);
+      c.i32Const(0x2d);
+      c.arraySet(strType);
+      c.localGet(IDX);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(IDX);
+      c.end();
+      c.localGet(OUT);
+      c.localGet(IDX);
+      c.i32Const(0x30);
+      c.arraySet(strType);
+      c.localGet(IDX);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(IDX);
+      c.localGet(FII);
+      c.i32Const(0);
+      c.i32GtS();
+      c.ifVoid();
+      c.localGet(OUT);
+      c.localGet(IDX);
+      c.i32Const(0x2e);
+      c.arraySet(strType);
+      c.localGet(IDX);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(IDX);
+      c.localGet(FII);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.i32Eqz();
+      c.brIf(1);
+      c.localGet(OUT);
+      c.localGet(IDX);
+      c.i32Const(0x30);
+      c.arraySet(strType);
+      c.localGet(IDX);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(IDX);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Sub();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.end();
+      c.localGet(OUT);
+      c.return_();
+      c.end();
+
+      // (6) the general path: exact expansion, round, read.
+      c.localGet(X);
+      c.call(this.sdcAssignF64());
+      c.globalGet(DP);
+      c.localGet(FII);
+      c.i32Add();
+      c.localSet(POS);
+      c.localGet(POS);
+      c.i32Const(1);
+      c.call(this.sdcRoundInBuffer());
+      c.globalGet(DP);
+      c.localSet(DPV);
+      c.localGet(DPV);
+      c.i32Const(1);
+      c.i32GtS();
+      c.ifResult(I32);
+      c.localGet(DPV);
+      c.else_();
+      c.i32Const(1);
+      c.end();
+      c.localSet(INTCOUNT);
+      c.localGet(DPV);
+      c.localGet(INTCOUNT);
+      c.i32Sub();
+      c.localSet(INTSTART);
+
+      c.localGet(NEG);
+      c.localGet(INTCOUNT);
+      c.i32Add();
+      c.localGet(FII);
+      c.i32Const(0);
+      c.i32GtS();
+      c.ifResult(I32);
+      c.localGet(FII);
+      c.i32Const(1);
+      c.i32Add();
+      c.else_();
+      c.i32Const(0);
+      c.end();
+      c.i32Add();
+      c.localSet(TOTALLEN);
+      c.localGet(TOTALLEN);
+      c.arrayNewDefault(strType);
+      c.localSet(OUT);
+      c.i32Const(0);
+      c.localSet(IDX);
+      c.localGet(NEG);
+      c.ifVoid();
+      c.localGet(OUT);
+      c.localGet(IDX);
+      c.i32Const(0x2d);
+      c.arraySet(strType);
+      c.localGet(IDX);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(IDX);
+      c.end();
+
+      c.localGet(INTSTART);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(DPV);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(OUT);
+      c.localGet(IDX);
+      c.i32Const(0x30);
+      c.localGet(I);
+      c.call(this.sdcDigitAt());
+      c.i32Add();
+      c.arraySet(strType);
+      c.localGet(IDX);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(IDX);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+
+      c.localGet(FII);
+      c.i32Const(0);
+      c.i32GtS();
+      c.ifVoid();
+      c.localGet(OUT);
+      c.localGet(IDX);
+      c.i32Const(0x2e);
+      c.arraySet(strType);
+      c.localGet(IDX);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(IDX);
+      c.localGet(DPV);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(DPV);
+      c.localGet(FII);
+      c.i32Add();
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(OUT);
+      c.localGet(IDX);
+      c.i32Const(0x30);
+      c.localGet(I);
+      c.call(this.sdcDigitAt());
+      c.i32Add();
+      c.arraySet(strType);
+      c.localGet(IDX);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(IDX);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.end();
+
+      c.localGet(OUT);
+      this.mb.setBody(idx, locals, c.bytes());
+    });
+  }
+
+  /** `%w.toFixed0(x)` → str — `num.toFixed0` [F64]->STRING
+   * (ir/validate.ts:219): the same formatter at f = 0, a thin wrapper
+   * (v6 §2.5: "the same helper at f = 0"). */
+  toFixed0(): number {
+    return this.cached("toFixed0", [F64], [this.deps.strRef()], (idx) => {
+      const c = new Code();
+      c.localGet(0);
+      c.f64Const(0);
+      c.call(this.toFixed());
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** `%w.toPrecision(x, p)` → str — the DYN-PATH-ONLY toPrecision helper
+   * (D4-ii, INC-25 P4, CP1 §7 / v6 §2.5): NOT a static key (no static
+   * lowering exists — v6 §7.8), called from dyn.ts's invoke ladder AND
+   * (R11) the placeholder-call site, both AFTER the caller has already
+   * handled `p === undefined` (-> `f64ToStr(x)`, oracle: `(5).toPrecision()`
+   * = "5") — this function only ever sees a REAL `p`.
+   * ORDER, from builtins-number.cc NumberPrototypeToPrecision: (1)
+   * ToIntegerOrInfinity(p); (2) NaN(x) -> "NaN", Infinity(x) -> its text
+   * — BEFORE the range check (the OPPOSITE order to toFixed, both
+   * lead-measured); (3) `p<1 || p>100` -> RangeError "toPrecision()
+   * argument must be between 1 and 100"; (4) sign from `x<0` (computed
+   * at the SAME point V8 computes it — before any zero/rounding — so
+   * -0 is NOT negative, matching `(-0).toPrecision(3)` = "0.00", no
+   * sign); (5) `x==0` -> "0" padded to p digits, no sign; (6) else
+   * ASSIGN(x) + `sdcRoundInBuffer(p, mode 1)` (SIGNIFICANT-digit
+   * position, not `dp+f`) + `e = dp-1` READ AFTER rounding (the carry
+   * can bump it — `(9.5).toPrecision(1)` = "1e+1") + `e<-6 || e>=p` ->
+   * exponential form (p significant digits, zero-padded via
+   * `sdcDigitAt`'s own out-of-range-is-0 rule — no separate padding
+   * step needed) else fixed form (p significant digits, same padding
+   * rule for the fractional tail). */
+  toPrecision(): number {
+    return this.cached("toPrecision", [F64, F64], [this.deps.strRef()], (idx) => {
+      const DP = this.i32Global("dp");
+      const strRef = this.deps.strRef();
+      const strType = this.deps.strType();
+      const c = new Code();
+      const X = 0, P = 1;
+      const PI = 2, NEG = 3, PII = 4, DPV = 5, E = 6, INTCOUNT = 7, INTSTART = 8, TOTALLEN = 9;
+      const OUT = 10, IDX = 11, I = 12;
+      const locals: ValType[] = [F64, I32, I32, I32, I32, I32, I32, I32, strRef, I32, I32];
+
+      // (1) ToIntegerOrInfinity(P).
+      c.localGet(P);
+      c.localGet(P);
+      c.f64Ne();
+      c.ifResult(F64);
+      c.f64Const(0);
+      c.else_();
+      c.localGet(P);
+      c.f64Trunc();
+      c.end();
+      c.localSet(PI);
+
+      // (2) NaN / Infinity, BEFORE the range check.
+      c.localGet(X);
+      c.localGet(X);
+      c.f64Ne();
+      c.ifVoid();
+      this.deps.lit(c, "NaN");
+      c.return_();
+      c.end();
+      c.localGet(X);
+      c.f64Const(0);
+      c.f64Lt();
+      c.localSet(NEG);
+      c.localGet(X);
+      c.i64ReinterpretF64();
+      c.i64Const(0x7fffffffffffffffn);
+      c.i64And();
+      c.f64ReinterpretI64();
+      c.f64Const(Infinity);
+      c.f64Eq();
+      c.ifVoid();
+      c.localGet(NEG);
+      c.ifResult(strRef);
+      this.deps.lit(c, "-Infinity");
+      c.else_();
+      this.deps.lit(c, "Infinity");
+      c.end();
+      c.return_();
+      c.end();
+
+      // (3) range check.
+      c.localGet(PI);
+      c.f64Const(1);
+      c.f64Lt();
+      c.localGet(PI);
+      c.f64Const(100);
+      c.f64Gt();
+      c.i32Or();
+      c.ifVoid();
+      this.deps.throwError(c, "%RangeError", "RangeError", (x) =>
+        this.deps.lit(x, "toPrecision() argument must be between 1 and 100"),
+      );
+      c.refNull(strType);
+      c.return_();
+      c.end();
+      c.localGet(PI);
+      c.i32TruncF64S();
+      c.localSet(PII);
+
+      // (4) sign (already computed above as NEG); negate X to its magnitude.
+      c.localGet(NEG);
+      c.ifVoid();
+      c.localGet(X);
+      c.f64Neg();
+      c.localSet(X);
+      c.end();
+
+      // (5) literal zero: "0" padded to p digits, NO sign (matches NEG's
+      // own -0-is-not-negative computation above).
+      c.localGet(X);
+      c.f64Const(0);
+      c.f64Eq();
+      c.ifVoid();
+      c.localGet(PII);
+      c.i32Const(1);
+      c.i32GtS();
+      c.ifResult(I32);
+      c.localGet(PII);
+      c.i32Const(1);
+      c.i32Add();
+      c.else_();
+      c.i32Const(1);
+      c.end();
+      c.localSet(TOTALLEN);
+      c.localGet(TOTALLEN);
+      c.arrayNewDefault(strType);
+      c.localSet(OUT);
+      c.localGet(OUT);
+      c.i32Const(0);
+      c.i32Const(0x30);
+      c.arraySet(strType);
+      c.localGet(PII);
+      c.i32Const(1);
+      c.i32GtS();
+      c.ifVoid();
+      c.localGet(OUT);
+      c.i32Const(1);
+      c.i32Const(0x2e);
+      c.arraySet(strType);
+      c.i32Const(2);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(TOTALLEN);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(OUT);
+      c.localGet(I);
+      c.i32Const(0x30);
+      c.arraySet(strType);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.end();
+      c.localGet(OUT);
+      c.return_();
+      c.end();
+
+      // (6) general path.
+      c.localGet(X);
+      c.call(this.sdcAssignF64());
+      c.localGet(PII);
+      c.i32Const(1);
+      c.call(this.sdcRoundInBuffer());
+      c.globalGet(DP);
+      c.localSet(DPV);
+      c.localGet(DPV);
+      c.i32Const(1);
+      c.i32Sub();
+      c.localSet(E);
+
+      c.localGet(E);
+      c.i32Const(-6);
+      c.i32LtS();
+      c.localGet(E);
+      c.localGet(PII);
+      c.i32GeS();
+      c.i32Or();
+      c.ifVoid();
+      // EXPONENTIAL: sign + d[0] + ('.' + d[1..p) if p>1) + "e" + expsign + |E|.
+      c.localGet(NEG);
+      c.ifResult(strRef);
+      this.deps.lit(c, "-");
+      c.else_();
+      this.deps.lit(c, "");
+      c.end();
+      c.i32Const(0x30);
+      c.i32Const(0);
+      c.call(this.sdcDigitAt());
+      c.i32Add();
+      c.localSet(IDX); // reuse IDX as a scratch i32 for the first digit char
+      c.localGet(IDX);
+      c.arrayNewFixed(strType, 1);
+      c.call(this.deps.concat());
+      c.localGet(PII);
+      c.i32Const(1);
+      c.i32GtS();
+      c.ifResult(strRef);
+      this.deps.lit(c, ".");
+      c.localGet(PII);
+      c.i32Const(1);
+      c.i32Sub();
+      c.arrayNewDefault(strType);
+      c.localSet(OUT);
+      c.i32Const(1);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(PII);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(OUT);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Sub();
+      c.i32Const(0x30);
+      c.localGet(I);
+      c.call(this.sdcDigitAt());
+      c.i32Add();
+      c.arraySet(strType);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(OUT);
+      c.call(this.deps.concat());
+      c.else_();
+      this.deps.lit(c, "");
+      c.end();
+      c.call(this.deps.concat());
+      this.deps.lit(c, "e");
+      c.call(this.deps.concat());
+      c.localGet(E);
+      c.i32Const(0);
+      c.i32LtS();
+      c.ifResult(strRef);
+      this.deps.lit(c, "-");
+      c.else_();
+      this.deps.lit(c, "+");
+      c.end();
+      c.call(this.deps.concat());
+      c.localGet(E);
+      c.i32Const(0);
+      c.i32LtS();
+      c.ifResult(I32);
+      c.i32Const(0);
+      c.localGet(E);
+      c.i32Sub();
+      c.else_();
+      c.localGet(E);
+      c.end();
+      c.f64ConvertI32S();
+      c.call(this.deps.f64ToStr());
+      c.call(this.deps.concat());
+      c.return_();
+      c.end();
+
+      // FIXED: sign + int digits [intStart, dp) + ('.' + digits [dp, p) if dp < p).
+      c.localGet(DPV);
+      c.i32Const(1);
+      c.i32GtS();
+      c.ifResult(I32);
+      c.localGet(DPV);
+      c.else_();
+      c.i32Const(1);
+      c.end();
+      c.localSet(INTCOUNT);
+      c.localGet(DPV);
+      c.localGet(INTCOUNT);
+      c.i32Sub();
+      c.localSet(INTSTART);
+
+      c.localGet(NEG);
+      c.localGet(INTCOUNT);
+      c.i32Add();
+      c.localGet(DPV);
+      c.localGet(PII);
+      c.i32LtS();
+      c.ifResult(I32);
+      c.localGet(PII);
+      c.localGet(DPV);
+      c.i32Sub();
+      c.i32Const(1);
+      c.i32Add();
+      c.else_();
+      c.i32Const(0);
+      c.end();
+      c.i32Add();
+      c.localSet(TOTALLEN);
+      c.localGet(TOTALLEN);
+      c.arrayNewDefault(strType);
+      c.localSet(OUT);
+      c.i32Const(0);
+      c.localSet(IDX);
+      c.localGet(NEG);
+      c.ifVoid();
+      c.localGet(OUT);
+      c.localGet(IDX);
+      c.i32Const(0x2d);
+      c.arraySet(strType);
+      c.localGet(IDX);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(IDX);
+      c.end();
+
+      c.localGet(INTSTART);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(DPV);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(OUT);
+      c.localGet(IDX);
+      c.i32Const(0x30);
+      c.localGet(I);
+      c.call(this.sdcDigitAt());
+      c.i32Add();
+      c.arraySet(strType);
+      c.localGet(IDX);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(IDX);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+
+      c.localGet(DPV);
+      c.localGet(PII);
+      c.i32LtS();
+      c.ifVoid();
+      c.localGet(OUT);
+      c.localGet(IDX);
+      c.i32Const(0x2e);
+      c.arraySet(strType);
+      c.localGet(IDX);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(IDX);
+      c.localGet(DPV);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(PII);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(OUT);
+      c.localGet(IDX);
+      c.i32Const(0x30);
+      c.localGet(I);
+      c.call(this.sdcDigitAt());
+      c.i32Add();
+      c.arraySet(strType);
+      c.localGet(IDX);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(IDX);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.end();
+
+      c.localGet(OUT);
+      this.mb.setBody(idx, locals, c.bytes());
     });
   }
 
