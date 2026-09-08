@@ -30544,8 +30544,12 @@ class Assembler {
    * after it are ignored, parseInt's own rule: "42abc" → 42); NaN when
    * zero digits are found at `start`. INC-25 P3: routes to arm (b) for a
    * power-of-two radix (endPos dropped — a prefix scan never cares where
-   * it stopped); radix 10 and every other radix still fall through to the
-   * OLD f64 loop here, TEMPORARILY, until arms (a) and (c) are wired. */
+   * it stopped); radix 10 to arm (a) — the digit-prefix span valued
+   * through %w.decimalWhole's correctly-rounded path; every other radix
+   * to arm (c) — %w.radixIntGeneric, the HandleGenericCase transcription.
+   * emitRadixDigitLoop is used here ONLY for its scanning half (where the
+   * digit run ends); its f64 accumulation is never this helper's result
+   * (board #123's fix, INC-25 P3; header corrected under board #128). */
   private radixScanPrefixHelper(): number {
     if (this.radixScanPrefixFunc !== null) return this.radixScanPrefixFunc;
     const idx = this.mb.declareFunc(
