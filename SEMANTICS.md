@@ -4557,6 +4557,18 @@ tmp/a%2` (truncated) — no exception. This tier has no `URIError` class
 class is not cheap in a bounded fix round) so it throws a catchable
 `TypeError` naming the gap instead, same style/class as (a) and (b).
 
+**Forward pointer (INC-25 P5, board #129):** the tier now DOES throw a
+real, catchable `URIError` — `instanceof Error`, `.name === "URIError"`
+— for `str.encodeUri`/`str.encodeUriComponent`/`str.decodeUriComponent`
+(`packages/compiler/src/backend/wasm/uri.ts`), via the SAME name-
+independent-of-class mechanism this entry's own (c) could reuse
+(`emitSetCellError`/`emitSetCellErrorLit`, no sixth `RUNTIME_ERROR_
+CLASSES` entry). This paragraph is phrased historically and is not
+itself stale — (c)'s own choice to throw a catchable `TypeError` for
+`fileURLToPathStr`'s malformed-escape trap is unchanged — but a reader
+following the "no URIError class" reasoning here should find uri.ts,
+not conclude a real URIError is out of reach tier-wide.
+
 **Rationale:** the two remaining gaps ((b)'s encoded half and (c)) are
 SCOPE narrowings of a rider whose own contract claims exactly one
 corpus program (2385, ASCII paths, no dot segments, well-formed

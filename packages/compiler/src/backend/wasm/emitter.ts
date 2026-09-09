@@ -119,6 +119,7 @@ import {
 } from "./dyn.js";
 import { InspectBuilder } from "./inspect.js";
 import { UrlBuilder } from "./url.js";
+import { UriBuilder } from "./uri.js";
 import { MapBuilder, type MapInfo, type MapKeyKind, type MapValKind } from "./maps.js";
 import { JsonBuilder, jsonQuote } from "./json.js";
 import {
@@ -5249,6 +5250,25 @@ class Assembler {
         this.emitSetCellError(c, className, name, pushMessage, codeLit),
     });
     return this.urlField;
+  }
+
+  private uriField: UriBuilder | null = null;
+
+  /** INC-25 pass P5's own builder (uri.ts) — the "str.*" URI-codec/
+   * base64 family, a structurally new subsystem (CP1 §8), distinct from
+   * url.ts's file-URL parser above despite both throwing the tier's
+   * "no URIError class, throw by literal name" shape. */
+  private get uri(): UriBuilder {
+    this.uriField ??= new UriBuilder(this.mb, {
+      strRef: () => this.strRef,
+      strType: () => this.strType,
+      lit: (c, s) => this.pushStrLitInto(c, s),
+      throwError: (c, className, name, pushMessage) => this.emitSetCellError(c, className, name, pushMessage, null),
+      hexVal: () => this.url.hexValHelper(),
+      dynRef: () => this.dyn.dynRef(),
+      dynToStr: () => this.dyn.toStr(),
+    });
+    return this.uriField;
   }
 
   /** The ARR payload's vector info — the SAME interning a static
@@ -11674,6 +11694,73 @@ class Assembler {
           return;
         }
         // ── end INC-25 P4 ────────────────────────────────────────────
+        // ── INC-25 pass P5 (design-number-v6.txt §5.4/§7.6, CP1
+        // §1/§5-§12; CP2 not yet reached). The "string.*" family's three
+        // mechanical siblings of matchAt/indexOf/etc (strings.ts) below,
+        // both of string.fromCharCode's argument shapes (validate.ts's
+        // own special check — a packed `array<f64>` or a typed-array/
+        // Buffer `bytes<u8/u32/i32/f32>` spread, CP1 §10's four elem
+        // kinds), and the "str.*" URI-codec/base64 family (uri.ts, a
+        // structurally new subsystem, CP1 §8) further below. */
+        if (e.fn === "string.fromCharCode" && e.args[0]!.type.kind === "array") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.strs.fromCharCode());
+          return;
+        }
+        if (e.fn === "string.fromCharCode" && e.args[0]!.type.kind === "bytes") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.strs.fromCharCodeBytes(e.args[0]!.type.elem));
+          return;
+        }
+        if (e.fn === "string.lastIndexOf") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.strs.lastIndexOf());
+          return;
+        }
+        if (e.fn === "string.raw") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.strs.raw());
+          return;
+        }
+        // Both throw on a lone surrogate (CP1 §3.2's own headline
+        // finding: URIError "URI malformed", identical both directions)
+        // by setting the pending-exception cell inside percentEncode —
+        // the call site owns the unwind uniformly, exactly as toFixed's
+        // RangeError does (P4's own precedent above), regardless of
+        // whether THIS call's own argument happens to contain one.
+        if (e.fn === "str.encodeUriComponent") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.uri.encodeUriComponentHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "str.encodeUri") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.uri.encodeUriHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "str.decodeUriComponent") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.uri.decodeUriComponentHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "str.atob") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.uri.atobHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "str.btoa") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.uri.btoaHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        // ── end INC-25 P5 — all eight keys wired ──────────────────────
         if (this.emitBufferLibCall(e)) return;
         if (this.emitTimerCall(e)) return;
         if (this.emitEmitterLibCall(e)) return;
@@ -16585,6 +16672,15 @@ class Assembler {
         const info = this.vecs.info("vec(str)", strRef, strRef, "string");
         return { info, push1: this.vecs.pushOne(info) };
       },
+      // INC-25 P5: string.fromCharCode's packed-argument `array<f64>`
+      // form — the SAME "vec(f64)" key math.maxArr/minArr's own inline
+      // `vecInfoFor(arrayOf(F64), ...)` call interns, so this shares
+      // their struct/bufType rather than minting a second.
+      vecF64: () => this.vecs.info("vec(f64)", F64, F64, "f64"),
+      concat: () => this.concatHelper(),
+      bytesRef: () => this.bytesB.bytesRef(),
+      bytesGet: (elem) => this.bytesB.get(elem),
+      bytesLength: () => this.bytesB.length(),
     });
     return this.strsField;
   }

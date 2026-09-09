@@ -3114,6 +3114,30 @@ const TIER_FLOOR: string[] = [
   "1112-number-methods.ts",
   "1116-island-static-mix.ts",
   "1980-primitive-proto-statics.ts",
+  // Increment 25, pass P5 (design-number-v6.txt §5.4/§7.6, D4's option
+  // C, CP1 sha256 0c1128c8.../827 + addendum 0c156446.../374 — the "str.*"
+  // URI component codecs (str.encodeUriComponent/str.encodeUri/str.
+  // decodeUriComponent — one shared percentEncode walk plus a strict
+  // UTF-8 decode, both new to this tier) and the "string.*" family's
+  // three mechanical siblings of matchAt/indexOf (string.fromCharCode —
+  // both the packed array<f64> AND the bytes<u8/u32/i32/f32> spread
+  // shapes — string.lastIndexOf, string.raw). D5's str.atob/str.btoa
+  // ship too (uri.ts) but claim NO corpus program (no candidate reaches
+  // either key) and pin instead in wasm-uri.test.ts, computed from Node
+  // in-process — the 1077 denominator does not move for them. No
+  // register entry (v6 §7.6: "REGISTER: none expected" — the URIError
+  // text is produced via the tier's existing name-independent-of-class
+  // mechanism, R0's own ReferenceError precedent, zero new
+  // RUNTIME_ERROR_CLASSES entries). 834 -> 840, every member accounted
+  // for: 838 (four keys' worth) + 2 (the two remaining candidates'
+  // remaining blockers, decodeUriComponent and fromCharCode's bytes
+  // shape) = 840 exactly, the design's own predicted end point.
+  "1406-dataview-mp4.ts",
+  "1427-fromcharcode-lastindexof.ts",
+  "1454-nonnull-narrow-and-fcc-bytes.ts",
+  "1536-string-array-sweep.ts",
+  "2140-uri-component-codecs.ts",
+  "2191-uri-encoders.ts",
 ];
 
 interface RunResult {

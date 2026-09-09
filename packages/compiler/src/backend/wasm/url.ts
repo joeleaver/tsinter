@@ -38,9 +38,15 @@
  *     measured (a lone/trailing '%', non-hex digits, a truncated multi-
  *     byte lead, an invalid/overlong/surrogate-encoding sequence) — this
  *     tier has no URIError class (RUNTIME_ERROR_CLASSES: Error/TypeError/
- *     RangeError/SyntaxError/DOMException only; adding one is not cheap
- *     this round) so it traps by name instead, same style as its sibling
- *     above — a future real UTF-8 decoder must trap every one of these
+ *     RangeError/SyntaxError/DOMException only; adding a sixth is not
+ *     cheap) so it traps by name instead — board #129: that RUNTIME_
+ *     ERROR_CLASSES fact does NOT mean a real URIError is unreachable.
+ *     INC-25 P5 (uri.ts) throws exactly `instanceof Error`, `.name ===
+ *     "URIError"` objects for its own str.encodeUri/str.encodeUriComponent
+ *     /str.decodeUriComponent, via the SAME name-independent-of-class
+ *     mechanism (emitSetCellError/emitSetCellErrorLit) this file's own
+ *     traps could reuse — but this rider predates that machinery and was
+ *     not revisited; a future real UTF-8 decoder must trap every one of these
  *     invalid-sequence classes under this SAME mechanism, or it silently
  *     reintroduces this exact bug on the inputs this round closed.
  * Posix arm only (this runtime never targets win32).
@@ -114,8 +120,15 @@ export class UrlBuilder {
     });
   }
 
-  /** %w.url.hexVal(ch: i32) -> i32 — the nibble value, or -1. */
-  private hexValHelper(): number {
+  /** %w.url.hexVal(ch: i32) -> i32 — the nibble value, or -1. Not private:
+   * P5's uri.ts (str.decodeUriComponent's strict percent-escape grammar)
+   * reuses this exact table via emitter.ts's dependency injection rather
+   * than re-deriving it — board #130 is a stale-twin board about
+   * DUPLICATED URI-encoder logic in the C lane; re-deriving this nibble
+   * table here would mint that same defect shape in the wasm lane
+   * (Q2, the LEAD's ruling, INC-25 P5 CP1 addendum — not Joe's; D4/D5
+   * are Joe's own rulings this pass, Q1-Q3 are the lead's). */
+  hexValHelper(): number {
     return this.cached("url.hexVal", [I32], [I32], (idx) => {
       const c = new Code();
       const CH = 0;
@@ -710,8 +723,11 @@ c,
       // literal '%' through; Node throws `URIError: URI malformed` for
       // every case measured: a lone or trailing '%', non-hex digits, a
       // truncated multi-byte UTF-8 lead — this tier has no URIError
-      // class, not cheap to add this round, so it traps by name instead,
-      // same style/class as its siblings). A decoded byte >= 0x80 traps
+      // class, so it traps by name instead, same style/class as its
+      // siblings — board #129: NOT because a real URIError is out of
+      // reach; see uri.ts, which throws one for the sibling str.*
+      // functions via the SAME class-independent naming this file could
+      // reuse). A decoded byte >= 0x80 traps
       // too (S060(b), now covering ONLY the percent-decoded side — the
       // raw side above is FIXED, no longer a divergence): `file:///tmp/
       // %C3%A9` decodes to bytes that ARE valid UTF-8 for 'é' (%C3%A9 IS

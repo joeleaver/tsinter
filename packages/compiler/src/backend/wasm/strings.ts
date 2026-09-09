@@ -24,12 +24,33 @@
  * the emitter refuses them by member. */
 import { Code } from "./code.js";
 import { F64, I32, ModuleBuilder, type ValType } from "./module.js";
-import type { VecInfo } from "./arrays.js";
+import { BUF, LEN, type VecInfo } from "./arrays.js";
+import type { BytesElem } from "./typedarrays.js";
 
 export interface StrDeps {
   /** The string[] vector machinery for split: the interned vec(str) info
    * plus %w.vec.push1's index (growth included). */
   vecStr: () => { info: VecInfo; push1: number };
+  /** INC-25 P5: the interned vec(f64) info — string.fromCharCode's
+   * packed-argument form (`String.fromCharCode(a, b, c)` and the plain
+   * `[...codes]` spread both lower to `array<f64>`, validate.ts's
+   * `argTypes: [null]` first arm). The SAME VecInfo math.maxArr/minArr's
+   * own inline `vecInfoFor(arrayOf(F64), ...)` call interns under the
+   * identical "vec(f64)" key — sharing the one struct/bufType, not
+   * minting a second. */
+  vecF64: () => VecInfo;
+  /** %w.concat's index — INC-25 P5's string.raw needs it (piece-by-piece
+   * accumulation, dyn.ts's own toStr() precedent: "the only string-
+   * building primitive the tier has"). */
+  concat: () => number;
+  /** INC-25 P5's fromCharCodeBytes: typedarrays.ts's own (bytes, f64
+   * index) -> f64 element read (already widened/sign-extended per elem
+   * kind — CP1 §10's enumeration, all four kinds validate.ts's `bytes`
+   * arg type can carry), the elem-independent bytes struct ref, and the
+   * elem-independent element-count reader. */
+  bytesRef: () => ValType;
+  bytesGet: (elem: BytesElem) => number;
+  bytesLength: () => number;
 }
 
 export class StrBuilder {
@@ -66,6 +87,52 @@ export class StrBuilder {
     c.localGet(X);
     c.f64Trunc();
     c.localSet(X);
+  }
+
+  /** ECMA ToUint16 on the f64 in local X, leaving the i32 result in OUT
+   * (INC-25 P5, string.fromCharCode — CP1 §9's own measurement: NaN/±0/
+   * ±Infinity → 0, otherwise truncate toward zero then reduce modulo
+   * 2^16 into an UNSIGNED 16-bit value). The reduction stays in the f64
+   * domain until the very end — `i32.trunc_f64_s` TRAPS outside the i32
+   * range (2^32+5 is already past it) and `i32.trunc_sat_f64_s`
+   * SATURATES instead of wrapping (±Infinity would land on ±0x7FFFFFFF,
+   * not the ToUint16 answer) — the CP1 addendum's M-5' mutation names
+   * exactly this pair of wrong primitives, which is why neither is used
+   * unconditionally here: the non-finite check happens FIRST (giving
+   * ToUint16's own +0), and the floor-based mod-65536 (n - 65536*floor(n
+   * /65536), which stays correct for negative n too — e.g. n=-1 gives
+   * m=65535) always leaves a value in [0, 65535] before the ONE i32
+   * conversion this function performs. */
+  private emitToUint16(c: Code, X: number, OUT: number): void {
+    c.localGet(X);
+    c.localGet(X);
+    c.f64Ne(); // NaN
+    c.localGet(X);
+    c.f64Const(Number.POSITIVE_INFINITY);
+    c.f64Eq();
+    c.i32Or();
+    c.localGet(X);
+    c.f64Const(Number.NEGATIVE_INFINITY);
+    c.f64Eq();
+    c.i32Or();
+    c.ifVoid();
+    c.i32Const(0);
+    c.localSet(OUT);
+    c.else_();
+    c.localGet(X);
+    c.f64Trunc();
+    c.localSet(X); // X now a finite whole number
+    c.localGet(X);
+    c.localGet(X);
+    c.f64Const(65536);
+    c.f64Div();
+    c.f64Floor();
+    c.f64Const(65536);
+    c.f64Mul();
+    c.f64Sub(); // m = X - 65536*floor(X/65536), in [0, 65535]
+    c.i32TruncF64U();
+    c.localSet(OUT);
+    c.end();
   }
 
   /** A fresh copy of s[F, F+CNT) — (ref $str) onto the stack. S/F/CNT are
@@ -1186,6 +1253,303 @@ export class StrBuilder {
       c.end();
       c.end();
       c.localGet(R);
+      this.mb.setBody(idx, [I32, I32, I32, this.strRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  /* ── INC-25 pass P5: string.fromCharCode / string.lastIndexOf /
+   * string.raw (design-number-v6.txt §5.4/§7.6, CP1 §1/§9/§10) — the
+   * "string.*" IR-key family's three siblings of matchAt/indexOf/etc.
+   * above. The "str.*" family (the URI codecs, atob/btoa) is a
+   * DIFFERENT, structurally new subsystem and lives in its own file,
+   * uri.ts (CP1 §8's own reasoning: two throw-disposition UTF-8 walks
+   * this tier never had, versus these three mechanical siblings). ── */
+
+  /** %w.str.fromCharCode — (array<f64>) → str: String.fromCharCode's
+   * PACKED-ARGUMENT form (plain args and the `[...codes]`/plain-array
+   * spread both lower to `array<f64>` — lower-builtins.ts). Each element
+   * takes ECMA ToUint16 (emitToUint16 above — CP1 §9's measured truth
+   * table). A lone surrogate produced this way is NOT combined with
+   * anything and NOT substituted: S002's storage keeps it verbatim,
+   * exactly as any other code unit — ir/nodes.ts's own doc comment for
+   * this key claims pairs "combine" and lone surrogates "become U+FFFD",
+   * which is the C RUNTIME's contract and is WRONG for this tier (CP1
+   * §15(a)/addendum §E — not fixed here, ir/* does not move this pass).
+   * The `bytes<u8/u32/i32/f32>` spread form (validate.ts's OTHER arm for
+   * this key, `String.fromCharCode(...someTypedArray)`) is NOT built by
+   * this method — CP1 §10 enumerated all four elem kinds as needed, but
+   * that wiring is deferred past this skeleton; a bytes-typed spread
+   * still refuses by name until it lands. */
+  fromCharCode(): number {
+    return this.cached("fromCharCode", () => {
+      const v = this.deps.vecF64();
+      const vecRef: ValType = { kind: "ref", nullable: true, typeIndex: v.struct };
+      const idx = this.mb.declareFunc(this.mb.funcType([vecRef], [this.strRef()]), "%w.str.fromCharCode");
+      const c = new Code();
+      const V = 0,
+        L = 1,
+        R = 2,
+        I = 3,
+        X = 4,
+        OUT = 5;
+      c.localGet(V);
+      c.structGet(v.struct, LEN);
+      c.localSet(L);
+      c.localGet(L);
+      c.arrayNewDefault(this.strType);
+      c.localSet(R);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(L);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(V);
+      c.structGet(v.struct, BUF);
+      c.localGet(I);
+      c.arrayGet(v.bufType);
+      c.localSet(X);
+      this.emitToUint16(c, X, OUT);
+      c.localGet(R);
+      c.localGet(I);
+      c.localGet(OUT);
+      c.arraySet(this.strType);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(R);
+      this.mb.setBody(idx, [I32, this.strRef(), I32, F64, I32], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.str.fromCharCode:bytes:<elem> — (bytes<elem>) → str: String.
+   * fromCharCode's OTHER argument shape (validate.ts's own special check
+   * — a typed-array/Buffer SPREAD, `String.fromCharCode(...someTyped
+   * Array)`), one specialized function per elem kind (CP1 §10: all four
+   * — u8/u32/i32/f32 — since validate.ts's bytes argtype is not narrowed
+   * to u8; 1454's own corpus source exercises u8 via both Uint8Array.
+   * slice and Buffer.from, and u32 via `new Uint32Array([...66376...])`
+   * — a live ToUint16-wrap witness sourced from a u32 element; i32/f32
+   * are unexercised by any corpus program but handled identically since
+   * `bytesB.get(elem)` already returns the widened f64 VALUE regardless
+   * of storage width, so this loop needs no elem-specific bit-twiddling
+   * of its own). Same ToUint16 reduction (emitToUint16 above) as the
+   * packed-f64-array sibling. */
+  fromCharCodeBytes(elem: BytesElem): number {
+    return this.cached(`fromCharCode:bytes:${elem}`, () => {
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.deps.bytesRef()], [this.strRef()]),
+        `%w.str.fromCharCode:bytes:${elem}`,
+      );
+      const c = new Code();
+      const B = 0,
+        L = 1,
+        R = 2,
+        I = 3,
+        X = 4,
+        OUT = 5;
+      c.localGet(B);
+      c.call(this.deps.bytesLength());
+      c.i32TruncF64S();
+      c.localSet(L);
+      c.localGet(L);
+      c.arrayNewDefault(this.strType);
+      c.localSet(R);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(L);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(B);
+      c.localGet(I);
+      c.f64ConvertI32S();
+      c.call(this.deps.bytesGet(elem));
+      c.localSet(X);
+      this.emitToUint16(c, X, OUT);
+      c.localGet(R);
+      c.localGet(I);
+      c.localGet(OUT);
+      c.arraySet(this.strType);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(R);
+      this.mb.setBody(idx, [I32, this.strRef(), I32, F64, I32], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.str.lastIndexOf — (s, needle) → f64: the ONE-ARGUMENT form only
+   * (CP1 §1 — `fromIndex` is fenced in the frontend, before any IR
+   * exists: lower-builtins.ts's own "lastIndexOf with a fromIndex
+   * argument" refusal; the position argument's ToNumber-not-
+   * ToIntegerOrInfinity distinction v6 §5.4 describes is the DYN path's
+   * own concern, unreachable through this static key). `matchAt` run
+   * BACKWARD from len-nlen: the empty needle answers `len` (matchAt(s,
+   * "", len) is vacuously true — CP1 §3.5/§12 M-6); absent or a needle
+   * longer than the haystack both answer -1 because the start index goes
+   * negative and the loop's own `I < 0` guard exits BEFORE ever calling
+   * matchAt with it — matchAt itself has no such guard on the low end
+   * (only `at > len`) and reads `s[at+j]` unconditionally, an
+   * out-of-bounds GC array access that TRAPS on a negative `at`, so this
+   * guard is load-bearing, not defensive. */
+  lastIndexOf(): number {
+    return this.cached("lastIndexOf", () => {
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.strRef(), this.strRef()], [F64]),
+        "%w.str.lastIndexOf",
+      );
+      const c = new Code();
+      const S = 0,
+        N = 1,
+        L = 2,
+        NL = 3,
+        I = 4;
+      c.localGet(S);
+      c.arrayLen();
+      c.localSet(L);
+      c.localGet(N);
+      c.arrayLen();
+      c.localSet(NL);
+      c.localGet(L);
+      c.localGet(NL);
+      c.i32Sub();
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.i32Const(0);
+      c.i32LtS();
+      c.brIf(1);
+      c.localGet(S);
+      c.localGet(N);
+      c.localGet(I);
+      c.call(this.matchAt());
+      c.ifVoid();
+      c.localGet(I);
+      c.f64ConvertI32S();
+      c.return_();
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Sub();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.f64Const(-1);
+      this.mb.setBody(idx, [I32, I32, I32], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.str.raw — (raw: array<string>, subs: array<string>) → str:
+   * String.raw's own OBJECT-ARGUMENT call form (`String.raw({raw:[...]},
+   * ...subs)` — validate.ts's two `arrayOf(STRING)` args). This is NOT
+   * the tagged-template call (`` String.raw`...` ``), which folds
+   * through an entirely different, already-existing frontend mechanism
+   * and never reaches this libCall at all (CP1 addendum §B2 — 1563/1564
+   * already claim at base via that other path; a mutation to THIS
+   * function reddens neither of them, which is why, not a sign the edit
+   * silently failed). Interleaves raw[i] with subs[i] for every SLOT
+   * (there are raw.length-1 of them): extra substitutions (subs.length >
+   * raw.length-1) are never read past the last slot and so drop; missing
+   * ones (subs.length < raw.length-1) leave a slot with nothing appended
+   * — skipped, never stringified as "undefined". Substitutions arrive
+   * ALREADY ToString'd and type-fenced by the frontend (lower-
+   * builtins.ts wraps non-string arguments in a `toString` IR node
+   * before packing) — this helper performs no coercion of its own, only
+   * concatenation (`%w.concat` — dyn.ts's toStr() precedent: "the only
+   * string-building primitive the tier has"). Never throws. An empty
+   * `raw` array (no template pieces at all) answers "" directly, before
+   * the first read that would otherwise be out of bounds. */
+  raw(): number {
+    return this.cached("raw", () => {
+      const { info } = this.deps.vecStr();
+      const vecRef: ValType = { kind: "ref", nullable: true, typeIndex: info.struct };
+      const idx = this.mb.declareFunc(this.mb.funcType([vecRef, vecRef], [this.strRef()]), "%w.str.raw");
+      const c = new Code();
+      const RAW = 0,
+        SUBS = 1,
+        RL = 2,
+        SL = 3,
+        I = 4,
+        ACC = 5;
+      c.localGet(RAW);
+      c.structGet(info.struct, LEN);
+      c.localSet(RL);
+      c.localGet(RL);
+      c.i32Eqz();
+      c.ifVoid();
+      c.i32Const(0);
+      c.arrayNewDefault(this.strType);
+      c.return_();
+      c.end();
+      c.localGet(SUBS);
+      c.structGet(info.struct, LEN);
+      c.localSet(SL);
+      c.localGet(RAW);
+      c.structGet(info.struct, BUF);
+      c.i32Const(0);
+      c.arrayGet(info.bufType);
+      c.refAsNonNull();
+      c.localSet(ACC);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(RL);
+      c.i32Const(1);
+      c.i32Sub();
+      c.i32GeS(); // I >= RL-1: no slot follows this piece — nothing left to append
+      c.brIf(1);
+      c.localGet(I);
+      c.localGet(SL);
+      c.i32LtS();
+      c.ifVoid();
+      c.localGet(ACC);
+      c.localGet(SUBS);
+      c.structGet(info.struct, BUF);
+      c.localGet(I);
+      c.arrayGet(info.bufType);
+      c.refAsNonNull();
+      c.call(this.deps.concat());
+      c.localSet(ACC);
+      c.end();
+      c.localGet(ACC);
+      c.localGet(RAW);
+      c.structGet(info.struct, BUF);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.arrayGet(info.bufType);
+      c.refAsNonNull();
+      c.call(this.deps.concat());
+      c.localSet(ACC);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(ACC);
       this.mb.setBody(idx, [I32, I32, I32, this.strRef()], c.bytes());
       return idx;
     });
