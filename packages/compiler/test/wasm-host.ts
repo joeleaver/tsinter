@@ -17,7 +17,12 @@
  * (wasm-random.test.ts) forces a specific seed with its OWN host instead,
  * a copy of this file's instantiate with `seed: () => BigInt(N)` — this
  * shared host must stay random precisely so nothing here can accidentally
- * pin a value Node would never produce. */
+ * pin a value Node would never produce.
+ *
+ * INC-26 R0 (board #135): this file also stubs `tsinter.wallClock`, and
+ * documents — right beside it, in `instantiate()`'s `tsinter: {...}`
+ * object — the ONE place P1..P5 add their own conditionally-minted
+ * import stubs as abi.ts mints the constants for them. */
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { expect } from "vitest";
@@ -36,6 +41,13 @@ async function instantiate(modulePath: string) {
   const chunks: { 1: Buffer[]; 2: Buffer[] } = { 1: [], 2: [] };
   let memory: WebAssembly.Memory | null = null;
   let clock = 0;
+  // wallBase, sampled ONCE per run, BEFORE instantiation — mirrors the
+  // differential harness's own runWasm exactly (INC-25 P6 D6-iv; INC-26
+  // R0, board #135). NEVER Date.now() per call: a real-time read here
+  // would let a virtual sleep observe real elapsed time (the P6 F-2
+  // lesson), which this shared host must not do any more than the
+  // differential harness's own host does.
+  const wallBase = Date.now();
   const { instance } = await WebAssembly.instantiate(readFileSync(modulePath), {
     tsinter: {
       write(fd: number, ptr: number, len: number): void {
@@ -44,6 +56,19 @@ async function instantiate(modulePath: string) {
       },
       now: (): number => clock,
       seed: (): bigint => randomBytes(8).readBigUInt64BE(),
+      // date.now / no-arg `new Date()` modules only (abi.ts).
+      wallClock: (): number => wallBase + clock,
+
+      // EXTENSION POINT (R0, board #135): as P1..P5 land, each pass's own
+      // conditionally-minted import gets its default stub added here as
+      // an additional key of this SAME `tsinter: {...}` object — keyed
+      // by whatever name that pass's OWN abi.ts constant mints, added
+      // here only once that constant exists. This file spells none of
+      // those future names by hand (abi.ts's own header reserves them to
+      // itself): a LinkError naming a key not yet present here means a
+      // shared-unit-test program has started reaching an import this
+      // file has not caught up to yet — the exact gap R0 exists to
+      // close.
     },
   });
   memory = instance.exports["memory"] as WebAssembly.Memory;
