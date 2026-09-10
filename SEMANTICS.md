@@ -5252,3 +5252,77 @@ score 0 (or, for the shift, ~0) against the real oracle.
 `packages/compiler/src/backend/emission/emit-exprs.ts:2736`). All five repoint here in the same hunk; a
 sixth site, `tests/corpus/1538-math-static-scalar.ts:3`, is a corpus file and stays untouched — recorded as
 a residual.)
+
+## S069 — `date.parseGetTime`: outside its two modelled grammars, the wasm tier FENCES by a named catchable Error; the native lanes answer NaN silently *(per-lane split)*
+
+The number was a WITHDRAWN DRAFT in design-number-v6.txt §9.2, for a different subject (a parseInt fence
+later replaced by a transcription and never shipped) — a reader of that document should not mistake this
+entry for the number's first use.
+
+Two grammars are modelled, exactly: (1) the ASN1_TIME_print certificate-validity shape (`MMM [D]D HH:MM:SS
+YYYY GMT`, case-insensitive month, one or two spaces before the day, seconds bounded 0-59 except where noted
+below); (2) the strict ECMA-262 Date Time String Format (`YYYY[-MM[-DD]]`, optional `THH:mm[:ss[.sss]]`,
+then `Z` or a bounded `±HH:MM`; expanded `±YYYYYY` years; a date-only form is UTC). Inside either grammar, a
+NaN the grammar's own numeric-domain rules produce (an hour past 24, a minute past 59, TimeClip, ...) is
+usually Node's own NaN and both lanes agree — measured exhaustively over years 0000-9999, not assumed: this
+holds for every year on the hour/minute/TimeClip arms of both grammars, but NOT universally. Grammar 1's own
+seconds-bound check and BOTH grammars' month/day-bound checks each have a narrow, year-dependent exception
+where V8's own legacy parser rereads a field as something else and answers a real, unmodelled time instead
+of NaN: grammar 1's seconds field past 59 is reread as a two-digit YEAR, at every tested year (10,000 of
+10,000); grammar 1's day field, when invalid (0 or past 31), is reread from the YEAR token at years
+0001-0031 specifically; grammar 2's month/day fields, when invalid, are reread from the (bare, non-expanded)
+YEAR token at years 0001-0012 specifically. None of these three is modelled — the wasm lane fences all of
+them, per the disposition rule below.
+
+Outside both grammars, the two lanes diverge. The native lanes (`scr_date_parse_get_time`, `scr_lib.c`)
+answer NaN SILENTLY for every such string — a pre-existing divergence since the key landed, UNREGISTERED
+until this entry (INC-25 P6). NaN is a WRONG VALUE for a real input: `new Date("bogus 2020").getTime()`
+answers a real time in Node (V8's legacy fallback reads "bogus" as noise and "2020" as the year), never NaN.
+MANY unmodelled forms Node accepts this way are LOCAL time — INCLUDING EVERY legacy and offset-less
+form — and the tier has no zone import, so even a transcription of V8's own legacy parser
+(`deps/v8/src/date/dateparser*.cc`) could not close those without one; this is not the fence's whole
+justification, though — a full twenty of the forty-one measured fence-worthy shapes carry an EXPLICIT zone
+marker and are stable across six zones (fraction-digit-count variants, case variants, a colon-less offset,
+"GMT"/"UTC" word forms), so a zone import alone would not close them either. The fence's real justification
+is the one v6 §5.5 gives first: unmodelled is not the same as guessed, and without V8's own parser the tier
+cannot tell a real input from a NaN one — "bogus 2020" is the witness. THE RULE HOLDS IN BOTH DIRECTIONS,
+and this entry states both: for a measured minority of the fence's own domain (twelve strings, of a
+103-row table — `""`, `" "`, `"bogus"`, `"Invalid Date"`, `"20"`, `"20260717"`, `"T12:00Z"`, and five more
+lenient-ISO/legacy shapes) Node ALSO answers NaN, and the native lanes are CORRECT today — yet the wasm
+tier still throws, because it cannot distinguish "Node also says NaN here" from "Node has a value here"
+without the same parser; fencing both uniformly, rather than guessing per string which is which, is the
+same tier contract as the "bogus 2020" direction, not a second one.
+
+The wasm tier FENCES instead: a NAMED, CATCHABLE `Error` (S043's stance — a reachable, unmodelled surface
+throws loudly rather than answering silently wrong), never NaN, never an uncatchable trap. Message: `date.
+parseGetTime: this string is not one of the two modelled date formats (SEMANTICS.md S069) — the
+certificate-validity form ("Mon D HH:MM:SS YYYY GMT") or the strict ECMA date-time string format
+("YYYY[-MM[-DD]][THH:mm[:ss[.sss]]](Z|±HH:MM)")`. `.code` "SC1090" — diagnostic.ts's own "generic fallback;
+message names the construct" family, already shared across every other unmodelled-construct fence in this
+backend; no more specific code fits an unmodelled runtime VALUE shape.
+
+Fenced, by measurement: every lenient-ISO shape V8 additionally tolerates (1/2/4/5 fraction digits,
+lowercase `t`/`z`, a one-digit month or day, a leading or trailing space, a space in place of `T`, a
+colon-less or hour-only UTC offset, a bare `T`-time, a separator-less basic-format date); the three
+year-dependent reinterpretation classes named above; a NEGATIVE-signed all-zero expanded year
+("-000000..."), any year (Node's own answer for this shape varies by what follows it — NaN with a time
+part, a real TZ-moving value for the date-only sub-case — so a fence is the only disposition safe for every
+measured variant); the offset-less ECMA date-time (`"2026-07-17T12:00:00"`, `.../T12:00`) — LOCAL per the
+spec's own rule; every legacy V8 form (`"Jan 1 2020"`, `"2020/01/01"`, `"1 Jan 2020"`, `"2020-1-1"`).
+
+Board #133 (BOARDS.md): three further pre-existing defects in `scr_date_parse_get_time`'s grammar-2 arm (an
+unbounded `±HH:MM` offset field; TimeClip checked before the offset rather than after; the accepted
+"-000000" expanded year) — silent-wrong, native lanes only, not this entry's subject but load-bearing for
+what the wasm arm does not transcribe. Board #134 (BOARDS.md): a FOURTH, separate defect, in grammar 1 —
+on a FULLY VALID certificate-shaped string, the native lanes answer the LITERAL parsed year where Node
+applies its own two-digit-year remap (0000-0049 -> 2000-2049, 0050-0099 -> 1950-1999); this is a WRONG
+VALUE where both lanes answer a value, not a NaN-for-a-time miss, so it is NOT this entry's class (v6 §9.4:
+silent-wrong is fixed, not registered) — the wasm lane models V8's rule directly, as its own two comparisons
+and an add, never by reusing `date.utc`'s different (ECMA MakeFullYear) two-digit-year rule.
+
+**Tested by:** 1572 (native lanes ONLY — it is NOT a wasm-tier member: under the per-pass stub sweep it
+refuses on `crypto.x509FingerprintStr`, a key outside this pass), plus `wasm-date.test.ts`'s genuine
+differential rows (the modelled grammars, computed against `new Date(x).getTime()` in-process, including
+the two-digit-year remap) and its fence-only rows (no Node expectation exists for a fence's own text; the
+test asserts the message/`.code` the wasm lane itself produces, per v6's own instruction for value
+contracts with no oracle).

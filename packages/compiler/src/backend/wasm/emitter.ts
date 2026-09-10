@@ -98,6 +98,7 @@ import {
   IMPORT_MODULE,
   IMPORT_NOW,
   IMPORT_SEED,
+  IMPORT_WALL_CLOCK,
   IMPORT_WRITE,
 } from "./abi.js";
 import { BUF, LEN, VecBuilder, type VecInfo } from "./arrays.js";
@@ -120,6 +121,7 @@ import {
 import { InspectBuilder } from "./inspect.js";
 import { UrlBuilder } from "./url.js";
 import { UriBuilder } from "./uri.js";
+import { DateBuilder } from "./date.js";
 import { MapBuilder, type MapInfo, type MapKeyKind, type MapValKind } from "./maps.js";
 import { JsonBuilder, jsonQuote } from "./json.js";
 import {
@@ -368,6 +370,61 @@ function mathRandomReachable(mod: WModule): boolean {
     if (found) return;
     if (typeof node === "string") {
       if (node === "math.random") found = true;
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      for (const value of Object.values(node)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn.body);
+  }
+  return found;
+}
+
+/** Does any reachable function call `date.now`? `mathRandomReachable`'s
+ * own exact-match shape (INC-25 P6, D3/D6) — the frontend already routes
+ * `Date.now()`, `new Date().toISOString()` and `new Date().getTime()`
+ * all through this one key (validate.ts's comment), so this single
+ * prescan decides `wallClock`'s presence for every caller. */
+function dateNowReachable(mod: WModule): boolean {
+  const reachable = reachableFunctionNames(mod);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (typeof node === "string") {
+      if (node === "date.now") found = true;
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      for (const value of Object.values(node)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn.body);
+  }
+  return found;
+}
+
+/** Does any reachable function call `perf.now`? The SAME exact-match
+ * shape, widening `now`'s own minting condition (abi.ts's own text,
+ * INC-25 P6): `now` is present when `timerSurfaceReachable(mod) ||
+ * perfNowReachable(mod)`. */
+function perfNowReachable(mod: WModule): boolean {
+  const reachable = reachableFunctionNames(mod);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (typeof node === "string") {
+      if (node === "perf.now") found = true;
       return;
     }
     if (Array.isArray(node)) {
@@ -1195,6 +1252,41 @@ class Assembler {
    * `Math.random` (mathRandomReachable's prescan, INC-25 P1 — the exact
    * `now`/timerSurfaceReachable shape). */
   private readonly seedFunc: number | null;
+  /** `tsinter.wallClock`'s index, or null in a module that never reaches
+   * `date.now` (dateNowReachable's prescan, INC-25 P6, D3/D6/C-1 — minted
+   * right after `seedFunc` so `seed`'s own index is unchanged). */
+  private readonly wallClockFunc: number | null;
+  /** `Date.now()`/`new Date()`'s wall clock reads this import and floors;
+   * `performance.now()`'s ORIGIN — `now()` sampled ONCE at `_start`
+   * entry, in a mutable f64 global, in any module that reaches
+   * `perf.now` (C-2, allocated lazily by `perfT0Global()` below). Null
+   * until first allocated. */
+  private perfT0GlobalField: number | null = null;
+
+  /** `this.nowFunc`, or a descriptive throw — the constructor's own
+   * prescan (`timerSurfaceReachable(mod) || perfNowReachable(mod)`) and
+   * the walk disagreeing can only mean the scan stopped seeing an IR
+   * shape it must see (the timers builder's own `now` closure has the
+   * identical check, for the identical reason). */
+  private nowFuncOrThrow(): number {
+    if (this.nowFunc === null) {
+      throw new Error("emitter bug: perf.now/a timer was reached but tsinter.now was never imported");
+    }
+    return this.nowFunc;
+  }
+
+  /** The mutable f64 global `perf.now`'s T0 lives in (C-2) — allocated
+   * lazily, only in a module that reaches `perf.now` (the constructor's
+   * `%w.start` prelude is the ONLY writer; every `perf.now` read is a
+   * plain subtraction against it). */
+  private perfT0Global(): number {
+    this.perfT0GlobalField ??= this.mb.addGlobal(F64, true, (w) => {
+      w.u8(0x44); // f64.const 0
+      w.f64(0);
+    });
+    return this.perfT0GlobalField;
+  }
+
   /** Math.random generator state (design-number-v6.txt §2.3/S068): two
    * lazily-seeded xorshift128+ states, a 64-slot ToDouble cache generated
    * FORWARD and consumed in REVERSE, and the index into it. The cache is a
@@ -1244,14 +1336,25 @@ class Assembler {
     // found. Over-approximating costs one unused import in a module that
     // then refuses anyway; under-approximating would be an emitter bug,
     // and the runtime says so by name if it ever happens.
-    this.nowFunc = timerSurfaceReachable(mod)
-      ? this.mb.importFunc(IMPORT_MODULE, IMPORT_NOW, this.mb.funcType([], [F64]))
-      : null;
+    // INC-25 P6 (D3/abi.ts's own text): `perf.now` reads the SAME clock
+    // timers do, so it widens `now`'s minting condition rather than
+    // getting a clock of its own — `timers.*` (prefix) OR `perf.now`
+    // (exact), the same over-approximation stance as before.
+    this.nowFunc =
+      timerSurfaceReachable(mod) || perfNowReachable(mod)
+        ? this.mb.importFunc(IMPORT_MODULE, IMPORT_NOW, this.mb.funcType([], [F64]))
+        : null;
     // `seed`'s twin decision (INC-25 P1, abi.ts §8.1): present only in
     // modules that reach Math.random, minted by the same front-of-the-
     // function-index-space prescan `now` uses.
     this.seedFunc = mathRandomReachable(mod)
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_SEED, this.mb.funcType([], [I64]))
+      : null;
+    // `wallClock`'s decision (INC-25 P6, D3/D6, C-1): present only in
+    // modules that reach `date.now` — minted RIGHT AFTER `seedFunc` so
+    // `seed`'s own index position is unchanged by this pass.
+    this.wallClockFunc = dateNowReachable(mod)
+      ? this.mb.importFunc(IMPORT_MODULE, IMPORT_WALL_CLOCK, this.mb.funcType([], [F64]))
       : null;
     this.mb.ensureMemory(1);
     this.cursorGlobal = this.mb.addGlobal(I32, true, (w) => {
@@ -1828,6 +1931,17 @@ class Assembler {
     const start = this.mb.declareFunc(this.mb.funcType([], []), "%w.start");
     {
       const c = new Code();
+      // C-2: T0 sampled ONCE, here, at `_start` ENTRY — before the
+      // program's own first instruction runs. Verified (this pass's own
+      // CP1 + rev-25's independent read, both citing this exact site):
+      // `%w.start` is exported as `_start` with no wasm `start` SECTION
+      // anywhere in this backend, so "T0 at instantiation" is not a
+      // choice this emitter could even make by accident — `_start`
+      // entry IS the earliest point `now()` is ever read here.
+      if (perfNowReachable(this.mod)) {
+        c.call(this.nowFuncOrThrow());
+        c.globalSet(this.perfT0Global());
+      }
       c.refNull(this.fnClosPair(entryFn).clos);
       c.call(entry);
       const root = this.rootGlobal();
@@ -5269,6 +5383,32 @@ class Assembler {
       dynToStr: () => this.dyn.toStr(),
     });
     return this.uriField;
+  }
+
+  private dateField: DateBuilder | null = null;
+
+  /** INC-25 pass P6's own builder (date.ts) — `date.toISOString` /
+   * `date.parseGetTime` / `date.utc`'s shared civil-calendar arithmetic
+   * and the parser's own two grammars. `intl.numFormatEnUs` and
+   * `perf.now` are NOT here — they follow `toExponentialHelper`'s own
+   * precedent (private emitter.ts methods, sharing numfmt.ts's d2d /
+   * ensureRyuTables, and a 3-instruction inline for perf.now — CP1 §(j)). */
+  private get date(): DateBuilder {
+    this.dateField ??= new DateBuilder(this.mb, {
+      strRef: () => this.strRef,
+      strType: () => this.strType,
+    });
+    return this.dateField;
+  }
+
+  /** `this.wallClockFunc`, or a descriptive throw — the constructor's own
+   * `dateNowReachable` prescan and the walk disagreeing can only mean the
+   * scan stopped seeing an IR shape it must see. */
+  private wallClockFuncOrThrow(): number {
+    if (this.wallClockFunc === null) {
+      throw new Error("emitter bug: date.now was reached but tsinter.wallClock was never imported");
+    }
+    return this.wallClockFunc;
   }
 
   /** The ARR payload's vector info — the SAME interning a static
@@ -11760,6 +11900,76 @@ class Assembler {
           this.emitPendingCheck();
           return;
         }
+        // ── INC-25 pass P6 (design-number-v6.txt §5.5/§6.6/§7.6; CP1
+        // cp1-plan-p6.txt e365032f + addendum bd77f800; CP1 ACK GO WITH
+        // DELTA, five deltas folded). date.now/perf.now are pure ABI
+        // reads (C-1/C-2); date.utc is pure (D-2); date.toISOString's
+        // RangeError is duplicated at THIS call site rather than inside
+        // date.ts's own helper (its own header comment says why); date.
+        // parseGetTime's S069 fence is likewise emitter-owned, via
+        // `fencedFlag()`, never nodes.ts's may-throw set (§1's own
+        // constraint — six keys checked against validate.ts, none
+        // widened).
+        if (e.fn === "date.now") {
+          code.call(this.wallClockFuncOrThrow());
+          code.f64Floor();
+          return;
+        }
+        if (e.fn === "perf.now") {
+          code.call(this.nowFuncOrThrow());
+          code.globalGet(this.perfT0Global());
+          code.f64Sub();
+          return;
+        }
+        if (e.fn === "date.utc") {
+          for (const arg of e.args) this.walkExpr(arg);
+          code.call(this.date.utcHelper());
+          return;
+        }
+        if (e.fn === "date.toISOString") {
+          this.walkExpr(e.args[0]!);
+          const msLocal = this.acquireScratch(F64);
+          code.localSet(msLocal);
+          // Invalid time value: |ms| > 8.64e15, OR ms is NaN — the C's
+          // own `!(fabs(ms) <= 8.64e15)` shape, which catches NaN
+          // without an explicit isnan (a plain `>` would NOT: any
+          // comparison against NaN is false, so `fabs(NaN) > X` is
+          // false — the negated-<= form is required).
+          code.localGet(msLocal);
+          code.f64Abs();
+          code.f64Const(8640000000000000);
+          code.f64Le();
+          code.i32Eqz();
+          this.openIf();
+          this.emitSetCellErrorLit("%RangeError", "RangeError", "Invalid time value", null);
+          this.emitUnwind();
+          this.close();
+          code.localGet(msLocal);
+          code.call(this.date.toISOHelper());
+          this.releaseScratch(F64, msLocal);
+          return;
+        }
+        if (e.fn === "date.parseGetTime") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.date.parseGetTimeHelper());
+          code.globalGet(this.date.fencedFlag());
+          this.openIf();
+          this.emitSetCellErrorLit(
+            "%Error",
+            "Error",
+            'date.parseGetTime: this string is not one of the two modelled date formats (SEMANTICS.md S069) — the certificate-validity form ("Mon D HH:MM:SS YYYY GMT") or the strict ECMA date-time string format ("YYYY[-MM[-DD]][THH:mm[:ss[.sss]]](Z|±HH:MM)")',
+            "SC1090",
+          );
+          this.emitUnwind();
+          this.close();
+          return;
+        }
+        if (e.fn === "intl.numFormatEnUs") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.intlNumFormatEnUsHelper());
+          return;
+        }
+        // ── end INC-25 P6 — all six keys wired ────────────────────────
         // ── end INC-25 P5 — all eight keys wired ──────────────────────
         if (this.emitBufferLibCall(e)) return;
         if (this.emitTimerCall(e)) return;
@@ -29182,6 +29392,458 @@ class Assembler {
     this.mb.setBody(idx, locals, c.bytes());
     return idx;
   }
+
+
+  /** `out[idx] = <pushValue()>; idx++` — the shared "append one code
+   * unit, computed or literal" shape `%w.intlNumFormatEnUs` uses
+   * throughout its own assembly (this file's local convention; date.ts's
+   * `writeChar`/`writeFixedDigits` are the same shape, scoped there). */
+  private emitArrPush(c: Code, strType: number, arrLocal: number, idxLocal: number, pushValue: () => void): void {
+    c.localGet(arrLocal);
+    c.localGet(idxLocal);
+    pushValue();
+    c.arraySet(strType);
+    c.localGet(idxLocal);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(idxLocal);
+  }
+
+  private intlNumFormatEnUsFunc: number | null = null;
+
+  /** `%w.intlNumFormatEnUs(x) -> str` — `intl.numFormatEnUs`
+   * (validate.ts's `[F64]->STRING`, INC-25 P6 D-4; scr_lib.c's
+   * `scr_intl_num_format_en_us` ~3702 + `scr_dec_inc` ~3679 +
+   * `scr_f64_digits`/scr_number.c ~34, this file's own CP1 §(h)). NEVER
+   * throws. Shortest digits via `%w.d2d` UNCONDITIONALLY (toExponential's
+   * own precedent — never the small-int fast path), half-up rounding at
+   * decimal position `n+3` with carry, ±0/NaN/±∞ special-cased first
+   * (U+221E, ONE UTF-16 unit — S002 storage, not UTF-8 bytes). The
+   * EXACTNESS ARGUMENT (labelled as an argument, not a measurement): the
+   * shortest digits are Ryu's = V8's (S001's fuzz gate certifies
+   * `%w.f64ToStr` == Node's Number->String; d2d is its digit core),
+   * chained through ICU's DecimalQuantity, which itself takes
+   * double-conversion's shortest digits as ITS input. The MEASUREMENT
+   * (this pass's own CP1 impl-p6/node-table-4-intl.txt, 3,828 samples, 0
+   * mismatches, 0 refutations against toFixed(3); rev-25's independently
+   * corroborating 200,069-row sweep against the verbatim C, 0
+   * disagreements, 4,197 shortest-vs-exact discriminator rows all siding
+   * with the shortest string) is the SEPARATE, labelled-as-such evidence
+   * — PIN THE ICU VERSION (78.3, `process.versions.icu` this session) in
+   * the pin file's own comment, S068's precedent: reproducing the C's
+   * algorithm discharges the algorithm, not ICU's contract, because the
+   * C was itself verified against the SAME Node/ICU pair. */
+  private intlNumFormatEnUsHelper(): number {
+    if (this.intlNumFormatEnUsFunc !== null) return this.intlNumFormatEnUsFunc;
+    const strRef = this.strRef;
+    const strType = this.strType;
+    const idx = this.mb.declareFunc(this.mb.funcType([F64], [strRef]), "%w.intlNumFormatEnUs");
+    this.intlNumFormatEnUsFunc = idx;
+    const c = new Code();
+        const X = 0;
+        const NEG = 1, BITS = 2, MANTF = 3, M = 4, E = 5, K = 6, T = 7, N = 8, DIGSTR = 9, I = 10, KEEP = 11, UP = 12, CH = 13, OVERFLOWED = 14, FRAC = 15, FLEN = 16, IDXV = 17, OUT = 18, O = 19, RES = 20;
+        const A = 21; // f64
+        const locals: ValType[] = [
+            I32, I64, I64, I64, I32, I32, I64, I32, strRef, I32, I32, I32, I32, I32, strRef, I32, I32, strRef, I32, strRef, F64,
+        ];
+        // NaN.
+        c.localGet(X);
+        c.localGet(X);
+        c.f64Ne();
+        c.ifVoid();
+        this.pushStrLitInto(c, "NaN");
+        c.return_();
+        c.end();
+        // sign bit, BEFORE the zero check (scr_lib.c's own order: signbit(x)
+        // then the x==0 arm reads it — -0 must print "-0", so this cannot
+        // reuse toExponential's own zero-drops-the-sign convention).
+        c.localGet(X);
+        c.i64ReinterpretF64();
+        c.i64Const(0n);
+        c.i64LtS();
+        c.localSet(NEG);
+        // ±Infinity.
+        c.localGet(X);
+        c.f64Const(Infinity);
+        c.f64Eq();
+        c.ifVoid();
+        this.pushStrLitInto(c, "∞");
+        c.return_();
+        c.end();
+        c.localGet(X);
+        c.f64Const(-Infinity);
+        c.f64Eq();
+        c.ifVoid();
+        this.pushStrLitInto(c, "-∞");
+        c.return_();
+        c.end();
+        // ±0.
+        c.localGet(X);
+        c.f64Const(0);
+        c.f64Eq();
+        c.ifVoid();
+        c.localGet(NEG);
+        c.ifResult(strRef);
+        this.pushStrLitInto(c, "-0");
+        c.else_();
+        this.pushStrLitInto(c, "0");
+        c.end();
+        c.return_();
+        c.end();
+        // a = |x|.
+        c.localGet(NEG);
+        c.ifResult(F64);
+        c.localGet(X);
+        c.f64Neg();
+        c.else_();
+        c.localGet(X);
+        c.end();
+        c.localSet(A);
+        // shortest digits, UNCONDITIONALLY via d2d (toExponential's own
+        // precedent — never the small-int fast path).
+        c.call(this.ensureRyuTablesHelper());
+        c.localGet(A);
+        c.i64ReinterpretF64();
+        c.localSet(BITS);
+        c.localGet(BITS);
+        c.i64Const(0xfffffffffffffn);
+        c.i64And();
+        c.localSet(MANTF);
+        c.localGet(MANTF);
+        c.localGet(BITS);
+        c.i64Const(52n);
+        c.i64ShrU();
+        c.i32WrapI64();
+        c.call(this.d2dHelper());
+        c.localSet(E);
+        c.localSet(M);
+        // k = decimal digit count of M.
+        c.i32Const(1);
+        c.localSet(K);
+        c.localGet(M);
+        c.localSet(T);
+        c.block();
+        c.loop();
+        c.localGet(T);
+        c.i64Const(10n);
+        c.i64LtU();
+        c.brIf(1);
+        c.localGet(T);
+        c.i64Const(10n);
+        c.i64DivU();
+        c.localSet(T);
+        c.localGet(K);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(K);
+        c.br(0);
+        c.end();
+        c.end();
+        // n = e + k (value = 0.digits * 10^n).
+        c.localGet(E);
+        c.localGet(K);
+        c.i32Add();
+        c.localSet(N);
+        // DIGSTR[k-1..0] <- M's digits, low to high (numfmt.ts's own shape,
+        // toExponential's own precedent — M is consumed here, K/E/N above
+        // already came from the untouched copy T).
+        c.localGet(K);
+        c.arrayNewDefault(strType);
+        c.localSet(DIGSTR);
+        c.localGet(K);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.i32Eqz();
+        c.brIf(1);
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Sub();
+        c.localSet(I);
+        c.localGet(DIGSTR);
+        c.localGet(I);
+        c.i32Const(0x30);
+        c.localGet(M);
+        c.i64Const(10n);
+        c.i64RemU();
+        c.i32WrapI64();
+        c.i32Add();
+        c.arraySet(strType);
+        c.localGet(M);
+        c.i64Const(10n);
+        c.i64DivU();
+        c.localSet(M);
+        c.br(0);
+        c.end();
+        c.end();
+        // round half-up at decimal position n+3 (the first DROPPED digit).
+        c.localGet(N);
+        c.i32Const(3);
+        c.i32Add();
+        c.localSet(KEEP);
+        c.localGet(KEEP);
+        c.localGet(K);
+        c.i32LtS();
+        c.ifVoid();
+        {
+            c.localGet(KEEP);
+            c.i32Const(0);
+            c.i32GeS();
+            c.ifResult(I32);
+            c.localGet(DIGSTR);
+            c.localGet(KEEP);
+            c.arrayGetU(strType);
+            c.i32Const(0x35);
+            c.i32GeS();
+            c.else_();
+            c.i32Const(0);
+            c.end();
+            c.localSet(UP);
+            c.localGet(KEEP);
+            c.i32Const(0);
+            c.i32LtS();
+            c.ifResult(I32);
+            c.i32Const(0);
+            c.else_();
+            c.localGet(KEEP);
+            c.end();
+            c.localSet(K);
+            c.localGet(UP);
+            c.ifVoid();
+            {
+                // scr_dec_inc(DIGSTR, K): increment the LAST kept digit, with
+                // carry propagating left; an all-nines run overflows to "1"
+                // with K reset to 1 and n bumped (the carry folding into scale).
+                c.i32Const(1);
+                c.localSet(OVERFLOWED);
+                c.localGet(K);
+                c.i32Const(1);
+                c.i32Sub();
+                c.localSet(I);
+                c.block();
+                c.loop();
+                c.localGet(I);
+                c.i32Const(0);
+                c.i32LtS();
+                c.brIf(1);
+                c.localGet(DIGSTR);
+                c.localGet(I);
+                c.arrayGetU(strType);
+                c.localSet(CH);
+                c.localGet(CH);
+                c.i32Const(0x39);
+                c.i32Ne();
+                c.ifVoid();
+                c.localGet(DIGSTR);
+                c.localGet(I);
+                c.localGet(CH);
+                c.i32Const(1);
+                c.i32Add();
+                c.arraySet(strType);
+                c.i32Const(0);
+                c.localSet(OVERFLOWED);
+                c.br(2);
+                c.end();
+                c.localGet(DIGSTR);
+                c.localGet(I);
+                c.i32Const(0x30);
+                c.arraySet(strType);
+                c.localGet(I);
+                c.i32Const(1);
+                c.i32Sub();
+                c.localSet(I);
+                c.br(0);
+                c.end();
+                c.end();
+                c.localGet(OVERFLOWED);
+                c.ifVoid();
+                c.localGet(DIGSTR);
+                c.i32Const(0);
+                c.i32Const(0x31);
+                c.arraySet(strType);
+                c.i32Const(1);
+                c.localSet(K);
+                c.localGet(N);
+                c.i32Const(1);
+                c.i32Add();
+                c.localSet(N);
+                c.end();
+            }
+            c.else_();
+            {
+                c.localGet(K);
+                c.i32Eqz();
+                c.ifVoid();
+                c.localGet(NEG);
+                c.ifResult(strRef);
+                this.pushStrLitInto(c, "-0");
+                c.else_();
+                this.pushStrLitInto(c, "0");
+                c.end();
+                c.return_();
+                c.end();
+            }
+            c.end();
+        }
+        c.end();
+        // fraction digits: positions n..n+2 (index n+p-1 for p=1,2,3),
+        // '0' outside [0,k); trim trailing zeros.
+        c.i32Const(3);
+        c.arrayNewDefault(strType);
+        c.localSet(FRAC);
+        c.i32Const(0);
+        c.localSet(FLEN);
+        for (let p = 1; p <= 3; p++) {
+            c.localGet(N);
+            c.i32Const(p - 1);
+            c.i32Add();
+            c.localSet(IDXV);
+            this.emitArrPush(c, strType, FRAC, FLEN, () => {
+                c.localGet(IDXV);
+                c.i32Const(0);
+                c.i32GeS();
+                c.localGet(IDXV);
+                c.localGet(K);
+                c.i32LtS();
+                c.i32And();
+                c.ifResult(I32);
+                c.localGet(DIGSTR);
+                c.localGet(IDXV);
+                c.arrayGetU(strType);
+                c.else_();
+                c.i32Const(0x30);
+                c.end();
+            });
+        }
+        c.block();
+        c.loop();
+        c.localGet(FLEN);
+        c.i32Const(0);
+        c.i32GtS();
+        c.ifResult(I32);
+        c.localGet(FRAC);
+        c.localGet(FLEN);
+        c.i32Const(1);
+        c.i32Sub();
+        c.arrayGetU(strType);
+        c.i32Const(0x30);
+        c.i32Eq();
+        c.else_();
+        c.i32Const(0);
+        c.end();
+        c.i32Eqz();
+        c.brIf(1);
+        c.localGet(FLEN);
+        c.i32Const(1);
+        c.i32Sub();
+        c.localSet(FLEN);
+        c.br(0);
+        c.end();
+        c.end();
+        // assemble: sign, integer digits (zero-padded past k, comma every
+        // three), then the trimmed fraction. 512 covers the 309-digit
+        // DBL_MAX row plus its ~103 commas, sign and decimal point
+        // (scr_lib.c's own `out[512]` bound).
+        c.i32Const(512);
+        c.arrayNewDefault(strType);
+        c.localSet(OUT);
+        c.i32Const(0);
+        c.localSet(O);
+        c.localGet(NEG);
+        c.ifVoid();
+        this.emitArrPush(c, strType, OUT, O, () => c.i32Const(0x2d));
+        c.end();
+        c.localGet(N);
+        c.i32Const(0);
+        c.i32LeS();
+        c.ifVoid();
+        this.emitArrPush(c, strType, OUT, O, () => c.i32Const(0x30));
+        c.else_();
+        {
+            c.i32Const(0);
+            c.localSet(I);
+            c.block();
+            c.loop();
+            c.localGet(I);
+            c.localGet(N);
+            c.i32GeS();
+            c.brIf(1);
+            c.localGet(I);
+            c.i32Const(0);
+            c.i32GtS();
+            c.ifVoid();
+            c.localGet(N);
+            c.localGet(I);
+            c.i32Sub();
+            c.i32Const(3);
+            c.i32RemS();
+            c.i32Eqz();
+            c.ifVoid();
+            this.emitArrPush(c, strType, OUT, O, () => c.i32Const(0x2c));
+            c.end();
+            c.end();
+            this.emitArrPush(c, strType, OUT, O, () => {
+                c.localGet(I);
+                c.localGet(K);
+                c.i32LtS();
+                c.ifResult(I32);
+                c.localGet(DIGSTR);
+                c.localGet(I);
+                c.arrayGetU(strType);
+                c.else_();
+                c.i32Const(0x30);
+                c.end();
+            });
+            c.localGet(I);
+            c.i32Const(1);
+            c.i32Add();
+            c.localSet(I);
+            c.br(0);
+            c.end();
+            c.end();
+        }
+        c.end();
+        c.localGet(FLEN);
+        c.i32Const(0);
+        c.i32GtS();
+        c.ifVoid();
+        this.emitArrPush(c, strType, OUT, O, () => c.i32Const(0x2e));
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(FLEN);
+        c.i32GeS();
+        c.brIf(1);
+        this.emitArrPush(c, strType, OUT, O, () => {
+            c.localGet(FRAC);
+            c.localGet(I);
+            c.arrayGetU(strType);
+        });
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        c.end();
+        // trim to the exact length O.
+        c.localGet(O);
+        c.arrayNewDefault(strType);
+        c.localSet(RES);
+        c.localGet(RES);
+        c.i32Const(0);
+        c.localGet(OUT);
+        c.i32Const(0);
+        c.localGet(O);
+        c.arrayCopy(strType, strType);
+        c.localGet(RES);
+        this.mb.setBody(idx, locals, c.bytes());
+        return idx;
+    }
 
   private toRadixFunc: number | null = null;
 

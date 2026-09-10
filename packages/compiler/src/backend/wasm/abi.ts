@@ -13,10 +13,19 @@
  *     exported memory to fd (1 = stdout, 2 = stderr), synchronously —
  *     the module reuses the staging region the moment the call returns.
  *
- *   (import "tsinter" "now" (func (result f64)))   [timer modules only]
- *     Milliseconds on the SAME clock `_tick`'s argument uses. The module
- *     reads it when it arms a timer, so the two must agree; the origin is
- *     the host's business (monotonic, epoch, virtual — any of them).
+ *   (import "tsinter" "now" (func (result f64)))   [timer modules, and
+ *                                                     perf.now modules]
+ *     MONOTONIC milliseconds from an unspecified origin — the SAME clock
+ *     `_tick`'s argument uses. Timers need a clock that never goes
+ *     backwards, and this is that clock; `performance.now()` reads it too
+ *     (widened, D3/P6 — the minting condition is now `timers.*` reachable
+ *     OR `perf.now` reachable). NOT a wall clock: it says nothing about
+ *     the date, and the difference between two readings is the only
+ *     meaningful quantity — the origin is deliberately unspecified so a
+ *     host may use whatever monotonic source it has (WASI 0.2's
+ *     `monotonic-clock` is the same shape). The module reads it when it
+ *     arms a timer or reads `performance.now()`, so every reader agrees
+ *     on which clock this is.
  *
  *   (import "tsinter" "seed" (func (result i64)))   [Math.random modules only]
  *     ONE 64-bit value, read AT MOST ONCE per module instance, on the
@@ -58,6 +67,56 @@
  *         is the host's business, exactly as `now`'s origin is — the
  *         guarantee here is the same shape as `now`'s, but it covers only
  *         this VALUE tier, not the result-type tier above it.
+ *
+ *   (import "tsinter" "wallClock" (func (result f64)))   [Date.now / no-arg `new Date()` modules only]
+ *     Milliseconds since the Unix epoch on the host's REAL-TIME clock, as
+ *     an f64. Present only in modules that read `Date.now()` or construct
+ *     a no-argument `new Date()`. MAY JUMP BACKWARDS: a real-time clock is
+ *     subject to NTP steps, manual changes and daylight transitions, and
+ *     nothing in the tier smooths that — a backwards step in the host is a
+ *     backwards step in `Date.now()`, exactly Node. Code that needs
+ *     elapsed time uses `now` below, never this.
+ *     THE MODULE FLOORS TO INTEGER MILLISECONDS (a genuine floor, not a
+ *     truncation — `-0.5` reads as `-1`, matching Node's own negative-time
+ *     handling), so the observable granularity is the tier's and not the
+ *     host's. A printed value from this clock cannot match any other
+ *     process, so nothing in the differential compares one; the guarantee
+ *     that this is the wall clock and not some other clock lives in THIS
+ *     TEXT and in the host contract (D3, DECISIONS.md).
+ *     ENFORCEMENT, measured directly against the engine (two independent
+ *     hand-built-module runs agree — this pass's own CP1 §(g)/§3B-6 and
+ *     rev-25's Phase A §7):
+ *       PRESENCE AND CALLABILITY — ENFORCED BY THE ENGINE, at
+ *         instantiation, before a single instruction runs — the SAME
+ *         LinkError/TypeError shape `now`/`seed` already get:
+ *         `LinkError: WebAssembly.instantiate(): Import #N "tsinter"
+ *         "wallClock": function import requires a callable` (missing or
+ *         non-callable) and `TypeError: WebAssembly.instantiate(): Import
+ *         #N "tsinter": module is not an object or function` (namespace
+ *         absent) or `TypeError: Imports argument must be present and must
+ *         be an object` (the whole imports argument omitted). THE ENTRY
+ *         POINT NAMES ITSELF IN THE TEXT — `WebAssembly.instantiate():`
+ *         through the differential harness's own call shape, but
+ *         `WebAssembly.Instance():` through `new WebAssembly.Instance`
+ *         instead, for the identical failure — and "#N" is an INDEX that
+ *         MOVES WITH THE MODULE'S OWN IMPORT LIST (this import is minted
+ *         right after `seed`, C-1); quote either text as what it is, never
+ *         as a fixed string with a hand-picked index.
+ *       THE RESULT'S KIND — WEAKER than `seed`'s three-way split: a host
+ *         returning a BigInt throws `TypeError: Cannot convert a BigInt
+ *         value to a number` at the CALL (the one kind check an f64-typed
+ *         import DOES get, at the WebAssembly JS-API boundary). EVERY
+ *         OTHER JS value coerces SILENTLY via ordinary ToNumber: a numeric
+ *         string ("1700000000000.75") produces OUTPUT IDENTICAL to a
+ *         correct host — worse than "different output, no error", because
+ *         on a numeric string there is no observable difference AT ALL;
+ *         `null` -> 0; `undefined` / a non-numeric string / a valueOf-less
+ *         object -> NaN; an object with `valueOf`/`toString` coerces
+ *         through it, silently.
+ *       THE VALUE ITSELF (origin, monotonicity, unit) — ENFORCED BY
+ *         NOTHING: a backwards sequence is followed exactly, a host
+ *         returning seconds instead of milliseconds runs silently, and
+ *         `-Infinity` runs silently. The text IS the enforcement.
  *
  *   (export "_start" (func))            — the program; run it once.
  *   (export "_tick" (func (param f64) (result f64)))  [timer modules only]
@@ -109,6 +168,7 @@ export const IMPORT_MODULE = "tsinter";
 export const IMPORT_WRITE = "write";
 export const IMPORT_NOW = "now";
 export const IMPORT_SEED = "seed";
+export const IMPORT_WALL_CLOCK = "wallClock";
 export const EXPORT_ENTRY = "_start";
 export const EXPORT_TICK = "_tick";
 export const EXPORT_STATUS = "_status";

@@ -3138,6 +3138,23 @@ const TIER_FLOOR: string[] = [
   "1536-string-array-sweep.ts",
   "2140-uri-component-codecs.ts",
   "2191-uri-encoders.ts",
+
+  // INC-25 pass P6 (design-number-v6.txt §5.5/§6.6/§7.6/§8; CP1 cp1-plan-
+  // p6.txt e365032f + cp1-addendum-p6.txt bd77f800; CP1 ACK GO WITH
+  // DELTA, five deltas folded — DELTA-1 the grammar-1 two-digit-year
+  // remap board #134, DELTA-2 the day-guard wording fix, D-alpha/beta/
+  // gamma/delta board #133's three grammar-2 defects + the years-1..12
+  // reinterpretation class, none transcribed). date.now/date.
+  // toISOString/date.parseGetTime/date.utc/intl.numFormatEnUs/perf.now,
+  // the wallClock ABI import (D3/D6), S069 (68 -> 69). 840 -> 846, all
+  // six candidates measured clean under the per-pass stub sweep, none
+  // else moves.
+  "1422-date-iso.ts",
+  "1582-timer-sleep-resolve.ts",
+  "1981-date-utc.ts",
+  "2427-perf-hooks-now.ts",
+  "2446-performance-global.ts",
+  "2562-intl-numberformat-en-us.ts",
 ];
 
 interface RunResult {
@@ -3268,6 +3285,8 @@ async function runWasm(modulePath: string): Promise<RunResult> {
   const chunks: { 1: Buffer[]; 2: Buffer[] } = { 1: [], 2: [] };
   let memory: WebAssembly.Memory | null = null;
   let clock = 0;
+  // wallBase, sampled ONCE per run, BEFORE instantiation (INC-25 P6, C-4).
+  const wallBase = Date.now();
   const { instance } = await WebAssembly.instantiate(readFileSync(modulePath), {
     tsinter: {
       write(fd: number, ptr: number, len: number): void {
@@ -3281,6 +3300,15 @@ async function runWasm(modulePath: string): Promise<RunResult> {
       // a CSPRNG so NO corpus program can depend on a fixed sequence —
       // the seed pin (wasm-random.test.ts) uses its own host instead.
       seed: (): bigint => randomBytes(8).readBigUInt64BE(),
+      // date.now modules only (INC-25 P6, D3/D6-iv, C-4). MUST be a
+      // VIRTUAL wall clock in lockstep with the virtual timer clock
+      // above, never the real clock: this harness's timer clock starts
+      // at 0 and never sleeps (the pump jumps it straight to each
+      // deadline), so 1582 measures a 20ms `setTimeout` in microseconds
+      // of real time — a real-time `wallClock` host would print `false`
+      // where Node prints `true` for that exact assertion. `wallBase`
+      // is real (sampled once, above) so 1422's window rows still hold.
+      wallClock: (): number => wallBase + clock,
     },
   });
   memory = instance.exports["memory"] as WebAssembly.Memory;
