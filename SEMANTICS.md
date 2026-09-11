@@ -5326,3 +5326,81 @@ differential rows (the modelled grammars, computed against `new Date(x).getTime(
 the two-digit-year remap) and its fence-only rows (no Node expectation exists for a fence's own text; the
 test asserts the message/`.code` the wasm lane itself produces, per v6's own instruction for value
 contracts with no oracle).
+
+## S070 — `process.argv[0]` and `process.argv[1]`: LENGTH and POSITIONS match Node on every lane; the VALUES do not *(per-lane split)*
+
+Node answers `[<the node executable's absolute path>, <the script's own path>]`. Neither non-Node lane
+reproduces this — both give `argv[0]`/`argv[1]` a DIFFERENT, tier-specific pair, MEASURED directly rather
+than assumed:
+
+**Native (both lanes — `c` and `llvm` — identical, built and run):** `["scriptc", <the invocation string, EXACTLY
+as typed>]`. `argv[1]` is the literal command line the process was invoked with, not a resolved path:
+invoked `./prog`, `argv[1]` is `"./prog"`; invoked by absolute path, it is that absolute path; invoked
+`./renamed-prog` (after a rename), it is `"./renamed-prog"`; invoked from a subdirectory
+(`./native-default/prog`), it is `"./native-default/prog"`. `process.execPath` (S071) IS the resolved
+absolute path and follows a rename where `argv[1]` does not — the two must never be conflated.
+
+**Wasm:** the host's own two strings for `hostStr` kinds 0 (argv[0]) and 0 (argv[1] at index 1) — the ABI
+requires two non-empty strings (abi.ts §2.2/§2.4) but says nothing about their content beyond that; the
+differential harness serves `["scriptc", <the module path>]`, matching the native lanes' own shape so all
+three lanes read alike to a program that only checks length, non-emptiness, and (per 2441) mutability.
+
+RETIRES the two argv-values citations in the tree, both unnumbered — a single-line grep for the phrase
+finds only one; the second is line-wrapped, which is exactly why it must be re-derived by reading rather
+than grepped for and trusted at face value: `packages/runtime/src/scr_runtime.h:1945` (`scr_lib_init`'s own
+header comment) and `packages/runtime/src/scr_lib.c:158-159` (`scr_process_argv`'s own, wrapped across two
+comment lines). Both a DEAD upstream register number the same way "divergence 12"/"60" (S071/S072) are:
+cited with no number, no prior entry naming either, until this one.
+
+**Tested by:** 990 (length 2, both non-empty, identity/mutation across all three lanes — never the VALUES,
+which this entry is why); 2441 (the fixture explicitly overwrites `argv[0]`/`argv[1]` before printing the
+array, exactly because the values are this entry's own divergence). Native argv[0]/argv[1]/execPath
+measured directly this pass (both lanes, four invocation shapes each) rather than transcribed from an
+earlier session's numbers.
+
+## S076 — the `promise` argument of `unhandledRejection`/`rejectionHandled` listeners has no preserved identity *(wasm tier only)*
+
+RULING P1-R6 (an earlier, RETIRED draft used this same number for a different, never-landed text — a
+synchronous-firing-timing divergence that was superseded by an implementation before it ever merged; this
+entry is unrelated to that draft and stands alone). The promise argument of the unhandledRejection and
+rejectionHandled listeners is a fresh, unrelated box EVERY fire (`dyn.boxObj`/`pushNewObj`, never the
+promise that triggered it), which costs FOUR separable observables Node preserves (rev-26's own measurement
+against Node v24.18.1, six answers, all confirmed true there):
+
+1. `p === originalPromise` — the promise reference the program itself holds. Answers false here.
+2. Equality BETWEEN THE TWO EVENTS: `rejectionHandled`'s own argument `=== ` the promise
+   `unhandledRejection` received for the SAME rejection. THE SHARPEST LOSS — this is how a real Node
+   program correlates "this was reported unhandled" with "this got handled later" (the common idiom is a
+   `WeakMap<Promise, reason>` set in the first listener and read in the second, keyed by the promise
+   argument itself — Node's own documented pattern for this exact pair of events). Answers false here:
+   the two events box two INDEPENDENT fresh objects, with no relationship to each other at all.
+3. Use as a `WeakMap`/`Set` key across calls — a direct consequence of 1 and 2, named separately because
+   it is the shape most programs actually use rather than a bare `===`.
+4. `p instanceof Promise` — MEASURED, not assumed, and sharper than a true/false answer: the wasm tier
+   cannot even POSE this specific check, on the fresh box or on ANY value — `promise instanceof Promise`
+   refuses to compile at all (`SC1090`: "'instanceof' right-hand sides other than classes declared in the
+   program is not supported yet"), because `Promise` has no class-graph representation this tier's
+   `instanceof` can test against. Confirmed this is Promise-specific, not a general instanceof-vs-builtins
+   gap: the identical shape against `Error` (`e instanceof Error`) compiles and runs. So no corpus program
+   or forced-host row can ask observable 4 at all here, on either lane's model of any promise value, while
+   Node answers true.
+
+THE CARVE-OUT, stated so a reader does not suspect an unrelated program: the REASON argument's identity
+holds on BOTH lanes, unaffected by any of the above — 2212 (`2212-unhandled-rejection-listener.cjs`)
+asserts this directly (`assert.strictEqual(err, reason)`) and passes today; that same fixture only checks
+`typeof promise === "object"` for the promise argument, never its identity, so it neither exercises nor
+contradicts this entry.
+
+Found while diagnosing why mutation M-16 (drain the rejectionHandled queue in LIFO instead of FIFO order)
+reddened nothing: the test row meant to prove FIFO order relied on the listener's own argument to
+distinguish which promise fired — observable 2 above, restated as a test-construction problem rather than
+a program-observable one. That is not merely a gap in one test row; it is an observable difference from
+Node for any program using the common `WeakMap`-keyed idiom (observables 2/3).
+
+**Tested by:** the FIFO-order row (retired — see wasm-host-process.test.ts's own comment, kept as a
+count-only assertion that the listener fires exactly twice, no longer claiming an order it cannot observe)
+and M-16 (retired-with-reason: reddens nothing BECAUSE the axis is unobservable by construction, a measured
+statement about this entry, not a missing pin). Board #140 (preserve promise identity across the dyn
+boundary for listener arguments — an interned/handle-kind box whose `strictEq` compares the underlying
+promise ref, `dyn.strictEq`'s own `offUnhandledRejection` shape) would retire this entry and make FIFO
+order observable again, restoring the row and M-16 as a real mutation. Not this pass's to build.

@@ -156,7 +156,7 @@ ScrArr *scr_process_argv(void) {
   if (!scr_argv_arr) {
     /* ["scriptc", argv[0], argv[1], ...]: positions and length line up
      * with Node's [node-path, script-path, ...args]; the argv[0]/argv[1]
-     * VALUES diverge (SEMANTICS.md). */
+     * VALUES diverge (SEMANTICS.md S070). */
     scr_argv_arr = scr_arr_new(SCR_ELEM_STR, (size_t)scr_lib_argc + 1);
     scr_arr_push_ref(scr_argv_arr, scr_str_new("scriptc", 7));
     for (int i = 0; i < scr_lib_argc; i++) {

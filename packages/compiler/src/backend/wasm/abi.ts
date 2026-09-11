@@ -8,6 +8,133 @@
  * console output and a clock are the only capabilities the tier needs yet,
  * and the clock half appears ONLY in modules that can arm a timer.
  *
+ * INC-26 pass P1 (design-host-v7.txt cccf7d6e §2.1-§2.5, DECISIONS.md D2/D3):
+ * the process host contract adds `hostStr`/`hostNum`/`exit`, each
+ * conditionally minted, each carrying this file's own three-tier
+ * enforcement doctrine PLUS A FOURTH TIER this file has not needed before
+ * (rev-26 R-14): two of these imports perform an EFFECT rather than
+ * answering a value, and none of the three tiers below says anything about
+ * whether the effect happened. For every effect in this ABI the honest
+ * answer is "NOTHING ENFORCES IT; the harness's own rows are the check",
+ * and each entry below says so in those words rather than asserting the
+ * obligation and moving on — §2.7's capability paragraph (below, D4/D6) is
+ * the model this borrows: it names the enforcement instead of asserting
+ * the duty.
+ *
+ *   (import "tsinter" "hostStr" (func (param i32 i32 i32 i32) (result i32)))
+ *     hostStr(kind, index, ptr, cap) -> len. Writes at most `cap` UTF-16
+ *     CODE UNITS (2 bytes each, little-endian) starting at `ptr` in the
+ *     exported memory, and answers the datum's TRUE length in code units.
+ *     Three answers, and only three: len <= cap means the datum was
+ *     written and its length is len; len > cap means NOTHING was written —
+ *     retry with a buffer of at least len; len === -1 means NO SUCH DATUM
+ *     (an argv/env index past the end), distinct from an EMPTY datum
+ *     (len 0). The retry contract exists so the module can start with a
+ *     modest stack buffer and pay a second call only on long values.
+ *     WHY UTF-16 AND NOT UTF-8: the tier stores UTF-16 (S002, `(array
+ *     i16)`) and the host's strings are JS strings, which ARE UTF-16 —
+ *     code units move with no transcoder on either side. THE HOST MAY SEND
+ *     ANY UTF-16 SEQUENCE INCLUDING UNPAIRED SURROGATES, and the module
+ *     stores whatever it is given: the tier's storage is faithful (S002)
+ *     and its OWN write boundary already replaces a lone surrogate with
+ *     U+FFFD on the way OUT, so a host that sends one produces exactly
+ *     what Node would print — the module never re-validates on the way in.
+ *     `cap` and `len` are CODE UNITS; the exported memory is BYTES. Getting
+ *     that factor of two wrong at a call site is a silent truncation on
+ *     odd-length data — it is a call-site concern, not this import's.
+ *     KIND TABLE (module and host must agree; the numbers ARE the ABI: no
+ *     gaps, no reuse, append-only — later passes consume kinds this pass
+ *     does not mint, but the table below ships whole and once):
+ *       0  argv[index]                      6  versions.node
+ *       1  env key   at index                7  versions.openssl
+ *       2  env value at index                8  os.tmpdir
+ *       3  cwd                               9  os.homedir
+ *       4  platform                         10  os.type
+ *       5  arch                             11  os.release
+ *      12  execPath                         13  os.userInfo.username
+ *      14  os.userInfo.homedir              15  os.userInfo.shell
+ *      16  os.networkInterfaces AS A JSON DOCUMENT
+ *      17  the host's own text for errno `index` — the one consumer of the
+ *          UNKNOWN arm in the fs errno enumeration (a later pass), and the
+ *          one place `index` means something other than an ordinal.
+ *     `index` is ignored for every kind but 0, 1, 2 and 17. This pass
+ *     (P1) mints and consumes kinds 0-4 only; 5-17 are later passes' — see
+ *     `hostNum`'s identical stance below for the reason both tables ship
+ *     complete now rather than growing a gap at a time.
+ *     hostStr's EFFECT TIER: that the host WROTE the bytes it claims to
+ *     have written is enforced by NOTHING. A host that answers a length
+ *     and writes nothing hands the module a run of NUL code units and no
+ *     error anywhere — the harness's own rows are the check.
+ *
+ *   (import "tsinter" "hostNum" (func (param i32 i32) (result f64)))
+ *     hostNum(kind, arg) -> f64 — every NUMBER-valued host fact.
+ *       0  argc                              1  env pair count
+ *       2  pid                               3  uid
+ *       4  gid                               5  isTTY(fd = arg): 1 or 0
+ *       6  columns(fd = arg): -1 = no width  7  uptime, in SECONDS
+ *       8  cpuUsage.user, microseconds       9  cpuUsage.system
+ *      10  threadCpuUsage.user              11  threadCpuUsage.system
+ *      12  availableMemory, bytes           13  constrainedMemory, bytes
+ *      14  rusage field `arg`, 0..15        15  os.totalmem, bytes
+ *     Kinds 0 and 1 are read ONCE each, at the argv/env snapshot (below);
+ *     everything else is read at its own call site, every time. This pass
+ *     mints and consumes kinds 0-1 only; 2-15 are later passes' (same
+ *     append-only stance as `hostStr`).
+ *     Inherits the WEAK f64 result-kind case (§ the `now`/`wallClock`
+ *     precedent above): a numeric-string host is indistinguishable from a
+ *     correct one. THE VALUE ITSELF is enforced by nothing — a host
+ *     reporting a zeroed rusage or a negative uptime runs silently; the
+ *     text is the only guarantee (the `wallClock` shape, restated).
+ *
+ *   (import "tsinter" "exit" (func (param i32)))   [process.exit modules only]
+ *     The host TERMINATES THE INSTANCE with this status. IT MUST NOT
+ *     RETURN. The module emits a defensive `unreachable` immediately after
+ *     the call — this both keeps the wasm stack types honest and turns a
+ *     broken host into a loud trap rather than a program that runs on past
+ *     its own exit. The host implements this by THROWING A SENTINEL it
+ *     recognises: a JS exception thrown from a `tsinter` import unwinds
+ *     through nested wasm frames with its identity intact — its own class,
+ *     its own `.code`, and NOT a WebAssembly.RuntimeError — and nothing in
+ *     the module after the call runs, identically from `_start` and from
+ *     inside a timer callback under `_tick`. That is Node's "nothing after
+ *     process.exit runs" with no in-module unwind machinery and no cost
+ *     that grows with stack depth.
+ *     THE PROPERTY THIS RESTS ON IS THE TIER'S, NOT THE ENGINE'S: a host
+ *     throw is not INHERENTLY uncatchable inside wasm — the same throwing
+ *     import IS catchable by a `try_table`/`catch_all` in a module that has
+ *     one. It escapes THIS tier's modules only because THE TIER EMITS NO
+ *     EXCEPTION-HANDLING OPCODES AT ALL: try/catch/finally lower through a
+ *     pending-flag unwind, never through wasm's own exception-handling
+ *     proposal, so there is no handler for a host throw to be caught by.
+ *     Node's `try { process.exit(0) } finally { ... }` does NOT run the
+ *     finally, and this reproduces that for free ONLY because there is no
+ *     wasm EH — a later increment that lowers `finally` to
+ *     `try_table`/`catch_all` would silently start running the finally and
+ *     swallowing the exit. The dependency is invisible unless it is written
+ *     down, which is why it is written down here.
+ *     exit's EFFECT TIER: that the host actually TERMINATES, and does not
+ *     return, is enforced by NOTHING. The module's defensive `unreachable`
+ *     after the call turns a returning host into a trap rather than into a
+ *     program that runs past its own exit — that is the MODULE defending
+ *     itself, not enforcement, and the harness's own rows are the check.
+ *
+ * THE ARGV/ENV SNAPSHOT (D2). `process.argv` and the whole of `process.env`
+ * are read ONCE, at first touch, into module-owned storage — never a live
+ * per-read fetch. argv: at first touch, the module reads argc (`hostNum`
+ * kind 0) then argv[0..argc) (`hostStr` kind 0) into ONE interned
+ * module-global `string[]`; every later `process.argv` read answers that
+ * SAME array (Node's own process.argv is one interned mutable array, and
+ * this is that model, not a simplification of it — a per-read fetch would
+ * break any program that mutates argv and reads the mutation back). env:
+ * at first touch of ANY env key, the module reads the pair count (`hostNum`
+ * kind 1) then all pairs (`hostStr` kinds 1 and 2) into one in-module map;
+ * get/set/unset/`in`/spread/Object.keys all run against that map from then
+ * on. THE ONE OBSERVABLE THAT DISTINGUISHES A SNAPSHOT FROM A LIVE PROXY is
+ * a spawned CHILD inheriting a variable this module wrote — no import in
+ * this ABI can reach a child process, so nothing observable can tell the
+ * difference yet; the first increment that gives this tier a child_process
+ * surface must revisit this decision.
+ *
  *   (import "tsinter" "write" (func (param i32 i32 i32)))
  *     write(fd, ptr, len): the host writes len bytes at ptr from the
  *     exported memory to fd (1 = stdout, 2 = stderr), synchronously —
@@ -169,6 +296,9 @@ export const IMPORT_WRITE = "write";
 export const IMPORT_NOW = "now";
 export const IMPORT_SEED = "seed";
 export const IMPORT_WALL_CLOCK = "wallClock";
+export const IMPORT_HOST_STR = "hostStr";
+export const IMPORT_HOST_NUM = "hostNum";
+export const IMPORT_EXIT = "exit";
 export const EXPORT_ENTRY = "_start";
 export const EXPORT_TICK = "_tick";
 export const EXPORT_STATUS = "_status";
@@ -176,3 +306,45 @@ export const EXPORT_MEMORY = "memory";
 
 export const FD_STDOUT = 1;
 export const FD_STDERR = 2;
+
+/* hostStr's KIND table (0..17) — see the import's own doc comment above.
+ * Append-only: a later pass adds a new constant at the next integer, never
+ * renumbers one of these. INC-26 P1 mints and consumes 0-4; 5-17 are later
+ * passes', declared now so the table ships whole and once. */
+export const HOST_STR_KIND_ARGV = 0;
+export const HOST_STR_KIND_ENV_KEY = 1;
+export const HOST_STR_KIND_ENV_VALUE = 2;
+export const HOST_STR_KIND_CWD = 3;
+export const HOST_STR_KIND_PLATFORM = 4;
+export const HOST_STR_KIND_ARCH = 5;
+export const HOST_STR_KIND_VERSIONS_NODE = 6;
+export const HOST_STR_KIND_VERSIONS_OPENSSL = 7;
+export const HOST_STR_KIND_OS_TMPDIR = 8;
+export const HOST_STR_KIND_OS_HOMEDIR = 9;
+export const HOST_STR_KIND_OS_TYPE = 10;
+export const HOST_STR_KIND_OS_RELEASE = 11;
+export const HOST_STR_KIND_EXEC_PATH = 12;
+export const HOST_STR_KIND_OS_USERINFO_USERNAME = 13;
+export const HOST_STR_KIND_OS_USERINFO_HOMEDIR = 14;
+export const HOST_STR_KIND_OS_USERINFO_SHELL = 15;
+export const HOST_STR_KIND_OS_NETWORK_INTERFACES_JSON = 16;
+export const HOST_STR_KIND_ERRNO_TEXT = 17;
+
+/* hostNum's KIND table (0..15) — same append-only stance. INC-26 P1 mints
+ * and consumes 0-1; 2-15 are later passes'. */
+export const HOST_NUM_KIND_ARGC = 0;
+export const HOST_NUM_KIND_ENV_PAIR_COUNT = 1;
+export const HOST_NUM_KIND_PID = 2;
+export const HOST_NUM_KIND_UID = 3;
+export const HOST_NUM_KIND_GID = 4;
+export const HOST_NUM_KIND_IS_TTY = 5;
+export const HOST_NUM_KIND_COLUMNS = 6;
+export const HOST_NUM_KIND_UPTIME = 7;
+export const HOST_NUM_KIND_CPU_USER = 8;
+export const HOST_NUM_KIND_CPU_SYSTEM = 9;
+export const HOST_NUM_KIND_THREAD_CPU_USER = 10;
+export const HOST_NUM_KIND_THREAD_CPU_SYSTEM = 11;
+export const HOST_NUM_KIND_AVAILABLE_MEMORY = 12;
+export const HOST_NUM_KIND_CONSTRAINED_MEMORY = 13;
+export const HOST_NUM_KIND_RUSAGE = 14;
+export const HOST_NUM_KIND_OS_TOTALMEM = 15;

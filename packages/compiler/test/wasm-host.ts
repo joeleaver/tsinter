@@ -22,10 +22,33 @@
  * INC-26 R0 (board #135): this file also stubs `tsinter.wallClock`, and
  * documents — right beside it, in `instantiate()`'s `tsinter: {...}`
  * object — the ONE place P1..P5 add their own conditionally-minted
- * import stubs as abi.ts mints the constants for them. */
+ * import stubs as abi.ts mints the constants for them.
+ *
+ * INC-26 P1: `hostStr`/`hostNum`/`exit` land here too, with DEFAULT
+ * values (argv=["scriptc","program.wasm"], an empty env, cwd="/",
+ * platform=the REAL `process.platform` — a default must not break an
+ * unrelated test that happens to print it, unlike the other three which
+ * are already synthetic). `exit` throws a local sentinel `drive()`
+ * recognises and reports as `exitCode`, mirroring the differential
+ * harness's own `runWasm`. These are DEFAULTS for the 21 existing
+ * importers that never chose to exercise process host facts, not the
+ * FORCED host the P1 unit rows compare against a table — that host is
+ * wasm-host-process.test.ts's own, separate `instantiate()` copy
+ * (wasm-random.test.ts's own "PRECEDENT FOR A HOST-FORCED UNIT PIN"
+ * shape), exactly because a forced row needs KNOWN, deliberately
+ * non-real values (§10-ii: a row that reads the real host and compares
+ * to the real host proves nothing). */
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { expect } from "vitest";
+
+/** `tsinter.exit`'s sentinel (abi.ts §2.5) — thrown by the host, caught
+ * inside `drive()` before it can propagate as an unhandled rejection. */
+class WasmHostExitSignal extends Error {
+  constructor(readonly code: number) {
+    super(`tsinter.exit(${code})`);
+  }
+}
 
 export interface HostRun {
   stdout: string;
@@ -69,24 +92,74 @@ async function instantiate(modulePath: string) {
       // shared-unit-test program has started reaching an import this
       // file has not caught up to yet — the exact gap R0 exists to
       // close.
+      //
+      // INC-26 P1's own defaults, added here: hostStr/hostNum serve a
+      // fixed, minimal argv+env, the REAL cwd/platform (see the file
+      // header on why cwd/platform are the one pair not synthetic here).
+      hostStr(kind: number, index: number, ptr: number, cap: number): number {
+        const argv = ["scriptc", "program.wasm"];
+        const write = (s: string): number => {
+          if (s.length > cap) return s.length;
+          if (memory === null) throw new Error("hostStr before instantiation completed");
+          const view = new Uint16Array(memory.buffer, ptr, s.length);
+          for (let i = 0; i < s.length; i++) view[i] = s.charCodeAt(i);
+          return s.length;
+        };
+        switch (kind) {
+          case 0: // argv
+            return index >= 0 && index < argv.length ? write(argv[index]!) : -1;
+          case 1: // env key
+          case 2: // env value
+            return -1; // the default env is empty
+          case 3: // cwd
+            return write(process.cwd());
+          case 4: // platform
+            return write(process.platform);
+          default:
+            throw new Error(`hostStr: unknown kind ${kind}`);
+        }
+      },
+      hostNum(kind: number): number {
+        switch (kind) {
+          case 0: // argc
+            return 2;
+          case 1: // env pair count
+            return 0;
+          default:
+            throw new Error(`hostNum: unknown kind ${kind}`);
+        }
+      },
+      exit(code: number): void {
+        throw new WasmHostExitSignal(code);
+      },
     },
   });
   memory = instance.exports["memory"] as WebAssembly.Memory;
   let exitCode = 0;
   const drive = (): void => {
-    (instance.exports["_start"] as () => void)();
-    const tick = instance.exports["_tick"] as ((now: number) => number) | undefined;
-    const status = instance.exports["_status"] as (() => number) | undefined;
-    if (tick !== undefined) {
-      for (let turns = 0; ; turns++) {
-        if (turns > 1_000_000) throw new Error(`_tick pump did not settle for ${modulePath}`);
-        const due = tick(clock);
-        if (due < 0) break;
-        clock = Math.max(clock, due);
+    try {
+      (instance.exports["_start"] as () => void)();
+      const tick = instance.exports["_tick"] as ((now: number) => number) | undefined;
+      const status = instance.exports["_status"] as (() => number) | undefined;
+      if (tick !== undefined) {
+        for (let turns = 0; ; turns++) {
+          if (turns > 1_000_000) throw new Error(`_tick pump did not settle for ${modulePath}`);
+          const due = tick(clock);
+          if (due < 0) break;
+          clock = Math.max(clock, due);
+        }
       }
+      // Quiescence: the only point `_status` means anything (abi.ts).
+      exitCode = status?.() ?? 0;
+    } catch (err) {
+      // INC-26 P1: an explicit process.exit(n) reports its OWN code here
+      // — NOT a trap (runWasmToTrap's own path is unaffected: it expects
+      // a WebAssembly.RuntimeError specifically, and this never throws
+      // that), and NOT re-thrown, so `runWasm` returns normally with the
+      // exit code instead of failing the test that called it.
+      if (!(err instanceof WasmHostExitSignal)) throw err;
+      exitCode = err.code;
     }
-    // Quiescence: the only point `_status` means anything (abi.ts).
-    exitCode = status?.() ?? 0;
   };
   const out = (): HostRun => ({
     stdout: Buffer.concat(chunks[1]).toString("utf8"),

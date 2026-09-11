@@ -95,6 +95,16 @@ import {
   EXPORT_TICK,
   FD_STDERR,
   FD_STDOUT,
+  HOST_NUM_KIND_ARGC,
+  HOST_NUM_KIND_ENV_PAIR_COUNT,
+  HOST_STR_KIND_ARGV,
+  HOST_STR_KIND_CWD,
+  HOST_STR_KIND_ENV_KEY,
+  HOST_STR_KIND_ENV_VALUE,
+  HOST_STR_KIND_PLATFORM,
+  IMPORT_EXIT,
+  IMPORT_HOST_NUM,
+  IMPORT_HOST_STR,
   IMPORT_MODULE,
   IMPORT_NOW,
   IMPORT_SEED,
@@ -122,6 +132,7 @@ import { InspectBuilder } from "./inspect.js";
 import { UrlBuilder } from "./url.js";
 import { UriBuilder } from "./uri.js";
 import { DateBuilder } from "./date.js";
+import { ProcessBuilder } from "./process.js";
 import { MapBuilder, type MapInfo, type MapKeyKind, type MapValKind } from "./maps.js";
 import { JsonBuilder, jsonQuote } from "./json.js";
 import {
@@ -137,6 +148,7 @@ import {
   PROM_OBSERVED,
   PROM_PRE,
   PROM_REF,
+  PROM_REPORTED_UNHANDLED,
   PROM_STATE,
   RACEE_DST,
   RACEE_SRC,
@@ -425,6 +437,174 @@ function perfNowReachable(mod: WModule): boolean {
     if (found) return;
     if (typeof node === "string") {
       if (node === "perf.now") found = true;
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      for (const value of Object.values(node)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn.body);
+  }
+  return found;
+}
+
+/** Does any reachable function reach an argv/env/cwd/platform HOST-FACT
+ * key? INC-26 P1 (design-host-v7.txt §3B): `hostStr`'s minting condition.
+ * A prefix match on "process.argv"/"process.env" (envGet/envSet/envUnset/
+ * envPairs all share the prefix) plus an exact match on "process.cwd" and
+ * "process.platform" — the same over-approximating shape as every prescan
+ * above (an unused import in a refusing module costs nothing; missing one
+ * would be an emitter bug). */
+function hostStrReachable(mod: WModule): boolean {
+  const reachable = reachableFunctionNames(mod);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (typeof node === "string") {
+      if (
+        node.startsWith("process.argv") ||
+        node.startsWith("process.env") ||
+        node === "process.cwd" ||
+        node === "process.platform"
+      ) {
+        found = true;
+      }
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      for (const value of Object.values(node)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn.body);
+  }
+  return found;
+}
+
+/** `hostNum`'s minting condition (INC-26 P1): the SAME reach set as
+ * `hostStr` — argc and the env pair count ride the same first-touch
+ * snapshot every argv/env key needs, so a module reaching any of them
+ * needs both imports together. */
+function hostNumReachable(mod: WModule): boolean {
+  return hostStrReachable(mod);
+}
+
+/** Does any reachable function call `process.exit`? INC-26 P1's `exit`
+ * minting condition — exact match, the same shape `mathRandomReachable`
+ * and `dateNowReachable` use. */
+function exitReachable(mod: WModule): boolean {
+  const reachable = reachableFunctionNames(mod);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (typeof node === "string") {
+      if (node === "process.exit") found = true;
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      for (const value of Object.values(node)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn.body);
+  }
+  return found;
+}
+
+/** Does any reachable function call `process.onExit` or `process.offExit`?
+ * INC-26 P1 — a STATIC, ORDER-INDEPENDENT fact computed once in the
+ * constructor, deliberately NOT `this.proc.hasExitListenerSurface()` (a
+ * runtime flag that only reflects the walk's progress SO FAR). The four
+ * drain-gate call sites (reportUncaughtHelper, emitReport via
+ * `drainAtQuiescence`-shaped deps, `_start`'s tail) are each reached the
+ * FIRST time some construct anywhere in the program needs them — which
+ * can be BEFORE a LATER `process.onExit` call is ever walked (an early
+ * throw-check building `reportUncaughtHelper` while a later statement
+ * still hasn't registered a listener is not hypothetical: nothing about
+ * source order guarantees otherwise). Gating on this prescan instead of
+ * the mutable flag means the gate is correct regardless of which
+ * construct happens to trigger a lazy builder first. */
+function exitListenerSurfaceReachable(mod: WModule): boolean {
+  const reachable = reachableFunctionNames(mod);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (typeof node === "string") {
+      if (node === "process.onExit" || node === "process.offExit") found = true;
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      for (const value of Object.values(node)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn.body);
+  }
+  return found;
+}
+
+/** Does any reachable function call `process.onUnhandledRejection`? INC-26
+ * P1 — the SAME static-prescan reasoning as exitListenerSurfaceReachable:
+ * the ledger walk's own report() function (promises.ts) is memoized and
+ * can be built from any construct in the program, so the "does a listener
+ * exist" gate must be an order-independent fact, not the mutable list
+ * state. `offUnhandledRejection`'s own reach does NOT gate this — removing
+ * a listener presupposes registering one first, so `onUnhandledRejection`
+ * alone is the complete condition. */
+function unhandledRejectionReachable(mod: WModule): boolean {
+  const reachable = reachableFunctionNames(mod);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (typeof node === "string") {
+      if (node === "process.onUnhandledRejection") found = true;
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      for (const value of Object.values(node)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn.body);
+  }
+  return found;
+}
+
+/** Does any reachable function call `process.onRejectionHandled`? RULING
+ * P1-R3: the SAME static-prescan reasoning as unhandledRejectionReachable
+ * — the two promise-subscription entry points (`subscribe`, `subscribeHandled`
+ * in promises.ts) that must check for a fire are memoized/shared machinery,
+ * so "does a rejectionHandled listener exist" must be an order-independent
+ * fact. `offRejectionHandled` does not exist in this increment's key set
+ * (survey, CP1 §2) so there is no removal reach to fold in. */
+function rejectionHandledReachable(mod: WModule): boolean {
+  const reachable = reachableFunctionNames(mod);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (typeof node === "string") {
+      if (node === "process.onRejectionHandled") found = true;
       return;
     }
     if (Array.isArray(node)) {
@@ -1256,6 +1436,30 @@ class Assembler {
    * `date.now` (dateNowReachable's prescan, INC-25 P6, D3/D6/C-1 — minted
    * right after `seedFunc` so `seed`'s own index is unchanged). */
   private readonly wallClockFunc: number | null;
+  /** `tsinter.hostStr`'s index, or null in a module that never reaches
+   * argv, env (get/set/unset/pairs), cwd or platform (INC-26 P1,
+   * hostStrReachable's prescan). */
+  private readonly hostStrFunc: number | null;
+  /** `tsinter.hostNum`'s index — the SAME reach set as `hostStrFunc`
+   * (INC-26 P1, hostNumReachable's prescan). */
+  private readonly hostNumFunc: number | null;
+  /** `tsinter.exit`'s index, or null in a module that never calls
+   * `process.exit` (INC-26 P1, exitReachable's prescan). */
+  private readonly exitFunc: number | null;
+  /** The exit-drain gate's static fact — see exitListenerSurfaceReachable's
+   * own comment (INC-26 P1). Computed ONCE in the constructor; every drain
+   * gate site reads this, never the mutable `procField`/
+   * `hasExitListenerSurface()` state. */
+  private readonly needsExitDrain: boolean;
+  /** Same reasoning, for `process.onUnhandledRejection` — see
+   * unhandledRejectionReachable's own comment. */
+  private readonly needsUnhandledRejectionDispatch: boolean;
+  /** RULING P1-R3: same reasoning, for `process.onRejectionHandled` — see
+   * rejectionHandledReachable's own comment. Gates `subscribe`/
+   * `subscribeHandled`'s fire check, distinct from
+   * `needsUnhandledRejectionDispatch` (a module can register one event
+   * without the other). */
+  private readonly needsRejectionHandledDispatch: boolean;
   /** `Date.now()`/`new Date()`'s wall clock reads this import and floors;
    * `performance.now()`'s ORIGIN — `now()` sampled ONCE at `_start`
    * entry, in a mutable f64 global, in any module that reaches
@@ -1356,6 +1560,26 @@ class Assembler {
     this.wallClockFunc = dateNowReachable(mod)
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_WALL_CLOCK, this.mb.funcType([], [F64]))
       : null;
+    // `hostStr`/`hostNum`'s decision (INC-26 P1, D2): present only in
+    // modules that reach argv, env, cwd or platform, minted right after
+    // `wallClockFunc` so nothing before it moves.
+    this.hostStrFunc = hostStrReachable(mod)
+      ? this.mb.importFunc(IMPORT_MODULE, IMPORT_HOST_STR, this.mb.funcType([I32, I32, I32, I32], [I32]))
+      : null;
+    this.hostNumFunc = hostNumReachable(mod)
+      ? this.mb.importFunc(IMPORT_MODULE, IMPORT_HOST_NUM, this.mb.funcType([I32, I32], [F64]))
+      : null;
+    // `exit`'s decision (INC-26 P1, D3): present only in modules that call
+    // `process.exit`, minted right after `hostNumFunc`.
+    this.exitFunc = exitReachable(mod)
+      ? this.mb.importFunc(IMPORT_MODULE, IMPORT_EXIT, this.mb.funcType([I32], []))
+      : null;
+    // The exit-drain gate's STATIC fact (see exitListenerSurfaceReachable's
+    // own comment on why this must not be a runtime flag): true iff
+    // process.exit/onExit/offExit is reached anywhere in the module.
+    this.needsExitDrain = this.exitFunc !== null || exitListenerSurfaceReachable(mod);
+    this.needsUnhandledRejectionDispatch = unhandledRejectionReachable(mod);
+    this.needsRejectionHandledDispatch = rejectionHandledReachable(mod);
     this.mb.ensureMemory(1);
     this.cursorGlobal = this.mb.addGlobal(I32, true, (w) => {
       w.u8(0x41); // i32.const 0
@@ -1607,6 +1831,7 @@ class Assembler {
   }
 
   private reportUncaughtFunc: number | null = null;
+  private renderUncaughtFunc: number | null = null;
 
   /** %w.err.reportUncaught() — the wasm tier's missing half of S010's
    * pattern: an unhandled promise rejection already prints "Unhandled
@@ -1633,6 +1858,45 @@ class Assembler {
     if (this.reportUncaughtFunc !== null) return this.reportUncaughtFunc;
     const idx = this.mb.declareFunc(this.mb.funcType([], []), "%w.err.reportUncaught");
     this.reportUncaughtFunc = idx;
+    const c = new Code();
+    // INC-26 P1 drain site 5/6 (design §4.4): INSIDE the reporter, at the
+    // top, before anything renders — covers every one of this helper's
+    // nine direct-emission call sites plus its four DI hand-offs BY
+    // CONSTRUCTION, not by enumerating them. Gated on `needsExitDrain`, a
+    // STATIC prescan fact (NOT the mutable `procField`/
+    // `hasExitListenerSurface()` state) — this helper is memoized and
+    // built on its FIRST reference from anywhere in the walk, which can
+    // be before a LATER process.onExit call is ever reached; a
+    // runtime-state gate checked at that moment would wrongly and
+    // permanently skip the drain. Fatal path: code is always 1 — a
+    // pending exception (this is what got us here) is already sitting in
+    // the cell, so exitDrainHelper's P1-R2 branch restores it unchanged
+    // over any throwing listener's own error rather than leaving that
+    // behind (see process.ts's exitDrainHelper doc comment: WAS_FATAL).
+    if (this.needsExitDrain) {
+      c.i32Const(1);
+      c.call(this.proc.exitDrainHelper());
+    }
+    c.call(this.renderUncaughtHelper());
+    c.unreachable();
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  /** %w.err.renderUncaught() — the PRINT-ONLY half of `reportUncaughtHelper`,
+   * split out for P1-R2's `process.exit(n)` arm: Node's measured rule is
+   * that an EXPLICIT exit code survives a throwing exit listener unchanged
+   * (only an IMPLICIT 0 becomes 1) — the listener's error is still
+   * printed, but the module must NOT trap (a trap has no code to give the
+   * `exit` import), so that call site renders through here directly and
+   * then still calls `exit(n)`. Every other call site keeps going through
+   * `reportUncaughtHelper`, which is now just this render plus the drain
+   * call plus the trap. Does not touch the drain — the caller decides
+   * whether one is needed first. Returns (unlike reportUncaughtHelper). */
+  private renderUncaughtHelper(): number {
+    if (this.renderUncaughtFunc !== null) return this.renderUncaughtFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([], []), "%w.err.renderUncaught");
+    this.renderUncaughtFunc = idx;
     const exc = this.exc();
     const out = this.ensureHelpers();
     const c = new Code();
@@ -1709,7 +1973,6 @@ class Assembler {
     c.call(out.putc);
     c.i32Const(FD_STDERR);
     c.call(out.flush);
-    c.unreachable();
     this.mb.setBody(idx, [I32], c.bytes());
     return idx;
   }
@@ -1994,6 +2257,17 @@ class Assembler {
       // emitCheckpoint) — this ONE call site is the special first one
       // (emitCheckpointCore's header).
       this.emitFirstCheckpoint(c);
+      // INC-26 P1 drain site 4/6 (design §4.3(b)): for a module with NO
+      // `_tick` at all, `_start`'s own tail IS quiescence — nothing else
+      // will ever run after this point, so this is where the 'exit'
+      // listeners fire. `this.timersField`'s final value is already
+      // settled here (the export line just below makes the identical
+      // assumption one statement later). Gated on `needsExitDrain` (a
+      // static prescan fact, computed in the constructor) rather than the
+      // listener struct's own lazily-built state, so a module using only
+      // argv/env/cwd/platform pays nothing for this AND the gate cannot
+      // depend on which construct happened to run first.
+      if (this.timersField === null) this.emitImplicitDrainAndCheck(c);
       this.mb.setBody(start, [], c.bytes());
     }
     this.mb.exportFunc(EXPORT_ENTRY, start);
@@ -2030,6 +2304,62 @@ class Assembler {
     c.end();
     this.mb.setBody(status, [], c.bytes());
     this.mb.exportFunc(EXPORT_STATUS, status);
+  }
+
+  /** INC-26 P1 (design §4.3(b)): pushes the SAME 0/13 verdict `emitStatus`
+   * exports as `_status`, inlined at a drain site instead of exported —
+   * the quiescence drain (`_start`'s tail for a no-`_tick` module, and
+   * `%w.tick`'s two -1 sites via `deps.drainAtQuiescence`) must consult
+   * the identical state `_status` does, not a copy that can drift from it
+   * (rev-26's own P4 pre-read finding: an unsettled top-level-await root
+   * drains with code 13). Read verbatim from `emitStatus` above. */
+  private emitCurrentStatusCode(c: Code): void {
+    const root = this.rootGlobal();
+    if (root === null) {
+      c.i32Const(0);
+      return;
+    }
+    c.globalGet(root);
+    c.refIsNull();
+    c.ifResult(I32);
+    c.i32Const(0);
+    c.else_();
+    c.globalGet(root);
+    c.structGet(this.proms.promT, PROM_STATE);
+    c.i32Eqz();
+    c.ifResult(I32);
+    c.i32Const(13);
+    c.else_();
+    c.i32Const(0);
+    c.end();
+    c.end();
+  }
+
+  /** INC-26 P1-R2: the shared body of drain sites 2/3/4 (the three
+   * IMPLICIT-code exit-listener drains — `%w.tick`'s two quiescence
+   * returns via `deps.drainAtQuiescence`, and `_start`'s own tail for a
+   * no-`_tick` module) — push the current `_status` verdict, drain, then
+   * check whether a listener left its OWN exception behind (process.ts's
+   * exitDrainHelper: NOT WAS_FATAL means it does not restore "nothing
+   * pending" over it). If so, route it through `reportUncaughtHelper`:
+   * that helper's own top-of-function drain call is a no-op re-entry (the
+   * guard already latched from the call just above), so it goes straight
+   * to rendering whatever the cell now holds and traps — the host reads
+   * that trap as status 1, which is exactly Node's measured rule for
+   * these three sites (implicit 0 becomes 1; the listener's error is
+   * printed as the uncaught reason). A no-op when `needsExitDrain` is
+   * false — nothing was ever registered, so nothing can be pending. */
+  private emitImplicitDrainAndCheck(c: Code): void {
+    if (!this.needsExitDrain) return;
+    this.emitCurrentStatusCode(c);
+    c.call(this.proc.exitDrainHelper());
+    const exc = this.exc();
+    c.globalGet(exc.kindG);
+    c.i32Const(0);
+    c.i32Ne();
+    c.ifVoid();
+    c.call(this.reportUncaughtHelper());
+    c.end();
   }
 
   finish(): Uint8Array {
@@ -3198,6 +3528,64 @@ class Assembler {
       errToStr: () => this.errToStrHelper(),
       out: () => this.ensureHelpers(),
       lit: (c, s) => this.pushStrLitInto(c, s),
+      exitDrainFatal: (c) => {
+        if (!this.needsExitDrain) return;
+        c.i32Const(1);
+        c.call(this.proc.exitDrainHelper());
+      },
+      dispatchOrReport: (c, p, k, fallback) => {
+        if (!this.needsUnhandledRejectionDispatch) {
+          fallback();
+          return;
+        }
+        this.proc.emitHasUnhandledRejectionListeners(c);
+        c.ifVoid();
+        // A listener takes over: mark observed (Node's own contract — a
+        // rejection is answered for ONCE, whichever channel answers it),
+        // box (reason, promise) as dyn, dispatch, and do NOT trap.
+        c.localGet(p);
+        c.i32Const(1);
+        c.structSet(this.proms.promT, PROM_OBSERVED);
+        // RULING P1-R3: this IS the "reported unhandled" moment for a
+        // module with a listener registered (the ONLY path that doesn't
+        // trap, so the only one where a LATER handler could ever attach)
+        // — mark it so promises.ts's subscribe/subscribeHandled can fire
+        // rejectionHandled if one attaches later.
+        c.localGet(p);
+        c.i32Const(1);
+        c.structSet(this.proms.promT, PROM_REPORTED_UNHANDLED);
+        this.boxPromiseReasonToDyn(c, p, k);
+        // SEMANTICS.md S076: a fresh generic object, never `p` itself —
+        // this listener's "promise" argument has no preserved identity
+        // (the reason argument above is unaffected).
+        this.dyn.boxObj(c, (x) => this.dyn.pushNewObj(x, false));
+        c.call(this.proc.dispatchUnhandledRejection());
+        c.else_();
+        fallback();
+        c.end();
+      },
+      // RULING P1-R5: called from `drainPendingHandled` (promises.ts),
+      // once per queued promise, AFTER the turn's microtask/nextTick
+      // drain and BEFORE the unhandled report — Node's own checkpoint-
+      // relative rule (measured; supersedes P1-R3's inline-at-attach
+      // shape — a register entry was drafted for that shape and then
+      // retired, since this is IMPLEMENTED, not a divergence). The
+      // read-and-clear of
+      // `PROM_REPORTED_UNHANDLED` and the FIFO enqueue both now live in
+      // promises.ts itself (pure `promT` field work, no DI needed); this
+      // hook only boxes a fresh generic "promise" dyn value (unchanged
+      // since P1-R3 — identity is not preserved either place) and fires
+      // the listener list. A no-op unless `needsRejectionHandledDispatch`
+      // (the static prescan).
+      fireRejectionHandled: (c) => {
+        if (!this.needsRejectionHandledDispatch) return;
+        // SEMANTICS.md S076: same fresh-generic-object shape as
+        // dispatchOrReport's own "promise" argument above — no identity
+        // preserved (board #140 would fix both sites at once).
+        this.dyn.boxObj(c, (x) => this.dyn.pushNewObj(x, false)); // "the promise"
+        c.call(this.proc.dispatchRejectionHandled());
+      },
+      needsRejectionHandled: () => this.needsRejectionHandledDispatch,
     });
     return this.promsField;
   }
@@ -3460,6 +3848,11 @@ class Assembler {
     if (!hasProms && !hasTicks) return;
     if (!hasTicks) {
       c.call(this.proms.drain());
+      // RULING P1-R5: the HANDLED pass — every promise a handler attached
+      // to since the last checkpoint, in FIFO order — runs AFTER the
+      // turn's own microtask drain and BEFORE the unhandled pass, exactly
+      // where Node's own checkpoint decides both (measured).
+      if (this.needsRejectionHandledDispatch) c.call(this.proms.drainPendingHandled());
       c.call(this.proms.report());
       this.emitRootCheck(c);
       return;
@@ -3474,6 +3867,11 @@ class Assembler {
     c.brIf(0);
     c.end();
     if (hasProms) {
+      // Same HANDLED-before-unhandled order as the no-nextTick branch
+      // above — the outer loop has already alternated both queues to a
+      // fixed point, so every promise this turn's work could have
+      // attached a handler to is already queued here.
+      if (this.needsRejectionHandledDispatch) c.call(this.proms.drainPendingHandled());
       c.call(this.proms.report());
       this.emitRootCheck(c);
     }
@@ -3522,6 +3920,14 @@ class Assembler {
       excKind: () => this.exc().kindG,
       reportUncaught: () => this.reportUncaughtHelper(),
       checkpoint: (c) => this.emitCheckpoint(c),
+      // INC-26 P1 (design §4.3(b)): a no-op unless `needsExitDrain` (the
+      // static prescan) is true for this module — never `this.proc`'s own
+      // lazily-built state, which `tick()`'s construction point happens
+      // to make safe to read but which the OTHER three gate sites do not.
+      // P1-R2: emitImplicitDrainAndCheck also covers the throwing-listener
+      // report (its own needsExitDrain check makes this one redundant but
+      // harmless).
+      drainAtQuiescence: (c) => this.emitImplicitDrainAndCheck(c),
     });
     return this.timersField;
   }
@@ -5401,6 +5807,59 @@ class Assembler {
     return this.dateField;
   }
 
+  private procField: ProcessBuilder | null = null;
+
+  /** INC-26 pass P1's own builder (process.ts) — the argv/env snapshot,
+   * the 'exit' listener list and its drain. Structurally new (its own
+   * `cached()` memo, its own `%w.proc.*` prefix), sharing the module's
+   * existing string-vec machinery (arrayOf(STRING)'s VecInfo) rather than
+   * inventing a second array representation. */
+  private get proc(): ProcessBuilder {
+    this.procField ??= new ProcessBuilder(this.mb, {
+      strRef: () => this.strRef,
+      strType: () => this.strType,
+      strEq: () => this.strEqHelper(),
+      hostStrFunc: () => this.hostStrFuncOrThrow(),
+      hostNumFunc: () => this.hostNumFuncOrThrow(),
+      exitFunc: () => this.exitFuncOrThrow(),
+      toInt32: () => this.toInt32Helper(),
+      ensureCapacity: (c, need) => this.emitEnsureCapacity(c, need),
+      stageCursor: () => this.cursorGlobal,
+      stringVecInfo: () => this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!,
+      stringVecRef: () => this.vecs.vecRef(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
+      stringVecNewLen: () => this.vecs.newLen(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
+      stringVecGet: () => this.vecs.get(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
+      stringVecSet: () => this.vecs.set(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
+      stringVecPushOne: () =>
+        this.vecs.pushOne(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
+      stringVecSplice: () =>
+        this.vecs.splice(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
+      closPairFor: (params, results) => this.closPairFor(params, results),
+      dynRef: () => this.dyn.dynRef(),
+      dynPathT: () => this.dyn.pathT(),
+      dynStrictEq: () => this.dyn.strictEq(),
+      rejCheckHelper: () => {
+        const t: IrType & { kind: "func" } = { kind: "func", params: [DYN, DYN], ret: VOID };
+        const idx = this.dynCheckHelper(t, undefined);
+        if (idx === null) throw new Error("emitter bug: (dyn,dyn)=>void has no dynCheck representation");
+        return idx;
+      },
+      // RULING P1-R3: the (dyn)=>void checker rejectionHandled's listener
+      // needs — rejCheckHelper's own shape, one parameter narrower.
+      rejHandledCheckHelper: () => {
+        const t: IrType & { kind: "func" } = { kind: "func", params: [DYN], ret: VOID };
+        const idx = this.dynCheckHelper(t, undefined);
+        if (idx === null) throw new Error("emitter bug: (dyn)=>void has no dynCheck representation");
+        return idx;
+      },
+      excCell: () => {
+        const exc = this.exc();
+        return { kindG: exc.kindG, f64G: exc.f64G, refG: exc.refG, preG: exc.preG, refType: ANY_REF };
+      },
+    });
+    return this.procField;
+  }
+
   /** `this.wallClockFunc`, or a descriptive throw — the constructor's own
    * `dateNowReachable` prescan and the walk disagreeing can only mean the
    * scan stopped seeing an IR shape it must see. */
@@ -5409,6 +5868,31 @@ class Assembler {
       throw new Error("emitter bug: date.now was reached but tsinter.wallClock was never imported");
     }
     return this.wallClockFunc;
+  }
+
+  /** `this.hostStrFunc`, or a descriptive throw (wallClockFuncOrThrow's
+   * exact shape, INC-26 P1). */
+  private hostStrFuncOrThrow(): number {
+    if (this.hostStrFunc === null) {
+      throw new Error("emitter bug: a host-fact key was reached but tsinter.hostStr was never imported");
+    }
+    return this.hostStrFunc;
+  }
+
+  /** `this.hostNumFunc`, or a descriptive throw. */
+  private hostNumFuncOrThrow(): number {
+    if (this.hostNumFunc === null) {
+      throw new Error("emitter bug: a host-fact key was reached but tsinter.hostNum was never imported");
+    }
+    return this.hostNumFunc;
+  }
+
+  /** `this.exitFunc`, or a descriptive throw. */
+  private exitFuncOrThrow(): number {
+    if (this.exitFunc === null) {
+      throw new Error("emitter bug: process.exit was reached but tsinter.exit was never imported");
+    }
+    return this.exitFunc;
   }
 
   /** The ARR payload's vector info — the SAME interning a static
@@ -7668,6 +8152,91 @@ class Assembler {
     c.i32Sub();
     c.i32Const(meta.post - meta.pre);
     c.i32LeU();
+  }
+
+  /** INC-26 P1's own use of `caughtToDyn`'s exact kind-dispatch (case
+   * "caughtToDyn" above) — a promise's rejection payload rides the SAME
+   * (kind, f64, ref, pre) encoding a caught exception snapshot does
+   * (promises.ts's own header comment: "the payload rides a (kind, f64,
+   * ref) triple with the EXCEPTION CELL's encoding"), so boxing it into a
+   * dyn value for `process.on('unhandledRejection', (reason, promise) =>
+   * ...)` is the identical walk over PROM_KIND/PROM_F64/PROM_REF/PROM_PRE
+   * instead of caughtT's fields 0/1/2/3. Leaves a dyn value on the stack.
+   * `p` is a local already holding the rejected promise; `k` is a
+   * CALLER-SUPPLIED i32 scratch local index — NOT `acquireScratch` (the
+   * SAME "own Code buffer, own local numbering" hazard `mtResumeHelper`'s
+   * own comment documents: this method is called while building a
+   * hand-built standalone function via its own `new Code()`, never while
+   * `this.fn` is the function actually being walked, so touching the
+   * scratch pool here would silently corrupt whatever function IS
+   * current). */
+  private boxPromiseReasonToDyn(c: Code, p: number, k: number): void {
+    const dynRef = this.dyn.dynRef();
+    c.localGet(p);
+    c.structGet(this.proms.promT, PROM_KIND);
+    c.localSet(k);
+    const kindIs = (tag: number): void => {
+      c.localGet(k);
+      c.i32Const(tag);
+      c.i32Eq();
+    };
+    kindIs(EXC_F64);
+    c.ifResult(dynRef);
+    this.dyn.boxNum(c, (x) => {
+      x.localGet(p);
+      x.structGet(this.proms.promT, PROM_F64);
+    });
+    c.else_();
+    kindIs(EXC_BOOL);
+    c.ifResult(dynRef);
+    this.dyn.boxBool(c, (x) => {
+      x.localGet(p);
+      x.structGet(this.proms.promT, PROM_F64);
+      x.f64Const(0);
+      x.f64Ne();
+    });
+    c.else_();
+    kindIs(EXC_STR);
+    c.ifResult(dynRef);
+    this.dyn.boxStr(c, (x) => {
+      x.localGet(p);
+      x.structGet(this.proms.promT, PROM_REF);
+      x.refCast(this.strType);
+    });
+    c.else_();
+    c.localGet(k);
+    c.i32Const(EXC_OBJ);
+    c.i32Eq();
+    c.ifResult(I32);
+    c.localGet(p);
+    c.structGet(this.proms.promT, PROM_PRE);
+    this.emitErrIntervalTest(c);
+    c.else_();
+    c.i32Const(0);
+    c.end();
+    c.ifResult(dynRef);
+    c.localGet(p);
+    c.structGet(this.proms.promT, PROM_REF);
+    c.refCast(this.exc().errT);
+    c.call(this.dyn.fromError());
+    c.else_();
+    c.localGet(p);
+    c.structGet(this.proms.promT, PROM_REF);
+    c.refTest(this.dyn.dynT());
+    c.ifResult(dynRef);
+    c.localGet(p);
+    c.structGet(this.proms.promT, PROM_REF);
+    c.refCast(this.dyn.dynT());
+    c.else_();
+    // Records, arrays, closures, unions and non-error classes are
+    // type-erased in the promise payload too (the SAME S022 approximation
+    // caughtToDyn falls back to) — the empty object.
+    this.dyn.boxObj(c, (x) => this.dyn.pushNewObj(x, false));
+    c.end();
+    c.end();
+    c.end();
+    c.end();
+    c.end();
   }
 
   /** The class object global, filled on first evaluation. */
@@ -11971,6 +12540,198 @@ class Assembler {
         }
         // ── end INC-25 P6 — all six keys wired ────────────────────────
         // ── end INC-25 P5 — all eight keys wired ──────────────────────
+        // ── INC-26 P1 — the process host contract (design-host-v7.txt
+        // §2.2-§2.5/§3.2, DECISIONS.md D2/D3, cp1-plan-p1.txt 70a46350) ──
+        if (e.fn === "process.argv") {
+          code.call(this.proc.ensureArgv());
+          code.globalGet(this.proc.argvGlobalForRead());
+          return;
+        }
+        if (e.fn === "process.cwd") {
+          code.i32Const(HOST_STR_KIND_CWD);
+          code.i32Const(0); // index is ignored for this kind
+          code.call(this.proc.readHostStr());
+          return;
+        }
+        if (e.fn === "process.platform") {
+          code.i32Const(HOST_STR_KIND_PLATFORM);
+          code.i32Const(0);
+          code.call(this.proc.readHostStr());
+          return;
+        }
+        if (e.fn === "process.envSet") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.proc.envSet());
+          return;
+        }
+        if (e.fn === "process.envUnset") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.proc.envUnset());
+          return;
+        }
+        if (e.fn === "process.envPairs") {
+          code.call(this.proc.envPairs());
+          return;
+        }
+        if (e.fn === "process.envGet") {
+          // Result is the module's interned `string | undefined` union
+          // (validate.ts's own comment: a documented PLACEHOLDER row, the
+          // real check is the arm shape below) — the union-wrap decision
+          // is made HERE, at the call site, exactly `error.code`'s own
+          // precedent (this file, ~line 11395's shape): the lookup helper
+          // (process.ts) only ever answers a NULLABLE string, never a
+          // union, because the union's arm tags are a per-call-site fact
+          // it has no business knowing.
+          const unionId = e.type.kind === "union" ? e.type.unionId : null;
+          if (unionId === null) {
+            this.refuse("libCall:process.envGet:unexpected-result-shape", e.loc);
+            code.unreachable();
+            return;
+          }
+          const undefTag = this.undefinedArmTag(unionId);
+          const strTag = this.unionArmTag(unionId, STRING);
+          if (undefTag < 0 || strTag < 0) {
+            this.refuse("libCall:process.envGet:unexpected-union-shape", e.loc);
+            code.unreachable();
+            return;
+          }
+          const strSt = this.unionArmStruct(unionId, strTag, e.loc);
+          const unionVal = this.mapType(e.type, e.loc);
+          if (strSt === null || unionVal === null) {
+            code.unreachable();
+            return;
+          }
+          this.walkExpr(e.args[0]!);
+          code.call(this.proc.envGetLookup());
+          const tmp = this.acquireScratch(this.strRef);
+          code.localSet(tmp);
+          code.localGet(tmp);
+          code.refIsNull();
+          this.openIfResult(unionVal);
+          code.globalGet(this.unions.unitGlobal(undefTag));
+          code.else_();
+          code.i32Const(strTag);
+          code.localGet(tmp);
+          code.refAsNonNull();
+          code.structNew(strSt);
+          this.close();
+          this.releaseScratch(this.strRef, tmp);
+          return;
+        }
+        if (e.fn === "process.stdoutWrite" || e.fn === "process.stderrWrite") {
+          const fd = e.fn === "process.stdoutWrite" ? FD_STDOUT : FD_STDERR;
+          this.walkExpr(e.args[0]!);
+          const helpers = this.ensureHelpers();
+          code.call(helpers.stage);
+          code.i32Const(fd);
+          code.call(helpers.flush);
+          // Node's constant backpressure answer for this synchronous
+          // runtime — scr_lib.c's own stance, nodes.ts:3049's doc comment.
+          code.i32Const(1);
+          return;
+        }
+        if (e.fn === "process.stdoutWriteBytes") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.stageBytesHelper());
+          code.i32Const(FD_STDOUT);
+          code.call(this.ensureHelpers().flush);
+          code.i32Const(1);
+          return;
+        }
+        if (e.fn === "process.exit") {
+          this.walkExpr(e.args[0]!); // f64 code
+          code.call(this.toInt32Helper()); // ECMA ToInt32 — matches the
+          // native lanes' own (int) cast on every in-range value the
+          // corpus exercises; see cp1-plan-p1.txt §9's own note.
+          const codeLocal = this.acquireScratch(I32);
+          code.localSet(codeLocal);
+          code.localGet(codeLocal);
+          code.call(this.proc.exitDrainHelper());
+          // P1-R2: this is the one drain site whose CODE is EXPLICIT —
+          // Node's measured rule keeps it unchanged even when a listener
+          // threw (process.exit(3) + throwing listener -> exit 3, the
+          // listener's error still printed). exitDrainHelper's non-fatal
+          // branch left that error in the cell rather than restoring
+          // "nothing pending" over it; render it (no trap — a trap has no
+          // code to hand the `exit` import) and still exit with codeLocal.
+          const exc = this.exc();
+          code.globalGet(exc.kindG);
+          code.i32Const(0);
+          code.i32Ne();
+          code.ifVoid();
+          code.call(this.renderUncaughtHelper());
+          code.end();
+          code.localGet(codeLocal);
+          code.call(this.exitFuncOrThrow());
+          code.unreachable(); // defensive: exit must not return (abi.ts §2.5)
+          this.releaseScratch(I32, codeLocal);
+          return;
+        }
+        if (e.fn === "process.onExit") {
+          const cbType = e.args[0]!.type;
+          if (cbType.kind !== "func") {
+            this.refuse("libCall:process.onExit:unexpected-callback-shape", e.loc);
+            code.unreachable();
+            return;
+          }
+          const shape = cbType.params.length; // 0 or 1 (validate.ts's own <= 1 check)
+          this.walkExpr(e.args[0]!); // cb — upcasts to the shared eq field on call
+          code.i32Const(shape);
+          this.walkExpr(e.args[1]!); // once
+          code.call(this.proc.onExitAppend());
+          return;
+        }
+        if (e.fn === "process.offExit") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.proc.offExitRemove());
+          return;
+        }
+        // ── INC-26 P1, §3F — the DYN-typed rejection listeners. MAY_THROW
+        // (nodes.ts's own seed list): a non-function `listener` argument
+        // throws Node's own message shape, measured directly against
+        // this session's Node (mtEnqueueDynHelper's own precedent, "the
+        // callback" -> "the listener" is the only difference). ──────────
+        if (e.fn === "process.onUnhandledRejection" || e.fn === "process.onRejectionHandled") {
+          this.walkExpr(e.args[0]!); // the dyn callback
+          const cbLocal = this.acquireScratch(this.dyn.dynRef());
+          code.localSet(cbLocal);
+          code.localGet(cbLocal);
+          code.structGet(this.dyn.dynT(), DYN_KIND);
+          code.i32Const(DK.FUNC);
+          code.i32Ne();
+          this.openIf();
+          this.emitSetCellError(
+            code,
+            "%TypeError",
+            "TypeError",
+            (cc) => {
+              this.pushStrLitInto(cc, 'The "listener" argument must be of type function. Received ');
+              cc.localGet(cbLocal);
+              cc.call(this.dyn.specificType());
+              cc.call(this.concatHelper());
+            },
+            "ERR_INVALID_ARG_TYPE",
+          );
+          this.emitUnwind();
+          this.close();
+          code.localGet(cbLocal);
+          this.walkExpr(e.args[1]!); // once
+          if (e.fn === "process.onUnhandledRejection") code.call(this.proc.onUnhandledRejectionAppend());
+          else code.call(this.proc.onRejectionHandledAppend());
+          this.releaseScratch(this.dyn.dynRef(), cbLocal);
+          return;
+        }
+        if (e.fn === "process.offUnhandledRejection") {
+          // NOT MAY_THROW (nodes.ts's own doc comment: "removal by
+          // identity, no callable check needed on remove") — a
+          // non-function argument simply matches nothing and no-ops,
+          // exactly `offExit`'s own stance.
+          this.walkExpr(e.args[0]!);
+          code.call(this.proc.offUnhandledRejectionRemove());
+          return;
+        }
+        // ── end INC-26 P1 ──────────────────────────────────────────────
         if (this.emitBufferLibCall(e)) return;
         if (this.emitTimerCall(e)) return;
         if (this.emitEmitterLibCall(e)) return;
@@ -29115,6 +29876,67 @@ class Assembler {
 
     this.helpers = { stage, putc, flush };
     return this.helpers;
+  }
+
+  private stageBytesFunc: number | null = null;
+
+  /** %w.stageBytes(bytes) → void — `%w.stage`'s raw-byte twin, INC-26 P1
+   * (process.stdoutWriteBytes). No transcode: bytes are already the tier's
+   * OWN wire format, so this is a 1:1 copy at the cursor instead of
+   * `%w.stage`'s UTF-16-to-UTF-8 walk — capacity is reserved for exactly
+   * `len` bytes, never `len` times a multiplier. Advances the cursor
+   * (unlike `%w.proc.readHostStr`'s INBOUND read, this is an ordinary
+   * OUTPUT stage — `%w.flush` reads memory[0, cursor) same as ever). */
+  private stageBytesHelper(): number {
+    if (this.stageBytesFunc !== null) return this.stageBytesFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.bytesB.bytesRef()], []), "%w.stageBytes");
+    this.stageBytesFunc = idx;
+    const c = new Code();
+    const B = 0;
+    const LEN = 1;
+    const OFF = 2;
+    const I = 3;
+    const CUR = 4;
+    c.localGet(B);
+    c.structGet(this.bytesB.bytesType(), 2); // len, in elements (u8 ⇒ bytes)
+    c.localSet(LEN);
+    c.localGet(B);
+    c.structGet(this.bytesB.bytesType(), 1); // off, in bytes
+    c.localSet(OFF);
+    this.emitEnsureCapacity(c, () => c.localGet(LEN));
+    c.globalGet(this.cursorGlobal);
+    c.localSet(CUR);
+    c.i32Const(0);
+    c.localSet(I);
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.localGet(LEN);
+    c.i32GeU();
+    c.brIf(1);
+    c.localGet(CUR);
+    c.localGet(I);
+    c.i32Add();
+    c.localGet(B);
+    c.structGet(this.bytesB.bytesType(), 0); // buf
+    c.localGet(OFF);
+    c.localGet(I);
+    c.i32Add();
+    c.arrayGetU(this.bytesB.bufType());
+    c.i32Store8();
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+    c.localGet(CUR);
+    c.localGet(LEN);
+    c.i32Add();
+    c.globalSet(this.cursorGlobal);
+    this.mb.setBody(idx, [I32, I32, I32, I32], c.bytes());
+    return idx;
   }
 
   /* ── the scalar runtime, emitted on first use ───────────────────────────

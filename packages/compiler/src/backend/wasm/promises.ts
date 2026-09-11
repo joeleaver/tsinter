@@ -70,6 +70,46 @@ export interface PromiseDeps {
   /** The output staging trio (stage/putc/flush) the report writes with. */
   out: () => { stage: number; putc: number; flush: number };
   lit: (c: Code, s: string) => void;
+  /** INC-26 P1 drain site 6/6 (design §4.4): pushes code 1 and drains the
+   * 'exit' listeners — emitter.ts's `%w.proc.exitDrain`, composed into one
+   * zero-argument closure (the code is always 1 here, unlike
+   * timers.ts's `drainAtQuiescence`, which needs 0-or-13) so this file
+   * never needs to know the drain helper exists. A no-op for a module
+   * that never reaches process.exit/onExit/offExit (emitter.ts's static
+   * `needsExitDrain` prescan gates it, not this file). */
+  exitDrainFatal: (c: Code) => void;
+  /** INC-26 P1 (§3.2, process.onUnhandledRejection): the DEFAULT report
+   * (`fallback`, a JS closure that emits `emitReport`'s OWN bytecode when
+   * invoked during code generation — never a runtime call) is what this
+   * file did unconditionally before P1; now it is what happens ONLY when
+   * no listener is registered. `p`/`k` are the SAME locals `emitReport`
+   * itself would use, so `fallback` can reference them directly. A no-op
+   * wrapper (calls `fallback()` immediately) for a module that never
+   * reaches process.onUnhandledRejection (emitter.ts's static
+   * `needsUnhandledRejectionDispatch` prescan gates the real branch). */
+  dispatchOrReport: (c: Code, p: number, k: number, fallback: () => void) => void;
+  /** RULING P1-R5 (supersedes P1-R3's inline-at-attach shape): fire every
+   * registered `process.on("rejectionHandled", ...)` listener with a
+   * freshly-boxed dyn value — called from `drainPendingHandled` ONCE PER
+   * QUEUED PROMISE, never from `subscribe`/`subscribeHandled` directly
+   * anymore (the read-and-clear of `PROM_REPORTED_UNHANDLED` and the
+   * enqueue onto the FIFO both live in THIS file now, needing no DI hook
+   * — they touch only `promT` fields this file already owns). Takes no
+   * promise argument: the dyn boxing is a fresh generic object regardless
+   * (unchanged since P1-R3), so this file never needs to know the
+   * listener list or the dyn boxing exist, only how many times and in
+   * what order to call. A no-op for a module that never reaches
+   * `process.onRejectionHandled` (emitter.ts's static
+   * `needsRejectionHandledDispatch` prescan gates the real branch). */
+  fireRejectionHandled: (c: Code) => void;
+  /** RULING P1-R5: a plain TypeScript-level boolean (not a wasm value) —
+   * emitter.ts's static `needsRejectionHandledDispatch` prescan, threaded
+   * through so `subscribe`'s rejected branch can skip emitting the
+   * check-and-clear-and-enqueue machinery ENTIRELY for a module that
+   * never reaches `process.onRejectionHandled` (pays nothing for it,
+   * same discipline as every other static gate in this pass), rather
+   * than emitting always-false dead code. */
+  needsRejectionHandled: () => boolean;
 }
 
 /* promT's fields. The first four and `observed` are exported because the
@@ -90,6 +130,21 @@ const P_NEXT = 7; // the maybe-unhandled ledger's intrusive link
  * object. Appended rather than placed beside the other payload fields so
  * no existing index moves. */
 export const PROM_PRE = 8;
+/** RULING P1-R3: was this rejection REPORTED as unhandled while nobody
+ * had a reaction attached — distinct from `PROM_OBSERVED` (which ALSO
+ * becomes 1 the instant any reaction attaches, `subscribeHandled`'s own
+ * unconditional mark, and would otherwise make "was this ever reported"
+ * unrecoverable by the time a later handler asks). Set ONLY at the one
+ * place `report()`'s ledger walk hands a rejection to a registered
+ * `onUnhandledRejection` listener instead of trapping (emitter.ts's
+ * `dispatchOrReport` closure) — the DEFAULT (no-listener) path traps
+ * immediately, so no later code could ever attach a handler anyway, and
+ * the module ROOT's own rejection is marked OBSERVED at birth and never
+ * reaches the ledger walk, so it never reaches this field either (Node's
+ * own rule: a top-level-await rejection is not this event's subject).
+ * Read and CLEARED (fire-once) by `subscribe`/`subscribeHandled` — the
+ * two places a handler can attach. */
+export const PROM_REPORTED_UNHANDLED = 9;
 
 /* waiterT's fields — one node type, used both for a promise's own waiter
  * list and for the microtask queue (a node moves between them). */
@@ -195,7 +250,8 @@ export class PromiseBuilder {
         { storage: waiter, mutable: true },
         { storage: I32, mutable: true },
         { storage: { kind: "ref", nullable: true, typeIndex: self }, mutable: true },
-        { storage: I32, mutable: true },
+        { storage: I32, mutable: true }, // PROM_PRE (8)
+        { storage: I32, mutable: true }, // PROM_REPORTED_UNHANDLED (9), P1-R3
       ]);
     }
     return this.promTField;
@@ -335,6 +391,38 @@ export class PromiseBuilder {
         c.localGet(P);
         c.i32Const(1);
         c.structSet(this.promT, PROM_OBSERVED);
+        // RULING P1-R5 (supersedes P1-R3's inline-fire shape): this
+        // landing is exactly "a handler attached to a rejected promise"
+        // — if the ledger walk already handed it to a registered
+        // onUnhandledRejection listener (dispatchOrReport), Node's own
+        // rejectionHandled event is CHECKPOINT-relative, not reaction-
+        // relative (measured: it fires after the TURN's remaining
+        // microtasks/nextTicks drain, in a HANDLED pass that runs BEFORE
+        // the unhandled pass — see emitCheckpointCore's own
+        // drainPendingHandled call). So: read-and-clear
+        // PROM_REPORTED_UNHANDLED here (fire-once, UNCHANGED from P1-R3 —
+        // only the ATTACH site's OWN action changed) and ENQUEUE `p` onto
+        // the FIFO instead of firing inline; the checkpoint drains it
+        // later, in FIFO/attach order. `subscribeHandled` (combinators)
+        // reaches here too, via its own unconditional call into
+        // `subscribe` below — one check covers both entry points. Gated
+        // on the TS-level `needsRejectionHandled` static fact (not a wasm
+        // `ifVoid`) — a module that never reaches
+        // `process.onRejectionHandled` emits NONE of this, same
+        // pays-nothing discipline the rest of this pass follows; a stray
+        // `PROM_REPORTED_UNHANDLED=1` sitting unread in that case is
+        // harmless (nothing left in the module ever looks at it).
+        if (this.deps.needsRejectionHandled()) {
+          c.localGet(P);
+          c.structGet(this.promT, PROM_REPORTED_UNHANDLED);
+          c.ifVoid();
+          c.localGet(P);
+          c.i32Const(0);
+          c.structSet(this.promT, PROM_REPORTED_UNHANDLED);
+          c.localGet(P);
+          c.call(this.enqueuePendingHandled());
+          c.end();
+        }
         c.end();
         c.localGet(CLOS);
         c.localGet(FRAME);
@@ -373,6 +461,123 @@ export class PromiseBuilder {
       c.localGet(FRAME);
       c.call(subscribe);
       this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  /* ── the rejectionHandled FIFO (RULING P1-R5) ───────────────────────────
+   * Node's `rejectionHandled` is CHECKPOINT-relative: it fires from a
+   * HANDLED pass that runs AFTER the current turn's microtasks/nextTicks
+   * have drained, BEFORE the unhandled pass, in FIFO (attach) order —
+   * measured directly (rev-26's five-probe preread, this ruling): a late
+   * `.catch()`'s own reaction output, and even an unrelated
+   * `queueMicrotask`, print BEFORE the event; a per-promise "after this
+   * reaction resumes" hook is not needed or built. `subscribe`'s rejected
+   * branch (above) enqueues here instead of firing inline;
+   * `drainPendingHandled` (below), called from `emitCheckpointCore`
+   * itself, does the actual firing — this file owns both ends since the
+   * FIFO's payload is a `promRef`, a type only this file has. */
+  private pendingHandledTField: number | null = null;
+  private get pendingHandledT(): number {
+    if (this.pendingHandledTField === null) {
+      this.pendingHandledTField = this.mb.selfStructType("%w.async.pendingHandled", (self) => [
+        { storage: this.promRef(), mutable: false },
+        { storage: { kind: "ref", nullable: true, typeIndex: self }, mutable: true },
+      ]);
+    }
+    return this.pendingHandledTField;
+  }
+  private pendingHandledRef(): ValType {
+    return { kind: "ref", nullable: true, typeIndex: this.pendingHandledT };
+  }
+  private pendingHandledHeadGlobal: number | null = null;
+  private pendingHandledTailGlobal: number | null = null;
+  private pendingHandledHeadG(): number {
+    if (this.pendingHandledHeadGlobal === null) {
+      this.pendingHandledHeadGlobal = this.mb.addGlobal(this.pendingHandledRef(), true, (w) => {
+        w.u8(0xd0);
+        w.sleb(this.pendingHandledT);
+      });
+    }
+    return this.pendingHandledHeadGlobal;
+  }
+  private pendingHandledTailG(): number {
+    if (this.pendingHandledTailGlobal === null) {
+      this.pendingHandledTailGlobal = this.mb.addGlobal(this.pendingHandledRef(), true, (w) => {
+        w.u8(0xd0);
+        w.sleb(this.pendingHandledT);
+      });
+    }
+    return this.pendingHandledTailGlobal;
+  }
+
+  /** %w.async.enqueuePendingHandled(p: promRef) — append at the tail,
+   * `onExitAppend`/`onUnhandledRejectionAppend`'s exact FIFO shape
+   * (process.ts) — the third use of this pattern in the codebase, not a
+   * new one invented for this ruling. */
+  private enqueuePendingHandled(): number {
+    return this.cached("enqueuePendingHandled", () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.promRef()], []), "%w.async.enqueuePendingHandled");
+      const c = new Code();
+      const P = 0, NODE = 1;
+      c.localGet(P);
+      c.refNull(this.pendingHandledT);
+      c.structNew(this.pendingHandledT);
+      c.localSet(NODE);
+      c.globalGet(this.pendingHandledTailG());
+      c.refIsNull();
+      c.ifVoid();
+      c.localGet(NODE);
+      c.globalSet(this.pendingHandledHeadG());
+      c.else_();
+      c.globalGet(this.pendingHandledTailG());
+      c.localGet(NODE);
+      c.structSet(this.pendingHandledT, 1);
+      c.end();
+      c.localGet(NODE);
+      c.globalSet(this.pendingHandledTailG());
+      this.mb.setBody(idx, [this.pendingHandledRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.async.drainPendingHandled() — fire every queued promise's
+   * `rejectionHandled` listeners, in FIFO/attach order, then empty the
+   * queue. Called from `emitCheckpointCore`, AFTER the turn's
+   * microtask/nextTick drain loop exhausts and BEFORE `report()` — Node's
+   * own HANDLED-before-unhandled pass order. Each node's OWN promRef is
+   * read but not otherwise used: `deps.fireRejectionHandled`'s dyn boxing
+   * is a fresh generic object regardless of which promise triggered it
+   * (unchanged from P1-R3 — this ruling moved WHEN the call happens, not
+   * WHAT it boxes or WHO it calls), so the walk exists to fire the
+   * correct NUMBER of times, in the correct ORDER, not to hand anything
+   * promise-specific downstream. A no-op when the queue is empty (the
+   * common case — most modules never populate it), one `ref.is_null`
+   * check. */
+  drainPendingHandled(): number {
+    return this.cached("drainPendingHandled", () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([], []), "%w.async.drainPendingHandled");
+      const c = new Code();
+      const CUR = 0;
+      c.globalGet(this.pendingHandledHeadG());
+      c.localSet(CUR);
+      c.refNull(this.pendingHandledT);
+      c.globalSet(this.pendingHandledHeadG());
+      c.refNull(this.pendingHandledT);
+      c.globalSet(this.pendingHandledTailG());
+      c.block();
+      c.loop();
+      c.localGet(CUR);
+      c.refIsNull();
+      c.brIf(1);
+      this.deps.fireRejectionHandled(c);
+      c.localGet(CUR);
+      c.structGet(this.pendingHandledT, 1);
+      c.localSet(CUR);
+      c.br(0);
+      c.end();
+      c.end();
+      this.mb.setBody(idx, [this.pendingHandledRef()], c.bytes());
       return idx;
     });
   }
@@ -592,6 +797,12 @@ export class PromiseBuilder {
    * ledger walk (report) and the module ROOT's own stop-and-trap
    * (rootReport) render through here, so the two lines cannot drift. */
   private emitReport(c: Code, p: number, k: number): void {
+    // INC-26 P1 drain site 6/6 (design §4.4): INSIDE this function, at the
+    // top, before anything renders — covers BOTH callers (the ledger
+    // walk's `report()` and the TLA root's `rootReport()`) by construction.
+    // Fatal path: code is always 1 (an unhandled rejection is always
+    // exit-1, S010).
+    this.deps.exitDrainFatal(c);
     const out = this.deps.out();
     const tags = this.deps.tags;
     this.deps.lit(c, "Unhandled promise rejection: ");
@@ -723,7 +934,12 @@ export class PromiseBuilder {
       c.i32Eqz();
       c.i32And();
       c.ifVoid();
-      this.emitReport(c, P, K);
+      // INC-26 P1 (§3.2): a registered onUnhandledRejection listener
+      // takes over from here — the default report/trap is the FALLBACK,
+      // not rootReport's own path (design: the module ROOT's rejection is
+      // marked observed at birth and never reaches this ledger walk at
+      // all, so it is unaffected and stays wired to `emitReport` directly).
+      this.deps.dispatchOrReport(c, P, K, () => this.emitReport(c, P, K));
       c.end();
       c.localGet(P);
       c.structGet(this.promT, P_NEXT);

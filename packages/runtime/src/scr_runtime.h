@@ -1942,7 +1942,7 @@ void scr_exc_print_uncaught(void);
  * BEFORE the RC audit runs (atexit is LIFO; scr_init registered the audit
  * earlier). scriptc argv shape: ["scriptc", argv[0], argv[1], ...] so
  * positions and length line up with Node's [node-path, script-path, ...args]
- * — the argv[0]/argv[1] VALUES diverge (see SEMANTICS.md).
+ * — the argv[0]/argv[1] VALUES diverge (SEMANTICS.md S070).
  */
 void scr_lib_init(int argc, char **argv);
 

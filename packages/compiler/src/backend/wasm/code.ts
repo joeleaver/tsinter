@@ -131,6 +131,19 @@ export class Code {
     this.w.uleb(0); // alignment (2^0 — byte access)
     this.w.uleb(0); // offset
   }
+  /** i32.load16_u — zero-extends a 16-bit little-endian read from linear
+   * memory to i32. INC-26 P1's first INBOUND read: every prior instruction
+   * in this file only ever WRITES to memory (the host reads it back on the
+   * JS side); hostStr's contract is the host WRITING UTF-16 code units into
+   * memory for the module to read back, which needs an actual load for the
+   * first time. Alignment 0 (no alignment claimed), matching i32Store8's
+   * own conservative stance — the dynamic address this pairs with is not
+   * guaranteed 2-byte aligned by construction. */
+  i32Load16U(): void {
+    this.w.u8(0x2f);
+    this.w.uleb(0); // alignment (none claimed)
+    this.w.uleb(0); // offset
+  }
   memorySize(): void {
     this.w.u8(0x3f);
     this.w.uleb(0);

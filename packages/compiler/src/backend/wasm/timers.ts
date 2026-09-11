@@ -87,6 +87,19 @@ export interface TimerDeps {
    * nothing here, which is what keeps a timer-only program free of the
    * promise runtime. */
   checkpoint: (c: Code) => void;
+  /** INC-26 P1 (design §4.3(b)/§4.2): pushes `_status`'s own 0/13 verdict
+   * then drains the 'exit' listeners with it — emitter.ts's
+   * `emitCurrentStatusCode` + `%w.proc.exitDrain` composed into ONE
+   * closure so this file never needs to know either exists. Called at
+   * BOTH of `%w.tick`'s -1 (quiescent) return sites below — they are
+   * structurally different (an early `return` inside a nested `if` vs.
+   * the function's own implicit tail value), which is exactly why this
+   * is a closure invoked at each site rather than one shared code path:
+   * getting the surrounding control flow right at each site is this
+   * file's job, not the drain's. A module that never reaches
+   * `process.exit`/`onExit`/`offExit` gets a no-op here (emitter.ts
+   * gates the whole call away for such a module). */
+  drainAtQuiescence: (c: Code) => void;
 }
 
 /* timerT's fields. Deadline, seq and reffed are MUTABLE: a re-armed
@@ -1297,6 +1310,10 @@ export class TimerBuilder {
       c.i32Eqz();
       c.i32And();
       c.ifVoid();
+      // INC-26 P1 drain site 2/6: quiescent (nothing ref'd left) — the
+      // early return taken when neither timers nor immediates hold the
+      // loop. `_status`'s own 0/13 verdict, then the 'exit' listeners.
+      this.deps.drainAtQuiescence(c);
       c.f64Const(-1);
       c.return_();
       c.end();
@@ -1318,6 +1335,11 @@ export class TimerBuilder {
       c.structGet(this.timerT, T_DEADLINE);
       c.return_();
       c.end();
+      // INC-26 P1 drain site 3/6: quiescent — the fall-through at the
+      // very end (this function's own implicit tail value), structurally
+      // different from site 2 above (no enclosing `if`, no explicit
+      // `return_`) but the SAME verdict and the SAME drain call.
+      this.deps.drainAtQuiescence(c);
       c.f64Const(-1);
       this.mb.setBody(idx, [this.timerRef(), this.immRef(), this.immRef()], c.bytes());
       return idx;

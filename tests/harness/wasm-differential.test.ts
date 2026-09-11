@@ -3155,6 +3155,46 @@ const TIER_FLOOR: string[] = [
   "2427-perf-hooks-now.ts",
   "2446-performance-global.ts",
   "2562-intl-numberformat-en-us.ts",
+
+  // INC-26 pass P1 (design-host-v7.txt cccf7d6e §2.2-§2.5/§3.2/§4;
+  // DECISIONS.md D2/D3; cp1-plan-p1.txt 70a46350). The process host
+  // contract: `hostStr`/`hostNum`/`exit`, the argv+env snapshots (one
+  // interned string vec for argv, two parallel string vecs for env), cwd,
+  // platform, the raw writes (stdoutWrite/stderrWrite/stdoutWriteBytes),
+  // the 'exit' listener list and its drain at all six insertion points
+  // (process.exit's own arm; %w.tick's two -1 sites; _start's tail for a
+  // no-`_tick` module; reportUncaughtHelper's top; promises.ts's
+  // emitReport top, covering both report()/rootReport() callers), the
+  // DYN-typed unhandledRejection listeners (onUnhandledRejection/
+  // offUnhandledRejection dispatch through the ledger walk's own
+  // report(), suppressing the default trap when a listener is
+  // registered; onRejectionHandled built as REGISTRATION ONLY — reached
+  // by no program, per D10), S070. 846 -> 871.
+  "1405-bytes-unions-arrays.ts",
+  "1436-default-undef-param.ts",
+  "1444-exit-listeners.ts",
+  "1445-exit-process-exit.ts",
+  "1446-exit-uncaught.ts",
+  "1460-console-error-warn.ts",
+  "1465-env-value.ts",
+  "1477-in-expressions.ts",
+  "1528-delete-records-env.ts",
+  "1541-union-keyed-reads.ts",
+  "1559-conditional-spread-index-merge.ts",
+  "2035-ternary-array-retag.cjs",
+  "2212-unhandled-rejection-listener.cjs",
+  "2310-process-next-tick.ts",
+  "2383-cycle-assertdoc/main.js",
+  "2387-tonumber-argv.ts",
+  "240-stdout-write.ts",
+  "2441-console-process-argv.ts",
+  "2616-js-collect-probe-defers.js",
+  "2643-or-default-retag.ts",
+  "2665-top-level-await-unhandled-listener-liveness.ts",
+  "978-unions-nullish.ts",
+  "990-process-basics.ts",
+  "991-process-exit.ts",
+  "998-process-env.ts",
 ];
 
 interface RunResult {
@@ -3281,12 +3321,43 @@ async function runNode(file: string): Promise<RunResult> {
  * non-deterministic ("bound by the performance of the process"), so no
  * corpus program may pin it — 1804 arms its immediates and timers inside
  * one root timer for exactly this reason. */
+/** INC-26 P1's own sentinel class for `tsinter.exit` (abi.ts §2.5): the
+ * host TERMINATES by throwing this, recognised BEFORE the RuntimeError
+ * test below (a wasm trap and an exit are different channels — S007/S010
+ * vs. the new nonzero-exit-without-a-trap channel abi.ts documents). */
+class WasmExitSignal extends Error {
+  constructor(readonly code: number) {
+    super(`tsinter.exit(${code})`);
+  }
+}
+
 async function runWasm(modulePath: string): Promise<RunResult> {
   const chunks: { 1: Buffer[]; 2: Buffer[] } = { 1: [], 2: [] };
   let memory: WebAssembly.Memory | null = null;
   let clock = 0;
   // wallBase, sampled ONCE per run, BEFORE instantiation (INC-25 P6, C-4).
   const wallBase = Date.now();
+  // INC-26 P1 (design §3G, S070): argv = ["scriptc", <the module path>] —
+  // TWO non-empty strings, matching the native lanes' own shape (S070's
+  // register entry). env = THIS harness process's real environment,
+  // snapshotted ONCE per run (matching the module's own once-at-first-
+  // touch snapshot contract, D2) — already carrying
+  // SCRIPTC_TEST_ENV=from-harness from this file's own module-load-time
+  // assignment above (line 61), so 998/1465's value-exact pins hold
+  // without any extra wiring here.
+  const argv: readonly string[] = ["scriptc", modulePath];
+  const envPairs: readonly (readonly [string, string])[] = Object.entries(process.env).filter(
+    (e): e is [string, string] => e[1] !== undefined,
+  );
+  const platform = process.platform;
+  const cwd = process.cwd();
+  const writeUtf16 = (s: string, ptr: number, cap: number): number => {
+    const len = s.length;
+    if (len > cap) return len;
+    const view = new Uint16Array(memory!.buffer, ptr, len);
+    for (let i = 0; i < len; i++) view[i] = s.charCodeAt(i);
+    return len;
+  };
   const { instance } = await WebAssembly.instantiate(readFileSync(modulePath), {
     tsinter: {
       write(fd: number, ptr: number, len: number): void {
@@ -3309,6 +3380,47 @@ async function runWasm(modulePath: string): Promise<RunResult> {
       // where Node prints `true` for that exact assertion. `wallBase`
       // is real (sampled once, above) so 1422's window rows still hold.
       wallClock: (): number => wallBase + clock,
+      // INC-26 P1 (abi.ts §2.2/§2.4/§3G): every HOST-FACT string, by kind
+      // (abi.ts's own kind table — argv=0, envKey=1, envValue=2, cwd=3,
+      // platform=4; kinds this pass does not consume are unreachable
+      // here, since the module never mints hostStr unless it needs one
+      // of these). `index` past the end answers -1 ("no such datum"),
+      // abi.ts's own contract, distinct from an empty string (len 0).
+      hostStr(kind: number, index: number, ptr: number, cap: number): number {
+        if (memory === null) throw new Error("hostStr before instantiation completed");
+        switch (kind) {
+          case 0:
+            return index < 0 || index >= argv.length ? -1 : writeUtf16(argv[index]!, ptr, cap);
+          case 1:
+            return index < 0 || index >= envPairs.length ? -1 : writeUtf16(envPairs[index]![0], ptr, cap);
+          case 2:
+            return index < 0 || index >= envPairs.length ? -1 : writeUtf16(envPairs[index]![1], ptr, cap);
+          case 3:
+            return writeUtf16(cwd, ptr, cap);
+          case 4:
+            return writeUtf16(platform, ptr, cap);
+          default:
+            throw new Error(`hostStr: unknown kind ${kind}`);
+        }
+      },
+      // abi.ts's hostNum kind table — argc=0, env pair count=1. Kinds
+      // this pass does not mint are unreachable for the same reason.
+      hostNum(kind: number): number {
+        switch (kind) {
+          case 0:
+            return argv.length;
+          case 1:
+            return envPairs.length;
+          default:
+            throw new Error(`hostNum: unknown kind ${kind}`);
+        }
+      },
+      // abi.ts §2.5: the host TERMINATES by throwing a sentinel the catch
+      // below recognises BEFORE the RuntimeError test — a trap and an
+      // exit are different channels.
+      exit(code: number): void {
+        throw new WasmExitSignal(code);
+      },
     },
   });
   memory = instance.exports["memory"] as WebAssembly.Memory;
@@ -3343,6 +3455,11 @@ async function runWasm(modulePath: string): Promise<RunResult> {
       };
     }
   } catch (err) {
+    // INC-26 P1: an explicit process.exit(n) reports its OWN code — BEFORE
+    // the RuntimeError test, since this is not a trap at all.
+    if (err instanceof WasmExitSignal) {
+      return { stdout: Buffer.concat(chunks[1]), stderr: Buffer.concat(chunks[2]), exitCode: err.code };
+    }
     // A wasm TRAP is the tier's stand-in for an uncaught runtime error
     // (S003's index traps, until the exception protocol lands): Node
     // exits 1 on an uncaught exception, so a trap reports exit 1 with
