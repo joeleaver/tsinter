@@ -133,6 +133,7 @@ import { UrlBuilder } from "./url.js";
 import { UriBuilder } from "./uri.js";
 import { DateBuilder } from "./date.js";
 import { ProcessBuilder } from "./process.js";
+import { PathBuilder } from "./path.js";
 import { MapBuilder, type MapInfo, type MapKeyKind, type MapValKind } from "./maps.js";
 import { JsonBuilder, jsonQuote } from "./json.js";
 import {
@@ -459,7 +460,16 @@ function perfNowReachable(mod: WModule): boolean {
  * envPairs all share the prefix) plus an exact match on "process.cwd" and
  * "process.platform" — the same over-approximating shape as every prescan
  * above (an unused import in a refusing module costs nothing; missing one
- * would be an emitter bug). */
+ * would be an emitter bug). INC-26 P2 adds "path.resolve"/"path.
+ * win32Resolve" AND "path.relative"/"path.win32Relative" — the FOUR path
+ * keys that read the cwd, through PathBuilder's own `cwdSnapshot()` memo
+ * (D2 ERRATUM 1): `relative`/`win32Relative` call `resolve`/`win32Resolve`
+ * internally on BOTH arguments (scr_path.c's own scr_path_relative/
+ * scr_path_win32_relative), so a program calling ONLY `path.relative`
+ * (never `path.resolve` directly) still reaches the cwd snapshot — caught
+ * by the 3D three-way oracle as a real "tsinter.hostStr was never
+ * imported" crash on `path.posix.relative("a","ab")` before this fix.
+ * Every OTHER path key needs no host fact at all. */
 function hostStrReachable(mod: WModule): boolean {
   const reachable = reachableFunctionNames(mod);
   let found = false;
@@ -470,7 +480,11 @@ function hostStrReachable(mod: WModule): boolean {
         node.startsWith("process.argv") ||
         node.startsWith("process.env") ||
         node === "process.cwd" ||
-        node === "process.platform"
+        node === "process.platform" ||
+        node === "path.resolve" ||
+        node === "path.win32Resolve" ||
+        node === "path.relative" ||
+        node === "path.win32Relative"
       ) {
         found = true;
       }
@@ -5858,6 +5872,30 @@ class Assembler {
       },
     });
     return this.procField;
+  }
+
+  private pathField: PathBuilder | null = null;
+
+  /** INC-26 pass P2's own builder (path.ts) — scr_path.c's posix/win32
+   * families, transcribed. Structurally new (its own `cached()` memo,
+   * its own `%w.path.*` prefix). `readHostStr` reuses process.ts's
+   * existing accessor for the ONE cwd read `resolve`/`win32Resolve`
+   * need (D2 ERRATUM 1 — path.ts owns the once-per-instantiation
+   * memo, process.ts itself has no cwd cache); the string-vec deps are
+   * the SAME `arrayOf(STRING)` VecInfo process.ts's argv already uses. */
+  private get path(): PathBuilder {
+    this.pathField ??= new PathBuilder(this.mb, {
+      strRef: () => this.strRef,
+      strType: () => this.strType,
+      readHostStr: () => this.proc.readHostStr(),
+      strEq: () => this.strEqHelper(),
+      stringVecInfo: () => this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!,
+      stringVecRef: () => this.vecs.vecRef(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
+      stringVecGet: () => this.vecs.get(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
+      stringVecNewLen: () => this.vecs.newLen(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
+      stringVecSet: () => this.vecs.set(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
+    });
+    return this.pathField;
   }
 
   /** `this.wallClockFunc`, or a descriptive throw — the constructor's own
@@ -12732,6 +12770,109 @@ class Assembler {
           return;
         }
         // ── end INC-26 P1 ──────────────────────────────────────────────
+        // ── INC-26 pass P2 (brief-p2-v2.md 89fd68aa; design-host-v7.txt
+        // cccf7d6e §3.1/§5) — the path family: the nine posix keys and
+        // their nine win32 twins, transcribed from scr_path.c. NO new
+        // import, NO register entry; resolve/win32Resolve read the cwd
+        // through P1's process.ts readHostStr accessor via PathBuilder's
+        // own snapshot cache (path.ts, NEW). Dispatch arms land here,
+        // between P1's block and the cross-file libCall fallbacks below.
+        // 871 -> 880.
+        if (e.fn === "path.join") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.path.joinHelper());
+          return;
+        }
+        if (e.fn === "path.resolve") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.path.resolveHelper());
+          return;
+        }
+        if (e.fn === "path.normalize") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.path.normalizeHelper());
+          return;
+        }
+        if (e.fn === "path.dirname") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.path.dirnameHelper());
+          return;
+        }
+        if (e.fn === "path.basename") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.path.basenameHelper());
+          return;
+        }
+        if (e.fn === "path.extname") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.path.extnameHelper());
+          return;
+        }
+        if (e.fn === "path.isAbsolute") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.path.isAbsoluteHelper());
+          return;
+        }
+        if (e.fn === "path.relative") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.path.relativeHelper());
+          return;
+        }
+        if (e.fn === "path.toNamespacedPath") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.path.toNamespacedPathHelper());
+          return;
+        }
+        if (e.fn === "path.win32Join") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.path.win32JoinHelper());
+          return;
+        }
+        if (e.fn === "path.win32Resolve") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.path.win32ResolveHelper());
+          return;
+        }
+        if (e.fn === "path.win32Normalize") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.path.win32NormalizeHelper());
+          return;
+        }
+        if (e.fn === "path.win32Dirname") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.path.win32DirnameHelper());
+          return;
+        }
+        if (e.fn === "path.win32Basename") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.path.win32BasenameHelper());
+          return;
+        }
+        if (e.fn === "path.win32Extname") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.path.win32ExtnameHelper());
+          return;
+        }
+        if (e.fn === "path.win32IsAbsolute") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.path.win32IsAbsoluteHelper());
+          return;
+        }
+        if (e.fn === "path.win32Relative") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.path.win32RelativeHelper());
+          return;
+        }
+        if (e.fn === "path.win32ToNamespacedPath") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.path.win32ToNamespacedPathHelper());
+          return;
+        }
+        // ── end INC-26 P2 ──────────────────────────────────────────────
         if (this.emitBufferLibCall(e)) return;
         if (this.emitTimerCall(e)) return;
         if (this.emitEmitterLibCall(e)) return;

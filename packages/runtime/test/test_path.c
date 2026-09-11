@@ -130,6 +130,47 @@ int main(int argc, char **argv) {
     }
 
     ScrStr *result = NULL;
+    int posix = 0;
+    if (op[0] == 'p' && op[1] == ':') { posix = 1; op += 2; }
+    if (posix) {
+      if (strcmp(op, "normalize") == 0) {
+        result = scr_path_normalize(args[0]);
+      } else if (strcmp(op, "dirname") == 0) {
+        result = scr_path_dirname(args[0]);
+      } else if (strcmp(op, "basename") == 0) {
+        ScrStr *empty = scr_str_new("", 0);
+        result = scr_path_basename(args[0], empty);
+        scr_str_release(empty);
+      } else if (strcmp(op, "basenameSuffix") == 0) {
+        result = scr_path_basename(args[0], args[1]);
+      } else if (strcmp(op, "extname") == 0) {
+        result = scr_path_extname(args[0]);
+      } else if (strcmp(op, "toNamespacedPath") == 0) {
+        result = scr_path_to_namespaced_path(args[0]);
+      } else if (strcmp(op, "isAbsolute") == 0) {
+        const char *s = scr_path_is_absolute(args[0]) ? "true" : "false";
+        check(op, args, nargs, s, strlen(s), expbuf, explen);
+      } else if (strncmp(op, "join", 4) == 0) {
+        ScrArr *pack = pack_args(args, nargs);
+        result = scr_path_join(pack);
+        scr_arr_release(pack);
+      } else if (strncmp(op, "resolve", 7) == 0) {
+        ScrArr *pack = pack_args(args, nargs);
+        result = scr_path_resolve(pack);
+        scr_arr_release(pack);
+      } else if (strcmp(op, "relative") == 0) {
+        result = scr_path_relative(args[0], args[1]);
+      } else {
+        fprintf(stderr, "unknown posix op: %s\n", op);
+        return 2;
+      }
+      if (result != NULL) {
+        check(op, args, nargs, result->data, result->len, expbuf, explen);
+        scr_str_release(result);
+      }
+      for (int i = 0; i < nargs; i++) scr_str_release(args[i]);
+      continue;
+    }
     if (strcmp(op, "normalize") == 0) {
       result = scr_path_win32_normalize(args[0]);
     } else if (strcmp(op, "dirname") == 0) {

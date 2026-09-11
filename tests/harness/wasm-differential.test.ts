@@ -3195,6 +3195,29 @@ const TIER_FLOOR: string[] = [
   "990-process-basics.ts",
   "991-process-exit.ts",
   "998-process-env.ts",
+
+  // INC-26 pass P2 (brief-p2-v2.md 89fd68aa §3F; design-host-v7.txt
+  // cccf7d6e §3.1/§5; cp1-plan-p2.txt 3a5721e2). The path family: both
+  // posix and win32 halves (nine mirror pairs, 18 keys total) transcribed
+  // from scr_path.c into the tier's own `(array i16)` string idiom — a
+  // pure TRANSCRIPTION, no new import, no register entry (uri.ts / INC-25
+  // P5's own precedent); `resolve`/`win32Resolve`/`relative`/
+  // `win32Relative` read P1's cwd snapshot through process.ts's existing
+  // accessor, never a fresh hostStr call per invocation. The 105-
+  // occurrence short-circuit audit (findings-p2.txt) and the three-way
+  // oracle (packages/compiler/test/wasm-path-oracle.test.ts, 41448 posix
+  // + 38214 win32 committed cases, Node vs the C port vs this emitted
+  // module) are this pass's own second instrument, run continuously as
+  // part of this package's suite rather than as a manual step. 871 -> 880.
+  "1350-path-normalize-join.ts",
+  "1351-path-parts.ts",
+  "1352-path-resolve-relative.ts",
+  "1533-path-platform-namespaces.ts",
+  "1598-cjs-builtin-require/main.js",
+  "1610-path-win32-full.ts",
+  "1629-require-main-filename.cjs",
+  "2166-cjs-getter-this/main.cjs",
+  "2637-create-require-bare/main.ts",
 ];
 
 interface RunResult {
