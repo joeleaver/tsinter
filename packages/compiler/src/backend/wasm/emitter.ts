@@ -75,6 +75,7 @@ import {
   arrayOf,
   STRING,
   BYTES_U8,
+  F64 as IR_F64,
 } from "../../ir/nodes.js";
 import { computeMayThrow } from "../emission/may-throw.js";
 import { buildClassGraph, type LlClassMeta, type LlVtSlot } from "../llvm/classes.js";
@@ -116,11 +117,14 @@ import {
   HOST_STR_KIND_ENV_KEY,
   HOST_STR_KIND_ENV_VALUE,
   HOST_STR_KIND_EXEC_PATH,
+  HOST_STR_KIND_OS_HOMEDIR,
+  HOST_STR_KIND_OS_TMPDIR,
   HOST_STR_KIND_PLATFORM,
   HOST_STR_KIND_VERSIONS_NODE,
   HOST_STR_KIND_VERSIONS_OPENSSL,
   IMPORT_CHDIR,
   IMPORT_EXIT,
+  IMPORT_FS_CALL,
   IMPORT_HOST_NUM,
   IMPORT_HOST_STR,
   IMPORT_KILL,
@@ -154,6 +158,7 @@ import { UriBuilder } from "./uri.js";
 import { DateBuilder } from "./date.js";
 import { ProcessBuilder } from "./process.js";
 import { PathBuilder } from "./path.js";
+import { FsBuilder } from "./fs.js";
 import { MapBuilder, type MapInfo, type MapKeyKind, type MapValKind } from "./maps.js";
 import { JsonBuilder, jsonQuote } from "./json.js";
 import {
@@ -539,7 +544,16 @@ function hostStrReachable(mod: WModule): boolean {
         node === "process.execPath" ||
         node === "process.versionsNode" ||
         node === "process.versionsOpenssl" ||
-        node === "process.chdir"
+        node === "process.chdir" ||
+        // INC-26 P4 (design-host-v7.txt §3.5, abi.ts kinds 8/9): os.tmpdir
+        // and os.homedir are the pass's ONLY hostStr consumers — none of
+        // the 13 fs.* keys touches hostStr at all (fsCall stages paths
+        // OUTBOUND via its own stageStrUtf16-shaped writes, never through
+        // readHostStr; the UNKNOWN arm's text is a MODULE CONSTANT, A-11 —
+        // no hostStr kind 17 round trip). Confirmed by reading every P4 arm
+        // (fs.ts's own builder), not assumed from this table alone.
+        node === "os.tmpdir" ||
+        node === "os.homedir"
       ) {
         found = true;
       }
@@ -732,16 +746,71 @@ function chdirReachable(mod: WModule): boolean {
   return found;
 }
 
-/** Does any reachable function call `process.umask`? INC-26 P3
- * (design-host-v7.txt §0.5 W4) — `umask`'s minting condition, an exact
- * match, `exitReachable`'s shape. */
+/** Does any reachable function call `process.umask` OR `process.umaskRead`?
+ * INC-26 P3 (design-host-v7.txt §0.5 W4); INC-26 P4 (board #142) ADDS
+ * `process.umaskRead` — the SAME import serves the SET and READ forms
+ * (both arms call `tsinter.umask`, differing only in the `isRead`
+ * argument), so a program reaching EITHER key needs it, exactly the
+ * `killReachable` precedent (`process.kill` OR `process.killNum`, one
+ * import). BUG FOUND BY THE P3 FORCED-HOST SUITE (wasm-host-process-p3.
+ * test.ts's own umask read-form row): the prescan matched only the SET
+ * key's name after R-C split the 0-ary form into its own IrLibFn, so a
+ * 0-ary-only program never minted the import and crashed at
+ * `umaskFuncOrThrow`. */
 function umaskReachable(mod: WModule): boolean {
   const reachable = reachableFunctionNames(mod);
   let found = false;
   const scan = (node: unknown): void => {
     if (found) return;
     if (typeof node === "string") {
-      if (node === "process.umask") found = true;
+      if (node === "process.umask" || node === "process.umaskRead") found = true;
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      for (const value of Object.values(node)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn.body);
+  }
+  return found;
+}
+
+/** Does any reachable function call one of the 13 fs.* keys behind
+ * `fsCall`? INC-26 P4 (design-host-v7.txt §2.6, brief-p4-v2.md §3A) —
+ * `fsCall`'s minting condition. UNLIKE kill/chdir/umask (each ONE key, one
+ * arm), THIRTEEN keys share this ONE import — enumerated BY ARM, matching
+ * the prescan-is-a-liability-list lesson (P3's own chdir-missed-at-CP1
+ * precedent, repeated here on purpose rather than assumed safe): every arm
+ * below was read at CP1 (cp1-plan-p4.txt §3) and none of the 13 touches
+ * hostStr/hostNum, so this predicate governs `fsCall` alone. */
+function fsCallReachable(mod: WModule): boolean {
+  const reachable = reachableFunctionNames(mod);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (typeof node === "string") {
+      if (
+        node === "fs.readFileSync" ||
+        node === "fs.writeFileSync" ||
+        node === "fs.appendFileSync" ||
+        node === "fs.existsSync" ||
+        node === "fs.mkdirSync" ||
+        node === "fs.mkdirRecursiveSync" ||
+        node === "fs.mkdtempSync" ||
+        node === "fs.rmSync" ||
+        node === "fs.rmOptsSync" ||
+        node === "fs.rmdirSync" ||
+        node === "fs.readdirSync" ||
+        node === "fs.unlinkSync" ||
+        node === "fs.accessSync"
+      ) {
+        found = true;
+      }
       return;
     }
     if (Array.isArray(node)) {
@@ -1718,6 +1787,11 @@ class Assembler {
   /** `tsinter.umask`'s index, or null in a module that never calls
    * `process.umask` (INC-26 P3, umaskReachable's prescan, design §0.5 W4). */
   private readonly umaskFunc: number | null;
+  /** `tsinter.fsCall`'s index, or null in a module that never calls one of
+   * the 13 fs.* keys (INC-26 P4, fsCallReachable's prescan, design §2.6).
+   * ONE effect-dispatcher import behind all 13 — never §2.7's kill/chdir/
+   * umask shape (one key, one import each). */
+  private readonly fsCallFunc: number | null;
   /** The exit-drain gate's static fact — see exitListenerSurfaceReachable's
    * own comment (INC-26 P1). Computed ONCE in the constructor; every drain
    * gate site reads this, never the mutable `procField`/
@@ -1859,6 +1933,18 @@ class Assembler {
       : null;
     this.umaskFunc = umaskReachable(mod)
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_UMASK, this.mb.funcType([I32, I32], [I32]))
+      : null;
+    // `fsCall`'s decision (INC-26 P4, design §2.6): ONE effect-dispatcher
+    // import behind THIRTEEN keys, minted right after `umaskFunc` so
+    // nothing before it moves. Signature: (op, aPtr, aLen, bPtr, bLen, x,
+    // y) -> status (i32); never throws (§6.1) — a THIRD, separate errno
+    // enumeration from kill's and chdir's (§6.3).
+    this.fsCallFunc = fsCallReachable(mod)
+      ? this.mb.importFunc(
+          IMPORT_MODULE,
+          IMPORT_FS_CALL,
+          this.mb.funcType([I32, I32, I32, I32, I32, I32, I32], [I32]),
+        )
       : null;
     // The exit-drain gate's STATIC fact (see exitListenerSurfaceReachable's
     // own comment on why this must not be a runtime flag): true iff
@@ -2122,6 +2208,35 @@ class Assembler {
     c.globalSet(exc.refG);
     // The class is known exactly here, so the cell's interval position is
     // a constant — no vt read.
+    const meta = this.classes.meta(className);
+    if (meta === undefined) throw new Error(`wasm emitter bug: cell error literal of unknown class ${className}`);
+    c.i32Const(meta.pre);
+    c.globalSet(exc.preG);
+    c.i32Const(EXC_OBJ);
+    c.globalSet(exc.kindG);
+  }
+
+  /** INC-26 P4 (design §6.1, brief §7/CP1 delta (a), rev-26's own N-1 pre-
+   * read confirmation): `emitSetCellError`'s MINIMAL SIBLING — the message
+   * half was ALREADY data (`pushMessage` is a callback there too); this
+   * one replaces the ONE `if (codeLit !== null) this.pushStrLitInto(c,
+   * codeLit); else c.refNull(this.strType);` line with a bare `pushCode(c)`
+   * call, because fs's `.code` is NEVER a compile-time literal — the
+   * UNKNOWN arm alone forces this (an `E<n>` string assembled from a
+   * runtime number), and every ordinary fs error ALSO has a real `.code`
+   * (never null, unlike kill's/chdir's occasional codeless UNKNOWN arm),
+   * so there is no null branch to preserve here. NOT a new "throw an
+   * already-built value" primitive (fromError/emitThrowValue stays the
+   * listener-OBJECT route, brief-p3-delta-3e E-2 — never the throw route,
+   * "P3-E-2" as a citation form is withdrawn). */
+  private emitSetCellErrorCoded(c: Code, className: string, name: string, pushMessage: (c: Code) => void, pushCode: (c: Code) => void): void {
+    const exc = this.exc();
+    c.globalGet(this.classes.vtGlobal(className));
+    this.pushStrLitInto(c, name);
+    pushMessage(c);
+    pushCode(c);
+    c.structNew(exc.errT);
+    c.globalSet(exc.refG);
     const meta = this.classes.meta(className);
     if (meta === undefined) throw new Error(`wasm emitter bug: cell error literal of unknown class ${className}`);
     c.i32Const(meta.pre);
@@ -6191,6 +6306,30 @@ class Assembler {
     return this.pathField;
   }
 
+  private fsField: FsBuilder | null = null;
+
+  /** INC-26 pass P4's own builder (fs.ts) — the fs core: 13 fs.* keys
+   * behind ONE `fsCall` effect-dispatcher import, its own errno table
+   * (the THIRD, sharing no number space with kill's or chdir's), the
+   * two-slot staging, the length-op retry contract. `throwCoded` wires
+   * `emitSetCellErrorCoded` (this pass's minimal sibling of
+   * `emitSetCellError` — CP1 delta (a)); `fsCallFunc` takes the op number
+   * ONLY so the "never imported" message can name it. */
+  private get fs(): FsBuilder {
+    this.fsField ??= new FsBuilder(this.mb, {
+      strRef: () => this.strRef,
+      strType: () => this.strType,
+      fsCallFunc: (op) => this.fsCallFuncOrThrow(op),
+      ensureCapacity: (c, need) => this.emitEnsureCapacity(c, need),
+      stageCursor: () => this.cursorGlobal,
+      pushStrLit: (c, value) => this.pushStrLitInto(c, value),
+      concat: () => this.concatHelper(),
+      f64ToStr: () => this.f64ToStrHelper(),
+      throwCoded: (c, className, name, pushMessage, pushCode) => this.emitSetCellErrorCoded(c, className, name, pushMessage, pushCode),
+    });
+    return this.fsField;
+  }
+
   /** `this.wallClockFunc`, or a descriptive throw — the constructor's own
    * `dateNowReachable` prescan and the walk disagreeing can only mean the
    * scan stopped seeing an IR shape it must see. */
@@ -6248,6 +6387,17 @@ class Assembler {
       throw new Error("emitter bug: process.umask was reached but tsinter.umask was never imported");
     }
     return this.umaskFunc;
+  }
+
+  /** `this.fsCallFunc`, or a descriptive throw naming the OP — unlike
+   * kill/chdir/umask's single-key message, `fsCall` is reached by any of 13
+   * keys, so "fsCall was reached" alone would not say which one; the
+   * caller passes the op number it was about to dispatch. */
+  private fsCallFuncOrThrow(op: number): number {
+    if (this.fsCallFunc === null) {
+      throw new Error(`emitter bug: an fs key (op ${op}) was reached but tsinter.fsCall was never imported`);
+    }
+    return this.fsCallFunc;
   }
 
   /** The ARR payload's vector info — the SAME interning a static
@@ -13243,7 +13393,14 @@ class Assembler {
             return;
           }
           const undefTag = this.undefinedArmTag(unionId);
-          const f64Tag = this.unionArmTag(unionId, { kind: "f64" });
+          // R-A (INC-26 P4, cp1-plan-p4.txt §4): the aliased IR F64 —
+          // module.ts's own `F64` (the WASM ValType) shadows the IMPORTED
+          // `ir/nodes.js` one at this call site, and `unionArmTag` expects
+          // the IR type. P3 sidestepped the collision with an inline
+          // `{ kind: "f64" }` literal (identical value, annotation-only
+          // difference from the real IR_F64 const); this pass names the
+          // alias explicitly instead.
+          const f64Tag = this.unionArmTag(unionId, IR_F64);
           if (undefTag < 0 || f64Tag < 0) {
             this.refuse("libCall:process.columns:unexpected-union-shape", e.loc);
             code.unreachable();
@@ -13618,25 +13775,26 @@ class Assembler {
           this.releaseScratch(this.strRef, BEFORE);
           return;
         }
-        if (e.fn === "process.umask") {
-          // The frontend already completed the 0-ary form to the literal
-          // -1 read sentinel (lower-builtins.ts, confirmed no IR change
-          // needed) — THE -1 COLLISION (board #142) is a frontend defect
-          // on every lane, not fixed here: the -1 IR value always means
-          // "read" at this import regardless of which source shape
-          // produced it.
-          const MASK = this.acquireScratch(F64);
-          this.walkExpr(e.args[0]!);
-          code.localSet(MASK);
-          code.localGet(MASK);
-          code.f64Const(-1);
-          code.f64Eq();
-          this.openIfResult(F64);
+        if (e.fn === "process.umaskRead") {
+          // board #142: the 0-ary READ form, now its OWN IrLibFn — always
+          // isRead=1, mask ignored. No collision possible: this arm is
+          // reached ONLY by an actual 0-ary `process.umask()` call; an
+          // explicit `process.umask(-1)` lowers to the SET arm below and
+          // reaches its own RangeError, matching Node exactly.
           code.i32Const(1); // isRead
           code.i32Const(0); // mask ignored
           code.call(this.umaskFuncOrThrow());
           code.f64ConvertI32S();
-          code.else_();
+          return;
+        }
+        if (e.fn === "process.umask") {
+          // board #142: the SET form ONLY — the -1 read-sentinel branch
+          // is GONE (it lived here through P3; process.umaskRead above is
+          // its replacement). A user-written `process.umask(-1)` now
+          // reaches Node's own ERR_OUT_OF_RANGE below, on every lane.
+          const MASK = this.acquireScratch(F64);
+          this.walkExpr(e.args[0]!);
+          code.localSet(MASK);
           // Node's own check ORDER (measured): INTEGER FIRST, RANGE
           // SECOND — a non-integer mask throws even when ALSO out of
           // range.
@@ -13688,7 +13846,6 @@ class Assembler {
           code.i32TruncF64U();
           code.call(this.umaskFuncOrThrow());
           code.f64ConvertI32S();
-          this.close();
           this.releaseScratch(F64, MASK);
           return;
         }
@@ -13728,6 +13885,194 @@ class Assembler {
           this.emitProcessEmitWarning(code, e.args[0]!);
           return;
         }
+        // ── INC-26 pass P4 — the fs core (brief-p4-v2.md eac927bd/304;
+        // design-host-v7.txt cccf7d6e §2.6/§6.1-§6.4/§9 P4). 13 fs.* keys +
+        // os.tmpdir/os.homedir. Every arm below calls into fs.ts's own
+        // FsBuilder wrapper (a standalone %w.fs.* function) and, unless the
+        // key is PROBE-shaped (existsSync), follows it with
+        // `emitPendingCheck()` — EXACTLY `json.parse()`'s own existing
+        // call-site shape (the wrapper writes the pending cell on failure
+        // and returns a placeholder; it never unwinds itself). 891 -> 908.
+        if (e.fn === "os.tmpdir" || e.fn === "os.homedir") {
+          const kind = e.fn === "os.tmpdir" ? HOST_STR_KIND_OS_TMPDIR : HOST_STR_KIND_OS_HOMEDIR;
+          code.i32Const(kind);
+          code.i32Const(0); // index is ignored for these kinds
+          code.call(this.proc.readHostStr());
+          return;
+        }
+        if (e.fn === "fs.existsSync") {
+          // PROBE-SHAPED (design §6.2): NEVER builds an error on any
+          // answer. The helper's own result IS the boolean.
+          this.walkExpr(e.args[0]!);
+          code.call(this.fs.existsSyncHelper());
+          return;
+        }
+        if (e.fn === "fs.readFileSync") {
+          // args[1] is the (always-"utf8") encoding — evaluated for
+          // JS-exact side-effect order, ignored by the runtime (emit-
+          // exprs.ts's own native-lane precedent, verbatim: "args[1] is
+          // the (always-'utf8') encoding: evaluated for JS-exact
+          // side-effect order, ignored by the runtime").
+          const PATH = this.acquireScratch(this.strRef);
+          this.walkExpr(e.args[0]!);
+          code.localSet(PATH);
+          this.walkExpr(e.args[1]!);
+          code.drop();
+          code.localGet(PATH);
+          code.call(this.fs.readFileSyncHelper());
+          this.emitPendingCheck();
+          this.releaseScratch(this.strRef, PATH);
+          return;
+        }
+        if (e.fn === "fs.mkdtempSync") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.fs.mkdtempSyncHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.readdirSync") {
+          // op 2's RAW JSON string, parsed here (never inside fs.ts —
+          // A-9's own rule: the parser is FORBID, used as-is, and the
+          // dyn/vec integration is an EMITTER-level concern, matching
+          // every other dyn-array walk in this file) into a `string[]`
+          // vec Node's own key order preserves (JSON arrays are ordered).
+          this.walkExpr(e.args[0]!);
+          code.call(this.fs.readdirSyncRawHelper());
+          this.emitPendingCheck();
+          const RAWJSON = this.acquireScratch(this.strRef);
+          code.localSet(RAWJSON);
+          code.localGet(RAWJSON);
+          code.call(this.json.parse());
+          this.emitPendingCheck();
+          const dynRefT = this.dyn.dynRef();
+          const ARR = this.acquireScratch(dynRefT);
+          code.localSet(ARR);
+          this.dyn.arrPayload(code, (c) => c.localGet(ARR));
+          const arrRefT = this.dyn.arrRef();
+          const DVEC = this.acquireScratch(arrRefT);
+          code.localSet(DVEC);
+          this.dyn.arrLen(code, (c) => c.localGet(DVEC));
+          const N = this.acquireScratch(I32);
+          code.localSet(N);
+          const stringVecKey = arrayOf(STRING) as IrType & { kind: "array" };
+          const stringVecInfo = this.vecInfoFor(stringVecKey, undefined)!;
+          const stringVecRefT = this.vecs.vecRef(stringVecInfo);
+          code.localGet(N);
+          code.f64ConvertI32S();
+          code.call(this.vecs.newLen(stringVecInfo));
+          const RESULTVEC = this.acquireScratch(stringVecRefT);
+          code.localSet(RESULTVEC);
+          const I_ = this.acquireScratch(I32);
+          code.i32Const(0);
+          code.localSet(I_);
+          code.block();
+          code.loop();
+          code.localGet(I_);
+          code.localGet(N);
+          code.i32GeU();
+          code.brIf(1);
+          this.dyn.arrAt(
+            code,
+            (c) => c.localGet(DVEC),
+            (c) => c.localGet(I_),
+          );
+          code.structGet(this.dyn.dynT(), DYN_REF);
+          code.refCast(this.strType);
+          const ELEM = this.acquireScratch(this.strRef);
+          code.localSet(ELEM);
+          code.localGet(RESULTVEC);
+          code.localGet(I_);
+          code.f64ConvertI32S();
+          code.localGet(ELEM);
+          code.call(this.vecs.set(stringVecInfo));
+          this.releaseScratch(this.strRef, ELEM);
+          code.localGet(I_);
+          code.i32Const(1);
+          code.i32Add();
+          code.localSet(I_);
+          code.br(0);
+          code.end();
+          code.end();
+          code.localGet(RESULTVEC);
+          this.releaseScratch(I32, I_);
+          this.releaseScratch(stringVecRefT, RESULTVEC);
+          this.releaseScratch(I32, N);
+          this.releaseScratch(arrRefT, DVEC);
+          this.releaseScratch(dynRefT, ARR);
+          this.releaseScratch(this.strRef, RAWJSON);
+          return;
+        }
+        if (e.fn === "fs.writeFileSync") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.fs.writeFileSyncHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.appendFileSync") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.fs.appendFileSyncHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.mkdirSync") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.fs.mkdirSyncHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.mkdirRecursiveSync") {
+          // K-3/S073's second sentence: Node's own first-created-path
+          // return is FENCED to statement position — VOID here, by the
+          // frontend's own lowering (ir/nodes.ts:3907's comment), not a
+          // choice this arm makes.
+          this.walkExpr(e.args[0]!);
+          code.call(this.fs.mkdirRecursiveSyncHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.rmdirSync") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.fs.rmdirSyncHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.unlinkSync") {
+          // S-1 (D10-shaped): BUILT here, reached by no P4 program — its
+          // forced-host row is mandatory (§9 P4's own text).
+          this.walkExpr(e.args[0]!);
+          code.call(this.fs.unlinkSyncHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.rmSync") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.fs.rmSyncHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.rmOptsSync") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          this.walkExpr(e.args[2]!);
+          code.call(this.fs.rmOptsSyncHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.accessSync") {
+          const PATH = this.acquireScratch(this.strRef);
+          this.walkExpr(e.args[0]!);
+          code.localSet(PATH);
+          code.localGet(PATH);
+          this.walkExpr(e.args[1]!);
+          code.call(this.toInt32Helper());
+          code.call(this.fs.accessSyncHelper());
+          this.emitPendingCheck();
+          this.releaseScratch(this.strRef, PATH);
+          return;
+        }
+        // ── end INC-26 P4 ──────────────────────────────────────────────
         if (e.fn === "process.onSignal" || e.fn === "process.offSignal") {
           // D5/A-9: registration is easy; DELIVERY needs a host signal
           // channel this tier does not have. BOTH keys refuse under the
@@ -28764,11 +29109,31 @@ class Assembler {
     // function serving every call, so this can't be a compile-time
     // choice). The actual side never needs this — MEASURED: it always
     // renders as a plain quoted string regardless of the expected side.
+    // delta-1720 (35a6cad6, P4-J4, 3I-1): a slot's RAW-pattern render is
+    // gated on THAT SLOT's own already-computed equality flag (`eqL`, a
+    // LOCAL — EQ0/EQ1/EQ2, computed above at stage 1). A matched regex key
+    // no longer renders the raw `/src/flags` on the expected side at all —
+    // it renders the ACTUAL value, quoted, the SAME text `pushActualValue`
+    // independently builds for that key's OWN alines entry a few lines
+    // below (CODEACT / errT.message / errT.name) — so the (unrelated,
+    // downstream) diff walk sees IDENTICAL text on both sides for that key
+    // and renders it as ONE unchanged line, matching Node's own per-key
+    // decision (measured: impl-p4/probes/probe-assert-regex.ts and
+    // probe-assert-regex2.ts, hashed in finding-1720.txt). `pushStrValue`
+    // (the plain-string expected value, e.g. `val0`) is UNSAFE to reuse
+    // here — it is never populated when a slot is regex-typed (only
+    // `regexValN`/`isRegexN` are), so the matched-regex fallback needs its
+    // OWN actual-value pusher, not the non-regex one. Before this fix,
+    // `regexBranch` rendered the RAW pattern whenever a slot was
+    // regex-typed, with no regard to whether THAT slot's own comparison
+    // had matched — so a matched regex key still printed as a mismatched
+    // pair whenever any OTHER key in the same shape mismatched (1720's
+    // row M).
     const buildLine = (
       keyName: string,
       pushStrValue: () => void,
       pushIsLast: () => void,
-      regexBranch: { isRegexG: number; pushRegexValue: () => void } | null,
+      regexBranch: { isRegexG: number; eqL: number; pushRegexValue: () => void; pushActualValue: () => void } | null,
     ): void => {
       this.insp.pushMark(c);
       c.localSet(LINEMARK);
@@ -28781,9 +29146,21 @@ class Assembler {
       if (regexBranch !== null) {
         c.globalGet(regexBranch.isRegexG);
         c.ifVoid();
+        c.localGet(regexBranch.eqL);
+        c.ifVoid();
+        // regex AND matched: render the ACTUAL value, quoted — never the
+        // raw pattern — so this key reads identically on both sides.
+        regexBranch.pushActualValue();
+        c.i32Const(0);
+        regexBranch.pushActualValue();
+        c.arrayLen();
+        c.call(this.insp.quoteInto());
+        c.else_();
+        // regex AND mismatched: unchanged — the raw pattern.
         regexBranch.pushRegexValue();
         c.call(this.regex.inspectHelper());
         c.call(this.insp.ibPuts());
+        c.end();
         c.else_();
         pushStrValue();
         c.i32Const(0);
@@ -28828,7 +29205,11 @@ class Assembler {
     c.i32Add();
     buildLine("code", () => c.globalGet(val0), isLastFrom(0), {
       isRegexG: isRegex0,
+      eqL: EQ0,
       pushRegexValue: () => c.globalGet(regexVal0),
+      // SAME pusher as this key's own ALINES call a few lines below
+      // (CODEACT) — a matched regex slot renders IDENTICAL text there.
+      pushActualValue: () => c.localGet(CODEACT),
     });
     c.arraySet(strArrT);
     c.localGet(EN);
@@ -28859,7 +29240,13 @@ class Assembler {
     c.i32Add();
     buildLine("message", () => c.globalGet(val1), isLastFrom(1), {
       isRegexG: isRegex1,
+      eqL: EQ1,
       pushRegexValue: () => c.globalGet(regexVal1),
+      // SAME pusher as this key's own ALINES call a few lines below.
+      pushActualValue: () => {
+        c.globalGet(errGlobal);
+        c.structGet(errT, ERR_MESSAGE);
+      },
     });
     c.arraySet(strArrT);
     c.localGet(EN);
@@ -28894,7 +29281,13 @@ class Assembler {
     c.i32Add();
     buildLine("name", () => c.globalGet(val2), isLastFrom(2), {
       isRegexG: isRegex2,
+      eqL: EQ2,
       pushRegexValue: () => c.globalGet(regexVal2),
+      // SAME pusher as this key's own ALINES call a few lines below.
+      pushActualValue: () => {
+        c.globalGet(errGlobal);
+        c.structGet(errT, ERR_NAME);
+      },
     });
     c.arraySet(strArrT);
     c.localGet(EN);

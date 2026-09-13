@@ -48,7 +48,24 @@
  * recording anything; chdir/umask answer success and mutate nothing) —
  * again, DEFAULTS for importers that reach these keys incidentally, never
  * the FORCED host wasm-host-process-p3.test.ts's own copy compares
- * against a table. */
+ * against a table.
+ *
+ * INC-26 P4 (design-host-v7.txt §2.6, brief-p4-v2.md §0(vii)/§3A, CP1
+ * delta (c); rev-26's 3B read P-1): `hostStr` gains SYNTHETIC defaults for
+ * os.tmpdir/os.homedir (kinds 8/9 — measured this pass: ZERO of the 21
+ * importers of this shared host touch either key in their own compiled
+ * programs, so synthetic is safe here exactly as it is for arch/versions/
+ * execPath above). `fsCall` lands LOUD BY DESIGN, never a plausible-
+ * answering default (R0's board #135 stance, applied to the fs family):
+ * EVERY op throws a host error naming the op, the first time any shared-
+ * host importer reaches an fs key it has not been given a forced host
+ * for — NO EXCEPTION for op 19 (exists), even though -1 ("does not
+ * exist") is a VALID encoding under §0(vi): it is a CORRECT, PLAUSIBLE
+ * answer, which is exactly what makes a silent default dangerous there
+ * (P-1's own point) — board #135's hazard reintroduced for one op with
+ * no caller to justify it, since nothing reaches op 19 through this
+ * shared host today. A future test needing `existsSync` supplies a
+ * FORCED host (wasm-host-fs-p4.test.ts's own job). */
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { expect } from "vitest";
@@ -138,6 +155,14 @@ async function instantiate(modulePath: string) {
             return write("3.5.5");
           case 12: // execPath
             return write("/forced/host/node");
+          // INC-26 P4: os.tmpdir/os.homedir default stubs. Synthetic —
+          // measured this session (impl-p4/probes/
+          // sharedhost-importers-implp4.out): zero of the 21 shared-host
+          // importers' own compiled programs touch either key today.
+          case 8: // os.tmpdir
+            return write("/forced/tmp");
+          case 9: // os.homedir
+            return write("/forced/home");
           default:
             throw new Error(`hostStr: unknown kind ${kind}`);
         }
@@ -196,6 +221,23 @@ async function instantiate(modulePath: string) {
       },
       umask(_isRead: number, _mask: number): number {
         return 0o22;
+      },
+      // INC-26 P4 (design §6.1, brief §0(vii)/§3A, CP1 delta (c); rev-26's
+      // 3B read P-1): the default `fsCall` stub is LOUD FOR EVERY OP, no
+      // exception — a shared-host program that touches fs without a
+      // forced host must fail LOUDLY at the exact op, never read a
+      // silently-fabricated result. An EARLIER draft carved out op 19
+      // (exists), answering -1 ("does not exist") on the reasoning that
+      // §6.2's PROBE-SHAPED rule means it can never build an error — but
+      // -1 IS A CORRECT, PLAUSIBLE ANSWER under §0(vi), which is exactly
+      // what makes a silent default dangerous there (board #135's own
+      // hazard, reintroduced for one op with no caller to justify it:
+      // measured, ZERO of the 21 shared-host importers' programs touch
+      // fs at all). Deleted; a future test that genuinely needs
+      // `existsSync` supplies a FORCED host, which is what
+      // wasm-host-fs-p4.test.ts exists for.
+      fsCall(op: number, _aPtr: number, _aLen: number, _bPtr: number, _bLen: number, _x: number, _y: number): number {
+        throw new Error(`fsCall: op ${op} reached with no forced host (default stub is loud by design)`);
       },
     },
   });

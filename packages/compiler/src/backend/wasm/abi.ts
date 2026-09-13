@@ -62,9 +62,11 @@
  *     and 12 (arch, versions.node, versions.openssl, execPath — S071/S072
  *     name what each answers on a non-Node lane) — P3's `process.chdir`
  *     ALSO reaches this import, for its OWN error message's "before" path
- *     (kind 3, cwd) rather than for a new kind. 8-11 and 13-17 are later
- *     passes' — see `hostNum`'s identical stance below for the reason both
- *     tables ship complete now rather than growing a gap at a time.
+ *     (kind 3, cwd) rather than for a new kind. INC-26 P4 (design §3.5)
+ *     consumes kinds 8 and 9 (os.tmpdir, os.homedir — THE VALUES PRINT,
+ *     design §11). 10-11 and 13-17 are later passes' — see `hostNum`'s
+ *     identical stance below for the reason both tables ship complete now
+ *     rather than growing a gap at a time.
  *     hostStr's EFFECT TIER: that the host WROTE the bytes it claims to
  *     have written is enforced by NOTHING. A host that answers a length
  *     and writes nothing hands the module a run of NUL code units and no
@@ -107,6 +109,19 @@
  *     BEFORE calling `instantiate` (the only order available to it) errs
  *     SLIGHTLY LARGE, never negative — small and harmless, and not a bug
  *     for a later pass to "fix" by moving the sample point.
+ *     KINDS 8-11 (cpuUsage.user/system, threadCpuUsage.user/system) AND
+ *     14's OWN CUMULATIVE FIELDS carry the SAME "since THIS INSTANCE
+ *     started" clause (INC-26 P4 rider R-B, board #144, ERRATA E-P4-2):
+ *     `process.cpuUsage()`/`threadCpuUsage()`/`resourceUsage()`'s twelve
+ *     cumulative rusage fields are ALL counters over the HOST's own
+ *     lifetime, not the module's, so a host that answers them directly
+ *     reports a number that keeps growing across unrelated
+ *     instantiations — kind 7's own bug, found again here. A host samples
+ *     a per-instance BASELINE (the same ordering as kind 7's) and answers
+ *     `<fresh> - <baseline>` for these twelve. rusage's maxRSS (a MAXIMUM,
+ *     never a counter) and its three memory-size fields (sharedMemorySize,
+ *     unsharedDataSize, unsharedStackSize — ALWAYS ZERO on Linux, so "real"
+ *     and "zero" are indistinguishable there) pass through RAW, unsubtracted.
  *
  *   (import "tsinter" "exit" (func (param i32)))   [process.exit modules only]
  *     The host TERMINATES THE INSTANCE with this status. IT MUST NOT
@@ -236,6 +251,83 @@
  *     enforced by NOTHING — the `wallClock` shape, restated (and, in the
  *     DIFFERENTIAL harness, `umask` is a RECORDING STUB for the same
  *     in-process reason `chdir` is — design §3C).
+ *
+ * INC-26 pass P4 (design-host-v7.txt §2.6/§6.1-§6.4, DECISIONS.md P4-J1..J3,
+ * brief-p4-v2.md §0/§1): ONE effect-dispatcher import behind THIRTEEN fs.*
+ * keys — never eighteen separate imports, and never kill's/chdir's shape
+ * (one key, one import, one errno table each).
+ *
+ *   (import "tsinter" "fsCall" (func (param i32 i32 i32 i32 i32 i32 i32) (result i32)))
+ *     fsCall(op, aPtr, aLen, bPtr, bLen, x, y) -> status (i32).
+ *     `op` SELECTS THE OPERATION — the numbers ARE the ABI, append-only,
+ *     never renumbered, and this table ships WHOLE even though P4 builds
+ *     only eleven of the twenty-three (the SAME stance hostStr's/hostNum's
+ *     kind tables already take):
+ *       READ-SHAPED (answer a length; content lands in the region the
+ *       caller gave):
+ *         1 readFile(pathA)->byte length      2 readdir(pathA)->JSON length
+ *         3 mkdtemp(prefixA)->path length     4 realpath(pathA)->path length
+ *                                                                   [P5]
+ *         5 readFd(fd=x)->byte length (ENCODED form only)          [P5]
+ *         6 read(fd,off,len)->byte count                           [P5]
+ *         7 stat(pathA)->JSON length           8 lstat(pathA)->JSON length
+ *                                                                   [P5]
+ *       WRITE-SHAPED (answer 0 or -errno):
+ *         9 writeFile(pathA,bytesB,mode=x)    10 appendFile(pathA,bytesB)
+ *        11 mkdir(pathA,mode=x,recursive=y)   12 rmdir(pathA)
+ *        13 unlink(pathA)                     14 rm(pathA,recursive,force,
+ *                                                    maxRetries,retryDelay)
+ *        15 copyFile(pathA,pathB)             16 chmod(pathA,mode)   [P5]
+ *        17 chown(pathA,uid,gid)              18 close(fd)           [P5]
+ *       PROBE-SHAPED (answer 0, or -errno, and NEVER build an error):
+ *        19 exists(pathA)                     20 access(pathA,mode)
+ *       HANDLE-SHAPED (P5): 21 open(pathA,flags=x,mode=y)->fd or -errno
+ *       op 5's two sub-ops (P5): 22 fstatFd(fd=x)->byte size or -errno;
+ *         23 readFdInto(fd=x,ptr,cap)->byte count or -errno.
+ *     P4 BUILDS: 1, 2, 3, 9, 10, 11, 12, 13, 14, 19, 20. The rest are P5's.
+ *     `x`/`y` carry integer options (mode, flags, fd, offset, length,
+ *     recursive, force, maxRetries, retryDelay) per op.
+ *
+ *     THE STATUS: >= 0 is success (a LENGTH for read-shaped ops, content in
+ *     the staging region the call was given); < 0 is -errno, using the
+ *     MODULE's OWN small enumeration (fs.ts's hand-written table — the
+ *     THIRD errno table in this ABI, sharing no number space with kill's or
+ *     chdir's), NOT the host's raw platform errno. THE HOST NEVER THROWS:
+ *     the module builds Node's Error itself, from a code it owns (design
+ *     §6.1 — the sharpest reason is that a host throw across this boundary
+ *     IS the tier's exit mechanism, M-12, and fs errors are CATCHABLE in
+ *     Node, so they must not share that channel with `exit`).
+ *
+ *     A LENGTH-RETURNING op uses hostStr's OWN retry contract: if the
+ *     answer exceeds the capacity offered, nothing is written and the true
+ *     length comes back, and the module retries with a bigger region.
+ *
+ *     TWO SLOTS, TWO REGIONS, LIVE AT ONCE. `writeFile(path, content)`
+ *     needs slot A (the path) and slot B (the content) populated
+ *     simultaneously, so "at the cursor" cannot describe both: slot A is
+ *     laid at the cursor exactly as hostStr's own outbound writes are; slot
+ *     B begins at `cursor + roundUp(aLen, 2)`, and `emitEnsureCapacity` is
+ *     called ONCE for the combined size before either is written. Neither
+ *     slot advances the cursor. THE ALIGNMENT IS 2 BYTES, REQUIRED, AND THE
+ *     REASON IS THE HOST, NOT THE MODULE (measured, CP1 delta (d)): nothing
+ *     the MODULE writes needs 4/8-byte alignment (`stageStrUtf16` emits two
+ *     `i32Store8`s per UTF-16 code unit — there is no wide store in this
+ *     tier to align for), but BOTH hosts read module memory as `new
+ *     Uint16Array(memory.buffer, ptr, len)`, and an ODD `ptr` makes THAT
+ *     CONSTRUCTOR THROW `RangeError: start offset of Uint16Array should be
+ *     a multiple of 2` — a host throw inside a `tsinter` import unwinds the
+ *     module UNCATCHABLY (M-12, the SAME property `exit` relies on
+ *     deliberately), so a misaligned slot B is an UNCATCHABLE CRASH naming
+ *     the host, not subtle corruption. A byte-payload slot (raw bytes, no
+ *     UTF-16 packing) needs no stricter alignment than 1.
+ *
+ *     fsCall's EFFECT TIER: that the host performed the syscall it was
+ *     asked for, on the path it was given, is enforced by NOTHING — the
+ *     harness's own rows are the check (§2.1's "fourth tier", restated).
+ *
+ *     STRUCTURED RESULTS (stat/lstat/readdir's JSON form, P5's stat/lstat;
+ *     P4's readdir) cross as a JSON DOCUMENT, parsed by the tier's own
+ *     parser — no new marshalling for a nested shape.
  *
  * THE ARGV/ENV SNAPSHOT (D2). `process.argv` and the whole of `process.env`
  * are read ONCE, at first touch, into module-owned storage — never a live
@@ -421,6 +513,7 @@ export const IMPORT_EXIT = "exit";
 export const IMPORT_KILL = "kill";
 export const IMPORT_CHDIR = "chdir";
 export const IMPORT_UMASK = "umask";
+export const IMPORT_FS_CALL = "fsCall";
 export const EXPORT_ENTRY = "_start";
 export const EXPORT_TICK = "_tick";
 export const EXPORT_STATUS = "_status";

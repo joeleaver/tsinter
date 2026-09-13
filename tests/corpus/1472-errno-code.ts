@@ -1,8 +1,10 @@
-// ErrnoException.code — thrown fs/exec/kill errors carry Node's `code`
-// property now (divergence 13 revised): the errno name where Node stamps
-// one, `undefined` where it doesn't (a plain new Error, a command that
-// merely failed). The read types `string | undefined` and narrows like
-// any env read; `e as NodeJS.ErrnoException` from an Error-narrowed
+// ErrnoException.code — thrown fs (SEMANTICS.md S073) and kill
+// (SEMANTICS.md S077) errors carry Node's `code` property now; exec's own
+// case here is not yet a registered divergence (board #137). The errno
+// name where Node stamps one, `undefined` where it doesn't (a plain new
+// Error, a command that merely failed). The read types `string |
+// undefined` and narrows like any env read; `e as NodeJS.ErrnoException`
+// from an Error-narrowed
 // catch binding is a no-op cast (the type maps to the same runtime
 // Error).
 import { readFileSync, mkdirSync, rmdirSync, writeFileSync, rmSync, mkdtempSync, statSync } from "node:fs";

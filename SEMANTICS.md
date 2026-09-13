@@ -5418,6 +5418,61 @@ parsed major, and the doctor idiom's presence-gated template literal — the DER
 uses, never the raw string) and 1639 (`typeof`/presence only, gating a "crypto-path"/"skip-path" choice
 the same way Node's own idiom does).
 
+## S073 — fs errors carry `.code` and Node's exact `.message` ONLY; `.errno`/`.syscall`/`.path` are UNREPRESENTED, and Node's own SystemError class/wording for rm-without-recursive on a directory is not modelled *(wasm tier; native lanes ship the same divergence)*
+
+Node's fs errors are decorated `Error` instances (or, for one shape below, a `SystemError`) carrying
+`.code`, `.errno`, `.syscall`, and `.path`. Every non-Node lane throws a PLAIN `Error` whose `.code` and
+`.message` match Node's exactly; `.errno`, `.syscall` and `.path` are UNREPRESENTED — nothing in the closed
+corpus reads them (measured over the closed set; widening to the full four stays UNPICKED, D6 ERRATUM 1).
+
+On the UNKNOWN arm (an errno outside the module's own fourteen-code enumeration — ENOENT, EEXIST, EACCES,
+ENOTDIR, EISDIR, ENOTEMPTY, EPERM, EBADF, EMFILE, ENOSPC, EINVAL, EROFS, ELOOP, ENAMETOOLONG — the last two
+appended by ERRATUM E-P4-3, delta-3e e4da1096 R-1: reached by ORDINARY `readFileSync` inputs, a symlink loop
+and an overlong path, so the twelve-only table printed a knowingly-wrong "Unknown system error" for inputs a
+user will actually hit), `.code` renders `E<n>` (NEVER a Node spelling) with the MODULE CONSTANT text
+`"Unknown system error -<n>"`, sourced from libuv's own table shape rather than the host platform's
+`strerror` (measured: glibc's `strerror` and libuv's table differ on every code compared, not merely in
+case). The arm is unreached by the generator and by every corpus program (this pass's own measurement: the
+generator measures 27 shapes / 9 codes, all inside the fourteen) — a stated limitation, not a silent one.
+
+SECOND SENTENCE: where Node throws a DIFFERENT ERROR CLASS — `rmSync`/`rmOptsSync` on a directory WITHOUT
+`recursive: true` throws a `SystemError`, `.code` `"ERR_FS_EISDIR"`, `.syscall` `"rm"`, message `"Path is a
+directory: rm returned EISDIR (is a directory) <path>"` (no `"EISDIR:"` prefix, path UNQUOTED — measured)
+— every non-Node lane throws a PLAIN `Error` with that SAME wording instead (the class divergence itself is
+observable: `instanceof`/`constructor.name` differ). `rmdirSync` on an EMPTY directory does not throw;
+`rmSync`/`rmOptsSync` WITH `recursive: true` does not throw either — the divergence is specific to
+rm-without-recursive on a directory. `mkdirSync(p, {recursive: true})`'s own return value (the first
+created directory, or `undefined`) is FENCED to statement position on every lane (no lowering exists for
+reading it) — the SAME dead number this divergence sits on, not a second one.
+
+**Native (both lanes) and wasm:** identical `.code`/`.message` construction from the SAME closed enumeration
+(`packages/runtime/src/scr_lib.c`'s `scr_fs_throw`/`scr_rm_fail_set` on the C lanes; `fs.ts`'s own hand-
+written table, independently checked against a generated-from-Node rows file, on the wasm lane) — never a
+platform errno crossing raw.
+
+RETIRES the dead "divergence 13" at its THREE source sites whose SUBJECT is this entry (the subject is the
+declaration a comment sits on, never a sibling stance it cites): `packages/runtime/src/scr_lib.c:1449` (the
+property-set sentence), `packages/runtime/src/scr_lib.c:1963` (the rm-on-directory class/wording, this
+entry's second sentence), and `packages/compiler/src/ir/nodes.ts:3907` (the SAME rm-on-directory wording,
+plus the fenced `mkdirSync` recursive return). ALSO rewrites `tests/corpus/1472-errno-code.ts:2`'s header BY
+CLAUSE — that comment spans THREE families (fs, kill, exec) under the one dead number; it now names this
+entry for its fs clause and S077 for its kill clause, leaving exec's own clause an UNREGISTERED citation
+(board #137).
+
+NAMED RESIDUE, NOT retired here (a different SUBJECT appealing to the same dead number, read and confirmed
+by SUBJECT rather than assumed by phrase): `packages/runtime/src/scr_dgram.c:41` and `tests/fixtures/dgram/
+cases/udp-error-code/main.ts:3` (dgram's OWN `.code`-only stance, a sibling family's citation of the same
+dead number — board #137); `tests/corpus/1473-promisify-execfile.ts:38` (a DIFFERENT subject — `execFile`'s
+own reads answering `undefined` — cites "divergence 13/50", and 50 is a LIVE number elsewhere, so this site
+is left exactly as it stands rather than partially retired).
+
+**Tested by:** 1306-errors-runtime-instances.ts (a real, uncontrived `ENOENT: no such file or directory,
+open '<path>'` from `readFileSync` on a missing file — one of the pass's two message-exact corpus
+witnesses); the errno table's own forced-host unit rows, driven against a table GENERATED from real `node:fs`
+runs (never transcribed from this entry or from the native C source) and independently cross-checked byte-
+for-byte against a second, separately-written measurement; a forced row for the rm-on-directory class/wording
+above, pinning both the `SystemError`-vs-`Error` class difference and the exact unprefixed, unquoted message.
+
 ## S075 — `process.getActiveResourcesInfo()` reports only the resource KINDS this tier's own event loop models *(wasm tier; native lanes ship the same divergence)*
 
 Node's real answer enumerates every live libuv handle by KIND — timers, sockets, file-descriptor

@@ -1551,7 +1551,8 @@
       "id": "node-builtin.process.umask",
       "kind": "node-builtin",
       "name": "process.umask",
-      "status": "static"
+      "status": "static",
+      "note": "the set and read forms are one surface (board #142)"
     },
     {
       "id": "node-builtin.process.uptime",

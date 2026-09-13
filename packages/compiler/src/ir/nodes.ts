@@ -2996,10 +2996,18 @@ export type IrLibFn =
    * execPath stance). Interned; +1 per read. Never throws. */
   | "process.versionsNode"
   | "process.versionsOpenssl"
-  /** umask(2): arg < 0 reads without setting (umask has no read-only form
-   * — set 0, restore); otherwise sets and answers the PREVIOUS mask.
-   * Never throws. */
+  /** umask(2), the SET form: sets `mask` and answers the PREVIOUS mask.
+   * Never throws for an in-range integer mask. The READ form is a
+   * SEPARATE IrLibFn (`process.umaskRead`, board #142) — a user-written
+   * `process.umask(-1)` is now an ordinary SET call with an out-of-range
+   * mask, matching Node's own ERR_OUT_OF_RANGE, on every lane. */
   | "process.umask"
+  /** umask(2), the READ form: reads without setting (mask=-1 at the
+   * C/wasm ABI level, isRead=1). Zero args. Never throws. Board #142: the
+   * frontend's 0-ary completion used to collide with a user-written
+   * `process.umask(-1)` on the SAME IR value; this key exists so the
+   * collision cannot happen. */
+  | "process.umaskRead"
   /** chdir(2) — throws Node's fs-shaped error (ENOENT/EACCES/ENOTDIR,
    * syscall "chdir") on failure. */
   | "process.chdir"
@@ -3904,8 +3912,10 @@ export type IrLibFn =
    * return value has no lowering (statement position only, frontend-
    * fenced). rmOptsSync is rmSync with (recursive, force) bools: force
    * swallows ENOENT, recursive removes trees post-order, a directory
-   * without recursive throws the EISDIR-worded error (divergence 13's
-   * wording note). mkdtempSync appends the six X's and returns the
+   * without recursive throws Node's SystemError ERR_FS_EISDIR wording,
+   * a class Node throws that no non-Node lane models (S073's second
+   * sentence — retires the dead "divergence 13" cited here). mkdtempSync
+   * appends the six X's and returns the
    * created path (+1). accessSync takes the F_OK/R_OK/W_OK/X_OK bits as
    * one f64 (the frontend bakes fs.constants.* as literals and completes
    * an omitted mode to 0). readFdSync/readFdSyncBytes are the
@@ -6685,6 +6695,7 @@ export const LIB_NONDETERMINISTIC_PREFIXES: readonly [string, string][] = [
   ["process.columns", "terminal geometry (columns)"],
   ["process.kill", "process authority (kill)"],
   ["process.umask", "process authority (umask)"],
+  ["process.umaskRead", "process authority (umask)"],
   ["process.exit", "process authority (exit)"],
   ["fs.", "the filesystem"],
   ["os.", "machine/OS identity"],

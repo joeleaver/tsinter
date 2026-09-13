@@ -1446,7 +1446,7 @@ void scr_fs_throw(int e, const char *op, const ScrStr *path) {
    * typed catch's `e instanceof Error` + `e.message` observes in Node —
    * with `code` stamped to the errno name (the exotic-errno fallback
    * stamps its "E<num>" spelling; Node would carry the uv name there).
-   * errno/syscall/path stay unrepresented (SEMANTICS.md divergence 13). */
+   * errno/syscall/path stay unrepresented (SEMANTICS.md S073). */
   scr_throw_error_msg_code(SCR_ERR_ERROR, msg, (size_t)len, name);
   free(msg);
 }
@@ -1959,8 +1959,11 @@ static void scr_fs_rm_attempt(ScrStr *path, bool recursive, bool force, ScrRmFai
   }
   if (S_ISDIR(st.st_mode)) {
     if (!recursive) {
-      /* Node throws ERR_FS_EISDIR here; the EISDIR-prefixed wording is
-       * divergence 13's documented difference. */
+      /* Node throws a SystemError here (code ERR_FS_EISDIR, syscall "rm",
+       * message "Path is a directory: rm returned EISDIR (is a
+       * directory) <path>" — no "EISDIR:" prefix, path unquoted,
+       * measured) — a class and wording every non-Node lane renders as a
+       * plain Error instead (SEMANTICS.md S073's second sentence). */
       scr_rm_fail_set(f, EISDIR, "rm", path->data, path->len);
       return;
     }

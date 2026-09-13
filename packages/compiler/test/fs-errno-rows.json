@@ -1,0 +1,284 @@
+{
+  "header": {
+    "generator": "gen-fs-errno-rows.mjs",
+    "nodeVersion": "v24.18.1",
+    "platform": "linux",
+    "uidClass": "non-root"
+  },
+  "rows": [
+    {
+      "op": 1,
+      "key": "readFileSync",
+      "code": "ENOENT",
+      "errnoLinux": -2,
+      "syscall": "open",
+      "shape": "one-path",
+      "message": "ENOENT: no such file or directory, open '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 1,
+      "key": "readFileSync",
+      "code": "EISDIR",
+      "errnoLinux": -21,
+      "syscall": "read",
+      "shape": "no-path",
+      "message": "EISDIR: illegal operation on a directory, read",
+      "className": "Error"
+    },
+    {
+      "op": 1,
+      "key": "readFileSync",
+      "code": "ENOTDIR",
+      "errnoLinux": -20,
+      "syscall": "open",
+      "shape": "one-path",
+      "message": "ENOTDIR: not a directory, open '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 1,
+      "key": "readFileSync",
+      "code": "EACCES",
+      "errnoLinux": -13,
+      "syscall": "open",
+      "shape": "one-path",
+      "message": "EACCES: permission denied, open '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 1,
+      "key": "readFileSync",
+      "code": "ELOOP",
+      "errnoLinux": -40,
+      "syscall": "open",
+      "shape": "one-path",
+      "message": "ELOOP: too many symbolic links encountered, open '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 1,
+      "key": "readFileSync",
+      "code": "ENAMETOOLONG",
+      "errnoLinux": -36,
+      "syscall": "open",
+      "shape": "one-path",
+      "message": "ENAMETOOLONG: name too long, open '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 2,
+      "key": "readdirSync",
+      "code": "ENOENT",
+      "errnoLinux": -2,
+      "syscall": "scandir",
+      "shape": "one-path",
+      "message": "ENOENT: no such file or directory, scandir '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 2,
+      "key": "readdirSync",
+      "code": "ENOTDIR",
+      "errnoLinux": -20,
+      "syscall": "scandir",
+      "shape": "one-path",
+      "message": "ENOTDIR: not a directory, scandir '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 3,
+      "key": "mkdtempSync",
+      "code": "ENOENT",
+      "errnoLinux": -2,
+      "syscall": "mkdtemp",
+      "shape": "one-path",
+      "message": "ENOENT: no such file or directory, mkdtemp '<PATH>XXXXXX'",
+      "className": "Error"
+    },
+    {
+      "op": 9,
+      "key": "writeFileSync",
+      "code": "ENOENT",
+      "errnoLinux": -2,
+      "syscall": "open",
+      "shape": "one-path",
+      "message": "ENOENT: no such file or directory, open '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 9,
+      "key": "writeFileSync",
+      "code": "EISDIR",
+      "errnoLinux": -21,
+      "syscall": "open",
+      "shape": "one-path",
+      "message": "EISDIR: illegal operation on a directory, open '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 10,
+      "key": "appendFileSync",
+      "code": "ENOENT",
+      "errnoLinux": -2,
+      "syscall": "open",
+      "shape": "one-path",
+      "message": "ENOENT: no such file or directory, open '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 10,
+      "key": "appendFileSync",
+      "code": "EISDIR",
+      "errnoLinux": -21,
+      "syscall": "open",
+      "shape": "one-path",
+      "message": "EISDIR: illegal operation on a directory, open '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 11,
+      "key": "mkdirSync",
+      "code": "EEXIST",
+      "errnoLinux": -17,
+      "syscall": "mkdir",
+      "shape": "one-path",
+      "message": "EEXIST: file already exists, mkdir '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 11,
+      "key": "mkdirSync",
+      "code": "ENOENT",
+      "errnoLinux": -2,
+      "syscall": "mkdir",
+      "shape": "one-path",
+      "message": "ENOENT: no such file or directory, mkdir '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 11,
+      "key": "mkdirSync",
+      "code": "ENOTDIR",
+      "errnoLinux": -20,
+      "syscall": "mkdir",
+      "shape": "one-path",
+      "message": "ENOTDIR: not a directory, mkdir '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 11,
+      "key": "mkdirRecursiveSync",
+      "code": "ENOTDIR",
+      "errnoLinux": -20,
+      "syscall": "mkdir",
+      "shape": "one-path",
+      "message": "ENOTDIR: not a directory, mkdir '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 12,
+      "key": "rmdirSync",
+      "code": "ENOENT",
+      "errnoLinux": -2,
+      "syscall": "rmdir",
+      "shape": "one-path",
+      "message": "ENOENT: no such file or directory, rmdir '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 12,
+      "key": "rmdirSync",
+      "code": "ENOTDIR",
+      "errnoLinux": -20,
+      "syscall": "rmdir",
+      "shape": "one-path",
+      "message": "ENOTDIR: not a directory, rmdir '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 12,
+      "key": "rmdirSync",
+      "code": "ENOTEMPTY",
+      "errnoLinux": -39,
+      "syscall": "rmdir",
+      "shape": "one-path",
+      "message": "ENOTEMPTY: directory not empty, rmdir '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 13,
+      "key": "unlinkSync",
+      "code": "ENOENT",
+      "errnoLinux": -2,
+      "syscall": "unlink",
+      "shape": "one-path",
+      "message": "ENOENT: no such file or directory, unlink '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 13,
+      "key": "unlinkSync",
+      "code": "EISDIR",
+      "errnoLinux": -21,
+      "syscall": "unlink",
+      "shape": "one-path",
+      "message": "EISDIR: illegal operation on a directory, unlink '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 14,
+      "key": "rmSync",
+      "code": "ENOENT",
+      "errnoLinux": -2,
+      "syscall": "lstat",
+      "shape": "one-path",
+      "message": "ENOENT: no such file or directory, lstat '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 14,
+      "key": "rmSync",
+      "code": "ERR_FS_EISDIR",
+      "errnoLinux": 21,
+      "syscall": "rm",
+      "shape": "special-systemerror",
+      "message": "Path is a directory: rm returned EISDIR (is a directory) <PATH>",
+      "className": "SystemError"
+    },
+    {
+      "op": 14,
+      "key": "rmOptsSync",
+      "code": "ENOENT",
+      "errnoLinux": -2,
+      "syscall": "lstat",
+      "shape": "one-path",
+      "message": "ENOENT: no such file or directory, lstat '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 20,
+      "key": "accessSync",
+      "code": "ENOENT",
+      "errnoLinux": -2,
+      "syscall": "access",
+      "shape": "one-path",
+      "message": "ENOENT: no such file or directory, access '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 20,
+      "key": "accessSync",
+      "code": "EACCES",
+      "errnoLinux": -13,
+      "syscall": "access",
+      "shape": "one-path",
+      "message": "EACCES: permission denied, access '<PATH>'",
+      "className": "Error"
+    }
+  ],
+  "mkdirRecursiveReturn": {
+    "firstCreated": "<PATH>/rec",
+    "secondCreated": null
+  }
+}

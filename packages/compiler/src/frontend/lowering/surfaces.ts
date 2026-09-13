@@ -990,7 +990,13 @@ export const AMBIENT_SURFACE_FNS: readonly AmbientSurfaceRow[] = [
     fns: ["process.kill", "process.killNum"],
     note: "the signal-name and signal-number forms are one surface",
   },
-  { id: "node-builtin.process.umask", kind: "node-builtin", name: "process.umask", fns: ["process.umask"] },
+  {
+    id: "node-builtin.process.umask",
+    kind: "node-builtin",
+    name: "process.umask",
+    fns: ["process.umask", "process.umaskRead"],
+    note: "the set and read forms are one surface (board #142)",
+  },
   {
     id: "node-builtin.process.exit",
     kind: "node-builtin",

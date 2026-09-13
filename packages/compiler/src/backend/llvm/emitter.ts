@@ -232,6 +232,13 @@ const LIB_FN_SYMS: Record<string, string> = {
   "process.versionsNode": "scr_process_versions_node",
   "process.versionsOpenssl": "scr_process_versions_openssl",
   "process.umask": "scr_process_umask",
+  // board #142: umaskRead's OWN row, documenting the symbol it reuses —
+  // the special case right below (never hidden in a helper, CP1 delta
+  // (b)) supplies the constant argument the generic dispatcher below
+  // cannot: umaskRead is 0-ary at the IR level, `scr_process_umask` is
+  // 1-ary, and the generic path maps `e.args` 1:1 with no way to inject
+  // a value not present in the call's own arguments.
+  "process.umaskRead": "scr_process_umask",
   "process.uptime": "scr_process_uptime",
   "perf.now": "scr_perf_now",
   "process.availableMemory": "scr_available_memory",
@@ -12038,6 +12045,23 @@ class LlEmitter {
     // case above already drops what it doesn't need). Dropped here,
     // before the generic dispatcher below — never forwarded to the C
     // runtime, same shape as that existing precedent.
+    // board #142: process.umaskRead is 0-ary at the IR level, but its OWN
+    // C symbol (scr_process_umask, the SAME one process.umask uses) is
+    // 1-ary — the generic dispatcher below maps `e.args` 1:1 into the
+    // call's argument list, which for an EMPTY args array would emit a
+    // wrong-arity `call double @scr_process_umask()`. MEASURED (CP1 delta
+    // (b)): the generic path has no mechanism to inject a constant not
+    // present in `e.args`, so this ONE case is handled here, visibly, in
+    // the table's own file, reading the symbol name FROM the table (never
+    // a second hardcoded string) rather than hidden in a helper.
+    if (e.fn === "process.umaskRead") {
+      const sym = LIB_FN_SYMS[e.fn];
+      if (sym === undefined) throw new LlvmUnsupportedError(`libCall:${e.fn}`, e.loc);
+      this.declare(`declare double @${sym}(double)`);
+      const t = B.tmp();
+      B.line(`${t} = call double @${sym}(double -1.000000e+00)`);
+      return this.own({ name: t, type: e.type });
+    }
     const dropsIsLiteral = e.fn === "assert.throwsRegex" || e.fn === "assert.regexErrTest";
     const sym = LIB_FN_SYMS[e.fn];
     if (sym === undefined) throw new LlvmUnsupportedError(`libCall:${e.fn}`, e.loc);

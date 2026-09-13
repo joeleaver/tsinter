@@ -5867,17 +5867,19 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       }
       return { kind: "libCall", fn: "process.activeResources", args: [], type: arrayOf(STRING), loc };
     }
-    // umask(2): the no-argument form reads without setting (the frontend
-    // completes it to the -1 read sentinel); umask(mask) sets and answers
-    // the previous mask, Node's shape either way.
+    // umask(2): the no-argument form reads without setting — board #142,
+    // a SEPARATE IrLibFn (process.umaskRead) rather than a -1 sentinel
+    // that collided with a user-written `process.umask(-1)` (an explicit
+    // out-of-range SET call Node itself rejects with ERR_OUT_OF_RANGE);
+    // umask(mask) sets and answers the previous mask.
     if (member === "umask") {
       if (call.arguments.length > 1) {
         L.noLowering(`process.umask with ${call.arguments.length} arguments`, call);
       }
-      const mask: IrExpr =
-        call.arguments.length === 1
-          ? L.lowerExpr(call.arguments[0]!)
-          : { kind: "numLit", value: -1, type: F64, loc };
+      if (call.arguments.length === 0) {
+        return { kind: "libCall", fn: "process.umaskRead", args: [], type: F64, loc };
+      }
+      const mask = L.lowerExpr(call.arguments[0]!);
       if (mask.type.kind !== "f64") {
         L.noLowering("process.umask of non-number masks", call.arguments[0]!);
       }

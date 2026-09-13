@@ -5017,6 +5017,10 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
             return finish(`scr_process_versions_openssl()`);
           case "process.umask":
             return finish(`scr_process_umask(${arg(0)})`);
+          case "process.umaskRead":
+            // The C's OWN existing read form (board #142): a compile-time
+            // literal -1, never a program-supplied argument.
+            return finish(`scr_process_umask(-1)`);
           case "process.chdir":
             return finish(`scr_process_chdir(${arg(0)})`);
           case "process.exiting":

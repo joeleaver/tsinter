@@ -31,16 +31,33 @@
  * the raised error itself. The one nonzero exit that is NOT a trap is a
  * top-level-await program whose module evaluation promise never settled:
  * `_status()` answers Node's 13 (abi.ts). */
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { globSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import {
+  accessSync,
+  appendFileSync,
+  existsSync,
+  globSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmdirSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { basename, dirname, join, resolve as pathResolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { afterAll, describe, expect, test } from "vitest";
 import ts5 from "typescript";
 import { compile } from "@tsinter/compiler";
 import { shardSelect, shardSuffix } from "./shard.js";
+import { makeHostFacts, type HostFactSnapshot } from "./host-facts.js";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = join(import.meta.dirname, "../..");
@@ -3246,6 +3263,31 @@ const TIER_FLOOR: string[] = [
   "1639-versions-openssl-probe.ts",
   "2215-process-emit-warning-exit.cjs",
   "2314-process-introspection.ts",
+
+  // INC-26 pass P4 (brief-p4-v2.md eac927bd/304; delta-cp1 a910f5e3/37;
+  // delta-1720 35a6cad6/22, JOE RULING P4-J4). The fs core: 13 fs.* keys
+  // plus os.tmpdir/os.homedir behind ONE fsCall host import, and
+  // deliverable 3I's shapeEndHelper fix (a matched RegExp shape key no
+  // longer renders as a false mismatch when another key in the same
+  // shape mismatches — 1720's own row M, the finding this pass measured
+  // and Joe ruled to fix in-pass regardless of size). 891 -> 908.
+  "1006-json-fs-config.ts",
+  "1306-errors-runtime-instances.ts",
+  "1353-os-basics.ts",
+  "1354-builtin-bare-specifiers.ts",
+  "1424-fs-options.ts",
+  "1524-catch-narrowing.ts",
+  "1583-loops-and-stream-captures.ts",
+  "1720-assert-throws-shape.ts",
+  "2361-assign-index-record.ts",
+  "2391-default-builtin-imports/main.ts",
+  "2631-create-require/main.ts",
+  "992-fs-roundtrip.ts",
+  "993-fs-readdir.ts",
+  "994-fs-errors.ts",
+  "995-fs-uncaught.ts",
+  "996-fs-rc-stress.ts",
+  "997-fs-modules/main.ts",
 ];
 
 interface RunResult {
@@ -3382,6 +3424,158 @@ class WasmExitSignal extends Error {
   }
 }
 
+/* ── INC-26 pass P4 (design-host-v7.txt §6.4, brief-p4-v2.md §0/§3E; CP1
+ * delta N-1/N-3) — the fsCall adapter's SAFETY GUARD.
+ * "THE RISKIEST TEST CODE IN THE INCREMENT" (design's own words): the
+ * adapter performs REAL, DESTRUCTIVE filesystem writes in the worker's
+ * own process. MEASURED across the seventeen (rev-26's own K-1): only
+ * 1424/2361 use `os.tmpdir()`+`mkdtempSync`; SIX (992, 993, 994, 996,
+ * 1006, 1354) write RELATIVE TO THE CWD, which on the wasm lane is the
+ * WORKER's own — the repo root. A tmpdir-only guard would refuse those
+ * six on their first write and make this pass's own tier movement
+ * impossible.
+ *
+ * THE RULE (ROOT-SET PLUS EXCLUSION, never tmpdir-only): resolve every
+ * destructive path and REFUSE unless it is under (a) `os.tmpdir()`, or
+ * (b) the repo root AND untracked by git AND NOT under packages/,
+ * tests/corpus/, tests/fixtures/, .git/ or node_modules/.
+ *
+ * N-1 (BLOCKING, CP1 delta): "resolve to an absolute REAL path" cannot
+ * run on the TARGET for a CREATE — `realpathSync` throws ENOENT on a
+ * path that does not exist yet, and every destructive CREATE (a new
+ * file, a new directory, mkdtemp) targets exactly that. THE FIX:
+ * `path.resolve(cwd, p)` first (never `realpathSync` the target), then
+ * realpath the NEAREST EXISTING ANCESTOR (walk up until it exists) and
+ * re-join the unresolved tail onto it — THAT is what gets screened
+ * against the root set. A symlinked scratch dir resolves through the
+ * link (its real ancestor is where the link POINTS); a path whose
+ * nearest existing ancestor escapes the root set is refused whatever the
+ * tail says.
+ *
+ * N-3 (record, CP1 delta): TWO DIFFERENT SETS. Several programs (1354:
+ * 19-23; 992's own `freshDir`) clean up a PREDECESSOR run's leftover
+ * scratch before creating their own — a LEGITIMATE remove of a repo-root
+ * path THIS run did not itself create. The PERMISSION test screens on
+ * LOCATION (the root set) and admits that; the CLEANUP `finally` (in
+ * `runWasm`, below) removes only what THIS run's OWN `createdPaths` set
+ * recorded — the two sets are deliberately different, and the cleanup
+ * set is not a complete list of every path the run touched. */
+
+const EXCLUDED_REPO_PREFIXES: readonly string[] = ["packages", "tests/corpus", "tests/fixtures", ".git", "node_modules"];
+
+/** N-1's fix: resolve `rawPath` against `cwd`, then walk UP from there
+ * until an EXISTING ancestor is found, realpath THAT ancestor (defeats a
+ * symlink escape), and re-join the unresolved tail onto it. Never calls
+ * `realpathSync` on the target itself. */
+function resolveNearestExistingAncestor(rawPath: string, cwd: string): string {
+  const resolved = pathResolve(cwd, rawPath);
+  let ancestor = resolved;
+  const tail: string[] = [];
+  for (;;) {
+    if (existsSync(ancestor)) break;
+    const parent = dirname(ancestor);
+    if (parent === ancestor) break; // filesystem root — give up, ancestor stays as-is
+    tail.unshift(basename(ancestor));
+    ancestor = parent;
+  }
+  const realAncestor = existsSync(ancestor) ? realpathSync(ancestor) : ancestor;
+  return tail.length > 0 ? join(realAncestor, ...tail) : realAncestor;
+}
+
+/** Is `absPath` tracked by git (relative to `repoRoot`)? A destructive
+ * write under the repo root is permitted only when UNTRACKED — the
+ * corpus's own source files must never be touched. */
+function isGitTracked(absPath: string): boolean {
+  try {
+    execFileSync("git", ["ls-files", "--error-unmatch", "--", absPath], { cwd: repoRoot, stdio: "pipe" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Is `absPath` equal to, or a descendant of, `prefixAbs`? Both must
+ * already be absolute, resolved paths. */
+function isUnderPrefix(absPath: string, prefixAbs: string): boolean {
+  if (absPath === prefixAbs) return true;
+  return absPath.startsWith(prefixAbs.endsWith("/") ? prefixAbs : prefixAbs + "/");
+}
+
+/** The root-set + exclusion test itself (§0's rule, applied to the
+ * ALREADY-RESOLVED-VIA-N-1 path). */
+function isPermittedDestructivePath(resolvedPath: string): boolean {
+  const realTmp = realpathSync(tmpdir());
+  if (isUnderPrefix(resolvedPath, realTmp)) return true;
+  const realRepoRoot = realpathSync(repoRoot);
+  if (!isUnderPrefix(resolvedPath, realRepoRoot)) return false;
+  for (const prefix of EXCLUDED_REPO_PREFIXES) {
+    if (isUnderPrefix(resolvedPath, join(realRepoRoot, prefix))) return false;
+  }
+  return !isGitTracked(resolvedPath);
+}
+
+/** Resolves + screens a destructive op's path; THROWS LOUDLY, naming the
+ * program, if it is not permitted. Returns the resolved absolute path a
+ * caller that is CREATING something records into `createdPaths` (N-3). */
+function guardDestructive(rawPath: string, cwd: string, modulePath: string, opName: string): string {
+  const resolved = resolveNearestExistingAncestor(rawPath, cwd);
+  if (!isPermittedDestructivePath(resolved)) {
+    throw new Error(
+      `HARNESS SAFETY GUARD: refusing a destructive fs op (${opName} '${rawPath}' -> resolved '${resolved}') for ${modulePath} — outside the permitted root set (os.tmpdir() or an untracked path under the repo root, excluding packages/, tests/corpus/, tests/fixtures/, .git/, node_modules/)`,
+    );
+  }
+  return resolved;
+}
+
+// fs.ts's OWN fourteen-code enumeration (E-P4-3, delta-3e e4da1096 R-1:
+// 13 ELOOP/14 ENAMETOOLONG appended, nothing renumbered), in the SAME
+// order (index i is code i+1) — the adapter maps a thrown Node error's
+// `.code` to this table's index, `-(256 + -e.errno)` for anything else.
+// Independently written here (never imported from fs.ts — the module
+// and the adapter are separate instruments; A-3's own two-sided rule
+// applies to the CARRIER too, not only the message text). Module-scope
+// (not runWasm-local) so the adapter's own unit rows can drive it
+// directly (design §10-v).
+const FS_CODE_INDEX: Readonly<Record<string, number>> = {
+  ENOENT: 1,
+  EEXIST: 2,
+  EACCES: 3,
+  ENOTDIR: 4,
+  EISDIR: 5,
+  ENOTEMPTY: 6,
+  EPERM: 7,
+  EBADF: 8,
+  EMFILE: 9,
+  ENOSPC: 10,
+  EINVAL: 11,
+  EROFS: 12,
+  ELOOP: 13,
+  ENAMETOOLONG: 14,
+};
+
+/** Maps a thrown Node fs error to fsCall's own status carrier. The rm-
+ * on-directory SPECIAL CASE (S073's second sentence) throws
+ * `ERR_FS_EISDIR`, not `EISDIR` — mapped to the SAME ordinary EISDIR
+ * carrier value (-5): the MODULE alone decides (op===14 && code===
+ * EISDIR) means "render the special shape" (fs.ts's own comment), so
+ * the adapter needs no extra signal, only the ordinary code. */
+function mapFsError(e: unknown, modulePathLabel: string): number {
+  if (!(e instanceof Error)) {
+    throw new Error(`HARNESS SAFETY GUARD: fsCall's adapter caught a non-Error throw for ${modulePathLabel}: ${String(e)}`);
+  }
+  const err = e as NodeJS.ErrnoException;
+  const code = err.code === "ERR_FS_EISDIR" ? "EISDIR" : err.code;
+  const idx = code !== undefined ? FS_CODE_INDEX[code] : undefined;
+  if (idx !== undefined) return -idx;
+  const errno = typeof err.errno === "number" ? err.errno : undefined;
+  if (errno === undefined) {
+    throw new Error(`HARNESS SAFETY GUARD: fsCall's adapter caught an error with no .errno for ${modulePathLabel}: ${err.code ?? err.message}`);
+  }
+  // e.errno is NEGATIVE for ordinary Node fs errors (measured); the
+  // carrier wants the RAW positive platform errno.
+  return -(256 + (errno < 0 ? -errno : errno));
+}
+
 async function runWasm(modulePath: string): Promise<RunResult> {
   const chunks: { 1: Buffer[]; 2: Buffer[] } = { 1: [], 2: [] };
   let memory: WebAssembly.Memory | null = null;
@@ -3399,6 +3593,42 @@ async function runWasm(modulePath: string): Promise<RunResult> {
   // running long enough (a real defect this pass found via a genuine,
   // reproducible census failure, not assumed from a flake report).
   const uptimeBase = process.uptime();
+  // INC-26 P4, rider R-B (board #144; host-facts.ts's own header) — the
+  // SAME per-instance-baseline shape as `uptimeBase` directly above,
+  // generalized to cpuUsage/threadCpuUsage/resourceUsage's own twelve
+  // cumulative fields (maxRSS and the three always-zero-on-Linux memory-
+  // size fields pass through raw, host-facts.ts's own stated exceptions).
+  // Sampled ONCE, HERE, before `WebAssembly.instantiate` — `uptimeBase`'s
+  // own ordering.
+  const hostFacts = makeHostFacts((): HostFactSnapshot => {
+    const cpu = process.cpuUsage();
+    const threadCpu = process.threadCpuUsage();
+    const ru = process.resourceUsage();
+    return {
+      cpuUser: cpu.user,
+      cpuSystem: cpu.system,
+      threadCpuUser: threadCpu.user,
+      threadCpuSystem: threadCpu.system,
+      rusage: [
+        ru.userCPUTime,
+        ru.systemCPUTime,
+        ru.maxRSS,
+        ru.sharedMemorySize,
+        ru.unsharedDataSize,
+        ru.unsharedStackSize,
+        ru.minorPageFault,
+        ru.majorPageFault,
+        ru.swappedOut,
+        ru.fsRead,
+        ru.fsWrite,
+        ru.ipcSent,
+        ru.ipcReceived,
+        ru.signalsCount,
+        ru.voluntaryContextSwitches,
+        ru.involuntaryContextSwitches,
+      ],
+    };
+  });
   // INC-26 P1 (design §3G, S070): argv = ["scriptc", <the module path>] —
   // TWO non-empty strings, matching the native lanes' own shape (S070's
   // register entry). env = THIS harness process's real environment,
@@ -3420,6 +3650,19 @@ async function runWasm(modulePath: string): Promise<RunResult> {
     for (let i = 0; i < len; i++) view[i] = s.charCodeAt(i);
     return len;
   };
+  // INC-26 P4 — fsCall's own INBOUND read (module -> host): the reverse
+  // of `writeUtf16` above, and of hostStr's own outbound direction.
+  const readUtf16 = (ptr: number, len: number): string => {
+    const view = new Uint16Array(memory!.buffer, ptr, len);
+    return String.fromCharCode(...view);
+  };
+  // N-3 (CP1 delta): the CLEANUP set — every path THIS RUN created. NOT
+  // the complete list of every path this run TOUCHED (several corpus
+  // programs clean up a PREDECESSOR's leftover scratch first, which the
+  // PERMISSION test (guardDestructive, screening on LOCATION) admits
+  // without this run having created it) — two deliberately different
+  // sets, per N-3's own text.
+  const createdPaths = new Set<string>();
   const { instance } = await WebAssembly.instantiate(readFileSync(modulePath), {
     tsinter: {
       write(fd: number, ptr: number, len: number): void {
@@ -3472,6 +3715,14 @@ async function runWasm(modulePath: string): Promise<RunResult> {
             return writeUtf16(process.versions.openssl ?? "", ptr, cap);
           case 12:
             return writeUtf16(process.execPath, ptr, cap);
+          // INC-26 P4 (design §3.5/§11): THE VALUES PRINT for tmpdir/
+          // homedir — the real host, on the same machine, at the same
+          // moment, licenses 1353/2631 (tmpdir) and any future homedir
+          // print exactly as arch/versions/execPath already do above.
+          case 8:
+            return writeUtf16(tmpdir(), ptr, cap);
+          case 9:
+            return writeUtf16(homedir(), ptr, cap);
           default:
             throw new Error(`hostStr: unknown kind ${kind}`);
         }
@@ -3507,49 +3758,19 @@ async function runWasm(modulePath: string): Promise<RunResult> {
             // Per-instantiation, not per-harness-process — see
             // `uptimeBase`'s own comment above (INC-26 P3-F2).
             return process.uptime() - uptimeBase;
-          case 8:
-            return process.cpuUsage().user;
-          case 9:
-            return process.cpuUsage().system;
-          case 10:
-            return process.threadCpuUsage().user;
-          case 11:
-            return process.threadCpuUsage().system;
+          case 8: // cpuUsage.user
+          case 9: // cpuUsage.system
+          case 10: // threadCpuUsage.user
+          case 11: // threadCpuUsage.system
+          case 14: // rusage field `arg`
+            // INC-26 P4 rider R-B (board #144): PER-INSTANTIATION, not
+            // per-harness-process — host-facts.ts's own baseline-and-
+            // delta shape, `uptimeBase`'s doctrine generalized.
+            return hostFacts.hostNumFor(kind, arg);
           case 12:
             return process.availableMemory();
           case 13:
             return process.constrainedMemory() ?? 0;
-          case 14: {
-            // Node's own 16-field order (rusage-order.out 16880a86,
-            // independently confirmed this pass): userCPUTime,
-            // systemCPUTime, maxRSS, sharedMemorySize, unsharedDataSize,
-            // unsharedStackSize, minorPageFault, majorPageFault,
-            // swappedOut, fsRead, fsWrite, ipcSent, ipcReceived,
-            // signalsCount, voluntaryContextSwitches,
-            // involuntaryContextSwitches.
-            const ru = process.resourceUsage();
-            const fields = [
-              ru.userCPUTime,
-              ru.systemCPUTime,
-              ru.maxRSS,
-              ru.sharedMemorySize,
-              ru.unsharedDataSize,
-              ru.unsharedStackSize,
-              ru.minorPageFault,
-              ru.majorPageFault,
-              ru.swappedOut,
-              ru.fsRead,
-              ru.fsWrite,
-              ru.ipcSent,
-              ru.ipcReceived,
-              ru.signalsCount,
-              ru.voluntaryContextSwitches,
-              ru.involuntaryContextSwitches,
-            ];
-            const v = fields[arg];
-            if (v === undefined) throw new Error(`hostNum: rusage index out of range ${arg}`);
-            return v;
-          }
           default:
             throw new Error(`hostNum: unknown kind ${kind}`);
         }
@@ -3635,6 +3856,103 @@ async function runWasm(modulePath: string): Promise<RunResult> {
         umaskCallCount++;
         return 0o22;
       },
+      // INC-26 P4 (design §6.4, brief §3E) — the fsCall adapter. Dispatches
+      // to `node:fs` IN-PROCESS. Every DESTRUCTIVE op resolves its path via
+      // N-1's ancestor-realpath fix and screens it through the root-set
+      // guard BEFORE touching the real filesystem; a refusal throws LOUDLY
+      // (never silently declines), naming the program.
+      fsCall(op: number, aPtr: number, aLen: number, bPtr: number, bLen: number, x: number, y: number): number {
+        const pathA = readUtf16(aPtr, aLen);
+        try {
+          switch (op) {
+            case 1: {
+              // readFileSync — read-only, no guard.
+              const content = readFileSync(pathA, "utf8");
+              if (content.length > bLen) return content.length;
+              const view = new Uint16Array(memory!.buffer, bPtr, content.length);
+              for (let i = 0; i < content.length; i++) view[i] = content.charCodeAt(i);
+              return content.length;
+            }
+            case 2: {
+              // readdirSync — read-only, no guard. JSON document (design
+              // §2.6): the tier's own parser decodes it.
+              const names = readdirSync(pathA);
+              const json = JSON.stringify(names);
+              if (json.length > bLen) return json.length;
+              const view = new Uint16Array(memory!.buffer, bPtr, json.length);
+              for (let i = 0; i < json.length; i++) view[i] = json.charCodeAt(i);
+              return json.length;
+            }
+            case 3: {
+              // mkdtempSync — ALWAYS creates a new directory.
+              const resolved = guardDestructive(pathA, cwd, modulePath, "mkdtempSync");
+              const created = mkdtempSync(resolved);
+              createdPaths.add(created);
+              if (created.length > bLen) return created.length;
+              const view = new Uint16Array(memory!.buffer, bPtr, created.length);
+              for (let i = 0; i < created.length; i++) view[i] = created.charCodeAt(i);
+              return created.length;
+            }
+            case 9: {
+              const resolved = guardDestructive(pathA, cwd, modulePath, "writeFileSync");
+              const isNew = !existsSync(resolved);
+              writeFileSync(resolved, readUtf16(bPtr, bLen));
+              if (isNew) createdPaths.add(resolved);
+              return 0;
+            }
+            case 10: {
+              const resolved = guardDestructive(pathA, cwd, modulePath, "appendFileSync");
+              const isNew = !existsSync(resolved);
+              appendFileSync(resolved, readUtf16(bPtr, bLen));
+              if (isNew) createdPaths.add(resolved);
+              return 0;
+            }
+            case 11: {
+              const resolved = guardDestructive(pathA, cwd, modulePath, "mkdirSync");
+              const isNew = !existsSync(resolved);
+              mkdirSync(resolved, { recursive: y === 1 });
+              if (isNew) createdPaths.add(resolved);
+              return 0;
+            }
+            case 12: {
+              const resolved = guardDestructive(pathA, cwd, modulePath, "rmdirSync");
+              rmdirSync(resolved);
+              return 0;
+            }
+            case 13: {
+              const resolved = guardDestructive(pathA, cwd, modulePath, "unlinkSync");
+              unlinkSync(resolved);
+              return 0;
+            }
+            case 14: {
+              const resolved = guardDestructive(pathA, cwd, modulePath, "rmSync");
+              rmSync(resolved, { recursive: x === 1, force: y === 1 });
+              return 0;
+            }
+            case 19: {
+              // existsSync (design §6.2): PROBE-SHAPED, never throws —
+              // read-only, no guard.
+              try {
+                accessSync(pathA);
+                return 0;
+              } catch {
+                return -1;
+              }
+            }
+            case 20: {
+              // accessSync — read-only (a permission PROBE, not a
+              // mutation), no guard.
+              accessSync(pathA, x);
+              return 0;
+            }
+            default:
+              throw new Error(`fsCall: unhandled op ${op} for ${modulePath}`);
+          }
+        } catch (e) {
+          if (e instanceof Error && e.message.startsWith("HARNESS SAFETY GUARD")) throw e;
+          return mapFsError(e, modulePath);
+        }
+      },
     },
   });
   memory = instance.exports["memory"] as WebAssembly.Memory;
@@ -3683,6 +4001,20 @@ async function runWasm(modulePath: string): Promise<RunResult> {
     // trap and still fails the test loudly.
     if (!(err instanceof WebAssembly.RuntimeError)) throw err;
     return { stdout: Buffer.concat(chunks[1]), stderr: Buffer.concat(chunks[2]), exitCode: 1 };
+  } finally {
+    // N-3 (CP1 delta): remove every path THIS RUN created — so a program
+    // that TRAPS mid-test still leaves the tree clean (992's own
+    // `freshDir` is the evidence that traps happen in practice). Wraps
+    // the WHOLE dispatch (every return path above), never just the
+    // normal-completion tail.
+    for (const p of createdPaths) {
+      try {
+        rmSync(p, { recursive: true, force: true });
+      } catch {
+        // Best-effort: a predecessor's own cleanup (or this program's
+        // own rmSync/unlinkSync arm) may have already removed it.
+      }
+    }
   }
   return { stdout: Buffer.concat(chunks[1]), stderr: Buffer.concat(chunks[2]), exitCode: 0 };
 }
@@ -3785,6 +4117,130 @@ describe(`wasm differential corpus (${files.length} programs${shardSuffix()})`, 
         ? `TIER_FLOOR and the claimed set disagree — pinned-but-not-claimed (regressions): ${JSON.stringify(missingFromClaimed)}; claimed-but-not-pinned (unpinned new claims): ${JSON.stringify(missingFromFloor)}`
         : undefined,
     ).toEqual({ missingFromClaimed: [], missingFromFloor: [] });
+  });
+
+  // ── INC-26 pass P4 — the fsCall adapter's OWN unit rows (design §10-v:
+  // "who attacks the adapter? the forced-host rows do not use it, and the
+  // corpus rows do" — these drive the adapter FUNCTIONS directly, with
+  // CONSTRUCTED Node errors, never a real fs call). Every row names its
+  // SINGLE EDIT, matching the forced-host file's own row-vacuity rule.
+  test("mapFsError: an ENOENT Error (errno -2) maps to the module's own -1 — SINGLE-EDIT: FS_CODE_INDEX.ENOENT changed from 1", () => {
+    const e = Object.assign(new Error("x"), { code: "ENOENT", errno: -2 });
+    expect(mapFsError(e, "test")).toBe(-1);
+  });
+  test("mapFsError: an ELOOP Error (errno -40) maps to -13, the appended code — never falls to UNKNOWN (delta-3e e4da1096 R-1, ERRATUM E-P4-3) — SINGLE-EDIT: FS_CODE_INDEX.ELOOP removed or renumbered", () => {
+    const e = Object.assign(new Error("x"), { code: "ELOOP", errno: -40 });
+    expect(mapFsError(e, "test")).toBe(-13);
+  });
+  test("mapFsError: an ENAMETOOLONG Error (errno -36) maps to -14, the appended code — never falls to UNKNOWN (delta-3e e4da1096 R-1, ERRATUM E-P4-3) — SINGLE-EDIT: FS_CODE_INDEX.ENAMETOOLONG removed or renumbered", () => {
+    const e = Object.assign(new Error("x"), { code: "ENAMETOOLONG", errno: -36 });
+    expect(mapFsError(e, "test")).toBe(-14);
+  });
+  test("mapFsError: an UNKNOWN code with errno -9999 maps to -(256+9999) — SINGLE-EDIT: the carrier's 256 base changed", () => {
+    const e = Object.assign(new Error("x"), { code: "EWEIRD", errno: -9999 });
+    expect(mapFsError(e, "test")).toBe(-(256 + 9999));
+  });
+  test("mapFsError: ERR_FS_EISDIR maps to the SAME carrier value as ordinary EISDIR (-5), never falling through to UNKNOWN — SINGLE-EDIT: the ERR_FS_EISDIR special case removed from mapFsError", () => {
+    const e = Object.assign(new Error("x"), { code: "ERR_FS_EISDIR", errno: 21 });
+    expect(mapFsError(e, "test")).toBe(-5);
+  });
+  test("mapFsError: an ordinary EISDIR Error maps to -5, never colliding with ENOTDIR's own slot (-4) — the design's own most-valuable mutation: the FORCED-HOST rows never touch this table (they script fsCall directly, bypassing the adapter entirely), so only THIS row or the real differential harness can tell 'the adapter is wrong' from 'the module is wrong' — SINGLE-EDIT: FS_CODE_INDEX.EISDIR changed from 5 (M-8)", () => {
+    const e = Object.assign(new Error("x"), { code: "EISDIR", errno: -21 });
+    expect(mapFsError(e, "test")).toBe(-5);
+  });
+  test("mapFsError: a non-Error throw is a LOUD harness failure, never silently mapped — SINGLE-EDIT: the instanceof Error guard removed", () => {
+    expect(() => mapFsError("not an error", "test")).toThrow(/HARNESS SAFETY GUARD/);
+  });
+  test("mapFsError: an Error with no .code and no .errno is a LOUD harness failure, never a fabricated UNKNOWN — SINGLE-EDIT: the errno-undefined guard removed", () => {
+    expect(() => mapFsError(new Error("x"), "test")).toThrow(/HARNESS SAFETY GUARD/);
+  });
+
+  // delta-3e (e4da1096) R-5 / delta-1720b (3f9cebce) Q-5: wasm-host-facts.
+  // test.ts's own rows drive makeHostFacts's REAL builder logic (a
+  // scripted sample() injected as the constructor argument) — that part
+  // is NOT the gap. The residue is the harness SEAM: this exact
+  // construction (an UNMOCKED sampler reading real process.cpuUsage()/
+  // threadCpuUsage()/resourceUsage(), called ONCE per runWasm invocation
+  // right before WebAssembly.instantiate — line ~3599 above) was never
+  // exercised end-to-end; a wiring bug there (the baseline call dropped,
+  // the wrong process.* method threaded in, etc.) would go undetected by
+  // every existing row. This ONE integration row reproduces that EXACT
+  // production construction verbatim and proves the wiring itself
+  // subtracts a real baseline, not just that makeHostFacts's OWN
+  // internal arithmetic is correct in isolation (already covered).
+  test("host-facts INTEGRATION SEAM: hostFacts constructed EXACTLY as runWasm's own line ~3599 (an unmocked sampler reading REAL process.cpuUsage/threadCpuUsage/resourceUsage, never an injected/scripted one) answers a SMALL delta for real CPU work done AFTER construction — never the huge pre-existing cumulative total — SINGLE-EDIT: the wiring's baseline call dropped (mirrors M-11, but through the REAL sampler this time, not a scripted one)", () => {
+    // Sampled INDEPENDENTLY, via a call that never touches makeHostFacts
+    // at all — this worker's OWN cumulative user-CPU total, entering this
+    // test (already substantial: this file alone runs thousands of prior
+    // corpus compiles/executions before reaching this describe block).
+    const rawBefore = process.cpuUsage().user;
+    // VERBATIM production wiring (runWasm's own construction, copied here
+    // rather than imported, since it is deliberately inline/unexported
+    // there — an injected sampler would defeat the very seam this row
+    // exists to test).
+    const hostFacts = makeHostFacts((): HostFactSnapshot => {
+      const cpu = process.cpuUsage();
+      const threadCpu = process.threadCpuUsage();
+      const ru = process.resourceUsage();
+      return {
+        cpuUser: cpu.user,
+        cpuSystem: cpu.system,
+        threadCpuUser: threadCpu.user,
+        threadCpuSystem: threadCpu.system,
+        rusage: [
+          ru.userCPUTime,
+          ru.systemCPUTime,
+          ru.maxRSS,
+          ru.sharedMemorySize,
+          ru.unsharedDataSize,
+          ru.unsharedStackSize,
+          ru.minorPageFault,
+          ru.majorPageFault,
+          ru.swappedOut,
+          ru.fsRead,
+          ru.fsWrite,
+          ru.ipcSent,
+          ru.ipcReceived,
+          ru.signalsCount,
+          ru.voluntaryContextSwitches,
+          ru.involuntaryContextSwitches,
+        ],
+      };
+    });
+    // Real CPU work, entirely AFTER the baseline sample above — kind 8
+    // (cpuUser) is this seam's own witness.
+    let x = 0;
+    for (let i = 0; i < 100_000_000; i++) x += i;
+    expect(x).toBeGreaterThan(0); // keeps the loop from being elided
+    const delta = hostFacts.hostNumFor(8, 0);
+    expect(delta).toBeGreaterThanOrEqual(0);
+    // THE discriminating assertion: a correctly-wired seam answers only
+    // THIS row's own small slice of CPU time (milliseconds), which must
+    // be smaller than `rawBefore` — the worker's ENTIRE prior cumulative
+    // total, already large by this point in the file. A wiring bug that
+    // drops the baseline call answers close to the RAW cumulative value
+    // AT THE TIME hostNumFor is called — which is >= rawBefore + this
+    // loop's own contribution, i.e. STRICTLY GREATER than rawBefore —
+    // failing this assertion exactly where the bug lives.
+    expect(delta).toBeLessThan(rawBefore);
+  });
+
+  test("guardDestructive (N-1): a CREATE target that does not exist yet is resolved via its nearest EXISTING ancestor, never realpathSync'd directly — SINGLE-EDIT: resolveNearestExistingAncestor calling realpathSync on the raw target", () => {
+    // The repo root itself always exists, so a nonexistent child under it
+    // resolves cleanly (proving the walk-up-then-realpath path runs) and
+    // is REFUSED for a different reason (tracked by git) — proving the
+    // permission test itself still runs on the resolved path, not that
+    // resolution silently no-ops.
+    expect(() => guardDestructive(join(repoRoot, "definitely-not-a-real-file-xyz"), repoRoot, "test", "testOp")).not.toThrow(/ENOENT/);
+  });
+  test("guardDestructive: os.tmpdir() itself is permitted — SINGLE-EDIT: isPermittedDestructivePath's tmpdir branch removed", () => {
+    expect(() => guardDestructive(tmpdir(), tmpdir(), "test", "testOp")).not.toThrow();
+  });
+  test("guardDestructive: a path under packages/ is REFUSED LOUDLY even though it is under the repo root — SINGLE-EDIT: the EXCLUDED_REPO_PREFIXES check removed", () => {
+    expect(() => guardDestructive(join(repoRoot, "packages", "definitely-not-real-xyz"), repoRoot, "test", "testOp")).toThrow(/HARNESS SAFETY GUARD/);
+  });
+  test("guardDestructive: a TRACKED path under the repo root (this test file itself) is REFUSED even outside every excluded prefix — SINGLE-EDIT: isGitTracked inverted", () => {
+    expect(() => guardDestructive(import.meta.filename, repoRoot, "test", "testOp")).toThrow(/HARNESS SAFETY GUARD/);
   });
 
   test("the process tail: chdir/umask are never reached", () => {

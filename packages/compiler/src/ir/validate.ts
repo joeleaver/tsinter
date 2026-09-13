@@ -180,6 +180,7 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "os.type": { argTypes: [], result: STRING },
   "os.totalmem": { argTypes: [], result: F64 },
   "process.umask": { argTypes: [F64], result: F64 },
+  "process.umaskRead": { argTypes: [], result: F64 },
   "process.chdir": { argTypes: [STRING], result: VOID },
   "process.exiting": { argTypes: [], result: BOOL },
   "net.getAutoSelTimeout": { argTypes: [], result: F64 },
