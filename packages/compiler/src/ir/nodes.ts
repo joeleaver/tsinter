@@ -2984,7 +2984,7 @@ export type IrLibFn =
   | "dyn.this"
   /** process.execPath: the compiled binary's own resolved absolute path
    * (one interned string, +1 per read) — the honest answer where Node's
-   * is the node executable's (SEMANTICS.md divergence 12). Never throws. */
+   * is the node executable's (SEMANTICS.md S071). Never throws. */
   | "process.execPath"
   /** process.arch: the compiled binary's OWN architecture ("arm64",
    * "x64") — Node's answer for its own build on the same machine.
@@ -2992,7 +2992,7 @@ export type IrLibFn =
   | "process.arch"
   /** process.versions.node: the runtime's Node COMPATIBILITY TARGET —
    * there is no Node under the binary, so this reports the version whose
-   * semantics the runtime implements (SEMANTICS.md divergence 60, the
+   * semantics the runtime implements (SEMANTICS.md S072, the
    * execPath stance). Interned; +1 per read. Never throws. */
   | "process.versionsNode"
   | "process.versionsOpenssl"

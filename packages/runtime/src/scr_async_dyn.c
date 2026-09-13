@@ -433,7 +433,7 @@ ScrDyn *scr_await_dyn_value(ScrDyn *v) {
  * must imply the dynAsync link). Listeners are dyn functions; emission
  * is SYNCHRONOUS at the
  * call (Node defers a tick through nextTick — the MaxListenersExceeded
- * precedent, SEMANTICS.md 138) and the default stderr report always
+ * precedent, SEMANTICS.md S078) and the default stderr report always
  * prints (Node's own bootstrap listener; a compiled binary has no
  * --no-warnings). The warning VALUE is the dyn error encoding built over
  * an ScrError (identity-cached, so a listener comparing two deliveries

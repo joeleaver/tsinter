@@ -4753,7 +4753,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     // process.versions.node — the ONE lowered member of process.versions:
     // there is no Node under the binary, so the honest answer is the
     // runtime's own Node compatibility target (the version whose semantics
-    // SEMANTICS.md verifies against — divergence 60, the execPath stance).
+    // SEMANTICS.md verifies against — S072, the execPath stance).
     // Other versions members (v8, openssl, ...) name components that do
     // not exist here and fall through to the member fence.
     if (
@@ -4836,7 +4836,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     }
     // process.execPath: the compiled binary's own resolved absolute path —
     // the honest answer where Node's is the node executable's (SEMANTICS.md
-    // divergence 12, the argv[0]/argv[1] precedent).
+    // S071, the argv[0]/argv[1] precedent).
     if (member === "execPath") {
       return { kind: "libCall", fn: "process.execPath", args: [], type: STRING, loc };
     }

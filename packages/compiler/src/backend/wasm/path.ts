@@ -147,6 +147,22 @@ export class PathBuilder {
     });
   }
 
+  /** INC-26 P3 (design-host-v7.txt §0.5 W5, brief-p3-v2.md §0.5) — the ONE
+   * permitted path.ts hunk: `process.chdir`'s emitter arm calls this
+   * DIRECTLY (never through a `cached()` function — it emits two
+   * instructions inline at the CALLER's own code sink) on the SUCCESS
+   * path only, immediately after a successful `chdir` host call.
+   * WITHOUT this, `cwdSnapshotHelper`'s memo (above) would answer the
+   * directory the module started in for the rest of the program's life —
+   * `path.resolve()` and friends read the memo, never the host, so a
+   * successful chdir that does not clear it is invisible to them. */
+  invalidateCwdSnapshot(c: Code): void {
+    const t = this.strRef();
+    if (t.kind !== "ref") throw new Error("emitter bug: strRef() must be a ref type");
+    c.refNull(t.typeIndex);
+    c.globalSet(this.cwdGlobalIdx());
+  }
+
   /* ── shared internals (mirror scr_path.c's own shared internals) ─────── */
 
   /** `%w.path.isSep(code, win32) -> i32 bool` — scr_path_is_sep/

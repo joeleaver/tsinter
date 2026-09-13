@@ -1987,14 +1987,14 @@ double scr_process_getgid(void);
 /* process.execPath: the running binary's own resolved absolute path
  * (_NSGetExecutablePath/readlink(/proc/self/exe) + realpath), interned on
  * first read; +1 per read. Node's value is the node executable's path —
- * SEMANTICS.md divergence 12 documents the difference. */
+ * SEMANTICS.md S071 documents the difference. */
 ScrStr *scr_process_exec_path(void);
 /* process.arch: the binary's OWN architecture ("arm64", "x64") — Node's
  * answer for its own build on the same machine. +1 interned. */
 ScrStr *scr_process_arch(void);
 /* process.versions.node: the runtime's Node COMPATIBILITY TARGET — no
  * Node exists under a compiled binary, so this reports the version whose
- * semantics the runtime implements (SEMANTICS.md divergence 60). +1
+ * semantics the runtime implements (SEMANTICS.md S072). +1
  * interned. */
 ScrStr *scr_process_versions_node(void);
 ScrStr *scr_process_versions_openssl(void);
@@ -3547,7 +3547,7 @@ ScrDyn *scr_promise_reason_dyn(const ScrPromise *p);
 /* process warnings (scr_lib.c — always linked so any unit can emit a
  * deprecation): dyn listeners plus Node's default stderr report
  * ("(node:pid) [CODE] Name: message" and a detail second line). Emission
- * is SYNCHRONOUS at the call (Node defers a tick — SEMANTICS.md 138's
+ * is SYNCHRONOUS at the call (Node defers a tick — SEMANTICS.md S078's
  * precedent). scr_process_emit_warning takes the ARGUMENT VECTOR as one
  * dyn array and applies Node's full grammar/TypeErrors; scr_emit_warning
  * is the C-side deprecation entry. */

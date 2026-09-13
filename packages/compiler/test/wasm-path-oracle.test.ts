@@ -771,9 +771,19 @@ console.log(w.relative("C:\\\\a\\\\b\\\\c", "C:\\\\a\\\\d"));
  * never -1, or cwdSnapshotHelper's own read would be servicing a "no such
  * datum" answer for a fact that always exists on a real host. argv/env/
  * platform (kinds 0/1/2/4) are never reached by this program and answer -1
- * (unreachable, not exercised — hostStr/hostNum must still exist as
- * IMPORTS, which is the whole point of this row: hostStrReachable firing
- * for a relative()-only program is what declares them in the first place). */
+ * (unreachable, not exercised — hostStr must still exist as an IMPORT,
+ * which is the whole point of this row: hostStrReachable firing for a
+ * relative()-only program is what declares it in the first place).
+ * INC-26 P3 (brief-p3-v2.md ffbf2fdf/371 §3A(ii), delta-3e E-4): hostNum
+ * is NOT minted for a path-only program from this pass onward —
+ * hostNumReachable's own alias of hostStrReachable ended here; its new,
+ * independent body has no path key in it, since none of P2's four
+ * cwd-reading path keys ever needed hostNum's argc/env-pair-count
+ * snapshot in the first place. This program's own Module.imports
+ * therefore now lists hostStr WITHOUT hostNum, where it carried both
+ * through P2. The stub below still answers `hostNum` regardless — an
+ * unused import in a module that never declares it is simply never
+ * called, which is why this row's own assertions did not need to change. */
 async function runRelativeOnly(binaryPath: string): Promise<string> {
   const bytes = await readFile(binaryPath);
   const chunks: Buffer[] = [];

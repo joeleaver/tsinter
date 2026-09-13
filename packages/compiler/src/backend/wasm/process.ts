@@ -65,6 +65,28 @@ export interface ProcessDeps {
   hostStrFunc: () => number;
   hostNumFunc: () => number;
   exitFunc: () => number;
+  /** `tsinter.kill`'s index (INC-26 P3, design §2.7) — present whenever
+   * `process.kill`/`process.killNum` is reached. */
+  killFunc: () => number;
+  /** `tsinter.chdir`'s index (INC-26 P3, design §0.5 W5) — present
+   * whenever `process.chdir` is reached. */
+  chdirFunc: () => number;
+  /** `tsinter.umask`'s index (INC-26 P3, design §0.5 W4) — present
+   * whenever `process.umask` is reached. */
+  umaskFunc: () => number;
+  /** `%w.nexttick.enqueueRaw(fn)` — INC-26 P3, L5 (DECISIONS.md
+   * 416a45a1): the stage-B raw-marker seam (nexttick.ts), stream.ts's
+   * `scheduleTick`/`dispatchOne` precedent — `emitWarning`'s deferral
+   * posts ONE bare `() -> ()` marker per warning onto the SAME nextTick
+   * queue user callbacks use, so warnings interleave in true FIFO order. */
+  enqueueRaw: () => number;
+  /** nexttick.ts's `rawFnType()` — the bare-funcref signature
+   * `dispatchWarnings` (below) must declare itself with. */
+  rawFnType: () => number;
+  /** `%w.proc.defaultWarningReport(warning: dyn) -> void` (emitter.ts) —
+   * called from `dispatchWarnings`'s own raw-marker body AFTER listener
+   * dispatch, per L5's ordering. */
+  defaultReportHelper: () => number;
   /** `%w.toInt32(f64)->i32` — NOT used for argc/pair-count (see readHostStr
    * and the snapshot loaders' own comments on why a trapping truncation is
    * the right defensive choice there instead). Kept for callers that need
@@ -129,6 +151,10 @@ export interface ProcessDeps {
    * reason" was loose shorthand — this file follows Node, not the
    * paraphrase, per CLAUDE.md's own "Node is the oracle"). */
   rejHandledCheckHelper: () => number;
+  /** Push a UTF-16 string LITERAL onto `c`'s stack (emitter.ts's own
+   * `pushStrLitInto`, threaded through — INC-26 P3, `killSignalByNameHelper`'s
+   * ONLY use so far). */
+  pushStrLit: (c: Code, value: string) => void;
   /** The pending-exception cell's four globals (emitter.ts's `exc()`) —
    * needed ONLY by `exitDrain`, to snapshot-clear-restore around EACH
    * listener call. Without this, a listener that itself throws (M-18(ii))
@@ -208,6 +234,16 @@ export class ProcessBuilder {
       });
     }
     return this.exitDrainingGlobal;
+  }
+
+  /** `process._exiting`'s model (INC-26 P3, W3, design §4.3): the SAME
+   * flag `exitDrainHelper` sets to 1 at its own top, BEFORE draining the
+   * 'exit' listener list, on ALL THREE reported exit paths (design §4.3
+   * shares one drain helper across all of them) — zero new host, zero
+   * new state. Public only so the emitter's `process.exiting` arm can
+   * `globalGet` it directly. */
+  exitingFlagGlobal(): number {
+    return this.exitDrainingG();
   }
 
   /* ── the exit listener list's struct ──────────────────────────────────── */
@@ -1267,6 +1303,442 @@ export class ProcessBuilder {
       c.end();
       c.end();
       this.mb.setBody(idx, [this.rejListenerRef(), this.rejHandledClosRefForLocal()], c.bytes());
+    });
+  }
+
+  /** `%w.proc.offRejectionHandled(cb)` — INC-26 P3, W2 (board #138):
+   * `offUnhandledRejectionRemove`'s EXACT SHAPE (this file's own header on
+   * that method explains why `dyn.strictEq()` and not a raw `ref.eq`:
+   * `dyn.boxFunc` allocates a fresh wrapper on every box, so two
+   * references to the SAME closure produce two different dyn wrappers),
+   * scoped to the `rejHandled` list's own head/tail globals instead of
+   * the unhandledRejection list's. Walks from `rejHandledListHeadG()` (the
+   * OLDEST registration) and removes the FIRST matching identity found —
+   * Node's own `removeListener` contract — the identical walk direction
+   * `offUnhandledRejectionRemove` already uses. */
+  offRejectionHandledRemove(): number {
+    return this.cached("offRejectionHandled", [this.deps.dynRef()], [], (idx) => {
+      const strictEq = this.deps.dynStrictEq();
+      const c = new Code();
+      const CB = 0;
+      const PREV = 1;
+      const CUR = 2;
+      c.refNull(this.rejListenerT());
+      c.localSet(PREV);
+      c.globalGet(this.rejHandledListHeadG());
+      c.localSet(CUR);
+      c.block();
+      c.loop();
+      c.localGet(CUR);
+      c.refIsNull();
+      c.brIf(1);
+      c.localGet(CUR);
+      c.structGet(this.rejListenerT(), 0);
+      c.localGet(CB);
+      c.call(strictEq);
+      c.ifVoid();
+      c.localGet(PREV);
+      c.refIsNull();
+      c.ifVoid();
+      c.localGet(CUR);
+      c.structGet(this.rejListenerT(), 2);
+      c.globalSet(this.rejHandledListHeadG());
+      c.else_();
+      c.localGet(PREV);
+      c.localGet(CUR);
+      c.structGet(this.rejListenerT(), 2);
+      c.structSet(this.rejListenerT(), 2);
+      c.end();
+      c.globalGet(this.rejHandledListTailG());
+      c.localGet(CUR);
+      c.refEq();
+      c.ifVoid();
+      c.localGet(PREV);
+      c.globalSet(this.rejHandledListTailG());
+      c.end();
+      c.return_();
+      c.end();
+      c.localGet(CUR);
+      c.localSet(PREV);
+      c.localGet(CUR);
+      c.structGet(this.rejListenerT(), 2);
+      c.localSet(CUR);
+      c.br(0);
+      c.end();
+      c.end();
+      this.mb.setBody(idx, [this.rejListenerRef(), this.rejListenerRef()], c.bytes());
+    });
+  }
+
+  /* ── process.onWarning / offWarning / emitWarning's dispatch list ─────
+   * INC-26 P3 (design §3.2/§3D): reuses `rejListenerT()`'s exact struct
+   * shape ONE MORE TIME (its own "once" field stored, unread — warning
+   * listeners have no once-vs-on distinction, matching the
+   * onRejectionHandled list's own precedent for the identical reason)
+   * with its OWN head/tail globals. */
+  private warnListHeadGlobal: number | null = null;
+  private warnListTailGlobal: number | null = null;
+  private warnListHeadG(): number {
+    if (this.warnListHeadGlobal === null) {
+      this.warnListHeadGlobal = this.mb.addGlobal(this.rejListenerRef(), true, (w) => {
+        w.u8(0xd0);
+        w.sleb(this.rejListenerT());
+      });
+    }
+    return this.warnListHeadGlobal;
+  }
+  private warnListTailG(): number {
+    if (this.warnListTailGlobal === null) {
+      this.warnListTailGlobal = this.mb.addGlobal(this.rejListenerRef(), true, (w) => {
+        w.u8(0xd0);
+        w.sleb(this.rejListenerT());
+      });
+    }
+    return this.warnListTailGlobal;
+  }
+
+  onWarningAppend(): number {
+    return this.cached("onWarning", [this.deps.dynRef()], [], (idx) => {
+      const c = new Code();
+      const CB = 0;
+      const NODE = 1;
+      c.localGet(CB);
+      c.i32Const(0); // "once" — unused for this list
+      c.refNull(this.rejListenerT());
+      c.structNew(this.rejListenerT());
+      c.localSet(NODE);
+      c.globalGet(this.warnListTailG());
+      c.refIsNull();
+      c.ifVoid();
+      c.localGet(NODE);
+      c.globalSet(this.warnListHeadG());
+      c.else_();
+      c.globalGet(this.warnListTailG());
+      c.localGet(NODE);
+      c.structSet(this.rejListenerT(), 2);
+      c.end();
+      c.localGet(NODE);
+      c.globalSet(this.warnListTailG());
+      this.mb.setBody(idx, [this.rejListenerRef()], c.bytes());
+    });
+  }
+
+  /** Identity removal, `offUnhandledRejectionRemove`'s exact shape,
+   * scoped to the warning list. */
+  offWarningRemove(): number {
+    return this.cached("offWarning", [this.deps.dynRef()], [], (idx) => {
+      const strictEq = this.deps.dynStrictEq();
+      const c = new Code();
+      const CB = 0;
+      const PREV = 1;
+      const CUR = 2;
+      c.refNull(this.rejListenerT());
+      c.localSet(PREV);
+      c.globalGet(this.warnListHeadG());
+      c.localSet(CUR);
+      c.block();
+      c.loop();
+      c.localGet(CUR);
+      c.refIsNull();
+      c.brIf(1);
+      c.localGet(CUR);
+      c.structGet(this.rejListenerT(), 0);
+      c.localGet(CB);
+      c.call(strictEq);
+      c.ifVoid();
+      c.localGet(PREV);
+      c.refIsNull();
+      c.ifVoid();
+      c.localGet(CUR);
+      c.structGet(this.rejListenerT(), 2);
+      c.globalSet(this.warnListHeadG());
+      c.else_();
+      c.localGet(PREV);
+      c.localGet(CUR);
+      c.structGet(this.rejListenerT(), 2);
+      c.structSet(this.rejListenerT(), 2);
+      c.end();
+      c.globalGet(this.warnListTailG());
+      c.localGet(CUR);
+      c.refEq();
+      c.ifVoid();
+      c.localGet(PREV);
+      c.globalSet(this.warnListTailG());
+      c.end();
+      c.return_();
+      c.end();
+      c.localGet(CUR);
+      c.localSet(PREV);
+      c.localGet(CUR);
+      c.structGet(this.rejListenerT(), 2);
+      c.localSet(CUR);
+      c.br(0);
+      c.end();
+      c.end();
+      this.mb.setBody(idx, [this.rejListenerRef(), this.rejListenerRef()], c.bytes());
+    });
+  }
+
+  /** Calls every registered `process.on('warning', ...)` listener, in
+   * registration order, with the ONE warning object — `dispatchRejection
+   * Handled`'s own shape, one caller-supplied unwrap helper substituted
+   * for another (both are `(dyn)=>void`, so `deps.rejHandledCheckHelper`
+   * is reused verbatim rather than building a THIRD identical checker). */
+  dispatchWarning(): number {
+    return this.cached("dispatchWarning", [this.deps.dynRef()], [], (idx) => {
+      const checkIdx = this.deps.rejHandledCheckHelper();
+      const c = new Code();
+      const WARNING = 0;
+      const CUR = 1;
+      const CLOS = 2;
+      c.globalGet(this.warnListHeadG());
+      c.localSet(CUR);
+      c.block();
+      c.loop();
+      c.localGet(CUR);
+      c.refIsNull();
+      c.brIf(1);
+      c.localGet(CUR);
+      c.structGet(this.rejListenerT(), 0);
+      c.refNull(this.deps.dynPathT());
+      c.call(checkIdx);
+      c.localSet(CLOS);
+      c.localGet(CLOS);
+      c.localGet(WARNING);
+      c.localGet(CLOS);
+      c.structGet(this.rejHandledClosT(), 0);
+      c.callRef(this.rejHandledClosFnT());
+      c.localGet(CUR);
+      c.structGet(this.rejListenerT(), 2);
+      c.localSet(CUR);
+      c.br(0);
+      c.end();
+      c.end();
+      this.mb.setBody(idx, [this.rejListenerRef(), this.rejHandledClosRefForLocal()], c.bytes());
+    });
+  }
+
+  /* ── emitWarning's DEFERRAL (L5, DECISIONS.md 416a45a1) ────────────────
+   * A private pending-warning list (this file's OWN, distinct from the
+   * `warnListT` LISTENER list above — this one queues WARNING VALUES
+   * waiting to be dispatched, stream.ts's `%w.rs` tick-queue shape) plus
+   * ONE raw dispatch marker posted to nexttick.ts's queue per warning,
+   * through `deps.enqueueRaw()` — the stage-B seam stream.ts's
+   * `scheduleTick`/`dispatchOne` already exercises. */
+  private pendingWarnNodeType: number | null = null;
+  private pendingWarnNodeT(): number {
+    if (this.pendingWarnNodeType === null) {
+      const dynRef = this.deps.dynRef();
+      this.pendingWarnNodeType = this.mb.selfStructType("%w.proc.pendingWarn", (self) => [
+        { storage: dynRef, mutable: false }, // the warning value
+        { storage: { kind: "ref", nullable: true, typeIndex: self }, mutable: true }, // next
+      ]);
+    }
+    return this.pendingWarnNodeType;
+  }
+  private pendingWarnNodeRef(): ValType {
+    return { kind: "ref", nullable: true, typeIndex: this.pendingWarnNodeT() };
+  }
+  private pendingWarnHeadGlobal: number | null = null;
+  private pendingWarnTailGlobal: number | null = null;
+  private pendingWarnHeadG(): number {
+    if (this.pendingWarnHeadGlobal === null) {
+      this.pendingWarnHeadGlobal = this.mb.addGlobal(this.pendingWarnNodeRef(), true, (w) => {
+        w.u8(0xd0);
+        w.sleb(this.pendingWarnNodeT());
+      });
+    }
+    return this.pendingWarnHeadGlobal;
+  }
+  private pendingWarnTailG(): number {
+    if (this.pendingWarnTailGlobal === null) {
+      this.pendingWarnTailGlobal = this.mb.addGlobal(this.pendingWarnNodeRef(), true, (w) => {
+        w.u8(0xd0);
+        w.sleb(this.pendingWarnNodeT());
+      });
+    }
+    return this.pendingWarnTailGlobal;
+  }
+
+  /** `%w.proc.enqueueWarning(warning: dyn) -> void` — appends to the
+   * pending list, then posts ONE raw marker (`dispatchWarnings`, below)
+   * onto nexttick.ts's own queue via `deps.enqueueRaw()`. `ref.func`
+   * requires the target in the module's declared-functions element
+   * segment (stream.ts's `scheduleTick` header, verbatim reasoning) —
+   * `dispatchWarnings` is taken BY REFERENCE here, so it needs the
+   * explicit declaration a plain `call` site gets for free. */
+  enqueueWarning(): number {
+    return this.cached("enqueueWarning", [this.deps.dynRef()], [], (idx) => {
+      const c = new Code();
+      const W = 0;
+      const N = 1;
+      c.localGet(W);
+      c.refNull(this.pendingWarnNodeT());
+      c.structNew(this.pendingWarnNodeT());
+      c.localSet(N);
+      c.globalGet(this.pendingWarnTailG());
+      c.refIsNull();
+      c.ifVoid();
+      c.localGet(N);
+      c.globalSet(this.pendingWarnHeadG());
+      c.else_();
+      c.globalGet(this.pendingWarnTailG());
+      c.localGet(N);
+      c.structSet(this.pendingWarnNodeT(), 1);
+      c.end();
+      c.localGet(N);
+      c.globalSet(this.pendingWarnTailG());
+      this.mb.declareFuncRef(this.dispatchWarnings());
+      c.refFunc(this.dispatchWarnings());
+      c.call(this.deps.enqueueRaw());
+      this.mb.setBody(idx, [this.pendingWarnNodeRef()], c.bytes());
+    });
+  }
+
+  /** `() -> ()` — the raw marker's target (nexttick.ts's bare-funcref
+   * seam, `deps.rawFnType()`): pops ONE warning off this file's private
+   * list — ONE MARKER PER `process.emitWarning` CALL (delta-3e E-1,
+   * rev-26 measured, warn-order-vs-report.mjs — a drain-all marker would
+   * print `emitWarning(A); process.nextTick(T); emitWarning(B)` as A, B,
+   * T where Node's own A, T, B interleaving needs one marker per call,
+   * matching nexttick.ts:92-95's own stated reason for `enqueueRaw`
+   * existing at all) — and prints the DEFAULT REPORT FIRST, THEN
+   * dispatches to registered listeners (`dispatchWarning`, above): Node's
+   * bootstrap 'warning' listener is registered at bootstrap, ahead of any
+   * user listener in ordinary EventEmitter order. nexttick.ts's own
+   * `drain()` already checks the exception cell after calling this and
+   * traps if either step left one set. Unlinked before either call
+   * (stream.ts's `dispatchOne` / nexttick's own `drain()` rationale:
+   * the node is dead, and a live `next` would keep the whole drained
+   * prefix reachable for the GC). */
+  dispatchWarnings(): number {
+    return this.cached("dispatchWarnings", [], [], (idx) => {
+      const c = new Code();
+      const N = 0;
+      const W = 1;
+      c.globalGet(this.pendingWarnHeadG());
+      c.localSet(N);
+      c.localGet(N);
+      c.structGet(this.pendingWarnNodeT(), 1);
+      c.globalSet(this.pendingWarnHeadG());
+      c.globalGet(this.pendingWarnHeadG());
+      c.refIsNull();
+      c.ifVoid();
+      c.refNull(this.pendingWarnNodeT());
+      c.globalSet(this.pendingWarnTailG());
+      c.end();
+      c.localGet(N);
+      c.refNull(this.pendingWarnNodeT());
+      c.structSet(this.pendingWarnNodeT(), 1);
+      c.localGet(N);
+      c.structGet(this.pendingWarnNodeT(), 0);
+      c.localSet(W);
+      // E-1 (delta-3e, rev-26 measured, warn-order-vs-report.mjs): THE
+      // DEFAULT REPORT PRINTS FIRST, THEN the user listeners — Node's
+      // bootstrap 'warning' listener is registered at bootstrap, so
+      // ordinary EventEmitter registration order puts it ahead of every
+      // user listener.
+      c.localGet(W);
+      c.call(this.deps.defaultReportHelper());
+      c.localGet(W);
+      c.call(this.dispatchWarning());
+      this.mb.setBody(idx, [this.pendingWarnNodeRef(), this.deps.dynRef()], c.bytes());
+    });
+  }
+
+  // ── end INC-26 P2 (path lives in path.ts) ───────────────────────────
+  // ── INC-26 pass P3 — the process tail (brief-p3-v2.md ffbf2fdf/371;
+  // design-host-v7.txt cccf7d6e §2.7/§3.2/§4.3/§9 P3; DECISIONS.md
+  // P3-J1..J4, P3-L1..L4, CP1 delta D-1/D-2/D-3): kill/killNum's IN-MODULE
+  // signal-name table (below); the rest of the arms — chdir/umask, the
+  // host-fact reads, cpuPrevValidate, activeResources, the warning
+  // surface, stdin's two keys, and Joe's five widened #138 keys — are
+  // built INLINE at the emitter's own dispatch (cpuPrevValidate's own P1
+  // precedent: idiosyncratic-enough validation logic stays at the call
+  // site rather than becoming a one-caller process.ts method).
+
+  /** `process.kill`'s IN-MODULE signal-name table (design §2.7, rev-26
+   * B-2/R-7): Node's `os.constants.signals` ON LINUX, measured directly
+   * (never `scr_signal_by_name`'s smaller C table) — 33 names over 31
+   * numbers 1-31 with NO GAPS, two alias pairs (SIGABRT=SIGIOT=6,
+   * SIGIO=SIGPOLL=29). Measured by:
+   *   node --experimental-transform-types signals.mjs
+   * (scratchpad/p3probes/signals.mjs, sha256 fcc3c7c32553f34f65063bf463c
+   * 982590d5ad3bc2695c037d8f3bb22228add5a — independently re-run this
+   * pass, package.json {"type":"module"}, via `os.constants.signals`).
+   * SIGBREAK/SIGINFO/SIGUNUSED/SIGCLD/SIGRTMIN/SIGRTMAX are ABSENT on
+   * Linux (measured) and must NOT be added from a `kill -l` reading. */
+  private static readonly KILL_SIGNAL_TABLE: readonly (readonly [string, number])[] = [
+    ["SIGHUP", 1],
+    ["SIGINT", 2],
+    ["SIGQUIT", 3],
+    ["SIGILL", 4],
+    ["SIGTRAP", 5],
+    ["SIGABRT", 6],
+    ["SIGIOT", 6],
+    ["SIGBUS", 7],
+    ["SIGFPE", 8],
+    ["SIGKILL", 9],
+    ["SIGUSR1", 10],
+    ["SIGSEGV", 11],
+    ["SIGUSR2", 12],
+    ["SIGPIPE", 13],
+    ["SIGALRM", 14],
+    ["SIGTERM", 15],
+    ["SIGSTKFLT", 16],
+    ["SIGCHLD", 17],
+    ["SIGCONT", 18],
+    ["SIGSTOP", 19],
+    ["SIGTSTP", 20],
+    ["SIGTTIN", 21],
+    ["SIGTTOU", 22],
+    ["SIGURG", 23],
+    ["SIGXCPU", 24],
+    ["SIGXFSZ", 25],
+    ["SIGVTALRM", 26],
+    ["SIGPROF", 27],
+    ["SIGWINCH", 28],
+    ["SIGIO", 29],
+    ["SIGPOLL", 29],
+    ["SIGPWR", 30],
+    ["SIGSYS", 31],
+  ];
+
+  /** `%w.proc.killSignalByName(name: str) -> f64`: 15 (SIGTERM) if `name`
+   * is the EMPTY STRING (CP1 delta D-2 — Node applies `sig = sig ||
+   * 'SIGTERM'` BEFORE the table lookup, so an empty string sends SIGTERM
+   * rather than throwing "Unknown signal: "), else the table's number for
+   * an EXACT-CASE match, else -1 (unknown — the caller renders Node's
+   * `Unknown signal: <name>` TypeError). A flat sequence of independent
+   * early-return checks — never a JS-object-keyed lookup, which would
+   * leak `Object.prototype` members ("toString", "constructor", ...) as
+   * false positives (rev-26 R-7's own warning); a string-equality chain
+   * has no such surface BY CONSTRUCTION. */
+  killSignalByNameHelper(): number {
+    return this.cached("killSignalByName", [this.strRef()], [F64], (idx) => {
+      const c = new Code();
+      const NAME = 0;
+      const strEq = this.deps.strEq();
+      c.localGet(NAME);
+      c.arrayLen();
+      c.i32Eqz();
+      c.ifVoid();
+      c.f64Const(15);
+      c.return_();
+      c.end();
+      for (const [name, num] of ProcessBuilder.KILL_SIGNAL_TABLE) {
+        c.localGet(NAME);
+        this.deps.pushStrLit(c, name);
+        c.call(strEq);
+        c.ifVoid();
+        c.f64Const(num);
+        c.return_();
+        c.end();
+      }
+      c.f64Const(-1);
+      c.return_();
+      this.mb.setBody(idx, [this.strRef()], c.bytes());
+      return idx;
     });
   }
 }

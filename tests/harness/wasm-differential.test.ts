@@ -60,6 +60,13 @@ const files = shardSelect(
 // Same known-env contract as the other differential suites.
 process.env["SCRIPTC_TEST_ENV"] = "from-harness";
 
+// INC-26 P3 (design §3C, B-5): incremented by the `chdir`/`umask` RECORDING
+// STUBS below — the positive proof that the zero-corpus-reach claim for
+// both keys holds (asserted in "the process tail: chdir/umask are never
+// reached" near the end of this file).
+let chdirCallCount = 0;
+let umaskCallCount = 0;
+
 /** The tier floor: programs whose membership is pinned, so a regression
  * out of the tier fails the suite instead of quietly shrinking the
  * histogram. Auto-discovery may claim more; these regressing out is
@@ -3218,6 +3225,27 @@ const TIER_FLOOR: string[] = [
   "1629-require-main-filename.cjs",
   "2166-cjs-getter-this/main.cjs",
   "2637-create-require-bare/main.ts",
+
+  // INC-26 pass P3 (brief-p3-v2.md ffbf2fdf/371; design-host-v7.txt
+  // cccf7d6e §2.7/§3.2/§4.3/§9 P3; DECISIONS.md P3-J1..J4). The process
+  // tail: arch/execPath/versions/pid/getuid/getgid/isTTY/columns/uptime/
+  // the cpu+thread-cpu counters and their in-module diffs,
+  // cpuPrevValidate, rusage, the memory reads, activeResources (no host),
+  // the warning surface, stdin's two keys, D4's `kill` import with its
+  // own errno enumeration, D5's two onSignal/offSignal refusals, and
+  // Joe's five widened #138 keys (stderrWriteBytes, offRejectionHandled,
+  // chdir, exiting, umask). 880 -> 891.
+  "1425-stdin-tty.ts",
+  "1448-stream-columns.ts",
+  "1461-process-pid-getuid-kill.ts",
+  "1468-exec-path.ts",
+  "1531-process-arch-versions.ts",
+  "1571-optional-call-tostring-tail.ts",
+  "1571-stdin-set-raw-mode-non-tty.ts",
+  "1612-cjs-module-globals.cjs",
+  "1639-versions-openssl-probe.ts",
+  "2215-process-emit-warning-exit.cjs",
+  "2314-process-introspection.ts",
 ];
 
 interface RunResult {
@@ -3360,6 +3388,17 @@ async function runWasm(modulePath: string): Promise<RunResult> {
   let clock = 0;
   // wallBase, sampled ONCE per run, BEFORE instantiation (INC-25 P6, C-4).
   const wallBase = Date.now();
+  // uptimeBase, sampled ONCE per run, BEFORE instantiation (INC-26 P3-F2,
+  // gate round P3-F1's own follow-up correction) — the SAME shape as
+  // wallBase directly above. The compiled module IS its own process on
+  // the wasm lane (the ABI's own doctrine), so `process.uptime()` must
+  // answer time since THIS run's own instantiation, never the shared
+  // harness process's own cumulative uptime across the whole 1077-
+  // program census: serving the latter made 2314-process-introspection
+  // .ts's own `uptime < 120` bound fail once the harness had been
+  // running long enough (a real defect this pass found via a genuine,
+  // reproducible census failure, not assumed from a flake report).
+  const uptimeBase = process.uptime();
   // INC-26 P1 (design §3G, S070): argv = ["scriptc", <the module path>] —
   // TWO non-empty strings, matching the native lanes' own shape (S070's
   // register entry). env = THIS harness process's real environment,
@@ -3422,18 +3461,95 @@ async function runWasm(modulePath: string): Promise<RunResult> {
             return writeUtf16(cwd, ptr, cap);
           case 4:
             return writeUtf16(platform, ptr, cap);
+          // INC-26 P3 (design §11): THE VALUE PRINTS for arch/versions —
+          // the real host, on the same machine, at the same moment,
+          // licenses every row that prints one (1531/1639).
+          case 5:
+            return writeUtf16(process.arch, ptr, cap);
+          case 6:
+            return writeUtf16(process.versions.node, ptr, cap);
+          case 7:
+            return writeUtf16(process.versions.openssl ?? "", ptr, cap);
+          case 12:
+            return writeUtf16(process.execPath, ptr, cap);
           default:
             throw new Error(`hostStr: unknown kind ${kind}`);
         }
       },
-      // abi.ts's hostNum kind table — argc=0, env pair count=1. Kinds
-      // this pass does not mint are unreachable for the same reason.
-      hostNum(kind: number): number {
+      // abi.ts's hostNum kind table — argc=0, env pair count=1. INC-26 P3
+      // adds kinds 2-14 (design §11): the harness process's OWN facts —
+      // isTTY false for 0/1/2 (sound: the oracle also runs under
+      // execFile with pipes, so Node answers non-TTY too — LICENSES 1425
+      // and 1571-stdin-set-raw-mode); columns "no width" (-1) for 1/2
+      // (LICENSES 1448 entirely); uptime/cpu/rusage/memory are the
+      // harness process's own counters, with maxRSS STRICTLY > 0 (§2.3's
+      // own written constraint). `arg` is a NEW second parameter — every
+      // hostNum stub in the tree took only `kind` before this pass
+      // (isTTY(fd)/columns(fd)/rusage(idx) are the first three kinds that
+      // need it).
+      hostNum(kind: number, arg: number): number {
         switch (kind) {
           case 0:
             return argv.length;
           case 1:
             return envPairs.length;
+          case 2:
+            return process.pid;
+          case 3:
+            return process.getuid ? process.getuid() : 0;
+          case 4:
+            return process.getgid ? process.getgid() : 0;
+          case 5: // isTTY(fd = arg)
+            return 0;
+          case 6: // columns(fd = arg)
+            return -1;
+          case 7:
+            // Per-instantiation, not per-harness-process — see
+            // `uptimeBase`'s own comment above (INC-26 P3-F2).
+            return process.uptime() - uptimeBase;
+          case 8:
+            return process.cpuUsage().user;
+          case 9:
+            return process.cpuUsage().system;
+          case 10:
+            return process.threadCpuUsage().user;
+          case 11:
+            return process.threadCpuUsage().system;
+          case 12:
+            return process.availableMemory();
+          case 13:
+            return process.constrainedMemory() ?? 0;
+          case 14: {
+            // Node's own 16-field order (rusage-order.out 16880a86,
+            // independently confirmed this pass): userCPUTime,
+            // systemCPUTime, maxRSS, sharedMemorySize, unsharedDataSize,
+            // unsharedStackSize, minorPageFault, majorPageFault,
+            // swappedOut, fsRead, fsWrite, ipcSent, ipcReceived,
+            // signalsCount, voluntaryContextSwitches,
+            // involuntaryContextSwitches.
+            const ru = process.resourceUsage();
+            const fields = [
+              ru.userCPUTime,
+              ru.systemCPUTime,
+              ru.maxRSS,
+              ru.sharedMemorySize,
+              ru.unsharedDataSize,
+              ru.unsharedStackSize,
+              ru.minorPageFault,
+              ru.majorPageFault,
+              ru.swappedOut,
+              ru.fsRead,
+              ru.fsWrite,
+              ru.ipcSent,
+              ru.ipcReceived,
+              ru.signalsCount,
+              ru.voluntaryContextSwitches,
+              ru.involuntaryContextSwitches,
+            ];
+            const v = fields[arg];
+            if (v === undefined) throw new Error(`hostNum: rusage index out of range ${arg}`);
+            return v;
+          }
           default:
             throw new Error(`hostNum: unknown kind ${kind}`);
         }
@@ -3443,6 +3559,81 @@ async function runWasm(modulePath: string): Promise<RunResult> {
       // exit are different channels.
       exit(code: number): void {
         throw new WasmExitSignal(code);
+      },
+      // INC-26 P3 (design §2.7/§11, brief §3C, CP1 delta E-5's refined
+      // guard): `process.kill` of the HARNESS process — a HARNESS SAFETY
+      // GUARD, never a semantic one. The ABI crosses NUMBERS (the module
+      // already resolved any name), so this reasons about LIVENESS:
+      //   pid <= 0            -> LOUD (0/-1 broadcast to a process group)
+      //   sig === 0           -> deliver (an existence probe is harmless)
+      //   pid === process.pid -> deliver iff sig === 28 (SIGWINCH,
+      //                          default-ignored — 1461's own two
+      //                          self-directed shapes), else LOUD
+      //   otherwise           -> probe first (kill(pid, 0)); deliver ONLY
+      //                          if that probe itself answers ESRCH (the
+      //                          pid does not exist); a LIVE non-self pid
+      //                          is refused LOUDLY rather than signalled.
+      // Maps success to 0, `.code` to kill's OWN 3-code enumeration
+      // (-1/-2/-3), anything else to -(256 + the raw platform errno).
+      kill(pid: number, sig: number): number {
+        const loud = (why: string): never => {
+          throw new Error(`HARNESS SAFETY GUARD: refusing to deliver a real signal (pid=${pid}, sig=${sig}) for ${modulePath} — ${why}`);
+        };
+        const doKill = (): number => {
+          try {
+            process.kill(pid, sig);
+            return 0;
+          } catch (e) {
+            const err = e as NodeJS.ErrnoException;
+            if (err.code === "ESRCH") return -1;
+            if (err.code === "EPERM") return -2;
+            if (err.code === "EINVAL") return -3;
+            // delta-3e E-6: an errno-less error here would silently carry
+            // as -(256+-0) = -256, decoded by the module as "kill E0" — a
+            // string no lane ever produces. Unreachable today (a valid
+            // int32 pid+signal either succeeds or throws a NAMED errno
+            // error), which is exactly when a fabricated answer should be
+            // a loud harness failure instead.
+            if (typeof err.errno !== "number") {
+              loud(`kill threw an error with no .errno: ${String(err.code)}`);
+            }
+            return -(256 + -err.errno!);
+          }
+        };
+        if (pid <= 0) loud("pid <= 0 broadcasts to a process group");
+        if (sig === 0) return doKill();
+        if (pid === process.pid) {
+          if (sig === 28) return doKill();
+          loud("a real, non-zero, non-SIGWINCH signal to the harness's OWN process");
+        }
+        // Any other pid: probe first. Only an ESRCH probe licenses the
+        // real call (the pid genuinely does not exist); a live pid is
+        // refused loudly rather than signalled for real.
+        try {
+          process.kill(pid, 0);
+          loud(`pid ${pid} is a LIVE process — refusing to deliver a real signal to it`);
+        } catch (probeErr) {
+          const probeCode = (probeErr as NodeJS.ErrnoException).code;
+          if (probeCode !== "ESRCH") loud(`the existence probe for pid ${pid} answered ${String(probeCode)}, not ESRCH`);
+        }
+        return doKill();
+      },
+      // INC-26 P3 (design §3C, B-5): `chdir`/`umask` are RECORDING STUBS
+      // that answer success and MUTATE NOTHING — the wasm lane runs
+      // IN-PROCESS (this function, called directly — no child), and a
+      // real chdir/umask would move the vitest worker's own cwd/file-mode
+      // mask under EVERY LATER program (990/1352/1612 print or pin the
+      // cwd). Both keys have ZERO corpus reach (rev-d10-p3.out b32fe774);
+      // the module-level counters below are the POSITIVE PROOF of that
+      // zero-reach claim, asserted in "the process tail: chdir/umask are
+      // never reached" below.
+      chdir(_ptr: number, _len: number): number {
+        chdirCallCount++;
+        return 0;
+      },
+      umask(_isRead: number, _mask: number): number {
+        umaskCallCount++;
+        return 0o22;
       },
     },
   });
@@ -3594,6 +3785,17 @@ describe(`wasm differential corpus (${files.length} programs${shardSuffix()})`, 
         ? `TIER_FLOOR and the claimed set disagree — pinned-but-not-claimed (regressions): ${JSON.stringify(missingFromClaimed)}; claimed-but-not-pinned (unpinned new claims): ${JSON.stringify(missingFromFloor)}`
         : undefined,
     ).toEqual({ missingFromClaimed: [], missingFromFloor: [] });
+  });
+
+  test("the process tail: chdir/umask are never reached", () => {
+    // INC-26 P3 (design §3C/B-5, rev-d10-p3.out b32fe774): chdir and
+    // umask are two of the FIVE D10-shaped keys — built, and reached by
+    // NO corpus program. This is the positive proof: if either counter is
+    // ever nonzero, either a NEW corpus program reaches the key (update
+    // this test and the D10 accounting) or the harness's own RECORDING
+    // STUB is being hit when it should not be — either way, investigate
+    // before assuming the stub's "mutate nothing" contract is still safe.
+    expect({ chdirCallCount, umaskCallCount }).toEqual({ chdirCallCount: 0, umaskCallCount: 0 });
   });
 
   afterAll(() => {

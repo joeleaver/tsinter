@@ -3731,8 +3731,10 @@ unbuilt:
   "(node:pid)" prefix format and the "(Use `node --trace-warnings
   ...`)" hint line; only the pid value and the position differ.
 - **wasm (current state):** the warning is UNBUILT — crossing the
-  threshold prints nothing at all. When it lands, it inherits the
-  synchronous-print stance below rather than inventing a third timing.
+  threshold prints nothing at all. When it lands, it will defer through
+  the tier's OWN `nextTick` queue (S078, INC-26 P3) exactly as
+  `process.emitWarning` itself now does — NOT the synchronous-print
+  stance below, which stays the C lane's alone.
 
 **Rationale:** matching Node's pid is definitionally impossible (this
 process is never that process); matching the deferred-tick timing would
@@ -5358,6 +5360,90 @@ array, exactly because the values are this entry's own divergence). Native argv[
 measured directly this pass (both lanes, four invocation shapes each) rather than transcribed from an
 earlier session's numbers.
 
+## S071 — `process.execPath`: Node answers the node executable's own path; every non-Node lane answers something ELSE, and the answers differ across lanes too *(per-lane split)*
+
+Node's `process.execPath` is the absolute, resolved path of the `node` binary that is running the
+script — never the SCRIPT's own path (that is `argv[1]`, S070's own subject; the two must not be
+conflated).
+
+**Native (both lanes — `c` and `llvm` — identical, measured):** the COMPILED BINARY's own resolved
+absolute path, and it FOLLOWS A RENAME where `argv[1]` does not (S070): invoked as `./prog`, `execPath`
+answers the binary's own resolved absolute path, not the literal string `"./prog"`; renamed to
+`./renamed-prog`, `execPath` follows the rename while `argv[1]` stays whatever string invoked it.
+
+**Wasm:** the host's own string, read through `hostStr` kind 12 (abi.ts §2.2) — the ABI text requires a
+non-empty, absolute-shaped string but says nothing about ITS content beyond that (the same weak-value
+stance the `wallClock` precedent already documents). The differential harness serves the MODULE'S OWN
+PATH, so a program reading `isAbsolute(execPath)` / `execPath.length > 0` / identity across two reads
+passes identically to the native lanes without ever printing the raw value (1468's own contract).
+
+RETIRES "divergence 12" at its four source sites (each a doc-comment naming this key by the OLD phrase,
+never printing a number): `packages/runtime/src/scr_runtime.h:1990`, `packages/compiler/src/ir/
+nodes.ts:2987`, `packages/compiler/src/frontend/lowering/lower-builtins.ts:4839`, and `packages/compiler/
+ambient/scriptc-node-fallback.d.ts:176` (SHIPS to users — not "only types"), plus the corpus's own
+citation at `tests/corpus/1468-exec-path.ts:2` (comment-only, never printing the number either).
+
+**Tested by:** 1468 (isAbsolute, non-empty, cross-read identity, non-empty basename — the CONTRACT all
+three lanes share, never the value); native execPath measured directly this pass (both lanes, two
+invocation shapes: as-invoked and after a rename) rather than transcribed from an earlier session.
+
+## S072 — `process.versions.node` / `process.versions.openssl`: every non-Node lane answers a fixed COMPATIBILITY TARGET, not a live version *(per-lane split)*
+
+Node answers the actual engine build's own version strings. Every non-Node lane answers the SAME two
+constants regardless of the machine or the moment: `"24.0.0"` (`versions.node`) and `"3.5.5"`
+(`versions.openssl`) — the runtime semantics this project verifies against, measured this pass against a
+live Node v24.18.1 / OpenSSL 3.5.7 on the same machine (deliberately different from both, so no program
+could mistake one for the other).
+
+**Native (both lanes) and wasm:** identical constants on all three non-Node lanes; the wasm lane's answer
+crosses through `hostStr` kinds 6/7 (abi.ts §2.2), served by the differential harness as the SAME two
+literals (design §11).
+
+`process.versions.openssl`'s OWN role is Node's "is crypto available" idiom
+(`Boolean(process.versions.openssl)`), not a version comparison — 1639 asserts presence and `typeof`
+only, never the raw string, matching this entry's own stance (a live crypto surface exists here; the
+string just never claims to BE a live OpenSSL's own version).
+
+RETIRES "divergence 60" at its FIVE `versions.node`-subject source sites (the subject is the DECLARATION
+the comment sits on, never a sibling stance it cites — the trap the design's own register section
+names): `packages/runtime/src/scr_lib.c:202`, `packages/runtime/src/scr_runtime.h:1997`, `packages/
+compiler/src/ir/nodes.ts:2995`, `packages/compiler/src/frontend/lowering/lower-builtins.ts:4756`, and
+`packages/compiler/ambient/scriptc-node-fallback.d.ts:137` (SHIPS), plus the corpus's own citation at
+`tests/corpus/1531-process-arch-versions.ts:4`. NEVER `packages/compiler/src/frontend/lowering/
+lower-stmts.ts:3636`/`:3679` — those cite the SAME phrase for a DIFFERENT topic (the record-delete/
+`= undefined` collapse, board #136) and stay exactly as they are.
+
+**Tested by:** 1531 (the dotted shape's segment count, the major-version gate `>= 24`, a NaN check on the
+parsed major, and the doctor idiom's presence-gated template literal — the DERIVED facts a real caller
+uses, never the raw string) and 1639 (`typeof`/presence only, gating a "crypto-path"/"skip-path" choice
+the same way Node's own idiom does).
+
+## S075 — `process.getActiveResourcesInfo()` reports only the resource KINDS this tier's own event loop models *(wasm tier; native lanes ship the same divergence)*
+
+Node's real answer enumerates every live libuv handle by KIND — timers, sockets, file-descriptor
+requests, and more. This tier's own event loop tracks exactly two kinds — `Timeout` (the heap of armed
+`setTimeout`/`setInterval` entries) and `Immediate` (the `setImmediate` queue) — so its answer is a
+SUBSET of Node's by construction: every resource kind this tier does not model as a loop handle (TCP
+wraps, FS requests, and everything else libuv tracks that this tier has no representation for) is simply
+ABSENT from the array, never a placeholder or an approximation.
+
+Node itself EXCLUDES unref'd handles from this same call (measured this pass: an unref'd `setTimeout`
+answers `[]`), and the wasm arm matches that exclusion exactly by reading the SAME reffed-only counters
+`timers.ts` already maintains for its own loop bookkeeping (the heap's own reffed count, gated by the
+currently-firing entry's own ref/cleared flags — a firing, un-cleared Timeout counts as active for the
+duration of its own callback, Node's own Timeout lifetime) — no new state, a pure read. The array itself
+groups BY KIND, every `Timeout` before every `Immediate`, regardless of arming order (measured against
+Node directly this pass: `getActiveResourcesInfo()` never interleaves the two kinds).
+
+RETIRES the unnumbered citation at `packages/runtime/src/scr_async.c:611` (inside the doc comment on
+`scr_active_resources`'s own declaration: "Resource kinds this runtime does not model as loop handles ...
+are absent — SEMANTICS.md names the divergence").
+
+**Tested by:** 2314 (no-handles / a firing-uncleared Timeout still counting / `clearTimeout` from inside
+dropping it immediately / a fired Immediate no longer counting — all via `.filter()`, never printing the
+full array) plus a forced-host row printing the FULL, unfiltered array (2314 never exercises that shape)
+and a forced-host row pinning the unref'd-handle exclusion (2314 never unrefs anything).
+
 ## S076 — the `promise` argument of `unhandledRejection`/`rejectionHandled` listeners has no preserved identity *(wasm tier only)*
 
 RULING P1-R6 (an earlier, RETIRED draft used this same number for a different, never-landed text — a
@@ -5404,3 +5490,68 @@ statement about this entry, not a missing pin). Board #140 (preserve promise ide
 boundary for listener arguments — an interned/handle-kind box whose `strictEq` compares the underlying
 promise ref, `dyn.strictEq`'s own `offUnhandledRejection` shape) would retire this entry and make FIFO
 order observable again, restoring the row and M-16 as a real mutation. Not this pass's to build.
+
+## S077 — `process.kill`'s and `process.chdir`'s thrown Errors carry `.code` and Node's exact `.message` ONLY; `.errno`/`.syscall` (kill) and `.errno`/`.syscall`/`.path`/`.dest` (chdir) are UNREPRESENTED *(wasm tier only)*
+
+Node's own `kill`/`chdir` failures are `ErrnoException`s carrying `.errno` (the raw platform number),
+`.syscall` (`"kill"`/`"chdir"`), `.code` (the errno NAME), and — for `chdir` — `.path`/`.dest`-shaped path
+context. The wasm tier builds a plain `Error` with `.code` and Node's own exact `.message` text (measured
+against Node, never transcribed from the C runtime) and stops there: `.errno`, `.syscall`, and (for
+`chdir`) `.path`/`.dest` are simply absent — a program that reads `e.code`/`e.message` sees Node's own
+answer; a program that reads `e.errno`/`e.syscall`/`e.path`/`e.dest` sees `undefined` where Node answers a
+value.
+
+Each import's UNKNOWN arm (an errno this tier's own enumeration does not name — unreachable on Linux by
+construction, since Linux's `kill(2)`/`chdir(2)` only ever answer the codes each enumeration lists) renders
+a spelling that is NEVER a Node spelling either: `kill`'s is `"kill E<n>"` with NO `.code` at all
+(reproducing the native C runtime's OWN asymmetry — `scr_kill_send`'s `errno`-printing fallback carries no
+code either; board #143b names the native lane's OWN further divergence on this same key); `chdir`'s is
+code `"E<n>"` with text `"Unknown system error -<n>"`, sourced from libuv's own generic errno-name table,
+never `strerror`.
+
+Design v7's own D6 ERRATUM 1 scopes a SEPARATE, sibling entry (S073, landing with P4's filesystem errno
+table) to the three fs-side properties as they stand today; WIDENING S073 to a fourth property is
+explicitly UNPICKED there. This entry is the alternative the pre-read chose (A-1): a NEW number for these
+TWO process-family keys now, rather than pulling `kill`/`chdir` into S073's own scope a pass early — two
+numbers, one topic each, is the safe direction when a later pass's own register entry does not exist yet
+to widen.
+
+**Tested by:** a forced-host row per named code (`kill`: ESRCH/EPERM/EINVAL; `chdir`: the eight-code table)
+confirming `.code` matches Node's own name and `.errno`/`.syscall`/`.path`/`.dest` are all `undefined`; one
+forced-host row per import's UNKNOWN arm, pinning the non-Node spelling exactly as this entry states it.
+
+## S078 — `process.emitWarning`'s DISPATCH TIMING: the wasm tier is NODE-EXACT (deferred through its OWN `nextTick` queue); the native (C) lane dispatches SYNCHRONOUSLY *(per-lane split)*
+
+Node's `process.emitWarning` never dispatches synchronously at the call: the default report and every
+registered listener fire after the CURRENT synchronous section finishes, through `process.nextTick`
+(measured this pass: with a listener and no other timer/tick surface, `on('warning', ...); emitWarning(x);
+console.log('main')` prints `main` before the listener fires; a `nextTick` registered strictly BETWEEN two
+`emitWarning` calls fires strictly between their two dispatches — ONE marker per `emitWarning` CALL, never
+one marker draining every pending warning at once, or the interleaving with a caller's OWN nextTicks would
+come out in the wrong order). Per warning, Node's own bootstrap 'warning' listener — registered before any
+user code runs — fires BEFORE any user listener, and the default report it prints is unconditional: it
+never checks whether a user listener is registered.
+
+**C (native, both lanes):** dispatches SYNCHRONOUSLY, at the call — the deprecation/warning surface predates
+this tier's own nextTick queue and was never re-plumbed through it.
+
+**Wasm:** defers through the SAME `process.nextTick` queue a user's own `process.nextTick` calls use (a
+per-`emitWarning`-call raw marker posted onto the tier's own queue, `nexttick.ts`'s stage-B seam — the
+SAME mechanism `stream.ts`'s own deferred stream emissions already use), so a program mixing `emitWarning`
+and `process.nextTick` interleaves exactly as Node's own does. Per warning, the default report prints
+FIRST, then registered listeners fire in registration order — matching Node's own bootstrap-listener-
+first EventEmitter order exactly.
+
+RETIRES "SEMANTICS.md 138" at its two source sites (a citation with NO PRIOR ENTRY — missed by board
+#137's own dead-number census because it is spelled without the word "divergence"):
+`packages/runtime/src/scr_async_dyn.c:436` and `packages/runtime/src/scr_runtime.h:3550`, plus the
+corpus's own unnumbered citation at `tests/corpus/2215-process-emit-warning-exit.cjs:8-9` — that program's
+own comment states it is BLIND to this axis (it prints from an `'exit'` listener with every emit already
+finished, so synchronous and deferred dispatch produce an IDENTICAL transcript); the forced-order row is
+the only instrument for this entry, stated as such rather than left implying 2215 is a second witness.
+
+**Tested by:** a forced-host order row (a program with NO timer surface at all, pinning `main` before any
+listener fires); a forced-host interleaving row (`emitWarning(A); process.nextTick(T); emitWarning(B)`,
+pinning Node's own A/T/B order against a drain-all mistake's A/B/T); a forced-host report-then-listener
+row per warning. Independently re-measured this pass against a live Node v24.18.1 rather than transcribed
+from the design phase's own numbers.

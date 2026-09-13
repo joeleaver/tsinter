@@ -6,7 +6,7 @@
 // default stderr report prints "(node:pid) [CODE] Name: message" with
 // the detail on its own line, wrong kinds throw ERR_INVALID_ARG_TYPE,
 // and off() removes by identity. Emission here is SYNCHRONOUS where
-// Node defers a tick (SEMANTICS.md) — the emits sit last in the turn so
+// Node defers a tick (SEMANTICS.md S078) — the emits sit last in the turn so
 // the transcripts agree. The default report carries the pid, which can
 // never byte-match — the @exit directive (line 1: the harness reads the
 // two-line head) keeps stderr out of the comparison (the 1651 precedent).

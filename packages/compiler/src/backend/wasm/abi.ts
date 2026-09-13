@@ -57,10 +57,14 @@
  *      17  the host's own text for errno `index` — the one consumer of the
  *          UNKNOWN arm in the fs errno enumeration (a later pass), and the
  *          one place `index` means something other than an ordinal.
- *     `index` is ignored for every kind but 0, 1, 2 and 17. This pass
- *     (P1) mints and consumes kinds 0-4 only; 5-17 are later passes' — see
- *     `hostNum`'s identical stance below for the reason both tables ship
- *     complete now rather than growing a gap at a time.
+ *     `index` is ignored for every kind but 0, 1, 2 and 17. P1 minted and
+ *     consumed kinds 0-4. INC-26 P3 (design §3.2) consumes kinds 5, 6, 7
+ *     and 12 (arch, versions.node, versions.openssl, execPath — S071/S072
+ *     name what each answers on a non-Node lane) — P3's `process.chdir`
+ *     ALSO reaches this import, for its OWN error message's "before" path
+ *     (kind 3, cwd) rather than for a new kind. 8-11 and 13-17 are later
+ *     passes' — see `hostNum`'s identical stance below for the reason both
+ *     tables ship complete now rather than growing a gap at a time.
  *     hostStr's EFFECT TIER: that the host WROTE the bytes it claims to
  *     have written is enforced by NOTHING. A host that answers a length
  *     and writes nothing hands the module a run of NUL code units and no
@@ -71,20 +75,38 @@
  *       0  argc                              1  env pair count
  *       2  pid                               3  uid
  *       4  gid                               5  isTTY(fd = arg): 1 or 0
- *       6  columns(fd = arg): -1 = no width  7  uptime, in SECONDS
+ *       6  columns(fd = arg): -1 = no width  7  uptime, in SECONDS since
+ *          THE INSTANCE started (never the host process — see below)
  *       8  cpuUsage.user, microseconds       9  cpuUsage.system
  *      10  threadCpuUsage.user              11  threadCpuUsage.system
  *      12  availableMemory, bytes           13  constrainedMemory, bytes
  *      14  rusage field `arg`, 0..15        15  os.totalmem, bytes
  *     Kinds 0 and 1 are read ONCE each, at the argv/env snapshot (below);
- *     everything else is read at its own call site, every time. This pass
- *     mints and consumes kinds 0-1 only; 2-15 are later passes' (same
- *     append-only stance as `hostStr`).
+ *     everything else is read at its own call site, every time. P1 minted
+ *     and consumed kinds 0-1. INC-26 P3 (design §3.2) consumes kinds 2-14
+ *     (pid through rusage) — the four `*Diff` process keys (cpuUserDiff,
+ *     cpuSystemDiff, threadCpuUserDiff, threadCpuSystemDiff) are IN-MODULE
+ *     subtractions over kinds 8-11's own raw counters and mint no kind of
+ *     their own. 15 is a later pass' (same append-only stance as
+ *     `hostStr`).
  *     Inherits the WEAK f64 result-kind case (§ the `now`/`wallClock`
  *     precedent above): a numeric-string host is indistinguishable from a
  *     correct one. THE VALUE ITSELF is enforced by nothing — a host
  *     reporting a zeroed rusage or a negative uptime runs silently; the
  *     text is the only guarantee (the `wallClock` shape, restated).
+ *     KIND 7 (uptime) NAMES ITS OWN CLOCK EXPLICITLY, the SAME "the text
+ *     IS the enforcement" shape `wallClock` already uses above: the
+ *     compiled module IS its own process on every lane that runs one, so
+ *     "uptime" MUST mean seconds since THIS INSTANCE started, never
+ *     seconds since whatever long-lived HOST PROCESS happens to be
+ *     servicing the import (a shared test harness driving many modules
+ *     in one process, for instance) — the latter answers a number that
+ *     keeps growing across unrelated instantiations and is not "this
+ *     process's own uptime" by any program's own reading of the word. A
+ *     host that samples its own per-instance base a few milliseconds
+ *     BEFORE calling `instantiate` (the only order available to it) errs
+ *     SLIGHTLY LARGE, never negative — small and harmless, and not a bug
+ *     for a later pass to "fix" by moving the sample point.
  *
  *   (import "tsinter" "exit" (func (param i32)))   [process.exit modules only]
  *     The host TERMINATES THE INSTANCE with this status. IT MUST NOT
@@ -117,6 +139,103 @@
  *     after the call turns a returning host into a trap rather than into a
  *     program that runs past its own exit — that is the MODULE defending
  *     itself, not enforcement, and the harness's own rows are the check.
+ *
+ * INC-26 pass P3 (design-host-v7.txt §2.7/§0.5, DECISIONS.md P3-J2, brief-
+ * p3-v2.md §3B/§0.5): THREE more conditional imports, each an EFFECT with
+ * its OWN errno enumeration — never §6.3's fs table (P4, not yet built)
+ * and never each other's. THE CAPABILITY PARAGRAPH (D4, applying equally
+ * to all three): THESE IMPORTS GRANT REAL AUTHORITY over the host
+ * process — `kill` lets a module signal ANY process the host user may
+ * signal; `chdir`/`umask` let it change the host process's own working
+ * directory and file-mode mask. A host that does not want to grant a
+ * capability DOES NOT SUPPLY THE IMPORT, and the module fails to
+ * instantiate with a LinkError before a single instruction runs — the
+ * engine enforces this half. A host that wants to grant a NARROWER
+ * capability supplies the import and answers a permission-shaped failure
+ * (kill: EPERM; chdir: EACCES/EPERM) for what it refuses; the module
+ * renders that as Node's own permission error.
+ *
+ *   (import "tsinter" "kill" (func (param i32 i32) (result i32)))
+ *     kill(pid, signum) -> 0 on success, kill's OWN three-code enumeration
+ *     on failure: -1 ESRCH, -2 EPERM, -3 EINVAL, or -(256 + the raw
+ *     platform errno) for anything else. 256 is a BASE, not a code; the
+ *     raw errno beyond it is the PLATFORM's, not this ABI's — Linux
+ *     ESRCH=3/EPERM=1/EINVAL=22 would collide with -1/-2/-3 if merged into
+ *     one channel, which is why the carrier keeps the number instead of
+ *     losing it. The module renders the first three as `Error("kill
+ *     ESRCH"/"kill EPERM"/"kill EINVAL")` with `.code` set to the bare
+ *     name, and the UNKNOWN arm as `Error("kill E<n>")` (n = -answer-256)
+ *     with NO `.code` — reproducing the native lane's own asymmetry
+ *     (scr_lib.c's `scr_kill_send`) rather than tidying it.
+ *     THE SIGNAL NUMBER CROSSES IN LINUX NUMBERING — the tier's comparison
+ *     platform. A host on another platform translates; two names share a
+ *     number in Node's own table (SIGABRT=SIGIOT, SIGPOLL=SIGIO), so a
+ *     translating host must know both spellings answer the same wire
+ *     value. THE PID/SIGNAL VALIDATION AND THE NAME TABLE ARE PURE
+ *     IN-MODULE WORK — this import's ONLY job is the syscall's residue;
+ *     Node's exact wording for a bad pid or an unknown signal never
+ *     reaches the host at all.
+ *     kill's EFFECT TIER: that the host signalled the RIGHT process with
+ *     the RIGHT signal is enforced by NOTHING — the harness's own forced-
+ *     host rows and its real-host safety guard (never a semantic one) are
+ *     the check.
+ *
+ *   (import "tsinter" "chdir" (func (param i32 i32) (result i32)))
+ *     chdir(ptr, len of a UTF-16 path in module memory) -> 0 on success,
+ *     -code on failure, in chdir's OWN eight-code enumeration (a NAMESPACE
+ *     SEPARATE FROM kill's — codes 1-8 here are NOT kill's -1/-2/-3):
+ *       1 ENOENT  2 ENOTDIR  3 EACCES  4 ENAMETOOLONG  5 ELOOP  6 EIO
+ *       7 ENOMEM  8 EPERM (a namespace/container answer)
+ *     and, for anything else, -(256 + the raw platform errno) — the SAME
+ *     carrier shape as `kill`'s, a coincidence of convenience, not a
+ *     shared table. The module renders `.message` from
+ *     `util.getSystemErrorMessage`'s OWN texts (Node's exact wording,
+ *     measured) inside the two-path fs form `"<CODE>: <text>, chdir
+ *     '<cwd-before-the-call>' -> '<dir>'"`; the UNKNOWN arm renders code
+ *     `E<n>` (n = -answer-256) with text `"Unknown system error -<n>"` —
+ *     NOT a Node spelling (S077's own limitation). `.errno`/`.syscall`/
+ *     `.path`/`.dest` are UNREPRESENTED on every non-Node lane (S077).
+ *     ON SUCCESS the host's cwd changed; the module's OWN cwd snapshot
+ *     (path.ts's `cwdSnapshot`, D2 ERRATUM 1) is invalidated by the arm
+ *     itself so a later `path.resolve()` reads the NEW directory rather
+ *     than a stale memo.
+ *     chdir's EFFECT TIER: that the host performed the chdir(2) it was
+ *     asked for is enforced by NOTHING — the harness's own rows are the
+ *     check (and, in the DIFFERENTIAL harness specifically, `chdir` is a
+ *     RECORDING STUB that mutates nothing, since the module runs
+ *     in-process and a real chdir would move every LATER program's own
+ *     cwd — design §3C).
+ *
+ *   (import "tsinter" "umask" (func (param i32 i32) (result i32)))
+ *     umask(isRead, mask) -> the PREVIOUS mask (always <= 0o777, fits i32
+ *     signed either way). isRead = 1: read without setting, `mask`
+ *     IGNORED. isRead = 0: SET `mask`, whose 32 bits are UNSIGNED (the
+ *     module passes `i32.trunc_f64_u` after its own range check; the host
+ *     reads them back with `>>> 0`). THERE IS NO IN-BAND SENTINEL:
+ *     4294967295 is a mask Node ACCEPTS (measured — the kernel then masks
+ *     to 0o777) and is ALSO the i32 bit pattern of -1, so a single-i32
+ *     "isRead if mask < 0" encoding cannot represent it; the explicit
+ *     isRead PARAMETER is why this import takes two i32s instead of one.
+ *     The MODULE performs Node's own validation before ever calling this
+ *     import — INTEGER FIRST, RANGE SECOND (measured: a non-integer mask
+ *     throws RangeError ERR_OUT_OF_RANGE 'The value of "mask" is out of
+ *     range. It must be an integer. Received <n>' even when it is ALSO
+ *     out of [0, 4294967295]; only an integral out-of-range mask throws
+ *     'It must be >= 0 && <= 4294967295. Received <n>') — the host never
+ *     sees an invalid mask.
+ *     THE FRONTEND'S 0-ARY COMPLETION COLLIDES WITH A USER-WRITTEN
+ *     `umask(-1)` (board #142): the read sentinel the frontend inserts for
+ *     `process.umask()` is the SAME IR-level value Node treats as an
+ *     out-of-range mask for an explicit `process.umask(-1)` call, so both
+ *     read on every lane where Node throws. This is a FRONTEND defect
+ *     (recorded, not fixed here — frontend/* is out of this pass's reach);
+ *     the -1 IR value always means "read" at THIS import regardless of
+ *     which source shape produced it.
+ *     umask's EFFECT TIER: that the host answers the PROCESS'S REAL
+ *     previous mask (on a read) or ACTUALLY sets it (on a write) is
+ *     enforced by NOTHING — the `wallClock` shape, restated (and, in the
+ *     DIFFERENTIAL harness, `umask` is a RECORDING STUB for the same
+ *     in-process reason `chdir` is — design §3C).
  *
  * THE ARGV/ENV SNAPSHOT (D2). `process.argv` and the whole of `process.env`
  * are read ONCE, at first touch, into module-owned storage — never a live
@@ -299,6 +418,9 @@ export const IMPORT_WALL_CLOCK = "wallClock";
 export const IMPORT_HOST_STR = "hostStr";
 export const IMPORT_HOST_NUM = "hostNum";
 export const IMPORT_EXIT = "exit";
+export const IMPORT_KILL = "kill";
+export const IMPORT_CHDIR = "chdir";
+export const IMPORT_UMASK = "umask";
 export const EXPORT_ENTRY = "_start";
 export const EXPORT_TICK = "_tick";
 export const EXPORT_STATUS = "_status";

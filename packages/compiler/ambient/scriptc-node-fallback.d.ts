@@ -134,7 +134,7 @@ declare var process: {
    * its own build on the same machine. */
   readonly arch: string;
   /* versions.node is the runtime's Node COMPATIBILITY TARGET — no Node
-   * exists under a compiled binary (SEMANTICS.md divergence 60); the
+   * exists under a compiled binary (SEMANTICS.md S072); the
    * other components @types/node lists (v8, openssl, ...) do not exist
    * here. openssl and sqlite are DECLARED (optional, so absence reads
    * undefined) and LOWER to undefined — the honest capability probe
@@ -173,7 +173,7 @@ declare var process: {
   _rawDebug(...args: unknown[]): void;
   pid: number;
   /* The compiled binary's own resolved absolute path — Node's is the node
-   * executable's (SEMANTICS.md divergence 12, the argv[0]/argv[1] story). */
+   * executable's (SEMANTICS.md S071, the argv[0]/argv[1] story). */
   readonly execPath: string;
   getuid?(): number;
   getgid?(): number;

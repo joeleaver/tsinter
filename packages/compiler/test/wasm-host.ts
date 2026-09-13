@@ -37,7 +37,18 @@
  * (wasm-random.test.ts's own "PRECEDENT FOR A HOST-FORCED UNIT PIN"
  * shape), exactly because a forced row needs KNOWN, deliberately
  * non-real values (§10-ii: a row that reads the real host and compares
- * to the real host proves nothing). */
+ * to the real host proves nothing).
+ *
+ * INC-26 P3: `hostNum` gains its SECOND parameter (`arg` — P1's kinds 0/1
+ * never needed it, isTTY(fd)/columns(fd)/rusage(idx) do), `hostStr` gains
+ * SYNTHETIC defaults for arch/versions.node/versions.openssl/execPath (no
+ * existing importer reads any of these, so synthetic is safe the way
+ * cwd/platform's own synthetic values would NOT be), and `kill`/`chdir`/
+ * `umask` land as no-op-shaped defaults (kill answers success without
+ * recording anything; chdir/umask answer success and mutate nothing) —
+ * again, DEFAULTS for importers that reach these keys incidentally, never
+ * the FORCED host wasm-host-process-p3.test.ts's own copy compares
+ * against a table. */
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { expect } from "vitest";
@@ -115,22 +126,76 @@ async function instantiate(modulePath: string) {
             return write(process.cwd());
           case 4: // platform
             return write(process.platform);
+          // INC-26 P3: arch/versions/execPath default stubs. Synthetic
+          // (unlike cwd/platform above) — no EXISTING importer of this
+          // shared host reads any of these today, so a synthetic value
+          // cannot break an unrelated test the way a synthetic cwd could.
+          case 5: // arch
+            return write("x64");
+          case 6: // versions.node
+            return write("24.0.0");
+          case 7: // versions.openssl
+            return write("3.5.5");
+          case 12: // execPath
+            return write("/forced/host/node");
           default:
             throw new Error(`hostStr: unknown kind ${kind}`);
         }
       },
-      hostNum(kind: number): number {
+      // INC-26 P3: `arg` is a NEW second parameter (P1's kinds 0/1 never
+      // needed it; P3's isTTY(fd)/columns(fd)/rusage(idx) all do).
+      hostNum(kind: number, arg: number): number {
         switch (kind) {
           case 0: // argc
             return 2;
           case 1: // env pair count
             return 0;
+          case 2: // pid
+            return 1;
+          case 3: // uid
+            return 0;
+          case 4: // gid
+            return 0;
+          case 5: // isTTY(fd = arg)
+            return 0;
+          case 6: // columns(fd = arg)
+            return -1;
+          case 7: // uptime, seconds
+            return 1;
+          case 8: // cpuUsage.user, microseconds
+            return 100;
+          case 9: // cpuUsage.system
+            return 100;
+          case 10: // threadCpuUsage.user
+            return 50;
+          case 11: // threadCpuUsage.system
+            return 50;
+          case 12: // availableMemory, bytes
+            return 1e9;
+          case 13: // constrainedMemory, bytes
+            return 2e9;
+          case 14: // rusage field `arg`, 0..15 — index 2 is maxRSS, which
+            // §2.3's own text requires STRICTLY positive.
+            return arg === 2 ? 4096 : arg;
           default:
             throw new Error(`hostNum: unknown kind ${kind}`);
         }
       },
       exit(code: number): void {
         throw new WasmHostExitSignal(code);
+      },
+      // INC-26 P3 defaults (design §2.7/§0.5): `kill` records its call and
+      // answers success; `chdir`/`umask` answer success and mutate
+      // nothing (this shared host's own `process.cwd()`/`process.platform`
+      // reads stay real regardless — see the file header).
+      kill(_pid: number, _sig: number): number {
+        return 0;
+      },
+      chdir(_ptr: number, _len: number): number {
+        return 0;
+      },
+      umask(_isRead: number, _mask: number): number {
+        return 0o22;
       },
     },
   });

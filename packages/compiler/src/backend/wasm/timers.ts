@@ -269,6 +269,47 @@ export class TimerBuilder {
     return this.immG;
   }
 
+  /** INC-26 P3 (design-host-v7.txt §3.2, brief-p3-v2.md §3.2/rev-26 A-8):
+   * READ-ONLY accessors onto the FOUR existing i32 globals
+   * `process.activeResources` needs — no new state, no behaviour change.
+   * Node EXCLUDES unref'd handles from `getActiveResourcesInfo()`
+   * (measured), so the REFFED counters (not the armed/total counts) are
+   * exactly the right ones: `timeoutReffedG` (armed, ref'd Timeouts) plus
+   * `firingReffedG`/`firingClearedG` (a FIRING, uncleared Timeout counts
+   * as active too — Node's own Timeout lifetime, scr_async.c's own
+   * mirror), and `immediateReffedG` (queued, ref'd, unfired Immediates —
+   * a FIRED immediate no longer counts). Calling this on a module that
+   * never otherwise touches a timer/immediate lazily allocates these
+   * globals for the first time (`g()`/`i()`'s own idiom) — harmless dead
+   * weight in a module that never arms one, the same "unused import costs
+   * nothing" stance the host-fact prescans already rely on.
+   * `firingIdG` is included ALONGSIDE `firingReffedG`/`firingClearedG`
+   * because the latter two are STALE outside an actual firing episode
+   * (`%w.tick`'s own pop-loop, read in full: `firingId` is set non-zero
+   * immediately before the callback and reset to exactly 0 immediately
+   * after, unconditionally — timers.ts:1199/1266-1267 — while
+   * `firingReffed`/`firingCleared` simply carry whatever the LAST firing
+   * episode left them at). Reading the "firing, uncleared" bonus without
+   * gating on `firingId !== 0` would double-count a timer that already
+   * finished firing and re-armed. */
+  reffedCounters(): {
+    timeoutReffedG: number;
+    firingIdG: number;
+    firingReffedG: number;
+    firingClearedG: number;
+    immediateReffedG: number;
+  } {
+    const heap = this.g();
+    const imm = this.i();
+    return {
+      timeoutReffedG: heap.reffed,
+      firingIdG: heap.firingId,
+      firingReffedG: heap.firingReffed,
+      firingClearedG: heap.firingCleared,
+      immediateReffedG: imm.reffed,
+    };
+  }
+
   /* ── heap primitives ───────────────────────────────────────────────── */
 
   /** heap[i] onto the stack. */

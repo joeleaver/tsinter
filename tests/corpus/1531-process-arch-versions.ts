@@ -1,7 +1,7 @@
 // process.arch — the binary's own architecture, the same answer Node
 // gives for its own build on the same machine, so the raw value is
 // oracle-comparable. process.versions.node reports the runtime's Node
-// COMPATIBILITY TARGET (SEMANTICS.md divergence 60) — the raw string
+// COMPATIBILITY TARGET (SEMANTICS.md S072) — the raw string
 // differs from a live Node's patch level by design, so the corpus pins
 // the DERIVED facts portless's doctor actually uses: the dotted shape and
 // the major-version gate.

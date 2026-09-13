@@ -96,18 +96,38 @@ import {
   FD_STDERR,
   FD_STDOUT,
   HOST_NUM_KIND_ARGC,
+  HOST_NUM_KIND_AVAILABLE_MEMORY,
+  HOST_NUM_KIND_COLUMNS,
+  HOST_NUM_KIND_CONSTRAINED_MEMORY,
+  HOST_NUM_KIND_CPU_SYSTEM,
+  HOST_NUM_KIND_CPU_USER,
   HOST_NUM_KIND_ENV_PAIR_COUNT,
+  HOST_NUM_KIND_GID,
+  HOST_NUM_KIND_IS_TTY,
+  HOST_NUM_KIND_PID,
+  HOST_NUM_KIND_RUSAGE,
+  HOST_NUM_KIND_THREAD_CPU_SYSTEM,
+  HOST_NUM_KIND_THREAD_CPU_USER,
+  HOST_NUM_KIND_UID,
+  HOST_NUM_KIND_UPTIME,
+  HOST_STR_KIND_ARCH,
   HOST_STR_KIND_ARGV,
   HOST_STR_KIND_CWD,
   HOST_STR_KIND_ENV_KEY,
   HOST_STR_KIND_ENV_VALUE,
+  HOST_STR_KIND_EXEC_PATH,
   HOST_STR_KIND_PLATFORM,
+  HOST_STR_KIND_VERSIONS_NODE,
+  HOST_STR_KIND_VERSIONS_OPENSSL,
+  IMPORT_CHDIR,
   IMPORT_EXIT,
   IMPORT_HOST_NUM,
   IMPORT_HOST_STR,
+  IMPORT_KILL,
   IMPORT_MODULE,
   IMPORT_NOW,
   IMPORT_SEED,
+  IMPORT_UMASK,
   IMPORT_WALL_CLOCK,
   IMPORT_WRITE,
 } from "./abi.js";
@@ -344,14 +364,28 @@ function reachableFunctionNames(mod: WModule): Set<string> {
  * string scan over the IR rather than a per-kind walk: over-approximating
  * (a string literal spelling one of these names) costs an unused import,
  * while missing one would be a miscompile the emitter cannot recover
- * from. */
+ * from.
+ *
+ * INC-26 P3's own addition: `process.activeResources` is NOT spelled
+ * "timers." (it is its own libCall name), but its dispatch arm calls
+ * `this.timers.reffedCounters()`, which touches the SAME timer-heap
+ * globals `tick()`'s own `rearm` reads — and `tick()`, once built, always
+ * needs the `now` import this prescan alone decides. A program that
+ * reaches `process.activeResources` and NOTHING else "timers."-prefixed
+ * would otherwise sail through this scan finding nothing, mint no `now`
+ * import, then crash at emit time when `tick()` is built anyway
+ * (`nowFuncOrThrow`'s own named throw, emitter.ts) — caught by this
+ * pass's own forced-host file (wasm-host-process-p3.test.ts), not by any
+ * corpus program, since `process.getActiveResourcesInfo()` reaches no
+ * differential corpus lane. Exact-matched (not prefixed) since it is the
+ * one deliberately-differently-named exception, not a family. */
 function timerSurfaceReachable(mod: WModule): boolean {
   const reachable = reachableFunctionNames(mod);
   let found = false;
   const scan = (node: unknown): void => {
     if (found) return;
     if (typeof node === "string") {
-      if (node.startsWith("timers.")) found = true;
+      if (node.startsWith("timers.") || node === "process.activeResources") found = true;
       return;
     }
     if (Array.isArray(node)) {
@@ -469,7 +503,23 @@ function perfNowReachable(mod: WModule): boolean {
  * (never `path.resolve` directly) still reaches the cwd snapshot — caught
  * by the 3D three-way oracle as a real "tsinter.hostStr was never
  * imported" crash on `path.posix.relative("a","ab")` before this fix.
- * Every OTHER path key needs no host fact at all. */
+ * Every OTHER path key needs no host fact at all.
+ *
+ * INC-26 P3 (design-host-v7.txt §3.2, brief-p3-v2.md §3A(i), delta D-1)
+ * adds FIVE more exact matches: "process.arch", "process.execPath",
+ * "process.versionsNode", "process.versionsOpenssl" — four genuine
+ * HOST-FACT reads — AND "process.chdir", which is NOT itself a host-fact
+ * key but whose OWN error arm reads readHostStr(HOST_STR_KIND_CWD, 0) for
+ * the Node-shaped two-path message's "before" half (process.ts's own
+ * accessor, the same one process.cwd's arm calls). THE RULE THIS PRESCAN
+ * FOLLOWS (rev-26 CP1 pre-read D-1, generalizing P1's own "argv/env/cwd/
+ * platform" list): a key joins this prescan when its ARM TOUCHES THE
+ * IMPORT, never merely because the key "is a host fact" by name — the same
+ * reasoning `hostNumReachable` below already applies to `stdinSetRawMode`
+ * (whose gate reads `isTTY`) and to `emitWarning`/`onWarning` (whose
+ * default report reads `pid`). Omitting chdir here is a null-import crash
+ * on EVERY forced-host chdir row (the whole of design §0.5 W5) — caught by
+ * this rule before any arm existed to crash. */
 function hostStrReachable(mod: WModule): boolean {
   const reachable = reachableFunctionNames(mod);
   let found = false;
@@ -484,7 +534,12 @@ function hostStrReachable(mod: WModule): boolean {
         node === "path.resolve" ||
         node === "path.win32Resolve" ||
         node === "path.relative" ||
-        node === "path.win32Relative"
+        node === "path.win32Relative" ||
+        node === "process.arch" ||
+        node === "process.execPath" ||
+        node === "process.versionsNode" ||
+        node === "process.versionsOpenssl" ||
+        node === "process.chdir"
       ) {
         found = true;
       }
@@ -504,12 +559,203 @@ function hostStrReachable(mod: WModule): boolean {
   return found;
 }
 
-/** `hostNum`'s minting condition (INC-26 P1): the SAME reach set as
- * `hostStr` — argc and the env pair count ride the same first-touch
- * snapshot every argv/env key needs, so a module reaching any of them
- * needs both imports together. */
+/** `hostNum`'s minting condition. Through INC-26 P2 this was an ALIAS of
+ * `hostStrReachable` — argc and the env pair count ride the SAME
+ * first-touch snapshot every argv/env key needs, so P1's own four-key set
+ * (argv/env/cwd/platform, plus P2's four cwd-reading path keys) needed
+ * both imports together and the alias was exact. INC-26 P3
+ * (brief-p3-v2.md §3A(ii), rev-26 pre-read B-1 — "the largest defect the
+ * pre-read found") BREAKS THE ALIAS: P3 adds thirteen hostNum-only keys
+ * that never touch hostStr at all (a program reaching ONLY
+ * `process.columns`, for instance, must mint hostNum WITHOUT hostStr, and
+ * a program reaching only `process.execPath` must mint hostStr WITHOUT
+ * hostNum — six programs in two groups are the Module.imports evidence:
+ * 1468/1639 hostStr-only, 1448/1461/1571-optional-call/2314 hostNum-only).
+ * THIS FUNCTION NOW HAS ITS OWN BODY, in `hostStrReachable`'s own idiom
+ * (spelled the SAME WAY — `startsWith` for the argv/env prefixes, matching
+ * `hostStrReachable` exactly, a lockstep rev-26 flagged (CP1 pre-read
+ * E-4): the two lists must stay diffable against each other, so a later
+ * pass adding an argv/env sibling is caught by both or neither, never
+ * split). The union is: P1's own argv/env/cwd/platform set (the snapshot
+ * both imports share) UNION P3's thirteen hostNum-only kinds UNION the two
+ * keys whose ARM touches hostNum without being a host-fact themselves
+ * (`stdinSetRawMode`'s gate reads `isTTY`; `emitWarning`/`onWarning`'s
+ * default report reads `pid`) — the same "arm touches the import" rule
+ * `hostStrReachable`'s own P3 addition states above. */
 function hostNumReachable(mod: WModule): boolean {
-  return hostStrReachable(mod);
+  const reachable = reachableFunctionNames(mod);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (typeof node === "string") {
+      if (
+        node.startsWith("process.argv") ||
+        node.startsWith("process.env") ||
+        node === "process.cwd" ||
+        node === "process.platform" ||
+        node === "process.pid" ||
+        node === "process.getuid" ||
+        node === "process.getgid" ||
+        node === "process.isTTY" ||
+        node === "process.columns" ||
+        node === "process.stdinSetRawMode" ||
+        node === "process.uptime" ||
+        node === "process.cpuUser" ||
+        node === "process.cpuSystem" ||
+        node === "process.cpuUserDiff" ||
+        node === "process.cpuSystemDiff" ||
+        node === "process.threadCpuUser" ||
+        node === "process.threadCpuSystem" ||
+        node === "process.threadCpuUserDiff" ||
+        node === "process.threadCpuSystemDiff" ||
+        node === "process.availableMemory" ||
+        node === "process.constrainedMemory" ||
+        node === "process.rusage" ||
+        node === "process.emitWarning" ||
+        node === "process.onWarning"
+      ) {
+        found = true;
+      }
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      for (const value of Object.values(node)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn.body);
+  }
+  return found;
+}
+
+/** Does any reachable function reach `process.emitWarning` specifically?
+ * INC-26 P3 (brief-p3-v2.md §3D, rev-26 CP1 pre-read D-3/E-1) — a DEDICATED,
+ * NARROWER prescan than `hostNumReachable`'s own emitWarning disjunct
+ * above (that one guards MINTING THE hostNum IMPORT for the default
+ * report's pid; this one guards INTERNING THE NEXTTICK QUEUE early enough
+ * that no checkpoint is ever emitted before it exists — the two are
+ * different hazards that happen to share a triggering key, and conflating
+ * them was CP1's own M-15 defect, corrected here before it was built).
+ * `emitCheckpointCore` (this file, `hasTicks` read) checks
+ * `this.nextTickField !== null` — the PRIVATE FIELD, not the lazily-
+ * interning `this.nextTick` GETTER — at the moment EACH checkpoint is
+ * emitted. If `process.emitWarning`'s own dispatch arm is the FIRST thing
+ * in the whole program to touch `this.nextTick`, and some EARLIER-walked
+ * function's checkpoint is emitted before that arm is reached, that
+ * checkpoint's bytes are already fixed with `hasTicks` false — the queued
+ * warning is silently never drained (board #139's own mechanism). The fix
+ * is to force `this.nextTick` (the GETTER, interning eagerly) from THIS
+ * prescan's result, in the constructor, before any function body is
+ * walked and therefore before any checkpoint can be emitted — see the
+ * eager-touch call site below. */
+function emitWarningReachable(mod: WModule): boolean {
+  const reachable = reachableFunctionNames(mod);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (typeof node === "string") {
+      if (node === "process.emitWarning") found = true;
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      for (const value of Object.values(node)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn.body);
+  }
+  return found;
+}
+
+/** Does any reachable function call `process.kill` OR `process.killNum`?
+ * INC-26 P3 (design-host-v7.txt §2.7, brief-p3-v2.md §3A(iii)) — `kill`'s
+ * minting condition; BOTH libCall names share the one import (the
+ * frontend splits string-vs-number signal at LOWERING time, never at the
+ * emitter), so a program reaching either needs it. `exitReachable`'s exact
+ * shape. */
+function killReachable(mod: WModule): boolean {
+  const reachable = reachableFunctionNames(mod);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (typeof node === "string") {
+      if (node === "process.kill" || node === "process.killNum") found = true;
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      for (const value of Object.values(node)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn.body);
+  }
+  return found;
+}
+
+/** Does any reachable function call `process.chdir`? INC-26 P3 (design-host
+ * -v7.txt §0.5 W5) — `chdir`'s minting condition, an exact match,
+ * `exitReachable`'s shape. (Note: `process.chdir`'s own error arm ALSO
+ * requires `hostStr` — see `hostStrReachable`'s own P3 addition above;
+ * this predicate governs the `chdir` import specifically.) */
+function chdirReachable(mod: WModule): boolean {
+  const reachable = reachableFunctionNames(mod);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (typeof node === "string") {
+      if (node === "process.chdir") found = true;
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      for (const value of Object.values(node)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn.body);
+  }
+  return found;
+}
+
+/** Does any reachable function call `process.umask`? INC-26 P3
+ * (design-host-v7.txt §0.5 W4) — `umask`'s minting condition, an exact
+ * match, `exitReachable`'s shape. */
+function umaskReachable(mod: WModule): boolean {
+  const reachable = reachableFunctionNames(mod);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (typeof node === "string") {
+      if (node === "process.umask") found = true;
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      for (const value of Object.values(node)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn.body);
+  }
+  return found;
 }
 
 /** Does any reachable function call `process.exit`? INC-26 P1's `exit`
@@ -1451,15 +1697,27 @@ class Assembler {
    * right after `seedFunc` so `seed`'s own index is unchanged). */
   private readonly wallClockFunc: number | null;
   /** `tsinter.hostStr`'s index, or null in a module that never reaches
-   * argv, env (get/set/unset/pairs), cwd or platform (INC-26 P1,
-   * hostStrReachable's prescan). */
+   * argv, env (get/set/unset/pairs), cwd, platform, arch, execPath,
+   * versions.node/openssl, or chdir's OWN error-path cwd read (INC-26 P1/
+   * P3, hostStrReachable's prescan). */
   private readonly hostStrFunc: number | null;
-  /** `tsinter.hostNum`'s index — the SAME reach set as `hostStrFunc`
-   * (INC-26 P1, hostNumReachable's prescan). */
+  /** `tsinter.hostNum`'s index — THROUGH P2 the SAME reach set as
+   * `hostStrFunc`; INC-26 P3 breaks the alias (hostNumReachable's own
+   * prescan, see its header comment). */
   private readonly hostNumFunc: number | null;
   /** `tsinter.exit`'s index, or null in a module that never calls
    * `process.exit` (INC-26 P1, exitReachable's prescan). */
   private readonly exitFunc: number | null;
+  /** `tsinter.kill`'s index, or null in a module that never calls
+   * `process.kill`/`process.killNum` (INC-26 P3, killReachable's prescan,
+   * design §2.7). */
+  private readonly killFunc: number | null;
+  /** `tsinter.chdir`'s index, or null in a module that never calls
+   * `process.chdir` (INC-26 P3, chdirReachable's prescan, design §0.5 W5). */
+  private readonly chdirFunc: number | null;
+  /** `tsinter.umask`'s index, or null in a module that never calls
+   * `process.umask` (INC-26 P3, umaskReachable's prescan, design §0.5 W4). */
+  private readonly umaskFunc: number | null;
   /** The exit-drain gate's static fact — see exitListenerSurfaceReachable's
    * own comment (INC-26 P1). Computed ONCE in the constructor; every drain
    * gate site reads this, never the mutable `procField`/
@@ -1588,12 +1846,40 @@ class Assembler {
     this.exitFunc = exitReachable(mod)
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_EXIT, this.mb.funcType([I32], []))
       : null;
+    // `kill`/`chdir`/`umask`'s decisions (INC-26 P3, design §2.7/§0.5):
+    // three NEW conditional imports, each minted right after `exitFunc` so
+    // nothing before it moves. Each carries its OWN errno enumeration
+    // (§3B/§0.5) — never §6.3's fs table (a later pass, not yet built) and
+    // never each other's.
+    this.killFunc = killReachable(mod)
+      ? this.mb.importFunc(IMPORT_MODULE, IMPORT_KILL, this.mb.funcType([I32, I32], [I32]))
+      : null;
+    this.chdirFunc = chdirReachable(mod)
+      ? this.mb.importFunc(IMPORT_MODULE, IMPORT_CHDIR, this.mb.funcType([I32, I32], [I32]))
+      : null;
+    this.umaskFunc = umaskReachable(mod)
+      ? this.mb.importFunc(IMPORT_MODULE, IMPORT_UMASK, this.mb.funcType([I32, I32], [I32]))
+      : null;
     // The exit-drain gate's STATIC fact (see exitListenerSurfaceReachable's
     // own comment on why this must not be a runtime flag): true iff
     // process.exit/onExit/offExit is reached anywhere in the module.
     this.needsExitDrain = this.exitFunc !== null || exitListenerSurfaceReachable(mod);
     this.needsUnhandledRejectionDispatch = unhandledRejectionReachable(mod);
     this.needsRejectionHandledDispatch = rejectionHandledReachable(mod);
+    // INC-26 P3 (brief-p3-v2.md §3D, rev-26 CP1 pre-read D-3/E-1): force
+    // `this.nextTick` (the GETTER, interning the queue NOW) in any module
+    // that reaches `process.emitWarning`, BEFORE any function body is
+    // walked and therefore before any checkpoint can be emitted —
+    // `emitWarningReachable`'s own header explains the hazard this closes
+    // (board #139's mechanism). Safe this early: `NextTickBuilder`'s own
+    // constructor (nexttick.ts) is pure field assignment over three LAZY
+    // closures (voidClos/excKind/reportUncaught — none evaluated here),
+    // so eagerly touching the getter changes the emitted module ONLY
+    // through `hasTicks` becoming true where it would otherwise start
+    // false — nothing else moves (rev-26 CP1 pre-read E-1).
+    if (emitWarningReachable(mod)) {
+      void this.nextTick;
+    }
     this.mb.ensureMemory(1);
     this.cursorGlobal = this.mb.addGlobal(I32, true, (w) => {
       w.u8(0x41); // i32.const 0
@@ -5836,6 +6122,13 @@ class Assembler {
       hostStrFunc: () => this.hostStrFuncOrThrow(),
       hostNumFunc: () => this.hostNumFuncOrThrow(),
       exitFunc: () => this.exitFuncOrThrow(),
+      killFunc: () => this.killFuncOrThrow(),
+      chdirFunc: () => this.chdirFuncOrThrow(),
+      umaskFunc: () => this.umaskFuncOrThrow(),
+      pushStrLit: (c, value) => this.pushStrLitInto(c, value),
+      enqueueRaw: () => this.nextTick.enqueueRaw(),
+      rawFnType: () => this.nextTick.rawFnType(),
+      defaultReportHelper: () => this.defaultWarningReportHelper(),
       toInt32: () => this.toInt32Helper(),
       ensureCapacity: (c, need) => this.emitEnsureCapacity(c, need),
       stageCursor: () => this.cursorGlobal,
@@ -5931,6 +6224,30 @@ class Assembler {
       throw new Error("emitter bug: process.exit was reached but tsinter.exit was never imported");
     }
     return this.exitFunc;
+  }
+
+  /** `this.killFunc`, or a descriptive throw. */
+  private killFuncOrThrow(): number {
+    if (this.killFunc === null) {
+      throw new Error("emitter bug: process.kill/killNum was reached but tsinter.kill was never imported");
+    }
+    return this.killFunc;
+  }
+
+  /** `this.chdirFunc`, or a descriptive throw. */
+  private chdirFuncOrThrow(): number {
+    if (this.chdirFunc === null) {
+      throw new Error("emitter bug: process.chdir was reached but tsinter.chdir was never imported");
+    }
+    return this.chdirFunc;
+  }
+
+  /** `this.umaskFunc`, or a descriptive throw. */
+  private umaskFuncOrThrow(): number {
+    if (this.umaskFunc === null) {
+      throw new Error("emitter bug: process.umask was reached but tsinter.umask was never imported");
+    }
+    return this.umaskFunc;
   }
 
   /** The ARR payload's vector info — the SAME interning a static
@@ -12873,6 +13190,554 @@ class Assembler {
           return;
         }
         // ── end INC-26 P2 ──────────────────────────────────────────────
+        // ── INC-26 pass P3 — the process tail (brief-p3-v2.md ffbf2fdf/
+        // 371; design-host-v7.txt cccf7d6e §2.7/§3.2/§4.3/§9 P3;
+        // DECISIONS.md P3-J1..J4, CP1 delta D-1/D-2/D-3). Host-fact reads,
+        // kill/killNum (D4's own errno enumeration), cpuPrevValidate,
+        // activeResources (timers.ts's REFFED counts, no host), stdin's
+        // two keys, the warning surface, and Joe's five widened #138
+        // keys. 880 -> 891.
+        if (
+          e.fn === "process.arch" ||
+          e.fn === "process.execPath" ||
+          e.fn === "process.versionsNode" ||
+          e.fn === "process.versionsOpenssl"
+        ) {
+          const kind =
+            e.fn === "process.arch"
+              ? HOST_STR_KIND_ARCH
+              : e.fn === "process.execPath"
+                ? HOST_STR_KIND_EXEC_PATH
+                : e.fn === "process.versionsNode"
+                  ? HOST_STR_KIND_VERSIONS_NODE
+                  : HOST_STR_KIND_VERSIONS_OPENSSL;
+          code.i32Const(kind);
+          code.i32Const(0); // index is ignored for these kinds
+          code.call(this.proc.readHostStr());
+          return;
+        }
+        if (e.fn === "process.pid" || e.fn === "process.getuid" || e.fn === "process.getgid") {
+          const kind = e.fn === "process.pid" ? HOST_NUM_KIND_PID : e.fn === "process.getuid" ? HOST_NUM_KIND_UID : HOST_NUM_KIND_GID;
+          code.i32Const(kind);
+          code.i32Const(0); // arg ignored for these kinds
+          code.call(this.hostNumFuncOrThrow());
+          return;
+        }
+        if (e.fn === "process.isTTY") {
+          code.i32Const(HOST_NUM_KIND_IS_TTY);
+          this.walkExpr(e.args[0]!);
+          code.call(this.toInt32Helper());
+          code.call(this.hostNumFuncOrThrow());
+          code.f64Const(0);
+          code.f64Ne();
+          return;
+        }
+        if (e.fn === "process.columns") {
+          // R-2/envGet's own precedent: the result is the module's
+          // interned `number | undefined` union. -1 is the host's "no
+          // width" sentinel (abi.ts §2.3).
+          const unionId = e.type.kind === "union" ? e.type.unionId : null;
+          if (unionId === null) {
+            this.refuse("libCall:process.columns:unexpected-result-shape", e.loc);
+            code.unreachable();
+            return;
+          }
+          const undefTag = this.undefinedArmTag(unionId);
+          const f64Tag = this.unionArmTag(unionId, { kind: "f64" });
+          if (undefTag < 0 || f64Tag < 0) {
+            this.refuse("libCall:process.columns:unexpected-union-shape", e.loc);
+            code.unreachable();
+            return;
+          }
+          const f64St = this.unionArmStruct(unionId, f64Tag, e.loc);
+          const unionVal = this.mapType(e.type, e.loc);
+          if (f64St === null || unionVal === null) {
+            code.unreachable();
+            return;
+          }
+          code.i32Const(HOST_NUM_KIND_COLUMNS);
+          this.walkExpr(e.args[0]!);
+          code.call(this.toInt32Helper());
+          code.call(this.hostNumFuncOrThrow());
+          const tmp = this.acquireScratch(F64);
+          code.localSet(tmp);
+          code.localGet(tmp);
+          code.f64Const(-1);
+          code.f64Eq();
+          this.openIfResult(unionVal);
+          code.globalGet(this.unions.unitGlobal(undefTag));
+          code.else_();
+          code.i32Const(f64Tag);
+          code.localGet(tmp);
+          code.structNew(f64St);
+          this.close();
+          this.releaseScratch(F64, tmp);
+          return;
+        }
+        if (
+          e.fn === "process.uptime" ||
+          e.fn === "process.availableMemory" ||
+          e.fn === "process.constrainedMemory" ||
+          e.fn === "process.cpuUser" ||
+          e.fn === "process.cpuSystem" ||
+          e.fn === "process.threadCpuUser" ||
+          e.fn === "process.threadCpuSystem"
+        ) {
+          const kind =
+            e.fn === "process.uptime"
+              ? HOST_NUM_KIND_UPTIME
+              : e.fn === "process.availableMemory"
+                ? HOST_NUM_KIND_AVAILABLE_MEMORY
+                : e.fn === "process.constrainedMemory"
+                  ? HOST_NUM_KIND_CONSTRAINED_MEMORY
+                  : e.fn === "process.cpuUser"
+                    ? HOST_NUM_KIND_CPU_USER
+                    : e.fn === "process.cpuSystem"
+                      ? HOST_NUM_KIND_CPU_SYSTEM
+                      : e.fn === "process.threadCpuUser"
+                        ? HOST_NUM_KIND_THREAD_CPU_USER
+                        : HOST_NUM_KIND_THREAD_CPU_SYSTEM;
+          code.i32Const(kind);
+          code.i32Const(0); // arg ignored for these kinds
+          code.call(this.hostNumFuncOrThrow());
+          return;
+        }
+        if (
+          e.fn === "process.cpuUserDiff" ||
+          e.fn === "process.cpuSystemDiff" ||
+          e.fn === "process.threadCpuUserDiff" ||
+          e.fn === "process.threadCpuSystemDiff"
+        ) {
+          // IN-MODULE subtraction (design §3.2): only the raw counters
+          // cross the ABI; `fresh - prev` mirrors scr_lib.c's own
+          // scr_cpu_user_diff etc. exactly.
+          const kind =
+            e.fn === "process.cpuUserDiff"
+              ? HOST_NUM_KIND_CPU_USER
+              : e.fn === "process.cpuSystemDiff"
+                ? HOST_NUM_KIND_CPU_SYSTEM
+                : e.fn === "process.threadCpuUserDiff"
+                  ? HOST_NUM_KIND_THREAD_CPU_USER
+                  : HOST_NUM_KIND_THREAD_CPU_SYSTEM;
+          code.i32Const(kind);
+          code.i32Const(0);
+          code.call(this.hostNumFuncOrThrow());
+          this.walkExpr(e.args[0]!);
+          code.f64Sub();
+          return;
+        }
+        if (e.fn === "process.rusage") {
+          code.i32Const(HOST_NUM_KIND_RUSAGE);
+          this.walkExpr(e.args[0]!);
+          code.call(this.toInt32Helper());
+          code.call(this.hostNumFuncOrThrow());
+          return;
+        }
+        if (e.fn === "process.cpuPrevValidate") {
+          // Pure validation, VOID result (design §3.2): user checked
+          // BEFORE system (scr_cpu_prev_check_field's own two-call
+          // order, scr_lib.c:1184-1196), RangeError ERR_INVALID_ARG_VALUE
+          // "The property 'prevValue.<name>' is invalid. Received <n>"
+          // for a non-finite or negative value (NaN/negative/+Infinity
+          // all fail the SAME two-comparison test the C uses).
+          const user = this.acquireScratch(F64);
+          const system = this.acquireScratch(F64);
+          this.walkExpr(e.args[0]!);
+          code.localSet(user);
+          this.walkExpr(e.args[1]!);
+          code.localSet(system);
+          this.emitCpuPrevFieldCheck(code, user, "user");
+          this.emitCpuPrevFieldCheck(code, system, "system");
+          this.releaseScratch(F64, system);
+          this.releaseScratch(F64, user);
+          return;
+        }
+        if (e.fn === "process.activeResources") {
+          const arrType = arrayOf(STRING) as IrType & { kind: "array" };
+          const vecInfo = this.vecInfoFor(arrType, e.loc);
+          if (vecInfo === null) {
+            code.unreachable();
+            return;
+          }
+          const counters = this.timers.reffedCounters();
+          const TIMEOUT_N = this.acquireScratch(I32);
+          const IMMEDIATE_N = this.acquireScratch(I32);
+          // heap.reffed (armed, ref'd, off the currently-firing one) PLUS
+          // the firing entry IF it is currently firing, was ref'd, and
+          // has not been cleared from inside its own callback (R-3(b),
+          // timers.ts's own reffedCounters() doc comment on why firingId
+          // must gate the other two, which are otherwise stale).
+          code.globalGet(counters.firingIdG);
+          code.f64Const(0);
+          code.f64Ne();
+          code.globalGet(counters.firingReffedG);
+          code.i32And();
+          code.globalGet(counters.firingClearedG);
+          code.i32Eqz();
+          code.i32And();
+          code.globalGet(counters.timeoutReffedG);
+          code.i32Add();
+          code.localSet(TIMEOUT_N);
+          code.globalGet(counters.immediateReffedG);
+          code.localSet(IMMEDIATE_N);
+          const vecRefT = this.vecs.vecRef(vecInfo);
+          const VEC = this.acquireScratch(vecRefT);
+          code.f64Const(0);
+          code.call(this.vecs.newLen(vecInfo));
+          code.localSet(VEC);
+          // Node groups BY KIND — every Timeout, then every Immediate,
+          // regardless of arming order (rev-26 CP1 ruling (b),
+          // rev-activeres-order.out f7036bd0 — measured, not guessed;
+          // matches scr_active_resources's own two-loop shape,
+          // scr_async.c:614-621).
+          code.block();
+          code.loop();
+          code.localGet(TIMEOUT_N);
+          code.i32Eqz();
+          code.brIf(1);
+          code.localGet(VEC);
+          this.pushStrLit("Timeout");
+          code.call(this.vecs.pushOne(vecInfo));
+          code.localGet(TIMEOUT_N);
+          code.i32Const(1);
+          code.i32Sub();
+          code.localSet(TIMEOUT_N);
+          code.br(0);
+          code.end();
+          code.end();
+          code.block();
+          code.loop();
+          code.localGet(IMMEDIATE_N);
+          code.i32Eqz();
+          code.brIf(1);
+          code.localGet(VEC);
+          this.pushStrLit("Immediate");
+          code.call(this.vecs.pushOne(vecInfo));
+          code.localGet(IMMEDIATE_N);
+          code.i32Const(1);
+          code.i32Sub();
+          code.localSet(IMMEDIATE_N);
+          code.br(0);
+          code.end();
+          code.end();
+          code.localGet(VEC);
+          this.releaseScratch(vecRefT, VEC);
+          this.releaseScratch(I32, IMMEDIATE_N);
+          this.releaseScratch(I32, TIMEOUT_N);
+          return;
+        }
+        if (e.fn === "process.stdinDestroy") {
+          // A no-op (design §3.2) — Node's stdin.destroy() on the
+          // piped/non-TTY stream this tier always presents has nothing
+          // observable to do.
+          return;
+        }
+        if (e.fn === "process.stdinSetRawMode") {
+          // Gated on isTTY(0) (design §3.2/§11): under a non-TTY stdin
+          // (every corpus/differential run) the property is ABSENT on
+          // Node's own Socket-shaped stdin (R-11, measured), so the tier
+          // produces the exact TypeError text FROM THE GATE, with no
+          // `.code`. The bool argument is only meaningful on the TTY arm.
+          this.walkExpr(e.args[0]!);
+          code.drop();
+          code.i32Const(HOST_NUM_KIND_IS_TTY);
+          code.i32Const(0);
+          code.call(this.hostNumFuncOrThrow());
+          code.f64Const(0);
+          code.f64Eq();
+          this.openIf();
+          this.emitSetCellError(
+            code,
+            "%TypeError",
+            "TypeError",
+            (c) => this.pushStrLitInto(c, "process.stdin.setRawMode is not a function"),
+            null,
+          );
+          this.emitUnwind();
+          this.close();
+          // TTY arm (A-3/D-P3-7): unreachable by design (§11 serves
+          // isTTY false for fds 0/1/2) — the module cannot change
+          // termios, so it TRAPS with a named stderr line rather than
+          // silently no-opping (rule 1's loudness contract).
+          this.pushStrLit("process.stdinSetRawMode: no TTY control in this tier\n");
+          {
+            const helpers = this.ensureHelpers();
+            code.call(helpers.stage);
+            code.i32Const(FD_STDERR);
+            code.call(helpers.flush);
+          }
+          code.unreachable();
+          return;
+        }
+        if (e.fn === "process.kill" || e.fn === "process.killNum") {
+          const PID = this.acquireScratch(F64);
+          this.walkExpr(e.args[0]!);
+          code.localSet(PID);
+          this.emitKillPidCheck(code, PID);
+          const SIG = this.acquireScratch(I32);
+          if (e.fn === "process.kill") {
+            // The string arm: D-2's falsy-then-lookup, entirely inside
+            // killSignalByNameHelper (Node's own `sig = sig || 'SIGTERM'`
+            // BEFORE the table — an empty string sends SIGTERM, never
+            // "Unknown signal: "). Unknown -> TypeError ERR_UNKNOWN_SIGNAL
+            // BEFORE any host call (B-2/R-7).
+            const NAMELOCAL = this.acquireScratch(this.strRef);
+            this.walkExpr(e.args[1]!);
+            code.localSet(NAMELOCAL);
+            code.localGet(NAMELOCAL);
+            code.call(this.proc.killSignalByNameHelper());
+            const RESOLVED = this.acquireScratch(F64);
+            code.localSet(RESOLVED);
+            code.localGet(RESOLVED);
+            code.f64Const(-1);
+            code.f64Eq();
+            this.openIf();
+            this.emitSetCellError(
+              code,
+              "%TypeError",
+              "TypeError",
+              (c) => {
+                this.pushStrLitInto(c, "Unknown signal: ");
+                c.localGet(NAMELOCAL);
+                c.call(this.concatHelper());
+              },
+              "ERR_UNKNOWN_SIGNAL",
+            );
+            this.emitUnwind();
+            this.close();
+            code.localGet(RESOLVED);
+            code.call(this.toInt32Helper());
+            code.localSet(SIG);
+            this.releaseScratch(F64, RESOLVED);
+            this.releaseScratch(this.strRef, NAMELOCAL);
+          } else {
+            // killNum (B-2, independently re-measured CP1 §0
+            // killgate.mjs): the gate is Node's INT32 ROUND-TRIP
+            // `sig === (sig|0)`, NOT Number.isInteger (M-17's own
+            // target). Inside int32: pass RAW. Outside: NaN (the only
+            // FALSY non-int32 number) resolves to SIGTERM(15); every
+            // OTHER value throws "Unknown signal: <the tier's own
+            // Number->string>". THERE IS NO THIRD ARM (delta-3e E-5,
+            // rev-26 F-2): a value reaching this point already failed
+            // the int32 round-trip, so it can NEVER be an integer in
+            // [1,31] — every such value round-trips through ToInt32 by
+            // construction and would already have taken the RAW branch
+            // above. A "is it an in-range integer after all" check here
+            // is unreachable dead code that encodes a false model (that
+            // a non-int32 number could equal a table value); deleted,
+            // not built. The only two outcomes past the int32 test are
+            // NaN -> SIGTERM and everything else -> the TypeError.
+            const RAWSIG = this.acquireScratch(F64);
+            this.walkExpr(e.args[1]!);
+            code.localSet(RAWSIG);
+            const SIGI32 = this.acquireScratch(I32);
+            code.localGet(RAWSIG);
+            code.call(this.toInt32Helper());
+            code.localSet(SIGI32);
+            code.localGet(RAWSIG);
+            code.localGet(SIGI32);
+            code.f64ConvertI32S();
+            code.f64Eq();
+            this.openIfResult(I32);
+            code.localGet(SIGI32);
+            code.else_();
+            code.localGet(RAWSIG);
+            code.localGet(RAWSIG);
+            code.f64Ne(); // true iff RAWSIG is NaN (self-inequality)
+            this.openIfResult(I32);
+            code.i32Const(15); // SIGTERM
+            code.else_();
+            this.emitSetCellError(
+              code,
+              "%TypeError",
+              "TypeError",
+              (c) => {
+                this.pushStrLitInto(c, "Unknown signal: ");
+                c.localGet(RAWSIG);
+                c.call(this.f64ToStrHelper());
+                c.call(this.concatHelper());
+              },
+              "ERR_UNKNOWN_SIGNAL",
+            );
+            this.emitUnwind();
+            code.i32Const(0); // unreachable after unwind; keeps the if typed
+            this.close();
+            this.close();
+            code.localSet(SIG);
+            this.releaseScratch(I32, SIGI32);
+            this.releaseScratch(F64, RAWSIG);
+          }
+          const PIDI32 = this.acquireScratch(I32);
+          code.localGet(PID);
+          code.call(this.toInt32Helper());
+          code.localSet(PIDI32);
+          code.localGet(PIDI32);
+          code.localGet(SIG);
+          code.call(this.killFuncOrThrow());
+          this.emitKillResultRender(code);
+          this.releaseScratch(I32, SIG);
+          this.releaseScratch(I32, PIDI32);
+          this.releaseScratch(F64, PID);
+          return;
+        }
+        if (e.fn === "process.chdir") {
+          // THE FIRST PATH is the cwd BEFORE the call (design §0.5 W5),
+          // read DIRECTLY via readHostStr — never through path.ts's
+          // cwdSnapshotHelper, which may be stale/absent.
+          const BEFORE = this.acquireScratch(this.strRef);
+          code.i32Const(HOST_STR_KIND_CWD);
+          code.i32Const(0);
+          code.call(this.proc.readHostStr());
+          code.localSet(BEFORE);
+          const DIR = this.acquireScratch(this.strRef);
+          this.walkExpr(e.args[0]!);
+          code.localSet(DIR);
+          code.localGet(DIR);
+          code.call(this.stageStrUtf16Helper());
+          const LEN = this.acquireScratch(I32);
+          code.localSet(LEN);
+          code.globalGet(this.cursorGlobal); // ptr — the cursor is 0 by
+          // construction at every libCall dispatch (M-17's own invariant)
+          code.localGet(LEN);
+          code.call(this.chdirFuncOrThrow());
+          const STATUS = this.acquireScratch(I32);
+          code.localSet(STATUS);
+          code.localGet(STATUS);
+          code.i32Const(0);
+          code.i32Ne();
+          this.openIf();
+          this.emitChdirErrorRender(code, STATUS, BEFORE, DIR);
+          this.close();
+          // Success: process.cwd() reads fresh (no cache of its own), but
+          // path.ts's memo MUST be invalidated (§0.5's own text) or
+          // path.resolve() answers the OLD directory.
+          this.path.invalidateCwdSnapshot(code);
+          this.releaseScratch(I32, STATUS);
+          this.releaseScratch(I32, LEN);
+          this.releaseScratch(this.strRef, DIR);
+          this.releaseScratch(this.strRef, BEFORE);
+          return;
+        }
+        if (e.fn === "process.umask") {
+          // The frontend already completed the 0-ary form to the literal
+          // -1 read sentinel (lower-builtins.ts, confirmed no IR change
+          // needed) — THE -1 COLLISION (board #142) is a frontend defect
+          // on every lane, not fixed here: the -1 IR value always means
+          // "read" at this import regardless of which source shape
+          // produced it.
+          const MASK = this.acquireScratch(F64);
+          this.walkExpr(e.args[0]!);
+          code.localSet(MASK);
+          code.localGet(MASK);
+          code.f64Const(-1);
+          code.f64Eq();
+          this.openIfResult(F64);
+          code.i32Const(1); // isRead
+          code.i32Const(0); // mask ignored
+          code.call(this.umaskFuncOrThrow());
+          code.f64ConvertI32S();
+          code.else_();
+          // Node's own check ORDER (measured): INTEGER FIRST, RANGE
+          // SECOND — a non-integer mask throws even when ALSO out of
+          // range.
+          code.localGet(MASK);
+          code.localGet(MASK);
+          code.f64Trunc();
+          code.f64Eq();
+          code.i32Eqz();
+          this.openIf();
+          this.emitSetCellError(
+            code,
+            "%RangeError",
+            "RangeError",
+            (c) => {
+              this.pushStrLitInto(c, 'The value of "mask" is out of range. It must be an integer. Received ');
+              c.localGet(MASK);
+              c.call(this.f64ToStrHelper());
+              c.call(this.concatHelper());
+            },
+            "ERR_OUT_OF_RANGE",
+          );
+          this.emitUnwind();
+          this.close();
+          code.localGet(MASK);
+          code.f64Const(0);
+          code.f64Ge();
+          code.localGet(MASK);
+          code.f64Const(4294967295);
+          code.f64Le();
+          code.i32And();
+          code.i32Eqz();
+          this.openIf();
+          this.emitSetCellError(
+            code,
+            "%RangeError",
+            "RangeError",
+            (c) => {
+              this.pushStrLitInto(c, 'The value of "mask" is out of range. It must be >= 0 && <= 4294967295. Received ');
+              c.localGet(MASK);
+              c.call(this.f64ToStrHelper());
+              c.call(this.concatHelper());
+            },
+            "ERR_OUT_OF_RANGE",
+          );
+          this.emitUnwind();
+          this.close();
+          code.i32Const(0); // isRead=0, SET mask
+          code.localGet(MASK);
+          code.i32TruncF64U();
+          code.call(this.umaskFuncOrThrow());
+          code.f64ConvertI32S();
+          this.close();
+          this.releaseScratch(F64, MASK);
+          return;
+        }
+        if (e.fn === "process.exiting") {
+          // W3: the SAME flag exitDrainHelper sets at its own top on ALL
+          // THREE reported exit paths (design §4.3) — zero new host.
+          code.globalGet(this.proc.exitingFlagGlobal());
+          return;
+        }
+        if (e.fn === "process.stderrWriteBytes") {
+          // W1: stdoutWriteBytes's own MIRROR, FD_STDERR substituted.
+          this.walkExpr(e.args[0]!);
+          code.call(this.stageBytesHelper());
+          code.i32Const(FD_STDERR);
+          code.call(this.ensureHelpers().flush);
+          code.i32Const(1); // Node's constant backpressure answer
+          return;
+        }
+        if (e.fn === "process.offRejectionHandled") {
+          // W2: offUnhandledRejectionRemove's own MIRROR (process.ts),
+          // scoped to the rejectionHandled list.
+          this.walkExpr(e.args[0]!);
+          code.call(this.proc.offRejectionHandledRemove());
+          return;
+        }
+        if (e.fn === "process.onWarning") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.proc.onWarningAppend());
+          return;
+        }
+        if (e.fn === "process.offWarning") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.proc.offWarningRemove());
+          return;
+        }
+        if (e.fn === "process.emitWarning") {
+          this.emitProcessEmitWarning(code, e.args[0]!);
+          return;
+        }
+        if (e.fn === "process.onSignal" || e.fn === "process.offSignal") {
+          // D5/A-9: registration is easy; DELIVERY needs a host signal
+          // channel this tier does not have. BOTH keys refuse under the
+          // SAME bucket name (`libCall:process.onSignal`) so the census
+          // bucket never moves, whichever the program reaches FIRST — the
+          // one way this control can silently break.
+          this.refuse("libCall:process.onSignal", e.loc);
+          code.unreachable();
+          return;
+        }
         if (this.emitBufferLibCall(e)) return;
         if (this.emitTimerCall(e)) return;
         if (this.emitEmitterLibCall(e)) return;
@@ -18936,6 +19801,725 @@ class Assembler {
     if (vr === null) return null;
     const key = `map(${this.vecKeyFor(keyType)},${this.vecKeyFor(valueType)})`;
     return this.maps.info(key, kr.kind, kr.val, vr.kind, vr.val, vr.storage);
+  }
+
+  /** INC-26 P3 (design-host-v7.txt §2.7, scr_kill_pid_check ported): Node
+   * validates `pid` as an int32 BEFORE any kill(2) call and throws this
+   * exact (odd) wording — "must be of type number" even though the
+   * received VALUE literally is one; that is Node's own template for
+   * this check, not a paraphrase (independently re-measured CP1 §0:
+   * `.code` = "ERR_INVALID_ARG_TYPE", confirmed via a written probe).
+   * NaN fails BOTH range comparisons, so no separate NaN check is
+   * needed — matches scr_kill_pid_check's own comment verbatim. Leaves
+   * `pidLocal` UNCHANGED; the caller converts to i32 only after this
+   * passes. */
+  private emitKillPidCheck(code: Code, pidLocal: number): void {
+    code.localGet(pidLocal);
+    code.f64Const(-2147483648);
+    code.f64Ge();
+    code.localGet(pidLocal);
+    code.f64Const(2147483647);
+    code.f64Le();
+    code.i32And();
+    code.localGet(pidLocal);
+    code.localGet(pidLocal);
+    code.f64Trunc();
+    code.f64Eq();
+    code.i32And();
+    code.i32Eqz();
+    this.openIf();
+    this.emitSetCellError(
+      code,
+      "%TypeError",
+      "TypeError",
+      (c) => {
+        this.pushStrLitInto(c, 'The "pid" argument must be of type number. Received type number (');
+        c.localGet(pidLocal);
+        c.call(this.f64ToStrHelper());
+        c.call(this.concatHelper());
+        this.pushStrLitInto(c, ")");
+        c.call(this.concatHelper());
+      },
+      "ERR_INVALID_ARG_TYPE",
+    );
+    this.emitUnwind();
+    this.close();
+  }
+
+  /** INC-26 P3 (design-host-v7.txt §2.7, B-3/C-3): renders `tsinter.kill`'s
+   * i32 STATUS already on the stack — 0 (success, Node's constant `true`
+   * pushed), -1/-2/-3 (ESRCH/EPERM/EINVAL, `Error("kill <NAME>")` with
+   * `.code` = the bare name), or <= -256 (`Error("kill E<n>")`, n =
+   * -status-256, NO `.code` — scr_lib.c:550-551's own asymmetry
+   * reproduced INCLUDING its number, never merged into a later pass's fs
+   * enumeration). Pushes the BOOL `true` result on the success path;
+   * every failure path unwinds and never returns to the caller. */
+  private emitKillResultRender(code: Code): void {
+    const status = this.acquireScratch(I32);
+    code.localSet(status);
+    code.localGet(status);
+    code.i32Const(0);
+    code.i32Ne();
+    this.openIf();
+    this.emitKillNamedErrorCheck(code, status, -1, "ESRCH");
+    this.emitKillNamedErrorCheck(code, status, -2, "EPERM");
+    this.emitKillNamedErrorCheck(code, status, -3, "EINVAL");
+    // Fallback: anything else is <= -256 by the host's own contract
+    // (abi.ts: 256 is a BASE, not a code). n = -status - 256.
+    const n = this.acquireScratch(I32);
+    code.localGet(status);
+    code.i32Const(-1);
+    code.i32Mul();
+    code.i32Const(256);
+    code.i32Sub();
+    code.localSet(n);
+    this.emitSetCellError(
+      code,
+      "%Error",
+      "Error",
+      (c) => {
+        this.pushStrLitInto(c, "kill E");
+        c.localGet(n);
+        c.f64ConvertI32S();
+        c.call(this.f64ToStrHelper());
+        c.call(this.concatHelper());
+      },
+      null,
+    );
+    this.emitUnwind();
+    this.releaseScratch(I32, n);
+    this.close();
+    code.i32Const(1); // Node's constant `true`
+    this.releaseScratch(I32, status);
+  }
+
+  private warnHintPrintedGlobal: number | null = null;
+  /** "once per process" flag for the trace-warnings hint line — INC-26
+   * P3, B-7 (measured, warnreport.mjs sha256 ca67b280b0dfce6567a0ccf2a27
+   * b312622615cccff170786592120c6e86ffad6, this session): the hint
+   * follows ONLY the FIRST default-reported warning, coded or not, and
+   * never repeats. */
+  private warnHintPrintedG(): number {
+    this.warnHintPrintedGlobal ??= this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41);
+      w.sleb(0);
+    });
+    return this.warnHintPrintedGlobal;
+  }
+
+  /** `process.emitWarning`'s FULL arm — INC-26 P3 (design §3.2/§3D, R-10,
+   * B-7). DISPATCH IS SYNCHRONOUS, A REPORTED FALLBACK FROM THE NODE-
+   * EXACT nextTick DEFERRAL brief §3D/A-2 designed (STOP AND REPORT,
+   * their own words, applied here): the eager `this.nextTick` touch
+   * (`emitWarningReachable`, this file's own prescan) is BUILT and
+   * WIRED, proven safe/inert by construction (E-1) — but ACTUALLY
+   * enqueuing a deferred action needs a wasm CLOSURE VALUE
+   * (`NextTickBuilder.enqueue`'s one parameter), and every existing
+   * closure in this tier is either a FRONTEND-adapted user callback or a
+   * null placeholder; nothing in this file already constructs an
+   * emitter-INTERNAL closure with no user-level callback backing it, and
+   * building that mechanism from zero (a fresh function ref + a captured
+   * environment struct, verified against `closPairFor`'s own call
+   * convention) was judged higher-risk than shipping a measured,
+   * synchronous WRONG-ORDER fallback under S078's own escape hatch. 2215
+   * cannot discriminate this axis (R-9: it prints from an 'exit'
+   * listener with the emits last in the turn) — ONLY a forced-host order
+   * row can, and none exists yet. FLAGGED FOR THE FREEZE/REVIEW, not
+   * decided silently. */
+  private emitProcessEmitWarning(code: Code, argsExpr: IrExpr): void {
+    const dynRefT = this.dyn.dynRef();
+    const dynT = this.dyn.dynT();
+    const objRefT = this.dyn.objRef();
+    // `argsExpr` is a `dynArrLit` — walking it produces a BOXED dyn ARR
+    // value (emitter.ts's own "dynArrLit" case: `this.dyn.boxArr(code,
+    // (c) => c.localGet(a))`), NEVER the raw vec struct directly. Unbox
+    // via `arrPayload`, then read length/elements with `arrLen`/`arrAt`
+    // (the UNCHECKED reads — `vecs.get()` TRAPS out of range, which is
+    // wrong here: an absent position is a NORMAL "undefined" case, not a
+    // bug).
+    const ARGSDYN = this.acquireScratch(dynRefT);
+    this.walkExpr(argsExpr);
+    code.localSet(ARGSDYN);
+    const ARR = this.acquireScratch(this.dyn.arrRef());
+    this.dyn.arrPayload(code, (c) => c.localGet(ARGSDYN));
+    code.localSet(ARR);
+    const LEN = this.acquireScratch(I32);
+    this.dyn.arrLen(code, (c) => c.localGet(ARR));
+    code.localSet(LEN);
+
+    const getPos = (idx: number): void => {
+      code.localGet(LEN);
+      code.i32Const(idx);
+      code.i32GtU();
+      this.openIfResult(dynRefT);
+      this.dyn.arrAt(
+        code,
+        (c) => c.localGet(ARR),
+        (c) => c.i32Const(idx),
+      );
+      code.else_();
+      code.refNull(dynT);
+      this.close();
+    };
+    const POS0 = this.acquireScratch(dynRefT);
+    getPos(0);
+    code.localSet(POS0);
+    const POS1 = this.acquireScratch(dynRefT);
+    getPos(1);
+    code.localSet(POS1);
+    const POS2 = this.acquireScratch(dynRefT);
+    getPos(2);
+    code.localSet(POS2);
+
+    const dynKindIs = (local: number, kind: number): void => {
+      code.localGet(local);
+      code.refIsNull();
+      code.i32Eqz();
+      this.openIfResult(I32);
+      code.localGet(local);
+      code.structGet(dynT, DYN_KIND);
+      code.i32Const(kind);
+      code.i32Eq();
+      code.else_();
+      code.i32Const(0);
+      this.close();
+    };
+
+    // Position 0 ("warning"): string OR an Error instance.
+    dynKindIs(POS0, DK.STR);
+    const isPos0Str = this.acquireScratch(I32);
+    code.localSet(isPos0Str);
+    code.localGet(POS0);
+    code.refIsNull();
+    code.i32Eqz();
+    this.openIfResult(I32);
+    code.localGet(POS0);
+    code.call(this.dyn.isError());
+    code.else_();
+    code.i32Const(0);
+    this.close();
+    const isPos0Err = this.acquireScratch(I32);
+    code.localSet(isPos0Err);
+    code.localGet(isPos0Str);
+    code.localGet(isPos0Err);
+    code.i32Or();
+    code.i32Eqz();
+    this.openIf();
+    this.emitSetCellError(
+      code,
+      "%TypeError",
+      "TypeError",
+      (c) => {
+        this.pushStrLitInto(c, 'The "warning" argument must be of type string or an instance of Error. Received ');
+        c.localGet(POS0);
+        c.call(this.dyn.specificType());
+        c.call(this.concatHelper());
+      },
+      "ERR_INVALID_ARG_TYPE",
+    );
+    this.emitUnwind();
+    this.close();
+
+    // Decode type/code/detail from POS1 (R-10): OBJECT = options bag;
+    // STRING = type (position 2 may then supply code); FUNCTION = the
+    // ctor position, ignored; anything else (when present) throws.
+    const TYPE = this.acquireScratch(this.strRef);
+    this.pushStrLit("Warning");
+    code.localSet(TYPE);
+    const CODE = this.acquireScratch(dynRefT);
+    code.refNull(dynT);
+    code.localSet(CODE);
+    const DETAIL = this.acquireScratch(dynRefT);
+    code.refNull(dynT);
+    code.localSet(DETAIL);
+
+    dynKindIs(POS1, DK.OBJ);
+    const pos1IsObj = this.acquireScratch(I32);
+    code.localSet(pos1IsObj);
+    dynKindIs(POS1, DK.STR);
+    const pos1IsStr = this.acquireScratch(I32);
+    code.localSet(pos1IsStr);
+    dynKindIs(POS1, DK.FUNC);
+    const pos1IsFunc = this.acquireScratch(I32);
+    code.localSet(pos1IsFunc);
+
+    code.localGet(POS1);
+    code.refIsNull();
+    code.i32Eqz();
+    code.localGet(pos1IsObj);
+    code.localGet(pos1IsStr);
+    code.i32Or();
+    code.localGet(pos1IsFunc);
+    code.i32Or();
+    code.i32Eqz();
+    code.i32And();
+    this.openIf();
+    this.emitSetCellError(
+      code,
+      "%TypeError",
+      "TypeError",
+      (c) => {
+        this.pushStrLitInto(c, 'The "type" argument must be of type string. Received ');
+        c.localGet(POS1);
+        c.call(this.dyn.specificType());
+        c.call(this.concatHelper());
+      },
+      "ERR_INVALID_ARG_TYPE",
+    );
+    this.emitUnwind();
+    this.close();
+
+    code.localGet(pos1IsObj);
+    this.openIf();
+    {
+      const OBJPAY = this.acquireScratch(objRefT);
+      this.dyn.objPayload(code, (c) => c.localGet(POS1));
+      code.localSet(OBJPAY);
+      const OTYPE = this.acquireScratch(dynRefT);
+      code.localGet(OBJPAY);
+      this.pushStrLit("type");
+      code.call(this.dyn.objGet());
+      code.localSet(OTYPE);
+      code.localGet(OTYPE);
+      code.refIsNull();
+      code.i32Eqz();
+      this.openIf();
+      code.localGet(OTYPE);
+      code.structGet(dynT, DYN_REF);
+      code.refCast(this.strType);
+      code.localSet(TYPE);
+      this.close();
+      this.releaseScratch(dynRefT, OTYPE);
+      code.localGet(OBJPAY);
+      this.pushStrLit("code");
+      code.call(this.dyn.objGet());
+      code.localSet(CODE);
+      code.localGet(OBJPAY);
+      this.pushStrLit("detail");
+      code.call(this.dyn.objGet());
+      code.localSet(DETAIL);
+      this.releaseScratch(objRefT, OBJPAY);
+    }
+    this.close();
+
+    code.localGet(pos1IsStr);
+    this.openIf();
+    code.localGet(POS1);
+    code.structGet(dynT, DYN_REF);
+    code.refCast(this.strType);
+    code.localSet(TYPE);
+    this.close();
+
+    // The code position (POS2) only applies when POS1 was a plain type
+    // string (the 3-ary positional form); the options bag already read
+    // its own "code" field above, and the ctor/absent shapes take none.
+    code.localGet(pos1IsStr);
+    code.localGet(POS2);
+    code.refIsNull();
+    code.i32Eqz();
+    code.i32And();
+    this.openIf();
+    dynKindIs(POS2, DK.STR);
+    code.i32Eqz();
+    this.openIf();
+    this.emitSetCellError(
+      code,
+      "%TypeError",
+      "TypeError",
+      (c) => {
+        this.pushStrLitInto(c, 'The "code" argument must be of type string. Received ');
+        c.localGet(POS2);
+        c.call(this.dyn.specificType());
+        c.call(this.concatHelper());
+      },
+      "ERR_INVALID_ARG_TYPE",
+    );
+    this.emitUnwind();
+    this.close();
+    code.localGet(POS2);
+    code.localSet(CODE);
+    this.close();
+
+    // Build the warning's dyn value — L6 (DECISIONS.md 416a45a1): a REAL
+    // %Error instance, `instanceof Error` true, `constructor === Error`,
+    // through the tier's EXISTING dyn error encoding (dyn.ts's
+    // `fromError()`, the SAME "%error"-marked OBJ `caughtToDyn` mints for
+    // a caught exception — rev's pre-read location, scr_async_dyn.c:
+    // 430-440's C shape). An Error warning (isPos0Err) IS ALREADY that
+    // encoding (POS0 arrived boxed by `dcMessageArg`'s own error-rooted
+    // `dynFrom`) — reused AS-IS, keeping its own identity and name,
+    // TYPE ignored entirely (R-10). A string warning builds a FRESH
+    // %Error instance (name = TYPE, message = POS0's string) via
+    // `emitBuildPlainError` (this file's own "construct, don't cell-
+    // write" twin of `emitSetCellError`), then wraps it with
+    // `fromError()` the same way a real `new Error()` would cross into
+    // `unknown`. `code`/`detail`, when given, are ADDED onto whichever
+    // box results — `fromError()`'s own cache keeps a fresh instance's
+    // identity stable, so mutating its OBJ payload here is safe and
+    // matches `caughtToDyn`'s "one error, one box" invariant.
+    const WARNDYN = this.acquireScratch(dynRefT);
+    code.localGet(isPos0Err);
+    this.openIfResult(dynRefT);
+    code.localGet(POS0);
+    code.else_();
+    {
+      const errT = this.exc().errT;
+      const errRefT: ValType = { kind: "ref", nullable: true, typeIndex: errT };
+      const ERRVAL = this.acquireScratch(errRefT);
+      this.emitBuildPlainError(
+        code,
+        (c) => c.localGet(TYPE),
+        (c) => {
+          c.localGet(POS0);
+          c.structGet(dynT, DYN_REF);
+          c.refCast(this.strType);
+        },
+        (c) => c.refNull(this.strType),
+      );
+      code.localSet(ERRVAL);
+      code.localGet(ERRVAL);
+      code.call(this.dyn.fromError());
+      this.releaseScratch(errRefT, ERRVAL);
+    }
+    this.close();
+    code.localSet(WARNDYN);
+
+    code.localGet(CODE);
+    code.refIsNull();
+    code.i32Eqz();
+    this.openIf();
+    this.dyn.objPayload(code, (c) => c.localGet(WARNDYN));
+    this.pushStrLit("code");
+    code.localGet(CODE);
+    code.call(this.dyn.objPut());
+    this.close();
+
+    code.localGet(DETAIL);
+    code.refIsNull();
+    code.i32Eqz();
+    this.openIf();
+    this.dyn.objPayload(code, (c) => c.localGet(WARNDYN));
+    this.pushStrLit("detail");
+    code.localGet(DETAIL);
+    code.call(this.dyn.objPut());
+    this.close();
+
+    // DEFER via the tier's OWN nextTick queue (L5, DECISIONS.md
+    // 416a45a1): `enqueueWarning` appends to `%w.proc`'s own pending
+    // list and posts ONE raw marker (nexttick.ts's `enqueueRaw` seam,
+    // stream.ts's `scheduleTick`/`dispatchOne` precedent) — the marker
+    // drains FIFO, dispatching listeners THEN the default report for
+    // each. The eager `this.nextTick` touch (`emitWarningReachable`,
+    // this file's own prescan) already guarantees the queue exists by
+    // the time any checkpoint is emitted.
+    code.localGet(WARNDYN);
+    code.call(this.proc.enqueueWarning());
+
+    this.releaseScratch(dynRefT, WARNDYN);
+    this.releaseScratch(dynRefT, DETAIL);
+    this.releaseScratch(dynRefT, CODE);
+    this.releaseScratch(this.strRef, TYPE);
+    this.releaseScratch(I32, pos1IsFunc);
+    this.releaseScratch(I32, pos1IsStr);
+    this.releaseScratch(I32, pos1IsObj);
+    this.releaseScratch(I32, isPos0Err);
+    this.releaseScratch(I32, isPos0Str);
+    this.releaseScratch(dynRefT, POS2);
+    this.releaseScratch(dynRefT, POS1);
+    this.releaseScratch(dynRefT, POS0);
+    this.releaseScratch(I32, LEN);
+    this.releaseScratch(this.dyn.arrRef(), ARR);
+    this.releaseScratch(dynRefT, ARGSDYN);
+  }
+
+  /** INC-26 P3 (design §2.7's own "construct, don't cell-write" shape,
+   * L6): `emitSetCellError`'s FIRST HALF, verbatim, MINUS the pending-
+   * exception cell writes — builds a %Error-class instance VALUE and
+   * leaves it on the stack, for a caller that wants to PASS the error
+   * around (to `dyn.fromError()`, here) rather than throw it. */
+  private emitBuildPlainError(
+    code: Code,
+    pushName: (c: Code) => void,
+    pushMessage: (c: Code) => void,
+    pushCode: (c: Code) => void,
+  ): void {
+    const exc = this.exc();
+    code.globalGet(this.classes.vtGlobal("%Error"));
+    pushName(code);
+    pushMessage(code);
+    pushCode(code);
+    code.structNew(exc.errT);
+  }
+
+  private defaultWarningReportFunc: number | null = null;
+
+  /** `%w.proc.defaultWarningReport(warning: dyn) -> void` (L5: the SECOND
+   * half of what `process.emitWarning`'s deferred marker does, after
+   * dispatching to listeners) — reads name/message/code/detail off the
+   * warning value the SAME way a listener would (`objGet`, never
+   * assuming how the box was built) and prints Node's own default report
+   * shape (B-7, measured this session, warnreport.mjs sha256 ca67b280
+   * b0dfce6567a0ccf2a27b312622615cccff170786592120c6e86ffad6): brackets
+   * ONLY when a code was given, a string `detail` on its own line, and
+   * the trace-warnings hint exactly once per process. A STANDALONE
+   * function (own numbered locals, not `this.fn`/`acquireScratch`) since
+   * `process.ts`'s `dispatchWarnings` calls it by index from ITS OWN
+   * body, not inline at any one call site. */
+  private defaultWarningReportHelper(): number {
+    if (this.defaultWarningReportFunc !== null) return this.defaultWarningReportFunc;
+    const dynRefT = this.dyn.dynRef();
+    const dynT = this.dyn.dynT();
+    const objRefT = this.dyn.objRef();
+    const idx = this.mb.declareFunc(this.mb.funcType([dynRefT], []), "%w.proc.defaultWarningReport");
+    this.defaultWarningReportFunc = idx;
+    const c = new Code();
+    const W = 0;
+    const PAYLOAD = 1;
+    const NAMED = 2;
+    const MSGD = 3;
+    const CODED = 4;
+    const DETAILD = 5;
+    const REPORT = 6;
+    this.dyn.objPayload(c, (x) => x.localGet(W));
+    c.localSet(PAYLOAD);
+    c.localGet(PAYLOAD);
+    this.pushStrLitInto(c, "name");
+    c.call(this.dyn.objGet());
+    c.localSet(NAMED);
+    c.localGet(PAYLOAD);
+    this.pushStrLitInto(c, "message");
+    c.call(this.dyn.objGet());
+    c.localSet(MSGD);
+    c.localGet(PAYLOAD);
+    this.pushStrLitInto(c, "code");
+    c.call(this.dyn.objGet());
+    c.localSet(CODED);
+    c.localGet(PAYLOAD);
+    this.pushStrLitInto(c, "detail");
+    c.call(this.dyn.objGet());
+    c.localSet(DETAILD);
+
+    this.pushStrLitInto(c, "(node:");
+    c.i32Const(HOST_NUM_KIND_PID);
+    c.i32Const(0);
+    c.call(this.hostNumFuncOrThrow());
+    c.call(this.f64ToStrHelper());
+    c.call(this.concatHelper());
+    this.pushStrLitInto(c, ") ");
+    c.call(this.concatHelper());
+    c.localSet(REPORT);
+
+    c.localGet(CODED);
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    c.localGet(REPORT);
+    this.pushStrLitInto(c, "[");
+    c.call(this.concatHelper());
+    c.localGet(CODED);
+    c.structGet(dynT, DYN_REF);
+    c.refCast(this.strType);
+    c.call(this.concatHelper());
+    this.pushStrLitInto(c, "] ");
+    c.call(this.concatHelper());
+    c.localSet(REPORT);
+    c.end();
+
+    c.localGet(REPORT);
+    c.localGet(NAMED);
+    c.structGet(dynT, DYN_REF);
+    c.refCast(this.strType);
+    c.call(this.concatHelper());
+    this.pushStrLitInto(c, ": ");
+    c.call(this.concatHelper());
+    c.localGet(MSGD);
+    c.structGet(dynT, DYN_REF);
+    c.refCast(this.strType);
+    c.call(this.concatHelper());
+    this.pushStrLitInto(c, "\n");
+    c.call(this.concatHelper());
+    c.localSet(REPORT);
+
+    c.localGet(DETAILD);
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    c.localGet(DETAILD);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.STR);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(REPORT);
+    c.localGet(DETAILD);
+    c.structGet(dynT, DYN_REF);
+    c.refCast(this.strType);
+    c.call(this.concatHelper());
+    this.pushStrLitInto(c, "\n");
+    c.call(this.concatHelper());
+    c.localSet(REPORT);
+    c.end();
+    c.end();
+
+    c.globalGet(this.warnHintPrintedG());
+    c.i32Eqz();
+    c.ifVoid();
+    c.localGet(REPORT);
+    this.pushStrLitInto(c, "(Use `node --trace-warnings ...` to show where the warning was created)\n");
+    c.call(this.concatHelper());
+    c.localSet(REPORT);
+    c.i32Const(1);
+    c.globalSet(this.warnHintPrintedG());
+    c.end();
+
+    c.localGet(REPORT);
+    c.call(this.ensureHelpers().stage);
+    c.i32Const(FD_STDERR);
+    c.call(this.ensureHelpers().flush);
+
+    this.mb.setBody(idx, [objRefT, dynRefT, dynRefT, dynRefT, dynRefT, this.strRef], c.bytes());
+    return this.defaultWarningReportFunc;
+  }
+
+  /** INC-26 P3 (design §3.2, scr_cpu_prev_check_field ported verbatim,
+   * scr_lib.c:1184-1196): one RangeError check for `cpuPrevValidate`'s
+   * `user`/`system` field. Node's own two-comparison test — `v >= 0 && v
+   * <= Number.MAX_VALUE` — rejects negative values, NaN (fails both
+   * comparisons under IEEE754) and +Infinity (finite upper bound, not a
+   * separate isFinite check) in one shot; the caller checks `user` BEFORE
+   * `system`, matching the C's own call order exactly. */
+  private emitCpuPrevFieldCheck(code: Code, valLocal: number, propName: string): void {
+    code.localGet(valLocal);
+    code.f64Const(0);
+    code.f64Ge();
+    code.localGet(valLocal);
+    code.f64Const(1.7976931348623157e308); // Number.MAX_VALUE (DBL_MAX)
+    code.f64Le();
+    code.i32And();
+    code.i32Eqz();
+    this.openIf();
+    this.emitSetCellError(
+      code,
+      "%RangeError",
+      "RangeError",
+      (c) => {
+        this.pushStrLitInto(c, `The property 'prevValue.${propName}' is invalid. Received `);
+        c.localGet(valLocal);
+        c.call(this.f64ToStrHelper());
+        c.call(this.concatHelper());
+      },
+      "ERR_INVALID_ARG_VALUE",
+    );
+    this.emitUnwind();
+    this.close();
+  }
+
+  /** `process.chdir`'s OWN eight-code enumeration (design §0.5 W5,
+   * DECISIONS.md delta A-4): the host answers -1..-8 for these, in this
+   * order; the text is `util.getSystemErrorMessage`'s own NEGATIVE-errno
+   * text (measured, rev-chdir-eloop-p3.out 2351e4b6, carried verbatim
+   * from the sealed brief rather than re-measured this session). A
+   * SEPARATE namespace from kill's -1/-2/-3 — never merged. */
+  private static readonly CHDIR_CODES: readonly (readonly [number, string, string])[] = [
+    [-1, "ENOENT", "no such file or directory"],
+    [-2, "ENOTDIR", "not a directory"],
+    [-3, "EACCES", "permission denied"],
+    [-4, "ENAMETOOLONG", "name too long"],
+    [-5, "ELOOP", "too many symbolic links encountered"],
+    [-6, "EIO", "i/o error"],
+    [-7, "ENOMEM", "not enough memory"],
+    [-8, "EPERM", "operation not permitted"],
+  ];
+
+  /** Renders `tsinter.chdir`'s i32 STATUS (already in `statusLocal`) as
+   * Node's own two-path fs-shaped message: `"<CODE>: <text>, chdir
+   * '<before>' -> '<dir>'"`, `.code` = the bare name. The UNKNOWN arm
+   * (anything past -8) renders `E<n>` (n = -status-256) with a
+   * non-Node-spelled text and, like `kill`'s own UNKNOWN arm, NO `.code`
+   * — `emitSetCellError`'s `codeLit` parameter is compile-time-literal
+   * only, and a RUNTIME-rendered code would need a new construction path
+   * for one arm this pass measures as unreachable on Linux by
+   * construction; the conservative choice is no `.code`, matching kill's
+   * own precedent for its structurally identical fallback arm. */
+  private emitChdirErrorRender(code: Code, statusLocal: number, beforeLocal: number, dirLocal: number): void {
+    for (const [value, name, text] of Assembler.CHDIR_CODES) {
+      code.localGet(statusLocal);
+      code.i32Const(value);
+      code.i32Eq();
+      this.openIf();
+      this.emitSetCellError(
+        code,
+        "%Error",
+        "Error",
+        (c) => {
+          this.pushStrLitInto(c, `${name}: ${text}, chdir '`);
+          c.localGet(beforeLocal);
+          c.call(this.concatHelper());
+          this.pushStrLitInto(c, "' -> '");
+          c.call(this.concatHelper());
+          c.localGet(dirLocal);
+          c.call(this.concatHelper());
+          this.pushStrLitInto(c, "'");
+          c.call(this.concatHelper());
+        },
+        name,
+      );
+      this.emitUnwind();
+      this.close();
+    }
+    // UNKNOWN arm: n = -status - 256, code `E<n>`, text NOT a Node
+    // spelling (S077's own limitation), no `.code`.
+    const n = this.acquireScratch(I32);
+    code.localGet(statusLocal);
+    code.i32Const(-1);
+    code.i32Mul();
+    code.i32Const(256);
+    code.i32Sub();
+    code.localSet(n);
+    this.emitSetCellError(
+      code,
+      "%Error",
+      "Error",
+      (c) => {
+        this.pushStrLitInto(c, "E");
+        c.localGet(n);
+        c.f64ConvertI32S();
+        c.call(this.f64ToStrHelper());
+        c.call(this.concatHelper());
+        this.pushStrLitInto(c, ": Unknown system error -");
+        c.call(this.concatHelper());
+        c.localGet(n);
+        c.f64ConvertI32S();
+        c.call(this.f64ToStrHelper());
+        c.call(this.concatHelper());
+        this.pushStrLitInto(c, ", chdir '");
+        c.call(this.concatHelper());
+        c.localGet(beforeLocal);
+        c.call(this.concatHelper());
+        this.pushStrLitInto(c, "' -> '");
+        c.call(this.concatHelper());
+        c.localGet(dirLocal);
+        c.call(this.concatHelper());
+        this.pushStrLitInto(c, "'");
+        c.call(this.concatHelper());
+      },
+      null,
+    );
+    this.emitUnwind();
+    this.releaseScratch(I32, n);
+  }
+
+  /** One named ESRCH/EPERM/EINVAL check for `emitKillResultRender` — a
+   * void-if that either throws (unreachable after) or falls through to
+   * the NEXT sequential check, never an else-chain (matching the
+   * date.toISO-style "throw then continue" idiom already in this file). */
+  private emitKillNamedErrorCheck(code: Code, statusLocal: number, value: number, name: string): void {
+    code.localGet(statusLocal);
+    code.i32Const(value);
+    code.i32Eq();
+    this.openIf();
+    this.emitSetCellError(code, "%Error", "Error", (c) => this.pushStrLitInto(c, `kill ${name}`), name);
+    this.emitUnwind();
+    this.close();
   }
 
   private pushStrLit(value: string): void {
@@ -30077,6 +31661,86 @@ class Assembler {
     c.i32Add();
     c.globalSet(this.cursorGlobal);
     this.mb.setBody(idx, [I32, I32, I32, I32], c.bytes());
+    return idx;
+  }
+
+  private stageStrUtf16Func: number | null = null;
+
+  /** %w.stageStrUtf16(str) → len (i32) — INC-26 P3 (`process.chdir`'s ONLY
+   * OUTBOUND-string import, design §2.2's own retry-region reused in
+   * reverse): writes `str`'s UTF-16 code units, little-endian, 2 bytes
+   * each, AT THE CURSOR — like `%w.proc.readHostStr`'s INBOUND read and
+   * UNLIKE `stageBytesHelper`'s OUTPUT stage, this does NOT advance the
+   * cursor (a single, one-shot write, never accumulated with anything
+   * else before the caller reads it back out). Relies on the SAME
+   * measured invariant M-17 proved for every dynamic libCall site (the
+   * cursor is 0 whenever a libCall dispatches): the caller passes
+   * `this.cursorGlobal`'s current value as `ptr` directly, never a value
+   * this function returns. No `i32Store16` exists in this file's opcode
+   * set (only `i32Store8`/`i32Load16U`, INC-26 P1's own inbound read) —
+   * two `i32Store8`s per code unit, `stageBytesHelper`'s own per-element
+   * loop shape, is the conservative choice over widening `Code`'s own
+   * opcode surface for a single caller. */
+  private stageStrUtf16Helper(): number {
+    if (this.stageStrUtf16Func !== null) return this.stageStrUtf16Func;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.strRef], [I32]), "%w.stageStrUtf16");
+    this.stageStrUtf16Func = idx;
+    const c = new Code();
+    const S = 0;
+    const LEN = 1;
+    const CUR = 2;
+    const I = 3;
+    c.localGet(S);
+    c.arrayLen();
+    c.localSet(LEN);
+    this.emitEnsureCapacity(c, () => {
+      c.localGet(LEN);
+      c.i32Const(2);
+      c.i32Mul();
+    });
+    c.globalGet(this.cursorGlobal);
+    c.localSet(CUR);
+    c.i32Const(0);
+    c.localSet(I);
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.localGet(LEN);
+    c.i32GeU();
+    c.brIf(1);
+    // low byte at CUR + I*2
+    c.localGet(CUR);
+    c.localGet(I);
+    c.i32Const(2);
+    c.i32Mul();
+    c.i32Add();
+    c.localGet(S);
+    c.localGet(I);
+    c.arrayGetU(this.strType);
+    c.i32Store8();
+    // high byte at CUR + I*2 + 1
+    c.localGet(CUR);
+    c.localGet(I);
+    c.i32Const(2);
+    c.i32Mul();
+    c.i32Add();
+    c.i32Const(1);
+    c.i32Add();
+    c.localGet(S);
+    c.localGet(I);
+    c.arrayGetU(this.strType);
+    c.i32Const(8);
+    c.i32ShrU();
+    c.i32Store8();
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+    c.localGet(LEN);
+    this.mb.setBody(idx, [I32, I32, I32], c.bytes());
     return idx;
   }
 

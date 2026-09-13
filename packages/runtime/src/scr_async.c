@@ -608,7 +608,7 @@ bool scr_timer_has_ref(double handle) {
  * drops it) — and 'Immediate' per queued, unfired immediate (a FIRED
  * immediate no longer counts, Node's current answer inside the
  * callback). Resource kinds this runtime does not model as loop handles
- * (TCP wraps, FS requests, ...) are absent — SEMANTICS.md names the
+ * (TCP wraps, FS requests, ...) are absent — SEMANTICS.md S075 names the
  * divergence. Result +1. */
 static size_t scr_pending_immediates; /* defined below with the queue */
 ScrArr *scr_active_resources(void) {
