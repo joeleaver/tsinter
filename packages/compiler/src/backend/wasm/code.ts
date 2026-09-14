@@ -144,6 +144,39 @@ export class Code {
     this.w.uleb(0); // alignment (none claimed)
     this.w.uleb(0); // offset
   }
+  /** i32.load8_u — zero-extends an 8-bit read from linear memory to i32.
+   * INC-26 P5 3C-1 (brief-p5-delta-3c.txt 0c29d591, PERMIT-HUNK): the
+   * stats record's three boolean fields (fs.ts) read a single raw byte
+   * each. Same conservative alignment stance as i32Load16U/i32Store8
+   * above — no claim, the dynamic address is not guaranteed aligned by
+   * construction. */
+  i32Load8U(): void {
+    this.w.u8(0x2d);
+    this.w.uleb(0); // alignment (none claimed)
+    this.w.uleb(0); // offset
+  }
+  /** f64.load — an 8-byte little-endian read from linear memory. INC-26
+   * P5 3C-1: the stats record's size/mtimeMs fields, written by the HOST
+   * through a DataView (N-1 — slot B is only 2-byte aligned, so a
+   * Float64Array throws on 5 of 6 bases); the MODULE's own read side is
+   * unconstrained (an alignment HINT, never a requirement), so 0 here is
+   * correct regardless of the field's true byte offset. */
+  f64Load(): void {
+    this.w.u8(0x2b);
+    this.w.uleb(0);
+    this.w.uleb(0);
+  }
+  /** i32.store — a 4-byte little-endian write to linear memory. INC-26
+   * P5 3C-1: op 14's retry record (maxRetries, retryDelay), written by
+   * the MODULE for the HOST to read back through a DataView (cp1b, M-24
+   * — slot B sits at 2 mod 4 on every odd-code-unit path, so an
+   * Int32Array on the HOST side would throw; the module's own write side
+   * is unconstrained the same way f64Load's read side is). */
+  i32Store(): void {
+    this.w.u8(0x36);
+    this.w.uleb(0);
+    this.w.uleb(0);
+  }
   memorySize(): void {
     this.w.u8(0x3f);
     this.w.uleb(0);

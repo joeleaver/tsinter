@@ -2003,7 +2003,10 @@ ScrStr *scr_process_versions_openssl(void);
  * named form (unknown names throw the ERR_UNKNOWN_SIGNAL TypeError),
  * signal 0 probes, kill(2) failure throws Node's `kill ESRCH`/`kill
  * EPERM` Error. Both return Node's constant true; the signal string is
- * borrowed. */
+ * borrowed. The numeric form's OWN gate (P5 R-B, board #143, measured
+ * against a live child): 0 (and -0) probes; an integral value inside
+ * int32 range passes raw; NaN defaults to SIGTERM; anything else throws
+ * Node's ERR_UNKNOWN_SIGNAL TypeError. */
 bool scr_process_kill(double pid, double signum);
 bool scr_process_kill_named(double pid, const ScrStr *signal);
 /* fflush stdout, then _Exit((int)code): no atexit handlers run — the RC
@@ -2013,9 +2016,21 @@ void scr_process_exit(double code);
  * the exit-listener runner set the flag). Never throws. */
 extern bool scr_process_in_exit;
 bool scr_process_exiting(void);
-/* umask(2): mask < 0 reads without setting; otherwise sets and answers
- * the previous mask. Never throws. */
+/* umask(2), SET form (P5 R-C, board #143): sets and answers the previous
+ * mask; throws Node's own INTEGER-FIRST then RANGE-SECOND RangeError
+ * (ERR_OUT_OF_RANGE) for a non-integer or out-of-[0,4294967295] mask. The
+ * READ form is scr_process_umask_read below — its OWN C symbol, not a
+ * sentinel value here (P4's `mask < 0` read sentinel could not coexist
+ * with this validation: -1 is itself a representable, INVALID mask that
+ * must now throw, not silently read). */
 double scr_process_umask(double mask);
+/* umask(2), READ form (P5 R-C): Node's own no-arg umask() — never
+ * throws. Takes one UNUSED double parameter (ignored) so the existing
+ * `process.umaskRead` call sites on THIS (C-emitting/LLVM) lane (board
+ * #142's own 0-ary-IR/1-ary-symbol special case) need no shape change,
+ * only a symbol-name repoint — the wasm lane's own umaskRead handling is
+ * a separate, wasm-native implementation untouched by this rider. */
+double scr_process_umask_read(double unused);
 /* The process introspection statics (scr_lib.c; Node's units). uptime:
  * fractional seconds since the binary's load-time anchor. The CPU clocks
  * answer microseconds; the *_diff forms subtract a prior sample, and
@@ -2042,7 +2057,10 @@ double scr_process_rusage(double idx);
 double scr_available_memory(void);
 double scr_constrained_memory(void);
 ScrArr *scr_active_resources(void);
-/* chdir(2) — throws Node's fs-shaped error on failure (syscall "chdir"). */
+/* chdir(2) — throws Node's fs-shaped error on failure (syscall "chdir"),
+ * the TWO-PATH form (P5 R-A, board #143): "<CODE>: <text>, chdir
+ * '<cwd-before>' -> '<dir>'", the "before" path taken via getcwd()
+ * immediately ahead of the chdir(2) call itself. */
 void scr_process_chdir(ScrStr *dir);
 /* net's process-wide happy-eyeballs attempt budget (default 250ms) — in
  * the core unit so the knob never links scr_net.c. Never throw. */

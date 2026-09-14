@@ -275,6 +275,428 @@
       "shape": "one-path",
       "message": "EACCES: permission denied, access '<PATH>'",
       "className": "Error"
+    },
+    {
+      "op": 4,
+      "key": "realpathSync",
+      "code": "ENOENT",
+      "errnoLinux": -2,
+      "syscall": "lstat",
+      "shape": "one-path",
+      "message": "ENOENT: no such file or directory, lstat '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 4,
+      "key": "realpathSync",
+      "code": "ENOTDIR",
+      "errnoLinux": -20,
+      "syscall": "lstat",
+      "shape": "one-path",
+      "message": "ENOTDIR: not a directory, lstat '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 4,
+      "key": "realpathSync",
+      "code": "ELOOP",
+      "errnoLinux": -40,
+      "syscall": "stat",
+      "shape": "one-path",
+      "message": "ELOOP: too many symbolic links encountered, stat '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 5,
+      "key": "readFdSync",
+      "code": "EBADF",
+      "errnoLinux": -9,
+      "syscall": "read",
+      "shape": "no-path",
+      "message": "EBADF: bad file descriptor, read",
+      "className": "Error"
+    },
+    {
+      "op": 6,
+      "key": "readSync",
+      "code": "EBADF",
+      "errnoLinux": -9,
+      "syscall": "read",
+      "shape": "no-path",
+      "message": "EBADF: bad file descriptor, read",
+      "className": "Error"
+    },
+    {
+      "op": 7,
+      "key": "statSync",
+      "code": "ENOENT",
+      "errnoLinux": -2,
+      "syscall": "stat",
+      "shape": "one-path",
+      "message": "ENOENT: no such file or directory, stat '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 8,
+      "key": "lstatSync",
+      "code": "ENOENT",
+      "errnoLinux": -2,
+      "syscall": "lstat",
+      "shape": "one-path",
+      "message": "ENOENT: no such file or directory, lstat '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 15,
+      "key": "copyFileSync",
+      "code": "ENOENT",
+      "errnoLinux": -2,
+      "syscall": "copyfile",
+      "shape": "two-path",
+      "message": "ENOENT: no such file or directory, copyfile '<PATH>' -> '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 15,
+      "key": "copyFileSync",
+      "code": "EISDIR",
+      "errnoLinux": -21,
+      "syscall": "copyfile",
+      "shape": "two-path",
+      "message": "EISDIR: illegal operation on a directory, copyfile '<PATH>' -> '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 16,
+      "key": "chmodSync",
+      "code": "ENOENT",
+      "errnoLinux": -2,
+      "syscall": "chmod",
+      "shape": "one-path",
+      "message": "ENOENT: no such file or directory, chmod '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 17,
+      "key": "chownSync",
+      "code": "ENOENT",
+      "errnoLinux": -2,
+      "syscall": "chown",
+      "shape": "one-path",
+      "message": "ENOENT: no such file or directory, chown '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 18,
+      "key": "closeSync",
+      "code": "EBADF",
+      "errnoLinux": -9,
+      "syscall": "close",
+      "shape": "no-path",
+      "message": "EBADF: bad file descriptor, close",
+      "className": "Error"
+    },
+    {
+      "op": 21,
+      "key": "openSync",
+      "code": "ENOENT",
+      "errnoLinux": -2,
+      "syscall": "open",
+      "shape": "one-path",
+      "message": "ENOENT: no such file or directory, open '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 21,
+      "key": "openSync",
+      "code": "EISDIR",
+      "errnoLinux": -21,
+      "syscall": "open",
+      "shape": "one-path",
+      "message": "EISDIR: illegal operation on a directory, open '<PATH>'",
+      "className": "Error"
+    },
+    {
+      "op": 22,
+      "key": "readFdSyncBytes",
+      "code": "EBADF",
+      "errnoLinux": -9,
+      "syscall": "fstat",
+      "shape": "no-path",
+      "message": "EBADF: bad file descriptor, fstat",
+      "className": "Error"
+    },
+    {
+      "op": 23,
+      "key": "readFdSyncBytes",
+      "code": "EBADF",
+      "errnoLinux": -9,
+      "syscall": "read",
+      "shape": "no-path",
+      "message": "EBADF: bad file descriptor, read",
+      "className": "Error"
+    }
+  ],
+  "rejectionRows": [
+    {
+      "op": 1,
+      "syncKey": "readFileSync",
+      "fspKey": "fsp.readFile",
+      "code": "ENOENT",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "ENOENT: no such file or directory, open '<PATH>'",
+      "syncMessage": "ENOENT: no such file or directory, open '<PATH>'"
+    },
+    {
+      "op": 1,
+      "syncKey": "readFileSync",
+      "fspKey": "fsp.readFile",
+      "code": "EISDIR",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "EISDIR: illegal operation on a directory, read",
+      "syncMessage": "EISDIR: illegal operation on a directory, read"
+    },
+    {
+      "op": 1,
+      "syncKey": "readFileSync",
+      "fspKey": "fsp.readFile",
+      "code": "ENOTDIR",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "ENOTDIR: not a directory, open '<PATH>'",
+      "syncMessage": "ENOTDIR: not a directory, open '<PATH>'"
+    },
+    {
+      "op": 1,
+      "syncKey": "readFileSync",
+      "fspKey": "fsp.readFile",
+      "code": "EACCES",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "EACCES: permission denied, open '<PATH>'",
+      "syncMessage": "EACCES: permission denied, open '<PATH>'"
+    },
+    {
+      "op": 1,
+      "syncKey": "readFileSync",
+      "fspKey": "fsp.readFile",
+      "code": "ELOOP",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "ELOOP: too many symbolic links encountered, open '<PATH>'",
+      "syncMessage": "ELOOP: too many symbolic links encountered, open '<PATH>'"
+    },
+    {
+      "op": 1,
+      "syncKey": "readFileSync",
+      "fspKey": "fsp.readFile",
+      "code": "ENAMETOOLONG",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "ENAMETOOLONG: name too long, open '<PATH>'",
+      "syncMessage": "ENAMETOOLONG: name too long, open '<PATH>'"
+    },
+    {
+      "op": 1,
+      "syncKey": "readFileSync",
+      "fspKey": "fsp.readFileBytes",
+      "code": "ENOENT",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "ENOENT: no such file or directory, open '<PATH>'",
+      "syncMessage": "ENOENT: no such file or directory, open '<PATH>'"
+    },
+    {
+      "op": 1,
+      "syncKey": "readFileSync",
+      "fspKey": "fsp.readFileBytes",
+      "code": "EISDIR",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "EISDIR: illegal operation on a directory, read",
+      "syncMessage": "EISDIR: illegal operation on a directory, read"
+    },
+    {
+      "op": 1,
+      "syncKey": "readFileSync",
+      "fspKey": "fsp.readFileBytes",
+      "code": "ENOTDIR",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "ENOTDIR: not a directory, open '<PATH>'",
+      "syncMessage": "ENOTDIR: not a directory, open '<PATH>'"
+    },
+    {
+      "op": 1,
+      "syncKey": "readFileSync",
+      "fspKey": "fsp.readFileBytes",
+      "code": "EACCES",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "EACCES: permission denied, open '<PATH>'",
+      "syncMessage": "EACCES: permission denied, open '<PATH>'"
+    },
+    {
+      "op": 1,
+      "syncKey": "readFileSync",
+      "fspKey": "fsp.readFileBytes",
+      "code": "ELOOP",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "ELOOP: too many symbolic links encountered, open '<PATH>'",
+      "syncMessage": "ELOOP: too many symbolic links encountered, open '<PATH>'"
+    },
+    {
+      "op": 1,
+      "syncKey": "readFileSync",
+      "fspKey": "fsp.readFileBytes",
+      "code": "ENAMETOOLONG",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "ENAMETOOLONG: name too long, open '<PATH>'",
+      "syncMessage": "ENAMETOOLONG: name too long, open '<PATH>'"
+    },
+    {
+      "op": 9,
+      "syncKey": "writeFileSync",
+      "fspKey": "fsp.writeFile",
+      "code": "ENOENT",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "ENOENT: no such file or directory, open '<PATH>'",
+      "syncMessage": "ENOENT: no such file or directory, open '<PATH>'"
+    },
+    {
+      "op": 9,
+      "syncKey": "writeFileSync",
+      "fspKey": "fsp.writeFile",
+      "code": "EISDIR",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "EISDIR: illegal operation on a directory, open '<PATH>'",
+      "syncMessage": "EISDIR: illegal operation on a directory, open '<PATH>'"
+    },
+    {
+      "op": 14,
+      "syncKey": "rmSync",
+      "fspKey": "fsp.rm",
+      "code": "ENOENT",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "ENOENT: no such file or directory, lstat '<PATH>'",
+      "syncMessage": "ENOENT: no such file or directory, lstat '<PATH>'"
+    },
+    {
+      "op": 14,
+      "syncKey": "rmSync",
+      "fspKey": "fsp.rm",
+      "code": "ERR_FS_EISDIR",
+      "className": "SystemError",
+      "matchesSync": true,
+      "rejectionMessage": "Path is a directory: rm returned EISDIR (is a directory) <PATH>",
+      "syncMessage": "Path is a directory: rm returned EISDIR (is a directory) <PATH>"
+    },
+    {
+      "op": 7,
+      "syncKey": "statSync",
+      "fspKey": "fsp.stat",
+      "code": "ENOENT",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "ENOENT: no such file or directory, stat '<PATH>'",
+      "syncMessage": "ENOENT: no such file or directory, stat '<PATH>'"
+    },
+    {
+      "op": 11,
+      "syncKey": "mkdirSync",
+      "fspKey": "fsp.mkdir",
+      "code": "EEXIST",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "EEXIST: file already exists, mkdir '<PATH>'",
+      "syncMessage": "EEXIST: file already exists, mkdir '<PATH>'"
+    },
+    {
+      "op": 11,
+      "syncKey": "mkdirSync",
+      "fspKey": "fsp.mkdir",
+      "code": "ENOENT",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "ENOENT: no such file or directory, mkdir '<PATH>'",
+      "syncMessage": "ENOENT: no such file or directory, mkdir '<PATH>'"
+    },
+    {
+      "op": 11,
+      "syncKey": "mkdirSync",
+      "fspKey": "fsp.mkdir",
+      "code": "ENOTDIR",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "ENOTDIR: not a directory, mkdir '<PATH>'",
+      "syncMessage": "ENOTDIR: not a directory, mkdir '<PATH>'"
+    },
+    {
+      "op": 11,
+      "syncKey": "mkdirRecursiveSync",
+      "fspKey": "fsp.mkdirRecursiveMode",
+      "code": "ENOTDIR",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "ENOTDIR: not a directory, mkdir '<PATH>'",
+      "syncMessage": "ENOTDIR: not a directory, mkdir '<PATH>'"
+    },
+    {
+      "op": 2,
+      "syncKey": "readdirSync",
+      "fspKey": "fsp.readdir",
+      "code": "ENOENT",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "ENOENT: no such file or directory, scandir '<PATH>'",
+      "syncMessage": "ENOENT: no such file or directory, scandir '<PATH>'"
+    },
+    {
+      "op": 2,
+      "syncKey": "readdirSync",
+      "fspKey": "fsp.readdir",
+      "code": "ENOTDIR",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "ENOTDIR: not a directory, scandir '<PATH>'",
+      "syncMessage": "ENOTDIR: not a directory, scandir '<PATH>'"
+    },
+    {
+      "op": 13,
+      "syncKey": "unlinkSync",
+      "fspKey": "fsp.unlink",
+      "code": "ENOENT",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "ENOENT: no such file or directory, unlink '<PATH>'",
+      "syncMessage": "ENOENT: no such file or directory, unlink '<PATH>'"
+    },
+    {
+      "op": 13,
+      "syncKey": "unlinkSync",
+      "fspKey": "fsp.unlink",
+      "code": "EISDIR",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "EISDIR: illegal operation on a directory, unlink '<PATH>'",
+      "syncMessage": "EISDIR: illegal operation on a directory, unlink '<PATH>'"
+    },
+    {
+      "op": 16,
+      "syncKey": "chmodSync",
+      "fspKey": "fsp.chmod",
+      "code": "ENOENT",
+      "className": "Error",
+      "matchesSync": true,
+      "rejectionMessage": "ENOENT: no such file or directory, chmod '<PATH>'",
+      "syncMessage": "ENOENT: no such file or directory, chmod '<PATH>'"
     }
   ],
   "mkdirRecursiveReturn": {

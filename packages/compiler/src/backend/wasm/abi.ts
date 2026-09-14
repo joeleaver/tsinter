@@ -265,18 +265,85 @@
  *     kind tables already take):
  *       READ-SHAPED (answer a length; content lands in the region the
  *       caller gave):
- *         1 readFile(pathA)->byte length      2 readdir(pathA)->JSON length
+ *         1 readFile(pathA,bytes=x)->length   2 readdir(pathA)->JSON length
+ *           (delta-3d a3c02af9, append-only: op 1's `x` was UNSPENT
+ *           before P5 — readFileSync and readFileSyncBytes/
+ *           fsp.readFileBytes share this ONE row, and the two keys need
+ *           INCOMPATIBLE slot-B encodings [UTF-16 CODE UNITS vs RAW
+ *           BYTES] from a wire call that was otherwise byte-for-byte
+ *           identical — measured LIVE, not hypothetical: this pass's own
+ *           STOP-AND-REPORT traced 1403/1574's actual bytes through the
+ *           OLD ambiguous host and found a fragile round-trip coincidence
+ *           masking the bug. x=1: the slot-B payload is RAW BYTES, bLen
+ *           in BYTES, no ×2 [readFileSyncBytes, fsp.readFileBytes]; x=0
+ *           (still the default, a DELIBERATE literal, never
+ *           uninitialized — the text key's own row asserts it): UTF-16
+ *           CODE UNITS, bLen in code units, exactly P4's own contract,
+ *           unchanged.)
  *         3 mkdtemp(prefixA)->path length     4 realpath(pathA)->path length
+ *                                              (on success; on failure, see
+ *                                              OP 4's own paragraph below)
  *                                                                   [P5]
  *         5 readFd(fd=x)->byte length (ENCODED form only)          [P5]
  *         6 read(fd,off,len)->byte count                           [P5]
- *         7 stat(pathA)->JSON length           8 lstat(pathA)->JSON length
- *                                                                   [P5]
+ *         7 stat(pathA)->0 or -errno, the FIXED 5-FIELD RECORD in slot B
+ *           8 lstat(pathA)->0 or -errno, SAME record shape          [P5]
+ *           (E-P5-1, CP1 delta 29286fa4 A-2/N-1 — REWRITES this line's
+ *           ORIGINAL "->JSON length" text; append-only, no renumber: ops
+ *           7/8 were UNBUILT before P5, so nothing else ever read the old
+ *           text. NOT read-shaped's length-retry contract — the record is
+ *           FIXED SIZE (20 bytes: 4 [isFile/isDirectory/isSymbolicLink/pad,
+ *           four u8 at offsets 0-3] + 8 [size f64 at offset 4] + 8 [mtimeMs
+ *           f64 at offset 12] = 20 — rev-26 B-1, findings-rev26-3c-p5.txt
+ *           a1b0b98f: this line previously said 24, disagreeing with its
+ *           own offset breakdown and with fs.ts's own "20-byte slot-B
+ *           record" header and its i32Const(20) width/bLen; a host author
+ *           taking 24 from here writes 4 bytes past what the module sizes
+ *           and ensureCapacity's — silent corruption, the Float64Array/
+ *           Int32Array class again), so status is 0 on success like a write-shaped op,
+ *           never a length. THE HOST WRITES THE THREE BOOLEANS (computed
+ *           host-side, A-1) and THE TWO f64 FIELDS THROUGH A DataView
+ *           setFloat64(off, v, true) — NEVER a Float64Array (N-1, measured
+ *           p5-f64-align.out b703a6c0: slot B is only 2-byte aligned,
+ *           RangeError on 5 of 6 sampled bases). The MODULE reads the
+ *           booleans with i32.load8_u and the f64s with a byte-aligned
+ *           f64.load (align=0 hint) — unconstrained, per the general slot-B
+ *           alignment note below.)
  *       WRITE-SHAPED (answer 0 or -errno):
- *         9 writeFile(pathA,bytesB,mode=x)    10 appendFile(pathA,bytesB)
- *        11 mkdir(pathA,mode=x,recursive=y)   12 rmdir(pathA)
+ *         9 writeFile(pathA,bytesB,mode=x-1,bytes=y) 10 appendFile(pathA,bytesB)
+ *           (delta-3d a3c02af9, append-only: the SAME shared-row hazard
+ *           as op 1's own paragraph above, but op 9's `x` is ALREADY
+ *           SPENT — writeFileModeSync forwards a REAL mode through it —
+ *           so the bytes flag rides `y` instead [op 9's own `y` is the
+ *           inert 0 everywhere else]. y=1: slot B is RAW BYTES, bLen in
+ *           BYTES, no ×2 [writeFileSyncBytes]; y=0 (the text key's own
+ *           row asserts it): UTF-16 CODE UNITS, bLen in code units,
+ *           exactly P4's own contract, unchanged — writeFileSync,
+ *           writeFileModeSync, and fsp.writeFile all keep y=0. delta-3db
+ *           d7e1c3db, B-1, append-only: `x` is `mode + 1`, NEVER the raw
+ *           mode — x=0 already means "absent" for writeFileSync/
+ *           fsp.writeFile [the SAME row's mode-less keys], so an unbiased
+ *           x would make an EXPLICIT, representable mode 0 indistinguish-
+ *           able from "no mode" [measured: Node's own {mode:0} is a real,
+ *           different mode — EACCES on the same process's own immediate
+ *           re-read — board #142's collision rebuilt on x]. x=1 is mode
+ *           0; x=N+1 is mode N; x=0 stays "omit mode, Node's own default"
+ *           for writeFileSync/fsp.writeFile, unchanged.)
+ *        11 mkdir(pathA,mode=x-1,recursive=y)  12 rmdir(pathA)
+ *           (delta-3db d7e1c3db, B-1, append-only: the SAME mode+1 bias
+ *           as op 9's own paragraph above — mkdirModeSync/
+ *           mkdirRecursiveModeSync send x=mode+1; mkdirSync/
+ *           mkdirRecursiveSync keep the unchanged literal x=0.)
  *        13 unlink(pathA)                     14 rm(pathA,recursive,force,
  *                                                    maxRetries,retryDelay)
+ *           [P5, CP1 delta cp1b] maxRetries/retryDelay do NOT ride x/y —
+ *           P4's rmOptsSync already spends both (x=recursive,y=force) —
+ *           they ride SLOT B as a two-i32 LE record (bLen=8) when present,
+ *           bLen=0 when absent (rmSync/rmOptsSync never send it). THE HOST
+ *           READS AND WRITES THIS RECORD THROUGH A DataView getInt32/
+ *           setInt32(off, v, true) — NEVER an Int32Array (N-1's rule at
+ *           4-byte granularity: slot B sits at 2 mod 4 on every odd-code-
+ *           unit path length, measured p5-i32-align.out 8e7aa7f6).
  *        15 copyFile(pathA,pathB)             16 chmod(pathA,mode)   [P5]
  *        17 chown(pathA,uid,gid)              18 close(fd)           [P5]
  *       PROBE-SHAPED (answer 0, or -errno, and NEVER build an error):
@@ -325,9 +392,44 @@
  *     asked for, on the path it was given, is enforced by NOTHING — the
  *     harness's own rows are the check (§2.1's "fourth tier", restated).
  *
- *     STRUCTURED RESULTS (stat/lstat/readdir's JSON form, P5's stat/lstat;
- *     P4's readdir) cross as a JSON DOCUMENT, parsed by the tier's own
- *     parser — no new marshalling for a nested shape.
+ *     STRUCTURED RESULTS: readdir's own JSON form (P4; readdirTypesSync
+ *     shares its op 2 row, P5, via an `x` flag — see op 2 above) crosses as
+ *     a JSON DOCUMENT, parsed by the tier's own parser. stat/lstat (P5)
+ *     do NOT — E-P5-1 above moved them to the fixed slot-B record instead,
+ *     once A-2's own measurement showed JSON.stringify(fs.Stats) silently
+ *     omits the three boolean accessors (they are prototype methods, never
+ *     own-enumerable properties) — the host would have had to hand-build
+ *     the JSON payload anyway, so the fixed record costs nothing extra and
+ *     avoids a parse this pass does not need.
+ *
+ *     OP 4 (realpathSync, P5) IS THE ONE OP WHOSE ERROR PATH IS A HOST
+ *     FACT, NOT A FUNCTION OF THE INPUT (E-P5-2, B-3, measured
+ *     p5-realpath-rule.out d26e5207): the failing PATH in Node's own
+ *     message is the ARGUMENT RESOLVED (symlinks replaced by their
+ *     targets, `.` dropped, `..` applied, relative made absolute against
+ *     cwd) then TRUNCATED at the first failing component under ENOENT, or
+ *     reported WHOLE under ENOTDIR — never simply the compile-time-known
+ *     input string every other op's error message uses. ON FAILURE, op 4
+ *     WRITES THE ERROR PATH INTO SLOT B (u16 code-unit count at slot B,
+ *     payload at +2) instead of the usual "answer a length" read-shaped
+ *     contract (INC-26 P5 3C-2, brief-p5-delta-3c.txt 0c29d591 — RULED
+ *     over a NUL-terminated alternative: a fixed-width length prefix
+ *     needs no scan loop and assumes nothing about content; slot B's
+ *     2-byte alignment already makes `i32.load16_u` safe for the count,
+ *     no DataView needed since there is no 4- or 8-byte field here); the
+ *     module's op-4 failure arm reads the count then the payload from
+ *     slot B instead of its own `pathALocal`, the ONE op built this way.
+ *     Its syscall is ALSO
+ *     PER-CODE (B-4, M-21, p5-eloop-netif.out 2ebde125): `lstat` under
+ *     ENOENT/ENOTDIR, `stat` under ELOOP — realpath's own OP_TABLE
+ *     `codeOverrides` entry, `{ELOOP:{syscall:"stat"}}`; every OTHER op
+ *     keeps its own literal under ELOOP. A failing realpath that
+ *     OVERSHOOTS slot B (the u16-prefixed error record does not fit the
+ *     capacity offered) runs the underlying syscall TWICE — once to
+ *     discover the overshoot, once more on the module's own retry with a
+ *     bigger region (rev-26 3D read, findings-rev26-3d-p5.txt 04dca2b6)
+ *     — the adapter recomputes rather than caching, exactly like every
+ *     other read-shaped op's own retry loop.
  *
  * THE ARGV/ENV SNAPSHOT (D2). `process.argv` and the whole of `process.env`
  * are read ONCE, at first touch, into module-owned storage — never a live

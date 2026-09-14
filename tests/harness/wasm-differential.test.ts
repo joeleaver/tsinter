@@ -36,20 +36,29 @@ import { createHash, randomBytes } from "node:crypto";
 import {
   accessSync,
   appendFileSync,
+  chmodSync,
+  chownSync,
+  closeSync,
+  copyFileSync,
   existsSync,
+  fstatSync,
   globSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
+  readSync,
   realpathSync,
   renameSync,
   rmdirSync,
   rmSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { homedir, networkInterfaces, release, tmpdir, totalmem, type as osType, userInfo } from "node:os";
 import { basename, dirname, join, resolve as pathResolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
@@ -3288,6 +3297,23 @@ const TIER_FLOOR: string[] = [
   "995-fs-uncaught.ts",
   "996-fs-rc-stress.ts",
   "997-fs-modules/main.ts",
+  // INC-26 P5 (3G, THE TWELVE — brief §1's own closed set, re-derived at
+  // CP1, confirmed unchanged through every checkpoint's own census: 908
+  // -> 920): 1357/1569 the stats-surface fsp twins; the rest the fs
+  // tail's own new keys (bytes ops, os tail, fd table, the retry
+  // record, the u16-prefixed realpath error path).
+  "1357-fsp-roundtrip.ts",
+  "1403-buffer-fs.ts",
+  "1426-stdin-read.ts",
+  "1480-os-network-interfaces.ts",
+  "1520-fs-wider-surface.ts",
+  "1540-os-userinfo.ts",
+  "1541-fs-readdir-dirent.ts",
+  "1569-fsp-mkdir-unlink-chmod.ts",
+  "1574-promise-all-tuple-literal.ts",
+  "1630-rmsync-retry-options.cjs",
+  "1640-fd-read-decode.ts",
+  "2096-os-type.ts",
 ];
 
 interface RunResult {
@@ -3576,6 +3602,32 @@ function mapFsError(e: unknown, modulePathLabel: string): number {
   return -(256 + (errno < 0 ? -errno : errno));
 }
 
+// INC-26 P5 (design §6.2, emitter.ts's own FLAGS_ENUM at the openSync
+// call site): the REVERSE of the module's compile-time literal-to-int
+// table. The module already validated the literal at compile time (an
+// unrecognized flags string is a compile-time ERR_INVALID_ARG_VALUE, the
+// 1640 row) — the host only ever sees one of these ten codes.
+const OPEN_FLAGS_BY_CODE: readonly string[] = ["r", "r+", "w", "wx", "w+", "wx+", "a", "ax", "a+", "ax+"];
+
+// P5 (design §2.6, fs.readdirTypesSync's own %dtype field): libuv's
+// UV_DIRENT encoding (scr_runtime.h:2640's own C-lane comment — the
+// SAME vendored reference the field-order precedent already cites): 1
+// file, 2 dir, 3 link, 4 fifo, 5 socket, 6 char, 7 block, 0 unknown.
+// Node's own Dirent predicate methods already apply libuv's own
+// DT_UNKNOWN -> lstat(2) fallback internally (documented Node
+// behavior), so calling them directly reproduces the C lane's own
+// fallback for free — no separate lstat call needed here.
+function direntType(d: import("node:fs").Dirent): number {
+  if (d.isFile()) return 1;
+  if (d.isDirectory()) return 2;
+  if (d.isSymbolicLink()) return 3;
+  if (d.isFIFO()) return 4;
+  if (d.isSocket()) return 5;
+  if (d.isCharacterDevice()) return 6;
+  if (d.isBlockDevice()) return 7;
+  return 0;
+}
+
 async function runWasm(modulePath: string): Promise<RunResult> {
   const chunks: { 1: Buffer[]; 2: Buffer[] } = { 1: [], 2: [] };
   let memory: WebAssembly.Memory | null = null;
@@ -3663,6 +3715,22 @@ async function runWasm(modulePath: string): Promise<RunResult> {
   // without this run having created it) — two deliberately different
   // sets, per N-3's own text.
   const createdPaths = new Set<string>();
+  // P5 (design §6.2, brief §3D): the per-run fd table — the module holds
+  // fd numbers as opaque f64 handles; the host hands back its OWN real
+  // OS-level fd from openSync and operates directly on it thereafter (no
+  // translation needed — Node's real fd numbers are already the small
+  // integers the module treats as opaque). SAME closure as createdPaths,
+  // SAME finally (a real OS fd is a SHARED, PROCESS-WIDE resource across
+  // the whole 1077-program census — a program that traps mid-run must
+  // not leak one into every later program's own fd space).
+  const openFds = new Set<number>();
+  // P5 (design §3.5, brief §3D): os.networkInterfaces' own JSON document
+  // — ONE real snapshot, captured lazily on first touch and reused for
+  // the rest of THIS run (never re-queried: the harness's own interface
+  // set can change between the oracle child's own call and this
+  // in-process run — R-6/A-9's own measured flake axis with no bug; a
+  // snapshot avoids observing that drift mid-run at least).
+  let netIfSnapshot: string | null = null;
   const { instance } = await WebAssembly.instantiate(readFileSync(modulePath), {
     tsinter: {
       write(fd: number, ptr: number, len: number): void {
@@ -3723,6 +3791,30 @@ async function runWasm(modulePath: string): Promise<RunResult> {
             return writeUtf16(tmpdir(), ptr, cap);
           case 9:
             return writeUtf16(homedir(), ptr, cap);
+          // INC-26 P5 (design §3.5, abi.ts's own kind numbers): os.type/
+          // os.release/os.userInfo's three string fields — THE VALUE
+          // PRINTS, arch/versions/execPath's own precedent (P3) restated:
+          // the real host, on the same machine, at the same moment.
+          case 10:
+            return writeUtf16(osType(), ptr, cap);
+          case 11:
+            return writeUtf16(release(), ptr, cap);
+          case 13:
+            return writeUtf16(userInfo().username, ptr, cap);
+          case 14:
+            return writeUtf16(userInfo().homedir, ptr, cap);
+          case 15:
+            return writeUtf16(userInfo().shell ?? "", ptr, cap);
+          // os.networkInterfaces (design §3.5, M-14): a JSON DOCUMENT, ONE
+          // real snapshot per run (`netIfSnapshot`, declared beside
+          // `createdPaths`/`openFds` above), captured lazily and reused —
+          // never re-queried mid-run (R-6/A-9's own measured flake axis:
+          // the interface set can change between the oracle child's own
+          // call and this in-process run — a snapshot cannot observe that
+          // drift, which is the point).
+          case 16:
+            if (netIfSnapshot === null) netIfSnapshot = JSON.stringify(networkInterfaces());
+            return writeUtf16(netIfSnapshot, ptr, cap);
           default:
             throw new Error(`hostStr: unknown kind ${kind}`);
         }
@@ -3771,6 +3863,12 @@ async function runWasm(modulePath: string): Promise<RunResult> {
             return process.availableMemory();
           case 13:
             return process.constrainedMemory() ?? 0;
+          // INC-26 P5 (design §3.5, abi.ts's own hostNum kind 15):
+          // os.totalmem — THE VALUE PRINTS, the same real-host stance as
+          // hostStr's arch/versions/execPath (P3) and os.type/os.release
+          // (P5) above.
+          case 15:
+            return totalmem();
           default:
             throw new Error(`hostNum: unknown kind ${kind}`);
         }
@@ -3866,7 +3964,21 @@ async function runWasm(modulePath: string): Promise<RunResult> {
         try {
           switch (op) {
             case 1: {
-              // readFileSync — read-only, no guard.
+              // readFileSync (x=0, UTF-16 text) / readFileSyncBytes +
+              // fsp.readFileBytes (x=1, RAW BYTES) — SHARED row (delta-3d
+              // a3c02af9's own bytes flag, ruling on this pass's own
+              // STOP-AND-REPORT + rev-26's confirming read): the wire
+              // call was byte-for-byte identical between the two keys
+              // before this flag existed, with INCOMPATIBLE slot-B
+              // encodings and DIFFERENT capacity units — read-only, no
+              // guard either way.
+              if (x === 1) {
+                const buf = readFileSync(pathA);
+                if (buf.length > bLen) return buf.length;
+                const view = new Uint8Array(memory!.buffer, bPtr, buf.length);
+                view.set(buf);
+                return buf.length;
+              }
               const content = readFileSync(pathA, "utf8");
               if (content.length > bLen) return content.length;
               const view = new Uint16Array(memory!.buffer, bPtr, content.length);
@@ -3875,9 +3987,15 @@ async function runWasm(modulePath: string): Promise<RunResult> {
             }
             case 2: {
               // readdirSync — read-only, no guard. JSON document (design
-              // §2.6): the tier's own parser decodes it.
-              const names = readdirSync(pathA);
-              const json = JSON.stringify(names);
+              // §2.6): the tier's own parser decodes it. x=1 (P5, D-6/D-8):
+              // readdirTypesSync's SAME row — an array of {"%dtype","name"}
+              // objects instead of bare name strings (fs.ts's own dispatch
+              // arm supplies parentPath itself, never from this JSON —
+              // never read `x` for anything but this ONE branch).
+              const json =
+                x === 1
+                  ? JSON.stringify(readdirSync(pathA, { withFileTypes: true }).map((d) => ({ "%dtype": direntType(d), name: d.name })))
+                  : JSON.stringify(readdirSync(pathA));
               if (json.length > bLen) return json.length;
               const view = new Uint16Array(memory!.buffer, bPtr, json.length);
               for (let i = 0; i < json.length; i++) view[i] = json.charCodeAt(i);
@@ -3893,10 +4011,125 @@ async function runWasm(modulePath: string): Promise<RunResult> {
               for (let i = 0; i < created.length; i++) view[i] = created.charCodeAt(i);
               return created.length;
             }
+            case 4: {
+              // realpathSync (P5, E-P5-2) — read-only, no guard. ON
+              // SUCCESS: the SAME length-retry contract as ops 1/2/3
+              // (bLen/CAP in code units). ON FAILURE: Node's OWN thrown
+              // error already carries the EXACT resolve-then-truncate
+              // path this op's message needs (B-3/B-4, measured
+              // p5-realpath-rule.out) — no need to reimplement Node's own
+              // resolution algorithm; slot B gets a u16 CODE-UNIT COUNT
+              // at its base then the path's own UTF-16 payload at +2
+              // (3C-2's ruling), and the OVERSHOOT-SIGNAL convention is
+              // SHARED with success (a positive return exceeding bLen
+              // means "retry with this much room", for EITHER eventual
+              // outcome — the module cannot yet tell which, by design).
+              try {
+                const real = realpathSync(pathA);
+                if (real.length > bLen) return real.length;
+                const view = new Uint16Array(memory!.buffer, bPtr, real.length);
+                for (let i = 0; i < real.length; i++) view[i] = real.charCodeAt(i);
+                return real.length;
+              } catch (e) {
+                const err = e as NodeJS.ErrnoException;
+                const errPath = typeof err.path === "string" ? err.path : pathA;
+                const needed = 1 + errPath.length; // the u16 count slot + the payload, same code-unit unit bLen uses
+                if (needed > bLen) return needed;
+                const view = new Uint16Array(memory!.buffer, bPtr, needed);
+                view[0] = errPath.length;
+                for (let i = 0; i < errPath.length; i++) view[1 + i] = errPath.charCodeAt(i);
+                return mapFsError(e, modulePath);
+              }
+            }
+            case 5: {
+              // readFdSync, ENCODED form (P5, design §2: syscall is
+              // ALWAYS `read`) — the SAME length-retry contract as op 1,
+              // reading from an fd (x) via Node's own fd-accepting
+              // readFileSync (reads from the fd's CURRENT position to
+              // EOF, exactly matching this op's own single-shot shape).
+              // fd 0 (H1, rev A-4 measured 1426's own shape: `"" 0` /
+              // `0 0` / `done`) is SYNTHESIZED as immediately empty —
+              // never a real read against the harness's OWN stdin, which
+              // this non-interactive process does not reliably offer.
+              // KNOWN RESIDUAL GAP (undriven by any current corpus
+              // fixture — 1426 only reaches the fd-0 branch above): a
+              // genuine OVERSHOOT retry (content longer than the
+              // module's initial 64-unit cap) would re-call
+              // `readFileSync(x,'utf8')`, which has ALREADY consumed the
+              // fd to EOF on the first attempt, losing the content on
+              // retry — no fixture drives this path today.
+              if (x === 0) return 0;
+              const content = readFileSync(x, "utf8");
+              if (content.length > bLen) return content.length;
+              const view = new Uint16Array(memory!.buffer, bPtr, content.length);
+              for (let i = 0; i < content.length; i++) view[i] = content.charCodeAt(i);
+              return content.length;
+            }
+            case 6: {
+              // readSync(fd,offset,length) -> byte count (P5, design
+              // §6.2) — a FIXED-length read (never retried — Node's own
+              // readSync answers the ACTUAL bytes read, short reads at
+              // EOF included) into slot B as RAW BYTES (never UTF-16 —
+              // the caller's own BYTES_U8 buffer, emitter.ts's own
+              // dispatch-arm copy loop reads it that way). No fd-0
+              // synthesis here — H1 names "BOTH readFd forms" only
+              // (op 5, ops 22/23), never this lower-level form, and no
+              // current fixture exercises fd 0 through it.
+              const buf = Buffer.alloc(bLen);
+              const n = readSync(x, buf, 0, bLen, null);
+              const view = new Uint8Array(memory!.buffer, bPtr, n);
+              for (let i = 0; i < n; i++) view[i] = buf[i]!;
+              return n;
+            }
+            case 7:
+            case 8: {
+              // statSync (7) / lstatSync (8) (P5, E-P5-1) — read-only, no
+              // guard. FIXED SIZE record (20 bytes, B-1/rev-26 a1b0b98f:
+              // 4 + 8 + 8 — abi.ts's own corrected arithmetic), status 0
+              // on success like a write-shaped op, never a length. THE
+              // TWO f64 FIELDS THROUGH A DataView setFloat64 (N-1,
+              // little-endian) — NEVER a Float64Array (slot B is only
+              // 2-byte aligned; a Float64Array over an 8-unaligned base
+              // throws on 7 of 8 sampled bases, measured
+              // p5-f64-align.out).
+              const st = op === 7 ? statSync(pathA) : lstatSync(pathA);
+              const dv = new DataView(memory!.buffer, bPtr, 20);
+              dv.setUint8(0, st.isFile() ? 1 : 0);
+              dv.setUint8(1, st.isDirectory() ? 1 : 0);
+              dv.setUint8(2, st.isSymbolicLink() ? 1 : 0);
+              dv.setFloat64(4, st.size, true);
+              dv.setFloat64(12, st.mtimeMs, true);
+              return 0;
+            }
             case 9: {
+              // writeFileSync/writeFileModeSync (`x` carries mode+1 for
+              // writeFileModeSync, abi.ts's own "mode=x-1" — delta-3db
+              // d7e1c3db B-1: BIASED BY ONE, never the raw mode, because
+              // x===0 already means "absent" for writeFileSync/
+              // fsp.writeFile [the row's mode-less keys], and Node's own
+              // writeFileSync({mode:0}) is NOT "no mode" — it is a REAL,
+              // different mode, measured: a file created with mode 0 is
+              // unreadable by its own creating process moments later,
+              // EACCES — an UNBIASED x would collapse that representable
+              // input into "no mode" silently, board #142's collision
+              // rebuilt on x. x===0 stays "omit mode, Node's own default
+              // applies"; x!==0 forwards `x-1` as the real mode) /
+              // writeFileSyncBytes (`y`=1, RAW BYTES — op 9's `x` is
+              // ALREADY spent by mode, so the bytes flag rides `y`
+              // instead, delta-3d a3c02af9's correction to this pass's
+              // own proposal; writeFileSync/writeFileModeSync/
+              // fsp.writeFile all keep y=0, their own text-key row
+              // asserts it).
               const resolved = guardDestructive(pathA, cwd, modulePath, "writeFileSync");
               const isNew = !existsSync(resolved);
-              writeFileSync(resolved, readUtf16(bPtr, bLen));
+              if (y === 1) {
+                const view = new Uint8Array(memory!.buffer, bPtr, bLen);
+                writeFileSync(resolved, Buffer.from(view));
+              } else if (x !== 0) {
+                writeFileSync(resolved, readUtf16(bPtr, bLen), { mode: x - 1 });
+              } else {
+                writeFileSync(resolved, readUtf16(bPtr, bLen));
+              }
               if (isNew) createdPaths.add(resolved);
               return 0;
             }
@@ -3908,9 +4141,18 @@ async function runWasm(modulePath: string): Promise<RunResult> {
               return 0;
             }
             case 11: {
+              // mkdirSync/mkdirRecursiveSync/mkdirModeSync/
+              // mkdirRecursiveModeSync (P5: `x` carries mode+1 for the
+              // two Mode keys — delta-3db d7e1c3db B-1, the SAME bias as
+              // case 9's own; P4's own two non-Mode keys always send the
+              // inert literal 0, unchanged).
               const resolved = guardDestructive(pathA, cwd, modulePath, "mkdirSync");
               const isNew = !existsSync(resolved);
-              mkdirSync(resolved, { recursive: y === 1 });
+              if (x !== 0) {
+                mkdirSync(resolved, { recursive: y === 1, mode: x - 1 });
+              } else {
+                mkdirSync(resolved, { recursive: y === 1 });
+              }
               if (isNew) createdPaths.add(resolved);
               return 0;
             }
@@ -3925,8 +4167,69 @@ async function runWasm(modulePath: string): Promise<RunResult> {
               return 0;
             }
             case 14: {
+              // rmSync/rmOptsSync/rmRetrySync — recursive/force ride x/y
+              // exactly as P4 built it; rmRetrySync (P5, CP1 delta cp1b)
+              // ADDS maxRetries/retryDelay as a two-i32 LE record riding
+              // slot B (bLen=8) instead of x/y (both already spent) —
+              // read via DataView getInt32 (cp1b/M-24: an Int32Array
+              // throws on a slot-B base that sits at 2 mod 4, which every
+              // odd-code-unit path length produces); bLen=0 (rmSync/
+              // rmOptsSync) means the record is ABSENT, Node's own
+              // defaults apply. Forwarded straight into Node's own real
+              // rmSync options so Node's OWN retry behavior does the
+              // work — no hand-rolled retry loop here.
               const resolved = guardDestructive(pathA, cwd, modulePath, "rmSync");
-              rmSync(resolved, { recursive: x === 1, force: y === 1 });
+              if (bLen === 8) {
+                const dv = new DataView(memory!.buffer, bPtr, 8);
+                const maxRetries = dv.getInt32(0, true);
+                const retryDelay = dv.getInt32(4, true);
+                rmSync(resolved, { recursive: x === 1, force: y === 1, maxRetries, retryDelay });
+              } else {
+                rmSync(resolved, { recursive: x === 1, force: y === 1 });
+              }
+              return 0;
+            }
+            case 15: {
+              // copyFileSync (P5) — the ONE two-path op. src is
+              // READ-ONLY (no guard, `pathA` unresolved — matching the
+              // EISDIR-for-copyfile trap: Node's OWN missing-dest-parent-
+              // wins check needs the real, unresolved arguments); dst is
+              // the ONE thing being created/overwritten, guarded like
+              // every other destructive op.
+              const dst = readUtf16(bPtr, bLen);
+              const resolvedDst = guardDestructive(dst, cwd, modulePath, "copyFileSync");
+              const isNew = !existsSync(resolvedDst);
+              copyFileSync(pathA, resolvedDst);
+              if (isNew) createdPaths.add(resolvedDst);
+              return 0;
+            }
+            case 16: {
+              // chmodSync (P5) — guard extended here (rev-26 3C read,
+              // POST-ACK #7): mutates an EXISTING path, never creates one
+              // — no createdPaths tracking.
+              const resolved = guardDestructive(pathA, cwd, modulePath, "chmodSync");
+              chmodSync(resolved, x);
+              return 0;
+            }
+            case 17: {
+              // chownSync (P5) — same guard-but-no-create shape as
+              // chmodSync above.
+              const resolved = guardDestructive(pathA, cwd, modulePath, "chownSync");
+              chownSync(resolved, x, y);
+              return 0;
+            }
+            case 18: {
+              // closeSync (P5) — fd-only, no path, no guard (closing
+              // touches no filesystem location). fd 0: a no-op — never
+              // actually close the HARNESS's own real stdin, which every
+              // LATER census program in this same process would then
+              // find closed too; no current fixture calls closeSync(0),
+              // this is a defensive no-op matching fd 0's own
+              // "synthesized, never real" stance throughout ops 5/22/23.
+              if (x !== 0) {
+                closeSync(x);
+                openFds.delete(x);
+              }
               return 0;
             }
             case 19: {
@@ -3944,6 +4247,54 @@ async function runWasm(modulePath: string): Promise<RunResult> {
               // mutation), no guard.
               accessSync(pathA, x);
               return 0;
+            }
+            case 21: {
+              // openSync(pathA,flags=x,mode=y) -> fd (P5) — `flags` is
+              // the REVERSE of emitter.ts's own compile-time FLAGS_ENUM
+              // (OPEN_FLAGS_BY_CODE above); the module already validated
+              // the literal at compile time (1640's own row), so an
+              // unrecognized code here is a HARNESS bug, not a module
+              // one. 'r' never creates and never writes through the fd
+              // it returns — no guard, matching every other read-only
+              // op; every OTHER flag is guarded (root-set guard extended
+              // here, POST-ACK #7's own RECORD item), and only the
+              // STRICTLY CREATING flags (every flag but 'r' and 'r+' —
+              // 'r+' opens an EXISTING file for read+write, never
+              // creates, Node throws ENOENT if missing) are tracked in
+              // createdPaths (H2's own creating-op enumeration).
+              const flags = OPEN_FLAGS_BY_CODE[x];
+              if (flags === undefined) {
+                throw new Error(`HARNESS SAFETY GUARD: openSync received an unrecognized flags code ${x} for ${modulePath}`);
+              }
+              const resolved = flags === "r" ? pathA : guardDestructive(pathA, cwd, modulePath, "openSync");
+              const isNew = flags !== "r" && flags !== "r+" && !existsSync(resolved);
+              const fd = openSync(resolved, flags, y);
+              openFds.add(fd);
+              if (isNew) createdPaths.add(resolved);
+              return fd;
+            }
+            case 22: {
+              // fstatFd(fd=x) -> byte size (P5, readFdSyncBytes's own
+              // stage 1) — the SIZE stage 2 allocates against. fd 0:
+              // synthesized as size 0 (H1's own "immediately empty"
+              // stance, matching op 5).
+              if (x === 0) return 0;
+              return fstatSync(x).size;
+            }
+            case 23: {
+              // readFdInto(fd=x,ptr,cap) -> byte count (P5,
+              // readFdSyncBytes's own stage 2) — RAW BYTES into slot B
+              // (never UTF-16 — emitReadBytesAt's own 1-byte-per-unit
+              // read), capacity = stage 1's own SIZE, never retried (a
+              // single fixed-length read, op 6's own shape). fd 0:
+              // synthesized as 0 bytes read (stage 1 already answered
+              // size 0, so bLen is 0 here too).
+              if (x === 0) return 0;
+              const buf = Buffer.alloc(bLen);
+              const n = readSync(x, buf, 0, bLen, null);
+              const view = new Uint8Array(memory!.buffer, bPtr, n);
+              for (let i = 0; i < n; i++) view[i] = buf[i]!;
+              return n;
             }
             default:
               throw new Error(`fsCall: unhandled op ${op} for ${modulePath}`);
@@ -4013,6 +4364,17 @@ async function runWasm(modulePath: string): Promise<RunResult> {
       } catch {
         // Best-effort: a predecessor's own cleanup (or this program's
         // own rmSync/unlinkSync arm) may have already removed it.
+      }
+    }
+    // P5: close every real fd THIS RUN opened and never closed itself
+    // (createdPaths' own SAME shape/SAME reasoning — a trap mid-run must
+    // not leak a real OS fd into every later census program).
+    for (const fd of openFds) {
+      try {
+        closeSync(fd);
+      } catch {
+        // Best-effort: the program's own closeSync arm, or its own
+        // failure path, may have already closed it.
       }
     }
   }
@@ -4117,6 +4479,49 @@ describe(`wasm differential corpus (${files.length} programs${shardSuffix()})`, 
         ? `TIER_FLOOR and the claimed set disagree — pinned-but-not-claimed (regressions): ${JSON.stringify(missingFromClaimed)}; claimed-but-not-pinned (unpinned new claims): ${JSON.stringify(missingFromFloor)}`
         : undefined,
     ).toEqual({ missingFromClaimed: [], missingFromFloor: [] });
+  });
+
+  // INC-26 P5, POST-ACK #25 §4 / delta-3gd (landed — M-4/M-6 were missing pins, closed
+  // here): two hand-sequenced TWO-PROGRAM tests. `createdPaths`/`openFds` (this file's
+  // own N-3/P5 leak-cleanup sets, both declared per-`runWasm`-call and reset every
+  // invocation) can only be caught by running two programs in series and inspecting
+  // REAL, process-wide filesystem/fd state between them — no single-program row can see
+  // a cleanup bug in either set, since the JS bookkeeping itself never persists across
+  // calls, only the underlying OS resource does. Fixtures live under
+  // tests/harness/fixtures-p5/m04-fdleak/ and tests/harness/fixtures-p5/m06-leak/ —
+  // harness-owned, outside every FORBID prefix (delta-3gd: tests/corpus/ itself is a
+  // FORBID-PREFIX regardless of subdirectory or census-glob reach, so these do not
+  // belong there even though the bulk `test.for` loop's own glob never matched them).
+  const fixturesP5Dir = join(repoRoot, "tests/harness/fixtures-p5");
+  test("M-6: a two-program createdPaths leak check — B must see A's own file gone", async () => {
+    const shared = join(tmpdir(), "m6-leak-check-shared.txt");
+    try { rmSync(shared, { force: true }); } catch { /* clean slate */ }
+    const resA = await build(join(fixturesP5Dir, "m06-leak/a.ts"));
+    if (!resA.ok) throw new Error("M-6 fixture A failed to build");
+    const outA = await runWasm(resA.binaryPath);
+    expect(outA.stdout.toString("utf8").trim()).toBe("a-wrote");
+    const resB = await build(join(fixturesP5Dir, "m06-leak/b.ts"));
+    if (!resB.ok) throw new Error("M-6 fixture B failed to build");
+    const outB = await runWasm(resB.binaryPath);
+    expect(outB.stdout.toString("utf8").trim()).toBe("b-sees false");
+  });
+  // Program B's own stdout carries the RAW fd number BY DESIGN — this row's whole
+  // mechanism is comparing B's real OS fd against A's — but this is now safe under
+  // every reader in the repo: fixturesP5Dir sits outside tests/corpus/ entirely (not
+  // merely in an unglobbed subdirectory of it), so neither the wasm lane's own
+  // `test.for` bulk loop NOR the llvm-differential lane's own equivalent can ever
+  // discover these files and Node-oracle-compare that raw, non-deterministic number.
+  test("M-4: a two-program fd-table leak check — B's fd must equal A's fd", async () => {
+    const resA = await build(join(fixturesP5Dir, "m04-fdleak/a.ts"));
+    if (!resA.ok) throw new Error("M-4 fixture A failed to build");
+    const outA = await runWasm(resA.binaryPath);
+    const fdA = Number(outA.stdout.toString("utf8").trim().split(" ")[1]);
+    expect(Number.isFinite(fdA)).toBe(true);
+    const resB = await build(join(fixturesP5Dir, "m04-fdleak/b.ts"));
+    if (!resB.ok) throw new Error("M-4 fixture B failed to build");
+    const outB = await runWasm(resB.binaryPath);
+    const fdB = Number(outB.stdout.toString("utf8").trim().split(" ")[1]);
+    expect(fdB).toBe(fdA);
   });
 
   // ── INC-26 pass P4 — the fsCall adapter's OWN unit rows (design §10-v:

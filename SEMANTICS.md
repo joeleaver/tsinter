@@ -5432,8 +5432,12 @@ and an overlong path, so the twelve-only table printed a knowingly-wrong "Unknow
 user will actually hit), `.code` renders `E<n>` (NEVER a Node spelling) with the MODULE CONSTANT text
 `"Unknown system error -<n>"`, sourced from libuv's own table shape rather than the host platform's
 `strerror` (measured: glibc's `strerror` and libuv's table differ on every code compared, not merely in
-case). The arm is unreached by the generator and by every corpus program (this pass's own measurement: the
-generator measures 27 shapes / 9 codes, all inside the fourteen) — a stated limitation, not a silent one.
+case). The arm is unreached by the generator and by every corpus program — measured against
+`packages/compiler/test/fs-errno-rows.json` (sha256 `e3ceac84f41fcf4a110c0ca52242fc6125153d499334a98cac89013d62dd3789`:
+43 rows, generated under uid class "non-root", every code inside the fourteen — the file's own header and
+row count are the citation, not a transcribed number that can go stale as the table grows). `EBADF`, never
+reachable through a path-based op, is reached through the fd-based ops P5 added to this same table —
+`closeSync`/`readSync`/`readFdSync`/`readFdSyncBytes` — a stated limitation, not a silent one.
 
 SECOND SENTENCE: where Node throws a DIFFERENT ERROR CLASS — `rmSync`/`rmOptsSync` on a directory WITHOUT
 `recursive: true` throws a `SystemError`, `.code` `"ERR_FS_EISDIR"`, `.syscall` `"rm"`, message `"Path is a
@@ -5472,6 +5476,48 @@ witnesses); the errno table's own forced-host unit rows, driven against a table 
 runs (never transcribed from this entry or from the native C source) and independently cross-checked byte-
 for-byte against a second, separately-written measurement; a forced row for the rm-on-directory class/wording
 above, pinning both the `SystemError`-vs-`Error` class difference and the exact unprefixed, unquoted message.
+
+## S074 — `fs/promises` runs its syscall SYNCHRONOUSLY and mints an ALREADY-SETTLED promise; I/O never interleaves with timers or other fibers *(native and wasm lanes; the same divergence, one mechanism)*
+
+Node's real `fs/promises` schedules the syscall onto libuv's own thread pool and settles the returned
+promise from a completion callback, so other timers, immediates, and concurrently-pending promises can run
+WHILE the I/O is in flight. Every non-Node lane instead runs the SAME synchronous syscall this tier's own
+`fs`/`fs.*Sync` family already uses, and wraps the outcome directly into a promise that is already settled
+the instant it is returned — a pending exception in the active cell becomes the REJECTION (Node's own
+fs/promises failures reject rather than throw, so this matches the catchable-at-`await` shape exactly), and
+anything else FULFILLS with the payload. The rejection's `.message` is the SAME sync text S073 registers
+(no separate wording for the promise form).
+
+ONE mechanism, TWO observables, ONE entry serving both: the SETTLING ITSELF — a pending exception moved out
+of the active cell into the promise's rejection slot before that promise is ever returned to the caller
+(`scr_promise_settled_common`, `packages/runtime/src/scr_async.c:1387`, the subject of the block comment's
+own citation at `:1379`) — and the NON-INTERLEAVING this produces (the `fs/promises` bridge's own block
+comment, citing the same divergence again at `:1430`, immediately before `scr_fsp_read_file` and its
+siblings): a program that AWAITS its fs/promises calls sequentially cannot observe the difference (the
+result and its timing relative to ITS OWN later statements are Node-exact), but a program that races an
+fs/promises call against a timer, an immediate, or another concurrently-pending promise CAN — the sync
+call runs to completion, and everything else queued for that same turn waits behind it, where Node would
+have let them interleave. The wasm lane's own fsp twins (`fs.readFile`/`writeFile`/`rm`/`stat`/`mkdir`/
+`mkdirRecursiveMode`/`unlink`/`chmod`/`readdir`/`readFileBytes`, P5's own construct) share this exact
+stance — `emitFspSettled` wraps the SAME sync fs.ts helpers the ordinary `fs.*Sync` calls use, via the
+module's own already-settled-promise minting (`this.proms.mint()`/`this.proms.settle()`), never new async
+machinery (design §6.5) — so one entry covers both lanes rather than a per-lane split.
+
+RETIRES the two unnumbered citations whose SUBJECT is this mechanism: `packages/runtime/src/scr_async.c:1379`
+(inside the block comment introducing the `scr_promise_settled_*` family, immediately before
+`scr_promise_settled_common` at `:1387`: "the documented non-interleaving divergence, SEMANTICS.md") and
+`packages/runtime/src/scr_async.c:1430` (inside the `fs/promises` bridge's own block comment, immediately
+before `scr_fsp_read_file`: "DOCUMENTED DIVERGENCE (SEMANTICS.md): the syscall blocks the event loop..."). A
+THIRD, unrelated citation sits nearby in the same file at `:575` (`scr_timer_refresh`'s own dead-handle
+no-op: "SEMANTICS: Node re-activates even a fired Timeout; the compiled handle cannot") — a DIFFERENT
+SUBJECT (re-activating an already-fired timer, not fs/promises), logged here as residue under board #137,
+not retired by this entry and not touched.
+
+**Tested by:** 1357-fsp-roundtrip.ts and 1569-fsp-mkdir-unlink-chmod.ts (both lanes — confirmed native AND
+wasm claim and pass them byte-exact this pass), exercising the settled-fulfillment and settled-rejection
+paths across the full fsp surface; #143's own native corpus rows (1461/1531/2314) as an unrelated-mechanism
+negative control, confirming this entry's own native code paths (`scr_promise_settled_*`) sit beside, and
+are unaffected by, that rider's three separate C-lane fixes.
 
 ## S075 — `process.getActiveResourcesInfo()` reports only the resource KINDS this tier's own event loop models *(wasm tier; native lanes ship the same divergence)*
 

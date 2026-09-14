@@ -1376,7 +1376,7 @@ void scr_promise_reject_pending(ScrPromise *p) {
 
 /* ── settled-promise minting (the fs/promises bridge) ─────────────────
  * The promise-returning stdlib functions run their syscall SYNCHRONOUSLY
- * (the documented non-interleaving divergence, SEMANTICS.md) and wrap the
+ * (the documented non-interleaving divergence, SEMANTICS.md S074) and wrap the
  * outcome here: a pending exception in the active cell becomes the
  * promise's REJECTION (moved out of the cell — the caller's pending check
  * then sees a clean cell, exactly like Node where fs/promises failures
@@ -1427,7 +1427,7 @@ ScrPromise *scr_promise_settled_ref(void *v, void *(*retain)(void *), void (*rel
  * The promise forms run the SAME sync operations and mint an already-
  * settled promise (scr_promise_settled_*): success fulfills, a pending
  * exception moves in as the rejection — catchable at the await, like
- * Node. DOCUMENTED DIVERGENCE (SEMANTICS.md): the syscall blocks the
+ * Node. DOCUMENTED DIVERGENCE (SEMANTICS.md S074): the syscall blocks the
  * event loop, so I/O never interleaves with timers or other fibers —
  * observable only in concurrent code, not in the sequential await
  * chains CLIs are made of. */

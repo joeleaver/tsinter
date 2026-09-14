@@ -117,8 +117,15 @@ import {
   HOST_STR_KIND_ENV_KEY,
   HOST_STR_KIND_ENV_VALUE,
   HOST_STR_KIND_EXEC_PATH,
+  HOST_NUM_KIND_OS_TOTALMEM,
   HOST_STR_KIND_OS_HOMEDIR,
+  HOST_STR_KIND_OS_NETWORK_INTERFACES_JSON,
+  HOST_STR_KIND_OS_RELEASE,
   HOST_STR_KIND_OS_TMPDIR,
+  HOST_STR_KIND_OS_TYPE,
+  HOST_STR_KIND_OS_USERINFO_HOMEDIR,
+  HOST_STR_KIND_OS_USERINFO_SHELL,
+  HOST_STR_KIND_OS_USERINFO_USERNAME,
   HOST_STR_KIND_PLATFORM,
   HOST_STR_KIND_VERSIONS_NODE,
   HOST_STR_KIND_VERSIONS_OPENSSL,
@@ -553,7 +560,18 @@ function hostStrReachable(mod: WModule): boolean {
         // no hostStr kind 17 round trip). Confirmed by reading every P4 arm
         // (fs.ts's own builder), not assumed from this table alone.
         node === "os.tmpdir" ||
-        node === "os.homedir"
+        node === "os.homedir" ||
+        // INC-26 P5 (brief-p5-v3.md §3A, abi.ts kinds 10/11/13/14/15/16):
+        // six more os.* hostStr consumers, same idiom as P4's tmpdir/
+        // homedir pair above — every one a bare host-fact string read,
+        // never touching fsCall. os.totalmem is NOT here (it is a
+        // hostNum kind, added to hostNumReachable below instead).
+        node === "os.type" ||
+        node === "os.release" ||
+        node === "os.userName" ||
+        node === "os.userHomedir" ||
+        node === "os.userShell" ||
+        node === "os.networkInterfaces"
       ) {
         found = true;
       }
@@ -626,7 +644,10 @@ function hostNumReachable(mod: WModule): boolean {
         node === "process.constrainedMemory" ||
         node === "process.rusage" ||
         node === "process.emitWarning" ||
-        node === "process.onWarning"
+        node === "process.onWarning" ||
+        // INC-26 P5 (brief-p5-v3.md §3A, abi.ts hostNum kind 15): the
+        // sole new hostNum-only os.* key this pass adds.
+        node === "os.totalmem"
       ) {
         found = true;
       }
@@ -807,7 +828,47 @@ function fsCallReachable(mod: WModule): boolean {
         node === "fs.rmdirSync" ||
         node === "fs.readdirSync" ||
         node === "fs.unlinkSync" ||
-        node === "fs.accessSync"
+        node === "fs.accessSync" ||
+        // INC-26 P5 (brief-p5-v3.md §3A + the CP1 delta 29286fa4 ruling
+        // (2)/C-2): the eighteen fs-tail keys. rmRetrySync REUSES op 14's
+        // row (a third key alongside rmSync/rmOptsSync above) but still
+        // needs its OWN string here — the prescan gates on the KEY the
+        // program actually calls, not the op number it happens to share.
+        // readdirTypesSync likewise reuses op 2's row (D-8) but is its own
+        // key. statSync/lstatSync mint fsCall even though their RESULT
+        // (STATS_T) is consumed by the stats.* accessors, which do not
+        // themselves touch fsCall.
+        node === "fs.openSync" ||
+        node === "fs.closeSync" ||
+        node === "fs.readSync" ||
+        node === "fs.readFdSync" ||
+        node === "fs.readFdSyncBytes" ||
+        node === "fs.readFileSyncBytes" ||
+        node === "fs.writeFileSyncBytes" ||
+        node === "fs.readdirTypesSync" ||
+        node === "fs.chmodSync" ||
+        node === "fs.chownSync" ||
+        node === "fs.copyFileSync" ||
+        node === "fs.writeFileModeSync" ||
+        node === "fs.mkdirModeSync" ||
+        node === "fs.mkdirRecursiveModeSync" ||
+        node === "fs.rmRetrySync" ||
+        node === "fs.statSync" ||
+        node === "fs.lstatSync" ||
+        node === "fs.realpathSync" ||
+        // The ten fsp promise twins (design §6.5): SYNCHRONOUS syscall +
+        // an already-settled promise, so they mint fsCall exactly like
+        // their sync siblings — no new import kind, no async machinery.
+        node === "fsp.readFile" ||
+        node === "fsp.readFileBytes" ||
+        node === "fsp.writeFile" ||
+        node === "fsp.rm" ||
+        node === "fsp.stat" ||
+        node === "fsp.mkdir" ||
+        node === "fsp.mkdirRecursiveMode" ||
+        node === "fsp.readdir" ||
+        node === "fsp.unlink" ||
+        node === "fsp.chmod"
       ) {
         found = true;
       }
@@ -6326,6 +6387,17 @@ class Assembler {
       concat: () => this.concatHelper(),
       f64ToStr: () => this.f64ToStrHelper(),
       throwCoded: (c, className, name, pushMessage, pushCode) => this.emitSetCellErrorCoded(c, className, name, pushMessage, pushCode),
+      // INC-26 P5 (readFileSyncBytes/writeFileSyncBytes) — the SAME
+      // bytes-array surface StreamBuilder's own deps already inject
+      // (this.bytesB, typedarrays.ts's BytesBuilder), for the FIRST byte
+      // payload in slot B (CP1 delta 29286fa4, P4's own R-3 axis finally
+      // exercised with an odd byte length).
+      bytesRef: () => this.bytesB.bytesRef(),
+      bytesType: () => this.bytesB.bytesType(),
+      bytesNewLen: () => this.bytesB.newLen("u8"),
+      bytesSetElem: () => this.bytesB.setElem("u8"),
+      bytesGetElem: () => this.bytesB.get("u8"),
+      bytesLength: () => this.bytesB.length(),
     });
     return this.fsField;
   }
@@ -9103,6 +9175,16 @@ class Assembler {
         // mapTypeSoft's addition alone left this one still refusing
         // (the LOCKSTEP LAW's own recurring bug class, brief §1).
         return { kind: "ref", nullable: true, typeIndex: this.regex.regexType };
+      // INC-26 P5 (CP1 delta 29286fa4 C-1 arm, brief §0.5/ruling(1)): the
+      // stats struct's own ref, retiring BOTH `type:stats` (this arm
+      // firing) and `expr:%async.settled:stats` (emitSettledPayload's own
+      // call into mapType taking the refusing branch) at once — the SAME
+      // code path, not two fixes. NEVER I32 (the bool-arm's own invariant
+      // two arms up in mapTypeSoft: I32 out of that whole switch means
+      // EITHER a genuine bool OR the unmappable placeholder — returning a
+      // REF here keeps that guard intact without touching it).
+      case "stats":
+        return this.fs.statsRef();
       default:
         this.refuse(`type:${t.kind}`, loc);
         return null;
@@ -9160,6 +9242,7 @@ class Assembler {
           t.elem.kind === "set" ||
           t.elem.kind === "bytes" ||
           t.elem.kind === "regex" ||
+          t.elem.kind === "stats" || // INC-26 P5, CP1 delta 29286fa4 D-2/ruling(1)(ii): a `stats[]` must not soft-map to a placeholder while mapType succeeds on it (the increment-6/7 lockstep lesson this list's own header comment names) — latent (no program in the twelve builds one), fixed now per the ruling's own reasoning
           (t.elem.kind === "object" && this.objectMappable(t.elem.className));
         if (!mappable) return I32;
         const kind =
@@ -9234,6 +9317,18 @@ class Assembler {
         // (regexLiteral()'s per-(source,flags) guard), not in a per-
         // pattern wasm type.
         return { kind: "ref", nullable: true, typeIndex: this.regex.regexType };
+      // INC-26 P5 (CP1 delta 29286fa4 D-2/ruling(1)(i)): mapType never
+      // fails on stats either — same consistency rule. MEASURED gap this
+      // pass closes: without this arm, a `fs.Stats`-typed value reaching
+      // mapTypeSoft (a captured variable, a function param) would
+      // silently answer the I32 PLACEHOLDER instead of the struct ref —
+      // the bool arm's own invariant above says I32 out of this switch
+      // means EITHER a genuine bool OR that placeholder, and this case
+      // must never be the second one for stats. Returning a REF here
+      // needs no change at `mapValRepFor`'s own guard (its own comment,
+      // repeated at the bool arm above).
+      case "stats":
+        return this.fs.statsRef();
       default:
         return I32;
     }
@@ -14072,6 +14167,1013 @@ class Assembler {
           this.releaseScratch(this.strRef, PATH);
           return;
         }
+        // ── INC-26 pass P5 — the fs tail + the fsp twins + the os tail +
+        // the stats surface (brief-p5-v3.md a8dc6daa/303; CP1 delta
+        // 29286fa4 + cp1b f7f2f8d1; design-host-v7.txt cccf7d6e §2.6/
+        // §3.3-§3.6/§6.2-§6.6/§9 P5). 908 -> 920.
+        if (e.fn === "fs.statSync") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.fs.statSyncHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.lstatSync") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.fs.lstatSyncHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "stats.isFile") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.fs.statsIsFileHelper());
+          return;
+        }
+        if (e.fn === "stats.isDirectory") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.fs.statsIsDirectoryHelper());
+          return;
+        }
+        if (e.fn === "stats.isSymbolicLink") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.fs.statsIsSymbolicLinkHelper());
+          return;
+        }
+        if (e.fn === "stats.size") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.fs.statsSizeHelper());
+          return;
+        }
+        if (e.fn === "stats.mtimeMs") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.fs.statsMtimeMsHelper());
+          return;
+        }
+        if (e.fn === "fs.realpathSync") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.fs.realpathSyncHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.chmodSync") {
+          const PATH = this.acquireScratch(this.strRef);
+          this.walkExpr(e.args[0]!);
+          code.localSet(PATH);
+          code.localGet(PATH);
+          this.walkExpr(e.args[1]!);
+          code.call(this.toInt32Helper());
+          code.call(this.fs.chmodSyncHelper());
+          this.emitPendingCheck();
+          this.releaseScratch(this.strRef, PATH);
+          return;
+        }
+        if (e.fn === "fs.chownSync") {
+          const PATH = this.acquireScratch(this.strRef);
+          this.walkExpr(e.args[0]!);
+          code.localSet(PATH);
+          code.localGet(PATH);
+          this.walkExpr(e.args[1]!);
+          code.call(this.toInt32Helper());
+          this.walkExpr(e.args[2]!);
+          code.call(this.toInt32Helper());
+          code.call(this.fs.chownSyncHelper());
+          this.emitPendingCheck();
+          this.releaseScratch(this.strRef, PATH);
+          return;
+        }
+        if (e.fn === "fs.copyFileSync") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.fs.copyFileSyncHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.writeFileModeSync") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          this.walkExpr(e.args[2]!);
+          code.call(this.toInt32Helper());
+          code.call(this.fs.writeFileModeSyncHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.mkdirModeSync") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.toInt32Helper());
+          code.call(this.fs.mkdirModeSyncHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.mkdirRecursiveModeSync") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.toInt32Helper());
+          code.call(this.fs.mkdirRecursiveModeSyncHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.rmRetrySync") {
+          // [STRING, BOOL, BOOL, F64, F64] = path, recursive, force,
+          // maxRetries, retryDelay — the bools are already I32 at the IR
+          // boundary (matching rmOptsSync's own args[1]/args[2] walk);
+          // maxRetries/retryDelay are F64 -> toInt32 (CP1 delta cp1b).
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          this.walkExpr(e.args[2]!);
+          this.walkExpr(e.args[3]!);
+          code.call(this.toInt32Helper());
+          this.walkExpr(e.args[4]!);
+          code.call(this.toInt32Helper());
+          code.call(this.fs.rmRetrySyncHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.closeSync") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.toInt32Helper());
+          code.call(this.fs.closeSyncHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.openSync") {
+          // args[1] (flags) MUST be a compile-time STRING LITERAL — Node's
+          // own flag strings map to a SMALL FIXED ENUM this tier's host
+          // contract shares with 3D's adapter (never raw POSIX bits, which
+          // would tie this ABI to one platform's own O_* values for no
+          // reason — the host already calls Node's OWN fs.openSync(path,
+          // flagString), so the enum only needs to name WHICH string,
+          // round-tripped by the adapter/forced host, never decoded here).
+          // An unrecognized (but still literal) flags string is 1640's own
+          // ERR_INVALID_ARG_VALUE — a call-site compile-time throw, since
+          // the argument is already fully known.
+          const flagsArg = e.args[1]!;
+          if (flagsArg.kind !== "strLit") {
+            this.refuse("libCall:fs.openSync:non-literal-flags", e.loc);
+            code.unreachable();
+            return;
+          }
+          const FLAGS_ENUM: Record<string, number> = { r: 0, "r+": 1, w: 2, wx: 3, "w+": 4, "wx+": 5, a: 6, ax: 7, "a+": 8, "ax+": 9 };
+          const flagCode = FLAGS_ENUM[flagsArg.value];
+          this.walkExpr(e.args[0]!);
+          if (flagCode === undefined) {
+            // ERR_INVALID_ARG_VALUE, Node's exact text — a compile-time-
+            // known throw (1640's own row): "The argument 'flags' is
+            // invalid. Received '<value>'".
+            code.drop();
+            this.emitSetCellErrorCoded(
+              code,
+              "%TypeError",
+              "TypeError",
+              (cc) => {
+                this.pushStrLitInto(cc, `The argument 'flags' is invalid. Received '${flagsArg.value}'`);
+              },
+              (cc) => this.pushStrLitInto(cc, "ERR_INVALID_ARG_VALUE"),
+            );
+            this.emitPendingCheck();
+            code.f64Const(0);
+            return;
+          }
+          code.i32Const(flagCode);
+          code.call(this.fs.openSyncHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.readSync") {
+          // [F64, BYTES_U8, F64, F64] = fd, buffer, offset, length ->
+          // bytes read. fs.ts's own readSyncHelper stages the read bytes
+          // at `stageCursor()` and returns the COUNT; THIS call site does
+          // the copy into the caller's OWN buffer at `offset` (fs.ts has
+          // no `this.bytesB` access — the split this file's own header
+          // comment states, mirrored from readFileSyncBytesHelper's).
+          const BUF = this.acquireScratch(this.bytesB.bytesRef());
+          const OFFSET = this.acquireScratch(I32);
+          this.walkExpr(e.args[0]!);
+          code.call(this.toInt32Helper());
+          const FD = this.acquireScratch(I32);
+          code.localSet(FD);
+          this.walkExpr(e.args[1]!);
+          code.localSet(BUF);
+          this.walkExpr(e.args[2]!);
+          code.call(this.toInt32Helper());
+          code.localSet(OFFSET);
+          this.walkExpr(e.args[3]!);
+          code.call(this.toInt32Helper());
+          const LEN = this.acquireScratch(I32);
+          code.localSet(LEN);
+          // P5 (brief §3B/§2, M-17, POST-ACK #11): Node's own readSync
+          // bounds validation, reproduced HERE so a violation throws
+          // Node's own CATCHABLE RangeError (ERR_OUT_OF_RANGE) through
+          // `emitSetCellError`/`emitPendingCheck`'s existing exception
+          // protocol, never the uncatchable WasmGC array-bounds TRAP an
+          // unchecked copy loop below would otherwise hit (1640's own
+          // failure before this fix). Exact texts + check order (offset,
+          // then length, then the DERIVED bound) from rev's own oracle
+          // (rev/probes/p5/p5-readsync-range.out, sha256 1b7f7ac249d6):
+          // the upper bound for `offset` alone is Node's own fixed
+          // 2^53-1 constant, never buffer-relative; `length`'s own upper
+          // bound (the THIRD check) is DERIVED — `BUF`'s own length minus
+          // `offset` — never a hard-coded literal (M-17's own row).
+          code.localGet(OFFSET);
+          code.i32Const(0);
+          code.i32LtS();
+          this.openIf();
+          this.emitSetCellError(
+            code,
+            "%RangeError",
+            "RangeError",
+            (c) => {
+              this.pushStrLitInto(c, 'The value of "offset" is out of range. It must be >= 0 && <= 9007199254740991. Received ');
+              c.localGet(OFFSET);
+              c.f64ConvertI32S();
+              c.call(this.f64ToStrHelper());
+              c.call(this.concatHelper());
+            },
+            "ERR_OUT_OF_RANGE",
+          );
+          this.emitUnwind();
+          this.close();
+          code.localGet(LEN);
+          code.i32Const(0);
+          code.i32LtS();
+          this.openIf();
+          this.emitSetCellError(
+            code,
+            "%RangeError",
+            "RangeError",
+            (c) => {
+              this.pushStrLitInto(c, 'The value of "length" is out of range. It must be >= 0. Received ');
+              c.localGet(LEN);
+              c.f64ConvertI32S();
+              c.call(this.f64ToStrHelper());
+              c.call(this.concatHelper());
+            },
+            "ERR_OUT_OF_RANGE",
+          );
+          this.emitUnwind();
+          this.close();
+          const BUFLEN = this.acquireScratch(I32);
+          code.localGet(BUF);
+          code.call(this.bytesB.length());
+          code.i32TruncF64U();
+          code.localSet(BUFLEN);
+          code.localGet(LEN);
+          code.localGet(BUFLEN);
+          code.localGet(OFFSET);
+          code.i32Sub();
+          code.i32GtS();
+          this.openIf();
+          this.emitSetCellError(
+            code,
+            "%RangeError",
+            "RangeError",
+            (c) => {
+              this.pushStrLitInto(c, 'The value of "length" is out of range. It must be <= ');
+              c.localGet(BUFLEN);
+              c.localGet(OFFSET);
+              c.i32Sub();
+              c.f64ConvertI32S();
+              c.call(this.f64ToStrHelper());
+              c.call(this.concatHelper());
+              this.pushStrLitInto(c, ". Received ");
+              c.call(this.concatHelper());
+              c.localGet(LEN);
+              c.f64ConvertI32S();
+              c.call(this.f64ToStrHelper());
+              c.call(this.concatHelper());
+            },
+            "ERR_OUT_OF_RANGE",
+          );
+          this.emitUnwind();
+          this.close();
+          this.releaseScratch(I32, BUFLEN);
+          code.localGet(FD);
+          code.localGet(LEN);
+          code.call(this.fs.readSyncHelper());
+          this.emitPendingCheck();
+          const COUNT = this.acquireScratch(I32);
+          code.i32TruncF64S();
+          code.localSet(COUNT);
+          // Copy COUNT bytes from stageCursor() into BUF at OFFSET.
+          const I_ = this.acquireScratch(I32);
+          code.i32Const(0);
+          code.localSet(I_);
+          code.block();
+          code.loop();
+          code.localGet(I_);
+          code.localGet(COUNT);
+          code.i32GeS();
+          code.brIf(1);
+          code.localGet(BUF);
+          code.localGet(OFFSET);
+          code.localGet(I_);
+          code.i32Add();
+          code.f64ConvertI32S();
+          code.globalGet(this.cursorGlobal);
+          code.localGet(I_);
+          code.i32Add();
+          // i32.load8_u — a single RAW BYTE, never i32Load16U's 16-bit
+          // read (INC-26 P5 3C-1, brief-p5-delta-3c.txt 0c29d591: `Code`'s
+          // own named method, code.ts's PERMIT-HUNK — never a hand-
+          // encoded opcode through `Code.w`).
+          code.i32Load8U();
+          code.f64ConvertI32S();
+          code.call(this.bytesB.setElem("u8"));
+          code.localGet(I_);
+          code.i32Const(1);
+          code.i32Add();
+          code.localSet(I_);
+          code.br(0);
+          code.end();
+          code.end();
+          code.localGet(COUNT);
+          code.f64ConvertI32S();
+          this.releaseScratch(I32, I_);
+          this.releaseScratch(I32, COUNT);
+          this.releaseScratch(I32, LEN);
+          this.releaseScratch(I32, OFFSET);
+          this.releaseScratch(I32, FD);
+          this.releaseScratch(this.bytesB.bytesRef(), BUF);
+          return;
+        }
+        if (e.fn === "fs.readFdSync") {
+          const FD = this.acquireScratch(I32);
+          this.walkExpr(e.args[0]!);
+          code.call(this.toInt32Helper());
+          code.localSet(FD);
+          this.walkExpr(e.args[1]!); // enc — JS-exact side-effect order only
+          code.drop();
+          code.localGet(FD);
+          code.call(this.fs.readFdSyncHelper());
+          this.emitPendingCheck();
+          this.releaseScratch(I32, FD);
+          return;
+        }
+        if (e.fn === "fs.readFdSyncBytes") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.toInt32Helper());
+          code.call(this.fs.readFdSyncBytesHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.readFileSyncBytes") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.fs.readFileSyncBytesHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.writeFileSyncBytes") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.fs.writeFileSyncBytesHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.readdirTypesSync") {
+          // INC-26 P5 3C-3 (brief-p5-delta-3c.txt 0c29d591): op 2's x=1
+          // form (D-6/D-8), raw JSON parsed HERE exactly like
+          // fs.readdirSync's own arm above — the ENTRY HELPER, named for
+          // the 3D report: `readdirTypesSyncRowsHelper`. Each JSON array
+          // element is an object carrying `%dtype`/`name` (the host's own
+          // per-entry pair); `parentPath` is NEVER read from JSON — this
+          // arm supplies it itself from the SAME already-known `path`
+          // argument for every row, mirroring the LLVM lane's own
+          // construction exactly (`retainValue(path.name, STRING)` there
+          // — the vendored reference for field order: %dtype, name,
+          // parentPath, validate.ts:3907-3924's own canonical order).
+          if (e.type.kind !== "array" || e.type.elem.kind !== "record") {
+            throw new Error("wasm emitter bug: fs.readdirTypesSync result is not a record array");
+          }
+          const recT = e.type.elem;
+          const recInfo = this.recordInfo(recT.shapeId, e.loc, false);
+          if (recInfo === null) {
+            code.unreachable();
+            return;
+          }
+          const dtypeIdx = recInfo.fieldIndex.get("%dtype");
+          const nameIdx = recInfo.fieldIndex.get("name");
+          const parentPathIdx = recInfo.fieldIndex.get("parentPath");
+          if (dtypeIdx === undefined || nameIdx === undefined || parentPathIdx === undefined) {
+            throw new Error("wasm emitter bug: fs.readdirTypesSync record shape missing a canonical field");
+          }
+          const vecInfo = this.vecInfoFor(e.type, e.loc);
+          if (vecInfo === null) {
+            code.unreachable();
+            return;
+          }
+          const vecRefT = this.vecs.vecRef(vecInfo);
+          const PATH = this.acquireScratch(this.strRef);
+          this.walkExpr(e.args[0]!);
+          code.localSet(PATH);
+          code.localGet(PATH);
+          code.call(this.fs.readdirTypesSyncRawHelper());
+          this.emitPendingCheck();
+          const RAWJSON = this.acquireScratch(this.strRef);
+          code.localSet(RAWJSON);
+          code.localGet(RAWJSON);
+          code.call(this.json.parse());
+          this.emitPendingCheck();
+          const dynRefT = this.dyn.dynRef();
+          const ARR = this.acquireScratch(dynRefT);
+          code.localSet(ARR);
+          this.dyn.arrPayload(code, (c) => c.localGet(ARR));
+          const arrRefT = this.dyn.arrRef();
+          const DVEC = this.acquireScratch(arrRefT);
+          code.localSet(DVEC);
+          this.dyn.arrLen(code, (c) => c.localGet(DVEC));
+          const N = this.acquireScratch(I32);
+          code.localSet(N);
+          code.localGet(N);
+          code.f64ConvertI32S();
+          code.call(this.vecs.newLen(vecInfo));
+          const RESULTVEC = this.acquireScratch(vecRefT);
+          code.localSet(RESULTVEC);
+          const I_ = this.acquireScratch(I32);
+          code.i32Const(0);
+          code.localSet(I_);
+          code.block();
+          code.loop();
+          code.localGet(I_);
+          code.localGet(N);
+          code.i32GeU();
+          code.brIf(1);
+          // The element: a dyn OBJECT carrying "%dtype" (number) and
+          // "name" (string).
+          this.dyn.arrAt(
+            code,
+            (c) => c.localGet(DVEC),
+            (c) => c.localGet(I_),
+          );
+          const ELEMDYN = this.acquireScratch(dynRefT);
+          code.localSet(ELEMDYN);
+          const objRefT = this.dyn.objRef();
+          const OBJ = this.acquireScratch(objRefT);
+          this.dyn.objPayload(code, (c) => c.localGet(ELEMDYN));
+          code.localSet(OBJ);
+          const recRef: ValType = { kind: "ref", nullable: true, typeIndex: recInfo.struct };
+          const ROW = this.acquireScratch(recRef);
+          code.structNewDefault(recInfo.struct);
+          code.localSet(ROW);
+          // %dtype: objGet -> dynRef, structGet(DYN_NUM) -> f64.
+          code.localGet(ROW);
+          code.localGet(OBJ);
+          this.pushStrLit("%dtype");
+          code.call(this.dyn.objGet());
+          code.structGet(this.dyn.dynT(), DYN_NUM);
+          code.structSet(recInfo.struct, dtypeIdx);
+          // name: objGet -> dynRef, structGet(DYN_REF) + refCast(strType).
+          code.localGet(ROW);
+          code.localGet(OBJ);
+          this.pushStrLit("name");
+          code.call(this.dyn.objGet());
+          code.structGet(this.dyn.dynT(), DYN_REF);
+          code.refCast(this.strType);
+          code.structSet(recInfo.struct, nameIdx);
+          // parentPath: the CALL's own path argument, every row (never
+          // read from JSON — the LLVM lane's own precedent).
+          code.localGet(ROW);
+          code.localGet(PATH);
+          code.structSet(recInfo.struct, parentPathIdx);
+          code.localGet(RESULTVEC);
+          code.localGet(I_);
+          code.f64ConvertI32S();
+          code.localGet(ROW);
+          code.call(this.vecs.set(vecInfo));
+          this.releaseScratch(recRef, ROW);
+          this.releaseScratch(objRefT, OBJ);
+          this.releaseScratch(dynRefT, ELEMDYN);
+          code.localGet(I_);
+          code.i32Const(1);
+          code.i32Add();
+          code.localSet(I_);
+          code.br(0);
+          code.end();
+          code.end();
+          code.localGet(RESULTVEC);
+          this.releaseScratch(I32, I_);
+          this.releaseScratch(vecRefT, RESULTVEC);
+          this.releaseScratch(I32, N);
+          this.releaseScratch(arrRefT, DVEC);
+          this.releaseScratch(dynRefT, ARR);
+          this.releaseScratch(this.strRef, RAWJSON);
+          this.releaseScratch(this.strRef, PATH);
+          return;
+        }
+        // ── end INC-26 P5 (fs tail) ──────────────────────────────────────
+        // ── INC-26 P5 — os tail (6 hostStr + 1 hostNum keys) ─────────────
+        if (e.fn === "os.type" || e.fn === "os.release" || e.fn === "os.userName" || e.fn === "os.userHomedir" || e.fn === "os.userShell") {
+          const kind =
+            e.fn === "os.type" ? HOST_STR_KIND_OS_TYPE
+            : e.fn === "os.release" ? HOST_STR_KIND_OS_RELEASE
+            : e.fn === "os.userName" ? HOST_STR_KIND_OS_USERINFO_USERNAME
+            : e.fn === "os.userHomedir" ? HOST_STR_KIND_OS_USERINFO_HOMEDIR
+            : HOST_STR_KIND_OS_USERINFO_SHELL;
+          code.i32Const(kind);
+          code.i32Const(0); // index ignored for these kinds
+          code.call(this.proc.readHostStr());
+          return;
+        }
+        if (e.fn === "os.totalmem") {
+          code.i32Const(HOST_NUM_KIND_OS_TOTALMEM);
+          code.i32Const(0); // arg ignored for this kind
+          code.call(this.hostNumFuncOrThrow());
+          return;
+        }
+        if (e.fn === "os.networkInterfaces") {
+          // INC-26 P5 3C-3 (brief-p5-delta-3c.txt 0c29d591, POST-ACK #5):
+          // the entry point is this inline dispatch arm — no separate
+          // helper, matching readdirTypesSync's own precedent. Walks the
+          // CALL's own result type exactly as ir/validate.ts:3928-3941
+          // checks it (never validate.ts's own maps — the union ids live
+          // ON the IR types themselves, ir/nodes.ts:273): e.type (a pure
+          // index-signature record, 0 declared fields) -> indexValue is
+          // {kind:"union", unionId:U1} (`Info[] | undefined`) -> U1's
+          // array arm's elem is {kind:"union", unionId:U2} (the two Info
+          // record arms) -> each arm's OWN "scopeid" field distinguishes
+          // IPv6 (f64 directly) from IPv4 (a THIRD union, U3, whose
+          // undefinedT arm is what M-14 wants: the tier's OWN "omitted
+          // optional field" representation — the SAME unit singleton
+          // `unionWrap` uses for a unit-typed value, `this.unions.
+          // unitGlobal(tag)`, never a materialized runtime undefined).
+          // Field order (address, netmask, family, mac, internal, cidr,
+          // [scopeid]) and the whole tag-by-scopeid-shape discriminator
+          // are the LLVM lane's own vendored reference (emitter.ts
+          // ~10638-10829), read for structure only — no C, no manual
+          // retain/release (this tier's GC needs none).
+          if (e.type.kind !== "record") throw new Error("wasm emitter bug: os.networkInterfaces result is not a record");
+          const dictShape = this.recordShapes.get(e.type.shapeId);
+          if (dictShape === undefined || dictShape.indexValue === undefined) {
+            throw new Error("wasm emitter bug: os.networkInterfaces dict shape missing indexValue");
+          }
+          const ivType = dictShape.indexValue;
+          if (ivType.kind !== "union") throw new Error("wasm emitter bug: os.networkInterfaces indexValue is not a union");
+          const u1Def = this.unionDef(ivType.unionId);
+          const arrTag = u1Def.arms.findIndex((a) => a.kind === "array");
+          const arrArm = u1Def.arms[arrTag];
+          if (arrTag < 0 || arrArm === undefined || arrArm.kind !== "array" || arrArm.elem.kind !== "union") {
+            throw new Error("wasm emitter bug: os.networkInterfaces bucket union shape");
+          }
+          const infoUnionId = arrArm.elem.unionId;
+          const u2Def = this.unionDef(infoUnionId);
+          if (u2Def.arms.length !== 2) throw new Error("wasm emitter bug: os.networkInterfaces Info union arity");
+          let ipv6Tag = -1;
+          let ipv4Tag = -1;
+          for (let i = 0; i < u2Def.arms.length; i++) {
+            const arm = u2Def.arms[i]!;
+            if (arm.kind !== "record") throw new Error("wasm emitter bug: os.networkInterfaces Info arm not a record");
+            const armShape = this.recordShapes.get(arm.shapeId);
+            const scopeidType = armShape?.fields.find((f) => f.name === "scopeid")?.type;
+            if (scopeidType?.kind === "f64") ipv6Tag = i;
+            else if (scopeidType?.kind === "union") ipv4Tag = i;
+          }
+          if (ipv6Tag < 0 || ipv4Tag < 0) throw new Error("wasm emitter bug: os.networkInterfaces Info arms not distinguishable by scopeid");
+          const ipv6Arm = u2Def.arms[ipv6Tag]!;
+          const ipv4Arm = u2Def.arms[ipv4Tag]!;
+          if (ipv6Arm.kind !== "record" || ipv4Arm.kind !== "record") throw new Error("wasm emitter bug: os.networkInterfaces Info arms");
+          const ipv6Info = this.recordInfo(ipv6Arm.shapeId, e.loc, false);
+          const ipv4Info = this.recordInfo(ipv4Arm.shapeId, e.loc, false);
+          if (ipv6Info === null || ipv4Info === null) {
+            code.unreachable();
+            return;
+          }
+          const ipv4Shape = this.recordShapes.get(ipv4Arm.shapeId)!;
+          const ipv4ScopeidType = ipv4Shape.fields.find((f) => f.name === "scopeid")!.type;
+          if (ipv4ScopeidType.kind !== "union") throw new Error("wasm emitter bug: os.networkInterfaces IPv4 scopeid type");
+          const u3Def = this.unionDef(ipv4ScopeidType.unionId);
+          const undefTag3 = u3Def.arms.findIndex((a) => a.kind === "undefinedT");
+          if (undefTag3 < 0) throw new Error("wasm emitter bug: os.networkInterfaces IPv4 scopeid union has no undefined arm");
+          const cidrType6 = this.recordShapes.get(ipv6Arm.shapeId)!.fields.find((f) => f.name === "cidr")?.type;
+          const cidrType4 = ipv4Shape.fields.find((f) => f.name === "cidr")?.type;
+          if (cidrType6?.kind !== "union" || cidrType4?.kind !== "union" || cidrType6.unionId !== cidrType4.unionId) {
+            throw new Error("wasm emitter bug: os.networkInterfaces cidr union shape");
+          }
+          const cidrDef = this.unionDef(cidrType6.unionId);
+          const cidrStrTag = cidrDef.arms.findIndex((a) => a.kind === "string");
+          const cidrNullTag = cidrDef.arms.findIndex((a) => a.kind === "nullT");
+          if (cidrStrTag < 0 || cidrNullTag < 0) throw new Error("wasm emitter bug: os.networkInterfaces cidr union arms");
+
+          const dictInfo = this.recordInfo(e.type.shapeId, e.loc, false);
+          if (dictInfo === null || dictInfo.overflow === null) {
+            code.unreachable();
+            return;
+          }
+          const vecInfo = this.vecInfoFor(arrArm as IrType & { kind: "array" }, e.loc);
+          if (vecInfo === null) {
+            code.unreachable();
+            return;
+          }
+          const vecRefT = this.vecs.vecRef(vecInfo);
+          const u1ArrStruct = this.unionArmStruct(ivType.unionId, arrTag, e.loc);
+          const u2Ipv6Struct = this.unionArmStruct(infoUnionId, ipv6Tag, e.loc);
+          const u2Ipv4Struct = this.unionArmStruct(infoUnionId, ipv4Tag, e.loc);
+          const cidrStrStruct = this.unionArmStruct(cidrType6.unionId, cidrStrTag, e.loc);
+          if (u1ArrStruct === null || u2Ipv6Struct === null || u2Ipv4Struct === null || cidrStrStruct === null) {
+            code.unreachable();
+            return;
+          }
+          const cidrNullGlobal = this.unions.unitGlobal(cidrNullTag);
+          const scopeidUndefGlobal = this.unions.unitGlobal(undefTag3);
+
+          code.i32Const(HOST_STR_KIND_OS_NETWORK_INTERFACES_JSON);
+          code.i32Const(0);
+          code.call(this.proc.readHostStr());
+          const RAWJSON = this.acquireScratch(this.strRef);
+          code.localSet(RAWJSON);
+          code.localGet(RAWJSON);
+          code.call(this.json.parse());
+          this.emitPendingCheck();
+          const dynRefT = this.dyn.dynRef();
+          const objRefT = this.dyn.objRef();
+          const arrRefT = this.dyn.arrRef();
+          const objT = this.dyn.objT();
+          const entryT = this.dyn.entryT();
+          const entriesArrT = this.dyn.entriesArrayType();
+          const entryRefT: ValType = { kind: "ref", nullable: true, typeIndex: entryT };
+          const TOPDYN = this.acquireScratch(dynRefT);
+          code.localSet(TOPDYN);
+          const TOPOBJ = this.acquireScratch(objRefT);
+          this.dyn.objPayload(code, (c) => c.localGet(TOPDYN));
+          code.localSet(TOPOBJ);
+
+          const dictRecRefT: ValType = { kind: "ref", nullable: true, typeIndex: dictInfo.struct };
+          const DICT = this.acquireScratch(dictRecRefT);
+          code.structNewDefault(dictInfo.struct);
+          code.localSet(DICT);
+          code.localGet(DICT);
+          code.call(this.maps.new_(dictInfo.overflow));
+          code.structSet(dictInfo.struct, 0); // 0 declared fields -> the overflow slot is field 0
+
+          // Reads ONE address-entry's own common fields (address, netmask,
+          // family, mac, internal, cidr) into a fresh record of `struct`,
+          // returning the record local — shared by both the IPv4 and
+          // IPv6 branches, which differ ONLY in the scopeid field.
+          const buildCommonFields = (struct: number, fieldIndex: Map<string, number>, addrObj: number): number => {
+            const recRefT: ValType = { kind: "ref", nullable: true, typeIndex: struct };
+            const REC = this.acquireScratch(recRefT);
+            code.structNewDefault(struct);
+            code.localSet(REC);
+            for (const name of ["address", "netmask", "family", "mac"]) {
+              const idx = fieldIndex.get(name)!;
+              code.localGet(REC);
+              code.localGet(addrObj);
+              this.pushStrLit(name);
+              code.call(this.dyn.objGet());
+              code.structGet(this.dyn.dynT(), DYN_REF);
+              code.refCast(this.strType);
+              code.structSet(struct, idx);
+            }
+            const internalIdx = fieldIndex.get("internal")!;
+            // dyn's own bool representation: {kind:DK.BOOL, num:0|1} —
+            // the SAME "read DYN_NUM, compare to 0" pattern
+            // emitSettledPayload's own bool fast path uses.
+            code.localGet(REC);
+            code.localGet(addrObj);
+            this.pushStrLit("internal");
+            code.call(this.dyn.objGet());
+            code.structGet(this.dyn.dynT(), DYN_NUM);
+            code.f64Const(0);
+            code.f64Ne();
+            code.structSet(struct, internalIdx);
+            // cidr: string | null — the dyn KIND decides the arm (JSON
+            // `null` parses to DK.NULL; a real cidr string to DK.STR).
+            const cidrIdx = fieldIndex.get("cidr")!;
+            const CIDRDYN = this.acquireScratch(dynRefT);
+            code.localGet(addrObj);
+            this.pushStrLit("cidr");
+            code.call(this.dyn.objGet());
+            code.localSet(CIDRDYN);
+            code.localGet(REC);
+            code.localGet(CIDRDYN);
+            code.structGet(this.dyn.dynT(), DYN_KIND);
+            code.i32Const(DK.NULL);
+            code.i32Eq();
+            code.ifResult({ kind: "ref", nullable: true, typeIndex: this.unions.base() });
+            code.globalGet(cidrNullGlobal);
+            code.else_();
+            code.i32Const(cidrStrTag);
+            code.localGet(CIDRDYN);
+            code.structGet(this.dyn.dynT(), DYN_REF);
+            code.refCast(this.strType);
+            code.structNew(cidrStrStruct);
+            code.end();
+            code.structSet(struct, cidrIdx);
+            this.releaseScratch(dynRefT, CIDRDYN);
+            return REC;
+          };
+
+          const N1 = this.acquireScratch(I32);
+          code.localGet(TOPOBJ);
+          code.structGet(objT, OBJ_LEN);
+          code.localSet(N1);
+          const I1 = this.acquireScratch(I32);
+          code.i32Const(0);
+          code.localSet(I1);
+          code.block();
+          code.loop();
+          code.localGet(I1);
+          code.localGet(N1);
+          code.i32GeU();
+          code.brIf(1);
+          const ENTRY = this.acquireScratch(entryRefT);
+          code.localGet(TOPOBJ);
+          code.structGet(objT, OBJ_ENTRIES);
+          code.localGet(I1);
+          code.arrayGet(entriesArrT);
+          code.localSet(ENTRY);
+          const IFNAME = this.acquireScratch(this.strRef);
+          code.localGet(ENTRY);
+          code.structGet(entryT, ENTRY_KEY);
+          code.localSet(IFNAME);
+          const ENTRIESDYN = this.acquireScratch(dynRefT);
+          code.localGet(ENTRY);
+          code.structGet(entryT, ENTRY_VALUE);
+          code.localSet(ENTRIESDYN);
+          this.releaseScratch(entryRefT, ENTRY);
+
+          const ADDRARR = this.acquireScratch(arrRefT);
+          this.dyn.arrPayload(code, (c) => c.localGet(ENTRIESDYN));
+          code.localSet(ADDRARR);
+          this.releaseScratch(dynRefT, ENTRIESDYN);
+          const N2 = this.acquireScratch(I32);
+          this.dyn.arrLen(code, (c) => c.localGet(ADDRARR));
+          code.localSet(N2);
+          code.localGet(N2);
+          code.f64ConvertI32S();
+          code.call(this.vecs.newLen(vecInfo));
+          const IFVEC = this.acquireScratch(vecRefT);
+          code.localSet(IFVEC);
+          const I2 = this.acquireScratch(I32);
+          code.i32Const(0);
+          code.localSet(I2);
+          code.block();
+          code.loop();
+          code.localGet(I2);
+          code.localGet(N2);
+          code.i32GeU();
+          code.brIf(1);
+          this.dyn.arrAt(
+            code,
+            (c) => c.localGet(ADDRARR),
+            (c) => c.localGet(I2),
+          );
+          const ADDRDYN = this.acquireScratch(dynRefT);
+          code.localSet(ADDRDYN);
+          const ADDROBJ = this.acquireScratch(objRefT);
+          this.dyn.objPayload(code, (c) => c.localGet(ADDRDYN));
+          code.localSet(ADDROBJ);
+          this.releaseScratch(dynRefT, ADDRDYN);
+          // M-14: presence of "scopeid" (never a fixed field list) picks
+          // the arm — IPv6 rows carry it, IPv4 rows never do (the host's
+          // own JSON.stringify already omits an undefined-valued key).
+          code.localGet(ADDROBJ);
+          this.pushStrLit("scopeid");
+          code.call(this.dyn.objGet());
+          const SCOPEIDDYN = this.acquireScratch(dynRefT);
+          code.localTee(SCOPEIDDYN);
+          code.refIsNull();
+          const infoUnionRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.unions.base() };
+          code.ifResult(infoUnionRefT);
+          // IPv4: no scopeid key -> the always-undefined arm.
+          {
+            const REC = buildCommonFields(ipv4Info.struct, ipv4Info.fieldIndex, ADDROBJ);
+            const scopeidIdx = ipv4Info.fieldIndex.get("scopeid")!;
+            // The union's own INTERNED unit instance IS the complete
+            // value — no wrapping structNew (unitGlobal already answers
+            // the {tag} struct itself, matching unionWrap's own unit-type
+            // arm exactly).
+            code.localGet(REC);
+            code.globalGet(scopeidUndefGlobal);
+            code.structSet(ipv4Info.struct, scopeidIdx);
+            code.i32Const(ipv4Tag);
+            code.localGet(REC);
+            code.structNew(u2Ipv4Struct);
+            this.releaseScratch({ kind: "ref", nullable: true, typeIndex: ipv4Info.struct }, REC);
+          }
+          code.else_();
+          // IPv6: scopeid is a real number.
+          {
+            const REC = buildCommonFields(ipv6Info.struct, ipv6Info.fieldIndex, ADDROBJ);
+            const scopeidIdx = ipv6Info.fieldIndex.get("scopeid")!;
+            code.localGet(REC);
+            code.localGet(SCOPEIDDYN);
+            code.structGet(this.dyn.dynT(), DYN_NUM);
+            code.structSet(ipv6Info.struct, scopeidIdx);
+            code.i32Const(ipv6Tag);
+            code.localGet(REC);
+            code.structNew(u2Ipv6Struct);
+            this.releaseScratch({ kind: "ref", nullable: true, typeIndex: ipv6Info.struct }, REC);
+          }
+          code.end();
+          this.releaseScratch(dynRefT, SCOPEIDDYN);
+          this.releaseScratch(objRefT, ADDROBJ);
+          const ROWU = this.acquireScratch(infoUnionRefT);
+          code.localSet(ROWU);
+          code.localGet(IFVEC);
+          code.localGet(I2);
+          code.f64ConvertI32S();
+          code.localGet(ROWU);
+          code.call(this.vecs.set(vecInfo));
+          this.releaseScratch(infoUnionRefT, ROWU);
+          code.localGet(I2);
+          code.i32Const(1);
+          code.i32Add();
+          code.localSet(I2);
+          code.br(0);
+          code.end();
+          code.end();
+          this.releaseScratch(I32, I2);
+          this.releaseScratch(arrRefT, ADDRARR);
+
+          // Wrap this interface's own vec into the U1 array arm, insert
+          // into the dict's overflow map under its own name.
+          code.localGet(DICT);
+          code.structGet(dictInfo.struct, 0);
+          code.localGet(IFNAME);
+          code.i32Const(arrTag);
+          code.localGet(IFVEC);
+          code.structNew(u1ArrStruct);
+          code.call(this.maps.set(dictInfo.overflow));
+          this.releaseScratch(vecRefT, IFVEC);
+          this.releaseScratch(I32, N2);
+          this.releaseScratch(this.strRef, IFNAME);
+
+          code.localGet(I1);
+          code.i32Const(1);
+          code.i32Add();
+          code.localSet(I1);
+          code.br(0);
+          code.end();
+          code.end();
+          this.releaseScratch(I32, I1);
+          this.releaseScratch(I32, N1);
+          this.releaseScratch(objRefT, TOPOBJ);
+          this.releaseScratch(dynRefT, TOPDYN);
+          this.releaseScratch(this.strRef, RAWJSON);
+          code.localGet(DICT);
+          this.releaseScratch(dictRecRefT, DICT);
+          return;
+        }
+        // ── end INC-26 P5 (os tail) ───────────────────────────────────────
+        // ── INC-26 P5 — the fsp twins (design §6.5, S074: SYNCHRONOUS
+        // syscall + an already-settled promise, NO new async machinery) ──
+        if (e.fn === "fsp.readFile") {
+          this.emitFspSettled(code, this.strRef, () => {
+            this.walkExpr(e.args[0]!);
+            code.call(this.fs.readFileSyncHelper());
+          });
+          return;
+        }
+        if (e.fn === "fsp.readFileBytes") {
+          this.emitFspSettled(code, this.bytesB.bytesRef(), () => {
+            this.walkExpr(e.args[0]!);
+            code.call(this.fs.readFileSyncBytesHelper());
+          });
+          return;
+        }
+        if (e.fn === "fsp.writeFile") {
+          this.emitFspSettled(code, null, () => {
+            this.walkExpr(e.args[0]!);
+            this.walkExpr(e.args[1]!);
+            code.call(this.fs.writeFileSyncHelper());
+          });
+          return;
+        }
+        if (e.fn === "fsp.rm") {
+          this.emitFspSettled(code, null, () => {
+            this.walkExpr(e.args[0]!);
+            code.call(this.fs.rmSyncHelper());
+          });
+          return;
+        }
+        if (e.fn === "fsp.stat") {
+          this.emitFspSettled(code, this.fs.statsRef(), () => {
+            this.walkExpr(e.args[0]!);
+            code.call(this.fs.statSyncHelper());
+          });
+          return;
+        }
+        if (e.fn === "fsp.mkdir") {
+          this.emitFspSettled(code, null, () => {
+            this.walkExpr(e.args[0]!);
+            code.call(this.fs.mkdirSyncHelper());
+          });
+          return;
+        }
+        if (e.fn === "fsp.mkdirRecursiveMode") {
+          this.emitFspSettled(code, null, () => {
+            this.walkExpr(e.args[0]!);
+            this.walkExpr(e.args[1]!);
+            code.call(this.toInt32Helper());
+            code.call(this.fs.mkdirRecursiveModeSyncHelper());
+          });
+          return;
+        }
+        if (e.fn === "fsp.unlink") {
+          this.emitFspSettled(code, null, () => {
+            this.walkExpr(e.args[0]!);
+            code.call(this.fs.unlinkSyncHelper());
+          });
+          return;
+        }
+        if (e.fn === "fsp.chmod") {
+          this.emitFspSettled(code, null, () => {
+            this.walkExpr(e.args[0]!);
+            this.walkExpr(e.args[1]!);
+            code.call(this.toInt32Helper());
+            code.call(this.fs.chmodSyncHelper());
+          });
+          return;
+        }
+        if (e.fn === "fsp.readdir") {
+          // Mirrors fs.readdirSync's OWN JSON-parse walk exactly (A-9's
+          // rule: the parser is FORBID, used as-is) — but CANNOT reuse
+          // that arm's own `emitPendingCheck()` calls verbatim: those
+          // UNWIND the enclosing function, which is wrong for an fsp
+          // twin (a failure here is a REJECTION, settled by
+          // `emitFspSettled`'s own outer check, never a propagating
+          // throw). Instead: check the pending cell EXPLICITLY after the
+          // raw op, and skip `json.parse()` entirely on failure — calling
+          // it on the raw helper's own null PLACEHOLDER would trap (a
+          // null string ref), not fail gracefully.
+          const stringVecKey = arrayOf(STRING) as IrType & { kind: "array" };
+          const stringVecInfo = this.vecInfoFor(stringVecKey, undefined)!;
+          const stringVecRefT = this.vecs.vecRef(stringVecInfo);
+          this.emitFspSettled(code, stringVecRefT, () => {
+            this.walkExpr(e.args[0]!);
+            code.call(this.fs.readdirSyncRawHelper());
+            const RAWJSON = this.acquireScratch(this.strRef);
+            code.localSet(RAWJSON);
+            code.globalGet(this.exc().kindG);
+            code.ifResult(stringVecRefT);
+            code.refNull(stringVecInfo.struct); // pending already — unread placeholder, emitFspSettled's own outer check settles the rejection
+            code.else_();
+            code.localGet(RAWJSON);
+            code.call(this.json.parse());
+            // json.parse() failing here (malformed host JSON) is not
+            // reachable in practice (the host only ever returns valid
+            // JSON on a successful raw read) but is still SAFE if it
+            // somehow did: the vec-building code below runs on a
+            // placeholder dyn value, and emitFspSettled's own outer
+            // kindG check (now set BY json.parse()'s own failure) still
+            // wins, settling the rejection correctly regardless of what
+            // this branch computes.
+            const dynRefT = this.dyn.dynRef();
+            const ARR = this.acquireScratch(dynRefT);
+            code.localSet(ARR);
+            this.dyn.arrPayload(code, (c) => c.localGet(ARR));
+            const arrRefT = this.dyn.arrRef();
+            const DVEC = this.acquireScratch(arrRefT);
+            code.localSet(DVEC);
+            this.dyn.arrLen(code, (c) => c.localGet(DVEC));
+            const N = this.acquireScratch(I32);
+            code.localSet(N);
+            code.localGet(N);
+            code.f64ConvertI32S();
+            code.call(this.vecs.newLen(stringVecInfo));
+            const RESULTVEC = this.acquireScratch(stringVecRefT);
+            code.localSet(RESULTVEC);
+            const I_ = this.acquireScratch(I32);
+            code.i32Const(0);
+            code.localSet(I_);
+            code.block();
+            code.loop();
+            code.localGet(I_);
+            code.localGet(N);
+            code.i32GeU();
+            code.brIf(1);
+            this.dyn.arrAt(
+              code,
+              (c) => c.localGet(DVEC),
+              (c) => c.localGet(I_),
+            );
+            code.structGet(this.dyn.dynT(), DYN_REF);
+            code.refCast(this.strType);
+            const ELEM = this.acquireScratch(this.strRef);
+            code.localSet(ELEM);
+            code.localGet(RESULTVEC);
+            code.localGet(I_);
+            code.f64ConvertI32S();
+            code.localGet(ELEM);
+            code.call(this.vecs.set(stringVecInfo));
+            this.releaseScratch(this.strRef, ELEM);
+            code.localGet(I_);
+            code.i32Const(1);
+            code.i32Add();
+            code.localSet(I_);
+            code.br(0);
+            code.end();
+            code.end();
+            code.localGet(RESULTVEC);
+            this.releaseScratch(I32, I_);
+            this.releaseScratch(stringVecRefT, RESULTVEC);
+            this.releaseScratch(I32, N);
+            this.releaseScratch(arrRefT, DVEC);
+            this.releaseScratch(dynRefT, ARR);
+            code.end();
+            this.releaseScratch(this.strRef, RAWJSON);
+          });
+          return;
+        }
+        // ── end INC-26 P5 (fsp twins, all 10) ─────────────────────────────
         // ── end INC-26 P4 ──────────────────────────────────────────────
         if (e.fn === "process.onSignal" || e.fn === "process.offSignal") {
           // D5/A-9: registration is easy; DELIVERY needs a host signal
@@ -30338,6 +31440,63 @@ class Assembler {
     code.globalSet(exc.kindG);
     this.emitUnwind();
     this.close();
+  }
+
+  /** INC-26 P5 (design §6.5, S074 — "no new async machinery"): wraps a
+   * SYNC fs.ts helper call into an ALREADY-SETTLED promise, the fsp
+   * twins' own mechanism. `pushSyncResult` performs the sync operation
+   * (the SAME wrapper the sync key itself calls) — it does NOT call
+   * `emitPendingCheck()` (that would UNWIND the caller, wrong here: an
+   * fsp twin's own failure is a REJECTION, never a propagating throw).
+   * `resultType` is the success payload's ValType, or null for a VOID
+   * result. MIRRORS `emitRejectCheckOn`'s own four-field restore, in
+   * reverse: a rejection settles straight from the pending cell's OWN
+   * f64G/refG/preG/kindG (never hand-built), then the cell is cleared —
+   * S074's own "a pending exception carried out of the active cell as
+   * the rejection." The fulfilled path's OWN kind tag is never consulted
+   * by any reader for a ref/void payload (`emitSettledPayload`'s general
+   * arm reads PROM_REF unconditionally, ignoring PROM_KIND) — EXC_OBJ is
+   * pushed there as a harmless, unread placeholder, not a claim about
+   * the value's real shape. */
+  private emitFspSettled(code: Code, resultType: ValType | null, pushSyncResult: () => void): void {
+    const exc = this.exc();
+    const P = this.acquireScratch(this.proms.promRef());
+    code.call(this.proms.mint());
+    code.localSet(P);
+    let VAL: number | null = null;
+    if (resultType !== null) {
+      VAL = this.acquireScratch(resultType);
+      pushSyncResult();
+      code.localSet(VAL);
+    } else {
+      pushSyncResult();
+    }
+    code.globalGet(exc.kindG);
+    code.ifVoid();
+    // REJECTED: settle straight from the cell's own four fields, then
+    // clear it — never re-propagated as a plain throw.
+    code.localGet(P);
+    code.globalGet(exc.kindG);
+    code.globalGet(exc.f64G);
+    code.globalGet(exc.refG);
+    code.globalGet(exc.preG);
+    code.i32Const(2); // state: rejected
+    code.call(this.proms.settle());
+    this.emitCellClearInto(code);
+    code.else_();
+    // FULFILLED.
+    code.localGet(P);
+    code.i32Const(EXC_OBJ); // kind: unread placeholder for a ref/void payload
+    code.f64Const(0);
+    if (VAL !== null) code.localGet(VAL);
+    else code.refNull(ANY_HEAP);
+    code.i32Const(0); // pre: unused outside EXC_OBJ instanceof tests
+    code.i32Const(1); // state: fulfilled
+    code.call(this.proms.settle());
+    code.end();
+    code.localGet(P);
+    if (VAL !== null) this.releaseScratch(resultType!, VAL);
+    this.releaseScratch(this.proms.promRef(), P);
   }
 
   /** A settled promise's payload, read back by a STATIC type — the

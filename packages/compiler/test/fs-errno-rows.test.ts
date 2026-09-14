@@ -45,9 +45,21 @@ interface FsErrnoRow {
   className: string | null;
 }
 
+interface FsRejectionRow {
+  op: number;
+  syncKey: string;
+  fspKey: string;
+  code: string;
+  className: string;
+  matchesSync: boolean;
+  rejectionMessage: string;
+  syncMessage: string;
+}
+
 interface FsErrnoRowsFile {
   header: { generator: string; nodeVersion: string; platform: string; uidClass: "root" | "non-root" };
   rows: FsErrnoRow[];
+  rejectionRows: FsRejectionRow[];
   mkdirRecursiveReturn: { firstCreated: string; secondCreated: string | null };
 }
 
@@ -89,6 +101,53 @@ describe("fs-errno-rows: the generator matches the committed file", () => {
       const freshRow = freshByKey.get(k)!;
       expect(freshRow, `row ${k}`).toEqual(committedRow);
     }
+  });
+
+  // INC-26 P5 (rev-26's 3B read, findings-rev26-3b-p5.txt bdbc0b6d/256, B-2
+  // BLOCKING): the fsp REJECTION AXIS — v3 §3B/ruling A-6's "every row
+  // asserted twice." A SEPARATE class from `rows` above (rejection rows
+  // carry no `syscall`/`shape`, only an identity check against their own
+  // sync sibling's message, computed BY THE GENERATOR ITSELF at
+  // generation time — this test re-derives the class fresh and diffs it
+  // exactly like the sync rows, PLUS asserts every entry's own
+  // `matchesSync` is true, so a generator that silently recorded a
+  // mismatch cannot hide behind a passing diff).
+  test("the fsp REJECTION AXIS reproduces byte-for-byte and every rejection matches its sync sibling (B-2)", () => {
+    const keyOf = (r: FsRejectionRow): string => `${r.op}:${r.fspKey}:${r.code}`;
+    const committedByKey = new Map(committed.rejectionRows.map((r) => [keyOf(r), r]));
+    const freshByKey = new Map(fresh.rejectionRows.map((r) => [keyOf(r), r]));
+
+    const missingFromFresh = [...committedByKey.keys()].filter((k) => !freshByKey.has(k));
+    const newInFresh = [...freshByKey.keys()].filter((k) => !committedByKey.has(k));
+    expect({ missingFromFresh, newInFresh }).toEqual({ missingFromFresh: [], newInFresh: [] });
+
+    for (const [k, committedRow] of committedByKey) {
+      const freshRow = freshByKey.get(k)!;
+      expect(freshRow, `rejection row ${k}`).toEqual(committedRow);
+    }
+
+    for (const row of committed.rejectionRows) {
+      expect(row.matchesSync, `${row.fspKey} (op ${row.op}, ${row.code}) rejection "${row.rejectionMessage}" != sync "${row.syncMessage}"`).toBe(true);
+    }
+  });
+
+  test("the rejection axis covers exactly the ten twinned sync-key groups, 26 rows (R-5: readFileSyncBytes counted once B-1 registered it)", () => {
+    const EXPECTED_COUNTS: Record<string, number> = {
+      "fsp.readFile": 6,
+      "fsp.readFileBytes": 6,
+      "fsp.writeFile": 2,
+      "fsp.rm": 2,
+      "fsp.stat": 1,
+      "fsp.mkdir": 3,
+      "fsp.mkdirRecursiveMode": 1,
+      "fsp.readdir": 2,
+      "fsp.unlink": 2,
+      "fsp.chmod": 1,
+    };
+    expect(committed.rejectionRows.length).toBe(26);
+    const counts: Record<string, number> = {};
+    for (const row of committed.rejectionRows) counts[row.fspKey] = (counts[row.fspKey] ?? 0) + 1;
+    expect(counts).toEqual(EXPECTED_COUNTS);
   });
 
   test("mkdirSync recursive's fenced return value reproduces (K-3/S073's second sentence)", () => {
@@ -143,21 +202,27 @@ describe("fs-errno-rows: the generator matches the committed file", () => {
 describe("fs.ts's OWN table (OP_TABLE/CODES) cross-checked against the committed rows (rev-26's 3B read P-3)", () => {
   const committed = JSON.parse(readFileSync(COMMITTED_PATH, "utf8")) as FsErrnoRowsFile;
 
-  // Six of the fourteen ordinary codes are NOT reachable from ordinary P4-
-  // key inputs (N-2's own "D10 inversion" record) — the generator, which
-  // only drives REAL fs operations, cannot manufacture EPERM/EBADF/
-  // EMFILE/ENOSPC/EINVAL/EROFS without root, a depleted fd table, or a
-  // read-only filesystem; those six get FORCED rows in 3H's own file
-  // instead, which is the correct instrument for a code no ordinary input
-  // reaches (design's own inversion of the D10 argument). ELOOP and
-  // ENAMETOOLONG, conversely, ARE reachable (this generator constructs
-  // both, via a symlink loop and an overlong path) and — per delta-3e
-  // (e4da1096) R-1, ERRATUM E-P4-3 — are NOW among fs.ts's own named
-  // codes (13/14, appended): they render Node's own exact wording, never
-  // fall to the UNKNOWN arm on ordinary readFileSync inputs. They are
-  // therefore NOT listed here — they belong in the ORDINARY reachable
-  // set the test below checks, like any other code the generator hits.
-  const CODES_NOT_REACHED_BY_GENERATOR: ReadonlySet<string> = new Set(["EPERM", "EBADF", "EMFILE", "ENOSPC", "EINVAL", "EROFS"]);
+  // Through P4, six of the fourteen ordinary codes were NOT reachable from
+  // ordinary key inputs (N-2's own "D10 inversion" record) — the
+  // generator, which only drives REAL fs operations, could not manufacture
+  // EPERM/EBADF/EMFILE/ENOSPC/EINVAL/EROFS without root, a depleted fd
+  // table, or a read-only filesystem. INC-26 P5 (CP1 delta 29286fa4)
+  // REMOVES EBADF from this set: the fd-shaped ops (readSync/closeSync/
+  // fstatFd/readFdInto/readFdSync) reach it via an ordinary bad-fd
+  // argument (999999) with no root/fd-table/filesystem trick needed — the
+  // generator now constructs it directly (gen-fs-errno-rows.mjs's own op
+  // 5/6/18/22/23 sections). The remaining five stay unreachable and still
+  // get FORCED rows in the forced-host file instead, the correct
+  // instrument for a code no ordinary input reaches (design's own
+  // inversion of the D10 argument). ELOOP and ENAMETOOLONG, similarly, ARE
+  // reachable (this generator constructs both, via a symlink loop and an
+  // overlong path) and — per delta-3e (e4da1096) R-1, ERRATUM E-P4-3 —
+  // are NOW among fs.ts's own named codes (13/14, appended): they render
+  // Node's own exact wording, never fall to the UNKNOWN arm on ordinary
+  // readFileSync inputs. They are therefore NOT listed here — they belong
+  // in the ORDINARY reachable set the test below checks, like any other
+  // code the generator hits.
+  const CODES_NOT_REACHED_BY_GENERATOR: ReadonlySet<string> = new Set(["EPERM", "EMFILE", "ENOSPC", "EINVAL", "EROFS"]);
 
   test("every ORDINARY-INPUT-REACHABLE code in fs.ts's table matches a row's own code exactly (no transposition, no typo)", () => {
     const rowCodes = new Set(committed.rows.map((r) => r.code).filter((c) => c !== "ERR_FS_EISDIR"));
@@ -185,15 +250,15 @@ describe("fs.ts's OWN table (OP_TABLE/CODES) cross-checked against the committed
     }
   });
 
-  test("every OP_TABLE entry's (syscall, shape) matches the committed rows for every code that row reaches, INCLUDING the op-1 EISDIR override", () => {
+  test("every OP_TABLE entry's (syscall, shape) matches the committed rows for every code that row reaches, INCLUDING op 1's EISDIR override and op 4's ELOOP override (INC-26 P5, CP1 delta 29286fa4 B-4: eisdirOverride GENERALIZED to codeOverrides, keyed by code NAME)", () => {
     for (const entry of OP_TABLE) {
       const rowsForOp = committed.rows.filter((r) => r.op === entry.op && r.shape !== "special-systemerror");
       expect(rowsForOp.length, `op ${entry.op} (${entry.keys.join("/")}) has no committed rows to check against`).toBeGreaterThan(0);
       for (const row of rowsForOp) {
-        const isEisdirOverride = entry.eisdirOverride !== null && row.code === "EISDIR";
-        const expectedSyscall = isEisdirOverride ? entry.eisdirOverride!.syscall : entry.syscall;
-        const expectedShape = isEisdirOverride ? entry.eisdirOverride!.shape : entry.shape;
-        const rowShape = row.shape === "no-path" ? "no" : row.shape === "one-path" ? "one" : row.shape;
+        const override = entry.codeOverrides[row.code];
+        const expectedSyscall = override?.syscall ?? entry.syscall;
+        const expectedShape = override?.shape ?? entry.shape;
+        const rowShape = row.shape === "no-path" ? "no" : row.shape === "one-path" ? "one" : row.shape === "two-path" ? "two" : row.shape;
         expect(row.syscall, `op ${entry.op} code ${row.code}: syscall`).toBe(expectedSyscall);
         expect(rowShape, `op ${entry.op} code ${row.code}: shape`).toBe(expectedShape);
       }
@@ -202,10 +267,71 @@ describe("fs.ts's OWN table (OP_TABLE/CODES) cross-checked against the committed
 
   test("op 14's rm-on-directory SPECIAL CASE is NOT part of OP_TABLE's ordinary (syscall,shape) — it is checked separately, by design", () => {
     const op14 = OP_TABLE.find((e) => e.op === 14)!;
-    expect(op14.eisdirOverride).toBeNull();
+    expect(op14.codeOverrides).toEqual({});
     // The special row exists in the committed rows but under its OWN
     // shape tag, excluded from the loop above by construction.
     const special = committed.rows.find((r) => r.op === 14 && r.shape === "special-systemerror");
     expect(special).toBeDefined();
+  });
+
+  test("op 4 (realpathSync) carries the per-CODE syscall override (B-4/M-21): `stat` under ELOOP, `lstat` everywhere else — the ONLY op whose ELOOP syscall differs from its own default literal", () => {
+    const op4 = OP_TABLE.find((e) => e.op === 4)!;
+    expect(op4.syscall).toBe("lstat");
+    expect(op4.codeOverrides["ELOOP"]).toEqual({ syscall: "stat" });
+    for (const entry of OP_TABLE) {
+      if (entry.op === 4) continue;
+      expect(entry.codeOverrides["ELOOP"], `op ${entry.op} (${entry.keys.join("/")}) unexpectedly overrides ELOOP`).toBeUndefined();
+    }
+  });
+
+  // INC-26 P5 (rev-26's 3B read, findings-rev26-3b-p5.txt bdbc0b6d/256, B-1
+  // BLOCKING): five P5 keys were absent from every OP_TABLE `keys` array
+  // although `fsCallReachable` (emitter.ts) already carried all 18 —
+  // readFileSyncBytes (op 1), writeFileSyncBytes/writeFileModeSync (op 9),
+  // mkdirModeSync/mkdirRecursiveModeSync (op 11). THE INSTRUMENT: every
+  // P5 fs.* key the fs-tail owns must appear in EXACTLY ONE OP_TABLE
+  // entry — never absent (B-1's own defect), never duplicated (a key
+  // sharing two op rows would make the errno-row cross-check ambiguous
+  // about which op's syscall/shape governs it) — WITH TWO NAMED
+  // EXCEPTIONS this test itself caught while being written: existsSync
+  // (op 19, PROBE-SHAPED — A-9's own rule: it never throws, so it carries
+  // no OP_TABLE row and no committed error row at all) is exempted by
+  // absence; readFdSyncBytes is exempted to A COUNT OF TWO, not one — its
+  // own design (§6c/3C) is genuinely TWO-STAGE (op 22 fstatFd, op 23
+  // readFdInto, "reporting the FAILING stage's own literal"), so BOTH
+  // OP_TABLE rows are necessary for the cross-check to validate BOTH of
+  // its own committed errno rows (22:EBADF:fstat and 23:EBADF:read)
+  // correctly — collapsing to one row would make one of those two rows
+  // unreachable by the cross-check's own per-op loop.
+  test("every P5 fs-tail key appears in OP_TABLE the RIGHT number of times (B-1: absent = fail, duplicated = fail); existsSync exempted by absence (op 19, probe-shaped), readFdSyncBytes exempted to exactly TWO (its own genuine two-stage design, ops 22+23)", () => {
+    const P5_FS_TAIL_KEYS_ONCE = [
+      "openSync",
+      "closeSync",
+      "readSync",
+      "readFdSync",
+      "readFileSyncBytes",
+      "writeFileSyncBytes",
+      "readdirTypesSync",
+      "chmodSync",
+      "chownSync",
+      "copyFileSync",
+      "writeFileModeSync",
+      "mkdirModeSync",
+      "mkdirRecursiveModeSync",
+      "rmRetrySync",
+      "statSync",
+      "lstatSync",
+      "realpathSync",
+    ];
+    const keyCounts = new Map<string, number>();
+    for (const entry of OP_TABLE) {
+      for (const k of entry.keys) keyCounts.set(k, (keyCounts.get(k) ?? 0) + 1);
+    }
+    for (const key of P5_FS_TAIL_KEYS_ONCE) {
+      const count = keyCounts.get(key) ?? 0;
+      expect(count, `"${key}" appears in ${count} OP_TABLE entries (want exactly 1)`).toBe(1);
+    }
+    expect(keyCounts.get("readFdSyncBytes") ?? 0, "readFdSyncBytes must appear in EXACTLY TWO OP_TABLE entries (op 22 + op 23, its own two-stage design)").toBe(2);
+    expect(keyCounts.has("existsSync"), "existsSync (op 19, probe-shaped) must NOT appear in OP_TABLE — A-9's own rule").toBe(false);
   });
 });

@@ -6980,6 +6980,7 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "dyn.toString",
   "dyn.defineProps",
   "process.chdir",
+  "process.umask",
   "fs.realpathSync",
   "fs.readFileSync",
   "fs.writeFileSync",

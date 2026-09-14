@@ -1,0 +1,23 @@
+kill	2147483600	0	Error	ESRCH	kill ESRCH
+kill	2147483600	-0	Error	ESRCH	kill ESRCH
+kill	2147483600	NaN	Error	ESRCH	kill ESRCH
+kill	2147483600	15	Error	ESRCH	kill ESRCH
+kill	2147483600	6	Error	ESRCH	kill ESRCH
+kill	2147483600	2147483647	Error	ESRCH	kill ESRCH
+kill	2147483600	-2147483648	Error	ESRCH	kill ESRCH
+kill	2147483600	2147483648	TypeError	ERR_UNKNOWN_SIGNAL	Unknown signal: 2147483648
+kill	2147483600	-2147483649	TypeError	ERR_UNKNOWN_SIGNAL	Unknown signal: -2147483649
+kill	2147483600	1.5	TypeError	ERR_UNKNOWN_SIGNAL	Unknown signal: 1.5
+kill	2147483600	-1.5	TypeError	ERR_UNKNOWN_SIGNAL	Unknown signal: -1.5
+chdir	/nonexistent-dir-p143-probe	Error	ENOENT	ENOENT: no such file or directory, chdir '/' -> '/nonexistent-dir-p143-probe'
+umask-invalid	1.5	RangeError	ERR_OUT_OF_RANGE	The value of "mask" is out of range. It must be an integer. Received 1.5
+umask-invalid	-1	RangeError	ERR_OUT_OF_RANGE	The value of "mask" is out of range. It must be >= 0 && <= 4294967295. Received -1
+umask-invalid	4294967296	RangeError	ERR_OUT_OF_RANGE	The value of "mask" is out of range. It must be >= 0 && <= 4294967295. Received 4294967296
+umask-invalid	NaN	RangeError	ERR_OUT_OF_RANGE	The value of "mask" is out of range. It must be an integer. Received NaN
+umask-invalid	-1.5	RangeError	ERR_OUT_OF_RANGE	The value of "mask" is out of range. It must be an integer. Received -1.5
+umask-invalid	4294967296.5	RangeError	ERR_OUT_OF_RANGE	The value of "mask" is out of range. It must be an integer. Received 4294967296.5
+umask-valid	18	0
+umask-valid	0	18
+umask-valid	511	0
+umask-valid	4294967295	511
+umaskread	511

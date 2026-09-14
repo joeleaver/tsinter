@@ -163,6 +163,26 @@ async function instantiate(modulePath: string) {
             return write("/forced/tmp");
           case 9: // os.homedir
             return write("/forced/home");
+          // INC-26 P5 (brief-p5-v3.md §3A, abi.ts kinds 10/11/13/14/15/16):
+          // six more os.* default stubs, same synthetic-is-safe reasoning
+          // as P4's tmpdir/homedir pair above — measured this session
+          // (grep over all 21 shared-host importers' own test files):
+          // ZERO touch os.type/os.release/os.userInfo (name/homedir/
+          // shell)/os.networkInterfaces in their compiled fixtures today.
+          case 10: // os.type
+            return write("ForcedOS");
+          case 11: // os.release
+            return write("0.0.0-forced");
+          case 13: // os.userInfo().username
+            return write("forced-user");
+          case 14: // os.userInfo().homedir
+            return write("/forced/userhome");
+          case 15: // os.userInfo().shell
+            return write("/forced/shell");
+          case 16: // os.networkInterfaces() — a JSON document; the empty
+            // object is the simplest valid "no interfaces" answer, never
+            // exercised by a real corpus program through THIS shared host.
+            return write("{}");
           default:
             throw new Error(`hostStr: unknown kind ${kind}`);
         }
@@ -202,6 +222,11 @@ async function instantiate(modulePath: string) {
           case 14: // rusage field `arg`, 0..15 — index 2 is maxRSS, which
             // §2.3's own text requires STRICTLY positive.
             return arg === 2 ? 4096 : arg;
+          // INC-26 P5 (brief-p5-v3.md §3A, abi.ts hostNum kind 15): the
+          // sole new hostNum-only os.* default, same synthetic-is-safe
+          // measurement as the hostStr additions above.
+          case 15: // os.totalmem, bytes
+            return 1e9;
           default:
             throw new Error(`hostNum: unknown kind ${kind}`);
         }

@@ -553,9 +553,35 @@ static bool scr_kill_send(int pid, int sig) {
   return false;
 }
 
+/* P5 R-B (board #143, measured against a LIVE CHILD, p5-kill-sig0-nan.out
+ * f6b5a212): the unguarded `(int)signum` cast is UNDEFINED BEHAVIOUR for
+ * NaN and silently wrong for anything out of int32 range — Node's own
+ * gate, in Node's own precedence order: 0 (and -0, `==` already treats
+ * them equal) probes, delivering nothing; an INTEGRAL value inside int32
+ * range passes RAW; NaN defaults to SIGTERM (Node's own documented
+ * default when no usable signal was given); anything else (non-integral,
+ * or integral but outside int32) is Node's ERR_UNKNOWN_SIGNAL TypeError,
+ * the number rendered through scr_f64_to_str (scr_kill_pid_check's own
+ * in-file precedent for this exact rendering). */
 bool scr_process_kill(double pid, double signum) {
   if (!scr_kill_pid_check(pid)) return false;
-  return scr_kill_send((int)pid, (int)signum);
+  int sig;
+  if (signum == 0) {
+    sig = 0;
+  } else if (signum >= -2147483648.0 && signum <= 2147483647.0 &&
+             signum == (double)(long long)signum) {
+    sig = (int)signum;
+  } else if (signum != signum) { /* NaN */
+    sig = SIGTERM;
+  } else {
+    char num[32];
+    size_t nlen = scr_f64_to_str(signum, num);
+    char msg[64];
+    int len = snprintf(msg, sizeof msg, "Unknown signal: %.*s", (int)nlen, num);
+    scr_throw_error_msg_code(SCR_ERR_TYPE, msg, (size_t)len, "ERR_UNKNOWN_SIGNAL");
+    return false;
+  }
+  return scr_kill_send((int)pid, sig);
 }
 
 bool scr_process_kill_named(double pid, const ScrStr *signal) {
@@ -1303,38 +1329,101 @@ bool scr_process_in_exit = false;
 
 bool scr_process_exiting(void) { return scr_process_in_exit; }
 
-/* umask(2): mask < 0 reads without setting (set 0, restore — umask has no
- * read-only form); otherwise sets and answers the previous mask. */
+/* umask(2), SET form ONLY (P5 R-C, board #143): the READ form is
+ * scr_process_umask_read below, its OWN C symbol — P4's `mask < 0`
+ * sentinel collided with a real, representable negative mask input once
+ * this function started validating its argument (the same x/mode-0
+ * collision class this pass hit twice on the wasm lane's own wire
+ * protocol, board #142's own precedent), so the sentinel leaves the
+ * VALIDATING WRITE PATH — it is still PASSED (the LLVM call site's own
+ * fixed `-1.0` argument, unchanged), but now to the READ form, which
+ * IGNORES it (rev-26 3F read: the 1-ary-ignoring shape, not a 0-ary
+ * one, is the smaller change measured — no call-site shape change
+ * needed, only the symbol name). Node's own
+ * validation, INTEGER-FIRST then RANGE-SECOND (a non-integer mask throws
+ * even when ALSO out of range — mirrors the wasm lane's own
+ * process.umask arm exactly), both RangeErrors with `.code` ==
+ * ERR_OUT_OF_RANGE through the existing scr_throw_error_msg_code seam. */
 double scr_process_umask(double mask) {
-#ifdef _WIN32
-  /* Node on Windows accepts umask() calls; only the low bits matter. */
-  int prev;
-  if (mask < 0) {
-    _umask_s(0, &prev);
-    int ignored;
-    _umask_s(prev, &ignored);
-  } else {
-    _umask_s((int)mask, &prev);
+  if (mask != (double)(long long)mask) {
+    char num[32];
+    size_t nlen = scr_f64_to_str(mask, num);
+    char msg[128];
+    int len = snprintf(msg, sizeof msg,
+                        "The value of \"mask\" is out of range. It must be an integer. Received %.*s",
+                        (int)nlen, num);
+    scr_throw_error_msg_code(SCR_ERR_RANGE, msg, (size_t)len, "ERR_OUT_OF_RANGE");
+    return 0;
   }
+  if (mask < 0 || mask > 4294967295.0) {
+    char num[32];
+    size_t nlen = scr_f64_to_str(mask, num);
+    char msg[128];
+    int len = snprintf(msg, sizeof msg,
+                        "The value of \"mask\" is out of range. It must be >= 0 && <= 4294967295. Received %.*s",
+                        (int)nlen, num);
+    scr_throw_error_msg_code(SCR_ERR_RANGE, msg, (size_t)len, "ERR_OUT_OF_RANGE");
+    return 0;
+  }
+#ifdef _WIN32
+  int prev;
+  _umask_s((int)mask, &prev);
   return (double)prev;
 #else
-  mode_t prev;
-  if (mask < 0) {
-    prev = umask(0);
-    umask(prev);
-  } else {
-    prev = umask((mode_t)mask);
-  }
+  mode_t prev = umask((mode_t)mask);
   return (double)prev;
 #endif
 }
 
-void scr_process_chdir(ScrStr *dir) {
+/* umask(2), READ form (P5 R-C): Node's own no-arg umask() — set 0,
+ * restore, answer the PRIOR mask (umask(2) has no read-only form). Its
+ * OWN C symbol, never P4's `-1` sentinel through scr_process_umask
+ * above — the sentinel could not coexist with that function's new
+ * validation (a real, representable mask of -1 would previously have
+ * been silently reinterpreted as a read). The parameter is UNUSED
+ * (ignored) rather than this being 0-ary: the LLVM call site (board
+ * #142's own special case, `process.umaskRead` being 0-ary at the IR
+ * level against a symbol call that needs an argument) already emits a
+ * fixed `double -1.0` argument, and keeping the SAME 1-ary shape here
+ * means neither that call site nor its own `declare` line needs to
+ * change — only the symbol NAME it resolves to (the LIB_FN_SYMS table
+ * row, this rider's own PERMIT-HUNK) — the smaller of the two changes
+ * measured, per the brief's own instruction to choose it. */
+double scr_process_umask_read(double unused) {
+  (void)unused;
 #ifdef _WIN32
-  if (_chdir(dir->data) != 0) scr_fs_throw(errno, "chdir", dir);
+  int prev;
+  _umask_s(0, &prev);
+  int ignored;
+  _umask_s(prev, &ignored);
+  return (double)prev;
 #else
-  if (chdir(dir->data) != 0) scr_fs_throw(errno, "chdir", dir);
+  mode_t prev = umask(0);
+  umask(prev);
+  return (double)prev;
 #endif
+}
+
+/* Forward declaration: the two-path builder is defined below (fs
+ * operations section) but chdir's own P5 fix (immediately below) needs
+ * it here, ahead of that section. */
+static void scr_fs_throw2(int e, const char *op, const ScrStr *src, const ScrStr *dest);
+
+/* P5 R-A (board #143, rev-umask-chdir-p3.out :19-23): Node's chdir error
+ * is TWO-PATH shaped — "<CODE>: <text>, chdir '<cwd-before>' -> '<dir>'"
+ * — never the one-path form scr_fs_throw renders. The "before" path is
+ * getcwd() taken BEFORE the chdir(2) call (scr_process_cwd's own +1
+ * ScrStr, released here either way). */
+void scr_process_chdir(ScrStr *dir) {
+  ScrStr *before = scr_process_cwd();
+#ifdef _WIN32
+  bool ok = _chdir(dir->data) == 0;
+#else
+  bool ok = chdir(dir->data) == 0;
+#endif
+  int e = errno;
+  if (!ok) scr_fs_throw2(e, "chdir", before, dir);
+  scr_str_release(before);
 }
 
 /* net's process-wide happy-eyeballs attempt budget (Node's

@@ -237,8 +237,15 @@ const LIB_FN_SYMS: Record<string, string> = {
   // (b)) supplies the constant argument the generic dispatcher below
   // cannot: umaskRead is 0-ary at the IR level, `scr_process_umask` is
   // 1-ary, and the generic path maps `e.args` 1:1 with no way to inject
-  // a value not present in the call's own arguments.
-  "process.umaskRead": "scr_process_umask",
+  // a value not present in the call's own arguments. P5 R-C (board
+  // #143): repointed to scr_process_umask_read — scr_process_umask
+  // itself now validates its argument, so the OLD sentinel-shaped read
+  // (a compile-time -1 through the SET entry point) cannot share it any
+  // more; the read form's own C symbol ignores its one argument, so
+  // NOTHING below this row (the declare + call special case) needs to
+  // change, only this row's symbol name — the smaller of the two
+  // changes measured, per the brief's own instruction to choose it.
+  "process.umaskRead": "scr_process_umask_read",
   "process.uptime": "scr_process_uptime",
   "perf.now": "scr_perf_now",
   "process.availableMemory": "scr_available_memory",

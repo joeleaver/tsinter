@@ -5018,9 +5018,15 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           case "process.umask":
             return finish(`scr_process_umask(${arg(0)})`);
           case "process.umaskRead":
-            // The C's OWN existing read form (board #142): a compile-time
-            // literal -1, never a program-supplied argument.
-            return finish(`scr_process_umask(-1)`);
+            // The C's OWN dedicated read form (P5 R-C, board #143):
+            // scr_process_umask_read, its own symbol since board #142 —
+            // scr_process_umask itself now validates its argument, so
+            // the OLD `mask < 0` sentinel (a compile-time literal -1
+            // here) cannot share that entry point any more. The literal
+            // -1 argument stays (the read form ignores it) — the
+            // smaller of the two changes measured, since the call site
+            // shape needs no update, only the symbol name.
+            return finish(`scr_process_umask_read(-1)`);
           case "process.chdir":
             return finish(`scr_process_chdir(${arg(0)})`);
           case "process.exiting":
