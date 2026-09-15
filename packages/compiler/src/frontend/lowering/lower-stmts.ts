@@ -7000,7 +7000,8 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
    * - RECORDS (fixed shapes): iteration over exactly the keys Object.keys
    *   answers — the shared interned keys helper (recordKeysArrayCall):
    *   declaration order, fields holding the undefined arm of their union
-   *   skipped at runtime (SEMANTICS.md 37's rules verbatim). The key list
+   *   skipped at runtime (Node's missing-key behavior: an unset optional
+   *   never entered the object). The key list
    *   snapshots at loop entry, which IS Node's for-in contract for keys
    *   ADDED during the walk (never visited); fixed shapes cannot lose keys
    *   mid-loop (no delete), so the snapshot is exact.
@@ -7082,8 +7083,8 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
           };
         }
         // Fixed and hybrid shapes cannot lose keys mid-walk (no delete;
-        // an undefined-arm write agrees with the snapshot under the
-        // SEMANTICS.md 37 stance), so the snapshot alone is exact.
+        // an undefined-arm write agrees with the snapshot under Node's
+        // missing-key behavior), so the snapshot alone is exact.
         const keys = rShape.indexValue
           ? objectIterOverIndexShape(L, stmt.expression, "keys", receiver.type, rShape, receiver, keysT, loc)
           : recordKeysArrayCall(L, receiver, receiver.type, rShape, loc);

@@ -797,26 +797,39 @@ describe("INC-26 P1 forced-host rows", () => {
     expect(stdout).toBe("sync tail\nreported unhandled #1\nrejectionHandled fired\nreported unhandled #2\n");
   });
 
-  // RETIRED (RULING P1-R6): this was meant to be the MULTI-HANDLED
-  // FIFO-ORDER row — two promises attached to in REVERSE creation order,
-  // proving the fire order follows ATTACH order. Diagnosing why mutation
-  // M-16 (drain the FIFO in LIFO order) reddened NOTHING found the real
-  // reason: the row's own "order" queue was filled in FIXED SOURCE-CODE
-  // sequence, and the rejectionHandled listener's argument cannot
-  // distinguish which promise actually fired (SEMANTICS.md S076 — no
-  // promise identity is preserved across the dyn boundary), so the
-  // printed order was always the SAME regardless of the real internal
-  // dispatch order. FIFO order is UNOBSERVABLE by construction until
-  // board #140 (identity-preserving listener arguments) lands. Kept as a
-  // COUNT-only row: it still proves the listener fires exactly once PER
-  // handled promise, not once overall or zero times — a real assertion
-  // this backend can make, unlike order.
-  test("onRejectionHandled: fires once per handled promise (a count row — order is unobservable, S076)", async () => {
+  // RESTORED by INC-26 B1 (board #140, SEMANTICS.md S076 RETIRED): this IS
+  // now the MULTI-HANDLED FIFO-ORDER row it was always meant to be — two
+  // promises attached to in REVERSE creation order, proving the fire order
+  // follows ATTACH order. Previously (RULING P1-R6) the rejectionHandled
+  // listener's own argument could not distinguish which promise actually
+  // fired (a fresh generic object every dispatch), so the printed order
+  // was always the same regardless of the real internal dispatch order —
+  // kept as a count-only row until #140 landed. Now that identity survives
+  // (DK.PROMISE boxing over the real ref), the row LABELS each fire by
+  // comparing the rejectionHandled argument against `seen` — an array of
+  // the unhandledRejection listener's OWN prior arguments (both sides
+  // `unknown`, avoiding the SEPARATE, unrelated tier limitation that a
+  // concretely-typed Promise cannot convert to `unknown` directly, SC1101
+  // — the identity-preserving dyn box is the ONLY path a promise crosses
+  // into `unknown` on this tier). Node: A rejects first (created first,
+  // both reject synchronously at construction) so unhandledRejection fires
+  // A then B, `seen = [A, B]`; the setTimeout callback attaches B's
+  // handler BEFORE A's, so rejectionHandled fires B first, then A —
+  // "fires 1 B\nfires 2 A", matching Node exactly (measured, node
+  // v24.18.1: inc26-work/inc26/impl-b1/design-140-probes/).
+  test("onRejectionHandled: fires in ATTACH order (B before A), identified by comparing against unhandledRejection's own prior arguments — the restored FIFO-order row, S076 RETIRED", async () => {
     const bin = await buildProgram(`
       'use strict';
       let fires = 0;
-      process.on("unhandledRejection", () => {});
-      process.on("rejectionHandled", () => { fires++; console.log("fires", fires); });
+      const seen: unknown[] = [];
+      process.on("unhandledRejection", (reason, promise) => { seen.push(promise); });
+      process.on("rejectionHandled", (promise) => {
+        fires++;
+        let label = "?";
+        if (promise === seen[0]) label = "A";
+        else if (promise === seen[1]) label = "B";
+        console.log("fires", fires, label);
+      });
       async function doomedA() { throw new Error("A"); }
       async function doomedB() { throw new Error("B"); }
       const a = doomedA();
@@ -828,6 +841,6 @@ describe("INC-26 P1 forced-host rows", () => {
       console.log("sync tail");
     `);
     const { stdout } = await runForced(bin);
-    expect(stdout).toBe("sync tail\nfires 1\nfires 2\n");
+    expect(stdout).toBe("sync tail\nfires 1 B\nfires 2 A\n");
   });
 });

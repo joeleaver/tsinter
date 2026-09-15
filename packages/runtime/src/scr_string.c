@@ -72,6 +72,9 @@ static ScrStr *scr_str_alloc(size_t len, size_t cap) {
   s->cap = cap;
 #ifdef SCR_RC_AUDIT
   scr_live_strings++;
+#if defined(SCR_LIB)
+  scr_library_live_insert(s, scr_str_release_v); /* #147 */
+#endif
 #endif
   return s;
 }
@@ -122,9 +125,27 @@ ScrStr *scr_str_alloc_raw(size_t len, size_t cap) {
 
 ScrStr *scr_str_regrow(ScrStr *s, size_t newcap) {
   scr_sidx_purge(s); /* realloc may move; the old address may be recycled */
+#ifdef SCR_RC_AUDIT
+#if defined(SCR_LIB)
+  /* #147 (delta-12 §A): realloc may free `s`'s block outright when it
+   * relocates — with no scr_str_release in this path, the live set would
+   * keep a now-freed pointer (a use-after-free source for the trap-path
+   * sweep) and the regrown string would go untracked at its real address.
+   * Forget the old address before the realloc, insert the (possibly new)
+   * one after — same object, same tracked-once invariant, no rc change
+   * (this is a relocation, not a free+alloc; scr_live_strings is
+   * untouched). */
+  scr_library_live_forget(s);
+#endif
+#endif
   ScrStr *r = realloc(s, sizeof(ScrStr) + newcap + 1);
   if (!r) scr_oom();
   r->cap = newcap;
+#ifdef SCR_RC_AUDIT
+#if defined(SCR_LIB)
+  scr_library_live_insert(r, scr_str_release_v);
+#endif
+#endif
   return r;
 }
 
@@ -134,6 +155,9 @@ void scr_str_release(ScrStr *s) {
     scr_sidx_purge(s); /* the address may be recycled by the next malloc */
 #ifdef SCR_RC_AUDIT
     scr_live_strings--;
+#if defined(SCR_LIB)
+    scr_library_live_forget(s); /* #147 */
+#endif
 #endif
 #ifndef SCR_RC_AUDIT
     if (s->cap >= 512) {

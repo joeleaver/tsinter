@@ -103,6 +103,15 @@ static ScrSearchParams *sp_alloc(void) {
     scr_trap("scriptc: out of memory\n");
   }
   sp->owner = NULL;
+#if defined(SCR_LIB) && defined(SCR_RC_AUDIT)
+  /* #147 (N-1, THE OTHER hazard this fold corrects): insert HERE, after
+   * every field is set — sp->names/sp->vals above are each a SEPARATE
+   * trapping malloc, and inserting at sp's own allocation (as design-v1
+   * would have) would register an object with a still-garbage owner
+   * field; scr_sp_release dereferences it (a wild read AND write) if the
+   * sweep ever reaches it. */
+  scr_library_live_insert(sp, scr_sp_release_v);
+#endif
   return sp;
 }
 
@@ -124,6 +133,9 @@ void scr_sp_release(ScrSearchParams *sp) {
       sp->owner->sp_cache = NULL;
       scr_url_release(sp->owner);
     }
+#if defined(SCR_LIB) && defined(SCR_RC_AUDIT)
+    scr_library_live_forget(sp); /* #147 */
+#endif
     free(sp);
   }
 }

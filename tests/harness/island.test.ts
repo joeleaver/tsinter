@@ -373,11 +373,18 @@ console.log(greet("world"), 6 * 7);
     ]);
     const staticSize = statSync(stat.binaryPath).size;
     const dynamicSize = statSync(dyn.binaryPath).size;
-    // The class is toolchain-specific and page-granular. The canonical
-    // Ubuntu 24.04/clang Sandbox measures 387,600 bytes; Mach-O measures
-    // about 353KB. Each bound leaves roughly one native page of growth,
-    // far below the >1MB jump measured when the engine is linked.
-    expect(staticSize).toBeLessThan(process.platform === "linux" ? 392_000 : 361_000);
+    // board #146: an ABSOLUTE bound on the static binary drifts with the
+    // toolchain (measured 396,272 bytes on this tree's Ubuntu clang
+    // 21.1.8 vs the canonical Sandbox clang's 387,600; Mach-O around
+    // 353KB) — the axis this test actually guards is AN ENGINE
+    // ACCIDENTALLY LINKED INTO THE STATIC BUILD, which is a ~1MB jump
+    // (measured this session: 1,561,600 − 396,272 = 1,165,328 bytes), not
+    // a byte count. The assertion is RELATIVE instead: island use must
+    // cost an engine-sized jump over the static build; a toolchain's
+    // page-granular drift (a few KB) can never satisfy this floor, which
+    // sits well under the measured jump and well over that drift.
+    const ENGINE_SIZE_FLOOR = 700_000; // bytes; measured jump ~1.17MB this session
+    expect(dynamicSize - staticSize).toBeGreaterThan(ENGINE_SIZE_FLOOR);
     expect(dynamicSize).toBeGreaterThan(500_000);
   });
 

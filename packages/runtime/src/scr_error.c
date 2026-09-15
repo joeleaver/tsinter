@@ -41,6 +41,9 @@ static void scr_error_gcfree(void *obj) {
   scr_str_release(e->message);
   scr_str_release(e->code); /* NULL-safe: absent on most errors */
   scr_obj_free_note();
+#if defined(SCR_LIB) && defined(SCR_RC_AUDIT)
+  scr_library_live_forget(e); /* #147 */
+#endif
   scr_cyc_free(e);
 }
 
@@ -71,6 +74,9 @@ static void scr_error_reld(void *obj) {
     scr_str_release(e->message);
     scr_str_release(e->code); /* NULL-safe: absent on most errors */
     scr_obj_free_note();
+#if defined(SCR_LIB) && defined(SCR_RC_AUDIT)
+    scr_library_live_forget(e); /* #147 */
+#endif
     if (scr_error_traced) scr_cyc_free(e);
     else free(e);
   } else if (scr_error_traced) {
@@ -146,6 +152,9 @@ static ScrError *scr_error_alloc(int kind) {
   e->rc = 1;
   e->vt = &scr_error_vts[kind];
   scr_obj_alloc_note();
+#if defined(SCR_LIB) && defined(SCR_RC_AUDIT)
+  scr_library_live_insert(e, scr_error_release_v); /* #147 */
+#endif
   return e;
 }
 

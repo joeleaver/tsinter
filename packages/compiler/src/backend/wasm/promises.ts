@@ -90,18 +90,19 @@ export interface PromiseDeps {
   dispatchOrReport: (c: Code, p: number, k: number, fallback: () => void) => void;
   /** RULING P1-R5 (supersedes P1-R3's inline-at-attach shape): fire every
    * registered `process.on("rejectionHandled", ...)` listener with a
-   * freshly-boxed dyn value — called from `drainPendingHandled` ONCE PER
-   * QUEUED PROMISE, never from `subscribe`/`subscribeHandled` directly
-   * anymore (the read-and-clear of `PROM_REPORTED_UNHANDLED` and the
-   * enqueue onto the FIFO both live in THIS file now, needing no DI hook
-   * — they touch only `promT` fields this file already owns). Takes no
-   * promise argument: the dyn boxing is a fresh generic object regardless
-   * (unchanged since P1-R3), so this file never needs to know the
-   * listener list or the dyn boxing exist, only how many times and in
-   * what order to call. A no-op for a module that never reaches
-   * `process.onRejectionHandled` (emitter.ts's static
-   * `needsRejectionHandledDispatch` prescan gates the real branch). */
-  fireRejectionHandled: (c: Code) => void;
+   * boxed dyn value — called from `drainPendingHandled` ONCE PER QUEUED
+   * PROMISE, never from `subscribe`/`subscribeHandled` directly anymore
+   * (the read-and-clear of `PROM_REPORTED_UNHANDLED` and the enqueue onto
+   * the FIFO both live in THIS file now, needing no DI hook — they touch
+   * only `promT` fields this file already owns). `promiseLocal` is the
+   * CALLER's own local holding the promise ref (board #140, INC-26 B1: S076
+   * RETIRED — the dyn boxing is now a DK.PROMISE-kind box over THIS ref,
+   * never a fresh generic object, so identity survives; this file passes
+   * its own `CUR` node's field-0 promise ref, never the node itself). A
+   * no-op for a module that never reaches `process.onRejectionHandled`
+   * (emitter.ts's static `needsRejectionHandledDispatch` prescan gates the
+   * real branch). */
+  fireRejectionHandled: (c: Code, promiseLocal: number) => void;
   /** RULING P1-R5: a plain TypeScript-level boolean (not a wasm value) —
    * emitter.ts's static `needsRejectionHandledDispatch` prescan, threaded
    * through so `subscribe`'s rejected branch can skip emitting the
@@ -110,6 +111,15 @@ export interface PromiseDeps {
    * same discipline as every other static gate in this pass), rather
    * than emitting always-false dead code. */
   needsRejectionHandled: () => boolean;
+  /** Board #139 (INC-26 B1): the SAME TypeScript-level-boolean discipline
+   * as needsRejectionHandled above, for settle()'s rejection branch — the
+   * ledger-generation-counter increment (design-139-v2 §B term (ii)) must
+   * NOT be emitted into settle() for a module where
+   * emitCheckpointCore.needsListenerLoopTerm is false, or settle()'s own
+   * bytecode (called by EVERY rejection, listener or not) would move for
+   * every module that ever rejects a promise — breaking §C's byte-
+   * identity guarantee for the common (no listener) case. */
+  needsListenerLoopTerm: () => boolean;
 }
 
 /* promT's fields. The first four and `observed` are exported because the
@@ -205,6 +215,7 @@ export class PromiseBuilder {
   private raceEntryField: number | null = null;
   private queue: { head: number; tail: number } | null = null;
   private ledger: { head: number; tail: number } | null = null;
+  private ledgerGeneration: number | null = null;
 
   constructor(
     private readonly mb: ModuleBuilder,
@@ -293,6 +304,30 @@ export class PromiseBuilder {
       this.ledger = { head: this.mb.addGlobal(t, true, init), tail: this.mb.addGlobal(t, true, init) };
     }
     return this.ledger;
+  }
+
+  /** Board #139 (INC-26 B1, design-139-v2 §B): a counter incremented every
+   * time a promise joins the maybe-unhandled ledger (settle()'s rejection
+   * branch, the ledger's ONE insertion site) — term (ii) of Node's fixed-
+   * point loop condition (processPromiseRejections() returning true
+   * because NEW unobserved rejections arrived during the pass, not
+   * because it dispatched one; nexttick.ts's header carries the full
+   * verbatim expression). Read before/after reportInvoked()'s walk.
+   * MEASURED (this pass): redundant with term (i) for every row this
+   * design covers — the ledger is append-only at the tail and
+   * reportInvoked()'s walk re-starts from the head and runs to null on
+   * every call, so any append during the pass is reached in that SAME
+   * pass no matter where the walk currently sits (N-3) — built anyway,
+   * per Node's own literal return expression, as defense-in-depth; no
+   * row in this pass's battery observes term (ii) in isolation (N-4). */
+  private ledgerGenerationGlobal(): number {
+    if (this.ledgerGeneration === null) {
+      this.ledgerGeneration = this.mb.addGlobal(I32, true, (w) => {
+        w.u8(0x41); // i32.const 0
+        w.sleb(0);
+      });
+    }
+    return this.ledgerGeneration;
   }
 
   /** %w.async.mint() → a fresh PENDING promise (every field's default). */
@@ -558,7 +593,7 @@ export class PromiseBuilder {
     return this.cached("drainPendingHandled", () => {
       const idx = this.mb.declareFunc(this.mb.funcType([], []), "%w.async.drainPendingHandled");
       const c = new Code();
-      const CUR = 0;
+      const CUR = 0, PROM = 1;
       c.globalGet(this.pendingHandledHeadG());
       c.localSet(CUR);
       c.refNull(this.pendingHandledT);
@@ -570,14 +605,21 @@ export class PromiseBuilder {
       c.localGet(CUR);
       c.refIsNull();
       c.brIf(1);
-      this.deps.fireRejectionHandled(c);
+      // Board #140 (INC-26 B1): extract CUR's own promise ref (field 0)
+      // into its own local so deps.fireRejectionHandled can box THAT ref
+      // (DK.PROMISE, identity-preserving) rather than the pendingHandledT
+      // node itself.
+      c.localGet(CUR);
+      c.structGet(this.pendingHandledT, 0);
+      c.localSet(PROM);
+      this.deps.fireRejectionHandled(c, PROM);
       c.localGet(CUR);
       c.structGet(this.pendingHandledT, 1);
       c.localSet(CUR);
       c.br(0);
       c.end();
       c.end();
-      this.mb.setBody(idx, [this.pendingHandledRef()], c.bytes());
+      this.mb.setBody(idx, [this.pendingHandledRef(), this.promRef()], c.bytes());
       return idx;
     });
   }
@@ -707,6 +749,22 @@ export class PromiseBuilder {
       c.end();
       c.localGet(P);
       c.globalSet(led.tail);
+      // Board #139 (INC-26 B1): a rejection joining the ledger is term
+      // (ii) of reportInvoked()'s fixed-point loop condition (design-139-
+      // v2 §B) — bump the generation counter, but ONLY for a module that
+      // will ever call reportInvoked() at all (deps.needsListenerLoopTerm,
+      // a TypeScript-level BUILD-TIME check, same discipline as
+      // needsRejectionHandled just below): settle() is called by EVERY
+      // rejection, listener or not, so an unconditional increment here
+      // would move settle()'s own bytecode for every module that ever
+      // rejects a promise, breaking §C's byte-identity guarantee for the
+      // common (no listener) case.
+      if (this.deps.needsListenerLoopTerm()) {
+        c.globalGet(this.ledgerGenerationGlobal());
+        c.i32Const(1);
+        c.i32Add();
+        c.globalSet(this.ledgerGenerationGlobal());
+      }
       c.end();
       // Splice the whole waiter list onto the queue in one go — order
       // preserved, which is what makes two frames awaiting one promise
@@ -947,6 +1005,123 @@ export class PromiseBuilder {
       c.br(0);
       c.end();
       this.mb.setBody(idx, [this.promRef(), I32], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.async.reportInvoked() — board #139 (INC-26 B1, design-139-v2 §B/§C).
+   * SAME walk as report(), a SEPARATE cached entry under a SEPARATE name
+   * (never touching report()'s own []→[] signature — changing THAT would
+   * move the type index for every hasProms module, listener-free or not,
+   * §C) — built and called ONLY when emitCheckpointCore's
+   * needsListenerLoopTerm is true (unhandledRejectionReachable(mod) ||
+   * rejectionHandledReachable(mod), emitter.ts). Returns i32: TRUE when
+   * this pass (i) dispatched to a listener (found a qualifying promise —
+   * the ONLY other arm is emitReport's S010 trap, which never returns, so
+   * finding one implies a real dispatch) OR (ii) the ledger's generation
+   * counter moved during the walk (term (ii), redundant with (i) for
+   * every row this pass measured — see ledgerGenerationGlobal's own
+   * comment). A listener-free module never builds this function at all
+   * (the `cached()`-by-name discipline). */
+  reportInvoked(): number {
+    return this.cached("reportInvoked", () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([], [I32]), "%w.async.reportInvoked");
+      const led = this.led();
+      const c = new Code();
+      const P = 0, K = 1, INVOKED = 2, GEN_BEFORE = 3;
+      c.globalGet(this.ledgerGenerationGlobal());
+      c.localSet(GEN_BEFORE);
+      c.i32Const(0);
+      c.localSet(INVOKED);
+      c.globalGet(led.head);
+      c.localSet(P);
+      c.loop();
+      c.localGet(P);
+      c.refIsNull();
+      c.ifVoid();
+      c.localGet(INVOKED);
+      c.globalGet(this.ledgerGenerationGlobal());
+      c.localGet(GEN_BEFORE);
+      c.i32Ne();
+      c.i32Or();
+      c.return_();
+      c.end();
+      c.localGet(P);
+      c.structGet(this.promT, PROM_STATE);
+      c.i32Const(2);
+      c.i32Eq();
+      c.localGet(P);
+      c.structGet(this.promT, PROM_OBSERVED);
+      c.i32Eqz();
+      c.i32And();
+      c.ifVoid();
+      // Term (i): finding a qualifying promise here IS "dispatched" —
+      // dispatchOrReport's only other arm traps and never returns (see
+      // report()'s own comment above, unchanged reasoning).
+      c.i32Const(1);
+      c.localSet(INVOKED);
+      this.deps.dispatchOrReport(c, P, K, () => this.emitReport(c, P, K));
+      c.end();
+      c.localGet(P);
+      c.structGet(this.promT, P_NEXT);
+      c.localSet(P);
+      c.br(0);
+      c.end();
+      // The loop's only exit is the return_() inside the null-check arm
+      // above (unlike report()'s own []→[] twin, this function's [I32]
+      // result means the validator requires a value at fallthrough —
+      // `unreachable` tells it this point is provably never reached).
+      c.unreachable();
+      this.mb.setBody(idx, [this.promRef(), I32, I32, I32], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.async.drainPendingHandledInvoked() — board #139's twin of
+   * reportInvoked() for the rejectionHandled queue (design-139-v2 §B/§C).
+   * SEPARATE cached entry, drainPendingHandled() itself untouched. Returns
+   * i32: TRUE iff the pending-handled queue was non-empty at entry (the
+   * loop below runs at least once — this queue's own contract, unlike the
+   * ledger, doesn't need a generation counter: it is fully drained and
+   * emptied every call, `board reportInvoked's ledger stays populated
+   * forever (entries are only ever marked observed, never unlinked), so
+   * "non-empty at entry" here already means "the loop body runs", exactly
+   * term (i)'s reasoning applied to a queue that empties instead of one
+   * that accumulates). */
+  drainPendingHandledInvoked(): number {
+    return this.cached("drainPendingHandledInvoked", () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([], [I32]), "%w.async.drainPendingHandledInvoked");
+      const c = new Code();
+      const CUR = 0, INVOKED = 1, PROM = 2;
+      c.globalGet(this.pendingHandledHeadG());
+      c.localSet(CUR);
+      c.localGet(CUR);
+      c.refIsNull();
+      c.i32Eqz();
+      c.localSet(INVOKED);
+      c.refNull(this.pendingHandledT);
+      c.globalSet(this.pendingHandledHeadG());
+      c.refNull(this.pendingHandledT);
+      c.globalSet(this.pendingHandledTailG());
+      c.block();
+      c.loop();
+      c.localGet(CUR);
+      c.refIsNull();
+      c.brIf(1);
+      // Board #140 (INC-26 B1): same identity-preserving extraction as
+      // drainPendingHandled()'s own twin above.
+      c.localGet(CUR);
+      c.structGet(this.pendingHandledT, 0);
+      c.localSet(PROM);
+      this.deps.fireRejectionHandled(c, PROM);
+      c.localGet(CUR);
+      c.structGet(this.pendingHandledT, 1);
+      c.localSet(CUR);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(INVOKED);
+      this.mb.setBody(idx, [this.pendingHandledRef(), I32, this.promRef()], c.bytes());
       return idx;
     });
   }

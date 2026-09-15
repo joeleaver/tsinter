@@ -98,6 +98,9 @@ ScrCaught *scr_exc_take(void) {
   scr_exc_release_fn = NULL;
   scr_exc_trace_fn = NULL;
   scr_obj_alloc_note();
+#if defined(SCR_LIB) && defined(SCR_RC_AUDIT)
+  scr_library_live_insert(c, scr_caught_release_v); /* #147 */
+#endif
   return c;
 }
 
@@ -115,9 +118,18 @@ void scr_caught_release(ScrCaught *c) {
       c->release_fn(c->payload);
     }
     scr_obj_free_note();
+#if defined(SCR_LIB) && defined(SCR_RC_AUDIT)
+    scr_library_live_forget(c); /* #147 */
+#endif
     free(c);
   }
 }
+#if defined(SCR_LIB) && defined(SCR_RC_AUDIT)
+/* #147 (delta-11/N-3, lead ruling): gated — its only caller (the INSERT
+ * call above) is itself gated to SCR_LIB+SCR_RC_AUDIT; see scr_closure.c's
+ * matching note on scr_box_release_v for the full rationale. */
+void scr_caught_release_v(void *c) { scr_caught_release((ScrCaught *)c); } /* #147 */
+#endif
 
 void scr_rethrow(const ScrCaught *c) {
   switch (c->kind) {

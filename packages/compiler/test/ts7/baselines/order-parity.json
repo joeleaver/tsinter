@@ -955,9 +955,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1520-string-split-static.ts": {
+  "<repo>/tests/corpus/2695-string-split-static.ts": {
    "order": [
-    "<repo>/tests/corpus/1520-string-split-static.ts"
+    "<repo>/tests/corpus/2695-string-split-static.ts"
    ],
    "diags": []
   },
@@ -967,9 +967,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1521-string-trim-pad-static.ts": {
+  "<repo>/tests/corpus/2696-string-trim-pad-static.ts": {
    "order": [
-    "<repo>/tests/corpus/1521-string-trim-pad-static.ts"
+    "<repo>/tests/corpus/2696-string-trim-pad-static.ts"
    ],
    "diags": []
   },
@@ -979,9 +979,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1522-spawnsync-options.ts": {
+  "<repo>/tests/corpus/2697-spawnsync-options.ts": {
    "order": [
-    "<repo>/tests/corpus/1522-spawnsync-options.ts"
+    "<repo>/tests/corpus/2697-spawnsync-options.ts"
    ],
    "diags": []
   },
@@ -991,9 +991,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1523-spawn-options.ts": {
+  "<repo>/tests/corpus/2698-spawn-options.ts": {
    "order": [
-    "<repo>/tests/corpus/1523-spawn-options.ts"
+    "<repo>/tests/corpus/2698-spawn-options.ts"
    ],
    "diags": []
   },
@@ -1003,9 +1003,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1524-catch-narrowing.ts": {
+  "<repo>/tests/corpus/2699-catch-narrowing.ts": {
    "order": [
-    "<repo>/tests/corpus/1524-catch-narrowing.ts"
+    "<repo>/tests/corpus/2699-catch-narrowing.ts"
    ],
    "diags": []
   },
@@ -1015,9 +1015,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1525-unknown-typeof-validation.ts": {
+  "<repo>/tests/corpus/2700-unknown-typeof-validation.ts": {
    "order": [
-    "<repo>/tests/corpus/1525-unknown-typeof-validation.ts"
+    "<repo>/tests/corpus/2700-unknown-typeof-validation.ts"
    ],
    "diags": []
   },
@@ -1051,9 +1051,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1530-spread-override-completion.ts": {
+  "<repo>/tests/corpus/2701-spread-override-completion.ts": {
    "order": [
-    "<repo>/tests/corpus/1530-spread-override-completion.ts"
+    "<repo>/tests/corpus/2701-spread-override-completion.ts"
    ],
    "diags": []
   },
@@ -1063,9 +1063,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1531-process-arch-versions.ts": {
+  "<repo>/tests/corpus/2702-process-arch-versions.ts": {
    "order": [
-    "<repo>/tests/corpus/1531-process-arch-versions.ts"
+    "<repo>/tests/corpus/2702-process-arch-versions.ts"
    ],
    "diags": []
   },
@@ -1075,9 +1075,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1532-union-shared-field-read.ts": {
+  "<repo>/tests/corpus/2703-union-shared-field-read.ts": {
    "order": [
-    "<repo>/tests/corpus/1532-union-shared-field-read.ts"
+    "<repo>/tests/corpus/2703-union-shared-field-read.ts"
    ],
    "diags": []
   },
@@ -1087,9 +1087,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1533-path-platform-namespaces.ts": {
+  "<repo>/tests/corpus/2704-path-platform-namespaces.ts": {
    "order": [
-    "<repo>/tests/corpus/1533-path-platform-namespaces.ts"
+    "<repo>/tests/corpus/2704-path-platform-namespaces.ts"
    ],
    "diags": []
   },
@@ -1099,9 +1099,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1534-union-as-arm-cast.ts": {
+  "<repo>/tests/corpus/2705-union-as-arm-cast.ts": {
    "order": [
-    "<repo>/tests/corpus/1534-union-as-arm-cast.ts"
+    "<repo>/tests/corpus/2705-union-as-arm-cast.ts"
    ],
    "diags": []
   },
@@ -1111,9 +1111,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1535-union-param-defaults.ts": {
+  "<repo>/tests/corpus/2706-union-param-defaults.ts": {
    "order": [
-    "<repo>/tests/corpus/1535-union-param-defaults.ts"
+    "<repo>/tests/corpus/2706-union-param-defaults.ts"
    ],
    "diags": []
   },
@@ -1123,9 +1123,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1536-string-array-sweep.ts": {
+  "<repo>/tests/corpus/2707-string-array-sweep.ts": {
    "order": [
-    "<repo>/tests/corpus/1536-string-array-sweep.ts"
+    "<repo>/tests/corpus/2707-string-array-sweep.ts"
    ],
    "diags": []
   },
@@ -1136,9 +1136,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1537-os-release-spawnsync-stdio.ts": {
+  "<repo>/tests/corpus/2708-os-release-spawnsync-stdio.ts": {
    "order": [
-    "<repo>/tests/corpus/1537-os-release-spawnsync-stdio.ts"
+    "<repo>/tests/corpus/2708-os-release-spawnsync-stdio.ts"
    ],
    "diags": []
   },
@@ -1148,9 +1148,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1538-math-static-scalar.ts": {
+  "<repo>/tests/corpus/2709-math-static-scalar.ts": {
    "order": [
-    "<repo>/tests/corpus/1538-math-static-scalar.ts"
+    "<repo>/tests/corpus/2709-math-static-scalar.ts"
    ],
    "diags": []
   },
@@ -1160,9 +1160,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1539-unknown-truthiness.ts": {
+  "<repo>/tests/corpus/2710-unknown-truthiness.ts": {
    "order": [
-    "<repo>/tests/corpus/1539-unknown-truthiness.ts"
+    "<repo>/tests/corpus/2710-unknown-truthiness.ts"
    ],
    "diags": []
   },
@@ -1172,9 +1172,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1540-void-statement.ts": {
+  "<repo>/tests/corpus/2711-void-statement.ts": {
    "order": [
-    "<repo>/tests/corpus/1540-void-statement.ts"
+    "<repo>/tests/corpus/2711-void-statement.ts"
    ],
    "diags": []
   },
@@ -1184,9 +1184,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1541-union-keyed-reads.ts": {
+  "<repo>/tests/corpus/2712-union-keyed-reads.ts": {
    "order": [
-    "<repo>/tests/corpus/1541-union-keyed-reads.ts"
+    "<repo>/tests/corpus/2712-union-keyed-reads.ts"
    ],
    "diags": []
   },
@@ -1196,9 +1196,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1542-record-literal-into-union.ts": {
+  "<repo>/tests/corpus/2713-record-literal-into-union.ts": {
    "order": [
-    "<repo>/tests/corpus/1542-record-literal-into-union.ts"
+    "<repo>/tests/corpus/2713-record-literal-into-union.ts"
    ],
    "diags": []
   },
@@ -1208,9 +1208,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1543-set-server-handles.ts": {
+  "<repo>/tests/corpus/2714-set-server-handles.ts": {
    "order": [
-    "<repo>/tests/corpus/1543-set-server-handles.ts"
+    "<repo>/tests/corpus/2714-set-server-handles.ts"
    ],
    "diags": []
   },
@@ -1220,9 +1220,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1544-string-matchall.ts": {
+  "<repo>/tests/corpus/2715-string-matchall.ts": {
    "order": [
-    "<repo>/tests/corpus/1544-string-matchall.ts"
+    "<repo>/tests/corpus/2715-string-matchall.ts"
    ],
    "diags": []
   },
@@ -1328,9 +1328,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1561-promise-then.ts": {
+  "<repo>/tests/corpus/2716-promise-then.ts": {
    "order": [
-    "<repo>/tests/corpus/1561-promise-then.ts"
+    "<repo>/tests/corpus/2716-promise-then.ts"
    ],
    "diags": []
   },
@@ -1340,9 +1340,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1562-spawn-conditional-spread.ts": {
+  "<repo>/tests/corpus/2717-spawn-conditional-spread.ts": {
    "order": [
-    "<repo>/tests/corpus/1562-spawn-conditional-spread.ts"
+    "<repo>/tests/corpus/2717-spawn-conditional-spread.ts"
    ],
    "diags": []
   },
@@ -1352,9 +1352,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1563-string-raw-fold.ts": {
+  "<repo>/tests/corpus/2718-string-raw-fold.ts": {
    "order": [
-    "<repo>/tests/corpus/1563-string-raw-fold.ts"
+    "<repo>/tests/corpus/2718-string-raw-fold.ts"
    ],
    "diags": []
   },
@@ -1364,9 +1364,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1564-string-raw.ts": {
+  "<repo>/tests/corpus/2719-string-raw.ts": {
    "order": [
-    "<repo>/tests/corpus/1564-string-raw.ts"
+    "<repo>/tests/corpus/2719-string-raw.ts"
    ],
    "diags": []
   },
@@ -1376,9 +1376,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1565-union-element-join.ts": {
+  "<repo>/tests/corpus/2720-union-element-join.ts": {
    "order": [
-    "<repo>/tests/corpus/1565-union-element-join.ts"
+    "<repo>/tests/corpus/2720-union-element-join.ts"
    ],
    "diags": []
   },
@@ -1418,9 +1418,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1571-stdin-set-raw-mode-non-tty.ts": {
+  "<repo>/tests/corpus/2721-stdin-set-raw-mode-non-tty.ts": {
    "order": [
-    "<repo>/tests/corpus/1571-stdin-set-raw-mode-non-tty.ts"
+    "<repo>/tests/corpus/2721-stdin-set-raw-mode-non-tty.ts"
    ],
    "diags": []
   },
@@ -1430,9 +1430,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1572-x509-validity-date-gettime.ts": {
+  "<repo>/tests/corpus/2722-x509-validity-date-gettime.ts": {
    "order": [
-    "<repo>/tests/corpus/1572-x509-validity-date-gettime.ts"
+    "<repo>/tests/corpus/2722-x509-validity-date-gettime.ts"
    ],
    "diags": []
   },
@@ -1442,9 +1442,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1573-tdz-scalar-forward-capture.ts": {
+  "<repo>/tests/corpus/2723-tdz-scalar-forward-capture.ts": {
    "order": [
-    "<repo>/tests/corpus/1573-tdz-scalar-forward-capture.ts"
+    "<repo>/tests/corpus/2723-tdz-scalar-forward-capture.ts"
    ],
    "diags": []
   },
@@ -1454,9 +1454,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1574-promise-all-tuple-literal.ts": {
+  "<repo>/tests/corpus/2724-promise-all-tuple-literal.ts": {
    "order": [
-    "<repo>/tests/corpus/1574-promise-all-tuple-literal.ts"
+    "<repo>/tests/corpus/2724-promise-all-tuple-literal.ts"
    ],
    "diags": []
   },
@@ -1815,9 +1815,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/1630-rmsync-retry-options.cjs": {
+  "<repo>/tests/corpus/2725-rmsync-retry-options.cjs": {
    "order": [
-    "<repo>/tests/corpus/1630-rmsync-retry-options.cjs"
+    "<repo>/tests/corpus/2725-rmsync-retry-options.cjs"
    ],
    "diags": []
   },
@@ -3153,9 +3153,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2040-mixin-heritage.ts": {
+  "<repo>/tests/corpus/2726-mixin-heritage.ts": {
    "order": [
-    "<repo>/tests/corpus/2040-mixin-heritage.ts"
+    "<repo>/tests/corpus/2726-mixin-heritage.ts"
    ],
    "diags": []
   },
@@ -3165,9 +3165,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2041-mixin-values.ts": {
+  "<repo>/tests/corpus/2727-mixin-values.ts": {
    "order": [
-    "<repo>/tests/corpus/2041-mixin-values.ts"
+    "<repo>/tests/corpus/2727-mixin-values.ts"
    ],
    "diags": []
   },
@@ -3177,10 +3177,10 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2042-mixin-modules/main.ts": {
+  "<repo>/tests/corpus/2728-mixin-modules/main.ts": {
    "order": [
-    "<repo>/tests/corpus/2042-mixin-modules/zoo.ts",
-    "<repo>/tests/corpus/2042-mixin-modules/main.ts"
+    "<repo>/tests/corpus/2728-mixin-modules/zoo.ts",
+    "<repo>/tests/corpus/2728-mixin-modules/main.ts"
    ],
    "diags": []
   },
@@ -3190,9 +3190,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2043-mixin-rc-stress.ts": {
+  "<repo>/tests/corpus/2729-mixin-rc-stress.ts": {
    "order": [
-    "<repo>/tests/corpus/2043-mixin-rc-stress.ts"
+    "<repo>/tests/corpus/2729-mixin-rc-stress.ts"
    ],
    "diags": []
   },
@@ -3208,9 +3208,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2045-parameter-properties.ts": {
+  "<repo>/tests/corpus/2730-parameter-properties.ts": {
    "order": [
-    "<repo>/tests/corpus/2045-parameter-properties.ts"
+    "<repo>/tests/corpus/2730-parameter-properties.ts"
    ],
    "diags": []
   },
@@ -3220,9 +3220,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2046-objlit-accessors-effects.ts": {
+  "<repo>/tests/corpus/2731-objlit-accessors-effects.ts": {
    "order": [
-    "<repo>/tests/corpus/2046-objlit-accessors-effects.ts"
+    "<repo>/tests/corpus/2731-objlit-accessors-effects.ts"
    ],
    "diags": []
   },
@@ -3232,9 +3232,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2047-optional-class-fields.ts": {
+  "<repo>/tests/corpus/2732-optional-class-fields.ts": {
    "order": [
-    "<repo>/tests/corpus/2047-optional-class-fields.ts"
+    "<repo>/tests/corpus/2732-optional-class-fields.ts"
    ],
    "diags": []
   },
@@ -4736,9 +4736,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2556-width-hybrid-shapes.ts": {
+  "<repo>/tests/corpus/2733-width-hybrid-shapes.ts": {
    "order": [
-    "<repo>/tests/corpus/2556-width-hybrid-shapes.ts"
+    "<repo>/tests/corpus/2733-width-hybrid-shapes.ts"
    ],
    "diags": []
   },
@@ -4748,9 +4748,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2557-width-field-lifts.ts": {
+  "<repo>/tests/corpus/2734-width-field-lifts.ts": {
    "order": [
-    "<repo>/tests/corpus/2557-width-field-lifts.ts"
+    "<repo>/tests/corpus/2734-width-field-lifts.ts"
    ],
    "diags": []
   },
@@ -4760,9 +4760,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2558-rejection-events.cjs": {
+  "<repo>/tests/corpus/2735-rejection-events.cjs": {
    "order": [
-    "<repo>/tests/corpus/2558-rejection-events.cjs"
+    "<repo>/tests/corpus/2735-rejection-events.cjs"
    ],
    "diags": []
   },
@@ -4910,9 +4910,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2582-jsval-routed-keyed-ops.js": {
+  "<repo>/tests/corpus/2736-jsval-routed-keyed-ops.js": {
    "order": [
-    "<repo>/tests/corpus/2582-jsval-routed-keyed-ops.js"
+    "<repo>/tests/corpus/2736-jsval-routed-keyed-ops.js"
    ],
    "diags": []
   },
@@ -4922,9 +4922,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2583-jsval-routed-calls.js": {
+  "<repo>/tests/corpus/2737-jsval-routed-calls.js": {
    "order": [
-    "<repo>/tests/corpus/2583-jsval-routed-calls.js"
+    "<repo>/tests/corpus/2737-jsval-routed-calls.js"
    ],
    "diags": []
   },
@@ -4934,9 +4934,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2584-union-dyn-collapse.ts": {
+  "<repo>/tests/corpus/2738-union-dyn-collapse.ts": {
    "order": [
-    "<repo>/tests/corpus/2584-union-dyn-collapse.ts"
+    "<repo>/tests/corpus/2738-union-dyn-collapse.ts"
    ],
    "diags": []
   },
@@ -4946,9 +4946,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2585-unknown-array.ts": {
+  "<repo>/tests/corpus/2739-unknown-array.ts": {
    "order": [
-    "<repo>/tests/corpus/2585-unknown-array.ts"
+    "<repo>/tests/corpus/2739-unknown-array.ts"
    ],
    "diags": []
   },
@@ -5808,9 +5808,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/518-promise-void-union-callbacks.ts": {
+  "<repo>/tests/corpus/2740-promise-void-union-callbacks.ts": {
    "order": [
-    "<repo>/tests/corpus/518-promise-void-union-callbacks.ts"
+    "<repo>/tests/corpus/2740-promise-void-union-callbacks.ts"
    ],
    "diags": []
   },
@@ -5820,9 +5820,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/519-promise-union-await-values.ts": {
+  "<repo>/tests/corpus/2741-promise-union-await-values.ts": {
    "order": [
-    "<repo>/tests/corpus/519-promise-union-await-values.ts"
+    "<repo>/tests/corpus/2741-promise-union-await-values.ts"
    ],
    "diags": []
   },
@@ -6397,9 +6397,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/965-unions-retag.ts": {
+  "<repo>/tests/corpus/2742-unions-retag.ts": {
    "order": [
-    "<repo>/tests/corpus/965-unions-retag.ts"
+    "<repo>/tests/corpus/2742-unions-retag.ts"
    ],
    "diags": []
   },

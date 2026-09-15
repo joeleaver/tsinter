@@ -173,6 +173,19 @@ double scr_library_u64_in(uint64_t v, const char *trap_msg);
 void scr_library_str_out(ScrStr *s, const uint8_t **out, size_t *out_len);
 void scr_library_bytes_out(ScrBytes *b, const uint8_t **out, size_t *out_len);
 
+#ifdef SCR_RC_AUDIT
+/* #147 (delta-10; design-147-v3.txt §(1)/§(3)): the per-entry live set's
+ * insert/forget, called beside every one of the nineteen construction
+ * sites and every one of the twenty-three free routes. A SEPARATE
+ * structure from the outbound arena above — no retain, borrows only.
+ * Compiled ONLY under the sanitize flavour (scr_library.c gates its own
+ * definitions identically); every call site in the shared type-bearing
+ * files must guard itself the same way, since those files also compile
+ * for the executable lane, where these functions do not exist. */
+void scr_library_live_insert(void *v, void (*release)(void *));
+void scr_library_live_forget(void *v);
+#endif
+
 #define scr_atexit(fn) scr_library_register_reset(fn)
 #else
 #define scr_atexit(fn) atexit(fn)
@@ -1372,6 +1385,21 @@ void *scr_closure_retain_v(void *c);
 void scr_closure_release_v(void *c);
 void *scr_union_retain_v(void *u);
 void scr_union_release_v(void *u);
+/* #147: two more void*-signature release adapters, needed only for the
+ * live set's INSERT calls (delta-10) — boxes and ScrCaught had none of
+ * these before (nothing else in the runtime needed to hold their
+ * release_fn as a bare function pointer until now). scr_dyn_release_v
+ * ALREADY EXISTED (declared at :3456, defined scr_json.c) — corrected
+ * here after a real duplicate-definition build failure caught it.
+ * GATED (delta-11/N-3, lead ruling): their only callers are gated to
+ * SCR_LIB+SCR_RC_AUDIT, so the declarations (and their definitions in
+ * scr_closure.c / scr_exception.c) are gated the same way — a shipping
+ * (non-audit) library build must be byte-identical to base, not merely
+ * carrying two expected, accepted differences. */
+#if defined(SCR_LIB) && defined(SCR_RC_AUDIT)
+void scr_box_release_v(void *b);
+void scr_caught_release_v(void *c);
+#endif
 
 /* Trace entry points for the runtime's cycle-headered kinds — passed
  * wherever a container stores a payload's RC entry points (ScrBox obj

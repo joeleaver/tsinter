@@ -1,0 +1,17 @@
+{
+  "profile_format": 1,
+  "name": "conformance-traps-cycled",
+  "entry": "lib.ts",
+  "emission": "llvm",
+  "abi": {
+    "prefix": "kc_",
+    "init_symbol": "kc_init",
+    "sink_register_symbol": "kc_set_panic_sink",
+    "collect_symbol": null,
+    "result_reset_symbol": "kc_reset_results"
+  },
+  "exports": [
+    { "export": "entry1", "symbol": "kc_entry1", "params": ["string"], "returns": "string" },
+    { "export": "entry2", "symbol": "kc_entry2", "params": ["f64"], "returns": "f64" }
+  ]
+}

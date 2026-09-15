@@ -6538,7 +6538,7 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
    * lifted helper whose body pushes each declared field name in first-seen
    * DECLARATION order, skipping fields currently holding the undefined arm
    * of their union at runtime (Node's missing key — an unset optional
-   * never made it into the object; SEMANTICS.md 37's rules). ONE
+   * never made it into the object). ONE
    * construction, interned per shape, shared by Object.keys and for-in —
    * for-in iterates exactly the keys Object.keys answers. */
   export function recordKeysArrayCall(

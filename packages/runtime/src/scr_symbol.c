@@ -34,6 +34,9 @@ void scr_sym_release(ScrSym *s) {
   if (--s->rc == 0) {
     scr_str_release(s->desc);
     scr_str_release(s->reg_key);
+#if defined(SCR_LIB) && defined(SCR_RC_AUDIT)
+    scr_library_live_forget(s); /* #147 */
+#endif
     free(s);
   }
 }
@@ -50,6 +53,9 @@ ScrSym *scr_sym_new(ScrStr *desc) {
   s->desc = desc ? scr_str_retain(desc) : NULL;
   s->reg_key = NULL;
   s->reg_next = NULL;
+#if defined(SCR_LIB) && defined(SCR_RC_AUDIT)
+  scr_library_live_insert(s, scr_sym_release_v); /* #147 */
+#endif
   return s;
 }
 

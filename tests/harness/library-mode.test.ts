@@ -324,6 +324,26 @@ survived, sink_calls=1
     );
   });
 
+  test("K5: #147 T-6, a stashed survivor's trap arrives the same way", async () => {
+    const { archive, outDir } = await buildLibrary("traps", emission);
+    const probe = buildProbe("traps", archive, outDir);
+    const run = runProbe(probe, ["stash"]);
+    expect(run.signal).toBeNull();
+    expect(run.status).toBe(0);
+    expect(run.stdout).toBe(
+      `traps ready
+sink[1]:
+text=[scriptc: RangeError: array index 9 out of bounds (length 3)
+]
+code=[SC4014]
+symbol=[kp_stashThenTrap]
+fields=3 text_printable=1
+addr: nonzero
+survived, sink_calls=1
+`,
+    );
+  });
+
   test("K5: a trap during init routes to the sink the same way", async () => {
     const { archive, outDir } = await buildLibrary("init-trap", emission);
     const probe = buildProbe("init-trap", archive, outDir);
@@ -505,6 +525,41 @@ survived, sink_calls=1
     );
   });
 
+  /* ── #147 T-7: the host-cycled fixture (delta-01 §B-3) ───────────────── */
+  /* Assertions target the printable substrings only — the sink line's raw
+   * bytes carry the structured trap-teaching marker/separator scheme
+   * (0x01/0x1F control bytes, K11's own subject), not reproduced here as
+   * an exact string to avoid re-deriving that encoding as this file's own
+   * literal; the THING T-7 exists to prove is the two lines below. */
+
+  function expectT7Survival(stdout: string): void {
+    expect(stdout).toContain("traps-cycled ready");
+    expect(stdout).toContain("entry1 (before trap): survivor-kept");
+    expect(stdout).toContain("survived, sink_calls=1");
+    // THE ASSERTION: entry1's result reads the SAME after entry2's trap —
+    // the arena and the #147 live set are disjoint, so the sweep never
+    // touches it.
+    expect(stdout).toContain("entry1 (after trap): survivor-kept");
+  }
+
+  test("#147 T-7: entry1's outbound result survives entry2's trap (host-cycled)", async () => {
+    const { archive, outDir } = await buildLibrary("traps-cycled", emission);
+    const probe = buildProbe("traps-cycled", archive, outDir);
+    const run = runProbe(probe);
+    expect(run.signal).toBeNull();
+    expect(run.status).toBe(0);
+    expectT7Survival(run.stdout);
+  });
+
+  platformTest("#147 T-7 under ASan: the same survival, LSan-clean", async () => {
+    const { archive, outDir } = await buildLibrary("traps-cycled", emission, { sanitize: true });
+    const probe = buildProbe("traps-cycled", archive, outDir, { sanitize: true });
+    const run = runProbe(probe);
+    expect(run.signal).toBeNull();
+    expect(run.status).toBe(0);
+    expectT7Survival(run.stdout);
+  });
+
   /* ── K10: the sanitized lane (ASan + the RC audit's re-init seam) ────── */
 
   platformTest("K10: K4 under ASan + RC audit (zero live heap across re-init)", async () => {
@@ -525,6 +580,15 @@ survived, sink_calls=1
     const thrown = runProbe(probe, ["throw"]);
     expect(thrown.status).toBe(0);
     expect(thrown.stdout).toContain("text=[Uncaught Error: kaput");
+    // #147 T-6 (a survivor stashed in a module global, then a trap in the
+    // SAME entry — the sweep's over-release case: the local's own
+    // reference is already consumed by the stash before the trap, one
+    // outstanding reference, not two). A status of 0 under ASan/LSan IS
+    // the clean-heap assertion (a leak or a use-after-free would exit
+    // nonzero); this is the same instrument T-1/T-2 already rely on.
+    const stashed = runProbe(probe, ["stash"]);
+    expect(stashed.status).toBe(0);
+    expect(stashed.stdout).toContain("survived, sink_calls=1");
   });
 });
 

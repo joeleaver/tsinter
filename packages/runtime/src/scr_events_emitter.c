@@ -239,6 +239,9 @@ void scr_emitter_trace(void *obj, ScrTraceVisit visit, void *ctx) {
 static void scr_emitter_gcfree(void *obj) {
   scr_emitter_reg_gcfree(((ScrEmitter *)obj)->reg);
   scr_obj_free_note();
+#if defined(SCR_LIB) && defined(SCR_RC_AUDIT)
+  scr_library_live_forget(obj); /* #147 */
+#endif
   scr_cyc_free(obj);
 }
 
@@ -248,6 +251,9 @@ static void scr_emitter_release_direct(void *obj) {
     scr_cyc_on_dead(em);
     scr_emitter_reg_drop(em->reg);
     scr_obj_free_note();
+#if defined(SCR_LIB) && defined(SCR_RC_AUDIT)
+    scr_library_live_forget(em); /* #147 */
+#endif
     scr_cyc_free(em);
   } else {
     scr_cyc_on_release(em); /* possible cycle root; may collect */
@@ -264,6 +270,9 @@ ScrEmitter *scr_emitter_new(void) {
   em->reg = NULL;
   em->cls = "EventEmitter";
   scr_obj_alloc_note();
+#if defined(SCR_LIB) && defined(SCR_RC_AUDIT)
+  scr_library_live_insert(em, scr_emitter_release_v); /* #147 */
+#endif
   return em;
 }
 

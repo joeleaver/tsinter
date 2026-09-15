@@ -39,6 +39,9 @@ static ScrBytes *scr_bytes_alloc(ScrBytesElem elem, size_t len) {
   b->backing = NULL;
 #ifdef SCR_RC_AUDIT
   scr_live_bytes++;
+#if defined(SCR_LIB)
+  scr_library_live_insert(b, scr_bytes_release_v); /* #147 */
+#endif
 #endif
   return b;
 }
@@ -76,6 +79,9 @@ void scr_bytes_release(ScrBytes *b) {
     }
 #ifdef SCR_RC_AUDIT
     scr_live_bytes--;
+#if defined(SCR_LIB)
+    scr_library_live_forget(b); /* #147 */
+#endif
 #endif
     free(b);
   }
@@ -219,6 +225,9 @@ ScrBytes *scr_bytes_subarray(ScrBytes *b, double start, double end) {
   v->backing = scr_bytes_retain(owner);
 #ifdef SCR_RC_AUDIT
   scr_live_bytes++;
+#if defined(SCR_LIB)
+  scr_library_live_insert(v, scr_bytes_release_v); /* #147 */
+#endif
 #endif
   return v;
 }
@@ -280,6 +289,9 @@ ScrBytes *scr_dataview_new(ScrBytes *src, double byte_off, bool has_len, double 
   v->backing = scr_bytes_retain(owner);
 #ifdef SCR_RC_AUDIT
   scr_live_bytes++;
+#if defined(SCR_LIB)
+  scr_library_live_insert(v, scr_bytes_release_v); /* #147 */
+#endif
 #endif
   return v;
 }

@@ -12,6 +12,9 @@
  *                 same way, its text the baseline "Uncaught ..." line
  *   poisoned    — after a trap, any further entry aborts deterministically
  *   preregister — a trap before sink registration aborts
+ *   stash       — #147 T-6: stores its string argument into a module
+ *                 global, then traps on an unrelated OOB access in the
+ *                 SAME entry — the sweep's over-release case
  */
 #include <setjmp.h>
 #include <stdint.h>
@@ -23,6 +26,7 @@ extern void kp_set_panic_sink(void (*fn)(void *, const uint8_t *, size_t, uint64
 extern double kp_boom(double i);
 extern double kp_fail(const uint8_t *p, size_t len);
 extern double kp_ok(double x);
+extern double kp_stashThenTrap(const uint8_t *p, size_t len, double i);
 
 static jmp_buf trap_jmp;
 static int sink_calls = 0;
@@ -87,6 +91,16 @@ int main(int argc, char **argv) {
   if (strcmp(mode, "throw") == 0) {
     if (setjmp(trap_jmp) == 0) {
       kp_fail((const uint8_t *)"kaput", 5);
+      printf("UNREACHABLE\n");
+    } else {
+      printf("survived, sink_calls=%d\n", sink_calls);
+    }
+    return 0;
+  }
+
+  if (strcmp(mode, "stash") == 0) {
+    if (setjmp(trap_jmp) == 0) {
+      kp_stashThenTrap((const uint8_t *)"kept-in-global", 14, 9);
       printf("UNREACHABLE\n");
     } else {
       printf("survived, sink_calls=%d\n", sink_calls);

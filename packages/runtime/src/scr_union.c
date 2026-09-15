@@ -31,6 +31,9 @@ static void scr_union_gcfree(void *o) {
   if (u->arm_release && !u->arm_trace) u->arm_release(scr_union_peek(u));
 #ifdef SCR_RC_AUDIT
   scr_live_unions--;
+#if defined(SCR_LIB)
+  scr_library_live_forget(u); /* #147 */
+#endif
 #endif
   scr_cyc_free(u);
 }
@@ -41,6 +44,9 @@ static ScrUnion *scr_union_alloc(uint32_t tag) {
   u->tag = tag;
 #ifdef SCR_RC_AUDIT
   scr_live_unions++;
+#if defined(SCR_LIB)
+  scr_library_live_insert(u, scr_union_release_v); /* #147 */
+#endif
 #endif
   return u;
 }
@@ -74,6 +80,9 @@ void scr_union_release(ScrUnion *u) {
     if (u->arm_release) u->arm_release(scr_union_peek(u));
 #ifdef SCR_RC_AUDIT
     scr_live_unions--;
+#if defined(SCR_LIB)
+    scr_library_live_forget(u); /* #147 */
+#endif
 #endif
     scr_cyc_free(u);
   } else {

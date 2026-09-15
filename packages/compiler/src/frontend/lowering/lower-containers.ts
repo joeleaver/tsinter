@@ -6130,7 +6130,8 @@ const DV_SETTERS: Record<string, { method: IrBytesIntrinsicMethod; le: boolean }
 /** `Object.keys/values/entries` over an INDEX-SIGNATURE (overflow-carrying)
    * record shape: declared fields answer first from the compile-time field
    * list (declaration order, undefined-valued fields skipped — exactly the
-   * fixed-shape lowering and SEMANTICS.md 37), then the overflow map's live
+   * fixed-shape lowering and Node's missing-key behavior: an unset optional
+   * never entered the object), then the overflow map's live
    * keys in JS OWN-KEY order (canonical array indices ascending, then
    * insertion order — recordOvfKeys). For a PURE index-signature shape
    * (Record<string, T> — no declared fields, the typical CLI config patterns) the

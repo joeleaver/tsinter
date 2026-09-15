@@ -213,6 +213,9 @@ void scr_regex_release(ScrRegex *re) {
     scr_str_release(re->source);
     scr_str_release(re->flags);
     if (re->bc) lre_realloc(lre_opaque(), re->bc, 0);
+#if defined(SCR_LIB) && defined(SCR_RC_AUDIT)
+    scr_library_live_forget(re); /* #147 */
+#endif
     free(re);
   }
 }
@@ -975,11 +978,25 @@ ScrRegex *scr_regex_new(ScrStr *pattern, ScrStr *flags) {
                      re->source->data, re->flags->data, error_msg);
     scr_str_release(re->source);
     scr_str_release(re->flags);
+    /* #147 B-1 (rev-28's design147v2 read): FORGET here is BELT-AND-
+     * BRACES, not load-bearing — under the corrected insert-point rule
+     * (N-1), `re` is never inserted until the SUCCESS path below, so this
+     * failure path never registered it in the first place. Kept anyway
+     * (a lookup miss is a safe no-op) because it documents the intent at
+     * the exact site a future reader would look for it. */
+#if defined(SCR_LIB) && defined(SCR_RC_AUDIT)
+    scr_library_live_forget(re);
+#endif
     free(re);
     scr_throw_error_msg(SCR_ERR_SYNTAX, msg, (size_t)n);
     return NULL;
   }
   re->bc = bc;
+#if defined(SCR_LIB) && defined(SCR_RC_AUDIT)
+  /* #147: the INSERT — after full initialisation (the success path only,
+   * N-1's corrected rule), never at the calloc above. */
+  scr_library_live_insert(re, scr_regex_release_v);
+#endif
   return re;
 }
 

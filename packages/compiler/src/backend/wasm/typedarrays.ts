@@ -41,19 +41,15 @@
  * OOB element get/set TRAPS (uncatchable) — SEMANTICS.md S003's array
  * discipline, amended to cover typed arrays (see the amendment).
  *
- * Scope note (stage A, reported to the PM): the u8-only Buffer
- * comparison/search surface (equals is here; compareBuf, indexOf/
- * lastIndexOf/includes, fill, fillNum are NOT) is deferred. compareBuf/
- * fill/fillNum need Node's ERR_OUT_OF_RANGE validateOffset ladder
- * (scr_bytes.c's scr_bytes_validate_off + scr_num_received's
- * addNumericalSeparator rendering) — substantial shared machinery that
- * stage B's readNum/writeNum bounds errors need anyway, so it lands once,
- * there. No stage-A-claimed corpus program exercises the deferred
- * methods (measured: 1663-buffer-compare-search-fill needs
- * toString/hex — stage B — regardless of these). indexOf/lastIndexOf/
- * includes never throw and were cut for time, not for a representational
- * reason; they are ordinary future work over the SAME storage this file
- * defines. */
+ * board #149 (INC-26 B1): the u8-only Buffer comparison/search surface is
+ * COMPLETE — equals, compareBuf, indexOf/lastIndexOf/includes(+Num), fill,
+ * fillNum, fillStr, copy and writeStr are all wired below, sharing Node's
+ * ERR_OUT_OF_RANGE validateOffset ladder (%w.bytes.validateOff, declared
+ * ~line 2286, called from fillCore, compareBuf, copy, and writeStr's own
+ * offset checks). Rows measured against a hashed Node oracle agree on
+ * every sampled case, including the two-call distinction at start>len
+ * (throws with an explicit end, silently no-ops without one) and the
+ * wrap-mod-256 numeric-fill arm. */
 import { BUF, LEN, type VecInfo } from "./arrays.js";
 import { Code } from "./code.js";
 import { F64, I32, I64, ModuleBuilder, type ValType } from "./module.js";
@@ -1195,9 +1191,10 @@ export class BytesBuilder {
   }
 
   /* ── numeric bounds/error rendering (scr_bytes.c:1282-1389) — shared by
-   * stage B's readNum/writeNum bounds errors and (future work) compareBuf/
-   * fill/fillNum's validateOffset ladder; built once, here, since both
-   * need Node's ERR_OUT_OF_RANGE "Received" rendering. ─────────────────── */
+   * readNum/writeNum's bounds errors AND validateOff's ladder (board #149,
+   * ~line 2286: compareBuf/fill/fillNum/copy/writeStr's own offset checks);
+   * built once, here, since both need Node's ERR_OUT_OF_RANGE "Received"
+   * rendering. ───────────────────────────────────────────────────────── */
 
   /** %w.bytes.numReceived — (f64) → str; Node's ERR_OUT_OF_RANGE "Received"
    * rendering (scr_num_received): the plain Number.toString() form, UNLESS
@@ -1881,8 +1878,9 @@ export class BytesBuilder {
    * includes(+Num) search family (scr_bytes.c:1032-1162). Neither group
    * needs validateOffHelper (search never throws; swap's only failure is
    * a constant-message length check) — the substrate-sharing methods
-   * (compareBuf/fill/fillNum/fillStr/copy/writeStr) are round B2's next
-   * slice. ───────────────────────────────────────────────────────────── */
+   * (compareBuf/fill/fillNum/fillStr/copy/writeStr) are ALL BUILT, further
+   * below in this file (board #149, INC-26 B1), sharing validateOff's
+   * ladder. ─────────────────────────────────────────────────────────── */
 
   /** %w.bytes.swap:<width> — (bytes<u8>) → bytes<u8>; in-place group
    * reversal, chains (returns the SAME ref — no struct.new; the backing

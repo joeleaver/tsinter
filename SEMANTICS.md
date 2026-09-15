@@ -5252,7 +5252,7 @@ score 0 (or, for the shift, ~0) against the real oracle.
 67-entry register, and three more source sites carry the same stale text (`packages/runtime/src/scr_lib.c:
 2483`, `packages/compiler/src/frontend/lowering/surfaces.ts:479`,
 `packages/compiler/src/backend/emission/emit-exprs.ts:2736`). All five repoint here in the same hunk; a
-sixth site, `tests/corpus/1538-math-static-scalar.ts:3`, is a corpus file and stays untouched — recorded as
+sixth site, `tests/corpus/2709-math-static-scalar.ts:3`, is a corpus file and stays untouched — recorded as
 a residual.)
 
 ## S069 — `date.parseGetTime`: outside its two modelled grammars, the wasm tier FENCES by a named catchable Error; the native lanes answer NaN silently *(per-lane split)*
@@ -5409,7 +5409,7 @@ the comment sits on, never a sibling stance it cites — the trap the design's o
 names): `packages/runtime/src/scr_lib.c:202`, `packages/runtime/src/scr_runtime.h:1997`, `packages/
 compiler/src/ir/nodes.ts:2995`, `packages/compiler/src/frontend/lowering/lower-builtins.ts:4756`, and
 `packages/compiler/ambient/scriptc-node-fallback.d.ts:137` (SHIPS), plus the corpus's own citation at
-`tests/corpus/1531-process-arch-versions.ts:4`. NEVER `packages/compiler/src/frontend/lowering/
+`tests/corpus/2702-process-arch-versions.ts:4`. NEVER `packages/compiler/src/frontend/lowering/
 lower-stmts.ts:3636`/`:3679` — those cite the SAME phrase for a DIFFERENT topic (the record-delete/
 `= undefined` collapse, board #136) and stay exactly as they are.
 
@@ -5547,6 +5547,19 @@ and a forced-host row pinning the unref'd-handle exclusion (2314 never unrefs an
 
 ## S076 — the `promise` argument of `unhandledRejection`/`rejectionHandled` listeners has no preserved identity *(wasm tier only)*
 
+**RETIRED by INC-26 B1 (board #140, commit pending at this pass's landing): the promise argument is now
+boxed as a DK.PROMISE-kind dyn value carrying the underlying promise reference (`dyn.ts`'s own
+`strictEq` already compared DK.PROMISE by that reference — the SAME "box is a boundary artifact, never
+the identity" shape FUNC-kind values get for their boxed closure — this entry's fix was to box the
+REAL promise there instead of a fresh generic object, at BOTH dispatch sites,
+`emitter.ts`'s `dispatchOrReport` and `fireRejectionHandled`). Observables 1-3 below are FIXED, measured
+against Node v24.18.1 (identical text, both lanes). Observable 4 (`instanceof Promise`) remains
+UNCHANGED — a SEPARATE, pre-existing tier limitation (`SC1090`, no class-graph representation for
+`Promise` to test against) this board does not touch; still no corpus program or forced-host row can
+pose that specific check. This entry stays COUNTED (an append-only register never loses an entry) —
+historical citations keep resolving; the header above is unchanged text, describing the divergence AS
+IT STOOD before this fix, for exactly the reader that entry text is still correct history for.**
+
 RULING P1-R6 (an earlier, RETIRED draft used this same number for a different, never-landed text — a
 synchronous-firing-timing divergence that was superseded by an implementation before it ever merged; this
 entry is unrelated to that draft and stands alone). The promise argument of the unhandledRejection and
@@ -5584,13 +5597,15 @@ distinguish which promise fired — observable 2 above, restated as a test-const
 a program-observable one. That is not merely a gap in one test row; it is an observable difference from
 Node for any program using the common `WeakMap`-keyed idiom (observables 2/3).
 
-**Tested by:** the FIFO-order row (retired — see wasm-host-process.test.ts's own comment, kept as a
-count-only assertion that the listener fires exactly twice, no longer claiming an order it cannot observe)
-and M-16 (retired-with-reason: reddens nothing BECAUSE the axis is unobservable by construction, a measured
-statement about this entry, not a missing pin). Board #140 (preserve promise identity across the dyn
-boundary for listener arguments — an interned/handle-kind box whose `strictEq` compares the underlying
-promise ref, `dyn.strictEq`'s own `offUnhandledRejection` shape) would retire this entry and make FIFO
-order observable again, restoring the row and M-16 as a real mutation. Not this pass's to build.
+**Tested by (historical, pre-INC-26-B1):** the FIFO-order row (retired — see wasm-host-process.test.ts's
+own comment, kept as a count-only assertion that the listener fires exactly twice, no longer claiming an
+order it cannot observe) and M-16 (retired-with-reason: reddens nothing BECAUSE the axis is unobservable
+by construction, a measured statement about this entry, not a missing pin).
+
+**RESTORED by INC-26 B1 (board #140):** the FIFO-order row and M-16 are back as REAL instruments —
+wasm-host-process.test.ts's own count-only row is replaced by an order-asserting one (its comment
+updated to say so), and M-16 (drain the rejectionHandled queue in LIFO instead of FIFO order) now
+reddens the restored row, since the listener argument can distinguish which promise fired again.
 
 ## S077 — `process.kill`'s and `process.chdir`'s thrown Errors carry `.code` and Node's exact `.message` ONLY; `.errno`/`.syscall` (kill) and `.errno`/`.syscall`/`.path`/`.dest` (chdir) are UNREPRESENTED *(wasm tier only)*
 

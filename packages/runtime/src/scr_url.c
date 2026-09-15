@@ -49,6 +49,9 @@ void scr_url_release(ScrUrl *u) {
     scr_str_release(u->path);
     scr_str_release(u->query);
     scr_str_release(u->fragment);
+#if defined(SCR_LIB) && defined(SCR_RC_AUDIT)
+    scr_library_live_forget(u); /* #147 */
+#endif
     free(u);
   }
 }
@@ -533,6 +536,13 @@ ScrUrl *scr_url_new(ScrStr *input) {
   u->fragment = fragment;
   u->has_authority = has_authority;
   u->sp_cache = NULL;
+#if defined(SCR_LIB) && defined(SCR_RC_AUDIT)
+  /* #147 (N-1): insert HERE, after every field is set — not at the
+   * malloc above, which precedes this by only non-trapping assignments
+   * in THIS function, but the insert-point rule is stated uniformly
+   * (design-147-v3-addendum.txt FOLD 1). */
+  scr_library_live_insert(u, scr_url_release_v);
+#endif
   return u;
 }
 
@@ -744,6 +754,14 @@ static ScrUrl *scr_url_new_file(ScrStr *host, ScrStr *encoded_path) {
   u->fragment = scr_str_new("", 0);
   u->has_authority = true;
   u->sp_cache = NULL;
+#if defined(SCR_LIB) && defined(SCR_RC_AUDIT)
+  /* #147 (N-1, THE hazard this fold corrects): insert HERE, after every
+   * field is set — the fields above are built via scr_str_new, each of
+   * which can scr_oom() and trap; inserting at the malloc (as design-v1
+   * would have) would register a partially-initialised object whose
+   * garbage fields scr_url_release then dereferences unconditionally. */
+  scr_library_live_insert(u, scr_url_release_v);
+#endif
   return u;
 }
 

@@ -94,13 +94,13 @@ const WINDOWS_SKIPS: Record<string, string> = {
   "1471-child-unref.ts": "posix-shaped: the unlistened sh spawn failure crashes both sides, rendered differently",
   "1473-promisify-execfile.ts": "posix-shaped: the unhandled spawn-ENOENT rejection crashes both sides, rendered differently",
   "1482-spawnsync-error.ts": "posix-shaped: /bin/sh fails ENOENT on Windows Node too — its null stdout .trim() crashes the oracle where the documented \"\" stance carries on",
-  "1522-spawnsync-options.ts": "posix-shaped: the sh capture case exposes the documented spawn-failure \"\"-vs-null stance (every other line agrees; 1644 covers the options here)",
-  "1523-spawn-options.ts": "posix-shaped: the unlistened sh spawn failure crashes both sides, rendered differently",
+  "2697-spawnsync-options.ts": "posix-shaped: the sh capture case exposes the documented spawn-failure \"\"-vs-null stance (every other line agrees; 1644 covers the options here)",
+  "2698-spawn-options.ts": "posix-shaped: the unlistened sh spawn failure crashes both sides, rendered differently",
   "1525-child-exit-signal.ts": "posix-shaped: the unlistened sh spawn failure crashes both sides, rendered differently (1646 covers kill/exit signals here)",
   "1535-spawn-fd-stdio.ts": "posix-shaped: the unlistened sh spawn failure crashes both sides, rendered differently",
-  "1537-os-release-spawnsync-stdio.ts": "posix-shaped: the failed spawns expose the documented spawn-failure \"\"-vs-null stance",
+  "2708-os-release-spawnsync-stdio.ts": "posix-shaped: the failed spawns expose the documented spawn-failure \"\"-vs-null stance",
   "1552-exec-options-record.ts": "posix-shaped: the uncaught /bin/echo ENOENT throw crashes both sides, rendered differently",
-  "1562-spawn-conditional-spread.ts": "posix-shaped: the unlistened sh spawn failure crashes both sides, rendered differently",
+  "2717-spawn-conditional-spread.ts": "posix-shaped: the unlistened sh spawn failure crashes both sides, rendered differently",
   "1565-spawn-pipe-streams.ts": "posix-shaped: the unlistened /bin/sh spawn failure crashes both sides, rendered differently (1646 covers pipe streams here)",
   "1566-child-duck-interface.ts": "posix-shaped: the unlistened sh spawn failure crashes both sides, rendered differently",
   "1570-child-unref-kill-reffed.ts": "posix-shaped: the unlistened sleep spawn failure crashes both sides, rendered differently",
@@ -132,7 +132,7 @@ const WINDOWS_SKIPS: Record<string, string> = {
   // are absent there); the runtime throws the same TypeError, but the
   // ORACLE differs per box user anyway.
   "1461-process-pid-getuid-kill.ts": "process.getuid absent on Windows (Node too)",
-  "1531-process-arch-versions.ts": "process.getuid/getgid absent on Windows Node (typed present here)",
+  "2702-process-arch-versions.ts": "process.getuid/getgid absent on Windows Node (typed present here)",
   "1571-optional-call-tostring-tail.ts": "process.getuid?.() short-circuits on Windows Node (member exists here)",
   // The errno-spelling gap 1520 used to name is FIXED (scr_fs_throw
   // translates the CRT's EACCES to EPERM on win32 — libuv's

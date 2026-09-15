@@ -678,15 +678,26 @@ function hostNumReachable(mod: WModule): boolean {
  * `emitCheckpointCore` (this file, `hasTicks` read) checks
  * `this.nextTickField !== null` — the PRIVATE FIELD, not the lazily-
  * interning `this.nextTick` GETTER — at the moment EACH checkpoint is
- * emitted. If `process.emitWarning`'s own dispatch arm is the FIRST thing
- * in the whole program to touch `this.nextTick`, and some EARLIER-walked
- * function's checkpoint is emitted before that arm is reached, that
- * checkpoint's bytes are already fixed with `hasTicks` false — the queued
- * warning is silently never drained (board #139's own mechanism). The fix
- * is to force `this.nextTick` (the GETTER, interning eagerly) from THIS
- * prescan's result, in the constructor, before any function body is
- * walked and therefore before any checkpoint can be emitted — see the
- * eager-touch call site below. */
+ * BUILT. The hazard is narrower than user-function walk order: it is that
+ * `emitCheckpointCore` itself, while building a checkpoint, calls
+ * `this.proms.report()` (cached — built on first use, right there), and
+ * IF that generated dispatch arm is the first thing in the whole module to
+ * touch `this.nextTick`, the touch lands one step after `hasTicks` was
+ * already read at this function's own top. The fix is to force
+ * `this.nextTick` (the GETTER, interning eagerly) from THIS prescan's
+ * result, in the constructor, before any checkpoint can be built. (INC-26
+ * B1 tried widening this to three more triggers — user-level
+ * `unhandledRejectionReachable`/`rejectionHandledReachable`/a direct
+ * `process.nextTick` scan — on the theory that ORDINARY walk order could
+ * cause the same lateness. Proven unreachable and WITHDRAWN, B1:
+ * `emitFirstCheckpoint` and `tick()` are each requested from exactly one
+ * call site, both strictly after the whole module's function-walk loop
+ * completes, so `hasTicks` is already final — from ordinary walked code,
+ * not just from `process.emitWarning` — before any checkpoint is ever
+ * built, timer-ful module or not. rev-27's proof:
+ * inc26-work/inc26/rev27/findings-rev27-r139g-b1.txt; this pass's own
+ * measurement: R139-g in wasm-host-boards-b1.test.ts, both stayed green
+ * without the widening.) */
 function emitWarningReachable(mod: WModule): boolean {
   const reachable = reachableFunctionNames(mod);
   let found = false;
@@ -1867,6 +1878,13 @@ class Assembler {
    * `needsUnhandledRejectionDispatch` (a module can register one event
    * without the other). */
   private readonly needsRejectionHandledDispatch: boolean;
+  /** Board #139 (INC-26 B1, design-139-v2 §C): true iff EITHER of the two
+   * listener-reachability prescans above is true — the gate for
+   * emitCheckpointCore's fixed-point loop term (reportInvoked()/
+   * drainPendingHandledInvoked() vs the plain report()/
+   * drainPendingHandled()). A listener-free module (this field false)
+   * takes emitCheckpointCore's UNCHANGED, byte-identical code path. */
+  private readonly needsListenerLoopTerm: boolean;
   /** `Date.now()`/`new Date()`'s wall clock reads this import and floors;
    * `performance.now()`'s ORIGIN — `now()` sampled ONCE at `_start`
    * entry, in a mutable f64 global, in any module that reaches
@@ -1935,6 +1953,7 @@ class Assembler {
     // require it — strings stay immutable by discipline: nothing outside
     // the concat builder may write an element.
     this.strType = this.mb.arrayType("i16", true);
+    // ── begin INC-26 host-import block (the ONE prescan-guarded importFunc site; wasm-host-fs-p5 (f) anchors here) ──
     this.writeFunc = this.mb.importFunc(
       IMPORT_MODULE,
       IMPORT_WRITE,
@@ -2007,12 +2026,14 @@ class Assembler {
           this.mb.funcType([I32, I32, I32, I32, I32, I32, I32], [I32]),
         )
       : null;
+    // ── end INC-26 host-import block ──
     // The exit-drain gate's STATIC fact (see exitListenerSurfaceReachable's
     // own comment on why this must not be a runtime flag): true iff
     // process.exit/onExit/offExit is reached anywhere in the module.
     this.needsExitDrain = this.exitFunc !== null || exitListenerSurfaceReachable(mod);
     this.needsUnhandledRejectionDispatch = unhandledRejectionReachable(mod);
     this.needsRejectionHandledDispatch = rejectionHandledReachable(mod);
+    this.needsListenerLoopTerm = this.needsUnhandledRejectionDispatch || this.needsRejectionHandledDispatch;
     // INC-26 P3 (brief-p3-v2.md §3D, rev-26 CP1 pre-read D-3/E-1): force
     // `this.nextTick` (the GETTER, interning the queue NOW) in any module
     // that reaches `process.emitWarning`, BEFORE any function body is
@@ -2024,6 +2045,20 @@ class Assembler {
     // so eagerly touching the getter changes the emitted module ONLY
     // through `hasTicks` becoming true where it would otherwise start
     // false — nothing else moves (rev-26 CP1 pre-read E-1).
+    //
+    // INC-26 B1 (board #139) tried widening this to three more triggers —
+    // `unhandledRejectionReachable`/`rejectionHandledReachable`/a direct
+    // `process.nextTick` scan — on the theory that ordinary user-function
+    // walk order could cause the same lateness for those paths too.
+    // WITHDRAWN: `emitFirstCheckpoint` and `tick()` (timers.ts) are each
+    // requested from exactly one call site, both strictly AFTER the whole
+    // module's function-walk loop completes, so `hasTicks` is already
+    // final for ordinary walked code — timer-ful module or not — before
+    // any checkpoint is ever built; the widening's target was
+    // unreachable. Proof: rev-27's
+    // inc26-work/inc26/rev27/findings-rev27-r139g-b1.txt, corroborated by
+    // this pass's own R139-g measurement (wasm-host-boards-b1.test.ts —
+    // green with and without this trigger).
     if (emitWarningReachable(mod)) {
       void this.nextTick;
     }
@@ -4031,10 +4066,22 @@ class Assembler {
         c.i32Const(1);
         c.structSet(this.proms.promT, PROM_REPORTED_UNHANDLED);
         this.boxPromiseReasonToDyn(c, p, k);
-        // SEMANTICS.md S076: a fresh generic object, never `p` itself —
-        // this listener's "promise" argument has no preserved identity
-        // (the reason argument above is unaffected).
-        this.dyn.boxObj(c, (x) => this.dyn.pushNewObj(x, false));
+        // Board #140 (INC-26 B1): S076 RETIRED — box the ACTUAL promise
+        // `p` as a DK.PROMISE-kind dyn value (dyn.ts's strictEq already
+        // compares DK.PROMISE by DYN_REF — the SAME comparison FUNC-kind
+        // dyn values get for their boxed closure; this arm existed,
+        // unreached from here, before this fix), never a fresh generic
+        // object — two fires of the SAME promise now box to two DIFFERENT
+        // $dyn wrappers (boxing is not interned) around the SAME
+        // underlying ref, exactly like FUNC's own boundary-artifact
+        // shape, so strictEq/Map/WeakMap/Set all see the same identity
+        // Node does. The construction is the SAME sequence
+        // %w.async's own `Promise.resolve()` dyn-boxing uses
+        // (emitter.ts, jsOp:callMethod's "then" receiver path).
+        c.i32Const(DK.PROMISE);
+        c.f64Const(0);
+        c.localGet(p);
+        c.structNew(this.dyn.dynT());
         c.call(this.proc.dispatchUnhandledRejection());
         c.else_();
         fallback();
@@ -4048,20 +4095,22 @@ class Assembler {
       // retired, since this is IMPLEMENTED, not a divergence). The
       // read-and-clear of
       // `PROM_REPORTED_UNHANDLED` and the FIFO enqueue both now live in
-      // promises.ts itself (pure `promT` field work, no DI needed); this
-      // hook only boxes a fresh generic "promise" dyn value (unchanged
-      // since P1-R3 — identity is not preserved either place) and fires
-      // the listener list. A no-op unless `needsRejectionHandledDispatch`
-      // (the static prescan).
-      fireRejectionHandled: (c) => {
+      // promises.ts itself (pure `promT` field work, no DI needed). A
+      // no-op unless `needsRejectionHandledDispatch` (the static prescan).
+      fireRejectionHandled: (c, promiseLocal) => {
         if (!this.needsRejectionHandledDispatch) return;
-        // SEMANTICS.md S076: same fresh-generic-object shape as
-        // dispatchOrReport's own "promise" argument above — no identity
-        // preserved (board #140 would fix both sites at once).
-        this.dyn.boxObj(c, (x) => this.dyn.pushNewObj(x, false)); // "the promise"
+        // Board #140 (INC-26 B1): S076 RETIRED — same DK.PROMISE boxing
+        // as dispatchOrReport's own "promise" argument above (dyn.ts's
+        // strictEq already compares DK.PROMISE by DYN_REF). `promiseLocal`
+        // is promises.ts's own CUR-node-field-0 extraction, passed in.
+        c.i32Const(DK.PROMISE);
+        c.f64Const(0);
+        c.localGet(promiseLocal);
+        c.structNew(this.dyn.dynT());
         c.call(this.proc.dispatchRejectionHandled());
       },
       needsRejectionHandled: () => this.needsRejectionHandledDispatch,
+      needsListenerLoopTerm: () => this.needsListenerLoopTerm,
     });
     return this.promsField;
   }
@@ -4318,39 +4367,121 @@ class Assembler {
    * on a nonzero exit (S007's surviving half, S010's root paragraph). A
    * program with no module root emits exactly what it did before this
    * existed — the check is three instructions that only appear with one. */
+  /** Board #139 (INC-26 B1, design-139-v2): emitCheckpointCore's own
+   * cross-call INVOKED accumulator for the fixed-point loop term — a
+   * GLOBAL, never a local, because emitCheckpointCore shares its `Code`
+   * object with whichever caller (_start via emitFirstCheckpoint, _tick
+   * via emitCheckpoint) is building around it and does not own that
+   * function's own local space — every other piece of cross-call state
+   * this function already reads works the same way (nextTick.headGlobal(),
+   * the ledger's head/tail). Lazily allocated: never built for a
+   * listener-free module (gated on needsListenerLoopTerm at every use
+   * site below). */
+  private invokedFlagField: number | null = null;
+
+  private invokedFlagGlobal(): number {
+    this.invokedFlagField ??= this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41); // i32.const 0
+      w.sleb(0);
+    });
+    return this.invokedFlagField;
+  }
+
   private emitCheckpointCore(c: Code, isFirst: boolean): void {
     const hasProms = this.promsField !== null;
     const hasTicks = this.nextTickField !== null;
     if (!hasProms && !hasTicks) return;
+    // Board #139 call sites, cited by SYMBOL (this function's own two
+    // branches), never by worktree line number (N-6): four total, two
+    // per branch below — this IS the complete, closed set (grep-verified;
+    // rootReport() is a separate function for the TLA module root, which
+    // is marked observed at birth and never reaches report()'s walk).
     if (!hasTicks) {
+      if (!this.needsListenerLoopTerm) {
+        // UNCHANGED from before this pass — byte-identical for a
+        // listener-free hasProms module (design-139-v2 §C).
+        c.call(this.proms.drain());
+        if (this.needsRejectionHandledDispatch) c.call(this.proms.drainPendingHandled());
+        c.call(this.proms.report());
+        this.emitRootCheck(c);
+        return;
+      }
+      // Board #139: the no-ticks branch becomes a fixed-point loop on
+      // INVOKED alone — Node's `while (!queue.isEmpty() || (hasRejection
+      // ToWarn() && processPromiseRejections()))` with the tick-queue
+      // disjunct dropped (there is no tick queue in this branch) and the
+      // guard dropped (sound — see nexttick.ts's header). ORDER unchanged:
+      // microtasks → handled-dispatch → report (P1-R5).
+      c.loop();
       c.call(this.proms.drain());
-      // RULING P1-R5: the HANDLED pass — every promise a handler attached
-      // to since the last checkpoint, in FIFO order — runs AFTER the
-      // turn's own microtask drain and BEFORE the unhandled pass, exactly
-      // where Node's own checkpoint decides both (measured).
-      if (this.needsRejectionHandledDispatch) c.call(this.proms.drainPendingHandled());
-      c.call(this.proms.report());
+      c.i32Const(0);
+      c.globalSet(this.invokedFlagGlobal());
+      if (this.needsRejectionHandledDispatch) {
+        c.call(this.proms.drainPendingHandledInvoked());
+        c.globalGet(this.invokedFlagGlobal());
+        c.i32Or();
+        c.globalSet(this.invokedFlagGlobal());
+      }
+      c.call(this.proms.reportInvoked());
+      c.globalGet(this.invokedFlagGlobal());
+      c.i32Or();
+      c.globalSet(this.invokedFlagGlobal());
+      c.globalGet(this.invokedFlagGlobal());
+      c.brIf(0);
+      c.end();
       this.emitRootCheck(c);
       return;
     }
     if (isFirst && hasProms) c.call(this.proms.drain());
+    if (!this.needsListenerLoopTerm) {
+      // UNCHANGED from before this pass — byte-identical for a
+      // listener-free module that only reaches nextTick directly
+      // (design-139-v2 §C).
+      c.loop();
+      c.call(this.nextTick.drain());
+      if (hasProms) c.call(this.proms.drain());
+      c.globalGet(this.nextTick.headGlobal());
+      c.refIsNull();
+      c.i32Eqz();
+      c.brIf(0);
+      c.end();
+      if (hasProms) {
+        if (this.needsRejectionHandledDispatch) c.call(this.proms.drainPendingHandled());
+        c.call(this.proms.report());
+        this.emitRootCheck(c);
+      }
+      return;
+    }
+    // Board #139: handled-dispatch + report move FROM AFTER this loop TO
+    // INSIDE it (ORDER unchanged: ticks → microtasks → handled → report,
+    // P1-R5), and the loop's own condition widens from "tick queue
+    // non-empty" alone to "tick queue non-empty OR INVOKED" — Node's own
+    // loop, verbatim (nexttick.ts's header).
     c.loop();
     c.call(this.nextTick.drain());
     if (hasProms) c.call(this.proms.drain());
+    c.i32Const(0);
+    c.globalSet(this.invokedFlagGlobal());
+    if (hasProms) {
+      if (this.needsRejectionHandledDispatch) {
+        c.call(this.proms.drainPendingHandledInvoked());
+        c.globalGet(this.invokedFlagGlobal());
+        c.i32Or();
+        c.globalSet(this.invokedFlagGlobal());
+      }
+      c.call(this.proms.reportInvoked());
+      c.globalGet(this.invokedFlagGlobal());
+      c.i32Or();
+      c.globalSet(this.invokedFlagGlobal());
+    }
     c.globalGet(this.nextTick.headGlobal());
     c.refIsNull();
     c.i32Eqz();
+    c.globalGet(this.invokedFlagGlobal());
+    c.i32Or();
     c.brIf(0);
     c.end();
-    if (hasProms) {
-      // Same HANDLED-before-unhandled order as the no-nextTick branch
-      // above — the outer loop has already alternated both queues to a
-      // fixed point, so every promise this turn's work could have
-      // attached a handler to is already queued here.
-      if (this.needsRejectionHandledDispatch) c.call(this.proms.drainPendingHandled());
-      c.call(this.proms.report());
-      this.emitRootCheck(c);
-    }
+    if (hasProms) this.emitRootCheck(c);
   }
 
   /** The top-level-await root's own stop, factored out of

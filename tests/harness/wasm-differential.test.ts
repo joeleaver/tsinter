@@ -208,8 +208,8 @@ const TIER_FLOOR: string[] = [
   "1368-constructor-functions.ts",
   "1370-spread.ts",
   "1372-loose-null-tests.ts",
-  "1530-spread-override-completion.ts",
-  "1532-union-shared-field-read.ts",
+  "2701-spread-override-completion.ts",
+  "2703-union-shared-field-read.ts",
   "1536-destructuring-defaults.ts",
   "1549-array-isarray-unions.ts",
   "1553-truthy-hof-predicates.ts",
@@ -279,7 +279,7 @@ const TIER_FLOOR: string[] = [
   // hoisting, the startup-crash pair (%main opens with the lowered
   // throw), and the invisible/poisoned cjs-esm tails.
   "1124-union-narrowed-retag.ts",
-  "1535-union-param-defaults.ts",
+  "2706-union-param-defaults.ts",
   "1616-cjs-esm-lexer-invisible/main.mjs",
   "1618-cjs-esm-poisoned-tail/main.mjs",
   "1619-cjs-esm-reexport-invisible/main.mjs",
@@ -309,12 +309,12 @@ const TIER_FLOOR: string[] = [
   "1408-string-indexing.ts",
   "1432-destructured-params.ts",
   "1433-filter-narrow.ts",
-  "1521-string-trim-pad-static.ts",
+  "2696-string-trim-pad-static.ts",
   "1533-bool-equality.ts",
   "1556-union-retag-width-arms.ts",
   "1561-forof-strings.ts",
-  "1563-string-raw-fold.ts",
-  "1564-string-raw.ts",
+  "2718-string-raw-fold.ts",
+  "2719-string-raw.ts",
   "1851-overload-return-narrowing.ts",
   "1990-labels-basics.ts",
   "2087-destructuring-for-heads.ts",
@@ -385,7 +385,7 @@ const TIER_FLOOR: string[] = [
   // `T | PromiseLike<T>` return form).
   "1538-await-promiselike-return.ts",
   // Fire-and-forget `void asyncFn()` beside an awaiting one.
-  "1540-void-statement.ts",
+  "2711-void-statement.ts",
   // `await null` / `await undefined` interleaved with `.then` chains —
   // the bare microtask hop against settled-promise awaits, one turn each.
   "2320-await-unit.ts",
@@ -491,7 +491,7 @@ const TIER_FLOOR: string[] = [
   // null inner slot is the sentinel), the declaration's `assign` fills it
   // through the indirection, and an early read is Node's catchable
   // ReferenceError.
-  "1573-tdz-scalar-forward-capture.ts",
+  "2723-tdz-scalar-forward-capture.ts",
   // A reference CYCLE through a body box: the box holds a promise that is
   // fulfilled with a closure capturing that same box. Also the boxed
   // PARAM shape — no boxInit, since the wrapper's prologue re-boxes every
@@ -515,7 +515,7 @@ const TIER_FLOOR: string[] = [
   // rejection on.
   "1429-promise-catch-finally.ts",
   // The `.then(onFulfilled, onRejected)` family beside them.
-  "1561-promise-then.ts",
+  "2716-promise-then.ts",
 
   // Increment 12 (async), stage 7: the promise combinators and the
   // union-armed await. Promise.all and Promise.race subscribe one REACTION
@@ -546,10 +546,10 @@ const TIER_FLOOR: string[] = [
   // `Promise<void> | void` callbacks: the union-armed await where the
   // result is VOID, so only subscribe/rejectCheck are involved — hop
   // counts pinned against a background fiber, tick for tick.
-  "518-promise-void-union-callbacks.ts",
+  "2740-promise-void-union-callbacks.ts",
   // The same await where the result carries a VALUE, which is the settled
   // read and its re-tag.
-  "519-promise-union-await-values.ts",
+  "2741-promise-union-await-values.ts",
   // Free riders: a top-level-await loader waiting on several dependencies
   // at once is a Promise.all, in the module initializer and across a
   // cycle's external importer (stage 4 named both).
@@ -671,7 +671,7 @@ const TIER_FLOOR: string[] = [
   "2073-destructuring-assignment.ts",
   "952-modules-cross/main.ts",
   // Unions whose only remaining blocker was identity on a ref arm.
-  "965-unions-retag.ts",
+  "2742-unions-retag.ts",
   "970-unions-basics.ts",
   // PROMISE identity rides the same arm: every promise is one struct
   // whatever its inner type, so `p1 === p2` is the same single compare.
@@ -705,9 +705,9 @@ const TIER_FLOOR: string[] = [
   "723-accessors-rc-stress.ts",
   // Mixins are plain inheritance chains once the frontend has flattened
   // them, so the whole family arrives with dispatch.
-  "2040-mixin-heritage.ts",
-  "2042-mixin-modules/main.ts",
-  "2043-mixin-rc-stress.ts",
+  "2726-mixin-heritage.ts",
+  "2728-mixin-modules/main.ts",
+  "2729-mixin-rc-stress.ts",
   // Generic classes and generic methods dispatching through a hierarchy.
   "1953-generic-class-hierarchy.ts",
   "2002-generic-methods-inheritance.ts",
@@ -767,7 +767,7 @@ const TIER_FLOOR: string[] = [
   // interval (JS has one `Box` at runtime) while construction still runs
   // the instantiation's own thunk — the native lanes' split.
   "1952-generic-class-statics-values.ts",
-  "2041-mixin-values.ts",
+  "2727-mixin-values.ts",
   // Decorators are class values by IR time: the decorator expression
   // takes and returns one, so the whole family arrives here.
   "1970-decorators-basics.ts",
@@ -797,7 +797,7 @@ const TIER_FLOOR: string[] = [
   "1711-cjs-export-single-values/main.js",
   "1825-exhaustive-typeof-switch.ts",
   "2352-void-coercions.ts",
-  "2557-width-field-lifts.ts",
+  "2734-width-field-lifts.ts",
   "2613-for-init-uninitialized-let.ts",
   // Increment 14 (dyn core), stage 2: the COMPOSITE walkers — per-typeKey
   // emitted functions that convert a static value into a dyn tree and
@@ -830,7 +830,7 @@ const TIER_FLOOR: string[] = [
   // this list honest without a compile-time fence.
   "1002-json-parse-cast.ts",
   "1004-json-parse-errors.ts",
-  "1539-unknown-truthiness.ts",
+  "2710-unknown-truthiness.ts",
   "912-unknown-slots.ts",
   // Increment 14 (dyn core), stage 3b: the rest of the keyed surface —
   // the keyed write, the presence tests, the three enumeration walks and
@@ -1019,7 +1019,7 @@ const TIER_FLOOR: string[] = [
   // moreItems, circCheck, seenPush, refWrap, circular, error.
   "1631-inspect-arrays.ts",
   "1632-inspect-records.ts",
-  "2045-parameter-properties.ts",
+  "2730-parameter-properties.ts",
   "2046-abstract-classes.ts",
   "2451-private-fields.ts",
   "2485-inspect-circular-refs.ts",
@@ -1077,7 +1077,7 @@ const TIER_FLOOR: string[] = [
   "2301-cjs-export-table-dom-attach.cjs",
   "2322-dyn-array-sort.cjs",
   "2473-option-table-widths.js",
-  "2585-unknown-array.ts",
+  "2739-unknown-array.ts",
   "2600-dyn-keyed-write-harness.js",
   "2601-dyn-keyed-write-ops.js",
   "2602-dyn-array-destructure.js",
@@ -1158,7 +1158,7 @@ const TIER_FLOOR: string[] = [
   // hybrid shapes.
   "908-records-index-signatures.ts",
   "911-records-index-dot-access.ts",
-  "1542-record-literal-into-union.ts",
+  "2713-record-literal-into-union.ts",
   "1545-spread-order-and-optional.ts",
   "1547-computed-key-fold.ts",
   "1548-boolean-condition-forms.ts",
@@ -1176,7 +1176,7 @@ const TIER_FLOOR: string[] = [
   "2433-as-const-command-tables.ts",
   "2470-mockable-module-shape.js",
   "2550-generics-keyof-pick.ts",
-  "2556-width-hybrid-shapes.ts",
+  "2733-width-hybrid-shapes.ts",
   "2559-index-signature-container-values.ts",
   // Increment 17 stage C (the edges + integration sweep): dyn.ts's CHECK
   // and MATCH walkers gain index-signature arms — width TOLERANCE becomes
@@ -1208,7 +1208,7 @@ const TIER_FLOOR: string[] = [
   "914-records-from-entries.ts",
   "915-unknown-tostring-eq.ts",
   "1011-json-unknown-typeof.ts",
-  "1525-unknown-typeof-validation.ts",
+  "2700-unknown-typeof-validation.ts",
   "1575-unknown-assert-into-record.ts",
   // Increment 18 stage A (typed arrays — the core): the $bytes struct
   // (typedarrays.ts), all four bytesNew source forms, get/bytesSet with
@@ -1452,7 +1452,7 @@ const TIER_FLOOR: string[] = [
   "2000-generic-methods-basic.ts",
   "2003-generic-methods-object-literal.ts",
   "2020-generic-value-bindings.ts",
-  "2047-optional-class-fields.ts",
+  "2732-optional-class-fields.ts",
   "2360-tuple-to-array.ts",
   "2366-string-well-formed.ts",
   "2369-promise-try.ts",
@@ -1466,7 +1466,7 @@ const TIER_FLOOR: string[] = [
   "2538-destructuring-assign-class-source.ts",
   "2554-generics-frontier-mix.ts",
   "2558-index-signature-func-values.ts",
-  "2584-union-dyn-collapse.ts",
+  "2738-union-dyn-collapse.ts",
   // Increment 21, toString:caught rider: String(e) / `${e}` over a catch
   // binding now lowers (emitter.ts's "toString" case, the "caught" arm) —
   // scalars format directly, an %Error-rooted OBJ payload renders through
@@ -1566,7 +1566,7 @@ const TIER_FLOOR: string[] = [
   "2579-jsval-object-param-crossing.js",
   "2580-jsval-routed-keyed-ops.js",
   "2582-jsval-object-statics.js",
-  "2582-jsval-routed-keyed-ops.js",
+  "2736-jsval-routed-keyed-ops.js",
   "2583-dyn-nullish-coalesce.js",
   "2584-jsval-object-statics.js",
   "2585-dyn-nullish-coalesce.js",
@@ -1785,7 +1785,7 @@ const TIER_FLOOR: string[] = [
   "2513-dyn-evolving-array-derived.ts",
   "2578-jsval-into-unknown-rows.ts",
   "2581-jsval-routed-calls.js",
-  "2583-jsval-routed-calls.js",
+  "2737-jsval-routed-calls.js",
   "765-any-optional-chain.ts",
   // Increment 21, stage C (the import bridge — the closing stage): the
   // TLA/dynamic-import family's `jsBridgePromise` needs, plus the two
@@ -2943,7 +2943,7 @@ const TIER_FLOOR: string[] = [
   // its pattern clean and static, no P2 refinement key applies).
   // 772 -> 777, exactly the predicted movers.
   "1467-string-match.ts",
-  "1544-string-matchall.ts",
+  "2715-string-matchall.ts",
   "1562-optional-chain-tails.ts",
   "1574-dyn-optional-method-number-keys.ts",
   "2610-regex-named-matchall.ts",
@@ -3093,11 +3093,11 @@ const TIER_FLOOR: string[] = [
   "1420-number-statics.ts",
   "1435-math-spread.ts",
   "1437-pad-default.ts",
-  "1538-math-static-scalar.ts",
+  "2709-math-static-scalar.ts",
   "1579-matchall-index.ts",
   "1590-js-unannotated.js",
   "2042-any-flow-loops.ts",
-  "2046-objlit-accessors-effects.ts",
+  "2731-objlit-accessors-effects.ts",
   "2112-array-at-findlast.ts",
   "2350-nan-global.ts",
   "2445-math-minmax-nary.ts",
@@ -3126,10 +3126,10 @@ const TIER_FLOOR: string[] = [
   // ({num.isNaN, math.floor} landed in P1; num.parseInt was the missing
   // third key). 821 -> 831.
   "1115-parse-globals.ts",
-  "1520-string-split-static.ts",
+  "2695-string-split-static.ts",
   "1522-parseint-static.ts",
   "1523-isnan-floor-static.ts",
-  "1534-union-as-arm-cast.ts",
+  "2705-union-as-arm-cast.ts",
   "1636-util-format.ts",
   "1991-for-in-loops.ts",
   "2388-tonumber-grammar-zoo.ts",
@@ -3168,7 +3168,7 @@ const TIER_FLOOR: string[] = [
   "1406-dataview-mp4.ts",
   "1427-fromcharcode-lastindexof.ts",
   "1454-nonnull-narrow-and-fcc-bytes.ts",
-  "1536-string-array-sweep.ts",
+  "2707-string-array-sweep.ts",
   "2140-uri-component-codecs.ts",
   "2191-uri-encoders.ts",
 
@@ -3212,7 +3212,7 @@ const TIER_FLOOR: string[] = [
   "1465-env-value.ts",
   "1477-in-expressions.ts",
   "1528-delete-records-env.ts",
-  "1541-union-keyed-reads.ts",
+  "2712-union-keyed-reads.ts",
   "1559-conditional-spread-index-merge.ts",
   "2035-ternary-array-retag.cjs",
   "2212-unhandled-rejection-listener.cjs",
@@ -3245,7 +3245,7 @@ const TIER_FLOOR: string[] = [
   "1350-path-normalize-join.ts",
   "1351-path-parts.ts",
   "1352-path-resolve-relative.ts",
-  "1533-path-platform-namespaces.ts",
+  "2704-path-platform-namespaces.ts",
   "1598-cjs-builtin-require/main.js",
   "1610-path-win32-full.ts",
   "1629-require-main-filename.cjs",
@@ -3265,9 +3265,9 @@ const TIER_FLOOR: string[] = [
   "1448-stream-columns.ts",
   "1461-process-pid-getuid-kill.ts",
   "1468-exec-path.ts",
-  "1531-process-arch-versions.ts",
+  "2702-process-arch-versions.ts",
   "1571-optional-call-tostring-tail.ts",
-  "1571-stdin-set-raw-mode-non-tty.ts",
+  "2721-stdin-set-raw-mode-non-tty.ts",
   "1612-cjs-module-globals.cjs",
   "1639-versions-openssl-probe.ts",
   "2215-process-emit-warning-exit.cjs",
@@ -3285,7 +3285,7 @@ const TIER_FLOOR: string[] = [
   "1353-os-basics.ts",
   "1354-builtin-bare-specifiers.ts",
   "1424-fs-options.ts",
-  "1524-catch-narrowing.ts",
+  "2699-catch-narrowing.ts",
   "1583-loops-and-stream-captures.ts",
   "1720-assert-throws-shape.ts",
   "2361-assign-index-record.ts",
@@ -3310,8 +3310,8 @@ const TIER_FLOOR: string[] = [
   "1540-os-userinfo.ts",
   "1541-fs-readdir-dirent.ts",
   "1569-fsp-mkdir-unlink-chmod.ts",
-  "1574-promise-all-tuple-literal.ts",
-  "1630-rmsync-retry-options.cjs",
+  "2724-promise-all-tuple-literal.ts",
+  "2725-rmsync-retry-options.cjs",
   "1640-fd-read-decode.ts",
   "2096-os-type.ts",
 ];
@@ -4681,5 +4681,85 @@ describe(`wasm differential corpus (${files.length} programs${shardSuffix()})`, 
       }
     }
     /* eslint-enable no-console */
+  });
+});
+
+// ── board #148: no duplicated corpus program numbers ────────────────────
+// The corpus imported at 23d5918 carried 48 duplicated leading numbers
+// (tests/corpus/RENUMBERED.md); every duplicate was renumbered in INC-26
+// B1. This guard keeps it that way. `entries` is INJECTABLE (default the
+// real directory listing) so the M-6 mutation battery can append a
+// synthetic duplicate IN MEMORY, at the call site, and observe this row
+// redden — no file is ever created under tests/corpus/ (a FORBID-PREFIX;
+// a transient write is a write).
+export function duplicateCorpusNumbers(entries: string[] = readdirSync(corpusDir)): string[] {
+  const seen = new Set<string>();
+  const dups = new Set<string>();
+  for (const name of entries) {
+    const m = /^(\d+)-/.exec(name);
+    if (m === null) continue;
+    const num = m[1]!;
+    if (seen.has(num)) dups.add(num);
+    else seen.add(num);
+  }
+  return [...dups].sort((a, b) => Number(a) - Number(b));
+}
+
+describe("board #148: corpus number hygiene", () => {
+  test("no duplicated corpus program numbers remain", () => {
+    expect(duplicateCorpusNumbers()).toEqual([]);
+  });
+});
+
+// ── board #150: the four for-in/Object.keys skip-rule sites cite the
+// BEHAVIOUR, never a dangling register number ──────────────────────────
+// "SEMANTICS.md 37" was a stale citation (S037 is the Buffer entry; no
+// S-entry states the undefined-valued-field skip rule, and the rule is
+// Node-exact — registering it would be a category error). All four sites
+// were de-numbered in INC-26 B1 to cite the behaviour directly. This test
+// (a) locates each site by a stable nearby anchor and asserts NO bare
+// `SEMANTICS.md <digits>` token appears in its neighbourhood — the digit
+// run is `\b`-delimited so "372" can never satisfy a check meant for "37"
+// — and (b) asserts the matched-site count is exactly four, so an anchor
+// silently going missing (an empty match) fails the row instead of
+// passing it. lower-calls.ts's OTHER, unrelated dangling citations
+// (S116/S117, upstream register numbers this board does not touch) are
+// deliberately out of scope: the anchors below target only the four
+// skip-rule sites, never a whole-file scan.
+const SKIP_RULE_SITES: { file: string; anchor: string }[] = [
+  {
+    file: "packages/compiler/src/frontend/lowering/lower-containers.ts",
+    anchor: "fixed-shape lowering and Node's missing-key behavior",
+  },
+  {
+    file: "packages/compiler/src/frontend/lowering/lower-calls.ts",
+    anchor: "of their union at runtime (Node's missing key — an unset optional",
+  },
+  {
+    file: "packages/compiler/src/frontend/lowering/lower-stmts.ts",
+    anchor: "declaration order, fields holding the undefined arm of their union",
+  },
+  {
+    file: "packages/compiler/src/frontend/lowering/lower-stmts.ts",
+    anchor: "Fixed and hybrid shapes cannot lose keys mid-walk",
+  },
+];
+
+describe("board #150: no dangling SEMANTICS.md citation at the skip-rule sites", () => {
+  test("all four sites found, none carries a bare register-number citation nearby", () => {
+    let matched = 0;
+    for (const site of SKIP_RULE_SITES) {
+      const text = readFileSync(join(repoRoot, site.file), "utf8");
+      const idx = text.indexOf(site.anchor);
+      expect(idx, `anchor not found in ${site.file}: ${JSON.stringify(site.anchor)}`).toBeGreaterThanOrEqual(0);
+      matched++;
+      const windowStart = Math.max(0, idx - 400);
+      const windowEnd = Math.min(text.length, idx + site.anchor.length + 400);
+      const window = text.slice(windowStart, windowEnd);
+      expect(window, `${site.file} still carries a bare SEMANTICS.md citation near "${site.anchor}"`).not.toMatch(
+        /SEMANTICS\.md\s+\d+\b/,
+      );
+    }
+    expect(matched).toBe(4);
   });
 });

@@ -196,6 +196,9 @@ static void scr_map_gcfree(void *o) {
   free(m->buckets);
 #ifdef SCR_RC_AUDIT
   scr_live_maps--;
+#if defined(SCR_LIB)
+  scr_library_live_forget(m); /* #147 */
+#endif
 #endif
   scr_cyc_free(m);
 }
@@ -219,6 +222,9 @@ ScrMap *scr_map_new(ScrMapKeyKind key_kind, ScrMapValKind val_kind,
   m->val_trace = val_trace;
 #ifdef SCR_RC_AUDIT
   scr_live_maps++;
+#if defined(SCR_LIB)
+  scr_library_live_insert(m, scr_map_release_v); /* #147 */
+#endif
 #endif
   return m;
 }
@@ -244,6 +250,9 @@ void scr_map_release(ScrMap *m) {
     free(m->buckets);
 #ifdef SCR_RC_AUDIT
     scr_live_maps--;
+#if defined(SCR_LIB)
+    scr_library_live_forget(m); /* #147 */
+#endif
 #endif
     if (m->val_trace) scr_cyc_free(m);
     else free(m);

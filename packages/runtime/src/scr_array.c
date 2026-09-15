@@ -97,6 +97,9 @@ ScrArr *scr_arr_new(ScrElemKind elem, size_t initial_cap) {
   if (initial_cap > 0) scr_arr_grow(a, initial_cap);
 #ifdef SCR_RC_AUDIT
   scr_live_arrays++;
+#if defined(SCR_LIB)
+  scr_library_live_insert(a, scr_arr_release_v); /* #147 */
+#endif
 #endif
   return a;
 }
@@ -115,6 +118,9 @@ static void scr_arr_gc_free(void *a0) {
   free(a->data);
 #ifdef SCR_RC_AUDIT
   scr_live_arrays--;
+#if defined(SCR_LIB)
+  scr_library_live_forget(a); /* #147 */
+#endif
 #endif
   scr_cyc_free(a);
 }
@@ -140,6 +146,9 @@ ScrArr *scr_arr_new_ref(void *(*elem_retain)(void *),
   if (initial_cap > 0) scr_arr_grow(a, initial_cap);
 #ifdef SCR_RC_AUDIT
   scr_live_arrays++;
+#if defined(SCR_LIB)
+  scr_library_live_insert(a, scr_arr_release_v); /* #147 */
+#endif
 #endif
   return a;
 }
@@ -157,6 +166,9 @@ void scr_arr_release(ScrArr *a) {
       free(a->data);
 #ifdef SCR_RC_AUDIT
       scr_live_arrays--;
+#if defined(SCR_LIB)
+      scr_library_live_forget(a); /* #147 */
+#endif
 #endif
       free(a);
     }

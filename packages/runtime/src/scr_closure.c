@@ -65,6 +65,9 @@ static void scr_box_gcfree(void *o) {
   }
 #ifdef SCR_RC_AUDIT
   scr_live_boxes--;
+#if defined(SCR_LIB)
+  scr_library_live_forget(b); /* #147 */
+#endif
 #endif
   scr_cyc_free(b);
 }
@@ -75,6 +78,9 @@ ScrBox *scr_box_new(ScrBoxKind kind) {
   b->kind = kind;
 #ifdef SCR_RC_AUDIT
   scr_live_boxes++;
+#if defined(SCR_LIB)
+  scr_library_live_insert(b, scr_box_release_v); /* #147 */
+#endif
 #endif
   return b;
 }
@@ -119,12 +125,25 @@ void scr_box_release(ScrBox *b) {
     scr_box_release_payload(b, scr_box_ptr(b));
 #ifdef SCR_RC_AUDIT
     scr_live_boxes--;
+#if defined(SCR_LIB)
+    scr_library_live_forget(b); /* #147 */
+#endif
 #endif
     scr_cyc_free(b);
   } else {
     scr_cyc_on_release(b); /* possible cycle root; may collect — b is done */
   }
 }
+#if defined(SCR_LIB) && defined(SCR_RC_AUDIT)
+/* #147 (delta-11/N-3, lead ruling): gated — its only caller (the INSERT
+ * call above) is itself gated to SCR_LIB+SCR_RC_AUDIT, so an ungated
+ * definition was dead code in every OTHER build flavor, contradicting
+ * the "shipping lanes are byte-identical to base" claim literally (the
+ * byte-identity instrument, impl-b1/147-byteid-base.txt, previously
+ * carried this as one of two EXPECTED, accepted differences instead of
+ * expecting zero). */
+void scr_box_release_v(void *b) { scr_box_release((ScrBox *)b); } /* #147 */
+#endif
 
 double scr_box_get_f64(ScrBox *b) {
   double v;
@@ -178,6 +197,9 @@ static void scr_closure_gcfree(void *o) {
   scr_closure_release(((ScrClosure *)o)->trueOrig);
 #ifdef SCR_RC_AUDIT
   scr_live_closures--;
+#if defined(SCR_LIB)
+  scr_library_live_forget(o); /* #147 */
+#endif
 #endif
   scr_cyc_free(o);
 }
@@ -192,6 +214,9 @@ ScrClosure *scr_closure_new(void *fn, size_t ncaps) {
   c->trueOrig = NULL; /* board #89: set once by a wrapper mint, never an ordinary closure */
 #ifdef SCR_RC_AUDIT
   scr_live_closures++;
+#if defined(SCR_LIB)
+  scr_library_live_insert(c, scr_closure_release_v); /* #147 */
+#endif
 #endif
   return c;
 }
@@ -205,6 +230,9 @@ void scr_closure_release(ScrClosure *c) {
     scr_closure_release(c->trueOrig); /* board #89: NULL-tolerant, own guard above */
 #ifdef SCR_RC_AUDIT
     scr_live_closures--;
+#if defined(SCR_LIB)
+    scr_library_live_forget(c); /* #147 */
+#endif
 #endif
     scr_cyc_free(c);
   } else {

@@ -1094,19 +1094,44 @@ describe("wasm-host-fs-p5: the fsp twins — synchronous syscall, already-settle
 });
 
 describe("wasm-host-fs-p5: (f) the SOLE importFunc site — the fsp/settled machinery adds NO new host import (a static-source audit, S074's own claim)", () => {
-  test("every `.importFunc(` call site in emitter.ts sits inside the ONE prescan-guarded import block (~:1938-2010) — SINGLE-EDIT: a NEW importFunc call added anywhere else in the file", async () => {
+  test("every `.importFunc(` call site in emitter.ts sits inside the ONE prescan-guarded import block, MARKER-ANCHORED (delta-07 §D — a hardcoded line range breaks under unrelated line-count drift elsewhere in the file; INC-26 B1's own #139 widening is exactly such a drift) — SINGLE-EDIT: a NEW importFunc call added anywhere else in the file", async () => {
     const { readFileSync } = await import("node:fs");
     const src = readFileSync(new URL("../src/backend/wasm/emitter.ts", import.meta.url), "utf8");
-    const lines = src.split("\n");
-    const siteLines: number[] = [];
-    lines.forEach((line, i) => {
-      if (line.includes(".importFunc(")) siteLines.push(i + 1);
-    });
-    expect(siteLines.length).toBeGreaterThan(0);
-    for (const ln of siteLines) {
-      expect(ln, `importFunc call at line ${ln} is outside the expected 1930-2015 import block`).toBeGreaterThanOrEqual(1930);
-      expect(ln, `importFunc call at line ${ln} is outside the expected 1930-2015 import block`).toBeLessThanOrEqual(2015);
-    }
+    // Board #139 (INC-26 B1, delta-07 §D): the predicate runs over a
+    // SOURCE STRING via two purpose-built sentinel markers (added to
+    // emitter.ts's constructor, bracketing the import block — the fsp
+    // block's own pattern, matching this file's SIBLING test below). A
+    // missing or inverted marker THROWS — never a vacuous pass.
+    const importFuncSitesOutsideBlock = (source: string): number[] => {
+      const start = source.indexOf("── begin INC-26 host-import block");
+      const end = source.indexOf("── end INC-26 host-import block");
+      if (start < 0 || end < 0 || end <= start) {
+        throw new Error(`markers not found or out of order: start=${start} end=${end}`);
+      }
+      const lines = source.split("\n");
+      let offset = 0;
+      const outside: number[] = [];
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i]!.includes(".importFunc(")) {
+          const abs = offset + lines[i]!.indexOf(".importFunc(");
+          if (abs < start || abs >= end) outside.push(i + 1);
+        }
+        offset += lines[i]!.length + 1;
+      }
+      return outside;
+    };
+    // KNOWN-PASS: the real file.
+    expect(importFuncSitesOutsideBlock(src)).toEqual([]);
+    // KNOWN-FAIL controls, inline: an out-of-block importFunc on EITHER
+    // side of the markers must be caught (the old literal-range predicate
+    // could only ever catch one direction, since 1930 sat below every
+    // real import site).
+    const failAfter =
+      "// ── begin INC-26 host-import block ──\nthis.writeFunc = this.mb.importFunc(A);\n// ── end INC-26 host-import block ──\nthis.mb.importFunc(B);\n";
+    expect(importFuncSitesOutsideBlock(failAfter)).toEqual([4]);
+    const failBefore =
+      "this.mb.importFunc(Z);\n// ── begin INC-26 host-import block ──\nthis.writeFunc = this.mb.importFunc(A);\n// ── end INC-26 host-import block ──\n";
+    expect(importFuncSitesOutsideBlock(failBefore)).toEqual([1]);
   });
   test("the fsp dispatch arms (design §6.5's own 'no new async machinery' — the block between the fs-tail's own end marker and the fsp twins' own end marker) contain ZERO `.importFunc(`/`.mb.import` references — SINGLE-EDIT: an fsp arm calling importFunc directly instead of reusing fsCallFunc's own cached import", async () => {
     const { readFileSync } = await import("node:fs");

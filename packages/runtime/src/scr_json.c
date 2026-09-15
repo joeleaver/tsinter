@@ -345,6 +345,9 @@ static ScrDyn *scr_dyn_alloc(ScrDynKind kind) {
   fresh->kind = kind;
 #ifdef SCR_RC_AUDIT
   scr_live_dyns++;
+#if defined(SCR_LIB)
+  scr_library_live_insert(fresh, scr_dyn_release_v); /* #147 */
+#endif
 #endif
   return fresh;
 }
@@ -392,6 +395,9 @@ void scr_dyn_release(ScrDyn *d) {
   }
 #ifdef SCR_RC_AUDIT
   scr_live_dyns--;
+#if defined(SCR_LIB)
+  scr_library_live_forget(d); /* #147 */
+#endif
 #endif
 #ifndef SCR_RC_AUDIT
   if (scr_dyn_free_count < SCR_DYN_FREE_MAX) {

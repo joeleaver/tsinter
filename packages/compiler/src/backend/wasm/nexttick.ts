@@ -11,10 +11,11 @@
  * `processTicksAndRejections` is, at the C++ boundary, exactly:
  *
  *   do {
- *     while (tick queue not empty) run one;       // exhaustive: a tick
- *                                                  // enqueuing another
- *                                                  // tick is swept up by
- *                                                  // this SAME loop
+ *     while ((tock = queue.shift()) !== null) { …run tick… }  // exhaustive:
+ *                                                  // a tick enqueuing
+ *                                                  // another tick is
+ *                                                  // swept up by this
+ *                                                  // SAME loop
  *     runMicrotasks();                            // V8-native, ALSO
  *                                                  // exhaustive — drains
  *                                                  // to empty INCLUDING
@@ -22,7 +23,30 @@
  *                                                  // without ever
  *                                                  // returning to the JS
  *                                                  // loop above
- *   } while (either queue non-empty);
+ *   } while (!queue.isEmpty() || (hasRejectionToWarn() && processPromiseRejections()));
+ *
+ * VERBATIM, Node's actual condition (lib/internal/process/task_queues.js)
+ * — not the two-term paraphrase this header carried before INC-26 B1
+ * (board #139). processPromiseRejections() returns
+ * `maybeScheduledTicksOrMicrotasks || pendingUnhandledRejections.size !== 0`:
+ * it fires BOTH listener kinds (rejectionHandled first, then the
+ * unhandled walk) and reports true when either queued new work or NEW
+ * unhandled rejections arrived DURING the pass (the pending map is
+ * swapped to a fresh one before the walk, so a rejection registered
+ * while listeners run lands in the new map and re-arms the loop by
+ * itself). THIS TIER MODELS THE THIRD TERM WITHOUT the
+ * hasRejectionToWarn() GUARD, soundly: both producers of a maybe-
+ * unhandled rejection (settle()'s rejection branch, promises.js's own
+ * equivalents at :267 and :285) set that flag as part of the SAME
+ * operation that makes the guard necessary in the first place, so
+ * hasRejectionToWarn() is true whenever there is anything for
+ * processPromiseRejections() to find — omitting the guard costs one
+ * extra (always-true-when-it-matters) check, never a wrong answer.
+ * emitCheckpointCore's own loop now carries this third term, gated on
+ * unhandledRejectionReachable||rejectionHandledReachable (promises.ts's
+ * reportInvoked()/drainPendingHandledInvoked(), design-139-v2 §B/§C) — a
+ * listener-free module keeps the ORIGINAL two-term loop below,
+ * byte-identical.
  *
  * which is scr_loop_run's shape exactly: tick-queue-to-exhaustion, THEN
  * microtask-queue-to-exhaustion, repeat while either has new work. Four

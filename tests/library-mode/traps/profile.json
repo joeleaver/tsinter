@@ -13,6 +13,7 @@
   "exports": [
     { "export": "boom", "symbol": "kp_boom", "params": ["f64"], "returns": "f64" },
     { "export": "fail", "symbol": "kp_fail", "params": ["string"], "returns": "f64" },
-    { "export": "ok", "symbol": "kp_ok", "params": ["f64"], "returns": "f64" }
+    { "export": "ok", "symbol": "kp_ok", "params": ["f64"], "returns": "f64" },
+    { "export": "stashThenTrap", "symbol": "kp_stashThenTrap", "params": ["string", "f64"], "returns": "f64" }
   ]
 }
