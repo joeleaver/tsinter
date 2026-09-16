@@ -3314,6 +3314,11 @@ const TIER_FLOOR: string[] = [
   "2725-rmsync-retry-options.cjs",
   "1640-fd-read-decode.ts",
   "2096-os-type.ts",
+  // INC-26 P6 (the twelve fs. argument-validation ladder keys,
+  // transcribed to Node's own measured check orders): 920 -> 922. 2573
+  // claims on the timestamp key alone; 2595 needs the other eleven.
+  "2573-fs-url-arg-ladders.cjs",
+  "2595-fs-arg-ladders.cjs",
 ];
 
 interface RunResult {

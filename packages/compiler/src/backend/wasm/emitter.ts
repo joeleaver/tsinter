@@ -166,6 +166,7 @@ import { DateBuilder } from "./date.js";
 import { ProcessBuilder } from "./process.js";
 import { PathBuilder } from "./path.js";
 import { FsBuilder } from "./fs.js";
+import { FsLaddersBuilder } from "./fs-ladders.js";
 import { MapBuilder, type MapInfo, type MapKeyKind, type MapValKind } from "./maps.js";
 import { JsonBuilder, jsonQuote } from "./json.js";
 import {
@@ -397,7 +398,13 @@ function timerSurfaceReachable(mod: WModule): boolean {
   const scan = (node: unknown): void => {
     if (found) return;
     if (typeof node === "string") {
-      if (node.startsWith("timers.") || node === "process.activeResources") found = true;
+      // INC-26 P6 delta-02 (eba33a02484f182e): fs.existsChk's real-
+      // answer arm schedules a 0ms timer (fs-ladders.ts's own two-
+      // capture closure), which needs the timer heap's `now` import
+      // exactly like any "timers."-prefixed key — the SAME failure
+      // class this function's own comment above already documents for
+      // "process.activeResources", repeated here on purpose.
+      if (node.startsWith("timers.") || node === "process.activeResources" || node === "fs.existsChk") found = true;
       return;
     }
     if (Array.isArray(node)) {
@@ -456,7 +463,15 @@ function dateNowReachable(mod: WModule): boolean {
   const scan = (node: unknown): void => {
     if (found) return;
     if (typeof node === "string") {
-      if (node === "date.now") found = true;
+      // INC-26 P6 delta-02 (eba33a02484f182e): fs.toUnixTimestamp's own
+      // negative-number branch calls wallClock directly (scr_fs_to_
+      // unix_timestamp's clock_gettime arm, ported) — a DIFFERENT IR
+      // node than "date.now" but the SAME host import, so this scan
+      // must recognize it too, exactly the precedent below (this file's
+      // own timerSurfaceReachable, "process.activeResources") already
+      // set for the identical failure class: a key that reuses a host
+      // import without spelling the name this scan looks for.
+      if (node === "date.now" || node === "fs.toUnixTimestamp") found = true;
       return;
     }
     if (Array.isArray(node)) {
@@ -879,7 +894,22 @@ function fsCallReachable(mod: WModule): boolean {
         node === "fsp.mkdirRecursiveMode" ||
         node === "fsp.readdir" ||
         node === "fsp.unlink" ||
-        node === "fsp.chmod"
+        node === "fsp.chmod" ||
+        // INC-26 P6 delta-02 (eba33a02484f182e): fs.existsChk's real-
+        // answer arm reuses P4's existsSyncHelper (fs.ts:1754), which
+        // calls fsCall internally — the SAME failure class as the other
+        // two additions in this file, added here rather than assumed
+        // safe because 2595 happens to ALSO call fs.existsSync directly
+        // (already on this list) and would otherwise mask the gap by
+        // coincidence, not correctness.
+        node === "fs.existsChk" ||
+        // CHECKPOINT-2 (as predicted by the CHECKPOINT-1 comment above):
+        // fs.mkdtempSyncChk's REAL-op arm reuses P4's mkdtempSyncHelper
+        // (fs.ts's own buildReadLengthOp, op 3), which calls fsCall
+        // internally — the identical failure class, found by a build-
+        // time "emitter bug: an fs key (op 3) was reached but tsinter.
+        // fsCall was never imported" on a program using ONLY this key.
+        node === "fs.mkdtempSyncChk"
       ) {
         found = true;
       }
@@ -6531,6 +6561,67 @@ class Assembler {
       bytesLength: () => this.bytesB.length(),
     });
     return this.fsField;
+  }
+
+  private fslField: FsLaddersBuilder | null = null;
+
+  /** INC-26 pass P6's own builder (fs-ladders.ts) — the fs argument-
+   * validation ladders: PathBuilder's shape (its own `cached()` memo,
+   * its own `%w.fsl.*` prefix). All twelve keys are built: fs.
+   * toUnixTimestamp, fs.existsChk, fs.mkdtempChk, fs.mkdtempSyncChk,
+   * fs.readFileChk, fs.opendirChk, fs.watchFileChk, fs.streamOptsChk,
+   * fs.readChk, fs.lchmodChk, fs.lchmodSyncChk, fsp.lchmodChk (the last
+   * built inline in this file's own dispatch, not through this getter —
+   * see the "fsp.lchmodChk" case's own comment for why). */
+  private get fsl(): FsLaddersBuilder {
+    this.fslField ??= new FsLaddersBuilder(this.mb, {
+      strRef: () => this.strRef,
+      strType: () => this.strType,
+      dynRef: () => this.dyn.dynRef(),
+      dynT: () => this.dyn.dynT(),
+      arrRef: () => this.dyn.arrRef(),
+      strToNum: () => this.strToNumHelper(),
+      wallClockFunc: () => this.wallClockFuncOrThrow(),
+      specificType: () => this.dyn.specificType(),
+      concat: () => this.concatHelper(),
+      pushStrLit: (c, value) => this.pushStrLitInto(c, value),
+      setCellError: (c, className, name, pushMessage, codeLit) => this.emitSetCellError(c, className, name, pushMessage, codeLit),
+      boxBool: (c, pushValue) => this.dyn.boxBool(c, pushValue),
+      undefinedGlobal: () => this.dyn.undefinedGlobal(),
+      callFn: () => this.dyn.callFn(),
+      arrPush: () => this.dyn.arrPush(),
+      dynArrNewLen: () => this.vecs.newLen(this.dynVecInfo()),
+      existsSyncHelper: () => this.fs.existsSyncHelper(),
+      setTimeout: () => this.timers.setTimeout(),
+      voidClosPair: () => this.closPairFor([], []),
+      // board #155 (rev-29's CP1 review N-1): the SAME "print the reason,
+      // then trap" primitive inspect.ts's own `namedTrap` dep uses for
+      // S058 (emitter.ts's reportUncaughtHelper on a fresh EXC_STR cell).
+      namedTrap: (c, message) => {
+        const exc = this.exc();
+        this.pushStrLitInto(c, message);
+        c.globalSet(exc.refG);
+        c.i32Const(EXC_STR);
+        c.globalSet(exc.kindG);
+        c.call(this.reportUncaughtHelper());
+      },
+      objT: () => this.dyn.objT(),
+      objRef: () => this.dyn.objRef(),
+      objGet: () => this.dyn.objGet(),
+      entriesArrayType: () => this.dyn.entriesArrayType(),
+      entryT: () => this.dyn.entryT(),
+      entryRef: () => this.dyn.entryRef(),
+      strEq: () => this.strEqHelper(),
+      isEncoding: () => this.bytesB.isEncodingHelper(),
+      numReceived: () => this.bytesB.numReceivedHelper(),
+      jsToNumber: () => this.jsToNumberHelper(),
+      toInt32: () => this.toInt32Helper(),
+      notFn: () => this.dyn.notFn(),
+      mkdtempSyncHelper: () => this.fs.mkdtempSyncHelper(),
+      bytesLength: () => this.bytesB.length(),
+      bytesPayloadT: () => this.dyn.bytesPayloadT(),
+    });
+    return this.fslField;
   }
 
   /** `this.wallClockFunc`, or a descriptive throw — the constructor's own
@@ -14126,6 +14217,157 @@ class Assembler {
           code.call(this.proc.readHostStr());
           return;
         }
+        // ── INC-26 P6 (the fs argument-validation ladders, CHECKPOINT-1:
+        // fs.toUnixTimestamp + fs.existsChk only — fs-ladders.ts's own
+        // builder, PathBuilder's shape). Both arms are STANDALONE
+        // functions that never call `emitUnwind()` themselves (fs.ts's
+        // own documented contract): `emitPendingCheck()` right after the
+        // call is what actually propagates a throw. ──────────────────
+        if (e.fn === "fs.toUnixTimestamp") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.fsl.toUnixTimestamp());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.existsChk") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.fsl.existsChk());
+          this.emitPendingCheck();
+          return;
+        }
+        // ── end INC-26 P6 CHECKPOINT-1; CHECKPOINT-2: the remaining ten
+        // keys, in the C's transcription order per the CP1 plan. SEVEN of
+        // these ten (every VOID-declared key: validate.ts:714-725 marks
+        // mkdtempChk/readFileChk/opendirChk/watchFileChk/streamOptsChk/
+        // readChk/lchmodChk VOID, but their OWN lowering passes `resultT`
+        // — the call SITE's inferred type — as the libCall node's `.type`,
+        // and the generic expression-statement wrapper unconditionally
+        // drops ONE value after evaluating any expression for effect
+        // (JS's own "every expression statement produces `undefined`"
+        // rule) — exactly the C lane's `(scr_fs_..._chk(...), 0)` comma-
+        // expression tail (emit-exprs.ts), ported: `code.call(...)`
+        // alone leaves NOTHING (my fs-ladders.ts arms are TRUE void
+        // internally), so this pushes the `undefined` singleton AFTER
+        // the call and BEFORE `emitPendingCheck()` — safe on the
+        // exception path too, since both `emitUnwind()`'s `br` and its
+        // `return_()` truncate the operand stack to the target's own
+        // declared type regardless of what sits above it (measured:
+        // "not enough arguments on the stack for drop" without this,
+        // isolated to exactly these seven keys). ────────────────────────
+        if (e.fn === "fs.mkdtempChk") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          this.walkExpr(e.args[2]!);
+          code.call(this.fsl.mkdtempChk());
+          code.globalGet(this.dyn.undefinedGlobal());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.mkdtempSyncChk") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          this.walkExpr(e.args[2]!);
+          code.call(this.fsl.mkdtempSyncChk());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.readFileChk") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          this.walkExpr(e.args[2]!);
+          this.walkExpr(e.args[3]!);
+          code.call(this.fsl.readFileChk());
+          code.globalGet(this.dyn.undefinedGlobal());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.opendirChk") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          this.walkExpr(e.args[2]!);
+          code.call(this.fsl.opendirChk());
+          code.globalGet(this.dyn.undefinedGlobal());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.watchFileChk") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          this.walkExpr(e.args[2]!);
+          code.call(this.fsl.watchFileChk());
+          code.globalGet(this.dyn.undefinedGlobal());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.streamOptsChk") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          this.walkExpr(e.args[2]!);
+          code.call(this.fsl.streamOptsChk());
+          code.globalGet(this.dyn.undefinedGlobal());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.readChk") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          this.walkExpr(e.args[2]!);
+          this.walkExpr(e.args[3]!);
+          this.walkExpr(e.args[4]!);
+          this.walkExpr(e.args[5]!);
+          code.call(this.fsl.readChk());
+          code.globalGet(this.dyn.undefinedGlobal());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.lchmodChk") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          this.walkExpr(e.args[2]!);
+          this.walkExpr(e.args[3]!);
+          code.call(this.fsl.lchmodChk());
+          code.globalGet(this.dyn.undefinedGlobal());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fs.lchmodSyncChk") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.fsl.lchmodSyncChk());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "fsp.lchmodChk") {
+          // *** D3: LINUX ARM ONLY *** — scr_fsp_lchmod_chk, :537: rejects
+          // ERR_METHOD_NOT_IMPLEMENTED unconditionally, before any
+          // validation of either argument (both are still WALKED, for
+          // JS's own argument-evaluation-order side effects, then
+          // dropped — the C's own `(void)path; (void)mode;`). Built HERE
+          // (not fs-ladders.ts): emitFspSettled needs `this.fn`'s own
+          // scratch-local pool, correctly bound only while walking the
+          // ACTUAL enclosing function, exactly P5's own fsp twins'
+          // reason for living beside their dispatch cases too. The ONE
+          // new renderer this pass needs (genuinely absent per §0.5/
+          // R-13): an Error (not TypeError) with the code set, into the
+          // cell WITHOUT unwinding — emitFspSettled's own outer check
+          // does the settle-vs-unwind branching.
+          this.walkExpr(e.args[0]!);
+          code.drop();
+          this.walkExpr(e.args[1]!);
+          code.drop();
+          this.emitFspSettled(code, null, () => {
+            this.emitSetCellError(
+              code,
+              "%Error",
+              "Error",
+              (cc) => this.pushStrLitInto(cc, "The lchmod() method is not implemented"),
+              "ERR_METHOD_NOT_IMPLEMENTED",
+            );
+          });
+          return;
+        }
+        // ── end INC-26 P6 CHECKPOINT-2 ────────────────────────────────
         if (e.fn === "fs.existsSync") {
           // PROBE-SHAPED (design §6.2): NEVER builds an error on any
           // answer. The helper's own result IS the boolean.
