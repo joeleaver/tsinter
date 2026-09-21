@@ -36919,10 +36919,14 @@ class Assembler {
 
   /** %w.jsPow(x, y: f64) → f64 — `**`'s numeric core (ECMA-262
    * Number::exponentiate), oracle-verified table-for-table
-   * (scratchpad/oracle/pow.mjs) — every NaN/±0/±Infinity/base-±1 special
-   * case below. NARROWED BY DESIGN past the special-value table: V8's
+   * (scratchpad/oracle/pow.mjs) — every NaN/±0/±Infinity special case
+   * below, and base ±1 ONLY with an INFINITE exponent (`1 ** 3`, a FINITE
+   * exponent, still fences below — S043). NARROWED BY DESIGN past the
+   * special-value table: V8's
    * Math.pow (fdlibm-derived) special-cases only a FEW exponents to
-   * elementary ops — y===2 is x*x, y===-1 is 1/x, y===0.5 is a sqrt with
+   * elementary ops (the fdlibm attribution in this rationale is
+   * superseded; the correction lands with the pow unit's entry — INC-27 U0
+   * changes nothing else here) — y===2 is x*x, y===-1 is 1/x, y===0.5 is a sqrt with
    * its own edge handling — and every OTHER exponent, INTEGER EXPONENTS
    * INCLUDED, takes fdlibm's polynomial path, which is NOT guaranteed
    * bit-identical to exponentiation-by-squaring for y===3, y===10, etc.
@@ -36943,12 +36947,22 @@ class Assembler {
     const c = new Code();
     const X = 0, Y = 1;
     const T = 2, HALF = 3, AX = 4, NEGZERO = 5;
-    // isOddInteger(v: local) → i32, leaving the answer on the stack. `v`
-    // must be a FINITE local (callers only invoke this once ±Infinity is
-    // already excluded — Infinity would otherwise pass the `trunc(v)==v`
-    // test, per the measured pow(-Infinity,Infinity)=Infinity /
-    // pow(-0,Infinity)=0 corners: an infinite exponent is NOT "odd").
+    // isOddInteger(v: local) → i32, leaving the answer on the stack.
+    // TOTAL: a non-finite v (±Infinity — NaN cannot reach here, arm 1
+    // already excludes it) answers 0 (not odd) via a `v - v != 0` guard in
+    // front of the unchanged parity body below. The y = ±Infinity arms run
+    // FIRST, right after arm 5, and return before any of this function's
+    // four call sites sees an infinite Y (R01-R04, R09 pin the ordering;
+    // R07/R08/R19/R20 pin the guard's two directions).
     const pushIsOddInteger = (v: number): void => {
+      c.localGet(v);
+      c.localGet(v);
+      c.f64Sub();
+      c.f64Const(0);
+      c.f64Ne();
+      c.ifResult(I32);
+      c.i32Const(0);
+      c.else_();
       c.localGet(v);
       c.f64Trunc();
       c.localTee(T);
@@ -36969,6 +36983,7 @@ class Assembler {
       c.f64Sub();
       c.f64Const(0);
       c.f64Ne();
+      c.end();
       c.end();
     };
     // 1. y is NaN.
@@ -37009,6 +37024,67 @@ class Assembler {
     c.f64Const(0);
     c.end();
     c.return_();
+    c.end();
+    // x is not NaN and not +Infinity from here (x may still be -Infinity
+    // or ±0 — the |x| ladder below already answers both). y === +Infinity.
+    c.localGet(Y);
+    c.f64Const(Infinity);
+    c.f64Eq();
+    c.ifVoid();
+    {
+      c.localGet(X);
+      c.i64ReinterpretF64();
+      c.i64Const(0x7fffffffffffffffn);
+      c.i64And();
+      c.f64ReinterpretI64();
+      c.localSet(AX);
+      c.localGet(AX);
+      c.f64Const(1);
+      c.f64Gt();
+      c.ifResult(F64);
+      c.f64Const(Infinity);
+      c.else_();
+      c.localGet(AX);
+      c.f64Const(1);
+      c.f64Lt();
+      c.ifResult(F64);
+      c.f64Const(0);
+      c.else_();
+      c.f64Const(CANONICAL_NAN);
+      c.end();
+      c.end();
+      c.return_();
+    }
+    c.end();
+    // y === -Infinity.
+    c.localGet(Y);
+    c.f64Const(-Infinity);
+    c.f64Eq();
+    c.ifVoid();
+    {
+      c.localGet(X);
+      c.i64ReinterpretF64();
+      c.i64Const(0x7fffffffffffffffn);
+      c.i64And();
+      c.f64ReinterpretI64();
+      c.localSet(AX);
+      c.localGet(AX);
+      c.f64Const(1);
+      c.f64Gt();
+      c.ifResult(F64);
+      c.f64Const(0);
+      c.else_();
+      c.localGet(AX);
+      c.f64Const(1);
+      c.f64Lt();
+      c.ifResult(F64);
+      c.f64Const(Infinity);
+      c.else_();
+      c.f64Const(CANONICAL_NAN);
+      c.end();
+      c.end();
+      c.return_();
+    }
     c.end();
     // 6. x is -Infinity.
     c.localGet(X);
@@ -37082,66 +37158,6 @@ class Assembler {
         c.f64Const(Infinity);
         c.end();
       }
-      c.end();
-      c.return_();
-    }
-    c.end();
-    // 8. x finite and nonzero from here. y === +Infinity.
-    c.localGet(Y);
-    c.f64Const(Infinity);
-    c.f64Eq();
-    c.ifVoid();
-    {
-      c.localGet(X);
-      c.i64ReinterpretF64();
-      c.i64Const(0x7fffffffffffffffn);
-      c.i64And();
-      c.f64ReinterpretI64();
-      c.localSet(AX);
-      c.localGet(AX);
-      c.f64Const(1);
-      c.f64Gt();
-      c.ifResult(F64);
-      c.f64Const(Infinity);
-      c.else_();
-      c.localGet(AX);
-      c.f64Const(1);
-      c.f64Lt();
-      c.ifResult(F64);
-      c.f64Const(0);
-      c.else_();
-      c.f64Const(CANONICAL_NAN);
-      c.end();
-      c.end();
-      c.return_();
-    }
-    c.end();
-    // y === -Infinity.
-    c.localGet(Y);
-    c.f64Const(-Infinity);
-    c.f64Eq();
-    c.ifVoid();
-    {
-      c.localGet(X);
-      c.i64ReinterpretF64();
-      c.i64Const(0x7fffffffffffffffn);
-      c.i64And();
-      c.f64ReinterpretI64();
-      c.localSet(AX);
-      c.localGet(AX);
-      c.f64Const(1);
-      c.f64Gt();
-      c.ifResult(F64);
-      c.f64Const(0);
-      c.else_();
-      c.localGet(AX);
-      c.f64Const(1);
-      c.f64Lt();
-      c.ifResult(F64);
-      c.f64Const(Infinity);
-      c.else_();
-      c.f64Const(CANONICAL_NAN);
-      c.end();
       c.end();
       c.return_();
     }

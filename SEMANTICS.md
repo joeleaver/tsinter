@@ -1960,6 +1960,7 @@ identical computation, because the spec never promised they'd agree.
 | FOLDS → canonical, the `NaN` global | `NaN`, `NaN+1`, `NaN*2` | `7ff8000000000000` |
 | does NOT fold → hardware | `0*Infinity`, `Infinity-Infinity`, `Infinity/Infinity`, `Infinity*0` — the `Infinity` GLOBAL does not fold, unlike a literal-derived Infinity | `fff8000000000000` (sign bit SET on this x86_64 build — non-deterministic per spec, could differ on another host/engine build) |
 | does NOT fold → hardware, variable lookthrough | `const z = 0; z / z` and every param/element/field form | `fff8000000000000` |
+| `**` / `Math.pow`'s OWN returned NaN — board #158 | `(-2) ** 0.5` and the negative-base / non-integer-exponent family: the NaN is the VALUE `**` RETURNS, not a NaN propagated by a wasm arithmetic op, so this is NOT the `does NOT fold → hardware` case above even where the bytes coincide; WHY Node returns these bytes belongs to the pow unit's entry, not this one | Node `fff8000000000000`, this tier `7ff8000000000000` (CANONICAL_NAN) — a REGISTERED DIVERGENCE, not fixed by INC-27 U0 (`packages/compiler/test/wasm-pow-u0.test.ts` R17) |
 | read from existing bytes | `buf.readDoubleBE(0)` written back unchanged | whatever bits were read (exact echo, sign/payload preserved) |
 | string-derived (STRUCK — see below) | `Number("x")`, `parseFloat("x")`, `+"x"` | N/A — refuses in-tier |
 | **overflowed source literal — REGISTERED RESIDUE** | `1e999 - 1e999`: a decimal literal whose VALUE overflows to `Infinity` at parse time | Node: `7ff8000000000000` (V8 folds it); this tier: `fff8000000000000` (our leaf-Infinity-poisons rule does not distinguish it from the `Infinity` global) — **DIVERGES** |
@@ -2762,15 +2763,19 @@ exact):
 The stage-B roster joins the same list (increment 21 stage B, all
 measured the same way):
 - **`Math.pow` / `**` beyond the exact set**: the ECMA-262 special-value
-  table (NaN, ±0, ±Infinity, base ±1, negative-base-non-integer)
-  computes exactly, and `y === 2` computes as `x*x` — the one form
+  table (NaN, ±0, ±Infinity, negative-base-non-integer) computes exactly
+  for ANY exponent, and base ±1 computes exactly ONLY with an INFINITE
+  exponent — a FINITE exponent against base ±1 (`1 ** n`, `(-1) ** n`;
+  `packages/compiler/test/wasm-pow-u0.test.ts` R13–R16) still FENCES below. `y === 2` computes as `x*x` — the one form
   fdlibm (V8's pow) itself special-cases to an elementary op, so
   bit-exactness is by construction, and the only measured corpus need.
   EVERY other exponent — other integers included — throws the catchable
   "Math.pow with this exponent is not supported yet": fdlibm's
   polynomial path is not reproducible by exponentiation-by-squaring at
   last-ulp fidelity, and an unprovable answer is the miscompile class,
-  not a feature.
+  not a feature. The fdlibm attribution in this rationale is superseded;
+  the correction lands with the pow unit's entry — INC-27 U0 changes
+  nothing else here.
 - **The unmodeled-name half of the Number-placeholder call surface**:
   calling an extracted placeholder whose NAME is not modeled for real
   dispatch (`toLocaleString.call(5)`, or `toExponential.call(5, 2)` — the
