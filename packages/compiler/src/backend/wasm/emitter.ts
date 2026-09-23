@@ -251,6 +251,7 @@ import {
   FIN_KIND_DYN,
   FIN_KIND_PROMISE,
 } from "./stream.js";
+import { SymBuilder } from "./symbols.js";
 import { UnionBuilder, type UnionArmRep } from "./unions.js";
 import { Code } from "./code.js";
 import { buildF64ToStr } from "./numfmt.js";
@@ -9407,6 +9408,13 @@ class Assembler {
       // REF here keeps that guard intact without touching it).
       case "stats":
         return this.fs.statsRef();
+      // INC-27 U1: the $sym struct (symbols.ts) — ONE representation
+      // whatever the symbol (registered or not, described or not), same
+      // shape as bytes/promise/dyn/regex/stats just above: this arm
+      // never fails. This arm's ABSENCE used to fall to the `default:`
+      // below and refuse as `type:symbol`.
+      case "symbol":
+        return this.syms.symRef();
       default:
         this.refuse(`type:${t.kind}`, loc);
         return null;
@@ -9465,6 +9473,7 @@ class Assembler {
           t.elem.kind === "bytes" ||
           t.elem.kind === "regex" ||
           t.elem.kind === "stats" || // INC-26 P5, CP1 delta 29286fa4 D-2/ruling(1)(ii): a `stats[]` must not soft-map to a placeholder while mapType succeeds on it (the increment-6/7 lockstep lesson this list's own header comment names) — latent (no program in the twelve builds one), fixed now per the ruling's own reasoning
+          t.elem.kind === "symbol" || // INC-27 U1: mapTypeSoft must admit symbol wherever mapType does, including as an array element, or the I32 placeholder is declared for a field that actually holds a $sym struct — the same lockstep-bug class this list's own header comment names
           (t.elem.kind === "object" && this.objectMappable(t.elem.className));
         if (!mappable) return I32;
         const kind =
@@ -9551,6 +9560,15 @@ class Assembler {
       // repeated at the bool arm above).
       case "stats":
         return this.fs.statsRef();
+      // INC-27 U1: mapType never fails on symbol either — same
+      // consistency rule as every other never-fails arm above
+      // (dyn/jsval/bytes/regex/stats). This case and mapType's own
+      // "symbol" arm above land in one edit: leaving either one out
+      // makes the two switches disagree, and a call site that reads the
+      // soft answer where the honest one would refuse silently accepts
+      // the I32 placeholder instead.
+      case "symbol":
+        return this.syms.symRef();
       default:
         return I32;
     }
@@ -10953,11 +10971,18 @@ class Assembler {
           this.walkExpr(e.operand);
           return;
         }
-        if (k === "array" || k === "func" || k === "record" || k === "object" || k === "classval" || k === "bytes") {
+        if (
+          k === "array" || k === "func" || k === "record" || k === "object" || k === "classval" ||
+          k === "bytes" || k === "symbol"
+        ) {
           // Every object is truthy; evaluate for effects, answer true.
           // (A class-typed value is never null — null and undefined ride
           // unions, whose own helper answers for them. map/set have the
-          // SAME gap — board #17, not this increment's.)
+          // SAME gap — board #17, not this increment's.) Symbol (INC-27
+          // U1): every symbol is truthy, unconditionally — there is no
+          // falsy symbol in JS, described or not, registered or not — so
+          // this is the SAME "evaluate, drop, answer true" shape, never a
+          // real branch.
           this.walkExpr(e.operand);
           code.drop();
           code.i32Const(1);
@@ -15564,6 +15589,92 @@ class Assembler {
         if (this.emitStreamLibCall(e)) return;
         if (this.emitAssertLibCall(e)) return;
         if (this.emitUrlLibCall(e)) return;
+        // INC-27 U1: symbol construction, toString, the description
+        // accessor, and the Symbol.for registry (sym.for / sym.keyFor).
+        if (e.fn === "sym.new") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.syms.newNamed());
+          return;
+        }
+        if (e.fn === "sym.newAnon") {
+          code.call(this.syms.newAnon());
+          return;
+        }
+        if (e.fn === "sym.toString") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.syms.toStringHelper());
+          return;
+        }
+        if (e.fn === "sym.desc") {
+          // Result is the interned `string | undefined` union (ir/
+          // validate.ts's own comment on this signature) — built INLINE
+          // here, the map `get` intrinsic's own precedent
+          // (emitMapIntrinsic's "get" case), never through a helper
+          // function: structGet the DESC field directly, then wrap null
+          // -> the union's undefined arm, non-null -> its string arm.
+          if (e.type.kind !== "union") throw new Error("emitter bug: sym.desc result is not a union");
+          const undefTag = this.undefinedArmTag(e.type.unionId);
+          if (undefTag < 0) throw new Error("emitter bug: sym.desc union lacks its undefined arm");
+          const valueTag = this.unionArmTag(e.type.unionId, STRING);
+          if (valueTag < 0) throw new Error("emitter bug: sym.desc union lacks its string arm");
+          const armSt = this.unionArmStruct(e.type.unionId, valueTag, e.loc);
+          if (armSt === null) {
+            code.unreachable();
+            return;
+          }
+          this.walkExpr(e.args[0]!);
+          code.structGet(this.syms.structType(), this.syms.descField());
+          const d = this.acquireScratch(this.strRef);
+          code.localSet(d);
+          code.localGet(d);
+          code.refIsNull();
+          this.openIfResult(this.unions.baseRef());
+          code.globalGet(this.unions.unitGlobal(undefTag));
+          code.else_();
+          code.i32Const(valueTag);
+          code.localGet(d);
+          code.structNew(armSt);
+          this.close();
+          this.releaseScratch(this.strRef, d);
+          return;
+        }
+        if (e.fn === "sym.for") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.syms.forHelper());
+          return;
+        }
+        if (e.fn === "sym.keyFor") {
+          // The IDENTICAL shape as sym.desc just above, over the KEY
+          // field instead of DESC: a registered symbol's `key` is set
+          // once, at `Symbol.for`'s own miss-path construction, and never
+          // read back through the registry itself — the struct already
+          // carries its own answer.
+          if (e.type.kind !== "union") throw new Error("emitter bug: sym.keyFor result is not a union");
+          const undefTag = this.undefinedArmTag(e.type.unionId);
+          if (undefTag < 0) throw new Error("emitter bug: sym.keyFor union lacks its undefined arm");
+          const valueTag = this.unionArmTag(e.type.unionId, STRING);
+          if (valueTag < 0) throw new Error("emitter bug: sym.keyFor union lacks its string arm");
+          const armSt = this.unionArmStruct(e.type.unionId, valueTag, e.loc);
+          if (armSt === null) {
+            code.unreachable();
+            return;
+          }
+          this.walkExpr(e.args[0]!);
+          code.structGet(this.syms.structType(), this.syms.keyField());
+          const k = this.acquireScratch(this.strRef);
+          code.localSet(k);
+          code.localGet(k);
+          code.refIsNull();
+          this.openIfResult(this.unions.baseRef());
+          code.globalGet(this.unions.unitGlobal(undefTag));
+          code.else_();
+          code.i32Const(valueTag);
+          code.localGet(k);
+          code.structNew(armSt);
+          this.close();
+          this.releaseScratch(this.strRef, k);
+          return;
+        }
         this.refuse(`libCall:${e.fn}`, e.loc);
         code.unreachable();
         return;
@@ -20453,8 +20564,31 @@ class Assembler {
       strEq: () => this.strEqHelper(),
       strType: () => this.strType,
       idxKey: () => this.dyn.idxKey(),
+      // INC-27 U1: the third (symbol) key kind's own hash reads the
+      // $sym struct's id field — injected as ONE closure rather than
+      // exposing the struct/field indices themselves, so maps.ts never
+      // needs to know symbols.ts's own type-section layout.
+      readSymId: (c) => c.structGet(this.syms.structType(), this.syms.idField()),
     });
     return this.mapsField;
+  }
+
+  private symsField: SymBuilder | null = null;
+
+  /** INC-27 U1 — the `$sym` value (symbols.ts), deps injected the same
+   * shape as every other per-kind builder: strRef/strType for the
+   * description field's representation, concat/lit for sym.toString's
+   * rendering (the SAME %w.concat/pushStrLitInto pair events.ts and
+   * stream.ts already share). */
+  private get syms(): SymBuilder {
+    this.symsField ??= new SymBuilder(this.mb, {
+      strRef: () => this.strRef,
+      strType: () => this.strType,
+      concat: () => this.concatHelper(),
+      lit: (c, s) => this.pushStrLitInto(c, s),
+      strEq: () => this.strEqHelper(),
+    });
+    return this.symsField;
   }
 
   private strsField: StrBuilder | null = null;
@@ -21544,18 +21678,20 @@ class Assembler {
     }
   }
 
-  /** The KEY representation for a map/set key type — f64 or string only
-   * (isSupportedMapKey's fence). The two ref-identity cases this refuses
-   * are NOT symmetric (measured, not assumed — an earlier draft claimed
-   * both were unreachable, which was only half true):
-   *   - Set<symbol>/Set<netServer> ARE reachable: `isSupportedSetElem`
-   *     admits them at the TYPE level, so `new Set<symbol>()` alone (no
-   *     Symbol() call even needed) compiles past the frontend and hits
-   *     `setNew:ref-elem` here as its FIRST refusal — a live census
-   *     bucket, not defensive dead code (probed directly).
-   *   - Map<symbol, V> is genuinely dead: `isSupportedMapKey` has no
-   *     symbol/netServer arm, so the FRONTEND rejects it outright
-   *     (SC2009/SC1090, before any IR reaches this backend at all) —
+  /** The KEY representation for a map/set key type — f64, string, or
+   * (INC-27 U1) symbol, hashed on the $sym struct's own monotone id and
+   * compared by ref.eq (symbols.ts's own header). netServer is the one
+   * remaining ref-identity case this still refuses (measured, not
+   * assumed — the two ref-identity cases here were never symmetric):
+   *   - Set<symbol> IS reachable and now succeeds: `isSupportedSetElem`
+   *     admits it at the TYPE level, so `new Set<symbol>()` alone (no
+   *     Symbol() call even needed) compiles past the frontend — this
+   *     arm is what makes it represent, lifting `setNew:ref-elem` for
+   *     symbol specifically (every OTHER ref kind reaching this
+   *     function, netServer included, still falls through and refuses).
+   *   - Map<symbol, V> stays genuinely dead regardless of this arm:
+   *     `isSupportedMapKey` has no symbol arm, so the FRONTEND rejects
+   *     it outright (before any IR reaches this backend at all) —
    *     `mapNew:ref-key` can still fire on this path in principle, it
    *     just has no known live program to name today. */
   private mapKeyRepFor(t: IrType): { kind: MapKeyKind; val: ValType } | null {
@@ -21563,6 +21699,7 @@ class Assembler {
     if (t.kind === "string") {
       return { kind: "str", val: { kind: "ref", nullable: true, typeIndex: this.strType } };
     }
+    if (t.kind === "symbol") return { kind: "sym", val: this.syms.symRef() };
     return null;
   }
 
@@ -22542,7 +22679,7 @@ class Assembler {
         }
         if (
           k === "array" || k === "record" || k === "object" || k === "promise" ||
-          k === "classval" || k === "map" || k === "set" || k === "bytes"
+          k === "classval" || k === "map" || k === "set" || k === "bytes" || k === "symbol"
         ) {
           // Reference identity — JS object/function equality exactly.
           // Every one of these is a GC struct or array reference and
@@ -22570,6 +22707,17 @@ class Assembler {
           // Uint32Array`-typed comparisons still validate (never reached
           // in practice — the checker types the operands apart — but the
           // representation is honestly one ref type either way).
+          //
+          // Symbol (INC-27 U1): `$sym` is a plain GC ref like the others
+          // — every `sym.new`/`sym.newAnon` call mints a FRESH struct
+          // (symbols.ts's monotone id counter is for maps.ts's third
+          // Map/Set key kind to hash on, never for equality), so two
+          // symbols with identical descriptions still compare unequal
+          // exactly as `Symbol('a')
+          // === Symbol('a')` does in Node. `bin:ref-eq` is lifted for
+          // symbol ONLY — every other as-yet-unbuilt ref kind still
+          // refuses by the fallback below, and any future row pinning
+          // that refusal should assert the exact refusal name.
           //
           // The representation has to be REAL: an operand whose type the
           // tier cannot spell holds a placeholder i32, and `ref.eq` over
@@ -27697,6 +27845,92 @@ class Assembler {
         this.close();
         this.releaseScratch(I32, aLocal);
         this.releaseScratch(I32, bLocal);
+        this.releaseScratch(I32, negatedLocal);
+        this.releaseScratch(I32, deepLocal);
+        this.releaseScratch(this.strRef, msgLocal);
+        this.releaseScratch(I32, hasMsgLocal);
+        return true;
+      }
+      // INC-27 U1 (assert.eqSym): symbols are primitives under SameValue —
+      // strictEqual IS deepStrictEqual, pointer identity either way
+      // (lower-assert.ts's own comment on why this dispatches here, not
+      // through assert.eqDyn) — so `deep` never changes the COMPARISON,
+      // only the header wording, exactly like assert.eqBool just above,
+      // whose whole shape this case mirrors: render both operands via
+      // sym.toString, compare by ref.eq, and let the shared
+      // eqFailHelper/neqFailHelper machinery build the message. QUOTES
+      // is always 0 (a symbol's rendering is never quoted) and BOTHZERO
+      // is always 0 (there is no empty-symbol-rendering degenerate
+      // case). The `^` indicator therefore falls out of eqFailHelper's
+      // OWN shared-prefix walk over the rendered text with no extra
+      // code: two distinct symbols with IDENTICAL renderings walk to
+      // i==la and suppress the caret by the SAME "i>=la" guard every
+      // other scalar case already relies on (1725's row B).
+      case "assert.eqSym": {
+        const symRefT = this.syms.symRef();
+        const aLocal = this.acquireScratch(symRefT);
+        const bLocal = this.acquireScratch(symRefT);
+        const negatedLocal = this.acquireScratch(I32);
+        const deepLocal = this.acquireScratch(I32);
+        const msgLocal = this.acquireScratch(this.strRef);
+        const hasMsgLocal = this.acquireScratch(I32);
+        this.walkExpr(e.args[0]!);
+        code.localSet(aLocal);
+        this.walkExpr(e.args[1]!);
+        code.localSet(bLocal);
+        this.walkExpr(e.args[2]!);
+        code.localSet(negatedLocal);
+        this.walkExpr(e.args[3]!);
+        code.localSet(deepLocal);
+        this.walkExpr(e.args[4]!);
+        code.localSet(msgLocal);
+        this.walkExpr(e.args[5]!);
+        code.localSet(hasMsgLocal);
+        code.localGet(aLocal);
+        code.localGet(bLocal);
+        code.refEq();
+        code.localGet(negatedLocal);
+        code.i32Xor();
+        code.i32Eqz();
+        this.openIf();
+        const symStr = (local: number): void => {
+          code.localGet(local);
+          code.call(this.syms.toStringHelper());
+        };
+        const iaLocal = this.acquireScratch(this.strRef);
+        symStr(aLocal);
+        code.localSet(iaLocal);
+        const msgResultLocal = this.acquireScratch(this.strRef);
+        code.localGet(negatedLocal);
+        this.openIf();
+        this.pushHeaderFor(code, deepLocal, NEQ_HEADER_STRICT, NOT_DEEP_EQUAL_HEADER);
+        code.localGet(iaLocal);
+        code.localGet(msgLocal);
+        code.localGet(hasMsgLocal);
+        code.call(this.neqFailHelper());
+        code.localSet(msgResultLocal);
+        code.else_();
+        const ibLocal = this.acquireScratch(this.strRef);
+        symStr(bLocal);
+        code.localSet(ibLocal);
+        code.localGet(iaLocal);
+        code.localGet(ibLocal);
+        code.i32Const(0);
+        code.i32Const(0);
+        this.pushHeaderFor(code, deepLocal, EQ_HEADER_STRICT, DEEP_EQUAL_HEADER);
+        code.localGet(msgLocal);
+        code.localGet(hasMsgLocal);
+        code.call(this.eqFailHelper());
+        code.localSet(msgResultLocal);
+        this.releaseScratch(this.strRef, ibLocal);
+        this.close();
+        this.emitSetCellError(code, "%Error", "AssertionError", () => code.localGet(msgResultLocal), "ERR_ASSERTION");
+        this.emitUnwind();
+        this.releaseScratch(this.strRef, msgResultLocal);
+        this.releaseScratch(this.strRef, iaLocal);
+        this.close();
+        this.releaseScratch(symRefT, aLocal);
+        this.releaseScratch(symRefT, bLocal);
         this.releaseScratch(I32, negatedLocal);
         this.releaseScratch(I32, deepLocal);
         this.releaseScratch(this.strRef, msgLocal);

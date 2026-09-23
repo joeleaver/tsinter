@@ -3319,6 +3319,22 @@ const TIER_FLOOR: string[] = [
   // claims on the timestamp key alone; 2595 needs the other eleven.
   "2573-fs-url-arg-ladders.cjs",
   "2595-fs-arg-ladders.cjs",
+  // INC-27 U1 (the symbol value: construction, toString, description,
+  // identity, truthiness, the `Symbol.for` registry, the third Map/Set
+  // key kind, and assert.eqSym's eight message shapes): 922 -> 934, the
+  // twelve programs this unit lands.
+  "1669-symbol-identity.ts",
+  "1670-symbol-registry.ts",
+  "1671-symbol-typeof.ts",
+  "1672-symbol-containers.ts",
+  "1673-symbol-cjs.cjs",
+  "1674-symbol-inspect.ts",
+  "1725-assert-symbols.ts",
+  "1730-countdown-symbol-keys/main.js",
+  "1731-symbol-field-shapes.cjs",
+  "1732-symbol-field-cross-module/main.js",
+  "2072-expando-function-members.ts",
+  "2440-console-inspect-args.ts",
 ];
 
 interface RunResult {

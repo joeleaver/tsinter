@@ -97,7 +97,7 @@ import { BUF, LEN } from "./arrays.js";
 import { Code } from "./code.js";
 import { F64, I32, ModuleBuilder, type FieldType, type StorageType, type ValType } from "./module.js";
 
-export type MapKeyKind = "f64" | "str";
+export type MapKeyKind = "f64" | "str" | "sym";
 /** How the VALUE is represented — f64/bool unpacked, everything else
  * (string, record, array, union, object, promise, classval, map, set,
  * dyn — anything mapType hands back as a ref) is one "ref" bucket: unlike
@@ -133,6 +133,11 @@ export interface MapDeps {
    * classification helper in the whole tier, shared by objWalk mode 2
    * and this file's keysJsOrder, never a second slightly-different one). */
   idxKey: () => number;
+  /** INC-27 U1: pushes the $sym struct's own i32 id field, given a $sym
+   * ref already on the stack (a symbol key's hash reads it) — injected
+   * as one closure so this file never needs symbols.ts's own struct or
+   * field index. */
+  readSymId: (c: Code) => void;
 }
 
 // Struct field indices.
@@ -248,9 +253,21 @@ export class MapBuilder {
    * -0/+0 — must hash identically, or a probe from the "wrong" bucket
    * would never find an existing entry), then a multiplicative mix of the
    * bit pattern's upper 32 bits. String kind: a polynomial rolling hash
-   * over code units, using L/SI/ACC as scratch (TMP/L/SI/ACC are each
+   * over code units, using L/SI/ACC as scratch. Symbol kind (INC-27 U1):
+   * no equal-but-differently-shaped-bits case exists to canonicalize
+   * (unlike f64's NaN/-0) — the struct's own monotone id, once minted,
+   * never changes for a given symbol — so this arm is STACK-ONLY:
+   * struct.get id, widen to i64, and reuse the SAME multiplicative mix
+   * tail the f64 arm ends with (no new formula), needing none of TMP/L/
+   * SI/ACC — every caller's own local-decl fork stays the ORIGINAL
+   * two-way split (f64 gets TMP; every other kind gets L/SI/ACC), which
+   * is still correct with a third kind present: TMP/L/SI/ACC are each
    * unused, and safe to pass as any allocated placeholder, on the arm
-   * that doesn't need them). */
+   * that doesn't read them (this file's own long-standing invariant,
+   * unchanged) — a sym key call simply never touches the L/SI/ACC
+   * locals it's handed. A fourth MapKeyKind member with no case HERE
+   * falls through to `never` and fails to compile — never silently
+   * takes another arm's hash. */
   private emitHashKey(c: Code, m: MapInfo, KL: number, TMP: number, L: number, SI: number, ACC: number): void {
     if (m.keyKind === "f64") {
       c.localGet(KL);
@@ -278,42 +295,63 @@ export class MapBuilder {
       c.i32WrapI64();
       return;
     }
-    c.localGet(KL);
-    c.arrayLen();
-    c.localSet(L);
-    c.i32Const(0);
-    c.localSet(ACC);
-    c.i32Const(0);
-    c.localSet(SI);
-    c.block();
-    c.loop();
-    c.localGet(SI);
-    c.localGet(L);
-    c.i32GeS();
-    c.brIf(1);
-    c.localGet(ACC);
-    c.i32Const(31);
-    c.i32Mul();
-    c.localGet(KL);
-    c.localGet(SI);
-    c.arrayGetU(this.deps.strType());
-    c.i32Add();
-    c.localSet(ACC);
-    c.localGet(SI);
-    c.i32Const(1);
-    c.i32Add();
-    c.localSet(SI);
-    c.br(0);
-    c.end();
-    c.end();
-    c.localGet(ACC);
+    if (m.keyKind === "str") {
+      c.localGet(KL);
+      c.arrayLen();
+      c.localSet(L);
+      c.i32Const(0);
+      c.localSet(ACC);
+      c.i32Const(0);
+      c.localSet(SI);
+      c.block();
+      c.loop();
+      c.localGet(SI);
+      c.localGet(L);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(ACC);
+      c.i32Const(31);
+      c.i32Mul();
+      c.localGet(KL);
+      c.localGet(SI);
+      c.arrayGetU(this.deps.strType());
+      c.i32Add();
+      c.localSet(ACC);
+      c.localGet(SI);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(SI);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(ACC);
+      return;
+    }
+    if (m.keyKind === "sym") {
+      c.localGet(KL);
+      this.deps.readSymId(c);
+      c.i64ExtendI32U();
+      c.i64Const(HASH_MIX);
+      c.i64Mul();
+      c.i64Const(32n);
+      c.i64ShrU();
+      c.i32WrapI64();
+      return;
+    }
+    const rest: never = m.keyKind;
+    throw new Error(`emitHashKey: unhandled key kind ${rest as string}`);
   }
 
   /** Pushes an i32 SameValueZero comparison of locals A and B (both
    * `m.keyVal`-typed). f64: `f64Eq(a,b) | (isNaN(a) & isNaN(b))` — f64Eq
    * alone already treats -0 == +0 (IEEE), the OR-clause makes any two
    * NaNs equal regardless of payload. String: exact content equality
-   * (strEq) — S005's collation order is a different predicate. */
+   * (strEq) — S005's collation order is a different predicate. Symbol
+   * (INC-27 U1): ref.eq — every `sym.new`/`sym.newAnon`/`Symbol.for`-miss
+   * call mints (or interns) its OWN struct, so pointer identity IS
+   * SameValueZero for a symbol, exactly as `bin:===`'s own symbol arm
+   * (emitter.ts) already treats it. A fourth MapKeyKind member with no
+   * case here falls through to `never` and fails to compile. */
   private emitKeyEq(c: Code, m: MapInfo, A: number, B: number): void {
     if (m.keyKind === "f64") {
       c.localGet(A);
@@ -329,9 +367,70 @@ export class MapBuilder {
       c.i32Or();
       return;
     }
-    c.localGet(A);
-    c.localGet(B);
-    c.call(this.deps.strEq());
+    if (m.keyKind === "str") {
+      c.localGet(A);
+      c.localGet(B);
+      c.call(this.deps.strEq());
+      return;
+    }
+    if (m.keyKind === "sym") {
+      c.localGet(A);
+      c.localGet(B);
+      c.refEq();
+      return;
+    }
+    const rest: never = m.keyKind;
+    throw new Error(`emitKeyEq: unhandled key kind ${rest as string}`);
+  }
+
+  /** Is this key kind a REF type that needs null-out-on-delete/clear
+   * (GC hygiene: a dead slot must not hold a live reference forever) and
+   * a non-null assertion when read back out of a source vector (addAll)?
+   * str and sym both answer yes (their `keyVal` is a nullable ref type);
+   * f64 answers no. ONE shared predicate for what was previously THREE
+   * separate `keyKind === "str"` literals (deleteM, clear, addAll) — a
+   * str-only check would silently miss sym at all three sites the same
+   * way an un-widened `if (kind === "f64") {...} else {...}` misses a
+   * third arm elsewhere in this file. A boolean-returning switch with NO
+   * default: `k === "str" || k === "sym"` stays SILENT when a fourth
+   * MapKeyKind member is added (measured — a plain `||`-chain never
+   * fails to compile no matter how many members exist), while a switch
+   * with every member given its own `return` and no default arm fails
+   * to compile on a fourth (TS2366, "not all code paths return a
+   * value") — the same exhaustiveness class emitHashKey/emitKeyEq's own
+   * `const rest: never` chains enforce, in the shape that suits a
+   * boolean answer rather than an emitted arm. */
+  private isRefKeyKind(k: MapKeyKind): boolean {
+    switch (k) {
+      case "str":
+        return true;
+      case "sym":
+        return true;
+      case "f64":
+        return false;
+    }
+  }
+
+  /** Which scratch the hash arm needs, for the three forks that declare
+   * find/rebuildBuckets/set's own local-decl locals (TMP for f64, L/SI/
+   * ACC otherwise) — the SAME no-default boolean-switch shape as
+   * `isRefKeyKind` just above, so a fourth MapKeyKind member fails to
+   * compile here too instead of silently taking the "else" (L/SI/ACC)
+   * branch. TODAY every non-f64 kind (str, sym) answers false and gets
+   * L/SI/ACC as unread placeholders (harmless: emitHashKey's own doc
+   * states neither arm touches a local it doesn't need) — the clause
+   * exists for whatever FOURTH kind arrives next, whose hash arm may
+   * genuinely need an f64 scratch of its own and would otherwise
+   * silently get the wrong trio. */
+  private hashNeedsF64Scratch(k: MapKeyKind): boolean {
+    switch (k) {
+      case "f64":
+        return true;
+      case "str":
+        return false;
+      case "sym":
+        return false;
+    }
   }
 
   /** %w.map.new — () -> map, all four arrays allocated at zero length (no
@@ -387,7 +486,7 @@ export class MapBuilder {
       let L = -1;
       let SI = -1;
       let ACC = -1;
-      if (m.keyKind === "f64") {
+      if (this.hashNeedsF64Scratch(m.keyKind)) {
         TMP = n++;
         locals.push(F64);
       } else {
@@ -498,7 +597,7 @@ export class MapBuilder {
       let L = -1;
       let SI = -1;
       let ACC = -1;
-      if (m.keyKind === "f64") {
+      if (this.hashNeedsF64Scratch(m.keyKind)) {
         TMP = n++;
         locals.push(F64);
       } else {
@@ -911,6 +1010,12 @@ export class MapBuilder {
       const E = n++;
       const locals: ValType[] = [I32];
 
+      // -0-to-+0 canonicalization: f64 ONLY. str and sym both stay `if`,
+      // not a switch — neither needs a branch (a string's bits ARE its
+      // content, and a symbol key is a struct reference with no -0/NaN-
+      // shaped equivalence class), so "no branch" is the CORRECT answer
+      // for both, not an omitted case; turning this into an exhaustive
+      // switch would force writing two identical empty arms.
       if (m.keyKind === "f64") {
         c.localGet(K);
         c.f64Const(0);
@@ -975,7 +1080,7 @@ export class MapBuilder {
       let L = -1;
       let SI = -1;
       let ACC = -1;
-      if (m.keyKind === "f64") {
+      if (this.hashNeedsF64Scratch(m.keyKind)) {
         TMP = n++;
         locals.push(F64);
       } else {
@@ -1150,7 +1255,7 @@ export class MapBuilder {
       c.i32Const(1);
       c.i32Sub();
       c.structSet(m.struct, NLIVE);
-      if (m.keyKind === "str") {
+      if (this.isRefKeyKind(m.keyKind)) {
         c.localGet(M);
         c.structGet(m.struct, KEYS);
         c.localGet(E);
@@ -1221,7 +1326,7 @@ export class MapBuilder {
       c.localGet(I);
       c.i32Const(0);
       c.arraySet(m.liveBufType);
-      if (m.keyKind === "str") {
+      if (this.isRefKeyKind(m.keyKind)) {
         c.localGet(M);
         c.structGet(m.struct, KEYS);
         c.localGet(I);
@@ -1531,7 +1636,7 @@ export class MapBuilder {
       c.structGet(vecStruct, BUF);
       c.localGet(I);
       c.arrayGet(vecBufType);
-      if (m.keyKind === "str") c.refAsNonNull();
+      if (this.isRefKeyKind(m.keyKind)) c.refAsNonNull();
       c.f64Const(0);
       c.call(this.set(m));
       c.localGet(I);
