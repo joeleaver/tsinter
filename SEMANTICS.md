@@ -5676,3 +5676,53 @@ listener fires); a forced-host interleaving row (`emitWarning(A); process.nextTi
 pinning Node's own A/T/B order against a drain-all mistake's A/B/T); a forced-host report-then-listener
 row per warning. Independently re-measured this pass against a live Node v24.18.1 rather than transcribed
 from the design phase's own numbers.
+
+## S080 — a tagged template's per-site strings array is NOT frozen: a write that Node rejects succeeds here, and the two build modes diverge from each other too *(scope stated per lane and per module mode below)*
+
+Node freezes each tagged-template call's per-site strings array (`Object.isFrozen` true, unobservable
+here — SC2020 — lowering it is not licensed by this entry) — a widened write to that array throws in
+strict mode. This tier's per-site interned array (a plain, writable GC vec, INC-27 U2's own per-key
+lazy-global design) carries no such check, and the two ways a value can widen enough to attempt the
+write diverge from EACH OTHER, not just from Node:
+
+**PLAIN** (`p = site() as unknown as string[]`, then `p.push(...)` or `p[i] = ...`): the write lands on
+the SAME array object the site's global caches — later evaluations of the SAME site see the mutation.
+This is the WASM TIER's own answer; the native lanes (llvm, c) SEGFAULT on this exact shape instead of
+answering anything (a separate, pre-existing defect under board #162 — NOT licensed by this entry and
+NOT this unit's to fix). Node (ESM/strict mode, the corpus's own module mode): the write throws
+(`TypeError: Cannot add property N, object is not extensible` for an out-of-bounds push, `TypeError:
+Cannot assign to read only property 'N' of object '[object Array]'` for an in-bounds index assignment —
+both measured against Node v24.18.1), and a later evaluation is unaffected (frozen, never mutated). In a
+CommonJS/sloppy script, `push` still throws (both module modes reject an out-of-bounds add), but an
+in-bounds INDEX WRITE is SILENTLY IGNORED instead of throwing (`q[0] = "Q"` leaves the array unchanged,
+no exception) — measured against Node v24.18.1.
+
+**--DYNAMIC** (`q: any = site()`, then `q[i] = ...`): the value crosses the `unknown`/dyn boundary on its
+way into `any` — S014's own rule (crossing that boundary COPIES; mutations on the far side do not
+propagate back) — so the write lands on a COPY, not the interned array. No throw. This answer is the
+SAME on every lane measured (wasm and llvm) — the --DYNAMIC half is NOT wasm-tier-only, unlike the
+PLAIN half above. Node (ESM/strict mode): still throws here too (`any` is a TypeScript-only erasure, not
+a distinct runtime object on Node's side) — a later evaluation of the SAME site is UNCHANGED regardless
+(the original was never touched, whether Node threw or the tier silently copied). This tier's
+own answer for the CommonJS/sloppy index-write shape (an untyped `.cjs` source, so the value
+already carries the S014 unknown-boundary copy without an explicit `any` cast) is the SAME
+shape as --DYNAMIC's above, not a third one: the write is visible through the value it landed
+on, and a second, independent evaluation of the same site is unaffected (row75) — only the
+module mode changes which mechanism produces the copy (an explicit cast vs. an untyped source),
+not the observable answer.
+
+This is one half of board #161 (a PRE-EXISTING miscompile: an `Object.freeze`-then-cast value elsewhere
+in the tier is not respected either) — #161 itself is NOT licensed by this entry and is NOT this unit's
+to fix; this entry documents the template-strings-array shape of the same underlying gap (no freeze
+representation at all, not an `Object.freeze` call this tier mishandles).
+
+**Tested by:** row43 (PLAIN — the value after the write, AND a second evaluation of the same site showing
+the array still carrying the mutation), row44 (--DYNAMIC — the no-throw write's own value, AND a
+second evaluation of the same site showing the ORIGINAL, unmutated array), and row75 (a `.cjs`/sloppy-
+mode program pinning the silently-ignored index write, contrasted with Node's own sloppy-mode answer) in
+`packages/compiler/test/wasm-smalls-u2.test.ts`. All three rows pin the ABSENCE of a check — no mutation
+is expected to redden any of them on its own; a mutant that allocates a FRESH template-site array on
+every evaluation instead of reusing the interned one reaches row43 as a measured side effect (a fresh
+array on the second PLAIN evaluation would show an UNMUTATED array, contradicting what row43 expects), a
+fact recorded in the rows-file battery's own reach table rather than invented as a dedicated mutant for
+this entry.

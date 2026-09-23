@@ -2947,6 +2947,10 @@ class Assembler {
 
   private readonly closSigs = new Map<string, { clos: number; fn: number }>();
   private readonly closInternGlobals = new Map<string, number>();
+  /** INC-27 U2 — templateStrings's per-site interning: one lazy global
+   * per IR `key`, the SAME closure-interning shape as closInternGlobals
+   * just above. */
+  private readonly templateInternGlobals = new Map<string, number>();
 
   /** The (closure struct, function type) pair for a wasm-level signature. */
   private closPairFor(params: ValType[], results: ValType[]): { clos: number; fn: number } {
@@ -9337,8 +9341,27 @@ class Assembler {
         return info === null ? null : this.classes.ref(info);
       }
       case "classval": {
-        const cv = this.classValInfo(t.className, loc, false);
-        return cv === null ? null : { kind: "ref", nullable: true, typeIndex: cv.objT };
+        // INC-27 U2: a ctor-less class (one never MATERIALISED as a
+        // value — a decorator-guarded class whose decorator throws
+        // before any application is one shape; a class referenced only
+        // as a TYPE, never constructed, is another) is not a hard
+        // refusal here — soft=true, the LOCKSTEP requirement
+        // mapTypeSoft's own arm below already honors: both return the
+        // IDENTICAL ValType (I32) for a ctor-less classval, never "null
+        // (refuse) in one, I32 in the other". A class that reaches an
+        // actual VALUE-construction site (emitClassObj, downcast,
+        // newValue, instanceOfValue, the libCall arm) still calls
+        // classValInfo with soft=false at THOSE five sites and still
+        // refuses if IT ever sees a ctor-less class — which never
+        // happens, because a class is only ever ctor-less when nothing
+        // constructs it. NOTE: soft=true here also silences
+        // classes.info's own refusal for ANY class reached only as a
+        // TYPE at this position, not only the ctor-less case — measured
+        // harmless (the census's claimed set gains exactly the ten
+        // named programs, no other program is newly claimed, and every
+        // VALUE-construction site above still refuses hard).
+        const cv = this.classValInfo(t.className, loc, true);
+        return cv === null ? I32 : { kind: "ref", nullable: true, typeIndex: cv.objT };
       }
       case "dyn":
         // The checked-dynamic box (dyn.ts). Like unions and promises this
@@ -11507,6 +11530,19 @@ class Assembler {
           this.close();
           this.releaseScratch(I32, kind);
           this.releaseScratch(this.caughtRef(), c);
+          return;
+        }
+        if (k === "record") {
+          // ToString(record) is Object.prototype.toString.call(record) =
+          // the CONSTANT "[object Object]" — no field enumeration, ever
+          // (INC-27 U2). The OPERAND still evaluates first — side
+          // effects observable — walkExpr pushes the record ref, which
+          // this arm discards unread, exactly the "[object Object]"
+          // fallback the caught-object arm above already uses for the
+          // same constant.
+          this.walkExpr(e.operand);
+          code.drop();
+          this.pushStrLit("[object Object]");
           return;
         }
         this.refuse(`toString:${k}`, e.loc);
@@ -19150,11 +19186,59 @@ class Assembler {
         }
       }
 
+      /* templateStrings is the tagged-template strings OBJECT (string[]) —
+       * INC-27 U2. `key` (the IR field) is the INTERNING key: the
+       * front end duplicates one site per generic instantiation and both
+       * copies carry the SAME key, so ONE per-key lazy global serves
+       * every evaluation of every IR node sharing it — the closure-
+       * interning precedent just above (`case "closure"`'s zero-capture
+       * arm) is the SAME shape: globalGet, refIsNull, build-once,
+       * globalSet, then read. `cooked`'s strings are compile-time known
+       * (the front end has already resolved every escape), so the array
+       * is built with an UNROLLED sequence of `vecs.set` calls, one per
+       * element — no runtime loop needed. Frozenness is REGISTERED
+       * (SEMANTICS S080), not built: nothing here makes the array
+       * read-only, matching Node's own array exactly UNTIL a write is
+       * attempted, which Node's real is frozen array rejects and this
+       * tier's plain mutable vec accepts (S080's two measured shapes). */
+      case "templateStrings": {
+        const stringVecKey = arrayOf(STRING) as IrType & { kind: "array" };
+        const vecInfo = this.vecInfoFor(stringVecKey, e.loc);
+        if (vecInfo === null) {
+          code.unreachable();
+          return;
+        }
+        let g = this.templateInternGlobals.get(e.key);
+        if (g === undefined) {
+          g = this.mb.addGlobal(this.vecs.vecRef(vecInfo), true, (w) => {
+            w.u8(0xd0); // ref.null
+            w.sleb(vecInfo.struct);
+          });
+          this.templateInternGlobals.set(e.key, g);
+        }
+        code.globalGet(g);
+        code.refIsNull();
+        this.openIf();
+        code.f64Const(e.cooked.length);
+        code.call(this.vecs.newLen(vecInfo));
+        const V = this.acquireScratch(this.vecs.vecRef(vecInfo));
+        code.localSet(V);
+        e.cooked.forEach((s, i) => {
+          code.localGet(V);
+          code.f64Const(i);
+          this.pushStrLit(s);
+          code.call(this.vecs.set(vecInfo));
+        });
+        code.localGet(V);
+        this.releaseScratch(this.vecs.vecRef(vecInfo), V);
+        code.globalSet(g);
+        this.close();
+        code.globalGet(g);
+        return;
+      }
       /* Unit values exist only inside unions (unionWrap intercepts them
        * before the walk, so a reached unitLit is refused loudly). */
       case "unitLit":
-      /* templateStrings is the tagged-template strings OBJECT (string[]). */
-      case "templateStrings":
       /* Native FFI — a link-time C ABI, nothing to link against here. */
       case "ffiCall":
       /* Async. yieldExpr never reaches here in a function the lowering
@@ -20547,6 +20631,12 @@ class Assembler {
       f64ToStr: () => this.f64ToStrHelper(),
       concat: () => this.concatHelper(),
       lit: (c, s) => this.pushStrLitInto(c, s),
+      // INC-27 U2: the array `with`'s catchable RangeError shares
+      // the SAME emitSetCellError route typedarrays.ts's BytesBuilder
+      // already wires for Uint8Array's with — one throwError plumbing,
+      // no new ABI.
+      throwError: (c, className, name, pushMessage, codeLit) =>
+        this.emitSetCellError(c, className, name, pushMessage, codeLit),
     });
     return this.vecsField;
   }
@@ -23090,19 +23180,36 @@ class Assembler {
         else code.f64Const(0);
         code.call(this.vecs.search(info, e.method === "includes"));
         return;
-      case "join":
+      case "join": {
+        // A "ref" elemKind element (INC-27 U2) is a union of
+        // {number,string,boolean}∪{null,undefined} arms — the front
+        // end's own join element fence: it refuses every other element kind
+        // (record/class/nested-array/function/bigint/Date) before it
+        // ever reaches this site, so the ONLY "ref" shape join ever sees
+        // here is a union whose arm list unionArmReps("toStr") already
+        // knows how to resolve (the same resolver toString's union arm
+        // and String()/template-literal ToString already share).
+        let refJoinToStr: (() => number) | null = null;
         if (info.elemKind === "ref") {
-          // ToString of an array element is its own recursive join —
-          // later work, its own tag.
-          this.refuse("arrIntrinsic:join:ref-elem", e.loc);
-          code.unreachable();
-          return;
+          if (rt.elem.kind !== "union") {
+            this.refuse("arrIntrinsic:join:ref-elem", e.loc);
+            code.unreachable();
+            return;
+          }
+          const unionId = rt.elem.unionId;
+          const reps = this.unionArmReps(unionId, "toStr", e.loc);
+          if (reps === null) {
+            code.unreachable();
+            return;
+          }
+          refJoinToStr = () => this.unions.toStrForJoin(unionId, reps);
         }
         this.walkExpr(e.receiver);
         if (e.args[0] !== undefined) this.walkExpr(e.args[0]);
         else this.pushStrLit(",");
-        code.call(this.vecs.join(info, this.strRef));
+        code.call(this.vecs.join(info, this.strRef, refJoinToStr));
         return;
+      }
       case "slice":
         this.walkExpr(e.receiver);
         if (e.args[0] !== undefined) this.walkExpr(e.args[0]);
@@ -23214,13 +23321,28 @@ class Assembler {
         this.releaseScratch(this.vecs.vecRef(info), vec);
         return;
       }
-      /* `with` throws a catchable RangeError — it joins with the
-       * exception protocol; the ES2023 copiers are tail work. */
+      /* The ES2023 copiers (INC-27 U2) — built generically over every
+       * VecInfo ElemKind. `with` throws a catchable RangeError
+       * through the SAME deps.throwError route typedarrays.ts's bytes
+       * `with` already uses — the call site here mirrors that
+       * one exactly: walk the args, call the helper, emitPendingCheck. */
       case "toReversed":
+        this.walkExpr(e.receiver);
+        code.call(this.vecs.toReversedHelper(info));
+        return;
       case "toSpliced":
+        this.walkExpr(e.receiver);
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        this.walkExpr(e.args[2]!);
+        code.call(this.vecs.toSplicedHelper(info));
+        return;
       case "with":
-        this.refuse(`arrIntrinsic:${e.method}`, e.loc);
-        code.unreachable();
+        this.walkExpr(e.receiver);
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        code.call(this.vecs.withHelper(info));
+        this.emitPendingCheck();
         return;
       default: {
         const rest: never = e.method;

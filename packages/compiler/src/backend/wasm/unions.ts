@@ -358,6 +358,53 @@ export class UnionBuilder {
     });
   }
 
+  /** %w.u.toStrJoin:<id> — the array `.join()` per-arm ToString over a
+   * union element (INC-27 U2, arrIntrinsic:join:ref-elem): SAME dispatch
+   * as toStr's f64/bool/string arms, but the unit arms answer "" instead
+   * of "null"/"undefined" — JS's Array.prototype.join convention (a
+   * hole/null/undefined element joins as empty), which is NOT toStr's
+   * direct-ToString convention. The front end's own join element fence
+   * for this site never lets a bytes or object arm reach here, so those
+   * two kinds throw defensively rather than being given a (dead) arm. */
+  toStrForJoin(unionId: string, arms: UnionArmRep[]): number {
+    return this.cached(`toStrJoin:${unionId}`, () => {
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.baseRef()], [this.deps.strRef()]),
+        `%w.u.toStrJoin:${unionId}`,
+      );
+      const c = new Code();
+      const TAGL = 1;
+      this.dispatch(c, TAGL, arms, (rep) => {
+        switch (rep.kind) {
+          case "undefined":
+          case "null":
+            this.deps.lit(c, "");
+            return;
+          case "string":
+            this.payload(c, rep, 0);
+            return;
+          case "f64":
+            this.payload(c, rep, 0);
+            c.call(this.deps.f64ToStr());
+            return;
+          case "bool":
+            this.payload(c, rep, 0);
+            c.ifResult(this.deps.strRef());
+            this.deps.lit(c, "true");
+            c.else_();
+            this.deps.lit(c, "false");
+            c.end();
+            return;
+          case "bytes":
+          case "ref":
+            throw new Error("join over a bytes/ref union arm (front end's own join element fence breached)");
+        }
+      });
+      this.mb.setBody(idx, [I32], c.bytes());
+      return idx;
+    });
+  }
+
   /** %w.u.retag:<fromKey>-><toKey> — re-wrap a value of the FROM union
    * into the TO union: same runtime family (every union shares this ONE
    * base struct), so this is purely a re-TAG, never a value conversion —

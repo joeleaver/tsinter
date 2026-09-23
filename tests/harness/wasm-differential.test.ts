@@ -3335,6 +3335,22 @@ const TIER_FLOOR: string[] = [
   "1732-symbol-field-cross-module/main.js",
   "2072-expando-function-members.ts",
   "2440-console-inspect-args.ts",
+  // INC-27 U2 (H, the static smalls: the ES2023 copiers toReversed/
+  // toSpliced/with over every VecInfo ElemKind, join over union elements
+  // per the front end's own join element fence, expr:templateStrings's
+  // per-site interning, toString:record, and classval:no-ctor's
+  // mapType/mapTypeSoft lockstep): 934 -> 944, the ten programs this
+  // unit lands.
+  "1872-template-tostring-composite.ts",
+  "1973-decorators-ambient.ts",
+  "1983-array-tuple-surfaces.ts",
+  "1992-small-syntax.ts",
+  "2250-tagged-templates.ts",
+  "2666-array-to-sorted.ts",
+  "2669-array-copying-methods.ts",
+  "2670-uint8array-copy-iterate.ts",
+  "2671-array-copying-js.cjs",
+  "2720-union-element-join.ts",
 ];
 
 interface RunResult {

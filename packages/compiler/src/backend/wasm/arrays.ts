@@ -28,6 +28,20 @@ export interface VecDeps {
   concat: () => number;
   /** Push an interned string literal onto `c`'s stack. */
   lit: (c: Code, s: string) => void;
+  /** Builds a class-error instance and fills the exception cell — the
+   * SAME emitSetCellError route typedarrays.ts's BytesBuilder.withHelper
+   * uses for the array `with`'s catchable RangeError (INC-27 U2): the
+   * caller pushes a dummy result and returns immediately;
+   * the outer emitter call site does the pending-check-and-propagate
+   * half via emitPendingCheck after the `call`, exactly as the bytes
+   * `with` call site already does. */
+  throwError: (
+    c: Code,
+    className: string,
+    name: string,
+    pushMessage: (c: Code) => void,
+    codeLit: string | null,
+  ) => void;
 }
 
 /** How elements compare (===/SameValueZero) and format (join). */
@@ -502,11 +516,32 @@ export class VecBuilder {
     });
   }
 
-  /** %w.vec.join — (vec, sep) → str; scalar and string elements only
-   * (the emitter refuses array-element join — ToString of an array is
-   * its own recursive join, later work). */
-  join(v: VecInfo, strRefT: ValType): number {
-    return this.cached(`${v.key}:join`, () => {
+  /** %w.vec.join — (vec, sep) → str. Scalar/string elements format
+   * inline; a "ref" elemKind element (INC-27 U2: a union of
+   * {number,string,boolean}∪{null,undefined} arms, the front end's own
+   * join element fence (lower-containers.ts) —
+   * a record/class/nested-array/function element is refused at the
+   * front end before it ever reaches here) formats via `refJoinToStr`,
+   * the caller's per-arm ToString helper index (unions.ts's
+   * toStrForJoin) — arrays.ts stays element-representation-agnostic and
+   * never itself inspects a union's arm list. A "ref" elemKind array
+   * reaching here with `refJoinToStr` still null is an emitter bug (the
+   * refusal belongs at the call site, before this helper is even
+   * requested). CACHE KEY: `vecKeyFor`'s `v.key` is deliberately ONE
+   * shared "vec(union)" key for EVERY union-element array (every union
+   * value is a ref to the same base struct — vecKeyFor's own documented
+   * reason), so `${v.key}:join` alone would collide TWO DIFFERENT
+   * unions' join calls onto the SAME cached function (measured:
+   * `(string|undefined)[]` and `(number|string|null)[]` join
+   * calls in one module shared one cached `%w.vec.join:vec(union)` and
+   * the SECOND union's runtime tag hit the FIRST union's arm casts —
+   * "illegal cast"). `refJoinToStr` is called EAGERLY (outside the
+   * lazy `cached` builder) so its own already-interned helper INDEX can
+   * fold into the join helper's cache key — never re-deriving a
+   * "structural union identity" arrays.ts has no business knowing. */
+  join(v: VecInfo, strRefT: ValType, refJoinToStr: (() => number) | null = null): number {
+    const refIdx = refJoinToStr === null ? null : refJoinToStr();
+    return this.cached(`${v.key}:join:${refIdx ?? "-"}`, () => {
       const idx = this.mb.declareFunc(
         this.mb.funcType([this.vecRef(v), strRefT], [strRefT]),
         `%w.vec.join:${v.key}`,
@@ -556,7 +591,9 @@ export class VecBuilder {
         case "string":
           break; // already a string
         case "ref":
-          throw new Error("join over ref elements is refused at the emitter");
+          if (refIdx === null) throw new Error("join over ref elements needs refJoinToStr (emitter bug)");
+          c.call(refIdx);
+          break;
       }
       c.call(this.deps.concat());
       c.localSet(ACC);
@@ -759,6 +796,282 @@ export class VecBuilder {
       c.refAsNonNull();
       c.structNew(v.struct);
       this.mb.setBody(idx, [I32, I32, I32, this.nullableBuf(v)], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.vec.toReversed — (vec) → fresh vec, elements in reverse order;
+   * the receiver is UNCHANGED (ES2023 copier — INC-27 U2). Every
+   * ElemKind: a raw element copy (arrayGet/arraySet), no per-kind
+   * formatting needed (unlike join). */
+  toReversedHelper(v: VecInfo): number {
+    return this.cached(`${v.key}:toReversed`, () => {
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.vecRef(v)], [this.vecRef(v)]),
+        `%w.vec.toReversed:${v.key}`,
+      );
+      const c = new Code();
+      const V = 0;
+      const L = 1; // i32 len
+      const NB = 2; // new buf
+      const I = 3; // loop cursor
+      c.localGet(V);
+      c.structGet(v.struct, LEN);
+      c.localSet(L);
+      c.localGet(L);
+      c.arrayNewDefault(v.bufType);
+      c.localSet(NB);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(L);
+      c.i32GeS();
+      c.brIf(1);
+      // NB[i] = V.buf[L - 1 - i] — a raw slot copy (no absent-slot trap:
+      // a receiver's own [0, len) slots are always populated).
+      c.localGet(NB);
+      c.localGet(I);
+      c.localGet(V);
+      c.structGet(v.struct, BUF);
+      c.localGet(L);
+      c.i32Const(1);
+      c.i32Sub();
+      c.localGet(I);
+      c.i32Sub();
+      if (v.storage === "i8" || v.storage === "i16") c.arrayGetU(v.bufType);
+      else c.arrayGet(v.bufType);
+      c.arraySet(v.bufType);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(L);
+      c.localGet(NB);
+      c.refAsNonNull();
+      c.structNew(v.struct);
+      this.mb.setBody(idx, [I32, this.nullableBuf(v), I32], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.vec.toSpliced — (vec, start f64, deleteCount f64, items vec) →
+   * fresh vec; the receiver is UNCHANGED (ES2023 copier — INC-27 U2).
+   * `start`/`deleteCount` clamp exactly as splice's own (start via
+   * emitRelIndex, deleteCount via the same NaN/negative/+Infinity
+   * clamp splice uses) — the frontend has already canonicalised the
+   * omitted-argument forms (lower-containers.ts's toSpliced lowering:
+   * no args → (0, 0, []); start only → (start, +Infinity, [])). `items`
+   * arrives as an already-built vec of the SAME VecInfo (an arrayLit
+   * IR node walked like any array literal), never a spread. */
+  toSplicedHelper(v: VecInfo): number {
+    return this.cached(`${v.key}:toSpliced`, () => {
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.vecRef(v), F64, F64, this.vecRef(v)], [this.vecRef(v)]),
+        `%w.vec.toSpliced:${v.key}`,
+      );
+      const c = new Code();
+      const V = 0;
+      const S = 1;
+      const CNT = 2;
+      const ITEMS = 3;
+      const L = 4; // i32 len
+      const A = 5; // i32 start
+      const N = 6; // i32 delete count
+      const IL = 7; // i32 items len
+      const NL = 8; // i32 new len
+      const NB = 9; // new buf
+      c.localGet(V);
+      c.structGet(v.struct, LEN);
+      c.localSet(L);
+      this.emitRelIndex(c, S, L);
+      c.localSet(A);
+      // n = clamp(trunc(count), 0, len - start); +Infinity → to the end,
+      // NaN → 0 — the SAME clamp splice() uses (a bare trunc would trap
+      // on +/-Infinity).
+      c.localGet(CNT);
+      c.localGet(CNT);
+      c.f64Ne();
+      c.ifVoid();
+      c.f64Const(0);
+      c.localSet(CNT);
+      c.end();
+      c.localGet(CNT);
+      c.f64Trunc();
+      c.localSet(CNT);
+      c.localGet(CNT);
+      c.f64Const(0);
+      c.f64Lt();
+      c.ifResult(I32);
+      c.i32Const(0);
+      c.else_();
+      c.localGet(CNT);
+      c.localGet(L);
+      c.localGet(A);
+      c.i32Sub();
+      c.f64ConvertI32S();
+      c.f64Ge();
+      c.ifResult(I32);
+      c.localGet(L);
+      c.localGet(A);
+      c.i32Sub();
+      c.else_();
+      c.localGet(CNT);
+      c.i32TruncF64S();
+      c.end();
+      c.end();
+      c.localSet(N);
+      c.localGet(ITEMS);
+      c.structGet(v.struct, LEN);
+      c.localSet(IL);
+      // newLen = len - n + itemsLen
+      c.localGet(L);
+      c.localGet(N);
+      c.i32Sub();
+      c.localGet(IL);
+      c.i32Add();
+      c.localSet(NL);
+      c.localGet(NL);
+      c.arrayNewDefault(v.bufType);
+      c.localSet(NB);
+      // NB[0, A) = V.buf[0, A)
+      c.localGet(NB);
+      c.i32Const(0);
+      c.localGet(V);
+      c.structGet(v.struct, BUF);
+      c.i32Const(0);
+      c.localGet(A);
+      c.arrayCopy(v.bufType, v.bufType);
+      // NB[A, A+IL) = ITEMS.buf[0, IL)
+      c.localGet(NB);
+      c.localGet(A);
+      c.localGet(ITEMS);
+      c.structGet(v.struct, BUF);
+      c.i32Const(0);
+      c.localGet(IL);
+      c.arrayCopy(v.bufType, v.bufType);
+      // NB[A+IL, NL) = V.buf[A+N, L)
+      c.localGet(NB);
+      c.localGet(A);
+      c.localGet(IL);
+      c.i32Add();
+      c.localGet(V);
+      c.structGet(v.struct, BUF);
+      c.localGet(A);
+      c.localGet(N);
+      c.i32Add();
+      c.localGet(L);
+      c.localGet(A);
+      c.localGet(N);
+      c.i32Add();
+      c.i32Sub();
+      c.arrayCopy(v.bufType, v.bufType);
+      c.localGet(NL);
+      c.localGet(NB);
+      c.refAsNonNull();
+      c.structNew(v.struct);
+      this.mb.setBody(idx, [I32, I32, I32, I32, I32, this.nullableBuf(v)], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.vec.with — (vec, index f64, value elem) → fresh vec, one element
+   * replaced (ES2023 copier — INC-27 U2). THROWS Node's catchable
+   * RangeError "Invalid index : " + the ORIGINAL argument's
+   * Number::toString on an out-of-range relative index — the SAME
+   * throwError route and message shape
+   * typedarrays.ts's BytesBuilder.withHelper already uses for
+   * Uint8Array, ported to a GC vec instead of linear-memory bytes. The
+   * index arrives as f64 (ToNumber is the boundary's, not the site's):
+   * trunc, NaN → 0, negative → + len, then a range check that
+   * THROWS (not clamps, unlike slice/splice's emitRelIndex). */
+  withHelper(v: VecInfo): number {
+    return this.cached(`${v.key}:with`, () => {
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.vecRef(v), F64, v.elemVal], [this.vecRef(v)]),
+        `%w.vec.with:${v.key}`,
+      );
+      const c = new Code();
+      const V = 0;
+      const IDX = 1;
+      const VAL = 2;
+      const L = 3; // i32 len
+      const REL = 4; // f64 relative index
+      const ACTUAL = 5; // i32 actual index
+      const NB = 6; // new buf
+      c.localGet(V);
+      c.structGet(v.struct, LEN);
+      c.localSet(L);
+      c.localGet(IDX);
+      c.localGet(IDX);
+      c.f64Ne();
+      c.ifResult(F64);
+      c.f64Const(0);
+      c.else_();
+      c.localGet(IDX);
+      c.f64Trunc();
+      c.end();
+      c.localSet(REL);
+      c.localGet(REL);
+      c.f64Const(0);
+      c.f64Lt();
+      c.ifVoid();
+      c.localGet(L);
+      c.f64ConvertI32S();
+      c.localGet(REL);
+      c.f64Add();
+      c.localSet(REL);
+      c.end();
+      c.localGet(REL);
+      c.f64Const(0);
+      c.f64Lt();
+      c.localGet(REL);
+      c.localGet(L);
+      c.f64ConvertI32S();
+      c.f64Ge();
+      c.i32Or();
+      c.ifVoid();
+      this.deps.throwError(
+        c,
+        "%RangeError",
+        "RangeError",
+        (mc) => {
+          this.deps.lit(mc, "Invalid index : ");
+          mc.localGet(IDX);
+          mc.call(this.deps.f64ToStr());
+          mc.call(this.deps.concat());
+        },
+        null,
+      );
+      c.refNull(v.struct);
+      c.return_();
+      c.end();
+      c.localGet(REL);
+      c.i32TruncF64S();
+      c.localSet(ACTUAL);
+      c.localGet(L);
+      c.arrayNewDefault(v.bufType);
+      c.localSet(NB);
+      c.localGet(NB);
+      c.i32Const(0);
+      c.localGet(V);
+      c.structGet(v.struct, BUF);
+      c.i32Const(0);
+      c.localGet(L);
+      c.arrayCopy(v.bufType, v.bufType);
+      c.localGet(NB);
+      c.localGet(ACTUAL);
+      c.localGet(VAL);
+      c.arraySet(v.bufType);
+      c.localGet(L);
+      c.localGet(NB);
+      c.refAsNonNull();
+      c.structNew(v.struct);
+      this.mb.setBody(idx, [I32, F64, I32, this.nullableBuf(v)], c.bytes());
       return idx;
     });
   }
