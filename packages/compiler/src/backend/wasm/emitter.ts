@@ -2974,10 +2974,24 @@ class Assembler {
     return made;
   }
 
+  /** The shared trailing-slot representation for a rest-typed func value's
+   * synthesized last parameter — read by BOTH closSigFor (below, the hard/
+   * mapType-opt-in arm) and mapTypeSoft's own func arm, so the two never
+   * independently drift on what a boxed rest vector looks like. */
+  private restTrailingValType(): ValType {
+    return this.dyn.dynRef();
+  }
+
   /** The pair for an IR func TYPE — honest refusals for unmappable
-   * components; rest-marked values live behind the dyn boundary. */
-  private closSigFor(t: IrType & { kind: "func" }, loc: SrcLoc | undefined): { clos: number; fn: number } | null {
-    if (t.rest === true) {
+   * components; a rest-marked type is refused by default unless the
+   * caller opts in, and a distinct key covers restAbi "jsval"
+   * unconditionally (never opts in). */
+  private closSigFor(t: IrType & { kind: "func" }, loc: SrcLoc | undefined, optIn = false): { clos: number; fn: number } | null {
+    if (t.rest === true && t.restAbi === "jsval") {
+      this.refuse("type:func-rest-jsval", loc);
+      return null;
+    }
+    if (t.rest === true && !optIn) {
       this.refuse("type:func-rest", loc);
       return null;
     }
@@ -2987,6 +3001,7 @@ class Assembler {
       if (v === null) return null;
       params.push(v);
     }
+    if (t.rest === true) params.push(this.restTrailingValType());
     let results: ValType[] = [];
     if (t.ret.kind !== "void") {
       const r = this.mapType(t.ret, loc);
@@ -8462,7 +8477,7 @@ class Assembler {
     const key = typeKey(t);
     const hit = this.dynFnThunks.get(key);
     if (hit !== undefined) return hit;
-    const pair = this.closSigFor(t, loc);
+    const pair = this.closSigFor(t, loc, true);
     if (pair === null) return null;
     const idx = this.mb.declareFunc(this.dyn.thunkSig(), `%w.dyn.fnThunk:${key}`);
     this.dynFnThunks.set(key, idx);
@@ -8487,9 +8502,10 @@ class Assembler {
     // JS ARITY lives in this loop: an argument the caller did not supply
     // IS the undefined immortal, and the parameter's own check decides
     // whether that flies (a dyn parameter takes it; a number parameter
-    // throws the path-annotated TypeError). Arguments PAST the declared
-    // list were evaluated by the caller and are simply never read —
-    // `argc` is the vector's length, exactly C's (args, argc) pair.
+    // throws the path-annotated TypeError). `argc` is the vector's
+    // length, exactly C's (args, argc) pair; arguments past the declared
+    // list are read below, when t.rest === true, into the trailing rest
+    // vector — never simply dropped.
     dyn.arrLen(c, (x) => x.localGet(1));
     c.localSet(n);
     const slots: number[] = [];
@@ -8530,6 +8546,39 @@ class Assembler {
       c.call(check);
       c.localSet(slot);
       this.emitWalkerPending(c, dynRef);
+    }
+    // Every argument at or past the declared list — `argc` in `n`, the
+    // declared count in `t.params.length` — is collected into a FRESH dyn
+    // array (never the incoming args vector itself, which some callers
+    // keep a live reference to) and boxed as the ONE trailing slot
+    // closSigFor's opt-in arm appended to the padded signature.
+    if (t.rest === true) {
+      const restVec = this.wlocal(w, dyn.arrRef());
+      dyn.pushNewArr(c);
+      c.localSet(restVec);
+      const i = this.wlocal(w, I32);
+      c.i32Const(t.params.length);
+      c.localSet(i);
+      c.block();
+      c.loop();
+      c.localGet(i);
+      c.localGet(n);
+      c.i32GeU();
+      c.brIf(1);
+      c.localGet(restVec);
+      dyn.arrAt(c, (x) => x.localGet(1), (x) => x.localGet(i));
+      c.call(dyn.arrPush());
+      c.localGet(i);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(i);
+      c.br(0);
+      c.end();
+      c.end();
+      const restSlot = this.wlocal(w, dynRef);
+      dyn.boxArr(c, (x) => x.localGet(restVec));
+      c.localSet(restSlot);
+      slots.push(restSlot);
     }
     // The closure the box carries, cast back to this signature's own
     // struct. Sound because a thunk is only ever reached through the box
@@ -8575,7 +8624,7 @@ class Assembler {
     const key = typeKey(t);
     const hit = this.dynFnBoxes.get(key);
     if (hit !== undefined) return hit;
-    const pair = this.closSigFor(t, loc);
+    const pair = this.closSigFor(t, loc, true);
     if (pair === null) return null;
     const closRef: ValType = { kind: "ref", nullable: true, typeIndex: pair.clos };
     const idx = this.mb.declareFunc(
@@ -9303,7 +9352,7 @@ class Assembler {
         return info === null ? null : this.vecs.vecRef(info);
       }
       case "func": {
-        const pair = this.closSigFor(t, loc);
+        const pair = this.closSigFor(t, loc, true);
         return pair === null ? null : { kind: "ref", nullable: true, typeIndex: pair.clos };
       }
       case "record": {
@@ -9508,9 +9557,18 @@ class Assembler {
         return this.vecs.vecRef(this.vecs.info(this.vecKeyFor(t), elem, storage, kind));
       }
       case "func": {
-        if (t.rest === true) return I32;
+        // restAbi "jsval" keeps its I32 placeholder unchanged (never opts
+        // in); a restAbi-absent rest type builds a REAL closPairFor pair
+        // — the declared params soft-mapped as before, PLUS one trailing
+        // slot for the boxed rest vector, using the SAME shared helper
+        // closSigFor's hard-mapped arm reads below (mapTypeSoft never
+        // calls closSigFor itself, but must still agree with it on the
+        // trailing slot's shape).
+        if (t.rest === true && t.restAbi === "jsval") return I32;
+        const softParams = t.params.map((p) => this.mapTypeSoft(p));
+        if (t.rest === true) softParams.push(this.restTrailingValType());
         const pair = this.closPairFor(
-          t.params.map((p) => this.mapTypeSoft(p)),
+          softParams,
           t.ret.kind === "void" ? [] : [this.mapTypeSoft(t.ret)],
         );
         return { kind: "ref", nullable: true, typeIndex: pair.clos };
@@ -13555,6 +13613,17 @@ class Assembler {
           const cbType = e.args[0]!.type;
           if (cbType.kind !== "func") {
             this.refuse("libCall:process.onExit:unexpected-callback-shape", e.loc);
+            code.unreachable();
+            return;
+          }
+          // This arm reads cbType.params.length directly and dispatches
+          // through TWO FIXED, non-rest synthetic shapes (process.ts's
+          // oneArgClosPair/zeroArgClosPair) — never through closSigFor. A
+          // rest-marked callback here used to fall through to an illegal-
+          // cast trap with no diagnostic; refused by name now, before
+          // `shape` is ever computed.
+          if (cbType.rest === true) {
+            this.refuse(cbType.restAbi === "jsval" ? "type:func-rest-jsval" : "type:func-rest", e.loc);
             code.unreachable();
             return;
           }

@@ -5726,3 +5726,126 @@ every evaluation instead of reusing the interned one reaches row43 as a measured
 array on the second PLAIN evaluation would show an UNMUTATED array, contradicting what row43 expects), a
 fact recorded in the rows-file battery's own reach table rather than invented as a dedicated mutant for
 this entry.
+
+## S081 — `arguments` inside a variadic (rest-marked) JS function is a real array on every tsinter lane: Node's Arguments exotic object is not synthesised
+
+A JS function that reads its own `arguments` binding with no declared parameters ahead of it (the sloppy-
+mode idiom this tier models internally as a rest-typed func value, restAbi absent) gets, on every lane —
+llvm, c and wasm, on both the DIRECT-call path and the VALUE path (a rest-typed function crossing a dyn
+boundary) — a REAL, ordinary array: the same boxed rest vector `(...args)` would build. Node's
+`arguments` is a distinct exotic object (a live view over the call's bindings in sloppy non-strict mode;
+in strict mode it is UNMAPPED — not linked to the parameters — but still an ordinary writable, extensible
+object, not frozen; it carries its own `[Symbol.iterator]`, `callee`, and `length`/index own-properties)
+— this tier never constructs that object; it hands back the plain array the rest-parameter machinery
+already builds.
+
+The two answers AGREE on reads that do not depend on the exotic object's own identity, its
+live-binding behavior, or its `Object.prototype.toString` tag: for-of iteration order and content,
+indexed reads (including an out-of-range index, `undefined` on both), `.length` (read, not write),
+membership (`0 in arguments`, `'length' in arguments`, `Object.hasOwn(arguments, 'length')`), `typeof
+push`/`join`/`forEach` (`"undefined"` on both — neither object exposes them as own properties directly
+on `arguments`), `typeof arguments` (`"object"`), `arguments == null` (`false`), `!!arguments` (`true`),
+`Object.keys(arguments)` and `JSON.stringify(Object.entries(arguments))` (both `"0,1"` /
+`[["0",1],["1","two"]]`). Tested by AGR-1..4 and AGR-o10 in `packages/compiler/test/wasm-funcrest-u3.test.ts`
+— stated for completeness, not separately registered.
+
+The two answers DIVERGE on the eleven observables below, each measured against Node v24.18.1 (`arguments`
+inside a CLASS or STATIC method is a DIFFERENT construct, not this entry's territory: this tier's front
+end folds `arguments.length` to the constant `0` there on every lane, silently, where Node answers the
+real count — board #164 owns that gap):
+
+`.callee` — strict mode: Node throws a TypeError reading it (`'caller', 'callee', and 'arguments'
+properties may not be accessed`) where this tier answers `undefined` (S081-8, a strict `.cjs`). Sloppy
+mode: Node answers `"function"` for `typeof arguments.callee` where this tier answers `"undefined"`
+uniformly on both the direct-call path and the value path (S081-9, a sloppy `.js`).
+
+`util.inspect`/`console.log(arguments)` — Node prints `[Arguments] { '0': 1, '1': 'two' }`; this tier
+prints the plain array form `[ 1, 'two' ]` (S081-1, strict `.cjs`).
+
+`JSON.stringify(arguments)` — Node's Arguments object serializes as an OBJECT with numeric-string keys
+(`{"0":1,"1":"two"}`); this tier serializes as an ARRAY (`[1,"two"]`) (S081-2, strict `.cjs`).
+
+`Array.isArray(arguments)` — Node answers `false` (an Arguments object is not an Array); this tier
+answers `true`, including the zero-argument twin (S081-3, strict `.cjs`).
+
+`String(arguments)` / template coercion — Node's Arguments object has no custom `toString`, so it falls
+to `Object.prototype.toString` and answers `"[object Arguments]"`; this tier answers the array's own
+join-based `String()`, e.g. `"1,two"` (S081-5 `String()`, S081-6 the template form; both strict `.cjs`).
+
+String concatenation (`'x' + arguments`) — same divergence, Node's `"x[object Arguments]"` vs this
+tier's `"x1,two"` (S081-7, strict `.cjs`).
+
+An index WRITE past the current length — Node's Arguments object accepts an arbitrary own-property
+write without growing `.length` (writing index 0 and index 5 on a 2-argument call leaves `.length` at
+2); this tier's array grows `.length` to accommodate the write, matching ordinary JS array semantics
+(S081-10, strict `.cjs`).
+
+`[].concat(arguments).length` — `Array.prototype.concat` does not special-case an array-like non-Array,
+so Node's result is `1` (the whole Arguments object concatenated as ONE element); this tier's result is
+`2` (the array's own two elements spread in, matching ordinary `Array.prototype.concat` over a real
+array) (S081-11, strict `.cjs`).
+
+Writing `.length` directly — Node's Arguments object accepts the write as an ordinary own-property
+assignment with no truncating/padding side effect on the actual indexed values (no throw); this tier
+throws a CATCHABLE TypeError, `"Cannot create property 'length' on array"` (S081-12, strict `.cjs`).
+
+**LOUD REFUSALS** (not divergences, and not compile-time refusals either — each of these four constructs
+COMPILES on every lane and fails at RUN TIME with a named, deferred diagnostic, `"Uncaught Error: ...
+is not supported yet [SC1090 at file:line]"`, printed before the program stops — a trap on wasm, exit 1
+on the native lanes; never a value, never silent): `Object.prototype.toString.call(arguments)`,
+`arguments instanceof Array`, spreading `arguments` into an `unknown[]`-typed position, and
+`arguments[Symbol.iterator]`.
+
+**Scope:** both native lanes (llvm, c) and wasm; both the DIRECT-call path and the VALUE path (a
+rest-typed function crossing a dyn boundary) on wasm; module mode is strict `.cjs` for every observable
+except S081-9 (a sloppy `.js` — `.callee`'s own divergence is per-mode, stated above). Corpus
+1703-arguments-rest-props.cjs is a further direct-call proof. Board #164 owns `arguments` inside class
+and static methods (a different, front-end-level construct), not this entry's territory.
+
+**Tested by:** S081-1, S081-2, S081-3, S081-5, S081-6, S081-7, S081-8, S081-9, S081-10, S081-11, S081-12
+(each a direct/value twin pair), AGR-1..4 and AGR-o10, and the four LOUD REFUSALS (each a direct/value
+twin pair) in `packages/compiler/test/wasm-funcrest-u3.test.ts`.
+
+## S082 — `process.nextTick` callbacks and microtasks (`queueMicrotask`, a `Promise` `.then` handler) drain in the SAME relative order on every tsinter lane, regardless of module mode; Node's CommonJS order is not reproduced
+
+Node schedules two separate queues after each turn of synchronous top-level code: the **next-tick
+queue** (`process.nextTick`) and the **microtask queue** (`queueMicrotask`, `Promise.prototype.then`).
+In a CommonJS (`.cjs`) or CommonJS-mode `.ts` module (this tier's oracle mirror runs a `.ts` file with no
+extension-forced module type as CommonJS, matching its `package.json`'s `"type"`), Node drains the
+**next-tick queue first, then the microtask queue**, independent of the two calls' relative registration
+order — `process.nextTick(a); queueMicrotask(b);` and `queueMicrotask(b); process.nextTick(a);` both
+print `a` before `b`. In an ES module (`.mjs`, or a `.ts`/`package.json` pair typed `"module"`), Node
+drains the **microtask queue first, then the next-tick queue** — the same two call orders both print `b`
+before `a`. (Both queues still drain in FIFO order internally; this entry is about the queues' relative
+priority, not intra-queue order.)
+
+This tier's queues — on every lane, llvm, c and wasm — always drain in the ES-module order: microtasks
+before next-tick callbacks, regardless of the source file's module mode (`.cjs`/`.ts`-CommonJS or
+`.mjs`) and regardless of the two calls' registration order. A same-body program run as `.cjs` and as
+`.mjs` therefore AGREES with Node on the `.mjs` twin and DIVERGES from Node on the `.cjs`/`.ts`-CommonJS
+twin — this tier has, in effect, only one ordering rule where Node has two.
+
+**Unaffected (both queues agree with Node, every lane, every module mode):** a next-tick callback that
+itself schedules a microtask, and a microtask that itself schedules a next-tick callback. Measured:
+`queueMicrotask(() => { console.log("micro"); process.nextTick(() => console.log("tick-from-micro")); })`
+prints `micro` then `tick-from-micro` on Node (`.cjs` and `.mjs` alike) and on every tsinter lane;
+`process.nextTick(() => { console.log("tick"); queueMicrotask(() => console.log("micro-from-tick")); })`
+prints `tick` then `micro-from-tick` on Node (both module modes) and on every tsinter lane. A three-way
+race registers a `Promise.resolve().then` handler FIRST, then a `queueMicrotask` callback, then a
+`process.nextTick` callback, at the top level, in that order — `Promise.resolve().then(() =>
+console.log("then")); queueMicrotask(() => console.log("micro")); process.nextTick(() =>
+console.log("tick"));` — and prints (Node `.cjs`) `tick, then, micro`; (Node `.mjs`) `then, micro,
+tick`; (every tsinter lane, every module mode) `then, micro, tick` — the `.then` handler and
+`queueMicrotask` keep their OWN relative (registration) order against each other on every lane and
+every mode; only their priority against `process.nextTick` follows this entry's rule.
+
+**Scope:** llvm, c and wasm; `.cjs`, `.mjs`, and CommonJS-mode `.ts` source files; both registration
+orders of the two top-level calls. Not yet fixed — board #169 owns bringing the `.cjs`/CommonJS-mode
+ordering in line with Node's; this entry registers the CURRENT (divergent) behavior, not a target.
+
+**Tested by:** S082-cjs-nt-first (the `.cjs` divergent cell, both registration orders), S082-mjs-agree
+(the `.mjs` agreeing twin, both registration orders), S082-nest-agree (the two nesting shapes, agreeing
+on every lane and mode — a stated non-divergence), S082-three-way (the next-tick/`.then`/`queueMicrotask`
+race, divergent cell + agreeing `.mjs` twin) in `packages/compiler/test/wasm-funcrest-u3.test.ts`. The
+CommonJS-mode `.ts` cell and the native (llvm, c) lanes are MEASURED, not pinned by a row. Measured
+against Node v24.18.1 and this tier's own llvm/c/wasm lanes.

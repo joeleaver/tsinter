@@ -3351,6 +3351,16 @@ const TIER_FLOOR: string[] = [
   "2670-uint8array-copy-iterate.ts",
   "2671-array-copying-js.cjs",
   "2720-union-element-join.ts",
+  // INC-27 U3 (G, rest-typed function values: closSigFor's opt-in,
+  // mapType/mapTypeSoft's func arms in lockstep, the rest-array thunk
+  // build, the process.onExit rest guard): 944 -> 950, the six programs
+  // this unit lands.
+  "1700-mustcall-common/main.cjs",
+  "1701-mustcall-exit-report/main.cjs",
+  "1703-arguments-rest-props.cjs",
+  "1826-settimeout-arguments-callback.js",
+  "2163-js-selfref-const.cjs",
+  "2164-js-then-dyn-handler.cjs",
 ];
 
 interface RunResult {
