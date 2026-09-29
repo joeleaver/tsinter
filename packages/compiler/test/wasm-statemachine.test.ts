@@ -877,12 +877,13 @@ describe("refusals leave the function untouched", () => {
     }
   });
 
-  test("a NON-suspending finally with a return still refuses — the settle-then-return bug is real for the verbatim-kept case", () => {
-    // The narrowed decline (checkEligible, stage B): a return inside a
-    // finally-bearing try that has NO suspension anywhere in it stays
-    // declined — rewriteReturns' naive splice would settle BEFORE the
-    // emitter's own native finally desugar runs it, observably too
-    // early. Only the ACTUALLY-suspending shape (above) gets the fix.
+  test("a NON-suspending finally with a return now lowers through the parked completion; a string for-of crossing one still refuses", () => {
+    // INC-27 U4: a return inside a finally-bearing try that has NO
+    // suspension anywhere in it no longer declines. Keeping the try
+    // verbatim would settle BEFORE the finally ran (rewriteReturns'
+    // splice); the statement is exploded instead (returnCrossesFinally),
+    // so the return parks through completeOrPark and the finally runs
+    // first. The observable side is wasm-async-u4.test.ts rows F01-F12.
     const withFinally = (tryBody: IrStmt[], finallyBody: IrStmt[]): IrStmt => ({
       kind: "tryCatch",
       tryBody,
@@ -891,8 +892,36 @@ describe("refusals leave the function untouched", () => {
       finallyBody,
       loc,
     });
-    expectRefusal(
+    const mod = lowerOne(
       plain([withFinally([{ kind: "return", value: num(1), loc }], [log([str("f")])])], [], { returnType: F64 }),
+    );
+    expect(mod.functions.some((f) => f.name === "%f.resume")).toBe(true);
+    // The parked completion's frame slots exist only when a finally took
+    // part in completion — evidence the park path was taken.
+    expect(frameFields(mod, "f")).toContain("%pending.kind");
+    expect(frameFields(mod, "f")).toContain("%pending.value");
+    // The one shape the name still covers: a for-of the pass cannot turn
+    // into an index-based loop (a non-array iterable) whose return must
+    // run a finally first.
+    expectRefusal(
+      plain(
+        [
+          withFinally(
+            [
+              {
+                kind: "forOf",
+                localId: "ch.0",
+                iterable: v("s.0", STRING),
+                body: [{ kind: "return", value: num(1), loc }],
+                loc,
+              },
+            ],
+            [log([str("f")])],
+          ),
+        ],
+        [local("ch.0", STRING), local("s.0", STRING)],
+        { returnType: F64 },
+      ),
       "fn:async:return-in-finally",
     );
   });
@@ -990,11 +1019,13 @@ describe("refusals leave the function untouched", () => {
     );
   });
 
-  test("a body-boxed local whose declaration can run twice", () => {
+  test("a body-boxed local whose declaration can run twice lowers with its varDecl kept; one captured ahead of it in the loop still refuses", () => {
     // JS binds `let` afresh per iteration, so closures made in iteration k
-    // must not see iteration k+1's writes — which is exactly what the ONE
-    // box the wrapper pre-creates would give them.
-    expectRefusal(
+    // must not see iteration k+1's writes. INC-27 U4: the declaration
+    // stays a `varDecl`, which mints a fresh box on every execution
+    // (loopBoxIds); the observable side is wasm-async-u4.test.ts rows
+    // L01-L10.
+    const loopMod = lowerOne(
       plain(
         [
           {
@@ -1006,10 +1037,12 @@ describe("refusals leave the function untouched", () => {
         ],
         [local("c.0", F64, { boxed: true })],
       ),
-      "fn:async:boxed-in-loop",
     );
-    // A for-of BINDING is the same story without a varDecl to point at.
-    expectRefusal(
+    const loopResume = fnNamed(loopMod, "%f.resume");
+    expect(nodesOfKind(loopResume.body, "varDecl").some((d) => d["localId"] === "c.0")).toBe(true);
+    // A for-of BINDING is the same story without a varDecl to point at:
+    // the loop is kept whole and binds a fresh box per pass itself.
+    const forOfMod = lowerOne(
       plain(
         [
           {
@@ -1022,6 +1055,22 @@ describe("refusals leave the function untouched", () => {
           exprStmt(awaitCall()),
         ],
         [local("e.0", F64, { boxed: true }), local("xs.0", { kind: "array", elem: F64 })],
+      ),
+    );
+    expect(forOfMod.functions.some((f) => f.name === "%f.resume")).toBe(true);
+    // Still refused: a closure built BEFORE the declaration inside the
+    // loop would need this iteration's box before the declaration mints it.
+    expectRefusal(
+      plain(
+        [
+          {
+            kind: "while",
+            cond: bool(true),
+            body: [exprStmt(closureOver("%lam", ["c.0"])), varDecl("c.0", num(1)), exprStmt(awaitCall())],
+            loc,
+          },
+        ],
+        [local("c.0", F64, { boxed: true })],
       ),
       "fn:async:boxed-in-loop",
     );
@@ -1123,8 +1172,12 @@ describe("refusals leave the function untouched", () => {
     );
   });
 
-  test("a return crossing a finally", () => {
-    expectRefusal(
+  test("a return crossing a finally after an await lowers through the parked completion", () => {
+    // INC-27 U4: an await BEFORE a verbatim try/finally holding a return
+    // (whole-body lowering, the finally itself never suspends) no longer
+    // declines; the return parks and the finally runs first. The
+    // observable side is wasm-async-u4.test.ts row F11.
+    const mod = lowerOne(
       plain([
         exprStmt(awaitCall()),
         {
@@ -1136,8 +1189,9 @@ describe("refusals leave the function untouched", () => {
           loc,
         },
       ]),
-      "fn:async:return-in-finally",
     );
+    expect(mod.functions.some((f) => f.name === "%f.resume")).toBe(true);
+    expect(frameFields(mod, "f")).toContain("%pending.kind");
   });
 
   // "a break out of a kept construct into an exploded one" lived here

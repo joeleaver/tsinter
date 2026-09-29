@@ -281,6 +281,17 @@
  * in an env, not values in a struct), which is why the wrapper's frame
  * literal skips a boxed param's `%l_` field — there is none.
  *
+ * A box declared INSIDE A LOOP of an ASYNC body keeps its `varDecl`
+ * instead (INC-27 U4): the emitter's boxed varDecl mints a fresh box on
+ * every execution, which is JS's per-iteration binding, and the next
+ * await packs whichever box the slot holds by then (every async
+ * suspension builds a new resume closure). The wrapper still pre-creates
+ * one, so the env is never packed with a null box. A GENERATOR has no
+ * such repack — it re-enters through the one resume closure its wrapper
+ * built, so after a yield the slot would hold the wrapper's box, not the
+ * iteration's — and any loop box in a generator body still refuses
+ * (`fn:async:boxed-in-loop`; board #179).
+ *
  * WHAT PRE-CREATION CANNOT SERVE is refused by name rather than aliased
  * together; see `fn:async:boxed-in-loop` and `fn:async:boxed-forward-
  * capture` in the refusal list.
@@ -493,13 +504,13 @@
  *   `fn:async:module-await-position`, above, stays UNFORKED on purpose:
  *   `module.await` is frontend-fenced to async module initializers and
  *   can never appear in a generator body.
- *   - `fn:async:hoist-void` — a hoist whose temp would be void-typed: the
- *     frame has no slot for one, and the operand position it came from
- *     still needs SOME expression back. The reachable shape is a recordLit
- *     `drop` field holding a void await (`{ status, value: await f() }`
- *     where the checker dropped `value`) inside a statement that cannot
- *     host a split — one corpus program, and the fix is a way to run a
- *     suspension for its effect alone rather than a wider hoist.
+ *   - `fn:async:hoist-void` — NARROWED in INC-27 U4: a void operand the
+ *     hoister has to move now runs as a statement of its own (a void
+ *     await at the root of an `exprStmt` is an ordinary split), and its
+ *     slot is resolved by its parent — a unionWrap's undefined arm takes
+ *     the interned unit, a dropped recordLit field is removed (VOID_DONE's
+ *     own doc comment). The name survives for a void operand in any OTHER
+ *     position, which no program reaches today.
  *   - `fn:async:await-dyn` — `await` of a checked-dynamic value
  *     (`async.awaitDyn`): the runtime decides between adoption and the
  *     one-hop non-thenable path, which needs the dyn surface.
@@ -528,12 +539,20 @@
  *     not build — a named, accepted gap, not a silent one); a
  *     SUSPENDING try/finally no longer reaches this name at all — see
  *     `fn:async:await-in-finally`, above.
- *   - `fn:async:boxed-in-loop` — a body-boxed local whose declaration can
- *     run more than once: inside a loop, in a `for` header, or as a
- *     for-of binding. JS gives each execution a FRESH binding (the
- *     emitter re-boxes per iteration for exactly this reason), so the
- *     ONE box the wrapper pre-creates would alias every iteration's
- *     closures together — a miscompile, not a slower answer.
+ *   - `fn:async:boxed-in-loop` — NARROWED in INC-27 U4, for ASYNC bodies
+ *     only: a body-boxed local declared inside a loop (body, `for` header,
+ *     for-of binding) keeps its `varDecl`, which mints a fresh box per
+ *     execution (JS's per-iteration binding; loopBoxIds), and lowerFor
+ *     copies a captured head variable into a fresh box before each
+ *     update; each await's new resume closure packs the current box. In
+ *     an async body the name survives only for a loop box some closure
+ *     captures BEFORE its declaration: that closure would need the
+ *     current iteration's box before the declaration has minted it. In a
+ *     GENERATOR body the name covers EVERY loop box, unnarrowed: a yield
+ *     builds no resume closure (the generator re-enters through the one
+ *     its wrapper built), so nothing would repack the iteration's box and
+ *     a read or write after the yield would reach the wrapper's box
+ *     instead (board #179).
  *   - `fn:async:boxed-forward-capture` — a NON-tdz body box some closure
  *     captures ahead of its declaration. Such a closure would read the
  *     box's default payload where JS says `undefined`. The frontend does
@@ -551,20 +570,17 @@
  *   - `fn:async:self-ref` — `selfRef` in the body. It means "the running
  *     closure", and after the split the running closure is resume's, not
  *     the wrapper's; rewriting it to `closure(f)` is future work.
- *   - `fn:async:return-in-finally` — NARROWED as of stage B: a `return`
- *     inside a finally-bearing try still declines here ONLY when that
- *     try has NO suspension anywhere in it (checkEligible's own
- *     `!hasSuspension(rec)` check). For that verbatim-kept shape,
- *     rewriteReturns' naive settle-then-return splice is still wrong —
- *     the emitter's own PENDING-RETURN path (emitTryCatch) only
- *     intercepts the BARE return that follows the spliced settle, by
- *     which point the settle already ran, observably too early. A try/
- *     finally that DOES suspend somewhere no longer reaches this name:
- *     `completeOrPark` parks the return and detours through the
- *     finally's own linearized states instead, settling only once it
- *     genuinely completes — see `fn:async:await-in-finally`, above.
- *     (`fn:async:return-in-<kind>` is its open-ended sibling: a `return`
- *     inside a container the return rewrite has never met.)
+ *   - `fn:async:return-in-finally` — NARROWED in INC-27 U4 to one shape:
+ *     a `return` that must run a finally first from inside a for-of the
+ *     pass cannot turn into an index-based `for` (a non-array iterable).
+ *     Every other statement whose return crosses a finally is EXPLODED
+ *     (returnCrossesFinally) rather than kept verbatim, so the return
+ *     reaches `completeOrPark`, which parks the value and runs the
+ *     finally's own states first — the verbatim-kept finally included,
+ *     where rewriteReturns' settle-then-return splice used to settle
+ *     before the finally ran. (`fn:async:return-in-<kind>` is its open-
+ *     ended sibling: a `return` inside a container the return rewrite
+ *     has never met.)
  *   - `fn:async:void-local` / `fn:async:local-id-clash` — shapes the
  *     frame cannot represent (a void-typed local has no field slot; a
  *     source local already named `%async.frame`/`%async.exc` would
@@ -911,6 +927,9 @@ interface BoxSite {
   inLoop: boolean;
   /** A `closure` listing this local was built before its declaration. */
   earlyCapture: boolean;
+  /** The declaration is a for-of BINDING, not a `varDecl` (INC-27 U4): a
+   * loop the pass keeps whole binds it itself, a fresh box per pass. */
+  forOfBinding: boolean;
 }
 
 /** Walk `body` in SOURCE order, recording each id's declaration sites and
@@ -925,7 +944,7 @@ interface BoxSite {
  * reports. */
 function boxSites(body: IrStmt[], ids: Set<string>): Map<string, BoxSite> {
   const sites = new Map<string, BoxSite>();
-  for (const id of ids) sites.set(id, { decls: 0, inLoop: false, earlyCapture: false });
+  for (const id of ids) sites.set(id, { decls: 0, inLoop: false, earlyCapture: false, forOfBinding: false });
   const declared = new Set<string>();
 
   const scanExpr = (node: unknown): void => {
@@ -978,6 +997,7 @@ function boxSites(body: IrStmt[], ids: Set<string>): Map<string, BoxSite> {
         scanExpr(s.iterable);
         // The per-iteration binding IS a fresh box every pass.
         declare(s.localId, true);
+        if (sites.has(s.localId)) sites.get(s.localId)!.forOfBinding = true;
         list(s.body, true);
         return;
       case "switch":
@@ -1372,6 +1392,16 @@ export function lowerResumableFunctions(mod: IrModule, refuse: Refuse): WModule 
   return { ...mod, functions, records };
 }
 
+/** The void hoist's marker (INC-27 U4): toTemp answers it, instead of a
+ * temp, for a VOID operand it has just run as a statement of its own — a
+ * void value has no frame slot and nothing to read back. hoistParts
+ * resolves it by the operand's parent: a unionWrap's value becomes a
+ * unitLit of the undefined arm (the tag the frontend already chose), a
+ * recordLit's field holding it is dropped (only a `drop:true` field can
+ * hold a void value, and its expression already ran). A marker left
+ * anywhere else is `fn:async:hoist-void`. Never emitted: nothing outside
+ * this file ever sees it. */
+const VOID_DONE = { kind: "%hoist.voidDone", type: VOID } as const;
 const FRAME_LOCAL = "%async.frame";
 /** Resume's actual parameter — the base-typed frame the cast prologue
  * narrows into FRAME_LOCAL. */
@@ -1585,6 +1615,20 @@ export class FunctionLowering {
    * every boxed argument into its slot before the body runs. */
   private boxInits: IrLocal[] = [];
   private readonly bodyBoxedIds = new Set<string>();
+  /** The body boxes whose declaration sits inside a loop of an ASYNC body
+   * (INC-27 U4): the declaration stays a `varDecl`, so the emitter's boxed
+   * varDecl mints a FRESH box on every execution — JS's per-iteration
+   * binding — and the next resumeClosure() packs whichever box the slot
+   * holds now. That repack happens at every async suspension (each
+   * subscribe/hop builds a new resume closure) and at NO generator one: a
+   * yield carries no resume closure, so a generator re-enters through the
+   * closure its wrapper built and would see the wrapper's box after a
+   * yield. planBoxes therefore declines any loop box in a generator body
+   * (board #179), and this set is only ever filled for async bodies. The
+   * wrapper still pre-creates one (boxInits), so the env never packs a
+   * null ref before the loop's first iteration has run. A loop `for`'s own
+   * head variable is copied into a fresh box per iteration by lowerFor. */
+  private readonly loopBoxIds = new Set<string>();
   private hoisted = 0;
   private readonly frameFields: { name: string; type: IrType }[] = [];
   /** Dispatch states, each a stmt list that must end in a terminator. */
@@ -1868,37 +1912,20 @@ export class FunctionLowering {
     if (hasSelfRef(fn.body)) this.decline("fn:async:self-ref");
     const captured = new Set((fn.captures ?? []).map((c) => c.localId));
     this.planBoxes(captured);
-    // A `return` crossing a finally settles AFTER the finally runs, which
-    // the naive settle-then-return rewrite (rewriteReturns' own splice,
-    // for a construct kept VERBATIM) gets backwards — the emitter's own
-    // native finally desugar (emitTryCatch) only intercepts the bare
-    // `return` that follows the spliced settle, by which point the
-    // settle has ALREADY happened, observably too early. Stage B fixes
-    // this for a finally that ACTUALLY LINEARIZES (hasSuspension true
-    // somewhere in ITS OWN subtree — lowerTry's own machinery, via
-    // completeOrPark, correctly parks the return until the finally
-    // completes, for EVERY return inside try/catch/finally alike, not
-    // just ones that themselves suspend: lowerStmt's own `return` case
-    // runs completeOrPark unconditionally the moment ANYTHING routes a
-    // statement list through lowerList at all). A finally kept
-    // ENTIRELY verbatim (no suspension anywhere in it) still has no
-    // fix — rewriteReturns' splice is still wrong there — so the decline
-    // narrows to exactly that case rather than lifting outright. Checked
-    // over the WHOLE body (not alongside the position scan) because the
-    // try may sit inside a construct the scan does not descend into.
-    if (
-      anyNode(
-        fn.body,
-        (rec) => rec["kind"] === "tryCatch" && rec["finallyBody"] !== null && hasReturn(rec) && !hasSuspension(rec),
-      )
-    ) {
-      this.decline("fn:async:return-in-finally");
-    }
+    // A `return` crossing a finally settles AFTER the finally runs. That
+    // is no longer checked here: lowerStmt EXPLODES every statement whose
+    // return crosses a finally (returnCrossesFinally), so the return
+    // reaches completeOrPark, which parks the value and runs the finally
+    // first — for a finally the linearization owns AND for one that would
+    // otherwise be kept verbatim (INC-27 U4; board #173 was the linearized
+    // half of this shape, silently skipping the finally).
     // Order-preserving hoisting: after this, every suspension the pass
     // accepts sits at the root of a statement's value slot.
     this.body = this.hoistList(fn.body);
     // ...and after THIS, no `varDecl` of a body box survives: each one is
-    // the `assign` that fills the wrapper's box in place. A declaration
+    // the `assign` that fills the wrapper's box in place — except a box
+    // declared inside a loop, whose `varDecl` is kept ON PURPOSE (it mints
+    // the per-iteration box; see loopBoxIds). A declaration
     // the rewrite missed would mint a SECOND box in resume and fork the
     // binding the closures already captured — the one silent miscompile
     // this design admits, so it is CHECKED rather than argued. (planBoxes
@@ -1906,6 +1933,7 @@ export class FunctionLowering {
     // reaches; reaching here means the two walks disagree, a pass bug.)
     this.body = this.rewriteBoxDecls(this.body);
     for (const id of this.bodyBoxedIds) {
+      if (this.loopBoxIds.has(id)) continue;
       if (declCount(this.body, id) !== 0) {
         throw new Error(`async lowering: body box "${id}" kept its varDecl in "${fn.name}"`);
       }
@@ -1941,8 +1969,19 @@ export class FunctionLowering {
         continue;
       }
       const site = sites.get(l.id)!;
-      if (site.inLoop) this.decline("fn:async:boxed-in-loop");
-      if (site.decls !== 1 || declCount(fn.body, l.id) !== 1) this.decline("fn:async:boxed-local");
+      if (site.inLoop) {
+        // A closure built BEFORE the declaration inside the loop would
+        // have to capture the binding of the iteration it runs in — a box
+        // that does not exist until the declaration mints it. Refused by
+        // name rather than aliased to the previous iteration's box.
+        // A GENERATOR body refuses every loop box: nothing repacks the
+        // resume closure at a yield, so the iteration's box would be lost
+        // across it (see loopBoxIds; board #179).
+        if (site.earlyCapture || this.genType !== null) this.decline("fn:async:boxed-in-loop");
+        this.loopBoxIds.add(l.id);
+      }
+      // A for-of binding has no `varDecl` to count (its loop binds it).
+      if (site.decls !== 1 || (declCount(fn.body, l.id) !== 1 && !site.forOfBinding)) this.decline("fn:async:boxed-local");
       // A tdz box is BUILT for the forward read — its empty slot answers
       // with Node's ReferenceError, so an early capture is the point.
       if (site.earlyCapture && l.tdz !== true) this.decline("fn:async:boxed-forward-capture");
@@ -1964,7 +2003,7 @@ export class FunctionLowering {
     const one = (s: IrStmt): IrStmt[] => {
       switch (s.kind) {
         case "varDecl":
-          if (!this.bodyBoxedIds.has(s.localId)) return [s];
+          if (!this.bodyBoxedIds.has(s.localId) || this.loopBoxIds.has(s.localId)) return [s];
           return s.init === null ? [] : [{ kind: "assign", localId: s.localId, value: s.init, loc: s.loc }];
         case "if":
           return [{ ...s, then: list(s.then), else_: s.else_ === null ? null : list(s.else_) }];
@@ -2102,37 +2141,8 @@ export class FunctionLowering {
         // scope.) Every OTHER iterable kind (string, dyn, a future Map/
         // Set forOf) stays declined under the existing name unchanged.
         if (s.iterable.type.kind === "array" && !hasSuspension(s.iterable)) {
-          const arrId = `${HOIST_PREFIX}fof.arr.${++this.hoisted}`;
-          const idxId = `${HOIST_PREFIX}fof.i.${++this.hoisted}`;
-          this.locals.push({ id: arrId, name: arrId, type: s.iterable.type, mutable: false });
-          this.locals.push({ id: idxId, name: idxId, type: F64, mutable: true });
-          out.push({ kind: "varDecl", localId: arrId, init: s.iterable, loc: s.loc });
-          const arrRef: IrExpr = { kind: "varRef", localId: arrId, type: s.iterable.type, loc: s.loc };
-          const idxRef: IrExpr = { kind: "varRef", localId: idxId, type: F64, loc: s.loc };
-          const forNode: IrStmt = {
-            kind: "for",
-            init: { kind: "varDecl", localId: idxId, init: { kind: "numLit", value: 0, type: F64, loc: s.loc }, loc: s.loc },
-            cond: {
-              kind: "bin",
-              op: "<",
-              left: idxRef,
-              right: { kind: "arrIntrinsic", method: "length", receiver: arrRef, args: [], type: F64, loc: s.loc },
-              type: BOOL,
-              loc: s.loc,
-            },
-            update: {
-              kind: "assign",
-              localId: idxId,
-              value: { kind: "bin", op: "+", left: idxRef, right: { kind: "numLit", value: 1, type: F64, loc: s.loc }, type: F64, loc: s.loc },
-              loc: s.loc,
-            },
-            body: [
-              { kind: "varDecl", localId: s.localId, init: { kind: "arrayGet", arr: arrRef, index: idxRef, type: s.iterable.type.elem, loc: s.loc }, loc: s.loc },
-              ...s.body,
-            ],
-            ...(s.labels && { labels: s.labels }),
-            loc: s.loc,
-          };
+          const [arrDecl, forNode] = this.desugarArrayForOf(s);
+          out.push(arrDecl);
           out.push({ ...forNode, body: this.hoistList(forNode.body) });
         } else {
           out.push(s);
@@ -2163,6 +2173,50 @@ export class FunctionLowering {
     return out;
   }
 
+  /** An array for-of as the ordinary index-based `for` the emitter's own
+   * (non-suspending) array for-of already runs — ascending index, length
+   * re-read each pass, JS-exact for arrays — plus the declaration of the
+   * array temp that must run ahead of it. Two callers: hoistStmt's own
+   * "forOf" case (a suspending body), and lowerStmt's crossing-return path
+   * (a for-of whose `return` must run a finally first — returnCrossesFinally
+   * — and which the linearization cannot explode as a for-of). The per-
+   * iteration binding lands as the loop body's first `varDecl`, which is
+   * what keeps a captured binding fresh per iteration. */
+  private desugarArrayForOf(s: Extract<IrStmt, { kind: "forOf" }>): [IrStmt, Extract<IrStmt, { kind: "for" }>] {
+    if (s.iterable.type.kind !== "array") throw new Error("async lowering: desugarArrayForOf on a non-array");
+    const arrId = `${HOIST_PREFIX}fof.arr.${++this.hoisted}`;
+    const idxId = `${HOIST_PREFIX}fof.i.${++this.hoisted}`;
+    this.locals.push({ id: arrId, name: arrId, type: s.iterable.type, mutable: false });
+    this.locals.push({ id: idxId, name: idxId, type: F64, mutable: true });
+    const arrRef: IrExpr = { kind: "varRef", localId: arrId, type: s.iterable.type, loc: s.loc };
+    const idxRef: IrExpr = { kind: "varRef", localId: idxId, type: F64, loc: s.loc };
+    const forNode: Extract<IrStmt, { kind: "for" }> = {
+      kind: "for",
+      init: { kind: "varDecl", localId: idxId, init: { kind: "numLit", value: 0, type: F64, loc: s.loc }, loc: s.loc },
+      cond: {
+        kind: "bin",
+        op: "<",
+        left: idxRef,
+        right: { kind: "arrIntrinsic", method: "length", receiver: arrRef, args: [], type: F64, loc: s.loc },
+        type: BOOL,
+        loc: s.loc,
+      },
+      update: {
+        kind: "assign",
+        localId: idxId,
+        value: { kind: "bin", op: "+", left: idxRef, right: { kind: "numLit", value: 1, type: F64, loc: s.loc }, type: F64, loc: s.loc },
+        loc: s.loc,
+      },
+      body: [
+        { kind: "varDecl", localId: s.localId, init: { kind: "arrayGet", arr: arrRef, index: idxRef, type: s.iterable.type.elem, loc: s.loc }, loc: s.loc },
+        ...s.body,
+      ],
+      ...(s.labels && { labels: s.labels }),
+      loc: s.loc,
+    };
+    return [{ kind: "varDecl", localId: arrId, init: s.iterable, loc: s.loc }, forNode];
+  }
+
   /** A value slot that CAN host a suspension at its root: a root
    * suspension stays put, anything else hoists its operands. */
   private hoistRoot(e: IrExpr, out: IrStmt[]): IrExpr {
@@ -2183,7 +2237,9 @@ export class FunctionLowering {
 
   /** A value slot that canNOT host a suspension: hoist, then bind. */
   private hoistValue(e: IrExpr, out: IrStmt[]): IrExpr {
-    return this.toTemp(this.hoistRoot(e, out), out);
+    const v = this.toTemp(this.hoistRoot(e, out), out);
+    if (v === (VOID_DONE as unknown as IrExpr)) this.decline("fn:async:hoist-void");
+    return v;
   }
 
   /** Walk one node's operands in evaluation order, hoisting everything
@@ -2230,6 +2286,15 @@ export class FunctionLowering {
         op.set(hasSuspension(rewritten) ? this.toTemp(rewritten, out) : rewritten);
       }
     }
+    // A void operand that ran as a statement of its own (toTemp) left the
+    // VOID_DONE marker in its slot; resolve it by this node's kind.
+    if (copy["kind"] === "unionWrap" && copy["value"] === VOID_DONE) {
+      copy["value"] = { kind: "unitLit", type: { kind: "undefinedT" }, loc: (copy["loc"] as SrcLoc) };
+    }
+    if (copy["kind"] === "recordLit") {
+      copy["fields"] = (copy["fields"] as { value: unknown }[]).filter((f) => f.value !== VOID_DONE);
+    }
+    if (anyNode(copy, (rec) => rec === VOID_DONE)) this.decline("fn:async:hoist-void");
     return copy as unknown as T;
   }
 
@@ -2237,11 +2302,15 @@ export class FunctionLowering {
    * reference that stands in for it. Ordinary locals: they ride the
    * frame's total save/restore like every other one. */
   private toTemp(e: IrExpr, out: IrStmt[]): IrExpr {
-    // A void temp has no frame slot AND no reference to hand back; the
-    // operand position it came from still needs an expression. The
-    // loader's wait is void by nature, so it keeps its own name.
+    // A void temp has no frame slot AND no reference to hand back, so a
+    // void operand runs as a statement of its own, in its evaluation
+    // position, and the VOID_DONE marker stands in for it until
+    // hoistParts resolves it by its parent. The loader's wait is void by
+    // nature, so it keeps its own name.
     if (e.type.kind === "void") {
-      this.decline(hasModuleAwait(e) ? "fn:async:module-await-position" : "fn:async:hoist-void");
+      if (hasModuleAwait(e)) this.decline("fn:async:module-await-position");
+      out.push({ kind: "exprStmt", expr: e, loc: e.loc });
+      return VOID_DONE as unknown as IrExpr;
     }
     const id = `${HOIST_PREFIX}${++this.hoisted}`;
     this.locals.push({ id, name: id, type: e.type, mutable: false });
@@ -2550,10 +2619,12 @@ export class FunctionLowering {
    * and lowerSuspension's resumed continuation for `return await x`/
    * `return yield x`) — NOT for `rewriteReturns`' rewrite of a `return`
    * nested inside a construct kept VERBATIM, which stays on plain
-   * `completion()` unconditionally: nothing in a verbatim-kept subtree
-   * suspends (lowerStmt's own fast path proves it), so the ordinary
-   * WASM try/finally the emitter compiles it to ALREADY runs any
-   * finally correctly — there is no state to park into.
+   * `completion()` unconditionally. That is sound only because a
+   * statement whose return crosses ANY finally is never kept verbatim
+   * (lowerStmt's returnCrossesFinally explodes it, INC-27 U4): a
+   * verbatim settle runs BEFORE a verbatim finally, and a verbatim
+   * return under a linearized finally would leave resume without
+   * running it at all (board #173).
    *
    * `state` is the CURRENTLY-LOWERING state (whatever `cur`/`resumeState`
    * this return's own statements are being emitted into) — its
@@ -2975,7 +3046,17 @@ export class FunctionLowering {
       this.emit(cur, ...this.goto(target));
       return null;
     }
-    if (!hasSuspension(s) && !escapes(s)) {
+    const crosses = this.returnCrossesFinally(s, cur);
+    if (crosses && s.kind === "forOf") {
+      // A for-of cannot be exploded as itself: an array one takes the
+      // same index-based `for` a suspending one is desugared to; any other
+      // iterable keeps the finally-crossing return refused by name.
+      if (s.iterable.type.kind !== "array" || hasSuspension(s)) this.decline("fn:async:return-in-finally");
+      const [arrDecl, forNode] = this.desugarArrayForOf(s);
+      this.emit(cur, arrDecl);
+      return this.lowerStmt(forNode, cur);
+    }
+    if (!hasSuspension(s) && !escapes(s) && !crosses) {
       // Kept verbatim — but a `return` nested inside it still has to
       // settle the promise instead of leaving the caller's value behind.
       this.emit(cur, hasReturn(s) ? this.rewriteReturns(s) : s);
@@ -3017,6 +3098,25 @@ export class FunctionLowering {
     }
   }
 
+  /** Does a `return` inside `s` have to run a finally before it completes?
+   * Yes when a finally the linearization owns encloses this state
+   * (finallyOf[cur]), or when `s` itself holds a finally-bearing try with
+   * a return in it. Such a statement is never kept verbatim: a verbatim
+   * return settles through rewriteReturns BEFORE any finally runs (the
+   * settle is observable — a finally that throws can no longer reject,
+   * and a microtask it schedules runs after the settled value's
+   * reactions), and under a linearized finally it leaves resume without
+   * reaching the finally's states at all (board #173). Exploding the
+   * statement instead routes every return through completeOrPark, which
+   * parks the value — evaluated before the finally — and runs the
+   * finally first. Lifted closures are separate functions, so a return
+   * inside one never makes its enclosing statement cross anything. */
+  private returnCrossesFinally(s: IrStmt, cur: number): boolean {
+    if (!hasReturn(s)) return false;
+    if ((this.finallyOf[cur] ?? -1) >= 0) return true;
+    return anyNode(s, (rec) => rec["kind"] === "tryCatch" && rec["finallyBody"] !== null && hasReturn(rec));
+  }
+
   private resolveJump(kind: "break" | "continue", label: string | undefined): number {
     for (let i = this.jumps.length - 1; i >= 0; i--) {
       const j = this.jumps[i]!;
@@ -3036,7 +3136,8 @@ export class FunctionLowering {
   }
 
   /** `return` inside a statement kept verbatim: splice the settle in
-   * ahead of it, in place, everywhere it appears. */
+   * ahead of it, in place, everywhere it appears. Reached only for a
+   * statement whose returns cross no finally (returnCrossesFinally). */
   private rewriteReturns(s: IrStmt): WStmt {
     const list = (body: IrStmt[]): IrStmt[] => widenBody(body.flatMap((st) => rewriteOne(st)));
     const rewriteOne = (st: IrStmt): WStmt[] => {
@@ -3372,6 +3473,22 @@ export class FunctionLowering {
     const end = this.lowerList(s.body, bodyS);
     this.jumps.pop();
     if (end !== null) this.emit(end, ...this.goto(updS));
+    // A captured head variable (`for (let i ...)` with a closure over i):
+    // each iteration gets a FRESH binding holding a copy of the previous
+    // one, and the UPDATE mutates the fresh binding — the emitter's own
+    // verbatim `for` does exactly this for a loop it emits whole. A
+    // `varDecl` of the boxed local reading its own current value is that
+    // copy (the boxed varDecl mints the new box; the read goes through
+    // the old one). `continue` lands here too.
+    if (s.init !== null && s.init.kind === "varDecl" && this.loopBoxIds.has(s.init.localId)) {
+      const l = this.locals.find((x) => x.id === (s.init as { localId: string }).localId)!;
+      this.emit(updS, {
+        kind: "varDecl",
+        localId: l.id,
+        init: { kind: "varRef", localId: l.id, type: l.type, loc: s.loc },
+        loc: s.loc,
+      });
+    }
     if (s.update !== null) this.emit(updS, s.update);
     this.emit(updS, ...this.goto(headS));
     return exitS;
@@ -3485,7 +3602,9 @@ export class FunctionLowering {
       return joinState;
     }
 
-    if (!hasSuspension(s)) {
+    if (!hasSuspension(s) && escapes(s)) {
+      // (A non-suspending finally-bearing try reaches here for a crossing
+      // `return` — returnCrossesFinally — and linearizes like any other.)
       // A break/continue leaves this finally-bearing try without
       // anything inside it suspending — running the finally on the way
       // out needs jump-routing stage B has not built (the design

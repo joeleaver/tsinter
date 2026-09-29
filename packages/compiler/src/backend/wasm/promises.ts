@@ -41,7 +41,7 @@
 import type { ByteWriter } from "./bytes.js";
 import { Code } from "./code.js";
 import { FD_STDERR } from "./abi.js";
-import { F64, I32, ModuleBuilder, type ValType } from "./module.js";
+import { F64, I32, ModuleBuilder, type FieldType, type ValType } from "./module.js";
 
 /** What the runtime needs from the emitter that owns it. Everything here
  * is resolved LAZILY (the first helper that needs it interns it), so a
@@ -155,6 +155,28 @@ export const PROM_PRE = 8;
  * Read and CLEARED (fire-once) by `subscribe`/`subscribeHandled` — the
  * two places a handler can attach. */
 export const PROM_REPORTED_UNHANDLED = 9;
+/** INC-27 U4: the two fields a promise carries ONLY in a module that
+ * boxes a statically typed promise into dyn (or runs a dyn receiver's
+ * then/catch/finally) — appended by `appendDynPromFields` at the
+ * emitter's deferred finalization, after every function has been walked,
+ * so every other module keeps its promise struct byte-identical. No
+ * existing index moves.
+ *
+ * PROM_DYNVIEW: the promise's settled value as ONE dyn value, computed
+ * the first time a dyn reader needs it and reused by every later one —
+ * two reactions on one boxed promise see the same object (Node's
+ * identity), and a composite fulfilment is converted once. anyref rather
+ * than a $dyn ref: a field may only name a type interned BEFORE this one
+ * outside a rec group, and the dyn tree's type can be interned later;
+ * readers cast it back, and only a $dyn is ever stored.
+ *
+ * PROM_CONV: how a fulfilment converts — 0 is the runtime-tag route (the
+ * payload's own kind tag decides: numbers, booleans, strings, void, an
+ * Error, a value that is already dyn), k >= 1 names a per-type converter
+ * the emitter registered for a composite inner type (array, record,
+ * union), written by the boxing site when it first boxes the promise. */
+export const PROM_DYNVIEW = 10;
+export const PROM_CONV = 11;
 
 /* waiterT's fields — one node type, used both for a promise's own waiter
  * list and for the microtask queue (a node moves between them). */
@@ -209,6 +231,12 @@ export const RACEE_SRC = 1;
 export class PromiseBuilder {
   private readonly fns = new Map<string, number>();
   private promTField: number | null = null;
+  /** promT's field list, kept so `appendDynPromFields` can extend the
+   * one type entry before the module is serialized (the struct is only
+   * ever built by `mint`'s struct.new_default, so appending is
+   * representation-safe). */
+  private promTFields: FieldType[] | null = null;
+  private dynPromFieldsAppended = false;
   private waiterTField: number | null = null;
   private allStateField: number | null = null;
   private allEntryField: number | null = null;
@@ -252,24 +280,43 @@ export class PromiseBuilder {
     if (this.promTField === null) {
       const waiter: ValType = { kind: "ref", nullable: true, typeIndex: this.waiterT };
       const anyRef = this.deps.anyRef;
-      this.promTField = this.mb.selfStructType("%w.promise", (self) => [
-        { storage: I32, mutable: true },
-        { storage: I32, mutable: true },
-        { storage: F64, mutable: true },
-        { storage: anyRef, mutable: true },
-        { storage: waiter, mutable: true },
-        { storage: waiter, mutable: true },
-        { storage: I32, mutable: true },
-        { storage: { kind: "ref", nullable: true, typeIndex: self }, mutable: true },
-        { storage: I32, mutable: true }, // PROM_PRE (8)
-        { storage: I32, mutable: true }, // PROM_REPORTED_UNHANDLED (9), P1-R3
-      ]);
+      this.promTField = this.mb.selfStructType("%w.promise", (self) => {
+        const fields: FieldType[] = [
+          { storage: I32, mutable: true },
+          { storage: I32, mutable: true },
+          { storage: F64, mutable: true },
+          { storage: anyRef, mutable: true },
+          { storage: waiter, mutable: true },
+          { storage: waiter, mutable: true },
+          { storage: I32, mutable: true },
+          { storage: { kind: "ref", nullable: true, typeIndex: self }, mutable: true },
+          { storage: I32, mutable: true }, // PROM_PRE (8)
+          { storage: I32, mutable: true }, // PROM_REPORTED_UNHANDLED (9), P1-R3
+        ];
+        this.promTFields = fields;
+        return fields;
+      });
     }
     return this.promTField;
   }
 
   promRef(): ValType {
     return { kind: "ref", nullable: true, typeIndex: this.promT };
+  }
+
+  /** Append PROM_DYNVIEW and PROM_CONV (see their constants). Called at
+   * most once, by the emitter's deferred finalization, only in a module
+   * that needs them. */
+  appendDynPromFields(): void {
+    if (this.dynPromFieldsAppended) return;
+    void this.promT;
+    const fields = this.promTFields;
+    if (fields === null || fields.length !== PROM_REPORTED_UNHANDLED + 1) {
+      throw new Error("appendDynPromFields: promise struct fields are not in their expected shape");
+    }
+    fields.push({ storage: this.deps.anyRef, mutable: true }); // PROM_DYNVIEW (10)
+    fields.push({ storage: I32, mutable: true }); // PROM_CONV (11)
+    this.dynPromFieldsAppended = true;
   }
 
   private waiterRef(): ValType {
@@ -797,8 +844,26 @@ export class PromiseBuilder {
       c.structSet(this.promT, P_WAIT_TAIL);
       c.end();
       this.mb.setBody(idx, [], c.bytes());
+      this.settleBody = { idx, bytes: c.bytes() };
       return idx;
     });
+  }
+
+  private settleBody: { idx: number; bytes: Uint8Array } | null = null;
+
+  /** INC-27 U4: put `prolog` (self-contained instructions over settle's own
+   * six parameters, no locals) in front of settle's body. Called only by
+   * the emitter's deferred finalization, in a module that boxes typed
+   * promises into dyn, to refuse fulfilling a promise WITH a dyn promise
+   * value (board #176's wrong answer) by name. False when the module never
+   * built settle. */
+  prependSettleProlog(prolog: Uint8Array): boolean {
+    if (this.settleBody === null) return false;
+    const body = new Uint8Array(prolog.length + this.settleBody.bytes.length);
+    body.set(prolog, 0);
+    body.set(this.settleBody.bytes, prolog.length);
+    this.mb.setBody(this.settleBody.idx, [], body);
+    return true;
   }
 
   /** %w.async.drain() — run microtasks to quiescence. No pending check

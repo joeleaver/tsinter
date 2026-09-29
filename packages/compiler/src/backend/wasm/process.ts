@@ -968,7 +968,7 @@ export class ProcessBuilder {
   private rejListenerT(): number {
     this.rejListenerStructField ??= this.mb.selfStructType("%w.proc.rejListener", (self) => [
       { storage: this.deps.dynRef(), mutable: false }, // cb — the RAW dyn value
-      { storage: I32, mutable: false }, // once — stored, unread (Node's 'unhandledRejection' fires once per rejection regardless of the once flag's TARGET semantics; no corpus program or unit row currently distinguishes once-vs-on for this event)
+      { storage: I32, mutable: false }, // once — a `process.once` registration: both dispatchers unlink the node before its callback runs (board #183)
       { storage: { kind: "ref", nullable: true, typeIndex: self }, mutable: true }, // next
     ]);
     return this.rejListenerStructField;
@@ -1122,6 +1122,18 @@ export class ProcessBuilder {
       const PROMISE = 1;
       const CUR = 2;
       const CLOS = 3;
+      const PREV = 4;
+      const NEXT = 5;
+      const LAST = 6;
+      // Node emits to a SNAPSHOT of the listeners. This walk reproduces it
+      // for ADDITIONS only: one registered by a callback during this
+      // dispatch (a `once` re-arming itself) waits for the next rejection,
+      // because the walk stops after the node that was the tail when the
+      // dispatch began. A listener REMOVED by a callback during the
+      // dispatch is not called, where Node's snapshot still calls it
+      // (board #185).
+      c.globalGet(this.rejListTailG());
+      c.localSet(LAST);
       c.globalGet(this.rejListHeadG());
       c.localSet(CUR);
       c.block();
@@ -1129,6 +1141,60 @@ export class ProcessBuilder {
       c.localGet(CUR);
       c.refIsNull();
       c.brIf(1);
+      // INC-27 U4 (board #183): the node's successor is read BEFORE the
+      // call, and a `process.once` listener is UNLINKED before its callback
+      // runs — Node's once wrapper removes itself, then calls — so a later
+      // rejection never reaches it again.
+      c.localGet(CUR);
+      c.structGet(this.rejListenerT(), 2);
+      c.localSet(NEXT);
+      // The unlink finds CUR's predecessor in the list AS IT IS NOW (an
+      // earlier callback may have removed nodes, itself included — board #183),
+      // never through a pointer captured before a callback ran.
+      c.localGet(CUR);
+      c.structGet(this.rejListenerT(), 1);
+      c.ifVoid();
+      c.refNull(this.rejListenerT());
+      c.localSet(PREV);
+      c.globalGet(this.rejListHeadG());
+      c.localGet(CUR);
+      c.refEq();
+      c.ifVoid();
+      c.localGet(NEXT);
+      c.globalSet(this.rejListHeadG());
+      c.else_();
+      c.globalGet(this.rejListHeadG());
+      c.localSet(PREV);
+      c.block();
+      c.loop();
+      c.localGet(PREV);
+      c.refIsNull();
+      c.brIf(1);
+      c.localGet(PREV);
+      c.structGet(this.rejListenerT(), 2);
+      c.localGet(CUR);
+      c.refEq();
+      c.ifVoid();
+      c.localGet(PREV);
+      c.localGet(NEXT);
+      c.structSet(this.rejListenerT(), 2);
+      c.br(2);
+      c.end();
+      c.localGet(PREV);
+      c.structGet(this.rejListenerT(), 2);
+      c.localSet(PREV);
+      c.br(0);
+      c.end();
+      c.end();
+      c.end();
+      c.globalGet(this.rejListTailG());
+      c.localGet(CUR);
+      c.refEq();
+      c.ifVoid();
+      c.localGet(PREV);
+      c.globalSet(this.rejListTailG());
+      c.end();
+      c.end();
       // Unwrap the stored dyn cb into the concrete (dyn,dyn)=>void closure.
       c.localGet(CUR);
       c.structGet(this.rejListenerT(), 0);
@@ -1143,12 +1209,19 @@ export class ProcessBuilder {
       c.structGet(this.rejClosT(), 0);
       c.callRef(this.rejClosFnT());
       c.localGet(CUR);
-      c.structGet(this.rejListenerT(), 2);
+      c.localGet(LAST);
+      c.refEq();
+      c.brIf(1);
+      c.localGet(NEXT);
       c.localSet(CUR);
       c.br(0);
       c.end();
       c.end();
-      this.mb.setBody(idx, [this.rejListenerRef(), this.rejClosRefForLocal()], c.bytes());
+      this.mb.setBody(
+        idx,
+        [this.rejListenerRef(), this.rejClosRefForLocal(), this.rejListenerRef(), this.rejListenerRef(), this.rejListenerRef()],
+        c.bytes(),
+      );
     });
   }
 
@@ -1277,6 +1350,15 @@ export class ProcessBuilder {
       const PROMISE = 0;
       const CUR = 1;
       const CLOS = 2;
+      const PREV = 3;
+      const NEXT = 4;
+      const LAST = 5;
+      // INC-27 U4 (board #183): dispatchUnhandledRejection's walk — bounded
+      // by the tail at dispatch start (additions wait; a removal during the
+      // dispatch is board #185), and a `process.once` listener unlinked
+      // before its callback runs.
+      c.globalGet(this.rejHandledListTailG());
+      c.localSet(LAST);
       c.globalGet(this.rejHandledListHeadG());
       c.localSet(CUR);
       c.block();
@@ -1284,6 +1366,56 @@ export class ProcessBuilder {
       c.localGet(CUR);
       c.refIsNull();
       c.brIf(1);
+      c.localGet(CUR);
+      c.structGet(this.rejListenerT(), 2);
+      c.localSet(NEXT);
+      // The unlink finds CUR's predecessor in the list AS IT IS NOW (an
+      // earlier callback may have removed nodes, itself included — board #183),
+      // never through a pointer captured before a callback ran.
+      c.localGet(CUR);
+      c.structGet(this.rejListenerT(), 1);
+      c.ifVoid();
+      c.refNull(this.rejListenerT());
+      c.localSet(PREV);
+      c.globalGet(this.rejHandledListHeadG());
+      c.localGet(CUR);
+      c.refEq();
+      c.ifVoid();
+      c.localGet(NEXT);
+      c.globalSet(this.rejHandledListHeadG());
+      c.else_();
+      c.globalGet(this.rejHandledListHeadG());
+      c.localSet(PREV);
+      c.block();
+      c.loop();
+      c.localGet(PREV);
+      c.refIsNull();
+      c.brIf(1);
+      c.localGet(PREV);
+      c.structGet(this.rejListenerT(), 2);
+      c.localGet(CUR);
+      c.refEq();
+      c.ifVoid();
+      c.localGet(PREV);
+      c.localGet(NEXT);
+      c.structSet(this.rejListenerT(), 2);
+      c.br(2);
+      c.end();
+      c.localGet(PREV);
+      c.structGet(this.rejListenerT(), 2);
+      c.localSet(PREV);
+      c.br(0);
+      c.end();
+      c.end();
+      c.end();
+      c.globalGet(this.rejHandledListTailG());
+      c.localGet(CUR);
+      c.refEq();
+      c.ifVoid();
+      c.localGet(PREV);
+      c.globalSet(this.rejHandledListTailG());
+      c.end();
+      c.end();
       // Unwrap the stored dyn cb into the concrete (dyn)=>void closure.
       c.localGet(CUR);
       c.structGet(this.rejListenerT(), 0);
@@ -1297,12 +1429,19 @@ export class ProcessBuilder {
       c.structGet(this.rejHandledClosT(), 0);
       c.callRef(this.rejHandledClosFnT());
       c.localGet(CUR);
-      c.structGet(this.rejListenerT(), 2);
+      c.localGet(LAST);
+      c.refEq();
+      c.brIf(1);
+      c.localGet(NEXT);
       c.localSet(CUR);
       c.br(0);
       c.end();
       c.end();
-      this.mb.setBody(idx, [this.rejListenerRef(), this.rejHandledClosRefForLocal()], c.bytes());
+      this.mb.setBody(
+        idx,
+        [this.rejListenerRef(), this.rejHandledClosRefForLocal(), this.rejListenerRef(), this.rejListenerRef(), this.rejListenerRef()],
+        c.bytes(),
+      );
     });
   }
 

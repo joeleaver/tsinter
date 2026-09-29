@@ -3361,6 +3361,17 @@ const TIER_FLOOR: string[] = [
   "1826-settimeout-arguments-callback.js",
   "2163-js-selfref-const.cjs",
   "2164-js-then-dyn-handler.cjs",
+  // INC-27 U4 (A, the async shapes: return through a finally the state
+  // machine keeps or explodes, a void await in an operand, an async loop
+  // box, a typed promise boxed into dyn with its value converted once,
+  // then/catch/finally on a dyn promise receiver with Node's adoption,
+  // and process.once removing itself before its call): 950 -> 955, the
+  // five programs this unit lands.
+  "1452-return-through-finally.ts",
+  "1453-pmap-settled.ts",
+  "2210-dyn-promise-crossing.cjs",
+  "2735-rejection-events.cjs",
+  "409-params-async-generics.ts",
 ];
 
 interface RunResult {

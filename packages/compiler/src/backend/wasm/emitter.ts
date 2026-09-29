@@ -177,6 +177,8 @@ import {
   ALLE_INDEX,
   ALLE_SRC,
   ALLE_STATE,
+  PROM_CONV,
+  PROM_DYNVIEW,
   PROM_F64,
   PROM_KIND,
   PROM_OBSERVED,
@@ -1650,10 +1652,14 @@ export function parseFnEvalConstruct(paramTexts: string[]): FnEvalPlan | null {
   return { kind: "pattern", numExtras, numTemps: parser.binds.length, pattern };
 }
 
-/** The three `dynInvoke` names whose real receiver is a PROMISE. They
- * refuse rather than dispatch: a promise box is constructible here, and
- * its reactions belong to the fiber machinery, not the dyn surface. */
+/** The three `dynInvoke` names whose real receiver may be a PROMISE box:
+ * such a receiver takes the reaction trio (%w.dynthen.*, INC-27 U4),
+ * every other receiver the generic dispatch. */
 const PROMISE_REACTION_METHODS = new Set(["then", "catch", "finally"]);
+/** The trio's reaction modes, carried in its entry node. */
+const DYNTHEN_THEN = 0;
+const DYNTHEN_CATCH = 1;
+const DYNTHEN_FINALLY = 2;
 
 /** jsOp:getProp's PROTOTYPE-MEMBER surface (increment 21, stage A,
  * post-review): an island receiver's property read can name a REAL
@@ -2725,6 +2731,10 @@ class Assembler {
     // (a no-op if nothing ever referenced it). See this file's own
     // "board #75" section header for the deferred-finalization story.
     this.finalizeListenerUnwrap();
+    // INC-27 U4: the dyn promise readers' bodies are chosen here, after
+    // every function has been walked and so after the last place a typed
+    // promise can be boxed into dyn — see finalizeDynProm.
+    this.finalizeDynProm();
 
     const entry = this.funcIndexByName.get(this.mod.entry);
     const entryFn = this.funcByName.get(this.mod.entry);
@@ -7149,7 +7159,9 @@ class Assembler {
         // promise crossing twice stays one JS value. C boxes the
         // ScrPromise directly when the inner type is ALREADY dyn, and
         // otherwise builds an adapter promise whose settle callback
-        // converts the payload; only the direct form lands here.
+        // converts the payload; this tier boxes the promise itself for
+        // every inner type it builds and converts at the dyn reader
+        // instead (INC-27 U4, below) — so identity is never an adapter's.
         //
         // jsval ≡ dyn (increment 21 stage C): a promise whose inner type
         // is jsval settles through the SAME (kind=EXC_REF, ref=<dyn
@@ -7182,13 +7194,37 @@ class Assembler {
         // warns against — so it stays pulled regardless of the order
         // correction. Re-add under a program that actually reaches it.
         //
-        // Any OTHER inner type (f64/bool/string/array/record/...) uses a
-        // differently-shaped slot a jsval/dyn reader would misread —
-        // those still need the adapter this tier does not build, and
-        // keep refusing.
+        // Any OTHER inner type (INC-27 U4) boxes the SAME promise too —
+        // identity stays the promise, so a second crossing is `===` —
+        // and its settled value is converted to dyn when a dyn reader
+        // first asks for it, never at box time (a pending promise has no
+        // value yet): numbers, booleans, strings and void by the payload's
+        // own tag, composites (array, record, union) by a converter this
+        // arm registers and records on the promise (PROM_CONV). Reaching
+        // this arm is what makes the module carry the dyn promise fields
+        // and the converting readers (the gate; see finalizeDynProm).
+        // Every other inner type keeps refusing by name.
         if (t.inner.kind !== "dyn" && t.inner.kind !== "jsval") {
-          this.refuse("dynFrom:promise:adapt", loc);
-          return false;
+          const conv = this.dynPromConvFor(t.inner, loc);
+          if (conv === null) {
+            this.refuse("dynFrom:promise:adapt", loc);
+            return false;
+          }
+          this.markDynPromGate();
+          if (conv > 0) {
+            // The first boxing site decides (the view is computed once
+            // per promise, so a later box of another static type must
+            // not change how it converts).
+            const promT = this.proms.promT;
+            c.localGet(0);
+            c.structGet(promT, PROM_CONV);
+            c.i32Eqz();
+            c.ifVoid();
+            c.localGet(0);
+            c.i32Const(conv);
+            c.structSet(promT, PROM_CONV);
+            c.end();
+          }
         }
         c.i32Const(DK.PROMISE);
         c.f64Const(0);
@@ -11273,6 +11309,44 @@ class Assembler {
         }
         this.walkExpr(e.length);
         code.call(this.vecs.newLen(info));
+        // Board #174 (INC-27 U4): newLen leaves every slot at the element's
+        // wasm default — a null ref for a union element — where JS reads
+        // `undefined` from a mapper-less `Array.from<T | undefined>({
+        // length })`. A union element with an undefined arm is filled with
+        // that arm's interned unit instance, so every read is the value
+        // Node reads. Every other element kind is left exactly as before.
+        const elem = e.type.elem;
+        const undefTag = elem.kind === "union" ? this.undefinedArmTag(elem.unionId) : -1;
+        if (undefTag >= 0) {
+          const vref = this.vecs.vecRef(info);
+          const v = this.acquireScratch(vref);
+          const i = this.acquireScratch(I32);
+          code.localSet(v);
+          code.i32Const(0);
+          code.localSet(i);
+          const breakPos = this.openBlock();
+          const loopPos = this.openLoop();
+          code.localGet(i);
+          code.localGet(v);
+          code.structGet(info.struct, LEN);
+          code.i32GeS();
+          this.brTo(breakPos, true);
+          code.localGet(v);
+          code.structGet(info.struct, BUF);
+          code.localGet(i);
+          code.globalGet(this.unions.unitGlobal(undefTag));
+          code.arraySet(info.bufType);
+          code.localGet(i);
+          code.i32Const(1);
+          code.i32Add();
+          code.localSet(i);
+          this.brTo(loopPos, false);
+          this.close();
+          this.close();
+          code.localGet(v);
+          this.releaseScratch(I32, i);
+          this.releaseScratch(vref, v);
+        }
         return;
       }
 
@@ -16534,16 +16608,17 @@ class Assembler {
        * whole family — the nullish read, the is-not-a-function refusals,
        * an argument fence, a callback's own throw. */
       case "dynInvoke": {
-        if (PROMISE_REACTION_METHODS.has(e.method)) {
-          // `then`/`catch`/`finally` on a dyn receiver: a PROMISE box is
-          // constructible here (dynFrom boxes one by reference), and its
-          // reaction trio rides the fiber machinery rather than anything
-          // in the dyn surface. Refusing by name beats a helper whose
-          // PROMISE arm would have to lie.
-          this.refuse(`dynInvoke:${e.method}`, e.loc);
-          code.unreachable();
-          return;
-        }
+        // `then`/`catch`/`finally` (INC-27 U4): a receiver that is a
+        // PROMISE box takes the reaction trio (%w.dynthen.*, riding the
+        // same waiter queue every await and combinator does); ANY other
+        // receiver takes the generic dispatch below unchanged — an object
+        // with its own callable `then` member has it called, a number or
+        // a plain object answers Node's "... is not a function", a
+        // nullish receiver throws at the member get. The evaluation order
+        // (receiver, the nullish test, the arguments) is the generic
+        // path's for both.
+        const reaction = PROMISE_REACTION_METHODS.has(e.method);
+        if (reaction) this.markDynPromGate();
         const dynRef = this.dyn.dynRef();
         const arrRef = this.dyn.arrRef();
         const d = this.acquireScratch(dynRef);
@@ -16561,10 +16636,23 @@ class Assembler {
           this.walkExpr(arg);
           code.call(this.dyn.arrPush());
         }
+        if (reaction) {
+          code.localGet(d);
+          code.structGet(this.dyn.dynT(), DYN_KIND);
+          code.i32Const(DK.PROMISE);
+          code.i32Eq();
+          this.openIfResult(dynRef);
+          code.localGet(d);
+          code.localGet(a);
+          code.i32Const(e.method === "then" ? DYNTHEN_THEN : e.method === "catch" ? DYNTHEN_CATCH : DYNTHEN_FINALLY);
+          code.call(this.dynThenGoFn(e.loc));
+          code.else_();
+        }
         code.localGet(d);
         code.localGet(a);
         this.pushStrLitInto(code, e.calleeName);
         code.call(this.dyn.invoke(e.method));
+        if (reaction) this.close();
         this.releaseScratch(arrRef, a);
         this.releaseScratch(dynRef, d);
         this.emitPendingCheck();
@@ -19319,12 +19407,17 @@ class Assembler {
       case "yieldExpr":
       case "awaitExpr":
       case "awaitUnionExpr":
-      /* Widening promise<T> into promise<void> is representationally free
-       * here (one struct), but the awaiting side then reads a payload it
-       * has no type for — the void-await path is its own work. */
-      case "promiseVoidWiden":
         this.refuse(`expr:${e.kind}`, e.loc);
         code.unreachable();
+        return;
+
+      /* Widening promise<T> into promise<void> (INC-27 U4): a type-only
+       * reinterpret — every promise shares one struct, and a void await
+       * reads no payload (the resumable lowering emits no settled-value
+       * read for a void await), so the operand's promise IS the result.
+       * Rejections flow through untouched. */
+      case "promiseVoidWiden":
+        this.walkExpr(e.value);
         return;
 
       /* The island → static PROMISE bridge (increment 21, stage C): a
@@ -32979,8 +33072,15 @@ class Assembler {
    * fulfilment converts the payload to the RESULT's inner type first,
    * which is what `adapt` means below and the only reason a race reaction
    * is interned per (from, to) rather than once. */
-  private raceReactionFor(from: IrType, to: IrType, loc: SrcLoc): number | null {
+  private raceReactionFor(from: IrType, to: IrType, loc: SrcLoc, bridge = false): number | null {
     const key = typeEquals(from, to) ? "copy" : `${typeKey(from)}=>${typeKey(to)}`;
+    // INC-27 U4: who shares the "copy" reaction decides its body at
+    // finalizeDynProm — a typed same-type Promise.race must copy raw, a dyn
+    // bridge in a module that boxes typed promises must convert.
+    if (key === "copy") {
+      if (bridge) this.copyBridgeUsed = true;
+      else this.copyRaceLoc ??= loc;
+    }
     const hit = this.raceRxFns.get(key);
     if (hit !== undefined) return hit;
     // Plan the whole conversion before declaring anything: an entry the
@@ -33042,6 +33142,12 @@ class Assembler {
       c.localGet(DST);
       c.localGet(SRC);
       c.call(this.proms.settleFrom());
+      // INC-27 U4: this body is SET at finalizeDynProm — unchanged in a
+      // module that boxes no typed promise into dyn (see buildCopyRxGated
+      // for the other case).
+      const locals: ValType[] = [{ kind: "ref", nullable: true, typeIndex: entryT }, this.proms.promRef(), this.proms.promRef()];
+      this.deferDynPromBody(idx, locals, c.bytes(), () => this.buildCopyRxGated());
+      return idx;
     } else {
       c.localGet(SRC);
       c.structGet(promT, PROM_STATE);
@@ -33236,6 +33342,23 @@ class Assembler {
     const pair = this.resumeClosPair();
     const idx = this.mb.declareFunc(pair.fn, "%w.async.thenRx");
     this.thenReactionField = idx;
+    // INC-27 U4: built HERE, where it is requested (so every helper it
+    // needs is interned in the order it always was), but SET at
+    // finalizeDynProm: a module that boxes a typed promise into dyn gets
+    // the converting body (the settled value read through its dyn view,
+    // a rejected source passed through), every other module this body.
+    const ungated = this.buildThenRxBody(loc, false);
+    this.deferDynPromBody(idx, ungated.locals, ungated.bytes, () => this.buildThenRxBody(loc, true));
+    return idx;
+  }
+
+  /** thenReactionFn's body. `gated` is the module-level fact
+   * finalizeDynProm samples: when true, SRC may be a promise whose payload
+   * is NOT dyn-shaped (a typed promise boxed into dyn and handed to an
+   * island `.then`), so the value is read through %w.dynprom.view, and a
+   * REJECTED source is passed through to DST (its payload is the
+   * exception encoding whatever the inner type) instead of trapping. */
+  private buildThenRxBody(loc: SrcLoc, gated: boolean): { locals: ValType[]; bytes: Uint8Array } {
     const entryT = this.thenEntryType();
     const promT = this.proms.promT;
     const dynT = this.dyn.dynT();
@@ -33266,18 +33389,32 @@ class Assembler {
     // (unchanged) rather than assumed; a future producer that CAN
     // reject here must re-add the branch under a program that actually
     // exercises it, not restore this comment's old code unverified.
+    // (INC-27 U4: in a module that boxes typed promises into dyn, a user's
+    // rejected promise CAN reach here — the gated body passes it through.)
     c.localGet(SRC);
     c.structGet(promT, PROM_STATE);
     c.i32Const(1);
     c.i32Ne();
     c.ifVoid();
-    c.unreachable();
+    if (gated) {
+      c.localGet(DST);
+      c.localGet(SRC);
+      c.call(this.proms.settleFrom());
+      c.return_();
+    } else {
+      c.unreachable();
+    }
     c.end();
     // Fulfilled: the payload is ALWAYS a dyn ref (jsval-shaped promises
-    // only — the only kind this arm ever subscribes to).
+    // only — the only kind this arm ever subscribes to) unless the module
+    // boxes typed promises into dyn, when the dyn view converts it.
     c.localGet(SRC);
-    c.structGet(promT, PROM_REF);
-    c.refCast(dynT);
+    if (gated) {
+      c.call(this.dynPromViewFn());
+    } else {
+      c.structGet(promT, PROM_REF);
+      c.refCast(dynT);
+    }
     c.localSet(VAL);
     c.f64Const(0);
     c.call(this.vecs.newLen(this.dynVecInfo()));
@@ -33341,9 +33478,8 @@ class Assembler {
     c.i32Const(-1);
     c.i32Const(1);
     c.call(this.proms.settle());
-    this.mb.setBody(
-      idx,
-      [
+    return {
+      locals: [
         { kind: "ref", nullable: true, typeIndex: entryT },
         this.proms.promRef(),
         this.proms.promRef(),
@@ -33353,9 +33489,8 @@ class Assembler {
         dynRef,
         this.proms.promRef(),
       ],
-      c.bytes(),
-    );
-    return idx;
+      bytes: c.bytes(),
+    };
   }
 
   /** `raceReactionFor(JSVAL, JSVAL, loc)`, forced onto the "copy" key —
@@ -33363,9 +33498,828 @@ class Assembler {
    * which `typeEquals(JSVAL, JSVAL)` never takes, so the call site's own
    * loc (threaded through, never invented) is safe to pass unread. */
   private raceReactionForCopy(loc: SrcLoc): number {
-    const rx = this.raceReactionFor(JSVAL, JSVAL, loc);
+    const rx = this.raceReactionFor(JSVAL, JSVAL, loc, true);
     if (rx === null) throw new Error("emitter bug: the 'copy' race reaction path refused");
     return rx;
+  }
+
+  /* ── the dyn promise side (INC-27 U4) ──────────────────────────────────
+   *
+   * A statically typed promise crossing into dyn is boxed BY REFERENCE
+   * (emitDynFromBody's promise arm) whatever its inner type, so identity
+   * is the promise and a second crossing is `===`. Its settled value is
+   * converted to dyn only when a dyn reader asks for it, and then ONCE:
+   * %w.dynprom.view caches the result on the promise (PROM_DYNVIEW), so
+   * two reactions on one promise see one object and one Error.
+   *
+   * THE GATE. A module that boxes a typed promise (the adapt arm, whichever
+   * site requested its walker — the IR dynFrom node, a boxed function's
+   * return conversion, an argument adapter, a composite's field) or that
+   * runs a dyn receiver's then/catch/finally sets `dynPromGate` while it
+   * is being walked. finalizeDynProm samples it ONCE, after every function
+   * has been walked; only then are the readers that could meet a typed
+   * payload given their bodies — the island `.then` reaction (thenRx),
+   * the shared "copy" reaction (the island bridge's await, a `.then`
+   * handler's returned promise, the trio's adoption) — converting in a
+   * gated module, exactly today's instructions in every other one, whose
+   * promise struct also stays unchanged. A walker built where it was
+   * requested and SET here is the whole mechanism; a typed box minted
+   * after the sample is an emitter bug and throws.
+   *
+   * THE TRIO. `.then(onF, onR)` / `.catch(onR)` / `.finally(onF)` on a
+   * PROMISE box (%w.dynthen.go) mint the derived promise and subscribe one
+   * reaction to the receiver's own waiter list, so dyn and typed reactions
+   * on one promise keep one order. The reaction (%w.dynthen.rx) runs one
+   * microtask after the receiver settles: a callable handler gets the dyn
+   * view (fulfilment) or the reason (rejection), a non-callable one passes
+   * the outcome through; a throw rejects the derived promise; a returned
+   * value resolves it through %w.dynthen.resolve — a PROMISE box is
+   * ADOPTED with Node's two extra jobs (one hop, then a subscribe whose
+   * reaction settles the derived promise), a promise resolved with itself
+   * rejects with Node's TypeError, an object with its own callable `then`
+   * rejects with a named run-time refusal (adopting a non-promise
+   * thenable is not built), anything else fulfils it. `.finally` calls its
+   * handler with no arguments and then waits for the handler's result
+   * (%w.dynthen.fin) before settling with the receiver's own outcome —
+   * or with the result's rejection. */
+
+  private dynPromGate = false;
+  private dynPromGateSampled = false;
+  private dynPromGateValue = false;
+  private readonly dynPromConvTypes: IrType[] = [];
+  private readonly dynPromConvByKey = new Map<string, number>();
+  private readonly dynPromDeferred: {
+    idx: number;
+    locals: ValType[];
+    bytes: Uint8Array;
+    gated: () => { locals: ValType[]; bytes: Uint8Array } | null;
+  }[] = [];
+  private dynPromViewField: number | null = null;
+  private dynPromConvField: number | null = null;
+  private copyRaceLoc: SrcLoc | null = null;
+  private copyBridgeUsed = false;
+  private dynThenGoField: number | null = null;
+  private dynThenRxField: number | null = null;
+  private dynThenEntryField: number | null = null;
+  private dynThenFinEntryField: number | null = null;
+  private dynThenResolveField: number | null = null;
+  private dynThenAdoptField: number | null = null;
+  private dynThenFinField: number | null = null;
+
+  private markDynPromGate(): void {
+    if (this.dynPromGateSampled && !this.dynPromGateValue) {
+      throw new Error("wasm emitter bug: a typed promise was boxed into dyn after the module's dyn promise gate was sampled");
+    }
+    this.dynPromGate = true;
+  }
+
+  /** Register a reader whose body finalizeDynProm chooses: `bytes` (built
+   * at the request, today's instructions) unless the module is gated and
+   * `gated()` returns a replacement. */
+  private deferDynPromBody(
+    idx: number,
+    locals: ValType[],
+    bytes: Uint8Array,
+    gated: () => { locals: ValType[]; bytes: Uint8Array } | null,
+  ): void {
+    if (this.dynPromGateSampled) {
+      throw new Error("wasm emitter bug: a dyn promise reader was requested after finalizeDynProm");
+    }
+    this.dynPromDeferred.push({ idx, locals, bytes, gated });
+  }
+
+  /** How a typed promise's fulfilment converts: 0 for the payload's own
+   * tag (numbers, booleans, strings, void), k >= 1 for a registered
+   * composite converter (array, record, union — whose payload is a typed
+   * struct the tag cannot read). Null refuses: every other inner type. */
+  private dynPromConvFor(inner: IrType, loc: SrcLoc | undefined): number | null {
+    switch (inner.kind) {
+      case "f64":
+      case "bool":
+      case "string":
+      case "void":
+        return 0;
+      case "array":
+      case "record":
+      case "union": {
+        const key = typeKey(inner);
+        const hit = this.dynPromConvByKey.get(key);
+        if (hit !== undefined) return hit;
+        if (this.mapType(inner, loc) === null) return null;
+        if (this.dynFromHelper(inner, loc) === null) return null;
+        this.dynPromConvTypes.push(inner);
+        const k = this.dynPromConvTypes.length;
+        this.dynPromConvByKey.set(key, k);
+        return k;
+      }
+      default:
+        return null;
+    }
+  }
+
+  /** Samples the gate and sets every deferred reader's body (see this
+   * section's header). Runs once, after every function has been walked. */
+  private finalizeDynProm(): void {
+    this.dynPromGateSampled = true;
+    this.dynPromGateValue = this.dynPromGate;
+    const gated = this.dynPromGateValue;
+    if (gated) {
+      this.proms.appendDynPromFields();
+      this.gateSettleOnDynPromise();
+    }
+    for (const d of this.dynPromDeferred) {
+      const g = gated ? d.gated() : null;
+      if (g !== null) this.mb.setBody(d.idx, g.locals, g.bytes);
+      else this.mb.setBody(d.idx, d.locals, d.bytes);
+    }
+    if (this.dynPromViewField !== null) {
+      if (!gated) throw new Error("wasm emitter bug: the dyn promise view was requested in an ungated module");
+      this.buildDynPromView();
+    }
+  }
+
+  /** Board #176's wrong answer, refused by name in a gated module: this
+   * tier FULFILS a promise with a dyn value as-is, so a dyn value that is
+   * itself a PROMISE (an `any` holding a promise, returned from an async
+   * function or passed to `Promise.resolve`) would become the fulfilment
+   * where Node adopts it. Every such resolve reaches promises.ts's shared
+   * settle with (EXC_REF, <the PROMISE box>), and no settle this tier
+   * performs legitimately stores a PROMISE box as a fulfilment (the
+   * reactions adopt one instead), so settle's own prologue — set here,
+   * after every function has been walked, and only in a gated module —
+   * reports the named refusal and exits nonzero exactly when a still
+   * PENDING promise is fulfilled with a PROMISE box. An ungated module's settle is unchanged
+   * (board #176 stays a stated gap there). */
+  private gateSettleOnDynPromise(): void {
+    const check = this.mb.declareFunc(this.mb.funcType([ANY_REF], []), "%w.dynprom.resolveCheck");
+    {
+      const dynT = this.dyn.dynT();
+      const c = new Code();
+      c.localGet(0);
+      c.refTest(dynT);
+      c.ifVoid();
+      c.localGet(0);
+      c.refCast(dynT);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.PROMISE);
+      c.i32Eq();
+      c.ifVoid();
+      this.emitSetCellError(
+        c,
+        "%Error",
+        "Error",
+        (x) => this.pushStrLitInto(x, "resolving a promise with a dyn promise value is not supported yet"),
+        "SC1090",
+      );
+      c.call(this.reportUncaughtHelper());
+      c.end();
+      c.end();
+      this.mb.setBody(check, [], c.bytes());
+    }
+    // settle(p, kind, f64, ref, pre, state): a FULFILMENT (state 1) whose
+    // payload is a ref (EXC_REF), of a promise still PENDING — a resolve
+    // JS ignores (the promise already settled: `res(1); res(p)`, or a
+    // resolve after a reject) stores nothing and must not be refused.
+    const prolog = new Code();
+    prolog.localGet(5);
+    prolog.i32Const(1);
+    prolog.i32Eq();
+    prolog.localGet(1);
+    prolog.i32Const(EXC_REF);
+    prolog.i32Eq();
+    prolog.i32And();
+    prolog.localGet(0);
+    prolog.structGet(this.proms.promT, PROM_STATE);
+    prolog.i32Eqz();
+    prolog.i32And();
+    prolog.ifVoid();
+    prolog.localGet(3);
+    prolog.call(check);
+    prolog.end();
+    this.proms.prependSettleProlog(prolog.bytes());
+  }
+
+  /** %w.dynprom.view(p) → the settled value of `p` as ONE dyn value (its
+   * body is built at finalizeDynProm, when every converter is known). */
+  private dynPromViewFn(): number {
+    if (this.dynPromViewField !== null) return this.dynPromViewField;
+    this.markDynPromGate();
+    this.dynPromViewField = this.mb.declareFunc(
+      this.mb.funcType([this.proms.promRef()], [this.dyn.dynRef()]),
+      "%w.dynprom.view",
+    );
+    return this.dynPromViewField;
+  }
+
+  /** The runtime-tag route: a promise payload (kind, f64, ref, pre) as a
+   * dyn value — caughtToDyn's ladder, plus void (no payload) as
+   * undefined. Leaves one dyn ref on the stack. */
+  private emitPromPayloadToDyn(c: Code, P: number, K: number, R: number): void {
+    const exc = this.exc();
+    const promT = this.proms.promT;
+    const dynRef = this.dyn.dynRef();
+    const kindIs = (tag: number): void => {
+      c.localGet(K);
+      c.i32Const(tag);
+      c.i32Eq();
+    };
+    kindIs(EXC_F64);
+    c.ifResult(dynRef);
+    this.dyn.boxNum(c, (x) => {
+      x.localGet(P);
+      x.structGet(promT, PROM_F64);
+    });
+    c.else_();
+    kindIs(EXC_BOOL);
+    c.ifResult(dynRef);
+    this.dyn.boxBool(c, (x) => {
+      x.localGet(P);
+      x.structGet(promT, PROM_F64);
+      x.f64Const(0);
+      x.f64Ne();
+    });
+    c.else_();
+    kindIs(EXC_STR);
+    c.ifResult(dynRef);
+    this.dyn.boxStr(c, (x) => {
+      x.localGet(R);
+      x.refCast(this.strType);
+    });
+    c.else_();
+    kindIs(EXC_OBJ);
+    c.ifResult(I32);
+    c.localGet(P);
+    c.structGet(promT, PROM_PRE);
+    this.emitErrIntervalTest(c);
+    c.else_();
+    c.i32Const(0);
+    c.end();
+    c.ifResult(dynRef);
+    c.localGet(R);
+    c.refCast(exc.errT);
+    c.call(this.dyn.fromError());
+    c.else_();
+    // No payload (a void fulfilment) answers undefined.
+    c.localGet(R);
+    c.refIsNull();
+    c.ifResult(dynRef);
+    c.globalGet(this.dyn.undefinedGlobal());
+    c.else_();
+    // Already dyn (a dyn or island promise, the trio's own promises).
+    c.localGet(R);
+    c.refTest(this.dyn.dynT());
+    c.ifResult(dynRef);
+    c.localGet(R);
+    c.refCast(this.dyn.dynT());
+    c.else_();
+    // A type-erased composite (a thrown record or class instance): the
+    // EMPTY object approximation, SEMANTICS.md S022.
+    this.dyn.boxObj(c, (x) => this.dyn.pushNewObj(x, false));
+    c.end();
+    c.end();
+    c.end();
+    c.end();
+    c.end();
+    c.end();
+  }
+
+  private buildDynPromView(): void {
+    const idx = this.dynPromViewField!;
+    const promT = this.proms.promT;
+    const dynT = this.dyn.dynT();
+    const dynRef = this.dyn.dynRef();
+    const c = new Code();
+    const P = 0, V = 1, K = 2, R = 3;
+    c.localGet(P);
+    c.structGet(promT, PROM_DYNVIEW);
+    c.localSet(R);
+    c.localGet(R);
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    c.localGet(R);
+    c.refCast(dynT);
+    c.return_();
+    c.end();
+    c.localGet(P);
+    c.structGet(promT, PROM_KIND);
+    c.localSet(K);
+    c.localGet(P);
+    c.structGet(promT, PROM_REF);
+    c.localSet(R);
+    if (this.dynPromConvTypes.length > 0) {
+      // A FULFILLED composite converts by its registered converter; a
+      // rejection is always the exception encoding (the tag route).
+      c.localGet(P);
+      c.structGet(promT, PROM_STATE);
+      c.i32Const(1);
+      c.i32Eq();
+      c.localGet(P);
+      c.structGet(promT, PROM_CONV);
+      c.i32Const(0);
+      c.i32Ne();
+      c.i32And();
+      c.ifResult(dynRef);
+      c.localGet(P);
+      c.structGet(promT, PROM_CONV);
+      c.localGet(P);
+      c.call(this.dynPromConvFn());
+      c.else_();
+      this.emitPromPayloadToDyn(c, P, K, R);
+      c.end();
+    } else {
+      this.emitPromPayloadToDyn(c, P, K, R);
+    }
+    c.localSet(V);
+    c.localGet(P);
+    c.localGet(V);
+    c.structSet(promT, PROM_DYNVIEW);
+    c.localGet(V);
+    this.mb.setBody(idx, [dynRef, I32, ANY_REF], c.bytes());
+  }
+
+  /** %w.dynprom.conv(k, p) → converter k applied to p's fulfilment: the
+   * static payload read (emitSettledPayload) then the static→dyn walker
+   * (dynFromHelper) for the k-th registered composite type. */
+  private dynPromConvFn(): number {
+    if (this.dynPromConvField !== null) return this.dynPromConvField;
+    const dynRef = this.dyn.dynRef();
+    const idx = this.mb.declareFunc(this.mb.funcType([I32, this.proms.promRef()], [dynRef]), "%w.dynprom.conv");
+    this.dynPromConvField = idx;
+    const c = new Code();
+    const K = 0, P = 1;
+    let open = 0;
+    for (const [i, t] of this.dynPromConvTypes.entries()) {
+      c.localGet(K);
+      c.i32Const(i + 1);
+      c.i32Eq();
+      c.ifResult(dynRef);
+      const walker = this.dynFromHelper(t, undefined);
+      if (walker === null || !this.emitSettledPayload(c, t, () => c.localGet(P), "dynFrom:promise:adapt", undefined)) {
+        throw new Error("wasm emitter bug: a registered dyn promise converter lost its representation");
+      }
+      c.call(walker);
+      c.else_();
+      open++;
+    }
+    // A converter id nothing registered: a corrupted promise, loud.
+    c.unreachable();
+    for (let i = 0; i < open; i++) c.end();
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  /** The shared "copy" reaction's gated body: a module that boxes typed
+   * promises into dyn has the island bridge's copies (and the trio's
+   * adoption) convert the fulfilment to its dyn view — the destination is
+   * always a dyn-shaped promise there. A typed same-type Promise.race
+   * ALSO sharing that reaction in such a module would need the raw copy;
+   * the two cannot share one body, so that module refuses by name.
+   * Null keeps the raw copy (race-only use). */
+  private buildCopyRxGated(): { locals: ValType[]; bytes: Uint8Array } | null {
+    if (!this.copyBridgeUsed) return null;
+    if (this.copyRaceLoc !== null) {
+      this.refuse("dynFrom:promise:race-copy", this.copyRaceLoc);
+      return null;
+    }
+    const promT = this.proms.promT;
+    const entryT = this.proms.raceEntryT;
+    const c = new Code();
+    const E = 2, DST = 3, SRC = 4;
+    c.localGet(1);
+    c.refCast(entryT);
+    c.localSet(E);
+    c.localGet(E);
+    c.structGet(entryT, RACEE_DST);
+    c.localSet(DST);
+    c.localGet(E);
+    c.structGet(entryT, RACEE_SRC);
+    c.localSet(SRC);
+    this.emitSettleFromView(c, DST, SRC);
+    return {
+      locals: [{ kind: "ref", nullable: true, typeIndex: entryT }, this.proms.promRef(), this.proms.promRef()],
+      bytes: c.bytes(),
+    };
+  }
+
+  /** Settle DST with SRC's outcome, a fulfilment as SRC's dyn view (so the
+   * destination always holds a dyn-shaped payload), a rejection raw. */
+  private emitSettleFromView(c: Code, DST: number, SRC: number): void {
+    const promT = this.proms.promT;
+    c.localGet(SRC);
+    c.structGet(promT, PROM_STATE);
+    c.i32Const(1);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(DST);
+    c.i32Const(EXC_REF);
+    c.f64Const(0);
+    c.localGet(SRC);
+    c.call(this.dynPromViewFn());
+    c.i32Const(-1);
+    c.i32Const(1);
+    c.call(this.proms.settle());
+    c.else_();
+    c.localGet(DST);
+    c.localGet(SRC);
+    c.call(this.proms.settleFrom());
+    c.end();
+  }
+
+  /** The handler threw: DST takes the exception cell as its rejection and
+   * the cell is cleared (a reaction has no enclosing try). Returns. */
+  private emitRejectFromCellAndReturn(c: Code, DST: number): void {
+    const exc = this.exc();
+    c.globalGet(exc.kindG);
+    c.ifVoid();
+    c.localGet(DST);
+    c.globalGet(exc.kindG);
+    c.globalGet(exc.f64G);
+    c.globalGet(exc.refG);
+    c.globalGet(exc.preG);
+    c.i32Const(2);
+    c.call(this.proms.settle());
+    this.emitCellClearInto(c);
+    c.return_();
+    c.end();
+  }
+
+  private pushBoxedPromise(c: Code, push: () => void): void {
+    c.i32Const(DK.PROMISE);
+    c.f64Const(0);
+    push();
+    c.structNew(this.dyn.dynT());
+  }
+
+  /** `%w.dynthen.entry` — one trio reaction's frame. */
+  private dynThenEntryType(): number {
+    this.dynThenEntryField ??= this.mb.subStructType(
+      "%w.dynthen.entry",
+      [
+        { storage: this.proms.promRef(), mutable: false }, // derived promise
+        { storage: this.proms.promRef(), mutable: false }, // receiver
+        { storage: this.dyn.dynRef(), mutable: false }, // onFulfilled / onFinally
+        { storage: this.dyn.dynRef(), mutable: false }, // onRejected
+        { storage: I32, mutable: false }, // mode
+      ],
+      this.frameBaseType(),
+    );
+    return this.dynThenEntryField;
+  }
+
+  /** `%w.dynthen.finEntry` — a `.finally` handler's wait: the promise the
+   * derived one adopts, the receiver, the handler's result promise. */
+  private dynThenFinEntryType(): number {
+    this.dynThenFinEntryField ??= this.mb.subStructType(
+      "%w.dynthen.finEntry",
+      [
+        { storage: this.proms.promRef(), mutable: false },
+        { storage: this.proms.promRef(), mutable: false },
+        { storage: this.proms.promRef(), mutable: false },
+      ],
+      this.frameBaseType(),
+    );
+    return this.dynThenFinEntryField;
+  }
+
+  /** %w.dynthen.go(recv, args, mode) → the derived promise, boxed. `recv`
+   * is a PROMISE box (the call site tested it); `args` the evaluated
+   * argument vector (missing handlers are undefined, extras ignored). */
+  private dynThenGoFn(loc: SrcLoc): number {
+    if (this.dynThenGoField !== null) return this.dynThenGoField;
+    const dynT = this.dyn.dynT();
+    const dynRef = this.dyn.dynRef();
+    const arrRef = this.dyn.arrRef();
+    const promT = this.proms.promT;
+    const idx = this.mb.declareFunc(this.mb.funcType([dynRef, arrRef, I32], [dynRef]), "%w.dynthen.go");
+    this.dynThenGoField = idx;
+    const entryT = this.dynThenEntryType();
+    const rx = this.dynThenRxFn(loc);
+    const c = new Code();
+    const RECV = 0, ARGS = 1, MODE = 2, SRC = 3, DST = 4, N = 5, A0 = 6, A1 = 7;
+    c.localGet(RECV);
+    c.structGet(dynT, DYN_REF);
+    c.refCast(promT);
+    c.localSet(SRC);
+    this.dyn.arrLen(c, (x) => x.localGet(ARGS));
+    c.localSet(N);
+    for (const [i, local] of [A0, A1].entries()) {
+      c.localGet(N);
+      c.i32Const(i);
+      c.i32GtS();
+      c.ifResult(dynRef);
+      this.dyn.arrAt(c, (x) => x.localGet(ARGS), (x) => x.i32Const(i));
+      c.else_();
+      c.globalGet(this.dyn.undefinedGlobal());
+      c.end();
+      c.localSet(local);
+    }
+    // `.catch(onR)` is `.then(undefined, onR)`.
+    c.localGet(MODE);
+    c.i32Const(DYNTHEN_CATCH);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(A0);
+    c.localSet(A1);
+    c.globalGet(this.dyn.undefinedGlobal());
+    c.localSet(A0);
+    c.end();
+    c.call(this.proms.mint());
+    c.localSet(DST);
+    c.localGet(SRC);
+    this.pushReactionClosure(c, rx);
+    c.localGet(DST);
+    c.localGet(SRC);
+    c.localGet(A0);
+    c.localGet(A1);
+    c.localGet(MODE);
+    c.structNew(entryT);
+    c.call(this.proms.subscribeHandled());
+    this.pushBoxedPromise(c, () => c.localGet(DST));
+    this.mb.setBody(idx, [this.proms.promRef(), this.proms.promRef(), I32, dynRef, dynRef], c.bytes());
+    return idx;
+  }
+
+  /** %w.dynthen.rx — the trio's reaction (see this section's header). */
+  private dynThenRxFn(loc: SrcLoc): number {
+    if (this.dynThenRxField !== null) return this.dynThenRxField;
+    const pair = this.resumeClosPair();
+    const idx = this.mb.declareFunc(pair.fn, "%w.dynthen.rx");
+    this.dynThenRxField = idx;
+    const entryT = this.dynThenEntryType();
+    const finEntryT = this.dynThenFinEntryType();
+    const promT = this.proms.promT;
+    const dynT = this.dyn.dynT();
+    const dynRef = this.dyn.dynRef();
+    const arrRef = this.dyn.arrRef();
+    const view = this.dynPromViewFn();
+    const resolve = this.dynThenResolveFn(loc);
+    const fin = this.dynThenFinFn();
+    const c = new Code();
+    const E = 2, DST = 3, SRC = 4, F = 5, R = 6, MODE = 7, H = 8, ARGS = 9, RESULT = 10, Q = 11, T = 12;
+    c.localGet(1);
+    c.refCast(entryT);
+    c.localSet(E);
+    for (const [field, local] of [[0, DST], [1, SRC], [2, F], [3, R], [4, MODE]] as const) {
+      c.localGet(E);
+      c.structGet(entryT, field);
+      c.localSet(local);
+    }
+    const isFunc = (local: number): void => {
+      c.localGet(local);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.FUNC);
+      c.i32Eq();
+    };
+    const newArgs = (): void => {
+      c.f64Const(0);
+      c.call(this.vecs.newLen(this.dynVecInfo()));
+      c.localSet(ARGS);
+    };
+    // `.finally(onF)`: call it with no arguments, then wait for its result.
+    c.localGet(MODE);
+    c.i32Const(DYNTHEN_FINALLY);
+    c.i32Eq();
+    c.ifVoid();
+    {
+      isFunc(F);
+      c.ifVoid();
+      newArgs();
+      c.localGet(F);
+      c.localGet(ARGS);
+      this.pushStrLitInto(c, "onFinally");
+      c.call(this.dyn.callFn());
+      c.localSet(RESULT);
+      this.emitRejectFromCellAndReturn(c, DST);
+      // PromiseResolve(result): a promise box is itself, any other value a
+      // fresh fulfilled promise.
+      c.localGet(RESULT);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.PROMISE);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(RESULT);
+      c.structGet(dynT, DYN_REF);
+      c.refCast(promT);
+      c.localSet(Q);
+      c.else_();
+      c.call(this.proms.mint());
+      c.localSet(Q);
+      c.localGet(Q);
+      c.i32Const(EXC_REF);
+      c.f64Const(0);
+      c.localGet(RESULT);
+      c.i32Const(-1);
+      c.i32Const(1);
+      c.call(this.proms.settle());
+      c.end();
+      c.call(this.proms.mint());
+      c.localSet(T);
+      c.localGet(Q);
+      this.pushReactionClosure(c, fin);
+      c.localGet(T);
+      c.localGet(SRC);
+      c.localGet(Q);
+      c.structNew(finEntryT);
+      c.call(this.proms.subscribeHandled());
+      c.localGet(DST);
+      this.pushBoxedPromise(c, () => c.localGet(T));
+      c.call(resolve);
+      c.return_();
+      c.end();
+      this.emitSettleFromView(c, DST, SRC);
+      c.return_();
+    }
+    c.end();
+    // then / catch: the handler for the receiver's outcome.
+    c.localGet(SRC);
+    c.structGet(promT, PROM_STATE);
+    c.i32Const(1);
+    c.i32Eq();
+    c.ifResult(dynRef);
+    c.localGet(F);
+    c.else_();
+    c.localGet(R);
+    c.end();
+    c.localSet(H);
+    isFunc(H);
+    c.ifVoid();
+    newArgs();
+    c.localGet(ARGS);
+    c.localGet(SRC);
+    c.call(view);
+    c.call(this.dyn.arrPush());
+    c.localGet(H);
+    c.localGet(ARGS);
+    this.pushStrLitInto(c, "value");
+    c.call(this.dyn.callFn());
+    c.localSet(RESULT);
+    this.emitRejectFromCellAndReturn(c, DST);
+    c.localGet(DST);
+    c.localGet(RESULT);
+    c.call(resolve);
+    c.return_();
+    c.end();
+    // No callable handler: the outcome passes through.
+    this.emitSettleFromView(c, DST, SRC);
+    this.mb.setBody(
+      idx,
+      [
+        { kind: "ref", nullable: true, typeIndex: entryT },
+        this.proms.promRef(),
+        this.proms.promRef(),
+        dynRef,
+        dynRef,
+        I32,
+        dynRef,
+        arrRef,
+        dynRef,
+        this.proms.promRef(),
+        this.proms.promRef(),
+      ],
+      c.bytes(),
+    );
+    return idx;
+  }
+
+  /** %w.dynthen.resolve(dst, r) — the derived promise's resolve function. */
+  private dynThenResolveFn(loc: SrcLoc): number {
+    if (this.dynThenResolveField !== null) return this.dynThenResolveField;
+    const dynT = this.dyn.dynT();
+    const dynRef = this.dyn.dynRef();
+    const promT = this.proms.promT;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.proms.promRef(), dynRef], []), "%w.dynthen.resolve");
+    this.dynThenResolveField = idx;
+    const adopt = this.dynThenAdoptFn(loc);
+    const c = new Code();
+    const DST = 0, RV = 1, INNER = 2, M = 3;
+    c.localGet(RV);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.PROMISE);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(RV);
+    c.structGet(dynT, DYN_REF);
+    c.refCast(promT);
+    c.localSet(INNER);
+    // Resolving a promise with itself: Node's TypeError.
+    c.localGet(INNER);
+    c.localGet(DST);
+    c.refEq();
+    c.ifVoid();
+    this.emitSetCellError(c, "%TypeError", "TypeError", (x) => this.pushStrLitInto(x, "Chaining cycle detected for promise #<Promise>"), null);
+    this.emitRejectFromCellAndReturn(c, DST);
+    c.end();
+    // Adoption: NewPromiseResolveThenableJob (this hop), whose `then`
+    // reaction (the copy) settles DST — Node's two extra jobs.
+    this.pushReactionClosure(c, adopt);
+    c.localGet(DST);
+    c.localGet(INNER);
+    c.structNew(this.proms.raceEntryT);
+    c.call(this.proms.hop());
+    c.return_();
+    c.end();
+    // An object with its own callable `then`: not a promise this tier can
+    // adopt — a named run-time refusal, never a silent fulfilment.
+    c.localGet(RV);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.OBJ);
+    c.i32Eq();
+    c.ifVoid();
+    this.dyn.objPayload(c, (x) => x.localGet(RV));
+    this.pushStrLitInto(c, "then");
+    c.call(this.dyn.objGet());
+    c.localSet(M);
+    c.localGet(M);
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    c.localGet(M);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.FUNC);
+    c.i32Eq();
+    c.ifVoid();
+    this.emitSetCellError(
+      c,
+      "%Error",
+      "Error",
+      (x) => this.pushStrLitInto(x, "adopting a non-promise thenable returned from a promise reaction is not supported yet"),
+      "SC1090",
+    );
+    this.emitRejectFromCellAndReturn(c, DST);
+    c.end();
+    c.end();
+    c.end();
+    c.localGet(DST);
+    c.i32Const(EXC_REF);
+    c.f64Const(0);
+    c.localGet(RV);
+    c.i32Const(-1);
+    c.i32Const(1);
+    c.call(this.proms.settle());
+    this.mb.setBody(idx, [this.proms.promRef(), dynRef], c.bytes());
+    return idx;
+  }
+
+  /** %w.dynthen.adopt — the adoption job: subscribe the adopted promise,
+   * whose copy reaction settles the derived one. */
+  private dynThenAdoptFn(loc: SrcLoc): number {
+    if (this.dynThenAdoptField !== null) return this.dynThenAdoptField;
+    const pair = this.resumeClosPair();
+    const idx = this.mb.declareFunc(pair.fn, "%w.dynthen.adopt");
+    this.dynThenAdoptField = idx;
+    const entryT = this.proms.raceEntryT;
+    const copy = this.raceReactionForCopy(loc);
+    const c = new Code();
+    const E = 2;
+    c.localGet(1);
+    c.refCast(entryT);
+    c.localSet(E);
+    c.localGet(E);
+    c.structGet(entryT, RACEE_SRC);
+    this.pushReactionClosure(c, copy);
+    c.localGet(E);
+    c.call(this.proms.subscribeHandled());
+    this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: entryT }], c.bytes());
+    return idx;
+  }
+
+  /** %w.dynthen.fin — a `.finally` handler's result settled: T takes that
+   * result's rejection, or else the receiver's own outcome. */
+  private dynThenFinFn(): number {
+    if (this.dynThenFinField !== null) return this.dynThenFinField;
+    const pair = this.resumeClosPair();
+    const idx = this.mb.declareFunc(pair.fn, "%w.dynthen.fin");
+    this.dynThenFinField = idx;
+    const entryT = this.dynThenFinEntryType();
+    const promT = this.proms.promT;
+    const c = new Code();
+    const E = 2, T = 3, SRC = 4, Q = 5;
+    c.localGet(1);
+    c.refCast(entryT);
+    c.localSet(E);
+    for (const [field, local] of [[0, T], [1, SRC], [2, Q]] as const) {
+      c.localGet(E);
+      c.structGet(entryT, field);
+      c.localSet(local);
+    }
+    c.localGet(Q);
+    c.structGet(promT, PROM_STATE);
+    c.i32Const(2);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(T);
+    c.localGet(Q);
+    c.call(this.proms.settleFrom());
+    c.return_();
+    c.end();
+    this.emitSettleFromView(c, T, SRC);
+    this.mb.setBody(
+      idx,
+      [{ kind: "ref", nullable: true, typeIndex: entryT }, this.proms.promRef(), this.proms.promRef(), this.proms.promRef()],
+      c.bytes(),
+    );
+    return idx;
   }
 
   /** Island → static PROMISE bridge (increment 21 stage C — the design
