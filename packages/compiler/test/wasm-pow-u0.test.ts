@@ -3,7 +3,7 @@
  * old arm 6/7, and pushIsOddInteger answering 0 for any non-finite operand,
  * bit-for-bit unchanged for every finite one. ONE `test` PER ROW, EACH ROW
  * ITS OWN COMPILE: with one shared module, a mutant that makes one row trap
- * (for example disabling the y===2 special case, or altering the fence)
+ * (for example disabling the y===2 special case, or altering the core)
  * would truncate that program's output and destroy mutation attribution for
  * every row sharing the module.
  *
@@ -206,49 +206,50 @@ test("R11 (-2)**2 — CONTROL", async () => {
 });
 
 // ============================================================
-// FENCE-PIN — R12..R16. The exact fence text; R13..R16 additionally pin the
-// S043 wording fix (base ±1 with a FINITE exponent still fences).
+// COMPUTE — R12..R16. These pinned the runtime fence until INC-27 U6 gave
+// the helper its general core (SEMANTICS.md S079): `2 ** 3` and base ±1 with
+// a FINITE exponent now compute through it, and each expected line is Node's.
 // ============================================================
 
-test("R12 2**3 — FENCE-PIN", async () => {
+test("R12 2**3 — COMPUTE", async () => {
   const actual = await runRow(
     "r12",
     "const two: any = 2;\nconst three: any = 3;",
     'row("R12 2**3", two, three);',
   );
-  expectRow(actual, "R12 2**3 4000000000000000 4008000000000000 -> CAUGHT:Math.pow with this exponent is not supported yet");
+  expectRow(actual, "R12 2**3 4000000000000000 4008000000000000 -> 4020000000000000 ");
 });
 
-test("R13 1**3 — FENCE-PIN (base +1, finite exponent, still fences)", async () => {
+test("R13 1**3 — COMPUTE (base +1, finite exponent)", async () => {
   const actual = await runRow(
     "r13",
     "const one: any = 1;\nconst three: any = 3;",
     'row("R13 1**3", one, three);',
   );
-  expectRow(actual, "R13 1**3 3ff0000000000000 4008000000000000 -> CAUGHT:Math.pow with this exponent is not supported yet");
+  expectRow(actual, "R13 1**3 3ff0000000000000 4008000000000000 -> 3ff0000000000000 ");
 });
 
-test("R14 1**1 — FENCE-PIN (base +1, finite exponent, still fences)", async () => {
+test("R14 1**1 — COMPUTE (base +1, finite exponent)", async () => {
   const actual = await runRow("r14", "const one: any = 1;", 'row("R14 1**1", one, one);');
-  expectRow(actual, "R14 1**1 3ff0000000000000 3ff0000000000000 -> CAUGHT:Math.pow with this exponent is not supported yet");
+  expectRow(actual, "R14 1**1 3ff0000000000000 3ff0000000000000 -> 3ff0000000000000 ");
 });
 
-test("R15 (-1)**3 — FENCE-PIN (base -1, finite exponent, still fences)", async () => {
+test("R15 (-1)**3 — COMPUTE (base -1, finite exponent)", async () => {
   const actual = await runRow(
     "r15",
     "const negOne: any = -1;\nconst three: any = 3;",
     'row("R15 (-1)**3", negOne, three);',
   );
-  expectRow(actual, "R15 (-1)**3 bff0000000000000 4008000000000000 -> CAUGHT:Math.pow with this exponent is not supported yet");
+  expectRow(actual, "R15 (-1)**3 bff0000000000000 4008000000000000 -> bff0000000000000 ");
 });
 
-test("R16 1**1e308 — FENCE-PIN (base +1, finite exponent, still fences)", async () => {
+test("R16 1**1e308 — COMPUTE (base +1, finite exponent)", async () => {
   const actual = await runRow(
     "r16",
     "const one: any = 1;\nconst big: any = 1e308;",
     'row("R16 1**1e308", one, big);',
   );
-  expectRow(actual, "R16 1**1e308 3ff0000000000000 7fe1ccf385ebc8a0 -> CAUGHT:Math.pow with this exponent is not supported yet");
+  expectRow(actual, "R16 1**1e308 3ff0000000000000 7fe1ccf385ebc8a0 -> 3ff0000000000000 ");
 });
 
 // ============================================================

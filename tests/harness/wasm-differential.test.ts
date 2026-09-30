@@ -567,9 +567,9 @@ const TIER_FLOOR: string[] = [
   // The core shapes: `this` captured into a closure, the refcount stress
   // program, and an inheritance chain (constructors chaining through
   // super, base fields as the derived struct's prefix). 700-classes-basic
-  // and 701-classes-composition are NOT here — the class surface stopped
-  // blocking them, but they now name `bin:**` and `bin:ref-eq`, which are
-  // their own work.
+  // and 701-classes-composition were NOT here — the class surface stopped
+  // blocking them, but they then named `bin:**` and `bin:ref-eq`, their own
+  // work (700 is claimed with `**`, INC-27 U6, below).
   "702-classes-this-capture.ts",
   "703-classes-rc-stress.ts",
   "710-inheritance-basics.ts",
@@ -1259,8 +1259,9 @@ const TIER_FLOOR: string[] = [
   // Two more programs claimed as a SIDE EFFECT of the same fix: both use
   // a literal-literal `**` expression (e.g. `2 ** 10`), previously an
   // unconditional bin:** refusal — emitBin's literal-operand fold now
-  // computes these at compile time (no general Math.pow support needed
-  // for the literal case), so both compile and are byte-exact.
+  // computes these at compile time (since INC-27 U6 with the tier's own
+  // pow, pow.ts, never the compiling host's), so both compile and are
+  // byte-exact.
   "101-arithmetic.ts",
   "1630-inspect-scalars.ts",
   // Increment 18 stage C, round R1: DataView (dataViewNew + every
@@ -1593,10 +1594,9 @@ const TIER_FLOOR: string[] = [
   // defaulted to a raw null ref instead of the engine's own undefined
   // (1587's `String(h.x)` before `.fill()` runs is what surfaced it —
   // masked until this gate opened a real end-to-end path through the
-  // program). `pow` computes exactly y===2 (`x*x`, fdlibm-exact) plus
-  // the full ECMA-262 special-value table; every other exponent takes a
-  // runtime "not supported yet" fence — narrowed deliberately, see the
-  // op's own header comment (jsPowHelper).
+  // program). `pow` computed only y===2 and the ECMA-262 special-value
+  // table then; since INC-27 U6 it is exact for every operand pair
+  // (SEMANTICS.md S079; the op's own header comment, jsPowHelper).
   "1587-any-field-unassigned.ts",
   "2365-dyn-into-island.ts",
   "2667-array-to-sorted-any.ts",
@@ -3387,6 +3387,11 @@ const TIER_FLOOR: string[] = [
   "2654-top-level-await-unrelated-rejection.ts",
   "2663-top-level-await-dependency-errors/main.ts",
   "2664-top-level-await-same-checkpoint-rejection.ts",
+  // INC-27 U6: `**` computes for every operand pair (the ECMA-262 ladder,
+  // V8's y = 2 and y = 0.5 pre-cases, and glibc's pow transcribed with its
+  // fused multiply-adds; SEMANTICS.md S079) and `bin:**` is routed to it.
+  "304-compound-incdec.ts",
+  "700-classes-basic.ts",
 ];
 
 interface RunResult {

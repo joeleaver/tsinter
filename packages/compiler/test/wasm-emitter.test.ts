@@ -6580,15 +6580,18 @@ test("bin: literal-operand constant folding — behavioral parity across +,-,*,/
   expect(stdout.toString("utf8")).toBe(expected);
 });
 
-test("bin: ** still refuses for NON-literal operands — folding is literal-operand only, no constant propagation or variable lookthrough", async () => {
+test("bin: ** over NON-literal operands computes at run time — folding is literal-operand only, no constant propagation or variable lookthrough (the module calls %w.jsPow)", async () => {
   const res = await buildWasm(
     "bin-pow-nonliteral.ts",
     ["const a: number = 2;", "const b: number = 10;", "console.log((a ** b).toString());", ""].join("\n"),
   );
-  expect(res.ok).toBe(false);
-  if (res.ok) return;
-  expect(res.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
-  expect(res.wasmSurvey).toContain("bin:**");
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const bytes = readFileSync(res.binaryPath);
+  expect(WebAssembly.validate(bytes)).toBe(true);
+  // not folded: the helper is in the module (its name is in the name section)
+  expect(bytes.includes("%w.jsPow")).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("1024\n");
 });
 
 test("bin: a variable-sourced division is NOT folded away — proves no over-folding by diffing raw f64.div (0xa3) opcode counts between otherwise-identical programs", async () => {

@@ -257,6 +257,7 @@ import { SymBuilder } from "./symbols.js";
 import { UnionBuilder, type UnionArmRep } from "./unions.js";
 import { Code } from "./code.js";
 import { buildF64ToStr } from "./numfmt.js";
+import { buildPowCore, jsPowValue } from "./pow.js";
 import { F64, I32, I64, ModuleBuilder, type FieldType, type StorageType, type ValType } from "./module.js";
 import {
   asIrModule,
@@ -21252,9 +21253,8 @@ class Assembler {
           // None of these can throw in this backend's static semantics
           // (no valueOf/toString hook exists to run user code, and
           // strToNum's own grammar failures are NaN, not exceptions) —
-          // the sole exception is `pow`'s deliberate internal fence
-          // (jsPowHelper's header), which DOES need the pending-check
-          // protocol. Every op still seeds may-throw in the IR contract
+          // `pow` included: jsPowHelper computes every operand pair and
+          // needs no pending check. Every op still seeds may-throw in the IR contract
           // (nodes.ts:4864) for uniformity with the native/engine lanes;
           // this static implementation is STRONGER (§8's "objLit cannot
           // run engine getters" precedent, same shape here).
@@ -21328,7 +21328,6 @@ class Assembler {
             });
             this.releaseScratch(this.dyn.dynRef(), a);
             this.releaseScratch(this.dyn.dynRef(), b);
-            this.emitPendingCheck(); // jsPowHelper's runtime fence, only
             return;
           }
           case "neg": case "plus": {
@@ -24196,7 +24195,8 @@ class Assembler {
 
   /* ── operators ──────────────────────────────────────────────────────── */
 
-  /** Attempts to fold `e` to a plain host number — RECURSIVE over
+  /** Attempts to fold `e` to a plain host number (`**` computed by
+   * pow.ts's jsPowValue, never the host's own pow) — RECURSIVE over
    * literal-derived float arithmetic, mirroring V8's OWN measured
    * constant-folding boundary (SEMANTICS.md S036 has the full table),
    * not a general partial evaluator:
@@ -24250,7 +24250,9 @@ class Assembler {
         case "*": return l * r;
         case "/": return l / r;
         case "%": return l % r;
-        case "**": return l ** r;
+        // The tier's own `**` (pow.ts), never the compiling host's: the same
+        // arms and bits the run-time helper computes.
+        case "**": return jsPowValue(l, r);
       }
     }
     return undefined;
@@ -24259,15 +24261,17 @@ class Assembler {
   private emitBin(e: Extract<IrExpr, { kind: "bin" }>): void {
     const code = this.fn.code;
     // Conservative literal-operand constant folding (SEMANTICS.md S036).
-    // Folding covers `**` too — a literal-literal exponentiation needs
-    // no general Math.pow support, so this handles it without lifting
-    // bin:**'s refusal for the general (non-foldable) case below.
+    // Folding covers `**` too: a literal-literal exponentiation folds to
+    // pow.ts's jsPowValue, the TypeScript transcription of the same helper
+    // the non-literal case below calls at run time (SEMANTICS.md S079).
     if (e.op === "+" || e.op === "-" || e.op === "*" || e.op === "/" || e.op === "%" || e.op === "**") {
       const folded = this.tryFoldFloatConst(e);
       if (folded !== undefined) {
         // Non-NaN folds are value-identical to what wasm's own f64 ops
         // would compute (IEEE754 double arithmetic is exactly specified,
-        // no fast-math relaxation in the base wasm spec) — safe to fold
+        // no fast-math relaxation in the base wasm spec), and a folded `**`
+        // equals %w.jsPow's run-time value (jsPowValue uses only IEEE-754
+        // binary64 + - * / and a correctly rounded Math.sqrt) — safe to fold
         // outright. A NaN result gets the CANONICAL bit pattern
         // explicitly (CANONICAL_NAN, not `folded`'s own bits) because
         // this fold runs inside the compiler's own host process, and
@@ -24297,12 +24301,11 @@ class Assembler {
         code.call(this.fmodHelper());
         return;
       case "**":
-        // Math.pow's transcendental core plus the spec's corner table —
-        // its own work item. The literal-literal case is handled by the
-        // folding check above; this refusal covers only the general
-        // (at least one non-literal operand) case.
-        this.refuse("bin:**", e.loc);
-        code.unreachable();
+        // The general (at least one non-literal operand) case: %w.jsPow,
+        // which cannot throw (SEMANTICS.md S079).
+        this.walkExpr(e.left);
+        this.walkExpr(e.right);
+        code.call(this.jsPowHelper());
         return;
       case "<":
       case "<=":
@@ -39736,30 +39739,28 @@ class Assembler {
   }
 
   private jsPowFunc: number | null = null;
+  private powCoreFunc: number | null = null;
 
-  /** %w.jsPow(x, y: f64) → f64 — `**`'s numeric core (ECMA-262
-   * Number::exponentiate), oracle-verified table-for-table
-   * (scratchpad/oracle/pow.mjs) — every NaN/±0/±Infinity special case
-   * below, and base ±1 ONLY with an INFINITE exponent (`1 ** 3`, a FINITE
-   * exponent, still fences below — S043). NARROWED BY DESIGN past the
-   * special-value table: V8's
-   * Math.pow (fdlibm-derived) special-cases only a FEW exponents to
-   * elementary ops (the fdlibm attribution in this rationale is
-   * superseded; the correction lands with the pow unit's entry — INC-27 U0
-   * changes nothing else here) — y===2 is x*x, y===-1 is 1/x, y===0.5 is a sqrt with
-   * its own edge handling — and every OTHER exponent, INTEGER EXPONENTS
-   * INCLUDED, takes fdlibm's polynomial path, which is NOT guaranteed
-   * bit-identical to exponentiation-by-squaring for y===3, y===10, etc.
-   * (a latent, unprovable-by-sampling miscompile class the review round
-   * caught). So only y===2 gets computed (`x*x`, bit-exact BECAUSE
-   * fdlibm itself reduces to that single multiply there) — the ONE
-   * measured need across the 64 (760's `n ** 2`, count=1 in the op
-   * census). Every other finite-base/finite-exponent combination,
-   * including other integers, takes the runtime "not supported yet"
-   * fence (S043-style: a real catchable Error, never a silent guess and
-   * never a bare trap) rather than risk a wrong last-ULP digit. A wider
-   * exponent set needs either a V8-source-confirmed special-case list or
-   * a real fdlibm-equivalent port — never squaring. */
+  /** %w.powCore(x, y: f64) → f64 — glibc's pow (pow.ts), declared once per
+   * module on first use; only %w.jsPow calls it. */
+  private powCoreHelper(): number {
+    if (this.powCoreFunc === null) this.powCoreFunc = buildPowCore(this.mb);
+    return this.powCoreFunc;
+  }
+
+  /** %w.jsPow(x, y: f64) → f64 — `**` (ECMA-262 Number::exponentiate) as
+   * Node computes it (SEMANTICS.md S079). V8's entry point
+   * (`v8::internal::math::pow`) answers a few cases itself and hands every
+   * other operand pair to the C library's `pow`; the arms below follow it in
+   * this order: the ECMA-262 special-value ladder (NaN, ±0, ±Infinity, a
+   * negative base with a non-integer exponent — including the |x| = 1,
+   * infinite-y NaN that V8 answers itself), then V8's two exponent pre-cases,
+   * y === 2 → x*x and y === 0.5 → sqrt(x + 0), both exact by construction,
+   * then everything else — base ±1, the exponents ±1 and every integer
+   * exponent included — through %w.powCore (pow.ts): a transcription of the
+   * glibc pow that Node calls on Linux x86-64 with an FMA CPU, bit-exact to
+   * it. The literal fold computes the same arms in TypeScript (pow.ts,
+   * jsPowValue). */
   private jsPowHelper(): number {
     if (this.jsPowFunc !== null) return this.jsPowFunc;
     const idx = this.mb.declareFunc(this.mb.funcType([F64, F64], [F64]), "%w.jsPow");
@@ -39999,7 +40000,7 @@ class Assembler {
       c.end();
     }
     c.end();
-    // The ONE measured, computed case: y === 2 → x*x, fdlibm-exact.
+    // V8's own pre-case: y === 2 → x*x (Node never reaches libm here).
     c.localGet(Y);
     c.f64Const(2);
     c.f64Eq();
@@ -40009,15 +40010,26 @@ class Assembler {
     c.f64Mul();
     c.return_();
     c.end();
-    // Everything else: the runtime fence (never squaring — see header).
-    this.emitSetCellError(
-      c,
-      "%Error",
-      "Error",
-      (x) => this.pushStrLitInto(x, "Math.pow with this exponent is not supported yet"),
-      null,
-    );
+    // V8's other pre-case: y === 0.5 → sqrt(x + 0). x is finite and
+    // nonzero here (the +Infinity, -Infinity and ±0 arms returned, and a
+    // negative x with this non-integer exponent took the NaN arm), so the
+    // `+ 0` — V8's own text, which maps -0 to +0 — is kept only to stay
+    // V8's expression; f64.sqrt is correctly rounded, like C's sqrt.
+    c.localGet(Y);
+    c.f64Const(0.5);
+    c.f64Eq();
+    c.ifVoid();
+    c.localGet(X);
     c.f64Const(0);
+    c.f64Add();
+    c.f64Sqrt();
+    c.return_();
+    c.end();
+    // Everything else: the C library's pow, as glibc's FMA build computes it
+    // (pow.ts). Nothing in this helper can throw.
+    c.localGet(X);
+    c.localGet(Y);
+    c.call(this.powCoreHelper());
     this.mb.setBody(idx, [F64, F64, F64, I32], c.bytes());
     return idx;
   }

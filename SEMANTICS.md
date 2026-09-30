@@ -2784,20 +2784,7 @@ exact):
 
 The stage-B roster joins the same list (increment 21 stage B, all
 measured the same way):
-- **`Math.pow` / `**` beyond the exact set**: the ECMA-262 special-value
-  table (NaN, ±0, ±Infinity, negative-base-non-integer) computes exactly
-  for ANY exponent, and base ±1 computes exactly ONLY with an INFINITE
-  exponent — a FINITE exponent against base ±1 (`1 ** n`, `(-1) ** n`;
-  `packages/compiler/test/wasm-pow-u0.test.ts` R13–R16) still FENCES below. `y === 2` computes as `x*x` — the one form
-  fdlibm (V8's pow) itself special-cases to an elementary op, so
-  bit-exactness is by construction, and the only measured corpus need.
-  EVERY other exponent — other integers included — throws the catchable
-  "Math.pow with this exponent is not supported yet": fdlibm's
-  polynomial path is not reproducible by exponentiation-by-squaring at
-  last-ulp fidelity, and an unprovable answer is the miscompile class,
-  not a feature. The fdlibm attribution in this rationale is superseded;
-  the correction lands with the pow unit's entry — INC-27 U0 changes
-  nothing else here.
+- (INC-27 U6: the former `Math.pow` / `**` bullet is DELETED here, not narrowed: `**` computes for every operand pair and fences nothing — S079.)
 - **The unmodeled-name half of the Number-placeholder call surface**:
   calling an extracted placeholder whose NAME is not modeled for real
   dispatch (`toLocaleString.call(5)`, or `toExponential.call(5, 2)` — the
@@ -5698,6 +5685,54 @@ listener fires); a forced-host interleaving row (`emitWarning(A); process.nextTi
 pinning Node's own A/T/B order against a drain-all mistake's A/B/T); a forced-host report-then-listener
 row per warning. Independently re-measured this pass against a live Node v24.18.1 rather than transcribed
 from the design phase's own numbers.
+
+## S079 — `**` beyond its exact cases answers the bits of ONE glibc build's `pow`: Ubuntu GLIBC 2.43-2ubuntu2.4's x86-64 FMA variant (`__ieee754_pow_fma`); Node's own last bit depends on the platform's libm, and the tier matches Node on that build *(wasm tier)*
+
+Node's `**` is not one answer. V8's live entry (`v8::internal::math::pow`, with `use_std_math_pow`
+on by default in Node v24.18.1's V8) answers these cases itself: a NaN exponent → NaN; an infinite
+exponent with a base of +1 or -1 → NaN; a NaN base → NaN; an exponent of exactly 2 → `x * x`; an
+exponent of exactly 0.5 → +Infinity for an infinite base, else `sqrt(x + 0)`. Every other operand pair
+goes to the C library's `pow`. On Linux that is glibc, and glibc chooses its `pow` build at load time by
+CPU: on the machine this tier is measured against (Ubuntu GLIBC 2.43-2ubuntu2.4, libm.so.6 sha256
+1c488db6f4fe8cecb72456bc018de000b7a9b539c2994864b0416b5e8371b3d8) an x86-64 CPU with FMA3 and AVX2
+runs the FMA build (`__ieee754_pow_fma`), whose last bit depends on where that build's compiler fused
+`a*b+c`. With FMA and AVX2 masked (`GLIBC_TUNABLES=glibc.cpu.hwcaps=-AVX2,-FMA,-FMA4`) the SSE2 build
+answers differently on 1,887 of 3,000,000 fixed inputs, every time by one ULP, and Node follows whichever
+build is loaded — except at the exponents 2 and 0.5, which V8 answers itself. glibc's `pow` is not
+correctly rounded either: on about 1 call in 1,200 its answer is one ULP from the correctly rounded one,
+and Node's answer is glibc's (`packages/compiler/test/wasm-pow-u6.test.ts` C04 lists eight such inputs
+with Node's bits).
+
+**What the tier does.** `**` — the static operator, `**=`, and the checked-dynamic route — computes
+through one helper (`emitter.ts` jsPowHelper): the ECMA-262 special-value ladder, V8's two pre-cases
+(`x * x` for 2; `f64.sqrt(x + 0)` for 0.5), then a transcription of ARM optimized-routines' `pow` (the
+upstream of glibc's; `packages/compiler/src/backend/wasm/pow.ts`, with its tables in `pow-tables.ts`) on
+its fma code path, with every multiply-add that the glibc FMA build fuses computed by an exact software
+fused multiply-add (WebAssembly has no fma instruction; relaxed-simd's is not deterministic). Of those 21
+fused sites, 9 change a result on inputs found so far (one row each: M01–M08, M12; M09–M11 pin three
+unfused sites whose fusion would), 1 cannot by construction, and 11 were not observed to in 2.28 billion generated rows —
+a statement about those rows, not a proof that they cannot. So the tier answers the bits of that glibc
+build on every host: bit-exact to Node on the measured platform. A literal-literal `**` still folds at
+compile time at S036's boundary, and the folded value is computed by a TypeScript transcription of the
+same helper — same tables, same fused sites, same exact fma — never by the compiling host's `**`; it uses
+only IEEE-754 binary64 + - * / and a correctly rounded `Math.sqrt`, so the folded bits equal the run-time
+bits on every engine the compiler runs on.
+
+**The divergence registered.** On a host whose Node runs a different `pow` — glibc's SSE2 or FMA4 build
+(a CPU without FMA3/AVX2), another distribution's glibc build, musl, macOS, Windows, or a non-x86 CPU —
+the tier and that host's Node can differ in the last bit of `**` for a general exponent; none of those is
+claimed. Exact on every host: the special-value ladder and the exponents 2 and 0.5. The exponents 1 and -1
+are NOT exact by construction: Node answers them from libm too, and `x ** -1` differs from `1 / x` on
+about 1 in 1,200 random bases (C07). `Math.pow` is not part of this: it stays refused (SC2012 in a plain
+build; SC3001 `expr:jsOp` under `--dynamic` on this tier; N01, N02). A NaN result is the tier's canonical
+NaN (S036; board #158). The native lanes call the C library's `pow` without V8's pre-cases and do not fold
+`**` (board #207).
+
+**Tested by:** `packages/compiler/test/wasm-pow-u6.test.ts` — the special-value cells (L01–L07), V8's two
+pre-cases and the unit-base NaN (P01–P03), bit tables through the core (C01–C09, incl. every
+overflow/underflow branch and the rows where a correctly rounded answer would miss Node), one row per
+observable fused or unfused multiply-add (M01–M12), the checked-dynamic route (D01–D02), the literal fold
+against the same operands at run time (X01–X03), and the lockstep of the two transcriptions (Z01–Z02).
 
 ## S080 — a tagged template's per-site strings array is NOT frozen: a write that Node rejects succeeds here, and the two build modes diverge from each other too *(scope stated per lane and per module mode below)*
 
