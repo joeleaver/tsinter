@@ -426,10 +426,10 @@ test("F.2 renderer: NULL/BOOL/UNDEF as nested values, an empty OBJ, and empty BY
 
 test("F.2 renderer: FUNC ANONYMOUS nested (same closure both sides, genuinely un-nameable)", async () => {
   // A null-prototype OBJ pin (F.2's own other citation in this group)
-  // is NOT built here: `Object.create(null)` boxed into `unknown`
-  // refuses by name today (libCall:dyn.objCreateNullProto, own probe)
-  // — an EXISTING wasm-backend gap unrelated to P2b's own scope, not
-  // something this pass introduces or should paper over.
+  // is NOT built here: when this pass landed, `Object.create(null)` boxed
+  // into `unknown` refused by name (libCall:dyn.objCreateNullProto) — a
+  // wasm-backend gap unrelated to P2b's own scope, since lifted by INC-27
+  // U5, whose rows cover the null-prototype readers.
   //
   // Getting a genuinely anonymous render took TWO failed attempts:
   // `const fn = (() => () => {})();` keeps `fn.name === ""` in real
@@ -614,8 +614,9 @@ test("F.2 comparison: BYTES payload identity under SameValue (two crossings of O
     "const u: unknown = new Uint8Array([1, 2]);",
     "showMsg(() => assert.strictEqual(u, u));",
     "const np: unknown = JSON.parse('{\"k\":1}');",
-    // A genuine null-prototype OBJECT cannot be constructed and boxed
-    // today (libCall:dyn.objCreateNullProto refuses) — this sub-case
+    // A genuine null-prototype OBJECT could not be constructed and boxed
+    // when this pass landed (libCall:dyn.objCreateNullProto refused; INC-27
+    // U5 lifts it) — this sub-case
     // instead pins the OTHER half of the SAME gate: two structurally
     // IDENTICAL plain objects still compare deep-equal, confirming the
     // null-proto check is a GATE alongside content equality, not a

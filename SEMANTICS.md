@@ -2253,6 +2253,28 @@ stringifyDyn, and inspect.ts's dyn walker, each checked both ways);
 real Buffer that DID cross generically) that pins THIS tier's answer with
 an explicit citation to this entry, never Node's.
 
+**Amendment (INC-27 U5): the reverse face — the clone of a Buffer-typed
+value renders as a Buffer.** In Node `structuredClone` of a `Buffer`
+answers a plain `Uint8Array` (a Buffer's clone keeps its bytes but not its
+Buffer-ness: `util.inspect` prints `Uint8Array(2) [ 104, 105 ]`). The
+front end types `structuredClone<T>(value: T): T`, so when TypeScript
+types the argument as `Buffer` the result is checked back to the argument's
+own `bytes<u8>` type, and every typed surface renders it by that static
+type — `util.inspect` and `console.log` print `<Buffer 68 69>` (measured
+on every lane), where Node's clone prints `Uint8Array(2) [ 104, 105 ]`;
+`String()`, a template literal, `JSON.stringify` and a string-typed
+argument reach existing named fences instead (SC2020 / SC1090, measured on
+every lane).
+Measured on every lane: wasm, C and LLVM print `<Buffer 68 69>` alike.
+The dynamic-value clone is right: a Buffer held in `unknown` (a stream
+chunk passed through an untyped callback) clones to a value that prints
+`Uint8Array(2) [ 104, 105 ]`, as Node's does, because the clone drops the
+flag this entry describes. The root cause is this entry's own — the IR has
+one type for both, so the static type the front end gives the result
+cannot say "Uint8Array". Board #206 owns the fix;
+`wasm-dynsmalls-u5.test.ts` pins this tier's answer (row R42c) beside the
+Node-exact dynamic-value row (R42b). The entry count is unchanged.
+
 ## S038 — A `Buffer | string`-shaped union's `.toString()` treats the bytes arm as Buffer UNCONDITIONALLY, even when the runtime value is a plain `Uint8Array` *(wasm tier, shared with the LLVM and C lanes)*
 
 Node's `.toString()`/`String(x)` on a bytes value depends on the ACTUAL

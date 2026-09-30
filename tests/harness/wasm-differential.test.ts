@@ -3372,6 +3372,21 @@ const TIER_FLOOR: string[] = [
   "2210-dyn-promise-crossing.cjs",
   "2735-rejection-events.cjs",
   "409-params-async-generics.ts",
+  // INC-27 U5 (D, the dyn smalls: a caught value narrowed as an Error,
+  // DOMException with its derived code and cause, structuredClone over the
+  // dynamic tree, spread arguments and variadic Object.assign's source
+  // pack, Object.create(null), and a failing top-level-await module
+  // reported before an unrelated rejection's listener): 955 -> 964, the
+  // nine programs this unit lands.
+  "1554-caught-into-unknown.ts",
+  "2281-domexception-atob-btoa.cjs",
+  "2283-structured-clone.cjs",
+  "2567-rest-spread-forward.js",
+  "2586-object-assign-spread.js",
+  "2589-object-create-null.cjs",
+  "2654-top-level-await-unrelated-rejection.ts",
+  "2663-top-level-await-dependency-errors/main.ts",
+  "2664-top-level-await-same-checkpoint-rejection.ts",
 ];
 
 interface RunResult {

@@ -364,6 +364,34 @@ export interface DynDeps {
    * header note), so they cross this boundary with no cast needed. */
   deqEnter: () => number;
   deqLeave: () => number;
+  /** INC-27 U5: the DOMException members of the `%error` encoding —
+   * present ONLY in a module that can mint a DOMException (the emitter's
+   * static prescan), so fromError's body is unchanged everywhere else.
+   * Called inside fromError after the `code` slot's member, with the
+   * error in local `errLocal` and the object being built in local
+   * `objLocal`; it adds `code` as the derived legacy NUMBER (board #187)
+   * and `cause` when one is present, exactly C's scr_dyn_from_error arm. */
+  fromErrorExtra?: (c: Code, errLocal: number, objLocal: number) => void;
+  /** INC-27 U5: the named run-time refusal a NULL-PROTOTYPE object
+   * (`Object.create(null)`) meets at ToString — present ONLY in a module
+   * that can build one (the emitter's static prescan), so toStr's body is
+   * unchanged everywhere else. It fills the exception cell and reports it
+   * as uncaught (the conversion sites are not may-throw, so the refusal
+   * cannot be catchable); it never returns. */
+  nullProtoToStr?: (c: Code) => void;
+  /** INC-27 U5: Object.assign's member PUT onto a DOMException — present
+   * ONLY in a module that can mint a DOMException (the emitter's static
+   * prescan), so assign's body is unchanged everywhere else. `isDomex`
+   * pushes i32: is the dyn box in local `dynLocal` the view of a
+   * DOMException (it may use `errLocal`, an errT-typed local, as
+   * scratch); `refuseKey` refuses by name — the same uncaught report as a
+   * direct member write — when the string in local `keyLocal` is one of
+   * the getter-only members (name, message, code), and does nothing
+   * otherwise. */
+  domexPut?: {
+    isDomex: (c: Code, dynLocal: number, errLocal: number) => void;
+    refuseKey: (c: Code, keyLocal: number) => void;
+  };
 }
 
 export class DynBuilder {
@@ -2246,6 +2274,18 @@ export class DynBuilder {
         c.call(this.errStr());
         c.return_();
         c.end();
+        const npRefuse = this.deps.nullProtoToStr;
+        if (npRefuse !== undefined) {
+          // A null-prototype object has no toString / valueOf to convert
+          // through: Node throws a TypeError here. The tier refuses by
+          // name instead of answering "[object Object]".
+          c.localGet(O);
+          c.structGet(this.objT(), OBJ_NULL_PROTO);
+          c.ifVoid();
+          npRefuse(c);
+          c.unreachable();
+          c.end();
+        }
         this.deps.lit(c, "[object Object]");
       });
       // Object.prototype.toString with the Promise @@toStringTag.
@@ -3773,7 +3813,11 @@ export class DynBuilder {
    * (a dyn array has no property table); nullish sources copy nothing
    * (Node skips them); an OBJ source copies its members directly, last
    * write winning; the index-keyed kinds ride the ENTRIES walk, so the
-   * copied key set is exactly what Object.keys answers for them. */
+   * copied key set is exactly what Object.keys answers for them. A
+   * DOMException target's getter-only members (name, message, code) are
+   * not written: in a module that can mint one, such a put refuses by
+   * name (board #198), as a direct member write does; every other key
+   * copies. */
   assign(): number {
     return this.cached("assign", [this.dynRef(), this.dynRef()], [this.dynRef()], (idx) => {
       const dynT = this.dynT();
@@ -3810,6 +3854,14 @@ export class DynBuilder {
       c.end();
       this.objPayload(c, (x) => x.localGet(0));
       c.localSet(O);
+      const dx = this.deps.domexPut;
+      const DX = 9;
+      const KS = 10;
+      const ER = 11;
+      if (dx !== undefined) {
+        dx.isDomex(c, 0, ER);
+        c.localSet(DX);
+      }
       c.localGet(1);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
@@ -3833,6 +3885,17 @@ export class DynBuilder {
         c.localGet(I);
         c.arrayGet(entries);
         c.localSet(E);
+        if (dx !== undefined) {
+          // Only an OBJ source can carry a non-index key; the index-keyed
+          // sources below never spell a getter-only member.
+          c.localGet(DX);
+          c.ifVoid();
+          c.localGet(E);
+          c.structGet(entryT, ENTRY_KEY);
+          c.localSet(KS);
+          dx.refuseKey(c, KS);
+          c.end();
+        }
         c.localGet(O);
         c.localGet(E);
         c.structGet(entryT, ENTRY_KEY);
@@ -3902,7 +3965,20 @@ export class DynBuilder {
       c.localGet(0);
       this.mb.setBody(
         idx,
-        [I32, this.objRef(), I32, I32, this.entryRef(), this.dynRef(), this.dynRef()],
+        dx !== undefined
+          ? [
+              I32,
+              this.objRef(),
+              I32,
+              I32,
+              this.entryRef(),
+              this.dynRef(),
+              this.dynRef(),
+              I32,
+              this.deps.strRef(),
+              { kind: "ref", nullable: true, typeIndex: this.deps.errT() },
+            ]
+          : [I32, this.objRef(), I32, I32, this.entryRef(), this.dynRef(), this.dynRef()],
         c.bytes(),
       );
     });
@@ -4254,6 +4330,251 @@ export class DynBuilder {
       this.emitIterSteps(c, OUT, K, null, L);
       this.boxArr(c, (x) => x.localGet(OUT));
       this.mb.setBody(idx, [I32, this.arrRef(), ...this.iterLocalTypes()], c.bytes());
+    });
+  }
+
+  /** %w.dyn.spreadPush(vec, src, what, iterPath) — one spread source
+   * FLATTENED onto an argument vector (INC-27 U5): the call-side
+   * `f(...xs)` and Object.assign's source pack both build through it.
+   * Arrays push element by element (a hole as undefined), strings by
+   * code POINT (a paired surrogate stays whole, a lone one is kept),
+   * bytes by element value. Every other kind throws V8's spread TypeError
+   * — and V8 has two families of text, chosen by the spread's SYNTACTIC
+   * position, which the caller passes as `iterPath`:
+   *   - 0, the single spread in the last argument position (V8's
+   *     optimized apply path): a nullish source spells the spread
+   *     expression, "<what> is not iterable (cannot read property
+   *     undefined|null)", and every other kind is "Spread syntax requires
+   *     ...iterable[Symbol.iterator] to be a function";
+   *   - 1, every other position (the iterator protocol runs): the value-
+   *     describing text iterFail already renders.
+   * C's scr_dyn_arr_push_spread and scr_dyn_pack_push_spread_iter, one
+   * for one. Leaves the TypeError in the cell; the caller checks. */
+  spreadPush(): number {
+    return this.cached("spreadPush", [this.arrRef(), this.dynRef(), this.deps.strRef(), I32], [], (idx) => {
+      const dynT = this.dynT();
+      const c = new Code();
+      const K = 4;
+      const A = 5;
+      const N = 6;
+      const I = 7;
+      const S = 8;
+      const CP = 9;
+      const AT = 10;
+      const E = 11;
+      const BR = 12;
+      const push = this.deps.arrPush();
+      c.localGet(1);
+      c.structGet(dynT, DYN_KIND);
+      c.localSet(K);
+      this.arm(c, K, [DK.ARR], () => {
+        this.arrPayload(c, (x) => x.localGet(1));
+        c.localSet(A);
+        this.arrLen(c, (x) => x.localGet(A));
+        c.localSet(N);
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(N);
+        c.i32GeU();
+        c.brIf(1);
+        c.localGet(0);
+        this.arrAt(c, (x) => x.localGet(A), (x) => x.localGet(I));
+        c.localTee(E);
+        c.refIsNull();
+        c.ifResult(this.dynRef());
+        c.globalGet(this.undefinedGlobal());
+        c.else_();
+        c.localGet(E);
+        c.end();
+        c.call(push);
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+      });
+      this.arm(c, K, [DK.STR], () => {
+        c.localGet(1);
+        c.structGet(dynT, DYN_REF);
+        c.refCast(this.deps.strType());
+        c.localTee(S);
+        c.arrayLen();
+        c.localSet(N);
+        c.i32Const(0);
+        c.localSet(AT);
+        c.block();
+        c.loop();
+        c.localGet(AT);
+        c.localGet(N);
+        c.i32GeU();
+        c.brIf(1);
+        c.localGet(S);
+        c.localGet(AT);
+        c.f64ConvertI32U();
+        c.call(this.deps.strCpAt());
+        c.localSet(CP);
+        c.localGet(AT);
+        c.localGet(CP);
+        c.arrayLen();
+        c.i32Add();
+        c.localSet(AT);
+        c.localGet(0);
+        this.boxStr(c, (x) => x.localGet(CP));
+        c.call(push);
+        c.br(0);
+        c.end();
+        c.end();
+      });
+      this.arm(c, K, [DK.BYTES], () => {
+        this.bytesPayloadBytes(c, (x) => x.localGet(1));
+        c.localSet(BR);
+        this.bytesLenI32(c, (x) => x.localGet(BR));
+        c.localSet(N);
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(N);
+        c.i32GeU();
+        c.brIf(1);
+        c.localGet(0);
+        this.boxNum(c, (x) => {
+          x.localGet(BR);
+          x.localGet(I);
+          x.f64ConvertI32U();
+          x.call(this.deps.bytesGet());
+        });
+        c.call(push);
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+      });
+      // Unconstructible on this tier (the header): no guess at them.
+      this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => c.unreachable());
+      this.arm(c, K, [DK.UNDEF, DK.NULL, DK.BOOL, DK.NUM, DK.OBJ, DK.FUNC, DK.PROMISE], () => {
+        c.localGet(3);
+        c.ifVoid();
+        c.localGet(1);
+        c.call(this.iterFail());
+        c.else_();
+        c.localGet(K);
+        c.i32Const(DK.UNDEF);
+        c.i32Eq();
+        c.localGet(K);
+        c.i32Const(DK.NULL);
+        c.i32Eq();
+        c.i32Or();
+        c.ifVoid();
+        this.deps.throwTypeError(c, (x) => {
+          x.localGet(2);
+          this.deps.lit(x, " is not iterable (cannot read property ");
+          x.call(this.deps.concat());
+          x.localGet(K);
+          x.i32Const(DK.UNDEF);
+          x.i32Eq();
+          x.ifResult(this.deps.strRef());
+          this.deps.lit(x, "undefined)");
+          x.else_();
+          this.deps.lit(x, "null)");
+          x.end();
+          x.call(this.deps.concat());
+        });
+        c.else_();
+        this.deps.throwTypeError(c, (x) => this.deps.lit(x, "Spread syntax requires ...iterable[Symbol.iterator] to be a function"));
+        c.end();
+        c.end();
+      });
+      c.unreachable();
+      this.mb.setBody(
+        idx,
+        [I32, this.arrRef(), I32, I32, this.deps.strRef(), this.deps.strRef(), I32, this.dynRef(), this.deps.bytesRefU8()],
+        c.bytes(),
+      );
+    });
+  }
+
+  /** %w.dyn.assignAll(target, pack) → target — variadic Object.assign
+   * over the already-flattened source pack (INC-27 U5; C's
+   * scr_dyn_assign_all): a nullish TARGET throws ToObject's TypeError
+   * before any source is looked at, then each source copies through
+   * `assign` left to right, and the TARGET itself answers (identity).
+   * Any target that is not a plain object — an array, a scalar, bytes, a
+   * function — refuses by name: `assign` would leave an array untouched
+   * and answer a scalar unwrapped where Node copies onto the array and
+   * wraps the scalar (board #193 keeps that answer for the two-argument
+   * form). The libCall is may-throw, so the refusal is a catchable Error
+   * at its site. Null with the error in the cell. */
+  assignAll(): number {
+    return this.cached("assignAll", [this.dynRef(), this.dynRef()], [this.dynRef()], (idx) => {
+      const dynT = this.dynT();
+      const c = new Code();
+      const K = 2;
+      const A = 3;
+      const N = 4;
+      const I = 5;
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.localTee(K);
+      c.i32Const(DK.UNDEF);
+      c.i32Eq();
+      c.localGet(K);
+      c.i32Const(DK.NULL);
+      c.i32Eq();
+      c.i32Or();
+      c.ifVoid();
+      this.pushToObjectFail(c);
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      c.localGet(K);
+      c.i32Const(DK.OBJ);
+      c.i32Ne();
+      c.ifVoid();
+      this.deps.throwError(c, "%Error", "Error", (x) =>
+        this.deps.lit(x, "Object.assign onto a non-plain-object target is not supported yet"),
+      );
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      this.arrPayload(c, (x) => x.localGet(1));
+      c.localSet(A);
+      this.arrLen(c, (x) => x.localGet(A));
+      c.localSet(N);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeU();
+      c.brIf(1);
+      c.localGet(0);
+      this.arrAt(c, (x) => x.localGet(A), (x) => x.localGet(I));
+      c.call(this.assign());
+      c.refIsNull();
+      c.ifVoid();
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(0);
+      this.mb.setBody(idx, [I32, this.arrRef(), I32, I32], c.bytes());
     });
   }
 
@@ -4701,6 +5022,7 @@ export class DynBuilder {
           });
         });
         c.end();
+        this.deps.fromErrorExtra?.(c, 0, O);
         this.boxObj(c, (x) => x.localGet(O));
         c.localSet(D);
         // Publish before answering, so the next crossing finds it.
@@ -4720,6 +5042,30 @@ export class DynBuilder {
           ],
           c.bytes(),
         );
+      },
+    );
+  }
+
+  /** %w.dyn.errCachePut(err, d) — enter one (error, box) pair at the head
+   * of the identity cache fromError and toError scan (INC-27 U5): the
+   * rebuilt error of an ALIEN `%error` object (the emitter's
+   * errFromDynHelper, C's scr_errdyn_put) so its next crossing answers
+   * the same box. */
+  errCachePut(): number {
+    return this.cached(
+      "errCachePut",
+      [{ kind: "ref", nullable: true, typeIndex: this.deps.errT() }, this.dynRef()],
+      [],
+      (idx) => {
+        const entryT = this.errDynT();
+        const head = this.errDynHead();
+        const c = new Code();
+        c.localGet(0);
+        c.localGet(1);
+        c.globalGet(head);
+        c.structNew(entryT);
+        c.globalSet(head);
+        this.mb.setBody(idx, [], c.bytes());
       },
     );
   }

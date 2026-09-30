@@ -1174,6 +1174,15 @@ const ERR_NAME = 1;
 const ERR_MESSAGE = 2;
 const ERR_CODE = 3;
 
+/** INC-27 U5: the named run-time refusal a null-prototype object meets at
+ * every ToString (String(), a template, `+` with a string, join, a
+ * computed key): Node throws a TypeError there ("Cannot convert object to
+ * primitive value"); the conversion sites cannot throw catchably on this
+ * tier, so the refusal is reported as uncaught and never answers
+ * "[object Object]". */
+const NULL_PROTO_TOSTR_REFUSAL =
+  "converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet";
+
 /** The canonical IEEE754 quiet NaN (0x7ff8000000000000), constructed
  * byte-exact from the literal hex rather than trusted from any
  * expression's OWN NaN bits — SEMANTICS.md S036: a NaN produced by real
@@ -1922,6 +1931,23 @@ class Assembler {
    * drainPendingHandled()). A listener-free module (this field false)
    * takes emitCheckpointCore's UNCHANGED, byte-identical code path. */
   private readonly needsListenerLoopTerm: boolean;
+  /** INC-27 U5: does any reachable function reach a libCall that can MINT
+   * a DOMException (the constructor and its clone, structuredClone and
+   * its transfer failure, atob/btoa)? A STATIC prescan fact, for the
+   * needsExitDrain reason: the arms it gates live in SHARED helpers that
+   * any construct may build first — fromError's numeric `code` and
+   * `cause` members, insp.error's DOMException header, the fieldSet
+   * check and the dyn member write's check — so a module that can never
+   * hold a DOMException keeps exactly the bytes it had before those arms
+   * existed. */
+  private readonly domexLive: boolean;
+  /** INC-27 U5: does any reachable function reach
+   * `dyn.objCreateNullProto`? The same kind of STATIC prescan fact as
+   * domexLive: it gates the null-prototype arms that live in SHARED
+   * paths — dyn toStr's named refusal, the caught-value ToString arm's
+   * routing to it, and the `.toString()` method's TypeError — so a module
+   * that can never build a null-prototype object keeps its bytes. */
+  private readonly nullProtoLive: boolean;
   /** `Date.now()`/`new Date()`'s wall clock reads this import and floors;
    * `performance.now()`'s ORIGIN — `now()` sampled ONCE at `_start`
    * entry, in a mutable f64 global, in any module that reaches
@@ -2071,6 +2097,15 @@ class Assembler {
     this.needsUnhandledRejectionDispatch = unhandledRejectionReachable(mod);
     this.needsRejectionHandledDispatch = rejectionHandledReachable(mod);
     this.needsListenerLoopTerm = this.needsUnhandledRejectionDispatch || this.needsRejectionHandledDispatch;
+    this.domexLive = this.libCallReachable(mod, [
+      "error.newDom",
+      "error.domClone",
+      "dyn.structuredClone",
+      "dyn.cloneTransferFail",
+      "str.atob",
+      "str.btoa",
+    ]);
+    this.nullProtoLive = this.libCallReachable(mod, ["dyn.objCreateNullProto"]);
     // INC-26 P3 (brief-p3-v2.md §3D, rev-26 CP1 pre-read D-3/E-1): force
     // `this.nextTick` (the GETTER, interning the queue NOW) in any module
     // that reaches `process.emitWarning`, BEFORE any function body is
@@ -2528,6 +2563,966 @@ class Assembler {
   /** A builtin error class's interval global — errT's `vt` operand. */
   private pushErrVt(className: string): void {
     this.fn.code.globalGet(this.classes.vtGlobal(className));
+  }
+
+  /* ── DOMException (INC-27 U5) ───────────────────────────────────────────
+   * The IR's %DOMException is %Error's shape (name, message, %code) and
+   * nothing more; Node's DOMException also answers a numeric legacy
+   * `code` and an optional `cause`. Neither widens the IR:
+   *
+   *  - `code` is DERIVED from the name on every read, the way Node's own
+   *    getter derives it (a legacy-name table, 0 off it) — so there is
+   *    nothing to store, and a DOMException minted anywhere (atob/btoa's
+   *    InvalidCharacterError included, board #187) answers it.
+   *  - `cause` lives in `class:domex`, a backend-private SUBTYPE of errT
+   *    that appends two immutable fields (presence, value). errT is an
+   *    OPEN struct and the frontend fences `extends DOMException`, so no
+   *    user layout can overlap them; every errT reader works on it as it
+   *    is. A DOMException minted as a plain errT (atob/btoa, the clone
+   *    failures) simply has no cause — the readers ask with ref.test.
+   *
+   * The instance carries %DOMException's vt, whose preorder position sits
+   * inside %Error's interval, so instanceof, String(), the catch-side
+   * class test and the uncaught report all see an Error. */
+
+  /** Does any reachable function reach a libCall named in `fns`? The
+   * same order-independent prescan shape as exitListenerSurfaceReachable,
+   * matched on the node's `fn` field rather than on any string. */
+  private libCallReachable(mod: WModule, fns: readonly string[]): boolean {
+    const want = new Set<string>(fns);
+    const reachable = reachableFunctionNames(mod);
+    let found = false;
+    const scan = (node: unknown): void => {
+      if (found || node === null || typeof node !== "object") return;
+      if (Array.isArray(node)) {
+        for (const item of node) scan(item);
+        return;
+      }
+      const rec = node as Record<string, unknown>;
+      if (rec["kind"] === "libCall" && typeof rec["fn"] === "string" && want.has(rec["fn"])) {
+        found = true;
+        return;
+      }
+      for (const value of Object.values(rec)) scan(value);
+    };
+    for (const fn of mod.functions) {
+      if (reachable.has(fn.name)) scan(fn.body);
+    }
+    return found;
+  }
+
+  private domexType: number | null = null;
+
+  /** `class:domex` — errT's four fields, then `hasCause` (i32, the
+   * PRESENCE of the options bag's own `cause` member: an explicit
+   * `cause: undefined` counts) and `cause` (the value, the undefined
+   * singleton when absent). Both immutable: Node's `cause` is fixed at
+   * construction. Field indices 4 and 5. */
+  private domexT(): number {
+    if (this.domexType !== null) return this.domexType;
+    const exc = this.exc();
+    this.domexType = this.mb.subStructType(
+      "class:domex",
+      [...exc.errFields, { storage: I32, mutable: false }, { storage: this.dyn.dynRef(), mutable: false }],
+      exc.errT,
+    );
+    return this.domexType;
+  }
+
+  private domexCodeFunc: number | null = null;
+
+  /** %w.domex.code(name) → f64 — Node's legacy DOMException code table,
+   * transcribed from a measured Node v24 run over every legacy name
+   * (exact and case-sensitive; DOMStringSizeError, NoDataAllowedError and
+   * ValidationError are 0 there, as is every non-legacy name). */
+  private domexCodeHelper(): number {
+    if (this.domexCodeFunc !== null) return this.domexCodeFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.strRef], [F64]), "%w.domex.code");
+    this.domexCodeFunc = idx;
+    const table: [string, number][] = [
+      ["IndexSizeError", 1],
+      ["HierarchyRequestError", 3],
+      ["WrongDocumentError", 4],
+      ["InvalidCharacterError", 5],
+      ["NoModificationAllowedError", 7],
+      ["NotFoundError", 8],
+      ["NotSupportedError", 9],
+      ["InUseAttributeError", 10],
+      ["InvalidStateError", 11],
+      ["SyntaxError", 12],
+      ["InvalidModificationError", 13],
+      ["NamespaceError", 14],
+      ["InvalidAccessError", 15],
+      ["TypeMismatchError", 17],
+      ["SecurityError", 18],
+      ["NetworkError", 19],
+      ["AbortError", 20],
+      ["URLMismatchError", 21],
+      ["QuotaExceededError", 22],
+      ["TimeoutError", 23],
+      ["InvalidNodeTypeError", 24],
+      ["DataCloneError", 25],
+    ];
+    const c = new Code();
+    c.localGet(0);
+    c.refIsNull();
+    c.ifVoid();
+    c.f64Const(0);
+    c.return_();
+    c.end();
+    for (const [name, code] of table) {
+      c.localGet(0);
+      this.pushStrLitInto(c, name);
+      c.call(this.strEqHelper());
+      c.ifVoid();
+      c.f64Const(code);
+      c.return_();
+      c.end();
+    }
+    c.f64Const(0);
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  private domexInspHeadFunc: number | null = null;
+
+  /** %w.domex.inspHead(name) → the header util.inspect prints inside a
+   * DOMException's stackless bracket (SEMANTICS.md S027's form), Node's
+   * improveStack rule against the constructor name "DOMException",
+   * measured branch by branch: a name ending in "Error" (legacy or not,
+   * the default "Error" included) is `DOMException [<name>]`; the name
+   * "DOMException" is itself; any other name ("Whatever", "Abort", the
+   * options form's "undefined") stands alone. */
+  private domexInspHeadHelper(): number {
+    if (this.domexInspHeadFunc !== null) return this.domexInspHeadFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.strRef], [this.strRef]), "%w.domex.inspHead");
+    this.domexInspHeadFunc = idx;
+    const c = new Code();
+    const N = 1;
+    c.localGet(0);
+    this.pushStrLitInto(c, "DOMException");
+    c.call(this.strEqHelper());
+    c.ifVoid();
+    c.localGet(0);
+    c.return_();
+    c.end();
+    c.localGet(0);
+    c.arrayLen();
+    c.localSet(N);
+    // endsWith("Error"): the length first, then the five units — nested,
+    // because the unit reads must not run on a shorter string.
+    c.localGet(N);
+    c.i32Const(5);
+    c.i32GeU();
+    c.ifVoid();
+    const tail = "Error";
+    for (let k = 0; k < 5; k++) {
+      c.localGet(0);
+      c.localGet(N);
+      c.i32Const(5 - k);
+      c.i32Sub();
+      c.arrayGetU(this.strType);
+      c.i32Const(tail.charCodeAt(k));
+      c.i32Eq();
+      if (k > 0) c.i32And();
+    }
+    c.ifVoid();
+    this.pushStrLitInto(c, "DOMException [");
+    c.localGet(0);
+    c.call(this.concatHelper());
+    this.pushStrLitInto(c, "]");
+    c.call(this.concatHelper());
+    c.return_();
+    c.end();
+    c.end();
+    c.localGet(0);
+    this.mb.setBody(idx, [I32], c.bytes());
+    return idx;
+  }
+
+  private domexNewFunc: number | null = null;
+
+  /** %w.domex.new(message, nameOrOptions) → a fresh `class:domex` —
+   * `new DOMException(message?, nameOrOptions?)` with Node's argument
+   * rules, measured: an undefined message is "" and anything else is its
+   * ToString; an undefined second argument names it "Error"; an object
+   * second argument is the OPTIONS form — the name is ToString of its own
+   * `name` member, and the STRING "undefined" when that member is absent
+   * (Node v24), while `cause` records presence and value; arrays, byte
+   * arrays and promises are objects too, with no such members; any other
+   * value is ToString'd into the name. Never throws. */
+  private domexNewHelper(): number {
+    if (this.domexNewFunc !== null) return this.domexNewFunc;
+    const dyn = this.dyn;
+    const dynT = dyn.dynT();
+    const dynRef = dyn.dynRef();
+    const exc = this.exc();
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: exc.errT };
+    const idx = this.mb.declareFunc(this.mb.funcType([dynRef, dynRef], [errRef]), "%w.domex.new");
+    this.domexNewFunc = idx;
+    const domexT = this.domexT();
+    const c = new Code();
+    const K = 2;
+    const NAME = 3;
+    const MSG = 4;
+    const HC = 5;
+    const CAUSE = 6;
+    const O = 7;
+    const V = 8;
+    // The message.
+    c.localGet(0);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.UNDEF);
+    c.i32Eq();
+    c.ifResult(this.strRef);
+    this.pushStrLitInto(c, "");
+    c.else_();
+    c.localGet(0);
+    c.call(dyn.toStr());
+    c.end();
+    c.localSet(MSG);
+    // No cause unless the options form supplies one.
+    c.globalGet(dyn.undefinedGlobal());
+    c.localSet(CAUSE);
+    c.i32Const(0);
+    c.localSet(HC);
+    c.localGet(1);
+    c.structGet(dynT, DYN_KIND);
+    c.localSet(K);
+    c.localGet(K);
+    c.i32Const(DK.UNDEF);
+    c.i32Eq();
+    c.ifVoid();
+    this.pushStrLitInto(c, "Error");
+    c.localSet(NAME);
+    c.else_();
+    c.localGet(K);
+    c.i32Const(DK.OBJ);
+    c.i32Eq();
+    c.ifVoid();
+    dyn.objPayload(c, (x) => x.localGet(1));
+    c.localSet(O);
+    c.localGet(O);
+    this.pushStrLitInto(c, "name");
+    c.call(dyn.objGet());
+    c.localTee(V);
+    c.refIsNull();
+    c.ifResult(this.strRef);
+    this.pushStrLitInto(c, "undefined");
+    c.else_();
+    c.localGet(V);
+    c.call(dyn.toStr());
+    c.end();
+    c.localSet(NAME);
+    c.localGet(O);
+    this.pushStrLitInto(c, "cause");
+    c.call(dyn.objGet());
+    c.localTee(V);
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    c.i32Const(1);
+    c.localSet(HC);
+    c.localGet(V);
+    c.localSet(CAUSE);
+    c.end();
+    c.else_();
+    // Arrays, byte arrays and promises are objects: the options form,
+    // with neither member.
+    c.localGet(K);
+    c.i32Const(DK.ARR);
+    c.i32Eq();
+    c.localGet(K);
+    c.i32Const(DK.BYTES);
+    c.i32Eq();
+    c.i32Or();
+    c.localGet(K);
+    c.i32Const(DK.PROMISE);
+    c.i32Eq();
+    c.i32Or();
+    c.ifResult(this.strRef);
+    this.pushStrLitInto(c, "undefined");
+    c.else_();
+    c.localGet(1);
+    c.call(dyn.toStr());
+    c.end();
+    c.localSet(NAME);
+    c.end();
+    c.end();
+    c.globalGet(this.classes.vtGlobal("%DOMException"));
+    c.localGet(NAME);
+    c.localGet(MSG);
+    c.refNull(this.strType);
+    c.localGet(HC);
+    c.localGet(CAUSE);
+    c.structNew(domexT);
+    this.mb.setBody(
+      idx,
+      [I32, this.strRef, this.strRef, I32, dynRef, dyn.objRef(), dynRef],
+      c.bytes(),
+    );
+    return idx;
+  }
+
+  /** Push i32: is the errT in local `slot` (of Code `c`) a DOMException —
+   * its vt's preorder position equal to %DOMException's? The class has
+   * no subclasses (the frontend fences `extends DOMException`), so an
+   * equality is the whole interval. */
+  private emitIsDomexInto(c: Code, slot: number): void {
+    const meta = this.classes.meta("%DOMException");
+    if (meta === undefined) throw new Error("wasm emitter bug: %DOMException has no class metadata");
+    c.localGet(slot);
+    c.structGet(this.exc().errT, 0);
+    c.structGet(this.classes.ci(), CI_PRE);
+    c.i32Const(meta.pre);
+    c.i32Eq();
+  }
+
+  /** A DOMException's getter-only member written through a dynamic value
+   * (INC-27 U5, board #198): when the string in local `keyLocal` is
+   * "name", "message" or "code", fill the cell with the named refusal and
+   * report it as uncaught — the text the typed member write uses; any
+   * other key falls through untouched. */
+  private emitDomexMemberRefusalInto(c: Code, keyLocal: number): void {
+    for (const field of ["name", "message", "code"]) {
+      c.localGet(keyLocal);
+      this.pushStrLitInto(c, field);
+      c.call(this.strEqHelper());
+      c.ifVoid();
+      this.emitSetCellError(
+        c,
+        "%Error",
+        "Error",
+        (x) => this.pushStrLitInto(x, `writing a DOMException's ${field} is not supported yet (Node's ${field} is getter-only)`),
+        null,
+      );
+      c.call(this.reportUncaughtHelper());
+      c.end();
+    }
+  }
+
+  /** Push i32: does the errT in local `slot` carry a DOMException cause?
+   * (A plain-errT DOMException never does.) */
+  private emitDomexHasCauseInto(c: Code, slot: number): void {
+    const domexT = this.domexT();
+    c.localGet(slot);
+    c.refTest(domexT);
+    c.ifResult(I32);
+    c.localGet(slot);
+    c.refCast(domexT);
+    c.structGet(domexT, 4);
+    c.else_();
+    c.i32Const(0);
+    c.end();
+  }
+
+  /** Push the DOMException cause of the errT in local `slot` — the
+   * undefined singleton when there is none. */
+  private emitDomexCauseInto(c: Code, slot: number): void {
+    const domexT = this.domexT();
+    c.localGet(slot);
+    c.refTest(domexT);
+    c.ifResult(this.dyn.dynRef());
+    c.localGet(slot);
+    c.refCast(domexT);
+    c.structGet(domexT, 5);
+    c.else_();
+    c.globalGet(this.dyn.undefinedGlobal());
+    c.end();
+  }
+
+  private errFromDynFunc: number | null = null;
+
+  /** %w.err.fromDyn(d) → the Error a dyn `%error` object stands for —
+   * `scr_error_from_dyn` ported, the extraction half of fromError. A box
+   * that came from a real error answers THAT instance (the shared
+   * identity cache, so an error crossing out and back compares `===`); an
+   * ALIEN `%error` object (one a program spelled itself — S025) rebuilds
+   * an error from its name/message/code, the class chosen by the name as
+   * C chooses it, and ENTERS the cache so its next crossing answers the
+   * same box. The caller has already confirmed an OBJ carrying the
+   * marker. */
+  private errFromDynHelper(): number {
+    if (this.errFromDynFunc !== null) return this.errFromDynFunc;
+    const dyn = this.dyn;
+    const dynT = dyn.dynT();
+    const exc = this.exc();
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: exc.errT };
+    const idx = this.mb.declareFunc(this.mb.funcType([dyn.dynRef()], [errRef]), "%w.err.fromDyn");
+    this.errFromDynFunc = idx;
+    const c = new Code();
+    const E = 1;
+    const O = 2;
+    const N = 3;
+    const M = 4;
+    const CD = 5;
+    const V = 6;
+    c.localGet(0);
+    c.call(dyn.toError());
+    c.localTee(E);
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    c.localGet(E);
+    c.return_();
+    c.end();
+    dyn.objPayload(c, (x) => x.localGet(0));
+    c.localSet(O);
+    // A member reads as a string only when it IS one (C's kind tests).
+    const strMember = (key: string, into: number): void => {
+      c.localGet(O);
+      this.pushStrLitInto(c, key);
+      c.call(dyn.objGet());
+      c.localTee(V);
+      c.refIsNull();
+      c.ifResult(I32);
+      c.i32Const(0);
+      c.else_();
+      c.localGet(V);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.STR);
+      c.i32Eq();
+      c.end();
+      c.ifResult(this.strRef);
+      c.localGet(V);
+      c.structGet(dynT, DYN_REF);
+      c.refCast(this.strType);
+      c.else_();
+      c.refNull(this.strType);
+      c.end();
+      c.localSet(into);
+    };
+    strMember("name", N);
+    strMember("message", M);
+    strMember("code", CD);
+    // The class by name, then the builtin default name for a nameless one.
+    const build = (className: string, lib: string): void => {
+      c.globalGet(this.classes.vtGlobal(className));
+      c.localGet(N);
+      c.refIsNull();
+      c.ifResult(this.strRef);
+      this.pushStrLitInto(c, lib);
+      c.else_();
+      c.localGet(N);
+      c.end();
+      c.localGet(M);
+      c.refIsNull();
+      c.ifResult(this.strRef);
+      this.pushStrLitInto(c, "");
+      c.else_();
+      c.localGet(M);
+      c.end();
+      c.localGet(CD);
+      c.structNew(exc.errT);
+      c.localSet(E);
+    };
+    const named = (lib: string): void => {
+      c.localGet(N);
+      c.refIsNull();
+      c.ifResult(I32);
+      c.i32Const(0);
+      c.else_();
+      c.localGet(N);
+      this.pushStrLitInto(c, lib);
+      c.call(this.strEqHelper());
+      c.end();
+    };
+    named("TypeError");
+    c.ifVoid();
+    build("%TypeError", "TypeError");
+    c.else_();
+    named("RangeError");
+    c.ifVoid();
+    build("%RangeError", "RangeError");
+    c.else_();
+    named("SyntaxError");
+    c.ifVoid();
+    build("%SyntaxError", "SyntaxError");
+    c.else_();
+    build("%Error", "Error");
+    c.end();
+    c.end();
+    c.end();
+    c.localGet(E);
+    c.localGet(0);
+    c.call(dyn.errCachePut());
+    c.localGet(E);
+    this.mb.setBody(
+      idx,
+      [errRef, dyn.objRef(), this.strRef, this.strRef, this.strRef, dyn.dynRef()],
+      c.bytes(),
+    );
+    return idx;
+  }
+
+  /* ── structuredClone over the dynamic tree (INC-27 U5) ─────────────────
+   * Node's structured clone for the value kinds a dyn value can hold:
+   * primitives as themselves (a dyn box is immutable, so sharing one is
+   * unobservable, -0 included); arrays and objects DEEP, through a memo
+   * keyed by the source payload's identity, so a shared child stays shared
+   * and a cycle clones as a cycle, exactly as Node does; a null-prototype
+   * object becomes an ordinary one; bytes as a fresh copy whose Buffer
+   * flag drops (Node's clone of a Buffer is a plain Uint8Array); an error
+   * the program built (one in the error identity cache) as a FRESH error
+   * of the class its name selects, name and message copied, `code` and
+   * `cause` not; a DOMException as a fresh DOMException. A promise throws
+   * Node's DataCloneError; a function is a named refusal (Node's message
+   * embeds the function's source text, which a compiled program does not
+   * keep). The option validation is shared with a typed DOMException's
+   * clone and throws Node's texts. The memo is a pair of vectors scanned
+   * linearly — quadratic in the number of distinct objects, which the
+   * value trees this tier builds keep small. */
+
+  private scValidateFunc: number | null = null;
+
+  /** %w.sc.validate(options) — Node's option checks, in its order:
+   * undefined/null → none; a primitive → the dictionary TypeError; an
+   * object's `transfer` member absent/undefined → none; not an array → the
+   * sequence TypeError; a member that is not an object → the indexed
+   * TypeError; otherwise a non-empty list → DataCloneError (nothing this
+   * tier holds is transferable). Leaves the error in the cell. */
+  private scValidateHelper(): number {
+    if (this.scValidateFunc !== null) return this.scValidateFunc;
+    const dyn = this.dyn;
+    const dynT = dyn.dynT();
+    const idx = this.mb.declareFunc(this.mb.funcType([dyn.dynRef()], []), "%w.sc.validate");
+    this.scValidateFunc = idx;
+    const c = new Code();
+    const K = 1;
+    const T = 2;
+    const A = 3;
+    const N = 4;
+    const I = 5;
+    const X = 6;
+    const typeErr = (push: (x: Code) => void): void => {
+      this.emitSetCellError(c, "%TypeError", "TypeError", push, "ERR_INVALID_ARG_TYPE");
+      c.return_();
+    };
+    c.localGet(0);
+    c.structGet(dynT, DYN_KIND);
+    c.localTee(K);
+    c.i32Const(DK.UNDEF);
+    c.i32Eq();
+    c.localGet(K);
+    c.i32Const(DK.NULL);
+    c.i32Eq();
+    c.i32Or();
+    c.ifVoid();
+    c.return_();
+    c.end();
+    c.localGet(K);
+    c.i32Const(DK.BOOL);
+    c.i32Eq();
+    c.localGet(K);
+    c.i32Const(DK.NUM);
+    c.i32Eq();
+    c.i32Or();
+    c.localGet(K);
+    c.i32Const(DK.STR);
+    c.i32Eq();
+    c.i32Or();
+    c.ifVoid();
+    typeErr((x) => this.pushStrLitInto(x, "Failed to execute 'structuredClone': Options cannot be converted to a dictionary"));
+    c.end();
+    // Any other object is a dictionary; only a plain object can carry a
+    // `transfer` member on this tier.
+    c.localGet(K);
+    c.i32Const(DK.OBJ);
+    c.i32Ne();
+    c.ifVoid();
+    c.return_();
+    c.end();
+    dyn.objPayload(c, (x) => x.localGet(0));
+    this.pushStrLitInto(c, "transfer");
+    c.call(dyn.objGet());
+    c.localTee(T);
+    c.refIsNull();
+    c.ifVoid();
+    c.return_();
+    c.end();
+    c.localGet(T);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.UNDEF);
+    c.i32Eq();
+    c.ifVoid();
+    c.return_();
+    c.end();
+    c.localGet(T);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.ARR);
+    c.i32Ne();
+    c.ifVoid();
+    typeErr((x) => this.pushStrLitInto(x, "Failed to execute 'structuredClone': transfer in Options cannot be converted to sequence."));
+    c.end();
+    dyn.arrPayload(c, (x) => x.localGet(T));
+    c.localSet(A);
+    dyn.arrLen(c, (x) => x.localGet(A));
+    c.localTee(N);
+    c.i32Eqz();
+    c.ifVoid();
+    c.return_();
+    c.end();
+    c.i32Const(0);
+    c.localSet(I);
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.localGet(N);
+    c.i32GeU();
+    c.brIf(1);
+    dyn.arrAt(c, (x) => x.localGet(A), (x) => x.localGet(I));
+    c.localTee(X);
+    c.refIsNull();
+    c.ifResult(I32);
+    c.i32Const(0);
+    c.else_();
+    this.emitDynIsObjectInto(c, X);
+    c.end();
+    c.i32Eqz();
+    c.ifVoid();
+    typeErr((x) => {
+      this.pushStrLitInto(x, "Failed to execute 'structuredClone': transfer in Options[");
+      x.localGet(I);
+      x.f64ConvertI32U();
+      x.call(this.f64ToStrHelper());
+      x.call(this.concatHelper());
+      this.pushStrLitInto(x, "] is not an object.");
+      x.call(this.concatHelper());
+    });
+    c.end();
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+    this.emitSetCellError(c, "%DOMException", "DataCloneError", (x) => this.pushStrLitInto(x, "Found invalid value in transferList."), null);
+    this.mb.setBody(idx, [I32, dyn.dynRef(), dyn.arrRef(), I32, I32, dyn.dynRef()], c.bytes());
+    return idx;
+  }
+
+  /** Push i32: is the dyn box in local `slot` a JS OBJECT (WebIDL's
+   * `object` type — anything but a primitive)? */
+  private emitDynIsObjectInto(c: Code, slot: number): void {
+    const dynT = this.dyn.dynT();
+    const kinds = [DK.OBJ, DK.ARR, DK.FUNC, DK.BYTES, DK.PROMISE];
+    kinds.forEach((k, i) => {
+      c.localGet(slot);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(k);
+      c.i32Eq();
+      if (i > 0) c.i32Or();
+    });
+  }
+
+  private scErrCloneFunc: number | null = null;
+
+  /** %w.sc.errClone(err) → a boxed FRESH error standing for Node's clone
+   * of `err`: a DOMException keeps its name and message (its legacy code
+   * re-derives from the name; its cause does not serialize); any other
+   * error becomes an instance of the class its NAME selects — TypeError,
+   * RangeError and SyntaxError have classes here, EvalError,
+   * ReferenceError and URIError keep their name on the base class, and
+   * every other name reads "Error" — with the message copied and no
+   * `code`. Boxed through fromError, so the clone enters the identity
+   * cache and answers instanceof. */
+  private scErrCloneHelper(): number {
+    if (this.scErrCloneFunc !== null) return this.scErrCloneFunc;
+    const dyn = this.dyn;
+    const exc = this.exc();
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: exc.errT };
+    const idx = this.mb.declareFunc(this.mb.funcType([errRef], [dyn.dynRef()]), "%w.sc.errClone");
+    this.scErrCloneFunc = idx;
+    const c = new Code();
+    const N = 1;
+    const R = 2;
+    const build = (className: string, pushName: () => void): void => {
+      c.globalGet(this.classes.vtGlobal(className));
+      pushName();
+      c.localGet(0);
+      c.structGet(exc.errT, ERR_MESSAGE);
+      c.refNull(this.strType);
+      c.structNew(exc.errT);
+      c.localSet(R);
+    };
+    const nameIs = (lib: string): void => {
+      c.localGet(N);
+      this.pushStrLitInto(c, lib);
+      c.call(this.strEqHelper());
+    };
+    c.localGet(0);
+    c.structGet(exc.errT, ERR_NAME);
+    c.localSet(N);
+    this.emitIsDomexInto(c, 0);
+    c.ifVoid();
+    build("%DOMException", () => c.localGet(N));
+    c.else_();
+    nameIs("TypeError");
+    c.ifVoid();
+    build("%TypeError", () => this.pushStrLitInto(c, "TypeError"));
+    c.else_();
+    nameIs("RangeError");
+    c.ifVoid();
+    build("%RangeError", () => this.pushStrLitInto(c, "RangeError"));
+    c.else_();
+    nameIs("SyntaxError");
+    c.ifVoid();
+    build("%SyntaxError", () => this.pushStrLitInto(c, "SyntaxError"));
+    c.else_();
+    nameIs("EvalError");
+    nameIs("ReferenceError");
+    c.i32Or();
+    nameIs("URIError");
+    c.i32Or();
+    c.ifVoid();
+    build("%Error", () => c.localGet(N));
+    c.else_();
+    build("%Error", () => this.pushStrLitInto(c, "Error"));
+    c.end();
+    c.end();
+    c.end();
+    c.end();
+    c.end();
+    c.localGet(R);
+    c.call(dyn.fromError());
+    this.mb.setBody(idx, [this.strRef, errRef], c.bytes());
+    return idx;
+  }
+
+  private scCloneFunc: number | null = null;
+
+  /** %w.sc.clone(v, memoSrc, memoDst) → the clone of `v`, or NULL with
+   * the error in the cell. Recursive; the memo pairs every source array /
+   * object payload already visited with the box its clone answers, and a
+   * clone enters the memo BEFORE its children are walked, which is what
+   * lets a cycle close on itself. */
+  private scCloneHelper(): number {
+    if (this.scCloneFunc !== null) return this.scCloneFunc;
+    const dyn = this.dyn;
+    const dynT = dyn.dynT();
+    const exc = this.exc();
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: exc.errT };
+    const arrRef = dyn.arrRef();
+    const idx = this.mb.declareFunc(this.mb.funcType([dyn.dynRef(), arrRef, arrRef], [dyn.dynRef()]), "%w.sc.clone");
+    this.scCloneFunc = idx;
+    const c = new Code();
+    const K = 3;
+    const I = 4;
+    const N = 5;
+    const R = 6;
+    const E = 7;
+    const O = 8;
+    const SO = 9;
+    const EN = 10;
+    const V = 11;
+    const A = 12;
+    const SA = 13;
+    const push = this.vecs.pushOne(this.dynVecInfo());
+    const ret = (): void => c.return_();
+    c.localGet(0);
+    c.structGet(dynT, DYN_KIND);
+    c.localSet(K);
+    const kindIn = (kinds: number[]): void => {
+      kinds.forEach((k, i) => {
+        c.localGet(K);
+        c.i32Const(k);
+        c.i32Eq();
+        if (i > 0) c.i32Or();
+      });
+    };
+    kindIn([DK.UNDEF, DK.NULL, DK.BOOL, DK.NUM, DK.STR]);
+    c.ifVoid();
+    c.localGet(0);
+    ret();
+    c.end();
+    kindIn([DK.BYTES]);
+    c.ifVoid();
+    dyn.boxBytes(c, (x) =>
+      dyn.pushNewBytesPayload(
+        x,
+        (y) => {
+          dyn.bytesPayloadBytes(y, (z) => z.localGet(0));
+          y.f64Const(0);
+          dyn.bytesPayloadBytes(y, (z) => z.localGet(0));
+          y.call(this.bytesB.length());
+          y.call(this.bytesB.sliceHelper("u8"));
+        },
+        (y) => y.i32Const(0),
+      ),
+    );
+    ret();
+    c.end();
+    kindIn([DK.PROMISE]);
+    c.ifVoid();
+    this.emitSetCellError(c, "%DOMException", "DataCloneError", (x) => this.pushStrLitInto(x, "#<Promise> could not be cloned."), null);
+    c.refNull(dynT);
+    ret();
+    c.end();
+    kindIn([DK.FUNC]);
+    c.ifVoid();
+    this.emitSetCellError(c, "%Error", "Error", (x) => this.pushStrLitInto(x, "structuredClone of a function value is not supported yet"), null);
+    c.refNull(dynT);
+    ret();
+    c.end();
+    // HANDLE and JSVAL are unconstructible on this tier (dyn.ts header).
+    kindIn([DK.HANDLE, DK.JSVAL]);
+    c.ifVoid();
+    c.unreachable();
+    c.end();
+    // ARR or OBJ: the memo first.
+    dyn.arrLen(c, (x) => x.localGet(1));
+    c.localSet(N);
+    c.i32Const(0);
+    c.localSet(I);
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.localGet(N);
+    c.i32GeU();
+    c.brIf(1);
+    dyn.arrAt(c, (x) => x.localGet(1), (x) => x.localGet(I));
+    c.structGet(dynT, DYN_REF);
+    c.localGet(0);
+    c.structGet(dynT, DYN_REF);
+    c.refEq();
+    c.ifVoid();
+    dyn.arrAt(c, (x) => x.localGet(2), (x) => x.localGet(I));
+    ret();
+    c.end();
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+    const remember = (): void => {
+      c.localGet(1);
+      c.localGet(0);
+      c.call(push);
+      c.localGet(2);
+      c.localGet(R);
+      c.call(push);
+    };
+    kindIn([DK.OBJ]);
+    c.ifVoid();
+    c.localGet(0);
+    c.call(dyn.toError());
+    c.localTee(E);
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    c.localGet(E);
+    c.call(this.scErrCloneHelper());
+    c.localSet(R);
+    remember();
+    c.localGet(R);
+    ret();
+    c.end();
+    dyn.pushNewObj(c, false);
+    c.localSet(O);
+    dyn.boxObj(c, (x) => x.localGet(O));
+    c.localSet(R);
+    remember();
+    dyn.objPayload(c, (x) => x.localGet(0));
+    c.localTee(SO);
+    c.structGet(dyn.objT(), OBJ_LEN);
+    c.localSet(N);
+    c.i32Const(0);
+    c.localSet(I);
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.localGet(N);
+    c.i32GeU();
+    c.brIf(1);
+    c.localGet(SO);
+    c.structGet(dyn.objT(), OBJ_ENTRIES);
+    c.localGet(I);
+    c.arrayGet(dyn.entriesArrayType());
+    c.localSet(EN);
+    c.localGet(EN);
+    c.structGet(dyn.entryT(), ENTRY_VALUE);
+    c.localGet(1);
+    c.localGet(2);
+    c.call(idx);
+    c.localTee(V);
+    c.refIsNull();
+    c.ifVoid();
+    c.refNull(dynT);
+    ret();
+    c.end();
+    c.localGet(O);
+    c.localGet(EN);
+    c.structGet(dyn.entryT(), ENTRY_KEY);
+    c.localGet(V);
+    c.call(dyn.objPut());
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+    c.localGet(R);
+    ret();
+    c.end();
+    // ARR.
+    dyn.pushNewArr(c);
+    c.localSet(A);
+    dyn.boxArr(c, (x) => x.localGet(A));
+    c.localSet(R);
+    remember();
+    dyn.arrPayload(c, (x) => x.localGet(0));
+    c.localSet(SA);
+    dyn.arrLen(c, (x) => x.localGet(SA));
+    c.localSet(N);
+    c.i32Const(0);
+    c.localSet(I);
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.localGet(N);
+    c.i32GeU();
+    c.brIf(1);
+    dyn.arrAt(c, (x) => x.localGet(SA), (x) => x.localGet(I));
+    c.localTee(V);
+    c.refIsNull();
+    c.ifVoid();
+    // An absent slot stays absent.
+    c.localGet(A);
+    c.refNull(dynT);
+    c.call(push);
+    c.else_();
+    c.localGet(V);
+    c.localGet(1);
+    c.localGet(2);
+    c.call(idx);
+    c.localTee(V);
+    c.refIsNull();
+    c.ifVoid();
+    c.refNull(dynT);
+    ret();
+    c.end();
+    c.localGet(A);
+    c.localGet(V);
+    c.call(push);
+    c.end();
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+    c.localGet(R);
+    this.mb.setBody(
+      idx,
+      [I32, I32, I32, dyn.dynRef(), errRef, dyn.objRef(), dyn.objRef(), dyn.entryRef(), dyn.dynRef(), arrRef, arrRef],
+      c.bytes(),
+    );
+    return idx;
   }
 
   /** Evaluate a thrown value and fill the cell from its STATIC type —
@@ -4420,12 +5415,21 @@ class Assembler {
    * before the steady-state loop begins; every later checkpoint (isFirst
    * false) drains ticks first, plain.
    *
-   * The root check comes AFTER the ledger report, where scr_loop_run puts
-   * it FIRST. Both orders reach the same observable: the two verdicts are
-   * the same exit 1 at the same point in the same checkpoint, over the
-   * same stdout, and the stderr line they disagree about is not compared
-   * on a nonzero exit (S007's surviving half, S010's root paragraph). A
-   * program with no module root emits exactly what it did before this
+   * THE ROOT CHECK FOLLOWS EVERY MICROTASK DRAIN (board #196, INC-27 U5).
+   * In Node a rejected top-level-await module is fatal through the
+   * loader's own reaction to its evaluation promise: whatever was already
+   * queued ahead of that reaction in the microtask FIFO still runs, and
+   * then the process dies — no nextTick, no unhandledRejection or
+   * rejectionHandled dispatch, and no later checkpoint's work runs after
+   * it (measured over the failure-order rows of wasm-dynsmalls-u5.test.ts).
+   * The tier cannot see the loader's reaction as a job of its own, so it
+   * approximates it by checking the root after each FULL drain: exact when
+   * nothing else is queued behind the failure, and otherwise it also runs
+   * the rest of the queued microtasks where Node stops a few jobs in —
+   * board #197, a pre-existing difference on every lane. The check used to
+   * come after the ledger report, which ran a listener for an unrelated
+   * rejection (and the pending ticks) before the module's own failure.
+   * A program with no module root emits exactly what it did before this
    * existed — the check is three instructions that only appear with one. */
   /** Board #139 (INC-26 B1, design-139-v2): emitCheckpointCore's own
    * cross-call INVOKED accumulator for the fixed-point loop term — a
@@ -4460,10 +5464,12 @@ class Assembler {
       if (!this.needsListenerLoopTerm) {
         // UNCHANGED from before this pass — byte-identical for a
         // listener-free hasProms module (design-139-v2 §C).
+        // That holds only without a module root: a top-level-await root
+        // now checks right after the drain (board #196, the header above).
         c.call(this.proms.drain());
+        this.emitRootCheck(c);
         if (this.needsRejectionHandledDispatch) c.call(this.proms.drainPendingHandled());
         c.call(this.proms.report());
-        this.emitRootCheck(c);
         return;
       }
       // Board #139: the no-ticks branch becomes a fixed-point loop on
@@ -4474,6 +5480,7 @@ class Assembler {
       // microtasks → handled-dispatch → report (P1-R5).
       c.loop();
       c.call(this.proms.drain());
+      this.emitRootCheck(c);
       c.i32Const(0);
       c.globalSet(this.invokedFlagGlobal());
       if (this.needsRejectionHandledDispatch) {
@@ -4489,17 +5496,24 @@ class Assembler {
       c.globalGet(this.invokedFlagGlobal());
       c.brIf(0);
       c.end();
-      this.emitRootCheck(c);
       return;
     }
-    if (isFirst && hasProms) c.call(this.proms.drain());
+    if (isFirst && hasProms) {
+      c.call(this.proms.drain());
+      this.emitRootCheck(c);
+    }
     if (!this.needsListenerLoopTerm) {
       // UNCHANGED from before this pass — byte-identical for a
       // listener-free module that only reaches nextTick directly
       // (design-139-v2 §C).
+      // That holds only without a module root: a top-level-await root
+      // now checks right after each drain (board #196, the header above).
       c.loop();
       c.call(this.nextTick.drain());
-      if (hasProms) c.call(this.proms.drain());
+      if (hasProms) {
+        c.call(this.proms.drain());
+        this.emitRootCheck(c);
+      }
       c.globalGet(this.nextTick.headGlobal());
       c.refIsNull();
       c.i32Eqz();
@@ -4508,7 +5522,6 @@ class Assembler {
       if (hasProms) {
         if (this.needsRejectionHandledDispatch) c.call(this.proms.drainPendingHandled());
         c.call(this.proms.report());
-        this.emitRootCheck(c);
       }
       return;
     }
@@ -4519,7 +5532,10 @@ class Assembler {
     // loop, verbatim (nexttick.ts's header).
     c.loop();
     c.call(this.nextTick.drain());
-    if (hasProms) c.call(this.proms.drain());
+    if (hasProms) {
+      c.call(this.proms.drain());
+      this.emitRootCheck(c);
+    }
     c.i32Const(0);
     c.globalSet(this.invokedFlagGlobal());
     if (hasProms) {
@@ -4541,7 +5557,6 @@ class Assembler {
     c.i32Or();
     c.brIf(0);
     c.end();
-    if (hasProms) this.emitRootCheck(c);
   }
 
   /** The top-level-await root's own stop, factored out of
@@ -6335,6 +7350,62 @@ class Assembler {
       sameValueF64: () => this.sameValueF64Helper(),
       deqEnter: () => this.deqEnterHelper(),
       deqLeave: () => this.deqLeaveHelper(),
+      ...(this.domexLive
+        ? {
+            fromErrorExtra: (c: Code, errLocal: number, objLocal: number): void => {
+              // A DOMException's `code` crosses as its derived legacy
+              // NUMBER and its `cause` crosses as itself (board #187).
+              this.emitIsDomexInto(c, errLocal);
+              c.ifVoid();
+              c.localGet(objLocal);
+              this.pushStrLitInto(c, "code");
+              this.dynField!.boxNum(c, (x) => {
+                x.localGet(errLocal);
+                x.structGet(this.exc().errT, ERR_NAME);
+                x.call(this.domexCodeHelper());
+              });
+              c.call(this.dynField!.objPut());
+              this.emitDomexHasCauseInto(c, errLocal);
+              c.ifVoid();
+              c.localGet(objLocal);
+              this.pushStrLitInto(c, "cause");
+              this.emitDomexCauseInto(c, errLocal);
+              c.call(this.dynField!.objPut());
+              c.end();
+              c.end();
+            },
+            // Object.assign's member put onto a DOMException view: the
+            // same named refusal as the dyn member write (board #198).
+            domexPut: {
+              isDomex: (c: Code, dynLocal: number, errLocal: number): void => {
+                c.localGet(dynLocal);
+                c.call(this.dynField!.toError());
+                c.localTee(errLocal);
+                c.refIsNull();
+                c.ifResult(I32);
+                c.i32Const(0);
+                c.else_();
+                this.emitIsDomexInto(c, errLocal);
+                c.end();
+              },
+              refuseKey: (c: Code, keyLocal: number): void => this.emitDomexMemberRefusalInto(c, keyLocal),
+            },
+          }
+        : {}),
+      ...(this.nullProtoLive
+        ? {
+            nullProtoToStr: (c: Code): void => {
+              this.emitSetCellError(
+                c,
+                "%Error",
+                "Error",
+                (x) => this.pushStrLitInto(x, NULL_PROTO_TOSTR_REFUSAL),
+                null,
+              );
+              c.call(this.reportUncaughtHelper());
+            },
+          }
+        : {}),
     });
     return this.dynField;
   }
@@ -6409,6 +7480,17 @@ class Assembler {
         c.globalSet(exc.kindG);
         c.call(this.reportUncaughtHelper());
       },
+      ...(this.domexLive
+        ? {
+            domex: {
+              isDomex: (c: Code, slot: number) => this.emitIsDomexInto(c, slot),
+              hasCause: (c: Code, slot: number) => this.emitDomexHasCauseInto(c, slot),
+              cause: (c: Code, slot: number) => this.emitDomexCauseInto(c, slot),
+              head: () => this.domexInspHeadHelper(),
+              pending: (c: Code) => c.call(this.reportUncaughtHelper()),
+            },
+          }
+        : {}),
     });
     return this.inspField;
   }
@@ -8452,6 +9534,32 @@ class Assembler {
         c.structNew(adapter.env);
         return true;
       }
+      case "object": {
+        // The %Error extraction (INC-27 U5), C's dynCheck arm for the
+        // class: the value must be an OBJ carrying the `%error` marker
+        // (the encoding fromError builds — the same test `instanceof
+        // Error` on a dyn value makes), and the error it stands for comes
+        // back through the identity cache (errFromDynHelper). A failure
+        // is the ordinary catchable "expected Error at $, got <kind>"
+        // (SEMANTICS.md S009's checked-cast family) — unreachable from
+        // the narrowing that emits this check, which tests the marker
+        // first. Every other class keeps refusing by name.
+        if (t.className !== "%Error") {
+          this.refuse(`dynCheck:${t.kind}`, loc);
+          return false;
+        }
+        kindGuard(DK.OBJ);
+        dyn.objPayload(c, (x) => x.localGet(0));
+        this.pushStrLitInto(c, "%error");
+        c.call(dyn.objGet());
+        c.refIsNull();
+        c.ifVoid();
+        this.emitWalkerFail(w, want, val, (x) => x.localGet(1), (x) => x.localGet(0));
+        c.end();
+        c.localGet(0);
+        c.call(this.errFromDynHelper());
+        return true;
+      }
       default:
         this.refuse(`dynCheck:${t.kind}`, loc);
         return false;
@@ -10224,6 +11332,44 @@ class Assembler {
             this.refuse(`fieldSet:error:${s.field}`, s.loc);
             return;
           }
+          // A DOMException's name and message are getter-only in Node (a
+          // write throws "Cannot set property name of ... which has only
+          // a getter"), and this statement cannot throw catchably, so a
+          // statically-DOMException receiver refuses by name (INC-27 U5).
+          if (s.className === "%DOMException") {
+            this.refuse(`fieldSet:domexception:${s.field}`, s.loc);
+            return;
+          }
+          if (this.domexLive && s.className === "%Error") {
+            // An Error-typed binding can hold a DOMException at run time:
+            // the same write is a named run-time refusal there, through
+            // the uncaught-report route. Modules that can mint no
+            // DOMException keep the plain store below.
+            const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+            const o = this.acquireScratch(errRef);
+            const v = this.acquireScratch(this.strRef);
+            this.walkExpr(s.obj);
+            code.localSet(o);
+            this.walkExpr(s.value);
+            code.localSet(v);
+            this.emitIsDomexInto(code, o);
+            this.openIf();
+            this.emitSetCellError(
+              code,
+              "%Error",
+              "Error",
+              (c) => this.pushStrLitInto(c, `writing a DOMException's ${s.field} is not supported yet (Node's ${s.field} is getter-only)`),
+              null,
+            );
+            code.call(this.reportUncaughtHelper());
+            this.close();
+            code.localGet(o);
+            code.localGet(v);
+            code.structSet(this.exc().errT, slot);
+            this.releaseScratch(this.strRef, v);
+            this.releaseScratch(errRef, o);
+            return;
+          }
           this.walkExpr(s.obj);
           this.walkExpr(s.value);
           code.structSet(this.exc().errT, slot);
@@ -11655,7 +12801,33 @@ class Assembler {
           code.refCast(exc.errT);
           code.call(this.errToStrHelper());
           code.else_();
-          this.pushStrLit("[object Object]");
+          if (this.nullProtoLive) {
+            // INC-27 U5: in a module that can build a null-prototype
+            // object, a thrown DYNAMIC value converts through dyn toStr,
+            // the one place its named refusal lives — so a caught
+            // Object.create(null) never reads "[object Object]" here.
+            // Every other payload keeps the default text.
+            code.localGet(kind);
+            code.i32Const(EXC_REF);
+            code.i32Eq();
+            this.openIfResult(I32);
+            code.localGet(c);
+            code.structGet(exc.caughtT, 2);
+            code.refTest(this.dyn.dynT());
+            code.else_();
+            code.i32Const(0);
+            this.close();
+            this.openIfResult(this.strRef);
+            code.localGet(c);
+            code.structGet(exc.caughtT, 2);
+            code.refCast(this.dyn.dynT());
+            code.call(this.dyn.toStr());
+            code.else_();
+            this.pushStrLit("[object Object]");
+            this.close();
+          } else {
+            this.pushStrLit("[object Object]");
+          }
           this.close();
           this.close();
           this.close();
@@ -12550,6 +13722,31 @@ class Assembler {
           code.call(this.errToStrHelper());
           return;
         }
+        // DOMException (INC-27 U5): the constructor, and the three reads
+        // the IR's %Error shape has no slot for — see the section above
+        // domexT for where each answer lives.
+        if (e.fn === "error.newDom") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.domexNewHelper());
+          return;
+        }
+        if (e.fn === "error.domCode") {
+          this.walkExpr(e.args[0]!);
+          code.structGet(this.exc().errT, ERR_NAME);
+          code.call(this.domexCodeHelper());
+          return;
+        }
+        if (e.fn === "error.domHasCause" || e.fn === "error.domCause") {
+          const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+          const x = this.acquireScratch(errRef);
+          this.walkExpr(e.args[0]!);
+          code.localSet(x);
+          if (e.fn === "error.domHasCause") this.emitDomexHasCauseInto(code, x);
+          else this.emitDomexCauseInto(code, x);
+          this.releaseScratch(errRef, x);
+          return;
+        }
         if (e.fn === "json.parse") {
           // The parser returns normally with the cell set on a syntax
           // error (or the depth cap's RangeError), so the call site owns
@@ -12563,6 +13760,64 @@ class Assembler {
           // `d[k] = v` where the RECEIVER is the dynamic thing. The
           // helper throws Node's TypeErrors on the receivers that cannot
           // take a property, so the site owns a pending check.
+          if (this.domexLive) {
+            // A DOMException's name, message and code are getter-only in
+            // Node (a strict write throws, a sloppy one is ignored). Its
+            // dynamic view (a caught `e`, an untyped parameter) would
+            // otherwise take the write and read it back (board #198), so
+            // in a module that can mint a DOMException the write is the
+            // typed arm's named run-time refusal, after the receiver, key
+            // and value are evaluated. An ordinary Error's view keeps
+            // today's store (board #199).
+            const dynRef = this.dyn.dynRef();
+            const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+            const d = this.acquireScratch(dynRef);
+            const k = this.acquireScratch(this.strRef);
+            const v = this.acquireScratch(dynRef);
+            const er = this.acquireScratch(errRef);
+            this.walkExpr(e.args[0]!);
+            code.localSet(d);
+            this.walkExpr(e.args[1]!);
+            code.localSet(k);
+            this.walkExpr(e.args[2]!);
+            code.localSet(v);
+            code.localGet(d);
+            code.call(this.dyn.toError());
+            code.localTee(er);
+            code.refIsNull();
+            code.ifResult(I32);
+            code.i32Const(0);
+            code.else_();
+            this.emitIsDomexInto(code, er);
+            code.end();
+            this.openIf();
+            for (const field of ["name", "message", "code"]) {
+              code.localGet(k);
+              this.pushStrLitInto(code, field);
+              code.call(this.strEqHelper());
+              this.openIf();
+              this.emitSetCellError(
+                code,
+                "%Error",
+                "Error",
+                (c) => this.pushStrLitInto(c, `writing a DOMException's ${field} is not supported yet (Node's ${field} is getter-only)`),
+                null,
+              );
+              code.call(this.reportUncaughtHelper());
+              this.close();
+            }
+            this.close();
+            code.localGet(d);
+            code.localGet(k);
+            code.localGet(v);
+            code.call(this.dyn.keySet());
+            this.emitPendingCheck();
+            this.releaseScratch(errRef, er);
+            this.releaseScratch(dynRef, v);
+            this.releaseScratch(this.strRef, k);
+            this.releaseScratch(dynRef, d);
+            return;
+          }
           this.walkExpr(e.args[0]!);
           this.walkExpr(e.args[1]!);
           this.walkExpr(e.args[2]!);
@@ -12592,6 +13847,148 @@ class Assembler {
           this.walkExpr(e.args[1]!);
           code.call(this.dyn.assign());
           this.emitPendingCheck();
+          return;
+        }
+        /* INC-27 U5: Object.create(null), variadic Object.assign's source
+         * pack and structuredClone. */
+        if (e.fn === "dyn.objCreateNullProto") {
+          // A fresh object whose payload carries the null-prototype flag
+          // (dyn.ts OBJ_NULL_PROTO) — the flag every reader already
+          // honours (inspect's `[Object: null prototype]` form, deep
+          // equality's prototype test).
+          this.dyn.boxObj(code, (c) => this.dyn.pushNewObj(c, true));
+          return;
+        }
+        if (e.fn === "dyn.packPush") {
+          // A plain source joins the pack (always a fresh dyn array).
+          this.dyn.arrPayload(code, () => this.walkExpr(e.args[0]!));
+          this.walkExpr(e.args[1]!);
+          code.call(this.dyn.arrPush());
+          return;
+        }
+        if (e.fn === "dyn.packPushSpread" || e.fn === "dyn.packPushSpreadIter") {
+          // A spread source flattens into the pack: the single last
+          // spread takes V8's apply-path texts (the front end passes the
+          // source spelling), every other position the iterator path's.
+          const iterPath = e.fn === "dyn.packPushSpreadIter";
+          this.dyn.arrPayload(code, () => this.walkExpr(e.args[0]!));
+          this.walkExpr(e.args[1]!);
+          if (iterPath) this.pushStrLit("");
+          else this.walkExpr(e.args[2]!);
+          code.i32Const(iterPath ? 1 : 0);
+          code.call(this.dyn.spreadPush());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "dyn.assignAll") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.dyn.assignAll());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "dyn.structuredClone") {
+          // Both arguments evaluate, then the options validate, then the
+          // value clones (section above scValidateHelper).
+          const dynRef = this.dyn.dynRef();
+          const v = this.acquireScratch(dynRef);
+          this.walkExpr(e.args[0]!);
+          code.localSet(v);
+          this.walkExpr(e.args[1]!);
+          code.call(this.scValidateHelper());
+          this.emitPendingCheck();
+          code.localGet(v);
+          code.f64Const(0);
+          code.call(this.vecs.newLen(this.dynVecInfo()));
+          code.f64Const(0);
+          code.call(this.vecs.newLen(this.dynVecInfo()));
+          code.call(this.scCloneHelper());
+          this.releaseScratch(dynRef, v);
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "dyn.cloneMissing") {
+          // structuredClone() with no argument — Node's message verbatim
+          // (its own template wraps the text twice).
+          this.emitSetCellError(
+            code,
+            "%TypeError",
+            "TypeError",
+            (c) => this.pushStrLitInto(c, 'The "The value argument must be specified" argument must be specified'),
+            "ERR_MISSING_ARGS",
+          );
+          code.refNull(this.dyn.dynT());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "dyn.cloneTransferFail") {
+          // A transfer list naming a value this tier cannot transfer.
+          this.emitSetCellError(
+            code,
+            "%DOMException",
+            "DataCloneError",
+            (c) => this.pushStrLitInto(c, "Found invalid value in transferList."),
+            null,
+          );
+          code.refNull(this.dyn.dynT());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "dyn.errInstanceof") {
+          // `x instanceof <builtin error class>` on a dyn value: only a
+          // value that came from an error (the identity cache) is one,
+          // and it is an instance when its class sits inside the tested
+          // class's preorder interval.
+          const kindArg = e.args[1]!;
+          const entry =
+            kindArg.kind === "numLit" ? [...RUNTIME_ERROR_CLASSES].find(([, v]) => v.kind === kindArg.value) : undefined;
+          const meta = entry === undefined ? undefined : this.classes.meta(entry[0]);
+          if (meta === undefined) {
+            this.refuse(`libCall:${e.fn}`, e.loc);
+            code.unreachable();
+            return;
+          }
+          const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+          const er = this.acquireScratch(errRef);
+          this.walkExpr(e.args[0]!);
+          code.call(this.dyn.toError());
+          code.localTee(er);
+          code.refIsNull();
+          this.openIfResult(I32);
+          code.i32Const(0);
+          code.else_();
+          code.localGet(er);
+          code.structGet(this.exc().errT, 0);
+          code.structGet(this.classes.ci(), CI_PRE);
+          code.i32Const(meta.pre);
+          code.i32Sub();
+          code.i32Const(meta.post - meta.pre);
+          code.i32LeU();
+          this.close();
+          this.releaseScratch(errRef, er);
+          return;
+        }
+        if (e.fn === "error.domClone") {
+          // structuredClone of a statically typed DOMException: the
+          // options validate first, then a fresh DOMException with the
+          // name and message copied — its code re-derives from the name
+          // and its cause does not serialize.
+          const exc = this.exc();
+          const errRef: ValType = { kind: "ref", nullable: true, typeIndex: exc.errT };
+          const src = this.acquireScratch(errRef);
+          this.walkExpr(e.args[0]!);
+          code.localSet(src);
+          this.walkExpr(e.args[1]!);
+          code.call(this.scValidateHelper());
+          this.emitPendingCheck();
+          code.globalGet(this.classes.vtGlobal("%DOMException"));
+          code.localGet(src);
+          code.structGet(exc.errT, ERR_NAME);
+          code.localGet(src);
+          code.structGet(exc.errT, ERR_MESSAGE);
+          code.refNull(this.strType);
+          code.structNew(exc.errT);
+          this.releaseScratch(errRef, src);
           return;
         }
         if (e.fn === "dyn.defineProps") {
@@ -12690,13 +14087,11 @@ class Assembler {
           // bufEncoding) encoding argument; every other kind answers
           // exactly what the general ToString conversion (`dyn.toStr()`,
           // already used everywhere else — template literals, String(),
-          // concatenation) already produces. The THIRD argument (the
-          // source spelling, for a null-prototype dictionary's Node-exact
-          // "<spelling> is not a function" TypeError) is NOT ported here
-          // — unexercised by any claim this stage reaches, named rather
-          // than silently approximated: a null-prototype receiver falls
-          // through to `dyn.toStr()`'s own general answer instead of
-          // throwing Node's exact error.
+          // concatenation) already produces. The THIRD argument is the
+          // call's source spelling: a null-prototype object has no
+          // toString at all, so in a module that can build one (INC-27
+          // U5) that receiver throws Node's catchable "<spelling> is not a
+          // function" TypeError (C's scr_dyn_to_string_method).
           const encArg = e.args[1]!;
           if (encArg.kind !== "strLit") {
             throw new Error("wasm emitter bug: dyn.toString's encoding argument must be a compile-time literal (lower-calls.ts's own construction)");
@@ -12705,6 +14100,39 @@ class Assembler {
           const recv = this.acquireScratch(recvT);
           this.walkExpr(e.args[0]!);
           code.localSet(recv);
+          if (this.nullProtoLive) {
+            // The spelling evaluates with the call (a literal).
+            const spell = this.acquireScratch(this.strRef);
+            const spellArg = e.args[2];
+            if (spellArg === undefined) this.pushStrLit("toString");
+            else this.walkExpr(spellArg);
+            code.localSet(spell);
+            code.localGet(recv);
+            code.structGet(this.dyn.dynT(), DYN_KIND);
+            code.i32Const(DK.OBJ);
+            code.i32Eq();
+            this.openIfResult(I32);
+            this.dyn.objPayload(code, (c) => c.localGet(recv));
+            code.structGet(this.dyn.objT(), OBJ_NULL_PROTO);
+            code.else_();
+            code.i32Const(0);
+            this.close();
+            this.openIf();
+            this.emitSetCellError(
+              code,
+              "%TypeError",
+              "TypeError",
+              (c) => {
+                c.localGet(spell);
+                this.pushStrLitInto(c, " is not a function");
+                c.call(this.concatHelper());
+              },
+              null,
+            );
+            this.close();
+            this.releaseScratch(this.strRef, spell);
+            this.emitPendingCheck();
+          }
           code.localGet(recv);
           code.structGet(this.dyn.dynT(), DYN_KIND);
           code.i32Const(DK.BYTES);
@@ -16226,7 +17654,13 @@ class Assembler {
             t.kind === "array" ||
             t.kind === "union" ||
             t.kind === "func" ||
-            t.kind === "bytes"
+            t.kind === "bytes" ||
+            // The %Error extraction after an `instanceof Error` narrow
+            // (INC-27 U5); no other class reaches here from the frontend
+            // (TypeError/RangeError narrows are board #189's front-end
+            // error, user classes a named front-end refusal), and any
+            // that did keeps refusing below.
+            (t.kind === "object" && t.className === "%Error")
           ) {
             // The composite extraction is a per-typeKey WALKER (the C
             // emitter's sc_dc_N). It returns normally with the cell set on
@@ -16560,17 +17994,16 @@ class Assembler {
        * not-a-function TypeError, the thunk's per-argument checks, and
        * whatever the called closure itself throws. */
       case "dynCall": {
-        if (e.spreads !== undefined && e.spreads.length > 0) {
-          // `f(...args)` applies through a runtime-built argument list,
-          // and building one means FLATTENING each spread source —
-          // arrays element-wise, strings by code point, bytes by byte,
-          // V8's spread-call TypeError for every other kind
-          // (scr_dyn_arr_push_spread). That is the iteration surface, a
-          // rock of its own; refusing by name beats half of it.
-          this.refuse("dynCall:spread", e.loc);
-          code.unreachable();
-          return;
-        }
+        // `f(...args)` (INC-27 U5) applies through the same runtime-built
+        // argument list: each spread source FLATTENS onto it in source
+        // order (dyn.ts spreadPush — arrays element-wise, strings by code
+        // point, bytes by element, V8's spread TypeError for every other
+        // kind), and the flattening completes before the callee's
+        // callable test, as in V8. The TypeError's text depends on the
+        // spread's position: the single spread in the last argument takes
+        // the apply-path texts, every other position the iterator's.
+        const spreadWhat = new Map<number, string>((e.spreads ?? []).map((sp) => [sp.arg, sp.what]));
+        const iterPath = !(e.spreads !== undefined && e.spreads.length === 1 && e.spreads[0]!.arg === e.args.length - 1);
         const dynRef = this.dyn.dynRef();
         const arrRef = this.dyn.arrRef();
         const d = this.acquireScratch(dynRef);
@@ -16580,11 +18013,19 @@ class Assembler {
         code.f64Const(0);
         code.call(this.vecs.newLen(this.dynVecInfo()));
         code.localSet(a);
-        for (const arg of e.args) {
+        e.args.forEach((arg, i) => {
+          const what = spreadWhat.get(i);
           code.localGet(a);
           this.walkExpr(arg);
-          code.call(this.dyn.arrPush());
-        }
+          if (what === undefined) {
+            code.call(this.dyn.arrPush());
+            return;
+          }
+          this.pushStrLit(what);
+          code.i32Const(iterPath ? 1 : 0);
+          code.call(this.dyn.spreadPush());
+          this.emitPendingCheck();
+        });
         code.localGet(d);
         code.localGet(a);
         this.pushStrLitInto(code, e.calleeName);

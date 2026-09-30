@@ -635,9 +635,17 @@ test("NL-4 a --dynamic rest forward refuses with the DISTINCT type:func-rest-jsv
   expect(diags.some((d) => d.includes("type:func-rest") && !d.includes("jsval"))).toBe(false);
 });
 
-test("NL-6 2567-rest-spread-forward stays refused by dynCall:spread, unrelated to type:func-rest", async () => {
-  const diags = await refuseCorpusRow("nl6", "2567-rest-spread-forward.js");
-  expect(diags.some((d) => d.includes("dynCall:spread"))).toBe(true);
+// NL-6 pinned, when this unit landed, that 2567 refused for dynCall:spread
+// and never for type:func-rest. INC-27 U5 lifts dynCall:spread, so 2567 now
+// builds: the row keeps its point — no diagnostic names type:func-rest —
+// and asserts the build succeeds. The program's full stdout and exit code
+// are row C04 of wasm-dynsmalls-u5.test.ts.
+test("NL-6 2567-rest-spread-forward builds, and nothing refuses it by type:func-rest", async () => {
+  const entry = fileURLToPath(new URL("../../../tests/corpus/2567-rest-spread-forward.js", import.meta.url));
+  const res = await compile(entry, { outPath: join(scratch, "nl6.wasm"), outDir: scratch, backend: "wasm" });
+  const diags = res.ok ? [] : [...new Set(res.diagnostics.map((d) => `${d.code}:${d.message}`))];
+  expect(diags.some((d) => d.includes("type:func-rest"))).toBe(false);
+  expect(res.ok).toBe(true);
 });
 
 // B-ii-1: a self-referencing named function expression, declaring ONE

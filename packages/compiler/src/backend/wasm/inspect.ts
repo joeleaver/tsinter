@@ -254,6 +254,20 @@ export interface InspectDeps {
    * bare `unreachable`, now named on stderr per the register's own
    * "reachable runtime refusals are named" rule). */
   namedTrap: (c: Code, message: string) => void;
+  /** INC-27 U5: the DOMException view insp.error needs — present ONLY in
+   * a module that can mint a DOMException (the emitter's static
+   * prescan), so the error leaf is byte-identical everywhere else. Each
+   * pusher reads the errT in local `slot`; `head` is a helper (name) →
+   * the bracket's header by Node's rule (see error()); `pending` fires
+   * when rendering a cause left an exception in the cell (the uncaught
+   * report — this leaf cannot throw). */
+  domex?: {
+    isDomex: (c: Code, slot: number) => void;
+    hasCause: (c: Code, slot: number) => void;
+    cause: (c: Code, slot: number) => void;
+    head: () => number;
+    pending: (c: Code) => void;
+  };
 }
 
 export class InspectBuilder {
@@ -3247,9 +3261,23 @@ export class InspectBuilder {
       const M = 6;
       const BASE = 7;
       const CODE = 8;
+      // The DOMException view (INC-27 U5), only where one can exist.
+      const dx = this.deps.domex;
+      const D = 9;
+      const HC = 10;
       c.localGet(E);
       c.structGet(errT, this.deps.errCode());
       c.localSet(CODE);
+      if (dx !== undefined) {
+        dx.isDomex(c, E);
+        c.localTee(D);
+        c.ifResult(I32);
+        dx.hasCause(c, E);
+        c.else_();
+        c.i32Const(0);
+        c.end();
+        c.localSet(HC);
+      }
       // Beyond the depth budget an error with extra properties collapses to
       // `[Name]`; one WITHOUT them still prints its full base, because the
       // bracket form IS its stack rather than a property dump (measured
@@ -3257,6 +3285,11 @@ export class InspectBuilder {
       c.localGet(CODE);
       c.refIsNull();
       c.i32Eqz();
+      if (dx !== undefined) {
+        // A DOMException's cause is its one extra property.
+        c.localGet(HC);
+        c.i32Or();
+      }
       c.ifVoid();
       c.localGet(RECURSE);
       c.localGet(DEPTH);
@@ -3266,8 +3299,20 @@ export class InspectBuilder {
       c.localSet(MARK);
       c.i32Const(0x5b); // '['
       c.call(this.ibPutc());
-      c.localGet(E);
-      c.structGet(errT, this.deps.errName());
+      if (dx !== undefined) {
+        // Beyond the depth budget Node names the CONSTRUCTOR, and a
+        // DOMException's is "DOMException" whatever its name (measured).
+        c.localGet(D);
+        c.ifResult(this.deps.strRef());
+        this.deps.lit(c, "DOMException");
+        c.else_();
+        c.localGet(E);
+        c.structGet(errT, this.deps.errName());
+        c.end();
+      } else {
+        c.localGet(E);
+        c.structGet(errT, this.deps.errName());
+      }
       c.call(this.ibPuts());
       c.i32Const(0x5d); // ']'
       c.call(this.ibPutc());
@@ -3282,8 +3327,22 @@ export class InspectBuilder {
       c.localSet(MARK);
       c.i32Const(0x5b);
       c.call(this.ibPutc());
-      c.localGet(E);
-      c.structGet(errT, this.deps.errName());
+      if (dx !== undefined) {
+        // Node's header rule for a DOMException (improveStack against the
+        // constructor name, measured per branch): see the head helper.
+        c.localGet(D);
+        c.ifResult(this.deps.strRef());
+        c.localGet(E);
+        c.structGet(errT, this.deps.errName());
+        c.call(dx.head());
+        c.else_();
+        c.localGet(E);
+        c.structGet(errT, this.deps.errName());
+        c.end();
+      } else {
+        c.localGet(E);
+        c.structGet(errT, this.deps.errName());
+      }
       c.call(this.ibPuts());
       c.localGet(E);
       c.structGet(errT, this.deps.errMessage());
@@ -3328,6 +3387,48 @@ export class InspectBuilder {
       c.localGet(MARK);
       c.call(this.ibTake());
       c.localSet(BASE);
+      if (dx !== undefined) {
+        // `[…] { [cause]: <value> }` — the cause through the dyn walker at
+        // the child level, in the same frame engine the code slot uses.
+        c.localGet(HC);
+        c.ifVoid();
+        c.localGet(RECURSE);
+        c.f64Const(1);
+        c.f64Add();
+        c.call(this.begin());
+        c.globalGet(this.len());
+        c.localSet(MARK);
+        this.deps.lit(c, "[cause]: ");
+        c.call(this.ibPuts());
+        dx.cause(c, E);
+        c.localGet(RECURSE);
+        c.f64Const(1);
+        c.f64Add();
+        c.localGet(DEPTH);
+        c.call(this.dyn());
+        c.localTee(M);
+        c.refIsNull();
+        c.ifVoid();
+        dx.pending(c);
+        c.end();
+        c.localGet(M);
+        c.call(this.ibPuts());
+        c.localGet(MARK);
+        c.call(this.ibTake());
+        c.i32Const(0);
+        c.call(this.entry());
+        c.localGet(BASE);
+        this.deps.lit(c, "{");
+        this.deps.lit(c, "}");
+        c.localGet(RECURSE);
+        c.f64Const(1);
+        c.f64Add();
+        c.i32Const(0);
+        c.i32Const(0);
+        c.call(this.end());
+        c.return_();
+        c.end();
+      }
       c.localGet(CODE);
       c.refIsNull();
       c.ifVoid();
@@ -3363,7 +3464,9 @@ export class InspectBuilder {
       c.call(this.end());
       this.mb.setBody(
         idx,
-        [I32, I32, I32, this.deps.strRef(), this.deps.strRef(), this.deps.strRef()],
+        dx !== undefined
+          ? [I32, I32, I32, this.deps.strRef(), this.deps.strRef(), this.deps.strRef(), I32, I32]
+          : [I32, I32, I32, this.deps.strRef(), this.deps.strRef(), this.deps.strRef()],
         c.bytes(),
       );
     });
@@ -3893,10 +3996,10 @@ export class InspectBuilder {
         // Object.create(null)'s dictionary: Node prefixes the rendering
         // with the constructor-less base at EVERY depth, the empty form
         // included, and the beyond-depth answer IS the bare marker (where
-        // a plain object says [Object]). No producer on the wasm tier
-        // builds one yet — `dyn.objCreateNullProto` refuses here — so this
-        // is the dyn surface's standing rule that an arm is filled before
-        // the payload that reaches it lands.
+        // a plain object says [Object]). `dyn.objCreateNullProto` builds
+        // one (INC-27 U5); the arm was filled before that producer landed,
+        // the dyn surface's standing rule that an arm is filled before the
+        // payload that reaches it lands.
         c.localGet(O);
         c.structGet(objT, OBJ_NULL_PROTO);
         c.localSet(NP);
