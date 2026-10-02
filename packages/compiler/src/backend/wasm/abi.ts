@@ -443,10 +443,95 @@
  * kind 1) then all pairs (`hostStr` kinds 1 and 2) into one in-module map;
  * get/set/unset/`in`/spread/Object.keys all run against that map from then
  * on. THE ONE OBSERVABLE THAT DISTINGUISHES A SNAPSHOT FROM A LIVE PROXY is
- * a spawned CHILD inheriting a variable this module wrote — no import in
- * this ABI can reach a child process, so nothing observable can tell the
- * difference yet; the first increment that gives this tier a child_process
- * surface must revisit this decision.
+ * a spawned CHILD inheriting a variable this module wrote. INC-28 U1 (the
+ * first increment with a child_process surface, `cpCall` below) revisited
+ * the decision and kept the snapshot as the model: every child the module
+ * starts is given an environment BY THE MODULE — its own current map when
+ * the call has no `env` option, the replacement pairs when it has one —
+ * and the host never consults its own environment for a child. A child
+ * therefore sees exactly the writes and deletes this module made, which
+ * closes the one observable by construction rather than by a live proxy.
+ * Node's process.env setter cuts a key or value at its first U+0000; when
+ * the module sends its OWN map it applies the same cut to each key and
+ * value, so the child sees Node's strings (an explicit `env` option is not
+ * cut: Node validates it and throws, and so does the module).
+ *
+ *   (import "tsinter" "cpCall" (func (param i32 i32 i32 i32 i32) (result i32)))
+ *     [modules that reach cp.spawnSync, cp.spawnSyncOpts,
+ *      cp.spawnSyncStdioStr, cp.execSync or cp.execCapture only]
+ *     cpCall(op, ptr, len, h, which) -> i32. INC-28 U1. ONE op-dispatched
+ *     import for child_process's synchronous surface. A child cannot be
+ *     re-run, so this import never uses the retry-on-short-buffer contract
+ *     of hostStr/fsCall: the HOST runs the child once, HOLDS the finished
+ *     result behind a small integer handle, and the module reads it out.
+ *       op 1 RUN(ptr, len)     -> handle >= 0; < 0 = a HOST FAILURE
+ *       op 2 META(ptr, h)      -> writes the 32-byte result record at ptr,
+ *                                 answers 32
+ *       op 3 READ(ptr, h, which) -> copies stream `which` (1 stdout,
+ *                                 2 stderr; its length from META) to ptr,
+ *                                 answers that length
+ *       op 4 FREE(h)           -> 0; the handle is gone
+ *     Unused parameters are 0. RUN, META, READ (0-2 times) and FREE run
+ *     inside ONE module function; the module never holds a handle across
+ *     a function boundary. Any answer outside these contracts (a negative
+ *     RUN, a META other than 32, a READ length other than META's, a
+ *     non-zero FREE) is a named trap in the module ("cpCall: host
+ *     failure"): every program-reachable Node throw is validated in the
+ *     MODULE before RUN, so a host failure is a host bug, never a program
+ *     outcome. The host never builds message text — the module builds
+ *     every error from the numbers in the result record.
+ *     THE REQUEST RECORD (module -> host) at ptr, which the module rounds
+ *     up to a multiple of 4, little-endian: header u32 stdinMode at +0
+ *     (0 pipe at end-of-file, 1 pipe carrying the input below, 2 inherit,
+ *     3 ignore), u32 stdoutMode at +4 and u32 stderrMode at +8 (0 capture,
+ *     1 discard, 2 inherit), u32 killSignal at +12 (a validated Linux
+ *     signal number), f64 timeoutMs at +16 (0 = none; any accepted value,
+ *     however large, is passed through), u32 maxBufferMode at +24
+ *     (0 = Node's default limit, 1 = unbounded), u32 reserved at +28 = 0 —
+ *     4+4+4+4+8+4+4 = 32 bytes. Then, from +32, RUNS — each a u32 count of
+ *     UTF-16 code units followed by 2*count bytes, padded with zeros to
+ *     the next multiple of 4 so every run starts 4-aligned: the file; a
+ *     u32 argument count and that many runs; the cwd (count 0 = no cwd,
+ *     the child inherits the host's); a u32 pair count and that many
+ *     (key run, value run) pairs — the WHOLE environment of the child;
+ *     then a u32 byte count and the input's UTF-8 bytes (a lone surrogate
+ *     encoded as EF BF BD, Node's Buffer.from(s, "utf8")). `len` is the
+ *     record's total byte length. The host reads every u32 and the f64
+ *     through a DataView and every run through a Uint16Array at a 4-aligned
+ *     offset, each view built from memory.buffer AT CALL TIME (a grow
+ *     detaches older views).
+ *     THE RESULT RECORD (op 2), field by field from the host's own child
+ *     result, written through a DataView: u32 hasStatus at +0, f64 status
+ *     at +4, u32 signal at +12 (0 = none, else the Linux number), i32
+ *     errCode at +16, u32 stdoutLen at +20, u32 stderrLen at +24, u32
+ *     reserved at +28 — 4+8+4+4+4+4+4 = 32 bytes. ORTHOGONAL: a status and
+ *     an error can both be present (a child that traps the timeout's
+ *     signal and exits; EPIPE after a normal exit), and so can a signal
+ *     and an error (ENOBUFS). errCode: 0 none; 1..15 index the module's
+ *     own table (childproc.ts CP_CODES: ENOENT EACCES EPERM ENOTDIR ENOEXEC
+ *     ELOOP ENAMETOOLONG E2BIG ENOMEM EAGAIN EIO EINVAL ETIMEDOUT EPIPE
+ *     ENOBUFS); any other errno n is carried as -(256 + n), from which the
+ *     module renders Node's own name for -n.
+ *     STDIO: an inherited stream is EMULATED — the host captures it and
+ *     the module writes the bytes, raw, to its own fd 1/2 right after
+ *     RUN, before any echo or throw. A host may pass a real inherit
+ *     through instead only if its fds are the program's own.
+ *     THE CLOCK: RUN advances the host's monotonic clock (`now`, and the
+ *     wall clock that follows it) by the child's measured duration, so a
+ *     timer armed before a long child is due when the call returns, as
+ *     in Node. The advance makes the clock FRACTIONAL; nothing observes
+ *     that — Date.now is floored by the module (wallClock above) and
+ *     performance.now is fractional in Node too.
+ *     THE CAPABILITY (S004): this import runs arbitrary programs with the
+ *     host user's authority. A host that does not grant it DOES NOT
+ *     SUPPLY THE IMPORT, and a module reaching child_process fails to
+ *     instantiate with a LinkError before a single instruction runs (the
+ *     engine enforces that half). A host granting less answers a spawn
+ *     failure (EACCES/EPERM) for what it refuses.
+ *     cpCall's EFFECT TIER: that the host ran the program it was asked
+ *     to, with the environment, cwd, input and stdio it was given, and
+ *     transcribed the child's result faithfully, is enforced by NOTHING —
+ *     the harness's own rows are the check.
  *
  *   (import "tsinter" "write" (func (param i32 i32 i32)))
  *     write(fd, ptr, len): the host writes len bytes at ptr from the
@@ -616,6 +701,7 @@ export const IMPORT_KILL = "kill";
 export const IMPORT_CHDIR = "chdir";
 export const IMPORT_UMASK = "umask";
 export const IMPORT_FS_CALL = "fsCall";
+export const IMPORT_CP_CALL = "cpCall";
 export const EXPORT_ENTRY = "_start";
 export const EXPORT_TICK = "_tick";
 export const EXPORT_STATUS = "_status";

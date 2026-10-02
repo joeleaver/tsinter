@@ -1969,6 +1969,9 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     let stdoutMode = 1;
     let stderrMode = 0;
     let stdinInherit = false;
+    // Whether the literal options carry an `encoding` member (the record
+    // path's type requires one and returns before the check below).
+    let hasEncoding = false;
     // A conditional env spread (`...(c ? { env: ... } : {})`): the call
     // itself splits into a ternary of the two env-nesses at the tail.
     let condEnvSpread: { cond: IrExpr; pairs: IrExpr; whenTrue: boolean } | null = null;
@@ -2098,6 +2101,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
                 'outputs are captured as utf8 — pass { encoding: "utf8" }',
               );
             }
+            hasEncoding = true;
             break;
           }
           case "cwd":
@@ -2201,6 +2205,80 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       }
     }
 
+    // INC-28 U1: without an encoding Node returns a Buffer, while every lane
+    // answers the captured utf8 text — so an encoding-less call whose
+    // RESULT IS USED is refused by name rather than answering the wrong
+    // kind of value. Parentheses, `as T`, `!` and `satisfies T` around the
+    // call change no value and are looked through. Two uses stay:
+    //  - the result is DISCARDED: the call is an expression statement, the
+    //    operand of `void`, the operand of an `await` whose own result is
+    //    discarded, or a branch of a conditional whose result is discarded;
+    //  - the result is immediately decoded by `.toString()` (no argument, or
+    //    "utf8"/"utf-8") and stdout is CAPTURED at the call — Buffer#toString's
+    //    utf8 decode is the text every lane already produces. With stdout
+    //    "inherit" or "ignore" Node returns null and `.toString()` throws a
+    //    TypeError, so that shape is refused like any other used result.
+    // Still refused although Node's answer would match: a template-literal
+    // hole, an arrow's expression body (a callback's return value is used as
+    // far as this check can tell), and a comma expression.
+    if (!hasEncoding) {
+      const outer = (n: ts.Node): ts.Node => {
+        let at = n;
+        for (;;) {
+          const up = at.parent;
+          if (
+            up !== undefined &&
+            (ts.isParenthesizedExpression(up) ||
+              ts.isAsExpression(up) ||
+              ts.isNonNullExpression(up) ||
+              ts.isSatisfiesExpression(up)) &&
+            up.expression === at
+          ) {
+            at = up;
+            continue;
+          }
+          return at;
+        }
+      };
+      const isDiscarded = (n: ts.Node): boolean => {
+        const at = outer(n);
+        const up = at.parent;
+        if (up === undefined) return false;
+        if (ts.isExpressionStatement(up)) return true;
+        if (ts.isVoidExpression(up)) return true;
+        if (ts.isAwaitExpression(up)) return isDiscarded(up);
+        if (ts.isConditionalExpression(up) && (up.whenTrue === at || up.whenFalse === at)) return isDiscarded(up);
+        return false;
+      };
+      const at = outer(expr);
+      const up = at.parent;
+      const discarded = isDiscarded(expr);
+      let decoded = false;
+      if (
+        stdoutMode === 1 &&
+        up !== undefined &&
+        ts.isPropertyAccessExpression(up) &&
+        up.expression === at &&
+        up.name.text === "toString"
+      ) {
+        const call = up.parent;
+        if (call !== undefined && ts.isCallExpression(call) && call.expression === up) {
+          const a = call.arguments;
+          decoded =
+            a.length === 0 ||
+            (a.length === 1 && ts.isStringLiteral(a[0]!) && (a[0]!.text === "utf8" || a[0]!.text === "utf-8"));
+        }
+      }
+      if (!discarded && !decoded) {
+        L.noLowering(
+          `${shell ? "execSync" : "execFileSync"} without an encoding whose result is used (without an encoding, Node returns a Buffer)`,
+          expr,
+          stdoutMode === 1
+            ? 'without an encoding, Node returns a Buffer — pass { encoding: "utf8" }, call .toString() on the result, or discard it'
+            : 'stdout is not captured, so Node returns null — discard the result',
+        );
+      }
+    }
     const execCall = (hasE: IrExpr, pairs: IrExpr): IrExpr => ({
       kind: "libCall",
       fn: "cp.execSync",

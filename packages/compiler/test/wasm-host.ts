@@ -65,7 +65,10 @@
  * (P-1's own point) — board #135's hazard reintroduced for one op with
  * no caller to justify it, since nothing reaches op 19 through this
  * shared host today. A future test needing `existsSync` supplies a
- * FORCED host (wasm-host-fs-p4.test.ts's own job). */
+ * FORCED host (wasm-host-fs-p4.test.ts's own job).
+ *
+ * INC-28 U1: `cpCall` lands LOUD BY DESIGN for the same reason — a child's
+ * result is never fabricated here; wasm-host-cp-u1.test.ts forces one. */
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { expect } from "vitest";
@@ -263,6 +266,13 @@ async function instantiate(modulePath: string) {
       // wasm-host-fs-p4.test.ts exists for.
       fsCall(op: number, _aPtr: number, _aLen: number, _bPtr: number, _bLen: number, _x: number, _y: number): number {
         throw new Error(`fsCall: op ${op} reached with no forced host (default stub is loud by design)`);
+      },
+      // INC-28 U1 (abi.ts cpCall): LOUD for every op, fsCall's stance — a
+      // shared-host program that starts a child without a forced host
+      // fails at the exact op, never reads a fabricated child result.
+      // wasm-host-cp-u1.test.ts carries its own forced host.
+      cpCall(op: number, _ptr: number, _len: number, _h: number, _which: number): number {
+        throw new Error(`cpCall: op ${op} reached with no forced host (default stub is loud by design)`);
       },
     },
   });

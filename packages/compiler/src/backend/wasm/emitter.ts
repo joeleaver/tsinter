@@ -130,6 +130,7 @@ import {
   HOST_STR_KIND_VERSIONS_NODE,
   HOST_STR_KIND_VERSIONS_OPENSSL,
   IMPORT_CHDIR,
+  IMPORT_CP_CALL,
   IMPORT_EXIT,
   IMPORT_FS_CALL,
   IMPORT_HOST_NUM,
@@ -167,6 +168,7 @@ import { ProcessBuilder } from "./process.js";
 import { PathBuilder } from "./path.js";
 import { FsBuilder } from "./fs.js";
 import { FsLaddersBuilder } from "./fs-ladders.js";
+import { ChildProcBuilder, SR_ERR_CODE, SR_HAS_STATUS, SR_SIGNAL, SR_STATUS, SR_STDERR, SR_STDOUT } from "./childproc.js";
 import { MapBuilder, type MapInfo, type MapKeyKind, type MapValKind } from "./maps.js";
 import { JsonBuilder, jsonQuote } from "./json.js";
 import {
@@ -590,7 +592,17 @@ function hostStrReachable(mod: WModule): boolean {
         node === "os.userName" ||
         node === "os.userHomedir" ||
         node === "os.userShell" ||
-        node === "os.networkInterfaces"
+        node === "os.networkInterfaces" ||
+        // INC-28 U1: every child the module starts is given an environment
+        // BY THE MODULE (abi.ts, cpCall) — its own map when the call has
+        // no env option — so each child_process key's arm reads the env
+        // snapshot (ensureEnv: hostNum kind 1, hostStr kinds 1/2), whether
+        // or not the program itself ever touches process.env.
+        node === "cp.spawnSync" ||
+        node === "cp.spawnSyncOpts" ||
+        node === "cp.spawnSyncStdioStr" ||
+        node === "cp.execSync" ||
+        node === "cp.execCapture"
       ) {
         found = true;
       }
@@ -666,7 +678,14 @@ function hostNumReachable(mod: WModule): boolean {
         node === "process.onWarning" ||
         // INC-26 P5 (brief-p5-v3.md §3A, abi.ts hostNum kind 15): the
         // sole new hostNum-only os.* key this pass adds.
-        node === "os.totalmem"
+        node === "os.totalmem" ||
+        // INC-28 U1: the same five child_process keys as hostStrReachable,
+        // for the same reason (ensureEnv reads the env pair count).
+        node === "cp.spawnSync" ||
+        node === "cp.spawnSyncOpts" ||
+        node === "cp.spawnSyncStdioStr" ||
+        node === "cp.execSync" ||
+        node === "cp.execCapture"
       ) {
         found = true;
       }
@@ -914,6 +933,87 @@ function fsCallReachable(mod: WModule): boolean {
         // time "emitter bug: an fs key (op 3) was reached but tsinter.
         // fsCall was never imported" on a program using ONLY this key.
         node === "fs.mkdtempSyncChk"
+      ) {
+        found = true;
+      }
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      for (const value of Object.values(node)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn.body);
+  }
+  return found;
+}
+
+/** INC-28 U1: the module the may-throw analysis reads. On this tier the
+ * three spawnSync keys THROW (Node's own argument validation —
+ * ERR_INVALID_ARG_VALUE, ERR_OUT_OF_RANGE, ERR_UNKNOWN_SIGNAL — before the
+ * child runs), where the native lanes never do (board #209 owns their
+ * cells), so the shared may-throw list (ir/nodes.ts MAY_THROW_LIB_FNS)
+ * deliberately does not carry them. Without a pending check after every
+ * call that can reach one, a caller would never see the throw. So when the
+ * module contains one of the three, the analysis runs over a COPY in which
+ * exactly those libCall names read as cp.execSync (already on the list);
+ * the copy is used for nothing else and never emitted. A module with none
+ * of them gets the ORIGINAL object back — its analysis, and its bytes, are
+ * exactly what they were. */
+function spawnSyncMayThrowView(mod: WModule): WModule {
+  const keys = new Set(["cp.spawnSync", "cp.spawnSyncOpts", "cp.spawnSyncStdioStr"]);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      const rec = node as Record<string, unknown>;
+      if (rec["kind"] === "libCall" && typeof rec["fn"] === "string" && keys.has(rec["fn"])) {
+        found = true;
+        return;
+      }
+      for (const value of Object.values(rec)) scan(value);
+    }
+  };
+  scan(mod.functions);
+  if (!found) return mod;
+  const copy = (node: unknown): unknown => {
+    if (Array.isArray(node)) return node.map(copy);
+    if (node !== null && typeof node === "object") {
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(node as Record<string, unknown>)) out[k] = copy(v);
+      if (out["kind"] === "libCall" && typeof out["fn"] === "string" && keys.has(out["fn"])) out["fn"] = "cp.execSync";
+      return out;
+    }
+    return node;
+  };
+  return { ...mod, functions: copy(mod.functions) as WModule["functions"] };
+}
+
+/** Does any reachable function call one of the five child_process keys
+ * behind `cpCall`? INC-28 U1 (abi.ts) — `cpCall`'s minting condition, in
+ * fsCallReachable's exact shape. Enumerated BY ARM: each of the five runs
+ * a child through `%w.cp.run`; the spawnRes.* readers only read a struct
+ * and never touch the import, so they are not here. */
+function cpCallReachable(mod: WModule): boolean {
+  const reachable = reachableFunctionNames(mod);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (typeof node === "string") {
+      if (
+        node === "cp.spawnSync" ||
+        node === "cp.spawnSyncOpts" ||
+        node === "cp.spawnSyncStdioStr" ||
+        node === "cp.execSync" ||
+        node === "cp.execCapture"
       ) {
         found = true;
       }
@@ -1911,6 +2011,7 @@ class Assembler {
    * ONE effect-dispatcher import behind all 13 — never §2.7's kill/chdir/
    * umask shape (one key, one import each). */
   private readonly fsCallFunc: number | null;
+  private readonly cpCallFunc: number | null;
   /** The exit-drain gate's static fact — see exitListenerSurfaceReachable's
    * own comment (INC-26 P1). Computed ONCE in the constructor; every drain
    * gate site reads this, never the mutable `procField`/
@@ -2090,6 +2191,13 @@ class Assembler {
           this.mb.funcType([I32, I32, I32, I32, I32, I32, I32], [I32]),
         )
       : null;
+    // `cpCall`'s decision (INC-28 U1, abi.ts): ONE op-dispatched import
+    // behind the five child_process keys, minted right after `fsCallFunc`
+    // so nothing before it moves. Signature: (op, ptr, len, h, which) ->
+    // i32; the host holds each finished child's result behind a handle.
+    this.cpCallFunc = cpCallReachable(mod)
+      ? this.mb.importFunc(IMPORT_MODULE, IMPORT_CP_CALL, this.mb.funcType([I32, I32, I32, I32, I32], [I32]))
+      : null;
     // ── end INC-26 host-import block ──
     // The exit-drain gate's STATIC fact (see exitListenerSurfaceReachable's
     // own comment on why this must not be a runtime flag): true iff
@@ -2147,7 +2255,7 @@ class Assembler {
     // IR — reused verbatim to place the pending-exception checks. It runs
     // on the LOWERED module and walks it generically, so the `%async.*`
     // kinds recurse through it like any node it has no case for.
-    const mt = computeMayThrow(asIrModule(mod));
+    const mt = computeMayThrow(asIrModule(spawnSyncMayThrowView(mod)));
     this.mayThrow = mt.fns;
     this.mayThrowIndirect = mt.indirect;
     for (const cls of mod.classes ?? []) {
@@ -7807,6 +7915,67 @@ class Assembler {
     return this.fsCallFunc;
   }
 
+  /** `this.cpCallFunc`, or a descriptive throw (fsCallFuncOrThrow's
+   * shape). */
+  private cpCallFuncOrThrow(): number {
+    if (this.cpCallFunc === null) {
+      throw new Error("emitter bug: a child_process key was reached but tsinter.cpCall was never imported");
+    }
+    return this.cpCallFunc;
+  }
+
+  private cpField: ChildProcBuilder | null = null;
+
+  /** INC-28 U1's own builder (childproc.ts) — child_process's synchronous
+   * surface behind ONE `cpCall` import: the request and result records,
+   * the run helper, the family wrappers and type:spawnRes. */
+  private get cp(): ChildProcBuilder {
+    const strVec = (): VecInfo => this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!;
+    this.cpField ??= new ChildProcBuilder(this.mb, {
+      strRef: () => this.strRef,
+      strType: () => this.strType,
+      cpCallFunc: () => this.cpCallFuncOrThrow(),
+      writeFunc: () => this.writeFunc,
+      ensureCapacity: (c, need) => this.emitEnsureCapacity(c, need),
+      stageCursor: () => this.cursorGlobal,
+      pushStrLit: (c, value) => this.pushStrLitInto(c, value),
+      namedTrap: (c, message) => {
+        const exc = this.exc();
+        this.pushStrLitInto(c, message);
+        c.globalSet(exc.refG);
+        c.i32Const(EXC_STR);
+        c.globalSet(exc.kindG);
+        c.call(this.reportUncaughtHelper());
+      },
+      stringVecRef: () => this.vecs.vecRef(strVec()),
+      stringVecLen: (c) => c.structGet(strVec().struct, LEN),
+      stringVecGet: () => this.vecs.get(strVec()),
+      bytesRef: () => this.bytesB.bytesRef(),
+      bytesFromStrUtf8: () => this.bytesB.fromStrHelper("utf8"),
+      bytesLength: () => this.bytesB.length(),
+      bytesGetElem: () => this.bytesB.get("u8"),
+      bytesNewLen: () => this.bytesB.newLen("u8"),
+      bytesSetElem: () => this.bytesB.setElem("u8"),
+      bytesToStrUtf8: () => this.bytesB.toStrHelper("utf8"),
+      throwCoded: (c, className, name, pushMessage, pushCode) => this.emitSetCellErrorCoded(c, className, name, pushMessage, pushCode),
+      newErrorCoded: (c, pushMessage, pushCode) => {
+        const exc = this.exc();
+        c.globalGet(this.classes.vtGlobal("%Error"));
+        this.pushStrLitInto(c, "Error");
+        pushMessage(c);
+        pushCode(c);
+        c.structNew(exc.errT);
+      },
+      errRef: () => ({ kind: "ref", nullable: true, typeIndex: this.exc().errT }),
+      concat: () => this.concatHelper(),
+      f64ToStr: () => this.f64ToStrHelper(),
+      inspectStr: () => this.insp.str(),
+      killSignalByName: () => this.proc.killSignalByNameHelper(),
+      envPairs: () => this.proc.envPairs(),
+    });
+    return this.cpField;
+  }
+
   /** The ARR payload's vector info — the SAME interning a static
    * `dyn[]` would get (`vecKeyFor` answers "dyn" for a dyn element), so
    * the two can never become distinct types by accident. */
@@ -10625,6 +10794,11 @@ class Assembler {
       // REF here keeps that guard intact without touching it).
       case "stats":
         return this.fs.statsRef();
+      // INC-28 U1: child_process's result struct (childproc.ts) — never
+      // fails, the same rule as stats; mapTypeSoft carries the same arm
+      // (a captured or parameter spawnRes must not read the placeholder).
+      case "spawnRes":
+        return this.cp.spawnResRef();
       // INC-27 U1: the $sym struct (symbols.ts) — ONE representation
       // whatever the symbol (registered or not, described or not), same
       // shape as bytes/promise/dyn/regex/stats just above: this arm
@@ -10786,6 +10960,9 @@ class Assembler {
       // repeated at the bool arm above).
       case "stats":
         return this.fs.statsRef();
+      // INC-28 U1: mapType's spawnRes arm, in lockstep.
+      case "spawnRes":
+        return this.cp.spawnResRef();
       // INC-27 U1: mapType never fails on symbol either — same
       // consistency rule as every other never-fails arm above
       // (dyn/jsval/bytes/regex/stats). This case and mapType's own
@@ -16177,6 +16354,116 @@ class Assembler {
         // the stats surface (brief-p5-v3.md a8dc6daa/303; CP1 delta
         // 29286fa4 + cp1b f7f2f8d1; design-host-v7.txt cccf7d6e §2.6/
         // §3.3-§3.6/§6.2-§6.6/§9 P5). 908 -> 920.
+        // ── INC-28 U1 — child_process's synchronous surface (childproc.ts,
+        // abi.ts cpCall). Every cp.* arm can throw (Node's own argument
+        // validation), so each is followed by the pending check.
+        if (e.fn === "cp.spawnSync") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.f64Const(0);
+          this.pushStrLitInto(code, "");
+          code.i32Const(0);
+          code.i32Const(0);
+          code.i32Const(0);
+          code.call(this.cp.spawnSyncHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "cp.spawnSyncOpts") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          this.walkExpr(e.args[2]!);
+          this.walkExpr(e.args[3]!);
+          for (const k of [4, 5, 6]) {
+            this.walkExpr(e.args[k]!);
+            code.i32TruncF64S();
+          }
+          code.call(this.cp.spawnSyncHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "cp.spawnSyncStdioStr") {
+          for (const k of [0, 1, 2, 3, 4]) this.walkExpr(e.args[k]!);
+          code.call(this.cp.spawnSyncStdioStrHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "cp.execSync") {
+          // (cmd, argv, shell, input, hasInput, cwd, hasEnv, envPairs,
+          // timeout, stdoutMode, stderrMode) — validate.ts's row.
+          for (const k of [0, 1, 2, 3, 4, 5, 6, 7, 8]) this.walkExpr(e.args[k]!);
+          this.walkExpr(e.args[9]!);
+          code.i32TruncF64S();
+          this.walkExpr(e.args[10]!);
+          code.i32TruncF64S();
+          code.call(this.cp.execSyncHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "cp.execCapture") {
+          // (cmd, argv, cwd, hasEnv, envPairs, timeout).
+          for (const k of [0, 1, 2, 3, 4, 5]) this.walkExpr(e.args[k]!);
+          code.call(this.cp.execCaptureHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "spawnRes.stdout" || e.fn === "spawnRes.stderr") {
+          this.walkExpr(e.args[0]!);
+          code.structGet(this.cp.spawnResType(), e.fn === "spawnRes.stdout" ? SR_STDOUT : SR_STDERR);
+          return;
+        }
+        if (e.fn === "spawnRes.status" || e.fn === "spawnRes.signal" || e.fn === "spawnRes.error") {
+          // The result is the call site's interned union (validate.ts):
+          // `number | null`, `string | null` (the signal's name) or
+          // `Error | undefined` (a FRESH error per read, S085) — built
+          // here, process.envGet's union-wrap shape.
+          if (e.type.kind !== "union") {
+            this.refuse(`libCall:${e.fn}:unexpected-result-shape`, e.loc);
+            code.unreachable();
+            return;
+          }
+          const unionId = e.type.unionId;
+          const def = this.unionDef(unionId);
+          const emptyKind = e.fn === "spawnRes.error" ? "undefinedT" : "nullT";
+          const valueKind = e.fn === "spawnRes.status" ? "f64" : e.fn === "spawnRes.signal" ? "string" : "object";
+          const emptyTag = def.arms.findIndex((a) => a.kind === emptyKind);
+          const valueTag = def.arms.findIndex((a) => a.kind === valueKind);
+          if (emptyTag < 0 || valueTag < 0 || def.arms.length !== 2) {
+            this.refuse(`libCall:${e.fn}:unexpected-union-shape`, e.loc);
+            code.unreachable();
+            return;
+          }
+          const armSt = this.unionArmStruct(unionId, valueTag, e.loc);
+          const unionVal = this.mapType(e.type, e.loc);
+          if (armSt === null || unionVal === null) {
+            code.unreachable();
+            return;
+          }
+          const resT = this.cp.spawnResType();
+          const R = this.acquireScratch(this.cp.spawnResRef());
+          this.walkExpr(e.args[0]!);
+          code.localSet(R);
+          code.localGet(R);
+          code.structGet(resT, e.fn === "spawnRes.status" ? SR_HAS_STATUS : e.fn === "spawnRes.signal" ? SR_SIGNAL : SR_ERR_CODE);
+          code.i32Eqz();
+          this.openIfResult(unionVal);
+          code.globalGet(this.unions.unitGlobal(emptyTag));
+          code.else_();
+          code.i32Const(valueTag);
+          code.localGet(R);
+          if (e.fn === "spawnRes.status") {
+            code.structGet(resT, SR_STATUS);
+          } else if (e.fn === "spawnRes.signal") {
+            code.structGet(resT, SR_SIGNAL);
+            code.call(this.cp.signalNameHelper());
+          } else {
+            code.call(this.cp.errorHelper());
+          }
+          code.structNew(armSt);
+          this.close();
+          this.releaseScratch(this.cp.spawnResRef(), R);
+          return;
+        }
         if (e.fn === "fs.statSync") {
           this.walkExpr(e.args[0]!);
           code.call(this.fs.statSyncHelper());

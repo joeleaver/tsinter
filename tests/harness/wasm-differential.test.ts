@@ -31,7 +31,7 @@
  * the raised error itself. The one nonzero exit that is NOT a trap is a
  * top-level-await program whose module evaluation promise never settled:
  * `_status()` answers Node's 13 (abi.ts). */
-import { execFile, execFileSync } from "node:child_process";
+import { execFile, execFileSync, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import {
   accessSync,
@@ -58,7 +58,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir, networkInterfaces, release, tmpdir, totalmem, type as osType, userInfo } from "node:os";
+import { constants as osConstants, homedir, networkInterfaces, release, tmpdir, totalmem, type as osType, userInfo } from "node:os";
 import { basename, dirname, join, resolve as pathResolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
@@ -3392,6 +3392,25 @@ const TIER_FLOOR: string[] = [
   // fused multiply-adds; SEMANTICS.md S079) and `bin:**` is routed to it.
   "304-compound-incdec.ts",
   "700-classes-basic.ts",
+  // INC-28 U1: child_process's synchronous surface (spawnSync, execSync,
+  // execFileSync and promisified execFile through the cpCall host import,
+  // the host holding each result behind a handle; SEMANTICS.md S085, S086):
+  // 966 -> 981, the fifteen programs this unit lands.
+  "1360-spawn-sync.ts",
+  "1462-exec-sync.ts",
+  "1464-env-writes.ts",
+  "1473-promisify-execfile.ts",
+  "1482-spawnsync-error.ts",
+  "1521-fs-lstat-lock.ts",
+  "1552-exec-options-record.ts",
+  "1573-promisify-execfile-env-spread.ts",
+  "1578-exec-input-optional.ts",
+  "1580-exec-env-conditional-spread.ts",
+  "1655-spawnsync-neutral.ts",
+  "1656-execsync-neutral.ts",
+  "2362-execsync-inherit.ts",
+  "2697-spawnsync-options.ts",
+  "2708-os-release-spawnsync-stdio.ts",
 ];
 
 interface RunResult {
@@ -3706,6 +3725,198 @@ function direntType(d: import("node:fs").Dirent): number {
   return 0;
 }
 
+// ── INC-28 U1 — the cpCall adapter's pure parts (abi.ts cpCall) ─────────
+// Module-scope (not runWasm-local) so the U1 block's unit rows drive them
+// directly, the mapFsError precedent. runWasm's own cpCall closure below
+// is the only other caller.
+
+/** One RUN request, decoded from the module's record (abi.ts layout). */
+interface CpRequest {
+  stdinMode: number;
+  stdoutMode: number;
+  stderrMode: number;
+  killSignal: number;
+  timeoutMs: number;
+  maxBufferMode: number;
+  file: string;
+  argv: string[];
+  cwd: string;
+  env: [string, string][];
+  input: Uint8Array;
+}
+
+/** A finished child, transcribed field by field from Node's own
+ * spawnSync result. */
+interface CpResult {
+  hasStatus: number;
+  status: number;
+  signal: number;
+  errCode: number;
+  stdout: Uint8Array;
+  stderr: Uint8Array;
+}
+
+/** Decodes the request record at [ptr, ptr + len): the 32-byte header
+ * through a DataView, then the runs (u32 count + UTF-16 units, padded to
+ * 4) and the input bytes. Throws on any record whose parts do not add up
+ * to exactly `len` bytes. */
+function cpDecodeRequest(buffer: ArrayBufferLike, ptr: number, len: number): CpRequest {
+  const dv = new DataView(buffer, ptr, len);
+  let off = 32;
+  const u32 = (): number => {
+    const v = dv.getUint32(off, true);
+    off += 4;
+    return v;
+  };
+  const run = (): string => {
+    const n = u32();
+    const units = new Uint16Array(buffer, ptr + off, n);
+    let text = "";
+    for (let i = 0; i < n; i += 4096) text += String.fromCharCode(...units.subarray(i, Math.min(n, i + 4096)));
+    off += (2 * n + 3) & ~3;
+    return text;
+  };
+  const file = run();
+  const argc = u32();
+  const argv: string[] = [];
+  for (let i = 0; i < argc; i++) argv.push(run());
+  const cwd = run();
+  const pairs = u32();
+  const env: [string, string][] = [];
+  for (let i = 0; i < pairs; i++) {
+    const key = run();
+    env.push([key, run()]);
+  }
+  const inputLen = u32();
+  const input = new Uint8Array(buffer, ptr + off, inputLen).slice();
+  off += inputLen;
+  if (off !== len) throw new Error(`cpCall: request record is ${len} bytes but its parts add up to ${off}`);
+  return {
+    stdinMode: dv.getUint32(0, true),
+    stdoutMode: dv.getUint32(4, true),
+    stderrMode: dv.getUint32(8, true),
+    killSignal: dv.getUint32(12, true),
+    timeoutMs: dv.getFloat64(16, true),
+    maxBufferMode: dv.getUint32(24, true),
+    file,
+    argv,
+    cwd,
+    env,
+    input,
+  };
+}
+
+/** stdin per mode: 0 pipe at end-of-file, 1 pipe carrying the input, 2
+ * inherit EMULATED as a pipe at end-of-file (the program's own stdin is
+ * not this worker's; the oracle's is a closed pipe, so its children read
+ * end-of-file too), 3 ignore. */
+function cpStdinFor(mode: number): "pipe" | "ignore" {
+  if (mode === 0 || mode === 1 || mode === 2) return "pipe";
+  if (mode === 3) return "ignore";
+  throw new Error(`cpCall: unknown stdin mode ${mode}`);
+}
+
+/** stdout/stderr per mode: 0 capture, 1 discard, 2 inherit EMULATED —
+ * captured here and written by the module to its own fd (a real inherit
+ * would write to this worker's fds, past the per-fd capture). */
+function cpStdioFor(mode: number): "pipe" | "ignore" {
+  if (mode === 0 || mode === 2) return "pipe";
+  if (mode === 1) return "ignore";
+  throw new Error(`cpCall: unknown output mode ${mode}`);
+}
+
+/** maxBuffer: unbounded for the exec family (mode 1), and whenever
+ * neither output is captured (Node has no pipe to limit then); otherwise
+ * Node's default. */
+function cpMaxBufferFor(req: Pick<CpRequest, "maxBufferMode" | "stdoutMode" | "stderrMode">): number | undefined {
+  if (req.maxBufferMode === 1) return Infinity;
+  if (req.stdoutMode !== 0 && req.stderrMode !== 0) return Infinity;
+  return undefined;
+}
+
+/** The host's own errno table, written independently of the module's
+ * (childproc.ts CP_CODES): index 1..15. A U1 unit row checks it against
+ * the literal list. */
+const CP_HOST_CODE_INDEX: Readonly<Record<string, number>> = {
+  ENOENT: 1,
+  EACCES: 2,
+  EPERM: 3,
+  ENOTDIR: 4,
+  ENOEXEC: 5,
+  ELOOP: 6,
+  ENAMETOOLONG: 7,
+  E2BIG: 8,
+  ENOMEM: 9,
+  EAGAIN: 10,
+  EIO: 11,
+  EINVAL: 12,
+  ETIMEDOUT: 13,
+  EPIPE: 14,
+  ENOBUFS: 15,
+};
+
+/** Node's result.error -> the record's errCode: 0 none, the table's
+ * index, or -(256 + errno) for a code outside it. */
+function cpErrCodeFor(error: Error | undefined): number {
+  if (error === undefined) return 0;
+  const err = error as NodeJS.ErrnoException;
+  const idx = err.code !== undefined ? CP_HOST_CODE_INDEX[err.code] : undefined;
+  if (idx !== undefined) return idx;
+  if (typeof err.errno !== "number") throw new Error(`cpCall: a child error with no .errno: ${err.code ?? err.message}`);
+  return -(256 + Math.abs(err.errno));
+}
+
+/** Writes a result record (abi.ts layout) at ptr through a DataView. */
+function cpEncodeResult(buffer: ArrayBufferLike, ptr: number, r: CpResult): void {
+  const dv = new DataView(buffer, ptr, 32);
+  dv.setUint32(0, r.hasStatus, true);
+  dv.setFloat64(4, r.status, true);
+  dv.setUint32(12, r.signal, true);
+  dv.setInt32(16, r.errCode, true);
+  dv.setUint32(20, r.stdout.length, true);
+  dv.setUint32(24, r.stderr.length, true);
+  dv.setUint32(28, 0, true);
+}
+
+/** Runs one decoded request with Node's own spawnSync and transcribes the
+ * result. The environment is ALWAYS the request's (the module sends its
+ * own map when the program gave no env option); the cwd is omitted when
+ * the run is empty. */
+function cpRunRequest(req: CpRequest): CpResult {
+  const env: Record<string, string> = Object.create(null) as Record<string, string>;
+  for (const [k, v] of req.env) env[k] = v;
+  const r = spawnSync(req.file, req.argv, {
+    ...(req.cwd === "" ? {} : { cwd: req.cwd }),
+    env,
+    stdio: [cpStdinFor(req.stdinMode), cpStdioFor(req.stdoutMode), cpStdioFor(req.stderrMode)],
+    ...(req.stdinMode === 1 ? { input: req.input } : {}),
+    ...(req.timeoutMs > 0 ? { timeout: req.timeoutMs } : {}),
+    killSignal: req.killSignal,
+    ...(cpMaxBufferFor(req) === undefined ? {} : { maxBuffer: Infinity }),
+    encoding: "buffer",
+    windowsHide: true,
+  });
+  const signals = osConstants.signals as Record<string, number>;
+  return {
+    hasStatus: r.status === null ? 0 : 1,
+    status: r.status ?? 0,
+    signal: r.signal === null ? 0 : (signals[r.signal] ?? 0),
+    errCode: cpErrCodeFor(r.error),
+    stdout: r.stdout ?? new Uint8Array(0),
+    stderr: r.stderr ?? new Uint8Array(0),
+  };
+}
+
+/** RUN's guard: any host-side throw becomes the negative status the
+ * module turns into its named trap. */
+function cpGuardedRun(run: () => number): number {
+  try {
+    return run();
+  } catch {
+    return -1;
+  }
+}
+
 async function runWasm(modulePath: string): Promise<RunResult> {
   const chunks: { 1: Buffer[]; 2: Buffer[] } = { 1: [], 2: [] };
   let memory: WebAssembly.Memory | null = null;
@@ -3809,6 +4020,13 @@ async function runWasm(modulePath: string): Promise<RunResult> {
   // in-process run — R-6/A-9's own measured flake axis with no bug; a
   // snapshot avoids observing that drift mid-run at least).
   let netIfSnapshot: string | null = null;
+  // INC-28 U1 (abi.ts cpCall): every finished child this run started,
+  // behind its handle; cleared in the finally below and required EMPTY
+  // after a clean run (no trap, no exit) — the module FREEs every handle
+  // it RUNs on every path that returns.
+  const cpHandles = new Map<number, CpResult>();
+  let cpNextHandle = 0;
+  let cleanRun = false;
   const { instance } = await WebAssembly.instantiate(readFileSync(modulePath), {
     tsinter: {
       write(fd: number, ptr: number, len: number): void {
@@ -4382,6 +4600,42 @@ async function runWasm(modulePath: string): Promise<RunResult> {
           return mapFsError(e, modulePath);
         }
       },
+      // INC-28 U1 (abi.ts cpCall): Node's own spawnSync runs the child; the
+      // result is transcribed field by field and held behind a handle.
+      // RUN advances the virtual clock by the child's measured duration,
+      // so a timer armed before a long child is due when the call returns.
+      cpCall(op: number, ptr: number, len: number, h: number, which: number): number {
+        if (memory === null) throw new Error("cpCall before instantiation completed");
+        const mem = memory;
+        if (op === 1) {
+          return cpGuardedRun(() => {
+            const req = cpDecodeRequest(mem.buffer, ptr, len);
+            const t0 = performance.now();
+            const result = cpRunRequest(req);
+            clock += performance.now() - t0;
+            const handle = cpNextHandle++;
+            cpHandles.set(handle, result);
+            return handle;
+          });
+        }
+        const result = cpHandles.get(h);
+        if (result === undefined) return -1;
+        if (op === 2) {
+          cpEncodeResult(mem.buffer, ptr, result);
+          return 32;
+        }
+        if (op === 3) {
+          const bytes = which === 1 ? result.stdout : which === 2 ? result.stderr : null;
+          if (bytes === null) return -1;
+          new Uint8Array(mem.buffer, ptr, bytes.length).set(bytes);
+          return bytes.length;
+        }
+        if (op === 4) {
+          cpHandles.delete(h);
+          return 0;
+        }
+        return -1;
+      },
     },
   });
   memory = instance.exports["memory"] as WebAssembly.Memory;
@@ -4403,6 +4657,7 @@ async function runWasm(modulePath: string): Promise<RunResult> {
         clock = Math.max(clock, due);
       }
     }
+    cleanRun = true;
     // The one non-trap nonzero exit (abi.ts): a top-level-await program
     // whose module evaluation promise never settled answers 13 here, which
     // is Node's own status for it. Only meaningful at quiescence, which is
@@ -4431,6 +4686,11 @@ async function runWasm(modulePath: string): Promise<RunResult> {
     if (!(err instanceof WebAssembly.RuntimeError)) throw err;
     return { stdout: Buffer.concat(chunks[1]), stderr: Buffer.concat(chunks[2]), exitCode: 1 };
   } finally {
+    // INC-28 U1: a clean run (no trap, no exit) must have FREEd every
+    // child handle it RUN; a trap or an exit may leave one, which this
+    // per-run table simply drops.
+    const leakedHandles = cpHandles.size;
+    cpHandles.clear();
     // N-3 (CP1 delta): remove every path THIS RUN created — so a program
     // that TRAPS mid-test still leaves the tree clean (992's own
     // `freshDir` is the evidence that traps happen in practice). Wraps
@@ -4454,6 +4714,10 @@ async function runWasm(modulePath: string): Promise<RunResult> {
         // Best-effort: the program's own closeSync arm, or its own
         // failure path, may have already closed it.
       }
+    }
+    // INC-28 U1: thrown LAST, after every cleanup above has run.
+    if (cleanRun && leakedHandles !== 0) {
+      throw new Error(`cpCall: ${leakedHandles} child handle(s) never freed after a clean run of ${modulePath}`);
     }
   }
   return { stdout: Buffer.concat(chunks[1]), stderr: Buffer.concat(chunks[2]), exitCode: 0 };
@@ -4839,5 +5103,544 @@ describe("board #150: no dangling SEMANTICS.md citation at the skip-rule sites",
       );
     }
     expect(matched).toBe(4);
+  });
+});
+
+// ── INC-28 U1 child_process rows ─────────────────────────────────────────
+// Rows that need a real child run through this file's own runWasm (never
+// a copy of the host); the cpCall adapter's pure parts are driven
+// directly by the unit rows (mapFsError's precedent). Not shard-gated: a
+// row compiles its inline source into its own mkdtemp directory and
+// shares no path or state with any other row or copy of this block.
+describe("INC-28 U1 child_process rows", () => {
+  /** Compiles `src` (a whole program) in a fresh directory of its own and
+   * runs it through this file's runWasm; the directory goes afterwards. */
+  async function runU1Source(src: string): Promise<RunResult> {
+    const dir = mkdtempSync(join(tmpdir(), "u1-row-"));
+    try {
+      const file = join(dir, "main.ts");
+      writeFileSync(file, src);
+      const res = await compile(file, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: false, backend: "wasm" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+      return await runWasm(res.binaryPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  /** A corpus program compiled into a fresh directory of its own (never
+   * the shared content-keyed cache), then run through runWasm. */
+  async function runU1Corpus(name: string): Promise<RunResult> {
+    const dir = mkdtempSync(join(tmpdir(), "u1-corpus-"));
+    try {
+      const res = await compile(join(corpusDir, name), { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: false, backend: "wasm" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+      return await runWasm(res.binaryPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  test("U1-C-1360 corpus 1360-spawn-sync.ts: full stdout, stderr and exit code equal Node's", async () => {
+    const r = await runU1Corpus("1360-spawn-sync.ts");
+    expect(r.stdout.toString("utf8")).toBe("hello spawn\n\n0\n3 out\n err\n\n0\nvia-path\n\ntrue 0 0\ntrue\n0 52890 25890\ntrue\ndone\n\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-C-1464 corpus 1464-env-writes.ts: full stdout, stderr and exit code equal Node's", async () => {
+    const r = await runU1Corpus("1464-env-writes.ts");
+    expect(r.stdout.toString("utf8")).toBe("before: (unset)\nafter: written\noverwrite: rewritten\ncomputed: via-brackets\nchild sees: rewritten\ntemplate: n=6\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-C-1482 corpus 1482-spawnsync-error.ts: full stdout, stderr and exit code equal Node's", async () => {
+    const r = await runU1Corpus("1482-spawnsync-error.ts");
+    expect(r.stdout.toString("utf8")).toBe("status: null\nmessage: spawnSync definitely-not-a-binary-xyz ENOENT\ninstanceof: true\ncode: ENOENT true\navailable: false\nok error: true true hi\nfailed error: true true\nexited 2\nspawn failed (ENOENT)\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-C-1655 corpus 1655-spawnsync-neutral.ts: full stdout, stderr and exit code equal Node's", async () => {
+    const r = await runU1Corpus("1655-spawnsync-neutral.ts");
+    expect(r.stdout.toString("utf8")).toBe("\"hello from child\\n\" 0\n[\"plain\",\"with space\",\"tab\\there\",\"quote\\\"inside\",\"trailing\\\\\",\"back\\\\slash\",\"both\\\\\\\"mix\",\"run\\\\\\\\\",\"\",\"last one\"]\n\n0\n3 \"out\\n\" \"err\\n\"\nnull ENOENT\nprobe: 0 null true\ntimeout: null SIGTERM ETIMEDOUT\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-C-2697 corpus 2697-spawnsync-options.ts: full stdout, stderr and exit code equal Node's", async () => {
+    const r = await runU1Corpus("2697-spawnsync-options.ts");
+    expect(r.stdout.toString("utf8")).toBe("probe: 0 null true\nmissing: null ENOENT null\ntimeout: null SIGKILL ETIMEDOUT\ntimeout default: SIGTERM\nselfkill: null SIGTERM true\ncapture: \"up\\n\" \"down\\n\" 4 null\nquiet: 0\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-C-2708 corpus 2708-os-release-spawnsync-stdio.ts: full stdout, stderr and exit code equal Node's", async () => {
+    const r = await runU1Corpus("2708-os-release-spawnsync-stdio.ts");
+    expect(r.stdout.toString("utf8")).toBe("7.0.0-31-generic\ntrue true\n0 \"captured-line\\n\"\n0 \"explicit-pipe\\n\"\nbefore-inherit\ninherited-line\nafter-inherit 0\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-RUN-01 spawnSync with asymmetric stdio tuples captures exactly the piped stream, and both with an exit status", async () => {
+    const r = await runU1Source("// spawnSync with asymmetric stdio tuples: one output captured, the other\n// discarded, both ways round (only the captured stream is printed); then\n// both captured with an exit status.\nimport { spawnSync } from \"node:child_process\";\n\nconst a = spawnSync(\"/bin/sh\", [\"-c\", \"echo to-out; echo to-err 1>&2\"], { encoding: \"utf8\", stdio: [\"pipe\", \"pipe\", \"ignore\"] });\nconsole.log(\"out-only:\", JSON.stringify(a.stdout), a.status);\nconst b = spawnSync(\"/bin/sh\", [\"-c\", \"echo to-out; echo to-err 1>&2\"], { encoding: \"utf8\", stdio: [\"pipe\", \"ignore\", \"pipe\"] });\nconsole.log(\"err-only:\", JSON.stringify(b.stderr), b.status);\nconst c = spawnSync(\"/bin/sh\", [\"-c\", \"echo to-out; echo to-err 1>&2; exit 2\"], { encoding: \"utf8\", stdio: \"pipe\" });\nconsole.log(\"both:\", JSON.stringify(c.stdout), JSON.stringify(c.stderr), c.status, c.signal);\n");
+    expect(r.stdout.toString("utf8")).toBe("out-only: \"to-out\\n\" 0\nerr-only: \"to-err\\n\" 0\nboth: \"to-out\\n\" \"to-err\\n\" 2 null\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-RUN-06 timeout + killSignal: the kill's signal and ETIMEDOUT; a child trapping the signal reports its own status beside ETIMEDOUT", async () => {
+    const r = await runU1Source("// timeout + killSignal on spawnSync, and a child that traps SIGTERM and\n// exits after the timeout's signal: Node reports its status AND ETIMEDOUT.\nimport { spawnSync } from \"node:child_process\";\n\nconst k = spawnSync(\"sleep\", [\"5\"], { timeout: 200, killSignal: \"SIGKILL\", encoding: \"utf8\" });\nconsole.log(\"kill:\", k.status, k.signal, `${(k.error as NodeJS.ErrnoException | undefined)?.code}`, k.error?.message);\nconst d = spawnSync(\"sleep\", [\"5\"], { timeout: 200, encoding: \"utf8\" });\nconsole.log(\"default:\", d.status, d.signal, `${(d.error as NodeJS.ErrnoException | undefined)?.code}`);\nconst t = spawnSync(\"/bin/sh\", [\"-c\", \"trap 'echo trapped; exit 7' TERM; sleep 5 & wait\"], { timeout: 300, encoding: \"utf8\" });\nconsole.log(\"trapped:\", t.status, t.signal, `${(t.error as NodeJS.ErrnoException | undefined)?.code}`, JSON.stringify(t.stdout));\nconst z = spawnSync(\"/bin/sh\", [\"-c\", \"trap 'exit 0' TERM; sleep 5 & wait\"], { timeout: 300, encoding: \"utf8\" });\nconsole.log(\"trapped0:\", z.status, z.signal, `${(z.error as NodeJS.ErrnoException | undefined)?.code}`);\n");
+    expect(r.stdout.toString("utf8")).toBe("kill: null SIGKILL ETIMEDOUT spawnSync sleep ETIMEDOUT\ndefault: null SIGTERM ETIMEDOUT\ntrapped: null SIGPIPE ETIMEDOUT \"\"\ntrapped0: 0 null ETIMEDOUT\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-RUN-07 spawnSync's default 1 MiB maxBuffer: ENOBUFS with SIGTERM past it, exactly 1 MiB passes", async () => {
+    const r = await runU1Source("// spawnSync's default maxBuffer (1 MiB): a child writing more is killed\n// with SIGTERM and the result carries ENOBUFS.\nimport { spawnSync } from \"node:child_process\";\n\nconst r = spawnSync(\"/bin/sh\", [\"-c\", \"head -c 3000000 /dev/zero | tr '\\\\0' 'x'\"], { encoding: \"utf8\" });\nconsole.log(\"big:\", r.status, r.signal, `${(r.error as NodeJS.ErrnoException | undefined)?.code}`, r.error?.message, r.stdout.length >= 1048576);\nconst ok = spawnSync(\"/bin/sh\", [\"-c\", \"head -c 1048576 /dev/zero | tr '\\\\0' 'y'\"], { encoding: \"utf8\" });\nconsole.log(\"exact:\", ok.status, ok.signal, ok.error === undefined, ok.stdout.length);\n");
+    expect(r.stdout.toString("utf8")).toBe("big: null SIGTERM ENOBUFS spawnSync /bin/sh ENOBUFS true\nexact: 0 null true 1048576\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-RUN-09 a spawnSync result flows through a ReturnType parameter, a closure, || and a conditional with undefined", async () => {
+    const r = await runU1Source("// A spawnSync result as an ordinary value: through a ReturnType-typed\n// parameter, captured by a closure, chosen by `||` and by a conditional\n// with undefined, and read through optional chaining.\nimport { spawnSync } from \"node:child_process\";\n\nfunction make(word: string) {\n  return spawnSync(\"/bin/echo\", [word], { encoding: \"utf8\" });\n}\ntype R = ReturnType<typeof make>;\nfunction show(r: R): string {\n  return `${r.status}:${r.stdout.trim()}`;\n}\nconst r = make(\"flow\");\nconst later = (): string => r.stdout.trim();\nconsole.log(show(r), later());\nconst none: R | undefined = undefined;\nconst either = none || make(\"fallback\");\nconsole.log(either.status, either.stdout.trim());\nconst flag = process.argv.length > 99;\nconst maybe = flag ? undefined : make(\"maybe\");\nconsole.log(maybe?.status, maybe?.stdout.trim());\nconst skipped = flag ? make(\"never\") : undefined;\nconsole.log(skipped?.status ?? \"none\");\n");
+    expect(r.stdout.toString("utf8")).toBe("0:flow flow\n0 fallback\n0 maybe\nnone\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-RUN-10 env writes holding U+0000 reach a child cut at the NUL, as Node's environment holds them", async () => {
+    const r = await runU1Source("// process.env writes holding U+0000 in a value and in a key, then a child\n// that prints both through the inherited environment.\nimport { spawnSync } from \"node:child_process\";\n\nprocess.env.SCRIPTC_U1_NUL = \"a\\u0000b\";\nprocess.env[\"SCRIPTC_U1_K\\u0000Y\"] = \"kv\";\nconst r = spawnSync(\"/bin/sh\", [\"-c\", \"printf '[%s][%s]' \\\"$SCRIPTC_U1_NUL\\\" \\\"${SCRIPTC_U1_K-unset}\\\"\"], { encoding: \"utf8\" });\nconsole.log(\"child:\", r.status, r.error === undefined, JSON.stringify(r.stdout));\n");
+    expect(r.stdout.toString("utf8")).toBe("child: 0 true \"[a][kv]\"\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-ERR-01 spawnSync's error property: ENOENT, EACCES, ENOTDIR as a real Error with code; none for a child that ran and failed", async () => {
+    const r = await runU1Source("// spawnSync's error property for spawn failures: a missing binary, a file\n// that is not executable, a directory, a path through a file \u2014 and no\n// error for a child that ran and failed.\nimport { spawnSync } from \"node:child_process\";\nimport { chmodSync, mkdtempSync, rmSync, writeFileSync } from \"node:fs\";\nimport { tmpdir } from \"node:os\";\nimport { join } from \"node:path\";\n\nconst dir = mkdtempSync(join(tmpdir(), \"u1-err-\"));\nconst plain = join(dir, \"plain.sh\");\nwriteFileSync(plain, \"echo hi\\n\");\nchmodSync(plain, 0o644);\nconst show = (label: string, file: string): void => {\n  const r = spawnSync(file, [], { encoding: \"utf8\" });\n  if (r.error) {\n    console.log(label, r.status, r.signal, r.error.message.split(dir).join(\"<dir>\"), `${(r.error as NodeJS.ErrnoException).code}`, r.error instanceof Error);\n  } else {\n    console.log(label, r.status, r.signal, \"no error\");\n  }\n};\nshow(\"missing:\", \"definitely-not-a-binary-xyz\");\nshow(\"abs-missing:\", \"/definitely/not/here\");\nshow(\"not-exec:\", plain);\nshow(\"directory:\", dir);\nshow(\"through-file:\", join(plain, \"x\"));\nshow(\"ran-and-failed:\", \"false\");\nrmSync(dir, { recursive: true, force: true });\n");
+    expect(r.stdout.toString("utf8")).toBe("missing: null null spawnSync definitely-not-a-binary-xyz ENOENT ENOENT true\nabs-missing: null null spawnSync /definitely/not/here ENOENT ENOENT true\nnot-exec: null null spawnSync <dir>/plain.sh EACCES EACCES true\ndirectory: null null spawnSync <dir> EACCES EACCES true\nthrough-file: null null spawnSync <dir>/plain.sh/x ENOTDIR ENOTDIR true\nran-and-failed: 1 null no error\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-VAL-01 timeout validation through spawnSync: Node's RangeError text incl. numeric separators; -0, 2**53 and 1e21 accepted", async () => {
+    const r = await runU1Source("// timeout validation through spawnSync: values Node accepts and the\n// RangeError text for the ones it rejects.\nimport { spawnSync } from \"node:child_process\";\n\nconst vals: number[] = [1.5, -1, NaN, Infinity, -Infinity, -0, 2 ** 53, -(2 ** 33), -(2 ** 32) - 1, -(2 ** 32), -1e21, 4294967296.5, -4294967296.5, 0.1, 1e21];\nfor (const v of vals) {\n  try {\n    const r = spawnSync(\"true\", [], { timeout: v });\n    console.log(\"ran\", r.status, r.error === undefined);\n  } catch (e) {\n    console.log(\"threw\", e instanceof Error ? e.name + \": \" + e.message : \"?\", `${(e as NodeJS.ErrnoException).code}`);\n  }\n}\n");
+    expect(r.stdout.toString("utf8")).toBe("threw RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received 1.5 ERR_OUT_OF_RANGE\nthrew RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received -1 ERR_OUT_OF_RANGE\nthrew RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received NaN ERR_OUT_OF_RANGE\nthrew RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received Infinity ERR_OUT_OF_RANGE\nthrew RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received -Infinity ERR_OUT_OF_RANGE\nran 0 true\nran 0 true\nthrew RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received -8_589_934_592 ERR_OUT_OF_RANGE\nthrew RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received -4_294_967_297 ERR_OUT_OF_RANGE\nthrew RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received -4294967296 ERR_OUT_OF_RANGE\nthrew RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received -1e_+21 ERR_OUT_OF_RANGE\nthrew RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received 4294967296.5 ERR_OUT_OF_RANGE\nthrew RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received -4294967296.5 ERR_OUT_OF_RANGE\nthrew RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received 0.1 ERR_OUT_OF_RANGE\nran 0 true\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-VAL-02 killSignal SIGINFO throws Node's ERR_UNKNOWN_SIGNAL TypeError; SIGIOT is accepted", async () => {
+    const r = await runU1Source("// killSignal validation: a name Node's front end accepts but Linux lacks.\nimport { spawnSync } from \"node:child_process\";\n\ntry {\n  const r = spawnSync(\"true\", [], { killSignal: \"SIGINFO\" });\n  console.log(\"no throw\", r.status);\n} catch (e) {\n  console.log(\"threw\", e instanceof Error ? e.name + \": \" + e.message : \"?\", `${(e as NodeJS.ErrnoException).code}`);\n}\nconst ok = spawnSync(\"true\", [], { killSignal: \"SIGIOT\", timeout: 1000 });\nconsole.log(\"alias ok\", ok.status, ok.error === undefined);\n");
+    expect(r.stdout.toString("utf8")).toBe("threw TypeError: Unknown signal: SIGINFO ERR_UNKNOWN_SIGNAL\nalias ok 0 true\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-VAL-03 NUL in spawnSync's file and arguments: Node's TypeError with the inspect-quoted value (quote choice, escapes, 128 cut); an empty file", async () => {
+    const r = await runU1Source("// NUL bytes in spawnSync's file and arguments, the inspect-quoted value in\n// the message, and the empty file name.\nimport { spawnSync } from \"node:child_process\";\n\nconst show = (label: string, f: () => void): void => {\n  try {\n    f();\n    console.log(label, \"no throw\");\n  } catch (e) {\n    console.log(label, e instanceof Error ? e.name + \": \" + JSON.stringify(e.message) : \"?\", `${(e as NodeJS.ErrnoException).code}`);\n  }\n};\nshow(\"file:\", () => spawnSync(\"ec\\u0000ho\", [], {}));\nshow(\"arg0:\", () => spawnSync(\"echo\", [\"a\\u0000b\"], {}));\nshow(\"arg2:\", () => spawnSync(\"echo\", [\"ok\", \"fine\", \"x\\u0000\"], {}));\nshow(\"both-quotes:\", () => spawnSync(\"echo\", [\"it's\\u0000\\\"q\\\"\"], {}));\nshow(\"single-quote:\", () => spawnSync(\"echo\", [\"it's\\u0000\"], {}));\nshow(\"newline:\", () => spawnSync(\"echo\", [\"line1\\nline2 is long enough\\u0000\"], {}));\nshow(\"long:\", () => spawnSync(\"echo\", [\"x\".repeat(200) + \"\\u0000\"], {}));\nshow(\"tab-and-unicode:\", () => spawnSync(\"echo\", [\"\\t\u00e9\u2028\\u0000\"], {}));\nshow(\"empty-file:\", () => spawnSync(\"\", [], {}));\nshow(\"plain-form:\", () => spawnSync(\"ec\\u0000ho\"));\n");
+    expect(r.stdout.toString("utf8")).toBe("file: TypeError: \"The argument 'file' must be a string without null bytes. Received 'ec\\\\x00ho'\" ERR_INVALID_ARG_VALUE\narg0: TypeError: \"The argument 'args[0]' must be a string without null bytes. Received 'a\\\\x00b'\" ERR_INVALID_ARG_VALUE\narg2: TypeError: \"The argument 'args[2]' must be a string without null bytes. Received 'x\\\\x00'\" ERR_INVALID_ARG_VALUE\nboth-quotes: TypeError: \"The argument 'args[0]' must be a string without null bytes. Received `it's\\\\x00\\\"q\\\"`\" ERR_INVALID_ARG_VALUE\nsingle-quote: TypeError: \"The argument 'args[0]' must be a string without null bytes. Received \\\"it's\\\\x00\\\"\" ERR_INVALID_ARG_VALUE\nnewline: TypeError: \"The argument 'args[0]' must be a string without null bytes. Received 'line1\\\\nline2 is long enough\\\\x00'\" ERR_INVALID_ARG_VALUE\nlong: TypeError: \"The argument 'args[0]' must be a string without null bytes. Received 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...\" ERR_INVALID_ARG_VALUE\ntab-and-unicode: TypeError: \"The argument 'args[0]' must be a string without null bytes. Received '\\\\t\u00e9\u2028\\\\x00'\" ERR_INVALID_ARG_VALUE\nempty-file: TypeError: \"The argument 'file' cannot be empty. Received ''\" ERR_INVALID_ARG_VALUE\nplain-form: TypeError: \"The argument 'file' must be a string without null bytes. Received 'ec\\\\x00ho'\" ERR_INVALID_ARG_VALUE\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-VAL-04 spawnSync validates in Node's order: file, args, timeout, killSignal", async () => {
+    const r = await runU1Source("// Node's validation order through spawnSync: file, args, timeout,\n// killSignal.\nimport { spawnSync } from \"node:child_process\";\n\nconst show = (label: string, f: () => void): void => {\n  try {\n    f();\n    console.log(label, \"no throw\");\n  } catch (e) {\n    console.log(label, e instanceof Error ? e.name + \": \" + e.message : \"?\");\n  }\n};\nshow(\"file<args:\", () => spawnSync(\"f\\u0000\", [\"a\\u0000\"], {}));\nshow(\"args<timeout:\", () => spawnSync(\"echo\", [\"a\\u0000\"], { timeout: -1 }));\nshow(\"timeout<signal:\", () => spawnSync(\"echo\", [], { timeout: -1, killSignal: \"SIGINFO\" }));\nshow(\"args<signal:\", () => spawnSync(\"echo\", [\"b\\u0000\"], { killSignal: \"SIGINFO\" }));\nshow(\"empty<args:\", () => spawnSync(\"\", [\"a\\u0000\"], {}));\n");
+    expect(r.stdout.toString("utf8")).toBe("file<args: TypeError: The argument 'file' must be a string without null bytes. Received 'f\\x00'\nargs<timeout: TypeError: The argument 'args[0]' must be a string without null bytes. Received 'a\\x00'\ntimeout<signal: RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received -1\nargs<signal: TypeError: The argument 'args[0]' must be a string without null bytes. Received 'b\\x00'\nempty<args: TypeError: The argument 'file' cannot be empty. Received ''\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-VAL-05 a spawnSync validation throw inside a named function, an arrow, a class method and two calls deep is caught by the caller", async () => {
+    const r = await runU1Source("// A spawnSync validation throw raised inside a named function, an arrow,\n// a class method and a function two calls deep, each caught by its caller.\nimport { spawnSync } from \"node:child_process\";\n\nfunction named(): number | null {\n  return spawnSync(\"n\\u0000\", [], {}).status;\n}\nconst arrow = (): number | null => spawnSync(\"echo\", [\"a\\u0000\"], {}).status;\nclass Runner {\n  run(): number | null {\n    return spawnSync(\"true\", [], { timeout: -1 }).status;\n  }\n}\nfunction inner(): number | null {\n  return spawnSync(\"true\", [], { killSignal: \"SIGINFO\" }).status;\n}\nfunction outer(): number | null {\n  return inner();\n}\nconst attempt = (label: string, f: () => number | null): void => {\n  try {\n    console.log(label, \"returned\", f());\n  } catch (e) {\n    console.log(label, \"caught\", e instanceof Error ? e.name + \": \" + e.message : \"?\");\n  }\n};\nattempt(\"named:\", named);\nattempt(\"arrow:\", arrow);\nattempt(\"method:\", () => new Runner().run());\nattempt(\"two-deep:\", outer);\ntry {\n  named();\n  console.log(\"direct-call: no throw\");\n} catch (e) {\n  console.log(\"direct-call: caught\", e instanceof Error ? e.message : \"?\");\n}\nconsole.log(\"after\");\n");
+    expect(r.stdout.toString("utf8")).toBe("named: caught TypeError: The argument 'file' must be a string without null bytes. Received 'n\\x00'\narrow: caught TypeError: The argument 'args[0]' must be a string without null bytes. Received 'a\\x00'\nmethod: caught RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received -1\ntwo-deep: caught TypeError: Unknown signal: SIGINFO\ndirect-call: caught The argument 'file' must be a string without null bytes. Received 'n\\x00'\nafter\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-RES-01 every spawnSync result field per outcome: exit 0, exit 3, signal, spawn failure, timeout, trapped timeout (status AND error)", async () => {
+    const r = await runU1Source("// Every field of the spawnSync result printed for each outcome kind (a\n// failed spawn's outputs are left out: their reading is registered).\nimport { spawnSync } from \"node:child_process\";\n\nconst show = (label: string, file: string, args: string[], timeout: number, outputs: boolean): void => {\n  const r = spawnSync(file, args, { encoding: \"utf8\", timeout: timeout });\n  const code = (r.error as NodeJS.ErrnoException | undefined)?.code;\n  const io = outputs ? ` out=${JSON.stringify(r.stdout)} err=${JSON.stringify(r.stderr)}` : \"\";\n  console.log(label, `status=${r.status}`, `signal=${r.signal}`, `error=${r.error === undefined ? \"undefined\" : r.error.message}`, `code=${code}` + io);\n};\nshow(\"exit0:\", \"/bin/sh\", [\"-c\", \"printf a; printf b 1>&2\"], 0, true);\nshow(\"exit3:\", \"/bin/sh\", [\"-c\", \"printf a; exit 3\"], 0, true);\nshow(\"signal:\", \"/bin/sh\", [\"-c\", \"printf a; kill -TERM $$\"], 0, true);\nshow(\"spawnfail:\", \"definitely-not-a-binary-xyz\", [], 0, false);\nshow(\"timeout:\", \"/bin/sh\", [\"-c\", \"printf a; sleep 5\"], 300, true);\nshow(\"trapped:\", \"/bin/sh\", [\"-c\", \"trap 'printf t; exit 4' TERM; printf a; sleep 5 & wait\"], 300, true);\nshow(\"trapped-quiet:\", \"/bin/sh\", [\"-c\", \"trap 'exit 4' TERM; printf a; sleep 5 & wait\"], 300, true);\n");
+    expect(r.stdout.toString("utf8")).toBe("exit0: status=0 signal=null error=undefined code=undefined out=\"a\" err=\"b\"\nexit3: status=3 signal=null error=undefined code=undefined out=\"a\" err=\"\"\nsignal: status=null signal=SIGTERM error=undefined code=undefined out=\"a\" err=\"\"\nspawnfail: status=null signal=null error=spawnSync definitely-not-a-binary-xyz ENOENT code=ENOENT\ntimeout: status=null signal=SIGTERM error=spawnSync /bin/sh ETIMEDOUT code=ETIMEDOUT out=\"a\" err=\"\"\ntrapped: status=null signal=SIGPIPE error=spawnSync /bin/sh ETIMEDOUT code=ETIMEDOUT out=\"a\" err=\"\"\ntrapped-quiet: status=4 signal=null error=spawnSync /bin/sh ETIMEDOUT code=ETIMEDOUT out=\"a\" err=\"\"\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-RES-02 the signal name for every terminating signal 1..31, incl. 6 SIGABRT, 16 SIGSTKFLT, 29 SIGIO and 30 SIGPWR", async () => {
+    const r = await runU1Source("// The signal name Node reports for each terminating signal a child sends\n// itself (stop signals and default-ignored ones are left out).\nimport { spawnSync } from \"node:child_process\";\n\nconst nums = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 24, 25, 26, 27, 29, 30, 31];\nconst names: string[] = [];\nfor (const n of nums) {\n  const r = spawnSync(\"/bin/sh\", [\"-c\", `kill -${n} $$`], { encoding: \"utf8\" });\n  names.push(`${n}:${r.signal}:${r.status}`);\n}\nconsole.log(names.join(\" \"));\n");
+    expect(r.stdout.toString("utf8")).toBe("1:SIGHUP:null 2:SIGINT:null 3:SIGQUIT:null 4:SIGILL:null 5:SIGTRAP:null 6:SIGABRT:null 7:SIGBUS:null 8:SIGFPE:null 9:SIGKILL:null 10:SIGUSR1:null 11:SIGSEGV:null 12:SIGUSR2:null 13:SIGPIPE:null 14:SIGALRM:null 15:SIGTERM:null 16:SIGSTKFLT:null 24:SIGXCPU:null 25:SIGXFSZ:null 26:SIGVTALRM:null 27:SIGPROF:null 29:SIGIO:null 30:SIGPWR:null 31:SIGSYS:null\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-DEC-01 invalid UTF-8 from a child decodes to U+FFFD per maximal subpart on stdout and stderr; valid sequences decode exactly", async () => {
+    const r = await runU1Source("// Invalid UTF-8 from a child, decoded with U+FFFD per maximal subpart;\n// valid two- and four-byte sequences decode to their code units.\nimport { spawnSync } from \"node:child_process\";\n\nconst codes = (s: string): string => {\n  const out: number[] = [];\n  for (let i = 0; i < s.length; i++) out.push(s.charCodeAt(i));\n  return out.join(\",\");\n};\nconst r = spawnSync(\"/usr/bin/printf\", [\"a\\\\377b\\\\300\\\\200c\\\\342\\\\202\"], { encoding: \"utf8\" });\nconsole.log(\"stdout:\", r.stdout.length, codes(r.stdout));\nconst e = spawnSync(\"/bin/sh\", [\"-c\", \"printf 'x\\\\377y\\\\355\\\\240\\\\200z' 1>&2\"], { encoding: \"utf8\" });\nconsole.log(\"stderr:\", e.stderr.length, codes(e.stderr));\nconst ok = spawnSync(\"/usr/bin/printf\", [\"\\\\303\\\\251\\\\360\\\\237\\\\230\\\\200\"], { encoding: \"utf8\" });\nconsole.log(\"valid:\", ok.stdout.length, codes(ok.stdout));\n");
+    expect(r.stdout.toString("utf8")).toBe("stdout: 7 97,65533,98,65533,65533,99,65533\nstderr: 7 120,65533,121,65533,65533,65533,122\nvalid: 3 233,55357,56832\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-CLK-01 a timer armed before a 300 ms child fires before an immediate armed after it, and Date.now advanced", async () => {
+    const r = await runU1Source("// A timer armed before a long child is due before an immediate armed\n// after it, and the clock moves by the child's duration.\nimport { spawnSync } from \"node:child_process\";\n\nconst t0 = Date.now();\nsetTimeout(() => console.log(\"timer\"), 50);\nconst r = spawnSync(\"sleep\", [\"0.3\"], { encoding: \"utf8\" });\nsetImmediate(() => console.log(\"immediate\"));\nconsole.log(\"child\", r.status, Date.now() - t0 >= 300);\n");
+    expect(r.stdout.toString("utf8")).toBe("child 0 true\ntimer\nimmediate\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-CLK-02 a child inside a timer callback: the callback's immediate, then the timers due during the child, in deadline order", async () => {
+    const r = await runU1Source("// A child spawned inside a timer callback: a timer armed in that callback\n// before the child, an immediate armed in it, and an earlier timer that\n// became due while the child ran.\nimport { spawnSync } from \"node:child_process\";\n\nsetTimeout(() => {\n  console.log(\"root\");\n  setTimeout(() => console.log(\"B-100\"), 100);\n  setImmediate(() => console.log(\"imm\"));\n  const r = spawnSync(\"sleep\", [\"0.3\"], { encoding: \"utf8\" });\n  console.log(\"child\", r.status);\n}, 10);\nsetTimeout(() => console.log(\"A-200\"), 200);\n");
+    expect(r.stdout.toString("utf8")).toBe("root\nchild 0\nimm\nB-100\nA-200\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-REG-01 SEMANTICS.md S085(a): an uncaptured stream reads \"\" where Node reads null, a failed spawn's \"\" where Node reads undefined", async () => {
+    const r = await runU1Source("// Uncaptured and failed-spawn outputs: Node reads null.\nimport { spawnSync } from \"node:child_process\";\n\nconst ig = spawnSync(\"/bin/sh\", [\"-c\", \"echo x; echo y 1>&2\"], { encoding: \"utf8\", stdio: \"ignore\" });\nconsole.log(\"ignored:\", JSON.stringify(ig.stdout), JSON.stringify(ig.stderr));\nconst inh = spawnSync(\"/bin/sh\", [\"-c\", \"true\"], { encoding: \"utf8\", stdio: \"inherit\" });\nconsole.log(\"inherited:\", JSON.stringify(inh.stdout), JSON.stringify(inh.stderr));\nconst miss = spawnSync(\"definitely-not-a-binary-xyz\", [], { encoding: \"utf8\" });\nconsole.log(\"failed:\", JSON.stringify(miss.stdout), JSON.stringify(miss.stderr));\n");
+    expect(r.stdout.toString("utf8")).toBe("ignored: \"\" \"\"\ninherited: \"\" \"\"\nfailed: \"\" \"\"\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-REG-03 SEMANTICS.md S085(c): spawnSync's error is a fresh Error on every read (Node: one object)", async () => {
+    const r = await runU1Source("// The error property read twice: Node hands back one object; a property\n// written on the first read is seen through the second.\nimport { spawnSync } from \"node:child_process\";\n\nconst r = spawnSync(\"definitely-not-a-binary-xyz\", [], { encoding: \"utf8\" });\nconst a = r.error;\nconst b = r.error;\nif (a !== undefined && b !== undefined) {\n  console.log(\"same object:\", a === b);\n  a.message = \"rewritten\";\n  console.log(\"second read:\", b.message);\n}\n");
+    expect(r.stdout.toString("utf8")).toBe("same object: false\nsecond read: spawnSync definitely-not-a-binary-xyz ENOENT\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-REG-09 SEMANTICS.md S086(d): stdin 'ignore' as a literal or tuple reaches the child as a socket (Node: /dev/null); the runtime string 'ignore' is /dev/null as in Node", async () => {
+    const r = await runU1Source("// The kind of a spawnSync child's stdin per stdio form: pipe and ignore\n// through literal tuples, the ignore string (all fds ignored, so the kind\n// comes back as an exit status), and the runtime-string form.\nimport { spawnSync } from \"node:child_process\";\n\nconst probe = \"if [ -c /dev/stdin ]; then echo chardev; elif [ -S /dev/stdin ]; then echo socket; elif [ -p /dev/stdin ]; then echo fifo; else echo other; fi\";\nconst byStatus = \"if [ -c /dev/stdin ]; then exit 10; elif [ -S /dev/stdin ]; then exit 11; elif [ -p /dev/stdin ]; then exit 12; else exit 13; fi\";\nconsole.log(\"tuple-pipe:\", spawnSync(\"/bin/sh\", [\"-c\", probe], { encoding: \"utf8\", stdio: [\"pipe\", \"pipe\", \"pipe\"] }).stdout.trim());\nconsole.log(\"tuple-ignore:\", spawnSync(\"/bin/sh\", [\"-c\", probe], { encoding: \"utf8\", stdio: [\"ignore\", \"pipe\", \"pipe\"] }).stdout.trim());\nconsole.log(\"literal-ignore status:\", spawnSync(\"/bin/sh\", [\"-c\", byStatus], { stdio: \"ignore\" }).status);\nconst runtime = (s: \"pipe\" | \"ignore\" | \"inherit\"): number | null => spawnSync(\"/bin/sh\", [\"-c\", byStatus], { encoding: \"utf8\", stdio: s }).status;\nconsole.log(\"str-ignore status:\", runtime(\"ignore\"));\nconsole.log(\"str-pipe status:\", runtime(\"pipe\"));\nconsole.log(\"plain status:\", spawnSync(\"/bin/sh\", [\"-c\", byStatus]).status);\n");
+    expect(r.stdout.toString("utf8")).toBe("tuple-pipe: socket\ntuple-ignore: socket\nliteral-ignore status: 11\nstr-ignore status: 10\nstr-pipe status: 11\nplain status: 11\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-RUN-11 spawnSync with every output inherited applies no maxBuffer: 2,000,000 bytes reach stderr and the child exits 0", async () => {
+    const r = await runU1Source("// spawnSync with every output inherited: Node applies no maxBuffer, so a\n// child writing 2,000,000 bytes to an inherited stderr runs normally.\nimport { spawnSync } from \"node:child_process\";\n\nconst all = spawnSync(\"/bin/sh\", [\"-c\", \"head -c 2000000 /dev/zero | tr '\\\\0' 'i' 1>&2\"], { stdio: \"inherit\" });\nconsole.log(\"all-inherit:\", all.status, all.signal, `${(all.error as NodeJS.ErrnoException | undefined)?.code}`);\n");
+    expect(r.stdout.toString("utf8")).toBe("all-inherit: 0 null undefined\n");
+    expect(r.stderr.toString("utf8")).toBe("i".repeat(2_000_000));
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-REG-12 SEMANTICS.md S086(d): stdin 'inherit' reaches a spawnSync child as a socket (Node passes its own stdin, here a pipe)", async () => {
+    const r = await runU1Source("// The kind of a spawnSync child's stdin given stdio \"inherit\": Node passes\n// its own stdin (here the oracle's closed pipe); the status names the kind.\nimport { spawnSync } from \"node:child_process\";\n\nconst byStatus = \"if [ -c /dev/stdin ]; then exit 10; elif [ -S /dev/stdin ]; then exit 11; elif [ -p /dev/stdin ]; then exit 12; else exit 13; fi\";\nconsole.log(\"inherit status:\", spawnSync(\"/bin/sh\", [\"-c\", byStatus], { stdio: \"inherit\" }).status);\n");
+    expect(r.stdout.toString("utf8")).toBe("inherit status: 11\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+
+  /** A request record built by hand in the module's layout (abi.ts). */
+  function buildRequest(): { buffer: ArrayBuffer; len: number } {
+    const parts: number[] = [];
+    const u32 = (v: number): void => {
+      parts.push(v & 0xff, (v >>> 8) & 0xff, (v >>> 16) & 0xff, (v >>> 24) & 0xff);
+    };
+    const run = (text: string): void => {
+      u32(text.length);
+      for (let i = 0; i < text.length; i++) parts.push(text.charCodeAt(i) & 0xff, text.charCodeAt(i) >>> 8);
+      while (parts.length % 4 !== 0) parts.push(0);
+    };
+    const header = new DataView(new ArrayBuffer(32));
+    header.setUint32(0, 1, true);
+    header.setUint32(4, 2, true);
+    header.setUint32(8, 1, true);
+    header.setUint32(12, 9, true);
+    header.setFloat64(16, 1500, true);
+    header.setUint32(24, 1, true);
+    parts.push(...new Uint8Array(header.buffer));
+    run("a\uD800");
+    u32(2);
+    run("x");
+    run("yz");
+    run("");
+    u32(2);
+    run("K");
+    run("V");
+    run("E");
+    run("");
+    u32(2);
+    parts.push(0xff, 0x01);
+    // 8 bytes before the record (a 4-aligned, non-zero base) and 8 after
+    // (room for the length-mismatch row to over-read into zeros).
+    const buffer = new ArrayBuffer(parts.length + 16);
+    new Uint8Array(buffer, 8).set(parts);
+    return { buffer, len: parts.length };
+  }
+
+  test("U1-C-1462 corpus 1462-exec-sync.ts: full stdout, stderr and exit code equal Node's", async () => {
+    const r = await runU1Corpus("1462-exec-sync.ts");
+    expect(r.stdout.toString("utf8")).toBe("\"a b\\nc\"\n\"42\\n\"\ncwd: /\n\nenv: A=one B=\n\ninput: fed to cat\nquiet: \"out\\n\"\nignored: \"kept\\n\"\necho: \"out-part\\n\"\nfail: Command failed: sh -c echo some-out; echo the-failure 1>&2; exit 3\nthe-failure\n\nfail2: Command failed: exit 7\nenoent: spawnSync definitely-not-a-command-xyz ENOENT\ntimeout: spawnSync sleep ETIMEDOUT\ndone\n");
+    expect(r.stderr.toString("utf8")).toBe("visible-err\n");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-C-1473 corpus 1473-promisify-execfile.ts: full stdout, stderr and exit code equal Node's", async () => {
+    const r = await runU1Corpus("1473-promisify-execfile.ts");
+    expect(r.stdout.toString("utf8")).toBe("plain: hi stderr empty: true\nboth: out err\nenv+cwd: envval:/\nfail: \"Command failed: /bin/sh -c printf failerr >&2; exit 3\\nfailerr\"\nspawnfail: spawn definitely-not-a-binary-xyz ENOENT code: ENOENT\ntimeout: \"Command failed: sleep 2\\n\"\ndone\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-C-1521 corpus 1521-fs-lstat-lock.ts: full stdout, stderr and exit code equal Node's", async () => {
+    const r = await runU1Corpus("1521-fs-lstat-lock.ts");
+    expect(r.stdout.toString("utf8")).toBe("stat follows: true false 10\nlstat sees the link: true false\nplain file: false\nlstat missing: ENOENT true\nmtime sane: true true\nfirst lock: true\nheld, fresh: true\nsecond lock: false\nrelock after release: true\ndone: true\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-C-1552 corpus 1552-exec-options-record.ts: full stdout, stderr and exit code equal Node's", async () => {
+    const r = await runU1Corpus("1552-exec-options-record.ts");
+    expect(r.stdout.toString("utf8")).toBe("-store -user Root\n-store -user Root\nran:/bin/echo:-store|-user|Root:utf-8:30000\nC:\\certs\\ca.pem\nca.pem\na-b\nhi there\n/\nquiet-ok\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-C-1573 corpus 1573-promisify-execfile-env-spread.ts: full stdout, stderr and exit code equal Node's", async () => {
+    const r = await runU1Corpus("1573-promisify-execfile-env-spread.ts");
+    expect(r.stdout.toString("utf8")).toBe("inherit: [none:from-harness]\nextra: [spread-on:from-harness]\nfalse-arm: none\ndone\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-C-1578 corpus 1578-exec-input-optional.ts: full stdout, stderr and exit code equal Node's", async () => {
+    const r = await runU1Corpus("1578-exec-input-optional.ts");
+    expect(r.stdout.toString("utf8")).toBe("absent: \"\"\nempty-member: \"\"\nempty: \"\"\ntext: \"piped text\\n\"\n\"\"\n\"\"\n\"abc\"\n\"sure\\n\"\n\"via shell\\n\"\n\"\"\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-C-1580 corpus 1580-exec-env-conditional-spread.ts: full stdout, stderr and exit code equal Node's", async () => {
+    const r = await runU1Corpus("1580-exec-env-conditional-spread.ts");
+    expect(r.stdout.toString("utf8")).toBe("inherit: A= B=from-harness\nempty: A= B=from-harness\nmerged: A=one B=from-harness\nloud: Q=loud\nquiet: Q=\npiped: body\nno-input: \"\"\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-C-1656 corpus 1656-execsync-neutral.ts: full stdout, stderr and exit code equal Node's", async () => {
+    const r = await runU1Corpus("1656-execsync-neutral.ts");
+    expect(r.stdout.toString("utf8")).toBe("\"a b\\nc\"\ninput: FED TO NODE\nenv: one unset\n\ncwd match: true\nquiet: \"kept\\n\"\necho: \"out-part\\n\"\nfail: \"Command failed: node -e console.error('the-failure'); process.exit(3)\\nthe-failure\\n\"\nenoent: spawnSync definitely-not-a-binary-xyz ENOENT ENOENT\n");
+    expect(r.stderr.toString("utf8")).toBe("visible-err\n");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-C-2362 corpus 2362-execsync-inherit.ts: full stdout, stderr and exit code equal Node's", async () => {
+    const r = await runU1Corpus("2362-execsync-inherit.ts");
+    expect(r.stdout.toString("utf8")).toBe("before\nchild-out\nafter\ntuple-out\nshown-first\nfail: Command failed: echo shown-first; exit 5\ncwd=/ flag=on\ndone\n");
+    expect(r.stderr.toString("utf8")).toBe("child-err\n");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-RUN-02 inherited output lands on the module's own fd in program order: stdout via spawnSync, stderr via execFileSync, both via 'inherit'", async () => {
+    const r = await runU1Source("// Inherited child output interleaves with the parent's own writes on the\n// same fd in program order: stdout through spawnSync, stderr through\n// execFileSync, both through execFileSync's \"inherit\".\nimport { execFileSync, spawnSync } from \"node:child_process\";\n\nconsole.log(\"p1\");\nconst r = spawnSync(\"/bin/sh\", [\"-c\", \"echo c1; echo c1-err 1>&2\"], { encoding: \"utf8\", stdio: [\"pipe\", \"inherit\", \"pipe\"] });\nconsole.log(\"p2\", JSON.stringify(r.stderr));\nconsole.error(\"e1\");\nconst s = execFileSync(\"/bin/sh\", [\"-c\", \"echo c2; echo c2-err 1>&2\"], { encoding: \"utf8\", stdio: [\"pipe\", \"pipe\", \"inherit\"] });\nconsole.error(\"e2\");\nconsole.log(\"p3\", JSON.stringify(s));\nexecFileSync(\"/bin/sh\", [\"-c\", \"echo c3; echo c3-err 1>&2\"], { stdio: \"inherit\" });\nconsole.log(\"p4\");\nconsole.error(\"e3\");\n");
+    expect(r.stdout.toString("utf8")).toBe("p1\nc1\np2 \"c1-err\\n\"\np3 \"c2\\n\"\nc3\np4\n");
+    expect(r.stderr.toString("utf8")).toBe("e1\nc2-err\ne2\nc3-err\ne3\n");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-RUN-03 the input option: absent, empty, text, a lone surrogate sent as EF BF BD, astral text", async () => {
+    const r = await runU1Source("// The input option: absent, empty, text, a lone surrogate (encoded as\n// EF BF BD on the way to the child), and astral text; od shows the bytes.\nimport { execFileSync } from \"node:child_process\";\n\nconst hex = (input: string | undefined): string =>\n  execFileSync(\"/usr/bin/od\", [\"-An\", \"-tx1\", \"-v\"], { encoding: \"utf8\", input: input }).replace(/\\s+/g, \" \").trim();\nconsole.log(\"absent:\", JSON.stringify(hex(undefined)));\nconsole.log(\"empty:\", JSON.stringify(hex(\"\")));\nconsole.log(\"text:\", hex(\"ab\\n\"));\nconsole.log(\"lone:\", hex(\"a\\uD800b\"));\nconsole.log(\"pair:\", hex(\"\ud83d\ude00\"));\nconsole.log(\"cat:\", JSON.stringify(execFileSync(\"cat\", [], { encoding: \"utf8\", input: \"line1\\nline2\" })));\n");
+    expect(r.stdout.toString("utf8")).toBe("absent: \"\"\nempty: \"\"\ntext: 61 62 0a\nlone: 61 ef bf bd 62\npair: f0 9f 98 80\ncat: \"line1\\nline2\"\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-RUN-04 the child's environment: the module's map with a write and a delete, a replacement env, an env listing", async () => {
+    const r = await runU1Source("// The child's environment: inherited from the module's map (a write made\n// before the call is seen, an unset is not), and REPLACED by an env option.\nimport { execFileSync, execSync, spawnSync } from \"node:child_process\";\n\nprocess.env.SCRIPTC_U1_W = \"written\";\nprocess.env.SCRIPTC_U1_GONE = \"x\";\ndelete process.env.SCRIPTC_U1_GONE;\nconst inh = spawnSync(\"/bin/sh\", [\"-c\", \"echo W=$SCRIPTC_U1_W G=${SCRIPTC_U1_GONE-unset} H=$SCRIPTC_TEST_ENV\"], { encoding: \"utf8\" });\nconsole.log(\"inherit:\", inh.stdout.trim());\nconst rep = execSync(\"echo W=${SCRIPTC_U1_W-unset} H=${SCRIPTC_TEST_ENV-unset} R=$SCRIPTC_U1_R\", { encoding: \"utf8\", env: { SCRIPTC_U1_R: \"replaced\" } });\nconsole.log(\"replace:\", rep.trim());\nconst cnt = execFileSync(\"/usr/bin/env\", [], { encoding: \"utf8\", env: { A: \"1\", B: \"two words\", C: \"\" } });\nconsole.log(\"env-list:\", JSON.stringify(cnt));\n");
+    expect(r.stdout.toString("utf8")).toBe("inherit: W=written G=unset H=from-harness\nreplace: W=unset H=unset R=replaced\nenv-list: \"A=1\\nB=two words\\nC=\\n\"\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-RUN-05 PATH is searched in the child's environment: a replacement PATH that cannot find sh fails ENOENT", async () => {
+    const r = await runU1Source("// PATH is searched in the CHILD's environment: a replacement env whose PATH\n// cannot find \"sh\" fails the spawn; an env without PATH falls back to the\n// default search path.\nimport { execFileSync } from \"node:child_process\";\n\ntry {\n  execFileSync(\"sh\", [\"-c\", \"echo ran\"], { encoding: \"utf8\", env: { PATH: \"/definitely/missing\" } });\n  console.log(\"missing-path: ran\");\n} catch (e) {\n  console.log(\"missing-path:\", e instanceof Error ? e.message : \"?\", `${(e as NodeJS.ErrnoException).code}`);\n}\nconsole.log(\"no-path:\", JSON.stringify(execFileSync(\"sh\", [\"-c\", \"echo ran\"], { encoding: \"utf8\", env: { X: \"1\" } })));\n");
+    expect(r.stdout.toString("utf8")).toBe("missing-path: spawnSync sh ENOENT ENOENT\nno-path: \"ran\\n\"\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-RUN-08 a child closing stdin before a 1 MiB input: execFileSync throws EPIPE after a normal exit", async () => {
+    const r = await runU1Source("// A child that closes its stdin before reading a large input: the write\n// fails with EPIPE after a normal exit, and execFileSync throws it.\nimport { execFileSync } from \"node:child_process\";\n\nconst big = \"z\".repeat(1048576);\ntry {\n  const out = execFileSync(\"/bin/sh\", [\"-c\", \"exec 0<&-; sleep 0.2; echo after\"], { encoding: \"utf8\", input: big, stdio: \"pipe\" });\n  console.log(\"no throw:\", JSON.stringify(out));\n} catch (e) {\n  console.log(\"epipe:\", e instanceof Error ? e.message : \"?\", `${(e as NodeJS.ErrnoException).code}`);\n}\n");
+    expect(r.stdout.toString("utf8")).toBe("epipe: spawnSync /bin/sh EPIPE EPIPE\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-ERR-02 execFileSync/execSync throws: tail, no tail, ignored stderr, signal, not-found, ENOENT forms, the display, a trapped timeout's ETIMEDOUT winning over status 7", async () => {
+    const r = await runU1Source("// execFileSync / execSync throws: non-zero exit with a captured stderr\n// tail, an empty stderr (no tail), an ignored stderr (no tail), a signal\n// death, a shell not-found, spawn failures in both forms, the display of\n// the arguments, and a child that traps the timeout's signal and exits 7\n// (the errno wins over the status).\nimport { execFileSync, execSync } from \"node:child_process\";\n\nconst msg = (f: () => string): string => {\n  try {\n    return \"ok \" + JSON.stringify(f());\n  } catch (e) {\n    return e instanceof Error ? JSON.stringify(e.message) + \" code=\" + `${(e as NodeJS.ErrnoException).code}` : \"?\";\n  }\n};\nconsole.log(\"tail:\", msg(() => execFileSync(\"/bin/sh\", [\"-c\", \"echo o; echo bad 1>&2; exit 3\"], { encoding: \"utf8\", stdio: \"pipe\" })));\nconsole.log(\"no-tail:\", msg(() => execFileSync(\"/bin/sh\", [\"-c\", \"exit 4\"], { encoding: \"utf8\", stdio: \"pipe\" })));\nconsole.log(\"ignored:\", msg(() => execFileSync(\"/bin/sh\", [\"-c\", \"echo bad 1>&2; exit 5\"], { encoding: \"utf8\", stdio: [\"pipe\", \"pipe\", \"ignore\"] })));\nconsole.log(\"signal:\", msg(() => execSync(\"echo dying 1>&2; kill -KILL $$\", { encoding: \"utf8\", stdio: \"pipe\" })));\nconsole.log(\"not-found:\", msg(() => execSync(\"definitely-not-a-cmd-xyz\", { encoding: \"utf8\", stdio: \"pipe\" })));\nconsole.log(\"enoent-file:\", msg(() => execFileSync(\"definitely-not-a-binary-xyz\", [\"a\", \"b\"], { encoding: \"utf8\", stdio: \"pipe\" })));\nconsole.log(\"enoent-cwd:\", msg(() => execFileSync(\"echo\", [\"x\"], { encoding: \"utf8\", stdio: \"pipe\", cwd: \"/definitely/missing\" })));\nconsole.log(\"enoent-cwd-shell:\", msg(() => execSync(\"echo x\", { encoding: \"utf8\", stdio: \"pipe\", cwd: \"/definitely/missing\" })));\nconsole.log(\"display:\", msg(() => execFileSync(\"/bin/sh\", [\"-c\", \"exit 1\", \"arg with space\", \"\"], { encoding: \"utf8\", stdio: \"pipe\" })));\nconsole.log(\"no-args:\", msg(() => execFileSync(\"false\", [], { encoding: \"utf8\", stdio: \"pipe\" })));\nconsole.log(\"trapped:\", msg(() => execFileSync(\"/bin/sh\", [\"-c\", \"trap 'exit 7' TERM; sleep 5 & wait\"], { encoding: \"utf8\", stdio: \"pipe\", timeout: 300 })));\n");
+    expect(r.stdout.toString("utf8")).toBe("tail: \"Command failed: /bin/sh -c echo o; echo bad 1>&2; exit 3\\nbad\\n\" code=undefined\nno-tail: \"Command failed: /bin/sh -c exit 4\" code=undefined\nignored: \"Command failed: /bin/sh -c echo bad 1>&2; exit 5\" code=undefined\nsignal: \"Command failed: echo dying 1>&2; kill -KILL $$\\ndying\\n\" code=undefined\nnot-found: \"Command failed: definitely-not-a-cmd-xyz\\n/bin/sh: 1: definitely-not-a-cmd-xyz: not found\\n\" code=undefined\nenoent-file: \"spawnSync definitely-not-a-binary-xyz ENOENT\" code=ENOENT\nenoent-cwd: \"spawnSync echo ENOENT\" code=ENOENT\nenoent-cwd-shell: \"spawnSync /bin/sh ENOENT\" code=ENOENT\ndisplay: \"Command failed: /bin/sh -c exit 1 arg with space \" code=undefined\nno-args: \"Command failed: false\" code=undefined\ntrapped: \"spawnSync /bin/sh ETIMEDOUT\" code=ETIMEDOUT\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-ERR-03 default stdio echoes the child's stderr before every throw (incl. ETIMEDOUT) and on success", async () => {
+    const r = await runU1Source("// Default stdio: the child's captured stderr is echoed to ours BEFORE the\n// throw \u2014 for a non-zero exit, for a timeout, and on success.\nimport { execFileSync, execSync } from \"node:child_process\";\n\nconsole.error(\"before\");\ntry {\n  execFileSync(\"/bin/sh\", [\"-c\", \"echo partial-err 1>&2; sleep 5\"], { encoding: \"utf8\", timeout: 300 });\n} catch (e) {\n  console.error(\"caught:\", e instanceof Error ? e.message : \"?\", `${(e as NodeJS.ErrnoException).code}`);\n}\ntry {\n  execSync(\"echo fail-err 1>&2; exit 9\", { encoding: \"utf8\" });\n} catch (e) {\n  console.error(\"caught2:\", e instanceof Error ? JSON.stringify(e.message) : \"?\");\n}\nconsole.error(\"ok:\", JSON.stringify(execSync(\"echo ok-err 1>&2; echo ok-out\", { encoding: \"utf8\" })));\nconsole.error(\"after\");\n");
+    expect(r.stdout.toString("utf8")).toBe("");
+    expect(r.stderr.toString("utf8")).toBe("before\npartial-err\ncaught: spawnSync /bin/sh ETIMEDOUT ETIMEDOUT\nfail-err\ncaught2: \"Command failed: echo fail-err 1>&2; exit 9\\nfail-err\\n\"\nok-err\nok: \"ok-out\\n\"\nafter\n");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-ERR-04 promisified execFile: resolve, spawn failures, Command failed with the unconditional newline, a trapped exit 0 resolving", async () => {
+    const r = await runU1Source("// The promisified execFile: success, a spawn failure, a non-zero exit, a\n// signal death, a timeout's kill, and a child that traps the timeout's\n// signal (exit 0 resolves, exit 7 rejects). The Command-failed codes are\n// left out (their reading is registered).\nimport { execFile } from \"node:child_process\";\nimport { promisify } from \"node:util\";\n\nconst execFileAsync = promisify(execFile);\n\nasync function show(label: string, file: string, args: string[], timeout: number, withCode: boolean): Promise<void> {\n  try {\n    const { stdout, stderr } = await execFileAsync(file, args, { encoding: \"utf8\", timeout: timeout });\n    console.log(label, \"resolved\", JSON.stringify(stdout), JSON.stringify(stderr));\n  } catch (e) {\n    const code = withCode ? ` ${(e as NodeJS.ErrnoException).code}` : \"\";\n    console.log(label, \"rejected\", e instanceof Error ? JSON.stringify(e.message) : \"?\", code);\n  }\n}\nasync function main(): Promise<void> {\n  await show(\"ok:\", \"/bin/sh\", [\"-c\", \"printf out; printf err 1>&2\"], 0, true);\n  await show(\"enoent:\", \"definitely-not-a-binary-xyz\", [\"x\"], 0, true);\n  await show(\"no-args:\", \"definitely-not-a-binary-xyz\", [], 0, true);\n  await show(\"exit:\", \"/bin/sh\", [\"-c\", \"printf e1 1>&2; exit 3\"], 0, false);\n  await show(\"signal:\", \"/bin/sh\", [\"-c\", \"kill -KILL $$\"], 0, false);\n  await show(\"timeout:\", \"/bin/sh\", [\"-c\", \"printf partial 1>&2; sleep 5\"], 300, false);\n  await show(\"trapped0:\", \"/bin/sh\", [\"-c\", \"trap 'exit 0' TERM; sleep 5 & wait\"], 300, false);\n  await show(\"trapped7:\", \"/bin/sh\", [\"-c\", \"trap 'exit 7' TERM; sleep 5 & wait\"], 300, false);\n}\nmain();\n");
+    expect(r.stdout.toString("utf8")).toBe("ok: resolved \"out\" \"err\"\nenoent: rejected \"spawn definitely-not-a-binary-xyz ENOENT\"  ENOENT\nno-args: rejected \"spawn definitely-not-a-binary-xyz ENOENT\"  ENOENT\nexit: rejected \"Command failed: /bin/sh -c printf e1 1>&2; exit 3\\ne1\" \nsignal: rejected \"Command failed: /bin/sh -c kill -KILL $$\\n\" \ntimeout: rejected \"Command failed: /bin/sh -c printf partial 1>&2; sleep 5\\npartial\" \ntrapped0: resolved \"\" \"\"\ntrapped7: rejected \"Command failed: /bin/sh -c trap 'exit 7' TERM; sleep 5 & wait\\n\" \n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-VAL-06 NUL per position across the families (file, args, command, cwd, env key and value) and the empty file/command", async () => {
+    const r = await runU1Source("// NUL bytes per position, and the inspect-quoted value in the message.\n// Every exec call carries an encoding: its result is used.\nimport { execFileSync, execSync, spawnSync } from \"node:child_process\";\n\nconst show = (label: string, f: () => void): void => {\n  try {\n    f();\n    console.log(label, \"no throw\");\n  } catch (e) {\n    console.log(label, e instanceof Error ? e.name + \": \" + JSON.stringify(e.message) : \"?\", `${(e as NodeJS.ErrnoException).code}`);\n  }\n};\nshow(\"file:\", () => spawnSync(\"ec\\u0000ho\", [], {}));\nshow(\"arg0:\", () => spawnSync(\"echo\", [\"a\\u0000b\"], {}));\nshow(\"arg2:\", () => spawnSync(\"echo\", [\"ok\", \"fine\", \"x\\u0000\"], {}));\nshow(\"command:\", () => execSync(\"echo a\\u0000b\", { encoding: \"utf8\" }));\nshow(\"execfile-file:\", () => execFileSync(\"ec\\u0000ho\", [\"a\"], { encoding: \"utf8\" }));\nshow(\"cwd:\", () => execFileSync(\"echo\", [\"a\"], { encoding: \"utf8\", cwd: \"/tm\\u0000p\" }));\nshow(\"env-value:\", () => execFileSync(\"echo\", [\"a\"], { encoding: \"utf8\", env: { GOOD: \"1\", BAD: \"v\\u0000\" } }));\nshow(\"env-key:\", () => execFileSync(\"echo\", [\"a\"], { encoding: \"utf8\", env: { [\"K\\u0000\"]: \"v\" } }));\nshow(\"both-quotes:\", () => spawnSync(\"echo\", [\"it's\\u0000\\\"q\\\"\"], {}));\nshow(\"single-quote:\", () => spawnSync(\"echo\", [\"it's\\u0000\"], {}));\nshow(\"newline:\", () => spawnSync(\"echo\", [\"line1\\nline2 is long enough\\u0000\"], {}));\nshow(\"long:\", () => spawnSync(\"echo\", [\"x\".repeat(200) + \"\\u0000\"], {}));\nshow(\"input-nul:\", () => execFileSync(\"cat\", [], { encoding: \"utf8\", input: \"a\\u0000b\", stdio: \"pipe\" }));\nshow(\"empty-file:\", () => spawnSync(\"\", [], {}));\nshow(\"empty-command:\", () => execSync(\"\", { encoding: \"utf8\" }));\n");
+    expect(r.stdout.toString("utf8")).toBe("file: TypeError: \"The argument 'file' must be a string without null bytes. Received 'ec\\\\x00ho'\" ERR_INVALID_ARG_VALUE\narg0: TypeError: \"The argument 'args[0]' must be a string without null bytes. Received 'a\\\\x00b'\" ERR_INVALID_ARG_VALUE\narg2: TypeError: \"The argument 'args[2]' must be a string without null bytes. Received 'x\\\\x00'\" ERR_INVALID_ARG_VALUE\ncommand: TypeError: \"The argument 'command' must be a string without null bytes. Received 'echo a\\\\x00b'\" ERR_INVALID_ARG_VALUE\nexecfile-file: TypeError: \"The argument 'file' must be a string without null bytes. Received 'ec\\\\x00ho'\" ERR_INVALID_ARG_VALUE\ncwd: TypeError: \"The property 'options.cwd' must be a string, Uint8Array, or URL without null bytes. Received '/tm\\\\x00p'\" ERR_INVALID_ARG_VALUE\nenv-value: TypeError: \"The property 'options.env['BAD']' must be a string without null bytes. Received 'v\\\\x00'\" ERR_INVALID_ARG_VALUE\nenv-key: TypeError: \"The property 'options.env['K\\u0000']' must be a string without null bytes. Received 'K\\\\x00'\" ERR_INVALID_ARG_VALUE\nboth-quotes: TypeError: \"The argument 'args[0]' must be a string without null bytes. Received `it's\\\\x00\\\"q\\\"`\" ERR_INVALID_ARG_VALUE\nsingle-quote: TypeError: \"The argument 'args[0]' must be a string without null bytes. Received \\\"it's\\\\x00\\\"\" ERR_INVALID_ARG_VALUE\nnewline: TypeError: \"The argument 'args[0]' must be a string without null bytes. Received 'line1\\\\nline2 is long enough\\\\x00'\" ERR_INVALID_ARG_VALUE\nlong: TypeError: \"The argument 'args[0]' must be a string without null bytes. Received 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...\" ERR_INVALID_ARG_VALUE\ninput-nul: no throw\nempty-file: TypeError: \"The argument 'file' cannot be empty. Received ''\" ERR_INVALID_ARG_VALUE\nempty-command: TypeError: \"The argument 'file' cannot be empty. Received ''\" ERR_INVALID_ARG_VALUE\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-VAL-07 Node's validation order across the families: file, args, cwd, env (insertion order), timeout, killSignal", async () => {
+    const r = await runU1Source("// Node's validation order: file, args, cwd, env, timeout, killSignal.\n// Every exec call carries an encoding: its result is used.\nimport { execFileSync, spawnSync } from \"node:child_process\";\n\nconst show = (label: string, f: () => void): void => {\n  try {\n    f();\n    console.log(label, \"no throw\");\n  } catch (e) {\n    console.log(label, e instanceof Error ? e.name + \": \" + e.message : \"?\");\n  }\n};\nshow(\"file<args:\", () => spawnSync(\"f\\u0000\", [\"a\\u0000\"], {}));\nshow(\"args<timeout:\", () => spawnSync(\"echo\", [\"a\\u0000\"], { timeout: -1 }));\nshow(\"timeout<signal:\", () => spawnSync(\"echo\", [], { timeout: -1, killSignal: \"SIGINFO\" }));\nshow(\"args<cwd:\", () => execFileSync(\"echo\", [\"a\\u0000\"], { encoding: \"utf8\", cwd: \"c\\u0000\" }));\nshow(\"cwd<env:\", () => execFileSync(\"echo\", [], { encoding: \"utf8\", cwd: \"c\\u0000\", env: { E: \"v\\u0000\" } }));\nshow(\"env<timeout:\", () => execFileSync(\"echo\", [], { encoding: \"utf8\", env: { E: \"v\\u0000\" }, timeout: 1.5 }));\nshow(\"env-order:\", () => execFileSync(\"echo\", [], { encoding: \"utf8\", env: { A: \"a\\u0000\", B: \"b\\u0000\" } }));\nshow(\"empty<args:\", () => spawnSync(\"\", [\"a\\u0000\"], {}));\n");
+    expect(r.stdout.toString("utf8")).toBe("file<args: TypeError: The argument 'file' must be a string without null bytes. Received 'f\\x00'\nargs<timeout: TypeError: The argument 'args[0]' must be a string without null bytes. Received 'a\\x00'\ntimeout<signal: RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received -1\nargs<cwd: TypeError: The argument 'args[0]' must be a string without null bytes. Received 'a\\x00'\ncwd<env: TypeError: The property 'options.cwd' must be a string, Uint8Array, or URL without null bytes. Received 'c\\x00'\nenv<timeout: TypeError: The property 'options.env['E']' must be a string without null bytes. Received 'v\\x00'\nenv-order: TypeError: The property 'options.env['A']' must be a string without null bytes. Received 'a\\x00'\nempty<args: TypeError: The argument 'file' cannot be empty. Received ''\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-VAL-08 timeout validation through spawnSync and execFileSync", async () => {
+    const r = await runU1Source("// timeout validation: values Node accepts and the RangeError text for the\n// ones it rejects, through spawnSync and execFileSync.\nimport { execFileSync, spawnSync } from \"node:child_process\";\n\nconst vals: number[] = [1.5, -1, NaN, Infinity, -Infinity, -0, 2 ** 53, -(2 ** 33), -(2 ** 32) - 1, -(2 ** 32), -1e21, 4294967296.5, -4294967296.5, 0.1];\nfor (const v of vals) {\n  try {\n    const r = spawnSync(\"true\", [], { timeout: v });\n    console.log(\"spawnSync\", r.status, r.error === undefined);\n  } catch (e) {\n    console.log(\"spawnSync threw\", e instanceof Error ? e.name + \": \" + e.message : \"?\", `${(e as NodeJS.ErrnoException).code}`);\n  }\n}\ntry {\n  execFileSync(\"true\", [], { timeout: -5 });\n  console.log(\"execFileSync ok\");\n} catch (e) {\n  console.log(\"execFileSync threw\", e instanceof Error ? e.name + \": \" + e.message : \"?\", `${(e as NodeJS.ErrnoException).code}`);\n}\n");
+    expect(r.stdout.toString("utf8")).toBe("spawnSync threw RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received 1.5 ERR_OUT_OF_RANGE\nspawnSync threw RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received -1 ERR_OUT_OF_RANGE\nspawnSync threw RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received NaN ERR_OUT_OF_RANGE\nspawnSync threw RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received Infinity ERR_OUT_OF_RANGE\nspawnSync threw RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received -Infinity ERR_OUT_OF_RANGE\nspawnSync 0 true\nspawnSync 0 true\nspawnSync threw RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received -8_589_934_592 ERR_OUT_OF_RANGE\nspawnSync threw RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received -4_294_967_297 ERR_OUT_OF_RANGE\nspawnSync threw RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received -4294967296 ERR_OUT_OF_RANGE\nspawnSync threw RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received -1e_+21 ERR_OUT_OF_RANGE\nspawnSync threw RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received 4294967296.5 ERR_OUT_OF_RANGE\nspawnSync threw RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received -4294967296.5 ERR_OUT_OF_RANGE\nspawnSync threw RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received 0.1 ERR_OUT_OF_RANGE\nexecFileSync threw RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received -5 ERR_OUT_OF_RANGE\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-VAL-09 promisified execFile's validation caught after await, in Node's async order (timeout first)", async () => {
+    const r = await runU1Source("// The promisified execFile's validation, caught after await: each check's\n// text, and Node's async order (the timeout is checked before the file,\n// the arguments, the cwd and the environment).\nimport { execFile } from \"node:child_process\";\nimport { promisify } from \"node:util\";\n\nconst execFileAsync = promisify(execFile);\nasync function main(): Promise<void> {\n  try {\n    await execFileAsync(\"true\", [], { timeout: -1 });\n    console.log(\"timeout:\", \"resolved\");\n  } catch (e) {\n    if (e instanceof Error) console.log(\"timeout:\", e.name + \": \" + e.message, `${(e as NodeJS.ErrnoException).code}`);\n  }\n  try {\n    await execFileAsync(\"t\\u0000rue\", []);\n    console.log(\"file-nul:\", \"resolved\");\n  } catch (e) {\n    if (e instanceof Error) console.log(\"file-nul:\", e.name + \": \" + e.message, `${(e as NodeJS.ErrnoException).code}`);\n  }\n  try {\n    await execFileAsync(\"\", []);\n    console.log(\"file-empty:\", \"resolved\");\n  } catch (e) {\n    if (e instanceof Error) console.log(\"file-empty:\", e.name + \": \" + e.message, `${(e as NodeJS.ErrnoException).code}`);\n  }\n  try {\n    await execFileAsync(\"true\", [\"a\\u0000\"]);\n    console.log(\"arg-nul:\", \"resolved\");\n  } catch (e) {\n    if (e instanceof Error) console.log(\"arg-nul:\", e.name + \": \" + e.message, `${(e as NodeJS.ErrnoException).code}`);\n  }\n  try {\n    await execFileAsync(\"true\", [], { cwd: \"c\\u0000\" });\n    console.log(\"cwd-nul:\", \"resolved\");\n  } catch (e) {\n    if (e instanceof Error) console.log(\"cwd-nul:\", e.name + \": \" + e.message, `${(e as NodeJS.ErrnoException).code}`);\n  }\n  try {\n    await execFileAsync(\"true\", [], { env: { A: \"a\\u0000\" } });\n    console.log(\"env-nul:\", \"resolved\");\n  } catch (e) {\n    if (e instanceof Error) console.log(\"env-nul:\", e.name + \": \" + e.message, `${(e as NodeJS.ErrnoException).code}`);\n  }\n  try {\n    await execFileAsync(\"f\\u0000\", [], { timeout: 1.5 });\n    console.log(\"timeout-before-file:\", \"resolved\");\n  } catch (e) {\n    if (e instanceof Error) console.log(\"timeout-before-file:\", e.name + \": \" + e.message, `${(e as NodeJS.ErrnoException).code}`);\n  }\n  try {\n    await execFileAsync(\"true\", [\"a\\u0000\"], { timeout: -2 });\n    console.log(\"timeout-before-arg:\", \"resolved\");\n  } catch (e) {\n    if (e instanceof Error) console.log(\"timeout-before-arg:\", e.name + \": \" + e.message, `${(e as NodeJS.ErrnoException).code}`);\n  }\n  try {\n    await execFileAsync(\"f\\u0000\", [], { env: { B: \"b\\u0000\" } });\n    console.log(\"file-before-env:\", \"resolved\");\n  } catch (e) {\n    if (e instanceof Error) console.log(\"file-before-env:\", e.name + \": \" + e.message, `${(e as NodeJS.ErrnoException).code}`);\n  }\n}\nmain();\n");
+    expect(r.stdout.toString("utf8")).toBe("timeout: RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received -1 ERR_OUT_OF_RANGE\nfile-nul: TypeError: The argument 'file' must be a string without null bytes. Received 't\\x00rue' ERR_INVALID_ARG_VALUE\nfile-empty: TypeError: The argument 'file' cannot be empty. Received '' ERR_INVALID_ARG_VALUE\narg-nul: TypeError: The argument 'args[0]' must be a string without null bytes. Received 'a\\x00' ERR_INVALID_ARG_VALUE\ncwd-nul: TypeError: The property 'options.cwd' must be a string, Uint8Array, or URL without null bytes. Received 'c\\x00' ERR_INVALID_ARG_VALUE\nenv-nul: TypeError: The property 'options.env['A']' must be a string without null bytes. Received 'a\\x00' ERR_INVALID_ARG_VALUE\ntimeout-before-file: RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received 1.5 ERR_OUT_OF_RANGE\ntimeout-before-arg: RangeError: The value of \"timeout\" is out of range. It must be an unsigned integer. Received -2 ERR_OUT_OF_RANGE\nfile-before-env: TypeError: The argument 'file' must be a string without null bytes. Received 'f\\x00' ERR_INVALID_ARG_VALUE\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-DEC-03 invalid UTF-8 decodes to U+FFFD in captured output and in the Command-failed tail", async () => {
+    const r = await runU1Source("// Invalid UTF-8 from a child: decoded with U+FFFD in captured output and in\n// the Command-failed tail.\nimport { execFileSync, spawnSync } from \"node:child_process\";\n\nconst r = spawnSync(\"/usr/bin/printf\", [\"a\\\\377b\\\\300\\\\200c\\\\342\\\\202\"], { encoding: \"utf8\" });\nconst codes: number[] = [];\nfor (let i = 0; i < r.stdout.length; i++) codes.push(r.stdout.charCodeAt(i));\nconsole.log(\"stdout:\", r.stdout.length, codes.join(\",\"));\ntry {\n  execFileSync(\"/bin/sh\", [\"-c\", \"printf 'x\\\\377y' 1>&2; exit 1\"], { encoding: \"utf8\", stdio: \"pipe\" });\n} catch (e) {\n  const m = e instanceof Error ? e.message : \"\";\n  const mc: number[] = [];\n  for (let i = 0; i < m.length; i++) mc.push(m.charCodeAt(i));\n  console.log(\"tail:\", mc.join(\",\"));\n}\nconst ok = execFileSync(\"/usr/bin/printf\", [\"\\\\303\\\\251\\\\360\\\\237\\\\230\\\\200\"], { encoding: \"utf8\" });\nconsole.log(\"valid:\", ok.length, ok.charCodeAt(0), ok.charCodeAt(1), ok.charCodeAt(2));\n");
+    expect(r.stdout.toString("utf8")).toBe("stdout: 7 97,65533,98,65533,65533,99,65533\ntail: 67,111,109,109,97,110,100,32,102,97,105,108,101,100,58,32,47,98,105,110,47,115,104,32,45,99,32,112,114,105,110,116,102,32,39,120,92,51,55,55,121,39,32,49,62,38,50,59,32,101,120,105,116,32,49,10,120,65533,121\nvalid: 3 233 55357 56832\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-HYG-01 twenty children across every path leave no host handle behind (the clean-run table check)", async () => {
+    const r = await runU1Source("// Twenty children across every path: success, a captured failure, a\n// spawn failure, a timeout, a caught validation throw, a caught exec\n// throw, and the promisified form resolving and rejecting.\nimport { execFile, execFileSync, execSync, spawnSync } from \"node:child_process\";\nimport { promisify } from \"node:util\";\n\nconst execFileAsync = promisify(execFile);\nlet n = 0;\nfor (let i = 0; i < 4; i++) n += spawnSync(\"/bin/echo\", [`${i}`], { encoding: \"utf8\" }).stdout.length;\nn += spawnSync(\"false\").status ?? 0;\nn += spawnSync(\"definitely-not-a-binary-xyz\").error === undefined ? 0 : 1;\nn += spawnSync(\"sleep\", [\"5\"], { timeout: 100 }).signal === \"SIGTERM\" ? 1 : 0;\nfor (const bad of [\"a\\u0000\", \"b\\u0000\"]) {\n  try {\n    spawnSync(bad);\n  } catch {\n    n += 1;\n  }\n}\nfor (let i = 0; i < 4; i++) n += execSync(`echo ${i}`, { encoding: \"utf8\" }).length;\nfor (const code of [1, 2]) {\n  try {\n    execFileSync(\"/bin/sh\", [\"-c\", `exit ${code}`], { stdio: \"pipe\" });\n  } catch {\n    n += code;\n  }\n}\nasync function main(): Promise<void> {\n  for (let i = 0; i < 3; i++) {\n    const { stdout } = await execFileAsync(\"/bin/echo\", [`${i}`]);\n    n += stdout.length;\n  }\n  try {\n    await execFileAsync(\"/bin/sh\", [\"-c\", \"exit 9\"]);\n  } catch {\n    n += 9;\n  }\n  console.log(\"total\", n);\n}\nmain();\n");
+    expect(r.stdout.toString("utf8")).toBe("total 39\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-REG-02 SEMANTICS.md S085(b): promisified execFile's Command-failed error has no numeric code (Node: the status or null)", async () => {
+    const r = await runU1Source("// The promisified execFile: success, a spawn failure, a non-zero exit, a\n// signal death, a timeout's kill, and a child that traps the timeout's\n// signal and exits 0 (resolves).\nimport { execFile } from \"node:child_process\";\nimport { promisify } from \"node:util\";\n\nconst execFileAsync = promisify(execFile);\n\nasync function show(label: string, file: string, args: string[], timeout: number): Promise<void> {\n  try {\n    const { stdout, stderr } = await execFileAsync(file, args, { encoding: \"utf8\", timeout: timeout });\n    console.log(label, \"resolved\", JSON.stringify(stdout), JSON.stringify(stderr));\n  } catch (e) {\n    console.log(label, \"rejected\", e instanceof Error ? JSON.stringify(e.message) : \"?\", `${(e as NodeJS.ErrnoException).code}`);\n  }\n}\nasync function main(): Promise<void> {\n  await show(\"ok:\", \"/bin/sh\", [\"-c\", \"printf out; printf err 1>&2\"], 0);\n  await show(\"enoent:\", \"definitely-not-a-binary-xyz\", [\"x\"], 0);\n  await show(\"exit:\", \"/bin/sh\", [\"-c\", \"printf e1 1>&2; exit 3\"], 0);\n  await show(\"signal:\", \"/bin/sh\", [\"-c\", \"kill -KILL $$\"], 0);\n  await show(\"timeout:\", \"/bin/sh\", [\"-c\", \"printf partial 1>&2; sleep 5\"], 300);\n  await show(\"trapped0:\", \"/bin/sh\", [\"-c\", \"trap 'exit 0' TERM; sleep 5 & wait\"], 300);\n  await show(\"trapped7:\", \"/bin/sh\", [\"-c\", \"trap 'exit 7' TERM; sleep 5 & wait\"], 300);\n}\nmain();\n");
+    expect(r.stdout.toString("utf8")).toBe("ok: resolved \"out\" \"err\"\nenoent: rejected \"spawn definitely-not-a-binary-xyz ENOENT\" ENOENT\nexit: rejected \"Command failed: /bin/sh -c printf e1 1>&2; exit 3\\ne1\" undefined\nsignal: rejected \"Command failed: /bin/sh -c kill -KILL $$\\n\" undefined\ntimeout: rejected \"Command failed: /bin/sh -c printf partial 1>&2; sleep 5\\npartial\" undefined\ntrapped0: resolved \"\" \"\"\ntrapped7: rejected \"Command failed: /bin/sh -c trap 'exit 7' TERM; sleep 5 & wait\\n\" undefined\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-REG-04 SEMANTICS.md S085(d): execFileSync returns 2,000,000 bytes (Node: ENOBUFS past its 1 MiB default)", async () => {
+    const r = await runU1Source("// The exec family's maxBuffer: Node's default 1 MiB throws ENOBUFS.\nimport { execFileSync } from \"node:child_process\";\n\ntry {\n  const out = execFileSync(\"/bin/sh\", [\"-c\", \"head -c 2000000 /dev/zero | tr '\\\\0' 'q'\"], { encoding: \"utf8\" });\n  console.log(\"len:\", out.length);\n} catch (e) {\n  console.log(\"threw:\", e instanceof Error ? e.message : \"?\", `${(e as NodeJS.ErrnoException).code}`);\n}\n");
+    expect(r.stdout.toString("utf8")).toBe("len: 2000000\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-REG-05 SEMANTICS.md S085(e): promisified execFile settles before a 20 ms timer; cat reads end-of-file and resolves", async () => {
+    const r = await runU1Source("// The promisified execFile settles after the child, synchronously on the\n// tier: a timer armed before the call, and a child that reads stdin.\nimport { execFile } from \"node:child_process\";\nimport { promisify } from \"node:util\";\n\nconst execFileAsync = promisify(execFile);\nsetTimeout(() => console.log(\"timer\"), 20);\nasync function main(): Promise<void> {\n  const { stdout } = await execFileAsync(\"/bin/sh\", [\"-c\", \"sleep 0.2; printf done\"]);\n  console.log(\"settled\", stdout);\n  try {\n    const { stdout: catOut } = await execFileAsync(\"cat\", [], { timeout: 300 });\n    console.log(\"cat resolved\", JSON.stringify(catOut));\n  } catch (e) {\n    console.log(\"cat rejected\", e instanceof Error ? JSON.stringify(e.message) : \"?\");\n  }\n}\nmain();\nconsole.log(\"main-returned\");\n");
+    expect(r.stdout.toString("utf8")).toBe("main-returned\nsettled done\ncat resolved \"\"\ntimer\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-REG-07 SEMANTICS.md S085(g): an explicit cwd \"\" runs the child in the current directory (Node: ENOENT)", async () => {
+    const r = await runU1Source("// An explicit empty cwd: Node fails the spawn with ENOENT.\nimport { execFileSync } from \"node:child_process\";\n\ntry {\n  const out = execFileSync(\"/bin/sh\", [\"-c\", \"echo ran\"], { encoding: \"utf8\", cwd: \"\" });\n  console.log(\"ran:\", JSON.stringify(out));\n} catch (e) {\n  console.log(\"threw:\", e instanceof Error ? e.message : \"?\", `${(e as NodeJS.ErrnoException).code}`);\n}\n");
+    expect(r.stdout.toString("utf8")).toBe("ran: \"ran\\n\"\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-REG-08 SEMANTICS.md S086(b): a grandchild holding the inherited stdout lands its output before the parent's next write", async () => {
+    const r = await runU1Source("// A grandchild that keeps an inherited stdout open after the child exits.\nimport { execSync } from \"node:child_process\";\n\nconsole.log(\"before\");\nexecSync(\"(sleep 0.5; echo late) & echo child-done\", { stdio: \"inherit\" });\nconsole.log(\"after\");\n");
+    expect(r.stdout.toString("utf8")).toBe("before\nchild-done\nlate\nafter\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-REG-13 SEMANTICS.md S086(d): stdin 'ignore' through execFileSync reaches the child as a socket (Node: /dev/null)", async () => {
+    const r = await runU1Source("// The kind of the child's stdin per stdio form: pipe and ignore through\n// literal tuples, the ignore string (all fds ignored, so the kind comes\n// back as an exit status), the runtime-string form, and the exec family.\nimport { execFileSync, spawnSync } from \"node:child_process\";\n\nconst probe = \"if [ -c /dev/stdin ]; then echo chardev; elif [ -S /dev/stdin ]; then echo socket; elif [ -p /dev/stdin ]; then echo fifo; else echo other; fi\";\nconst byStatus = \"if [ -c /dev/stdin ]; then exit 10; elif [ -S /dev/stdin ]; then exit 11; elif [ -p /dev/stdin ]; then exit 12; else exit 13; fi\";\nconsole.log(\"tuple-pipe:\", spawnSync(\"/bin/sh\", [\"-c\", probe], { encoding: \"utf8\", stdio: [\"pipe\", \"pipe\", \"pipe\"] }).stdout.trim());\nconsole.log(\"tuple-ignore:\", spawnSync(\"/bin/sh\", [\"-c\", probe], { encoding: \"utf8\", stdio: [\"ignore\", \"pipe\", \"pipe\"] }).stdout.trim());\nconsole.log(\"literal-ignore status:\", spawnSync(\"/bin/sh\", [\"-c\", byStatus], { stdio: \"ignore\" }).status);\nconst runtime = (s: \"pipe\" | \"ignore\" | \"inherit\"): number | null => spawnSync(\"/bin/sh\", [\"-c\", byStatus], { encoding: \"utf8\", stdio: s }).status;\nconsole.log(\"str-ignore status:\", runtime(\"ignore\"));\nconsole.log(\"str-pipe status:\", runtime(\"pipe\"));\nconsole.log(\"plain status:\", spawnSync(\"/bin/sh\", [\"-c\", byStatus]).status);\nconsole.log(\"exec-default:\", execFileSync(\"/bin/sh\", [\"-c\", probe], { encoding: \"utf8\" }).trim());\nconsole.log(\"exec-ignore:\", execFileSync(\"/bin/sh\", [\"-c\", probe], { encoding: \"utf8\", stdio: [\"ignore\", \"pipe\", \"pipe\"] }).trim());\nconsole.log(\"exec-input:\", execFileSync(\"/bin/sh\", [\"-c\", probe], { encoding: \"utf8\", input: \"\" }).trim());\n");
+    expect(r.stdout.toString("utf8")).toBe("tuple-pipe: socket\ntuple-ignore: socket\nliteral-ignore status: 11\nstr-ignore status: 10\nstr-pipe status: 11\nplain status: 11\nexec-default: socket\nexec-ignore: socket\nexec-input: socket\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  // Node throws the validation error out of the call itself (its
+  // promisify wrapper calls execFile synchronously), so the try catches it
+  // and prints "threw: ..." then "after". Here the IR's helper is async:
+  // the call returns a rejected promise, the try sees nothing, and the
+  // rejection is reported unhandled at the end of the program.
+  test("U1-REG-11 SEMANTICS.md S085(e): a validation failure in promisified execFile rejects the returned promise where Node throws from the call", async () => {
+    const r = await runU1Source("// A validation failure in the promisified execFile, called as a statement\n// (not awaited) inside a synchronous try: Node throws from the call itself.\nimport { execFile } from \"node:child_process\";\nimport { promisify } from \"node:util\";\n\nconst execFileAsync = promisify(execFile);\ntry {\n  execFileAsync(\"t\\u0000rue\", []);\n  console.log(\"returned\");\n} catch (e) {\n  console.log(\"threw:\", e instanceof Error ? e.message : \"?\");\n}\nconsole.log(\"after\");\n");
+    expect(r.stdout.toString("utf8")).toBe("returned\nafter\n");
+    expect(r.stderr.toString("utf8")).toMatch(/^Unhandled promise rejection: /);
+    expect(r.exitCode).toBe(1);
+  }, 60000);
+  // The echo's bytes, compared as bytes (a decoded comparison cannot tell
+  // a raw FF from Node's EF BF BD). The first line has no encoding option:
+  // Node echoes the raw byte, and so does this tier.
+  test("U1-DEC-02 the default-stdio echo without an encoding writes the child's raw invalid byte (FF), as Node does", async () => {
+    const r = await runU1Source("// The default-stdio echo of an invalid UTF-8 byte: without an encoding\n// option (raw) and with one (Node echoes the decoded string).\nimport { execFileSync } from \"node:child_process\";\n\nexecFileSync(\"/bin/sh\", [\"-c\", \"printf 'E1[\\\\377]\\\\n' 1>&2\"]);\nconst s = execFileSync(\"/bin/sh\", [\"-c\", \"printf 'E2[\\\\377]\\\\n' 1>&2\"], { encoding: \"utf8\" });\nconsole.log(\"done\", JSON.stringify(s));\n");
+    expect(r.stdout.toString("utf8")).toBe('done ""\n');
+    expect(r.stderr.subarray(0, 6).toString("hex")).toBe(Buffer.from("E1[\xff]\n", "latin1").toString("hex"));
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  // The second line has encoding "utf8": Node echoes the DECODED string
+  // (EF BF BD); this tier echoes the raw byte.
+  test("U1-REG-06 SEMANTICS.md S085(f): the echo with an encoding option writes the raw byte FF where Node writes EF BF BD", async () => {
+    const r = await runU1Source("// The default-stdio echo of an invalid UTF-8 byte: without an encoding\n// option (raw) and with one (Node echoes the decoded string).\nimport { execFileSync } from \"node:child_process\";\n\nexecFileSync(\"/bin/sh\", [\"-c\", \"printf 'E1[\\\\377]\\\\n' 1>&2\"]);\nconst s = execFileSync(\"/bin/sh\", [\"-c\", \"printf 'E2[\\\\377]\\\\n' 1>&2\"], { encoding: \"utf8\" });\nconsole.log(\"done\", JSON.stringify(s));\n");
+    expect(r.stderr.subarray(6).toString("hex")).toBe(Buffer.from("E2[\xff]\n", "latin1").toString("hex"));
+  }, 60000);
+  // Node exits 1 with its stack and the error's extra properties on stderr;
+  // this tier prints the uncaught report (name and message only — SEMANTICS.md
+  // S085(b)). The child wrote nothing to stderr, so the message has no tail.
+  test("U1-HYG-02 an uncaught execFileSync failure with an empty stderr: exit 1, the module's uncaught report with no tail", async () => {
+    const r = await runU1Source("// An uncaught execFileSync failure whose child wrote nothing to stderr.\nimport { execFileSync } from \"node:child_process\";\n\nconsole.log(\"before\");\nexecFileSync(\"/bin/sh\", [\"-c\", \"exit 3\"], { stdio: \"pipe\" });\nconsole.log(\"never\");\n");
+    expect(r.stdout.toString("utf8")).toBe("before\n");
+    expect(r.stderr.toString("utf8")).toBe("Uncaught Error: Command failed: /bin/sh -c exit 3\n");
+    expect(r.exitCode).toBe(1);
+  }, 60000);
+  // Node prints "mixed: 0 null undefined \"captured\\n\"" and 2,000,000
+  // bytes on stderr: its inherited stream has no limit. Here the host pipes
+  // the inherited stream, so spawnSync's 1 MiB default applies to it: the
+  // child is killed with SIGTERM once stderr passes the limit (how far past
+  // depends on pipe timing, so only the bound is asserted), and the
+  // captured stdout never receives "captured".
+  test("U1-REG-10 SEMANTICS.md S086(c): spawnSync with stderr inherited and stdout captured counts the inherited stream against the 1 MiB default", async () => {
+    const r = await runU1Source("// spawnSync with stderr inherited and stdout captured: Node's inherited\n// stream has no limit; the captured one keeps the 1 MiB default.\nimport { spawnSync } from \"node:child_process\";\n\nconst mixed = spawnSync(\"/bin/sh\", [\"-c\", \"head -c 2000000 /dev/zero | tr '\\\\0' 'i' 1>&2; echo captured\"], { encoding: \"utf8\", stdio: [\"pipe\", \"pipe\", \"inherit\"] });\nconsole.log(\"mixed:\", mixed.status, mixed.signal, `${(mixed.error as NodeJS.ErrnoException | undefined)?.code}`, JSON.stringify(mixed.stdout));\n");
+    expect(r.stdout.toString("utf8")).toBe("mixed: null SIGTERM ENOBUFS \"\"\n");
+    const err = r.stderr.toString("utf8");
+    expect(err.length).toBeGreaterThan(1_048_576);
+    expect(err.length).toBeLessThan(2_000_000);
+    expect(/^i+$/.test(err)).toBe(true);
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U1-UNIT-01 cpDecodeRequest reads every header field and run of a hand-built record at a 4-aligned base, odd-length runs padded — SINGLE-EDIT: the run padding or a header offset changed", () => {
+    const { buffer, len } = buildRequest();
+    expect(cpDecodeRequest(buffer, 8, len)).toEqual({
+      stdinMode: 1,
+      stdoutMode: 2,
+      stderrMode: 1,
+      killSignal: 9,
+      timeoutMs: 1500,
+      maxBufferMode: 1,
+      file: "a\uD800",
+      argv: ["x", "yz"],
+      cwd: "",
+      env: [
+        ["K", "V"],
+        ["E", ""],
+      ],
+      input: new Uint8Array([0xff, 0x01]),
+    });
+  });
+  test("U1-UNIT-01b cpDecodeRequest refuses a record whose parts do not add up to its length — SINGLE-EDIT: the length check removed", () => {
+    const { buffer, len } = buildRequest();
+    expect(() => cpDecodeRequest(buffer, 8, len + 4)).toThrow(/request record/);
+  });
+  test("U1-UNIT-02 cpEncodeResult writes the 32-byte result record at the documented offsets (hasStatus 0, status 4, signal 12, errCode 16, stdoutLen 20, stderrLen 24) — SINGLE-EDIT: a field written at another offset", () => {
+    const buffer = new ArrayBuffer(48);
+    cpEncodeResult(buffer, 12, {
+      hasStatus: 1,
+      status: 7,
+      signal: 15,
+      errCode: -(256 + 18),
+      stdout: new Uint8Array(3),
+      stderr: new Uint8Array(5),
+    });
+    const dv = new DataView(buffer, 12, 32);
+    expect([dv.getUint32(0, true), dv.getFloat64(4, true), dv.getUint32(12, true), dv.getInt32(16, true), dv.getUint32(20, true), dv.getUint32(24, true), dv.getUint32(28, true)]).toEqual([1, 7, 15, -274, 3, 5, 0]);
+  });
+  test("U1-UNIT-03 the host's errno table is ENOENT..ENOBUFS = 1..15 in the module's order, and a code outside it carries -(256 + errno) — SINGLE-EDIT: two table entries swapped", () => {
+    expect(Object.entries(CP_HOST_CODE_INDEX).sort((a, b) => a[1] - b[1]).map(([k]) => k)).toEqual([
+      "ENOENT",
+      "EACCES",
+      "EPERM",
+      "ENOTDIR",
+      "ENOEXEC",
+      "ELOOP",
+      "ENAMETOOLONG",
+      "E2BIG",
+      "ENOMEM",
+      "EAGAIN",
+      "EIO",
+      "EINVAL",
+      "ETIMEDOUT",
+      "EPIPE",
+      "ENOBUFS",
+    ]);
+    expect(cpErrCodeFor(undefined)).toBe(0);
+    expect(cpErrCodeFor(Object.assign(new Error("x"), { code: "ENOENT", errno: -2 }))).toBe(1);
+    expect(cpErrCodeFor(Object.assign(new Error("x"), { code: "ENOBUFS", errno: -105 }))).toBe(15);
+    expect(cpErrCodeFor(Object.assign(new Error("x"), { code: "EXDEV", errno: -18 }))).toBe(-(256 + 18));
+    expect(() => cpErrCodeFor(Object.assign(new Error("x"), { code: "EWEIRD" }))).toThrow(/no \.errno/);
+  });
+  test("U1-UNIT-04 the stdio and maxBuffer maps: stdin 0/1/2 pipe and 3 ignore, outputs 0 pipe, 1 ignore, 2 pipe (inherit emulated, never passed through), maxBuffer unbounded for the exec family or when nothing is captured — SINGLE-EDIT: inherit passed through, or a stdin mode mapped to ignore", () => {
+    expect([0, 1, 2, 3].map(cpStdinFor)).toEqual(["pipe", "pipe", "pipe", "ignore"]);
+    expect([0, 1, 2].map(cpStdioFor)).toEqual(["pipe", "ignore", "pipe"]);
+    expect(() => cpStdinFor(4)).toThrow(/stdin mode/);
+    expect(() => cpStdioFor(3)).toThrow(/output mode/);
+    expect(cpMaxBufferFor({ maxBufferMode: 1, stdoutMode: 0, stderrMode: 0 })).toBe(Infinity);
+    expect(cpMaxBufferFor({ maxBufferMode: 0, stdoutMode: 2, stderrMode: 1 })).toBe(Infinity);
+    expect(cpMaxBufferFor({ maxBufferMode: 0, stdoutMode: 2, stderrMode: 0 })).toBeUndefined();
+    expect(cpMaxBufferFor({ maxBufferMode: 0, stdoutMode: 0, stderrMode: 0 })).toBeUndefined();
+  });
+  test("U1-UNIT-05 a host-side throw during RUN becomes the negative status the module traps on, never an exception through the import — SINGLE-EDIT: the guard rethrows", () => {
+    expect(
+      cpGuardedRun(() => {
+        throw new Error("boom");
+      }),
+    ).toBe(-1);
+    expect(cpGuardedRun(() => 7)).toBe(7);
   });
 });
