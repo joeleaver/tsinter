@@ -78,26 +78,26 @@ describe("INC-28 U1 child_process — host-free rows", () => {
     expect(r.ok, JSON.stringify(r)).toBe(true);
   });
 
-  test("N-NL-01 child_process.spawn stays refused by key: SC3001 (libCall:cp.spawn) — SINGLE-EDIT: a cp.spawn arm added", async () => {
-    const r = await build('import { spawn } from "node:child_process";\nspawn("true", [], { stdio: "ignore" });\n');
+  test("N-NL-01 (re-aimed at INC-28 U2, which lifts spawn) spawn with a piped output stays refused by key: SC3001 (libCall:cp.spawnOpts:pipe) — SINGLE-EDIT: the pipe refusal removed", async () => {
+    const r = await build('import { spawn } from "node:child_process";\nspawn("true", [], { stdio: ["ignore", "pipe", "pipe"] });\n');
     expect(r.ok).toBe(false);
     if (r.ok) return;
-    expect(r.diagnostics.join("\n")).toContain("(libCall:cp.spawn)");
+    expect(r.diagnostics.join("\n")).toContain("(libCall:cp.spawnOpts:pipe)");
   });
 
-  test("N-NL-02 spawn with options stays refused by key: SC3001 (libCall:cp.spawnOpts) — SINGLE-EDIT: a cp.spawnOpts arm added", async () => {
-    const r = await build('import { spawn } from "node:child_process";\nspawn("true", [], { stdio: "ignore", detached: true });\n');
+  test("N-NL-02 (re-aimed at INC-28 U2, which lifts spawn with options) a ChildProcess's stdout stream stays refused by key: SC3001 (libCall:child.stdout) — SINGLE-EDIT: a child.stdout arm added", async () => {
+    const r = await build('import { spawn } from "node:child_process";\nconst c = spawn("true", [], { stdio: "ignore" });\nconsole.log(c.stdout === null);\n');
     expect(r.ok).toBe(false);
     if (r.ok) return;
-    expect(r.diagnostics.join("\n")).toContain("(libCall:cp.spawnOpts)");
+    expect(r.diagnostics.join("\n")).toContain("(libCall:child.stdout)");
   });
 
-  test("N-NL-03 a ChildProcess member read stays refused by key: the survey still names libCall:child.onExit — SINGLE-EDIT: a child.* arm added", async () => {
+  test("N-NL-03 (re-aimed at INC-28 U2, which lifts the ChildProcess members) a stdout data listener stays refused: the survey names libCall:stream.onData — SINGLE-EDIT: a stream.onData arm added", async () => {
     const file = join(scratch, `p${seq++}.ts`);
-    await writeFile(file, 'import { spawn } from "node:child_process";\nconst c = spawn("true", [], { stdio: "ignore" });\nc.on("exit", (code) => console.log(code));\n');
+    await writeFile(file, 'import { spawn } from "node:child_process";\nconst c = spawn("true", [], { stdio: "ignore" });\nc.stdout!.on("data", (d: Buffer) => console.log(d.length));\n');
     const res = await compile(file, { outPath: `${file}.wasm`, outDir: scratch, dynamic: false, backend: "wasm" });
     expect(res.ok).toBe(false);
-    expect(res.wasmSurvey).toContain("libCall:child.onExit");
+    expect(res.wasmSurvey).toContain("libCall:stream.onData");
   });
 
   test("N-SHAPE-01 the exec-options record path (a typed options const, runtime stdio modes) compiles for wasm — SINGLE-EDIT: the cp.execSync arm removed", async () => {

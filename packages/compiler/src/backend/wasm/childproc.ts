@@ -372,7 +372,7 @@ export class ChildProcBuilder {
    * to the next multiple of 4; answers the address after it. With cut =
    * 1 the run stops at the string's first U+0000 (Node's process.env
    * setter's cut, applied when the module sends its own environment). */
-  private stageRunHelper(): number {
+  stageRunHelper(): number {
     return this.cached("stageRun", [this.strRef(), I32, I32], [I32], (idx) => {
       const c = new Code();
       const S = 0;
@@ -1504,7 +1504,7 @@ export class ChildProcBuilder {
    * cwd of "" is how the lowering spells "absent", so it is not checked)
    * and the env option's per-entry checks, key then value, in insertion
    * order. */
-  private checkCwdEnvHelper(): number {
+  checkCwdEnvHelper(): number {
     return this.cached("checkCwdEnv", [this.strRef(), I32, this.deps.stringVecRef()], [I32], (idx) => {
       const c = new Code();
       const CWD = 0;

@@ -91,6 +91,7 @@ import {
 } from "./classes.js";
 import {
   EXPORT_ENTRY,
+  EXPORT_LOOP,
   EXPORT_MEMORY,
   EXPORT_STATUS,
   EXPORT_TICK,
@@ -131,6 +132,7 @@ import {
   HOST_STR_KIND_VERSIONS_OPENSSL,
   IMPORT_CHDIR,
   IMPORT_CP_CALL,
+  IMPORT_EV_POLL,
   IMPORT_EXIT,
   IMPORT_FS_CALL,
   IMPORT_HOST_NUM,
@@ -169,6 +171,7 @@ import { PathBuilder } from "./path.js";
 import { FsBuilder } from "./fs.js";
 import { FsLaddersBuilder } from "./fs-ladders.js";
 import { ChildProcBuilder, SR_ERR_CODE, SR_HAS_STATUS, SR_SIGNAL, SR_STATUS, SR_STDERR, SR_STDOUT } from "./childproc.js";
+import { CH_CODE, CH_HAS_PID, CH_KILLED, CH_PID, CH_STATE, ChildAsyncBuilder } from "./childasync.js";
 import { MapBuilder, type MapInfo, type MapKeyKind, type MapValKind } from "./maps.js";
 import { JsonBuilder, jsonQuote } from "./json.js";
 import {
@@ -410,7 +413,19 @@ function timerSurfaceReachable(mod: WModule): boolean {
       // exactly like any "timers."-prefixed key — the SAME failure
       // class this function's own comment above already documents for
       // "process.activeResources", repeated here on purpose.
-      if (node.startsWith("timers.") || node === "process.activeResources" || node === "fs.existsChk") found = true;
+      // INC-28 U2: an event module (cp.spawn / cp.spawnOpts, exact names —
+      // a prefix would also match the cp.spawnSync* keys) builds its
+      // `_loop` from the timer runtime, which reads `now`, whether or not
+      // the program arms a timer itself.
+      if (
+        node.startsWith("timers.") ||
+        node === "process.activeResources" ||
+        node === "fs.existsChk" ||
+        node === "cp.spawn" ||
+        node === "cp.spawnOpts"
+      ) {
+        found = true;
+      }
       return;
     }
     if (Array.isArray(node)) {
@@ -602,7 +617,11 @@ function hostStrReachable(mod: WModule): boolean {
         node === "cp.spawnSyncOpts" ||
         node === "cp.spawnSyncStdioStr" ||
         node === "cp.execSync" ||
-        node === "cp.execCapture"
+        node === "cp.execCapture" ||
+        // INC-28 U2: an asynchronous child's environment comes from the
+        // same map (exact names; the cp.spawnSync* keys are listed above).
+        node === "cp.spawn" ||
+        node === "cp.spawnOpts"
       ) {
         found = true;
       }
@@ -685,7 +704,10 @@ function hostNumReachable(mod: WModule): boolean {
         node === "cp.spawnSyncOpts" ||
         node === "cp.spawnSyncStdioStr" ||
         node === "cp.execSync" ||
-        node === "cp.execCapture"
+        node === "cp.execCapture" ||
+        // INC-28 U2: and the two asynchronous keys, as hostStrReachable.
+        node === "cp.spawn" ||
+        node === "cp.spawnOpts"
       ) {
         found = true;
       }
@@ -963,9 +985,13 @@ function fsCallReachable(mod: WModule): boolean {
  * exactly those libCall names read as cp.execSync (already on the list);
  * the copy is used for nothing else and never emitted. A module with none
  * of them gets the ORIGINAL object back — its analysis, and its bytes, are
- * exactly what they were. */
+ * exactly what they were. INC-28 U2 adds the asynchronous keys that throw
+ * here and not on the native lanes: spawn and spawn with options (the same
+ * argument validation, and the synchronously thrown spawn failures), and
+ * kill with a number (Node's ERR_UNKNOWN_SIGNAL for a number naming no
+ * signal; child.kill with a name is already on the shared list). */
 function spawnSyncMayThrowView(mod: WModule): WModule {
-  const keys = new Set(["cp.spawnSync", "cp.spawnSyncOpts", "cp.spawnSyncStdioStr"]);
+  const keys = new Set(["cp.spawnSync", "cp.spawnSyncOpts", "cp.spawnSyncStdioStr", "cp.spawn", "cp.spawnOpts", "child.killNum"]);
   let found = false;
   const scan = (node: unknown): void => {
     if (found) return;
@@ -1013,10 +1039,45 @@ function cpCallReachable(mod: WModule): boolean {
         node === "cp.spawnSyncOpts" ||
         node === "cp.spawnSyncStdioStr" ||
         node === "cp.execSync" ||
-        node === "cp.execCapture"
+        node === "cp.execCapture" ||
+        // INC-28 U2: ops 5-8 (abi.ts) — spawn's SPAWN, and the KILL, UNREF
+        // and RELEASE a ChildProcess's own members send.
+        node === "cp.spawn" ||
+        node === "cp.spawnOpts" ||
+        node === "child.kill" ||
+        node === "child.killNum" ||
+        node === "child.unref"
       ) {
         found = true;
       }
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      for (const value of Object.values(node)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn.body);
+  }
+  return found;
+}
+
+/** Is this an EVENT MODULE — does any reachable function call `cp.spawn`
+ * or `cp.spawnOpts`? INC-28 U2 (abi.ts): such a module imports `evPoll`
+ * and exports `_loop` instead of `_tick`. EXACT names: "cp.spawn" is a
+ * prefix of the synchronous cp.spawnSync* keys, which must not make a
+ * module an event module. */
+function eventModuleReachable(mod: WModule): boolean {
+  const reachable = reachableFunctionNames(mod);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (typeof node === "string") {
+      if (node === "cp.spawn" || node === "cp.spawnOpts") found = true;
       return;
     }
     if (Array.isArray(node)) {
@@ -2012,6 +2073,12 @@ class Assembler {
    * umask shape (one key, one import each). */
   private readonly fsCallFunc: number | null;
   private readonly cpCallFunc: number | null;
+  /** INC-28 U2: `tsinter.evPoll`'s index, or null in a module that is not
+   * an EVENT MODULE (eventModuleReachable). */
+  private readonly evPollFunc: number | null;
+  /** INC-28 U2: the module reaches cp.spawn or cp.spawnOpts — it exports
+   * `_loop` instead of `_tick` (abi.ts). Computed once. */
+  private readonly eventModule: boolean;
   /** The exit-drain gate's static fact — see exitListenerSurfaceReachable's
    * own comment (INC-26 P1). Computed ONCE in the constructor; every drain
    * gate site reads this, never the mutable `procField`/
@@ -2197,6 +2264,12 @@ class Assembler {
     // i32; the host holds each finished child's result behind a handle.
     this.cpCallFunc = cpCallReachable(mod)
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_CP_CALL, this.mb.funcType([I32, I32, I32, I32, I32], [I32]))
+      : null;
+    // `evPoll`'s decision (INC-28 U2, abi.ts): the host's event queue, in
+    // event modules only, minted LAST so no earlier import index moves.
+    this.eventModule = eventModuleReachable(mod);
+    this.evPollFunc = this.eventModule
+      ? this.mb.importFunc(IMPORT_MODULE, IMPORT_EV_POLL, this.mb.funcType([I32, I32], [I32]))
       : null;
     // ── end INC-26 host-import block ──
     // The exit-drain gate's STATIC fact (see exitListenerSurfaceReachable's
@@ -3923,11 +3996,16 @@ class Assembler {
       // listener struct's own lazily-built state, so a module using only
       // argv/env/cwd/platform pays nothing for this AND the gate cannot
       // depend on which construct happened to run first.
+      // INC-28 U2: an event module's quiescence belongs to its `_loop`
+      // (abi.ts), so its timer runtime exists before this tail is built
+      // whether or not the program arms a timer.
+      if (this.eventModule) void this.timers;
       if (this.timersField === null) this.emitImplicitDrainAndCheck(c);
       this.mb.setBody(start, [], c.bytes());
     }
     this.mb.exportFunc(EXPORT_ENTRY, start);
-    if (this.timersField !== null) this.mb.exportFunc(EXPORT_TICK, this.timersField.tick());
+    if (this.eventModule) this.mb.exportFunc(EXPORT_LOOP, this.timers.loop());
+    else if (this.timersField !== null) this.mb.exportFunc(EXPORT_TICK, this.timersField.tick());
     this.emitStatus();
     this.mb.exportMemory(EXPORT_MEMORY);
   }
@@ -5719,6 +5797,10 @@ class Assembler {
       // report (its own needsExitDrain check makes this one redundant but
       // harmless).
       drainAtQuiescence: (c) => this.emitImplicitDrainAndCheck(c),
+      // INC-28 U2: an event module's poll phase and its third liveness
+      // term (read only when `_loop` is built).
+      poll: (c) => c.call(this.cpa.pollHelper()),
+      childRefLive: () => this.cpa.refLiveGlobal(),
     });
     return this.timersField;
   }
@@ -7974,6 +8056,192 @@ class Assembler {
       envPairs: () => this.proc.envPairs(),
     });
     return this.cpField;
+  }
+
+  /** `this.evPollFunc`, or a descriptive throw (cpCallFuncOrThrow's
+   * shape). */
+  private evPollFuncOrThrow(): number {
+    if (this.evPollFunc === null) {
+      throw new Error("emitter bug: a child's event was polled but tsinter.evPoll was never imported");
+    }
+    return this.evPollFunc;
+  }
+
+  private cpaField: ChildAsyncBuilder | null = null;
+
+  /** INC-28 U2's builder (childasync.ts) — spawn's asynchronous surface:
+   * the ChildProcess value, the SPAWN request, the poll phase. */
+  private get cpa(): ChildAsyncBuilder {
+    const strVec = (): VecInfo => this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!;
+    this.cpaField ??= new ChildAsyncBuilder(this.mb, {
+      strRef: () => this.strRef,
+      cpCallFunc: () => this.cpCallFuncOrThrow(),
+      evPollFunc: () => this.evPollFuncOrThrow(),
+      writeFunc: () => this.writeFunc,
+      ensureCapacity: (c, need) => this.emitEnsureCapacity(c, need),
+      stageCursor: () => this.cursorGlobal,
+      pushStrLit: (c, value) => this.pushStrLitInto(c, value),
+      namedTrap: (c, message) => {
+        const exc = this.exc();
+        this.pushStrLitInto(c, message);
+        c.globalSet(exc.refG);
+        c.i32Const(EXC_STR);
+        c.globalSet(exc.kindG);
+        c.call(this.reportUncaughtHelper());
+      },
+      stringVecRef: () => this.vecs.vecRef(strVec()),
+      stringVecLen: (c) => c.structGet(strVec().struct, LEN),
+      stringVecGet: () => this.vecs.get(strVec()),
+      envPairs: () => this.proc.envPairs(),
+      stageRun: () => this.cp.stageRunHelper(),
+      checkFile: () => this.cp.checkFileHelper(),
+      checkArgs: () => this.cp.checkArgsHelper(),
+      checkCwdEnv: () => this.cp.checkCwdEnvHelper(),
+      codeName: () => this.cp.codeNameHelper(),
+      signalName: () => this.cp.signalNameHelper(),
+      concat: () => this.concatHelper(),
+      throwCoded: (c, className, name, pushMessage, pushCode) => this.emitSetCellErrorCoded(c, className, name, pushMessage, pushCode),
+      newErrorCoded: (c, pushMessage, pushCode) => {
+        const exc = this.exc();
+        c.globalGet(this.classes.vtGlobal("%Error"));
+        this.pushStrLitInto(c, "Error");
+        pushMessage(c);
+        pushCode(c);
+        c.structNew(exc.errT);
+      },
+      voidClos: () => this.closPairFor([], []),
+      nextTickEnqueue: () => this.nextTick.enqueue(),
+      exitClos: () => this.closPairFor([I32, F64, I32], []),
+      errorClos: () => this.closPairFor([{ kind: "ref", nullable: true, typeIndex: this.exc().errT }], []),
+      excKind: () => this.exc().kindG,
+      reportUncaught: () => this.reportUncaughtHelper(),
+      checkpoint: (c) => this.emitCheckpoint(c),
+      toUpperCase: () => this.casing.toUpperCase(),
+      killSignalByName: () => this.proc.killSignalByNameHelper(),
+      f64ToStr: () => this.f64ToStrHelper(),
+    });
+    return this.cpaField;
+  }
+
+  /** INC-28 U2: the exit-listener ADAPTER for a user callback of type
+   * `cbType` — a function of the fixed exit-listener closure type
+   * (hasCode, code, signum) whose environment holds the user's closure,
+   * and which calls it with the `number | null` code and the
+   * `string | null` signal name built in the call site's own unions
+   * (0, 1 or 2 parameters — validate.ts's shapes). Interned per callback
+   * type. Null when a parameter's representation refused by name. */
+  private readonly exitAdapterFns = new Map<string, { fn: number; env: number }>();
+
+  private exitAdapterFor(cbType: IrType & { kind: "func" }, loc: SrcLoc | undefined): { fn: number; env: number } | null {
+    const user = this.closSigFor(cbType, loc);
+    if (user === null) return null;
+    const key = `${user.clos}:${cbType.params.map((p) => (p.kind === "union" ? p.unionId : p.kind)).join(",")}`;
+    const hit = this.exitAdapterFns.get(key);
+    if (hit !== undefined) return hit;
+    const fixed = this.closPairFor([I32, F64, I32], []);
+    const env = this.mb.subStructType(
+      `cpaExitEnv:${key}`,
+      [
+        { storage: { kind: "ref", nullable: false, typeIndex: fixed.fn }, mutable: false },
+        { storage: { kind: "ref", nullable: true, typeIndex: user.clos }, mutable: false },
+      ],
+      fixed.clos,
+    );
+    // Each parameter: the union value builder, resolved BEFORE the body.
+    const params: { unionVal: ValType; emptyTag: number; valueTag: number; armSt: number; isSignal: boolean }[] = [];
+    for (const [i, p] of cbType.params.entries()) {
+      if (p.kind !== "union") return null;
+      const def = this.unionDef(p.unionId);
+      const isSignal = i === 1;
+      const emptyTag = def.arms.findIndex((a) => a.kind === "nullT");
+      const valueTag = def.arms.findIndex((a) => a.kind === (isSignal ? "string" : "f64"));
+      const armSt = this.unionArmStruct(p.unionId, valueTag, loc);
+      const unionVal = this.mapType(p, loc);
+      if (emptyTag < 0 || valueTag < 0 || armSt === null || unionVal === null) return null;
+      params.push({ unionVal, emptyTag, valueTag, armSt, isSignal });
+    }
+    const fn = this.mb.declareFunc(fixed.fn, `%w.cpa.exitAdapter.${this.exitAdapterFns.size}`);
+    const made = { fn, env };
+    this.exitAdapterFns.set(key, made);
+    const c = new Code();
+    const HAS = 1;
+    const CODE = 2;
+    const SIG = 3;
+    const U = 4;
+    c.localGet(0);
+    c.refCast(env);
+    c.structGet(env, 1);
+    c.localSet(U);
+    c.localGet(U);
+    for (const p of params) {
+      c.localGet(p.isSignal ? SIG : HAS);
+      c.ifResult(p.unionVal);
+      c.i32Const(p.valueTag);
+      if (p.isSignal) {
+        c.localGet(SIG);
+        c.call(this.cp.signalNameHelper());
+      } else {
+        c.localGet(CODE);
+      }
+      c.structNew(p.armSt);
+      c.else_();
+      c.globalGet(this.unions.unitGlobal(p.emptyTag));
+      c.end();
+    }
+    c.localGet(U);
+    c.structGet(user.clos, 0);
+    c.callRef(user.fn);
+    this.mb.setBody(fn, [{ kind: "ref", nullable: true, typeIndex: user.clos }], c.bytes());
+    return made;
+  }
+
+  /** INC-28 U2: the error-listener ADAPTER for a user callback of type
+   * `cbType` (no parameter, or the %Error one — validate.ts's shapes): a
+   * function of the fixed error-listener closure type whose environment
+   * holds the user's closure. Interned per callback type. */
+  private readonly errorAdapterFns = new Map<string, { fn: number; env: number }>();
+
+  private errorAdapterFor(cbType: IrType & { kind: "func" }, loc: SrcLoc | undefined): { fn: number; env: number } | null {
+    const user = this.closSigFor(cbType, loc);
+    if (user === null) return null;
+    const key = `${user.clos}:${cbType.params.length}`;
+    const hit = this.errorAdapterFns.get(key);
+    if (hit !== undefined) return hit;
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+    const fixed = this.closPairFor([errRef], []);
+    let paramVal: ValType | null = null;
+    if (cbType.params.length === 1) {
+      paramVal = this.mapType(cbType.params[0]!, loc);
+      if (paramVal === null) return null;
+    }
+    const env = this.mb.subStructType(
+      `cpaErrorEnv:${key}`,
+      [
+        { storage: { kind: "ref", nullable: false, typeIndex: fixed.fn }, mutable: false },
+        { storage: { kind: "ref", nullable: true, typeIndex: user.clos }, mutable: false },
+      ],
+      fixed.clos,
+    );
+    const fn = this.mb.declareFunc(fixed.fn, `%w.cpa.errorAdapter.${this.errorAdapterFns.size}`);
+    const made = { fn, env };
+    this.errorAdapterFns.set(key, made);
+    const c = new Code();
+    const ERR = 1;
+    const U = 2;
+    c.localGet(0);
+    c.refCast(env);
+    c.structGet(env, 1);
+    c.localSet(U);
+    c.localGet(U);
+    if (paramVal !== null) {
+      c.localGet(ERR);
+      if (paramVal.kind === "ref" && paramVal.typeIndex !== this.exc().errT) c.refCast(paramVal.typeIndex);
+    }
+    c.localGet(U);
+    c.structGet(user.clos, 0);
+    c.callRef(user.fn);
+    this.mb.setBody(fn, [{ kind: "ref", nullable: true, typeIndex: user.clos }], c.bytes());
+    return made;
   }
 
   /** The ARR payload's vector info — the SAME interning a static
@@ -10799,6 +11067,11 @@ class Assembler {
       // (a captured or parameter spawnRes must not read the placeholder).
       case "spawnRes":
         return this.cp.spawnResRef();
+      // INC-28 U2: the ChildProcess struct (childasync.ts) — never fails;
+      // mapTypeSoft carries the same arm, and its array-element list
+      // admits child (a ChildProcess[] must not soft-map to a placeholder).
+      case "child":
+        return this.cpa.childRef();
       // INC-27 U1: the $sym struct (symbols.ts) — ONE representation
       // whatever the symbol (registered or not, described or not), same
       // shape as bytes/promise/dyn/regex/stats just above: this arm
@@ -10864,6 +11137,7 @@ class Assembler {
           t.elem.kind === "bytes" ||
           t.elem.kind === "regex" ||
           t.elem.kind === "stats" || // INC-26 P5, CP1 delta 29286fa4 D-2/ruling(1)(ii): a `stats[]` must not soft-map to a placeholder while mapType succeeds on it (the increment-6/7 lockstep lesson this list's own header comment names) — latent (no program in the twelve builds one), fixed now per the ruling's own reasoning
+          t.elem.kind === "child" || // INC-28 U2: a ChildProcess[] (mapType's child arm never fails), the lockstep this list's header comment names
           t.elem.kind === "symbol" || // INC-27 U1: mapTypeSoft must admit symbol wherever mapType does, including as an array element, or the I32 placeholder is declared for a field that actually holds a $sym struct — the same lockstep-bug class this list's own header comment names
           (t.elem.kind === "object" && this.objectMappable(t.elem.className));
         if (!mappable) return I32;
@@ -10963,6 +11237,9 @@ class Assembler {
       // INC-28 U1: mapType's spawnRes arm, in lockstep.
       case "spawnRes":
         return this.cp.spawnResRef();
+      // INC-28 U2: mapType's child arm, in lockstep.
+      case "child":
+        return this.cpa.childRef();
       // INC-27 U1: mapType never fails on symbol either — same
       // consistency rule as every other never-fails arm above
       // (dyn/jsval/bytes/regex/stats). This case and mapType's own
@@ -16462,6 +16739,180 @@ class Assembler {
           code.structNew(armSt);
           this.close();
           this.releaseScratch(this.cp.spawnResRef(), R);
+          return;
+        }
+        // ── INC-28 U2 — spawn's asynchronous surface (childasync.ts; abi.ts
+        // cpCall ops 5-8, evPoll). spawn validates and can throw (Node's
+        // own argument checks, and the spawn failures Node throws at once),
+        // so it is followed by the pending check.
+        if (e.fn === "cp.spawn" || e.fn === "cp.spawnOpts") {
+          const opts = e.fn === "cp.spawnOpts";
+          const modes = opts ? [e.args[2]!, e.args[3]!, e.args[4]!] : [];
+          for (const m of modes) {
+            if (m.kind !== "numLit") {
+              this.refuse("libCall:cp.spawnOpts:mode-shape", e.loc);
+              code.unreachable();
+              return;
+            }
+          }
+          const mv = modes.map((m) => (m.kind === "numLit" ? m.value : -1));
+          // Piped outputs are child.stdout/child.stderr's streams, not
+          // lowered yet; inherited and fd outputs are routed by the host
+          // (abi.ts: SPAWN's modes, evPoll's kinds 2 and 3).
+          if (mv.includes(3)) {
+            this.refuse("libCall:cp.spawnOpts:pipe", e.loc);
+            code.unreachable();
+            return;
+          }
+          const vecT = this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, e.loc);
+          if (vecT === null) {
+            code.unreachable();
+            return;
+          }
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          if (opts) {
+            for (const v of mv) code.i32Const(v);
+            this.walkExpr(e.args[5]!);
+            code.call(this.toInt32Helper());
+            this.walkExpr(e.args[6]!);
+            code.call(this.toInt32Helper());
+            this.walkExpr(e.args[7]!);
+            this.walkExpr(e.args[8]!);
+            this.walkExpr(e.args[9]!);
+            this.walkExpr(e.args[10]!);
+          } else {
+            for (let k = 0; k < 7; k++) code.i32Const(0);
+            code.refNull(vecT.struct);
+            this.pushStrLitInto(code, "");
+          }
+          code.call(this.cpa.spawnHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "child.onExit") {
+          const cbType = e.args[1]!.type;
+          if (cbType.kind !== "func") {
+            this.refuse("libCall:child.onExit:unexpected-callback-shape", e.loc);
+            code.unreachable();
+            return;
+          }
+          if (cbType.rest === true) {
+            this.refuse(cbType.restAbi === "jsval" ? "type:func-rest-jsval" : "type:func-rest", e.loc);
+            code.unreachable();
+            return;
+          }
+          const adapter = this.exitAdapterFor(cbType, e.loc);
+          if (adapter === null) {
+            code.unreachable();
+            return;
+          }
+          this.walkExpr(e.args[0]!);
+          this.mb.declareFuncRef(adapter.fn);
+          code.refFunc(adapter.fn);
+          this.walkExpr(e.args[1]!);
+          code.structNew(adapter.env);
+          code.call(this.cpa.addExitHelper());
+          return;
+        }
+        if (e.fn === "child.unref") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.cpa.unrefHelper());
+          return;
+        }
+        if (e.fn === "child.onError") {
+          const cbType = e.args[1]!.type;
+          if (cbType.kind !== "func") {
+            this.refuse("libCall:child.onError:unexpected-callback-shape", e.loc);
+            code.unreachable();
+            return;
+          }
+          if (cbType.rest === true) {
+            this.refuse(cbType.restAbi === "jsval" ? "type:func-rest-jsval" : "type:func-rest", e.loc);
+            code.unreachable();
+            return;
+          }
+          const adapter = this.errorAdapterFor(cbType, e.loc);
+          if (adapter === null) {
+            code.unreachable();
+            return;
+          }
+          this.walkExpr(e.args[0]!);
+          this.mb.declareFuncRef(adapter.fn);
+          code.refFunc(adapter.fn);
+          this.walkExpr(e.args[1]!);
+          code.structNew(adapter.env);
+          code.call(this.cpa.addErrorHelper());
+          return;
+        }
+        // kill validates its signal (Node's ERR_UNKNOWN_SIGNAL) and can
+        // throw "kill EINVAL" or emit 'error' at once, so it is followed by
+        // the pending check.
+        if (e.fn === "child.kill" || e.fn === "child.killNum") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(e.fn === "child.kill" ? this.cpa.killHelper() : this.cpa.killNumHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "child.killed") {
+          this.walkExpr(e.args[0]!);
+          code.structGet(this.cpa.childType(), CH_KILLED);
+          return;
+        }
+        if (e.fn === "child.pid" || e.fn === "child.exitCode") {
+          // The call site's interned union (validate.ts): `number |
+          // undefined` for pid, `number | null` for exitCode — built here,
+          // spawnRes.status's shape. exitCode is the code once an exit was
+          // delivered (state 1), the negative errno once a failed spawn's
+          // 'error' fired (state 3), null otherwise (running, or a signal).
+          if (e.type.kind !== "union") {
+            this.refuse(`libCall:${e.fn}:unexpected-result-shape`, e.loc);
+            code.unreachable();
+            return;
+          }
+          const unionId = e.type.unionId;
+          const def = this.unionDef(unionId);
+          const emptyTag = def.arms.findIndex((a) => a.kind === (e.fn === "child.pid" ? "undefinedT" : "nullT"));
+          const valueTag = def.arms.findIndex((a) => a.kind === "f64");
+          if (emptyTag < 0 || valueTag < 0 || def.arms.length !== 2) {
+            this.refuse(`libCall:${e.fn}:unexpected-union-shape`, e.loc);
+            code.unreachable();
+            return;
+          }
+          const armSt = this.unionArmStruct(unionId, valueTag, e.loc);
+          const unionVal = this.mapType(e.type, e.loc);
+          if (armSt === null || unionVal === null) {
+            code.unreachable();
+            return;
+          }
+          const childT = this.cpa.childType();
+          const CH = this.acquireScratch(this.cpa.childRef());
+          this.walkExpr(e.args[0]!);
+          code.localSet(CH);
+          if (e.fn === "child.pid") {
+            code.localGet(CH);
+            code.structGet(childT, CH_HAS_PID);
+          } else {
+            code.localGet(CH);
+            code.structGet(childT, CH_STATE);
+            code.i32Const(1);
+            code.i32Eq();
+            code.localGet(CH);
+            code.structGet(childT, CH_STATE);
+            code.i32Const(3);
+            code.i32Eq();
+            code.i32Or();
+          }
+          this.openIfResult(unionVal);
+          code.i32Const(valueTag);
+          code.localGet(CH);
+          code.structGet(childT, e.fn === "child.pid" ? CH_PID : CH_CODE);
+          code.structNew(armSt);
+          code.else_();
+          code.globalGet(this.unions.unitGlobal(emptyTag));
+          this.close();
+          this.releaseScratch(this.cpa.childRef(), CH);
           return;
         }
         if (e.fn === "fs.statSync") {

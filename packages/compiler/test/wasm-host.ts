@@ -68,7 +68,18 @@
  * FORCED host (wasm-host-fs-p4.test.ts's own job).
  *
  * INC-28 U1: `cpCall` lands LOUD BY DESIGN for the same reason — a child's
- * result is never fabricated here; wasm-host-cp-u1.test.ts forces one. */
+ * result is never fabricated here; wasm-host-cp-u1.test.ts forces one.
+ *
+ * INC-28 U2: `evPoll` lands LOUD too, and an EVENT MODULE (one exporting
+ * `_loop` instead of `_tick`, abi.ts) is driven by the loop contract on
+ * the same virtual clock: a negative answer stops, +Infinity asks the
+ * optional `onIdle` hook for the time of the next scripted event (none:
+ * "module waits for an event no source can deliver"), anything else is a
+ * time to jump to. A test scripts the host through `runWasm`'s and
+ * `runWasmToTrap`'s ONE optional parameter: import overrides merged over
+ * these defaults, plus `onIdle`, `onJump` and `onInstance`
+ * (wasm-host-cp-u2.test.ts);
+ * a caller that passes nothing gets exactly the host it always had. */
 import { randomBytes } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { expect } from "vitest";
@@ -81,6 +92,20 @@ class WasmHostExitSignal extends Error {
   }
 }
 
+/** A test's scripting of this host (INC-28 U2): import overrides merged
+ * over the defaults below, and the event drive's two hooks. */
+export interface HostOverrides {
+  imports?: Record<string, unknown>;
+  /** The event drive got +Infinity: the virtual time of the next scripted
+   * event, or undefined when there is none. */
+  onIdle?: (clock: number) => number | undefined;
+  /** The event drive jumped the virtual clock to `to`. */
+  onJump?: (to: number) => void;
+  /** Called once, right after instantiation (a scripted import that
+   * reads or writes the module's memory takes it from here). */
+  onInstance?: (instance: WebAssembly.Instance) => void;
+}
+
 export interface HostRun {
   stdout: string;
   stderr: string;
@@ -91,7 +116,7 @@ export interface HostRun {
   exitCode: number;
 }
 
-async function instantiate(modulePath: string) {
+async function instantiate(modulePath: string, overrides?: HostOverrides) {
   const chunks: { 1: Buffer[]; 2: Buffer[] } = { 1: [], 2: [] };
   let memory: WebAssembly.Memory | null = null;
   let clock = 0;
@@ -274,14 +299,23 @@ async function instantiate(modulePath: string) {
       cpCall(op: number, _ptr: number, _len: number, _h: number, _which: number): number {
         throw new Error(`cpCall: op ${op} reached with no forced host (default stub is loud by design)`);
       },
+      // INC-28 U2 (abi.ts evPoll): LOUD, cpCall's stance — an event module
+      // that polls with no forced host fails at the call, never reads a
+      // fabricated event. wasm-host-cp-u2.test.ts scripts one.
+      evPoll(_ptr: number, _cap: number): number {
+        throw new Error("evPoll: reached with no forced host (default stub is loud by design)");
+      },
+      ...(overrides?.imports ?? {}),
     },
   });
   memory = instance.exports["memory"] as WebAssembly.Memory;
+  overrides?.onInstance?.(instance);
   let exitCode = 0;
   const drive = (): void => {
     try {
       (instance.exports["_start"] as () => void)();
       const tick = instance.exports["_tick"] as ((now: number) => number) | undefined;
+      const loop = instance.exports["_loop"] as ((now: number) => number) | undefined;
       const status = instance.exports["_status"] as (() => number) | undefined;
       if (tick !== undefined) {
         for (let turns = 0; ; turns++) {
@@ -289,6 +323,26 @@ async function instantiate(modulePath: string) {
           const due = tick(clock);
           if (due < 0) break;
           clock = Math.max(clock, due);
+        }
+      }
+      // INC-28 U2: an event module's drive (abi.ts's loop contract), on the
+      // virtual clock; the `now` it passes is whatever the (possibly
+      // overridden) `now` import answers.
+      if (loop !== undefined) {
+        const nowFn = (overrides?.imports?.["now"] as (() => number) | undefined) ?? ((): number => clock);
+        let due = loop(nowFn());
+        for (let turns = 0; ; turns++) {
+          if (turns > 1_000_000) throw new Error(`_loop drive did not settle for ${modulePath}`);
+          if (due < 0) break;
+          let to = due;
+          if (due === Infinity) {
+            const next = overrides?.onIdle?.(clock);
+            if (next === undefined) throw new Error("module waits for an event no source can deliver");
+            to = next;
+          }
+          clock = Math.max(clock, to);
+          overrides?.onJump?.(clock);
+          due = loop(nowFn());
         }
       }
       // Quiescence: the only point `_status` means anything (abi.ts).
@@ -311,16 +365,16 @@ async function instantiate(modulePath: string) {
   return { drive, out, instance };
 }
 
-export async function runWasm(modulePath: string): Promise<HostRun> {
-  const { drive, out } = await instantiate(modulePath);
+export async function runWasm(modulePath: string, overrides?: HostOverrides): Promise<HostRun> {
+  const { drive, out } = await instantiate(modulePath, overrides);
   drive();
   return out();
 }
 
 /** S007/S010's bridge shape: run to an EXPECTED trap (the tier's exit-1
  * channel), returning the output that preceded it. */
-export async function runWasmToTrap(modulePath: string): Promise<HostRun> {
-  const { drive, out } = await instantiate(modulePath);
+export async function runWasmToTrap(modulePath: string, overrides?: HostOverrides): Promise<HostRun> {
+  const { drive, out } = await instantiate(modulePath, overrides);
   const trap = await Promise.resolve()
     .then(drive)
     .then(

@@ -2,8 +2,16 @@
  * armed timers, a FIFO of immediates, and `%w.tick` — one turn of
  * scr_async.c's `scr_loop_run` with the sleep taken OUT and handed to the
  * embedder (abi.ts's `_tick` contract). Emitted lazily, like every other
- * helper family here: a module that arms no timer gets none of this, and
- * exports no `_tick`.
+ * helper family here: a module that neither arms a timer nor starts an
+ * asynchronous child gets none of this, and exports neither `_tick` nor
+ * `_loop`.
+ *
+ * EVENT MODULES. A module that reaches child_process's asynchronous spawn
+ * (an EVENT MODULE, abi.ts) always gets this machinery, whether or not it
+ * arms a timer, and exports `_loop` INSTEAD of `_tick`: `%w.loop` (loop()
+ * below) is a transcription of libuv's uv_run with a POLL phase that
+ * delivers the host's queued child events before the check and timers
+ * phases. Every other timer module keeps `%w.tick` and `_tick` unchanged.
  *
  * WHY THE LOOP INVERTS. The native runtime owns its own clock: it sleeps
  * to the next deadline and runs what came due. A .wasm module cannot sleep
@@ -100,6 +108,13 @@ export interface TimerDeps {
    * `process.exit`/`onExit`/`offExit` gets a no-op here (emitter.ts
    * gates the whole call away for such a module). */
   drainAtQuiescence: (c: Code) => void;
+  /** INC-28 U2, event modules only (read only when `loop()` is built):
+   * emits the POLL phase — every queued host event delivered, each
+   * followed by its own listeners' death check and checkpoint. */
+  poll?: (c: Code) => void;
+  /** INC-28 U2, event modules only: the i32 global counting ref'd
+   * children whose exit has not been delivered — liveness's third term. */
+  childRefLive?: () => number;
 }
 
 /* timerT's fields. Deadline, seq and reffed are MUTABLE: a re-armed
@@ -163,6 +178,7 @@ export class TimerBuilder {
     firingRefresh: number;
   } | null = null;
   private immG: { head: number; tail: number; nextId: number; pending: number; reffed: number } | null = null;
+  private loopStartedG: number | null = null;
 
   constructor(
     private readonly mb: ModuleBuilder,
@@ -1169,6 +1185,172 @@ export class TimerBuilder {
     c.end();
   }
 
+  /** The timers phase, shared by `%w.tick` and `%w.loop`: every timer due
+   * at the f64 in local `NOW` fires, earliest first (local `T` is scratch).
+   * Emitted verbatim from where `%w.tick` used to inline it. */
+  private emitTimersPhase(c: Code, NOW: number, T: number, pop: number, push: number): void {
+    const g = this.g();
+    // 2. The timers phase. Each callback is followed by its own
+    // checkpoint, so a promise settled by a timer resumes before the
+    // NEXT timer fires.
+    c.block();
+    c.loop();
+    c.globalGet(g.len);
+    c.i32Eqz();
+    c.brIf(1);
+    this.slot(c, () => c.i32Const(0));
+    c.structGet(this.timerT, T_DEADLINE);
+    c.localGet(NOW);
+    c.f64Gt();
+    c.brIf(1);
+    c.call(pop);
+    c.localSet(T);
+    // The entry is OUT of the heap while its callback runs; the flags
+    // carry clear/ref/unref/refresh of its own id to the re-arm.
+    c.localGet(T);
+    c.structGet(this.timerT, T_ID);
+    c.f64Const(0);
+    c.f64Ne();
+    c.ifVoid();
+    c.localGet(T);
+    c.structGet(this.timerT, T_ID);
+    c.globalSet(g.firingId);
+    c.i32Const(0);
+    c.globalSet(g.firingCleared);
+    c.localGet(T);
+    c.structGet(this.timerT, T_REFFED);
+    c.globalSet(g.firingReffed);
+    c.i32Const(0);
+    c.globalSet(g.firingRefresh);
+    c.end();
+    this.emitCall(c, T, T_CB, this.timerT);
+    // Re-arm — never after a throw: the process is already dead, so a
+    // repeating interval does not get another tick.
+    c.localGet(T);
+    c.structGet(this.timerT, T_ID);
+    c.f64Const(0);
+    c.f64Ne();
+    c.globalGet(g.firingCleared);
+    c.i32Eqz();
+    c.i32And();
+    c.globalGet(this.deps.excKind());
+    c.i32Eqz();
+    c.i32And();
+    c.ifVoid();
+    {
+      const rearm = (delay: () => void): void => {
+        c.localGet(T);
+        c.call(this.deps.now());
+        delay();
+        c.f64Add();
+        c.structSet(this.timerT, T_DEADLINE);
+        c.localGet(T);
+        c.globalGet(g.seq);
+        c.structSet(this.timerT, T_SEQ);
+        c.globalGet(g.seq);
+        c.f64Const(1);
+        c.f64Add();
+        c.globalSet(g.seq);
+        // The ref state carries across ticks: a self-unref'd interval
+        // stays unref'd.
+        c.localGet(T);
+        c.globalGet(g.firingReffed);
+        c.structSet(this.timerT, T_REFFED);
+        c.localGet(T);
+        c.call(push);
+      };
+      c.localGet(T);
+      c.structGet(this.timerT, T_REPEAT);
+      c.f64Const(0);
+      c.f64Gt();
+      c.ifVoid();
+      // An interval re-arms relative to the POST-callback clock — no
+      // catch-up burst after a slow callback (libuv's uv_timer repeat).
+      rearm(() => {
+        c.localGet(T);
+        c.structGet(this.timerT, T_REPEAT);
+      });
+      c.else_();
+      c.globalGet(g.firingRefresh);
+      c.ifVoid();
+      rearm(() => {
+        c.localGet(T);
+        c.structGet(this.timerT, T_DELAY);
+      });
+      c.end();
+      c.end();
+    }
+    c.end();
+    c.f64Const(0);
+    c.globalSet(g.firingId);
+    this.emitDeathCheck(c);
+    this.deps.checkpoint(c);
+    c.br(0);
+    c.end();
+    c.end();
+  }
+
+  /** The check phase, shared by `%w.tick` and `%w.loop` (locals `N` and
+   * `END` are scratch). Emitted verbatim from where `%w.tick` used to
+   * inline it. */
+  private emitCheckPhase(c: Code, N: number, END: number): void {
+    const i = this.i();
+    // 3. The check phase: immediates queued BEFORE it run FIFO; ones a
+    // callback queues wait for the next turn, so a setImmediate chain
+    // cannot starve the timers phase.
+    c.globalGet(i.pending);
+    c.i32Const(0);
+    c.i32GtS();
+    c.ifVoid();
+    c.globalGet(i.tail);
+    c.localSet(END);
+    c.block();
+    c.loop();
+    c.globalGet(i.head);
+    c.refIsNull();
+    c.brIf(1);
+    c.globalGet(i.head);
+    c.localSet(N);
+    c.localGet(N);
+    c.structGet(this.immT, I_NEXT);
+    c.globalSet(i.head);
+    c.globalGet(i.head);
+    c.refIsNull();
+    c.ifVoid();
+    c.refNull(this.immT);
+    c.globalSet(i.tail);
+    c.end();
+    c.localGet(N);
+    c.refNull(this.immT);
+    c.structSet(this.immT, I_NEXT);
+    c.localGet(N);
+    c.structGet(this.immT, I_CB);
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    this.emitUnreff(c, i.pending);
+    c.localGet(N);
+    c.structGet(this.immT, I_REFFED);
+    c.ifVoid();
+    c.localGet(N);
+    c.i32Const(0);
+    c.structSet(this.immT, I_REFFED);
+    this.emitUnreff(c, i.reffed);
+    c.end();
+    this.emitCall(c, N, I_CB, this.immT);
+    this.emitDeathCheck(c);
+    this.deps.checkpoint(c);
+    c.end();
+    c.localGet(N);
+    c.localGet(END);
+    c.refEq();
+    c.brIf(1);
+    c.br(0);
+    c.end();
+    c.end();
+    c.end();
+  }
+
   /** `%w.tick(now) -> next` — ONE loop turn (see the header). The return
    * is the `due` the C loop would sleep until: a deadline in the future,
    * `now` itself when there is ready work (immediates), or -1 when
@@ -1188,159 +1370,9 @@ export class TimerBuilder {
       // complete checkpoint and BEFORE advancing to timers.
       this.deps.checkpoint(c);
 
-      // 2. The timers phase. Each callback is followed by its own
-      // checkpoint, so a promise settled by a timer resumes before the
-      // NEXT timer fires.
-      c.block();
-      c.loop();
-      c.globalGet(g.len);
-      c.i32Eqz();
-      c.brIf(1);
-      this.slot(c, () => c.i32Const(0));
-      c.structGet(this.timerT, T_DEADLINE);
-      c.localGet(NOW);
-      c.f64Gt();
-      c.brIf(1);
-      c.call(pop);
-      c.localSet(T);
-      // The entry is OUT of the heap while its callback runs; the flags
-      // carry clear/ref/unref/refresh of its own id to the re-arm.
-      c.localGet(T);
-      c.structGet(this.timerT, T_ID);
-      c.f64Const(0);
-      c.f64Ne();
-      c.ifVoid();
-      c.localGet(T);
-      c.structGet(this.timerT, T_ID);
-      c.globalSet(g.firingId);
-      c.i32Const(0);
-      c.globalSet(g.firingCleared);
-      c.localGet(T);
-      c.structGet(this.timerT, T_REFFED);
-      c.globalSet(g.firingReffed);
-      c.i32Const(0);
-      c.globalSet(g.firingRefresh);
-      c.end();
-      this.emitCall(c, T, T_CB, this.timerT);
-      // Re-arm — never after a throw: the process is already dead, so a
-      // repeating interval does not get another tick.
-      c.localGet(T);
-      c.structGet(this.timerT, T_ID);
-      c.f64Const(0);
-      c.f64Ne();
-      c.globalGet(g.firingCleared);
-      c.i32Eqz();
-      c.i32And();
-      c.globalGet(this.deps.excKind());
-      c.i32Eqz();
-      c.i32And();
-      c.ifVoid();
-      {
-        const rearm = (delay: () => void): void => {
-          c.localGet(T);
-          c.call(this.deps.now());
-          delay();
-          c.f64Add();
-          c.structSet(this.timerT, T_DEADLINE);
-          c.localGet(T);
-          c.globalGet(g.seq);
-          c.structSet(this.timerT, T_SEQ);
-          c.globalGet(g.seq);
-          c.f64Const(1);
-          c.f64Add();
-          c.globalSet(g.seq);
-          // The ref state carries across ticks: a self-unref'd interval
-          // stays unref'd.
-          c.localGet(T);
-          c.globalGet(g.firingReffed);
-          c.structSet(this.timerT, T_REFFED);
-          c.localGet(T);
-          c.call(push);
-        };
-        c.localGet(T);
-        c.structGet(this.timerT, T_REPEAT);
-        c.f64Const(0);
-        c.f64Gt();
-        c.ifVoid();
-        // An interval re-arms relative to the POST-callback clock — no
-        // catch-up burst after a slow callback (libuv's uv_timer repeat).
-        rearm(() => {
-          c.localGet(T);
-          c.structGet(this.timerT, T_REPEAT);
-        });
-        c.else_();
-        c.globalGet(g.firingRefresh);
-        c.ifVoid();
-        rearm(() => {
-          c.localGet(T);
-          c.structGet(this.timerT, T_DELAY);
-        });
-        c.end();
-        c.end();
-      }
-      c.end();
-      c.f64Const(0);
-      c.globalSet(g.firingId);
-      this.emitDeathCheck(c);
-      this.deps.checkpoint(c);
-      c.br(0);
-      c.end();
-      c.end();
+      this.emitTimersPhase(c, NOW, T, pop, push);
 
-      // 3. The check phase: immediates queued BEFORE it run FIFO; ones a
-      // callback queues wait for the next turn, so a setImmediate chain
-      // cannot starve the timers phase.
-      c.globalGet(i.pending);
-      c.i32Const(0);
-      c.i32GtS();
-      c.ifVoid();
-      c.globalGet(i.tail);
-      c.localSet(END);
-      c.block();
-      c.loop();
-      c.globalGet(i.head);
-      c.refIsNull();
-      c.brIf(1);
-      c.globalGet(i.head);
-      c.localSet(N);
-      c.localGet(N);
-      c.structGet(this.immT, I_NEXT);
-      c.globalSet(i.head);
-      c.globalGet(i.head);
-      c.refIsNull();
-      c.ifVoid();
-      c.refNull(this.immT);
-      c.globalSet(i.tail);
-      c.end();
-      c.localGet(N);
-      c.refNull(this.immT);
-      c.structSet(this.immT, I_NEXT);
-      c.localGet(N);
-      c.structGet(this.immT, I_CB);
-      c.refIsNull();
-      c.i32Eqz();
-      c.ifVoid();
-      this.emitUnreff(c, i.pending);
-      c.localGet(N);
-      c.structGet(this.immT, I_REFFED);
-      c.ifVoid();
-      c.localGet(N);
-      c.i32Const(0);
-      c.structSet(this.immT, I_REFFED);
-      this.emitUnreff(c, i.reffed);
-      c.end();
-      this.emitCall(c, N, I_CB, this.immT);
-      this.emitDeathCheck(c);
-      this.deps.checkpoint(c);
-      c.end();
-      c.localGet(N);
-      c.localGet(END);
-      c.refEq();
-      c.brIf(1);
-      c.br(0);
-      c.end();
-      c.end();
-      c.end();
+      this.emitCheckPhase(c, N, END);
 
       // 4. The answer. Liveness counts only REF'D work: parked promise
       // frames and unref'd timers never hold the loop, and armed-but-
@@ -1383,6 +1415,122 @@ export class TimerBuilder {
       this.deps.drainAtQuiescence(c);
       c.f64Const(-1);
       this.mb.setBody(idx, [this.timerRef(), this.immRef(), this.immRef()], c.bytes());
+      return idx;
+    });
+  }
+
+  /** INC-28 U2: `%w.loop(now) -> next` — an EVENT MODULE's loop (abi.ts),
+   * built INSTEAD of `%w.tick`. A transcription of libuv 1.52.1's
+   * uv_run(UV_RUN_DEFAULT) restricted to the phases this tier has:
+   *
+   *   r = uv__loop_alive(loop); if (!r) uv__update_time(loop);
+   *   if (DEFAULT && r) { uv__update_time(loop); uv__run_timers(loop); }
+   *   while (r != 0 && !stop) {
+   *     [pending, idle, prepare: nothing in this tier]
+   *     timeout = uv__backend_timeout(loop);  -> this function's ANSWER
+   *     uv__io_poll(loop, timeout);           -> the host's wait, then POLL
+   *     uv__run_check(loop);                  -> CHECK
+   *     [closing handles: nothing in this tier]
+   *     uv__update_time(loop); uv__run_timers(loop);   -> TIMERS
+   *     r = uv__loop_alive(loop);
+   *   }
+   *
+   * The FIRST call is everything before the while: liveness taken once,
+   * then the pre-loop timers pass, and an answer that is never -1 — libuv
+   * enters the loop body because `r` was true when it was taken, even if
+   * the pass consumed the last ref'd holder (the backend timeout is then
+   * 0: `now`). Every LATER call is one iteration of the body from the
+   * poll on: the host has done the wait, so the call's `now` is the loop
+   * time uv__io_poll's own update takes; the timers phase then reads a
+   * FRESH `now` import (uv__update_time) and compares every deadline
+   * against that one value (the cached due), while arming keeps reading
+   * the import at the arming call. Liveness is ref'd timers, ref'd
+   * immediates and ref'd children whose exit has not been delivered. */
+  loop(): number {
+    return this.cached("loop", () => {
+      const poll = this.deps.poll;
+      const childRefLive = this.deps.childRefLive;
+      if (poll === undefined || childRefLive === undefined) {
+        throw new Error("emitter bug: an event loop was built without its poll phase");
+      }
+      const idx = this.mb.declareFunc(this.mb.funcType([F64], [F64]), "%w.loop");
+      const pop = this.pop();
+      const push = this.push();
+      const g = this.g();
+      const i = this.i();
+      this.loopStartedG ??= this.mb.addGlobal(I32, true, initI32(0));
+      const started = this.loopStartedG;
+      const c = new Code();
+      const NOW = 0, T = 1, N = 2, END = 3, LT = 4;
+      const alive = (): void => {
+        c.globalGet(g.reffed);
+        c.globalGet(i.reffed);
+        c.i32Or();
+        c.globalGet(childRefLive());
+        c.i32Or();
+      };
+      const quiescent = (): void => {
+        alive();
+        c.i32Eqz();
+        c.ifVoid();
+        this.deps.drainAtQuiescence(c);
+        c.f64Const(-1);
+        c.return_();
+        c.end();
+      };
+      // uv__backend_timeout: ready immediates poll without waiting; else
+      // the earliest ARMED deadline (ref'd or not, %w.tick's rule); else
+      // only children hold the loop (+Infinity: wait for an event); else
+      // nothing is active and the timeout is 0.
+      const answer = (): void => {
+        c.globalGet(i.pending);
+        c.i32Const(0);
+        c.i32GtS();
+        c.ifVoid();
+        c.localGet(NOW);
+        c.return_();
+        c.end();
+        c.globalGet(g.len);
+        c.i32Const(0);
+        c.i32GtS();
+        c.ifVoid();
+        this.slot(c, () => c.i32Const(0));
+        c.structGet(this.timerT, T_DEADLINE);
+        c.return_();
+        c.end();
+        c.globalGet(childRefLive());
+        c.ifVoid();
+        c.f64Const(Infinity);
+        c.return_();
+        c.end();
+        c.localGet(NOW);
+      };
+
+      // The first call: liveness once, then the pre-loop timers pass.
+      c.globalGet(started);
+      c.i32Eqz();
+      c.ifVoid();
+      c.i32Const(1);
+      c.globalSet(started);
+      quiescent();
+      c.call(this.deps.now());
+      c.localSet(LT);
+      this.emitTimersPhase(c, LT, T, pop, push);
+      answer();
+      c.return_();
+      c.end();
+
+      // A later call: one iteration from the poll on.
+      c.localGet(NOW);
+      c.localSet(LT);
+      poll(c);
+      this.emitCheckPhase(c, N, END);
+      c.call(this.deps.now());
+      c.localSet(LT);
+      this.emitTimersPhase(c, LT, T, pop, push);
+      quiescent();
+      answer();
+      this.mb.setBody(idx, [this.timerRef(), this.immRef(), this.immRef(), F64], c.bytes());
       return idx;
     });
   }

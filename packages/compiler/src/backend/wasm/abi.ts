@@ -532,6 +532,67 @@
  *     to, with the environment, cwd, input and stdio it was given, and
  *     transcribed the child's result faithfully, is enforced by NOTHING —
  *     the harness's own rows are the check.
+ *     INC-28 U2 — FOUR MORE OPS for spawn's asynchronous surface, minted
+ *     only in EVENT MODULES (those reaching cp.spawn or cp.spawnOpts) and
+ *     in modules reaching child.kill, child.killNum or child.unref:
+ *       op 5 SPAWN(ptr, len)   -> the host starts a child and answers at
+ *                                 once (it does not wait for it)
+ *       op 6 KILL(h, which)    -> `which` is the Linux signal number;
+ *                                 answers 0 when the signal was sent, else
+ *                                 a NEGATIVE Linux errno (ESRCH -3 for a
+ *                                 child already reaped, EINVAL -22, ENOSYS
+ *                                 -38, EPERM -1, ...)
+ *       op 7 UNREF(h)          -> 0
+ *       op 8 RELEASE(h)        -> 0; the module sends it once the child's
+ *                                 exit has been delivered, and the handle
+ *                                 is gone
+ *     THE SPAWN REQUEST at ptr, little-endian: header u32 stdinMode at +0
+ *     (0 ignore, 1 inherit), u32 stdoutMode at +4 and u32 stderrMode at +8
+ *     (0 ignore, 1 inherit, 2 a file descriptor), i32 outFd at +12 and
+ *     i32 errFd at +16 (read only in mode 2), u32 detached at +20, two
+ *     u32 reserved words at +24 and +28 = 0 — 4+4+4+4+4+4+4+4 = 32 bytes;
+ *     then from +32 op 1's RUNS in op 1's order — the file, a u32 argument
+ *     count and that many runs, the cwd (count 0 = no cwd), a u32 pair
+ *     count and that many (key, value) runs, the child's WHOLE environment
+ *     — and no input. `len` is the record's total byte length.
+ *     THE SPAWN REPLY, written by the host over the same ptr: i32 errno at
+ *     +0 (0, or the NEGATIVE Linux errno the spawn failed with), i32
+ *     disposition at +4 (0 spawned, 1 the failure is reported later as an
+ *     'error' event, 2 the failure is thrown now — Node's own split: EACCES,
+ *     EAGAIN, EMFILE, ENFILE and ENOENT are reported later, every other
+ *     errno is thrown), i32 pid at +8 — 4+4+4 = 12 bytes. The answer is
+ *     the child's HANDLE, >= 1, exactly when disposition is 0, and 0
+ *     exactly when it is 1 or 2 (there is no host child then); a negative
+ *     answer is a host failure. Handles are numbered from 1. The module
+ *     derives the disposition from the errno itself and checks the host's
+ *     agrees, and checks both directions of the answer rule: any mismatch
+ *     is the named trap.
+ *     A spawned child's events reach the module through `evPoll` below.
+ *
+ *   (import "tsinter" "evPoll" (func (param i32 i32) (result i32)))
+ *     [event modules only — those reaching cp.spawn or cp.spawnOpts]
+ *     evPoll(ptr, cap) -> i32. INC-28 U2. The host's EVENT QUEUE, read one
+ *     event at a time: the host writes the oldest queued event at ptr and
+ *     answers its length; answers 0 when the queue is empty; and answers
+ *     -(the length it needs) WITHOUT removing the event when `cap` is too
+ *     small, so the module grows its buffer and asks again — the event is
+ *     held, never lost and never re-created. THE RECORD, little-endian:
+ *     u32 source at +0 (1 = a child), u32 handle at +4, u32 kind at +8,
+ *     u32 payloadLen at +12, i32 a at +16, i32 b at +20 — 4+4+4+4+4+4 = 24
+ *     bytes — then payloadLen bytes. A child's kinds: 1 EXIT (a = the exit
+ *     code, or -1 when a signal ended the child; b = that signal's Linux
+ *     number, else 0; no payload), 2 bytes for the PROGRAM'S stdout, 3
+ *     bytes for the PROGRAM'S stderr (named by destination: a child's
+ *     inherited stream, or its fd 1 or 2 given in either output slot, is
+ *     captured by the host and written by the module, raw, when the
+ *     module polls). The host queues a child's EXIT only after every
+ *     stream it captures for that child has reached end of file. A header
+ *     is 24 bytes, so 0 is never a valid length. Any record the module
+ *     cannot read (an unknown source, kind or handle, a length that is not
+ *     24 + payloadLen) is the named trap "cpCall: host failure".
+ *     evPoll's EFFECT TIER: that the queue holds what the host's children
+ *     did, in the order the host saw it, is enforced by NOTHING — the
+ *     harness's own rows are the check.
  *
  *   (import "tsinter" "write" (func (param i32 i32 i32)))
  *     write(fd, ptr, len): the host writes len bytes at ptr from the
@@ -645,6 +706,8 @@
  *
  *   (export "_start" (func))            — the program; run it once.
  *   (export "_tick" (func (param f64) (result f64)))  [timer modules only]
+ *   (export "_loop" (func (param f64) (result f64)))  [event modules only,
+ *                                                      INSTEAD of _tick]
  *   (export "_status" (func (result i32)))  [top-level-await modules only]
  *   (export "memory" (memory))          — where write's bytes live.
  *
@@ -666,7 +729,48 @@
  * the check phase (setImmediate). Its result is the next deadline — a
  * future time to wait for, `now` itself when ready work remains (pending
  * immediates), or a NEGATIVE value when nothing ref'd is left and the
- * program is over.
+ * program is over. `_tick` never answers +Infinity.
+ *
+ * EVENT MODULES (INC-28 U2: a module reaching cp.spawn or cp.spawnOpts)
+ * export `_loop(now)` instead, a transcription of libuv's
+ * uv_run(UV_RUN_DEFAULT) — the loop Node runs — restricted to the phases
+ * this tier has. Its FIRST call: if nothing ref'd is alive (timers,
+ * immediates, children whose exit has not been delivered) the 'exit'
+ * listeners run and it answers -1; otherwise it runs the due timers once
+ * and answers as libuv computes a poll timeout — never -1 on this path.
+ * Every LATER call is one loop iteration: the POLL phase (every queued
+ * `evPoll` event, each followed by a microtask checkpoint), the check
+ * phase (setImmediate), the timers phase, then the liveness test (-1 when
+ * nothing ref'd is left, after the 'exit' listeners). The answer is -1,
+ * `now` itself (ready work: run again without waiting), a deadline, or
+ * +Infinity (only children hold the loop: wait for an event). The DUE
+ * test reads the loop time the module took at libuv's update points
+ * (the `now` argument after the host's wait, and a fresh `now` import
+ * right before the timers phase); ARMING reads the `now` import at the
+ * arming call, as in every module. The host's side of the contract:
+ *
+ *     start(); let due = loop(clock());
+ *     for (;;) {
+ *       if (due < 0) break;
+ *       if (no child of this run is live) {
+ *         if (due === Infinity) fail("module waits for an event no source can deliver");
+ *         <advance the virtual clock to due>; due = loop(clock()); continue;
+ *       }
+ *       await <one host loop turn, resolved from the host's own check
+ *              phase once an event is queued or clock() >= due>;
+ *       due = loop(clock());
+ *     }
+ *
+ * The host YIELDS to its own event loop before every call while a child
+ * is live, so that a child which exited while the module ran is reaped
+ * where libuv's poll would reap it, and a batch reaped together is queued
+ * together; it never resumes from inside one of its own event listeners.
+ * While any child is live (spawned, its EXIT not yet read by the module)
+ * the host's clock is REAL time, synchronous module time included —
+ * `now` and the wall clock are evaluated at each call — anchored to the
+ * virtual clock at every moment the first child goes live again; with no
+ * child live the clock is virtual as above. Enforced by NOTHING beyond
+ * the harness's own rows.
  *
  * A TRAP IS THE EXIT CODE — 1, always. A trap out of `_start` or `_tick`
  * is the program dying with exit 1: an uncaught exception, an unhandled
@@ -702,8 +806,10 @@ export const IMPORT_CHDIR = "chdir";
 export const IMPORT_UMASK = "umask";
 export const IMPORT_FS_CALL = "fsCall";
 export const IMPORT_CP_CALL = "cpCall";
+export const IMPORT_EV_POLL = "evPoll";
 export const EXPORT_ENTRY = "_start";
 export const EXPORT_TICK = "_tick";
+export const EXPORT_LOOP = "_loop";
 export const EXPORT_STATUS = "_status";
 export const EXPORT_MEMORY = "memory";
 
