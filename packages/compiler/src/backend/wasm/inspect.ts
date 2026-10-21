@@ -4256,6 +4256,18 @@ export class InspectBuilder {
 
       // HANDLE and JSVAL: see the header — no producer on this tier can
       // build one, so arriving here means a kind grew without an arm.
+      // INC-29 U1: a node:net handle's rendering is not built — loud.
+      if (this.deps.dyn().handleLive()) {
+        c.localGet(D);
+        c.structGet(dynT, DYN_KIND);
+        c.i32Const(DK.HANDLE);
+        c.i32Eq();
+        c.ifVoid();
+        this.deps.throwError(c, "%Error", "Error", (x) => this.deps.lit(x, "inspecting a net handle is not supported yet"));
+        c.refNull(this.deps.strType());
+        c.return_();
+        c.end();
+      }
       c.unreachable();
       this.mb.setBody(
         idx,

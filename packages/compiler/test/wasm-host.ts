@@ -305,6 +305,13 @@ async function instantiate(modulePath: string, overrides?: HostOverrides) {
       evPoll(_ptr: number, _cap: number): number {
         throw new Error("evPoll: reached with no forced host (default stub is loud by design)");
       },
+      // INC-29 U1 (abi.ts netCall): LOUD for every op, cpCall's stance — a
+      // net module run without a forced host fails at its first OS-level
+      // request, never reads a fabricated socket. wasm-host-net-u1.test.ts
+      // scripts one.
+      netCall(op: number, _ptr: number, _len: number, _h: number, _x: number): number {
+        throw new Error(`netCall: op ${op} reached with no forced host (default stub is loud by design)`);
+      },
       ...(overrides?.imports ?? {}),
     },
   });

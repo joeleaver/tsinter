@@ -5401,7 +5401,17 @@ export class JsonBuilder {
       // HANDLE and JSVAL: no producer on this tier can build one (runtime
       // handles and the island bridge both refuse upstream of here), so
       // reaching this point means the dyn surface grew a kind without
-      // growing this walk.
+      // growing this walk. INC-29 U1: a node:net handle is fenced, loudly.
+      if (dyn.handleLive()) {
+        c.localGet(K);
+        c.i32Const(DK.HANDLE);
+        c.i32Eq();
+        c.ifVoid();
+        this.deps.throwError(c, "%Error", "Error", (x) => this.deps.lit(x, "JSON.stringify of a net handle is not supported yet"));
+        c.i32Const(0);
+        c.return_();
+        c.end();
+      }
       c.unreachable();
       this.mb.setBody(
         idx,

@@ -586,14 +586,17 @@
  *     A spawned child's events reach the module through `evPoll` below.
  *
  *   (import "tsinter" "evPoll" (func (param i32 i32) (result i32)))
- *     [event modules only — those reaching cp.spawn or cp.spawnOpts]
+ *     [event modules only — those reaching cp.spawn or cp.spawnOpts, and
+ *     since INC-29 U1 those reaching a node:net key that can start host
+ *     I/O (netCall below)]
  *     evPoll(ptr, cap) -> i32. INC-28 U2. The host's EVENT QUEUE, read one
  *     event at a time: the host writes the oldest queued event at ptr and
  *     answers its length; answers 0 when the queue is empty; and answers
  *     -(the length it needs) WITHOUT removing the event when `cap` is too
  *     small, so the module grows its buffer and asks again — the event is
  *     held, never lost and never re-created. THE RECORD, little-endian:
- *     u32 source at +0 (1 = a child), u32 handle at +4, u32 kind at +8,
+ *     u32 source at +0 (1 = a child, 2 = a net handle — INC-29 U1,
+ *     netCall below), u32 handle at +4, u32 kind at +8,
  *     u32 payloadLen at +12, i32 a at +16, i32 b at +20 — 4+4+4+4+4+4 = 24
  *     bytes — then payloadLen bytes. A child's kinds: 1 EXIT (a = the exit
  *     code, or -1 when a signal ended the child; b = that signal's Linux
@@ -627,6 +630,139 @@
  *     evPoll's EFFECT TIER: that the queue holds what the host's children
  *     did, in the order the host saw it, is enforced by NOTHING — the
  *     harness's own rows are the check.
+ *
+ *   (import "tsinter" "netCall" (func (param i32 i32 i32 i32 i32) (result i32)))
+ *     [net modules only — INC-29 U1: those reaching a node:net key that
+ *     can start host I/O; the attempt-budget pair
+ *     (get/setDefaultAutoSelectFamilyAttemptTimeout) and connect's
+ *     option-bag check alone do not mint it. Always the LAST import.]
+ *     netCall(op, ptr, len, h, x) -> i32: raw TCP at the level of libuv's
+ *     uv_tcp_* and uv_getaddrinfo, and nothing more. Every Node behaviour
+ *     — validation and its texts, the errno-to-Error construction
+ *     (ErrnoException, ExceptionWithHostPort, UVExceptionWithHostPort,
+ *     DNSException, the AggregateError of a multi-address connect), the
+ *     Readable / Writable state machine of a Socket, every nextTick and
+ *     emit position, the closing phase — is built in the module (net.ts),
+ *     so a host answers facts only: a HANDLE (>= 1, numbered from 1 in one
+ *     space shared by servers, sockets and lookups), a NEGATIVE Linux
+ *     errno (or a negative getaddrinfo code, Node's -3000 range), a
+ *     completion. Strings travel as UTF-16 RUNS: u32 code-unit count, the
+ *     units, zero padding to a multiple of 4. All words little-endian.
+ *       op 1 LISTEN(ptr, len)   request at ptr: u32 port, u32 family
+ *                               (4 or 6), u32 flags (bit 0 = ipv6Only),
+ *                               u32 backlog (Node's 511), then the bind
+ *                               address's run. The host creates, binds
+ *                               and listens. REPLY written over ptr: u32
+ *                               stage (0 listening; 1 the handle could not
+ *                               be created or bound; 2 listen(2) failed),
+ *                               u32 bound port, u32 bound family, the
+ *                               bound address's run. Answers the server's
+ *                               handle at stage 0, else the -errno. The
+ *                               module retries an unbound '::' failure at
+ *                               stage 1 on '0.0.0.0' itself, as Node does.
+ *       op 2 CONNECT(ptr, len)  request: u32 port, u32 family, the
+ *                               address's run (an IP literal; the module
+ *                               resolved any name with op 9). Answers the
+ *                               socket's handle at once; the outcome is a
+ *                               CONNECT event. A -errno answer is a
+ *                               connect that failed synchronously.
+ *       op 3 READ_START(h)      -> 0. Start delivering DATA / EOF /
+ *                               READ_ERROR for h.
+ *       op 4 READ_STOP(h)       -> 0. Stop: no DATA, EOF or READ_ERROR
+ *                               for h is delivered until the next
+ *                               READ_START — including any the host has
+ *                               already queued, which it HOLDS and
+ *                               re-queues, in order, at that READ_START
+ *                               (Node's readStop: the module's Readable
+ *                               sits at its high-water mark, 64 KiB).
+ *                               The host stops reading the socket itself
+ *                               at once (uv_read_stop), so it never reads
+ *                               ahead of the module or sees a read error
+ *                               the module would not.
+ *       op 5 WRITE(ptr, len, h) the len bytes at ptr, written to h. 0 =
+ *                               written now (the module completes the
+ *                               write synchronously, so the Writable
+ *                               runs its callback on a nextTick, as
+ *                               afterWriteDispatched does); 1 = pending,
+ *                               completed by a WRITE_DONE; -errno = the
+ *                               write failed now. One write is pending
+ *                               per handle at a time.
+ *       op 6 SHUTDOWN(h)        -> 0 accepted, or -errno (uv_shutdown's
+ *                               own refusal: ENOTCONN for a stream no
+ *                               longer writable, which Node's _final
+ *                               takes as a synchronous finish). On 0 the
+ *                               host shuts the write side down; the
+ *                               MODULE completes the request — libuv's
+ *                               uv_shutdown with an empty write queue
+ *                               feeds the handle to the loop's pending
+ *                               queue, and uv__drain completes it in the
+ *                               next pending pass (see THE EVENT LOOP).
+ *                               No event follows: Node's afterShutdown
+ *                               ignores the status. Any other answer is a
+ *                               host failure. (An empty write queue is
+ *                               certain here: the Writable calls _final
+ *                               only once every write has completed.)
+ *       op 7 CLOSE(h)           -> 0. h is gone: the host drops every
+ *                               event it still holds or has queued for h
+ *                               (a queued ACCEPT's new socket is closed
+ *                               with it) and never names h again. A
+ *                               pending WRITE or SHUTDOWN on h needs no
+ *                               completion: the module completes it with
+ *                               ECANCELED in its own closing phase.
+ *       op 8 NODELAY(h, x)      -> 0. TCP_NODELAY on h, on when x != 0.
+ *       op 9 RESOLVE(ptr, len)  request: u32 family (0, 4 or 6), u32
+ *                               hints (Node's ADDRCONFIG, 32), the name's
+ *                               run. Answers a request handle at once;
+ *                               the answer is a RESOLVE_DONE, after which
+ *                               the request handle is gone.
+ *     EVENTS, evPoll source 2, `handle` the server, socket or request:
+ *       1 ACCEPT        on a server: a = the new socket's handle (not yet
+ *                       reading); payload = the peer (u32 family, u32
+ *                       port, address run).
+ *       2 CONNECT       a = 0, payload = the peer; or a = -errno, no
+ *                       payload. Once per CONNECT op.
+ *       3 DATA          payload = the bytes, one host read.
+ *       4 EOF           the peer's FIN; no payload. Once.
+ *       5 READ_ERROR    a = -errno (ECONNRESET, ...).
+ *       6 WRITE_DONE    a = 0 or -errno: the pending write finished.
+ *       7               retired (INC-29 U1 review): a shutdown completes
+ *                       in the module's pending pass, never by an event.
+ *       8 RESOLVE_DONE  a = 0 and payload = u32 count, then (u32 family,
+ *                       address run) per address, in the resolver's
+ *                       order; or a = the negative getaddrinfo code.
+ *       9 ACCEPT_ERROR  on a server: a = -errno (the harness host never
+ *                       sends it).
+ *     `b` is 0 on every net event. ONE HOST ITERATION, ONE POLL PHASE: a
+ *     host answers 0 (no event) once the events it observed in one of its
+ *     own loop iterations are delivered, though later ones are queued; the
+ *     module ends that poll phase and gets them at its next one, as its
+ *     own libuv would have read them in a later iteration. (A host whose
+ *     loop is not libuv's maps "iteration" to its own nearest unit.) A
+ *     WRITE that does not finish at once is answered by a WRITE_DONE in
+ *     the poll phase (libuv's POLLOUT completion, uv__stream_io running
+ *     the write callbacks directly). PLATFORM SCOPE: on Linux the
+ *     shutdown is the only pending-queue completion lib/net.js reaches, and
+ *     this contract models only it. Two more exist in libuv and are not
+ *     modelled: a connect the kernel refuses at once (uv__tcp_connect keeps
+ *     the ECONNREFUSED as a delayed error and feeds the handle to the
+ *     pending queue; a non-blocking loopback connect on Linux answers
+ *     EINPROGRESS instead, measured), and a write uv_write2 finishes
+ *     synchronously after a partial try-write (uv__write_req_finish feeds
+ *     the handle). Node completes those in a pending pass; this tier
+ *     delivers them as a poll-phase CONNECT or WRITE_DONE (SEMANTICS.md
+ *     S087 (j)). Any answer or record out of these
+ *     shapes (an unknown kind, a handle the module does not hold, a WRITE
+ *     answer other than 0, 1 or negative, a zero handle) is the named
+ *     trap "netCall: host failure".
+ *     THE CAPABILITY (S004): this import opens real sockets with the host
+ *     user's authority. A host that does not grant it DOES NOT SUPPLY THE
+ *     IMPORT, and a module reaching node:net fails to instantiate with a
+ *     LinkError. A host granting less answers an errno (EACCES, EPERM,
+ *     ECONNREFUSED) for what it refuses.
+ *     netCall's EFFECT TIER: that the host did on the network what it was
+ *     asked to and reported it faithfully, in the order it observed it,
+ *     is enforced by NOTHING — the harness's own rows are the check.
+ *     SEMANTICS.md S087 registers what differs from Node.
  *
  *   (import "tsinter" "write" (func (param i32 i32 i32)))
  *     write(fd, ptr, len): the host writes len bytes at ptr from the
@@ -765,19 +901,36 @@
  * immediates), or a NEGATIVE value when nothing ref'd is left and the
  * program is over. `_tick` never answers +Infinity.
  *
- * EVENT MODULES (INC-28 U2: a module reaching cp.spawn or cp.spawnOpts)
- * export `_loop(now)` instead, a transcription of libuv's
+ * EVENT MODULES (INC-28 U2: a module reaching cp.spawn or cp.spawnOpts;
+ * INC-29 U1: a module reaching node:net I/O) export `_loop(now)`
+ * instead, a transcription of libuv's
  * uv_run(UV_RUN_DEFAULT) — the loop Node runs — restricted to the phases
  * this tier has. Its FIRST call: if nothing ref'd is alive (timers,
- * immediates, children whose exit has not been delivered) the 'exit'
+ * immediates, children whose exit has not been delivered; in a net module,
+ * open servers and sockets, lookups in flight and handles waiting in the
+ * closing phase) the 'exit'
  * listeners run and it answers -1; otherwise it runs the due timers once
  * and answers as libuv computes a poll timeout — never -1 on this path.
  * Every LATER call is one loop iteration: the POLL phase (every queued
- * `evPoll` event, each followed by a microtask checkpoint), the check
- * phase (setImmediate), the timers phase, then the liveness test (-1 when
- * nothing ref'd is left, after the 'exit' listeners). The answer is -1,
+ * `evPoll` event, each followed by a microtask checkpoint), INC-29 U1 in a
+ * net module up to eight PENDING passes while the pending queue is not
+ * empty (libuv's uv__run_pending after uv__io_poll: a socket fed by
+ * uv_shutdown completes its shutdown there, each completion a callback
+ * followed by a checkpoint; a socket fed during a pass waits for the
+ * next), the check phase (setImmediate), in a net module the CLOSING
+ * phase (the close callbacks of handles closed since the last one, the
+ * handle closed LAST first — uv__make_close_pending pushes onto the
+ * list's head: a pending write's or shutdown's ECANCELED completion, then
+ * the Socket's 'close' — libuv's uv__run_closing_handles), the timers
+ * phase, then the liveness test (-1 when nothing ref'd is left, after the
+ * 'exit' listeners), and then, the next iteration having begun, in a net
+ * module one more pending pass (the uv__run_pending at the top of
+ * uv_run's loop body, before the timeout is computed; the FIRST call runs
+ * it too, after its timers pass). A loop with closing or pending work
+ * left answers `now`. The answer is -1,
  * `now` itself (ready work: run again without waiting), a deadline, or
- * +Infinity (only children hold the loop: wait for an event). The DUE
+ * +Infinity (only children or net handles hold the loop: wait for an
+ * event). The DUE
  * test reads the loop time the module took at libuv's update points
  * (the `now` argument after the host's wait, and a fresh `now` import
  * right before the timers phase); ARMING reads the `now` import at the
@@ -803,8 +956,11 @@
  * the host's clock is REAL time, synchronous module time included —
  * `now` and the wall clock are evaluated at each call — anchored to the
  * virtual clock at every moment the first child goes live again; with no
- * child live the clock is virtual as above. Enforced by NOTHING beyond
- * the harness's own rows.
+ * child live the clock is virtual as above. INC-29 U1: the same holds for
+ * net handles — while any server, socket or lookup of the run is open on
+ * the host the clock is real time, re-anchored when the first one opens
+ * after none were, and the host's wait ends when an event is queued.
+ * Enforced by NOTHING beyond the harness's own rows.
  *
  * A TRAP IS THE EXIT CODE — 1, always. A trap out of `_start` or `_tick`
  * is the program dying with exit 1: an uncaught exception, an unhandled
@@ -841,6 +997,7 @@ export const IMPORT_UMASK = "umask";
 export const IMPORT_FS_CALL = "fsCall";
 export const IMPORT_CP_CALL = "cpCall";
 export const IMPORT_EV_POLL = "evPoll";
+export const IMPORT_NET_CALL = "netCall";
 export const EXPORT_ENTRY = "_start";
 export const EXPORT_TICK = "_tick";
 export const EXPORT_LOOP = "_loop";

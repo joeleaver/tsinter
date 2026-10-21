@@ -843,10 +843,8 @@ test("NOT-LIFTED setNew:ref-elem still refuses for netServer (Set of server hand
   expect(res.wasmSurvey).toContain("setNew:ref-elem");
 });
 
-test("NOT-LIFTED bin:ref-eq still refuses for netSocket (a dynamic socket comparison)", async () => {
+test("LIFTED (INC-29 U1) bin:ref-eq for netSocket: corpus 2640's socket comparison compiles (its output is pinned in the differential's INC-29 U1 block)", async () => {
   const entry = fileURLToPath(new URL("../../../tests/corpus/2640-net-dyn-socket-compat.cjs", import.meta.url));
-  const res = await compile(entry, { outPath: join(scratch, "notlifted-2640.wasm"), outDir: scratch, backend: "wasm" });
-  expect(res.ok).toBe(false);
-  if (res.ok) return;
-  expect(res.wasmSurvey).toContain("bin:ref-eq");
+  const res = await compile(entry, { outPath: join(scratch, "lifted-2640.wasm"), outDir: scratch, backend: "wasm" });
+  expect(res.ok).toBe(true);
 });

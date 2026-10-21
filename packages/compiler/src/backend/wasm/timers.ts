@@ -115,6 +115,22 @@ export interface TimerDeps {
   /** INC-28 U2, event modules only: the i32 global counting ref'd
    * children whose exit has not been delivered — liveness's third term. */
   childRefLive?: () => number;
+  /** INC-29 U1, net modules only (instead of childRefLive): pushes an i32,
+   * nonzero while an active handle or request holds the loop (net.ts's
+   * alive). */
+  netAlive?: (c: Code) => void;
+  /** INC-29 U1, net modules only: libuv's closing-handles phase, run after
+   * the check phase (net.ts's closing). */
+  closing?: (c: Code) => void;
+  /** INC-29 U1, net modules only: pushes an i32, nonzero while a closed
+   * handle's callback is still to run (uv__backend_timeout answers 0). */
+  closingPending?: (c: Code) => void;
+  /** INC-29 U1 (review), net modules only: one uv__run_pending pass
+   * (net.ts's pending; leaves an i32 on the stack, dropped here). */
+  pending?: (c: Code) => void;
+  /** INC-29 U1 (review), net modules only: pushes an i32, nonzero while the
+   * pending queue holds a fed handle (uv__backend_timeout answers 0). */
+  pendingQueued?: (c: Code) => void;
 }
 
 /* timerT's fields. Deadline, seq and reffed are MUTABLE: a re-armed
@@ -1426,14 +1442,20 @@ export class TimerBuilder {
    *   r = uv__loop_alive(loop); if (!r) uv__update_time(loop);
    *   if (DEFAULT && r) { uv__update_time(loop); uv__run_timers(loop); }
    *   while (r != 0 && !stop) {
-   *     [pending, idle, prepare: nothing in this tier]
+   *     uv__run_pending(loop);                -> PENDING (net modules)
+   *     [idle, prepare: nothing in this tier]
    *     timeout = uv__backend_timeout(loop);  -> this function's ANSWER
    *     uv__io_poll(loop, timeout);           -> the host's wait, then POLL
+   *     for (r = 0; r < 8 && pending; r++)
+   *       uv__run_pending(loop);              -> PENDING (net modules)
    *     uv__run_check(loop);                  -> CHECK
-   *     [closing handles: nothing in this tier]
+   *     uv__run_closing_handles(loop);        -> CLOSING (net modules)
    *     uv__update_time(loop); uv__run_timers(loop);   -> TIMERS
    *     r = uv__loop_alive(loop);
    *   }
+   *
+   * (INC-29 U1: the pending passes and the closing phase exist only in net
+   * modules; every other event module's loop is unchanged.)
    *
    * The FIRST call is everything before the while: liveness taken once,
    * then the pre-loop timers pass, and an answer that is never -1 — libuv
@@ -1450,9 +1472,16 @@ export class TimerBuilder {
     return this.cached("loop", () => {
       const poll = this.deps.poll;
       const childRefLive = this.deps.childRefLive;
-      if (poll === undefined || childRefLive === undefined) {
+      const netAlive = this.deps.netAlive;
+      if (poll === undefined || (childRefLive === undefined && netAlive === undefined)) {
         throw new Error("emitter bug: an event loop was built without its poll phase");
       }
+      // INC-29 U1: a net module's third liveness term is a scan (net.ts),
+      // every other event module's the child counter.
+      const liveTerm = (): void => {
+        if (childRefLive !== undefined) c.globalGet(childRefLive());
+        else netAlive!(c);
+      };
       const idx = this.mb.declareFunc(this.mb.funcType([F64], [F64]), "%w.loop");
       const pop = this.pop();
       const push = this.push();
@@ -1466,7 +1495,7 @@ export class TimerBuilder {
         c.globalGet(g.reffed);
         c.globalGet(i.reffed);
         c.i32Or();
-        c.globalGet(childRefLive());
+        liveTerm();
         c.i32Or();
       };
       const quiescent = (): void => {
@@ -1490,6 +1519,22 @@ export class TimerBuilder {
         c.localGet(NOW);
         c.return_();
         c.end();
+        // INC-29 U1: a fed handle still in the pending queue is ready work.
+        if (this.deps.pendingQueued !== undefined) {
+          this.deps.pendingQueued(c);
+          c.ifVoid();
+          c.localGet(NOW);
+          c.return_();
+          c.end();
+        }
+        // INC-29 U1: a closed handle's callback still to run is ready work.
+        if (this.deps.closingPending !== undefined) {
+          this.deps.closingPending(c);
+          c.ifVoid();
+          c.localGet(NOW);
+          c.return_();
+          c.end();
+        }
         c.globalGet(g.len);
         c.i32Const(0);
         c.i32GtS();
@@ -1498,7 +1543,7 @@ export class TimerBuilder {
         c.structGet(this.timerT, T_DEADLINE);
         c.return_();
         c.end();
-        c.globalGet(childRefLive());
+        liveTerm();
         c.ifVoid();
         c.f64Const(Infinity);
         c.return_();
@@ -1506,6 +1551,13 @@ export class TimerBuilder {
         c.localGet(NOW);
       };
 
+      // INC-29 U1 (review): the uv__run_pending at the top of each
+      // iteration of uv_run's body, before uv__backend_timeout.
+      const prePollPending = (): void => {
+        if (this.deps.pending === undefined) return;
+        this.deps.pending(c);
+        c.drop();
+      };
       // The first call: liveness once, then the pre-loop timers pass.
       c.globalGet(started);
       c.i32Eqz();
@@ -1516,6 +1568,7 @@ export class TimerBuilder {
       c.call(this.deps.now());
       c.localSet(LT);
       this.emitTimersPhase(c, LT, T, pop, push);
+      prePollPending();
       answer();
       c.return_();
       c.end();
@@ -1524,11 +1577,30 @@ export class TimerBuilder {
       c.localGet(NOW);
       c.localSet(LT);
       poll(c);
+      // INC-29 U1 (review): up to eight uv__run_pending passes after the
+      // poll, each only while the queue is not empty — libuv 1.52's
+      // "process immediate callbacks a small fixed number of times".
+      if (this.deps.pending !== undefined && this.deps.pendingQueued !== undefined) {
+        const pending = this.deps.pending;
+        const queued = this.deps.pendingQueued;
+        for (let pass = 0; pass < 8; pass++) {
+          queued(c);
+          c.ifVoid();
+          pending(c);
+          c.drop();
+          c.end();
+        }
+      }
       this.emitCheckPhase(c, N, END);
+      // INC-29 U1: uv__run_closing_handles, after the check phase.
+      if (this.deps.closing !== undefined) this.deps.closing(c);
       c.call(this.deps.now());
       c.localSet(LT);
       this.emitTimersPhase(c, LT, T, pop, push);
       quiescent();
+      // The next iteration has begun: its uv__run_pending comes before the
+      // timeout is computed and the host waits.
+      prePollPending();
       answer();
       this.mb.setBody(idx, [this.timerRef(), this.immRef(), this.immRef(), F64], c.bytes());
       return idx;

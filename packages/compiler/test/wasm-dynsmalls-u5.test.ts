@@ -147,12 +147,6 @@ async function runCorpusRowTrap(id: string, relPath: string): Promise<{ stdout: 
   return { stdout: String(run.stdout), stderr: String(run.stderr) };
 }
 
-async function refuseCorpusRow(id: string, relPath: string): Promise<{ survey: string[] }> {
-  const { res } = await compileCorpus(id, relPath);
-  if (res.ok) throw new Error(`${id} compiled but was expected to refuse`);
-  return { survey: [...(res.wasmSurvey ?? [])].sort() };
-}
-
 // ----------------------------------------------------------------------
 // DYNCHECK — a caught or unknown value narrowed by `instanceof Error` and read as an Error
 
@@ -552,9 +546,9 @@ test("R94 NOT-LIFTED: an Int32Array boxed into any keeps refusing by name", asyn
   expect(diagnostics).toEqual(["SC3001: the wasm backend does not support this construct yet (dynFrom:bytes:i32); build with the LLVM backend (the default) or the reference C backend (--backend c)"]);
 });
 
-test("R95 NOT-LIFTED: corpus 2596 still carries the refused property-type throw", async () => {
-  const { survey } = await refuseCorpusRow("R95", "2596-net-arg-ladders.cjs");
-  expect(survey).toContain("libCall:error.propTypeThrow");
+test("R95 LIFTED (INC-29 U1): corpus 2596's property-type throw is built — the program compiles, and its output is pinned in the differential's INC-29 U1 block", async () => {
+  const { res } = await compileCorpus("R95", "2596-net-arg-ladders.cjs");
+  expect(res.ok).toBe(true);
 });
 
 // ----------------------------------------------------------------------

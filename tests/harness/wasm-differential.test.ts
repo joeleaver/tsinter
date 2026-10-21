@@ -32,7 +32,9 @@
  * top-level-await program whose module evaluation promise never settled:
  * `_status()` answers Node's 13 (abi.ts). */
 import { execFile, execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { Socket } from "node:net";
+import { Socket, type Server, createServer as netCreateServer } from "node:net";
+import * as netModuleNs from "node:net";
+import { lookup as dnsLookup } from "node:dns";
 import { hasSubscribers as dcHasSubscribers, subscribe as dcSubscribe, unsubscribe as dcUnsubscribe } from "node:diagnostics_channel";
 import { createHash, randomBytes } from "node:crypto";
 import {
@@ -3439,6 +3441,15 @@ const TIER_FLOOR: string[] = [
   "1566-child-duck-interface.ts",
   "1657-spawn-async-neutral.ts",
   "1662-string-decoder-encodings.ts",
+  // INC-29 U1: node:net — net.Server and net.Socket built in the module from
+  // Node's own source over the OS-level netCall host import and the evPoll
+  // queue (SEMANTICS.md S087): 998 -> 1004, the six programs this unit lands.
+  "1567-server-close-override.ts",
+  "1797-dyn-handle-socket.cjs",
+  "2500-net-autosel-timeout.ts",
+  "2596-net-arg-ladders.cjs",
+  "2599-stream-arg-ladders.cjs",
+  "2640-net-dyn-socket-compat.cjs",
 ];
 
 interface RunResult {
@@ -4020,6 +4031,10 @@ interface HostEvent {
   a: number;
   b: number;
   payload: Uint8Array;
+  /** INC-29 U1 (review): the host loop iteration a net event was observed
+   * in (abi.ts evPoll: one host iteration's net events form one poll
+   * phase). */
+  gen?: number;
 }
 
 /** Writes `ev` at ptr when it fits in `cap` bytes and answers its length
@@ -4113,6 +4128,438 @@ interface EvChild {
   /** A pipe both output slots share (they name one program stream), read
    * by the host itself; null when there is none. */
   shared: Socket | null;
+}
+
+// ── INC-29 U1 — the net host (abi.ts netCall, evPoll source 2) ───────────
+// node:net's OS-level operations, done with Node's own public net API: a
+// listening handle is net._createServerHandle's bind (the module's own
+// address and family, no fallback of its own) wrapped by a server whose
+// listen() reports a listen failure through the documented
+// tracing:net.server.listen:error channel; every socket is created with
+// allowHalfOpen (the module decides when the write side ends) and paused,
+// so nothing is read off the kernel until the module's READ_START; a
+// write reports done when the host's own uv_try_write took it all (the
+// writable length is back to 0 when write() returns), else pending until
+// the host's write callback. Read results (DATA, EOF, READ_ERROR) are
+// queued only while the module reads; between READ_STOP and READ_START
+// they are held, in order. CLOSE drops every queued event of the handle
+// (and, for a listening handle, closes the connections its dropped
+// ACCEPTs carried). Module-scope so the INC-29 block's unit rows drive
+// its pure parts directly; runWasm is its only other caller.
+
+const NET_OP_LISTEN = 1;
+const NET_OP_CONNECT = 2;
+const NET_OP_READ_START = 3;
+const NET_OP_READ_STOP = 4;
+const NET_OP_WRITE = 5;
+const NET_OP_SHUTDOWN = 6;
+const NET_OP_CLOSE = 7;
+const NET_OP_NODELAY = 8;
+const NET_OP_RESOLVE = 9;
+const NET_EV_ACCEPT = 1;
+const NET_EV_CONNECT = 2;
+const NET_EV_DATA = 3;
+const NET_EV_EOF = 4;
+const NET_EV_READ_ERROR = 5;
+const NET_EV_WRITE_DONE = 6;
+const NET_EV_RESOLVE_DONE = 8;
+const NET_READ_KINDS: ReadonlySet<number> = new Set([NET_EV_DATA, NET_EV_EOF, NET_EV_READ_ERROR]);
+
+/** One UTF-16 run (abi.ts): a u32 code-unit count, the units, padding to 4. */
+function netRunBytes(s: string): Uint8Array {
+  const out = new Uint8Array(4 + ((2 * s.length + 3) & ~3));
+  const dv = new DataView(out.buffer);
+  dv.setUint32(0, s.length, true);
+  for (let i = 0; i < s.length; i++) dv.setUint16(4 + 2 * i, s.charCodeAt(i), true);
+  return out;
+}
+
+function netU32(v: number): Uint8Array {
+  const b = new Uint8Array(4);
+  new DataView(b.buffer).setUint32(0, v >>> 0, true);
+  return b;
+}
+
+function netConcat(parts: Uint8Array[]): Uint8Array {
+  const out = new Uint8Array(parts.reduce((a, p) => a + p.length, 0));
+  let o = 0;
+  for (const p of parts) {
+    out.set(p, o);
+    o += p.length;
+  }
+  return out;
+}
+
+/** The run at `off`: its text and the offset after it. */
+function netReadRun(buffer: ArrayBufferLike, off: number): { text: string; next: number } {
+  const n = new DataView(buffer).getUint32(off, true);
+  const units = new Uint16Array(buffer, off + 4, n);
+  let text = "";
+  for (let i = 0; i < n; i += 4096) text += String.fromCharCode(...units.subarray(i, Math.min(n, i + 4096)));
+  return { text, next: off + 4 + ((2 * n + 3) & ~3) };
+}
+
+/** A peer, as ACCEPT's and CONNECT's payload carry it: u32 family, u32
+ * port, the address run. */
+function netPeerPayload(family: string | undefined, port: number | undefined, address: string | undefined): Uint8Array {
+  return netConcat([netU32(family === "IPv6" ? 6 : 4), netU32(port ?? 0), netRunBytes(address ?? "")]);
+}
+
+/** RESOLVE_DONE's payload: u32 count, then (u32 family, address run) each. */
+function netResolvePayload(addresses: { address: string; family: number }[]): Uint8Array {
+  return netConcat([netU32(addresses.length), ...addresses.flatMap((a) => [netU32(a.family), netRunBytes(a.address)])]);
+}
+
+/** A Node error's negative errno (an error with none is EIO). */
+function netErrno(e: unknown): number {
+  const n = (e as { errno?: unknown } | null)?.errno;
+  return typeof n === "number" ? n : -5;
+}
+
+/** INC-29 U1 (review; abi.ts evPoll): one host loop iteration's net events
+ * form one module poll phase. `stamp` gives a net event the host
+ * iteration it was observed in — the counter advances in the check phase
+ * of an iteration that queued one (`schedule` is setImmediate: armed by
+ * that iteration's first event, never left armed while nothing arrives);
+ * `beginPoll`, at every _loop call, takes the oldest iteration still
+ * queued; `admits` holds back a later iteration's events for the next
+ * poll phase. */
+class NetBatchGate {
+  private hostGen = 0;
+  private closer = false;
+  private pollGen = -1;
+  constructor(private readonly schedule: (f: () => void) => void) {}
+  /** A held event re-queued at READ_START: the next iteration's. */
+  stampNext(ev: HostEvent): void {
+    this.stamp(ev);
+    if (ev.source === 2) ev.gen = this.hostGen + 1;
+  }
+  stamp(ev: HostEvent): void {
+    if (ev.source !== 2) return;
+    ev.gen = this.hostGen;
+    if (this.closer) return;
+    this.closer = true;
+    this.schedule(() => {
+      this.closer = false;
+      this.hostGen++;
+    });
+  }
+  beginPoll(queue: readonly HostEvent[]): void {
+    this.pollGen = queue.find((e) => e.source === 2)?.gen ?? -1;
+  }
+  admits(ev: HostEvent): boolean {
+    return ev.source !== 2 || ev.gen === undefined || ev.gen <= this.pollGen;
+  }
+}
+
+interface NetHostDeps {
+  memory: () => WebAssembly.Memory;
+  push: (ev: HostEvent) => void;
+  /** Drop every queued event `pred` matches. */
+  purge: (pred: (ev: HostEvent) => boolean) => void;
+  /** Remove and answer, in order, every queued event `pred` matches. */
+  take: (pred: (ev: HostEvent) => boolean) => HostEvent[];
+  /** A handle or request came into being (+1) or ended (-1). */
+  live: (delta: number) => void;
+  /** Re-queue a held event at READ_START (default: push). The batch gate
+   * stamps it with the NEXT host iteration. */
+  requeue?: (ev: HostEvent) => void;
+}
+
+interface NetRec {
+  kind: "server" | "socket" | "resolve";
+  server?: Server;
+  sock?: Socket;
+  reading: boolean;
+  /** The host socket has been resumed once (its stream flows from then on;
+   * reads are gated by `reading` through its _read). */
+  started: boolean;
+  held: HostEvent[];
+  pendingWrite: boolean;
+  connected: boolean;
+}
+
+/** The host stream handle's own read switch (libuv's uv_read_start /
+ * uv_read_stop, as Node's net.Socket drives it). */
+interface NetStreamHandle {
+  reading: boolean;
+  readStart(): number;
+  readStop(): number;
+}
+
+function makeNetHost(deps: NetHostDeps): { netCall: (op: number, ptr: number, len: number, h: number, x: number) => number; delivered: (ev: HostEvent) => void; finish: () => void; open: () => number; socketOf: (h: number) => Socket | undefined } {
+  const recs = new Map<number, NetRec>();
+  let next = 1;
+  let finished = false;
+  const ev = (handle: number, kind: number, a: number, payload?: Uint8Array): HostEvent => ({
+    source: 2,
+    handle,
+    kind,
+    a: a | 0,
+    b: 0,
+    payload: payload ?? new Uint8Array(0),
+  });
+  const queue = (h: number, e: HostEvent): void => {
+    const rec = recs.get(h);
+    if (finished || rec === undefined) return;
+    if (NET_READ_KINDS.has(e.kind) && !rec.reading) {
+      rec.held.push(e);
+      return;
+    }
+    deps.push(e);
+  };
+  const newRec = (r: Partial<NetRec> & { kind: NetRec["kind"] }): number => {
+    const h = next++;
+    recs.set(h, { reading: false, started: false, held: [], pendingWrite: false, connected: false, ...r });
+    deps.live(1);
+    return h;
+  };
+  const watch = (h: number, sock: Socket): void => {
+    // The module decides when this socket reads (READ_START / READ_STOP):
+    // the stream's own _read — the one place Node's net.Socket starts the
+    // handle reading — runs only while the module has it reading, so the
+    // host's Node never reads ahead of the module (and never sees a read
+    // error the module would not have seen).
+    const ownRead = sock._read.bind(sock);
+    sock._read = (n: number): void => {
+      if (recs.get(h)?.reading === true) ownRead(n);
+    };
+    sock.on("data", (chunk: Buffer) => queue(h, ev(h, NET_EV_DATA, 0, new Uint8Array(chunk))));
+    sock.on("end", () => queue(h, ev(h, NET_EV_EOF, 0)));
+    sock.on("error", (e: NodeJS.ErrnoException) => {
+      const rec = recs.get(h);
+      if (rec === undefined) return;
+      if (e.syscall === "connect") {
+        if (!rec.connected) {
+          rec.connected = true;
+          queue(h, ev(h, NET_EV_CONNECT, netErrno(e)));
+        }
+        return;
+      }
+      if (e.syscall === "write") {
+        if (rec.pendingWrite) {
+          rec.pendingWrite = false;
+          queue(h, ev(h, NET_EV_WRITE_DONE, netErrno(e)));
+        }
+        return;
+      }
+      // Node's afterShutdown ignores the shutdown status; so does the
+      // module (abi.ts SHUTDOWN), and it is never a read error.
+      if (e.syscall === "shutdown") return;
+      queue(h, ev(h, NET_EV_READ_ERROR, netErrno(e)));
+    });
+  };
+  const socketOf = (h: number): NetRec | undefined => {
+    const rec = recs.get(h);
+    return rec?.kind === "socket" ? rec : undefined;
+  };
+  const netCall = (op: number, ptr: number, len: number, h: number, x: number): number => {
+    const buffer = deps.memory().buffer;
+    const dv = new DataView(buffer);
+    switch (op) {
+      case NET_OP_LISTEN: {
+        const port = dv.getUint32(ptr, true);
+        const family = dv.getUint32(ptr + 4, true);
+        const flags = dv.getUint32(ptr + 8, true);
+        const backlog = dv.getUint32(ptr + 12, true);
+        const { text: address } = netReadRun(buffer, ptr + 16);
+        const reply = (stage: number, boundPort: number, boundFamily: number, boundAddress: string): void => {
+          const out = new DataView(deps.memory().buffer);
+          out.setUint32(ptr, stage, true);
+          out.setUint32(ptr + 4, boundPort, true);
+          out.setUint32(ptr + 8, boundFamily, true);
+          const run = netRunBytes(boundAddress);
+          new Uint8Array(deps.memory().buffer, ptr + 12, run.length).set(run);
+        };
+        const createHandle = (netModuleNs as unknown as { _createServerHandle: (a: string, p: number, f: number, fd: undefined, flags: number) => unknown })._createServerHandle;
+        // UV_TCP_IPV6ONLY is 1.
+        const handle = createHandle(address, port, family, undefined, flags & 1);
+        if (typeof handle === "number") {
+          reply(1, 0, 0, "");
+          return handle;
+        }
+        const server = netCreateServer({ allowHalfOpen: true, pauseOnConnect: true });
+        server.on("error", () => {});
+        let listenErrno: number | undefined;
+        const onListenError = (m: unknown): void => {
+          const msg = m as { server?: unknown; error?: unknown };
+          if (msg.server === server) listenErrno = netErrno(msg.error);
+        };
+        dcSubscribe("tracing:net.server.listen:error", onListenError);
+        try {
+          server.listen(handle as never, backlog);
+        } finally {
+          dcUnsubscribe("tracing:net.server.listen:error", onListenError);
+        }
+        if (listenErrno !== undefined) {
+          reply(2, 0, 0, "");
+          return listenErrno;
+        }
+        const bound = server.address();
+        if (bound === null || typeof bound === "string") throw new Error("netCall: a listening server with no address");
+        const sh = newRec({ kind: "server", server });
+        server.on("connection", (sock: Socket) => {
+          if (finished || !recs.has(sh)) {
+            sock.destroy();
+            return;
+          }
+          const ch = newRec({ kind: "socket", sock });
+          watch(ch, sock);
+          deps.push(ev(sh, NET_EV_ACCEPT, ch, netPeerPayload(sock.remoteFamily, sock.remotePort, sock.remoteAddress)));
+        });
+        reply(0, bound.port, bound.family === "IPv6" ? 6 : 4, bound.address);
+        return sh;
+      }
+      case NET_OP_CONNECT: {
+        const port = dv.getUint32(ptr, true);
+        const family = dv.getUint32(ptr + 4, true);
+        const { text: address } = netReadRun(buffer, ptr + 8);
+        const sock = new Socket({ allowHalfOpen: true });
+        sock.pause();
+        const ch = newRec({ kind: "socket", sock });
+        watch(ch, sock);
+        sock.on("connect", () => {
+          const rec = recs.get(ch);
+          if (rec === undefined || rec.connected) return;
+          rec.connected = true;
+          queue(ch, ev(ch, NET_EV_CONNECT, 0, netPeerPayload(sock.remoteFamily, sock.remotePort, sock.remoteAddress)));
+        });
+        sock.connect({ port, host: address, family, autoSelectFamily: false });
+        return ch;
+      }
+      case NET_OP_READ_START: {
+        const rec = socketOf(h);
+        if (rec === undefined) throw new Error(`netCall: READ_START of handle ${h}, not an open socket`);
+        if (!rec.reading) {
+          rec.reading = true;
+          const held = rec.held;
+          rec.held = [];
+          // libuv would read these in a later iteration than this one.
+          for (const e of held) (deps.requeue ?? deps.push)(e);
+          const sock = rec.sock!;
+          if (!rec.started) {
+            rec.started = true;
+            sock.resume();
+          } else if (!sock.destroyed) {
+            sock._read(0);
+          }
+        }
+        return 0;
+      }
+      case NET_OP_READ_STOP: {
+        const rec = socketOf(h);
+        if (rec === undefined) throw new Error(`netCall: READ_STOP of handle ${h}, not an open socket`);
+        if (rec.reading) {
+          rec.reading = false;
+          // uv_read_stop on the host's handle, now: no read past this
+          // point until the next READ_START.
+          const handle = (rec.sock as unknown as { _handle: NetStreamHandle | null })._handle;
+          if (handle !== null && handle.reading) {
+            handle.reading = false;
+            handle.readStop();
+          }
+          rec.held = deps.take((e) => e.source === 2 && e.handle === h && NET_READ_KINDS.has(e.kind));
+        }
+        return 0;
+      }
+      case NET_OP_WRITE: {
+        const rec = socketOf(h);
+        if (rec === undefined) throw new Error(`netCall: WRITE to handle ${h}, not an open socket`);
+        const sock = rec.sock!;
+        // A host socket its Node already destroyed: the kernel would refuse
+        // this write too — with the error the socket died of (ECONNRESET
+        // after an RST, ...), else EPIPE, as write(2) answers on a socket
+        // whose peer is gone.
+        if (sock.destroyed) return sock.errored ? netErrno(sock.errored) : -32;
+        const data = Buffer.from(new Uint8Array(buffer, ptr, len));
+        const before = sock.errored;
+        sock.write(data, (err) => {
+          const r = recs.get(h);
+          if (r === undefined || !r.pendingWrite) return;
+          r.pendingWrite = false;
+          queue(h, ev(h, NET_EV_WRITE_DONE, err ? netErrno(err) : 0));
+        });
+        const after = sock.errored;
+        if (after !== null && after !== before) return netErrno(after);
+        if (sock.writableLength === 0) return 0;
+        rec.pendingWrite = true;
+        return 1;
+      }
+      case NET_OP_SHUTDOWN: {
+        const rec = socketOf(h);
+        if (rec === undefined) throw new Error(`netCall: SHUTDOWN of handle ${h}, not an open socket`);
+        // uv_shutdown's own refusal: a stream no longer writable is
+        // ENOTCONN. Otherwise accepted (0): the host shuts the write side
+        // down and the module completes the request in its own pending
+        // pass (abi.ts SHUTDOWN), as libuv does.
+        const sock = rec.sock!;
+        if (sock.destroyed || !sock.writable) return -107;
+        sock.end();
+        return 0;
+      }
+      case NET_OP_CLOSE: {
+        const rec = recs.get(h);
+        if (rec === undefined || rec.kind === "resolve") throw new Error(`netCall: CLOSE of handle ${h}, not an open handle`);
+        recs.delete(h);
+        deps.live(-1);
+        deps.purge((e) => {
+          if (e.source !== 2 || e.handle !== h) return false;
+          if (e.kind === NET_EV_ACCEPT) {
+            const carried = recs.get(e.a);
+            if (carried !== undefined) {
+              carried.sock?.destroy();
+              recs.delete(e.a);
+              deps.live(-1);
+            }
+          }
+          return true;
+        });
+        if (rec.kind === "socket") rec.sock!.destroy();
+        else rec.server!.close();
+        return 0;
+      }
+      case NET_OP_NODELAY: {
+        const rec = socketOf(h);
+        if (rec === undefined) throw new Error(`netCall: NODELAY of handle ${h}, not an open socket`);
+        rec.sock!.setNoDelay(x !== 0);
+        return 0;
+      }
+      case NET_OP_RESOLVE: {
+        const family = dv.getUint32(ptr, true);
+        const hints = dv.getUint32(ptr + 4, true);
+        const { text: name } = netReadRun(buffer, ptr + 8);
+        const rh = newRec({ kind: "resolve" });
+        dnsLookup(name, { all: true, family: family as 0 | 4 | 6, hints, order: "verbatim" }, (err, addresses) => {
+          if (finished || !recs.has(rh)) return;
+          deps.push(ev(rh, NET_EV_RESOLVE_DONE, err ? netErrno(err) : 0, err ? undefined : netResolvePayload(addresses)));
+        });
+        return rh;
+      }
+      default:
+        throw new Error(`netCall: unknown op ${op}`);
+    }
+  };
+  return {
+    netCall,
+    // The module read a RESOLVE_DONE: that request is over.
+    delivered(e: HostEvent): void {
+      if (e.source === 2 && e.kind === NET_EV_RESOLVE_DONE && recs.get(e.handle)?.kind === "resolve") {
+        recs.delete(e.handle);
+        deps.live(-1);
+      }
+    },
+    finish(): void {
+      finished = true;
+      for (const rec of recs.values()) {
+        if (rec.kind === "socket") rec.sock!.destroy();
+        else if (rec.kind === "server") rec.server!.close();
+      }
+      recs.clear();
+    },
+    open: (): number => recs.size,
+    // For the unit rows: the host socket behind a handle.
+    socketOf: (h: number): Socket | undefined => recs.get(h)?.sock,
+  };
 }
 
 async function runWasm(modulePath: string): Promise<RunResult> {
@@ -4250,9 +4697,14 @@ async function runWasm(modulePath: string): Promise<RunResult> {
   // such event queued while it is open marks the one before it: the module
   // runs no checkpoint between them, as Node runs none.
   let evScopeLast: HostEvent | null = null;
+  // INC-29 U1 (review; abi.ts evPoll): each module poll phase delivers
+  // only the net events of the oldest host loop iteration still queued.
+  const evGate = new NetBatchGate((f) => setImmediate(f));
   const evPush = (ev: HostEvent): void => {
     if (evFinished) return;
-    if (ev.kind === 1 || ev.kind === 4 || ev.kind === 5 || ev.kind === 6) {
+    evGate.stamp(ev);
+    // INC-29 U1: the scope bit is the children's (source 1) only.
+    if (ev.source === 1 && (ev.kind === 1 || ev.kind === 4 || ev.kind === 5 || ev.kind === 6)) {
       if (evScopeLast !== null) {
         evScopeLast.kind |= 0x100;
       } else {
@@ -4265,6 +4717,43 @@ async function runWasm(modulePath: string): Promise<RunResult> {
     evQueue.push(ev);
     evWaker?.();
   };
+  // INC-29 U1 (abi.ts netCall, evPoll source 2): the net host. Its handles
+  // count as live for the clock exactly as children do: while any socket,
+  // server or lookup is open the clock is real time.
+  const evLiveAdd = (delta: number): void => {
+    if (delta > 0 && evLive === 0) {
+      evAnchorV = clock;
+      evAnchorR = performance.now();
+    }
+    const t = clockNow();
+    evLive += delta;
+    if (delta < 0 && evLive === 0) clock = Math.max(clock, t);
+  };
+  const netHost = makeNetHost({
+    memory: () => {
+      if (memory === null) throw new Error("netCall before instantiation completed");
+      return memory;
+    },
+    push: evPush,
+    purge: (pred) => {
+      for (let i = evQueue.length - 1; i >= 0; i--) if (pred(evQueue[i]!)) evQueue.splice(i, 1);
+    },
+    take: (pred) => {
+      const taken: HostEvent[] = [];
+      for (let i = 0; i < evQueue.length; ) {
+        if (pred(evQueue[i]!)) taken.push(...evQueue.splice(i, 1));
+        else i++;
+      }
+      return taken;
+    },
+    live: evLiveAdd,
+    requeue: (ev) => {
+      if (evFinished) return;
+      evGate.stampNext(ev);
+      evQueue.push(ev);
+      evWaker?.();
+    },
+  });
   // SPAWN: public spawn() inside ONE synchronous span with the documented
   // tracing channel subscribed for exactly that span (never at module
   // scope: a subscriber makes every spawn in the worker publish), matched
@@ -5167,6 +5656,10 @@ async function runWasm(modulePath: string): Promise<RunResult> {
         }
         return -1;
       },
+      // INC-29 U1 (abi.ts netCall): node:net's OS-level operations.
+      netCall(op: number, ptr: number, len: number, h: number, x: number): number {
+        return netHost.netCall(op, ptr, len, h, x);
+      },
       // INC-28 U2 (abi.ts evPoll): the oldest queued event, or 0; a short
       // buffer answers -(the length needed) and keeps the event. Reading an
       // EXIT ends that child's life for the clock.
@@ -5174,12 +5667,17 @@ async function runWasm(modulePath: string): Promise<RunResult> {
         if (memory === null) throw new Error("evPoll before instantiation completed");
         const ev = evQueue[0];
         if (ev === undefined) return 0;
+        // INC-29 U1 (review): a later host iteration's net events wait for
+        // the module's next poll phase.
+        if (!evGate.admits(ev)) return 0;
         const n = evEncodeRecord(memory.buffer, ptr, cap, ev);
         if (n < 0) return n;
         evQueue.shift();
+        // INC-29 U1: a net event's own bookkeeping (a lookup's answer ends it).
+        netHost.delivered(ev);
         // Reading a child's last event (its EXIT, and INC-28 U3 every piped
         // stream's END) ends that child's life for the clock.
-        if ((ev.kind & 0xff) === 1 || (ev.kind & 0xff) === 5) {
+        if (ev.source === 1 && ((ev.kind & 0xff) === 1 || (ev.kind & 0xff) === 5)) {
           const rec = evChildren.get(ev.handle);
           if (rec !== undefined && rec.live) {
             if ((ev.kind & 0xff) === 1) rec.exitRead = true;
@@ -5218,7 +5716,16 @@ async function runWasm(modulePath: string): Promise<RunResult> {
       }
     }
     // INC-28 U2: an event module's pump (abi.ts's loop contract).
-    const loop = instance.exports["_loop"] as ((now: number) => number) | undefined;
+    const loopExport = instance.exports["_loop"] as ((now: number) => number) | undefined;
+    const loop =
+      loopExport === undefined
+        ? undefined
+        : (now: number): number => {
+            // INC-29 U1 (review): this call's poll phase takes the oldest
+            // queued host iteration's net events, and only those.
+            evGate.beginPoll(evQueue);
+            return loopExport(now);
+          };
     if (loop !== undefined) {
       let due = loop(clockNow());
       for (let turns = 0; ; turns++) {
@@ -5275,6 +5782,9 @@ async function runWasm(modulePath: string): Promise<RunResult> {
     evFinished = true;
     evWaker = null;
     evQueue.length = 0;
+    // INC-29 U1: every socket and server still open is closed (the module
+    // left them so: the loop ended, or the program died).
+    netHost.finish();
     for (const rec of evChildren.values()) {
       rec.proc.removeAllListeners("close");
       rec.proc.removeAllListeners("exit");
@@ -7038,6 +7548,393 @@ describe("INC-28 U3 child output stream rows", () => {
   test("U3-LX-06 a 'data' listener added three nextTicks after the 'exit' listener: flushStdio's resume_ already flowed the output to nobody, only 'end' is seen (Node 5/5)", async () => {
     const r = await runU3Source("// a data listener added three nextTicks after the exit listener: flushStdio's resume_ has flowed the output to nobody, so only end is seen.\nimport { spawn } from \"node:child_process\";\nconst c = spawn(\"/bin/sh\", [\"-c\", \"printf hi; exec 1>&-; sleep 0.3\"], { stdio: [\"ignore\", \"pipe\", \"ignore\"] });\nc.on(\"exit\", (code) => {\n  console.log(\"exit\", code);\n  process.nextTick(() => {\n    process.nextTick(() => { process.nextTick(() => {\n      c.stdout?.on(\"data\", (d: Buffer) => console.log(\"data\", d.toString()));\n      c.stdout?.on(\"end\", () => console.log(\"end\"));\n    }); });\n  });\n});\n");
     expect(r.stdout.toString("utf8")).toBe("exit 0\nend\n");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+});
+
+// ── INC-29 U1 node:net rows ───────────────────────────────────────────────
+// Rows that open real sockets go through this file's own runWasm and its
+// net host (makeNetHost above); the host's pure parts are driven directly
+// by the unit rows. Not shard-gated: each row compiles its inline source
+// into its own mkdtemp directory and uses ephemeral ports only. Every
+// expected output was measured against Node v24.18.1 on the same source,
+// and no row depends on the kernel's order between a client's 'connect'
+// and the server's 'connection': each line is printed by the side that
+// causes it, or after a causal round trip.
+describe("INC-29 U1 node:net rows", () => {
+  /** Compiles `src` (a whole program, `ext` its file kind) in a fresh
+   * directory of its own and runs it through this file's runWasm. */
+  async function runN1Source(src: string, ext: string): Promise<RunResult> {
+    const dir = mkdtempSync(join(tmpdir(), "n1-row-"));
+    try {
+      const file = join(dir, `main.${ext}`);
+      writeFileSync(file, src);
+      const res = await compile(file, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: false, backend: "wasm" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+      return await runWasm(res.binaryPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  /** A corpus program compiled into a fresh directory of its own, then
+   * run through runWasm. */
+  async function runN1Corpus(name: string): Promise<RunResult> {
+    const dir = mkdtempSync(join(tmpdir(), "n1-corpus-"));
+    try {
+      const res = await compile(join(corpusDir, name), { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: false, backend: "wasm" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+      return await runWasm(res.binaryPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  const corpusRows: [string, string, string][] = [
+    ["1567-server-close-override.ts", "both listening\noverride ran\ninner closed\nwrapper closed\n", "two servers, the close override closing the inner one through the bound real close"],
+    ["1797-dyn-handle-socket.cjs", "typeof socket: object, string form: [object Object]\ndestroyed: false, writable: true\nremote is loopback: true\nserver saw: marbles\nclient got: echo:marbles\nserver socket closed, destroyed now: true\n", "a checked-dynamic accepted socket: its properties, data / close listeners, write and end with a dyn chunk"],
+    ["2599-stream-arg-ladders.cjs", "TypeError|ERR_INVALID_ARG_TYPE|The \"stream\" argument must be an instance of ReadableStream, WritableStream, or Stream. Received an instance of Object\nTypeError|ERR_INVALID_ARG_TYPE|The \"stream\" argument must be an instance of ReadableStream, WritableStream, or Stream. Received type string ('nope')\nTypeError|ERR_INVALID_ARG_VALUE|The property 'options.type' must be one of: 'bytes', undefined. Received 'wrong type'\nTypeError|ERR_INVALID_ARG_TYPE|Second argument must be a buffer\n", "a connect to 'localhost' (a lookup, two addresses), a write and destroy on 'connect'"],
+    ["2640-net-dyn-socket-compat.cjs", "setNoDelay is sock: true\nreadable pre: true\nwrite cb, bytesWritten: 6\nfinish cb\npause returns c: true\nclient got: \"hello!\" readable: false\nat(-1): 10 slice: 3 97 99\nclient closed, destroyed: true\n", "the checked-dynamic socket members (setNoDelay, write / end callbacks, bytesWritten, readable), pause / resume, destroySoon"],
+    ["2500-net-autosel-timeout.ts", "number 300\n1234\n10\n", "the attempt-budget pair"],
+    ["2596-net-arg-ladders.cjs", "TypeError|ERR_INVALID_ARG_TYPE|The \"options\" argument must be of type object. Received type string ('path')\nTypeError|ERR_INVALID_ARG_TYPE|The \"options\" argument must be of type object. Received type number (0)\nTypeError|ERR_INVALID_ARG_TYPE|The \"options.host\" property must be of type string. Received an instance of Array\nTypeError|ERR_INVALID_ARG_TYPE|The \"options.autoSelectFamily\" property must be of type boolean. Received type string ('INVALID')\nRangeError|ERR_OUT_OF_RANGE|The value of \"options.autoSelectFamilyAttemptTimeout\" is out of range. It must be >= 1 && <= 2147483647. Received -10\nRangeError|ERR_OUT_OF_RANGE|The value of \"options.autoSelectFamilyAttemptTimeout\" is out of range. It must be >= 1 && <= 2147483647. Received 0\nRangeError|ERR_OUT_OF_RANGE|The value of \"options.autoSelectFamilyAttemptTimeout\" is out of range. It must be >= 1 && <= 2147483647. Received -10\nRangeError|ERR_OUT_OF_RANGE|The value of \"value\" is out of range. It must be >= 1 && <= 2147483647. Received -10\nRangeError|ERR_OUT_OF_RANGE|The value of \"options.autoSelectFamilyAttemptTimeout\" is out of range. It must be >= 1 && <= 2147483647. Received 0\nRangeError|ERR_OUT_OF_RANGE|The value of \"value\" is out of range. It must be >= 1 && <= 2147483647. Received 0\nRangeError|ERR_OUT_OF_RANGE|The value of \"value\" is out of range. It must be an integer. Received 2.5\nbudget 10\nbudget 10\nbudget 25\nTypeError|ERR_INVALID_ARG_TYPE|The \"options.signal\" property must be an instance of AbortSignal. Received type string ('INVALID_SIGNAL')\nTypeError|ERR_INVALID_ARG_VALUE|The property 'options.objectMode' is not supported. Received true\nTypeError|ERR_INVALID_ARG_VALUE|The property 'options.readableObjectMode' is not supported. Received true\nTypeError|ERR_INVALID_ARG_VALUE|The property 'options.writableObjectMode' is not supported. Received true\n", "the argument ladders: the attempt budget's validation in connect and in its setter, the option bag's objectMode trio"],
+  ];
+  for (const [name, stdout, what] of corpusRows) {
+    test(`N1-C-${name.slice(0, 4)} corpus ${name} (${what}): full stdout, stderr and exit code equal Node's`, async () => {
+      const r = await runN1Corpus(name);
+      expect(r.stdout.toString("utf8")).toBe(stdout);
+      expect(r.stderr.toString("utf8")).toBe("");
+      expect(r.exitCode).toBe(0);
+    }, 60000);
+  }
+
+  test("N1-UNIT-01 the host's records: a UTF-16 run is a u32 count, the units and zero padding to 4; a peer is u32 family, u32 port, the address run; a lookup answer is a u32 count then (family, run) pairs — SINGLE-EDIT: the padding rounded to 2", () => {
+    expect([...netRunBytes("ab")]).toEqual([2, 0, 0, 0, 97, 0, 98, 0]);
+    expect([...netRunBytes("abc")]).toEqual([3, 0, 0, 0, 97, 0, 98, 0, 99, 0, 0, 0]);
+    expect([...netPeerPayload("IPv6", 258, "::1")]).toEqual([6, 0, 0, 0, 2, 1, 0, 0, 3, 0, 0, 0, 58, 0, 58, 0, 49, 0, 0, 0]);
+    expect([...netPeerPayload("IPv4", 1, "")]).toEqual([4, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+    const answer = netResolvePayload([{ address: "::1", family: 6 }, { address: "1", family: 4 }]);
+    expect([...answer]).toEqual([2, 0, 0, 0, 6, 0, 0, 0, 3, 0, 0, 0, 58, 0, 58, 0, 49, 0, 0, 0, 4, 0, 0, 0, 1, 0, 0, 0, 49, 0, 0, 0]);
+    const mem = new ArrayBuffer(64);
+    new Uint8Array(mem, 8).set(netRunBytes("héllo"));
+    expect(netReadRun(mem, 8)).toEqual({ text: "héllo", next: 8 + 4 + 12 });
+  });
+  test("N1-UNIT-02 a Node error's errno is the negative number it carries, EIO (-5) when it has none — SINGLE-EDIT: the default errno 0", () => {
+    expect(netErrno({ errno: -111 })).toBe(-111);
+    expect(netErrno(new Error("x"))).toBe(-5);
+    expect(netErrno(null)).toBe(-5);
+  });
+  test("N1-UNIT-03 CLOSE purges every event queued for that handle and only those, and the handle stops counting as live — SINGLE-EDIT: the CLOSE purge's predicate", async () => {
+    const memory = new WebAssembly.Memory({ initial: 1 });
+    const queued: HostEvent[] = [];
+    let live = 0;
+    const host = makeNetHost({
+      memory: () => memory,
+      push: (e) => queued.push(e),
+      purge: (pred) => {
+        for (let i = queued.length - 1; i >= 0; i--) if (pred(queued[i]!)) queued.splice(i, 1);
+      },
+      take: () => [],
+      live: (d) => {
+        live += d;
+      },
+    });
+    const req = netConcat([netU32(1), netU32(4), netRunBytes("127.0.0.1")]);
+    new Uint8Array(memory.buffer, 0, req.length).set(req);
+    const a = host.netCall(2, 0, req.length, 0, 0);
+    new Uint8Array(memory.buffer, 0, req.length).set(req);
+    const b = host.netCall(2, 0, req.length, 0, 0);
+    expect([a, b, live]).toEqual([1, 2, 2]);
+    const ev = (source: number, handle: number, kind: number): HostEvent => ({ source, handle, kind, a: 0, b: 0, payload: new Uint8Array(0) });
+    queued.push(ev(2, a, 3), ev(2, b, 3), ev(1, a, 1), ev(2, a, 4));
+    expect(host.netCall(7, 0, 0, a, 0)).toBe(0);
+    expect(queued.map((e) => `${e.source}:${e.handle}:${e.kind}`)).toEqual([`2:${b}:3`, `1:${a}:1`]);
+    expect(live).toBe(1);
+    host.finish();
+  });
+  test("N1-ERR-01 a refused connect to an IP literal: 'error' (connect ECONNREFUSED <ip>:<port>, its name and code) with its nextTick and microtask, then 'close'", async () => {
+    const r = await runN1Source("// ECONNREFUSED to an IP literal: a port freed by closing a server; the\n// error's message, code and name, then 'close'; nextTick and microtask\n// ordering around the error.\nimport * as net from \"node:net\";\n\nconst probe = net.createServer();\nprobe.listen(0, \"127.0.0.1\", () => {\n  const port = probe.address().port;\n  probe.close(() => {\n    const c = net.connect(port, \"127.0.0.1\");\n    c.on(\"error\", (e) => {\n      console.log(\"error\", e.message === \"connect ECONNREFUSED 127.0.0.1:\" + port, e.name, (e as NodeJS.ErrnoException).code);\n      process.nextTick(() => console.log(\"tick after error\"));\n      Promise.resolve().then(() => console.log(\"micro after error\"));\n    });\n    c.on(\"close\", () => {\n      console.log(\"close\", c.destroyed);\n    });\n    c.on(\"connect\", () => console.log(\"connect (never)\"));\n    console.log(\"connecting\", c.destroyed);\n  });\n});\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("connecting false\nerror true Error ECONNREFUSED\ntick after error\nmicro after error\nclose true\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-ERR-02 EADDRINUSE with no host (the '::' bind: listen EADDRINUSE: address already in use :::<port>) and with an IP host (its lookup tick first), in Node's order", async () => {
+    const r = await runN1Source("// EADDRINUSE: a second server on the first one's port, with no host (the\n// '::' bind) and with an IP host; the errors' texts and codes, in order.\nimport * as net from \"node:net\";\n\nconst a = net.createServer();\na.listen(0, () => {\n  const port = a.address().port;\n  const b = net.createServer();\n  b.on(\"error\", (e) => {\n    console.log(\"b error\", e.message === \"listen EADDRINUSE: address already in use :::\" + port, (e as NodeJS.ErrnoException).code);\n    const c = net.createServer();\n    c.on(\"error\", (e2) => {\n      console.log(\"c error\", e2.message === \"listen EADDRINUSE: address already in use 127.0.0.1:\" + port, (e2 as NodeJS.ErrnoException).code);\n      a.close(() => console.log(\"a closed\"));\n    });\n    c.on(\"listening\", () => console.log(\"c listening (never)\"));\n    c.listen(port, \"127.0.0.1\");\n    console.log(\"c listen called\");\n  });\n  b.listen(port);\n  console.log(\"b listen called\");\n  process.nextTick(() => console.log(\"tick after b listen\"));\n});\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("b listen called\nb error true EADDRINUSE\nc listen called\ntick after b listen\nc error true EADDRINUSE\na closed\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-HALF-01 half-close with allowHalfOpen false: the server writes and ends, the client reads it all and its write side ends on its own; each side's events in order", async () => {
+    const r = await runN1Source("// Half-close with allowHalfOpen false: the server writes and ends; the\n// client reads everything, sees 'end', and its write side ends on its own\n// (the server then sees 'end'); both sides close. Each side's events in\n// order, printed only from the side that owns them (no cross-side race).\nimport * as net from \"node:net\";\n\nconst serverLog: string[] = [];\nconst clientLog: string[] = [];\nlet closed = 0;\nfunction done(): void {\n  closed++;\n  if (closed === 2) {\n    console.log(\"server:\", serverLog.join(\" \"));\n    console.log(\"client:\", clientLog.join(\" \"));\n    server.close(() => console.log(\"server closed\"));\n  }\n}\nconst server = net.createServer((sock) => {\n  let got = \"\";\n  sock.on(\"data\", (d: Buffer) => {\n    got += d.toString();\n  });\n  sock.on(\"end\", () => serverLog.push(\"end(\" + got + \")\"));\n  sock.on(\"finish\", () => serverLog.push(\"finish\"));\n  sock.on(\"close\", () => {\n    serverLog.push(\"close\");\n    done();\n  });\n  sock.write(\"hello \");\n  sock.end(\"world\");\n  serverLog.push(\"ended-writable:\" + sock.writable);\n});\nserver.listen(0, () => {\n  const c = net.connect(server.address().port, \"127.0.0.1\");\n  let got = \"\";\n  c.on(\"data\", (d: Buffer) => {\n    got += d.toString();\n  });\n  c.on(\"end\", () => {\n    clientLog.push(\"end(\" + got + \") writable:\" + c.writable + \" readable:\" + c.readable);\n    process.nextTick(() => clientLog.push(\"tick writable:\" + c.writable));\n  });\n  c.on(\"finish\", () => clientLog.push(\"finish\"));\n  c.on(\"close\", () => {\n    clientLog.push(\"close destroyed:\" + c.destroyed);\n    done();\n  });\n  c.write(\"ping\");\n});\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("server: ended-writable:false finish end(ping) close\nclient: end(hello world) writable:true readable:false tick writable:true finish close destroyed:true\nserver closed\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-CLOSE-01 a server closed with a live connection: its 'close' (callback and event) only once that socket is destroyed", async () => {
+    const r = await runN1Source("// A server closed while a connection is live: 'close' waits until that\n// connection's socket is gone; the listening handle stops accepting at once.\nimport * as net from \"node:net\";\n\nconst server = net.createServer((sock) => {\n  console.log(\"connection\");\n  server.close(() => console.log(\"server close callback\"));\n  server.on(\"close\", () => console.log(\"server close event\"));\n  console.log(\"close called\");\n  setTimeout(() => {\n    console.log(\"destroying the connection\");\n    sock.destroy();\n  }, 100);\n});\nserver.listen(0, () => {\n  const c = net.connect(server.address().port, \"127.0.0.1\");\n  c.on(\"close\", () => console.log(\"client close\"));\n  c.on(\"end\", () => console.log(\"client end\"));\n  c.on(\"data\", () => console.log(\"client data (never)\"));\n});\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("connection\nclose called\ndestroying the connection\nserver close callback\nserver close event\nclient end\nclient close\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-PAUSE-01 pause() holds 'data' while the peer writes more and ends; resume() delivers the rest, then 'end'", async () => {
+    const r = await runN1Source("// pause() and resume() gate the reads: while paused no 'data' arrives, even\n// after the peer has written more and ended; resume delivers the rest, then\n// 'end'. isPaused-like state through readable.\nimport * as net from \"node:net\";\n\nconst server = net.createServer((sock) => {\n  sock.write(\"first\");\n  setTimeout(() => {\n    sock.write(\"second\");\n    sock.end(\"third\");\n  }, 50);\n});\nserver.listen(0, () => {\n  const c = net.connect(server.address().port, \"127.0.0.1\");\n  const seen: string[] = [];\n  let paused = false;\n  c.on(\"data\", (d: Buffer) => {\n    seen.push(d.toString());\n    if (!paused) {\n      paused = true;\n      c.pause();\n      console.log(\"paused after\", JSON.stringify(seen.join(\"\")));\n      setTimeout(() => {\n        console.log(\"while paused saw\", JSON.stringify(seen.join(\"\")));\n        c.resume();\n      }, 300);\n    }\n  });\n  c.on(\"end\", () => {\n    console.log(\"end, all:\", JSON.stringify(seen.join(\"\")));\n    server.close();\n  });\n});\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("paused after \"first\"\nwhile paused saw \"first\"\nend, all: \"firstsecondthird\"\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-VAL-01 the synchronous throws: address().port before a listen, a bad or fractional listen port, a bad connect port, a NUL in the host, listen twice \u2014 Node's names, codes and texts", async () => {
+    const r = await runN1Source("// The synchronous throws: listen twice, a bad listen port, a bad connect\n// port, a NUL in the host, address().port before a listen.\nimport * as net from \"node:net\";\n\nfunction show(label: string, f: () => void): void {\n  try {\n    f();\n    console.log(label, \"ok\");\n  } catch (e) {\n    const err = e as NodeJS.ErrnoException;\n    console.log(label, err.name, err.code, err.message);\n  }\n}\nconst s = net.createServer();\nshow(\"port before listen\", () => {\n  console.log(s.address().port);\n});\nshow(\"bad listen port\", () => {\n  s.listen(70000);\n});\nshow(\"fraction port\", () => {\n  s.listen(1.5);\n});\nshow(\"bad connect port\", () => {\n  net.connect(-1, \"127.0.0.1\");\n});\nshow(\"nul host\", () => {\n  net.connect(80, \"a\\u0000b\");\n});\ns.listen(0, () => {\n  show(\"listen twice\", () => {\n    s.listen(0);\n  });\n  s.close(() => console.log(\"closed\"));\n});\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("port before listen TypeError undefined Cannot read properties of null (reading 'port')\nbad listen port RangeError ERR_SOCKET_BAD_PORT options.port should be >= 0 and < 65536. Received type number (70000).\nfraction port RangeError ERR_SOCKET_BAD_PORT options.port should be >= 0 and < 65536. Received type number (1.5).\nbad connect port RangeError ERR_SOCKET_BAD_PORT Port should be >= 0 and < 65536. Received type number (-1).\nnul host TypeError ERR_INVALID_ARG_VALUE The property 'options.host' must be a string without null bytes. Received 'a\\x00b'\nlisten twice Error ERR_SERVER_ALREADY_LISTEN Listen method has been called more than once without closing.\nclosed\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-WAE-01 write() after end(): ERR_STREAM_WRITE_AFTER_END as an 'error', the socket destroyed at once, then 'close'", async () => {
+    const r = await runN1Source("// write() after end(): the stream's ERR_STREAM_WRITE_AFTER_END 'error'\n// (asynchronous), then 'close' with the error set.\nimport * as net from \"node:net\";\n\nconst server = net.createServer((sock) => {\n  sock.on(\"data\", () => {});\n  sock.on(\"error\", () => {});\n});\nserver.listen(0, () => {\n  const c = net.connect(server.address().port, \"127.0.0.1\", () => {\n    c.end(\"bye\");\n    c.write(\"late\");\n    console.log(\"after late write, destroyed:\", c.destroyed);\n  });\n  c.on(\"error\", (e) => console.log(\"error\", e.message, (e as NodeJS.ErrnoException).code));\n  c.on(\"close\", () => {\n    console.log(\"close\", c.destroyed);\n    server.close();\n  });\n});\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("after late write, destroyed: true\nerror write after end ERR_STREAM_WRITE_AFTER_END\nclose true\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-PRE-01 writes and end() while connecting: buffered, one writev on 'connect'; bytesWritten counts the buffered bytes (UTF-8); the server reads all of it", async () => {
+    const r = await runN1Source("// Writes made while connecting (buffered, then one writev on 'connect') and\n// an end() before the connect: the server reads all of it, then 'end';\n// bytesWritten counts the buffered bytes before the connect.\nimport * as net from \"node:net\";\n\nconst server = net.createServer((sock) => {\n  let got = \"\";\n  sock.on(\"data\", (d: Buffer) => {\n    got += d.toString();\n  });\n  sock.on(\"end\", () => {\n    console.log(\"server got\", JSON.stringify(got));\n    server.close();\n  });\n});\nserver.listen(0, () => {\n  const c = net.connect(server.address().port, \"127.0.0.1\");\n  c.write(\"one,\");\n  c.write(\"two,\");\n  c.write(\"thr\u00e9e\");\n  console.log(\"bytesWritten before connect\", c.bytesWritten, \"connecting writable\", c.writable);\n  c.end();\n  c.on(\"connect\", () => console.log(\"connect, bytesWritten\", c.bytesWritten));\n  c.on(\"finish\", () => console.log(\"finish, bytesWritten\", c.bytesWritten));\n});\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("bytesWritten before connect 14 connecting writable true\nconnect, bytesWritten 14\nfinish, bytesWritten 14\nserver got \"one,two,thr\u00e9e\"\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-BIG-01 a 4 MiB transfer with the reader paused midway: every byte, in order (checksum), then 'end'", async () => {
+    const r = await runN1Source("// A large transfer (4 MiB): every byte arrives, in order, and 'end' follows;\n// the receiver pauses midway for a while (the sender's writes back up).\nimport * as net from \"node:net\";\n\nconst total = 4 * 1024 * 1024;\nconst server = net.createServer((sock) => {\n  const chunk = Buffer.alloc(64 * 1024);\n  for (let i = 0; i < chunk.length; i++) chunk[i] = i % 251;\n  for (let n = 0; n < total / chunk.length; n++) sock.write(chunk);\n  sock.end();\n});\nserver.listen(0, () => {\n  const c = net.connect(server.address().port, \"127.0.0.1\");\n  let got = 0;\n  let sum = 0;\n  let paused = false;\n  c.on(\"data\", (d: Buffer) => {\n    for (let i = 0; i < d.length; i++) sum = (sum + d[i]! * ((got + i) % 7 + 1)) % 1000000007;\n    got += d.length;\n    if (!paused && got > total / 2) {\n      paused = true;\n      c.pause();\n      setTimeout(() => c.resume(), 200);\n    }\n  });\n  c.on(\"end\", () => {\n    console.log(\"received\", got, \"checksum\", sum);\n    server.close();\n  });\n});\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("received 4194304 checksum 96428761\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-ERR-03 a refused connect through 'localhost' (both addresses tried in turn): the AggregateError's name, empty message and code", async () => {
+    const r = await runN1Source("// A refused connect through 'localhost' (both of its addresses are tried,\n// one after the other): the aggregate error's name, message and code.\nimport * as net from \"node:net\";\n\nconst probe = net.createServer();\nprobe.listen(0, \"127.0.0.1\", () => {\n  const port = probe.address().port;\n  probe.close(() => {\n    const c = net.connect(port);\n    c.on(\"error\", (e) => {\n      console.log(\"error\", e.name, JSON.stringify(e.message), (e as NodeJS.ErrnoException).code);\n    });\n    c.on(\"close\", () => console.log(\"close\"));\n  });\n});\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("error AggregateError \"\" ECONNREFUSED\nclose\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-DMW-01 destroy() in the middle of a large write: the pending write's and a buffered write's callbacks get ECANCELED in the closing phase, after a queued immediate, then 'close'", async () => {
+    const r = await runN1Source("// Destroy in the middle of a large write (a checked-dynamic socket, so the\n// write callbacks are reachable): the pending write's callback and a\n// buffered one's both see the ECANCELED error, in the closing phase, after\n// a queued immediate, then 'close' without an error.\n'use strict';\nconst net = require('net');\n\nfunction wrap(fn) {\n  return function () {\n    return fn.apply(this, arguments);\n  };\n}\nconst server = net.createServer((sock) => {\n  sock.on('data', () => {});\n  sock.on('error', () => {});\n});\nserver.listen(0, () => {\n  const c = net.connect(server.address().port, '127.0.0.1', wrap(function () {\n    const s = wrap(function (x) { return x; })(c);\n    const big = Buffer.alloc(8 * 1024 * 1024, 97);\n    const r = s.write(big, function (err) {\n      console.log('big write cb', err && err.message, err && err.code);\n    });\n    console.log('write returned', r);\n    s.write('small', function (err) {\n      console.log('small write cb', err && err.message);\n    });\n    s.destroy();\n    console.log('after destroy', s.destroyed);\n    process.nextTick(function () { console.log('tick after destroy'); });\n    setImmediate(function () { console.log('immediate'); });\n  }));\n  c.on('close', function () {\n    console.log('close');\n    server.close();\n  });\n  c.on('error', function (e) { console.log('error', e.message); });\n});\n", "cjs");
+    expect(r.stdout.toString("utf8")).toBe("write returned false\nafter destroy true\ntick after destroy\nimmediate\nbig write cb write ECANCELED ECANCELED\nsmall write cb write ECANCELED\nclose\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-ECHO-01 three echo round trips on one connection, then the client ends and both sides close", async () => {
+    const r = await runN1Source("// Several round trips on one connection (the client waits for each echo\n// before it sends the next), then the client ends and both sides close.\nimport * as net from \"node:net\";\n\nconst server = net.createServer((sock) => {\n  sock.on(\"data\", (d: Buffer) => {\n    sock.write(\"echo(\" + d.toString() + \")\");\n  });\n  sock.on(\"end\", () => console.log(\"server end\"));\n  sock.on(\"close\", () => {\n    console.log(\"server socket close\");\n    server.close(() => console.log(\"server closed\"));\n  });\n});\nserver.listen(0, () => {\n  const c = net.connect(server.address().port, \"127.0.0.1\");\n  const words = [\"alpha\", \"beta\", \"gamma\"];\n  let i = 0;\n  c.on(\"connect\", () => {\n    c.write(words[i]!);\n  });\n  let pending = \"\";\n  c.on(\"data\", (d: Buffer) => {\n    pending += d.toString();\n    const want = \"echo(\" + words[i] + \")\";\n    if (pending === want) {\n      console.log(\"got\", pending);\n      pending = \"\";\n      i++;\n      if (i < words.length) c.write(words[i]!);\n      else c.end();\n    }\n  });\n  c.on(\"close\", () => console.log(\"client close\"));\n});\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("got echo(alpha)\ngot echo(beta)\ngot echo(gamma)\nserver end\nserver socket close\nserver closed\nclient close\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-STATE-01 a client socket's destroyed / writable / readable / bytesWritten / remoteAddress at each stage of its life", async () => {
+    const r = await runN1Source("// A client socket's state through its life: destroyed / writable /\n// readable / bytesWritten / remoteAddress before the connect, after it,\n// after end(), at 'end', after destroy() and at 'close'.\nimport * as net from \"node:net\";\n\nconst server = net.createServer((sock) => {\n  sock.end(\"bye\");\n});\nserver.listen(0, \"127.0.0.1\", () => {\n  const c = net.connect(server.address().port, \"127.0.0.1\");\n  const state = (label: string): void => {\n    console.log(label, c.destroyed, c.writable, c.readable, c.bytesWritten, c.remoteAddress);\n  };\n  state(\"created\");\n  c.on(\"connect\", () => {\n    state(\"connect\");\n    c.write(\"abc\");\n    state(\"written\");\n  });\n  c.on(\"data\", () => {});\n  c.on(\"end\", () => {\n    state(\"end\");\n    process.nextTick(() => {\n      state(\"end+tick\");\n      c.destroy();\n      state(\"destroyed\");\n    });\n  });\n  c.on(\"close\", () => {\n    state(\"close\");\n    server.close();\n  });\n});\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("created false true true 0 undefined\nconnect false true true 0 127.0.0.1\nwritten false true true 3 127.0.0.1\nend false true false 3 127.0.0.1\nend+tick false true false 3 127.0.0.1\ndestroyed true false false 3 127.0.0.1\nclose true false false 3 127.0.0.1\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-ORD-01 'listening' (event and callback) and a server's 'close' with no connections, among nextTicks, microtasks and immediates", async () => {
+    const r = await runN1Source("// Callback order around listen and close: the 'listening' listener, a\n// nextTick, a microtask and an immediate queued around them; a server\n// closed with no connections ('close' on a nextTick, before an immediate).\nimport * as net from \"node:net\";\n\nconst s = net.createServer();\ns.on(\"listening\", () => console.log(\"listening event\"));\ns.listen(0, () => {\n  console.log(\"listen callback\");\n  setImmediate(() => console.log(\"immediate after listening\"));\n  s.close(() => console.log(\"close callback\"));\n  s.on(\"close\", () => console.log(\"close event\"));\n  process.nextTick(() => console.log(\"tick after close()\"));\n  Promise.resolve().then(() => console.log(\"micro after close()\"));\n});\nprocess.nextTick(() => console.log(\"tick after listen()\"));\nPromise.resolve().then(() => console.log(\"micro after listen()\"));\nsetImmediate(() => console.log(\"immediate after listen()\"));\nconsole.log(\"main done\");\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("main done\nmicro after listen()\nlistening event\nlisten callback\ntick after listen()\nclose callback\nclose event\ntick after close()\nmicro after close()\nimmediate after listen()\nimmediate after listening\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-SOON-01 destroySoon() and the write(chunk, cb) / end(chunk, cb) callbacks on a checked-dynamic socket", async () => {
+    const r = await runN1Source("// destroySoon after a write: end(), 'finish', then the destroy and 'close';\n// end(chunk, cb) and write(chunk, cb) callbacks on a checked-dynamic socket\n// (cb(null) after the bytes left, the end callback at 'finish').\n'use strict';\nconst net = require('net');\n\nfunction wrap(fn) {\n  return function () {\n    return fn.apply(this, arguments);\n  };\n}\nconst server = net.createServer(wrap(function (sock) {\n  let got = '';\n  sock.on('data', wrap(function (d) { got += d; }));\n  sock.on('end', wrap(function () {\n    console.log('server got', JSON.stringify(got));\n  }));\n  sock.on('close', wrap(function () {\n    console.log('server socket close');\n    server.close();\n  }));\n}));\nserver.listen(0, wrap(function () {\n  const c = net.connect(server.address().port, '127.0.0.1');\n  const s = wrap(function (x) { return x; })(c);\n  s.write('one', function (err) { console.log('write cb', err, s.bytesWritten); });\n  s.end('two', function (err) { console.log('end cb', err); });\n  c.on('finish', function () { console.log('finish'); });\n  c.on('close', function () { console.log('client close', c.destroyed); });\n  c.on('connect', function () {\n    console.log('connect');\n    c.destroySoon();\n    console.log('after destroySoon', c.destroyed);\n  });\n}));\n", "cjs");
+    expect(r.stdout.toString("utf8")).toBe("write cb null 6\nconnect\nafter destroySoon false\nend cb null\nfinish\nclient close true\nserver got \"onetwo\"\nserver socket close\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-DYN-01 a checked-dynamic socket: typeof, String(), identity through a second crossing, and a non-function listener's TypeError", async () => {
+    const r = await runN1Source("// The checked-dynamic surface's edges on a socket: typeof, String(), ===,\n// a property and an event the tier does not model (each a named Error,\n// caught), a non-function listener (Node's TypeError).\n'use strict';\nconst net = require('net');\n\nfunction wrap(fn) {\n  return function () {\n    return fn.apply(this, arguments);\n  };\n}\nconst server = net.createServer(wrap(function (sock) {\n  const again = wrap(function (x) { return x; })(sock);\n  console.log(typeof sock, String(sock), sock === again);\n  try {\n    sock.on('data', 42);\n  } catch (e) {\n    console.log('bad listener:', e.name, e.code, e.message);\n  }\n  sock.destroy();\n  server.close();\n}));\nserver.listen(0, wrap(function () {\n  const c = net.connect(server.address().port, '127.0.0.1');\n  c.on('error', function () {});\n}));\n", "cjs");
+    expect(r.stdout.toString("utf8")).toBe("object [object Object] true\nbad listener: TypeError ERR_INVALID_ARG_TYPE The \"listener\" argument must be of type function. Received type number (42)\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-MANY-01 three clients at once, each answered; the server closes after its last connection is gone", async () => {
+    const r = await runN1Source("// Three clients at once; each sends its name and is answered; the server\n// counts its connections and closes after the last socket is gone.\nimport * as net from \"node:net\";\n\nlet open = 0;\nlet seen = 0;\nconst names: string[] = [];\nconst server = net.createServer((sock) => {\n  open++;\n  sock.on(\"data\", (d: Buffer) => {\n    names.push(d.toString());\n    sock.end(\"hi \" + d.toString());\n  });\n  sock.on(\"close\", () => {\n    open--;\n    seen++;\n    if (seen === 3) {\n      console.log(\"server saw\", names.sort().join(\",\"), \"open\", open);\n      server.close(() => console.log(\"server closed\"));\n    }\n  });\n});\nserver.listen(0, () => {\n  const port = server.address().port;\n  const replies: string[] = [];\n  for (const name of [\"c1\", \"c2\", \"c3\"]) {\n    const c = net.connect(port, \"127.0.0.1\");\n    let got = \"\";\n    c.on(\"data\", (d: Buffer) => {\n      got += d.toString();\n    });\n    c.on(\"end\", () => {\n      replies.push(got);\n      if (replies.length === 3) console.log(\"clients got\", replies.sort().join(\",\"));\n    });\n    c.write(name);\n  }\n});\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("clients got hi c1,hi c2,hi c3\nserver saw c1,c2,c3 open 0\nserver closed\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-UNH-01 an 'error' with no listener: exit 1 after the output already written", async () => {
+    const r = await runN1Source("// An 'error' with no listener: the program dies (exit 1) on the error's\n// nextTick, after the output already written.\nimport * as net from \"node:net\";\n\nconst probe = net.createServer();\nprobe.listen(0, \"127.0.0.1\", () => {\n  const port = probe.address().port;\n  probe.close(() => {\n    net.connect(port, \"127.0.0.1\");\n    console.log(\"connect called\");\n    setTimeout(() => console.log(\"timer (never)\"), 1000);\n  });\n});\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("connect called\n");
+    expect(r.exitCode).toBe(1);
+  }, 60000);
+  test("N1-LATE-01 a 'data' listener added after the peer wrote and ended: the buffered bytes on resume's tick, then 'end', with the listener's own nextTick and microtask", async () => {
+    const r = await runN1Source("// A 'data' listener added well after the peer wrote: the socket read the\n// bytes into its buffer meanwhile, and the listener gets them on resume's\n// tick; 'end' follows. A nextTick and a microtask from the data listener.\nimport * as net from \"node:net\";\n\nconst server = net.createServer((sock) => {\n  sock.end(\"early bytes\");\n});\nserver.listen(0, () => {\n  const c = net.connect(server.address().port, \"127.0.0.1\");\n  c.on(\"end\", () => {\n    console.log(\"end\");\n    server.close();\n  });\n  setTimeout(() => {\n    console.log(\"adding data listener, readable:\", c.readable);\n    c.on(\"data\", (d: Buffer) => {\n      console.log(\"data\", d.toString());\n      process.nextTick(() => console.log(\"tick in data\"));\n      Promise.resolve().then(() => console.log(\"micro in data\"));\n    });\n    process.nextTick(() => console.log(\"tick after on(data)\"));\n  }, 200);\n});\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("adding data listener, readable: true\ndata early bytes\ntick after on(data)\nend\ntick in data\nmicro in data\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-HOST-01 listen on a hostname (a real lookup, then the bind), a connect to it, and close(cb) twice", async () => {
+    const r = await runN1Source("// listen on a hostname ('localhost': a real lookup, then the bind), a\n// connect to it, and close(cb) twice \u2014 the second on a server that is no\n// longer listening.\nimport * as net from \"node:net\";\n\nconst s = net.createServer((sock) => {\n  sock.end(\"x\");\n});\ns.listen(0, \"localhost\", () => {\n  console.log(\"listening on localhost\");\n  const c = net.connect(s.address().port, \"localhost\");\n  c.on(\"data\", (d: Buffer) => console.log(\"client data\", d.toString()));\n  c.on(\"end\", () => {\n    s.close(() => console.log(\"first close callback\"));\n    s.close(() => console.log(\"second close callback\"));\n    s.on(\"close\", () => console.log(\"close event\"));\n  });\n});\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("listening on localhost\nclient data x\nfirst close callback\nsecond close callback\nclose event\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-PEER-01 the client ends first: the server sees 'end', a nextTick from its 'end' listener still writes before its own write side ends", async () => {
+    const r = await runN1Source("// The client ends first while the server keeps writing: the server sees\n// 'end' (still writable), and a nextTick queued by its 'end' listener runs\n// before the auto end() that allowHalfOpen false queues right after the\n// listeners, so its write still goes out; then 'close'.\nimport * as net from \"node:net\";\n\nconst server = net.createServer((sock) => {\n  sock.on(\"data\", () => {});\n  sock.on(\"end\", () => {\n    console.log(\"server end, writable:\", sock.writable);\n    process.nextTick(() => {\n      console.log(\"tick, writable:\", sock.writable);\n      sock.write(\"too late\");\n    });\n  });\n  sock.on(\"error\", (e) => console.log(\"server error\", e.message, (e as NodeJS.ErrnoException).code));\n  sock.on(\"close\", () => {\n    console.log(\"server socket close\");\n    server.close();\n  });\n});\nserver.listen(0, () => {\n  const c = net.connect(server.address().port, \"127.0.0.1\", () => {\n    c.end(\"bye\");\n  });\n  c.on(\"data\", () => {});\n  c.on(\"error\", () => {});\n});\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("server end, writable: true\ntick, writable: true\nserver socket close\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-TICK-01 a nextTick and a microtask from 'connect', 'data', 'end', 'finish' and 'close' listeners: each callback's queues drain before the next callback", async () => {
+    const r = await runN1Source("// nextTicks and microtasks queued from 'connect', 'data', 'end', 'finish'\n// and 'close' listeners on one socket: each callback's own queue drains\n// before the next callback.\nimport * as net from \"node:net\";\n\nconst server = net.createServer((sock) => {\n  sock.on(\"data\", () => {\n    sock.end(\"reply\");\n  });\n});\nserver.listen(0, () => {\n  const c = net.connect(server.address().port, \"127.0.0.1\");\n  const mark = (name: string): void => {\n    console.log(name);\n    process.nextTick(() => console.log(name + \":tick\"));\n    Promise.resolve().then(() => console.log(name + \":micro\"));\n  };\n  c.on(\"connect\", () => {\n    mark(\"connect\");\n    c.write(\"ask\");\n  });\n  c.on(\"data\", () => mark(\"data\"));\n  c.on(\"end\", () => mark(\"end\"));\n  c.on(\"finish\", () => mark(\"finish\"));\n  c.on(\"close\", () => {\n    mark(\"close\");\n    server.close();\n  });\n});\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("connect\nconnect:tick\nconnect:micro\ndata\ndata:tick\ndata:micro\nend\nend:tick\nend:micro\nfinish\nfinish:tick\nfinish:micro\nclose\nclose:tick\nclose:micro\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-UNIT-04 the batch gate: a net event takes the host iteration it was queued in, the iteration ends at the host's next check phase, and a poll phase admits only the oldest iteration still queued (a child's events are never held) — SINGLE-EDIT: admits() ignoring the generation", () => {
+    const scheduled: (() => void)[] = [];
+    const gate = new NetBatchGate((f) => scheduled.push(f));
+    const ev = (source: number, kind: number): HostEvent => ({ source, handle: 1, kind, a: 0, b: 0, payload: new Uint8Array(0) });
+    const a = ev(2, 3);
+    const b = ev(2, 3);
+    gate.stamp(a);
+    gate.stamp(b);
+    expect(scheduled.length).toBe(1);
+    scheduled.shift()!();
+    const c = ev(2, 4);
+    const child = ev(1, 1);
+    gate.stamp(c);
+    gate.stamp(child);
+    expect([a.gen, b.gen, c.gen, child.gen]).toEqual([0, 0, 1, undefined]);
+    gate.beginPoll([a, b, c, child]);
+    expect([gate.admits(a), gate.admits(b), gate.admits(c), gate.admits(child)]).toEqual([true, true, false, true]);
+    gate.beginPoll([c]);
+    expect(gate.admits(c)).toBe(true);
+    gate.beginPoll([]);
+    expect(gate.admits(c)).toBe(false);
+    // A held event re-queued at READ_START is the NEXT iteration's.
+    const held = ev(2, 3);
+    gate.stampNext(held);
+    expect(held.gen).toBe(2);
+    gate.beginPoll([c, held]);
+    expect([gate.admits(c), gate.admits(held)]).toEqual([true, false]);
+  });
+  test("N1-UNIT-05 the host answers from its own socket's state: WRITE to a host socket its Node already destroyed answers the error it died of (here ECONNREFUSED; EPIPE when it has none), SHUTDOWN of one is ENOTCONN — SINGLE-EDIT: the destroyed-socket WRITE answered as written", async () => {
+    const memory = new WebAssembly.Memory({ initial: 1 });
+    const queued: HostEvent[] = [];
+    const host = makeNetHost({ memory: () => memory, push: (e) => queued.push(e), purge: () => {}, take: () => [], live: () => {} });
+    const probe = netCreateServer();
+    await new Promise<void>((r) => probe.listen(0, "127.0.0.1", () => r()));
+    const port = (probe.address() as { port: number }).port;
+    await new Promise<void>((r) => probe.close(() => r()));
+    const req = netConcat([netU32(port), netU32(4), netRunBytes("127.0.0.1")]);
+    new Uint8Array(memory.buffer, 0, req.length).set(req);
+    const h = host.netCall(2, 0, req.length, 0, 0);
+    for (let i = 0; i < 400 && !queued.some((e) => e.handle === h && e.kind === 2); i++) await new Promise((r) => setTimeout(r, 5));
+    expect(queued.find((e) => e.handle === h && e.kind === 2)?.a).toBe(-111);
+    expect(host.socketOf(h)?.destroyed).toBe(true);
+    new Uint8Array(memory.buffer, 0, 3).set([1, 2, 3]);
+    expect(host.netCall(5, 0, 3, h, 0)).toBe(-111);
+    expect(host.netCall(6, 0, 0, h, 0)).toBe(-107);
+    host.finish();
+  });
+  test("N1-UNIT-06 READ_STOP stops the host's reads at once (the handle's own readStop): while the peer keeps writing, the host socket buffers nothing and reads nothing until the next READ_START — SINGLE-EDIT: READ_STOP as the stream's pause()", async () => {
+    const memory = new WebAssembly.Memory({ initial: 1 });
+    const queued: HostEvent[] = [];
+    const host = makeNetHost({
+      memory: () => memory,
+      push: (e) => queued.push(e),
+      purge: () => {},
+      take: (pred) => {
+        const taken = queued.filter(pred);
+        for (const e of taken) queued.splice(queued.indexOf(e), 1);
+        return taken;
+      },
+      live: () => {},
+    });
+    const big = Buffer.alloc(1 << 16, 97);
+    const peer = netCreateServer((s) => {
+      s.on("error", () => {});
+      const pump = (): void => {
+        while (s.writable && s.write(big)) {}
+      };
+      s.on("drain", pump);
+      pump();
+    });
+    await new Promise<void>((r) => peer.listen(0, "127.0.0.1", () => r()));
+    const port = (peer.address() as { port: number }).port;
+    const req = netConcat([netU32(port), netU32(4), netRunBytes("127.0.0.1")]);
+    new Uint8Array(memory.buffer, 0, req.length).set(req);
+    const h = host.netCall(2, 0, req.length, 0, 0);
+    const until = async (p: () => boolean): Promise<void> => {
+      for (let i = 0; i < 400 && !p(); i++) await new Promise((r) => setTimeout(r, 5));
+    };
+    await until(() => queued.some((e) => e.handle === h && e.kind === 2));
+    expect(host.netCall(3, 0, 0, h, 0)).toBe(0);
+    await until(() => queued.some((e) => e.handle === h && e.kind === 3));
+    expect(host.netCall(4, 0, 0, h, 0)).toBe(0);
+    const sock = host.socketOf(h)!;
+    await new Promise((r) => setTimeout(r, 150));
+    expect(queued.filter((e) => e.handle === h && e.kind === 3).length).toBe(0);
+    expect(sock.readableLength).toBe(0);
+    expect((sock as unknown as { _handle: { reading: boolean } })._handle.reading).toBe(false);
+    expect(host.netCall(3, 0, 0, h, 0)).toBe(0);
+    await until(() => queued.some((e) => e.handle === h && e.kind === 3));
+    expect(queued.some((e) => e.handle === h && e.kind === 3)).toBe(true);
+    host.finish();
+    await new Promise<void>((r) => peer.close(() => r()));
+  });
+  test("N1-PEND-01 a shutdown with an empty write queue completes in the pending pass after the poll: 'finish' before an immediate queued beside end(), from a 'connect' and from a 'data' listener (libuv's uv__run_pending)", async () => {
+    const r = await runN1Source("// The pending phase: a shutdown with an empty write queue completes in\n// libuv's pending pass after the poll, before the check phase \u2014 so\n// 'finish' comes before an immediate queued in the same callback, from a\n// 'connect' listener and from a 'data' listener.\nimport * as net from \"node:net\";\n\nconst server = net.createServer((sock) => {\n  sock.on(\"data\", () => {});\n  sock.on(\"end\", () => sock.end());\n});\nserver.listen(0, () => {\n  const port = server.address().port;\n  const a = net.connect(port, \"127.0.0.1\", () => {\n    console.log(\"a connect\");\n    a.end();\n    setImmediate(() => console.log(\"a imm\"));\n  });\n  a.on(\"finish\", () => console.log(\"a finish\"));\n  a.on(\"data\", () => {});\n  a.on(\"close\", () => {\n    console.log(\"a close\");\n    const b = net.connect(port, \"127.0.0.1\", () => b.write(\"x\"));\n    b.on(\"data\", () => {});\n    b.on(\"finish\", () => console.log(\"b finish\"));\n    b.on(\"close\", () => {\n      console.log(\"b close\");\n      server.close();\n    });\n    let first = true;\n    server.once(\"connection\", (s2) => {\n      s2.write(\"hello\");\n    });\n    b.on(\"data\", () => {\n      if (!first) return;\n      first = false;\n      console.log(\"b data\");\n      b.end();\n      setImmediate(() => console.log(\"b imm\"));\n    });\n  });\n});\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("a connect\na finish\na imm\na close\nb data\nb finish\nb imm\nb close\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-PEND-02 the commonest shape: the server's FIN under allowHalfOpen false \u2014 the automatic end's 'finish' (and its nextTick and microtask) before the 'end' listener's immediate", async () => {
+    const r = await runN1Source("// The commonest shape: the client gets the server's FIN under\n// allowHalfOpen false; its automatic end() shuts its write side down,\n// completed in the pending pass. A nextTick, a microtask and an\n// immediate from its 'end' and 'finish' listeners.\nimport * as net from \"node:net\";\n\nconst server = net.createServer((sock) => {\n  sock.on(\"data\", () => {});\n  sock.end(\"bye\");\n  sock.on(\"close\", () => server.close());\n});\nserver.listen(0, () => {\n  const c = net.connect(server.address().port, \"127.0.0.1\");\n  const mark = (name: string): void => {\n    console.log(name);\n    process.nextTick(() => console.log(name + \":t\"));\n    Promise.resolve().then(() => console.log(name + \":m\"));\n    setImmediate(() => console.log(name + \":i\"));\n  };\n  c.on(\"data\", () => mark(\"data\"));\n  c.on(\"end\", () => mark(\"end\"));\n  c.on(\"finish\", () => mark(\"finish\"));\n  c.on(\"close\", () => mark(\"close\"));\n});\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("data\ndata:t\ndata:m\ndata:i\nend\nend:t\nend:m\nfinish\nfinish:t\nfinish:m\nend:i\nfinish:i\nclose\nclose:t\nclose:m\nclose:i\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-PEND-03 destroySoon() on a connected checked-dynamic socket: 'finish' in the pending pass, before an immediate queued beside the call", async () => {
+    const r = await runN1Source("// destroySoon() on a connected socket with nothing buffered: end(), the\n// shutdown in the pending pass, then 'finish' and the destroy \u2014 before an\n// immediate queued beside the call.\n'use strict';\nconst net = require('net');\nfunction wrap(fn) { return function () { return fn.apply(this, arguments); }; }\nconst server = net.createServer(function (sock) {\n  sock.on('data', function () {});\n  sock.on('end', function () { console.log('server end'); });\n  sock.on('close', function () { console.log('server sock close'); server.close(); });\n});\nserver.listen(0, function () {\n  const c = net.connect(server.address().port, '127.0.0.1');\n  const s = wrap(function (x) { return x; })(c);\n  c.on('connect', function () {\n    console.log('connect');\n    s.destroySoon();\n    setImmediate(function () { console.log('imm'); });\n    process.nextTick(function () { console.log('tick'); });\n  });\n  c.on('finish', function () { console.log('finish'); });\n  c.on('close', function () { console.log('close'); });\n});\n", "cjs");
+    expect(r.stdout.toString("utf8")).toBe("connect\ntick\nfinish\nimm\nclose\nserver end\nserver sock close\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-CLOSE-02 the closing phase runs the handle closed last first (libuv's closing list is LIFO): three sockets destroyed in one callback close c, b, a; two destroyed while connecting close e, d", async () => {
+    const r = await runN1Source("// The closing phase walks libuv's closing list from its head: the handle\n// closed last runs first. Three connected sockets destroyed in one\n// callback, then two sockets destroyed while still connecting.\nimport * as net from \"node:net\";\n\nconst server = net.createServer((sock) => {\n  sock.on(\"data\", () => {});\n  sock.on(\"error\", () => {});\n});\nserver.listen(0, () => {\n  const port = server.address().port;\n  let ready = 0;\n  const onReady = (): void => {\n    ready++;\n    if (ready === 3) {\n      a.destroy();\n      b.destroy();\n      c.destroy();\n    }\n  };\n  const a = net.connect(port, \"127.0.0.1\", onReady);\n  const b = net.connect(port, \"127.0.0.1\", onReady);\n  const c = net.connect(port, \"127.0.0.1\", onReady);\n  b.on(\"close\", () => console.log(\"close b\"));\n  c.on(\"close\", () => console.log(\"close c\"));\n  a.on(\"close\", () => {\n    console.log(\"close a\");\n    const d = net.connect(port, \"127.0.0.1\");\n    const e = net.connect(port, \"127.0.0.1\");\n    d.on(\"close\", () => console.log(\"close d\"));\n    e.on(\"close\", () => {\n      console.log(\"close e\");\n      server.close();\n    });\n    d.destroy();\n    e.destroy();\n  });\n});\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("close c\nclose b\nclose a\nclose e\nclose d\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-CLOSE-03 a paused-then-resumed server socket while the client ends (cend, cclose, then the server socket's close); a server closed with a callback while its connection echoes and ends", async () => {
+    const r = await runN1Source("// A paused-then-resumed server socket while the client ends; and a server\n// closed (with a callback) while a connection is live, whose socket echoes\n// and then ends. Each socket's close lands in the closing phase of the\n// loop iteration that saw its peer's end.\nimport * as net from \"node:net\";\n\nconst server = net.createServer((sock) => {\n  sock.pause();\n  setTimeout(() => {\n    console.log(\"resume\");\n    sock.resume();\n  }, 50);\n  sock.on(\"data\", (d: Buffer) => console.log(\"sdata\", d.toString()));\n  sock.on(\"end\", () => console.log(\"send\"));\n  sock.on(\"close\", () => {\n    console.log(\"close\");\n    second();\n  });\n});\nserver.listen(0, () => {\n  const c = net.connect(server.address().port, \"127.0.0.1\", () => {\n    c.end(\"hi\");\n  });\n  c.on(\"end\", () => console.log(\"cend\"));\n  c.on(\"close\", () => console.log(\"cclose\"));\n});\n\nconst second = (): void => {\n  const s2 = net.createServer((sock) => {\n    sock.on(\"data\", (d: Buffer) => {\n      sock.write(d);\n      s2.close(() => console.log(\"close cb\"));\n      s2.on(\"close\", () => console.log(\"close ev\"));\n    });\n    sock.on(\"end\", () => sock.end());\n    sock.on(\"close\", () => {\n      console.log(\"sock close\");\n      server.close();\n    });\n  });\n  s2.listen(0, () => {\n    const c2 = net.connect(s2.address().port, \"127.0.0.1\", () => c2.write(\"echo\"));\n    c2.on(\"data\", () => c2.end());\n    c2.on(\"end\", () => console.log(\"c2end\"));\n    c2.on(\"close\", () => console.log(\"c2close\"));\n  });\n};\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("resume\nsdata hi\nsend\ncend\ncclose\nclose\nclose cb\nclose ev\nsock close\nc2end\nc2close\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-BATCH-01 a server closed with a callback while its one connection echoes and ends: the client's end and close before the server socket's, then the close callback, the event and the socket's close", async () => {
+    const r = await runN1Source("// A server closed with a callback while its one connection is live; the\n// connection echoes and ends. Client and server events interleave across\n// loop iterations: each host iteration's events are one poll phase.\nimport * as net from \"node:net\";\n\nconst server = net.createServer((sock) => {\n  server.close(() => console.log(\"close cb\"));\n  server.on(\"close\", () => console.log(\"close ev\"));\n  sock.on(\"data\", (d: Buffer) => {\n    sock.write(d);\n    sock.end();\n  });\n  sock.on(\"end\", () => console.log(\"send\"));\n  sock.on(\"close\", () => console.log(\"sock close\"));\n});\nserver.listen(0, () => {\n  const c = net.connect(server.address().port, \"127.0.0.1\", () => c.write(\"x\"));\n  c.on(\"data\", (d: Buffer) => console.log(\"cdata\", d.toString()));\n  c.on(\"end\", () => console.log(\"cend\"));\n  c.on(\"close\", () => console.log(\"cclose\"));\n});\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("cdata x\ncend\ncclose\nsend\nclose cb\nclose ev\nsock close\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-BATCH-02 chunks the peer wrote from successive check phases: each 'data' callback's immediate runs before the next chunk Node read in a later iteration", async () => {
+    const r = await runN1Source("// Events the host observed in different loop iterations stay in different\n// poll phases: an immediate queued from one 'data' callback runs before\n// a chunk the next iteration read.\nimport * as net from \"node:net\";\n\nconst server = net.createServer((sock) => {\n  sock.write(\"a\");\n  setImmediate(() => {\n    sock.write(\"b\");\n    setImmediate(() => {\n      sock.write(\"c\");\n      setImmediate(() => sock.end());\n    });\n  });\n  sock.on(\"data\", () => {});\n  sock.on(\"close\", () => server.close());\n});\nserver.listen(0, () => {\n  const c = net.connect(server.address().port, \"127.0.0.1\");\n  c.on(\"data\", (d: Buffer) => {\n    const x = d.toString();\n    console.log(\"data\", x);\n    setImmediate(() => console.log(\"imm\", x));\n  });\n  c.on(\"end\", () => console.log(\"end\"));\n});\n", "ts");
+    expect(r.stdout.toString("utf8")).toBe("data ab\nimm ab\ndata c\nimm c\nend\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-REG-02 S087 (f): on a checked-dynamic Socket or Server, `in`, Object.hasOwn and Object.assign onto or from one are named Errors, and so is a non-utf8 or unknown encoding to a modelled write or end", async () => {
+    const r = await runN1Source("// S087 (f): on a checked-dynamic Socket or Server, `in`, Object.hasOwn and\n// Object.assign (onto one or from one) are named Errors, and so is an\n// encoding argument other than utf8 to a modelled write or end.\n'use strict';\nconst net = require('net');\nfunction wrap(fn) { return function () { return fn.apply(this, arguments); }; }\nconst srv = net.createServer();\nconst c = net.connect(1, '127.0.0.1');\nc.on('error', function () {});\nconst s = wrap(function (x) { return x; })(c);\nconst v = wrap(function (x) { return x; })(srv);\nfunction t(name, f) {\n  try { console.log(name, String(f())); } catch (e) { console.log(name, e.name, e.message); }\n}\nt('in', () => 'on' in s);\nt('in server', () => 'close' in v);\nt('hasOwn', () => Object.hasOwn(s, 'connecting'));\nt('assign from', () => Object.keys(Object.assign({}, s)).length);\nt('assign onto', () => Object.assign(s, { zz: 1 }) === s);\nt('assign from server', () => Object.keys(Object.assign({}, v)).length);\nt('write latin1', () => s.write('x', 'latin1'));\nt('write unknown encoding', () => s.write('x', 'nope'));\nt('end hex', () => s.end('00', 'hex') === s);\nc.destroy();\n", "cjs");
+    // Node v24.18.1 prints: "in true\nin server true\nhasOwn true\nassign from 16\nassign onto true\nassign from server 15\nwrite latin1 true\nwrite unknown encoding TypeError Unknown encoding: nope\nend hex true\n"
+    expect(r.stdout.toString("utf8")).toBe("in Error 'in' or Object.hasOwn on a net handle is not supported yet\nin server Error 'in' or Object.hasOwn on a net handle is not supported yet\nhasOwn Error 'in' or Object.hasOwn on a net handle is not supported yet\nassign from Error Object.assign from a net handle is not supported yet\nassign onto Error Object.assign onto a net handle is not supported yet\nassign from server Error Object.assign from a net handle is not supported yet\nwrite latin1 Error 'write' with an encoding other than utf8 on a net handle is not supported yet\nwrite unknown encoding Error 'write' with an encoding other than utf8 on a net handle is not supported yet\nend hex Error 'end' with an encoding other than utf8 on a net handle is not supported yet\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-REG-03 S037 (INC-29 U1 amendment): slice() of a Buffer that crossed an untyped call is a Uint8Array's slice here, a copy (Node: a view, so a write through it shows in the source); a 'data' chunk keeps the Buffer flag and its slice is a view", async () => {
+    const r = await runN1Source("// S037's INC-29 U1 amendment: a Buffer that crossed an untyped call is a\n// Uint8Array on this side, so its slice() is a copy (Node: a view, and the\n// write through it shows in the source). A 'data' chunk keeps the Buffer\n// flag, and its slice is a view.\n'use strict';\nconst net = require('net');\nfunction pass(x) { return x; }\nconst raw = pass(Buffer.from('abcd'));\nconst p = raw.slice(1, 3);\np[0] = 65;\nconsole.log('through the slice:', raw[1]);\nconst server = net.createServer(function (sock) {\n  sock.end('wxyz');\n});\nserver.listen(0, function () {\n  const c = net.connect(server.address().port, '127.0.0.1');\n  c.on('data', function (d) {\n    const q = d.slice(1, 3);\n    q[0] = 90;\n    console.log('chunk', d.toString(), q.length);\n  });\n  c.on('end', function () { server.close(); });\n});\n", "cjs");
+    // Node v24.18.1 prints "through the slice: 65" (the view).
+    expect(r.stdout.toString("utf8")).toBe("through the slice: 98\nchunk wZyz 2\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("N1-REG-01 S087 (a): a refused connect's error has no errno, syscall, address or port, and the AggregateError of a 'localhost' connect has no errors array (Node: -111 connect 127.0.0.1 <port>, and an array of two)", async () => {
+    const r = await runN1Source("// S087 (a): a connect error carries name, message and code only; the\n// AggregateError has no errors array. Node's answers are in the row.\nimport * as net from \"node:net\";\nconst srv = net.createServer();\nsrv.listen(0, \"127.0.0.1\", () => {\n  const port = srv.address().port;\n  srv.close(() => {\n    const c = net.connect(port, \"127.0.0.1\");\n    c.on(\"error\", (e: any) => {\n      console.log(e.name, e.code);\n      console.log(\"errno\", e.errno, \"syscall\", e.syscall, \"address\", e.address, \"port\", e.port === undefined);\n      const d = net.connect(port, \"localhost\");\n      d.on(\"error\", (a: any) => {\n        console.log(a.name, a.code, \"errors\", a.errors === undefined);\n      });\n    });\n  });\n});\n", "ts");
+    // Node v24.18.1 prints "errno -111 syscall connect address 127.0.0.1 port false" and "... errors false".
+    expect(r.stdout.toString("utf8")).toBe("Error ECONNREFUSED\nerrno undefined syscall undefined address undefined port true\nAggregateError ECONNREFUSED errors true\n");
+    expect(r.stderr.toString("utf8")).toBe("");
     expect(r.exitCode).toBe(0);
   }, 60000);
 });

@@ -226,7 +226,27 @@ const VEC_BUF = 1;
 export const BYTES_PAYLOAD_REF = 0;
 export const BYTES_PAYLOAD_IS_BUFFER = 1;
 
+/** INC-29 U1: the runtime HANDLE kind's own surface — present only in a
+ * module that can box a node:net Socket or Server (net modules); every
+ * other module keeps the trapping arms, byte for byte. DYN_NUM carries the
+ * handle's tag (1 Socket, 2 Server) and DYN_REF the handle itself. */
+export interface DynHandleDeps {
+  /** `(d, key) -> dyn` — a property read (null with an error pending). */
+  keyGet: () => number;
+  /** The dispatch function for `d.method(...args)` — `(d, args, what) ->
+   * dyn` — or null when the handle surface has no implementation of it. */
+  invoke: (method: string) => number | null;
+}
+
 export interface DynDeps {
+  /** INC-29 U1: see DynHandleDeps. */
+  handle?: DynHandleDeps;
+  /** INC-29 U1: Buffer / Uint8Array `slice` and `at` on a dyn BYTES value
+   * (the invoke ladder's BYTES arm for those two names) — built only where
+   * this is supplied (net modules: 2640's own dyn Buffer reads), so every
+   * other module keeps the trapping arm, byte for byte. `bufType` is the
+   * bytes storage array type. */
+  bytesMethods?: { bufType: () => number };
   /** The tier's string valtype — `(ref null (array (mut i16)))`. */
   strRef: () => ValType;
   /** The string ARRAY type index (payload casts and `array.len`). */
@@ -1529,7 +1549,19 @@ export class DynBuilder {
       // strict equality (scr_json.c:2304). Neither is constructible on
       // this tier, so neither may borrow the box-identity answer below —
       // that would be a wrong answer rather than a loud one.
-      this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => c.unreachable());
+      if (this.deps.handle !== undefined) {
+        // INC-29 U1: a handle is its payload (C's tag + pointer compare).
+        this.arm(c, K, [DK.HANDLE], () => {
+          c.localGet(0);
+          c.structGet(dynT, DYN_REF);
+          c.localGet(1);
+          c.structGet(dynT, DYN_REF);
+          c.refEq();
+        });
+        this.arm(c, K, [DK.JSVAL], () => c.unreachable());
+      } else {
+        this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => c.unreachable());
+      }
       // ARR/OBJ — and ONLY those two now (BYTES has its own arm above):
       // C's `default: return a == b` (scr_json.c:2310). Node identity is
       // the dyn tree's object identity because those kinds are never
@@ -1865,16 +1897,44 @@ export class DynBuilder {
       c.end();
 
       // HANDLE, JSVAL -> unconstructible here; trap rather than borrow an answer (A.5/0.1)
-      c.localGet(KA);
-      c.i32Const(DK.HANDLE);
-      c.i32Eq();
-      c.localGet(KA);
-      c.i32Const(DK.JSVAL);
-      c.i32Eq();
-      c.i32Or();
-      c.ifVoid();
-      c.unreachable();
-      c.end();
+      if (this.deps.handle !== undefined) {
+        // INC-29 U1: one handle equals itself; any other comparison of
+        // handles is fenced.
+        c.localGet(KA);
+        c.i32Const(DK.HANDLE);
+        c.i32Eq();
+        c.ifVoid();
+        c.localGet(A);
+        c.structGet(dynT, DYN_REF);
+        c.localGet(B);
+        c.structGet(dynT, DYN_REF);
+        c.refEq();
+        c.ifVoid();
+        c.i32Const(1);
+        c.return_();
+        c.end();
+        this.handleFence(c, "deep equality");
+        c.i32Const(0);
+        c.return_();
+        c.end();
+        c.localGet(KA);
+        c.i32Const(DK.JSVAL);
+        c.i32Eq();
+        c.ifVoid();
+        c.unreachable();
+        c.end();
+      } else {
+        c.localGet(KA);
+        c.i32Const(DK.HANDLE);
+        c.i32Eq();
+        c.localGet(KA);
+        c.i32Const(DK.JSVAL);
+        c.i32Eq();
+        c.i32Or();
+        c.ifVoid();
+        c.unreachable();
+        c.end();
+      }
 
       // BYTES -> the prototype gate (isBuffer), then content
       c.localGet(KA);
@@ -2877,7 +2937,18 @@ export class DynBuilder {
         });
         // BYTES has its OWN arm above now; HANDLE and JSVAL are still
         // unconstructible on this tier.
-        this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => c.unreachable());
+        const handle = this.deps.handle;
+        if (handle !== undefined) {
+          // INC-29 U1: the handle's own properties (net.ts).
+          this.arm(c, K, [DK.HANDLE], () => {
+            c.localGet(0);
+            c.localGet(1);
+            c.call(handle.keyGet());
+          });
+          this.arm(c, K, [DK.JSVAL], () => c.unreachable());
+        } else {
+          this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => c.unreachable());
+        }
         // NUM and BOOL have no own properties: JS reads undefined.
         c.globalGet(this.undefinedGlobal());
         this.mb.setBody(
@@ -3024,7 +3095,12 @@ export class DynBuilder {
       // REAL engine object; neither is constructible here, and neither may
       // borrow the throw below (that would be a wrong answer, not a loud
       // one).
-      this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => c.unreachable());
+      if (this.deps.handle !== undefined) {
+        this.arm(c, K, [DK.HANDLE], () => this.handleFence(c, "setting a property"));
+        this.arm(c, K, [DK.JSVAL], () => c.unreachable());
+      } else {
+        this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => c.unreachable());
+      }
       // P4 / H-2: FUNC RETIRES S016's own write-throw — `f.x = 1` now
       // lands in the enum table (a PLAIN assignment is enumerable,
       // measured — the same table `Object.defineProperties({enumerable:
@@ -3171,6 +3247,15 @@ export class DynBuilder {
         this.pushToObjectFail(c);
         c.i32Const(0);
       });
+      // INC-29 U1: a net handle's own and inherited members are not
+      // modelled as a table, so `in` and Object.hasOwn on one are fenced
+      // rather than answered false (SEMANTICS.md S087 (f)).
+      if (this.handleLive()) {
+        this.arm(c, K, [DK.HANDLE], () => {
+          this.handleFence(c, "'in' or Object.hasOwn");
+          c.i32Const(0);
+        });
+      }
       this.arm(c, K, [DK.OBJ], () => {
         this.objPayload(c, (x) => x.localGet(0));
         c.localGet(1);
@@ -3621,7 +3706,15 @@ export class DynBuilder {
       });
       // The ENGINE walks its own object in C. Neither JSVAL nor HANDLE is
       // constructible here.
-      this.arm(c, K, [DK.JSVAL, DK.HANDLE], () => c.unreachable());
+      if (this.deps.handle !== undefined) {
+        this.arm(c, K, [DK.HANDLE], () => {
+          this.handleFence(c, "walking the keys");
+          c.refNull(dynT);
+        });
+        this.arm(c, K, [DK.JSVAL], () => c.unreachable());
+      } else {
+        this.arm(c, K, [DK.JSVAL, DK.HANDLE], () => c.unreachable());
+      }
       this.pushNewArr(c);
       c.localSet(OUT);
       this.arm(c, K, [DK.OBJ], () => {
@@ -3845,6 +3938,23 @@ export class DynBuilder {
       c.end();
       // An ENGINE target runs the copy engine-side in C; unconstructible.
       this.arm(c, K, [DK.JSVAL], () => c.unreachable());
+      // INC-29 U1: a net handle as the target or a source is fenced
+      // (SEMANTICS.md S087 (f)) — copying nothing would be a silent wrong
+      // answer either way.
+      const handleSide = (side: number, what: string): void => {
+        if (!this.handleLive()) return;
+        c.localGet(side);
+        c.structGet(dynT, DYN_KIND);
+        c.i32Const(DK.HANDLE);
+        c.i32Eq();
+        c.ifVoid();
+        this.deps.throwError(c, "%Error", "Error", (x) => this.deps.lit(x, `Object.assign ${what} a net handle is not supported yet`));
+        c.refNull(dynT);
+        c.return_();
+        c.end();
+      };
+      handleSide(0, "onto");
+      handleSide(1, "from");
       c.localGet(K);
       c.i32Const(DK.OBJ);
       c.i32Ne();
@@ -4460,7 +4570,12 @@ export class DynBuilder {
         c.end();
       });
       // Unconstructible on this tier (the header): no guess at them.
-      this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => c.unreachable());
+      if (this.deps.handle !== undefined) {
+        this.arm(c, K, [DK.HANDLE], () => this.handleFence(c, "spreading"));
+        this.arm(c, K, [DK.JSVAL], () => c.unreachable());
+      } else {
+        this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => c.unreachable());
+      }
       this.arm(c, K, [DK.UNDEF, DK.NULL, DK.BOOL, DK.NUM, DK.OBJ, DK.FUNC, DK.PROMISE], () => {
         c.localGet(3);
         c.ifVoid();
@@ -4627,8 +4742,12 @@ export class DynBuilder {
       this.arm(c, K, [DK.JSVAL], () => this.deps.lit(c, "an island value"));
       // HANDLE alone is left: C answers the handle's runtime class name
       // ("got IncomingMessage"), a registry lookup with no producer on
-      // this tier.
-      c.unreachable();
+      // this tier. INC-29 U1: a node:net handle names its class.
+      if (this.deps.handle !== undefined) {
+        this.handleClassName(c, () => c.localGet(0), "");
+      } else {
+        c.unreachable();
+      }
       this.mb.setBody(idx, [I32], c.bytes());
     });
   }
@@ -4805,7 +4924,12 @@ export class DynBuilder {
         this.deps.lit(c, "an instance of Uint8Array");
         c.end();
       });
-      // HANDLE and JSVAL are what's left — see the header note.
+      // HANDLE and JSVAL are what's left — see the header note. INC-29
+      // U1: a node:net handle is determineSpecificType's "an instance of
+      // <constructor name>".
+      if (this.deps.handle !== undefined) {
+        this.arm(c, K, [DK.HANDLE], () => this.handleClassName(c, () => c.localGet(0), "an instance of "));
+      }
       c.unreachable();
       this.mb.setBody(idx, [I32, F64, this.deps.strRef()], c.bytes());
     });
@@ -5660,6 +5784,30 @@ export class DynBuilder {
    * — the header comment below the OLD radix-fence framing is corrected
    * at its own site, not here). */
   private static readonly NUM_METHODS = new Set(["toFixed", "toString", "toPrecision"]);
+
+  /** INC-29 U1: does this module box node:net handles? */
+  handleLive(): boolean {
+    return this.deps.handle !== undefined;
+  }
+
+  /** INC-29 U1: the loud fence for an operation the handle surface does
+   * not model (a plain Error, the invoke ladder's own stance). */
+  private handleFence(c: Code, what: string): void {
+    this.deps.throwError(c, "%Error", "Error", (x) => this.deps.lit(x, `${what} on a net handle is not supported yet`));
+  }
+
+  /** INC-29 U1: push the handle's class name from its tag in DYN_NUM. */
+  private handleClassName(c: Code, d: () => void, prefix: string): void {
+    d();
+    c.structGet(this.dynT(), DYN_NUM);
+    c.f64Const(1);
+    c.f64Eq();
+    c.ifResult(this.deps.strRef());
+    this.deps.lit(c, `${prefix}Socket`);
+    c.else_();
+    this.deps.lit(c, `${prefix}Server`);
+    c.end();
+  }
 
   /** %w.dyn.notFn(what) — Node's catchable "<what> is not a function",
    * `dyn_throw_not_fn`. The CALLER pushes the null result and returns. */
@@ -7813,7 +7961,162 @@ export class DynBuilder {
         // arms cannot be reached — and a trap says so, where the
         // is-not-a-function tail below would be a quiet wrong answer for
         // the names their prototypes really do declare.
-        this.arm(c, K, [DK.BYTES, DK.HANDLE, DK.JSVAL], () => c.unreachable());
+        const bytesMethods = this.deps.bytesMethods;
+        if (bytesMethods !== undefined && (method === "slice" || method === "at")) {
+          // INC-29 U1: Buffer.prototype.slice (a VIEW: adjustOffset's
+          // clamps, the bytes shared) or TypedArray.prototype.slice (a
+          // copy) by the payload's Buffer flag, and
+          // TypedArray.prototype.at. Index arguments are numbers (idxArg
+          // fences any other kind, loudly).
+          this.arm(c, K, [DK.BYTES], () => {
+            const bt = this.deps.bytesTypeU8();
+            const bufT = bytesMethods.bufType();
+            const bytes = (x: Code): void => this.bytesPayloadBytes(x, (y) => y.localGet(0));
+            this.bytesLenI32(c, bytes);
+            c.localSet(N);
+            c.localGet(1);
+            c.i32Const(0);
+            c.f64Const(0);
+            c.f64Const(0);
+            c.f64Const(0);
+            c.localGet(2);
+            c.call(this.idxArg());
+            c.localSet(F0);
+            bailIfPending();
+            if (method === "at") {
+              c.localGet(F0);
+              c.f64Const(0);
+              c.f64Lt();
+              c.ifVoid();
+              c.localGet(N);
+              c.f64ConvertI32U();
+              c.localGet(F0);
+              c.f64Add();
+              c.localSet(F0);
+              c.end();
+              c.localGet(F0);
+              c.f64Const(0);
+              c.f64Lt();
+              c.localGet(F0);
+              c.localGet(N);
+              c.f64ConvertI32U();
+              c.f64Ge();
+              c.i32Or();
+              c.ifVoid();
+              c.globalGet(this.undefinedGlobal());
+              c.return_();
+              c.end();
+              this.boxNum(c, (x) => {
+                bytes(x);
+                x.localGet(F0);
+                x.call(this.deps.bytesGet());
+              });
+              return;
+            }
+            c.localGet(1);
+            c.i32Const(1);
+            c.localGet(N);
+            c.f64ConvertI32U();
+            c.localGet(N);
+            c.f64ConvertI32U();
+            c.f64Const(0);
+            c.localGet(2);
+            c.call(this.idxArg());
+            c.localSet(F1);
+            bailIfPending();
+            c.localGet(F0);
+            c.localGet(N);
+            c.call(this.relIdx());
+            c.localSet(I);
+            c.localGet(F1);
+            c.localGet(N);
+            c.call(this.relIdx());
+            c.localSet(J);
+            c.localGet(J);
+            c.localGet(I);
+            c.i32Sub();
+            c.localTee(B);
+            c.i32Const(0);
+            c.i32LtS();
+            c.ifVoid();
+            c.i32Const(0);
+            c.localSet(B);
+            c.end();
+            this.bytesPayload(c, (x) => x.localGet(0));
+            c.structGet(this.bytesPayloadT(), BYTES_PAYLOAD_IS_BUFFER);
+            c.ifResult(this.dynRef());
+            // A Buffer: the view.
+            this.boxBytes(c, (x) => {
+              this.pushNewBytesPayload(
+                x,
+                (y) => {
+                  bytes(y);
+                  y.structGet(bt, 0);
+                  bytes(y);
+                  y.structGet(bt, 1);
+                  y.localGet(I);
+                  y.i32Add();
+                  y.localGet(B);
+                  y.structNew(bt);
+                },
+                (y) => y.i32Const(1),
+              );
+            });
+            c.else_();
+            // No Buffer flag: a Uint8Array, so TypedArray.prototype.slice,
+            // a copy. A Buffer that crossed the generic path is a
+            // Uint8Array on this side (SEMANTICS.md S037), so it slices as
+            // one too — a copy where Node's Buffer slice is a view (S037's
+            // INC-29 U1 amendment registers it).
+            this.boxBytes(c, (x) => {
+              this.pushNewBytesPayload(
+                x,
+                (y) => {
+                  y.localGet(B);
+                  y.arrayNewDefault(bufT);
+                  y.refAsNonNull();
+                  y.i32Const(0);
+                  y.localGet(B);
+                  y.structNew(bt);
+                },
+                (y) => y.i32Const(0),
+              );
+            });
+            c.localTee(E);
+            this.bytesPayloadBytes(c, (x) => x.localGet(E));
+            c.structGet(bt, 0);
+            c.i32Const(0);
+            bytes(c);
+            c.structGet(bt, 0);
+            bytes(c);
+            c.structGet(bt, 1);
+            c.localGet(I);
+            c.i32Add();
+            c.localGet(B);
+            c.arrayCopy(bufT, bufT);
+            c.end();
+          });
+        }
+        const handle = this.deps.handle;
+        if (handle !== undefined) {
+          // INC-29 U1: a node:net handle's own members (net.ts), or the
+          // loud fence for one it does not model.
+          this.arm(c, K, [DK.HANDLE], () => {
+            const h = handle.invoke(method);
+            if (h !== null) {
+              c.localGet(0);
+              c.localGet(1);
+              c.localGet(2);
+              c.call(h);
+            } else {
+              this.handleFence(c, `'${method}'`);
+              c.refNull(dynT);
+            }
+          });
+          this.arm(c, K, [DK.BYTES, DK.JSVAL], () => c.unreachable());
+        } else {
+          this.arm(c, K, [DK.BYTES, DK.HANDLE, DK.JSVAL], () => c.unreachable());
+        }
 
         // NUM, BOOL, PROMISE, and FUNC/ARR/STR for the names their own
         // prototypes do not declare: JS's own answer.

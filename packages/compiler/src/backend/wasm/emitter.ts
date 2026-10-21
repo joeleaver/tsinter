@@ -134,6 +134,7 @@ import {
   IMPORT_CP_CALL,
   IMPORT_EV_POLL,
   IMPORT_EXIT,
+  IMPORT_NET_CALL,
   IMPORT_FS_CALL,
   IMPORT_HOST_NUM,
   IMPORT_HOST_STR,
@@ -172,6 +173,7 @@ import { FsBuilder } from "./fs.js";
 import { FsLaddersBuilder } from "./fs-ladders.js";
 import { ChildProcBuilder, SR_ERR_CODE, SR_HAS_STATUS, SR_SIGNAL, SR_STATUS, SR_STDERR, SR_STDOUT } from "./childproc.js";
 import { CH_CODE, CH_ERR, CH_HAS_PID, CH_KILLED, CH_OUT, CH_PID, CH_STATE, ChildAsyncBuilder } from "./childasync.js";
+import { NET_LISTS, NetBuilder, type NetList } from "./net.js";
 import { MapBuilder, type MapInfo, type MapKeyKind, type MapValKind } from "./maps.js";
 import { JsonBuilder, jsonQuote } from "./json.js";
 import {
@@ -992,7 +994,13 @@ function fsCallReachable(mod: WModule): boolean {
  * kill with a number (Node's ERR_UNKNOWN_SIGNAL for a number naming no
  * signal; child.kill with a name is already on the shared list). */
 function spawnSyncMayThrowView(mod: WModule): WModule {
-  const keys = new Set(["cp.spawnSync", "cp.spawnSyncOpts", "cp.spawnSyncStdioStr", "cp.spawn", "cp.spawnOpts", "child.killNum"]);
+  // INC-29 U1: node:net's synchronous throws on this tier — listen's
+  // ERR_SERVER_ALREADY_LISTEN and port check, connect's host and port
+  // checks, and server.address().port before a listen (null.port).
+  const keys = new Set([
+    "cp.spawnSync", "cp.spawnSyncOpts", "cp.spawnSyncStdioStr", "cp.spawn", "cp.spawnOpts", "child.killNum",
+    "net.listen", "net.listenCb", "net.listenOpts", "net.listenOptsCb", "net.connect", "net.connectCb", "net.serverPort",
+  ]);
   let found = false;
   const scan = (node: unknown): void => {
     if (found) return;
@@ -1010,13 +1018,20 @@ function spawnSyncMayThrowView(mod: WModule): WModule {
     }
   };
   scan(mod.functions);
-  if (!found) return mod;
+  const netKeys = netModuleReachable(mod);
+  if (!found && !netKeys) return mod;
   const copy = (node: unknown): unknown => {
     if (Array.isArray(node)) return node.map(copy);
     if (node !== null && typeof node === "object") {
       const out: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(node as Record<string, unknown>)) out[k] = copy(v);
       if (out["kind"] === "libCall" && typeof out["fn"] === "string" && keys.has(out["fn"])) out["fn"] = "cp.execSync";
+      // INC-29 U1 (review): in a module that boxes net handles, `in` on a
+      // checked-dynamic value can throw (the handle fence), so it reads as
+      // a throwing call here.
+      if (out["kind"] === "dynHasKey" && netKeys) {
+        return { kind: "libCall", fn: "cp.execSync", args: [out["value"]], type: out["type"], loc: out["loc"] };
+      }
       return out;
     }
     return node;
@@ -1094,6 +1109,61 @@ function eventModuleReachable(mod: WModule): boolean {
   for (const fn of mod.functions) {
     if (reachable.has(fn.name)) scan(fn.body);
   }
+  return found;
+}
+
+/** INC-29 U1: is this a NET MODULE — does any reachable function call a
+ * node:net libCall that can start host I/O? Such a module imports
+ * `netCall` (and `evPoll`) and exports `_loop` (abi.ts). Keyed on libCall
+ * NODES (never a string literal that happens to spell a key), and the
+ * three keys that never reach the host are left out: the attempt-budget
+ * pair (a module global) and the runtime option-bag check (it always
+ * throws). */
+function netModuleReachable(mod: WModule): boolean {
+  const reachable = reachableFunctionNames(mod);
+  const pure = new Set(["net.getAutoSelTimeout", "net.setAutoSelTimeout", "net.connectOptsChk"]);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      const rec = node as Record<string, unknown>;
+      if (rec["kind"] === "libCall" && typeof rec["fn"] === "string" && rec["fn"].startsWith("net.") && !pure.has(rec["fn"])) {
+        found = true;
+        return;
+      }
+      for (const value of Object.values(rec)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn.body);
+  }
+  return found;
+}
+
+/** INC-29 U1: does any function set a net.Server's close override
+ * (`server.close = fn`)? */
+function closeOverrideReachable(mod: WModule): boolean {
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      const rec = node as Record<string, unknown>;
+      if (rec["kind"] === "libCall" && rec["fn"] === "net.serverSetCloseOverride") {
+        found = true;
+        return;
+      }
+      for (const value of Object.values(rec)) scan(value);
+    }
+  };
+  scan(mod.functions);
   return found;
 }
 
@@ -2123,6 +2193,16 @@ class Assembler {
   private readonly eventModule: boolean;
   /** INC-28 U3: the module pipes a child's output (pipeModuleReachable). */
   private readonly pipeModule: boolean;
+  /** INC-29 U1: the module reaches node:net's host I/O (netModuleReachable):
+   * an event module whose poll phase reads the net kinds (net.ts). */
+  private readonly netModule: boolean;
+  /** INC-29 U1: the module reaches cp.spawn / cp.spawnOpts (the INC-28 U2
+   * event-module condition, before net joined it). */
+  private readonly cpEventModule: boolean;
+  /** INC-29 U1: some function sets a server's close override. */
+  private readonly closeOverride: boolean;
+  /** INC-29 U1: `tsinter.netCall`'s index, or null outside a net module. */
+  private readonly netCallFunc: number | null;
   /** The exit-drain gate's static fact — see exitListenerSurfaceReachable's
    * own comment (INC-26 P1). Computed ONCE in the constructor; every drain
    * gate site reads this, never the mutable `procField`/
@@ -2246,8 +2326,11 @@ class Assembler {
     // timers do, so it widens `now`'s minting condition rather than
     // getting a clock of its own — `timers.*` (prefix) OR `perf.now`
     // (exact), the same over-approximation stance as before.
+    // INC-29 U1: a net module's `_loop` is built from the timer runtime,
+    // which reads `now`, whether or not the program arms a timer itself.
+    const netMod = netModuleReachable(mod);
     this.nowFunc =
-      timerSurfaceReachable(mod) || perfNowReachable(mod)
+      timerSurfaceReachable(mod) || perfNowReachable(mod) || netMod
         ? this.mb.importFunc(IMPORT_MODULE, IMPORT_NOW, this.mb.funcType([], [F64]))
         : null;
     // `seed`'s twin decision (INC-25 P1, abi.ts §8.1): present only in
@@ -2311,10 +2394,20 @@ class Assembler {
       : null;
     // `evPoll`'s decision (INC-28 U2, abi.ts): the host's event queue, in
     // event modules only, minted LAST so no earlier import index moves.
-    this.eventModule = eventModuleReachable(mod);
+    this.cpEventModule = eventModuleReachable(mod);
+    this.netModule = netMod;
+    this.closeOverride = closeOverrideReachable(mod);
+    // INC-29 U1: a net module is an event module too.
+    this.eventModule = this.cpEventModule || netMod;
     this.pipeModule = pipeModuleReachable(mod);
     this.evPollFunc = this.eventModule
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_EV_POLL, this.mb.funcType([I32, I32], [I32]))
+      : null;
+    // `netCall`'s decision (INC-29 U1, abi.ts): ONE op-dispatched import for
+    // node:net's OS-level operations, minted after evPoll so no earlier
+    // import index moves.
+    this.netCallFunc = netMod
+      ? this.mb.importFunc(IMPORT_MODULE, IMPORT_NET_CALL, this.mb.funcType([I32, I32, I32, I32, I32], [I32]))
       : null;
     // ── end INC-26 host-import block ──
     // The exit-drain gate's STATIC fact (see exitListenerSurfaceReachable's
@@ -3593,6 +3686,16 @@ class Assembler {
     ret();
     c.end();
     // HANDLE and JSVAL are unconstructible on this tier (dyn.ts header).
+    // INC-29 U1: a node:net handle does not clone (Node's DataCloneError
+    // names it; this tier fences it, loudly).
+    if (this.netModule) {
+      kindIn([DK.HANDLE]);
+      c.ifVoid();
+      this.emitSetCellError(c, "%Error", "Error", (x) => this.pushStrLitInto(x, "structuredClone of a net handle is not supported yet"), null);
+      c.refNull(dynT);
+      ret();
+      c.end();
+    }
     kindIn([DK.HANDLE, DK.JSVAL]);
     c.ifVoid();
     c.unreachable();
@@ -5844,8 +5947,21 @@ class Assembler {
       drainAtQuiescence: (c) => this.emitImplicitDrainAndCheck(c),
       // INC-28 U2: an event module's poll phase and its third liveness
       // term (read only when `_loop` is built).
-      poll: (c) => c.call(this.cpa.pollHelper()),
-      childRefLive: () => this.cpa.refLiveGlobal(),
+      // INC-29 U1: a net module's poll phase, liveness and closing phase
+      // are net.ts's instead (a module with both surfaces refuses).
+      ...(this.netModule
+        ? {
+            poll: (c: Code) => c.call(this.net.pollHelper()),
+            netAlive: (c: Code) => c.call(this.net.aliveHelper()),
+            closing: (c: Code) => c.call(this.net.closingHelper()),
+            closingPending: (c: Code) => c.call(this.net.closingPendingHelper()),
+            pending: (c: Code) => c.call(this.net.pendingHelper()),
+            pendingQueued: (c: Code) => c.call(this.net.pendingQueuedHelper()),
+          }
+        : {
+            poll: (c: Code) => c.call(this.cpa.pollHelper()),
+            childRefLive: () => this.cpa.refLiveGlobal(),
+          }),
     });
     return this.timersField;
   }
@@ -7548,6 +7664,13 @@ class Assembler {
 
   private get dyn(): DynBuilder {
     this.dynField ??= new DynBuilder(this.mb, {
+      // INC-29 U1: a net module boxes its Sockets and Servers as HANDLEs.
+      ...(this.netModule
+        ? {
+            handle: { keyGet: () => this.netHandleKeyGetFn(), invoke: (m: string) => this.netHandleInvokeFn(m) },
+            bytesMethods: { bufType: () => this.bytesB.bufType() },
+          }
+        : {}),
       strRef: () => this.strRef,
       strType: () => this.strType,
       strEq: () => this.strEqHelper(),
@@ -8125,6 +8248,1608 @@ class Assembler {
       toStr: (enc) => this.bytesB.toStrHelper(enc),
     });
     return this.strdecField;
+  }
+
+  /* ── INC-29 U1 — node:net (net.ts; abi.ts netCall, evPoll source 2) ── */
+
+  private netField: NetBuilder | null = null;
+
+  /** `this.netCallFunc`, or a descriptive throw (cpCallFuncOrThrow's
+   * shape). */
+  private netCallFuncOrThrow(): number {
+    if (this.netCallFunc === null) {
+      throw new Error("emitter bug: a node:net key was reached but tsinter.netCall was never imported");
+    }
+    return this.netCallFunc;
+  }
+
+  /** The net builder (net.ts): net.Server and net.Socket. */
+  private get net(): NetBuilder {
+    this.netField ??= new NetBuilder(this.mb, {
+      strRef: () => this.strRef,
+      strType: () => this.strType,
+      netCallFunc: () => this.netCallFuncOrThrow(),
+      evPollFunc: () => this.evPollFuncOrThrow(),
+      ensureCapacity: (c, need) => this.emitEnsureCapacity(c, need),
+      stageCursor: () => this.cursorGlobal,
+      pushStrLit: (c, value) => this.pushStrLitInto(c, value),
+      namedTrap: (c, message) => {
+        const exc = this.exc();
+        this.pushStrLitInto(c, message);
+        c.globalSet(exc.refG);
+        c.i32Const(EXC_STR);
+        c.globalSet(exc.kindG);
+        c.call(this.reportUncaughtHelper());
+      },
+      concat: () => this.concatHelper(),
+      f64ToStr: () => this.f64ToStrHelper(),
+      codeName: () => this.cp.codeNameHelper(),
+      stageRun: () => this.cp.stageRunHelper(),
+      voidClos: () => this.closPairFor([], []),
+      errClos: () => this.closPairFor([{ kind: "ref", nullable: true, typeIndex: this.exc().errT }], []),
+      dataClos: () => this.closPairFor([this.bytesB.bytesRef()], []),
+      sockClos: () => this.closPairFor([this.net.sockRef()], []),
+      nextTickEnqueue: () => this.nextTick.enqueue(),
+      excKind: () => this.exc().kindG,
+      reportUncaught: () => this.reportUncaughtHelper(),
+      checkpoint: (c) => this.emitCheckpoint(c),
+      errType: () => this.exc().errT,
+      newError: (c, className, name, pushMessage, pushCode) => {
+        const exc = this.exc();
+        c.globalGet(this.classes.vtGlobal(className));
+        this.pushStrLitInto(c, name);
+        pushMessage(c);
+        pushCode(c);
+        c.structNew(exc.errT);
+      },
+      throwStack: (c) => {
+        const exc = this.exc();
+        const tmp = this.netThrowTmpGlobal();
+        c.globalSet(tmp);
+        c.globalGet(tmp);
+        c.globalSet(exc.refG);
+        c.globalGet(tmp);
+        c.structGet(exc.errT, 0);
+        c.structGet(this.classes.ci(), CI_PRE);
+        c.globalSet(exc.preG);
+        c.i32Const(EXC_OBJ);
+        c.globalSet(exc.kindG);
+      },
+      bytesType: () => this.bytesB.bytesType(),
+      bufType: () => this.bytesB.bufType(),
+      strToBytes: () => this.bytesB.fromStrHelper("utf8"),
+      numReceived: () => this.bytesB.numReceivedHelper(),
+      inspectStr: () => this.insp.str(),
+      dynRef: () => this.dyn.dynRef(),
+      attemptCheck: () => this.emitNetAttemptCheckFn(),
+    });
+    return this.netField;
+  }
+
+  private netThrowTmpField: number | null = null;
+
+  /** The error being thrown, between the two reads throwStack needs. */
+  private netThrowTmpGlobal(): number {
+    const errT = this.exc().errT;
+    this.netThrowTmpField ??= this.mb.addGlobal({ kind: "ref", nullable: true, typeIndex: errT }, true, (w) => {
+      w.u8(0xd0);
+      w.sleb(errT);
+    });
+    return this.netThrowTmpField;
+  }
+
+  /** INC-29 U1: the listener ADAPTER for a user callback of type `cbType`
+   * on a 'data' list (the fixed (Buffer) closure) or a 'connection' list
+   * (the fixed (Socket) closure): a function of the fixed type whose
+   * environment holds the user's closure, which it calls with nothing,
+   * or the value boxed for a `dyn` parameter. Interned per callback
+   * type. */
+  private readonly netAdapterFns = new Map<string, { fn: number; env: number }>();
+
+  private netAdapterFor(kind: "data" | "sock", cbType: IrType & { kind: "func" }, loc: SrcLoc | undefined): { fn: number; env: number } | null {
+    const user = this.closSigFor(cbType, loc);
+    if (user === null) return null;
+    const p = cbType.params[0];
+    const key = `${kind}:${user.clos}:${p === undefined ? "-" : p.kind}`;
+    const hit = this.netAdapterFns.get(key);
+    if (hit !== undefined) return hit;
+    const fixedParam = kind === "data" ? this.bytesB.bytesRef() : this.net.sockRef();
+    const fixed = this.closPairFor([fixedParam], []);
+    let box: number | null = null;
+    if (p !== undefined) {
+      if (p.kind === "dyn") {
+        box = kind === "data" ? this.netBoxBufferFn() : this.dynFromHelper({ kind: "netSocket" }, loc);
+        if (box === null) return null;
+      } else {
+        this.refuse(`libCall:net.listener:${kind}:${p.kind}`, loc);
+        return null;
+      }
+    }
+    const env = this.mb.subStructType(
+      `netAdapterEnv:${key}`,
+      [
+        { storage: { kind: "ref", nullable: false, typeIndex: fixed.fn }, mutable: false },
+        { storage: { kind: "ref", nullable: true, typeIndex: user.clos }, mutable: false },
+      ],
+      fixed.clos,
+    );
+    const fn = this.mb.declareFunc(fixed.fn, `%w.net.adapter.${this.netAdapterFns.size}`);
+    const made = { fn, env };
+    this.netAdapterFns.set(key, made);
+    const c = new Code();
+    const U = 2;
+    c.localGet(0);
+    c.refCast(env);
+    c.structGet(env, 1);
+    c.localSet(U);
+    c.localGet(U);
+    if (p !== undefined) {
+      c.localGet(1);
+      if (box !== null) c.call(box);
+    }
+    c.localGet(U);
+    c.structGet(user.clos, 0);
+    c.callRef(user.fn);
+    this.mb.setBody(fn, [{ kind: "ref", nullable: true, typeIndex: user.clos }], c.bytes());
+    return made;
+  }
+
+  /** Push the listener closure for `cbExpr` on a list taking `arg`, or
+   * false (refused). A callback already of the list's own closure type is
+   * stored as it is. */
+  private emitNetListener(cbExpr: WExpr, arg: NetList["arg"], fnName: string, loc: SrcLoc | undefined): boolean {
+    const code = this.fn.code;
+    const cbType = cbExpr.type;
+    if (cbType.kind !== "func" || cbType.ret.kind !== "void") {
+      this.refuse(`libCall:${fnName}:callback-shape`, loc);
+      return false;
+    }
+    if (cbType.rest === true) {
+      this.refuse(cbType.restAbi === "jsval" ? "type:func-rest-jsval" : "type:func-rest", loc);
+      return false;
+    }
+    const p = cbType.params[0];
+    if (cbType.params.length > 1) {
+      this.refuse(`libCall:${fnName}:callback-shape`, loc);
+      return false;
+    }
+    if (arg === "void") {
+      if (p !== undefined) {
+        this.refuse(`libCall:${fnName}:callback-shape`, loc);
+        return false;
+      }
+      this.walkExpr(cbExpr);
+      return true;
+    }
+    if (arg === "err") {
+      const adapter = this.errorAdapterFor(cbType, loc);
+      if (adapter === null) return false;
+      this.mb.declareFuncRef(adapter.fn);
+      code.refFunc(adapter.fn);
+      this.walkExpr(cbExpr);
+      code.structNew(adapter.env);
+      return true;
+    }
+    const direct = arg === "data" ? p?.kind === "bytes" && p.elem === "u8" : p?.kind === "netSocket";
+    if (direct) {
+      this.walkExpr(cbExpr);
+      return true;
+    }
+    const adapter = this.netAdapterFor(arg, cbType, loc);
+    if (adapter === null) return false;
+    this.mb.declareFuncRef(adapter.fn);
+    code.refFunc(adapter.fn);
+    this.walkExpr(cbExpr);
+    code.structNew(adapter.env);
+    return true;
+  }
+
+  /** The `on`/`once` literal of a listener libCall, or null (refused). */
+  private netOnce(arg: WExpr | undefined, fnName: string, loc: SrcLoc | undefined): boolean | null {
+    if (arg === undefined) return false;
+    if (arg.kind !== "boolLit") {
+      this.refuse(`libCall:${fnName}:dynamic-once`, loc);
+      return null;
+    }
+    return arg.value;
+  }
+
+  /** Push a `(() => void) | undefined` union (or a plain `() => void`, or
+   * nothing) as a nullable void closure. */
+  private emitNetOptionalVoidCb(cbExpr: WExpr | undefined, fnName: string, loc: SrcLoc | undefined): boolean {
+    const code = this.fn.code;
+    const pair = this.closPairFor([], []);
+    if (cbExpr === undefined) {
+      code.refNull(pair.clos);
+      return true;
+    }
+    const t = cbExpr.type;
+    if (t.kind === "func") return this.emitNetListener(cbExpr, "void", fnName, loc);
+    if (t.kind === "union") {
+      const def = this.unionDef(t.unionId);
+      const fTag = def.arms.findIndex((a) => a.kind === "func" && a.params.length === 0 && a.ret.kind === "void");
+      const uTag = def.arms.findIndex((a) => a.kind === "undefinedT");
+      const armSt = fTag < 0 ? null : this.unionArmStruct(t.unionId, fTag, loc);
+      if (def.arms.length !== 2 || fTag < 0 || uTag < 0 || armSt === null) {
+        this.refuse(`libCall:${fnName}:callback-shape`, loc);
+        return false;
+      }
+      const U = this.acquireScratch(this.unions.baseRef());
+      this.walkExpr(cbExpr);
+      code.localTee(U);
+      code.structGet(this.unions.base(), 0);
+      code.i32Const(fTag);
+      code.i32Eq();
+      this.openIfResult({ kind: "ref", nullable: true, typeIndex: pair.clos });
+      code.localGet(U);
+      code.refCast(armSt);
+      code.structGet(armSt, 1);
+      code.else_();
+      code.refNull(pair.clos);
+      this.close();
+      this.releaseScratch(this.unions.baseRef(), U);
+      return true;
+    }
+    this.refuse(`libCall:${fnName}:callback-shape`, loc);
+    return false;
+  }
+
+  /** The bound close (`server.close.bind(server)` as a value): a closure
+   * of the call site's own `(cb?) => void | Server` type over the server,
+   * running the REAL close with the callback's function arm (or none). */
+  private readonly netCloseBindFns = new Map<string, { fn: number; env: number }>();
+
+  private netCloseBindFor(t: IrType & { kind: "func" }, loc: SrcLoc | undefined): { fn: number; env: number; pair: { clos: number; fn: number } } | null {
+    const pair = this.closSigFor(t, loc);
+    if (pair === null) return null;
+    const u = t.params[0];
+    if (u === undefined || u.kind !== "union" || t.params.length !== 1 || (t.ret.kind !== "void" && t.ret.kind !== "netServer")) {
+      this.refuse("libCall:net.serverCloseBind:shape", loc);
+      return null;
+    }
+    const def = this.unionDef(u.unionId);
+    const fTag = def.arms.findIndex((a) => a.kind === "func");
+    const fArm = def.arms[fTag];
+    if (fArm === undefined || fArm.kind !== "func" || fArm.params.length !== 0 || fArm.ret.kind !== "void") {
+      // A callback taking the error: Node's ERR_SERVER_NOT_RUNNING reaches
+      // it on a server that is not listening; not built.
+      this.refuse("libCall:net.serverCloseBind:err-callback", loc);
+      return null;
+    }
+    const armSt = this.unionArmStruct(u.unionId, fTag, loc);
+    if (armSt === null) return null;
+    const key = `${pair.clos}`;
+    const hit = this.netCloseBindFns.get(key);
+    if (hit !== undefined) return { ...hit, pair };
+    const env = this.mb.subStructType(
+      `netCloseBindEnv:${key}`,
+      [
+        { storage: { kind: "ref", nullable: false, typeIndex: pair.fn }, mutable: false },
+        { storage: this.net.srvRef(), mutable: false },
+      ],
+      pair.clos,
+    );
+    const fn = this.mb.declareFunc(pair.fn, `%w.net.closeBind.${this.netCloseBindFns.size}`);
+    this.netCloseBindFns.set(key, { fn, env });
+    const vpair = this.closPairFor([], []);
+    const c = new Code();
+    const V = 2;
+    c.localGet(0);
+    c.refCast(env);
+    c.structGet(env, 1);
+    c.localSet(V);
+    c.localGet(V);
+    c.localGet(1);
+    c.structGet(this.unions.base(), 0);
+    c.i32Const(fTag);
+    c.i32Eq();
+    c.ifResult({ kind: "ref", nullable: true, typeIndex: vpair.clos });
+    c.localGet(1);
+    c.refCast(armSt);
+    c.structGet(armSt, 1);
+    c.else_();
+    c.refNull(vpair.clos);
+    c.end();
+    c.call(this.net.srvCloseHelper());
+    if (t.ret.kind === "netServer") c.localGet(V);
+    this.mb.setBody(fn, [this.net.srvRef()], c.bytes());
+    return { fn, env, pair };
+  }
+
+  /** The close override's zero-argument wrapper: calls the user function
+   * with the `undefined` arm of its callback union. */
+  private readonly netOverrideFns = new Map<string, { fn: number; env: number }>();
+
+  private netOverrideFor(t: IrType & { kind: "func" }, loc: SrcLoc | undefined): { fn: number; env: number } | null {
+    const user = this.closSigFor(t, loc);
+    if (user === null) return null;
+    const u = t.params[0];
+    if (u === undefined || u.kind !== "union" || t.params.length !== 1) {
+      this.refuse("libCall:net.serverSetCloseOverride:shape", loc);
+      return null;
+    }
+    const def = this.unionDef(u.unionId);
+    const uTag = def.arms.findIndex((a) => a.kind === "undefinedT");
+    if (uTag < 0) {
+      this.refuse("libCall:net.serverSetCloseOverride:shape", loc);
+      return null;
+    }
+    const key = `${user.clos}`;
+    const hit = this.netOverrideFns.get(key);
+    if (hit !== undefined) return hit;
+    const vpair = this.closPairFor([], []);
+    const env = this.mb.subStructType(
+      `netOverrideEnv:${key}`,
+      [
+        { storage: { kind: "ref", nullable: false, typeIndex: vpair.fn }, mutable: false },
+        { storage: { kind: "ref", nullable: true, typeIndex: user.clos }, mutable: false },
+      ],
+      vpair.clos,
+    );
+    const fn = this.mb.declareFunc(vpair.fn, `%w.net.override.${this.netOverrideFns.size}`);
+    const made = { fn, env };
+    this.netOverrideFns.set(key, made);
+    const c = new Code();
+    const U = 1;
+    c.localGet(0);
+    c.refCast(env);
+    c.structGet(env, 1);
+    c.localSet(U);
+    c.localGet(U);
+    c.globalGet(this.unions.unitGlobal(uTag));
+    c.localGet(U);
+    c.structGet(user.clos, 0);
+    c.callRef(user.fn);
+    if (t.ret.kind !== "void") c.drop();
+    this.mb.setBody(fn, [{ kind: "ref", nullable: true, typeIndex: user.clos }], c.bytes());
+    return made;
+  }
+
+  /** node:net's libCalls (net.ts; abi.ts netCall). Answers false for a key
+   * this does not handle (it then refuses by its own libCall name). */
+  private emitNetLibCall(e: Extract<WExpr, { kind: "libCall" }>): boolean {
+    if (!e.fn.startsWith("net.")) return false;
+    const code = this.fn.code;
+    const L = NET_LISTS;
+    const unreach = (): true => {
+      code.unreachable();
+      return true;
+    };
+    if (this.netModule && this.cpEventModule) {
+      // One poll phase per module: a module that both spawns children
+      // asynchronously and uses node:net has no claim and no build here.
+      this.refuse("libCall:net:with-spawn", e.loc);
+      return unreach();
+    }
+    const vpair = this.closPairFor([], []);
+    const vnull = (): void => code.refNull(vpair.clos);
+    const ecNull = (): void => code.refNull(this.closPairFor([{ kind: "ref", nullable: true, typeIndex: this.exc().errT }], []).clos);
+    const listen = (port: WExpr, host: WExpr | null, v6: WExpr | null, cb: WExpr | null): boolean => {
+      if (e.type.kind !== "void") {
+        this.refuse(`libCall:${e.fn}:value`, e.loc);
+        return unreach();
+      }
+      this.walkExpr(e.args[0]!);
+      this.walkExpr(port);
+      if (host !== null) this.walkExpr(host);
+      else this.pushStrLitInto(code, "");
+      if (v6 !== null) this.walkExpr(v6);
+      else code.i32Const(0);
+      if (cb !== null) {
+        if (!this.emitNetOptionalVoidCb(cb, e.fn, e.loc)) return unreach();
+      } else vnull();
+      code.call(this.net.listenHelper());
+      code.drop();
+      this.emitPendingCheck();
+      return true;
+    };
+    const addListener = (list: NetList, cb: WExpr, onceArg: WExpr | undefined, after?: () => void): boolean => {
+      const once = this.netOnce(onceArg, e.fn, e.loc);
+      if (once === null) return unreach();
+      const recvT = list.owner === "sock" ? this.net.sockRef() : this.net.srvRef();
+      const R = this.acquireScratch(recvT);
+      this.walkExpr(e.args[0]!);
+      code.localTee(R);
+      if (!this.emitNetListener(cb, list.arg, e.fn, e.loc)) {
+        this.releaseScratch(recvT, R);
+        return unreach();
+      }
+      code.i32Const(once ? 1 : 0);
+      code.i32Const(0);
+      code.call(this.net.addHelper(list));
+      if (after !== undefined) {
+        code.localGet(R);
+        after();
+      }
+      this.releaseScratch(recvT, R);
+      return true;
+    };
+    /** write/end of a chunk: string -> its UTF-8 bytes and its own length. */
+    const pushChunk = (chunk: WExpr): void => {
+      if (chunk.type.kind === "string") {
+        const S = this.acquireScratch(this.strRef);
+        this.walkExpr(chunk);
+        code.localTee(S);
+        code.call(this.bytesB.fromStrHelper("utf8"));
+        code.localGet(S);
+        code.arrayLen();
+        this.releaseScratch(this.strRef, S);
+      } else {
+        const B = this.acquireScratch(this.bytesB.bytesRef());
+        this.walkExpr(chunk);
+        code.localTee(B);
+        code.localGet(B);
+        code.structGet(this.bytesB.bytesType(), 2);
+        this.releaseScratch(this.bytesB.bytesRef(), B);
+      }
+    };
+    switch (e.fn) {
+      case "net.getAutoSelTimeout":
+        code.globalGet(this.net.autoselGlobal());
+        return true;
+      case "net.setAutoSelTimeout": {
+        // validateInt32(value, 'value', 1), then the sub-10ms floor.
+        const V = this.acquireScratch(F64);
+        this.walkExpr(e.args[0]!);
+        code.localSet(V);
+        this.emitNetInt32Check(code, () => code.localGet(V), "value", "argument");
+        code.localGet(V);
+        code.f64Const(10);
+        code.f64Max();
+        code.globalSet(this.net.autoselGlobal());
+        this.releaseScratch(F64, V);
+        return true;
+      }
+      case "net.createServer":
+        code.call(this.net.srvNewHelper());
+        return true;
+      case "net.createServerCb": {
+        const V = this.acquireScratch(this.net.srvRef());
+        code.call(this.net.srvNewHelper());
+        code.localTee(V);
+        if (!this.emitNetListener(e.args[0]!, "sock", e.fn, e.loc)) return unreach();
+        code.i32Const(0);
+        code.i32Const(0);
+        code.call(this.net.addHelper(L.LV_CONN));
+        code.localGet(V);
+        this.releaseScratch(this.net.srvRef(), V);
+        return true;
+      }
+      case "net.listen":
+        return listen(e.args[1]!, null, null, null);
+      case "net.listenCb":
+        return listen(e.args[1]!, null, null, e.args[2]!);
+      case "net.listenOpts":
+        return listen(e.args[1]!, e.args[2]!, e.args[3]!, null);
+      case "net.listenOptsCb":
+        return listen(e.args[1]!, e.args[2]!, e.args[3]!, e.args[4]!);
+      case "net.serverPort":
+        this.walkExpr(e.args[0]!);
+        code.call(this.net.srvPortHelper());
+        this.emitPendingCheck();
+        return true;
+      case "net.serverClose": {
+        const V = this.acquireScratch(this.net.srvRef());
+        this.walkExpr(e.args[0]!);
+        code.localSet(V);
+        if (this.closeOverride) {
+          // server.close() runs the override when one is set.
+          code.localGet(V);
+          code.structGet(this.net.srvType(), this.net.srvOverrideField());
+          code.refIsNull();
+          this.openIf();
+          code.localGet(V);
+          vnull();
+          code.call(this.net.srvCloseHelper());
+          code.else_();
+          code.localGet(V);
+          code.structGet(this.net.srvType(), this.net.srvOverrideField());
+          code.refCast(vpair.clos);
+          code.localGet(V);
+          code.structGet(this.net.srvType(), this.net.srvOverrideField());
+          code.refCast(vpair.clos);
+          code.structGet(vpair.clos, 0);
+          code.callRef(vpair.fn);
+          this.close();
+          this.emitPendingCheck();
+        } else {
+          code.localGet(V);
+          vnull();
+          code.call(this.net.srvCloseHelper());
+        }
+        this.releaseScratch(this.net.srvRef(), V);
+        return true;
+      }
+      case "net.serverCloseCb":
+        if (this.closeOverride) {
+          // The override would receive this callback: not built.
+          this.refuse("libCall:net.serverCloseCb:override", e.loc);
+          return unreach();
+        }
+        this.walkExpr(e.args[0]!);
+        if (!this.emitNetOptionalVoidCb(e.args[1]!, e.fn, e.loc)) return unreach();
+        code.call(this.net.srvCloseHelper());
+        return true;
+      case "net.serverCloseBind": {
+        if (e.type.kind !== "func") {
+          this.refuse("libCall:net.serverCloseBind:shape", e.loc);
+          return unreach();
+        }
+        const made = this.netCloseBindFor(e.type, e.loc);
+        if (made === null) return unreach();
+        this.mb.declareFuncRef(made.fn);
+        code.refFunc(made.fn);
+        this.walkExpr(e.args[0]!);
+        code.structNew(made.env);
+        return true;
+      }
+      case "net.serverSetCloseOverride": {
+        const fnT = e.args[1]!.type;
+        if (fnT.kind !== "func") {
+          this.refuse("libCall:net.serverSetCloseOverride:shape", e.loc);
+          return unreach();
+        }
+        const made = this.netOverrideFor(fnT, e.loc);
+        if (made === null) return unreach();
+        this.walkExpr(e.args[0]!);
+        this.mb.declareFuncRef(made.fn);
+        code.refFunc(made.fn);
+        this.walkExpr(e.args[1]!);
+        code.structNew(made.env);
+        code.structSet(this.net.srvType(), this.net.srvOverrideField());
+        return true;
+      }
+      case "net.serverOnClose":
+        return addListener(L.LV_CLOSE, e.args[1]!, e.args[2]);
+      case "net.serverOnListening":
+        return addListener(L.LV_LISTENING, e.args[1]!, e.args[2]);
+      case "net.serverOnError":
+        return addListener(L.LV_ERROR, e.args[1]!, e.args[2]);
+      case "net.serverOnConnection":
+        return addListener(L.LV_CONN, e.args[1]!, e.args[2]);
+      case "net.connect":
+      case "net.connectCb":
+      case "net.connectAttempt": {
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        if (e.fn === "net.connectCb") {
+          if (!this.emitNetListener(e.args[2]!, "void", e.fn, e.loc)) return unreach();
+        } else vnull();
+        if (e.fn === "net.connectAttempt") this.walkExpr(e.args[2]!);
+        else code.refNull(this.dyn.dynT());
+        code.call(this.net.connectHelper());
+        this.emitPendingCheck();
+        return true;
+      }
+      case "net.connectOptsChk": {
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        code.call(this.netConnectOptsChkFn());
+        this.emitPendingCheck();
+        // Always throws (the fence ends it): the declared result is never
+        // read.
+        const soft = this.mapTypeSoft(e.type);
+        if (soft.kind === "ref") code.refNull(soft.typeIndex);
+        else if (soft.kind === "f64") code.f64Const(0);
+        else if (soft.kind === "i32") code.i32Const(0);
+        return true;
+      }
+      case "net.sockWrite":
+      case "net.sockWriteBytes":
+        this.walkExpr(e.args[0]!);
+        pushChunk(e.args[1]!);
+        ecNull();
+        code.call(this.net.sockWriteHelper());
+        code.drop();
+        return true;
+      case "net.sockEnd":
+        this.walkExpr(e.args[0]!);
+        code.refNull(this.bytesB.bytesType());
+        code.i32Const(0);
+        ecNull();
+        code.call(this.net.sockEndHelper());
+        return true;
+      case "net.sockEndStr":
+      case "net.sockEndBytes":
+        this.walkExpr(e.args[0]!);
+        pushChunk(e.args[1]!);
+        ecNull();
+        code.call(this.net.sockEndHelper());
+        return true;
+      case "net.sockWriteDyn":
+      case "net.sockEndDyn":
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        ecNull();
+        code.call(this.netDynChunkFn(e.fn === "net.sockWriteDyn"));
+        if (e.fn === "net.sockWriteDyn") code.drop();
+        this.emitPendingCheck();
+        return true;
+      case "net.sockDestroy":
+        this.walkExpr(e.args[0]!);
+        code.refNull(this.exc().errT);
+        code.call(this.net.destroyHelper());
+        return true;
+      case "net.sockDestroySoon":
+        this.walkExpr(e.args[0]!);
+        code.call(this.net.destroySoonHelper());
+        return true;
+      case "net.sockPause":
+      case "net.sockResume": {
+        const S = this.acquireScratch(this.net.sockRef());
+        this.walkExpr(e.args[0]!);
+        code.localTee(S);
+        code.call(e.fn === "net.sockPause" ? this.net.pauseHelper() : this.net.resumeHelper());
+        if (e.type.kind !== "void") code.localGet(S);
+        this.releaseScratch(this.net.sockRef(), S);
+        return true;
+      }
+      case "net.sockSetNoDelay": {
+        const S = this.acquireScratch(this.net.sockRef());
+        this.walkExpr(e.args[0]!);
+        code.localTee(S);
+        this.walkExpr(e.args[1]!);
+        code.call(this.net.setNoDelayHelper());
+        if (e.type.kind !== "void") code.localGet(S);
+        this.releaseScratch(this.net.sockRef(), S);
+        return true;
+      }
+      case "net.sockDestroyed":
+        this.walkExpr(e.args[0]!);
+        code.call(this.net.destroyedHelper());
+        return true;
+      case "net.sockWritable":
+        this.walkExpr(e.args[0]!);
+        code.call(this.net.writableGetterHelper());
+        return true;
+      case "net.sockReadable":
+        this.walkExpr(e.args[0]!);
+        code.call(this.net.readableHelper());
+        return true;
+      case "net.sockBytesWritten":
+        this.walkExpr(e.args[0]!);
+        code.call(this.net.bytesWrittenHelper());
+        return true;
+      case "net.sockRemoteAddress": {
+        if (e.type.kind !== "union") {
+          this.refuse("libCall:net.sockRemoteAddress:shape", e.loc);
+          return unreach();
+        }
+        const def = this.unionDef(e.type.unionId);
+        const sTag = def.arms.findIndex((a) => a.kind === "string");
+        const uTag = def.arms.findIndex((a) => a.kind === "undefinedT");
+        const armSt = sTag < 0 ? null : this.unionArmStruct(e.type.unionId, sTag, e.loc);
+        const unionVal = this.mapType(e.type, e.loc);
+        if (def.arms.length !== 2 || uTag < 0 || armSt === null || unionVal === null) {
+          this.refuse("libCall:net.sockRemoteAddress:shape", e.loc);
+          return unreach();
+        }
+        const A = this.acquireScratch(this.strRef);
+        this.walkExpr(e.args[0]!);
+        code.call(this.net.remoteAddressHelper());
+        code.localTee(A);
+        code.refIsNull();
+        this.openIfResult(unionVal);
+        code.globalGet(this.unions.unitGlobal(uTag));
+        code.else_();
+        code.i32Const(sTag);
+        code.localGet(A);
+        code.structNew(armSt);
+        this.close();
+        this.releaseScratch(this.strRef, A);
+        return true;
+      }
+      case "net.sockOnData":
+        return addListener(L.L_DATA, e.args[1]!, e.args[2], () => code.call(this.net.dataAddedHelper()));
+      case "net.sockOnEnd":
+        return addListener(L.L_END, e.args[1]!, e.args[2]);
+      case "net.sockOnClose":
+        return addListener(L.L_CLOSE, e.args[1]!, e.args[2]);
+      case "net.sockOnError":
+        return addListener(L.L_ERROR, e.args[1]!, e.args[2]);
+      case "net.sockOnConnect":
+        return addListener(L.L_CONNECT, e.args[1]!, e.args[2]);
+      case "net.sockOnFinish":
+        return addListener(L.L_FINISH, e.args[1]!, undefined);
+      default:
+        return false;
+    }
+  }
+
+  /** validateInt32(value, name, 1) over the f64 `push` pushes: Node's
+   * ERR_OUT_OF_RANGE for a non-integer and for one outside [1, 2^31 - 1]
+   * (the caller's pending check unwinds). `kind` is ERR_INVALID_ARG_TYPE's
+   * word for the name (unused for a number). */
+  private emitNetInt32Check(c: Code, push: () => void, name: string, _kind: "argument" | "property"): void {
+    // !NumberIsInteger: NaN, +-Infinity, or a fraction.
+    push();
+    c.f64Trunc();
+    push();
+    c.f64Ne();
+    push();
+    push();
+    c.f64Sub();
+    c.f64Const(0);
+    c.f64Ne();
+    c.i32Or();
+    this.openIf();
+    this.emitSetCellError(c, "%RangeError", "RangeError", (c2) => {
+      this.pushStrLitInto(c2, `The value of "${name}" is out of range. It must be an integer. Received `);
+      push();
+      c2.call(this.bytesB.numReceivedHelper());
+      c2.call(this.concatHelper());
+    }, "ERR_OUT_OF_RANGE");
+    this.emitUnwind();
+    c.else_();
+    push();
+    c.f64Const(1);
+    c.f64Lt();
+    push();
+    c.f64Const(2147483647);
+    c.f64Gt();
+    c.i32Or();
+    this.openIf();
+    this.emitSetCellError(c, "%RangeError", "RangeError", (c2) => {
+      this.pushStrLitInto(c2, `The value of "${name}" is out of range. It must be >= 1 && <= 2147483647. Received `);
+      push();
+      c2.call(this.bytesB.numReceivedHelper());
+      c2.call(this.concatHelper());
+    }, "ERR_OUT_OF_RANGE");
+    this.emitUnwind();
+    this.close();
+    this.close();
+  }
+
+  private netAttemptCheckField: number | null = null;
+
+  /** `%w.net.attemptCheck(dyn) -> i32` — lookupAndConnect's
+   * validateInt32(autoSelectFamilyAttemptTimeout,
+   * 'options.autoSelectFamilyAttemptTimeout', 1) on a checked-dynamic
+   * value (null = the option is absent): 1, or 0 with the error pending. */
+  private emitNetAttemptCheckFn(): number {
+    if (this.netAttemptCheckField !== null) return this.netAttemptCheckField;
+    const dynRefT = this.dyn.dynRef();
+    const idx = this.mb.declareFunc(this.mb.funcType([dynRefT], [I32]), "%w.net.attemptCheck");
+    this.netAttemptCheckField = idx;
+    const c = new Code();
+    const D = 0;
+    const N = 1;
+    const name = "options.autoSelectFamilyAttemptTimeout";
+    const fail = (className: string, ctor: string, msg: (c2: Code) => void, codeLit: string): void => {
+      this.emitSetCellError(c, className, ctor, msg, codeLit);
+      c.i32Const(0);
+      c.return_();
+    };
+    c.localGet(D);
+    c.refIsNull();
+    c.ifVoid();
+    c.i32Const(1);
+    c.return_();
+    c.end();
+    // An undefined or null option is absent (`!= null`).
+    c.localGet(D);
+    c.structGet(this.dyn.dynT(), 0);
+    c.i32Const(6);
+    c.i32Eq();
+    c.localGet(D);
+    c.structGet(this.dyn.dynT(), 0);
+    c.i32Eqz();
+    c.i32Or();
+    c.ifVoid();
+    c.i32Const(1);
+    c.return_();
+    c.end();
+    c.localGet(D);
+    c.structGet(this.dyn.dynT(), 0);
+    c.i32Const(2);
+    c.i32Ne();
+    c.ifVoid();
+    fail("%TypeError", "TypeError", (c2) => {
+      this.pushStrLitInto(c2, `The "${name}" property must be of type number. Received `);
+      c2.localGet(D);
+      c2.call(this.dyn.specificType());
+      c2.call(this.concatHelper());
+    }, "ERR_INVALID_ARG_TYPE");
+    c.end();
+    c.localGet(D);
+    c.structGet(this.dyn.dynT(), 1);
+    c.localSet(N);
+    c.localGet(N);
+    c.f64Trunc();
+    c.localGet(N);
+    c.f64Ne();
+    c.localGet(N);
+    c.localGet(N);
+    c.f64Sub();
+    c.f64Const(0);
+    c.f64Ne();
+    c.i32Or();
+    c.ifVoid();
+    fail("%RangeError", "RangeError", (c2) => {
+      this.pushStrLitInto(c2, `The value of "${name}" is out of range. It must be an integer. Received `);
+      c2.localGet(N);
+      c2.call(this.bytesB.numReceivedHelper());
+      c2.call(this.concatHelper());
+    }, "ERR_OUT_OF_RANGE");
+    c.end();
+    c.localGet(N);
+    c.f64Const(1);
+    c.f64Lt();
+    c.localGet(N);
+    c.f64Const(2147483647);
+    c.f64Gt();
+    c.i32Or();
+    c.ifVoid();
+    fail("%RangeError", "RangeError", (c2) => {
+      this.pushStrLitInto(c2, `The value of "${name}" is out of range. It must be >= 1 && <= 2147483647. Received `);
+      c2.localGet(N);
+      c2.call(this.bytesB.numReceivedHelper());
+      c2.call(this.concatHelper());
+    }, "ERR_OUT_OF_RANGE");
+    c.end();
+    c.i32Const(1);
+    this.mb.setBody(idx, [F64], c.bytes());
+    return idx;
+  }
+
+  private netConnectOptsChkField: number | null = null;
+
+  /** `%w.net.connectOptsChk(opts, fence)` — net.connect over a runtime
+   * option bag, in Node's order: the Socket constructor's objectMode
+   * checks, then lookupAndConnect's host and port checks and the attempt
+   * budget, then the compiler-rendered fence (always throws). */
+  private netConnectOptsChkFn(): number {
+    if (this.netConnectOptsChkField !== null) return this.netConnectOptsChkField;
+    const dynRefT = this.dyn.dynRef();
+    const idx = this.mb.declareFunc(this.mb.funcType([dynRefT, this.strRef], []), "%w.net.connectOptsChk");
+    this.netConnectOptsChkField = idx;
+    const c = new Code();
+    const D = 0;
+    const FENCE = 1;
+    const O = 2;
+    const V = 3;
+    const RV = 4;
+    const N = 5;
+    const dynT = this.dyn.dynT();
+    const get = (key: string): void => {
+      c.localGet(O);
+      this.pushStrLitInto(c, key);
+      c.call(this.dyn.objGet());
+      c.localSet(V);
+    };
+    // A present, truthy member.
+    const truthy = (): void => {
+      c.localGet(V);
+      c.refIsNull();
+      c.ifResult(I32);
+      c.i32Const(0);
+      c.else_();
+      c.localGet(V);
+      c.call(this.dyn.truthy());
+      c.end();
+    };
+    // A member other than undefined / null (`!= null`).
+    const present = (): void => {
+      c.localGet(V);
+      c.refIsNull();
+      c.ifResult(I32);
+      c.i32Const(0);
+      c.else_();
+      c.localGet(V);
+      c.structGet(dynT, 0);
+      c.i32Const(6);
+      c.i32Ne();
+      c.localGet(V);
+      c.structGet(dynT, 0);
+      c.i32Const(0);
+      c.i32Ne();
+      c.i32And();
+      c.end();
+    };
+    const argValue = (prop: string, push: () => void): void => {
+      this.emitSetCellError(c, "%TypeError", "TypeError", (c2) => {
+        this.pushStrLitInto(c2, `The property '${prop}' is not supported. Received `);
+        push();
+        c2.f64Const(0);
+        c2.f64Const(2);
+        c2.call(this.insp.dyn());
+        c2.call(this.concatHelper());
+      }, "ERR_INVALID_ARG_VALUE");
+      c.return_();
+    };
+    // A non-object bag: Node's normalizeArgs would read it as a port; the
+    // lowering only sends objects here.
+    c.localGet(D);
+    c.structGet(dynT, 0);
+    c.i32Const(5);
+    c.i32Ne();
+    c.ifVoid();
+    c.localGet(FENCE);
+    this.emitNetFence(c);
+    c.return_();
+    c.end();
+    c.localGet(D);
+    c.structGet(dynT, 2);
+    c.refCast(this.dyn.objT());
+    c.localSet(O);
+    get("objectMode");
+    truthy();
+    c.ifVoid();
+    argValue("options.objectMode", () => c.localGet(V));
+    c.end();
+    get("readableObjectMode");
+    c.localGet(V);
+    c.localSet(RV);
+    truthy();
+    c.localSet(N);
+    get("writableObjectMode");
+    c.localGet(N);
+    c.ifVoid();
+    argValue("options.readableObjectMode", () => c.localGet(RV));
+    c.end();
+    truthy();
+    c.ifVoid();
+    argValue("options.writableObjectMode", () => c.localGet(V));
+    c.end();
+    // Everything after the constructor's checks (the timeout option,
+    // ERR_MISSING_ARGS, the host, localAddress, the port, autoSelectFamily,
+    // the budget) is the fence's: a bag this lowering could not model
+    // refuses here, loudly.
+    c.localGet(FENCE);
+    this.emitNetFence(c);
+    this.mb.setBody(idx, [this.dyn.objRef(), dynRefT, dynRefT, I32], c.bytes());
+    return idx;
+  }
+
+  /** Throw the lowering fence (scr_throw_lowering_fence: an Error, code
+   * SC2020) whose message is the string on the stack. */
+  private emitNetFence(c: Code): void {
+    const S = this.netFenceTmp();
+    c.globalSet(S);
+    this.emitSetCellError(c, "%Error", "Error", (c2) => c2.globalGet(S), "SC2020");
+  }
+
+  private netFenceTmpField: number | null = null;
+
+  private netFenceTmp(): number {
+    this.netFenceTmpField ??= this.mb.addGlobal(this.strRef, true, (w) => {
+      w.u8(0xd0);
+      w.sleb(this.strType);
+    });
+    return this.netFenceTmpField;
+  }
+
+  private readonly netDynChunkFields = new Map<boolean, number>();
+
+  /** `%w.net.dynChunk(sock, chunk, cb)` — write / end of a checked-dynamic
+   * chunk: a string or a Buffer, else Node's ERR_INVALID_ARG_TYPE (and
+   * ERR_STREAM_NULL_VALUES for null). write answers its boolean. */
+  private netDynChunkFn(write: boolean): number {
+    const hit = this.netDynChunkFields.get(write);
+    if (hit !== undefined) return hit;
+    const dynRefT = this.dyn.dynRef();
+    const ecRef: ValType = { kind: "ref", nullable: true, typeIndex: this.closPairFor([{ kind: "ref", nullable: true, typeIndex: this.exc().errT }], []).clos };
+    const idx = this.mb.declareFunc(
+      this.mb.funcType([this.net.sockRef(), dynRefT, ecRef], write ? [I32] : []),
+      write ? "%w.net.dynWrite" : "%w.net.dynEnd",
+    );
+    this.netDynChunkFields.set(write, idx);
+    const c = new Code();
+    const S = 0;
+    const D = 1;
+    const CB = 2;
+    const K = 3;
+    const B = 4;
+    const dynT = this.dyn.dynT();
+    c.localGet(D);
+    c.structGet(dynT, 0);
+    c.localSet(K);
+    // A string: its UTF-8 bytes, its own length.
+    c.localGet(K);
+    c.i32Const(3);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(S);
+    c.localGet(D);
+    c.structGet(dynT, 2);
+    c.refCast(this.strType);
+    c.call(this.bytesB.fromStrHelper("utf8"));
+    c.localGet(D);
+    c.structGet(dynT, 2);
+    c.refCast(this.strType);
+    c.arrayLen();
+    c.localGet(CB);
+    c.call(write ? this.net.sockWriteHelper() : this.net.sockEndHelper());
+    c.return_();
+    c.end();
+    c.localGet(K);
+    c.i32Const(7);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(D);
+    c.refNull(this.dyn.pathT());
+    c.call(this.dynBytesPayloadFn());
+    c.localSet(B);
+    c.localGet(S);
+    c.localGet(B);
+    c.localGet(B);
+    c.structGet(this.bytesB.bytesType(), 2);
+    c.localGet(CB);
+    c.call(write ? this.net.sockWriteHelper() : this.net.sockEndHelper());
+    c.return_();
+    c.end();
+    // end(): undefined and null are "no chunk" (chunk != null).
+    if (!write) {
+      c.localGet(K);
+      c.i32Const(6);
+      c.i32Eq();
+      c.localGet(K);
+      c.i32Eqz();
+      c.i32Or();
+      c.ifVoid();
+      c.localGet(S);
+      c.refNull(this.bytesB.bytesType());
+      c.i32Const(0);
+      c.localGet(CB);
+      c.call(this.net.sockEndHelper());
+      c.return_();
+      c.end();
+    } else {
+      c.localGet(K);
+      c.i32Eqz();
+      c.ifVoid();
+      this.emitSetCellError(c, "%TypeError", "TypeError", (c2) => this.pushStrLitInto(c2, "May not write null values to stream"), "ERR_STREAM_NULL_VALUES");
+      c.i32Const(0);
+      c.return_();
+      c.end();
+    }
+    this.emitSetCellError(c, "%TypeError", "TypeError", (c2) => {
+      this.pushStrLitInto(c2, `The "chunk" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received `);
+      c2.localGet(D);
+      c2.call(this.dyn.specificType());
+      c2.call(this.concatHelper());
+    }, "ERR_INVALID_ARG_TYPE");
+    if (write) c.i32Const(0);
+    this.mb.setBody(idx, [I32, this.bytesB.bytesRef()], c.bytes());
+    return idx;
+  }
+
+  private dynBytesPayloadField: number | null = null;
+
+  /** `(dyn BYTES) -> bytes` — the Buffer a dyn BYTES box carries (its
+   * payload, unboxed by the dynCheck walker). */
+  private dynBytesPayloadFn(): number {
+    if (this.dynBytesPayloadField !== null) return this.dynBytesPayloadField;
+    const check = this.dynCheckHelper(BYTES_U8, undefined);
+    if (check === null) throw new Error("emitter bug: the bytes dynCheck walker refused");
+    this.dynBytesPayloadField = check;
+    return check;
+  }
+
+  /* ── INC-29 U1 — the checked-dynamic HANDLE surface of node:net ──────
+   * A Socket or Server crossing into dyn boxes BY REFERENCE (DK.HANDLE,
+   * DYN_NUM = 1 Socket / 2 Server, DYN_REF = the struct); dyn.ts reaches
+   * its members through these two hooks. A member or event the surface
+   * does not model throws a named "not supported yet" Error. */
+
+  /** A dyn listener's environment: a subtype of the list's fixed closure
+   * holding the dyn function and the receiver it is called with (`this`
+   * is the emitter, as Node calls a listener). */
+  private readonly netDynEnvFields = new Map<number, number>();
+
+  private netDynEnvT(closT: number, fnT: number): number {
+    const hit = this.netDynEnvFields.get(closT);
+    if (hit !== undefined) return hit;
+    const env = this.mb.subStructType(
+      `netDynEnv:${closT}`,
+      [
+        { storage: { kind: "ref", nullable: false, typeIndex: fnT }, mutable: false },
+        this.dynFieldT(),
+        this.dynFieldT(),
+      ],
+      closT,
+    );
+    this.netDynEnvFields.set(closT, env);
+    return env;
+  }
+
+  private dynFieldT(): FieldType {
+    return { storage: this.dyn.dynRef(), mutable: false };
+  }
+
+  /** The adapter function calling a dyn listener: `args` pushes the dyn
+   * argument values from the fixed closure's own parameters (local 1). */
+  private readonly netDynAdapterFns = new Map<string, number>();
+
+  private netDynAdapter(name: string, pair: { clos: number; fn: number }, args: ((c: Code) => void)[]): number {
+    const hit = this.netDynAdapterFns.get(name);
+    if (hit !== undefined) return hit;
+    const fn = this.mb.declareFunc(pair.fn, `%w.net.dynAdapter.${name}`);
+    this.netDynAdapterFns.set(name, fn);
+    const env = this.netDynEnvT(pair.clos, pair.fn);
+    const c = new Code();
+    const nparams = name === "void" || name === "close" ? 1 : 2;
+    const R = nparams;
+    // this = the receiver, for the call's duration (dyn.this()).
+    c.localGet(0);
+    c.refCast(env);
+    c.structGet(env, 2);
+    c.call(this.dyn.thisPush());
+    c.localGet(0);
+    c.refCast(env);
+    c.structGet(env, 1);
+    c.i32Const(args.length);
+    for (const a of args) a(c);
+    c.arrayNewFixed(this.dynArgsBufType(), args.length);
+    c.structNew(this.dynArrStructType());
+    this.pushStrLitInto(c, "listener");
+    c.call(this.dyn.callFn());
+    c.localSet(R);
+    c.call(this.dyn.thisPop());
+    this.mb.setBody(fn, [this.dyn.dynRef()], c.bytes());
+    return fn;
+  }
+
+  /** Push a closure of `pair`'s type wrapping the dyn function in `fnLocal`
+   * called with `recvLocal` as this. */
+  private emitNetDynListener(c: Code, kind: "void" | "close" | "data" | "err" | "cb" | "sock", fnLocal: number, recvLocal: number): void {
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+    const pair =
+      kind === "void" || kind === "close" ? this.closPairFor([], [])
+      : kind === "data" ? this.closPairFor([this.bytesB.bytesRef()], [])
+      : kind === "sock" ? this.closPairFor([this.net.sockRef()], [])
+      : this.closPairFor([errRef], []);
+    const args: ((c: Code) => void)[] =
+      kind === "void" ? []
+      : kind === "close" ? [(x) => this.dyn.boxBool(x, (y) => y.globalGet(this.net.emitArgGlobal()))]
+      : kind === "data" ? [(x) => {
+          x.localGet(1);
+          x.call(this.netBoxBufferFn());
+        }]
+      : kind === "sock" ? [(x) => {
+          x.localGet(1);
+          x.call(this.dynFromHelper({ kind: "netSocket" }, undefined)!);
+        }]
+      : kind === "err" ? [(x) => {
+          x.localGet(1);
+          x.call(this.dyn.fromError());
+        }]
+      : [(x) => {
+          // A write / end callback: (null) on success, (err) else.
+          x.localGet(1);
+          x.refIsNull();
+          x.ifResult(this.dyn.dynRef());
+          x.globalGet(this.dyn.nullGlobal());
+          x.else_();
+          x.localGet(1);
+          x.call(this.dyn.fromError());
+          x.end();
+        }];
+    const fn = this.netDynAdapter(kind, pair, args);
+    const env = this.netDynEnvT(pair.clos, pair.fn);
+    this.mb.declareFuncRef(fn);
+    c.refFunc(fn);
+    c.localGet(fnLocal);
+    c.localGet(recvLocal);
+    c.structNew(env);
+  }
+
+  private netBoxBufferField: number | null = null;
+
+  /** `(bytes) -> dyn` — a socket's chunk crossing into dyn: a Buffer (the
+   * isBuffer flag set; S037's generic crossing cannot know it, this one
+   * does). Aliases, never copies (S014). */
+  private netBoxBufferFn(): number {
+    if (this.netBoxBufferField !== null) return this.netBoxBufferField;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.bytesB.bytesRef()], [this.dyn.dynRef()]), "%w.net.boxBuffer");
+    this.netBoxBufferField = idx;
+    const c = new Code();
+    this.dyn.boxBytes(c, (x) => {
+      this.dyn.pushNewBytesPayload(
+        x,
+        (y) => y.localGet(0),
+        (y) => y.i32Const(1),
+      );
+    });
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  private netHandleKeyGetField: number | null = null;
+
+  /** `(d, key) -> dyn` — a handle's property read. */
+  private netHandleKeyGetFn(): number {
+    if (this.netHandleKeyGetField !== null) return this.netHandleKeyGetField;
+    const dynRefT = this.dyn.dynRef();
+    const idx = this.mb.declareFunc(this.mb.funcType([dynRefT, this.strRef], [dynRefT]), "%w.net.handleKeyGet");
+    this.netHandleKeyGetField = idx;
+    const c = new Code();
+    const D = 0;
+    const KEY = 1;
+    const S = 2;
+    const V = 3;
+    const A = 4;
+    const dynT = this.dyn.dynT();
+    const is = (key: string): void => {
+      c.localGet(KEY);
+      this.pushStrLitInto(c, key);
+      c.call(this.strEqHelper());
+    };
+    const boolProp = (key: string, push: () => void): void => {
+      is(key);
+      c.ifVoid();
+      this.dyn.boxBool(c, () => push());
+      c.return_();
+      c.end();
+    };
+    c.localGet(D);
+    c.structGet(dynT, DYN_NUM);
+    c.f64Const(1);
+    c.f64Eq();
+    c.ifVoid();
+    c.localGet(D);
+    c.structGet(dynT, DYN_REF);
+    c.refCast(this.net.sockType());
+    c.localSet(S);
+    boolProp("destroyed", () => {
+      c.localGet(S);
+      c.call(this.net.destroyedHelper());
+    });
+    boolProp("writable", () => {
+      c.localGet(S);
+      c.call(this.net.writableGetterHelper());
+    });
+    boolProp("readable", () => {
+      c.localGet(S);
+      c.call(this.net.readableHelper());
+    });
+    is("bytesWritten");
+    c.ifVoid();
+    this.dyn.boxNum(c, () => {
+      c.localGet(S);
+      c.call(this.net.bytesWrittenHelper());
+    });
+    c.return_();
+    c.end();
+    is("remoteAddress");
+    c.ifVoid();
+    c.localGet(S);
+    c.call(this.net.remoteAddressHelper());
+    c.localTee(A);
+    c.refIsNull();
+    c.ifResult(dynRefT);
+    c.globalGet(this.dyn.undefinedGlobal());
+    c.else_();
+    this.dyn.boxStr(c, () => c.localGet(A));
+    c.end();
+    c.return_();
+    c.end();
+    c.end();
+    // Anything else: the loud fence, naming the property.
+    this.emitSetCellError(c, "%Error", "Error", (c2) => {
+      this.pushStrLitInto(c2, "reading the property '");
+      c2.localGet(KEY);
+      c2.call(this.concatHelper());
+      this.pushStrLitInto(c2, "' of a net handle is not supported yet");
+      c2.call(this.concatHelper());
+    }, null);
+    c.refNull(dynT);
+    this.mb.setBody(idx, [this.net.sockRef(), this.net.srvRef(), this.strRef], c.bytes());
+    void V;
+    return idx;
+  }
+
+  private readonly netHandleInvokeFns = new Map<string, number | null>();
+
+  /** The dispatch function for `d.<method>(...args)` on a handle, or null
+   * when the surface does not model `method` at all. */
+  private netHandleInvokeFn(method: string): number | null {
+    if (this.netHandleInvokeFns.has(method)) return this.netHandleInvokeFns.get(method)!;
+    const sockMethods = ["on", "once", "addListener", "write", "end", "setNoDelay", "destroy", "destroySoon", "pause", "resume"];
+    const srvMethods = ["on", "once", "addListener", "close"];
+    if (!sockMethods.includes(method) && !srvMethods.includes(method)) {
+      this.netHandleInvokeFns.set(method, null);
+      return null;
+    }
+    const dynRefT = this.dyn.dynRef();
+    const arrRefT = this.dyn.arrRef();
+    const idx = this.mb.declareFunc(this.mb.funcType([dynRefT, arrRefT, this.strRef], [dynRefT]), `%w.net.handleInvoke:${method}`);
+    this.netHandleInvokeFns.set(method, idx);
+    const c = new Code();
+    const D = 0;
+    const ARGS = 1;
+    const S = 3;
+    const V = 4;
+    const ARGC = 5;
+    const A0 = 6;
+    const A1 = 7;
+    const A2 = 8;
+    const CB = 9;
+    const NAME = 10;
+    const B = 11;
+    const VCB = 12;
+    const dynT = this.dyn.dynT();
+    const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+    const ecPair = this.closPairFor([errRef], []);
+    const vPair = this.closPairFor([], []);
+    const kindOf = (local: number): void => {
+      c.localGet(local);
+      c.structGet(dynT, DYN_KIND);
+    };
+    const isKind = (local: number, k: number): void => {
+      kindOf(local);
+      c.i32Const(k);
+      c.i32Eq();
+    };
+    const fence = (what: string): void => {
+      this.emitSetCellError(c, "%Error", "Error", (c2) => this.pushStrLitInto(c2, `${what} on a net handle is not supported yet`), null);
+      c.refNull(dynT);
+      c.return_();
+    };
+    // The arguments, undefined past the end.
+    this.dyn.arrLen(c, (x) => x.localGet(ARGS));
+    c.localSet(ARGC);
+    [A0, A1, A2].forEach((local, i) => {
+      c.i32Const(i);
+      c.localGet(ARGC);
+      c.i32LtU();
+      c.ifResult(dynRefT);
+      this.dyn.arrAt(c, (x) => x.localGet(ARGS), (x) => x.i32Const(i));
+      c.else_();
+      c.globalGet(this.dyn.undefinedGlobal());
+      c.end();
+      c.localSet(local);
+    });
+    const isSock = (): void => {
+      c.localGet(D);
+      c.structGet(dynT, DYN_NUM);
+      c.f64Const(1);
+      c.f64Eq();
+    };
+    const castSock = (): void => {
+      c.localGet(D);
+      c.structGet(dynT, DYN_REF);
+      c.refCast(this.net.sockType());
+      c.localSet(S);
+    };
+    const castSrv = (): void => {
+      c.localGet(D);
+      c.structGet(dynT, DYN_REF);
+      c.refCast(this.net.srvType());
+      c.localSet(V);
+    };
+    const strArg = (local: number, value: string): void => {
+      c.localGet(local);
+      c.structGet(dynT, DYN_REF);
+      c.refCast(this.strType);
+      this.pushStrLitInto(c, value);
+      c.call(this.strEqHelper());
+    };
+    if (method === "on" || method === "once" || method === "addListener") {
+      const once = method === "once" ? 1 : 0;
+      // checkListener(listener) first.
+      isKind(A1, DK.FUNC);
+      c.i32Eqz();
+      c.ifVoid();
+      this.emitSetCellError(c, "%TypeError", "TypeError", (c2) => {
+        this.pushStrLitInto(c2, `The "listener" argument must be of type function. Received `);
+        c2.localGet(A1);
+        c2.call(this.dyn.specificType());
+        c2.call(this.concatHelper());
+      }, "ERR_INVALID_ARG_TYPE");
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      isKind(A0, DK.STR);
+      c.i32Eqz();
+      c.ifVoid();
+      fence(`'${method}' with a non-string event`);
+      c.end();
+      const add = (owner: "sock" | "srv", list: NetList, kind: "void" | "close" | "data" | "err" | "sock", after?: () => void): void => {
+        c.localGet(owner === "sock" ? S : V);
+        this.emitNetDynListener(c, kind, A1, D);
+        c.i32Const(once);
+        c.i32Const(0);
+        c.call(this.net.addHelper(list));
+        if (after !== undefined) after();
+        c.localGet(D);
+        c.return_();
+      };
+      const L = NET_LISTS;
+      isSock();
+      c.ifVoid();
+      castSock();
+      for (const [ev, list, kind] of [
+        ["data", L.L_DATA, "data"],
+        ["end", L.L_END, "void"],
+        ["close", L.L_CLOSE, "close"],
+        ["error", L.L_ERROR, "err"],
+        ["connect", L.L_CONNECT, "void"],
+        ["finish", L.L_FINISH, "void"],
+      ] as const) {
+        strArg(A0, ev);
+        c.ifVoid();
+        add("sock", list, kind, ev === "data" ? () => {
+          c.localGet(S);
+          c.call(this.net.dataAddedHelper());
+        } : undefined);
+        c.end();
+      }
+      c.else_();
+      castSrv();
+      for (const [ev, list, kind] of [
+        ["connection", L.LV_CONN, "sock"],
+        ["listening", L.LV_LISTENING, "void"],
+        ["close", L.LV_CLOSE, "void"],
+        ["error", L.LV_ERROR, "err"],
+      ] as const) {
+        strArg(A0, ev);
+        c.ifVoid();
+        add("srv", list, kind);
+        c.end();
+      }
+      c.end();
+      // Another event name: not modelled.
+      this.emitSetCellError(c, "%Error", "Error", (c2) => {
+        this.pushStrLitInto(c2, `'${method}' for the event '`);
+        c2.localGet(A0);
+        c2.structGet(dynT, DYN_REF);
+        c2.refCast(this.strType);
+        c2.call(this.concatHelper());
+        this.pushStrLitInto(c2, "' on a net handle is not supported yet");
+        c2.call(this.concatHelper());
+      }, null);
+      c.refNull(dynT);
+    } else if (method === "close") {
+      // Server.prototype.close([cb]) — a socket has no close member.
+      isSock();
+      c.ifVoid();
+      this.emitSetCellError(c, "%TypeError", "TypeError", (c2) => {
+        c2.localGet(2);
+        this.pushStrLitInto(c2, " is not a function");
+        c2.call(this.concatHelper());
+      }, null);
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      castSrv();
+      c.refNull(vPair.clos);
+      c.localSet(VCB);
+      isKind(A0, DK.FUNC);
+      c.ifVoid();
+      // close(cb) on a server that is not listening: Node hands cb an
+      // ERR_SERVER_NOT_RUNNING; not built.
+      c.localGet(V);
+      c.call(this.net.srvListeningHelper());
+      c.i32Eqz();
+      c.ifVoid();
+      fence("close(cb) while not listening");
+      c.end();
+      this.emitNetDynListener(c, "void", A0, D);
+      c.localSet(VCB);
+      c.end();
+      c.localGet(V);
+      c.localGet(VCB);
+      c.call(this.net.srvCloseHelper());
+      c.localGet(D);
+    } else {
+      // The Socket members.
+      isSock();
+      c.i32Eqz();
+      c.ifVoid();
+      this.emitSetCellError(c, "%TypeError", "TypeError", (c2) => {
+        c2.localGet(2);
+        this.pushStrLitInto(c2, " is not a function");
+        c2.call(this.concatHelper());
+      }, null);
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      castSock();
+      if (method === "write" || method === "end") {
+        const chunk = A0;
+        // (chunk, cb) / (chunk, encoding, cb); end also takes (cb).
+        c.refNull(ecPair.clos);
+        c.localSet(CB);
+        if (method === "end") {
+          isKind(A0, DK.FUNC);
+          c.ifVoid();
+          this.emitNetDynListener(c, "cb", A0, D);
+          c.localSet(CB);
+          c.globalGet(this.dyn.undefinedGlobal());
+          c.localSet(A0);
+          c.end();
+        }
+        isKind(A1, DK.FUNC);
+        c.ifVoid();
+        this.emitNetDynListener(c, "cb", A1, D);
+        c.localSet(CB);
+        c.else_();
+        // An encoding: absent, or utf8.
+        isKind(A1, DK.UNDEF);
+        isKind(A1, DK.NULL);
+        c.i32Or();
+        c.i32Eqz();
+        c.ifVoid();
+        isKind(A1, DK.STR);
+        c.ifResult(I32);
+        strArg(A1, "utf8");
+        strArg(A1, "utf-8");
+        c.i32Or();
+        c.else_();
+        c.i32Const(0);
+        c.end();
+        c.i32Eqz();
+        c.ifVoid();
+        fence(`'${method}' with an encoding other than utf8`);
+        c.end();
+        c.end();
+        isKind(A2, DK.FUNC);
+        c.ifVoid();
+        this.emitNetDynListener(c, "cb", A2, D);
+        c.localSet(CB);
+        c.end();
+        c.end();
+        c.localGet(S);
+        c.localGet(chunk);
+        c.localGet(CB);
+        c.call(this.netDynChunkFn(method === "write"));
+        if (method === "write") {
+          c.localSet(NAME);
+          c.globalGet(this.exc().kindG);
+          c.ifVoid();
+          c.refNull(dynT);
+          c.return_();
+          c.end();
+          this.dyn.boxBool(c, (x) => x.localGet(NAME));
+        } else {
+          c.globalGet(this.exc().kindG);
+          c.ifVoid();
+          c.refNull(dynT);
+          c.return_();
+          c.end();
+          c.localGet(D);
+        }
+      } else if (method === "setNoDelay") {
+        c.localGet(S);
+        isKind(A0, DK.UNDEF);
+        c.ifResult(I32);
+        c.i32Const(1);
+        c.else_();
+        c.localGet(A0);
+        c.call(this.dyn.truthy());
+        c.end();
+        c.call(this.net.setNoDelayHelper());
+        c.localGet(D);
+      } else if (method === "destroy") {
+        isKind(A0, DK.UNDEF);
+        isKind(A0, DK.NULL);
+        c.i32Or();
+        c.i32Eqz();
+        c.ifVoid();
+        fence("destroy(err)");
+        c.end();
+        c.localGet(S);
+        c.refNull(this.exc().errT);
+        c.call(this.net.destroyHelper());
+        c.localGet(D);
+      } else if (method === "destroySoon") {
+        c.localGet(S);
+        c.call(this.net.destroySoonHelper());
+        c.globalGet(this.dyn.undefinedGlobal());
+      } else {
+        c.localGet(S);
+        c.call(method === "pause" ? this.net.pauseHelper() : this.net.resumeHelper());
+        c.localGet(D);
+      }
+    }
+    this.mb.setBody(
+      idx,
+      [this.net.sockRef(), this.net.srvRef(), I32, dynRefT, dynRefT, dynRefT, { kind: "ref", nullable: true, typeIndex: ecPair.clos }, I32, this.bytesB.bytesRef(), { kind: "ref", nullable: true, typeIndex: vPair.clos }],
+      c.bytes(),
+    );
+    void B;
+    return idx;
   }
 
   private cpaField: ChildAsyncBuilder | null = null;
@@ -8901,6 +10626,19 @@ class Assembler {
         c.call(box);
         return true;
       }
+      // INC-29 U1: a node:net Socket or Server boxes BY REFERENCE (the
+      // checked-dynamic tree's HANDLE kind; DYN_NUM is the tag).
+      case "netSocket":
+      case "netServer":
+        if (!this.netModule) {
+          this.refuse(`dynFrom:${t.kind}`, loc);
+          return false;
+        }
+        c.i32Const(DK.HANDLE);
+        c.f64Const(t.kind === "netSocket" ? 1 : 2);
+        c.localGet(0);
+        c.structNew(dyn.dynT());
+        return true;
       default:
         this.refuse(`dynFrom:${t.kind}`, loc);
         return false;
@@ -11211,6 +12949,12 @@ class Assembler {
       // mapTypeSoft and its array-element list carry the same arm.
       case "childStream":
         return this.cpa.streamRef();
+      // INC-29 U1: node:net's Socket and Server (net.ts) — never fail;
+      // mapTypeSoft and its array-element list carry the same arms.
+      case "netSocket":
+        return this.net.sockRef();
+      case "netServer":
+        return this.net.srvRef();
       // INC-27 U1: the $sym struct (symbols.ts) — ONE representation
       // whatever the symbol (registered or not, described or not), same
       // shape as bytes/promise/dyn/regex/stats just above: this arm
@@ -11278,6 +13022,8 @@ class Assembler {
           t.elem.kind === "stats" || // INC-26 P5, CP1 delta 29286fa4 D-2/ruling(1)(ii): a `stats[]` must not soft-map to a placeholder while mapType succeeds on it (the increment-6/7 lockstep lesson this list's own header comment names) — latent (no program in the twelve builds one), fixed now per the ruling's own reasoning
           t.elem.kind === "child" || // INC-28 U2: a ChildProcess[] (mapType's child arm never fails), the lockstep this list's header comment names
           t.elem.kind === "childStream" || // INC-28 U3: a stream[] (mapType's childStream arm never fails), the same lockstep
+          t.elem.kind === "netSocket" || // INC-29 U1: a Socket[] (mapType's netSocket arm never fails), the same lockstep
+          t.elem.kind === "netServer" || // INC-29 U1: a Server[], the same lockstep
           t.elem.kind === "symbol" || // INC-27 U1: mapTypeSoft must admit symbol wherever mapType does, including as an array element, or the I32 placeholder is declared for a field that actually holds a $sym struct — the same lockstep-bug class this list's own header comment names
           (t.elem.kind === "object" && this.objectMappable(t.elem.className));
         if (!mappable) return I32;
@@ -11383,6 +13129,11 @@ class Assembler {
       // INC-28 U3: mapType's childStream arm, in lockstep.
       case "childStream":
         return this.cpa.streamRef();
+      // INC-29 U1: mapType's netSocket / netServer arms, in lockstep.
+      case "netSocket":
+        return this.net.sockRef();
+      case "netServer":
+        return this.net.srvRef();
       // INC-27 U1: mapType never fails on symbol either — same
       // consistency rule as every other never-fails arm above
       // (dyn/jsval/bytes/regex/stats). This case and mapType's own
@@ -14866,14 +16617,30 @@ class Assembler {
           return;
         }
         if (e.fn === "error.propTypeThrow") {
-          // net.createServer's option-bag validation (lower-server.ts)
-          // ONLY — both call sites sit behind Joe's standing net.*
-          // deferral, so this arm has no in-tier execution path today.
-          // Condition 3's ruling: defer rather than build without real
-          // coverage. Refuses BY NAME rather than silently falling
-          // through to argTypeThrow's shape or miscompiling.
-          this.refuse(`libCall:${e.fn}`, e.loc);
-          code.unreachable();
+          // INC-29 U1: the PROPERTY twin of error.argTypeThrow — Node's
+          // ERR_INVALID_ARG_TYPE for a dotted name ("The "options.host"
+          // property must be ..."), compiler-resolved by lower-server.ts's
+          // option-bag ladders (and lower-dgram.ts's), the runtime piece
+          // again dyn.ts's specificType().
+          const nameArg = e.args[0]!;
+          const expectedArg = e.args[1]!;
+          const gotArg = e.args[2]!;
+          if (nameArg.kind !== "strLit" || expectedArg.kind !== "strLit") {
+            throw new Error("wasm emitter bug: error.propTypeThrow's name/expected args must be compile-time literals");
+          }
+          this.emitSetCellError(
+            code,
+            "%TypeError",
+            "TypeError",
+            (c) => {
+              this.pushStrLitInto(c, `The "${nameArg.value}" property must be ${expectedArg.value}. Received `);
+              this.walkExpr(gotArg);
+              c.call(this.dyn.specificType());
+              c.call(this.concatHelper());
+            },
+            "ERR_INVALID_ARG_TYPE",
+          );
+          this.emitUnwind();
           return;
         }
         if (e.fn === "regex.new") {
@@ -18173,6 +19940,7 @@ class Assembler {
           code.unreachable();
           return;
         }
+        if (this.emitNetLibCall(e)) return;
         if (this.emitBufferLibCall(e)) return;
         if (this.emitTimerCall(e)) return;
         if (this.emitEmitterLibCall(e)) return;
@@ -18563,7 +20331,11 @@ class Assembler {
           case "array":
           case "union":
           case "promise":
-          case "bytes": {
+          case "bytes":
+          // INC-29 U1: a node:net Socket / Server, boxed by reference
+          // (emitDynFromBody's own arm; refused outside a net module).
+          case "netSocket":
+          case "netServer": {
             // The composite conversion is a per-typeKey WALKER (the C
             // emitter's sc_td_N): a deep copy for the structured kinds, a
             // reference box for a promise, the `%error` encoding for an
@@ -18736,6 +20508,20 @@ class Assembler {
         const d = this.acquireScratch(this.dyn.dynRef());
         this.walkExpr(e.value);
         code.localSet(d);
+        // INC-29 U1 (review): `in` on a net handle is fenced (SEMANTICS.md
+        // S087 (f)) — the handle's members are not a table to ask. Only in
+        // a module that boxes handles; the may-throw view reads dynHasKey
+        // as throwing there, and the pending check follows below.
+        const handleIn = this.netModule && this.dyn.handleLive();
+        if (handleIn) {
+          code.localGet(d);
+          code.structGet(this.dyn.dynT(), DYN_KIND);
+          code.i32Const(DK.HANDLE);
+          code.i32Eq();
+          code.ifVoid();
+          this.emitSetCellError(code, "%Error", "Error", (c2) => this.pushStrLitInto(c2, "'in' or Object.hasOwn on a net handle is not supported yet"), null);
+          code.end();
+        }
         code.localGet(d);
         code.structGet(this.dyn.dynT(), DYN_KIND);
         code.i32Const(DK.OBJ);
@@ -18790,6 +20576,7 @@ class Assembler {
         this.close();
         if (e.negated === true) code.i32Eqz();
         this.releaseScratch(this.dyn.dynRef(), d);
+        if (handleIn) this.emitPendingCheck();
         return;
       }
 
@@ -25357,7 +27144,10 @@ class Assembler {
         }
         if (
           k === "array" || k === "record" || k === "object" || k === "promise" ||
-          k === "classval" || k === "map" || k === "set" || k === "bytes" || k === "symbol"
+          k === "classval" || k === "map" || k === "set" || k === "bytes" || k === "symbol" ||
+          // INC-29 U1: a node:net Socket / Server is one GC struct per
+          // handle; identity is the reference (`c.pause() === c`).
+          k === "netSocket" || k === "netServer"
         ) {
           // Reference identity — JS object/function equality exactly.
           // Every one of these is a GC struct or array reference and
