@@ -100,6 +100,27 @@ export interface NetDeps {
   /** `(dyn | null) -> i32`: connect's autoSelectFamilyAttemptTimeout
    * validation (null = absent); 0 with the error pending. */
   attemptCheck: () => number;
+  /** INC-29 U2: present only in a module that uses node:http (http.ts).
+   * Every http-only field, list and behaviour below is gated on it, so a
+   * module without node:http keeps U1's bytes. */
+  http?: NetHttpHooks;
+}
+
+/** INC-29 U2: what an http module adds to its sockets and servers. */
+export interface NetHttpHooks {
+  /** `(sock, bytes)`: Parser::OnStreamRead — the http parser that
+   * consumed this socket's handle reads the data (http.ts). */
+  consumedRead: () => number;
+  /** `(srv)`: httpServerPreClose, run by an http server's close. */
+  preClose: () => number;
+  /** timers.ts: `(clos, ms) -> id` (a one-shot with a handle). */
+  setTimeoutHandle: () => number;
+  /** timers.ts: `(id)` clearTimeout. */
+  clearTimer: () => number;
+  /** timers.ts: `(id) -> id` refresh(). */
+  refreshTimer: () => number;
+  /** timers.ts: `(id) -> id` unref(). */
+  unrefTimer: () => number;
 }
 
 /* netCall's ops (abi.ts). */
@@ -174,6 +195,7 @@ const wFinalCalled = 1 << 11;
 const wOnFinished = 1 << 18;
 const wBufferProcessing = 1 << 19;
 const wAllNoop = 1 << 20;
+const wCorked = 1 << 21; // INC-29 U2 (http modules)
 
 /* ── $sock's fields ───────────────────────────────────────────────── */
 const S_H = 0; // i32: the host handle, 0 = none
@@ -233,6 +255,38 @@ const S_LCONNECT_N = 53;
 const S_LFINISH = 54;
 const S_LFINISH_N = 55;
 const S_LOOKUP = 56; // i32: a RESOLVE is outstanding for this socket
+/* INC-29 U2: the http module's extra $sock fields (absent elsewhere). */
+const S_CORKED = 57; // i32: the Writable's corked counter
+const S_UNREF = 58; // i32: the handle is unref'd
+const S_TMO = 59; // f64: this[kTimeout]'s timer id (0 = none)
+const S_TIMEOUT = 60; // f64: socket.timeout (-1 = undefined)
+const S_HTTPMSG = 61; // eqref: socket._httpMessage
+const S_PARSER = 62; // eqref: socket.parser
+const S_CONSUMED = 63; // i32: the handle is consumed by socket.parser
+const S_HPAUSED = 64; // i32: socket._paused (the http server's flag)
+const S_HADERR = 65; // i32: socket._hadError
+const S_HALFOPEN = 66; // i32: allowHalfOpen
+const S_KEEPALIVE = 67; // i32: setKeepAlive's flag (recorded only: SEMANTICS.md S088 (c))
+const S_LWQS = 68; // i32: kLastWriteQueueSize
+const S_LDRAIN = 69;
+const S_LDRAIN_N = 70;
+const S_LTIMEOUT = 71;
+const S_LTIMEOUT_N = 72;
+const S_LPAUSE = 73;
+const S_LPAUSE_N = 74;
+const S_LRESUME = 75;
+const S_LRESUME_N = 76;
+const S_LFREE = 77;
+const S_LFREE_N = 78;
+const S_LAGENTRM = 79;
+const S_LAGENTRM_N = 80;
+const S_HCLI = 81; // eqref: http.ts's per-socket client listeners
+const S_FREEGUARD = 82; // i32: the Agent's free-socket read guard is the handle's onread
+/** INC-29 U2: the $sock field indices http.ts reads and writes. */
+export const NET_SOCK_HTTP = {
+  S_HTTPMSG, S_PARSER, S_CONSUMED, S_HPAUSED, S_HADERR, S_TIMEOUT, S_UNREF, S_CORKED, S_KEEPALIVE, S_HCLI, S_FREEGUARD,
+  S_SERVER: 20, S_WLEN: 7, S_HAS_HANDLE: 42, S_CONNECTING: 19, S_RS: 1, S_WS: 2, S_RLEN: 3, S_H: 0, S_READING: 29,
+};
 
 /* ── $srv's fields ────────────────────────────────────────────────── */
 const V_H = 0; // i32: the listening handle, 0 = none (Node's _handle)
@@ -254,6 +308,12 @@ const V_LOOKUP_PORT = 15; // i32: lookupAndListen's port
 const V_LOOKUP_LID = 16; // i32: lookupAndListen's captured listeningId
 const V_LOOKUP = 17; // i32: a RESOLVE is outstanding for this server
 const V_FLAGS = 18; // i32: listen flags (bit 0 = ipv6Only)
+/* INC-29 U2: the http module's extra $srv fields. */
+const V_HTTP = 19; // eqref: the http server's own state (http.ts), null for a net.Server
+const V_HALFOPEN = 20; // i32: allowHalfOpen
+const V_NODELAY = 21; // i32: noDelay
+/** INC-29 U2: the $srv field indices http.ts reads and writes. */
+export const NET_SRV_HTTP = { V_HTTP, V_HALFOPEN, V_NODELAY, V_H: 0, V_CONNS: 1 };
 
 /* ── the tick / internal-listener environment ─────────────────────── */
 const T_SOCK = 1;
@@ -283,7 +343,18 @@ const LV_LISTENING: ListSpec = { owner: "srv", arr: V_LLISTENING, n: V_LLISTENIN
 const LV_CLOSE: ListSpec = { owner: "srv", arr: V_LCLOSE, n: V_LCLOSE_N, arg: "void" };
 const LV_ERROR: ListSpec = { owner: "srv", arr: V_LERROR, n: V_LERROR_N, arg: "err" };
 
-export const NET_LISTS = { L_DATA, L_END, L_CLOSE, L_ERROR, L_CONNECT, L_FINISH, LV_CONN, LV_LISTENING, LV_CLOSE, LV_ERROR };
+/* INC-29 U2: the http module's extra socket lists. */
+const L_DRAIN: ListSpec = { owner: "sock", arr: S_LDRAIN, n: S_LDRAIN_N, arg: "void" };
+const L_TIMEOUT: ListSpec = { owner: "sock", arr: S_LTIMEOUT, n: S_LTIMEOUT_N, arg: "void" };
+const L_PAUSE: ListSpec = { owner: "sock", arr: S_LPAUSE, n: S_LPAUSE_N, arg: "void" };
+const L_RESUME: ListSpec = { owner: "sock", arr: S_LRESUME, n: S_LRESUME_N, arg: "void" };
+const L_FREE: ListSpec = { owner: "sock", arr: S_LFREE, n: S_LFREE_N, arg: "void" };
+const L_AGENTRM: ListSpec = { owner: "sock", arr: S_LAGENTRM, n: S_LAGENTRM_N, arg: "void" };
+
+export const NET_LISTS = {
+  L_DATA, L_END, L_CLOSE, L_ERROR, L_CONNECT, L_FINISH, LV_CONN, LV_LISTENING, LV_CLOSE, LV_ERROR,
+  L_DRAIN, L_TIMEOUT, L_PAUSE, L_RESUME, L_FREE, L_AGENTRM,
+};
 export type NetList = ListSpec;
 
 /** Node's uv error messages (util.getSystemErrorMap(), v24.18.1) for the
@@ -529,6 +600,13 @@ export class NetBuilder {
         { storage: I32, mutable: true }, // V_LOOKUP_LID
         { storage: I32, mutable: true }, // V_LOOKUP
         { storage: I32, mutable: true }, // V_FLAGS
+        ...(this.deps.http !== undefined
+          ? [
+              { storage: EQ_REF, mutable: true }, // V_HTTP
+              { storage: I32, mutable: true }, // V_HALFOPEN
+              { storage: I32, mutable: true }, // V_NODELAY
+            ]
+          : []),
       ]);
     }
     return this.srvTField;
@@ -601,6 +679,28 @@ export class NetBuilder {
         { storage: ent, mutable: true },
         { storage: I32, mutable: true },
         { storage: I32, mutable: true }, // S_LOOKUP
+        ...(this.deps.http !== undefined
+          ? [
+              { storage: I32, mutable: true }, // S_CORKED
+              { storage: I32, mutable: true }, // S_UNREF
+              { storage: F64, mutable: true }, // S_TMO
+              { storage: F64, mutable: true }, // S_TIMEOUT
+              { storage: EQ_REF, mutable: true }, // S_HTTPMSG
+              { storage: EQ_REF, mutable: true }, // S_PARSER
+              { storage: I32, mutable: true }, // S_CONSUMED
+              { storage: I32, mutable: true }, // S_HPAUSED
+              { storage: I32, mutable: true }, // S_HADERR
+              { storage: I32, mutable: true }, // S_HALFOPEN
+              { storage: I32, mutable: true }, // S_KEEPALIVE
+              { storage: I32, mutable: true }, // S_LWQS
+              ...Array.from({ length: 6 }, () => [
+                { storage: ent, mutable: true },
+                { storage: I32, mutable: true },
+              ]).flat(),
+              { storage: EQ_REF, mutable: true }, // S_HCLI
+              { storage: I32, mutable: true }, // S_FREEGUARD
+            ]
+          : []),
       ]);
     }
     return this.sockTField;
@@ -1083,7 +1183,7 @@ export class NetBuilder {
   /** `%w.net.remove<list>(owner, entOrClos)` — remove the LAST entry
    * whose entry (or whose closure) is `x` (removeListener's own search
    * order). */
-  private removeHelper(spec: ListSpec): number {
+  removeHelper(spec: ListSpec): number {
     return this.fn(`remove.${this.listName(spec)}`, [this.ownerRef(spec), EQ_REF], [], (f) => {
       const c = f.c;
       const O = 0;
@@ -1242,6 +1342,11 @@ export class NetBuilder {
   }
 
   /** `%w.net.count<list>(owner) -> i32` */
+  /** INC-29 U2: `%w.net.count<list>(owner) -> i32` — listenerCount. */
+  countHelper(spec: ListSpec): number {
+    return this.fn(`count.${this.listName(spec)}`, [this.ownerRef(spec)], [I32], (f) => this.countOf(f.c, spec, 0));
+  }
+
   private countOf(c: Code, spec: ListSpec, o: number): void {
     c.localGet(o);
     c.structGet(this.ownerType(spec), spec.n);
@@ -2807,10 +2912,16 @@ export class NetBuilder {
         c.call(this.emitHelper(L_END));
         c.drop();
         this.excReturn(c);
-        // A Socket's allowHalfOpen is false here (no lowering sets it).
+        // A Socket's allowHalfOpen is false here (no lowering sets it) —
+        // except an http server's (INC-29 U2), which is true.
         this.if_(c, () => {
           c.localGet(S);
           c.call(this.writableHelper());
+          if (this.deps.http !== undefined) {
+            this.sget(c, S, S_HALFOPEN);
+            c.i32Eqz();
+            c.i32And();
+          }
         }, () => {
           this.nextTick(c, this.endWritableTick(), { sock: () => c.localGet(S) });
         }, () => {
@@ -2889,6 +3000,13 @@ export class NetBuilder {
         this.excReturn(c);
       });
       this.sbitClr(c, S, S_RS, kResumeScheduled);
+      // INC-29 U2: stream.emit('resume') — an http server listens for it.
+      if (this.deps.http !== undefined) {
+        c.localGet(S);
+        c.call(this.emitHelper(L_RESUME));
+        c.drop();
+        this.excReturn(c);
+      }
       c.localGet(S);
       c.call(this.flowHelper());
       this.excReturn(c);
@@ -2912,6 +3030,12 @@ export class NetBuilder {
       }, () => {
         this.sbitSet(c, S, S_RS, kHasFlowing);
         this.sbitClr(c, S, S_RS, kFlowing);
+        // INC-29 U2: this.emit('pause') — an http server listens for it.
+        if (this.deps.http !== undefined) {
+          c.localGet(S);
+          c.call(this.emitHelper(L_PAUSE));
+          c.drop();
+        }
       });
       this.sbitSet(c, S, S_RS, kHasPaused | kPaused);
     });
@@ -3147,7 +3271,9 @@ export class NetBuilder {
         c.localGet(LEN);
         c.i32Add();
       });
-      this.if_(c, () => this.sbits(c, S, S_WS, wWriting | kErrored), () => {
+      // INC-29 U2: a corked socket buffers too (http modules cork).
+      const bufferMask = this.deps.http !== undefined ? wWriting | kErrored | wCorked : wWriting | kErrored;
+      this.if_(c, () => this.sbits(c, S, S_WS, bufferMask), () => {
         c.localGet(S);
         c.localGet(B);
         c.localGet(LEN);
@@ -3260,6 +3386,11 @@ export class NetBuilder {
         this.sget(c, S, S_H);
         c.i32Eqz();
       }, () => this.trap(c));
+      // INC-29 U2: this._unrefTimer()
+      if (this.deps.http !== undefined) {
+        c.localGet(S);
+        c.call(this.unrefTimerHelper());
+      }
       // WRITE: the bytes at [ptr, ptr + len).
       c.localGet(B);
       c.structGet(bt, 2);
@@ -3323,6 +3454,8 @@ export class NetBuilder {
       });
       this.if_(c, () => c.localGet(R), () => {
         this.sset(c, S, S_WPEND, () => c.i32Const(1));
+        // INC-29 U2: if (req.async) this[kLastWriteQueueSize] = req.bytes
+        if (this.deps.http !== undefined) this.sset(c, S, S_LWQS, () => c.localGet(LEN));
       }, () => {
         c.localGet(S);
         c.refNull(this.deps.errType());
@@ -3535,7 +3668,16 @@ export class NetBuilder {
         this.sget(c, S, S_WLEN);
         c.i32Eqz();
         c.i32And();
-      }, () => this.sbitClr(c, S, S_WS, wNeedDrain));
+      }, () => {
+        this.sbitClr(c, S, S_WS, wNeedDrain);
+        // INC-29 U2: stream.emit('drain') — http modules listen for it.
+        if (this.deps.http !== undefined) {
+          c.localGet(S);
+          c.call(this.emitHelper(L_DRAIN));
+          c.drop();
+          this.excReturn(c);
+        }
+      });
       this.while_(c, () => {
         c.localGet(COUNT);
         c.i32Const(0);
@@ -3677,8 +3819,9 @@ export class NetBuilder {
       const B = f.local(this.bytesRef);
       const bt = this.deps.bytesType();
       const bufT = this.deps.bufType();
+      const guard = this.deps.http !== undefined ? kDestroyed | wBufferProcessing | wBuffered | wCorked : kDestroyed | wBufferProcessing | wBuffered;
       this.if_(c, () => {
-        this.sbitsEq(c, S, S_WS, kDestroyed | wBufferProcessing | wBuffered, wBuffered);
+        this.sbitsEq(c, S, S_WS, guard, wBuffered);
         c.i32Eqz();
       }, () => c.return_());
       this.sget(c, S, S_WBUFN);
@@ -3903,6 +4046,14 @@ export class NetBuilder {
           c.localSet(ERR);
         });
       });
+      // INC-29 U2: .end() fully uncorks (http modules cork).
+      if (this.deps.http !== undefined) {
+        this.if_(c, () => this.sbits(c, S, S_WS, wCorked), () => {
+          this.sset(c, S, S_CORKED, () => c.i32Const(1));
+          c.localGet(S);
+          c.call(this.uncorkHelper());
+        });
+      }
       this.if_(c, () => {
         c.localGet(ERR);
         c.refIsNull();
@@ -3954,6 +4105,215 @@ export class NetBuilder {
           });
         });
       });
+    });
+  }
+
+  /* ── INC-29 U2: what an http module adds to a Socket ──────────────── */
+
+  /** Writable.prototype.cork */
+  corkHelper(): number {
+    return this.fn("cork", [this.sockRef()], [], (f) => {
+      const c = f.c;
+      this.sbitSet(c, 0, S_WS, wCorked);
+      this.sset(c, 0, S_CORKED, () => {
+        this.sget(c, 0, S_CORKED);
+        c.i32Const(1);
+        c.i32Add();
+      });
+    });
+  }
+
+  /** Writable.prototype.uncork */
+  uncorkHelper(): number {
+    return this.fn("uncork", [this.sockRef()], [], (f) => {
+      const c = f.c;
+      const S = 0;
+      this.if_(c, () => this.sget(c, S, S_CORKED), () => {
+        this.sset(c, S, S_CORKED, () => {
+          this.sget(c, S, S_CORKED);
+          c.i32Const(1);
+          c.i32Sub();
+        });
+        this.if_(c, () => {
+          this.sget(c, S, S_CORKED);
+          c.i32Eqz();
+        }, () => this.sbitClr(c, S, S_WS, wCorked));
+        this.if_(c, () => {
+          this.sbits(c, S, S_WS, wWriting);
+          c.i32Eqz();
+        }, () => {
+          c.localGet(S);
+          c.call(this.clearBufferHelper());
+        });
+      });
+    });
+  }
+
+  /** `socket._writableState.corked = 1` (OutgoingMessage.end's own
+   * assignment: the counter only, not the kCorked bit). */
+  corkedOneHelper(): number {
+    return this.fn("corkedOne", [this.sockRef()], [], (f) => {
+      this.sset(f.c, 0, S_CORKED, () => f.c.i32Const(1));
+    });
+  }
+
+  /** writableLength / writableCorked / writableFinished readers. */
+  wlenHelper(): number {
+    return this.fn("wlen", [this.sockRef()], [I32], (f) => this.sget(f.c, 0, S_WLEN));
+  }
+
+  writableCorkedHelper(): number {
+    return this.fn("wcorked", [this.sockRef()], [I32], (f) => this.sget(f.c, 0, S_CORKED));
+  }
+
+  /** Readable.readableLength */
+  rlenHelper(): number {
+    return this.fn("rlen", [this.sockRef()], [I32], (f) => this.sget(f.c, 0, S_RLEN));
+  }
+
+  /** Writable.needDrain */
+  needDrainHelper(): number {
+    return this.fn("needDrain", [this.sockRef()], [I32], (f) => this.sbits(f.c, 0, S_WS, wNeedDrain));
+  }
+
+  /** Socket.prototype._unrefTimer: refresh this[kTimeout]. */
+  unrefTimerHelper(): number {
+    const http = this.deps.http!;
+    return this.fn("_unrefTimer", [this.sockRef()], [], (f) => {
+      const c = f.c;
+      this.if_(c, () => {
+        this.sget(c, 0, S_TMO);
+        c.f64Const(0);
+        c.f64Ne();
+      }, () => {
+        this.sget(c, 0, S_TMO);
+        c.call(http.refreshTimer());
+        c.drop();
+      });
+    });
+  }
+
+  /** setStreamTimeout(msecs) for an msecs already a valid duration. */
+  setTimeoutHelper(): number {
+    const http = this.deps.http!;
+    return this.fn("setTimeout", [this.sockRef(), F64], [], (f) => {
+      const c = f.c;
+      const S = 0;
+      const MS = 1;
+      this.if_(c, () => {
+        c.localGet(S);
+        c.call(this.destroyedHelper());
+      }, () => c.return_());
+      this.sset(c, S, S_TIMEOUT, () => c.localGet(MS));
+      this.if_(c, () => {
+        this.sget(c, S, S_TMO);
+        c.f64Const(0);
+        c.f64Ne();
+      }, () => {
+        this.sget(c, S, S_TMO);
+        c.call(http.clearTimer());
+        this.sset(c, S, S_TMO, () => c.f64Const(0));
+      });
+      this.if_(c, () => {
+        c.localGet(MS);
+        c.f64Const(0);
+        c.f64Ne();
+      }, () => {
+        // setUnrefTimeout(this._onTimeout.bind(this), msecs)
+        this.sset(c, S, S_TMO, () => {
+          this.closure(c, this.onTimeoutTick(), { sock: () => c.localGet(S) });
+          c.localGet(MS);
+          c.call(http.setTimeoutHandle());
+          c.call(http.unrefTimer());
+        });
+      });
+    });
+  }
+
+  /** Socket.prototype._onTimeout. The handle's writeQueueSize is the
+   * bytes of the write the host still holds (S_LWQS while one is
+   * outstanding, else 0: SEMANTICS.md S088 (j)). */
+  private onTimeoutTick(): number {
+    return this.tickFn("_onTimeout", (f, e) => {
+      const c = f.c;
+      const S = e.sock;
+      // this[kTimeout] still names the timer (a fired one-shot can be
+      // refreshed while its callback runs: timers.ts's firing flag).
+      this.if_(c, () => {
+        this.sget(c, S, S_LWQS);
+        c.i32Const(0);
+        c.i32GtS();
+        this.sget(c, S, S_HAS_HANDLE);
+        c.i32And();
+        this.sget(c, S, S_WPEND);
+        c.i32Eqz();
+        c.i32And();
+      }, () => {
+        this.sset(c, S, S_LWQS, () => c.i32Const(0));
+        c.localGet(S);
+        c.call(this.unrefTimerHelper());
+        c.return_();
+      });
+      c.localGet(S);
+      c.call(this.emitHelper(L_TIMEOUT));
+      c.drop();
+    });
+  }
+
+  /** handle.reading = true; handle.readStart() (an error destroys). */
+  readStartHandleHelper(): number {
+    return this.fn("handleReadStart", [this.sockRef()], [], (f) => {
+      f.c.localGet(0);
+      f.c.call(this.tryReadStartHelper());
+    });
+  }
+
+  /** handle.reading = false; handle.readStop() */
+  readStopHandleHelper(): number {
+    return this.fn("handleReadStop", [this.sockRef()], [], (f) => {
+      const c = f.c;
+      const R = f.local(I32);
+      this.sset(c, 0, S_READING, () => c.i32Const(0));
+      c.i32Const(OP_READ_STOP);
+      c.i32Const(0);
+      c.i32Const(0);
+      this.sget(c, 0, S_H);
+      c.i32Const(0);
+      this.netCall(c);
+      c.localSet(R);
+      this.if_(c, () => {
+        c.localGet(R);
+        c.i32Const(0);
+        c.i32GtS();
+      }, () => this.trap(c));
+    });
+  }
+
+  /** Socket.prototype.ref / unref (the handle exists: the http module only
+   * calls them on connected sockets). */
+  refHelper(on: boolean): number {
+    return this.fn(on ? "ref" : "unref", [this.sockRef()], [], (f) => {
+      this.sset(f.c, 0, S_UNREF, () => f.c.i32Const(on ? 0 : 1));
+    });
+  }
+
+  /** Socket.prototype.setKeepAlive(enable): recorded, not applied
+   * (SEMANTICS.md S088 (c)). */
+  setKeepAliveHelper(): number {
+    return this.fn("setKeepAlive", [this.sockRef(), I32], [], (f) => {
+      this.sset(f.c, 0, S_KEEPALIVE, () => f.c.localGet(1));
+    });
+  }
+
+  /** Socket.prototype.connect for net.createConnection(options) with the
+   * agent's options: kSetNoDelay from options.noDelay, then
+   * socket.setTimeout(options.timeout) when it is truthy, then the
+   * connect — the same as connectHelper's otherwise. */
+  connectExHelper(): number {
+    return this.fn("connectEx", [F64, this.strRef, I32, F64], [this.sockRef()], (f) => {
+      const CB = f.local(this.ref(this.deps.voidClos().clos));
+      const ATTEMPT = f.local(this.deps.dynRef());
+      this.connectBody(f, CB, ATTEMPT, { noDelay: 2, timeout: 3 });
     });
   }
 
@@ -4351,6 +4711,17 @@ export class NetBuilder {
       const ERR = 1;
       const V = f.local(this.srvRef());
       this.sset(c, S, S_CONNECTING, () => c.i32Const(0));
+      // INC-29 U2: clearTimeout(this[kTimeout])
+      if (this.deps.http !== undefined) {
+        this.if_(c, () => {
+          this.sget(c, S, S_TMO);
+          c.f64Const(0);
+          c.f64Ne();
+        }, () => {
+          this.sget(c, S, S_TMO);
+          c.call(this.deps.http!.clearTimer());
+        });
+      }
       this.if_(c, () => this.sget(c, S, S_HAS_HANDLE), () => {
         c.localGet(S);
         c.localGet(ERR);
@@ -4633,6 +5004,26 @@ export class NetBuilder {
         c.i32Const(0);
       }
       c.i32Const(0); // S_LOOKUP
+      if (this.deps.http !== undefined) {
+        c.i32Const(0); // S_CORKED
+        c.i32Const(0); // S_UNREF
+        c.f64Const(0); // S_TMO
+        c.f64Const(-1); // S_TIMEOUT
+        c.refNull(EQ_HEAP); // S_HTTPMSG
+        c.refNull(EQ_HEAP); // S_PARSER
+        c.i32Const(0); // S_CONSUMED
+        c.i32Const(0); // S_HPAUSED
+        c.i32Const(0); // S_HADERR
+        c.i32Const(0); // S_HALFOPEN
+        c.i32Const(0); // S_KEEPALIVE
+        c.i32Const(0); // S_LWQS
+        for (let i = 0; i < 6; i++) {
+          c.refNull(this.entArrT);
+          c.i32Const(0);
+        }
+        c.refNull(EQ_HEAP); // S_HCLI
+        c.i32Const(0); // S_FREEGUARD
+      }
       c.structNew(T);
       c.localSet(S);
       c.localGet(S);
@@ -4648,6 +5039,14 @@ export class NetBuilder {
    * false). */
   private onReadableStreamEndTick(): number {
     return this.tickFn("onReadableStreamEnd", (f, e) => {
+      if (this.deps.http !== undefined) {
+        // INC-29 U2: if (!this.allowHalfOpen)
+        this.if_(f.c, () => {
+          this.sget(f.c, e.sock, S_HALFOPEN);
+          f.c.i32Eqz();
+        }, () => this.sset(f.c, e.sock, S_WAF, () => f.c.i32Const(1)));
+        return;
+      }
       this.sset(f.c, e.sock, S_WAF, () => f.c.i32Const(1));
     });
   }
@@ -5091,6 +5490,11 @@ export class NetBuilder {
       c.i32Const(0);
       c.i32Const(0);
       c.i32Const(0);
+      if (this.deps.http !== undefined) {
+        c.refNull(EQ_HEAP); // V_HTTP
+        c.i32Const(0); // V_HALFOPEN
+        c.i32Const(0); // V_NODELAY
+      }
       c.structNew(this.srvType());
     });
   }
@@ -5311,6 +5715,17 @@ export class NetBuilder {
     return this.fn("srvClose", [this.srvRef(), this.ref(this.deps.voidClos().clos)], [], (f) => {
       const c = f.c;
       const V = 0;
+      // INC-29 U2: http.Server.prototype.close runs httpServerPreClose first.
+      if (this.deps.http !== undefined) {
+        this.if_(c, () => {
+          this.vget(c, V, V_HTTP);
+          c.refIsNull();
+          c.i32Eqz();
+        }, () => {
+          c.localGet(V);
+          c.call(this.deps.http!.preClose());
+        });
+      }
       this.vset(c, V, V_LID, () => {
         this.vget(c, V, V_LID);
         c.i32Const(1);
@@ -5406,6 +5821,8 @@ export class NetBuilder {
       }, () => this.trap(c));
       c.call(this.sockNewHelper());
       c.localSet(S);
+      // INC-29 U2: allowHalfOpen: self.allowHalfOpen (an http server's).
+      if (this.deps.http !== undefined) this.sset(c, S, S_HALFOPEN, () => this.vget(c, V, V_HALFOPEN));
       this.sset(c, S, S_H, () => c.localGet(NH));
       this.sset(c, S, S_HAS_HANDLE, () => c.i32Const(1));
       c.localGet(NH);
@@ -5418,6 +5835,19 @@ export class NetBuilder {
       c.call(this.readHelper());
       c.drop();
       this.excReturn(c);
+      // INC-29 U2: if (self.noDelay) setNoDelay(true) on the handle.
+      if (this.deps.http !== undefined) {
+        this.if_(c, () => this.vget(c, V, V_NODELAY), () => {
+          this.sset(c, S, S_NODELAY, () => c.i32Const(1));
+          c.i32Const(OP_NODELAY);
+          c.i32Const(0);
+          c.i32Const(0);
+          this.sget(c, S, S_H);
+          c.i32Const(1);
+          this.netCall(c);
+          c.drop();
+        });
+      }
       this.vset(c, V, V_CONNS, () => {
         this.vget(c, V, V_CONNS);
         c.i32Const(1);
@@ -5437,18 +5867,35 @@ export class NetBuilder {
    * pending (lookupAndConnect's synchronous validation). `host` "" is
    * 'localhost'; `cb` null is none. */
   connectHelper(): number {
-    return this.fn("connect", [F64, this.strRef, this.ref(this.deps.voidClos().clos), this.deps.dynRef()], [this.sockRef()], (f) => {
+    return this.fn("connect", [F64, this.strRef, this.ref(this.deps.voidClos().clos), this.deps.dynRef()], [this.sockRef()], (f) =>
+      this.connectBody(f, 2, 3, null),
+    );
+  }
+
+  /** connectHelper's body; `ex` (INC-29 U2, connectExHelper) adds the
+   * Socket constructor's kSetNoDelay and connect()'s setTimeout. */
+  private connectBody(f: Fn, CB: number, ATTEMPT: number, ex: { noDelay: number; timeout: number } | null): void {
       const c = f.c;
       const PORT = 0;
       const HOST = 1;
-      const CB = 2;
-      const ATTEMPT = 3;
       const S = f.local(this.sockRef());
       const H2 = f.local(this.strRef);
       const I = f.local(I32);
       const FAM = f.local(I32);
       c.call(this.sockNewHelper());
       c.localSet(S);
+      if (ex !== null) {
+        this.sset(c, S, S_NODELAY, () => c.localGet(ex.noDelay));
+        this.if_(c, () => {
+          c.localGet(ex.timeout);
+          c.f64Const(0);
+          c.f64Ne();
+        }, () => {
+          c.localGet(S);
+          c.localGet(ex.timeout);
+          c.call(this.setTimeoutHelper());
+        });
+      }
       this.if_(c, () => {
         c.localGet(CB);
         c.refIsNull();
@@ -5535,7 +5982,6 @@ export class NetBuilder {
       });
       c.end();
       c.localGet(S);
-    });
   }
 
   /** lookupAndConnect's nextTick for an IP host. */
@@ -5709,6 +6155,11 @@ export class NetBuilder {
         c.i32Eqz();
       }, () => {
         this.setPeer(c, S, P);
+        // INC-29 U2: self._unrefTimer()
+        if (this.deps.http !== undefined) {
+          c.localGet(S);
+          c.call(this.unrefTimerHelper());
+        }
         this.if_(c, () => this.sget(c, S, S_NODELAY), () => {
           c.i32Const(OP_NODELAY);
           c.i32Const(0);
@@ -6324,7 +6775,40 @@ export class NetBuilder {
           c.call(this.afterConnectHelper());
         });
       });
+      // INC-29 U2: the Agent's freeSocketOnReadGuard as the handle's onread:
+      // any read (data, EOF or an error) destroys the pooled socket.
+      const freeGuard = (): void => {
+        if (this.deps.http === undefined) return;
+        this.if_(c, () => this.sget(c, S, S_FREEGUARD), () => {
+          c.localGet(S);
+          c.refNull(this.deps.errType());
+          c.call(this.destroyHelper());
+          c.return_();
+        });
+      };
       kind(EV_DATA, () => {
+        freeGuard();
+        if (this.deps.http !== undefined) {
+          // INC-29 U2: a handle an http parser consumed reads into the
+          // parser (Parser::OnStreamRead), not into the socket.
+          this.if_(c, () => this.sget(c, S, S_CONSUMED), () => {
+            this.if_(c, () => {
+              c.localGet(S);
+              c.call(this.destroyedHelper());
+              c.i32Eqz();
+            }, () => {
+              c.localGet(S);
+              c.localGet(PTR);
+              c.localGet(LEN);
+              c.call(this.bytesAtHelper());
+              c.call(this.deps.http!.consumedRead());
+            });
+            c.return_();
+          });
+          // onStreamRead: stream[kUpdateTimer]()
+          c.localGet(S);
+          c.call(this.unrefTimerHelper());
+        }
         // onStreamRead, nread > 0.
         this.if_(c, () => {
           c.localGet(S);
@@ -6375,6 +6859,13 @@ export class NetBuilder {
       kind(EV_EOF, () => {
         // onStreamRead, UV_EOF: push(null) then read(0).
         this.sset(c, S, S_READING, () => c.i32Const(0));
+        freeGuard();
+        // INC-29 U2: stream[kUpdateTimer]() (a consumed handle passes its
+        // read errors to this listener too).
+        if (this.deps.http !== undefined) {
+          c.localGet(S);
+          c.call(this.unrefTimerHelper());
+        }
         this.if_(c, () => {
           this.sbits(c, S, S_RS, kEndEmitted);
           c.i32Eqz();
@@ -6390,6 +6881,11 @@ export class NetBuilder {
       });
       kind(EV_READ_ERROR, () => {
         this.sset(c, S, S_READING, () => c.i32Const(0));
+        freeGuard();
+        if (this.deps.http !== undefined) {
+          c.localGet(S);
+          c.call(this.unrefTimerHelper());
+        }
         c.localGet(S);
         c.localGet(A);
         this.lit(c, "read");
@@ -6688,6 +7184,13 @@ export class NetBuilder {
             c.localGet(I);
             c.i32Eq();
             this.sget(c, S, S_READING);
+            // INC-29 U2: an unref'd handle's reading does not hold the loop
+            // (its requests still do).
+            if (this.deps.http !== undefined) {
+              this.sget(c, S, S_UNREF);
+              c.i32Eqz();
+              c.i32And();
+            }
             this.sget(c, S, S_CONNECTING);
             c.i32Or();
             this.sget(c, S, S_WPEND);

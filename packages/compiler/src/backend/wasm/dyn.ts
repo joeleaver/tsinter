@@ -236,6 +236,12 @@ export interface DynHandleDeps {
   /** The dispatch function for `d.method(...args)` — `(d, args, what) ->
    * dyn` — or null when the handle surface has no implementation of it. */
   invoke: (method: string) => number | null;
+  /** INC-29 U2 (http modules only): `(d, key, value)` — a property write
+   * (the error pending when it throws). Absent: the write is fenced. */
+  keySet?: () => number;
+  /** INC-29 U2 (http modules only): the handle's class names beyond
+   * Socket (1) and Server (2), by tag. */
+  classNames?: readonly (readonly [number, string])[];
 }
 
 export interface DynDeps {
@@ -3096,7 +3102,18 @@ export class DynBuilder {
       // borrow the throw below (that would be a wrong answer, not a loud
       // one).
       if (this.deps.handle !== undefined) {
-        this.arm(c, K, [DK.HANDLE], () => this.handleFence(c, "setting a property"));
+        const setter = this.deps.handle.keySet;
+        if (setter !== undefined) {
+          // INC-29 U2: the handle's own setters.
+          this.arm(c, K, [DK.HANDLE], () => {
+            c.localGet(0);
+            c.localGet(1);
+            c.localGet(2);
+            c.call(setter());
+          });
+        } else {
+          this.arm(c, K, [DK.HANDLE], () => this.handleFence(c, "setting a property"));
+        }
         this.arm(c, K, [DK.JSVAL], () => c.unreachable());
       } else {
         this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => c.unreachable());
@@ -5798,6 +5815,30 @@ export class DynBuilder {
 
   /** INC-29 U1: push the handle's class name from its tag in DYN_NUM. */
   private handleClassName(c: Code, d: () => void, prefix: string): void {
+    const more = this.deps.handle?.classNames;
+    if (more !== undefined) {
+      // INC-29 U2: http's handles (tags 3..6) name their classes too.
+      for (const [tag, name] of more) {
+        d();
+        c.structGet(this.dynT(), DYN_NUM);
+        c.f64Const(tag);
+        c.f64Eq();
+        c.ifResult(this.deps.strRef());
+        this.deps.lit(c, `${prefix}${name}`);
+        c.else_();
+      }
+      d();
+      c.structGet(this.dynT(), DYN_NUM);
+      c.f64Const(1);
+      c.f64Eq();
+      c.ifResult(this.deps.strRef());
+      this.deps.lit(c, `${prefix}Socket`);
+      c.else_();
+      this.deps.lit(c, `${prefix}Server`);
+      c.end();
+      for (let i = 0; i < more.length; i++) c.end();
+      return;
+    }
     d();
     c.structGet(this.dynT(), DYN_NUM);
     c.f64Const(1);

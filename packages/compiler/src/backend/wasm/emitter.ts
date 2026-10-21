@@ -174,6 +174,8 @@ import { FsLaddersBuilder } from "./fs-ladders.js";
 import { ChildProcBuilder, SR_ERR_CODE, SR_HAS_STATUS, SR_SIGNAL, SR_STATUS, SR_STDERR, SR_STDOUT } from "./childproc.js";
 import { CH_CODE, CH_ERR, CH_HAS_PID, CH_KILLED, CH_OUT, CH_PID, CH_STATE, ChildAsyncBuilder } from "./childasync.js";
 import { NET_LISTS, NetBuilder, type NetList } from "./net.js";
+import { ENC_NAMES as HTTP_ENC_NAMES, ENC_NONE, ENC_UTF8, HL, HttpBuilder } from "./http.js";
+import { A, Fn, type X } from "./asm.js";
 import { MapBuilder, type MapInfo, type MapKeyKind, type MapValKind } from "./maps.js";
 import { JsonBuilder, jsonQuote } from "./json.js";
 import {
@@ -1026,6 +1028,9 @@ function spawnSyncMayThrowView(mod: WModule): WModule {
       const out: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(node as Record<string, unknown>)) out[k] = copy(v);
       if (out["kind"] === "libCall" && typeof out["fn"] === "string" && keys.has(out["fn"])) out["fn"] = "cp.execSync";
+      // INC-29 U2: every node:http key can throw here (Node's validation
+      // ladders, the named fences), so each reads as a throwing call.
+      if (out["kind"] === "libCall" && typeof out["fn"] === "string" && out["fn"].startsWith("http.")) out["fn"] = "cp.execSync";
       // INC-29 U1 (review): in a module that boxes net handles, `in` on a
       // checked-dynamic value can throw (the handle fence), so it reads as
       // a throwing call here.
@@ -1132,6 +1137,38 @@ function netModuleReachable(mod: WModule): boolean {
     if (node !== null && typeof node === "object") {
       const rec = node as Record<string, unknown>;
       if (rec["kind"] === "libCall" && typeof rec["fn"] === "string" && rec["fn"].startsWith("net.") && !pure.has(rec["fn"])) {
+        found = true;
+        return;
+      }
+      // INC-29 U2: node:http is built over node:net's sockets (http.ts).
+      if (rec["kind"] === "libCall" && typeof rec["fn"] === "string" && rec["fn"].startsWith("http.")) {
+        found = true;
+        return;
+      }
+      for (const value of Object.values(rec)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn.body);
+  }
+  return found;
+}
+
+/** INC-29 U2: is this an HTTP MODULE — does any reachable function call a
+ * node:http libCall? Such a module is a net module (netModuleReachable
+ * counts the same keys) whose sockets and servers carry http.ts's fields. */
+function httpModuleReachable(mod: WModule): boolean {
+  const reachable = reachableFunctionNames(mod);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      const rec = node as Record<string, unknown>;
+      if (rec["kind"] === "libCall" && typeof rec["fn"] === "string" && rec["fn"].startsWith("http.")) {
         found = true;
         return;
       }
@@ -2201,6 +2238,8 @@ class Assembler {
   private readonly cpEventModule: boolean;
   /** INC-29 U1: some function sets a server's close override. */
   private readonly closeOverride: boolean;
+  /** INC-29 U2: the module reaches node:http (httpModuleReachable). */
+  private readonly httpModule: boolean;
   /** INC-29 U1: `tsinter.netCall`'s index, or null outside a net module. */
   private readonly netCallFunc: number | null;
   /** The exit-drain gate's static fact — see exitListenerSurfaceReachable's
@@ -2342,7 +2381,8 @@ class Assembler {
     // `wallClock`'s decision (INC-25 P6, D3/D6, C-1): present only in
     // modules that reach `date.now` — minted RIGHT AFTER `seedFunc` so
     // `seed`'s own index position is unchanged by this pass.
-    this.wallClockFunc = dateNowReachable(mod)
+    // INC-29 U2: an http module reads it too (a response's Date header).
+    this.wallClockFunc = dateNowReachable(mod) || httpModuleReachable(mod)
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_WALL_CLOCK, this.mb.funcType([], [F64]))
       : null;
     // `hostStr`/`hostNum`'s decision (INC-26 P1, D2): present only in
@@ -2397,6 +2437,7 @@ class Assembler {
     this.cpEventModule = eventModuleReachable(mod);
     this.netModule = netMod;
     this.closeOverride = closeOverrideReachable(mod);
+    this.httpModule = httpModuleReachable(mod);
     // INC-29 U1: a net module is an event module too.
     this.eventModule = this.cpEventModule || netMod;
     this.pipeModule = pipeModuleReachable(mod);
@@ -4154,6 +4195,9 @@ class Assembler {
     this.mb.exportFunc(EXPORT_ENTRY, start);
     if (this.eventModule) this.mb.exportFunc(EXPORT_LOOP, this.timers.loop());
     else if (this.timersField !== null) this.mb.exportFunc(EXPORT_TICK, this.timersField.tick());
+    // INC-29 U2: bodies built last (http.ts's drain: its checkpoint must
+    // see every queue the module ended up with).
+    for (let i = 0; i < this.lateBuilds.length; i++) this.lateBuilds[i]!();
     this.emitStatus();
     this.mb.exportMemory(EXPORT_MEMORY);
   }
@@ -7667,7 +7711,20 @@ class Assembler {
       // INC-29 U1: a net module boxes its Sockets and Servers as HANDLEs.
       ...(this.netModule
         ? {
-            handle: { keyGet: () => this.netHandleKeyGetFn(), invoke: (m: string) => this.netHandleInvokeFn(m) },
+            handle: this.httpModule
+              ? {
+                  // INC-29 U2: http's handles (tags 3..6) beside net's.
+                  keyGet: () => this.httpTopKeyGetFn(),
+                  invoke: (m: string) => this.httpTopInvokeFn(m),
+                  keySet: () => this.httpTopKeySetFn(),
+                  classNames: [
+                    [3, "IncomingMessage"],
+                    [4, "ServerResponse"],
+                    [5, "ClientRequest"],
+                    [6, "Agent"],
+                  ] as const,
+                }
+              : { keyGet: () => this.netHandleKeyGetFn(), invoke: (m: string) => this.netHandleInvokeFn(m) },
             bytesMethods: { bufType: () => this.bytesB.bufType() },
           }
         : {}),
@@ -8322,6 +8379,20 @@ class Assembler {
       inspectStr: () => this.insp.str(),
       dynRef: () => this.dyn.dynRef(),
       attemptCheck: () => this.emitNetAttemptCheckFn(),
+      // INC-29 U2: an http module's sockets and servers carry http.ts's
+      // fields and behaviours.
+      ...(this.httpModule
+        ? {
+            http: {
+              consumedRead: () => this.http.consumedReadFn(),
+              preClose: () => this.http.preCloseFn(),
+              setTimeoutHandle: () => this.timers.setTimeoutHandle(),
+              clearTimer: () => this.timers.clear(),
+              refreshTimer: () => this.timers.refresh(),
+              unrefTimer: () => this.timers.refOp(false),
+            },
+          }
+        : {}),
     });
     return this.netField;
   }
@@ -9368,7 +9439,7 @@ class Assembler {
     this.netDynAdapterFns.set(name, fn);
     const env = this.netDynEnvT(pair.clos, pair.fn);
     const c = new Code();
-    const nparams = name === "void" || name === "close" ? 1 : 2;
+    const nparams = name === "void" || name === "close" ? 1 : name === "httpReqRes" ? 3 : 2;
     const R = nparams;
     // this = the receiver, for the call's duration (dyn.this()).
     c.localGet(0);
@@ -9850,6 +9921,1817 @@ class Assembler {
     );
     void B;
     return idx;
+  }
+
+  /* ── INC-29 U2 — node:http (http.ts over net.ts) ───────────────────── */
+
+  /** Bodies built after the walk (registerLate). */
+  private readonly lateBuilds: (() => void)[] = [];
+
+  private httpField: HttpBuilder | null = null;
+
+  /** The http builder (http.ts). */
+  private get http(): HttpBuilder {
+    const errRef = (): ValType => ({ kind: "ref", nullable: true, typeIndex: this.exc().errT });
+    this.httpField ??= new HttpBuilder(this.mb, {
+      net: () => this.net,
+      strRef: () => this.strRef,
+      strType: () => this.strType,
+      pushStrLit: (c, value) => this.pushStrLitInto(c, value),
+      concat: () => this.concatHelper(),
+      f64ToStr: () => this.f64ToStrHelper(),
+      strEq: () => this.strEqHelper(),
+      voidClos: () => this.closPairFor([], []),
+      errClos: () => this.closPairFor([errRef()], []),
+      dataClos: () => this.closPairFor([this.bytesB.bytesRef()], []),
+      sockClos: () => this.closPairFor([this.net.sockRef()], []),
+      reqResClos: () => this.closPairFor([this.http.incRef(), this.http.resRef()], []),
+      incClos: () => this.closPairFor([this.http.incRef()], []),
+      nextTickEnqueue: () => this.nextTick.enqueue(),
+      excKind: () => this.exc().kindG,
+      checkpoint: (c) => this.emitCheckpoint(c),
+      errType: () => this.exc().errT,
+      newError: (c, className, name, pushMessage, pushCode) => {
+        const exc = this.exc();
+        c.globalGet(this.classes.vtGlobal(className));
+        this.pushStrLitInto(c, name);
+        pushMessage(c);
+        pushCode(c);
+        c.structNew(exc.errT);
+      },
+      throwStack: (c) => {
+        const exc = this.exc();
+        const tmp = this.netThrowTmpGlobal();
+        c.globalSet(tmp);
+        c.globalGet(tmp);
+        c.globalSet(exc.refG);
+        c.globalGet(tmp);
+        c.structGet(exc.errT, 0);
+        c.structGet(this.classes.ci(), CI_PRE);
+        c.globalSet(exc.preG);
+        c.i32Const(EXC_OBJ);
+        c.globalSet(exc.kindG);
+      },
+      bytesType: () => this.bytesB.bytesType(),
+      bufType: () => this.bytesB.bufType(),
+      strToBytes: (enc) => this.bytesB.fromStrHelper(enc),
+      setTimeoutHandle: () => this.timers.setTimeoutHandle(),
+      setInterval: () => this.timers.setInterval(),
+      clearTimer: () => this.timers.clear(),
+      unrefTimer: () => this.timers.refOp(false),
+      now: () => this.nowFuncOrThrow(),
+      wallClock: () => this.wallClockFuncOrThrow(),
+      inspectStr: () => this.insp.str(),
+      inspectStrArr: () => this.httpInspectStrArrFn(),
+      numReceived: () => this.bytesB.numReceivedHelper(),
+      registerLate: (build) => this.lateBuilds.push(build),
+      strToNumber: () => this.strToNumHelper(),
+      utf8Decode: () => this.bytesB.toStrHelper("utf8"),
+      toLowerCase: () => this.casing.toLowerCase(),
+    });
+    return this.httpField;
+  }
+
+  /** The string vector type (arrays of strings). */
+  private strVecInfo(): VecInfo {
+    return this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!;
+  }
+
+  /** The listener ADAPTER for a user callback of type `cbType` on an http
+   * list whose fixed closure takes `fixed` (the list's own arguments): a
+   * function of the fixed type whose environment holds the user's
+   * closure, which it calls with the arguments its own parameters take
+   * (a prefix of the list's, or the value boxed for a `dyn` parameter). */
+  private readonly httpAdapterFns = new Map<string, { fn: number; env: number }>();
+
+  private httpAdapterFor(
+    kind: "reqres" | "inc" | "data" | "void",
+    cbType: IrType & { kind: "func" },
+    loc: SrcLoc | undefined,
+  ): { fn: number; env: number } | null {
+    const user = this.closSigFor(cbType, loc);
+    if (user === null) return null;
+    const fixedParams: ValType[] =
+      kind === "reqres" ? [this.http.incRef(), this.http.resRef()]
+      : kind === "inc" ? [this.http.incRef()]
+      : kind === "data" ? [this.bytesB.bytesRef()]
+      : [];
+    const want: IrType["kind"][] =
+      kind === "reqres" ? ["httpReq", "httpRes"] : kind === "inc" ? ["httpReq"] : kind === "data" ? ["bytes"] : [];
+    if (cbType.params.length > want.length) {
+      this.refuse(`libCall:http.listener:${kind}:arity`, loc);
+      return null;
+    }
+    const boxes: (number | null)[] = [];
+    for (let i = 0; i < cbType.params.length; i++) {
+      const p = cbType.params[i]!;
+      if (p.kind === want[i]) {
+        boxes.push(null);
+      } else if (p.kind === "dyn") {
+        const t: IrType = want[i] === "bytes" ? BYTES_U8 : ({ kind: want[i] } as IrType);
+        const box = want[i] === "bytes" ? this.netBoxBufferFn() : this.dynFromHelper(t, loc);
+        if (box === null) return null;
+        boxes.push(box);
+      } else {
+        this.refuse(`libCall:http.listener:${kind}:${p.kind}`, loc);
+        return null;
+      }
+    }
+    const key = `${kind}:${user.clos}:${cbType.params.map((p) => p.kind).join(",")}`;
+    const hit = this.httpAdapterFns.get(key);
+    if (hit !== undefined) return hit;
+    const fixed = this.closPairFor(fixedParams, []);
+    const env = this.mb.subStructType(
+      `httpAdapterEnv:${key}`,
+      [
+        { storage: { kind: "ref", nullable: false, typeIndex: fixed.fn }, mutable: false },
+        { storage: { kind: "ref", nullable: true, typeIndex: user.clos }, mutable: false },
+      ],
+      fixed.clos,
+    );
+    const fn = this.mb.declareFunc(fixed.fn, `%w.http.adapter.${this.httpAdapterFns.size}`);
+    const made = { fn, env };
+    this.httpAdapterFns.set(key, made);
+    const c = new Code();
+    const U = 1 + fixedParams.length;
+    c.localGet(0);
+    c.refCast(env);
+    c.structGet(env, 1);
+    c.localSet(U);
+    c.localGet(U);
+    for (let i = 0; i < cbType.params.length; i++) {
+      c.localGet(1 + i);
+      const box = boxes[i];
+      if (box !== null && box !== undefined) c.call(box);
+    }
+    c.localGet(U);
+    c.structGet(user.clos, 0);
+    c.callRef(user.fn);
+    if (cbType.ret.kind !== "void") c.drop();
+    this.mb.setBody(fn, [{ kind: "ref", nullable: true, typeIndex: user.clos }], c.bytes());
+    return made;
+  }
+
+  /** Push the listener closure for `cbExpr` on an http list, or false
+   * (refused). */
+  private emitHttpListener(cbExpr: WExpr, kind: "reqres" | "inc" | "data" | "void" | "err", fnName: string, loc: SrcLoc | undefined): boolean {
+    const code = this.fn.code;
+    const cbType = cbExpr.type;
+    if (cbType.kind !== "func") {
+      this.refuse(`libCall:${fnName}:callback-shape`, loc);
+      return false;
+    }
+    if (cbType.rest === true) {
+      this.refuse(cbType.restAbi === "jsval" ? "type:func-rest-jsval" : "type:func-rest", loc);
+      return false;
+    }
+    if (kind === "err") {
+      if (cbType.params.length > 1) {
+        this.refuse(`libCall:${fnName}:callback-shape`, loc);
+        return false;
+      }
+      const adapter = this.errorAdapterFor(cbType, loc);
+      if (adapter === null) return false;
+      this.mb.declareFuncRef(adapter.fn);
+      code.refFunc(adapter.fn);
+      this.walkExpr(cbExpr);
+      code.structNew(adapter.env);
+      return true;
+    }
+    const exact =
+      cbType.ret.kind === "void" &&
+      (kind === "void" ? cbType.params.length === 0
+        : kind === "data" ? cbType.params.length === 1 && cbType.params[0]!.kind === "bytes"
+        : kind === "inc" ? cbType.params.length === 1 && cbType.params[0]!.kind === "httpReq"
+        : cbType.params.length === 2 && cbType.params[0]!.kind === "httpReq" && cbType.params[1]!.kind === "httpRes");
+    if (exact) {
+      this.walkExpr(cbExpr);
+      return true;
+    }
+    const adapter = this.httpAdapterFor(kind, cbType, loc);
+    if (adapter === null) return false;
+    this.mb.declareFuncRef(adapter.fn);
+    code.refFunc(adapter.fn);
+    this.walkExpr(cbExpr);
+    code.structNew(adapter.env);
+    return true;
+  }
+
+  /** The agent: false detection: the lowering injects `Connection: close`
+   * at the end of a literal headers array with the CALL's own location
+   * (lower-server.ts); a header the program wrote carries its property's.
+   * Answers the headers expression without the injected pair. */
+  private httpAgentFalse(headers: WExpr, callLoc: SrcLoc | undefined): WExpr | null {
+    if (headers.kind !== "arrayLit") return null;
+    const n = headers.elems.length;
+    if (n < 2) return null;
+    const k = headers.elems[n - 2]!;
+    const v = headers.elems[n - 1]!;
+    const sameLoc = (a: SrcLoc | undefined, b: SrcLoc | undefined): boolean =>
+      a !== undefined && b !== undefined && JSON.stringify(a) === JSON.stringify(b);
+    if (k.kind === "strLit" && k.value === "Connection" && v.kind === "strLit" && v.value === "close" && sameLoc(k.loc, callLoc) && sameLoc(v.loc, callLoc)) {
+      return { ...headers, elems: headers.elems.slice(0, n - 2) };
+    }
+    return null;
+  }
+
+  /** Push a `string | undefined` union of e.type from a nullable string
+   * the caller pushes. */
+  private emitStrOrUndefined(t: IrType, push: () => void, fnName: string, loc: SrcLoc | undefined): boolean {
+    const code = this.fn.code;
+    if (t.kind !== "union") {
+      this.refuse(`libCall:${fnName}:shape`, loc);
+      return false;
+    }
+    const def = this.unionDef(t.unionId);
+    const sTag = def.arms.findIndex((a) => a.kind === "string");
+    const uTag = def.arms.findIndex((a) => a.kind === "undefinedT");
+    const armSt = sTag < 0 ? null : this.unionArmStruct(t.unionId, sTag, loc);
+    const unionVal = this.mapType(t, loc);
+    if (def.arms.length !== 2 || uTag < 0 || armSt === null || unionVal === null) {
+      this.refuse(`libCall:${fnName}:shape`, loc);
+      return false;
+    }
+    const A = this.acquireScratch(this.strRef);
+    push();
+    code.localTee(A);
+    code.refIsNull();
+    this.openIfResult(unionVal);
+    code.globalGet(this.unions.unitGlobal(uTag));
+    code.else_();
+    code.i32Const(sTag);
+    code.localGet(A);
+    code.structNew(armSt);
+    this.close();
+    this.releaseScratch(this.strRef, A);
+    return true;
+  }
+
+  /** Push a `number | undefined` union of e.type from an f64 the caller
+   * pushes (`isUndef` pushes the i32 that selects the undefined arm). */
+  private emitNumOrUndefined(t: IrType, pushNum: () => void, isUndef: () => void, fnName: string, loc: SrcLoc | undefined): boolean {
+    const code = this.fn.code;
+    if (t.kind !== "union") {
+      this.refuse(`libCall:${fnName}:shape`, loc);
+      return false;
+    }
+    const def = this.unionDef(t.unionId);
+    const nTag = def.arms.findIndex((a) => a.kind === "f64");
+    const uTag = def.arms.findIndex((a) => a.kind === "undefinedT");
+    const armSt = nTag < 0 ? null : this.unionArmStruct(t.unionId, nTag, loc);
+    const unionVal = this.mapType(t, loc);
+    if (def.arms.length !== 2 || uTag < 0 || armSt === null || unionVal === null) {
+      this.refuse(`libCall:${fnName}:shape`, loc);
+      return false;
+    }
+    isUndef();
+    this.openIfResult(unionVal);
+    code.globalGet(this.unions.unitGlobal(uTag));
+    code.else_();
+    code.i32Const(nTag);
+    pushNum();
+    code.structNew(armSt);
+    this.close();
+    return true;
+  }
+
+  /** node:http's libCalls (http.ts). Answers false for a key this does
+   * not handle (it then refuses by its own libCall name). */
+  private emitHttpLibCall(e: Extract<WExpr, { kind: "libCall" }>): boolean {
+    if (!e.fn.startsWith("http.")) return false;
+    const code = this.fn.code;
+    const unreach = (): true => {
+      code.unreachable();
+      return true;
+    };
+    if (this.netModule && this.cpEventModule) {
+      this.refuse("libCall:net:with-spawn", e.loc);
+      return unreach();
+    }
+    const h = this.http;
+    const strVec = this.strVecInfo();
+    const errT = this.exc().errT;
+    const ecPair = this.closPairFor([{ kind: "ref", nullable: true, typeIndex: errT }], []);
+    const vPair = this.closPairFor([], []);
+    const arg = (i: number): void => this.walkExpr(e.args[i]!);
+    const once = (i: number): boolean | null => this.netOnce(e.args[i], e.fn, e.loc);
+    const fence = (what: string): true => {
+      this.emitSetCellError(code, "%Error", "Error", (c2) => this.pushStrLitInto(c2, `${what} is not supported yet`), null);
+      this.emitPendingCheck();
+      const soft = this.mapTypeSoft(e.type);
+      if (soft.kind === "ref") code.refNull(soft.typeIndex);
+      else if (soft.kind === "f64") code.f64Const(0);
+      else if (soft.kind === "i32") code.i32Const(0);
+      return true;
+    };
+    /** A listener registration: receiver (arg 0), callback (arg 1), once (arg 2). */
+    const listen = (addFn: number, kind: "reqres" | "inc" | "data" | "void" | "err", after?: (R: number) => void, recvT?: ValType): boolean => {
+      const o = once(2);
+      if (o === null) return unreach();
+      const rt = recvT ?? this.mapType(e.args[0]!.type, e.loc)!;
+      const R = this.acquireScratch(rt);
+      arg(0);
+      code.localTee(R);
+      if (!this.emitHttpListener(e.args[1]!, kind, e.fn, e.loc)) {
+        this.releaseScratch(rt, R);
+        return unreach();
+      }
+      code.i32Const(o ? 1 : 0);
+      code.i32Const(0);
+      code.call(addFn);
+      if (after !== undefined) after(R);
+      this.releaseScratch(rt, R);
+      return true;
+    };
+    /** A chunk argument as (string, bytes) with one of them null. */
+    const pushChunk = (i: number): boolean => {
+      const t = e.args[i]!.type;
+      if (t.kind === "string") {
+        arg(i);
+        code.refNull(this.bytesB.bytesType());
+        return true;
+      }
+      if (t.kind === "bytes") {
+        code.refNull(this.strType);
+        arg(i);
+        return true;
+      }
+      this.refuse(`libCall:${e.fn}:chunk`, e.loc);
+      return false;
+    };
+    switch (e.fn) {
+      case "http.createServer": {
+        if (!this.emitHttpListener(e.args[0]!, "reqres", e.fn, e.loc)) return unreach();
+        code.call(h.serverNewFn());
+        return true;
+      }
+      case "http.createServerEmpty":
+        code.refNull(EQ_HEAP);
+        code.call(h.serverNewFn());
+        return true;
+      case "http.serverJoinDupHeaders":
+        arg(0);
+        code.call(h.serverJoinDupFn());
+        return true;
+      case "http.serverOnRequest":
+        return listen(h.serverOnRequestFn(), "reqres", undefined, this.net.srvRef());
+      /* ── IncomingMessage ── */
+      case "http.reqUrl":
+        arg(0);
+        code.call(h.incUrlFn());
+        return true;
+      case "http.reqMethod":
+        arg(0);
+        code.call(h.incMethodFn());
+        this.emitPendingCheck();
+        return true;
+      case "http.reqHttpVersion":
+        arg(0);
+        code.call(h.incHttpVersionFn());
+        return true;
+      case "http.reqHttpVersionMajor":
+      case "http.reqHttpVersionMinor":
+        arg(0);
+        code.call(h.incVersionPartFn(e.fn === "http.reqHttpVersionMajor"));
+        return true;
+      case "http.reqAborted":
+      case "http.reqComplete":
+        arg(0);
+        code.call(h.incFlagFn(e.fn === "http.reqAborted" ? "aborted" : "complete"));
+        return true;
+      case "http.reqHeader":
+        return this.emitStrOrUndefined(e.type, () => {
+          arg(0);
+          arg(1);
+          code.call(h.incHeaderStaticFn());
+        }, e.fn, e.loc) ? (this.emitPendingCheck(), true) : unreach();
+      case "http.reqStatusCode": {
+        const R = this.acquireScratch(h.incRef());
+        arg(0);
+        code.localSet(R);
+        code.localGet(R);
+        code.call(h.incStatusCheckFn());
+        this.emitPendingCheck();
+        const ok = this.emitNumOrUndefined(e.type, () => {
+          code.localGet(R);
+          code.call(h.incStatusFn());
+        }, () => code.i32Const(0), e.fn, e.loc);
+        this.releaseScratch(h.incRef(), R);
+        return ok ? true : unreach();
+      }
+      case "http.reqStatusMessage":
+        return this.emitStrOrUndefined(e.type, () => {
+          arg(0);
+          code.call(h.incStatusMessageFn());
+        }, e.fn, e.loc) ? (this.emitPendingCheck(), true) : unreach();
+      case "http.reqRawHeaders": {
+        // One array per message (Node's rawHeaders is a property): built on
+        // the first read, kept on the message.
+        const vecRef = this.vecs.vecRef(strVec);
+        const R = this.acquireScratch(h.incRef());
+        const T = this.acquireScratch({ kind: "ref", nullable: true, typeIndex: h.strArrT });
+        const V = this.acquireScratch(vecRef);
+        arg(0);
+        code.localTee(R);
+        code.structGet(h.incT(), h.incRawVecField);
+        code.refIsNull();
+        this.openIf();
+        code.localGet(R);
+        code.call(h.incRawHeadersFn());
+        code.localTee(T);
+        code.arrayLen();
+        code.localGet(T);
+        code.refAsNonNull();
+        code.structNew(strVec.struct);
+        code.localSet(V);
+        code.localGet(R);
+        code.localGet(V);
+        code.structSet(h.incT(), h.incRawVecField);
+        this.close();
+        code.localGet(R);
+        code.structGet(h.incT(), h.incRawVecField);
+        code.refCast(strVec.struct);
+        this.releaseScratch(vecRef, V);
+        this.releaseScratch({ kind: "ref", nullable: true, typeIndex: h.strArrT }, T);
+        this.releaseScratch(h.incRef(), R);
+        return true;
+      }
+      case "http.reqHeaderPairs": {
+        const T = this.acquireScratch({ kind: "ref", nullable: true, typeIndex: h.strArrT });
+        arg(0);
+        code.call(h.incHeaderPairsStaticFn());
+        code.localSet(T);
+        this.emitPendingCheck();
+        code.localGet(T);
+        code.arrayLen();
+        code.localGet(T);
+        code.refAsNonNull();
+        code.structNew(strVec.struct);
+        this.releaseScratch({ kind: "ref", nullable: true, typeIndex: h.strArrT }, T);
+        return true;
+      }
+      case "http.reqSocket":
+        arg(0);
+        code.call(h.incSocketFn());
+        this.emitPendingCheck();
+        return true;
+      case "http.reqResume":
+        arg(0);
+        code.call(h.incResumeFn());
+        if (e.type.kind !== "void") arg(0);
+        return true;
+      case "http.reqDestroy":
+        arg(0);
+        code.refNull(errT);
+        code.call(h.incDestroyFn());
+        return true;
+      case "http.reqOnData":
+        return listen(h.addFn(HL.INC_DATA), "data", (R) => {
+          code.localGet(R);
+          code.call(h.incDataAddedFn());
+        });
+      case "http.reqOnEnd":
+        return listen(h.addFn(HL.INC_END), "void");
+      case "http.reqOnClose":
+        return listen(h.addFn(HL.INC_CLOSE), "void");
+      case "http.reqOnAborted":
+        return listen(h.addFn(HL.INC_ABORTED), "void");
+      case "http.reqOnError":
+        return listen(h.addFn(HL.INC_ERROR), "err");
+      case "http.reqPipeRes":
+      case "http.reqPipeClient":
+        arg(0);
+        arg(1);
+        code.call(h.incPipeCheckedFn());
+        this.emitPendingCheck();
+        return true;
+      /* ── ServerResponse ── */
+      case "http.resStatusGet":
+        arg(0);
+        code.call(h.resStatusGetFn());
+        return true;
+      case "http.resStatusSet":
+        arg(0);
+        arg(1);
+        code.call(h.resStatusSetFn());
+        return true;
+      case "http.resStatusMsgGet":
+        arg(0);
+        code.call(h.resStatusMsgGetFn());
+        this.emitPendingCheck();
+        return true;
+      case "http.resStatusMsgSet":
+        arg(0);
+        arg(1);
+        code.call(h.resStatusMsgSetFn());
+        return true;
+      case "http.resSetHeader":
+        arg(0);
+        arg(1);
+        arg(2);
+        code.call(h.resSetHeaderStrFn());
+        this.emitPendingCheck();
+        return true;
+      case "http.resGetHeader":
+        return this.emitStrOrUndefined(e.type, () => {
+          arg(0);
+          arg(1);
+          code.call(h.resGetHeaderStrFn());
+        }, e.fn, e.loc) ? (this.emitPendingCheck(), true) : unreach();
+      case "http.resHasHeader":
+        arg(0);
+        arg(1);
+        code.call(h.hasHeaderFn());
+        return true;
+      case "http.resRemoveHeader":
+        arg(0);
+        arg(1);
+        code.call(h.removeHeaderFn());
+        this.emitPendingCheck();
+        return true;
+      case "http.resHeadersSent":
+        arg(0);
+        code.call(h.headersSentFn());
+        return true;
+      case "http.resOnFinish":
+        // end(cb)'s callback, picked up by the end call that follows it
+        // in the lowered helper (it registers where Node's end does).
+        arg(0);
+        if (!this.emitHttpListener(e.args[1]!, "void", e.fn, e.loc)) return unreach();
+        code.call(h.resPendingEndCbFn());
+        return true;
+      case "http.resOnClose":
+        return listen(h.addFn(HL.OUT_CLOSE), "void", undefined, h.outRef());
+      case "http.resWriteHead":
+        arg(0);
+        arg(1);
+        code.call(h.resWriteHeadStatusFn());
+        this.emitPendingCheck();
+        return true;
+      case "http.resWriteHeadN": {
+        arg(0);
+        arg(1);
+        arg(2);
+        code.structGet(strVec.struct, LEN);
+        arg(2);
+        code.structGet(strVec.struct, BUF);
+        arg(3);
+        code.structGet(strVec.struct, BUF);
+        code.call(h.resWriteHeadNVFn());
+        this.emitPendingCheck();
+        return true;
+      }
+      case "http.resWriteHeadPairs": {
+        // A Record's pairs (the env.pairs helper's call) are an object;
+        // a string[] is the flat array form.
+        const isObject = e.args[2]!.kind === "call";
+        arg(0);
+        arg(1);
+        arg(2);
+        code.structGet(strVec.struct, LEN);
+        arg(2);
+        code.structGet(strVec.struct, BUF);
+        code.i32Const(isObject ? 1 : 2);
+        code.call(h.resWriteHeadPairsFn());
+        this.emitPendingCheck();
+        return true;
+      }
+      case "http.resWriteHeadDyn":
+        arg(0);
+        arg(1);
+        arg(2);
+        code.call(this.httpWriteHeadDynFn());
+        this.emitPendingCheck();
+        return true;
+      case "http.resWrite":
+      case "http.resWriteBytes":
+        arg(0);
+        if (!pushChunk(1)) return unreach();
+        code.i32Const(ENC_NONE);
+        code.refNull(ecPair.clos);
+        code.call(h.outWriteFn());
+        code.drop();
+        this.emitPendingCheck();
+        return true;
+      case "http.resWriteDyn":
+        arg(0);
+        arg(1);
+        code.call(this.httpDynChunkFn(true));
+        code.drop();
+        this.emitPendingCheck();
+        return true;
+      case "http.resEnd":
+      case "http.resEndStr":
+      case "http.resEndBytes": {
+        const R = this.acquireScratch(h.resRef());
+        arg(0);
+        code.localTee(R);
+        if (e.fn === "http.resEnd") {
+          code.refNull(this.strType);
+          code.refNull(this.bytesB.bytesType());
+        } else if (!pushChunk(1)) {
+          this.releaseScratch(h.resRef(), R);
+          return unreach();
+        }
+        code.i32Const(ENC_NONE);
+        code.localGet(R);
+        code.call(h.resTakeEndCbFn());
+        code.call(h.outEndFn());
+        this.emitPendingCheck();
+        this.releaseScratch(h.resRef(), R);
+        return true;
+      }
+      case "http.resEndDyn":
+        arg(0);
+        arg(1);
+        code.call(this.httpDynChunkFn(false));
+        this.emitPendingCheck();
+        return true;
+      case "http.resDestroy":
+        arg(0);
+        code.refNull(errT);
+        code.call(h.outDestroyFn());
+        return true;
+      /* ── the client ── */
+      case "http.request":
+      case "http.requestCb":
+      case "http.requestAgent":
+      case "http.requestAgentCb": {
+        const withAgent = e.fn === "http.requestAgent" || e.fn === "http.requestAgentCb";
+        const withCb = e.fn === "http.requestCb" || e.fn === "http.requestAgentCb";
+        const headersArg = e.args[5]!;
+        const stripped = withAgent ? null : this.httpAgentFalse(headersArg, e.loc);
+        const Q = this.acquireScratch(h.creqRef());
+        const V = this.acquireScratch(this.vecs.vecRef(strVec));
+        arg(0);
+        arg(1);
+        arg(2);
+        arg(3);
+        arg(4);
+        this.walkExpr(stripped ?? headersArg);
+        code.localTee(V);
+        code.structGet(strVec.struct, BUF);
+        code.localGet(V);
+        code.structGet(strVec.struct, LEN);
+        if (withAgent) {
+          arg(7);
+          code.call(this.httpAgentArgFn());
+          this.emitPendingCheck();
+        } else {
+          code.refNull(h.agentT());
+        }
+        // agent: false — the request's own fresh Agent.
+        if (withAgent) {
+          arg(7);
+          code.call(this.httpAgentIsFalseFn());
+        } else {
+          code.i32Const(stripped !== null ? 1 : 0);
+        }
+        if (withCb) {
+          if (!this.emitHttpListener(e.args[withAgent ? 8 : 7]!, "inc", e.fn, e.loc)) return unreach();
+        } else {
+          code.refNull(EQ_HEAP);
+        }
+        code.call(h.clientRequestNewFn());
+        this.emitPendingCheck();
+        code.localSet(Q);
+        // http.get: req.end()
+        const autoEnd = e.args[6]!;
+        if (autoEnd.kind === "boolLit") {
+          if (autoEnd.value) {
+            code.localGet(Q);
+            code.refNull(this.strType);
+            code.refNull(this.bytesB.bytesType());
+            code.i32Const(ENC_NONE);
+            code.refNull(vPair.clos);
+            code.call(h.outEndFn());
+            this.emitPendingCheck();
+          }
+        } else {
+          this.walkExpr(autoEnd);
+          this.openIf();
+          code.localGet(Q);
+          code.refNull(this.strType);
+          code.refNull(this.bytesB.bytesType());
+          code.i32Const(ENC_NONE);
+          code.refNull(vPair.clos);
+          code.call(h.outEndFn());
+          this.emitPendingCheck();
+          this.close();
+        }
+        code.localGet(Q);
+        this.releaseScratch(this.vecs.vecRef(strVec), V);
+        this.releaseScratch(h.creqRef(), Q);
+        return true;
+      }
+      case "http.clientEnd":
+        arg(0);
+        code.refNull(this.strType);
+        code.refNull(this.bytesB.bytesType());
+        code.i32Const(ENC_NONE);
+        code.refNull(vPair.clos);
+        code.call(h.outEndFn());
+        this.emitPendingCheck();
+        return true;
+      case "http.clientEndStr":
+      case "http.clientEndBytes":
+        arg(0);
+        if (!pushChunk(1)) return unreach();
+        code.i32Const(ENC_NONE);
+        code.refNull(vPair.clos);
+        code.call(h.outEndFn());
+        this.emitPendingCheck();
+        return true;
+      case "http.clientEndDyn":
+        arg(0);
+        arg(1);
+        code.call(this.httpDynChunkFn(false));
+        this.emitPendingCheck();
+        return true;
+      case "http.clientWrite":
+      case "http.clientWriteBytes":
+        arg(0);
+        if (!pushChunk(1)) return unreach();
+        code.i32Const(ENC_NONE);
+        code.refNull(ecPair.clos);
+        code.call(h.outWriteFn());
+        code.drop();
+        this.emitPendingCheck();
+        return true;
+      case "http.clientWriteDyn":
+        arg(0);
+        arg(1);
+        code.call(this.httpDynChunkFn(true));
+        code.drop();
+        this.emitPendingCheck();
+        return true;
+      case "http.clientDestroy":
+        arg(0);
+        code.refNull(errT);
+        code.call(h.clientDestroyFn());
+        return true;
+      case "http.clientDestroyed":
+        arg(0);
+        code.call(h.outDestroyedFn());
+        return true;
+      case "http.clientOnResponse":
+        return listen(h.addFn(HL.CREQ_RESPONSE), "inc");
+      case "http.clientOnError":
+        return listen(h.addFn(HL.OUT_ERROR), "err", undefined, h.outRef());
+      case "http.clientOnClose":
+        return listen(h.addFn(HL.OUT_CLOSE), "void", undefined, h.outRef());
+      case "http.clientOnTimeout":
+        return listen(h.addFn(HL.OUT_TIMEOUT), "void", undefined, h.outRef());
+      case "http.agentNew": {
+        // new http.Agent(options) -> the Agent handle (tag 6).
+        const dyn = this.dyn;
+        // (secure, keepAlive, keepAliveMsecs, maxSockets, maxFreeSockets,
+        // timeout, port) -> agentNew(keepAlive, ..., port, secure)
+        for (let i = 1; i < 7; i++) arg(i);
+        arg(0);
+        code.call(h.agentNewFn());
+        const A = this.acquireScratch(h.agentRef());
+        code.localSet(A);
+        code.i32Const(DK.HANDLE);
+        code.f64Const(6);
+        code.localGet(A);
+        code.structNew(dyn.dynT());
+        this.releaseScratch(h.agentRef(), A);
+        return true;
+      }
+      default:
+        return false;
+    }
+    void fence;
+  }
+
+  /* ── INC-29 U2 — the checked-dynamic HANDLE surface of node:http ─────
+   * IncomingMessage (3), ServerResponse (4), ClientRequest (5) and
+   * Agent (6) box by reference like U1's Socket (1) and Server (2); the
+   * members the corpus reaches are Node's, every other property, method
+   * or event a named Error (SEMANTICS.md S088 (f), S087 (f)'s stance). */
+
+  /** Declare and build one helper function with the asm layer. */
+  private httpFn(name: string, params: ValType[], results: ValType[], build: (f: Fn, $: A) => void): number {
+    const hit = this.httpFns.get(name);
+    if (hit !== undefined) return hit;
+    const idx = this.mb.declareFunc(this.mb.funcType(params, results), `%w.http.dyn.${name}`);
+    this.httpFns.set(name, idx);
+    const f = new Fn(params.length);
+    build(f, new A(f));
+    this.mb.setBody(idx, f.locals, f.c.bytes());
+    return idx;
+  }
+
+  private readonly httpFns = new Map<string, number>();
+
+  /** Throw a named fence ("<what> is not supported yet") and return `ret`. */
+  private httpFence($: A, what: X, ret?: X): void {
+    this.emitSetCellError($.c, "%Error", "Error", () => what(), null);
+    $.ret(ret);
+  }
+
+  /** The dyn value's kind tag. */
+  private dk($: A, d: X): X {
+    return $.get(this.dyn.dynT(), DYN_KIND, d);
+  }
+
+  private dynTag($: A, d: X): X {
+    return $.get(this.dyn.dynT(), DYN_NUM, d);
+  }
+
+  private dynStr($: A, d: X): X {
+    return $.cast(this.strType, $.get(this.dyn.dynT(), DYN_REF, d));
+  }
+
+  private boxStrX($: A, s: X): X {
+    return () => this.dyn.boxStr($.c, () => s());
+  }
+
+  private boxNumX($: A, n: X): X {
+    return () => this.dyn.boxNum($.c, () => n());
+  }
+
+  private boxBoolX($: A, b: X): X {
+    return () => this.dyn.boxBool($.c, () => b());
+  }
+
+  private boxHandleX($: A, tag: number, ref: X): X {
+    return $.new_(this.dyn.dynT(), $.i(DK.HANDLE), $.d(tag), ref);
+  }
+
+  /** `(hv) -> dyn` — a header value as it was set. */
+  private httpHvToDynFn(): number {
+    const dynRefT = this.dyn.dynRef();
+    return this.httpFn("hvToDyn", [{ kind: "ref", nullable: true, typeIndex: this.http.hvT }], [dynRefT], (f, $) => {
+      const HT = this.http.hvT;
+      const V = f.local(this.dyn.arrRef());
+      const I = f.local(I32);
+      $.if($.isNull($.l(0)), () => $.ret($.g(this.dyn.undefinedGlobal())));
+      $.if($.eq($.get(HT, 0, $.l(0)), $.i(0)), () => $.ret(this.boxStrX($, $.get(HT, 1, $.l(0)))));
+      $.if($.eq($.get(HT, 0, $.l(0)), $.i(1)), () => $.ret(this.boxNumX($, $.get(HT, 2, $.l(0)))));
+      $.put(V, $.raw((c) => this.dyn.pushNewArr(c)));
+      $.for(I, $.i(0), $.get(HT, 4, $.l(0)), () => {
+        $.run(this.dyn.arrPush(), $.l(V), $.call(this.httpHvToDynFn(), $.aget(this.http.hvArrT, $.cast(this.http.hvArrT, $.get(HT, 3, $.l(0))), $.l(I))));
+      });
+      $.do($.raw((c) => this.dyn.boxArr(c, (x) => x.localGet(V))));
+    });
+  }
+
+  /** `(dyn, name) -> hv` — a header value from a dynamic value: a string,
+   * a number, an array of them; undefined -> null (the validator's
+   * undefined); anything else fenced (the error pending, null). */
+  private httpDynToHvFn(): number {
+    const HT = this.http.hvT;
+    return this.httpFn("dynToHv", [this.dyn.dynRef()], [{ kind: "ref", nullable: true, typeIndex: HT }], (f, $) => {
+      const D = 0;
+      const ARR = f.local({ kind: "ref", nullable: true, typeIndex: this.http.hvArrT });
+      const N = f.local(I32);
+      const I = f.local(I32);
+      const E = f.local({ kind: "ref", nullable: true, typeIndex: HT });
+      const k = this.dk($, $.l(D));
+      $.if($.eq(k, $.i(DK.UNDEF)), () => $.ret($.nul(HT)));
+      $.if($.eq(k, $.i(DK.STR)), () => $.ret(this.http.hvStrNew($, this.dynStr($, $.l(D)))));
+      $.if($.eq(k, $.i(DK.NUM)), () => $.ret(this.http.hvNumNew($, $.get(this.dyn.dynT(), DYN_NUM, $.l(D)))));
+      $.if($.eq(k, $.i(DK.ARR)), () => {
+        $.put(N, $.raw((c) => this.dyn.arrLen(c, (x) => this.dyn.arrPayload(x, (y) => y.localGet(D)))));
+        $.put(ARR, $.anew(this.http.hvArrT, $.l(N)));
+        $.for(I, $.i(0), $.l(N), () => {
+          $.put(E, $.call(this.httpDynToHvFn(), $.raw((c) => this.dyn.arrAt(c, (x) => this.dyn.arrPayload(x, (y) => y.localGet(D)), (x) => x.localGet(I)))));
+          $.if($.g(this.exc().kindG), () => $.ret($.nul(HT)));
+          $.if($.isNull($.l(E)), () => this.httpFence($, this.httpLit($, "an undefined element in a header value array"), $.nul(HT)));
+          $.aset(this.http.hvArrT, $.l(ARR), $.l(I), $.l(E));
+        });
+        $.ret($.new_(HT, $.i(2), $.nul(this.strType), $.d(0), $.l(ARR), $.l(N)));
+      });
+      this.httpFence($, this.httpLit($, "a header value that is not a string, a number or an array of them"), $.nul(HT));
+    });
+  }
+
+  private httpLit($: A, s: string): X {
+    return () => this.pushStrLitInto($.c, s);
+  }
+
+  /** A string argument for a header name: String(value) for the token
+   * check's message, the string itself when it is one. Answers null with
+   * Node's ERR_INVALID_HTTP_TOKEN pending for a non-string. */
+  private httpNameArgFn(): number {
+    return this.httpFn("nameArg", [this.dyn.dynRef()], [this.strRef], (f, $) => {
+      $.if($.eq(this.dk($, $.l(0)), $.i(DK.STR)), () => $.ret(this.dynStr($, $.l(0))));
+      this.emitSetCellError($.c, "%TypeError", "TypeError", (c2) => {
+        this.pushStrLitInto(c2, 'Header name must be a valid HTTP token ["');
+        c2.localGet(0);
+        c2.call(this.dyn.toStr());
+        c2.call(this.concatHelper());
+        this.pushStrLitInto(c2, '"]');
+        c2.call(this.concatHelper());
+      }, "ERR_INVALID_HTTP_TOKEN");
+      $.ret($.nul(this.strType));
+    });
+  }
+
+  /** validateString(name, 'name') for getHeader / hasHeader /
+   * removeHeader: ERR_INVALID_ARG_TYPE for a non-string. */
+  private httpNameStrictFn(): number {
+    return this.httpFn("nameStrict", [this.dyn.dynRef()], [this.strRef], (f, $) => {
+      $.if($.eq(this.dk($, $.l(0)), $.i(DK.STR)), () => $.ret(this.dynStr($, $.l(0))));
+      this.emitSetCellError($.c, "%TypeError", "TypeError", (c2) => {
+        this.pushStrLitInto(c2, 'The "name" argument must be of type string. Received ');
+        c2.localGet(0);
+        c2.call(this.dyn.specificType());
+        c2.call(this.concatHelper());
+      }, "ERR_INVALID_ARG_TYPE");
+      $.ret($.nul(this.strType));
+    });
+  }
+
+  /** A headers object / flat array (dyn) as writeHead's list: `(dyn) ->
+   * hentArr` with the kind in the global `httpHdrKind` (0 none, 1 an
+   * object, 2 a flat array, 3 an odd flat array) and the count in
+   * `httpHdrN`. */
+  private httpHdrKindG: number | null = null;
+  private httpHdrNG: number | null = null;
+
+  private httpHdrGlobals(): { kind: number; n: number } {
+    this.httpHdrKindG ??= this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41);
+      w.sleb(0);
+    });
+    this.httpHdrNG ??= this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41);
+      w.sleb(0);
+    });
+    return { kind: this.httpHdrKindG, n: this.httpHdrNG };
+  }
+
+  private httpDynHeadersFn(): number {
+    const hentArrRef: ValType = { kind: "ref", nullable: true, typeIndex: this.http.hentArrT };
+    return this.httpFn("dynHeaders", [this.dyn.dynRef()], [hentArrRef], (f, $) => {
+      const D = 0;
+      const g = this.httpHdrGlobals();
+      const L = f.local(hentArrRef);
+      const N = f.local(I32);
+      const I = f.local(I32);
+      const NAME = f.local(this.strRef);
+      const V = f.local({ kind: "ref", nullable: true, typeIndex: this.http.hvT });
+      const EL = f.local(this.dyn.dynRef());
+      const objT = this.dyn.objT();
+      const k = this.dk($, $.l(D));
+      $.gput(g.kind, $.i(0));
+      $.gput(g.n, $.i(0));
+      $.if($.eq(k, $.i(DK.OBJ)), () => {
+        // for (const key of ObjectKeys(obj)): own enumerable keys in order
+        $.put(N, $.raw((c) => {
+          this.dyn.objPayload(c, (x) => x.localGet(D));
+          c.structGet(objT, 0);
+        }));
+        $.put(L, $.anew(this.http.hentArrT, $.l(N)));
+        $.for(I, $.i(0), $.l(N), () => {
+          const entry = $.raw((c) => {
+            this.dyn.objPayload(c, (x) => x.localGet(D));
+            c.structGet(objT, 1);
+            c.localGet(I);
+            c.arrayGet(this.dyn.entriesArrayType());
+          });
+          $.put(NAME, $.get(this.dyn.entryT(), 0, entry));
+          $.put(EL, $.get(this.dyn.entryT(), 1, entry));
+          // An undefined value reaches validateHeaderValue (setHeader /
+          // _storeHeader): an $hv null.
+          $.put(V, $.call(this.httpDynToHvFn(), $.l(EL)));
+          $.if($.g(this.exc().kindG), () => $.ret($.nul(this.http.hentArrT)));
+          $.aset(this.http.hentArrT, $.l(L), $.l(I), $.new_(this.http.hentT, $.l(NAME), $.l(NAME), $.l(V)));
+        });
+        $.gput(g.kind, $.i(1));
+        $.gput(g.n, $.l(N));
+        $.ret($.l(L));
+      });
+      $.if($.eq(k, $.i(DK.ARR)), () => {
+        $.put(N, $.raw((c) => this.dyn.arrLen(c, (x) => this.dyn.arrPayload(x, (y) => y.localGet(D)))));
+        const at = (i: X): X => $.raw((c) => this.dyn.arrAt(c, (x) => this.dyn.arrPayload(x, (y) => y.localGet(D)), () => i()));
+        $.if($.andThen($.gt($.l(N), $.i(0)), $.eq(this.dk($, at($.i(0))), $.i(DK.ARR))), () =>
+          this.httpFence($, this.httpLit($, "writeHead with an array of [name, value] arrays"), $.nul(this.http.hentArrT)),
+        );
+        $.if($.ne($.and($.l(N), $.i(1)), $.i(0)), () => {
+          $.gput(g.kind, $.i(3));
+          $.gput(g.n, $.l(N));
+          $.ret($.nul(this.http.hentArrT));
+        });
+        $.put(L, $.anew(this.http.hentArrT, $.shrU($.l(N), $.i(1))));
+        $.for(I, $.i(0), $.shrU($.l(N), $.i(1)), () => {
+          $.put(EL, at($.shl($.l(I), $.i(1))));
+          // A falsy name is skipped by writeHead's append loop; a
+          // non-string one is fenced.
+          $.if($.ne(this.dk($, $.l(EL)), $.i(DK.STR)), () =>
+            this.httpFence($, this.httpLit($, "a header name that is not a string in a headers array"), $.nul(this.http.hentArrT)),
+          );
+          $.put(NAME, this.dynStr($, $.l(EL)));
+          $.put(V, $.call(this.httpDynToHvFn(), at($.add($.shl($.l(I), $.i(1)), $.i(1)))));
+          $.if($.g(this.exc().kindG), () => $.ret($.nul(this.http.hentArrT)));
+          $.aset(this.http.hentArrT, $.l(L), $.l(I), $.new_(this.http.hentT, $.l(NAME), $.l(NAME), $.l(V)));
+        });
+        $.gput(g.kind, $.i(2));
+        $.gput(g.n, $.shrU($.l(N), $.i(1)));
+        $.ret($.l(L));
+      });
+      // null / undefined / a primitive or function with no own keys.
+      $.if($.or($.or($.eq(k, $.i(DK.UNDEF)), $.eq(k, $.i(DK.NULL))), $.or($.or($.eq(k, $.i(DK.NUM)), $.eq(k, $.i(DK.BOOL))), $.eq(k, $.i(DK.FUNC)))), () => $.ret($.nul(this.http.hentArrT)));
+      this.httpFence($, this.httpLit($, "writeHead with this headers value"), $.nul(this.http.hentArrT));
+    });
+  }
+
+  /** res.writeHead(status, [reason], [headers]) over dynamic arguments
+   * (the static writeHead(status, dyn) too: a string is the reason). */
+  private httpDynWriteHeadFn(): number {
+    const dynRefT = this.dyn.dynRef();
+    return this.httpFn("dynWriteHead", [this.http.resRef(), dynRefT, dynRefT, dynRefT], [], (f, $) => {
+      const [R, SC, A1, A2] = [0, 1, 2, 3];
+      const g = this.httpHdrGlobals();
+      const REASON = f.local(this.strRef);
+      const HD = f.local(dynRefT);
+      const L = f.local({ kind: "ref", nullable: true, typeIndex: this.http.hentArrT });
+      $.if($.ne(this.dk($, $.l(SC)), $.i(DK.NUM)), () => this.httpFence($, this.httpLit($, "writeHead with a status code that is not a number")));
+      $.put(HD, $.l(A2));
+      $.if($.eq(this.dk($, $.l(A1)), $.i(DK.STR)), () => $.put(REASON, this.dynStr($, $.l(A1))), () => {
+        // obj ??= reason
+        $.if($.or($.eq(this.dk($, $.l(HD)), $.i(DK.UNDEF)), $.eq(this.dk($, $.l(HD)), $.i(DK.NULL))), () => $.put(HD, $.l(A1)));
+      });
+      $.put(L, $.call(this.httpDynHeadersFn(), $.l(HD)));
+      $.if($.g(this.exc().kindG), () => $.ret());
+      $.if($.eq($.g(g.kind), $.i(3)), () => {
+        // the odd flat array: writeHead's checks, then its error
+        $.run(this.http.writeHeadFn(), $.l(R), $.get(this.dyn.dynT(), DYN_NUM, $.l(SC)), $.l(REASON), $.i(3), $.nul(this.http.hentArrT), $.i(0));
+        $.if($.g(this.exc().kindG), () => $.ret());
+        $.run(this.http.invalidHeadersArgFn(), $.call(this.insp.dyn(), $.l(HD), $.d(0), $.d(2)));
+        $.ret();
+      });
+      $.run(this.http.writeHeadFn(), $.l(R), $.get(this.dyn.dynT(), DYN_NUM, $.l(SC)), $.l(REASON), $.g(g.kind), $.l(L), $.g(g.n));
+    });
+  }
+
+  /** `(string array, count) -> string`: util.inspect of the first `count`
+   * strings as an array (boxed into a dyn ARR for the inspector). */
+  private httpInspectStrArrFn(): number {
+    return this.httpFn("inspectStrArr", [{ kind: "ref", nullable: true, typeIndex: this.http.strArrT }, I32], [this.strRef], (f, $) => {
+      const V = f.local(this.dyn.arrRef());
+      const I = f.local(I32);
+      $.put(V, $.raw((c) => this.dyn.pushNewArr(c)));
+      $.for(I, $.i(0), $.l(1), () => $.run(this.dyn.arrPush(), $.l(V), this.boxStrX($, $.aget(this.http.strArrT, $.l(0), $.l(I)))));
+      $.do($.call(this.insp.dyn(), $.raw((c) => this.dyn.boxArr(c, (x) => x.localGet(V))), $.d(0), $.d(2)));
+    });
+  }
+
+  /** The static resWriteHeadDyn(res, status, dyn). */
+  private httpWriteHeadDynFn(): number {
+    const dynRefT = this.dyn.dynRef();
+    return this.httpFn("writeHeadDyn", [this.http.resRef(), F64, dynRefT], [], (f, $) => {
+      $.run(this.httpDynWriteHeadFn(), $.l(0), this.boxNumX($, $.l(1)), $.l(2), $.g(this.dyn.undefinedGlobal()));
+    });
+  }
+
+  /** A chunk from a dynamic value: (string, bytes) through the two
+   * globals; `forEnd` reads Node's `if (chunk)` (no chunk: both null);
+   * else write_'s ERR_STREAM_NULL_VALUES / ERR_INVALID_ARG_TYPE. Answers
+   * 0 with the error pending. */
+  private httpChunkStrG: number | null = null;
+  private httpChunkBytesG: number | null = null;
+
+  private httpChunkGlobals(): { s: number; b: number } {
+    const strT = this.strType;
+    const bt = this.bytesB.bytesType();
+    this.httpChunkStrG ??= this.mb.addGlobal(this.strRef, true, (w) => {
+      w.u8(0xd0);
+      w.sleb(strT);
+    });
+    this.httpChunkBytesG ??= this.mb.addGlobal(this.bytesB.bytesRef(), true, (w) => {
+      w.u8(0xd0);
+      w.sleb(bt);
+    });
+    return { s: this.httpChunkStrG, b: this.httpChunkBytesG };
+  }
+
+  private httpDynChunkArgFn(forEnd: boolean): number {
+    return this.httpFn(`chunkArg:${forEnd ? "end" : "write"}`, [this.dyn.dynRef()], [I32], (f, $) => {
+      const D = 0;
+      const g = this.httpChunkGlobals();
+      $.gput(g.s, $.nul(this.strType));
+      $.gput(g.b, $.nul(this.bytesB.bytesType()));
+      if (forEnd) {
+        // if (chunk): a falsy chunk is none.
+        $.if($.not($.call(this.dyn.truthy(), $.l(D))), () => $.ret($.i(1)));
+      }
+      $.if($.eq(this.dk($, $.l(D)), $.i(DK.STR)), () => {
+        $.gput(g.s, this.dynStr($, $.l(D)));
+        $.ret($.i(1));
+      });
+      $.if($.eq(this.dk($, $.l(D)), $.i(DK.BYTES)), () => {
+        $.gput(g.b, $.call(this.dynBytesPayloadFn(), $.l(D), $.nul(this.dyn.pathT())));
+        $.ret($.i(1));
+      });
+      $.if($.eq(this.dk($, $.l(D)), $.i(DK.NULL)), () => {
+        this.emitSetCellError($.c, "%TypeError", "TypeError", (c2) => this.pushStrLitInto(c2, "May not write null values to stream"), "ERR_STREAM_NULL_VALUES");
+        $.ret($.i(0));
+      });
+      this.emitSetCellError($.c, "%TypeError", "TypeError", (c2) => {
+        this.pushStrLitInto(c2, 'The "chunk" argument must be of type string or an instance of Buffer or Uint8Array. Received ');
+        c2.localGet(D);
+        c2.call(this.dyn.specificType());
+        c2.call(this.concatHelper());
+      }, "ERR_INVALID_ARG_TYPE");
+      $.do($.i(0));
+    });
+  }
+
+  /** The static resWriteDyn / resEndDyn / clientWriteDyn / clientEndDyn:
+   * `(out, dyn) -> i32` (write's boolean; end answers 0). */
+  private httpDynChunkFn(write: boolean): number {
+    return this.httpFn(`dynChunk:${write ? "write" : "end"}`, [this.http.outRef(), this.dyn.dynRef()], write ? [I32] : [], (f, $) => {
+      const g = this.httpChunkGlobals();
+      $.if($.not($.call(this.httpDynChunkArgFn(!write), $.l(1))), () => $.ret(write ? $.i(0) : undefined));
+      if (write) {
+        $.ret($.call(this.http.outWriteFn(), $.l(0), $.g(g.s), $.g(g.b), $.i(ENC_NONE), $.nul(this.closPairFor([{ kind: "ref", nullable: true, typeIndex: this.exc().errT }], []).clos)));
+      } else {
+        const cb = $.sel(
+          { kind: "ref", nullable: true, typeIndex: this.closPairFor([], []).clos },
+          $.test(this.http.resT(), $.l(0)),
+          $.call(this.http.resTakeEndCbFn(), $.cast(this.http.resT(), $.l(0))),
+          $.nul(this.closPairFor([], []).clos),
+        );
+        $.run(this.http.outEndFn(), $.l(0), $.g(g.s), $.g(g.b), $.i(ENC_NONE), cb);
+      }
+    });
+  }
+
+  /** The request's agent option from a dynamic value -> the Agent (null:
+   * the global agent); false is agentIsFalse's; anything else Node's
+   * ERR_INVALID_ARG_TYPE. */
+  private httpAgentArgFn(): number {
+    return this.httpFn("agentArg", [this.dyn.dynRef()], [this.http.agentRef()], (f, $) => {
+      const D = 0;
+      const k = this.dk($, $.l(D));
+      $.if($.or($.eq(k, $.i(DK.UNDEF)), $.eq(k, $.i(DK.NULL))), () => $.ret($.nul(this.http.agentT())));
+      $.if($.both($.eq(k, $.i(DK.BOOL)), $.deq($.get(this.dyn.dynT(), DYN_NUM, $.l(D)), $.d(0))), () => $.ret($.nul(this.http.agentT())));
+      $.if($.both($.eq(k, $.i(DK.HANDLE)), $.deq(this.dynTag($, $.l(D)), $.d(6))), () => $.ret($.cast(this.http.agentT(), $.get(this.dyn.dynT(), DYN_REF, $.l(D)))));
+      this.emitSetCellError($.c, "%TypeError", "TypeError", (c2) => {
+        this.pushStrLitInto(c2, 'The "options.agent" property must be one of Agent-like Object, undefined, or false. Received ');
+        c2.localGet(D);
+        c2.call(this.dyn.specificType());
+        c2.call(this.concatHelper());
+      }, "ERR_INVALID_ARG_TYPE");
+      $.do($.nul(this.http.agentT()));
+    });
+  }
+
+  private httpAgentIsFalseFn(): number {
+    return this.httpFn("agentIsFalse", [this.dyn.dynRef()], [I32], (f, $) => {
+      $.do($.both($.eq(this.dk($, $.l(0)), $.i(DK.BOOL)), $.deq($.get(this.dyn.dynT(), DYN_NUM, $.l(0)), $.d(0))));
+    });
+  }
+
+  /** A snapshot of an agent table as a null-prototype object of arrays of
+   * handles (`tag` 1 sockets, 5 requests). */
+  private httpAgentTableFn(field: number, tag: number): number {
+    return this.httpFn(`agentTable:${field}`, [this.http.agentRef()], [this.dyn.dynRef()], (f, $) => {
+      const AG = 0;
+      const O = f.local({ kind: "ref", nullable: true, typeIndex: this.dyn.objT() });
+      const I = f.local(I32);
+      const J = f.local(I32);
+      const V = f.local(this.dyn.arrRef());
+      const E = f.local({ kind: "ref", nullable: true, typeIndex: this.http.amapT });
+      const AT = this.http.agentT();
+      const MT = this.http.amapT;
+      $.put(O, $.raw((c) => this.dyn.pushNewObj(c, true)));
+      $.for(I, $.i(0), $.get(AT, field + 1, $.l(AG)), () => {
+        $.put(E, $.aget(this.http.amapArrT, $.get(AT, field, $.l(AG)), $.l(I)));
+        $.put(V, $.raw((c) => this.dyn.pushNewArr(c)));
+        $.for(J, $.i(0), $.get(MT, 2, $.l(E)), () => {
+          $.run(this.dyn.arrPush(), $.l(V), this.boxHandleX($, tag, $.aget(this.http.eqArrTPublic, $.get(MT, 1, $.l(E)), $.l(J))));
+        });
+        $.run(this.dyn.objPut(), $.l(O), $.get(MT, 0, $.l(E)), $.raw((c) => this.dyn.boxArr(c, (x) => x.localGet(V))));
+      });
+      $.do($.raw((c) => this.dyn.boxObj(c, (x) => x.localGet(O))));
+    });
+  }
+
+  /** The headers object of an IncomingMessage (cached, like kHeaders). */
+  private httpIncHeadersFn(): number {
+    return this.httpFn("incHeaders", [this.http.incRef()], [this.dyn.dynRef()], (f, $) => {
+      const INC = 0;
+      const P = f.local({ kind: "ref", nullable: true, typeIndex: this.http.strArrT });
+      const O = f.local({ kind: "ref", nullable: true, typeIndex: this.dyn.objT() });
+      const I = f.local(I32);
+      const K = f.local(this.strRef);
+      const V = f.local(this.dyn.arrRef());
+      const N = f.local(I32);
+      const R = f.local(this.dyn.dynRef());
+      const IT = this.http.incT();
+      const cached = $.get(IT, this.http.incHeadersField, $.l(INC));
+      $.if($.notNull(cached), () => $.ret($.cast(this.dyn.dynT(), cached)));
+      $.put(P, $.call(this.http.incHeaderPairsFn(), $.l(INC)));
+      $.put(O, $.raw((c) => this.dyn.pushNewObj(c, false)));
+      $.for(I, $.i(0), $.alen($.l(P)), () => {
+        $.put(K, $.aget(this.http.strArrT, $.l(P), $.l(I)));
+        $.if(this.streqX($, $.l(K), this.httpLit($, "set-cookie")), () => {
+          // set-cookie: every value, an array.
+          $.put(V, $.raw((c) => this.dyn.pushNewArr(c)));
+          $.put(N, $.i(0));
+          $.while($.lt($.l(N), $.get(IT, this.http.incHCountField, $.l(INC))), () => {
+            $.if(this.streqX($, $.call(this.casing.toLowerCase(), $.aget(this.http.strArrT, $.get(IT, this.http.incRawField, $.l(INC)), $.l(N))), this.httpLit($, "set-cookie")), () => {
+              $.run(this.dyn.arrPush(), $.l(V), this.boxStrX($, $.aget(this.http.strArrT, $.get(IT, this.http.incRawField, $.l(INC)), $.add($.l(N), $.i(1)))));
+            });
+            $.put(N, $.add($.l(N), $.i(2)));
+          });
+          $.run(this.dyn.objPut(), $.l(O), $.l(K), $.raw((c) => this.dyn.boxArr(c, (x) => x.localGet(V))));
+        }, () => {
+          $.run(this.dyn.objPut(), $.l(O), $.l(K), this.boxStrX($, $.aget(this.http.strArrT, $.l(P), $.add($.l(I), $.i(1)))));
+        });
+        $.put(I, $.add($.l(I), $.i(1)));
+      });
+      $.put(R, $.raw((c) => this.dyn.boxObj(c, (x) => x.localGet(O))));
+      $.set(IT, this.http.incHeadersField, $.l(INC), $.l(R));
+      $.do($.l(R));
+    });
+  }
+
+  private streqX($: A, a: X, b: X): X {
+    return $.call(this.strEqHelper(), a, b);
+  }
+
+  /** getHeaders(): a null-prototype object of the values as set. */
+  private httpGetHeadersFn(): number {
+    return this.httpFn("getHeaders", [this.http.outRef()], [this.dyn.dynRef()], (f, $) => {
+      const O = f.local({ kind: "ref", nullable: true, typeIndex: this.dyn.objT() });
+      const I = f.local(I32);
+      const L = f.local({ kind: "ref", nullable: true, typeIndex: this.http.hentArrT });
+      const E = f.local({ kind: "ref", nullable: true, typeIndex: this.http.hentT });
+      $.put(O, $.raw((c) => this.dyn.pushNewObj(c, true)));
+      $.put(L, $.call(this.http.outHeadersListFn(), $.l(0)));
+      $.if($.notNull($.l(L)), () => {
+        $.for(I, $.i(0), $.call(this.http.outHeadersCountFn(), $.l(0)), () => {
+          $.put(E, $.aget(this.http.hentArrT, $.l(L), $.l(I)));
+          $.run(this.dyn.objPut(), $.l(O), $.get(this.http.hentT, 0, $.l(E)), $.call(this.httpHvToDynFn(), $.get(this.http.hentT, 2, $.l(E))));
+        });
+      });
+      $.do($.raw((c) => this.dyn.boxObj(c, (x) => x.localGet(O))));
+    });
+  }
+
+  /** getName(options) over a dynamic value (lib/_http_agent.js). */
+  private httpAgentGetNameFn(): number {
+    return this.httpFn("agentGetName", [this.dyn.dynRef()], [this.strRef], (f, $) => {
+      const D = 0;
+      const O = f.local({ kind: "ref", nullable: true, typeIndex: this.dyn.objT() });
+      const S = f.local(this.strRef);
+      const V = f.local(this.dyn.dynRef());
+      const k = this.dk($, $.l(D));
+      // options = kEmptyObject when undefined
+      $.if($.eq(k, $.i(DK.UNDEF)), () => $.ret(this.httpLit($, "localhost::")));
+      $.if($.ne(k, $.i(DK.OBJ)), () => this.httpFence($, this.httpLit($, "getName with options that are not an object"), $.nul(this.strType)));
+      $.put(O, $.raw((c) => this.dyn.objPayload(c, (x) => x.localGet(D))));
+      const member = (key: string): X => $.call(this.dyn.objGet(), $.l(O), this.httpLit($, key));
+      const asText = (v: number): X => $.raw((c) => {
+        c.localGet(v);
+        c.call(this.dyn.toStr());
+      });
+      const present = (v: number): X => $.andThen($.notNull($.l(v)), $.call(this.dyn.truthy(), $.l(v)));
+      $.put(V, member("host"));
+      $.put(S, $.sel(this.strRef, present(V), asText(V), this.httpLit($, "localhost")));
+      $.put(S, $.raw((c) => {
+        c.localGet(S);
+        this.pushStrLitInto(c, ":");
+        c.call(this.concatHelper());
+      }));
+      $.put(V, member("port"));
+      $.if(present(V), () => $.put(S, $.call(this.concatHelper(), $.l(S), asText(V))));
+      $.put(S, $.call(this.concatHelper(), $.l(S), this.httpLit($, ":")));
+      $.put(V, member("localAddress"));
+      $.if(present(V), () => $.put(S, $.call(this.concatHelper(), $.l(S), asText(V))));
+      $.put(V, member("family"));
+      $.if($.andThen($.notNull($.l(V)), $.both($.eq(this.dk($, $.l(V)), $.i(DK.NUM)), $.or($.deq($.get(this.dyn.dynT(), DYN_NUM, $.l(V)), $.d(4)), $.deq($.get(this.dyn.dynT(), DYN_NUM, $.l(V)), $.d(6))))), () => {
+        $.put(S, $.call(this.concatHelper(), $.call(this.concatHelper(), $.l(S), this.httpLit($, ":")), asText(V)));
+      });
+      $.put(V, member("socketPath"));
+      $.if(present(V), () => $.put(S, $.call(this.concatHelper(), $.call(this.concatHelper(), $.l(S), this.httpLit($, ":")), asText(V))));
+      $.do($.l(S));
+    });
+  }
+
+  /** `(d, key) -> dyn` — an http handle's property read (tags 3..6). */
+  private httpHandleKeyGetFn(): number {
+    const dynRefT = this.dyn.dynRef();
+    return this.httpFn("keyGet", [dynRefT, this.strRef], [dynRefT], (f, $) => {
+      const [D, KEY] = [0, 1];
+      const h = this.http;
+      const INC = f.local(h.incRef());
+      const RES = f.local(h.resRef());
+      const Q = f.local(h.creqRef());
+      const AG = f.local(h.agentRef());
+      const S = f.local(this.strRef);
+      const tag = this.dynTag($, $.l(D));
+      const is = (k: string): X => this.streqX($, $.l(KEY), this.httpLit($, k));
+      const ref = $.get(this.dyn.dynT(), DYN_REF, $.l(D));
+      const strOrNull = (s: X): X => () => {
+        $.put(S, s);
+        $.do($.sel(dynRefT, $.isNull($.l(S)), $.g(this.dyn.nullGlobal()), this.boxStrX($, $.l(S))));
+      };
+      $.if($.deq(tag, $.d(3)), () => {
+        $.put(INC, $.cast(h.incT(), ref));
+        const i = $.l(INC);
+        $.if(is("method"), () => $.ret(strOrNull($.get(h.incT(), h.incMethodField, i))));
+        $.if(is("url"), () => $.ret(this.boxStrX($, $.call(h.incUrlFn(), i))));
+        $.if(is("statusCode"), () => $.ret($.sel(dynRefT, $.lt($.get(h.incT(), h.incStatusField, i), $.i(0)), $.g(this.dyn.nullGlobal()), this.boxNumX($, $.call(h.incStatusFn(), i)))));
+        $.if(is("statusMessage"), () => $.ret(strOrNull($.get(h.incT(), h.incStatusMsgField, i))));
+        $.if(is("headers"), () => $.ret($.call(this.httpIncHeadersFn(), i)));
+        $.if(is("httpVersion"), () => $.ret(this.boxStrX($, $.call(h.incHttpVersionFn(), i))));
+        $.if(is("httpVersionMajor"), () => $.ret(this.boxNumX($, $.call(h.incVersionPartFn(true), i))));
+        $.if(is("httpVersionMinor"), () => $.ret(this.boxNumX($, $.call(h.incVersionPartFn(false), i))));
+        $.if(is("complete"), () => $.ret(this.boxBoolX($, $.call(h.incFlagFn("complete"), i))));
+        $.if(is("aborted"), () => $.ret(this.boxBoolX($, $.call(h.incFlagFn("aborted"), i))));
+        $.if(is("readable"), () => $.ret(this.boxBoolX($, $.call(h.incReadableFn(), i))));
+        $.if(is("destroyed"), () => $.ret(this.boxBoolX($, $.call(h.incDestroyedFn(), i))));
+        $.if(is("readableEnded"), () => $.ret(this.boxBoolX($, $.call(h.incReadableEndedFn(), i))));
+        $.if(is("req"), () => {
+          $.if($.isNull($.get(h.incT(), h.incReqField, i)), () => $.ret($.g(this.dyn.undefinedGlobal())));
+          $.ret(this.boxHandleX($, 5, $.get(h.incT(), h.incReqField, i)));
+        });
+        $.if(is("rawHeaders"), () => {
+          // One array per message, as Node's rawHeaders property is.
+          const cached = $.get(h.incT(), h.incRawDynField, i);
+          $.if($.notNull(cached), () => $.ret($.cast(this.dyn.dynT(), cached)));
+          const T = $.local({ kind: "ref", nullable: true, typeIndex: h.strArrT });
+          const V = $.local(this.dyn.arrRef());
+          const J = $.local(I32);
+          const R = $.local(dynRefT);
+          $.put(T, $.call(h.incRawHeadersFn(), i));
+          $.put(V, $.raw((c) => this.dyn.pushNewArr(c)));
+          $.for(J, $.i(0), $.alen($.l(T)), () => $.run(this.dyn.arrPush(), $.l(V), this.boxStrX($, $.aget(h.strArrT, $.l(T), $.l(J)))));
+          $.put(R, $.raw((c) => this.dyn.boxArr(c, (x) => x.localGet(V))));
+          $.set(h.incT(), h.incRawDynField, i, $.l(R));
+          $.ret($.l(R));
+        });
+      });
+      $.if($.deq(tag, $.d(4)), () => {
+        $.put(RES, $.cast(h.resT(), ref));
+        const r = $.l(RES);
+        $.if(is("statusCode"), () => $.ret(this.boxNumX($, $.call(h.resStatusGetFn(), r))));
+        $.if(is("statusMessage"), () => {
+          $.put(S, $.get(h.resT(), h.resStatusMsgField, r));
+          $.ret($.sel(dynRefT, $.isNull($.l(S)), $.g(this.dyn.undefinedGlobal()), this.boxStrX($, $.l(S))));
+        });
+        $.if(is("headersSent"), () => $.ret(this.boxBoolX($, $.call(h.headersSentFn(), r))));
+        $.if($.or(is("writableEnded"), is("finished")), () => $.ret(this.boxBoolX($, $.call(h.outFinishedFn(), r))));
+        $.if(is("writableFinished"), () => $.ret(this.boxBoolX($, $.call(h.outWritableFinishedFn(), r))));
+        $.if(is("writableCorked"), () => $.ret(this.boxNumX($, $.i2d($.call(h.outCorkedFn(), r)))));
+        $.if(is("writableLength"), () => $.ret(this.boxNumX($, $.i2d($.call(h.outWritableLengthFn(), r)))));
+        $.if(is("writableNeedDrain"), () => $.ret(this.boxBoolX($, $.call(h.outNeedDrainGetterFn(), r))));
+        $.if(is("destroyed"), () => $.ret(this.boxBoolX($, $.call(h.outDestroyedFn(), r))));
+        $.if(is("req"), () => $.ret(this.boxHandleX($, 3, $.get(h.resT(), h.resReqField, r))));
+      });
+      $.if($.deq(tag, $.d(5)), () => {
+        $.put(Q, $.cast(h.creqT(), ref));
+        const q = $.l(Q);
+        $.if(is("destroyed"), () => $.ret(this.boxBoolX($, $.call(h.outDestroyedFn(), q))));
+        $.if($.or(is("writableEnded"), is("finished")), () => $.ret(this.boxBoolX($, $.call(h.outFinishedFn(), q))));
+        $.if(is("headersSent"), () => $.ret(this.boxBoolX($, $.call(h.headersSentFn(), q))));
+        $.if(is("method"), () => $.ret(this.boxStrX($, $.get(h.creqT(), h.creqMethodField, q))));
+        $.if(is("path"), () => $.ret(this.boxStrX($, $.get(h.creqT(), h.creqPathField, q))));
+        $.if(is("host"), () => $.ret(this.boxStrX($, $.get(h.creqT(), h.creqHostField, q))));
+        $.if(is("protocol"), () => $.ret(this.boxStrX($, $.get(h.creqT(), h.creqProtocolField, q))));
+        $.if(is("reusedSocket"), () => $.ret(this.boxBoolX($, $.get(h.creqT(), h.creqReusedField, q))));
+      });
+      $.if($.deq(tag, $.d(6)), () => {
+        $.put(AG, $.cast(h.agentT(), ref));
+        const a = $.l(AG);
+        const AT = h.agentT();
+        $.if(is("maxSockets"), () => $.ret(this.boxNumX($, $.get(AT, h.agentField("maxSockets"), a))));
+        $.if(is("maxFreeSockets"), () => $.ret(this.boxNumX($, $.get(AT, h.agentField("maxFreeSockets"), a))));
+        $.if(is("maxTotalSockets"), () => $.ret(this.boxNumX($, $.get(AT, h.agentField("maxTotalSockets"), a))));
+        $.if(is("totalSocketCount"), () => $.ret(this.boxNumX($, $.get(AT, h.agentField("totalSocketCount"), a))));
+        $.if(is("keepAliveMsecs"), () => $.ret(this.boxNumX($, $.get(AT, h.agentField("keepAliveMsecs"), a))));
+        $.if(is("keepAlive"), () => $.ret(this.boxBoolX($, $.get(AT, h.agentField("keepAlive"), a))));
+        $.if(is("defaultPort"), () => $.ret(this.boxNumX($, $.get(AT, h.agentField("defaultPort"), a))));
+        $.if(is("protocol"), () => $.ret(this.boxStrX($, $.get(AT, h.agentField("protocol"), a))));
+        $.if(is("scheduling"), () => $.ret(this.boxStrX($, $.sel(this.strRef, $.get(AT, h.agentField("fifo"), a), this.httpLit($, "fifo"), this.httpLit($, "lifo")))));
+        $.if(is("sockets"), () => $.ret($.call(this.httpAgentTableFn(h.agentField("sockets"), 1), a)));
+        $.if(is("freeSockets"), () => $.ret($.call(this.httpAgentTableFn(h.agentField("freeSockets"), 1), a)));
+        $.if(is("requests"), () => $.ret($.call(this.httpAgentTableFn(h.agentField("requests"), 5), a)));
+      });
+      this.emitSetCellError($.c, "%Error", "Error", (c2) => {
+        this.pushStrLitInto(c2, "reading the property '");
+        c2.localGet(KEY);
+        c2.call(this.concatHelper());
+        this.pushStrLitInto(c2, "' of an http handle is not supported yet");
+        c2.call(this.concatHelper());
+      }, null);
+      $.do($.nul(this.dyn.dynT()));
+    });
+  }
+
+  /** `(d, key, value)` — an http handle's property write. */
+  private httpHandleKeySetFn(): number {
+    const dynRefT = this.dyn.dynRef();
+    return this.httpFn("keySet", [dynRefT, this.strRef, dynRefT], [], (f, $) => {
+      const [D, KEY, V] = [0, 1, 2];
+      const h = this.http;
+      const tag = this.dynTag($, $.l(D));
+      const is = (k: string): X => this.streqX($, $.l(KEY), this.httpLit($, k));
+      const ref = $.get(this.dyn.dynT(), DYN_REF, $.l(D));
+      const num = $.get(this.dyn.dynT(), DYN_NUM, $.l(V));
+      const isNum = $.eq(this.dk($, $.l(V)), $.i(DK.NUM));
+      const isStr = $.eq(this.dk($, $.l(V)), $.i(DK.STR));
+      $.if($.deq(tag, $.d(4)), () => {
+        $.if($.both(is("statusCode"), isNum), () => {
+          $.run(h.resStatusSetFn(), $.cast(h.resT(), ref), num);
+          $.ret();
+        });
+        $.if($.both(is("statusMessage"), isStr), () => {
+          $.run(h.resStatusMsgSetFn(), $.cast(h.resT(), ref), this.dynStr($, $.l(V)));
+          $.ret();
+        });
+      });
+      $.if($.deq(tag, $.d(3)), () => {
+        $.if($.both(is("url"), isStr), () => {
+          $.set(h.incT(), h.incUrlField, $.cast(h.incT(), ref), this.dynStr($, $.l(V)));
+          $.ret();
+        });
+      });
+      $.if($.deq(tag, $.d(6)), () => {
+        const AT = h.agentT();
+        for (const name of ["defaultPort", "maxSockets", "maxFreeSockets", "keepAliveMsecs"]) {
+          $.if($.both(is(name), isNum), () => {
+            $.set(AT, h.agentField(name), $.cast(AT, ref), num);
+            $.ret();
+          });
+        }
+        $.if($.both(is("keepAlive"), $.eq(this.dk($, $.l(V)), $.i(DK.BOOL))), () => {
+          $.set(AT, h.agentField("keepAlive"), $.cast(AT, ref), $.dne(num, $.d(0)));
+          $.ret();
+        });
+      });
+      this.emitSetCellError($.c, "%Error", "Error", (c2) => {
+        this.pushStrLitInto(c2, "setting the property '");
+        c2.localGet(KEY);
+        c2.call(this.concatHelper());
+        this.pushStrLitInto(c2, "' of an http handle (to this value) is not supported yet");
+        c2.call(this.concatHelper());
+      }, null);
+    });
+  }
+
+  /** The dyn closure for a listener on an http list: `kind` is the list's
+   * argument (void / data / err / inc / reqres). */
+  private emitHttpDynListener(c: Code, kind: "void" | "data" | "err" | "inc" | "reqres", fnLocal: number, recvLocal: number): void {
+    if (kind === "void" || kind === "data" || kind === "err") {
+      this.emitNetDynListener(c, kind, fnLocal, recvLocal);
+      return;
+    }
+    const pair = kind === "inc" ? this.closPairFor([this.http.incRef()], []) : this.closPairFor([this.http.incRef(), this.http.resRef()], []);
+    const args: ((c: Code) => void)[] =
+      kind === "inc"
+        ? [(x) => {
+            x.i32Const(DK.HANDLE);
+            x.f64Const(3);
+            x.localGet(1);
+            x.structNew(this.dyn.dynT());
+          }]
+        : [
+            (x) => {
+              x.i32Const(DK.HANDLE);
+              x.f64Const(3);
+              x.localGet(1);
+              x.structNew(this.dyn.dynT());
+            },
+            (x) => {
+              x.i32Const(DK.HANDLE);
+              x.f64Const(4);
+              x.localGet(2);
+              x.structNew(this.dyn.dynT());
+            },
+          ];
+    const fn = this.netDynAdapter(kind === "inc" ? "httpInc" : "httpReqRes", pair, args);
+    const env = this.netDynEnvT(pair.clos, pair.fn);
+    this.mb.declareFuncRef(fn);
+    c.refFunc(fn);
+    c.localGet(fnLocal);
+    c.localGet(recvLocal);
+    c.structNew(env);
+  }
+
+  /** The dispatch for `d.<method>(...args)` on an http handle, or null
+   * when no http handle has `method`. */
+  private readonly httpHandleInvokeFns = new Map<string, number | null>();
+
+  private httpHandleInvokeFn(method: string): number | null {
+    if (this.httpHandleInvokeFns.has(method)) return this.httpHandleInvokeFns.get(method)!;
+    const known = [
+      "on", "once", "addListener", "prependListener", "pause", "resume", "pipe", "destroy",
+      "setHeader", "getHeader", "getHeaders", "getHeaderNames", "hasHeader", "removeHeader", "appendHeader",
+      "writeHead", "write", "end", "cork", "uncork", "flushHeaders", "getName",
+    ];
+    if (!known.includes(method)) {
+      this.httpHandleInvokeFns.set(method, null);
+      return null;
+    }
+    const dynRefT = this.dyn.dynRef();
+    const arrRefT = this.dyn.arrRef();
+    const idx = this.httpFn(`invoke:${method}`, [dynRefT, arrRefT, this.strRef], [dynRefT], (f, $) => {
+      const [D, ARGS] = [0, 1];
+      const h = this.http;
+      const dynT = this.dyn.dynT();
+      const ARGC = f.local(I32);
+      const A0 = f.local(dynRefT);
+      const A1 = f.local(dynRefT);
+      const A2 = f.local(dynRefT);
+      const L = f.local(EQ_REF);
+      const R = f.local(I32);
+      const ENC = f.local(I32);
+      const NAME = f.local(this.strRef);
+      const V = f.local({ kind: "ref", nullable: true, typeIndex: h.hvT });
+      const g = this.httpChunkGlobals();
+      const errRef: ValType = { kind: "ref", nullable: true, typeIndex: this.exc().errT };
+      const ecPair = this.closPairFor([errRef], []);
+      const vPair = this.closPairFor([], []);
+      const ECB = f.local({ kind: "ref", nullable: true, typeIndex: ecPair.clos });
+      const VCB = f.local({ kind: "ref", nullable: true, typeIndex: vPair.clos });
+      const tag = this.dynTag($, $.l(D));
+      const ref = $.get(dynT, DYN_REF, $.l(D));
+      const c = f.c;
+      this.dyn.arrLen(c, (x) => x.localGet(ARGS));
+      c.localSet(ARGC);
+      [A0, A1, A2].forEach((local, i) => {
+        $.put(local, $.sel(dynRefT, $.ltU($.i(i), $.l(ARGC)), $.raw((x) => this.dyn.arrAt(x, (y) => y.localGet(ARGS), (y) => y.i32Const(i))), $.g(this.dyn.undefinedGlobal())));
+      });
+      const kindOf = (local: number): X => this.dk($, $.l(local));
+      const fenceMsg = (what: string): void => this.httpFence($, this.httpLit($, `${what} is not supported yet`), $.nul(dynT));
+      const notFn = (): void => {
+        this.emitSetCellError(c, "%TypeError", "TypeError", (c2) => {
+          c2.localGet(2);
+          this.pushStrLitInto(c2, " is not a function");
+          c2.call(this.concatHelper());
+        }, null);
+        $.ret($.nul(dynT));
+      };
+      const strArg = (local: number, value: string): X => $.andThen($.eq(kindOf(local), $.i(DK.STR)), this.streqX($, this.dynStr($, $.l(local)), this.httpLit($, value)));
+      /** A write / end callback (err) -> the dyn function, null = none. */
+      const ecbOf = (local: number): void => {
+        $.put(ECB, $.nul(ecPair.clos));
+        $.if($.eq(kindOf(local), $.i(DK.FUNC)), () => {
+          this.emitNetDynListener(c, "cb", local, D);
+          c.localSet(ECB);
+        });
+      };
+      /** end's callback: the 'finish' listener (no argument) and, for
+       * the two calls that pass one, the same function taking the error. */
+      const vcbOf = (local: number): void => {
+        $.put(VCB, $.nul(vPair.clos));
+        $.put(ECB, $.nul(ecPair.clos));
+        $.if($.eq(kindOf(local), $.i(DK.FUNC)), () => {
+          this.emitNetDynListener(c, "void", local, D);
+          c.localSet(VCB);
+          this.emitNetDynListener(c, "cb", local, D);
+          c.localSet(ECB);
+        });
+      };
+      /** An encoding argument: absent (ENC_NONE) or one Buffer knows. */
+      const encOf = (local: number): void => {
+        $.put(ENC, $.i(ENC_NONE));
+        $.if($.eq(kindOf(local), $.i(DK.STR)), () => {
+          $.put(ENC, $.i(-1));
+          for (const [id, name] of HTTP_ENC_NAMES) {
+            const spellings = name === "utf8" ? ["utf8", "utf-8"] : name === "latin1" ? ["latin1", "binary"] : name === "utf16le" ? ["utf16le", "ucs2", "ucs-2", "utf-16le"] : [name];
+            for (const sp of spellings) $.if(strArg(local, sp), () => $.put(ENC, $.i(id)));
+          }
+          $.if($.eq($.l(ENC), $.i(-1)), () => fenceMsg(`'${method}' with an encoding this tier does not model`));
+        });
+        void ENC_UTF8;
+      };
+      const ret = (v: X): void => $.ret(v);
+      if (method === "on" || method === "once" || method === "addListener" || method === "prependListener") {
+        const once = method === "once" ? 1 : 0;
+        const prepend = method === "prependListener" ? 1 : 0;
+        $.if($.ne(kindOf(A1), $.i(DK.FUNC)), () => {
+          this.emitSetCellError(c, "%TypeError", "TypeError", (c2) => {
+            this.pushStrLitInto(c2, `The "listener" argument must be of type function. Received `);
+            c2.localGet(A1);
+            c2.call(this.dyn.specificType());
+            c2.call(this.concatHelper());
+          }, "ERR_INVALID_ARG_TYPE");
+          ret($.nul(dynT));
+        });
+        $.if($.ne(kindOf(A0), $.i(DK.STR)), () => fenceMsg(`'${method}' with a non-string event`));
+        const add = (owner: X, list: Parameters<HttpBuilder["addFn"]>[0], kind: "void" | "data" | "err" | "inc", after?: () => void): void => {
+          this.emitHttpDynListener(c, kind, A1, D);
+          c.localSet(L);
+          $.run(h.addFn(list), owner, $.l(L), $.i(once), $.i(prepend));
+          if (after !== undefined) after();
+          ret($.l(D));
+        };
+        $.if($.deq(tag, $.d(3)), () => {
+          const i = $.cast(h.incT(), ref);
+          $.if(strArg(A0, "data"), () => add(i, HL.INC_DATA, "data", () => $.run(h.incDataAddedFn(), $.cast(h.incT(), ref))));
+          $.if(strArg(A0, "end"), () => add(i, HL.INC_END, "void"));
+          $.if(strArg(A0, "close"), () => add(i, HL.INC_CLOSE, "void"));
+          $.if(strArg(A0, "error"), () => add(i, HL.INC_ERROR, "err"));
+          $.if(strArg(A0, "aborted"), () => add(i, HL.INC_ABORTED, "void"));
+        });
+        $.if($.or($.deq(tag, $.d(4)), $.deq(tag, $.d(5))), () => {
+          const o = $.cast(h.outT(), ref);
+          $.if(strArg(A0, "close"), () => add(o, HL.OUT_CLOSE, "void"));
+          $.if(strArg(A0, "finish"), () => add(o, HL.OUT_FINISH, "void"));
+          $.if(strArg(A0, "error"), () => add(o, HL.OUT_ERROR, "err"));
+          $.if(strArg(A0, "drain"), () => add(o, HL.OUT_DRAIN, "void"));
+          $.if(strArg(A0, "timeout"), () => add(o, HL.OUT_TIMEOUT, "void"));
+          $.if($.both($.deq(tag, $.d(5)), strArg(A0, "response")), () => add($.cast(h.creqT(), ref), HL.CREQ_RESPONSE, "inc"));
+        });
+        this.emitSetCellError(c, "%Error", "Error", (c2) => {
+          this.pushStrLitInto(c2, `'${method}' for the event '`);
+          c2.localGet(A0);
+          c2.structGet(dynT, DYN_REF);
+          c2.refCast(this.strType);
+          c2.call(this.concatHelper());
+          this.pushStrLitInto(c2, "' on an http handle is not supported yet");
+          c2.call(this.concatHelper());
+        }, null);
+        ret($.nul(dynT));
+      } else if (method === "pause" || method === "resume") {
+        $.if($.deq(tag, $.d(3)), () => {
+          $.run(method === "pause" ? h.incPauseFn() : h.incResumeFn(), $.cast(h.incT(), ref));
+          ret($.l(D));
+        });
+        notFn();
+      } else if (method === "pipe") {
+        $.if($.deq(tag, $.d(3)), () => {
+          $.if($.both($.eq(kindOf(A0), $.i(DK.HANDLE)), $.or($.deq(this.dynTag($, $.l(A0)), $.d(4)), $.deq(this.dynTag($, $.l(A0)), $.d(5)))), () => {
+            $.run(h.incPipeCheckedFn(), $.cast(h.incT(), ref), $.cast(h.outT(), $.get(dynT, DYN_REF, $.l(A0))));
+            $.if($.g(this.exc().kindG), () => ret($.nul(dynT)));
+            ret($.l(A0));
+          });
+          fenceMsg("pipe into this destination");
+        });
+        notFn();
+      } else if (method === "destroy") {
+        $.if($.not($.or($.eq(kindOf(A0), $.i(DK.UNDEF)), $.eq(kindOf(A0), $.i(DK.NULL)))), () => fenceMsg("destroy(err) on an http handle"));
+        $.if($.deq(tag, $.d(3)), () => {
+          $.run(h.incDestroyFn(), $.cast(h.incT(), ref), $.nul(this.exc().errT));
+          ret($.l(D));
+        });
+        $.if($.deq(tag, $.d(4)), () => {
+          $.run(h.outDestroyFn(), $.cast(h.outT(), ref), $.nul(this.exc().errT));
+          ret($.l(D));
+        });
+        $.if($.deq(tag, $.d(5)), () => {
+          $.run(h.clientDestroyFn(), $.cast(h.creqT(), ref), $.nul(this.exc().errT));
+          ret($.l(D));
+        });
+        $.if($.deq(tag, $.d(6)), () => {
+          $.run(h.agentDestroyFn(), $.cast(h.agentT(), ref));
+          ret($.g(this.dyn.undefinedGlobal()));
+        });
+        notFn();
+      } else if (method === "getName") {
+        $.if($.deq(tag, $.d(6)), () => {
+          $.put(NAME, $.call(this.httpAgentGetNameFn(), $.l(A0)));
+          $.if($.g(this.exc().kindG), () => ret($.nul(dynT)));
+          ret(this.boxStrX($, $.l(NAME)));
+        });
+        notFn();
+      } else {
+        // OutgoingMessage members: ServerResponse (4) and ClientRequest (5).
+        $.if($.not($.or($.deq(tag, $.d(4)), $.deq(tag, $.d(5)))), () => notFn());
+        const o = $.cast(h.outT(), ref);
+        const pend = (): void => {
+          $.if($.g(this.exc().kindG), () => ret($.nul(dynT)));
+        };
+        if (method === "setHeader" || method === "appendHeader") {
+          $.put(NAME, $.call(this.httpNameArgFn(), $.l(A0)));
+          pend();
+          $.put(V, $.call(this.httpDynToHvFn(), $.l(A1)));
+          pend();
+          $.run(method === "setHeader" ? h.setHeaderFn() : h.appendHeaderFn(), o, $.l(NAME), $.l(V));
+          pend();
+          ret($.l(D));
+        } else if (method === "getHeader") {
+          $.put(NAME, $.call(this.httpNameStrictFn(), $.l(A0)));
+          pend();
+          ret($.call(this.httpHvToDynFn(), $.call(h.getHeaderFn(), o, $.l(NAME))));
+        } else if (method === "hasHeader") {
+          $.put(NAME, $.call(this.httpNameStrictFn(), $.l(A0)));
+          pend();
+          ret(this.boxBoolX($, $.call(h.hasHeaderFn(), o, $.l(NAME))));
+        } else if (method === "removeHeader") {
+          $.put(NAME, $.call(this.httpNameStrictFn(), $.l(A0)));
+          pend();
+          $.run(h.removeHeaderFn(), o, $.l(NAME));
+          pend();
+          ret($.g(this.dyn.undefinedGlobal()));
+        } else if (method === "getHeaders") {
+          ret($.call(this.httpGetHeadersFn(), o));
+        } else if (method === "getHeaderNames") {
+          const ARR = $.local(this.dyn.arrRef());
+          const I = $.local(I32);
+          const LST = $.local({ kind: "ref", nullable: true, typeIndex: h.hentArrT });
+          $.put(ARR, $.raw((x) => this.dyn.pushNewArr(x)));
+          $.put(LST, $.call(h.outHeadersListFn(), o));
+          $.if($.notNull($.l(LST)), () => {
+            $.for(I, $.i(0), $.call(h.outHeadersCountFn(), o), () => {
+              $.run(this.dyn.arrPush(), $.l(ARR), this.boxStrX($, $.get(h.hentT, 0, $.aget(h.hentArrT, $.l(LST), $.l(I)))));
+            });
+          });
+          ret($.raw((x) => this.dyn.boxArr(x, (y) => y.localGet(ARR))));
+        } else if (method === "writeHead") {
+          $.if($.deq(tag, $.d(5)), () => notFn());
+          $.run(this.httpDynWriteHeadFn(), $.cast(h.resT(), ref), $.l(A0), $.l(A1), $.l(A2));
+          pend();
+          ret($.l(D));
+        } else if (method === "write") {
+          // write(chunk[, encoding][, callback])
+          $.if($.eq(kindOf(A1), $.i(DK.FUNC)), () => {
+            ecbOf(A1);
+            $.put(ENC, $.i(ENC_NONE));
+          }, () => {
+            encOf(A1);
+            ecbOf(A2);
+          });
+          $.if($.not($.call(this.httpDynChunkArgFn(false), $.l(A0))), () => ret($.nul(dynT)));
+          $.put(R, $.call(h.outWriteFn(), o, $.g(g.s), $.g(g.b), $.l(ENC), $.l(ECB)));
+          pend();
+          ret(this.boxBoolX($, $.l(R)));
+        } else if (method === "end") {
+          // end([chunk][, encoding][, callback])
+          $.if($.eq(kindOf(A0), $.i(DK.FUNC)), () => {
+            vcbOf(A0);
+            $.put(A0, $.g(this.dyn.undefinedGlobal()));
+            $.put(ENC, $.i(ENC_NONE));
+          }, () => {
+            $.if($.eq(kindOf(A1), $.i(DK.FUNC)), () => {
+              vcbOf(A1);
+              $.put(ENC, $.i(ENC_NONE));
+            }, () => {
+              encOf(A1);
+              vcbOf(A2);
+            });
+          });
+          $.if($.not($.call(this.httpDynChunkArgFn(true), $.l(A0))), () => ret($.nul(dynT)));
+          $.run(h.outEndXFn(), o, $.g(g.s), $.g(g.b), $.l(ENC), $.l(VCB), $.l(ECB));
+          pend();
+          ret($.l(D));
+        } else if (method === "cork" || method === "uncork") {
+          $.run(method === "cork" ? h.outCorkFn() : h.outUncorkFn(), o);
+          pend();
+          ret($.g(this.dyn.undefinedGlobal()));
+        } else if (method === "flushHeaders") {
+          $.run(h.outFlushHeadersFn(), o);
+          pend();
+          ret($.g(this.dyn.undefinedGlobal()));
+        } else {
+          notFn();
+        }
+      }
+      $.do($.nul(dynT));
+    });
+    this.httpHandleInvokeFns.set(method, idx);
+    return idx;
+  }
+
+  /** The handle surface the dyn builder reaches in an http module: tags 3..6
+   * route to http's, 1 and 2 to node:net's. */
+  private httpTopKeyGetFn(): number {
+    const dynRefT = this.dyn.dynRef();
+    return this.httpFn("topKeyGet", [dynRefT, this.strRef], [dynRefT], (f, $) => {
+      $.if($.dge(this.dynTag($, $.l(0)), $.d(3)), () => $.ret($.call(this.httpHandleKeyGetFn(), $.l(0), $.l(1))));
+      $.do($.call(this.netHandleKeyGetFn(), $.l(0), $.l(1)));
+    });
+  }
+
+  private httpTopKeySetFn(): number {
+    const dynRefT = this.dyn.dynRef();
+    return this.httpFn("topKeySet", [dynRefT, this.strRef, dynRefT], [], (f, $) => {
+      $.if($.dge(this.dynTag($, $.l(0)), $.d(3)), () => {
+        $.run(this.httpHandleKeySetFn(), $.l(0), $.l(1), $.l(2));
+        $.ret();
+      });
+      this.emitSetCellError($.c, "%Error", "Error", (c2) => this.pushStrLitInto(c2, "setting a property on a net handle is not supported yet"), null);
+    });
+  }
+
+  private httpTopInvokeFn(method: string): number {
+    const dynRefT = this.dyn.dynRef();
+    const arrRefT = this.dyn.arrRef();
+    return this.httpFn(`topInvoke:${method}`, [dynRefT, arrRefT, this.strRef], [dynRefT], (f, $) => {
+      const hInv = this.httpHandleInvokeFn(method);
+      const nInv = this.netHandleInvokeFn(method);
+      $.if($.dge(this.dynTag($, $.l(0)), $.d(3)), () => {
+        if (hInv !== null) $.ret($.call(hInv, $.l(0), $.l(1), $.l(2)));
+        else {
+          this.emitSetCellError($.c, "%Error", "Error", (c2) => this.pushStrLitInto(c2, `'${method}' on an http handle is not supported yet`), null);
+          $.ret($.nul(this.dyn.dynT()));
+        }
+      });
+      if (nInv !== null) $.do($.call(nInv, $.l(0), $.l(1), $.l(2)));
+      else {
+        this.emitSetCellError($.c, "%Error", "Error", (c2) => this.pushStrLitInto(c2, `'${method}' on a net handle is not supported yet`), null);
+        $.do($.nul(this.dyn.dynT()));
+      }
+    });
   }
 
   private cpaField: ChildAsyncBuilder | null = null;
@@ -10636,6 +12518,20 @@ class Assembler {
         }
         c.i32Const(DK.HANDLE);
         c.f64Const(t.kind === "netSocket" ? 1 : 2);
+        c.localGet(0);
+        c.structNew(dyn.dynT());
+        return true;
+      // INC-29 U2: IncomingMessage (3), ServerResponse (4), ClientRequest
+      // (5) box by reference too (the Agent, 6, is born a handle).
+      case "httpReq":
+      case "httpRes":
+      case "httpClientReq":
+        if (!this.httpModule) {
+          this.refuse(`dynFrom:${t.kind}`, loc);
+          return false;
+        }
+        c.i32Const(DK.HANDLE);
+        c.f64Const(t.kind === "httpReq" ? 3 : t.kind === "httpRes" ? 4 : 5);
         c.localGet(0);
         c.structNew(dyn.dynT());
         return true;
@@ -11522,6 +13418,26 @@ class Assembler {
         // to validate, nothing to build.
         c.localGet(0);
         return true;
+      case "httpReq":
+      case "httpRes":
+      case "httpClientReq": {
+        // INC-29 U2: an http handle comes back by reference — a HANDLE
+        // whose tag names the class (3 IncomingMessage, 4 ServerResponse,
+        // 5 ClientRequest); anything else is the ordinary check failure.
+        if (val.kind !== "ref") return false;
+        kindGuard(DK.HANDLE);
+        c.localGet(0);
+        c.structGet(dyn.dynT(), DYN_NUM);
+        c.f64Const(t.kind === "httpReq" ? 3 : t.kind === "httpRes" ? 4 : 5);
+        c.f64Ne();
+        c.ifVoid();
+        this.emitWalkerFail(w, want, val, (x) => x.localGet(1), (x) => x.localGet(0));
+        c.end();
+        c.localGet(0);
+        c.structGet(dyn.dynT(), DYN_REF);
+        c.refCast(val.typeIndex);
+        return true;
+      }
       case "record": {
         const shape = this.recordShapes.get(t.shapeId);
         const info = this.recordInfo(t.shapeId, loc, false);
@@ -12955,6 +14871,14 @@ class Assembler {
         return this.net.sockRef();
       case "netServer":
         return this.net.srvRef();
+      // INC-29 U2: node:http's IncomingMessage, ServerResponse and
+      // ClientRequest (http.ts) — never fail in an http module.
+      case "httpReq":
+        return this.http.incRef();
+      case "httpRes":
+        return this.http.resRef();
+      case "httpClientReq":
+        return this.http.creqRef();
       // INC-27 U1: the $sym struct (symbols.ts) — ONE representation
       // whatever the symbol (registered or not, described or not), same
       // shape as bytes/promise/dyn/regex/stats just above: this arm
@@ -13024,6 +14948,7 @@ class Assembler {
           t.elem.kind === "childStream" || // INC-28 U3: a stream[] (mapType's childStream arm never fails), the same lockstep
           t.elem.kind === "netSocket" || // INC-29 U1: a Socket[] (mapType's netSocket arm never fails), the same lockstep
           t.elem.kind === "netServer" || // INC-29 U1: a Server[], the same lockstep
+          (this.httpModule && (t.elem.kind === "httpReq" || t.elem.kind === "httpRes" || t.elem.kind === "httpClientReq")) || // INC-29 U2
           t.elem.kind === "symbol" || // INC-27 U1: mapTypeSoft must admit symbol wherever mapType does, including as an array element, or the I32 placeholder is declared for a field that actually holds a $sym struct — the same lockstep-bug class this list's own header comment names
           (t.elem.kind === "object" && this.objectMappable(t.elem.className));
         if (!mappable) return I32;
@@ -13134,6 +15059,13 @@ class Assembler {
         return this.net.sockRef();
       case "netServer":
         return this.net.srvRef();
+      // INC-29 U2: mapType's http arms, in lockstep.
+      case "httpReq":
+        return this.httpModule ? this.http.incRef() : I32;
+      case "httpRes":
+        return this.httpModule ? this.http.resRef() : I32;
+      case "httpClientReq":
+        return this.httpModule ? this.http.creqRef() : I32;
       // INC-27 U1: mapType never fails on symbol either — same
       // consistency rule as every other never-fails arm above
       // (dyn/jsval/bytes/regex/stats). This case and mapType's own
@@ -19940,6 +21872,7 @@ class Assembler {
           code.unreachable();
           return;
         }
+        if (this.emitHttpLibCall(e)) return;
         if (this.emitNetLibCall(e)) return;
         if (this.emitBufferLibCall(e)) return;
         if (this.emitTimerCall(e)) return;
@@ -20335,7 +22268,10 @@ class Assembler {
           // INC-29 U1: a node:net Socket / Server, boxed by reference
           // (emitDynFromBody's own arm; refused outside a net module).
           case "netSocket":
-          case "netServer": {
+          case "netServer":
+          case "httpReq":
+          case "httpRes":
+          case "httpClientReq": {
             // The composite conversion is a per-typeKey WALKER (the C
             // emitter's sc_td_N): a deep copy for the structured kinds, a
             // reference box for a promise, the `%error` encoding for an
@@ -26161,6 +28097,8 @@ class Assembler {
       return { kind: "str", val: { kind: "ref", nullable: true, typeIndex: this.strType } };
     }
     if (t.kind === "symbol") return { kind: "sym", val: this.syms.symRef() };
+    // INC-29 U2: a net.Server by reference identity (Set<http.Server>).
+    if (t.kind === "netServer") return { kind: "ref", val: this.net.srvRef() };
     return null;
   }
 
@@ -27147,7 +29085,9 @@ class Assembler {
           k === "classval" || k === "map" || k === "set" || k === "bytes" || k === "symbol" ||
           // INC-29 U1: a node:net Socket / Server is one GC struct per
           // handle; identity is the reference (`c.pause() === c`).
-          k === "netSocket" || k === "netServer"
+          k === "netSocket" || k === "netServer" ||
+          // INC-29 U2: http's structs, the same.
+          k === "httpReq" || k === "httpRes" || k === "httpClientReq"
         ) {
           // Reference identity — JS object/function equality exactly.
           // Every one of these is a GC struct or array reference and

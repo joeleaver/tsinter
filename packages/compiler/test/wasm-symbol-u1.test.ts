@@ -835,12 +835,10 @@ test("REGRESSION 1731 (symbol field shapes, one of the twelve U1 programs) is un
 // contains the fallback key even though it is not the first entry.
 // ============================================================
 
-test("NOT-LIFTED setNew:ref-elem still refuses for netServer (Set of server handles)", async () => {
+test("LIFTED (INC-29 U2) setNew:ref-elem for netServer: corpus 2714's Set of server handles compiles (maps.ts's reference-identity key kind; its output is pinned in the differential's INC-29 U2 block)", async () => {
   const entry = fileURLToPath(new URL("../../../tests/corpus/2714-set-server-handles.ts", import.meta.url));
-  const res = await compile(entry, { outPath: join(scratch, "notlifted-2714.wasm"), outDir: scratch, backend: "wasm" });
-  expect(res.ok).toBe(false);
-  if (res.ok) return;
-  expect(res.wasmSurvey).toContain("setNew:ref-elem");
+  const res = await compile(entry, { outPath: join(scratch, "lifted-2714.wasm"), outDir: scratch, backend: "wasm" });
+  expect(res.ok).toBe(true);
 });
 
 test("LIFTED (INC-29 U1) bin:ref-eq for netSocket: corpus 2640's socket comparison compiles (its output is pinned in the differential's INC-29 U1 block)", async () => {

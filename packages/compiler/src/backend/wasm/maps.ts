@@ -97,7 +97,10 @@ import { BUF, LEN } from "./arrays.js";
 import { Code } from "./code.js";
 import { F64, I32, ModuleBuilder, type FieldType, type StorageType, type ValType } from "./module.js";
 
-export type MapKeyKind = "f64" | "str" | "sym";
+/** "ref" (INC-29 U2): a handle key compared by reference identity — a
+ * net.Server in a Set (SameValueZero for objects). It has no identity
+ * number to hash, so every key lands in one bucket: correct, linear. */
+export type MapKeyKind = "f64" | "str" | "sym" | "ref";
 /** How the VALUE is represented — f64/bool unpacked, everything else
  * (string, record, array, union, object, promise, classval, map, set,
  * dyn — anything mapType hands back as a ref) is one "ref" bucket: unlike
@@ -338,6 +341,10 @@ export class MapBuilder {
       c.i32WrapI64();
       return;
     }
+    if (m.keyKind === "ref") {
+      c.i32Const(0);
+      return;
+    }
     const rest: never = m.keyKind;
     throw new Error(`emitHashKey: unhandled key kind ${rest as string}`);
   }
@@ -379,6 +386,12 @@ export class MapBuilder {
       c.refEq();
       return;
     }
+    if (m.keyKind === "ref") {
+      c.localGet(A);
+      c.localGet(B);
+      c.refEq();
+      return;
+    }
     const rest: never = m.keyKind;
     throw new Error(`emitKeyEq: unhandled key kind ${rest as string}`);
   }
@@ -406,6 +419,8 @@ export class MapBuilder {
         return true;
       case "sym":
         return true;
+      case "ref":
+        return true;
       case "f64":
         return false;
     }
@@ -429,6 +444,8 @@ export class MapBuilder {
       case "str":
         return false;
       case "sym":
+        return false;
+      case "ref":
         return false;
     }
   }
