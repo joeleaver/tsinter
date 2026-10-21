@@ -283,6 +283,24 @@ import { WasmUnsupportedError } from "./unsupported.js";
 
 export { WasmUnsupportedError } from "./unsupported.js";
 
+/** Does `init` build a closure that captures `localId`, the binding it is
+ * about to initialize? A generic deep scan (reachableFunctionNames' own
+ * blunt-on-purpose precedent below): the closure may sit under a wrapper,
+ * and any closure naming the id would otherwise capture the slot before
+ * its box exists. */
+function capturesOwnBinding(init: unknown, localId: string): boolean {
+  const seen = new Set<object>();
+  const visit = (v: unknown): boolean => {
+    if (v === null || typeof v !== "object" || seen.has(v)) return false;
+    seen.add(v);
+    if (Array.isArray(v)) return v.some(visit);
+    const o = v as { kind?: unknown; captures?: unknown };
+    if (o.kind === "closure" && Array.isArray(o.captures) && o.captures.includes(localId)) return true;
+    return Object.values(o).some(visit);
+  };
+  return visit(init);
+}
+
 function valKey(t: ValType): string {
   return t.kind === "ref" ? `r${t.nullable ? "?" : ""}${t.typeIndex}` : t.kind;
 }
@@ -15316,6 +15334,24 @@ class Assembler {
           // (structNewDefault leaves the nullable slot null — the
           // sentinel; the initializing assign fills it).
           const box = this.boxTypeForLocal(local);
+          if (s.init !== null && capturesOwnBinding(s.init, s.localId)) {
+            // The initializer closes over the binding it initializes (a
+            // hoisted `function f` whose body hands `f` to a nested
+            // closure): the box must exist BEFORE the closure captures it,
+            // so mint it empty, run the initializer, then fill it — the
+            // closure and every later read share the one box.
+            const slot = this.localIndex(s.localId);
+            code.structNewDefault(box);
+            code.localSet(slot);
+            code.localGet(slot);
+            this.walkExpr(s.init);
+            if (local.tdz === true) {
+              const inner = this.tdzInnerFor(this.mapTypeSoft(local.type));
+              if (inner !== null) code.structNew(inner);
+            }
+            code.structSet(box, 0);
+            return;
+          }
           if (s.init !== null) {
             this.walkExpr(s.init);
             if (local.tdz === true) {

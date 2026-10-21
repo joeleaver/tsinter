@@ -8064,3 +8064,32 @@ describe("INC-29 U2 node:http rows", () => {
     expect({ stdout: r.stdout.toString("utf8"), stderr: r.stderr.toString("utf8"), exitCode: r.exitCode }).toEqual({ stdout: "getHeader is the string: true\nwriteHead threw: Invalid status code: 99\nstatusMessage after: true\nstatusCode threw: reading 'statusCode' of a server request (null) is not supported yet\n200 5\n", stderr: "", exitCode: 0 });
   }, 60000);
 });
+
+// ── self-capturing boxed declarations ─────────────────────────────────────
+// A hoisted `function f` that hands `f` to a nested closure captures its own
+// binding while that binding is being initialized: the box must be minted
+// before the closure is built (a stale null box trapped on the first nested
+// read). Expected outputs measured against Node v24.18.1 on the same source.
+describe("self-capturing boxed declaration rows", () => {
+  async function runDyn(src: string): Promise<RunResult> {
+    const dir = mkdtempSync(join(tmpdir(), "selfcap-row-"));
+    try {
+      const path = join(dir, "main.cjs");
+      writeFileSync(path, src);
+      const res = await compile(path, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: true, backend: "wasm" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+      return await runWasm(res.binaryPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  test("SELFCAP-01 the write/drain pump: a nested hoisted function capturing let locals and a dyn value, re-entered from a timer callback that captures it \u2014 SINGLE-EDIT: the boxed varDecl walking its initializer before minting the box", async () => {
+    const r = await runDyn("'use strict';\nconst EventEmitter = require('events');\nfunction pass(x) { return x; }\nfunction run(e0) {\n  const res = pass(e0);\n  let i = 0;\n  let drains = 0;\n  let falses = 0;\n  function pump() {\n    while (i < 5) {\n      i++;\n      if (i % 2 === 0) { falses++; setTimeout(function () { drains++; pump(); }, 1); return; }\n    }\n    console.log('done', falses, drains, typeof res);\n  }\n  pump();\n}\nrun({});\n");
+    expect({ stdout: r.stdout.toString("utf8"), stderr: r.stderr.toString("utf8"), exitCode: r.exitCode }).toEqual({ stdout: "done 2 2 object\n", stderr: "", exitCode: 0 });
+  }, 60000);
+  test("SELFCAP-02 a block-scoped hoisted function in a for-let loop recursing through a nested closure, and an outer function called twice: a fresh box per execution, each shared with its own closure \u2014 SINGLE-EDIT: the boxed varDecl walking its initializer before minting the box", async () => {
+    const r = await runDyn("'use strict';\nfor (let k = 0; k < 3; k++) {\n  function tick(n) {\n    if (n > 0) { const g = function () { tick(n - 1); }; g(); return; }\n    console.log('k' + String(k));\n  }\n  tick(2);\n}\nfunction outer(tag) {\n  let c = 0;\n  function again() { c++; if (c < 2) setTimeout(function () { again(); }, 1); else console.log(`${tag} ${c}`); }\n  again();\n}\nouter('one');\nouter('two');\n");
+    expect({ stdout: r.stdout.toString("utf8"), stderr: r.stderr.toString("utf8"), exitCode: r.exitCode }).toEqual({ stdout: "k0\nk1\nk2\none 2\ntwo 2\n", stderr: "", exitCode: 0 });
+  }, 60000);
+});
