@@ -1967,7 +1967,7 @@ declare module "http" {
   };
   /* The options-record stance (the RequestOptions precedent): every
    * documented key typechecks; the lowering's option walk decides per
-   * key — requireHostHeader: false and joinDuplicateHeaders lower,
+   * key — requireHostHeader and joinDuplicateHeaders lower,
    * documented-but-unlowered keys fence by name, unknown keys drop. */
   export interface ServerOptions {
     requireHostHeader?: boolean;
@@ -2014,7 +2014,7 @@ declare module "http" {
     statusCode: number;
     statusMessage: string;
     setHeader(name: string, value: string | number): void;
-    getHeader(name: string): string | undefined;
+    getHeader(name: string): string | number | undefined;
     hasHeader(name: string): boolean;
     removeHeader(name: string): void;
     /* Both overloads answer the response (`return this` chaining); the
@@ -2047,10 +2047,9 @@ declare module "http" {
     /* The caller's own dialer (the proxy's loopback dial): invoked once,
      * synchronously; its socket carries the exchange. */
     createConnection?: () => Socket;
-    /* agent: false is a one-shot dial with Connection: close — exactly
-     * the compiled client's model; null/undefined are the default; an
-     * Agent VALUE threads through (getName-keyed maxSockets accounting
-     * over one-dial-per-request connections). */
+    /* agent: false is Node's one-shot Agent (a fresh default Agent per
+     * request); null/undefined are the default; an Agent VALUE threads
+     * through. */
     agent?: Agent | boolean | null;
     /* The options-record stance: Node ignores an options record's
      * unknown keys, so every key typechecks here — the option WALK in
@@ -2328,7 +2327,7 @@ declare module "http2" {
     statusCode: number;
     statusMessage: string;
     setHeader(name: string, value: string | number): void;
-    getHeader(name: string): string | undefined;
+    getHeader(name: string): string | number | undefined;
     hasHeader(name: string): boolean;
     removeHeader(name: string): void;
     writeHead(statusCode: number, headers?: import("http").OutgoingHttpHeaders | string[]): Http2ServerResponse;

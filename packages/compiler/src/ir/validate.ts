@@ -403,13 +403,15 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "http.createServer": { argTypes: [null], result: NETSERVER_T },
   "http.createServerEmpty": { argTypes: [], result: NETSERVER_T },
   "http.serverJoinDupHeaders": { argTypes: [NETSERVER_T], result: VOID },
+  "http.serverRequireHost": { argTypes: [NETSERVER_T, BOOL], result: VOID },
   "net.serverOnListening": { argTypes: [NETSERVER_T, { kind: "func", params: [], ret: VOID }, BOOL], result: VOID },
   "http.resStatusGet": { argTypes: [HTTPRES_T], result: F64 },
   "http.resStatusSet": { argTypes: [HTTPRES_T, F64], result: VOID },
   "http.resStatusMsgGet": { argTypes: [HTTPRES_T], result: STRING },
   "http.resStatusMsgSet": { argTypes: [HTTPRES_T, STRING], result: VOID },
-  // resGetHeader answers the interned `string | undefined` union — the
-  // reqHeader/envGet sentinel pattern (VOID here, checked specially).
+  "http.resWriteHeadReason": { argTypes: [HTTPRES_T, F64, STRING], result: VOID },
+  // resGetHeader answers the interned `number | string | undefined`
+  // union (VOID here, checked specially).
   "http.resGetHeader": { argTypes: [HTTPRES_T, STRING], result: VOID },
   "http.resHasHeader": { argTypes: [HTTPRES_T, STRING], result: BOOL },
   "http.resRemoveHeader": { argTypes: [HTTPRES_T, STRING], result: VOID },
@@ -420,6 +422,7 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "http.reqOnData": { argTypes: [HTTPREQ_T, null, BOOL], result: VOID },
   "http.reqOnEnd": { argTypes: [HTTPREQ_T, { kind: "func", params: [], ret: VOID }, BOOL], result: VOID },
   "http.resSetHeader": { argTypes: [HTTPRES_T, STRING, STRING], result: VOID },
+  "http.resSetHeaderNum": { argTypes: [HTTPRES_T, STRING, F64], result: VOID },
   "http.resWriteHead": { argTypes: [HTTPRES_T, F64], result: VOID },
   "http.resWriteHeadN": { argTypes: [HTTPRES_T, F64, arrayOf(STRING), arrayOf(STRING)], result: VOID },
   "http.resWrite": { argTypes: [HTTPRES_T, STRING], result: VOID },
@@ -472,11 +475,11 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "net.sockEncrypted": { argTypes: [NETSOCKET_T], result: VOID },
   // node:http, the client slice. The response callback shapes are
   // program-dependent (checked below); header pairs arrive flat.
-  "http.request": { argTypes: [STRING, F64, STRING, STRING, F64, arrayOf(STRING), BOOL], result: HTTPCLIENTREQ_T },
-  "http.requestCb": { argTypes: [STRING, F64, STRING, STRING, F64, arrayOf(STRING), BOOL, null], result: HTTPCLIENTREQ_T },
-  "http.agentNew": { argTypes: [BOOL, BOOL, F64, F64, F64, F64, F64], result: DYN },
-  "http.requestAgent": { argTypes: [STRING, F64, STRING, STRING, F64, arrayOf(STRING), BOOL, DYN], result: HTTPCLIENTREQ_T },
-  "http.requestAgentCb": { argTypes: [STRING, F64, STRING, STRING, F64, arrayOf(STRING), BOOL, DYN, null], result: HTTPCLIENTREQ_T },
+  "http.request": { argTypes: [STRING, F64, STRING, STRING, DYN, arrayOf(STRING), BOOL], result: HTTPCLIENTREQ_T },
+  "http.requestCb": { argTypes: [STRING, F64, STRING, STRING, DYN, arrayOf(STRING), BOOL, null], result: HTTPCLIENTREQ_T },
+  "http.agentNew": { argTypes: [BOOL, BOOL, F64, F64, F64, F64, F64, BOOL, STRING], result: DYN },
+  "http.requestAgent": { argTypes: [STRING, F64, STRING, STRING, DYN, arrayOf(STRING), BOOL, DYN], result: HTTPCLIENTREQ_T },
+  "http.requestAgentCb": { argTypes: [STRING, F64, STRING, STRING, DYN, arrayOf(STRING), BOOL, DYN, null], result: HTTPCLIENTREQ_T },
   "http.requestUrl": { argTypes: [STRING, STRING, BOOL], result: HTTPCLIENTREQ_T },
   "http.requestUrlCb": { argTypes: [STRING, STRING, BOOL, null], result: HTTPCLIENTREQ_T },
   "net.sockOnReadable": { argTypes: [NETSOCKET_T, null, BOOL], result: VOID },
@@ -611,18 +614,18 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   // The createConnection forms: arg 0 is the dialer closure (() =>
   // Socket — the libCall case checks), then path/method/timeout/headers/
   // autoEnd like http.request.
-  "http.requestConn": { argTypes: [null, STRING, STRING, F64, arrayOf(STRING), BOOL], result: HTTPCLIENTREQ_T },
-  "http.requestConnCb": { argTypes: [null, STRING, STRING, F64, arrayOf(STRING), BOOL, null], result: HTTPCLIENTREQ_T },
-  "https.request": { argTypes: [STRING, F64, STRING, STRING, F64, arrayOf(STRING), BOOL, BOOL, null], result: HTTPCLIENTREQ_T },
-  "https.requestCb": { argTypes: [STRING, F64, STRING, STRING, F64, arrayOf(STRING), BOOL, BOOL, null, null], result: HTTPCLIENTREQ_T },
+  "http.requestConn": { argTypes: [null, STRING, STRING, DYN, arrayOf(STRING), BOOL], result: HTTPCLIENTREQ_T },
+  "http.requestConnCb": { argTypes: [null, STRING, STRING, DYN, arrayOf(STRING), BOOL, null], result: HTTPCLIENTREQ_T },
+  "https.request": { argTypes: [STRING, F64, STRING, STRING, DYN, arrayOf(STRING), BOOL, BOOL, null], result: HTTPCLIENTREQ_T },
+  "https.requestCb": { argTypes: [STRING, F64, STRING, STRING, DYN, arrayOf(STRING), BOOL, BOOL, null, null], result: HTTPCLIENTREQ_T },
   "https.requestUrl": { argTypes: [STRING, STRING, BOOL], result: HTTPCLIENTREQ_T },
   "https.requestUrlCb": { argTypes: [STRING, STRING, BOOL, null], result: HTTPCLIENTREQ_T },
-  "https.requestAgent": { argTypes: [STRING, F64, STRING, STRING, F64, arrayOf(STRING), BOOL, BOOL, null, DYN], result: HTTPCLIENTREQ_T },
-  "https.requestAgentCb": { argTypes: [STRING, F64, STRING, STRING, F64, arrayOf(STRING), BOOL, BOOL, null, DYN, null], result: HTTPCLIENTREQ_T },
+  "https.requestAgent": { argTypes: [STRING, F64, STRING, STRING, DYN, arrayOf(STRING), BOOL, BOOL, null, DYN], result: HTTPCLIENTREQ_T },
+  "https.requestAgentCb": { argTypes: [STRING, F64, STRING, STRING, DYN, arrayOf(STRING), BOOL, BOOL, null, DYN, null], result: HTTPCLIENTREQ_T },
   // The requestFn binding's runtime-secure rows: https.request's shape
   // with the leading `secure` bool.
-  "https.requestFn": { argTypes: [BOOL, STRING, F64, STRING, STRING, F64, arrayOf(STRING), BOOL, BOOL, null], result: HTTPCLIENTREQ_T },
-  "https.requestFnCb": { argTypes: [BOOL, STRING, F64, STRING, STRING, F64, arrayOf(STRING), BOOL, BOOL, null, null], result: HTTPCLIENTREQ_T },
+  "https.requestFn": { argTypes: [BOOL, STRING, F64, STRING, STRING, DYN, arrayOf(STRING), BOOL, BOOL, null], result: HTTPCLIENTREQ_T },
+  "https.requestFnCb": { argTypes: [BOOL, STRING, F64, STRING, STRING, DYN, arrayOf(STRING), BOOL, BOOL, null, null], result: HTTPCLIENTREQ_T },
   "http.clientWrite": { argTypes: [HTTPCLIENTREQ_T, STRING], result: VOID },
   "http.clientWriteBytes": { argTypes: [HTTPCLIENTREQ_T, BYTES_U8], result: VOID },
   "http.clientEnd": { argTypes: [HTTPCLIENTREQ_T], result: VOID },
@@ -3770,7 +3773,21 @@ function validateFunction(
           }
           break;
         }
-        if (e.fn === "http.reqHeader" || e.fn === "http.resGetHeader") {
+        if (e.fn === "http.resGetHeader") {
+          // Result is the interned `number | string | undefined` union.
+          const def = e.type.kind === "union" ? unions.get(e.type.unionId) : undefined;
+          const ok =
+            def &&
+            def.arms.length === 3 &&
+            def.arms.some((a) => a.kind === "f64") &&
+            def.arms.some((a) => a.kind === "string") &&
+            def.arms.some((a) => a.kind === "undefinedT");
+          if (!ok) {
+            err(`libCall http.resGetHeader must return the 'number | string | undefined' union`, e.loc);
+          }
+          break;
+        }
+        if (e.fn === "http.reqHeader") {
           // Result is the interned `string | undefined` union (envGet's).
           const def = e.type.kind === "union" ? unions.get(e.type.unionId) : undefined;
           const ok =

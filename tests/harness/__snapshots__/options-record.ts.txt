@@ -1,29 +1,29 @@
-options-record.ts:15:7 - error SC2020: 'AgentOptions' is part of the standard library types but has no scriptc lowering yet
+options-record.ts:16:7 - error SC2020: 'AgentOptions' is part of the standard library types but has no scriptc lowering yet
 
-  14 | // LITERAL options object; a runtime options value cannot be walked.
-  15 | const agentOpts: http.AgentOptions = { maxSockets: 1 };
+  15 | // LITERAL options object; a runtime options value cannot be walked.
+  16 | const agentOpts: http.AgentOptions = { maxSockets: 1 };
      |       ^~~~~~~~~
-  16 | const agent = new http.Agent(agentOpts);
+  17 | const agent = new http.Agent(agentOpts);
 
   hint: the type checker sees the full standard library, but only the supported surface compiles (https://scriptc.dev/limitations)
 
-options-record.ts:16:30 - error SC2020: 'new http.Agent with a non-literal options value' is part of the standard library types but has no scriptc lowering yet
+options-record.ts:17:30 - error SC2020: 'new http.Agent with a non-literal options value' is part of the standard library types but has no scriptc lowering yet
 
-  15 | const agentOpts: http.AgentOptions = { maxSockets: 1 };
-  16 | const agent = new http.Agent(agentOpts);
+  16 | const agentOpts: http.AgentOptions = { maxSockets: 1 };
+  17 | const agent = new http.Agent(agentOpts);
      |                              ^~~~~~~~~
-  17 | http.get({ port: 80, agent }, () => {});
+  18 | http.get({ port: 80, agent }, () => {});
 
   hint: spell the options as an object literal at the construction site
 
-options-record.ts:22:22 - error SC2020: 'get with agent: false and a non-literal headers record' is part of the standard library types but has no scriptc lowering yet
+options-record.ts:22:23 - error SC2020: 'get mixing agent: false with createConnection' is part of the standard library types but has no scriptc lowering yet
 
-  21 | const dynHeaders: Record<string, string> = { "x-a": "1" };
-  22 | http.get({ port: 80, agent: false, headers: dynHeaders }, () => {});
-     |                      ^~~~~~~~~~~~
+  21 | // createConnection and ignores the option's dialer.
+  22 | http.get({ path: "/", agent: false, createConnection: () => net.connect(80) }, () => {});
+     |                       ^~~~~~~~~~~~
   23 | 
 
-  hint: agent: false lowers by injecting Connection: close into a LITERAL headers object — add connection: "close" to the record instead, or write the headers inline
+  hint: Node's one-shot Agent dials with its own createConnection and ignores the option — pass one or the other
 
 options-record.ts:25:22 - error SC2020: 'get option 'socketPath'' is part of the standard library types but has no scriptc lowering yet
 

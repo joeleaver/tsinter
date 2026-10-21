@@ -615,6 +615,7 @@ const LIB_FN_SYMS: Record<string, string> = {
   "http.reqDestroy": "scr_http_req_destroy",
   "http.reqSetEncoding": "scr_http_req_set_encoding",
   "http.resSetHeader": "scr_http_res_set_header",
+  "http.resSetHeaderNum": "scr_http_res_set_header_num",
   "http.resWriteHead": "scr_http_res_write_head",
   "http.resWriteHeadN": "scr_http_res_write_head_n",
   "http.resWrite": "scr_http_res_write_str",
@@ -630,11 +631,13 @@ const LIB_FN_SYMS: Record<string, string> = {
   "http.resStatusSet": "scr_http_res_status_set",
   "http.resStatusMsgGet": "scr_http_res_status_msg_get",
   "http.resStatusMsgSet": "scr_http_res_status_msg_set",
+  "http.resWriteHeadReason": "scr_http_res_write_head_reason",
   "http.resHasHeader": "scr_http_res_has_header_named",
   "http.resRemoveHeader": "scr_http_res_remove_header",
   "http.resWriteHeadPairs": "scr_http_res_write_head_pairs",
   "http.resWriteHeadDyn": "scr_http_res_write_head_dyn",
   "http.serverJoinDupHeaders": "scr_http_server_join_duplicate_headers",
+  "http.serverRequireHost": "scr_http_server_require_host",
   "http.clientWrite": "scr_http_client_write_str",
   "http.clientWriteBytes": "scr_http_client_write_bytes",
   "http.clientEnd": "scr_http_client_end",
@@ -11660,7 +11663,22 @@ class LlEmitter {
       B.line(`${raw} = call ptr @scr_net_sock_read_bytes(ptr ${args[0]!.name}, double ${args[1]!.name}) ; +1 or NULL`);
       return this.wrapNullable(raw, raw, def!.arms[bytesTag]!, bytesTag, e.type, nullTag);
     }
-    if (e.fn === "net.sockRemoteAddress" || e.fn === "http.reqHeader" || e.fn === "http.resGetHeader" || e.fn === "http.reqStatusMessage") {
+    if (e.fn === "http.resGetHeader") {
+      // number | string | undefined: the runtime builds the union value
+      // (a number set by setHeader stays one).
+      if (e.type.kind !== "union") throw new Error(`llvm emitter bug: ${e.fn} result is not a union`);
+      const def = this.unionsById.get(e.type.unionId);
+      const strTag = def ? def.arms.findIndex((a) => a.kind === "string") : -1;
+      const numTag = def ? def.arms.findIndex((a) => a.kind === "f64") : -1;
+      const undefTag = this.undefinedArmTag(e.type);
+      if (strTag < 0 || numTag < 0 || undefTag < 0) throw new Error(`llvm emitter bug: ${e.fn} union lacks its arms`);
+      const args = e.args.map((a) => this.emitExpr(a));
+      this.declare(`declare ptr @scr_http_res_get_header_u(ptr, ptr, i32, i32, ptr)`);
+      const t = B.tmp();
+      B.line(`${t} = call ptr @scr_http_res_get_header_u(ptr ${args[0]!.name}, ptr ${args[1]!.name}, i32 ${strTag}, i32 ${numTag}, ptr ${this.unitInstanceRef(e.type.unionId, undefTag)}) ; +1`);
+      return this.own({ name: t, type: e.type });
+    }
+    if (e.fn === "net.sockRemoteAddress" || e.fn === "http.reqHeader" || e.fn === "http.reqStatusMessage") {
       // string | undefined: +1 or NULL, NULL takes the undefined arm.
       if (e.type.kind !== "union") throw new Error(`llvm emitter bug: ${e.fn} result is not a union`);
       const def = this.unionsById.get(e.type.unionId);
@@ -11670,7 +11688,6 @@ class LlEmitter {
       const entry = {
         "net.sockRemoteAddress": "scr_net_sock_remote_address",
         "http.reqHeader": "scr_http_req_header",
-        "http.resGetHeader": "scr_http_res_get_header",
         "http.reqStatusMessage": "scr_http_req_status_message",
       }[e.fn]!;
       const args = e.args.map((a) => this.emitExpr(a));
@@ -11849,7 +11866,7 @@ class LlEmitter {
           throw new Error(`llvm emitter bug: ${e.fn} CA is not a string or Buffer`);
         }
         callArgs = [...callArgs.slice(0, 8), `ptr ${caData}`, `i64 ${caLen}`];
-        this.declare(`declare ptr @scr_https_request(ptr, double, ptr, ptr, double, ptr, i1 zeroext, i1 zeroext, ptr, i64, ptr, ptr)`);
+        this.declare(`declare ptr @scr_https_request(ptr, double, ptr, ptr, ptr, ptr, i1 zeroext, i1 zeroext, ptr, i64, ptr, ptr)`);
       } else {
         const decls = head.map((a) => (this.llType(a.type) === "i1" ? "i1 zeroext" : this.llType(a.type)));
         this.declare(`declare ptr @${entry}(${[...decls, "ptr", "ptr"].join(", ")})`);

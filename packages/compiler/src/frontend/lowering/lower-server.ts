@@ -109,7 +109,7 @@ function voidizedCallback(L: Lowerer, cb: IrExpr, loc: SrcLoc): IrExpr {
 /** A registration/side-effect libCall re-shaped to answer its RECEIVER —
  * Node's `return this` chaining (server.listen(...), res.writeHead(...)):
  * an interned helper runs the void call and returns its first argument.
- * `prefix` calls (the writeHead statusMessage form's resStatusMsgSet)
+ * `prefix` calls (the writeHead statusMessage form's resWriteHeadReason)
  * run first, sharing the same parameter refs. */
 function receiverReturningCall(
   L: Lowerer,
@@ -2234,13 +2234,13 @@ function lowerRequestHandlerArg(L: Lowerer, node: ts.Expression): IrExpr {
 }
 
 /** The http.createServer / http.Server options object — { requireHostHeader?,
- * joinDuplicateHeaders?, ... }: the two lowered keys are exactly the
- * parser behaviors this runtime has (requireHostHeader: false IS the
- * parser's stance — it never answers 400 for a missing Host;
- * joinDuplicateHeaders: true joins repeated request-header reads with
- * ", "). Other documented keys fence by name; unknown keys drop like
- * Node drops them. Answers whether joinDuplicateHeaders was requested. */
-function lowerHttpServerOptions(L: Lowerer, node: ts.Expression, what: string): { joinDup: boolean } {
+ * joinDuplicateHeaders?, ... }: requireHostHeader (a boolean: whether a
+ * Host-less HTTP/1.1 request is answered 400, Node's default true) and
+ * joinDuplicateHeaders: true (repeated request-header reads join ", ")
+ * lower. Other documented keys fence by name; unknown keys drop like
+ * Node drops them. Answers whether joinDuplicateHeaders was requested
+ * and the requireHostHeader value (null when absent). */
+function lowerHttpServerOptions(L: Lowerer, node: ts.Expression, what: string): { joinDup: boolean; requireHost: IrExpr | null } {
   if (!ts.isObjectLiteralExpression(node)) {
     L.noLowering(
       `${what} with a non-literal options argument`,
@@ -2249,6 +2249,7 @@ function lowerHttpServerOptions(L: Lowerer, node: ts.Expression, what: string): 
     );
   }
   let joinDup = false;
+  let requireHost: IrExpr | null = null;
   for (const prop of node.properties) {
     let initializer: ts.Expression | null;
     if (ts.isPropertyAssignment(prop) &&
@@ -2265,17 +2266,20 @@ function lowerHttpServerOptions(L: Lowerer, node: ts.Expression, what: string): 
     }
     const key = (prop.name as ts.Identifier | ts.StringLiteral).text;
     if (key === "requireHostHeader") {
-      // The literal `false` only: it asks for exactly this parser's
-      // behavior (requests without Host are served). Node's default
-      // (true: answer 400) is the behavior this slice does not have, so
-      // `true`/dynamic values fence instead of silently not enforcing.
-      if (initializer === null || initializer.kind !== ts.SyntaxKind.FalseKeyword) {
+      // A boolean value. Node's validateBoolean would answer anything
+      // else with its inspect of the value, so other types (a dyn value
+      // included) fence.
+      const v = initializer !== null
+        ? L.lowerExpr(initializer)
+        : L.lowerShorthandValue(prop as ts.ShorthandPropertyAssignment);
+      if (v.type.kind !== "bool") {
         L.noLowering(
-          `${what} with a non-\`false\` requireHostHeader option`,
+          `${what} with a requireHostHeader option of '${L.fmt(v.type)}' values`,
           prop,
-          "this parser never answers 400 for a missing Host header — requireHostHeader: false is the honest (and only) lowered value",
+          "requireHostHeader is a boolean",
         );
       }
+      requireHost = v;
       continue;
     }
     if (key === "joinDuplicateHeaders") {
@@ -2296,11 +2300,11 @@ function lowerHttpServerOptions(L: Lowerer, node: ts.Expression, what: string): 
     }
     fenceOrDropOptionKey(
       L, prop, key, what, HTTP_SERVER_DOCUMENTED_OPTIONS,
-      "requireHostHeader: false and joinDuplicateHeaders are the supported options",
+      "requireHostHeader and joinDuplicateHeaders are the supported options",
     );
     // An undocumented key, dropped like Node drops it.
   }
-  return { joinDup };
+  return { joinDup, requireHost };
 }
 
 /** The shared createServer([options][, handler]) shapes behind
@@ -2327,36 +2331,56 @@ function lowerHttpCreateServerForms(L: Lowerer, expr: ts.CallExpression | ts.New
     if (ts.isObjectLiteralExpression(args[0]!)) optsNode = args[0]!;
     else handlerNode = args[0]!;
   }
-  const joinDup = optsNode !== null && lowerHttpServerOptions(L, optsNode, what).joinDup;
+  const opts = optsNode !== null ? lowerHttpServerOptions(L, optsNode, what) : { joinDup: false, requireHost: null };
+  const { joinDup, requireHost } = opts;
+  // Node evaluates the options before the handler; the handler lowers to
+  // a closure value (no effects), so the server call can come first.
   const server: IrExpr = handlerNode !== null
     ? { kind: "libCall", fn: "http.createServer", args: [lowerRequestHandlerArg(L, handlerNode)], type: NETSERVER_T, loc }
     : { kind: "libCall", fn: "http.createServerEmpty", args: [], type: NETSERVER_T, loc };
-  if (!joinDup) return server;
+  if (!joinDup && requireHost === null) return server;
   // The flag-setting composition: an interned helper takes the fresh
-  // server, sets the parser flag, and answers it — one expression.
-  const key = `server.joindup`;
+  // server (and the requireHostHeader value), sets the parser flags, and
+  // answers it — one expression.
+  const key = `server.opts.${joinDup ? 1 : 0}.${requireHost !== null ? 1 : 0}`;
   const existing = L.arrHofHelpers.get(key);
-  const name = existing ?? `%server.joindup.${L.arrHofHelpers.size}`;
+  const name = existing ?? `%server.opts.${L.arrHofHelpers.size}`;
   if (!existing) {
     L.arrHofHelpers.set(key, name);
     const ref: IrExpr = { kind: "varRef", localId: "s.0", type: NETSERVER_T, loc };
+    const flag: IrExpr = { kind: "varRef", localId: "h.0", type: BOOL, loc };
+    const body: IrStmt[] = [];
+    if (joinDup) {
+      body.push({
+        kind: "exprStmt",
+        expr: { kind: "libCall", fn: "http.serverJoinDupHeaders", args: [ref], type: VOID, loc },
+        loc,
+      });
+    }
+    if (requireHost !== null) {
+      body.push({
+        kind: "exprStmt",
+        expr: { kind: "libCall", fn: "http.serverRequireHost", args: [ref, flag], type: VOID, loc },
+        loc,
+      });
+    }
+    body.push({ kind: "return", value: ref, loc });
     L.liftedFns.push({
       name,
-      params: [{ localId: "s.0", name: "s", type: NETSERVER_T }],
-      returnType: NETSERVER_T,
-      locals: [{ id: "s.0", name: "s", type: NETSERVER_T, mutable: false }],
-      body: [
-        {
-          kind: "exprStmt",
-          expr: { kind: "libCall", fn: "http.serverJoinDupHeaders", args: [ref], type: VOID, loc },
-          loc,
-        },
-        { kind: "return", value: ref, loc },
+      params: [
+        { localId: "s.0", name: "s", type: NETSERVER_T },
+        ...(requireHost !== null ? [{ localId: "h.0", name: "h", type: BOOL }] : []),
       ],
+      returnType: NETSERVER_T,
+      locals: [
+        { id: "s.0", name: "s", type: NETSERVER_T, mutable: false },
+        ...(requireHost !== null ? [{ id: "h.0", name: "h", type: BOOL, mutable: false }] : []),
+      ],
+      body,
       loc,
     });
   }
-  return { kind: "call", callee: name, args: [server], type: NETSERVER_T, loc };
+  return { kind: "call", callee: name, args: requireHost !== null ? [server, requireHost] : [server], type: NETSERVER_T, loc };
 }
 
 /** `new http.Server([options][, handler])` — the constructor spelling of
@@ -2368,10 +2392,9 @@ function lowerHttpCreateServerForms(L: Lowerer, expr: ts.CallExpression | ts.New
  * getName/destroy and the sockets/requests/freeSockets counters dispatch
  * through the dyn handle ops, and the request path threads it (the
  * requestAgent rows). Options parse at the LITERAL construction site:
- * keepAlive (a boolean value — TRUE throws the runtime's named pooling
- * fence: this client dials one connection per request), keepAliveMsecs /
- * maxSockets / maxFreeSockets / timeout / port as numbers, scheduling
- * DROPS (no free pool exists, so selection order cannot observe), other
+ * keepAlive (a boolean value), keepAliveMsecs / maxSockets /
+ * maxFreeSockets / timeout / port as numbers (Node's values, negatives
+ * included), scheduling as a string (validated at runtime), other
  * documented keys fence by name, and undocumented keys drop like Node
  * drops them. Null when the callee isn't the http/https Agent. */
 export function lowerHttpAgentNew(L: Lowerer, expr: ts.NewExpression): IrExpr | null {
@@ -2387,12 +2410,18 @@ export function lowerHttpAgentNew(L: Lowerer, expr: ts.NewExpression): IrExpr | 
   const api = `new ${bi.module}.Agent`;
   const numLit = (value: number): IrExpr => ({ kind: "numLit", value, type: F64, loc });
   const boolAt = (value: boolean): IrExpr => ({ kind: "boolLit", value, type: BOOL, loc });
+  // An absent option is the value Node's own `opts.x || default` reads as
+  // absent (0, '') — so a negative number reaches the runtime as itself.
+  // `port` is the one every number counts for (agent options override
+  // the request's port), so it carries a presence flag.
   let keepAlive: IrExpr = boolAt(false);
-  let kaMsecs: IrExpr = numLit(-1);
-  let maxSockets: IrExpr = numLit(-1);
-  let maxFree: IrExpr = numLit(-1);
-  let timeout: IrExpr = numLit(-1);
-  let port: IrExpr = numLit(-1);
+  let kaMsecs: IrExpr = numLit(0);
+  let maxSockets: IrExpr = numLit(0);
+  let maxFree: IrExpr = numLit(0);
+  let timeout: IrExpr = numLit(0);
+  let port: IrExpr = numLit(0);
+  let hasPort: IrExpr = boolAt(false);
+  let scheduling: IrExpr = { kind: "strLit", value: "", type: STRING, loc };
   const args = expr.arguments ?? [];
   if (args.length > 1) {
     L.noLowering(`${api} with ${args.length} arguments`, expr, "the supported form is new Agent(options?)");
@@ -2457,15 +2486,29 @@ export function lowerHttpAgentNew(L: Lowerer, expr: ts.NewExpression): IrExpr | 
           timeout = lowerVal("f64");
           break;
         case "port":
-          // Node merges agent options under portless request options —
-          // the settable defaultPort carries this one.
+          // Node's agent options override the request's (addRequest /
+          // createSocket merge them over it): getName and the dial use it.
           port = lowerVal("f64");
+          hasPort = boolAt(true);
           break;
-        case "scheduling":
-          // Free-socket selection order: no free pool exists here (no
-          // keep-alive reuse), so the choice cannot observe — dropped.
-          if (initializer !== null) L.lowerExpr(initializer); // evaluate, like Node
+        case "scheduling": {
+          // Node reads `scheduling || 'lifo'` and validates it against
+          // fifo/lifo (ERR_INVALID_ARG_VALUE) in the runtime. A non-string
+          // value would need Node's inspect of it in that message, so only
+          // strings lower.
+          const v = initializer !== null
+            ? L.lowerExpr(initializer)
+            : L.lowerShorthandValue(prop as ts.ShorthandPropertyAssignment);
+          if (v.type.kind !== "string") {
+            L.noLowering(
+              `a ${api} 'scheduling' option of '${L.fmt(v.type)}' values`,
+              prop,
+              "scheduling is the string 'fifo' or 'lifo'",
+            );
+          }
+          scheduling = v;
           break;
+        }
         default:
           fenceOrDropOptionKey(
             L, prop, key, api, AGENT_DOCUMENTED_OPTIONS,
@@ -2477,7 +2520,7 @@ export function lowerHttpAgentNew(L: Lowerer, expr: ts.NewExpression): IrExpr | 
   return {
     kind: "libCall",
     fn: "http.agentNew",
-    args: [boolAt(bi.module === "https"), keepAlive, kaMsecs, maxSockets, maxFree, timeout, port],
+    args: [boolAt(bi.module === "https"), keepAlive, kaMsecs, maxSockets, maxFree, timeout, port, hasPort, scheduling],
     type: DYN,
     loc,
   };
@@ -3611,10 +3654,13 @@ function lowerHttpClientCall(L: Lowerer, expr: ts.CallExpression, member: "reque
   let reject: IrExpr | null = null;
   let ca: IrExpr | null = null;
   let connCb: IrExpr | null = null;
-  /** agent: false — inject Connection: close into the request head. */
+  /** agent: false through a request-function binding (whose rows take no
+   * agent) — inject Connection: close into the request head. */
   let agentClose: ts.Node | null = null;
-  /** agent: <Agent value> — the requestAgent rows thread the handle. */
+  /** agent: <Agent value> (or false) — the requestAgent rows thread it. */
   let agentVal: IrExpr | null = null;
+  /** The agent: false entry, when agentVal is its dyn false. */
+  let agentFalse: ts.Node | null = null;
   for (const prop of optsNode.properties) {
     // Shorthand entries ({ port } for { port: port }) are the natural
     // spelling at these call sites — the shorthand's VALUE lowering
@@ -3707,9 +3753,26 @@ function lowerHttpClientCall(L: Lowerer, expr: ts.CallExpression, member: "reque
       case "method":
         method = lowerVal("string");
         break;
-      case "timeout":
-        timeout = lowerVal("f64");
+      case "timeout": {
+        // Node: `options.timeout !== undefined` → getTimerDuration, so the
+        // runtime takes the value itself (a dyn value unchecked: Node's
+        // validateNumber answers a non-number) and `undefined` for none.
+        const v = initializer !== null
+          ? L.lowerExpr(initializer)
+          : L.lowerShorthandValue(prop as ts.ShorthandPropertyAssignment);
+        if (v.type.kind === "dyn") {
+          timeout = v;
+        } else if (v.type.kind === "f64") {
+          timeout = { kind: "dynFrom", value: v, type: DYN, loc: locOf(prop) };
+        } else {
+          L.noLowering(
+            `a ${member} 'timeout' option of '${L.fmt(v.type)}' values`,
+            prop,
+            "the option value must be a number",
+          );
+        }
         break;
+      }
       case "headers":
         if (initializer === null) {
           L.noLowering(`${member} with a shorthand headers option`, prop, "spell it out: headers: theHeaders");
@@ -3797,7 +3860,20 @@ function lowerHttpClientCall(L: Lowerer, expr: ts.CallExpression, member: "reque
         // non-Agent value is Node's ERR_INVALID_ARG_TYPE.
         const e = initializer !== null ? stripParensAndCasts(initializer) : null;
         if (e !== null && e.kind === ts.SyntaxKind.FalseKeyword) {
-          agentClose = prop;
+          // Node: `new defaultAgent.constructor()` — a fresh default Agent
+          // per request. The agent rows take it as the dyn `false` both
+          // runtimes read as that one-shot Agent.
+          if (binding !== null) {
+            agentClose = prop;
+            break;
+          }
+          agentVal = {
+            kind: "dynFrom",
+            value: { kind: "boolLit", value: false, type: BOOL, loc: locOf(prop) },
+            type: DYN,
+            loc: locOf(prop),
+          };
+          agentFalse = prop;
           break;
         }
         if (e !== null &&
@@ -3830,12 +3906,12 @@ function lowerHttpClientCall(L: Lowerer, expr: ts.CallExpression, member: "reque
     }
   }
   if (agentClose !== null) {
-    // agent: false → Node sends `Connection: close` (its one-shot Agent
-    // sets the header) and tears the socket down with the response — the
-    // compiled client already closes, so the header is the whole
-    // lowering. A user-set connection header wins, Node's rule; a
-    // non-literal headers record cannot be checked for one, so the combo
-    // fences instead of double-sending.
+    // agent: false through a request-function binding → Node's one-shot
+    // Agent sends `Connection: close` and tears the socket down with the
+    // response, which is the binding rows' own connection model, so the
+    // header is the whole lowering. A user-set connection header would
+    // keep that Agent's socket alive instead, and a non-literal headers
+    // record cannot be checked for one: both fence.
     const strLitAt = (value: string): IrExpr => ({ kind: "strLit", value, type: STRING, loc });
     if (headers === null) {
       headers = { kind: "arrayLit", elems: [strLitAt("Connection"), strLitAt("close")], type: arrayOf(STRING), loc };
@@ -3843,9 +3919,14 @@ function lowerHttpClientCall(L: Lowerer, expr: ts.CallExpression, member: "reque
       const hasConnection = headers.elems.some(
         (el, i) => i % 2 === 0 && el.kind === "strLit" && el.value.toLowerCase() === "connection",
       );
-      if (!hasConnection) {
-        headers = { ...headers, elems: [...headers.elems, strLitAt("Connection"), strLitAt("close")] };
+      if (hasConnection) {
+        L.noLowering(
+          `${member} through a module-function binding with agent: false and a Connection header`,
+          agentClose,
+          "call http.request/https.request directly for agent: false with a Connection header",
+        );
       }
+      headers = { ...headers, elems: [...headers.elems, strLitAt("Connection"), strLitAt("close")] };
     } else {
       L.noLowering(
         `${member} with agent: false and a non-literal headers record`,
@@ -3868,9 +3949,11 @@ function lowerHttpClientCall(L: Lowerer, expr: ts.CallExpression, member: "reque
   }
   if (agentVal !== null && connCb !== null) {
     L.noLowering(
-      `${member} mixing an agent value with createConnection`,
-      optsNode,
-      "both own the dial — pass one or the other",
+      agentFalse !== null ? `${member} mixing agent: false with createConnection` : `${member} mixing an agent value with createConnection`,
+      agentFalse ?? optsNode,
+      agentFalse !== null
+        ? "Node's one-shot Agent dials with its own createConnection and ignores the option — pass one or the other"
+        : "both own the dial — pass one or the other",
     );
   }
   if (agentVal !== null && binding !== null) {
@@ -3891,7 +3974,12 @@ function lowerHttpClientCall(L: Lowerer, expr: ts.CallExpression, member: "reque
     : numLit(secure === true ? 443 : 80);
   path ??= strLit("/");
   method ??= strLit("GET");
-  timeout ??= numLit(0);
+  timeout ??= {
+    kind: "dynFrom",
+    value: { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc },
+    type: DYN,
+    loc,
+  };
   headers ??= { kind: "arrayLit", elems: [], type: arrayOf(STRING), loc };
   const autoEnd = boolLit(member === "get", loc);
   if (connCb !== null) {
@@ -4297,6 +4385,14 @@ function lowerHttpReqMethodCall(L: Lowerer, call: ts.CallExpression,
   );
 }
 
+/** The typed getHeader result: `number | string | undefined` (what the
+ * typed setHeader can store). */
+export function resHeaderValueType(L: Lowerer): IrType {
+  const arms = [F64, STRING, UNDEFINED_T];
+  arms.sort((a, b) => (typeKey(a) < typeKey(b) ? -1 : 1));
+  return { kind: "union", unionId: L.unions.intern(arms) };
+}
+
 /** Method calls on ServerResponse receivers: setHeader/writeHead/write/
  * end. Null for other receivers. */
 function lowerHttpResMethodCall(L: Lowerer, call: ts.CallExpression,
@@ -4313,10 +4409,70 @@ function lowerHttpResMethodCall(L: Lowerer, call: ts.CallExpression,
     }
     const receiver = handleReceiver(L, access.expression, HTTPRES_T);
     const header = L.lowerExprExpecting(args[0]!, STRING);
-    let value = L.lowerExpr(args[1]!);
+    const value = L.lowerExpr(args[1]!);
     if (value.type.kind === "f64") {
-      // Node formats number values via String(n) — the same ToString.
-      value = { kind: "toString", operand: value, type: STRING, loc };
+      // Node stores the number itself (getHeader answers it; the head
+      // writes String(n)).
+      return { kind: "libCall", fn: "http.resSetHeaderNum", args: [receiver, header, value], type: VOID, loc };
+    }
+    if (value.type.kind === "union") {
+      // `number | string` (a getHeader answer handed back): an interned
+      // helper picks the arm's setter by the runtime tag.
+      const def = L.unions.get(value.type.unionId);
+      const numTag = def ? def.arms.findIndex((a) => a.kind === "f64") : -1;
+      const strTag = def ? def.arms.findIndex((a) => a.kind === "string") : -1;
+      if (def && def.arms.length === 2 && numTag >= 0 && strTag >= 0) {
+        const unionId = value.type.unionId;
+        const key = `server.setHeaderU:${unionId}`;
+        const existing = L.arrHofHelpers.get(key);
+        const name = existing ?? `%server.setHeaderU.${L.arrHofHelpers.size}`;
+        if (!existing) {
+          L.arrHofHelpers.set(key, name);
+          const uT = value.type;
+          const r: IrExpr = { kind: "varRef", localId: "r.0", type: HTTPRES_T, loc };
+          const n: IrExpr = { kind: "varRef", localId: "n.0", type: STRING, loc };
+          const u: IrExpr = { kind: "varRef", localId: "u.0", type: uT, loc };
+          L.liftedFns.push({
+            name,
+            params: [
+              { localId: "r.0", name: "r", type: HTTPRES_T },
+              { localId: "n.0", name: "n", type: STRING },
+              { localId: "u.0", name: "u", type: uT },
+            ],
+            returnType: VOID,
+            locals: [
+              { id: "r.0", name: "r", type: HTTPRES_T, mutable: false },
+              { id: "n.0", name: "n", type: STRING, mutable: false },
+              { id: "u.0", name: "u", type: uT, mutable: false },
+            ],
+            body: [{
+              kind: "if",
+              cond: { kind: "unionIsTag", unionId, tag: numTag, negated: false, value: u, type: BOOL, loc },
+              then: [{
+                kind: "exprStmt",
+                expr: {
+                  kind: "libCall", fn: "http.resSetHeaderNum",
+                  args: [r, n, { kind: "unionNarrow", unionId, tag: numTag, value: u, type: F64, loc }],
+                  type: VOID, loc,
+                },
+                loc,
+              }],
+              else_: [{
+                kind: "exprStmt",
+                expr: {
+                  kind: "libCall", fn: "http.resSetHeader",
+                  args: [r, n, { kind: "unionNarrow", unionId, tag: strTag, value: u, type: STRING, loc }],
+                  type: VOID, loc,
+                },
+                loc,
+              }],
+              loc,
+            }],
+            loc,
+          });
+        }
+        return { kind: "call", callee: name, args: [receiver, header, value], type: VOID, loc };
+      }
     }
     if (value.type.kind !== "string") {
       L.noLowering(
@@ -4339,7 +4495,9 @@ function lowerHttpResMethodCall(L: Lowerer, call: ts.CallExpression,
     const status = L.lowerExprExpecting(args[0]!, F64);
     // The optional statusMessage: a string-typed second argument is the
     // reason phrase (Node's overload split); it rides the composing
-    // helper as a resStatusMsgSet prefix before the head goes out.
+    // helper as a resWriteHeadReason prefix before the head goes out
+    // (Node's order: the headers-sent and status checks, then the
+    // reason).
     let msg: IrExpr | null = null;
     let headersNode: ts.Expression | undefined;
     if (args.length === 2) {
@@ -4359,12 +4517,13 @@ function lowerHttpResMethodCall(L: Lowerer, call: ts.CallExpression,
       }
       if (msg === null) return receiverReturningCall(L, fn, callArgs, HTTPRES_T, loc);
       // With a message the helper's parameter list gains the msg at slot
-      // 1 (feeding the resStatusMsgSet prefix); the head call itself
-      // re-selects around it.
-      const withMsg = [callArgs[0]!, msg, ...callArgs.slice(1)];
+      // 2, after the status (source order), feeding the
+      // resWriteHeadReason prefix; the head call itself re-selects around
+      // it.
+      const withMsg = [callArgs[0]!, callArgs[1]!, msg, ...callArgs.slice(2)];
       return receiverReturningCall(L, fn, withMsg, HTTPRES_T, loc, {
-        prefix: { fn: "http.resStatusMsgSet", argIndices: [0, 1] },
-        mainArgIndices: [0, ...callArgs.slice(1).map((_, i) => i + 2)],
+        prefix: { fn: "http.resWriteHeadReason", argIndices: [0, 1, 2] },
+        mainArgIndices: [0, 1, ...callArgs.slice(2).map((_, i) => i + 3)],
       });
     };
     if (headersNode === undefined) {
@@ -4525,8 +4684,8 @@ function lowerHttpResMethodCall(L: Lowerer, call: ts.CallExpression,
   }
   if (name === "getHeader" || name === "hasHeader" || name === "removeHeader") {
     // The header CRUD trio (setHeader's readers): getHeader answers the
-    // value as SET — `string | undefined` here, where Node can also
-    // answer numbers/arrays it was handed (this surface stores strings);
+    // value as SET — `number | string | undefined` (the typed setHeader
+    // takes strings and numbers);
     // removeHeader drops every case-insensitive match before the head
     // goes out; hasHeader is the boolean probe.
     if (name === "removeHeader") requireStatementPosition(L, call, "res.removeHeader(...)");
@@ -4536,7 +4695,7 @@ function lowerHttpResMethodCall(L: Lowerer, call: ts.CallExpression,
     const receiver = handleReceiver(L, access.expression, HTTPRES_T);
     const header = L.lowerExprExpecting(args[0]!, STRING);
     if (name === "getHeader") {
-      return { kind: "libCall", fn: "http.resGetHeader", args: [receiver, header], type: L.envValueType(), loc };
+      return { kind: "libCall", fn: "http.resGetHeader", args: [receiver, header], type: resHeaderValueType(L), loc };
     }
     if (name === "hasHeader") {
       return { kind: "libCall", fn: "http.resHasHeader", args: [receiver, header], type: BOOL, loc };

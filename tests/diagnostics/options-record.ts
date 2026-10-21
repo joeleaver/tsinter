@@ -5,6 +5,7 @@
  * values on keys Node would ignore but still evaluate. Never a generic
  * excess-property error. */
 import * as http from "node:http";
+import * as net from "node:net";
 import * as tls from "node:tls";
 import * as fs from "node:fs";
 import * as dns from "node:dns";
@@ -16,10 +17,9 @@ const agentOpts: http.AgentOptions = { maxSockets: 1 };
 const agent = new http.Agent(agentOpts);
 http.get({ port: 80, agent }, () => {});
 
-// agent: false needs a LITERAL headers object to inject Connection: close
-// into; a record variable cannot be checked for a user connection header.
-const dynHeaders: Record<string, string> = { "x-a": "1" };
-http.get({ port: 80, agent: false, headers: dynHeaders }, () => {});
+// agent: false is Node's one-shot Agent, which dials with its own
+// createConnection and ignores the option's dialer.
+http.get({ path: "/", agent: false, createConnection: () => net.connect(80) }, () => {});
 
 // Documented client options with no lowering fence by name.
 http.get({ port: 80, socketPath: "/tmp/sock.s" }, () => {});

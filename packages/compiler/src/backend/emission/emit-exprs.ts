@@ -3680,6 +3680,9 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           case "http.resSetHeader":
             E.line(`scr_http_res_set_header(${arg(0)}, ${arg(1)}, ${arg(2)});${E.srcComment(e.loc)}`);
             return { name: "", type: e.type };
+          case "http.resSetHeaderNum":
+            E.line(`scr_http_res_set_header_num(${arg(0)}, ${arg(1)}, ${arg(2)});${E.srcComment(e.loc)}`);
+            return { name: "", type: e.type };
           case "http.resWriteHead":
             E.line(`scr_http_res_write_head(${arg(0)}, ${arg(1)});${E.srcComment(e.loc)}`);
             return { name: "", type: e.type };
@@ -3859,6 +3862,9 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           case "http.serverJoinDupHeaders":
             E.line(`scr_http_server_join_duplicate_headers(${arg(0)});${E.srcComment(e.loc)}`);
             return { name: "", type: e.type };
+          case "http.serverRequireHost":
+            E.line(`scr_http_server_require_host(${arg(0)}, ${arg(1)});${E.srcComment(e.loc)}`);
+            return { name: "", type: e.type };
           case "net.serverOnListening": {
             const cb = args[1]!;
             E.moveTemp(cb);
@@ -3875,20 +3881,20 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           case "http.resStatusMsgSet":
             E.line(`scr_http_res_status_msg_set(${arg(0)}, ${arg(1)});${E.srcComment(e.loc)}`);
             return { name: "", type: e.type };
+          case "http.resWriteHeadReason":
+            return finish(`scr_http_res_write_head_reason(${arg(0)}, ${arg(1)}, ${arg(2)})`);
           case "http.resGetHeader": {
-            // string|undefined, exactly the http.reqHeader emission.
+            // number|string|undefined: the value as set (a number stays one).
             if (e.type.kind !== "union") throw new Error("emitter bug: http.resGetHeader result is not a union");
             const def = E.unionsById.get(e.type.unionId);
             const strTag = def ? def.arms.findIndex((a) => a.kind === "string") : -1;
+            const numTag = def ? def.arms.findIndex((a) => a.kind === "f64") : -1;
             const undefTag = E.undefinedArmTag(e.type);
-            if (strTag < 0 || undefTag < 0) {
+            if (strTag < 0 || numTag < 0 || undefTag < 0) {
               throw new Error("emitter bug: http.resGetHeader union lacks its arms");
             }
-            const s = E.newTemp(STRING, `scr_http_res_get_header(${arg(0)}, ${arg(1)})`);
-            E.moveTemp(s); // moves into the box when present; NULL otherwise
-            const present = `scr_union_new_ref(${strTag}, ${s.name}, &scr_str_retain_v, &scr_str_release_v, NULL)`;
             const absent = E.unitInstanceRef(e.type.unionId, undefTag);
-            return E.newTemp(e.type, `${s.name} ? ${present} : ${absent}`);
+            return E.newTemp(e.type, `scr_http_res_get_header_u(${arg(0)}, ${arg(1)}, ${strTag}, ${numTag}, ${absent})`);
           }
           case "http.resHasHeader":
             return finish(`scr_http_res_has_header_named(${arg(0)}, ${arg(1)})`);
@@ -3984,7 +3990,7 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           case "http.agentNew":
             E.usesTimers = true; // queued dials hold the loop open
             return finish(
-              `scr_http_agent_new(${arg(0)}, ${arg(1)}, ${arg(2)}, ${arg(3)}, ${arg(4)}, ${arg(5)}, ${arg(6)})`,
+              `scr_http_agent_new(${arg(0)}, ${arg(1)}, ${arg(2)}, ${arg(3)}, ${arg(4)}, ${arg(5)}, ${arg(6)}, ${arg(7)}, ${arg(8)})`,
             );
           case "http.requestAgent":
           case "http.requestAgentCb": {
@@ -4628,7 +4634,7 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
               adapter = cbT.params.length === 0 ? "&scr_http_resp_thunk0" : "&scr_http_resp_thunk_res";
             }
             return finish(
-              `(${arg(0)} ? scr_https_request(${arg(1)}, ${arg(2)}, ${arg(3)}, ${arg(4)}, ${arg(5)}, ${arg(6)}, ${arg(7)}, ${arg(8)}, (const char *)${arg(9)}->data, ${arg(9)}->len, ${cbExpr}, ${adapter}) : scr_http_request_ex(${arg(1)}, ${arg(2)}, ${arg(3)}, ${arg(4)}, ${arg(5)}, ${arg(6)}, ${arg(7)}, ${cbExpr}, ${adapter}, 80, NULL, NULL))`,
+              `(${arg(0)} ? scr_https_request(${arg(1)}, ${arg(2)}, ${arg(3)}, ${arg(4)}, ${arg(5)}, ${arg(6)}, ${arg(7)}, ${arg(8)}, (const char *)${arg(9)}->data, ${arg(9)}->len, ${cbExpr}, ${adapter}) : scr_http_request(${arg(1)}, ${arg(2)}, ${arg(3)}, ${arg(4)}, ${arg(5)}, ${arg(6)}, ${arg(7)}, ${cbExpr}, ${adapter}))`,
             );
           }
           case "http.clientWrite":

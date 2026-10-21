@@ -2379,12 +2379,13 @@ export type IrLibFn =
    * for end-before-head, chunked after an explicit writeHead/write). */
   | "http.createServer"
   /** http.createServer() / http.Server() with no handler — the
-   * on("request") route; createServerOpts is the (options[, listener])
-   * overload's twin carrying the two lowered parser flags
-   * (requireHostHeader: false is already this parser's behavior;
-   * joinDuplicateHeaders joins repeated request-header reads ", "). */
+   * on("request") route. The two lowered options set flags on the fresh
+   * server: joinDuplicateHeaders joins repeated request-header reads
+   * ", "; serverRequireHost(server, b) is requireHostHeader (Node's
+   * default true answers a Host-less HTTP/1.1 request 400). */
   | "http.createServerEmpty"
   | "http.serverJoinDupHeaders"
+  | "http.serverRequireHost"
   /** server.on("listening", cb) — the deferred listen-callback list. */
   | "net.serverOnListening"
   /** The ServerResponse member surface: statusCode/statusMessage reads
@@ -2398,6 +2399,9 @@ export type IrLibFn =
   | "http.resStatusSet"
   | "http.resStatusMsgGet"
   | "http.resStatusMsgSet"
+  /** writeHead(status, reason, ...)'s prefix: Node's headers-sent and
+   * status-code checks (both throw), then statusMessage = reason. */
+  | "http.resWriteHeadReason"
   | "http.resGetHeader"
   | "http.resHasHeader"
   | "http.resRemoveHeader"
@@ -2408,6 +2412,9 @@ export type IrLibFn =
   | "http.reqOnData"
   | "http.reqOnEnd"
   | "http.resSetHeader"
+  /** setHeader(name, number): the number is stored as itself (getHeader
+   * answers it; the head writes String(n)). */
+  | "http.resSetHeaderNum"
   | "http.resWriteHead"
   | "http.resWriteHeadN"
   | "http.resWrite"
@@ -6763,6 +6770,8 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "dc.chanBindStore",
   "dc.chanRunStores",
   "http.resWriteHeadDyn",
+  // Node's writeHead checks: ERR_HTTP_HEADERS_SENT, ERR_HTTP_INVALID_STATUS_CODE.
+  "http.resWriteHeadReason",
   "net.sockSetEncoding",
   "http.reqSetEncoding",
   "fs.readFileSyncBuf",

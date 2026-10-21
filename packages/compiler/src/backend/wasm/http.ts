@@ -244,6 +244,7 @@ const R_SENT100 = 56;
 const R_EXPECTCONT = 57;
 const R_CONN = 58; // $conn: resOnFinish's bound state, and _onPendingData's
 const R_PENDCB = 59; // the lowered end(cb)'s callback, for the end call that follows
+const R_PENDREASON = 60; // the typed writeHead(status, reason, ...)'s reason, for the writeHead call that follows
 
 /* $creq: ClientRequest */
 const C_AGENT = 53; // $agent, null = none
@@ -374,7 +375,7 @@ const A_MAXFREE = 3; // f64
 const A_MAXTOTAL = 4; // f64
 const A_TOTAL = 5; // f64 totalSocketCount
 const A_FIFO = 6; // scheduling === 'fifo'
-const A_TIMEOUT = 7; // f64 options.timeout, -1 = undefined
+const A_TIMEOUT = 7; // f64 `options.timeout || 0` (0 = none; a negative number is kept)
 const A_DEFPORT = 8; // f64 defaultPort
 const A_PROTOCOL = 9; // string
 const A_NODELAY = 10; // options.noDelay
@@ -385,8 +386,9 @@ const A_SOCKETS = 14;
 const A_SOCKETS_N = 15;
 const A_FREE = 16;
 const A_FREE_N = 17;
-const A_OPTPORT = 18; // f64 this.options.port, -1 = absent
+const A_OPTPORT = 18; // f64 this.options.port (when A_HASOPTPORT)
 const A_SECURE = 19;
+const A_HASOPTPORT = 20; // this.options has a port key
 
 /* $amap: one key of a requests / sockets / freeSockets object. */
 const M_NAME = 0;
@@ -824,6 +826,7 @@ export class HttpBuilder {
           { storage: I32, mutable: true }, // R_EXPECTCONT
           { storage: this.ref(this.connT()), mutable: true }, // R_CONN
           { storage: EQ_REF, mutable: true }, // R_PENDCB
+          { storage: this.strRef, mutable: true }, // R_PENDREASON
         ],
         out,
       );
@@ -1014,6 +1017,7 @@ export class HttpBuilder {
         { storage: I32, mutable: true },
         { storage: F64, mutable: true }, // A_OPTPORT
         { storage: I32, mutable: true }, // A_SECURE
+        { storage: I32, mutable: true }, // A_HASOPTPORT
       ]),
     );
   }
@@ -4496,6 +4500,7 @@ export class HttpBuilder {
       c.i32Const(0); // R_EXPECTCONT
       c.refNull(this.connT()); // R_CONN
       c.refNull(EQ_HEAP); // R_PENDCB
+      c.refNull(this.strT); // R_PENDREASON
       c.structNew(this.RT);
       c.localSet(R);
       $.if(this.streq($, $.get(IT, I_METHOD, $.l(REQ)), this.lit($, "HEAD")), () => $.set(this.OT, O_HASBODY, $.l(R), $.i(0)));
@@ -5529,7 +5534,9 @@ export class HttpBuilder {
   }
 
   /** new ClientRequest(options[, cb]) from the lowered options: host,
-   * port (<= 0 = none), path, method, timeout (0 = none), the headers as
+   * port (<= 0 = none), path, method, the timeout option (TMO when TMOHAS;
+   * TMOERR, when not null, is the ERR_INVALID_ARG_TYPE text for a
+   * non-number value), the headers as
    * flat [name, value, ...] pairs (set in order), the agent (null = the
    * global agent; `oneShot` = `agent: false`'s own fresh Agent), and the
    * 'response' callback (null = none). */
@@ -5546,7 +5553,7 @@ export class HttpBuilder {
       (f, $) => {
         const [HOST, PORT, PATH, METHOD, CB, AUTH] = [0, 1, 2, 3, 4, 5];
         const Q = f.local(this.creqRef());
-        $.put(Q, $.call(this.clientRequestNewFn(), $.l(HOST), $.l(PORT), $.l(PATH), $.l(METHOD), $.d(0), $.anew(this.strArrT, $.i(0)), $.i(0), $.nul(this.agentT()), $.i(0), $.l(CB)));
+        $.put(Q, $.call(this.clientRequestNewFn(), $.l(HOST), $.l(PORT), $.l(PATH), $.l(METHOD), $.d(0), $.i(0), $.nul(this.strT), $.anew(this.strArrT, $.i(0)), $.i(0), $.nul(this.agentT()), $.i(0), $.l(CB)));
         this.excReturn($, $.nul(this.CT));
         $.if($.notNull($.l(AUTH)), () => {
           $.run(this.setHeaderFn(), $.l(Q), this.lit($, "Authorization"), this.hvStrNew($, this.cat($, this.lit($, "Basic "), $.l(AUTH))));
@@ -5560,10 +5567,11 @@ export class HttpBuilder {
   clientRequestNewFn(): number {
     return this.fn(
       "clientRequestNew",
-      [this.strRef, F64, this.strRef, this.strRef, F64, this.ref(this.strArrT), I32, this.agentRef(), I32, EQ_REF],
+      [this.strRef, F64, this.strRef, this.strRef, F64, I32, this.strRef, this.ref(this.strArrT), I32, this.agentRef(), I32, EQ_REF],
       [this.creqRef()],
       (f, $) => {
-        const [HOST0, PORT0, PATH0, METHOD0, TMO, HDRS, NHDRS, AGENT0, ONESHOT, CB] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+        const [HOST0, PORT0, PATH0, METHOD0, TMO, TMOHAS, TMOERR, HDRS, NHDRS, AGENT0, ONESHOT, CB] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        const TIMEOUT = f.local(F64);
         const CT = this.CT;
         const OT = this.OT;
         const AT = this.agentT();
@@ -5579,7 +5587,7 @@ export class HttpBuilder {
         const PC = f.local(I32);
         const c = f.c;
         // agent: false -> new defaultAgent.constructor(); absent -> the global agent.
-        $.if($.l(ONESHOT), () => $.put(AG, $.call(this.agentNewFn(), $.i(0), $.d(-1), $.d(-1), $.d(-1), $.d(-1), $.d(-1), $.i(0))), () => {
+        $.if($.l(ONESHOT), () => $.put(AG, $.call(this.agentNewFn(), $.i(0), $.d(0), $.d(0), $.d(0), $.d(0), $.d(0), $.i(0), $.i(0), this.lit($, ""))), () => {
           $.put(AG, $.sel(this.agentRef(), $.isNull($.l(AGENT0)), $.call(this.globalAgentFn()), $.l(AGENT0)));
         });
         // The path check: /[^!-ÿ]/
@@ -5602,6 +5610,16 @@ export class HttpBuilder {
           $.if($.not($.dgt($.l(PORT), $.d(0))), () => $.put(PORT, $.d(80)));
         });
         $.put(HOST, $.sel(this.strRef, $.gt($.alen($.l(HOST0)), $.i(0)), $.l(HOST0), this.lit($, "localhost")));
+        // if (options.timeout !== undefined) this.timeout = getTimerDuration(options.timeout, 'timeout')
+        $.put(TIMEOUT, $.d(-1));
+        $.if($.notNull($.l(TMOERR)), () => {
+          this.throwErr($, "%TypeError", $.l(TMOERR), "ERR_INVALID_ARG_TYPE");
+          $.ret($.nul(CT));
+        });
+        $.if($.l(TMOHAS), () => {
+          $.if($.not($.call(this.timerDurationFn("timeout"), $.l(TMO))), () => $.ret($.nul(CT)));
+          $.put(TIMEOUT, $.l(TMO));
+        });
         // method: checkIsHttpToken, toUpperCase
         $.if($.gt($.alen($.l(METHOD0)), $.i(0)), () => {
           $.if($.not($.call(this.checkIsHttpTokenFn(), $.l(METHOD0))), () => {
@@ -5625,7 +5643,7 @@ export class HttpBuilder {
         c.refNull(this.PT); // C_PARSER
         c.i32Const(-1); // C_MAXHEADERS
         c.i32Const(0); // C_REUSED
-        $.do($.sel(F64, $.dgt($.l(TMO), $.d(0)), $.l(TMO), $.d(-1))); // C_TIMEOUT
+        c.localGet(TIMEOUT); // C_TIMEOUT (-1 = undefined)
         c.refNull(this.deps.errType()); // C_ERROR
         c.localGet(PORT); // C_PORT
         c.refNull(this.entArrT);
@@ -5778,7 +5796,7 @@ export class HttpBuilder {
       this.son($, NET_LISTS.L_END, $.l(S), this.hcli($, $.l(S), 1));
       this.son($, NET_LISTS.L_CLOSE, $.l(S), this.hcli($, $.l(S), 2));
       this.son($, NET_LISTS.L_DRAIN, $.l(S), this.hcli($, $.l(S), 4));
-      $.if($.or($.dge($.get(CT, C_TIMEOUT, $.l(Q)), $.d(0)), $.dgt($.get(this.agentT(), A_TIMEOUT, $.get(CT, C_AGENT, $.l(Q))), $.d(0))), () => {
+      $.if($.or($.dge($.get(CT, C_TIMEOUT, $.l(Q)), $.d(0)), $.dne($.get(this.agentT(), A_TIMEOUT, $.get(CT, C_AGENT, $.l(Q))), $.d(0))), () => {
         $.run(this.listenSocketTimeoutFn(), $.l(Q));
       });
       // req.emit('socket', socket): no listener can exist here.
@@ -6107,21 +6125,36 @@ export class HttpBuilder {
     return this.agentT();
   }
 
-  /** new Agent(options) — the lowered options: numbers < 0 are unset
-   * (each reads Node's `|| default`). */
+  /** new Agent(options) — the lowered options: an absent number is 0 and
+   * an absent scheduling "" (each reads Node's `|| default`, so a
+   * negative number is kept); PORT counts when HASPORT. Null with the
+   * error pending when scheduling is not fifo/lifo. */
   agentNewFn(): number {
-    return this.fn("agentNew", [I32, F64, F64, F64, F64, F64, I32], [this.agentRef()], (f, $) => {
-      const [KEEP, KAMS, MAXS, MAXF, TMO, PORT, SECURE] = [0, 1, 2, 3, 4, 5, 6];
+    return this.fn("agentNew", [I32, F64, F64, F64, F64, F64, I32, I32, this.strRef], [this.agentRef()], (f, $) => {
+      const [KEEP, KAMS, MAXS, MAXF, TMO, PORT, SECURE, HASPORT, SCHED] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
       const c = f.c;
-      const orDefault = (v: number, d: number): X => $.sel(F64, $.dgt($.l(v), $.d(0)), $.l(v), $.d(d));
+      const FIFO = f.local(I32);
+      // `opts.x || d`: 0 and NaN are absent.
+      const truthy = (v: number): X => $.both($.dne($.l(v), $.d(0)), $.deq($.l(v), $.l(v)));
+      const orDefault = (v: number, d: number): X => $.sel(F64, truthy(v), $.l(v), $.d(d));
+      // validateOneOf(this.scheduling = options.scheduling || 'lifo', 'scheduling', ['fifo', 'lifo'])
+      const SHOWN = f.local(this.strRef);
+      $.put(FIFO, this.streq($, $.l(SCHED), this.lit($, "fifo")));
+      $.if($.not($.or($.l(FIFO), $.or($.eq($.alen($.l(SCHED)), $.i(0)), this.streq($, $.l(SCHED), this.lit($, "lifo"))))), () => {
+        // ERR_INVALID_ARG_VALUE: inspect(value), cut to 128 and '...'
+        $.put(SHOWN, $.call(this.deps.inspectStr(), $.l(SCHED)));
+        $.if($.gt($.alen($.l(SHOWN)), $.i(128)), () => $.put(SHOWN, this.cat($, $.call(this.substrFn(), $.l(SHOWN), $.i(0), $.i(128)), this.lit($, "..."))));
+        this.throwErr($, "%TypeError", this.cat($, this.lit($, "The argument 'scheduling' must be one of: 'fifo', 'lifo'. Received "), $.l(SHOWN)), "ERR_INVALID_ARG_VALUE");
+        $.ret($.nul(this.AT));
+      });
       c.localGet(KEEP); // A_KEEPALIVE
       orDefault(KAMS, 1000)(); // A_KAMSECS
       orDefault(MAXS, Infinity)(); // A_MAXSOCKETS
       orDefault(MAXF, 256)(); // A_MAXFREE
       c.f64Const(Infinity); // A_MAXTOTAL
       c.f64Const(0); // A_TOTAL
-      c.i32Const(0); // A_FIFO (scheduling 'lifo')
-      $.do($.sel(F64, $.dgt($.l(TMO), $.d(0)), $.l(TMO), $.d(-1))); // A_TIMEOUT
+      c.localGet(FIFO); // A_FIFO
+      orDefault(TMO, 0)(); // A_TIMEOUT
       $.do($.sel(F64, $.l(SECURE), $.d(443), $.d(80))); // A_DEFPORT (options.defaultPort || 80)
       this.deps.pushStrLit(c, "http:"); // A_PROTOCOL
       c.i32Const(1); // A_NODELAY
@@ -6132,9 +6165,29 @@ export class HttpBuilder {
       c.i32Const(0);
       c.refNull(this.amapArrT);
       c.i32Const(0);
-      $.do($.sel(F64, $.dgt($.l(PORT), $.d(0)), $.l(PORT), $.d(-1))); // A_OPTPORT
+      c.localGet(PORT); // A_OPTPORT
       c.localGet(SECURE);
+      c.localGet(HASPORT); // A_HASOPTPORT
       c.structNew(this.AT);
+    });
+  }
+
+  /** getTimerDuration(msecs, name)'s checks: 1, or 0 with the error
+   * pending — ERR_OUT_OF_RANGE for a negative or non-finite number; above
+   * TIMEOUT_MAX Node warns (TimeoutOverflowWarning) and truncates, which
+   * has no machinery here, so that is a named Error. */
+  timerDurationFn(name: string): number {
+    return this.fn(`timerDuration.${name}`, [F64], [I32], (f, $) => {
+      const MS = 0;
+      $.if($.or($.dlt($.l(MS), $.d(0)), $.not($.deq($.dsub($.l(MS), $.l(MS)), $.d(0)))), () => {
+        this.throwErr($, "%RangeError", this.cat($, this.lit($, `The value of "${name}" is out of range. It must be a non-negative finite number. Received `), $.call(this.deps.numReceived(), $.l(MS))), "ERR_OUT_OF_RANGE");
+        $.ret($.i(0));
+      });
+      $.if($.dgt($.l(MS), $.d(2147483647)), () => {
+        this.fenceErr($, "an http timeout above 2147483647 ms (Node truncates it with a TimeoutOverflowWarning)");
+        $.ret($.i(0));
+      });
+      $.do($.i(1));
     });
   }
 
@@ -6143,7 +6196,7 @@ export class HttpBuilder {
   globalAgentFn(): number {
     return this.fn("globalAgent", [], [this.agentRef()], (f, $) => {
       const g = this.g();
-      $.if($.isNull($.g(g.globalAgent)), () => $.gput(g.globalAgent, $.call(this.agentNewFn(), $.i(1), $.d(-1), $.d(-1), $.d(-1), $.d(5000), $.d(-1), $.i(0))));
+      $.if($.isNull($.g(g.globalAgent)), () => $.gput(g.globalAgent, $.call(this.agentNewFn(), $.i(1), $.d(0), $.d(0), $.d(0), $.d(5000), $.d(0), $.i(0), $.i(0), this.lit($, ""))));
       $.do($.g(g.globalAgent));
     });
   }
@@ -6155,8 +6208,9 @@ export class HttpBuilder {
       const [AG, Q] = [0, 1];
       const PORT = f.local(F64);
       // options = { ...options, ...this.options }: an agent's own port wins.
-      $.put(PORT, $.sel(F64, $.dgt($.get(this.AT, A_OPTPORT, $.l(AG)), $.d(0)), $.get(this.AT, A_OPTPORT, $.l(AG)), $.get(this.CT, C_PORT, $.l(Q))));
-      $.do(this.cat($, $.get(this.CT, C_HOST, $.l(Q)), this.lit($, ":"), $.sel(this.strRef, $.dne($.l(PORT), $.d(0)), this.num2str($, $.l(PORT)), this.lit($, "")), this.lit($, ":")));
+      $.put(PORT, $.sel(F64, $.get(this.AT, A_HASOPTPORT, $.l(AG)), $.get(this.AT, A_OPTPORT, $.l(AG)), $.get(this.CT, C_PORT, $.l(Q))));
+      // if (options.port) name += options.port
+      $.do(this.cat($, $.get(this.CT, C_HOST, $.l(Q)), this.lit($, ":"), $.sel(this.strRef, $.both($.dne($.l(PORT), $.d(0)), $.deq($.l(PORT), $.l(PORT))), this.num2str($, $.l(PORT)), this.lit($, "")), this.lit($, ":")));
     });
   }
 
@@ -6325,11 +6379,16 @@ export class HttpBuilder {
       const PORT = f.local(F64);
       const H = f.local(this.ref(this.hcliT));
       // timeout = req.timeout || this.options.timeout || undefined
+      // (C_TIMEOUT is -1 for undefined; A_TIMEOUT is `|| 0` already)
       $.put(TMO, $.get(this.CT, C_TIMEOUT, $.l(Q)));
       $.if($.not($.dgt($.l(TMO), $.d(0))), () => $.put(TMO, $.get(AT, A_TIMEOUT, $.l(AG))));
-      $.if($.not($.dgt($.l(TMO), $.d(0))), () => $.put(TMO, $.d(0)));
       $.put(NAME, $.call(this.agentNameFn(), $.l(AG), $.l(Q)));
-      $.put(PORT, $.sel(F64, $.dgt($.get(AT, A_OPTPORT, $.l(AG)), $.d(0)), $.get(AT, A_OPTPORT, $.l(AG)), $.get(this.CT, C_PORT, $.l(Q))));
+      $.put(PORT, $.sel(F64, $.get(AT, A_HASOPTPORT, $.l(AG)), $.get(AT, A_OPTPORT, $.l(AG)), $.get(this.CT, C_PORT, $.l(Q))));
+      // net.createConnection: `if (options.timeout) socket.setTimeout(options.timeout)`
+      // validates it (getTimerDuration 'msecs') before the connect.
+      $.if($.dne($.l(TMO), $.d(0)), () => {
+        $.if($.not($.call(this.timerDurationFn("msecs"), $.l(TMO))), () => $.ret($.nul(this.sockT)));
+      });
       // this.createConnection(options, oncreate) = net.createConnection
       $.put(S, $.call(this.net.connectExHelper(), $.l(PORT), $.get(this.CT, C_HOST, $.l(Q)), $.get(AT, A_NODELAY, $.l(AG)), $.l(TMO)));
       this.excReturn($, $.nul(this.sockT));
@@ -6357,7 +6416,7 @@ export class HttpBuilder {
       const [AG, Q, S] = [0, 1, 2];
       const AGT = f.local(F64);
       $.run(this.onSocketFn(), $.l(Q), $.l(S));
-      $.put(AGT, $.sel(F64, $.dgt($.get(this.AT, A_TIMEOUT, $.l(AG)), $.d(0)), $.get(this.AT, A_TIMEOUT, $.l(AG)), $.d(0)));
+      $.put(AGT, $.get(this.AT, A_TIMEOUT, $.l(AG))); // agent.options.timeout || 0
       $.if($.or($.dlt($.get(this.CT, C_TIMEOUT, $.l(Q)), $.d(0)), $.deq($.get(this.CT, C_TIMEOUT, $.l(Q)), $.l(AGT))), () => $.ret());
       $.run(this.net.setTimeoutHelper(), $.l(S), $.get(this.CT, C_TIMEOUT, $.l(Q)));
     });
@@ -6444,7 +6503,7 @@ export class HttpBuilder {
       const HT = f.local(F64);
       $.run(this.net.setKeepAliveHelper(), $.l(S), $.i(1));
       $.run(this.net.refHelper(false), $.l(S));
-      $.put(AGT, $.sel(F64, $.dgt($.get(AT, A_TIMEOUT, $.l(AG)), $.d(0)), $.get(AT, A_TIMEOUT, $.l(AG)), $.d(0)));
+      $.put(AGT, $.get(AT, A_TIMEOUT, $.l(AG))); // this.options.timeout || 0
       $.put(CAN, $.i(1));
       $.put(M, $.get(this.sockT, NET_SOCK_HTTP.S_HTTPMSG, $.l(S)));
       $.if($.andThen($.andThen($.notNull($.l(M)), $.test(this.CT, $.l(M))), $.notNull($.get(this.CT, C_RES, $.cast(this.CT, $.l(M))))), () => {
@@ -6634,6 +6693,13 @@ export class HttpBuilder {
     this.deps.throwStack($.c);
   }
 
+  /** server's requireHostHeader (the createServer option; default true). */
+  serverRequireHostFn(): number {
+    return this.fn("serverRequireHost", [this.srvRef, I32], [], (f, $) => {
+      $.if($.notNull($.get(this.srvT, NET_SRV_HTTP.V_HTTP, $.l(0))), () => $.set(this.HT, H_REQUIREHOST, this.hsrvOf($, $.l(0)), $.l(1)));
+    });
+  }
+
   /** server's joinDuplicateHeaders: true (the createServer option). */
   serverJoinDupFn(): number {
     return this.fn("serverJoinDup", [this.srvRef], [], (f, $) => {
@@ -6804,18 +6870,38 @@ export class HttpBuilder {
     });
   }
 
-  /** getHeader for the typed surface: a value that is not a string (a
-   * number or an array set through a dynamic value) is fenced. */
-  resGetHeaderStrFn(): number {
-    return this.fn("resGetHeaderStr", [this.outRef(), this.strRef], [this.strRef], (f, $) => {
+  resSetHeaderNumFn(): number {
+    return this.fn("resSetHeaderNum", [this.outRef(), this.strRef, F64], [], (f, $) => {
+      $.run(this.setHeaderFn(), $.l(0), $.l(1), this.hvNumNew($, $.l(2)));
+    });
+  }
+
+  /** getHeader for the typed surface's `number | string | undefined`:
+   * (out, name) -> 0 undefined, 1 string, 2 number; an array value (set
+   * through a dynamic value) is fenced (-1, the error pending). The
+   * value itself is read with resHeaderStrFn / resHeaderNumFn. */
+  resGetHeaderKindFn(): number {
+    return this.fn("resGetHeaderKind", [this.outRef(), this.strRef], [I32], (f, $) => {
       const V = f.local(this.ref(this.hvT));
       $.put(V, $.call(this.getHeaderFn(), $.l(0), $.l(1)));
-      $.if($.isNull($.l(V)), () => $.ret($.nul(this.strT)));
-      $.if($.ne($.get(this.hvT, V_KIND, $.l(V)), $.i(0)), () => {
-        this.fenceErr($, "reading a header set to a number or an array as a string");
-        $.ret($.nul(this.strT));
+      $.if($.isNull($.l(V)), () => $.ret($.i(0)));
+      $.if($.eq($.get(this.hvT, V_KIND, $.l(V)), $.i(2)), () => {
+        this.fenceErr($, "reading a header set to an array through the typed getHeader");
+        $.ret($.i(-1));
       });
-      $.do($.get(this.hvT, V_STR, $.l(V)));
+      $.do($.sel(I32, $.eq($.get(this.hvT, V_KIND, $.l(V)), $.i(0)), $.i(1), $.i(2)));
+    });
+  }
+
+  resHeaderStrFn(): number {
+    return this.fn("resHeaderStr", [this.outRef(), this.strRef], [this.strRef], (f, $) => {
+      $.do($.get(this.hvT, V_STR, $.call(this.getHeaderFn(), $.l(0), $.l(1))));
+    });
+  }
+
+  resHeaderNumFn(): number {
+    return this.fn("resHeaderNum", [this.outRef(), this.strRef], [F64], (f, $) => {
+      $.do($.get(this.hvT, V_NUM, $.call(this.getHeaderFn(), $.l(0), $.l(1))));
     });
   }
 
@@ -6851,9 +6937,26 @@ export class HttpBuilder {
     });
   }
 
+  /** The typed writeHead(status, reason, ...)'s prefix: the reason is
+   * held for the writeHead call that follows, which runs Node's checks
+   * before it takes it. */
+  resWriteHeadReasonFn(): number {
+    return this.fn("resWriteHeadReason", [this.resRef(), F64, this.strRef], [], (f, $) => $.set(this.RT, R_PENDREASON, $.l(0), $.l(2)));
+  }
+
+  /** The held reason (null = none), cleared. */
+  resTakeReasonFn(): number {
+    return this.fn("resTakeReason", [this.resRef()], [this.strRef], (f, $) => {
+      const M = f.local(this.strRef);
+      $.put(M, $.get(this.RT, R_PENDREASON, $.l(0)));
+      $.set(this.RT, R_PENDREASON, $.l(0), $.nul(this.strT));
+      $.do($.l(M));
+    });
+  }
+
   resWriteHeadStatusFn(): number {
     return this.fn("resWriteHeadStatus", [this.resRef(), F64], [], (f, $) => {
-      $.run(this.writeHeadFn(), $.l(0), $.l(1), $.nul(this.strT), $.i(0), $.nul(this.hentArrT), $.i(0));
+      $.run(this.writeHeadFn(), $.l(0), $.l(1), $.call(this.resTakeReasonFn(), $.l(0)), $.i(0), $.nul(this.hentArrT), $.i(0));
     });
   }
 
@@ -6868,7 +6971,7 @@ export class HttpBuilder {
         const name = $.aget(this.strArrT, $.l(NAMES), $.l(I));
         $.aset(this.hentArrT, $.l(L), $.l(I), $.new_(this.hentT, name, name, this.hvStrNew($, $.aget(this.strArrT, $.l(VALUES), $.l(I)))));
       });
-      $.run(this.writeHeadFn(), $.l(R), $.l(SC), $.nul(this.strT), $.i(1), $.l(L), $.l(N));
+      $.run(this.writeHeadFn(), $.l(R), $.l(SC), $.call(this.resTakeReasonFn(), $.l(R)), $.i(1), $.l(L), $.l(N));
     });
   }
 
@@ -6889,7 +6992,7 @@ export class HttpBuilder {
         const name = $.aget(this.strArrT, $.l(PAIRS), $.shl($.l(I), $.i(1)));
         $.aset(this.hentArrT, $.l(L), $.l(I), $.new_(this.hentT, name, name, this.hvStrNew($, $.aget(this.strArrT, $.l(PAIRS), $.add($.shl($.l(I), $.i(1)), $.i(1))))));
       });
-      $.run(this.writeHeadFn(), $.l(R), $.l(SC), $.nul(this.strT), $.l(KIND), $.l(L), $.shrU($.l(N), $.i(1)));
+      $.run(this.writeHeadFn(), $.l(R), $.l(SC), $.call(this.resTakeReasonFn(), $.l(R)), $.l(KIND), $.l(L), $.shrU($.l(N), $.i(1)));
     });
   }
 
@@ -6902,7 +7005,7 @@ export class HttpBuilder {
     return this.fn("writeHeadOdd", [this.resRef(), F64, this.ref(this.strArrT), I32], [], (f, $) => {
       const [R, SC, ARR, N] = [0, 1, 2, 3];
       // Run writeHead's own checks up to the headers (they throw first).
-      $.run(this.writeHeadFn(), $.l(R), $.l(SC), $.nul(this.strT), $.i(3), $.nul(this.hentArrT), $.i(0));
+      $.run(this.writeHeadFn(), $.l(R), $.l(SC), $.call(this.resTakeReasonFn(), $.l(R)), $.i(3), $.nul(this.hentArrT), $.i(0));
       $.if($.g(this.deps.excKind()), () => $.ret());
       $.run(this.invalidHeadersArgFn(), $.call(this.deps.inspectStrArr(), $.l(ARR), $.l(N)));
     });

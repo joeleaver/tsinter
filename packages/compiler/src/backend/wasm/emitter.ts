@@ -10302,24 +10302,6 @@ class Assembler {
     return true;
   }
 
-  /** The agent: false detection: the lowering injects `Connection: close`
-   * at the end of a literal headers array with the CALL's own location
-   * (lower-server.ts); a header the program wrote carries its property's.
-   * Answers the headers expression without the injected pair. */
-  private httpAgentFalse(headers: WExpr, callLoc: SrcLoc | undefined): WExpr | null {
-    if (headers.kind !== "arrayLit") return null;
-    const n = headers.elems.length;
-    if (n < 2) return null;
-    const k = headers.elems[n - 2]!;
-    const v = headers.elems[n - 1]!;
-    const sameLoc = (a: SrcLoc | undefined, b: SrcLoc | undefined): boolean =>
-      a !== undefined && b !== undefined && JSON.stringify(a) === JSON.stringify(b);
-    if (k.kind === "strLit" && k.value === "Connection" && v.kind === "strLit" && v.value === "close" && sameLoc(k.loc, callLoc) && sameLoc(v.loc, callLoc)) {
-      return { ...headers, elems: headers.elems.slice(0, n - 2) };
-    }
-    return null;
-  }
-
   /** Push a `string | undefined` union of e.type from a nullable string
    * the caller pushes. */
   private emitStrOrUndefined(t: IrType, push: () => void, fnName: string, loc: SrcLoc | undefined): boolean {
@@ -10457,6 +10439,11 @@ class Assembler {
       case "http.serverJoinDupHeaders":
         arg(0);
         code.call(h.serverJoinDupFn());
+        return true;
+      case "http.serverRequireHost":
+        arg(0);
+        arg(1);
+        code.call(h.serverRequireHostFn());
         return true;
       case "http.serverOnRequest":
         return listen(h.serverOnRequestFn(), "reqres", undefined, this.net.srvRef());
@@ -10610,6 +10597,19 @@ class Assembler {
         arg(1);
         code.call(h.resStatusMsgSetFn());
         return true;
+      case "http.resWriteHeadReason":
+        arg(0);
+        arg(1);
+        arg(2);
+        code.call(h.resWriteHeadReasonFn());
+        return true;
+      case "http.resSetHeaderNum":
+        arg(0);
+        arg(1);
+        arg(2);
+        code.call(h.resSetHeaderNumFn());
+        this.emitPendingCheck();
+        return true;
       case "http.resSetHeader":
         arg(0);
         arg(1);
@@ -10617,12 +10617,63 @@ class Assembler {
         code.call(h.resSetHeaderStrFn());
         this.emitPendingCheck();
         return true;
-      case "http.resGetHeader":
-        return this.emitStrOrUndefined(e.type, () => {
-          arg(0);
-          arg(1);
-          code.call(h.resGetHeaderStrFn());
-        }, e.fn, e.loc) ? (this.emitPendingCheck(), true) : unreach();
+      case "http.resGetHeader": {
+        // number | string | undefined: the value as set.
+        const t = e.type;
+        if (t.kind !== "union") {
+          this.refuse(`libCall:${e.fn}:shape`, e.loc);
+          return unreach();
+        }
+        const def = this.unionDef(t.unionId);
+        const sTag = def.arms.findIndex((a) => a.kind === "string");
+        const nTag = def.arms.findIndex((a) => a.kind === "f64");
+        const uTag = def.arms.findIndex((a) => a.kind === "undefinedT");
+        const armS = sTag < 0 ? null : this.unionArmStruct(t.unionId, sTag, e.loc);
+        const armN = nTag < 0 ? null : this.unionArmStruct(t.unionId, nTag, e.loc);
+        const unionVal = this.mapType(t, e.loc);
+        if (def.arms.length !== 3 || uTag < 0 || armS === null || armN === null || unionVal === null) {
+          this.refuse(`libCall:${e.fn}:shape`, e.loc);
+          return unreach();
+        }
+        const R = this.acquireScratch(h.outRef());
+        const N = this.acquireScratch(this.strRef);
+        const K = this.acquireScratch(I32);
+        arg(0);
+        code.localSet(R);
+        arg(1);
+        code.localSet(N);
+        code.localGet(R);
+        code.localGet(N);
+        code.call(h.resGetHeaderKindFn());
+        code.localSet(K);
+        this.emitPendingCheck();
+        code.localGet(K);
+        code.i32Eqz();
+        this.openIfResult(unionVal);
+        code.globalGet(this.unions.unitGlobal(uTag));
+        code.else_();
+        code.localGet(K);
+        code.i32Const(1);
+        code.i32Eq();
+        this.openIfResult(unionVal);
+        code.i32Const(sTag);
+        code.localGet(R);
+        code.localGet(N);
+        code.call(h.resHeaderStrFn());
+        code.structNew(armS);
+        code.else_();
+        code.i32Const(nTag);
+        code.localGet(R);
+        code.localGet(N);
+        code.call(h.resHeaderNumFn());
+        code.structNew(armN);
+        this.close();
+        this.close();
+        this.releaseScratch(I32, K);
+        this.releaseScratch(this.strRef, N);
+        this.releaseScratch(h.outRef(), R);
+        return true;
+      }
       case "http.resHasHeader":
         arg(0);
         arg(1);
@@ -10745,21 +10796,33 @@ class Assembler {
         const withAgent = e.fn === "http.requestAgent" || e.fn === "http.requestAgentCb";
         const withCb = e.fn === "http.requestCb" || e.fn === "http.requestAgentCb";
         const headersArg = e.args[5]!;
-        const stripped = withAgent ? null : this.httpAgentFalse(headersArg, e.loc);
         const Q = this.acquireScratch(h.creqRef());
         const V = this.acquireScratch(this.vecs.vecRef(strVec));
+        const TD = this.acquireScratch(this.dyn.dynRef());
         arg(0);
         arg(1);
         arg(2);
         arg(3);
+        // the timeout option (a dyn value): its number, whether it is
+        // given, and the ERR_INVALID_ARG_TYPE text for a non-number
         arg(4);
-        this.walkExpr(stripped ?? headersArg);
+        code.localTee(TD);
+        code.structGet(this.dyn.dynT(), DYN_NUM);
+        code.localGet(TD);
+        code.call(this.httpTimeoutGivenFn());
+        code.localGet(TD);
+        code.call(this.httpTimeoutErrFn());
+        this.releaseScratch(this.dyn.dynRef(), TD);
+        this.walkExpr(headersArg);
         code.localTee(V);
         code.structGet(strVec.struct, BUF);
         code.localGet(V);
         code.structGet(strVec.struct, LEN);
+        // the agent option, evaluated once
+        const AD = withAgent ? this.acquireScratch(this.dyn.dynRef()) : -1;
         if (withAgent) {
           arg(7);
+          code.localTee(AD);
           code.call(this.httpAgentArgFn());
           this.emitPendingCheck();
         } else {
@@ -10767,10 +10830,11 @@ class Assembler {
         }
         // agent: false — the request's own fresh Agent.
         if (withAgent) {
-          arg(7);
+          code.localGet(AD);
           code.call(this.httpAgentIsFalseFn());
+          this.releaseScratch(this.dyn.dynRef(), AD);
         } else {
-          code.i32Const(stripped !== null ? 1 : 0);
+          code.i32Const(0);
         }
         if (withCb) {
           if (!this.emitHttpListener(e.args[withAgent ? 8 : 7]!, "inc", e.fn, e.loc)) return unreach();
@@ -10914,10 +10978,14 @@ class Assembler {
         // new http.Agent(options) -> the Agent handle (tag 6).
         const dyn = this.dyn;
         // (secure, keepAlive, keepAliveMsecs, maxSockets, maxFreeSockets,
-        // timeout, port) -> agentNew(keepAlive, ..., port, secure)
+        // timeout, port, hasPort, scheduling) -> agentNew(keepAlive, ...,
+        // port, secure, hasPort, scheduling)
         for (let i = 1; i < 7; i++) arg(i);
         arg(0);
+        arg(7);
+        arg(8);
         code.call(h.agentNewFn());
+        this.emitPendingCheck();
         const A = this.acquireScratch(h.agentRef());
         code.localSet(A);
         code.i32Const(DK.HANDLE);
@@ -11212,7 +11280,15 @@ class Assembler {
   private httpWriteHeadDynFn(): number {
     const dynRefT = this.dyn.dynRef();
     return this.httpFn("writeHeadDyn", [this.http.resRef(), F64, dynRefT], [], (f, $) => {
-      $.run(this.httpDynWriteHeadFn(), $.l(0), this.boxNumX($, $.l(1)), $.l(2), $.g(this.dyn.undefinedGlobal()));
+      // writeHead(status, reason, headers): the resWriteHeadReason prefix
+      // held the reason for this call.
+      const M = f.local(this.strRef);
+      $.put(M, $.call(this.http.resTakeReasonFn(), $.l(0)));
+      $.if($.isNull($.l(M)), () => {
+        $.run(this.httpDynWriteHeadFn(), $.l(0), this.boxNumX($, $.l(1)), $.l(2), $.g(this.dyn.undefinedGlobal()));
+      }, () => {
+        $.run(this.httpDynWriteHeadFn(), $.l(0), this.boxNumX($, $.l(1)), this.boxStrX($, $.l(M)), $.l(2));
+      });
     });
   }
 
@@ -11306,6 +11382,29 @@ class Assembler {
         c2.call(this.concatHelper());
       }, "ERR_INVALID_ARG_TYPE");
       $.do($.nul(this.http.agentT()));
+    });
+  }
+
+  /** A request's timeout option is given: `options.timeout !== undefined`. */
+  private httpTimeoutGivenFn(): number {
+    return this.httpFn("timeoutGiven", [this.dyn.dynRef()], [I32], (f, $) => {
+      $.do($.ne(this.dk($, $.l(0)), $.i(DK.UNDEF)));
+    });
+  }
+
+  /** getTimerDuration's validateNumber(options.timeout, 'timeout') text
+   * for a given non-number value, else null. */
+  private httpTimeoutErrFn(): number {
+    return this.httpFn("timeoutErr", [this.dyn.dynRef()], [this.strRef], (f, $) => {
+      const D = 0;
+      const k = this.dk($, $.l(D));
+      $.if($.or($.eq(k, $.i(DK.UNDEF)), $.eq(k, $.i(DK.NUM))), () => $.ret($.nul(this.strType)));
+      $.do($.raw((c) => {
+        this.pushStrLitInto(c, 'The "timeout" argument must be of type number. Received ');
+        c.localGet(D);
+        c.call(this.dyn.specificType());
+        c.call(this.concatHelper());
+      }));
     });
   }
 

@@ -8134,6 +8134,18 @@
     "<repo>/tests/fixtures/node-types/stream-capture.ts"
    ],
    "diags": []
+  },
+  "<repo>/tests/corpus/2743-http-option-carry.ts": {
+   "order": [
+    "<repo>/tests/corpus/2743-http-option-carry.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2744-http-option-carry-dyn.cjs": {
+   "order": [
+    "<repo>/tests/corpus/2744-http-option-carry-dyn.cjs"
+   ],
+   "diags": []
   }
  }
 }

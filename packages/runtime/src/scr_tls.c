@@ -997,13 +997,20 @@ void scr_tls_fetch_client_wrap(ScrNetSocket *sock, void *ctx) {
 
 ScrHttpClientReq *scr_https_request(ScrStr *host /*borrowed*/, double port,
                                      ScrStr *path /*borrowed*/, ScrStr *method /*borrowed*/,
-                                     double timeout_ms, ScrArr *header_pairs /*borrowed*/,
+                                     const ScrDyn *timeout /*borrowed*/, ScrArr *header_pairs /*borrowed*/,
                                      bool auto_end, bool reject_unauthorized,
                                      const char *ca /*borrowed, len 0 = none*/, size_t ca_len,
                                      ScrClosure *cb /*moves, nullable*/, ScrHttpRespFn fn) {
+  double timeout_ms;
+  if (!scr_http_timeout_arg(timeout, &timeout_ms)) {
+    if (cb) scr_closure_release(cb);
+    return NULL;
+  }
   ScrTlsCli *cli = scr_tls_cli_new(host, reject_unauthorized, ca, ca_len);
-  return scr_http_request_ex(host, port, path, method, timeout_ms, header_pairs, auto_end, cb,
-                              fn, 443, &scr_tls_cli_wrap, cli);
+  ScrHttpClientReq *c = scr_http_request_ex(host, port, path, method, timeout_ms, header_pairs,
+                                             auto_end, cb, fn, 443, &scr_tls_cli_wrap, cli);
+  if (c == NULL) scr_tls_cli_free(cli); /* a constructor throw: never wrapped */
+  return c;
 }
 
 /* https.get('https://host/path') — the URL-string spelling, sharing
@@ -1022,7 +1029,7 @@ ScrHttpClientReq *scr_https_request_url(ScrStr *url /*borrowed*/, ScrStr *method
     return NULL; /* Invalid URL / ERR_INVALID_PROTOCOL pending */
   }
   ScrArr *pairs = scr_arr_new(SCR_ELEM_STR, 0);
-  ScrHttpClientReq *c = scr_https_request(host, port, path, method, 0, pairs, auto_end,
+  ScrHttpClientReq *c = scr_https_request(host, port, path, method, scr_dyn_undefined(), pairs, auto_end,
                                            true /* rejectUnauthorized */, NULL, 0, cb, fn);
   scr_arr_release(pairs);
   scr_str_release(host);
@@ -1032,14 +1039,17 @@ ScrHttpClientReq *scr_https_request_url(ScrStr *url /*borrowed*/, ScrStr *method
 
 ScrHttpClientReq *scr_https_request_agent(ScrStr *host /*borrowed*/, double port,
                                            ScrStr *path /*borrowed*/, ScrStr *method /*borrowed*/,
-                                           double timeout_ms, ScrArr *header_pairs /*borrowed*/,
+                                           const ScrDyn *timeout_ms /*borrowed*/, ScrArr *header_pairs /*borrowed*/,
                                            bool auto_end, bool reject_unauthorized,
                                            const char *ca /*borrowed, len 0 = none*/, size_t ca_len,
                                            const ScrDyn *agent /*borrowed*/,
                                            ScrClosure *cb /*moves, nullable*/, ScrHttpRespFn fn) {
   ScrTlsCli *cli = scr_tls_cli_new(host, reject_unauthorized, ca, ca_len);
-  return scr_http_request_agent_ex(host, port, path, method, timeout_ms, header_pairs, auto_end,
-                                    agent, cb, fn, 443, &scr_tls_cli_wrap, cli);
+  ScrHttpClientReq *c = scr_http_request_agent_ex(host, port, path, method, timeout_ms,
+                                                   header_pairs, auto_end, agent, cb, fn, 443,
+                                                   &scr_tls_cli_wrap, cli);
+  if (c == NULL) scr_tls_cli_free(cli); /* a constructor throw: never wrapped */
+  return c;
 }
 
 /* ── RUNTIME options records (the divergence-66 stance) ────────────────
