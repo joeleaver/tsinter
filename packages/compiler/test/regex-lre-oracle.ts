@@ -6,18 +6,20 @@
  * pattern via a TSV-in/TSV-out protocol — this just batches a whole
  * corpus through ONE subprocess call rather than one per pattern.
  *
- * The compiled binary lives OUT OF REPO (durable build dir, same as
- * CP1's own bcsize-validation record) since it's a build-time C tool,
- * not a repo/CI artifact — see findings-p1-v1.txt's CP1 section for why.
+ * bcsize.c lives in-repo (test/fixtures/bcsize/) and links the vendored
+ * quickjs-ng; the compiled binary goes to an untracked cache directory.
  * Rebuilt fresh here (not assumed present) so a stale binary can never
  * silently diverge from the vendored source it links. */
 import { execFileSync } from "node:child_process";
 import { closeSync, existsSync, mkdirSync, openSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const BUILD_DIR = "/home/joe/.claude/projects/-home-joe-dev-tsinter/inc24-work/inc24/impl-p1/build/bcsize";
-const BCSIZE_C = "/home/joe/.claude/projects/-home-joe-dev-tsinter/inc24-work/inc24/des/probes/bcsize/bcsize.c";
-const VENDOR = "/home/joe/dev/tsinter/.claude/worktrees/inc24-impl/packages/runtime/vendor/quickjs-ng";
+const HERE = dirname(fileURLToPath(import.meta.url));
+const REPO_ROOT = join(HERE, "..", "..", "..");
+const BUILD_DIR = join(REPO_ROOT, "node_modules", ".cache", "tsinter-bcsize");
+const BCSIZE_C = join(HERE, "fixtures", "bcsize", "bcsize.c");
+const VENDOR = join(REPO_ROOT, "packages", "runtime", "vendor", "quickjs-ng");
 const BIN = join(BUILD_DIR, "bcsize");
 const LOCK_PATH = join(BUILD_DIR, "bcsize.lock");
 const TMP_BIN = join(BUILD_DIR, "bcsize.tmp");
@@ -174,9 +176,8 @@ function encodeTsvRow(pattern: string, flags: string): number[] {
  * a pattern would otherwise collide with the TSV format — none of this
  * port's patterns do, but the key format makes that assumption explicit
  * rather than silent) to the reference's exact output bytes (header +
- * bytecode, no trailer — this port's own generated corpus never uses
- * named captures YET, so the group-names trailer is out of scope for
- * this first oracle cut; revisit when CP3 reaches named groups). `null`
+ * bytecode + the group-names trailer when the pattern has named
+ * groups — everything lre_compile returns). `null`
  * for a pattern bcsize reports ERR on (should never happen for this
  * port's in-scope corpus; a null surfaces as a hard test failure, not a
  * silent skip). */
@@ -235,7 +236,7 @@ export function archiveCanaryRun(): void {
   const canary = lreCompile("a", "");
   if (canary) {
     writeFileSync(
-      "/home/joe/.claude/projects/-home-joe-dev-tsinter/inc24-work/inc24/impl-p1/cp3-oracle-canary-v1.txt",
+      join(BUILD_DIR, "canary.txt"),
       `/a/ (no flags) via live lre_compile, ${canary.bytes.length} bytes, captures=${canary.captures}\n` +
         [...canary.bytes].map((b) => b.toString(16).padStart(2, "0")).join(""),
     );

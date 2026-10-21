@@ -5774,7 +5774,7 @@ describe("INC-28 U1 child_process rows", () => {
   }, 60000);
   test("U1-C-2708 corpus 2708-os-release-spawnsync-stdio.ts: full stdout, stderr and exit code equal Node's", async () => {
     const r = await runU1Corpus("2708-os-release-spawnsync-stdio.ts");
-    expect(r.stdout.toString("utf8")).toBe("7.0.0-31-generic\ntrue true\n0 \"captured-line\\n\"\n0 \"explicit-pipe\\n\"\nbefore-inherit\ninherited-line\nafter-inherit 0\n");
+    expect(r.stdout.toString("utf8")).toBe(release() + "\ntrue true\n0 \"captured-line\\n\"\n0 \"explicit-pipe\\n\"\nbefore-inherit\ninherited-line\nafter-inherit 0\n");
     expect(r.stderr.toString("utf8")).toBe("");
     expect(r.exitCode).toBe(0);
   }, 60000);
