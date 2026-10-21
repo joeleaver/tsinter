@@ -3430,6 +3430,15 @@ const TIER_FLOOR: string[] = [
   "1570-child-unref-kill-reffed.ts",
   "2698-spawn-options.ts",
   "2717-spawn-conditional-spread.ts",
+  // INC-28 U3: child output streams (stdio "pipe" for stdout/stderr:
+  // child.stdout / child.stderr with 'data' and 'end', through cpCall's FLOW
+  // and evPoll's kinds 4 and 5) and node:string_decoder (strdec.ts;
+  // SEMANTICS.md S086 (k)): 993 -> 998, the five programs this unit lands.
+  "1474-string-decoder.ts",
+  "1565-spawn-pipe-streams.ts",
+  "1566-child-duck-interface.ts",
+  "1657-spawn-async-neutral.ts",
+  "1662-string-decoder-encodings.ts",
 ];
 
 interface RunResult {
@@ -4059,11 +4068,14 @@ function dispositionFor(r: { threw: boolean; dcErrno: number | undefined; pid: n
  * Node oracle runs with fd 0 a socket whose peer is gone, so a child's
  * write there fails with SIGPIPE); an fd THIS run opened, passed through;
  * anything else is EBADF — never a host descriptor the run did not open. */
-type StdioRoute = "ignore" | { capture: 1 | 2 } | "fd0-pipe" | { fd: number } | "EBADF";
+type StdioRoute = "ignore" | { capture: 1 | 2 } | "fd0-pipe" | { fd: number } | "EBADF" | "pipe";
 
 function stdioRouteFor(slot: 1 | 2, mode: number, fd: number, openFds: ReadonlySet<number>): StdioRoute {
   if (mode === 0) return "ignore";
   if (mode === 1) return { capture: slot };
+  // INC-28 U3: a piped slot — child.stdout / child.stderr's stream, read by
+  // the host's own ChildProcess once the module sends FLOW.
+  if (mode === 3) return "pipe";
   if (mode !== 2) throw new Error(`cpCall: unknown output mode ${mode}`);
   if (fd === 1 || fd === 2) return { capture: fd };
   if (fd === 0) return "fd0-pipe";
@@ -4083,7 +4095,20 @@ function clockFor(s: { vclock: number; live: number; anchorV: number; anchorR: n
  * the module has read its EXIT. */
 interface EvChild {
   proc: ChildProcess;
+  /** The host may still deliver an event for this child: its EXIT (a
+   * spawned child) and every piped stream's END are unread. */
   live: boolean;
+  /** INC-28 U3: the EXIT has been read (always true for a failed spawn,
+   * which has none), and the piped streams' ENDs still unread. */
+  exitRead: boolean;
+  endsUnread: number;
+  /** The piped streams by slot (index 0 stdout, 1 stderr), null for a
+   * slot that is not piped; `flowing` once FLOW attached the host's
+   * 'data' listener. */
+  pipes: (import("node:stream").Readable | null)[];
+  flowing: boolean[];
+  /** The host's own exit-time listener reads this stream (kind 6). */
+  held: boolean[];
   errorErrno: number | undefined;
   /** A pipe both output slots share (they name one program stream), read
    * by the host itself; null when there is none. */
@@ -4218,8 +4243,25 @@ async function runWasm(modulePath: string): Promise<RunResult> {
   let evFinished = false;
   const clockNow = (): number =>
     clockFor({ vclock: clock, live: evLive, anchorV: evAnchorV, anchorR: evAnchorR, nowR: performance.now() });
+  // INC-28 U3 (abi.ts evPoll, the kind word's bit 8): the host's callback
+  // SCOPE — open from the first EXIT, DATA or END queued in one of the host
+  // Node's callbacks until that callback's ticks and microtasks have
+  // drained (a microtask queued at the first event runs only then). Each
+  // such event queued while it is open marks the one before it: the module
+  // runs no checkpoint between them, as Node runs none.
+  let evScopeLast: HostEvent | null = null;
   const evPush = (ev: HostEvent): void => {
     if (evFinished) return;
+    if (ev.kind === 1 || ev.kind === 4 || ev.kind === 5 || ev.kind === 6) {
+      if (evScopeLast !== null) {
+        evScopeLast.kind |= 0x100;
+      } else {
+        queueMicrotask(() => {
+          evScopeLast = null;
+        });
+      }
+      evScopeLast = ev;
+    }
     evQueue.push(ev);
     evWaker?.();
   };
@@ -4231,6 +4273,11 @@ async function runWasm(modulePath: string): Promise<RunResult> {
   const evSpawn = (req: SpawnRequest, ptr: number, buffer: ArrayBufferLike): number => {
     if (req.stdinMode !== 0 && req.stdinMode !== 1) throw new Error(`cpCall: unknown stdin mode ${req.stdinMode}`);
     const routes = [stdioRouteFor(1, req.stdoutMode, req.outFd, openFds), stdioRouteFor(2, req.stderrMode, req.errFd, openFds)];
+    // INC-28 U3: a piped slot beside an inherited or fd output slot is
+    // refused by the module at compile time (cp.spawnOpts:pipeMixed).
+    if (routes.includes("pipe") && routes.some((r) => r !== "pipe" && r !== "ignore")) {
+      throw new Error("cpCall: a piped slot mixed with an inherited or fd output slot");
+    }
     const reply = (errno: number, disposition: number, pid: number): void => {
       const dv = new DataView(buffer, ptr, 12);
       dv.setInt32(0, errno, true);
@@ -4274,6 +4321,7 @@ async function runWasm(modulePath: string): Promise<RunResult> {
     }
     const slotStdio = routes.map((r): "ignore" | "pipe" | number => {
       if (r === "ignore") return "ignore";
+      if (r === "pipe") return "pipe";
       // fd 0 in an output slot: the write end of a pipe whose read end is
       // already closed.
       if (r === "fd0-pipe") {
@@ -4322,24 +4370,60 @@ async function runWasm(modulePath: string): Promise<RunResult> {
       sharedReader = null;
     }
     if (d === null) throw new Error(`cpCall: a spawn outcome the module's own validation should have prevented (${req.file})`);
-    const handle = d.disposition === 0 ? evNextHandle++ : 0;
+    // INC-28 U3: a failed spawn reported later still has its piped streams
+    // (Node creates them, and they end), so it gets a handle too.
+    const anyPipe = routes.includes("pipe");
+    const handle = d.disposition === 0 || (d.disposition === 1 && anyPipe) ? evNextHandle++ : 0;
     if (proc !== undefined) {
-      const rec: EvChild = { proc, live: d.disposition === 0, errorErrno: undefined, shared: null };
+      const rec: EvChild = {
+        proc,
+        live: handle !== 0,
+        errorErrno: undefined,
+        shared: null,
+        exitRead: d.disposition !== 0,
+        endsUnread: 0,
+        pipes: [null, null],
+        flowing: [false, false],
+        held: [false, false],
+      };
       const signals = osConstants.signals as Record<string, number>;
       proc.on("error", (e: NodeJS.ErrnoException) => {
         rec.errorErrno = typeof e.errno === "number" ? e.errno : undefined;
       });
       // The EXIT is queued on 'close': after every captured stream has
       // reached end of file (the shared pipe's too), so the child's output
-      // precedes its exit.
+      // precedes its exit. INC-28 U3: a child with a piped stream (never
+      // mixed with a captured one) queues it at its 'exit' instead, in the
+      // order Node emits it among the piped streams' events.
       let exitEv: HostEvent | null = null;
       let sharedOpen = sharedReader !== null;
       const queueExit = (): void => {
-        if (exitEv !== null && !sharedOpen && rec.live) evPush(exitEv);
+        if (exitEv !== null && !sharedOpen && rec.live) {
+          evPush(exitEv);
+          exitEv = null;
+        }
       };
-      proc.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
+      proc.on(anyPipe ? "exit" : "close", (code: number | null, signal: NodeJS.Signals | null) => {
         exitEv = { source: 1, handle, kind: 1, a: code ?? -1, b: signal === null ? 0 : (signals[signal] ?? 0), payload: new Uint8Array(0) };
         queueExit();
+        // INC-28 U3: Node's onexit queues flushStdio right after this
+        // 'exit', which resumes every piped stream nobody consumed — its
+        // buffered and later chunks flow to whatever 'data' listener the
+        // program has by then (one added in its 'exit' listener, or a tick
+        // after). The host reads each such stream from now on (kind 6,
+        // STREAM-HELD) and the module, which knows its listeners, emits or
+        // drops each chunk where Node's flow() would.
+        if (anyPipe) {
+          rec.pipes.forEach((stream, i) => {
+            if (stream === null || rec.flowing[i]) return;
+            rec.flowing[i] = true;
+            rec.held[i] = true;
+            stream.on("data", (chunk: Buffer) => {
+              if (!rec.live) return;
+              evPush({ source: 1, handle, kind: 6, a: i + 1, b: 0, payload: new Uint8Array(chunk) });
+            });
+          });
+        }
       });
       if (sharedReader !== null && sharedDest !== null) {
         const sock = new Socket({ fd: sharedReader, readable: true, writable: false });
@@ -4365,7 +4449,20 @@ async function runWasm(modulePath: string): Promise<RunResult> {
           evPush({ source: 1, handle, kind, a: 0, b: 0, payload: new Uint8Array(chunk) });
         });
       });
-      if (d.disposition === 0) {
+      // INC-28 U3: the piped streams. Their 'end' is forwarded always (it
+      // never changes how the stream reads); their 'data' only once FLOW
+      // attaches the host's listener (cpCall op 9), so the stream starts
+      // flowing exactly when the program's would.
+      [proc.stdout, proc.stderr].forEach((stream, i) => {
+        if (routes[i] !== "pipe" || stream === null || handle === 0) return;
+        rec.pipes[i] = stream;
+        rec.endsUnread++;
+        stream.on("end", () => {
+          if (!rec.live) return;
+          evPush({ source: 1, handle, kind: 5, a: i + 1, b: 0, payload: new Uint8Array(0) });
+        });
+      });
+      if (handle !== 0) {
         if (evLive === 0) {
           evAnchorV = clock;
           evAnchorR = performance.now();
@@ -5011,11 +5108,27 @@ async function runWasm(modulePath: string): Promise<RunResult> {
           });
         }
         // INC-28 U2: the asynchronous ops (abi.ts), event modules only.
-        if (op >= 5 && op <= 8) {
+        if (op >= 5 && op <= 9) {
           if (!eventModule) return -1;
           if (op === 5) return cpGuardedRun(() => evSpawn(spawnDecodeRequest(mem.buffer, ptr, len), ptr, mem.buffer));
           const rec = evChildren.get(h);
           if (rec === undefined) return -999999;
+          // INC-28 U3: FLOW — the host's own 'data' listener on that piped
+          // stream, attached now, once; Node's chunks are queued as they
+          // are emitted.
+          if (op === 9) {
+            const stream = which === 1 || which === 2 ? rec.pipes[which - 1] : null;
+            if (stream === null || stream === undefined) return -999999;
+            // Already read since the exit (kind 6): the module decides.
+            if (rec.held[which - 1]) return 0;
+            if (rec.flowing[which - 1]) return -999999;
+            rec.flowing[which - 1] = true;
+            stream.on("data", (chunk: Buffer) => {
+              if (!rec.live) return;
+              evPush({ source: 1, handle: h, kind: 4, a: which, b: 0, payload: new Uint8Array(chunk) });
+            });
+            return 0;
+          }
           if (op === 6) {
             let returned: boolean | undefined;
             let thrownErrno: number | undefined;
@@ -5064,13 +5177,19 @@ async function runWasm(modulePath: string): Promise<RunResult> {
         const n = evEncodeRecord(memory.buffer, ptr, cap, ev);
         if (n < 0) return n;
         evQueue.shift();
-        if (ev.kind === 1) {
+        // Reading a child's last event (its EXIT, and INC-28 U3 every piped
+        // stream's END) ends that child's life for the clock.
+        if ((ev.kind & 0xff) === 1 || (ev.kind & 0xff) === 5) {
           const rec = evChildren.get(ev.handle);
           if (rec !== undefined && rec.live) {
-            const t = clockNow();
-            rec.live = false;
-            evLive--;
-            if (evLive === 0) clock = Math.max(clock, t);
+            if ((ev.kind & 0xff) === 1) rec.exitRead = true;
+            else rec.endsUnread--;
+            if (rec.exitRead && rec.endsUnread === 0) {
+              const t = clockNow();
+              rec.live = false;
+              evLive--;
+              if (evLive === 0) clock = Math.max(clock, t);
+            }
           }
         }
         return n;
@@ -5158,7 +5277,13 @@ async function runWasm(modulePath: string): Promise<RunResult> {
     evQueue.length = 0;
     for (const rec of evChildren.values()) {
       rec.proc.removeAllListeners("close");
+      rec.proc.removeAllListeners("exit");
       rec.shared?.destroy();
+      for (const stream of rec.pipes) {
+        stream?.removeAllListeners("data");
+        stream?.removeAllListeners("end");
+        stream?.destroy();
+      }
       if (rec.proc.exitCode === null && rec.proc.signalCode === null) {
         try {
           rec.proc.kill("SIGKILL");
@@ -6510,7 +6635,9 @@ describe("INC-28 U2 child_process async rows", () => {
     expect(stdioRouteFor(1, 2, 0, open)).toBe("fd0-pipe");
     expect(stdioRouteFor(1, 2, 7, open)).toEqual({ fd: 7 });
     expect(stdioRouteFor(2, 2, 8, open)).toBe("EBADF");
-    expect(() => stdioRouteFor(1, 3, 0, open)).toThrow(/output mode/);
+    // INC-28 U3: mode 3 is now a piped slot; the first unknown mode is 4.
+    expect(stdioRouteFor(1, 3, 0, open)).toBe("pipe");
+    expect(() => stdioRouteFor(1, 4, 0, open)).toThrow(/output mode/);
   });
   test("U2-HYG-01 an exit listener throws while a `sleep 5` child is live: the program dies with exit 1 (stdout and exit asserted; the leftover kill is U2-HYG-03's assertion, not this row's)", async () => {
     const r = await runU2Source("// An exit listener throws while another child is still running: the program dies (exit 1).\nimport { spawn } from \"node:child_process\";\nconst long = spawn(\"sleep\", [\"5\"], { stdio: \"ignore\" });\nlong.on(\"exit\", () => {\n  console.log(\"long exit never\");\n});\nconst c = spawn(\"true\", [], { stdio: \"ignore\" });\nc.on(\"exit\", () => {\n  console.log(\"throwing\");\n  throw new Error(\"boom in exit\");\n});\nconsole.log(\"main done\");\n");
@@ -6698,4 +6825,219 @@ describe("INC-28 U2 child_process async rows", () => {
     expect(clockFor({ vclock: 5000, live: 1, anchorV: 5000, anchorR: 100, nowR: 350 })).toBe(5250);
     expect(clockFor({ vclock: 5000, live: 2, anchorV: 0, anchorR: 100, nowR: 350 })).toBe(5000);
   });
+});
+
+// ── INC-28 U3 child output stream rows ───────────────────────────────────
+// child.stdout / child.stderr as streams ('data' with Node's own chunks,
+// 'end'), on U2's event host: the module tells the host when a stream starts
+// flowing (cpCall op 9, FLOW), and the host forwards its own Node's 'data'
+// and 'end' (evPoll kinds 4 and 5) with the callback-scope flag. Rows that
+// run real children go through this file's own runWasm; the expected text
+// of every row is Node's own, measured with the same source under the
+// harness oracle and stable across repeated runs (a row whose order is
+// scheduling noise in Node is not written). Not shard-gated, U2's rule.
+describe("INC-28 U3 child output stream rows", () => {
+  async function runU3Source(src: string): Promise<RunResult> {
+    const dir = mkdtempSync(join(tmpdir(), "u3-row-"));
+    try {
+      const file = join(dir, "main.ts");
+      writeFileSync(file, src);
+      const res = await compile(file, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: false, backend: "wasm" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+      return await runWasm(res.binaryPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  async function runU3Corpus(name: string): Promise<RunResult> {
+    const dir = mkdtempSync(join(tmpdir(), "u3-corpus-"));
+    try {
+      const res = await compile(join(corpusDir, name), { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: false, backend: "wasm" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+      return await runWasm(res.binaryPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  /** Node's own run of `src` under the harness oracle's flags. */
+  async function runU3Node(src: string): Promise<RunResult> {
+    const dir = mkdtempSync(join(tmpdir(), "u3-node-"));
+    try {
+      const file = join(dir, "main.ts");
+      writeFileSync(file, src);
+      const r = spawnSync(process.execPath, ["--experimental-transform-types", "--no-warnings", file], { maxBuffer: 64 * 1024 * 1024 });
+      return { stdout: r.stdout, stderr: r.stderr, exitCode: r.status ?? -1 };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  test("U3-C-1566 corpus 1566-child-duck-interface.ts: full stdout, stderr and exit code equal Node's", async () => {
+    const r = await runU3Corpus("1566-child-duck-interface.ts");
+    expect(r.stdout.toString("utf8")).toBe("spawned\nexit clean: true true\nsaw out1: true\nsaw err2: true\npid real: true\nlate kill: false\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U3-C-1565 corpus 1565-spawn-pipe-streams.ts: full stdout, stderr and exit code equal Node's", async () => {
+    const r = await runU3Corpus("1565-spawn-pipe-streams.ts");
+    expect(r.stdout.toString("utf8")).toBe(
+      'spawned\nphase1 text: "hello\\nworld\\n"\nphase1 order: end exit:3\nphase2 lines: e1|e2\nphase2 order: end exit:0\nphase3 total: 300000 chunked: true capped: true\nphase3 exit: true\nphase4 error: spawn definitely-not-a-binary-zzz ENOENT\nphase4 impossible end\n',
+    );
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U3-C-1657 corpus 1657-spawn-async-neutral.ts: full stdout, stderr and exit code equal Node's", async () => {
+    const r = await runU3Corpus("1657-spawn-async-neutral.ts");
+    expect(r.stdout.toString("utf8")).toBe(
+      'main done\nclean: 5 null true\npiped: "hello\\nworld\\n" "warn\\n" 3\nkill sent: true\nkilled: null SIGTERM true\nerror: spawn definitely-not-a-binary-xyz ENOENT ENOENT\npid gone: true\n',
+    );
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U3-C-1474 corpus 1474-string-decoder.ts: full stdout, stderr and exit code equal Node's", async () => {
+    const r = await runU3Corpus("1474-string-decoder.ts");
+    const n = await runU3Node(readFileSync(join(corpusDir, "1474-string-decoder.ts"), "utf8"));
+    expect(n.stdout.length).toBeGreaterThan(0);
+    expect(r.stdout.toString("utf8")).toBe(n.stdout.toString("utf8"));
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U3-C-1662 corpus 1662-string-decoder-encodings.ts: full stdout, stderr and exit code equal Node's", async () => {
+    const r = await runU3Corpus("1662-string-decoder-encodings.ts");
+    const n = await runU3Node(readFileSync(join(corpusDir, "1662-string-decoder-encodings.ts"), "utf8"));
+    expect(n.stdout.length).toBeGreaterThan(0);
+    expect(r.stdout.toString("utf8")).toBe(n.stdout.toString("utf8"));
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U3-ORD-01 data then end then exit (the child closes its stdout long before it exits): 'data' runs where the chunk arrives and its ticks and microtask drain before the immediate; 'end' is one tick after the EOF; each listener's tick chain and microtask run before the next event", async () => {
+    const r = await runU3Source("// data then end (the child closes its stdout long before it exits), then exit; each listener queues a nextTick chain and a microtask.\nimport { spawn } from \"node:child_process\";\nconst c = spawn(\"sh\", [\"-c\", \"printf abc; exec 1>&-; sleep 0.4\"], { stdio: [\"ignore\", \"pipe\", \"ignore\"] });\nconst mark = (name: string): void => {\n  console.log(name);\n  process.nextTick(() => {\n    console.log(name + \":t1\");\n    process.nextTick(() => {\n      console.log(name + \":t2\");\n      process.nextTick(() => console.log(name + \":t3\"));\n    });\n  });\n  void Promise.resolve().then(() => console.log(name + \":m\"));\n};\nc.stdout?.on(\"data\", (chunk: Buffer) => mark(\"data \" + chunk.toString()));\nc.stdout?.on(\"end\", () => mark(\"end\"));\nc.on(\"exit\", (code) => mark(\"exit \" + code));\nsetImmediate(() => console.log(\"immediate\"));\nconsole.log(\"main done\");\n");
+    expect(r.stdout.toString("utf8")).toBe("main done\ndata abc\ndata abc:t1\ndata abc:t2\ndata abc:t3\ndata abc:m\nimmediate\nend\nend:t1\nend:t2\nend:t3\nend:m\nexit 0\nexit 0:t1\nexit 0:t2\nexit 0:t3\nexit 0:m\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U3-ORD-02 'end' with no 'data' listener (Q1/Q2): the empty stderr ends on its own before the exit; the non-empty stdout, its EOF read before the exit, ends from the exit's flushStdio chain three ticks after the exit, after the exit listener's two-deep ticks and before its microtask", async () => {
+    const r = await runU3Source("// 'end' with no 'data' listener, the child's EOF read before its exit: the exit's flushStdio chain ends the stream three ticks after the exit, before the exit listener's microtask.\nimport { spawn } from \"node:child_process\";\nconst c = spawn(\"sh\", [\"-c\", \"printf abc; exec 1>&- 2>&-; sleep 0.4\"], { stdio: [\"ignore\", \"pipe\", \"pipe\"] });\nconst mark = (name: string): void => {\n  console.log(name);\n  process.nextTick(() => {\n    console.log(name + \":t1\");\n    process.nextTick(() => {\n      console.log(name + \":t2\");\n      process.nextTick(() => console.log(name + \":t3\"));\n    });\n  });\n  void Promise.resolve().then(() => console.log(name + \":m\"));\n};\nc.stdout?.on(\"end\", () => mark(\"out end\"));\nc.stderr?.on(\"end\", () => mark(\"err end\"));\nc.on(\"exit\", (code) => mark(\"exit \" + code));\nconsole.log(\"main done\");\n");
+    expect(r.stdout.toString("utf8")).toBe("main done\nerr end\nerr end:t1\nerr end:t2\nerr end:t3\nerr end:m\nexit 0\nexit 0:t1\nexit 0:t2\nexit 0:t3\nout end\nout end:t1\nout end:t2\nout end:t3\nexit 0:m\nout end:m\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U3-ORD-03 'end' with no 'data' listener whose EOF comes after the exit (a grandchild holds the pipe): exit, its ticks and microtask, then 'end' in its own callback", async () => {
+    const r = await runU3Source("// 'end' with no 'data' listener, the EOF after the exit (a grandchild holds the pipe): exit, its ticks and microtask, then 'end' in its own callback.\nimport { spawn } from \"node:child_process\";\nconst c = spawn(\"sh\", [\"-c\", \"(sleep 0.4; printf late) & exit 0\"], { stdio: [\"ignore\", \"pipe\", \"ignore\"] });\nconst mark = (name: string): void => {\n  console.log(name);\n  process.nextTick(() => {\n    console.log(name + \":t1\");\n    process.nextTick(() => console.log(name + \":t2\"));\n  });\n  void Promise.resolve().then(() => console.log(name + \":m\"));\n};\nc.stdout?.on(\"end\", () => mark(\"end\"));\nc.on(\"exit\", (code) => mark(\"exit \" + code));\nconsole.log(\"main done\");\n");
+    expect(r.stdout.toString("utf8")).toBe("main done\nexit 0\nexit 0:t1\nexit 0:t2\nexit 0:m\nend\nend:t1\nend:t2\nend:m\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U3-ORD-04 exit before data and end: a grandchild writes after the shell exits \u2014 exit, the late chunk, then end (EXIT is forwarded in arrival order for a piped child, not after its streams)", async () => {
+    const r = await runU3Source("// exit before data and end: a grandchild writes after the shell exits; the reader sees exit, then the late chunk, then end.\nimport { spawn } from \"node:child_process\";\nconst c = spawn(\"sh\", [\"-c\", \"(sleep 0.4; printf late) & exit 7\"], { stdio: [\"ignore\", \"pipe\", \"ignore\"] });\nconst mark = (name: string): void => {\n  console.log(name);\n  process.nextTick(() => console.log(name + \":t1\"));\n  void Promise.resolve().then(() => console.log(name + \":m\"));\n};\nc.stdout?.on(\"data\", (chunk: Buffer) => mark(\"data \" + chunk.toString()));\nc.stdout?.on(\"end\", () => mark(\"end\"));\nc.on(\"exit\", (code) => mark(\"exit \" + code));\n");
+    expect(r.stdout.toString("utf8")).toBe("exit 7\nexit 7:t1\nexit 7:m\ndata late\ndata late:t1\ndata late:m\nend\nend:t1\nend:m\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U3-TWO-01 two streams interleaved: each chunk reaches its own stream's listener in the order the child wrote them; both ends and the exit arrive", async () => {
+    const r = await runU3Source("// two streams interleaved: each chunk reaches its own stream's listener in the order the child wrote them; the two ends and the exit (their relative order is scheduling noise in Node) are printed sorted once all three arrived.\nimport { spawn } from \"node:child_process\";\nconst c = spawn(\"sh\", [\"-c\", \"printf o1; sleep 0.15; printf e1 >&2; sleep 0.15; printf o2; sleep 0.15; printf e2 >&2\"], { stdio: [\"ignore\", \"pipe\", \"pipe\"] });\nconst seen: string[] = [];\nconst tail: string[] = [];\nconst done = (what: string): void => {\n  tail.push(what);\n  if (tail.length === 3) console.log(seen.join(\" \"), \"|\", tail.sort().join(\" \"));\n};\nc.stdout?.on(\"data\", (chunk: Buffer) => seen.push(\"out:\" + chunk.toString()));\nc.stderr?.on(\"data\", (chunk: Buffer) => seen.push(\"err:\" + chunk.toString()));\nc.stdout?.on(\"end\", () => done(\"out-end\"));\nc.stderr?.on(\"end\", () => done(\"err-end\"));\nc.on(\"exit\", (code) => done(\"exit-\" + code));\n");
+    expect(r.stdout.toString("utf8")).toBe("out:o1 err:e1 out:o2 err:e2 | err-end exit-0 out-end\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U3-ONCE-01 once listeners: a once 'data' listener sees only the first chunk, an on listener every chunk; a 'data' listener added during an emission is not called for it; a once 'end' fires once and an 'end' listener added inside it never runs", async () => {
+    const r = await runU3Source("// once listeners: a once 'data' listener sees only the first chunk, an on listener every chunk; a once 'end' listener fires once; a listener added during an emission is not called for it.\nimport { spawn } from \"node:child_process\";\nconst c = spawn(\"sh\", [\"-c\", \"printf one; sleep 0.15; printf two; sleep 0.15; printf three\"], { stdio: [\"ignore\", \"pipe\", \"ignore\"] });\nlet added = false;\nc.stdout?.once(\"data\", (chunk: Buffer) => console.log(\"once data\", chunk.toString()));\nc.stdout?.on(\"data\", (chunk: Buffer) => {\n  console.log(\"on data\", chunk.toString());\n  if (!added) {\n    added = true;\n    c.stdout?.on(\"data\", (later: Buffer) => console.log(\"added data\", later.toString()));\n  }\n});\nc.stdout?.once(\"end\", () => {\n  console.log(\"once end\");\n  c.stdout?.on(\"end\", () => console.log(\"added end never\"));\n});\nc.stdout?.on(\"end\", () => console.log(\"on end\"));\n");
+    expect(r.stdout.toString("utf8")).toBe("once data one\non data one\non data two\nadded data two\non data three\nadded data three\nonce end\non end\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U3-BIG-01 a large output (1 MB) with a reader: Node's own chunks, at most 64 KiB each, add up to every byte", async () => {
+    const r = await runU3Source("// a large output with a reader: Node's own chunks (at most 64 KiB each) add up to every byte.\nimport { spawn } from \"node:child_process\";\nconst c = spawn(\"head\", [\"-c\", \"1000000\", \"/dev/zero\"], { stdio: [\"ignore\", \"pipe\", \"ignore\"] });\nlet total = 0;\nlet chunks = 0;\nlet max = 0;\nc.stdout?.on(\"data\", (chunk: Buffer) => {\n  total += chunk.length;\n  chunks += 1;\n  if (chunk.length > max) max = chunk.length;\n});\nc.stdout?.on(\"end\", () => console.log(\"end\", total, chunks >= 2, max <= 65536));\nc.on(\"exit\", (code) => console.log(\"exit\", code));\n");
+    expect(r.stdout.toString("utf8")).toBe("end 1000000 true true\nexit 0\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U3-BIG-02 a large output (2 MB) with NO reader: the child blocks on its full pipe and is still running at 500 ms; killed, its exit is (null, SIGTERM) and the exit's flushStdio drains the pipe so 'end' still fires", async () => {
+    const r = await runU3Source("// a large output with NO reader: the child blocks on its full pipe (Node reads only to its high-water mark), so it is still running when a timer kills it; the exit's flushStdio then drains the pipe and 'end' fires.\nimport { spawn } from \"node:child_process\";\nconst c = spawn(\"head\", [\"-c\", \"2000000\", \"/dev/zero\"], { stdio: [\"ignore\", \"pipe\", \"ignore\"] });\nc.stdout?.on(\"end\", () => console.log(\"end\"));\nc.on(\"exit\", (code, signal) => console.log(\"exit\", code, signal));\nsetTimeout(() => {\n  console.log(\"still running\", c.exitCode === null);\n  console.log(\"kill\", c.kill(\"SIGTERM\"));\n}, 500);\n");
+    expect(r.stdout.toString("utf8")).toBe("still running true\nkill true\nexit null SIGTERM\nend\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U3-FAIL-01 a failed spawn with both outputs piped: 'error' on its nextTick with both streams present, then stdout's and stderr's 'end', no data, no exit", async () => {
+    const r = await runU3Source("// a failed spawn with both outputs piped: 'error' on its nextTick, then both streams end (stdout first) and no data arrives.\nimport { spawn } from \"node:child_process\";\nconst c = spawn(\"definitely-not-a-binary-u3\", [], { stdio: [\"ignore\", \"pipe\", \"pipe\"] });\nc.stdout?.on(\"data\", () => console.log(\"data never\"));\nc.stderr?.on(\"data\", () => console.log(\"data never\"));\nc.stdout?.on(\"end\", () => console.log(\"out end\"));\nc.stderr?.on(\"end\", () => console.log(\"err end\"));\nc.on(\"error\", (e) => console.log(\"error\", e.message, c.stdout !== null, c.stderr !== null));\nc.on(\"exit\", () => console.log(\"exit never\"));\nconsole.log(\"main done\");\n");
+    expect(r.stdout.toString("utf8")).toBe("main done\nerror spawn definitely-not-a-binary-u3 ENOENT true true\nout end\nerr end\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U3-MIX-01 (re-aimed: refused) a piped slot beside an inherited or fd output slot refuses by name, cp.spawnOpts:pipeMixed — the host would hold the exit for the captured stream, where Node prints 'exit' before the piped stream's 'end' (reviewer's a08 and d09)", async () => {
+    for (const stdio of ['["ignore", "pipe", "inherit"]', '["ignore", "inherit", "pipe"]', '["ignore", "pipe", 1]', '["ignore", 2, "pipe"]']) {
+      const dir = mkdtempSync(join(tmpdir(), "u3-mix-"));
+      try {
+        const file = join(dir, "main.ts");
+        writeFileSync(file, `import { spawn } from "node:child_process";\nconst c = spawn("sh", ["-c", "printf a"], { stdio: ${stdio} });\nc.on("exit", () => console.log("exit"));\n`);
+        const res = await compile(file, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: false, backend: "wasm" });
+        expect(res.ok, stdio).toBe(false);
+        if (!res.ok) expect(res.diagnostics.map((d) => d.message).join("\n")).toContain("(libCall:cp.spawnOpts:pipeMixed)");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  }, 60000);
+  test("U3-NULL-01 child.stdout / child.stderr are null for \"ignore\", \"inherit\" and fd slots and a stream for each \"pipe\" slot", async () => {
+    const r = await runU3Source("// child.stdout / child.stderr: null for \"ignore\", \"inherit\" and fd slots, a stream for \"pipe\".\nimport { spawn } from \"node:child_process\";\nconst a = spawn(\"true\", [], { stdio: \"ignore\" });\nconst b = spawn(\"true\", [], { stdio: \"inherit\" });\nconst d = spawn(\"true\", [], { stdio: [\"ignore\", 1, 2] });\nconst p = spawn(\"true\", [], { stdio: [\"ignore\", \"pipe\", \"ignore\"] });\nconst q = spawn(\"true\", [], { stdio: [\"ignore\", \"ignore\", \"pipe\"] });\nconsole.log(a.stdout === null, a.stderr === null, b.stdout === null, b.stderr === null, d.stdout === null, d.stderr === null);\nconsole.log(p.stdout === null, p.stderr === null, q.stdout === null, q.stderr === null);\nlet n = 0;\nfor (const c of [a, b, d, p, q]) c.on(\"exit\", () => {\n  n++;\n  if (n === 5) console.log(\"all exited\");\n});\n");
+    expect(r.stdout.toString("utf8")).toBe("true true true true true true\nfalse true true false\nall exited\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U3-CHUNK-01 the chunk is a Buffer of the child's raw bytes (invalid UTF-8 and NUL included): hex, length, indexing, and a Buffer | string listener's toString", async () => {
+    const r = await runU3Source("// the chunk is a Buffer of the child's raw bytes (invalid UTF-8 included): hex, length, indexing, and a Buffer | string listener's toString.\nimport { spawn } from \"node:child_process\";\nconst c = spawn(\"printf\", [\"\\\\377\\\\000A\\\\342\\\\202\\\\254\"], { stdio: [\"ignore\", \"pipe\", \"ignore\"] });\nc.stdout?.on(\"data\", (chunk: Buffer) => {\n  console.log(chunk.toString(\"hex\"), chunk.length, chunk[0], chunk[1] === 0);\n});\nconst asText = (chunk: Buffer | string): void => {\n  console.log(JSON.stringify(chunk.toString()));\n};\nc.stdout?.on(\"data\", asText);\nc.stdout?.on(\"end\", () => console.log(\"end\"));\n");
+    expect(r.stdout.toString("utf8")).toBe("ff0041e282ac 6 255 true\n\"\ufffd\\u0000A\u20ac\"\nend\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U3-DEATH-01 a 'data' listener that throws ends the program with exit 1 after the output before it (stderr is not compared on a nonzero exit)", async () => {
+    const r = await runU3Source("// a 'data' listener that throws ends the program (exit 1) after the output before it.\nimport { spawn } from \"node:child_process\";\nconst c = spawn(\"sh\", [\"-c\", \"printf x; sleep 0.2; printf y\"], { stdio: [\"ignore\", \"pipe\", \"ignore\"] });\nc.stdout?.on(\"data\", (chunk: Buffer) => {\n  console.log(\"got\", chunk.toString());\n  throw new Error(\"boom in data\");\n});\nc.on(\"exit\", () => console.log(\"exit never\"));\n");
+    expect(r.stdout.toString("utf8")).toBe("got x\n");
+    expect(r.exitCode).toBe(1);
+  }, 60000);
+  test("U3-LATE-01 SEMANTICS.md S086 (k): a 'data' listener added on a later turn, after the output was buffered — Node prints listener added, data early, tick (the buffered chunk from the resume tick the listener queued); this tier delivers it at the next poll phase, after the adding turn's nextTick", async () => {
+    const r = await runU3Source("// a 'data' listener added on a later turn, after the child's output was buffered (SEMANTICS.md S086 (k)): Node emits the buffered chunk from the resume tick the listener queued, before the timer callback's own later nextTick; this tier delivers it at the next poll phase.\nimport { spawn } from \"node:child_process\";\nconst c = spawn(\"sh\", [\"-c\", \"printf early; sleep 0.6\"], { stdio: [\"ignore\", \"pipe\", \"ignore\"] });\nsetTimeout(() => {\n  c.stdout?.on(\"data\", (chunk: Buffer) => console.log(\"data\", chunk.toString()));\n  process.nextTick(() => console.log(\"tick\"));\n  console.log(\"listener added\");\n}, 300);\nc.stdout?.on(\"end\", () => console.log(\"end\"));\nc.on(\"exit\", (code) => console.log(\"exit\", code));\n");
+    expect(r.stdout.toString("utf8")).toBe("listener added\ntick\ndata early\nend\nexit 0\n");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U3-LX-01 a 'data' listener added inside the 'exit' listener (the EOF read before the exit) gets the output from its own resume_ tick — before the exit listener's tick — then 'end', before the exit listener's microtask (Node 10/10)", async () => {
+    const r = await runU3Source("// a 'data' listener added inside the 'exit' listener: the exit's flushStdio has not run yet, so the buffered output reaches it, then 'end'.\nimport { spawn } from \"node:child_process\";\nconst c = spawn(\"/bin/sh\", [\"-c\", \"printf hi; exec 1>&-; sleep 0.3\"], { stdio: [\"ignore\", \"pipe\", \"ignore\"] });\nc.on(\"exit\", (code) => {\n  console.log(\"exit\", code);\n  c.stdout?.on(\"data\", (d: Buffer) => console.log(\"data\", d.toString()));\n  c.stdout?.on(\"end\", () => console.log(\"end\"));\n  process.nextTick(() => console.log(\"exit tick\"));\n  void Promise.resolve().then(() => console.log(\"exit micro\"));\n});\n");
+    expect(r.stdout.toString("utf8")).toBe("exit 0\ndata hi\nexit tick\nend\nexit micro\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U3-LX-02 a 'data' listener added one nextTick after the 'exit' listener, the EOF read before the exit: the output still reaches it, then 'end'", async () => {
+    const r = await runU3Source("// a 'data' listener added one nextTick after the 'exit' listener (before flushStdio's resume_ flows): the output still reaches it.\nimport { spawn } from \"node:child_process\";\nconst c = spawn(\"/bin/sh\", [\"-c\", \"printf hi; exec 1>&-; sleep 0.3\"], { stdio: [\"ignore\", \"pipe\", \"ignore\"] });\nc.on(\"exit\", (code) => {\n  console.log(\"exit\", code);\n  process.nextTick(() => {\n    c.stdout?.on(\"data\", (d: Buffer) => console.log(\"data\", d.toString()));\n    c.stdout?.on(\"end\", () => console.log(\"end\"));\n  });\n});\n");
+    expect(r.stdout.toString("utf8")).toBe("exit 0\ndata hi\nend\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U3-LX-03 a 'data' listener added two nextTicks after the 'exit' listener: still before flushStdio's resume_ flows, so the output reaches it, then 'end'", async () => {
+    const r = await runU3Source("// a 'data' listener added two nextTicks after the 'exit' listener: flushStdio's resume_ has already flowed the output to nobody, so only 'end' is seen.\nimport { spawn } from \"node:child_process\";\nconst c = spawn(\"/bin/sh\", [\"-c\", \"printf hi; exec 1>&-; sleep 0.3\"], { stdio: [\"ignore\", \"pipe\", \"ignore\"] });\nc.on(\"exit\", (code) => {\n  console.log(\"exit\", code);\n  process.nextTick(() => {\n    process.nextTick(() => {\n      c.stdout?.on(\"data\", (d: Buffer) => console.log(\"data\", d.toString()));\n      c.stdout?.on(\"end\", () => console.log(\"end\"));\n    });\n  });\n});\n");
+    expect(r.stdout.toString("utf8")).toBe("exit 0\ndata hi\nend\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U3-LX-04 listeners (once and on) added in the 'exit' listener while a grandchild still writes: the buffered chunk and the later one, the once listener only the first, then 'end'", async () => {
+    const r = await runU3Source("// a 'data' listener added in the 'exit' listener while a grandchild still writes: the buffered chunk and the later one both reach it, then 'end'.\nimport { spawn } from \"node:child_process\";\nconst c = spawn(\"/bin/sh\", [\"-c\", \"printf a; (sleep 0.3; printf b) & exit 0\"], { stdio: [\"ignore\", \"pipe\", \"ignore\"] });\nc.on(\"exit\", (code) => {\n  console.log(\"exit\", code);\n  c.stdout?.once(\"data\", (d: Buffer) => console.log(\"once\", d.toString()));\n  c.stdout?.on(\"data\", (d: Buffer) => console.log(\"data\", d.toString()));\n  c.stdout?.on(\"end\", () => console.log(\"end\"));\n});\n");
+    expect(r.stdout.toString("utf8")).toBe("exit 0\nonce a\ndata a\ndata b\nend\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U3-LX-05 a 'data' listener added in a timer after the exit: the output that flowed before it is gone, the grandchild's later chunk reaches it, then 'end'", async () => {
+    const r = await runU3Source("// a 'data' listener added after the exit, in a timer, while a grandchild still writes: output flowed before the listener is gone, the later chunk reaches it.\nimport { spawn } from \"node:child_process\";\nconst c = spawn(\"/bin/sh\", [\"-c\", \"printf a; (sleep 0.5; printf b) & exit 0\"], { stdio: [\"ignore\", \"pipe\", \"ignore\"] });\nc.on(\"exit\", (code) => {\n  console.log(\"exit\", code);\n  setTimeout(() => {\n    console.log(\"timer\");\n    c.stdout?.on(\"data\", (d: Buffer) => console.log(\"data\", d.toString()));\n    c.stdout?.on(\"end\", () => console.log(\"end\"));\n  }, 200);\n});\n");
+    expect(r.stdout.toString("utf8")).toBe("exit 0\ntimer\ndata b\nend\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U3-TWO-02 two concurrent piped children that outlive the program's start, 'end' and 'exit' listeners only: exit 1, end 1, exit 2, end 2 — each unread stream ends from its own exit's flushStdio (Node, 12/12); the fast-child order is S086 (l)", async () => {
+    const r = await runU3Source("// two concurrent piped children that run longer than the program takes to reach its event loop: each exit is followed by its own unread stream's end (flushStdio), then the next child's (SEMANTICS.md S086 (l) is the fast-child case).\nimport { spawn } from \"node:child_process\";\nfor (const n of [\"1\", \"2\"]) {\n  const c = spawn(\"/bin/sh\", [\"-c\", \"sleep 0.2; printf \" + n], { stdio: [\"ignore\", \"pipe\", \"ignore\"] });\n  c.stdout?.on(\"end\", () => console.log(\"end\", n));\n  c.on(\"exit\", () => { console.log(\"exit\", n); });\n}\n");
+    expect(r.stdout.toString("utf8")).toBe("exit 1\nend 1\nexit 2\nend 2\n");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U3-LX-06 a 'data' listener added three nextTicks after the 'exit' listener: flushStdio's resume_ already flowed the output to nobody, only 'end' is seen (Node 5/5)", async () => {
+    const r = await runU3Source("// a data listener added three nextTicks after the exit listener: flushStdio's resume_ has flowed the output to nobody, so only end is seen.\nimport { spawn } from \"node:child_process\";\nconst c = spawn(\"/bin/sh\", [\"-c\", \"printf hi; exec 1>&-; sleep 0.3\"], { stdio: [\"ignore\", \"pipe\", \"ignore\"] });\nc.on(\"exit\", (code) => {\n  console.log(\"exit\", code);\n  process.nextTick(() => {\n    process.nextTick(() => { process.nextTick(() => {\n      c.stdout?.on(\"data\", (d: Buffer) => console.log(\"data\", d.toString()));\n      c.stdout?.on(\"end\", () => console.log(\"end\"));\n    }); });\n  });\n});\n");
+    expect(r.stdout.toString("utf8")).toBe("exit 0\nend\n");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
 });

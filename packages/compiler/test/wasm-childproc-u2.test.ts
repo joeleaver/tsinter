@@ -105,12 +105,11 @@ describe("INC-28 U2 child_process async — host-free rows", () => {
     });
   }
 
-  // NOT-LIFTED: the stream half and the signal listeners stay refused by
-  // key; inherited and fd outputs refuse by their own keys until the
-  // host's stream capture routes them.
+  // NOT-LIFTED: the signal listeners stay refused by key. (INC-28 U3 lifted
+  // the stream half — piped output, child.stdout and the stream listeners:
+  // U2-NL-01..03 now pin that they compile, and wasm-childproc-u3.test.ts
+  // holds the keys U3 leaves refused.)
   const refusals: [string, string, string][] = [
-    ["U2-NL-01", "libCall:cp.spawnOpts:pipe", 'import { spawn } from "node:child_process";\nspawn("true", [], { stdio: ["ignore", "pipe", "pipe"] });\n'],
-    ["U2-NL-02", "libCall:child.stdout", 'import { spawn } from "node:child_process";\nconst c = spawn("true", [], { stdio: "ignore" });\nconsole.log(c.stdout === null);\n'],
     ["U2-NL-04", "libCall:process.onSignal", 'process.on("SIGINT", () => console.log("int"));\nconsole.log("armed");\n'],
   ];
   for (const [id, key, src] of refusals) {
@@ -119,6 +118,19 @@ describe("INC-28 U2 child_process async — host-free rows", () => {
       expect(r.ok).toBe(false);
       if (r.ok) return;
       expect(r.diagnostics.join("\n")).toContain(`(${key})`);
+    });
+  }
+  const liftedU3: [string, string, string][] = [
+    ["U2-NL-01", "a piped output tuple (re-aimed at INC-28 U3)", 'import { spawn } from "node:child_process";\nconst c = spawn("true", [], { stdio: ["ignore", "pipe", "pipe"] });\nc.on("exit", () => console.log("done"));\n'],
+    ["U2-NL-02", "child.stdout on an ignored slot (re-aimed at INC-28 U3)", 'import { spawn } from "node:child_process";\nconst c = spawn("true", [], { stdio: "ignore" });\nconsole.log(c.stdout === null);\n'],
+    ["U2-NL-03", "a stdout data listener (re-aimed at INC-28 U3)", 'import { spawn } from "node:child_process";\nconst c = spawn("true", [], { stdio: "ignore" });\nc.stdout?.on("data", (d: Buffer) => console.log(d.length));\n'],
+  ];
+  for (const [id, what, src] of liftedU3) {
+    test(`${id} ${what} compiles to an event module — SINGLE-EDIT: the stream surface refused again`, async () => {
+      const r = await build(src);
+      expect(r.ok, JSON.stringify(r)).toBe(true);
+      if (!r.ok) return;
+      expect(r.exports).toContain("_loop");
     });
   }
   // Inherited and fd outputs, refused by their own keys until the host's
@@ -141,13 +153,6 @@ describe("INC-28 U2 child_process async — host-free rows", () => {
       'import { spawn, type ChildProcess } from "node:child_process";\nimport { openSync } from "node:fs";\nconst fd = openSync("/dev/null", "w");\nconst dir = "/tmp";\nconst flag = process.argv.length > 99;\nconst a = spawn("true", [], { stdio: ["ignore", fd, fd], cwd: dir, env: { K: "v" }, ...(flag ? {} : { detached: true }) });\na.on("exit", () => console.log("e0"));\na.on("exit", (code) => console.log("e1", code));\na.on("exit", (code, signal) => console.log("e2", code, signal));\na.on("error", () => console.log("r0"));\na.on("error", (e) => console.log("r1", e.message));\nconst m = new Map<string, ChildProcess>([["b", spawn("true", [], { stdio: "ignore", env: process.env })]]);\nconst b = m.get("b");\nif (b) b.on("error", () => console.log("r2"));\nconsole.log(a.pid !== undefined, a.exitCode, a.killed);\n',
     );
     expect(r.ok, JSON.stringify(r)).toBe(true);
-  });
-
-  test("U2-NL-03 a stdout data listener stays refused: the survey names libCall:stream.onData — SINGLE-EDIT: a stream.onData arm added", async () => {
-    const r = await build('import { spawn } from "node:child_process";\nconst c = spawn("true", [], { stdio: "ignore" });\nc.stdout!.on("data", (d: Buffer) => console.log(d.length));\n');
-    expect(r.ok).toBe(false);
-    if (r.ok) return;
-    expect(r.survey).toContain("libCall:stream.onData");
   });
 
   test("U2-LS-01 a ChildProcess captured by a closure, held in an array and a Map, passed and returned compiles to a valid module (mapType, mapTypeSoft and its array-element list agree on child) — SINGLE-EDIT: mapTypeSoft's child arm removed", async () => {

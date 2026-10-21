@@ -171,7 +171,7 @@ import { PathBuilder } from "./path.js";
 import { FsBuilder } from "./fs.js";
 import { FsLaddersBuilder } from "./fs-ladders.js";
 import { ChildProcBuilder, SR_ERR_CODE, SR_HAS_STATUS, SR_SIGNAL, SR_STATUS, SR_STDERR, SR_STDOUT } from "./childproc.js";
-import { CH_CODE, CH_HAS_PID, CH_KILLED, CH_PID, CH_STATE, ChildAsyncBuilder } from "./childasync.js";
+import { CH_CODE, CH_ERR, CH_HAS_PID, CH_KILLED, CH_OUT, CH_PID, CH_STATE, ChildAsyncBuilder } from "./childasync.js";
 import { MapBuilder, type MapInfo, type MapKeyKind, type MapValKind } from "./maps.js";
 import { JsonBuilder, jsonQuote } from "./json.js";
 import {
@@ -225,6 +225,7 @@ const FOLD_DEPTH_CAP = 32;
 import type { RegexAst } from "./regex-ast.js";
 import { RE_HEADER_REGISTER_COUNT, RE_HEADER_FLAGS, LRE_FLAG_GLOBAL, LRE_FLAG_STICKY, LRE_FLAG_UNICODE } from "./regex-opcodes.js";
 import { BytesBuilder, type BytesElem } from "./typedarrays.js";
+import { StrdecBuilder } from "./strdec.js";
 import { TimerBuilder } from "./timers.js";
 import { NextTickBuilder } from "./nexttick.js";
 import { EventsBuilder, EMITTER_REG, EMITTER_NAME } from "./events.js";
@@ -1046,7 +1047,9 @@ function cpCallReachable(mod: WModule): boolean {
         node === "cp.spawnOpts" ||
         node === "child.kill" ||
         node === "child.killNum" ||
-        node === "child.unref"
+        node === "child.unref" ||
+        // INC-28 U3: op 9, FLOW, sent by a stream's first 'data' listener.
+        node === "stream.onData"
       ) {
         found = true;
       }
@@ -1086,6 +1089,45 @@ function eventModuleReachable(mod: WModule): boolean {
     }
     if (node !== null && typeof node === "object") {
       for (const value of Object.values(node)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn.body);
+  }
+  return found;
+}
+
+/** INC-28 U3: does this module PIPE a child's output — a reachable
+ * `cp.spawnOpts` with a "pipe" (mode 3) output slot, or a reachable
+ * child.stdout / child.stderr read or stream listener? Only such a module's
+ * ChildProcess carries its streams and its poll phase reads the stream
+ * kinds (childasync.ts); every other module's bytes stay U2's. */
+function pipeModuleReachable(mod: WModule): boolean {
+  const reachable = reachableFunctionNames(mod);
+  const keys = new Set(["child.stdout", "child.stderr", "stream.onData", "stream.onEnd"]);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      const rec = node as Record<string, unknown>;
+      if (rec["kind"] === "libCall" && typeof rec["fn"] === "string") {
+        if (keys.has(rec["fn"])) {
+          found = true;
+          return;
+        }
+        if (rec["fn"] === "cp.spawnOpts" && Array.isArray(rec["args"])) {
+          const args = rec["args"] as { kind?: string; value?: unknown }[];
+          if ([args[3], args[4]].some((a) => a?.kind === "numLit" && a.value === 3)) {
+            found = true;
+            return;
+          }
+        }
+      }
+      for (const value of Object.values(rec)) scan(value);
     }
   };
   for (const fn of mod.functions) {
@@ -2079,6 +2121,8 @@ class Assembler {
   /** INC-28 U2: the module reaches cp.spawn or cp.spawnOpts — it exports
    * `_loop` instead of `_tick` (abi.ts). Computed once. */
   private readonly eventModule: boolean;
+  /** INC-28 U3: the module pipes a child's output (pipeModuleReachable). */
+  private readonly pipeModule: boolean;
   /** The exit-drain gate's static fact — see exitListenerSurfaceReachable's
    * own comment (INC-26 P1). Computed ONCE in the constructor; every drain
    * gate site reads this, never the mutable `procField`/
@@ -2268,6 +2312,7 @@ class Assembler {
     // `evPoll`'s decision (INC-28 U2, abi.ts): the host's event queue, in
     // event modules only, minted LAST so no earlier import index moves.
     this.eventModule = eventModuleReachable(mod);
+    this.pipeModule = pipeModuleReachable(mod);
     this.evPollFunc = this.eventModule
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_EV_POLL, this.mb.funcType([I32, I32], [I32]))
       : null;
@@ -8067,6 +8112,21 @@ class Assembler {
     return this.evPollFunc;
   }
 
+  /** INC-28 U3: node:string_decoder's three pure functions (strdec.ts). */
+  private strdecField: StrdecBuilder | null = null;
+
+  private get strdec(): StrdecBuilder {
+    this.strdecField ??= new StrdecBuilder(this.mb, {
+      strRef: () => this.strRef,
+      strEq: () => this.strEqHelper(),
+      pushStrLit: (c, value) => this.pushStrLitInto(c, value),
+      bytesType: () => this.bytesB.bytesType(),
+      bufType: () => this.bytesB.bufType(),
+      toStr: (enc) => this.bytesB.toStrHelper(enc),
+    });
+    return this.strdecField;
+  }
+
   private cpaField: ChildAsyncBuilder | null = null;
 
   /** INC-28 U2's builder (childasync.ts) — spawn's asynchronous surface:
@@ -8116,6 +8176,10 @@ class Assembler {
       excKind: () => this.exc().kindG,
       reportUncaught: () => this.reportUncaughtHelper(),
       checkpoint: (c) => this.emitCheckpoint(c),
+      pipes: this.pipeModule,
+      bytesType: () => this.bytesB.bytesType(),
+      bufType: () => this.bytesB.bufType(),
+      dataClos: () => this.closPairFor([this.bytesB.bytesRef()], []),
       toUpperCase: () => this.casing.toUpperCase(),
       killSignalByName: () => this.proc.killSignalByNameHelper(),
       f64ToStr: () => this.f64ToStrHelper(),
@@ -8236,6 +8300,77 @@ class Assembler {
     if (paramVal !== null) {
       c.localGet(ERR);
       if (paramVal.kind === "ref" && paramVal.typeIndex !== this.exc().errT) c.refCast(paramVal.typeIndex);
+    }
+    c.localGet(U);
+    c.structGet(user.clos, 0);
+    c.callRef(user.fn);
+    this.mb.setBody(fn, [{ kind: "ref", nullable: true, typeIndex: user.clos }], c.bytes());
+    return made;
+  }
+
+  /** INC-28 U3: the stream-listener ADAPTER for a user callback of type
+   * `cbType` — a function of the fixed 'data' closure type (the chunk) or
+   * the void closure type ('end') whose environment holds the user's
+   * closure. A 'data' callback takes nothing, the Buffer, or a
+   * Buffer-armed union (the chunk is wrapped at its bytes arm — the
+   * stream never emits a string here: setEncoding has no lowering).
+   * Interned per callback type. */
+  private readonly streamAdapterFns = new Map<string, { fn: number; env: number }>();
+
+  private streamAdapterFor(cbType: IrType & { kind: "func" }, data: boolean, loc: SrcLoc | undefined): { fn: number; env: number } | null {
+    const user = this.closSigFor(cbType, loc);
+    if (user === null) return null;
+    const p = cbType.params[0];
+    const key = `${data ? "d" : "e"}:${user.clos}:${p === undefined ? "-" : p.kind === "union" ? `u${p.unionId}` : p.kind}`;
+    const hit = this.streamAdapterFns.get(key);
+    if (hit !== undefined) return hit;
+    const bytesRef = this.bytesB.bytesRef();
+    const fixed = data ? this.closPairFor([bytesRef], []) : this.closPairFor([], []);
+    let wrap: { unionVal: ValType; tag: number; armSt: number } | null = null;
+    if (p !== undefined) {
+      if (!data) return null;
+      if (p.kind === "union") {
+        const def = this.unionDef(p.unionId);
+        const tag = def.arms.findIndex((a) => a.kind === "bytes" && a.elem === "u8");
+        const armSt = tag < 0 ? null : this.unionArmStruct(p.unionId, tag, loc);
+        const unionVal = this.mapType(p, loc);
+        if (armSt === null || unionVal === null) {
+          this.refuse("libCall:stream.onData:unexpected-callback-shape", loc);
+          return null;
+        }
+        wrap = { unionVal, tag, armSt };
+      } else if (!(p.kind === "bytes" && p.elem === "u8")) {
+        this.refuse("libCall:stream.onData:unexpected-callback-shape", loc);
+        return null;
+      }
+    }
+    const env = this.mb.subStructType(
+      `cpaStreamEnv:${key}`,
+      [
+        { storage: { kind: "ref", nullable: false, typeIndex: fixed.fn }, mutable: false },
+        { storage: { kind: "ref", nullable: true, typeIndex: user.clos }, mutable: false },
+      ],
+      fixed.clos,
+    );
+    const fn = this.mb.declareFunc(fixed.fn, `%w.cpa.streamAdapter.${this.streamAdapterFns.size}`);
+    const made = { fn, env };
+    this.streamAdapterFns.set(key, made);
+    const c = new Code();
+    const CHUNK = 1;
+    const U = data ? 2 : 1;
+    c.localGet(0);
+    c.refCast(env);
+    c.structGet(env, 1);
+    c.localSet(U);
+    c.localGet(U);
+    if (p !== undefined) {
+      if (wrap !== null) {
+        c.i32Const(wrap.tag);
+        c.localGet(CHUNK);
+        c.structNew(wrap.armSt);
+      } else {
+        c.localGet(CHUNK);
+      }
     }
     c.localGet(U);
     c.structGet(user.clos, 0);
@@ -11072,6 +11207,10 @@ class Assembler {
       // admits child (a ChildProcess[] must not soft-map to a placeholder).
       case "child":
         return this.cpa.childRef();
+      // INC-28 U3: a piped child stream (childasync.ts) — never fails;
+      // mapTypeSoft and its array-element list carry the same arm.
+      case "childStream":
+        return this.cpa.streamRef();
       // INC-27 U1: the $sym struct (symbols.ts) — ONE representation
       // whatever the symbol (registered or not, described or not), same
       // shape as bytes/promise/dyn/regex/stats just above: this arm
@@ -11138,6 +11277,7 @@ class Assembler {
           t.elem.kind === "regex" ||
           t.elem.kind === "stats" || // INC-26 P5, CP1 delta 29286fa4 D-2/ruling(1)(ii): a `stats[]` must not soft-map to a placeholder while mapType succeeds on it (the increment-6/7 lockstep lesson this list's own header comment names) — latent (no program in the twelve builds one), fixed now per the ruling's own reasoning
           t.elem.kind === "child" || // INC-28 U2: a ChildProcess[] (mapType's child arm never fails), the lockstep this list's header comment names
+          t.elem.kind === "childStream" || // INC-28 U3: a stream[] (mapType's childStream arm never fails), the same lockstep
           t.elem.kind === "symbol" || // INC-27 U1: mapTypeSoft must admit symbol wherever mapType does, including as an array element, or the I32 placeholder is declared for a field that actually holds a $sym struct — the same lockstep-bug class this list's own header comment names
           (t.elem.kind === "object" && this.objectMappable(t.elem.className));
         if (!mappable) return I32;
@@ -11240,6 +11380,9 @@ class Assembler {
       // INC-28 U2: mapType's child arm, in lockstep.
       case "child":
         return this.cpa.childRef();
+      // INC-28 U3: mapType's childStream arm, in lockstep.
+      case "childStream":
+        return this.cpa.streamRef();
       // INC-27 U1: mapType never fails on symbol either — same
       // consistency rule as every other never-fails arm above
       // (dyn/jsval/bytes/regex/stats). This case and mapType's own
@@ -16741,6 +16884,21 @@ class Assembler {
           this.releaseScratch(this.cp.spawnResRef(), R);
           return;
         }
+        // ── INC-28 U3 — node:string_decoder's pure steps (strdec.ts): the
+        // front end's interned %strdec helpers thread the packed state.
+        if (e.fn === "strdec.write" || e.fn === "strdec.next") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          this.walkExpr(e.args[2]!);
+          code.call(e.fn === "strdec.write" ? this.strdec.writeHelper() : this.strdec.nextHelper());
+          return;
+        }
+        if (e.fn === "strdec.end") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.strdec.endHelper());
+          return;
+        }
         // ── INC-28 U2 — spawn's asynchronous surface (childasync.ts; abi.ts
         // cpCall ops 5-8, evPoll). spawn validates and can throw (Node's
         // own argument checks, and the spawn failures Node throws at once),
@@ -16756,11 +16914,21 @@ class Assembler {
             }
           }
           const mv = modes.map((m) => (m.kind === "numLit" ? m.value : -1));
-          // Piped outputs are child.stdout/child.stderr's streams, not
-          // lowered yet; inherited and fd outputs are routed by the host
-          // (abi.ts: SPAWN's modes, evPoll's kinds 2 and 3).
-          if (mv.includes(3)) {
+          // Inherited and fd outputs are routed by the host (abi.ts: SPAWN's
+          // modes, evPoll's kinds 2 and 3); INC-28 U3: a piped output slot
+          // is child.stdout / child.stderr's stream (evPoll's kinds 4 and 5).
+          // The front end fences a piped stdin.
+          if (mv[0] === 3 || (mv.includes(3) && !this.pipeModule)) {
             this.refuse("libCall:cp.spawnOpts:pipe", e.loc);
+            code.unreachable();
+            return;
+          }
+          // A piped output beside an inherited or fd output: the host would
+          // have to hold the exit for the captured stream, which reorders it
+          // against the piped stream's events (Node emits 'exit' when the
+          // child is reaped) — refused by name; no corpus program needs it.
+          if ((mv[1] === 3 && mv[2] !== 3 && mv[2] !== 0) || (mv[2] === 3 && mv[1] !== 3 && mv[1] !== 0)) {
+            this.refuse("libCall:cp.spawnOpts:pipeMixed", e.loc);
             code.unreachable();
             return;
           }
@@ -16816,8 +16984,84 @@ class Assembler {
           return;
         }
         if (e.fn === "child.unref") {
+          // INC-28 U3: Node unrefs only the process handle — a piped stream
+          // keeps the loop alive while it reads and stops holding it when it
+          // pauses, which this tier does not model; a module that pipes a
+          // child's output refuses unref by name.
+          if (this.pipeModule) {
+            this.refuse("libCall:child.unref:pipe", e.loc);
+            code.unreachable();
+            return;
+          }
           this.walkExpr(e.args[0]!);
           code.call(this.cpa.unrefHelper());
+          return;
+        }
+        // ── INC-28 U3 — child output streams (childasync.ts). child.stdout /
+        // child.stderr build the call site's `Readable | null` union: the
+        // stream for a piped slot, null otherwise (Node's own answer for
+        // "ignore", "inherit" and fd slots).
+        if (e.fn === "child.stdout" || e.fn === "child.stderr") {
+          if (e.type.kind !== "union") {
+            this.refuse(`libCall:${e.fn}:unexpected-result-shape`, e.loc);
+            code.unreachable();
+            return;
+          }
+          const unionId = e.type.unionId;
+          const def = this.unionDef(unionId);
+          const emptyTag = def.arms.findIndex((a) => a.kind === "nullT");
+          const valueTag = def.arms.findIndex((a) => a.kind === "childStream");
+          if (emptyTag < 0 || valueTag < 0 || def.arms.length !== 2) {
+            this.refuse(`libCall:${e.fn}:unexpected-union-shape`, e.loc);
+            code.unreachable();
+            return;
+          }
+          const armSt = this.unionArmStruct(unionId, valueTag, e.loc);
+          const unionVal = this.mapType(e.type, e.loc);
+          if (armSt === null || unionVal === null) {
+            code.unreachable();
+            return;
+          }
+          const ST = this.acquireScratch(this.cpa.streamRef());
+          this.walkExpr(e.args[0]!);
+          code.structGet(this.cpa.childType(), e.fn === "child.stdout" ? CH_OUT : CH_ERR);
+          code.localTee(ST);
+          code.refIsNull();
+          this.openIfResult(unionVal);
+          code.globalGet(this.unions.unitGlobal(emptyTag));
+          code.else_();
+          code.i32Const(valueTag);
+          code.localGet(ST);
+          code.structNew(armSt);
+          this.close();
+          this.releaseScratch(this.cpa.streamRef(), ST);
+          return;
+        }
+        if (e.fn === "stream.onData" || e.fn === "stream.onEnd") {
+          const data = e.fn === "stream.onData";
+          const cbType = e.args[1]!.type;
+          if (cbType.kind !== "func") {
+            this.refuse(`libCall:${e.fn}:unexpected-callback-shape`, e.loc);
+            code.unreachable();
+            return;
+          }
+          if (cbType.rest === true) {
+            this.refuse(cbType.restAbi === "jsval" ? "type:func-rest-jsval" : "type:func-rest", e.loc);
+            code.unreachable();
+            return;
+          }
+          const adapter = this.streamAdapterFor(cbType, data, e.loc);
+          if (adapter === null) {
+            code.unreachable();
+            return;
+          }
+          this.walkExpr(e.args[0]!);
+          this.mb.declareFuncRef(adapter.fn);
+          code.refFunc(adapter.fn);
+          this.walkExpr(e.args[1]!);
+          code.structNew(adapter.env);
+          this.walkExpr(e.args[2]!);
+          code.call(data ? this.cpa.onDataHelper() : this.cpa.onEndHelper());
           return;
         }
         if (e.fn === "child.onError") {

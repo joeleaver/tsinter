@@ -78,26 +78,25 @@ describe("INC-28 U1 child_process — host-free rows", () => {
     expect(r.ok, JSON.stringify(r)).toBe(true);
   });
 
-  test("N-NL-01 (re-aimed at INC-28 U2, which lifts spawn) spawn with a piped output stays refused by key: SC3001 (libCall:cp.spawnOpts:pipe) — SINGLE-EDIT: the pipe refusal removed", async () => {
-    const r = await build('import { spawn } from "node:child_process";\nspawn("true", [], { stdio: ["ignore", "pipe", "pipe"] });\n');
+  test("N-NL-01 (re-aimed at INC-28 U3, which lifts piped output) child.unref in a module that pipes a child's output stays refused by key: SC3001 (libCall:child.unref:pipe) — SINGLE-EDIT: the unref-in-a-pipe-module refusal removed", async () => {
+    const r = await build('import { spawn } from "node:child_process";\nconst c = spawn("true", [], { stdio: ["ignore", "pipe", "pipe"] });\nc.unref();\n');
     expect(r.ok).toBe(false);
     if (r.ok) return;
-    expect(r.diagnostics.join("\n")).toContain("(libCall:cp.spawnOpts:pipe)");
+    expect(r.diagnostics.join("\n")).toContain("(libCall:child.unref:pipe)");
   });
 
-  test("N-NL-02 (re-aimed at INC-28 U2, which lifts spawn with options) a ChildProcess's stdout stream stays refused by key: SC3001 (libCall:child.stdout) — SINGLE-EDIT: a child.stdout arm added", async () => {
-    const r = await build('import { spawn } from "node:child_process";\nconst c = spawn("true", [], { stdio: "ignore" });\nconsole.log(c.stdout === null);\n');
+  test("N-NL-02 (re-aimed at INC-28 U3, which lifts child.stdout) TextDecoder's decode, not picked by U3, stays refused by key: SC3001 (libCall:text.decode) — SINGLE-EDIT: a text.decode arm added", async () => {
+    const r = await build("console.log(new TextDecoder().decode(new Uint8Array([104, 105])));\n");
     expect(r.ok).toBe(false);
     if (r.ok) return;
-    expect(r.diagnostics.join("\n")).toContain("(libCall:child.stdout)");
+    expect(r.diagnostics.join("\n")).toContain("(libCall:text.decode)");
   });
 
-  test("N-NL-03 (re-aimed at INC-28 U2, which lifts the ChildProcess members) a stdout data listener stays refused: the survey names libCall:stream.onData — SINGLE-EDIT: a stream.onData arm added", async () => {
-    const file = join(scratch, `p${seq++}.ts`);
-    await writeFile(file, 'import { spawn } from "node:child_process";\nconst c = spawn("true", [], { stdio: "ignore" });\nc.stdout!.on("data", (d: Buffer) => console.log(d.length));\n');
-    const res = await compile(file, { outPath: `${file}.wasm`, outDir: scratch, dynamic: false, backend: "wasm" });
-    expect(res.ok).toBe(false);
-    expect(res.wasmSurvey).toContain("libCall:stream.onData");
+  test("N-NL-03 (re-aimed at INC-28 U3, which lifts the stream listeners) a piped STDIN stays refused by the front end, every lane — SINGLE-EDIT: the stdin pipe fence removed", async () => {
+    const r = await build('import { spawn } from "node:child_process";\nconst c = spawn("cat", [], { stdio: ["pipe", "pipe", "ignore"] });\nc.on("exit", () => console.log("done"));\n');
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.diagnostics.join("\n")).toContain('spawn with stdio: "pipe"');
   });
 
   test("N-SHAPE-01 the exec-options record path (a typed options const, runtime stdio modes) compiles for wasm — SINGLE-EDIT: the cp.execSync arm removed", async () => {

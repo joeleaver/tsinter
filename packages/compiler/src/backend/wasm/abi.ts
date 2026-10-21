@@ -545,10 +545,23 @@
  *       op 7 UNREF(h)          -> 0
  *       op 8 RELEASE(h)        -> 0; the module sends it once the child's
  *                                 exit has been delivered, and the handle
- *                                 is gone
+ *                                 is gone (INC-28 U3: in a module that
+ *                                 pipes output, once every piped stream's
+ *                                 END has been delivered too)
+ *       op 9 FLOW(h, which)    -> 0. INC-28 U3: the piped stream `which`
+ *                                 (1 stdout, 2 stderr) got its first
+ *                                 'data' listener; the host attaches its
+ *                                 own 'data' listener to that stream now,
+ *                                 once, so its stream starts flowing (and
+ *                                 stops back-pressuring the child) exactly
+ *                                 when the program's would. Minted with
+ *                                 cpCall wherever stream.onData is
+ *                                 reachable.
  *     THE SPAWN REQUEST at ptr, little-endian: header u32 stdinMode at +0
  *     (0 ignore, 1 inherit), u32 stdoutMode at +4 and u32 stderrMode at +8
- *     (0 ignore, 1 inherit, 2 a file descriptor), i32 outFd at +12 and
+ *     (0 ignore, 1 inherit, 2 a file descriptor, 3 a pipe — INC-28 U3:
+ *     child.stdout / child.stderr's stream, read by the host; a 3 is never
+ *     beside a 1 or 2 in the other output slot), i32 outFd at +12 and
  *     i32 errFd at +16 (read only in mode 2), u32 detached at +20, two
  *     u32 reserved words at +24 and +28 = 0 — 4+4+4+4+4+4+4+4 = 32 bytes;
  *     then from +32 op 1's RUNS in op 1's order — the file, a u32 argument
@@ -562,7 +575,10 @@
  *     EAGAIN, EMFILE, ENFILE and ENOENT are reported later, every other
  *     errno is thrown), i32 pid at +8 — 4+4+4 = 12 bytes. The answer is
  *     the child's HANDLE, >= 1, exactly when disposition is 0, and 0
- *     exactly when it is 1 or 2 (there is no host child then); a negative
+ *     exactly when it is 1 or 2 (there is no host child then) — INC-28 U3:
+ *     except that a disposition-1 failure with a piped output slot has a
+ *     handle too, for its streams (Node creates them, and they end; that
+ *     handle never carries an EXIT, and KILL and UNREF never name it); a negative
  *     answer is a host failure. Handles are numbered from 1. The module
  *     derives the disposition from the errno itself and checks the host's
  *     agrees, and checks both directions of the answer rule: any mismatch
@@ -586,7 +602,25 @@
  *     inherited stream, or its fd 1 or 2 given in either output slot, is
  *     captured by the host and written by the module, raw, when the
  *     module polls). The host queues a child's EXIT only after every
- *     stream it captures for that child has reached end of file. A header
+ *     stream it captures for that child has reached end of file.
+ *     INC-28 U3 adds, for a piped slot (`a` = the slot, 1 stdout or 2
+ *     stderr; `b` = 0): 4 STREAM-DATA (payload = one chunk, the bytes and
+ *     boundaries of the host Node's own 'data' event; sent only after
+ *     FLOW, never after that stream's END) and 5 STREAM-END (the host
+ *     Node's 'end'; no payload; once per piped stream), and 6 STREAM-HELD
+ *     (payload = one chunk the host's stream emitted after the child's
+ *     'exit', for a stream that had not been FLOWed by then — the host
+ *     attaches its own 'data' listener at its 'exit' for exactly those;
+ *     the module emits the chunk where Node's flow() would, or drops it;
+ *     a FLOW for such a stream answers 0 and changes nothing). A piped child's
+ *     EXIT is queued at the host's 'exit' — in the order its Node emits it
+ *     among the streams' events — once its captured (inherited) streams
+ *     have closed. THE SCOPE BIT: in a module that pipes output, bit 8
+ *     (0x100) of the kind word on an EXIT, DATA, END or HELD says the NEXT
+ *     queued event was emitted in the same host callback scope (before
+ *     that scope's ticks and microtasks drained): the module runs no
+ *     microtask checkpoint between them. An event carrying it is never the
+ *     last one queued. A header
  *     is 24 bytes, so 0 is never a valid length. Any record the module
  *     cannot read (an unknown source, kind or handle, a length that is not
  *     24 + payloadLen) is the named trap "cpCall: host failure".
