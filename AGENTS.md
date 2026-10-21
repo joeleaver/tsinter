@@ -5,25 +5,17 @@ Guidance for agents (and humans) working on this repository. These conventions a
 ## Build and test
 
 ```bash
-pnpm install && pnpm -r build   # build the workspace
-pnpm test:sandbox              # default full gate: plain + sanitized lanes (~4 minutes)
-```
-
-Use focused local tests while iterating, then use `pnpm test:sandbox` whenever a
-full validation gate is required. It loads Sandbox configuration from the
-shell and `.env.local`, runs portable coverage across disposable Linux
-Sandboxes, and retains the Darwin-native contracts on macOS. Linux hosts run
-their supported native-clang contracts locally; other hosts retain those
-checks in the Sandboxes. Both lanes green is the bar before shipping any
-change.
-
-On this fork, Vercel Sandbox credentials are generally unavailable — use the
-local lanes:
-
-```bash
+pnpm install && pnpm -r build                    # build the workspace
 SCRIPTC_TEST_WORKERS=4 pnpm test                 # plain lane
 SCRIPTC_TEST_WORKERS=4 SCRIPTC_SAN=1 pnpm test  # sanitized lane
 ```
+
+Use focused local tests while iterating. Wasm-only changes (under
+`packages/compiler/src/backend/wasm/`, its tests, `SEMANTICS.md`, or
+`tests/harness/wasm-differential.test.ts`) gate on build + `tsc --noEmit`, the
+non-harness suite and the wasm census; anything else also needs the full run.
+(`pnpm test:sandbox` is upstream's Vercel Sandbox gate; its credentials are not
+available on this fork.)
 
 `SCRIPTC_TEST_WORKERS` caps the vitest worker pool so concurrent agents don't
 contend for cores; full local suites also queue behind an advisory lock per
