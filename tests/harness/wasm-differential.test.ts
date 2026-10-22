@@ -3464,6 +3464,21 @@ const TIER_FLOOR: string[] = [
   "2641-http-agent-surface.cjs",
   "2642-http-agent-maxsockets.cjs",
   "2714-set-server-handles.ts",
+  // INC-29 U3: the WHATWG URL and URLSearchParams built in the module
+  // (url-whatwg.ts, url-idna.ts — Node's ada and lib/internal/url.js;
+  // SEMANTICS.md S089): 1015 -> 1027.
+  "1355-url-parse.ts",
+  "1356-url-file-bridge.ts",
+  "1557-url-host.ts",
+  "1577-url-hostname.ts",
+  "1611-url-file-bridge-neutral.ts",
+  "1791-searchparams-core.ts",
+  "1792-searchparams-encoding.ts",
+  "1793-searchparams-iteration.ts",
+  "1794-searchparams-url-live.ts",
+  "2381-builtin-default-imports.js",
+  "2571-searchparams-arg-validation.cjs",
+  "2644-http-client-url-argument.ts",
 ];
 
 interface RunResult {
@@ -8091,5 +8106,61 @@ describe("self-capturing boxed declaration rows", () => {
   test("SELFCAP-02 a block-scoped hoisted function in a for-let loop recursing through a nested closure, and an outer function called twice: a fresh box per execution, each shared with its own closure \u2014 SINGLE-EDIT: the boxed varDecl walking its initializer before minting the box", async () => {
     const r = await runDyn("'use strict';\nfor (let k = 0; k < 3; k++) {\n  function tick(n) {\n    if (n > 0) { const g = function () { tick(n - 1); }; g(); return; }\n    console.log('k' + String(k));\n  }\n  tick(2);\n}\nfunction outer(tag) {\n  let c = 0;\n  function again() { c++; if (c < 2) setTimeout(function () { again(); }, 1); else console.log(`${tag} ${c}`); }\n  again();\n}\nouter('one');\nouter('two');\n");
     expect({ stdout: r.stdout.toString("utf8"), stderr: r.stderr.toString("utf8"), exitCode: r.exitCode }).toEqual({ stdout: "k0\nk1\nk2\none 2\ntwo 2\n", stderr: "", exitCode: 0 });
+  }, 60000);
+});
+
+// ── INC-29 U3 WHATWG URL rows ─────────────────────────────────────────────
+// The WHATWG URL and URLSearchParams are built in the module (url-whatwg.ts,
+// url-idna.ts — Node's ada and lib/internal/url.js). The parse, IDNA and
+// URLSearchParams oracle matrices are host-free (packages/compiler/test/
+// wasm-url-u3.test.ts); these rows pin the twelve corpus programs this unit
+// claims and the http client's URL argument, which needs this file's net
+// host. Every expected output was measured against Node v24.18.1 on the
+// same source.
+describe("INC-29 U3 WHATWG URL rows", () => {
+  async function runU3(file: string, src: string | null): Promise<RunResult> {
+    const dir = mkdtempSync(join(tmpdir(), "u3-row-"));
+    try {
+      let path = file;
+      if (src !== null) {
+        path = join(dir, file);
+        writeFileSync(path, src);
+      }
+      const res = await compile(path, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: wantsDynamic(path), backend: "wasm" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+      return await runWasm(res.binaryPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  const corpusRows: [string, string, string][] = [
+    ["1355-url-parse.ts", "U http://example.com/b?q=1#f | http: | /b\nT true\nU https://a.b/x | https: | /x\nT true\nU http://a.b:8080/x | http: | /x\nT true\nU http://h/x | http: | /x\nT true\nU http://h:0/x | http: | /x\nT true\nU http://h/x | http: | /x\nT true\nU file:///tmp/x%20y/z | file: | /tmp/x%20y/z\nT true\nU file:///tmp/x | file: | /tmp/x\nT true\nU file:///tmp | file: | /tmp\nT true\nU file:/// | file: | /\nT true\nU file:///etc | file: | /etc\nT true\nU file:////double | file: | //double\nT true\nU data:text/plain,hi there | data: | text/plain,hi there\nT true\nU mailto:x@y.z | mailto: | x@y.z\nT true\nU git://Host/X | git: | /X\nT true\nU git://host | git: | \nT true\nU git://host?q | git: | \nT true\nU http://user:pw@host/p | http: | /p\nT true\nU ws://h/ | ws: | /\nT true\nU wss://h/a | wss: | /a\nT true\nU ftp://h/f | ftp: | /f\nT true\nU http://h/a%20b?c%20d#e%20f | http: | /a%20b\nT true\nU http://h//double//slash/ | http: | //double//slash/\nT true\nU http://h/x | http: | /x\nT true\nU http://h/y | http: | /y\nT true\nU http://h/ | http: | /\nT true\nU http://h/a/ | http: | /a/\nT true\nU http://h/a | http: | /a\nT true\nU https://h/?q | https: | /\nT true\nU https://h/#f | https: | /\nT true\nU http://foo.com/x | http: | /x\nT true\nU http://foo.com/x | http: | /x\nT true\nU https://h/x | https: | /x\nT true\nU foo:/x | foo: | /x\nT true\nU foo:bar/../x | foo: | bar/../x\nT true\nU view-source:http://x/ | view-source: | http://x/\nT true\nU c:\\windows | c: | \\windows\nT true\nU http://h/backslash/x | http: | /backslash/x\nT true\nU http://h/%41%zz | http: | /%41%zz\nT true\nU http://h/a?b%20c?d | http: | /a\nT true\nU http://h/%7Bcurly%7D?`tick`#lt%3Cgt%3E | http: | /%7Bcurly%7D\nT true\nU http://trimmed.example/ | http: | /\nT true\nX Invalid URL\nX Invalid URL\nX Invalid URL\nX Invalid URL\nX Invalid URL\nX Invalid URL\nX Invalid URL\nX Invalid URL\nX Invalid URL\nX Invalid URL\nX Invalid URL\nhit https: /path\nmiss true\n", "the URL class over the WHATWG parse table, Invalid URL TypeErrors, URL | undefined"],
+    ["1356-url-file-bridge.ts", "file:///tmp/a%20b/c%25d\nfile:///tmp/%C3%A9%F0%9F%8C%8D\n/tmp/a b/c%d\n/tmp/é\n/x/y\n/\n/upper\ntrue\ntrue\ntrue\nThe URL must be of scheme file\nFile URL path must not include encoded / characters\nFile URL path must not include encoded / characters\nFile URL host must be \"localhost\" or empty on linux\nInvalid URL\n", "fileURLToPath / pathToFileURL: percent round-trips, both receiver forms, the TypeError texts"],
+    ["1557-url-host.ts", "example.com\nlocalhost:3000\napi.test:8443\n<>\n<>\nexample.com\napi.test:8443\nhttps: example.com /path\n", "URL.host: lowercase, non-default ports, empty for file and opaque URLs"],
+    ["1577-url-hostname.ts", "example.com\nlocalhost\napi.test\n<>\n<>\nexample.com\nfalse\ntrue\napi.test\nhttps: example.com example.com /path\n", "URL.hostname beside host"],
+    ["1611-url-file-bridge-neutral.ts", "U1 file: true\nU2 true\nU3 true\nU4 true\nU5 true\nU6 true\nU7 true true\nF1 The URL must be of scheme file\nF2 Invalid URL\nF3 File URL path must not include encoded / characters\nF4 File URL host must be \"localhost\" or empty on linux\n", "the file-URL bridge built from the cwd"],
+    ["1791-searchparams-core.ts", "a=1&b=2&a=3\n\"1\" null\n1,3 0\na=1&b=2&a=3&c+d=x+y%2Bz\na=9&b=2&c+d=x+y%2Bz\na=9&b=2&c+d=x+y%2Bz&brand=new\na=9&c+d=x+y%2Bz&brand=new 3 true false true\na=9&brand=new&c+d=x+y%2Bz\na=0&k=3&k=1&k=2\na=2&b=9 true false false\nlead=1\n%3Fkeep=1\n0 0\na=1&b+c=2+3\nk=v&k=w&s+p=q%2Br\na=1&b+c=2+3 | a=1&b+c=2+3&q=r\ncaught TypeError Each query pair must be an iterable [name, value] tuple\ncaught TypeError Each query pair must be an iterable [name, value] tuple\n", "URLSearchParams constructor shapes and list methods, ERR_INVALID_TUPLE"],
+    ["1792-searchparams-encoding.ts", "q \"\" ->  |  | 0\nq \"&\" ->  |  | 0\nq \"&&\" ->  |  | 0\nq \"a\" -> \"a\":\"\" | a= | 1\nq \"=x\" -> \"\":\"x\" | =x | 1\nq \"a=\" -> \"a\":\"\" | a= | 1\nq \"=\" -> \"\":\"\" | = | 1\nq \"a==b\" -> \"a\":\"=b\" | a=%3Db | 1\nq \"a=b=c\" -> \"a\":\"b=c\" | a=b%3Dc | 1\nq \"%\" -> \"%\":\"\" | %25= | 1\nq \"%2\" -> \"%2\":\"\" | %252= | 1\nq \"%2G\" -> \"%2G\":\"\" | %252G= | 1\nq \"%2b=%2B\" -> \"+\":\"+\" | %2B=%2B | 1\nq \"%ff=%FF\" -> \"�\":\"�\" | %EF%BF%BD=%EF%BF%BD | 1\nq \"a+b=c+d\" -> \"a b\":\"c d\" | a+b=c+d | 1\nq \"%41=%61\" -> \"A\":\"a\" | A=a | 1\nq \"??a=1\" -> \"?a\":\"1\" | %3Fa=1 | 1\nq \"a=%E2%88\" -> \"a\":\"�\" | a=%EF%BF%BD | 1\nq \"a=%ED%A0%80\" -> \"a\":\"���\" | a=%EF%BF%BD%EF%BF%BD%EF%BF%BD | 1\nq \"🚀=💥\" -> \"🚀\":\"💥\" | %F0%9F%9A%80=%F0%9F%92%A5 | 1\n%01%02%03%04%05%06%07%08%09%0A%0B%0C%0D%0E%0F%10%11%12%13%14%15%16%17%18%19%1A%1B%1C%1D%1E%1F+%21%22%23%24%25%26%27%28%29*%2B%2C-.%2F0123456789%3A%3B%3C%3D%3E%3F%40ABCDEFGHIJKLMNOPQRSTUVWXYZ%5B%5C%5D%5E_%60abcdefghijklmnopqrstuvwxyz%7B%7C%7D%7E%7F=%01%02%03%04%05%06%07%08%09%0A%0B%0C%0D%0E%0F%10%11%12%13%14%15%16%17%18%19%1A%1B%1C%1D%1E%1F+%21%22%23%24%25%26%27%28%29*%2B%2C-.%2F0123456789%3A%3B%3C%3D%3E%3F%40ABCDEFGHIJKLMNOPQRSTUVWXYZ%5B%5C%5D%5E_%60abcdefghijklmnopqrstuvwxyz%7B%7C%7D%7E%7F\n%C3%A9=%E6%BC%A2%E5%AD%97&%F0%9D%92%B3=%EF%BF%BDx\n=3|a=5|z=4|z=6|🚀=2|￻=1\ntrue \"c&d=e\" \"100%\"\n", "the urlencoded parser and serializer edges, sort by code units"],
+    ["1793-searchparams-iteration.ts", "pair a 1\npair b 2\npair c 3\nkeyonly a\nkeyonly b\nkeyonly c\ntuple a 1 2\ntuple b 2 2\ntuple c 3 2\nentry a 1\nentry b 2\nentry c 3\nkey a\nkey b\nkey c\nval 1\nval 2\nval 3\nfe2 a 1\nfe2 b 2\nfe2 c 3\nfe1 1\nfe1 2\nfe1 3\nfe3 a 1 3\nfe3 b 2 3\nfe3 c 3 3\na,c,d | a=1&c=3&d=4\na,ax,axx\nmid y\n", "for-of, keys/values/entries and forEach over a live list"],
+    ["1794-searchparams-url-live.ts", "?a=1 1\nhttps://ex.com/p?a=1&b=2+3 ?a=1&b=2+3 a=1&b=2+3\n?a=zz&b=2+3 https://ex.com/p?a=zz&b=2+3\nhttps://ex.com/p?a=zz&b=2+3\nhttps://ex.com/p \"\" 0\nhttps://ex.com/p?late=1\n\"c d\" \"é\"\nhttp://h/p?a+b=c+d&u=%C3%A9&w=x+y\n\"\"\n\"\"\n?q=1 q=1\nhttp://h/x?k=v | k=v&more=1\n?z=one ?z=2\n", "url.searchParams as the live view of the URL's query"],
+    ["2381-builtin-default-imports.js", "a/c / y.txt .gz\ntrue true true\nfalse\n/tmp/a b.txt file:///tmp/x%20y\n/home/u false /a/c\n", "node:url's default import: fileURLToPath and pathToFileURL(...).href"],
+    ["2571-searchparams-arg-validation.cjs", "TypeError|ERR_INVALID_THIS|Value of \"this\" must be of type URLSearchParams\nTypeError|ERR_INVALID_THIS|Value of \"this\" must be of type URLSearchParams\nTypeError|ERR_INVALID_THIS|Value of \"this\" must be of type URLSearchParams\nTypeError|ERR_INVALID_THIS|Value of \"this\" must be of type URLSearchParams\nTypeError|ERR_INVALID_THIS|Value of \"this\" must be of type URLSearchParams\nTypeError|ERR_INVALID_THIS|Value of \"this\" must be of type URLSearchParams\nTypeError|ERR_INVALID_THIS|Value of \"this\" must be of type URLSearchParams\nTypeError|ERR_INVALID_THIS|Value of \"this\" must be of type URLSearchParams\nTypeError|ERR_MISSING_ARGS|The \"name\" argument must be specified\nTypeError|ERR_MISSING_ARGS|The \"name\" argument must be specified\nTypeError|ERR_MISSING_ARGS|The \"name\" argument must be specified\nTypeError|ERR_MISSING_ARGS|The \"name\" argument must be specified\nTypeError|ERR_MISSING_ARGS|The \"name\" and \"value\" arguments must be specified\nTypeError|ERR_MISSING_ARGS|The \"name\" and \"value\" arguments must be specified\nError|undefined|toString\nError|undefined|toString\nError|undefined|toString\nret \"1\"\nTypeError|undefined|Cannot convert a Symbol value to a string\nTypeError|undefined|Cannot convert a Symbol value to a string\nTypeError|undefined|Cannot convert a Symbol value to a string\nret null\nret null\nret null\n?foo=~bar\n?foo=%7Ebar\n", "URLSearchParams argument coercion through a user toString"],
+    ["2644-http-client-url-argument.ts", "string 200\nbody hi /one?q=1\nurl object hi /two\nrequest hi /three\nscheme Protocol \"https:\" not supported. Expected \"http:\"\nparse Invalid URL\n", "http.get / http.request with a URL string or URL object, ERR_INVALID_PROTOCOL, Invalid URL"],
+  ];
+  for (const [name, stdout, what] of corpusRows) {
+    test(`URL-C-${name.slice(0, 4)} corpus ${name} (${what}): full stdout, stderr and exit code equal Node's`, async () => {
+      const r = await runU3(join(corpusDir, name), null);
+      expect(r.stdout.toString("utf8")).toBe(stdout);
+      expect(r.stderr.toString("utf8")).toBe("");
+      expect(r.exitCode).toBe(0);
+    }, 60000);
+  }
+
+  test("URL-HTTP-01 the http client's URL argument: ERR_INVALID_PROTOCOL for another scheme (whatever its case), urlToHttpOptions' URIError on malformed credentials before the protocol check, Invalid URL; credentials become the Authorization header after Host, the path is pathname + search with dot segments resolved and the fragment dropped, a host lowercases, request(url) without a callback — SINGLE-EDIT: httpTarget's checks or clientRequestUrl's header order", async () => {
+    const r = await runU3("main.ts", "import * as http from \"node:http\";\n\nconst server = http.createServer((req, res) => {\n  res.end(`${req.method} ${req.url} auth=${req.headers.authorization ?? \"-\"} host=${req.headers.host ?? \"-\"}`);\n});\n\nfunction fails(f: () => void): void {\n  try {\n    f();\n    console.log(\"no throw\");\n  } catch (e) {\n    console.log(\"threw\", (e as Error).name, (e as Error).message);\n  }\n}\n\nserver.listen(0, () => {\n  const port = server.address().port;\n  fails(() => http.get(\"ftp://127.0.0.1/x\", () => {}));\n  fails(() => http.get(\"HTTPS://127.0.0.1/x\", () => {}));\n  fails(() => http.get(\"http://%zz@127.0.0.1:1/\", () => {}));\n  fails(() => http.get(\"http://u:%zz@127.0.0.1:1/\", () => {}));\n  fails(() => http.get(\"ftp://%zz@127.0.0.1:1/\", () => {}));\n  fails(() => http.get(\"\", () => {}));\n  http.get(`http://us%20er:p%C3%A9ss@127.0.0.1:${port}/a/../b%20c?x=1#frag`, (res) => {\n    let b = \"\";\n    res.on(\"data\", (c) => { b += c; });\n    res.on(\"end\", () => {\n      console.log(\"one\", res.statusCode, b.split(String(port)).join(\"PORT\"));\n      const req = http.request(`http://LOCALHOST:${port}/two?é`);\n      req.on(\"response\", (res2) => {\n        let b2 = \"\";\n        res2.on(\"data\", (c) => { b2 += c; });\n        res2.on(\"end\", () => {\n          console.log(\"two\", b2.split(String(port)).join(\"PORT\"));\n          http.get(new URL(`http://:pw@127.0.0.1:${port}`), (res3) => {\n            let b3 = \"\";\n            res3.on(\"data\", (c) => { b3 += c; });\n            res3.on(\"end\", () => {\n              console.log(\"three\", b3.split(String(port)).join(\"PORT\"));\n              server.close();\n            });\n          });\n        });\n      });\n      req.end();\n    });\n  });\n});\n");
+    expect(r.stdout.toString("utf8")).toBe("threw TypeError Protocol \"ftp:\" not supported. Expected \"http:\"\nthrew TypeError Protocol \"https:\" not supported. Expected \"http:\"\nthrew URIError URI malformed\nthrew URIError URI malformed\nthrew URIError URI malformed\nthrew TypeError Invalid URL\none 200 GET /b%20c?x=1 auth=Basic dXMgZXI6cMOpc3M= host=127.0.0.1:PORT\ntwo GET /two?%C3%A9 auth=- host=localhost:PORT\nthree GET / auth=Basic OnB3 host=127.0.0.1:PORT\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
   }, 60000);
 });

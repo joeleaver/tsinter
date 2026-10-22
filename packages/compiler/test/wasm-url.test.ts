@@ -1,4 +1,9 @@
-/* increment 23 P3, rider 2 — `url.fileURLToPathStr` (SEMANTICS.md S060:
+/* INC-29 U3 retired SEMANTICS.md S060: fileURLToPath(string) now runs
+ * through the WHATWG URL engine (url-whatwg.ts), so the four rows that
+ * pinned S060's named traps pin Node's answers instead; the rest of this
+ * file is unchanged. Original header:
+ *
+ * increment 23 P3, rider 2 — `url.fileURLToPathStr` (SEMANTICS.md S060:
  * the remaining scope narrowings — dot-segment resolution, PERCENT-
  * DECODED non-ASCII path bytes, malformed percent-escapes — this file's
  * own trap pins). Compile REAL TypeScript through the actual frontend+
@@ -56,6 +61,18 @@ const FAILS_HELPER = [
   "  } catch (e) {",
   "    if (e instanceof TypeError) return e.message;",
   "    return 'not-a-typeerror';",
+  "  }",
+  "}",
+];
+
+const OUT_HELPER = [
+  "function out(input: string): string {",
+  "  try {",
+  "    return fileURLToPath(input);",
+  "  } catch (e) {",
+  "    if (e instanceof TypeError) return 'TE ' + e.message;",
+  "    if (e instanceof Error) return 'E ' + e.message;",
+  "    return '?';",
   "  }",
   "}",
 ];
@@ -131,37 +148,35 @@ test("fileURLToPathStr — the four TypeError arms, message and instanceof byte-
   expect(stderr).toBe("");
 });
 
-test("fileURLToPathStr — S060(a): a bare dot-segment (interior and trailing) traps by name, catchable, NOT Node's own collapsed-path answer (Node measured: file:///a/../b -> /b; this tier throws instead), citing SEMANTICS.md S060 by number (F-4)", async () => {
+test("fileURLToPathStr — dot segments resolve as in Node (S060(a), retired by INC-29 U3: this row pinned a named trap; fileURLToPath now runs through the WHATWG engine) — Node measured: /b, /a/b, /", async () => {
   const path = await build("dotseg.ts", [
     "import { fileURLToPath } from 'node:url';",
-    ...FAILS_HELPER,
-    "console.log(fails('file:///a/../b'));",
-    "console.log(fails('file:///a/./b'));",
-    "console.log(fails('file:///a/..'));",
+    ...OUT_HELPER,
+    "console.log(out('file:///a/../b'));",
+    "console.log(out('file:///a/./b'));",
+    "console.log(out('file:///a/..'));",
   ]);
   const { stdout, stderr } = await runWasm(path);
-  const msg = "dot-segment path resolution is not supported yet (SEMANTICS.md S060)";
-  expect(stdout).toBe([msg, msg, msg, ""].join("\n"));
+  expect(stdout).toBe(["/b", "/a/b", "/", ""].join("\n"));
   expect(stderr).toBe("");
 });
 
-test("fileURLToPathStr — F-3: the dot-segment trap now ALSO fires on the %2e/%2E PERCENT-ENCODED spellings (S060(a)'s heading used to be false of its own body — this closes the gap: checked on DECODED segments, not raw bytes), while non-dot-segment near-misses still pass through unchanged (Node measured: %2eb -> .b, a literal segment; %2e%2e%2e -> ..., three dots, also literal — neither is a real dot-segment)", async () => {
+test("fileURLToPathStr — the %2e/%2E dot-segment spellings resolve as in Node (S060(a), retired by INC-29 U3), while non-dot-segment near-misses stay literal (Node measured: %2eb -> .b, %2e%2e%2e -> ...)", async () => {
   const path = await build("dotseg-encoded.ts", [
     "import { fileURLToPath } from 'node:url';",
-    ...FAILS_HELPER,
-    "console.log(fails('file:///a/%2e%2e/b'));",
-    "console.log(fails('file:///a/%2E%2E/b'));",
-    "console.log(fails('file:///a/.%2e/b'));",
-    "console.log(fails('file:///a/%2e./b'));",
-    "console.log(fails('file:///a/%2e/b'));",
+    ...OUT_HELPER,
+    "console.log(out('file:///a/%2e%2e/b'));",
+    "console.log(out('file:///a/%2E%2E/b'));",
+    "console.log(out('file:///a/.%2e/b'));",
+    "console.log(out('file:///a/%2e./b'));",
+    "console.log(out('file:///a/%2e/b'));",
     "console.log(fileURLToPath('file:///a/%2eb/c'));",
     "console.log(fileURLToPath('file:///a/%2e%2e%2e/b'));",
     "console.log(fileURLToPath('file:///a..b/c'));",
-    "console.log(fileURLToPath('file:///a/x%2ey/b'));", // CTRL.x-pct2e-y — the dot lands MID-segment, not at its start; still not a dot-segment
+    "console.log(fileURLToPath('file:///a/x%2ey/b'));",
   ]);
   const { stdout, stderr } = await runWasm(path);
-  const msg = "dot-segment path resolution is not supported yet (SEMANTICS.md S060)";
-  expect(stdout).toBe([msg, msg, msg, msg, msg, "/a/.b/c", "/a/.../b", "/a..b/c", "/a/x.y/b", ""].join("\n"));
+  expect(stdout).toBe(["/b", "/b", "/b", "/b", "/a/b", "/a/.b/c", "/a/.../b", "/a..b/c", "/a/x.y/b", ""].join("\n"));
   expect(stderr).toBe("");
 });
 
@@ -193,46 +208,30 @@ test("fileURLToPathStr — class-4 amendment: a RAW non-ASCII code unit is NOT t
   expect(stderr).toBe("");
 });
 
-test("fileURLToPathStr — F-1(4): S060(b), the ENCODED half — a percent-DECODED byte >= 0x80 traps (the raw half, pinned above, is FIXED — this is the one remaining divergence, reached via a percent escape rather than a raw byte). This is corpus 1356's OWN line 9 (fileURLToPath('file:///tmp/%C3%A9')) — previously a SILENT WRONG PATH ('/tmp/Ã©', a byte-wise mojibake decode of café's UTF-8 bytes); now a named, catchable refusal instead (rule 1) — 1356 itself still does not claim through this rider (its own first refusal is libCall:url.href, unchanged; this trap is unreachable from its own top-level code)", async () => {
+test("fileURLToPathStr — percent-encoded UTF-8 decodes as in Node, and an invalid sequence is decodeURIComponent's URIError (S060(b), retired by INC-29 U3) — corpus 1356's own line 9; Node measured: /tmp/é, /tmp/🌍, URIError URI malformed", async () => {
   const path = await build("nonascii-encoded.ts", [
     "import { fileURLToPath } from 'node:url';",
-    ...FAILS_HELPER,
-    "console.log(fails('file:///tmp/%C3%A9'));", // 1356 line 9's own literal, byte-for-byte
-    "console.log(fails('file:///tmp/%F0%9F%8C%8D'));", // 1611's own astral (U+1F30D) shape
-    // WITNESS row (completion round): %C3 is a well-formed hex escape
-    // (no F-1(4b) malformed-escape violation) but %28 is NOT a valid
-    // UTF-8 continuation byte for the %C3 lead — an INVALID sequence,
-    // not merely an unsupported valid one. Node throws URIError('URI
-    // malformed') for this (measured). This tier's decoded->=0x80 trap
-    // SUBSUMES this and all 7 measured invalid-UTF-8 classes: %C3 alone
-    // already decodes to 0xC3 (>=0x80), tripping THIS trap before %28's
-    // own validity is ever examined — no separate handling needed.
-    "console.log(fails('file:///t/%C3%28'));",
+    ...OUT_HELPER,
+    "console.log(out('file:///tmp/%C3%A9'));",
+    "console.log(out('file:///tmp/%F0%9F%8C%8D'));",
+    "console.log(out('file:///t/%C3%28'));",
   ]);
   const { stdout, stderr } = await runWasm(path);
-  const msg = "non-ASCII fileURLToPath paths are not supported yet (SEMANTICS.md S060)";
-  expect(stdout).toBe([msg, msg, msg, ""].join("\n"));
+  expect(stdout).toBe(["/tmp/é", "/tmp/\u{1f30d}", "E URI malformed", ""].join("\n"));
   expect(stderr).toBe("");
 });
 
-test("fileURLToPathStr — F-1(4b): a malformed percent-escape (bad hex, trailing '%', truncated) traps by name — Node throws a catchable URIError('URI malformed') for every one of these; this tier has no URIError class (not cheap to add this round), so it traps by name instead of the PREVIOUS silent behavior (treating the bare '%' as a literal character)", async () => {
+test("fileURLToPathStr — a malformed percent-escape (bad hex, trailing '%', truncated, a mixed valid/invalid pair) is decodeURIComponent's catchable URIError, as in Node (S060(c), retired by INC-29 U3)", async () => {
   const path = await build("malformed-escape.ts", [
     "import { fileURLToPath } from 'node:url';",
-    ...FAILS_HELPER,
-    "console.log(fails('file:///tmp/a%zzb'));",
-    "console.log(fails('file:///tmp/a%'));",
-    "console.log(fails('file:///tmp/a%2'));",
-    // R-1 (rev-23's re-cert finding): ONE valid hex digit, one invalid
-    // ('2' then 'Z') — the fence a naive is-next-char-hex test can miss
-    // if it ORs the two digit checks instead of ANDing them (rev's M9:
-    // %zz still traps under OR since NEITHER digit is hex; %/%2 fail the
-    // room check first; only a MIXED valid/invalid pair like this one
-    // actually distinguishes AND from OR). Node throws URIError('URI
-    // malformed') on this exact input (measured).
-    "console.log(fails('file:///tmp/a%2Zb'));",
+    ...OUT_HELPER,
+    "console.log(out('file:///tmp/a%zzb'));",
+    "console.log(out('file:///tmp/a%'));",
+    "console.log(out('file:///tmp/a%2'));",
+    "console.log(out('file:///tmp/a%2Zb'));",
   ]);
   const { stdout, stderr } = await runWasm(path);
-  const msg = "malformed percent-escape in a file URL path is not supported yet (SEMANTICS.md S060)";
+  const msg = "E URI malformed";
   expect(stdout).toBe([msg, msg, msg, msg, ""].join("\n"));
   expect(stderr).toBe("");
 });

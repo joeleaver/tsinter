@@ -4421,7 +4421,17 @@ caret's 80-unit boundary" pin (increment 23 P2b) and by
 test the constant-vs-terminal-read distinction itself, only the
 constant's own correct value.
 
-## S060 — `url.fileURLToPathStr`'s file-scheme parser is narrower than Node's WHATWG parser on three axes: dot-segment resolution, percent-DECODED non-ASCII path bytes, and malformed percent-escapes — each traps by NAME rather than a silent wrong answer *(wasm tier)*
+## S060 — `url.fileURLToPathStr`'s file-scheme parser is narrower than Node's WHATWG parser on three axes: dot-segment resolution, percent-DECODED non-ASCII path bytes, and malformed percent-escapes — each traps by NAME rather than a silent wrong answer *(wasm tier — RETIRED by INC-29 U3)*
+
+**Retired (INC-29 U3).** The file-scheme subset this entry describes is
+gone: `fileURLToPath` — the string form and the URL form — now runs
+through the WHATWG URL engine built in the module
+(`packages/compiler/src/backend/wasm/url-whatwg.ts`, Node v24.18.1's ada
+and `lib/internal/url.js`), which resolves dot segments, decodes
+percent-escaped UTF-8 (a malformed sequence is decodeURIComponent's
+`URIError`, as in Node) and parses every input Node's parser does. None of
+the traps below exists any more; the divergence is closed, not moved.
+What follows is the entry's history.
 
 Increment 23 P3's rider 2 builds `url.fileURLToPath(str)`'s posix arm
 (reference: `scr_url.c:344-709` — `scr_url_new` + `parse_rooted_path` +
@@ -6117,3 +6127,17 @@ On the wasm lane node:http is built in the module (`packages/compiler/src/backen
 **Scope:** the wasm lane, under a host built on Node's `net` (the differential harness). The llvm and c lanes build node:http themselves and are not changed by this entry.
 
 **Tested by:** N2-REG-01 (d, e, f), N2-REG-02 (h: requireHostHeader), N2-REG-03 (g, i) in `tests/harness/wasm-differential.test.ts`, with Node's answers in comments beside them; the corpus programs 1750, 1780, 1781, 1795, 1796, 1798, 2638, 2639, 2641, 2642 and 2714 (the modelled surface, Node-exact); (a), (b), (c), (j), (k) and the rest of (h) are measured, not pinned by a row. Measured against Node v24.18.1.
+
+## S089 — the WHATWG URL on the wasm lane: errors carry name, message and code only, any dynamic value other than a primitive or a plain object is fenced by name as a URLSearchParams name or value, and (on every lane) a record argument converts through its toString member alone *(wasm lane; (c) all lanes)*
+
+On the wasm lane `URL`, `URLSearchParams`, `fileURLToPath`, `pathToFileURL` and the http client's URL argument are built in the module (`packages/compiler/src/backend/wasm/url-whatwg.ts`, `url-idna.ts`, `url-tables.ts`), transcribed from Node v24.18.1's vendored ada 3.4.4 (`deps/ada`: the parser, host parsing with IPv4 / IPv6 / opaque hosts, the percent-encode sets, path parsing, serialization, and its IDNA — UTS #46 mapping, NFC, punycode, the bidi and ContextJ checks — with ada's tables as data), `lib/internal/url.js` (the getters, URLSearchParams and its urlencoded parser and serializer, the live `searchParams` view, `fileURLToPath`), `src/node_url.cc` (`pathToFileURL`'s path encoding) and `lib/_http_client.js` (`urlToHttpOptions` and the protocol check). No host operation is added. Results, error classes, codes and messages are Node's, measured over the web-platform-tests URL and IDNA inputs. These differ:
+
+- **(a) An error carries name, message and code only.** `ERR_INVALID_URL` has no `input` (or `base`) property and `ERR_INVALID_FILE_URL_PATH` no `input`; inspecting one shows S021's encoding. The same shape as S087 (a) and S088 (a).
+- **(b) Some dynamic values are fenced as a URLSearchParams name or value.** A checked-dynamic argument converts with Node's ToPrimitive (string hint) when it is a primitive or a plain object: an own callable `toString` is called with the object as `this`, then an own `valueOf`, a throw propagates, and neither giving a primitive is Node's `TypeError: Cannot convert object to primitive value`; an object with no own `toString` answers `"[object Object]"`. Any other dynamic value — an array, a function, a Buffer, a handle, a promise, or any other non-plain kind the checked-dynamic tree carries — throws a catchable Error ("converting this dynamic value to a URLSearchParams string is not supported yet") where Node converts it.
+- **(c) A statically typed record argument converts through its `toString` member alone (every lane).** The front end boxes only the record's `toString` member for the conversion, so a record whose `toString` returns an object and whose `valueOf` returns a primitive throws `TypeError: Cannot convert object to primitive value` where Node uses `valueOf`. The llvm and c lanes do the same (the IR carries no `valueOf`). Board #217.
+
+Not divergences, recorded for the reader: `new URL(input, base)` is fenced by the front end, so every parse here has no base (ada's base-URL branches are not built; resolving against a base remains to do); `sort()` is Node's own algorithm (a stable insertion sort below 100 list entries, a stable bottom-up merge sort from 100); a `searchParams` mutation writes the URL's query at once, where Node writes it on the URL's next read (no read can tell).
+
+**Scope:** (a) and (b) the wasm lane; (c) every lane.
+
+**Tested by:** `packages/compiler/test/wasm-url-u3.test.ts` (the parse, IDNA, URLSearchParams and file-URL matrices against Node in-process) and the "INC-29 U3 WHATWG URL rows" block of `tests/harness/wasm-differential.test.ts` (the twelve corpus programs and the http client's URL argument); URL-REG-01 (a) and URL-REG-02 (b) in `wasm-url-u3.test.ts` pin this tier's answers with Node's in their titles; (c) is measured, not pinned by a row. Measured against Node v24.18.1.

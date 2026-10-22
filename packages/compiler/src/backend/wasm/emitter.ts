@@ -165,6 +165,8 @@ import {
 } from "./dyn.js";
 import { InspectBuilder } from "./inspect.js";
 import { UrlBuilder } from "./url.js";
+import { UrlEngine } from "./url-whatwg.js";
+import { IdnaBuilder } from "./url-idna.js";
 import { UriBuilder } from "./uri.js";
 import { DateBuilder } from "./date.js";
 import { ProcessBuilder } from "./process.js";
@@ -611,6 +613,8 @@ function hostStrReachable(mod: WModule): boolean {
         node === "process.versionsNode" ||
         node === "process.versionsOpenssl" ||
         node === "process.chdir" ||
+        // INC-29 U3: pathToFileURL resolves against the cwd snapshot.
+        node === "url.pathToFileURL" ||
         // INC-26 P4 (design-host-v7.txt §3.5, abi.ts kinds 8/9): os.tmpdir
         // and os.homedir are the pass's ONLY hostStr consumers — none of
         // the 13 fs.* keys touches hostStr at all (fsCall stages paths
@@ -7955,6 +7959,169 @@ class Assembler {
     return this.urlField;
   }
 
+  private urlEngineField: UrlEngine | null = null;
+  private idnaField: IdnaBuilder | null = null;
+
+  /** INC-29 U3: the WHATWG URL engine (url-whatwg.ts, Node's ada) and
+   * its domain-to-ASCII (url-idna.ts). */
+  private get urlEngine(): UrlEngine {
+    this.urlEngineField ??= new UrlEngine(this.mb, {
+      strRef: () => this.strRef,
+      strType: () => this.strType,
+      lit: (c, s) => this.pushStrLitInto(c, s),
+      setCellError: (c, className, name, pushMessage, codeLit) => this.emitSetCellError(c, className, name, pushMessage, codeLit),
+      excKind: () => this.exc().kindG,
+      decodeUriComponent: () => this.uri.decodeUriComponentHelper(),
+      resolve1: () => this.urlResolve1Fn(),
+      strVec: () => this.strVecInfo(),
+      strVecVec: () => this.vecInfoFor(arrayOf(arrayOf(STRING)) as IrType & { kind: "array" }, undefined)!,
+      idnaToAscii: () => this.idna.toAsciiFn(),
+    });
+    return this.urlEngineField;
+  }
+
+  private get idna(): IdnaBuilder {
+    this.idnaField ??= new IdnaBuilder(this.mb, () => this.urlEngine.B8);
+    return this.idnaField;
+  }
+
+  private dynCoerceIdx: number | null = null;
+
+  /** `%w.dyn.toStringCoerce(d) -> str` — `${d}`, ToPrimitive with the
+   * string hint (the URLSearchParams USVString conversions): an object's
+   * OWN callable toString is called with the object as `this`, then its
+   * own valueOf; a primitive answer converts, a throw propagates, and
+   * neither giving a primitive is Node's "Cannot convert object to
+   * primitive value". An object with no own toString answers the
+   * inherited Object.prototype.toString ("[object Object]"). Kinds whose
+   * inherited conversion would itself run user code (arrays, functions,
+   * buffers, handles, promises) are not modelled and throw by name. Null
+   * with the exception pending on a throw. */
+  private dynToStringCoerceFn(): number {
+    if (this.dynCoerceIdx !== null) return this.dynCoerceIdx;
+    const dyn = this.dyn;
+    const dynT = dyn.dynT();
+    const idx = this.mb.declareFunc(this.mb.funcType([dyn.dynRef()], [this.strRef]), "%w.dyn.toStringCoerce");
+    this.dynCoerceIdx = idx;
+    const c = new Code();
+    const D = 0;
+    const K = 1;
+    const M = 2;
+    const R = 3;
+    const vec = this.dynVecInfo();
+    const isPrim = (local: number): void => {
+      // NULL BOOL NUM STR UNDEF
+      c.localGet(local);
+      c.structGet(dynT, DYN_KIND);
+      c.localSet(K);
+      c.localGet(K);
+      c.i32Const(DK.STR);
+      c.i32LeU();
+      c.localGet(K);
+      c.i32Const(DK.UNDEF);
+      c.i32Eq();
+      c.i32Or();
+    };
+    /** Try the own member `name`: a primitive answer returns its string. */
+    const tryMember = (name: string): void => {
+      c.localGet(D);
+      c.structGet(dynT, DYN_REF);
+      c.refCast(dyn.objT());
+      this.pushStrLitInto(c, name);
+      c.call(dyn.objGet());
+      c.localTee(M);
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(M);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.FUNC);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(D);
+      c.call(dyn.thisPush());
+      c.localGet(M);
+      c.i32Const(0);
+      c.i32Const(0);
+      c.arrayNewDefault(vec.bufType);
+      c.structNew(vec.struct);
+      this.pushStrLitInto(c, name);
+      c.call(dyn.callFn());
+      c.localSet(R);
+      c.call(dyn.thisPop());
+      c.localGet(R);
+      c.refIsNull();
+      c.ifVoid();
+      c.refNull(this.strType);
+      c.return_();
+      c.end();
+      isPrim(R);
+      c.ifVoid();
+      c.localGet(R);
+      c.call(dyn.toStr());
+      c.return_();
+      c.end();
+      c.end();
+      c.end();
+    };
+    c.localGet(D);
+    c.structGet(dynT, DYN_KIND);
+    c.localSet(K);
+    c.localGet(K);
+    c.i32Const(DK.OBJ);
+    c.i32Eq();
+    c.ifVoid();
+    {
+      // no own toString: the inherited one
+      c.localGet(D);
+      c.structGet(dynT, DYN_REF);
+      c.refCast(dyn.objT());
+      this.pushStrLitInto(c, "toString");
+      c.call(dyn.objGet());
+      c.refIsNull();
+      c.ifVoid();
+      c.localGet(D);
+      c.call(dyn.toStr());
+      c.return_();
+      c.end();
+      tryMember("toString");
+      tryMember("valueOf");
+      this.emitSetCellError(c, "%TypeError", "TypeError", (x) => this.pushStrLitInto(x, "Cannot convert object to primitive value"), null);
+      c.refNull(this.strType);
+      c.return_();
+    }
+    c.end();
+    isPrim(D);
+    c.ifVoid();
+    c.localGet(D);
+    c.call(dyn.toStr());
+    c.return_();
+    c.end();
+    this.emitSetCellError(c, "%Error", "Error", (x) => this.pushStrLitInto(x, "converting this dynamic value to a URLSearchParams string is not supported yet"), null);
+    c.refNull(this.strType);
+    this.mb.setBody(idx, [I32, dyn.dynRef(), dyn.dynRef()], c.bytes());
+    return idx;
+  }
+
+  private urlResolve1Idx: number | null = null;
+
+  /** `%w.url.resolve1(str) -> str` — path.posix.resolve over one path
+   * (path.ts's resolve takes the parts as a string[]). */
+  private urlResolve1Fn(): number {
+    if (this.urlResolve1Idx !== null) return this.urlResolve1Idx;
+    const info = this.strVecInfo();
+    const idx = this.mb.declareFunc(this.mb.funcType([this.strRef], [this.strRef]), "%w.url.resolve1");
+    this.urlResolve1Idx = idx;
+    const c = new Code();
+    c.i32Const(1);
+    c.localGet(0);
+    c.arrayNewFixed(info.bufType, 1);
+    c.structNew(info.struct);
+    c.call(this.path.resolveHelper());
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
   private uriField: UriBuilder | null = null;
 
   /** INC-25 pass P5's own builder (uri.ts) — the "str.*" URI-codec/
@@ -10640,6 +10807,49 @@ class Assembler {
         code.localGet(Q);
         this.releaseScratch(this.vecs.vecRef(strVec), V);
         this.releaseScratch(h.creqRef(), Q);
+        return true;
+      }
+      /* ── INC-29 U3: the URL-string / URL-object first argument ── */
+      case "http.requestUrl":
+      case "http.requestUrlCb": {
+        const W = this.urlEngine;
+        const U = this.acquireScratch(W.urlRef());
+        const Q = this.acquireScratch(h.creqRef());
+        arg(0);
+        code.call(W.httpTargetFn());
+        this.emitPendingCheck();
+        code.localSet(U);
+        code.localGet(U);
+        code.call(W.httpHostFn());
+        code.localGet(U);
+        code.call(W.httpPortFn());
+        code.localGet(U);
+        code.call(W.httpPathFn());
+        arg(1);
+        if (e.fn === "http.requestUrlCb") {
+          if (!this.emitHttpListener(e.args[3]!, "inc", e.fn, e.loc)) return unreach();
+        } else {
+          code.refNull(EQ_HEAP);
+        }
+        code.localGet(U);
+        code.call(W.httpAuthFn());
+        code.call(h.clientRequestUrlFn());
+        this.emitPendingCheck();
+        code.localSet(Q);
+        const autoEnd = e.args[2]!;
+        this.walkExpr(autoEnd);
+        this.openIf();
+        code.localGet(Q);
+        code.refNull(this.strType);
+        code.refNull(this.bytesB.bytesType());
+        code.i32Const(ENC_NONE);
+        code.refNull(vPair.clos);
+        code.call(h.outEndFn());
+        this.emitPendingCheck();
+        this.close();
+        code.localGet(Q);
+        this.releaseScratch(h.creqRef(), Q);
+        this.releaseScratch(W.urlRef(), U);
         return true;
       }
       case "http.clientEnd":
@@ -14904,6 +15114,13 @@ class Assembler {
       // below and refuse as `type:symbol`.
       case "symbol":
         return this.syms.symRef();
+      // INC-29 U3: the WHATWG URL and URLSearchParams (url-whatwg.ts) —
+      // never fail; mapTypeSoft and its array-element list carry the same
+      // arms.
+      case "url":
+        return this.urlEngine.urlRef();
+      case "searchParams":
+        return this.urlEngine.spRef();
       default:
         this.refuse(`type:${t.kind}`, loc);
         return null;
@@ -14967,6 +15184,7 @@ class Assembler {
           t.elem.kind === "netSocket" || // INC-29 U1: a Socket[] (mapType's netSocket arm never fails), the same lockstep
           t.elem.kind === "netServer" || // INC-29 U1: a Server[], the same lockstep
           (this.httpModule && (t.elem.kind === "httpReq" || t.elem.kind === "httpRes" || t.elem.kind === "httpClientReq")) || // INC-29 U2
+          t.elem.kind === "url" || t.elem.kind === "searchParams" || // INC-29 U3: the same lockstep
           t.elem.kind === "symbol" || // INC-27 U1: mapTypeSoft must admit symbol wherever mapType does, including as an array element, or the I32 placeholder is declared for a field that actually holds a $sym struct — the same lockstep-bug class this list's own header comment names
           (t.elem.kind === "object" && this.objectMappable(t.elem.className));
         if (!mappable) return I32;
@@ -15093,6 +15311,11 @@ class Assembler {
       // the I32 placeholder instead.
       case "symbol":
         return this.syms.symRef();
+      // INC-29 U3: mapType's url / searchParams arms, in lockstep.
+      case "url":
+        return this.urlEngine.urlRef();
+      case "searchParams":
+        return this.urlEngine.spRef();
       default:
         return I32;
     }
@@ -16553,7 +16776,7 @@ class Assembler {
         }
         if (
           k === "array" || k === "func" || k === "record" || k === "object" || k === "classval" ||
-          k === "bytes" || k === "symbol"
+          k === "bytes" || k === "symbol" || k === "url" || k === "searchParams"
         ) {
           // Every object is truthy; evaluate for effects, answer true.
           // (A class-typed value is never null — null and undefined ride
@@ -29123,7 +29346,9 @@ class Assembler {
           // handle; identity is the reference (`c.pause() === c`).
           k === "netSocket" || k === "netServer" ||
           // INC-29 U2: http's structs, the same.
-          k === "httpReq" || k === "httpRes" || k === "httpClientReq"
+          k === "httpReq" || k === "httpRes" || k === "httpClientReq" ||
+          // INC-29 U3: a URL / URLSearchParams is one struct per object.
+          k === "url" || k === "searchParams"
         ) {
           // Reference identity — JS object/function equality exactly.
           // Every one of these is a GC struct or array reference and
@@ -30837,20 +31062,131 @@ class Assembler {
     return false;
   }
 
-  /** node:url — increment 23 P3, rider 2. `url.fileURLToPathStr` is the
-   * ONLY member this pass builds (the file-scheme subset, url.ts) — the
-   * URL-VALUE receiver form (`url.fileURLToPathUrl`) and the rest of the
-   * url.* surface (href/pathname/pathToFileURL/...) stay refused by
-   * name, out of this rider's scope. */
+  /** node:url and the WHATWG URL / URLSearchParams classes — INC-29 U3
+   * (url-whatwg.ts, Node's ada and lib/internal/url.js). The win32
+   * pathToFileURL arm stays refused by name. */
   private emitUrlLibCall(e: Extract<IrExpr, { kind: "libCall" }>): boolean {
     const code = this.fn.code;
-    if (e.fn === "url.fileURLToPathStr") {
-      this.walkExpr(e.args[0]!);
-      code.call(this.url.fileURLToPathStr());
-      this.emitPendingCheck();
+    const W = (): UrlEngine => this.urlEngine;
+    const args = (): void => {
+      for (const a of e.args) this.walkExpr(a);
+    };
+    const simple = (fn: () => number, mayThrow: boolean): boolean => {
+      args();
+      code.call(fn());
+      if (mayThrow) this.emitPendingCheck();
       return true;
+    };
+    switch (e.fn) {
+      case "url.new":
+        return simple(() => W().newFn(), true);
+      case "url.href":
+        return simple(() => W().hrefFn(), false);
+      case "url.protocol":
+        return simple(() => W().protocolFn(), false);
+      case "url.host":
+        return simple(() => W().hostFn(), false);
+      case "url.hostname":
+        return simple(() => W().hostnameFn(), false);
+      case "url.pathname":
+        return simple(() => W().pathnameFn(), false);
+      case "url.search":
+        return simple(() => W().searchFn(), false);
+      case "url.searchParams":
+        return simple(() => W().searchParamsFn(), false);
+      case "url.fileURLToPathUrl":
+        return simple(() => W().fileToPathFn(), true);
+      case "url.fileURLToPathStr":
+        return simple(() => W().fileStrToPathFn(), true);
+      case "url.pathToFileURL":
+        return simple(() => W().pathToFileFn(), true);
+      case "sp.new":
+        return simple(() => W().spNewFn(), false);
+      case "sp.parse":
+        return simple(() => W().spParseFn(), false);
+      case "sp.copy":
+        return simple(() => W().spCopyFn(), false);
+      case "sp.fromPairs":
+        return simple(() => W().spFromPairsFn(), true);
+      case "sp.with": {
+        const S = this.acquireScratch(W().spRef());
+        this.walkExpr(e.args[0]!);
+        code.localTee(S);
+        this.walkExpr(e.args[1]!);
+        this.walkExpr(e.args[2]!);
+        code.call(W().spAppendFn());
+        code.localGet(S);
+        this.releaseScratch(W().spRef(), S);
+        return true;
+      }
+      case "sp.get": {
+        if (e.type.kind !== "union") throw new Error("emitter bug: sp.get result is not a union");
+        const nullTag = this.unionDef(e.type.unionId).arms.findIndex((a) => a.kind === "nullT");
+        const valueTag = this.unionArmTag(e.type.unionId, STRING);
+        if (nullTag < 0 || valueTag < 0) throw new Error("emitter bug: sp.get union lacks its arms");
+        const armSt = this.unionArmStruct(e.type.unionId, valueTag, e.loc);
+        if (armSt === null) {
+          code.unreachable();
+          return true;
+        }
+        args();
+        code.call(W().spGetFn());
+        const d = this.acquireScratch(this.strRef);
+        code.localSet(d);
+        code.localGet(d);
+        code.refIsNull();
+        this.openIfResult(this.unions.baseRef());
+        code.globalGet(this.unions.unitGlobal(nullTag));
+        code.else_();
+        code.i32Const(valueTag);
+        code.localGet(d);
+        code.structNew(armSt);
+        this.close();
+        this.releaseScratch(this.strRef, d);
+        return true;
+      }
+      case "sp.getAll":
+        return simple(() => W().spGetAllFn(), false);
+      case "sp.append":
+        return simple(() => W().spAppendFn(), false);
+      case "sp.set":
+        return simple(() => W().spSetFn(), false);
+      case "sp.delete":
+        args();
+        code.refNull(this.strType);
+        code.call(W().spDeleteFn());
+        return true;
+      case "sp.deleteValue":
+        return simple(() => W().spDeleteFn(), false);
+      case "sp.has":
+      case "sp.hasValue":
+        args();
+        if (e.fn === "sp.has") code.refNull(this.strType);
+        code.call(W().spFindFn());
+        code.i32Const(0);
+        code.i32GeS();
+        return true;
+      case "sp.sort":
+        return simple(() => W().spSortFn(), false);
+      case "sp.size":
+        args();
+        code.call(W().spSizeFn());
+        code.f64ConvertI32S();
+        return true;
+      case "sp.toString":
+        return simple(() => W().spToStringFn(), false);
+      case "dyn.toStringCoerce":
+        return simple(() => this.dynToStringCoerceFn(), true);
+      case "sp.keyAt":
+      case "sp.valAt":
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        code.i32TruncF64S();
+        code.call(W().spAtFn(e.fn === "sp.valAt"));
+        return true;
+      default:
+        return false;
     }
-    return false;
   }
 
   /** node:events (events.ts's registry) — STAGE-A SCOPE: construction,

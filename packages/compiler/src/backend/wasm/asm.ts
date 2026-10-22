@@ -200,6 +200,12 @@ export class A {
   geU(a: X, b: X): X {
     return this.bin((c) => c.i32GeU(), a, b);
   }
+  gtU(a: X, b: X): X {
+    return this.bin((c) => c.i32GtU(), a, b);
+  }
+  leU(a: X, b: X): X {
+    return this.bin((c) => c.i32LeU(), a, b);
+  }
   not(a: X): X {
     return () => {
       a();

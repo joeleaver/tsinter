@@ -5533,6 +5533,30 @@ export class HttpBuilder {
    * flat [name, value, ...] pairs (set in order), the agent (null = the
    * global agent; `oneShot` = `agent: false`'s own fresh Agent), and the
    * 'response' callback (null = none). */
+  /** INC-29 U3: new ClientRequest(urlToHttpOptions(url)[, cb]) — the
+   * URL's hostname (brackets stripped), its port (<= 0 = none), path
+   * (pathname + search) and the method; `auth` (null = none) is the
+   * decoded "user:password" whose Authorization header Node sets right
+   * after the Host header. */
+  clientRequestUrlFn(): number {
+    return this.fn(
+      "clientRequestUrl",
+      [this.strRef, F64, this.strRef, this.strRef, EQ_REF, this.strRef],
+      [this.creqRef()],
+      (f, $) => {
+        const [HOST, PORT, PATH, METHOD, CB, AUTH] = [0, 1, 2, 3, 4, 5];
+        const Q = f.local(this.creqRef());
+        $.put(Q, $.call(this.clientRequestNewFn(), $.l(HOST), $.l(PORT), $.l(PATH), $.l(METHOD), $.d(0), $.anew(this.strArrT, $.i(0)), $.i(0), $.nul(this.agentT()), $.i(0), $.l(CB)));
+        this.excReturn($, $.nul(this.CT));
+        $.if($.notNull($.l(AUTH)), () => {
+          $.run(this.setHeaderFn(), $.l(Q), this.lit($, "Authorization"), this.hvStrNew($, this.cat($, this.lit($, "Basic "), $.l(AUTH))));
+          this.excReturn($, $.nul(this.CT));
+        });
+        $.do($.l(Q));
+      },
+    );
+  }
+
   clientRequestNewFn(): number {
     return this.fn(
       "clientRequestNew",

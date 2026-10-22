@@ -294,6 +294,12 @@ export class Code {
   i32RemS(): void {
     this.w.u8(0x6f);
   }
+  i32DivU(): void {
+    this.w.u8(0x6e);
+  }
+  i32RemU(): void {
+    this.w.u8(0x70);
+  }
   i32And(): void {
     this.w.u8(0x71);
   }
