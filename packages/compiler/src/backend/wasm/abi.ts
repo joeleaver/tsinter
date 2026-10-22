@@ -635,7 +635,9 @@
  *     [net modules only — INC-29 U1: those reaching a node:net key that
  *     can start host I/O; the attempt-budget pair
  *     (get/setDefaultAutoSelectFamilyAttemptTimeout) and connect's
- *     option-bag check alone do not mint it. Always the LAST import.]
+ *     option-bag check alone do not mint it. INC-29 U4: node:tls /
+ *     node:https keys that open a socket or a server, and every
+ *     node:dgram key, mint it too. The LAST import but for tlsCall.]
  *     netCall(op, ptr, len, h, x) -> i32: raw TCP at the level of libuv's
  *     uv_tcp_* and uv_getaddrinfo, and nothing more. Every Node behaviour
  *     — validation and its texts, the errno-to-Error construction
@@ -715,6 +717,39 @@
  *                               run. Answers a request handle at once;
  *                               the answer is a RESOLVE_DONE, after which
  *                               the request handle is gone.
+ *     INC-29 U4 — UDP (node:dgram, IPv4), at the level of libuv's
+ *     uv_udp_*: a UDP handle is in the same handle space; CLOSE (op 7)
+ *     closes it (no event follows; the module emits 'close' itself).
+ *       op 20 UDP_BIND(ptr, len) request: u32 port, u32 family (4), the
+ *                               address's run (an IPv4 literal), u32
+ *                               flags (bit 0 = reuseAddr). The host
+ *                               creates the socket, binds it and starts
+ *                               receiving (uv_udp_init, uv_udp_bind,
+ *                               uv_udp_recv_start). Answers the handle,
+ *                               or the -errno of a failed bind (no handle
+ *                               then). REPLY over ptr on success: u32
+ *                               bound port, u32 family, the bound
+ *                               address's run (getsockname).
+ *       op 21 UDP_CONNECT(ptr, len, h) request: u32 port, u32 family, the
+ *                               address's run. uv_udp_connect, now:
+ *                               answers 0 or the -errno; on 0 the REPLY
+ *                               over ptr is the local address, as op 20's.
+ *       op 22 UDP_SEND(ptr, len, h) request: u32 port, u32 family, the
+ *                               destination's run (empty and port 0 on a
+ *                               connected socket), then a blob (u32 byte
+ *                               count, the bytes, padding to 4): one
+ *                               datagram. Answers 0 (sent, or queued by
+ *                               the host) or a -errno, which the module
+ *                               drops as Node's doSend drops an error with
+ *                               no callback. ORDER: datagrams leave in
+ *                               the order of their UDP_SEND calls, across
+ *                               every UDP handle (uv_udp_send's queue,
+ *                               which Node reaches synchronously for an
+ *                               IP literal): a host queues, it never
+ *                               reorders or defers one behind a later
+ *                               call.
+ *       op 23 UDP_RECV_START(h) -> 0. A no-op kept for the contract's
+ *                               shape: op 20 already receives.
  *     EVENTS, evPoll source 2, `handle` the server, socket or request:
  *       1 ACCEPT        on a server: a = the new socket's handle (not yet
  *                       reading); payload = the peer (u32 family, u32
@@ -732,6 +767,20 @@
  *                       order; or a = the negative getaddrinfo code.
  *       9 ACCEPT_ERROR  on a server: a = -errno (the harness host never
  *                       sends it).
+ *       10 SECURE       INC-29 U4, tlsCall below: a secured socket's
+ *                       handshake completed; a = 0; payload = u32 the
+ *                       X.509 verification result of the peer's chain
+ *                       (client mode; 0 in server mode), then a blob: the
+ *                       peer's leaf certificate, DER (empty when none).
+ *       11 TLS_ERROR    a TLS-protocol failure on a secured socket (the
+ *                       engine's, before or after the handshake);
+ *                       payload = the message's run, then the code's run
+ *                       (empty when the engine has none). A transport
+ *                       failure is still a READ_ERROR / EOF.
+ *       20 UDP_MESSAGE  on a UDP handle: payload = the sender (u32
+ *                       family, u32 port, address run), then the
+ *                       datagram's bytes (the rest of the payload).
+ *       21 UDP_ERROR    on a UDP handle: a = the receive's -errno.
  *     `b` is 0 on every net event. ONE HOST ITERATION, ONE POLL PHASE: a
  *     host answers 0 (no event) once the events it observed in one of its
  *     own loop iterations are delivered, though later ones are queued; the
@@ -763,6 +812,115 @@
  *     asked to and reported it faithfully, in the order it observed it,
  *     is enforced by NOTHING — the harness's own rows are the check.
  *     SEMANTICS.md S087 registers what differs from Node.
+ *
+ *   (import "tsinter" "tlsCall" (func (param i32 i32 i32 i32 i32) (result i32)))
+ *     [TLS modules only — INC-29 U4: those reaching a node:tls or
+ *     node:https key that needs the engine or the host's stores. A module
+ *     that only reads the bundled roots (tls.rootCertificates,
+ *     getCACertificates('bundled' / 'default') by literal) or calls
+ *     setDefaultCACertificates does not import it. Always the LAST
+ *     import.]
+ *     tlsCall(op, ptr, len, h, x) -> i32: the HOST's TLS engine, asked
+ *     for facts only. Every Node behaviour — the option ladders and their
+ *     texts, the TLSSocket's events and their order, socket.authorized and
+ *     authorizationError, Node's verification codes and texts, the
+ *     host-name check (tls.checkServerIdentity, read from the peer's DER),
+ *     the CA store's strings and setDefaultCACertificates' parse — is the
+ *     module's (tls.ts, tls-x509.ts). A BLOB is a u32 byte count, the
+ *     bytes, zero padding to a multiple of 4; strings are UTF-16 runs as
+ *     in netCall. A material op's FAILURE answers -1 and writes over ptr
+ *     the message's run then the code's run (the engine's own text; `x`
+ *     is the room the module left at ptr for it, at least 4096 bytes).
+ *       op 1 CTX_NEW            -> a secure context's handle (>= 1; its own
+ *                               handle space). A context starts with no
+ *                               trust, no certificate and no key; the
+ *                               host's own protocol versions and ciphers.
+ *                               It lives as long as the instance (the
+ *                               module does not free it; a host may share
+ *                               identical ones).
+ *       op 2 CTX_ROOTS(h)       -> 0. Trust the host's default store for
+ *                               this context's verification (Node's
+ *                               addRootCerts). The module asks for it
+ *                               only while the program has not replaced
+ *                               the default set: after
+ *                               setDefaultCACertificates it sends that
+ *                               set's certificates with op 3 instead.
+ *       op 3 CTX_ADD_CA(ptr, len, h, x)   request: a blob, PEM (as the
+ *                               program gave it). Trust it. 0, or a
+ *                               failure.
+ *       op 4 CTX_SET_CERT(ptr, len, h, x) request: a blob, PEM. The
+ *                               context's certificate (chain). 0 / failure.
+ *       op 5 CTX_SET_KEY(ptr, len, h, x)  request: a blob, PEM. Its key;
+ *                               a key that does not match the certificate
+ *                               is a failure. 0 / failure.
+ *       op 6 SECURE(ptr, len, h) request: u32 context, u32 mode (0 client,
+ *                               1 server), the servername's run (client;
+ *                               empty = no SNI). Secures the OPEN net
+ *                               socket h (netCall's handle) — answers 0.
+ *                               From then on netCall's WRITE, SHUTDOWN,
+ *                               READ_START / READ_STOP and CLOSE act on
+ *                               the plaintext, DATA /
+ *                               EOF / READ_ERROR carry the plaintext side,
+ *                               and the handshake's outcome is a SECURE
+ *                               or TLS_ERROR event (evPoll source 2,
+ *                               kinds 10 and 11 above). The host
+ *                               VERIFIES the peer's chain against the
+ *                               context's trust and REPORTS the result
+ *                               (OpenSSL's X509_V_ERR numbering) — it
+ *                               never fails a handshake for it (Node's
+ *                               verify callback accepts), never checks a
+ *                               host name, and never asks a server's peer
+ *                               for a certificate. The host may read the
+ *                               socket during the handshake whatever the
+ *                               module's READ_START state; the plaintext
+ *                               it reads is held until the module reads.
+ *                               NO APPLICATION DATA BEFORE THE VERDICT:
+ *                               the module issues no WRITE on a secured
+ *                               socket until it has accepted the
+ *                               handshake (after its SECURE event, its
+ *                               verification and host-name decision,
+ *                               and 'secureConnect' / 'secureConnection');
+ *                               writes the program makes earlier are
+ *                               held in the module and dropped when it
+ *                               rejects the peer. A host therefore never
+ *                               sends plaintext to a peer the module
+ *                               refuses.
+ *                               A HOST WHOSE ENGINE IS NOT OPENSSL maps
+ *                               its own verdict to OpenSSL's X509_V_ERR
+ *                               numbers (x509_vfy.h), which is what the
+ *                               module turns into Node's codes and texts:
+ *                               mbedTLS's MBEDTLS_X509_BADCERT_EXPIRED is
+ *                               10 (CERT_HAS_EXPIRED), _FUTURE 9
+ *                               (CERT_NOT_YET_VALID), _NOT_TRUSTED 20 for
+ *                               a chain to no trusted root (18 when the
+ *                               leaf is self-signed and alone, 19 when
+ *                               the chain ends in a self-signed
+ *                               untrusted root), _REVOKED 23, _BAD_KEY
+ *                               66 / 67 (EE_ / CA_KEY_TOO_SMALL), _BAD_MD
+ *                               68 (CA_MD_TOO_WEAK), _CN_MISMATCH never
+ *                               (the host checks no
+ *                               name), anything it cannot place 1
+ *                               (UNSPECIFIED). Where an engine cannot
+ *                               tell OpenSSL's cases apart the code and
+ *                               text Node would print can differ
+ *                               (SEMANTICS.md S090 (b)).
+ *       op 7 CA_STORE(ptr, cap, x) the host's 'system' (x = 1) or 'extra'
+ *                               (x = 2, NODE_EXTRA_CA_CERTS's) store, for
+ *                               getCACertificates('system' / 'extra'): u32
+ *                               count, then a DER blob per certificate,
+ *                               written at ptr. Answers the bytes written,
+ *                               or -(the bytes needed) when cap is short
+ *                               (the module grows its room and asks
+ *                               again).
+ *     Any answer or record out of these shapes is the named trap
+ *     "tlsCall: host failure".
+ *     THE CAPABILITY (S004): a host without a TLS engine DOES NOT SUPPLY
+ *     THE IMPORT, and a module reaching node:tls fails to instantiate with
+ *     a LinkError.
+ *     tlsCall's EFFECT TIER: that the host verified what it reports, with
+ *     the trust it was given, is enforced by NOTHING — the harness's own
+ *     rows are the check. SEMANTICS.md S090 registers what differs from
+ *     Node.
  *
  *   (import "tsinter" "write" (func (param i32 i32 i32)))
  *     write(fd, ptr, len): the host writes len bytes at ptr from the
@@ -998,6 +1156,7 @@ export const IMPORT_FS_CALL = "fsCall";
 export const IMPORT_CP_CALL = "cpCall";
 export const IMPORT_EV_POLL = "evPoll";
 export const IMPORT_NET_CALL = "netCall";
+export const IMPORT_TLS_CALL = "tlsCall";
 export const EXPORT_ENTRY = "_start";
 export const EXPORT_TICK = "_tick";
 export const EXPORT_LOOP = "_loop";

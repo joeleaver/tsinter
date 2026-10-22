@@ -104,6 +104,34 @@ export interface NetDeps {
    * Every http-only field, list and behaviour below is gated on it, so a
    * module without node:http keeps U1's bytes. */
   http?: NetHttpHooks;
+  /** INC-29 U4: present only in a module that reaches node:tls or
+   * node:https (tls.ts). Every TLS-only field and list below is gated on
+   * it, so a module without TLS keeps U2's bytes. */
+  tls?: NetTlsHooks;
+  /** INC-29 U4: present only in a module that reaches node:dgram
+   * (dgram.ts): the handle table also holds its UDP sockets. */
+  dgram?: NetDgramHooks;
+}
+
+/** INC-29 U4: what a TLS module adds to its sockets' events. */
+export interface NetTlsHooks {
+  /** `(sock, kind, a, ptr, len)`: a SECURE or TLS_ERROR event (abi.ts
+   * tlsCall) on a socket the module secured. */
+  event: () => number;
+  /** `(sock, bytes) -> i32`: 1 when the socket is a TLS socket whose
+   * handshake the module has not accepted yet — the bytes are held there
+   * (no application data reaches the host before the module's verdict). */
+  hold: () => number;
+}
+
+/** INC-29 U4: a dgram module's UDP sockets in the shared handle table. */
+export interface NetDgramHooks {
+  /** The UDP socket struct type (dgram.ts). */
+  type: () => number;
+  /** `(udp, kind, a, ptr, len)`: an event on a UDP handle. */
+  event: () => number;
+  /** `(udp) -> i32`: the UDP socket holds the loop. */
+  alive: () => number;
 }
 
 /** INC-29 U2: what an http module adds to its sockets and servers. */
@@ -145,6 +173,9 @@ const EV_WRITE_DONE = 6;
 // 7 was SHUTDOWN_DONE: retired, a shutdown completes in the pending pass.
 const EV_RESOLVE_DONE = 8;
 const EV_ACCEPT_ERROR = 9;
+/* INC-29 U4 (abi.ts tlsCall): the TLS kinds on a secured socket. */
+export const EV_SECURE = 10;
+export const EV_TLS_ERROR = 11;
 
 const EV_HEADER_BYTES = 24;
 const EV_FIRST_CAPACITY = 1024;
@@ -607,6 +638,13 @@ export class NetBuilder {
               { storage: I32, mutable: true }, // V_NODELAY
             ]
           : []),
+        ...(this.deps.tls !== undefined
+          ? [
+              { storage: EQ_REF, mutable: true }, // V_TLS (tls.ts)
+              { storage: ent, mutable: true }, // 'secureConnection'
+              { storage: I32, mutable: true },
+            ]
+          : []),
       ]);
     }
     return this.srvTField;
@@ -701,6 +739,13 @@ export class NetBuilder {
               { storage: I32, mutable: true }, // S_FREEGUARD
             ]
           : []),
+        ...(this.deps.tls !== undefined
+          ? [
+              { storage: EQ_REF, mutable: true }, // S_TLS (tls.ts)
+              { storage: ent, mutable: true }, // 'secureConnect'
+              { storage: I32, mutable: true },
+            ]
+          : []),
       ]);
     }
     return this.sockTField;
@@ -708,6 +753,20 @@ export class NetBuilder {
 
   sockRef(): ValType {
     return this.ref(this.sockType());
+  }
+
+  /** INC-29 U4: the TLS fields of $sock and $srv (tls.ts), after U2's
+   * http fields when the module has them. */
+  tlsFields(): { S_TLS: number; L_SECURE: NetList; V_TLS: number; LV_SECCONN: NetList } {
+    if (this.deps.tls === undefined) throw new Error("net.ts: tlsFields in a module without TLS");
+    const s = this.deps.http !== undefined ? S_FREEGUARD + 1 : S_LOOKUP + 1;
+    const v = this.deps.http !== undefined ? V_NODELAY + 1 : V_FLAGS + 1;
+    return {
+      S_TLS: s,
+      L_SECURE: { owner: "sock", arr: s + 1, n: s + 2, arg: "void" },
+      V_TLS: v,
+      LV_SECCONN: { owner: "srv", arr: v + 1, n: v + 2, arg: "sock" },
+    };
   }
 
   /** The environment of every tick and internal listener the machine
@@ -880,7 +939,7 @@ export class NetBuilder {
 
   /* ── record I/O in linear memory ───────────────────────────────────── */
 
-  private loadU32(c: Code, addr: number, off: number): void {
+  loadU32(c: Code, addr: number, off: number): void {
     c.localGet(addr);
     c.i32Const(off);
     c.i32Add();
@@ -894,7 +953,7 @@ export class NetBuilder {
     c.i32Or();
   }
 
-  private storeU32(c: Code, addr: number, off: number, push: () => void): void {
+  storeU32(c: Code, addr: number, off: number, push: () => void): void {
     c.localGet(addr);
     c.i32Const(off);
     c.i32Add();
@@ -903,7 +962,7 @@ export class NetBuilder {
   }
 
   /** The stage base: the cursor rounded up to 4, into `local`. */
-  private base(c: Code, local: number): void {
+  base(c: Code, local: number): void {
     c.globalGet(this.deps.stageCursor());
     c.i32Const(3);
     c.i32Add();
@@ -928,7 +987,7 @@ export class NetBuilder {
 
   /** `%w.net.readRun(ptr) -> string` — the UTF-16 run at ptr (a u32 count,
    * then the code units). */
-  private readRunHelper(): number {
+  readRunHelper(): number {
     return this.fn("readRun", [I32], [this.strRef], (f) => {
       const c = f.c;
       const P = 0;
@@ -967,7 +1026,7 @@ export class NetBuilder {
 
   /** `%w.net.bytesAt(ptr, len) -> bytes` — a fresh Buffer of the bytes at
    * [ptr, ptr + len). */
-  private bytesAtHelper(): number {
+  bytesAtHelper(): number {
     return this.fn("bytesAt", [I32, I32], [this.bytesRef], (f) => {
       const c = f.c;
       const P = 0;
@@ -1010,7 +1069,7 @@ export class NetBuilder {
   /* ── the handle table ──────────────────────────────────────────────── */
 
   /** `%w.net.tableSet(h, obj)` — grows by copy; a null obj clears. */
-  private tableSetHelper(): number {
+  tableSetHelper(): number {
     return this.fn("tableSet", [I32, EQ_REF], [], (f) => {
       const c = f.c;
       const H = 0;
@@ -1432,7 +1491,7 @@ export class NetBuilder {
 
   /** `%w.net.errnoEx(errno, syscall) -> err` — ErrnoException:
    * "<syscall> <CODE>", code CODE. */
-  private errnoExHelper(): number {
+  errnoExHelper(): number {
     return this.fn("errnoEx", [I32, this.strRef], [this.errRef], (f) => {
       const c = f.c;
       const CODE = f.local(this.strRef);
@@ -1485,7 +1544,7 @@ export class NetBuilder {
 
   /** `%w.net.hostPortEx(errno, syscall, address, port) -> err` —
    * ExceptionWithHostPort: "<syscall> <CODE> <address>:<port>". */
-  private hostPortExHelper(): number {
+  hostPortExHelper(): number {
     return this.fn("hostPortEx", [I32, this.strRef, this.strRef, I32], [this.errRef], (f) => {
       const c = f.c;
       const CODE = f.local(this.strRef);
@@ -1572,7 +1631,7 @@ export class NetBuilder {
   }
 
   /** Push a fresh Node error (class Error) with a literal message and code. */
-  private nodeErr(c: Code, message: string, code: string): void {
+  nodeErr(c: Code, message: string, code: string): void {
     this.deps.newError(c, "%Error", "Error", (c2) => this.lit(c2, message), (c2) => this.lit(c2, code));
   }
 
@@ -3391,6 +3450,32 @@ export class NetBuilder {
         c.localGet(S);
         c.call(this.unrefTimerHelper());
       }
+      // INC-29 U4: a TLS socket before the module accepted its handshake
+      // holds the write (tls.ts releases it): it is outstanding until then.
+      if (this.deps.tls !== undefined) {
+        const t = this.deps.tls;
+        this.if_(c, () => {
+          c.localGet(S);
+          c.localGet(B);
+          c.call(t.hold());
+        }, () => {
+          this.sset(c, S, S_DISPATCHED, () => {
+            this.sget(c, S, S_DISPATCHED);
+            c.localGet(B);
+            c.structGet(bt, 2);
+            c.f64ConvertI32S();
+            c.f64Add();
+          });
+          this.sset(c, S, S_WPEND, () => c.i32Const(1));
+          if (this.deps.http !== undefined) {
+            this.sset(c, S, S_LWQS, () => {
+              c.localGet(B);
+              c.structGet(bt, 2);
+            });
+          }
+          c.return_();
+        });
+      }
       // WRITE: the bytes at [ptr, ptr + len).
       c.localGet(B);
       c.structGet(bt, 2);
@@ -3459,6 +3544,83 @@ export class NetBuilder {
       }, () => {
         c.localGet(S);
         c.refNull(this.deps.errType());
+        c.call(this.onwriteHelper());
+      });
+    });
+  }
+
+  /** INC-29 U4: a held write's WRITE, once the module accepted the
+   * handshake (tls.ts): the write is already outstanding (S_WPEND) and
+   * counted; the host's answer completes it as _writeGeneric's would. */
+  issueHeldHelper(): number {
+    return this.fn("issueHeld", [this.sockRef(), this.bytesRef], [], (f) => {
+      const c = f.c;
+      const S = 0;
+      const B = 1;
+      const BASE = f.local(I32);
+      const LEN = f.local(I32);
+      const I = f.local(I32);
+      const R = f.local(I32);
+      const bt = this.deps.bytesType();
+      c.localGet(B);
+      c.structGet(bt, 2);
+      c.localSet(LEN);
+      this.deps.ensureCapacity(c, () => {
+        c.localGet(LEN);
+        c.i32Const(3);
+        c.i32Add();
+      });
+      this.base(c, BASE);
+      this.while_(c, () => {
+        c.localGet(I);
+        c.localGet(LEN);
+        c.i32LtU();
+      }, () => {
+        c.localGet(BASE);
+        c.localGet(I);
+        c.i32Add();
+        c.localGet(B);
+        c.structGet(bt, 0);
+        c.localGet(B);
+        c.structGet(bt, 1);
+        c.localGet(I);
+        c.i32Add();
+        c.arrayGetU(this.deps.bufType());
+        c.i32Store8();
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+      });
+      c.i32Const(OP_WRITE);
+      c.localGet(BASE);
+      c.localGet(LEN);
+      this.sget(c, S, S_H);
+      c.i32Const(0);
+      this.netCall(c);
+      c.localSet(R);
+      this.if_(c, () => {
+        c.localGet(R);
+        c.i32Const(1);
+        c.i32GtS();
+      }, () => this.trap(c));
+      this.if_(c, () => {
+        c.localGet(R);
+        c.i32Const(1);
+        c.i32Ne();
+      }, () => {
+        this.sset(c, S, S_WPEND, () => c.i32Const(0));
+        c.localGet(S);
+        c.localGet(R);
+        c.i32Const(0);
+        c.i32LtS();
+        c.ifResult(this.errRef);
+        c.localGet(R);
+        this.lit(c, "write");
+        c.call(this.errnoExHelper());
+        c.else_();
+        c.refNull(this.deps.errType());
+        c.end();
         c.call(this.onwriteHelper());
       });
     });
@@ -4317,6 +4479,15 @@ export class NetBuilder {
     });
   }
 
+  /** INC-29 U4: connectExHelper with a 'connect' callback (tls.connect's
+   * `tlssock.connect(options, tlssock._start)` through the https Agent). */
+  connectExCbHelper(): number {
+    return this.fn("connectExCb", [F64, this.strRef, I32, F64, this.ref(this.deps.voidClos().clos)], [this.sockRef()], (f) => {
+      const ATTEMPT = f.local(this.deps.dynRef());
+      this.connectBody(f, 4, ATTEMPT, { noDelay: 2, timeout: 3 });
+    });
+  }
+
   private onfinPushHelper(): number {
     return this.fn("onfinPush", [this.sockRef(), this.eclosRef()], [], (f) => {
       const c = f.c;
@@ -4950,7 +5121,7 @@ export class NetBuilder {
   /** A fresh Socket's state: Readable's kSync, Writable's kSync and
    * kAllNoop (resetBuffer), and the constructor's own
    * this.on('end', onReadableStreamEnd). */
-  private sockNewHelper(): number {
+  sockNewHelper(): number {
     return this.fn("sockNew", [], [this.sockRef()], (f) => {
       const c = f.c;
       const S = f.local(this.sockRef());
@@ -5023,6 +5194,11 @@ export class NetBuilder {
         }
         c.refNull(EQ_HEAP); // S_HCLI
         c.i32Const(0); // S_FREEGUARD
+      }
+      if (this.deps.tls !== undefined) {
+        c.refNull(EQ_HEAP); // S_TLS
+        c.refNull(this.entArrT);
+        c.i32Const(0);
       }
       c.structNew(T);
       c.localSet(S);
@@ -5494,6 +5670,11 @@ export class NetBuilder {
         c.refNull(EQ_HEAP); // V_HTTP
         c.i32Const(0); // V_HALFOPEN
         c.i32Const(0); // V_NODELAY
+      }
+      if (this.deps.tls !== undefined) {
+        c.refNull(EQ_HEAP); // V_TLS
+        c.refNull(this.entArrT);
+        c.i32Const(0);
       }
       c.structNew(this.srvType());
     });
@@ -6679,6 +6860,23 @@ export class NetBuilder {
       c.localGet(H);
       c.call(this.tableGetHelper());
       c.localSet(O);
+      // INC-29 U4: a UDP socket's event (dgram.ts).
+      if (this.deps.dgram !== undefined) {
+        const dg = this.deps.dgram;
+        this.if_(c, () => {
+          c.localGet(O);
+          c.refTest(dg.type());
+        }, () => {
+          c.localGet(O);
+          c.refCast(dg.type());
+          c.localGet(KIND);
+          c.localGet(A);
+          c.localGet(PTR);
+          c.localGet(LEN);
+          c.call(dg.event());
+          c.return_();
+        });
+      }
       const asSock = (): void => {
         this.if_(c, () => {
           this.isSock(c, O);
@@ -6748,6 +6946,20 @@ export class NetBuilder {
         });
       });
       asSock();
+      // INC-29 U4: the handshake's outcome and TLS failures (tls.ts).
+      if (this.deps.tls !== undefined) {
+        const t = this.deps.tls;
+        for (const k of [EV_SECURE, EV_TLS_ERROR]) {
+          kind(k, () => {
+            c.localGet(S);
+            c.localGet(KIND);
+            c.localGet(A);
+            c.localGet(PTR);
+            c.localGet(LEN);
+            c.call(t.event());
+          });
+        }
+      }
       kind(EV_CONNECT, () => {
         // afterConnectMultiple's failure branch, else afterConnect.
         this.if_(c, () => {
@@ -7175,6 +7387,23 @@ export class NetBuilder {
           c.i32Const(1);
           c.return_();
         });
+        // INC-29 U4: a bound, ref'd UDP socket (dgram.ts).
+        if (this.deps.dgram !== undefined) {
+          const dg = this.deps.dgram;
+          this.if_(c, () => {
+            c.localGet(O);
+            c.refTest(dg.type());
+          }, () => {
+            this.if_(c, () => {
+              c.localGet(O);
+              c.refCast(dg.type());
+              c.call(dg.alive());
+            }, () => {
+              c.i32Const(1);
+              c.return_();
+            });
+          });
+        }
         this.if_(c, () => this.isSock(c, O), () => {
           c.localGet(O);
           c.refCast(this.sockType());

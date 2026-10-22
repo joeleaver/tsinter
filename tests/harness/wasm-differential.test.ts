@@ -33,6 +33,8 @@
  * `_status()` answers Node's 13 (abi.ts). */
 import { execFile, execFileSync, spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { Socket, type Server, createServer as netCreateServer } from "node:net";
+import { TLSSocket, connect as tlsConnect, createSecureContext, getCACertificates, type SecureContext } from "node:tls";
+import { createSocket as dgramCreateSocket, type Socket as UdpSocket } from "node:dgram";
 import * as netModuleNs from "node:net";
 import { lookup as dnsLookup } from "node:dns";
 import { hasSubscribers as dcHasSubscribers, subscribe as dcSubscribe, unsubscribe as dcUnsubscribe } from "node:diagnostics_channel";
@@ -3483,6 +3485,17 @@ const TIER_FLOOR: string[] = [
   // requireHostHeader, setHeader numbers and writeHead's check order
   "2743-http-option-carry.ts",
   "2744-http-option-carry-dyn.cjs",
+  // INC-29 U4: node:tls, node:https and node:dgram — the TLS engine is the
+  // host's (tlsCall), everything Node does is the module's (tls.ts,
+  // tls-x509.ts, Node's bundled roots in tls-roots.ts); UDP over netCall's
+  // ops 20-23 (dgram.ts) (SEMANTICS.md S090): 1029 -> 1036.
+  "2330-tls-server-runtime-options.cjs",
+  "2331-tls-server-options-typed.ts",
+  "2557-tls-ca-store.ts",
+  "2597-dgram-send-ladders.cjs",
+  "2598-tls-arg-ladders.cjs",
+  "2645-https-client-url-argument.ts",
+  "2672-http-request-response-callback.ts",
 ];
 
 interface RunResult {
@@ -4197,6 +4210,76 @@ const NET_EV_READ_ERROR = 5;
 const NET_EV_WRITE_DONE = 6;
 const NET_EV_RESOLVE_DONE = 8;
 const NET_READ_KINDS: ReadonlySet<number> = new Set([NET_EV_DATA, NET_EV_EOF, NET_EV_READ_ERROR]);
+// INC-29 U4 (abi.ts tlsCall, netCall's UDP ops)
+const NET_EV_SECURE = 10;
+const NET_EV_TLS_ERROR = 11;
+const NET_OP_UDP_BIND = 20;
+const NET_OP_UDP_CONNECT = 21;
+const NET_OP_UDP_SEND = 22;
+const NET_OP_UDP_RECV_START = 23;
+const NET_EV_UDP_MESSAGE = 20;
+const NET_EV_UDP_ERROR = 21;
+const TLS_OP_CTX_NEW = 1;
+const TLS_OP_CTX_ROOTS = 2;
+const TLS_OP_CTX_ADD_CA = 3;
+const TLS_OP_CTX_SET_CERT = 4;
+const TLS_OP_CTX_SET_KEY = 5;
+const TLS_OP_SECURE = 6;
+const TLS_OP_CA_STORE = 7;
+
+/** OpenSSL 3.5's X509_verify_cert_error_string, index = the X509_V_ERR
+ * code (1..95): the harness host's Node reports a verification error by
+ * its text (ssl.verifyError()), the ABI by its number. */
+const TLS_VERIFY_TEXTS = [
+  "ok", "unspecified certificate verification error", "unable to get issuer certificate", "unable to get certificate CRL",
+  "unable to decrypt certificate's signature", "unable to decrypt CRL's signature", "unable to decode issuer public key",
+  "certificate signature failure", "CRL signature failure", "certificate is not yet valid", "certificate has expired",
+  "CRL is not yet valid", "CRL has expired", "format error in certificate's notBefore field",
+  "format error in certificate's notAfter field", "format error in CRL's lastUpdate field",
+  "format error in CRL's nextUpdate field", "out of memory", "self-signed certificate",
+  "self-signed certificate in certificate chain", "unable to get local issuer certificate",
+  "unable to verify the first certificate", "certificate chain too long", "certificate revoked",
+  "issuer certificate doesn't have a public key", "path length constraint exceeded", "unsuitable certificate purpose",
+  "certificate not trusted", "certificate rejected", "subject issuer mismatch", "authority and subject key identifier mismatch",
+  "authority and issuer serial number mismatch", "key usage does not include certificate signing",
+  "unable to get CRL issuer certificate", "unhandled critical extension", "key usage does not include CRL signing",
+  "unhandled critical CRL extension", "invalid non-CA certificate (has CA markings)", "proxy path length constraint exceeded",
+  "key usage does not include digital signature", "proxy certificates not allowed, please set the appropriate flag",
+  "invalid or inconsistent certificate extension", "invalid or inconsistent certificate policy extension",
+  "no explicit policy", "different CRL scope", "unsupported extension feature",
+  "RFC 3779 resource not subset of parent's resources", "permitted subtree violation", "excluded subtree violation",
+  "name constraints minimum and maximum not supported", "application verification failure",
+  "unsupported name constraint type", "unsupported or invalid name constraint syntax", "unsupported or invalid name syntax",
+  "CRL path validation error", "path loop", "Suite B: certificate version invalid", "Suite B: invalid public key algorithm",
+  "Suite B: invalid ECC curve", "Suite B: invalid signature algorithm", "Suite B: curve not allowed for this LOS",
+  "Suite B: cannot sign P-384 with P-256", "hostname mismatch", "email address mismatch", "IP address mismatch",
+  "no matching DANE TLSA records", "EE certificate key too weak", "CA certificate key too weak",
+  "CA signature digest algorithm too weak", "invalid certificate verification context", "issuer certificate lookup error",
+  "Certificate Transparency required, but no valid SCTs found", "proxy subject name violation", "OCSP verification needed",
+  "OCSP verification failed", "OCSP unknown cert", "Cannot find certificate signature algorithm",
+  "subject signature algorithm and issuer public key algorithm mismatch", "cert info signature and signature algorithm mismatch",
+  "invalid CA certificate", "Path length invalid for non-CA cert", "Path length given without key usage keyCertSign",
+  "Key usage keyCertSign invalid for non-CA cert", "Issuer name empty", "Subject name empty", "Missing Authority Key Identifier",
+  "Missing Subject Key Identifier", "Empty Subject Alternative Name extension", "Subject empty and Subject Alt Name extension not critical",
+  "Basic Constraints of CA cert not marked critical", "Authority Key Identifier marked critical",
+  "Subject Key Identifier marked critical", "CA cert does not include key usage extension",
+  "Using cert extension requires at least X509v3", "Certificate public key has explicit ECC parameters",
+  "Raw public key untrusted, no trusted keys configured",
+];
+
+/** A TLS error of the host's engine (OpenSSL's, through Node): one the
+ * ABI reports as TLS_ERROR, not as a transport errno. */
+function tlsIsEngineError(e: NodeJS.ErrnoException & { library?: unknown }): boolean {
+  return typeof e.library === "string" || (typeof e.code === "string" && (e.code.startsWith("ERR_SSL_") || e.code.startsWith("ERR_OSSL_")));
+}
+
+/** A blob (abi.ts tlsCall): u32 byte count, the bytes, padding to 4. */
+function netBlobBytes(b: Uint8Array): Uint8Array {
+  const out = new Uint8Array(4 + ((b.length + 3) & ~3));
+  new DataView(out.buffer).setUint32(0, b.length, true);
+  out.set(b, 4);
+  return out;
+}
 
 /** One UTF-16 run (abi.ts): a u32 code-unit count, the units, padding to 4. */
 function netRunBytes(s: string): Uint8Array {
@@ -4300,9 +4383,13 @@ interface NetHostDeps {
 }
 
 interface NetRec {
-  kind: "server" | "socket" | "resolve";
+  kind: "server" | "socket" | "resolve" | "udp";
   server?: Server;
   sock?: Socket;
+  /** INC-29 U4: a secured socket's raw side (sock is then the TLSSocket). */
+  raw?: Socket;
+  /** INC-29 U4: a UDP socket. */
+  udp?: UdpSocket;
   reading: boolean;
   /** The host socket has been resumed once (its stream flows from then on;
    * reads are gated by `reading` through its _read). */
@@ -4320,8 +4407,12 @@ interface NetStreamHandle {
   readStop(): number;
 }
 
-function makeNetHost(deps: NetHostDeps): { netCall: (op: number, ptr: number, len: number, h: number, x: number) => number; delivered: (ev: HostEvent) => void; finish: () => void; open: () => number; socketOf: (h: number) => Socket | undefined } {
+function makeNetHost(deps: NetHostDeps): { netCall: (op: number, ptr: number, len: number, h: number, x: number) => number; tlsCall: (op: number, ptr: number, len: number, h: number, x: number) => number; delivered: (ev: HostEvent) => void; finish: () => void; open: () => number; socketOf: (h: number) => Socket | undefined } {
   const recs = new Map<number, NetRec>();
+  // INC-29 U4: the secure contexts (their own handle space; not live
+  // handles — a context lives as long as the run).
+  const ctxs = new Map<number, { roots: boolean; ca: Buffer[]; certs: Buffer[]; keys: Buffer[] }>();
+  let nextCtx = 1;
   let next = 1;
   let finished = false;
   const ev = (handle: number, kind: number, a: number, payload?: Uint8Array): HostEvent => ({
@@ -4357,11 +4448,18 @@ function makeNetHost(deps: NetHostDeps): { netCall: (op: number, ptr: number, le
     sock._read = (n: number): void => {
       if (recs.get(h)?.reading === true) ownRead(n);
     };
-    sock.on("data", (chunk: Buffer) => queue(h, ev(h, NET_EV_DATA, 0, new Uint8Array(chunk))));
-    sock.on("end", () => queue(h, ev(h, NET_EV_EOF, 0)));
+    // INC-29 U4: once a socket is secured, its raw side's events are the
+    // TLSSocket's business (the rec's sock is then the TLSSocket).
+    const mine = (): boolean => recs.get(h)?.sock === sock;
+    sock.on("data", (chunk: Buffer) => {
+      if (mine()) queue(h, ev(h, NET_EV_DATA, 0, new Uint8Array(chunk)));
+    });
+    sock.on("end", () => {
+      if (mine()) queue(h, ev(h, NET_EV_EOF, 0));
+    });
     sock.on("error", (e: NodeJS.ErrnoException) => {
       const rec = recs.get(h);
-      if (rec === undefined) return;
+      if (rec === undefined || !mine()) return;
       if (e.syscall === "connect") {
         if (!rec.connected) {
           rec.connected = true;
@@ -4470,6 +4568,9 @@ function makeNetHost(deps: NetHostDeps): { netCall: (op: number, ptr: number, le
           // libuv would read these in a later iteration than this one.
           for (const e of held) (deps.requeue ?? deps.push)(e);
           const sock = rec.sock!;
+          // INC-29 U4: a TLSSocket reads for its handshake whatever the
+          // module does; its plaintext is held while the module does not read.
+          if (rec.raw !== undefined) return 0;
           if (!rec.started) {
             rec.started = true;
             sock.resume();
@@ -4486,7 +4587,7 @@ function makeNetHost(deps: NetHostDeps): { netCall: (op: number, ptr: number, le
           rec.reading = false;
           // uv_read_stop on the host's handle, now: no read past this
           // point until the next READ_START.
-          const handle = (rec.sock as unknown as { _handle: NetStreamHandle | null })._handle;
+          const handle = rec.raw !== undefined ? null : (rec.sock as unknown as { _handle: NetStreamHandle | null })._handle;
           if (handle !== null && handle.reading) {
             handle.reading = false;
             handle.readStop();
@@ -4547,7 +4648,10 @@ function makeNetHost(deps: NetHostDeps): { netCall: (op: number, ptr: number, le
           }
           return true;
         });
-        if (rec.kind === "socket") rec.sock!.destroy();
+        if (rec.kind === "socket") {
+          rec.sock!.destroy();
+          rec.raw?.destroy();
+        } else if (rec.kind === "udp") rec.udp!.close();
         else rec.server!.close();
         return 0;
       }
@@ -4568,12 +4672,223 @@ function makeNetHost(deps: NetHostDeps): { netCall: (op: number, ptr: number, le
         });
         return rh;
       }
+      // INC-29 U4: UDP (abi.ts netCall ops 20-23), over Node's dgram
+      // Socket and its UDP handle's synchronous bind / connect.
+      case NET_OP_UDP_BIND: {
+        const port = dv.getUint32(ptr, true);
+        const { text: address, next: flagsAt } = netReadRun(buffer, ptr + 8);
+        const flags = dv.getUint32(flagsAt, true);
+        const s = dgramCreateSocket({ type: "udp4", reuseAddr: (flags & 1) !== 0 });
+        const state = udpState(s);
+        // UV_UDP_REUSEADDR is 4.
+        const err = state.handle.bind(address, port, (flags & 1) !== 0 ? 4 : 0);
+        if (err !== 0) {
+          s.close();
+          return err;
+        }
+        // abi.ts: sends leave in call order, as uv_udp_send's do — an IP
+        // literal is not looked up through dns (a later tick), so each
+        // UDP_SEND reaches the kernel before netCall returns.
+        const lookup = state.handle.lookup;
+        state.handle.lookup = (a: string, cb: (e: Error | null, ip: string) => void): void => {
+          if (netModuleNs.isIP(a) !== 0) cb(null, a);
+          else lookup.call(state.handle, a, cb);
+        };
+        const uh = newRec({ kind: "udp", udp: s });
+        state.handle.onmessage = (nread: number, _handle: unknown, buf: Buffer, rinfo: { address: string; port: number; family: string }): void => {
+          if (finished || !recs.has(uh)) return;
+          if (nread < 0) {
+            deps.push(ev(uh, NET_EV_UDP_ERROR, nread));
+            return;
+          }
+          deps.push(ev(uh, NET_EV_UDP_MESSAGE, 0, netConcat([netPeerPayload(rinfo.family, rinfo.port, rinfo.address), new Uint8Array(buf)])));
+        };
+        state.handle.onerror = (): void => {};
+        state.bindState = 2;
+        state.receiving = true;
+        const out: { address?: string; port?: number; family?: string } = {};
+        state.handle.getsockname(out);
+        const reply = netPeerPayload(out.family, out.port, out.address);
+        // the reply is (u32 port, u32 family, run): the peer payload's
+        // family and port swapped into place
+        const rv = new DataView(reply.buffer);
+        const fam = rv.getUint32(0, true);
+        rv.setUint32(0, out.port ?? 0, true);
+        rv.setUint32(4, fam, true);
+        new Uint8Array(deps.memory().buffer, ptr, reply.length).set(reply);
+        return uh;
+      }
+      case NET_OP_UDP_CONNECT: {
+        const rec = recs.get(h);
+        if (rec?.kind !== "udp") throw new Error(`netCall: UDP_CONNECT of handle ${h}, not a UDP socket`);
+        const port = dv.getUint32(ptr, true);
+        const { text: address } = netReadRun(buffer, ptr + 8);
+        const state = udpState(rec.udp!);
+        const err = state.handle.connect(address, port);
+        if (err !== 0) return err;
+        state.connectState = 2;
+        const out: { address?: string; port?: number; family?: string } = {};
+        state.handle.getsockname(out);
+        const reply = netPeerPayload(out.family, out.port, out.address);
+        const rv = new DataView(reply.buffer);
+        const fam = rv.getUint32(0, true);
+        rv.setUint32(0, out.port ?? 0, true);
+        rv.setUint32(4, fam, true);
+        new Uint8Array(deps.memory().buffer, ptr, reply.length).set(reply);
+        return 0;
+      }
+      case NET_OP_UDP_SEND: {
+        const rec = recs.get(h);
+        if (rec?.kind !== "udp") throw new Error(`netCall: UDP_SEND to handle ${h}, not a UDP socket`);
+        const port = dv.getUint32(ptr, true);
+        const { text: address, next } = netReadRun(buffer, ptr + 8);
+        const n = dv.getUint32(next, true);
+        const data = Buffer.from(new Uint8Array(buffer, next + 4, n));
+        // Node's doSend drops an error without a callback; so does this host.
+        if (address === "") rec.udp!.send(data);
+        else rec.udp!.send(data, port, address);
+        return 0;
+      }
+      case NET_OP_UDP_RECV_START: {
+        const rec = recs.get(h);
+        if (rec?.kind !== "udp") throw new Error(`netCall: UDP_RECV_START of handle ${h}, not a UDP socket`);
+        return udpState(rec.udp!).handle.recvStart();
+      }
       default:
         throw new Error(`netCall: unknown op ${op}`);
     }
   };
+  // INC-29 U4 (abi.ts tlsCall): the TLS engine is the host Node's own.
+  const tlsReply = (ptr: number, e: unknown): number => {
+    const err = e as { message?: unknown; code?: unknown };
+    const parts = netConcat([netRunBytes(String(err.message ?? "")), netRunBytes(typeof err.code === "string" ? err.code : "")]);
+    new Uint8Array(deps.memory().buffer, ptr, parts.length).set(parts);
+    return -1;
+  };
+  const tlsContext = (c: { roots: boolean; ca: Buffer[]; certs: Buffer[]; keys: Buffer[] }): SecureContext =>
+    createSecureContext({
+      ...(c.roots ? {} : { ca: c.ca }),
+      ...(c.certs.length > 0 ? { cert: c.certs } : {}),
+      ...(c.keys.length > 0 ? { key: c.keys } : {}),
+    });
+  const watchTls = (h: number, ts: TLSSocket): void => {
+    const mine = (): boolean => recs.get(h)?.sock === ts;
+    ts.on("data", (chunk: Buffer) => {
+      if (mine()) queue(h, ev(h, NET_EV_DATA, 0, new Uint8Array(chunk)));
+    });
+    ts.on("end", () => {
+      if (mine()) queue(h, ev(h, NET_EV_EOF, 0));
+    });
+    ts.on("error", (e: NodeJS.ErrnoException) => {
+      const rec = recs.get(h);
+      if (rec === undefined || !mine()) return;
+      if (tlsIsEngineError(e)) {
+        deps.push(ev(h, NET_EV_TLS_ERROR, 0, netConcat([netRunBytes(e.message), netRunBytes(typeof e.code === "string" ? e.code : "")])));
+        return;
+      }
+      if (e.syscall === "write") {
+        if (rec.pendingWrite) {
+          rec.pendingWrite = false;
+          queue(h, ev(h, NET_EV_WRITE_DONE, netErrno(e)));
+        }
+        return;
+      }
+      if (e.syscall === "shutdown") return;
+      queue(h, ev(h, NET_EV_READ_ERROR, netErrno(e)));
+    });
+  };
+  const tlsCall = (op: number, ptr: number, len: number, h: number, _x: number): number => {
+    const buffer = deps.memory().buffer;
+    const dv = new DataView(buffer);
+    const blob = (): Buffer => Buffer.from(new Uint8Array(buffer, ptr + 4, dv.getUint32(ptr, true)));
+    switch (op) {
+      case TLS_OP_CTX_NEW: {
+        const id = nextCtx++;
+        ctxs.set(id, { roots: false, ca: [], certs: [], keys: [] });
+        return id;
+      }
+      case TLS_OP_CTX_ROOTS: {
+        const c = ctxs.get(h);
+        if (c === undefined) throw new Error(`tlsCall: CTX_ROOTS of ${h}, not a context`);
+        c.roots = true;
+        return 0;
+      }
+      case TLS_OP_CTX_ADD_CA:
+      case TLS_OP_CTX_SET_CERT:
+      case TLS_OP_CTX_SET_KEY: {
+        const c = ctxs.get(h);
+        if (c === undefined) throw new Error(`tlsCall: material for ${h}, not a context`);
+        const b = blob();
+        const next = { ...c, ca: [...c.ca], certs: [...c.certs], keys: [...c.keys] };
+        if (op === TLS_OP_CTX_ADD_CA) next.ca.push(b);
+        else if (op === TLS_OP_CTX_SET_CERT) next.certs.push(b);
+        else next.keys.push(b);
+        try {
+          tlsContext(next);
+        } catch (e) {
+          return tlsReply(ptr, e);
+        }
+        ctxs.set(h, next);
+        return 0;
+      }
+      case TLS_OP_SECURE: {
+        const rec = socketOf(h);
+        if (rec === undefined || rec.raw !== undefined) throw new Error(`tlsCall: SECURE of handle ${h}, not an open plain socket`);
+        const c = ctxs.get(dv.getUint32(ptr, true));
+        if (c === undefined) throw new Error("tlsCall: SECURE with an unknown context");
+        const server = dv.getUint32(ptr + 4, true) === 1;
+        const { text: servername } = netReadRun(buffer, ptr + 8);
+        const raw = rec.sock!;
+        const secureContext = tlsContext(c);
+        let ts: TLSSocket;
+        if (server) {
+          ts = new TLSSocket(raw, { isServer: true, secureContext, requestCert: false, rejectUnauthorized: false });
+          ts.on("secure", () => {
+            if (recs.get(h)?.sock === ts) deps.push(ev(h, NET_EV_SECURE, 0, netConcat([netU32(0), netBlobBytes(new Uint8Array(0))])));
+          });
+        } else {
+          ts = tlsConnect({
+            socket: raw,
+            secureContext,
+            ...(servername !== "" ? { servername } : {}),
+            rejectUnauthorized: false,
+            checkServerIdentity: () => undefined,
+          });
+          ts.on("secureConnect", () => {
+            if (recs.get(h)?.sock !== ts) return;
+            const verr = (ts as unknown as { ssl: { verifyError(): Error | null } }).ssl.verifyError();
+            let code = 0;
+            if (verr !== null) {
+              code = TLS_VERIFY_TEXTS.indexOf(verr.message.replace("; if the root CA is installed locally, try running Node.js with --use-system-ca", ""));
+              if (code < 1) throw new Error(`tlsCall: an unknown verification text ${verr.message}`);
+            }
+            const der = ts.getPeerCertificate().raw as Buffer | undefined;
+            deps.push(ev(h, NET_EV_SECURE, 0, netConcat([netU32(code), netBlobBytes(der === undefined ? new Uint8Array(0) : new Uint8Array(der))])));
+          });
+        }
+        rec.raw = raw;
+        rec.sock = ts as unknown as Socket;
+        watchTls(h, ts);
+        // The module reads the plaintext when it reads; the TLSSocket
+        // itself reads now (its handshake).
+        ts.resume();
+        return 0;
+      }
+      case TLS_OP_CA_STORE: {
+        const pems = getCACertificates(_x === 1 ? "system" : "extra");
+        const ders = pems.map((p) => Buffer.from(p.replace(/-----(BEGIN|END) CERTIFICATE-----/g, "").replace(/\s+/g, ""), "base64"));
+        const out = netConcat([netU32(ders.length), ...ders.map((d) => netBlobBytes(new Uint8Array(d)))]);
+        if (out.length > len) return -out.length;
+        new Uint8Array(buffer, ptr, out.length).set(out);
+        return out.length;
+      }
+      default:
+        throw new Error(`tlsCall: unknown op ${op}`);
+    }
+  };
   return {
     netCall,
+    tlsCall,
     // The module read a RESOLVE_DONE: that request is over.
     delivered(e: HostEvent): void {
       if (e.source === 2 && e.kind === NET_EV_RESOLVE_DONE && recs.get(e.handle)?.kind === "resolve") {
@@ -4584,8 +4899,11 @@ function makeNetHost(deps: NetHostDeps): { netCall: (op: number, ptr: number, le
     finish(): void {
       finished = true;
       for (const rec of recs.values()) {
-        if (rec.kind === "socket") rec.sock!.destroy();
-        else if (rec.kind === "server") rec.server!.close();
+        if (rec.kind === "socket") {
+          rec.sock!.destroy();
+          rec.raw?.destroy();
+        } else if (rec.kind === "server") rec.server!.close();
+        else if (rec.kind === "udp") rec.udp!.close();
       }
       recs.clear();
     },
@@ -4593,6 +4911,28 @@ function makeNetHost(deps: NetHostDeps): { netCall: (op: number, ptr: number, le
     // For the unit rows: the host socket behind a handle.
     socketOf: (h: number): Socket | undefined => recs.get(h)?.sock,
   };
+}
+
+/** INC-29 U4: a dgram Socket's internal state (Node v24.18.1's
+ * kStateSymbol): its UDP handle's synchronous bind / connect. */
+interface UdpState {
+  handle: {
+    bind(address: string, port: number, flags: number): number;
+    connect(address: string, port: number): number;
+    getsockname(out: object): number;
+    recvStart(): number;
+    lookup(address: string, cb: (e: Error | null, ip: string) => void): void;
+    onmessage: unknown;
+    onerror: unknown;
+  };
+  bindState: number;
+  connectState: number;
+  receiving: boolean;
+}
+function udpState(s: UdpSocket): UdpState {
+  const sym = Object.getOwnPropertySymbols(s).find((x) => x.description === "state symbol");
+  if (sym === undefined) throw new Error("netCall: a dgram Socket without its state");
+  return (s as unknown as Record<symbol, UdpState>)[sym]!;
 }
 
 async function runWasm(modulePath: string): Promise<RunResult> {
@@ -5692,6 +6032,10 @@ async function runWasm(modulePath: string): Promise<RunResult> {
       // INC-29 U1 (abi.ts netCall): node:net's OS-level operations.
       netCall(op: number, ptr: number, len: number, h: number, x: number): number {
         return netHost.netCall(op, ptr, len, h, x);
+      },
+      // INC-29 U4 (abi.ts tlsCall): the TLS engine (the host Node's own).
+      tlsCall(op: number, ptr: number, len: number, h: number, x: number): number {
+        return netHost.tlsCall(op, ptr, len, h, x);
       },
       // INC-28 U2 (abi.ts evPoll): the oldest queued event, or 0; a short
       // buffer answers -(the length needed) and keeps the event. Reading an
@@ -8169,6 +8513,223 @@ describe("INC-29 U3 WHATWG URL rows", () => {
   test("URL-HTTP-01 the http client's URL argument: ERR_INVALID_PROTOCOL for another scheme (whatever its case), urlToHttpOptions' URIError on malformed credentials before the protocol check, Invalid URL; credentials become the Authorization header after Host, the path is pathname + search with dot segments resolved and the fragment dropped, a host lowercases, request(url) without a callback — SINGLE-EDIT: httpTarget's checks or clientRequestUrl's header order", async () => {
     const r = await runU3("main.ts", "import * as http from \"node:http\";\n\nconst server = http.createServer((req, res) => {\n  res.end(`${req.method} ${req.url} auth=${req.headers.authorization ?? \"-\"} host=${req.headers.host ?? \"-\"}`);\n});\n\nfunction fails(f: () => void): void {\n  try {\n    f();\n    console.log(\"no throw\");\n  } catch (e) {\n    console.log(\"threw\", (e as Error).name, (e as Error).message);\n  }\n}\n\nserver.listen(0, () => {\n  const port = server.address().port;\n  fails(() => http.get(\"ftp://127.0.0.1/x\", () => {}));\n  fails(() => http.get(\"HTTPS://127.0.0.1/x\", () => {}));\n  fails(() => http.get(\"http://%zz@127.0.0.1:1/\", () => {}));\n  fails(() => http.get(\"http://u:%zz@127.0.0.1:1/\", () => {}));\n  fails(() => http.get(\"ftp://%zz@127.0.0.1:1/\", () => {}));\n  fails(() => http.get(\"\", () => {}));\n  http.get(`http://us%20er:p%C3%A9ss@127.0.0.1:${port}/a/../b%20c?x=1#frag`, (res) => {\n    let b = \"\";\n    res.on(\"data\", (c) => { b += c; });\n    res.on(\"end\", () => {\n      console.log(\"one\", res.statusCode, b.split(String(port)).join(\"PORT\"));\n      const req = http.request(`http://LOCALHOST:${port}/two?é`);\n      req.on(\"response\", (res2) => {\n        let b2 = \"\";\n        res2.on(\"data\", (c) => { b2 += c; });\n        res2.on(\"end\", () => {\n          console.log(\"two\", b2.split(String(port)).join(\"PORT\"));\n          http.get(new URL(`http://:pw@127.0.0.1:${port}`), (res3) => {\n            let b3 = \"\";\n            res3.on(\"data\", (c) => { b3 += c; });\n            res3.on(\"end\", () => {\n              console.log(\"three\", b3.split(String(port)).join(\"PORT\"));\n              server.close();\n            });\n          });\n        });\n      });\n      req.end();\n    });\n  });\n});\n");
     expect(r.stdout.toString("utf8")).toBe("threw TypeError Protocol \"ftp:\" not supported. Expected \"http:\"\nthrew TypeError Protocol \"https:\" not supported. Expected \"http:\"\nthrew URIError URI malformed\nthrew URIError URI malformed\nthrew URIError URI malformed\nthrew TypeError Invalid URL\none 200 GET /b%20c?x=1 auth=Basic dXMgZXI6cMOpc3M= host=127.0.0.1:PORT\ntwo GET /two?%C3%A9 auth=- host=localhost:PORT\nthree GET / auth=Basic OnB3 host=127.0.0.1:PORT\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+});
+
+/* ── INC-29 U4 — node:tls, node:https and node:dgram (tls.ts, tls-x509.ts,
+ * dgram.ts; abi.ts tlsCall and netCall's UDP ops). The TLS engine is the
+ * harness host's own Node (a TLSSocket over the host's net socket); the
+ * module does everything Node does around it. Every expected text below is
+ * Node v24.18.1's own output for the same program, measured. ── */
+
+describe("INC-29 U4 node:tls, node:https and node:dgram rows", () => {
+  async function runU4(file: string, src: string | null): Promise<RunResult> {
+    const dir = mkdtempSync(join(tmpdir(), "u4-row-"));
+    try {
+      let path = file;
+      if (src !== null) {
+        path = join(dir, file);
+        writeFileSync(path, src);
+      }
+      const res = await compile(path, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: wantsDynamic(path), backend: "wasm" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+      return await runWasm(res.binaryPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  const corpusRows: [string, string | null, string][] = [
+    ["2330-tls-server-runtime-options.cjs", "tls record ok true\ntls arrays ok true\nhttps record ok true\n", "tls/https createServer over a runtime options record: cert/key as Buffers, strings and one-element arrays, inert ca / requestCert: false / rejectUnauthorized, listen and close"],
+    ["2331-tls-server-options-typed.ts", "constructed true\nbuffers true\n", "the typed tls.createServer options literal: strings and Buffers, inert members"],
+    ["2557-tls-ca-store.ts", "bundled-nonempty true\nbundled-pem true\ncached true\nroots true true\ndefault-cached true\nsystem-cached true\nextra-cached true\nreplaced 1 true\nbundled-untouched true\ndedup 1\nemptied 0\nrestored true\nbad-type The argument 'type' is invalid. Received 'bogus'\nbad-set No valid certificates found in the provided array\nintact true\n", "the CA store: Node's bundled roots, the per-type caches, setDefaultCACertificates' parse, dedupe and errors"],
+    ["2597-dgram-send-ladders.cjs", "TypeError|ERR_INVALID_ARG_TYPE|The \"options.signal\" property must be an instance of AbortSignal. Received an instance of Object\nTypeError|ERR_INVALID_ARG_TYPE|The \"buffer\" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received undefined\nRangeError|ERR_SOCKET_BAD_PORT|Port should be > 0 and < 65536. Received type number (-1).\nRangeError|ERR_SOCKET_BAD_PORT|Port should be > 0 and < 65536. Received type number (0).\nRangeError|ERR_SOCKET_BAD_PORT|Port should be > 0 and < 65536. Received type number (65536).\nTypeError|ERR_INVALID_ARG_TYPE|The \"buffer\" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received type number (23)\nTypeError|ERR_INVALID_ARG_TYPE|The \"buffer list arguments\" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received an instance of Array\nTypeError|ERR_INVALID_ARG_TYPE|The \"address\" argument must be of type string. Received type number (0)\nRangeError|ERR_BUFFER_OUT_OF_BOUNDS|\"offset\" is outside of buffer bounds\nRangeError|ERR_BUFFER_OUT_OF_BOUNDS|\"length\" is outside of buffer bounds\nRangeError|ERR_BUFFER_OUT_OF_BOUNDS|\"length\" is outside of buffer bounds\nRangeError|ERR_BUFFER_OUT_OF_BOUNDS|\"offset\" is outside of buffer bounds\nRangeError|ERR_BUFFER_OUT_OF_BOUNDS|\"length\" is outside of buffer bounds\nRangeError|ERR_BUFFER_OUT_OF_BOUNDS|\"length\" is outside of buffer bounds\nError|ERR_SOCKET_DGRAM_IS_CONNECTED|Already connected\nError|ERR_SOCKET_DGRAM_IS_CONNECTED|Already connected\nRangeError|ERR_BUFFER_OUT_OF_BOUNDS|\"offset\" is outside of buffer bounds\nRangeError|ERR_BUFFER_OUT_OF_BOUNDS|\"length\" is outside of buffer bounds\nTypeError|ERR_INVALID_ARG_TYPE|The \"buffer\" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received type number (23)\n", "dgram send's signature shuffle and validation ladder, unconnected and connected, the implicit bind and connect"],
+    ["2598-tls-arg-ladders.cjs", null, "createSecureContext / createServer / connect / getCACertificates option ladders"],
+    ["2645-https-client-url-argument.ts", "status 200\nbody secure /one\nscheme Protocol \"http:\" not supported. Expected \"https:\"\nparse Invalid URL\nrequest secure /two\n", "an https server and https.get / https.request with a URL string, verified against setDefaultCACertificates' CA, keep-alive reuse"],
+    ["2672-http-request-response-callback.ts", "http refused\nhttps refused\n", "https.request to a released port: the transport's error before any handshake"],
+  ];
+  for (const [name, stdout, what] of corpusRows) {
+    test(`U4-C-${name.slice(0, 4)} corpus ${name} (${what}): full stdout, stderr and exit code equal Node's`, async () => {
+      const r = await runU4(join(corpusDir, name), null);
+      if (stdout === null) {
+        expect(r.stdout.toString("utf8")).toBe((await runNode(join(corpusDir, name))).stdout.toString("utf8"));
+      } else {
+        expect(r.stdout.toString("utf8")).toBe(stdout);
+      }
+      expect(r.stderr.toString("utf8")).toBe("");
+      expect(r.exitCode).toBe(0);
+    }, 60000);
+  }
+
+  test("U4-VERIFY-01 certificate verdicts through https: a self-signed leaf (DEPTH_ZERO_SELF_SIGNED_CERT), the default trust and a wrong CA (UNABLE_TO_VERIFY_LEAF_SIGNATURE, Node's --use-system-ca suggestion appended), the right CA, an IP in the SAN, another name and an IP not in the SAN (ERR_TLS_CERT_ALTNAME_INVALID with Node's altnames text), rejectUnauthorized: false over both kinds of failure \u2014 SINGLE-EDIT: the verification code's table or checkServerIdentity's reason", async () => {
+    const r = await runU4("main.ts", "// Certificate verification outcomes through https.get: a self-signed\n// leaf, a leaf no trusted CA signed (the default trust), the right CA,\n// a wrong CA, a certificate for another name, an IP literal in the SAN\n// and one not in it; then rejectUnauthorized: false.\nimport * as fs from \"node:fs\";\nimport * as https from \"node:https\";\n\nconst dir = \"tests/fixtures/server/certs/\";\nconst ca = fs.readFileSync(dir + \"ca.pem\", \"utf8\");\nconst ca2 = fs.readFileSync(dir + \"ca2.pem\", \"utf8\");\n\nfunction serve(name: string, next: (port: number, done: () => void) => void): void {\n  const server = https.createServer({\n    key: fs.readFileSync(dir + name + \"-key.pem\"),\n    cert: fs.readFileSync(dir + name + \".pem\"),\n  }, (req, res) => {\n    res.end(\"ok \" + req.url);\n  });\n  server.listen(0, () => {\n    next(server.address().port, () => server.close());\n  });\n}\n\nfunction probe(label: string, host: string, port: number, caPem: string, reject: boolean, done: () => void): void {\n  const req = https.request({ hostname: host, port, path: \"/\" + label, method: \"GET\", ca: caPem, rejectUnauthorized: reject }, (res) => {\n    let body = \"\";\n    res.on(\"data\", (c) => { body += c; });\n    res.on(\"end\", () => {\n      console.log(label, \"status\", res.statusCode, body);\n      done();\n    });\n  });\n  req.on(\"error\", (e) => {\n    console.log(label, \"error\", (e as Error).name, (e as NodeJS.ErrnoException).code, (e as Error).message);\n    done();\n  });\n  req.end();\n}\n\nserve(\"selfsigned\", (port, close) => {\n  probe(\"selfsigned\", \"localhost\", port, \"\", true, () => {\n    probe(\"selfsigned-noreject\", \"localhost\", port, \"\", false, () => {\n      close();\n      serve(\"localhost\", (port2, close2) => {\n        probe(\"default-trust\", \"localhost\", port2, \"\", true, () => {\n          probe(\"right-ca\", \"localhost\", port2, ca, true, () => {\n            probe(\"wrong-ca\", \"localhost\", port2, ca2, true, () => {\n              probe(\"ip-in-san\", \"127.0.0.1\", port2, ca, true, () => {\n                close2();\n                serve(\"alt\", (port3, close3) => {\n                  probe(\"other-name\", \"localhost\", port3, ca, true, () => {\n                    probe(\"ip-not-in-san\", \"127.0.0.1\", port3, ca, true, () => {\n                      probe(\"other-name-noreject\", \"localhost\", port3, ca, false, () => {\n                        close3();\n                      });\n                    });\n                  });\n                });\n              });\n            });\n          });\n        });\n      });\n    });\n  });\n});\n");
+    expect(r.stdout.toString("utf8")).toBe("selfsigned error Error DEPTH_ZERO_SELF_SIGNED_CERT self-signed certificate; if the root CA is installed locally, try running Node.js with --use-system-ca\nselfsigned-noreject status 200 ok /selfsigned-noreject\ndefault-trust error Error UNABLE_TO_VERIFY_LEAF_SIGNATURE unable to verify the first certificate; if the root CA is installed locally, try running Node.js with --use-system-ca\nright-ca status 200 ok /right-ca\nwrong-ca error Error UNABLE_TO_VERIFY_LEAF_SIGNATURE unable to verify the first certificate; if the root CA is installed locally, try running Node.js with --use-system-ca\nip-in-san status 200 ok /ip-in-san\nother-name error Error ERR_TLS_CERT_ALTNAME_INVALID Hostname/IP does not match certificate's altnames: Host: localhost. is not in the cert's altnames: DNS:alt.localhost\nip-not-in-san error Error ERR_TLS_CERT_ALTNAME_INVALID Hostname/IP does not match certificate's altnames: IP: 127.0.0.1 is not in the cert's list: \nother-name-noreject status 200 ok /other-name-noreject\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U4-TLS-01 tls.connect against tls.createServer: authorized with the ca option (authorizationError null), the server's secureConnection and data both ways, rejectUnauthorized: false connecting unauthorized with the code as authorizationError, and the rejected connect's 'error' then 'close' \u2014 SINGLE-EDIT: onConnectSecure emitting 'secureConnect' before the reject check", async () => {
+    const r = await runU4("main.ts", "// tls.connect against tls.createServer: the trusted case (authorized,\n// no authorizationError, the server's secureConnection then data both\n// ways), an untrusted certificate with rejectUnauthorized: false (the\n// socket connects unauthorized, authorizationError names the code), and\n// the rejected case (the 'error' and 'close').\nimport * as fs from \"node:fs\";\nimport * as tls from \"node:tls\";\n\nconst dir = \"tests/fixtures/server/certs/\";\nconst ca = fs.readFileSync(dir + \"ca.pem\", \"utf8\");\nlet connections = 0;\nconst server = tls.createServer({\n  key: fs.readFileSync(dir + \"localhost-key.pem\"),\n  cert: fs.readFileSync(dir + \"localhost.pem\"),\n}, (socket) => {\n  // A client that rejects the certificate never completes the server's\n  // handshake under Node; here it does (SEMANTICS.md S090 (h)): only the\n  // first two connections are reported.\n  connections++;\n  if (connections > 2) return;\n  console.log(\"server secureConnection\");\n  socket.on(\"data\", (d) => {\n    console.log(\"server got\", d.toString());\n    socket.end(\"pong\");\n  });\n});\n\nserver.listen(0, () => {\n  const port = server.address().port;\n  const a = tls.connect(port, \"localhost\", { ca }, () => {\n    console.log(\"a secureConnect\", a.authorized, a.authorizationError);\n    a.write(\"ping\");\n  });\n  a.on(\"data\", (d) => console.log(\"a got\", d.toString()));\n  a.on(\"end\", () => console.log(\"a end\"));\n  a.on(\"close\", () => {\n    console.log(\"a close\");\n    const b = tls.connect(port, \"localhost\", { rejectUnauthorized: false }, () => {\n      console.log(\"b secureConnect\", b.authorized, b.authorizationError);\n      b.end();\n    });\n    b.on(\"close\", () => {\n      console.log(\"b close\");\n      const c = tls.connect(port, \"127.0.0.1\", {});\n      c.on(\"secureConnect\", () => console.log(\"c secureConnect (never)\"));\n      c.on(\"error\", (e) => console.log(\"c error\", (e as NodeJS.ErrnoException).code, e.message));\n      c.on(\"close\", () => {\n        console.log(\"c close\");\n        server.close(() => console.log(\"server closed\"));\n      });\n    });\n  });\n});\n");
+    expect(r.stdout.toString("utf8")).toBe("a secureConnect true null\nserver secureConnection\nserver got ping\na got pong\na end\na close\nb secureConnect false UNABLE_TO_VERIFY_LEAF_SIGNATURE\nserver secureConnection\nb close\nc error UNABLE_TO_VERIFY_LEAF_SIGNATURE unable to verify the first certificate; if the root CA is installed locally, try running Node.js with --use-system-ca\nc close\nserver closed\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U4-TLS-02 TLS failures that are not certificate verdicts: plain text where a ServerHello belongs (the engine's ERR_SSL_WRONG_VERSION_NUMBER, its text the host's), a peer that closes first (onConnectEnd's ECONNRESET text), a refused port, and createServer's material errors (a key that is not PEM, a key that does not match) with the engine's texts \u2014 SINGLE-EDIT: the TLS_ERROR event mapped to a transport errno", async () => {
+    const r = await runU4("main.cjs", "'use strict';\n// TLS failures that are not certificate verdicts: a peer that answers the\n// ClientHello with plain text (the engine's protocol error), a peer that\n// closes before the handshake (onConnectEnd's ECONNRESET), a port nothing\n// listens on (the transport's ECONNREFUSED); then a server whose key is\n// not PEM (the engine's material error, thrown by createServer).\nconst net = require('net');\nconst tls = require('tls');\nconst fs = require('fs');\nconst show = (label) => (e) => console.log(label, e.name, e.code, e.message);\nconst wrongVersion = (label) => (e) => console.log(label, e.name, e.code, /wrong version number/.test(e.message));\nconst codeOnly = (label) => (e) => console.log(label, e.name, e.code);\nconst plain = net.createServer((s) => {\n  s.on('data', () => s.end('HTTP/1.1 400 Bad Request\\r\\n\\r\\n'));\n});\nplain.listen(0, '127.0.0.1', () => {\n  const port = plain.address().port;\n  const a = tls.connect(port, '127.0.0.1', { rejectUnauthorized: false });\n  a.on('error', wrongVersion('garbage'));\n  a.on('close', () => {\n    const closer = net.createServer((s) => s.destroy());\n    closer.listen(0, '127.0.0.1', () => {\n      const b = tls.connect(closer.address().port, '127.0.0.1', { rejectUnauthorized: false });\n      b.on('error', show('closed'));\n      b.on('close', () => {\n        closer.close();\n        plain.close(() => {\n          const c = tls.connect(port, '127.0.0.1', {});\n          c.on('error', codeOnly('refused'));\n          c.on('close', () => {\n            try {\n              tls.createServer({ key: 'not a key', cert: fs.readFileSync('tests/fixtures/server/certs/localhost.pem') });\n              console.log('no throw');\n            } catch (e) {\n              show('badkey')(e);\n            }\n            try {\n              tls.createServer({ key: fs.readFileSync('tests/fixtures/server/certs/alt-key.pem'), cert: fs.readFileSync('tests/fixtures/server/certs/localhost.pem') });\n              console.log('no throw');\n            } catch (e) {\n              show('mismatch')(e);\n            }\n          });\n        });\n      });\n    });\n  });\n});\n");
+    expect(r.stdout.toString("utf8")).toBe("garbage Error ERR_SSL_WRONG_VERSION_NUMBER true\nclosed Error ECONNRESET Client network socket disconnected before secure TLS connection was established\nrefused Error ECONNREFUSED\nbadkey Error ERR_OSSL_UNSUPPORTED error:1E08010C:DECODER routines::unsupported\nmismatch Error ERR_OSSL_X509_KEY_VALUES_MISMATCH error:05800074:x509 certificate routines::key values mismatch\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U4-DGRAM-01 a UDP round trip: bind's 'listening' event and callback, address(), ERR_SOCKET_ALREADY_BOUND, a send before the client is bound (the implicit bind and its queue), the server's 'message' with its rinfo, the reply, a connected send ignoring its port and address, close(cb) then ERR_SOCKET_DGRAM_NOT_RUNNING \u2014 SINGLE-EDIT: the queued send dropped instead of run at 'listening'", async () => {
+    const r = await runU4("main.ts", "// A UDP round trip: a server bound to an ephemeral loopback port, a\n// client that sends before it is bound (the implicit bind and its queue),\n// the server's 'message' with its rinfo, the reply to rinfo.port, a\n// connected send, and both closes; plus bind's 'listening' callback,\n// address(), and the already-bound / not-running errors.\nimport * as dgram from \"node:dgram\";\n\nconst server = dgram.createSocket(\"udp4\");\nconst client = dgram.createSocket(\"udp4\");\nlet replies = 0;\nserver.on(\"message\", (msg, rinfo) => {\n  console.log(\"server got\", msg.toString(), rinfo.family, rinfo.size, rinfo.address, rinfo.port > 0);\n  server.send(\"re:\" + msg.toString(), rinfo.port, rinfo.address);\n});\nserver.on(\"listening\", () => console.log(\"server listening event\"));\nserver.on(\"close\", () => console.log(\"server close\"));\nclient.on(\"message\", (msg, rinfo) => {\n  console.log(\"client got\", msg.toString(), rinfo.size);\n  replies++;\n  if (replies === 1) {\n    client.connect(server.address().port, \"127.0.0.1\", () => {\n      console.log(\"client connected\");\n      client.send(\"two\", server.address().port, \"ignored-when-connected\");\n    });\n  } else {\n    client.close(() => {\n      console.log(\"client closed\");\n      try {\n        client.close();\n      } catch (e) {\n        console.log(\"close again\", (e as NodeJS.ErrnoException).code, (e as Error).message);\n      }\n      server.close();\n    });\n  }\n});\nserver.bind(0, \"127.0.0.1\", () => {\n  const a = server.address();\n  console.log(\"server bound\", a.address, a.family, a.port > 0);\n  try {\n    server.bind(0, \"127.0.0.1\");\n  } catch (e) {\n    console.log(\"bind again\", (e as NodeJS.ErrnoException).code, (e as Error).message);\n  }\n  client.send(\"one\", a.port, \"127.0.0.1\");\n});\n");
+    expect(r.stdout.toString("utf8")).toBe("server listening event\nserver bound 127.0.0.1 IPv4 true\nbind again ERR_SOCKET_ALREADY_BOUND Socket is already bound\nserver got one IPv4 3 127.0.0.1 true\nclient got re:one 6\nclient connected\nserver got two IPv4 3 127.0.0.1 true\nclient got re:two 6\nclient closed\nclose again ERR_SOCKET_DGRAM_NOT_RUNNING Not running\nserver close\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U4-REG-01 S090 (h): a client that rejects the server's certificate has already sent its handshake Finished, so the server's handshake completes and its 'secureConnection' runs before the client closes — Node: count 0 (the rejecting client closes before its Finished leaves) — SINGLE-EDIT: the client's verdict deferred past 'secureConnect'", async () => {
+    const r = await runU4("main.ts", "// A client that rejects the server's certificate (the default trust does\n// not know the suite's CA): the 'error', and whether the server's\n// handshake completed \u2014 its 'secureConnection' count when it closes.\nimport * as fs from \"node:fs\";\nimport * as tls from \"node:tls\";\n\nconst dir = \"tests/fixtures/server/certs/\";\nlet connections = 0;\nconst server = tls.createServer({\n  key: fs.readFileSync(dir + \"localhost-key.pem\"),\n  cert: fs.readFileSync(dir + \"localhost.pem\"),\n}, () => {\n  connections++;\n});\nserver.listen(0, () => {\n  const c = tls.connect(server.address().port, \"localhost\", {});\n  c.on(\"error\", (e) => console.log(\"client error\", (e as NodeJS.ErrnoException).code));\n  c.on(\"close\", () => {\n    server.close(() => console.log(\"server closed, secureConnection count\", connections));\n  });\n});\n");
+    expect(r.stdout.toString("utf8")).toBe("client error UNABLE_TO_VERIFY_LEAF_SIGNATURE\nserver closed, secureConnection count 1\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U4-HOST-01 a host that declines tsinter.tlsCall (no TLS engine: SEMANTICS.md S004) fails to instantiate a module that opens a TLS connection with a LinkError naming the import; a module that only reads the bundled store (rootCertificates, getCACertificates('bundled' / 'default'), setDefaultCACertificates) or has no node:tls does not import it and runs on that host \u2014 SINGLE-EDIT: tlsCall minted only for keys that need the host", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "u4-host-"));
+    try {
+      const tlsSrc = join(dir, "t.ts");
+      writeFileSync(tlsSrc, "import * as tls from \"node:tls\";\nconst c = tls.connect(1, \"127.0.0.1\");\nc.on(\"error\", () => {});\n");
+      const storeSrc = join(dir, "s.ts");
+      writeFileSync(storeSrc, "import * as tls from \"node:tls\";\nconsole.log(tls.rootCertificates.length, tls.getCACertificates(\"bundled\").length, tls.getCACertificates(\"default\").length);\ntls.setDefaultCACertificates([tls.rootCertificates[0]!]);\nconsole.log(tls.getCACertificates(\"default\").length);\n");
+      const storeRes = await compile(storeSrc, { outPath: join(dir, "s.wasm"), outDir: dir, dynamic: false, backend: "wasm" });
+      if (!storeRes.ok) throw new Error("refused");
+      const store = await WebAssembly.compile(readFileSync(storeRes.binaryPath));
+      expect(WebAssembly.Module.imports(store).map((i) => i.name)).not.toContain("tlsCall");
+      const sr = await runWasm(storeRes.binaryPath);
+      // Node's answer without NODE_USE_SYSTEM_CA / --use-system-ca (S090 (d))
+      expect(sr.stdout.toString("utf8")).toBe("120 120 120\n1\n");
+      const plainSrc = join(dir, "p.ts");
+      writeFileSync(plainSrc, "import * as net from \"node:net\";\nconst s = net.createServer();\ns.listen(0, () => s.close());\n");
+      const tlsRes = await compile(tlsSrc, { outPath: join(dir, "t.wasm"), outDir: dir, dynamic: false, backend: "wasm" });
+      const plainRes = await compile(plainSrc, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: false, backend: "wasm" });
+      if (!tlsRes.ok || !plainRes.ok) throw new Error("refused");
+      const mod = await WebAssembly.compile(readFileSync(tlsRes.binaryPath));
+      const names = WebAssembly.Module.imports(mod).map((i) => `${i.module}.${i.name}`);
+      expect(names).toContain("tsinter.tlsCall");
+      const imports: Record<string, Record<string, unknown>> = { tsinter: {} };
+      for (const i of WebAssembly.Module.imports(mod)) {
+        if (i.name !== "tlsCall") imports[i.module]![i.name] = () => 0;
+      }
+      await expect(WebAssembly.instantiate(mod, imports as WebAssembly.Imports)).rejects.toThrow(/LinkError|tlsCall/);
+      await expect(WebAssembly.instantiate(mod, imports as WebAssembly.Imports)).rejects.toBeInstanceOf(WebAssembly.LinkError);
+      const plain = await WebAssembly.compile(readFileSync(plainRes.binaryPath));
+      expect(WebAssembly.Module.imports(plain).map((i) => i.name)).not.toContain("tlsCall");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+});
+
+/* ── INC-29 U4 review rows: one per divergence the unit's independent
+ * review reproduced, each the review's own probe; every expected text is
+ * Node v24.18.1's output for the same program, measured. Certificates the
+ * fixtures do not hold are written next to the program (@CERTS@). ── */
+
+describe("INC-29 U4 review rows", () => {
+  async function runR(src: string, files: Record<string, string>, ext: string): Promise<RunResult> {
+    const dir = mkdtempSync(join(tmpdir(), "u4-rev-"));
+    try {
+      for (const [n, body] of Object.entries(files)) writeFileSync(join(dir, n), body);
+      const path = join(dir, `main.${ext}`);
+      writeFileSync(path, src.replaceAll("@CERTS@", dir + "/"));
+      const res = await compile(path, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: wantsDynamic(path), backend: "wasm" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+      return await runWasm(res.binaryPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  test("U4-R-01 finding 1: a client that rejects the server's certificate sends nothing it wrote before its verdict \u2014 the server logs no data (writes are held in the module until it accepts the handshake)", async () => {
+    const r = await runR("import * as fs from \"node:fs\";\nimport * as tls from \"node:tls\";\nconst dir = \"tests/fixtures/server/certs/\";\nconst server = tls.createServer({ key: fs.readFileSync(dir + \"localhost-key.pem\"), cert: fs.readFileSync(dir + \"localhost.pem\") }, (s) => {\n  s.on(\"data\", (d) => console.log(\"TLS SERVER RECEIVED:\", d.toString()));\n});\nserver.listen(0, \"127.0.0.1\", () => {\n  const c = tls.connect(server.address().port, \"localhost\", {});\n  c.write(\"password=hunter2\");\n  c.on(\"error\", (e) => console.log(\"client error\", (e as NodeJS.ErrnoException).code));\n  c.on(\"close\", () => { console.log(\"client close\"); server.close(() => console.log(\"server closed\")); });\n});\n", {}, "ts");
+    expect(r.stdout.toString("utf8")).toBe("client error UNABLE_TO_VERIFY_LEAF_SIGNATURE\nclient close\nserver closed\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U4-R-02 finding 1: an https request (method, path, Authorization header, body) to a server the client rejects never reaches it \u2014 the server logs no request (S090 (h))", async () => {
+    const r = await runR("import * as fs from \"node:fs\";\nimport * as https from \"node:https\";\nconst dir = \"tests/fixtures/server/certs/\";\nconst hs = https.createServer({ key: fs.readFileSync(dir + \"localhost-key.pem\"), cert: fs.readFileSync(dir + \"localhost.pem\") }, (req, res) => {\n  console.log(\"HTTPS SERVER RECEIVED:\", req.method, req.url, req.headers.authorization);\n  res.end();\n});\nhs.listen(0, () => {\n  const req = https.request({ hostname: \"localhost\", port: hs.address().port, path: \"/login\", method: \"POST\", headers: { authorization: \"Bearer SECRET\" } }, (res) => { res.resume(); });\n  req.on(\"error\", (e) => { console.log(\"https client error\", (e as NodeJS.ErrnoException).code); setTimeout(() => hs.close(), 100); });\n  req.write(\"body-secret\");\n  req.end();\n});\n", {}, "ts");
+    expect(r.stdout.toString("utf8")).toBe("https client error UNABLE_TO_VERIFY_LEAF_SIGNATURE\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U4-R-03 finding 2: an IPv6 literal host is not a domain to Node's domainToASCII, so checkServerIdentity takes the DNS path and fails with Node's altnames text", async () => {
+    const r = await runR("import * as fs from \"node:fs\";\nimport * as tls from \"node:tls\";\nconst dir = \"tests/fixtures/server/certs/\";\nconst ca = fs.readFileSync(dir + \"ca.pem\", \"utf8\");\nconst server = tls.createServer({ key: fs.readFileSync(dir + \"localhost-key.pem\"), cert: fs.readFileSync(dir + \"localhost.pem\") }, (s) => { s.end(); });\nserver.listen(0, \"::1\", () => {\n  const port = server.address().port;\n  const c = tls.connect({ host: \"::1\", port, ca }, () => {\n    console.log(\"secureConnect\", c.authorized, c.authorizationError);\n    c.end();\n  });\n  c.on(\"error\", (e) => console.log(\"error\", (e as NodeJS.ErrnoException).code, e.message));\n  c.on(\"close\", () => server.close(() => console.log(\"closed\")));\n});\n", {}, "ts");
+    expect(r.stdout.toString("utf8")).toBe("error ERR_TLS_CERT_ALTNAME_INVALID Hostname/IP does not match certificate's altnames: Host: ::1. is not in the cert's altnames: DNS:localhost, IP Address:127.0.0.1, IP Address:0:0:0:0:0:0:0:1\nclosed\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U4-R-04 finding 3: tls.createServer over an options record held in a variable (Buffers)", async () => {
+    const r = await runR("import * as fs from \"node:fs\";\nimport * as tls from \"node:tls\";\nconst dir = \"tests/fixtures/server/certs/\";\nconst opts = { key: fs.readFileSync(dir + \"localhost-key.pem\"), cert: fs.readFileSync(dir + \"localhost.pem\") };\nconst server = tls.createServer(opts, (s) => { s.end(); });\nconsole.log(\"created\");\nserver.listen(0, \"127.0.0.1\", () => {\n  console.log(\"listening\");\n  server.close();\n});\n", {}, "ts");
+    expect(r.stdout.toString("utf8")).toBe("created\nlistening\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U4-R-05 finding 3: tls.createServer over an options record held in a variable (strings)", async () => {
+    const r = await runR("import * as fs from \"node:fs\";\nimport * as tls from \"node:tls\";\nconst dir = \"tests/fixtures/server/certs/\";\nconst opts = { key: fs.readFileSync(dir + \"localhost-key.pem\", \"utf8\"), cert: fs.readFileSync(dir + \"localhost.pem\", \"utf8\") };\nconst server = tls.createServer(opts, (s) => { s.end(); });\nconsole.log(\"created\");\nserver.listen(0, \"127.0.0.1\", () => {\n  console.log(\"listening\");\n  server.close();\n});\n", {}, "ts");
+    expect(r.stdout.toString("utf8")).toBe("created\nlistening\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U4-R-06 finding 3: https.createServer and tls.connect over options records held in variables", async () => {
+    const r = await runR("import * as fs from \"node:fs\";\nimport * as tls from \"node:tls\";\nimport * as https from \"node:https\";\nconst dir = \"tests/fixtures/server/certs/\";\nconst ca = fs.readFileSync(dir + \"ca.pem\", \"utf8\");\nconst hopts = { key: fs.readFileSync(dir + \"localhost-key.pem\"), cert: fs.readFileSync(dir + \"localhost.pem\") };\nconst hs = https.createServer(hopts, (req, res) => { res.end(\"hi\"); });\nconsole.log(\"https created\");\nhs.listen(0, () => {\n  const copts = { ca: ca, servername: \"localhost\" };\n  const c = tls.connect(hs.address().port, \"127.0.0.1\", copts, () => { console.log(\"connected\", c.authorized); c.end(); });\n  c.on(\"close\", () => hs.close());\n});\n", {}, "ts");
+    expect(r.stdout.toString("utf8")).toBe("https created\nconnected true\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U4-R-07 finding 4: a runtime-empty https ca is no ca (the default store), as Node's falsy test", async () => {
+    const r = await runR("import * as fs from \"node:fs\";\nimport * as https from \"node:https\";\nimport * as tls from \"node:tls\";\nconst dir = \"tests/fixtures/server/certs/\";\nconst ca = fs.readFileSync(dir + \"ca.pem\", \"utf8\");\ntls.setDefaultCACertificates([ca]);\nconst server = https.createServer({ key: fs.readFileSync(dir + \"localhost-key.pem\"), cert: fs.readFileSync(dir + \"localhost.pem\") }, (req, res) => res.end(\"ok\"));\nfunction probe(label: string, caPem: string, port: number, done: () => void): void {\n  const req = https.request({ hostname: \"localhost\", port, path: \"/\", method: \"GET\", ca: caPem, rejectUnauthorized: true }, (res) => {\n    res.resume();\n    res.on(\"end\", () => { console.log(label, \"status\", res.statusCode); done(); });\n  });\n  req.on(\"error\", (e) => { console.log(label, \"error\", (e as NodeJS.ErrnoException).code); done(); });\n  req.end();\n}\nconst empty = process.argv.length > 100 ? \"x\" : \"\";\nserver.listen(0, () => {\n  const port = server.address().port;\n  probe(\"runtime-empty-ca\", empty, port, () => {\n    probe(\"explicit-ca\", ca, port, () => server.close());\n  });\n});\n", {}, "ts");
+    expect(r.stdout.toString("utf8")).toBe("runtime-empty-ca status 200\nexplicit-ca status 200\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U4-R-08 finding 5: a datagram sent before connect() on the same socket is delivered (sends leave in call order)", async () => {
+    const r = await runR("import * as dgram from \"node:dgram\";\nconst srv = dgram.createSocket(\"udp4\");\nlet got = 0;\nsrv.on(\"message\", (m) => {\n  console.log(\"srv got\", m.toString());\n  if (++got === 2) { srv.close(); b.close(); }\n});\nconst b = dgram.createSocket(\"udp4\");\nsrv.bind(0, \"127.0.0.1\", () => {\n  const port = srv.address().port;\n  b.bind(0, \"127.0.0.1\", () => {\n    b.send(\"before-connect\", port, \"127.0.0.1\");\n    b.connect(port, \"127.0.0.1\", () => {\n      console.log(\"connected\");\n      b.send(\"after-connect\", port, \"127.0.0.1\");\n    });\n  });\n});\nsetTimeout(() => { if (got < 2) { console.log(\"timeout, got\", got); srv.close(); b.close(); } }, 500);\n", {}, "ts");
+    expect(r.stdout.toString("utf8")).toBe("connected\nsrv got before-connect\nsrv got after-connect\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U4-R-09 finding 5: datagrams from two sockets arrive in Node's order, at Node's nextTick depths", async () => {
+    const r = await runR("'use strict';\nconst dgram = require('dgram');\nlet depth = 0;\nfunction chain(n) { if (n > 0) process.nextTick(() => { depth++; chain(n - 1); }); }\nconst log = (s) => console.log(s, 'tick', depth);\nconst srv = dgram.createSocket('udp4');\nsrv.on('message', (m) => { log('msg ' + m.toString()); });\nsrv.bind(0, '127.0.0.1', () => {\n  log('srv bound');\n  const port = srv.address().port;\n  depth = 0; chain(30);\n  const a = dgram.createSocket('udp4');\n  a.on('listening', () => log('a listening'));\n  a.send('a1', port, '127.0.0.1');\n  const b = dgram.createSocket('udp4');\n  b.on('listening', () => log('b listening'));\n  b.on('connect', () => log('b connect'));\n  b.bind(0, '127.0.0.1', () => {\n    log('b bind cb');\n    b.send('b-unconn', port, '127.0.0.1');\n    b.connect(port, '127.0.0.1', () => { log('b connect cb'); b.send('b-conn'); });\n  });\n  setTimeout(() => {\n    depth = 0; chain(30);\n    log('close start');\n    a.on('close', () => log('a close'));\n    a.close(() => log('a close cb'));\n    b.close();\n    srv.close();\n  }, 50);\n});\n", {}, "cjs");
+    expect(r.stdout.toString("utf8")).toBe("srv bound tick 0\na listening tick 1\nb listening tick 1\nb bind cb tick 1\nb connect tick 3\nb connect cb tick 3\nmsg a1 tick 30\nmsg b-unconn tick 30\nmsg b-conn tick 30\nclose start tick 0\na close tick 1\na close cb tick 1\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U4-R-10 finding 6: verification codes over a leaf + intermediate chain; Node's --use-system-ca suggestion only for 18 and 21 (not 2, 20)", async () => {
+    const r = await runR("import * as fs from \"node:fs\";\nimport * as tls from \"node:tls\";\nconst cdir = \"@CERTS@\";\nconst ca = fs.readFileSync(\"tests/fixtures/server/certs/ca.pem\", \"utf8\");\nconst ca2 = fs.readFileSync(\"tests/fixtures/server/certs/ca2.pem\", \"utf8\");\nconst inter = fs.readFileSync(cdir + \"inter.pem\", \"utf8\");\nconst cases: [string, string, string, boolean][] = [\n  [\"chain-trust-root\", \"chainfull\", ca, true],\n  [\"chain-wrong-ca\", \"chainfull\", ca2, true],\n  [\"chain-trust-inter-only\", \"chainfull\", inter, true],\n  [\"leaf-only-trust-root\", \"leafi\", ca, true],\n  [\"expired\", \"expired\", ca, true],\n  [\"future\", \"future\", ca, true],\n  [\"expired-noreject\", \"expired\", ca, false],\n  [\"altname-noreject\", \"wild\", ca, false],\n];\nlet i = 0;\nfunction next(): void {\n  if (i >= cases.length) return;\n  const [label, cert, trust, reject] = cases[i++];\n  const server = tls.createServer({ key: fs.readFileSync(cdir + \"k.pem\"), cert: fs.readFileSync(cdir + cert + \".pem\") }, (s) => { s.end(); });\n  server.listen(0, \"127.0.0.1\", () => {\n    const c = tls.connect({ host: \"127.0.0.1\", port: server.address().port, servername: \"localhost\", ca: trust, rejectUnauthorized: reject }, () => {\n      console.log(label, \"OK\", c.authorized, c.authorizationError);\n      c.end();\n    });\n    c.on(\"error\", (e) => console.log(label, \"ERR\", (e as NodeJS.ErrnoException).code, e.message));\n    c.on(\"close\", () => server.close(() => next()));\n  });\n}\nnext();\n", {"k.pem": "-----BEGIN EC PRIVATE KEY-----\nMHcCAQEEIEtD2oNjJIN1+Vw8fAs5g+tNixuj3uNTSYEI1nULHnrvoAoGCCqGSM49\nAwEHoUQDQgAEHfe+4UwC8PoMn6VWdIb19qginktUR5lFfTXywiMvrQgspW0suoSP\n0OSCnjFHOiwkz5v8YF774adZYxP2GO8s8w==\n-----END EC PRIVATE KEY-----\n", "chainfull.pem": "-----BEGIN CERTIFICATE-----\nMIIBiTCCAS+gAwIBAgIUfhfiP88rviI/sWMLTRJiD17JYiwwCgYIKoZIzj0EAwIw\nEDEOMAwGA1UEAwwFaW50ZXIwHhcNMjYxMDIyMTgwMzM5WhcNMzYxMDE5MTgwMzM5\nWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNC\nAAQd977hTALw+gyfpVZ0hvX2qCKeS1RHmUV9NfLCIy+tCCylbSy6hI/Q5IKeMUc6\nLCTPm/xgXvvhp1ljE/YY7yzzo2MwYTAJBgNVHRMEAjAAMBQGA1UdEQQNMAuCCWxv\nY2FsaG9zdDAdBgNVHQ4EFgQU3K/vjxONHEplA7J6TBZsonY0q+0wHwYDVR0jBBgw\nFoAUDgIsTC8MZ1owQ4VRIheOq8ZQvu8wCgYIKoZIzj0EAwIDSAAwRQIhAL2cWFPS\nz7Yd6D/OAftDGIPSD+7oNEERkujU10E2RuBLAiAiKJZg0SMH/AT1KMaAZHLh+487\nfmDeO1qzSRHVmEss8A==\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nMIIBkDCCATagAwIBAgIUegPX98GWQBGsXfpQ8TKcSSKYmPwwCgYIKoZIzj0EAwIw\nGzEZMBcGA1UEAwwQdHNuYXRpdmUgdGVzdCBDQTAeFw0yNjEwMjIxODAzMzlaFw0z\nNjEwMTkxODAzMzlaMBAxDjAMBgNVBAMMBWludGVyMFkwEwYHKoZIzj0CAQYIKoZI\nzj0DAQcDQgAEYogbqljjmtmFoI1mMxvdzBhSQnAnxlVh/lZieH2W8kkn3PL7uRB+\nlfj81tHVnoQ/M8Rvu16utfc8QmyJbQKok6NjMGEwDwYDVR0TAQH/BAUwAwEB/zAO\nBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYEFA4CLEwvDGdaMEOFUSIXjqvGUL7vMB8G\nA1UdIwQYMBaAFPshJbeBgppdQm5lhrY6sPogFlsFMAoGCCqGSM49BAMCA0gAMEUC\nIQDMkcUuTKR2+i8he2ZW/b7bSImsq3zj9VT8KyiPe7cLsAIgKi+3Sdlg4ZjcOQew\nJo/r2k5Ojo8FG8999NDE3nt3b4A=\n-----END CERTIFICATE-----\n", "leafi.pem": "-----BEGIN CERTIFICATE-----\nMIIBiTCCAS+gAwIBAgIUfhfiP88rviI/sWMLTRJiD17JYiwwCgYIKoZIzj0EAwIw\nEDEOMAwGA1UEAwwFaW50ZXIwHhcNMjYxMDIyMTgwMzM5WhcNMzYxMDE5MTgwMzM5\nWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNC\nAAQd977hTALw+gyfpVZ0hvX2qCKeS1RHmUV9NfLCIy+tCCylbSy6hI/Q5IKeMUc6\nLCTPm/xgXvvhp1ljE/YY7yzzo2MwYTAJBgNVHRMEAjAAMBQGA1UdEQQNMAuCCWxv\nY2FsaG9zdDAdBgNVHQ4EFgQU3K/vjxONHEplA7J6TBZsonY0q+0wHwYDVR0jBBgw\nFoAUDgIsTC8MZ1owQ4VRIheOq8ZQvu8wCgYIKoZIzj0EAwIDSAAwRQIhAL2cWFPS\nz7Yd6D/OAftDGIPSD+7oNEERkujU10E2RuBLAiAiKJZg0SMH/AT1KMaAZHLh+487\nfmDeO1qzSRHVmEss8A==\n-----END CERTIFICATE-----\n", "expired.pem": "-----BEGIN CERTIFICATE-----\nMIIBlTCCATqgAwIBAgIUegPX98GWQBGsXfpQ8TKcSSKYmP0wCgYIKoZIzj0EAwIw\nGzEZMBcGA1UEAwwQdHNuYXRpdmUgdGVzdCBDQTAeFw0yMDAxMDEwMDAwMDBaFw0y\nMTAxMDEwMDAwMDBaMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDBZMBMGByqGSM49AgEG\nCCqGSM49AwEHA0IABB33vuFMAvD6DJ+lVnSG9faoIp5LVEeZRX018sIjL60ILKVt\nLLqEj9Dkgp4xRzosJM+b/GBe++GnWWMT9hjvLPOjYzBhMAkGA1UdEwQCMAAwFAYD\nVR0RBA0wC4IJbG9jYWxob3N0MB0GA1UdDgQWBBTcr++PE40cSmUDsnpMFmyidjSr\n7TAfBgNVHSMEGDAWgBT7ISW3gYKaXUJuZYa2OrD6IBZbBTAKBggqhkjOPQQDAgNJ\nADBGAiEA0NzZBYvUWNkn31lI7rH3flU3yz4NUVymorzBxSG9YG0CIQCLP/kERWDO\nebgKbxCe/tNvs6yPHkqCakAuOLkAkk6OWQ==\n-----END CERTIFICATE-----\n", "future.pem": "-----BEGIN CERTIFICATE-----\nMIIBmDCCAT6gAwIBAgIUegPX98GWQBGsXfpQ8TKcSSKYmP4wCgYIKoZIzj0EAwIw\nGzEZMBcGA1UEAwwQdHNuYXRpdmUgdGVzdCBDQTAiGA8yMDkwMDEwMTAwMDAwMFoY\nDzIwOTEwMTAxMDAwMDAwWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjO\nPQIBBggqhkjOPQMBBwNCAAQd977hTALw+gyfpVZ0hvX2qCKeS1RHmUV9NfLCIy+t\nCCylbSy6hI/Q5IKeMUc6LCTPm/xgXvvhp1ljE/YY7yzzo2MwYTAJBgNVHRMEAjAA\nMBQGA1UdEQQNMAuCCWxvY2FsaG9zdDAdBgNVHQ4EFgQU3K/vjxONHEplA7J6TBZs\nonY0q+0wHwYDVR0jBBgwFoAU+yElt4GCml1CbmWGtjqw+iAWWwUwCgYIKoZIzj0E\nAwIDSAAwRQIhANfh5SJAcBovf/pv5FFfh1rl0HSQFJHai8pFR7pprnLAAiBaUXkn\nDP5YHeVGJ5Zj7pXy9iMHg6opl65tVsSZsu24HQ==\n-----END CERTIFICATE-----\n", "wild.pem": "-----BEGIN CERTIFICATE-----\nMIIBkTCCATagAwIBAgIUegPX98GWQBGsXfpQ8TKcSSKYmPAwCgYIKoZIzj0EAwIw\nGzEZMBcGA1UEAwwQdHNuYXRpdmUgdGVzdCBDQTAeFw0yNjEwMjIxNzQ4NTBaFw0z\nNjEwMTkxNzQ4NTBaMAwxCjAIBgNVBAMMAXgwWTATBgcqhkjOPQIBBggqhkjOPQMB\nBwNCAAQd977hTALw+gyfpVZ0hvX2qCKeS1RHmUV9NfLCIy+tCCylbSy6hI/Q5IKe\nMUc6LCTPm/xgXvvhp1ljE/YY7yzzo2cwZTAJBgNVHRMEAjAAMBgGA1UdEQQRMA+C\nDSouZXhhbXBsZS5jb20wHQYDVR0OBBYEFNyv748TjRxKZQOyekwWbKJ2NKvtMB8G\nA1UdIwQYMBaAFPshJbeBgppdQm5lhrY6sPogFlsFMAoGCCqGSM49BAMCA0kAMEYC\nIQDzChZoBZNhpKYmAlljnkmrsLxAupS9dAXNh/n921p/HgIhANQjgoavZILlyFxl\nuw/I3UmtKwQO7tujNkLRs2m0z0HL\n-----END CERTIFICATE-----\n", "inter.pem": "-----BEGIN CERTIFICATE-----\nMIIBkDCCATagAwIBAgIUegPX98GWQBGsXfpQ8TKcSSKYmPwwCgYIKoZIzj0EAwIw\nGzEZMBcGA1UEAwwQdHNuYXRpdmUgdGVzdCBDQTAeFw0yNjEwMjIxODAzMzlaFw0z\nNjEwMTkxODAzMzlaMBAxDjAMBgNVBAMMBWludGVyMFkwEwYHKoZIzj0CAQYIKoZI\nzj0DAQcDQgAEYogbqljjmtmFoI1mMxvdzBhSQnAnxlVh/lZieH2W8kkn3PL7uRB+\nlfj81tHVnoQ/M8Rvu16utfc8QmyJbQKok6NjMGEwDwYDVR0TAQH/BAUwAwEB/zAO\nBgNVHQ8BAf8EBAMCAQYwHQYDVR0OBBYEFA4CLEwvDGdaMEOFUSIXjqvGUL7vMB8G\nA1UdIwQYMBaAFPshJbeBgppdQm5lhrY6sPogFlsFMAoGCCqGSM49BAMCA0gAMEUC\nIQDMkcUuTKR2+i8he2ZW/b7bSImsq3zj9VT8KyiPe7cLsAIgKi+3Sdlg4ZjcOQew\nJo/r2k5Ojo8FG8999NDE3nt3b4A=\n-----END CERTIFICATE-----\n"}, "ts");
+    expect(r.stdout.toString("utf8")).toBe("chain-trust-root OK true null\nchain-wrong-ca ERR UNABLE_TO_GET_ISSUER_CERT_LOCALLY unable to get local issuer certificate\nchain-trust-inter-only ERR UNABLE_TO_GET_ISSUER_CERT unable to get issuer certificate\nleaf-only-trust-root ERR UNABLE_TO_VERIFY_LEAF_SIGNATURE unable to verify the first certificate; if the root CA is installed locally, try running Node.js with --use-system-ca\nexpired ERR CERT_HAS_EXPIRED certificate has expired\nfuture ERR CERT_NOT_YET_VALID certificate is not yet valid\nexpired-noreject OK false CERT_HAS_EXPIRED\naltname-noreject OK false ERR_TLS_CERT_ALTNAME_INVALID\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U4-R-11 finding 7: a PEM block that decodes to no bytes ends setDefaultCACertificates' read, successfully", async () => {
+    const r = await runR("import * as fs from \"node:fs\";\nimport * as tls from \"node:tls\";\nconst ca = fs.readFileSync(\"tests/fixtures/server/certs/ca.pem\", \"utf8\");\nconst ca2 = fs.readFileSync(\"tests/fixtures/server/certs/ca2.pem\", \"utf8\");\nconst bom = String.fromCharCode(0xfeff);\nconst sets: string[][] = [\n  [bom + bom + ca],\n  [bom + ca],\n  [\"x\" + bom + ca],\n  [bom + \"x\\n\" + ca],\n  [ca + \"-----BEGIN CERTIFICATE-----\\n-AAAA\\n-----END CERTIFICATE-----\\n\" + ca2],\n  [\"-----BEGIN CERTIFICATE-----\\n-AAAA\\n-----END CERTIFICATE-----\\n\" + ca2],\n  [ca, \"-----BEGIN CERTIFICATE-----\\n-AAAA\\n-----END CERTIFICATE-----\\n\"],\n  [ca + \"-----BEGIN CERTIFICATE-----\\n====\\n-----END CERTIFICATE-----\\n\" + ca2],\n];\nlet i = 0;\nfor (const set of sets) {\n  let line: string;\n  try {\n    tls.setDefaultCACertificates(set);\n    const d = tls.getCACertificates(\"default\");\n    line = \"n=\" + d.length + \" \" + d.map((s) => s.slice(28, 50)).join(\",\");\n  } catch (e) {\n    line = \"X \" + (e as Error).message;\n  }\n  console.log(i++, line);\n}\n", {}, "ts");
+    expect(r.stdout.toString("utf8")).toBe("0 X No valid certificates found in the provided array\n1 n=1 MIIBfDCCASKgAwIBAgIUbo\n2 X No valid certificates found in the provided array\n3 n=1 MIIBfDCCASKgAwIBAgIUbo\n4 n=1 MIIBfDCCASKgAwIBAgIUbo\n5 X No valid certificates found in the provided array\n6 n=1 MIIBfDCCASKgAwIBAgIUbo\n7 X error:04800064:PEM routines::bad base64 decode\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U4-R-12 finding 8: a non-minimal or indefinite outer DER length is re-encoded as i2d does; a TBS without its fields is OpenSSL's ASN1 error", async () => {
+    const r = await runR("import * as tls from \"node:tls\";\nconst SETS: string[][] = [[\"-----BEGIN CERTIFICATE-----\\nMIMAAXwwggEioAMCAQICFG6PSZhwTlD7wraEUQI0Hkl2T5IpMAoGCCqGSM49BAMC\\nMBsxGTAXBgNVBAMMEHRzbmF0aXZlIHRlc3QgQ0EwIBcNMjYwNzE2MjAzNzA4WhgP\\nMjEyNjA2MjIyMDM3MDhaMBsxGTAXBgNVBAMMEHRzbmF0aXZlIHRlc3QgQ0EwWTAT\\nBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQqbWHip4RjSXGDge9uDJeJnZRPgJekfDSx\\njP/b6NvP7wVn2mi7GEfOvbPq8W0AUD+7/nUFMI23c6TBrHT4q6B5o0IwQDAPBgNV\\nHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBBjAdBgNVHQ4EFgQU+yElt4GCml1C\\nbmWGtjqw+iAWWwUwCgYIKoZIzj0EAwIDSAAwRQIhAIvYpWlTassrtznGQZgk/p9z\\nG2W8rSJOwcIRMnaKvHVKAiAQmDLtT18L5cJKd3YhR4oaAXioB0uNtchl56VqTtr8\\niw==\\n-----END CERTIFICATE-----\\n\"],[\"-----BEGIN CERTIFICATE-----\\nMIAwggEioAMCAQICFG6PSZhwTlD7wraEUQI0Hkl2T5IpMAoGCCqGSM49BAMCMBsx\\nGTAXBgNVBAMMEHRzbmF0aXZlIHRlc3QgQ0EwIBcNMjYwNzE2MjAzNzA4WhgPMjEy\\nNjA2MjIyMDM3MDhaMBsxGTAXBgNVBAMMEHRzbmF0aXZlIHRlc3QgQ0EwWTATBgcq\\nhkjOPQIBBggqhkjOPQMBBwNCAAQqbWHip4RjSXGDge9uDJeJnZRPgJekfDSxjP/b\\n6NvP7wVn2mi7GEfOvbPq8W0AUD+7/nUFMI23c6TBrHT4q6B5o0IwQDAPBgNVHRMB\\nAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBBjAdBgNVHQ4EFgQU+yElt4GCml1CbmWG\\ntjqw+iAWWwUwCgYIKoZIzj0EAwIDSAAwRQIhAIvYpWlTassrtznGQZgk/p9zG2W8\\nrSJOwcIRMnaKvHVKAiAQmDLtT18L5cJKd3YhR4oaAXioB0uNtchl56VqTtr8iwAA\\n-----END CERTIFICATE-----\\n\"],[\"-----BEGIN CERTIFICATE-----\\nMIIBfDCCASKgAwIBAgIUbo9JmHBOUPvCtoRRAjQeSXZPkikwCgYIKoZIzj0EAwIw\\nGzEZMBcGA1UEAwwQdHNuYXRpdmUgdGVzdCBDQTAgFw0yNjA3MTYyMDM3MDhaGA8y\\nMTI2MDYyMjIwMzcwOFowGzEZMBcGA1UEAwwQdHNuYXRpdmUgdGVzdCBDQTBZMBMG\\nByqGSM49AgEGCCqGSM49AwEHA0IABCptYeKnhGNJcYOB724Ml4mdlE+Al6R8NLGM\\n/9vo28/vBWfaaLsYR869s+rxbQBQP7v+dQUwjbdzpMGsdPiroHmjQjBAMA8GA1Ud\\nEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMB0GA1UdDgQWBBT7ISW3gYKaXUJu\\nZYa2OrD6IBZbBTAKBggqhkjOPQQDAgNIADBFAiEAi9ilaVNqyyu3OcZBmCT+n3Mb\\nZbytIk7BwhEydoq8dUoCIBCYMu1PXwvlwkp3diFHihoBeKgHS421yGXnpWpO2vyL\\nAQID\\n-----END CERTIFICATE-----\\n\"],[\"-----BEGIN CERTIFICATE-----\\nMIIBfDCCASKgAwIBAgIUbo9JmHBOUPvCtoRRAjQeSXZPkikwCgYIKoZIzj0EAwIw\\nGzEZMBcGA1UEAwwQdHNuYXRpdmUgdGVzdCBDQTAgFw0yNjA3MTYyMDM3MDhaGA8y\\nMTI2MDYyMjIwMzcwOFowGzEZMBcGA1UEAwwQdHNuYXRpdmUgdGVzdCBDQTBZMBMG\\nByqGSM49AgEGCCqGSM49AwEHA0IABCptYeKnhGNJcYOB724Ml4mdlE+Al6R8NLGM\\n/9vo28/vBWfaaLsYR869s+rxbQBQP7v+dQUwjbdzpMGsdPiroHmjQjBAMA8GA1Ud\\nEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMB0GA1UdDgQWBBT7ISW3gYKaXUJu\\nZYa2OrD6IBZbBTAKBggqhkjOPQQDAgNIADBFAiEAi9ilaVNqyyu3OcZBmCT+n3Mb\\nZbytIk7BwhEydoq8dUoCIBCYMu1PXwvlwkp3diFHihoBeKgHS421yGXnpQ==\\n-----END CERTIFICATE-----\\n\"],[\"-----BEGIN CERTIFICATE-----\\nMAowAwIBATAAAwEA\\n-----END CERTIFICATE-----\\n\"],[\"-----BEGIN CERTIFICATE-----\\nMAYfgQEBAAA=\\n-----END CERTIFICATE-----\\n\"],[\"-----BEGIN CERTIFICATE-----\\nMAA=\\n-----END CERTIFICATE-----\\n\"],[\"-----BEGIN CERTIFICATE-----\\nMIQAAAAFAAAAAAA=\\n-----END CERTIFICATE-----\\n\"],[\"-----BEGIN CERTIFICATE-----\\nMA==\\n-----END CERTIFICATE-----\\n\"]];\nfor (const set of SETS) {\n  let line: string;\n  try {\n    tls.setDefaultCACertificates(set);\n    line = JSON.stringify(tls.getCACertificates(\"default\")).slice(0, 120) + \" n=\" + tls.getCACertificates(\"default\").length;\n  } catch (e) {\n    line = \"X \" + (e as Error).name + \" \" + (e as Error).message;\n  }\n  console.log(line);\n}\n", {}, "ts");
+    expect(r.stdout.toString("utf8")).toBe("[\"-----BEGIN CERTIFICATE-----\\nMIIBfDCCASKgAwIBAgIUbo9JmHBOUPvCtoRRAjQeSXZPkikwCgYIKoZIzj0EAwIw\\nGzEZMBcGA1UEAwwQdHNuYXR n=1\n[\"-----BEGIN CERTIFICATE-----\\nMIIBfDCCASKgAwIBAgIUbo9JmHBOUPvCtoRRAjQeSXZPkikwCgYIKoZIzj0EAwIw\\nGzEZMBcGA1UEAwwQdHNuYXR n=1\n[\"-----BEGIN CERTIFICATE-----\\nMIIBfDCCASKgAwIBAgIUbo9JmHBOUPvCtoRRAjQeSXZPkikwCgYIKoZIzj0EAwIw\\nGzEZMBcGA1UEAwwQdHNuYXR n=1\nX Error error:0488000D:PEM routines::ASN1 lib\nX Error error:0488000D:PEM routines::ASN1 lib\nX Error error:0488000D:PEM routines::ASN1 lib\nX Error error:0488000D:PEM routines::ASN1 lib\nX Error error:0488000D:PEM routines::ASN1 lib\nX Error error:0488000D:PEM routines::ASN1 lib\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U4-R-13 finding 8: a non-minimal length inside the signatureAlgorithm, which OpenSSL re-encodes (Node prints the re-encoded PEM), is a named Error (S090 (c))", async () => {
+    const r = await runR("import * as fs from \"node:fs\";\nimport * as tls from \"node:tls\";\nconst pem = fs.readFileSync(\"@CERTS@ncsig.pem\", \"utf8\");\ntry {\n  tls.setDefaultCACertificates([pem]);\n  const d = tls.getCACertificates(\"default\");\n  console.log(\"n=\" + d.length, d[0] === pem, d[0].slice(28, 60));\n} catch (e) {\n  console.log(\"X\", (e as Error).message);\n}\n", {"ncsig.pem": "-----BEGIN CERTIFICATE-----\nMIIBfTCCASKgAwIBAgIUbo9JmHBOUPvCtoRRAjQeSXZPkikwCgYIKoZIzj0EAwIw\nGzEZMBcGA1UEAwwQdHNuYXRpdmUgdGVzdCBDQTAgFw0yNjA3MTYyMDM3MDhaGA8y\nMTI2MDYyMjIwMzcwOFowGzEZMBcGA1UEAwwQdHNuYXRpdmUgdGVzdCBDQTBZMBMG\nByqGSM49AgEGCCqGSM49AwEHA0IABCptYeKnhGNJcYOB724Ml4mdlE+Al6R8NLGM\n/9vo28/vBWfaaLsYR869s+rxbQBQP7v+dQUwjbdzpMGsdPiroHmjQjBAMA8GA1Ud\nEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMB0GA1UdDgQWBBT7ISW3gYKaXUJu\nZYa2OrD6IBZbBTCBCgYIKoZIzj0EAwIDSAAwRQIhAIvYpWlTassrtznGQZgk/p9z\nG2W8rSJOwcIRMnaKvHVKAiAQmDLtT18L5cJKd3YhR4oaAXioB0uNtchl56VqTtr8\niw==\n-----END CERTIFICATE-----\n"}, "ts");
+    expect(r.stdout.toString("utf8")).toBe("X tls.setDefaultCACertificates of a certificate whose DER OpenSSL would re-encode (a non-minimal or indefinite length inside it) is not supported yet\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("U4-R-14 a leaf whose only CN is empty: Node's subject.CN is falsy, so 'Cert does not contain a DNS name'", async () => {
+    const r = await runR("import * as fs from \"node:fs\";\nimport * as tls from \"node:tls\";\nconst cdir = \"@CERTS@\";\nconst ca = fs.readFileSync(\"tests/fixtures/server/certs/ca.pem\", \"utf8\");\nconst server = tls.createServer({ key: fs.readFileSync(cdir + \"cnempty2-key.pem\"), cert: fs.readFileSync(cdir + \"cnempty2.pem\") }, (s) => { s.end(); });\nserver.listen(0, \"127.0.0.1\", () => {\n  const c = tls.connect({ host: \"127.0.0.1\", port: server.address().port, servername: \"localhost\", ca }, () => {\n    console.log(\"OK\", c.authorized);\n    c.end();\n  });\n  c.on(\"error\", (e) => console.log(\"ERR\", (e as NodeJS.ErrnoException).code, e.message));\n  c.on(\"close\", () => server.close());\n});\n", {"cnempty2.pem": "-----BEGIN CERTIFICATE-----\nMIIBIzCBzKADAgECAhQNQ8UaZC+ca2T2txqJPKbPcaImBDAKBggqhkjOPQQDAjAb\nMRkwFwYDVQQDDBB0c25hdGl2ZSB0ZXN0IENBMB4XDTI2MDEwMTAwMDAwMFoXDTM1\nMTIzMDAwMDAwMFowCzEJMAcGA1UEAwwAMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcD\nQgAEvoykbu0MED62A1qIgMcXwb8Y4HFUqaDFypmt2VvLrZgyp6qusfc9CfHgOOFe\njWzTAKRsMSBMAtSFmdhnL9mcSTAKBggqhkjOPQQDAgNGADBDAh97vvqS+czJ1F51\nbAvRnt3ymA8gFWoT6DAmjtS5EXHsAiAs/d8VWDIIw6AsN9quiCOj3iTCzk4wrU+/\n+rtpRuM11A==\n-----END CERTIFICATE-----\n", "cnempty2-key.pem": "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgmFT6+bxofa1WEiLd\nHnXsCgbAn4gSLtplLLZpKY4U0tyhRANCAAS+jKRu7QwQPrYDWoiAxxfBvxjgcVSp\noMXKma3ZW8utmDKnqq6x9z0J8eA44V6NbNMApGwxIEwC1IWZ2Gcv2ZxJ\n-----END PRIVATE KEY-----\n"}, "ts");
+    expect(r.stdout.toString("utf8")).toBe("ERR ERR_TLS_CERT_ALTNAME_INVALID Hostname/IP does not match certificate's altnames: Cert does not contain a DNS name\n");
     expect(r.stderr.toString("utf8")).toBe("");
     expect(r.exitCode).toBe(0);
   }, 60000);

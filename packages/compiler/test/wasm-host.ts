@@ -312,6 +312,10 @@ async function instantiate(modulePath: string, overrides?: HostOverrides) {
       netCall(op: number, _ptr: number, _len: number, _h: number, _x: number): number {
         throw new Error(`netCall: op ${op} reached with no forced host (default stub is loud by design)`);
       },
+      // INC-29 U4 (abi.ts tlsCall): LOUD for every op, netCall's stance.
+      tlsCall(op: number, _ptr: number, _len: number, _h: number, _x: number): number {
+        throw new Error(`tlsCall: op ${op} reached with no forced host (default stub is loud by design)`);
+      },
       ...(overrides?.imports ?? {}),
     },
   });

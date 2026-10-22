@@ -2481,8 +2481,9 @@ export class UrlEngine {
   /** `new URL(input)` then urlToHttpOptions's decodeURIComponent of the
    * credentials, then ClientRequest's protocol check against http:'s
    * agent — each failure pending in Node's order (null). */
-  httpTargetFn(): number {
-    return this.fn("httpTarget", [this.sRef], [this.urlRef()], (f, $) => {
+  httpTargetFn(secure = false): number {
+    // INC-29 U4: https's (secure) expects "https:".
+    return this.fn(secure ? "httpsTarget" : "httpTarget", [this.sRef], [this.urlRef()], (f, $) => {
       const U = f.local(this.urlRef());
       const O = f.local(this.obRef);
       const g = (i: number): X => $.get(this.urlType(), i, $.l(U));
@@ -2494,11 +2495,11 @@ export class UrlEngine {
         $.drop($.call(this.deps.decodeUriComponent(), g(U_PASS)));
         $.if(this.pending($), () => $.ret($.nul(this.urlType())));
       });
-      $.if($.ne(g(U_TYPE), $.i(T_HTTP)), () => {
+      $.if($.ne(g(U_TYPE), $.i(secure ? T_HTTPS : T_HTTP)), () => {
         $.put(O, this.obNew($));
         this.pushLit($, $.l(O), 'Protocol "');
         $.run(this.obAppendStrFn(), $.l(O), g(U_SCHEME));
-        this.pushLit($, $.l(O), ':" not supported. Expected "http:"');
+        this.pushLit($, $.l(O), secure ? ':" not supported. Expected "https:"' : ':" not supported. Expected "http:"');
         this.deps.setCellError($.c, "%TypeError", "TypeError", (c) => {
           c.localGet(O);
           c.call(this.obToStrFn());

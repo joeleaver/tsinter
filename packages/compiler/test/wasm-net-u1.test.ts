@@ -99,7 +99,9 @@ describe("INC-29 U1 node:net — host-free rows", () => {
     ["N1-NL-06", "libCall:net.sockRead", 'import * as net from "node:net";\nconst c = net.connect(1, "127.0.0.1");\nc.on("connect", () => {\n  const b = c.read(1);\n  if (b !== null) console.log(b.length);\n});\n'],
     ["N1-NL-07", "libCall:net.serverCloseCb:override", 'import * as net from "node:net";\nconst s = net.createServer();\nconst orig = s.close.bind(s);\ns.close = function (cb?: () => void) {\n  return orig(cb);\n} as typeof s.close;\ns.close(() => console.log("closed"));\n'],
     ["N1-NL-08", "libCall:net:with-spawn", 'import * as net from "node:net";\nimport { spawn } from "node:child_process";\nspawn("true", [], { stdio: "ignore" });\nnet.createServer();\n'],
-    ["N1-NL-09", "libCall:net.serverOnSecureConnection", 'import * as net from "node:net";\nconst s = net.createServer();\ns.on("secureConnection", () => console.log("s"));\n'],
+    // INC-29 U4 lifted net.serverOnSecureConnection (tls.ts); a TLS
+    // socket's 'session' listener still refuses.
+    ["N1-NL-09", "libCall:tls.sockOnSession", 'import * as tls from "node:tls";\nconst c = tls.connect(1, "127.0.0.1", {});\nc.on("session", (s) => console.log(s.length));\n'],
     ["N1-NL-10", "libCall:net.sockOnTimeout", 'import * as net from "node:net";\nconst c = net.connect(1, "127.0.0.1");\nc.on("timeout", () => console.log("t"));\n'],
   ];
   for (const [id, key, src, ext] of refusals) {

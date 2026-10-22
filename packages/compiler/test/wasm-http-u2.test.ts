@@ -63,8 +63,9 @@ describe("INC-29 U2 node:http — host-free rows", () => {
   const refusals: [string, string, string, string][] = [
     // Re-aimed by INC-29 U3, which lifts the http.* URL-argument form: the
     // https spelling (TLS) still refuses by name.
-    ["H2-REF-01", "libCall:https.requestUrlCb", 'import * as https from "node:https";\nhttps.get(new URL("https://127.0.0.1:1/"), (res) => res.resume());\n', "ts"],
-    ["H2-REF-02", "libCall:https.requestCb", 'import * as https from "node:https";\nhttps.get({ host: "127.0.0.1", port: 1, path: "/" }, (res) => res.resume());\n', "ts"],
+    // INC-29 U4 lifted https.requestUrlCb and https.requestCb (tls.ts); an
+    // https request through an Agent value still refuses.
+    ["H2-REF-01", "libCall:https.requestAgentCb", 'import * as https from "node:https";\nconst agent = new https.Agent({ keepAlive: true });\nhttps.get({ host: "127.0.0.1", port: 1, path: "/", agent }, (res) => res.resume());\n', "ts"],
     ["H2-REF-03", "libCall:http.serverOnUpgrade", 'import * as http from "node:http";\nconst s = http.createServer();\ns.on("upgrade", (req, sock) => sock.destroy());\n', "ts"],
     ["H2-REF-04", "libCall:http.reqSetEncoding", 'import * as http from "node:http";\nconst s = http.createServer((req, res) => {\n  req.setEncoding("utf8");\n  res.end();\n});\ns.listen(0, () => s.close());\n', "ts"],
   ];

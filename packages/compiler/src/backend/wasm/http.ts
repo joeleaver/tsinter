@@ -95,6 +95,19 @@ export interface HttpDeps {
   utf8Decode: () => number;
   /** `(string) -> string`, String.prototype.toLowerCase. */
   toLowerCase: () => number;
+  /** INC-29 U4: present only in a TLS module (tls.ts): the https client's
+   * dial and its request options. Every TLS-only field and branch below
+   * is gated on it, so a module without TLS keeps U2's bytes. */
+  tls?: HttpTlsHooks;
+}
+
+/** INC-29 U4: what a TLS module adds to the http client. */
+export interface HttpTlsHooks {
+  /** `(port, host, noDelay, timeout, tlso, servername) -> sock`: the
+   * https Agent's createConnection (tls.connect). */
+  agentConnect: () => number;
+  /** The $tlso struct (an https request's TLS options). */
+  tlsoT: () => number;
 }
 
 /* ── the Readable state bits (lib/internal/streams/readable.js; the
@@ -267,6 +280,7 @@ const C_LRESPONSE = 69;
 const C_LRESPONSE_N = 70;
 const C_RTMO = 71; // eqref: the socket 'timeout' listener emitRequestTimeout
 const C_RSPTMO = 72; // eqref: the socket 'timeout' listener responseOnTimeout
+const C_TLSO = 73; // INC-29 U4 (TLS modules): the https request's $tlso, null for http
 
 /* ── $hsrv: an http.Server's own state (net.Server's V_HTTP) ──────── */
 const H_LREQ = 0;
@@ -866,6 +880,7 @@ export class HttpBuilder {
           { storage: I32, mutable: true }, // C_LRESPONSE_N
           { storage: EQ_REF, mutable: true }, // C_RTMO
           { storage: EQ_REF, mutable: true }, // C_RSPTMO
+          ...(this.deps.tls !== undefined ? [{ storage: EQ_REF, mutable: true }] : []), // C_TLSO
         ],
         out,
       );
@@ -4711,7 +4726,18 @@ export class HttpBuilder {
    * net.Server ({ allowHalfOpen: true, noDelay: true }), the 'request'
    * listener, and the 'connection' / 'listening' listeners. */
   serverNewFn(): number {
-    return this.fn("serverNew", [EQ_REF], [this.srvRef], (f, $) => {
+    return this.serverNewImpl(false);
+  }
+
+  /** INC-29 U4: https.Server — the http server over a tls.Server: the
+   * connection listener runs on 'secureConnection', allowHalfOpen is
+   * net.Server's false and noDelay https's true. */
+  serverNewSecureFn(): number {
+    return this.serverNewImpl(true);
+  }
+
+  private serverNewImpl(secure: boolean): number {
+    return this.fn(secure ? "serverNewSecure" : "serverNew", [EQ_REF], [this.srvRef], (f, $) => {
       const CB = 0;
       const V = f.local(this.srvRef);
       const H = f.local(this.hsrvRef());
@@ -4740,10 +4766,10 @@ export class HttpBuilder {
       c.structNew(this.HT);
       c.localSet(H);
       $.set(this.srvT, NET_SRV_HTTP.V_HTTP, $.l(V), $.l(H));
-      $.set(this.srvT, NET_SRV_HTTP.V_HALFOPEN, $.l(V), $.i(1));
+      $.set(this.srvT, NET_SRV_HTTP.V_HALFOPEN, $.l(V), $.i(secure ? 0 : 1));
       $.set(this.srvT, NET_SRV_HTTP.V_NODELAY, $.l(V), $.i(1));
       $.if($.notNull($.l(CB)), () => this.on($, HL.SRV_REQUEST, $.l(H), $.l(CB)));
-      this.son($, NET_LISTS.LV_CONN, $.l(V), this.clos($, this.connectionListenerFn(), "sock", { a: $.l(V) }));
+      this.son($, secure ? this.net.tlsFields().LV_SECCONN : NET_LISTS.LV_CONN, $.l(V), this.clos($, this.connectionListenerFn(), "sock", { a: $.l(V) }));
       this.son($, NET_LISTS.LV_LISTENING, $.l(V), this.clos($, this.setupConnectionsTrackingFn(), "void", { a: $.l(V) }));
       $.do($.l(V));
     });
@@ -5546,14 +5572,16 @@ export class HttpBuilder {
    * decoded "user:password" whose Authorization header Node sets right
    * after the Host header. */
   clientRequestUrlFn(): number {
+    const tls = this.deps.tls !== undefined;
     return this.fn(
       "clientRequestUrl",
-      [this.strRef, F64, this.strRef, this.strRef, EQ_REF, this.strRef],
+      [this.strRef, F64, this.strRef, this.strRef, EQ_REF, this.strRef, ...(tls ? [EQ_REF] : [])],
       [this.creqRef()],
       (f, $) => {
-        const [HOST, PORT, PATH, METHOD, CB, AUTH] = [0, 1, 2, 3, 4, 5];
+        const [HOST, PORT, PATH, METHOD, CB, AUTH, TLSO] = [0, 1, 2, 3, 4, 5, 6];
         const Q = f.local(this.creqRef());
-        $.put(Q, $.call(this.clientRequestNewFn(), $.l(HOST), $.l(PORT), $.l(PATH), $.l(METHOD), $.d(0), $.i(0), $.nul(this.strT), $.anew(this.strArrT, $.i(0)), $.i(0), $.nul(this.agentT()), $.i(0), $.l(CB)));
+        // INC-29 U4: an https URL's request: its options, the https global agent
+        $.put(Q, $.call(this.clientRequestNewFn(), $.l(HOST), $.l(PORT), $.l(PATH), $.l(METHOD), $.d(0), $.i(0), $.nul(this.strT), $.anew(this.strArrT, $.i(0)), $.i(0), tls ? $.sel(this.agentRef(), $.isNull($.l(TLSO)), $.nul(this.agentT()), $.call(this.httpsGlobalAgentFn())) : $.nul(this.agentT()), $.i(0), $.l(CB), ...(tls ? [$.l(TLSO)] : [])));
         this.excReturn($, $.nul(this.CT));
         $.if($.notNull($.l(AUTH)), () => {
           $.run(this.setHeaderFn(), $.l(Q), this.lit($, "Authorization"), this.hvStrNew($, this.cat($, this.lit($, "Basic "), $.l(AUTH))));
@@ -5565,12 +5593,13 @@ export class HttpBuilder {
   }
 
   clientRequestNewFn(): number {
+    const tls = this.deps.tls !== undefined;
     return this.fn(
       "clientRequestNew",
-      [this.strRef, F64, this.strRef, this.strRef, F64, I32, this.strRef, this.ref(this.strArrT), I32, this.agentRef(), I32, EQ_REF],
+      [this.strRef, F64, this.strRef, this.strRef, F64, I32, this.strRef, this.ref(this.strArrT), I32, this.agentRef(), I32, EQ_REF, ...(tls ? [EQ_REF] : [])],
       [this.creqRef()],
       (f, $) => {
-        const [HOST0, PORT0, PATH0, METHOD0, TMO, TMOHAS, TMOERR, HDRS, NHDRS, AGENT0, ONESHOT, CB] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        const [HOST0, PORT0, PATH0, METHOD0, TMO, TMOHAS, TMOERR, HDRS, NHDRS, AGENT0, ONESHOT, CB, TLSO] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
         const TIMEOUT = f.local(F64);
         const CT = this.CT;
         const OT = this.OT;
@@ -5587,7 +5616,7 @@ export class HttpBuilder {
         const PC = f.local(I32);
         const c = f.c;
         // agent: false -> new defaultAgent.constructor(); absent -> the global agent.
-        $.if($.l(ONESHOT), () => $.put(AG, $.call(this.agentNewFn(), $.i(0), $.d(0), $.d(0), $.d(0), $.d(0), $.d(0), $.i(0), $.i(0), this.lit($, ""))), () => {
+        $.if($.l(ONESHOT), () => $.put(AG, $.call(this.agentNewFn(), $.i(0), $.d(0), $.d(0), $.d(0), $.d(0), $.d(0), tls ? $.notNull($.l(TLSO)) : $.i(0), $.i(0), this.lit($, ""))), () => {
           $.put(AG, $.sel(this.agentRef(), $.isNull($.l(AGENT0)), $.call(this.globalAgentFn()), $.l(AGENT0)));
         });
         // The path check: /[^!-ÿ]/
@@ -5601,6 +5630,13 @@ export class HttpBuilder {
             });
           });
         });
+        // INC-29 U4: protocol !== expectedProtocol (the agent's)
+        if (tls) {
+          $.if($.ne($.get(AT, A_SECURE, $.l(AG)), $.notNull($.l(TLSO))), () => {
+            this.throwErr($, "%TypeError", this.cat($, this.lit($, 'Protocol "'), $.sel(this.strRef, $.isNull($.l(TLSO)), this.lit($, "http:"), this.lit($, "https:")), this.lit($, '" not supported. Expected "'), $.get(AT, A_PROTOCOL, $.l(AG)), this.lit($, '"')), "ERR_INVALID_PROTOCOL");
+            $.ret($.nul(CT));
+          });
+        }
         // defaultPort = options.defaultPort || this.agent?.defaultPort
         $.put(DEFPORT, $.get(AT, A_DEFPORT, $.l(AG)));
         // port = options.port || defaultPort || 80
@@ -5634,7 +5670,8 @@ export class HttpBuilder {
         c.localGet(METHOD); // C_METHOD
         $.do($.sel(this.strRef, $.gt($.alen($.l(PATH)), $.i(0)), $.l(PATH), this.lit($, "/"))); // C_PATH (this[kPath])
         c.localGet(HOST); // C_HOST
-        this.deps.pushStrLit(c, "http:"); // C_PROTOCOL
+        if (tls) $.do($.sel(this.strRef, $.isNull($.l(TLSO)), this.lit($, "http:"), this.lit($, "https:"))); // C_PROTOCOL
+        else this.deps.pushStrLit(c, "http:"); // C_PROTOCOL
         c.i32Const(0); // C_ENDED
         c.refNull(this.IT); // C_RES
         c.i32Const(0); // C_ABORTED
@@ -5650,6 +5687,7 @@ export class HttpBuilder {
         c.i32Const(0);
         c.refNull(EQ_HEAP);
         c.refNull(EQ_HEAP);
+        if (tls) c.localGet(TLSO); // C_TLSO
         c.structNew(CT);
         c.localSet(Q);
         $.if($.notNull($.l(CB)), () => this.on($, HL.CREQ_RESPONSE, $.l(Q), $.l(CB), true));
@@ -6156,7 +6194,9 @@ export class HttpBuilder {
       c.localGet(FIFO); // A_FIFO
       orDefault(TMO, 0)(); // A_TIMEOUT
       $.do($.sel(F64, $.l(SECURE), $.d(443), $.d(80))); // A_DEFPORT (options.defaultPort || 80)
-      this.deps.pushStrLit(c, "http:"); // A_PROTOCOL
+      // A_PROTOCOL (INC-29 U4: an https.Agent's is 'https:')
+      if (this.deps.tls !== undefined) $.do($.sel(this.strRef, $.l(SECURE), this.lit($, "https:"), this.lit($, "http:")));
+      else this.deps.pushStrLit(c, "http:");
       c.i32Const(1); // A_NODELAY
       c.f64Const(1000); // A_KABUFFER
       c.refNull(this.amapArrT);
@@ -6211,6 +6251,67 @@ export class HttpBuilder {
       $.put(PORT, $.sel(F64, $.get(this.AT, A_HASOPTPORT, $.l(AG)), $.get(this.AT, A_OPTPORT, $.l(AG)), $.get(this.CT, C_PORT, $.l(Q))));
       // if (options.port) name += options.port
       $.do(this.cat($, $.get(this.CT, C_HOST, $.l(Q)), this.lit($, ":"), $.sel(this.strRef, $.both($.dne($.l(PORT), $.d(0)), $.deq($.l(PORT), $.l(PORT))), this.num2str($, $.l(PORT)), this.lit($, "")), this.lit($, ":")));
+      // INC-29 U4: https.Agent.prototype.getName's TLS fields
+      if (this.deps.tls !== undefined) {
+        const TT = this.deps.tls.tlsoT();
+        const TO = f.local(this.ref(TT));
+        const SN = f.local(this.strRef);
+        const NAME = f.local(this.strRef);
+        f.c.localSet(NAME);
+        $.if($.notNull($.get(this.CT, C_TLSO, $.l(Q))), () => {
+          $.put(TO, $.cast(TT, $.get(this.CT, C_TLSO, $.l(Q))));
+          $.put(SN, $.call(this.serverNameFn(), $.l(Q)));
+          $.put(NAME, this.cat($, $.l(NAME), this.lit($, ":"), $.get(TT, 2, $.l(TO)), this.lit($, "::::::"), $.sel(this.strRef, $.get(TT, 0, $.l(TO)), this.lit($, ""), this.lit($, "false")), this.lit($, ":"),
+            $.sel(this.strRef, $.both($.gt($.alen($.l(SN)), $.i(0)), $.not(this.streq($, $.l(SN), $.get(this.CT, C_HOST, $.l(Q))))), $.l(SN), this.lit($, "")), this.lit($, "::::::::::::")));
+        });
+        $.do($.l(NAME));
+      }
+    });
+  }
+
+  /** INC-29 U4: normalizeServerName's calculateServerName(options, req):
+   * the Host header's name (options.host without one), '' for an IP. */
+  private serverNameFn(): number {
+    return this.fn("serverName", [this.creqRef()], [this.strRef], (f, $) => {
+      const Q = 0;
+      const HV = f.local(this.ref(this.hvT));
+      const SN = f.local(this.strRef);
+      const I = f.local(I32);
+      $.put(SN, $.get(this.CT, C_HOST, $.l(Q)));
+      $.put(HV, $.call(this.getHeaderFn(), $.l(Q), this.lit($, "host")));
+      $.if($.notNull($.l(HV)), () => {
+        $.if($.ne($.get(this.hvT, V_KIND, $.l(HV)), $.i(0)), () => {
+          this.fenceErr($, "an https request whose Host header is not a string");
+          $.ret(this.lit($, ""));
+        });
+        $.put(SN, $.get(this.hvT, V_STR, $.l(HV)));
+        $.if($.andThen($.gt($.alen($.l(SN)), $.i(0)), $.eq($.agetU(this.strT, $.l(SN), $.i(0)), $.i(91))), () => {
+          $.put(I, $.call(this.indexOfFn(), $.l(SN), $.i(93), $.i(0)));
+          $.if($.ne($.l(I), $.i(-1)), () => $.put(SN, $.call(this.substrFn(), $.l(SN), $.i(1), $.l(I))));
+        }, () => {
+          $.put(I, $.call(this.indexOfFn(), $.l(SN), $.i(58), $.i(0)));
+          $.if($.ne($.l(I), $.i(-1)), () => $.put(SN, $.call(this.substrFn(), $.l(SN), $.i(0), $.l(I))));
+        });
+      });
+      $.if($.call(this.net.isIPHelper(), $.l(SN)), () => $.ret(this.lit($, "")));
+      $.do($.l(SN));
+    });
+  }
+
+  /** INC-29 U4: https.globalAgent — new https.Agent({ keepAlive: true,
+   * scheduling: 'lifo', timeout: 5000 }). */
+  private httpsAgentGlobal: number | null = null;
+
+  httpsGlobalAgentFn(): number {
+    return this.fn("httpsGlobalAgent", [], [this.agentRef()], (f, $) => {
+      const agentT = this.agentT();
+      this.httpsAgentGlobal ??= this.mb.addGlobal(this.ref(agentT), true, (w) => {
+        w.u8(0xd0);
+        w.sleb(agentT);
+      });
+      const g = this.httpsAgentGlobal;
+      $.if($.isNull($.g(g)), () => $.gput(g, $.call(this.agentNewFn(), $.i(1), $.d(0), $.d(0), $.d(0), $.d(5000), $.d(0), $.i(1), $.i(0), this.lit($, ""))));
+      $.do($.g(g));
     });
   }
 
@@ -6390,7 +6491,15 @@ export class HttpBuilder {
         $.if($.not($.call(this.timerDurationFn("msecs"), $.l(TMO))), () => $.ret($.nul(this.sockT)));
       });
       // this.createConnection(options, oncreate) = net.createConnection
-      $.put(S, $.call(this.net.connectExHelper(), $.l(PORT), $.get(this.CT, C_HOST, $.l(Q)), $.get(AT, A_NODELAY, $.l(AG)), $.l(TMO)));
+      // (INC-29 U4: https's createConnection = tls.connect)
+      if (this.deps.tls !== undefined) {
+        const TT = this.deps.tls.tlsoT();
+        $.if($.notNull($.get(this.CT, C_TLSO, $.l(Q))), () => {
+          $.put(S, $.call(this.deps.tls!.agentConnect(), $.l(PORT), $.get(this.CT, C_HOST, $.l(Q)), $.get(AT, A_NODELAY, $.l(AG)), $.l(TMO), $.cast(TT, $.get(this.CT, C_TLSO, $.l(Q))), $.call(this.serverNameFn(), $.l(Q))));
+        }, () => $.put(S, $.call(this.net.connectExHelper(), $.l(PORT), $.get(this.CT, C_HOST, $.l(Q)), $.get(AT, A_NODELAY, $.l(AG)), $.l(TMO))));
+      } else {
+        $.put(S, $.call(this.net.connectExHelper(), $.l(PORT), $.get(this.CT, C_HOST, $.l(Q)), $.get(AT, A_NODELAY, $.l(AG)), $.l(TMO)));
+      }
       this.excReturn($, $.nul(this.sockT));
       $.if($.get(AT, A_KEEPALIVE, $.l(AG)), () => $.run(this.net.setKeepAliveHelper(), $.l(S), $.i(1)));
       // oncreate(null, s)

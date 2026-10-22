@@ -135,6 +135,7 @@ import {
   IMPORT_EV_POLL,
   IMPORT_EXIT,
   IMPORT_NET_CALL,
+  IMPORT_TLS_CALL,
   IMPORT_FS_CALL,
   IMPORT_HOST_NUM,
   IMPORT_HOST_STR,
@@ -176,6 +177,8 @@ import { FsLaddersBuilder } from "./fs-ladders.js";
 import { ChildProcBuilder, SR_ERR_CODE, SR_HAS_STATUS, SR_SIGNAL, SR_STATUS, SR_STDERR, SR_STDOUT } from "./childproc.js";
 import { CH_CODE, CH_ERR, CH_HAS_PID, CH_KILLED, CH_OUT, CH_PID, CH_STATE, ChildAsyncBuilder } from "./childasync.js";
 import { NET_LISTS, NetBuilder, type NetList } from "./net.js";
+import { TlsBuilder } from "./tls.js";
+import { DgramBuilder, DGRAM_LISTS } from "./dgram.js";
 import { ENC_NAMES as HTTP_ENC_NAMES, ENC_NONE, ENC_UTF8, HL, HttpBuilder } from "./http.js";
 import { A, Fn, type X } from "./asm.js";
 import { MapBuilder, type MapInfo, type MapKeyKind, type MapValKind } from "./maps.js";
@@ -1042,7 +1045,8 @@ function spawnSyncMayThrowView(mod: WModule): WModule {
     }
   };
   scan(mod.functions);
-  const netKeys = netModuleReachable(mod);
+  // INC-29 U4: the socketless TLS keys (createSecureContext, the CA store) throw too.
+  const netKeys = netModuleReachable(mod) || libCallWhere(mod, isTlsKey);
   if (!found && !netKeys) return mod;
   const copy = (node: unknown): unknown => {
     if (Array.isArray(node)) return node.map(copy);
@@ -1053,6 +1057,10 @@ function spawnSyncMayThrowView(mod: WModule): WModule {
       // INC-29 U2: every node:http key can throw here (Node's validation
       // ladders, the named fences), so each reads as a throwing call.
       if (out["kind"] === "libCall" && typeof out["fn"] === "string" && out["fn"].startsWith("http.")) out["fn"] = "cp.execSync";
+      // INC-29 U4: every node:tls / node:https / CA-store / node:dgram key
+      // can throw here (Node's ladders, the host's material errors, the
+      // named fences).
+      if (out["kind"] === "libCall" && typeof out["fn"] === "string" && (isTlsKey(out["fn"]) || out["fn"].startsWith("dgram."))) out["fn"] = "cp.execSync";
       // INC-29 U1 (review): in a module that boxes net handles, `in` on a
       // checked-dynamic value can throw (the handle fence), so it reads as
       // a throwing call here.
@@ -1167,6 +1175,13 @@ function netModuleReachable(mod: WModule): boolean {
         found = true;
         return;
       }
+      // INC-29 U4: TLS sockets and servers are net's (tls.ts); UDP
+      // sockets share its handle table and event source (dgram.ts).
+      if (rec["kind"] === "libCall" && typeof rec["fn"] === "string" &&
+          ((isTlsKey(rec["fn"]) && !TLS_SOCKETLESS_KEYS.has(rec["fn"])) || rec["fn"].startsWith("dgram."))) {
+        found = true;
+        return;
+      }
       for (const value of Object.values(rec)) scan(value);
     }
   };
@@ -1190,7 +1205,8 @@ function httpModuleReachable(mod: WModule): boolean {
     }
     if (node !== null && typeof node === "object") {
       const rec = node as Record<string, unknown>;
-      if (rec["kind"] === "libCall" && typeof rec["fn"] === "string" && rec["fn"].startsWith("http.")) {
+      // INC-29 U4: node:https is node:http over TLS (http.ts, tls.ts).
+      if (rec["kind"] === "libCall" && typeof rec["fn"] === "string" && (rec["fn"].startsWith("http.") || rec["fn"].startsWith("https."))) {
         found = true;
         return;
       }
@@ -1202,6 +1218,57 @@ function httpModuleReachable(mod: WModule): boolean {
   }
   return found;
 }
+
+/** INC-29 U4: a libCall node anywhere in a reachable function whose
+ * name `pred` accepts. */
+function libCallWhere(mod: WModule, pred: (fn: string, args: readonly unknown[]) => boolean): boolean {
+  const reachable = reachableFunctionNames(mod);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      const rec = node as Record<string, unknown>;
+      if (rec["kind"] === "libCall" && typeof rec["fn"] === "string" && pred(rec["fn"], Array.isArray(rec["args"]) ? (rec["args"] as unknown[]) : [])) {
+        found = true;
+        return;
+      }
+      for (const value of Object.values(rec)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn.body);
+  }
+  return found;
+}
+
+/** INC-29 U4: a TLS key that needs the host's engine or stores (imports
+ * tlsCall). Reading the bundled roots, getCACertificates('bundled' /
+ * 'default') by literal, and setDefaultCACertificates are the module's
+ * own data and never reach the host. */
+function tlsHostKey(fn: string, args: readonly unknown[]): boolean {
+  if (!isTlsKey(fn)) return false;
+  if (fn === "tlsca.root" || fn === "tlsca.set") return false;
+  if (fn === "tlsca.get") {
+    const a = args[0] as Record<string, unknown> | undefined;
+    return !(a !== undefined && a["kind"] === "strLit" && (a["value"] === "bundled" || a["value"] === "default"));
+  }
+  return true;
+}
+
+/** INC-29 U4: a node:tls / node:https / CA-store key (tls.ts). */
+function isTlsKey(fn: string): boolean {
+  return fn.startsWith("tls.") || fn.startsWith("https.") || fn.startsWith("tlsca.") || fn === "net.serverOnSecureConnection";
+}
+
+/** INC-29 U4: the TLS keys that never open a socket or a server. */
+const TLS_SOCKETLESS_KEYS: ReadonlySet<string> = new Set([
+  "tls.caCertsChk", "tls.createSecureContext", "tls.createSecureContextDyn", "tls.pemDyn",
+  "tlsca.get", "tlsca.root", "tlsca.set",
+]);
 
 /** INC-29 U1: does any function set a net.Server's close override
  * (`server.close = fn`)? */
@@ -2264,6 +2331,14 @@ class Assembler {
   private readonly httpModule: boolean;
   /** INC-29 U1: `tsinter.netCall`'s index, or null outside a net module. */
   private readonly netCallFunc: number | null;
+  /** INC-29 U4: the module reaches node:tls / node:https / the CA store. */
+  private readonly tlsModule: boolean;
+  /** INC-29 U4: the module can replace the default CA set. */
+  private readonly caSetModule: boolean;
+  /** INC-29 U4: the module reaches node:dgram. */
+  private readonly dgramModule: boolean;
+  /** INC-29 U4: `tsinter.tlsCall`'s index, or null outside a TLS module. */
+  private readonly tlsCallFunc: number | null;
   /** The exit-drain gate's static fact — see exitListenerSurfaceReachable's
    * own comment (INC-26 P1). Computed ONCE in the constructor; every drain
    * gate site reads this, never the mutable `procField`/
@@ -2471,6 +2546,15 @@ class Assembler {
     // import index moves.
     this.netCallFunc = netMod
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_NET_CALL, this.mb.funcType([I32, I32, I32, I32, I32], [I32]))
+      : null;
+    // `tlsCall`'s decision (INC-29 U4, abi.ts): the host's TLS engine, in
+    // modules that reach node:tls, node:https or the CA store, minted after
+    // netCall so no earlier import index moves.
+    this.tlsModule = libCallWhere(mod, isTlsKey);
+    this.caSetModule = libCallWhere(mod, (fn) => fn === "tlsca.set");
+    this.dgramModule = libCallWhere(mod, (fn) => fn.startsWith("dgram."));
+    this.tlsCallFunc = libCallWhere(mod, tlsHostKey)
+      ? this.mb.importFunc(IMPORT_MODULE, IMPORT_TLS_CALL, this.mb.funcType([I32, I32, I32, I32, I32], [I32]))
       : null;
     // ── end INC-26 host-import block ──
     // The exit-drain gate's STATIC fact (see exitListenerSurfaceReachable's
@@ -8578,8 +8662,167 @@ class Assembler {
             },
           }
         : {}),
+      // INC-29 U4: a TLS module's sockets carry their TLS state (tls.ts),
+      // a dgram module's handle table its UDP sockets (dgram.ts).
+      ...(this.tlsModule ? { tls: { event: () => this.tls.eventFn(), hold: () => this.tls.holdFn() } } : {}),
+      ...(this.dgramModule
+        ? { dgram: { type: () => this.dgram.udpT(), event: () => this.dgram.eventFn(), alive: () => this.dgram.aliveFn() } }
+        : {}),
     });
     return this.netField;
+  }
+
+  private tlsField: TlsBuilder | null = null;
+
+  /** INC-29 U4: the TLS builder (tls.ts). */
+  private get tls(): TlsBuilder {
+    const strVec = (): VecInfo => this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!;
+    this.tlsField ??= new TlsBuilder(this.mb, {
+      net: () => this.net,
+      strRef: () => this.strRef,
+      strType: () => this.strType,
+      pushStrLit: (c, value) => this.pushStrLitInto(c, value),
+      concat: () => this.concatHelper(),
+      f64ToStr: () => this.f64ToStrHelper(),
+      strEq: () => this.strEqHelper(),
+      tlsCallFunc: () => {
+        if (this.tlsCallFunc === null) throw new Error("emitter bug: a TLS key was reached but tsinter.tlsCall was never imported");
+        return this.tlsCallFunc;
+      },
+      ensureCapacity: (c, need) => this.emitEnsureCapacity(c, need),
+      stageCursor: () => this.cursorGlobal,
+      namedTrap: (c, message) => {
+        const exc = this.exc();
+        this.pushStrLitInto(c, message);
+        c.globalSet(exc.refG);
+        c.i32Const(EXC_STR);
+        c.globalSet(exc.kindG);
+        c.call(this.reportUncaughtHelper());
+      },
+      voidClos: () => this.closPairFor([], []),
+      errClos: () => this.closPairFor([{ kind: "ref", nullable: true, typeIndex: this.exc().errT }], []),
+      sockClos: () => this.closPairFor([this.net.sockRef()], []),
+      nextTickEnqueue: () => this.nextTick.enqueue(),
+      excKind: () => this.exc().kindG,
+      errType: () => this.exc().errT,
+      newError: (c, className, name, pushMessage, pushCode) => {
+        c.globalGet(this.classes.vtGlobal(className));
+        this.pushStrLitInto(c, name);
+        pushMessage(c);
+        pushCode(c);
+        c.structNew(this.exc().errT);
+      },
+      throwStack: (c) => this.emitThrowStackTop(c),
+      bytesType: () => this.bytesB.bytesType(),
+      bufType: () => this.bytesB.bufType(),
+      strToBytes: () => this.bytesB.fromStrHelper("utf8"),
+      utf8Decode: () => this.bytesB.toStrHelper("utf8"),
+      numReceived: () => this.bytesB.numReceivedHelper(),
+      inspectStr: () => this.insp.str(),
+      inspectDyn: () => this.insp.dyn(),
+      formatJ: () => this.json.formatJ(),
+      dynRef: () => this.dyn.dynRef(),
+      dynT: () => this.dyn.dynT(),
+      objT: () => this.dyn.objT(),
+      objGet: () => this.dyn.objGet(),
+      truthy: () => this.dyn.truthy(),
+      specificType: () => this.dyn.specificType(),
+      dynBytes: () => this.tlsDynBytesFn(),
+      dynArrVec: () => {
+        const info = this.dynVecInfo();
+        return { struct: info.struct, bufType: info.bufType };
+      },
+      strVec: () => {
+        const v = strVec();
+        return { struct: v.struct, bufType: v.bufType };
+      },
+      caSet: this.caSetModule,
+    });
+    return this.tlsField;
+  }
+
+  private dgramField: DgramBuilder | null = null;
+
+  /** INC-29 U4: the dgram builder (dgram.ts). */
+  private get dgram(): DgramBuilder {
+    this.dgramField ??= new DgramBuilder(this.mb, {
+      net: () => this.net,
+      strRef: () => this.strRef,
+      strType: () => this.strType,
+      pushStrLit: (c, value) => this.pushStrLitInto(c, value),
+      concat: () => this.concatHelper(),
+      f64ToStr: () => this.f64ToStrHelper(),
+      netCallFunc: () => this.netCallFuncOrThrow(),
+      ensureCapacity: (c, need) => this.emitEnsureCapacity(c, need),
+      stageCursor: () => this.cursorGlobal,
+      namedTrap: (c, message) => {
+        const exc = this.exc();
+        this.pushStrLitInto(c, message);
+        c.globalSet(exc.refG);
+        c.i32Const(EXC_STR);
+        c.globalSet(exc.kindG);
+        c.call(this.reportUncaughtHelper());
+      },
+      voidClos: () => this.closPairFor([], []),
+      errClos: () => this.closPairFor([{ kind: "ref", nullable: true, typeIndex: this.exc().errT }], []),
+      msgClos: () => this.closPairFor([this.bytesB.bytesRef(), this.strRef, this.strRef, F64, F64], []),
+      nextTickEnqueue: () => this.nextTick.enqueue(),
+      excKind: () => this.exc().kindG,
+      errType: () => this.exc().errT,
+      newError: (c, className, name, pushMessage, pushCode) => {
+        c.globalGet(this.classes.vtGlobal(className));
+        this.pushStrLitInto(c, name);
+        pushMessage(c);
+        pushCode(c);
+        c.structNew(this.exc().errT);
+      },
+      throwStack: (c) => this.emitThrowStackTop(c),
+      bytesType: () => this.bytesB.bytesType(),
+      bufType: () => this.bytesB.bufType(),
+      strToBytes: () => this.bytesB.fromStrHelper("utf8"),
+      strToNumber: () => this.strToNumHelper(),
+      specificType: () => this.dyn.specificType(),
+      dynRef: () => this.dyn.dynRef(),
+      dynT: () => this.dyn.dynT(),
+      dynBytes: () => this.tlsDynBytesFn(),
+      dynArrVec: () => {
+        const info = this.dynVecInfo();
+        return { struct: info.struct, bufType: info.bufType };
+      },
+    });
+    return this.dgramField;
+  }
+
+  /** INC-29 U4: throw the error value on top of the stack (fills the
+   * pending cell) — net.ts's throwStack. */
+  private emitThrowStackTop(c: Code): void {
+    const exc = this.exc();
+    const tmp = this.netThrowTmpGlobal();
+    c.globalSet(tmp);
+    c.globalGet(tmp);
+    c.globalSet(exc.refG);
+    c.globalGet(tmp);
+    c.structGet(exc.errT, 0);
+    c.structGet(this.classes.ci(), CI_PRE);
+    c.globalSet(exc.preG);
+    c.i32Const(EXC_OBJ);
+    c.globalSet(exc.kindG);
+  }
+
+  private tlsDynBytesField: number | null = null;
+
+  /** INC-29 U4: `(dyn) -> bytes` for a BYTES value (the bytes check
+   * walker with no path). */
+  private tlsDynBytesFn(): number {
+    if (this.tlsDynBytesField !== null) return this.tlsDynBytesField;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.dyn.dynRef()], [this.bytesB.bytesRef()]), "%w.tls.dynBytes");
+    this.tlsDynBytesField = idx;
+    const c = new Code();
+    c.localGet(0);
+    c.refNull(this.dyn.pathT());
+    c.call(this.dynBytesPayloadFn());
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
   }
 
   private netThrowTmpField: number | null = null;
@@ -9061,8 +9304,25 @@ class Assembler {
         return addListener(L.LV_LISTENING, e.args[1]!, e.args[2]);
       case "net.serverOnError":
         return addListener(L.LV_ERROR, e.args[1]!, e.args[2]);
-      case "net.serverOnConnection":
-        return addListener(L.LV_CONN, e.args[1]!, e.args[2]);
+      case "net.serverOnConnection": {
+        if (!this.tlsModule) return addListener(L.LV_CONN, e.args[1]!, e.args[2]);
+        // INC-29 U4: a tls.Server's 'connection' listener is a named fence
+        const once = this.netOnce(e.args[2], e.fn, e.loc);
+        if (once === null) return unreach();
+        const R = this.acquireScratch(this.net.srvRef());
+        this.walkExpr(e.args[0]!);
+        code.localTee(R);
+        code.call(this.tls.connGuardFn());
+        code.drop();
+        this.emitPendingCheck();
+        code.localGet(R);
+        this.releaseScratch(this.net.srvRef(), R);
+        if (!this.emitNetListener(e.args[1]!, "sock", e.fn, e.loc)) return unreach();
+        code.i32Const(once ? 1 : 0);
+        code.i32Const(0);
+        code.call(this.net.addHelper(L.LV_CONN));
+        return true;
+      }
       case "net.connect":
       case "net.connectCb":
       case "net.connectAttempt": {
@@ -10173,6 +10433,8 @@ class Assembler {
       strToNumber: () => this.strToNumHelper(),
       utf8Decode: () => this.bytesB.toStrHelper("utf8"),
       toLowerCase: () => this.casing.toLowerCase(),
+      // INC-29 U4: https's client dials through tls.connect (tls.ts).
+      ...(this.tlsModule ? { tls: { agentConnect: () => this.tls.agentConnectFn(), tlsoT: () => this.tls.tlsoT() } } : {}),
     });
     return this.httpField;
   }
@@ -10364,8 +10626,484 @@ class Assembler {
 
   /** node:http's libCalls (http.ts). Answers false for a key this does
    * not handle (it then refuses by its own libCall name). */
+  /* ── INC-29 U4 — node:tls / node:https servers and the CA store (tls.ts) ── */
+
+  /** Push an https request's $tlso from its rejectUnauthorized (bool) and
+   * ca (a PEM string or Buffer; "" = none) arguments. */
+  private emitTlsoNew(reject: WExpr, ca: WExpr, fnName: string, loc: SrcLoc | undefined): boolean {
+    const code = this.fn.code;
+    this.walkExpr(reject);
+    if (ca.kind === "strLit" && ca.value === "") {
+      code.refNull(this.bytesB.bytesType());
+      this.pushStrLitInto(code, "");
+    } else if (ca.type.kind === "string") {
+      const S = this.acquireScratch(this.strRef);
+      this.walkExpr(ca);
+      code.localTee(S);
+      // a falsy ca (a runtime "") is no ca: the default store
+      code.arrayLen();
+      code.ifResult(this.bytesB.bytesRef());
+      code.localGet(S);
+      code.call(this.bytesB.fromStrHelper("utf8"));
+      code.else_();
+      code.refNull(this.bytesB.bytesType());
+      code.end();
+      code.localGet(S);
+      this.releaseScratch(this.strRef, S);
+    } else if (ca.type.kind === "bytes") {
+      const B = this.acquireScratch(this.bytesB.bytesRef());
+      this.walkExpr(ca);
+      code.localTee(B);
+      code.localGet(B);
+      code.call(this.bytesB.toStrHelper("utf8"));
+      this.releaseScratch(this.bytesB.bytesRef(), B);
+    } else {
+      this.refuse(`libCall:${fnName}:ca`, loc);
+      return false;
+    }
+    code.call(this.tls.tlsoNewFn());
+    return true;
+  }
+
+  private emitTlsLibCall(e: Extract<WExpr, { kind: "libCall" }>): boolean {
+    if (!isTlsKey(e.fn)) return false;
+    // https's request rows ride the http client (emitHttpLibCall).
+    if (e.fn === "https.request" || e.fn === "https.requestCb" || e.fn === "https.requestUrl" || e.fn === "https.requestUrlCb") return false;
+    const code = this.fn.code;
+    const unreach = (): true => {
+      code.unreachable();
+      return true;
+    };
+    if (this.netModule && this.cpEventModule) {
+      this.refuse("libCall:net:with-spawn", e.loc);
+      return unreach();
+    }
+    const t = this.tls;
+    const arg = (i: number): void => this.walkExpr(e.args[i]!);
+    /** a PEM argument (a string or a Buffer) as bytes */
+    const pem = (i: number): boolean => {
+      const a = e.args[i]!;
+      if (a.type.kind === "string") {
+        arg(i);
+        code.call(this.bytesB.fromStrHelper("utf8"));
+        return true;
+      }
+      if (a.type.kind === "bytes") {
+        arg(i);
+        return true;
+      }
+      this.refuse(`libCall:${e.fn}:pem`, e.loc);
+      return false;
+    };
+    const srvRef = (): ValType => this.net.srvRef();
+    /** ctx on the stack (0 = error pending) -> the tls.Server: srvNew,
+     * the TLS setup, the optional secureConnection listener. */
+    const tlsServer = (cbIdx: number | null): boolean => {
+      this.emitPendingCheck();
+      const CTX = this.acquireScratch(I32);
+      const V = this.acquireScratch(srvRef());
+      code.localSet(CTX);
+      code.call(this.net.srvNewHelper());
+      code.localTee(V);
+      code.localGet(CTX);
+      code.i32Const(0);
+      code.call(t.serverSetupFn());
+      if (cbIdx !== null) {
+        code.localGet(V);
+        if (!this.emitNetListener(e.args[cbIdx]!, "sock", e.fn, e.loc)) return false;
+        code.i32Const(0);
+        code.i32Const(0);
+        code.call(this.net.addHelper(this.net.tlsFields().LV_SECCONN));
+      }
+      code.localGet(V);
+      this.releaseScratch(srvRef(), V);
+      this.releaseScratch(I32, CTX);
+      return true;
+    };
+    /** ctx on the stack -> the https.Server with the request handler. */
+    const httpsServer = (cbIdx: number | null): boolean => {
+      this.emitPendingCheck();
+      const CTX = this.acquireScratch(I32);
+      const V = this.acquireScratch(srvRef());
+      code.localSet(CTX);
+      if (cbIdx !== null) {
+        if (!this.emitHttpListener(e.args[cbIdx]!, "reqres", e.fn, e.loc)) return false;
+      } else {
+        code.refNull(EQ_HEAP);
+      }
+      code.call(this.http.serverNewSecureFn());
+      code.localTee(V);
+      code.localGet(CTX);
+      code.i32Const(1);
+      code.call(t.serverSetupFn());
+      code.localGet(V);
+      this.releaseScratch(srvRef(), V);
+      this.releaseScratch(I32, CTX);
+      return true;
+    };
+    const addListener = (list: NetList, cbIdx: number, onceIdx: number | null): boolean => {
+      const once = onceIdx === null ? false : this.netOnce(e.args[onceIdx], e.fn, e.loc);
+      if (once === null) return unreach();
+      arg(0);
+      if (!this.emitNetListener(e.args[cbIdx]!, list.arg, e.fn, e.loc)) return unreach();
+      code.i32Const(once ? 1 : 0);
+      code.i32Const(0);
+      code.call(this.net.addHelper(list));
+      return true;
+    };
+    switch (e.fn) {
+      case "tls.createSecureContext":
+        if (!pem(0) || !pem(1)) return unreach();
+        code.call(t.serverCtxFn());
+        this.emitPendingCheck();
+        code.call(t.sctxNewFn());
+        return true;
+      case "tls.createSecureContextDyn":
+        arg(0);
+        code.i32Const(0);
+        this.pushStrLitInto(code, "tls.createSecureContext");
+        code.call(t.ctxFromDynFn(false));
+        this.emitPendingCheck();
+        code.call(t.sctxNewFn());
+        return true;
+      case "tls.createServer":
+      case "tls.createServerCb":
+        if (!pem(0) || !pem(1)) return unreach();
+        code.call(t.serverCtxFn());
+        return tlsServer(e.fn === "tls.createServerCb" ? 2 : null) ? true : unreach();
+      case "tls.createServerDyn":
+      case "tls.createServerDynCb":
+        arg(0);
+        this.pushStrLitInto(code, "tls.createServer");
+        code.call(t.serverCtxFromDynFn(false));
+        return tlsServer(e.fn === "tls.createServerDynCb" ? 1 : null) ? true : unreach();
+      case "https.createServer":
+        if (!pem(0) || !pem(1)) return unreach();
+        code.call(t.serverCtxFn());
+        return httpsServer(2) ? true : unreach();
+      case "https.createServerDyn":
+      case "https.createServerDynCb":
+        arg(0);
+        this.pushStrLitInto(code, "https.createServer");
+        code.call(t.serverCtxFromDynFn(true));
+        return httpsServer(e.fn === "https.createServerDynCb" ? 1 : null) ? true : unreach();
+      case "tls.pemDyn":
+        arg(0);
+        arg(1);
+        code.call(t.pemDynFn());
+        this.emitPendingCheck();
+        return true;
+      case "tls.connect":
+      case "tls.connectCb":
+        arg(0);
+        arg(1);
+        arg(2);
+        if (e.fn === "tls.connectCb") {
+          if (!this.emitNetListener(e.args[3]!, "void", e.fn, e.loc)) return unreach();
+        } else {
+          code.refNull(this.closPairFor([], []).clos);
+        }
+        code.call(t.connectFn());
+        this.emitPendingCheck();
+        return true;
+      case "tls.sockAuthorized":
+        arg(0);
+        code.call(t.authorizedFn());
+        return true;
+      case "tls.sockAuthError": {
+        // string | null
+        const ty = e.type;
+        if (ty.kind !== "union") {
+          this.refuse(`libCall:${e.fn}:shape`, e.loc);
+          return unreach();
+        }
+        const def = this.unionDef(ty.unionId);
+        const sTag = def.arms.findIndex((a) => a.kind === "string");
+        const nTag = def.arms.findIndex((a) => a.kind === "nullT");
+        const armSt = sTag < 0 ? null : this.unionArmStruct(ty.unionId, sTag, e.loc);
+        const unionVal = this.mapType(ty, e.loc);
+        if (def.arms.length !== 2 || nTag < 0 || armSt === null || unionVal === null) {
+          this.refuse(`libCall:${e.fn}:shape`, e.loc);
+          return unreach();
+        }
+        const A = this.acquireScratch(this.strRef);
+        arg(0);
+        code.call(t.authErrorFn());
+        code.localTee(A);
+        code.refIsNull();
+        this.openIfResult(unionVal);
+        code.globalGet(this.unions.unitGlobal(nTag));
+        code.else_();
+        code.i32Const(sTag);
+        code.localGet(A);
+        code.structNew(armSt);
+        this.close();
+        this.releaseScratch(this.strRef, A);
+        return true;
+      }
+      case "tls.sockOnSecureConnect":
+        return addListener(this.net.tlsFields().L_SECURE, 1, 2);
+      case "net.serverOnSecureConnection":
+        return addListener(this.net.tlsFields().LV_SECCONN, 1, 2);
+      case "tls.caCertsChk": {
+        const sv = this.strVecInfo();
+        if (e.type.kind !== "array" || e.type.elem.kind !== "string") {
+          this.refuse(`libCall:${e.fn}:shape`, e.loc);
+          return unreach();
+        }
+        void sv;
+        arg(0);
+        code.call(t.getDynFn());
+        this.emitPendingCheck();
+        return true;
+      }
+      case "tlsca.get": {
+        // a literal type that names the module's own stores reads them
+        // directly (no host import is reached)
+        const a = e.args[0]!;
+        if (a.kind === "strLit" && (a.value === "bundled" || a.value === "default")) {
+          code.call(a.value === "bundled" ? t.bundledFn() : t.defaultFn());
+          return true;
+        }
+        arg(0);
+        code.call(t.getFn());
+        this.emitPendingCheck();
+        return true;
+      }
+      case "tlsca.root":
+        code.call(t.bundledFn());
+        return true;
+      case "tlsca.set":
+        arg(0);
+        code.call(t.setFn());
+        this.emitPendingCheck();
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  /* ── INC-29 U4 — node:dgram (dgram.ts) ── */
+
+  /** The 'message' listener ADAPTER: the fixed (bytes, address, family,
+   * port, size) closure calling the user's (msg[, rinfo]) with the rinfo
+   * record built. Interned per callback type. */
+  private readonly dgramMsgAdapters = new Map<string, { fn: number; env: number }>();
+
+  private dgramMsgAdapterFor(cbType: IrType & { kind: "func" }, loc: SrcLoc | undefined): { fn: number; env: number } | null {
+    const user = this.closSigFor(cbType, loc);
+    if (user === null) return null;
+    const p0 = cbType.params[0];
+    const p1 = cbType.params[1];
+    if (p0 !== undefined && !(p0.kind === "bytes" && p0.elem === "u8")) {
+      this.refuse("libCall:dgram.onMessage:callback-shape", loc);
+      return null;
+    }
+    let rinfo: { struct: number; fieldIndex: Map<string, number> } | null = null;
+    if (p1 !== undefined) {
+      if (p1.kind !== "record") {
+        this.refuse("libCall:dgram.onMessage:callback-shape", loc);
+        return null;
+      }
+      const info = this.recordInfo(p1.shapeId, loc, false);
+      if (info === null || info.overflow !== null) {
+        this.refuse("libCall:dgram.onMessage:callback-shape", loc);
+        return null;
+      }
+      rinfo = info;
+    }
+    const key = `${user.clos}:${p1 === undefined ? "-" : (p1 as { shapeId: string }).shapeId}:${cbType.params.length}`;
+    const hit = this.dgramMsgAdapters.get(key);
+    if (hit !== undefined) return hit;
+    const fixed = this.closPairFor([this.bytesB.bytesRef(), this.strRef, this.strRef, F64, F64], []);
+    const env = this.mb.subStructType(
+      `dgramMsgEnv:${key}`,
+      [
+        { storage: { kind: "ref", nullable: false, typeIndex: fixed.fn }, mutable: false },
+        { storage: { kind: "ref", nullable: true, typeIndex: user.clos }, mutable: false },
+      ],
+      fixed.clos,
+    );
+    const fn = this.mb.declareFunc(fixed.fn, `%w.dgram.msgAdapter.${this.dgramMsgAdapters.size}`);
+    const made = { fn, env };
+    this.dgramMsgAdapters.set(key, made);
+    const c = new Code();
+    const U = 6;
+    c.localGet(0);
+    c.refCast(env);
+    c.structGet(env, 1);
+    c.localSet(U);
+    c.localGet(U);
+    if (p0 !== undefined) c.localGet(1);
+    if (rinfo !== null) {
+      const R = 7;
+      c.structNewDefault(rinfo.struct);
+      c.localSet(R);
+      const put = (name: string, push: () => void): void => {
+        const idx = rinfo!.fieldIndex.get(name);
+        if (idx === undefined) return;
+        c.localGet(R);
+        push();
+        c.structSet(rinfo!.struct, idx);
+      };
+      put("address", () => c.localGet(2));
+      put("family", () => c.localGet(3));
+      put("port", () => c.localGet(4));
+      put("size", () => c.localGet(5));
+      c.localGet(R);
+    }
+    c.localGet(U);
+    c.structGet(user.clos, 0);
+    c.callRef(user.fn);
+    const locals: ValType[] = [{ kind: "ref", nullable: true, typeIndex: user.clos }];
+    if (rinfo !== null) locals.push({ kind: "ref", nullable: true, typeIndex: rinfo.struct });
+    this.mb.setBody(fn, locals, c.bytes());
+    return made;
+  }
+
+  private emitDgramLibCall(e: Extract<WExpr, { kind: "libCall" }>): boolean {
+    if (!e.fn.startsWith("dgram.")) return false;
+    const code = this.fn.code;
+    const unreach = (): true => {
+      code.unreachable();
+      return true;
+    };
+    if (this.netModule && this.cpEventModule) {
+      this.refuse("libCall:net:with-spawn", e.loc);
+      return unreach();
+    }
+    const d = this.dgram;
+    const arg = (i: number): void => this.walkExpr(e.args[i]!);
+    const vnull = (): void => code.refNull(this.closPairFor([], []).clos);
+    const statement = (fn: number): true => {
+      code.call(fn);
+      code.drop();
+      this.emitPendingCheck();
+      return true;
+    };
+    const voidCb = (i: number): boolean => this.emitNetListener(e.args[i]!, "void", e.fn, e.loc);
+    const on = (list: (typeof DGRAM_LISTS)[keyof typeof DGRAM_LISTS], push: () => boolean): boolean => {
+      const once = this.netOnce(e.args[2], e.fn, e.loc);
+      if (once === null) return unreach();
+      arg(0);
+      if (!push()) return unreach();
+      code.i32Const(once ? 1 : 0);
+      code.i32Const(0);
+      code.call(d.addFn(list));
+      return true;
+    };
+    switch (e.fn) {
+      case "dgram.createSocket":
+        arg(0);
+        code.call(d.newFn());
+        return true;
+      case "dgram.bind":
+      case "dgram.bindCb":
+      case "dgram.connect":
+      case "dgram.connectCb": {
+        arg(0);
+        arg(1);
+        arg(2);
+        if (e.fn.endsWith("Cb")) {
+          if (!voidCb(3)) return unreach();
+        } else {
+          vnull();
+        }
+        return statement(e.fn.startsWith("dgram.bind") ? d.bindFn() : d.connectFn());
+      }
+      case "dgram.sendStr":
+      case "dgram.sendBytes":
+        arg(0);
+        arg(1);
+        if (e.fn === "dgram.sendStr") code.call(this.bytesB.fromStrHelper("utf8"));
+        arg(2);
+        arg(3);
+        return statement(d.sendTypedFn());
+      case "dgram.sendChk":
+        for (let i = 0; i < 7; i++) arg(i);
+        return statement(d.sendChkFn());
+      case "dgram.address": {
+        if (e.type.kind !== "record") {
+          this.refuse("libCall:dgram.address:shape", e.loc);
+          return unreach();
+        }
+        const info = this.recordInfo(e.type.shapeId, e.loc, false);
+        if (info === null || info.overflow !== null) return unreach();
+        const U = this.acquireScratch(d.udpRef());
+        const R = this.acquireScratch({ kind: "ref", nullable: true, typeIndex: info.struct });
+        arg(0);
+        code.localTee(U);
+        statement(d.addressCheckFn());
+        code.structNewDefault(info.struct);
+        code.localSet(R);
+        const put = (name: string, push: () => void): void => {
+          const idx = info.fieldIndex.get(name);
+          if (idx === undefined) return;
+          code.localGet(R);
+          push();
+          code.structSet(info.struct, idx);
+        };
+        put("address", () => {
+          code.localGet(U);
+          code.call(d.addrStrFn());
+        });
+        put("family", () => this.pushStrLitInto(code, "IPv4"));
+        put("port", () => {
+          code.localGet(U);
+          code.call(d.addrPortFn());
+        });
+        code.localGet(R);
+        this.releaseScratch({ kind: "ref", nullable: true, typeIndex: info.struct }, R);
+        this.releaseScratch(d.udpRef(), U);
+        return true;
+      }
+      case "dgram.close":
+      case "dgram.closeCb":
+        arg(0);
+        if (e.fn === "dgram.closeCb") {
+          if (!voidCb(1)) return unreach();
+        } else {
+          vnull();
+        }
+        return statement(d.closeFn());
+      case "dgram.unref":
+      case "dgram.ref":
+        arg(0);
+        code.call(d.refFn(e.fn === "dgram.ref"));
+        return true;
+      case "dgram.onMessage":
+        return on(DGRAM_LISTS.MESSAGE, () => {
+          const cb = e.args[1]!;
+          if (cb.type.kind !== "func" || cb.type.ret.kind !== "void" || cb.type.params.length > 2) {
+            this.refuse("libCall:dgram.onMessage:callback-shape", e.loc);
+            return false;
+          }
+          const adapter = this.dgramMsgAdapterFor(cb.type, e.loc);
+          if (adapter === null) return false;
+          this.mb.declareFuncRef(adapter.fn);
+          code.refFunc(adapter.fn);
+          this.walkExpr(cb);
+          code.structNew(adapter.env);
+          return true;
+        });
+      case "dgram.onError":
+        return on(DGRAM_LISTS.ERROR, () => this.emitHttpListener(e.args[1]!, "err", e.fn, e.loc));
+      case "dgram.onListening":
+        return on(DGRAM_LISTS.LISTENING, () => voidCb(1));
+      case "dgram.onClose":
+        return on(DGRAM_LISTS.CLOSE, () => voidCb(1));
+      case "dgram.onConnect":
+        return on(DGRAM_LISTS.CONNECT, () => voidCb(1));
+      default:
+        return false;
+    }
+  }
+
   private emitHttpLibCall(e: Extract<WExpr, { kind: "libCall" }>): boolean {
-    if (!e.fn.startsWith("http.")) return false;
+    // INC-29 U4: https's request rows are the http client's with TLS
+    // options and the https global agent.
+    const httpsRow = this.tlsModule && (e.fn === "https.request" || e.fn === "https.requestCb" || e.fn === "https.requestUrl" || e.fn === "https.requestUrlCb");
+    if (!e.fn.startsWith("http.") && !httpsRow) return false;
     const code = this.fn.code;
     const unreach = (): true => {
       code.unreachable();
@@ -10792,9 +11530,12 @@ class Assembler {
       case "http.request":
       case "http.requestCb":
       case "http.requestAgent":
-      case "http.requestAgentCb": {
+      case "http.requestAgentCb":
+      case "https.request":
+      case "https.requestCb": {
+        const secure = e.fn.startsWith("https.");
         const withAgent = e.fn === "http.requestAgent" || e.fn === "http.requestAgentCb";
-        const withCb = e.fn === "http.requestCb" || e.fn === "http.requestAgentCb";
+        const withCb = e.fn === "http.requestCb" || e.fn === "http.requestAgentCb" || e.fn === "https.requestCb";
         const headersArg = e.args[5]!;
         const Q = this.acquireScratch(h.creqRef());
         const V = this.acquireScratch(this.vecs.vecRef(strVec));
@@ -10825,6 +11566,8 @@ class Assembler {
           code.localTee(AD);
           code.call(this.httpAgentArgFn());
           this.emitPendingCheck();
+        } else if (secure) {
+          code.call(h.httpsGlobalAgentFn());
         } else {
           code.refNull(h.agentT());
         }
@@ -10837,9 +11580,17 @@ class Assembler {
           code.i32Const(0);
         }
         if (withCb) {
-          if (!this.emitHttpListener(e.args[withAgent ? 8 : 7]!, "inc", e.fn, e.loc)) return unreach();
+          if (!this.emitHttpListener(e.args[secure ? 9 : withAgent ? 8 : 7]!, "inc", e.fn, e.loc)) return unreach();
         } else {
           code.refNull(EQ_HEAP);
+        }
+        // INC-29 U4: the request's TLS options (null for http)
+        if (this.tlsModule) {
+          if (secure) {
+            if (!this.emitTlsoNew(e.args[7]!, e.args[8]!, e.fn, e.loc)) return unreach();
+          } else {
+            code.refNull(EQ_HEAP);
+          }
         }
         code.call(h.clientRequestNewFn());
         this.emitPendingCheck();
@@ -10875,12 +11626,15 @@ class Assembler {
       }
       /* ── INC-29 U3: the URL-string / URL-object first argument ── */
       case "http.requestUrl":
-      case "http.requestUrlCb": {
+      case "http.requestUrlCb":
+      case "https.requestUrl":
+      case "https.requestUrlCb": {
+        const secure = e.fn.startsWith("https.");
         const W = this.urlEngine;
         const U = this.acquireScratch(W.urlRef());
         const Q = this.acquireScratch(h.creqRef());
         arg(0);
-        code.call(W.httpTargetFn());
+        code.call(W.httpTargetFn(secure));
         this.emitPendingCheck();
         code.localSet(U);
         code.localGet(U);
@@ -10890,13 +11644,24 @@ class Assembler {
         code.localGet(U);
         code.call(W.httpPathFn());
         arg(1);
-        if (e.fn === "http.requestUrlCb") {
+        if (e.fn === "http.requestUrlCb" || e.fn === "https.requestUrlCb") {
           if (!this.emitHttpListener(e.args[3]!, "inc", e.fn, e.loc)) return unreach();
         } else {
           code.refNull(EQ_HEAP);
         }
         code.localGet(U);
         code.call(W.httpAuthFn());
+        // INC-29 U4: the URL form's TLS options are Node's defaults
+        if (this.tlsModule) {
+          if (secure) {
+            code.i32Const(1);
+            code.refNull(this.bytesB.bytesType());
+            this.pushStrLitInto(code, "");
+            code.call(this.tls.tlsoNewFn());
+          } else {
+            code.refNull(EQ_HEAP);
+          }
+        }
         code.call(h.clientRequestUrlFn());
         this.emitPendingCheck();
         code.localSet(Q);
@@ -15220,6 +15985,16 @@ class Assembler {
         return this.urlEngine.urlRef();
       case "searchParams":
         return this.urlEngine.spRef();
+      // INC-29 U4: a dgram.Socket (dgram.ts) and a SecureContext (tls.ts),
+      // in the modules that reach them; mapTypeSoft carries the same arms.
+      case "dgramSocket":
+        if (this.dgramModule) return this.dgram.udpRef();
+        this.refuse(`type:${t.kind}`, loc);
+        return null;
+      case "secureCtx":
+        if (this.tlsModule) return this.tls.sctxRef();
+        this.refuse(`type:${t.kind}`, loc);
+        return null;
       default:
         this.refuse(`type:${t.kind}`, loc);
         return null;
@@ -15401,6 +16176,11 @@ class Assembler {
         return this.httpModule ? this.http.resRef() : I32;
       case "httpClientReq":
         return this.httpModule ? this.http.creqRef() : I32;
+      // INC-29 U4: mapType's dgramSocket / secureCtx arms, in lockstep.
+      case "dgramSocket":
+        return this.dgramModule ? this.dgram.udpRef() : I32;
+      case "secureCtx":
+        return this.tlsModule ? this.tls.sctxRef() : I32;
       // INC-27 U1: mapType never fails on symbol either — same
       // consistency rule as every other never-fails arm above
       // (dyn/jsval/bytes/regex/stats). This case and mapType's own
@@ -22230,6 +23010,8 @@ class Assembler {
           code.unreachable();
           return;
         }
+        if (this.emitTlsLibCall(e)) return;
+        if (this.emitDgramLibCall(e)) return;
         if (this.emitHttpLibCall(e)) return;
         if (this.emitNetLibCall(e)) return;
         if (this.emitBufferLibCall(e)) return;
