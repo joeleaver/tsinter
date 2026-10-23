@@ -1029,7 +1029,12 @@ function spawnSyncMayThrowView(mod: WModule): WModule {
   // INC-29 U1: node:net's synchronous throws on this tier — listen's
   // ERR_SERVER_ALREADY_LISTEN and port check, connect's host and port
   // checks, and server.address().port before a listen (null.port).
+  // Board #233: parseGetTime's S069 fence throws on this tier only (the
+  // native lanes answer a value), so a caller must check after the call;
+  // without it the fence was swallowed inside a function and an uncaught
+  // one at top level exited 0 with no output.
   const keys = new Set([
+    "date.parseGetTime",
     "cp.spawnSync", "cp.spawnSyncOpts", "cp.spawnSyncStdioStr", "cp.spawn", "cp.spawnOpts", "child.killNum",
     "net.listen", "net.listenCb", "net.listenOpts", "net.listenOptsCb", "net.connect", "net.connectCb", "net.serverPort",
   ]);

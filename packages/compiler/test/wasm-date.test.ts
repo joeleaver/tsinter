@@ -24,7 +24,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { compile } from "../src/index.js";
-import { runWasm } from "./wasm-host.js";
+import { runWasm, runWasmToTrap } from "./wasm-host.js";
 import { LIB_FN_SIGS } from "../src/ir/validate.js";
 import { F64, STRING } from "../src/ir/nodes.js";
 
@@ -217,6 +217,38 @@ describe("date.parseGetTime — the S069 fence, asserted on its OWN text (no Nod
       );
       const { stdout } = await runWasm(path);
       expect(stdout).toBe("Error SC1090\n");
+    });
+  }
+});
+
+// ── board #233: the fence reaches callers and the top level ───────────
+// The fence is emitter-owned and outside the shared may-throw list, so
+// these rows pin that a caller still sees it: through a function (it was
+// swallowed — f() answered 0 and the program carried on) and uncaught at
+// top level (it exited 0 with no output).
+describe("date.parseGetTime — the S069 fence propagates (board #233)", () => {
+  test("through a function, caught by the caller", async () => {
+    const path = await build(
+      "fence-fn-caught.ts",
+      `function f(s: string): number { return new Date(s).getTime(); }
+       function g(s: string): number { return f(s) + 1; }
+       try { console.log(g("bogus")); console.log("NOT FENCED"); }
+       catch (e) { if (e instanceof Error) console.log(e.name, \`\${(e as NodeJS.ErrnoException).code}\`); }
+       console.log("after");`,
+    );
+    const { stdout } = await runWasm(path);
+    expect(stdout).toBe("Error SC1090\nafter\n");
+  });
+  for (const [name, src] of [
+    ["top level", `console.log("before");\nconsole.log(new Date("bogus").getTime());\nconsole.log("after");`],
+    ["inside a function", `function f(): number { return new Date("bogus").getTime(); }\nconsole.log("before");\nconsole.log(f());\nconsole.log("after");`],
+  ] as const) {
+    test(`uncaught ${name}: a loud uncaught Error, never a value or exit 0`, async () => {
+      const path = await build(`fence-uncaught-${name.replace(/ /g, "-")}.ts`, src);
+      await expect(runWasm(path)).rejects.toThrow();
+      const { stdout, stderr } = await runWasmToTrap(path);
+      expect(stdout).toBe("before\n");
+      expect(stderr).toMatch(/^Uncaught Error: date\.parseGetTime: this string is not one of the two modelled date formats/);
     });
   }
 });
