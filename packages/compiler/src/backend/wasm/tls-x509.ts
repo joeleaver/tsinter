@@ -44,6 +44,10 @@ export const PEM_UNSUPPORTED = 4;
 /** A certificate whose DER OpenSSL would re-encode (a non-minimal or
  * indefinite length below the outer SEQUENCE): fenced by name. */
 export const PEM_NONCANON = 5;
+/** First-only mode (crypto.ts's X509Certificate): bytes after the
+ * certificate inside the PEM block, which d2i_X509_AUX would read as
+ * X509_CERT_AUX trust data — fenced by name. */
+export const PEM_TRAILING = 6;
 
 /* x509Info's fields. */
 export const XI_SAN = 0; // string, null = no subjectAltName extension
@@ -508,9 +512,18 @@ export class X509Builder {
 
   /** `(buf, len) -> bytes[]` (the DER of each certificate, in order;
    * null with the error global set). The count is the array's non-null
-   * prefix. */
-  pemReadFn(): number {
-    return this.fn("pemRead", [this.bRef, I32], [this.ref(this.BA)], (f, $) => {
+   * prefix.
+   *
+   * `first` is PEM_read_bio_X509_AUX's single read instead (ncrypto's
+   * X509Pointer::Parse, crypto.ts): it stops at the first certificate,
+   * also takes the TRUSTED CERTIFICATE name, and fences what that read
+   * does differently from the loop: an empty block (PEM_UNSUPPORTED),
+   * bytes after the certificate (PEM_TRAILING, the AUX trust data) and an
+   * indefinite outer length (PEM_NONCANON). A DER failure is PEM_ASN1
+   * (its text is the ASN.1 decoder's reason, which this tier does not
+   * model). No certificate block at all answers null with PEM_OK. */
+  pemReadFn(first = false): number {
+    return this.fn(first ? "pemRead1" : "pemRead", [this.bRef, I32], [this.ref(this.BA)], (f, $) => {
       const [BUF, LEN] = [0, 1];
       const POS = f.local(I32);
       const OUT = f.local(this.ref(this.BA));
@@ -636,15 +649,26 @@ export class X509Builder {
           f.c.end();
           // no data at all: PEM_read_bio_ex answers 0 with nothing queued,
           // so Node's loop stops here, successfully.
-          $.if($.eq($.l(DN), $.i(0)), () => $.ret($.l(OUT)));
+          if (first) $.if($.eq($.l(DN), $.i(0)), () => fail(PEM_UNSUPPORTED));
+          else $.if($.eq($.l(DN), $.i(0)), () => $.ret($.l(OUT)));
           $.put(DER, $.call(this.decodeFn(), $.l(D), $.l(DN)));
           $.if($.isNull($.l(DER)), () => fail(PEM_BAD_BASE64));
           // a block that decodes to nothing ends the read, successfully
           // (PEM_read_bio answers no data; Node's loop stops there)
-          $.if($.not($.get(this.BT, 2, $.l(DER))), () => $.ret($.l(OUT)));
+          if (first) $.if($.not($.get(this.BT, 2, $.l(DER))), () => fail(PEM_UNSUPPORTED));
+          else $.if($.not($.get(this.BT, 2, $.l(DER))), () => $.ret($.l(OUT)));
           // check_pem(nm, PEM_STRING_X509): "CERTIFICATE" or "X509 CERTIFICATE"
-          $.put(ISCERT, $.call(this.isCertNameFn(), $.l(BUF), $.l(NAME0), $.l(NAMEN)));
+          // (PEM_STRING_X509_TRUSTED adds "TRUSTED CERTIFICATE")
+          $.put(ISCERT, $.call(this.isCertNameFn(first), $.l(BUF), $.l(NAME0), $.l(NAMEN)));
         });
+        if (first) {
+          // d2i_X509_AUX reads what follows the certificate as trust data
+          $.do($.call(this.tlvFn(), $.get(this.BT, 0, $.l(DER)), $.get(this.BT, 1, $.l(DER)), $.add($.get(this.BT, 1, $.l(DER)), $.get(this.BT, 2, $.l(DER)))));
+          f.c.localSet(I);
+          f.c.localSet(K);
+          $.if($.eq($.l(K), $.i(-2)), () => fail(PEM_NONCANON));
+          $.if($.andThen($.ge($.l(K), $.i(0)), $.ne($.add($.l(K), $.l(I)), $.get(this.BT, 2, $.l(DER)))), () => fail(PEM_TRAILING));
+        }
         // d2i_X509: the certificate's outer structure
         $.put(DER, $.call(this.certTlvFn(), $.l(DER)));
         $.if($.isNull($.l(DER)), () => {
@@ -652,6 +676,7 @@ export class X509Builder {
           fail(PEM_ASN1);
         });
         $.put(OUT, $.call(this.baPushFn(), $.l(OUT), $.l(N), $.l(DER)));
+        if (first) $.ret($.l(OUT));
         $.put(N, $.add($.l(N), $.i(1)));
       });
       $.do($.l(OUT));
@@ -681,8 +706,8 @@ export class X509Builder {
     });
   }
 
-  private isCertNameFn(): number {
-    return this.fn("isCertName", [this.bRef, I32, I32], [I32], (f, $) => {
+  private isCertNameFn(trusted = false): number {
+    return this.fn(trusted ? "isCertName1" : "isCertName", [this.bRef, I32, I32], [I32], (f, $) => {
       const [BUF, N0, NN] = [0, 1, 2];
       const I = f.local(I32);
       const eqAt = (s: string, off: number): X => {
@@ -696,6 +721,7 @@ export class X509Builder {
       void I;
       $.if($.eq($.l(NN), $.i(11)), () => $.ret(eqAt("CERTIFICATE", 0)));
       $.if($.eq($.l(NN), $.i(16)), () => $.ret(eqAt("X509 CERTIFICATE", 0)));
+      if (trusted) $.if($.eq($.l(NN), $.i(19)), () => $.ret(eqAt("TRUSTED CERTIFICATE", 0)));
       $.do($.i(0));
     });
   }

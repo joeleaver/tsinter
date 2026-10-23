@@ -201,6 +201,12 @@ describe("date.parseGetTime — the S069 fence, asserted on its OWN text (no Nod
     // whitespace" habit would silently accept this and change the
     // answer the same way.
     "Jul  1 00:00:00 2026 GMT ",
+    // S069's own witness: no grammar, but a digit — Node answers a real
+    // time ("2020" read as the year), so the digit-free NaN arm below
+    // must not reach it.
+    "bogus 2020",
+    // one digit anywhere keeps the fence
+    "Invalid Date 1",
   ];
   for (const s of rows) {
     test(`FENCED: ${JSON.stringify(s)}`, async () => {
@@ -221,6 +227,26 @@ describe("date.parseGetTime — the S069 fence, asserted on its OWN text (no Nod
   }
 });
 
+// ── date.parseGetTime — a string with no ASCII digit is NaN (S069) ─────
+// V8's date parser makes a number token only from an ASCII digit, and a
+// date with no number has no day component and fails, so Node answers NaN
+// for every digit-free string. Genuine differential: each expectation is
+// this process's own `new Date(s).getTime()`. Non-ASCII digits (Arabic-
+// Indic, fullwidth) are not ASCII digits and stay on this arm.
+describe("date.parseGetTime — digit-free strings answer Node's NaN, genuine differential", () => {
+  const rows = [
+    "", " ", "bogus", "Invalid Date", "Jan", "Jan GMT", "T", "Z", "GMT", "Tue Jan GMT+", "NaN", "Infinity",
+    "-Infinity", "January February", "am pm", "(Jan)", "Jan-Feb", "٣٠٢٦",
+    "２０２６", "\t\n", "été", "🌍", "+-:./,",
+  ];
+  test(`${rows.length} digit-free strings in one program — SINGLE-EDIT: the digit scan's range (48..57) widened, or the NaN arm removed`, async () => {
+    const want = rows.map((s) => String(new Date(s).getTime())).join("\n") + "\n";
+    const path = await build("digitfree.ts", rows.map((s) => `console.log(new Date(${JSON.stringify(s)}).getTime());`).join("\n"));
+    const { stdout } = await runWasm(path);
+    expect(stdout).toBe(want);
+  });
+});
+
 // ── board #233: the fence reaches callers and the top level ───────────
 // The fence is emitter-owned and outside the shared may-throw list, so
 // these rows pin that a caller still sees it: through a function (it was
@@ -232,7 +258,7 @@ describe("date.parseGetTime — the S069 fence propagates (board #233)", () => {
       "fence-fn-caught.ts",
       `function f(s: string): number { return new Date(s).getTime(); }
        function g(s: string): number { return f(s) + 1; }
-       try { console.log(g("bogus")); console.log("NOT FENCED"); }
+       try { console.log(g("bogus 2020")); console.log("NOT FENCED"); }
        catch (e) { if (e instanceof Error) console.log(e.name, \`\${(e as NodeJS.ErrnoException).code}\`); }
        console.log("after");`,
     );
@@ -240,8 +266,8 @@ describe("date.parseGetTime — the S069 fence propagates (board #233)", () => {
     expect(stdout).toBe("Error SC1090\nafter\n");
   });
   for (const [name, src] of [
-    ["top level", `console.log("before");\nconsole.log(new Date("bogus").getTime());\nconsole.log("after");`],
-    ["inside a function", `function f(): number { return new Date("bogus").getTime(); }\nconsole.log("before");\nconsole.log(f());\nconsole.log("after");`],
+    ["top level", `console.log("before");\nconsole.log(new Date("bogus 2020").getTime());\nconsole.log("after");`],
+    ["inside a function", `function f(): number { return new Date("bogus 2020").getTime(); }\nconsole.log("before");\nconsole.log(f());\nconsole.log("after");`],
   ] as const) {
     test(`uncaught ${name}: a loud uncaught Error, never a value or exit 0`, async () => {
       const path = await build(`fence-uncaught-${name.replace(/ /g, "-")}.ts`, src);

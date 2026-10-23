@@ -82,6 +82,10 @@
  *     10,000 — never safely NaN-able, unlike hh/mi's own bound checks,
  *     which stay NODE-NaN at every year, also exhaustively confirmed).
  *
+ * When neither grammar answers, a string with no ASCII digit is Node's NaN
+ * (V8's parser has no number token to build a date from — SEMANTICS.md
+ * S069's amendment); only a string with a digit reaches the fence.
+ *
  * The fence (parseGetTime's own ok=0 exhaustion) is emitter-owned at the
  * call site, via `fencedFlag()` (see parseGetTimeHelper's own doc) —
  * this file NEVER touches the shared exception cell itself. This is a
@@ -1857,6 +1861,40 @@ export class DateBuilder {
       c.globalSet(this.fencedFlag());
       c.localGet(V);
       c.return_();
+      c.end();
+
+      // No ASCII digit anywhere: Node's NaN (SEMANTICS.md S069). V8's
+      // date parser makes a number token only from ASCII digits, and with
+      // no number its DayComposer has no component and fails, so every
+      // digit-free string is NaN; any string with a digit keeps the fence.
+      const I = 3; // i32, declared below
+      locals.push(I32);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(S);
+      c.arrayLen();
+      c.i32GeU();
+      c.ifVoid();
+      c.i32Const(0);
+      c.globalSet(this.fencedFlag());
+      c.f64Const(NaN);
+      c.return_();
+      c.end();
+      c.localGet(S);
+      c.localGet(I);
+      c.arrayGetU(this.strType());
+      c.i32Const(48);
+      c.i32Sub();
+      c.i32Const(10);
+      c.i32LtU();
+      c.brIf(1);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
       c.end();
 
       c.i32Const(1);

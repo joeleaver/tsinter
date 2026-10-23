@@ -1032,6 +1032,20 @@
  *         returning seconds instead of milliseconds runs silently, and
  *         `-Infinity` runs silently. The text IS the enforcement.
  *
+ *   (import "tsinter" "random" (func (param i32 i32)))   [node:crypto randomness modules only]
+ *     random(ptr, len): the host fills len bytes of linear memory at ptr
+ *     with OS entropy and returns — an entropy READ, getrandom(2)'s
+ *     shape: a native host calls getrandom / arc4random_buf, a browser
+ *     crypto.getRandomValues, an engine its OS RNG. Present only in modules
+ *     that reach crypto.randomUUID or crypto.randomBytes (with or without
+ *     the composed .toString). The module asks for at most 4096 bytes per
+ *     call (inside getRandomValues' 65536-byte cap) and copies them out
+ *     before anything else touches the staging region. It is NOT `seed`:
+ *     that is one PRNG seed per instance that a host may make reproducible
+ *     (the `--random-seed` contract), which crypto's randomness, like
+ *     Node's, never is. The bytes' quality is the host's business — the
+ *     text is the enforcement (SEMANTICS.md S093).
+ *
  *   (export "_start" (func))            — the program; run it once.
  *   (export "_tick" (func (param f64) (result f64)))  [timer modules only]
  *   (export "_loop" (func (param f64) (result f64)))  [event modules only,
@@ -1157,6 +1171,7 @@ export const IMPORT_CP_CALL = "cpCall";
 export const IMPORT_EV_POLL = "evPoll";
 export const IMPORT_NET_CALL = "netCall";
 export const IMPORT_TLS_CALL = "tlsCall";
+export const IMPORT_RANDOM = "random";
 export const EXPORT_ENTRY = "_start";
 export const EXPORT_TICK = "_tick";
 export const EXPORT_LOOP = "_loop";

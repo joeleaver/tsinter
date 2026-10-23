@@ -80,7 +80,7 @@
  * these defaults, plus `onIdle`, `onJump` and `onInstance`
  * (wasm-host-cp-u2.test.ts);
  * a caller that passes nothing gets exactly the host it always had. */
-import { randomBytes } from "node:crypto";
+import { randomBytes, randomFillSync } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { expect } from "vitest";
 
@@ -135,6 +135,11 @@ async function instantiate(modulePath: string, overrides?: HostOverrides) {
       },
       now: (): number => clock,
       seed: (): bigint => randomBytes(8).readBigUInt64BE(),
+      // node:crypto randomness modules only (abi.ts `random`).
+      random(ptr: number, len: number): void {
+        if (memory === null) throw new Error("random before instantiation completed");
+        randomFillSync(new Uint8Array(memory.buffer, ptr, len));
+      },
       // date.now / no-arg `new Date()` modules only (abi.ts).
       wallClock: (): number => wallBase + clock,
 

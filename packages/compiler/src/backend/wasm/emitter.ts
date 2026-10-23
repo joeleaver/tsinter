@@ -136,6 +136,7 @@ import {
   IMPORT_EV_POLL,
   IMPORT_EXIT,
   IMPORT_NET_CALL,
+  IMPORT_RANDOM,
   IMPORT_TLS_CALL,
   IMPORT_FS_CALL,
   IMPORT_HOST_NUM,
@@ -183,6 +184,9 @@ import { ChildProcBuilder, SR_ERR_CODE, SR_HAS_STATUS, SR_SIGNAL, SR_STATUS, SR_
 import { CH_CODE, CH_ERR, CH_HAS_PID, CH_KILLED, CH_OUT, CH_PID, CH_STATE, ChildAsyncBuilder } from "./childasync.js";
 import { NET_LISTS, NetBuilder, type NetList } from "./net.js";
 import { TlsBuilder } from "./tls.js";
+import { X509Builder } from "./tls-x509.js";
+import { CryptoBuilder, X509_BAD_TIME, X509_NO_START } from "./crypto.js";
+import { PEM_ASN1, PEM_BAD_BASE64, PEM_BAD_END_LINE, PEM_NONCANON, PEM_TRAILING, PEM_UNSUPPORTED } from "./tls-x509.js";
 import { DgramBuilder, DGRAM_LISTS } from "./dgram.js";
 import { ENC_NAMES as HTTP_ENC_NAMES, ENC_NONE, ENC_UTF8, HL, HttpBuilder } from "./http.js";
 import { A, Fn, type X } from "./asm.js";
@@ -1274,6 +1278,11 @@ function tlsHostKey(fn: string, args: readonly unknown[]): boolean {
   return true;
 }
 
+/** A node:crypto key that draws randomness (imports `random`). */
+function isCryptoRandomKey(fn: string): boolean {
+  return fn === "crypto.randomUUID" || fn === "crypto.randomBytes" || fn === "crypto.randomBytesToString";
+}
+
 /** INC-29 U4: a node:tls / node:https / CA-store key (tls.ts). */
 function isTlsKey(fn: string): boolean {
   return fn.startsWith("tls.") || fn.startsWith("https.") || fn.startsWith("tlsca.") || fn === "net.serverOnSecureConnection";
@@ -2354,6 +2363,8 @@ class Assembler {
   private readonly dgramModule: boolean;
   /** INC-29 U4: `tsinter.tlsCall`'s index, or null outside a TLS module. */
   private readonly tlsCallFunc: number | null;
+  /** `tsinter.random`'s index (node:crypto's randomness), or null. */
+  private readonly randomFunc: number | null;
   /** The exit-drain gate's static fact — see exitListenerSurfaceReachable's
    * own comment (INC-26 P1). Computed ONCE in the constructor; every drain
    * gate site reads this, never the mutable `procField`/
@@ -2584,6 +2595,12 @@ class Assembler {
     this.dgramModule = libCallWhere(mod, (fn) => fn.startsWith("dgram."));
     this.tlsCallFunc = libCallWhere(mod, tlsHostKey)
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_TLS_CALL, this.mb.funcType([I32, I32, I32, I32, I32], [I32]))
+      : null;
+    // `random`'s decision: node:crypto's entropy read, in modules that
+    // reach randomUUID / randomBytes, minted after tlsCall so no earlier
+    // import index moves.
+    this.randomFunc = libCallWhere(mod, isCryptoRandomKey)
+      ? this.mb.importFunc(IMPORT_MODULE, IMPORT_RANDOM, this.mb.funcType([I32, I32], []))
       : null;
     // ── end INC-26 host-import block ──
     // The exit-drain gate's STATIC fact (see exitListenerSurfaceReachable's
@@ -8812,8 +8829,178 @@ class Assembler {
         return { struct: v.struct, bufType: v.bufType };
       },
       caSet: this.caSetModule,
+      x509: () => this.x509,
     });
     return this.tlsField;
+  }
+
+  private x509Field: X509Builder | null = null;
+
+  /** The module's one X509Builder (tls.ts and crypto.ts share it). */
+  private get x509(): X509Builder {
+    this.x509Field ??= new X509Builder(this.mb, {
+      strRef: () => this.strRef,
+      strType: () => this.strType,
+      bufType: () => this.bytesB.bufType(),
+      bytesType: () => this.bytesB.bytesType(),
+      utf8Decode: () => this.bytesB.toStrHelper("utf8"),
+    });
+    return this.x509Field;
+  }
+
+  private cryptoField: CryptoBuilder | null = null;
+
+  /** node:crypto's builder (crypto.ts). */
+  private get crypto(): CryptoBuilder {
+    this.cryptoField ??= new CryptoBuilder(this.mb, {
+      strRef: () => this.strRef,
+      strType: () => this.strType,
+      bufType: () => this.bytesB.bufType(),
+      bytesType: () => this.bytesB.bytesType(),
+      x509: () => this.x509,
+      toStr: (enc) => this.bytesB.toStrHelper(enc),
+      randomFunc: () => {
+        if (this.randomFunc === null) throw new Error("emitter bug: a crypto random key was reached but tsinter.random was never imported");
+        return this.randomFunc;
+      },
+      ensureCapacity: (c, need) => this.emitEnsureCapacity(c, need),
+      stageCursor: () => this.cursorGlobal,
+    });
+    return this.cryptoField;
+  }
+
+  /** node:crypto's keys (crypto.ts). The size check of randomBytes and the
+   * X509Certificate parse's errors are set here, at the call site. */
+  private emitCryptoLibCall(e: Extract<WExpr, { kind: "libCall" }>): boolean {
+    if (!e.fn.startsWith("crypto.")) return false;
+    const code = this.fn.code;
+    const cr = this.crypto;
+    /** randomBytes' size, walked and checked: Node's ERR_OUT_OF_RANGE
+     * (0 <= size <= 2^31 - 1, NaN out), then truncated to an i32. */
+    const size = (): void => {
+      this.walkExpr(e.args[0]!);
+      const N = this.acquireScratch(F64);
+      code.localTee(N);
+      code.f64Const(0);
+      code.f64Ge();
+      code.localGet(N);
+      code.f64Const(2147483647);
+      code.f64Le();
+      code.i32And();
+      code.i32Eqz();
+      this.openIf();
+      this.emitSetCellError(code, "%RangeError", "RangeError", (c) => {
+        this.pushStrLitInto(c, 'The value of "size" is out of range. It must be >= 0 && <= 2147483647. Received ');
+        c.localGet(N);
+        c.call(this.bytesB.numReceivedHelper());
+        c.call(this.concatHelper());
+      }, "ERR_OUT_OF_RANGE");
+      this.emitUnwind();
+      this.close();
+      code.localGet(N);
+      code.i32TruncF64U();
+      this.releaseScratch(F64, N);
+    };
+    /** a bytes<u8> value and its length (validate.ts: the data is u8) */
+    const withLen = (): void => {
+      const D = this.acquireScratch(this.bytesB.bytesRef());
+      code.localTee(D);
+      code.localGet(D);
+      code.structGet(this.bytesB.bytesType(), 2);
+      this.releaseScratch(this.bytesB.bytesRef(), D);
+    };
+    switch (e.fn) {
+      case "crypto.randomUUID":
+        code.call(cr.randomUuidFn());
+        return true;
+      case "crypto.randomBytes":
+        size();
+        code.call(cr.randomBytesFn());
+        return true;
+      case "crypto.randomBytesToString":
+        size();
+        this.walkExpr(e.args[1]!);
+        code.call(cr.randomStringFn());
+        return true;
+      case "crypto.hashDigestStr":
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        code.call(this.bytesB.fromStrHelper("utf8"));
+        withLen();
+        this.walkExpr(e.args[2]!);
+        code.call(cr.hashDigestFn());
+        return true;
+      case "crypto.hashDigestBytes":
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        withLen();
+        this.walkExpr(e.args[2]!);
+        code.call(cr.hashDigestFn());
+        return true;
+      case "crypto.x509Fingerprint":
+      case "crypto.x509FingerprintStr":
+      case "crypto.x509ValidFrom":
+      case "crypto.x509ValidFromStr":
+      case "crypto.x509ValidTo":
+      case "crypto.x509ValidToStr": {
+        this.walkExpr(e.args[0]!);
+        if (e.fn.endsWith("Str")) code.call(this.bytesB.fromStrHelper("utf8"));
+        const which = e.fn.replace(/Str$/, "");
+        code.call(which === "crypto.x509Fingerprint" ? cr.fingerprintFn() : cr.validityFn(which === "crypto.x509ValidTo"));
+        const R = this.acquireScratch(this.strRef);
+        code.localTee(R);
+        code.refIsNull();
+        this.openIf();
+        this.emitX509Error();
+        this.close();
+        code.localGet(R);
+        this.releaseScratch(this.strRef, R);
+        return true;
+      }
+      default:
+        return false;
+    }
+  }
+
+  /** The X509Certificate parse's failure (crypto.ts's error global): Node's
+   * PEM errors, or a named fence (SEMANTICS.md S093); then the unwind. */
+  private emitX509Error(): void {
+    const code = this.fn.code;
+    const E = this.acquireScratch(I32);
+    code.globalGet(this.crypto.errGlobal());
+    code.localSet(E);
+    const ossl: [number, string, string][] = [
+      [X509_NO_START, "error:0480006C:PEM routines::no start line", "ERR_OSSL_PEM_NO_START_LINE"],
+      [PEM_BAD_BASE64, "error:04800064:PEM routines::bad base64 decode", "ERR_OSSL_PEM_BAD_BASE64_DECODE"],
+      [PEM_BAD_END_LINE, "error:04800066:PEM routines::bad end line", "ERR_OSSL_PEM_BAD_END_LINE"],
+    ];
+    const fences: [number, string][] = [
+      [PEM_ASN1, "new crypto.X509Certificate of a PEM block whose body is not a certificate's DER"],
+      [PEM_UNSUPPORTED, "new crypto.X509Certificate of a PEM block with header lines, a line over 253 bytes or an empty body"],
+      [PEM_NONCANON, "new crypto.X509Certificate of a certificate whose DER OpenSSL would re-encode (a non-minimal or indefinite length inside it)"],
+      [PEM_TRAILING, "new crypto.X509Certificate of a PEM block with bytes after the certificate (X509_CERT_AUX trust data)"],
+      [X509_BAD_TIME, "X509Certificate.validFrom / validTo of a time that is not a canonical RFC 5280 UTCTime or GeneralizedTime"],
+    ];
+    for (const [k, msg, errCode] of ossl) {
+      code.localGet(E);
+      code.i32Const(k);
+      code.i32Eq();
+      this.openIf();
+      this.emitSetCellErrorLit("%Error", "Error", msg, errCode);
+      this.emitUnwind();
+      this.close();
+    }
+    for (const [k, what] of fences) {
+      code.localGet(E);
+      code.i32Const(k);
+      code.i32Eq();
+      this.openIf();
+      this.emitSetCellErrorLit("%Error", "Error", `${what} is not supported yet (SEMANTICS.md S093)`, null);
+      this.emitUnwind();
+      this.close();
+    }
+    this.releaseScratch(I32, E);
+    code.unreachable();
   }
 
   private dgramField: DgramBuilder | null = null;
@@ -23112,6 +23299,7 @@ class Assembler {
           code.unreachable();
           return;
         }
+        if (this.emitCryptoLibCall(e)) return;
         if (this.emitTlsLibCall(e)) return;
         if (this.emitDgramLibCall(e)) return;
         if (this.emitHttpLibCall(e)) return;

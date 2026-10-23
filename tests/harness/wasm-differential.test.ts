@@ -38,7 +38,7 @@ import { createSocket as dgramCreateSocket, type Socket as UdpSocket } from "nod
 import * as netModuleNs from "node:net";
 import { lookup as dnsLookup } from "node:dns";
 import { hasSubscribers as dcHasSubscribers, subscribe as dcSubscribe, unsubscribe as dcUnsubscribe } from "node:diagnostics_channel";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomFillSync } from "node:crypto";
 import {
   accessSync,
   appendFileSync,
@@ -3499,6 +3499,16 @@ const TIER_FLOOR: string[] = [
   // board #219 (1036 -> 1037): a string literal beginning with a raw U+FEFF
   // keeps it (the TS7 API's decoder dropped it, every lane)
   "2745-bom-string-literals.ts",
+  // the node:crypto core (1037 -> 1043): randomUUID / randomBytes over the
+  // new `random` entropy import, sha256 / sha1 digests and X509Certificate's
+  // fingerprint and validity computed in the module (crypto.ts, SEMANTICS.md
+  // S093); 2722 also needs S069's digit-free NaN arm
+  "957-builtins-namespace.ts",
+  "1358-crypto-random.ts",
+  "1534-crypto-hash-chain.ts",
+  "1568-x509-fingerprint.ts",
+  "2280-builtin-namespace-destructure.cjs",
+  "2722-x509-validity-date-gettime.ts",
 ];
 
 interface RunResult {
@@ -5394,6 +5404,12 @@ async function runWasm(modulePath: string): Promise<RunResult> {
       // a CSPRNG so NO corpus program can depend on a fixed sequence —
       // the seed pin (wasm-random.test.ts) uses its own host instead.
       seed: (): bigint => randomBytes(8).readBigUInt64BE(),
+      // node:crypto randomness modules only (abi.ts `random`): the OS
+      // entropy read, from Node's own CSPRNG.
+      random(ptr: number, len: number): void {
+        if (memory === null) throw new Error("random before instantiation completed");
+        randomFillSync(new Uint8Array(memory.buffer, ptr, len));
+      },
       // date.now modules only (INC-25 P6, D3/D6-iv, C-4). MUST be a
       // VIRTUAL wall clock in lockstep with the virtual timer clock
       // above, never the real clock: this harness's timer clock starts
@@ -8795,5 +8811,210 @@ describe("board #218 untyped Map / WeakMap / WeakSet rows", () => {
     expect(r.stdout.toString("utf8")).toBe("");
     expect(r.stderr.toString("utf8")).toBe("Uncaught cfValue: an untyped Map, WeakMap or WeakSet in an assert failure message is not supported yet\n");
     expect(r.exitCode).toBe(1);
+  }, 60000);
+});
+
+/* ── node:crypto core (crypto.ts; abi.ts `random`) — hashes, randomness and
+ * X509Certificate computed in the module. Each differential row runs the
+ * SAME source under Node and compares the full stdout, stderr and exit
+ * code; the fence rows assert this tier's own text (SEMANTICS.md S093),
+ * since no Node expectation exists for a fence. ── */
+
+describe("node:crypto core rows (crypto.ts)", () => {
+  async function both(name: string, src: string): Promise<[RunResult, RunResult]> {
+    const dir = mkdtempSync(join(tmpdir(), "crypto-row-"));
+    try {
+      const path = join(dir, name);
+      writeFileSync(path, src);
+      const res = await compile(path, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: wantsDynamic(path), backend: "wasm" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+      return await Promise.all([runWasm(res.binaryPath), runNode(path)]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  const same = ([w, n]: [RunResult, RunResult]): void => {
+    expect(w.stdout.toString("utf8")).toBe(n.stdout.toString("utf8"));
+    expect(w.stderr.toString("utf8")).toBe(n.stderr.toString("utf8"));
+    expect(w.exitCode).toBe(n.exitCode);
+  };
+  // The fixed certificate the x509 rows read, out of 1568's own source.
+  const PEM_PRELUDE =
+    'import * as fs from "node:fs";\n' +
+    'const SRC = fs.readFileSync("tests/corpus/1568-x509-fingerprint.ts", "utf8");\n' +
+    'const PEM = SRC.slice(SRC.indexOf("-----BEGIN CERTIFICATE-----"), SRC.indexOf("-----END CERTIFICATE-----") + 26);\n' +
+    'const BODY = PEM.split("\\n").filter((l) => !l.startsWith("-----")).join("");\n' +
+    'const DER = Buffer.from(BODY, "base64");\n';
+
+  test("CR-HASH-01 sha256 and sha1 over every padding boundary (55/56/63/64/119/120/127/128 bytes), UTF-8 input with astral and lone-surrogate characters, a 70000-byte Buffer, a Uint8Array, a subarray view's own bytes, a literal-typed algorithm variable, hex and base64 — SINGLE-EDIT: one sha256 round constant", async () => {
+    same(await both("main.ts", `import { createHash } from "node:crypto";
+const lens = [0, 1, 2, 3, 54, 55, 56, 57, 63, 64, 65, 111, 119, 120, 127, 128, 129, 1000, 4097];
+for (const n of lens) {
+  const s = "ab\\u00e9\\u{1F30D}".repeat(n).slice(0, n);
+  console.log(n, createHash("sha256").update(s).digest("hex"), createHash("sha1").update(s).digest("base64"));
+}
+console.log(createHash("sha256").update("\\ud800x").digest("hex"));
+const big = Buffer.alloc(70000, 7);
+console.log(createHash("sha256").update(big).digest("base64"), createHash("sha1").update(big).digest("hex"));
+const arr = new Uint8Array([0, 1, 2, 255, 128, 0]);
+console.log(createHash("sha256").update(arr).digest("hex"), createHash("sha1").update(arr).digest("hex"));
+const sub = Buffer.from("0123456789abcdef").subarray(3, 11);
+console.log(createHash("sha1").update(sub).digest("hex"), createHash("sha256").update(sub).digest("base64"));
+const alg: "sha1" = "sha1";
+console.log(createHash(alg).update("abc").digest("hex"));
+`));
+  }, 60000);
+
+  test("CR-RAND-01 randomBytes: Node's ERR_OUT_OF_RANGE ladder (negative, NaN, infinite, past 2^31 - 1, the numeric-separator rendering) on both the Buffer and the composed toString form, the sizes that truncate, lengths across the 4096-byte host chunk, every byte value reached in 64 KiB, distinct chunks; randomUUID's version-4 shape over 300 draws — SINGLE-EDIT: every host chunk copied to offset 0", async () => {
+    same(await both("main.ts", `import { randomBytes, randomUUID } from "node:crypto";
+for (const n of [-1, -0.5, NaN, Infinity, -Infinity, 2147483647.5, 2147483648, 1e10, 1e21, 12345678901, -12345.678]) {
+  try {
+    randomBytes(n);
+    console.log("no throw", n);
+  } catch (e) {
+    console.log((e as Error).name, (e as NodeJS.ErrnoException).code, (e as Error).message, e instanceof RangeError);
+  }
+  try {
+    console.log(randomBytes(n).toString("hex"));
+  } catch (e) {
+    console.log((e as Error).name, (e as NodeJS.ErrnoException).code, (e as Error).message);
+  }
+}
+for (const n of [0, -0, 0.5, 1.5, 3, 4095, 4096, 4097, 9000]) {
+  console.log(n, randomBytes(n).length, randomBytes(n).toString("hex").length, randomBytes(n).toString("base64").length);
+}
+const big = randomBytes(65536);
+const seen = new Set<number>();
+for (let i = 0; i < big.length; i++) seen.add(big[i]!);
+console.log("every byte value", seen.size === 256);
+console.log("chunks differ", big.subarray(0, 4096).toString("hex") !== big.subarray(4096, 8192).toString("hex"));
+let live = 0;
+for (let i = 65536 - 64; i < 65536; i++) if (big[i] !== 0) live++;
+console.log("tail live", live > 32);
+const ids = new Set<string>();
+const variants = new Set<string>();
+let ok = true;
+for (let i = 0; i < 300; i++) {
+  const u = randomUUID();
+  ids.add(u);
+  variants.add(u.charAt(19));
+  for (let k = 0; k < 36; k++) {
+    const c = u.charAt(k);
+    const dash = k === 8 || k === 13 || k === 18 || k === 23;
+    if (dash ? c !== "-" : !"0123456789abcdef".includes(c)) ok = false;
+  }
+  if (u.length !== 36 || u.charAt(14) !== "4" || !"89ab".includes(u.charAt(19))) ok = false;
+}
+console.log("uuid", ok, ids.size, variants.size);
+`));
+  }, 60000);
+
+  test("CR-X509-01 new X509Certificate over the forms Node parses (PEM string and Buffer, raw DER, DER with trailing bytes, the X509 CERTIFICATE and TRUSTED CERTIFICATE names, CRLF lines, no final newline, text before the block, a key block first, a bad block after the first) and Node's PEM errors (no start line for garbage, empty input, truncated DER and a stray SEQUENCE; bad base64 decode; bad end line, the END line missing): fingerprint, validFrom, validTo, error name, code and message — SINGLE-EDIT: the first-only reader reading past its first certificate", async () => {
+    same(await both("main.ts", `import * as crypto from "node:crypto";
+${PEM_PRELUDE}
+function show(label: string, c: crypto.X509Certificate): void {
+  console.log(label, "OK", c.fingerprint, c.validFrom, c.validTo);
+}
+function t(label: string, x: string): void {
+  try {
+    show(label, new crypto.X509Certificate(x));
+  } catch (e) {
+    console.log(label, "ERR", (e as Error).name, (e as NodeJS.ErrnoException).code, (e as Error).message);
+  }
+}
+function tb(label: string, x: Buffer): void {
+  try {
+    show(label, new crypto.X509Certificate(x));
+  } catch (e) {
+    console.log(label, "ERR", (e as Error).name, (e as NodeJS.ErrnoException).code, (e as Error).message);
+  }
+}
+t("pem", PEM);
+tb("pem-buffer", Buffer.from(PEM));
+tb("der", DER);
+tb("der+trail", Buffer.concat([DER, Buffer.from("junk")]));
+tb("der-trunc", DER.subarray(0, DER.length - 1));
+t("garbage", "not a certificate");
+t("empty", "");
+tb("emptybuf", Buffer.alloc(0));
+t("badb64", "-----BEGIN CERTIFICATE-----\\n!!!!\\n-----END CERTIFICATE-----\\n");
+t("badend", "-----BEGIN CERTIFICATE-----\\nMIIB\\n-----END FOO-----\\n");
+t("noend", "-----BEGIN CERTIFICATE-----\\nMIIB\\n");
+t("good+bad", PEM + "-----BEGIN CERTIFICATE-----\\n!!!!\\n-----END CERTIFICATE-----\\n");
+t("key-then-cert", "-----BEGIN PRIVATE KEY-----\\nMIIB\\n-----END PRIVATE KEY-----\\n" + PEM);
+t("trusted", PEM.replace(/CERTIFICATE/g, "TRUSTED CERTIFICATE"));
+t("x509cert", PEM.replace(/CERTIFICATE/g, "X509 CERTIFICATE"));
+t("no-final-newline", PEM.trimEnd());
+t("crlf", PEM.replace(/\\n/g, "\\r\\n"));
+t("lead", "hello\\n" + PEM);
+tb("stray-seq", Buffer.from([0x30, 0x03, 1, 2, 3]));
+t("seq-text", "0garbage");
+`));
+  }, 60000);
+
+  test("CR-X509-02 the named fences (S093): a PEM body that is not a certificate's DER (Node's text is the ASN.1 decoder's reason), a header line, bytes after the certificate inside the block (d2i_X509_AUX's trust data), and a validity month outside 1-12 — each a catchable Error naming the construct — SINGLE-EDIT: the trailing-bytes check removed from the first-only reader", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "crypto-fence-"));
+    try {
+      const path = join(dir, "main.ts");
+      writeFileSync(path, `import * as crypto from "node:crypto";
+${PEM_PRELUDE}
+function t(label: string, x: Buffer): void {
+  try {
+    console.log(label, "OK", new crypto.X509Certificate(x).validFrom);
+  } catch (e) {
+    console.log(label, (e as Error).name, (e as NodeJS.ErrnoException).code, (e as Error).message);
+  }
+}
+t("asn1", Buffer.from("-----BEGIN CERTIFICATE-----\\nMIIB\\n-----END CERTIFICATE-----\\n"));
+t("header", Buffer.from("-----BEGIN CERTIFICATE-----\\nProc-Type: 4,ENCRYPTED\\n\\n" + BODY + "\\n-----END CERTIFICATE-----\\n"));
+const b64 = Buffer.concat([DER, Buffer.from([5, 0])]).toString("base64");
+let lines = "";
+for (let i = 0; i < b64.length; i += 64) lines += b64.slice(i, i + 64) + "\\n";
+t("trailing", Buffer.from("-----BEGIN CERTIFICATE-----\\n" + lines + "-----END CERTIFICATE-----\\n"));
+const bad = Buffer.from(DER);
+const at = bad.indexOf(Buffer.from("260717175211Z"));
+bad[at + 2] = 0x31;
+bad[at + 3] = 0x33;
+t("month-13", bad);
+`);
+      const res = await compile(path, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: false, backend: "wasm" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => d.message).join("; ")}`);
+      const r = await runWasm(res.binaryPath);
+      const fence = (label: string, what: string): string => `${label} Error undefined ${what} is not supported yet (SEMANTICS.md S093)\n`;
+      expect(r.stdout.toString("utf8")).toBe(
+        fence("asn1", "new crypto.X509Certificate of a PEM block whose body is not a certificate's DER") +
+          fence("header", "new crypto.X509Certificate of a PEM block with header lines, a line over 253 bytes or an empty body") +
+          fence("trailing", "new crypto.X509Certificate of a PEM block with bytes after the certificate (X509_CERT_AUX trust data)") +
+          fence("month-13", "X509Certificate.validFrom / validTo of a time that is not a canonical RFC 5280 UTCTime or GeneralizedTime"),
+      );
+      expect(r.exitCode).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  test("CR-HOST-01 tsinter.random is imported exactly by the modules that draw (randomUUID, randomBytes, the composed toString), never by a hash- or certificate-only module, and a host without it fails to instantiate with a LinkError — SINGLE-EDIT: the minting condition widened to every crypto key", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "crypto-host-"));
+    try {
+      const importsOf = async (name: string, src: string): Promise<string[]> => {
+        const p = join(dir, name);
+        writeFileSync(p, src);
+        const res = await compile(p, { outPath: join(dir, `${name}.wasm`), outDir: dir, dynamic: false, backend: "wasm" });
+        if (!res.ok) throw new Error("refused");
+        return WebAssembly.Module.imports(await WebAssembly.compile(readFileSync(res.binaryPath))).map((i) => `${i.module}.${i.name}`);
+      };
+      expect(await importsOf("u.ts", 'import { randomUUID } from "node:crypto";\nconsole.log(randomUUID().length);\n')).toContain("tsinter.random");
+      expect(await importsOf("b.ts", 'import { randomBytes } from "node:crypto";\nconsole.log(randomBytes(3).length);\n')).toContain("tsinter.random");
+      expect(await importsOf("s.ts", 'import { randomBytes } from "node:crypto";\nconsole.log(randomBytes(3).toString("hex"));\n')).toContain("tsinter.random");
+      expect(await importsOf("h.ts", 'import { createHash } from "node:crypto";\nconsole.log(createHash("sha1").update("x").digest("hex"));\n')).not.toContain("tsinter.random");
+      const res = await compile(join(dir, "u.ts"), { outPath: join(dir, "u2.wasm"), outDir: dir, dynamic: false, backend: "wasm" });
+      if (!res.ok) throw new Error("refused");
+      const mod = await WebAssembly.compile(readFileSync(res.binaryPath));
+      const imports: Record<string, Record<string, unknown>> = { tsinter: {} };
+      for (const i of WebAssembly.Module.imports(mod)) if (i.name !== "random") imports[i.module]![i.name] = () => 0;
+      await expect(WebAssembly.instantiate(mod, imports as WebAssembly.Imports)).rejects.toBeInstanceOf(WebAssembly.LinkError);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }, 60000);
 });

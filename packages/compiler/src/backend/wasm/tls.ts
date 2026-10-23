@@ -254,6 +254,8 @@ export interface TlsDeps {
   strVec: () => { struct: number; bufType: number };
   /** The module can replace the default CA set (tls.setDefaultCACertificates). */
   caSet: boolean;
+  /** The module's one X509Builder (shared with crypto.ts). */
+  x509: () => X509Builder;
 }
 
 export class TlsBuilder {
@@ -283,13 +285,7 @@ export class TlsBuilder {
   }
 
   get x509(): X509Builder {
-    this.x509Field ??= new X509Builder(this.mb, {
-      strRef: () => this.deps.strRef(),
-      strType: () => this.deps.strType(),
-      bufType: () => this.deps.bufType(),
-      bytesType: () => this.deps.bytesType(),
-      utf8Decode: () => this.deps.utf8Decode(),
-    });
+    this.x509Field ??= this.deps.x509();
     return this.x509Field;
   }
 

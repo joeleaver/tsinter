@@ -5378,12 +5378,27 @@ VALUE where both lanes answer a value, not a NaN-for-a-time miss, so it is NOT t
 silent-wrong is fixed, not registered) — the wasm lane models V8's rule directly, as its own two comparisons
 and an add, never by reusing `date.utc`'s different (ECMA MakeFullYear) two-digit-year rule.
 
+**Amendment (node:crypto unit, 2026-10-23, Joe's ruling for 2722): a string with no ASCII digit answers
+Node's NaN on the wasm tier; the fence keeps every other string.** V8's date parser (`dateparser-inl.h`)
+makes a number token only from an ASCII digit, and a date with no number gives its DayComposer no
+component, so `DayComposer::Write` fails and `Date.parse` answers NaN for EVERY digit-free string — the
+ES5 arm and the legacy arm alike, whatever words, signs, zone names or non-ASCII digits (Arabic-Indic,
+fullwidth) it holds. Measured: 600,021 random digit-free strings (keyword soups and arbitrary non-digit
+ASCII/Unicode) all answer NaN under Node v24.18.1. So the fence's domain narrows by exactly that
+class: `""`, `" "`, `"bogus"` and `"Invalid Date"` of the twelve Node-NaN strings above now answer NaN
+on the wasm tier, the same answer as the native lanes; every string containing an ASCII digit and
+outside both grammars still fences ("bogus 2020", the other eight Node-NaN strings — `"20"`, `"20260717"`, `"T12:00Z"`
+and the five numeric lenient-ISO/legacy shapes), because Node answers a real time for some such strings. The check runs only after both grammars declined, so no modelled
+answer moves.
+
 **Tested by:** 1572 (native lanes ONLY — it is NOT a wasm-tier member: under the per-pass stub sweep it
 refuses on `crypto.x509FingerprintStr`, a key outside this pass), plus `wasm-date.test.ts`'s genuine
 differential rows (the modelled grammars, computed against `new Date(x).getTime()` in-process, including
 the two-digit-year remap) and its fence-only rows (no Node expectation exists for a fence's own text; the
 test asserts the message/`.code` the wasm lane itself produces, per v6's own instruction for value
-contracts with no oracle).
+contracts with no oracle). The amendment: 2722 (wasm census — its `new Date("bogus")` row) and
+`wasm-date.test.ts`'s digit-free row (twenty-three strings against Node in-process; "bogus 2020" and
+"Invalid Date 1" join the fence-only rows).
 
 ## S070 — `process.argv[0]` and `process.argv[1]`: LENGTH and POSITIONS match Node on every lane; the VALUES do not *(per-lane split)*
 
@@ -6246,3 +6261,17 @@ is exact for every program that does not write `undefined` into a field that is 
 **Tested by:** `packages/compiler/test/wasm-silent-batch.test.ts` (PRESENCE rows: the required, optional,
 widened-literal, index-signature and checked-conversion cells with Node's answers, and the divergent
 cells pinned with Node's output beside them); the llvm and c lanes are measured, not pinned.
+
+## S093 — node:crypto on the wasm lane: errors carry name, message and code only, randomness is the host's entropy, an X509Certificate is read at its outer DER structure, and a few PEM forms and validity times are fenced by name *(wasm lane only)*
+
+On the wasm lane the lowered node:crypto keys are computed in the module (`packages/compiler/src/backend/wasm/crypto.ts`): `randomUUID`, `randomBytes(n)` and the composed `randomBytes(n).toString("hex" | "base64")`; the composed `createHash("sha256" | "sha1").update(data).digest("hex" | "base64")` (SHA-256 per FIPS 180-4, SHA-1 from `tls-x509.ts`, strings hashed as their UTF-8 bytes); and the composed `new X509Certificate(data).fingerprint` / `.validFrom` / `.validTo`, transcribed from ncrypto's `X509Pointer::Parse` (OpenSSL 3.5.7's `PEM_read_bio_X509_AUX` over the bytes, through U4's PEM reader in a first-certificate mode, then `d2i_X509_bio` over the raw bytes), `X509_digest` and `ASN1_TIME_print`. `randomBytes`' size ladder (Node's `ERR_OUT_OF_RANGE` with its numeric-separator rendering) and the PEM errors (`no start line`, `bad base64 decode`, `bad end line`, with their `ERR_OSSL_PEM_*` codes) are Node's. These differ:
+
+- **(a) An error carries name, message and code only.** The PEM errors have no `library` or `reason` (Node's have both); the same shape as S090 (a).
+- **(b) Randomness is the host's entropy.** The bytes come from `tsinter.random` (abi.ts), an OS entropy read the host services (getrandom(2), arc4random_buf, crypto.getRandomValues). Their quality is the host's, as `seed`'s is for S068; Node's come from OpenSSL's CSPRNG. Values are never compared differentially, only their shape.
+- **(c) A certificate is read at its outer DER structure.** As S090 (c): a certificate OpenSSL's `d2i_X509` rejects deeper inside (an OID's or a time's contents, an extension) is accepted here. On the PEM path such a failure is the ASN.1 decoder's own error in Node; here a PEM block whose body is not a certificate at this outer level is a named Error (below) rather than Node's ASN.1 text, and on the raw-DER path it is Node's `no start line`, as Node's is.
+- **(d) A few PEM forms and validity times are fenced by name.** Each is a catchable `Error` whose message names the construct and ends "is not supported yet (SEMANTICS.md S093)": a PEM block whose body is not a certificate's DER (Node: the ASN.1 decoder's reason, e.g. `header too long`); a block with header lines, a line over 253 bytes or an empty body (as S090 (c)); a certificate whose DER OpenSSL would re-encode (as S090 (c)); bytes after the certificate inside the block, which `d2i_X509_AUX` reads as `X509_CERT_AUX` trust data (a `TRUSTED CERTIFICATE` block without them is read, as Node reads it); and a validity time other than a canonical RFC 5280 UTCTime (`YYMMDDHHMMSSZ`, 50-99 as 19xx) or GeneralizedTime (`YYYYMMDDHHMMSSZ`) with every field in range (Node prints other forms, fractions and offsets included, or "Bad time value").
+- **(e) Sizes past the engine.** `randomBytes(n)` for a size the engine cannot allocate as one array is an uncatchable trap (V8: "requested new array is too large" at 2^31 - 1 bytes), where Node allocates it; hashing a single input of 512 MiB or more is outside the SHA-1 length counter (which holds 2^29 bytes).
+
+**Scope:** the wasm lane. The llvm and c lanes run `scr_lib.c`'s own crypto slice and are not changed by this entry.
+
+**Tested by:** 957, 1358, 1534, 1568, 2280 and 2722 on the wasm census; the "node:crypto core rows" block of `tests/harness/wasm-differential.test.ts` (CR-HASH-01 the padding boundaries and input forms, CR-RAND-01 the size ladder and the randomness shape, CR-X509-01 the parse forms and PEM errors against Node, CR-X509-02 the fences of (d) on their own text, CR-HOST-01 the import's presence). (a), (b) and (e) are measured, not pinned. Measured against Node v24.18.1.
