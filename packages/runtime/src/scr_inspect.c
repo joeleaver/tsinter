@@ -736,6 +736,20 @@ ScrStr *scr_insp_key(ScrStr *k) {
  * lives in the value, so the traversal lives here instead of a
  * synthesized helper. Same engine, same defaults. dyn-boxed bytes render
  * in the checked-dynamic tree's documented Uint8Array identity (SEMANTICS.md). */
+/* Board #192: true while scr_insp_dyn_hidden renders — util.format's %o,
+ * Node's showHidden: an array gains its hidden `[length]` entry, and the
+ * kinds whose hidden members are not modelled fence loudly. */
+static bool insp_hidden = false;
+
+static ScrStr *insp_hidden_fence(const char *what) {
+  InspBuf out = {0};
+  ib_cstr(&out, "util.format %o of ");
+  ib_cstr(&out, what);
+  ib_cstr(&out, " is not supported yet");
+  scr_throw_error(SCR_ERR_ERROR, ib_take(&out));
+  return scr_str_new("", 0);
+}
+
 ScrStr *scr_insp_dyn(ScrDyn *d, double recurse, double depth) {
   switch (d->kind) {
     case SCR_DYN_NULL:
@@ -749,7 +763,9 @@ ScrStr *scr_insp_dyn(ScrDyn *d, double recurse, double depth) {
     case SCR_DYN_STR:
       return scr_insp_str(d->v.str);
     case SCR_DYN_ARR: {
-      if (d->v.arr.len == 0) return scr_str_new("[]", 2);
+      /* With showHidden the hidden `length` key keeps an empty array off
+       * Node's empty shortcut: it is a frame like any other. */
+      if (d->v.arr.len == 0 && !insp_hidden) return scr_str_new("[]", 2);
       if (recurse > depth) return scr_str_new("[Array]", 7);
       scr_insp_begin(recurse + 1);
       size_t shown = d->v.arr.len < 100 ? d->v.arr.len : 100;
@@ -764,6 +780,19 @@ ScrStr *scr_insp_dyn(ScrDyn *d, double recurse, double depth) {
         ScrStr *m = scr_insp_more_items((double)(d->v.arr.len - 100));
         scr_insp_entry(m, d->v.arr.items[100]->kind == SCR_DYN_NUM);
         scr_str_release(m);
+      }
+      if (insp_hidden) {
+        /* %o: the hidden `[length]: N` entry, last. Node's grid code reads
+         * it as one more output slot: the padStart order tests value[i]
+         * for every slot (a number only where value[101] is one), and the
+         * slot it leaves out of the grid is the LAST one whenever the
+         * output outgrows maxArrayLength — the `[length]` entry itself. */
+        char lenbuf[48];
+        int ln = snprintf(lenbuf, sizeof lenbuf, "[length]: %zu", d->v.arr.len);
+        ScrStr *le = scr_str_new(lenbuf, (size_t)ln);
+        scr_insp_entry(le, d->v.arr.len > 101 && d->v.arr.items[101]->kind == SCR_DYN_NUM);
+        scr_str_release(le);
+        more = d->v.arr.len >= 100;
       }
       ScrStr *base = scr_str_new("", 0);
       ScrStr *b0 = scr_str_new("[", 1);
@@ -811,6 +840,8 @@ ScrStr *scr_insp_dyn(ScrDyn *d, double recurse, double depth) {
       return out;
     }
     case SCR_DYN_FUNC: {
+      /* %o: Node lists length, name, arguments, caller and prototype. */
+      if (insp_hidden) return insp_hidden_fence("a function value");
       /* Node's function rendering: [Function: name] / [Function
        * (anonymous)]. The boxed name is the compiler's best-effort static
        * spelling (SEMANTICS.md — reference-site naming). */
@@ -860,6 +891,9 @@ ScrStr *scr_insp_dyn(ScrDyn *d, double recurse, double depth) {
     }
     case SCR_DYN_BYTES: {
       ScrBytes *b = d->v.bytes;
+      /* %o of a Uint8Array lists BYTES_PER_ELEMENT, length, byteLength,
+       * byteOffset and buffer; a Buffer keeps its <Buffer ..> form. */
+      if (insp_hidden && !d->buffer) return insp_hidden_fence("a Uint8Array value");
       if (d->buffer) {
         /* Buffer-flavored (a stream chunk): Node's <Buffer ..> form. */
         return scr_insp_buffer(b);
@@ -905,4 +939,13 @@ ScrStr *scr_insp_dyn(ScrDyn *d, double recurse, double depth) {
 ScrStr *scr_insp_dyn_s(ScrDyn *d, double depth) {
   if (d->kind == SCR_DYN_STR) return scr_str_retain(d->v.str);
   return scr_insp_dyn(d, 0, depth);
+}
+
+/* util.format's %o over a dyn value (board #192): the walk with
+ * showHidden on. */
+ScrStr *scr_insp_dyn_hidden(ScrDyn *d, double depth) {
+  insp_hidden = true;
+  ScrStr *s = scr_insp_dyn(d, 0, depth);
+  insp_hidden = false;
+  return s;
 }

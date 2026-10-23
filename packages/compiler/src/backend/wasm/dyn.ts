@@ -5948,6 +5948,13 @@ export class DynBuilder {
   /** Function.prototype names with an arm. */
   private static readonly FN_METHODS = new Set(["apply", "call"]);
 
+  /** Object.prototype names every non-nullish receiver inherits (board
+   * #191) — a call, not a member read, so S015's own-only reads do not
+   * apply. toLocaleString is answered only on OBJ receivers: Array's and
+   * Number's own versions differ, and those kinds keep the
+   * is-not-a-function tail below. */
+  private static readonly OBJPROTO_METHODS = new Set(["hasOwnProperty", "propertyIsEnumerable", "isPrototypeOf", "valueOf", "toLocaleString"]);
+
   /** Number.prototype names with an arm (increment 21 stage B, gate 2;
    * INC-25 P4 gains "toPrecision" and toString's non-10 radix, D4 ii/iii
    * — the header comment below the OLD radix-fence framing is corrected
@@ -6831,6 +6838,70 @@ export class DynBuilder {
         // around `scr_dyn_call`, unconditionally popped after); ported
         // below via thisPush/thisPop, R staging callFn()'s result across
         // the pop the way C's local `r` does.
+        /** Board #191: Object.prototype's `method` over receiver 0,
+         * leaving the dyn result. Every own member is enumerable on the
+         * tree except an array's or a string's `length` and a function's
+         * `name` / `length` (hasOwn's arms), so propertyIsEnumerable is
+         * hasOwn minus those; the tree has no prototype objects, so
+         * isPrototypeOf is always false; valueOf is ToObject(this), the
+         * receiver itself. */
+        const objProtoCall = (): void => {
+          if (method === "valueOf") {
+            c.localGet(0);
+            return;
+          }
+          if (method === "isPrototypeOf") {
+            this.boxBool(c, (x) => x.i32Const(0));
+            return;
+          }
+          if (method === "toLocaleString") {
+            // OBJ only (OBJPROTO_METHODS' doc): this.toString(), which on
+            // the tree is the ToString conversion.
+            c.localGet(0);
+            c.call(this.toStr());
+            c.localSet(S);
+            bailIfPending();
+            this.boxStr(c, (x) => x.localGet(S));
+            return;
+          }
+          // hasOwnProperty / propertyIsEnumerable: ToPropertyKey(key).
+          argAt(0);
+          c.call(this.toStr());
+          c.localSet(S);
+          bailIfPending();
+          this.boxBool(c, (x) => {
+            x.localGet(0);
+            x.localGet(S);
+            x.call(this.hasOwn());
+            if (method === "propertyIsEnumerable") {
+              // hasOwn AND NOT (an array's or string's `length`, or a
+              // function's `name` / `length`).
+              this.pushIsLength(x, (y) => y.localGet(S));
+              x.localGet(K);
+              x.i32Const(DK.ARR);
+              x.i32Eq();
+              x.localGet(K);
+              x.i32Const(DK.STR);
+              x.i32Eq();
+              x.i32Or();
+              x.i32And();
+              x.localGet(K);
+              x.i32Const(DK.FUNC);
+              x.i32Eq();
+              this.pushIsLength(x, (y) => y.localGet(S));
+              x.localGet(S);
+              this.deps.lit(x, "name");
+              x.call(this.deps.strEq());
+              x.i32Or();
+              x.i32And();
+              x.i32Or();
+              x.i32Eqz();
+              x.i32And();
+            }
+          });
+        };
+        const objProto = DynBuilder.OBJPROTO_METHODS.has(method);
+
         this.arm(c, K, [DK.OBJ], () => {
           this.objPayload(c, (x) => x.localGet(0));
           this.deps.lit(c, method);
@@ -6856,6 +6927,24 @@ export class DynBuilder {
           c.return_();
           c.end();
           c.end();
+          if (objProto) {
+            // No own member, and a prototype to inherit from: every proto
+            // code but null-prototype's reaches Object.prototype (a Map
+            // stand-in through Map.prototype, which declares none of
+            // these names).
+            c.localGet(M);
+            c.refIsNull();
+            c.ifVoid();
+            this.objPayload(c, (x) => x.localGet(0));
+            c.structGet(this.objT(), OBJ_PROTO);
+            this.protoIsNull(c);
+            c.i32Eqz();
+            c.ifVoid();
+            objProtoCall();
+            c.return_();
+            c.end();
+            c.end();
+          }
           throwNotFn();
         });
 
@@ -8309,6 +8398,12 @@ export class DynBuilder {
           this.arm(c, K, [DK.BYTES, DK.JSVAL], () => c.unreachable());
         } else {
           this.arm(c, K, [DK.BYTES, DK.HANDLE, DK.JSVAL], () => c.unreachable());
+        }
+
+        // Board #191: the Object.prototype names every remaining kind
+        // inherits (OBJ answered them in its own arm).
+        if (objProto && method !== "toLocaleString") {
+          this.arm(c, K, [DK.NUM, DK.BOOL, DK.STR, DK.ARR, DK.FUNC, DK.PROMISE], objProtoCall);
         }
 
         // NUM, BOOL, PROMISE, and FUNC/ARR/STR for the names their own

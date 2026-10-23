@@ -1,7 +1,7 @@
 /* Cheap whole-module may-throw analysis (see computeMayThrow). Pure function
  * of the IR module; the emitter consults the result to place unwind checks. */
 import type { IrArrIntrinsicMethod, IrBytesIntrinsicMethod, IrLibFn, IrModule } from "../../ir/nodes.js";
-import { MAY_THROW_ARR_METHODS, MAY_THROW_BYTES_METHODS, MAY_THROW_LIB_FNS } from "../../ir/nodes.js";
+import { MAY_THROW_ARR_METHODS, MAY_THROW_BYTES_METHODS, MAY_THROW_LIB_FNS, moduleHasJsvalValues } from "../../ir/nodes.js";
 
 /** Cheap may-throw analysis (cost discipline: functions that transitively
  * CANNOT throw pay for no pending-exception checks). A function may throw
@@ -25,6 +25,10 @@ export function computeMayThrow(mod: IrModule): { fns: Set<string>; indirect: bo
   // closure table; any callValue may then reach a throwing body.
   let sawDynFuncAdapter = false;
   const asyncFns = new Set(mod.functions.filter((fn) => fn.async).map((fn) => fn.name));
+  // Board #195: String(e) over a catch binding runs the island engine's
+  // ToString on a thrown island value, which can throw — only in a module
+  // that holds island values.
+  const caughtToStrThrows = moduleHasJsvalValues(mod);
   // Generator functions follow the async exclusion: CALLING one only
   // allocates the suspended fiber (nothing runs, nothing can throw) — a
   // body throw surfaces at genResume, which seeds unconditionally below.
@@ -147,6 +151,11 @@ export function computeMayThrow(mod: IrModule): { fns: Set<string>; indirect: bo
           // read.
           const vt = (rec["value"] as { type?: { kind?: string } }).type?.kind;
           if (vt === "dyn" || vt === "record" || vt === "array" || vt === "union") f.throws = true;
+          break;
+        }
+        case "toString": {
+          const ot = (rec["operand"] as { type?: { kind?: string } }).type?.kind;
+          if (caughtToStrThrows && ot === "caught") f.throws = true;
           break;
         }
         case "jsOp":

@@ -1091,9 +1091,34 @@ export class LlDyn {
         for (const f of dynFields) {
           const klen = Buffer.byteLength(f.name, "utf8");
           const fv = loadFieldOf(f.name, f.type);
+          // Boards #178/#230: a units-only OPTIONAL field (a widened
+          // literal's phantom `b?: undefined`) holding undefined does not
+          // cross; any other field does (SEMANTICS.md S091).
+          const absentDef = f.optional === true && f.type.kind === "union" ? host.unionsById.get(f.type.unionId) : undefined;
+          const absentTag =
+            absentDef && absentDef.arms.every((a) => a.kind === "undefinedT" || a.kind === "nullT")
+              ? absentDef.arms.findIndex((a) => a.kind === "undefinedT")
+              : -1;
+          let skipTo: string | null = null;
+          if (absentTag >= 0) {
+            const tp = B.tmp();
+            const tg = B.tmp();
+            const has = B.tmp();
+            B.line(`${tp} = getelementptr inbounds %ScrUnion, ptr ${fv}, i64 0, i32 1`);
+            B.line(`${tg} = load i32, ptr ${tp}`);
+            B.line(`${has} = icmp ne i32 ${tg}, ${absentTag}`);
+            const lput = B.newLabel("dfo.put");
+            skipTo = B.newLabel("dfo.next");
+            B.condBr(has, lput, skipTo);
+            B.startBlock(lput);
+          }
           const conv = B.tmp();
           B.line(`${conv} = call ptr @${this.toDynHelper(f.type)}(${this.valTy(f.type)} ${fv})`);
           B.line(`call void @scr_dyn_obj_set(ptr ${d}, ptr ${host.cstr(f.name)}, i64 ${klen}, ptr ${conv}) ; ${f.name}`);
+          if (skipTo !== null) {
+            B.br(skipTo);
+            B.startBlock(skipTo);
+          }
         }
         if (shape.indexValue) {
           const iv = shape.indexValue;

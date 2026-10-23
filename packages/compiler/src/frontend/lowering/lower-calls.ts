@@ -6573,22 +6573,28 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
           },
           loc,
         };
-        // Undefined-armed fields: the push is guarded by a tag test (the
-        // key exists exactly when the arm is not undefined).
+        // Undefined-armed fields: the push is guarded by a tag test (an
+        // OPTIONAL field is an own key exactly when it does not hold
+        // undefined; a required one always is — L.markPresence, board
+        // #178).
         const utag = f.type.kind === "union" ? L.armTag(f.type.unionId, UNDEFINED_T) : -1;
         body.push(
           utag >= 0 && f.type.kind === "union"
             ? {
                 kind: "if",
-                cond: {
-                  kind: "unionIsTag",
-                  unionId: f.type.unionId,
-                  tag: utag,
-                  negated: true,
-                  value: { kind: "recordGet", obj: ref, shapeId: argIr.shapeId, field: f.name, type: f.type, loc },
-                  type: BOOL,
-                  loc,
-                },
+                cond: L.markPresence(
+                  {
+                    kind: "unionIsTag",
+                    unionId: f.type.unionId,
+                    tag: utag,
+                    negated: true,
+                    value: { kind: "recordGet", obj: ref, shapeId: argIr.shapeId, field: f.name, type: f.type, loc },
+                    type: BOOL,
+                    loc,
+                  },
+                  argIr.shapeId,
+                  f.name,
+                ),
                 then: [pushStmt],
                 else_: null,
                 loc,
@@ -6633,15 +6639,19 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
       const utag = f.type.kind === "union" ? L.armTag(f.type.unionId, UNDEFINED_T) : -1;
       const answer: IrExpr =
         utag >= 0 && f.type.kind === "union"
-          ? {
-              kind: "unionIsTag",
-              unionId: f.type.unionId,
-              tag: utag,
-              negated: true,
-              value: { kind: "recordGet", obj: rRef, shapeId, field: f.name, type: f.type, loc },
-              type: BOOL,
-              loc,
-            }
+          ? L.markPresence(
+              {
+                kind: "unionIsTag",
+                unionId: f.type.unionId,
+                tag: utag,
+                negated: true,
+                value: { kind: "recordGet", obj: rRef, shapeId, field: f.name, type: f.type, loc },
+                type: BOOL,
+                loc,
+              },
+              shapeId,
+              f.name,
+            )
           : { kind: "boolLit", value: true, type: BOOL, loc };
       body.push({
         kind: "if",
@@ -6694,7 +6704,11 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
         utag >= 0 && f.type.kind === "union"
           ? {
               kind: "if",
-              cond: { kind: "unionIsTag", unionId: f.type.unionId, tag: utag, negated: true, value: get, type: BOOL, loc },
+              cond: L.markPresence(
+                { kind: "unionIsTag", unionId: f.type.unionId, tag: utag, negated: true, value: get, type: BOOL, loc },
+                srcShapeId,
+                f.name,
+              ),
               then: [set],
               else_: null,
               loc,
@@ -7468,13 +7482,47 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
           expr: { kind: "arrIntrinsic", method: "push", receiver: outRef, args: [pushed], type: F64, loc },
           loc,
         };
+        // Board #178: a REQUIRED field holding undefined is still an own
+        // key — its value is pushed as undefined in the else branch, which
+        // the required flag enables once the shape's flags are final.
+        let elseUndef: IrStmt[] | null = null;
+        if (guardUndefTag !== null && valueT) {
+          const undefLit: IrExpr = { kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc };
+          const undefElem =
+            valueT.kind === "union" && L.armTag(valueT.unionId, UNDEFINED_T) >= 0 ? L.coerceToExpected(undefLit, valueT) : null;
+          if (undefElem !== null) {
+            const undefPushed: IrExpr =
+              member === "values"
+                ? undefElem
+                : {
+                    kind: "recordLit",
+                    fields: [
+                      { name: "0", value: { kind: "strLit", value: f.name, type: STRING, loc } },
+                      { name: "1", value: undefElem },
+                    ],
+                    type: tupleT!,
+                    loc,
+                  };
+            elseUndef = [{
+              kind: "if",
+              cond: L.requiredFieldFlag(argIr.shapeId, f.name, loc),
+              then: [{
+                kind: "exprStmt",
+                expr: { kind: "arrIntrinsic", method: "push", receiver: outRef, args: [undefPushed], type: F64, loc },
+                loc,
+              }],
+              else_: null,
+              loc,
+            }];
+          }
+        }
         body.push(
           guardUndefTag !== null && f.type.kind === "union"
             ? {
                 kind: "if",
                 cond: { kind: "unionIsTag", unionId: f.type.unionId, tag: guardUndefTag, negated: true, value: raw, type: BOOL, loc },
                 then: [pushStmt],
-                else_: null,
+                else_: elseUndef,
                 loc,
               }
             : pushStmt,

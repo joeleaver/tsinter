@@ -6229,6 +6229,8 @@ const DV_SETTERS: Record<string, { method: IrBytesIntrinsicMethod; le: boolean }
         const raw: IrExpr = { kind: "recordGet", obj: rRef, shapeId: argIr.shapeId, field: f.name, type: f.type, loc };
         const utag = f.type.kind === "union" ? L.armTag(f.type.unionId, UNDEFINED_T) : -1;
         // The pushed value per member; null when the field cannot surface.
+        // `narrows` records that it was narrowed past the undefined arm.
+        let narrows = false;
         const surfaced = (): IrExpr | null => {
           if (!valueT) return null;
           if (typeEquals(f.type, valueT)) return raw;
@@ -6255,6 +6257,7 @@ const DV_SETTERS: Record<string, { method: IrBytesIntrinsicMethod; le: boolean }
                   const narrowed: IrExpr = isUnitType(other)
                     ? { kind: "unitLit", unit: "null", type: other, loc }
                     : { kind: "unionNarrow", unionId: f.type.unionId, tag: narrowTag, value: raw, type: other, loc };
+                  narrows = true;
                   return { kind: "unionWrap", unionId: valueT.unionId, tag: otherTag, value: narrowed, type: valueT, loc };
                 }
               }
@@ -6287,17 +6290,34 @@ const DV_SETTERS: Record<string, { method: IrBytesIntrinsicMethod; le: boolean }
                   loc,
                 };
         }
-        body.push(
-          utag >= 0 && f.type.kind === "union"
-            ? {
-                kind: "if",
-                cond: { kind: "unionIsTag", unionId: f.type.unionId, tag: utag, negated: true, value: raw, type: BOOL, loc },
-                then: [push(pushed)],
-                else_: null,
-                loc,
-              }
-            : push(pushed),
-        );
+        // Board #178: an OPTIONAL field holding undefined is no own key; a
+        // required one is. A push that carries the raw value answers that
+        // through the marked guard; one narrowed past undefined keeps the
+        // guard and pushes undefined in the required-field else branch.
+        let guard: IrExpr | null = null;
+        let elseUndef: IrStmt[] | null = null;
+        if (utag >= 0 && f.type.kind === "union") {
+          guard = { kind: "unionIsTag", unionId: f.type.unionId, tag: utag, negated: true, value: raw, type: BOOL, loc };
+          if (!narrows) {
+            guard = L.markPresence(guard, argIr.shapeId, f.name);
+          } else if (valueT && valueT.kind === "union" && L.armTag(valueT.unionId, UNDEFINED_T) >= 0) {
+            const undefElem = L.coerceToExpected({ kind: "unitLit", unit: "undefined", type: UNDEFINED_T, loc }, valueT);
+            const undefPushed: IrExpr =
+              member === "values"
+                ? undefElem
+                : {
+                    kind: "recordLit",
+                    fields: [
+                      { name: "0", value: { kind: "strLit", value: f.name, type: STRING, loc } },
+                      { name: "1", value: undefElem },
+                    ],
+                    type: tupleT!,
+                    loc,
+                  };
+            elseUndef = [{ kind: "if", cond: L.requiredFieldFlag(argIr.shapeId, f.name, loc), then: [push(undefPushed)], else_: null, loc }];
+          }
+        }
+        body.push(guard !== null ? { kind: "if", cond: guard, then: [push(pushed)], else_: elseUndef, loc } : push(pushed));
       }
 
       // The overflow walk: a fresh key snapshot in JS own-key order, each

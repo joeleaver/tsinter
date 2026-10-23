@@ -6,7 +6,7 @@
  * interning ORDER is part of the emitted C, so the registries stay on
  * CEmitter and these functions only consult them through it. */
 import type { CEmitter } from "./emitter.js";
-import { DYN_HANDLE_KINDS, IrType, isRefCounted, typeEquals, typeKey } from "../../ir/nodes.js";
+import { DYN_HANDLE_KINDS, IrType, isRefCounted, isUnitType, typeEquals, typeKey } from "../../ir/nodes.js";
 import { cDecl, cStringLiteral, cType, elemAccess, releaseCallC, retainCallC, vAdapters } from "./emit-types.js";
 import { mangleField, mangleRecordNew, mangleRecordStruct } from "../mangle.js";
 import { OVERFLOW_MEMBER } from "./emit-shapes.js";
@@ -1414,7 +1414,13 @@ export function jsonWriteHelper(E: CEmitter, t: IrType): string {
           for (const f of dynFields) {
             const keyLit = cStringLiteral(Buffer.from(f.name, "utf8"));
             const keyLen = Buffer.byteLength(f.name, "utf8");
-            d.push(`  scr_dyn_obj_set(d, ${keyLit}, ${keyLen}, ${E.toDynHelper(f.type)}(v->${mangleField(f.name)}));`);
+            const set = `scr_dyn_obj_set(d, ${keyLit}, ${keyLen}, ${E.toDynHelper(f.type)}(v->${mangleField(f.name)}));`;
+            // Boards #178/#230: a units-only OPTIONAL field (a widened
+            // literal's phantom `b?: undefined`) holding undefined does not
+            // cross; any other field does (SEMANTICS.md S091).
+            const unitsOnly = f.type.kind === "union" && (E.unionsById.get(f.type.unionId)?.arms.every((a) => isUnitType(a)) ?? false);
+            const absentTag = f.optional === true && unitsOnly ? E.undefinedArmTag(f.type) : -1;
+            d.push(absentTag >= 0 ? `  if (v->${mangleField(f.name)}->tag != ${absentTag}) ${set}` : `  ${set}`);
           }
         }
         if (shape.indexValue) {

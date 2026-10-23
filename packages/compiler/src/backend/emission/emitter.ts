@@ -33,7 +33,7 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "../../ir/nodes.js";
-import { funcOf, isRefCounted, isUnitType, mapOf, moduleEmbedsCompressedNpm, moduleUsesDgram, moduleUsesDynInvoke, moduleEmbedsBuiltin, moduleUsesFetch, moduleUsesFsWatch, moduleUsesHttp2, moduleUsesHttpServer, moduleUsesNet, moduleUsesNodeTest, moduleUsesProcessEvents, moduleUsesStream, RUNTIME_EMITTER_CLASS, STRING, VOID } from "../../ir/nodes.js";
+import { funcOf, isRefCounted, isUnitType, mapOf, moduleEmbedsCompressedNpm, moduleUsesDgram, moduleUsesDynInvoke, moduleEmbedsBuiltin, moduleHasDynValues, moduleHasJsvalValues, moduleUsesFetch, moduleUsesFsWatch, moduleUsesHttp2, moduleUsesHttpServer, moduleUsesNet, moduleUsesNodeTest, moduleUsesProcessEvents, moduleUsesStream, RUNTIME_EMITTER_CLASS, STRING, VOID } from "../../ir/nodes.js";
 import {
   mangleAsyncSpawn,
   mangleGenSpawn,
@@ -320,6 +320,22 @@ export class CEmitter {
   /** Vtable slot adapters to define after the function signatures (they
    * call sc_f_* bodies): dedupe key "implClass.method". */
   readonly vtAdapters = new Map<string, { impl: ClassMeta; slot: VtSlot }>();
+
+  private dynValuesCache: boolean | undefined;
+
+  /** Board #195: can a checked-dynamic value exist in this module? */
+  moduleHasDynValues(): boolean {
+    this.dynValuesCache ??= moduleHasDynValues(this.mod);
+    return this.dynValuesCache;
+  }
+
+  private jsvalValuesCache: boolean | undefined;
+
+  /** Board #195: can an island value exist in this module? */
+  moduleHasJsvalValues(): boolean {
+    this.jsvalValuesCache ??= moduleHasJsvalValues(this.mod);
+    return this.jsvalValuesCache;
+  }
 
   constructor(
     readonly mod: IrModule,

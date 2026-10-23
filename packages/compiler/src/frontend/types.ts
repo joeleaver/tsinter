@@ -94,7 +94,7 @@ export class ShapeRegistry {
    * registers the structural key (first writer wins — the key may already
    * belong to a structurally identical shape; the recursive id stays
    * authoritative for its own checker type either way). */
-  finalizeRecursive(t: ts.Type, fields: { name: string; type: IrType }[], indexValue?: IrType, declaredOrder?: string[]): string {
+  finalizeRecursive(t: ts.Type, fields: { name: string; type: IrType; optional?: true }[], indexValue?: IrType, declaredOrder?: string[]): string {
     const id = this.recIds.get(t);
     if (id === undefined) throw new Error("shape registry bug: finalizeRecursive without a placeholder");
     if (this.pendingRec.has(id)) {
@@ -117,9 +117,10 @@ export class ShapeRegistry {
    * value type (`indexValue`) is part of the identity too: the same
    * declared fields with and without an overflow portion — or with
    * differently-typed ones — are different structs. */
-  intern(fields: { name: string; type: IrType }[], tuple = false, indexValue?: IrType, declaredOrder?: string[],): string {
+  intern(fields: { name: string; type: IrType; optional?: true }[], tuple = false, indexValue?: IrType, declaredOrder?: string[],): string {
     const key = this.keyOf(fields, tuple, indexValue);
     let id = this.byKey.get(key);
+    if (id !== undefined) this.mergeOptional(id, fields);
     if (id === undefined) {
       id = `r${this.shapes.length}`;
       const shape: IrRecordShape = {
@@ -141,6 +142,18 @@ export class ShapeRegistry {
 
   get(shapeId: string): IrRecordShape | undefined {
     return this.byId.get(shapeId);
+  }
+
+  /** Board #178: a structurally identical contribution's `?` flags OR into
+   * the interned shape (optionality is not identity — see IrRecordShape). */
+  private mergeOptional(id: string, fields: { name: string; optional?: true }[]): void {
+    const shape = this.byId.get(id);
+    if (!shape) return;
+    for (const f of fields) {
+      if (f.optional !== true) continue;
+      const mine = shape.fields.find((x) => x.name === f.name);
+      if (mine !== undefined && mine.optional !== true) mine.optional = true;
+    }
   }
 }
 
@@ -1894,13 +1907,13 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
       kind: "record",
       shapeId: ctx.shapes.intern(
         [
-          { name: "cwd", type: optStr },
+          { name: "cwd", type: optStr, optional: true },
           { name: "encoding", type: STRING },
-          { name: "input", type: optStr },
-          { name: "maxBuffer", type: optNum },
-          { name: "stdio", type: stdio },
-          { name: "timeout", type: optNum },
-          { name: "windowsHide", type: optBool },
+          { name: "input", type: optStr, optional: true },
+          { name: "maxBuffer", type: optNum, optional: true },
+          { name: "stdio", type: stdio, optional: true },
+          { name: "timeout", type: optNum, optional: true },
+          { name: "windowsHide", type: optBool, optional: true },
         ],
         false,
         undefined,
@@ -2101,7 +2114,8 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
       { name: "internal", type: BOOL },
       { name: "mac", type: STRING },
       { name: "netmask", type: STRING },
-      { name: "scopeid", type: scopeid },
+      // IPv4's `scopeid?` is optional (board #178: absent, not a key).
+      { name: "scopeid", type: scopeid, ...(v6 ? {} : { optional: true as const }) },
     ];
     return {
       kind: "record",
@@ -2639,11 +2653,11 @@ function mapGenericUtilityAlias(widened: ts.Type, ctx: TypeMapperCtx): IrType | 
   // Partial over an index-signature shape would need `V | undefined`
   // overflow arming; no generic body needs it yet — stay unmapped.
   if (shape.indexValue) return null;
-  const fields: { name: string; type: IrType }[] = [];
+  const fields: { name: string; type: IrType; optional?: true }[] = [];
   for (const f of shape.fields) {
     const armed = withUndefinedArm(f.type, unions);
     if (!armed) return null;
-    fields.push({ name: f.name, type: armed });
+    fields.push({ name: f.name, type: armed, optional: true });
   }
   // Fields inherit the source shape's canonical (name-sorted) order — and
   // its declaration order (mapped types preserve property order in TS).
@@ -2845,14 +2859,14 @@ function mapHybridCallableIntersection(widened: ts.Type, ctx: TypeMapperCtx): Ir
   if (!funcPart) return null;
   const fn = mapType(funcPart, ctx);
   if (!fn || fn.kind !== "func") return null;
-  const fields: { name: string; type: IrType }[] = [{ name: "%call", type: fn }];
+  const fields: { name: string; type: IrType; optional?: true }[] = [{ name: "%call", type: fn }];
   const declaredOrder: string[] = [];
   for (const p of checker.getPropertiesOfType(widened)) {
     if (p.flags & (ts.SymbolFlags.GetAccessor | ts.SymbolFlags.SetAccessor)) return null;
     const pt = mapType(checker.getTypeOfSymbol(p), ctx);
     // No jsval absorb here: an island-entangled hybrid is not this shape.
     if (!pt || pt.kind === "void" || pt.kind === "jsval") return null;
-    fields.push({ name: p.name, type: pt });
+    fields.push({ name: p.name, type: pt, ...((p.flags & ts.SymbolFlags.Optional) !== 0 ? { optional: true as const } : {}) });
     declaredOrder.push(p.name);
   }
   if (fields.length === 1) return null; // no properties — it is just F
@@ -2926,7 +2940,7 @@ export function isGenericCallableMemberType(t: ts.Type, checker: ts.TypeChecker)
  * placeholder for the type mid-construction, to finalize INTO that
  * placeholder (the named-recursive-shape knot). */
 interface RecordShapeParts {
-  fields: { name: string; type: IrType }[];
+  fields: { name: string; type: IrType; optional?: true }[];
   indexValue?: IrType;
   declaredOrder?: string[];
 }
@@ -3132,7 +3146,7 @@ function mapRecordTypeInner(widened: ts.Type, ctx: TypeMapperCtx): IrType | Reco
     ) {
       return DYN;
     }
-    const fields: { name: string; type: IrType }[] = [];
+    const fields: { name: string; type: IrType; optional?: true }[] = [];
     for (const p of props) {
       if (p.flags & (ts.SymbolFlags.GetAccessor | ts.SymbolFlags.SetAccessor)) {
         // OBJECT-LITERAL get/set accessors (TS sources): the property has
@@ -3237,7 +3251,7 @@ function mapRecordTypeInner(widened: ts.Type, ctx: TypeMapperCtx): IrType | Reco
       // BEARING composite fields (`content: any[]`) keep their static
       // shape — the lift covers them.
       if (pt.kind === "jsval") return JSVAL;
-      fields.push({ name: p.name, type: pt });
+      fields.push({ name: p.name, type: pt, ...((p.flags & ts.SymbolFlags.Optional) !== 0 ? { optional: true as const } : {}) });
     }
     // getPropertiesOfType yields DECLARATION order (interface/alias/literal
     // source order) — captured before the canonical sort so Object.keys/

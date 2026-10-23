@@ -1946,6 +1946,7 @@ bool scr_caught_instanceof(const ScrCaught *c, size_t pre, size_t post);
  * records and toString-less class instances; a documented approximation
  * for thrown arrays/closures/union boxes). Borrows the box; returns +1. */
 ScrStr *scr_caught_to_string(const ScrCaught *c);
+ScrStr *scr_caught_to_string_dyn(const ScrCaught *c, ScrStr *(*ds)(const ScrDyn *));
 /* `e as C` on a catch binding (scr_lib.c): an OBJ payload inside C's
  * preorder interval extracts (retained, +1); every other payload THROWS a
  * catchable TypeError naming `cls`. Callers are compiler-emitted pending
@@ -4209,6 +4210,7 @@ ScrJsval *scr_jsval_plus(ScrJsval *a); /* unary + (ToNumber) */
 int scr_jsval_truthy(ScrJsval *a);
 ScrStr *scr_jsval_typeof(ScrJsval *a);
 ScrStr *scr_jsval_to_str(ScrJsval *a); /* String(v); NULL = bridged */
+ScrStr *scr_caught_to_string_isl(const ScrCaught *c, ScrStr *(*ds)(const ScrDyn *)); /* board #195; NULL = bridged */
 
 /* Property/element access and calls. Names are NUL-terminated ScrStr
  * (identifier property names from source); computed keys are jsvals. */
@@ -4789,6 +4791,7 @@ ScrStr *scr_insp_error(ScrError *e, double recurse, double depth);
 ScrStr *scr_insp_dyn(ScrDyn *d, double recurse, double depth);
 /* format's %s / rest-args twin: dyn strings pass verbatim. */
 ScrStr *scr_insp_dyn_s(ScrDyn *d, double depth);
+ScrStr *scr_insp_dyn_hidden(ScrDyn *d, double depth);
 #ifdef SCR_DYNAMIC
 /* Island `any` (scr_inspect_island.c — linked when a --dynamic build's
  * IR carries insp.* libCalls): the scalar kinds render exactly (typeof

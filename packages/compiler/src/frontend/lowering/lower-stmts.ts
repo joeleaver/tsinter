@@ -2307,7 +2307,7 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
   function objectRestValue(L: Lowerer, el: ts.BindingElement,
     srcRef: () => IrExpr,
     srcType: IrType & { kind: "record" },
-    shape: { fields: readonly { name: string; type: IrType }[]; indexValue?: IrType },): IrExpr {
+    shape: { fields: readonly { name: string; type: IrType; optional?: true }[]; indexValue?: IrType },): IrExpr {
     const loc = locOf(el);
     const restT = patternBindingType(L, el.name!); // callers skip nameless elisions
     // A DYN rest type is the top-type spelling (`const { ...rest } = src`
@@ -2345,7 +2345,7 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
           name: f.name,
           value: { kind: "recordGet", obj: srcRef(), shapeId: srcType.shapeId, field: f.name, type: f.type, loc } as IrExpr,
         })),
-        type: { kind: "record", shapeId: L.shapes.intern(rem.map((f) => ({ name: f.name, type: f.type }))) },
+        type: { kind: "record", shapeId: L.shapes.intern(rem.map((f) => ({ name: f.name, type: f.type, ...(f.optional === true ? { optional: true as const } : {}) }))) },
         loc,
       };
       return L.coerceInto(el, packed, DYN);
@@ -5249,7 +5249,7 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
         }
         const remaining = shape.fields.filter((f) => !consumed.has(f.name));
         const restShapeId = L.shapes.intern(
-          remaining.map((f) => ({ name: f.name, type: f.type })),
+          remaining.map((f) => ({ name: f.name, type: f.type, ...(f.optional === true ? { optional: true as const } : {}) })),
           false,
           undefined,
           shape.declaredOrder?.filter((n) => !consumed.has(n)),

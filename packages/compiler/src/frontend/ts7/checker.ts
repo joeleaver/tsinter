@@ -233,6 +233,12 @@ export class CheckerFacade {
     return this.intrinsic("any", () => this.raw.getAnyType());
   }
 
+  /** The intrinsic `any` (board #203: an Object.assign result the lowering
+   * types as the checked-dynamic kind). */
+  getAnyType(): Type {
+    return this.anyType();
+  }
+
   /** Batch-prefetches getTypeAtLocation and getSymbolAtLocation for every
    * node of the file, plus getTypeOfSymbol for every symbol those answers
    * surfaced — the per-file hook that turns the lowering's walk into three

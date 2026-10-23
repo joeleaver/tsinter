@@ -76,6 +76,7 @@ import {
   STRING,
   BYTES_U8,
   F64 as IR_F64,
+  REF_TRUTHY_KINDS,
 } from "../../ir/nodes.js";
 import { computeMayThrow } from "../emission/may-throw.js";
 import { buildClassGraph, type LlClassMeta, type LlVtSlot } from "../llvm/classes.js";
@@ -2377,10 +2378,19 @@ class Assembler {
   /** INC-27 U5: does any reachable function reach
    * `dyn.objCreateNullProto`? The same kind of STATIC prescan fact as
    * domexLive: it gates the null-prototype arms that live in SHARED
-   * paths — dyn toStr's named refusal, the caught-value ToString arm's
-   * routing to it, and the `.toString()` method's TypeError — so a module
-   * that can never build a null-prototype object keeps its bytes. */
+   * paths — dyn toStr's named refusal and the `.toString()` method's
+   * TypeError — so a module that can never build a null-prototype object
+   * keeps its bytes. node:http builds them too (an agent's `sockets` /
+   * `freeSockets` / `requests` tables and `getHeaders()`, board #229), so
+   * any http or https call counts. */
   private readonly nullProtoLive: boolean;
+  /** Board #228: can a checked-dynamic value exist at all — does any
+   * reachable IR node have the dyn type? Gates the caught-value ToString
+   * arm's dyn routing, so a module with no dyn values never interns the
+   * dyn types for it. */
+  private readonly dynValuesLive: boolean;
+  /** Board #192: util.format's %o over a dyn value is reachable. */
+  private readonly inspHiddenLive: boolean;
   /** Board #218: the module builds an opaque container stand-in (an
    * untyped JavaScript `new Map()` / `new WeakMap()` / `new WeakSet()`,
    * dyn.ts OBJ_PROTO codes 2-4), so the OBJ_PROTO readers test codes
@@ -2581,7 +2591,18 @@ class Assembler {
       "str.atob",
       "str.btoa",
     ]);
-    this.nullProtoLive = this.libCallReachable(mod, ["dyn.objCreateNullProto"]);
+    this.nullProtoLive = this.irNodeReachable(
+      mod,
+      (rec) =>
+        rec["kind"] === "libCall" &&
+        typeof rec["fn"] === "string" &&
+        (rec["fn"] === "dyn.objCreateNullProto" || rec["fn"].startsWith("http.") || rec["fn"].startsWith("https.")),
+    );
+    this.inspHiddenLive = this.libCallReachable(mod, ["insp.dynHidden"]);
+    this.dynValuesLive = this.irNodeReachable(mod, (rec) => {
+      const t = rec["type"];
+      return t !== null && typeof t === "object" && (t as Record<string, unknown>)["kind"] === "dyn";
+    });
     this.builtinObjLive = this.irNodeReachable(mod, (rec) => rec["kind"] === "dynObjLit" && rec["builtin"] !== undefined);
     // INC-26 P3 (brief-p3-v2.md §3D, rev-26 CP1 pre-read D-3/E-1): force
     // `this.nextTick` (the GETTER, interning the queue NOW) in any module
@@ -8045,6 +8066,7 @@ class Assembler {
         c.globalSet(exc.kindG);
         c.call(this.reportUncaughtHelper());
       },
+      ...(this.inspHiddenLive ? { showHidden: true as const } : {}),
       ...(this.domexLive
         ? {
             domex: {
@@ -13408,12 +13430,30 @@ class Assembler {
           const inner = this.dynFromHelper(f.type, loc);
           const slot = info.fieldIndex.get(f.name);
           if (inner === null || slot === undefined) return false;
+          // Boards #178/#230: an OPTIONAL field whose type is only units
+          // (TypeScript's phantom `b?: undefined` members of a widened
+          // literal) is no own key while it holds undefined, so it does not
+          // cross; any other optional field crosses whatever it holds
+          // (SEMANTICS.md S091).
+          const absentTag =
+            f.optional === true && f.type.kind === "union" && this.unionDef(f.type.unionId).arms.every((a) => isUnitType(a))
+              ? this.undefinedArmTag(f.type.unionId)
+              : -1;
+          if (absentTag >= 0) {
+            c.localGet(0);
+            c.structGet(info.struct, slot);
+            c.structGet(this.unions.base(), 0);
+            c.i32Const(absentTag);
+            c.i32Ne();
+            c.ifVoid();
+          }
           c.localGet(o);
           this.pushStrLitInto(c, f.name);
           c.localGet(0);
           c.structGet(info.struct, slot);
           c.call(inner);
           c.call(dyn.objPut());
+          if (absentTag >= 0) c.end();
         }
         if (info.overflow !== null) {
           // The overflow TAIL: unlike dynCheck/dynMatch's width-CAPTURE
@@ -17696,10 +17736,7 @@ class Assembler {
           this.walkExpr(e.operand);
           return;
         }
-        if (
-          k === "array" || k === "func" || k === "record" || k === "object" || k === "classval" ||
-          k === "bytes" || k === "symbol" || k === "url" || k === "searchParams"
-        ) {
+        if (k === "classval" || REF_TRUTHY_KINDS.has(k)) {
           // Every object is truthy; evaluate for effects, answer true.
           // (A class-typed value is never null — null and undefined ride
           // unions, whose own helper answers for them. map/set have the
@@ -17707,7 +17744,8 @@ class Assembler {
           // U1): every symbol is truthy, unconditionally — there is no
           // falsy symbol in JS, described or not, registered or not — so
           // this is the SAME "evaluate, drop, answer true" shape, never a
-          // real branch.
+          // real branch. Every other ref kind (a generator, map, promise,
+          // ...) is an object too — board #204's kept operands reach them.
           this.walkExpr(e.operand);
           code.drop();
           code.i32Const(1);
@@ -18263,13 +18301,15 @@ class Assembler {
           code.refCast(exc.errT);
           code.call(this.errToStrHelper());
           code.else_();
-          if (this.nullProtoLive || this.builtinObjLive) {
-            // INC-27 U5: in a module that can build a null-prototype
-            // object, a thrown DYNAMIC value converts through dyn toStr,
-            // the one place its named refusal lives — so a caught
-            // Object.create(null) never reads "[object Object]" here; an
-            // opaque container stand-in reads its class's tag there
-            // (board #218). Every other payload keeps the default text.
+          // A thrown DYNAMIC value converts through dyn toStr — its
+          // array, number and string texts, a null-prototype object's
+          // named refusal, a container stand-in's class tag — in every
+          // module (board #228: this was once gated on the module also
+          // building one of the latter two). Every other payload keeps the
+          // default text.
+          if (!this.dynValuesLive) {
+            this.pushStrLit("[object Object]");
+          } else {
             code.localGet(kind);
             code.i32Const(EXC_REF);
             code.i32Eq();
@@ -18288,8 +18328,6 @@ class Assembler {
             code.else_();
             this.pushStrLit("[object Object]");
             this.close();
-          } else {
-            this.pushStrLit("[object Object]");
           }
           this.close();
           this.close();
@@ -19051,6 +19089,15 @@ class Assembler {
           // the site checks the cell.
           for (const a of e.args) this.walkExpr(a);
           code.call(e.fn === "insp.dynS" ? this.insp.dynS() : this.insp.dyn());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "insp.dynHidden") {
+          // util.format's %o over a dyn value (board #192): the walker
+          // with showHidden on. Throws like insp.dyn, plus the fences for
+          // the kinds whose hidden members it does not model.
+          for (const a of e.args) this.walkExpr(a);
+          code.call(this.insp.dynHidden());
           this.emitPendingCheck();
           return;
         }

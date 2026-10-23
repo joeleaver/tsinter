@@ -263,6 +263,10 @@ export interface InspectDeps {
    * the bracket's header by Node's rule (see error()); `pending` fires
    * when rendering a cause left an exception in the cell (the uncaught
    * report — this leaf cannot throw). */
+  /** Board #192: the module reaches `insp.dynHidden` (util.format's %o
+   * over a dyn value), so the walker carries the showHidden arms. Absent,
+   * every module keeps its bytes. */
+  showHidden?: true;
   domex?: {
     isDomex: (c: Code, slot: number) => void;
     hasCause: (c: Code, slot: number) => void;
@@ -2857,6 +2861,16 @@ export class InspectBuilder {
 
   private seenG: number | null = null;
   private nseenG: number | null = null;
+  private hiddenG: number | null = null;
+
+  /** Board #192: 1 while `dynHidden` renders — Node's showHidden. */
+  private hidden(): number {
+    this.hiddenG ??= this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41);
+      w.sleb(0);
+    });
+    return this.hiddenG;
+  }
   private circG: number | null = null;
   private ncircG: number | null = null;
   private eqArrT: number | null = null;
@@ -3674,6 +3688,8 @@ export class InspectBuilder {
         c.return_();
       });
       this.kindArm(c, K, [DK.FUNC], () => {
+        // %o: Node lists length, name, arguments, caller and prototype.
+        this.hiddenFence(c, "a function value");
         // NAME: keyGet's OWN precedence (tables, THEN FN_NAME's built-in
         // fallback — a null FN_NAME already reads back as "" through
         // that path: C's `name && name[0]`, ported once, in keyGet, not
@@ -3890,6 +3906,15 @@ export class InspectBuilder {
         // needs a slot to hold it.
         c.localGet(N);
         c.i32Eqz();
+        if (this.deps.showHidden === true) {
+          // With showHidden the hidden `length` key keeps an empty array
+          // off Node's empty shortcut: it is a frame like any other (its
+          // depth counts toward the parent's compact test, and beyond the
+          // depth it reads [Array]).
+          c.globalGet(this.hidden());
+          c.i32Eqz();
+          c.i32And();
+        }
         c.ifVoid();
         this.deps.lit(c, "[]");
         c.return_();
@@ -3978,6 +4003,43 @@ export class InspectBuilder {
         c.i32Eq();
         c.call(this.entry());
         c.end();
+        if (this.deps.showHidden === true) {
+          // %o: the hidden `[length]: N` entry, last. Node's grid code
+          // then reads it as one more output slot: the padStart order
+          // tests `value[i]` for every slot (so the entry counts as a
+          // number only where `value[101]` is one), and the slot it
+          // leaves out of the grid is the LAST one whenever the output
+          // outgrows maxArrayLength — here, the `[length]` entry itself.
+          c.globalGet(this.hidden());
+          c.ifVoid();
+          c.globalGet(this.len());
+          c.localSet(MARK);
+          this.deps.lit(c, "[length]: ");
+          c.call(this.ibPuts());
+          c.localGet(N);
+          c.f64ConvertI32U();
+          c.call(this.deps.f64ToStr());
+          c.call(this.ibPuts());
+          c.localGet(MARK);
+          c.call(this.ibTake());
+          c.localGet(N);
+          c.i32Const(MAX_ARRAY_LENGTH + 1);
+          c.i32GtU();
+          c.ifResult(I32);
+          dyn.arrAt(c, (x) => x.localGet(V), (x) => x.i32Const(MAX_ARRAY_LENGTH + 1));
+          c.structGet(dynT, DYN_KIND);
+          c.i32Const(DK.NUM);
+          c.i32Eq();
+          c.else_();
+          c.i32Const(0);
+          c.end();
+          c.call(this.entry());
+          c.localGet(N);
+          c.i32Const(MAX_ARRAY_LENGTH);
+          c.i32GeU();
+          c.localSet(MORE);
+          c.end();
+        }
         this.deps.lit(c, "");
         this.deps.lit(c, "[");
         this.deps.lit(c, "]");
@@ -4072,6 +4134,13 @@ export class InspectBuilder {
           c.localGet(NP);
           c.i32Const(OBJ_PROTO_WEAKMAP);
           c.i32GeU();
+          if (this.deps.showHidden === true) {
+            // With showHidden Node previews the (here always empty)
+            // entries instead: `WeakMap { x: 1 }`, `WeakSet {  }`.
+            c.globalGet(this.hidden());
+            c.i32Eqz();
+            c.i32And();
+          }
           c.ifVoid();
           this.deps.lit(c, "<items unknown>");
           c.i32Const(0);
@@ -4164,6 +4233,17 @@ export class InspectBuilder {
       //    never itself be part of a cycle (S014's bytes amendment argues
       //    the same acyclic-by-construction point).
       this.kindArm(c, K, [DK.BYTES], () => {
+        if (this.deps.showHidden === true) {
+          // %o of a Uint8Array lists BYTES_PER_ELEMENT, length,
+          // byteLength, byteOffset and buffer; a Buffer keeps its
+          // <Buffer ..> form.
+          dyn.bytesPayload(c, (x) => x.localGet(D));
+          c.structGet(dyn.bytesPayloadT(), BYTES_PAYLOAD_IS_BUFFER);
+          c.i32Eqz();
+          c.ifVoid();
+          this.hiddenFence(c, "a Uint8Array value");
+          c.end();
+        }
         dyn.bytesPayload(c, (x) => x.localGet(D));
         c.structGet(dyn.bytesPayloadT(), BYTES_PAYLOAD_IS_BUFFER);
         c.ifResult(strRef);
@@ -4330,6 +4410,42 @@ export class InspectBuilder {
       c.call(this.dyn());
       this.mb.setBody(idx, [], c.bytes());
     });
+  }
+
+  /** `%w.insp.dynHidden(d, depth)` — util.format's %o over a dyn value
+   * (board #192): the walker with showHidden on, which adds an array's
+   * `[length]` entry, drops a weak collection's `<items unknown>` marker
+   * and fences the kinds whose hidden members it does not model. The flag
+   * is cleared on every return, a fence's included. */
+  dynHidden(): number {
+    const dyn = this.deps.dyn();
+    return this.cached("dynHidden", [dyn.dynRef(), F64], [this.deps.strRef()], (idx) => {
+      const c = new Code();
+      c.i32Const(1);
+      c.globalSet(this.hidden());
+      c.localGet(0);
+      c.f64Const(0);
+      c.localGet(1);
+      c.call(this.dyn());
+      c.i32Const(0);
+      c.globalSet(this.hidden());
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** In the showHidden render only: abandon it with the named fence for
+   * `what`, whose hidden members the walker does not model. */
+  private hiddenFence(c: Code, what: string): void {
+    if (this.deps.showHidden !== true) return;
+    c.globalGet(this.hidden());
+    c.ifVoid();
+    c.call(this.reset());
+    this.deps.throwError(c, "%Error", "Error", (x) =>
+      this.deps.lit(x, `util.format %o of ${what} is not supported yet`),
+    );
+    c.refNull(this.deps.strType());
+    c.return_();
+    c.end();
   }
 
   /** The scratch array type for the OBJ arm's entry sort (A.4) — a plain

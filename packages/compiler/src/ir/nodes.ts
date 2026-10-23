@@ -1040,8 +1040,13 @@ export const RUNTIME_STREAM_CLASSES: ReadonlyMap<
 export interface IrRecordShape {
   /** Frontend-assigned shape id (`r0`, `r1`, ...). */
   id: string;
-  /** Sorted by field name (canonical order). Types are never void. */
-  fields: { name: string; type: IrType }[];
+  /** Sorted by field name (canonical order). Types are never void.
+   * `optional` (board #178): some type interned to this shape declares
+   * the field with `?` — NOT identity (structurally identical shapes still
+   * share one id; the flag ORs across them). Key PRESENCE follows it: a
+   * required field is always an own key, an optional one is an own key
+   * exactly while it does not hold undefined (SEMANTICS.md S091). */
+  fields: { name: string; type: IrType; optional?: true }[];
   /** A TUPLE shape (`[string, number]`): fields are exactly "0".."n-1" —
    * one per position, arity = fields.length. Same struct/RC/trace emission
    * as any record; the flag changes the SURFACE (literal-index access,
@@ -3713,6 +3718,10 @@ export type IrLibFn =
   | "insp.error"
   | "insp.dyn"
   | "insp.dynS"
+  /** util.format's %o over a checked-dynamic argument ([value, depth]):
+   * the dyn walk with showHidden (an array's hidden `[length]` entry);
+   * kinds whose hidden members are not modelled throw a loud fence. */
+  | "insp.dynHidden"
   | "insp.jsval"
   | "insp.begin"
   | "insp.entry"
@@ -6272,6 +6281,40 @@ export function moduleUsesSearchParams(mod: IrModule): boolean {
  * binary (the moduleUsesSearchParams precedent: pure data transforms, no
  * loop hooks, cross-compiles everywhere). qs-free programs keep their
  * exact link line. Same generic-walk shape as moduleUsesZlib. */
+/** True when any IR node in the module carries the checked-dynamic type —
+ * whether a dyn value can exist at all (board #195: the native lanes'
+ * caught-value ToString routes a thrown dyn value only then, so dyn-free
+ * programs keep their exact output). */
+export function moduleHasDynValues(mod: IrModule): boolean {
+  return moduleHasTypeKind(mod, "dyn");
+}
+
+/** True when any IR node carries the island `jsval` type — the native
+ * lanes link the island runtime (scr_island.c) then (board #195's caught
+ * ToString routes a thrown island value through it). */
+export function moduleHasJsvalValues(mod: IrModule): boolean {
+  return moduleHasTypeKind(mod, "jsval");
+}
+
+function moduleHasTypeKind(mod: IrModule, kind: "dyn" | "jsval"): boolean {
+  let found = false;
+  const visit = (v: unknown): void => {
+    if (found || v === null || typeof v !== "object") return;
+    if (Array.isArray(v)) {
+      for (const item of v) visit(item);
+      return;
+    }
+    const t = (v as { type?: unknown }).type;
+    if (t !== null && typeof t === "object" && (t as { kind?: unknown }).kind === kind) {
+      found = true;
+      return;
+    }
+    for (const key of Object.keys(v)) visit((v as Record<string, unknown>)[key]);
+  };
+  for (const fn of mod.functions) visit(fn.body);
+  return found;
+}
+
 export function moduleUsesQs(mod: IrModule): boolean {
   let found = false;
   const visit = (v: unknown): void => {
@@ -6753,6 +6796,7 @@ export function moduleLibNondeterministicSurface(mod: IrModule): string | null {
 export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "num.toFixed",
   "insp.jsonDyn",
+  "insp.dynHidden",
   // diagnostics_channel: publish runs subscribers synchronously (a throw
   // propagates — the documented divergence from triggerUncaughtException);
   // the subscribe/unsubscribe forms throw Node's ERR_INVALID_ARG_TYPE for

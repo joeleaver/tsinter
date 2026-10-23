@@ -73,7 +73,7 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "../../ir/nodes.js";
-import { canMarshalFuncIntoIsland, CAUGHT, DYN, F64, islandCallbackRet, islandPromisePayloadTag, isRefCounted, isUnitType, MAY_THROW_LIB_FNS, moduleUsesDynInvoke, moduleUsesFetch, moduleUsesFsWatch, moduleUsesHttpServer, moduleUsesNet, moduleUsesProcessEvents, moduleUsesStream, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, STRING, typeEquals, typeKey, VOID } from "../../ir/nodes.js";
+import { canMarshalFuncIntoIsland, CAUGHT, DYN, F64, islandCallbackRet, islandPromisePayloadTag, isRefCounted, isUnitType, MAY_THROW_LIB_FNS, moduleHasDynValues, moduleHasJsvalValues, moduleUsesDynInvoke, moduleUsesFetch, moduleUsesFsWatch, moduleUsesHttpServer, moduleUsesNet, moduleUsesProcessEvents, moduleUsesStream, RUNTIME_EMITTER_CLASS, RUNTIME_ERROR_CLASSES, RUNTIME_STREAM_CLASSES, STRING, typeEquals, typeKey, VOID } from "../../ir/nodes.js";
 import { computeMayThrow } from "../emission/may-throw.js";
 import { mangleArgPack, mangleAsyncSpawn, mangleClassNew, mangleClassObj, mangleClassRetain, mangleFnClosure, mangleFunction, mangleGenDrop, mangleGenResThunk, mangleGenSpawn, mangleGlobal, mangleLocal, mangleRecordNew, mangleRecordStruct, mangleResolveThunk, mangleTrampoline, mangleVtStruct, mangleWrapper } from "../mangle.js";
 import { BlockBuilder } from "./blocks.js";
@@ -503,6 +503,7 @@ const LIB_FN_SYMS: Record<string, string> = {
   "dyn.this": "scr_dyn_this_get",
   "insp.dyn": "scr_insp_dyn",
   "insp.dynS": "scr_insp_dyn_s",
+  "insp.dynHidden": "scr_insp_dyn_hidden",
   "fs.readFileSyncDyn": "scr_fs_read_file_sync_dyn",
   // Loose generic-shaped stragglers the burn-down surfaced alongside the
   // dyn head: the x509 PEM walks and stdin raw-mode throw catchably (the
@@ -993,6 +994,22 @@ class LlEmitter {
   /** Active optional-chain bind slots, by chain id (chainRecv reads). */
   private readonly chainSlots = new Map<string, LlValue>();
   private logArgSlots = 0;
+
+  private dynValuesCache: boolean | undefined;
+
+  /** Board #195: can a checked-dynamic value exist in this module? */
+  private moduleHasDynValues(): boolean {
+    this.dynValuesCache ??= moduleHasDynValues(this.mod);
+    return this.dynValuesCache;
+  }
+
+  private jsvalValuesCache: boolean | undefined;
+
+  /** Board #195: can an island value exist in this module? */
+  private moduleHasJsvalValues(): boolean {
+    this.jsvalValuesCache ??= moduleHasJsvalValues(this.mod);
+    return this.jsvalValuesCache;
+  }
 
   constructor(private readonly mod: IrModule) {
     for (const fn of mod.functions) this.fnByName.set(fn.name, fn);
@@ -4222,9 +4239,26 @@ class LlEmitter {
         if (v.type.kind === "caught") {
           // String(e) / `${e}` on a catch binding: JS's String() over the
           // snapshot (scr_caught_to_string — borrows the box, +1 result).
-          this.declare(`declare ptr @scr_caught_to_string(ptr)`);
+          // In a module that can hold dyn values, a thrown DYN value
+          // converts through the dyn ToString helper (board #195).
           const t = B.tmp();
-          B.line(`${t} = call ptr @scr_caught_to_string(ptr ${v.name})`);
+          if (this.moduleHasJsvalValues()) {
+            // ...and a thrown ISLAND value through the engine's ToString,
+            // which can throw (scr_caught_to_string_isl).
+            this.declare(`declare ptr @scr_caught_to_string_isl(ptr, ptr)`);
+            const helper = this.dyn.dynToStrHelper();
+            B.line(`${t} = call ptr @scr_caught_to_string_isl(ptr ${v.name}, ptr @${helper})`);
+            const r = this.own({ name: t, type: e.type });
+            this.emitPendingCheck();
+            return r;
+          } else if (this.moduleHasDynValues()) {
+            this.declare(`declare ptr @scr_caught_to_string_dyn(ptr, ptr)`);
+            const helper = this.dyn.dynToStrHelper();
+            B.line(`${t} = call ptr @scr_caught_to_string_dyn(ptr ${v.name}, ptr @${helper})`);
+          } else {
+            this.declare(`declare ptr @scr_caught_to_string(ptr)`);
+            B.line(`${t} = call ptr @scr_caught_to_string(ptr ${v.name})`);
+          }
           return this.own({ name: t, type: e.type });
         }
         if (v.type.kind === "dyn") {

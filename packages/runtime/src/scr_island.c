@@ -9964,4 +9964,14 @@ ScrJsval *scr_jsval_from_url(ScrUrl *u) {
   return isl_cell_new(v);
 }
 
+/* Board #195: String(e) in a module that holds island values — a thrown
+ * ISLAND value converts through the engine's ToString (NULL with the
+ * exception pending when that throws; the caller checks), everything else
+ * through scr_caught_to_string_dyn. Borrows; +1. */
+ScrStr *scr_caught_to_string_isl(const ScrCaught *c, ScrStr *(*ds)(const ScrDyn *)) {
+  if (c->kind == SCR_EXC_REF && c->retain_fn == scr_jsval_retain_v) return scr_jsval_to_str((ScrJsval *)c->payload);
+  return scr_caught_to_string_dyn(c, ds);
+}
+
 #endif /* SCR_DYNAMIC */
+

@@ -104,7 +104,7 @@ import { lowerAssertModuleCall, lowerAssertDirectCall } from "./lower-assert.js"
 import { lowerUtilModuleCall } from "./lower-inspect.js";
 import { lowerComptime, comptimeBakeable, rejectComptimeCaptures, comptimeValueToIr } from "./lower-comptime.js";
 import { lowerStmts, noteBlockedBindings, isBlockedBinding, lowerScopedBlock, predeclareForwardCapture, predeclareForwardFnDecl, predeclareForwardVar, rejectJumpCrossingFinally, lowerStmt, lowerVarStatement, lowerDestructuringDecl, lowerDestructuringAssignParts, lowerBindingPattern, lowerJsvalBindingPattern, checkBindingElement, bindPatternTarget, lowerVarDeclList, lowerVarDecl, lowerSwitch, lowerTry, lowerExprStatement, lowerForOf, lowerForStatement } from "./lower-stmts.js";
-import { FieldTarget, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf } from "./lower-exprs.js";
+import { FieldTarget, droppableStatic, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf } from "./lower-exprs.js";
 import type { ExpandoMember } from "./lower-expando.js";
 import { lowerRecordFieldCall, lowerObjectMethodCall } from "./lower-calls.js";
 import { fenceCrossBlockNsRef, nsPathPrefix } from "./lower-namespaces.js";
@@ -1981,6 +1981,10 @@ export class Lowerer {
       }
     }
 
+    // Board #178: every shape's optional flags are final now.
+    this.markCheckedShapesOptional(functions);
+    this.resolvePresenceTests(functions);
+
     // Computed before the module gate: retention resolves every class name
     // the emitted program references, flushing deferred class diagnostics
     // that a reached type makes relevant.
@@ -2598,6 +2602,14 @@ export class Lowerer {
     // receiver-kind check downstream sees the narrowed arm.
     const narrowed = this.chainNarrowedType.get(node);
     if (narrowed) return narrowed;
+    // Board #205: `Object.assign(target, ...)` RETURNS its target, but
+    // its declared type is `T & U`, which tsc collapses to the sources'
+    // type when T is `unknown` (JSON.parse's type in a JavaScript file) —
+    // mapping that would project the target into a fresh source-shaped
+    // record. A call over an any/unknown target, and a const binding it
+    // initializes, answer the target's own type instead.
+    const assignTarget = this.dynAssignTargetOf(node);
+    if (assignTarget !== null) return assignTarget === "any" ? this.checker.getAnyType() : this.typeOf(assignTarget);
     const t = this.checker.getTypeAtLocation(node);
     // ALIASED-TYPEOF narrowing: inside a branch a `type === 'string'`
     // test proves (type = typeof val, both never reassigned), references
@@ -2784,6 +2796,192 @@ export class Lowerer {
     const sym: ts.Symbol | undefined = t.getSymbol();
     return (sym && this.typeParamTsBindings.get(sym)) ?? null;
   };
+
+  /** Board #205: the target argument of the `Object.assign(target, ...)`
+   * call `node` is (or the const binding `node` names, or whose
+   * declaration `node` is, is initialized by), when that target's type is
+   * any or unknown; else null. Board #203: "any" for a call with a SPREAD
+   * source whose checker type (the tuple overload's `T & U`) maps to
+   * anything but a plain record — that call lowers to the dyn copy
+   * (dyn.assignAll), and an own-property copy is never an instance of a
+   * source's class. */
+  private dynAssignTargetOf(node: ts.Node): ts.Expression | "any" | null {
+    let hit = this.dynAssignTargets.get(node);
+    if (hit === undefined) {
+      hit = this.computeDynAssignTarget(node);
+      this.dynAssignTargets.set(node, hit);
+    }
+    return hit;
+  }
+
+  private readonly dynAssignTargets = new WeakMap<ts.Node, ts.Expression | "any" | null>();
+
+  private computeDynAssignTarget(node: ts.Node): ts.Expression | "any" | null {
+    let call: ts.Node | undefined = node;
+    if (ts.isIdentifier(node) || ts.isVariableDeclaration(node)) {
+      const sym = ts.isVariableDeclaration(node) ? undefined : this.checker.getSymbolAtLocation(node);
+      const decl = ts.isVariableDeclaration(node)
+        ? node
+        : sym !== undefined ? this.checker.valueDeclarationOf(sym) : undefined;
+      if (
+        decl === undefined || !ts.isVariableDeclaration(decl) || decl.type !== undefined ||
+        !ts.isIdentifier(decl.name) ||
+        !ts.isVariableDeclarationList(decl.parent) || (decl.parent.flags & ts.NodeFlags.Const) === 0
+      ) {
+        return null;
+      }
+      call = decl.initializer;
+    }
+    while (call !== undefined && ts.isParenthesizedExpression(call)) call = call.expression;
+    if (
+      call === undefined || !ts.isCallExpression(call) || call.arguments.length < 1 ||
+      ts.isSpreadElement(call.arguments[0]!) ||
+      !ts.isPropertyAccessExpression(call.expression) || call.expression.name.text !== "assign" ||
+      !this.isStdlibGlobal(call.expression.expression, "Object")
+    ) {
+      return null;
+    }
+    const target = call.arguments[0]!;
+    const tt = this.checker.getTypeAtLocation(target);
+    if ((tt.flags & (ts.TypeFlags.Any | ts.TypeFlags.Unknown)) !== 0) return target;
+    if (call.arguments.slice(1).some((a) => ts.isSpreadElement(a))) {
+      const mapped = this.mapTypeOf(this.checker.getTypeAtLocation(call));
+      if (mapped === null || (mapped.kind !== "record" && mapped.kind !== "dyn")) return "any";
+    }
+    return null;
+  }
+
+  /** Board #178: the record key-presence tests built during lowering —
+   * each a `unionIsTag` asking "does this field not hold undefined" —
+   * keyed by node, with the shape and field they ask about. Whether the
+   * question applies depends on the field's `optional` flag, which a later
+   * structurally identical type can still set (IrRecordShape), so the
+   * answer is fixed after lowering by resolvePresenceTests. */
+  private readonly presenceTests = new Map<IrExpr, { shapeId: string; field: string; required?: true }>();
+
+  /** Marks `test` (a negated undefined-arm `unionIsTag` over a read of
+   * `field`) as the own-key presence question for that field: kept when
+   * the field is optional, answered `true` when it is required — a
+   * required field is an own key whatever it holds. Returns `test`. */
+  markPresence(test: IrExpr, shapeId: string, field: string): IrExpr {
+    this.presenceTests.set(test, { shapeId, field });
+    return test;
+  }
+
+  /** A `false` literal that becomes `true` when `field` turns out to be
+   * required — the branch that keeps a required field's key while it
+   * holds undefined (Object.values/entries, whose guarded push narrows the
+   * value past undefined). */
+  requiredFieldFlag(shapeId: string, field: string, loc: SrcLoc): IrExpr {
+    const flag: IrExpr = { kind: "boolLit", value: false, type: BOOL, loc };
+    this.presenceTests.set(flag, { shapeId, field, required: true });
+    return flag;
+  }
+
+  /** Board #178: a record built by checking a dynamic or island value
+   * (`dynCheck`, `jsExit`) may lack a required undefined-armed field's
+   * key — the source simply did not have it, and the slot then holds
+   * undefined. Every such field of every shape a check can build (nested
+   * ones included) counts as optional, so its key is reported exactly
+   * while it holds a value (SEMANTICS.md S091 (c)). */
+  private markCheckedShapesOptional(roots: unknown): void {
+    const seenNodes = new Set<unknown>();
+    const seenTypes = new Set<string>();
+    const markType = (t: IrType): void => {
+      switch (t.kind) {
+        case "record": {
+          if (seenTypes.has(`r:${t.shapeId}`)) return;
+          seenTypes.add(`r:${t.shapeId}`);
+          const shape = this.shapes.get(t.shapeId);
+          if (!shape) return;
+          for (const f of shape.fields) {
+            if (f.type.kind === "union" && this.armTag(f.type.unionId, UNDEFINED_T) >= 0) f.optional = true;
+            markType(f.type);
+          }
+          if (shape.indexValue) markType(shape.indexValue);
+          return;
+        }
+        case "union": {
+          if (seenTypes.has(`u:${t.unionId}`)) return;
+          seenTypes.add(`u:${t.unionId}`);
+          for (const a of this.unions.get(t.unionId)?.arms ?? []) markType(a);
+          return;
+        }
+        case "array":
+          markType(t.elem);
+          return;
+        case "set":
+          markType(t.elem);
+          return;
+        case "map":
+          markType(t.key);
+          markType(t.value);
+          return;
+        case "promise":
+          markType(t.inner);
+          return;
+        case "func":
+          for (const p of t.params) markType(p);
+          markType(t.ret);
+          return;
+        default:
+          return;
+      }
+    };
+    const visit = (n: unknown): void => {
+      if (n === null || typeof n !== "object" || seenNodes.has(n)) return;
+      seenNodes.add(n);
+      if (Array.isArray(n)) {
+        for (const item of n) visit(item);
+        return;
+      }
+      const rec = n as { kind?: unknown; type?: IrType };
+      if ((rec.kind === "dynCheck" || rec.kind === "jsExit") && rec.type !== undefined) markType(rec.type);
+      for (const v of Object.values(n as Record<string, unknown>)) visit(v);
+    };
+    visit(roots);
+  }
+
+  /** Answers every marked presence test against the final optional
+   * flags: a required field's test becomes `true` (its read is a pure one
+   * at every marking site, so it drops; otherwise it still runs). */
+  private resolvePresenceTests(roots: unknown): void {
+    if (this.presenceTests.size === 0) return;
+    const seen = new Set<unknown>();
+    const visit = (n: unknown): void => {
+      if (n === null || typeof n !== "object" || seen.has(n)) return;
+      seen.add(n);
+      if (Array.isArray(n)) {
+        for (const item of n) visit(item);
+        return;
+      }
+      const mark = this.presenceTests.get(n as IrExpr);
+      if (mark !== undefined) {
+        this.presenceTests.delete(n as IrExpr);
+        const f = this.shapes.get(mark.shapeId)?.fields.find((x) => x.name === mark.field);
+        if (mark.required === true) {
+          (n as { value: boolean }).value = f !== undefined && f.optional !== true;
+          return;
+        }
+        if (f !== undefined && f.optional !== true) {
+          const node = n as Record<string, unknown>;
+          const original = { ...node } as IrExpr;
+          const loc = original.loc;
+          const yes: IrExpr = { kind: "boolLit", value: true, type: BOOL, loc };
+          for (const k of Object.keys(node)) delete node[k];
+          Object.assign(
+            node,
+            droppableStatic(original)
+              ? yes
+              : { kind: "logical", op: "||", left: original, right: yes, type: BOOL, loc },
+          );
+          return;
+        }
+      }
+      for (const v of Object.values(n as Record<string, unknown>)) visit(v);
+    };
+    visit(roots);
+  }
 
   irTypeOf(node: ts.Node): IrType {
     const t = this.typeOf(node);

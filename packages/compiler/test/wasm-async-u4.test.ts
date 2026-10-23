@@ -36,7 +36,7 @@
  * diagnostics are this tier's own named refusal. Nothing outside this
  * repository is read at test time; corpus rows read tests/corpus through a
  * relative path. Row classes, in file order: FINALLY, FINALLY-LINEAR, GEN,
- * HOISTVOID, LOOPBOX, HOLES, EVERYTHING-VALID, S083, S084, DYNPROMISE,
+ * HOISTVOID, LOOPBOX, HOLES, EVERYTHING-VALID, S083, VOIDFIELD, DYNPROMISE,
  * REACTION, NONPROMISE, ADOPT, VOIDWIDEN, ISLAND, ONCE, RESOLVE, CORPUS (with the
  * REGRESSION rows over the claimed finally-chain programs).
  *
@@ -44,8 +44,7 @@
  * with Node's own output stated beside it: the registered divergences
  * (SEMANTICS.md S083 — typed promise adoption settles early, a dynamic
  * import's module evaluates early, and an `any`-held promise's island
- * `.then` adoption and `await` land one job off; S084 — a record field
- * typed void is dropped from the object); the trap rows (a named fence or
+ * `.then` adoption and `await` land one job off); the trap rows (a named fence or
  * run-time refusal, or an unhandled rejection reported as SEMANTICS.md
  * S010 registers it); and
  * the one pinned named run-time refusal (adopting a non-promise thenable). */
@@ -970,29 +969,30 @@ test("S16 S083: S083 an awaited dynamic import of a module that itself awaits", 
 });
 
 // ============================================================
-// S084
+// VOIDFIELD (formerly S084, retired by board #178: a required field typed
+// void keeps its key, as in Node)
 // ============================================================
 
-test("VF01 S084: S084 a record field typed void is dropped: the synchronous record (pre-existing path)", async () => {
-  // Node v24 prints "v ran\n1 undefined {\"a\":1} 2\n" — the registered divergence (S084).
+test("VF01 VOIDFIELD: a record field typed void keeps its key: the synchronous record", async () => {
+  // Node v24 prints "v ran\n1 undefined {\"a\":1} 2\n".
   const { stdout, stderr, exitCode } = await runRow("VF01", "function v(): void { console.log(\"v ran\"); }\nfunction main(): void {\n  const r: { a: number; w: void } = { a: 1, w: v() };\n  console.log(r.a, r.w, JSON.stringify(r), Object.keys(r).length);\n}\nmain();", "ts");
-  expect(stdout).toBe("v ran\n1 undefined {\"a\":1} 1\n");
+  expect(stdout).toBe("v ran\n1 undefined {\"a\":1} 2\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
 
-test("VF02 S084: S084 a void await filling a record field: the field is dropped", async () => {
-  // Node v24 prints "v ran\n1 undefined {\"a\":1} 2\n" — the registered divergence (S084).
+test("VF02 VOIDFIELD: a void await filling a record field keeps its key", async () => {
+  // Node v24 prints "v ran\n1 undefined {\"a\":1} 2\n".
   const { stdout, stderr, exitCode } = await runRow("VF02", "async function v(): Promise<void> { console.log(\"v ran\"); }\nasync function main(): Promise<void> {\n  const r: { a: number; w: void } = { a: 1, w: await v() };\n  console.log(r.a, r.w, JSON.stringify(r), Object.keys(r).length);\n}\nmain();", "ts");
-  expect(stdout).toBe("v ran\n1 undefined {\"a\":1} 1\n");
+  expect(stdout).toBe("v ran\n1 undefined {\"a\":1} 2\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
 
-test("VF03 S084: S084 a void await filling a record field: printed whole, then probed with in", async () => {
-  // Node v24 prints "v ran\n{ a: 1, w: undefined }\ntrue\n" — the registered divergence (S084).
+test("VF03 VOIDFIELD: a void await filling a record field: printed whole, then probed with in", async () => {
+  // Node v24 prints "v ran\n{ a: 1, w: undefined }\ntrue\n".
   const { stdout, stderr, exitCode } = await runRow("VF03", "async function v(): Promise<void> { console.log(\"v ran\"); }\nasync function main(): Promise<void> {\n  const r: { a: number; w: void } = { a: 1, w: await v() };\n  console.log(r);\n  console.log(\"w\" in r);\n}\nmain();", "ts");
-  expect(stdout).toBe("v ran\n{ a: 1, w: undefined }\nfalse\n");
+  expect(stdout).toBe("v ran\n{ a: 1, w: undefined }\ntrue\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });

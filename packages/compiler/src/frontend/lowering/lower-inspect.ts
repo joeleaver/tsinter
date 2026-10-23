@@ -36,7 +36,7 @@
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { isJsSourceFile } from "../program.js";
-import { BOOL, DYN, F64, IrExpr, IrStmt, IrType, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, shapeHasAccessorSlots, typeKey } from "../../ir/nodes.js";
+import { BOOL, DYN, F64, IrExpr, IrStmt, IrType, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, UNDEFINED_T, isUnitType, shapeHasAccessorSlots, typeKey } from "../../ir/nodes.js";
 import type { ClassInfo } from "./lower-classes.js";
 import { pureReemittable } from "./lower-exprs.js";
 
@@ -545,16 +545,40 @@ function inspectHelper(L: Lowerer, t: IrType, loc: SrcLoc): string {
       // Object.keys' declared order (SEMANTICS.md 36's stance).
       const order = shape.declaredOrder ?? shape.fields.map((f) => f.name);
       const byName = new Map(shape.fields.map((f) => [f.name, f.type] as const));
-      body = [depthGate("[Object]"), ...begin()];
-      for (const fname of order) {
-        const ft = byName.get(fname);
-        if (!ft) continue;
-        body.push(
-          entry(
-            concatAll([str(`${inspectKey(fname)}: `, loc), child(ft, get(fname, ft))], loc),
-            boolLit(false, loc),
-          ),
+      // Boards #178/#230: a units-only OPTIONAL field (a widened literal's
+      // phantom `b?: undefined`) holding undefined renders nothing
+      // (L.markPresence decides once the shape's flags are final); every
+      // other field renders whatever it holds (SEMANTICS.md S091).
+      const presence = (fname: string, ft: IrType): IrExpr | null => {
+        const utag = ft.kind === "union" ? L.armTag(ft.unionId, UNDEFINED_T) : -1;
+        if (utag < 0 || ft.kind !== "union") return null;
+        if (!(L.unions.get(ft.unionId)?.arms ?? []).every((a) => isUnitType(a))) return null;
+        return L.markPresence(
+          { kind: "unionIsTag", unionId: ft.unionId, tag: utag, negated: true, value: get(fname, ft), type: BOOL, loc },
+          t.shapeId,
+          fname,
         );
+      };
+      body = [];
+      const shown = order.filter((fname) => byName.has(fname));
+      if (shown.length > 0 && shown.every((fname) => presence(fname, byName.get(fname)!) !== null)) {
+        // Every key may be absent: Node's empty form `{}` (before the
+        // depth cutoff, like any empty object).
+        let anyPresent: IrExpr = presence(shown[0]!, byName.get(shown[0]!)!)!;
+        for (const fname of shown.slice(1)) {
+          anyPresent = { kind: "logical", op: "||", left: anyPresent, right: presence(fname, byName.get(fname)!)!, type: BOOL, loc };
+        }
+        body.push({ kind: "if", cond: { kind: "unary", op: "!", operand: anyPresent, type: BOOL, loc }, then: [ret(str("{}", loc))], else_: null, loc });
+      }
+      body.push(depthGate("[Object]"), ...begin());
+      for (const fname of shown) {
+        const ft = byName.get(fname)!;
+        const put = entry(
+          concatAll([str(`${inspectKey(fname)}: `, loc), child(ft, get(fname, ft))], loc),
+          boolLit(false, loc),
+        );
+        const has = presence(fname, ft);
+        body.push(has === null ? put : { kind: "if", cond: has, then: [put], else_: null, loc });
       }
       body.push(ret(end(str("", loc), str("{", loc), str("}", loc), false, boolLit(false, loc))));
       break;
@@ -1088,6 +1112,11 @@ function formatOArg(L: Lowerer, node: ts.Expression, depth: number, loc: SrcLoc)
   const value = L.lowerExpr(node);
   if (value.type.kind === "bytes") {
     L.noLowering(`util.format %${depth === 4 ? "o" : "O"} of typed-array values`, node, "pass util.inspect(buf) explicitly");
+  }
+  if (depth === 4 && value.type.kind === "dyn") {
+    // Board #192: the walker's showHidden mode — the static array fence
+    // below cannot see a dyn value's arrays.
+    return { kind: "libCall", fn: "insp.dynHidden", args: [value, num(depth, loc)], type: STRING, loc };
   }
   const walk = { recursive: false };
   const reason = inspectSupport(L, value.type, new Set(), walk);

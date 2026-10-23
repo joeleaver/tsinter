@@ -609,7 +609,16 @@ string receivers included; it parts company only where S016's padding
 invents members Node left as holes.) The named forms that DO work are
 the ones the runtime models directly: `length` on arrays and strings,
 canonical index reads, and prototype METHOD CALLS, which dispatch on the
-receiver's kind rather than reading a member (S023's surface). **Rationale:** inherited
+receiver's kind rather than reading a member (S023's surface). On the wasm
+tier those calls include Object.prototype's own (board #191):
+`hasOwnProperty`, `propertyIsEnumerable`, `isPrototypeOf` and `valueOf` on
+every non-nullish receiver, and `toLocaleString` on an object, answer as in
+Node — `JSON.parse('{"a":1}').hasOwnProperty("a")` is `true` — while an own
+member of the same name still shadows them and a null-prototype object has
+none; the c and llvm lanes still throw "is not a function" there. `toLocaleString`
+answers the object's ToString conversion, which on the tree ignores an own
+`toString` member (`o.toString = () => "X"` still gives "[object Object]",
+the same answer `String(o)` gives). **Rationale:** inherited
 from the C runtime's dyn tree, which stores own entries and has no
 prototype chain; giving it one means materializing Object/Array/String
 prototypes as real function values on every lane, which is a feature
@@ -5840,9 +5849,9 @@ on `arguments`), `typeof arguments` (`"object"`), `arguments == null` (`false`),
 — stated for completeness, not separately registered.
 
 The two answers DIVERGE on the eleven observables below, each measured against Node v24.18.1 (`arguments`
-inside a CLASS or STATIC method is a DIFFERENT construct, not this entry's territory: this tier's front
-end folds `arguments.length` to the constant `0` there on every lane, silently, where Node answers the
-real count — board #164 owns that gap):
+inside a CLASS or STATIC method is a DIFFERENT construct, not this entry's territory: there the front
+end folds `arguments.length` to the declared parameter count in a TypeScript file, where tsc enforces the
+arity, and refuses it by name in a JavaScript file, where a caller may pass any count — board #164):
 
 `.callee` — strict mode: Node throws a TypeError reading it (`'caller', 'callee', and 'arguments'
 properties may not be accessed`) where this tier answers `undefined` (S081-8, a strict `.cjs`). Sloppy
@@ -6017,7 +6026,14 @@ not an adoption cell, recorded here because the row is this entry's control) in
 `packages/compiler/test/wasm-async-u4.test.ts`. The llvm and c lanes are MEASURED, not pinned by a row.
 Measured against Node v24.18.1 and this tier's own llvm/c/wasm lanes.
 
-## S084 — a record field typed `void` is DROPPED from the object on every tsinter lane: `Object.keys` omits it and `"w" in r` answers false, where Node keeps the key holding `undefined` *(llvm, c and wasm)*
+## S084 — a record field typed `void` is DROPPED from the object on every tsinter lane: `Object.keys` omits it and `"w" in r` answers false, where Node keeps the key holding `undefined` *(llvm, c and wasm — RETIRED by board #178)*
+
+**Retired (board #178).** Record shapes now carry each field's `?` (IrRecordShape's `optional`), and a
+field declared without one is an own key whatever it holds: `{ a: number; w: void }` built as
+`{ a: 1, w: v() }` answers `Object.keys(r).length` 2 and `"w" in r` true, as in Node, on every lane
+(rows VF01-VF03 in `packages/compiler/test/wasm-async-u4.test.ts` now assert Node's answers). What is
+left of the old rule — an OPTIONAL field holding `undefined` counts as absent — is S091. What follows is
+the entry's history.
 
 A record whose declared type has a field of type `void` (`{ a: number; w: void }`), built from a literal
 that fills that field with a void call (`{ a: 1, w: v() }`) or a void `await` (`{ a: 1, w: await v() }`),
@@ -6168,3 +6184,65 @@ A secured socket and a dgram socket are net-lane handles for event ordering: S08
 **Scope:** the wasm lane, under a host built on Node's `tls` and `dgram` (the differential harness). The llvm and c lanes build these modules on mbedTLS and their own sockets and are not changed by this entry.
 
 **Tested by:** the "INC-29 U4 node:tls, node:https and node:dgram rows" block of `tests/harness/wasm-differential.test.ts` (the seven corpus programs; U4-VERIFY-01 the verification codes, texts and the altnames reason; U4-TLS-01 tls.connect; U4-TLS-02 (b); U4-DGRAM-01; U4-REG-01 (h); U4-HOST-01 the declined import and the store-only module that needs none; the U4-R rows from the unit's review: writes held until the verdict, an IPv6 host, options in a variable, a runtime empty `ca`, UDP send order, the verification suffix, the empty-decoding PEM block, non-canonical DER) and `packages/compiler/test/wasm-tls-u4.test.ts` (the bundled roots, the PEM matrix against Node, U4-REG-02 (c)); (a), (d), (e), (f), (g), (i) and (j) are measured, not pinned by a row. Measured against Node v24.18.1.
+
+## S091 — record own keys: an OPTIONAL field holding `undefined` is not an own key to the key surfaces, even when the program wrote `undefined` to it explicitly, while printing and the dynamic conversion keep every field but a units-only optional one; structurally identical record types share one answer, and a record shape built by a checked conversion treats its undefined-armed fields as optional *(llvm, c and wasm)*
+
+A record value has no per-key presence bit: a field slot always exists and holds a value. Which fields
+are own keys is decided from the shape (`IrRecordShape.fields[].optional`, the `?` of the declaring
+type), by two rules:
+
+- The KEY surfaces — `Object.keys` / `values` / `entries`, `for...in`, `in`, `Object.hasOwn` and
+  `Object.assign` between records: a field declared WITHOUT `?` is an own key whatever it holds
+  (`undefined` and `void` fields included); a field declared WITH `?` is an own key exactly while it does
+  not hold `undefined`.
+- PRINTING (`util.inspect`, `console.log`) and the conversion to a checked-dynamic value (what
+  `Object.assign({}, ...srcs)`, `querystring.stringify` on the native lanes and every dyn reader see):
+  every field is present, except an optional field whose type is ONLY `undefined`/`null` — TypeScript's
+  phantom `b?: undefined` members of a widened literal like `[{ a: 1 }, { b: 2 }]` (board #230) — which is
+  absent while it holds `undefined`.
+
+`JSON.stringify` drops `undefined` values either way and is unaffected. Both rules are Node's answer for
+the common cases: required fields, optional fields the program set, optional fields the program left out
+(key surfaces), an optional field explicitly set to `undefined` (printing and the dyn crossing), and the
+widened-literal phantoms (everywhere). They diverge in four cells, each measured against Node v24.18.1:
+
+(a) an optional field the program EXPLICITLY set to `undefined`, at the key surfaces: `const p: { a:
+number; w?: number } = { a: 1, w: undefined }` — Node `console.log(p, Object.keys(p), "w" in p)` prints
+`{ a: 1, w: undefined } [ 'a', 'w' ] true`; every tsinter lane prints `{ a: 1, w: undefined } [ 'a' ]
+false`.
+
+(b) a REQUIRED field holding `undefined` whose shape is shared with an identical type that declares the
+same field optional: record identity is the field list (names and types), not the `?`, so `{ a: number;
+w: number | undefined }` and `{ a: number; w?: number }` are one shape, and the `?` of either makes the
+field optional for both (`optional` ORs across them). `const e: { a: number; w: number | undefined } =
+{ a: 1, w: undefined }` alone answers Node's `a,w`; in a module that also declares
+`{ a: number; w?: number }` it answers `a`.
+
+(c) a REQUIRED field of a shape that a checked conversion builds — a dynamic or island value checked into
+a record (`JSON.parse(s) as T`, an `unknown` argument narrowed by `as`, a JavaScript value crossing into
+a typed slot), at any nesting depth: the source may simply lack the key, so every undefined-armed field
+of such a shape counts as optional module-wide, which makes a required field holding an EXPLICIT
+`undefined` lose its key at the key surfaces the way (a) does. `type A = { a: number | undefined; b:
+number }` with `const x: A = JSON.parse('{"b":1}') as A` answers Node's `[ 'b' ] false`; in the same
+module `const y: A = { a: undefined, b: 2 }` answers `[ 'b' ]` where Node answers `[ 'a', 'b' ]`.
+
+(d) printing and the dyn crossing of an optional field that is ABSENT — left out by the program, or
+missing from the source of a checked conversion — when its type holds more than units: `const o: { a:
+number; w?: number } = { a: 1 }; console.log(o)` prints `{ a: 1, w: undefined }` where Node prints
+`{ a: 1 }`, and the `x` of (c) prints `{ a: undefined, b: 1 }` where Node prints `{ b: 1 }`. (This was
+the behaviour before board #178 too.)
+
+**Rationale:** telling (a) and (d) apart needs a presence bit per optional slot that every record write,
+copy and reader maintains — absent and explicitly-undefined are the same slot value, so each surface
+must pick one reading: the key surfaces read "absent" (the left-out field is the common case there) and
+printing and the dyn crossing read "present" (a program that writes `undefined` into an optional field
+usually means it to show, `querystring.stringify`'s `u=` being the corpus case), except where the field
+can hold nothing else; splitting shapes on `?` to close (b) would make two TypeScript-compatible types two
+distinct structs, so every assignment between them would copy and lose aliasing (an observable
+divergence of its own, on far more programs); (c) keeps a record that came from a key-less source
+answering Node's keys, at the cost of the explicit-undefined case on the same shape. The `?`-driven rule
+is exact for every program that does not write `undefined` into a field that is optional or checked.
+
+**Tested by:** `packages/compiler/test/wasm-silent-batch.test.ts` (PRESENCE rows: the required, optional,
+widened-literal, index-signature and checked-conversion cells with Node's answers, and the divergent
+cells pinned with Node's output beside them); the llvm and c lanes are measured, not pinned.

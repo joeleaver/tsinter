@@ -1150,11 +1150,11 @@ test("A02 ASSIGN: control, board #193: the two-argument form on array and scalar
   expect(exitCode).toBe(0);
 });
 
-test("A04 ASSIGN: board #205: a typed record spread as the source projects the result onto the record's keys", async () => {
+test("A04 ASSIGN: board #205 (closed): a typed record spread as the source — the result is the dyn target itself", async () => {
   const src = "'use strict';\nconst src = { z: 2 };\nconst a = Object.assign(JSON.parse('{\"a\":1}'), ...[src]);\nconsole.log(JSON.stringify(a));\n";
-  // This tier's answer (board #205: the result is a fresh copy projected onto the source record's keys); Node prints "{\"a\":1,\"z\":2}\n".
+  // Node prints "{\"a\":1,\"z\":2}\n".
   const { stdout, stderr, exitCode } = await runRow("A04", src, "cjs");
-  expect(stdout).toBe("{\"z\":2}\n");
+  expect(stdout).toBe("{\"a\":1,\"z\":2}\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
@@ -1343,13 +1343,12 @@ test("R89 NULLPROTO: a null-prototype object as a computed key refuses by name",
   expect(stderr).toBe("Uncaught Error: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet\n");
 });
 
-test("R89b NULLPROTO: board #204: a folded String(e) === undefined never converts", async () => {
+test("R89b NULLPROTO: board #204 (closed): String(e) === undefined still converts, and the conversion refuses by name", async () => {
   const src = "'use strict';\ntry { throw Object.create(null); } catch (e) { console.log('S', String(e) === undefined); }\n";
-  // This tier's answer (board #204: the comparison is folded to false before String(e) runs, where Node's String(e) throws a TypeError and the program exits 1); Node prints "".
-  const { stdout, stderr, exitCode } = await runRow("R89b", src, "cjs");
-  expect(stdout).toBe("S false\n");
-  expect(stderr).toBe("");
-  expect(exitCode).toBe(0);
+  // This tier's answer (the named ToString refusal); Node prints "" and String(e) throws a TypeError (exit 1).
+  const { stdout, stderr } = await runRowTrap("R89b", src, "cjs");
+  expect(stdout).toBe("");
+  expect(stderr).toBe("Uncaught Error: converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet\n");
 });
 
 // ----------------------------------------------------------------------

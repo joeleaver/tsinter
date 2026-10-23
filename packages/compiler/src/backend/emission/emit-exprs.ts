@@ -589,6 +589,22 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
         }
         if (v.type.kind === "caught") {
           // String(e) over the exception snapshot. Box borrowed; result +1.
+          // A thrown DYN value converts through the dyn ToString helper
+          // (board #195, scr_caught_to_string_dyn); every other payload
+          // keeps scr_caught_to_string.
+          if (E.moduleHasJsvalValues()) {
+            // ...and a thrown ISLAND value through the engine's ToString,
+            // which can throw (scr_caught_to_string_isl).
+            const t = E.newTemp(e.type, `scr_caught_to_string_isl(${v.name}, ${E.dynToStrHelper()})`);
+            E.emitPendingCheck();
+            return t;
+          }
+          if (E.moduleHasDynValues()) {
+            return E.newTemp(
+              e.type,
+              `scr_caught_to_string_dyn(${v.name}, ${E.dynToStrHelper()})`,
+            );
+          }
           return E.newTemp(e.type, `scr_caught_to_string(${v.name})`);
         }
         if (v.type.kind === "dyn") {
@@ -5931,6 +5947,8 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
             return finish(`scr_insp_dyn(${arg(0)}, ${arg(1)}, ${arg(2)})`);
           case "insp.dynS":
             return finish(`scr_insp_dyn_s(${arg(0)}, ${arg(1)})`);
+          case "insp.dynHidden":
+            return finish(`scr_insp_dyn_hidden(${arg(0)}, ${arg(1)})`);
           case "insp.jsval":
             return finish(`scr_insp_jsval(${arg(0)}, ${arg(1)}, ${arg(2)})`);
           case "insp.begin":

@@ -2280,6 +2280,15 @@ ScrDyn *scr_json_parse(ScrStr *text) {
 
 /* Untyped RC adapters (box/promise/exception-cell currency). */
 void *scr_dyn_retain_v(void *d) { return scr_dyn_retain((ScrDyn *)d); }
+
+/* Board #195: String(e) in a module that can hold dyn values — a thrown
+ * DYN value (its retain function says so, scr_caught_to_dyn's test)
+ * converts through the module's dyn ToString helper `ds` (the emitted
+ * sc_ds); every other payload is scr_caught_to_string's. Borrows; +1. */
+ScrStr *scr_caught_to_string_dyn(const ScrCaught *c, ScrStr *(*ds)(const ScrDyn *)) {
+  if (c->kind == SCR_EXC_REF && c->retain_fn == scr_dyn_retain_v) return ds((const ScrDyn *)c->payload);
+  return scr_caught_to_string(c);
+}
 void scr_dyn_release_v(void *d) { scr_dyn_release((ScrDyn *)d); }
 
 /* JS === over two dyn values: scalars by value (NaN false, ±0 equal via

@@ -1409,7 +1409,11 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
             (p) => p.questionToken === undefined && p.initializer === undefined &&
               p.dotDotDotToken === undefined,
           );
-          if (fixedArity) {
+          // Board #164: only TypeScript enforces the arity — a JavaScript
+          // caller may pass any count (`m(1, 2)` on a parameterless method
+          // is legal JS), so a JS-source function never folds.
+          const jsSource = isJsSourceFile(fn.getSourceFile());
+          if (fixedArity && !jsSource) {
             return {
               kind: "numLit",
               value: (fn as ts.FunctionLikeDeclaration).parameters.length,
@@ -1420,7 +1424,9 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
           L.unsupported(
             "SC1090",
             expr,
-            "'arguments.length' in functions with optional, default, or rest parameters (the count varies per call — a fixed-arity signature folds to a constant)",
+            jsSource
+              ? "'arguments.length' in a JavaScript method, constructor or accessor (callers may pass any count, which this function has no hidden argc for)"
+              : "'arguments.length' in functions with optional, default, or rest parameters (the count varies per call — a fixed-arity signature folds to a constant)",
           );
         }
       }
@@ -2267,8 +2273,35 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
     if (other.type.kind === "void") return null;
     // Non-union operand: it can never hold undefined/null at runtime (the
     // checker narrowed it to a concrete arm), so `=== unit` is false and
-    // `!== unit` is true.
-    return { kind: "boolLit", value: negated, type: BOOL, loc };
+    // `!== unit` is true — after the operand evaluates (board #204).
+    return foldKeepingOperand(L, other, negated, loc);
+  }
+
+/** Board #204: the constant `answer` of a comparison the checker decided,
+   * with the operand still evaluated exactly once when it is not
+   * droppable — JS runs it (a call's effects, a ToString that throws). The
+   * IR has no sequence form, so the operand rides a ToBoolean whose value
+   * the short-circuit then ignores: `toBool(x) && false`, `toBool(x) ||
+   * true`. */
+  function foldKeepingOperand(L: Lowerer, other: IrExpr, answer: boolean, loc: SrcLoc): IrExpr | null {
+    const lit: IrExpr = { kind: "boolLit", value: answer, type: BOOL, loc };
+    if (droppableStatic(other)) return lit;
+    let evalOnce: IrExpr | null = null;
+    const k = other.type.kind;
+    if (k === "bool") evalOnce = other;
+    else if (k === "f64" || k === "string" || REF_TRUTHY_KINDS.has(k)) evalOnce = { kind: "toBool", operand: other, type: BOOL, loc };
+    else if (k === "dyn") evalOnce = { kind: "dynTest", test: "truthy", value: other, type: BOOL, loc };
+    else if (k === "jsval") evalOnce = { kind: "jsOp", op: "truthy", args: [other], type: BOOL, loc };
+    else if (other.type.kind === "union") {
+      const def = L.unions.get(other.type.unionId);
+      if (def && def.arms.every((a) => a.kind !== "dyn" && a.kind !== "caught")) {
+        evalOnce = { kind: "toBool", operand: other, type: BOOL, loc };
+      }
+    }
+    // No ToBoolean for this kind: null, so the caller's comparison fence
+    // fires rather than the operand being dropped.
+    if (evalOnce === null) return null;
+    return { kind: "logical", op: answer ? "||" : "&&", left: evalOnce, right: lit, type: BOOL, loc };
   }
 
 /** The union-typed process.envGet read inside a checker-narrowed operand,
@@ -2367,8 +2400,9 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       }
     }
     // A non-nullable operand (tsc allows the comparison as a guard):
-    // `== null` is statically false, `!= null` statically true.
-    return { kind: "boolLit", value: negated, type: BOOL, loc };
+    // `== null` is statically false, `!= null` statically true — after the
+    // operand evaluates (board #204).
+    return foldKeepingOperand(L, other, negated, loc);
   }
 
 /** Safe to EMIT twice: plain reads with no side effects — local/global
@@ -4474,7 +4508,7 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
       if (accessorNames.size > 0) {
         const narrowed = shape.fields.filter((f) => !accessorNames.has(f.name));
         const narrowedId = L.shapes.intern(
-          narrowed.map((f) => ({ name: f.name, type: f.type })),
+          narrowed.map((f) => ({ name: f.name, type: f.type, ...(f.optional === true ? { optional: true as const } : {}) })),
           false,
           shape.indexValue,
         );
@@ -5231,7 +5265,7 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
     if (droppedNames.size > 0) {
       const narrowed = shape.fields.filter((f) => !droppedNames.has(f.name));
       const narrowedId = L.shapes.intern(
-        narrowed.map((f) => ({ name: f.name, type: f.type })),
+        narrowed.map((f) => ({ name: f.name, type: f.type, ...(f.optional === true ? { optional: true as const } : {}) })),
         false,
         shape.indexValue,
       );
@@ -8921,9 +8955,15 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
     const field = shape.fields.find((f) => f.name === key);
     if (field) {
       if (field.type.kind === "union" && L.armTag(field.type.unionId, UNDEFINED_T) >= 0) {
-        // Optional slot: the key is present iff the arm is not undefined.
+        // Undefined-armed slot: an OPTIONAL field's key is present iff the
+        // arm is not undefined; a required field's always is (board #178 —
+        // L.markPresence answers which once the shape's flags are final).
         const read: IrExpr = { kind: "recordGet", obj: recv, shapeId: recv.type.shapeId, field: key, type: field.type, loc };
-        return { kind: "unionIsTag", unionId: field.type.unionId, tag: L.armTag(field.type.unionId, UNDEFINED_T), negated: true, value: read, type: BOOL, loc };
+        return L.markPresence(
+          { kind: "unionIsTag", unionId: field.type.unionId, tag: L.armTag(field.type.unionId, UNDEFINED_T), negated: true, value: read, type: BOOL, loc },
+          recv.type.shapeId,
+          key,
+        );
       }
       // A declared non-optional field always exists on every value of the
       // shape — statically true, but folding may only drop a
@@ -8986,15 +9026,19 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
         const utag = !accessor && f.type.kind === "union" ? L.armTag(f.type.unionId, UNDEFINED_T) : -1;
         const answer: IrExpr =
           utag >= 0 && f.type.kind === "union"
-            ? {
-                kind: "unionIsTag",
-                unionId: f.type.unionId,
-                tag: utag,
-                negated: true,
-                value: { kind: "recordGet", obj: r, shapeId: recvT.shapeId, field: f.name, type: f.type, loc },
-                type: BOOL,
-                loc,
-              }
+            ? L.markPresence(
+                {
+                  kind: "unionIsTag",
+                  unionId: f.type.unionId,
+                  tag: utag,
+                  negated: true,
+                  value: { kind: "recordGet", obj: r, shapeId: recvT.shapeId, field: f.name, type: f.type, loc },
+                  type: BOOL,
+                  loc,
+                },
+                recvT.shapeId,
+                f.name,
+              )
             : { kind: "boolLit", value: true, type: BOOL, loc };
         body.push({ kind: "if", cond: eq, then: [ret(answer)], else_: null, loc });
       }
