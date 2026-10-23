@@ -29,6 +29,34 @@ import { CheckerFacade } from "./checker.js";
 import { enumKeyOf, ModuleKind, ModuleResolutionKind, ScriptTarget } from "./enums.js";
 import { tsgoPath } from "../shared.js";
 
+/** typescript@7.0.2 decodes every source-file string (literal text,
+ * identifiers) with a Wtf8Decoder built on a default TextDecoder, which
+ * strips a LEADING U+FEFF from each decode call — so the literal "\uFEFF"
+ * written as the raw character lowered to "" on every lane (board #219).
+ * This is the same WTF-8 decode (lone surrogates arrive as ED A0..BF xx
+ * and become their code unit) with ignoreBOM set; the Program's own
+ * decoder field is swapped for it before any file is fetched. */
+class BomKeepingWtf8Decoder {
+  private readonly utf8 = new TextDecoder("utf-8", { ignoreBOM: true });
+
+  decode(bytes: Uint8Array): string {
+    if (bytes.indexOf(0xed) < 0) return this.utf8.decode(bytes);
+    let out = "";
+    let start = 0;
+    for (let i = 0; i + 2 < bytes.length; i++) {
+      const b1 = bytes[i + 1]!;
+      const b2 = bytes[i + 2]!;
+      if (bytes[i] !== 0xed || b1 < 0xa0 || b1 > 0xbf || b2 < 0x80 || b2 > 0xbf) continue;
+      out += this.utf8.decode(bytes.subarray(start, i));
+      out += String.fromCharCode(0xd000 | ((b1 & 0x3f) << 6) | (b2 & 0x3f));
+      i += 2;
+      start = i + 1;
+    }
+    return out + this.utf8.decode(bytes.subarray(start));
+  }
+}
+const BOM_KEEPING_DECODER = new BomKeepingWtf8Decoder();
+
 /** The compiler options our createProgram accepts: TS7's CompilerOptions
  * shape (numeric enums for target/module/moduleResolution — the enums module
  * re-exports them symbolically) with the 5.9.3 "lib.es2025.d.ts" lib
@@ -190,7 +218,9 @@ export class Ts7Program {
     private readonly snapshot: Snapshot,
     private readonly host: Ts7Host,
     private readonly sharedHost: boolean,
-  ) {}
+  ) {
+    (project.program as unknown as { decoder: BomKeepingWtf8Decoder }).decoder = BOM_KEEPING_DECODER;
+  }
 
   getCompilerOptions(): CompilerOptions {
     return this.project.program.getCompilerOptions();

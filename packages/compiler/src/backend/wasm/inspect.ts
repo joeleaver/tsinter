@@ -125,7 +125,9 @@ import {
   FN_CLOS,
   OBJ_ENTRIES,
   OBJ_LEN,
-  OBJ_NULL_PROTO,
+  OBJ_PROTO,
+  OBJ_PROTO_MAP,
+  OBJ_PROTO_WEAKMAP,
   type DynBuilder,
 } from "./dyn.js";
 import { F64, I32, ModuleBuilder, type ValType } from "./module.js";
@@ -4000,21 +4002,42 @@ export class InspectBuilder {
         // one (INC-27 U5); the arm was filled before that producer landed,
         // the dyn surface's standing rule that an arm is filled before the
         // payload that reaches it lands.
+        // Board #218: in a module that builds an opaque container
+        // stand-in, NP holds the proto CODE and every form below answers
+        // as that class — Node's `Map(0) {}`, `WeakMap { <items unknown> }`
+        // (a weak collection is never the empty form: its first entry is
+        // the marker), `[Map]` beyond the depth, `[Map: ...]` for S029.
+        // Elsewhere NP is the 0/1 flag and these are the plain forms.
+        const builtins = dyn.builtinObjsLive;
+        const byProto = (render: (name: string) => string, plain: (c: Code) => void): void => {
+          if (builtins) dyn.pushByBuiltinProto(c, NP, render, plain);
+          else plain(c);
+        };
+        const npOr = (nullForm: string, plainForm: string) => (x: Code): void => {
+          x.localGet(NP);
+          dyn.protoIsNull(x);
+          x.ifResult(strRef);
+          this.deps.lit(x, nullForm);
+          x.else_();
+          this.deps.lit(x, plainForm);
+          x.end();
+        };
         c.localGet(O);
-        c.structGet(objT, OBJ_NULL_PROTO);
+        c.structGet(objT, OBJ_PROTO);
         c.localSet(NP);
         c.localGet(O);
         c.structGet(objT, OBJ_LEN);
         c.localSet(N);
         c.localGet(N);
         c.i32Eqz();
+        if (builtins) {
+          c.localGet(NP);
+          c.i32Const(OBJ_PROTO_WEAKMAP);
+          c.i32LtU();
+          c.i32And();
+        }
         c.ifVoid();
-        c.localGet(NP);
-        c.ifResult(strRef);
-        this.deps.lit(c, `${NULL_PROTO} {}`);
-        c.else_();
-        this.deps.lit(c, "{}");
-        c.end();
+        byProto((name) => `${name}(0) {}`, npOr(`${NULL_PROTO} {}`, "{}"));
         c.return_();
         c.end();
         c.localGet(O);
@@ -4025,12 +4048,7 @@ export class InspectBuilder {
         c.localGet(DEPTH);
         c.f64Gt();
         c.ifVoid();
-        c.localGet(NP);
-        c.ifResult(strRef);
-        this.deps.lit(c, NULL_PROTO);
-        c.else_();
-        this.deps.lit(c, "[Object]");
-        c.end();
+        byProto((name) => `[${name}]`, npOr(NULL_PROTO, "[Object]"));
         c.return_();
         c.end();
         // S029 again. Node builds this text as `[${constructorName}: ...]`
@@ -4041,18 +4059,25 @@ export class InspectBuilder {
         c.f64Const(MAX_DYN_DEPTH);
         c.f64Gt();
         c.ifVoid();
-        c.localGet(NP);
-        c.ifResult(strRef);
-        this.deps.lit(c, `[${NULL_PROTO}${INTERRUPTED}`);
-        c.else_();
-        this.deps.lit(c, `[Object${INTERRUPTED}`);
-        c.end();
+        byProto((name) => `[${name}${INTERRUPTED}`, npOr(`[${NULL_PROTO}${INTERRUPTED}`, `[Object${INTERRUPTED}`));
         c.return_();
         c.end();
         deeper();
         c.call(this.begin());
         c.localGet(O);
         c.call(this.seenPush());
+        if (builtins) {
+          // A weak collection's first entry: Node's formatWeakCollection
+          // without showHidden.
+          c.localGet(NP);
+          c.i32Const(OBJ_PROTO_WEAKMAP);
+          c.i32GeU();
+          c.ifVoid();
+          this.deps.lit(c, "<items unknown>");
+          c.i32Const(0);
+          c.call(this.entry());
+          c.end();
+        }
         // Own-key ORDER, through the one helper that defines it. The
         // receiver is an OBJ, so this walk cannot throw.
         c.localGet(D);
@@ -4109,13 +4134,11 @@ export class InspectBuilder {
         c.br(0);
         c.end();
         c.end();
-        c.localGet(NP);
-        c.ifResult(strRef);
-        this.deps.lit(c, NULL_PROTO);
-        c.else_();
+        // The class text is part of the opening brace, as Node builds it
+        // (braces[0] = "Map(0) {" or "[Object: null prototype] {", base
+        // ''), which is what its line-width test counts.
         this.deps.lit(c, "");
-        c.end();
-        this.deps.lit(c, "{");
+        byProto((name) => (name === "Map" ? "Map(0) {" : `${name} {`), npOr(`${NULL_PROTO} {`, "{"));
         this.deps.lit(c, "}");
         deeper();
         c.i32Const(0); // no array extras: properties never grid-group
@@ -4948,8 +4971,18 @@ export class InspectBuilder {
       dyn.objPayload(c, (x) => x.localGet(D));
       c.localSet(OP);
       c.localGet(OP);
-      c.structGet(dyn.objT(), OBJ_NULL_PROTO);
+      c.structGet(dyn.objT(), OBJ_PROTO);
       c.localSet(ONULLP);
+      if (dyn.builtinObjsLive) {
+        // Board #218: Node's diff renders a Map / WeakMap / WeakSet with
+        // its class text inside the sorted entry list; not built here.
+        c.localGet(ONULLP);
+        c.i32Const(OBJ_PROTO_MAP);
+        c.i32GeU();
+        c.ifVoid();
+        this.deps.namedTrap(c, "cfValue: an untyped Map, WeakMap or WeakSet in an assert failure message is not supported yet");
+        c.end();
+      }
       c.localGet(OP);
       c.structGet(dyn.objT(), OBJ_LEN);
       c.localSet(OLEN);
@@ -4957,6 +4990,7 @@ export class InspectBuilder {
       c.i32Eqz();
       c.ifVoid();
       c.localGet(ONULLP);
+      dyn.protoIsNull(c);
       c.ifVoid();
       putLit("[Object: null prototype] {}");
       c.else_();
@@ -4970,6 +5004,7 @@ export class InspectBuilder {
       c.i32GtS();
       c.ifVoid();
       c.localGet(ONULLP);
+      dyn.protoIsNull(c);
       c.ifVoid();
       putLit("[Object: null prototype]");
       c.else_();

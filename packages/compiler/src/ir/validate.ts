@@ -3111,6 +3111,7 @@ function validateFunction(
       }
       case "dynObjLit":
         if (e.type.kind !== "dyn") err(`dynObjLit must be dyn-typed, got ${e.type.kind}`, e.loc);
+        if (e.builtin !== undefined && (e.fields?.length ?? 0) > 0) err(`dynObjLit with builtin '${e.builtin}' must have no fields`, e.loc);
         for (const f of e.fields ?? []) {
           checkExpr(f.key);
           if (f.key.type.kind !== "string") err(`dynObjLit key of kind ${f.key.type.kind} (must be string)`, e.loc);

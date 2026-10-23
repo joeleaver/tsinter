@@ -3496,6 +3496,9 @@ const TIER_FLOOR: string[] = [
   "2598-tls-arg-ladders.cjs",
   "2645-https-client-url-argument.ts",
   "2672-http-request-response-callback.ts",
+  // board #219 (1036 -> 1037): a string literal beginning with a raw U+FEFF
+  // keeps it (the TS7 API's decoder dropped it, every lane)
+  "2745-bom-string-literals.ts",
 ];
 
 interface RunResult {
@@ -8732,5 +8735,65 @@ describe("INC-29 U4 review rows", () => {
     expect(r.stdout.toString("utf8")).toBe("ERR ERR_TLS_CERT_ALTNAME_INVALID Hostname/IP does not match certificate's altnames: Cert does not contain a DNS name\n");
     expect(r.stderr.toString("utf8")).toBe("");
     expect(r.exitCode).toBe(0);
+  }, 60000);
+});
+/* ── Boards #218 (wasm) and the null-prototype line width — an untyped
+ * JavaScript `new Map()` / `new WeakMap()` / `new WeakSet()` is an opaque
+ * dyn object tagged with its class (dyn.ts OBJ_PROTO codes 2-4), so it
+ * converts, inspects, clones, deep-compares and iterates as that class.
+ * The native lanes still answer as a plain object (board #218 stays open
+ * for them), so these are wasm-lane rows rather than corpus programs.
+ * Every expected text is Node v24.18.1's own output for the same
+ * program, measured. ── */
+
+describe("board #218 untyped Map / WeakMap / WeakSet rows", () => {
+  async function runB(file: string, src: string): Promise<RunResult> {
+    const dir = mkdtempSync(join(tmpdir(), "b218-row-"));
+    try {
+      const path = join(dir, file);
+      writeFileSync(path, src);
+      const res = await compile(path, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: false, backend: "wasm" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+      return await runWasm(res.binaryPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  test("B218-01 an untyped Map, WeakMap and WeakSet convert to Object.prototype.toString's tagged text: template, String(), concatenation, join, the toString method, a caught throw, a URLSearchParams value \u2014 SINGLE-EDIT: dyn.ts toStr's builtin arm", async () => {
+    const r = await runB("main.cjs", "'use strict';\nconst m = new Map();\nconst w = new WeakMap();\nconst s = new WeakSet();\nconsole.log(`${m}`, String(w), '' + s);\nconsole.log([m, w, s].join('|'), String([m]));\nconsole.log(m.toString(), w.toString(), s.toString());\ntry { throw w; } catch (e) { console.log(String(e)); }\nconst u = new URLSearchParams();\nu.append('a', m);\nu.set('b', s);\nconsole.log(u.toString());\n");
+    expect(r.stdout.toString("utf8")).toBe("[object Map] [object WeakMap] [object WeakSet]\n[object Map]|[object WeakMap]|[object WeakSet] [object Map]\n[object Map] [object WeakMap] [object WeakSet]\n[object WeakMap]\na=%5Bobject+Map%5D&b=%5Bobject+WeakSet%5D\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("B218-02 util.inspect forms: Map(0) {} and the WeakMap / WeakSet <items unknown> entry, own properties, [Map] / [WeakMap] beyond the depth (an empty Map still renders), circular refs, grid grouping, %s / %O, and the one-line / multi-line break at Node's width \u2014 SINGLE-EDIT: inspect.ts's OBJ arm byProto forms", async () => {
+    const r = await runB("main.cjs", "'use strict';\nconst util = require('util');\nconst m = new Map();\nconst w = new WeakMap();\nconst s = new WeakSet();\nconst m2 = new Map(); m2.x = 1;\nconst w2 = new WeakMap(); w2.x = 1;\nconsole.log(m, w, s);\nconsole.log(m2, w2);\nconsole.log({ a: { b: { c: m, d: w, e: s, f: m2, g: w2 } } });\nconst self = new Map(); self.me = self; console.log(self);\nconst ws = new WeakSet(); ws.me = ws; console.log(ws);\nconsole.log([m, m, m, m, m, m, m, m]);\nconst outer = new Map(); outer.inner = m2; outer.arr = [m, w]; console.log(outer);\nconsole.log(util.inspect(m2, { depth: -1 }), util.inspect(w, { depth: -1 }));\nconsole.log(util.format('%s|%O', m2, s));\nconst m3 = new Map(); m3.k = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; console.log(m3);\nconst m4 = new Map(); m4.k = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; console.log(m4);\nconst w3 = new WeakMap(); w3.k = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; console.log(w3);\nconst w4 = new WeakMap(); w4.k = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'; console.log(w4);\n");
+    expect(r.stdout.toString("utf8")).toBe("Map(0) {} WeakMap { <items unknown> } WeakSet { <items unknown> }\nMap(0) { x: 1 } WeakMap { <items unknown>, x: 1 }\n{\n  a: {\n    b: {\n      c: Map(0) {},\n      d: [WeakMap],\n      e: [WeakSet],\n      f: [Map],\n      g: [WeakMap]\n    }\n  }\n}\n<ref *1> Map(0) { me: [Circular *1] }\n<ref *1> WeakSet { <items unknown>, me: [Circular *1] }\n[\n  Map(0) {}, Map(0) {},\n  Map(0) {}, Map(0) {},\n  Map(0) {}, Map(0) {},\n  Map(0) {}, Map(0) {}\n]\nMap(0) {\n  inner: Map(0) { x: 1 },\n  arr: [ Map(0) {}, WeakMap { <items unknown> } ]\n}\n[Map] [WeakMap]\nMap(0) { x: 1 }|WeakSet { <items unknown> }\nMap(0) { k: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' }\nMap(0) {\n  k: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'\n}\nWeakMap { <items unknown>, k: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' }\nWeakMap {\n  <items unknown>,\n  k: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'\n}\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("B218-03 structuredClone (a Map clones to an empty Map, a WeakMap / WeakSet is a DataCloneError), iteration (a Map iterates nothing, a WeakMap is not iterable), deepStrictEqual (Maps by own properties, weak collections by identity), JSON \u2014 SINGLE-EDIT: the clone helper's builtin arm or dyn.ts iterSrc", async () => {
+    const r = await runB("main.cjs", "'use strict';\nconst assert = require('assert');\nconst m = new Map();\nconst w = new WeakMap();\nconst s = new WeakSet();\nconst m2 = new Map(); m2.x = 1;\nconsole.log(structuredClone(m2), structuredClone({ m, n: [m2] }));\nfor (const v of [w, s, { deep: [s] }]) {\n  try { structuredClone(v); console.log('cloned'); } catch (e) { console.log(e.name, e.message, e instanceof DOMException); }\n}\nfor (const x of m) console.log('never', x);\nconst [a, b] = m;\nconsole.log(a === undefined, b === undefined);\ntry { for (const x of w) console.log('never', x); } catch (e) { console.log(e.name, e.message); }\nassert.deepStrictEqual(m, new Map());\nassert.deepStrictEqual({ k: m }, { k: new Map() });\nassert.deepStrictEqual(w, w);\nassert.deepStrictEqual([s], [s]);\nconsole.log(JSON.stringify({ m, w, s, m2 }), Object.keys(m2).length);\nconsole.log('done');\n");
+    expect(r.stdout.toString("utf8")).toBe("Map(0) {} { m: Map(0) {}, n: [ Map(0) {} ] }\nDataCloneError #<WeakMap> could not be cloned. true\nDataCloneError #<WeakSet> could not be cloned. true\nDataCloneError #<WeakSet> could not be cloned. true\ntrue true\nTypeError w is not iterable\n{\"m\":{},\"w\":{},\"s\":{},\"m2\":{\"x\":1}} 1\ndone\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("NP-01 Object.create(null)'s rendering breaks lines at Node's width: the class text counts as part of the opening brace (pre-existing, fixed with board #218's inspect change)", async () => {
+    const r = await runB("main.ts", "// @dynamic\nconst a: any = Object.create(null); a.k = \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"; console.log(a);\nconst b: any = Object.create(null); b.k = \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"; console.log(b);\nconst c: any = JSON.parse(\"{}\"); c.n = b; console.log(c);\n");
+    expect(r.stdout.toString("utf8")).toBe("[Object: null prototype] { k: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' }\n[Object: null prototype] {\n  k: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'\n}\n{\n  n: [Object: null prototype] {\n    k: 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'\n  }\n}\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("B218-05 the invalid-argument texts name the class: determineSpecificType's 'an instance of Map' (dgram, the listener check) and V8's '#<WeakMap>' in the sort comparator TypeError — SINGLE-EDIT: dyn.ts specificType's or v8Str's builtin arm", async () => {
+    const r = await runB("main.cjs", "'use strict';\nconst dgram = require('dgram');\nconst EventEmitter = require('events');\nconst s = dgram.createSocket('udp4');\nconst m = new Map();\nconst w = new WeakMap();\ntry { s.send(m, 41234, 'localhost'); } catch (e) { console.log(e.message); }\ntry { s.send('x', 41234, w); } catch (e) { console.log(e.message); }\ns.close();\nconst ee = new EventEmitter();\ntry { ee.on('e', new WeakSet()); } catch (e) { console.log(e.code, e.message); }\nconst x = JSON.parse('{}'); x.m = m; x.w = w;\nconst a = JSON.parse('[2, 1]');\ntry { a.sort(x.m); } catch (e) { console.log(e.message); }\ntry { a.sort(x.w); } catch (e) { console.log(e.message); }\n");
+    expect(r.stdout.toString("utf8")).toBe("The \"buffer\" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received an instance of Map\nThe \"address\" argument must be of type string. Received an instance of WeakMap\nERR_INVALID_ARG_TYPE The \"listener\" argument must be of type function. Received an instance of WeakSet\nThe comparison function must be either a function or undefined: #<Map>\nThe comparison function must be either a function or undefined: #<WeakMap>\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+  test("B218-04 a failing deepStrictEqual over a weak collection refuses by name while rendering its message (Node prints its diff; the program below prints 'caught AssertionError')", async () => {
+    const r = await runB("main.cjs", "'use strict';\nconst assert = require('assert');\ntry {\n  assert.deepStrictEqual(new WeakMap(), new WeakMap());\n  console.log('equal');\n} catch (e) {\n  console.log('caught', e.name);\n}\n");
+    expect(r.stdout.toString("utf8")).toBe("");
+    expect(r.stderr.toString("utf8")).toBe("Uncaught cfValue: an untyped Map, WeakMap or WeakSet in an assert failure message is not supported yet\n");
+    expect(r.exitCode).toBe(1);
   }, 60000);
 });

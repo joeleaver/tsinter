@@ -597,7 +597,13 @@ String (`hasOwnProperty`, `valueOf`, `slice` as a VALUE rather than a
 call, ...). The PRESENCE operator answers the same way for the same
 reason — `"toString" in u` is `true` in Node and `false` here, as is
 `"slice" in u` on a dyn array — because there is no chain to walk, only
-the own-entry table the read consults. (`Object.hasOwn` is own-only by
+the own-entry table the read consults. The same holds for the class
+prototype of an untyped JavaScript `new Map()`, `new WeakMap()` or
+`new WeakSet()`, which the wasm tier builds as a dyn object tagged with its
+class (board #218): `typeof m.get` is `"undefined"`, `"size" in m` is
+`false`, `m.constructor === Map` is `false`, and `m.size` read into a typed
+slot is the checked read's TypeError, while conversion, inspection,
+cloning, deep equality and iteration answer as the class. (`Object.hasOwn` is own-only by
 definition, so it agrees with Node wherever the member genuinely exists,
 string receivers included; it parts company only where S016's padding
 invents members Node left as holes.) The named forms that DO work are

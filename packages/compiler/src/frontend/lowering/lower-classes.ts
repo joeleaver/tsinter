@@ -5207,7 +5207,7 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
           targs.length > 0 &&
           targs.every((t) => (t.flags & ts.TypeFlags.Any) !== 0)
         ) {
-          return { kind: "dynObjLit", type: DYN, loc };
+          return { kind: "dynObjLit", builtin: "Map", type: DYN, loc };
         }
         const keyIr = targs[0] ? L.mapTypeOf(targs[0]) : null;
         if (targs[0] && (!keyIr || !isSupportedMapKey(keyIr))) {
@@ -5247,7 +5247,7 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
         isJsSourceFile(expr.getSourceFile()) &&
         (expr.arguments?.length ?? 0) === 0
       ) {
-        return { kind: "dynObjLit", type: DYN, loc };
+        return { kind: "dynObjLit", builtin: symbol.name as "WeakMap" | "WeakSet", type: DYN, loc };
       }
       if (symbol?.name === "Set" && L.isStdlibSymbol(symbol)) {
         const tsType = L.typeOf(expr);

@@ -162,7 +162,11 @@ import {
   FN_SIG,
   OBJ_ENTRIES,
   OBJ_LEN,
-  OBJ_NULL_PROTO,
+  OBJ_PROTO,
+  OBJ_PROTO_MAP,
+  OBJ_PROTO_WEAKMAP,
+  OBJ_PROTO_WEAKSET,
+  BUILTIN_OBJ_PROTO,
 } from "./dyn.js";
 import { InspectBuilder } from "./inspect.js";
 import { UrlBuilder } from "./url.js";
@@ -2377,6 +2381,11 @@ class Assembler {
    * routing to it, and the `.toString()` method's TypeError — so a module
    * that can never build a null-prototype object keeps its bytes. */
   private readonly nullProtoLive: boolean;
+  /** Board #218: the module builds an opaque container stand-in (an
+   * untyped JavaScript `new Map()` / `new WeakMap()` / `new WeakSet()`,
+   * dyn.ts OBJ_PROTO codes 2-4), so the OBJ_PROTO readers test codes
+   * exactly. */
+  private readonly builtinObjLive: boolean;
   /** `Date.now()`/`new Date()`'s wall clock reads this import and floors;
    * `performance.now()`'s ORIGIN — `now()` sampled ONCE at `_start`
    * entry, in a mutable f64 global, in any module that reaches
@@ -2573,6 +2582,7 @@ class Assembler {
       "str.btoa",
     ]);
     this.nullProtoLive = this.libCallReachable(mod, ["dyn.objCreateNullProto"]);
+    this.builtinObjLive = this.irNodeReachable(mod, (rec) => rec["kind"] === "dynObjLit" && rec["builtin"] !== undefined);
     // INC-26 P3 (brief-p3-v2.md §3D, rev-26 CP1 pre-read D-3/E-1): force
     // `this.nextTick` (the GETTER, interning the queue NOW) in any module
     // that reaches `process.emitWarning`, BEFORE any function body is
@@ -3057,6 +3067,11 @@ class Assembler {
    * matched on the node's `fn` field rather than on any string. */
   private libCallReachable(mod: WModule, fns: readonly string[]): boolean {
     const want = new Set<string>(fns);
+    return this.irNodeReachable(mod, (rec) => rec["kind"] === "libCall" && typeof rec["fn"] === "string" && want.has(rec["fn"]));
+  }
+
+  /** Whether any IR node in a reachable function's body satisfies `test`. */
+  private irNodeReachable(mod: WModule, test: (rec: Record<string, unknown>) => boolean): boolean {
     const reachable = reachableFunctionNames(mod);
     let found = false;
     const scan = (node: unknown): void => {
@@ -3066,7 +3081,7 @@ class Assembler {
         return;
       }
       const rec = node as Record<string, unknown>;
-      if (rec["kind"] === "libCall" && typeof rec["fn"] === "string" && want.has(rec["fn"])) {
+      if (test(rec)) {
         found = true;
         return;
       }
@@ -3897,6 +3912,33 @@ class Assembler {
     c.localGet(R);
     ret();
     c.end();
+    if (this.builtinObjLive) {
+      // Board #218: an untyped Map stand-in clones to an empty Map (its
+      // entries are always empty; structured clone copies a Map's entries,
+      // never its own properties); a WeakMap or WeakSet does not clone.
+      dyn.objPayload(c, (x) => x.localGet(0));
+      c.structGet(dyn.objT(), OBJ_PROTO);
+      c.localTee(I);
+      c.i32Const(OBJ_PROTO_MAP);
+      c.i32Eq();
+      c.ifVoid();
+      dyn.boxObj(c, (x) => dyn.pushNewObj(x, OBJ_PROTO_MAP));
+      c.localSet(R);
+      remember();
+      c.localGet(R);
+      ret();
+      c.end();
+      for (const [tag, name] of [[OBJ_PROTO_WEAKMAP, "WeakMap"], [OBJ_PROTO_WEAKSET, "WeakSet"]] as const) {
+        c.localGet(I);
+        c.i32Const(tag);
+        c.i32Eq();
+        c.ifVoid();
+        this.emitSetCellError(c, "%DOMException", "DataCloneError", (x) => this.pushStrLitInto(x, `#<${name}> could not be cloned.`), null);
+        c.refNull(dynT);
+        ret();
+        c.end();
+      }
+    }
     dyn.pushNewObj(c, false);
     c.localSet(O);
     dyn.boxObj(c, (x) => x.localGet(O));
@@ -7914,6 +7956,7 @@ class Assembler {
             },
           }
         : {}),
+      ...(this.builtinObjLive ? { builtinObjs: true as const } : {}),
       ...(this.nullProtoLive
         ? {
             nullProtoToStr: (c: Code): void => {
@@ -18220,12 +18263,13 @@ class Assembler {
           code.refCast(exc.errT);
           code.call(this.errToStrHelper());
           code.else_();
-          if (this.nullProtoLive) {
+          if (this.nullProtoLive || this.builtinObjLive) {
             // INC-27 U5: in a module that can build a null-prototype
             // object, a thrown DYNAMIC value converts through dyn toStr,
             // the one place its named refusal lives — so a caught
-            // Object.create(null) never reads "[object Object]" here.
-            // Every other payload keeps the default text.
+            // Object.create(null) never reads "[object Object]" here; an
+            // opaque container stand-in reads its class's tag there
+            // (board #218). Every other payload keeps the default text.
             code.localGet(kind);
             code.i32Const(EXC_REF);
             code.i32Eq();
@@ -19272,7 +19316,7 @@ class Assembler {
          * pack and structuredClone. */
         if (e.fn === "dyn.objCreateNullProto") {
           // A fresh object whose payload carries the null-prototype flag
-          // (dyn.ts OBJ_NULL_PROTO) — the flag every reader already
+          // (dyn.ts OBJ_PROTO) — the flag every reader already
           // honours (inspect's `[Object: null prototype]` form, deep
           // equality's prototype test).
           this.dyn.boxObj(code, (c) => this.dyn.pushNewObj(c, true));
@@ -19532,7 +19576,8 @@ class Assembler {
             code.i32Eq();
             this.openIfResult(I32);
             this.dyn.objPayload(code, (c) => c.localGet(recv));
-            code.structGet(this.dyn.objT(), OBJ_NULL_PROTO);
+            code.structGet(this.dyn.objT(), OBJ_PROTO);
+            this.dyn.protoIsNull(code);
             code.else_();
             code.i32Const(0);
             this.close();
@@ -23812,7 +23857,7 @@ class Assembler {
 
       case "dynObjLit": {
         const o = this.acquireScratch(this.dyn.objRef());
-        this.dyn.pushNewObj(code, false);
+        this.dyn.pushNewObj(code, e.builtin !== undefined ? BUILTIN_OBJ_PROTO[e.builtin] : false);
         code.localSet(o);
         // Entries evaluate KEY then VALUE in SOURCE order (JS's
         // object-literal evaluation order); later duplicate keys win,
@@ -39300,7 +39345,19 @@ class Assembler {
     code.i32Const(DK.OBJ);
     code.i32Eq();
     this.openIf(); // #10 OBJ
-    instanceOf("Object"); // NAMED simplification — see the method doc
+    if (this.builtinObjLive) {
+      // An opaque container stand-in names its class (board #218):
+      // specificType's OBJ arm reads the proto code.
+      this.emitSetCellError(code, "%TypeError", "TypeError", (m) => {
+        msgPrefix(m);
+        m.localGet(dynLocal);
+        m.call(this.dyn.specificType());
+        m.call(this.concatHelper());
+      }, "ERR_INVALID_ARG_TYPE");
+      this.emitUnwind();
+    } else {
+      instanceOf("Object"); // NAMED simplification — see the method doc
+    }
     code.else_();
     // HANDLE/JSVAL: provably unreachable on this tier (dyn.ts's own
     // precedent) — `unreachable()`, no `refuse()`.

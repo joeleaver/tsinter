@@ -196,12 +196,35 @@ export const FN_SIG = 2;
 export const FN_NAME = 3;
 export const FN_ARITY = 4;
 
-/** `$dynObj`'s field indices. `nullProto` is the flag C carries beside the
- * kind — it rides the PAYLOAD here (the header's rule: flags never become
- * kind ids) and is false everywhere until `Object.create(null)` lands. */
+/** `$dynObj`'s field indices. `proto` is the prototype code C carries as
+ * its nullProto flag beside the kind — it rides the PAYLOAD here (the
+ * header's rule: flags never become kind ids): Object.prototype (0),
+ * `Object.create(null)` (1), or the class an opaque container stand-in
+ * answers as (2-4, the IR's `dynObjLit.builtin`, board #218). Codes 2-4
+ * exist only in a module that builds one (DynDeps.builtinObjs), so every
+ * other module reads the field as the 0/1 flag it always was. */
 export const OBJ_LEN = 0;
 export const OBJ_ENTRIES = 1;
-export const OBJ_NULL_PROTO = 2;
+export const OBJ_PROTO = 2;
+
+export const OBJ_PROTO_PLAIN = 0;
+export const OBJ_PROTO_NULL = 1;
+export const OBJ_PROTO_MAP = 2;
+export const OBJ_PROTO_WEAKMAP = 3;
+export const OBJ_PROTO_WEAKSET = 4;
+
+/** The class names of the opaque container stand-ins, by proto code. */
+export const BUILTIN_OBJ_PROTO: Readonly<Record<"Map" | "WeakMap" | "WeakSet", number>> = {
+  Map: OBJ_PROTO_MAP,
+  WeakMap: OBJ_PROTO_WEAKMAP,
+  WeakSet: OBJ_PROTO_WEAKSET,
+};
+const BUILTIN_OBJ_NAMES: readonly [number, string][] = [
+  [OBJ_PROTO_MAP, "Map"],
+  [OBJ_PROTO_WEAKMAP, "WeakMap"],
+  [OBJ_PROTO_WEAKSET, "WeakSet"],
+];
+
 
 /** `eq`'s s33 encoding — the payload slot's heap type. Every GC object is
  * a subtype, and unlike `any` it admits `ref.eq` (see the header). */
@@ -405,6 +428,11 @@ export interface DynDeps {
    * as uncaught (the conversion sites are not may-throw, so the refusal
    * cannot be catchable); it never returns. */
   nullProtoToStr?: (c: Code) => void;
+  /** Board #218: present ONLY in a module that builds an opaque container
+   * stand-in (an untyped `new Map()` / `new WeakMap()` / `new WeakSet()`,
+   * proto codes 2-4) — the emitter's static prescan — so every OBJ_PROTO
+   * reader is byte-identical everywhere else. */
+  builtinObjs?: true;
   /** INC-27 U5: Object.assign's member PUT onto a DOMException — present
    * ONLY in a module that can mint a DOMException (the emitter's static
    * prescan), so assign's body is unchanged everywhere else. `isDomex`
@@ -604,11 +632,92 @@ export class DynBuilder {
   /** A fresh empty OBJ payload (C's `scr_dyn_new_obj` /
    * `scr_dyn_new_obj_null_proto`): len 0, no buffer yet — obj_put
    * allocates the first one, matching C's `cap ? cap * 2 : 4`. */
-  pushNewObj(c: Code, nullProto: boolean): void {
+  pushNewObj(c: Code, proto: boolean | number): void {
     c.i32Const(0);
     c.refNull(this.entriesArrayType());
-    c.i32Const(nullProto ? 1 : 0);
+    c.i32Const(typeof proto === "number" ? proto : proto ? OBJ_PROTO_NULL : OBJ_PROTO_PLAIN);
     c.structNew(this.objT());
+  }
+
+  /** Whether this module can build an opaque container stand-in (proto
+   * codes 2-4): every reader of OBJ_PROTO tests codes exactly only then. */
+  get builtinObjsLive(): boolean {
+    return this.deps.builtinObjs === true;
+  }
+
+  /** With the OBJ payload's proto code on the stack, leaves i32: is it a
+   * null-prototype object. A plain flag test where codes 2-4 cannot
+   * exist, so those modules' bytes are unchanged. */
+  protoIsNull(c: Code): void {
+    if (!this.builtinObjsLive) return;
+    c.i32Const(OBJ_PROTO_NULL);
+    c.i32Eq();
+  }
+
+  /** With an OBJ payload's proto code in local `code`, pushes the class
+   * name text `render(name)` gives for each stand-in class and `other`
+   * for every other code — a chain of ifs over the three codes. */
+  pushByBuiltinProto(c: Code, code: number, render: (name: string) => string, other: (c: Code) => void): void {
+    for (const [tag, name] of BUILTIN_OBJ_NAMES) {
+      c.localGet(code);
+      c.i32Const(tag);
+      c.i32Eq();
+      c.ifResult(this.deps.strRef());
+      this.deps.lit(c, render(name));
+      c.else_();
+    }
+    other(c);
+    for (let i = 0; i < BUILTIN_OBJ_NAMES.length; i++) c.end();
+  }
+
+  /** %w.dyn.builtinOf(d) → i32: the proto code of an OBJ value, 0 for
+   * every other kind. Built only where builtinObjs is live. */
+  builtinOf(): number {
+    return this.cached("builtinOf", [this.dynRef()], [I32], (idx) => {
+      const c = new Code();
+      c.localGet(0);
+      c.structGet(this.dynT(), DYN_KIND);
+      c.i32Const(DK.OBJ);
+      c.i32Eq();
+      c.ifResult(I32);
+      this.objPayload(c, (x) => x.localGet(0));
+      c.structGet(this.objT(), OBJ_PROTO);
+      c.else_();
+      c.i32Const(0);
+      c.end();
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** %w.dyn.iterSrc(d) → d, or a fresh empty array when d is an untyped
+   * Map stand-in: its entries are always empty (every Map method use is
+   * fenced), so iterating it is iterating `[]` (board #218). The WeakMap
+   * and WeakSet stand-ins stay OBJ, which is not iterable, as in Node. */
+  private iterSrc(): number {
+    return this.cached("iterSrc", [this.dynRef()], [this.dynRef()], (idx) => {
+      const c = new Code();
+      c.localGet(0);
+      c.call(this.builtinOf());
+      c.i32Const(OBJ_PROTO_MAP);
+      c.i32Eq();
+      c.ifResult(this.dynRef());
+      this.pushNewArr(c);
+      c.localSet(1);
+      this.boxArr(c, (x) => x.localGet(1));
+      c.else_();
+      c.localGet(0);
+      c.end();
+      this.mb.setBody(idx, [this.arrRef()], c.bytes());
+    });
+  }
+
+  /** The iteration helpers' prologue: replace the source in `local` by
+   * iterSrc's answer. Nothing where builtinObjs is not live. */
+  private emitIterSrc(c: Code, local: number): void {
+    if (!this.builtinObjsLive) return;
+    c.localGet(local);
+    c.call(this.iterSrc());
+    c.localSet(local);
   }
 
   /** Wrap an OBJ payload the caller pushes into an OBJ box. */
@@ -2056,10 +2165,20 @@ export class DynBuilder {
       this.objPayload(c, (x) => x.localGet(B));
       c.localSet(OBJB);
       c.localGet(OBJA);
-      c.structGet(objT, OBJ_NULL_PROTO);
+      c.structGet(objT, OBJ_PROTO);
       c.localGet(OBJB);
-      c.structGet(objT, OBJ_NULL_PROTO);
+      c.structGet(objT, OBJ_PROTO);
       c.i32Ne();
+      if (this.builtinObjsLive) {
+        // A WeakMap or WeakSet equals only itself (Node compares weak
+        // collections by reference; the ref.eq fast path above already
+        // answered that case), board #218.
+        c.localGet(OBJA);
+        c.structGet(objT, OBJ_PROTO);
+        c.i32Const(OBJ_PROTO_WEAKMAP);
+        c.i32GeU();
+        c.i32Or();
+      }
       c.ifVoid();
       c.call(deqLeave);
       c.i32Const(0);
@@ -2346,13 +2465,23 @@ export class DynBuilder {
           // through: Node throws a TypeError here. The tier refuses by
           // name instead of answering "[object Object]".
           c.localGet(O);
-          c.structGet(this.objT(), OBJ_NULL_PROTO);
+          c.structGet(this.objT(), OBJ_PROTO);
+          this.protoIsNull(c);
           c.ifVoid();
           npRefuse(c);
           c.unreachable();
           c.end();
         }
-        this.deps.lit(c, "[object Object]");
+        if (this.builtinObjsLive) {
+          // An opaque container stand-in answers Object.prototype.toString
+          // with its class's @@toStringTag (board #218).
+          c.localGet(O);
+          c.structGet(this.objT(), OBJ_PROTO);
+          c.localSet(I);
+          this.pushByBuiltinProto(c, I, (name) => `[object ${name}]`, (x) => this.deps.lit(x, "[object Object]"));
+        } else {
+          this.deps.lit(c, "[object Object]");
+        }
       });
       // Object.prototype.toString with the Promise @@toStringTag.
       this.arm(c, K, [DK.PROMISE], () => this.deps.lit(c, "[object Promise]"));
@@ -4242,7 +4371,16 @@ export class DynBuilder {
         c.call(this.errStr());
         c.return_();
         c.end();
-        this.deps.lit(c, "#<Object>");
+        if (this.builtinObjsLive) {
+          // An opaque container stand-in names its class (board #218). K
+          // is free: this arm returns.
+          c.localGet(O);
+          c.structGet(this.objT(), OBJ_PROTO);
+          c.localSet(K);
+          this.pushByBuiltinProto(c, K, (name) => `#<${name}>`, (x) => this.deps.lit(x, "#<Object>"));
+        } else {
+          this.deps.lit(c, "#<Object>");
+        }
       });
       c.localGet(0);
       c.call(this.toStr());
@@ -4378,6 +4516,7 @@ export class DynBuilder {
       const K = 2;
       const OUT = 3;
       const L = this.iterLocals(4);
+      this.emitIterSrc(c, 0);
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
@@ -4419,6 +4558,7 @@ export class DynBuilder {
       const K = 2;
       const OUT = 3;
       const L = this.iterLocals(4);
+      this.emitIterSrc(c, 0);
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
@@ -4491,6 +4631,7 @@ export class DynBuilder {
       const E = 11;
       const BR = 12;
       const push = this.deps.arrPush();
+      this.emitIterSrc(c, 1);
       c.localGet(1);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
@@ -4813,7 +4954,18 @@ export class DynBuilder {
       this.arm(c, K, [DK.NULL], () => this.deps.lit(c, "null"));
       this.arm(c, K, [DK.UNDEF], () => this.deps.lit(c, "undefined"));
       this.arm(c, K, [DK.ARR], () => this.deps.lit(c, "an instance of Array"));
-      this.arm(c, K, [DK.OBJ], () => this.deps.lit(c, "an instance of Object"));
+      this.arm(c, K, [DK.OBJ], () => {
+        if (this.builtinObjsLive) {
+          // An opaque container stand-in names its class (board #218). K
+          // is free: this arm returns.
+          this.objPayload(c, (x) => x.localGet(0));
+          c.structGet(this.objT(), OBJ_PROTO);
+          c.localSet(K);
+          this.pushByBuiltinProto(c, K, (name) => `an instance of ${name}`, (x) => this.deps.lit(x, "an instance of Object"));
+        } else {
+          this.deps.lit(c, "an instance of Object");
+        }
+      });
       this.arm(c, K, [DK.PROMISE], () => this.deps.lit(c, "an instance of Promise"));
       this.arm(c, K, [DK.BOOL], () => {
         c.localGet(0);

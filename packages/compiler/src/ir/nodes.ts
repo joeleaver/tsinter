@@ -4734,8 +4734,13 @@ export type IrExpr =
    * entries evaluate key-then-value in SOURCE order (JS's object-literal
    * evaluation order; later duplicate keys win, insertion order preserved —
    * the checked-dynamic tree's own set semantics). Keys and values are borrowed (the member
-   * retains the value in). Never throws itself. */
-  | { kind: "dynObjLit"; fields?: { key: IrExpr; value: IrExpr }[]; type: IrType; loc: SrcLoc }
+   * retains the value in). Never throws itself. `builtin` names the class
+   * of an opaque container stand-in (JavaScript's untyped `new Map()`,
+   * `new WeakMap()`, `new WeakSet()`): the wasm backend tags the object
+   * with it, so conversion, inspection, cloning, deep equality and
+   * iteration answer as that class (board #218); the native backends
+   * ignore it. */
+  | { kind: "dynObjLit"; fields?: { key: IrExpr; value: IrExpr }[]; builtin?: "Map" | "WeakMap" | "WeakSet"; type: IrType; loc: SrcLoc }
   /** Runtime kind test on a dyn value — the narrowing tests tsc's
    * control flow understands on `unknown`: `typeof v === "string" |
    * "number" | "boolean" | "undefined"` and the unit comparisons `v ===
