@@ -1033,8 +1033,13 @@ function spawnSyncMayThrowView(mod: WModule): WModule {
   // native lanes answer a value), so a caller must check after the call;
   // without it the fence was swallowed inside a function and an uncaught
   // one at top level exited 0 with no output.
+  // Board #235: encodeURI / encodeURIComponent throw URIError on a lone
+  // surrogate on this tier (UTF-16 strings); the native lanes' UTF-8
+  // strings cannot hold one, so the shared list says they never throw.
   const keys = new Set([
     "date.parseGetTime",
+    "str.encodeUri",
+    "str.encodeUriComponent",
     "cp.spawnSync", "cp.spawnSyncOpts", "cp.spawnSyncStdioStr", "cp.spawn", "cp.spawnOpts", "child.killNum",
     "net.listen", "net.listenCb", "net.listenOpts", "net.listenOptsCb", "net.connect", "net.connectCb", "net.serverPort",
   ]);

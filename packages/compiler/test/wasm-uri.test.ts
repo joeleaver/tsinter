@@ -29,7 +29,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import { compile } from "../src/index.js";
-import { runWasm } from "./wasm-host.js";
+import { runWasm, runWasmToTrap } from "./wasm-host.js";
 
 let scratch: string;
 beforeAll(async () => {
@@ -140,6 +140,35 @@ test("lone-surrogate encode arm — both encoders throw URIError \"URI malformed
   const { stdout, stderr } = await runWasm(path);
   expect(stdout).toBe(`${expected.join("\n")}\n`);
   expect(stderr).toBe("");
+});
+
+/* ── board #235: the encoders' URIError reaches callers and the top level ── */
+
+// The encoders' throw is wasm-only (the shared may-throw list says they
+// never throw), so before #235 a caller never checked: through a function
+// the URIError was swallowed, and uncaught it exited 0 with no output.
+test("lone-surrogate encode — the URIError propagates through a function and is loud when uncaught (board #235)", async () => {
+  const caught = await build("enc-fn.ts", [
+    "function f(s: string): string { return encodeURIComponent(s) + \"!\"; }",
+    "function g(s: string): string { return encodeURI(s) + \"!\"; }",
+    "try { console.log(f(String.fromCharCode(0xd800))); } catch (e) { console.log((e as Error).name + \":\" + (e as Error).message); }",
+    "try { console.log(g(String.fromCharCode(0xdc00))); } catch (e) { console.log((e as Error).name + \":\" + (e as Error).message); }",
+    "console.log(\"after\");",
+  ]);
+  const r = await runWasm(caught);
+  expect(r.stdout).toBe(`${tryFmt(() => encodeURIComponent("\ud800"))}\n${tryFmt(() => encodeURI("\udc00"))}\nafter\n`);
+  for (const [name, call] of [["enc-top.ts", "encodeURIComponent"], ["enc-top2.ts", "encodeURI"]] as const) {
+    const uncaught = await build(name, [
+      "function f(s: string): string { return " + call + "(s); }",
+      "console.log(\"before\");",
+      "console.log(f(String.fromCharCode(0xd800)));",
+      "console.log(\"after\");",
+    ]);
+    await expect(runWasm(uncaught)).rejects.toThrow();
+    const t = await runWasmToTrap(uncaught);
+    expect(t.stdout).toBe("before\n");
+    expect(t.stderr).toMatch(/^Uncaught URIError: URI malformed/);
+  }
 });
 
 /* ── (3) decodeURIComponent's grammar — every malformed row ─────────── */
