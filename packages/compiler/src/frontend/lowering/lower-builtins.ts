@@ -5294,6 +5294,19 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     ) {
       return { kind: "strLit", value: "", type: STRING, loc };
     }
+    // An inline literal types against the contextual index-signature
+    // record, which has no slot for an accessor: a get accessor's value
+    // would silently drop out of the output (Node reads it, `g=got`).
+    let litNode: ts.Expression = objNode;
+    while (ts.isParenthesizedExpression(litNode) || ts.isAsExpression(litNode) || ts.isSatisfiesExpression(litNode)) {
+      litNode = litNode.expression;
+    }
+    if (ts.isObjectLiteralExpression(litNode)) {
+      const accessor = litNode.properties.find((p) => ts.isGetAccessorDeclaration(p) || ts.isSetAccessorDeclaration(p));
+      if (accessor) {
+        L.unsupported("SC1090", accessor, "get/set accessors in a querystring.stringify object literal");
+      }
+    }
     const objV = L.lowerExpr(objNode);
     let obj: IrExpr;
     if (objV.type.kind === "dyn") {

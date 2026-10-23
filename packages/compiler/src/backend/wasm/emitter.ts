@@ -173,6 +173,7 @@ import {
 import { InspectBuilder } from "./inspect.js";
 import { UrlBuilder } from "./url.js";
 import { UrlEngine } from "./url-whatwg.js";
+import { QsBuilder, type QsDict } from "./querystring.js";
 import { IdnaBuilder } from "./url-idna.js";
 import { UriBuilder } from "./uri.js";
 import { DateBuilder } from "./date.js";
@@ -1046,6 +1047,10 @@ function spawnSyncMayThrowView(mod: WModule): WModule {
     "str.encodeUriComponent",
     "cp.spawnSync", "cp.spawnSyncOpts", "cp.spawnSyncStdioStr", "cp.spawn", "cp.spawnOpts", "child.killNum",
     "net.listen", "net.listenCb", "net.listenOpts", "net.listenOptsCb", "net.connect", "net.connectCb", "net.serverPort",
+    // node:querystring: escape and stringify throw URIError
+    // [ERR_INVALID_URI] for a string ending in a surrogate (encodeStr);
+    // the native lanes never throw there (board #232).
+    "qs.escape", "qs.stringify",
   ]);
   let found = false;
   const scan = (node: unknown): void => {
@@ -2405,6 +2410,13 @@ class Assembler {
    * `freeSockets` / `requests` tables and `getHeaders()`, board #229), so
    * any http or https call counts. */
   private readonly nullProtoLive: boolean;
+  /** node:querystring: the record shapes qs.parse results have in this
+   * module (empty when qs.parse is unreachable, so no other module's
+   * bytes depend on the null-prototype gates). */
+  private readonly qsParseShapes = new Set<string>();
+  /** Set only while qs.stringify fetches its own argument's dynFrom
+   * walker (the one conversion where the prototype is unobservable). */
+  private qsDynFromDirect = false;
   /** Board #228: can a checked-dynamic value exist at all — does any
    * reachable IR node have the dyn type? Gates the caught-value ToString
    * arm's dyn routing, so a module with no dyn values never interns the
@@ -2626,6 +2638,13 @@ class Assembler {
         (rec["fn"] === "dyn.objCreateNullProto" || rec["fn"].startsWith("http.") || rec["fn"].startsWith("https.")),
     );
     this.inspHiddenLive = this.libCallReachable(mod, ["insp.dynHidden"]);
+    this.irNodeReachable(mod, (rec) => {
+      if (rec["kind"] === "libCall" && rec["fn"] === "qs.parse") {
+        const t = rec["type"] as IrType;
+        if (t.kind === "record") this.qsParseShapes.add(t.shapeId);
+      }
+      return false;
+    });
     this.dynValuesLive = this.irNodeReachable(mod, (rec) => {
       const t = rec["type"];
       return t !== null && typeof t === "object" && (t as Record<string, unknown>)["kind"] === "dyn";
@@ -4285,7 +4304,27 @@ class Assembler {
     }
 
     for (const fn of this.mod.functions) {
-      if (reachable.has(fn.name)) this.walkFunction(fn);
+      if (!reachable.has(fn.name)) continue;
+      // node:querystring: the frontend's per-type inspect helper over a
+      // qs.parse result would print it without Node's
+      // "[Object: null prototype]" header.
+      if (this.qsParseShapes.size > 0 && fn.name.startsWith("%util.insp.") && fn.params[0] !== undefined && this.qsNullProtoType(fn.params[0].type)) {
+        this.refuse("libCall:qs.parse:null-proto-inspect", fn.loc);
+      }
+      // ...and a cast, annotated binding or return as ANOTHER record type
+      // copies it into a fresh shape (%rec.capture / %rec.width) that the
+      // three gates no longer recognize, where Node keeps the same
+      // null-prototype object. A spread (%rec.merge / %rec.declmerge) is
+      // an ordinary-prototype copy in Node too, so it stays open.
+      if (
+        this.qsParseShapes.size > 0 &&
+        (fn.name.startsWith("%rec.capture.") || fn.name.startsWith("%rec.width.")) &&
+        fn.params[0] !== undefined &&
+        this.qsNullProtoType(fn.params[0].type)
+      ) {
+        this.refuse("libCall:qs.parse:null-proto-reshape", fn.loc);
+      }
+      this.walkFunction(fn);
     }
     // Board #75's universal unwrap: every reachable function has now been
     // walked, so every `.listeners()`/`.rawListeners()` call site has had
@@ -8154,6 +8193,23 @@ class Assembler {
       idnaToAscii: () => this.idna.toAsciiFn(),
     });
     return this.urlEngineField;
+  }
+
+  private qsField: QsBuilder | null = null;
+
+  /** node:querystring (querystring.ts, Node's lib/querystring.js). */
+  private get qs(): QsBuilder {
+    this.qsField ??= new QsBuilder(this.mb, {
+      strRef: () => this.strRef,
+      strType: () => this.strType,
+      url: () => this.urlEngine,
+      lit: (c, s) => this.pushStrLitInto(c, s),
+      setCellError: (c, className, name, pushMessage, codeLit) => this.emitSetCellError(c, className, name, pushMessage, codeLit),
+      excKind: () => this.exc().kindG,
+      f64ToStr: () => this.f64ToStrHelper(),
+      dyn: () => this.dyn,
+    });
+    return this.qsField;
   }
 
   private get idna(): IdnaBuilder {
@@ -13503,6 +13559,12 @@ class Assembler {
    * tree. Never throws. Null (refusal recorded) when a part is out of
    * tier — the refusal names the SHAPE, not just "dynFrom". */
   private dynFromHelper(t: IrType, loc: SrcLoc | undefined): number | null {
+    if (!this.qsDynFromDirect && this.qsNullProtoType(t)) {
+      // A dynamic copy would gain Object.prototype (hasOwnProperty,
+      // toString, instanceof Object), which Node's parse result lacks.
+      this.refuse("libCall:qs.parse:null-proto-dyn", loc);
+      return null;
+    }
     const key = typeKey(t);
     const hit = this.dynFromFns.get(key);
     if (hit !== undefined) return hit;
@@ -18535,6 +18597,13 @@ class Assembler {
           return;
         }
         if (k === "record") {
+          if (this.qsNullProtoType(e.operand.type)) {
+            // Node: a null-prototype object has no toString, so its
+            // ToString throws "Cannot convert object to primitive value".
+            this.refuse("libCall:qs.parse:null-proto-tostring", e.loc);
+            code.unreachable();
+            return;
+          }
           // ToString(record) is Object.prototype.toString.call(record) =
           // the CONSTANT "[object Object]" — no field enumeration, ever
           // (INC-27 U2). The OPERAND still evaluates first — side
@@ -23310,6 +23379,7 @@ class Assembler {
         if (this.emitStreamLibCall(e)) return;
         if (this.emitAssertLibCall(e)) return;
         if (this.emitUrlLibCall(e)) return;
+        if (this.emitQsLibCall(e)) return;
         // INC-27 U1: symbol construction, toString, the description
         // accessor, and the Symbol.for registry (sym.for / sym.keyFor).
         if (e.fn === "sym.new") {
@@ -32231,6 +32301,108 @@ class Assembler {
       return true;
     }
     return false;
+  }
+
+  /** node:querystring — parse, stringify, escape, unescape
+   * (querystring.ts). */
+  private emitQsLibCall(e: Extract<IrExpr, { kind: "libCall" }>): boolean {
+    const code = this.fn.code;
+    switch (e.fn) {
+      case "qs.escape":
+        this.walkExpr(e.args[0]!);
+        code.call(this.qs.escapeFn());
+        this.emitPendingCheck();
+        return true;
+      case "qs.unescape":
+        this.walkExpr(e.args[0]!);
+        code.call(this.qs.unescapeFn());
+        return true;
+      case "qs.stringify": {
+        // The object argument's dynamic conversion: directly here the
+        // parse result's missing prototype is unobservable (stringify
+        // reads its own entries only), so the null-prototype gate in
+        // dynFromHelper stands aside for this one conversion.
+        const obj = e.args[0]!;
+        if (obj.kind === "dynFrom" && this.qsNullProtoType(obj.value.type)) {
+          this.qsDynFromDirect = true;
+          const h = this.dynFromHelper(obj.value.type, obj.loc);
+          this.qsDynFromDirect = false;
+          if (h === null) {
+            code.unreachable();
+            return true;
+          }
+          this.walkExpr(obj.value);
+          code.call(h);
+        } else {
+          this.walkExpr(obj);
+        }
+        this.walkExpr(e.args[1]!);
+        this.walkExpr(e.args[2]!);
+        code.call(this.qs.stringifyFn());
+        this.emitPendingCheck();
+        return true;
+      }
+      case "qs.parse": {
+        const d = this.qsDict(e.type, e.loc);
+        if (d === null) {
+          code.unreachable();
+          return true;
+        }
+        for (const a of e.args) this.walkExpr(a);
+        code.call(this.qs.parseFn(d));
+        return true;
+      }
+      default:
+        return false;
+    }
+  }
+
+  /** The qs.parse call site's dictionary record, walked off its own
+   * result type exactly as ir/validate.ts checks it (a pure
+   * index-signature record over a union with a string arm and a string[]
+   * arm). Null with a refusal recorded when a part is out of tier. */
+  private qsDict(t: IrType, loc: SrcLoc | undefined): QsDict | null {
+    if (t.kind !== "record") throw new Error("wasm emitter bug: qs.parse result is not a record");
+    const shape = this.recordShapes.get(t.shapeId);
+    const iv = shape?.indexValue;
+    if (shape === undefined || iv === undefined || iv.kind !== "union" || shape.fields.length !== 0) {
+      throw new Error("wasm emitter bug: qs.parse dict shape");
+    }
+    const def = this.unionDef(iv.unionId);
+    const strTag = def.arms.findIndex((a) => a.kind === "string");
+    const arrTag = def.arms.findIndex((a) => a.kind === "array" && a.elem.kind === "string");
+    if (strTag < 0 || arrTag < 0) throw new Error("wasm emitter bug: qs.parse index union lacks its arms");
+    const info = this.recordInfo(t.shapeId, loc, false);
+    if (info === null || info.overflow === null) return null;
+    const vec = this.vecInfoFor(def.arms[arrTag] as IrType & { kind: "array" }, loc);
+    const strArm = this.unionArmStruct(iv.unionId, strTag, loc);
+    const arrArm = this.unionArmStruct(iv.unionId, arrTag, loc);
+    if (vec === null || strArm === null || arrArm === null) return null;
+    return {
+      key: typeKey(t),
+      dictStruct: info.struct,
+      mapRef: this.maps.mapRef(info.overflow),
+      mapNew: this.maps.new_(info.overflow),
+      mapGet: this.maps.get(info.overflow),
+      mapSet: this.maps.set(info.overflow),
+      unionBase: this.unions.base(),
+      unionRef: this.unions.baseRef(),
+      strArm,
+      strTag,
+      arrArm,
+      arrTag,
+      vecRef: this.vecs.vecRef(vec),
+      vecNewLen: this.vecs.newLen(vec),
+      vecPush: this.vecs.pushOne(vec),
+    };
+  }
+
+  /** Is `t` a qs.parse result's record type in a module that reaches
+   * qs.parse? Node's result has a null prototype, which the typed record
+   * cannot show, so its printing, its ToString and its dynamic
+   * conversion refuse by name (board #231 is the native lanes' side). */
+  private qsNullProtoType(t: IrType): boolean {
+    return t.kind === "record" && this.qsParseShapes.has(t.shapeId);
   }
 
   /** node:url and the WHATWG URL / URLSearchParams classes — INC-29 U3

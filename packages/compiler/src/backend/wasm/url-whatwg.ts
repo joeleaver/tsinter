@@ -1619,11 +1619,15 @@ export class UrlEngine {
     ]);
     return this.obT16_;
   }
-  private get ubRef(): ValType {
+  get ubRef(): ValType {
     return this.ref(this.UB);
   }
-  private ubNew($: A): X {
+  ubNew($: A): X {
     return $.new_(this.UB, $.anew(this.S, $.i(16)), $.i(0));
+  }
+  /** The buffer's length in code units (querystring.ts reads it). */
+  ubLen($: A, ub: X): X {
+    return $.get(this.UB, OB_N, ub);
   }
   ubPushFn(): number {
     return this.fn("ubPush", [this.ubRef, I32], [], (f, $) => {

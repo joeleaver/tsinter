@@ -3509,6 +3509,14 @@ const TIER_FLOOR: string[] = [
   "1568-x509-fingerprint.ts",
   "2280-builtin-namespace-destructure.cjs",
   "2722-x509-validity-date-gettime.ts",
+  // node:querystring (1043 -> 1048): parse, stringify, escape and unescape
+  // built in the module (querystring.ts, Node's lib/querystring.js); the
+  // parse result's null prototype refuses by name where it would show.
+  "2460-qs-parse-grammar.ts",
+  "2461-qs-parse-options.ts",
+  "2462-qs-stringify.ts",
+  "2463-qs-escape-unescape.ts",
+  "2464-qs-require-forms.cjs",
 ];
 
 interface RunResult {
@@ -8753,6 +8761,54 @@ describe("INC-29 U4 review rows", () => {
     expect(r.exitCode).toBe(0);
   }, 60000);
 });
+// ── node:querystring rows ─────────────────────────────────────────────────
+// parse, stringify, escape and unescape are built in the module
+// (querystring.ts; unescape is url-whatwg.ts's qsUnescape). The parse,
+// stringify and escape oracle matrices and the null-prototype refusal rows
+// are host-free (packages/compiler/test/wasm-qs.test.ts); these rows pin
+// the five corpus programs and the uncaught ERR_INVALID_URI exit. Every
+// expected output was measured against Node v24.18.1 on the same source.
+describe("node:querystring rows", () => {
+  async function runQs(file: string, src: string | null): Promise<RunResult> {
+    const dir = mkdtempSync(join(tmpdir(), "qs-row-"));
+    try {
+      let path = file;
+      if (src !== null) {
+        path = join(dir, file);
+        writeFileSync(path, src);
+      }
+      const res = await compile(path, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: wantsDynamic(path), backend: "wasm" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+      return await runWasm(res.binaryPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  const corpusRows: [string, string, string][] = [
+    ["2460-qs-parse-grammar.ts", "\"\" {}\n\"a\" {\"a\":\"\"}\n\"a=\" {\"a\":\"\"}\n\"=a\" {\"\":\"a\"}\n\"=\" {\"\":\"\"}\n\"&\" {}\n\"&&\" {}\n\"a&&b\" {\"a\":\"\",\"b\":\"\"}\n\"a=1&\" {\"a\":\"1\"}\n\"&a=1\" {\"a\":\"1\"}\n\"a=1&&b=2\" {\"a\":\"1\",\"b\":\"2\"}\n\"a=1&a=2&a=3\" {\"a\":[\"1\",\"2\",\"3\"]}\n\"k=v&k=w&k=x&single=s\" {\"k\":[\"v\",\"w\",\"x\"],\"single\":\"s\"}\n\"a=b=c&==x\" {\"a\":\"b=c\",\"\":\"=x\"}\n\"a==b\" {\"a\":\"=b\"}\n\"a%3Db=c\" {\"a=b\":\"c\"}\n\"key only\" {\"key only\":\"\"}\n\"sp ace=v al\" {\"sp ace\":\"v al\"}\n\"a+b=c+d&%20=+\" {\"a b\":\"c d\",\" \":\" \"}\n\"a=+%2B+\" {\"a\":\" + \"}\n\"a=%2B+b\" {\"a\":\"+ b\"}\n\"%zz\" {\"%zz\":\"\"}\n\"%zz%25=%25zz\" {\"%zz%\":\"%zz\"}\n\"%25%25=%25\" {\"%%\":\"%\"}\n\"a=%E2%98%83&b=%FF&c=%zz&d=%1\" {\"a\":\"☃\",\"b\":\"�\",\"c\":\"%zz\",\"d\":\"%1\"}\n\"foo=%F0%9F%98%80&bar=%ED%A0%80\" {\"foo\":\"😀\",\"bar\":\"���\"}\n\"%E2%98%83=%E2%98%83\" {\"☃\":\"☃\"}\n\"☃=☃&é=é\" {\"☃\":\"☃\",\"é\":\"é\"}\n\"😀=🌍\" {\"😀\":\"🌍\"}\n\"%\" {\"%\":\"\"}\n\"%2\" {\"%2\":\"\"}\n\"a=%\" {\"a\":\"%\"}\n\"a=%F\" {\"a\":\"%F\"}\n\"a=%FG\" {\"a\":\"%FG\"}\n\"%GG=1\" {\"%GG\":\"1\"}\n\"1=a&0=b&x=c\" {\"0\":\"b\",\"1\":\"a\",\"x\":\"c\"}\nbucket 2 v|w\nsingle s\nmissing true\nkeys 0,1,x\n", "parse's grammar corners: empty and keyless segments, repeats becoming arrays, '+', malformed escapes, the encodeCheck fast path, non-ASCII and astral input"],
+    ["2461-qs-parse-options.ts", "S1 {\"a\":\"1\",\"b\":\"2\"}\nS2 {\"a\":\"1\",\"b\":\"2\"}\nS3 {\"aXYb\":\"1\",\"c\":\"2\"}\nS4 {\"a\":\"b=c===d\"}\nS5 {\"a\":\"1\",\"b\":\"2\"}\nS6 {\"a\":\"1\",\"b\":\"2\"}\nS7 {\"aabX\":\"1\"}\nS8 {\"a\":\"1\",\"b\":\"2\"}\nS9 {\"x\":\"y=1\",\"z=2\":\"\"}\nM1 {\"a\":\"1\",\"b\":\"2\"}\nM2 {\"a\":\"1\",\"b\":\"2\"}\nM3 {}\nM4 {\"a\":\"1\"}\nM5 {\"a\":\"1\",\"b\":\"2\",\"c\":\"3\"}\nM6 {\"a\":[\"1\",\"2\",\"3\"]}\nM7 {\"a\":\"1\",\"b\":\"2\",\"c\":\"3\"}\nM8 {\"a\":\"1\",\"b\":\"2\",\"c\":\"3\"}\nM9 {\"a\":\"1\",\"b\":\"2\"}\nM10 {\"a\":\"1\",\"b\":\"2\"}\n", "custom and multi-unit separators with the naive partial-match resets, the falsy default rule, the maxKeys budget"],
+    ["2462-qs-stringify.ts", "T1 a=1&b=x%20y&c=1&c=2&d=true&e=\nT2 a=&b=&c=0&d=1e%2B21&e=0.1&f=-1.5\nT3 a%20b=c&%E2%98%83=%2B&=empty&k=\nT4 \"\"\nT5 b=x\nT6 a:x;a:y\nT7 a=1&b=2\nT8 u=&n=&s=v\nT9 a=1&a=2.5&a=true\nT10 %C3%A9%E2%98%83=%C3%A9%E2%98%83%20%F0%9F%98%80\nT11 a🌍x\nT12 x=1&x=2\nT13 u=&s=v&n=\nT14 first=1&multi=a&multi=b&last=z\nT15 a=1&a=2&b=x%20y&c=\n", "stringify's encodeStringified value rules over records, arrays, custom separators, the parse round trip"],
+    ["2463-qs-escape-unescape.ts", "E1 %20!%22%23%24%25%26'()*%2B%2C-.%2F0123456789%3A%3B%3C%3D%3E%3F%40ABCDEFGHIJKLMNOPQRSTUVWXYZ%5B%5C%5D%5E_%60abcdefghijklmnopqrstuvwxyz%7B%7C%7D~\nE2 h%C3%A9llo%20%E2%98%83%20%F0%9F%98%80\nE3 \nE4 a%2Bb%20c%3Dd%26e\nU1 \"A B\"\nU2 \"☃\"\nU3 \"😀\"\nU4 \"abc\"\nU5 \"%\"\nU6 \"a+b c\"\nF1 \"a+b c☃%zz%\"\nF2 \"���\"\nF3 \"��\"\nF4 \"��\"\nF5 \"\\u0003�\"\nF6 \"=\\u0000�\"\nF7 \"%\"\nF8 \"%2\"\nF9 \"100%\"\nF10 \"�\"\nF11 \"%GGA\"\nF12 \"é�\"\nC1 true\n", "escape over printable ASCII and non-ASCII, unescape's strict decode and lenient unescapeBuffer fallback"],
+    ["2464-qs-require-forms.cjs", "Q1 {\"a\":[\"1\",\"2\"],\"b\":\"x y z\",\"c\":\"\"}\nQ2 a=1&arr=1&arr=x&arr=true&u=h%C3%A9llo%20%E2%98%83&s=a%20b&e=\nQ3 h%C3%A9llo%20%E2%98%83%20a%2Bb!'()*~\nQ4 a+b c☃%zz\nQ5 {\"x\":[\"1\",\"2\"]}\nQ6 x=1&x=2\nD1 {\"a\":\"1\",\"b\":\"2\"}\nD2 {\"a\":\"1\",\"b\":\"2\"}\nD3 k:v;k:w\nM1 a%20b%2Bc\nM2 ☃\nR1 a,b\nR2 2\n", "every CommonJS acquisition spelling and the decode / encode aliases"],
+  ];
+  for (const [name, stdout, what] of corpusRows) {
+    test(`QS-C-${name.slice(0, 4)} corpus ${name} (${what}): full stdout, stderr and exit code equal Node's`, async () => {
+      const r = await runQs(join(corpusDir, name), null);
+      expect(r.stdout.toString("utf8")).toBe(stdout);
+      expect(r.stderr.toString("utf8")).toBe("");
+      expect(r.exitCode).toBe(0);
+    }, 60000);
+  }
+
+  test("QS-EXIT-01 an uncaught querystring.escape of a string ending in a surrogate exits 1 after the output before it (Node: URIError [ERR_INVALID_URI]: URI malformed) — SINGLE-EDIT: encodeInto's end-of-string check", async () => {
+    const r = await runQs("main.ts", 'import { escape } from "node:querystring";\nconsole.log(escape("\\ud800a"));\nconsole.log(escape("x\\udc00"));\nconsole.log("never");\n');
+    expect(r.stdout.toString("utf8")).toBe("%F0%90%81%A1\n");
+    expect(r.stderr.toString("utf8")).toBe("Uncaught URIError [ERR_INVALID_URI]: URI malformed\n");
+    expect(r.exitCode).toBe(1);
+  }, 60000);
+});
+
 /* ── Boards #218 (wasm) and the null-prototype line width — an untyped
  * JavaScript `new Map()` / `new WeakMap()` / `new WeakSet()` is an opaque
  * dyn object tagged with its class (dyn.ts OBJ_PROTO codes 2-4), so it
