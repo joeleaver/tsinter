@@ -129,6 +129,9 @@ export interface FsDeps {
   bytesGetElem: () => number;
   /** `%w.bytes.length(bytesRef) -> f64`. */
   bytesLength: () => number;
+  /** Unit G3: `tsinter.watchCall`'s index (abi.ts), or a descriptive throw
+   * in a module that never reaches fs.watch. */
+  watchCallFunc: () => number;
 }
 
 /** The fourteen codes (E-P4-3, delta-3e: appended 13 ELOOP/14
@@ -684,6 +687,84 @@ export class FsBuilder {
       c.end();
 
       this.mb.setBody(idx, [this.strRef(), I32, I32, I32, I32, I32, this.strRef(), I32, I32, I32], c.bytes());
+    });
+  }
+
+  /** Unit G3: `%w.fs.watchStart(path) -> i32` — fs.watch's synchronous
+   * start (abi.ts watchCall op 1, uv_fs_event_start): the path staged at
+   * the cursor as UTF-16, the host's answer returned as is — a handle
+   * (>= 1), or a failure in this file's carrier, rendered here exactly as
+   * Node's FSWatcher.start throws it (UVException, syscall `watch`, the
+   * path as the program gave it: "ENOENT: no such file or directory,
+   * watch '<path>'") into the pending cell. The caller runs the pending
+   * check, and checks a non-negative answer is a handle. */
+  watchStartHelper(): number {
+    return this.cached("watchStart", [this.strRef()], [I32], (idx) => {
+      const c = new Code();
+      const PATH = 0;
+      const A_LEN = 1;
+      const A_BASE = 2;
+      const STATUS = 3;
+      const MATCHED = 4;
+      const N = 5;
+      c.localGet(PATH);
+      c.arrayLen();
+      c.localSet(A_LEN);
+      this.deps.ensureCapacity(c, () => {
+        c.localGet(A_LEN);
+        c.i32Const(2);
+        c.i32Mul();
+        this.emitRoundUp2(c);
+      });
+      c.globalGet(this.deps.stageCursor());
+      c.localSet(A_BASE);
+      c.localGet(PATH);
+      c.localGet(A_BASE);
+      c.call(this.stageStrUtf16AtHelper());
+      c.drop();
+      c.i32Const(1); // START
+      c.localGet(A_BASE);
+      c.localGet(A_LEN);
+      c.i32Const(0);
+      c.call(this.deps.watchCallFunc());
+      c.localSet(STATUS);
+      c.localGet(STATUS);
+      c.i32Const(0);
+      c.i32LtS();
+      c.ifVoid();
+      // uvException leaves a falsy path out of the message: fs.watch("")
+      // is "ENOENT: no such file or directory, watch".
+      c.localGet(A_LEN);
+      c.ifVoid();
+      this.emitThrowFromStatus(c, STATUS, PATH, MATCHED, N, "watch", "one", {});
+      c.else_();
+      this.emitThrowFromStatus(c, STATUS, PATH, MATCHED, N, "watch", "no", {});
+      c.end();
+      c.end();
+      c.localGet(STATUS);
+      this.mb.setBody(idx, [I32, I32, I32, I32, I32], c.bytes());
+    });
+  }
+
+  /** Unit G3: `%w.fs.watchError(status, filename | null)` — the Error a
+   * failing watcher emits (Node's FSWatcher onchange with status < 0:
+   * UVException, syscall `watch`, the EVENT's filename as the path, none
+   * when the event carried no filename), written into the pending cell. */
+  watchErrorHelper(): number {
+    return this.cached("watchError", [I32, this.strRef()], [], (idx) => {
+      const c = new Code();
+      const STATUS = 0;
+      const NAME = 1;
+      const MATCHED = 2;
+      const N = 3;
+      c.localGet(NAME);
+      c.refIsNull();
+      c.ifVoid();
+      this.emitThrowFromStatus(c, STATUS, NAME, MATCHED, N, "watch", "no", {});
+      c.else_();
+      this.emitThrowFromStatus(c, STATUS, NAME, MATCHED, N, "watch", "one", {});
+      c.end();
+      this.mb.setBody(idx, [I32, I32], c.bytes());
     });
   }
 

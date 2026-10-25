@@ -140,6 +140,7 @@ import {
   IMPORT_SLEEP,
   IMPORT_SIG_CALL,
   IMPORT_TLS_CALL,
+  IMPORT_WATCH_CALL,
   IMPORT_FS_CALL,
   IMPORT_HOST_NUM,
   IMPORT_HOST_STR,
@@ -2422,9 +2423,13 @@ class Assembler {
   /** Unit G1: `tsinter.sigCall`'s index, or null in a module that reaches no
    * signal listener (hostev.ts). */
   private readonly sigCallFunc: number | null;
+  /** Unit G3: `tsinter.watchCall`'s index, or null in a module that never
+   * reaches fs.watch (hostev.ts). */
+  private readonly watchCallFunc: number | null;
   /** Units G1-G3: the module reaches a host-event surface of hostev.ts
-   * (signals) — an event module whatever else it reaches. */
+   * (signals, fs.watch) — an event module whatever else it reaches. */
   private readonly hevSignals: boolean;
+  private readonly hevWatch: boolean;
   private readonly hevModule: boolean;
   /** The exit-drain gate's static fact — see exitListenerSurfaceReachable's
    * own comment (INC-26 P1). Computed ONCE in the constructor; every drain
@@ -2585,8 +2590,10 @@ class Assembler {
     const netMod = netModuleReachable(mod);
     // Units G1-G3: a host-event module's `_loop` reads `now` too.
     const hevSignals = libCallWhere(mod, (fn) => fn === "process.onSignal" || fn === "process.offSignal");
-    const hevMod = hevSignals;
+    const hevWatch = libCallWhere(mod, (fn) => fn === "fs.watch" || fn === "fs.watchCb" || fn === "watcher.close");
+    const hevMod = hevSignals || hevWatch;
     this.hevSignals = hevSignals;
+    this.hevWatch = hevWatch;
     this.hevModule = hevMod;
     this.nowFunc =
       timerSurfaceReachable(mod) || perfNowReachable(mod) || netMod || hevMod
@@ -2697,6 +2704,12 @@ class Assembler {
     // earlier import index moves.
     this.sigCallFunc = hevSignals
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_SIG_CALL, this.mb.funcType([I32, I32], [I32]))
+      : null;
+    // `watchCall`'s decision (unit G3, abi.ts): file-system event watches,
+    // in modules that reach fs.watch, minted after sigCall so no earlier
+    // import index moves.
+    this.watchCallFunc = hevWatch
+      ? this.mb.importFunc(IMPORT_MODULE, IMPORT_WATCH_CALL, this.mb.funcType([I32, I32, I32, I32], [I32]))
       : null;
     // ── end INC-26 host-import block ──
     // The exit-drain gate's STATIC fact (see exitListenerSurfaceReachable's
@@ -8670,6 +8683,10 @@ class Assembler {
       strRef: () => this.strRef,
       strType: () => this.strType,
       fsCallFunc: (op) => this.fsCallFuncOrThrow(op),
+      watchCallFunc: () => {
+        if (this.watchCallFunc === null) throw new Error("emitter bug: fs.watch was reached but tsinter.watchCall was never imported");
+        return this.watchCallFunc;
+      },
       ensureCapacity: (c, need) => this.emitEnsureCapacity(c, need),
       stageCursor: () => this.cursorGlobal,
       pushStrLit: (c, value) => this.pushStrLitInto(c, value),
@@ -13357,6 +13374,17 @@ class Assembler {
       reportUncaught: () => this.reportUncaughtHelper(),
       checkpoint: (c) => this.emitCheckpoint(c),
       signals: this.hevSignals,
+      watch: this.hevWatch,
+      watchCallFunc: () => {
+        if (this.watchCallFunc === null) throw new Error("emitter bug: fs.watch was reached but tsinter.watchCall was never imported");
+        return this.watchCallFunc;
+      },
+      watchStart: () => this.fs.watchStartHelper(),
+      watchError: () => this.fs.watchErrorHelper(),
+      strRef: () => this.strRef,
+      strType: () => this.strType,
+      pushStrLit: (c, value) => this.pushStrLitInto(c, value),
+      strClos: () => this.closPairFor([this.strRef], []),
     });
     return this.hevField;
   }
@@ -16596,6 +16624,12 @@ class Assembler {
         if (this.tlsModule) return this.tls.sctxRef();
         this.refuse(`type:${t.kind}`, loc);
         return null;
+      // Unit G3: an FSWatcher (hostev.ts), in the modules that reach
+      // fs.watch; mapTypeSoft carries the same arm.
+      case "fsWatcher":
+        if (this.hevWatch) return this.hev.watcherRef();
+        this.refuse(`type:${t.kind}`, loc);
+        return null;
       default:
         this.refuse(`type:${t.kind}`, loc);
         return null;
@@ -16783,6 +16817,9 @@ class Assembler {
         return this.dgramModule ? this.dgram.udpRef() : I32;
       case "secureCtx":
         return this.tlsModule ? this.tls.sctxRef() : I32;
+      // Unit G3: mapType's fsWatcher arm, in lockstep.
+      case "fsWatcher":
+        return this.hevWatch ? this.hev.watcherRef() : I32;
       // INC-27 U1: mapType never fails on symbol either — same
       // consistency rule as every other never-fails arm above
       // (dyn/jsval/bytes/regex/stats). This case and mapType's own
@@ -23763,6 +23800,40 @@ class Assembler {
           } else {
             code.call(this.hev.sigOffHelper());
           }
+          return;
+        }
+        // Unit G3 (hostev.ts; abi.ts watchCall, evPoll source 4): fs.watch
+        // starts now and throws Node's fs error on failure (pending check);
+        // the listener is kept with its shape (none, (), (eventType)).
+        if (e.fn === "fs.watch" || e.fn === "fs.watchCb") {
+          let shape = 0;
+          if (e.fn === "fs.watchCb") {
+            const cbType = e.args[1]!.type;
+            if (cbType.kind !== "func" || cbType.rest === true || cbType.params.length > 1) {
+              this.refuse("libCall:fs.watchCb:unexpected-callback-shape", e.loc);
+              code.unreachable();
+              return;
+            }
+            shape = cbType.params.length === 0 ? 1 : 2;
+            const pair = this.closSigFor(cbType, e.loc);
+            const want = shape === 1 ? this.closPairFor([], []) : this.closPairFor([this.strRef], []);
+            if (pair === null || pair.clos !== want.clos) {
+              this.refuse("libCall:fs.watchCb:unexpected-callback-shape", e.loc);
+              code.unreachable();
+              return;
+            }
+          }
+          this.walkExpr(e.args[0]!);
+          if (shape === 0) code.refNull(-0x13);
+          else this.walkExpr(e.args[1]!);
+          code.i32Const(shape);
+          code.call(this.hev.watchHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "watcher.close") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.hev.watchCloseHelper());
           return;
         }
         if (this.emitCryptoLibCall(e)) return;

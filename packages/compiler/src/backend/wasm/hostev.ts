@@ -24,7 +24,21 @@
  *     one MakeCallback into Node.
  *   - signals add nothing to the loop's liveness: Node unrefs the wrap
  *     (measured: a program that signals itself with nothing else alive
- *     exits without the listener running). */
+ *     exits without the listener running).
+ *
+ * FS.WATCH (G3). The host starts and stops a file-system event watch on a
+ * path (libuv's uv_fs_event_start / uv_fs_event_stop, abi.ts `watchCall`)
+ * and queues one EVENT record per notification; the FSWatcher is Node's
+ * lib/internal/fs/watchers.js, built here: start's failure throws the
+ * UVException text synchronously (fs.ts watchStart); an event is the
+ * handle's onchange — "rename" when the libuv bitmask has UV_RENAME, else
+ * "change" (fs_event_wrap.cc's precedence) — emitted to the one listener
+ * fs.watch registered, followed by the death check and one checkpoint; a
+ * watcher error closes the handle and emits 'error', which no lowered
+ * program listens for, so it is the uncaught death with Node's message.
+ * close() stops the watch once (idempotent: Node's `if (!this._handle)
+ * return`), and an open watcher holds the loop (persistent: true, the only
+ * lowered option — the front end fences the rest). */
 import { Code } from "./code.js";
 import { F64, I32, ModuleBuilder, type ValType } from "./module.js";
 
@@ -47,6 +61,18 @@ export interface HostEvDeps {
   checkpoint: (c: Code) => void;
   /** Which surfaces this module reaches (static prescan facts). */
   signals: boolean;
+  watch: boolean;
+  /** Unit G3: `tsinter.watchCall`'s index. */
+  watchCallFunc: () => number;
+  /** fs.ts: `(path) -> i32`, the start (handle, or a failure with the
+   * pending cell set), and `(status, filename | null) -> ()`, the error. */
+  watchStart: () => number;
+  watchError: () => number;
+  strRef: () => ValType;
+  strType: () => number;
+  pushStrLit: (c: Code, value: string) => void;
+  /** The `(string) => void` closure pair (a watch listener's eventType form). */
+  strClos: () => { clos: number; fn: number };
 }
 
 /** evPoll's header, in bytes, and the module's first buffer size. */
@@ -55,6 +81,14 @@ const EV_FIRST_CAPACITY = 1024;
 const HOST_FAILURE = "evPoll: host failure";
 /** evPoll sources (abi.ts). */
 export const SRC_SIGNAL = 3;
+export const SRC_WATCH = 4;
+/** watchCall ops and event kinds (abi.ts). */
+const WATCH_STOP = 2;
+const WATCH_EV_CHANGE = 1;
+const WATCH_EV_ERROR = 2;
+/** libuv's uv_fs_event bits. */
+const UV_RENAME = 1;
+const UV_CHANGE = 2;
 /** sigCall ops (abi.ts). */
 const SIG_START = 1;
 const SIG_STOP = 2;
@@ -70,6 +104,15 @@ const E_FIRED = 2; // i32, mutable: onceWrapper's fired flag
 const SG_HANDLE = 0; // i32: the host subscription, 0 = none
 const SG_N = 1; // i32: live listener count
 const SG_LIST = 2; // the listener array (grown by copy)
+
+/* An FSWatcher. */
+const W_HANDLE = 0; // i32: the host watch, 0 once closed
+const W_CB = 1; // the listener (eq: either shape), null without one
+const W_SHAPE = 2; // i32: 0 none, 1 () => void, 2 (eventType: string) => void
+
+/** The abstract `eq` heap type (process.ts's REF_EQ). */
+const EQ_HEAP = -0x13;
+const REF_EQ: ValType = { kind: "ref", nullable: true, typeIndex: EQ_HEAP };
 
 class Fn {
   readonly c = new Code();
@@ -91,6 +134,9 @@ export class HostEvBuilder {
   private sigTField: number | null = null;
   private sigTabTField: number | null = null;
   private globalsField: { cap: number; sigTab: number } | null = null;
+  private watchTField: number | null = null;
+  private watchTabTField: number | null = null;
+  private watchGField: { tab: number; open: number } | null = null;
 
   constructor(
     private readonly mb: ModuleBuilder,
@@ -615,6 +661,315 @@ export class HostEvBuilder {
     });
   }
 
+  /* ── fs.watch (G3) ─────────────────────────────────────────────────── */
+
+  /** type:fsWatcher — the module's own FSWatcher. */
+  watcherType(): number {
+    this.watchTField ??= this.mb.structType([
+      { storage: I32, mutable: true },
+      { storage: REF_EQ, mutable: false },
+      { storage: I32, mutable: false },
+    ]);
+    return this.watchTField;
+  }
+
+  watcherRef(): ValType {
+    return this.ref(this.watcherType());
+  }
+
+  private get watchTabT(): number {
+    this.watchTabTField ??= this.mb.arrayType(this.watcherRef(), true);
+    return this.watchTabTField;
+  }
+
+  private wg(): { tab: number; open: number } {
+    if (this.watchGField === null) {
+      const tabT = this.watchTabT;
+      this.watchGField = {
+        tab: this.mb.addGlobal(this.ref(tabT), true, (w) => {
+          w.u8(0xd0);
+          w.sleb(tabT);
+        }),
+        open: this.mb.addGlobal(I32, true, (w) => {
+          w.u8(0x41);
+          w.sleb(0);
+        }),
+      };
+    }
+    return this.watchGField;
+  }
+
+  /** `%w.hev.watch(path, cb: eq, shape) -> watcher` — fs.watch: the start,
+   * then the watcher in the handle table. A failed start leaves the pending
+   * cell set and answers null (the caller's pending check unwinds). */
+  watchHelper(): number {
+    return this.fn("watch", [this.deps.strRef(), REF_EQ, I32], [this.watcherRef()], (f) => {
+      const c = f.c;
+      const PATH = 0;
+      const CB = 1;
+      const SHAPE = 2;
+      const H = f.local(I32);
+      const W = f.local(this.watcherRef());
+      const NT = f.local(this.ref(this.watchTabT));
+      const g = this.wg();
+      c.localGet(PATH);
+      c.call(this.deps.watchStart());
+      c.localTee(H);
+      c.i32Const(0);
+      c.i32LtS();
+      c.ifVoid();
+      c.refNull(this.watcherType());
+      c.return_();
+      c.end();
+      // A start answers a handle >= 1 or a failure.
+      this.if_(c, () => {
+        c.localGet(H);
+        c.i32Eqz();
+      }, () => this.trap(c));
+      c.localGet(H);
+      c.localGet(CB);
+      c.localGet(SHAPE);
+      c.structNew(this.watcherType());
+      c.localSet(W);
+      // The table, grown by copy to hold the handle.
+      this.if_(c, () => {
+        c.globalGet(g.tab);
+        c.refIsNull();
+      }, () => {
+        c.i32Const(8);
+        c.arrayNewDefault(this.watchTabT);
+        c.globalSet(g.tab);
+      });
+      this.while_(c, () => {
+        c.localGet(H);
+        c.globalGet(g.tab);
+        c.arrayLen();
+        c.i32GeU();
+      }, () => {
+        c.globalGet(g.tab);
+        c.arrayLen();
+        c.i32Const(1);
+        c.i32Shl();
+        c.arrayNewDefault(this.watchTabT);
+        c.localSet(NT);
+        c.localGet(NT);
+        c.i32Const(0);
+        c.globalGet(g.tab);
+        c.i32Const(0);
+        c.globalGet(g.tab);
+        c.arrayLen();
+        c.arrayCopy(this.watchTabT, this.watchTabT);
+        c.localGet(NT);
+        c.globalSet(g.tab);
+      });
+      c.globalGet(g.tab);
+      c.localGet(H);
+      c.localGet(W);
+      c.arraySet(this.watchTabT);
+      c.globalGet(g.open);
+      c.i32Const(1);
+      c.i32Add();
+      c.globalSet(g.open);
+      c.localGet(W);
+    });
+  }
+
+  /** `%w.hev.watchClose(watcher)` — FSWatcher.close: the watch stops once;
+   * a closed watcher's close is a no-op. */
+  watchCloseHelper(): number {
+    return this.fn("watchClose", [this.watcherRef()], [], (f) => {
+      const c = f.c;
+      const W = 0;
+      const H = f.local(I32);
+      const g = this.wg();
+      c.localGet(W);
+      c.structGet(this.watcherType(), W_HANDLE);
+      c.localTee(H);
+      c.i32Eqz();
+      c.ifVoid();
+      c.return_();
+      c.end();
+      c.i32Const(WATCH_STOP);
+      c.i32Const(0);
+      c.i32Const(0);
+      c.localGet(H);
+      c.call(this.deps.watchCallFunc());
+      // STOP answers 0; anything else is a host failure.
+      c.ifVoid();
+      this.trap(c);
+      c.end();
+      c.localGet(W);
+      c.i32Const(0);
+      c.structSet(this.watcherType(), W_HANDLE);
+      c.globalGet(g.tab);
+      c.localGet(H);
+      c.refNull(this.watcherType());
+      c.arraySet(this.watchTabT);
+      c.globalGet(g.open);
+      c.i32Const(1);
+      c.i32Sub();
+      c.globalSet(g.open);
+    });
+  }
+
+  /** `%w.hev.watchEvent(base, kind, plen)` — one source-4 record: the
+   * handle's watcher (a record for a handle the module does not hold is a
+   * host failure — the host drops a handle's records at STOP), then the
+   * event or the error. */
+  private watchEventHelper(): number {
+    return this.fn("watchEvent", [I32, I32, I32], [], (f) => {
+      const c = f.c;
+      const BASE = 0;
+      const KIND = 1;
+      const PLEN = 2;
+      const H = f.local(I32);
+      const A = f.local(I32);
+      const W = f.local(this.watcherRef());
+      const NAME = f.local(this.deps.strRef());
+      const I = f.local(I32);
+      const CB = f.local(REF_EQ);
+      const g = this.wg();
+      this.loadU32(c, BASE, 4);
+      c.localSet(H);
+      this.loadU32(c, BASE, 16);
+      c.localSet(A);
+      this.if_(c, () => {
+        c.globalGet(g.tab);
+        c.refIsNull();
+        c.localGet(H);
+        c.i32Eqz();
+        c.i32Or();
+        this.loadU32(c, BASE, 20);
+        c.i32Or();
+        c.localGet(PLEN);
+        c.i32Const(1);
+        c.i32And();
+        c.i32Or();
+      }, () => this.trap(c));
+      this.if_(c, () => {
+        c.localGet(H);
+        c.globalGet(g.tab);
+        c.arrayLen();
+        c.i32GeU();
+      }, () => this.trap(c));
+      c.globalGet(g.tab);
+      c.localGet(H);
+      c.arrayGet(this.watchTabT);
+      c.localTee(W);
+      c.refIsNull();
+      c.ifVoid();
+      this.trap(c);
+      c.end();
+      this.if_(c, () => {
+        c.localGet(KIND);
+        c.i32Const(WATCH_EV_ERROR);
+        c.i32Eq();
+      }, () => {
+        // The filename (UTF-16 code units), null when the event had none.
+        this.if_(c, () => c.localGet(PLEN), () => {
+          c.localGet(PLEN);
+          c.i32Const(1);
+          c.i32ShrU();
+          c.arrayNewDefault(this.deps.strType());
+          c.localSet(NAME);
+          this.while_(c, () => {
+            c.localGet(I);
+            c.localGet(PLEN);
+            c.i32Const(1);
+            c.i32ShrU();
+            c.i32LtU();
+          }, () => {
+            c.localGet(NAME);
+            c.localGet(I);
+            c.localGet(BASE);
+            c.i32Const(EV_HEADER_BYTES);
+            c.i32Add();
+            c.localGet(I);
+            c.i32Const(1);
+            c.i32Shl();
+            c.i32Add();
+            c.i32Load16U();
+            c.arraySet(this.deps.strType());
+            c.localGet(I);
+            c.i32Const(1);
+            c.i32Add();
+            c.localSet(I);
+          });
+        });
+        // A failure status (the carrier); the handle closes, then 'error'.
+        this.if_(c, () => {
+          c.localGet(A);
+          c.i32Const(0);
+          c.i32GeS();
+        }, () => this.trap(c));
+        c.localGet(W);
+        c.call(this.watchCloseHelper());
+        c.localGet(A);
+        c.localGet(NAME);
+        c.call(this.deps.watchError());
+        c.call(this.deps.reportUncaught());
+        c.return_();
+      });
+      this.if_(c, () => {
+        c.localGet(KIND);
+        c.i32Const(WATCH_EV_CHANGE);
+        c.i32Ne();
+        c.localGet(A);
+        c.i32Const(UV_RENAME | UV_CHANGE);
+        c.i32And();
+        c.i32Eqz();
+        c.i32Or();
+      }, () => this.trap(c));
+      c.localGet(W);
+      c.structGet(this.watcherType(), W_CB);
+      c.localSet(CB);
+      // emit('change', eventType, filename): the one listener, if any.
+      this.if_(c, () => {
+        c.localGet(W);
+        c.structGet(this.watcherType(), W_SHAPE);
+        c.i32Const(1);
+        c.i32Eq();
+      }, () => {
+        const pair = this.deps.voidClos();
+        c.localGet(CB);
+        c.refCast(pair.clos);
+        c.localGet(CB);
+        c.refCast(pair.clos);
+        c.structGet(pair.clos, 0);
+        c.callRef(pair.fn);
+        this.deathCheck(c);
+      });
+      this.if_(c, () => {
+        c.localGet(W);
+        c.structGet(this.watcherType(), W_SHAPE);
+        c.i32Const(2);
+        c.i32Eq();
+      }, () => {
+        const pair = this.deps.strClos();
+        this.if_(c, () => {
+          c.localGet(A);
+          c.i32Const(UV_RENAME);
+          c.i32And();
+        }, () => {
+          this.deps.pushStrLit(c, "rename");
+          c.localSet(NAME);
+        }, () => {
+          this.deps.pushStrLit(c, "change");
+          c.localSet(NAME);
+        });
+        c.localGet(CB);
+        c.refCast(pair.clos);
+        c.localGet(NAME);
+        c.localGet(CB);
+        c.refCast(pair.clos);
+        c.structGet(pair.clos, 0);
+        c.callRef(pair.fn);
+        this.deathCheck(c);
+      });
+      this.deps.checkpoint(c);
+    });
+  }
+
   /* ── the foreign-source dispatcher and the poll phase ──────────────── */
 
   /** `%w.hev.dispatch(base, len)` — one evPoll record of a source this
@@ -663,6 +1018,20 @@ export class HostEvBuilder {
           this.loadU32(c, BASE, 4);
           this.loadU32(c, BASE, 16);
           c.call(this.sigDeliverHelper());
+          c.br(1);
+        });
+      }
+      if (this.deps.watch) {
+        // Source 4: a watch EVENT or ERROR.
+        this.if_(c, () => {
+          c.localGet(SRC);
+          c.i32Const(SRC_WATCH);
+          c.i32Eq();
+        }, () => {
+          c.localGet(BASE);
+          c.localGet(KIND);
+          c.localGet(PLEN);
+          c.call(this.watchEventHelper());
           c.br(1);
         });
       }
@@ -723,8 +1092,9 @@ export class HostEvBuilder {
   }
 
   /** Pushes an i32, nonzero while a surface of this builder holds the loop.
-   * Signals never do (Node unrefs the wrap). */
+   * Signals never do (Node unrefs the wrap); an open watcher does. */
   emitAlive(c: Code): void {
-    c.i32Const(0);
+    if (this.deps.watch) c.globalGet(this.wg().open);
+    else c.i32Const(0);
   }
 }

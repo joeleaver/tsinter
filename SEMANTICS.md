@@ -110,7 +110,12 @@ when a host declines either. Since unit G1, process signal listeners
 only through the `tsinter.sigCall` import — subscribe and unsubscribe a
 signal number, libuv's uv_signal_start / uv_signal_stop — and
 `tsinter.evPoll`; a host that cannot catch signals (a browser) declines it
-and the module fails to instantiate with a LinkError.
+and the module fails to instantiate with a LinkError. Since unit G3,
+`fs.watch` and `FSWatcher.close` enter only through the `tsinter.watchCall`
+import — start and stop a file-system event watch on one path, libuv's
+uv_fs_event_start / uv_fs_event_stop, failures in fsCall's error carrier —
+and `tsinter.evPoll`, with the same LinkError when a host without
+file-system notifications (a browser) declines it.
 **Rationale:** the output is a
 sandboxed wasm module; ambient OS authority would be a lie at best and a
 sandbox hole at worst. **Tested by:** wasm-differential harness refusal

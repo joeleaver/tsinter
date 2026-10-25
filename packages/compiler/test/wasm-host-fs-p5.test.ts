@@ -871,43 +871,33 @@ describe("wasm-host-fs-p5: the odd-byte-payload row (P4's own R-3 axis)", () => 
   });
 });
 
-describe("wasm-host-fs-p5: D9 — the four refused constructs, SC3001 by name (§6g's own finding: a test only, no builder change)", () => {
-  test("fs.watch — SINGLE-EDIT: none, a REFUSAL-shape control (fs.watch remains genuinely unbuilt; the NO-LISTENER 1-arg form, per a freeze-time finding: a 2-arg fs.watch(path, listener) call names itself 'libCall:fs.watchCb', the SAME bucket as the 3-arg options+listener form below — only the listener-less form gets its OWN 'libCall:fs.watch' name, and the assertion below checks the closing paren so it cannot pass vacuously against the 'watchCb' superstring)", async () => {
-    const { code, message } = await buildRefused(`import * as fs from "node:fs"; const w = fs.watch("/x");`);
-    expect(code).toBe("SC3001");
-    expect(message).toContain("(libCall:fs.watch)");
-  });
-  test("fs.watchCb (the 3-arg options+listener form) — SINGLE-EDIT: none, a REFUSAL-shape control", async () => {
-    const { code, message } = await buildRefused(`import * as fs from "node:fs"; fs.watch("/x", { persistent: true }, () => {});`);
-    expect(code).toBe("SC3001");
-    expect(message).toContain("libCall:fs.watchCb");
-  });
-  test("watcher.close — reachable as a SURVEY member (fs.watch itself is this program's own first refusal, watcher.close never gets a turn to be first) — SINGLE-EDIT: none, a REFUSAL-shape control", async () => {
-    const file = join(scratch, `p${seq++}.ts`);
-    await writeFile(file, `import * as fs from "node:fs"; const w = fs.watch("/x"); w.close();`);
-    const res = await compile(file, { outPath: `${file}.wasm`, outDir: scratch, dynamic: false, backend: "wasm" });
-    expect(res.ok).toBe(false);
-    if (!res.ok) {
-      expect(res.diagnostics[0]?.code).toBe("SC3001");
-      expect([...(res.wasmSurvey ?? [])]).toContain("libCall:watcher.close");
-    }
-  });
-  test("type:fsWatcher (the FIRST refusal when a REAL fs.watch() result is stored typed, 1564's own opening shape) — SINGLE-EDIT: none, a REFUSAL-shape control", async () => {
-    const { code, message } = await buildRefused(`import * as fs from "node:fs"; let w: fs.FSWatcher | null = fs.watch("/x"); console.log(w !== null);`);
-    expect(code).toBe("SC3001");
-    expect(message).toContain("type:fsWatcher");
-  });
-  test("1564's own measured survey set is EXACTLY {type:fsWatcher, libCall:fs.watch, libCall:watcher.close} — three of the four D9 constructs, never fs.watchCb (no 3-arg call in that fixture) — SINGLE-EDIT: none, the survey-set row", async () => {
+describe("wasm-host-fs-p5: D9 — the four constructs P5 refused, lifted by unit G3 (hostev.ts, abi.ts watchCall)", () => {
+  // Each compiles now; a module reaching any of them imports watchCall,
+  // last. The runs against a real host are the wasm differential harness's
+  // ("unit G3 fs.watch rows", 1564 on the census).
+  const imports = async (src: string): Promise<string[]> => {
+    const { readFileSync } = await import("node:fs");
+    const bin = await buildProgram(src);
+    return WebAssembly.Module.imports(new WebAssembly.Module(readFileSync(bin))).map((i) => `${i.module}.${i.name}`);
+  };
+  const lifted: [string, string][] = [
+    ["fs.watch (the no-listener form)", `import * as fs from "node:fs"; const w = fs.watch("/x"); w.close();`],
+    ["fs.watchCb (the 3-arg options+listener form)", `import * as fs from "node:fs"; fs.watch("/x", { persistent: true }, () => {});`],
+    ["type:fsWatcher (a watcher stored typed, 1564's opening shape)", `import * as fs from "node:fs"; let w: fs.FSWatcher | null = fs.watch("/x"); console.log(w !== null);`],
+  ];
+  for (const [what, src] of lifted) {
+    test(`${what} compiles and imports watchCall last — SINGLE-EDIT: the fs.watch arm or the fsWatcher mapType arm removed`, async () => {
+      const names = await imports(src);
+      expect(names[names.length - 1]).toBe("tsinter.watchCall");
+    });
+  }
+  test("1564 compiles (its survey set {type:fsWatcher, libCall:fs.watch, libCall:watcher.close} was P5's refusal) — SINGLE-EDIT: any of the three refused again", async () => {
     const { readFileSync } = await import("node:fs");
     const src = readFileSync(new URL("../../../tests/corpus/1564-fs-watch.ts", import.meta.url), "utf8");
     const file = join(scratch, `p${seq++}.ts`);
     await writeFile(file, src);
     const res = await compile(file, { outPath: `${file}.wasm`, outDir: scratch, dynamic: false, backend: "wasm" });
-    expect(res.ok).toBe(false);
-    if (!res.ok) {
-      expect(res.diagnostics[0]?.code).toBe("SC3001");
-      expect([...(res.wasmSurvey ?? [])].sort()).toEqual(["libCall:fs.watch", "libCall:watcher.close", "type:fsWatcher"].sort());
-    }
+    expect(res.ok, JSON.stringify(res.ok ? "" : res.diagnostics)).toBe(true);
   });
 });
 

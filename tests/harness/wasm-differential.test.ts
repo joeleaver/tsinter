@@ -62,8 +62,10 @@ import {
   rmSync,
   statSync,
   unlinkSync,
+  watch as fsWatch,
   writeFileSync,
   constants as fsConstants,
+  type FSWatcher,
 } from "node:fs";
 import { constants as osConstants, homedir, networkInterfaces, release, tmpdir, totalmem, type as osType, userInfo } from "node:os";
 import { basename, dirname, join, resolve as pathResolve } from "node:path";
@@ -3550,6 +3552,9 @@ const TIER_FLOOR: string[] = [
   // refusal: 1062 -> 1064.
   "1443-signal-handlers.ts",
   "1469-remove-listener.ts",
+  // Unit G3: fs.watch over the OS-level `watchCall` host import and evPoll
+  // source 4 (abi.ts; hostev.ts): 1064 -> 1065.
+  "1564-fs-watch.ts",
 ];
 
 interface RunResult {
@@ -5217,6 +5222,59 @@ async function runWasm(modulePath: string): Promise<RunResult> {
     }
     throw new Error(`sigCall: unknown op ${op}`);
   };
+  // Unit G3 (abi.ts watchCall, evPoll source 4): each watch is Node's own
+  // public fs.watch (libuv's uv_fs_event, inotify on Linux), persistent;
+  // its notifications are queued as EVENT records (the bitmask from Node's
+  // eventType: rename precedes change in fs_event_wrap.cc, so the string
+  // maps back to one bit), a watcher error as an ERROR. An open watch
+  // counts as live for the clock: its events are real OS events.
+  const watches = new Map<number, FSWatcher>();
+  let watchNextHandle = 1;
+  const utf16Payload = (s: string): Uint8Array => {
+    const out = new Uint8Array(s.length * 2);
+    for (let i = 0; i < s.length; i++) {
+      out[2 * i] = s.charCodeAt(i) & 0xff;
+      out[2 * i + 1] = s.charCodeAt(i) >> 8;
+    }
+    return out;
+  };
+  const watchCall = (op: number, ptr: number, len: number, h: number): number => {
+    if (memory === null) throw new Error("watchCall before instantiation completed");
+    if (op === 1) {
+      const path = readUtf16(ptr, len);
+      let w: FSWatcher;
+      try {
+        w = fsWatch(path, { persistent: true });
+      } catch (e) {
+        return mapFsError(e, modulePath);
+      }
+      const handle = watchNextHandle++;
+      w.on("change", (eventType: string, filename: string | Buffer | null) => {
+        const name = filename === null ? "" : String(filename);
+        evPush({ source: 4, handle, kind: 1, a: eventType === "rename" ? 1 : 2, b: 0, payload: utf16Payload(name) });
+      });
+      w.on("error", (err: Error) => {
+        evPush({ source: 4, handle, kind: 2, a: mapFsError(err, modulePath), b: 0, payload: new Uint8Array(0) });
+      });
+      watches.set(handle, w);
+      evLiveAdd(1);
+      return handle;
+    }
+    if (op === 2) {
+      const w = watches.get(h);
+      if (w === undefined) throw new Error(`watchCall: STOP of handle ${h}, not a watch`);
+      w.removeAllListeners("change");
+      w.close();
+      watches.delete(h);
+      for (let i = evQueue.length - 1; i >= 0; i--) {
+        const ev = evQueue[i]!;
+        if (ev.source === 4 && ev.handle === h) evQueue.splice(i, 1);
+      }
+      evLiveAdd(-1);
+      return 0;
+    }
+    throw new Error(`watchCall: unknown op ${op}`);
+  };
   // SPAWN: public spawn() inside ONE synchronous span with the documented
   // tracing channel subscribed for exactly that span (never at module
   // scope: a subscriber makes every spawn in the worker publish), matched
@@ -6150,6 +6208,8 @@ async function runWasm(modulePath: string): Promise<RunResult> {
       },
       // Unit G1 (abi.ts sigCall): signal subscriptions.
       sigCall,
+      // Unit G3 (abi.ts watchCall): file-system watches.
+      watchCall,
       // INC-28 U2 (abi.ts evPoll): the oldest queued event, or 0; a short
       // buffer answers -(the length needed) and keeps the event. Reading an
       // EXIT ends that child's life for the clock.
@@ -6278,6 +6338,12 @@ async function runWasm(modulePath: string): Promise<RunResult> {
     // Unit G1: every signal subscription still held is released.
     for (const rec of sigSubs.values()) process.off(rec.name, rec.listener);
     sigSubs.clear();
+    // Unit G3: every watch still open is closed.
+    for (const w of watches.values()) {
+      w.removeAllListeners("change");
+      w.close();
+    }
+    watches.clear();
     for (const rec of evChildren.values()) {
       rec.proc.removeAllListeners("close");
       rec.proc.removeAllListeners("exit");
@@ -9468,6 +9534,65 @@ describe("unit G1 signal listener rows", () => {
         expect(imports.includes("tsinter.evPoll")).toBe(want);
         expect(exports.includes("_loop")).toBe(want);
         if (want) expect(imports[imports.length - 1]).toBe("tsinter.sigCall");
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+});
+
+describe("unit G3 fs.watch rows", () => {
+  /** Compiles `src` (a whole program) in a fresh directory of its own and
+   * runs it through this file's runWasm; the directory goes afterwards. */
+  async function runRow(src: string): Promise<RunResult> {
+    const dir = mkdtempSync(join(tmpdir(), "g3-row-"));
+    try {
+      const file = join(dir, "main.ts");
+      writeFileSync(file, src);
+      const res = await compile(file, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: false, backend: "wasm" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+      return await runWasm(res.binaryPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  // Expected outputs generated from the Node oracle (three runs each, all
+  // identical), never typed.
+  const rows: [string, string, string, string, number][] = [
+    ["G3-W-01","a start failure throws Node's fs error synchronously, syscall watch, the path as given (none for an empty path) — ENOENT, ENOTDIR — with its code, and the program goes on — SINGLE-EDIT: fs.ts watchStart's syscall literal","import * as fs from \"node:fs\";\nimport { join } from \"node:path\";\nimport { tmpdir } from \"node:os\";\nconst dir = fs.mkdtempSync(join(tmpdir(), \"g3-w01-\"));\nconst file = join(dir, \"f.txt\");\nfs.writeFileSync(file, \"x\");\nfor (const p of [join(dir, \"missing.txt\"), join(file, \"sub\"), \"relative-missing-g3\", \"\"]) {\n  try {\n    fs.watch(p);\n    console.log(\"no throw\");\n  } catch (e) {\n    if (e instanceof Error) {\n      console.log(e.message.split(dir).join(\"<dir>\"), (e as NodeJS.ErrnoException).code);\n    }\n  }\n}\nfs.rmSync(dir, { recursive: true, force: true });\nconsole.log(\"done\");\n","ENOENT: no such file or directory, watch '<dir>/missing.txt' ENOENT\nENOTDIR: not a directory, watch '<dir>/f.txt/sub' ENOTDIR\nENOENT: no such file or directory, watch 'relative-missing-g3' ENOENT\nENOENT: no such file or directory, watch ENOENT\ndone\n",0],
+    ["G3-W-02","an open watcher holds the loop until it closes; close() twice is a no-op; a watcher with no listener ignores its events — SINGLE-EDIT: hostev.ts watchClose not decrementing the open count","import * as fs from \"node:fs\";\nimport { join } from \"node:path\";\nimport { tmpdir } from \"node:os\";\nconst dir = fs.mkdtempSync(join(tmpdir(), \"g3-w02-\"));\nconst w = fs.watch(dir);\nfs.writeFileSync(join(dir, \"a.txt\"), \"a\");\nsetTimeout(() => {\n  console.log(\"closing\");\n  w.close();\n  w.close();\n  fs.rmSync(dir, { recursive: true, force: true });\n  console.log(\"closed twice\");\n}, 60);\nconsole.log(\"main done\");\n","main done\nclosing\nclosed twice\n",0],
+    ["G3-W-03","the listener's eventType: a rewrite in place of a watched file is 'change', a name created in a watched directory is 'rename'; each phase closes on its first event (retried triggers) — SINGLE-EDIT: hostev.ts watchEvent's rename bit test","import * as fs from \"node:fs\";\nimport { join } from \"node:path\";\nimport { tmpdir } from \"node:os\";\nconst dir = fs.mkdtempSync(join(tmpdir(), \"g3-w03-\"));\nconst a = join(dir, \"a.txt\");\nfs.writeFileSync(a, \"seed\");\nlet phase = 0;\nlet kick: ReturnType<typeof setInterval> | null = null;\nlet w: fs.FSWatcher | null = null;\nfunction arm(path: string, trigger: () => void, next: () => void): void {\n  let fired = false;\n  w = fs.watch(path, (eventType: string) => {\n    if (fired) return;\n    fired = true;\n    if (kick !== null) clearInterval(kick);\n    console.log(\"phase\", phase, eventType);\n    if (w !== null) w.close();\n    next();\n  });\n  kick = setInterval(trigger, 40);\n}\narm(a, () => fs.appendFileSync(a, \"+\"), () => {\n  phase = 1;\n  let n = 0;\n  arm(dir, () => {\n    n += 1;\n    fs.writeFileSync(join(dir, \"new-\" + String(n) + \".txt\"), \"n\");\n  }, () => {\n    fs.rmSync(dir, { recursive: true, force: true });\n    console.log(\"done\");\n  });\n});\n","phase 0 change\nphase 1 rename\ndone\n",0],
+    ["G3-W-04","a throwing watch listener is the program's death: nothing after it runs — SINGLE-EDIT: hostev.ts watchEvent's death check","import * as fs from \"node:fs\";\nimport { join } from \"node:path\";\nimport { tmpdir } from \"node:os\";\nconst dir = fs.mkdtempSync(join(tmpdir(), \"g3-w04-\"));\nconst a = join(dir, \"a.txt\");\nfs.writeFileSync(a, \"seed\");\nprocess.on(\"exit\", () => {\n  fs.rmSync(dir, { recursive: true, force: true });\n});\nfs.watch(a, () => {\n  console.log(\"event\");\n  throw new Error(\"listener boom\");\n});\nconst kick = setInterval(() => fs.appendFileSync(a, \"+\"), 40);\nsetTimeout(() => {\n  clearInterval(kick);\n  console.log(\"never\");\n}, 5000);\nconsole.log(\"main done\");\n","main done\nevent\n",1],
+  ];
+  for (const [id, what, src, stdout, exitCode] of rows) {
+    test(`${id} ${what}`, async () => {
+      const r = await runRow(src);
+      expect(r.stdout.toString("utf8")).toBe(stdout);
+      expect(r.exitCode).toBe(exitCode);
+      if (exitCode === 0) expect(r.stderr.toString("utf8")).toBe("");
+      else expect(r.stderr.toString("utf8")).toBe("Uncaught Error: listener boom\n");
+    }, 60000);
+  }
+  test("G3-HOST-01 fs.watch mints watchCall (after every earlier import) and evPoll and exports _loop; a module without it mints neither — SINGLE-EDIT: emitter.ts hevWatch's prescan", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "g3-row-"));
+    try {
+      const shapes: [string, boolean][] = [
+        ['import * as fs from "node:fs";\nconst w = fs.watch(".", () => {});\nw.close();\n', true],
+        ['import * as fs from "node:fs";\nconsole.log(fs.existsSync("."));\n', false],
+      ];
+      for (const [i, [src, want]] of shapes.entries()) {
+        const file = join(dir, `m${i}.ts`);
+        writeFileSync(file, src);
+        const res = await compile(file, { outPath: join(dir, `m${i}.wasm`), outDir: dir, dynamic: false, backend: "wasm" });
+        expect(res.ok, JSON.stringify(res.ok ? "" : res.diagnostics)).toBe(true);
+        if (!res.ok) return;
+        const m = await WebAssembly.compile(readFileSync(res.binaryPath));
+        const imports = WebAssembly.Module.imports(m).map((x) => `${x.module}.${x.name}`);
+        const exports = WebAssembly.Module.exports(m).map((x) => x.name);
+        expect(imports.includes("tsinter.watchCall")).toBe(want);
+        expect(imports.includes("tsinter.evPoll")).toBe(want);
+        expect(exports.includes("_loop")).toBe(want);
+        if (want) expect(imports[imports.length - 1]).toBe("tsinter.watchCall");
       }
     } finally {
       rmSync(dir, { recursive: true, force: true });

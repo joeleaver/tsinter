@@ -336,6 +336,10 @@ async function instantiate(modulePath: string, overrides?: HostOverrides) {
       sigCall(op: number, _x: number): number {
         throw new Error(`sigCall: op ${op} reached with no forced host (default stub is loud by design)`);
       },
+      // Unit G3 (abi.ts watchCall): LOUD for every op, netCall's stance.
+      watchCall(op: number, _ptr: number, _len: number, _h: number): number {
+        throw new Error(`watchCall: op ${op} reached with no forced host (default stub is loud by design)`);
+      },
       ...(overrides?.imports ?? {}),
     },
   });

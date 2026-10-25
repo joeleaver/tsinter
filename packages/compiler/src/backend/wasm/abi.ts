@@ -589,7 +589,7 @@
  *     [event modules only — those reaching cp.spawn or cp.spawnOpts, and
  *     since INC-29 U1 those reaching a node:net key that can start host
  *     I/O (netCall below); since unit G1 those reaching a signal listener
- *     (sigCall below)]
+ *     (sigCall below); since unit G3 those reaching fs.watch (watchCall)]
  *     evPoll(ptr, cap) -> i32. INC-28 U2. The host's EVENT QUEUE, read one
  *     event at a time: the host writes the oldest queued event at ptr and
  *     answers its length; answers 0 when the queue is empty; and answers
@@ -597,7 +597,8 @@
  *     small, so the module grows its buffer and asks again — the event is
  *     held, never lost and never re-created. THE RECORD, little-endian:
  *     u32 source at +0 (1 = a child, 2 = a net handle — INC-29 U1,
- *     netCall below; 3 = a signal subscription — unit G1, sigCall below),
+ *     netCall below; 3 = a signal subscription — unit G1, sigCall below;
+ *     4 = a file-system watch — unit G3, watchCall below),
  *     u32 handle at +4, u32 kind at +8,
  *     u32 payloadLen at +12, i32 a at +16, i32 b at +20 — 4+4+4+4+4+4 = 24
  *     bytes — then payloadLen bytes. A child's kinds: 1 EXIT (a = the exit
@@ -1102,6 +1103,37 @@
  *     delivered them, is enforced by NOTHING — the harness's own rows are
  *     the check.
  *
+ *   (import "tsinter" "watchCall" (func (param i32 i32 i32 i32) (result i32)))
+ *     [modules reaching fs.watch / FSWatcher.close only — unit G3; minted
+ *     after sigCall]
+ *     watchCall(op, ptr, len, h) -> i32: libuv's uv_fs_event_start /
+ *     uv_fs_event_stop on one path, and nothing more.
+ *       op 1 START(ptr, len)    the path: `len` UTF-16 code units at ptr
+ *                               (2-aligned), as the program gave it. Starts
+ *                               watching it (not recursively; the watch
+ *                               holds the host's loop as a persistent one
+ *                               does) and answers a handle (>= 1; numbered
+ *                               from 1), or a failure in fsCall's carrier
+ *                               (-1..-14 fsCall's fourteen codes, -(256 +
+ *                               errno) any other), which the module renders
+ *                               as Node's fs error, syscall `watch`.
+ *       op 2 STOP(h)            -> 0. The watch stops; the host drops every
+ *                               record it still holds or has queued for h
+ *                               and never names h again.
+ *     EVENTS, evPoll source 4, `handle` the watch: kind 1 EVENT (a = libuv's
+ *     uv_fs_event bitmask, UV_RENAME 1 and / or UV_CHANGE 2; payload = the
+ *     filename the OS reported, UTF-16 code units, empty when there was
+ *     none), kind 2 ERROR (a = a failure in fsCall's carrier; payload = the
+ *     filename as for EVENT); b = 0. After an ERROR the module STOPs the
+ *     watch. Any record out of these shapes is the named trap "evPoll:
+ *     host failure".
+ *     THE CAPABILITY (S004): a host without file-system notifications (a
+ *     browser) DOES NOT SUPPLY THE IMPORT, and the module fails to
+ *     instantiate with a LinkError.
+ *     watchCall's EFFECT TIER: that the host watches the path it was given
+ *     and reports what its OS reported, in order, is enforced by NOTHING —
+ *     the harness's own rows are the check.
+ *
  *   (export "_start" (func))            — the program; run it once.
  *   (export "_tick" (func (param f64) (result f64)))  [timer modules only]
  *   (export "_loop" (func (param f64) (result f64)))  [event modules only,
@@ -1230,6 +1262,7 @@ export const IMPORT_TLS_CALL = "tlsCall";
 export const IMPORT_RANDOM = "random";
 export const IMPORT_SLEEP = "sleep";
 export const IMPORT_SIG_CALL = "sigCall";
+export const IMPORT_WATCH_CALL = "watchCall";
 export const EXPORT_ENTRY = "_start";
 export const EXPORT_TICK = "_tick";
 export const EXPORT_LOOP = "_loop";
