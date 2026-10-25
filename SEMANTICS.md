@@ -6158,8 +6158,17 @@ is callable is not adopted; resolving a promise with one is a named run-time ref
 with a non-promise thenable is not supported yet"). A host handle held in an `any` (a net, http, tls,
 dgram or child-process object) is never a thenable — none of Node's has a `then` — and resolving a promise
 with one fulfils it with the handle, as in Node. A promise of a STATICALLY typed destination resolved
-with an `any`-held promise (`async function g(): Promise<number> { return x; }`) still rejects with the
-boundary's type error where Node adopts — a wrong answer owned by board #234, not this entry.
+with an `any`-held promise (`async function g(): Promise<number> { return x; }`, `new Promise<number>((r)
+=> r(x))`, a typed `Promise.withResolvers` resolve — board #234) adopts it the same way, with Node's two
+jobs, and the cast to the typed slot applies to the ADOPTED value: a value that does not fit rejects the
+destination with the boundary's TypeError at adoption (S009's checked-cast footing; Node, untyped,
+fulfils). An ordinary typed function called with an `any`-held promise is not a resolve function and
+keeps the boundary's TypeError at the call. The same holds for an ordinary typed function that RETURNS
+one through a typed result: a typed `.then` / `.catch` handler such as `(): number => x` casts `x` as its
+own return value, inside the handler, before the derived promise's resolve function sees anything — so
+`Promise.resolve(1).then((): number => x)` rejects with the boundary's TypeError where Node adopts and
+fulfils with the held value (a registered divergence of this entry, wasm lane). Rows TY01–TY19 in `wasm-adopt.test.ts` (TY19 pins the
+handler cell).
 
 **Scope:** llvm, c and wasm; promises the front end types statically (declared or inferred, in
 TypeScript and in plain JavaScript); `import()` on every lane as stated.

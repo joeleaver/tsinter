@@ -1517,6 +1517,10 @@ export function surveyWasmModule(mod: IrModule): string[] {
 }
 
 
+/** A resolution value cast from an `any` into a typed slot (board #234):
+ * the checked-dynamic `dynCheck` or the island's `jsExit`. */
+type TypedDynResolution = Extract<IrExpr, { kind: "dynCheck" | "jsExit" }>;
+
 /* ── per-function state ────────────────────────────────────────────────── */
 
 interface FnState {
@@ -17597,6 +17601,9 @@ class Assembler {
        * slot, emitThrowValue's dispatch exactly — the two share the cell's
        * encoding, which is what lets a rejection copy across field-wise. */
       case "%async.settle":
+        // Board #234: a TYPED `return x` with `x` an `any` adopts a held
+        // promise before the cast (emitTypedDynSettle).
+        if (this.isTypedDynResolution(s.value) && this.emitTypedDynSettle(s.promise, s.value, s.loc)) return;
         // A dyn-typed fulfilment (an async function's `return x` with `x`
         // an `any`) may be a promise to adopt — settle's prologue does it.
         if (s.value !== null && (s.value.type.kind === "jsval" || s.value.type.kind === "dyn")) this.needSettleAdopt();
@@ -18048,6 +18055,46 @@ class Assembler {
         const c = this.acquireScratch(closRef);
         this.walkExpr(e.callee);
         code.localSet(c);
+        // Board #234: `r(x)` with `x` an `any` and `r` possibly a typed
+        // settler (`new Promise<T>((r) => r(x))`): a held promise is
+        // adopted before the cast — when the closure IS T's settler.
+        const arg0 = e.args[0];
+        const adopt =
+          e.args.length === 1 && ct.ret.kind === "void" && this.isTypedDynResolution(arg0 ?? null) &&
+          this.typedResolverKeys().has(typeKey(arg0!.type))
+            ? this.adoptAsFn(arg0 as TypedDynResolution, e.loc)
+            : null;
+        if (adopt !== null && arg0 !== undefined && this.isTypedDynResolution(arg0)) {
+          const val = this.mapTypeSoft(arg0.type);
+          const { env } = this.settlerEnvFor(val, 1);
+          const dynRef = this.dyn.dynRef();
+          const d = this.acquireScratch(dynRef);
+          this.walkExpr(arg0.value);
+          code.localSet(d);
+          code.localGet(c);
+          code.refTest(env);
+          this.openIfResult(I32);
+          code.localGet(c);
+          code.refCast(env);
+          code.structGet(env, 1);
+          code.localGet(d);
+          code.call(adopt);
+          code.else_();
+          code.i32Const(0);
+          this.close();
+          code.i32Eqz();
+          this.openIf();
+          code.localGet(c);
+          this.walkExpr({ ...arg0, value: { kind: "%wasm.scratch", index: d, type: DYN, loc: arg0.value.loc } as unknown as IrExpr });
+          code.localGet(c);
+          code.structGet(pair.clos, 0);
+          code.callRef(pair.fn);
+          if (this.mayThrowIndirect) this.emitPendingCheck();
+          this.close();
+          this.releaseScratch(dynRef, d);
+          this.releaseScratch(closRef, c);
+          return;
+        }
         code.localGet(c); // arg0: the closure itself (selfRef, env)
         for (const a of e.args) this.walkExpr(a);
         code.localGet(c);
@@ -19216,6 +19263,12 @@ class Assembler {
       /** The pending promise a spawn wrapper hands back. */
       case "%async.mint":
         code.call(this.proms.mint());
+        return;
+
+      /** A value this emitter already holds in a wasm local (board #234's
+       * re-walk of a dynCheck over an operand evaluated once). */
+      case "%wasm.scratch":
+        code.localGet(e.index);
         return;
 
       /** Resume's prologue: the base-typed parameter narrowed to this
@@ -41721,18 +41774,12 @@ class Assembler {
 
   private readonly settlerFns = new Map<string, number>();
 
-  /** The settler for one payload shape: `(v: T) => void` fulfilling (or
-   * `(e) => void` rejecting) the promise in its environment. */
-  private settlerFor(param: IrType | null, state: 1 | 2, loc: SrcLoc | undefined): number | null {
-    const val = param === null ? null : this.mapType(param, loc);
-    if (param !== null && val === null) return null;
-    // `new Promise((r) => r(x))` with a dyn `x`: settle's prologue adopts.
-    if (state === 1 && param !== null && (param.kind === "jsval" || param.kind === "dyn")) this.needSettleAdopt();
-    const params = val === null ? [] : [val];
-    const pair = this.closPairFor(params, []);
+  /** A settler's environment: a subtype of the `(v) => void` closure
+   * struct for payload representation `val` holding the promise it
+   * settles — one per (state, representation), interned by name. */
+  private settlerEnvFor(val: ValType | null, state: 1 | 2): { key: string; env: number; pair: { clos: number; fn: number } } {
+    const pair = this.closPairFor(val === null ? [] : [val], []);
     const key = `${state}:${valKey({ kind: "ref", nullable: true, typeIndex: pair.fn })}`;
-    const cached = this.settlerFns.get(key);
-    if (cached !== undefined) return cached;
     const env = this.mb.subStructType(
       `settlerEnv:${key}`,
       [
@@ -41741,6 +41788,19 @@ class Assembler {
       ],
       pair.clos,
     );
+    return { key, env, pair };
+  }
+
+  /** The settler for one payload shape: `(v: T) => void` fulfilling (or
+   * `(e) => void` rejecting) the promise in its environment. */
+  private settlerFor(param: IrType | null, state: 1 | 2, loc: SrcLoc | undefined): number | null {
+    const val = param === null ? null : this.mapType(param, loc);
+    if (param !== null && val === null) return null;
+    // `new Promise((r) => r(x))` with a dyn `x`: settle's prologue adopts.
+    if (state === 1 && param !== null && (param.kind === "jsval" || param.kind === "dyn")) this.needSettleAdopt();
+    const { key, env, pair } = this.settlerEnvFor(val, state);
+    const cached = this.settlerFns.get(key);
+    if (cached !== undefined) return cached;
     const idx = this.mb.declareFunc(pair.fn, `%w.async.${state === 1 ? "resolve" : "reject"}.${this.settlerFns.size}`);
     this.settlerFns.set(key, idx);
     const c = new Code();
@@ -41800,20 +41860,325 @@ class Assembler {
   private pushSettler(fnIndex: number, param: IrType | null, state: 1 | 2, promLocal: number): void {
     const code = this.fn.code;
     const val = param === null ? null : this.mapTypeSoft(param);
-    const pair = this.closPairFor(val === null ? [] : [val], []);
-    const key = `${state}:${valKey({ kind: "ref", nullable: true, typeIndex: pair.fn })}`;
-    const env = this.mb.subStructType(
-      `settlerEnv:${key}`,
-      [
-        { storage: { kind: "ref", nullable: false, typeIndex: pair.fn }, mutable: false },
-        { storage: this.proms.promRef(), mutable: false },
-      ],
-      pair.clos,
-    );
+    const { env } = this.settlerEnvFor(val, state);
     this.mb.declareFuncRef(fnIndex);
     code.refFunc(fnIndex);
     code.localGet(promLocal);
     code.structNew(env);
+  }
+
+  /* ── board #234: a TYPED destination adopting an any-held promise ──────
+   *
+   * `async function g(): Promise<T> { return x; }` and `new Promise<T>((r)
+   * => r(x))` with `x` an `any` reach this emitter as a resolution whose
+   * value is `dynCheck(x → T)`: the cast to the typed slot would run
+   * BEFORE settle's adoption prologue could see a PROMISE box, so Node's
+   * adoption became the boundary's "expected number, got Promise". Both
+   * sites (the state machine's `%async.settle` and a call of a closure
+   * that may be a typed settler) evaluate `x` once and ask
+   * %w.async.adoptAs:<T> first. A PROMISE box is adopted exactly as
+   * adoptInSettle adopts one (already-resolved ignored, the chaining-cycle
+   * TypeError, the ADOPTING mark, NewPromiseResolveThenableJob's hop, a
+   * handled subscription) — only the reaction differs: a fulfilment is
+   * read as dyn, cast to T by the same %w.dyn.check:<T> walker (a failed
+   * cast rejects the destination with the boundary TypeError, as the
+   * direct path would have), and settled through T's own settler. Node's
+   * two jobs. Anything else takes the unchanged direct path, its dynCheck
+   * re-walked over the already-evaluated operand (`%wasm.scratch`). */
+
+  private readonly adoptAsFns = new Map<string, number | null>();
+  private typedResolverKeysField: Set<string> | null = null;
+
+  /** The settled-value types a typed settler in this module can take:
+   * every `new Promise<T>` executor's resolve parameter and every
+   * `Promise.withResolvers<T>()` record's resolve field (a generic walk —
+   * the IR is plain JSON). A call site's settler check is emitted only
+   * for these. */
+  private typedResolverKeys(): Set<string> {
+    if (this.typedResolverKeysField !== null) return this.typedResolverKeysField;
+    const keys = new Set<string>();
+    const visit = (node: unknown): void => {
+      if (Array.isArray(node)) {
+        for (const item of node) visit(item);
+        return;
+      }
+      if (node === null || typeof node !== "object") return;
+      const rec = node as Record<string, unknown>;
+      if (rec["kind"] === "newPromise") {
+        const ex = (rec["executor"] as IrExpr | undefined)?.type;
+        const r = ex?.kind === "func" ? ex.params[0] : undefined;
+        const t = r?.kind === "func" ? r.params[0] : undefined;
+        if (t !== undefined) keys.add(typeKey(t));
+      } else if (rec["kind"] === "promiseWithResolvers") {
+        const rt = rec["type"] as IrType | undefined;
+        const shape = rt?.kind === "record" ? this.recordShapes.get(rt.shapeId) : undefined;
+        const r = shape?.fields.find((f) => f.name === "resolve")?.type;
+        const t = r?.kind === "func" ? r.params[0] : undefined;
+        if (t !== undefined) keys.add(typeKey(t));
+      }
+      for (const key of Object.keys(rec)) {
+        if (key === "loc" || key === "type") continue;
+        visit(rec[key]);
+      }
+    };
+    for (const f of this.mod.functions) visit(f.body);
+    this.typedResolverKeysField = keys;
+    return keys;
+  }
+
+  /** Is `e` a resolution value this tier must offer to adoption first: a
+   * checked cast of a dyn value to a typed slot the walkers can build
+   * (`dynCheck`), or the island's validated exit of an `any` (`jsExit`,
+   * jsval ≡ dyn on this tier) — a `// @dynamic` module's `x: any`. */
+  private isTypedDynResolution(e: WExpr | null): e is TypedDynResolution {
+    if (e === null) return false;
+    const t = e.type;
+    if (e.kind === "jsExit") {
+      if (e.value.type.kind !== "jsval") return false;
+      return (
+        t.kind === "f64" || t.kind === "bool" || t.kind === "string" || t.kind === "record" ||
+        t.kind === "bytes" || t.kind === "union" || (t.kind === "array" && t.elem.kind !== "jsval")
+      );
+    }
+    if (e.kind !== "dynCheck" || e.value.type.kind !== "dyn") return false;
+    return (
+      t.kind === "f64" || t.kind === "bool" || t.kind === "string" || t.kind === "record" ||
+      t.kind === "array" || t.kind === "union" || t.kind === "func" || t.kind === "bytes" ||
+      (t.kind === "object" && t.className === "%Error")
+    );
+  }
+
+  private readonly jsExitScalarFns = new Map<string, number>();
+
+  /** %w.isl.exit:<T>(d, path) → the scalar — jsExit's strict primitive
+   * extraction as a function (the cell set on a wrong kind, with jsExit's
+   * own "expected <want>, got <typeof>" text), call-compatible with the
+   * %w.dyn.check walkers so the adoption reaction can take either. */
+  private jsExitScalarFn(t: IrType & { kind: "f64" | "bool" | "string" }): number {
+    const hit = this.jsExitScalarFns.get(t.kind);
+    if (hit !== undefined) return hit;
+    const val: ValType = t.kind === "f64" ? F64 : t.kind === "string" ? this.strRef : I32;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.dyn.dynRef(), this.dyn.pathRef()], [val]), `%w.isl.exit:${t.kind}`);
+    this.jsExitScalarFns.set(t.kind, idx);
+    const wantDK = t.kind === "f64" ? DK.NUM : t.kind === "bool" ? DK.BOOL : DK.STR;
+    const wantDesc = t.kind === "f64" ? "number" : t.kind === "bool" ? "boolean" : "string";
+    const dynT = this.dyn.dynT();
+    const c = new Code();
+    c.localGet(0);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(wantDK);
+    c.i32Ne();
+    c.ifVoid();
+    this.emitSetCellError(c, "%TypeError", "TypeError", (x) => {
+      this.pushStrLitInto(x, `expected ${wantDesc}, got `);
+      x.localGet(0);
+      x.call(this.dyn.typeOf());
+      x.call(this.concatHelper());
+    }, null);
+    this.pushZeroInto(c, val);
+    c.return_();
+    c.end();
+    c.localGet(0);
+    if (t.kind === "string") {
+      c.structGet(dynT, DYN_REF);
+      c.refCast(this.strType);
+    } else {
+      c.structGet(dynT, DYN_NUM);
+      if (t.kind === "bool") {
+        c.f64Const(0);
+        c.f64Ne();
+      }
+    }
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  /** %w.async.adoptAs:<T>(p, d) → 1 when `d` is a PROMISE box and the
+   * resolution of `p` was taken over (adopted, ignored as already
+   * resolved, or rejected as a chaining cycle); 0 for any other value.
+   * `cast` is the resolution's own conversion (dynCheck or jsExit), so an
+   * adopted value that does not fit T fails exactly as it would have. */
+  private adoptAsFn(cast: TypedDynResolution, loc: SrcLoc | undefined): number | null {
+    const t = cast.type;
+    const exitScalar = cast.kind === "jsExit" && (t.kind === "f64" || t.kind === "bool" || t.kind === "string");
+    const key = `${exitScalar ? "exit:" : ""}${typeKey(t)}`;
+    const hit = this.adoptAsFns.get(key);
+    if (hit !== undefined) return hit;
+    const val = this.mapType(t, loc);
+    const check =
+      val === null ? null
+      : exitScalar ? this.jsExitScalarFn(t as IrType & { kind: "f64" | "bool" | "string" })
+      : this.dynCheckHelper(t, loc);
+    const settler = val === null ? null : this.settlerFor(t, 1, loc);
+    if (val === null || check === null || settler === null) {
+      this.adoptAsFns.set(key, null);
+      return null;
+    }
+    // The ADOPTING mark is honored only by settle's adoption prologue.
+    this.needSettleAdopt();
+    const { env } = this.settlerEnvFor(val, 1);
+    const dynT = this.dyn.dynT();
+    const promT = this.proms.promT;
+    const entryT = this.proms.raceEntryT;
+    const entryLocal: ValType = { kind: "ref", nullable: true, typeIndex: entryT };
+    const pair = this.resumeClosPair();
+    const exc = this.exc();
+    // The adopted promise settled: lift DST's mark, copy a rejection raw,
+    // cast a fulfilment to T and settle DST through T's settler.
+    const rx = this.mb.declareFunc(pair.fn, `%w.async.adoptAsRx:${key}`);
+    {
+      const c = new Code();
+      const E = 2, DST = 3, SRC = 4, V = 5;
+      c.localGet(1);
+      c.refCast(entryT);
+      c.localSet(E);
+      c.localGet(E);
+      c.structGet(entryT, RACEE_DST);
+      c.localSet(DST);
+      c.localGet(E);
+      c.structGet(entryT, RACEE_SRC);
+      c.localSet(SRC);
+      c.localGet(DST);
+      c.i32Const(0);
+      c.structSet(promT, PROM_KIND);
+      c.localGet(SRC);
+      c.structGet(promT, PROM_STATE);
+      c.i32Const(2);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(DST);
+      c.localGet(SRC);
+      c.call(this.proms.settleFrom());
+      c.return_();
+      c.end();
+      c.localGet(SRC);
+      c.call(this.promReadDynFn());
+      c.refNull(this.dyn.pathT()); // the ROOT path: `$`
+      c.call(check);
+      c.localSet(V);
+      c.globalGet(exc.kindG);
+      c.ifVoid();
+      c.localGet(DST);
+      c.globalGet(exc.kindG);
+      c.globalGet(exc.f64G);
+      c.globalGet(exc.refG);
+      c.globalGet(exc.preG);
+      c.i32Const(2);
+      c.call(this.proms.settle());
+      this.emitCellClearInto(c);
+      c.return_();
+      c.end();
+      this.mb.declareFuncRef(settler);
+      c.refFunc(settler);
+      c.localGet(DST);
+      c.structNew(env);
+      c.localGet(V);
+      c.call(settler);
+      this.mb.setBody(rx, [entryLocal, this.proms.promRef(), this.proms.promRef(), val], c.bytes());
+    }
+    // NewPromiseResolveThenableJob: the adopted promise's `then`.
+    const job = this.mb.declareFunc(pair.fn, `%w.async.adoptAsJob:${key}`);
+    {
+      const c = new Code();
+      const E = 2;
+      c.localGet(1);
+      c.refCast(entryT);
+      c.localSet(E);
+      c.localGet(E);
+      c.structGet(entryT, RACEE_SRC);
+      this.pushReactionClosure(c, rx);
+      c.localGet(E);
+      c.call(this.proms.subscribeHandled());
+      this.mb.setBody(job, [entryLocal], c.bytes());
+    }
+    const idx = this.mb.declareFunc(this.mb.funcType([this.proms.promRef(), this.dyn.dynRef()], [I32]), `%w.async.adoptAs:${key}`);
+    this.adoptAsFns.set(key, idx);
+    {
+      const c = new Code();
+      const P = 0, D = 1, INNER = 2;
+      c.localGet(D);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.PROMISE);
+      c.i32Ne();
+      c.ifVoid();
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      // ECMA-262's [[AlreadyResolved]]: a settled or adopting P ignores
+      // this resolution entirely.
+      c.localGet(P);
+      c.structGet(promT, PROM_STATE);
+      c.localGet(P);
+      c.structGet(promT, PROM_KIND);
+      c.i32Const(PROM_KIND_ADOPTING);
+      c.i32Eq();
+      c.i32Or();
+      c.ifVoid();
+      c.i32Const(1);
+      c.return_();
+      c.end();
+      c.localGet(D);
+      c.structGet(dynT, DYN_REF);
+      c.refCast(promT);
+      c.localSet(INNER);
+      c.localGet(INNER);
+      c.localGet(P);
+      c.refEq();
+      c.ifVoid();
+      this.emitSetCellError(c, "%TypeError", "TypeError", (x) => this.pushStrLitInto(x, "Chaining cycle detected for promise #<Promise>"), null);
+      c.localGet(P);
+      c.globalGet(exc.kindG);
+      c.globalGet(exc.f64G);
+      c.globalGet(exc.refG);
+      c.globalGet(exc.preG);
+      c.i32Const(2);
+      c.call(this.proms.settle());
+      this.emitCellClearInto(c);
+      c.i32Const(1);
+      c.return_();
+      c.end();
+      c.localGet(P);
+      c.i32Const(PROM_KIND_ADOPTING);
+      c.structSet(promT, PROM_KIND);
+      this.pushReactionClosure(c, job);
+      c.localGet(P);
+      c.localGet(INNER);
+      c.structNew(entryT);
+      c.call(this.proms.hop());
+      c.i32Const(1);
+      this.mb.setBody(idx, [this.proms.promRef()], c.bytes());
+    }
+    return idx;
+  }
+
+  /** `%async.settle(P, dynCheck(x → T))` — an async function's typed
+   * `return x`: adoption first, else the direct typed settle. False when
+   * T has no adoption helper (the caller emits the direct path). */
+  private emitTypedDynSettle(promise: WExpr, value: TypedDynResolution, loc: SrcLoc): boolean {
+    const adopt = this.adoptAsFn(value, loc);
+    if (adopt === null) return false;
+    const code = this.fn.code;
+    const promRef = this.proms.promRef();
+    const dynRef = this.dyn.dynRef();
+    const p = this.acquireScratch(promRef);
+    const d = this.acquireScratch(dynRef);
+    this.walkExpr(promise);
+    code.localSet(p);
+    this.walkExpr(value.value);
+    code.localSet(d);
+    code.localGet(p);
+    code.localGet(d);
+    code.call(adopt);
+    code.i32Eqz();
+    this.openIf();
+    code.localGet(p);
+    this.emitPayload({ ...value, value: { kind: "%wasm.scratch", index: d, type: DYN, loc: value.value.loc } as unknown as IrExpr }, "settle", loc);
+    code.i32Const(1);
+    code.call(this.proms.settle());
+    this.close();
+    this.releaseScratch(dynRef, d);
+    this.releaseScratch(promRef, p);
+    return true;
   }
 
   private emitNewPromise(e: Extract<IrExpr, { kind: "newPromise" }>): void {

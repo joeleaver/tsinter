@@ -689,7 +689,13 @@ export type AsyncExpr =
    * afterward (an ordinary `recordSet` — GEN_FIELD is a real frame field,
    * not part of this op) since the frame is built FIRST and $gen needs
    * that frame reference to exist before $gen itself can. */
-  | { kind: "%gen.new"; frame: WExpr; resume: WExpr; type: IrType; loc: SrcLoc };
+  | { kind: "%gen.new"; frame: WExpr; resume: WExpr; type: IrType; loc: SrcLoc }
+  /** EMITTER-ONLY, never built by this pass: a value the emitter already
+   * holds in wasm local `index`, re-entered as an expression of `type` so
+   * an IR operand evaluated once can be walked a second time under an
+   * existing lowering (board #234's typed adoption re-walks
+   * `dynCheck(<the scratch>)` on its non-promise path). */
+  | { kind: "%wasm.scratch"; index: number; type: IrType; loc: SrcLoc };
 
 /** Statement-position runtime seams: the two halves of a suspension
  * (register a waiter / enqueue the bare microtask hop), the two halves of

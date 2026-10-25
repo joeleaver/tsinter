@@ -8,7 +8,10 @@
  * `await x` answer a promise held in `x` itself), island
  * then/catch/finally on a promise receiver through the reaction trio, and
  * the gated payload reader %w.prom.readDyn for a `Promise<any>` that is a
- * typed promise underneath. The import spine keeps its own timing (board
+ * typed promise underneath. Board #234's TYPED rows: a statically typed
+ * destination (`async function g(): Promise<number> { return x; }`, a
+ * typed settler) adopts a held promise before its cast
+ * (%w.async.adoptAs:<T>). The import spine keeps its own timing (board
  * #181, SEMANTICS.md S083's import() cells): the SPINE rows pin it.
  *
  * Every expected line below is an INLINED literal. A run row's stdout is a
@@ -324,6 +327,151 @@ test("TH04 THENABLE: a function expression given its own then method, returned f
   const { stdout, stderr } = await runRowTrap("TH04", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function n(): Promise<unknown> { return 7; }\nasync function t(): Promise<number> { return 9; }\nconst f: any = function () {};\nf.then = (r: any) => r(5);\nasync function g(): Promise<any> { return f; }\ng().then((v: any) => console.log(`fn ${typeof v}`));\nconsole.log(\"sync\");", "ts");
   expect(stdout).toBe("");
   expect(stderr).toBe("Uncaught Error: resolving a promise with a non-promise thenable is not supported yet\n");
+});
+
+// ============================================================
+// TYPED — a statically typed destination adopts an any-held promise before its cast (board #234)
+// ============================================================
+
+test("TY01 TYPED: an async function's typed return of an any-held promise adopts it with Node's two jobs (board #234)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("TY01", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function n(): Promise<unknown> { return 7; }\nasync function t(): Promise<number> { return 9; }\nconst x: any = id(n());\nasync function g(): Promise<number> { return x; }\ng().then((v) => console.log(`g ${v + 1}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\no1\no2\ng 8\no3\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("TY02 TYPED: a typed new Promise resolved with an any-held promise adopts it (board #234)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("TY02", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function n(): Promise<unknown> { return 7; }\nasync function t(): Promise<number> { return 9; }\nconst x: any = id(n());\nnew Promise<number>((r) => r(x)).then((v) => console.log(`np ${v + 1}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\no1\no2\nnp 8\no3\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("TY03 TYPED: the adopted value is cast to the typed slot: a mismatch rejects with the boundary TypeError at adoption", async () => {
+  // SEMANTICS.md S009: a typed slot validates a dyn value; Node has no slot type and fulfils with 7.
+  // Node v24.18.1 prints "sync\no1\no2\ng 7\no3\no4\no5\n".
+  const { stdout, stderr, exitCode } = await runRow("TY03", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function n(): Promise<unknown> { return 7; }\nasync function t(): Promise<number> { return 9; }\nconst x: any = id(n());\nasync function g(): Promise<string> { return x; }\ng().then((v) => console.log(`g ${v}`)).catch((e: unknown) => console.log(`caught ${String(e)}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\no1\no2\no3\ncaught TypeError: expected string, got number\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("TY04 TYPED: an any-held REJECTED promise returned from a typed async function rejects it with the reason", async () => {
+  const { stdout, stderr, exitCode } = await runRow("TY04", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function n(): Promise<unknown> { return 7; }\nasync function t(): Promise<number> { return 9; }\nasync function bad(): Promise<unknown> { throw new Error(\"boom\"); }\nconst x: any = id(bad());\nasync function g(): Promise<number> { return x; }\ng().then((v) => console.log(`g ${v}`)).catch((e: unknown) => console.log(`caught ${String(e)}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\no1\no2\no3\ncaught Error: boom\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("TY05 TYPED: control: an any holding a number returns directly, no job", async () => {
+  const { stdout, stderr, exitCode } = await runRow("TY05", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function n(): Promise<unknown> { return 7; }\nasync function t(): Promise<number> { return 9; }\nconst x: any = id(5);\nasync function g(): Promise<number> { return x; }\ng().then((v) => console.log(`g ${v + 1}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\ng 6\no1\no2\no3\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("TY06 TYPED: a settler already resolved by adoption ignores a later resolve", async () => {
+  const { stdout, stderr, exitCode } = await runRow("TY06", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function n(): Promise<unknown> { return 7; }\nasync function t(): Promise<number> { return 9; }\nconst x: any = id(n());\nnew Promise<number>((r) => { r(x); r(1); }).then((v) => console.log(`np ${v + 1}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\no1\no2\nnp 8\no3\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("TY07 TYPED: a boxed TYPED promise (gated module) adopted through both a typed return and a typed settler", async () => {
+  const { stdout, stderr, exitCode } = await runRow("TY07", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function n(): Promise<unknown> { return 7; }\nasync function t(): Promise<number> { return 9; }\nconst x: any = id(t());\nasync function g(): Promise<number> { return x; }\ng().then((v) => console.log(`g ${v + 1}`));\nnew Promise<number>((r) => r(x)).then((v) => console.log(`np ${v + 1}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\no1\no2\ng 10\nnp 10\no3\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("TY08 TYPED: a record-typed destination: the adopted record is cast by the composite walker", async () => {
+  const { stdout, stderr, exitCode } = await runRow("TY08", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function n(): Promise<unknown> { return 7; }\nasync function t(): Promise<number> { return 9; }\nasync function rec(): Promise<unknown> { return { a: 3, b: \"s\" }; }\nconst x: any = id(rec());\nasync function g(): Promise<{ a: number; b: string }> { return x; }\ng().then((v) => console.log(`g ${v.a} ${v.b}`));\nnew Promise<{ a: number; b: string }>((r) => r(x)).then((v) => console.log(`np ${v.a} ${v.b}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\no1\no2\ng 3 s\nnp 3 s\no3\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("TY09 TYPED: Promise.withResolvers' typed resolve adopts an any-held promise", async () => {
+  const { stdout, stderr, exitCode } = await runRow("TY09", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function n(): Promise<unknown> { return 7; }\nasync function t(): Promise<number> { return 9; }\nconst x: any = id(n());\nconst w = Promise.withResolvers<number>();\nw.resolve(x);\nw.promise.then((v) => console.log(`wr ${v + 1}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\no1\no2\nwr 8\no3\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("TY10 TYPED: control: a typed settler called with an any holding a number settles directly", async () => {
+  const { stdout, stderr, exitCode } = await runRow("TY10", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function n(): Promise<unknown> { return 7; }\nasync function t(): Promise<number> { return 9; }\nconst x: any = id(5);\nnew Promise<number>((r) => r(x)).then((v) => console.log(`np ${v + 1}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\nnp 6\no1\no2\no3\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("TY11 TYPED: a typed settler adopting an any-held rejected promise rejects with the reason", async () => {
+  const { stdout, stderr, exitCode } = await runRow("TY11", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function n(): Promise<unknown> { return 7; }\nasync function t(): Promise<number> { return 9; }\nasync function bad(): Promise<unknown> { throw new Error(\"boom\"); }\nconst x: any = id(bad());\nnew Promise<number>((r) => r(x)).then((v) => console.log(`np ${v}`)).catch((e: unknown) => console.log(`caught ${String(e)}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\no1\no2\no3\ncaught Error: boom\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("TY12 TYPED: a settler that escaped into a variable, resolved with its own promise: Node's chaining-cycle TypeError", async () => {
+  const { stdout, stderr, exitCode } = await runRow("TY12", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function n(): Promise<unknown> { return 7; }\nasync function t(): Promise<number> { return 9; }\nlet res: (v: number) => void = () => {};\nconst p = new Promise<number>((r) => { res = r; });\nconst x: any = id(p);\nres(x);\np.then((v) => console.log(`self ${v}`)).catch((e: unknown) => console.log(`caught ${String(e)}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\no1\ncaught TypeError: Chaining cycle detected for promise #<Promise>\no2\no3\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("TY13 TYPED: a PENDING any-held promise settled by a timer, adopted by a typed return", async () => {
+  const { stdout, stderr, exitCode } = await runRow("TY13", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function n(): Promise<unknown> { return 7; }\nasync function t(): Promise<number> { return 9; }\nfunction later(): Promise<unknown> { return new Promise<unknown>((r) => setTimeout(() => r(4), 0)); }\nconst x: any = id(later());\nasync function g(): Promise<number> { return x; }\ng().then((v) => console.log(`pending ${v}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\no1\no2\no3\no4\no5\npending 4\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("TY14 TYPED: control: a typed NON-settler closure called with an any-held promise keeps the boundary TypeError", async () => {
+  // SEMANTICS.md S009: an ordinary typed parameter validates a dyn value; only a promise's resolve function adopts.
+  // Node v24.18.1 prints "f [object Promise]\nsync\nnp 1\no1\no2\no3\no4\no5\n".
+  const { stdout, stderr, exitCode } = await runRow("TY14", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function n(): Promise<unknown> { return 7; }\nasync function t(): Promise<number> { return 9; }\nconst x: any = id(n());\nfunction f(v: number): void { console.log(`f ${v}`); }\ntry { f(x); } catch (e) { console.log(`caught ${String(e)}`); }\nnew Promise<number>((r) => r(1)).then((v) => console.log(`np ${v}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("caught TypeError: expected number, got object\nsync\nnp 1\no1\no2\no3\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("TY15 TYPED: a checked cast of an unknown-held promise returned from a typed async function adopts it before the cast (board #234)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("TY15", "async function n(): Promise<unknown> { return 7; }\nconst x: unknown = n();\nasync function g(): Promise<number> { return x as number; }\ng().then((v) => console.log(`g ${v + 1}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\no1\no2\ng 8\no3\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("TY16 TYPED: a typed settler resolved with a checked cast of an unknown-held promise adopts it", async () => {
+  const { stdout, stderr, exitCode } = await runRow("TY16", "async function n(): Promise<unknown> { return 7; }\nconst x: unknown = n();\nnew Promise<number>((r) => r(x as number)).then((v) => console.log(`np ${v + 1}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\no1\no2\nnp 8\no3\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("TY17 TYPED: the adopted value fails the checked cast: the dynCheck TypeError rejects at adoption", async () => {
+  // SEMANTICS.md S009: the checked cast validates; Node erases the cast and fulfils with 7.
+  // Node v24.18.1 prints "sync\no1\no2\ng 7\no3\no4\no5\n".
+  const { stdout, stderr, exitCode } = await runRow("TY17", "async function n(): Promise<unknown> { return 7; }\nconst x: unknown = n();\nasync function g(): Promise<string> { return x as string; }\ng().then((v) => console.log(`g ${v}`)).catch((e: unknown) => console.log(`caught ${String(e)}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\no1\no2\no3\ncaught TypeError: expected string at $, got number\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("TY18 TYPED: control: a checked cast of an unknown-held number returns directly, no job", async () => {
+  const { stdout, stderr, exitCode } = await runRow("TY18", "async function n(): Promise<unknown> { return 7; }\nconst x: unknown = n();\nconst y: unknown = 5;\nasync function g(): Promise<number> { return y as number; }\ng().then((v) => console.log(`g ${v + 1}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\ng 6\no1\no2\no3\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("TY19 TYPED: NOT-LIFTED: a typed then handler's `: number` return of an any-held promise keeps the boundary TypeError (the handler is an ordinary typed function)", async () => {
+  // SEMANTICS.md S083 (the #234 sentence): the cast is the handler's own return, inside an ordinary typed function, before any resolve function sees the value.
+  // Node v24.18.1 prints "sync\nthen-h 8\n".
+  const { stdout, stderr, exitCode } = await runRow("TY19", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function n(): Promise<unknown> { return 7; }\nconst x: any = id(n());\nPromise.resolve(1).then((): number => x).then((v) => console.log(`then-h ${v + 1}`)).catch((e: unknown) => console.log(`caught ${String(e)}`));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\ncaught TypeError: expected number, got object\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
 // ============================================================
