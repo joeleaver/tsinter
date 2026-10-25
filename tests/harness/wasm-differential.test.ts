@@ -8589,6 +8589,35 @@ describe("INC-29 U3 WHATWG URL rows", () => {
   }, 60000);
 });
 
+// ── URL base rows ─────────────────────────────────────────────────────────
+// `new URL(input, base)`, URL.parse and URL.canParse (url-whatwg.ts's
+// parseBase — ada 3.4.4's base states). No corpus program uses a base; the
+// web-platform-tests [input, base] pairs and the hand matrix are host-free
+// (packages/compiler/test/wasm-url-u3.test.ts URL-BASE-01..04), and this
+// row pins one whole program — relative paths and queries, the file base
+// arms with drive letters, the ada mailto: fall-through, same-scheme
+// special relatives, a URL-object base, an undefined base, bad bases, and
+// the statics. The expected output was measured against Node v24.18.1 on
+// the same source. The native lanes' answer is SEMANTICS.md S096
+// (packages/compiler/test/url-base-native.test.ts).
+describe("URL base rows", () => {
+  test("URL-BASE-W01 a program resolving against bases: full stdout, stderr and exit code equal Node's — SINGLE-EDIT: any parseBase state", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "url-base-row-"));
+    try {
+      const path = join(dir, "url-base.ts");
+      writeFileSync(path, "const t = (i: string, b: string): void => {\n  try {\n    const u = new URL(i, b);\n    console.log(JSON.stringify([i, b]), u.href, JSON.stringify(u.pathname), JSON.stringify(u.search));\n  } catch (e) {\n    console.log(JSON.stringify([i, b]), \"X\", e instanceof TypeError ? e.message : \"?\");\n  }\n};\nt(\"\", \"http://h/a?\"); t(\"\", \"http://h/a?q#f\"); t(\"#g\", \"http://h/a?\"); t(\"#f\", \"mailto:a?\"); t(\"#f\", \"mailto:a?q\"); t(\"x#f\", \"mailto:a\"); t(\"x\", \"mailto:a\"); t(\"\", \"mailto:a\");\nt(\"\", \"file:///a?\"); t(\"x\", \"file:///a?\"); t(\"?\", \"file:///a?q\"); t(\"//x\", \"file:///C:/a\"); t(\"/x\", \"file:///C:/a\"); t(\"/x\", \"file:///C:x/a\"); t(\"/x\", \"file:///C:\"); t(\"x\", \"file:///C:\"); t(\"..\", \"file:///C:\"); t(\"C:\", \"file:///D:/a/b\"); t(\"C|x\", \"file:///D:/a/b\");\nt(\"x\", \"foo:/..//a\"); t(\"\", \"foo:/..//a\"); t(\"?q\", \"foo:/..//a\"); t(\"..//b\", \"foo:/a/c\"); t(\"x\", \"sc://h\"); t(\"http:foo\", \"http://h/a/\"); t(\"https:foo\", \"http://h/a/\"); t(\"HTTP:foo\", \"http://h/a/\"); t(\"http:\", \"http://h/a?q#f\"); t(\"http:?z\", \"http://h/a?q#f\");\nt(\"x\", \"http://h/a b/c\"); t(\"x\", \"bad\"); t(\" \\t/x \", \"http://h/a\"); t(\"\\\\\\\\y\\\\z\", \"http://h/a\"); t(\"\\\\\\\\y\\\\z\", \"foo://h/a\"); t(\"//u@/x\", \"foo://h/a\");\nt(\"../x?y#z\", \"http://h/a/b/c\");\nconst b = new URL(\"http://u:p@h:81/a/b?q\");\nconsole.log(new URL(\"c\", b).href, new URL(\"http://x/\", undefined).href);\nconsole.log(URL.canParse(\"http://h/\"), URL.canParse(\"x\"), URL.canParse(\"x\", \"http://h/\"), URL.canParse(\"x\", \"bad\"));\nconst p = URL.parse(\"x\", \"http://h/a/\");\nconsole.log(p ? p.href : null, URL.parse(\"x\") === null, URL.parse(\"http://z/\")?.href);\n");
+      const res = await compile(path, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: false, backend: "wasm" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+      const r = await runWasm(res.binaryPath);
+      expect(r.stdout.toString("utf8")).toBe("[\"\",\"http://h/a?\"] http://h/a? \"/a\" \"\"\n[\"\",\"http://h/a?q#f\"] http://h/a?q \"/a\" \"?q\"\n[\"#g\",\"http://h/a?\"] http://h/a?#g \"/a\" \"\"\n[\"#f\",\"mailto:a?\"] mailto:a?#f \"a\" \"\"\n[\"#f\",\"mailto:a?q\"] mailto:a?q#f \"a\" \"?q\"\n[\"x#f\",\"mailto:a\"] mailto:a/x#f \"a/x\" \"\"\n[\"x\",\"mailto:a\"] X Invalid URL\n[\"\",\"mailto:a\"] X Invalid URL\n[\"\",\"file:///a?\"] file:///a? \"/a\" \"\"\n[\"x\",\"file:///a?\"] file:///x \"/x\" \"\"\n[\"?\",\"file:///a?q\"] file:///a? \"/a\" \"\"\n[\"//x\",\"file:///C:/a\"] file://x/ \"/\" \"\"\n[\"/x\",\"file:///C:/a\"] file:///C:/x \"/C:/x\" \"\"\n[\"/x\",\"file:///C:x/a\"] file:///C:x/x \"/C:x/x\" \"\"\n[\"/x\",\"file:///C:\"] file:///C:/x \"/C:/x\" \"\"\n[\"x\",\"file:///C:\"] file:///C:/x \"/C:/x\" \"\"\n[\"..\",\"file:///C:\"] file:///C:/ \"/C:/\" \"\"\n[\"C:\",\"file:///D:/a/b\"] c: \"\" \"\"\n[\"C|x\",\"file:///D:/a/b\"] file:///D:/a/C|x \"/D:/a/C|x\" \"\"\n[\"x\",\"foo:/..//a\"] foo:/.//x \"//x\" \"\"\n[\"\",\"foo:/..//a\"] foo:/.//a \"//a\" \"\"\n[\"?q\",\"foo:/..//a\"] foo:/.//a?q \"//a\" \"?q\"\n[\"..//b\",\"foo:/a/c\"] foo:/.//b \"//b\" \"\"\n[\"x\",\"sc://h\"] sc://h/x \"/x\" \"\"\n[\"http:foo\",\"http://h/a/\"] http://h/a/foo \"/a/foo\" \"\"\n[\"https:foo\",\"http://h/a/\"] https://foo/ \"/\" \"\"\n[\"HTTP:foo\",\"http://h/a/\"] http://h/a/foo \"/a/foo\" \"\"\n[\"http:\",\"http://h/a?q#f\"] http://h/a?q \"/a\" \"?q\"\n[\"http:?z\",\"http://h/a?q#f\"] http://h/a?z \"/a\" \"?z\"\n[\"x\",\"http://h/a b/c\"] http://h/a%20b/x \"/a%20b/x\" \"\"\n[\"x\",\"bad\"] X Invalid URL\n[\" \\t/x \",\"http://h/a\"] http://h/x \"/x\" \"\"\n[\"\\\\\\\\y\\\\z\",\"http://h/a\"] http://y/z \"/z\" \"\"\n[\"\\\\\\\\y\\\\z\",\"foo://h/a\"] foo://h/\\\\y\\z \"/\\\\\\\\y\\\\z\" \"\"\n[\"//u@/x\",\"foo://h/a\"] X Invalid URL\n[\"../x?y#z\",\"http://h/a/b/c\"] http://h/a/x?y#z \"/a/x\" \"?y\"\nhttp://u:p@h:81/a/c http://x/\ntrue false true false\nhttp://h/a/x true http://z/\n");
+      expect(r.stderr.toString("utf8")).toBe("");
+      expect(r.exitCode).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+});
+
 /* ── INC-29 U4 — node:tls, node:https and node:dgram (tls.ts, tls-x509.ts,
  * dgram.ts; abi.ts tlsCall and netCall's UDP ops). The TLS engine is the
  * harness host's own Node (a TLSSocket over the host's net socket); the

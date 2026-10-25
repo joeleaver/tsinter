@@ -2,7 +2,7 @@
  * expression lands in a fresh C temp, with RC ownership tracked on the
  * emitter's frames (see the discipline comment in emitter core). */
 import type { CEmitter, Temp } from "./emitter.js";
-import { arrayOf, BOOL, BYTES_U8, bytesOf, canMarshalFuncIntoIsland, CHILDSTREAM_T, DYN, F64, IrExpr, IrRecordShape, IrType, islandPromisePayloadTag, isRefCounted, isUnitType, MAY_THROW_LIB_FNS, RUNTIME_ERROR_CLASSES, STRING, typeEquals } from "../../ir/nodes.js";
+import { arrayOf, BOOL, BYTES_U8, bytesOf, canMarshalFuncIntoIsland, CHILDSTREAM_T, DYN, F64, IrExpr, IrRecordShape, IrType, islandPromisePayloadTag, isRefCounted, isUnitType, MAY_THROW_LIB_FNS, RUNTIME_ERROR_CLASSES, STRING, typeEquals, URL_T } from "../../ir/nodes.js";
 import { boxAccess, BYTES_NUM_KIND_C, BYTES_NUM_VAR_C, bytesElemKindC, cDecl, cFnPtrCast, cNumberLiteral, cStringLiteral, cType, DV_GET_KIND_C, DV_SET_KIND_C, elemAccess, mapKeyAccess, mapKeyKindC, mapValKindC, retainCallC, vAdapters } from "./emit-types.js";
 import { mangleClassNew, mangleClassRetain, mangleClassStruct, mangleField, mangleFnClosure, mangleFunction, mangleGlobal, mangleLocal, mangleRecordNew, mangleRecordStruct, mangleVtStruct } from "../mangle.js";
 import { OVERFLOW_MEMBER } from "./emit-shapes.js";
@@ -2841,6 +2841,36 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           }
           case "url.new":
             return finish(`scr_url_new(${arg(0)})`);
+          // A base is checked, then a named Error; the statics are a named
+          // Error outright (SEMANTICS.md S096).
+          case "url.newBase":
+            return finish(`scr_url_new_base(${arg(0)}, ${arg(1)})`);
+          case "url.canParse":
+            return finish(`scr_url_can_parse(${arg(0)})`);
+          case "url.canParseBase":
+            return finish(`scr_url_can_parse_base(${arg(0)}, ${arg(1)})`);
+          case "url.parse":
+          case "url.parseBase": {
+            // `URL | null` — the sp.get pattern: the runtime answers a +1
+            // URL or NULL (on this lane it throws S096's named Error).
+            if (e.type.kind !== "union") {
+              throw new Error(`emitter bug: ${e.fn} result is not a union`);
+            }
+            const def = E.unionsById.get(e.type.unionId);
+            const urlTag = def ? def.arms.findIndex((a) => a.kind === "url") : -1;
+            const nullTag = def ? def.arms.findIndex((a) => a.kind === "nullT") : -1;
+            if (urlTag < 0 || nullTag < 0) {
+              throw new Error(`emitter bug: ${e.fn} union lacks its arms`);
+            }
+            const call = e.fn === "url.parse" ? `scr_url_parse(${arg(0)})` : `scr_url_parse_base(${arg(0)}, ${arg(1)})`;
+            const raw = E.newTemp(URL_T, call);
+            E.moveTemp(raw); // ownership passes into the union arm below
+            const present = `scr_union_new_ref(${urlTag}, ${raw.name}, &scr_url_retain_v, &scr_url_release_v, NULL)`;
+            const absent = E.unitInstanceRef(e.type.unionId, nullTag);
+            const out = E.newTemp(e.type, `${raw.name} != NULL ? ${present} : ${absent}`);
+            if (MAY_THROW_LIB_FNS.has(e.fn)) E.emitPendingCheck();
+            return out;
+          }
           case "url.protocol":
             return finish(`scr_url_protocol(${arg(0)})`);
           case "url.host":

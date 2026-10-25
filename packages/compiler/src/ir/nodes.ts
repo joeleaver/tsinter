@@ -2015,6 +2015,20 @@ export type IrLibFn =
    * encoded slashes, and non-empty hosts. url.pathToFileURL resolves the
    * path (getcwd) and never throws. */
   | "url.new"
+  /** `new URL(input, base)` with a defined base — both borrowed strings
+   * (a URL base arrives as its href). Node parses the base first: either
+   * failing THROWS the catchable "Invalid URL" TypeError. The wasm tier
+   * resolves; the native lanes check the base, then THROW a named
+   * catchable Error (SEMANTICS.md S096). url.parse / url.parseBase are
+   * `URL.parse(input, base?)`: the interned `URL | null` union, null on
+   * failure. url.canParse / url.canParseBase are `URL.canParse`: a bool.
+   * The statics never throw on wasm; the native lanes throw S096's named
+   * Error for every one of them, so all five seed may-throw. */
+  | "url.newBase"
+  | "url.parse"
+  | "url.parseBase"
+  | "url.canParse"
+  | "url.canParseBase"
   | "url.protocol"
   | "url.host"
   | "url.hostname"
@@ -7049,6 +7063,11 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "fs.readdirSync",
   "fs.readdirTypesSync",
   "url.new",
+  "url.newBase",
+  "url.parse",
+  "url.parseBase",
+  "url.canParse",
+  "url.canParseBase",
   "url.fileURLToPathUrl",
   "url.fileURLToPathStr",
   // The win32-target flavor of pathToFileURL (same runtime entry point —

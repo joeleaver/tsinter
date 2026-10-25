@@ -403,6 +403,12 @@ const LIB_FN_SYMS: Record<string, string> = {
   // constructions +1; url.new, the fileURLToPath pair, the win32
   // pathToFileURL flavor, and sp.fromPairs throw catchably (may-throw).
   "url.new": "scr_url_new",
+  // A base, and the statics: named Errors on these lanes (SEMANTICS.md
+  // S096); url.parse / url.parseBase build their `URL | null` union in
+  // emitLibCall.
+  "url.newBase": "scr_url_new_base",
+  "url.canParse": "scr_url_can_parse",
+  "url.canParseBase": "scr_url_can_parse_base",
   "url.protocol": "scr_url_protocol",
   "url.host": "scr_url_host",
   "url.hostname": "scr_url_hostname",
@@ -10627,6 +10633,27 @@ class LlEmitter {
       this.declare(`declare void @${sym}(double)`);
       B.line(`call void @${sym}(double ${h.name})`);
       return { name: h.name, type: e.type };
+    }
+    if (e.fn === "url.parse" || e.fn === "url.parseBase") {
+      // `URL | null` — the sp.get pattern: the runtime answers a +1 URL or
+      // NULL (on these lanes it throws S096's named Error).
+      if (e.type.kind !== "union") throw new Error(`llvm emitter bug: ${e.fn} result is not a union`);
+      const def = this.unionsById.get(e.type.unionId);
+      const urlTag = def ? def.arms.findIndex((a) => a.kind === "url") : -1;
+      const nullTag = def ? def.arms.findIndex((a) => a.kind === "nullT") : -1;
+      if (urlTag < 0 || nullTag < 0) throw new Error(`llvm emitter bug: ${e.fn} union lacks its arms`);
+      const args = e.args.map((a) => this.emitExpr(a));
+      const raw = B.tmp();
+      if (e.fn === "url.parse") {
+        this.declare(`declare ptr @scr_url_parse(ptr)`);
+        B.line(`${raw} = call ptr @scr_url_parse(ptr ${args[0]!.name})`);
+      } else {
+        this.declare(`declare ptr @scr_url_parse_base(ptr, ptr)`);
+        B.line(`${raw} = call ptr @scr_url_parse_base(ptr ${args[0]!.name}, ptr ${args[1]!.name})`);
+      }
+      const out = this.wrapNullable(raw, raw, { kind: "url" }, urlTag, e.type, nullTag);
+      if (MAY_THROW_LIB_FNS.has(e.fn)) this.emitPendingCheck();
+      return out;
     }
     if (e.fn === "sp.get") {
       // `string | null` — the sym.desc pattern with a null arm: the

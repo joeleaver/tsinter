@@ -27,6 +27,7 @@ const WPT = JSON.parse(readFileSync(join(import.meta.dirname, "fixtures/wpt-url-
   urls: string[];
   toascii: string[];
   idna: string[];
+  bases: [string, string][];
 };
 
 let seq = 0;
@@ -149,6 +150,139 @@ describe("INC-29 U3 WHATWG URL — parse matrices against Node", () => {
     const inputs = hosts.flatMap((h) => [`https://${h}/p`, `foo://${h}/p`]);
     await parseRow(inputs);
   }, 300000);
+});
+
+/* ── a base: new URL(input, base), URL.parse, URL.canParse ────────────── */
+
+const BASE_DRIVER = `
+for (const [s, b] of PAIRS) {
+  let line: string;
+  try {
+    const u = new URL(s, b);
+    line = JSON.stringify([u.href, u.protocol, u.host, u.hostname, u.pathname, u.search, u.searchParams.toString()]);
+  } catch (e) {
+    line = e instanceof TypeError ? "X " + e.message : "not a TypeError";
+  }
+  const p = URL.parse(s, b);
+  console.log(line + " | " + String(URL.canParse(s, b)) + " " + (p === null ? "null" : p.href));
+}
+`;
+function baseLine([s, b]: readonly [string, string]): string {
+  let line: string;
+  try {
+    const u = new URL(s, b);
+    line = JSON.stringify([u.href, u.protocol, u.host, u.hostname, u.pathname, u.search, u.searchParams.toString()]);
+  } catch (e) {
+    line = e instanceof TypeError ? "X " + e.message : "not a TypeError";
+  }
+  const p = URL.parse(s, b);
+  return line + " | " + String(URL.canParse(s, b)) + " " + (p === null ? "null" : p.href);
+}
+async function baseRow(pairs: readonly (readonly [string, string])[]): Promise<void> {
+  const got = await run(`const PAIRS: [string, string][] = ${JSON.stringify(pairs)};\n${BASE_DRIVER}`);
+  same(pairs.map((p) => JSON.stringify(p)), got, pairs.map(baseLine));
+}
+
+/** The hand-written base matrix: every input against every base. */
+const BASE_INPUTS: string[] = [
+  "", " ", "?", "?q", "#", "#f", "?#", "?q#f", "x", "x#f", "x?q", "./x", "../x", "../../../../x", "..", ".", "./", "../", "%2e%2E/x", "a/./b/../c",
+  "/", "/x", "/x/../..", "\\x", "\\y\\z", "//", "//h2/p", "///p", "//u:p@h2:99/p", "//[::1]/", "//ñ/x", "/\\x", "\\/x", "\\x\\y",
+  "C:", "C:/x", "C|/x", "/C:/x", "//C:/x", "C:x", "c:\\x", "/C|x",
+  "http:x", "http:/x", "http://x", "https:x", "ws:x", "file:x", "file:/x", "file://x/y", "FILE:..", "foo:x", "foo:/x", "foo://x", "mailto:x", "sc:x",
+  "x y", "é", "\ud800", "\tx\n", "javascript:alert(1)",
+];
+const BASE_BASES: string[] = [
+  "http://h/a/b?q#f", "http://h", "https://u:p@h:8443/a/b/", "http://h/a?", "http://[::1]:81/p", "http://ñ.test/a/", "ws://h/", "ftp://h/a",
+  "file:///a/b", "file:///C:/a/b", "file:///C:", "file:///c|/a", "file://srv/share/x", "file:///", "file:",
+  "foo://h/a/b", "foo:/a/b", "foo:///a", "foo:/..//a", "foo://h", "foo:", "mailto:a@b", "mailto:a?q", "data:,x", "sc://ñ/x", "javascript:x", "a:b/c",
+  "bad", "", "//h/", "http://[::1", "http://h:99999/",
+];
+const BASE_MATRIX: [string, string][] = BASE_BASES.flatMap((b) => BASE_INPUTS.map((i): [string, string] => [i, b]));
+
+describe("URL base — new URL(input, base), URL.parse, URL.canParse against Node", () => {
+  test("URL-BASE-01 every distinct web-platform-tests urltestdata.json [input, base] pair: href and the getters (or the TypeError), URL.canParse and URL.parse's href or null — SINGLE-EDIT: any base state (NO_SCHEME, SPECIAL_RELATIVE_OR_AUTHORITY, RELATIVE_SCHEME, RELATIVE_SLASH, the FILE / FILE_SLASH base arms)", async () => {
+    await baseRow(WPT.bases);
+  }, 300000);
+  test("URL-BASE-02 the hand-written matrix — every input (empty, query, fragment, dot segments, slashes and backslashes, drive letters, same- and other-scheme relatives, non-ASCII) against every base (special, file with and without drive letters, non-special with and without host, opaque including the ada mailto: fall-through, an empty query, invalid) — SINGLE-EDIT: RELATIVE_SCHEME's query copy, shorten_path in the FILE base arm, or NO_SCHEME's opaque-base test", async () => {
+    await baseRow(BASE_MATRIX);
+  }, 600000);
+  test("URL-BASE-03 the argument routes on the static tier: a URL-object base (its href), the literal undefined and an undefined-typed variable (the base-less parse), a string base after a throwing input — and URL.parse / URL.canParse with no base — SINGLE-EDIT: lowerUrlBaseArgs' URL route skipping url.href", async () => {
+    const src = `const b = new URL("http://u:p@h:81/a/b?q#f");
+const none: undefined = undefined;
+const out: string[] = [];
+out.push(new URL("c", b).href, new URL("?z", b).href, new URL("", b).href);
+out.push(new URL("http://x/y", undefined).href, new URL("http://x/z", none).href);
+try { new URL("x", undefined); out.push("no throw"); } catch (e) { out.push(e instanceof TypeError ? e.message : "?"); }
+try { new URL("x", "nope"); out.push("no throw"); } catch (e) { out.push(e instanceof TypeError ? e.message : "?"); }
+out.push(String(URL.canParse("http://h/")), String(URL.canParse("x")), String(URL.canParse("x", undefined)), String(URL.canParse("x", b)));
+const p1 = URL.parse("http://h/p?q"); const p2 = URL.parse("x"); const p3 = URL.parse("../y", b);
+out.push(p1 === null ? "null" : p1.href, p2 === null ? "null" : p2.href, p3 === null ? "null" : p3.href + " " + p3.pathname);
+console.log(JSON.stringify(out));
+`;
+    const b = new URL("http://u:p@h:81/a/b?q#f");
+    const out: string[] = [];
+    out.push(new URL("c", b).href, new URL("?z", b).href, new URL("", b).href);
+    out.push(new URL("http://x/y", undefined).href, new URL("http://x/z", undefined).href);
+    try { new URL("x", undefined); out.push("no throw"); } catch (e) { out.push(e instanceof TypeError ? e.message : "?"); }
+    try { new URL("x", "nope"); out.push("no throw"); } catch (e) { out.push(e instanceof TypeError ? e.message : "?"); }
+    out.push(String(URL.canParse("http://h/")), String(URL.canParse("x")), String(URL.canParse("x", undefined)), String(URL.canParse("x", b)));
+    const p1 = URL.parse("http://h/p?q"); const p2 = URL.parse("x"); const p3 = URL.parse("../y", b);
+    out.push(p1 === null ? "null" : p1.href, p2 === null ? "null" : p2.href, p3 === null ? "null" : p3.href + " " + p3.pathname);
+    expect(await run(src)).toEqual([JSON.stringify(out)]);
+  }, 120000);
+  test("URL-BASE-05 an optional base (`b?: string`, `b?: URL`): undefined chooses the base-less parse, a string or URL resolves, for new URL, URL.parse and URL.canParse — SINGLE-EDIT: the union arm of lowerUrlBaseArgs' run-time undefined test", async () => {
+    const src = `function f(b?: string): string { return new URL("x", b).href; }
+function g(b?: URL): string { return new URL("http://abs/y", b).href + " " + new URL("z", b ?? new URL("http://d/")).href; }
+function h(i: string, b?: string): string { const p = URL.parse(i, b); return String(URL.canParse(i, b)) + " " + (p === null ? "null" : p.href); }
+const show = (fn: () => string): void => { try { console.log("ret " + fn()); } catch (e) { console.log(e instanceof TypeError ? "TypeError " + e.message : "?"); } };
+show(() => f("http://h/a/b")); show(() => f(undefined)); show(() => f()); show(() => f("bad"));
+show(() => g(new URL("http://u/p/q"))); show(() => g());
+show(() => h("x", "http://h/")); show(() => h("x")); show(() => h("http://q/")); show(() => h("http://q/", "bad"));
+`;
+    const f = (b?: string): string => new URL("x", b).href;
+    const g = (b?: URL): string => new URL("http://abs/y", b).href + " " + new URL("z", b ?? new URL("http://d/")).href;
+    const h = (i: string, b?: string): string => { const p = URL.parse(i, b); return String(URL.canParse(i, b)) + " " + (p === null ? "null" : p.href); };
+    const want: string[] = [];
+    const show = (fn: () => string): void => { try { want.push("ret " + fn()); } catch (e) { want.push(e instanceof TypeError ? "TypeError " + e.message : "?"); } };
+    show(() => f("http://h/a/b")); show(() => f(undefined)); show(() => f()); show(() => f("bad"));
+    show(() => g(new URL("http://u/p/q"))); show(() => g());
+    show(() => h("x", "http://h/")); show(() => h("x")); show(() => h("http://q/")); show(() => h("http://q/", "bad"));
+    expect(await run(src)).toEqual(want);
+  }, 120000);
+  test("URL-BASE-04 a dynamic base (.cjs): undefined chooses the base-less parse, anything else converts as `${base}` does — null and 5 are Invalid URL bases, an object's own toString is called (its throw propagates), an own valueOf answers when toString is not callable — for new URL, URL.parse and URL.canParse — SINGLE-EDIT: the run-time undefined test in lowerUrlBaseArgs, or the dyn base converted by String() instead of dyn.toStringCoerce", async () => {
+    const src = `'use strict';
+const show = (f) => { try { console.log('ret ' + String(f())); } catch (e) { console.log(e.name + '|' + e.message); } };
+const bases = JSON.parse('["http://h/a/b", null, 5, "bad", "file:///C:/x"]');
+const rel = JSON.parse('"../c?d#e"');
+let b0 = bases[0]; let bu; let bn = bases[1]; let b5 = bases[2]; let bb = bases[3]; let bf = bases[4];
+show(() => new URL(rel, b0).href);
+show(() => new URL('x', bu).href);
+show(() => new URL('http://q/', bu).href);
+show(() => new URL(rel, bn).href);
+show(() => new URL('x', b5).href);
+show(() => new URL('x', bb).href);
+show(() => new URL('/y', bf).href);
+show(() => URL.canParse(rel, b0));
+show(() => URL.canParse(rel, bu));
+show(() => URL.canParse('http://q/', bu));
+show(() => URL.canParse('x', bn));
+show(() => { const p = URL.parse(rel, b0); return p === null ? 'null' : p.href; });
+show(() => { const p = URL.parse('x', bb); return p === null ? 'null' : p.href; });
+show(() => { const p = URL.parse('http://q/', bu); return p === null ? 'null' : p.href; });
+let ob = JSON.parse('{}'); ob.toString = function () { console.log('ts called'); return 'http://h/a/'; };
+let ot = JSON.parse('{}'); ot.toString = function () { throw new RangeError('boom'); };
+let ov = JSON.parse('{}'); ov.valueOf = function () { return 'http://v/'; }; ov.toString = undefined;
+show(() => new URL('x', ob).href);
+show(() => new URL('x', ot).href);
+show(() => new URL('x', ov).href);
+show(() => URL.canParse('x', ob));
+`;
+    expect(await run(src, "cjs")).toEqual([
+      "ret http://h/c?d#e", "TypeError|Invalid URL", "ret http://q/", "TypeError|Invalid URL", "TypeError|Invalid URL", "TypeError|Invalid URL",
+      "ret file:///C:/y", "ret true", "ret false", "ret true", "ret false", "ret http://h/c?d#e", "ret null", "ret http://q/",
+      "ts called", "ret http://h/a/x", "RangeError|boom", "ret http://v/x", "ts called", "ret true",
+    ]);
+  }, 120000);
 });
 
 /* ── URLSearchParams ─────────────────────────────────────────────────── */

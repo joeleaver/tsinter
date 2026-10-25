@@ -26,7 +26,7 @@ import {
   fenceOrDropOptionKey,
   isChildSurfaceMember,
 } from "./surfaces.js";
-import { conditionalSpreadOf, lowerDynObjectLiteral } from "./lower-exprs.js";
+import { conditionalSpreadOf, ensureString, lowerDynObjectLiteral } from "./lower-exprs.js";
 import { HTTP2_CONSTANTS } from "./http2-constants.js";
 import { CRYPTO_CIPHERS, CRYPTO_CONSTANTS, CRYPTO_CURVES, CRYPTO_HASHES } from "./crypto-tables.js";
 import { timerStyleCallback } from "./lower-calls.js";
@@ -3811,6 +3811,107 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
       call,
       "protocol, pathname, href, and toString() are the supported URL members",
       L.checker.getSymbolAtLocation(access.name),
+    );
+  }
+
+/** The `(input, base?)` argument pair of `new URL`, `URL.parse` and
+   * `URL.canParse`. Node converts the input with `${input}`, then — only
+   * when `base !== undefined` — the base with `${base}`, and parses the
+   * base first. The input takes the one-argument constructor's string
+   * route. The base routes: omitted, the literal `undefined` or an
+   * undefined-typed variable -> the base-less op; a string -> the base
+   * op; a URL -> its href (what `${base}` answers); a base read from a
+   * variable that may be undefined at run time — a `string | undefined`
+   * or `URL | undefined` union, or a dynamic (dyn or jsval) value -> a
+   * run-time undefined test choosing between the two, the base then
+   * converted: a dyn with URLSearchParams' ToPrimitive converter
+   * (SEMANTICS.md S089 (b)), a jsval by the engine. Any other base type,
+   * such a base that is not a plain variable read (or whose input is not
+   * a side-effect-free read), and a third argument are fenced by name. */
+  export function lowerUrlBaseArgs(
+    L: Lowerer,
+    what: string,
+    call: ts.CallExpression | ts.NewExpression,
+    noBase: (input: IrExpr) => IrExpr,
+    withBase: (input: IrExpr, base: IrExpr) => IrExpr,
+  ): IrExpr {
+    const args = call.arguments ?? [];
+    const loc = locOf(call);
+    if (args.length === 0 || args.length > 2) {
+      L.noLowering(
+        `${what} with ${args.length} argument${args.length === 1 ? "" : "s"}`,
+        call,
+        "an input string and an optional base are the lowered form",
+      );
+    }
+    const input = L.lowerExprExpecting(args[0]!, STRING);
+    const baseNode = args[1];
+    if (!baseNode) return noBase(input);
+    const baseT = L.mapTypeOf(L.typeOf(baseNode));
+    if (baseT?.kind === "string") return withBase(input, L.lowerExpr(baseNode));
+    if (baseT?.kind === "url") {
+      return withBase(input, { kind: "libCall", fn: "url.href", args: [L.lowerExpr(baseNode)], type: STRING, loc });
+    }
+    const read = L.lowerExpr(baseNode);
+    // Statically undefined (the literal, or a variable whose type is
+    // `undefined`): the base-less op, the read itself unobservable.
+    if ((L.typeOf(baseNode).flags & ts.TypeFlags.Undefined) !== 0 && (read.kind === "unitLit" || read.kind === "varRef")) {
+      return noBase(input);
+    }
+    // A base that may be undefined at run time: test it, then convert.
+    let isUndef: IrExpr | null = null;
+    let conv: IrExpr | null = null;
+    if (read.type.kind === "dyn") {
+      // `${base}` over the checked-dynamic tree: ToPrimitive (string hint)
+      // with an own toString / valueOf called — URLSearchParams' converter
+      // (SEMANTICS.md S089 (b): the kinds it does not model throw by name).
+      isUndef = { kind: "dynTest", test: "undefined", value: read, type: BOOL, loc };
+      conv = { kind: "libCall", fn: "dyn.toStringCoerce", args: [structuredClone(read)], type: STRING, loc };
+    } else if (read.type.kind === "jsval") {
+      // The engine's own `=== undefined` (the default-parameter prologue's
+      // test) and its own string conversion.
+      isUndef = { kind: "jsOp", op: "eq", args: [read, { kind: "jsOp", op: "undefLit", args: [], type: JSVAL, loc }], type: BOOL, loc };
+      conv = ensureString(L, structuredClone(read), baseNode);
+    } else if (read.type.kind === "union") {
+      // `string | undefined` / `URL | undefined` (an optional parameter).
+      const def = L.unions.get(read.type.unionId);
+      const uTag = L.armTag(read.type.unionId, UNDEFINED_T);
+      const sTag = L.armTag(read.type.unionId, STRING);
+      const urlTag = L.armTag(read.type.unionId, { kind: "url" });
+      const vTag = sTag >= 0 ? sTag : urlTag;
+      if (def && def.arms.length === 2 && uTag >= 0 && vTag >= 0) {
+        isUndef = { kind: "unionIsTag", unionId: read.type.unionId, tag: uTag, negated: false, value: read, type: BOOL, loc };
+        const narrow: IrExpr = { kind: "unionNarrow", unionId: read.type.unionId, tag: vTag, value: structuredClone(read), type: sTag >= 0 ? STRING : { kind: "url" }, loc };
+        conv = sTag >= 0 ? narrow : { kind: "libCall", fn: "url.href", args: [narrow], type: STRING, loc };
+      }
+    }
+    if (isUndef !== null && conv !== null) {
+      // The input is lowered once and appears in both arms, so it must be
+      // a read (re-evaluating it is unobservable); the base is tested and
+      // then converted, so it must be a plain variable read too.
+      const pureKinds = new Set(["strLit", "varRef", "dynCheck", "dynKeyGet", "jsExit"]);
+      const pure = (x: unknown): boolean => {
+        if (Array.isArray(x)) return x.every(pure);
+        if (x === null || typeof x !== "object") return true;
+        const o = x as Record<string, unknown>;
+        if (typeof o.kind === "string" && "type" in o && !pureKinds.has(o.kind)) return false;
+        return Object.entries(o).every(([k, v]) => k === "type" || k === "loc" || pure(v));
+      };
+      if (read.kind !== "varRef" || !pure(input)) {
+        L.noLowering(
+          `${what} with a base that may be undefined and is not a variable read`,
+          baseNode,
+          "bind the input and the base to variables first (the base is tested for undefined, then converted)",
+        );
+      }
+      const absent = noBase(input);
+      const present = withBase(structuredClone(input), conv);
+      return { kind: "ternary", cond: isUndef, then: absent, else_: present, type: absent.type, loc };
+    }
+    L.noLowering(
+      `${what} with a '${L.checker.typeToString(L.typeOf(baseNode))}' base`,
+      baseNode,
+      "a string or URL base is the lowered form (narrow a union to one of them first)",
     );
   }
 

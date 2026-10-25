@@ -920,3 +920,70 @@ ScrStr *scr_url_search(ScrUrl *u) {
   if (u->query->len <= 1) return scr_str_new("", 0);
   return scr_str_retain(u->query);
 }
+
+/* ── a base: new URL(input, base), URL.parse, URL.canParse ────────────
+ * This lane does not resolve against a base (SEMANTICS.md S096). The
+ * base is parsed first, as Node does: a base this parser rejects is
+ * Node's "Invalid URL" — unless it holds a byte outside this parser's
+ * subset (non-ASCII, '%', '[' or ']': IDNA, percent-escaped and IPv6
+ * hosts), where the rejection says nothing about Node's answer and the
+ * named Error below is thrown instead; a parseable base throws it too.
+ * URL.parse and URL.canParse always throw their own named Error: this
+ * parser accepts some inputs Node rejects and rejects some Node accepts,
+ * so a null / false answer from it could be silently wrong. */
+static const char URL_BASE_GAP[] = "resolving a URL against a base is not supported on this lane yet";
+static const char URL_STATICS_GAP[] = "URL.parse and URL.canParse are not supported on this lane yet";
+
+static bool scr_url_out_of_subset(ScrStr *s) {
+  for (size_t i = 0; i < s->len; i++) {
+    unsigned char c = (unsigned char)s->data[i];
+    if (c >= 0x80 || c == '%' || c == '[' || c == ']') return true;
+  }
+  return false;
+}
+
+ScrUrl *scr_url_new_base(ScrStr *input, ScrStr *base) {
+  (void)input;
+  ScrUrl *b = scr_url_new(base);
+  if (!b) {
+    /* Invalid URL is pending; an out-of-subset base trades it for the gap. */
+    if (scr_url_out_of_subset(base)) {
+      scr_exc_clear();
+      scr_throw_error_msg(SCR_ERR_ERROR, URL_BASE_GAP, sizeof URL_BASE_GAP - 1);
+    }
+    return NULL;
+  }
+  scr_url_release(b);
+  scr_throw_error_msg(SCR_ERR_ERROR, URL_BASE_GAP, sizeof URL_BASE_GAP - 1);
+  return NULL;
+}
+
+static void scr_url_throw_statics_gap(void) {
+  scr_throw_error_msg(SCR_ERR_ERROR, URL_STATICS_GAP, sizeof URL_STATICS_GAP - 1);
+}
+
+ScrUrl *scr_url_parse(ScrStr *input) {
+  (void)input;
+  scr_url_throw_statics_gap();
+  return NULL;
+}
+
+bool scr_url_can_parse(ScrStr *input) {
+  (void)input;
+  scr_url_throw_statics_gap();
+  return false;
+}
+
+ScrUrl *scr_url_parse_base(ScrStr *input, ScrStr *base) {
+  (void)input;
+  (void)base;
+  scr_url_throw_statics_gap();
+  return NULL;
+}
+
+bool scr_url_can_parse_base(ScrStr *input, ScrStr *base) {
+  (void)input;
+  (void)base;
+  scr_url_throw_statics_gap();
+  return false;
+}

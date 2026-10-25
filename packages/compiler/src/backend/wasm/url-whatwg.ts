@@ -11,9 +11,12 @@
  * an observable byte (parse_host, parse_ipv4/ipv6, parse_port, the
  * percent-encode sets, parse_prepared_path's general case, which its
  * trivial and fast paths only shortcut), and the getters below answer what
- * lib/internal/url.js slices out of the aggregator's href. ada's base-URL
- * branches are not built: the frontend fences `new URL(input, base)`, so
- * every parse here is base-less (a scheme-less input fails, as in Node).
+ * lib/internal/url.js slices out of the aggregator's href. One builder
+ * makes two parsers: `parse` (no base — a scheme-less input fails, as in
+ * Node) and `parseBase` (a non-null, already-parsed base: ada's NO_SCHEME,
+ * SPECIAL_RELATIVE_OR_AUTHORITY, RELATIVE_SCHEME and RELATIVE_SLASH states
+ * and the FILE / FILE_SLASH base arms), so the base-less function's bytes
+ * are what they were before the base existed.
  *
  * Every component the parser produces is ASCII (non-ASCII bytes are
  * percent-encoded or IDNA-encoded), so components are built as bytes and
@@ -79,7 +82,7 @@ const SP_URL = 2;
 const OB_A = 0;
 const OB_N = 1;
 
-/* parser states (ada::state, the base-less subset) */
+/* parser states (ada::state) */
 const ST_FILE = 1;
 const ST_FILE_SLASH = 2;
 const ST_FILE_HOST = 3;
@@ -93,6 +96,11 @@ const ST_PATH_START = 10;
 const ST_PATH = 11;
 const ST_OPAQUE = 12;
 const ST_QUERY = 13;
+/* the states only a base reaches */
+const ST_NO_SCHEME = 14;
+const ST_SROA = 15; // SPECIAL_RELATIVE_OR_AUTHORITY
+const ST_REL = 16; // RELATIVE_SCHEME
+const ST_REL_SLASH = 17; // RELATIVE_SLASH
 
 export interface UrlEngineDeps {
   strRef: () => ValType;
@@ -1236,7 +1244,31 @@ export class UrlEngine {
   /** ada::parser::parse_url_impl over UTF-8 input (no base): the URL, or
    * null. */
   parseFn(): number {
-    return this.fn("parse", [this.bRef], [this.urlRef()], (f, $) => {
+    return this.fn("parse", [this.bRef], [this.urlRef()], (f, $) => this.parseBody(f, $, false));
+  }
+
+  /** parse_url_impl against a non-null base URL (already parsed — Node
+   * parses the base first and throws on it before the input is read). */
+  parseBaseFn(): number {
+    return this.fn("parseBase", [this.bRef, this.urlRef()], [this.urlRef()], (f, $) => this.parseBody(f, $, true));
+  }
+
+  /** ob holding an ASCII string's bytes (a base component cloned into the
+   * buffer the parser goes on appending to). */
+  obFromStrFn(): number {
+    return this.fn("obFromStr", [this.sRef], [this.obRef], (f, $) => {
+      const O = f.local(this.obRef);
+      $.put(O, this.obNew($));
+      $.run(this.obAppendStrFn(), $.l(O), $.l(0));
+      $.do($.l(O));
+    });
+  }
+
+  /** The parser body; `withBase` adds param 1 (the base $url) and the
+   * states only a base reaches. With `withBase` false the emitted code is
+   * the base-less parser exactly. */
+  private parseBody(f: Fn, $: A, withBase: boolean): void {
+    {
       const IN0 = 0;
       const IN = f.local(this.bRef);
       const S0 = f.local(I32);
@@ -1266,6 +1298,13 @@ export class UrlEngine {
       const DP = f.local(I32);
       const O = f.local(this.obRef);
       const HS = f.local(this.sRef);
+      // base-only locals (declared after every base-less one)
+      const BASE = 1;
+      const BK = withBase ? f.local(I32) : -1;
+      const BI = withBase ? f.local(I32) : -1;
+      const BP = withBase ? f.local(this.sRef) : -1;
+      const bg = (i: number): X => $.get(this.urlType(), i, $.l(BASE));
+      const obFrom = (s: X): X => $.call(this.obFromStrFn(), s);
       const at = (i: X): X => this.u8($, $.l(IN), i);
       const fail = (): void => $.ret($.nul(this.urlType()));
       const is = (s: number): X => $.eq($.l(ST), $.i(s));
@@ -1291,27 +1330,128 @@ export class UrlEngine {
       });
       // SCHEME_START / SCHEME (NO_SCHEME with no base is failure)
       $.put(P, $.l(S0));
-      $.if($.not($.andThen(notEof(), this.isAlpha($, at($.l(P))))), fail);
-      inc();
-      $.while($.andThen(notEof(), this.isAlnumPlus($, at($.l(P)))), inc);
-      $.if($.not(cIs(58)), fail);
-      $.put(LB, $.call(this.lowerCopyFn(), $.l(IN), $.l(S0), $.l(P)));
-      $.put(TYPE, $.call(this.schemeTypeFn(), $.l(LB), $.i(0), $.alen($.l(LB))));
-      $.put(SP, $.ne($.l(TYPE), $.i(T_NOT_SPECIAL)));
-      $.put(SCH, $.call(this.rangeStrFn(), $.l(LB), $.i(0), $.alen($.l(LB))));
-      $.put(USER, this.obNew($));
-      $.put(PASS, this.obNew($));
-      $.put(PATH, this.obNew($));
-      $.put(PORT, $.i(-1));
-      $.if($.eq($.l(TYPE), $.i(T_FILE)), () => go(ST_FILE), () => {
-        $.if($.l(SP), () => go(ST_SAS), () => {
-          $.if($.andThen($.lt($.add($.l(P), $.i(1)), $.l(E)), $.eq(at($.add($.l(P), $.i(1))), $.i(47))), () => {
-            go(ST_POA);
-            inc();
-          }, () => go(ST_OPAQUE));
+      if (!withBase) {
+        $.if($.not($.andThen(notEof(), this.isAlpha($, at($.l(P))))), fail);
+        inc();
+        $.while($.andThen(notEof(), this.isAlnumPlus($, at($.l(P)))), inc);
+        $.if($.not(cIs(58)), fail);
+        $.put(LB, $.call(this.lowerCopyFn(), $.l(IN), $.l(S0), $.l(P)));
+        $.put(TYPE, $.call(this.schemeTypeFn(), $.l(LB), $.i(0), $.alen($.l(LB))));
+        $.put(SP, $.ne($.l(TYPE), $.i(T_NOT_SPECIAL)));
+        $.put(SCH, $.call(this.rangeStrFn(), $.l(LB), $.i(0), $.alen($.l(LB))));
+        $.put(USER, this.obNew($));
+        $.put(PASS, this.obNew($));
+        $.put(PATH, this.obNew($));
+        $.put(PORT, $.i(-1));
+        $.if($.eq($.l(TYPE), $.i(T_FILE)), () => go(ST_FILE), () => {
+          $.if($.l(SP), () => go(ST_SAS), () => {
+            $.if($.andThen($.lt($.add($.l(P), $.i(1)), $.l(E)), $.eq(at($.add($.l(P), $.i(1))), $.i(47))), () => {
+              go(ST_POA);
+              inc();
+            }, () => go(ST_OPAQUE));
+          });
         });
-      });
-      inc();
+        inc();
+      } else {
+        // SCHEME_START / SCHEME; no scheme starts over in NO_SCHEME
+        $.if($.andThen(notEof(), this.isAlpha($, at($.l(P)))), () => {
+          inc();
+          $.while($.andThen(notEof(), this.isAlnumPlus($, at($.l(P)))), inc);
+        });
+        $.put(USER, this.obNew($));
+        $.put(PASS, this.obNew($));
+        $.put(PATH, this.obNew($));
+        $.put(PORT, $.i(-1));
+        $.if($.andThen($.gt($.l(P), $.l(S0)), cIs(58)), () => {
+          $.put(LB, $.call(this.lowerCopyFn(), $.l(IN), $.l(S0), $.l(P)));
+          $.put(TYPE, $.call(this.schemeTypeFn(), $.l(LB), $.i(0), $.alen($.l(LB))));
+          $.put(SP, $.ne($.l(TYPE), $.i(T_NOT_SPECIAL)));
+          $.put(SCH, $.call(this.rangeStrFn(), $.l(LB), $.i(0), $.alen($.l(LB))));
+          $.if($.eq($.l(TYPE), $.i(T_FILE)), () => go(ST_FILE), () => {
+            $.if($.both($.l(SP), $.eq(bg(U_TYPE), $.l(TYPE))), () => go(ST_SROA), () => {
+              $.if($.l(SP), () => go(ST_SAS), () => {
+                $.if($.andThen($.lt($.add($.l(P), $.i(1)), $.l(E)), $.eq(at($.add($.l(P), $.i(1))), $.i(47))), () => {
+                  go(ST_POA);
+                  inc();
+                }, () => go(ST_OPAQUE));
+              });
+            });
+          });
+          inc();
+        }, () => {
+          $.put(P, $.l(S0));
+          go(ST_NO_SCHEME);
+        });
+      }
+      const copyScheme = (): void => {
+        $.put(SCH, bg(U_SCHEME));
+        $.put(TYPE, bg(U_TYPE));
+        $.put(SP, $.ne($.l(TYPE), $.i(T_NOT_SPECIAL)));
+      };
+      const copyAuthority = (): void => {
+        $.put(USER, obFrom(bg(U_USER)));
+        $.put(PASS, obFrom(bg(U_PASS)));
+        $.put(HOST, bg(U_HOST));
+        $.put(PORT, bg(U_PORT));
+      };
+      const baseStates = (): [number, () => void][] => [
+        [ST_NO_SCHEME, () => {
+          // an opaque-path base admits only a bare "#fragment" (ada lets
+          // any input with a fragment fall through to RELATIVE_SCHEME)
+          $.if($.both(bg(U_OPAQUE), $.lt($.l(FF), $.i(0))), fail);
+          copyScheme();
+          $.if($.both(bg(U_OPAQUE), $.eq($.l(P), $.l(E))), () => {
+            $.put(OPQ, $.i(1));
+            $.put(PATH, obFrom(bg(U_PATH)));
+            $.put(QUERY, bg(U_QUERY));
+            $.put(P, $.add($.l(E), $.i(1)));
+          }, () => {
+            $.if($.ne($.l(TYPE), $.i(T_FILE)), () => go(ST_REL), () => go(ST_FILE));
+          });
+        }],
+        [ST_SROA, () => {
+          $.if($.andThen($.lt($.add($.l(P), $.i(1)), $.l(E)), $.both($.eq(at($.l(P)), $.i(47)), $.eq(at($.add($.l(P), $.i(1))), $.i(47)))), () => {
+            $.put(P, $.add($.l(P), $.i(2)));
+            go(ST_SAIS);
+          }, () => go(ST_REL));
+        }],
+        [ST_REL, () => {
+          copyScheme();
+          $.if($.either(cIs(47), $.both($.l(SP), cIs(92))), () => {
+            go(ST_REL_SLASH);
+            inc();
+          }, () => {
+            copyAuthority();
+            $.put(OPQ, bg(U_OPAQUE));
+            $.put(PATH, obFrom(bg(U_PATH)));
+            $.put(QUERY, bg(U_QUERY));
+            $.if(cIs(63), () => {
+              go(ST_QUERY);
+              inc();
+            }, () => {
+              $.if(notEof(), () => {
+                $.put(QUERY, $.nul(this.S));
+                $.run(this.shortenFn(), $.l(PATH), $.l(TYPE));
+                go(ST_PATH);
+              }, inc);
+            });
+          });
+        }],
+        [ST_REL_SLASH, () => {
+          $.if($.both($.l(SP), cSlash()), () => {
+            go(ST_SAIS);
+            inc();
+          }, () => {
+            $.if(cIs(47), () => {
+              go(ST_AUTHORITY);
+              inc();
+            }, () => {
+              copyAuthority();
+              go(ST_PATH);
+            });
+          });
+        }],
+      ];
       const chain = (cases: [number, () => void][], last: () => void): void => {
         const [s, body] = cases[0]!;
         if (cases.length === 1) $.if(is(s), body, last);
@@ -1321,16 +1461,68 @@ export class UrlEngine {
         chain([
           [ST_FILE, () => {
             $.put(HOST, empty());
+            if (!withBase) {
+              $.if(cSlash(), () => {
+                go(ST_FILE_SLASH);
+                inc();
+              }, () => go(ST_PATH));
+              return;
+            }
             $.if(cSlash(), () => {
               go(ST_FILE_SLASH);
               inc();
-            }, () => go(ST_PATH));
+            }, () => {
+              // a file base: its host, path and query, then '?' replaces
+              // the query, and any other input drops it and either empties
+              // the path (a drive letter follows) or shortens it
+              $.if($.eq(bg(U_TYPE), $.i(T_FILE)), () => {
+                $.put(HOST, bg(U_HOST));
+                $.put(PATH, obFrom(bg(U_PATH)));
+                $.put(QUERY, bg(U_QUERY));
+                $.put(OPQ, bg(U_OPAQUE));
+                $.if(cIs(63), () => {
+                  go(ST_QUERY);
+                  inc();
+                }, () => {
+                  $.if(notEof(), () => {
+                    $.put(QUERY, $.nul(this.S));
+                    $.if($.call(this.winDriveFn(), $.l(IN), $.l(P), $.l(E)), () => $.put(PATH, this.obNew($)), () => {
+                      $.run(this.shortenFn(), $.l(PATH), $.l(TYPE));
+                    });
+                    go(ST_PATH);
+                  }, inc);
+                });
+              }, () => go(ST_PATH));
+            });
           }],
           [ST_FILE_SLASH, () => {
+            if (!withBase) {
+              $.if(cSlash(), () => {
+                go(ST_FILE_HOST);
+                inc();
+              }, () => go(ST_PATH));
+              return;
+            }
             $.if(cSlash(), () => {
               go(ST_FILE_HOST);
               inc();
-            }, () => go(ST_PATH));
+            }, () => {
+              // a file base: its host, and its first path segment when that
+              // is a normalized drive letter (ada: two or more bytes, an
+              // alpha then ':') and the rest does not start with one
+              $.if($.eq(bg(U_TYPE), $.i(T_FILE)), () => {
+                $.put(HOST, bg(U_HOST));
+                $.put(BP, bg(U_PATH));
+                $.if($.andThen($.gt($.alen($.l(BP)), $.i(0)), $.not($.call(this.winDriveFn(), $.l(IN), $.l(P), $.l(E)))), () => {
+                  $.put(BK, $.i(1));
+                  $.while($.andThen($.lt($.l(BK), $.alen($.l(BP))), $.ne($.agetU(this.S, $.l(BP), $.l(BK)), $.i(47))), () => $.put(BK, $.add($.l(BK), $.i(1))));
+                  $.if($.andThen($.ge($.sub($.l(BK), $.i(1)), $.i(2)), $.both(this.isAlpha($, $.agetU(this.S, $.l(BP), $.i(1))), $.eq($.agetU(this.S, $.l(BP), $.i(2)), $.i(58)))), () => {
+                    $.for(BI, $.i(0), $.l(BK), () => this.push($, $.l(PATH), $.and($.agetU(this.S, $.l(BP), $.l(BI)), $.i(0xff))));
+                  });
+                });
+              });
+              go(ST_PATH);
+            });
           }],
           [ST_FILE_HOST, () => {
             $.put(L, $.l(P));
@@ -1453,6 +1645,7 @@ export class UrlEngine {
               $.put(P, $.add($.l(Q), $.i(1)));
             }, () => $.put(P, $.add($.l(E), $.i(1))));
           }],
+          ...(withBase ? baseStates() : []),
         ], () => {
           // QUERY
           $.put(O, this.obNew($));
@@ -1480,7 +1673,7 @@ export class UrlEngine {
         $.l(FRAG),
         $.nul(EQ_HEAP),
       ));
-    });
+    }
   }
 
   /** scheme default port by type */
@@ -1512,6 +1705,55 @@ export class UrlEngine {
       $.put(U, $.call(this.parseFn(), $.call(this.utf8Fn(), $.l(0))));
       $.if($.isNull($.l(U)), () => this.throwType($, "Invalid URL", "ERR_INVALID_URL"));
       $.do($.l(U));
+    });
+  }
+
+  /** `new URL(str, base)` with a defined base (both already strings):
+   * Node parses the base first — a bad one is "Invalid URL" before the
+   * input is read — then the input against it. */
+  newBaseFn(): number {
+    return this.fn("newBase", [this.sRef, this.sRef], [this.urlRef()], (f, $) => {
+      const B = f.local(this.urlRef());
+      const U = f.local(this.urlRef());
+      $.put(B, $.call(this.parseFn(), $.call(this.utf8Fn(), $.l(1))));
+      $.if($.isNull($.l(B)), () => {
+        this.throwType($, "Invalid URL", "ERR_INVALID_URL");
+        $.ret($.l(B));
+      });
+      $.put(U, $.call(this.parseBaseFn(), $.call(this.utf8Fn(), $.l(0)), $.l(B)));
+      $.if($.isNull($.l(U)), () => this.throwType($, "Invalid URL", "ERR_INVALID_URL"));
+      $.do($.l(U));
+    });
+  }
+
+  /** `URL.parse(str)`: the URL, or null. */
+  parseOrNullFn(): number {
+    return this.fn("parseOrNull", [this.sRef], [this.urlRef()], (_f, $) => {
+      $.do($.call(this.parseFn(), $.call(this.utf8Fn(), $.l(0))));
+    });
+  }
+
+  /** `URL.parse(str, base)`: null when the base or the input fails. */
+  parseBaseOrNullFn(): number {
+    return this.fn("parseBaseOrNull", [this.sRef, this.sRef], [this.urlRef()], (f, $) => {
+      const B = f.local(this.urlRef());
+      $.put(B, $.call(this.parseFn(), $.call(this.utf8Fn(), $.l(1))));
+      $.if($.isNull($.l(B)), () => $.ret($.l(B)));
+      $.do($.call(this.parseBaseFn(), $.call(this.utf8Fn(), $.l(0)), $.l(B)));
+    });
+  }
+
+  /** `URL.canParse(str)` */
+  canParseFn(): number {
+    return this.fn("canParse", [this.sRef], [I32], (_f, $) => {
+      $.do($.notNull($.call(this.parseOrNullFn(), $.l(0))));
+    });
+  }
+
+  /** `URL.canParse(str, base)` */
+  canParseBaseFn(): number {
+    return this.fn("canParseBase", [this.sRef, this.sRef], [I32], (_f, $) => {
+      $.do($.notNull($.call(this.parseBaseOrNullFn(), $.l(0), $.l(1))));
     });
   }
 

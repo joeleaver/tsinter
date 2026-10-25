@@ -1167,7 +1167,12 @@ interface URL {
   toString(): string;
 }
 declare var URL: {
-  new (input: string): URL;
+  /** A base is resolved like Node on the wasm tier; the native lanes
+   * check it, then throw a named Error (SEMANTICS.md S096). */
+  new (input: string, base?: string | URL): URL;
+  /** The URL, or null where the constructor would throw. */
+  parse(input: string, base?: string | URL): URL | null;
+  canParse(input: string, base?: string | URL): boolean;
 };
 
 /* URLSearchParams — the WHATWG application/x-www-form-urlencoded list.

@@ -33418,6 +33418,41 @@ class Assembler {
     switch (e.fn) {
       case "url.new":
         return simple(() => W().newFn(), true);
+      case "url.newBase":
+        return simple(() => W().newBaseFn(), true);
+      case "url.canParse":
+        return simple(() => W().canParseFn(), false);
+      case "url.canParseBase":
+        return simple(() => W().canParseBaseFn(), false);
+      case "url.parse":
+      case "url.parseBase": {
+        // `URL | null` — the sp.get pattern: the engine answers the URL or
+        // a null ref, never throws.
+        if (e.type.kind !== "union") throw new Error(`emitter bug: ${e.fn} result is not a union`);
+        const nullTag = this.unionDef(e.type.unionId).arms.findIndex((a) => a.kind === "nullT");
+        const valueTag = this.unionArmTag(e.type.unionId, { kind: "url" });
+        if (nullTag < 0 || valueTag < 0) throw new Error(`emitter bug: ${e.fn} union lacks its arms`);
+        const armSt = this.unionArmStruct(e.type.unionId, valueTag, e.loc);
+        if (armSt === null) {
+          code.unreachable();
+          return true;
+        }
+        args();
+        code.call(e.fn === "url.parse" ? W().parseOrNullFn() : W().parseBaseOrNullFn());
+        const d = this.acquireScratch(W().urlRef());
+        code.localSet(d);
+        code.localGet(d);
+        code.refIsNull();
+        this.openIfResult(this.unions.baseRef());
+        code.globalGet(this.unions.unitGlobal(nullTag));
+        code.else_();
+        code.i32Const(valueTag);
+        code.localGet(d);
+        code.structNew(armSt);
+        this.close();
+        this.releaseScratch(W().urlRef(), d);
+        return true;
+      }
       case "url.href":
         return simple(() => W().hrefFn(), false);
       case "url.protocol":

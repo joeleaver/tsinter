@@ -12,7 +12,7 @@ import { cjsClassExprWholeExportOf, isCjsJsFile, isJsSourceFile, isModuleExports
 import { PoisonError, dynFallbackType, dynUndefinedExpr, newFnCtx, own, withEsFnName } from "./lowerer.js";
 import { bufEncoding, lowerMapSeedArrayNew } from "./lower-containers.js";
 import { pureReemittable } from "./lower-exprs.js";
-import { lowerSearchParamsNew } from "./lower-builtins.js";
+import { lowerSearchParamsNew, lowerUrlBaseArgs } from "./lower-builtins.js";
 import { requiresDynamicPackageDiag, unsupportedDiag } from "../../diagnostics/diagnostic.js";
 import { STREAM_API_MEMBERS, STREAM_PROP_MEMBERS, UNDERSCORE_METHODS, lowerStreamNew, lowerStreamSuperCall, streamCtorShape } from "./lower-stream.js";
 import { emitOverrideShapeReason, emitSpecSuperForward, emitterRooted, lowerEmitterSuperCall, type EmitOverrideRec } from "./lower-emitter.js";
@@ -4973,9 +4973,9 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
       if (streamInfo) return lowerStreamNew(L, expr, streamInfo);
       // `new URL(input)`: the WHATWG URL class (stdlib/@types provenance —
       // a user's own `class URL` resolves through classBySymbol below).
-      // One string argument; invalid input throws a catchable TypeError
-      // ("Invalid URL"), like Node. The lib's base-argument form
-      // typechecks and is fenced here.
+      // An input string and an optional base (lowerUrlBaseArgs routes the
+      // base); invalid input or base throws a catchable TypeError
+      // ("Invalid URL"), like Node.
       // `new RegExp(pattern, flags?)`: runtime construction over the same
       // libregexp engine the literals ride. The pattern compiles EAGERLY,
       // so bad input throws Node's catchable SyntaxError at construction.
@@ -5004,16 +5004,21 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
       }
       if (symbol && symbol.name === "URL" && L.isStdlibSymbol(symbol)) {
         const args = expr.arguments ?? [];
-        if (args.length !== 1) {
+        if (args.length === 0 || args.length > 2) {
           L.noLowering(
             `new URL with ${args.length} argument${args.length === 1 ? "" : "s"}`,
             expr,
-            "one absolute-URL string is the supported form (resolve relative inputs against a base yourself)",
+            "an input string and an optional base are the supported form",
             symbol,
           );
         }
-        const input = L.lowerExprExpecting(args[0]!, STRING);
-        return { kind: "libCall", fn: "url.new", args: [input], type: URL_T, loc };
+        return lowerUrlBaseArgs(
+          L,
+          "new URL",
+          expr,
+          (input) => ({ kind: "libCall", fn: "url.new", args: [input], type: URL_T, loc }),
+          (input, base) => ({ kind: "libCall", fn: "url.newBase", args: [input, base], type: URL_T, loc }),
+        );
       }
       // `new URLSearchParams(init?)`: the WHATWG list (stdlib provenance —
       // see lowerSearchParamsNew for the lowered init shapes).

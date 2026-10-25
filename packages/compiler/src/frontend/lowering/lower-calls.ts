@@ -16,7 +16,7 @@ import { ffiBindingDiag, ffiSignatureDiag, requiresDynamicDiag } from "../../dia
 import type { ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import { mixinFnShapeOf } from "./lower-mixins.js";
 import { bufEncoding, dynStringReceiver, lowerArrayFromCall, lowerDynArrayFilterCall, lowerDynArrayFlatMapCall, lowerGroupByStaticCall, lowerIteratorHelperCall, lowerObjectAssignIndexShape, lowerObjectFromEntriesCall, lowerObjectIterOverIndexShape, lowerRegexMethodCall, lowerStringMethodCall, lowerTupleReadMethodCall } from "./lower-containers.js";
-import { lowerChildStreamMethodCall, lowerCreateRequireCall, lowerDirentMethodCall, lowerPerfHooksCall, lowerProcStreamMethodCall, lowerReflectApplyCall, lowerWatcherMethodCall } from "./lower-builtins.js";
+import { lowerChildStreamMethodCall, lowerCreateRequireCall, lowerDirentMethodCall, lowerPerfHooksCall, lowerProcStreamMethodCall, lowerReflectApplyCall, lowerUrlBaseArgs, lowerWatcherMethodCall } from "./lower-builtins.js";
 import { droppableStatic, lowerPromiseAllTupleCall, lowerPromiseRejectCall, probeLower, templateRawTextOf } from "./lower-exprs.js";
 import { httpClientFnBindingOf, isStreamUndefCallExpr, lowerHttpClientFnCall } from "./lower-server.js";
 import { EMITTER_API_MEMBERS, exactInstanceClassOf, findGenericMethodOn, lowerClassGenericMethodCall, lowerStaticMethodCall, type ClassInfo } from "./lower-classes.js";
@@ -8399,15 +8399,47 @@ export function lowerFunction(L: Lowerer, decl: ts.FunctionDeclaration): IrFunct
    * direct `call` of the instance with the receiver unevaluated. Claims
    * every call whose member is generic-callable — lowering it or fencing
    * with a named message. */
-  /** URL.revokeObjectURL() with NO argument: Node's ERR_MISSING_ARGS
-   * throws before the registry lookup, so the zero-argument contract is
-   * exact without any blob machinery. The one-argument form (Node's
-   * silent no-op for unregistered ids) and createObjectURL keep their
-   * fences — a compiled program has no blob registry to consult. */
+  /** The URL statics. URL.parse(input, base?) and URL.canParse(input,
+   * base?) take the constructor's argument routes (lowerUrlBaseArgs):
+   * parse answers the `URL | null` union, canParse a boolean; neither
+   * throws on the wasm tier, and a base on the native lanes is
+   * SEMANTICS.md S096. URL.revokeObjectURL() with NO argument: Node's
+   * ERR_MISSING_ARGS throws before the registry lookup, so the
+   * zero-argument contract is exact without any blob machinery. The
+   * one-argument form (Node's silent no-op for unregistered ids) and
+   * createObjectURL keep their fences — a compiled program has no blob
+   * registry to consult. */
   function lowerUrlStaticCall(L: Lowerer, call: ts.CallExpression, callee: ts.Expression): IrExpr | null {
     if (!ts.isPropertyAccessExpression(callee) || callee.questionDotToken !== undefined) return null;
     if (!ts.isIdentifier(callee.expression) || callee.expression.text !== "URL") return null;
-    if (callee.name.text !== "revokeObjectURL" || call.arguments.length !== 0) return null;
+    const member = callee.name.text;
+    if (member === "parse" || member === "canParse") {
+      const sym = L.resolveValueSymbol(callee.expression);
+      if (!sym || !L.isStdlibSymbol(sym) || call.questionDotToken !== undefined) return null;
+      const loc = locOf(call);
+      if (member === "canParse") {
+        return lowerUrlBaseArgs(
+          L,
+          "URL.canParse",
+          call,
+          (input) => ({ kind: "libCall", fn: "url.canParse", args: [input], type: BOOL, loc }),
+          (input, base) => ({ kind: "libCall", fn: "url.canParseBase", args: [input, base], type: BOOL, loc }),
+        );
+      }
+      const type = L.mapTypeOf(L.typeOf(call));
+      const def = type?.kind === "union" ? L.unions.get(type.unionId) : undefined;
+      if (!type || !def || def.arms.length !== 2 || !def.arms.some((a) => a.kind === "url") || !def.arms.some((a) => a.kind === "nullT")) {
+        L.noLowering("URL.parse with a result type other than 'URL | null'", call, "the standard library's URL.parse signature is the lowered form");
+      }
+      return lowerUrlBaseArgs(
+        L,
+        "URL.parse",
+        call,
+        (input) => ({ kind: "libCall", fn: "url.parse", args: [input], type, loc }),
+        (input, base) => ({ kind: "libCall", fn: "url.parseBase", args: [input, base], type, loc }),
+      );
+    }
+    if (member !== "revokeObjectURL" || call.arguments.length !== 0) return null;
     const sym = L.resolveValueSymbol(callee.expression);
     if (!sym || !L.isStdlibSymbol(sym)) return null;
     return nodeThrowExpr(1, "ERR_MISSING_ARGS", 'The "url" argument must be specified', VOID, locOf(call));

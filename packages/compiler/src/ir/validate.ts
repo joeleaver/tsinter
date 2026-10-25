@@ -230,6 +230,11 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "sym.desc": { argTypes: [SYMBOL_T], result: VOID },
   "sym.toString": { argTypes: [SYMBOL_T], result: STRING },
   "url.new": { argTypes: [STRING], result: URL_T },
+  "url.newBase": { argTypes: [STRING, STRING], result: URL_T },
+  "url.parse": { argTypes: [STRING], result: VOID },
+  "url.parseBase": { argTypes: [STRING, STRING], result: VOID },
+  "url.canParse": { argTypes: [STRING], result: BOOL },
+  "url.canParseBase": { argTypes: [STRING, STRING], result: BOOL },
   "url.protocol": { argTypes: [URL_T], result: STRING },
   "url.host": { argTypes: [URL_T], result: STRING },
   "url.hostname": { argTypes: [URL_T], result: STRING },
@@ -4057,6 +4062,20 @@ function validateFunction(
             def.arms.some((a) => a.kind === "nullT");
           if (!ok) {
             err(`libCall spawnRes.signal must return the 'string | null' union`, e.loc);
+          }
+          break;
+        }
+        if (e.fn === "url.parse" || e.fn === "url.parseBase") {
+          // Result is the interned `URL | null` union (the backend builds
+          // the arms from a URL-or-null answer).
+          const def = e.type.kind === "union" ? unions.get(e.type.unionId) : undefined;
+          const ok =
+            def &&
+            def.arms.length === 2 &&
+            def.arms.some((a) => a.kind === "url") &&
+            def.arms.some((a) => a.kind === "nullT");
+          if (!ok) {
+            err(`libCall ${e.fn} must return the 'URL | null' union`, e.loc);
           }
           break;
         }

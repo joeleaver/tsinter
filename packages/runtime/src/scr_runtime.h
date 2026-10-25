@@ -2581,6 +2581,15 @@ void scr_fs_close(double fd);
 typedef struct ScrUrl ScrUrl;
 
 ScrUrl *scr_url_new(ScrStr *input); /* +1, or throws */
+/* SEMANTICS.md S096: this lane does not resolve a base. scr_url_new_base
+ * parses the base first (Node's Invalid URL for a rejected in-subset base),
+ * then THROWS a catchable Error naming the gap. URL.parse / URL.canParse
+ * (with or without a base) always THROW their own named Error. */
+ScrUrl *scr_url_new_base(ScrStr *input, ScrStr *base);   /* throws */
+ScrUrl *scr_url_parse(ScrStr *input);                    /* throws */
+bool scr_url_can_parse(ScrStr *input);                   /* throws */
+ScrUrl *scr_url_parse_base(ScrStr *input, ScrStr *base); /* throws */
+bool scr_url_can_parse_base(ScrStr *input, ScrStr *base); /* throws */
 ScrUrl *scr_url_retain(ScrUrl *u);
 void scr_url_release(ScrUrl *u);
 void *scr_url_retain_v(void *p);
