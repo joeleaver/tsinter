@@ -120,6 +120,15 @@ export interface PromiseDeps {
    * every module that ever rejects a promise — breaking §C's byte-
    * identity guarantee for the common (no listener) case. */
   needsListenerLoopTerm: () => boolean;
+  /** Unit B (AsyncLocalStorage — dc.ts): the global holding the current
+   * AsyncContextFrame (anyref) in a module that reaches
+   * AsyncLocalStorage, else null. When set, every waiter carries the frame
+   * current when it was CREATED (hop/subscribe: an await, a `.then`, a
+   * reaction, queueMicrotask — Node captures the frame when the job is
+   * scheduled) and `drain` installs it around the job. Null keeps the
+   * waiter type and those three functions byte-identical. Decided by a
+   * static prescan, so it is stable before waiterT is interned. */
+  alsCtx?: () => number | null;
 }
 
 /* promT's fields. The first four and `observed` are exported because the
@@ -183,6 +192,8 @@ export const PROM_CONV = 11;
 const W_CLOS = 0;
 const W_FRAME = 1;
 const W_NEXT = 2;
+/** The captured AsyncContextFrame — present only in an ALS module. */
+const W_CTX = 3;
 
 /* ── the combinators' reaction nodes ──────────────────────────────────
  * Promise.all and Promise.race need NO promise-shape change: a reaction
@@ -266,10 +277,12 @@ export class PromiseBuilder {
     if (this.waiterTField === null) {
       const clos: ValType = { kind: "ref", nullable: true, typeIndex: this.deps.resumeClos().clos };
       const frame: ValType = { kind: "ref", nullable: true, typeIndex: this.deps.frameBase() };
+      const als = this.alsG() !== null;
       this.waiterTField = this.mb.selfStructType("%w.waiter", (self) => [
         { storage: clos, mutable: true },
         { storage: frame, mutable: true },
         { storage: { kind: "ref", nullable: true, typeIndex: self }, mutable: true },
+        ...(als ? [{ storage: this.deps.anyRef, mutable: false }] : []),
       ]);
     }
     return this.waiterTField;
@@ -317,6 +330,17 @@ export class PromiseBuilder {
     fields.push({ storage: this.deps.anyRef, mutable: true }); // PROM_DYNVIEW (10)
     fields.push({ storage: I32, mutable: true }); // PROM_CONV (11)
     this.dynPromFieldsAppended = true;
+  }
+
+  /** The ALS frame global (see PromiseDeps.alsCtx), or null. */
+  private alsG(): number | null {
+    return this.deps.alsCtx?.() ?? null;
+  }
+
+  /** A waiter's struct.new tail: the frame current now (ALS modules). */
+  private pushWaiterCtx(c: Code): void {
+    const g = this.alsG();
+    if (g !== null) c.globalGet(g);
   }
 
   private waiterRef(): ValType {
@@ -402,6 +426,7 @@ export class PromiseBuilder {
       c.localGet(CLOS);
       c.localGet(FRAME);
       this.nullWaiter(c);
+      this.pushWaiterCtx(c);
       c.structNew(this.waiterT);
       c.localSet(N);
       c.globalGet(q.tail);
@@ -444,6 +469,7 @@ export class PromiseBuilder {
         c.localGet(CLOS);
         c.localGet(FRAME);
         this.nullWaiter(c);
+        this.pushWaiterCtx(c);
         c.structNew(this.waiterT);
         c.localSet(N);
         c.localGet(P);
@@ -904,6 +930,16 @@ export class PromiseBuilder {
       c.localGet(N);
       this.nullWaiter(c);
       c.structSet(this.waiterT, W_NEXT);
+      // Unit B: an ALS module runs the job in the frame it captured.
+      const als = this.alsG();
+      const SAVE = 1;
+      if (als !== null) {
+        c.globalGet(als);
+        c.localSet(SAVE);
+        c.localGet(N);
+        c.structGet(this.waiterT, W_CTX);
+        c.globalSet(als);
+      }
       c.localGet(N);
       c.structGet(this.waiterT, W_CLOS); // arg0: the closure itself
       c.localGet(N);
@@ -912,9 +948,13 @@ export class PromiseBuilder {
       c.structGet(this.waiterT, W_CLOS);
       c.structGet(pair.clos, 0);
       c.callRef(pair.fn);
+      if (als !== null) {
+        c.localGet(SAVE);
+        c.globalSet(als);
+      }
       c.br(0);
       c.end();
-      this.mb.setBody(idx, [this.waiterRef()], c.bytes());
+      this.mb.setBody(idx, als !== null ? [this.waiterRef(), this.deps.anyRef] : [this.waiterRef()], c.bytes());
       return idx;
     });
   }

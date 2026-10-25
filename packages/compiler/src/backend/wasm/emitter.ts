@@ -247,6 +247,7 @@ import { BytesBuilder, type BytesElem } from "./typedarrays.js";
 import { StrdecBuilder } from "./strdec.js";
 import { TimerBuilder } from "./timers.js";
 import { NextTickBuilder } from "./nexttick.js";
+import { DcBuilder, alsBlockedFamily } from "./dc.js";
 import { EventsBuilder, EMITTER_REG, EMITTER_NAME } from "./events.js";
 import {
   StreamBuilder,
@@ -2103,6 +2104,15 @@ const DYNTHEN_FINALLY = 2;
  * #184): settle's adoption prologue ignores every later resolve/reject of
  * it. No payload tag uses it, and nothing reads a pending promise's kind. */
 const PROM_KIND_ADOPTING = -2;
+/** The timer-queue libCalls whose first argument is the scheduled
+ * callback closure — wrapped in an AsyncLocalStorage module (Unit B). */
+const TIMER_SCHEDULE_FNS: ReadonlySet<string> = new Set([
+  "timers.setTimeout",
+  "timers.setTimeoutHandle",
+  "timers.setInterval",
+  "timers.setImmediate",
+  "process.nextTick",
+]);
 
 /** jsOp:getProp's PROTOTYPE-MEMBER surface (increment 21, stage A,
  * post-review): an island receiver's property read can name a REAL
@@ -2396,6 +2406,10 @@ class Assembler {
    * drainPendingHandled()). A listener-free module (this field false)
    * takes emitCheckpointCore's UNCHANGED, byte-identical code path. */
   private readonly needsListenerLoopTerm: boolean;
+  /** Unit B: the module reaches AsyncLocalStorage (any `als.*` libCall) —
+   * promise jobs and the timer/immediate/nextTick callbacks then carry
+   * the AsyncContextFrame they were scheduled in (dc.ts). */
+  private readonly alsLive: boolean;
   /** INC-27 U5: does any reachable function reach a libCall that can MINT
    * a DOMException (the constructor and its clone, structuredClone and
    * its transfer failure, atob/btoa)? A STATIC prescan fact, for the
@@ -2627,6 +2641,7 @@ class Assembler {
     this.needsUnhandledRejectionDispatch = unhandledRejectionReachable(mod);
     this.needsRejectionHandledDispatch = rejectionHandledReachable(mod);
     this.needsListenerLoopTerm = this.needsUnhandledRejectionDispatch || this.needsRejectionHandledDispatch;
+    this.alsLive = libCallWhere(mod, (fn) => fn.startsWith("als."));
     this.domexLive = this.libCallReachable(mod, [
       "error.newDom",
       "error.domClone",
@@ -4341,6 +4356,13 @@ class Assembler {
     // every function has been walked and so after the last place a typed
     // promise can be boxed into dyn — see finalizeDynProm.
     this.finalizeDynProm();
+    // Unit B review: where the %error encoding can exist, JSON.stringify
+    // skips an Error's non-enumerable name/message (json.ts
+    // hideErrorMembers). Sampled after the dyn promise view, whose body
+    // is the last place fromError can be requested.
+    if (this.dynField !== null && this.dynField.built("fromError") && this.jsonField !== null) {
+      this.jsonField.hideErrorMembers();
+    }
 
     const entry = this.funcIndexByName.get(this.mod.entry);
     const entryFn = this.funcByName.get(this.mod.entry);
@@ -5785,6 +5807,7 @@ class Assembler {
       },
       needsRejectionHandled: () => this.needsRejectionHandledDispatch,
       needsListenerLoopTerm: () => this.needsListenerLoopTerm,
+      alsCtx: () => (this.alsLive ? this.dc.alsCurGlobal() : null),
     });
     return this.promsField;
   }
@@ -8075,6 +8098,7 @@ class Assembler {
 
   private get json(): JsonBuilder {
     this.jsonField ??= new JsonBuilder(this.mb, {
+      strEq: () => this.strEqHelper(),
       strRef: () => this.strRef,
       strType: () => this.strType,
       concat: () => this.concatHelper(),
@@ -19312,6 +19336,14 @@ class Assembler {
        * that bucket would top the queue forever while saying nothing about
        * what to implement; the member name IS the work item. */
       case "libCall":
+        if (this.alsLive) {
+          const fam = alsBlockedFamily(e.fn);
+          if (fam !== null) {
+            this.refuse(`libCall:als:context-through-${fam}`, e.loc);
+            code.unreachable();
+            return;
+          }
+        }
         if (e.fn === "insp.f64") {
           // util.inspect's one number-ism (scr_insp_f64): JS ToString
           // except -0 prints "-0" — console.log's number formatting,
@@ -23393,6 +23425,7 @@ class Assembler {
         if (this.emitNetLibCall(e)) return;
         if (this.emitBufferLibCall(e)) return;
         if (this.emitTimerCall(e)) return;
+        if (this.emitDcLibCall(e)) return;
         if (this.emitEmitterLibCall(e)) return;
         if (this.emitStreamLibCall(e)) return;
         if (this.emitAssertLibCall(e)) return;
@@ -40166,14 +40199,38 @@ class Assembler {
 
   private emitTimerCall(e: Extract<IrExpr, { kind: "libCall" }>): boolean {
     const code = this.fn.code;
+    // Unit B: in a module that reaches AsyncLocalStorage, a scheduled
+    // callback runs in the AsyncContextFrame current when it was
+    // scheduled (Node's Timeout / Immediate / nextTick capture) — the
+    // closure is wrapped right after it is evaluated.
+    const scheduled = this.alsLive && TIMER_SCHEDULE_FNS.has(e.fn);
     const call1 = (idx: number): void => {
       this.walkExpr(e.args[0]!);
+      if (scheduled) code.call(this.dc.wrapVoid());
       code.call(idx);
     };
     const call2 = (idx: number): void => {
+      if (!scheduled) {
+        this.walkExpr(e.args[0]!);
+        this.walkExpr(e.args[1]!);
+        code.call(idx);
+        return;
+      }
+      // The frame is captured AFTER every argument is evaluated (Node's
+      // Timeout is constructed once setTimeout has its arguments).
+      const closRef: ValType = { kind: "ref", nullable: true, typeIndex: this.closPairFor([], []).clos };
+      const cl = this.acquireScratch(closRef);
+      const ms = this.acquireScratch(F64);
       this.walkExpr(e.args[0]!);
+      code.localSet(cl);
       this.walkExpr(e.args[1]!);
+      code.localSet(ms);
+      code.localGet(cl);
+      code.call(this.dc.wrapVoid());
+      code.localGet(ms);
       code.call(idx);
+      this.releaseScratch(F64, ms);
+      this.releaseScratch(closRef, cl);
     };
     switch (e.fn) {
       case "timers.clearNoop":
@@ -40237,6 +40294,310 @@ class Assembler {
         call1(this.nextTick.enqueue());
         return true;
       default:
+        return false;
+    }
+  }
+
+  /* ── Unit B: node:diagnostics_channel and AsyncLocalStorage (dc.ts) ── */
+
+  private dcField: DcBuilder | null = null;
+  /** The libCall being emitted — the one SrcLoc dynThenGoFn wants. */
+  private dcLoc: SrcLoc | undefined = undefined;
+
+  private get dc(): DcBuilder {
+    this.dcField ??= new DcBuilder(this.mb, this.dyn, {
+      strRef: () => this.strRef,
+      strType: () => this.strType,
+      lit: (c, s) => this.pushStrLitInto(c, s),
+      concat: () => this.concatHelper(),
+      strEq: () => this.strEqHelper(),
+      f64ToStr: () => this.f64ToStrHelper(),
+      vec: () => this.dynVecInfo(),
+      vecPush: () => this.dyn.arrPush(),
+      vecNewLen: () => this.vecs.newLen(this.dynVecInfo()),
+      setCellError: (c, className, name, pushMessage, codeLit) =>
+        this.emitSetCellError(c, className, name, pushMessage, codeLit),
+      exc: () => this.exc(),
+      cellClear: (c) => this.emitCellClearInto(c),
+      cellToDyn: () => this.dcCellToDynHelper(),
+      voidClos: () => this.closPairFor([], []),
+      nextTickEnqueue: () => this.nextTick.enqueue(),
+      setImmediate: () => this.timers.setImmediate(),
+      promRef: () => this.proms.promRef(),
+      promT: () => this.proms.promT,
+      mint: () => this.proms.mint(),
+      settle: () => this.proms.settle(),
+      thenGo: () => this.dynThenGoFn(this.dcLoc ?? { file: "<dc>", start: 0, end: 0 }),
+      thenMode: DYNTHEN_THEN,
+      excRef: EXC_REF,
+      alsLive: this.alsLive,
+    });
+    return this.dcField;
+  }
+
+  /** %w.dc.cellToDyn() → the PENDING exception as one dyn value —
+   * caughtToDyn's ladder over the cell itself (boxPromiseReasonToDyn's
+   * twin): numbers, booleans, strings, an Error through the identity
+   * cache, a thrown dyn value as itself, the S022 empty object for the
+   * rest. The cell is left as it is. */
+  private dcCellToDynField: number | null = null;
+  private dcCellToDynHelper(): number {
+    if (this.dcCellToDynField !== null) return this.dcCellToDynField;
+    const dynRef = this.dyn.dynRef();
+    const idx = this.mb.declareFunc(this.mb.funcType([], [dynRef]), "%w.dc.cellToDyn");
+    this.dcCellToDynField = idx;
+    const exc = this.exc();
+    const c = new Code();
+    const K = 0;
+    c.globalGet(exc.kindG);
+    c.localSet(K);
+    const kindIs = (tag: number): void => {
+      c.localGet(K);
+      c.i32Const(tag);
+      c.i32Eq();
+    };
+    kindIs(EXC_F64);
+    c.ifResult(dynRef);
+    this.dyn.boxNum(c, (x) => x.globalGet(exc.f64G));
+    c.else_();
+    kindIs(EXC_BOOL);
+    c.ifResult(dynRef);
+    this.dyn.boxBool(c, (x) => {
+      x.globalGet(exc.f64G);
+      x.f64Const(0);
+      x.f64Ne();
+    });
+    c.else_();
+    kindIs(EXC_STR);
+    c.ifResult(dynRef);
+    this.dyn.boxStr(c, (x) => {
+      x.globalGet(exc.refG);
+      x.refCast(this.strType);
+    });
+    c.else_();
+    kindIs(EXC_OBJ);
+    c.ifResult(I32);
+    c.globalGet(exc.preG);
+    this.emitErrIntervalTest(c);
+    c.else_();
+    c.i32Const(0);
+    c.end();
+    c.ifResult(dynRef);
+    c.globalGet(exc.refG);
+    c.refCast(exc.errT);
+    c.call(this.dyn.fromError());
+    c.else_();
+    c.globalGet(exc.refG);
+    c.refTest(this.dyn.dynT());
+    c.ifResult(dynRef);
+    c.globalGet(exc.refG);
+    c.refCast(this.dyn.dynT());
+    c.else_();
+    this.dyn.boxObj(c, (x) => this.dyn.pushNewObj(x, false));
+    c.end();
+    c.end();
+    c.end();
+    c.end();
+    c.end();
+    this.mb.setBody(idx, [I32], c.bytes());
+    return idx;
+  }
+
+  /** The dc.* / als.* libCalls, and the two setImmediate shapes the
+   * tracing surface brings (dc.ts). Handles (f64) are registry indices. */
+  private emitDcLibCall(e: Extract<IrExpr, { kind: "libCall" }>): boolean {
+    const fn = e.fn as string;
+    if (!fn.startsWith("dc.") && !fn.startsWith("als.") &&
+        fn !== "timers.setImmediateFnValue" && fn !== "timers.immediatePromise") {
+      return false;
+    }
+    const code = this.fn.code;
+    this.dcLoc = e.loc;
+    const dc = this.dc;
+    const handle = (i: number): void => {
+      this.walkExpr(e.args[i]!);
+      code.i32TruncF64S();
+    };
+    const val = (i: number): void => this.walkExpr(e.args[i]!);
+    const vec = (i: number): void => {
+      this.walkExpr(e.args[i]!);
+      dc.vecOf(code);
+    };
+    const toF64 = (): void => code.f64ConvertI32S();
+    switch (fn) {
+      case "dc.channel":
+        val(0);
+        code.call(dc.channelIdx());
+        toF64();
+        return true;
+      case "dc.subscribe":
+      case "dc.unsubscribe": {
+        // `channel(name).subscribe(fn)`: both arguments evaluate first.
+        const n = this.acquireScratch(this.strRef);
+        const f = this.acquireScratch(this.dyn.dynRef());
+        val(0);
+        code.localSet(n);
+        val(1);
+        code.localSet(f);
+        code.localGet(n);
+        code.call(dc.channelIdx());
+        code.localGet(f);
+        code.call(fn === "dc.subscribe" ? dc.subscribe() : dc.unsubscribe());
+        this.releaseScratch(this.dyn.dynRef(), f);
+        this.releaseScratch(this.strRef, n);
+        if (fn === "dc.subscribe") this.emitPendingCheck();
+        return true;
+      }
+      case "dc.hasSubscribers":
+        val(0);
+        code.call(dc.hasSubscribersName());
+        return true;
+      case "dc.publish":
+        handle(0);
+        val(1);
+        code.call(dc.publish());
+        return true;
+      case "dc.chanSubscribe":
+        handle(0);
+        val(1);
+        code.call(dc.subscribe());
+        this.emitPendingCheck();
+        return true;
+      case "dc.chanUnsubscribe":
+        handle(0);
+        val(1);
+        code.call(dc.unsubscribe());
+        return true;
+      case "dc.chanHasSubscribers":
+        handle(0);
+        code.call(dc.active());
+        return true;
+      case "dc.chanName":
+        handle(0);
+        code.call(dc.name());
+        return true;
+      case "dc.chanBindStore":
+        handle(0);
+        handle(1);
+        val(2);
+        code.call(dc.bindStore());
+        return true;
+      case "dc.chanUnbindStore":
+        handle(0);
+        handle(1);
+        code.call(dc.unbindStore());
+        return true;
+      case "dc.chanRunStores":
+        handle(0);
+        val(1);
+        val(2);
+        val(3);
+        vec(4);
+        code.call(dc.runStoresApply());
+        this.emitPendingCheck();
+        return true;
+      case "dc.tracingChannel":
+        val(0);
+        code.call(dc.tracingChannel());
+        toF64();
+        return true;
+      case "dc.tracingChannelOf":
+        for (let i = 0; i < 5; i++) handle(i);
+        code.call(dc.tracingChannelOf());
+        toF64();
+        return true;
+      case "dc.tcChannel":
+        handle(0);
+        handle(1);
+        code.call(dc.tcChannel());
+        toF64();
+        return true;
+      case "dc.tcHasSubscribers":
+        handle(0);
+        code.call(dc.tcHas());
+        return true;
+      case "dc.tcSubscribe":
+        handle(0);
+        val(1);
+        code.call(dc.tcSubscribe());
+        this.emitPendingCheck();
+        return true;
+      case "dc.tcUnsubscribe":
+        handle(0);
+        val(1);
+        code.call(dc.tcUnsubscribe());
+        this.emitPendingCheck();
+        return true;
+      case "dc.tcTraceSync":
+        handle(0);
+        val(1);
+        val(2);
+        val(3);
+        vec(4);
+        code.call(dc.traceSync());
+        this.emitPendingCheck();
+        return true;
+      case "dc.tcTracePromise":
+        handle(0);
+        val(1);
+        val(2);
+        val(3);
+        vec(4);
+        code.call(dc.tracePromise());
+        this.emitPendingCheck();
+        return true;
+      case "dc.tcTraceCallback":
+        handle(0);
+        val(1);
+        val(2);
+        val(3);
+        val(4);
+        vec(5);
+        code.call(dc.traceCallback());
+        this.emitPendingCheck();
+        return true;
+      case "als.new":
+        code.call(dc.alsNew());
+        return true;
+      case "als.get":
+        handle(0);
+        code.call(dc.alsGetI());
+        return true;
+      case "als.run":
+        handle(0);
+        val(1);
+        val(2);
+        vec(3);
+        code.call(dc.alsRunI());
+        this.emitPendingCheck();
+        return true;
+      case "als.exitRun": {
+        // exit(fn, ...args) is run(undefined, fn, ...args).
+        handle(0);
+        code.globalGet(this.dyn.undefinedGlobal());
+        val(1);
+        vec(2);
+        code.call(dc.alsRunI());
+        this.emitPendingCheck();
+        return true;
+      }
+      case "als.enterWith":
+        handle(0);
+        val(1);
+        code.call(dc.alsEnterWithI());
+        return true;
+      case "als.disable":
+        handle(0);
+        code.call(dc.alsDisableI());
+        return true;
+      case "timers.setImmediateFnValue":
+        code.call(dc.setImmediateValue());
+        return true;
+      case "timers.immediatePromise":
+        code.call(dc.immediatePromise());
+        return true;
+      default:
+        // A dc.* / als.* key this unit does not serve refuses by name.
         return false;
     }
   }

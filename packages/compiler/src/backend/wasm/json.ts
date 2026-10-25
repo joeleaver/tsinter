@@ -110,6 +110,8 @@ export interface JsonDeps {
   concat: () => number;
   f64ToStr: () => number;
   lit: (c: Code, s: string) => void;
+  /** (str, str) -> i32 — only hideErrorMembers reads it. */
+  strEq?: () => number;
   /** Fill the exception cell with a catchable error of the named builtin
    * class whose message `pushMessage` builds at runtime. The CALLER
    * unwinds; json.parse is may-throw-seeded so its callers' pending
@@ -4930,7 +4932,29 @@ export class JsonBuilder {
    * recursive call tests the cell BEFORE reading the answer. */
   putDyn(): number {
     const dyn = this.deps.dyn();
-    return this.cached("putDyn", [dyn.dynRef()], [I32], (idx) => {
+    return this.cached("putDyn", [dyn.dynRef()], [I32], (idx) => this.buildPutDyn(idx, false));
+  }
+
+  /** Unit B review: an Error's `name`, `message` and `stack` are
+   * NON-enumerable own properties in Node (an assigned `stack` stays so),
+   * so JSON.stringify of an Error answers its other own members only
+   * (`{}`, or `{"code":...}`). The `%error` encoding stores the marker,
+   * name and message as ordinary members (S021); in a module that can
+   * build that encoding (the emitter asks after every function is walked
+   * — dyn.ts fromError was built), putDyn's object arm is rebuilt to skip
+   * those keys and `stack` of an error-encoded object. The residue (an
+   * assigned `name` is hidden too; a user object carrying the marker
+   * loses those keys) is S021's and S025's amendments. Every other module
+   * keeps putDyn byte-identical. */
+  hideErrorMembers(): void {
+    const idx = this.fns.get("putDyn");
+    if (idx === undefined) return;
+    this.buildPutDyn(idx, true);
+  }
+
+  private buildPutDyn(idx: number, hideErr: boolean): void {
+    const dyn = this.deps.dyn();
+    {
       const dynT = dyn.dynT();
       const strT = this.deps.strType();
       const c = new Code();
@@ -4964,6 +4988,7 @@ export class JsonBuilder {
       const SAVEDSEENLEN = 19;
       const SAVEDDEPTH = 20;
       const SAVEDCIRC = 21;
+      const ISERR = 22; // hideErr: the OBJ is the %error encoding
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
@@ -5227,6 +5252,11 @@ export class JsonBuilder {
         c.end();
         c.i32Const(0x7b); // '{'
         c.call(this.jbPutc());
+        if (hideErr) {
+          c.localGet(0);
+          c.call(dyn.isError());
+          c.localSet(ISERR);
+        }
         // Own-key ORDER, through the one helper that defines it.
         c.localGet(0);
         c.i32Const(2); // Object.entries mode
@@ -5262,6 +5292,24 @@ export class JsonBuilder {
         c.i32Const(DK.FUNC);
         c.i32Eq();
         c.i32Or();
+        if (hideErr) {
+          // name / message / stack / the marker of an Error: not enumerable
+          // (an assigned stack stays non-enumerable in V8, as Node shows).
+          c.localGet(ISERR);
+          c.ifResult(I32);
+          for (const [i, key] of ["%error", "name", "message", "stack"].entries()) {
+            dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(0));
+            c.structGet(dynT, DYN_REF);
+            c.refCast(strT);
+            this.deps.lit(c, key);
+            c.call(this.deps.strEq!());
+            if (i > 0) c.i32Or();
+          }
+          c.else_();
+          c.i32Const(0);
+          c.end();
+          c.i32Or();
+        }
         c.i32Eqz();
         c.ifVoid();
         c.localGet(FIRST);
@@ -5437,10 +5485,11 @@ export class JsonBuilder {
           I32,
           I32,
           I32,
+          ...(hideErr ? [I32] : []),
         ],
         c.bytes(),
       );
-    });
+    }
   }
 
   /** `if (kind is one of ks) { body }` — the kind-dispatch shape dyn.ts

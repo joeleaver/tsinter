@@ -1412,10 +1412,11 @@ test("A05 ADOPT: a finally handler returns a promise", async () => {
 // VOIDWIDEN
 // ============================================================
 
-test("W01 VOIDWIDEN: the widened promise now reaches its next refusal", async () => {
-  const { diagnostics, survey } = await refuseRow("W01", "'use strict';\nfunction wait() { return new Promise(setImmediate); }\nasync function main() { await wait(); console.log('waited'); }\nmain();\nconsole.log('sync');", "cjs");
-  expect(diagnostics).toEqual(["SC3001:the wasm backend does not support this construct yet (libCall:timers.immediatePromise); build with the LLVM backend (the default) or the reference C backend (--backend c)"]);
-  expect(survey).toEqual(["libCall:timers.immediatePromise"]);
+test("W01 VOIDWIDEN: the widened promise runs (Unit B serves timers.immediatePromise; Node prints sync, then waited)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("W01", "'use strict';\nfunction wait() { return new Promise(setImmediate); }\nasync function main() { await wait(); console.log('waited'); }\nmain();\nconsole.log('sync');", "cjs");
+  expect(stdout).toBe("sync\nwaited\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
 // ============================================================

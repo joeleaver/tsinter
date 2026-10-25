@@ -1498,14 +1498,13 @@ test("JSON.stringify over a dyn ROOT: the tree's own kinds drive the walk", asyn
   );
 });
 
-test("S021: a crossed error stringifies as its MEMBERS, where Node answers {}", async () => {
+test("S021 amendment: a crossed error stringifies as {}, Node's answer", async () => {
   // The dyn tree has no non-enumerable properties, so the error encoding
   // stores name/message as ordinary members beside the reserved `%error`
-  // marker — and stringify, which walks own enumerable keys, prints them.
-  // S021 names this exact output as one of its consequences; this is the
-  // pin. Node answers `{}` for the same throw (Error's own properties are
-  // non-enumerable). The native lanes agree with this tier, because C
-  // builds the same encoding.
+  // marker. Since the Unit B review, the wasm stringify walker skips those
+  // three keys of an error-encoded object (json.ts hideErrorMembers), so
+  // this answers Node's `{}` (Error's name and message are non-enumerable).
+  // The native lanes still print the members (C builds the same encoding).
   const res = await buildWasm(
     "json-dyn-error.ts",
     [
@@ -1516,7 +1515,7 @@ test("S021: a crossed error stringifies as its MEMBERS, where Node answers {}", 
   );
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
   const { stdout } = await runWasm(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe(`{"%error":true,"name":"TypeError","message":"boom"}\n`);
+  expect(stdout.toString("utf8")).toBe(`{}\n`);
 });
 
 test("S026: the dyn stringify walker caps depth at 1000, catchably", async () => {

@@ -1542,6 +1542,11 @@ export class DynBuilder {
   /** Declare-then-build, interned by NAME: the index is published before
    * the body runs, so a helper may call itself (pathRender recurses) and
    * may pull in the others without re-entering here. */
+  /** Was helper `name` built (requested at least once)? */
+  built(name: string): boolean {
+    return this.fns.has(name);
+  }
+
   private cached(name: string, params: ValType[], results: ValType[], build: (idx: number) => void): number {
     const hit = this.fns.get(name);
     if (hit !== undefined) return hit;

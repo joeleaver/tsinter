@@ -3152,6 +3152,23 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
         call.arguments.length >= 1) {
       const receiver = L.lowerExprExpecting(access.expression, F64);
       const fn = dcSubscriberArg(L, call.arguments[0]!);
+      // traceCallback hands the traced function Node's wrappedCallback,
+      // which reads (err, res) and forwards every argument. A function-
+      // typed parameter of the traced function declaring fewer than two
+      // parameters (TypeScript infers it from the trailing callback, e.g.
+      // `() => {}`) would lower `cb(null, v)` with the arguments dropped —
+      // a silent wrong result and a lost error event — so it refuses.
+      if (name === "traceCallback") {
+        const fnT = fn.kind === "dynFrom" ? fn.value.type : fn.type;
+        if (fnT.kind === "func" &&
+            fnT.params.some((p) => p.kind === "func" && p.rest !== true && p.params.length < 2)) {
+          L.noLowering(
+            "traceCallback over a function whose callback parameter declares fewer than two parameters",
+            call.arguments[0]!,
+            "declare the callback as (err, result) => ... (or (...args) => ...) so the traced function's calls keep their arguments",
+          );
+        }
+      }
       // traceSync(fn, context?, thisArg?, ...args) /
       // tracePromise(fn, context?, thisArg?, ...args) /
       // traceCallback(fn, position?, context?, thisArg?, ...args)

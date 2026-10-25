@@ -1010,6 +1010,24 @@ six do not reach it, and a dedicated pin would duplicate S021's own
 already-covered "the marker enumerates" finding at one more call
 site rather than establish anything new).
 
+**Amendment (Unit B review): `JSON.stringify` on the wasm tier skips the
+marker, `name`, `message` and `stack` of an error-encoded object**, so a
+crossed `Error("x")` serializes as `{}` and one carrying a stamped or
+assigned `code` as `{"code":...}` — Node's answers (V8's `name`, `message`
+and `stack` are non-enumerable, and an assigned `stack` stays so; a Node
+error's `code` is enumerable). What remains of this entry for JSON: ANY
+assignment to `name` (`e.name = "Renamed"` on a caught error, or a
+subclass's `this.name = ...`) serializes WITHOUT it, where Node prints
+`{"name":"Renamed"}` (the assignment makes an own enumerable property —
+the encoding cannot tell an assigned name from the class default), and a
+DOMException's derived `code` and `cause` serialize (Node's are not own
+enumerable). A user object carrying the marker loses those keys too —
+S025. Every other surface above is unchanged, and the llvm and c lanes
+still serialize the members.
+**Tested by:** the DCALS-07 row in `tests/harness/wasm-differential.test.ts`
+(the hidden `stack` included) and `wasm-emitter.test.ts`'s "S021
+amendment" row; the assigned-`name` residue is measured, not pinned.
+
 ## S022 — A non-Error exception payload crossing into `unknown` becomes an EMPTY object *(inherited)*
 
 The exception cell type-erases everything that is not a scalar, an error
@@ -1222,6 +1240,16 @@ EMPTY string (Error.prototype.toString over two absent members) against
 Node's `"[object Object]"`. `typeof` and `Object.keys` agree with Node
 throughout — the key really is an own member on both sides, which is
 S021's other half seen from this direction.
+
+**Amendment (Unit B review): `JSON.stringify` is a marker-confusable
+surface on the wasm tier.** In a module that can build the error
+encoding (S021's JSON amendment), stringify skips `%error`, `name`,
+`message` and `stack` of ANY object carrying the marker: the parsed
+`{"%error":true,"name":"n","message":"m","z":2}` prints `{"z":2}` where
+Node prints all four keys, and a caught error given `e["%error"] = "user"`
+prints `{}` where Node prints `{"%error":"user"}`. In a module that cannot
+build the encoding, stringify prints every key, as before. **Tested by:**
+measured (the review probes), not pinned.
 
 **Rationale:** inherited — the C runtime uses the same marker and
 reproduces every line above, verified by running it. The marker cannot
@@ -6272,6 +6300,22 @@ is exact for every program that does not write `undefined` into a field that is 
 **Tested by:** `packages/compiler/test/wasm-silent-batch.test.ts` (PRESENCE rows: the required, optional,
 widened-literal, index-signature and checked-conversion cells with Node's answers, and the divergent
 cells pinned with Node's output beside them); the llvm and c lanes are measured, not pinned.
+
+## S092 — node:diagnostics_channel and AsyncLocalStorage on the wasm lane: ReflectApply's TypeError text is rendered for primitives, plain objects and arrays only, tracePromise fences a non-promise without subscribers and a non-promise thenable, setImmediate as a function value answers undefined and calls its callback with `this` undefined, and channels are never collected *(wasm lane only)*
+
+On the wasm lane `diagnostics_channel` (channels, `subscribe` / `unsubscribe` / `publish`, `bindStore` / `unbindStore` / `runStores`, tracing channels with `traceSync`, `traceCallback` and `tracePromise`) and `AsyncLocalStorage` (`run`, `exit`, `getStore`, `enterWith`, `disable`) are built in the module (`packages/compiler/src/backend/wasm/dc.ts`), transcribed from Node v24.18.1's `lib/diagnostics_channel.js`, `lib/internal/async_local_storage/async_context_frame.js` and `lib/internal/async_context_frame.js` (v24 runs AsyncContextFrame by default). No host operation is added. The ActiveChannel prototype swap, the copy-on-write subscriber list, the wrapStoreRun chain (the last-bound store outermost, a throwing transform skipped), a subscriber's or transform's throw re-raised from a nextTick job (`triggerUncaughtException`, rendered as S007 says), `run`'s ObjectIs shortcut and its restore through `enterWith(prior)`, and the frame carried by every promise job, timer, interval, immediate and nextTick callback (captured when it is scheduled) are Node's. These differ:
+
+- **(a) ReflectApply's TypeError text is rendered for some values only.** Calling a non-function through `run`, `exit`, `runStores` or a trace call throws V8's `Function.prototype.apply was called on <value>, which is <kind> and not a function` for undefined, null, booleans, numbers, strings, plain objects (`#<Object>`) and arrays (`[object Array]`). Any other non-function dynamic value (a Buffer, an error object, a null-prototype object, a Map stand-in, a promise, a handle) throws a catchable Error ("calling a non-function value of this kind through diagnostics_channel or AsyncLocalStorage is not supported yet").
+- **(b) tracePromise fences two returns.** With no subscribers, a traced function returning a non-promise throws a catchable Error ("tracePromise without subscribers over a function returning a non-promise is not supported yet") where Node returns the value itself (the IR types the call as a promise). With subscribers, a traced function returning an object with a callable `then` throws a catchable Error ("tracePromise over a function returning a non-promise thenable is not supported yet") where Node adopts the thenable.
+- **(c) setImmediate as a function value** (`traceCallback(setImmediate, …)`) validates its callback and schedules it as Node does, but answers undefined where Node returns an Immediate, and calls the callback with `this` undefined where Node passes the Immediate.
+- **(d) Channels are never garbage-collected.** Node keeps channels in a WeakRefMap: a channel nothing references can be collected, after which `hasSubscribers(name)` answers false and `channel(name)` makes a new object. Here every channel lives for the whole run; in Node the difference shows only through garbage-collection timing.
+- **(e) The re-raise of a throwing subscriber or transform rides this tier's nextTick queue**, so S082's ordering applies to it: microtasks already queued run before the uncaught error ends the program, where a CommonJS Node runs the tick first.
+
+Not divergences, recorded for the reader: a module that reaches AsyncLocalStorage REFUSES (compile time, `libCall:als:context-through-<family>`) node:net, http, https, http2, tls, dgram, dns, streams, child processes, readline and stdin, fs.watch and fs.exists, node:test and the process signal / exit / warning / rejection listeners, because the callbacks those deliver would not carry the frame; `new Promise(setImmediate)` fulfils with the executor's reject function as Node does (an anonymous native function); `traceCallback` over a traced function with a function-typed parameter declaring fewer than two parameters refuses by name on every lane (TypeScript infers that parameter from the trailing callback, e.g. `() => {}`, and the traced function's `cb(err, value)` call would otherwise lose its arguments).
+
+**Scope:** the wasm lane.
+
+**Tested by:** the "Unit B diagnostics_channel and AsyncLocalStorage rows" block of `tests/harness/wasm-differential.test.ts`: the five corpus programs (2094, 2160, 2211, 2213, 2214), DCALS-01 to DCALS-06 against Node's output, DCALS-F1 pinning (a) to (c) with Node's answers in its title, DCALS-R1 the refusal; (d) is not pinned by a row. Measured against Node v24.18.1.
 
 ## S093 — node:crypto on the wasm lane: errors carry name, message and code only, randomness is the host's entropy, an X509Certificate is read at its outer DER structure, and a few PEM forms and validity times are fenced by name *(wasm lane only)*
 
