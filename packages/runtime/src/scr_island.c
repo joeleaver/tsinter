@@ -384,6 +384,7 @@ enum {
   ISL_H_HASOWN,
   ISL_H_ASSIGN,
   ISL_H_ITERDRAIN,
+  ISL_H_CALLSPREADM,
   ISL_H_COUNT,
 };
 
@@ -456,7 +457,20 @@ static const char isl_prelude[] =
     "else if(typeof v===\"number\")d=\"number \"+v;else if(typeof v===\"boolean\")d=\"boolean \"+v;"
     "else if(typeof v===\"function\")d=\"function\";else d=\"object\";"
     "throw new TypeError(d+\" is not iterable (cannot read property Symbol(Symbol.iterator))\")}"
-    "const o=[];for(const x of v)o.push(x);return o}]";
+    "const o=[];for(const x of v)o.push(x);return o},"
+    /* ISL_H_CALLSPREADM: the METHOD form of the spread call (board #243,
+     * `o.m(...pre, ...s)` / `o["m"](...)`): the spread guards of
+     * ISL_H_CALLSPREAD, then the receiver's member `k` called with `this`
+     * = the receiver; a non-callable member throws "<n> is not a function"
+     * with the front end's callee spelling. */
+    "(o,p,s,w,k,n)=>{if(s===undefined||s===null){if(w===\"\")"
+    "throw new Error(\"spreading null or undefined from this expression into an island call is not supported yet\");"
+    "throw new TypeError(w+\" is not iterable (cannot read property \"+s+\")\")}"
+    "if(typeof s[Symbol.iterator]!==\"function\")"
+    "throw new TypeError(\"Spread syntax requires ...iterable[Symbol.iterator] to be a function\");"
+    "const a=[...p,...s];const f=o[k];"
+    "if(typeof f!==\"function\")throw new TypeError(n+\" is not a function\");"
+    "return Reflect.apply(f,o,a)}]";
 
 static void isl_free_boot(void);
 static void isl_prom_wraps_teardown(void);
@@ -1648,6 +1662,31 @@ ScrJsval *scr_jsval_call_spread(ScrJsval *f, ScrJsval *pre, ScrJsval *spread, co
   JSValue argv[4] = {f->v, pre->v, spread->v, JS_NewStringLen(isl_ctx, what->data, what->len)};
   JSValue r = JS_Call(isl_ctx, isl_helpers[ISL_H_CALLSPREAD], JS_UNDEFINED, 4, argv);
   JS_FreeValue(isl_ctx, argv[3]);
+  if (JS_IsException(r)) {
+    isl_bridge_exception();
+    return NULL;
+  }
+  return isl_cell_new(r);
+}
+
+/* The METHOD form of the spread call (jsOp callSpread with five args,
+ * board #243): `key` read off `recv` and called with `this` = recv, the
+ * guards of scr_jsval_call_spread first; `name` spells a non-callable
+ * member. Borrows everything; +1 out, or NULL with the engine exception
+ * bridged. */
+ScrJsval *scr_jsval_call_spread_method(ScrJsval *recv, ScrJsval *pre, ScrJsval *spread, const ScrStr *what,
+                                       const ScrStr *key, const ScrStr *name) {
+  isl_entry();
+  JSValue argv[6] = {
+    recv->v, pre->v, spread->v,
+    JS_NewStringLen(isl_ctx, what->data, what->len),
+    JS_NewStringLen(isl_ctx, key->data, key->len),
+    JS_NewStringLen(isl_ctx, name->data, name->len),
+  };
+  JSValue r = JS_Call(isl_ctx, isl_helpers[ISL_H_CALLSPREADM], JS_UNDEFINED, 6, argv);
+  JS_FreeValue(isl_ctx, argv[3]);
+  JS_FreeValue(isl_ctx, argv[4]);
+  JS_FreeValue(isl_ctx, argv[5]);
   if (JS_IsException(r)) {
     isl_bridge_exception();
     return NULL;

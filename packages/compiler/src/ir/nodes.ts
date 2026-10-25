@@ -5088,7 +5088,19 @@ export type IrExpr =
    * (engine
    * exceptions bridge into the exception cell, catchably) — backends'
    * may-throw analyses must seed on every jsOp like a `throw`. */
-  | { kind: "jsOp"; op: IrJsOp; name?: string; args: IrExpr[]; type: IrType; loc: SrcLoc }
+  | {
+      kind: "jsOp";
+      op: IrJsOp;
+      name?: string;
+      /** callMethod only: V8's rendering of the callee (`o.zz`, `o[16]`,
+       * board #243 review), for "<x> is not a function" where the backend
+       * builds that text itself; absent when the source has no rendered
+       * form (the backend then names the method). */
+      spelling?: string;
+      args: IrExpr[];
+      type: IrType;
+      loc: SrcLoc;
+    }
   /** Island → static validated exit (--dynamic builds only): `value` is
    * jsval-typed, `type` is the static target. STRICT for primitives (a
    * non-number refuses to exit as number — no coercion); composite
@@ -5142,7 +5154,12 @@ export type IrJsOp =
    * `name` carries the spread expression's source spelling (V8's nullish
    * spread-call TypeError spells it). The prelude helper uses REAL spread
    * syntax, so iterator protocols are the engine's own, with guards
-   * front-running V8's exact spread-call TypeError texts. May throw. */
+   * front-running V8's exact spread-call TypeError texts. May throw.
+   * The METHOD form (board #243, `o.m(...pre, ...s)` / `o["m"](...)`)
+   * takes five args: (receiver, pre, spread, method-name strLit marshal,
+   * callee-spelling strLit marshal) — the member is read from the
+   * receiver and called with `this` = the receiver; the spelling names
+   * a non-callable member in "<x> is not a function". */
   | "callSpread"
   /** `new X(...)` where X is jsval-typed (package-declared classes):
    * JS_CallConstructor — args are the callee then the constructor

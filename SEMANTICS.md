@@ -818,17 +818,20 @@ catchable TypeError, and the name in it is a compile-time string the
 lowering threads through: the identifier's text for a bare identifier,
 `getText()` for a property or element access, and the literal word
 "value" for every other callee shape. V8 instead re-renders the callee
-from its own AST, so the two part company in four places. `(g)(1)` says
+from its own AST, so the two part company in three places. `(g)(1)` says
 "g is not a function" in Node and "value is not a function" here (any
 parenthesized callee); `o . a . b (1)` says "o.a.b" there and
-"o . a . b" here (raw source keeps the spaces); `o["f"]()` says "o.f"
-there — V8 re-renders a string-literal computed key as a dotted one —
-and `o["f"]` here; and a callee with no referenceable spelling at all,
+"o . a . b" here (raw source keeps the spaces); and a callee with no referenceable spelling at all,
 such as `(c ? g : g)(1)`,
 says "(intermediate value)(intermediate value)(intermediate value)"
 there and "value" here. The shapes that AGREE are the common ones: a
 bare identifier, a dotted chain, a computed access with a variable key
-(`o[k]`), and an element index (`o.arr[0]`). Argument EVALUATION order
+(`o[k]`), an element index (`o.arr[0]`), and — since board #243 made a
+literal-key callee a method call — a callee ending in a literal key
+(`o["f"]()` says "o.f" and `o["list"][0]()` says "o.list[0]", V8's
+re-rendering of the whole callee; they said `o["f"]` and `o["list"][0]`
+before). A literal-key call with SPREAD arguments (`o["f"](...xs)`) keeps
+the stored-member path and its source spelling `o["f"]`. Argument EVALUATION order
 is unaffected and exact — arguments run, in source order, before the
 callability test, so their side effects appear in Node's order on every
 lane. An `as`-CAST callee never reaches this message at all: `(g as F)(1)`
@@ -2918,14 +2921,16 @@ name, measured against Node v24.18.1:
   model**: the nullish spread-call TypeError names the source as V8's
   CallPrinter renders it (`f(1)` → `f(...)`, `o["x"]` → `o.x`, parentheses
   dropped). The front end renders it for every lane (board #242: the lanes
-  printed the source text verbatim) for identifiers and `this` followed by
-  `.name` / `[name]` / `["name"]` / call chains, and `[digits]` only where
-  the digits are the index's own ToString (V8 prints the VALUE:
-  `o[99999999999999999999]` reads `o[100000000000000000000]`). Any other
-  shape (`o?.x` — Node's "(intermediate value)" — `o["0"]` — Node's `o.0`
-  — `(void 0)`, whitespace, other operators) throws a catchable Error
-  instead: "spreading null or undefined from this expression into a call
-  is not supported yet" on the checked-dynamic call path (a dynamic
+  printed the source text verbatim) for identifiers, `this` and
+  parenthesized rendered expressions followed by `.name` / `[name]` / call
+  chains, a numeric-literal key printed as its VALUE (`o[0x10]` reads
+  `o[16]`, `o[99999999999999999999]` reads `o[100000000000000000000]`,
+  `o[1_000]` reads `o[1000]`, as V8 prints them) and a string-literal key without escapes printed as
+  `.content` (`o["0"]` reads `o.0`, `o["a-b"]` reads `o.a-b`, measured).
+  Any other shape (`o?.x` — Node's "(intermediate value)" — `(void 0)`,
+  an escaped string key, whitespace, other operators) throws a catchable
+  Error instead: "spreading null or undefined from this expression into a
+  call is not supported yet" on the checked-dynamic call path (a dynamic
   source), "spreading null or undefined from this expression into an
   island call is not supported yet" on the island's callSpread. A
   non-nullish source of any shape is exact.
@@ -2985,6 +2990,43 @@ measured against Node v24.18.1:
 
 **Tested by:** A2-REF-01..05 in `packages/compiler/test/wasm-island-a.test.ts`,
 each with Node's answer beside it.
+
+**Amendment (unit A3, board #243): method calls through a member key or a
+spread.** `o["m"](...)` with a literal key on an island or checked-dynamic
+receiver is now the method call it is in JS (`this` = `o`; it called the
+member with `this` undefined), and `o.m(...pre, ...s)` / `o["m"](...)` with
+one trailing spread runs the island's spread call with `this` bound (it was
+fenced). The island's "<x> is not a function" text now spells the callee
+as V8 does (`o.zz`, `o.v` for `o["v"]`, `o[16]` for `o[0x10]`,
+`o.list[0]` for `o["list"][0]`), where the wasm tier named only the
+method; a callee V8's rendering does not cover keeps the method name.
+Three shapes still differ:
+- **A computed key** (`o[k](...)`, `fns[i](3)`, `table[k](1)`) keeps the
+  plain call it always lowered to, on every lane and every receiver: the
+  member is read, then called with `this` undefined, where Node calls it
+  with `this` = `o`. Arrows and functions that never read `this` (the
+  dispatch tables programs write: corpus 2600's
+  `catchWarning[warning.name](warning)`) answer exactly as Node; a plain
+  `function` member that reads `this` sees undefined (A3-MCALL-09: Node
+  prints 7, this tier `undefined`). On a checked-dynamic receiver spread
+  arguments on a literal-key call keep the stored-member path `o.m(...xs)`
+  takes as well.
+- **The spread method form reads the member AFTER the arguments**: Node
+  reads `o.m` first, then evaluates the arguments and the spread. The two
+  orders differ only when reading the member has an effect the arguments
+  observe (a getter, a proxy) or an argument replaces the member.
+- **On the c and llvm lanes `this` never binds for a function stored on
+  an island object**: `o.m(1)`, `o["m"](1)` and both spread forms call
+  the member with `this` undefined (a member reading `this.v` with `v` = 7
+  prints `undef:1` where Node prints `7:1`). This predates the unit for
+  `o.m(1)`; the wasm tier binds `this` in all four.
+The dot form `o.m(x)` on a checked-dynamic receiver keeps S042's answer.
+`o.toString()` on an island object (plain or linked) now answers like
+`String(o)` — Object.prototype.toString through the method call, where it
+threw "is not a function" — and an own or inherited `toString` member is
+still the one called.
+**Tested by:** A3-MCALL-01..09, A3-TOSTR-01 and A3-RENDER-01/02 in
+`packages/compiler/test/wasm-island-a.test.ts`.
 
 ## S044 — jsExit of `array<jsval>`: the SPINE aliases on the wasm tier (matching Node); the native island copies it *(per-lane split)*
 

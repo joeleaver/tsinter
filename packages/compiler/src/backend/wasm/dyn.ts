@@ -6569,10 +6569,12 @@ export class DynBuilder {
 
   /** Object.prototype names every non-nullish receiver inherits (board
    * #191) — a call, not a member read, so S015's own-only reads do not
-   * apply. toLocaleString is answered only on OBJ receivers: Array's and
-   * Number's own versions differ, and those kinds keep the
-   * is-not-a-function tail below. */
-  private static readonly OBJPROTO_METHODS = new Set(["hasOwnProperty", "propertyIsEnumerable", "isPrototypeOf", "valueOf", "toLocaleString"]);
+   * apply. toLocaleString and toString (A3 review: `o.toString()` on an
+   * island object threw "is not a function" while `String(o)` worked) are
+   * answered only on OBJ receivers, as the ToString conversion: Array's,
+   * Number's and Function's own versions differ, and those kinds keep
+   * their own arms or the is-not-a-function tail below. */
+  private static readonly OBJPROTO_METHODS = new Set(["hasOwnProperty", "propertyIsEnumerable", "isPrototypeOf", "valueOf", "toLocaleString", "toString"]);
 
   /** Number.prototype names with an arm (increment 21 stage B, gate 2;
    * INC-25 P4 gains "toPrecision" and toString's non-10 radix, D4 ii/iii
@@ -7478,7 +7480,7 @@ export class DynBuilder {
             this.boxBool(c, (x) => x.i32Const(0));
             return;
           }
-          if (method === "toLocaleString") {
+          if (method === "toLocaleString" || method === "toString") {
             // OBJ only (OBJPROTO_METHODS' doc): this.toString(), which on
             // the tree is the ToString conversion.
             c.localGet(0);
@@ -9040,7 +9042,7 @@ export class DynBuilder {
 
         // Board #191: the Object.prototype names every remaining kind
         // inherits (OBJ answered them in its own arm).
-        if (objProto && method !== "toLocaleString") {
+        if (objProto && method !== "toLocaleString" && method !== "toString") {
           this.arm(c, K, [DK.NUM, DK.BOOL, DK.STR, DK.ARR, DK.FUNC, DK.PROMISE], objProtoCall);
         }
 

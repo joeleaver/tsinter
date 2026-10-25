@@ -156,17 +156,16 @@ test("A1-SPREAD-04 a spread call on an any-typed callee is a real spread, not ap
   expect(exitCode).toBe(0);
 });
 
-test("A1-SPREAD-05 a nullish spread source with no known V8 rendering refuses by name, on both call paths", async () => {
+test("A1-SPREAD-05 a nullish spread source with no known V8 rendering refuses by name, on both call paths; a numeric key renders its value", async () => {
   const { stdout, stderr, exitCode } = await runRow("A1-SPREAD-05", "// @dynamic\n\"use strict\";\n/** @type {*} */\nconst o = { x: null };\nconst id = (...a) => a.length;\ntry {\n  id(...o?.x);\n} catch (e) {\n  console.log(`${e.name}: ${e.message}`);\n}\ntry {\n  id(...o[99999999999999999999]);\n} catch (e) {\n  console.log(`${e.name}: ${e.message}`);\n}\ntry {\n  id(...o[7]);\n} catch (e) {\n  console.log(`${e.name}: ${e.message}`);\n}\n/** @param {*} g */\nfunction cs(g) {\n  try {\n    g(...o?.x);\n  } catch (e) {\n    console.log(`${e.name}: ${e.message}`);\n  }\n}\ncs((...a) => a.length);\nconsole.log(`${id(...(o?.y ?? [1, 2]))}`);", "js");
   // Node: "TypeError: (intermediate value) is not iterable (cannot read
-  // property null)", "TypeError: o[100000000000000000000] is not iterable
-  // (cannot read property undefined)" (V8 prints the index's VALUE), the
-  // o[7] line as here, "(intermediate value)" again, then 2. The static
+  // property null)"; the index lines as here (V8 prints a numeric key's
+  // VALUE, which the front end now renders the same way); "(intermediate value)" again, then 2. The static
   // callee's three ride the checked-dynamic call path (an `any` source),
   // the any-callee one the island callSpread.
   expect(stdout).toBe(
     "Error: spreading null or undefined from this expression into a call is not supported yet\n" +
-      "Error: spreading null or undefined from this expression into a call is not supported yet\n" +
+      "TypeError: o[100000000000000000000] is not iterable (cannot read property undefined)\n" +
       "TypeError: o[7] is not iterable (cannot read property undefined)\n" +
       "Error: spreading null or undefined from this expression into an island call is not supported yet\n" +
       "2\n",
@@ -369,3 +368,93 @@ test("A2-REF-06 an index-signature typed conversion of an object carrying an isl
   expect(stdout).toBe("before\n");
   expect(stderr).toContain("Uncaught Error: reading a getter-defined property of an island object here");
 });
+
+// ============================================================
+// A3 — board #243: element-access and spread method calls
+// ============================================================
+
+test("A3-MCALL-01 an element-access callee on an island receiver is a method call: this binds", async () => {
+  const { stdout, stderr, exitCode } = await runRow("A3-MCALL-01", "// @dynamic\n\"use strict\";\n// an element-access callee on an island receiver is a method call: this binds\n/** @returns {*} */\nfunction mk() {\n  return JSON.parse('{\"v\":7}');\n}\nconst o = mk();\no.m = function (a, b) {\n  return `${this === undefined ? \"undef\" : this.v}:${a + b}`;\n};\nconsole.log(`${o[\"m\"](1, 2)} ${o.m(1, 2)} ${o['m'](2, 3)}`);\n/** @returns {*} */\nfunction arr() {\n  return [3, 1, 2];\n}\nconst a = arr();\nconsole.log(`${a[\"push\"](9)} ${a.length} ${a[\"join\"](\"-\")} ${a[0]}`);", "js");
+  expect(stdout).toBe("7:3 7:3 7:5\n4 4 3-1-2-9 3\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("A3-MCALL-02 a spread method call on an island receiver: this binds, the spread iterates", async () => {
+  const { stdout, stderr, exitCode } = await runRow("A3-MCALL-02", "// @dynamic\n\"use strict\";\n// a spread method call on an island receiver: this binds, the spread iterates\n/** @returns {*} */\nfunction mk() {\n  return JSON.parse('{\"v\":7}');\n}\nconst o = mk();\no.m = function (...a) {\n  return `${this === undefined ? \"undef\" : this.v}:${a.join(\",\")}`;\n};\nconst xs = [1, 2];\nconsole.log(`${o.m(...xs)} ${o[\"m\"](0, ...xs)} ${o.m(...\"ab\")}`);\n/** @returns {*} */\nfunction arr() {\n  return [3];\n}\nconst a = arr();\nconsole.log(`${a[\"push\"](...xs)} ${a.push(...[4, 5])} ${a.join(\",\")}`);\ntry {\n  o.nope(...xs);\n} catch (e) {\n  console.log(`${e.name}: ${e.message}`);\n}\ntry {\n  o[\"nope\"](1, ...xs);\n} catch (e) {\n  console.log(`${e.name}: ${e.message}`);\n}\ntry {\n  o.m(...o.missing);\n} catch (e) {\n  console.log(`${e.name}: ${e.message}`);\n}", "js");
+  expect(stdout).toBe("7:1,2 7:0,1,2 7:a,b\n3 5 3,1,2,4,5\nTypeError: o.nope is not a function\nTypeError: o.nope is not a function\nTypeError: o.missing is not iterable (cannot read property undefined)\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("A3-MCALL-03 an element-access callee on a checked-dynamic receiver binds this too", async () => {
+  const { stdout, stderr, exitCode } = await runRow("A3-MCALL-03", "\"use strict\";\n// an element-access callee on a checked-dynamic receiver binds this too\nconst o = JSON.parse('{\"v\":7,\"list\":[1,2]}');\no.m = function (a) {\n  return `${this === undefined ? \"undef\" : this.v}:${a}`;\n};\nconsole.log(`${o[\"m\"](5)} ${o[\"list\"][\"indexOf\"](2)}`);", "cjs");
+  expect(stdout).toBe("7:5 1\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("A3-RENDER-01 V8's rendering of a nullish spread source: string keys print .content, numeric keys their value", async () => {
+  const { stdout, stderr, exitCode } = await runRow("A3-RENDER-01", "// @dynamic\n\"use strict\";\n// V8's rendering of a nullish spread source: string keys print .content, numeric keys their value\n/** @returns {*} */\nfunction mk() {\n  return {};\n}\nconst o = mk();\nconst id = (...a) => a.length;\nconst tries = [\n  () => id(...o[\"a-b\"]),\n  () => id(...o[\"0\"]),\n  () => id(...o[0x10]),\n  () => id(...o[1.5]),\n  () => id(...(o).x),\n  () => id(...o['q']),\n];\nfor (const t of tries) {\n  try {\n    t();\n  } catch (e) {\n    console.log(`${e.message}`);\n  }\n}", "js");
+  expect(stdout).toBe("o.a-b is not iterable (cannot read property undefined)\no.0 is not iterable (cannot read property undefined)\no[16] is not iterable (cannot read property undefined)\no[1.5] is not iterable (cannot read property undefined)\no.x is not iterable (cannot read property undefined)\no.q is not iterable (cannot read property undefined)\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("A3-MCALL-04 a computed-key member call on an island value keeps the plain call", async () => {
+  const { stdout, stderr, exitCode } = await runRow("A3-MCALL-04", "// @dynamic\n\"use strict\";\n/** @returns {*} */\nfunction mk() {\n  return { v: 1, m() { return 2; } };\n}\nconst o = mk();\nconst k = \"m\";\nconsole.log(\"before\");\nconsole.log(`${o[k]()}`);", "js");
+  expect(stdout).toBe("before\n2\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("A3-MCALL-05 a computed-key call out of an ordinary any[] is a plain call, as before", async () => {
+  const { stdout, stderr, exitCode } = await runRow("A3-MCALL-05", "// @dynamic\n\"use strict\";\n// a computed-key call out of an ordinary any[] is a plain call, as before\n/** @type {*[]} */\nconst fns = [(x) => x + 1, (x) => x * 2];\nlet total = 0;\nfor (let i = 0; i < fns.length; i++) total += fns[i](3);\nconsole.log(`${total}`);", "js");
+  expect(stdout).toBe("10\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("A3-MCALL-06 computed-key calls out of a Record<string, any> and an any[]", async () => {
+  const { stdout, stderr, exitCode } = await runRow("A3-MCALL-06", "// @dynamic\n// computed-key calls out of a Record<string, any> and an any[]\nconst table: Record<string, any> = { inc: (x: number) => x + 1, dbl: (x: number) => x * 2 };\nconst arr: any[] = [(x: number) => x - 1, (x: number) => x * 10];\nfor (const k of [\"inc\", \"dbl\"]) console.log(`${table[k](1)}`);\nfor (let i = 0; i < arr.length; i++) console.log(`${arr[i](2)}`);", "ts");
+  expect(stdout).toBe("2\n2\n1\n20\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("A3-MCALL-07 the island's not-a-function texts spell the callee as V8 does", async () => {
+  const { stdout, stderr, exitCode } = await runRow("A3-MCALL-07", "// @dynamic\n\"use strict\";\n// the island's not-a-function texts spell the callee as V8 does\n/** @returns {*} */\nfunction mk() {\n  return { v: 1, list: [1] };\n}\nconst o = mk();\ntry { o.zz(1); } catch (e) { console.log(e.message); }\ntry { o[\"v\"](1); } catch (e) { console.log(e.message); }\ntry { o[\"zz\"](1); } catch (e) { console.log(e.message); }\ntry { o[0x10](1); } catch (e) { console.log(e.message); }\ntry { o[\"list\"][0](1); } catch (e) { console.log(e.message); }\ntry { o.list[0](1); } catch (e) { console.log(e.message); }", "js");
+  expect(stdout).toBe("o.zz is not a function\no.v is not a function\no.zz is not a function\no[16] is not a function\no.list[0] is not a function\no.list[0] is not a function\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("A3-MCALL-08 a checked-dynamic receiver's not-a-function texts spell the whole callee", async () => {
+  const { stdout, stderr, exitCode } = await runRow("A3-MCALL-08", "// @dynamic\n// a checked-dynamic receiver's not-a-function texts spell the whole callee\nfunction mk(): any {\n  return JSON.parse('{\"v\":1,\"list\":[1]}');\n}\nconst o = mk();\ntry { o.zz(1); } catch (e) { console.log((e as Error).message); }\ntry { o[\"v\"](1); } catch (e) { console.log((e as Error).message); }\ntry { o[0x10](1); } catch (e) { console.log((e as Error).message); }\ntry { o[\"list\"][0](1); } catch (e) { console.log((e as Error).message); }\ntry { o.slice(); } catch (e) { console.log((e as Error).message); }", "ts");
+  expect(stdout).toBe("o.zz is not a function\no.v is not a function\no[16] is not a function\no.list[0] is not a function\no.slice is not a function\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("A3-MCALL-09 a computed-key call on an island object calls the member with this undefined (registered)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("A3-MCALL-09", "// @dynamic\n\"use strict\";\n// a computed-key call on an island object calls the member with this undefined (registered)\n/** @returns {*} */\nfunction mk() {\n  return { v: 7, m: function () { return typeof this === \"object\" ? this.v : String(this); } };\n}\nconst o = mk();\nconst k = \"m\";\nconsole.log(`${o[k]()} ${o[\"m\"]()} ${o.m()}`);", "js");
+  // Node: 7 7 7. A computed key keeps the plain call, so `this` is
+  // undefined in the member (SEMANTICS.md S043, unit-A3 amendment).
+  expect(stdout).toBe("undefined 7 7\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+test("A3-TOSTR-01 Object.prototype.toString called as a method on island objects", async () => {
+  const { stdout, stderr, exitCode } = await runRow("A3-TOSTR-01", "// @dynamic\n\"use strict\";\n// Object.prototype.toString called as a method on island objects\n/** @returns {*} */\nfunction mk() {\n  return { a: 1 };\n}\nconst o = mk();\nconst c = Object.create(o);\n/** @returns {*} */\nfunction withOwn() {\n  return { toString() { return \"own\"; } };\n}\nconst w = withOwn();\nconst d = Object.create(w);\nconsole.log(`${o.toString()} ${c.toString()} ${String(c)} ${w.toString()} ${d.toString()} ${o.toLocaleString()}`);", "js");
+  expect(stdout).toBe("[object Object] [object Object] [object Object] own own [object Object]\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("A3-RENDER-02 numeric-literal keys print their VALUE (unsafe integers, hex/octal/binary, exponents, separators)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("A3-RENDER-02", "// @dynamic\n\"use strict\";\n// numeric-literal keys print their VALUE (unsafe integers, hex/octal/binary, exponents, separators)\n/** @returns {*} */\nfunction mk() {\n  return {};\n}\nconst o = mk();\nconst id = (...a) => a.length;\nconst tries = [\n  () => id(...o[9007199254740993]),\n  () => id(...o[99999999999999999999]),\n  () => id(...o[0xff]),\n  () => id(...o[0o17]),\n  () => id(...o[0b101]),\n  () => id(...o[1e3]),\n  () => id(...o[1e21]),\n  () => id(...o[2.50]),\n  () => id(...o[.5]),\n  () => id(...o[1_000]),\n  () => id(...o[\"it's\"]),\n];\nfor (const t of tries) {\n  try {\n    t();\n  } catch (e) {\n    console.log(`${e.message}`);\n  }\n}", "js");
+  expect(stdout).toBe("o[9007199254740992] is not iterable (cannot read property undefined)\no[100000000000000000000] is not iterable (cannot read property undefined)\no[255] is not iterable (cannot read property undefined)\no[15] is not iterable (cannot read property undefined)\no[5] is not iterable (cannot read property undefined)\no[1000] is not iterable (cannot read property undefined)\no[1e+21] is not iterable (cannot read property undefined)\no[2.5] is not iterable (cannot read property undefined)\no[0.5] is not iterable (cannot read property undefined)\no[1000] is not iterable (cannot read property undefined)\no.it's is not iterable (cannot read property undefined)\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+

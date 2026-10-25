@@ -127,6 +127,9 @@ export interface FsLaddersDeps {
   entriesArrayType: () => number;
   entryT: () => number;
   entryRef: () => ValType;
+  /** Unit A3: dyn.guardCell — the named refusal of an island getter met by
+   * a raw entry read (nothing where getters cannot exist). */
+  guardCell: (c: Code) => void;
   /** `%w.strEq(ref,ref)->i32` — content equality, for the entry-key walk. */
   strEq: () => number;
   /** `%w.bytes.isEncoding(str) -> i32` (typedarrays.ts, Buffer.isEncoding). */
@@ -707,6 +710,7 @@ export class FsLaddersBuilder {
       c.ifVoid();
       c.localGet(E);
       c.structGet(entryT, ENTRY_VALUE);
+      this.deps.guardCell(c);
       c.localSet(ENCV);
       c.localGet(ENCV);
       c.structGet(dynT, DYN_KIND);

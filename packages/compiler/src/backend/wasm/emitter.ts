@@ -8939,6 +8939,7 @@ class Assembler {
       entriesArrayType: () => this.dyn.entriesArrayType(),
       entryT: () => this.dyn.entryT(),
       entryRef: () => this.dyn.entryRef(),
+      guardCell: (c: Code) => this.dyn.guardCell(c),
       strEq: () => this.strEqHelper(),
       isEncoding: () => this.bytesB.isEncodingHelper(),
       numReceived: () => this.bytesB.numReceivedHelper(),
@@ -28474,6 +28475,9 @@ class Assembler {
           case "callMethod": {
             if (e.name === undefined) throw new Error("emitter bug: jsOp callMethod without a name");
             const name = e.name;
+            // The callee as V8 spells it for "<x> is not a function" (the
+            // front end's rendering, board #243 review), else the name.
+            const what = e.spelling ?? name;
             // globalGet's CLOSED TABLE (increment 21 stage B, gate 3):
             // jsOp:globalGet never produces a real runtime "ambient
             // object" value — it is recognized here as a STATIC IR
@@ -28738,7 +28742,7 @@ class Assembler {
                 code.localSet(argsVec0);
                 code.localGet(recv);
                 code.localGet(argsVec0);
-                this.pushStrLit(name);
+                this.pushStrLit(what);
                 code.call(this.dyn.invoke(name));
                 this.releaseScratch(this.dyn.arrRef(), argsVec0);
               }
@@ -28832,7 +28836,7 @@ class Assembler {
                 code.localSet(argsVec0);
                 code.localGet(recv);
                 code.localGet(argsVec0);
-                this.pushStrLit(name);
+                this.pushStrLit(what);
                 code.call(this.dyn.invoke(name));
                 this.releaseScratch(this.dyn.arrRef(), argsVec0);
               }
@@ -28877,7 +28881,7 @@ class Assembler {
               code.else_();
               code.localGet(recv);
               code.localGet(argsVecR);
-              this.pushStrLit(name);
+              this.pushStrLit(what);
               code.call(this.dyn.invoke(name));
               code.end();
               this.emitPendingCheck();
@@ -28965,7 +28969,7 @@ class Assembler {
                 }
                 code.localGet(recv);
                 code.localGet(argsVecT);
-                this.pushStrLit(name);
+                this.pushStrLit(what);
                 code.call(this.dyn.invoke(name));
                 this.releaseScratch(this.dyn.arrRef(), argsVecT);
               }
@@ -28985,7 +28989,7 @@ class Assembler {
             }
             code.localGet(recv);
             code.localGet(argsVec);
-            this.pushStrLit(name);
+            this.pushStrLit(what);
             code.call(this.dyn.invoke(name));
             this.emitPendingCheck();
             this.releaseScratch(this.dyn.dynRef(), recv);
@@ -29212,6 +29216,28 @@ class Assembler {
             code.i32Const(0);
             code.call(this.dyn.spreadPush());
             this.emitPendingCheck();
+            if (e.args.length === 5) {
+              // The METHOD form (board #243): the receiver's method by
+              // name through the invoke ladder — an own function member
+              // runs with `this` = the receiver, a modeled prototype
+              // method (an array's push, a string's concat) dispatches on
+              // the receiver's kind, anything else throws "<callee> is not
+              // a function" with the front end's spelling.
+              const m = e.args[3]!;
+              const what = e.args[4]!;
+              if (m.kind !== "jsMarshal" || m.value.kind !== "strLit" || what.kind !== "jsMarshal" || what.value.kind !== "strLit") {
+                throw new Error("emitter bug: callSpread's method form without literal names");
+              }
+              code.localGet(fn);
+              code.localGet(argsVec);
+              this.pushStrLit(what.value.value);
+              code.call(this.dyn.invoke(m.value.value));
+              this.emitPendingCheck();
+              this.releaseScratch(this.dyn.dynRef(), src);
+              this.releaseScratch(this.dyn.dynRef(), fn);
+              this.releaseScratch(this.dyn.arrRef(), argsVec);
+              return;
+            }
             code.localGet(fn);
             code.localGet(argsVec);
             this.pushStrLit(this.islandCalleeSpelling(e.args[0]!));

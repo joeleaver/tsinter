@@ -2295,12 +2295,11 @@ test("dyn fn: JS ARITY through the thunk, and the adapter's result check", async
 });
 
 test("S018: the not-a-function TypeError names the callee's SOURCE text", async () => {
-  // Four of these seven disagree with Node, and they are the four the
+  // Three of these eight disagree with Node, and they are the three the
   // register names: V8 re-renders the callee from its own AST (stripping
-  // parens, normalizing whitespace, spelling a string-literal computed
-  // key as a dotted one) while the lowering threads a compile-time
-  // spelling through. The other three agree exactly. The C lane
-  // reproduces every line, verified against a C-lane build.
+  // parens, normalizing whitespace) while the lowering threads a
+  // compile-time spelling through. The others agree exactly; `o['f']()`
+  // is a method call since board #243 and spells V8's dotted `o.f`.
   const res = await buildWasm(
     "dyn-fn-naf.ts",
     [
@@ -2326,7 +2325,7 @@ test("S018: the not-a-function TypeError names the callee's SOURCE text", async 
       "value is not a function", // S018 — Node: "g"
       "o.a.b is not a function", // agrees
       "o . a . b is not a function", // S018 — Node: "o.a.b"
-      "o['f'] is not a function", // S018 — Node: "o.f"
+      "o.f is not a function", // agrees (board #243: a literal-key method call)
       "o[k] is not a function", // agrees — the KEY is not evaluated
       "o.arr[0] is not a function", // agrees
       // S018 — Node: "(intermediate value)(intermediate value)(intermediate

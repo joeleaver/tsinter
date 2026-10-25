@@ -4246,6 +4246,8 @@ ScrJsval *scr_jsval_call(ScrJsval *f, int argc, ScrJsval **argv);
  * spread expression's source spelling (the nullish text spells it).
  * Borrows everything; +1 out, or NULL with the exception bridged. */
 ScrJsval *scr_jsval_call_spread(ScrJsval *f, ScrJsval *pre, ScrJsval *spread, const ScrStr *what);
+ScrJsval *scr_jsval_call_spread_method(ScrJsval *recv, ScrJsval *pre, ScrJsval *spread, const ScrStr *what,
+                                       const ScrStr *key, const ScrStr *name);
 /* `new X(...)` on an island callee (jsOp construct) — JS_CallConstructor.
  * Borrows everything; +1 out, or NULL with the exception bridged. */
 ScrJsval *scr_jsval_construct(ScrJsval *f, int argc, ScrJsval **argv);

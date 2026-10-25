@@ -3256,12 +3256,78 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
           `'.${expr.expression.name.text}()' calls through 'unknown'-valued receivers in dynamically-executed positions`,
         );
       }
+      if (expr.arguments.some((a) => ts.isSpreadElement(a))) {
+        return islandMethodSpreadCall(L, expr, receiver, expr.expression.name.text, expr.expression.getText(), loc);
+      }
       const args = expr.arguments.map((a) => L.jsvalIn(L.lowerExpr(a), a));
+      const spelling = v8SpreadSpelling(expr.expression.getText());
       const result: IrExpr = {
         kind: "jsOp", op: "callMethod", name: expr.expression.name.text,
+        ...(spelling !== "" ? { spelling } : {}),
         args: [receiver, ...args], type: JSVAL, loc,
       };
       return islandPrimitiveExit(L, expr, result);
+    }
+    // `o["m"](...)` — an ELEMENT-access callee on an island (or checked-
+    // dynamic) receiver is a METHOD call too: `this` is the receiver, as in
+    // JS (board #243 — it lowered as a plain call of the member read, so
+    // `this` was undefined and `a["push"](x)` threw). A literal key is the
+    // method name, so the call takes the property-access forms exactly. A
+    // COMPUTED key (`o[k](...)`) has no method-call form with a runtime
+    // name and keeps the plain call below (the member read, then a call
+    // with `this` undefined — SEMANTICS.md S043's A3 amendment): the
+    // dispatch tables real programs write (`fns[i](3)` over an `any[]`,
+    // `table[k](1)` over a `Record<string, any>`, corpus 2600's
+    // `catchWarning[warning.name](warning)`) call arrows and plain
+    // functions that never read `this`.
+    const elemKeyNode = ts.isElementAccessExpression(expr.expression) ? expr.expression.argumentExpression : null;
+    if (
+      elemKeyNode !== null &&
+      (ts.isStringLiteral(elemKeyNode) || ts.isNoSubstitutionTemplateLiteral(elemKeyNode) || ts.isNumericLiteral(elemKeyNode)) &&
+      ts.isElementAccessExpression(expr.expression) &&
+      !expr.expression.questionDotToken &&
+      !expr.questionDotToken &&
+      (L.isIslandExpr(expr.expression.expression) ||
+        L.isIslandExpr(expr.expression) ||
+        probeLower(L, expr.expression.expression)?.type.kind === "dyn")
+    ) {
+      const keyNode = elemKeyNode;
+      const key: string = ts.isNumericLiteral(keyNode) ? String(Number(keyNode.text)) : keyNode.text;
+      const recvProbe = probeLower(L, expr.expression.expression);
+      if (recvProbe?.type.kind === "jsval") {
+        if (expr.arguments.some((a) => ts.isSpreadElement(a))) {
+          return islandMethodSpreadCall(L, expr, recvProbe, key, expr.expression.getText(), loc);
+        }
+        const args = expr.arguments.map((a) => L.jsvalIn(L.lowerExpr(a), a));
+        const spelling = v8SpreadSpelling(expr.expression.getText());
+        const result: IrExpr = {
+          kind: "jsOp", op: "callMethod", name: key,
+          ...(spelling !== "" ? { spelling } : {}),
+          args: [recvProbe, ...args], type: JSVAL, loc,
+        };
+        return islandPrimitiveExit(L, expr, result);
+      }
+      // (Spread arguments on a checked-dynamic receiver keep the
+      // stored-member path below, as for `o.m(...xs)`.)
+      if (recvProbe?.type.kind === "dyn" && !expr.arguments.some((a) => ts.isSpreadElement(a))) {
+        const args = expr.arguments.map((a) => L.lowerExprExpecting(a, DYN));
+        return {
+          kind: "dynInvoke",
+          recv: recvProbe,
+          method: key,
+          // V8's spelling of the whole callee (`o['f']` reads `o.f`,
+          // `o["list"][0]` reads `o.list[0]`); a callee it does not render
+          // keeps the receiver's source text and the key's own form.
+          calleeName:
+            v8SpreadSpelling(expr.expression.getText()) ||
+            (ts.isNumericLiteral(keyNode)
+              ? `${expr.expression.expression.getText()}[${key}]`
+              : `${expr.expression.expression.getText()}.${key}`),
+          args,
+          type: DYN,
+          loc,
+        };
+      }
     }
     if (L.isIslandExpr(expr.expression)) {
       // `o.m(...)` where o LOWERS checked-dynamic and the checker types
@@ -8710,12 +8776,13 @@ export function lowerFunction(L: Lowerer, decl: ts.FunctionDeclaration): IrFunct
 /** V8's CallPrinter rendering of a spread source, as its nullish spread-call
  * TypeError prints it ("<x> is not iterable (cannot read property null)"),
  * from the source text — shared by every lane (unit A1 review; board #242:
- * the lanes printed the source text verbatim). Rendered: an identifier or
- * `this`, then any chain of `.name`, `[name]`, `[n]` for an index whose
- * source digits are the number's own ToString (V8 prints the VALUE:
- * `o[99999999999999999999]` reads `o[100000000000000000000]`), `["name"]`
- * (printed `.name`) and calls (printed `(...)`, the arguments elided), with
- * redundant outer parentheses dropped. Every other shape — whitespace,
+ * the lanes printed the source text verbatim). Rendered: an identifier,
+ * `this` or a parenthesized rendered expression, then any chain of
+ * `.name`, `[name]`, a numeric-literal index (printed as its VALUE:
+ * `o[99999999999999999999]` reads `o[100000000000000000000]`, `o[0x10]`
+ * reads `o[16]`), a string-literal key without escapes (printed
+ * `.content`: `o["0"]` reads `o.0`) and calls (printed `(...)`, the
+ * arguments elided), with redundant outer parentheses dropped. Every other shape — whitespace,
  * optional chains (V8's "(intermediate value)"), literals, operators —
  * answers the EMPTY string, which each backend reads as "not rendered": a
  * nullish source there refuses by name instead of naming itself wrongly
@@ -8727,10 +8794,22 @@ export function v8SpreadSpelling(text: string): string {
     t = t.slice(1, -1);
   }
   const ident = /^[A-Za-z_$][A-Za-z0-9_$]*/;
+  let out: string;
+  let i: number;
   const head = ident.exec(t);
-  if (head === null) return "";
-  let out = head[0];
-  let i = head[0].length;
+  if (head !== null) {
+    out = head[0];
+    i = head[0].length;
+  } else if (t[0] === "(") {
+    // A parenthesized head (`(o).x`): V8 prints the inner expression.
+    const close = matchParenClose(t, 0);
+    if (close < 0) return "";
+    out = v8SpreadSpelling(t.slice(1, close));
+    if (out === "") return "";
+    i = close + 1;
+  } else {
+    return "";
+  }
   while (i < t.length) {
     const ch = t[i];
     if (ch === ".") {
@@ -8742,9 +8821,16 @@ export function v8SpreadSpelling(text: string): string {
       const close = t.indexOf("]", i);
       if (close < 0) return "";
       const key = t.slice(i + 1, close);
-      const str = /^"([A-Za-z_$][A-Za-z0-9_$]*)"$|^'([A-Za-z_$][A-Za-z0-9_$]*)'$/.exec(key);
+      // A string-literal key prints as `.content` whatever it holds
+      // (`o["a-b"]` reads `o.a-b`, measured); an escape is left to the
+      // fence. A numeric literal prints its VALUE (`o[0x10]` reads
+      // `o[16]`, `o[99999999999999999999]` reads `o[100000000000000000000]`).
+      const str = /^"([^"\\]*)"$|^'([^'\\]*)'$/.exec(key);
+      // (numeric separators drop: `o[1_000]` reads `o[1000]`)
+      const digits = /^[0-9a-zA-Z.+-]+$/.test(key.replace(/_/g, "")) && !/__|^_|_$|_\.|\._/.test(key) ? key.replace(/_/g, "") : key;
+      const num = /^(?:0[xX][0-9a-fA-F]+|0[oO][0-7]+|0[bB][01]+|(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?)$/.test(digits) ? Number(digits) : NaN;
       if (str !== null) out += `.${str[1] ?? str[2]}`;
-      else if (/^[0-9]+$/.test(key) && String(Number(key)) === key) out += `[${key}]`;
+      else if (!Number.isNaN(num)) out += `[${String(num)}]`;
       else if (ident.test(key) && ident.exec(key)![0] === key) out += `[${key}]`;
       else return "";
       i = close + 1;
@@ -8779,4 +8865,49 @@ function matchParenClose(t: string, open: number): number {
     }
   }
   return -1;
+}
+
+/** `o.m(...pre, ...s)` / `o["m"](...)` on an island receiver (board #243):
+ * jsOp callSpread's METHOD form — args (receiver, pre, spread, the method
+ * name, the callee spelling for "<x> is not a function"), the receiver
+ * read once, `this` bound to it, the spread through the iterator protocol
+ * with V8's texts. One trailing spread after plain arguments, as for a
+ * function callee; other spread shapes keep the fence. */
+function islandMethodSpreadCall(
+  L: Lowerer,
+  expr: ts.CallExpression,
+  receiver: IrExpr,
+  method: string,
+  calleeText: string,
+  loc: SrcLoc,
+): IrExpr {
+  const args = expr.arguments;
+  const last = args[args.length - 1]!;
+  if (!ts.isSpreadElement(last) || args.slice(0, -1).some((a) => ts.isSpreadElement(a))) {
+    L.unsupported(
+      "SC1090",
+      expr,
+      "spread arguments before positional arguments in island calls (one trailing spread after the fixed arguments is the supported form)",
+    );
+  }
+  const spread = last as ts.SpreadElement;
+  const leading = args.slice(0, -1).map((a) => L.jsvalIn(L.lowerExpr(a), a));
+  const spreadV = L.jsvalIn(L.lowerExpr(spread.expression), spread.expression);
+  const str = (value: string): IrExpr => ({ kind: "jsMarshal", value: { kind: "strLit", value, type: STRING, loc }, type: JSVAL, loc });
+  const calleeName = v8SpreadSpelling(calleeText);
+  const result: IrExpr = {
+    kind: "jsOp",
+    op: "callSpread",
+    name: v8SpreadSpelling(spread.expression.getText()),
+    args: [
+      receiver,
+      { kind: "jsOp", op: "arrLit", args: leading, type: JSVAL, loc },
+      spreadV,
+      str(method),
+      str(calleeName === "" ? "value" : calleeName),
+    ],
+    type: JSVAL,
+    loc,
+  };
+  return islandPrimitiveExit(L, expr, result);
 }

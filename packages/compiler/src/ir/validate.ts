@@ -4788,13 +4788,16 @@ function validateFunction(
         if (named !== (e.name !== undefined)) {
           err(`jsOp ${e.op} ${named ? "requires" : "forbids"} a name`, e.loc);
         }
+        if (e.spelling !== undefined && e.op !== "callMethod") {
+          err(`jsOp ${e.op} forbids a callee spelling (callMethod only)`, e.loc);
+        }
         const arity: Record<string, number | null> = {
           add: 2, sub: 2, mul: 2, div: 2, mod: 2, pow: 2,
           lt: 2, le: 2, gt: 2, ge: 2, eq: 2, neq: 2, instanceOf: 2,
           neg: 1, plus: 1, truthy: 1, not: 1, typeof: 1, toStr: 1,
           getProp: 1, setProp: 2, getIdx: 2, setIdx: 3, globalGet: 0,
           undefLit: 0, nullLit: 0, iterNew: 1, defineGetter: 3, objSpread: 2,
-          callSpread: 3, // callee + pre array + spread source
+          callSpread: null, // callee + pre array + spread source, or the METHOD form: receiver + pre + spread + method name + callee spelling (checked below)
           callMethod: null, optCallMethod: null, callFn: null, construct: null, // receiver/callee + any number of args
           objLit: null, arrLit: null, tplStrings: null, // variable length (objLit: key/value pairs; tplStrings: n cooked + n raw)
         };
@@ -4804,6 +4807,14 @@ function validateFunction(
         }
         if (want === null && e.op !== "objLit" && e.op !== "arrLit" && e.op !== "tplStrings" && e.args.length < 1) {
           err(`jsOp ${e.op} needs a receiver/callee arg`, e.loc);
+        }
+        if (e.op === "callSpread" && e.args.length !== 3 && e.args.length !== 5) {
+          err(`jsOp callSpread takes 3 args (or 5, the method form), got ${e.args.length}`, e.loc);
+        }
+        if (e.op === "callSpread" && e.args.length === 5) {
+          for (const a of e.args.slice(3)) {
+            if (a.kind !== "jsMarshal" || a.value.kind !== "strLit") err("jsOp callSpread's method name and callee spelling must be marshaled string literals", e.loc);
+          }
         }
         if (e.op === "objLit" && e.args.length % 2 !== 0) {
           err("jsOp objLit takes key/value pairs", e.loc);

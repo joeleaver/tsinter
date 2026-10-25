@@ -6962,6 +6962,22 @@ class LlEmitter {
         // real spread syntax — iterator protocols are the engine's own,
         // the guards front-run V8's spread-call TypeError texts (the name
         // literal is the spread expression's spelling).
+        if (e.args.length === 5) {
+          // The METHOD form (board #243): receiver, pre, spread, then the
+          // method name and callee spelling as string literals.
+          const lit = (x: IrExpr): string => {
+            if (x.kind !== "jsMarshal" || x.value.kind !== "strLit") throw new Error("callSpread method form without literal names");
+            return this.internLiteral(x.value.value);
+          };
+          const key = lit(e.args[3]!);
+          const nm = lit(e.args[4]!);
+          this.declare(`declare ptr @scr_jsval_call_spread_method(ptr, ptr, ptr, ptr, ptr, ptr)`);
+          return fallible(() => {
+            const t = B.tmp();
+            B.line(`${t} = call ptr @scr_jsval_call_spread_method(ptr ${a(0)}, ptr ${a(1)}, ptr ${a(2)}, ptr ${nameSym()}, ptr ${key}, ptr ${nm})`);
+            return t;
+          });
+        }
         this.declare(`declare ptr @scr_jsval_call_spread(ptr, ptr, ptr, ptr)`);
         return fallible(() => {
           const t = B.tmp();
