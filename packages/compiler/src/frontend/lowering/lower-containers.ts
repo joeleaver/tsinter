@@ -11,7 +11,7 @@ import { forOfVarTarget, lowerDestructuringAssign } from "./lower-stmts.js";
 import { isJsSourceFile, locOf } from "../program.js";
 import { DYN_DISPATCH_METHODS, islandPrimitiveExit } from "./lower-calls.js";
 import { typeKey } from "../types.js";
-import { dynUndefinedExpr, own, WidthLift } from "./lowerer.js";
+import { dynUndefinedExpr, own, WidthLift, withEsFnName } from "./lowerer.js";
 
 /** Lower an expression whose checker type is statically `undefined`/`void`.
  * Optional builtin arguments use this before their ordinary expected-type
@@ -5729,7 +5729,7 @@ function lowerBufferInstanceMethod(L: Lowerer, call: ts.CallExpression,
     const v = L.lowerExpr(args[i]!);
     if (v.type.kind === "dyn") return v;
     if (v.kind === "unitLit" || L.dynConvertible(v.type)) {
-      return { kind: "dynFrom", value: v, type: DYN, loc: v.loc };
+      return withEsFnName(L, { kind: "dynFrom", value: v, type: DYN, loc: v.loc }, args[i]!);
     }
     L.noLowering(
       `.${name} of '${L.fmt(v.type)}' values`,
@@ -6054,7 +6054,7 @@ const DV_SETTERS: Record<string, { method: IrBytesIntrinsicMethod; le: boolean }
       const dyns = sides.map((v, i) => {
         if (v.type.kind === "dyn") return v;
         if (v.kind === "unitLit" || L.dynConvertible(v.type)) {
-          return { kind: "dynFrom", value: v, type: DYN, loc: v.loc } as IrExpr;
+          return withEsFnName(L, { kind: "dynFrom", value: v, type: DYN, loc: v.loc }, args[i]!);
         }
         L.noLowering(
           `Buffer.compare of '${L.fmt(v.type)}' values`,

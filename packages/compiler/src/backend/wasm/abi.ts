@@ -1046,6 +1046,23 @@
  *     Node's, never is. The bytes' quality is the host's business — the
  *     text is the enforcement (SEMANTICS.md S093).
  *
+ *   (import "tsinter" "sleep" (func (param f64)))   [Atomics.wait modules only]
+ *     sleep(ms): BLOCK the calling thread for ms milliseconds, then return
+ *     — nanosleep(2)'s shape (a native host: nanosleep / Sleep, resumed
+ *     across EINTR; a browser worker: Atomics.wait on a private
+ *     SharedArrayBuffer; never a spin on a clock). The module's ONE
+ *     synchronous wait: `Atomics.wait` whose element equals the expected
+ *     value (no thread can ever notify, so the wait is a sleep that always
+ *     times out). `ms` is >= 0 and may be +Infinity: Node then blocks
+ *     forever, and so does a host that honours it (a host may instead end
+ *     the program loudly — the harness hosts do, rather than hang a test).
+ *     Afterwards the MONOTONIC clock (`now`) and the wall clock must both
+ *     read at least ms later: a host whose clock is virtual advances it by
+ *     at least ms (the harness: by max(ms, the time it really slept), the
+ *     same accounting as cpCall RUN). Nothing runs while it sleeps — no
+ *     timer, microtask or event is delivered, exactly Node's blocked main
+ *     thread. Present only in modules that reach `Atomics.wait`.
+ *
  *   (export "_start" (func))            — the program; run it once.
  *   (export "_tick" (func (param f64) (result f64)))  [timer modules only]
  *   (export "_loop" (func (param f64) (result f64)))  [event modules only,
@@ -1172,6 +1189,7 @@ export const IMPORT_EV_POLL = "evPoll";
 export const IMPORT_NET_CALL = "netCall";
 export const IMPORT_TLS_CALL = "tlsCall";
 export const IMPORT_RANDOM = "random";
+export const IMPORT_SLEEP = "sleep";
 export const EXPORT_ENTRY = "_start";
 export const EXPORT_TICK = "_tick";
 export const EXPORT_LOOP = "_loop";

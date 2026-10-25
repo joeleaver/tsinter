@@ -4196,6 +4196,44 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
     );
   }
 
+/** Is `node` syntactically `new Int32Array(new SharedArrayBuffer(n))` (both
+ * the stdlib constructors), or a read of a `const` variable or a
+ * `static readonly` class property whose initializer is? */
+function visiblySharedInt32Array(L: Lowerer, node: ts.Expression): boolean {
+  const strip = (n: ts.Node): ts.Node => {
+    while (ts.isParenthesizedExpression(n) || ts.isAsExpression(n) || ts.isNonNullExpression(n)) n = n.expression;
+    return n;
+  };
+  const isStdCtor = (e: ts.Expression, name: string): boolean =>
+    ts.isIdentifier(e) && e.text === name && L.isStdlibSymbol(L.resolveValueSymbol(e) ?? undefined);
+  const isSharedNew = (n: ts.Node): boolean => {
+    n = strip(n);
+    if (!ts.isNewExpression(n) || !isStdCtor(n.expression, "Int32Array")) return false;
+    const a = n.arguments;
+    if (a === undefined || a.length !== 1) return false;
+    const inner = strip(a[0]!);
+    return ts.isNewExpression(inner) && isStdCtor(inner.expression, "SharedArrayBuffer");
+  };
+  const n = strip(node);
+  if (isSharedNew(n)) return true;
+  const sym =
+    ts.isIdentifier(n) ? L.resolveValueSymbol(n)
+    : ts.isPropertyAccessExpression(n) ? (L.checker.getSymbolAtLocation(n.name) ?? null)
+    : null;
+  if (sym === null) return false;
+  const d = L.checker.valueDeclarationOf(sym);
+  if (d === undefined) return false;
+  if (ts.isVariableDeclaration(d)) {
+    return (ts.getCombinedNodeFlags(d) & ts.NodeFlags.Const) !== 0 && d.initializer !== undefined && isSharedNew(d.initializer);
+  }
+  if (ts.isPropertyDeclaration(d)) {
+    const mods = ts.getCombinedModifierFlags(d);
+    return (mods & ts.ModifierFlags.Static) !== 0 && (mods & ts.ModifierFlags.Readonly) !== 0 &&
+      d.initializer !== undefined && isSharedNew(d.initializer);
+  }
+  return false;
+}
+
 /** `Atomics.wait(int32Array, idx, expected, timeoutMs)` — the
    * synchronous-sleep idiom (RouteStore's
    * `Atomics.wait(sleepBuffer, 0, 0, ms)`): scriptc has no threads, so
@@ -4236,6 +4274,21 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
         `Atomics.wait over '${L.checker.typeToString(L.typeOf(arrNode))}' values`,
         arrNode,
         "an Int32Array is the supported waitable array",
+      );
+    }
+    // The buffer is erased at construction (lower-containers.ts), so the
+    // lowered value cannot say whether it is shared, and Node throws
+    // TypeError "[object Int32Array] is not a shared typed array." for an
+    // unshared one. The wait is admitted only where the SOURCE shows the
+    // array is `new Int32Array(new SharedArrayBuffer(n))`: that expression
+    // itself, or a `const` / `static readonly` binding initialized with
+    // it (no other assignment can reach either).
+    if (!visiblySharedInt32Array(L, arrNode)) {
+      L.noLowering(
+        "Atomics.wait over an Int32Array not visibly backed by a SharedArrayBuffer",
+        arrNode,
+        "Node throws TypeError for an unshared Int32Array; pass `new Int32Array(new SharedArrayBuffer(n))` " +
+          "directly or through a const (or static readonly field) initialized with it",
       );
     }
     const arr = L.lowerExpr(arrNode);

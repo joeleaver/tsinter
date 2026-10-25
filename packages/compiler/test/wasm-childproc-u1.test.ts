@@ -85,11 +85,11 @@ describe("INC-28 U1 child_process — host-free rows", () => {
     expect(r.diagnostics.join("\n")).toContain("(libCall:child.unref:pipe)");
   });
 
-  test("N-NL-02 (re-aimed at INC-28 U3, which lifts child.stdout) TextDecoder's decode, not picked by U3, stays refused by key: SC3001 (libCall:text.decode) — SINGLE-EDIT: a text.decode arm added", async () => {
-    const r = await build("console.log(new TextDecoder().decode(new Uint8Array([104, 105])));\n");
+  test("N-NL-02 (re-aimed at INC-28 U3, which lifts child.stdout, then at unit H, which lifts TextDecoder's decode) zlib's deflateSync stays refused by key: SC3001 (libCall:zlib.deflateSync) — SINGLE-EDIT: a zlib.deflateSync arm added", async () => {
+    const r = await build('import { deflateSync } from "node:zlib";\nconsole.log(deflateSync(Buffer.from("hi")).length);\n');
     expect(r.ok).toBe(false);
     if (r.ok) return;
-    expect(r.diagnostics.join("\n")).toContain("(libCall:text.decode)");
+    expect(r.diagnostics.join("\n")).toContain("(libCall:zlib.deflateSync)");
   });
 
   test("N-NL-03 (re-aimed at INC-28 U3, which lifts the stream listeners) a piped STDIN stays refused by the front end, every lane — SINGLE-EDIT: the stdin pipe fence removed", async () => {

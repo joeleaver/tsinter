@@ -140,6 +140,17 @@ async function instantiate(modulePath: string, overrides?: HostOverrides) {
         if (memory === null) throw new Error("random before instantiation completed");
         randomFillSync(new Uint8Array(memory.buffer, ptr, len));
       },
+      // Atomics.wait modules only (unit H, abi.ts `sleep`): a REAL blocking
+      // sleep (Atomics.wait on a private SharedArrayBuffer — never a spin on
+      // a clock), and the virtual clock moves by max(ms, the time really
+      // slept): cpCall RUN's accounting. A non-finite ms (Node blocks forever)
+      // ends the run loudly instead of hanging the worker.
+      sleep(ms: number): void {
+        if (!Number.isFinite(ms) || ms < 0) throw new Error(`tsinter.sleep(${ms}): an unbounded wait (Node blocks forever)`);
+        const t0 = performance.now();
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+        clock += Math.max(ms, performance.now() - t0);
+      },
       // date.now / no-arg `new Date()` modules only (abi.ts).
       wallClock: (): number => wallBase + clock,
 

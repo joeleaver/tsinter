@@ -137,6 +137,7 @@ import {
   IMPORT_EXIT,
   IMPORT_NET_CALL,
   IMPORT_RANDOM,
+  IMPORT_SLEEP,
   IMPORT_TLS_CALL,
   IMPORT_FS_CALL,
   IMPORT_HOST_NUM,
@@ -458,6 +459,8 @@ function timerSurfaceReachable(mod: WModule): boolean {
       // the program arms a timer itself.
       if (
         node.startsWith("timers.") ||
+        // Unit H: node:timers/promises arms the same heap / queue.
+        node.startsWith("tp.") ||
         node === "process.activeResources" ||
         node === "fs.existsChk" ||
         node === "cp.spawn" ||
@@ -1052,6 +1055,9 @@ function spawnSyncMayThrowView(mod: WModule): WModule {
     // [ERR_INVALID_URI] for a string ending in a surrogate (encodeStr);
     // the native lanes never throw there (board #232).
     "qs.escape", "qs.stringify",
+    // Unit H: Atomics.wait's index check throws Node's RangeError on this
+    // tier; the native lanes trap on an out-of-range index instead.
+    "atomics.wait",
   ]);
   let found = false;
   const scan = (node: unknown): void => {
@@ -2385,6 +2391,9 @@ class Assembler {
   private readonly tlsCallFunc: number | null;
   /** `tsinter.random`'s index (node:crypto's randomness), or null. */
   private readonly randomFunc: number | null;
+  /** Unit H: `tsinter.sleep`'s index (Atomics.wait's synchronous sleep),
+   * or null outside a module that reaches `atomics.wait`. */
+  private readonly sleepFunc: number | null;
   /** The exit-drain gate's static fact — see exitListenerSurfaceReachable's
    * own comment (INC-26 P1). Computed ONCE in the constructor; every drain
    * gate site reads this, never the mutable `procField`/
@@ -2632,6 +2641,12 @@ class Assembler {
     // import index moves.
     this.randomFunc = libCallWhere(mod, isCryptoRandomKey)
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_RANDOM, this.mb.funcType([I32, I32], []))
+      : null;
+    // `sleep`'s decision (unit H, abi.ts): Atomics.wait's synchronous
+    // sleep, in modules that reach `atomics.wait`, minted after random so
+    // no earlier import index moves.
+    this.sleepFunc = libCallWhere(mod, (fn) => fn === "atomics.wait")
+      ? this.mb.importFunc(IMPORT_MODULE, IMPORT_SLEEP, this.mb.funcType([F64], []))
       : null;
     // ── end INC-26 host-import block ──
     // The exit-drain gate's STATIC fact (see exitListenerSurfaceReachable's
@@ -23424,6 +23439,7 @@ class Assembler {
         if (this.emitHttpLibCall(e)) return;
         if (this.emitNetLibCall(e)) return;
         if (this.emitBufferLibCall(e)) return;
+        if (this.emitTailLibCall(e)) return;
         if (this.emitTimerCall(e)) return;
         if (this.emitDcLibCall(e)) return;
         if (this.emitEmitterLibCall(e)) return;
@@ -32348,6 +32364,391 @@ class Assembler {
    * stage B). Split out like emitTimerCall's own cluster — one small
    * dispatcher rather than growing the enormous e.fn if-chain above.
    * Returns false (unhandled) for anything not listed here yet. */
+  /* ── unit H: the small library tail ───────────────────────────────────
+   * node:timers/promises' promisified pair, WHATWG TextDecoder.decode,
+   * Atomics.wait's synchronous sleep, and the checked-dynamic Buffer
+   * argument ladders (scr_bytes_io.c's validators, ported). */
+  private emitTailLibCall(e: Extract<IrExpr, { kind: "libCall" }>): boolean {
+    const code = this.fn.code;
+    const walkAll = (): void => {
+      for (const a of e.args) this.walkExpr(a);
+    };
+    switch (e.fn) {
+      case "text.decode":
+        walkAll();
+        code.call(this.bytesB.textDecodeHelper());
+        return true;
+      case "tp.setTimeout":
+        walkAll();
+        code.call(this.tpPromiseHelper(true));
+        return true;
+      case "tp.setImmediate":
+        code.call(this.tpPromiseHelper(false));
+        return true;
+      case "atomics.wait":
+        walkAll();
+        code.call(this.atomicsWaitHelper());
+        this.emitPendingCheck();
+        return true;
+      case "buffer.compareChk":
+        walkAll();
+        code.call(this.bufCompareChkHelper());
+        this.emitPendingCheck();
+        return true;
+      case "bytes.equalsChk":
+        walkAll();
+        code.call(this.bytesEqualsChkHelper());
+        this.emitPendingCheck();
+        return true;
+      case "bytes.compareChk":
+        walkAll();
+        code.call(this.bytesCompareChkHelper());
+        this.emitPendingCheck();
+        return true;
+      case "buffer.newStringFail":
+        walkAll();
+        code.call(this.bufNewStringFailHelper());
+        this.emitPendingCheck();
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  private readonly tailFns = new Map<string, number>();
+
+  /** Declare-then-build a unit-H helper, interned by name. */
+  private tailDef(
+    name: string,
+    params: ValType[],
+    results: ValType[],
+    build: (c: Code, local: (t: ValType) => number) => void,
+  ): number {
+    const hit = this.tailFns.get(name);
+    if (hit !== undefined) return hit;
+    const idx = this.mb.declareFunc(this.mb.funcType(params, results), `%w.${name}`);
+    this.tailFns.set(name, idx);
+    const locals: ValType[] = [];
+    const c = new Code();
+    build(c, (t) => {
+      locals.push(t);
+      return params.length + locals.length - 1;
+    });
+    this.mb.setBody(idx, locals, c.bytes());
+    return idx;
+  }
+
+  /** `%w.tp.setTimeout(ms) -> promise` / `%w.tp.setImmediate() -> promise`
+   * (scr_tp_set_timeout / scr_tp_set_immediate): a PENDING void promise a
+   * one-shot timer (the statement-form arm — Node's delay coercion, id 0,
+   * nothing can clear it) or the immediate queue fulfils. The armed timer
+   * or immediate holds the loop open until it fires, as Node's does. The
+   * closure only settles: the awaiting continuation's waiter carries its
+   * own AsyncContextFrame (promises.ts), so nothing here is ALS-wrapped. */
+  private tpPromiseHelper(timeout: boolean): number {
+    const name = timeout ? "tp.setTimeout" : "tp.setImmediate";
+    return this.tailDef(name, timeout ? [F64] : [], [this.proms.promRef()], (c, local) => {
+      const P = local(this.proms.promRef());
+      const pair = this.closPairFor([], []);
+      let env = this.tailFns.get("tp.env");
+      if (env === undefined) {
+        env = this.mb.subStructType(
+          "%w.tp.env",
+          [
+            { storage: { kind: "ref", nullable: false, typeIndex: pair.fn }, mutable: false },
+            { storage: this.proms.promRef(), mutable: false },
+          ],
+          pair.clos,
+        );
+        this.tailFns.set("tp.env", env);
+      }
+      const envT = env;
+      let run = this.tailFns.get("tp.resolve");
+      if (run === undefined) {
+        run = this.mb.declareFunc(pair.fn, "%w.tp.resolve");
+        this.tailFns.set("tp.resolve", run);
+        const x = new Code();
+        x.localGet(0);
+        x.refCast(envT);
+        x.structGet(envT, 1);
+        x.i32Const(EXC_OBJ); // kind: unread placeholder for a void payload
+        x.f64Const(0);
+        x.refNull(ANY_HEAP);
+        x.i32Const(0);
+        x.i32Const(1); // fulfilled
+        x.call(this.proms.settle());
+        this.mb.setBody(run, [], x.bytes());
+        this.mb.declareFuncRef(run);
+      }
+      c.call(this.proms.mint());
+      c.localSet(P);
+      c.refFunc(run);
+      c.localGet(P);
+      c.structNew(envT);
+      if (timeout) {
+        c.localGet(0);
+        c.call(this.timers.setTimeout());
+      } else {
+        c.call(this.timers.setImmediate());
+        c.drop();
+      }
+      c.localGet(P);
+    });
+  }
+
+  /** `%w.atomics.wait(arr, idx, expected, timeout) -> str`
+   * (scr_atomics_wait, with the spec's checks Node runs): ToIndex(idx)
+   * and the bounds check → Node's catchable RangeError "Invalid atomic
+   * access index"; expected → ToInt32; timeout NaN → +Infinity, else
+   * max(timeout, 0). A differing element answers "not-equal" at once;
+   * otherwise nothing can ever notify (no threads), so the wait is the
+   * host's `sleep` (abi.ts) and answers "timed-out" — "ok" is
+   * unreachable. Throws through the cell (caller checks). Node's
+   * TypeError for an unshared array cannot arise: the front end admits
+   * only an array the source shows is SharedArrayBuffer-backed. */
+  private atomicsWaitHelper(): number {
+    const bytesRef = this.bytesB.bytesRef();
+    return this.tailDef("atomics.wait", [bytesRef, F64, F64, F64], [this.strRef], (c, local) => {
+      const ARR = 0, IDX = 1, EXP = 2, TMO = 3;
+      const I = local(F64);
+      if (this.sleepFunc === null) throw new Error("wasm emitter bug: atomics.wait without the sleep import");
+      // ToIntegerOrInfinity: NaN → 0, else truncate.
+      c.localGet(IDX);
+      c.localGet(IDX);
+      c.f64Ne();
+      c.ifResult(F64);
+      c.f64Const(0);
+      c.else_();
+      c.localGet(IDX);
+      c.f64Trunc();
+      c.end();
+      c.localSet(I);
+      c.localGet(I);
+      c.f64Const(0);
+      c.f64Ge();
+      c.localGet(I);
+      c.localGet(ARR);
+      c.call(this.bytesB.length());
+      c.f64Lt();
+      c.i32And();
+      c.i32Eqz();
+      c.ifVoid();
+      this.emitSetCellError(c, "%RangeError", "RangeError", (x) => this.pushStrLitInto(x, "Invalid atomic access index"), null);
+      c.refNull(this.strType);
+      c.return_();
+      c.end();
+      c.localGet(ARR);
+      c.localGet(I);
+      c.call(this.bytesB.get("i32"));
+      c.localGet(EXP);
+      c.call(this.toInt32Helper());
+      c.f64ConvertI32S();
+      c.f64Ne();
+      c.ifVoid();
+      this.pushStrLitInto(c, "not-equal");
+      c.return_();
+      c.end();
+      c.localGet(TMO);
+      c.localGet(TMO);
+      c.f64Ne();
+      c.ifResult(F64);
+      c.f64Const(Infinity);
+      c.else_();
+      c.localGet(TMO);
+      c.f64Const(0);
+      c.f64Max();
+      c.end();
+      c.call(this.sleepFunc);
+      this.pushStrLitInto(c, "timed-out");
+    });
+  }
+
+  /** Fill the cell with Node's ERR_INVALID_ARG_TYPE for argument `name`:
+   * `The "<name>" argument must be <expected>. Received <specificType(d)>`
+   * (scr_dyn_arg_type_fail). */
+  private emitTailArgTypeFail(c: Code, name: string, expected: string, pushDyn: (c: Code) => void): void {
+    this.emitSetCellError(c, "%TypeError", "TypeError", (x) => {
+      this.pushStrLitInto(x, `The "${name}" argument must be ${expected}. Received `);
+      pushDyn(x);
+      x.call(this.dyn.specificType());
+      x.call(this.concatHelper());
+    }, "ERR_INVALID_ARG_TYPE");
+  }
+
+  /** scr_bytes_chk_u8, inline: a non-BYTES dyn in local `d` fills the cell
+   * and returns `ret` from the helper. */
+  private emitTailChkU8(c: Code, d: number, name: string, ret: (c: Code) => void): void {
+    c.localGet(d);
+    c.structGet(this.dyn.dynT(), DYN_KIND);
+    c.i32Const(DK.BYTES);
+    c.i32Ne();
+    c.ifVoid();
+    this.emitTailArgTypeFail(c, name, "an instance of Buffer or Uint8Array", (x) => x.localGet(d));
+    ret(c);
+    c.return_();
+    c.end();
+  }
+
+  /** `%w.buf.compareChk(a, b) -> f64` (scr_buffer_compare_chk): the static
+   * Buffer.compare's buf1/buf2 ladder, then the real comparison. */
+  private bufCompareChkHelper(): number {
+    const dynRef = this.dyn.dynRef();
+    return this.tailDef("buf.compareChk", [dynRef, dynRef], [F64], (c) => {
+      const zero = (x: Code): void => x.f64Const(0);
+      this.emitTailChkU8(c, 0, "buf1", zero);
+      this.emitTailChkU8(c, 1, "buf2", zero);
+      this.dyn.bytesPayloadBytes(c, (x) => x.localGet(0));
+      this.dyn.bytesPayloadBytes(c, (x) => x.localGet(1));
+      c.i32Const(0);
+      c.f64Const(0);
+      c.f64Const(0);
+      c.f64Const(0);
+      c.f64Const(0);
+      c.call(this.bytesB.compareBufHelper());
+    });
+  }
+
+  /** `%w.buf.equalsChk(recv, other) -> i32` (scr_bytes_equals_chk). */
+  private bytesEqualsChkHelper(): number {
+    const dynRef = this.dyn.dynRef();
+    return this.tailDef("buf.equalsChk", [this.bytesB.bytesRef(), dynRef], [I32], (c) => {
+      this.emitTailChkU8(c, 1, "otherBuffer", (x) => x.i32Const(0));
+      c.localGet(0);
+      this.dyn.bytesPayloadBytes(c, (x) => x.localGet(1));
+      c.call(this.bytesB.equalsHelper());
+    });
+  }
+
+  /** `%w.buf.compareChk5(src, target, ts, te, ss, se) -> f64`
+   * (scr_bytes_compare_chk): target first, then each offset slot in order
+   * — undefined takes Node's default, a non-number is ERR_INVALID_ARG_TYPE
+   * "of type number", a number runs validateOffset — then the comparison
+   * over the now-validated four. */
+  private bytesCompareChkHelper(): number {
+    const dynRef = this.dyn.dynRef();
+    const bytesRef = this.bytesB.bytesRef();
+    return this.tailDef(
+      "buf.compareChk5",
+      [bytesRef, dynRef, dynRef, dynRef, dynRef, dynRef],
+      [F64],
+      (c, local) => {
+        const SRC = 0, TGT = 1;
+        const T = local(bytesRef);
+        const V = [local(F64), local(F64), local(F64), local(F64)];
+        const zero = (x: Code): void => x.f64Const(0);
+        const lenOf = (l: number) => (x: Code): void => {
+          x.localGet(l);
+          x.call(this.bytesB.length());
+        };
+        this.emitTailChkU8(c, TGT, "target", zero);
+        this.dyn.bytesPayloadBytes(c, (x) => x.localGet(TGT));
+        c.localSet(T);
+        const slots: { name: string; max: (x: Code) => void; dflt: (x: Code) => void }[] = [
+          { name: "targetStart", max: (x) => x.f64Const(9007199254740991), dflt: zero },
+          { name: "targetEnd", max: lenOf(T), dflt: lenOf(T) },
+          { name: "sourceStart", max: (x) => x.f64Const(9007199254740991), dflt: zero },
+          { name: "sourceEnd", max: lenOf(SRC), dflt: lenOf(SRC) },
+        ];
+        slots.forEach((s, i) => {
+          const D = 2 + i;
+          c.localGet(D);
+          c.structGet(this.dyn.dynT(), DYN_KIND);
+          c.i32Const(DK.UNDEF);
+          c.i32Eq();
+          c.ifVoid();
+          s.dflt(c);
+          c.localSet(V[i]!);
+          c.else_();
+          c.localGet(D);
+          c.structGet(this.dyn.dynT(), DYN_KIND);
+          c.i32Const(DK.NUM);
+          c.i32Ne();
+          c.ifVoid();
+          this.emitTailArgTypeFail(c, s.name, "of type number", (x) => x.localGet(D));
+          c.f64Const(0);
+          c.return_();
+          c.end();
+          c.localGet(D);
+          c.structGet(this.dyn.dynT(), DYN_NUM);
+          c.localSet(V[i]!);
+          this.pushStrLitInto(c, s.name);
+          c.localGet(V[i]!);
+          s.max(c);
+          c.call(this.bytesB.validateOffHelper());
+          c.i32Eqz();
+          c.ifVoid();
+          c.f64Const(0);
+          c.return_();
+          c.end();
+          c.end();
+        });
+        c.localGet(SRC);
+        c.localGet(T);
+        c.i32Const(4);
+        for (const v of V) c.localGet(v);
+        c.call(this.bytesB.compareBufHelper());
+      },
+    );
+  }
+
+  /** `%w.buf.newStringFail(got) -> bytes` — `new Buffer(<value not typed
+   * string>, encoding)`, Node's deprecated ctor over the value's runtime
+   * kind. (Node prints DEP0005 before any of these; no lane prints it,
+   * which the corpus covers with `// @no-deprecation`.)
+   *   - a number: the string arm, `The "string" argument must be of type
+   *     string` (scr_buffer_new_string_fail);
+   *   - undefined, null, a boolean, a function: Buffer.from's own
+   *     `The first argument must be of type string or an instance of
+   *     Buffer, ArrayBuffer, or Array or an Array-like Object`;
+   *   - anything else (a string, array, object, bytes, handle ...) goes
+   *     through Buffer.from's ladder in Node — a conversion for a string,
+   *     an array or an array-like, the same TypeError for a plain object
+   *     or a Map — which this libCall cannot run (the encoding is not
+   *     carried): a named catchable Error (SEMANTICS.md S094).
+   * Always throws. */
+  private bufNewStringFailHelper(): number {
+    const dynRef = this.dyn.dynRef();
+    return this.tailDef("buf.newStringFail", [dynRef], [this.bytesB.bytesRef()], (c, local) => {
+      const K = local(I32);
+      c.localGet(0);
+      c.structGet(this.dyn.dynT(), DYN_KIND);
+      c.localSet(K);
+      c.localGet(K);
+      c.i32Const(DK.NUM);
+      c.i32Eq();
+      c.ifVoid();
+      this.emitTailArgTypeFail(c, "string", "of type string", (x) => x.localGet(0));
+      c.else_();
+      [DK.UNDEF, DK.NULL, DK.BOOL, DK.FUNC].forEach((k, i) => {
+        c.localGet(K);
+        c.i32Const(k);
+        c.i32Eq();
+        if (i > 0) c.i32Or();
+      });
+      c.ifVoid();
+      this.emitSetCellError(c, "%TypeError", "TypeError", (x) => {
+        this.pushStrLitInto(
+          x,
+          "The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received ",
+        );
+        x.localGet(0);
+        x.call(this.dyn.specificType());
+        x.call(this.concatHelper());
+      }, "ERR_INVALID_ARG_TYPE");
+      c.else_();
+      this.emitSetCellError(
+        c,
+        "%Error",
+        "Error",
+        (x) => this.pushStrLitInto(x, "new Buffer(value, encoding) over a string or object value is not supported yet (SEMANTICS.md S094)"),
+        null,
+      );
+      c.end();
+      c.end();
+      c.refNull(this.bytesB.bytesType());
+    });
+  }
+
   private emitBufferLibCall(e: Extract<IrExpr, { kind: "libCall" }>): boolean {
     const code = this.fn.code;
     if (e.fn === "buffer.fromStr") {

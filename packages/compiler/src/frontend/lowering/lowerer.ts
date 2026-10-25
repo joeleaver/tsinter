@@ -770,6 +770,41 @@ export function jsFuncNameOf(node: ts.Node): string | null {
   return null;
 }
 
+/** The function's ES `name` where the source shows it: an identifier read
+ * of a `const` (or a function declaration) resolves to the definition —
+ * a named function expression's own name, else the binding's
+ * NamedEvaluation — which is what Node's determineSpecificType renders
+ * ("Received function named"). Anything else falls back to
+ * jsFuncNameOf's binding spelling (SEMANTICS.md S020). Used by the
+ * checked-dynamic Buffer ladders, whose dyn boxes carry the name only
+ * for their error texts. */
+export function esFuncNameOf(L: Lowerer, node: ts.Node): string | null {
+  let n: ts.Node = node;
+  while (ts.isParenthesizedExpression(n)) n = n.expression;
+  if (ts.isIdentifier(n)) {
+    const sym = L.resolveValueSymbol(n);
+    const d = sym !== null ? L.checker.valueDeclarationOf(sym) : undefined;
+    if (d !== undefined && ts.isFunctionDeclaration(d) && d.name) return d.name.text;
+    if (
+      d !== undefined && ts.isVariableDeclaration(d) && d.initializer !== undefined &&
+      ts.isIdentifier(d.name) && (ts.getCombinedNodeFlags(d) & ts.NodeFlags.Const) !== 0
+    ) {
+      let init: ts.Node = d.initializer;
+      while (ts.isParenthesizedExpression(init)) init = init.expression;
+      if (ts.isFunctionExpression(init) && init.name) return init.name.text;
+      if (ts.isFunctionExpression(init) || ts.isArrowFunction(init)) return d.name.text;
+    }
+  }
+  return jsFuncNameOf(n);
+}
+
+/** A function-typed dynFrom box gets esFuncNameOf(node) as its fnName. */
+export function withEsFnName(L: Lowerer, e: IrExpr & { kind: "dynFrom" }, node: ts.Node): IrExpr {
+  if (e.value.type.kind !== "func") return e;
+  const name = esFuncNameOf(L, node);
+  return name === null ? e : { ...e, fnName: name };
+}
+
 export class Lowerer {
   readonly checker: ts.TypeChecker;
   readonly diags: ScrDiagnostic[] = [];

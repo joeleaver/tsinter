@@ -3377,6 +3377,60 @@ export class BytesBuilder {
     c.localGet(TMP);
   }
 
+  /** %w.bytes.textDecode — (bytes<u8>) → str; WHATWG `new TextDecoder()
+   * .decode(bytes)` (utf-8, default options): toStr:utf8's maximal-subpart
+   * decode with ONE difference — a leading UTF-8 BOM (EF BB BF) is
+   * stripped first (ignoreBOM defaults to false; Buffer.toString keeps it
+   * as U+FEFF). scr_text_decode's port. Never throws. */
+  textDecodeHelper(): number {
+    return this.cached("textDecode", () => {
+      const idx = this.mb.declareFunc(this.mb.funcType([this.bytesRef()], [this.strRefN()]), "%w.bytes.textDecode");
+      const c = new Code();
+      const V = 0;
+      const byteAt = (k: number): void => {
+        c.localGet(V);
+        c.structGet(this.bytesType(), STORAGE);
+        c.localGet(V);
+        c.structGet(this.bytesType(), OFF);
+        c.i32Const(k);
+        c.i32Add();
+        c.arrayGetU(this.bufType());
+      };
+      c.localGet(V);
+      c.structGet(this.bytesType(), BLEN);
+      c.i32Const(3);
+      c.i32GeS();
+      c.ifResult(I32);
+      byteAt(0);
+      c.i32Const(0xef);
+      c.i32Eq();
+      byteAt(1);
+      c.i32Const(0xbb);
+      c.i32Eq();
+      c.i32And();
+      byteAt(2);
+      c.i32Const(0xbf);
+      c.i32Eq();
+      c.i32And();
+      c.else_();
+      c.i32Const(0);
+      c.end();
+      c.ifVoid();
+      c.localGet(V);
+      c.f64Const(3);
+      c.localGet(V);
+      c.structGet(this.bytesType(), BLEN);
+      c.f64ConvertI32S();
+      c.call(this.subarrayHelper("u8"));
+      c.localSet(V);
+      c.end();
+      c.localGet(V);
+      c.call(this.toStrHelper("utf8"));
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
   /** %w.bytes.toStr:<enc> — (bytes<u8>) → str; the `toString(enc)`
    * decode surface (Buffer.prototype.toString / util.TextDecoder share
    * this — utf8's WHATWG maximal-subpart replacement rule, the OTHER six

@@ -9,7 +9,7 @@ import { BOOL, DYN, F64, bytesOf, IrClassDef, IrExpr, IrFunction, IrLocal, IrPar
 import { MAX_GENERIC_INSTANCES, genericCallInstance, implicitAnyParamSymbolsOf, implicitCallInstance, implicitMonoFile, omittedArgFor, type GenericFnInfo, type ParamShape } from "./lower-calls.js";
 import { isGenericCallableMemberType, typeKey } from "../types.js";
 import { cjsClassExprWholeExportOf, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeTypesPath, locOf } from "../program.js";
-import { PoisonError, dynFallbackType, dynUndefinedExpr, newFnCtx, own } from "./lowerer.js";
+import { PoisonError, dynFallbackType, dynUndefinedExpr, newFnCtx, own, withEsFnName } from "./lowerer.js";
 import { bufEncoding, lowerMapSeedArrayNew } from "./lower-containers.js";
 import { pureReemittable } from "./lower-exprs.js";
 import { lowerSearchParamsNew } from "./lower-builtins.js";
@@ -5427,7 +5427,7 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
           const first = L.lowerExpr(expr.arguments[0]!);
           if (first.kind === "unitLit" || first.type.kind === "dyn" || L.dynConvertible(first.type)) {
             const got: IrExpr =
-              first.type.kind === "dyn" ? first : { kind: "dynFrom", value: first, type: DYN, loc };
+              first.type.kind === "dyn" ? first : withEsFnName(L, { kind: "dynFrom", value: first, type: DYN, loc }, expr.arguments[0]!);
             // The encoding argument still evaluates in Node before the
             // throw only via the ctor body's later reads — it does NOT
             // observe it before throwing, so dropping it is exact for

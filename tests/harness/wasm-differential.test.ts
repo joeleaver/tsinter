@@ -3525,6 +3525,13 @@ const TIER_FLOOR: string[] = [
   "2211-dc-trace-promise.cjs",
   "2213-async-local-storage.cjs",
   "2214-dc-bind-store.cjs",
+  // Unit H, the small library tail: TextDecoder.decode, Atomics.wait over
+  // the host `sleep` import (abi.ts), node:timers/promises, and the
+  // checked-dynamic Buffer argument ladders: 1053 -> 1057.
+  "1423-text-codec.ts",
+  "1524-atomics-sleep-static.ts",
+  "2093-timers-promises.ts",
+  "2570-buffer-arg-validation.cjs",
 ];
 
 interface RunResult {
@@ -5425,6 +5432,17 @@ async function runWasm(modulePath: string): Promise<RunResult> {
       random(ptr: number, len: number): void {
         if (memory === null) throw new Error("random before instantiation completed");
         randomFillSync(new Uint8Array(memory.buffer, ptr, len));
+      },
+      // Atomics.wait modules only (unit H, abi.ts `sleep`): a REAL blocking
+      // sleep (Atomics.wait on a private SharedArrayBuffer — never a spin on
+      // a clock), and the virtual clock moves by max(ms, the time really
+      // slept): cpCall RUN's accounting. A non-finite ms (Node blocks forever)
+      // ends the run loudly instead of hanging the worker.
+      sleep(ms: number): void {
+        if (!Number.isFinite(ms) || ms < 0) throw new Error(`tsinter.sleep(${ms}): an unbounded wait (Node blocks forever)`);
+        const t0 = performance.now();
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+        clock += Math.max(ms, performance.now() - t0);
       },
       // date.now modules only (INC-25 P6, D3/D6-iv, C-4). MUST be a
       // VIRTUAL wall clock in lockstep with the virtual timer clock
@@ -8820,6 +8838,125 @@ describe("node:querystring rows", () => {
     expect(r.stdout.toString("utf8")).toBe("%F0%90%81%A1\n");
     expect(r.stderr.toString("utf8")).toBe("Uncaught URIError [ERR_INVALID_URI]: URI malformed\n");
     expect(r.exitCode).toBe(1);
+  }, 60000);
+});
+
+// ── unit H: the small library tail rows ─────────────────────────────────
+// node:timers/promises (tp.setTimeout / tp.setImmediate), TextDecoder.decode,
+// Atomics.wait over the `sleep` import (abi.ts) and the checked-dynamic Buffer
+// ladders. Every expected output was measured against Node v24.18.1 on the
+// same source with the oracle's own flags, except H-BUF-03 (the S094 fence)
+// and the compile-time rows H-AW-03 and H-HOST-01.
+describe("unit H small library tail rows", () => {
+  async function runH(file: string, src: string | null): Promise<RunResult> {
+    const dir = mkdtempSync(join(tmpdir(), "tail-h-"));
+    try {
+      let path = file;
+      if (src !== null) {
+        path = join(dir, file);
+        writeFileSync(path, src);
+      }
+      const res = await compile(path, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: wantsDynamic(path), backend: "wasm" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+      return await runWasm(res.binaryPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  const corpusRows: [string, string, string][] = [
+    ["1423-text-codec.ts", "10 104 195 169 240\nhéllo😀\nAB\n0\n2\n\"A�B\"\n\"�\"\n0\nhi\ntrue round ✓ trip\n0\n", "TextDecoder.decode: utf-8 round trips, BOM strip, maximal-subpart replacement, no-arg, the label"],
+    ["1524-atomics-sleep-static.ts", "static init saw the const: true nap\nslept at least ~120ms: true and under 5s: true\nnot-equal timed-out\nno sleep on not-equal: true\ni32: -5 0 2\nwrap: -2147483648 2147483647\nseeded: -1 0 7 3\ncopy independent: -1 9\n", "Atomics.wait as a synchronous sleep through the host's sleep import, not-equal, the i32 element semantics"],
+    ["2093-timers-promises.ts", "start\nslept\ndefault delay\nimmediate\nnamespace\ncallback,sleep\ndone\n", "timers/promises setTimeout/setImmediate, named and namespace spellings, interleaved with a callback timer"],
+    ["2570-buffer-arg-validation.cjs", "TypeError|ERR_INVALID_ARG_TYPE|The \"buf2\" argument must be an instance of Buffer or Uint8Array. Received type string ('abc')\nTypeError|ERR_INVALID_ARG_TYPE|The \"buf1\" argument must be an instance of Buffer or Uint8Array. Received type string ('abc')\nTypeError|ERR_INVALID_ARG_TYPE|The \"buf1\" argument must be an instance of Buffer or Uint8Array. Received null\nret -1\nTypeError|ERR_INVALID_ARG_TYPE|The \"otherBuffer\" argument must be an instance of Buffer or Uint8Array. Received type string ('abc')\nTypeError|ERR_INVALID_ARG_TYPE|The \"otherBuffer\" argument must be an instance of Buffer or Uint8Array. Received type number (7)\nret true\nTypeError|ERR_INVALID_ARG_TYPE|The \"target\" argument must be an instance of Buffer or Uint8Array. Received undefined\nTypeError|ERR_INVALID_ARG_TYPE|The \"target\" argument must be an instance of Buffer or Uint8Array. Received type string ('abc')\nTypeError|ERR_INVALID_ARG_TYPE|The \"targetStart\" argument must be of type number. Received type string ('0')\nret -1\nret -1\nTypeError|ERR_INVALID_ARG_TYPE|The \"targetEnd\" argument must be of type number. Received null\nTypeError|ERR_INVALID_ARG_TYPE|The \"targetEnd\" argument must be of type number. Received an instance of Object\nRangeError|ERR_OUT_OF_RANGE|The value of \"targetStart\" is out of range. It must be an integer. Received Infinity\nret 1\nTypeError|ERR_INVALID_ARG_TYPE|The \"targetStart\" argument must be of type number. Received type string ('0xff')\nTypeError|ERR_INVALID_ARG_TYPE|The \"targetEnd\" argument must be of type number. Received type string ('0xff')\nRangeError|ERR_OUT_OF_RANGE|The value of \"targetEnd\" is out of range. It must be >= 0 && <= 10. Received 100\nRangeError|ERR_OUT_OF_RANGE|The value of \"sourceEnd\" is out of range. It must be >= 0 && <= 10. Received 100\nRangeError|ERR_OUT_OF_RANGE|The value of \"targetStart\" is out of range. It must be >= 0 && <= 9007199254740991. Received -1\nRangeError|ERR_OUT_OF_RANGE|The value of \"targetEnd\" is out of range. It must be an integer. Received Infinity\nRangeError|ERR_OUT_OF_RANGE|The value of \"sourceStart\" is out of range. It must be >= 0 && <= 9007199254740991. Received -1\nRangeError|ERR_OUT_OF_RANGE|The value of \"targetStart\" is out of range. It must be an integer. Received -Infinity\nRangeError|ERR_OUT_OF_RANGE|The value of \"targetStart\" is out of range. It must be an integer. Received NaN\nRangeError|ERR_OUT_OF_RANGE|The value of \"targetStart\" is out of range. It must be an integer. Received 1.5\nret 1\nret -1\nret 0\nret 1\nTypeError|ERR_INVALID_ARG_TYPE|The \"string\" argument must be of type string. Received type number (42)\nRangeError|ERR_OUT_OF_RANGE|The value of \"offset\" is out of range. It must be >= 0 && <= 9. Received -1\nRangeError|ERR_OUT_OF_RANGE|The value of \"offset\" is out of range. It must be >= 0 && <= 9. Received 10\nRangeError|ERR_INVALID_BUFFER_SIZE|Buffer size must be a multiple of 16-bits\nTypeError|ERR_INVALID_ARG_VALUE|The argument 'value' is invalid. Received <Buffer >\nRangeError|ERR_OUT_OF_RANGE|The value of \"offset\" is out of range. It must be >= 0 and <= 2. Received -1\nRangeError|ERR_OUT_OF_RANGE|The value of \"value\" is out of range. It must be >= 0 and <= 255. Received 256\nRangeError|ERR_BUFFER_OUT_OF_BOUNDS|Attempt to access memory outside buffer bounds\nRangeError|ERR_BUFFER_OUT_OF_BOUNDS|Attempt to access memory outside buffer bounds\n", "Buffer compare/equals checked-argument ladders, new Buffer(number, enc), the write/swap/fill codes"],
+  ];
+  for (const [name, stdout, what] of corpusRows) {
+    test(`H-C-${name.slice(0, 4)} corpus ${name} (${what}): full stdout, stderr and exit code equal Node's`, async () => {
+      const r = await runH(join(corpusDir, name), null);
+      expect(r.stdout.toString("utf8")).toBe(stdout);
+      expect(r.stderr.toString("utf8")).toBe("");
+      expect(r.exitCode).toBe(0);
+    }, 60000);
+  }
+
+  const focusedRows: [string, string, string, string, string][] = [
+    ["H-TP-01", "main.ts", "import { setTimeout as sleep, setImmediate as tick } from \"node:timers/promises\";\nimport * as tp from \"node:timers/promises\";\nsetTimeout(() => console.log(\"cb50\"), 50);\nsetImmediate(() => console.log(\"imm\"));\nasync function main(): Promise<void> {\n  await tick();\n  console.log(\"tick\");\n  await sleep(0);\n  console.log(\"zero\");\n  await sleep(0.5);\n  console.log(\"half\");\n  await tp.setImmediate();\n  console.log(\"ns-imm\");\n  await sleep(100);\n  console.log(\"s100\");\n}\nmain().then(() => console.log(\"done\"));\nconsole.log(\"sync\");\n", "sync\nimm\ntick\nzero\nhalf\nns-imm\ncb50\ns100\ndone\n", "timers/promises order against callback timers and immediates; a 0 and a 0.5 delay take the 1ms floor (no warning: Node warns only for negative, NaN and overflowing delays, SEMANTICS.md S095)"],
+    ["H-TP-02", "main.cjs", "'use strict';\nconst { AsyncLocalStorage } = require('node:async_hooks');\nconst tp = require('node:timers/promises');\nconst als = new AsyncLocalStorage();\nals.run('outer', async () => {\n  await tp.setTimeout(5);\n  console.log('after sleep', als.getStore());\n  await tp.setImmediate();\n  console.log('after immediate', als.getStore());\n});\nals.run('second', async () => {\n  await tp.setImmediate();\n  console.log('second', als.getStore());\n});\nconsole.log('sync', als.getStore());\n", "sync undefined\nsecond second\nafter sleep outer\nafter immediate outer\n", "an AsyncLocalStorage store survives an await on timers/promises setTimeout and setImmediate (unit B composition)"],
+    ["H-TD-01", "main.ts", "const d = (b: Uint8Array): string => JSON.stringify(new TextDecoder().decode(b));\nconsole.log(d(new Uint8Array([0xef, 0xbb, 0xbf])), d(new Uint8Array(0)), d(new Uint8Array([0xef, 0xbb])));\nconsole.log(d(Buffer.from([0x41, 0xef, 0xbb, 0xbf, 0x42])));\nconsole.log(d(Buffer.from([0x41, 0xef, 0xbb, 0xbf, 0x42]).subarray(1)));\nconsole.log(d(new Uint8Array([0xef, 0xbb, 0xbf, 0xef, 0xbb, 0xbf, 0x43])));\nconsole.log(d(new Uint8Array([0xc3, 0x28, 0xe2, 0x82, 0xed, 0xa0, 0x80, 0x61])));\nconsole.log(new TextDecoder(\"utf8\").decode(new TextEncoder().encode(\"\\u{1F600}x\")).length);\n", "\"\" \"\" \"�\"\n\"A﻿B\"\n\"B\"\n\"﻿C\"\n\"�(����a\"\n3\n", "TextDecoder.decode: a BOM-only and an empty input, a BOM not at the start kept, a view whose BOM sits at a nonzero offset, only one BOM stripped, replacement runs"],
+    ["H-AW-01", "main.ts", "const buf = new Int32Array(new SharedArrayBuffer(8));\nbuf[0] = 7;\nconst tryWait = (i: number, v: number, t: number): string => {\n  try {\n    return Atomics.wait(buf, i, v, t);\n  } catch (e) {\n    if (e instanceof RangeError) return `RangeError:${e.message}`;\n    return \"other\";\n  }\n};\nconsole.log(tryWait(2, 0, 0), tryWait(-1, 0, 0), tryWait(Infinity, 0, 0), tryWait(2 ** 53, 7, 0));\nconsole.log(tryWait(-0.5, 7, 0), tryWait(1.9, 0, 0), tryWait(NaN, 7, 0), tryWait(NaN, 0, 0));\nconsole.log(tryWait(1, NaN, 0), tryWait(1, 2 ** 32, -5), tryWait(0, 7 + 2 ** 32, 0), tryWait(0, 7.9, 0), tryWait(0, -7, 0));\nbuf[1] = -1;\nconsole.log(tryWait(1, 4294967295, 0), tryWait(1, -1, -Infinity));\n", "RangeError:Invalid atomic access index RangeError:Invalid atomic access index RangeError:Invalid atomic access index RangeError:Invalid atomic access index\ntimed-out timed-out timed-out not-equal\ntimed-out timed-out timed-out timed-out not-equal\ntimed-out timed-out\n", "Atomics.wait's argument handling: the index RangeError (catchable, instanceof RangeError), ToIndex truncation and NaN, ToInt32 of the expected value, negative and -Infinity timeouts"],
+    ["H-AW-02", "main.ts", "const sab = new Int32Array(new SharedArrayBuffer(4));\nsetTimeout(() => console.log(\"timer armed before the sleep\"), 0);\nPromise.resolve().then(() => console.log(\"microtask after the sync body\"));\nconst t0 = Date.now();\nconst r = Atomics.wait(sab, 0, 0, 60);\nconsole.log(r, Date.now() - t0 >= 50);\nsetImmediate(() => console.log(\"immediate armed after the sleep\"));\n", "timed-out true\nmicrotask after the sync body\ntimer armed before the sleep\nimmediate armed after the sleep\n", "a sleep blocks the loop and moves the clock: a 0ms timer armed before a 60ms wait fires before an immediate armed after it"],
+    ["H-BUF-01", "main.cjs", "// @no-deprecation\n'use strict';\nconst show = (fn) => {\n  try {\n    console.log('ret', fn());\n  } catch (e) {\n    console.log(`${e.name}|${e.code}|${e.message}`);\n  }\n};\nconst a = Buffer.from('abcdef');\nconst b = Buffer.from('abcxyz');\nconst u = new Uint8Array([97, 98, 99]);\nshow(() => Buffer.compare(a, u));\nshow(() => Buffer.compare(u, a));\nshow(() => Buffer.compare(a, undefined));\nshow(() => Buffer.compare([1], a));\nshow(() => a.equals(undefined));\nshow(() => a.equals({}));\nshow(() => a.equals(Buffer.from('abcdef')));\nshow(() => a.equals(u));\nshow(() => a.compare(b, 0, 3, 0, 3));\nshow(() => a.compare(b, 3, undefined, 3));\nshow(() => a.compare(b, undefined, undefined, undefined, 2));\nshow(() => a.compare(u, 1, 2, '1'));\nshow(() => a.compare(b, 0, 6, 0, true));\nshow(() => a.compare(b, 0, 7));\nshow(() => a.compare(b, 0, 6, 0, 7));\nshow(() => a.compare(b, 0, 6, 7));\nshow(() => a.compare(b, 2 ** 53));\nshow(() => a.compare(b, 0, -0));\nshow(() => a.compare(null));\nshow(() => a.compare(u));\nshow(() => new Buffer(null, 'hex'));\nshow(() => new Buffer(true, 'latin1'));\n", "ret 1\nret -1\nTypeError|ERR_INVALID_ARG_TYPE|The \"buf2\" argument must be an instance of Buffer or Uint8Array. Received undefined\nTypeError|ERR_INVALID_ARG_TYPE|The \"buf1\" argument must be an instance of Buffer or Uint8Array. Received an instance of Array\nTypeError|ERR_INVALID_ARG_TYPE|The \"otherBuffer\" argument must be an instance of Buffer or Uint8Array. Received undefined\nTypeError|ERR_INVALID_ARG_TYPE|The \"otherBuffer\" argument must be an instance of Buffer or Uint8Array. Received an instance of Object\nret true\nret false\nret 0\nret -1\nret -1\nTypeError|ERR_INVALID_ARG_TYPE|The \"sourceStart\" argument must be of type number. Received type string ('1')\nTypeError|ERR_INVALID_ARG_TYPE|The \"sourceEnd\" argument must be of type number. Received type boolean (true)\nRangeError|ERR_OUT_OF_RANGE|The value of \"targetEnd\" is out of range. It must be >= 0 && <= 6. Received 7\nRangeError|ERR_OUT_OF_RANGE|The value of \"sourceEnd\" is out of range. It must be >= 0 && <= 6. Received 7\nret -1\nRangeError|ERR_OUT_OF_RANGE|The value of \"targetStart\" is out of range. It must be >= 0 && <= 9007199254740991. Received 9_007_199_254_740_992\nret 1\nTypeError|ERR_INVALID_ARG_TYPE|The \"target\" argument must be an instance of Buffer or Uint8Array. Received null\nret 1\nTypeError|ERR_INVALID_ARG_TYPE|The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received null\nTypeError|ERR_INVALID_ARG_TYPE|The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received type boolean (true)\n", "the checked ladders over each slot in order: undefined and array arguments, Uint8Array targets, default slots, boolean and string offsets, the range ends"],
+    ["H-BUF-04", "main.cjs", "// @no-deprecation\n'use strict';\nconst show = (fn) => {\n  try {\n    console.log('ret', fn());\n  } catch (e) {\n    console.log(`${e.name}|${e.code}|${e.message}`);\n  }\n};\nconst f = function named() {};\nconst v = () => 1;\nconst w = (function () {});\nfunction decl() {}\nconst a = Buffer.from('abc');\nshow(() => Buffer.compare(a, f));\nshow(() => Buffer.compare(v, a));\nshow(() => a.equals(w));\nshow(() => a.equals(decl));\nshow(() => a.compare(a, f));\nshow(() => a.compare(decl));\nshow(() => new Buffer(f, 'utf8'));\nshow(() => new Buffer(v, 'utf8'));\n", "TypeError|ERR_INVALID_ARG_TYPE|The \"buf2\" argument must be an instance of Buffer or Uint8Array. Received function named\nTypeError|ERR_INVALID_ARG_TYPE|The \"buf1\" argument must be an instance of Buffer or Uint8Array. Received function v\nTypeError|ERR_INVALID_ARG_TYPE|The \"otherBuffer\" argument must be an instance of Buffer or Uint8Array. Received function w\nTypeError|ERR_INVALID_ARG_TYPE|The \"otherBuffer\" argument must be an instance of Buffer or Uint8Array. Received function decl\nTypeError|ERR_INVALID_ARG_TYPE|The \"targetStart\" argument must be of type number. Received function named\nTypeError|ERR_INVALID_ARG_TYPE|The \"target\" argument must be an instance of Buffer or Uint8Array. Received function decl\nTypeError|ERR_INVALID_ARG_TYPE|The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received function named\nTypeError|ERR_INVALID_ARG_TYPE|The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received function v\n", "a function argument renders with its ES name (a named function expression's own, else the const binding's, a declaration's) in every ladder"],
+    ["H-BUF-02", "main.cjs", "// @no-deprecation\n'use strict';\nconst show = (fn) => {\n  try {\n    console.log('ret', fn());\n  } catch (e) {\n    console.log(`${e.name}|${e.code}|${e.message}`);\n  }\n};\nshow(() => new Buffer(-1, 'hex'));\nshow(() => new Buffer(undefined, 'utf8'));\nshow(() => new Buffer(null, 'hex'));\nshow(() => new Buffer(false, 'latin1'));\n", "TypeError|ERR_INVALID_ARG_TYPE|The \"string\" argument must be of type string. Received type number (-1)\nTypeError|ERR_INVALID_ARG_TYPE|The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received undefined\nTypeError|ERR_INVALID_ARG_TYPE|The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received null\nTypeError|ERR_INVALID_ARG_TYPE|The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received type boolean (false)\n", "new Buffer(value, encoding) over a number, undefined, null and a boolean: Node's two TypeErrors"],
+  ];
+  for (const [id, file, src, stdout, what] of focusedRows) {
+    test(`${id} ${what}: full stdout, stderr and exit code equal Node's`, async () => {
+      const r = await runH(file, src);
+      expect(r.stdout.toString("utf8")).toBe(stdout);
+      expect(r.stderr.toString("utf8")).toBe("");
+      expect(r.exitCode).toBe(0);
+    }, 60000);
+  }
+
+  test("H-BUF-03 new Buffer(value, encoding) over a string, an array and an object is fenced by name (SEMANTICS.md S094); Node converts the string and the array through Buffer.from and throws ERR_INVALID_ARG_TYPE for the plain object", async () => {
+    const r = await runH("main.cjs", "'use strict';\nconst show = (fn) => {\n  try {\n    console.log('ret', fn());\n  } catch (e) {\n    console.log(`${e.name}|${e.code}|${e.message}`);\n  }\n};\nconst s = JSON.parse('\"abc\"');\nshow(() => new Buffer(s, 'hex'));\nshow(() => new Buffer([1, 2], 'utf8'));\nshow(() => new Buffer({ a: 1 }, 'utf8'));\nconsole.log('after');\n");
+    const fence = "Error|undefined|new Buffer(value, encoding) over a string or object value is not supported yet (SEMANTICS.md S094)\n";
+    expect(r.stdout.toString("utf8")).toBe(fence + fence + fence + "after\n");
+    expect(r.stderr.toString("utf8")).toBe("");
+    expect(r.exitCode).toBe(0);
+  }, 60000);
+
+  test("H-AW-03 Atomics.wait over an Int32Array the source does not show is SharedArrayBuffer-backed refuses by name at compile time (Node throws TypeError '[object Int32Array] is not a shared typed array.'): a plain new Int32Array(n), a plain ArrayBuffer, a let binding, a parameter; the const, static readonly and direct forms compile", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tail-h-aw-"));
+    try {
+      const build = async (src: string): Promise<{ ok: boolean; text: string }> => {
+        const path = join(dir, "main.ts");
+        writeFileSync(path, src);
+        const res = await compile(path, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: false, backend: "wasm" });
+        return { ok: res.ok, text: res.ok ? "" : res.diagnostics.map((d) => d.message).join("\n") };
+      };
+      const refused = [
+        "const plain = new Int32Array(4);\nconsole.log(Atomics.wait(plain, 0, 0, 1));\n",
+        "const plain = new Int32Array(new ArrayBuffer(8));\nconsole.log(Atomics.wait(plain, 0, 0, 1));\n",
+        "let b: Int32Array = new Int32Array(new SharedArrayBuffer(8));\nb = new Int32Array(2);\nconsole.log(Atomics.wait(b, 0, 0, 1));\n",
+        "function w(b: Int32Array): string {\n  return Atomics.wait(b, 0, 0, 1);\n}\nconsole.log(w(new Int32Array(new SharedArrayBuffer(8))));\n",
+      ];
+      for (const src of refused) {
+        const r = await build(src);
+        expect(r.ok, src).toBe(false);
+        expect(r.text, src).toContain("Atomics.wait over an Int32Array not visibly backed by a SharedArrayBuffer");
+      }
+      const admitted = [
+        "const b = new Int32Array(new SharedArrayBuffer(8));\nconsole.log(Atomics.wait(b, 0, 1, 1));\n",
+        "class S {\n  static readonly b = new Int32Array(new SharedArrayBuffer(4));\n}\nconsole.log(Atomics.wait(S.b, 0, 1, 1));\n",
+        "console.log(Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 1, 1));\n",
+      ];
+      for (const src of admitted) {
+        const r = await build(src);
+        expect(r.ok, `${src}\n${r.text}`).toBe(true);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  test("H-HOST-01 the sleep import is minted only where Atomics.wait is reachable, after random; a module without it keeps its imports", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tail-h-host-"));
+    try {
+      const importsOf = async (src: string): Promise<string[]> => {
+        const path = join(dir, "main.ts");
+        writeFileSync(path, src);
+        const res = await compile(path, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: false, backend: "wasm" });
+        if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+        const m = await WebAssembly.compile(readFileSync(res.binaryPath));
+        return WebAssembly.Module.imports(m).map((i) => `${i.module}.${i.name}`);
+      };
+      expect(await importsOf("const b = new Int32Array(new SharedArrayBuffer(4));\nconsole.log(Atomics.wait(b, 0, 1, 0));\n")).toEqual(["tsinter.write", "tsinter.sleep"]);
+      expect(await importsOf("const b = new Int32Array(new SharedArrayBuffer(4));\nconsole.log(b[0]);\n")).toEqual(["tsinter.write"]);
+      expect(await importsOf("import { randomUUID } from \"node:crypto\";\nconst b = new Int32Array(new SharedArrayBuffer(4));\nconsole.log(randomUUID().length, Atomics.wait(b, 0, 0, 1));\n")).toEqual(["tsinter.write", "tsinter.random", "tsinter.sleep"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }, 60000);
 });
 
