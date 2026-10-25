@@ -115,7 +115,13 @@ and the module fails to instantiate with a LinkError. Since unit G3,
 import — start and stop a file-system event watch on one path, libuv's
 uv_fs_event_start / uv_fs_event_stop, failures in fsCall's error carrier —
 and `tsinter.evPoll`, with the same LinkError when a host without
-file-system notifications (a browser) declines it.
+file-system notifications (a browser) declines it. Since unit G2,
+process.stdin's events and its for-await chunk source, and node:readline's
+question / close slice, read fd 0 only through the `tsinter.stdinCall`
+import — start and stop reading, libuv's uv_read_start / uv_read_stop — and
+`tsinter.evPoll`; a host with no standard input may answer end-of-file at
+once, and one that declines the import fails the module's instantiation
+with a LinkError (SEMANTICS.md S097 registers what differs from Node).
 **Rationale:** the output is a
 sandboxed wasm module; ambient OS authority would be a lie at best and a
 sandbox hole at worst. **Tested by:** wasm-differential harness refusal
@@ -6475,3 +6481,13 @@ A base that is omitted or `undefined` is no base on every lane; `new URL(input)`
 **Scope:** the llvm and c lanes. On wasm there is no divergence.
 
 **Tested by:** `packages/compiler/test/url-base-native.test.ts` (URL-BASE-NATIVE, one row per native lane, plain and sanitized: an in-subset bad base, an IDNA and an IPv6 base, parseable bases, the statics with and without a base). No corpus program uses a base or the statics, so the corpus cannot pin either side; the wasm side is pinned by S089's URL-BASE rows. Measured against Node v24.18.1.
+
+## S097 — process.stdin on the wasm lane: a host read error on fd 0 is a named trap, leaving a for-await over stdin early does not destroy it, and a for-await reads one chunk per step *(wasm lane only)*
+
+- **(a) A host read error.** A READ_ERROR record (abi.ts `stdinCall`) ends the program with the named trap "process.stdin: a read error from the host is not supported yet", and a READ_START the host refuses with "process.stdin: the host could not start reading fd 0", where Node emits 'error' on process.stdin (to the program's listener, or as the uncaught death). A `process.stdin.on('error', …)` listener is accepted and never called. The harness host's emulated pipe never fails.
+- **(b) Leaving a for-await early.** Node destroys process.stdin when a `for await` over it exits early (break, return or a throw out of the body): later listeners never receive anything. Here the stream stays as it was: a 'data' listener added afterwards receives the following chunks and an 'end' listener the end.
+- **(c) One chunk per step.** A for-await consumer reads one host read per step and stops reading while the body runs; Node's Readable reads ahead into its buffer up to the high-water mark and hands the next step everything buffered, concatenated. Where a pipe's writer produces data faster than the body consumes it, the chunk boundaries a body sees differ (they are the OS's timing in both cases); the bytes and their order do not.
+
+**Scope:** the wasm lane.
+
+**Tested by:** the stdin and readline surface itself (flowing, 'end', for-await, the readline splitter with its crlfDelay window, question / close, prompts only with an output stream) against Node with piped input: G2-IN-01..05 and G2-RL-01..11 in the "unit G2 stdin and readline rows" block of `tests/harness/wasm-differential.test.ts` (generated from the oracle); 1447, 1475 and 1751 on the wasm census. (a), (b) and (c) are measured, not pinned. Measured against Node v24.18.1.

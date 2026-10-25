@@ -10422,9 +10422,11 @@ class LlEmitter {
       // readline interface handles are runtime IDs (doubles); an open
       // interface holds the loop.
       this.usesTimers = true;
-      this.declare(`declare double @scr_rl_create()`);
+      const hasOut = this.emitExpr(e.args[0]!);
+      const delay = this.emitExpr(e.args[1]!);
+      this.declare(`declare double @scr_rl_create(i1 zeroext, double)`);
       const t = B.tmp();
-      B.line(`${t} = call double @scr_rl_create()`);
+      B.line(`${t} = call double @scr_rl_create(i1 ${hasOut.name}, double ${delay.name})`);
       return { name: t, type: e.type };
     }
     if (e.fn === "rl.question") {

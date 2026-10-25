@@ -46,7 +46,7 @@ fs.watch("/tmp", { persistent: false }, () => {});
 dns.lookup("localhost", { family: 4, hints: 32 }, () => {});
 dns.lookup("localhost", { family: 4, all: true }, () => {});
 
-// readline: a finite crlfDelay is not the lowered splitter; completer
-// needs an interactive terminal.
+// readline: completer needs an interactive terminal (a finite crlfDelay
+// lowers since unit G2: the splitter keeps Node's kSawReturnAt window).
 readline.createInterface({ input: process.stdin, output: process.stdout, crlfDelay: 100 });
 readline.createInterface({ input: process.stdin, output: process.stdout, completer: (l: string) => [[l], l] });

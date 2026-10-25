@@ -960,6 +960,12 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
         );
       }
       let sawInput = false;
+      // Node writes a question's prompt only to an output stream, and
+      // honours crlfDelay as `crlfDelay ? max(100, crlfDelay) : 100`: the
+      // interface is told whether `output` was given and the raw delay (0,
+      // falsy, when absent).
+      let sawOutput = false;
+      let crlfDelay: IrExpr = { kind: "numLit", value: 0, type: F64, loc };
       for (const p of optsNode.properties) {
         if (!ts.isPropertyAssignment(p) || !ts.isIdentifier(p.name)) {
           L.noLowering(
@@ -988,6 +994,7 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
               "process.stdout is the one supported output stream",
             );
           }
+          sawOutput = true;
         } else if (member === "terminal") {
           const t = L.typeOf(p.initializer);
           if (!(t.flags & ts.TypeFlags.BooleanLiteral) || L.checker.typeToString(t) !== "false") {
@@ -998,17 +1005,9 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
             );
           }
         } else if (member === "crlfDelay") {
-          // Infinity states the lowered behavior: the splitter holds a
-          // trailing \r until the next chunk decides \r\n vs \r, with no
-          // time limit (scr_readline.c) — Node's crlfDelay: Infinity.
-          // Finite delays would need a timer the splitter does not have.
-          if (!ts.isIdentifier(p.initializer) || p.initializer.text !== "Infinity") {
-            L.noLowering(
-              "createInterface with a finite crlfDelay",
-              p.initializer,
-              "the lowered splitter always joins \\r\\n across chunks (Node's crlfDelay: Infinity) — Infinity is the accepted value",
-            );
-          }
+          // The splitter compares the time since a chunk-final \r with
+          // the delay (Node's kSawReturnAt), so any number lowers.
+          crlfDelay = L.lowerExprExpecting(p.initializer, F64);
         } else if (member === "completer") {
           L.noLowering(
             "createInterface with a completer",
@@ -1030,7 +1029,13 @@ function optionMember(p: ts.ObjectLiteralElementLike): { name: string; value: ts
           "pass { input: process.stdin, output: process.stdout }",
         );
       }
-      return { kind: "libCall", fn: "rl.create", args: [], type: F64, loc };
+      return {
+        kind: "libCall",
+        fn: "rl.create",
+        args: [{ kind: "boolLit", value: sawOutput, type: BOOL, loc }, crlfDelay],
+        type: F64,
+        loc,
+      };
     }
     // The Buffer forms of fs: readFileSync(path)/readFile(path) with NO
     // encoding read raw bytes (Node returns a Buffer there), and

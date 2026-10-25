@@ -3802,7 +3802,7 @@ bool scr_stdin_ended(void);
  * the 'close' listeners SYNCHRONOUSLY (Node's inline emit) and detaches
  * the stdin consumer; onClose registers a zero-arg listener (moves).
  * Answer adapters: thunk0 ignores the line, thunk_str passes it. */
-double scr_rl_create(void);
+double scr_rl_create(bool has_output, double crlf_delay);
 void scr_rl_question(double id, const ScrStr *query, ScrClosure *cb /*moves*/,
                       void (*fn)(ScrClosure *, ScrStr *));
 void scr_rl_close(double id);

@@ -106,15 +106,6 @@ options-record.ts:47:38 - error SC2020: 'lookup option 'all'' is part of the sta
 
   hint: the all-addresses callback shape has no lowering — the lowered callback is (err, address, family) over one IPv4 answer
 
-options-record.ts:51:85 - error SC2020: 'createInterface with a finite crlfDelay' is part of the standard library types but has no scriptc lowering yet
-
-  50 | // needs an interactive terminal.
-  51 | readline.createInterface({ input: process.stdin, output: process.stdout, crlfDelay: 100 });
-     |                                                                                     ^~~
-  52 | readline.createInterface({ input: process.stdin, output: process.stdout, completer: (l: string) => [[l], l] });
-
-  hint: the lowered splitter always joins \r\n across chunks (Node's crlfDelay: Infinity) — Infinity is the accepted value
-
 options-record.ts:52:74 - error SC2020: 'createInterface with a completer' is part of the standard library types but has no scriptc lowering yet
 
   51 | readline.createInterface({ input: process.stdin, output: process.stdout, crlfDelay: 100 });

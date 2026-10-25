@@ -139,6 +139,7 @@ import {
   IMPORT_RANDOM,
   IMPORT_SLEEP,
   IMPORT_SIG_CALL,
+  IMPORT_STDIN_CALL,
   IMPORT_TLS_CALL,
   IMPORT_WATCH_CALL,
   IMPORT_FS_CALL,
@@ -1061,6 +1062,9 @@ function spawnSyncMayThrowView(mod: WModule): WModule {
     // Unit H: Atomics.wait's index check throws Node's RangeError on this
     // tier; the native lanes trap on an out-of-range index instead.
     "atomics.wait",
+    // Unit G2: an interface's 'close' listeners run inside close(), and a
+    // throw from one reaches close()'s caller.
+    "rl.close",
   ]);
   let found = false;
   const scan = (node: unknown): void => {
@@ -2426,6 +2430,10 @@ class Assembler {
   /** Unit G3: `tsinter.watchCall`'s index, or null in a module that never
    * reaches fs.watch (hostev.ts). */
   private readonly watchCallFunc: number | null;
+  /** Unit G2: `tsinter.stdinCall`'s index, or null in a module that never
+   * reaches process.stdin's events or node:readline (hostev.ts). */
+  private readonly stdinCallFunc: number | null;
+  private readonly hevStdin: boolean;
   /** Units G1-G3: the module reaches a host-event surface of hostev.ts
    * (signals, fs.watch) — an event module whatever else it reaches. */
   private readonly hevSignals: boolean;
@@ -2591,9 +2599,11 @@ class Assembler {
     // Units G1-G3: a host-event module's `_loop` reads `now` too.
     const hevSignals = libCallWhere(mod, (fn) => fn === "process.onSignal" || fn === "process.offSignal");
     const hevWatch = libCallWhere(mod, (fn) => fn === "fs.watch" || fn === "fs.watchCb" || fn === "watcher.close");
-    const hevMod = hevSignals || hevWatch;
+    const hevStdin = libCallWhere(mod, (fn) => fn === "stdin.onData" || fn === "stdin.onEnd" || fn === "stdin.onError" || fn === "stdin.nextChunk" || fn.startsWith("rl."));
+    const hevMod = hevSignals || hevWatch || hevStdin;
     this.hevSignals = hevSignals;
     this.hevWatch = hevWatch;
+    this.hevStdin = hevStdin;
     this.hevModule = hevMod;
     this.nowFunc =
       timerSurfaceReachable(mod) || perfNowReachable(mod) || netMod || hevMod
@@ -2710,6 +2720,12 @@ class Assembler {
     // import index moves.
     this.watchCallFunc = hevWatch
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_WATCH_CALL, this.mb.funcType([I32, I32, I32, I32], [I32]))
+      : null;
+    // `stdinCall`'s decision (unit G2, abi.ts): reads of fd 0, in modules
+    // that reach process.stdin's events or node:readline, minted after
+    // watchCall so no earlier import index moves.
+    this.stdinCallFunc = hevStdin
+      ? this.mb.importFunc(IMPORT_MODULE, IMPORT_STDIN_CALL, this.mb.funcType([I32], [I32]))
       : null;
     // ── end INC-26 host-import block ──
     // The exit-drain gate's STATIC fact (see exitListenerSurfaceReachable's
@@ -13385,6 +13401,32 @@ class Assembler {
       strType: () => this.strType,
       pushStrLit: (c, value) => this.pushStrLitInto(c, value),
       strClos: () => this.closPairFor([this.strRef], []),
+      stdin: this.hevStdin,
+      stdinCallFunc: () => {
+        if (this.stdinCallFunc === null) throw new Error("emitter bug: process.stdin was reached but tsinter.stdinCall was never imported");
+        return this.stdinCallFunc;
+      },
+      bytesType: () => this.bytesB.bytesType(),
+      bufType: () => this.bytesB.bufType(),
+      dataClos: () => this.closPairFor([this.bytesB.bytesRef()], []),
+      promRef: () => this.proms.promRef(),
+      promMint: () => this.proms.mint(),
+      promSettle: () => this.proms.settle(),
+      excObjKind: EXC_OBJ,
+      writeStdout: (c) => {
+        const h = this.ensureHelpers();
+        c.call(h.stage);
+        c.i32Const(FD_STDOUT);
+        c.call(h.flush);
+      },
+      strdecWrite: () => this.strdec.writeHelper(),
+      strdecNext: () => this.strdec.nextHelper(),
+      concat: () => this.concatHelper(),
+      throwCoded: (c, className, name, pushMessage, pushCode) => this.emitSetCellErrorCoded(c, className, name, pushMessage, pushCode),
+      nowFunc: () => {
+        if (this.nowFunc === null) throw new Error("emitter bug: a host-event module without tsinter.now");
+        return this.nowFunc;
+      },
     });
     return this.hevField;
   }
@@ -23834,6 +23876,96 @@ class Assembler {
         if (e.fn === "watcher.close") {
           this.walkExpr(e.args[0]!);
           code.call(this.hev.watchCloseHelper());
+          return;
+        }
+        // Unit G2 (hostev.ts; abi.ts stdinCall, evPoll source 5):
+        // process.stdin's events, its for-await chunk source, and
+        // node:readline's question / close slice.
+        if (e.fn === "stdin.onData" || e.fn === "stdin.onEnd") {
+          const data = e.fn === "stdin.onData";
+          const cbType = e.args[0]!.type;
+          if (cbType.kind !== "func" || cbType.rest === true) {
+            this.refuse(`libCall:${e.fn}:unexpected-callback-shape`, e.loc);
+            code.unreachable();
+            return;
+          }
+          const adapter = this.streamAdapterFor(cbType, data, e.loc);
+          if (adapter === null) {
+            code.unreachable();
+            return;
+          }
+          this.mb.declareFuncRef(adapter.fn);
+          code.refFunc(adapter.fn);
+          this.walkExpr(e.args[0]!);
+          code.structNew(adapter.env);
+          this.walkExpr(e.args[1]!);
+          code.call(data ? this.hev.stdinOnDataHelper() : this.hev.stdinOnEndHelper());
+          return;
+        }
+        if (e.fn === "stdin.onError") {
+          // The listener is accepted and never called: a host read error is
+          // a named trap on this tier (SEMANTICS.md S097).
+          this.walkExpr(e.args[0]!);
+          code.drop();
+          this.walkExpr(e.args[1]!);
+          code.drop();
+          return;
+        }
+        if (e.fn === "stdin.nextChunk") {
+          code.call(this.hev.stdinNextChunkHelper());
+          return;
+        }
+        if (e.fn === "rl.create") {
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.hev.rlCreateHelper());
+          return;
+        }
+        if (e.fn === "rl.question") {
+          const cbType = e.args[2]!.type;
+          if (cbType.kind !== "func" || cbType.rest === true || cbType.params.length > 1) {
+            this.refuse("libCall:rl.question:unexpected-callback-shape", e.loc);
+            code.unreachable();
+            return;
+          }
+          const shape = cbType.params.length === 0 ? 1 : 2;
+          const pair = this.closSigFor(cbType, e.loc);
+          const want = shape === 1 ? this.closPairFor([], []) : this.closPairFor([this.strRef], []);
+          if (pair === null || pair.clos !== want.clos) {
+            this.refuse("libCall:rl.question:unexpected-callback-shape", e.loc);
+            code.unreachable();
+            return;
+          }
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          this.walkExpr(e.args[2]!);
+          code.i32Const(shape);
+          code.call(this.hev.rlQuestionHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "rl.close") {
+          this.walkExpr(e.args[0]!);
+          code.call(this.hev.rlCloseHelper());
+          this.emitPendingCheck();
+          return;
+        }
+        if (e.fn === "rl.onClose") {
+          const cbType = e.args[1]!.type;
+          if (cbType.kind !== "func" || cbType.rest === true || cbType.params.length !== 0) {
+            this.refuse("libCall:rl.onClose:unexpected-callback-shape", e.loc);
+            code.unreachable();
+            return;
+          }
+          const pair = this.closSigFor(cbType, e.loc);
+          if (pair === null || pair.clos !== this.closPairFor([], []).clos) {
+            this.refuse("libCall:rl.onClose:unexpected-callback-shape", e.loc);
+            code.unreachable();
+            return;
+          }
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          code.call(this.hev.rlOnCloseHelper());
           return;
         }
         if (this.emitCryptoLibCall(e)) return;

@@ -340,6 +340,10 @@ async function instantiate(modulePath: string, overrides?: HostOverrides) {
       watchCall(op: number, _ptr: number, _len: number, _h: number): number {
         throw new Error(`watchCall: op ${op} reached with no forced host (default stub is loud by design)`);
       },
+      // Unit G2 (abi.ts stdinCall): LOUD for every op, netCall's stance.
+      stdinCall(op: number): number {
+        throw new Error(`stdinCall: op ${op} reached with no forced host (default stub is loud by design)`);
+      },
       ...(overrides?.imports ?? {}),
     },
   });

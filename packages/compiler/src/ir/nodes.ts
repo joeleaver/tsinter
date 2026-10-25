@@ -3766,8 +3766,11 @@ export type IrLibFn =
   /** node:readline's question/close slice (scr_readline.c, linked under
    * the events gate — these fns imply moduleUsesProcessEvents). The
    * interface value is an f64 handle (the Timeout-id precedent).
-   * rl.create: [] → f64 — createInterface({ input: process.stdin,
-   * output: process.stdout }), registering the unit's shared stdin
+   * rl.create: [hasOutput bool, crlfDelay f64] → f64 —
+   * createInterface({ input: process.stdin, output?: process.stdout,
+   * crlfDelay? }) (crlfDelay 0 when absent; Node's effective delay is
+   * `crlfDelay ? max(100, crlfDelay) : 100`; without output no prompt is
+   * written), registering the unit's shared stdin
    * consumer (an OPEN interface keeps the loop alive until close/EOF,
    * Node's semantics). rl.question: [handle, query, cb] — writes the
    * query to stdout (Node writes under pipes too) and delivers the next

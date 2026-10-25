@@ -1026,7 +1026,7 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   // node:readline: the interface handle is f64; the callbacks' func types
   // are program-dependent (zero-param or (answer: string) — the emitter
   // picks the adapter), so those slots are null like child.onExit's.
-  "rl.create": { argTypes: [], result: F64 },
+  "rl.create": { argTypes: [BOOL, F64], result: F64 },
   "rl.question": { argTypes: [F64, STRING, null], result: VOID },
   "rl.close": { argTypes: [F64], result: VOID },
   "rl.onClose": { argTypes: [F64, null], result: VOID },

@@ -6005,7 +6005,7 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           // interface is a stdin consumer — the loop must run.
           case "rl.create":
             E.usesTimers = true;
-            return finish(`scr_rl_create()`);
+            return finish(`scr_rl_create(${arg(0)}, ${arg(1)})`);
           case "rl.question": {
             E.usesTimers = true;
             const cbT = e.args[2]!.type;

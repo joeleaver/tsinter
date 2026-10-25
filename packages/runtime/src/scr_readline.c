@@ -7,10 +7,13 @@
  *   registers this unit's ONE shared stdin data listener (a consumer: the
  *   loop watches fd 0 and the process stays alive while any interface is
  *   open, exactly Node's un-closed readline) and a global 'end' listener.
- * - Lines split on \n and \r\n (and a bare \r followed by more input);
- *   a trailing \r holds until the next chunk decides \r\n vs \r.
+ * - Lines split on \n, \r\n and a bare \r; a chunk-final \r ends its
+ *   line at once, and a \n leading the next chunk is dropped when it
+ *   arrives within the crlfDelay of that \r (Node's kSawReturnAt:
+ *   `crlfDelay ? max(100, crlfDelay) : 100` ms, on the loop's clock).
  * - question(query, cb) writes the query to stdout (Node writes it under
- *   pipes too) and delivers the NEXT line's text; a line arriving with no
+ *   pipes too) — only when the interface has an output stream — and
+ *   delivers the NEXT line's text; a line arriving with no
  *   pending question is DROPPED (Node emits 'line' that nobody hears).
  * - close() removes the consumer (the loop stops waiting on fd 0), drops
  *   a pending question (its callback never fires), and fires the 'close'
@@ -38,6 +41,10 @@ static void scr_rl_oom(void) {
 typedef struct ScrRl {
   double id;
   bool closed;
+  bool has_output; /* createInterface named output: process.stdout */
+  double crlf_delay; /* the effective delay, ms */
+  bool saw_return; /* kSawReturnAt is set: a chunk ended in \r ... */
+  double saw_return_at; /* ... at this loop time */
   bool dead; /* created after stdin ended: close fires at question() */
   ScrClosure *q_cb; /* pending question's callback (owned), or NULL */
   void (*q_fn)(ScrClosure *, ScrStr *);
@@ -107,9 +114,10 @@ static bool scr_rl_scan(const ScrRl *rl, size_t *line_len, size_t *adv) {
       return true;
     }
     if (c == '\r') {
-      if (i + 1 >= rl->len) return false; /* hold: \r\n may straddle chunks */
+      /* A chunk-final \r ends its line now (Node's /\r(?!\n)/); the next
+       * chunk's leading \n is dropped by the data adapter. */
       *line_len = i;
-      *adv = rl->buf[i + 1] == '\n' ? i + 2 : i + 1;
+      *adv = (i + 1 < rl->len && rl->buf[i + 1] == '\n') ? i + 2 : i + 1;
       return true;
     }
   }
@@ -141,13 +149,27 @@ static void scr_rl_data_adapter(ScrClosure *cb, ScrBytes *chunk) {
   (void)cb;
   for (ScrRl *rl = scr_rls; rl; rl = rl->next) {
     if (rl->closed || rl->dead) continue;
-    if (rl->len + chunk->len > rl->cap) {
-      rl->cap = (rl->len + chunk->len) * 2 + 64;
+    const char *data = (const char *)chunk->data;
+    size_t n = chunk->len;
+    /* kSawReturnAt within crlfDelay: a leading \n belongs to the \r. */
+    if (rl->saw_return && scr_now_ms() - rl->saw_return_at <= rl->crlf_delay) {
+      if (n > 0 && data[0] == '\n') {
+        data++;
+        n--;
+      }
+      rl->saw_return = false;
+    }
+    if (memchr(data, '\n', n) != NULL || memchr(data, '\r', n) != NULL) {
+      rl->saw_return = data[n - 1] == '\r';
+      rl->saw_return_at = scr_now_ms();
+    }
+    if (rl->len + n > rl->cap) {
+      rl->cap = (rl->len + n) * 2 + 64;
       rl->buf = realloc(rl->buf, rl->cap);
       if (!rl->buf) scr_rl_oom();
     }
-    memcpy(rl->buf + rl->len, chunk->data, chunk->len);
-    rl->len += chunk->len;
+    memcpy(rl->buf + rl->len, data, n);
+    rl->len += n;
     scr_rl_drain(rl);
     if (scr_exc_pending()) return;
   }
@@ -160,18 +182,6 @@ static void scr_rl_end_thunk(ScrClosure *cb) {
   scr_rl_data_cb = NULL; /* the stdin unit dropped its listeners itself */
   for (ScrRl *rl = scr_rls; rl; rl = rl->next) {
     if (rl->closed || rl->dead) continue;
-    if (rl->len > 0 && rl->buf[rl->len - 1] == '\r' && rl->q_cb) {
-      /* "a\r" then EOF: the \r terminates the line (Node's crlfDelay
-       * expiry collapsed to EOF time). */
-      ScrStr *line = scr_str_new(rl->buf, rl->len - 1);
-      ScrClosure *qcb = rl->q_cb;
-      void (*fn)(ScrClosure *, ScrStr *) = rl->q_fn;
-      rl->q_cb = NULL;
-      rl->len = 0;
-      fn(qcb, line);
-      scr_closure_release(qcb);
-      if (scr_exc_pending()) return;
-    }
     scr_rl_settle_close(rl);
     if (scr_exc_pending()) return;
   }
@@ -196,7 +206,7 @@ static void scr_rl_cleanup_atexit(void) {
   }
 }
 
-double scr_rl_create(void) {
+double scr_rl_create(bool has_output, double crlf_delay) {
   static bool cleanup_registered = false;
   if (!cleanup_registered) {
     cleanup_registered = true;
@@ -205,6 +215,10 @@ double scr_rl_create(void) {
   ScrRl *rl = calloc(1, sizeof *rl);
   if (!rl) scr_rl_oom();
   rl->id = scr_rl_next_id++;
+  rl->has_output = has_output;
+  rl->crlf_delay = (crlf_delay != 0 && crlf_delay == crlf_delay) ? (crlf_delay > 100 ? crlf_delay : 100) : 100;
+  rl->saw_return = false;
+  rl->saw_return_at = 0;
   rl->next = scr_rls;
   scr_rls = rl;
   if (scr_stdin_ended()) {
@@ -238,7 +252,7 @@ void scr_rl_question(double id, const ScrStr *query, ScrClosure *cb /*moves*/,
   /* The prompt writes to stdout under pipes too (Node's question does), and
    * must be visible before input arrives even though it has no trailing
    * newline. */
-  scr_stdio_write(1, query->data, query->len);
+  if (rl->has_output) scr_stdio_write(1, query->data, query->len);
   if (rl->dead) {
     /* Created after stdin ended: pinned against Node — the prompt still
      * writes, but the DESTROYED stream delivers nothing and 'close'

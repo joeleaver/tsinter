@@ -589,7 +589,9 @@
  *     [event modules only — those reaching cp.spawn or cp.spawnOpts, and
  *     since INC-29 U1 those reaching a node:net key that can start host
  *     I/O (netCall below); since unit G1 those reaching a signal listener
- *     (sigCall below); since unit G3 those reaching fs.watch (watchCall)]
+ *     (sigCall below); since unit G3 those reaching fs.watch (watchCall);
+ *     since unit G2 those reaching process.stdin's events or node:readline
+ *     (stdinCall)]
  *     evPoll(ptr, cap) -> i32. INC-28 U2. The host's EVENT QUEUE, read one
  *     event at a time: the host writes the oldest queued event at ptr and
  *     answers its length; answers 0 when the queue is empty; and answers
@@ -598,7 +600,8 @@
  *     held, never lost and never re-created. THE RECORD, little-endian:
  *     u32 source at +0 (1 = a child, 2 = a net handle — INC-29 U1,
  *     netCall below; 3 = a signal subscription — unit G1, sigCall below;
- *     4 = a file-system watch — unit G3, watchCall below),
+ *     4 = a file-system watch — unit G3, watchCall below; 5 = fd 0 — unit
+ *     G2, stdinCall below),
  *     u32 handle at +4, u32 kind at +8,
  *     u32 payloadLen at +12, i32 a at +16, i32 b at +20 — 4+4+4+4+4+4 = 24
  *     bytes — then payloadLen bytes. A child's kinds: 1 EXIT (a = the exit
@@ -1134,6 +1137,34 @@
  *     and reports what its OS reported, in order, is enforced by NOTHING —
  *     the harness's own rows are the check.
  *
+ *   (import "tsinter" "stdinCall" (func (param i32) (result i32)))
+ *     [modules reaching process.stdin's 'data' / 'end' / 'error' listeners,
+ *     its for-await chunk source, or node:readline — unit G2; minted after
+ *     watchCall]
+ *     stdinCall(op) -> i32: libuv's uv_read_start / uv_read_stop on the
+ *     program's fd 0 stream, and nothing more.
+ *       op 1 READ_START -> 0, or the NEGATIVE errno the read could not start
+ *                          with (the module's named trap). Deliver DATA /
+ *                          EOF / READ_ERROR records from now on.
+ *       op 2 READ_STOP  -> 0. Stop: no record is delivered until the next
+ *                          READ_START — including any the host has already
+ *                          queued, which it HOLDS and re-queues, in order,
+ *                          at that READ_START (netCall's READ_STOP). The
+ *                          host stops reading fd 0 itself at once.
+ *     EVENTS, evPoll source 5, handle 0: kind 1 DATA (payload = the bytes of
+ *     one read), 2 EOF (no payload; once — reading has ended, and the
+ *     module never asks again), 3 READ_ERROR (a = -errno; the module's
+ *     named trap, SEMANTICS.md S097); a = 0 otherwise, b = 0. Any record
+ *     out of these shapes is the named trap "evPoll: host failure". Every
+ *     Node behaviour — the Readable's flowing state and lists, readline's
+ *     splitter and question / close — is the module's (hostev.ts); a READ
+ *     loop's liveness is the module's too (reading holds the loop).
+ *     THE CAPABILITY (S004): a host with no standard input may still supply
+ *     the import and answer EOF at the first READ_START; one that declines
+ *     it fails the module's instantiation with a LinkError.
+ *     stdinCall's EFFECT TIER: that the records are fd 0's bytes, in order,
+ *     is enforced by NOTHING — the harness's own rows are the check.
+ *
  *   (export "_start" (func))            — the program; run it once.
  *   (export "_tick" (func (param f64) (result f64)))  [timer modules only]
  *   (export "_loop" (func (param f64) (result f64)))  [event modules only,
@@ -1263,6 +1294,7 @@ export const IMPORT_RANDOM = "random";
 export const IMPORT_SLEEP = "sleep";
 export const IMPORT_SIG_CALL = "sigCall";
 export const IMPORT_WATCH_CALL = "watchCall";
+export const IMPORT_STDIN_CALL = "stdinCall";
 export const EXPORT_ENTRY = "_start";
 export const EXPORT_TICK = "_tick";
 export const EXPORT_LOOP = "_loop";

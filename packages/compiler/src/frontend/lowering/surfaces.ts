@@ -721,7 +721,7 @@ export const BUILTIN_MODULE_FNS: Record<string, Record<string, BuiltinModuleFn |
   // interface's question/close/on lower through
   // lowerReadlineMethodCall.
   readline: {
-    createInterface: { fn: "rl.create", params: [], result: F64 },
+    createInterface: { fn: "rl.create", params: [BOOL, F64], result: F64 },
   },
   // node:net and node:http lower ENTIRELY through the server spoke
   // (lower-server.ts — every call shape is special-cased: closures, the
