@@ -3654,6 +3654,14 @@ export class InspectBuilder {
         this.deps.lit(c, "null");
         c.return_();
       });
+      if (dyn.accessorsLive) {
+        // Unit A2: an island getter member, reached only as an entry of
+        // the OBJ arm's raw walk — Node prints `[Getter]` and never runs it.
+        this.kindArm(c, K, [DK.JSVAL], () => {
+          this.deps.lit(c, "[Getter]");
+          c.return_();
+        });
+      }
       this.kindArm(c, K, [DK.UNDEF], () => {
         this.deps.lit(c, "undefined");
         c.return_();
@@ -4148,9 +4156,12 @@ export class InspectBuilder {
           c.end();
         }
         // Own-key ORDER, through the one helper that defines it. The
-        // receiver is an OBJ, so this walk cannot throw.
+        // receiver is an OBJ, so this walk cannot throw. Where island
+        // getters exist (unit A2) it is objWalk's raw entries mode, which
+        // hands an accessor member back as its cell (rendered `[Getter]`
+        // below, Node's text) instead of calling the getter.
         c.localGet(D);
-        c.i32Const(2); // Object.entries mode
+        c.i32Const(dyn.accessorsLive ? 3 : 2); // Object.entries mode
         c.call(dyn.objWalk());
         c.localSet(ENTS);
         dyn.arrPayload(c, (x) => x.localGet(ENTS));
@@ -5159,7 +5170,7 @@ export class InspectBuilder {
       c.call(this.ibPuts());
       putLit(": ");
       c.localGet(OENTRY);
-      c.structGet(dyn.entryT(), ENTRY_VALUE);
+      c.structGet(dyn.entryT(), ENTRY_VALUE); dyn.guardCell(c);
       c.localGet(INDENT);
       c.i32Const(2);
       c.i32Add();

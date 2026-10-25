@@ -1619,6 +1619,25 @@ const ERR_CODE = 3;
 const NULL_PROTO_TOSTR_REFUSAL =
   "converting a null-prototype object (Object.create(null)) to a primitive value is not supported yet";
 
+/** Unit A2: the named run-time refusals of the island accessor and
+ * prototype-link surfaces (dyn.ts's unit-A2 section): a reader that can
+ * neither call a getter nor walk a prototype chain meets one. Reported
+ * as uncaught (those readers are not catchable sites), never answered. */
+const ACCESSOR_READ_REFUSAL =
+  "reading a getter-defined property of an island object here (a typed conversion, an option record, deep equality) is not supported yet";
+const PROTO_LINK_REFUSAL =
+  "deep equality over an island object built by Object.create(proto) is not supported yet";
+
+/** Unit A2: the island's `Object.create(...)` call — jsOp callMethod
+ * "create" over globalGet("Object"), the shape lower-island.ts builds. */
+function isIslandObjectCreate(rec: Record<string, unknown>): boolean {
+  if (rec["kind"] !== "jsOp" || rec["op"] !== "callMethod" || rec["name"] !== "create") return false;
+  const args = rec["args"];
+  if (!Array.isArray(args) || args.length === 0) return false;
+  const recv = args[0] as Record<string, unknown>;
+  return recv["kind"] === "jsOp" && recv["op"] === "globalGet" && recv["name"] === "Object";
+}
+
 /** The canonical IEEE754 quiet NaN (0x7ff8000000000000), constructed
  * byte-exact from the literal hex rather than trusted from any
  * expression's OWN NaN bits — SEMANTICS.md S036: a NaN produced by real
@@ -2457,6 +2476,12 @@ class Assembler {
    * dyn.ts OBJ_PROTO codes 2-4), so the OBJ_PROTO readers test codes
    * exactly. */
   private readonly builtinObjLive: boolean;
+  /** Unit A2: the module defines an island getter (jsOp defineGetter). */
+  private readonly accessorsLive: boolean;
+  /** Unit A2: the module calls the island's `Object.create`. */
+  private readonly objCreateLive: boolean;
+  /** Unit A2: the module builds an island tag call's strings array. */
+  private readonly tplLive: boolean;
   /** `Date.now()`/`new Date()`'s wall clock reads this import and floors;
    * `performance.now()`'s ORIGIN — `now()` sampled ONCE at `_start`
    * entry, in a mutable f64 global, in any module that reaches
@@ -2665,13 +2690,21 @@ class Assembler {
       "str.atob",
       "str.btoa",
     ]);
-    this.nullProtoLive = this.irNodeReachable(
-      mod,
-      (rec) =>
-        rec["kind"] === "libCall" &&
-        typeof rec["fn"] === "string" &&
-        (rec["fn"] === "dyn.objCreateNullProto" || rec["fn"].startsWith("http.") || rec["fn"].startsWith("https.")),
-    );
+    // Unit A2: the island's `Object.create(...)` (jsOp callMethod over
+    // globalGet("Object")) can build a null-prototype object or a linked
+    // one; both readers' refusals are installed only where it appears.
+    this.objCreateLive = this.irNodeReachable(mod, (rec) => isIslandObjectCreate(rec));
+    this.nullProtoLive =
+      this.objCreateLive ||
+      this.irNodeReachable(
+        mod,
+        (rec) =>
+          rec["kind"] === "libCall" &&
+          typeof rec["fn"] === "string" &&
+          (rec["fn"] === "dyn.objCreateNullProto" || rec["fn"].startsWith("http.") || rec["fn"].startsWith("https.")),
+      );
+    this.accessorsLive = this.irNodeReachable(mod, (rec) => rec["kind"] === "jsOp" && rec["op"] === "defineGetter");
+    this.tplLive = this.irNodeReachable(mod, (rec) => rec["kind"] === "jsOp" && rec["op"] === "tplStrings");
     this.inspHiddenLive = this.libCallReachable(mod, ["insp.dynHidden"]);
     this.irNodeReachable(mod, (rec) => {
       if (rec["kind"] === "libCall" && rec["fn"] === "qs.parse") {
@@ -4065,6 +4098,25 @@ class Assembler {
     c.localSet(EN);
     c.localGet(EN);
     c.structGet(dyn.entryT(), ENTRY_VALUE);
+    if (dyn.accessorsLive) {
+      // Unit A2: structuredClone reads an island getter's answer (Node
+      // runs it once, as a [[Get]]), the source as `this`; a throwing
+      // getter abandons the clone with its error pending.
+      c.localTee(V);
+      dyn.isAccessorCell(c);
+      c.ifVoid();
+      c.localGet(0);
+      c.localGet(V);
+      c.call(dyn.callGetter());
+      c.localTee(V);
+      c.refIsNull();
+      c.ifVoid();
+      c.refNull(dynT);
+      ret();
+      c.end();
+      c.end();
+      c.localGet(V);
+    }
     c.localGet(1);
     c.localGet(2);
     c.call(idx);
@@ -8130,6 +8182,27 @@ class Assembler {
             },
           }
         : {}),
+      ...(this.accessorsLive
+        ? {
+            accessors: {
+              refuse: (c: Code): void => {
+                this.emitSetCellError(c, "%Error", "Error", (x) => this.pushStrLitInto(x, ACCESSOR_READ_REFUSAL), null);
+                c.call(this.reportUncaughtHelper());
+              },
+            },
+          }
+        : {}),
+      ...(this.objCreateLive
+        ? {
+            protoLink: {
+              refuse: (c: Code): void => {
+                this.emitSetCellError(c, "%Error", "Error", (x) => this.pushStrLitInto(x, PROTO_LINK_REFUSAL), null);
+                c.call(this.reportUncaughtHelper());
+              },
+            },
+          }
+        : {}),
+      ...(this.tplLive ? { tpl: true as const } : {}),
     });
     return this.dynField;
   }
@@ -14718,7 +14791,7 @@ class Assembler {
             c.i32Eqz();
             c.ifVoid();
             c.localGet(oE);
-            c.structGet(entryT, ENTRY_VALUE);
+            c.structGet(entryT, ENTRY_VALUE); this.dyn.guardCell(c);
             c.call(inner);
             c.i32Eqz();
             c.ifVoid();
@@ -15111,7 +15184,7 @@ class Assembler {
               c.localGet(oE);
               c.structGet(entryT, ENTRY_KEY);
               c.localGet(oE);
-              c.structGet(entryT, ENTRY_VALUE);
+              c.structGet(entryT, ENTRY_VALUE); this.dyn.guardCell(c);
               c.call(this.maps.set(info.overflow));
             } else {
               const inner = this.dynCheckHelper(iv, loc);
@@ -15121,7 +15194,7 @@ class Assembler {
               c.localGet(oE);
               c.structGet(entryT, ENTRY_KEY);
               c.localGet(oE);
-              c.structGet(entryT, ENTRY_VALUE);
+              c.structGet(entryT, ENTRY_VALUE); this.dyn.guardCell(c);
               dyn.pushPathKey(c, (x) => x.localGet(1), (x) => {
                 x.localGet(oE);
                 x.structGet(entryT, ENTRY_KEY);
@@ -15335,6 +15408,41 @@ class Assembler {
    * function, the env `struct.new` for a capturing one — which is what
    * `closure` already pushes. C is immune for free (a ScrClosure is
    * always a real pointer); this lane is immune by discipline. */
+
+  /** Unit A2: whether a defineGetter's getter was written AFTER every
+   * data member of the literal it defines onto (the only order the front
+   * end's append-the-getters lowering reproduces). The literal is the
+   * objLit at the base of the defineGetter / objSpread chain, plus any
+   * objLit an objSpread merges; a member without a position never
+   * disqualifies. */
+  private islandGetterInOrder(e: WExpr & { kind: "jsOp" }): boolean {
+    const at = e.loc?.start;
+    if (at === undefined) return true;
+    const lits: WExpr[] = [];
+    let base: WExpr = e.args[0]!;
+    for (;;) {
+      if (base.kind === "jsOp" && base.op === "defineGetter") {
+        base = base.args[0]!;
+        continue;
+      }
+      if (base.kind === "jsOp" && base.op === "objSpread") {
+        lits.push(base.args[1]!);
+        base = base.args[0]!;
+        continue;
+      }
+      break;
+    }
+    lits.push(base);
+    for (const lit of lits) {
+      if (lit.kind !== "jsOp" || lit.op !== "objLit") continue;
+      for (let i = 0; i < lit.args.length; i += 2) {
+        const k = lit.args[i]!;
+        const kAt = k.loc?.start ?? (k.kind === "jsMarshal" ? k.value.loc?.start : undefined);
+        if (kAt !== undefined && kAt > at) return false;
+      }
+    }
+    return true;
+  }
 
   private readonly dynFnSigIds = new Map<string, number>();
   private readonly dynFnThunks = new Map<string, number>();
@@ -23219,7 +23327,7 @@ class Assembler {
           code.localSet(IFNAME);
           const ENTRIESDYN = this.acquireScratch(dynRefT);
           code.localGet(ENTRY);
-          code.structGet(entryT, ENTRY_VALUE);
+          code.structGet(entryT, ENTRY_VALUE); this.dyn.guardCell(code);
           code.localSet(ENTRIESDYN);
           this.releaseScratch(entryRefT, ENTRY);
 
@@ -24118,7 +24226,10 @@ class Assembler {
         this.openIfResult(I32);
         this.dyn.objPayload(code, (c) => c.localGet(d));
         this.pushStrLit(e.key);
-        code.call(this.dyn.objGet());
+        // Unit A2: an accessor member is present (the raw lookup), and a
+        // linked island object answers through its prototype chain —
+        // `in` is HasProperty, as in Node.
+        code.call(this.accessorsLive || this.objCreateLive ? this.dyn.memberLookup() : this.dyn.objGet());
         code.refIsNull();
         code.i32Eqz();
         code.else_();
@@ -24142,7 +24253,16 @@ class Assembler {
         // The ARRAY arm: "length" is always there, a canonical index is
         // there when it is in range, and no other spelling ever is.
         const arrIdx = /^(0|[1-9][0-9]*)$/.test(e.key) ? Number(e.key) : null;
-        if (e.key !== "length" && (arrIdx === null || arrIdx > Number.MAX_SAFE_INTEGER)) {
+        if (e.key === "raw" && this.tplLive) {
+          // Unit A2: a tag call's strings array owns `raw`.
+          code.localGet(d);
+          code.refTest(this.dyn.tplT());
+          this.openIfResult(I32);
+          code.i32Const(1);
+          code.else_();
+          pushFuncArm();
+          this.close();
+        } else if (e.key !== "length" && (arrIdx === null || arrIdx > Number.MAX_SAFE_INTEGER)) {
           pushFuncArm();
         } else {
           code.localGet(d);
@@ -27977,6 +28097,23 @@ class Assembler {
               this.releaseScratch(this.dyn.dynRef(), v);
               return;
             }
+            if (globalGetName === "Object" && name === "create") {
+              // Unit A2: `Object.create(proto)` on the island — a null-
+              // prototype object for null, a LINKED object (live
+              // delegation, dyn.ts's unit-A2 section) for an object, V8's
+              // TypeError for a primitive, a named refusal for the
+              // prototypes this tier does not chain through. The
+              // properties argument is not modeled.
+              if (e.args.length !== 2) {
+                this.refuse(`expr:${e.kind}`, e.loc);
+                code.unreachable();
+                return;
+              }
+              this.walkExpr(e.args[1]!);
+              code.call(this.dyn.objCreate());
+              this.emitPendingCheck();
+              return;
+            }
             if (globalGetName === "Number" && (name === "isInteger" || name === "isSafeInteger")) {
               // Oracle-measured (2474's own need): NO coercion — a
               // string that "looks numeric" answers false, same as a
@@ -28394,8 +28531,12 @@ class Assembler {
             // source spelling for a bare call target (unlike getProp/
             // callMethod's `name`) — no measured corpus call reaches
             // the non-callable path through this op, so this is a
-            // reasonable placeholder, not a pinned text.
-            this.pushStrLit("value");
+            // reasonable placeholder, not a pinned text. An island TAG
+            // call (unit A2: its first argument is the tplStrings array)
+            // names a bare-identifier tag the way Node does ("tag is not
+            // a function").
+            const tagCall = e.args[1]?.kind === "jsOp" && e.args[1].op === "tplStrings";
+            this.pushStrLit(tagCall ? this.islandCalleeSpelling(e.args[0]!) : "value");
             code.call(this.dyn.callFn());
             this.emitPendingCheck();
             this.releaseScratch(this.dyn.dynRef(), fn);
@@ -28555,10 +28696,87 @@ class Assembler {
             this.releaseScratch(dynRef, t);
             return;
           }
-          // globalGet + the literal-adjacent ops that need engine
-          // dispatch — later gates of stage B, not yet wired.
+          // `{ get k() {...} }` in an island literal (unit A2): the member
+          // is an ACCESSOR CELL (dyn.ts's unit-A2 section) holding the
+          // getter's FUNC box, defined onto the literal the front end has
+          // already built (args are the object, the marshaled key and the
+          // getter), answering the object for chaining. The front end
+          // appends every getter AFTER the literal's data members, so a
+          // getter written BEFORE a data member would take the wrong own-
+          // key position (Node keeps source order): that shape refuses by
+          // name at compile time rather than enumerate out of order.
+          case "defineGetter": {
+            const keyArg = e.args[1]!;
+            if (keyArg.kind !== "jsMarshal" || keyArg.value.kind !== "strLit") {
+              this.refuse(`expr:${e.kind}`, e.loc);
+              code.unreachable();
+              return;
+            }
+            if (!this.islandGetterInOrder(e)) {
+              this.refuse("jsOp:defineGetter-order", e.loc);
+              code.unreachable();
+              return;
+            }
+            this.walkExpr(e.args[0]!);
+            const o = this.acquireScratch(this.dyn.dynRef());
+            code.localSet(o);
+            this.dyn.objPayload(code, (c) => c.localGet(o));
+            this.pushStrLit(keyArg.value.value);
+            this.dyn.pushAccessorCell(code, () => this.walkExpr(e.args[2]!));
+            code.call(this.dyn.objPut());
+            code.localGet(o);
+            this.releaseScratch(this.dyn.dynRef(), o);
+            return;
+          }
+          // An island tag call's strings array (unit A2): the cooked
+          // strings as an ordinary dyn array, carrying the raw spellings
+          // as its `raw` member (a `$dynTpl`, dyn.ts). Node hands a tag
+          // the SAME array object at every evaluation of one site, so the
+          // array interns per site in a lazy global (the static
+          // templateStrings's own per-key shape). It is not frozen:
+          // SEMANTICS.md S080.
+          case "tplStrings": {
+            const n = e.args.length / 2;
+            const dynRef = this.dyn.dynRef();
+            const key = `island:${e.loc?.file ?? ""}:${e.loc?.start ?? 0}:${this.templateInternGlobals.size}`;
+            const g = this.mb.addGlobal(dynRef, true, (w) => {
+              w.u8(0xd0); // ref.null $dyn
+              w.sleb(this.dyn.dynT());
+            });
+            this.templateInternGlobals.set(key, g);
+            code.globalGet(g);
+            code.refIsNull();
+            code.ifVoid();
+            const cooked = this.acquireScratch(this.dyn.arrRef());
+            const raw = this.acquireScratch(this.dyn.arrRef());
+            code.f64Const(0);
+            code.call(this.vecs.newLen(this.dynVecInfo()));
+            code.localSet(cooked);
+            code.f64Const(0);
+            code.call(this.vecs.newLen(this.dynVecInfo()));
+            code.localSet(raw);
+            for (let i = 0; i < n; i++) {
+              code.localGet(cooked);
+              this.walkExpr(e.args[i]!);
+              code.call(this.dyn.arrPush());
+              code.localGet(raw);
+              this.walkExpr(e.args[n + i]!);
+              code.call(this.dyn.arrPush());
+            }
+            code.i32Const(DK.ARR);
+            code.f64Const(0);
+            code.localGet(cooked);
+            this.dyn.boxArr(code, (c) => c.localGet(raw));
+            code.structNew(this.dyn.tplT());
+            code.globalSet(g);
+            this.releaseScratch(this.dyn.arrRef(), raw);
+            this.releaseScratch(this.dyn.arrRef(), cooked);
+            code.end();
+            code.globalGet(g);
+            return;
+          }
+          // globalGet — later gates of stage B, not yet wired.
           case "globalGet":
-          case "tplStrings": case "defineGetter":
             this.refuse(`expr:${e.kind}`, e.loc);
             code.unreachable();
             return;
@@ -37556,7 +37774,7 @@ class Assembler {
         this.brTo(breakPos, false);
         code.else_();
         code.localGet(entryLocal);
-        code.structGet(entryT, ENTRY_VALUE);
+        code.structGet(entryT, ENTRY_VALUE); this.dyn.guardCell(code);
         code.localGet(bvLocal);
         code.call(this.dyn.deepEqDyn());
         code.i32Eqz();

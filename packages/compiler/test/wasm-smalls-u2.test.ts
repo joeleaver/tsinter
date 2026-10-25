@@ -657,13 +657,16 @@ test("row67 B-i [plain]: toSpliced() with ZERO arguments — the .ts spelling (p
 // but is NOT part of this unit (its own, different, still-refused key).
 // ============================================================
 
-test("row68 NOT-LIFTED: 2251 (a dyn-tagged template) stays refused at expr:jsOp", async () => {
+// row68 pinned, when this unit landed, that 2251 (a dyn-tagged template)
+// stayed refused at expr:jsOp. Unit A2 builds the island tag call's
+// strings array (jsOp tplStrings), so it now builds; the row keeps its
+// point — the dyn-tag path is a different one from this unit's static
+// templates — and pins that the build succeeds (its stdout is the corpus
+// row in wasm-island-a.test.ts).
+test("row68 2251 (a dyn-tagged template) builds since unit A2", async () => {
   const entry = fileURLToPath(new URL("../../../tests/corpus/2251-tagged-templates-dyn.ts", import.meta.url));
   const res = await compile(entry, { outPath: join(scratch, "row68.wasm"), outDir: scratch, backend: "wasm", dynamic: true });
-  if (res.ok) throw new Error("row68 (2251) compiled but was expected to stay refused at expr:jsOp");
-  const codes = res.diagnostics.map((d) => d.code);
-  expect(codes).toContain("SC3001");
-  expect(res.diagnostics.some((d) => d.message.includes("expr:jsOp"))).toBe(true);
+  expect(res.ok).toBe(true);
 });
 
 // ============================================================

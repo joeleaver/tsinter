@@ -5161,6 +5161,25 @@ export class JsonBuilder {
         // with skip=0 — a CHILD is always a fresh property, so its own
         // toJSON (if any) still fires (oracle-measured:
         // `{toJSON:()=>({x:{toJSON:()=>7}})}` → `{"x":7}`).
+        if (dyn.accessorsLive) {
+          // Unit A2: a `toJSON` that is an island GETTER would run from the
+          // keyGet below, outside the reentrancy bracket the call itself
+          // gets — refused by name.
+          dyn.objPayload(c, (x) => x.localGet(0));
+          this.deps.lit(c, "toJSON");
+          c.call(dyn.objGetRaw());
+          c.localTee(TJ);
+          c.refIsNull();
+          c.i32Eqz();
+          c.ifVoid();
+          c.localGet(TJ);
+          dyn.isAccessorCell(c);
+          c.ifVoid();
+          dyn.refuseAccessor(c);
+          c.unreachable();
+          c.end();
+          c.end();
+        }
         c.globalGet(this.jbSkipToJson());
         c.i32Eqz();
         c.ifVoid();
@@ -5240,6 +5259,44 @@ export class JsonBuilder {
         // toJSON found (the ordinary case) — either way, `v` (param 0)
         // is EXACTLY what SerializeJSONObject's own stack push and depth
         // increment (jbEnter) must key on now.
+        if (dyn.accessorsLive) {
+          // Unit A2: the members walk runs island GETTERS (objWalk's
+          // entries mode answers what each returns), which is arbitrary
+          // user code — so it runs FIRST, inside the same save/restore
+          // bracket a toJSON call gets (a getter may stringify too), and
+          // a getter that throws ends the walk with its error pending.
+          c.call(this.jbFinish());
+          c.localSet(SAVEDBUF);
+          c.globalGet(this.seen());
+          c.localSet(SAVEDSEEN);
+          c.refNull(this.seenArr());
+          c.globalSet(this.seen());
+          c.globalGet(this.seenLen());
+          c.localSet(SAVEDSEENLEN);
+          c.globalGet(this.jbDepth());
+          c.localSet(SAVEDDEPTH);
+          c.globalGet(this.circHit());
+          c.localSet(SAVEDCIRC);
+          c.localGet(0);
+          c.i32Const(2); // Object.entries mode
+          c.call(dyn.objWalk());
+          c.localSet(ENTS);
+          c.localGet(SAVEDBUF);
+          c.call(this.jbPuts());
+          c.localGet(SAVEDSEEN);
+          c.globalSet(this.seen());
+          c.localGet(SAVEDSEENLEN);
+          c.globalSet(this.seenLen());
+          c.localGet(SAVEDDEPTH);
+          c.globalSet(this.jbDepth());
+          c.localGet(SAVEDCIRC);
+          c.globalSet(this.circHit());
+          c.globalGet(this.deps.excKind());
+          c.ifVoid();
+          c.i32Const(0);
+          c.return_();
+          c.end();
+        }
         dyn.objPayload(c, (x) => x.localGet(0));
         c.localSet(OP);
         c.localGet(OP);
@@ -5257,11 +5314,13 @@ export class JsonBuilder {
           c.call(dyn.isError());
           c.localSet(ISERR);
         }
-        // Own-key ORDER, through the one helper that defines it.
-        c.localGet(0);
-        c.i32Const(2); // Object.entries mode
-        c.call(dyn.objWalk());
-        c.localSet(ENTS);
+        if (!dyn.accessorsLive) {
+          // Own-key ORDER, through the one helper that defines it.
+          c.localGet(0);
+          c.i32Const(2); // Object.entries mode
+          c.call(dyn.objWalk());
+          c.localSet(ENTS);
+        }
         dyn.arrPayload(c, (x) => x.localGet(ENTS));
         c.localSet(V);
         dyn.arrLen(c, (x) => x.localGet(V));

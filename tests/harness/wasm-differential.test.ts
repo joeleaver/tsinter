@@ -3537,6 +3537,13 @@ const TIER_FLOOR: string[] = [
   // spread-call texts, and an island literal's object spread: 1057 -> 1059.
   "2475-variadic-wrapper-island.js",
   "2568-rest-spread-forward-dynamic.js",
+  // Unit A2: island getters (an accessor cell read through its getter),
+  // `Object.create` on the island (null prototypes and linked objects
+  // with live delegation), and an island tag call's strings array with
+  // its `raw` member: 1059 -> 1062.
+  "2251-tagged-templates-dyn.ts",
+  "2474-island-literal-forms.ts",
+  "2590-object-create-dynamic.js",
 ];
 
 interface RunResult {

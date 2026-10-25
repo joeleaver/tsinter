@@ -618,7 +618,11 @@ member of the same name still shadows them and a null-prototype object has
 none; the c and llvm lanes still throw "is not a function" there. `toLocaleString`
 answers the object's ToString conversion, which on the tree ignores an own
 `toString` member (`o.toString = () => "X"` still gives "[object Object]",
-the same answer `String(o)` gives). **Rationale:** inherited
+the same answer `String(o)` gives). On the wasm tier one shape does have a
+chain (unit A2): an island object built by `Object.create(proto)` reads,
+calls methods and answers `in` through its prototype objects, live, as in
+Node — its conversion still ignores a `toString` member, own or inherited,
+the same way. **Rationale:** inherited
 from the C runtime's dyn tree, which stores own entries and has no
 prototype chain; giving it one means materializing Object/Array/String
 prototypes as real function values on every lane, which is a feature
@@ -2921,6 +2925,45 @@ name, measured against Node v24.18.1:
 
 **Tested by:** A1-SPREAD-03/05, A1-OSPREAD-03 and A1-DEFPROPS-01 in
 `packages/compiler/test/wasm-island-a.test.ts`.
+
+**Amendment (unit A2): island getters and `Object.create`.** An island
+literal's `get k() {...}` member is now modeled (read through the getter —
+a getter body using `this` still refuses at compile time, so the receiver
+binding is not observable; `[Getter]` to `util.inspect`; JSON,
+`Object.values`/`entries`, object spread and `structuredClone` read its
+answer), and the
+island's `Object.create(proto)` builds a null-prototype object or an object
+LINKED to `proto` (reads, method calls and `in` delegate live; own-key
+surfaces stay own). The surfaces this does not model fence by name, each
+measured against Node v24.18.1:
+- **A write over a getter-only member**, own or inherited (`o.g = 5`): a
+  catchable "assigning to the getter-only property 'g' of an island object
+  is not supported yet" Error, where Node's strict code throws
+  `TypeError: Cannot set property g of #<Object> which has only a getter`
+  and its sloppy code ignores the write (the writing code's strictness is
+  not known at the write). `Object.assign` onto such a member is the same
+  fence ("copying onto the getter-only property ...").
+- **A getter read by a reader that cannot run it** — a typed conversion of
+  the object (`f(o)` into a record parameter), an option record, the error
+  encoding's members, deep equality — reports the uncaught "reading a
+  getter-defined property of an island object here ... is not supported
+  yet" rather than reading a stale value; Node runs the getter. (A reader
+  not taught about the cell at all traps.)
+- **A getter written BEFORE a data member of its literal** (`{ get g()
+  {...}, n: 2 }`) refuses at compile time (`jsOp:defineGetter-order`): the
+  front end defines getters after the data members, which would enumerate
+  `n` before `g` where Node keeps source order.
+- **`Object.create` over an array, a function, bytes, a promise, a handle,
+  a null-prototype object or a built-in stand-in** throws a catchable named
+  Error where Node creates the object; a primitive prototype throws Node's
+  own `TypeError: Object prototype may only be an Object or null: <v>`.
+  The properties argument (`Object.create(p, props)`) refuses at compile
+  time.
+- **Deep equality over a linked object** reports an uncaught named refusal
+  (Node compares the prototypes).
+
+**Tested by:** A2-REF-01..05 in `packages/compiler/test/wasm-island-a.test.ts`,
+each with Node's answer beside it.
 
 ## S044 — jsExit of `array<jsval>`: the SPINE aliases on the wasm tier (matching Node); the native island copies it *(per-lane split)*
 
@@ -5890,6 +5933,17 @@ shape as --DYNAMIC's above, not a third one: the write is visible through the va
 on, and a second, independent evaluation of the same site is unaffected (row75) — only the
 module mode changes which mechanism produces the copy (an explicit cast vs. an untyped source),
 not the observable answer.
+
+**ISLAND TAG** (unit A2, wasm tier: an `any`-typed tag in a `--dynamic` build,
+jsOp tplStrings): the strings array, with its `raw` member, interns per site like the
+PLAIN array — the same object at every evaluation, as in Node — and is likewise not
+frozen: an index write lands on it and later evaluations of the site see it, where Node's
+strict code throws and its sloppy code ignores the write. The same holds for its `raw` array
+(`a.raw[0] = "Z"` lands; Node's strict code throws "Cannot assign to read only property '0' of
+object '[object Array]'") and for growth (`a.push("x")` lands; Node throws "Cannot add property <length>,
+object is not extensible"); assigning `a.raw = 1` throws this tier's "Cannot create property 'raw'
+on array" (S016's non-index write) where Node throws "Cannot assign to read only property 'raw' of
+object '[object Array]'".
 
 This is one half of board #161 (a PRE-EXISTING miscompile: an `Object.freeze`-then-cast value elsewhere
 in the tier is not respected either) — #161 itself is NOT licensed by this entry and is NOT this unit's

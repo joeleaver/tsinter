@@ -433,6 +433,23 @@ export interface DynDeps {
    * proto codes 2-4) — the emitter's static prescan — so every OBJ_PROTO
    * reader is byte-identical everywhere else. */
   builtinObjs?: true;
+  /** Unit A2: present ONLY in a module that defines an island GETTER
+   * (jsOp defineGetter — the emitter's static prescan), so every OBJ
+   * reader is byte-identical everywhere else. `refuse` is the named
+   * run-time refusal an accessor meets at a reader that cannot call it
+   * (it fills the exception cell, reports it as uncaught, and never
+   * returns — the nullProtoToStr shape). */
+  accessors?: { refuse: (c: Code) => void };
+  /** Unit A2: present ONLY in a module that builds an island object with
+   * a prototype LINK (`Object.create(proto)` pattern-served on the
+   * island), so OBJ readers walk a chain only there. `refuse` is the
+   * named uncaught refusal a linked object meets at a reader that would
+   * need its prototype (deep equality). */
+  protoLink?: { refuse: (c: Code) => void };
+  /** Unit A2: present ONLY in a module that builds an island tag call's
+   * strings array (jsOp tplStrings), whose `raw` member keyGet, hasOwn
+   * and `in` answer. */
+  tpl?: true;
   /** INC-27 U5: Object.assign's member PUT onto a DOMException — present
    * ONLY in a module that can mint a DOMException (the emitter's static
    * prescan), so assign's body is unchanged everywhere else. `isDomex`
@@ -735,6 +752,310 @@ export class DynBuilder {
     c.refCast(this.objT());
   }
 
+  /* ── unit A2: island accessors, prototype links, template strings ─────
+   *
+   * Three island-literal surfaces the native island gets from its engine,
+   * each built only in a module that can produce it (DynDeps.accessors /
+   * protoLink / tpl, the emitter's static prescan), so every other module
+   * is byte-identical.
+   *
+   * ACCESSOR CELL. A getter-defined member (`{ get k() {...} }` on the
+   * island, jsOp defineGetter) is an ordinary OBJ entry whose VALUE is a
+   * `$dyn` tagged DK.JSVAL carrying the getter's FUNC box in its ref slot.
+   * DK.JSVAL is otherwise unconstructible on this tier and every dispatch
+   * on it is `unreachable`, so a cell that reached a reader not taught
+   * about it would trap rather than answer as a value. The readers that
+   * ARE taught: keyGet (and through it every property read) and invoke's
+   * member lookup CALL the getter with `this` = the receiver; objWalk's
+   * values/entries modes call it too (Object.values/entries, JSON);
+   * objWalk mode 3 hands the cell back raw for the inspect renderer, which
+   * prints Node's `[Getter]`; hasOwn and `in` see the key, as in Node.
+   * keySet and assign refuse to write over one by name (Node's answer
+   * depends on the strictness of the code writing it); every other
+   * member reader (`objGet` — option records, the error encoding, typed
+   * conversions) and deep equality refuse by name through
+   * `accessors.refuse`. A literal's own later key (objPut — an object
+   * literal or spread defines, CreateDataProperty) simply replaces the
+   * cell, exactly as Node's literal redefinition does.
+   *
+   * PROTOTYPE LINK. `Object.create(proto)` on the island builds a
+   * `$dynObjLinked` — `$dynObj` plus an immutable `proto` field holding the
+   * prototype's OBJ box (so delegation is LIVE: a key added to the
+   * prototype later shows through). Reads (keyGet), method lookup
+   * (invoke), `in` and keySet's accessor check walk the chain; hasOwn,
+   * objWalk, JSON, inspect and assign are own-only, which is Node's own
+   * answer for each. The proto code stays PLAIN: the chain always ends at
+   * Object.prototype (a null-prototype or non-object prototype is refused
+   * where the object is created).
+   *
+   * TEMPLATE STRINGS. An island tag call's strings array is a `$dynTpl` —
+   * a `$dyn` subtype carrying an ARR box of the raw spellings beside the
+   * ordinary ARR payload of the cooked ones; keyGet, hasOwn and `in`
+   * answer its `raw` member. */
+
+  get accessorsLive(): boolean {
+    return this.deps.accessors !== undefined;
+  }
+
+  get protoLinkLive(): boolean {
+    return this.deps.protoLink !== undefined;
+  }
+
+  get tplLive(): boolean {
+    return this.deps.tpl === true;
+  }
+
+  private objLinkedType: number | null = null;
+  private tplType: number | null = null;
+
+  /** `$dynObjLinked <: $dynObj` — the OBJ payload with a prototype link. */
+  objLinkedT(): number {
+    if (this.objLinkedType !== null) return this.objLinkedType;
+    const objT = this.objT();
+    const entries = this.entriesArrayType();
+    this.objLinkedType = this.mb.subStructType(
+      "dyn:objLinked",
+      [
+        { storage: I32, mutable: true },
+        { storage: { kind: "ref", nullable: true, typeIndex: entries }, mutable: true },
+        { storage: I32, mutable: false },
+        { storage: this.dynRef(), mutable: false },
+      ],
+      objT,
+    );
+    return this.objLinkedType;
+  }
+
+  /** A fresh empty linked OBJ payload whose prototype box the caller
+   * pushes. */
+  pushNewLinkedObj(c: Code, pushProto: (c: Code) => void): void {
+    c.i32Const(0);
+    c.refNull(this.entriesArrayType());
+    c.i32Const(OBJ_PROTO_PLAIN);
+    pushProto(c);
+    c.structNew(this.objLinkedT());
+  }
+
+  /** `$dynTpl <: $dyn` — an ARR box with its `raw` companion. */
+  tplT(): number {
+    if (this.tplType !== null) return this.tplType;
+    const dynT = this.dynT();
+    this.tplType = this.mb.subStructType(
+      "dyn:tpl",
+      [
+        { storage: I32, mutable: false },
+        { storage: F64, mutable: false },
+        { storage: { kind: "ref", nullable: true, typeIndex: EQ_HEAP }, mutable: false },
+        { storage: this.dynRef(), mutable: false },
+      ],
+      dynT,
+    );
+    return this.tplType;
+  }
+
+  /** The accessor cell for the getter FUNC box the caller pushes. */
+  pushAccessorCell(c: Code, pushGetter: (c: Code) => void): void {
+    c.i32Const(DK.JSVAL);
+    c.f64Const(0);
+    pushGetter(c);
+    c.structNew(this.dynT());
+  }
+
+  /** %w.dyn.protoOf(obj) → the prototype box of a linked OBJ payload, or
+   * null for an unlinked one. */
+  protoOf(): number {
+    return this.cached("protoOf", [this.objRef()], [this.dynRef()], (idx) => {
+      const c = new Code();
+      c.localGet(0);
+      c.refTest(this.objLinkedT());
+      c.ifResult(this.dynRef());
+      c.localGet(0);
+      c.refCast(this.objLinkedT());
+      c.structGet(this.objLinkedT(), 3);
+      c.else_();
+      c.refNull(this.dynT());
+      c.end();
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** %w.dyn.callGetter(recv, cell) → the getter's answer with `this` =
+   * recv, or null with its exception pending. */
+  callGetter(): number {
+    return this.cached("callGetter", [this.dynRef(), this.dynRef()], [this.dynRef()], (idx) => {
+      const c = new Code();
+      const R = 2;
+      c.localGet(0);
+      c.call(this.thisPush());
+      c.localGet(1);
+      c.structGet(this.dynT(), DYN_REF);
+      c.refCast(this.dynT());
+      this.pushNewArr(c);
+      this.deps.lit(c, "getter");
+      c.call(this.callFn());
+      c.localSet(R);
+      c.call(this.thisPop());
+      c.localGet(R);
+      this.mb.setBody(idx, [this.dynRef()], c.bytes());
+    });
+  }
+
+  /** %w.dyn.objGetRaw(obj, key) — objGet's own-member scan with an
+   * accessor cell answered AS the cell (objGet itself refuses one in a
+   * module that can build it). The same function as objGet elsewhere. */
+  objGetRaw(): number {
+    if (!this.accessorsLive) return this.objGet();
+    return this.cached("objGetRaw", [this.objRef(), this.deps.strRef()], [this.dynRef()], (idx) => this.emitObjGetBody(idx));
+  }
+
+  /** The member lookup keyGet, invoke, keySet and `in` share: own entry,
+   * then (where links exist) each prototype's, answering the raw member
+   * (an accessor cell stays a cell) or null. */
+  memberLookup(): number {
+    if (!this.protoLinkLive) return this.objGetRaw();
+    return this.cached("chainGet", [this.objRef(), this.deps.strRef()], [this.dynRef()], (idx) => {
+      const c = new Code();
+      const V = 2;
+      const P = 3;
+      c.block();
+      c.loop();
+      c.localGet(0);
+      c.localGet(1);
+      c.call(this.objGetRaw());
+      c.localTee(V);
+      c.refIsNull();
+      c.i32Eqz();
+      c.brIf(1);
+      c.localGet(0);
+      c.call(this.protoOf());
+      c.localTee(P);
+      c.refIsNull();
+      c.ifVoid();
+      c.refNull(this.dynT());
+      c.return_();
+      c.end();
+      this.objPayload(c, (x) => x.localGet(P));
+      c.localSet(0);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(V);
+      this.mb.setBody(idx, [this.dynRef(), this.dynRef()], c.bytes());
+    });
+  }
+
+  /** %w.dyn.objCreate(proto) → the island's `Object.create(proto)`, or
+   * null with an error pending:
+   *   - null: a fresh null-prototype object (the existing OBJ flag);
+   *   - a plain object (or a linked one): a fresh LINKED object;
+   *   - a primitive or undefined: V8's TypeError, "Object prototype may
+   *     only be an Object or null: " and the value's ToString (measured:
+   *     `undefined`, `42`, `abc`, `true`, `0` for -0, the empty string);
+   *   - any other prototype — a null-prototype object or a built-in
+   *     container stand-in (the chain would not end at Object.prototype),
+   *     an array, a function, bytes, a promise, a handle — a named Error:
+   *     reads through it are not modeled. */
+  objCreate(): number {
+    return this.cached("objCreate", [this.dynRef()], [this.dynRef()], (idx) => {
+      const dynT = this.dynT();
+      const c = new Code();
+      const K = 1;
+      const MSG = 2;
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.localSet(K);
+      this.arm(c, K, [DK.NULL], () => this.boxObj(c, (x) => this.pushNewObj(x, true)));
+      this.arm(c, K, [DK.OBJ], () => {
+        this.objPayload(c, (x) => x.localGet(0));
+        c.structGet(this.objT(), OBJ_PROTO);
+        c.i32Const(OBJ_PROTO_PLAIN);
+        c.i32Ne();
+        c.ifVoid();
+        this.deps.throwError(c, "%Error", "Error", (x) =>
+          this.deps.lit(x, "Object.create over a null-prototype or built-in object on the island is not supported yet"),
+        );
+        c.refNull(dynT);
+        c.return_();
+        c.end();
+        this.boxObj(c, (x) => this.pushNewLinkedObj(x, (y) => y.localGet(0)));
+      });
+      this.arm(c, K, [DK.UNDEF, DK.BOOL, DK.NUM, DK.STR], () => {
+        this.deps.lit(c, "Object prototype may only be an Object or null: ");
+        c.localGet(0);
+        c.call(this.toStr());
+        c.call(this.deps.concat());
+        c.localSet(MSG);
+        this.deps.throwTypeError(c, (x) => x.localGet(MSG));
+        c.refNull(dynT);
+      });
+      this.arm(c, K, [DK.JSVAL], () => c.unreachable());
+      this.deps.throwError(c, "%Error", "Error", (x) =>
+        this.deps.lit(x, "Object.create over an array, function, bytes, promise or handle prototype on the island is not supported yet"),
+      );
+      c.refNull(dynT);
+      this.mb.setBody(idx, [I32, this.deps.strRef()], c.bytes());
+    });
+  }
+
+  /** The named uncaught refusal of an accessor at a reader that cannot run
+   * it (never returns). Only where accessors are live. */
+  refuseAccessor(c: Code): void {
+    const acc = this.deps.accessors;
+    if (acc === undefined) throw new Error("wasm dyn builder: refuseAccessor without live accessors");
+    acc.refuse(c);
+  }
+
+  /** With a raw entry VALUE on the stack: where accessors are live, the
+   * named uncaught refusal when it is an accessor cell (a reader that
+   * cannot run a getter — the typed conversion walkers, option records,
+   * the assert renderer), else the value itself. Nothing elsewhere. */
+  guardCell(c: Code): void {
+    if (!this.accessorsLive) return;
+    c.call(
+      this.cached("cellGuard", [this.dynRef()], [this.dynRef()], (idx) => {
+        const x = new Code();
+        x.localGet(0);
+        this.isAccessorCell(x);
+        x.ifVoid();
+        this.refuseAccessor(x);
+        x.unreachable();
+        x.end();
+        x.localGet(0);
+        this.mb.setBody(idx, [], x.bytes());
+      }),
+    );
+  }
+
+  /** With a member value on the stack, leaves i32: is it an accessor cell.
+   * Only meaningful where accessors are live. */
+  isAccessorCell(c: Code): void {
+    c.structGet(this.dynT(), DYN_KIND);
+    c.i32Const(DK.JSVAL);
+    c.i32Eq();
+  }
+
+  /** With a raw member (non-null) in local `m` and the receiver in local
+   * `recv`: replace an accessor cell in `m` by the getter's answer,
+   * returning `nullAnswer` (pushed by the caller's callback) from the
+   * enclosing function when the getter throws. Nothing where accessors
+   * are not live. */
+  resolveCellInto(c: Code, recv: number, m: number, returnPending: (c: Code) => void): void {
+    if (!this.accessorsLive) return;
+    c.localGet(m);
+    this.isAccessorCell(c);
+    c.ifVoid();
+    c.localGet(recv);
+    c.localGet(m);
+    c.call(this.callGetter());
+    c.localTee(m);
+    c.refIsNull();
+    c.ifVoid();
+    returnPending(c);
+    c.return_();
+    c.end();
+    c.end();
+  }
+
   /* ── the BYTES payload (increment 18 stage C) ──────────────────────────
    * `$dynBytes` — { bytes: bytes<u8> ref, isBuffer: i32 } — mirrors
    * `$dynObj`'s shape exactly (a payload struct wrapping the real value
@@ -815,9 +1136,41 @@ export class DynBuilder {
    * linear scan of `scr_dyn_obj_get`. A null answer is what the record
    * walkers test for (C's `if (!m)`), and kindName renders it
    * "undefined", so a missing member reports exactly like a present
-   * undefined one. */
+   * undefined one. In a module that can build an island accessor (unit
+   * A2), a member that is an accessor cell refuses by name here — this is
+   * the reader the option records, the error encoding and the typed
+   * conversions share, none of which can run a getter; the readers that
+   * can go through `objGetRaw`. */
   objGet(): number {
     return this.cached("objGet", [this.objRef(), this.deps.strRef()], [this.dynRef()], (idx) => {
+      const acc = this.deps.accessors;
+      if (acc !== undefined) {
+        const c = new Code();
+        const V = 2;
+        c.localGet(0);
+        c.localGet(1);
+        c.call(this.objGetRaw());
+        c.localTee(V);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(V);
+        this.isAccessorCell(c);
+        c.ifVoid();
+        acc.refuse(c);
+        c.unreachable();
+        c.end();
+        c.end();
+        c.localGet(V);
+        this.mb.setBody(idx, [this.dynRef()], c.bytes());
+        return;
+      }
+      this.emitObjGetBody(idx);
+    });
+  }
+
+  private emitObjGetBody(idx: number): void {
+    {
       const objT = this.objT();
       const entries = this.entriesArrayType();
       const entryT = this.entryT();
@@ -858,7 +1211,7 @@ export class DynBuilder {
       c.end();
       c.refNull(this.dynT());
       this.mb.setBody(idx, [I32, I32, this.entryRef()], c.bytes());
-    });
+    }
   }
 
   /** %w.dyn.objPut(obj, key, value) — `scr_dyn_obj_put` ported, LATER
@@ -1930,6 +2283,23 @@ export class DynBuilder {
       c.localGet(B);
       c.structGet(dynT, DYN_KIND);
       c.localTee(KB);
+      const acc = this.deps.accessors;
+      if (acc !== undefined) {
+        // Unit A2: an accessor member reached as a value (the a-side walk
+        // below hands entry values straight in): Node's comparison reads
+        // it through the getter; this walk cannot, so it refuses by name.
+        c.localGet(KA);
+        c.i32Const(DK.JSVAL);
+        c.i32Eq();
+        c.localGet(KB);
+        c.i32Const(DK.JSVAL);
+        c.i32Eq();
+        c.i32Or();
+        c.ifVoid();
+        acc.refuse(c);
+        c.unreachable();
+        c.end();
+      }
       c.i32Ne();
       c.ifVoid();
       c.i32Const(0);
@@ -2169,6 +2539,21 @@ export class DynBuilder {
       c.localSet(OBJA);
       this.objPayload(c, (x) => x.localGet(B));
       c.localSet(OBJB);
+      const link = this.deps.protoLink;
+      if (link !== undefined) {
+        // Unit A2: Node's strict comparison compares the PROTOTYPES of
+        // two objects; a linked island object's is not Object.prototype,
+        // and this walk does not compare chains, so it refuses by name.
+        c.localGet(OBJA);
+        c.refTest(this.objLinkedT());
+        c.localGet(OBJB);
+        c.refTest(this.objLinkedT());
+        c.i32Or();
+        c.ifVoid();
+        link.refuse(c);
+        c.unreachable();
+        c.end();
+      }
       c.localGet(OBJA);
       c.structGet(objT, OBJ_PROTO);
       c.localGet(OBJB);
@@ -2864,20 +3249,40 @@ export class DynBuilder {
         c.refNull(dynT);
         c.return_();
         c.end();
-        // Objects answer their own members.
+        // Objects answer their own members — and, unit A2, their
+        // prototypes' where a link exists, with an accessor member read
+        // through its getter (`this` = the receiver, wherever on the
+        // chain the getter lives).
         this.arm(c, K, [DK.OBJ], () => {
           this.objPayload(c, (x) => x.localGet(0));
           c.localGet(1);
-          c.call(this.objGet());
+          c.call(this.accessorsLive || this.protoLinkLive ? this.memberLookup() : this.objGet());
           c.localTee(M);
           c.refIsNull();
           c.ifResult(this.dynRef());
           c.globalGet(this.undefinedGlobal());
           c.else_();
+          this.resolveCellInto(c, 0, M, (x) => x.refNull(dynT));
           c.localGet(M);
           c.end();
         });
         this.arm(c, K, [DK.ARR], () => {
+          if (this.tplLive) {
+            // Unit A2: a tag call's strings array answers `raw`.
+            c.localGet(1);
+            this.deps.lit(c, "raw");
+            c.call(this.deps.strEq());
+            c.ifVoid();
+            c.localGet(0);
+            c.refTest(this.tplT());
+            c.ifVoid();
+            c.localGet(0);
+            c.refCast(this.tplT());
+            c.structGet(this.tplT(), 3);
+            c.return_();
+            c.end();
+            c.end();
+          }
           this.pushIsLength(c, (x) => x.localGet(1));
           c.ifVoid();
           this.boxNum(c, (x) => {
@@ -3135,7 +3540,35 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      const SETM = 8;
       this.arm(c, K, [DK.OBJ], () => {
+        if (this.accessorsLive) {
+          // Unit A2: a write over a getter-only member — own or inherited
+          // — throws in Node's strict code and is ignored in its sloppy
+          // code; which one the writing code is cannot be told here, so
+          // it refuses by name. (A plain inherited member is shadowed by
+          // the own write below, as in Node.)
+          this.objPayload(c, (x) => x.localGet(0));
+          c.localGet(1);
+          c.call(this.memberLookup());
+          c.localTee(SETM);
+          c.refIsNull();
+          c.i32Eqz();
+          c.ifVoid();
+          c.localGet(SETM);
+          this.isAccessorCell(c);
+          c.ifVoid();
+          this.deps.throwError(c, "%Error", "Error", (x) => {
+            this.deps.lit(x, "assigning to the getter-only property '");
+            x.localGet(1);
+            x.call(concat);
+            this.deps.lit(x, "' of an island object is not supported yet");
+            x.call(concat);
+          });
+          c.return_();
+          c.end();
+          c.end();
+        }
         this.objPayload(c, (x) => x.localGet(0));
         c.localGet(1);
         c.localGet(2);
@@ -3357,6 +3790,7 @@ export class DynBuilder {
           this.arrRef() /* A=5 */,
           this.deps.strRef() /* MSG=6 */,
           { kind: "ref", nullable: true, typeIndex: this.fnPropsT() } /* FP=7 */,
+          ...(this.accessorsLive ? [this.dynRef() /* SETM=8 */] : []),
         ],
         c.bytes(),
       );
@@ -3410,10 +3844,24 @@ export class DynBuilder {
       this.arm(c, K, [DK.OBJ], () => {
         this.objPayload(c, (x) => x.localGet(0));
         c.localGet(1);
-        c.call(this.objGet());
+        c.call(this.objGetRaw());
         c.refIsNull();
         c.i32Eqz();
       });
+      if (this.tplLive) {
+        // Unit A2: a tag call's strings array owns `raw` (non-enumerable).
+        c.localGet(0);
+        c.refTest(this.tplT());
+        c.ifVoid();
+        c.localGet(1);
+        this.deps.lit(c, "raw");
+        c.call(this.deps.strEq());
+        c.ifVoid();
+        c.i32Const(1);
+        c.return_();
+        c.end();
+        c.end();
+      }
       this.arm(c, K, [DK.ARR, DK.STR], () => {
         this.pushIsLength(c, (x) => x.localGet(1));
         c.ifResult(I32);
@@ -3636,10 +4084,38 @@ export class DynBuilder {
     MODE: number,
     OUT: number,
     PAIR: number,
+    resolve?: { recv: number; tmp: number },
   ): void {
     const objT = this.objT();
     const entries = this.entriesArrayType();
     const entryT = this.entryT();
+    // Unit A2: an accessor member's VALUE is its getter's answer (`this`
+    // = the walked object) in the values and entries modes; mode 3 is the
+    // entries walk that keeps the cell (the inspect renderer's `[Getter]`).
+    // A throwing getter returns null from the walk, its error pending.
+    const pushValue = (x: Code): void => {
+      x.localGet(E);
+      x.structGet(entryT, ENTRY_VALUE);
+      if (resolve === undefined || !this.accessorsLive) return;
+      x.localTee(resolve.tmp);
+      this.isAccessorCell(x);
+      x.localGet(MODE);
+      x.i32Const(3);
+      x.i32Ne();
+      x.i32And();
+      x.ifVoid();
+      x.localGet(resolve.recv);
+      x.localGet(resolve.tmp);
+      x.call(this.callGetter());
+      x.localTee(resolve.tmp);
+      x.refIsNull();
+      x.ifVoid();
+      x.refNull(this.dynT());
+      x.return_();
+      x.end();
+      x.end();
+      x.localGet(resolve.tmp);
+    };
     c.localGet(O);
     c.structGet(objT, OBJ_LEN);
     c.localSet(N);
@@ -3715,10 +4191,7 @@ export class DynBuilder {
         x.localGet(E);
         x.structGet(entryT, ENTRY_KEY);
       },
-      (x) => {
-        x.localGet(E);
-        x.structGet(entryT, ENTRY_VALUE);
-      },
+      pushValue,
     );
     c.br(0);
     c.end();
@@ -3751,10 +4224,7 @@ export class DynBuilder {
         x.localGet(E);
         x.structGet(entryT, ENTRY_KEY);
       },
-      (x) => {
-        x.localGet(E);
-        x.structGet(entryT, ENTRY_VALUE);
-      },
+      pushValue,
     );
     c.end();
     c.localGet(I);
@@ -3848,6 +4318,7 @@ export class DynBuilder {
       const CP = 15;
       const AB = 16;
       const FP = 17;
+      const CELL = 18; // unit A2, only where accessors are live
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
@@ -3871,7 +4342,7 @@ export class DynBuilder {
       this.arm(c, K, [DK.OBJ], () => {
         this.objPayload(c, (x) => x.localGet(0));
         c.localSet(O);
-        this.walkOrderedEntries(c, O, N, I, E, BEST, BESTV, LAST, IV, MODE, OUT, PAIR);
+        this.walkOrderedEntries(c, O, N, I, E, BEST, BESTV, LAST, IV, MODE, OUT, PAIR, { recv: 0, tmp: CELL });
         this.boxArr(c, (x) => x.localGet(OUT));
       });
       // P4, SITE C: enumTable entries ONLY (get-shaped surfaces read both
@@ -4045,6 +4516,7 @@ export class DynBuilder {
           this.deps.strRef(),
           this.deps.bytesRefU8(),
           { kind: "ref", nullable: true, typeIndex: this.fnPropsT() } /* FP=17 */,
+          ...(this.accessorsLive ? [this.dynRef() /* CELL=18 */] : []),
         ],
         c.bytes(),
       );
@@ -4119,6 +4591,9 @@ export class DynBuilder {
       const DX = 9;
       const KS = 10;
       const ER = 11;
+      // Unit A2's two scratch members, after whichever frame is in use.
+      const TV = dx !== undefined ? 12 : 9;
+      const SV = TV + 1;
       if (dx !== undefined) {
         dx.isDomex(c, 0, ER);
         c.localSet(DX);
@@ -4157,12 +4632,51 @@ export class DynBuilder {
           dx.refuseKey(c, KS);
           c.end();
         }
-        c.localGet(O);
-        c.localGet(E);
-        c.structGet(entryT, ENTRY_KEY);
-        c.localGet(E);
-        c.structGet(entryT, ENTRY_VALUE);
-        c.call(this.objPut());
+        if (this.accessorsLive) {
+          // Unit A2: a getter on the TARGET is not overwritten (Node's
+          // Object.assign throws over a getter-only member; a literal's
+          // spread would redefine it) — refused by name; a getter on the
+          // SOURCE copies its answer (`this` = the source).
+          c.localGet(O);
+          c.localGet(E);
+          c.structGet(entryT, ENTRY_KEY);
+          c.call(this.objGetRaw());
+          c.localTee(TV);
+          c.refIsNull();
+          c.i32Eqz();
+          c.ifVoid();
+          c.localGet(TV);
+          this.isAccessorCell(c);
+          c.ifVoid();
+          this.deps.throwError(c, "%Error", "Error", (x) => {
+            this.deps.lit(x, "copying onto the getter-only property '");
+            x.localGet(E);
+            x.structGet(entryT, ENTRY_KEY);
+            x.call(this.deps.concat());
+            this.deps.lit(x, "' of an island object is not supported yet");
+            x.call(this.deps.concat());
+          });
+          c.refNull(dynT);
+          c.return_();
+          c.end();
+          c.end();
+          c.localGet(E);
+          c.structGet(entryT, ENTRY_VALUE);
+          c.localSet(SV);
+          this.resolveCellInto(c, 1, SV, (x) => x.refNull(dynT));
+          c.localGet(O);
+          c.localGet(E);
+          c.structGet(entryT, ENTRY_KEY);
+          c.localGet(SV);
+          c.call(this.objPut());
+        } else {
+          c.localGet(O);
+          c.localGet(E);
+          c.structGet(entryT, ENTRY_KEY);
+          c.localGet(E);
+          c.structGet(entryT, ENTRY_VALUE);
+          c.call(this.objPut());
+        }
         c.localGet(I);
         c.i32Const(1);
         c.i32Add();
@@ -4238,8 +4752,18 @@ export class DynBuilder {
               I32,
               this.deps.strRef(),
               { kind: "ref", nullable: true, typeIndex: this.deps.errT() },
+              ...(this.accessorsLive ? [this.dynRef(), this.dynRef()] : []),
             ]
-          : [I32, this.objRef(), I32, I32, this.entryRef(), this.dynRef(), this.dynRef()],
+          : [
+              I32,
+              this.objRef(),
+              I32,
+              I32,
+              this.entryRef(),
+              this.dynRef(),
+              this.dynRef(),
+              ...(this.accessorsLive ? [this.dynRef(), this.dynRef()] : []),
+            ],
         c.bytes(),
       );
     });
@@ -6979,7 +7503,21 @@ export class DynBuilder {
         this.arm(c, K, [DK.OBJ], () => {
           this.objPayload(c, (x) => x.localGet(0));
           this.deps.lit(c, method);
-          c.call(this.objGet());
+          if (this.accessorsLive || this.protoLinkLive) {
+            // Unit A2: the method member is looked up along the prototype
+            // chain, and an accessor member is read through its getter
+            // first (`o.m()` with `get m()` calls what the getter answers).
+            c.call(this.memberLookup());
+            c.localTee(M);
+            c.refIsNull();
+            c.i32Eqz();
+            c.ifVoid();
+            this.resolveCellInto(c, 0, M, (x) => x.refNull(dynT));
+            c.end();
+            c.localGet(M);
+          } else {
+            c.call(this.objGet());
+          }
           c.localTee(M);
           c.refIsNull();
           c.i32Eqz();
