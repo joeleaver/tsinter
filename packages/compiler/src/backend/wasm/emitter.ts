@@ -2098,6 +2098,11 @@ const PROMISE_REACTION_METHODS = new Set(["then", "catch", "finally"]);
 const DYNTHEN_THEN = 0;
 const DYNTHEN_CATCH = 1;
 const DYNTHEN_FINALLY = 2;
+/** A PENDING promise's PROM_KIND while it is already resolved to a promise
+ * it is adopting (ECMA-262 [[AlreadyResolved]], boards #176 #177 #182
+ * #184): settle's adoption prologue ignores every later resolve/reject of
+ * it. No payload tag uses it, and nothing reads a pending promise's kind. */
+const PROM_KIND_ADOPTING = -2;
 
 /** jsOp:getProp's PROTOTYPE-MEMBER surface (increment 21, stage A,
  * post-review): an island receiver's property read can name a REAL
@@ -17408,6 +17413,9 @@ class Assembler {
        * slot, emitThrowValue's dispatch exactly — the two share the cell's
        * encoding, which is what lets a rejection copy across field-wise. */
       case "%async.settle":
+        // A dyn-typed fulfilment (an async function's `return x` with `x`
+        // an `any`) may be a promise to adopt — settle's prologue does it.
+        if (s.value !== null && (s.value.type.kind === "jsval" || s.value.type.kind === "dyn")) this.needSettleAdopt();
         this.walkExpr(s.promise);
         this.emitPayload(s.value, "settle", s.loc);
         code.i32Const(1);
@@ -19256,6 +19264,16 @@ class Assembler {
           case "promise.resolve":
           case "promise.reject": {
             const rejecting = e.name === "promise.reject";
+            const arg0 = e.args[0];
+            if (!rejecting && arg0 !== undefined && (arg0.type.kind === "jsval" || arg0.type.kind === "dyn")) {
+              // Boards #176/#182: `Promise.resolve(x)` over a dyn value is
+              // PromiseResolve — a promise held in `x` is answered itself
+              // (no job), any other value fulfils a fresh promise through
+              // settle's adoption prologue (%w.dynprom.resolve).
+              this.walkExpr(arg0);
+              code.call(this.dynPromResolveFn());
+              return;
+            }
             const p = this.acquireScratch(this.proms.promRef());
             code.call(this.proms.mint());
             code.localSet(p);
@@ -27991,8 +28009,54 @@ class Assembler {
               this.releaseScratch(this.dyn.dynRef(), recv);
               return;
             }
+            // then / catch / finally on an `any` receiver (boards #177,
+            // #182): a PROMISE receiver takes the reaction trio
+            // (%w.dynthen.go — the same machinery an `unknown` receiver's
+            // dynInvoke uses: a rejection passes through to the derived
+            // promise, a returned promise is adopted with Node's two jobs,
+            // 0-2 handlers, `.finally` waits for its handler's result).
+            // Any other receiver takes the generic dispatch unchanged (an
+            // object's own callable `then` is called; anything else is
+            // Node's "... is not a function"). Evaluation order is the
+            // receiver, the arguments, then the dispatch. The import
+            // spine's `then` is NOT taken here: it keeps thenRx below
+            // (isImportSpineThen; board #181 owns its timing).
+            if (PROMISE_REACTION_METHODS.has(name) && !this.isImportSpineThen(e)) {
+              this.markDynPromGate();
+              const dynRef = this.dyn.dynRef();
+              const argsVecR = this.acquireScratch(this.dyn.arrRef());
+              code.f64Const(0);
+              code.call(this.vecs.newLen(this.dynVecInfo()));
+              code.localSet(argsVecR);
+              for (let i = 1; i < e.args.length; i++) {
+                code.localGet(argsVecR);
+                this.walkExpr(e.args[i]!);
+                code.call(this.dyn.arrPush());
+              }
+              code.localGet(recv);
+              code.structGet(this.dyn.dynT(), DYN_KIND);
+              code.i32Const(DK.PROMISE);
+              code.i32Eq();
+              code.ifResult(dynRef);
+              code.localGet(recv);
+              code.localGet(argsVecR);
+              code.i32Const(name === "then" ? DYNTHEN_THEN : name === "catch" ? DYNTHEN_CATCH : DYNTHEN_FINALLY);
+              code.call(this.dynThenGoFn(e.loc));
+              code.else_();
+              code.localGet(recv);
+              code.localGet(argsVecR);
+              this.pushStrLit(name);
+              code.call(this.dyn.invoke(name));
+              code.end();
+              this.emitPendingCheck();
+              this.releaseScratch(this.dyn.arrRef(), argsVecR);
+              this.releaseScratch(dynRef, recv);
+              return;
+            }
             // then: the import bridge's OTHER spine half
             // (lower-island.ts:379) — `Promise.resolve().then(builder)`.
+            // Since boards #177/#182 ONLY the spine reaches this arm (the
+            // block above takes every other then/catch/finally).
             // Reached with a RUNTIME-kind check (not a static globalGet
             // shape match, unlike resolve): the receiver here is
             // `resolved`, an ordinary jsOp result, not a literal
@@ -40298,6 +40362,14 @@ class Assembler {
       c.f64Ne();
       return true;
     }
+    if (t.kind === "jsval" || t.kind === "dyn") {
+      // Boards #176/#184: a `Promise<any>` may be a typed promise handed
+      // out by %w.dynprom.resolve's identity — read through the helper
+      // whose body finalizeDynProm chooses (see promReadDynFn).
+      push();
+      c.call(this.promReadDynFn());
+      return true;
+    }
     const val = this.mapType(t, loc);
     if (val === null || val.kind !== "ref") {
       this.refuse(`${what}:${t.kind}`, loc);
@@ -40448,6 +40520,8 @@ class Assembler {
   private settlerFor(param: IrType | null, state: 1 | 2, loc: SrcLoc | undefined): number | null {
     const val = param === null ? null : this.mapType(param, loc);
     if (param !== null && val === null) return null;
+    // `new Promise((r) => r(x))` with a dyn `x`: settle's prologue adopts.
+    if (state === 1 && param !== null && (param.kind === "jsval" || param.kind === "dyn")) this.needSettleAdopt();
     const params = val === null ? [] : [val];
     const pair = this.closPairFor(params, []);
     const key = `${state}:${valKey({ kind: "ref", nullable: true, typeIndex: pair.fn })}`;
@@ -40789,6 +40863,12 @@ class Assembler {
         c.structGet(promT, PROM_F64);
         c.f64Const(0);
         c.f64Ne();
+      } else if (values.key === "vec(dyn)") {
+        // A dyn element (`Promise<any>` entries; array<jsval> keys as
+        // `vec(dyn)`, vecKeyFor): the entry may be a typed
+        // promise handed out by %w.dynprom.resolve's identity — boards
+        // #176/#184, see promReadDynFn.
+        c.call(this.promReadDynFn());
       } else {
         if (values.elemVal.kind !== "ref") throw new Error("ref-kind all element without a ref valtype");
         c.structGet(promT, PROM_REF);
@@ -40956,6 +41036,11 @@ class Assembler {
    * which is what `adapt` means below and the only reason a race reaction
    * is interned per (from, to) rather than once. */
   private raceReactionFor(from: IrType, to: IrType, loc: SrcLoc, bridge = false): number | null {
+    // A dyn race (`Promise<any>` entries into a `Promise<any>`): an entry
+    // may be a typed promise handed out by %w.dynprom.resolve's identity
+    // (boards #176/#184), so it copies through the dyn view in a gated
+    // module — its own reaction, never the typed race's raw "copy".
+    if (!bridge && typeEquals(from, to) && (from.kind === "jsval" || from.kind === "dyn")) return this.dynCopyRxFn();
     const key = typeEquals(from, to) ? "copy" : `${typeKey(from)}=>${typeKey(to)}`;
     // INC-27 U4: who shares the "copy" reaction decides its body at
     // finalizeDynProm — a typed same-type Promise.race must copy raw, a dyn
@@ -41225,6 +41310,11 @@ class Assembler {
     const pair = this.resumeClosPair();
     const idx = this.mb.declareFunc(pair.fn, "%w.async.thenRx");
     this.thenReactionField = idx;
+    // The spine's handler result (an imported module's namespace object)
+    // fulfils DST through settle: a namespace exporting a callable `then`
+    // is a thenable Node adopts, so settle's prologue must see it and
+    // refuse by name rather than fulfil with the namespace.
+    this.needSettleAdopt();
     // INC-27 U4: built HERE, where it is requested (so every helper it
     // needs is interned in the order it always was), but SET at
     // finalizeDynProm: a module that boxes a typed promise into dyn gets
@@ -41401,9 +41491,10 @@ class Assembler {
    * runs a dyn receiver's then/catch/finally sets `dynPromGate` while it
    * is being walked. finalizeDynProm samples it ONCE, after every function
    * has been walked; only then are the readers that could meet a typed
-   * payload given their bodies — the island `.then` reaction (thenRx),
-   * the shared "copy" reaction (the island bridge's await, a `.then`
-   * handler's returned promise, the trio's adoption) — converting in a
+   * payload given their bodies — the import spine's `.then` reaction
+   * (thenRx), the shared "copy" reaction (the spine's bridge), the trio's
+   * and a dyn Promise.race's own copy (%w.dynprom.copyRx), the jsval/dyn
+   * payload reader %w.prom.readDyn — converting in a
    * gated module, exactly today's instructions in every other one, whose
    * promise struct also stays unchanged. A walker built where it was
    * requested and SET here is the whole mechanism; a typed box minted
@@ -41506,10 +41597,10 @@ class Assembler {
     this.dynPromGateSampled = true;
     this.dynPromGateValue = this.dynPromGate;
     const gated = this.dynPromGateValue;
-    if (gated) {
-      this.proms.appendDynPromFields();
-      this.gateSettleOnDynPromise();
-    }
+    if (gated) this.proms.appendDynPromFields();
+    // Boards #176/#177/#182/#184: settle adopts a PROMISE box (and refuses
+    // a thenable object by name) wherever a dyn value can be a fulfilment.
+    if (gated || this.settleAdoptNeeded) this.adoptInSettle(gated);
     for (const d of this.dynPromDeferred) {
       const g = gated ? d.gated() : null;
       if (g !== null) this.mb.setBody(d.idx, g.locals, g.bytes);
@@ -41521,49 +41612,277 @@ class Assembler {
     }
   }
 
-  /** Board #176's wrong answer, refused by name in a gated module: this
-   * tier FULFILS a promise with a dyn value as-is, so a dyn value that is
-   * itself a PROMISE (an `any` holding a promise, returned from an async
-   * function or passed to `Promise.resolve`) would become the fulfilment
-   * where Node adopts it. Every such resolve reaches promises.ts's shared
-   * settle with (EXC_REF, <the PROMISE box>), and no settle this tier
-   * performs legitimately stores a PROMISE box as a fulfilment (the
-   * reactions adopt one instead), so settle's own prologue — set here,
-   * after every function has been walked, and only in a gated module —
-   * reports the named refusal and exits nonzero exactly when a still
-   * PENDING promise is fulfilled with a PROMISE box. An ungated module's settle is unchanged
-   * (board #176 stays a stated gap there). */
-  private gateSettleOnDynPromise(): void {
-    const check = this.mb.declareFunc(this.mb.funcType([ANY_REF], []), "%w.dynprom.resolveCheck");
+  /* ── adopting a promise held in dyn (boards #176 #177 #182 #184) ─────────
+   *
+   * The untyped-value bridge's promise half. A value of dyn type (an `any`
+   * or `unknown`) can hold a PROMISE box, and three paths can meet one:
+   *
+   *   1. THE RESOLVE FUNCTION. `async function g(): Promise<any> { return
+   *      x }`, `new Promise((r) => r(x))` and `Promise.resolve(x)`'s slow
+   *      path all reach promises.ts's shared settle with (EXC_REF, <the
+   *      box>). ECMA-262's promise resolve function ADOPTS a thenable
+   *      (NewPromiseResolveThenableJob), so settle's prologue
+   *      (adoptInSettle) does too: one hop, then a subscription whose
+   *      reaction settles the destination — Node's two extra jobs. A
+   *      promise resolved with itself rejects with Node's TypeError; an
+   *      object with its own callable `then` is a NAMED run-time refusal
+   *      (Joe's ruling 2026-10-23: full thenable adoption is not built).
+   *   2. PROMISERESOLVE. `Promise.resolve(x)` and `await x` (the island
+   *      bridge, emitJsBridgePromise) take %w.dynprom.resolve: a PROMISE
+   *      box answers its own promise — V8's `IsPromise(x) && x.constructor
+   *      === %Promise%` identity, no job — and any other value a fresh
+   *      promise settled through (1).
+   *   3. ISLAND then/catch/finally. `x.then(...)` on an `any` lowers to
+   *      jsOp callMethod; a PROMISE receiver takes the reaction trio
+   *      (%w.dynthen.*, below), exactly as an `unknown` receiver's
+   *      dynInvoke does.
+   *
+   * Identity in (2) means a `Promise<any>` slot can, in a GATED module,
+   * hold a statically typed promise whose payload is not dyn-shaped (an
+   * f64, a typed record). Every jsval/dyn payload read therefore goes
+   * through %w.prom.readDyn (emitSettledPayload), whose body
+   * finalizeDynProm chooses: today's two instructions in an ungated module,
+   * a dyn-box test falling back to %w.dynprom.view in a gated one.
+   *
+   * THE IMPORT SPINE IS HELD FIXED. lower-island.ts's lowerOwnModuleImport
+   * synthesizes `jsBridgePromise(jsOp then(jsOp resolve(globalGet
+   * "Promise"), builder))`; isImportSpineThen recognizes exactly that IR
+   * shape and keeps the original thenRx + copying bridge for it. Its
+   * timing is board #181's (an every-lane fix; SEMANTICS.md S083's
+   * import() cells), and the claimed TLA/import programs depend on it. */
+
+  /** Set while walking by every site that can FULFIL a promise with a dyn
+   * value (a dyn-typed settle or settler, %w.dynprom.resolve, the trio);
+   * finalizeDynProm reads it to decide whether settle gets the adoption
+   * prologue. A module that never fulfils with a dyn value cannot meet a
+   * PROMISE box (or a thenable object) at settle, and keeps settle's
+   * bytes. */
+  private settleAdoptNeeded = false;
+  private dynPromResolveField: number | null = null;
+  private promReadDynField: number | null = null;
+
+  private needSettleAdopt(): void {
+    if (this.dynPromGateSampled) {
+      throw new Error("wasm emitter bug: a dyn fulfilment site was walked after the module's dyn promise gate was sampled");
+    }
+    this.settleAdoptNeeded = true;
+  }
+
+  /** The import spine's `then` (see this section's header): `jsOp
+   * callMethod then` over `jsOp callMethod resolve(globalGet "Promise")`
+   * with exactly one handler. User code never produces that receiver — a
+   * user-visible `Promise.resolve(...)` lowers to the static intrinsic
+   * (lower-calls.ts), which is what makes the shape match exact. Keep in
+   * step with lower-island.ts's lowerOwnModuleImport. */
+  private isImportSpineThen(e: IrExpr): boolean {
+    if (e.kind !== "jsOp" || e.op !== "callMethod" || e.name !== "then" || e.args.length !== 2) return false;
+    return this.isImportSpineResolve(e.args[0]!);
+  }
+
+  private isImportSpineResolve(e: IrExpr): boolean {
+    if (e.kind !== "jsOp" || e.op !== "callMethod" || e.name !== "resolve" || e.args.length !== 1) return false;
+    const recv = e.args[0]!;
+    return recv.kind === "jsOp" && recv.op === "globalGet" && recv.name === "Promise";
+  }
+
+  /** Settle's adoption prologue (see this section's header, path 1). Set
+   * at finalizeDynProm, after every function has been walked, in a module
+   * where some site can fulfil a promise with a dyn value. The prologue
+   * runs on a FULFILMENT (state 1) whose payload is a ref (EXC_REF) of a
+   * promise still PENDING — a resolve JS ignores (`res(1); res(p)`, a
+   * resolve after a reject) stores nothing and adopts nothing — and hands
+   * the payload to %w.dynprom.settleAdopt, returning early when it took
+   * the settle over. Every tier site that holds a PROMISE box adopts it
+   * before calling settle (thenRx, the trio), so the prologue never meets
+   * a fulfilment that should legitimately store a box: JS cannot fulfil a
+   * promise with a thenable. */
+  private adoptInSettle(gated: boolean): void {
+    if (!this.proms.settleBuilt()) return;
+    const dynT = this.dyn.dynT();
+    const promT = this.proms.promT;
+    const entryT = this.proms.raceEntryT;
+    const entryLocal: ValType = { kind: "ref", nullable: true, typeIndex: entryT };
+    const pair = this.resumeClosPair();
+    // %w.dynprom.adoptRx — the adopted promise settled: DST takes its
+    // outcome. In a gated module the adopted promise may be a typed one,
+    // so a fulfilment crosses as its dyn view (DST is dyn-shaped: it was
+    // being fulfilled with a dyn value); a rejection always copies raw.
+    const adoptRx = this.mb.declareFunc(pair.fn, "%w.dynprom.adoptRx");
     {
-      const dynT = this.dyn.dynT();
       const c = new Code();
-      c.localGet(0);
+      const E = 2, DST = 3, SRC = 4;
+      c.localGet(1);
+      c.refCast(entryT);
+      c.localSet(E);
+      c.localGet(E);
+      c.structGet(entryT, RACEE_DST);
+      c.localSet(DST);
+      c.localGet(E);
+      c.structGet(entryT, RACEE_SRC);
+      c.localSet(SRC);
+      // The adoption's own settle: lift DST's already-resolved mark (see
+      // PROM_KIND_ADOPTING) so settle takes it.
+      c.localGet(DST);
+      c.i32Const(0);
+      c.structSet(promT, PROM_KIND);
+      if (gated) {
+        this.emitSettleFromView(c, DST, SRC);
+      } else {
+        c.localGet(DST);
+        c.localGet(SRC);
+        c.call(this.proms.settleFrom());
+      }
+      this.mb.setBody(adoptRx, [entryLocal, this.proms.promRef(), this.proms.promRef()], c.bytes());
+    }
+    // %w.dynprom.adoptJob — NewPromiseResolveThenableJob: the adopted
+    // promise's `then` (a handled subscription — adopting observes a
+    // rejection, as `then` does in JS).
+    const adoptJob = this.mb.declareFunc(pair.fn, "%w.dynprom.adoptJob");
+    {
+      const c = new Code();
+      const E = 2;
+      c.localGet(1);
+      c.refCast(entryT);
+      c.localSet(E);
+      c.localGet(E);
+      c.structGet(entryT, RACEE_SRC);
+      this.pushReactionClosure(c, adoptRx);
+      c.localGet(E);
+      c.call(this.proms.subscribeHandled());
+      this.mb.setBody(adoptJob, [entryLocal], c.bytes());
+    }
+    // %w.dynprom.settleAdopt(p, ref) → 1 when it took the settle over.
+    const settleAdopt = this.mb.declareFunc(this.mb.funcType([this.proms.promRef(), ANY_REF], [I32]), "%w.dynprom.settleAdopt");
+    {
+      const c = new Code();
+      const P = 0, REF = 1, V = 2, INNER = 3, M = 4;
+      c.localGet(REF);
       c.refTest(dynT);
+      c.i32Eqz();
       c.ifVoid();
-      c.localGet(0);
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      c.localGet(REF);
       c.refCast(dynT);
+      c.localSet(V);
+      // A PROMISE box: adopt it.
+      c.localGet(V);
       c.structGet(dynT, DYN_KIND);
       c.i32Const(DK.PROMISE);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(V);
+      c.structGet(dynT, DYN_REF);
+      c.refCast(promT);
+      c.localSet(INNER);
+      // Resolving a promise with itself: Node's TypeError, as a rejection.
+      c.localGet(INNER);
+      c.localGet(P);
+      c.refEq();
+      c.ifVoid();
+      this.emitSetCellError(c, "%TypeError", "TypeError", (x) => this.pushStrLitInto(x, "Chaining cycle detected for promise #<Promise>"), null);
+      c.localGet(P);
+      c.globalGet(this.exc().kindG);
+      c.globalGet(this.exc().f64G);
+      c.globalGet(this.exc().refG);
+      c.globalGet(this.exc().preG);
+      c.i32Const(2);
+      c.call(this.proms.settle());
+      this.emitCellClearInto(c);
+      c.i32Const(1);
+      c.return_();
+      c.end();
+      // ECMA-262's [[AlreadyResolved]]: from here on P is resolved (to
+      // INNER) though still pending — every later resolve or reject of P
+      // is ignored (settle's prologue tests the mark), and only adoptRx's
+      // settle lands. The mark rides PROM_KIND, unread while P is pending.
+      c.localGet(P);
+      c.i32Const(PROM_KIND_ADOPTING);
+      c.structSet(promT, PROM_KIND);
+      this.pushReactionClosure(c, adoptJob);
+      c.localGet(P);
+      c.localGet(INNER);
+      c.structNew(entryT);
+      c.call(this.proms.hop());
+      c.i32Const(1);
+      c.return_();
+      c.end();
+      // Any other object-kind value (an object, a function, an array, a
+      // byte array) whose `then` is callable: a thenable this tier does
+      // not adopt — a named run-time refusal, never a silent fulfilment.
+      // Primitives are never thenables (IsObject fails). A HANDLE (a net /
+      // http / tls / dgram / child-process object) is never asked: none of
+      // Node's has a `then`, and a handle's keyed get fences unmodeled
+      // names by setting the exception cell.
+      for (const [i, k] of [DK.OBJ, DK.FUNC, DK.ARR, DK.BYTES].entries()) {
+        c.localGet(V);
+        c.structGet(dynT, DYN_KIND);
+        c.i32Const(k);
+        c.i32Eq();
+        if (i > 0) c.i32Or();
+      }
+      c.ifVoid();
+      c.localGet(V);
+      this.pushStrLitInto(c, "then");
+      c.i32Const(0);
+      c.call(this.dyn.keyGet());
+      c.localSet(M);
+      // Reading `then` threw (never expected for these kinds; kept so the
+      // probe can never leave the exception cell set): ECMA-262 rejects
+      // the promise with the thrown value — and P is resolved.
+      c.globalGet(this.exc().kindG);
+      c.ifVoid();
+      c.localGet(P);
+      c.globalGet(this.exc().kindG);
+      c.globalGet(this.exc().f64G);
+      c.globalGet(this.exc().refG);
+      c.globalGet(this.exc().preG);
+      c.i32Const(2);
+      c.call(this.proms.settle());
+      this.emitCellClearInto(c);
+      c.i32Const(1);
+      c.return_();
+      c.end();
+      c.localGet(M);
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(M);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.FUNC);
       c.i32Eq();
       c.ifVoid();
       this.emitSetCellError(
         c,
         "%Error",
         "Error",
-        (x) => this.pushStrLitInto(x, "resolving a promise with a dyn promise value is not supported yet"),
+        (x) => this.pushStrLitInto(x, "resolving a promise with a non-promise thenable is not supported yet"),
         "SC1090",
       );
       c.call(this.reportUncaughtHelper());
       c.end();
       c.end();
-      this.mb.setBody(check, [], c.bytes());
+      c.end();
+      c.i32Const(0);
+      this.mb.setBody(settleAdopt, [this.dyn.dynRef(), this.proms.promRef(), this.dyn.dynRef()], c.bytes());
     }
-    // settle(p, kind, f64, ref, pre, state): a FULFILMENT (state 1) whose
-    // payload is a ref (EXC_REF), of a promise still PENDING — a resolve
-    // JS ignores (the promise already settled: `res(1); res(p)`, or a
-    // resolve after a reject) stores nothing and must not be refused.
+    // settle(p, kind, f64, ref, pre, state)'s prologue, over its own
+    // parameters (no locals).
     const prolog = new Code();
+    // A pending promise already resolved to an adopted one: ignore every
+    // later resolve and reject (adoptRx lifts the mark for its own).
+    prolog.localGet(0);
+    prolog.structGet(promT, PROM_STATE);
+    prolog.i32Eqz();
+    prolog.localGet(0);
+    prolog.structGet(promT, PROM_KIND);
+    prolog.i32Const(PROM_KIND_ADOPTING);
+    prolog.i32Eq();
+    prolog.i32And();
+    prolog.ifVoid();
+    prolog.return_();
+    prolog.end();
     prolog.localGet(5);
     prolog.i32Const(1);
     prolog.i32Eq();
@@ -41572,14 +41891,131 @@ class Assembler {
     prolog.i32Eq();
     prolog.i32And();
     prolog.localGet(0);
-    prolog.structGet(this.proms.promT, PROM_STATE);
+    prolog.structGet(promT, PROM_STATE);
     prolog.i32Eqz();
     prolog.i32And();
     prolog.ifVoid();
+    prolog.localGet(0);
     prolog.localGet(3);
-    prolog.call(check);
+    prolog.call(settleAdopt);
+    prolog.ifVoid();
+    prolog.return_();
+    prolog.end();
     prolog.end();
     this.proms.prependSettleProlog(prolog.bytes());
+  }
+
+  private dynCopyRxField: number | null = null;
+
+  /** %w.dynprom.copyRx — a reaction (race entry frame) settling DST from
+   * SRC where DST is dyn-shaped: the trio's adoption and a dyn
+   * Promise.race. Its body is chosen at finalizeDynProm: a raw copy in an
+   * ungated module (every promise there is dyn-shaped), the dyn view of a
+   * fulfilment in a gated one (SRC may be a typed promise). */
+  private dynCopyRxFn(): number {
+    if (this.dynCopyRxField !== null) return this.dynCopyRxField;
+    const pair = this.resumeClosPair();
+    const idx = this.mb.declareFunc(pair.fn, "%w.dynprom.copyRx");
+    this.dynCopyRxField = idx;
+    const entryT = this.proms.raceEntryT;
+    const locals: ValType[] = [{ kind: "ref", nullable: true, typeIndex: entryT }, this.proms.promRef(), this.proms.promRef()];
+    const E = 2, DST = 3, SRC = 4;
+    const body = (gated: boolean): Uint8Array => {
+      const c = new Code();
+      c.localGet(1);
+      c.refCast(entryT);
+      c.localSet(E);
+      c.localGet(E);
+      c.structGet(entryT, RACEE_DST);
+      c.localSet(DST);
+      c.localGet(E);
+      c.structGet(entryT, RACEE_SRC);
+      c.localSet(SRC);
+      if (gated) {
+        this.emitSettleFromView(c, DST, SRC);
+      } else {
+        c.localGet(DST);
+        c.localGet(SRC);
+        c.call(this.proms.settleFrom());
+      }
+      return c.bytes();
+    };
+    this.deferDynPromBody(idx, locals, body(false), () => ({ locals, bytes: body(true) }));
+    return idx;
+  }
+
+  /** %w.dynprom.resolve(v) → a promise: ECMA-262 PromiseResolve(%Promise%,
+   * v) over a dyn value (path 2). A PROMISE box answers its own promise,
+   * unchanged — which may, in a gated module, be a typed one (see
+   * %w.prom.readDyn); any other value a fresh promise fulfilled with it
+   * through settle (so its adoption prologue sees a thenable object). */
+  private dynPromResolveFn(): number {
+    this.needSettleAdopt();
+    if (this.dynPromResolveField !== null) return this.dynPromResolveField;
+    const dynT = this.dyn.dynT();
+    const promT = this.proms.promT;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.dyn.dynRef()], [this.proms.promRef()]), "%w.dynprom.resolve");
+    this.dynPromResolveField = idx;
+    const c = new Code();
+    const V = 0, P = 1;
+    c.localGet(V);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.PROMISE);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(V);
+    c.structGet(dynT, DYN_REF);
+    c.refCast(promT);
+    c.return_();
+    c.end();
+    c.call(this.proms.mint());
+    c.localSet(P);
+    c.localGet(P);
+    c.i32Const(EXC_REF);
+    c.f64Const(0);
+    c.localGet(V);
+    c.i32Const(-1);
+    c.i32Const(1);
+    c.call(this.proms.settle());
+    c.localGet(P);
+    this.mb.setBody(idx, [this.proms.promRef()], c.bytes());
+    return idx;
+  }
+
+  /** %w.prom.readDyn(p) → p's fulfilment as a dyn value, for a promise
+   * read at a jsval/dyn static type (emitSettledPayload). Ungated: the
+   * payload IS the dyn ref. Gated: a `Promise<any>` may be a typed promise
+   * handed out by %w.dynprom.resolve's identity, so a payload that is not
+   * a dyn box converts through %w.dynprom.view. */
+  private promReadDynFn(): number {
+    if (this.promReadDynField !== null) return this.promReadDynField;
+    const dynT = this.dyn.dynT();
+    const dynRef = this.dyn.dynRef();
+    const promT = this.proms.promT;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.proms.promRef()], [dynRef]), "%w.prom.readDyn");
+    this.promReadDynField = idx;
+    const c = new Code();
+    c.localGet(0);
+    c.structGet(promT, PROM_REF);
+    c.refCast(dynT);
+    this.deferDynPromBody(idx, [], c.bytes(), () => {
+      const g = new Code();
+      const P = 0, R = 1;
+      g.localGet(P);
+      g.structGet(promT, PROM_REF);
+      g.localSet(R);
+      g.localGet(R);
+      g.refTest(dynT);
+      g.ifResult(dynRef);
+      g.localGet(R);
+      g.refCast(dynT);
+      g.else_();
+      g.localGet(P);
+      g.call(this.dynPromViewFn());
+      g.end();
+      return { locals: [ANY_REF], bytes: g.bytes() };
+    });
+    return idx;
   }
 
   /** %w.dynprom.view(p) → the settled value of `p` as ONE dyn value (its
@@ -41753,8 +42189,9 @@ class Assembler {
   }
 
   /** The shared "copy" reaction's gated body: a module that boxes typed
-   * promises into dyn has the island bridge's copies (and the trio's
-   * adoption) convert the fulfilment to its dyn view — the destination is
+   * promises into dyn has the import spine's bridge copies convert the
+   * fulfilment to its dyn view (the trio and a dyn race use their own
+   * %w.dynprom.copyRx since boards #177/#182) — the destination is
    * always a dyn-shaped promise there. A typed same-type Promise.race
    * ALSO sharing that reaction in such a module would need the raw copy;
    * the two cannot share one body, so that module refuses by name.
@@ -41876,6 +42313,9 @@ class Assembler {
     const promT = this.proms.promT;
     const idx = this.mb.declareFunc(this.mb.funcType([dynRef, arrRef, I32], [dynRef]), "%w.dynthen.go");
     this.dynThenGoField = idx;
+    // `.finally`'s handler result fulfils a fresh promise (rx's
+    // PromiseResolve) — a thenable object there meets settle's refusal.
+    this.needSettleAdopt();
     const entryT = this.dynThenEntryType();
     const rx = this.dynThenRxFn(loc);
     const c = new Code();
@@ -42152,7 +42592,11 @@ class Assembler {
     const idx = this.mb.declareFunc(pair.fn, "%w.dynthen.adopt");
     this.dynThenAdoptField = idx;
     const entryT = this.proms.raceEntryT;
-    const copy = this.raceReactionForCopy(loc);
+    // Boards #177/#182: the trio's own copy reaction, not the shared race
+    // "copy" — so a module running the trio (an island then/catch/finally
+    // now included) can still hold a typed same-type Promise.race.
+    void loc;
+    const copy = this.dynCopyRxFn();
     const c = new Code();
     const E = 2;
     c.localGet(1);
@@ -42205,7 +42649,17 @@ class Assembler {
     return idx;
   }
 
-  /** Island → static PROMISE bridge (increment 21 stage C — the design
+  /** Island → static PROMISE bridge.
+   *
+   * Boards #176/#184: every bridge but the import spine's is ECMA-262
+   * PromiseResolve over the dyn value (%w.dynprom.resolve — `await x` of an
+   * `any` awaits a promise held in `x` ITSELF, Node's one job; any other
+   * value, `await 5` included, awaits a fresh fulfilled promise; a thenable
+   * object meets settle's named refusal). Only the import spine
+   * (isImportSpineThen) still takes the copying re-wrap the rest of this
+   * comment describes — held fixed for board #181.
+   *
+   * (increment 21 stage C — the design
    * doc's own §6: "close to a re-wrap"). `e.value` is a dyn PROMISE
    * payload (by construction: the ONLY producers reaching this operand —
    * `jsOp:callMethod("resolve"/"then")` and the (out-of-tier)
@@ -42250,14 +42704,22 @@ class Assembler {
     const code = this.fn.code;
     if (e.type.kind !== "promise") throw new Error("jsBridgePromise result must be a promise (validator's contract)");
     const inner = e.type.inner;
-    let rx: number;
-    if (inner.kind === "jsval" || inner.kind === "dyn") {
-      rx = this.raceReactionForCopy(e.loc);
-    } else {
+    if (inner.kind !== "jsval" && inner.kind !== "dyn") {
       this.refuse(`expr:${e.kind}`, e.loc);
       code.unreachable();
       return;
     }
+    // Board #184: every bridge but the import spine's is PromiseResolve
+    // (`await x` with `x` an `any`): a promise held in `x` is awaited
+    // itself — Node's one job — and any other value through a fresh
+    // promise (%w.dynprom.resolve). The import spine (isImportSpineThen)
+    // keeps the copying bridge below: its timing is board #181's.
+    if (!this.isImportSpineThen(e.value)) {
+      this.walkExpr(e.value);
+      code.call(this.dynPromResolveFn());
+      return;
+    }
+    const rx = this.raceReactionForCopy(e.loc);
     const dynRef = this.dyn.dynRef();
     const src = this.acquireScratch(dynRef);
     this.walkExpr(e.value);

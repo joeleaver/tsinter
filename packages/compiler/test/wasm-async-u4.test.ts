@@ -24,9 +24,9 @@
  * dyn promise receiver run as microtask reactions with Node's adoption of
  * a returned promise; a non-promise receiver takes the ordinary method
  * dispatch; the island readers of an `any`-held promise read a typed
- * promise through the same conversion; and where a typed promise is boxed,
- * fulfilling a promise WITH an `any`-held promise is a named run-time
- * refusal (board #176's wrong answer). Board #183 rides along: a
+ * promise through the same conversion; and fulfilling a promise WITH an
+ * `any`-held promise adopts it (boards #176 #177 #182 #184 — the ISLAND
+ * and RESOLVE rows; wasm-adopt.test.ts holds that unit's own rows). Board #183 rides along: a
  * `process.once` listener for 'unhandledRejection' or 'rejectionHandled'
  * removes itself before its call.
  *
@@ -42,9 +42,8 @@
  *
  * Three kinds of row assert THIS TIER's answer instead of a Node run, each
  * with Node's own output stated beside it: the registered divergences
- * (SEMANTICS.md S083 — typed promise adoption settles early, a dynamic
- * import's module evaluates early, and an `any`-held promise's island
- * `.then` adoption and `await` land one job off); the trap rows (a named fence or
+ * (SEMANTICS.md S083 — typed promise adoption settles early, and a dynamic
+ * import's module evaluates early); the trap rows (a named fence or
  * run-time refusal, or an unhandled rejection reported as SEMANTICS.md
  * S010 registers it); and
  * the one pinned named run-time refusal (adopting a non-promise thenable). */
@@ -1165,10 +1164,18 @@ test("D24 DYNPROMISE: console.log of a boxed promise is the named inspect fence"
   expect(stderr).toBe("Uncaught Error: util.inspect of a promise value is not supported yet\n");
 });
 
-test("D25 DYNPROMISE: NOT-LIFTED: a module mixing a typed same-type Promise.race with a converting dyn bridge", async () => {
-  const { diagnostics, survey } = await refuseRow("D25", "// @dynamic\nasync function n(): Promise<number> { return 7; }\nasync function k(): Promise<number> { return 8; }\nfunction id(v: unknown): unknown { return v; }\nconst x: any = id(n());\nasync function main(): Promise<void> {\n  const v = await x;\n  const w = await Promise.race([n(), k()]);\n  console.log(`${v} ${w}`);\n}\nmain();", "ts");
-  expect(diagnostics).toEqual(["SC3001:the wasm backend does not support this construct yet (dynFrom:promise:race-copy); build with the LLVM backend (the default) or the reference C backend (--backend c)"]);
-  expect(survey).toEqual(["dynFrom:promise:race-copy"]);
+test("D25 DYNPROMISE: a module mixing a typed same-type Promise.race with an any-held await (the await no longer copies, board #184)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("D25", "// @dynamic\nasync function n(): Promise<number> { return 7; }\nasync function k(): Promise<number> { return 8; }\nfunction id(v: unknown): unknown { return v; }\nconst x: any = id(n());\nasync function main(): Promise<void> {\n  const v = await x;\n  const w = await Promise.race([n(), k()]);\n  console.log(`${v} ${w}`);\n}\nmain();", "ts");
+  expect(stdout).toBe("7 7\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("D25b DYNPROMISE: a module mixing a typed same-type Promise.race with the reaction trio (the trio adopts through its own copy reaction, boards #177/#182)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("D25b", "// @dynamic\nasync function n(): Promise<number> { return 7; }\nasync function k(): Promise<number> { return 8; }\nfunction id(v: unknown): unknown { return v; }\nconst x: any = id(n());\nx.then((v: any) => console.log(`then ${v}`));\nPromise.race([n(), k()]).then((w) => console.log(`race ${w}`));", "ts");
+  expect(stdout).toBe("then 7\nrace 7\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
 // ============================================================
@@ -1443,50 +1450,44 @@ test("Z04 ISLAND: a rejected typed promise through an island then reaches the un
   expect(stderr).toBe("Unhandled promise rejection: Error: boom\n");
 });
 
-test("Z05 ISLAND: S083 await of an any-held typed number promise resumes one job late (board #184)", async () => {
-  // Node v24 prints "sync\nawait any 7 number\nobs\n" — the registered divergence (S083).
+test("Z05 ISLAND: await of an any-held typed number promise awaits the promise itself, Node's one job (board #184)", async () => {
   const { stdout, stderr, exitCode } = await runRow("Z05", "// @dynamic\nasync function n(): Promise<number> { return 7; }\nfunction id(v: unknown): unknown { return v; }\nconst x: any = id(n());\nasync function main(): Promise<void> { const v = await x; console.log(`await any ${v} ${typeof v}`); }\nmain();\nPromise.resolve().then(() => console.log(\"obs\"));\nconsole.log(\"sync\");", "ts");
-  expect(stdout).toBe("sync\nobs\nawait any 7 number\n");
+  expect(stdout).toBe("sync\nawait any 7 number\nobs\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
 
-test("Z06 ISLAND: S083 await of an any-held typed string promise (board #184)", async () => {
-  // Node v24 prints "sync\nawait any seven string 5\nobs\n" — the registered divergence (S083).
+test("Z06 ISLAND: await of an any-held typed string promise (board #184)", async () => {
   const { stdout, stderr, exitCode } = await runRow("Z06", "// @dynamic\nasync function n(): Promise<string> { return \"seven\"; }\nfunction id(v: unknown): unknown { return v; }\nconst x: any = id(n());\nasync function main(): Promise<void> { const v = await x; console.log(`await any ${v} ${typeof v} ${v.length}`); }\nmain();\nPromise.resolve().then(() => console.log(\"obs\"));\nconsole.log(\"sync\");", "ts");
-  expect(stdout).toBe("sync\nobs\nawait any seven string 5\n");
+  expect(stdout).toBe("sync\nawait any seven string 5\nobs\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
 
-test("Z07 ISLAND: S083 await of an any-held typed record promise (board #184)", async () => {
-  // Node v24 prints "sync\nawait any 1 two {\"a\":1,\"b\":\"two\"}\nobs\n" — the registered divergence (S083).
+test("Z07 ISLAND: await of an any-held typed record promise (board #184)", async () => {
   const { stdout, stderr, exitCode } = await runRow("Z07", "// @dynamic\nasync function n(): Promise<{ a: number; b: string }> { return { a: 1, b: \"two\" }; }\nfunction id(v: unknown): unknown { return v; }\nconst x: any = id(n());\nasync function main(): Promise<void> { const v = await x; console.log(`await any ${v.a} ${v.b} ${JSON.stringify(v)}`); }\nmain();\nPromise.resolve().then(() => console.log(\"obs\"));\nconsole.log(\"sync\");", "ts");
-  expect(stdout).toBe("sync\nobs\nawait any 1 two {\"a\":1,\"b\":\"two\"}\n");
+  expect(stdout).toBe("sync\nawait any 1 two {\"a\":1,\"b\":\"two\"}\nobs\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
 
-test("Z08 ISLAND: S083 await of an any-held rejected typed promise (board #184)", async () => {
-  // Node v24 prints "sync\ncaught Error: boom\nobs\n" — the registered divergence (S083).
+test("Z08 ISLAND: await of an any-held rejected typed promise (board #184)", async () => {
   const { stdout, stderr, exitCode } = await runRow("Z08", "// @dynamic\nasync function n(): Promise<number> { throw new Error(\"boom\"); }\nfunction id(v: unknown): unknown { return v; }\nconst x: any = id(n());\nasync function main(): Promise<void> { try { await x; console.log(\"not reached\"); } catch (e) { console.log(`caught ${String(e)}`); } }\nmain();\nPromise.resolve().then(() => console.log(\"obs\"));\nconsole.log(\"sync\");", "ts");
-  expect(stdout).toBe("sync\nobs\ncaught Error: boom\n");
+  expect(stdout).toBe("sync\ncaught Error: boom\nobs\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
 
-test("Z09 ISLAND: S083 an island then handler returns a typed number promise (board #182)", async () => {
-  // Node v24 prints "sync\nobs1\nobs2\nobs3\nadopted 7 number\n" — the registered divergence (S083).
+test("Z09 ISLAND: an island then handler returns a typed number promise: adopted with Node's two jobs (board #182)", async () => {
   const { stdout, stderr, exitCode } = await runRow("Z09", "// @dynamic\nasync function n(): Promise<unknown> { return 1; }\nasync function m(): Promise<number> { return 7; }\nfunction id(v: unknown): unknown { return v; }\nconst x: any = id(n());\nconst y: any = id(m());\nx.then(() => y).then((v: any) => console.log(`adopted ${v} ${typeof v}`));\nPromise.resolve().then(() => console.log(\"obs1\")).then(() => console.log(\"obs2\")).then(() => console.log(\"obs3\"));\nconsole.log(\"sync\");", "ts");
-  expect(stdout).toBe("sync\nobs1\nobs2\nadopted 7 number\nobs3\n");
+  expect(stdout).toBe("sync\nobs1\nobs2\nobs3\nadopted 7 number\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
 
-test("Z09b ISLAND: S083 an island then handler returns a typed record promise (board #182)", async () => {
-  // Node v24 prints "sync\nobs1\nobs2\nobs3\nadopted 1 two {\"a\":1,\"b\":\"two\"}\n" — the registered divergence (S083).
+test("Z09b ISLAND: an island then handler returns a typed record promise (board #182)", async () => {
   const { stdout, stderr, exitCode } = await runRow("Z09b", "// @dynamic\nasync function n(): Promise<unknown> { return 1; }\nasync function m(): Promise<{ a: number; b: string }> { return { a: 1, b: \"two\" }; }\nfunction id(v: unknown): unknown { return v; }\nconst x: any = id(n());\nconst y: any = id(m());\nx.then(() => y).then((v: any) => console.log(`adopted ${v.a} ${v.b} ${JSON.stringify(v)}`));\nPromise.resolve().then(() => console.log(\"obs1\")).then(() => console.log(\"obs2\")).then(() => console.log(\"obs3\"));\nconsole.log(\"sync\");", "ts");
-  expect(stdout).toBe("sync\nobs1\nobs2\nadopted 1 two {\"a\":1,\"b\":\"two\"}\nobs3\n");
+  expect(stdout).toBe("sync\nobs1\nobs2\nobs3\nadopted 1 two {\"a\":1,\"b\":\"two\"}\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
@@ -1533,25 +1534,23 @@ test("Z16 ISLAND: control: a boxed function value returning a dyn promise", asyn
   expect(exitCode).toBe(0);
 });
 
-test("Z17 ISLAND: catch directly on an any-held rejected typed promise is not a function (board #177)", async () => {
-  // Node v24 prints "sync\ncaught Error: boom\n" and exits 0; this tier traps.
-  const { stdout, stderr } = await runRowTrap("Z17", "// @dynamic\nasync function f(): Promise<number> { throw new Error(\"boom\"); }\nfunction id(v: unknown): unknown { return v; }\nconst x: any = id(f());\nx.catch((e: any) => console.log(`caught ${e}`));\nconsole.log(\"sync\");", "ts");
-  expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught TypeError: catch is not a function\n");
-});
-
-test("ISL01 ISLAND: S083 an island then handler returns a dyn promise: adopted one job early (board #182)", async () => {
-  // Node v24 prints "sync\nobs1\nobs2\nobs3\nadopted 7 number\n" — the registered divergence (S083).
-  const { stdout, stderr, exitCode } = await runRow("ISL01", "// @dynamic\nasync function n(): Promise<unknown> { return 1; }\nasync function m(): Promise<unknown> { return 7; }\nfunction id(v: unknown): unknown { return v; }\nconst x: any = id(n());\nconst y: any = id(m());\nx.then(() => y).then((v: any) => console.log(`adopted ${v} ${typeof v}`));\nPromise.resolve().then(() => console.log(\"obs1\")).then(() => console.log(\"obs2\")).then(() => console.log(\"obs3\"));\nconsole.log(\"sync\");", "ts");
-  expect(stdout).toBe("sync\nobs1\nobs2\nadopted 7 number\nobs3\n");
+test("Z17 ISLAND: catch directly on an any-held rejected typed promise (board #177)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("Z17", "// @dynamic\nasync function f(): Promise<number> { throw new Error(\"boom\"); }\nfunction id(v: unknown): unknown { return v; }\nconst x: any = id(f());\nx.catch((e: any) => console.log(`caught ${e}`));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\ncaught Error: boom\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
 
-test("ISL02 ISLAND: S083 await of an any-held dyn promise resumes one job late (board #184)", async () => {
-  // Node v24 prints "sync\nawait any 7 number\nobs\n" — the registered divergence (S083).
+test("ISL01 ISLAND: an island then handler returns a dyn promise: adopted with Node's two jobs (board #182)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("ISL01", "// @dynamic\nasync function n(): Promise<unknown> { return 1; }\nasync function m(): Promise<unknown> { return 7; }\nfunction id(v: unknown): unknown { return v; }\nconst x: any = id(n());\nconst y: any = id(m());\nx.then(() => y).then((v: any) => console.log(`adopted ${v} ${typeof v}`));\nPromise.resolve().then(() => console.log(\"obs1\")).then(() => console.log(\"obs2\")).then(() => console.log(\"obs3\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\nobs1\nobs2\nobs3\nadopted 7 number\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("ISL02 ISLAND: await of an any-held dyn promise awaits the promise itself (board #184)", async () => {
   const { stdout, stderr, exitCode } = await runRow("ISL02", "// @dynamic\nasync function n(): Promise<unknown> { return 7; }\nfunction id(v: unknown): unknown { return v; }\nconst x: any = id(n());\nasync function main(): Promise<void> { const v = await x; console.log(`await any ${v} ${typeof v}`); }\nmain();\nPromise.resolve().then(() => console.log(\"obs\"));\nconsole.log(\"sync\");", "ts");
-  expect(stdout).toBe("sync\nobs\nawait any 7 number\n");
+  expect(stdout).toBe("sync\nawait any 7 number\nobs\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
@@ -1613,18 +1612,18 @@ test("O07 ONCE: rejectionHandled: a once listener re-registering itself", async 
 // RESOLVE
 // ============================================================
 
-test("T01 RESOLVE: an async function returning an any that holds a typed promise is a named run-time refusal (board #176)", async () => {
-  // Node v24 prints "sync\nobs1\nobs2\nasync-return any 7 number\nobs3\n" and exits 0; this tier traps.
-  const { stdout, stderr } = await runRowTrap("T01", "// @dynamic\nasync function f(): Promise<number> { return 7; }\nfunction id(v: unknown): unknown { return v; }\nasync function g(): Promise<any> { const x: any = id(f()); return x; }\ng().then((v: any) => console.log(`async-return any ${v} ${typeof v}`));\nPromise.resolve().then(() => console.log(\"obs1\")).then(() => console.log(\"obs2\")).then(() => console.log(\"obs3\"));\nconsole.log(\"sync\");", "ts");
-  expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: resolving a promise with a dyn promise value is not supported yet\n");
+test("T01 RESOLVE: an async function returning an any that holds a typed promise adopts it (board #176)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("T01", "// @dynamic\nasync function f(): Promise<number> { return 7; }\nfunction id(v: unknown): unknown { return v; }\nasync function g(): Promise<any> { const x: any = id(f()); return x; }\ng().then((v: any) => console.log(`async-return any ${v} ${typeof v}`));\nPromise.resolve().then(() => console.log(\"obs1\")).then(() => console.log(\"obs2\")).then(() => console.log(\"obs3\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\nobs1\nobs2\nasync-return any 7 number\nobs3\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
-test("T02 RESOLVE: Promise.resolve of an any that holds a typed promise is a named run-time refusal (board #176)", async () => {
-  // Node v24 prints "sync\nresolve any 7\n" and exits 0; this tier traps.
-  const { stdout, stderr } = await runRowTrap("T02", "// @dynamic\nasync function n(): Promise<number> { return 7; }\nfunction id(v: unknown): unknown { return v; }\nconst x: any = id(n());\nPromise.resolve(x).then((v) => console.log(`resolve any ${v}`));\nconsole.log(\"sync\");", "ts");
-  expect(stdout).toBe("");
-  expect(stderr).toBe("Uncaught Error: resolving a promise with a dyn promise value is not supported yet\n");
+test("T02 RESOLVE: Promise.resolve of an any that holds a typed promise answers that promise (board #176)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("T02", "// @dynamic\nasync function n(): Promise<number> { return 7; }\nfunction id(v: unknown): unknown { return v; }\nconst x: any = id(n());\nPromise.resolve(x).then((v) => console.log(`resolve any ${v}`));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\nresolve any 7\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
 test("T03 RESOLVE: control: the same module shapes with a non-promise any", async () => {

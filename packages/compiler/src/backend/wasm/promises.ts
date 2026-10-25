@@ -851,12 +851,17 @@ export class PromiseBuilder {
 
   private settleBody: { idx: number; bytes: Uint8Array } | null = null;
 
+  /** Whether this module built settle (so a prologue has a body to go on). */
+  settleBuilt(): boolean {
+    return this.settleBody !== null;
+  }
+
   /** INC-27 U4: put `prolog` (self-contained instructions over settle's own
    * six parameters, no locals) in front of settle's body. Called only by
-   * the emitter's deferred finalization, in a module that boxes typed
-   * promises into dyn, to refuse fulfilling a promise WITH a dyn promise
-   * value (board #176's wrong answer) by name. False when the module never
-   * built settle. */
+   * the emitter's deferred finalization, in a module where a promise can be
+   * fulfilled with a dyn value, to ADOPT a dyn promise value (boards #176
+   * #177 #182 #184 — the emitter's adoptInSettle). False when the module
+   * never built settle. */
   prependSettleProlog(prolog: Uint8Array): boolean {
     if (this.settleBody === null) return false;
     const body = new Uint8Array(prolog.length + this.settleBody.bytes.length);

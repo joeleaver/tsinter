@@ -5964,7 +5964,7 @@ race, divergent cell + agreeing `.mjs` twin) in `packages/compiler/test/wasm-fun
 CommonJS-mode `.ts` cell and the native (llvm, c) lanes are MEASURED, not pinned by a row. Measured
 against Node v24.18.1 and this tier's own llvm/c/wasm lanes.
 
-## S083 — a TYPED promise resolved with another promise settles EARLY on every tsinter lane: Node's two extra microtask jobs are not taken, and a typed `.finally` handler's returned promise is not waited for; a dynamic `import()` evaluates its module at a different microtask position than Node; on the wasm lane an `any`-held promise's `.then` adoption and `await` land one job off Node *(llvm, c and wasm)*
+## S083 — a TYPED promise resolved with another promise settles EARLY on every tsinter lane: Node's two extra microtask jobs are not taken, and a typed `.finally` handler's returned promise is not waited for; a dynamic `import()` evaluates its module at a different microtask position than Node *(llvm, c and wasm)*
 
 When a promise is resolved WITH another promise (a `then`/`catch` handler returns a promise, an async
 function returns one without `await`, a promise is nested inside another), Node adopts it through the
@@ -5998,8 +5998,9 @@ statically, and that includes plain JavaScript, whose types it infers: an untype
 `async function f() { return g(); }` (or `const f = async () => g();`) in a `.cjs` file, beside an
 `o1 … o3` chain, prints (Node) `sync|o1|o2|f 7 number|o3` and (llvm, c and wasm)
 `sync|o1|f 7 number|o2|o3` — the same one-job-early adoption. `.then` / `.catch` / `.finally` called on
-an `unknown`-typed (checked-dynamic) promise are outside this paragraph (the dyn reactions adopt with
-Node's timing).
+an `unknown`- or `any`-typed (checked-dynamic) promise, and a promise held in an `any` that another
+promise is resolved with or that is awaited, are outside this entry (they adopt with Node's timing on the
+wasm lane; see the retired paragraph below).
 
 **Why typed code cannot be fixed in the backend:** the frontend rewrites an async function's `return p` into
 `return await p` and lowers a typed `.then(cb)` / `.catch(cb)` / `.finally(cb)` into a small async function
@@ -6018,22 +6019,32 @@ importing a module that itself awaits prints (Node)
 values are Node's; only the interleaving differs, and the wasm lane's order also differs from the llvm
 and c lanes' order. Not yet fixed; owned by board #181.
 
-**A promise held in an `any` (wasm lane only; measured separately):** a promise reached through an
-`any`-typed value under `// @dynamic` is read by the island bridge, whose timing differs from Node's in
-two cells, whether the promise's own value is statically typed or not:
-- a `.then` handler on such a promise RETURNS another such promise, and a second `.then` prints the
-  adopted value beside an `obs1 … obs3` chain: Node `sync|obs1|obs2|obs3|adopted 7 number`; wasm
-  `sync|obs1|obs2|adopted 7 number|obs3` — the adoption lands one job early. Owned by board #182.
-- an `async` function `await`s such a promise beside one observer: Node `sync|await any 7 number|obs`;
-  wasm `sync|obs|await any 7 number` — the await resumes one job late. Owned by board #184.
-The values are Node's. The llvm and c lanes fail to link these programs (board #172), so the cells are
-measured on the wasm lane only. Not yet fixed.
+**A promise held in an `any` — RETIRED (boards #176, #177, #182, #184; wasm lane).** This paragraph
+registered two cells where the wasm lane's island bridge read an `any`-held promise one job off Node (an
+island `.then` handler returning such a promise was adopted one job early, board #182; `await` of one
+resumed one job late, board #184). Both now take Node's timing: a promise resolved with an `any`-held
+promise adopts it through the spec's thenable job (`async function g(): Promise<any> { return x; }`,
+`new Promise((r) => r(x))`), `Promise.resolve(x)` and `await x` use the held promise itself, and an
+island `.then` / `.catch` / `.finally` on one runs the dyn reaction machinery — beside `o1 … o5`
+observers, `Promise.resolve(x).then` prints `sync|resolve any 7 number|o1|…`, `return x` prints
+`sync|o1|o2|async-return any 7 number|o3`, `await x` prints `sync|await any 7 number|o1|…`, and the then-adoption
+cell prints `sync|o1|o2|o3|adopted 7 number|o4`, all as Node does (rows in
+`packages/compiler/test/wasm-adopt.test.ts`; ISL01–ISL02, Z05–Z09b now assert Node's answers). As in Node,
+a promise resolved with an `any`-held promise is already resolved while the adoption runs: a later
+`resolve(v)` or `reject(e)` of it is ignored (`new Promise((res) => { res(x); res(1); })` fulfils with
+`x`'s value). What is NOT covered here, and is not a registered divergence: an `any` holding a NON-promise
+object-kind value — a plain object, a function, an array, an imported module's namespace — whose `then`
+is callable is not adopted; resolving a promise with one is a named run-time refusal ("resolving a promise
+with a non-promise thenable is not supported yet"). A host handle held in an `any` (a net, http, tls,
+dgram or child-process object) is never a thenable — none of Node's has a `then` — and resolving a promise
+with one fulfils it with the handle, as in Node. A promise of a STATICALLY typed destination resolved
+with an `any`-held promise (`async function g(): Promise<number> { return x; }`) still rejects with the
+boundary's type error where Node adopts — a wrong answer owned by board #234, not this entry.
 
 **Scope:** llvm, c and wasm; promises the front end types statically (declared or inferred, in
-TypeScript and in plain JavaScript); `import()` on every lane as stated; the `any`-held promise cells on
-the wasm lane only.
+TypeScript and in plain JavaScript); `import()` on every lane as stated.
 
-**Tested by:** S01–S08, S15–S16, ISL01–ISL02, Z05–Z08, Z09 and Z09b (the divergent cells, asserting this
+**Tested by:** S01–S08 and S15–S16 (the divergent cells, asserting this
 tier's order with Node's in a comment), S09–S12 (the agreeing controls) and S13 (a late `catch` against
 `rejectionHandled`: the wasm lane prints Node's `unhandled|late catch|rejectionHandled`; the llvm and
 c lanes print `unhandled|rejectionHandled|late catch`, a native-only divergence owned by board #180 —
