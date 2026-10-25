@@ -131,6 +131,10 @@ export interface TimerDeps {
   /** INC-29 U1 (review), net modules only: pushes an i32, nonzero while the
    * pending queue holds a fed handle (uv__backend_timeout answers 0). */
   pendingQueued?: (c: Code) => void;
+  /** Units G1-G3 (hostev.ts), in a child_process or net module that also
+   * reaches a host-event surface: pushes an i32, nonzero while one of those
+   * surfaces holds the loop — OR'd into the third liveness term. */
+  extraAlive?: (c: Code) => void;
 }
 
 /* timerT's fields. Deadline, seq and reffed are MUTABLE: a re-armed
@@ -1481,6 +1485,10 @@ export class TimerBuilder {
       const liveTerm = (): void => {
         if (childRefLive !== undefined) c.globalGet(childRefLive());
         else netAlive!(c);
+        if (this.deps.extraAlive !== undefined) {
+          this.deps.extraAlive(c);
+          c.i32Or();
+        }
       };
       const idx = this.mb.declareFunc(this.mb.funcType([F64], [F64]), "%w.loop");
       const pop = this.pop();

@@ -105,21 +105,18 @@ describe("INC-28 U2 child_process async — host-free rows", () => {
     });
   }
 
-  // NOT-LIFTED: the signal listeners stay refused by key. (INC-28 U3 lifted
-  // the stream half — piped output, child.stdout and the stream listeners:
-  // U2-NL-01..03 now pin that they compile, and wasm-childproc-u3.test.ts
-  // holds the keys U3 leaves refused.)
-  const refusals: [string, string, string][] = [
-    ["U2-NL-04", "libCall:process.onSignal", 'process.on("SIGINT", () => console.log("int"));\nconsole.log("armed");\n'],
-  ];
-  for (const [id, key, src] of refusals) {
-    test(`${id} stays refused by key: SC3001 (${key}) — SINGLE-EDIT: the ${key} refusal removed`, async () => {
-      const r = await build(src);
-      expect(r.ok).toBe(false);
-      if (r.ok) return;
-      expect(r.diagnostics.join("\n")).toContain(`(${key})`);
-    });
-  }
+  // LIFTED by unit G1: the signal listeners compile to an event module over
+  // sigCall (minted last) and evPoll. (INC-28 U3 lifted the stream half —
+  // piped output, child.stdout and the stream listeners: U2-NL-01..03 now
+  // pin that they compile, and wasm-childproc-u3.test.ts holds the keys U3
+  // leaves refused.)
+  test("U2-NL-04 a signal listener (re-aimed at unit G1) compiles to an event module importing evPoll and sigCall (last) — SINGLE-EDIT: the libCall:process.onSignal refusal restored", async () => {
+    const r = await build('process.on("SIGINT", () => console.log("int"));\nconsole.log("armed");\n');
+    expect(r.ok, JSON.stringify(r)).toBe(true);
+    if (!r.ok) return;
+    expect(r.imports).toEqual(["tsinter.write", "tsinter.now", "tsinter.evPoll", "tsinter.sigCall"]);
+    expect(r.exports).toContain("_loop");
+  });
   const liftedU3: [string, string, string][] = [
     ["U2-NL-01", "a piped output tuple (re-aimed at INC-28 U3)", 'import { spawn } from "node:child_process";\nconst c = spawn("true", [], { stdio: ["ignore", "pipe", "pipe"] });\nc.on("exit", () => console.log("done"));\n'],
     ["U2-NL-02", "child.stdout on an ignored slot (re-aimed at INC-28 U3)", 'import { spawn } from "node:child_process";\nconst c = spawn("true", [], { stdio: "ignore" });\nconsole.log(c.stdout === null);\n'],

@@ -104,7 +104,13 @@ destroy, close) enters the wasm tier only through the `tsinter.netCall`
 import — OS-level operations only (bind and listen, connect, start and stop
 reading, write bytes, shut down, close, TCP_NODELAY, getaddrinfo), every Node
 behaviour built in the module — and `tsinter.evPoll`, with the same LinkError
-when a host declines either.
+when a host declines either. Since unit G1, process signal listeners
+(`process.on` / `once` / `off` / `removeListener` for `"SIGINT"` and
+`"SIGTERM"`, refused by INC-26 P3 until a host signal channel existed) enter
+only through the `tsinter.sigCall` import — subscribe and unsubscribe a
+signal number, libuv's uv_signal_start / uv_signal_stop — and
+`tsinter.evPoll`; a host that cannot catch signals (a browser) declines it
+and the module fails to instantiate with a LinkError.
 **Rationale:** the output is a
 sandboxed wasm module; ambient OS authority would be a lie at best and a
 sandbox hole at worst. **Tested by:** wasm-differential harness refusal

@@ -35,6 +35,10 @@ export interface ChildAsyncDeps {
   cpCallFunc: () => number;
   /** `tsinter.evPoll`'s index. */
   evPollFunc: () => number;
+  /** Units G1-G3 (hostev.ts): `(base, len) -> ()`, one record of a
+   * host-event source (abi.ts evPoll sources 3-5), defined only in a
+   * module that reaches one — every other module's poll phase is unchanged. */
+  foreign?: () => number;
   /** `tsinter.write`'s index. */
   writeFunc: () => number;
   /** `emitEnsureCapacity`: `need` pushes ONE i32 and is emitted twice. */
@@ -2229,7 +2233,16 @@ export class ChildAsyncBuilder {
       c.i32Const(1);
       c.i32Ne();
       c.ifVoid();
-      this.trap(c);
+      if (this.deps.foreign !== undefined) {
+        // Units G1-G3: a host-event source's record, with its own listeners,
+        // death check and checkpoint.
+        c.localGet(BASE);
+        c.localGet(LEN);
+        c.call(this.deps.foreign());
+        c.br(1);
+      } else {
+        this.trap(c);
+      }
       c.end();
       this.emitLoadU32(c, BASE, 8);
       c.localSet(KIND);
@@ -2352,7 +2365,21 @@ export class ChildAsyncBuilder {
       c.i32Const(1);
       c.i32Ne();
       c.ifVoid();
-      this.trap(c);
+      if (this.deps.foreign !== undefined) {
+        // Units G1-G3: a host-event source's record (never inside a child
+        // event's callback scope), with its own listeners, death check and
+        // checkpoint.
+        c.localGet(CONT);
+        c.ifVoid();
+        this.trap(c);
+        c.end();
+        c.localGet(BASE);
+        c.localGet(LEN);
+        c.call(this.deps.foreign());
+        c.br(1);
+      } else {
+        this.trap(c);
+      }
       c.end();
       this.emitLoadU32(c, BASE, 8);
       c.localTee(KIND);

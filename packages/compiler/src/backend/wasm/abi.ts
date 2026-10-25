@@ -588,7 +588,8 @@
  *   (import "tsinter" "evPoll" (func (param i32 i32) (result i32)))
  *     [event modules only — those reaching cp.spawn or cp.spawnOpts, and
  *     since INC-29 U1 those reaching a node:net key that can start host
- *     I/O (netCall below)]
+ *     I/O (netCall below); since unit G1 those reaching a signal listener
+ *     (sigCall below)]
  *     evPoll(ptr, cap) -> i32. INC-28 U2. The host's EVENT QUEUE, read one
  *     event at a time: the host writes the oldest queued event at ptr and
  *     answers its length; answers 0 when the queue is empty; and answers
@@ -596,7 +597,8 @@
  *     small, so the module grows its buffer and asks again — the event is
  *     held, never lost and never re-created. THE RECORD, little-endian:
  *     u32 source at +0 (1 = a child, 2 = a net handle — INC-29 U1,
- *     netCall below), u32 handle at +4, u32 kind at +8,
+ *     netCall below; 3 = a signal subscription — unit G1, sigCall below),
+ *     u32 handle at +4, u32 kind at +8,
  *     u32 payloadLen at +12, i32 a at +16, i32 b at +20 — 4+4+4+4+4+4 = 24
  *     bytes — then payloadLen bytes. A child's kinds: 1 EXIT (a = the exit
  *     code, or -1 when a signal ended the child; b = that signal's Linux
@@ -1063,6 +1065,43 @@
  *     timer, microtask or event is delivered, exactly Node's blocked main
  *     thread. Present only in modules that reach `Atomics.wait`.
  *
+ *   (import "tsinter" "sigCall" (func (param i32 i32) (result i32)))
+ *     [modules reaching process.on / once / off / removeListener for a
+ *     signal only (process.onSignal / process.offSignal) — unit G1; minted
+ *     after sleep]
+ *     sigCall(op, x) -> i32: libuv's uv_signal_start / uv_signal_stop, and
+ *     nothing more.
+ *       op 1 START(x = a Linux signal number) -> a subscription handle
+ *                               (>= 1; numbered from 1), or the NEGATIVE
+ *                               Linux errno the subscription failed with.
+ *                               From now on the host catches that signal
+ *                               instead of taking its default action, and
+ *                               queues one SIGNAL record per delivery its
+ *                               OS reports (non-real-time signals coalesce
+ *                               there, as they do for libuv).
+ *       op 2 STOP(x = handle)   -> 0. The signal's previous disposition is
+ *                               restored, and the host drops every record
+ *                               it still holds or has queued for the
+ *                               handle and never names it again.
+ *     The module holds at most one subscription per signal number (Node's
+ *     signalWraps): it STARTs with the signal's first listener and STOPs
+ *     when the last one leaves. Every Node behaviour — the listener lists,
+ *     once / off, the emission's copy, the death check, liveness (a signal
+ *     subscription never holds the loop: Node unrefs the wrap) — is the
+ *     module's (hostev.ts).
+ *     EVENTS, evPoll source 3, `handle` the subscription: kind 1 SIGNAL,
+ *     a = the Linux signal number, b = 0, no payload. Any record out of
+ *     these shapes (an unknown kind, a handle the module does not hold, a
+ *     signal number that is not the handle's) is the named trap "evPoll:
+ *     host failure".
+ *     THE CAPABILITY (S004): a host that cannot or will not catch signals
+ *     (a browser) DOES NOT SUPPLY THE IMPORT, and the module fails to
+ *     instantiate with a LinkError.
+ *     sigCall's EFFECT TIER: that the host catches exactly the signals it
+ *     was asked to, and reports each delivery once, in the order its OS
+ *     delivered them, is enforced by NOTHING — the harness's own rows are
+ *     the check.
+ *
  *   (export "_start" (func))            — the program; run it once.
  *   (export "_tick" (func (param f64) (result f64)))  [timer modules only]
  *   (export "_loop" (func (param f64) (result f64)))  [event modules only,
@@ -1190,6 +1229,7 @@ export const IMPORT_NET_CALL = "netCall";
 export const IMPORT_TLS_CALL = "tlsCall";
 export const IMPORT_RANDOM = "random";
 export const IMPORT_SLEEP = "sleep";
+export const IMPORT_SIG_CALL = "sigCall";
 export const EXPORT_ENTRY = "_start";
 export const EXPORT_TICK = "_tick";
 export const EXPORT_LOOP = "_loop";

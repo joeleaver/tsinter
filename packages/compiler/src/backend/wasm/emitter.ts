@@ -138,6 +138,7 @@ import {
   IMPORT_NET_CALL,
   IMPORT_RANDOM,
   IMPORT_SLEEP,
+  IMPORT_SIG_CALL,
   IMPORT_TLS_CALL,
   IMPORT_FS_CALL,
   IMPORT_HOST_NUM,
@@ -185,6 +186,7 @@ import { FsLaddersBuilder } from "./fs-ladders.js";
 import { ChildProcBuilder, SR_ERR_CODE, SR_HAS_STATUS, SR_SIGNAL, SR_STATUS, SR_STDERR, SR_STDOUT } from "./childproc.js";
 import { CH_CODE, CH_ERR, CH_HAS_PID, CH_KILLED, CH_OUT, CH_PID, CH_STATE, ChildAsyncBuilder } from "./childasync.js";
 import { NET_LISTS, NetBuilder, type NetList } from "./net.js";
+import { HostEvBuilder } from "./hostev.js";
 import { TlsBuilder } from "./tls.js";
 import { X509Builder } from "./tls-x509.js";
 import { CryptoBuilder, X509_BAD_TIME, X509_NO_START } from "./crypto.js";
@@ -2417,6 +2419,13 @@ class Assembler {
   /** Unit H: `tsinter.sleep`'s index (Atomics.wait's synchronous sleep),
    * or null outside a module that reaches `atomics.wait`. */
   private readonly sleepFunc: number | null;
+  /** Unit G1: `tsinter.sigCall`'s index, or null in a module that reaches no
+   * signal listener (hostev.ts). */
+  private readonly sigCallFunc: number | null;
+  /** Units G1-G3: the module reaches a host-event surface of hostev.ts
+   * (signals) — an event module whatever else it reaches. */
+  private readonly hevSignals: boolean;
+  private readonly hevModule: boolean;
   /** The exit-drain gate's static fact — see exitListenerSurfaceReachable's
    * own comment (INC-26 P1). Computed ONCE in the constructor; every drain
    * gate site reads this, never the mutable `procField`/
@@ -2574,8 +2583,13 @@ class Assembler {
     // INC-29 U1: a net module's `_loop` is built from the timer runtime,
     // which reads `now`, whether or not the program arms a timer itself.
     const netMod = netModuleReachable(mod);
+    // Units G1-G3: a host-event module's `_loop` reads `now` too.
+    const hevSignals = libCallWhere(mod, (fn) => fn === "process.onSignal" || fn === "process.offSignal");
+    const hevMod = hevSignals;
+    this.hevSignals = hevSignals;
+    this.hevModule = hevMod;
     this.nowFunc =
-      timerSurfaceReachable(mod) || perfNowReachable(mod) || netMod
+      timerSurfaceReachable(mod) || perfNowReachable(mod) || netMod || hevMod
         ? this.mb.importFunc(IMPORT_MODULE, IMPORT_NOW, this.mb.funcType([], [F64]))
         : null;
     // `seed`'s twin decision (INC-25 P1, abi.ts §8.1): present only in
@@ -2644,8 +2658,9 @@ class Assembler {
     this.netModule = netMod;
     this.closeOverride = closeOverrideReachable(mod);
     this.httpModule = httpModuleReachable(mod);
-    // INC-29 U1: a net module is an event module too.
-    this.eventModule = this.cpEventModule || netMod;
+    // INC-29 U1: a net module is an event module too; units G1-G3: so is a
+    // host-event module.
+    this.eventModule = this.cpEventModule || netMod || hevMod;
     this.pipeModule = pipeModuleReachable(mod);
     this.evPollFunc = this.eventModule
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_EV_POLL, this.mb.funcType([I32, I32], [I32]))
@@ -2676,6 +2691,12 @@ class Assembler {
     // no earlier import index moves.
     this.sleepFunc = libCallWhere(mod, (fn) => fn === "atomics.wait")
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_SLEEP, this.mb.funcType([F64], []))
+      : null;
+    // `sigCall`'s decision (unit G1, abi.ts): signal subscriptions, in
+    // modules that reach a signal listener, minted after sleep so no
+    // earlier import index moves.
+    this.sigCallFunc = hevSignals
+      ? this.mb.importFunc(IMPORT_MODULE, IMPORT_SIG_CALL, this.mb.funcType([I32, I32], [I32]))
       : null;
     // ── end INC-26 host-import block ──
     // The exit-drain gate's STATIC fact (see exitListenerSurfaceReachable's
@@ -6365,10 +6386,22 @@ class Assembler {
             pending: (c: Code) => c.call(this.net.pendingHelper()),
             pendingQueued: (c: Code) => c.call(this.net.pendingQueuedHelper()),
           }
-        : {
-            poll: (c: Code) => c.call(this.cpa.pollHelper()),
-            childRefLive: () => this.cpa.refLiveGlobal(),
-          }),
+        : this.cpEventModule
+          ? {
+              poll: (c: Code) => c.call(this.cpa.pollHelper()),
+              childRefLive: () => this.cpa.refLiveGlobal(),
+            }
+          : {
+              // Units G1-G3: neither children nor net handles — the host-
+              // event builder's own poll phase and liveness.
+              poll: (c: Code) => c.call(this.hev.pollHelper()),
+              netAlive: (c: Code) => this.hev.emitAlive(c),
+            }),
+      // Units G1-G3: a host-event surface beside children or net handles
+      // holds the loop too (OR'd into their liveness).
+      ...(this.hevModule && (this.netModule || this.cpEventModule)
+        ? { extraAlive: (c: Code) => this.hev.emitAlive(c) }
+        : {}),
     });
     return this.timersField;
   }
@@ -8894,6 +8927,8 @@ class Assembler {
       strType: () => this.strType,
       netCallFunc: () => this.netCallFuncOrThrow(),
       evPollFunc: () => this.evPollFuncOrThrow(),
+      // Units G1-G3: the host-event sources, dispatched from the poll phase.
+      ...(this.hevModule ? { foreign: () => this.hev.dispatchHelper() } : {}),
       ensureCapacity: (c, need) => this.emitEnsureCapacity(c, need),
       stageCursor: () => this.cursorGlobal,
       pushStrLit: (c, value) => this.pushStrLitInto(c, value),
@@ -13296,6 +13331,36 @@ class Assembler {
 
   private cpaField: ChildAsyncBuilder | null = null;
 
+  private hevField: HostEvBuilder | null = null;
+
+  /** Units G1-G3's builder (hostev.ts): process signal listeners and the
+   * host-event sources' shared dispatcher. */
+  private get hev(): HostEvBuilder {
+    this.hevField ??= new HostEvBuilder(this.mb, {
+      evPollFunc: () => this.evPollFuncOrThrow(),
+      sigCallFunc: () => {
+        if (this.sigCallFunc === null) throw new Error("emitter bug: a signal listener was reached but tsinter.sigCall was never imported");
+        return this.sigCallFunc;
+      },
+      ensureCapacity: (c, need) => this.emitEnsureCapacity(c, need),
+      stageCursor: () => this.cursorGlobal,
+      namedTrap: (c, message) => {
+        const exc = this.exc();
+        this.pushStrLitInto(c, message);
+        c.globalSet(exc.refG);
+        c.i32Const(EXC_STR);
+        c.globalSet(exc.kindG);
+        c.call(this.reportUncaughtHelper());
+      },
+      voidClos: () => this.closPairFor([], []),
+      excKind: () => this.exc().kindG,
+      reportUncaught: () => this.reportUncaughtHelper(),
+      checkpoint: (c) => this.emitCheckpoint(c),
+      signals: this.hevSignals,
+    });
+    return this.hevField;
+  }
+
   /** INC-28 U2's builder (childasync.ts) — spawn's asynchronous surface:
    * the ChildProcess value, the SPAWN request, the poll phase. */
   private get cpa(): ChildAsyncBuilder {
@@ -13304,6 +13369,8 @@ class Assembler {
       strRef: () => this.strRef,
       cpCallFunc: () => this.cpCallFuncOrThrow(),
       evPollFunc: () => this.evPollFuncOrThrow(),
+      // Units G1-G3: the host-event sources, dispatched from the poll phase.
+      ...(this.hevModule ? { foreign: () => this.hev.dispatchHelper() } : {}),
       writeFunc: () => this.writeFunc,
       ensureCapacity: (c, need) => this.emitEnsureCapacity(c, need),
       stageCursor: () => this.cursorGlobal,
@@ -23671,13 +23738,31 @@ class Assembler {
         // ── end INC-26 P5 (fsp twins, all 10) ─────────────────────────────
         // ── end INC-26 P4 ──────────────────────────────────────────────
         if (e.fn === "process.onSignal" || e.fn === "process.offSignal") {
-          // D5/A-9: registration is easy; DELIVERY needs a host signal
-          // channel this tier does not have. BOTH keys refuse under the
-          // SAME bucket name (`libCall:process.onSignal`) so the census
-          // bucket never moves, whichever the program reaches FIRST — the
-          // one way this control can silently break.
-          this.refuse("libCall:process.onSignal", e.loc);
-          code.unreachable();
+          // Unit G1 (hostev.ts; abi.ts sigCall, evPoll source 3) lifts
+          // INC-26 P3's D5 refusal (Joe, 2026-10-25): delivery rides the
+          // host's signal subscription. The listener is a `() => void`
+          // closure, kept by identity for off.
+          const cbType = e.args[1]!.type;
+          if (cbType.kind !== "func" || cbType.params.length !== 0 || cbType.rest === true) {
+            this.refuse(`libCall:${e.fn}:unexpected-callback-shape`, e.loc);
+            code.unreachable();
+            return;
+          }
+          const pair = this.closSigFor(cbType, e.loc);
+          const want = this.closPairFor([], []);
+          if (pair === null || pair.clos !== want.clos) {
+            this.refuse(`libCall:${e.fn}:unexpected-callback-shape`, e.loc);
+            code.unreachable();
+            return;
+          }
+          this.walkExpr(e.args[0]!);
+          this.walkExpr(e.args[1]!);
+          if (e.fn === "process.onSignal") {
+            this.walkExpr(e.args[2]!);
+            code.call(this.hev.sigOnHelper());
+          } else {
+            code.call(this.hev.sigOffHelper());
+          }
           return;
         }
         if (this.emitCryptoLibCall(e)) return;

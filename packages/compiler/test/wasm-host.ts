@@ -332,6 +332,10 @@ async function instantiate(modulePath: string, overrides?: HostOverrides) {
       tlsCall(op: number, _ptr: number, _len: number, _h: number, _x: number): number {
         throw new Error(`tlsCall: op ${op} reached with no forced host (default stub is loud by design)`);
       },
+      // Unit G1 (abi.ts sigCall): LOUD for every op, netCall's stance.
+      sigCall(op: number, _x: number): number {
+        throw new Error(`sigCall: op ${op} reached with no forced host (default stub is loud by design)`);
+      },
       ...(overrides?.imports ?? {}),
     },
   });

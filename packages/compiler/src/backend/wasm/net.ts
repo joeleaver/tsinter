@@ -60,6 +60,10 @@ export interface NetDeps {
   strType: () => number;
   netCallFunc: () => number;
   evPollFunc: () => number;
+  /** Units G1-G3 (hostev.ts): `(base, len) -> ()`, one record of a
+   * host-event source (abi.ts evPoll sources 3-5), defined only in a
+   * module that reaches one — every other module's poll phase is unchanged. */
+  foreign?: () => number;
   ensureCapacity: (c: Code, need: () => void) => void;
   stageCursor: () => number;
   pushStrLit: (c: Code, value: string) => void;
@@ -7175,7 +7179,16 @@ export class NetBuilder {
       c.i32Const(SRC_NET);
       c.i32Ne();
       c.ifVoid();
-      this.trap(c);
+      if (this.deps.foreign !== undefined) {
+        // Units G1-G3: a host-event source's record, with its own listeners,
+        // death check and checkpoint.
+        c.localGet(BASE);
+        c.localGet(LEN);
+        c.call(this.deps.foreign());
+        c.br(1);
+      } else {
+        this.trap(c);
+      }
       c.end();
       this.loadU32(c, BASE, 12);
       c.localSet(PLEN);

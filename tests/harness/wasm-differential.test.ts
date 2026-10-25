@@ -3265,7 +3265,8 @@ const TIER_FLOOR: string[] = [
   // the cpu+thread-cpu counters and their in-module diffs,
   // cpuPrevValidate, rusage, the memory reads, activeResources (no host),
   // the warning surface, stdin's two keys, D4's `kill` import with its
-  // own errno enumeration, D5's two onSignal/offSignal refusals, and
+  // own errno enumeration, D5's two onSignal/offSignal refusals (lifted by
+  // unit G1 — the sigCall import, abi.ts), and
   // Joe's five widened #138 keys (stderrWriteBytes, offRejectionHandled,
   // chdir, exiting, umask). 880 -> 891.
   "1425-stdin-tty.ts",
@@ -3544,6 +3545,11 @@ const TIER_FLOOR: string[] = [
   "2251-tagged-templates-dyn.ts",
   "2474-island-literal-forms.ts",
   "2590-object-create-dynamic.js",
+  // Unit G1: process signal listeners over the OS-level `sigCall` host
+  // import and evPoll source 3 (abi.ts; hostev.ts), lifting INC-26 P3's D5
+  // refusal: 1062 -> 1064.
+  "1443-signal-handlers.ts",
+  "1469-remove-listener.ts",
 ];
 
 interface RunResult {
@@ -5175,6 +5181,42 @@ async function runWasm(modulePath: string): Promise<RunResult> {
       evWaker?.();
     },
   });
+  // Unit G1 (abi.ts sigCall, evPoll source 3): each subscription is a real
+  // listener on this worker's own process for the signal's name, so the
+  // signal is caught (never its default action) while the module holds it.
+  // A subscription counts as live for the clock: deliveries are real OS
+  // events, and the host must yield to its own loop for them to arrive.
+  const sigSubs = new Map<number, { name: NodeJS.Signals; signum: number; listener: () => void }>();
+  let sigNextHandle = 1;
+  const sigNameOf = (signum: number): NodeJS.Signals | undefined =>
+    (Object.entries(osConstants.signals) as [NodeJS.Signals, number][]).find(([, n]) => n === signum)?.[0];
+  const sigCall = (op: number, x: number): number => {
+    if (op === 1) {
+      const name = sigNameOf(x);
+      if (name === undefined) return -22;
+      const handle = sigNextHandle++;
+      const listener = (): void => {
+        evPush({ source: 3, handle, kind: 1, a: x, b: 0, payload: new Uint8Array(0) });
+      };
+      process.on(name, listener);
+      sigSubs.set(handle, { name, signum: x, listener });
+      evLiveAdd(1);
+      return handle;
+    }
+    if (op === 2) {
+      const rec = sigSubs.get(x);
+      if (rec === undefined) throw new Error(`sigCall: STOP of handle ${x}, not a subscription`);
+      process.off(rec.name, rec.listener);
+      sigSubs.delete(x);
+      for (let i = evQueue.length - 1; i >= 0; i--) {
+        const ev = evQueue[i]!;
+        if (ev.source === 3 && ev.handle === x) evQueue.splice(i, 1);
+      }
+      evLiveAdd(-1);
+      return 0;
+    }
+    throw new Error(`sigCall: unknown op ${op}`);
+  };
   // SPAWN: public spawn() inside ONE synchronous span with the documented
   // tracing channel subscribed for exactly that span (never at module
   // scope: a subscriber makes every spawn in the worker publish), matched
@@ -5635,6 +5677,10 @@ async function runWasm(modulePath: string): Promise<RunResult> {
         if (sig === 0) return doKill();
         if (pid === process.pid) {
           if (sig === 28) return doKill();
+          // Unit G1: a signal this run has subscribed to is caught by the
+          // subscription's own listener (abi.ts sigCall), never its default
+          // action — delivering it is safe and is the program's behaviour.
+          if ([...sigSubs.values()].some((r) => r.signum === sig)) return doKill();
           loud("a real, non-zero, non-SIGWINCH signal to the harness's OWN process");
         }
         // Any other pid: probe first. Only an ESRCH probe licenses the
@@ -6102,6 +6148,8 @@ async function runWasm(modulePath: string): Promise<RunResult> {
       tlsCall(op: number, ptr: number, len: number, h: number, x: number): number {
         return netHost.tlsCall(op, ptr, len, h, x);
       },
+      // Unit G1 (abi.ts sigCall): signal subscriptions.
+      sigCall,
       // INC-28 U2 (abi.ts evPoll): the oldest queued event, or 0; a short
       // buffer answers -(the length needed) and keeps the event. Reading an
       // EXIT ends that child's life for the clock.
@@ -6227,6 +6275,9 @@ async function runWasm(modulePath: string): Promise<RunResult> {
     // INC-29 U1: every socket and server still open is closed (the module
     // left them so: the loop ended, or the program died).
     netHost.finish();
+    // Unit G1: every signal subscription still held is released.
+    for (const rec of sigSubs.values()) process.off(rec.name, rec.listener);
+    sigSubs.clear();
     for (const rec of evChildren.values()) {
       rec.proc.removeAllListeners("close");
       rec.proc.removeAllListeners("exit");
@@ -9356,6 +9407,68 @@ describe("Unit B diagnostics_channel and AsyncLocalStorage rows", () => {
       const res = await compile(path, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: false, backend: "wasm" });
       expect(res.ok).toBe(false);
       expect(res.diagnostics.map((d) => d.message).join("\n")).toContain("(libCall:als:context-through-net)");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+});
+
+describe("unit G1 signal listener rows", () => {
+  /** Compiles `src` (a whole program) in a fresh directory of its own and
+   * runs it through this file's runWasm; the directory goes afterwards. */
+  async function runG1(src: string): Promise<RunResult> {
+    const dir = mkdtempSync(join(tmpdir(), "g1-row-"));
+    try {
+      const file = join(dir, "main.ts");
+      writeFileSync(file, src);
+      const res = await compile(file, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: false, backend: "wasm" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+      return await runWasm(res.binaryPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  // Expected outputs generated from the Node oracle (three runs each, all
+  // identical), never typed.
+  const rows: [string, string, string, string, number][] = [
+    ["G1-SIG-01","self-signals delivered in the poll phase in kill order, one emission per delivery with its own checkpoint (ticks, then microtasks) before the next, a once listener gone after its first delivery, the check phase after the poll — SINGLE-EDIT: hostev.ts sigDeliver's checkpoint","const a = (): void => {\n  console.log(\"a\");\n  Promise.resolve().then(() => console.log(\"a micro\"));\n  process.nextTick(() => console.log(\"a tick\"));\n};\nconst b = (): void => {\n  console.log(\"b\");\n};\nprocess.on(\"SIGTERM\", a);\nprocess.once(\"SIGTERM\", b);\nprocess.on(\"SIGINT\", b);\nprocess.kill(process.pid, \"SIGTERM\");\nprocess.kill(process.pid, \"SIGINT\");\nsetImmediate(() => console.log(\"immediate\"));\nsetTimeout(() => {\n  console.log(\"timer 50\");\n  process.kill(process.pid, \"SIGTERM\");\n  setTimeout(() => {\n    console.log(\"timer 100\");\n    process.off(\"SIGTERM\", a);\n    process.off(\"SIGINT\", b);\n  }, 50);\n}, 50);\nconsole.log(\"main done\");\n","main done\na\nb\na tick\na micro\nb\nimmediate\ntimer 50\na\na tick\na micro\ntimer 100\n",0],
+    ["G1-SIG-02","off removes the LAST registration of a listener (a once one included); an emission runs over a copy — a listener removed during it still runs, one added during it does not — SINGLE-EDIT: hostev.ts sigOff scanning from the front","const a = (): void => console.log(\"a\");\nconst b = (): void => console.log(\"b\");\nconst c = (): void => {\n  console.log(\"c removes b, adds a once\");\n  process.off(\"SIGTERM\", b);\n  process.once(\"SIGTERM\", a);\n};\nprocess.on(\"SIGTERM\", a);\nprocess.on(\"SIGTERM\", b);\nprocess.once(\"SIGTERM\", a);\nprocess.on(\"SIGTERM\", c);\nprocess.on(\"SIGTERM\", b);\nprocess.off(\"SIGTERM\", a);\nprocess.kill(process.pid, \"SIGTERM\");\nsetTimeout(() => {\n  console.log(\"second\");\n  process.kill(process.pid, \"SIGTERM\");\n  setTimeout(() => {\n    console.log(\"done\");\n    process.off(\"SIGTERM\", a);\n    process.off(\"SIGTERM\", a);\n    process.off(\"SIGTERM\", b);\n    process.off(\"SIGTERM\", c);\n  }, 30);\n}, 30);\n","a\nb\nc removes b, adds a once\nb\nsecond\na\nb\nc removes b, adds a once\na\ndone\n",0],
+    ["G1-SIG-03","a signal listener does not hold the loop: a self-signal with nothing else alive never reaches it, and the program exits 0 — SINGLE-EDIT: hostev.ts emitAlive answering 1","process.on(\"SIGTERM\", () => {\n  console.log(\"term (never prints)\");\n});\nprocess.kill(process.pid, \"SIGTERM\");\nPromise.resolve().then(() => console.log(\"micro\"));\nconsole.log(\"main done\");\n","main done\nmicro\n",0],
+    ["G1-SIG-04","a function declaration keeps its identity across on and off: two registrations, one removed, one delivery; off of a listener never added is a no-op — SINGLE-EDIT: hostev.ts sigOff's identity test","function onTerm(): void {\n  console.log(\"term\");\n}\nfunction never(): void {\n  console.log(\"never\");\n}\nprocess.off(\"SIGTERM\", never);\nprocess.on(\"SIGTERM\", onTerm);\nprocess.on(\"SIGTERM\", onTerm);\nprocess.off(\"SIGTERM\", onTerm);\nprocess.off(\"SIGINT\", onTerm);\nprocess.kill(process.pid, \"SIGTERM\");\nsetTimeout(() => {\n  process.off(\"SIGTERM\", onTerm);\n  console.log(\"off\");\n}, 30);\n","term\noff\n",0],
+    ["G1-SIG-05","the last listener leaving stops the subscription and a new first listener starts another: deliveries reach the new one only — SINGLE-EDIT: hostev.ts sigStop never clearing the handle","const first = (): void => {\n  console.log(\"first\");\n  process.off(\"SIGINT\", first);\n  process.on(\"SIGINT\", second);\n  setTimeout(() => process.kill(process.pid, \"SIGINT\"), 10);\n};\nconst second = (): void => {\n  console.log(\"second\");\n  process.removeListener(\"SIGINT\", second);\n};\nprocess.on(\"SIGINT\", first);\nprocess.kill(process.pid, \"SIGINT\");\nsetTimeout(() => console.log(\"end\"), 80);\n","first\nsecond\nend\n",0],
+    ["G1-SIG-06","a throwing signal listener is the program's death: the listener after it never runs and nothing later does — SINGLE-EDIT: hostev.ts sigDeliver's death check","process.on(\"SIGTERM\", () => {\n  console.log(\"first\");\n});\nprocess.on(\"SIGTERM\", () => {\n  throw new Error(\"listener boom\");\n});\nprocess.on(\"SIGTERM\", () => {\n  console.log(\"third (never prints)\");\n});\nprocess.kill(process.pid, \"SIGTERM\");\nsetTimeout(() => console.log(\"timer (never prints)\"), 50);\nconsole.log(\"main done\");\n","main done\nfirst\n",1],
+  ];
+  for (const [id, what, src, stdout, exitCode] of rows) {
+    test(`${id} ${what}`, async () => {
+      const r = await runG1(src);
+      expect(r.stdout.toString("utf8")).toBe(stdout);
+      expect(r.exitCode).toBe(exitCode);
+      if (exitCode === 0) expect(r.stderr.toString("utf8")).toBe("");
+      else expect(r.stderr.toString("utf8")).toBe("Uncaught Error: listener boom\n");
+    }, 60000);
+  }
+  test("G1-HOST-01 a signal listener mints sigCall (after every earlier import) and evPoll and exports _loop; a module without one mints neither — SINGLE-EDIT: emitter.ts hevSignals' prescan", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "g1-row-"));
+    try {
+      const shapes: [string, boolean][] = [
+        ['process.on("SIGINT", () => console.log("int"));\nconsole.log("armed");\n', true],
+        ['process.off("SIGTERM", () => {});\n', true],
+        ['setTimeout(() => console.log("t"), 1);\n', false],
+      ];
+      for (const [i, [src, want]] of shapes.entries()) {
+        const file = join(dir, `m${i}.ts`);
+        writeFileSync(file, src);
+        const res = await compile(file, { outPath: join(dir, `m${i}.wasm`), outDir: dir, dynamic: false, backend: "wasm" });
+        expect(res.ok).toBe(true);
+        if (!res.ok) return;
+        const m = await WebAssembly.compile(readFileSync(res.binaryPath));
+        const imports = WebAssembly.Module.imports(m).map((x) => `${x.module}.${x.name}`);
+        const exports = WebAssembly.Module.exports(m).map((x) => x.name);
+        expect(imports.includes("tsinter.sigCall")).toBe(want);
+        expect(imports.includes("tsinter.evPoll")).toBe(want);
+        expect(exports.includes("_loop")).toBe(want);
+        if (want) expect(imports[imports.length - 1]).toBe("tsinter.sigCall");
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -41,19 +41,6 @@ async function buildProgram(src: string): Promise<string> {
   return res.binaryPath;
 }
 
-/** Same-shape refusal check for the two D5 keys (onSignal/offSignal) —
- * these never reach the forced host at all (they refuse at COMPILE time),
- * so their own "row" is a compile-time assertion, not a runtime one. */
-async function expectRefused(src: string): Promise<{ code: string; message: string }> {
-  const file = join(scratch, `p${seq++}.ts`);
-  await writeFile(file, src);
-  const res = await compile(file, { outPath: `${file}.wasm`, outDir: scratch, dynamic: false, backend: "wasm" });
-  if (res.ok) throw new Error("expected a refusal, got ok:true");
-  const d = res.diagnostics[0];
-  if (!d) throw new Error("expected at least one diagnostic");
-  return { code: d.code, message: d.message };
-}
-
 class ExitSignal extends Error {
   constructor(readonly code: number) {
     super(`exit(${code})`);
@@ -1139,19 +1126,22 @@ describe("P3 forced-host: stdinSetRawMode", () => {
   });
 });
 
-// ── the two D5 refusals (diagnostics-shaped, compile-time) ────────────────
-describe("P3 forced-host: onSignal/offSignal refuse by name", () => {
+// ── the two D5 keys, lifted by unit G1 (hostev.ts, abi.ts sigCall) ──────
+describe("P3 forced-host: onSignal/offSignal compile since unit G1", () => {
   // The ambient type only overloads process.on/removeListener's signal
   // form for "SIGINT" | "SIGTERM" — an unlisted name (e.g. "SIGWINCH")
-  // never reaches the backend at all (a plain TS overload error, SC0001);
-  // "SIGTERM" is the one that actually exercises the wasm backend's own
-  // refusal path.
-  test("process.on('SIGTERM', cb) refuses with the named diagnostic", async () => {
-    const { code } = await expectRefused(`process.on("SIGTERM", () => {});`);
-    expect(code).toBe("SC3001");
+  // never reaches the backend at all (a plain TS overload error, SC0001).
+  // INC-26 P3 refused both keys (D5: no host signal channel); unit G1
+  // (Joe, 2026-10-25) delivers them over the sigCall import.
+  const imports = async (src: string): Promise<string[]> => {
+    const { readFileSync } = await import("node:fs");
+    const bin = await buildProgram(src);
+    return WebAssembly.Module.imports(new WebAssembly.Module(readFileSync(bin))).map((i) => `${i.module}.${i.name}`);
+  };
+  test("process.on('SIGTERM', cb) compiles and imports sigCall — SINGLE-EDIT: the libCall:process.onSignal refusal restored", async () => {
+    expect(await imports(`process.on("SIGTERM", () => {});`)).toContain("tsinter.sigCall");
   });
-  test("process.off('SIGTERM', cb) refuses under the SAME bucket (A-9)", async () => {
-    const { code } = await expectRefused(`process.removeListener("SIGTERM", () => {});`);
-    expect(code).toBe("SC3001");
+  test("process.removeListener('SIGTERM', cb) compiles and imports sigCall — SINGLE-EDIT: the libCall:process.onSignal refusal restored for offSignal", async () => {
+    expect(await imports(`process.removeListener("SIGTERM", () => {});`)).toContain("tsinter.sigCall");
   });
 });
