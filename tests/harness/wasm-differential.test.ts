@@ -3532,6 +3532,11 @@ const TIER_FLOOR: string[] = [
   "1524-atomics-sleep-static.ts",
   "2093-timers-promises.ts",
   "2570-buffer-arg-validation.cjs",
+  // Unit A1, the island JS surface: the island-rest ABI (a `(...args) =>`
+  // closure called directly or boxed as a value), `callSpread` with V8's
+  // spread-call texts, and an island literal's object spread: 1057 -> 1059.
+  "2475-variadic-wrapper-island.js",
+  "2568-rest-spread-forward-dynamic.js",
 ];
 
 interface RunResult {

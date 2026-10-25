@@ -3292,34 +3292,26 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
         return { kind: "dynCall", callee, calleeName, args, type: DYN, loc };
       }
       // `fn(...args)` — a TRAILING spread into an island call: the
-      // engine's own apply (`fn.apply(undefined, argsArray)`); leading
-      // plain arguments prepend through `[l1, l2].concat(argsArray)`
-      // (concat flattens the array argument one level — exactly the
-      // spread). Other spread shapes keep the syntax fence.
+      // engine's own spread application (jsOp callSpread — the leading
+      // plain arguments, then the spread source through the iterator
+      // protocol, with V8's spread-call TypeErrors). It was `fn.apply(
+      // undefined, argsArray)`, which is not spread: a string source
+      // threw CreateListFromArrayLike's text and a nullish one called
+      // with no arguments (unit A1 review). Arguments evaluate in source
+      // order. Other spread shapes keep the syntax fence.
       if (
         expr.arguments.length > 0 &&
         ts.isSpreadElement(expr.arguments[expr.arguments.length - 1]!) &&
         expr.arguments.slice(0, -1).every((a) => !ts.isSpreadElement(a))
       ) {
         const spread = expr.arguments[expr.arguments.length - 1] as ts.SpreadElement;
-        const spreadV = L.jsvalIn(L.lowerExpr(spread.expression), spread.expression);
         const leading = expr.arguments.slice(0, -1).map((a) => L.jsvalIn(L.lowerExpr(a), a));
-        const argsArr: IrExpr =
-          leading.length === 0
-            ? spreadV
-            : {
-                kind: "jsOp",
-                op: "callMethod",
-                name: "concat",
-                args: [{ kind: "jsOp", op: "arrLit", args: leading, type: JSVAL, loc }, spreadV],
-                type: JSVAL,
-                loc,
-              };
+        const spreadV = L.jsvalIn(L.lowerExpr(spread.expression), spread.expression);
         const result: IrExpr = {
           kind: "jsOp",
-          op: "callMethod",
-          name: "apply",
-          args: [callee, { kind: "jsOp", op: "undefLit", args: [], type: JSVAL, loc }, argsArr],
+          op: "callSpread",
+          name: v8SpreadSpelling(spread.expression.getText()),
+          args: [callee, { kind: "jsOp", op: "arrLit", args: leading, type: JSVAL, loc }, spreadV],
           type: JSVAL,
           loc,
         };
@@ -4228,7 +4220,7 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
         if (p.spreadOf !== null) {
           // The spelling rides along for V8's nullish spread-call
           // TypeError ("v is not iterable (cannot read property ...)").
-          spreads.push({ arg: args.length, what: p.spreadOf.getText() });
+          spreads.push({ arg: args.length, what: v8SpreadSpelling(p.spreadOf.getText()) });
           args.push(L.coerceInto(p.spreadOf, p.v, DYN));
         } else {
           args.push(L.coerceInto(p.node!, p.v, DYN));
@@ -4257,7 +4249,7 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       const last = parts[parts.length - 1]!;
       // The spelling rides in `name` for V8's nullish spread-call
       // TypeError ("v is not iterable (cannot read property ...)").
-      return { kind: "jsOp", op: "callSpread", name: last.spreadOf!.getText(), args: [f, preArr, last.v], type: JSVAL, loc };
+      return { kind: "jsOp", op: "callSpread", name: v8SpreadSpelling(last.spreadOf!.getText()), args: [f, preArr, last.v], type: JSVAL, loc };
     }
     // No lane fits (a spread source outside both tiers, a callee neither
     // boxable nor marshalable, mixed dyn/jsval spreads): fence HERE — the
@@ -7180,7 +7172,7 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
                     ? {
                         kind: "libCall",
                         fn: "dyn.packPushSpread",
-                        args: [pRef(), src, { kind: "strLit", value: srcNode.getText(), type: STRING, loc: argLoc }],
+                        args: [pRef(), src, { kind: "strLit", value: v8SpreadSpelling(srcNode.getText()), type: STRING, loc: argLoc }],
                         type: VOID,
                         loc: argLoc,
                       }
@@ -8667,3 +8659,77 @@ export function lowerFunction(L: Lowerer, decl: ts.FunctionDeclaration): IrFunct
       loc: locOf(call),
     });
   }
+
+/** V8's CallPrinter rendering of a spread source, as its nullish spread-call
+ * TypeError prints it ("<x> is not iterable (cannot read property null)"),
+ * from the source text — shared by every lane (unit A1 review; board #242:
+ * the lanes printed the source text verbatim). Rendered: an identifier or
+ * `this`, then any chain of `.name`, `[name]`, `[n]` for an index whose
+ * source digits are the number's own ToString (V8 prints the VALUE:
+ * `o[99999999999999999999]` reads `o[100000000000000000000]`), `["name"]`
+ * (printed `.name`) and calls (printed `(...)`, the arguments elided), with
+ * redundant outer parentheses dropped. Every other shape — whitespace,
+ * optional chains (V8's "(intermediate value)"), literals, operators —
+ * answers the EMPTY string, which each backend reads as "not rendered": a
+ * nullish source there refuses by name instead of naming itself wrongly
+ * (SEMANTICS.md S043, unit A1 amendment). */
+export function v8SpreadSpelling(text: string): string {
+  let t = text;
+  for (;;) {
+    if (t.length < 2 || t[0] !== "(" || matchParenClose(t, 0) !== t.length - 1) break;
+    t = t.slice(1, -1);
+  }
+  const ident = /^[A-Za-z_$][A-Za-z0-9_$]*/;
+  const head = ident.exec(t);
+  if (head === null) return "";
+  let out = head[0];
+  let i = head[0].length;
+  while (i < t.length) {
+    const ch = t[i];
+    if (ch === ".") {
+      const m = ident.exec(t.slice(i + 1));
+      if (m === null) return "";
+      out += `.${m[0]}`;
+      i += 1 + m[0].length;
+    } else if (ch === "[") {
+      const close = t.indexOf("]", i);
+      if (close < 0) return "";
+      const key = t.slice(i + 1, close);
+      const str = /^"([A-Za-z_$][A-Za-z0-9_$]*)"$|^'([A-Za-z_$][A-Za-z0-9_$]*)'$/.exec(key);
+      if (str !== null) out += `.${str[1] ?? str[2]}`;
+      else if (/^[0-9]+$/.test(key) && String(Number(key)) === key) out += `[${key}]`;
+      else if (ident.test(key) && ident.exec(key)![0] === key) out += `[${key}]`;
+      else return "";
+      i = close + 1;
+    } else if (ch === "(") {
+      const close = matchParenClose(t, i);
+      if (close < 0) return "";
+      out += "(...)";
+      i = close + 1;
+    } else {
+      return "";
+    }
+  }
+  return out;
+}
+
+/** The index of the `)` closing the `(` at `open`, skipping string
+ * literals, or -1. */
+function matchParenClose(t: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < t.length; i++) {
+    const ch = t[i];
+    if (ch === "'" || ch === '"' || ch === "`") {
+      const q = ch;
+      i++;
+      while (i < t.length && t[i] !== q) i += t[i] === "\\" ? 2 : 1;
+      continue;
+    }
+    if (ch === "(") depth++;
+    else if (ch === ")") {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}

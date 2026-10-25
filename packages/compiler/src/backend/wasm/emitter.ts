@@ -4645,12 +4645,41 @@ class Assembler {
 
   /** The pair for an IR func TYPE — honest refusals for unmappable
    * components; a rest-marked type is refused by default unless the
-   * caller opts in, and a distinct key covers restAbi "jsval"
-   * unconditionally (never opts in). */
-  private closSigFor(t: IrType & { kind: "func" }, loc: SrcLoc | undefined, optIn = false): { clos: number; fn: number } | null {
+   * caller opts in, and a distinct key covers restAbi "jsval", which
+   * only `jsvalRest` callers admit (unit A1): the ISLAND-REST type SPELLS
+   * its trailing engine array as its last declared parameter, so its
+   * wasm signature is the declared list as it stands — no hidden slot.
+   * Only the sites that pass that array explicitly opt in: the value's
+   * own representation (mapType/mapTypeSoft), `callValue` (whose IR
+   * args carry the arrLit), and the dyn box/thunk pair (which packs the
+   * surplus itself). Every fixed-arity caller (static-API callbacks,
+   * listeners, the dynCheck adapter) keeps the refusal — calling the
+   * closure positionally there would bind a plain argument to the rest
+   * slot. */
+  private closSigFor(
+    t: IrType & { kind: "func" },
+    loc: SrcLoc | undefined,
+    optIn = false,
+    jsvalRest = false,
+  ): { clos: number; fn: number } | null {
     if (t.rest === true && t.restAbi === "jsval") {
-      this.refuse("type:func-rest-jsval", loc);
-      return null;
+      if (!jsvalRest) {
+        this.refuse("type:func-rest-jsval", loc);
+        return null;
+      }
+      const jparams: ValType[] = [];
+      for (const p of t.params) {
+        const v = this.mapType(p, loc);
+        if (v === null) return null;
+        jparams.push(v);
+      }
+      let jresults: ValType[] = [];
+      if (t.ret.kind !== "void") {
+        const r = this.mapType(t.ret, loc);
+        if (r === null) return null;
+        jresults = [r];
+      }
+      return this.closPairFor(jparams, jresults);
     }
     if (t.rest === true && !optIn) {
       this.refuse("type:func-rest", loc);
@@ -15326,7 +15355,7 @@ class Assembler {
     const key = typeKey(t);
     const hit = this.dynFnThunks.get(key);
     if (hit !== undefined) return hit;
-    const pair = this.closSigFor(t, loc, true);
+    const pair = this.closSigFor(t, loc, true, true);
     if (pair === null) return null;
     const idx = this.mb.declareFunc(this.dyn.thunkSig(), `%w.dyn.fnThunk:${key}`);
     this.dynFnThunks.set(key, idx);
@@ -15358,7 +15387,12 @@ class Assembler {
     dyn.arrLen(c, (x) => x.localGet(1));
     c.localSet(n);
     const slots: number[] = [];
-    for (let i = 0; i < t.params.length; i++) {
+    // The ISLAND-REST form (restAbi "jsval", unit A1) spells its rest
+    // array as the LAST declared parameter: the leading list is one
+    // shorter, and that last slot is the packed surplus below — exactly
+    // the hidden trailing slot the dyn-rest form appends.
+    const lead = t.rest === true && t.restAbi === "jsval" ? t.params.length - 1 : t.params.length;
+    for (let i = 0; i < lead; i++) {
       const p = t.params[i]!;
       const val = this.mapType(p, loc);
       if (val === null) return false;
@@ -15406,7 +15440,7 @@ class Assembler {
       dyn.pushNewArr(c);
       c.localSet(restVec);
       const i = this.wlocal(w, I32);
-      c.i32Const(t.params.length);
+      c.i32Const(lead);
       c.localSet(i);
       c.block();
       c.loop();
@@ -15473,7 +15507,7 @@ class Assembler {
     const key = typeKey(t);
     const hit = this.dynFnBoxes.get(key);
     if (hit !== undefined) return hit;
-    const pair = this.closSigFor(t, loc, true);
+    const pair = this.closSigFor(t, loc, true, true);
     if (pair === null) return null;
     const closRef: ValType = { kind: "ref", nullable: true, typeIndex: pair.clos };
     const idx = this.mb.declareFunc(
@@ -15498,8 +15532,10 @@ class Assembler {
       // TypeScript's `?` erases, so those two agree. Only the reported
       // number is affected: the thunk's checks still admit a missing
       // defaulted argument (its type carries an undefined arm), so the
-      // body applies its own default exactly like Node.
-      t.params.length,
+      // body applies its own default exactly like Node. The island-rest
+      // form's last declared parameter IS its rest array (unit A1), so it
+      // is excluded the same way.
+      t.rest === true && t.restAbi === "jsval" ? t.params.length - 1 : t.params.length,
     );
     this.mb.setBody(idx, [], c.bytes());
     return idx;
@@ -16201,7 +16237,7 @@ class Assembler {
         return info === null ? null : this.vecs.vecRef(info);
       }
       case "func": {
-        const pair = this.closSigFor(t, loc, true);
+        const pair = this.closSigFor(t, loc, true, true);
         return pair === null ? null : { kind: "ref", nullable: true, typeIndex: pair.clos };
       }
       case "record": {
@@ -16464,9 +16500,10 @@ class Assembler {
         // closSigFor's hard-mapped arm reads below (mapTypeSoft never
         // calls closSigFor itself, but must still agree with it on the
         // trailing slot's shape).
-        if (t.rest === true && t.restAbi === "jsval") return I32;
+        // restAbi "jsval" (unit A1): the declared list IS the signature
+        // (closSigFor's jsvalRest arm) — the same pair, soft-mapped.
         const softParams = t.params.map((p) => this.mapTypeSoft(p));
-        if (t.rest === true) softParams.push(this.restTrailingValType());
+        if (t.rest === true && t.restAbi !== "jsval") softParams.push(this.restTrailingValType());
         const pair = this.closPairFor(
           softParams,
           t.ret.kind === "void" ? [] : [this.mapTypeSoft(t.ret)],
@@ -17894,7 +17931,7 @@ class Assembler {
       case "callValue": {
         const ct = e.callee.type;
         if (ct.kind !== "func") throw new Error("callValue on a non-func callee");
-        const pair = this.closSigFor(ct, e.loc);
+        const pair = this.closSigFor(ct, e.loc, false, true);
         if (pair === null) {
           code.unreachable();
           return;
@@ -19714,6 +19751,27 @@ class Assembler {
           const iterPath = e.fn === "dyn.packPushSpreadIter";
           this.dyn.arrPayload(code, () => this.walkExpr(e.args[0]!));
           this.walkExpr(e.args[1]!);
+          const what = e.args[2];
+          if (!iterPath && what?.kind === "strLit" && what.value === "") {
+            // No CallPrinter rendering for this source (the front end's
+            // v8SpreadSpelling): a nullish one refuses by name.
+            const src = this.acquireScratch(this.dyn.dynRef());
+            code.localTee(src);
+            code.structGet(this.dyn.dynT(), DYN_KIND);
+            code.i32Const(DK.UNDEF);
+            code.i32Eq();
+            code.localGet(src);
+            code.structGet(this.dyn.dynT(), DYN_KIND);
+            code.i32Const(DK.NULL);
+            code.i32Eq();
+            code.i32Or();
+            code.ifVoid();
+            this.emitSetCellErrorLit("%Error", "Error", "spreading null or undefined from this expression into a call is not supported yet", null);
+            code.end();
+            this.emitPendingCheck();
+            code.localGet(src);
+            this.releaseScratch(this.dyn.dynRef(), src);
+          }
           if (iterPath) this.pushStrLit("");
           else this.walkExpr(e.args[2]!);
           code.i32Const(iterPath ? 1 : 0);
@@ -19839,8 +19897,36 @@ class Assembler {
           // not-yet-supported Errors (an accessor descriptor; H-1's
           // non-enumerable OBJ-target write), or answers the target —
           // every path is may-throw, so the site owns the pending check.
+          //
+          // A descriptor the front end could not hold as a dyn value (an
+          // accessor descriptor `{ get() {...} }`, a record with function
+          // fields) arrives as a deferred-fence CLOSURE, which only fires
+          // when CALLED — read as a descriptor it would define `undefined`
+          // silently. Each such descriptor raises its own fence here, at
+          // the defineProperties site, after the target and before any
+          // member is defined.
           this.walkExpr(e.args[0]!);
+          const fenceMessages: { message: string; code: string }[] = [];
+          const descs = e.args[1]!;
+          if (descs.kind === "dynObjLit") {
+            for (const f of descs.fields ?? []) {
+              const v = f.value;
+              if (v.kind !== "dynFrom" || v.value.kind !== "closure") continue;
+              const lifted = this.funcByName.get(v.value.fnName);
+              const only = lifted?.body.length === 1 ? lifted.body[0] : undefined;
+              if (only?.kind === "runtimeFence" && only.code !== "SC9002") fenceMessages.push({ message: only.message, code: only.code });
+            }
+          }
           this.walkExpr(e.args[1]!);
+          if (fenceMessages.length > 0) {
+            const first = fenceMessages[0]!;
+            code.drop();
+            code.drop();
+            this.emitSetCellErrorLit("%Error", "Error", first.message, first.code);
+            this.emitUnwind();
+            code.unreachable();
+            return;
+          }
           code.call(this.dyn.defineProps());
           this.emitPendingCheck();
           return;
@@ -24294,7 +24380,30 @@ class Assembler {
             code.call(this.dyn.arrPush());
             return;
           }
-          this.pushStrLit(what);
+          // The apply-path nullish text names the source as V8's
+          // CallPrinter renders it (the front end's v8SpreadSpelling); a
+          // shape with no known rendering arrives EMPTY and refuses by
+          // name when nullish.
+          const spelling = iterPath || what !== "" ? what : null;
+          if (spelling === null) {
+            const src = this.acquireScratch(dynRef);
+            code.localTee(src);
+            code.structGet(this.dyn.dynT(), DYN_KIND);
+            code.i32Const(DK.UNDEF);
+            code.i32Eq();
+            code.localGet(src);
+            code.structGet(this.dyn.dynT(), DYN_KIND);
+            code.i32Const(DK.NULL);
+            code.i32Eq();
+            code.i32Or();
+            code.ifVoid();
+            this.emitSetCellErrorLit("%Error", "Error", "spreading null or undefined from this expression into a call is not supported yet", null);
+            code.end();
+            this.emitPendingCheck();
+            code.localGet(src);
+            this.releaseScratch(dynRef, src);
+          }
+          this.pushStrLit(spelling ?? what);
           code.i32Const(iterPath ? 1 : 0);
           code.call(this.dyn.spreadPush());
           this.emitPendingCheck();
@@ -27277,17 +27386,16 @@ class Assembler {
             // is a different node). The island-REST ABI form (a trailing
             // `(...args) => ...` collecting surplus arguments as one
             // jsval array — canMarshalTypedFuncIntoIsland's OWN
-            // `t.rest === true` branch) is NOT yet covered by
-            // `dynFnThunk`'s fixed-arity parameter loop; that shape
-            // refuses below rather than silently mis-binding the rest
-            // slot as an ordinary per-argument-converted parameter —
-            // under the SAME stable "expr:jsMarshal" aggregate bucket
-            // every other unimplemented jsMarshal shape uses (the
-            // census-currency rule this case's own `default` arm states
-            // two paragraphs down; a fragmented per-shape name here was
-            // this file's own mistake, not a deliberate exception like
-            // dynFrom's).
-            if (vt.rest === true) {
+            // `t.rest === true` branch) boxes through the same pair
+            // (unit A1): `dynFnThunk` packs every argument past the
+            // leading list into a fresh array for the last slot. Only
+            // the dyn-rest form (restAbi absent — never a legal
+            // jsMarshal source) still refuses, under the SAME stable
+            // "expr:jsMarshal" aggregate bucket every other
+            // unimplemented jsMarshal shape uses (the census-currency
+            // rule this case's own `default` arm states two paragraphs
+            // down).
+            if (vt.rest === true && vt.restAbi !== "jsval") {
               this.refuse(`expr:${e.kind}`, e.loc);
               code.unreachable();
               return;
@@ -28341,11 +28449,116 @@ class Assembler {
             code.unreachable();
             return;
           }
-          // callSpread + globalGet + the literal-adjacent ops that need
-          // engine dispatch — later gates of stage B, not yet wired.
-          case "callSpread":
+          // `f(...pre, ...s)` on an island callee (unit A1): the args
+          // vector is the leading fixed arguments, then the spread
+          // source flattened by `dyn.spreadPush` in its single-last-
+          // spread mode — V8's apply path, whose texts are "<s> is not
+          // iterable (cannot read property null|undefined)" for a nullish
+          // source and "Spread syntax requires ...iterable[Symbol.
+          // iterator] to be a function" for every other non-iterable —
+          // then the ordinary dyn call. JS's order: callee, the leading
+          // arguments, the spread, and only then the callable check.
+          //
+          // `<s>` is V8's CallPrinter rendering of the source expression,
+          // not its source text (`f(1)` prints `f(...)`, `o["x"]` prints
+          // `o.x`, parentheses drop) — rendered by the front end for every
+          // lane (lower-calls.ts's v8SpreadSpelling), which leaves `name`
+          // EMPTY for a shape with no known rendering: a nullish source
+          // there refuses by name instead of naming itself wrongly (the
+          // iterable and non-iterable cases never print it). The callee's own spelling (a non-callable
+          // callee's "<f> is not a function") names a bare identifier and
+          // says "value" otherwise, S018's fallback.
+          case "callSpread": {
+            const pre = e.args[1]!;
+            if (pre.kind !== "jsOp" || pre.op !== "arrLit") {
+              this.refuse(`expr:${e.kind}`, e.loc);
+              code.unreachable();
+              return;
+            }
+            const spelling = e.name === undefined || e.name === "" ? null : e.name;
+            this.walkExpr(e.args[0]!);
+            const fn = this.acquireScratch(this.dyn.dynRef());
+            code.localSet(fn);
+            const argsVec = this.acquireScratch(this.dyn.arrRef());
+            code.f64Const(0);
+            code.call(this.vecs.newLen(this.dynVecInfo()));
+            code.localSet(argsVec);
+            for (const a of pre.args) {
+              code.localGet(argsVec);
+              this.walkExpr(a);
+              code.call(this.dyn.arrPush());
+            }
+            this.walkExpr(e.args[2]!);
+            const src = this.acquireScratch(this.dyn.dynRef());
+            code.localSet(src);
+            if (spelling === null) {
+              code.localGet(src);
+              code.structGet(this.dyn.dynT(), DYN_KIND);
+              code.i32Const(DK.UNDEF);
+              code.i32Eq();
+              code.localGet(src);
+              code.structGet(this.dyn.dynT(), DYN_KIND);
+              code.i32Const(DK.NULL);
+              code.i32Eq();
+              code.i32Or();
+              code.ifVoid();
+              this.emitSetCellErrorLit(
+                "%Error",
+                "Error",
+                "spreading null or undefined from this expression into an island call is not supported yet",
+                null,
+              );
+              code.end();
+              this.emitPendingCheck();
+            }
+            code.localGet(argsVec);
+            code.localGet(src);
+            this.pushStrLit(spelling ?? "");
+            code.i32Const(0);
+            code.call(this.dyn.spreadPush());
+            this.emitPendingCheck();
+            code.localGet(fn);
+            code.localGet(argsVec);
+            this.pushStrLit(this.islandCalleeSpelling(e.args[0]!));
+            code.call(this.dyn.callFn());
+            this.emitPendingCheck();
+            this.releaseScratch(this.dyn.dynRef(), src);
+            this.releaseScratch(this.dyn.dynRef(), fn);
+            this.releaseScratch(this.dyn.arrRef(), argsVec);
+            return;
+          }
+          // `{ ...src }` in an island-native literal (unit A1): the
+          // spec's CopyDataProperties onto the fresh literal, which over
+          // the dyn tree is `dyn.assign`'s copy exactly — nullish and
+          // scalar sources copy nothing, an object its own members in
+          // order, an array/string/bytes its index keys — answering the
+          // target for chaining. The source first passes `dyn.spreadSource`:
+          // a function with an own-property table spreads that table's
+          // enumerable members (what Node's CopyDataProperties copies, and
+          // assign alone does not read), and a caught error's encoding
+          // refuses by name rather than copy its marker.
+          case "objSpread": {
+            const dynRef = this.dyn.dynRef();
+            this.walkExpr(e.args[0]!);
+            const t = this.acquireScratch(dynRef);
+            code.localSet(t);
+            this.walkExpr(e.args[1]!);
+            code.call(this.dyn.spreadSource());
+            const s = this.acquireScratch(dynRef);
+            code.localSet(s);
+            this.emitPendingCheck();
+            code.localGet(t);
+            code.localGet(s);
+            code.call(this.dyn.assign());
+            this.emitPendingCheck();
+            this.releaseScratch(dynRef, s);
+            this.releaseScratch(dynRef, t);
+            return;
+          }
+          // globalGet + the literal-adjacent ops that need engine
+          // dispatch — later gates of stage B, not yet wired.
           case "globalGet":
-          case "tplStrings": case "objSpread": case "defineGetter":
+          case "tplStrings": case "defineGetter":
             this.refuse(`expr:${e.kind}`, e.loc);
             code.unreachable();
             return;
@@ -28503,6 +28716,19 @@ class Assembler {
     if (indent === undefined || indent === "") return;
     this.pushStrLit(indent);
     this.fn.code.call(this.json.indent());
+  }
+
+  /** The callee spelling V8 puts in an island spread call's "<x> is not
+   * a function" (unit A1): a bare identifier names itself — a local, a
+   * parameter or a module global, possibly behind the marshal that boxes
+   * a static closure — and every other shape says "value", the fallback
+   * S018 registers. */
+  private islandCalleeSpelling(callee: WExpr): string {
+    const v = callee.kind === "jsMarshal" ? callee.value : callee;
+    if (v.kind !== "varRef") return "value";
+    const global = this.globalById.get(v.localId);
+    if (global !== undefined) return global.name;
+    return this.fn.localById.get(v.localId)?.name ?? "value";
   }
 
   private localIndex(localId: string): number {

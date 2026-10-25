@@ -4245,6 +4245,59 @@ export class DynBuilder {
     });
   }
 
+  /** %w.dyn.spreadSource(src) → the value an island object spread copies
+   * from (unit A1): a FUNC with an own-property table answers that
+   * table's ENUMERABLE half (an ordinary OBJ, `defineProps`'s enumT), so
+   * `assign` copies exactly the members Node's CopyDataProperties would;
+   * an object carrying the error encoding's `%error` marker (a caught
+   * error held in an `any`) refuses by name, null with the Error pending:
+   * Node's error members are non-enumerable and copy nothing, while the
+   * encoding's would copy, marker included, and make the copy an error
+   * (S021/S025); every other value answers itself. */
+  spreadSource(): number {
+    return this.cached("spreadSource", [this.dynRef()], [this.dynRef()], (idx) => {
+      const c = new Code();
+      const FP = 1;
+      c.localGet(0);
+      c.structGet(this.dynT(), DYN_KIND);
+      c.i32Const(DK.OBJ);
+      c.i32Eq();
+      c.ifVoid();
+      this.objPayload(c, (x) => x.localGet(0));
+      this.deps.lit(c, "%error");
+      c.call(this.objGet());
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifVoid();
+      this.deps.throwError(c, "%Error", "Error", (x) =>
+        this.deps.lit(x, "spreading an error value (an object carrying the reserved %error member) into an island object literal is not supported yet"),
+      );
+      c.refNull(this.dynT());
+      c.return_();
+      c.end();
+      c.end();
+      c.localGet(0);
+      c.structGet(this.dynT(), DYN_KIND);
+      c.i32Const(DK.FUNC);
+      c.i32Eq();
+      c.ifVoid();
+      this.fnPayload(c, (x) => x.localGet(0));
+      c.structGet(this.fnT(), FN_CLOS);
+      c.call(this.fnPropsFind());
+      c.localTee(FP);
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(FP);
+      c.structGet(this.fnPropsT(), 1);
+      c.return_();
+      c.end();
+      c.end();
+      c.localGet(0);
+      this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: this.fnPropsT() }], c.bytes());
+    });
+  }
+
   /** %w.dyn.iterFail(d) — GetIterator's refusal in its VALUE-DESCRIBING
    * form: "<desc> is not iterable (cannot read property
    * Symbol(Symbol.iterator))" where desc names the value ("undefined",
@@ -5754,6 +5807,22 @@ export class DynBuilder {
         x.call(this.toStr());
         x.call(this.deps.concat());
       });
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      // A FUNCTION as the descriptor: legal in Node (its own get/set/
+      // value members are read), but on this tier it is also how the
+      // front end's deferred fence arrives for a descriptor it could not
+      // hold as a dyn value (an accessor `{ get() {...} }`, a record with
+      // function fields) — read as a descriptor that would define
+      // `undefined` silently, so it refuses by name (unit A1 review).
+      c.localGet(DVK);
+      c.i32Const(DK.FUNC);
+      c.i32Eq();
+      c.ifVoid();
+      this.deps.throwError(c, "%Error", "Error", (x) =>
+        this.deps.lit(x, "a function as a property descriptor on a dynamic value is not supported yet"),
+      );
       c.refNull(dynT);
       c.return_();
       c.end();

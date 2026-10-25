@@ -469,6 +469,13 @@ void scr_dyn_arr_push_spread(ScrDyn *arr, const ScrDyn *src, const char *what) {
     return;
   }
   if (src->kind == SCR_DYN_UNDEF || src->kind == SCR_DYN_NULL) {
+    if (what[0] == '\0') {
+      /* No V8 CallPrinter rendering of the source (the front end's
+       * v8SpreadSpelling, board #242): refused by name, SEMANTICS.md S043. */
+      const char *msg = "spreading null or undefined from this expression into a call is not supported yet";
+      scr_throw_error_msg(SCR_ERR_ERROR, msg, strlen(msg));
+      return;
+    }
     ScrJsonBuf b;
     scr_jb_init(&b);
     scr_jb_puts(&b, what);

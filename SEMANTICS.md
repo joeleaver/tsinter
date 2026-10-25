@@ -2884,6 +2884,44 @@ FUNC-only scoping of caller/arguments with the negative control
 its near-miss-name negative control, and the review rigs' g1–g5 +
 h1–h6b probe set (session-15 gate, four rounds).
 
+**Amendment (unit A1): spread calls, object spread and descriptors.** The
+island's spread call (`f(...s)`, jsOp callSpread — now also the lowering of
+a spread call on an `any`-typed callee, which used to be a non-spread
+`apply`) and object spread (`{ ...s }`) are modeled; three shapes fence by
+name, measured against Node v24.18.1:
+- **A nullish spread source V8 renders in a way this tier does not
+  model**: the nullish spread-call TypeError names the source as V8's
+  CallPrinter renders it (`f(1)` → `f(...)`, `o["x"]` → `o.x`, parentheses
+  dropped). The front end renders it for every lane (board #242: the lanes
+  printed the source text verbatim) for identifiers and `this` followed by
+  `.name` / `[name]` / `["name"]` / call chains, and `[digits]` only where
+  the digits are the index's own ToString (V8 prints the VALUE:
+  `o[99999999999999999999]` reads `o[100000000000000000000]`). Any other
+  shape (`o?.x` — Node's "(intermediate value)" — `o["0"]` — Node's `o.0`
+  — `(void 0)`, whitespace, other operators) throws a catchable Error
+  instead: "spreading null or undefined from this expression into a call
+  is not supported yet" on the checked-dynamic call path (a dynamic
+  source), "spreading null or undefined from this expression into an
+  island call is not supported yet" on the island's callSpread. A
+  non-nullish source of any shape is exact.
+- **Spreading an error value** — ANY object carrying the reserved `%error`
+  key, a caught error held in an `any` or user data spelling the key
+  (`{ ...JSON.parse('{"%error":1,"k":2}') }`) — into an island literal
+  throws the catchable "spreading an error value (an object carrying the
+  reserved %error member) into an island object literal is not supported
+  yet", where Node copies its enumerable members (none for an Error, both
+  keys for the user object): the encoding's members would copy, marker
+  included, and make the copy an error (S021; S025 is the user-data side
+  of the same key). `Object.assign` keeps S021's registered answer.
+- **`Object.defineProperties` with a function as a descriptor**, or a
+  descriptor the front end could not hold as a dynamic value (an accessor
+  `{ get() {...} }`, a record with function fields), throws a named Error
+  at the call, where Node reads the descriptor (for the accessor, defines
+  the getter). It used to define `undefined` silently.
+
+**Tested by:** A1-SPREAD-03/05, A1-OSPREAD-03 and A1-DEFPROPS-01 in
+`packages/compiler/test/wasm-island-a.test.ts`.
+
 ## S044 — jsExit of `array<jsval>`: the SPINE aliases on the wasm tier (matching Node); the native island copies it *(per-lane split)*
 
 The validated exit of an `any[]`-declared slot crosses elements BY

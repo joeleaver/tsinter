@@ -6,7 +6,8 @@
  * pass it; every other caller keeps the unconditional default-refuse);
  * mapTypeSoft's func arm builds its own padded closPairFor pair directly
  * (never calls closSigFor); a distinct key, type:func-rest-jsval, covers
- * restAbi "jsval" (still refused, never lifted); the process.onExit arm
+ * restAbi "jsval" (refused when this unit landed; unit A1 has since built
+ * that ABI — see NL-4); the process.onExit arm
  * gained an explicit guard converting a live illegal-cast trap into a named
  * compile-time refusal.
  *
@@ -624,15 +625,21 @@ test("NL-3 process.on('exit') with a rest callback now REFUSES BY NAME at compil
   expect(diags.some((d) => d.includes("type:func-rest") && !d.includes("jsval"))).toBe(true);
 });
 
-test("NL-4 a --dynamic rest forward refuses with the DISTINCT type:func-rest-jsval key, never plain type:func-rest", async () => {
-  const diags = await runRowRefuse(
-    "nl4",
-    "// @dynamic\n'use strict';\nfunction decl(a, b) { return a + b; }\nconst fDecl = (...args) => decl(...args);\nconsole.log(`${fDecl(1, 2)}`);",
-    true,
-    "js",
-  );
-  expect(diags.some((d) => d.includes("type:func-rest-jsval"))).toBe(true);
-  expect(diags.some((d) => d.includes("type:func-rest") && !d.includes("jsval"))).toBe(false);
+// NL-4 pinned, when this unit landed, that a --dynamic rest forward refused
+// with the distinct type:func-rest-jsval key. Unit A1 builds the island-rest
+// ABI (wasm-island-a.test.ts has its rows), so the same forward now runs:
+// the row keeps its point — nothing names plain type:func-rest — and pins
+// Node's answer.
+test("NL-4 a --dynamic rest forward builds (unit A1), and nothing refuses it by plain type:func-rest", async () => {
+  const entry = join(scratch, "nl4.js");
+  await writeFile(entry, "// @dynamic\n'use strict';\nfunction decl(a, b) { return a + b; }\nconst fDecl = (...args) => decl(...args);\nconsole.log(`${fDecl(1, 2)}`);\n");
+  const res = await compile(entry, { outPath: join(scratch, "nl4.wasm"), outDir: scratch, backend: "wasm", dynamic: true });
+  const diags = res.ok ? [] : [...new Set(res.diagnostics.map((d) => `${d.code}:${d.message}`))];
+  expect(diags.some((d) => d.includes("type:func-rest"))).toBe(false);
+  expect(res.ok).toBe(true);
+  if (!res.ok) return;
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(String(stdout)).toBe("3\n");
 });
 
 // NL-6 pinned, when this unit landed, that 2567 refused for dynCall:spread

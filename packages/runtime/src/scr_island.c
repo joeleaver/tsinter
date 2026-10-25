@@ -427,9 +427,12 @@ static const char isl_prelude[] =
      * rest-forwarding idiom's call): REAL spread syntax, so iterator
      * protocols are the engine's own; the guards front-run V8's exact
      * spread-call TypeError texts (nullish spells the spread expression
-     * `w`, everything else the generic Spread-syntax text). */
-    "(f,p,s,w)=>{if(s===undefined||s===null)"
-    "throw new TypeError(w+\" is not iterable (cannot read property \"+s+\")\");"
+     * `w` — V8's CallPrinter rendering, the front end's v8SpreadSpelling,
+     * empty for a shape it cannot render, which refuses by name, board
+     * #242 — everything else the generic Spread-syntax text). */
+    "(f,p,s,w)=>{if(s===undefined||s===null){if(w===\"\")"
+    "throw new Error(\"spreading null or undefined from this expression into an island call is not supported yet\");"
+    "throw new TypeError(w+\" is not iterable (cannot read property \"+s+\")\")}"
     "if(typeof s[Symbol.iterator]!==\"function\")"
     "throw new TypeError(\"Spread syntax requires ...iterable[Symbol.iterator] to be a function\");"
     "return f(...p,...s)},"
