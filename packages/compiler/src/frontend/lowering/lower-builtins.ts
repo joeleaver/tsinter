@@ -6788,26 +6788,29 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
         L.arrHofHelpers.set(key, helper);
         const fRef: IrExpr = { kind: "varRef", localId: "f.0", type: f.type, loc };
         const callF: IrExpr = { kind: "callValue", callee: fRef, args: [], type: ret, loc };
+        // A promise result RESOLVES the helper's promise: adopted (board
+        // #170, Lowerer.adoptPromise) through this hidden slot.
+        const adoptLocal: IrLocal = { id: "%adopt.0", name: "%adopt", type: ret, mutable: false };
         const body: IrStmt[] = [];
         if (inner.kind === "void") {
           // Void settlements: evaluate (awaiting a promise result) and
           // complete — the async machinery fulfills the void promise.
           const effect: IrExpr =
-            ret.kind === "promise" ? { kind: "awaitExpr", value: callF, type: ret.inner, loc } : callF;
+            ret.kind === "promise" ? L.adoptPromise(callF, adoptLocal) : callF;
           body.push({ kind: "exprStmt", expr: effect, loc });
           body.push({ kind: "return", value: null, loc });
         } else {
-          // lowerReturnValue's async rule, mirrored: a promise result
-          // awaits (adoption), a plain result returns directly.
+          // lowerReturnValue's async rule, mirrored: a promise result is
+          // adopted, a plain result returns directly.
           const value: IrExpr =
-            ret.kind === "promise" ? { kind: "awaitExpr", value: callF, type: ret.inner, loc } : callF;
+            ret.kind === "promise" ? L.adoptPromise(callF, adoptLocal) : callF;
           body.push({ kind: "return", value, loc });
         }
         const lifted: IrFunction = {
           name: helper,
           params: [{ localId: "f.0", name: "f", type: f.type }],
           returnType: inner,
-          locals: [{ id: "f.0", name: "f", type: f.type, mutable: true }],
+          locals: [{ id: "f.0", name: "f", type: f.type, mutable: true }, ...(ret.kind === "promise" ? [adoptLocal] : [])],
           body,
           loc,
           async: true,

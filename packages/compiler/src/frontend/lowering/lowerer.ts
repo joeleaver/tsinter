@@ -6060,9 +6060,9 @@ export class Lowerer {
 
   /** The value of a `return` statement. In an async function `return p`
    * where p is a promise flattens (JS: the returned promise's settlement
-   * becomes the async function's result), so it lowers exactly as
-   * `return await p` — the awaitExpr parks the fiber and re-throws
-   * rejections, which IS the flattening. Everything else flows into the
+   * becomes the async function's result) — it is ADOPTED (adoptPromise:
+   * the thenable job's hop, then an await that parks the fiber and
+   * re-throws rejections, which IS the flattening). Everything else flows into the
    * function's return slot through the usual coercion path. */
   /** The value of `return <expr>` against the context's declared return —
    * or NULL for a bare return: `return undefined`/`return null` in a
@@ -6075,10 +6075,45 @@ export class Lowerer {
     const e = this.lowerExpr(node);
     if (expected.kind === "void" && e.kind === "unitLit") return null;
     if (this.ctx.isAsync && e.type.kind === "promise" && expected.kind !== "promise") {
-      const awaited: IrExpr = { kind: "awaitExpr", value: e, type: e.type.inner, loc: e.loc };
-      return this.coerceInto(node, awaited, expected);
+      return this.coerceInto(node, this.adoptPromise(e), expected);
     }
     return this.coerceInto(node, e, expected);
+  }
+
+  /** A promise RESOLVING the current async function's own promise (board
+   * #170): `return p`, an async concise body `async () => p`, a typed
+   * `.then` handler's returned promise. ECMA-262's resolve function adopts
+   * a thenable through NewPromiseResolveThenableJob — one job — whose
+   * `p.then` then costs what an await costs, so adoption is a HOP and THEN
+   * the await: `p` evaluates first, the hop yields one turn, and the
+   * subscription to `p` lands inside that turn (Node's registration order
+   * on `p`), its settlement resuming one job later. Plain `return await p`
+   * stays a single await. An async GENERATOR's `return p` is the spec's
+   * single Await (no resolve function is involved), so it keeps the
+   * plain await. */
+  adoptPromise(p: IrExpr, local?: IrLocal): IrExpr {
+    if (p.type.kind !== "promise") throw new Error("adoptPromise of a non-promise");
+    const loc = p.loc;
+    const inner = p.type.inner;
+    if (local === undefined && this.ctx.generator) return { kind: "awaitExpr", value: p, type: inner, loc };
+    const tmp = local ?? this.declareHiddenLocal("%adopt", p.type);
+    // `p` into the slot, then the hop — the `await <void>` lowering's own
+    // seqExpr shape (operand statements, hop as the result), so every
+    // lane's suspension handling already knows it — then the await.
+    const hop: IrExpr = {
+      kind: "seqExpr",
+      stmts: [{ kind: "varDecl", localId: tmp.id, init: p, loc }],
+      result: { kind: "libCall", fn: "async.hop", args: [], type: VOID, loc },
+      type: VOID,
+      loc,
+    };
+    return {
+      kind: "seqExpr",
+      stmts: [{ kind: "exprStmt", expr: hop, loc }],
+      result: { kind: "awaitExpr", value: { kind: "varRef", localId: tmp.id, type: p.type, loc }, type: inner, loc },
+      type: inner,
+      loc,
+    };
   }
 
   /** `return <expr>` lowered as a STATEMENT against the declared return.
@@ -6091,9 +6126,7 @@ export class Lowerer {
     const expected = this.ctx.returnType;
     if (expected.kind === "void") {
       let e = this.lowerExpr(node);
-      if (this.ctx.isAsync && e.type.kind === "promise") {
-        e = { kind: "awaitExpr", value: e, type: e.type.inner, loc: e.loc };
-      }
+      if (this.ctx.isAsync && e.type.kind === "promise") e = this.adoptPromise(e);
       if (e.kind === "unitLit") return { kind: "return", value: null, loc };
       if (e.type.kind === "void") return { kind: "return", value: e, loc };
       return {

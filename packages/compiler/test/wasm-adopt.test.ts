@@ -21,7 +21,7 @@
  * stated beside it: an unhandled rejection reported as SEMANTICS.md S010
  * registers it, or the named refusal for a non-promise thenable (Joe's
  * ruling: full thenable adoption is not built). Typed promises resolved
- * with promises (board #170) stay S083's and are rowed in
+ * with promises (board #170, retired from S083) are rowed in
  * wasm-async-u4.test.ts. */
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";

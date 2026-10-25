@@ -5429,7 +5429,11 @@ const inliningPredicates = new Set<ts.Symbol>();
           if (ts.isVoidExpression(stripped)) {
             body = [L.lowerExprStatement(stripped)];
           } else {
-            const value = L.lowerExpr(bodyExpr);
+            let value = L.lowerExpr(bodyExpr);
+            // `async (): Promise<void> => p`: the function's promise is
+            // RESOLVED with p, so it adopts p (Lowerer.adoptPromise) —
+            // dropping the value would settle before p does.
+            if (isAsync && value.type.kind === "promise") value = L.adoptPromise(value);
             body = value.kind === "unitLit" ? [] : [{ kind: "exprStmt", expr: value, loc: locOf(node.body!) }];
           }
         } else {
@@ -5437,9 +5441,9 @@ const inliningPredicates = new Set<ts.Symbol>();
           // An async concise body whose value is itself a promise
           // (`async () => p`): the async machinery RESOLVES the returned
           // thenable into the function's own promise — lowerReturnValue's
-          // await-through, applied to the implicit return.
+          // adoption (Lowerer.adoptPromise), applied to the implicit return.
           if (isAsync && value.type.kind === "promise" && bodyReturn.kind !== "promise") {
-            value = { kind: "awaitExpr", value, type: value.type.inner, loc: value.loc };
+            value = L.adoptPromise(value);
           }
           body =
             value.type.kind === "void" && L.wrappedUndefined(bodyReturn, locOf(node.body!))
@@ -5869,23 +5873,19 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
           type: cb.type.ret,
           loc,
         };
-        // The handler's result: promise returns flatten exactly like
-        // `return p` in any async body (awaitExpr re-throws rejections —
-        // the spec's thenable adoption); everything else coerces into R.
+        // The handler's result: promise returns are ADOPTED exactly like
+        // `return p` in any async body (Lowerer.adoptPromise — the spec's
+        // thenable job, then the await, which re-throws rejections);
+        // everything else coerces into R.
         if (R.kind === "void") {
           if (handlerCall.type.kind === "promise") {
-            body.push({
-              kind: "exprStmt",
-              expr: { kind: "awaitExpr", value: handlerCall, type: handlerCall.type.inner, loc },
-              loc,
-            });
+            body.push({ kind: "exprStmt", expr: L.adoptPromise(handlerCall), loc });
           } else {
             body.push({ kind: "exprStmt", expr: handlerCall, loc });
           }
           body.push({ kind: "return", value: null, loc });
         } else if (handlerCall.type.kind === "promise" && R.kind !== "promise") {
-          const awaited: IrExpr = { kind: "awaitExpr", value: handlerCall, type: handlerCall.type.inner, loc };
-          body.push({ kind: "return", value: L.coerceInto(call, awaited, R), loc });
+          body.push({ kind: "return", value: L.coerceInto(call, L.adoptPromise(handlerCall), R), loc });
         } else {
           body.push({ kind: "return", value: L.coerceInto(call, handlerCall, R), loc });
         }

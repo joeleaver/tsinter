@@ -847,50 +847,44 @@ test("E02 EVERYTHING-VALID: every value of a typed async path, in order, with an
 // S083
 // ============================================================
 
-test("S01 S083: S083 a then handler returns a promise: adoption lands one job early", async () => {
-  // Node v24 prints "o1\no2\no3\nadopted 9\no4\no5\n" — the registered divergence (S083).
+test("S01 S083: a then handler returns a promise: adopted with Node's two jobs (board #170)", async () => {
   const { stdout, stderr, exitCode } = await runRow("S01", "async function other(): Promise<number> { return 9; }\nPromise.resolve(1).then(() => other()).then((v) => console.log(\"adopted\", v));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));", "ts");
-  expect(stdout).toBe("o1\no2\nadopted 9\no3\no4\no5\n");
+  expect(stdout).toBe("o1\no2\no3\nadopted 9\no4\no5\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
 
-test("S02 S083: S083 an async function's return of a promise: one job early", async () => {
-  // Node v24 prints "o1\no2\nasync-return-p 9\no3\no4\no5\n" — the registered divergence (S083).
+test("S02 S083: an async function's return of a promise: adopted with Node's two jobs (board #170)", async () => {
   const { stdout, stderr, exitCode } = await runRow("S02", "async function other(): Promise<number> { return 9; }\nasync function f(): Promise<number> { return other(); }\nf().then((v) => console.log(\"async-return-p\", v));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));", "ts");
-  expect(stdout).toBe("o1\nasync-return-p 9\no2\no3\no4\no5\n");
+  expect(stdout).toBe("o1\no2\nasync-return-p 9\no3\no4\no5\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
 
-test("S03 S083: S083 nested adoption: one job early", async () => {
-  // Node v24 prints "o1\no2\no3\no4\no5\nnested 9\n" — the registered divergence (S083).
+test("S03 S083: nested adoption: Node's order (board #170)", async () => {
   const { stdout, stderr, exitCode } = await runRow("S03", "async function other(): Promise<number> { return 9; }\nPromise.resolve(1).then(() => Promise.resolve(1).then(() => other())).then((v) => console.log(\"nested\", v));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));", "ts");
-  expect(stdout).toBe("o1\no2\no3\no4\nnested 9\no5\n");
+  expect(stdout).toBe("o1\no2\no3\no4\no5\nnested 9\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
 
-test("S04 S083: S083 a rejected promise adopted: one job early", async () => {
-  // Node v24 prints "o1\no2\no3\no4\nrejected-adopt\no5\n" — the registered divergence (S083).
+test("S04 S083: a rejected promise adopted: Node's order (board #170)", async () => {
   const { stdout, stderr, exitCode } = await runRow("S04", "async function bad(): Promise<number> { throw new Error(\"r\"); }\nPromise.resolve(1).then(() => bad()).then((v) => console.log(\"never\", v)).catch((e: unknown) => console.log(\"rejected-adopt\"));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));", "ts");
-  expect(stdout).toBe("o1\no2\no3\nrejected-adopt\no4\no5\n");
+  expect(stdout).toBe("o1\no2\no3\no4\nrejected-adopt\no5\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
 
-test("S05 S083: S083 a handler returns Promise.resolve: one job early", async () => {
-  // Node v24 prints "o1\no2\no3\nresolved-p 9\no4\no5\n" — the registered divergence (S083).
+test("S05 S083: a handler returns Promise.resolve: Node's order (board #170)", async () => {
   const { stdout, stderr, exitCode } = await runRow("S05", "Promise.resolve(1).then(() => Promise.resolve(9)).then((v) => console.log(\"resolved-p\", v));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));", "ts");
-  expect(stdout).toBe("o1\no2\nresolved-p 9\no3\no4\no5\n");
+  expect(stdout).toBe("o1\no2\no3\nresolved-p 9\no4\no5\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
 
-test("S06 S083: S083 a catch handler returns a promise: one job early", async () => {
-  // Node v24 prints "o1\no2\no3\ncatch-adopt 9\no4\no5\n" — the registered divergence (S083).
+test("S06 S083: a catch handler returns a promise: Node's order (board #170)", async () => {
   const { stdout, stderr, exitCode } = await runRow("S06", "async function bad(): Promise<number> { throw new Error(\"x\"); }\nasync function other(): Promise<number> { return 9; }\nbad().catch(() => other()).then((v) => console.log(\"catch-adopt\", v));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));", "ts");
-  expect(stdout).toBe("o1\no2\ncatch-adopt 9\no3\no4\no5\n");
+  expect(stdout).toBe("o1\no2\no3\ncatch-adopt 9\no4\no5\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
@@ -903,10 +897,9 @@ test("S07 S083: S083 a finally handler's returned promise is not waited for", as
   expect(exitCode).toBe(0);
 });
 
-test("S08 S083: S083 then-chain adoption against a four-step observer", async () => {
-  // Node v24 prints "sync\no1\no2\no3\nadopted 9\no4\n" — the registered divergence (S083).
+test("S08 S083: then-chain adoption against a four-step observer: Node's order (board #170)", async () => {
   const { stdout, stderr, exitCode } = await runRow("S08", "async function good(): Promise<number> { return 5; }\nasync function other(): Promise<number> { return 9; }\ngood().then(() => other()).then((v) => console.log(\"adopted\", v));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\"));\nconsole.log(\"sync\");", "ts");
-  expect(stdout).toBe("sync\no1\no2\nadopted 9\no3\no4\n");
+  expect(stdout).toBe("sync\no1\no2\no3\nadopted 9\no4\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
@@ -963,6 +956,97 @@ test("S16 S083: S083 an awaited dynamic import of a module that itself awaits", 
   // Node v24 prints "sync\no1\no2\no3\no4\nm-start\no5\nm-after-await\no6\nimported 8\n" — the registered divergence (S083).
   const { stdout, stderr, exitCode } = await runRowDir("S16", { "m.ts": "console.log(\"m-start\");\nawait Promise.resolve();\nconsole.log(\"m-after-await\");\nexport const v = 8;", "main.ts": "// @dynamic\n// an ASYNC imported module (it awaits during its own evaluation): the bridge adopts its evaluation promise\nasync function main(): Promise<void> {\n  const ns = await import(\"./m.ts\");\n  console.log(`imported ${ns.v}`);\n}\nmain();\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\")).then(() => console.log(\"o6\"));\nconsole.log(\"sync\");" });
   expect(stdout).toBe("sync\nm-start\no1\nm-after-await\no2\no3\no4\no5\nimported 8\no6\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("S17 S083: a void async function's return of a void promise: adopted with Node's two jobs (board #170)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("S17", "async function other(): Promise<void> { console.log(\"in\"); }\nasync function f(): Promise<void> { return other(); }\nf().then(() => console.log(\"void-return-p\"));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("in\nsync\no1\no2\nvoid-return-p\no3\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("S18 S083: an async concise arrow returning a promise: adopted (board #170)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("S18", "async function other(): Promise<number> { return 9; }\nconst f = async (): Promise<number> => other();\nf().then((v) => console.log(\"arrow-p\", v));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\no1\no2\narrow-p 9\no3\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("S19 S083: an async function returning a REJECTED promise: the rejection lands where Node's does (board #170)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("S19", "async function bad(): Promise<number> { throw new Error(\"b\"); }\nasync function f(): Promise<number> { return bad(); }\nf().then((v) => console.log(\"never\", v)).catch((e: unknown) => console.log(\"rej-return\", String(e)));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\no1\no2\no3\nrej-return Error: b\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("S20 S083: an async function returning a PENDING promise settled by a timer (board #170)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("S20", "function later(): Promise<number> { return new Promise<number>((r) => setTimeout(() => r(4), 0)); }\nasync function f(): Promise<number> { return later(); }\nf().then((v) => console.log(\"pending\", v));\nsetTimeout(() => { Promise.resolve().then(() => console.log(\"t1\")).then(() => console.log(\"t2\")).then(() => console.log(\"t3\")); }, 0);\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\no1\no2\no3\no4\no5\npending 4\nt1\nt2\nt3\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("S21 S083: a conditional return of a promise (board #170)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("S21", "async function other(): Promise<number> { return 9; }\nasync function f(c: boolean): Promise<number> { if (c) return other(); return 3; }\nf(true).then((v) => console.log(\"cond\", v));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\no1\no2\ncond 9\no3\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("S22 S083: a void async concise arrow returning a promise waits for it, adopted (board #170)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("S22", "async function other(): Promise<void> { await null; console.log(\"in\"); }\nconst f = async (): Promise<void> => other();\nf().then(() => console.log(\"void-arrow\"));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\nin\no1\no2\nvoid-arrow\no3\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("S23 S083: Promise.try's promise-returning callback: adopted (board #170)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("S23", "async function other(): Promise<number> { return 9; }\nPromise.try(() => other()).then((v) => console.log(\"try\", v));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\no1\no2\ntry 9\no3\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("S24 S083: a promise returned from inside a loop, two calls interleaved (board #170)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("S24", "async function other(i: number): Promise<number> { return i; }\nasync function f(i: number): Promise<number> { for (let k = 0; k < 3; k++) { if (k === i) return other(k * 10); } return -1; }\nf(1).then((v) => console.log(\"loop\", v));\nf(2).then((v) => console.log(\"loop\", v));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\no1\no2\nloop 10\nloop 20\no3\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("S25 S083: a then handler returning a void promise (board #170)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("S25", "async function other(): Promise<void> { console.log(\"in\"); }\nPromise.resolve(1).then(() => other()).then(() => console.log(\"then-void-p\"));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\nin\no1\no2\no3\nthen-void-p\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("S26 S083: two async functions each returning the next one's promise (board #170)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("S26", "async function other(): Promise<number> { return 9; }\nasync function g(): Promise<number> { return other(); }\nasync function f(): Promise<number> { return g(); }\nf().then((v) => console.log(\"chain2\", v));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\no1\no2\no3\nchain2 9\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("S27 S083: a promise returned into a union-typed async result (board #170)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("S27", "async function other(): Promise<string> { return \"s\"; }\nasync function f(): Promise<string | number> { return other(); }\nf().then((v) => console.log(\"union\", v));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
+  expect(stdout).toBe("sync\no1\no2\nunion s\no3\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("S28 S083: plain JavaScript: an untyped async function returning another's promise (board #170)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("S28", "async function other() { return 7; }\nasync function f() { return other(); }\nf().then((v) => console.log(\"f\", v, typeof v));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "cjs");
+  expect(stdout).toBe("sync\no1\no2\nf 7 number\no3\no4\no5\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("S29 S083: plain JavaScript: an untyped async concise arrow returning another's promise (board #170)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("S29", "const other = async () => 7;\nconst f = async () => other();\nf().then((v) => console.log(\"f\", v, typeof v));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\"));\nconsole.log(\"sync\");", "cjs");
+  expect(stdout).toBe("sync\no1\no2\nf 7 number\no3\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });

@@ -6084,50 +6084,42 @@ race, divergent cell + agreeing `.mjs` twin) in `packages/compiler/test/wasm-fun
 CommonJS-mode `.ts` cell and the native (llvm, c) lanes are MEASURED, not pinned by a row. Measured
 against Node v24.18.1 and this tier's own llvm/c/wasm lanes.
 
-## S083 — a TYPED promise resolved with another promise settles EARLY on every tsinter lane: Node's two extra microtask jobs are not taken, and a typed `.finally` handler's returned promise is not waited for; a dynamic `import()` evaluates its module at a different microtask position than Node *(llvm, c and wasm)*
+## S083 — a typed `.finally` handler's returned promise is not waited for, and a dynamic `import()` evaluates its module at a different microtask position than Node, on every tsinter lane *(llvm, c and wasm)*
 
-When a promise is resolved WITH another promise (a `then`/`catch` handler returns a promise, an async
-function returns one without `await`, a promise is nested inside another), Node adopts it through the
-spec's thenable job: the outer promise settles TWO microtask jobs after the inner one does, so a chain of
-observers scheduled beside it runs two more steps first. This tier's statically typed promise path settles
-the outer promise ONE job after the inner one, on every lane. The difference is visible only to code that
-interleaves other microtasks with the adoption; the settled VALUE is Node's in every measured cell.
+A typed `.finally` handler that RETURNS a promise: Node waits for the returned promise (and then the
+adoption jobs) before settling the derived promise. Beside a chain of observers `o1 … o5` (`|` separates
+lines; Node v24.18.1 and this tier's llvm, c and wasm lanes, which agree) Node prints
+`o1|o2|o3|finally-adopt 3|o4|o5`. This tier does not wait for the handler's promise at all. It settles the
+derived promise from the original value and prints `o1|finally-adopt 3|o2|o3|o4|o5`. The cause is the
+front end's lowering: a typed `.finally` callback is accepted only as `() => void`, and the returned
+promise is dropped as the void value before any adoption could see it.
 
-Measured cells, each a program racing the adoption against a chain of observers `o1 … o5` (`|` separates
-lines; Node v24.18.1 and this tier's llvm, c and wasm lanes — the three lanes agree cell for cell):
-- a `then` handler returns a promise: Node `o1|o2|o3|adopted 9|o4|o5`; tier `o1|o2|adopted 9|o3|o4|o5`.
-- a `catch` handler returns a promise: Node `o1|o2|o3|catch-adopt 9|o4|o5`; tier `o1|o2|catch-adopt 9|o3|o4|o5`.
-- a handler returns `Promise.resolve(9)`: Node `o1|o2|o3|resolved-p 9|o4|o5`; tier `o1|o2|resolved-p 9|o3|o4|o5`.
-- a nested adoption (a handler returns a chain that itself adopts): Node `o1|o2|o3|o4|o5|nested 9`; tier
-  `o1|o2|o3|o4|nested 9|o5`.
-- a rejected promise adopted: Node `o1|o2|o3|o4|rejected-adopt|o5`; tier `o1|o2|o3|rejected-adopt|o4|o5`.
-- an async function's `return p` (no `await`): Node `o1|o2|async-return-p 9|o3|o4|o5`; tier
-  `o1|async-return-p 9|o2|o3|o4|o5`.
-- a then-chain against a four-step observer: Node `sync|o1|o2|o3|adopted 9|o4`; tier
-  `sync|o1|o2|adopted 9|o3|o4`.
+**A promise resolved WITH another promise — RETIRED (board #170; every lane).** This entry used to
+register the typed adoption cells. Node adopts a promise resolved with a promise through the spec's thenable
+job: the outer promise settles TWO jobs after the inner one, where this tier settled it one job after. That
+covers a `then`/`catch` handler returning a promise, an async function's `return p` without `await`, an
+async concise arrow `async () => p`, and `Promise.try`'s callback. The front end lowers each of these as a
+`return await p`. They are now ADOPTED: `p` evaluates, one microtask hop stands for
+NewPromiseResolveThenableJob, and then the await subscribes to `p` from inside that job. That is Node's two
+jobs, with Node's registration order on `p`. Every lane runs the same IR (`Lowerer.adoptPromise`). The
+formerly divergent cells now print Node's answers on llvm, c and wasm:
+- a `then` handler returning a promise prints `o1|o2|o3|adopted 9|o4|o5`;
+- a `catch` handler, `o1|o2|o3|catch-adopt 9|o4|o5`;
+- a handler returning `Promise.resolve(9)`, `o1|o2|o3|resolved-p 9|o4|o5`;
+- a nested adoption, `o1|o2|o3|o4|o5|nested 9`;
+- a rejected promise adopted, `o1|o2|o3|o4|rejected-adopt|o5`;
+- an async function's `return p`, `o1|o2|async-return-p 9|o3|o4|o5`;
+- the four-step then-chain, `sync|o1|o2|o3|adopted 9|o4`;
+- plain JavaScript's untyped `async function f() { return g(); }` and `const f = async () => g();` in a
+  `.cjs`, `sync|o1|o2|f 7 number|o3`.
 
-A typed `.finally` handler that RETURNS a promise is a separate, larger difference: Node waits for the
-returned promise (and then the adoption jobs) before settling the derived promise, printing
-`o1|o2|o3|finally-adopt 3|o4|o5`; this tier does not wait for the handler's promise at all and settles the
-derived promise from the original value, printing `o1|finally-adopt 3|o2|o3|o4|o5`.
+An async void concise arrow `async (): Promise<void> => p` used to drop `p` without waiting for it, and so
+settled before `p` did. It now adopts `p` like any other return. An async GENERATOR's `return p` is the
+spec's single Await (no resolve function is involved) and keeps the plain await. These were always Node's
+and are unaffected: `return await p` (`o1|return-await 9|o2|…`), a plain `await p` (`await 9|o1|…`),
+`Promise.resolve(p) === p` (true, settling before `o1`), and an awaited value returned.
 
-**Unaffected (every lane agrees with Node):** `return await p` (`o1|return-await 9|o2|…`), a plain
-`await p` (`await 9|o1|…`), `Promise.resolve(p) === p` (true, and it settles before `o1`), an awaited value
-returned from an async function. The adoption cells cover every promise the front end types
-statically, and that includes plain JavaScript, whose types it infers: an untyped
-`async function f() { return g(); }` (or `const f = async () => g();`) in a `.cjs` file, beside an
-`o1 … o3` chain, prints (Node) `sync|o1|o2|f 7 number|o3` and (llvm, c and wasm)
-`sync|o1|f 7 number|o2|o3` — the same one-job-early adoption. `.then` / `.catch` / `.finally` called on
-an `unknown`- or `any`-typed (checked-dynamic) promise, and a promise held in an `any` that another
-promise is resolved with or that is awaited, are outside this entry (they adopt with Node's timing on the
-wasm lane; see the retired paragraph below).
-
-**Why typed code cannot be fixed in the backend:** the frontend rewrites an async function's `return p` into
-`return await p` and lowers a typed `.then(cb)` / `.catch(cb)` / `.finally(cb)` into a small async function
-that awaits the receiver and then the handler's result, so the backend receives identical code for the
-shapes Node distinguishes. Board #170 owns the frontend fix; this entry registers the CURRENT behavior.
-
-**Dynamic `import()` timing (registered beside the adoption cells; measured separately):** the tier
+**Dynamic `import()` timing (measured separately):** the tier
 evaluates a dynamically imported module at a different microtask position than Node relative to
 observers scheduled beside the `import()` call. A program importing a synchronous module beside
 `o1 … o5` prints (Node) `sync|o1|o2|o3|o4|m-init|o5|imported 7`, (wasm)
@@ -6170,15 +6162,17 @@ own return value, inside the handler, before the derived promise's resolve funct
 fulfils with the held value (a registered divergence of this entry, wasm lane). Rows TY01–TY19 in `wasm-adopt.test.ts` (TY19 pins the
 handler cell).
 
-**Scope:** llvm, c and wasm; promises the front end types statically (declared or inferred, in
-TypeScript and in plain JavaScript); `import()` on every lane as stated.
+**Scope:** llvm, c and wasm; a typed `.finally` callback's returned promise; `import()` on every lane as
+stated.
 
-**Tested by:** S01–S08 and S15–S16 (the divergent cells, asserting this
-tier's order with Node's in a comment), S09–S12 (the agreeing controls) and S13 (a late `catch` against
+**Tested by:** S07 and S15–S16 (the divergent cells, asserting this tier's order with Node's in a
+comment), S01–S06, S08 and S17–S29 (the retired adoption cells, now asserting Node's answers), S09–S12
+(the agreeing controls) and S13 (a late `catch` against
 `rejectionHandled`: the wasm lane prints Node's `unhandled|late catch|rejectionHandled`; the llvm and
 c lanes print `unhandled|rejectionHandled|late catch`, a native-only divergence owned by board #180 —
 not an adoption cell, recorded here because the row is this entry's control) in
-`packages/compiler/test/wasm-async-u4.test.ts`. The llvm and c lanes are MEASURED, not pinned by a row.
+`packages/compiler/test/wasm-async-u4.test.ts`. The llvm and c lanes are MEASURED, not pinned by a row
+(board #170's cells re-measured on llvm and c at the retirement: every one prints Node's answer).
 Measured against Node v24.18.1 and this tier's own llvm/c/wasm lanes.
 
 ## S084 — a record field typed `void` is DROPPED from the object on every tsinter lane: `Object.keys` omits it and `"w" in r` answers false, where Node keeps the key holding `undefined` *(llvm, c and wasm — RETIRED by board #178)*
