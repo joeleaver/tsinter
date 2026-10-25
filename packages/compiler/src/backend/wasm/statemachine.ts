@@ -1260,6 +1260,10 @@ const HOIST_SLOTS: Partial<Record<IrExpr["kind"], HoistSlot[]>> = {
   // ever seeing the suspension underneath, declining at the wrapper
   // instead (fn:generator:yield-position) with the yield never reached.
   dynCheck: ["value"],
+  // The island's validated exit — one operand, the same rationale (#227:
+  // `const body: string = await res.text()` wraps the await in it). A
+  // jsval temp is an ordinary dyn slot on this tier (jsval ≡ dyn).
+  jsExit: ["value"],
   // Type-only and tag-only nodes: one operand, nothing else to order.
   upcast: ["value"],
   downcast: ["value"],

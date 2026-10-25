@@ -337,6 +337,13 @@ export interface LowerOptions {
    * path.delimiter / os.EOL lower as the win32 literals; path.posix and
    * path.win32 keep answering THEIR platform everywhere, like Node's. */
   targetPlatform?: string;
+  /** The build's backend supplies `fetch` through its host (the WasmGC
+   * tier's one `fetch` import, SEMANTICS.md S098): the fetch slice —
+   * fetch(), the AbortSignal statics and the island-backed ambient types
+   * (ISLAND_AMBIENT_TYPES) — lowers to its island ops without --dynamic,
+   * and the module itself serves them. compile() sets it for the wasm
+   * backend only; the native lanes keep the requires-dynamic diagnostic. */
+  hostFetch?: boolean;
   /** Node's startup refusal (LoadResult.startupCrash — preflight's
    * resolution walk and CJS named-import link check): the program
    * compiles to that startup crash. */
@@ -368,6 +375,8 @@ export interface LowererMode {
   /** The build's target platform (LowerOptions.targetPlatform — lowerToIr
    * passes it to every pass). Defaults to the host. */
   targetPlatform?: string;
+  /** LowerOptions.hostFetch — lowerToIr passes it to every pass. */
+  hostFetch?: boolean;
   /** Node's startup refusal (preflight's resolution walk / CJS named-
    * import link check): %main opens with exactly this throw, before any
    * module init — Node refuses the whole graph before anything evaluates,
@@ -407,6 +416,7 @@ export function lowerToIr(
 ): LowerResult {
   const dynamic = options.dynamic ?? false;
   const targetPlatform = options.targetPlatform ?? process.platform;
+  const hostFetch = options.hostFetch ?? false;
   const startupCrash = options.startupCrash ?? null;
   // --dynamic: modules reachable only through dynamic import() of the
   // program's own files join the compiled graph here, ONCE, before any
@@ -427,6 +437,7 @@ export function lowerToIr(
   const ffiImports = options.ffiImports ?? [];
   const validation = new Lowerer(program, entry, moduleOrder, dynamic, {
     targetPlatform,
+    hostFetch,
     ffiImports,
   });
   const ffiValidation = validateFfiImports(validation);
@@ -440,6 +451,7 @@ export function lowerToIr(
     ? validation
     : new Lowerer(program, entry, moduleOrder, dynamic, {
         targetPlatform,
+        hostFetch,
         ffiImports,
         ffiBindingSymbols: ffiValidation.symbolsByName,
       });
@@ -447,6 +459,7 @@ export function lowerToIr(
   const emit = new Lowerer(program, entry, moduleOrder, dynamic, {
     reachable,
     targetPlatform,
+    hostFetch,
     startupCrash,
     ffiImports,
     ffiBindingSymbols: ffiValidation.symbolsByName,
@@ -460,6 +473,7 @@ export function lowerToIr(
     remainder: true,
     alreadyFlushed: emit.flushedSymbols,
     targetPlatform,
+    hostFetch,
     ffiImports,
     ffiBindingSymbols: ffiValidation.symbolsByName,
   });
@@ -1204,6 +1218,8 @@ export class Lowerer {
    * selects the platform-keyed builtin surfaces (builtinModuleFnsOf /
    * builtinModuleConstOf in surfaces.ts). */
   readonly targetPlatform: string;
+  /** LowererMode.hostFetch: the fetch slice lowers without --dynamic. */
+  readonly hostFetch: boolean;
   /** LowererMode.startupCrash — buildMain opens %main with the throw. */
   readonly startupCrash: StartupCrash | null;
   /** Outbound native bindings by their source-level ambient name. */
@@ -1262,6 +1278,7 @@ export class Lowerer {
     this.remainder = mode.remainder ?? false;
     this.alreadyFlushed = mode.alreadyFlushed ?? new Set();
     this.targetPlatform = mode.targetPlatform ?? process.platform;
+    this.hostFetch = mode.hostFetch ?? false;
     this.startupCrash = mode.startupCrash ?? null;
     this.ffiImports = mode.ffiImports ?? [];
     this.ffiImportsByName = new Map(this.ffiImports.map((entry) => [entry.name, entry]));
@@ -1283,6 +1300,7 @@ export class Lowerer {
       isStdlibFile: this.isStdlibFile,
       isNpmFile: this.isNpmFile,
       dynamic: this.dynamic,
+      hostFetch: this.hostFetch,
       // fileTag is filled just below; the hook is only ever CALLED during
       // lowering, long after the constructor completes.
       isProgramFile: (sf) => this.fileTag.has(sf),

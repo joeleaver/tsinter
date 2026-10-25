@@ -5514,7 +5514,7 @@ export class JsonBuilder {
         c.i32Const(DK.HANDLE);
         c.i32Eq();
         c.ifVoid();
-        this.deps.throwError(c, "%Error", "Error", (x) => this.deps.lit(x, "JSON.stringify of a net handle is not supported yet"));
+        this.deps.throwError(c, "%Error", "Error", (x) => this.deps.lit(x, `JSON.stringify of a ${dyn.handleNoun()} is not supported yet`));
         c.i32Const(0);
         c.return_();
         c.end();

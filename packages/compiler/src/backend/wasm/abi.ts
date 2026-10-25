@@ -1165,6 +1165,76 @@
  *     stdinCall's EFFECT TIER: that the records are fd 0's bytes, in order,
  *     is enforced by NOTHING — the harness's own rows are the check.
  *
+ *   (import "tsinter" "fetch" (func (param i32 i32 i32 i32 i32) (result i32)))
+ *     [fetch modules only — #227: those calling the global fetch() (the
+ *     AbortSignal statics alone do not mint it); such a module is an EVENT
+ *     MODULE (evPoll, _loop) whose poll phase reads source 6 and hands the
+ *     host-event sources 3-5 to hostev.ts. A module reaching node:net or
+ *     child_process's asynchronous spawn as well refuses at compile time
+ *     (fetch:with-net-or-child). Always the LAST import.]
+ *     fetch(op, ptr, len, h, x) -> i32: the HOST's own fetch, asked for
+ *     plain data only. The request, redirect, decoding and error answers
+ *     are the host's (SEMANTICS.md S098); every value a program sees — the
+ *     promise, Response, Headers, the body readers, AbortSignal.timeout and
+ *     the errors' classes — is built by the module (fetch.ts). Strings are
+ *     UTF-16 runs as in netCall (a u32 count, the units, padding to 4); a
+ *     BLOB is a u32 byte count, the bytes, padding to 4.
+ *       op 1 START(ptr, len, 0, x) request at ptr: u32 body kind (0 none,
+ *                               1 a string — the blob is its UTF-8, which
+ *                               the host decodes and sends as a string, so
+ *                               its own defaults apply (Node's text/plain
+ *                               content type) — 2 bytes), u32 header count,
+ *                               u32 given (bit 0: the program gave a
+ *                               method, bit 1: a redirect mode; a field
+ *                               not given takes the host's default, and a
+ *                               given one — the empty string included —
+ *                               is the host's to check), the method's run,
+ *                               the URL's run (as the program gave it), the
+ *                               redirect mode's run, count (name, value) run pairs in
+ *                               the program's order, then the body's blob
+ *                               when the kind is not 0. Answers the
+ *                               request's handle (>= 1; its own handle
+ *                               space), whose outcome arrives as events;
+ *                               or -1 when the host refuses the request
+ *                               before sending it (Node's Request
+ *                               constructor throwing: an invalid URL,
+ *                               method or header, a body on GET or HEAD,
+ *                               credentials in the URL): it then writes an
+ *                               ERROR RECORD over ptr (x is the room the
+ *                               module left there, at least 16384 bytes).
+ *       op 2 ABORT(0, 0, h)     -> 0. The module aborted h (its signal
+ *                               fired): the host cancels it, drops every
+ *                               event it holds for h and never names h
+ *                               again.
+ *     THE ERROR RECORD: the error's name run, its message run, u32 hasCause
+ *     (0 or 1), then — when 1 — the cause's name, message and code runs
+ *     (an empty code = none). The module builds a TypeError, RangeError or
+ *     SyntaxError for those names, otherwise an Error carrying the name;
+ *     a cause is reachable as the error's `cause` (name, message, code).
+ *     EVENTS, evPoll source 6, `handle` the request:
+ *       1 HEAD   the response's head: a = the status, b = flags (bit 0
+ *                redirected, bit 1 a null body); payload = the status
+ *                text's run, the final URL's run, the response type's run
+ *                ("basic", "cors", "opaque", ...), u32 n, then n (name,
+ *                value) run pairs — the header list as the host's own
+ *                Headers iterates it (lowercase names, sorted, duplicates
+ *                combined, each set-cookie its own entry). Once, first.
+ *       2 BODY   payload = every byte of the body, decoded as the host's
+ *                fetch decodes it (content-encoding). Once, after HEAD; the
+ *                request is then finished.
+ *       3 FAIL   payload = an ERROR RECORD: the request failed (before
+ *                HEAD: fetch() rejects; after it: the body readers do). The
+ *                request is then finished.
+ *     A request holds the loop from START until its BODY or FAIL is
+ *     delivered or the module ABORTs it. Any record out of these shapes is
+ *     the named trap "fetch: host failure".
+ *     THE CAPABILITY (S004): this import reaches the network with the
+ *     host's authority. A host that does not grant it DOES NOT SUPPLY THE
+ *     IMPORT (a LinkError at instantiation); a browser host answers with
+ *     its own fetch, CORS and all (S098).
+ *     fetch's EFFECT TIER: that the host did what it reports is enforced by
+ *     NOTHING — the harness's own rows are the check.
+ *
  *   (export "_start" (func))            — the program; run it once.
  *   (export "_tick" (func (param f64) (result f64)))  [timer modules only]
  *   (export "_loop" (func (param f64) (result f64)))  [event modules only,
@@ -1295,6 +1365,7 @@ export const IMPORT_SLEEP = "sleep";
 export const IMPORT_SIG_CALL = "sigCall";
 export const IMPORT_WATCH_CALL = "watchCall";
 export const IMPORT_STDIN_CALL = "stdinCall";
+export const IMPORT_FETCH = "fetch";
 export const EXPORT_ENTRY = "_start";
 export const EXPORT_TICK = "_tick";
 export const EXPORT_LOOP = "_loop";

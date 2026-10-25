@@ -670,6 +670,10 @@ export async function compile(entryPath: string, opts: CompileOptions): Promise<
       lowered = fe.lower({
         dynamic: opts.dynamic ?? false,
         targetPlatform: buildTargetPlatform(),
+        // The WasmGC tier's host supplies fetch (one `fetch` import,
+        // SEMANTICS.md S098): the fetch slice lowers without --dynamic
+        // there; the native lanes keep the requires-dynamic diagnostic.
+        ...(opts.backend === "wasm" ? { hostFetch: true } : {}),
         ...(ffi !== null ? { ffiImports: ffi.functions } : {}),
       });
     } catch (e) {

@@ -79,10 +79,17 @@
  * `runWasmToTrap`'s ONE optional parameter: import overrides merged over
  * these defaults, plus `onIdle`, `onJump` and `onInstance`
  * (wasm-host-cp-u2.test.ts);
- * a caller that passes nothing gets exactly the host it always had. */
+ * a caller that passes nothing gets exactly the host it always had.
+ *
+ * #227: a FETCH MODULE (one importing `tsinter.fetch`, abi.ts) gets the
+ * REAL fetch host (wasm-fetch-host.ts, Node's own fetch) unless a test
+ * overrides `fetch`: its evPoll serves that host's queue, its clock is
+ * real time, and its `_loop` is driven asynchronously so Node's own event
+ * loop runs the requests between turns. */
 import { randomBytes, randomFillSync } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { expect } from "vitest";
+import { makeFetchHost, writeFetchEvent, type FetchHostEvent } from "./wasm-fetch-host.js";
 
 /** `tsinter.exit`'s sentinel (abi.ts §2.5) — thrown by the host, caught
  * inside `drive()` before it can propagate as an unhandled rejection. */
@@ -127,7 +134,48 @@ async function instantiate(modulePath: string, overrides?: HostOverrides) {
   // lesson), which this shared host must not do any more than the
   // differential harness's own host does.
   const wallBase = Date.now();
-  const { instance } = await WebAssembly.instantiate(readFileSync(modulePath), {
+  const wasmModule = await WebAssembly.compile(readFileSync(modulePath));
+  // #227: the real fetch host, for a fetch module no test scripts.
+  const fetchMode =
+    WebAssembly.Module.imports(wasmModule).some((i) => i.module === "tsinter" && i.name === "fetch") &&
+    overrides?.imports?.["fetch"] === undefined;
+  const t0 = performance.now();
+  const fetchQueue: FetchHostEvent[] = [];
+  let fetchWaker: (() => void) | null = null;
+  let fetchLive = 0;
+  const fetchHost = fetchMode
+    ? makeFetchHost({
+        memory: () => {
+          if (memory === null) throw new Error("fetch before instantiation completed");
+          return memory;
+        },
+        push: (ev) => {
+          fetchQueue.push(ev);
+          fetchWaker?.();
+        },
+        purge: (pred) => {
+          for (let i = fetchQueue.length - 1; i >= 0; i--) if (pred(fetchQueue[i]!)) fetchQueue.splice(i, 1);
+        },
+        live: (d) => {
+          fetchLive += d;
+        },
+      })
+    : null;
+  const fetchNow = (): number => performance.now() - t0;
+  const fetchImports = fetchHost
+    ? {
+        now: fetchNow,
+        evPoll(ptr: number, cap: number): number {
+          const ev = fetchQueue[0];
+          if (ev === undefined) return 0;
+          const n = writeFetchEvent(memory!, ptr, cap, ev);
+          if (n > 0) fetchQueue.shift();
+          return n;
+        },
+        fetch: fetchHost.fetchCall,
+      }
+    : {};
+  const instance = await WebAssembly.instantiate(wasmModule, {
     tsinter: {
       write(fd: number, ptr: number, len: number): void {
         if (memory === null) throw new Error("write before instantiation completed");
@@ -344,13 +392,47 @@ async function instantiate(modulePath: string, overrides?: HostOverrides) {
       stdinCall(op: number): number {
         throw new Error(`stdinCall: op ${op} reached with no forced host (default stub is loud by design)`);
       },
+      ...fetchImports,
       ...(overrides?.imports ?? {}),
     },
   });
   memory = instance.exports["memory"] as WebAssembly.Memory;
   overrides?.onInstance?.(instance);
   let exitCode = 0;
-  const drive = (): void => {
+  // #227: a fetch module's drive — real time, and Node's own loop turns
+  // between module turns so the requests make progress.
+  const driveFetch = async (): Promise<void> => {
+    try {
+      (instance.exports["_start"] as () => void)();
+      const loop = instance.exports["_loop"] as (now: number) => number;
+      const status = instance.exports["_status"] as (() => number) | undefined;
+      let due = loop(fetchNow());
+      while (due >= 0) {
+        const wait = due === Infinity ? Infinity : Math.max(0, due - fetchNow());
+        if (fetchQueue.length === 0 && wait > 0) {
+          if (wait === Infinity && fetchLive === 0) throw new Error("module waits for an event no source can deliver");
+          await new Promise<void>((resolve) => {
+            const timer = Number.isFinite(wait) ? setTimeout(resolve, Math.ceil(wait)) : undefined;
+            fetchWaker = () => {
+              if (timer !== undefined) clearTimeout(timer);
+              resolve();
+            };
+          });
+          fetchWaker = null;
+        }
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        due = loop(fetchNow());
+      }
+      exitCode = status?.() ?? 0;
+    } catch (err) {
+      if (!(err instanceof WasmHostExitSignal)) throw err;
+      exitCode = err.code;
+    } finally {
+      fetchHost!.finish();
+    }
+  };
+  const drive = (): void | Promise<void> => {
+    if (fetchHost !== null) return driveFetch();
     try {
       (instance.exports["_start"] as () => void)();
       const tick = instance.exports["_tick"] as ((now: number) => number) | undefined;
@@ -406,7 +488,7 @@ async function instantiate(modulePath: string, overrides?: HostOverrides) {
 
 export async function runWasm(modulePath: string, overrides?: HostOverrides): Promise<HostRun> {
   const { drive, out } = await instantiate(modulePath, overrides);
-  drive();
+  await drive();
   return out();
 }
 

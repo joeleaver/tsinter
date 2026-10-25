@@ -630,6 +630,7 @@ interface Headers {
   forEach(callbackfn: (value: string, key: string, parent: Headers) => void): void;
 }
 interface Response {
+  readonly type: "basic" | "cors" | "default" | "error" | "opaque" | "opaqueredirect";
   readonly ok: boolean;
   readonly status: number;
   readonly statusText: string;
@@ -651,9 +652,10 @@ interface Response {
 }
 interface RequestInit {
   method?: string;
-  headers?: Record<string, string>;
-  body?: string;
-  signal?: AbortSignal;
+  headers?: Record<string, string> | Headers;
+  body?: string | Uint8Array | null;
+  signal?: AbortSignal | null;
+  redirect?: "error" | "follow" | "manual";
 }
 declare function fetch(input: string | URL, init?: RequestInit): Promise<Response>;
 

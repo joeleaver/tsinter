@@ -131,6 +131,13 @@ export class Code {
     this.w.uleb(0); // alignment (2^0 — byte access)
     this.w.uleb(0); // offset
   }
+  /** i32.store16 — a 2-byte little-endian write (#227: fetch's UTF-16
+   * request runs). No alignment claimed, as i32Store8. */
+  i32Store16(): void {
+    this.w.u8(0x3b);
+    this.w.uleb(0);
+    this.w.uleb(0);
+  }
   /** i32.load16_u — zero-extends a 16-bit little-endian read from linear
    * memory to i32. INC-26 P1's first INBOUND read: every prior instruction
    * in this file only ever WRITES to memory (the host reads it back on the

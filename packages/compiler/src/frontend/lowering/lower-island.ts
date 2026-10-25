@@ -250,7 +250,7 @@ import { PoisonError, newFnCtx, own } from "./lowerer.js";
     const symbol = L.resolveValueSymbol(callee);
     if (!symbol || !L.isStdlibSymbol(symbol)) return null;
     if (call.arguments.length < 1 || call.arguments.length > 2) return null;
-    L.requireDynamicApi("'fetch'", call);
+    if (!L.hostFetch) L.requireDynamicApi("'fetch'", call);
     const loc = locOf(call);
     const fetchFn: IrExpr = { kind: "jsOp", op: "globalGet", name: "fetch", args: [], type: JSVAL, loc };
     // Init OBJECT LITERALS build natively in the island (the general
@@ -260,9 +260,17 @@ import { PoisonError, newFnCtx, own } from "./lowerer.js";
     // through and dashed header keys ("content-type") are plain engine
     // property names. Non-literal inits marshal as a whole (JSON-safe
     // records; a signal field inside one fences with the boundary rule).
-    const args = call.arguments.map((a) =>
-      ts.isObjectLiteralExpression(a) ? lowerIslandObjectLiteral(L, a) : L.jsvalIn(L.lowerExpr(a), a),
-    );
+    const args = call.arguments.map((a, i) => {
+      if (ts.isObjectLiteralExpression(a)) return lowerIslandObjectLiteral(L, a);
+      const v = L.lowerExpr(a);
+      // The host-fetch slice (SEMANTICS.md S098): a URL input is its href
+      // — what fetch's `${input}` reads — so the module's request carries
+      // the string Node's would.
+      if (i === 0 && L.hostFetch && v.type.kind === "url") {
+        return L.jsvalIn({ kind: "libCall", fn: "url.href", args: [v], type: STRING, loc: locOf(a) }, a);
+      }
+      return L.jsvalIn(v, a);
+    });
     const raw: IrExpr = { kind: "jsOp", op: "callFn", args: [fetchFn, ...args], type: JSVAL, loc };
     return { kind: "jsBridgePromise", value: raw, type: { kind: "promise", inner: JSVAL }, loc };
   }
@@ -659,7 +667,7 @@ import { PoisonError, newFnCtx, own } from "./lowerer.js";
         call.arguments.length <= 1 &&
         (sigMember === "abort" || call.arguments.length === 1)
       ) {
-        L.requireDynamicApi(`'AbortSignal.${sigMember}'`, call);
+        if (!L.hostFetch) L.requireDynamicApi(`'AbortSignal.${sigMember}'`, call);
         const args = call.arguments.map((a) => L.jsvalIn(L.lowerExpr(a), a));
         const signalGlobal: IrExpr = {
           kind: "jsOp", op: "globalGet", name: "AbortSignal", args: [], type: JSVAL, loc,

@@ -21,7 +21,11 @@ export class WasmUnsupportedError extends Error {
   ) {
     super(
       `the wasm backend does not support this construct yet (${kind}); ` +
-        `build with the LLVM backend (the default) or the reference C backend (--backend c)`,
+        // #227: the native backends refuse a static fetch themselves, so
+        // the usual advice would send a fetch program to another refusal.
+        (kind.startsWith("fetch:")
+          ? `the native backends run fetch only in a --dynamic build (the embedded engine's fetch, --backend c --dynamic)`
+          : `build with the LLVM backend (the default) or the reference C backend (--backend c)`),
     );
     this.name = "WasmUnsupportedError";
   }

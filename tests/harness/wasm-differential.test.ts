@@ -71,11 +71,16 @@ import { constants as osConstants, homedir, networkInterfaces, release, tmpdir, 
 import { basename, dirname, join, resolve as pathResolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
-import { afterAll, describe, expect, test } from "vitest";
+import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import ts5 from "typescript";
 import { compile } from "@tsinter/compiler";
 import { shardSelect, shardSuffix } from "./shard.js";
 import { makeHostFacts, type HostFactSnapshot } from "./host-facts.js";
+// #227: the `fetch` import's host half over Node's own fetch, shared with
+// packages/compiler/test/wasm-host.ts.
+import { makeFetchHost } from "../../packages/compiler/test/wasm-fetch-host.js";
+// eslint-disable-next-line import/no-relative-packages
+import { startFetchServers } from "../fixtures/fetch/servers.mjs";
 
 const execFileAsync = promisify(execFile);
 const repoRoot = join(import.meta.dirname, "../..");
@@ -5321,6 +5326,20 @@ async function runWasm(modulePath: string, opts?: { stdin?: Buffer }): Promise<R
     }
     throw new Error(`stdinCall: unknown op ${op}`);
   };
+  // #227 (abi.ts fetch, evPoll source 6): the fetch host — Node's own
+  // fetch. A request in flight holds the clock in real time, as a socket
+  // does.
+  const fetchHost = makeFetchHost({
+    memory: () => {
+      if (memory === null) throw new Error("fetch before instantiation completed");
+      return memory;
+    },
+    push: evPush,
+    purge: (pred) => {
+      for (let i = evQueue.length - 1; i >= 0; i--) if (pred(evQueue[i]!)) evQueue.splice(i, 1);
+    },
+    live: evLiveAdd,
+  });
   // SPAWN: public spawn() inside ONE synchronous span with the documented
   // tracing channel subscribed for exactly that span (never at module
   // scope: a subscriber makes every spawn in the worker publish), matched
@@ -6258,6 +6277,10 @@ async function runWasm(modulePath: string, opts?: { stdin?: Buffer }): Promise<R
       watchCall,
       // Unit G2 (abi.ts stdinCall): fd 0's reads.
       stdinCall,
+      // #227 (abi.ts fetch): the host Node's own fetch.
+      fetch(op: number, ptr: number, len: number, h: number, x: number): number {
+        return fetchHost.fetchCall(op, ptr, len, h, x);
+      },
       // INC-28 U2 (abi.ts evPoll): the oldest queued event, or 0; a short
       // buffer answers -(the length needed) and keeps the event. Reading an
       // EXIT ends that child's life for the clock.
@@ -6397,6 +6420,8 @@ async function runWasm(modulePath: string, opts?: { stdin?: Buffer }): Promise<R
       w.close();
     }
     watches.clear();
+    // #227: every request still in flight is aborted.
+    fetchHost.finish();
     for (const rec of evChildren.values()) {
       rec.proc.removeAllListeners("close");
       rec.proc.removeAllListeners("exit");
@@ -9721,6 +9746,196 @@ describe("unit G2 stdin and readline rows", () => {
         expect(exports.includes("_loop")).toBe(want);
         if (want) expect(imports[imports.length - 1]).toBe("tsinter.stdinCall");
       }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+});
+
+/* ── #227: fetch() over the host's fetch import ─────────────────────────
+ * Every row runs against the fetch fixtures' local servers
+ * (tests/fixtures/fetch/servers.mjs, started here, in this process) —
+ * never the network. The wasm side runs through this file's runWasm,
+ * whose fetch host is Node's own fetch (packages/compiler/test/
+ * wasm-fetch-host.ts); the Node side runs the same program with the
+ * oracle's flags. Programs name the servers by placeholder: the three
+ * fetch.test.ts user-code fixtures read process.argv[2] / [3] (the wasm
+ * module's argv is the harness's own, so the copy compiled here has the
+ * URLs substituted, and Node runs the original with them in argv); the
+ * focused programs under tests/fixtures/fetch/wasm/ spell __BASE__ and
+ * __REFUSED__. SEMANTICS.md S098 registers what is the host's answer. */
+describe("#227 fetch rows", () => {
+  let servers: Awaited<ReturnType<typeof startFetchServers>>;
+  beforeAll(async () => {
+    servers = await startFetchServers();
+  });
+  afterAll(async () => {
+    await servers.close();
+  });
+  const fixturesDir = join(repoRoot, "tests/fixtures/fetch");
+  const subst = (src: string): string =>
+    src
+      .replaceAll("process.argv[2]", JSON.stringify(servers.baseUrl))
+      .replaceAll("process.argv[3]", JSON.stringify(servers.refusedUrl))
+      .replaceAll("__BASE__", servers.baseUrl)
+      .replaceAll("__REFUSED__", servers.refusedUrl);
+  /** Compile `src` (written as `name`) for wasm and run it. */
+  async function runF(name: string, src: string, dynamic: boolean): Promise<RunResult> {
+    const dir = mkdtempSync(join(tmpdir(), "fetch-row-"));
+    try {
+      const path = join(dir, name);
+      writeFileSync(path, src);
+      const res = await compile(path, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic, backend: "wasm" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+      return await runWasm(res.binaryPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  /** The oracle over `file` with `argv` after it (asynchronous: the
+   * servers live in this process). */
+  async function nodeF(file: string, argv: string[]): Promise<RunResult> {
+    const pending = execFileAsync("node", [...nodeOracleArgs(file), ...argv], { encoding: "buffer" });
+    pending.child.stdin?.end();
+    try {
+      const { stdout, stderr } = await pending;
+      return { stdout, stderr, exitCode: 0 };
+    } catch (err) {
+      const e = err as { code?: unknown; stdout?: Buffer; stderr?: Buffer };
+      if (typeof e.code !== "number" || !Buffer.isBuffer(e.stdout) || !Buffer.isBuffer(e.stderr)) throw err;
+      return { stdout: e.stdout, stderr: e.stderr, exitCode: e.code };
+    }
+  }
+  /** The focused program tests/fixtures/fetch/wasm/<name>, substituted,
+   * run on both sides. */
+  async function bothF(name: string): Promise<{ wasm: RunResult; node: RunResult }> {
+    const src = subst(readFileSync(join(fixturesDir, "wasm", name), "utf8"));
+    const dir = mkdtempSync(join(tmpdir(), "fetch-oracle-"));
+    try {
+      const path = join(dir, name);
+      writeFileSync(path, src);
+      const [wasm, node] = await Promise.all([runF(name, src, false), nodeF(path, [])]);
+      return { wasm, node };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  const fixtureRows: [string, string, string, boolean][] = [
+    ["F-FX-01", "user-fetch", "ok/status probes, json() and text() into typed slots, a 404 that resolves, a POST init literal, a stored Response promise, AbortSignal.timeout against the slow route, a refused connection's 'fetch failed'", true],
+    ["F-FX-02", "response-surface", "Headers get / has / getSetCookie / forEach, bodyUsed / url / redirected, combined duplicate headers, request headers echoed, arrayBuffer().byteLength, bytes() into a Uint8Array, a followed redirect", true],
+    ["F-FX-03", "proxy-optin", "a plain GET whose text() lands in a template", false],
+  ];
+  for (const [id, fixture, what, hasDynamic] of fixtureRows) {
+    const spellings = hasDynamic ? ["static", "dynamic"] : ["static"];
+    for (const spelling of spellings) {
+      test(`${id}${spelling === "dynamic" ? "d" : ""} fetch.test.ts's ${fixture} fixture as a ${spelling} wasm build (${what}): full stdout, stderr and exit code equal Node's`, async () => {
+        const entry = join(fixturesDir, "cases", fixture, "main.ts");
+        const raw = readFileSync(entry, "utf8");
+        const src = subst(spelling === "static" ? raw.replace(/^\/\/ @dynamic\n/, "") : raw);
+        const [wasm, node] = await Promise.all([
+          runF("main.ts", src, spelling === "dynamic"),
+          nodeF(entry, [servers.baseUrl, servers.refusedUrl]),
+        ]);
+        expect(node.exitCode).toBe(0);
+        expect(node.stdout.toString("utf8").split("\n").length).toBeGreaterThan(1);
+        expect(wasm.stdout.toString("utf8")).toBe(node.stdout.toString("utf8"));
+        expect(wasm.stderr.toString("utf8")).toBe("");
+        expect(wasm.exitCode).toBe(0);
+      }, 60000);
+    }
+  }
+
+  const focusedRows: [string, string, string][] = [
+    ["F-BODY-01", "body-readers.ts", "bodyUsed before, during and after text(); the 'Body is unusable' TypeError for a second text() and a json(); json()'s SyntaxError text; a HEAD response's null body read twice and never used; type and statusText"],
+    ["F-HDR-01", "headers.ts", "request headers as written, get over combined and missing names, the invalid-name and ByteString TypeErrors, forEach's sorted walk, a Headers value as a request's headers (the host refuses its keep-alive header: 'fetch failed'), set / append / delete: the name and value checks before the immutable guard"],
+    ["F-SIG-01", "abort-signal.ts", "AbortSignal.timeout's delay ladder, aborted before and after its unref'd timer, AbortSignal.abort()'s AbortError rejecting at once, a timeout that fires while the body is still arriving rejects text()"],
+    ["F-REQ-01", "requests.ts", "the host's request-construction refusals (a relative URL, a bad method, a GET body, credentials) and a refused connection; a lowercase method and a string body's content type, a Uint8Array body, gzip and deflate bodies decoded, redirect: 'manual'"],
+    ["F-CAUSE-01", "failure-cause.ts", "the cause behind 'fetch failed' (an Error with code ECONNREFUSED) and behind 'Failed to parse URL' (a TypeError with code ERR_INVALID_URL), read through a checked conversion"],
+    ["F-URL-01", "url-input.ts", "a URL object as fetch's input (its href)"],
+    ["F-GIVEN-01", "given-empty.ts", "an empty method and an empty redirect mode reach the host as given (Node's TypeErrors), an explicit GET goes through — SINGLE-EDIT: fetch.ts start's GIVEN bits"],
+    ["F-HEV-01", "with-signal.ts", "fetch beside a process signal listener: the fetch poll phase hands the signal's record (evPoll source 3) to the host-event dispatcher — SINGLE-EDIT: fetch.ts pollHelper's foreign arm"],
+    ["F-TAG-01", "string-tags.ts", "String() and template conversion of a Response, its Headers, an AbortSignal and an ArrayBuffer answer their toStringTag ('[object Response]', ...) — SINGLE-EDIT: dyn.ts toStr's HANDLE arm"],
+  ];
+  for (const [id, name, what] of focusedRows) {
+    test(`${id} ${what}: full stdout, stderr and exit code equal Node's`, async () => {
+      const { wasm, node } = await bothF(name);
+      expect(node.exitCode).toBe(0);
+      expect(node.stderr.toString("utf8")).toBe("");
+      expect(wasm.stdout.toString("utf8")).toBe(node.stdout.toString("utf8"));
+      expect(wasm.stderr.toString("utf8")).toBe("");
+      expect(wasm.exitCode).toBe(0);
+    }, 60000);
+  }
+
+  test("F-FENCE-01 a Response's body (a ReadableStream) and JSON.stringify of a Headers value throw named Errors (SEMANTICS.md S098 (d)); Node answers a stream and '{}'", async () => {
+    const { wasm, node } = await bothF("fences.ts");
+    expect(node.stdout.toString("utf8")).toBe("body ok false\njson ok {}\ntypeof: object\n");
+    expect(wasm.stdout.toString("utf8")).toBe(
+      "body: Error Response.body (a ReadableStream) is not supported yet\njson: Error JSON.stringify of a fetch value is not supported yet\ntypeof: object\n",
+    );
+    expect(wasm.exitCode).toBe(0);
+  }, 60000);
+
+  test("F-UNH-01 an unhandled 'fetch failed' rejection ends the run with exit 1 and this tier's report (SEMANTICS.md S007); Node prints the error with its cause", async () => {
+    const { wasm, node } = await bothF("unhandled.ts");
+    expect(node.exitCode).toBe(1);
+    expect(node.stderr.toString("utf8")).toContain("[cause]: Error: connect ECONNREFUSED");
+    expect(wasm.exitCode).toBe(1);
+    expect(wasm.stdout.toString("utf8")).toBe("");
+    expect(wasm.stderr.toString("utf8")).toBe("Unhandled promise rejection: TypeError: fetch failed\n");
+  }, 60000);
+
+  test("F-REF-01 AbortSignal.any, AbortSignal.abort(reason) and fetch beside node:net refuse by name at compile time", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "fetch-ref-"));
+    try {
+      const build = async (src: string): Promise<string> => {
+        const path = join(dir, "main.ts");
+        writeFileSync(path, src);
+        const res = await compile(path, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: false, backend: "wasm" });
+        return res.ok ? "ok" : res.diagnostics.map((d) => d.message).join("\n");
+      };
+      expect(await build("const s = AbortSignal.any([AbortSignal.timeout(5)]);\nconsole.log(s.aborted);\n")).toContain("(fetch:AbortSignal.any)");
+      expect(await build("const s = AbortSignal.abort(\"why\");\nconsole.log(s.aborted);\n")).toContain("(fetch:AbortSignal.abort:reason)");
+      expect(
+        await build("import { createServer } from \"node:net\";\nconst srv = createServer(() => {});\nsrv.listen(0, () => srv.close());\nfetch(\"http://127.0.0.1:1/\").then(() => console.log(\"x\"));\n"),
+      ).toContain("(fetch:with-net-or-child)");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  test("F-HOST-01 a fetch module imports evPoll and, last, tsinter.fetch and exports _loop; a module without fetch, or with only the AbortSignal statics, imports neither; the native lanes keep refusing a static fetch (SC2012)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "fetch-host-"));
+    try {
+      const build = async (src: string, backend: "wasm" | "c"): Promise<Awaited<ReturnType<typeof compile>>> => {
+        const path = join(dir, "main.ts");
+        writeFileSync(path, src);
+        return compile(path, { outPath: join(dir, backend === "wasm" ? "p.wasm" : "p"), outDir: dir, dynamic: false, backend });
+      };
+      const fetchSrc = "async function main(): Promise<void> {\n  try {\n    const r = await fetch(\"http://127.0.0.1:1/\");\n    console.log(`${r.status}`);\n  } catch {\n    console.log(\"failed\");\n  }\n}\nmain();\n";
+      const res = await build(fetchSrc, "wasm");
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => d.message).join("; ")}`);
+      const mod = await WebAssembly.compile(readFileSync(res.binaryPath));
+      const imports = WebAssembly.Module.imports(mod).map((i) => `${i.module}.${i.name}`);
+      expect(imports.at(-1)).toBe("tsinter.fetch");
+      expect(imports).toContain("tsinter.evPoll");
+      expect(WebAssembly.Module.exports(mod).map((e) => e.name)).toContain("_loop");
+      const plain = await build("console.log(1);\n", "wasm");
+      if (!plain.ok) throw new Error("refused");
+      const plainImports = WebAssembly.Module.imports(await WebAssembly.compile(readFileSync(plain.binaryPath))).map((i) => i.name);
+      expect(plainImports).not.toContain("fetch");
+      expect(plainImports).not.toContain("evPoll");
+      // Only the AbortSignal statics: the values, no import and no loop.
+      const sigOnly = await build("const s = AbortSignal.timeout(5);\nconsole.log(`${s.aborted}`);\n", "wasm");
+      if (!sigOnly.ok) throw new Error(`refused: ${sigOnly.diagnostics.map((d) => d.message).join("; ")}`);
+      const sigImports = WebAssembly.Module.imports(await WebAssembly.compile(readFileSync(sigOnly.binaryPath))).map((i) => i.name);
+      expect(sigImports).not.toContain("fetch");
+      expect(sigImports).not.toContain("evPoll");
+      expect((await runWasm(sigOnly.binaryPath)).stdout.toString("utf8")).toBe("false\n");
+      const native = await build(fetchSrc, "c");
+      expect(native.ok).toBe(false);
+      expect(native.ok ? [] : native.diagnostics.map((d) => d.code)).toContain("SC2012");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

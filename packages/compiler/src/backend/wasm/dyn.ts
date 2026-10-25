@@ -265,6 +265,13 @@ export interface DynHandleDeps {
   /** INC-29 U2 (http modules only): the handle's class names beyond
    * Socket (1) and Server (2), by tag. */
   classNames?: readonly (readonly [number, string])[];
+  /** #227: what the fences call a handle ("fetch value" in a fetch
+   * module); absent, "net handle". */
+  noun?: string;
+  /** #227: the handles carry Symbol.toStringTag (Response, Headers, ...):
+   * String() answers "[object <class name>]" by tag (classNames), where a
+   * net handle inherits Object.prototype.toString's "[object Object]". */
+  toStringTags?: boolean;
 }
 
 export interface DynDeps {
@@ -2876,7 +2883,21 @@ export class DynBuilder {
       // Object.prototype.toString with the Promise @@toStringTag.
       this.arm(c, K, [DK.PROMISE], () => this.deps.lit(c, "[object Promise]"));
       // The runtime handles inherit Object.prototype.toString.
-      this.arm(c, K, [DK.HANDLE], () => this.deps.lit(c, "[object Object]"));
+      this.arm(c, K, [DK.HANDLE], () => {
+        const tags = this.deps.handle?.toStringTags === true ? this.deps.handle.classNames ?? [] : [];
+        // #227: a fetch value's toStringTag, by tag.
+        for (const [tag, name] of tags) {
+          c.localGet(0);
+          c.structGet(this.dynT(), DYN_NUM);
+          c.f64Const(tag);
+          c.f64Eq();
+          c.ifResult(this.deps.strRef());
+          this.deps.lit(c, `[object ${name}]`);
+          c.else_();
+        }
+        this.deps.lit(c, "[object Object]");
+        for (let i = 0; i < tags.length; i++) c.end();
+      });
       // Function.prototype.toString, C's arm exactly: the SOURCE a JS
       // engine would echo is gone in a compiled program, so this renders
       // the native-code form engines print for their own non-JS
@@ -4571,7 +4592,7 @@ export class DynBuilder {
         c.i32Const(DK.HANDLE);
         c.i32Eq();
         c.ifVoid();
-        this.deps.throwError(c, "%Error", "Error", (x) => this.deps.lit(x, `Object.assign ${what} a net handle is not supported yet`));
+        this.deps.throwError(c, "%Error", "Error", (x) => this.deps.lit(x, `Object.assign ${what} a ${this.handleNoun()} is not supported yet`));
         c.refNull(dynT);
         c.return_();
         c.end();
@@ -6564,10 +6585,15 @@ export class DynBuilder {
     return this.deps.handle !== undefined;
   }
 
+  /** #227: the fences' name for a handle ("net handle", "fetch value"). */
+  handleNoun(): string {
+    return this.deps.handle?.noun ?? "net handle";
+  }
+
   /** INC-29 U1: the loud fence for an operation the handle surface does
    * not model (a plain Error, the invoke ladder's own stance). */
   private handleFence(c: Code, what: string): void {
-    this.deps.throwError(c, "%Error", "Error", (x) => this.deps.lit(x, `${what} on a net handle is not supported yet`));
+    this.deps.throwError(c, "%Error", "Error", (x) => this.deps.lit(x, `${what} on a ${this.handleNoun()} is not supported yet`));
   }
 
   /** INC-29 U1: push the handle's class name from its tag in DYN_NUM. */

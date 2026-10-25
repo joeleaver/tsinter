@@ -140,6 +140,7 @@ import {
   IMPORT_SLEEP,
   IMPORT_SIG_CALL,
   IMPORT_STDIN_CALL,
+  IMPORT_FETCH,
   IMPORT_TLS_CALL,
   IMPORT_WATCH_CALL,
   IMPORT_FS_CALL,
@@ -189,6 +190,7 @@ import { ChildProcBuilder, SR_ERR_CODE, SR_HAS_STATUS, SR_SIGNAL, SR_STATUS, SR_
 import { CH_CODE, CH_ERR, CH_HAS_PID, CH_KILLED, CH_OUT, CH_PID, CH_STATE, ChildAsyncBuilder } from "./childasync.js";
 import { NET_LISTS, NetBuilder, type NetList } from "./net.js";
 import { HostEvBuilder } from "./hostev.js";
+import { FETCH_CLASS_NAMES, FetchBuilder } from "./fetch.js";
 import { TlsBuilder } from "./tls.js";
 import { X509Builder } from "./tls-x509.js";
 import { CryptoBuilder, X509_BAD_TIME, X509_NO_START } from "./crypto.js";
@@ -1192,6 +1194,37 @@ function eventModuleReachable(mod: WModule): boolean {
  * three keys that never reach the host are left out: the attempt-budget
  * pair (a module global) and the runtime option-bag check (it always
  * throws). */
+/** #227: what of the fetch surface a reachable function reaches (the
+ * island ops the front end lowers it to: jsOp globalGet "fetch" /
+ * "AbortSignal"): "fetch" when fetch() itself is called (an event module
+ * importing tsinter.fetch), "signal" when only the AbortSignal statics
+ * are (the values, no import), else "none". */
+function fetchModuleReachable(mod: WModule): "none" | "signal" | "fetch" {
+  const reachable = reachableFunctionNames(mod);
+  let found = false;
+  let signal = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      const rec = node as Record<string, unknown>;
+      if (rec["kind"] === "jsOp" && rec["op"] === "globalGet" && rec["name"] === "fetch") {
+        found = true;
+        return;
+      }
+      if (rec["kind"] === "jsOp" && rec["op"] === "globalGet" && rec["name"] === "AbortSignal") signal = true;
+      for (const value of Object.values(rec)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn.body);
+  }
+  return found ? "fetch" : signal ? "signal" : "none";
+}
+
 function netModuleReachable(mod: WModule): boolean {
   const reachable = reachableFunctionNames(mod);
   const pure = new Set(["net.getAutoSelTimeout", "net.setAutoSelTimeout", "net.connectOptsChk"]);
@@ -2439,6 +2472,18 @@ class Assembler {
   private readonly hevSignals: boolean;
   private readonly hevWatch: boolean;
   private readonly hevModule: boolean;
+  /** #227: `tsinter.fetch`'s index, or null outside a fetch module. */
+  private readonly fetchCallFunc: number | null;
+  /** #227: the module reaches the global fetch() or the AbortSignal
+   * statics (fetchModuleReachable) and no other event source: it boxes
+   * fetch values (fetch.ts). */
+  private readonly fetchModule: boolean;
+  /** #227: fetch() itself is reached — an event module whose poll phase
+   * reads source 6 and that imports tsinter.fetch. */
+  private readonly fetchEvents: boolean;
+  /** #227: fetch reached beside node:net or the asynchronous spawn — the
+   * fetch sites refuse (fetch:with-net-or-child). */
+  private readonly fetchBlocked: boolean;
   /** The exit-drain gate's static fact — see exitListenerSurfaceReachable's
    * own comment (INC-26 P1). Computed ONCE in the constructor; every drain
    * gate site reads this, never the mutable `procField`/
@@ -2605,8 +2650,13 @@ class Assembler {
     this.hevWatch = hevWatch;
     this.hevStdin = hevStdin;
     this.hevModule = hevMod;
+    // #227: a fetch module's `_loop` reads `now` too.
+    const fetchReach = fetchModuleReachable(mod);
+    const fetchReached = fetchReach !== "none";
+    const fetchMod = fetchReached && !netMod && !eventModuleReachable(mod);
+    const fetchCalled = fetchMod && fetchReach === "fetch";
     this.nowFunc =
-      timerSurfaceReachable(mod) || perfNowReachable(mod) || netMod || hevMod
+      timerSurfaceReachable(mod) || perfNowReachable(mod) || netMod || hevMod || fetchMod
         ? this.mb.importFunc(IMPORT_MODULE, IMPORT_NOW, this.mb.funcType([], [F64]))
         : null;
     // `seed`'s twin decision (INC-25 P1, abi.ts §8.1): present only in
@@ -2676,8 +2726,11 @@ class Assembler {
     this.closeOverride = closeOverrideReachable(mod);
     this.httpModule = httpModuleReachable(mod);
     // INC-29 U1: a net module is an event module too; units G1-G3: so is a
-    // host-event module.
-    this.eventModule = this.cpEventModule || netMod || hevMod;
+    // host-event module; #227: so is a module that calls fetch().
+    this.fetchModule = fetchMod;
+    this.fetchEvents = fetchCalled;
+    this.fetchBlocked = fetchReached && !fetchMod;
+    this.eventModule = this.cpEventModule || netMod || hevMod || fetchCalled;
     this.pipeModule = pipeModuleReachable(mod);
     this.evPollFunc = this.eventModule
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_EV_POLL, this.mb.funcType([I32, I32], [I32]))
@@ -2727,6 +2780,11 @@ class Assembler {
     this.stdinCallFunc = hevStdin
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_STDIN_CALL, this.mb.funcType([I32], [I32]))
       : null;
+    // `fetch`'s decision (#227, abi.ts): the host's fetch, in fetch modules
+    // only, minted LAST so no earlier import index moves.
+    this.fetchCallFunc = fetchCalled
+      ? this.mb.importFunc(IMPORT_MODULE, IMPORT_FETCH, this.mb.funcType([I32, I32, I32, I32, I32], [I32]))
+      : null;
     // ── end INC-26 host-import block ──
     // The exit-drain gate's STATIC fact (see exitListenerSurfaceReachable's
     // own comment on why this must not be a runtime flag): true iff
@@ -2743,7 +2801,7 @@ class Assembler {
       "dyn.cloneTransferFail",
       "str.atob",
       "str.btoa",
-    ]);
+    ]) || this.fetchModule;
     // Unit A2: the island's `Object.create(...)` (jsOp callMethod over
     // globalGet("Object")) can build a null-prototype object or a linked
     // one; both readers' refusals are installed only where it appears.
@@ -3283,6 +3341,80 @@ class Assembler {
   }
 
   private domexType: number | null = null;
+
+  private fetchCauseType: number | null = null;
+
+  /** `class:fetchCause` (#227) — errT's four fields, then the host's
+   * `cause` (an error, field 4): fetch's "fetch failed" TypeError and the
+   * request-construction errors that carry one. */
+  private fetchCauseT(): number {
+    if (this.fetchCauseType !== null) return this.fetchCauseType;
+    const exc = this.exc();
+    this.fetchCauseType = this.mb.subStructType(
+      "class:fetchCause",
+      [...exc.errFields, { storage: { kind: "ref", nullable: true, typeIndex: exc.errT }, mutable: false }],
+      exc.errT,
+    );
+    return this.fetchCauseType;
+  }
+
+  private fetchField: FetchBuilder | null = null;
+
+  /** #227's builder (fetch.ts): fetch(), its values and its poll phase. */
+  private get fetch(): FetchBuilder {
+    this.fetchField ??= new FetchBuilder(this.mb, {
+      dyn: () => this.dyn,
+      strRef: () => this.strRef,
+      strType: () => this.strType,
+      lit: (c, s) => this.pushStrLitInto(c, s),
+      concat: () => this.concatHelper(),
+      strEq: () => this.strEqHelper(),
+      f64ToStr: () => this.f64ToStrHelper(),
+      fetchCallFunc: () => this.fetchCallFunc,
+      evPollFunc: () => this.evPollFuncOrThrow(),
+      ensureCapacity: (c, need) => this.emitEnsureCapacity(c, need),
+      stageCursor: () => this.cursorGlobal,
+      namedTrap: (c, message) => {
+        const exc = this.exc();
+        this.pushStrLitInto(c, message);
+        c.globalSet(exc.refG);
+        c.i32Const(EXC_STR);
+        c.globalSet(exc.kindG);
+        c.call(this.reportUncaughtHelper());
+      },
+      bytesType: () => this.bytesB.bytesType(),
+      bufType: () => this.bytesB.bufType(),
+      strToUtf8: () => this.bytesB.fromStrHelper("utf8"),
+      textDecode: () => this.bytesB.textDecodeHelper(),
+      jsonParse: () => this.json.parse(),
+      promRef: () => this.proms.promRef(),
+      promMint: () => this.proms.mint(),
+      promSettle: () => this.proms.settle(),
+      exc: () => this.exc(),
+      cellClear: (c) => this.emitCellClearInto(c),
+      reportUncaught: () => this.reportUncaughtHelper(),
+      checkpoint: (c) => this.emitCheckpoint(c),
+      errT: () => this.exc().errT,
+      causeT: () => this.fetchCauseT(),
+      vtGlobal: (className) => this.classes.vtGlobal(className),
+      errPre: (c, pushErr) => {
+        pushErr();
+        c.structGet(this.exc().errT, 0);
+        c.structGet(this.classes.ci(), CI_PRE);
+      },
+      setCellError: (c, className, name, pushMessage, code) => this.emitSetCellError(c, className, name, pushMessage, code),
+      domexNew: () => this.domexNewHelper(),
+      voidClos: () => this.closPairFor([], []),
+      setTimeoutHandle: () => this.timers.setTimeoutHandle(),
+      unrefTimer: () => this.timers.refOp(false),
+      numReceived: () => this.bytesB.numReceivedHelper(),
+      excObjTag: EXC_OBJ,
+      excRefTag: EXC_REF,
+      // Units G1-G3: a host-event source's records beside the requests.
+      ...(this.hevModule ? { foreign: () => this.hev.dispatchHelper() } : {}),
+    });
+    return this.fetchField;
+  }
 
   /** `class:domex` — errT's four fields, then `hasCause` (i32, the
    * PRESENCE of the options bag's own `cause` member: an explicit
@@ -4039,10 +4171,10 @@ class Assembler {
     // HANDLE and JSVAL are unconstructible on this tier (dyn.ts header).
     // INC-29 U1: a node:net handle does not clone (Node's DataCloneError
     // names it; this tier fences it, loudly).
-    if (this.netModule) {
+    if (this.netModule || this.fetchModule) {
       kindIn([DK.HANDLE]);
       c.ifVoid();
-      this.emitSetCellError(c, "%Error", "Error", (x) => this.pushStrLitInto(x, "structuredClone of a net handle is not supported yet"), null);
+      this.emitSetCellError(c, "%Error", "Error", (x) => this.pushStrLitInto(x, `structuredClone of a ${this.dyn.handleNoun()} is not supported yet`), null);
       c.refNull(dynT);
       ret();
       c.end();
@@ -6420,15 +6552,22 @@ class Assembler {
               poll: (c: Code) => c.call(this.cpa.pollHelper()),
               childRefLive: () => this.cpa.refLiveGlobal(),
             }
-          : {
-              // Units G1-G3: neither children nor net handles — the host-
-              // event builder's own poll phase and liveness.
-              poll: (c: Code) => c.call(this.hev.pollHelper()),
-              netAlive: (c: Code) => this.hev.emitAlive(c),
-            }),
-      // Units G1-G3: a host-event surface beside children or net handles
-      // holds the loop too (OR'd into their liveness).
-      ...(this.hevModule && (this.netModule || this.cpEventModule)
+          : this.fetchEvents
+            ? {
+                // #227: a fetch module's poll phase and liveness (fetch.ts):
+                // a request in flight holds the loop.
+                poll: (c: Code) => c.call(this.fetch.pollHelper()),
+                childRefLive: () => this.fetch.liveGlobal(),
+              }
+            : {
+                // Units G1-G3: neither children nor net handles — the host-
+                // event builder's own poll phase and liveness.
+                poll: (c: Code) => c.call(this.hev.pollHelper()),
+                netAlive: (c: Code) => this.hev.emitAlive(c),
+              }),
+      // Units G1-G3: a host-event surface beside children, net handles or
+      // fetch requests holds the loop too (OR'd into their liveness).
+      ...(this.hevModule && (this.netModule || this.cpEventModule || this.fetchEvents)
         ? { extraAlive: (c: Code) => this.hev.emitAlive(c) }
         : {}),
     });
@@ -8152,7 +8291,19 @@ class Assembler {
               : { keyGet: () => this.netHandleKeyGetFn(), invoke: (m: string) => this.netHandleInvokeFn(m) },
             bytesMethods: { bufType: () => this.bytesB.bufType() },
           }
-        : {}),
+        : this.fetchModule
+          ? {
+              // #227: a fetch module boxes its Responses, Headers,
+              // AbortSignals and ArrayBuffers as HANDLEs (tags 7..10).
+              handle: {
+                keyGet: () => this.fetch.keyGetFn(),
+                invoke: (m: string) => this.fetch.invokeFn(m),
+                classNames: FETCH_CLASS_NAMES,
+                noun: "fetch value",
+                toStringTags: true,
+              },
+            }
+          : {}),
       strRef: () => this.strRef,
       strType: () => this.strType,
       strEq: () => this.strEqHelper(),
@@ -8214,6 +8365,22 @@ class Assembler {
               c.call(this.dynField!.objPut());
               c.end();
               c.end();
+              // #227: "fetch failed" and its kin carry the host's cause
+              // (class:fetchCause), which crosses as itself.
+              if (this.fetchModule) {
+                const causeT = this.fetchCauseT();
+                c.localGet(errLocal);
+                c.refTest(causeT);
+                c.ifVoid();
+                c.localGet(objLocal);
+                this.pushStrLitInto(c, "cause");
+                c.localGet(errLocal);
+                c.refCast(causeT);
+                c.structGet(causeT, 4);
+                c.call(this.dynField!.fromError());
+                c.call(this.dynField!.objPut());
+                c.end();
+              }
             },
             // Object.assign's member put onto a DOMException view: the
             // same named refusal as the dyn member write (board #198).
@@ -24557,14 +24724,14 @@ class Assembler {
         // S087 (f)) — the handle's members are not a table to ask. Only in
         // a module that boxes handles; the may-throw view reads dynHasKey
         // as throwing there, and the pending check follows below.
-        const handleIn = this.netModule && this.dyn.handleLive();
+        const handleIn = (this.netModule || this.fetchModule) && this.dyn.handleLive();
         if (handleIn) {
           code.localGet(d);
           code.structGet(this.dyn.dynT(), DYN_KIND);
           code.i32Const(DK.HANDLE);
           code.i32Eq();
           code.ifVoid();
-          this.emitSetCellError(code, "%Error", "Error", (c2) => this.pushStrLitInto(c2, "'in' or Object.hasOwn on a net handle is not supported yet"), null);
+          this.emitSetCellError(code, "%Error", "Error", (c2) => this.pushStrLitInto(c2, `'in' or Object.hasOwn on a ${this.dyn.handleNoun()} is not supported yet`), null);
           code.end();
         }
         code.localGet(d);
@@ -28320,6 +28487,29 @@ class Assembler {
             // ambient-object representation nothing else needs.
             const globalGetName =
               e.args[0]!.kind === "jsOp" && e.args[0]!.op === "globalGet" ? e.args[0]!.name : undefined;
+            if (globalGetName === "AbortSignal") {
+              // #227: AbortSignal.timeout(delay) and the argument-less
+              // AbortSignal.abort() (fetch.ts); a reason for abort() and
+              // AbortSignal.any are not modelled.
+              if (this.fetchBlocked) {
+                this.refuse("fetch:with-net-or-child", e.loc);
+                code.unreachable();
+                return;
+              }
+              if (name === "timeout" && e.args.length === 2) {
+                this.walkExpr(e.args[1]!);
+                code.call(this.fetch.timeoutFn());
+                this.emitPendingCheck();
+                return;
+              }
+              if (name === "abort" && e.args.length === 1) {
+                code.call(this.fetch.abortNowFn());
+                return;
+              }
+              this.refuse(name === "abort" ? "fetch:AbortSignal.abort:reason" : `fetch:AbortSignal.${name}`, e.loc);
+              code.unreachable();
+              return;
+            }
             if (globalGetName === "Promise" && name === "resolve") {
               // The import bridge's spine (increment 21 stage C,
               // lower-island.ts:365–366): `Promise.resolve()`, ALWAYS
@@ -28821,6 +29011,22 @@ class Assembler {
             // on `e.args[0]`, never a real "parseFloat" ambient value.
             const globalGetFnName =
               e.args[0]!.kind === "jsOp" && e.args[0]!.op === "globalGet" ? e.args[0]!.name : undefined;
+            if (globalGetFnName === "fetch") {
+              // #227: the global fetch(input, init?) — fetch.ts builds the
+              // promise and the request; the host's fetch import does the
+              // network half.
+              if (this.fetchBlocked || e.args.length < 2 || e.args.length > 3) {
+                this.refuse(this.fetchBlocked ? "fetch:with-net-or-child" : `expr:${e.kind}`, e.loc);
+                code.unreachable();
+                return;
+              }
+              this.walkExpr(e.args[1]!);
+              if (e.args.length === 3) this.walkExpr(e.args[2]!);
+              else code.globalGet(this.dyn.undefinedGlobal());
+              code.call(this.fetch.startFn());
+              this.emitPendingCheck();
+              return;
+            }
             if (globalGetFnName === "parseFloat" || globalGetFnName === "parseInt") {
               // Both ToString their first argument (review round 1, SB7
               // — oracle-measured: `parseFloat(true)`/`parseInt(true,10)`

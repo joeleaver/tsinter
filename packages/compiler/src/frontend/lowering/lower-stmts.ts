@@ -3178,7 +3178,12 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
       // island members).
       (L.dynamic && init.type.kind === "dyn" && jsvalFlavoredType(L.mapTypeOf(L.typeOf(decl.name)) ?? DYN) ? DYN : null) ??
       (bindingTainted ? null : L.mapTypeOf(L.typeOf(decl.name))) ??
-      (init.type.kind === "dyn" ? DYN : null);
+      (init.type.kind === "dyn" ? DYN : null) ??
+      // The host-fetch slice without --dynamic (LowererMode.hostFetch): a
+      // value the module's fetch minted under a declared type with no
+      // static mapping (`const ab = await res.arrayBuffer()`) stays the
+      // handle it is, as the --dynamic rule above keeps it.
+      (L.hostFetch && !L.dynamic && init.type.kind === "jsval" ? JSVAL : null);
     // A JS `let x = {}`: TS's empty-object-literal type admits ANY later
     // non-nullish assignment (`envs = {}`, later `envs =
     // Object.fromEntries(...)` — tsc accepts every such write, since

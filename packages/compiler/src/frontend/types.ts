@@ -547,6 +547,10 @@ export interface TypeMapperCtx {
   /** --dynamic: `any` maps to the island handle type (jsval). Off, `any`
    * stays unmapped and the requires-dynamic diagnostic fires per site. */
   dynamic: boolean;
+  /** LowererMode.hostFetch: the backend's host supplies fetch, so the
+   * fetch slice's ambient types (ISLAND_AMBIENT_TYPES) map to jsval
+   * without --dynamic (the module serves them — SEMANTICS.md S098). */
+  hostFetch?: boolean;
   /** True for files the Lowerer actually compiles (its module order). A
    * class type can reach the entry through the TYPE world alone — a jsdoc
    * `typeof import('./mod')` over a module never imported at value level
@@ -1359,7 +1363,7 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
         ctx.isStdlibFile(d.getSourceFile()),
     )
   ) {
-    return ctx.dynamic ? JSVAL : null;
+    return ctx.dynamic || ctx.hostFetch === true ? JSVAL : null;
   }
   // ReadonlyMap/ReadonlySet are the SAME runtime values as Map/Set — the
   // readonly-ness is a checker-only view (no mutating members on the
