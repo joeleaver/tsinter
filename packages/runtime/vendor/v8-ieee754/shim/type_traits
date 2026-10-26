@@ -1,0 +1,26 @@
+// tsinter shim for the C++ <type_traits> header: the three traits
+// src/base/overflowing-math.h uses (is_integral, is_signed, make_unsigned),
+// over the standard integer types. Not a V8 file; see ../README.md.
+#ifndef SCR_SHIM_TYPE_TRAITS_
+#define SCR_SHIM_TYPE_TRAITS_
+
+namespace std {
+template <typename T> struct is_integral { static constexpr bool value = false; };
+template <typename T> struct is_signed { static constexpr bool value = false; };
+template <typename T> struct make_unsigned;
+
+#define SCR_SHIM_INT(S, U)                                                      \
+  template <> struct is_integral<S> { static constexpr bool value = true; };    \
+  template <> struct is_integral<U> { static constexpr bool value = true; };    \
+  template <> struct is_signed<S> { static constexpr bool value = true; };      \
+  template <> struct make_unsigned<S> { using type = U; };                      \
+  template <> struct make_unsigned<U> { using type = U; };
+SCR_SHIM_INT(signed char, unsigned char)
+SCR_SHIM_INT(short, unsigned short)
+SCR_SHIM_INT(int, unsigned int)
+SCR_SHIM_INT(long, unsigned long)
+SCR_SHIM_INT(long long, unsigned long long)
+#undef SCR_SHIM_INT
+}  // namespace std
+
+#endif  // SCR_SHIM_TYPE_TRAITS_

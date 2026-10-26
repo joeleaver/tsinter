@@ -496,12 +496,13 @@ console.log("unreachable", direct);
     expect(r.stderr).toContain("TypeError: expected string, got undefined");
   });
 
-  test("island-backed calls re-anchor the engine on fibers (Math after await)", async () => {
+  test("island-backed calls re-anchor the engine on fibers (an engine call after await)", async () => {
+    // (Math is static now -- SEMANTICS.md S100 -- so toPrecision is the engine call.)
     const r = await compileAndRun(
       "math-on-fiber",
       `async function calc(n: number): Promise<number> {
   await new Promise<void>((resolve) => resolve());
-  return Math.sqrt(n) + Math.floor(1.9);
+  return Number(Math.sqrt(n).toPrecision(6)) + Math.floor(1.9);
 }
 async function main(): Promise<void> {
   console.log(await calc(144));

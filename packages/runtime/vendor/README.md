@@ -43,6 +43,17 @@ Vendored: the files Node's zlib.gyp compiles for a target without SIMD (adler32.
 
 The objects build lazily on the first zlib-using compile into `.cache/zlib-<version>-<recipe>-<flavor>/` (recipe: a hash of the defines and the prefix header) next to this file — one flavor per driver/target and lane (plain, asan; the lre-objects pattern). Zlib-free binaries never compile any of this.
 
+## v8-ieee754/
+
+- Project: https://chromium.googlesource.com/v8/v8 (Node v24.18.1's V8, 13.6.233.17-node.50)
+- Version: tag 13.6.233.17
+- Files: `src/base/ieee754.cc` (sha256 1bf999809d4c4c1d31ad5ff3578d32614796f159e08b9e7782560d017721a0c2), `src/base/ieee754.h`, `src/base/overflowing-math.h`, fetched from `https://chromium.googlesource.com/v8/v8/+/refs/tags/13.6.233.17/<path>?format=TEXT`
+- License: BSD-3-Clause (V8's, see v8-ieee754/LICENSE); the fdlibm notice is reproduced in ieee754.cc itself
+
+Math's transcendental functions as Node computes them (SEMANTICS.md S100), kept ONCE for every lane. The native lanes compile ieee754.cc as C++ through packages/runtime/src/scr_ieee754.cc (which `#include`s it unmodified and exports `scr_ieee754_<fn>` with C linkage); the WasmGC tier compiles the text scripts/gen-wasm-ieee754-src.mjs renders from the same file into packages/compiler/src/backend/wasm/ieee754-src.ts (packages/compiler/test/wasm-ieee754-src-drift.test.ts pins the sha256 and the rendering). No vendored file is modified. `shim/` is OURS, not V8's: minimal stand-ins for the headers ieee754.cc and overflowing-math.h include — V8's `base-export.h`, `build_config.h` and `macros.h` (bit_cast and two attribute macros), and the three C++ standard headers `<cmath>`, `<limits>`, `<type_traits>` — so the file compiles with `-nostdinc++` and no C++ standard library is needed on the host or linked into a binary (the object references only libm). To update, re-fetch the three files at the new tag, update the sha in scripts/gen-wasm-ieee754-src.mjs, re-run it, and re-run test/math-ieee754.test.ts against the matching Node.
+
+The object builds lazily on the first build that calls a transcendental (or any --dynamic build) into `.cache/v8-ieee754-<input hash>-<flavor>/` next to this file (cc.ts, ensureIeee754Object) — `-std=c++17 -ffp-contract=off -fno-exceptions -fno-rtti`, one flavor per driver/target/lane.
+
 ## curl/
 
 - Project: https://curl.se/ (Debian bookworm's libcurl4-openssl-dev 7.88.1, the exact library the Linux lane's pinned container image ships)

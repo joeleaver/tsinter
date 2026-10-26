@@ -97,32 +97,23 @@ es2025-fences.ts:23:16 - error SC2020: 'Atomics.waitAsync' is part of the standa
 
   hint: Atomics.wait(int32Array, idx, expected, timeoutMs) is the supported Atomics surface (scriptc has no threads — wait is the synchronous-sleep idiom, and nothing else has anyone to race)
 
-es2025-fences.ts:26:7 - error SC2020: 'Float16Array<ArrayBuffer>' is part of the standard library types but has no scriptc lowering yet
+es2025-fences.ts:27:7 - error SC2020: 'Float16Array<ArrayBuffer>' is part of the standard library types but has no scriptc lowering yet
 
-  25 | // Float16 (ES2025): the typed array, Math.f16round, DataView accessors.
-  26 | const f16 = new Float16Array(4);
+  26 | // compiles statically on every lane — SEMANTICS.md S100).
+  27 | const f16 = new Float16Array(4);
      |       ^~~
-  27 | console.log(Math.f16round(1.337));
-
-  hint: the type checker sees the full standard library, but only the supported surface compiles (https://scriptc.dev/limitations)
-
-es2025-fences.ts:26:13 - error SC2020: 'new Float16Array' is part of the standard library types but has no scriptc lowering yet
-
-  25 | // Float16 (ES2025): the typed array, Math.f16round, DataView accessors.
-  26 | const f16 = new Float16Array(4);
-     |             ^~~~~~~~~~~~~~~~~~~
-  27 | console.log(Math.f16round(1.337));
-
-  hint: the type checker sees the full standard library, but only the supported surface compiles (https://scriptc.dev/limitations)
-
-es2025-fences.ts:27:13 - error SC2012: 'Math.f16round' runs in the embedded dynamic engine, which this build does not include
-
-  26 | const f16 = new Float16Array(4);
-  27 | console.log(Math.f16round(1.337));
-     |             ^~~~~~~~~~~~~~~~~~~~
   28 | const dv = new DataView(new Uint8Array(8).buffer);
 
-  hint: build with --dynamic to run this call in the embedded engine (adds ~620KB to the binary); static builds never include it
+  hint: the type checker sees the full standard library, but only the supported surface compiles (https://scriptc.dev/limitations)
+
+es2025-fences.ts:27:13 - error SC2020: 'new Float16Array' is part of the standard library types but has no scriptc lowering yet
+
+  26 | // compiles statically on every lane — SEMANTICS.md S100).
+  27 | const f16 = new Float16Array(4);
+     |             ^~~~~~~~~~~~~~~~~~~
+  28 | const dv = new DataView(new Uint8Array(8).buffer);
+
+  hint: the type checker sees the full standard library, but only the supported surface compiles (https://scriptc.dev/limitations)
 
 es2025-fences.ts:29:1 - error SC2020: 'DataView<ArrayBuffer>.setFloat16' is part of the standard library types but has no scriptc lowering yet
 

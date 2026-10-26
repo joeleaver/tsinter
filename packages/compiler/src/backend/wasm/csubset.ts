@@ -4,7 +4,7 @@
  * the upstream text itself, not a hand transcription of it: what this file must get
  * right is the C semantics of a few dozen constructs, each spelled out below, and
  * every one is exercised by the per-function bit-exact rows of
- * test/wasm-ieee754.test.ts against live Node.
+ * test/math-ieee754.test.ts against live Node.
  *
  * What it accepts, and what each construct means here (C11/C++17 on an LP64
  * target, which is what V8 is compiled as on Linux x86-64):
@@ -52,7 +52,7 @@
  * Anything else throws a CSubsetError naming the construct and line, while the
  * module is being built -- an internal error, never a wrong answer. The input is
  * fixed text, so whether it throws does not depend on the program being compiled;
- * test/wasm-ieee754.test.ts compiles every function. */
+ * test/math-ieee754.test.ts compiles every function. */
 
 import { Code } from "./code.js";
 import { F64, I32, I64, type ModuleBuilder, type ValType } from "./module.js";

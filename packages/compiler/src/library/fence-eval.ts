@@ -55,6 +55,7 @@ import {
   BUILTIN_MODULE_CONSTS,
   BUILTIN_MODULE_FNS,
   BUILTIN_MODULE_FN_ALIASES,
+  MATH_CONSTANTS,
   STATIC_MATH_FNS,
   STATIC_NUMBER_METHODS,
   STR_METHODS,
@@ -160,6 +161,8 @@ function fenceTaxonomy(): FenceTaxonomy {
   for (const [mod, members] of Object.entries(BUILTIN_MODULE_CONSTS)) {
     for (const member of Object.keys(members!)) foldedIds.add(`${builtinRootId(mod)}.${member}`);
   }
+  // Math's value properties fold to their numbers (lowerMathProperty).
+  for (const name of Object.keys(MATH_CONSTANTS)) foldedIds.add(`stdlib.math.${name}`);
   const ambientFns = new Map(AMBIENT_SURFACE_FNS.map((row) => [row.id, row.fns as readonly string[]]));
   taxonomy = { byId, ids: manifest.entries.map((e) => e.id), builtinFns, builtinRoots, foldedIds, ambientFns };
   return taxonomy;

@@ -4,8 +4,8 @@
  * package boundary fences for node_modules-declared symbols. */
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
-import { F64, IrExpr, IrStmt, IrType, JSVAL, MAX_ISLAND_CALLBACK_ARITY, STRING, VOID, canMarshalTypedFuncIntoIsland, islandPromisePayloadTag, isUnitType } from "../../ir/nodes.js";
-import { ISLAND_SURFACE, IslandFnEntry, STATIC_MATH_FNS, boundaryIntoIslandMsg } from "./surfaces.js";
+import { BOOL, DYN, F64, IrExpr, IrStmt, IrType, JSVAL, MAX_ISLAND_CALLBACK_ARITY, STRING, VOID, canMarshalTypedFuncIntoIsland, islandPromisePayloadTag, isUnitType } from "../../ir/nodes.js";
+import { ISLAND_SURFACE, IslandFnEntry, MATH_CONSTANTS, STATIC_MATH_FNS, boundaryIntoIslandMsg } from "./surfaces.js";
 import { requiresDynamicApiDiag, requiresDynamicPackageDiag } from "../../diagnostics/diagnostic.js";
 import { isCjsJsFile, isJsSourceFile, locOf, npmPackageNameOf } from "../program.js";
 import { pureReemittable } from "./lower-exprs.js";
@@ -679,46 +679,54 @@ import { PoisonError, newFnCtx, own } from "./lowerer.js";
       }
     }
     const isMath = L.stdlibGlobalMember(access, "Math") !== null;
-    // The STATIC Math members (floor/min/max/random): one C call IS the
-    // JS operation — no island, no --dynamic. Only the tabled arity with
+    // Math is STATIC on every lane (SEMANTICS.md S100): each member is one
+    // libCall that IS the JS operation -- no island, no --dynamic. The
+    // tabled arity (any plain arity for the variadic min/max/hypot) with
     // plain (non-spread) arguments takes this path; other forms fall
-    // through to the spread fold / island / lib fence below.
+    // through to the spread fold below or the lib fence.
     const staticMath = isMath ? own(STATIC_MATH_FNS, name) : undefined;
     if (
       staticMath &&
-      call.arguments.every((a) => !ts.isSpreadElement(a))
+      call.arguments.every((a) => !ts.isSpreadElement(a)) &&
+      (staticMath.variadic === true || call.arguments.length === staticMath.arity)
     ) {
       // Math.max/Math.min at ANY plain arity — Node's are variadic. The
       // spec's reduction is a left fold of the same NaN-poisoning
       // ±0-ordered scalar compare the two-arg form lowers to, so n
       // arguments nest n-1 scalar calls (arguments still evaluate left to
       // right, before any compare that involves them). One argument is
-      // the value itself (every argument here is number-typed, so the
-      // spec's ToNumber is the identity — NaN included), and zero
-      // arguments are the fold's seed: -Infinity for max, +Infinity for
-      // min, exactly Node.
+      // compared with the fold's seed, and zero arguments are the seed
+      // itself: -Infinity for max, +Infinity for min, exactly Node.
       if (name === "max" || name === "min") {
         if (call.arguments.length === 0) {
           return { kind: "numLit", value: name === "max" ? -Infinity : Infinity, type: F64, loc };
         }
-        const args = call.arguments.map((a) => L.lowerExprExpecting(a, F64));
-        let acc = args[0]!;
+        const args = lowerMathArgs(L, name, call);
+        // One argument folds against the seed too (V8 does: a NaN answer is
+        // then the compare's NaN -- 0xfff8000000000000 on x86-64 -- not
+        // the argument's own bits).
+        let acc: IrExpr =
+          args.length === 1
+            ? {
+                kind: "libCall",
+                fn: staticMath.fn,
+                args: [{ kind: "numLit", value: name === "max" ? -Infinity : Infinity, type: F64, loc }, args[0]!],
+                type: F64,
+                loc,
+              }
+            : args[0]!;
         for (let i = 1; i < args.length; i++) {
           acc = { kind: "libCall", fn: staticMath.fn, args: [acc, args[i]!], type: F64, loc };
         }
         return acc;
       }
-      if (call.arguments.length === staticMath.arity) {
-        const args = call.arguments.map((a) => L.lowerExprExpecting(a, F64));
-        return { kind: "libCall", fn: staticMath.fn, args, type: F64, loc };
-      }
+      return { kind: "libCall", fn: staticMath.fn, args: lowerMathArgs(L, name, call), type: F64, loc };
     }
     // `Math.max(...xs)` / `Math.min(...xs)` over a number[]: a STATIC
     // runtime fold (JS-exact: NaN poisons, ±0 order by the JS rules, the
-    // empty array yields ∓Infinity like the zero-arg calls) — no island
-    // involved, so it works without --dynamic too. Only the exact
-    // one-spread form lowers; mixed spread/positional argument lists keep
-    // the nest-calls fence.
+    // empty array yields ∓Infinity like the zero-arg calls). Only the
+    // exact one-spread form lowers; mixed spread/positional argument lists
+    // keep the nest-calls fence.
     if (
       isMath &&
       (name === "max" || name === "min") &&
@@ -742,18 +750,6 @@ import { PoisonError, newFnCtx, own } from "./lowerer.js";
         loc,
       };
     }
-    const mathFn = isMath ? own(ISLAND_SURFACE.math.fns, name) : undefined;
-    if (
-      mathFn &&
-      (call.arguments.length === mathFn.args.length ||
-        (mathFn.variadic === true && call.arguments.every((a) => !ts.isSpreadElement(a))))
-    ) {
-      L.requireDynamicApi(`'Math.${name}'`, call);
-      return finish(
-        { kind: "jsOp", op: "globalGet", name: "Math", args: [], type: JSVAL, loc },
-        mathFn,
-      );
-    }
     const kind = L.mapTypeOf(L.typeOf(access.expression))?.kind;
     const entry =
       kind === "f64"
@@ -770,28 +766,109 @@ import { PoisonError, newFnCtx, own } from "./lowerer.js";
     return finish(L.jsvalIn(L.lowerExpr(access.expression), access.expression), entry);
   }
 
-/** `Math.PI` / `Math.E` property READS: getProp off globalGet("Math"),
-   * exiting to the declared number type. Math methods referenced without a
-   * call are rejected specifically (no value form exists, --dynamic or
-   * not). Null for non-Math receivers (the property chain keeps trying). */
+/** `Math.PI` / `Math.E` and the other value properties: each folds to its
+   * number (MATH_CONSTANTS -- the same bits on every engine), on every lane.
+   * Math methods referenced without a call are rejected specifically (no
+   * value form exists). Null for non-Math receivers (the property chain
+   * keeps trying). */
   export function lowerMathProperty(L: Lowerer, expr: ts.PropertyAccessExpression): IrExpr | null {
     const member = L.stdlibGlobalMember(expr, "Math");
     if (member === null) return null;
     const loc = locOf(expr);
-    const propType = own(ISLAND_SURFACE.math.props, member);
-    if (propType !== undefined) {
-      L.requireDynamicApi(`'Math.${member}'`, expr);
-      const math: IrExpr = { kind: "jsOp", op: "globalGet", name: "Math", args: [], type: JSVAL, loc };
-      const read: IrExpr = { kind: "jsOp", op: "getProp", name: member, args: [math], type: JSVAL, loc };
-      return { kind: "jsExit", value: read, type: propType, loc };
-    }
-    if (
-      own(ISLAND_SURFACE.math.fns, member) !== undefined ||
-      own(STATIC_MATH_FNS, member) !== undefined
-    ) {
+    const value = own(MATH_CONSTANTS, member);
+    if (value !== undefined) return { kind: "numLit", value, type: F64, loc };
+    if (own(STATIC_MATH_FNS, member) !== undefined) {
       L.unsupported("SC1090", expr, `Math methods as values (call '${member}' directly)`);
     }
     return null; // declared-but-untabled members fall through generically
+  }
+
+/** A Math member's arguments, each converted with ECMA-262 ToNumber (the
+   * spec's first step in every Math function -- board #263, SEMANTICS.md
+   * S104): a number is itself; a string converts by StringToNumber and a
+   * boolean to 0/1; an `undefined` / `null` literal is NaN / 0; a
+   * checked-dynamic `any` value goes through dyn.toNumber and an island
+   * value through the engine's own unary plus -- both call an object's
+   * valueOf/toString -- and any other JSON-safe type (a union with unit
+   * arms, a unit-typed expression) crosses into a dyn value first. Node
+   * evaluates EVERY argument before converting any, and a conversion that
+   * can run user code (a dynamic argument's valueOf) can change what a
+   * later argument reads, so when a dynamic argument precedes a
+   * non-literal one each non-literal argument is first evaluated, left to
+   * right, into a hidden local, and only then converted (sequenced through
+   * the first argument's position: an always-true condition that performs
+   * the stores). */
+  function lowerMathArgs(L: Lowerer, _name: string, call: ts.CallExpression): IrExpr[] {
+    const isLiteral = (e: IrExpr): boolean => e.kind === "numLit" || e.kind === "strLit" || e.kind === "boolLit";
+    const raw = call.arguments.map((a, i): IrExpr => {
+      const e = L.lowerExpr(a);
+      switch (e.type.kind) {
+        case "f64": case "string": case "bool": case "dyn": case "jsval":
+          return e;
+        default:
+          if (e.kind === "unitLit") {
+            return { kind: "numLit", value: e.unit === "null" ? 0 : NaN, type: F64, loc: e.loc };
+          }
+          if (L.dynConvertible(e.type)) return { kind: "dynFrom", value: e, type: DYN, loc: e.loc };
+          return L.coerceInto(call.arguments[i]!, e, F64);
+      }
+    });
+    const convert = (e: IrExpr): IrExpr => {
+      const loc = e.loc;
+      switch (e.type.kind) {
+        case "string":
+          return { kind: "libCall", fn: "num.fromString", args: [e], type: F64, loc };
+        case "bool":
+          return {
+            kind: "ternary",
+            cond: e,
+            then: { kind: "numLit", value: 1, type: F64, loc },
+            else_: { kind: "numLit", value: 0, type: F64, loc },
+            type: F64,
+            loc,
+          };
+        case "dyn":
+          return { kind: "libCall", fn: "dyn.toNumber", args: [e], type: F64, loc };
+        case "jsval":
+          return {
+            kind: "jsExit",
+            value: { kind: "jsOp", op: "plus", args: [e], type: JSVAL, loc },
+            type: F64,
+            loc,
+          };
+        default:
+          return e;
+      }
+    };
+    const firstDynamic = raw.findIndex((e) => e.type.kind === "dyn" || e.type.kind === "jsval");
+    if (firstDynamic < 0 || !raw.some((e, j) => j > firstDynamic && !isLiteral(e))) return raw.map(convert);
+    // Evaluate first, convert after: every non-literal argument into a hidden local.
+    const stores: IrExpr[] = [];
+    const reads = raw.map((e): IrExpr => {
+      if (isLiteral(e)) return e;
+      const loc = e.loc;
+      const t = L.declareHiddenMutableLocal("%mathArg", e.type);
+      const store: IrExpr = { kind: "assignExpr", localId: t.id, value: e, type: e.type, loc };
+      // A side-effect-free boolean over the stored value, so the store runs exactly once.
+      const test: IrExpr =
+        e.type.kind === "f64"
+          ? { kind: "bin", op: "<", left: store, right: { kind: "numLit", value: 0, type: F64, loc }, type: BOOL, loc }
+          : e.type.kind === "string"
+            ? { kind: "strEq", negated: false, left: store, right: { kind: "strLit", value: "", type: STRING, loc }, type: BOOL, loc }
+            : e.type.kind === "bool"
+              ? store
+              : e.type.kind === "dyn"
+                ? { kind: "dynTest", test: "null", value: store, type: BOOL, loc }
+                : { kind: "jsOp", op: "truthy", args: [store], type: BOOL, loc };
+      stores.push({ kind: "logical", op: "||", left: test, right: { kind: "boolLit", value: true, type: BOOL, loc }, type: BOOL, loc });
+      return { kind: "varRef", localId: t.id, type: e.type, loc };
+    });
+    const out = reads.map(convert);
+    const loc = out[0]!.loc;
+    let cond = stores[0]!;
+    for (let i = 1; i < stores.length; i++) cond = { kind: "logical", op: "&&", left: cond, right: stores[i]!, type: BOOL, loc };
+    out[0] = { kind: "ternary", cond, then: out[0]!, else_: { kind: "numLit", value: NaN, type: F64, loc }, type: F64, loc };
+    return out;
   }
 
 /** The npm package a type is declared by ("commander", "@scope/pkg"),

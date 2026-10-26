@@ -121,8 +121,8 @@ const PROBES: Probe[] = [
   { id: "node-builtin.os.EOL", source: 'import { EOL } from "node:os";\nconsole.log(EOL.length);\n' },
   // status dynamic-only — refused with the entry's code statically,
   // analyzed clean under --dynamic
-  { id: "stdlib.math.sqrt", source: "console.log(Math.sqrt(2));\n" },
-  { id: "stdlib.math.PI", source: "console.log(Math.PI);\n" },
+  { id: "stdlib.number.toPrecision", source: "console.log((2).toPrecision(3));\n" },
+  { id: "stdlib.string.at", source: 'console.log("ab".at(1));\n' },
   { id: "stdlib.string.replace", source: 'console.log("aa".replace("a", "b"));\n' },
   { id: "diagnostic.sc2011", source: "const y: any = 1;\nconst z = y * 2;\nconsole.log(0);\n" },
   // status unsupported — refused with the entry's code

@@ -2575,14 +2575,15 @@ void scr_fs_scandir_free(ScrScandir *s) {
  * Node's, necessarily a different sequence (SEMANTICS.md S068); range and
  * granularity are pinned differentially by invariant, not by bytes. */
 
+/* (scr_math_minmax_nan, the NaN both answer, lives in scr_array.c beside the folds.) */
 double scr_math_min(double a, double b) {
-  if (isnan(a) || isnan(b)) return (double)NAN;
+  if (isnan(a) || isnan(b)) return scr_math_minmax_nan();
   if (a == 0.0 && b == 0.0) return signbit(a) ? a : b; /* -0 wins */
   return a < b ? a : b;
 }
 
 double scr_math_max(double a, double b) {
-  if (isnan(a) || isnan(b)) return (double)NAN;
+  if (isnan(a) || isnan(b)) return scr_math_minmax_nan();
   if (a == 0.0 && b == 0.0) return signbit(a) ? b : a; /* +0 wins */
   return a > b ? a : b;
 }
@@ -2600,7 +2601,8 @@ double scr_math_max(double a, double b) {
  * fraction is exactly 0.5); results
  * in (-0.5, 0] keep the sign (JS: Math.round(-0.3) is -0). */
 double scr_math_round(double x) {
-  if (isnan(x) || isinf(x) || x == 0.0) return x;
+  if (isnan(x)) return x + x; /* quieted, as V8 answers a signaling NaN in every tier (S100) */
+  if (isinf(x) || x == 0.0) return x;
   double f = floor(x);
   double diff = x - f;
   double r = diff < 0.5 ? f : f + 1.0;
@@ -2613,6 +2615,125 @@ double scr_math_random(void) {
   /* The top 53 bits scaled by 2^-53: every representable k/2^53 in [0,1)
    * is equally likely — V8's own construction. */
   return (double)(r >> 11) * 0x1.0p-53;
+}
+
+/* ── the rest of Math, as Node computes it (SEMANTICS.md S100) ─────────
+ * The twenty transcendentals are V8's own ieee754.cc, compiled as C++
+ * (scr_ieee754.cc, the scr_ieee754_* exports). These are the members V8
+ * computes in its builtins rather than in ieee754.cc; the WasmGC tier
+ * computes the same arms (emitter.ts: emitMath, emitHypot, f16roundHelper,
+ * jsPowHelper). */
+
+/* `x ** y` and Math.pow: V8 13.6's v8::internal::math::pow
+ * (src/numbers/ieee754.cc, use_std_math_pow on -- Node's default), arm for
+ * arm: the two NaN answers ECMA-262 has where IEEE pow does not (a NaN
+ * exponent; |x| = 1 with an infinite exponent) are quiet_NaN(); a NaN base
+ * is quieted; the optimizing compilers' two pre-cases (y = 2 is x * x, y =
+ * 0.5 is sqrt(x + 0), -Infinity ** 0.5 being +Infinity); and everything else
+ * is the C library's pow -- which is Node's own on the same machine (glibc's
+ * on Linux, SEMANTICS.md S079). */
+double scr_js_pow(double x, double y) {
+  if (isnan(y)) return __builtin_nan("");
+  if (isinf(y) && (x == 1 || x == -1)) return __builtin_nan("");
+  if (isnan(x)) x = __builtin_nan("");
+  if (y == 2) return x * x;
+  if (y == 0.5) {
+    if (isinf(x)) return INFINITY;
+    return sqrt(x + 0);
+  }
+  return pow(x, y);
+}
+
+/* Math.hypot over n already-ToNumber'd arguments: V8 13.6's math.tq
+ * MathHypot. Up to three arguments take the fast path (an infinite argument
+ * answers Infinity before NaN is looked at; the maximum of the absolute
+ * values -- NaN if any is -- answers NaN, then 0; two squares summed, or
+ * three with the compensation term); more take the slow path (NaN arguments
+ * stay out of the maximum, then Infinity, NaN, 0, and a Kahan sum of
+ * (v / max)^2 in argument order). The NaN answered is kNaN, the quiet one. */
+double scr_math_hypot(const double *xs, size_t n) {
+  if (n == 0) return 0;
+  if (n == 1) return fabs(xs[0]);
+  double a[3];
+  if (n <= 3) {
+    for (size_t i = 0; i < n; i++) a[i] = fabs(xs[i]);
+    for (size_t i = 0; i < n; i++) {
+      if (a[i] == INFINITY) return INFINITY;
+    }
+    double max = 0;
+    for (size_t i = 0; i < n; i++) {
+      if (isnan(a[i])) return __builtin_nan("");
+      if (i == 0 || a[i] > max) max = a[i];
+    }
+    if (max == 0) return 0;
+    double p0 = (a[0] / max) * (a[0] / max);
+    double p1 = (a[1] / max) * (a[1] / max);
+    if (n == 2) return sqrt(p0 + p1) * max;
+    double comp = (p0 + p1) - p0 - p1;
+    double p2 = (a[2] / max) * (a[2] / max);
+    return sqrt((p0 + p1) + (p2 - comp)) * max;
+  }
+  bool nan = false;
+  double max = 0;
+  for (size_t i = 0; i < n; i++) {
+    double v = fabs(xs[i]);
+    if (isnan(v)) nan = true;
+    else if (v > max) max = v;
+  }
+  if (max == INFINITY) return INFINITY;
+  if (nan) return __builtin_nan("");
+  if (max == 0) return 0;
+  double sum = 0, comp = 0;
+  for (size_t i = 0; i < n; i++) {
+    double v = fabs(xs[i]) / max;
+    double summand = v * v - comp;
+    double prelim = sum + summand;
+    comp = (prelim - sum) - summand;
+    sum = prelim;
+  }
+  return sqrt(sum) * max;
+}
+
+/* Math.sign: V8's MathSign, x < 0 ? -1 : x > 0 ? 1 : x (±0 and NaN are
+ * themselves, payload included). */
+double scr_math_sign(double x) { return x < 0 ? -1.0 : x > 0 ? 1.0 : x; }
+
+/* Math.fround: the binary32 rounding (ties to even) and back, the
+ * conversion instructions V8 emits. */
+double scr_math_fround(double x) { return (double)(float)x; }
+
+/* Math.f16round: x rounded to the nearest binary16 value (ties to even) in
+ * ONE rounding from the double, back as a double. With a = |x|: a NaN is the
+ * quiet NaN with x's sign (Node's answer whatever the payload); a >= 65520
+ * (65504 plus half its ulp) is Infinity; otherwise q = 2^(max(e, -14) - 10)
+ * is the binary16 quantum at a's binade e, a / q and the product back are
+ * exact, and rint rounds ties to even. The sign is copied back. */
+double scr_math_f16round(double x) {
+  if (isnan(x)) return copysign(__builtin_nan(""), x);
+  double a = fabs(x);
+  if (a >= 65520) return copysign(INFINITY, x);
+  uint64_t bits;
+  memcpy(&bits, &a, sizeof bits);
+  int e = (int)(bits >> 52) - 1023;
+  if (e < -14) e = -14;
+  uint64_t qbits = (uint64_t)(e - 10 + 1023) << 52;
+  double q;
+  memcpy(&q, &qbits, sizeof q);
+  return copysign(rint(a / q) * q, x);
+}
+
+static uint32_t scr_to_uint32(double d);
+static double scr_bits_as_int32(uint32_t u);
+
+/* Math.clz32: the leading zeros of ToUint32(x) (32 for 0). */
+double scr_math_clz32(double x) {
+  uint32_t u = scr_to_uint32(x);
+  return u == 0 ? 32.0 : (double)__builtin_clz(u);
+}
+
+/* Math.imul: ToInt32(a) * ToInt32(b) modulo 2^32, as an Int32. */
+double scr_math_imul(double a, double b) {
+  return scr_bits_as_int32(scr_to_uint32(a) * scr_to_uint32(b));
 }
 
 ScrStr *scr_crypto_random_uuid(void) {

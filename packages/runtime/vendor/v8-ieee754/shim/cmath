@@ -1,0 +1,32 @@
+// tsinter shim for the C++ <cmath> header, as src/base/ieee754.cc and the
+// shims beside this file use it: the C library's math.h functions, plus the
+// std:: classification functions as the compiler builtins. The native lanes
+// compile ieee754.cc with -nostdinc++ against these shims, so the build needs
+// no C++ standard library (none is linked, and the host may have none
+// installed). Not a V8 file; see ../README.md.
+#ifndef SCR_SHIM_CMATH_
+#define SCR_SHIM_CMATH_
+
+#include <math.h>
+
+#include <limits>  // libstdc++ and libc++ <cmath> both bring it in; overflowing-math.h relies on that
+
+// math.h may define these as macros in C++ mode; <cmath> provides functions.
+#undef signbit
+#undef isnan
+#undef isinf
+#undef isfinite
+
+namespace std {
+inline bool signbit(double x) { return __builtin_signbit(x); }
+inline bool signbit(float x) { return __builtin_signbit(x); }
+inline bool isnan(double x) { return __builtin_isnan(x); }
+inline bool isinf(double x) { return __builtin_isinf(x); }
+inline bool isfinite(double x) { return __builtin_isfinite(x); }
+using ::fabs;
+using ::sqrt;
+inline float sqrt(float x) { return ::sqrtf(x); }
+using ::scalbn;
+}  // namespace std
+
+#endif  // SCR_SHIM_CMATH_

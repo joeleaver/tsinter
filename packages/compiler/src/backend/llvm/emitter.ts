@@ -87,6 +87,7 @@ import {
 } from "./classes.js";
 import { DK, LlDyn } from "./dyn.js";
 import { LlvmUnsupportedError } from "./unsupported.js";
+import { foldFloatConst, foldNegation } from "../float-fold.js";
 import { LlWalkers } from "./walkers.js";
 import {
   arrNewCall,
@@ -173,6 +174,38 @@ const LIB_FN_SYMS: Record<string, string> = {
   "num.parseFloat": "scr_parse_float",
   "num.fromString": "scr_string_to_number",
   "math.round": "scr_math_round",
+  // The rest of Math (SEMANTICS.md S100): the transcendentals are V8's
+  // ieee754.cc (the object cc.ts links on IR_IEEE754_FNS), the others
+  // scr_lib.c's (pow is `**`'s scr_js_pow). math.sqrt and math.hypot have
+  // their own arms (an intrinsic; an n-ary array).
+  "math.acos": "scr_ieee754_acos",
+  "math.acosh": "scr_ieee754_acosh",
+  "math.asin": "scr_ieee754_asin",
+  "math.asinh": "scr_ieee754_asinh",
+  "math.atan": "scr_ieee754_atan",
+  "math.atanh": "scr_ieee754_atanh",
+  "math.atan2": "scr_ieee754_atan2",
+  "math.cbrt": "scr_ieee754_cbrt",
+  "math.cos": "scr_ieee754_cos",
+  "math.cosh": "scr_ieee754_cosh",
+  "math.exp": "scr_ieee754_exp",
+  "math.expm1": "scr_ieee754_expm1",
+  "math.log": "scr_ieee754_log",
+  "math.log1p": "scr_ieee754_log1p",
+  "math.log2": "scr_ieee754_log2",
+  "math.log10": "scr_ieee754_log10",
+  "math.sin": "scr_ieee754_sin",
+  "math.sinh": "scr_ieee754_sinh",
+  "math.tan": "scr_ieee754_tan",
+  "math.tanh": "scr_ieee754_tanh",
+  "math.pow": "scr_js_pow",
+  "math.sign": "scr_math_sign",
+  "math.fround": "scr_math_fround",
+  "math.f16round": "scr_math_f16round",
+  "math.clz32": "scr_math_clz32",
+  "math.imul": "scr_math_imul",
+  // ToNumber over a dyn value (board #263): may throw (pending check).
+  "dyn.toNumber": "scr_dyn_to_number",
   // decodeUriComponent is NOT here: it throws (MAY_THROW_LIB_FNS), so it
   // refuses by name like the rest of the throwing tier.
   "str.encodeUriComponent": "scr_str_encode_uri_component",
@@ -3998,12 +4031,19 @@ class LlEmitter {
         return { name: t, type: e.type };
       }
       case "bin": {
+        // A literal-only `**` folds as V8's parser folds it (float-fold.ts;
+        // a NaN is the canonical quiet NaN -- S036, board #207).
+        if (e.op === "**") {
+          const folded = foldFloatConst(e);
+          if (folded !== undefined) return { name: f64Lit(Number.isNaN(folded) ? NaN : folded), type: e.type };
+        }
         const l = this.emitExpr(e.left);
         const r = this.emitExpr(e.right);
         const t = B.tmp();
         const arith: Record<string, string> = { "+": "fadd", "-": "fsub", "*": "fmul", "/": "fdiv" };
         const cmp: Record<string, string> = { "<": "olt", "<=": "ole", ">": "ogt", ">=": "oge", "===": "oeq", "!==": "une" };
-        const libm: Record<string, string> = { "%": "fmod", "**": "pow" };
+        // `**` is V8's math::pow (scr_js_pow, SEMANTICS.md S079).
+        const libm: Record<string, string> = { "%": "fmod", "**": "scr_js_pow" };
         const bit: Record<string, string> = {
           "&": "scr_bit_and",
           "|": "scr_bit_or",
@@ -4042,6 +4082,9 @@ class LlEmitter {
         return { name: t, type: e.type };
       }
       case "unary": {
+        // A literal-only negation folds as V8's parser folds it (float-fold.ts).
+        const negFolded = foldNegation(e);
+        if (negFolded !== undefined) return { name: f64Lit(Number.isNaN(negFolded) ? NaN : negFolded), type: e.type };
         const v = this.emitExpr(e.operand);
         const t = B.tmp();
         if (e.op === "-") B.line(`${t} = fneg double ${v.name}`);
@@ -12021,6 +12064,33 @@ class LlEmitter {
       this.declare(`declare double @llvm.fabs.f64(double)`);
       const t = B.tmp();
       B.line(`${t} = call double @llvm.fabs.f64(double ${v.name})`);
+      return { name: t, type: e.type };
+    }
+    if (e.fn === "math.sqrt") {
+      const v = this.emitExpr(e.args[0]!);
+      this.declare(`declare double @llvm.sqrt.f64(double)`);
+      const t = B.tmp();
+      B.line(`${t} = call double @llvm.sqrt.f64(double ${v.name})`);
+      return { name: t, type: e.type };
+    }
+    if (e.fn === "math.hypot") {
+      // math.tq's MathHypot over the arguments (already ToNumber'd), in an
+      // entry-block array: scr_math_hypot(xs, n).
+      const vs = e.args.map((a) => this.emitExpr(a));
+      this.declare(`declare double @scr_math_hypot(ptr, i64)`);
+      const t = B.tmp();
+      if (vs.length === 0) {
+        B.line(`${t} = call double @scr_math_hypot(ptr null, i64 0)`);
+        return { name: t, type: e.type };
+      }
+      const arr = B.tmp();
+      B.entryAllocas.push(`${arr} = alloca [${vs.length} x double]`);
+      vs.forEach((v, i) => {
+        const slot = B.tmp();
+        B.line(`${slot} = getelementptr inbounds [${vs.length} x double], ptr ${arr}, i64 0, i64 ${i}`);
+        B.line(`store double ${v.name}, ptr ${slot}`);
+      });
+      B.line(`${t} = call double @scr_math_hypot(ptr ${arr}, i64 ${vs.length})`);
       return { name: t, type: e.type };
     }
     if (e.fn === "num.isNaN") {

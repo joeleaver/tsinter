@@ -132,8 +132,12 @@ function hostPowUses(text: string): string[] {
 
 /** The text of emitter.ts's tryFoldFloatConst, from its declaration to its matching close brace (by tokens). */
 function tryFoldFloatConstText(): string {
-  const text = readFileSync(fileURLToPath(new URL("../src/backend/wasm/emitter.ts", import.meta.url)), "utf8");
-  const at = text.indexOf("private tryFoldFloatConst(");
+  // The fold rule lives in backend/float-fold.ts (shared with the native lanes since
+  // the Math-the-same unit); the wasm emitter's tryFoldFloatConst only delegates to it.
+  const emitter = readFileSync(fileURLToPath(new URL("../src/backend/wasm/emitter.ts", import.meta.url)), "utf8");
+  expect(emitter).toContain("return foldFloatConst(e);");
+  const text = readFileSync(fileURLToPath(new URL("../src/backend/float-fold.ts", import.meta.url)), "utf8");
+  const at = text.indexOf("export function foldFloatConst(");
   expect(at).toBeGreaterThan(0);
   const scanner = ts.createScanner(ts.ScriptTarget.Latest, true, ts.LanguageVariant.Standard, text, undefined, at);
   let depth = 0;
@@ -141,7 +145,7 @@ function tryFoldFloatConstText(): string {
     if (k === ts.SyntaxKind.OpenBraceToken) depth++;
     if (k === ts.SyntaxKind.CloseBraceToken && --depth === 0) return text.slice(at, scanner.getTextPos());
   }
-  throw new Error("tryFoldFloatConst's body not closed");
+  throw new Error("foldFloatConst's body not closed");
 }
 
 // ----------------------------------------------------------------------
@@ -526,13 +530,14 @@ test("S02 STATIC: ** in a generic function, a class method and a loop", async ()
 });
 
 // ----------------------------------------------------------------------
-// NOT-LIFTED — what stays refused, by name
+// N — Math.pow (lifted) and what stays refused, by name
 
-test("N01 NOT-LIFTED: Math.pow stays refused (plain build) — a named refusal", async () => {
-  const src = "const buf = Buffer.alloc(8);\nfunction bits(v: number): string {\n  buf.writeDoubleBE(v, 0);\n  return buf.toString(\"hex\");\n}\nfunction hx(h: string): number {\n  return Buffer.from(h, \"hex\").readDoubleBE(0);\n}\nfunction out(r: number): string {\n  return (r !== r ? \"NaN\" : bits(r)) + (Object.is(r, -0) ? \" IS-NEG-ZERO\" : \"\");\n}\nfunction mp(a: number, b: number): number {\n  return Math.pow(a, b);\n}\nconsole.log(\"N01.1 \" + out(mp(2, 0.5)));\n";
-  const { diagnostics, survey } = await refuseRow("n01", src);
-  expect(diagnostics).toEqual(["SC2012: 'Math.pow' runs in the embedded dynamic engine, which this build does not include"]);
-  expect(survey).toEqual([]);
+test("N01 LIFTED (SEMANTICS.md S100): Math.pow in a plain build computes through %w.jsPow -- the bits of `**`", async () => {
+  const src = "const buf = Buffer.alloc(8);\nfunction bits(v: number): string {\n  buf.writeDoubleBE(v, 0);\n  return buf.toString(\"hex\");\n}\nfunction out(r: number): string {\n  return (r !== r ? \"NaN\" : bits(r)) + (Object.is(r, -0) ? \" IS-NEG-ZERO\" : \"\");\n}\nfunction mp(a: number, b: number): number {\n  return Math.pow(a, b);\n}\nconst pairs: number[][] = [[2, 0.5], [1.1, 3.7], [-8, 1 / 3], [10, -2], [-0, -3], [0.9999999, 1e10], [3, 2], [1.0000001, -1]];\nfor (const [a, b] of pairs) {\n  const m = mp(a!, b!);\n  console.log(\"N01 \" + out(m) + \" \" + (out(m) === out(a! ** b!) ? \"same\" : \"DIFFERENT\"));\n}\n";
+  const { stdout, stderr, exitCode } = await runRow("n01", src);
+  expect(stdout).toBe("N01 3ff6a09e667f3bcd same\nN01 3ff6c3e91ed0825a same\nN01 NaN same\nN01 3f847ae147ae147b same\nN01 fff0000000000000 same\nN01 0000000000000000 same\nN01 4022000000000000 same\nN01 3fefffffca501b24 same\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
 test("N02 LIFTED (the Math unit, SEMANTICS.md S100): Math.pow under --dynamic computes through %w.jsPow -- the bits of `**`", async () => {

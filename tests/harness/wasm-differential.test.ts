@@ -3620,6 +3620,10 @@ const TIER_FLOOR: string[] = [
   // "exports" condition objects resolve with Node's condition set for the
   // importing syntax (node-conditions.ts): 1083 -> 1084.
   "2757-imports-field-node-conditions/main.ts",
+  // Math the same: every Math member static on every lane, from one
+  // vendored copy of V8's ieee754.cc; raw transcendentals, `any` arguments
+  // through ToNumber (SEMANTICS.md S100, S104): 1084 -> 1085.
+  "2758-math-static-raw.ts",
 ];
 
 interface RunResult {

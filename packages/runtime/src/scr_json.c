@@ -1533,6 +1533,60 @@ ScrStr *scr_dyn_string_coerce_js(const ScrDyn *d) {
   return scr_dyn_string_coerce(d);
 }
 
+/* ToNumber of a PRIMITIVE dyn kind (the scr_dyn_to_number arms that cannot
+ * run user code). */
+static double scr_dyn_prim_to_number(const ScrDyn *d) {
+  switch (d->kind) {
+  case SCR_DYN_NUM: return d->v.num;
+  case SCR_DYN_BOOL: return d->v.b ? 1.0 : 0.0;
+  case SCR_DYN_NULL: return 0.0;
+  case SCR_DYN_UNDEF: return __builtin_nan("");
+  case SCR_DYN_STR: return scr_string_to_number(d->v.str);
+  default: break;
+  }
+  ScrStr *s = scr_dyn_string_coerce(d);
+  double n = scr_string_to_number(s);
+  scr_str_release(s);
+  return n;
+}
+
+double scr_dyn_to_number(const ScrDyn *d) {
+  if (d->kind != SCR_DYN_OBJ) {
+    /* Arrays, bytes, functions, handles, promises: their inherited valueOf
+     * answers the object, so the string form decides (S015 -- members
+     * nested inside are not consulted). */
+    if (d->kind == SCR_DYN_FUNC) return __builtin_nan(""); /* source text is never numeric */
+    return scr_dyn_prim_to_number(d);
+  }
+  static const char *const hint[2] = { "valueOf", "toString" };
+  for (int i = 0; i < 2; i++) {
+    ScrDyn *m = scr_dyn_obj_get(d, hint[i], strlen(hint[i])); /* borrowed */
+    if (m == NULL) {
+      /* Object.prototype's own: valueOf answers the object (next hint),
+       * toString "[object Object]" -- NaN. A null-prototype object has
+       * neither. */
+      if (i == 1 && !d->null_proto) return __builtin_nan("");
+      continue;
+    }
+    if (m->kind != SCR_DYN_FUNC) continue; /* not callable: skipped */
+    ScrDyn *r = scr_dyn_call(m, NULL, 0, hint[i]);
+    if (!r) return __builtin_nan(""); /* the method threw -- pending */
+    if (r->kind == SCR_DYN_OBJ || r->kind == SCR_DYN_ARR ||
+        r->kind == SCR_DYN_FUNC || r->kind == SCR_DYN_HANDLE ||
+        r->kind == SCR_DYN_PROMISE || r->kind == SCR_DYN_BYTES ||
+        r->kind == SCR_DYN_JSVAL) {
+      scr_dyn_release(r); /* an object: try the next hint */
+      continue;
+    }
+    double n = scr_dyn_prim_to_number(r);
+    scr_dyn_release(r);
+    return n;
+  }
+  static const char msg[] = "Cannot convert object to primitive value";
+  scr_throw_error_msg(SCR_ERR_TYPE, msg, sizeof msg - 1);
+  return __builtin_nan("");
+}
+
 /* The checked-dynamic keyed WRITE (`h.k = v` on a dyn receiver): OBJ sets
  * the member (later writes win, insertion order — JS); undefined/null
  * throws Node's "Cannot set properties of ..."; every other kind throws

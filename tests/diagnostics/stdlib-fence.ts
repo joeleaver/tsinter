@@ -31,8 +31,8 @@ const st = new Set(new Set([1, 2])); // array seeds lower; Set/iterable seeds st
 const agg = new AggregateError([]);
 const stack = new Error("boom").stack;
 
-// An island-only member (Math.SQRT2: SC2012 without --dynamic), then unlowered members on lowered containers.
-const sqrt2 = Math.SQRT2;
+// Unlowered members on lowered containers. (Math is wholly static now —
+// SEMANTICS.md S100 — so no Math member is island-only.)
 // (n-ary Math.min/max LOWER now — the variadic battery lives in the
 // corpus; the mixed spread/positional list is the form that stays fenced.)
 const clamped = Math.min(1, ...[2, 3]);

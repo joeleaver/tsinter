@@ -2077,169 +2077,169 @@
       "id": "stdlib.math.E",
       "kind": "stdlib",
       "name": "Math.E",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "folds to its number at compile time"
     },
     {
       "id": "stdlib.math.LN10",
       "kind": "stdlib",
       "name": "Math.LN10",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "folds to its number at compile time"
     },
     {
       "id": "stdlib.math.LN2",
       "kind": "stdlib",
       "name": "Math.LN2",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "folds to its number at compile time"
     },
     {
       "id": "stdlib.math.LOG10E",
       "kind": "stdlib",
       "name": "Math.LOG10E",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "folds to its number at compile time"
     },
     {
       "id": "stdlib.math.LOG2E",
       "kind": "stdlib",
       "name": "Math.LOG2E",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "folds to its number at compile time"
     },
     {
       "id": "stdlib.math.PI",
       "kind": "stdlib",
       "name": "Math.PI",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "folds to its number at compile time"
     },
     {
       "id": "stdlib.math.SQRT1_2",
       "kind": "stdlib",
       "name": "Math.SQRT1_2",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "folds to its number at compile time"
     },
     {
       "id": "stdlib.math.SQRT2",
       "kind": "stdlib",
       "name": "Math.SQRT2",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "folds to its number at compile time"
     },
     {
       "id": "stdlib.math.abs",
       "kind": "stdlib",
       "name": "Math.abs",
       "status": "static",
-      "note": "compiles statically at arity 1; other declared call shapes run only in the embedded dynamic engine (SC2012 without --dynamic)"
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.acos",
       "kind": "stdlib",
       "name": "Math.acos",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.acosh",
       "kind": "stdlib",
       "name": "Math.acosh",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.asin",
       "kind": "stdlib",
       "name": "Math.asin",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.asinh",
       "kind": "stdlib",
       "name": "Math.asinh",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.atan",
       "kind": "stdlib",
       "name": "Math.atan",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.atan2",
       "kind": "stdlib",
       "name": "Math.atan2",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 2"
     },
     {
       "id": "stdlib.math.atanh",
       "kind": "stdlib",
       "name": "Math.atanh",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.cbrt",
       "kind": "stdlib",
       "name": "Math.cbrt",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.ceil",
       "kind": "stdlib",
       "name": "Math.ceil",
       "status": "static",
-      "note": "compiles statically at arity 1; other declared call shapes run only in the embedded dynamic engine (SC2012 without --dynamic)"
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.clz32",
       "kind": "stdlib",
       "name": "Math.clz32",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.cos",
       "kind": "stdlib",
       "name": "Math.cos",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.cosh",
       "kind": "stdlib",
       "name": "Math.cosh",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.exp",
       "kind": "stdlib",
       "name": "Math.exp",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.expm1",
       "kind": "stdlib",
       "name": "Math.expm1",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.f16round",
       "kind": "stdlib",
       "name": "Math.f16round",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.floor",
@@ -2252,71 +2252,71 @@
       "id": "stdlib.math.fround",
       "kind": "stdlib",
       "name": "Math.fround",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.hypot",
       "kind": "stdlib",
       "name": "Math.hypot",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at any plain (non-spread) arity"
     },
     {
       "id": "stdlib.math.imul",
       "kind": "stdlib",
       "name": "Math.imul",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 2"
     },
     {
       "id": "stdlib.math.log",
       "kind": "stdlib",
       "name": "Math.log",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.log10",
       "kind": "stdlib",
       "name": "Math.log10",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.log1p",
       "kind": "stdlib",
       "name": "Math.log1p",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.log2",
       "kind": "stdlib",
       "name": "Math.log2",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.max",
       "kind": "stdlib",
       "name": "Math.max",
       "status": "static",
-      "note": "compiles statically at arity 2"
+      "note": "compiles statically at any plain (non-spread) arity"
     },
     {
       "id": "stdlib.math.min",
       "kind": "stdlib",
       "name": "Math.min",
       "status": "static",
-      "note": "compiles statically at arity 2"
+      "note": "compiles statically at any plain (non-spread) arity"
     },
     {
       "id": "stdlib.math.pow",
       "kind": "stdlib",
       "name": "Math.pow",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 2"
     },
     {
       "id": "stdlib.math.random",
@@ -2330,56 +2330,56 @@
       "kind": "stdlib",
       "name": "Math.round",
       "status": "static",
-      "note": "compiles statically at arity 1; other declared call shapes run only in the embedded dynamic engine (SC2012 without --dynamic)"
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.sign",
       "kind": "stdlib",
       "name": "Math.sign",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.sin",
       "kind": "stdlib",
       "name": "Math.sin",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.sinh",
       "kind": "stdlib",
       "name": "Math.sinh",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.sqrt",
       "kind": "stdlib",
       "name": "Math.sqrt",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.tan",
       "kind": "stdlib",
       "name": "Math.tan",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.tanh",
       "kind": "stdlib",
       "name": "Math.tanh",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.math.trunc",
       "kind": "stdlib",
       "name": "Math.trunc",
       "status": "static",
-      "note": "compiles statically at arity 1; other declared call shapes run only in the embedded dynamic engine (SC2012 without --dynamic)"
+      "note": "compiles statically at arity 1"
     },
     {
       "id": "stdlib.number.toFixed",

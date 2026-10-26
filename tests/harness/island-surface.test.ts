@@ -26,7 +26,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, test } from "vitest";
 import * as ts from "../../packages/compiler/src/frontend/ts7/adapter.js";
-import { ambientDtsPath, ir, ISLAND_SURFACE, overridesDtsPath, type IslandFnEntry } from "@tsinter/compiler";
+import { ambientDtsPath, ir, ISLAND_SURFACE, MATH_CONSTANTS, overridesDtsPath, STATIC_MATH_FNS, type IslandFnEntry } from "@tsinter/compiler";
 import { loadProgram } from "../../packages/compiler/src/frontend/program.js";
 
 function placeholder(t: ir.IrType): string {
@@ -51,8 +51,12 @@ interface Probe {
 }
 
 const probes: Probe[] = [
-  ...Object.entries(ISLAND_SURFACE.math.fns).map(([name, entry]) => ({
-    what: `Math.${name}`, callee: `Math.${name}`, entry: entry!,
+  // Math is static now (STATIC_MATH_FNS, SEMANTICS.md S100), but its table
+  // makes the same promise: each member at its tabled arity typechecks and
+  // returns number.
+  ...Object.entries(STATIC_MATH_FNS).map(([name, entry]) => ({
+    what: `Math.${name}`, callee: `Math.${name}`,
+    entry: { args: Array.from({ length: entry!.arity }, () => ir.F64), ret: ir.F64 },
   })),
   ...Object.entries(ISLAND_SURFACE.number).map(([name, entry]) => ({
     what: `number.${name}`, callee: `__num.${name}`, entry: entry!,
@@ -64,10 +68,10 @@ const probes: Probe[] = [
     what: name, callee: name, entry: entry!,
   })),
 ];
-const propProbes = Object.entries(ISLAND_SURFACE.math.props).map(([name, propType]) => ({
+const propProbes = Object.keys(MATH_CONSTANTS).map((name) => ({
   what: `Math.${name}`,
   expr: `Math.${name}`,
-  type: propType!,
+  type: ir.F64,
 }));
 
 // One probe program through the compiler's own loader, containing every

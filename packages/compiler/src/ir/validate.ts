@@ -203,6 +203,36 @@ export const LIB_FN_SIGS: Record<IrLibFn, { argTypes: (IrType | null)[]; result:
   "math.min": { argTypes: [F64, F64], result: F64 },
   "math.max": { argTypes: [F64, F64], result: F64 },
   "math.random": { argTypes: [], result: F64 },
+  "math.acos": { argTypes: [F64], result: F64 },
+  "math.acosh": { argTypes: [F64], result: F64 },
+  "math.asin": { argTypes: [F64], result: F64 },
+  "math.asinh": { argTypes: [F64], result: F64 },
+  "math.atan": { argTypes: [F64], result: F64 },
+  "math.atanh": { argTypes: [F64], result: F64 },
+  "math.cbrt": { argTypes: [F64], result: F64 },
+  "math.cos": { argTypes: [F64], result: F64 },
+  "math.cosh": { argTypes: [F64], result: F64 },
+  "math.exp": { argTypes: [F64], result: F64 },
+  "math.expm1": { argTypes: [F64], result: F64 },
+  "math.log": { argTypes: [F64], result: F64 },
+  "math.log1p": { argTypes: [F64], result: F64 },
+  "math.log2": { argTypes: [F64], result: F64 },
+  "math.log10": { argTypes: [F64], result: F64 },
+  "math.sin": { argTypes: [F64], result: F64 },
+  "math.sinh": { argTypes: [F64], result: F64 },
+  "math.tan": { argTypes: [F64], result: F64 },
+  "math.tanh": { argTypes: [F64], result: F64 },
+  "math.sqrt": { argTypes: [F64], result: F64 },
+  "math.sign": { argTypes: [F64], result: F64 },
+  "math.fround": { argTypes: [F64], result: F64 },
+  "math.f16round": { argTypes: [F64], result: F64 },
+  "math.clz32": { argTypes: [F64], result: F64 },
+  "math.atan2": { argTypes: [F64, F64], result: F64 },
+  "math.pow": { argTypes: [F64, F64], result: F64 },
+  "math.imul": { argTypes: [F64, F64], result: F64 },
+  // Any number of f64 arguments (checked in the libCall case).
+  "math.hypot": { argTypes: [], result: F64 },
+  "dyn.toNumber": { argTypes: [DYN], result: F64 },
   "num.parseInt": { argTypes: [STRING, F64], result: F64 },
   "num.parseFloat": { argTypes: [STRING], result: F64 },
   "num.fromString": { argTypes: [STRING], result: F64 },
@@ -3495,7 +3525,8 @@ function validateFunction(
           e.fn === "writable.write" ||
           e.fn === "writable.writeStr" || e.fn === "writable.writeU" ||
           e.fn === "writable.end" ||
-          e.fn === "readable.unpipe";
+          e.fn === "readable.unpipe" ||
+          e.fn === "math.hypot";
         if (variadic
           ? e.args.length < sig.argTypes.length
           : e.args.length !== sig.argTypes.length) {
@@ -3506,6 +3537,9 @@ function validateFunction(
           const want = sig.argTypes[i];
           if (want) expectType(a, want, `libCall ${e.fn} arg ${i}`);
         });
+        if (e.fn === "math.hypot") {
+          e.args.forEach((a, i) => expectType(a, F64, `libCall math.hypot arg ${i}`));
+        }
         if (e.fn === "string.fromCharCode") {
           // One packed f64[] or one bytes value (the spread form).
           const t = e.args[0]?.type;

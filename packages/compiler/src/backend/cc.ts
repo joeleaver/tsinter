@@ -84,6 +84,13 @@ export interface CcOptions {
    * Node itself bundles (ensureZlibObjects, per flavor and target; no
    * system libz on any target), so deflate's bytes are Node's. */
   zlib?: boolean;
+  /** The program calls one of Math's twenty transcendentals (index.ts
+   * detects the math.<fn> libCalls on the IR, moduleUsesIeee754): links
+   * the object compiled from V8's ieee754.cc (ensureIeee754Object).
+   * --dynamic builds link it whatever the IR says -- scr_island.c points
+   * the engine's Math at the same functions. Off = Math-free: the link
+   * line is exactly the historical one. */
+  ieee754?: boolean;
   /** The program uses node:assert (index.ts detects assert.* libCalls on
    * the IR): compiles scr_assert.c — the zlib gating precedent, so
    * assert-free binaries keep their exact size class. scr_regex.c calls
@@ -604,6 +611,97 @@ async function ensureZlibObjects(sanitize: boolean, driver: CcDriver): Promise<s
   return objects;
 }
 
+function vendorIeee754Dir(): string {
+  return join(runtimeSrcDir(), "..", "vendor", "v8-ieee754");
+}
+
+/** Every input of the ieee754 object, relative to the runtime package root:
+ * the wrapper TU, the vendored V8 files, and the header shims. Their content
+ * hash keys the object cache (and, through the object's path, the binary
+ * cache), so an edit to any of them rebuilds. */
+const IEEE754_INPUTS = [
+  "src/scr_ieee754.cc",
+  "vendor/v8-ieee754/src/base/ieee754.cc",
+  "vendor/v8-ieee754/src/base/ieee754.h",
+  "vendor/v8-ieee754/src/base/overflowing-math.h",
+  "vendor/v8-ieee754/shim/cmath",
+  "vendor/v8-ieee754/shim/limits",
+  "vendor/v8-ieee754/shim/type_traits",
+  "vendor/v8-ieee754/shim/src/base/base-export.h",
+  "vendor/v8-ieee754/shim/src/base/build_config.h",
+  "vendor/v8-ieee754/shim/src/base/macros.h",
+];
+
+let ieee754HashMemo: Promise<string> | null = null;
+function ieee754InputsHash(): Promise<string> {
+  ieee754HashMemo ??= (async () => {
+    const root = join(runtimeSrcDir(), "..");
+    const h = createHash("sha256");
+    for (const f of IEEE754_INPUTS) h.update(f).update("\0").update(await readFile(join(root, f))).update("\0");
+    return h.digest("hex").slice(0, 16);
+  })();
+  return ieee754HashMemo;
+}
+
+/** The object behind Math's transcendentals on the native lanes: V8's own
+ * src/base/ieee754.cc (vendor/v8-ieee754, unmodified) compiled as C++ through
+ * the runtime's scr_ieee754.cc wrapper, which exports the scr_ieee754_*
+ * functions (SEMANTICS.md S100). Compiled lazily on the first build that
+ * needs it and cached like the lre/zlib objects --
+ * vendor/.cache/v8-ieee754-<input hash>-<flavor>/scr_ieee754.o -- with the
+ * same atomic-rename publish. The flags are load-bearing: -ffp-contract=off
+ * (no fused multiply-add may contract an expression: Node's x86-64 build of
+ * this file has none, and arm64 compilers contract by default), C++17 with no
+ * exceptions/RTTI, and -nostdinc++ against vendor/v8-ieee754/shim (stand-ins
+ * for the four V8 headers and the three standard headers the file includes):
+ * no C++ standard library is needed to build it or linked into the binary --
+ * the object references only libm. Optimization follows the lane (-O2 plain,
+ * -O1 + ASan sanitized); neither changes a result (IEEE binary64, no
+ * contraction, no fast-math). A zig driver compiles it with `zig c++`. */
+async function ensureIeee754Object(sanitize: boolean, driver: CcDriver): Promise<string> {
+  const flavor =
+    (sanitize ? "asan" : "plain") +
+    (driver.argv.length === 1 && driver.argv[0] === "clang" ? "" : "-zigcc") +
+    (driver.target !== null ? `-${driver.target}` : "");
+  const vendor = vendorIeee754Dir();
+  const cacheRoot = join(vendor, "..", ".cache");
+  const cacheDir = join(cacheRoot, `v8-ieee754-${await ieee754InputsHash()}-${flavor}`);
+  const object = join(cacheDir, "scr_ieee754.o");
+  if (await fileExists(object)) return object;
+
+  await mkdir(cacheRoot, { recursive: true });
+  const buildDir = await mkdtemp(join(cacheRoot, `build-v8-ieee754-${flavor}-`));
+  // `zig cc` → `zig c++`; a plain clang driver compiles C++ with -x c++.
+  const argv = driver.argv[0] === "zig" ? ["zig", "c++"] : [...driver.argv, "-x", "c++"];
+  try {
+    await execFileAsync(
+      argv[0] ?? "clang",
+      [
+        ...argv.slice(1),
+        "-std=c++17",
+        "-nostdinc++",
+        ...driver.targetArgs,
+        ...(sanitize ? ["-O1", "-fsanitize=address"] : ["-O2"]),
+        "-ffp-contract=off",
+        "-fno-exceptions",
+        "-fno-rtti",
+        "-fno-math-errno",
+        "-I", join(vendor, "shim"),
+        "-I", vendor,
+        "-c", join(runtimeSrcDir(), "scr_ieee754.cc"),
+        "-o", join(buildDir, "scr_ieee754.o"),
+      ],
+      { cwd: buildDir },
+    );
+    // Atomic publish: rename fails if a concurrent build won the race, and
+    // the winner's object is just as good.
+    await rename(buildDir, cacheDir).catch(() => undefined);
+  } finally {
+    await rm(buildDir, { recursive: true, force: true });
+  }
+  return object;
+}
+
 function vendorCurlDir(): string {
   return join(runtimeSrcDir(), "..", "vendor", "curl");
 }
@@ -770,6 +868,7 @@ export interface LibArchiveOptions {
   emitter?: boolean;
   zlib?: boolean;
   copying?: boolean;
+  ieee754?: boolean;
 }
 
 export async function compileLibArchive(opts: LibArchiveOptions): Promise<void> {
@@ -779,6 +878,7 @@ export async function compileLibArchive(opts: LibArchiveOptions): Promise<void> 
   const regex = opts.regex ?? false;
   const lreObjects = regex ? await ensureLreObjects(sanitize, driver) : [];
   const zlibObjects = opts.zlib ? await ensureZlibObjects(sanitize, driver) : [];
+  const ieee754Objects = opts.ieee754 ? [await ensureIeee754Object(sanitize, driver)] : [];
   const sources = [
     ...LIB_RUNTIME_SOURCES,
     // win32 targets compile the libc-shim TU into the archive (stpcpy,
@@ -804,6 +904,11 @@ export async function compileLibArchive(opts: LibArchiveOptions): Promise<void> 
     ...driver.targetArgs,
     ...(sanitize ? ["-O1", "-fsanitize=address", "-DSCR_RC_AUDIT"] : ["-O2"]),
     "-fno-math-errno",
+    // No fused multiply-add: every float expression in the runtime and the
+    // emitted program rounds each operation, as Node's x86-64 build does
+    // (clang contracts by default on arm64 -- SEMANTICS.md S100). In
+    // lockstep across buildArgs, the cache-miss cflags and the lib archive.
+    "-ffp-contract=off",
     "-fno-strict-aliasing", // the emitted object model type-puns — see compileC's buildArgs
     "-Wno-deprecated-declarations",
     "-DSCR_LIB",
@@ -841,7 +946,7 @@ export async function compileLibArchive(opts: LibArchiveOptions): Promise<void> 
     for (let i = 0; i < sources.length; i += width) {
       await Promise.all(sources.slice(i, i + width).map((f) => compileOne(join(rtDir, f), f.replace(/\.c$/, ".o"))));
     }
-    objects.push(...lreObjects, ...zlibObjects);
+    objects.push(...lreObjects, ...zlibObjects, ...ieee754Objects);
     await rm(opts.outPath, { force: true }); // `ar r` would append into a stale archive
     await mkdir(dirname(opts.outPath), { recursive: true });
     await execFileAsync(arArgv[0] ?? "ar", [...arArgv.slice(1), "rcs", opts.outPath, ...objects]);
@@ -1088,6 +1193,10 @@ export async function compileC(opts: CcOptions): Promise<void> {
     }
   }
   const engineArchive = dynamic ? await ensureEngineArchive(opts.sanitize ?? false, driver) : null;
+  // V8's ieee754.cc as an object: Math's transcendentals in the program, or
+  // the engine's Math under --dynamic (scr_island.c overrides it with them).
+  const ieee754Object =
+    (opts.ieee754 ?? false) || dynamic ? await ensureIeee754Object(opts.sanitize ?? false, driver) : null;
   const tlsArchive = tls ? await ensureTlsArchive(opts.sanitize ?? false, driver) : null;
   // --dynamic + regex shares the archive's libregexp (its host hooks and
   // ours would collide; see scr_regex.c) — the standalone objects are for
@@ -1112,6 +1221,11 @@ export async function compileC(opts: CcOptions): Promise<void> {
       ? ["-O1", "-fsanitize=address", "-DSCR_RC_AUDIT"]
       : ["-O2"]),
     "-fno-math-errno",
+    // No fused multiply-add: every float expression in the runtime and the
+    // emitted program rounds each operation, as Node's x86-64 build does
+    // (clang contracts by default on arm64 -- SEMANTICS.md S100). In
+    // lockstep across buildArgs, the cache-miss cflags and the lib archive.
+    "-ffp-contract=off",
     // The emitted object model is deliberately type-punned C: a hierarchy
     // upcast is a raw pointer cast, so one object's header (rc, vt) and
     // fields are read and written through BOTH the base and derived struct
@@ -1127,6 +1241,8 @@ export async function compileC(opts: CcOptions): Promise<void> {
     "-Wno-deprecated-declarations", // ucontext fibers (scr_async.c)
     "-I", rtDir,
     ...RUNTIME_SOURCES.map((f) => rt(join(rtDir, f))),
+    // An object, not a source: scr_ieee754.cc is C++ (ensureIeee754Object).
+    ...(ieee754Object !== null ? [ieee754Object] : []),
     ...(opts.copying ? [rt(join(rtDir, "scr_copying.c"))] : []),
     // win32 targets compile the libc-shim TU (stpcpy, arc4random_buf,
     // gmtime_r, strcasestr — the _WIN32 block in scr_runtime.h declares
@@ -1343,6 +1459,11 @@ export async function compileC(opts: CcOptions): Promise<void> {
       ? ["-O1", "-fsanitize=address", "-DSCR_RC_AUDIT"]
       : ["-O2"]),
     "-fno-math-errno",
+    // No fused multiply-add: every float expression in the runtime and the
+    // emitted program rounds each operation, as Node's x86-64 build does
+    // (clang contracts by default on arm64 -- SEMANTICS.md S100). In
+    // lockstep across buildArgs, the cache-miss cflags and the lib archive.
+    "-ffp-contract=off",
     "-fno-strict-aliasing", // the emitted object model type-puns — see buildArgs
     "-Wno-deprecated-declarations",
     "-I", rtDir,

@@ -1,0 +1,39 @@
+// tsinter shim for the C++ <limits> header: the std::numeric_limits members
+// src/base/ieee754.cc and the shims beside this file use, for float and
+// double, spelled as the compiler builtins every C++ standard library uses
+// for them (libstdc++ and libc++ both define signaling_NaN() as
+// __builtin_nans(""), quiet_NaN() as __builtin_nan(""), infinity() as
+// __builtin_huge_val()), and the signed integer types' min(). Not a V8 file; see ../README.md.
+#ifndef SCR_SHIM_LIMITS_
+#define SCR_SHIM_LIMITS_
+
+namespace std {
+template <typename T>
+struct numeric_limits;
+
+template <>
+struct numeric_limits<double> {
+  static constexpr double quiet_NaN() noexcept { return __builtin_nan(""); }
+  static constexpr double signaling_NaN() noexcept { return __builtin_nans(""); }
+  static constexpr double infinity() noexcept { return __builtin_huge_val(); }
+};
+
+template <>
+struct numeric_limits<float> {
+  static constexpr float quiet_NaN() noexcept { return __builtin_nanf(""); }
+  static constexpr float signaling_NaN() noexcept { return __builtin_nansf(""); }
+  static constexpr float infinity() noexcept { return __builtin_huge_valf(); }
+};
+
+// The signed integer types' min() (overflowing-math.h's NegateWithWraparound).
+#define SCR_SHIM_INT_MIN(T, M) \
+  template <> struct numeric_limits<T> { static constexpr T min() noexcept { return M; } };
+SCR_SHIM_INT_MIN(signed char, -__SCHAR_MAX__ - 1)
+SCR_SHIM_INT_MIN(short, -__SHRT_MAX__ - 1)
+SCR_SHIM_INT_MIN(int, -__INT_MAX__ - 1)
+SCR_SHIM_INT_MIN(long, -__LONG_MAX__ - 1L)
+SCR_SHIM_INT_MIN(long long, -__LONG_LONG_MAX__ - 1LL)
+#undef SCR_SHIM_INT_MIN
+}  // namespace std
+
+#endif  // SCR_SHIM_LIMITS_

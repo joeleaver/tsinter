@@ -48,6 +48,7 @@ import {
   COMPOUND_ASSIGN_OPS,
   ISLAND_SURFACE,
   MAP_METHODS,
+  MATH_CONSTANTS,
   SET_COMBINE_METHODS,
   SET_METHODS,
   STATIC_MATH_FNS,
@@ -192,33 +193,29 @@ export function generateSurfaceManifest(compilerVersion: string): SurfaceManifes
     });
   }
 
-  // ── stdlib: the Math surface — static table first, island remainder ───
-  const mathNames = new Set([...Object.keys(STATIC_MATH_FNS), ...Object.keys(ISLAND_SURFACE.math.fns)]);
-  for (const name of mathNames) {
-    const stat = STATIC_MATH_FNS[name];
-    const island = ISLAND_SURFACE.math.fns[name];
-    if (stat !== undefined) {
-      add({
-        id: `stdlib.math.${name}`,
-        kind: "stdlib",
-        name: `Math.${name}`,
-        status: "static",
-        // Only the island overlap earns a tail: the tables prove where the
-        // untabled arities go there. Elsewhere untabled shapes may have
-        // their own special-cased lowerings (Math.min/max over one array
-        // spread), so no claim is made about them.
-        note:
-          `compiles statically at arity ${stat.arity}` +
-          (island !== undefined
-            ? "; other declared call shapes run only in the embedded dynamic engine (SC2012 without --dynamic)"
-            : ""),
-      });
-    } else {
-      add({ id: `stdlib.math.${name}`, kind: "stdlib", name: `Math.${name}`, status: "dynamic-only", code: "SC2012" });
-    }
+  // ── stdlib: the Math surface — wholly static (SEMANTICS.md S100) ───────
+  for (const [name, stat] of Object.entries(STATIC_MATH_FNS)) {
+    add({
+      id: `stdlib.math.${name}`,
+      kind: "stdlib",
+      name: `Math.${name}`,
+      status: "static",
+      // Untabled shapes may have their own special-cased lowerings
+      // (Math.min/max over one array spread), so no claim is made about them.
+      note:
+        stat!.variadic === true
+          ? "compiles statically at any plain (non-spread) arity"
+          : `compiles statically at arity ${stat!.arity}`,
+    });
   }
-  for (const name of Object.keys(ISLAND_SURFACE.math.props)) {
-    add({ id: `stdlib.math.${name}`, kind: "stdlib", name: `Math.${name}`, status: "dynamic-only", code: "SC2012" });
+  for (const name of Object.keys(MATH_CONSTANTS)) {
+    add({
+      id: `stdlib.math.${name}`,
+      kind: "stdlib",
+      name: `Math.${name}`,
+      status: "static",
+      note: "folds to its number at compile time",
+    });
   }
   const numberNames = new Set([
     ...Object.keys(STATIC_NUMBER_METHODS),

@@ -183,11 +183,20 @@ double scr_arr_len(ScrArr *a) { return (double)a->len; }
  * The JS fold exactly (ECMA Math.max/min applied to the elements): any
  * NaN poisons the result, +0 beats -0 for max (the reverse for min), and
  * the empty array yields the zero-argument constants. Borrows the array. */
+/* The NaN V8's Float64Min/Float64Max answer for any NaN operand: the one
+ * the machine's invalid operation produces (0xfff8000000000000 on x86-64,
+ * measured -- whatever the operands' payloads), computed at run time so it
+ * is the machine's, not a folded constant. */
+double scr_math_minmax_nan(void) {
+  volatile double z = 0.0;
+  return z / z;
+}
+
 double scr_math_max_arr(ScrArr *a) {
   double best = -INFINITY;
   for (size_t i = 0; i < a->len; i++) {
     double v = scr_slot_to_f64(a->data[i]);
-    if (isnan(v)) return v;
+    if (isnan(v)) return scr_math_minmax_nan(); /* V8's compare NaN, not the element's (scr_lib.c) */
     if (v > best || (v == 0.0 && best == 0.0 && !signbit(v))) best = v;
   }
   return best;
@@ -197,7 +206,7 @@ double scr_math_min_arr(ScrArr *a) {
   double best = INFINITY;
   for (size_t i = 0; i < a->len; i++) {
     double v = scr_slot_to_f64(a->data[i]);
-    if (isnan(v)) return v;
+    if (isnan(v)) return scr_math_minmax_nan(); /* V8's compare NaN, not the element's (scr_lib.c) */
     if (v < best || (v == 0.0 && best == 0.0 && signbit(v))) best = v;
   }
   return best;

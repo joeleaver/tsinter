@@ -8,6 +8,7 @@ import { mangleClassNew, mangleClassRetain, mangleClassStruct, mangleField, mang
 import { OVERFLOW_MEMBER } from "./emit-shapes.js";
 import { arityDropTrampolineHelper, dynDestrCheckHelper, dynIterNHelper, dynKeyGetHelper } from "./emit-walkers.js";
 import { genResultThunkFor } from "./emit-async.js";
+import { foldFloatConst, foldNegation } from "../float-fold.js";
 
 
 
@@ -74,8 +75,15 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
         switch (e.op) {
           case "%":
             return E.newTemp(e.type, `fmod(${l.name}, ${r.name})`);
-          case "**":
-            return E.newTemp(e.type, `pow(${l.name}, ${r.name})`);
+          case "**": {
+            // V8's math::pow (scr_js_pow, SEMANTICS.md S079). A literal-only
+            // exponentiation is folded as V8's parser folds it -- the tier's
+            // own pow transcription, a NaN as the canonical quiet NaN (S036,
+            // board #207) -- by the wasm tier's own fold rule (pow.ts).
+            const folded = foldFloatConst(e);
+            if (folded !== undefined) return E.newTemp(e.type, cNumberLiteral(folded));
+            return E.newTemp(e.type, `scr_js_pow(${l.name}, ${r.name})`);
+          }
           case "===":
             // Board #89: func identity chain-walks past any
             // identity-transparent wrapper (funcCoerceAdapter's
@@ -109,6 +117,9 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
         }
       }
       case "unary": {
+        // A literal-only negation folds as V8's parser folds it (float-fold.ts).
+        const negFolded = foldNegation(e);
+        if (negFolded !== undefined) return E.newTemp(e.type, cNumberLiteral(Number.isNaN(negFolded) ? NaN : negFolded));
         const v = E.emitExpr(e.operand);
         if (e.op === "~") return E.newTemp(e.type, `scr_bit_not(${v.name})`);
         return E.newTemp(e.type, `${e.op}${v.name}`);
@@ -2756,6 +2767,44 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
             return finish(`scr_math_max(${arg(0)}, ${arg(1)})`);
           case "math.random":
             return finish(`scr_math_random()`);
+          // The rest of Math (SEMANTICS.md S100): the transcendentals are
+          // V8's ieee754.cc (scr_ieee754_*, the object cc.ts links on
+          // IR_IEEE754_FNS); pow is `**` (V8's math::pow), hypot math.tq's
+          // MathHypot over a compound-literal array, the rest scr_lib.c's
+          // one-operation builtins (sqrt is C's, correctly rounded). Borrow
+          // nothing; never throw.
+          case "math.acos": case "math.acosh": case "math.asin": case "math.asinh":
+          case "math.atan": case "math.atanh": case "math.cbrt": case "math.cos":
+          case "math.cosh": case "math.exp": case "math.expm1": case "math.log":
+          case "math.log1p": case "math.log2": case "math.log10": case "math.sin":
+          case "math.sinh": case "math.tan": case "math.tanh":
+            return finish(`scr_ieee754_${fn.slice(5)}(${arg(0)})`);
+          case "math.atan2":
+            return finish(`scr_ieee754_atan2(${arg(0)}, ${arg(1)})`);
+          case "math.pow":
+            return finish(`scr_js_pow(${arg(0)}, ${arg(1)})`);
+          case "math.hypot":
+            return finish(
+              args.length === 0
+                ? `scr_math_hypot(NULL, 0)`
+                : `scr_math_hypot((const double[]){${args.map((a) => a.name).join(", ")}}, ${args.length})`,
+            );
+          case "math.sqrt":
+            return finish(`sqrt(${arg(0)})`);
+          case "math.sign":
+            return finish(`scr_math_sign(${arg(0)})`);
+          case "math.fround":
+            return finish(`scr_math_fround(${arg(0)})`);
+          case "math.f16round":
+            return finish(`scr_math_f16round(${arg(0)})`);
+          case "math.clz32":
+            return finish(`scr_math_clz32(${arg(0)})`);
+          case "math.imul":
+            return finish(`scr_math_imul(${arg(0)}, ${arg(1)})`);
+          // ToNumber over a dyn value (board #263): borrowed; calls an
+          // object's own valueOf/toString, so it may throw (seed set).
+          case "dyn.toNumber":
+            return finish(`scr_dyn_to_number(${arg(0)})`);
           // The static global parsers/tests (scr_string.c). Borrow; no throw.
           case "num.parseInt":
             return finish(`scr_parse_int(${arg(0)}, ${arg(1)})`);

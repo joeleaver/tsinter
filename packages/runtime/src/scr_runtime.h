@@ -815,10 +815,47 @@ double scr_math_min_arr(ScrArr *a);
  * folds (NaN poisons; max prefers +0, min prefers -0 — NOT C's fmin/fmax);
  * random is a uniform [0,1) double at 53-bit granularity from
  * arc4random_buf (SEMANTICS.md S068: Node's distribution, not its sequence). */
+double scr_math_minmax_nan(void); /* V8's min/max NaN: the machine's invalid-operation NaN */
 double scr_math_min(double a, double b);
 double scr_math_round(double x);
 double scr_math_max(double a, double b);
 double scr_math_random(void);
+/* The rest of Math, bit for bit as Node computes it (SEMANTICS.md S100).
+ * scr_lib.c: `**` / Math.pow (V8's math::pow over the C library's pow),
+ * hypot (math.tq's MathHypot over n ToNumber'd arguments), sign, fround,
+ * f16round, clz32, imul. Never throw. */
+double scr_js_pow(double x, double y);
+double scr_math_hypot(const double *xs, size_t n);
+double scr_math_sign(double x);
+double scr_math_fround(double x);
+double scr_math_f16round(double x);
+double scr_math_clz32(double x);
+double scr_math_imul(double a, double b);
+/* The twenty transcendentals: V8 13.6's src/base/ieee754.cc itself
+ * (vendor/v8-ieee754), compiled as C++ by scr_ieee754.cc -- an object the
+ * build links when the program's IR calls one (cc.ts, ensureIeee754Object)
+ * or under --dynamic, where scr_island.c points the engine's Math at them.
+ * Never throw. */
+double scr_ieee754_acos(double x);
+double scr_ieee754_acosh(double x);
+double scr_ieee754_asin(double x);
+double scr_ieee754_asinh(double x);
+double scr_ieee754_atan(double x);
+double scr_ieee754_atanh(double x);
+double scr_ieee754_atan2(double y, double x);
+double scr_ieee754_cbrt(double x);
+double scr_ieee754_cos(double x);
+double scr_ieee754_cosh(double x);
+double scr_ieee754_exp(double x);
+double scr_ieee754_expm1(double x);
+double scr_ieee754_log(double x);
+double scr_ieee754_log1p(double x);
+double scr_ieee754_log2(double x);
+double scr_ieee754_log10(double x);
+double scr_ieee754_sin(double x);
+double scr_ieee754_sinh(double x);
+double scr_ieee754_tan(double x);
+double scr_ieee754_tanh(double x);
 
 double scr_arr_get_f64(ScrArr *a, double i); /* trap OOB */
 bool scr_arr_get_bool(ScrArr *a, double i);  /* trap OOB */
@@ -3058,6 +3095,17 @@ ScrStr *scr_dyn_string_coerce(const ScrDyn *d);
  * called, their throws propagating) — the WHATWG USVString conversions.
  * Borrows; +1 or NULL with the exception pending. */
 ScrStr *scr_dyn_string_coerce_js(const ScrDyn *d);
+/* ECMA-262 ToNumber over a dyn value (a Math member's `any` argument):
+ * primitives convert directly (undefined NaN, null 0, booleans 0/1,
+ * strings by StringToNumber); an OBJ runs OrdinaryToPrimitive with the
+ * number hint over its OWN valueOf/toString members (each called with no
+ * arguments, a throw propagating; a non-callable own member shadows the
+ * inherited one), the inherited Object.prototype pair answering NaN and a
+ * null-prototype object with neither answering Node's "Cannot convert
+ * object to primitive value" TypeError; every other kind converts its
+ * string form (S015: nested members are not consulted). Borrows; NaN with
+ * the exception pending on a throw. */
+double scr_dyn_to_number(const ScrDyn *d);
 
 /* `d instanceof TypeError` (and the other builtin error classes) on a
  * checked-dynamic value: the from_error cache resolves the dyn encoding

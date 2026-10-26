@@ -22,9 +22,9 @@ sab.grow(16);
 const ia = new Int32Array(4);
 const waited = Atomics.waitAsync(ia, 0, 0, 1);
 
-// Float16 (ES2025): the typed array, Math.f16round, DataView accessors.
+// Float16 (ES2025): the typed array and the DataView accessors (Math.f16round
+// compiles statically on every lane — SEMANTICS.md S100).
 const f16 = new Float16Array(4);
-console.log(Math.f16round(1.337));
 const dv = new DataView(new Uint8Array(8).buffer);
 dv.setFloat16(0, 1.5);
 

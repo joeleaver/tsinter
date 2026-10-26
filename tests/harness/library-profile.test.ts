@@ -348,7 +348,7 @@ describe("library profile fences", () => {
           fences: [
             { id: "stdlib.math.random", teaching: "randomness is an effect", remediation: "ask the host" },
             { prefix: "node-builtin.fs.", teaching: "files are effects" },
-            { id: "stdlib.math.sin", teaching: "trig is host math", remediation: "request it as an effect" },
+            { id: "stdlib.string.replace", teaching: "patterns are host code", remediation: "request it as an effect" },
           ],
         },
       }),
@@ -368,9 +368,9 @@ describe("library profile fences", () => {
     expect(fsIds).toContain("node-builtin.fs.promises.readFile");
     // A fenced dynamic-only surface carries its own refusal code and no
     // detector: the teaching rides the refusal that already fires.
-    const sin = r.profile.fences[2]!.surfaces[0]!;
-    expect(sin.code).toBe("SC2012");
-    expect(sin.detector).toBeUndefined();
+    const replace = r.profile.fences[2]!.surfaces[0]!;
+    expect(replace.code).toBe("SC2012");
+    expect(replace.detector).toBeUndefined();
   });
 
   test("a fence remediation feeds the trap-remediation lookup through covered codes", () => {

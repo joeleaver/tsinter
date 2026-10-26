@@ -1916,6 +1916,33 @@ export type IrLibFn =
    * inference needs them compiled, not island-served. Never throw. */
   | "math.trunc"
   | "math.ceil"
+  /** The rest of Math, static on every lane (SEMANTICS.md S100), each the
+   * JS operation over already-ToNumber'd arguments, bit for bit as Node
+   * computes it:
+   *  - the twenty transcendentals (math.atan2 takes y, x) are V8 13.6's
+   *    src/base/ieee754.cc, vendored once (packages/runtime/vendor/
+   *    v8-ieee754): the native lanes call scr_ieee754_<fn>, the object
+   *    compiled from it as C++ (IR_IEEE754_FNS gates its link); the WasmGC
+   *    tier compiles the same text with csubset.ts (ieee754.ts);
+   *  - math.pow is `**` (V8's math::pow: scr_js_pow / %w.jsPow, S079);
+   *  - math.hypot takes ANY number of f64 arguments (V8's math.tq
+   *    MathHypot; zero answers 0);
+   *  - sqrt, sign, fround, f16round, clz32 (over ToUint32) and imul (over
+   *    ToInt32) are V8's one-operation builtins.
+   * Never throw. */
+  | "math.acos" | "math.acosh" | "math.asin" | "math.asinh" | "math.atan" | "math.atanh"
+  | "math.atan2" | "math.cbrt" | "math.cos" | "math.cosh" | "math.exp" | "math.expm1"
+  | "math.log" | "math.log1p" | "math.log2" | "math.log10" | "math.sin" | "math.sinh"
+  | "math.tan" | "math.tanh"
+  | "math.pow" | "math.hypot" | "math.sqrt" | "math.sign" | "math.fround" | "math.f16round"
+  | "math.clz32" | "math.imul"
+  /** ECMA-262 ToNumber over a checked-dynamic value (a Math member's `any`
+   * argument, board #263): primitives convert directly, an object runs
+   * OrdinaryToPrimitive (number hint) over its OWN valueOf/toString
+   * members -- calling them, so it MAY THROW (their throw, or Node's
+   * "Cannot convert object to primitive value") -- and every other kind
+   * converts its string form (S015). Borrows. */
+  | "dyn.toNumber"
   /** The static global parsers/tests (scr_string.c). num.parseInt is
    * ECMA-262 19.2.5 exactly — JS whitespace, sign, ToInt32 radix (the
    * frontend completes an omitted radix to 0 = the spec's "undefined":
@@ -6063,6 +6090,38 @@ export function moduleUsesZlib(mod: IrModule): boolean {
   return found;
 }
 
+/** The libCalls computed by V8's ieee754.cc (the Math transcendentals): on
+ * the native lanes each calls scr_ieee754_<fn>, from the object cc.ts
+ * compiles out of packages/runtime/vendor/v8-ieee754 (ensureIeee754Object). */
+export const IR_IEEE754_FNS: ReadonlySet<IrLibFn> = new Set<IrLibFn>([
+  "math.acos", "math.acosh", "math.asin", "math.asinh", "math.atan", "math.atanh",
+  "math.atan2", "math.cbrt", "math.cos", "math.cosh", "math.exp", "math.expm1",
+  "math.log", "math.log1p", "math.log2", "math.log10", "math.sin", "math.sinh",
+  "math.tan", "math.tanh",
+]);
+
+/** True when the module calls one of IR_IEEE754_FNS -- the link switch for
+ * the ieee754 object (cc.ts). Math-free binaries keep their exact link
+ * line. Same walk shape as moduleUsesZlib. */
+export function moduleUsesIeee754(mod: IrModule): boolean {
+  let found = false;
+  const visit = (v: unknown): void => {
+    if (found || v === null || typeof v !== "object") return;
+    if (Array.isArray(v)) {
+      for (const item of v) visit(item);
+      return;
+    }
+    const node = v as { kind?: unknown; fn?: unknown };
+    if (node.kind === "libCall" && typeof node.fn === "string" && IR_IEEE754_FNS.has(node.fn as IrLibFn)) {
+      found = true;
+      return;
+    }
+    for (const key of Object.keys(v)) visit((v as Record<string, unknown>)[key]);
+  };
+  visit(mod);
+  return found;
+}
+
 /** True when the module contains any dc.* libCall — the link switch that
  * pulls scr_dc.c (the diagnostics_channel registry and pub/sub) into the
  * binary (cc.ts). Channel-free binaries keep their exact size class.
@@ -6991,6 +7050,8 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "error.nodeThrow",
   // USVString coercion runs user toString/valueOf — throws propagate.
   "dyn.toStringCoerce",
+  // ToNumber over a dyn object calls its own valueOf/toString (board #263).
+  "dyn.toNumber",
   "child.kill",
   // The caller's lookup runs synchronously inside the connect call — a
   // throw there propagates like Node's.

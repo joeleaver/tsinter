@@ -414,8 +414,8 @@ export const boundaryOutOfIslandMsg = (typeName: string): string =>
   `and 'T | undefined' over those)`;
 
 /** The island-backed surface — standard-library APIs with no static
- * runtime implementation (Math.*, number/string methods beyond the
- * intrinsic set, parseFloat, ...). ONE table drives both sides of the
+ * runtime implementation (number/string methods beyond the intrinsic set,
+ * parseFloat, ...; Math is wholly static now -- STATIC_MATH_FNS). ONE table drives both sides of the
  * gate: under --dynamic each entry lowers to marshal → engine execution →
  * validated exit to the declared return type; without the flag each use
  * site is a per-site SC2012. Membership here is only half the check — the
@@ -428,29 +428,6 @@ export const boundaryOutOfIslandMsg = (typeName: string): string =>
  * own declarations — a drifted entry fails a test instead of surprising a
  * user. */
 export const ISLAND_SURFACE = {
-  /** `Math.<fn>(...)` lowers to callMethod(globalGet("Math"), fn, args);
-   * the readonly number props (`Math.PI`) to getProp(globalGet("Math")).
-   * Every member of Node 24's Math object is here or in STATIC_MATH_FNS:
-   * hypot is declared variadic (`...values: number[]`, any plain arity);
-   * atan2/pow/imul take exactly two. */
-  math: {
-    // floor, min/max (any plain arity), and random are STATIC now
-    // (STATIC_MATH_FNS below).
-    fns: {
-      abs: ISL_N1, acos: ISL_N1, acosh: ISL_N1, asin: ISL_N1, asinh: ISL_N1,
-      atan: ISL_N1, atanh: ISL_N1, atan2: ISL_N2,
-      cbrt: ISL_N1, ceil: ISL_N1, clz32: ISL_N1, cos: ISL_N1, cosh: ISL_N1,
-      exp: ISL_N1, expm1: ISL_N1, f16round: ISL_N1, fround: ISL_N1,
-      hypot: { args: [F64, F64], ret: F64, variadic: true }, imul: ISL_N2,
-      log: ISL_N1, log1p: ISL_N1, log2: ISL_N1, log10: ISL_N1, pow: ISL_N2,
-      round: ISL_N1,
-      sign: ISL_N1, sin: ISL_N1, sinh: ISL_N1, sqrt: ISL_N1, tan: ISL_N1,
-      tanh: ISL_N1, trunc: ISL_N1,
-    } as Record<string, IslandFnEntry | undefined>,
-    props: {
-      PI: F64, E: F64, LN10: F64, LN2: F64, LOG10E: F64, LOG2E: F64, SQRT1_2: F64, SQRT2: F64,
-    } as Record<string, IrType | undefined>,
-  },
   /** Methods on `number` receivers. The receiver marshals by value; the
    * engine auto-boxes primitives on method calls, so `this` binds the
    * number exactly as in JS. toString takes an EXPLICIT radix (radix-free
@@ -483,19 +460,24 @@ export const ISLAND_SURFACE = {
   } as Record<string, IslandFnEntry | undefined>,
 };
 
-/** Math members with a STATIC lowering — each is one libCall that IS the
- * JS operation, at the tabled arity, on every lane (native: libm's floor,
- * scr_lib.c's NaN-poisoning ±0-ordered min/max folds, arc4random-backed
- * random; wasm: the f64 instructions, a port of scr_math_round, and a
- * seeded V8 xorshift128+ — random's per-lane split is SEMANTICS.md S068).
- * Checked BEFORE the island table
- * (lowerIslandMethodCall), so the tabled arities compile statically and
- * other arities keep the island/fence story — except min/max, whose
- * variadic spelling lowers at ANY plain arity (the n-ary left fold of
- * the scalar compare; zero arguments answer the fold's ∓Infinity seed);
- * unioned with the island table for the methods-as-values fence
+/** Node 24's Math object, every member STATIC on every lane (no island,
+ * no --dynamic; SEMANTICS.md S100): each call is one libCall that IS the
+ * JS operation, at the tabled arity -- or, for `variadic` members, at any
+ * plain (non-spread) arity: min/max nest the two-argument fold (zero
+ * arguments answer its ∓Infinity seed, lower-island.ts), hypot is one
+ * n-ary call. Arguments are ToNumber'd first (number arguments as they
+ * are, `any` ones by ToNumber -- board #263). Per member:
+ *  - floor/trunc/ceil/abs are the C functions / wasm instructions, round
+ *    is scr_math_round's ECMA rule, min/max the NaN-poisoning ±0-ordered
+ *    folds, random arc4random-backed on native and V8's xorshift128+ on
+ *    wasm (the per-lane sequence split is S068);
+ *  - the twenty transcendentals are V8 13.6's src/base/ieee754.cc, vendored
+ *    once and compiled for every lane (IR_IEEE754_FNS);
+ *  - pow is `**` (V8's math::pow, S079), hypot V8's math.tq MathHypot,
+ *    and sqrt/sign/fround/f16round/clz32/imul V8's one-operation builtins.
+ * Unioned with MATH_CONSTANTS for the methods-as-values fence
  * (lowerMathProperty). */
-export const STATIC_MATH_FNS: Record<string, { fn: IrLibFn; arity: number } | undefined> = {
+export const STATIC_MATH_FNS: Record<string, { fn: IrLibFn; arity: number; variadic?: true } | undefined> = {
   floor: { fn: "math.floor", arity: 1 },
   abs: { fn: "math.abs", arity: 1 },
   round: { fn: "math.round", arity: 1 },
@@ -504,9 +486,45 @@ export const STATIC_MATH_FNS: Record<string, { fn: IrLibFn; arity: number } | un
   // trunc()/ceil() ARE the JS operations, like floor).
   trunc: { fn: "math.trunc", arity: 1 },
   ceil: { fn: "math.ceil", arity: 1 },
-  min: { fn: "math.min", arity: 2 },
-  max: { fn: "math.max", arity: 2 },
+  min: { fn: "math.min", arity: 2, variadic: true },
+  max: { fn: "math.max", arity: 2, variadic: true },
   random: { fn: "math.random", arity: 0 },
+  acos: { fn: "math.acos", arity: 1 },
+  acosh: { fn: "math.acosh", arity: 1 },
+  asin: { fn: "math.asin", arity: 1 },
+  asinh: { fn: "math.asinh", arity: 1 },
+  atan: { fn: "math.atan", arity: 1 },
+  atanh: { fn: "math.atanh", arity: 1 },
+  atan2: { fn: "math.atan2", arity: 2 },
+  cbrt: { fn: "math.cbrt", arity: 1 },
+  cos: { fn: "math.cos", arity: 1 },
+  cosh: { fn: "math.cosh", arity: 1 },
+  exp: { fn: "math.exp", arity: 1 },
+  expm1: { fn: "math.expm1", arity: 1 },
+  log: { fn: "math.log", arity: 1 },
+  log1p: { fn: "math.log1p", arity: 1 },
+  log2: { fn: "math.log2", arity: 1 },
+  log10: { fn: "math.log10", arity: 1 },
+  sin: { fn: "math.sin", arity: 1 },
+  sinh: { fn: "math.sinh", arity: 1 },
+  tan: { fn: "math.tan", arity: 1 },
+  tanh: { fn: "math.tanh", arity: 1 },
+  pow: { fn: "math.pow", arity: 2 },
+  hypot: { fn: "math.hypot", arity: 2, variadic: true },
+  sqrt: { fn: "math.sqrt", arity: 1 },
+  sign: { fn: "math.sign", arity: 1 },
+  fround: { fn: "math.fround", arity: 1 },
+  f16round: { fn: "math.f16round", arity: 1 },
+  clz32: { fn: "math.clz32", arity: 1 },
+  imul: { fn: "math.imul", arity: 2 },
+};
+
+/** Math's eight value properties (ECMA-262 21.3.1): each the correctly
+ * rounded binary64 value the spec names -- the same bits on every engine,
+ * so a read folds to the number at compile time on every lane. */
+export const MATH_CONSTANTS: Record<string, number | undefined> = {
+  E: Math.E, LN10: Math.LN10, LN2: Math.LN2, LOG10E: Math.LOG10E,
+  LOG2E: Math.LOG2E, PI: Math.PI, SQRT1_2: Math.SQRT1_2, SQRT2: Math.SQRT2,
 };
 
 /** Number prototype methods with dedicated STATIC lowering paths. The

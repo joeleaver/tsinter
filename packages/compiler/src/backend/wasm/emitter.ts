@@ -295,7 +295,8 @@ import { UnionBuilder, type UnionArmRep } from "./unions.js";
 import { Code, ENGINE_MEMORY } from "./code.js";
 import { EngineFormatError, fencedGlobalIn, loadEngine, type EngineImage } from "./engine.js";
 import { buildF64ToStr } from "./numfmt.js";
-import { buildPowCore, jsPowValue } from "./pow.js";
+import { buildPowCore } from "./pow.js";
+import { foldFloatConst, foldNegation } from "../float-fold.js";
 import { Ieee754, IEEE754_MEMBERS } from "./ieee754.js";
 import { F64, I32, I64, ModuleBuilder, type FieldType, type StorageType, type ValType } from "./module.js";
 import {
@@ -1701,25 +1702,14 @@ function isIslandObjectCreate(rec: Record<string, unknown>): boolean {
  * than passing through whatever bits our own fold computation produced. */
 const CANONICAL_NAN: number = new Float64Array(new BigUint64Array([0x7ff8000000000000n]).buffer)[0]!;
 
-/** Math's eight value properties (ECMA-262 21.3.1), each the correctly
- * rounded binary64 value the spec names -- identical on every engine. */
-const MATH_CONSTANTS: ReadonlyMap<string, number> = new Map([
-  ["E", Math.E], ["LN10", Math.LN10], ["LN2", Math.LN2], ["LOG10E", Math.LOG10E],
-  ["LOG2E", Math.LOG2E], ["PI", Math.PI], ["SQRT1_2", Math.SQRT1_2], ["SQRT2", Math.SQRT2],
+/** The Math libCalls emitMath computes (SEMANTICS.md S100): the frontend
+ * lowers every Math member statically (surfaces.ts STATIC_MATH_FNS), with
+ * its arguments already ToNumber'd; floor/ceil/trunc/abs/round/min/max/
+ * random have their own arms. */
+const MATH_LIB_FNS: ReadonlySet<string> = new Set([
+  ...[...IEEE754_MEMBERS].map((n) => `math.${n}`),
+  "math.pow", "math.hypot", "math.sqrt", "math.sign", "math.fround", "math.f16round", "math.clz32", "math.imul",
 ]);
-
-/** The Math methods the island surface (surfaces.ts ISLAND_SURFACE.math)
- * brings to the emitter as callMethod(globalGet("Math"), ...), at the
- * argument counts it brings them with; emitIslandMath computes each.
- * abs/ceil/round/trunc are tabled there too but never arrive (the static
- * table, STATIC_MATH_FNS, takes their only arity first), so they are not
- * served here: they would refuse. */
-function islandMathServed(name: string, nargs: number): boolean {
-  if (name === "hypot") return true;
-  if (name === "atan2" || name === "pow" || name === "imul") return nargs === 2;
-  if (IEEE754_MEMBERS.has(name)) return nargs === 1;
-  return ["sqrt", "sign", "fround", "f16round", "clz32"].includes(name) && nargs === 1;
-}
 
 /* ── increment 21 stage B, gate 3: the Function-eval recognizer ──────────
  * (design note: scratchpad/function-helper-decision.md, Option A —
@@ -9347,6 +9337,122 @@ class Assembler {
     c.end();
     this.emitSetCellError(c, "%Error", "Error", (x) => this.pushStrLitInto(x, "converting this dynamic value to a URLSearchParams string is not supported yet"), null);
     c.refNull(this.strType);
+    this.mb.setBody(idx, [I32, dyn.dynRef(), dyn.dynRef()], c.bytes());
+    return idx;
+  }
+
+  private dynToNumberIdx: number | null = null;
+
+  /** `%w.dyn.toNumber(d) -> f64` — ECMA-262 ToNumber over a dyn value, a
+   * Math member's `any` argument (board #263), as scr_dyn_to_number
+   * computes it on the native lanes: an object runs OrdinaryToPrimitive with
+   * the NUMBER hint over its OWN members -- a callable valueOf is called
+   * with the object as `this`, then toString; a primitive answer converts
+   * (jsToNumber), a throw propagates (NaN with the exception pending), and
+   * an own toString that is not callable or answers an object is Node's
+   * "Cannot convert object to primitive value". With no own toString the
+   * inherited conversion decides (jsToNumber: "[object Object]" is NaN, a
+   * null-prototype object meets toStr's named refusal); every other kind is
+   * jsToNumber. */
+  private dynToNumberFn(): number {
+    if (this.dynToNumberIdx !== null) return this.dynToNumberIdx;
+    const dyn = this.dyn;
+    const dynT = dyn.dynT();
+    const idx = this.mb.declareFunc(this.mb.funcType([dyn.dynRef()], [F64]), "%w.dyn.toNumber");
+    this.dynToNumberIdx = idx;
+    const c = new Code();
+    const D = 0;
+    const K = 1;
+    const M = 2;
+    const R = 3;
+    const vec = this.dynVecInfo();
+    const isPrim = (local: number): void => {
+      // NULL BOOL NUM STR UNDEF
+      c.localGet(local);
+      c.structGet(dynT, DYN_KIND);
+      c.localSet(K);
+      c.localGet(K);
+      c.i32Const(DK.STR);
+      c.i32LeU();
+      c.localGet(K);
+      c.i32Const(DK.UNDEF);
+      c.i32Eq();
+      c.i32Or();
+    };
+    /** Calls the own member in M (a FUNC) with D as `this`: a throw returns
+     * NaN (pending), a primitive answer returns its number. */
+    const callM = (name: string): void => {
+      c.localGet(D);
+      c.call(dyn.thisPush());
+      c.localGet(M);
+      c.i32Const(0);
+      c.i32Const(0);
+      c.arrayNewDefault(vec.bufType);
+      c.structNew(vec.struct);
+      this.pushStrLitInto(c, name);
+      c.call(dyn.callFn());
+      c.localSet(R);
+      c.call(dyn.thisPop());
+      c.localGet(R);
+      c.refIsNull();
+      c.ifVoid();
+      c.f64Const(CANONICAL_NAN);
+      c.return_();
+      c.end();
+      isPrim(R);
+      c.ifVoid();
+      c.localGet(R);
+      c.call(this.jsToNumberHelper());
+      c.return_();
+      c.end();
+    };
+    const getOwn = (name: string): void => {
+      c.localGet(D);
+      c.structGet(dynT, DYN_REF);
+      c.refCast(dyn.objT());
+      this.pushStrLitInto(c, name);
+      c.call(dyn.objGet());
+      c.localSet(M);
+    };
+    const mIsFunc = (): void => {
+      c.localGet(M);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.FUNC);
+      c.i32Eq();
+    };
+    c.localGet(D);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.OBJ);
+    c.i32Eq();
+    c.ifVoid();
+    {
+      getOwn("valueOf");
+      c.localGet(M);
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifVoid();
+      mIsFunc();
+      c.ifVoid();
+      callM("valueOf");
+      c.end();
+      c.end();
+      getOwn("toString");
+      c.localGet(M);
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifVoid();
+      mIsFunc();
+      c.ifVoid();
+      callM("toString");
+      c.end();
+      this.emitSetCellError(c, "%TypeError", "TypeError", (x) => this.pushStrLitInto(x, "Cannot convert object to primitive value"), null);
+      c.f64Const(CANONICAL_NAN);
+      c.return_();
+      c.end();
+    }
+    c.end();
+    c.localGet(D);
+    c.call(this.jsToNumberHelper());
     this.mb.setBody(idx, [I32, dyn.dynRef(), dyn.dynRef()], c.bytes());
     return idx;
   }
@@ -19157,10 +19263,18 @@ class Assembler {
 
       case "unary":
         switch (e.op) {
-          case "-":
+          case "-": {
+            // A literal-only negation folds as V8's parser folds it
+            // (float-fold.ts; S036): the canonical NaN, not its negation.
+            const negFolded = foldNegation(e);
+            if (negFolded !== undefined) {
+              code.f64Const(Number.isNaN(negFolded) ? CANONICAL_NAN : negFolded);
+              return;
+            }
             this.walkExpr(e.operand);
             code.f64Neg();
             return;
+          }
           case "!":
             this.walkExpr(e.operand);
             code.i32Eqz();
@@ -21572,6 +21686,18 @@ class Assembler {
         // §2.3/§2.6/§7.3) ─────────────────────────────────────────────
         // f64.abs/ceil/floor/trunc ARE the JS operations — no helper, one
         // instruction each (§2.1: "the instructions ARE the operations").
+        if (MATH_LIB_FNS.has(e.fn)) {
+          this.emitMath(e.fn.slice("math.".length), e.args);
+          return;
+        }
+        if (e.fn === "dyn.toNumber") {
+          // ToNumber over a dyn value (board #263): may run an own
+          // valueOf/toString, whose throw propagates.
+          this.walkExpr(e.args[0]!);
+          code.call(this.dynToNumberFn());
+          this.emitPendingCheck();
+          return;
+        }
         if (e.fn === "math.abs") {
           this.walkExpr(e.args[0]!);
           code.f64Abs();
@@ -21711,7 +21837,19 @@ class Assembler {
           code.f64Eq();
           code.i32Or();
           code.ifResult(F64);
+          // a NaN comes back quieted (x + x), as V8's Math.round answers a
+          // signaling one in every tier (SEMANTICS.md S100); ±Infinity and
+          // ±0 are themselves
           code.localGet(x);
+          code.localGet(x);
+          code.f64Ne();
+          code.ifResult(F64);
+          code.localGet(x);
+          code.localGet(x);
+          code.f64Add();
+          code.else_();
+          code.localGet(x);
+          code.end();
           code.else_();
           code.localGet(x);
           code.f64Floor();
@@ -28792,26 +28930,6 @@ class Assembler {
             // helper, let alone need a runtime check for them there.
             if (e.name === undefined) throw new Error("emitter bug: jsOp getProp without a name");
             const name = e.name;
-            // Math.PI, Math.E and the other six Math constants (D4-i,
-            // INC-25 P4; the Math unit, SEMANTICS.md S100):
-            // globalGet's CLOSED TABLE shape, matched BEFORE walkExpr ever
-            // runs on the receiver sub-expression — the SAME structural
-            // check the callMethod arm's own Promise/JSON precedent uses.
-            // ISLAND_SURFACE.math.props (surfaces.ts) is exactly these
-            // eight; each is the correctly rounded binary64 value ECMA-262
-            // names, the same bits on every engine. A bare globalGet
-            // reached any other way still refuses named (case
-            // "globalGet" below, `expr:${e.kind}`).
-            const mathConst = MATH_CONSTANTS.get(name);
-            if (
-              mathConst !== undefined &&
-              e.args[0]!.kind === "jsOp" &&
-              e.args[0]!.op === "globalGet" &&
-              e.args[0]!.name === "Math"
-            ) {
-              this.dyn.boxNum(code, (x) => x.f64Const(mathConst));
-              return;
-            }
             // "__proto__"/"caller"/"arguments" ride the gate as SPECIAL
             // names rather than table members (review round 3, R1/R2):
             // they are ACCESSORS (an own-property/proto pair, or a
@@ -29026,14 +29144,19 @@ class Assembler {
             return;
           }
           case "neg": case "plus": {
+            // ToNumber with the object protocol (%w.dyn.toNumber: an own
+            // valueOf/toString is called, its throw propagates) -- the
+            // conversion a Math member's island argument rides too
+            // (lower-island.ts lowerMathArgs, board #263).
             this.walkExpr(e.args[0]!);
             const a = this.acquireScratch(this.dyn.dynRef());
             code.localSet(a);
             this.dyn.boxNum(code, (c) => {
               c.localGet(a);
-              c.call(this.jsToNumberHelper());
+              c.call(this.dynToNumberFn());
               if (op === "neg") c.f64Neg();
             });
+            this.emitPendingCheck();
             this.releaseScratch(this.dyn.dynRef(), a);
             return;
           }
@@ -29170,19 +29293,6 @@ class Assembler {
             // ambient-object representation nothing else needs.
             const globalGetName =
               e.args[0]!.kind === "jsOp" && e.args[0]!.op === "globalGet" ? e.args[0]!.name : undefined;
-            if (globalGetName === "Math") {
-              // Math.<fn>(...) from the island surface (SEMANTICS.md S100):
-              // computed here, boxed for the dynamic value the IR asks for
-              // (the jsExit<f64> arm computes it unboxed instead).
-              const margs = e.args.slice(1);
-              if (!islandMathServed(name, margs.length)) {
-                this.refuse(`expr:${e.kind}`, e.loc);
-                code.unreachable();
-                return;
-              }
-              this.dyn.boxNum(code, () => this.emitIslandMath(name, margs));
-              return;
-            }
             if (globalGetName === "AbortSignal") {
               // #227: AbortSignal.timeout(delay) and the argument-less
               // AbortSignal.abort() (fetch.ts); a reason for abort() and
@@ -30130,21 +30240,6 @@ class Assembler {
        * plain read, no copy, no cast of the vector itself). */
       case "jsExit": {
         const t = e.type;
-        if (
-          t.kind === "f64" &&
-          e.value.kind === "jsOp" &&
-          e.value.op === "callMethod" &&
-          e.value.args[0]!.kind === "jsOp" &&
-          e.value.args[0]!.op === "globalGet" &&
-          e.value.args[0]!.name === "Math" &&
-          e.value.name !== undefined &&
-          islandMathServed(e.value.name, e.value.args.length - 1)
-        ) {
-          // A Math call's number is already the f64 the exit wants: no box
-          // (SEMANTICS.md S100).
-          this.emitIslandMath(e.value.name, e.value.args.slice(1));
-          return;
-        }
         if (t.kind === "f64" || t.kind === "bool" || t.kind === "string") {
           const wantDK = t.kind === "f64" ? DK.NUM : t.kind === "bool" ? DK.BOOL : DK.STR;
           const wantDesc = t.kind === "f64" ? "number" : t.kind === "bool" ? "boolean" : "string";
@@ -32460,67 +32555,10 @@ class Assembler {
 
   /* ── operators ──────────────────────────────────────────────────────── */
 
-  /** Attempts to fold `e` to a plain host number (`**` computed by
-   * pow.ts's jsPowValue, never the host's own pow) — RECURSIVE over
-   * literal-derived float arithmetic, mirroring V8's OWN measured
-   * constant-folding boundary (SEMANTICS.md S036 has the full table),
-   * not a general partial evaluator:
-   *  - a `numLit` folds to its value, UNLESS that value is EXACTLY
-   *    +/-Infinity: `Infinity`/`NaN` as source globals lower to a BARE
-   *    numLit with no other marker (lower-exprs.ts), so a numLit
-   *    holding +/-Infinity AT A LEAF POSITION is, in this IR,
-   *    indistinguishable from the bare `Infinity` global — which V8
-   *    measurably does NOT constant-fold (`Infinity-Infinity`,
-   *    `0*Infinity`: the runtime/hardware NaN pattern, not canonical).
-   *    Treating a leaf-position Infinity as unfoldable (poisoning its
-   *    containing expression) reproduces that boundary exactly. `NaN`
-   *    has no equivalent ambiguity — there is no OTHER way to spell a
-   *    NaN-valued numLit — so it folds normally alongside ordinary
-   *    finite literals (`NaN+1`, `NaN*2`: both measured to fold).
-   *  - a `bin` node with a foldable op folds if BOTH operands
-   *    (recursively) fold — this is what lets a literal-DERIVED
-   *    Infinity, e.g. `1/0`, re-enter the fold pool for an ENCLOSING
-   *    expression like `(1/0)-(1/0)` (measured to fold), even though a
-   *    BARE `Infinity` leaf cannot: the poison rule above only fires for
-   *    a numLit reached DIRECTLY, not for a value that arrived by
-   *    recursively folding a sub-expression.
-   *  - a unary `-` over a foldable operand folds (its negation) — covers
-   *    `-(1/0)`-shaped expressions; `-0`/`-Infinity`/`-NaN` never reach
-   *    this arm because lowerPrefixUnary already pre-folds unary-minus
-   *    directly over a numLit operand into a signed numLit itself.
-   *  - anything else (varRef, calls, ...) does not fold: NO constant
-   *    propagation, no variable lookthrough, by design (measured:
-   *    `const z = 0; z / z` stays a genuine runtime division on Node
-   *    too — folding it would be the INVERSE divergence). */
+  /** The literal-operand float fold (SEMANTICS.md S036) -- one rule for
+   * every lane, float-fold.ts. */
   private tryFoldFloatConst(e: IrExpr): number | undefined {
-    if (e.kind === "numLit") {
-      if (e.value === Infinity || e.value === -Infinity) return undefined;
-      return e.value;
-    }
-    if (e.kind === "unary" && e.op === "-") {
-      const v = this.tryFoldFloatConst(e.operand);
-      return v === undefined ? undefined : -v;
-    }
-    if (e.kind === "bin") {
-      if (e.op !== "+" && e.op !== "-" && e.op !== "*" && e.op !== "/" && e.op !== "%" && e.op !== "**") {
-        return undefined;
-      }
-      const l = this.tryFoldFloatConst(e.left);
-      if (l === undefined) return undefined;
-      const r = this.tryFoldFloatConst(e.right);
-      if (r === undefined) return undefined;
-      switch (e.op) {
-        case "+": return l + r;
-        case "-": return l - r;
-        case "*": return l * r;
-        case "/": return l / r;
-        case "%": return l % r;
-        // The tier's own `**` (pow.ts), never the compiling host's: the same
-        // arms and bits the run-time helper computes.
-        case "**": return jsPowValue(l, r);
-      }
-    }
-    return undefined;
+    return foldFloatConst(e);
   }
 
   private emitBin(e: Extract<IrExpr, { kind: "bin" }>): void {
@@ -50265,12 +50303,10 @@ class Assembler {
   private ieee754: Ieee754 | null = null;
   private f16roundFunc: number | null = null;
 
-  /** Math.<name>(...args) as an f64 on the stack, for a member
-   * islandMathServed accepts (SEMANTICS.md S100). Every argument is
-   * evaluated, left to right, before any is converted: a number marshalled
-   * into the call (jsMarshal of an f64) is used as is; any other argument is
-   * a dynamic value and gets ECMA-262 ToNumber (jsToNumber, which cannot
-   * throw on this tier -- no valueOf hook exists to run). Then:
+  /** Math.<name>(...args) as an f64 on the stack, for a MATH_LIB_FNS
+   * member (SEMANTICS.md S100). The arguments are f64 (the frontend
+   * ToNumber'd them) and are evaluated, left to right, into locals first.
+   * Then:
    *  - the transcendentals are V8's base::ieee754 functions (ieee754.ts);
    *  - pow is `**` (%w.jsPow, SEMANTICS.md S079), as V8's MathPow is;
    *  - sqrt, fround (f32.demote_f64 rounds to nearest even) and the integer
@@ -50279,29 +50315,14 @@ class Assembler {
    *    x > 0 ? 1 : x, so ±0 and NaN are themselves); f16round is
    *    %w.f16round;
    *  - hypot is V8's math.tq MathHypot (emitHypot). */
-  private emitIslandMath(name: string, args: WExpr[]): void {
+  private emitMath(name: string, args: IrExpr[]): void {
     const code = this.fn.code;
-    const dynRef = this.dyn.dynRef();
     const xs: number[] = [];
-    const pending: [number, number][] = [];
     for (const a of args) {
       const x = this.acquireScratch(F64);
-      if (a.kind === "jsMarshal" && a.value.type.kind === "f64") {
-        this.walkExpr(a.value);
-        code.localSet(x);
-      } else {
-        const d = this.acquireScratch(dynRef);
-        this.walkExpr(a);
-        code.localSet(d);
-        pending.push([d, x]);
-      }
-      xs.push(x);
-    }
-    for (const [d, x] of pending) {
-      code.localGet(d);
-      code.call(this.jsToNumberHelper());
+      this.walkExpr(a);
       code.localSet(x);
-      this.releaseScratch(dynRef, d);
+      xs.push(x);
     }
     const arg = (i: number): void => code.localGet(xs[i]!);
     if (IEEE754_MEMBERS.has(name)) {
@@ -50353,7 +50374,7 @@ class Assembler {
     } else if (name === "hypot") {
       this.emitHypot(xs);
     } else {
-      throw new Error(`wasm emitter bug: Math.${name} passed islandMathServed but has no arm`);
+      throw new Error(`wasm emitter bug: math.${name} is in MATH_LIB_FNS but has no arm`);
     }
     for (const x of xs) this.releaseScratch(F64, x);
   }
@@ -50869,7 +50890,11 @@ class Assembler {
     }
     c.end();
     // y finite and nonzero from here too. Negative base + non-integer
-    // exponent is NaN (no complex results in this world).
+    // exponent is NaN (no complex results in this world) -- the NaN Node's
+    // own path makes: V8's sqrt(x + 0) for y = 0.5, glibc's
+    // __math_invalid (x - x) / (x - x) otherwise, both the machine's
+    // invalid-operation NaN (0xfff8000000000000 on x86-64; board #158). So
+    // it is computed here the same way, at run time, never a constant.
     c.localGet(X);
     c.f64Const(0);
     c.f64Lt();
@@ -50880,7 +50905,13 @@ class Assembler {
       c.localGet(Y);
       c.f64Ne();
       c.ifVoid();
-      c.f64Const(CANONICAL_NAN);
+      c.localGet(X);
+      c.localGet(X);
+      c.f64Sub();
+      c.localGet(X);
+      c.localGet(X);
+      c.f64Sub();
+      c.f64Div();
       c.return_();
       c.end();
     }

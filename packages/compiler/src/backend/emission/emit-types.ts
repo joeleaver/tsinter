@@ -656,7 +656,12 @@ export function cNumberLiteral(value: number): string {
   // includes math.h).
   if (value === Infinity) return "INFINITY";
   if (value === -Infinity) return "-INFINITY";
-  if (Number.isNaN(value)) return "NAN";
+  // A NaN keeps its sign: `-NaN` is the negated global (fff8000000000000 on
+  // Node), every other NaN numLit the canonical one.
+  if (Number.isNaN(value)) {
+    const f = new Float64Array([value]);
+    return new BigUint64Array(f.buffer)[0]! >> 63n ? "(-NAN)" : "NAN";
+  }
   if (Object.is(value, -0)) return "-0.0"; // String(-0) is "0", which would lose the sign
   const text = String(value);
   // Integral shortest-roundtrip text ("118059162071741140000") would be a

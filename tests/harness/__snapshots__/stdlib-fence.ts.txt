@@ -156,15 +156,6 @@ stdlib-fence.ts:32:15 - error SC2020: 'Error.stack' is part of the standard libr
 
   hint: stack traces are not captured (frames would need runtime bookkeeping); name, message, and toString() are available
 
-stdlib-fence.ts:35:15 - error SC2012: 'Math.SQRT2' runs in the embedded dynamic engine, which this build does not include
-
-  34 | // An island-only member (Math.SQRT2: SC2012 without --dynamic), then unlowered members on lowered containers.
-  35 | const sqrt2 = Math.SQRT2;
-     |               ^~~~~~~~~~
-  36 | // (n-ary Math.min/max LOWER now — the variadic battery lives in the
-
-  hint: build with --dynamic to run this call in the embedded engine (adds ~620KB to the binary); static builds never include it
-
 stdlib-fence.ts:38:17 - error SC2020: 'Math.min' is part of the standard library types but has no scriptc lowering yet
 
   37 | // corpus; the mixed spread/positional list is the form that stays fenced.)

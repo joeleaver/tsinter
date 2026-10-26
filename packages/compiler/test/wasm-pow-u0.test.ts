@@ -253,18 +253,19 @@ test("R16 1**1e308 — COMPUTE (base +1, finite exponent)", async () => {
 });
 
 // ============================================================
-// REGISTERED-NaN — R17. Asserts the TIER's OWN 7ff8000000000000 (not
-// Node's fff8000000000000) — board #158, cited by SEMANTICS.md S036; this
-// row changes when #158 is fixed, not before.
+// NaN — R17. Board #158 FIXED (the Math-the-same unit): the tier computes
+// the negative-base NaN as Node's own path does, (x - x) / (x - x) at run
+// time -- the machine's invalid-operation NaN, Node's fff8000000000000 on
+// x86-64 (SEMANTICS.md S036's `**` row).
 // ============================================================
 
-test("R17 (-2)**0.5 — REGISTERED-NaN (board #158; tier answers CANONICAL_NAN, Node answers fff8000000000000; SEMANTICS.md S036)", async () => {
+test("R17 (-2)**0.5 — Node's NaN (board #158 fixed; the machine's invalid-operation NaN, fff8000000000000 on x86-64; SEMANTICS.md S036)", async () => {
   const actual = await runRow(
     "r17",
     "const negTwo: any = -2;\nconst half: any = 0.5;",
     'row("R17 (-2)**0.5", negTwo, half);',
   );
-  expectRow(actual, "R17 (-2)**0.5 c000000000000000 3fe0000000000000 -> 7ff8000000000000 ");
+  expectRow(actual, "R17 (-2)**0.5 c000000000000000 3fe0000000000000 -> fff8000000000000 ");
 });
 
 // ============================================================

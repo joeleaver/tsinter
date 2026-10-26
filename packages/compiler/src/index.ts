@@ -21,7 +21,7 @@ import {
 import { validateSidecar } from "./library/sidecar-validate.js";
 import { entryFunctionExports, type EntryExportInfo } from "./frontend/lib-exports.js";
 import { entryContractFacts, type ContractFacts } from "./frontend/lib-contract.js";
-import { moduleLibAsyncSurface, moduleLibNondeterministicSurface, moduleEmbedsBuiltin, moduleEmbedsCompressedNpm, moduleUsesAssert, moduleUsesCopying, moduleUsesDc, moduleUsesDgram, moduleUsesDynAsync, moduleUsesDynInvoke, moduleUsesEmitter, moduleUsesFetch, moduleUsesFsWatch, moduleUsesHttp2, moduleUsesHttpServer, moduleUsesInspect, moduleUsesNet, moduleUsesNodeTest, moduleUsesProcessEvents, moduleUsesQs, moduleUsesRegex, moduleUsesSearchParams, moduleUsesStream, moduleUsesSymbol, moduleUsesTls, moduleUsesTlsCa, moduleUsesZlib, type IrLibSection, type IrModule, type IrType, type SrcLoc } from "./ir/nodes.js";
+import { moduleLibAsyncSurface, moduleLibNondeterministicSurface, moduleEmbedsBuiltin, moduleEmbedsCompressedNpm, moduleUsesAssert, moduleUsesCopying, moduleUsesDc, moduleUsesDgram, moduleUsesDynAsync, moduleUsesDynInvoke, moduleUsesEmitter, moduleUsesFetch, moduleUsesFsWatch, moduleUsesHttp2, moduleUsesHttpServer, moduleUsesIeee754, moduleUsesInspect, moduleUsesNet, moduleUsesNodeTest, moduleUsesProcessEvents, moduleUsesQs, moduleUsesRegex, moduleUsesSearchParams, moduleUsesStream, moduleUsesSymbol, moduleUsesTls, moduleUsesTlsCa, moduleUsesZlib, type IrLibSection, type IrModule, type IrType, type SrcLoc } from "./ir/nodes.js";
 import { serializeModule } from "./ir/serialize.js";
 import { validateModule } from "./ir/validate.js";
 import { canonicalBuiltinModule, checkPreflight, isNodeTypesPath, loadProgram, locOf, requiresOf, resolveNpmImport, type LoadResult } from "./frontend/program.js";
@@ -91,7 +91,7 @@ export {
 } from "./library/sidecar.js";
 export { validateSidecar } from "./library/sidecar-validate.js";
 export { BUILD_ID_SEED, SOURCE_HASH_SEED, hex16, lengthPrefixedStream, wyhash64 } from "./library/wyhash.js";
-export { ISLAND_SURFACE, type IslandFnEntry } from "./frontend/lowering/surfaces.js";
+export { ISLAND_SURFACE, MATH_CONSTANTS, STATIC_MATH_FNS, type IslandFnEntry } from "./frontend/lowering/surfaces.js";
 export { ambientDtsPath, overridesDtsPath } from "./frontend/program.js";
 export { resolveProvenanceSources } from "./frontend/provenance.js";
 export {
@@ -820,6 +820,9 @@ export async function compile(entryPath: string, opts: CompileOptions): Promise<
       // (emit-island.ts stores big npm sources as raw DEFLATE; the emitted
       // main installs scr_zlib_inflate_exact on the same predicate).
       zlib: moduleUsesZlib(lowered.module) || moduleEmbedsCompressedNpm(lowered.module),
+      // The link switch for the object compiled from V8's ieee754.cc: a
+      // Math transcendental on the IR (--dynamic builds always link it).
+      ieee754: moduleUsesIeee754(lowered.module),
       // The link switch for scr_assert.c: assert.* libCalls on the IR (the
       // regex switch also pulls it — scr_regex.c calls the assert helpers).
       assert: moduleUsesAssert(lowered.module),
@@ -1417,6 +1420,7 @@ export async function compileLibrary(opts: CompileLibraryOptions): Promise<Compi
     searchParams: moduleUsesSearchParams(mod),
     emitter: moduleUsesEmitter(mod),
     zlib: moduleUsesZlib(mod),
+    ieee754: moduleUsesIeee754(mod),
     copying: moduleUsesCopying(mod),
   });
 
