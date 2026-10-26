@@ -292,7 +292,8 @@ import {
 } from "./stream.js";
 import { SymBuilder } from "./symbols.js";
 import { UnionBuilder, type UnionArmRep } from "./unions.js";
-import { Code } from "./code.js";
+import { Code, ENGINE_MEMORY } from "./code.js";
+import { EngineFormatError, fencedGlobalIn, loadEngine, type EngineImage } from "./engine.js";
 import { buildF64ToStr } from "./numfmt.js";
 import { buildPowCore, jsPowValue } from "./pow.js";
 import { Ieee754, IEEE754_MEMBERS } from "./ieee754.js";
@@ -2413,6 +2414,9 @@ class Assembler {
   /** `tsinter.now`'s index, or null in a module that cannot arm a timer
    * (see the prescan in the constructor). */
   private readonly nowFunc: number | null;
+  /** Phase 2 E0/E1: the module reaches the island engine (`__island_eval`)
+   * and carries it — engine.ts; the bridge is the `%isl.*` helpers. */
+  private readonly engineLive: boolean;
   /** `tsinter.seed`'s index, or null in a module that never reaches
    * `Math.random` (mathRandomReachable's prescan, INC-25 P1 — the exact
    * `now`/timerSurfaceReachable shape). */
@@ -2657,6 +2661,13 @@ class Assembler {
     // require it — strings stay immutable by discipline: nothing outside
     // the concat builder may write an element.
     this.strType = this.mb.arrayType("i16", true);
+    // Phase 2 E0/E1: a module that reaches the island engine carries it
+    // (engine.ts), and the engine's code owns memory 0 — so the decision
+    // is made HERE, before any instruction is built, and moves every
+    // memory instruction of ours to memory 1. Every other module is
+    // byte-identical to a build without engine support.
+    this.engineLive = libCallWhere(mod, (fn) => fn === "island.eval");
+    if (this.engineLive) this.mb.reserveEngineMemory();
     // ── begin INC-26 host-import block (the ONE prescan-guarded importFunc site; wasm-host-fs-p5 (f) anchors here) ──
     this.writeFunc = this.mb.importFunc(
       IMPORT_MODULE,
@@ -2692,20 +2703,22 @@ class Assembler {
     const fetchMod = fetchReached && !netMod && !eventModuleReachable(mod);
     const fetchCalled = fetchMod && fetchReach === "fetch";
     this.nowFunc =
-      timerSurfaceReachable(mod) || perfNowReachable(mod) || netMod || hevMod || fetchMod
+      timerSurfaceReachable(mod) || perfNowReachable(mod) || netMod || hevMod || fetchMod || this.engineLive
         ? this.mb.importFunc(IMPORT_MODULE, IMPORT_NOW, this.mb.funcType([], [F64]))
         : null;
     // `seed`'s twin decision (INC-25 P1, abi.ts §8.1): present only in
     // modules that reach Math.random, minted by the same front-of-the-
     // function-index-space prescan `now` uses.
-    this.seedFunc = mathRandomReachable(mod)
+    this.seedFunc = mathRandomReachable(mod) || this.engineLive
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_SEED, this.mb.funcType([], [I64]))
       : null;
     // `wallClock`'s decision (INC-25 P6, D3/D6, C-1): present only in
     // modules that reach `date.now` — minted RIGHT AFTER `seedFunc` so
     // `seed`'s own index position is unchanged by this pass.
     // INC-29 U2: an http module reads it too (a response's Date header).
-    this.wallClockFunc = dateNowReachable(mod) || httpModuleReachable(mod)
+    // Phase 2 E0: the island engine reads both clocks (its WASI
+    // clock_time_get shim: Date.now and performance.now inside an eval).
+    this.wallClockFunc = dateNowReachable(mod) || httpModuleReachable(mod) || this.engineLive
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_WALL_CLOCK, this.mb.funcType([], [F64]))
       : null;
     // `hostStr`/`hostNum`'s decision (INC-26 P1, D2): present only in
@@ -2934,6 +2947,7 @@ class Assembler {
       w.u8(0x41); // i32.const 0
       w.sleb(0);
     });
+    if (this.engineLive) this.attachIslandEngine();
     for (const g of mod.globals ?? []) this.globalById.set(g.id, g);
     for (const r of mod.records ?? []) this.recordShapes.set(r.id, r);
     for (const u of mod.unions ?? []) this.unionsById.set(u.id, u);
@@ -6405,12 +6419,14 @@ class Assembler {
    * checkpoint is emitFirstCheckpoint, below. */
   private emitCheckpoint(c: Code): void {
     this.emitCheckpointCore(c, false);
+    this.emitIslandCheckpoint(c);
   }
 
   /** The FIRST checkpoint only — `_start`, once, right after the entry
    * returns. See emitCheckpointCore's header for why this one differs. */
   private emitFirstCheckpoint(c: Code): void {
     this.emitCheckpointCore(c, true);
+    this.emitIslandCheckpoint(c);
   }
 
   /** The checkpoint: drain to quiescence, answer for a rejection nobody
@@ -6596,6 +6612,500 @@ class Assembler {
     c.call(this.proms.rootReport()); // renders, then traps
     c.end();
     c.end();
+  }
+
+  /* ── the island engine (phase 2 E0/E1; engine.ts, isl_core.c) ─────────
+   * A module that reaches `__island_eval` carries the prebuilt quickjs-ng
+   * engine, spliced in by ModuleBuilder.attachEngine: the engine's code on
+   * memory 0, ours on memory 1. Its five WASI imports never reach the
+   * host — each is bound to a `%isl.wasi.*` shim over the tier's OWN
+   * imports (`write`, `now`, `wallClock`), so the host contract (abi.ts)
+   * gains nothing. The static half of the bridge is `%isl.eval` (UTF-16
+   * staging in, String(result) out, engine exceptions into the cell
+   * exactly as native's isl_throw_reason renders them) and
+   * `%isl.checkpoint` (engine jobs + the engine's unhandled-rejection
+   * ledger, at the static checkpoint's quiescence). SEMANTICS.md S103. */
+
+  private engineLink: {
+    initialize: number;
+    alloc: number;
+    free: number;
+    eval16: number;
+    outNum: number;
+    outPtr: number;
+    outLen: number;
+    outDone: number;
+    drain: number;
+    rejection: number;
+  } | null = null;
+  private islInitField: number | null = null;
+  private islEvalFunc: number | null = null;
+  private islOutFunc: number | null = null;
+  private islCheckpointFunc: number | null = null;
+
+  private attachIslandEngine(): void {
+    const img = loadEngine();
+    const link = this.mb.attachEngine(img, (imp) => this.islandWasiShim(img, imp));
+    this.engineLink = {
+      initialize: link.func("_initialize"),
+      alloc: link.func("isl_alloc"),
+      free: link.func("isl_free"),
+      eval16: link.func("isl_eval16"),
+      outNum: link.func("isl_out_num"),
+      outPtr: link.func("isl_out_ptr"),
+      outLen: link.func("isl_out_len"),
+      outDone: link.func("isl_out_done"),
+      drain: link.func("isl_drain_jobs"),
+      rejection: link.func("isl_rejection"),
+    };
+    this.islInitField = this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41); // i32.const 0
+      w.sleb(0);
+    });
+  }
+
+  private engine(): NonNullable<typeof this.engineLink> {
+    if (this.engineLink === null) throw new Error("emitter bug: an island op in a module that does not carry the engine");
+    return this.engineLink;
+  }
+
+  /** The engine's WASI imports, served inside the module. Only these five
+   * exist (wasi-libc's clock and stdio); any other is an artifact the
+   * merger does not understand, refused by name. */
+  private islandWasiShim(img: EngineImage, imp: EngineImage["imports"][number]): number {
+    const t = img.types[imp.type]!;
+    const sig = `${t.params.map((p) => p.kind).join(",")}->${t.results.map((r) => r.kind).join(",")}`;
+    if (imp.module === "tsinter_engine" && imp.name === "math_random" && sig === "->f64") {
+      // The engine's Math.random IS the static side's generator (S068's
+      // xorshift128+, seeded once from `seed`): one sequence, as in Node.
+      return this.randomHelper();
+    }
+    const want: Record<string, string> = {
+      clock_time_get: "i32,i64,i32->i32",
+      fd_close: "i32->i32",
+      fd_fdstat_get: "i32,i32->i32",
+      fd_seek: "i32,i64,i32,i32->i32",
+      fd_write: "i32,i32,i32,i32->i32",
+    };
+    if (imp.module !== "wasi_snapshot_preview1" || want[imp.name] !== sig) {
+      throw new EngineFormatError(`unexpected engine import ${imp.module}.${imp.name} (${sig})`);
+    }
+    const idx = this.mb.declareFunc(this.mb.funcType(t.params, t.results), `%isl.wasi.${imp.name}`);
+    const c = new Code();
+    const locals: ValType[] = [];
+    switch (imp.name) {
+      case "clock_time_get": {
+        // (clock id, precision, *out u64 ns): REALTIME (0) is the host's
+        // wall clock, every other clock its monotonic one — abi.ts's two
+        // clocks, nanoseconds.
+        c.localGet(2);
+        c.localGet(0);
+        c.i32Eqz();
+        c.ifResult(F64);
+        c.call(this.wallClockFunc!);
+        c.else_();
+        c.call(this.nowFunc!);
+        c.end();
+        c.f64Const(1e6);
+        c.f64Mul();
+        c.i64TruncSatF64U();
+        c.store64In(ENGINE_MEMORY, 0);
+        c.i32Const(0);
+        break;
+      }
+      case "fd_close":
+        c.i32Const(0);
+        break;
+      case "fd_seek":
+        c.i32Const(70); // ESPIPE: stdio streams do not seek
+        break;
+      case "fd_fdstat_get":
+        // A character device with no seek/tell rights: wasi-libc's isatty
+        // answers yes, so engine stdio is line-buffered and never sits in
+        // a buffer nobody flushes.
+        for (const off of [0, 8, 16]) {
+          c.localGet(1);
+          c.i64Const(0n);
+          c.store64In(ENGINE_MEMORY, off);
+        }
+        c.localGet(1);
+        c.i32Const(2); // __WASI_FILETYPE_CHARACTER_DEVICE
+        c.store8In(ENGINE_MEMORY, 0);
+        c.i32Const(0);
+        break;
+      case "fd_write": {
+        // (fd, iovs, iovs_len, *nwritten): each iovec's bytes are staged
+        // into OUR memory in 4096-byte chunks and handed to `write`.
+        const I = 4, TOTAL = 5, P = 6, LEN = 7, CH = 8;
+        locals.push(I32, I32, I32, I32, I32);
+        c.i32Const(0);
+        c.localSet(TOTAL);
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(2);
+        c.i32GeU();
+        c.brIf(1);
+        c.localGet(1);
+        c.localGet(I);
+        c.i32Const(3);
+        c.i32Shl();
+        c.i32Add();
+        c.localSet(P);
+        c.localGet(P);
+        c.load32In(ENGINE_MEMORY, 4);
+        c.localSet(LEN);
+        c.localGet(P);
+        c.load32In(ENGINE_MEMORY, 0);
+        c.localSet(P);
+        c.localGet(TOTAL);
+        c.localGet(LEN);
+        c.i32Add();
+        c.localSet(TOTAL);
+        c.block();
+        c.loop();
+        c.localGet(LEN);
+        c.i32Eqz();
+        c.brIf(1);
+        c.localGet(LEN);
+        c.i32Const(4096);
+        c.localGet(LEN);
+        c.i32Const(4096);
+        c.i32LtU();
+        c.select();
+        c.localSet(CH);
+        // Copied to the free space ABOVE the staging cursor (grown if
+        // needed) — never over a line the program has staged but not yet
+        // flushed — and written from there; the cursor does not move.
+        this.emitEnsureCapacity(c, () => c.localGet(CH));
+        c.globalGet(this.cursorGlobal);
+        c.localGet(P);
+        c.localGet(CH);
+        c.memoryCopy(undefined, ENGINE_MEMORY);
+        c.localGet(0);
+        c.globalGet(this.cursorGlobal);
+        c.localGet(CH);
+        c.call(this.writeFunc);
+        c.localGet(P);
+        c.localGet(CH);
+        c.i32Add();
+        c.localSet(P);
+        c.localGet(LEN);
+        c.localGet(CH);
+        c.i32Sub();
+        c.localSet(LEN);
+        c.br(0);
+        c.end();
+        c.end();
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        c.localGet(3);
+        c.localGet(TOTAL);
+        c.store32In(ENGINE_MEMORY, 0);
+        c.i32Const(0);
+        break;
+      }
+    }
+    this.mb.setBody(idx, locals, c.bytes());
+    return idx;
+  }
+
+  /** Runs the engine's reactor initializer once (wasi-libc's constructors);
+   * the engine creates its runtime and context lazily on first entry. */
+  private emitIslandEnsureInit(c: Code): void {
+    const e = this.engine();
+    c.globalGet(this.islInitField!);
+    c.i32Eqz();
+    c.ifVoid();
+    c.i32Const(1);
+    c.globalSet(this.islInitField!);
+    c.call(e.initialize);
+    c.end();
+  }
+
+  /** %isl.out(i) -> string: the engine's answer string `i`, copied out of
+   * engine memory code unit by code unit (faithful UTF-16 — lone
+   * surrogates survive, as S002 stores them). */
+  private islandOutHelper(): number {
+    if (this.islOutFunc !== null) return this.islOutFunc;
+    const e = this.engine();
+    const idx = this.mb.declareFunc(this.mb.funcType([I32], [this.strRef]), "%isl.out");
+    this.islOutFunc = idx;
+    const c = new Code();
+    const IX = 0, N = 1, P = 2, J = 3, R = 4;
+    c.localGet(IX);
+    c.call(e.outLen);
+    c.localSet(N);
+    c.localGet(IX);
+    c.call(e.outPtr);
+    c.localSet(P);
+    c.localGet(N);
+    c.arrayNewDefault(this.strType);
+    c.localSet(R);
+    c.i32Const(0);
+    c.localSet(J);
+    c.block();
+    c.loop();
+    c.localGet(J);
+    c.localGet(N);
+    c.i32GeU();
+    c.brIf(1);
+    c.localGet(R);
+    c.localGet(J);
+    c.localGet(P);
+    c.localGet(J);
+    c.i32Const(1);
+    c.i32Shl();
+    c.i32Add();
+    c.load16UIn(ENGINE_MEMORY, 0);
+    c.arraySet(this.strType);
+    c.localGet(J);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(J);
+    c.br(0);
+    c.end();
+    c.end();
+    c.localGet(R);
+    this.mb.setBody(idx, [I32, I32, I32, this.strRef], c.bytes());
+    return idx;
+  }
+
+  /** %isl.eval(code) -> String(result) — native scr_island_eval. The
+   * source is staged into an engine-heap buffer as UTF-16; a number or
+   * boolean result is formatted by the tier's OWN formatter (native's
+   * scr_f64_to_scrstr arm); an engine exception becomes the pending
+   * exception: an engine Error crosses as a builtin error picked by NAME
+   * (TypeError / RangeError / SyntaxError, any other name riding an
+   * Error-rooted instance — scr_throw_error_named), anything else as
+   * String(v), a string payload. On an exception the answer is a dummy
+   * empty string the caller's pending check never lets anyone read. */
+  private islandEvalHelper(): number {
+    if (this.islEvalFunc !== null) return this.islEvalFunc;
+    const e = this.engine();
+    const idx = this.mb.declareFunc(this.mb.funcType([this.strRef], [this.strRef]), "%isl.eval");
+    this.islEvalFunc = idx;
+    const out = this.islandOutHelper();
+    const exc = this.exc();
+    const c = new Code();
+    const S = 0, N = 1, P = 2, I = 3, K = 4, A = 5, B = 6, CODE = 7;
+    this.emitIslandEnsureInit(c);
+    c.localGet(S);
+    c.arrayLen();
+    c.localSet(N);
+    c.localGet(N);
+    c.i32Const(1);
+    c.i32Shl();
+    c.call(e.alloc);
+    c.localSet(P);
+    c.i32Const(0);
+    c.localSet(I);
+    c.block();
+    c.loop();
+    c.localGet(I);
+    c.localGet(N);
+    c.i32GeU();
+    c.brIf(1);
+    c.localGet(P);
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Shl();
+    c.i32Add();
+    c.localGet(S);
+    c.localGet(I);
+    c.arrayGetU(this.strType);
+    c.store16In(ENGINE_MEMORY, 0);
+    c.localGet(I);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(I);
+    c.br(0);
+    c.end();
+    c.end();
+    c.localGet(P);
+    c.localGet(N);
+    c.call(e.eval16);
+    c.localSet(K);
+    c.localGet(P);
+    c.call(e.free);
+    // ISL_K_STR
+    c.localGet(K);
+    c.i32Eqz();
+    c.ifVoid();
+    c.i32Const(0);
+    c.call(out);
+    c.call(e.outDone);
+    c.return_();
+    c.end();
+    // ISL_K_NUM
+    c.localGet(K);
+    c.i32Const(1);
+    c.i32Eq();
+    c.ifVoid();
+    c.call(e.outNum);
+    c.call(this.f64ToStrHelper());
+    c.return_();
+    c.end();
+    // ISL_K_BOOL
+    c.localGet(K);
+    c.i32Const(2);
+    c.i32Eq();
+    c.ifVoid();
+    c.call(e.outNum);
+    c.f64Const(0);
+    c.f64Ne();
+    c.ifResult(this.strRef);
+    this.pushStrLitInto(c, "true");
+    c.else_();
+    this.pushStrLitInto(c, "false");
+    c.end();
+    c.return_();
+    c.end();
+    // A thrown value: answer string 0 is the name or String(v).
+    c.i32Const(0);
+    c.call(out);
+    c.localSet(A);
+    c.localGet(K);
+    c.i32Const(3);
+    c.i32Eq();
+    c.ifVoid();
+    // ISL_K_THROW_ERROR: name in A, message in B.
+    c.i32Const(1);
+    c.call(out);
+    c.localSet(B);
+    // An Error's string `code` (slot 2; -1 = none) rides the error's own
+    // code field.
+    c.i32Const(2);
+    c.call(e.outLen);
+    c.i32Const(0);
+    c.i32GeS();
+    c.ifVoid();
+    c.i32Const(2);
+    c.call(out);
+    c.localSet(CODE);
+    c.end();
+    c.call(e.outDone);
+    const named = (cls: string): void => {
+      c.globalGet(this.classes.vtGlobal(cls));
+      c.localGet(A);
+      c.localGet(B);
+      c.localGet(CODE);
+      c.structNew(exc.errT);
+      c.globalSet(exc.refG);
+      const meta = this.classes.meta(cls);
+      if (meta === undefined) throw new Error(`wasm emitter bug: island error of unknown class ${cls}`);
+      c.i32Const(meta.pre);
+      c.globalSet(exc.preG);
+    };
+    const builtin = ["TypeError", "RangeError", "SyntaxError"];
+    for (const name of builtin) {
+      c.localGet(A);
+      this.pushStrLitInto(c, name);
+      c.call(this.strEqHelper());
+      c.ifVoid();
+      named(`%${name}`);
+      c.else_();
+    }
+    named("%Error");
+    for (let i = 0; i < builtin.length; i++) c.end();
+    c.i32Const(EXC_OBJ);
+    c.globalSet(exc.kindG);
+    c.else_();
+    // ISL_K_THROW_VALUE: String(v), a string payload.
+    c.call(e.outDone);
+    c.localGet(A);
+    c.globalSet(exc.refG);
+    c.i32Const(EXC_STR);
+    c.globalSet(exc.kindG);
+    c.end();
+    c.i32Const(0);
+    c.arrayNewDefault(this.strType);
+    this.mb.setBody(idx, [I32, I32, I32, I32, this.strRef, this.strRef, this.strRef], c.bytes());
+    return idx;
+  }
+
+  /** After every static checkpoint in an engine-carrying module: run the
+   * engine's pending jobs (promise reactions inside the island), then
+   * answer for an engine rejection nobody handled — native's report hook
+   * (drain first, so a same-checkpoint handler rescinds), its exact line,
+   * and the tier's exit-1 trap (S010). A module whose program never
+   * entered the engine skips both. */
+  private emitIslandCheckpoint(c: Code): void {
+    if (!this.engineLive) return;
+    c.call(this.islandCheckpointHelper());
+  }
+
+  private islandCheckpointHelper(): number {
+    if (this.islCheckpointFunc !== null) return this.islCheckpointFunc;
+    const e = this.engine();
+    const idx = this.mb.declareFunc(this.mb.funcType([], []), "%isl.checkpoint");
+    this.islCheckpointFunc = idx;
+    const out = this.ensureHelpers();
+    const exc = this.exc();
+    const c = new Code();
+    c.globalGet(this.islInitField!);
+    c.i32Eqz();
+    c.ifVoid();
+    c.return_();
+    c.end();
+    c.call(e.drain);
+    c.i32Const(0);
+    c.i32LtS();
+    c.ifVoid();
+    // A job the engine itself could not complete: native prints
+    // "Uncaught <String(exc)>" and exits 1 — the uncaught reporter, over
+    // a string payload.
+    c.i32Const(0);
+    c.call(this.islandOutHelper());
+    c.globalSet(exc.refG);
+    c.call(e.outDone);
+    c.i32Const(EXC_STR);
+    c.globalSet(exc.kindG);
+    c.call(this.reportUncaughtHelper());
+    c.end();
+    c.call(e.rejection);
+    c.ifVoid();
+    if (this.needsUnhandledRejectionDispatch) {
+      // Node hands the rejection to the program's 'unhandledRejection'
+      // listener; the engine's ledger does not reach the tier's dispatch
+      // yet — a named error instead of a silently different stop.
+      c.call(e.outDone);
+      this.emitSetCellError(
+        c,
+        "%Error",
+        "Error",
+        (x) => this.pushStrLitInto(x, "an island promise rejection with an 'unhandledRejection' listener registered is not supported yet (SEMANTICS.md S103)"),
+        null,
+      );
+      c.call(this.reportUncaughtHelper());
+    }
+    // The static report's own order (promises.ts emitReport): 'exit'
+    // listeners with code 1 first, then the line, then the trap.
+    if (this.needsExitDrain) {
+      c.i32Const(1);
+      c.call(this.proc.exitDrainHelper());
+    }
+    this.pushStrLitInto(c, "Unhandled promise rejection: ");
+    c.call(out.stage);
+    c.i32Const(0);
+    c.call(this.islandOutHelper());
+    c.call(out.stage);
+    c.call(e.outDone);
+    c.i32Const(0x0a);
+    c.call(out.putc);
+    c.i32Const(FD_STDERR);
+    c.call(out.flush);
+    c.unreachable();
+    c.end();
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
   }
 
   /* ── the timer runtime and the loop the host pumps (timers.ts) ────────
@@ -20084,6 +20594,35 @@ class Assembler {
             code.unreachable();
             return;
           }
+        }
+        if (e.fn === "island.eval") {
+          // __island_eval through the engine this module carries
+          // (phase 2 E1; islandEvalHelper). Source text the compiler can
+          // see that names a Node global the engine lacks refuses here,
+          // by name — the run-time fence (S103 (b)) is for text it cannot.
+          {
+            let fenced: string | null = null;
+            const scan = (node: unknown): void => {
+              if (fenced !== null || node === null || typeof node !== "object") return;
+              if (Array.isArray(node)) {
+                for (const x of node) scan(x);
+                return;
+              }
+              const rec = node as Record<string, unknown>;
+              if (rec["kind"] === "strLit" && typeof rec["value"] === "string") fenced = fencedGlobalIn(rec["value"]);
+              for (const v of Object.values(rec)) scan(v);
+            };
+            scan(e.args[0]);
+            if (fenced !== null) {
+              this.refuse(`libCall:island.eval:engine-global:${fenced}`, e.loc);
+              code.unreachable();
+              return;
+            }
+          }
+          this.walkExpr(e.args[0]!);
+          code.call(this.islandEvalHelper());
+          this.emitPendingCheck();
+          return;
         }
         if (e.fn === "insp.f64") {
           // util.inspect's one number-ism (scr_insp_f64): JS ToString

@@ -932,9 +932,21 @@
  *     write(fd, ptr, len): the host writes len bytes at ptr from the
  *     exported memory to fd (1 = stdout, 2 = stderr), synchronously —
  *     the module reuses the staging region the moment the call returns.
+ *     THE EXPORTED MEMORY IS ALWAYS THE MODULE'S OWN. A module that
+ *     carries the island engine (phase 2, `__island_eval`; engine.ts) has
+ *     TWO memories — the engine's heap is memory 0 and is not exported,
+ *     the module's own is memory 1 — and `memory` still names the module's
+ *     own, so every import here reads and writes exactly what it always
+ *     did. The engine's own WASI imports are served INSIDE the module
+ *     (emitter.ts `%isl.wasi.*`, over `write`, `now` and `wallClock`; its
+ *     Math.random is the module's own generator over `seed`): carrying
+ *     the engine adds no import to this contract, but SUCH A MODULE
+ *     REQUIRES A HOST WITH MULTI-MEMORY (Node 24 and wasmtime have it;
+ *     Safari is unverified) — SEMANTICS.md S103.
  *
- *   (import "tsinter" "now" (func (result f64)))   [timer modules, and
- *                                                     perf.now modules]
+ *   (import "tsinter" "now" (func (result f64)))   [timer modules,
+ *                                                     perf.now modules and
+ *                                                     engine-carrying modules]
  *     MONOTONIC milliseconds from an unspecified origin — the SAME clock
  *     `_tick`'s argument uses. Timers need a clock that never goes
  *     backwards, and this is that clock; `performance.now()` reads it too
@@ -947,7 +959,7 @@
  *     arms a timer or reads `performance.now()`, so every reader agrees
  *     on which clock this is.
  *
- *   (import "tsinter" "seed" (func (result i64)))   [Math.random modules only]
+ *   (import "tsinter" "seed" (func (result i64)))   [Math.random modules and engine-carrying modules only]
  *     ONE 64-bit value, read AT MOST ONCE per module instance, on the
  *     first `Math.random()` call. Present only in modules that reach
  *     `Math.random`. The module owns the generator: it seeds V8's
@@ -988,7 +1000,7 @@
  *         guarantee here is the same shape as `now`'s, but it covers only
  *         this VALUE tier, not the result-type tier above it.
  *
- *   (import "tsinter" "wallClock" (func (result f64)))   [Date.now / no-arg `new Date()` modules only]
+ *   (import "tsinter" "wallClock" (func (result f64)))   [Date.now / no-arg `new Date()` modules, http modules and engine-carrying modules only]
  *     Milliseconds since the Unix epoch on the host's REAL-TIME clock, as
  *     an f64. Present only in modules that read `Date.now()` or construct
  *     a no-argument `new Date()`. MAY JUMP BACKWARDS: a real-time clock is

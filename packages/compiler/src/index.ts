@@ -4,6 +4,7 @@ import { CcCompileError, compileC, compileLibArchive, resolveCc, targetPlatform 
 import { emitModule } from "./backend/emission/emitter.js";
 import { emitLlvmModule, LlvmUnsupportedError } from "./backend/llvm/emitter.js";
 import { emitWasmModule, surveyWasmModule, WasmUnsupportedError } from "./backend/wasm/emitter.js";
+import { EngineFormatError } from "./backend/wasm/engine.js";
 import { checkerPanicDiag, ffiNativeBuildDiag, libAsyncExportDiag, libAsyncSurfaceDiag, libExportUnresolvedDiag, libGenericExportDiag, libIntBoundaryDiag, libNpmIneligibleDiag, libUnmappableSignatureDiag, iceDiag, isCheckerPanic, LIB_INBOUND_BYTES_TRAP_CODE, LIB_RUNTIME_TRAP_CODES, type ScrDiagnostic } from "./diagnostics/diagnostic.js";
 import { checkLibraryIntegerSlots, classSeed, hasIntSlots, type FnIntSlots, type IntSlotConfig } from "./library/int-infer.js";
 import { loadLibraryProfile, profileRemediation, profileTeaching, type LibraryProfile } from "./library/profile.js";
@@ -715,6 +716,16 @@ export async function compile(entryPath: string, opts: CompileOptions): Promise<
     try {
       bytes = emitWasmModule(lowered.module!);
     } catch (err) {
+      if (err instanceof EngineFormatError) {
+        // The island engine artifact a module needs failed its integrity
+        // or shape check (engine.ts): a broken installation, reported as
+        // a diagnostic — never an exception out of compile().
+        return {
+          ok: false,
+          diagnostics: [{ code: "SC3002", message: err.message, loc: { file: entryPath, start: 0, end: 0 } }],
+          sourceTexts,
+        };
+      }
       if (!(err instanceof WasmUnsupportedError)) throw err;
       return {
         ok: false,

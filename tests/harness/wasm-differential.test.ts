@@ -3606,6 +3606,16 @@ const TIER_FLOOR: string[] = [
   // and drive it as Node does, so deflate's bytes print on every lane;
   // a new program, passing here from its first run: 1078 -> 1079.
   "2756-zlib-deflate-bytes.ts",
+  // Phase 2 units E0+E1: the prebuilt quickjs-ng engine spliced into the
+  // module only when it is reached (engine.ts, ModuleBuilder.attachEngine;
+  // the engine on memory 0, ours on memory 1), and `__island_eval`
+  // lowered through it — String(result), one context per instance,
+  // engine exceptions as the native bridge's catchable errors
+  // (SEMANTICS.md S103): 1079 -> 1083.
+  "1100-island-eval-basics.ts",
+  "1101-island-marshal-unicode.ts",
+  "1102-island-rc-stress.ts",
+  "1206-regex-dynamic-mix.ts",
 ];
 
 interface RunResult {

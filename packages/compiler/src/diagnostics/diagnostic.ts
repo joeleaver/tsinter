@@ -13,7 +13,11 @@
  *   SC3xxx  backend coverage: the program is compilable (the C backend
  *            builds it) but the selected alternate backend's tier does not
  *            include some IR construct yet (SC3001 — the LLVM backend's
- *            refusal, minted in index.ts from LlvmUnsupportedError)
+ *            refusal, minted in index.ts from LlvmUnsupportedError);
+ *            SC3002 — the WasmGC backend's island engine artifact
+ *            (vendor/quickjs-ng-wasm/engine.wasm) failed its sha256 or
+ *            shape check (engine.ts EngineFormatError): an installation
+ *            fault, not a program one
  *   SC4xxx  library-mode/profile refusals (the library-emission mode): profile
  *            malformed (SC4001), export unresolved (SC4002), unmappable
  *            signature (SC4003), async/generator export (SC4004), the

@@ -3094,15 +3094,15 @@ JSRuntime *JS_GetRuntime(JSContext *ctx)
 
 static void update_stack_limit(JSRuntime *rt)
 {
-#if defined(__wasi__)
-    rt->stack_limit = 0; /* no limit */
-#else
+    /* tsinter patch (packages/runtime/vendor/README.md): upstream forces
+     * "no limit" under __wasi__; the WasmGC tier's engine sets a real
+     * budget (JS_SetMaxStackSize) so deep recursion is a catchable
+     * RangeError instead of a host stack-overflow trap. */
     if (rt->stack_size == 0) {
         rt->stack_limit = 0; /* no limit */
     } else {
         rt->stack_limit = rt->stack_top - rt->stack_size;
     }
-#endif
 }
 
 void JS_SetMaxStackSize(JSRuntime *rt, size_t stack_size)

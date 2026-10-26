@@ -6889,3 +6889,135 @@ libregexp and keep S065's native arm.
 (RTN-01..07, end to end against Node; RTN-03 pins the fence's message and
 code), corpus 2448 and 2748 on the wasm census. Measured against Node
 v24.18.1.
+
+## S103 — `__island_eval` on the wasm lane runs in the embedded engine: its recursion depth is about a tenth of Node's and some deep engine recursion overflows the host stack uncatchably, Node globals and locale methods it lacks are fenced by name, its jobs run at the checkpoint instead of in Node's microtask queue, its error messages and some limits are QuickJS's, its local time is UTC, its transcendental Math is musl's, an error crossing out keeps name, message and a string code only, and a rejection with an 'unhandledRejection' listener is fenced *(wasm lane; (c) and (d) are shared with the native lanes)*
+
+A module that reaches `__island_eval` carries the quickjs-ng engine the native
+lanes embed, at the same pin, compiled to wasm32 with wasi-libc
+(`scripts/build-engine-wasm.mjs`; the artifact is
+`packages/runtime/vendor/quickjs-ng-wasm/engine.wasm`, spliced into the module
+by `packages/compiler/src/backend/wasm/engine.ts`). Such a module has TWO
+linear memories (the engine's heap is memory 0 and is not exported; the
+module's own, exported as `memory`, is memory 1), so its host must support
+multi-memory (Node 24 and wasmtime do; Safari is unverified); every other
+module keeps one memory and is byte-identical to a build without engine
+support. The engine evaluates the source as an indirect eval — `(0,
+eval)(code)`, the corpus oracle's own shim (`tests/harness/island-shim.mjs`):
+`let`/`const` stay local to one eval, `var` and functions land on the global
+object, and globals persist for the whole run. The answer is
+`String(result)` (a symbol renders `Symbol(desc)`), numbers formatted by the
+tier's own formatter. The engine's `Math.random` is the module's own
+generator (S068), so static and island draws share one sequence, as in Node.
+An engine exception crosses as the native bridge renders it
+(`isl_throw_reason`): an Error as a builtin error picked by name (TypeError,
+RangeError, SyntaxError; any other name rides an Error-rooted instance), any
+other value as `String(value)`, a string payload. Everything else is Node's,
+except:
+
+- **(a) Recursion depth, and the host stack.** The engine checks its own C
+  stack against a 256 KiB budget (`packages/runtime/src/wasm/isl_core.c`,
+  `ISL_STACK_BUDGET`; the vendored engine's "no limit under WASI" was patched
+  out — see `packages/runtime/vendor/README.md`). Past it, a catchable
+  `RangeError: Maximum call stack size exceeded`, as in Node — but sooner:
+  `function d(n) { return n === 0 ? 0 : 1 + d(n - 1); }` reaches 1,020 frames
+  in the engine where Node's indirect eval reaches 9,610. The engine's frames
+  are also wasm frames on the host's stack, shared with the program's own,
+  and the budget measures only the engine's C stack, so what the host has
+  left decides the rest. Measured on Node v24.18.1 with the module run by
+  the test host: unbounded JS recursion inside the eval stays catchable with
+  up to 4,700 static frames below the call site when each of them holds a
+  `try`/`catch` (4,800 overflows the host) and with at least 6,000 plain
+  static frames; at the top level these overflow the HOST stack first — the
+  host's RangeError ends the run, uncatchable, where Node throws a catchable
+  RangeError: `JSON.stringify` of a 100,000-deep object, an eval of 100,000
+  nested parentheses, `JSON.parse` of 100,000 nested arrays (Node parses
+  it), `flat(Infinity)` over 100,000 nested arrays. `String()` of 100,000
+  nested arrays and a 100,000-deep Proxy chain are caught. No single budget
+  fixes the list: swept at 64, 128 and 256 KiB, each budget catches a
+  different subset of these shapes and smaller budgets halve the depth. The
+  native lanes budget 128 KiB on a fiber and 4 MiB on the main stack.
+- **(b) Node globals and locale methods the engine does not have are
+  fenced.** Every own property name of Node's global object (generated from
+  Node v24.18.1 into `packages/runtime/src/wasm/node_globals.h` by the build
+  script) that the engine lacks is an accessor that throws a catchable
+  `Error` whose message is `<name> inside __island_eval is not supported yet
+  on the wasm lane (SEMANTICS.md S103)` — `typeof` included — where Node
+  answers its object: 67 names, recorded in
+  `vendor/quickjs-ng-wasm/engine-fence.json` (among them `console`,
+  `setTimeout`, `TextEncoder`, `URL`, `Intl`, `Atomics`, `WebSocket`,
+  `process`, `Buffer`, `crypto`, `fetch`, `structuredClone`, the stream,
+  event and performance classes). Assigning one replaces the fence with an
+  ordinary global. Without `Intl` the engine's locale-sensitive methods
+  answer differently from Node (`(1234567.891).toLocaleString()` is
+  `1234567.891`, Node prints `1,234,567.891`), so `Number`, `BigInt` and
+  `Date` `toLocaleString`, `Date` `toLocaleDateString` and
+  `toLocaleTimeString`, and `String` `localeCompare`, `toLocaleLowerCase` and
+  `toLocaleUpperCase` throw the same named error (message
+  `<Class>.prototype.<method> inside __island_eval ...`); array and typed-array
+  `toLocaleString` reach them through their elements. Where the compiler can
+  see the eval's source — a string literal in the argument that references
+  a fenced global in identifier position (not inside a quoted string, a
+  comment, or after `.`) — the program refuses at build time instead
+  (`libCall:island.eval:engine-global:<name>`; corpus 1120 refuses this
+  way).
+- **(c) Engine jobs run at the checkpoint.** A promise reaction created inside
+  an eval runs after the static checkpoint drains (after every static
+  microtask and tick, before the next macrotask), the station the native lanes
+  drain the engine at (`scr_island_drain_jobs`, at loop quiescence) — not in
+  Node's single microtask queue. Observable through a later eval: after
+  `await null`, an eval that queues `globalThis.w = 7` and, after a second
+  `await null`, an eval reading `w`, prints `undefined` where Node prints `7`.
+  A job the engine cannot complete prints `Uncaught <String(error)>` and exits
+  1, as native does.
+- **(d) Engine error messages and limits are QuickJS's.** The name is right;
+  the text can differ from V8's: `null.x` is `cannot read property 'x' of
+  null` (Node: `Cannot read properties of null (reading 'x')`), `undefined()`
+  is `not a function` (Node: `undefined is not a function`). Engine limits
+  differ too: a regex with 5,000 nested groups is a SyntaxError (Node
+  matches it); a chain of 10,000 `bind`s throws RangeError when called
+  (Node answers). The native lanes run the same engine and print the same
+  texts.
+- **(e) Local time is UTC.** wasi-libc's `localtime_r` has no time zone, so
+  inside the engine `getTimezoneOffset()` is 0 and every local-time method and
+  `toString` answers in UTC; measured under `TZ=America/New_York`, Node
+  answers `new Date(0).getTimezoneOffset()` with 300. The native lanes use the
+  host's zone.
+- **(f) Transcendental Math inside the engine is wasi-libc's (musl's).**
+  Measured over 2,000 inputs in (-10, 10) (|x| for log/log1p), the count that
+  differ from Node in the last bit: sin 19, cos 25, exp 206, log 142, log1p 1;
+  tan, atan, cbrt, sinh and expm1 0. (The tier's own Math is S100's; the
+  native lanes' engine uses glibc — S100 (d).)
+- **(g) An unhandled engine rejection** prints the native lanes' line,
+  `Unhandled promise rejection: <String(reason)>`, and exits 1 (S010's shape)
+  at the checkpoint after the engine's jobs ran (a handler attached by then
+  rescinds it). With an `'unhandledRejection'` listener registered, it throws
+  a named `Error` (`an island promise rejection with an 'unhandledRejection'
+  listener registered is not supported yet (SEMANTICS.md S103)`) uncaught,
+  where Node calls the listener.
+- **(h) An Error crossing out of an eval keeps its name, message and a
+  string `code`.** Its `cause`, `stack`, a non-string `code` and every other
+  own property are lost: `throw Object.assign(new Error('m'), { code: 'E1',
+  extra: 5 })` caught statically reads `code` `E1`, `extra` undefined and
+  `stack` undefined (Node: `5` and a string); `new TypeError('t', { cause:
+  'c' })` reads `cause` undefined (Node: `c`). The native lanes also drop
+  `code`. Like every non-Error value, a thrown symbol arrives as its
+  `String()` — the string `Symbol(desc)` — where Node's catch sees the
+  symbol itself (native: the string `Error: unrepresentable island
+  exception`).
+
+The engine's heap is never torn down; its counting allocator returns to the
+same live count after any number of evals, throws and job drains (the unit
+test reads it). A module that reaches `__island_eval` is about 666 KB larger
+than one that does not (665,633 bytes: a one-eval hello world, 666,510
+bytes, against the same program written without the eval, 877).
+
+**Tested by:** `packages/compiler/test/wasm-island-engine.test.ts` — (a)
+the catchable overflow with 2,000 static frames below it and a host
+overflow, (b) the global and locale fences, the generated lists' agreement
+and the build-time refusal, (c) job timing against timers, (d) and (e) the
+texts and the zone, (g) the rejection line and the listener fence, (h) the
+carried code and the lost properties, the shared Math.random sequence, plus
+the leak oracle, the artifact's format check, its SC3002 diagnostic and the
+zero-cost rule — and corpus 1100, 1101, 1102 and 1206 on the wasm census.
+(f), the depth figures and the host-stack shapes in (a), and the limits in
+(d) were measured by hand, outside the suite. Measured against Node v24.18.1.

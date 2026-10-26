@@ -5,11 +5,43 @@
 import { ByteWriter } from "./bytes.js";
 import type { ValType } from "./module.js";
 
+/** The memory index of the module's OWN linear memory: 0, except in a
+ * module that carries the island engine (ModuleBuilder.
+ * reserveEngineMemory), where the engine owns memory 0 and ours is 1. A
+ * memarg naming memory 0 keeps the single-memory encoding, so a module
+ * without the engine is byte-identical to one built before multi-memory
+ * existed here. Set by ModuleBuilder only. */
+let ourMem = 0;
 
+export function setOurMemoryIndex(n: number): void {
+  ourMem = n;
+}
 
+/** The memory index memory instructions are being built for right now —
+ * ModuleBuilder.setBody checks it against its own, so a body built while
+ * a DIFFERENT builder's setting was live fails loudly instead of naming
+ * the wrong memory. */
+export function currentOurMemoryIndex(): number {
+  return ourMem;
+}
+
+/** The engine's memory (memory 0 of an engine-carrying module). */
+export const ENGINE_MEMORY = 0;
 
 export class Code {
   readonly w = new ByteWriter();
+
+  /** memarg: alignment exponent, then (multi-memory) the memory index
+   * flagged by bit 6 when it is not 0, then the offset. */
+  private memarg(align: number, off: number, mem: number = ourMem): void {
+    if (mem === 0) {
+      this.w.uleb(align);
+    } else {
+      this.w.uleb(align | 0x40);
+      this.w.uleb(mem);
+    }
+    this.w.uleb(off);
+  }
 
   bytes(): Uint8Array {
     return this.w.bytes();
@@ -143,15 +175,13 @@ export class Code {
   }
   i32Store8(): void {
     this.w.u8(0x3a);
-    this.w.uleb(0); // alignment (2^0 — byte access)
-    this.w.uleb(0); // offset
+    this.memarg(0, 0);
   }
   /** i32.store16 — a 2-byte little-endian write (#227: fetch's UTF-16
    * request runs). No alignment claimed, as i32Store8. */
   i32Store16(): void {
     this.w.u8(0x3b);
-    this.w.uleb(0);
-    this.w.uleb(0);
+    this.memarg(0, 0);
   }
   /** i32.load16_u — zero-extends a 16-bit little-endian read from linear
    * memory to i32. INC-26 P1's first INBOUND read: every prior instruction
@@ -163,8 +193,7 @@ export class Code {
    * guaranteed 2-byte aligned by construction. */
   i32Load16U(): void {
     this.w.u8(0x2f);
-    this.w.uleb(0); // alignment (none claimed)
-    this.w.uleb(0); // offset
+    this.memarg(0, 0);
   }
   /** i32.load8_u — zero-extends an 8-bit read from linear memory to i32.
    * INC-26 P5 3C-1 (brief-p5-delta-3c.txt 0c29d591, PERMIT-HUNK): the
@@ -174,8 +203,7 @@ export class Code {
    * construction. */
   i32Load8U(): void {
     this.w.u8(0x2d);
-    this.w.uleb(0); // alignment (none claimed)
-    this.w.uleb(0); // offset
+    this.memarg(0, 0);
   }
   /** f64.load — an 8-byte little-endian read from linear memory. INC-26
    * P5 3C-1: the stats record's size/mtimeMs fields, written by the HOST
@@ -185,8 +213,7 @@ export class Code {
    * correct regardless of the field's true byte offset. */
   f64Load(): void {
     this.w.u8(0x2b);
-    this.w.uleb(0);
-    this.w.uleb(0);
+    this.memarg(0, 0);
   }
   /** i32.store — a 4-byte little-endian write to linear memory. INC-26
    * P5 3C-1: op 14's retry record (maxRetries, retryDelay), written by
@@ -196,69 +223,98 @@ export class Code {
    * is unconstrained the same way f64Load's read side is). */
   i32Store(): void {
     this.w.u8(0x36);
-    this.w.uleb(0);
-    this.w.uleb(0);
+    this.memarg(0, 0);
   }
   /** The memarg-offset loads and stores zlib.ts's work area reads through:
    * the address on the stack plus a constant `off` (a region's offset in
    * the area). No alignment claimed, as the forms above. */
   load8UAt(off: number): void {
     this.w.u8(0x2d);
-    this.w.uleb(0);
-    this.w.uleb(off);
+    this.memarg(0, off);
   }
   load16UAt(off: number): void {
     this.w.u8(0x2f);
-    this.w.uleb(0);
-    this.w.uleb(off);
+    this.memarg(0, off);
   }
   load32At(off: number): void {
     this.w.u8(0x28);
-    this.w.uleb(0);
-    this.w.uleb(off);
+    this.memarg(0, off);
   }
   store8At(off: number): void {
     this.w.u8(0x3a);
-    this.w.uleb(0);
-    this.w.uleb(off);
+    this.memarg(0, off);
   }
   store16At(off: number): void {
     this.w.u8(0x3b);
-    this.w.uleb(0);
-    this.w.uleb(off);
+    this.memarg(0, off);
   }
   store32At(off: number): void {
     this.w.u8(0x36);
-    this.w.uleb(0);
-    this.w.uleb(off);
+    this.memarg(0, off);
   }
   /** memory.copy (dest, src, n) — memmove semantics. */
-  memoryCopy(): void {
+  memoryCopy(dst: number = ourMem, src: number = ourMem): void {
     this.w.u8(0xfc);
     this.w.uleb(10);
-    this.w.u8(0);
-    this.w.u8(0);
+    this.w.uleb(dst);
+    this.w.uleb(src);
   }
   /** memory.fill (dest, byte, n). */
   memoryFill(): void {
     this.w.u8(0xfc);
     this.w.uleb(11);
-    this.w.u8(0);
+    this.w.uleb(ourMem);
   }
   /** memory.init (dest, srcOffset, n) from passive data segment `seg`. */
   memoryInit(seg: number): void {
     this.w.u8(0xfc);
     this.w.uleb(8);
     this.w.uleb(seg);
-    this.w.u8(0);
+    this.w.uleb(ourMem);
   }
   memorySize(): void {
     this.w.u8(0x3f);
-    this.w.uleb(0);
+    this.w.uleb(ourMem);
   }
   memoryGrow(): void {
     this.w.u8(0x40);
-    this.w.uleb(0);
+    this.w.uleb(ourMem);
+  }
+  /** The island bridge's loads and stores on the ENGINE's memory
+   * (memory 0 of an engine-carrying module), whatever memory the tier's
+   * own instructions address. */
+  load16UIn(mem: number, off: number): void {
+    this.w.u8(0x2f);
+    this.memarg(0, off, mem);
+  }
+  store16In(mem: number, off: number): void {
+    this.w.u8(0x3b);
+    this.memarg(0, off, mem);
+  }
+  load8UIn(mem: number, off: number): void {
+    this.w.u8(0x2d);
+    this.memarg(0, off, mem);
+  }
+  load32In(mem: number, off: number): void {
+    this.w.u8(0x28);
+    this.memarg(0, off, mem);
+  }
+  store8In(mem: number, off: number): void {
+    this.w.u8(0x3a);
+    this.memarg(0, off, mem);
+  }
+  store32In(mem: number, off: number): void {
+    this.w.u8(0x36);
+    this.memarg(0, off, mem);
+  }
+  store64In(mem: number, off: number): void {
+    this.w.u8(0x37);
+    this.memarg(0, off, mem);
+  }
+  /** i64.trunc_sat_f64_u — saturating (never traps). */
+  i64TruncSatF64U(): void {
+    this.w.u8(0xfc);
+    this.w.uleb(7);
   }
   localTee(i: number): void {
     this.w.u8(0x22);

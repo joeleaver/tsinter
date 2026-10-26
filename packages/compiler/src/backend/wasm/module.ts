@@ -34,6 +34,8 @@
  * later entry may still reference a group member freely — the backward
  * rule is unchanged outside the span. */
 import { ByteWriter } from "./bytes.js";
+import { currentOurMemoryIndex, setOurMemoryIndex } from "./code.js";
+import { writeUleb5, type EngineImage } from "./engine.js";
 
 export type ValType =
   | { kind: "i32" }
@@ -109,6 +111,28 @@ interface FuncDecl {
   typeIndex: number;
   name: string;
   body: { locals: ValType[]; code: Uint8Array } | null;
+  /** An island-engine function (attachEngine): its body is the engine's
+   * own, re-indexed — an index into the attached engine's `bodies`. */
+  engineBody?: number;
+}
+
+/** The spliced island engine (attachEngine): its re-indexed code, its
+ * table + element segment, its memory (memory 0) and data. */
+interface AttachedEngine {
+  code: Uint8Array;
+  bodies: { start: number; end: number }[];
+  tableMin: number;
+  tableMax: number | null;
+  memoryMin: number;
+  elemOffset: Uint8Array;
+  elemFuncs: number[];
+  dataSegments: Uint8Array[];
+}
+
+/** What the emitter gets back from attachEngine: merged function indices
+ * of the engine's exports. */
+export interface EngineLink {
+  func(name: string): number;
 }
 
 type ExportEntry = { name: string; desc: "func" | "memory"; index: number };
@@ -137,6 +161,99 @@ export class ModuleBuilder {
    * against segment 0, which must then exist (empty is fine, absent is a
    * validation error). */
   private blobUsed = false;
+  /** reserveEngineMemory was called: the engine owns memory 0 and the
+   * module's own memory is memory 1 (multi-memory). */
+  private engineMemory = false;
+  private engine: AttachedEngine | null = null;
+
+  /** Must be called BEFORE any instruction is built when the module will
+   * carry the island engine: the engine's code addresses memory 0, so the
+   * module's own memory moves to index 1 and every memory instruction the
+   * tier emits names it (code.ts). Without this call nothing changes — a
+   * module that never reaches the engine is byte-identical to a build
+   * that has no engine support at all. */
+  constructor() {
+    // A fresh module starts on memory 0 whatever an earlier builder in
+    // this process did (a walk that threw out of an engine module never
+    // reached emit()'s reset).
+    setOurMemoryIndex(0);
+  }
+
+  reserveEngineMemory(): void {
+    this.engineMemory = true;
+    setOurMemoryIndex(1);
+  }
+
+  /** Splices the island engine image in: its types interned into ours,
+   * its functions declared HERE (a contiguous block at the current end of
+   * the function space), its globals appended, its imports bound to
+   * functions the caller already declared (`bindImport`), and every
+   * index-space immediate in its code re-indexed in place (engine.ts). */
+  attachEngine(img: EngineImage, bindImport: (imp: EngineImage["imports"][number]) => number): EngineLink {
+    if (!this.engineMemory) throw new Error("attachEngine without reserveEngineMemory");
+    if (this.engine !== null) throw new Error("attachEngine called twice");
+    if (this.recSpanStart !== null) throw new Error("attachEngine inside an open rec group");
+    const typeMap = img.types.map((t) => this.funcType(t.params, t.results));
+    const nImp = img.imports.length;
+    const impMap = img.imports.map((imp) => {
+      const target = bindImport(imp);
+      if (this.funcTypeOf(target) !== typeMap[imp.type]) {
+        throw new Error(`engine import ${imp.module}.${imp.name} bound to a function of the wrong type`);
+      }
+      return target;
+    });
+    const funcBase = this.imports.length + this.funcs.length;
+    img.funcTypes.forEach((t, i) => {
+      this.funcs.push({ typeIndex: typeMap[t]!, name: img.names.get(nImp + i) ?? `qjs.${i}`, body: null, engineBody: i });
+    });
+    const globalMap = img.globals.map((g) => this.addGlobal(g.type, g.mutable, (w) => w.raw(g.init)));
+    const funcMap = (e: number): number => (e < nImp ? impMap[e]! : funcBase + (e - nImp));
+    const code = img.code.slice();
+    for (const r of img.relocs) {
+      let v: number | undefined;
+      switch (r.space) {
+        case "func":
+          v = r.index < nImp + img.funcTypes.length ? funcMap(r.index) : undefined;
+          break;
+        case "type":
+          v = typeMap[r.index];
+          break;
+        case "global":
+          v = globalMap[r.index];
+          break;
+        case "table":
+          // The engine's table is the module's only table.
+          v = r.index === 0 ? 0 : undefined;
+          break;
+      }
+      if (v === undefined) throw new Error(`engine ${r.space} index ${r.index} out of range`);
+      writeUleb5(code, r.offset, v);
+    }
+    this.engine = {
+      code,
+      bodies: img.bodies,
+      tableMin: img.tableMin,
+      tableMax: img.tableMax,
+      memoryMin: img.memoryMin,
+      elemOffset: img.elemOffset,
+      elemFuncs: img.elemFuncs.map(funcMap),
+      dataSegments: img.dataSegments,
+    };
+    return {
+      func: (name) => {
+        const e = img.exports.get(name);
+        if (e === undefined) throw new Error(`the island engine exports no function "${name}"`);
+        return funcMap(e);
+      },
+    };
+  }
+
+  private funcTypeOf(funcIndex: number): number {
+    if (funcIndex < this.imports.length) return this.imports[funcIndex]!.typeIndex;
+    const decl = this.funcs[funcIndex - this.imports.length];
+    if (decl === undefined) throw new Error(`no function ${funcIndex}`);
+    return decl.typeIndex;
+  }
 
   funcType(params: ValType[], results: ValType[]): number {
     const key = `f:${params.map(valTypeKey).join(",")}->${results.map(valTypeKey).join(",")}`;
@@ -300,6 +417,10 @@ export class ModuleBuilder {
   setBody(funcIndex: number, locals: ValType[], code: Uint8Array): void {
     const decl = this.funcs[funcIndex - this.imports.length];
     if (decl === undefined) throw new Error(`setBody on undeclared function index ${funcIndex}`);
+    if (decl.engineBody !== undefined) throw new Error(`setBody on island-engine function ${funcIndex}`);
+    if (currentOurMemoryIndex() !== (this.engineMemory ? 1 : 0)) {
+      throw new Error(`setBody("${decl.name}"): the body was built for memory ${currentOurMemoryIndex()}, this module's own is ${this.engineMemory ? 1 : 0}`);
+    }
     decl.body = { locals, code };
   }
 
@@ -339,6 +460,11 @@ export class ModuleBuilder {
 
   emit(): Uint8Array {
     if (this.recSpanStart !== null) throw new Error("emit() with a rec group still open");
+    if (this.engineMemory && this.engine === null) throw new Error("emit() with engine memory reserved but no engine attached");
+    // reserveEngineMemory moved every memory instruction built since to
+    // memory 1; restore the default for whatever this process builds next.
+    setOurMemoryIndex(0);
+    const engine = this.engine;
     if (this.reservedTypes.size > 0) {
       // The declareFunc-without-body rule, for types: a reservation that
       // outlived its span is a planning walk that skipped work, and the
@@ -420,12 +546,36 @@ export class ModuleBuilder {
       });
     }
 
-    if (this.memoryPages !== null) {
+    // The engine's table (the module's only one): its function pointers.
+    if (engine !== null) {
+      w.section(4, (s) => {
+        s.uleb(1);
+        s.u8(0x70); // funcref
+        if (engine.tableMax === null) {
+          s.u8(0x00);
+          s.uleb(engine.tableMin);
+        } else {
+          s.u8(0x01);
+          s.uleb(engine.tableMin);
+          s.uleb(engine.tableMax);
+        }
+      });
+    }
+
+    if (this.memoryPages !== null || engine !== null) {
       const pages = this.memoryPages;
       w.section(5, (s) => {
-        s.uleb(1);
-        s.u8(0x00); // min only, no max
-        s.uleb(pages);
+        s.uleb((pages !== null ? 1 : 0) + (engine !== null ? 1 : 0));
+        // The engine's memory is memory 0 (its code addresses it
+        // implicitly); the module's own follows as memory 1.
+        if (engine !== null) {
+          s.u8(0x00);
+          s.uleb(engine.memoryMin);
+        }
+        if (pages !== null) {
+          s.u8(0x00); // min only, no max
+          s.uleb(pages);
+        }
       });
     }
 
@@ -447,32 +597,50 @@ export class ModuleBuilder {
         for (const e of this.exports) {
           s.name(e.name);
           s.u8(e.desc === "func" ? 0x00 : 0x02);
-          s.uleb(e.index);
+          s.uleb(e.desc === "memory" && engine !== null ? 1 : e.index);
         }
       });
     }
 
     // Declarative element segment: every ref.func target must be
     // pre-declared here or the instruction fails validation.
-    if (this.funcRefs.size > 0) {
+    if (this.funcRefs.size > 0 || engine !== null) {
       const refs = [...this.funcRefs].sort((a, b) => a - b);
       w.section(9, (s) => {
-        s.uleb(1);
-        s.u8(0x03); // declarative, elemkind + funcidx vec
-        s.u8(0x00);
-        s.uleb(refs.length);
-        for (const f of refs) s.uleb(f);
+        s.uleb((refs.length > 0 ? 1 : 0) + (engine !== null ? 1 : 0));
+        if (engine !== null) {
+          // The engine's active segment for table 0, functions re-indexed.
+          s.u8(0x00);
+          s.raw(engine.elemOffset);
+          s.u8(0x0b);
+          s.uleb(engine.elemFuncs.length);
+          for (const f of engine.elemFuncs) s.uleb(f);
+        }
+        if (refs.length > 0) {
+          s.u8(0x03); // declarative, elemkind + funcidx vec
+          s.u8(0x00);
+          s.uleb(refs.length);
+          for (const f of refs) s.uleb(f);
+        }
       });
     }
 
     // DataCount precedes code whenever data exists: array.new_data inside a
-    // body validates against the declared segment count.
-    if (this.blobUsed) w.section(12, (s) => s.uleb(1));
+    // body validates against the declared segment count. Our passive blob
+    // is segment 0; the engine's active segments follow it.
+    const engineSegs = engine !== null ? engine.dataSegments.length : 0;
+    if (this.blobUsed) w.section(12, (s) => s.uleb(1 + engineSegs));
 
     if (this.funcs.length > 0) {
       w.section(10, (s) => {
         s.uleb(this.funcs.length);
         for (const f of this.funcs) {
+          if (f.engineBody !== undefined) {
+            // Size prefix included: the engine's body bytes, re-indexed.
+            const r = engine!.bodies[f.engineBody]!;
+            s.raw(engine!.code.subarray(r.start, r.end));
+            continue;
+          }
           const body = f.body;
           if (body === null) {
             throw new Error(`function "${f.name}" was declared but never given a body`);
@@ -497,13 +665,16 @@ export class ModuleBuilder {
       });
     }
 
-    if (this.blobUsed) {
+    if (this.blobUsed || engineSegs > 0) {
       const blob = this.blob;
       w.section(11, (s) => {
-        s.uleb(1);
-        s.u8(0x01); // passive
-        s.uleb(blob.length);
-        s.raw(new Uint8Array(blob));
+        s.uleb((this.blobUsed ? 1 : 0) + engineSegs);
+        if (this.blobUsed) {
+          s.u8(0x01); // passive
+          s.uleb(blob.length);
+          s.raw(new Uint8Array(blob));
+        }
+        if (engine !== null) for (const seg of engine.dataSegments) s.raw(seg);
       });
     }
 
