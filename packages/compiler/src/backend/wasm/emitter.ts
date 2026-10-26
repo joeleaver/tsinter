@@ -2553,6 +2553,9 @@ class Assembler {
   private readonly objCreateLive: boolean;
   /** Unit A2: the module builds an island tag call's strings array. */
   private readonly tplLive: boolean;
+  /** Unit F1: the module builds an island RegExp (the island's
+   * `new RegExp(...)`, jsOp construct over globalGet("RegExp")). */
+  private readonly regexIslandLive: boolean;
   /** `Date.now()`/`new Date()`'s wall clock reads this import and floors;
    * `performance.now()`'s ORIGIN — `now()` sampled ONCE at `_start`
    * entry, in a mutable f64 global, in any module that reaches
@@ -2817,6 +2820,11 @@ class Assembler {
       );
     this.accessorsLive = this.irNodeReachable(mod, (rec) => rec["kind"] === "jsOp" && rec["op"] === "defineGetter");
     this.tplLive = this.irNodeReachable(mod, (rec) => rec["kind"] === "jsOp" && rec["op"] === "tplStrings");
+    this.regexIslandLive = this.irNodeReachable(mod, (rec) => {
+      if (rec["kind"] !== "jsOp" || rec["op"] !== "construct") return false;
+      const callee = (rec["args"] as Record<string, unknown>[] | undefined)?.[0];
+      return callee?.["kind"] === "jsOp" && callee["op"] === "globalGet" && callee["name"] === "RegExp";
+    });
     this.inspHiddenLive = this.libCallReachable(mod, ["insp.dynHidden"]);
     this.irNodeReachable(mod, (rec) => {
       if (rec["kind"] === "libCall" && rec["fn"] === "qs.parse") {
@@ -4259,6 +4267,17 @@ class Assembler {
         ret();
         c.end();
       }
+    }
+    if (dyn.regexLive) {
+      // Unit F1: Node clones a RegExp as a RegExp; the copy below would be
+      // a plain object, so an island RegExp refuses by name.
+      dyn.objPayload(c, (x) => x.localGet(0));
+      c.refTest(dyn.objRegexT());
+      c.ifVoid();
+      this.emitSetCellError(c, "%Error", "Error", (x) => this.pushStrLitInto(x, "structuredClone of an island RegExp is not supported yet"), null);
+      c.refNull(dynT);
+      ret();
+      c.end();
     }
     dyn.pushNewObj(c, false);
     c.localSet(O);
@@ -8436,6 +8455,9 @@ class Assembler {
           }
         : {}),
       ...(this.tplLive ? { tpl: true as const } : {}),
+      ...(this.regexIslandLive
+        ? { regex: { reType: () => this.regex.regexType, test: () => this.dynRegexTestHelper() } }
+        : {}),
     });
     return this.dynField;
   }
@@ -24748,6 +24770,12 @@ class Assembler {
         code.call(this.accessorsLive || this.objCreateLive ? this.dyn.memberLookup() : this.dyn.objGet());
         code.refIsNull();
         code.i32Eqz();
+        if (this.regexIslandLive && e.key === "lastIndex") {
+          // Unit F1: an island RegExp's lastIndex is an own data property.
+          this.dyn.objPayload(code, (c) => c.localGet(d));
+          code.refTest(this.dyn.objRegexT());
+          code.i32Or();
+        }
         code.else_();
         // The FUNC arm, which the C emitter's inline lowering lacks: a
         // boxed function owns exactly `name` and `length` — keyGet's arm
@@ -29111,6 +29139,41 @@ class Assembler {
           // same as before this gate.
           case "construct": {
             const callee = e.args[0]!;
+            if (callee.kind === "jsOp" && callee.op === "globalGet" && callee.name === "RegExp") {
+              // Unit F1: the island's `new RegExp(source, flags)` — the
+              // boundary's own synthesis for a regex crossing into `any`
+              // (lower-island.ts) and the plain spelling — over strings
+              // known at compile time (literals, or `.source`/`.flags` of
+              // a const regex literal): compiled like a static literal
+              // and boxed as an island RegExp (dyn.ts's objRegex). A
+              // pattern known only at run time stays refused by name.
+              const parts = e.args.slice(1).map((a) => (a.kind === "jsMarshal" ? this.foldRegexArgOrIntrinsic(a.value) : { ok: false as const }));
+              if (e.args.length < 2 || e.args.length > 3 || parts.some((p) => !p.ok)) {
+                this.refuse("expr:jsOp:regexp-dynamic-pattern", e.loc);
+                code.unreachable();
+                return;
+              }
+              const pattern = (parts[0] as { ok: true; value: string }).value;
+              const flags = parts.length > 1 ? (parts[1] as { ok: true; value: string }).value : "";
+              // EscapeRegExpPattern: Node's `.source` of `new RegExp("a/b")`
+              // is "a\/b" and of `new RegExp("")` is "(?:)"; the static
+              // value's source is the pattern text as written, so a pattern
+              // that would need that escaping refuses by name.
+              if (pattern === "" || /(^|[^\\])(\\\\)*\//.test(pattern) || /[\n\r\u2028\u2029]/.test(pattern)) {
+                this.refuse("expr:jsOp:regexp-source-escape", e.loc);
+                code.unreachable();
+                return;
+              }
+              if (!/^[dgimsuy]*$/.test(flags) || new Set(flags).size !== flags.length) {
+                this.refuse("expr:jsOp:regexp-invalid-flags", e.loc);
+                code.unreachable();
+                return;
+              }
+              this.dyn.boxRegex(code, () =>
+                this.walkExpr({ kind: "regexLit", pattern, flags, type: { kind: "regex" }, loc: e.loc } as WExpr),
+              );
+              return;
+            }
             if (callee.kind === "jsOp" && callee.op === "globalGet" && callee.name === "Function" && e.args.length >= 2) {
               const paramTexts: string[] = [];
               let allStrLit = true;
@@ -29795,6 +29858,67 @@ class Assembler {
     code.ifVoid();
     code.unreachable();
     code.end();
+  }
+
+  /** Unit F1: foldRegexArg, plus `.source` / `.flags` of a regex literal
+   * or of a const global holding one (the boundary's `new RegExp(re.source,
+   * re.flags)` synthesis) — `.flags` in the canonical order the static
+   * value reports. */
+  private foldRegexArgOrIntrinsic(expr: WExpr): { ok: true; value: string } | { ok: false } {
+    if (expr.kind === "regexIntrinsic" && (expr.method === "source" || expr.method === "flags") && expr.args.length === 0) {
+      let r: WExpr = expr.receiver;
+      if (r.kind === "varRef" && r.localId.startsWith("%g.")) {
+        const global = this.globalById.get(r.localId);
+        if (global === undefined || global.mutable !== false) return { ok: false };
+        if (!this.fn.fn.name.startsWith("%init.")) return { ok: false };
+        const resolved = this.resolveGlobalInit(r.localId);
+        if (resolved === null || resolved.fnName !== this.fn.fn.name || !(resolved.stmtIndex < this.fn.topStmtIndex)) return { ok: false };
+        r = resolved.init;
+      }
+      if (r.kind !== "regexLit") return { ok: false };
+      if (expr.method === "source") return { ok: true, value: r.pattern };
+      return { ok: true, value: "dgimsuy".split("").filter((ch) => r.kind === "regexLit" && r.flags.includes(ch)).join("") };
+    }
+    return this.foldRegexArg(expr);
+  }
+
+  private dynRegexTestFn: number | null = null;
+
+  /** Unit F1: `%w.dyn.regexTest(eqref re, str s) -> i32` — one match of the
+   * compiled regex from index 0, the static `.test` body (regexIntrinsic)
+   * over a value whose receiver is the island RegExp's payload. The
+   * global/sticky forms never reach it (dyn.ts fences them first). */
+  private dynRegexTestHelper(): number {
+    if (this.dynRegexTestFn !== null) return this.dynRegexTestFn;
+    const regexRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.regexType };
+    const bcRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.bcType };
+    const idx = this.mb.declareFunc(this.mb.funcType([regexRefT, this.strRef], [I32]), "%w.dyn.regexTest");
+    this.dynRegexTestFn = idx;
+    const c = new Code();
+    const BC = 2;
+    const N = 3;
+    c.localGet(0);
+    c.structGet(this.regex.regexType, 2);
+    c.localSet(BC);
+    c.localGet(BC);
+    c.i32Const(RE_HEADER_REGISTER_COUNT);
+    c.call(this.regexInterp.readU8());
+    c.i32Const(1);
+    c.i32Add();
+    c.i32Const(1);
+    c.i32ShrU();
+    c.localGet(0);
+    c.structGet(this.regex.regexType, 3);
+    c.i32Add();
+    c.localSet(N);
+    c.localGet(BC);
+    c.localGet(1);
+    c.i32Const(0);
+    c.localGet(N);
+    c.call(this.regexInterp.newCaptureArray());
+    c.call(this.regexInterp.exec());
+    this.mb.setBody(idx, [bcRefT, I32], c.bytes());
+    return idx;
   }
 
   /** THE CONSTANT-FOLDER (design §7.6, ruled in; the varRef arm CORRECTED

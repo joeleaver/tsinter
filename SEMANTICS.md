@@ -3028,6 +3028,35 @@ still the one called.
 **Tested by:** A3-MCALL-01..09, A3-TOSTR-01 and A3-RENDER-01/02 in
 `packages/compiler/test/wasm-island-a.test.ts`.
 
+**Amendment (unit F1): an island RegExp value.** A RegExp crossing into
+`any` (the boundary's `new RegExp(re.source, re.flags)` over a regex
+literal or a const binding holding one) is now a value on the wasm
+island: the static tier's compiled regex inside an empty island object
+(`$dynObjRegex`), so `typeof`, `Object.keys`, `JSON.stringify` (`{}`) and
+spread answer as Node's do. Modeled: `source`, `flags`, the flag
+accessors (`global` … `unicodeSets`), `lastIndex` (reads 0; an own
+member for `in`/`hasOwn`), `test` on a non-global, non-sticky regex
+(one match from index 0), `toString`/`String(r)`/template conversion and
+`util.inspect` (`/src/flags`), and deep equality (source and flags).
+Fenced by name where Node answers: `test` on a `g`/`y` regex (it reads
+and moves `lastIndex`); `exec` and `compile`; a RegExp.prototype
+function read as a value (`typeof r.exec` throws where Node answers
+"function"); ANY member write onto the value (a member assignment,
+`lastIndex` and the accessor names included, and the Object.assign /
+Object.defineProperties targets), so an island RegExp never holds an own
+member and its readers (the method calls, `inspect`, the accessors)
+stay exact; `Object.create` over one (the built-in stand-in refusal —
+Node's accessors would throw on the non-RegExp result); and
+`structuredClone` of the value. The
+emitter's own `new RegExp(...)` arm refuses a pattern not known at
+compile time (`regexp-dynamic-pattern`), a pattern Node's `.source`
+would escape (`regexp-source-escape`: an unescaped `/`, a line
+terminator, the empty pattern) and an invalid flag string
+(`regexp-invalid-flags`); the front end already refuses a regex value
+whose pattern is computed at run time before it reaches the boundary.
+**Tested by:** F1-RE-01..05 and F1-CORPUS-2172 in
+`packages/compiler/test/wasm-island-a.test.ts`.
+
 ## S044 — jsExit of `array<jsval>`: the SPINE aliases on the wasm tier (matching Node); the native island copies it *(per-lane split)*
 
 The validated exit of an `any[]`-declared slot crosses elements BY

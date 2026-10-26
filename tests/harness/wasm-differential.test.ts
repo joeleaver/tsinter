@@ -3572,6 +3572,9 @@ const TIER_FLOOR: string[] = [
   // 1068 -> 1070.
   "2746-format-runtime-string.ts",
   "2747-buffer-alloc-size.ts",
+  // Unit F1: a RegExp crossing into `any` is an island RegExp value (its
+  // accessors, a non-global `test`, String() and inspect): 1070 -> 1071.
+  "2172-island-regexp-boundary.ts",
 ];
 
 interface RunResult {

@@ -4065,6 +4065,16 @@ export class InspectBuilder {
       this.kindArm(c, K, [DK.OBJ], () => {
         dyn.objPayload(c, (x) => x.localGet(D));
         c.localSet(O);
+        if (dyn.regexLive) {
+          // Unit F1: an island RegExp prints as its literal, Node's form.
+          c.localGet(O);
+          c.refTest(dyn.objRegexT());
+          c.ifVoid();
+          c.localGet(O);
+          c.call(dyn.regexStr());
+          c.return_();
+          c.end();
+        }
         // Object.create(null)'s dictionary: Node prefixes the rendering
         // with the constructor-less base at EVERY depth, the empty form
         // included, and the beyond-depth answer IS the bare marker (where

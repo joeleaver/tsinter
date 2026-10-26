@@ -458,3 +458,53 @@ test("A3-RENDER-02 numeric-literal keys print their VALUE (unsafe integers, hex/
   expect(exitCode).toBe(0);
 });
 
+
+// ============================================================
+// F1 — an island RegExp value
+// ============================================================
+
+test("F1-RE-01 a RegExp held in an any: accessors, test, String(), inspect, keys, JSON, spread", async () => {
+  const { stdout, stderr, exitCode } = await runRow("F1-RE-01", "// @dynamic\n// a RegExp held in an any: accessors, test, String(), inspect, keys, JSON, spread\nimport { inspect } from \"node:util\";\nconst r: any = /a(b)+c/im;\nconsole.log(`${typeof r} ${r.source} ${r.flags} ${r.global} ${r.ignoreCase} ${r.multiline} ${r.sticky} ${r.unicode} ${r.lastIndex}`);\nconsole.log(`${r.test(\"xABBC\")} ${r.test(\"ac\")} ${r.test(42)} ${String(r)} ${r.toString()}`);\nconst sp: any = { ...r };\nconsole.log(inspect(r), JSON.stringify(r), JSON.stringify(sp));\nconst u: unknown = r;\nif (typeof u === \"object\" && u !== null) console.log(`${Object.hasOwn(u, \"lastIndex\")} ${Object.hasOwn(u, \"source\")} ${JSON.stringify(Object.keys(u))}`);\nconst r2: any = /a(b)+c/im;\nconsole.log(`${r === r2}`);", "ts");
+  expect(stdout).toBe("object a(b)+c im false true true false false 0\ntrue false false /a(b)+c/im /a(b)+c/im\n/a(b)+c/im {} {}\ntrue false []\nfalse\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("F1-RE-02 the unmodeled RegExp surface refuses by name", async () => {
+  const { stdout, stderr, exitCode } = await runRow("F1-RE-02", "// @dynamic\n// the unmodeled RegExp surface refuses by name\nconst g: any = /x/g;\nconst r: any = /x/;\nfor (const f of [() => g.test(\"x\"), () => r.exec(\"x\"), () => typeof r.exec, () => { r.lastIndex = 3; }]) {\n  try {\n    console.log(`ok ${f()}`);\n  } catch (e) {\n    console.log(`${(e as Error).name}: ${(e as Error).message}`);\n  }\n}", "ts");
+  // Node: ok true / ok x / ok function / ok undefined.
+  expect(stdout).toBe("Error: 'RegExp.prototype.test' on a global or sticky island RegExp is not supported yet\nError: 'RegExp.prototype.exec' on an island value is not supported yet\nError: 'RegExp.prototype.exec' read as a value on an island value is not supported yet\nError: assigning a member of an island RegExp is not supported yet\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("F1-RE-04 an island RegExp holds no own members: member writes and Object.create over one refuse by name", async () => {
+  const { stdout, stderr, exitCode } = await runRow("F1-RE-04", "// @dynamic\n// an island RegExp holds no own members: every member write, and Object.create over one, refuses by name\nconst r: any = /a/;\nconst tries: (() => any)[] = [\n  () => { r.test = () => true; return r.test(\"b\"); },\n  () => { r.toString = () => \"X\"; return r.toString(); },\n  () => { r.foo = 1; return r.foo; },\n  () => { r.source = \"zz\"; return r.source; },\n  () => Object.create(r).source,\n];\nfor (const t of tries) {\n  try {\n    console.log(`ok ${t()}`);\n  } catch (e) {\n    console.log(`${(e as Error).message}`);\n  }\n}\nconsole.log(`${r.test(\"a\")} ${r.test(\"b\")} ${r.toString()} ${r.source}`);", "ts");
+  // Node: ok true / ok X / ok 1 / "Cannot set property source of [object
+  // Object] which has only a getter" / "RegExp.prototype.source getter
+  // called on non-RegExp object" / true true X a. Each refusal keeps the
+  // regex's own readers exact (the last line's built-ins answer).
+  expect(stdout).toBe("assigning a member of an island RegExp is not supported yet\nassigning a member of an island RegExp is not supported yet\nassigning a member of an island RegExp is not supported yet\nassigning a member of an island RegExp is not supported yet\nObject.create over a null-prototype or built-in object on the island is not supported yet\ntrue false /a/ a\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("F1-RE-05 lastIndex is an own member of an island RegExp, for in and Object.hasOwn alike", async () => {
+  const { stdout, stderr, exitCode } = await runRow("F1-RE-05", "// @dynamic\n// lastIndex is an own member of an island RegExp, for in and Object.hasOwn alike\nconst r: any = /a/;\nconst u: unknown = r;\nif (typeof u === \"object\" && u !== null) {\n  console.log(`${\"lastIndex\" in u} ${Object.hasOwn(u, \"lastIndex\")} ${\"foo\" in u} ${Object.hasOwn(u, \"source\")}`);\n}", "ts");
+  expect(stdout).toBe("true true false false\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("F1-RE-03 a RegExp whose pattern is known only at run time still refuses by name", async () => {
+  const diags = await refuseRow("F1-RE-03", "// @dynamic\n// a RegExp whose pattern is known only at run time refuses by name\nfunction take(r: RegExp, s: string): boolean;\nfunction take(r: any, s: any): any {\n  return r.test(s);\n}\nconst src = process.argv.length > 99 ? \"a\" : \"b\";\nconsole.log(take(new RegExp(src), \"b\"));", "ts");
+  // Node: true.
+  expect(diags.some((d) => d.startsWith("SC1090:") && d.includes("passing a value of type 'RegExp'"))).toBe(true);
+});
+
+test("F1-CORPUS-2172 the island RegExp boundary program", async () => {
+  const { stdout, stderr, exitCode } = await runCorpusRow("F1-CORPUS-2172", "2172-island-regexp-boundary.ts");
+  expect(stdout).toBe("y\nn\ny\ny\nn\nobject\nd{2} u\nn\ny\nc\\d+ <none>\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});

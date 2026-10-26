@@ -457,6 +457,12 @@ export interface DynDeps {
    * strings array (jsOp tplStrings), whose `raw` member keyGet, hasOwn
    * and `in` answer. */
   tpl?: true;
+  /** Unit F1: present ONLY in a module that builds an island RegExp value
+   * (the island's `new RegExp(source, flags)` over compile-time strings):
+   * `reType` is the static tier's compiled-regex struct (source, flags,
+   * bytecode, captureCount, groupNames — regex-value.ts), `test` the
+   * emitter's `(eqref re, str s) -> i32` matcher (one exec at index 0). */
+  regex?: { reType: () => number; test: () => number };
   /** INC-27 U5: Object.assign's member PUT onto a DOMException — present
    * ONLY in a module that can mint a DOMException (the emitter's static
    * prescan), so assign's body is unchanged everywhere else. `isDomex`
@@ -812,6 +818,166 @@ export class DynBuilder {
     return this.deps.tpl === true;
   }
 
+  get regexLive(): boolean {
+    return this.deps.regex !== undefined;
+  }
+
+  private objRegexType: number | null = null;
+
+  /** Unit F1: `$dynObjRegex <: $dynObj` — an island RegExp: an ordinary
+   * (empty) OBJ payload, so own-key surfaces answer as for any object
+   * (`Object.keys`, JSON's `{}`), carrying the compiled static regex. */
+  objRegexT(): number {
+    if (this.objRegexType !== null) return this.objRegexType;
+    const objT = this.objT();
+    const entries = this.entriesArrayType();
+    this.objRegexType = this.mb.subStructType(
+      "dyn:objRegex",
+      [
+        { storage: I32, mutable: true },
+        { storage: { kind: "ref", nullable: true, typeIndex: entries }, mutable: true },
+        { storage: I32, mutable: false },
+        { storage: { kind: "ref", nullable: true, typeIndex: EQ_HEAP }, mutable: false },
+      ],
+      objT,
+    );
+    return this.objRegexType;
+  }
+
+  /** Box the static regex ref the caller pushes as an island RegExp. */
+  boxRegex(c: Code, pushRe: (c: Code) => void): void {
+    this.boxObj(c, (x) => {
+      x.i32Const(0);
+      x.refNull(this.entriesArrayType());
+      x.i32Const(OBJ_PROTO_PLAIN);
+      pushRe(x);
+      x.structNew(this.objRegexT());
+    });
+  }
+
+  /** Where island RegExps can exist: if the `$dyn` in local `d` (kind in
+   * local `k`) is one, refuse the member write by name, push the enclosing
+   * function's error answer and return. An island RegExp holds no own
+   * members, so its readers stay exact. */
+  regexWriteFence(c: Code, d: number, k: number, pushNull: (c: Code) => void): void {
+    if (!this.regexLive) return;
+    c.localGet(k);
+    c.i32Const(DK.OBJ);
+    c.i32Eq();
+    c.ifResult(I32);
+    this.objPayload(c, (x) => x.localGet(d));
+    c.refTest(this.objRegexT());
+    c.else_();
+    c.i32Const(0);
+    c.end();
+    c.ifVoid();
+    this.deps.throwError(c, "%Error", "Error", (x) =>
+      this.deps.lit(x, "assigning a member of an island RegExp is not supported yet"),
+    );
+    pushNull(c);
+    c.return_();
+    c.end();
+  }
+
+  /** With an OBJ payload in local `o`, leaves i32: is it an island RegExp. */
+  isRegexPayload(c: Code, o: number): void {
+    c.localGet(o);
+    c.refTest(this.objRegexT());
+  }
+
+  /** The static regex struct of an island RegExp payload in local `o`. */
+  regexOf(c: Code, o: number): void {
+    const rx = this.deps.regex!;
+    c.localGet(o);
+    c.refCast(this.objRegexT());
+    c.structGet(this.objRegexT(), 3);
+    c.refCast(rx.reType());
+  }
+
+  /** The RegExp.prototype members (functions and accessors) that a read
+   * either answers (the accessors below) or fences by name. */
+  private static readonly REGEX_ACCESSORS = new Map<string, string | null>([
+    ["source", null], ["flags", null], ["global", "g"], ["ignoreCase", "i"], ["multiline", "m"],
+    ["dotAll", "s"], ["unicode", "u"], ["sticky", "y"], ["hasIndices", "d"], ["unicodeSets", "v"],
+  ]);
+  private static readonly REGEX_PROTO_FNS = ["exec", "test", "toString", "compile"];
+
+  /** %w.dyn.regexKey(o, key) -> dyn, or null when `key` is no RegExp
+   * member (the caller then reads the own table): the accessors answer
+   * from the compiled regex (`lastIndex` reads 0 — a non-global,
+   * non-sticky island RegExp never moves it; the global/sticky forms are
+   * fenced where they would), the prototype functions fence by name. */
+  regexKey(): number {
+    return this.cached("regexKey", [this.objRef(), this.deps.strRef()], [this.dynRef()], (idx) => {
+      const rx = this.deps.regex!;
+      const reT = rx.reType();
+      const c = new Code();
+      for (const [name, ch] of DynBuilder.REGEX_ACCESSORS) {
+        c.localGet(1);
+        this.deps.lit(c, name);
+        c.call(this.deps.strEq());
+        c.ifVoid();
+        if (ch === null) {
+          this.boxStr(c, (x) => {
+            this.regexOf(x, 0);
+            x.structGet(reT, name === "source" ? 0 : 1);
+          });
+        } else {
+          this.boxBool(c, (x) => {
+            this.regexOf(x, 0);
+            x.structGet(reT, 1);
+            this.deps.lit(x, ch);
+            x.f64Const(0);
+            x.call(this.deps.strIndexOf());
+            x.f64Const(0);
+            x.f64Ge();
+          });
+        }
+        c.return_();
+        c.end();
+      }
+      c.localGet(1);
+      this.deps.lit(c, "lastIndex");
+      c.call(this.deps.strEq());
+      c.ifVoid();
+      this.boxNum(c, (x) => x.f64Const(0));
+      c.return_();
+      c.end();
+      for (const name of DynBuilder.REGEX_PROTO_FNS) {
+        c.localGet(1);
+        this.deps.lit(c, name);
+        c.call(this.deps.strEq());
+        c.ifVoid();
+        this.deps.throwError(c, "%Error", "Error", (x) =>
+          this.deps.lit(x, `'RegExp.prototype.${name}' read as a value on an island value is not supported yet`),
+        );
+        c.refNull(this.dynT());
+        c.return_();
+        c.end();
+      }
+      c.refNull(this.dynT());
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** %w.dyn.regexStr(o) -> str — `/source/flags`, RegExp.prototype.toString. */
+  regexStr(): number {
+    return this.cached("regexStr", [this.objRef()], [this.deps.strRef()], (idx) => {
+      const reT = this.deps.regex!.reType();
+      const c = new Code();
+      this.deps.lit(c, "/");
+      this.regexOf(c, 0);
+      c.structGet(reT, 0);
+      c.call(this.deps.concat());
+      this.deps.lit(c, "/");
+      c.call(this.deps.concat());
+      this.regexOf(c, 0);
+      c.structGet(reT, 1);
+      c.call(this.deps.concat());
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
   private objLinkedType: number | null = null;
   private tplType: number | null = null;
 
@@ -977,6 +1143,13 @@ export class DynBuilder {
         c.structGet(this.objT(), OBJ_PROTO);
         c.i32Const(OBJ_PROTO_PLAIN);
         c.i32Ne();
+        if (this.regexLive) {
+          // Unit F1: an island RegExp is a built-in stand-in too (its
+          // accessors would read a non-RegExp receiver).
+          this.objPayload(c, (x) => x.localGet(0));
+          c.refTest(this.objRegexT());
+          c.i32Or();
+        }
         c.ifVoid();
         this.deps.throwError(c, "%Error", "Error", (x) =>
           this.deps.lit(x, "Object.create over a null-prototype or built-in object on the island is not supported yet"),
@@ -2546,6 +2719,49 @@ export class DynBuilder {
       c.localSet(OBJA);
       this.objPayload(c, (x) => x.localGet(B));
       c.localSet(OBJB);
+      if (this.regexLive) {
+        // Unit F1: two island RegExps are equal when their source and
+        // flags are (Node also compares lastIndex, always 0 here); a
+        // RegExp and a plain object differ by prototype.
+        const reT = this.deps.regex!.reType();
+        const reOf = (o: number): void => {
+          c.localGet(o);
+          c.refCast(this.objRegexT());
+          c.structGet(this.objRegexT(), 3);
+          c.refCast(reT);
+        };
+        c.localGet(OBJA);
+        c.refTest(this.objRegexT());
+        c.localGet(OBJB);
+        c.refTest(this.objRegexT());
+        c.i32Ne();
+        c.ifVoid();
+        c.call(deqLeave);
+        c.i32Const(0);
+        c.return_();
+        c.end();
+        c.localGet(OBJA);
+        c.refTest(this.objRegexT());
+        c.ifVoid();
+        reOf(OBJA);
+        c.structGet(reT, 0);
+        reOf(OBJB);
+        c.structGet(reT, 0);
+        c.call(strEqFn);
+        reOf(OBJA);
+        c.structGet(reT, 1);
+        reOf(OBJB);
+        c.structGet(reT, 1);
+        c.call(strEqFn);
+        c.i32And();
+        c.i32Eqz();
+        c.ifVoid();
+        c.call(deqLeave);
+        c.i32Const(0);
+        c.return_();
+        c.end();
+        c.end();
+      }
       const link = this.deps.protoLink;
       if (link !== undefined) {
         // Unit A2: Node's strict comparison compares the PROTOTYPES of
@@ -2856,6 +3072,15 @@ export class DynBuilder {
         c.call(this.errStr());
         c.return_();
         c.end();
+        if (this.regexLive) {
+          // Unit F1: an island RegExp converts as RegExp.prototype.toString.
+          this.isRegexPayload(c, O);
+          c.ifVoid();
+          c.localGet(O);
+          c.call(this.regexStr());
+          c.return_();
+          c.end();
+        }
         const npRefuse = this.deps.nullProtoToStr;
         if (npRefuse !== undefined) {
           // A null-prototype object has no toString / valueOf to convert
@@ -3275,6 +3500,26 @@ export class DynBuilder {
         // through its getter (`this` = the receiver, wherever on the
         // chain the getter lives).
         this.arm(c, K, [DK.OBJ], () => {
+          if (this.regexLive) {
+            // Unit F1: an island RegExp's own accessors and fenced
+            // prototype functions come first.
+            this.objPayload(c, (x) => x.localGet(0));
+            c.refTest(this.objRegexT());
+            c.ifVoid();
+            this.objPayload(c, (x) => x.localGet(0));
+            c.localGet(1);
+            c.call(this.regexKey());
+            c.localTee(M);
+            c.refIsNull();
+            c.i32Eqz();
+            c.globalGet(this.deps.excKind());
+            c.i32Or();
+            c.ifVoid();
+            c.localGet(M);
+            c.return_();
+            c.end();
+            c.end();
+          }
           this.objPayload(c, (x) => x.localGet(0));
           c.localGet(1);
           c.call(this.accessorsLive || this.protoLinkLive ? this.memberLookup() : this.objGet());
@@ -3563,6 +3808,20 @@ export class DynBuilder {
       c.localSet(K);
       const SETM = 8;
       this.arm(c, K, [DK.OBJ], () => {
+        if (this.regexLive) {
+          // Unit F1: an island RegExp holds no own members (its readers —
+          // the method ladder, inspect, the accessors — answer from the
+          // compiled regex first), so a member write refuses by name,
+          // lastIndex included.
+          this.objPayload(c, (x) => x.localGet(0));
+          c.refTest(this.objRegexT());
+          c.ifVoid();
+          this.deps.throwError(c, "%Error", "Error", (x) =>
+            this.deps.lit(x, "assigning a member of an island RegExp is not supported yet"),
+          );
+          c.return_();
+          c.end();
+        }
         if (this.accessorsLive) {
           // Unit A2: a write over a getter-only member — own or inherited
           // — throws in Node's strict code and is ignored in its sloppy
@@ -3868,6 +4127,17 @@ export class DynBuilder {
         c.call(this.objGetRaw());
         c.refIsNull();
         c.i32Eqz();
+        if (this.regexLive) {
+          // Unit F1: a RegExp's lastIndex is an own (non-enumerable) data
+          // property.
+          this.objPayload(c, (x) => x.localGet(0));
+          c.refTest(this.objRegexT());
+          c.localGet(1);
+          this.deps.lit(c, "lastIndex");
+          c.call(this.deps.strEq());
+          c.i32And();
+          c.i32Or();
+        }
       });
       if (this.tplLive) {
         // Unit A2: a tag call's strings array owns `raw` (non-enumerable).
@@ -4582,6 +4852,7 @@ export class DynBuilder {
       c.end();
       // An ENGINE target runs the copy engine-side in C; unconstructible.
       this.arm(c, K, [DK.JSVAL], () => c.unreachable());
+      this.regexWriteFence(c, 0, K, (x) => x.refNull(dynT)); // Unit F1
       // INC-29 U1: a net handle as the target or a source is fenced
       // (SEMANTICS.md S087 (f)) — copying nothing would be a silent wrong
       // answer either way.
@@ -6246,6 +6517,7 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(TK);
+      this.regexWriteFence(c, 0, TK, (x) => x.refNull(dynT)); // Unit F1
       c.localGet(TK);
       c.i32Const(DK.OBJ);
       c.i32Eq();
@@ -7529,6 +7801,63 @@ export class DynBuilder {
         const objProto = DynBuilder.OBJPROTO_METHODS.has(method);
 
         this.arm(c, K, [DK.OBJ], () => {
+          if (this.regexLive && ["test", "exec", "toString", "compile"].includes(method)) {
+            // Unit F1: an island RegExp's own methods. test runs one match
+            // from index 0 (the static tier's matcher); the global and
+            // sticky forms, which read and move lastIndex, fence by name,
+            // as do exec (its result array carries index/input/groups,
+            // which a dyn array cannot hold) and compile.
+            const reT = this.deps.regex!.reType();
+            const pushRe = (x: Code): void => {
+              this.objPayload(x, (y) => y.localGet(0));
+              x.refCast(this.objRegexT());
+              x.structGet(this.objRegexT(), 3);
+              x.refCast(reT);
+            };
+            this.objPayload(c, (x) => x.localGet(0));
+            c.refTest(this.objRegexT());
+            c.ifVoid();
+            if (method === "toString") {
+              this.boxStr(c, (x) => {
+                this.objPayload(x, (y) => y.localGet(0));
+                x.call(this.regexStr());
+              });
+              c.return_();
+            } else if (method === "test") {
+              for (const ch of ["g", "y"]) {
+                pushRe(c);
+                c.structGet(reT, 1);
+                this.deps.lit(c, ch);
+                c.f64Const(0);
+                c.call(this.deps.strIndexOf());
+                c.f64Const(0);
+                c.f64Ge();
+                c.ifVoid();
+                this.deps.throwError(c, "%Error", "Error", (x) =>
+                  this.deps.lit(x, "'RegExp.prototype.test' on a global or sticky island RegExp is not supported yet"),
+                );
+                c.refNull(dynT);
+                c.return_();
+                c.end();
+              }
+              argAt(0);
+              c.call(this.toStr());
+              c.localSet(S);
+              this.boxBool(c, (x) => {
+                pushRe(x);
+                x.localGet(S);
+                x.call(this.deps.regex!.test());
+              });
+              c.return_();
+            } else {
+              this.deps.throwError(c, "%Error", "Error", (x) =>
+                this.deps.lit(x, `'RegExp.prototype.${method}' on an island value is not supported yet`),
+              );
+              c.refNull(dynT);
+              c.return_();
+            }
+            c.end();
+          }
           this.objPayload(c, (x) => x.localGet(0));
           this.deps.lit(c, method);
           if (this.accessorsLive || this.protoLinkLive) {
