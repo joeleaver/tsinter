@@ -4049,7 +4049,7 @@ void scr_island_modules(const ScrIslandModule *mods, size_t nmods,
 /* The inflater for compressed embedded module text (raw DEFLATE, exact
  * inflated size known from the table row). The emitted main installs
  * scr_zlib.c's scr_zlib_inflate_exact exactly when some module compressed
- * at build time — index.ts links scr_zlib.c/libz on the same predicate,
+ * at build time — index.ts links scr_zlib.c and the vendored zlib on the same predicate,
  * so compression-free builds keep their link line and the island keeps no
  * zlib reference of its own. */
 void scr_island_set_inflate(bool (*inflate)(const unsigned char *src, size_t src_len,
@@ -5297,7 +5297,7 @@ ScrArr *scr_tls_ca_root(void);        /* +1; === getCACertificates("bundled") */
  * ERR_CRYPTO_OPERATION_FAILED and leaves the set unchanged. Borrows. */
 void scr_tls_ca_set_default(ScrArr *certs);
 /* scr_tls.c's anchor consult: true iff setDefaultCACertificates ran;
- * *pem/*len then carry the concatenated NUL-terminated blocks (len 0 =
+ * *pem and *len then carry the concatenated NUL-terminated blocks (len 0 =
  * the empty set — verification fails, Node's own consequence), and *gen
  * a counter that bumps per set so the parsed chain re-parses on change. */
 bool scr_tls_ca_default_override(const char **pem, size_t *len, uint64_t *gen);

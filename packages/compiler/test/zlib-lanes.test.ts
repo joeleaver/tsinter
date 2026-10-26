@@ -62,12 +62,16 @@ const PROGRAMS: [string, string, (stdout: string) => void][] = [
 ];
 
 const LANES = ["wasm", "c", "llvm"] as const;
+/** SCRIPTC_SAN=1 (the sanitized lane) builds the c and llvm binaries with
+ * ASan + the RC audit, so the table doubles as a leak/overflow check of
+ * the codec and its driver. */
+const sanitize = process.env["SCRIPTC_SAN"] === "1";
 type Lane = (typeof LANES)[number];
 
 async function runLane(file: string, lane: Lane): Promise<string> {
   const dir = await mkdtemp(join(scratch, `${lane}-`));
   const outPath = join(dir, lane === "wasm" ? "p.wasm" : "p");
-  const res = await compile(file, { outPath, outDir: dir, backend: lane });
+  const res = await compile(file, { outPath, outDir: dir, backend: lane, sanitize: lane !== "wasm" && sanitize });
   if (!res.ok) throw new Error(`${lane} refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
   if (lane === "wasm") {
     const run = await runWasm(res.binaryPath);
@@ -86,7 +90,7 @@ function runNode(file: string): string {
   return n.stdout.toString("utf8");
 }
 
-describe("zlib on every lane: stdout equals Node's run of the same program", () => {
+describe(`zlib on every lane: stdout equals Node's run of the same program${sanitize ? " (native lanes sanitized)" : ""}`, () => {
   test("Z-LANES-00 the oracle is Node's bundled Chromium zlib at the pinned revision", () => {
     expect(process.versions.zlib).toBe("1.3.1-e00f703");
   });

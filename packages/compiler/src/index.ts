@@ -804,7 +804,7 @@ export async function compile(entryPath: string, opts: CompileOptions): Promise<
         moduleEmbedsBuiltin(lowered.module, "node:https") ||
         moduleEmbedsBuiltin(lowered.module, "node:net") ||
         moduleEmbedsBuiltin(lowered.module, "node:tls"),
-      // The link switch for scr_zlib.c + libz: zlib.* libCalls on the IR,
+      // The link switch for scr_zlib.c + the vendored zlib: zlib.* libCalls on the IR,
       // node:zlib in the embedded graph, or COMPRESSED embedded module text
       // (emit-island.ts stores big npm sources as raw DEFLATE; the emitted
       // main installs scr_zlib_inflate_exact on the same predicate).

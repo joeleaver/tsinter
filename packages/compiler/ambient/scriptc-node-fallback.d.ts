@@ -1794,7 +1794,7 @@ declare module "node:readline" {
 }
 
 /* node:zlib — deflateSync/inflateSync lower (Buffer in, Buffer out,
- * Node's default options; libz links only into zlib-using binaries);
+ * Node's default options; the vendored zlib links only into zlib-using binaries);
  * gzip and friends typecheck and fence at their use sites. */
 declare module "zlib" {
   export function deflateSync(data: string | Uint8Array): Buffer;

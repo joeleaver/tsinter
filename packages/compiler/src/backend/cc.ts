@@ -522,26 +522,28 @@ function vendorZlibDir(): string {
 /** The vendored zlib TUs every native zlib build links: the codec core
  * scr_zlib.c and scr_fetch.c's gzip decoder reach (deflate/inflate,
  * checksums, the scalar cpu_features stub). The gzFile, infback and
- * compress/uncompress units are not vendored — nothing calls them. */
-const ZLIB_SOURCES = ["adler32.c", "cpu_features.c", "crc32.c", "deflate.c", "inffast.c", "inflate.c", "inftrees.c", "trees.c", "zutil.c"];
+ * compress/uncompress units are not vendored — nothing calls them.
+ * Exported with zlibDefines for packages/runtime/test/bytes.test.ts, which
+ * links the same set by hand. */
+export const ZLIB_SOURCES = ["adler32.c", "cpu_features.c", "crc32.c", "deflate.c", "inffast.c", "inflate.c", "inftrees.c", "trees.c", "zutil.c"];
 
 /** The defines Node's zlib.gyp gives its `zlib` target on a target with
  * no SIMD path: CPU_NO_SIMD (the scalar build — every SIMD path is
  * value-identical, the multiplicative insert_string hash is scalar
  * arithmetic, so the bytes are Node's on every CPU) and HAVE_HIDDEN off
  * Windows (codec internals stay out of the binary's dynamic symbols),
- * plus the Chromium symbol prefix below. */
-function zlibDefines(driver: CcDriver): string[] {
+ * plus our own symbol prefix: scr_zlib_prefix.h renames every zlib and
+ * cpu_features global scr_z_* (Chromium's chromeconf.h list, respelled),
+ * so neither a system libz another library drags in nor a host that links
+ * Chromium's own Cr_z_ zlib (an engine-plugin embedder of a library
+ * archive) can collide with it. Symbol names only: no generated code
+ * changes. scr_zlib.c / scr_fetch.c include the same header before
+ * zlib.h. */
+export function zlibDefines(platform: string): string[] {
   return [
     "-DCPU_NO_SIMD",
-    ...(targetPlatform(driver) === "win32" ? [] : ["-DHAVE_HIDDEN"]),
-    // Chromium's Cr_z_ symbol prefix. Node's copy of zconf.h comments
-    // out this include (Node exports plain zlib names to addons); forcing
-    // it here keeps the codec from ever binding to — or being bound by — a
-    // system libz another library drags in. Symbol names only: no
-    // generated code changes. scr_zlib.c / scr_fetch.c include it the same
-    // way before zlib.h.
-    "-include", join(vendorZlibDir(), "chromeconf.h"),
+    ...(platform === "win32" ? [] : ["-DHAVE_HIDDEN"]),
+    "-include", join(runtimeSrcDir(), "scr_zlib_prefix.h"),
   ];
 }
 
@@ -560,7 +562,15 @@ async function ensureZlibObjects(sanitize: boolean, driver: CcDriver): Promise<s
     (driver.target !== null ? `-${driver.target}` : "");
   const vendor = vendorZlibDir();
   const cacheRoot = join(vendor, "..", ".cache");
-  const cacheDir = join(cacheRoot, `zlib-${ZLIB_VERSION}-${flavor}`);
+  // The key carries the build recipe too (defines and the prefix
+  // header's bytes), so a recipe change never reuses stale objects.
+  const defines = zlibDefines(targetPlatform(driver));
+  const recipe = createHash("sha256")
+    .update(defines.join("\0"))
+    .update(await readFile(join(runtimeSrcDir(), "scr_zlib_prefix.h")))
+    .digest("hex")
+    .slice(0, 12);
+  const cacheDir = join(cacheRoot, `zlib-${ZLIB_VERSION}-${recipe}-${flavor}`);
   const objects = ZLIB_SOURCES.map((f) => join(cacheDir, f.replace(/\.c$/, ".o")));
   if ((await Promise.all(objects.map(fileExists))).every(Boolean)) return objects;
 
@@ -577,7 +587,7 @@ async function ensureZlibObjects(sanitize: boolean, driver: CcDriver): Promise<s
           "-std=c11",
           ...driver.targetArgs,
           ...(sanitize ? ["-O1", "-fsanitize=address"] : ["-Os"]),
-          ...zlibDefines(driver),
+          ...defines,
           "-I", vendor,
           "-c", join(vendor, f),
           "-o", join(buildDir, f.replace(/\.c$/, ".o")),

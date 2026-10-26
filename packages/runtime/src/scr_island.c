@@ -8835,7 +8835,7 @@ static const char isl_modules_bootstrap[] =
      * (zlib/raw/gzip modes; inflate auto-detects for unzip), plus
      * BUFFERING stream classes: a Transform that collects its input
      * and converts at flush (no incremental output — documented
-     * divergence). Brotli is not carried; its names exist and throw
+     * divergence, SEMANTICS.md S101 (e)). Brotli is not carried; its names exist and throw
      * at the call. */
     "  builtins.zlib = memo(() => {\n"
     "    const Buffer = builtins.buffer().Buffer;\n"
@@ -8849,14 +8849,42 @@ static const char isl_modules_bootstrap[] =
     "      e.code = 'ERR_INVALID_ARG_TYPE';\n"
     "      throw e;\n"
     "    };\n"
+    /* options.level is validated as lib/zlib.js's checkRangesOrGetDefault
+     * does: undefined/NaN take the default, a non-number throws
+     * ERR_INVALID_ARG_TYPE, +-Infinity and values outside -1..9 throw
+     * ERR_OUT_OF_RANGE, with Node's texts. The other options (strategy,
+     * windowBits, memLevel, chunkSize, dictionary) are not carried:
+     * SEMANTICS.md S101 (e). */
+    "    const zSep = (v) => { let r = ''; let i = v.length; const st = v[0] === '-' ? 1 : 0; for (; i >= st + 4; i -= 3) r = '_' + v.slice(i - 3, i) + r; return v.slice(0, i) + r; };\n"
+    "    const zNum = (n) => Number.isInteger(n) && Math.abs(n) > 4294967296 ? zSep(String(n)) : Object.is(n, -0) ? '-0' : String(n);\n"
+    "    const zType = (v) => {\n"
+    "      if (v === null) return 'null';\n"
+    "      const t = typeof v;\n"
+    "      if (t === 'bigint') return 'type bigint (' + v + 'n)';\n"
+    "      if (t === 'boolean') return 'type boolean (' + v + ')';\n"
+    "      if (t === 'symbol') return 'type symbol (' + String(v) + ')';\n"
+    "      if (t === 'function') return 'function ' + v.name;\n"
+    "      if (t === 'string') { if (v.length > 28) v = v.slice(0, 25) + '...'; return v.indexOf(\"'\") === -1 ? \"type string ('\" + v + \"')\" : 'type string (' + JSON.stringify(v) + ')'; }\n"
+    "      if (v.constructor && 'name' in v.constructor) return 'an instance of ' + v.constructor.name;\n"
+    "      return 'an instance of Object';\n"
+    "    };\n"
+    "    const zLevel = (options) => {\n"
+    "      const n = options !== undefined && options !== null ? options.level : undefined;\n"
+    "      if (n === undefined || (typeof n === 'number' && Number.isNaN(n))) return -1;\n"
+    "      if (typeof n !== 'number') { const e = new TypeError('The \"options.level\" property must be of type number. Received ' + zType(n)); e.code = 'ERR_INVALID_ARG_TYPE'; throw e; }\n"
+    "      const range = !Number.isFinite(n) ? 'a finite number' : n < -1 || n > 9 ? '>= -1 and <= 9' : null;\n"
+    "      if (range !== null) { const e = new RangeError('The value of \"options.level\" is out of range. It must be ' + range + '. Received ' + zNum(n)); e.code = 'ERR_OUT_OF_RANGE'; throw e; }\n"
+    "      return n;\n"
+    "    };\n"
     "    const codec = (deflating, mode) => (data, options) => {\n"
-    "      const level = options !== undefined && options !== null && options.level !== undefined ? options.level : -1;\n"
+    "      const level = zLevel(options);\n"
     "      const raw = host.zlib(deflating ? 1 : 0, toU8(data), mode, level);\n"
     "      return Buffer.from(raw.buffer, raw.byteOffset, raw.length);\n"
     "    };\n"
     "    const asyncify = (syncFn) => (data, optionsOrCb, maybeCb) => {\n"
     "      const cb = typeof optionsOrCb === 'function' ? optionsOrCb : maybeCb;\n"
     "      const options = typeof optionsOrCb === 'function' ? undefined : optionsOrCb;\n"
+    "      zLevel(options);\n"
     "      if (typeof cb !== 'function') {\n"
     "        const e = new TypeError('The \"callback\" argument must be of type function');\n"
     "        e.code = 'ERR_INVALID_ARG_TYPE';\n"
@@ -8870,6 +8898,7 @@ static const char isl_modules_bootstrap[] =
     "    const mkStreamClass = (name, syncFn) => {\n"
     "      const cls = class extends Transform {\n"
     "        constructor(options) {\n"
+    "          zLevel(options);\n"
     "          super({});\n"
     "          this._zopts = options;\n"
     "          this._zchunks = [];\n"

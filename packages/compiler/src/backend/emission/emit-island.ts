@@ -19,7 +19,7 @@ import { IrType, islandCallbackRet, NPM_COMPRESS_MIN, typeKey } from "../../ir/n
  * inflated length beside the stored one, and the island's loader inflates
  * LAZILY at a module's first load through the inflater the emitted main
  * installs (scr_island_set_inflate ← scr_zlib_inflate_exact; index.ts
- * links scr_zlib.c/libz on the same moduleEmbedsCompressedNpm predicate),
+ * links scr_zlib.c and the vendored zlib on the same moduleEmbedsCompressedNpm predicate),
  * so boot touches no compressed page a run never loads — cold start
  * SHRINKS with the binary. */
 export function emitNpmEmbedding(E: CEmitter, out: string[]): void {

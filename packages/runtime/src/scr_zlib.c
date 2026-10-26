@@ -8,9 +8,8 @@
  * packages/runtime/vendor/zlib-chromium and built scalar (CPU_NO_SIMD, the
  * configuration Node itself builds on targets without SIMD), on host AND
  * cross builds alike (ensureZlibObjects in cc.ts; no system libz anywhere).
- * Its chromeconf.h renames every symbol Cr_z_*, so it can never bind to a
- * system libz by accident (a build that found a system zlib.h instead
- * fails to find chromeconf.h, loudly).
+ * scr_zlib_prefix.h renames every symbol scr_z_*, so it can never bind to
+ * a system libz, or to a host's own Chromium zlib (Cr_z_*), by accident.
  *
  * Both directions are DRIVEN exactly as Node drives them: lib/zlib.js's
  * processChunkSync calls the codec with flush Z_FINISH and a fresh 16 KiB
@@ -30,9 +29,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-/* the vendored codec's header, under Chromium's Cr_z_ symbol prefix (the
+/* the vendored codec's header, under our scr_z_ symbol prefix (the
  * objects compile with the same prefix — zlibDefines in cc.ts) */
-#include "chromeconf.h"
+#include "scr_zlib_prefix.h"
 #include "zlib.h"
 
 /* Node's default chunkSize (zlib.constants.Z_DEFAULT_CHUNK). */
@@ -133,8 +132,10 @@ static int scr_zlib_window_bits(int mode, bool inflating) {
 ScrBytes *scr_zlib_deflate_mode(const ScrBytes *data, double mode, double level) {
   z_stream zs;
   memset(&zs, 0, sizeof zs);
-  int lvl = (int)level;
-  if (lvl < -1 || lvl > 9) lvl = Z_DEFAULT_COMPRESSION;
+  /* the island shim validates options.level as Node does (NaN = default,
+   * out of range throws) before it gets here; range-check BEFORE the cast
+   * so no double ever reaches an out-of-range (int) conversion */
+  int lvl = level >= -1 && level <= 9 ? (int)level : Z_DEFAULT_COMPRESSION;
   /* node_zlib.cc's Init: memLevel 8 and the default strategy are
    * zlib.js's defaults */
   if (deflateInit2(&zs, lvl, Z_DEFLATED, scr_zlib_window_bits((int)mode, false), 8,
@@ -252,9 +253,9 @@ bool scr_zlib_inflate_exact(const unsigned char *src, size_t src_len,
   memset(&zs, 0, sizeof zs);
   if (inflateInit2(&zs, -15) != Z_OK) return false; /* raw DEFLATE */
   zs.next_in = (Bytef *)(uintptr_t)src;
-  zs.avail_in = (uInt)src_len;
+  zs.avail_in = scr_zlib_in_len(src_len);
   zs.next_out = dst;
-  zs.avail_out = (uInt)dst_len;
+  zs.avail_out = scr_zlib_in_len(dst_len); /* one call, as above */
   int rc = inflate(&zs, Z_FINISH);
   bool ok = rc == Z_STREAM_END && zs.total_out == dst_len;
   inflateEnd(&zs);

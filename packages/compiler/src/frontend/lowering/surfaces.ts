@@ -670,7 +670,7 @@ export const BUILTIN_MODULE_FNS: Record<string, Record<string, BuiltinModuleFn |
   zlib: {
     // Buffer in, Buffer out, Node's default options; string inputs fence
     // per site (see the zlib special case in lowerBuiltinModuleCall).
-    // cc.ts links libz only when these appear on the IR.
+    // cc.ts links the vendored zlib only when these appear on the IR.
     deflateSync: { fn: "zlib.deflateSync", params: [BYTES_U8], result: BYTES_U8 },
     inflateSync: { fn: "zlib.inflateSync", params: [BYTES_U8], result: BYTES_U8 },
   },

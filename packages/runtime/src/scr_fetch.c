@@ -79,8 +79,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* the vendored zlib (Node's own, Cr_z_-prefixed — see scr_zlib.c) */
-#include "chromeconf.h"
+/* the vendored zlib (Node's own, scr_z_-prefixed — see scr_zlib.c) */
+#include "scr_zlib_prefix.h"
 #include "zlib.h"
 
 #include "quickjs.h"

@@ -4,13 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterAll, beforeAll, expect, test } from "vitest";
+// the vendored zlib recipe every native build uses — one definition
+import { ZLIB_SOURCES, zlibDefines } from "../../compiler/src/backend/cc.js";
 
 const execFileAsync = promisify(execFile);
 const testDir = import.meta.dirname;
 const bin = join(testDir, "build", "test_bytes");
 let scratch: string;
 const zlibDir = join(testDir, "../vendor/zlib-chromium");
-const ZLIB_SOURCES = ["adler32.c", "cpu_features.c", "crc32.c", "deflate.c", "inffast.c", "inflate.c", "inftrees.c", "trees.c", "zutil.c"];
 
 // Compiled once with ASan + the RC audit: the assertions in test_bytes.c
 // cover the ToUint8/ToUint32 coercion matrix, ToIndex construction,
@@ -27,8 +28,7 @@ beforeAll(async () => {
     // the vendored zlib every native build links (cc.ts's ZLIB_SOURCES /
     // zlibDefines) — never a system libz
     "-I", zlibDir,
-    "-DCPU_NO_SIMD",
-    "-include", join(zlibDir, "chromeconf.h"),
+    ...zlibDefines(process.platform),
     ...ZLIB_SOURCES.map((f) => join(zlibDir, f)),
     "-o", bin,
     join(testDir, "test_bytes.c"),
