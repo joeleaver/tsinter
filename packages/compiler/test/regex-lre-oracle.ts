@@ -140,7 +140,7 @@ export interface LreCompileResult {
  * pattern, byte-for-byte per-code-unit-encoded instead, compiles
  * successfully into two REOP_char emissions (one per surrogate) —
  * exactly matching this port's own parser distinction (getClassAtom's
- * codePointAt-vs-charCodeAt split by isUnicode, regex-charclass.ts). */
+ * codePointAt-vs-charCodeAt split by isUnicode — the regex compiler's class atom). */
 function encodeWtf8PerCodeUnit(s: string): number[] {
   const bytes: number[] = [];
   for (let i = 0; i < s.length; i++) {

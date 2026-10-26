@@ -236,12 +236,7 @@ import { CasingBuilder } from "./casing.js";
 import { RegexBuilder } from "./regex-value.js";
 import { RegexInterpreterBuilder } from "./regex-interpreter.js";
 import { RegexCompilerBuilder } from "./regex-compiler.js";
-import { foldRegexNew } from "./regex-fold.js";
-import { RX_PATTERN_SIZE_LIMIT } from "./regex-compiler-tables.js";
-import { parsePattern } from "./regex-parser.js";
-import { assemble, collectGroupNames, type AssembleFlags } from "./regex-assembler.js";
-import { classifyRegexLitRefusal, usesUnicodeCasefold } from "./regex-disposition.js";
-import { classifyRegexSyntaxErrorReason, escapeRegExpPattern } from "./regex-syntax-reason.js";
+import { foldRegexLiteral, foldRegexNew } from "./regex-fold.js";
 import { escapeRegExpText } from "./regexp-escape.js";
 
 /** THE CONSTANT-FOLDER's own termination bound (design §7.6) — a belt-
@@ -252,7 +247,6 @@ import { escapeRegExpText } from "./regexp-escape.js";
  * practical limit, purely a safety net against a pathological or
  * unanticipated shape hanging the compiler. */
 const FOLD_DEPTH_CAP = 32;
-import type { RegexAst } from "./regex-ast.js";
 import { RE_HEADER_REGISTER_COUNT, RE_HEADER_FLAGS, LRE_FLAG_GLOBAL, LRE_FLAG_STICKY, LRE_FLAG_UNICODE } from "./regex-opcodes.js";
 import { BytesBuilder, type BytesElem } from "./typedarrays.js";
 import { StrdecBuilder } from "./strdec.js";
@@ -21595,25 +21589,13 @@ class Assembler {
             );
             return;
           }
-          // Both resolved to concrete text: regex-fold.ts runs the build-
-          // time pipeline (flags legality, the disposition layer, the
-          // constant-folded SyntaxError, assembly) and this case turns its
-          // outcome into code. Not interned (design §7.5's own named non-
-          // requirement) — regexConstruct emits a fresh %w.re.Regex struct
-          // on every evaluation, matching `new RegExp("a") !== new
-          // RegExp("a")`.
+          // Both resolved to concrete text: the run-time compiler runs over
+          // them at build time (regex-fold.ts / regex-buildtime.ts) and
+          // this case turns its outcome into code. Not interned (design
+          // §7.5's own named non-requirement) — regexConstruct emits a
+          // fresh %w.re.Regex struct on every evaluation, matching `new
+          // RegExp("a") !== new RegExp("a")`.
           const folded = foldRegexNew(foldedPattern.value, foldedFlags.value);
-          if (folded.kind === "runtime") {
-            // The run-time compiler's verdict is V8's where the build-time
-            // pipeline has no wording for a syntax error, or accepts what
-            // V8 rejects (regex-fold.ts names the cases): the constant
-            // texts go through it rather than refusing (unit P1).
-            this.emitRuntimeRegexNew(
-              () => this.pushStrLit(foldedPattern.value),
-              () => this.pushStrLit(foldedFlags.value),
-            );
-            return;
-          }
           if (folded.kind === "refuse") {
             this.refuse(`libCall:regex.new:${folded.key}`, e.loc);
             code.unreachable();
@@ -21624,6 +21606,21 @@ class Assembler {
             // SyntaxError) requires the throw to actually happen and be
             // caught) — a constant-folded throw of V8's exact message.
             this.emitSetCellError(code, "%SyntaxError", "SyntaxError", (c) => this.pushStrLitInto(c, folded.message), null);
+            this.emitUnwind();
+            return;
+          }
+          if (folded.kind === "fence") {
+            // A pattern outside the tier throws S102's named fence Error at
+            // the call, exactly as the run-time compiler would for the same
+            // texts — not a build refusal: Node builds this regex, and a
+            // call that never runs must not cost the program its build.
+            this.emitSetCellErrorCoded(
+              code,
+              "%Error",
+              "Error",
+              (c) => this.pushStrLitInto(c, folded.message),
+              (c) => this.pushStrLitInto(c, folded.code),
+            );
             this.emitUnwind();
             return;
           }
@@ -27329,70 +27326,23 @@ class Assembler {
         return;
       }
 
-      /* Regex literal: parse (P1's own already-gate-verified parser),
-       * classify against the four regexLit-side refusal keys (design
-       * §5.1/§2.5 — regex-disposition.ts's own paper trace), assemble +
-       * intern via RegexBuilder.regexLiteral() on the supported path.
-       * ENGINE UNTOUCHED beyond the two signature exports this needs
-       * (regex-assembler.ts's own collectGroupNames; emitRange was P1's
-       * own precedent for this exact kind of minimal export). */
+      /* Regex literal: the one regex compiler (regex-compiler.ts, run at
+       * build time — regex-fold.ts) compiles the pattern; a fenced
+       * construct refuses by its key, a pattern Node rejects (an early
+       * SyntaxError) refuses as invalid-pattern, and an accepted one is
+       * interned via RegexBuilder.regexLiteral(). The literal's own text
+       * is its source (a literal's text is already in source form). */
       case "regexLit": {
-        const flags: AssembleFlags = {
-          global: e.flags.includes("g"),
-          ignoreCase: e.flags.includes("i"),
-          multiLine: e.flags.includes("m"),
-          dotAll: e.flags.includes("s"),
-          unicode: e.flags.includes("u"),
-          sticky: e.flags.includes("y"),
-        };
-        // usesUnicodeCasefold checked BEFORE any parse attempt with the
-        // pattern's own real flags: regex-parser.ts's own
-        // assertNoUnicodeCasefold THROWS (a "should never happen"
-        // internal invariant, design §6.3), not returns null, the
-        // moment ignoreCase+isUnicode both reach char/class compilation
-        // — which almost any non-trivial pattern does. /iu must never
-        // reach parsePattern here. classifyRegexLitRefusal's own
-        // precedence checks this FIRST too (never touches ast for it),
-        // so skipping the parse and handing it ast:null matches exactly.
-        let ast: RegexAst | null = null;
-        if (!usesUnicodeCasefold(flags.ignoreCase, flags.unicode)) {
-          const parsed = parsePattern(e.pattern, 0, flags.unicode, flags.ignoreCase, flags.multiLine, flags.dotAll);
-          ast = parsed !== null && parsed.next === e.pattern.length ? parsed.ast : null;
-        }
-        // a literal past the size V8 is sure to compile is fenced like a
-        // run-time pattern (SEMANTICS.md S102, regex-compiler-tables.ts)
-        const refusal: string | null =
-          classifyRegexLitRefusal(e.pattern, ast, flags.ignoreCase, flags.multiLine, flags.dotAll, flags.unicode, parsePattern) ??
-          (e.pattern.length > RX_PATTERN_SIZE_LIMIT ? "pattern-too-large" : null);
-        if (refusal !== null) {
-          this.refuse(`expr:regexLit:${refusal}`, e.loc);
+        const lit = foldRegexLiteral(e.pattern, e.flags);
+        if (lit.kind === "refuse") {
+          this.refuse(`expr:regexLit:${lit.key}`, e.loc);
           code.unreachable();
           return;
         }
-        if (ast === null) {
-          // A genuine syntax error (Node would ALSO reject) — S065's own
-          // "compile-time diagnostic naming Node's exact error" is a
-          // SEPARATE, not-yet-built mechanism (no claim needs it; none
-          // of the four use an invalid pattern). Refuse by NAME rather
-          // than let a null ast reach assemble() — never silently wrong.
-          this.refuse("expr:regexLit:invalid-pattern", e.loc);
-          code.unreachable();
-          return;
-        }
-        const asm = assemble(ast, flags);
-        const groupNamesMap = collectGroupNames(ast);
-        const hasNamed = [...groupNamesMap.values()].some((v) => v.name !== null);
         // .flags is ALWAYS canonical getter order (d g i m s u y), NEVER
         // source order (design §5.6 — THE named trap, 1200 reads this
         // back directly, S067's own register contract).
-        const canonicalFlags = "dgimsuy"
-          .split("")
-          .filter((c) => e.flags.includes(c))
-          .join("");
-        const groupNames = hasNamed
-          ? Array.from({ length: asm.captureCount - 1 }, (_, i) => groupNamesMap.get(i + 1)?.name ?? "")
-          : null;
-        const fnIdx = this.regex.regexLiteral(e.pattern, canonicalFlags, asm.bytes, asm.captureCount, groupNames);
+        const fnIdx = this.regex.regexLiteral(e.pattern, lit.flags, lit.bytes, lit.captureCount, lit.groupNames);
         code.call(fnIdx);
         return;
       }
@@ -27594,50 +27544,18 @@ class Assembler {
               code.unreachable();
               return;
             }
-            const flags: AssembleFlags = {
-              global: patArg.flags.includes("g"),
-              ignoreCase: patArg.flags.includes("i"),
-              multiLine: patArg.flags.includes("m"),
-              dotAll: patArg.flags.includes("s"),
-              unicode: patArg.flags.includes("u"),
-              sticky: true, // FORCED regardless of the literal's own /y
-            };
-            // Same /iu guard as regexLit's own case (assertNoUnicodeCasefold
-            // THROWS, not refuses, on a real parse with both true).
-            let ast: RegexAst | null = null;
-            if (!usesUnicodeCasefold(flags.ignoreCase, flags.unicode)) {
-              const parsed = parsePattern(patArg.pattern, 0, flags.unicode, flags.ignoreCase, flags.multiLine, flags.dotAll);
-              ast = parsed !== null && parsed.next === patArg.pattern.length ? parsed.ast : null;
-            }
-            // a literal past the size V8 is sure to compile is fenced like a
-        // run-time pattern (SEMANTICS.md S102, regex-compiler-tables.ts)
-        const refusal: string | null =
-          classifyRegexLitRefusal(patArg.pattern, ast, flags.ignoreCase, flags.multiLine, flags.dotAll, flags.unicode, parsePattern) ??
-          (patArg.pattern.length > RX_PATTERN_SIZE_LIMIT ? "pattern-too-large" : null);
-            if (refusal !== null) {
-              // Grammar disposition doesn't depend on sticky — the SAME
-              // regexLit-side key this pattern would refuse under as an
-              // ordinary literal.
-              this.refuse(`expr:regexLit:${refusal}`, e.loc);
+            // The literal compiled with /y FORCED regardless of its own,
+            // by the same one compiler as any literal; grammar disposition
+            // doesn't depend on sticky, so a refusal is the SAME
+            // regexLit-side key the pattern refuses under as a literal.
+            const unicode = patArg.flags.includes("u");
+            const asm = foldRegexLiteral(patArg.pattern, patArg.flags.includes("y") ? patArg.flags : patArg.flags + "y");
+            if (asm.kind === "refuse") {
+              this.refuse(`expr:regexLit:${asm.key}`, e.loc);
               code.unreachable();
               return;
             }
-            if (ast === null) {
-              this.refuse("expr:regexLit:invalid-pattern", e.loc);
-              code.unreachable();
-              return;
-            }
-            const asm = assemble(ast, flags);
-            const groupNamesMap = collectGroupNames(ast);
-            const hasNamed = [...groupNamesMap.values()].some((v) => v.name !== null);
-            const canonicalFlags = "dgimsuy"
-              .split("")
-              .filter((c) => c === "y" || patArg.flags.includes(c))
-              .join("");
-            const groupNames = hasNamed
-              ? Array.from({ length: asm.captureCount - 1 }, (_, i) => groupNamesMap.get(i + 1)?.name ?? "")
-              : null;
-            const stickyFnIdx = this.regex.regexLiteral(patArg.pattern, canonicalFlags, asm.bytes, asm.captureCount, groupNames);
+            const stickyFnIdx = this.regex.regexLiteral(patArg.pattern, asm.flags, asm.bytes, asm.captureCount, asm.groupNames);
             // captureCount/registerCount are COMPILE-TIME known here
             // (unlike test/search, whose receiver can be an arbitrary
             // expression) — no runtime header read needed.
@@ -27750,7 +27668,7 @@ class Assembler {
                   // read directly) — treated as no-match, q advances.
                   code.localGet(subjLocal);
                   code.localGet(qLocal);
-                  code.i32Const(flags.unicode ? 1 : 0);
+                  code.i32Const(unicode ? 1 : 0);
                   code.call(this.regexInterp.getChar());
                   code.localSet(qLocal); // newIdx (getChar's own result order — see its doc comment)
                   code.drop(); // discard the codePoint
@@ -27804,13 +27722,31 @@ class Assembler {
               }
               code.else_();
               {
-                // No match at q: advance.
-                code.localGet(subjLocal);
-                code.localGet(qLocal);
-                code.i32Const(flags.unicode ? 1 : 0);
-                code.call(this.regexInterp.getChar());
-                code.localSet(qLocal);
-                code.drop();
+                // No match at q: advance ONE CODE UNIT, also under /u.
+                // Node's split (V8's RegExpPrototypeSplitBody) searches
+                // from q with the non-sticky regex, whose unanchored
+                // prelude steps by code unit (regexp-compiler.cc
+                // UnanchoredAdvance), so a zero-width match between the
+                // halves of a surrogate pair splits there:
+                // "a😀b".split(/\B/u) is ["a\ud83d", "\ude00b"] (#269).
+                // A STICKY receiver is not on that fast path (V8's
+                // RegExpSplit builtin hands it to the runtime's spec
+                // algorithm), which steps AdvanceStringIndex — a whole
+                // code point under /u: "a😀b".split(/\B/uy) is ["a😀b"].
+                // (Without /u getChar's step is that same one unit.)
+                if (unicode && !patArg.flags.includes("y")) {
+                  code.localGet(qLocal);
+                  code.i32Const(1);
+                  code.i32Add();
+                  code.localSet(qLocal);
+                } else {
+                  code.localGet(subjLocal);
+                  code.localGet(qLocal);
+                  code.i32Const(unicode ? 1 : 0);
+                  code.call(this.regexInterp.getChar());
+                  code.localSet(qLocal);
+                  code.drop();
+                }
               }
               code.end(); // matched ifVoid
               code.br(0);

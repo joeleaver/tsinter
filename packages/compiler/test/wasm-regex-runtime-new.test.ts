@@ -166,19 +166,11 @@ test("RTN-06 build-time fixes found by the gate: \\b under /i, (?i:..) under /i,
       "console.log(new RegExp('(?i:a)', 'i').test('A'));",
       "try { new RegExp('\\\\p{L=}', 'u'); console.log('built'); } catch (e) { console.log((e as Error).message); }",
     ].join("\n"),
-  ).catch((e: Error) => ({ wasm: e.message, node: "" }));
-  // \p{L=} under /u is now refused at build time by name (it used to
-  // build \p{L}); the program as a whole therefore refuses.
-  expect(wasm).toContain("libCall:regex.new:unported-unicode-property");
-  const ok = await both(
-    "rtn06b",
-    [
-      "console.log(/\\bfoo/i.test('a FOO'), /\\Bfoo/i.test('aFOO'), new RegExp('\\\\bba', 'i').test('x BAR'));",
-      "console.log(new RegExp('(?i:a)', 'i').test('A'));",
-    ].join("\n"),
   );
-  expect(ok.wasm).toBe(ok.node);
-  void node;
+  // \p{L=} under /u used to build \p{L}, then refused as
+  // unported-unicode-property; since unit E's review it throws V8's own
+  // "Invalid property name" SyntaxError at the call, as Node does.
+  expect(wasm).toBe(node);
 });
 
 test("RTN-07 constant patterns the build-time pipeline used to build or refuse wrongly now answer as Node does", async () => {

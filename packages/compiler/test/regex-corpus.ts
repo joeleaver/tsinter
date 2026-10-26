@@ -1,5 +1,5 @@
 /* INC-24 P1: the shared (pattern, flags) corpus generators — factored
- * out of wasm-regex-verdict.test.ts (CP2d) so CP3's assembler byte-
+ * out of wasm-regex-verdict.test.ts (CP2d; retired in unit E) so CP3's assembler byte-
  * comparison harness (gate leg (i)'s OTHER half — "assembler-vs-
  * lre_compile byte-identical over a generated pattern corpus", brief-
  * p1.md §3) reuses the SAME generator instead of maintaining a second,

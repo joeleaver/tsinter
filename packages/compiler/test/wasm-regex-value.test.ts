@@ -5,7 +5,7 @@
  * interpreter all shipped test-verified with zero live callers first).
  * Verifies: every field round-trips (source/flags/bytecode/
  * captureCount/groupNames, both null and populated), the bytecode
- * embedded is BYTE-IDENTICAL to what assemble() itself produced (the
+ * embedded is BYTE-IDENTICAL to what the regex compiler produced (the
  * SAME kind of measured claim the canonicalize-sweep's own BRIDGE
  * checks made, not argued), and literal INTERNING actually holds:
  * calling regexLiteral() twice with the identical (source,flags) pair
@@ -15,9 +15,8 @@
 import { describe, expect, test } from "vitest";
 import { Code } from "../src/backend/wasm/code.js";
 import { I32, ModuleBuilder, type ValType } from "../src/backend/wasm/module.js";
-import { assemble } from "../src/backend/wasm/regex-assembler.js";
-import { parsePattern } from "../src/backend/wasm/regex-parser.js";
 import { RegexBuilder } from "../src/backend/wasm/regex-value.js";
+import { compiled } from "./regex-compile.js";
 
 interface ValueExports {
   litA: () => unknown;
@@ -37,32 +36,11 @@ interface ValueExports {
   bcAt: (b: unknown, i: number) => number;
 }
 
+/** The one regex compiler's output for the pattern (regexLiteral() takes
+ * bytecode, capture count and group names as caller-supplied inputs). */
 function assembledFor(pattern: string, flagStr: string): { bytes: Uint8Array; captureCount: number; groupNames: string[] | null } {
-  const flags = { global: false, ignoreCase: flagStr.includes("i"), multiLine: flagStr.includes("m"), dotAll: flagStr.includes("s"), unicode: flagStr.includes("u"), sticky: flagStr.includes("y") };
-  const parsed = parsePattern(pattern, 0, flags.unicode, flags.ignoreCase, flags.multiLine, flags.dotAll)!;
-  const asm = assemble(parsed.ast, flags);
-  // Named-group extraction: walk the AST for group nodes with a name,
-  // in capture-index order — a small local walk (this test's own need,
-  // not a production helper) since regexLiteral() takes groupNames as
-  // a plain input rather than deriving it itself (division of labour:
-  // the CALLER's already-built AST is the one source of truth for
-  // names, matching how captureCount/bytecode are ALSO caller-supplied
-  // here rather than re-derived).
-  const names: (string | null)[] = [];
-  const walk = (node: unknown): void => {
-    if (node === null || typeof node !== "object") return;
-    const rec = node as Record<string, unknown>;
-    if (rec.kind === "group" && rec.capture !== null) {
-      names[(rec.capture as number) - 1] = (rec.name as string | null) ?? null;
-    }
-    for (const k of Object.keys(rec)) {
-      const v = rec[k];
-      if (v && typeof v === "object") walk(v);
-    }
-  };
-  walk(parsed.ast);
-  const hasNamed = names.some((n) => n !== null && n !== undefined);
-  return { bytes: asm.bytes, captureCount: asm.captureCount, groupNames: hasNamed ? names.map((n) => n ?? "") : null };
+  const c = compiled(pattern, flagStr);
+  return { bytes: c.bytes, captureCount: c.captureCount, groupNames: c.groupNames };
 }
 
 async function build(): Promise<ValueExports> {
@@ -209,14 +187,14 @@ function readBytes(ex: ValueExports, b: unknown): Uint8Array {
 }
 
 describe("%w.re.Regex value struct + literal interning (design §3.2/§3.3)", () => {
-  test("source/flags/bytecode/captureCount round-trip exactly, bytecode byte-identical to assemble()'s own output", async () => {
+  test("source/flags/bytecode/captureCount round-trip exactly, bytecode byte-identical to the compiler's own output", async () => {
     const ex = await build();
     const A = assembledFor("a(b)c", "i");
     const r = ex.litA();
     expect(readStr(ex, ex.source(r))).toBe("a(b)c");
     expect(readStr(ex, ex.flags(r))).toBe("i");
     expect(ex.captureCount(r)).toBe(A.captureCount);
-    expect(Array.from(readBytes(ex, ex.bytecode(r))), "embedded bytecode vs assemble()'s own real output").toEqual(Array.from(A.bytes));
+    expect(Array.from(readBytes(ex, ex.bytecode(r))), "embedded bytecode vs the compiler's own real output").toEqual(Array.from(A.bytes));
     expect(ex.groupNamesIsNull(r), "a(b)c has no NAMED groups").toBe(1);
   });
 

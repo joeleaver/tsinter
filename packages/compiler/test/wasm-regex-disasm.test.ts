@@ -1,22 +1,18 @@
 /* INC-24 P1, CP4: regex-disasm.ts's own pins — a durable instrument
  * deserves direct verification too, not just trust because it "looks
- * right". Real patterns through this port's own already-byte-verified
- * assemble() (CP3), not hand-built bytecode: the point is confirming
- * the walker reads REAL emitted bytecode correctly, opcode names AND
- * variable-length skips both. */
+ * right". Real patterns through the one regex compiler (regex-compiler.ts,
+ * byte-verified against lre_compile by its gate), not hand-built
+ * bytecode: the point is confirming the walker reads REAL emitted
+ * bytecode correctly, opcode names AND variable-length skips both. */
 import { describe, expect, test } from "vitest";
-import { assemble, type AssembleFlags } from "../src/backend/wasm/regex-assembler.js";
-import { parsePattern } from "../src/backend/wasm/regex-parser.js";
+import { compiled, type RegexFlags } from "./regex-compile.js";
 import { disassemble } from "./regex-disasm.js";
 
-function disasmOf(pattern: string, flags: AssembleFlags): string[] {
-  const parsed = parsePattern(pattern, 0, flags.unicode, flags.ignoreCase, flags.multiLine, flags.dotAll);
-  if (parsed === null || parsed.next !== pattern.length) throw new Error(`parse failed for /${pattern}/`);
-  const asm = assemble(parsed.ast, flags);
-  return disassemble(asm.bytes);
+function disasmOf(pattern: string, flags: RegexFlags): string[] {
+  return disassemble(compiled(pattern, flags).bytes);
 }
 
-const base: AssembleFlags = { global: false, ignoreCase: false, multiLine: false, dotAll: false, unicode: false, sticky: true };
+const base: RegexFlags = { global: false, ignoreCase: false, multiLine: false, dotAll: false, unicode: false, sticky: true };
 
 describe("regex-disasm.ts: opcode-by-opcode walk (REOP_SIZE-driven, not a byte-value scan)", () => {
   test("a fixed-size-only pattern: every opcode name in emission order", () => {

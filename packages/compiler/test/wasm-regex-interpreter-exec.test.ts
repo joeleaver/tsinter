@@ -1,14 +1,14 @@
 /* INC-24 P1, CP4: %w.re.exec end to end — REAL bytecode from this
- * port's own already-byte-verified assemble() (CP3), run through the
+ * port's one regex compiler (regex-compiler.ts, run in-process), run through the
  * wasm interpreter, compared against Node's own regex matching. Every
- * test pattern here is STICKY (assemble()'s own `sticky: true`) as a
+ * test pattern here is STICKY (compiled with /y) as a
  * deliberate SCOPE choice for this file specifically — not because
  * exec() can't handle the alternative. STALE CLAIM CORRECTED (CP4 back
  * half): an earlier draft of this comment said the non-sticky search-
  * loop prelude "needs a genuine loop construct exec() doesn't
  * implement yet" — true when written, false by the time split_goto_
- * first/any/goto (the prelude's own three opcodes, regex-assembler.ts:
- * 716-723) were built, and never corrected. Sticky-vs-search is
+ * first/any/goto (the prelude's own three opcodes, libregexp.c lre_compile's
+ * non-sticky prelude) were built, and never corrected. Sticky-vs-search is
  * entirely a BYTECODE-SHAPE decision the ASSEMBLER makes; exec() never
  * reads the header's own STICKY bit and is shape-agnostic. Proven
  * (not just reasoned) through real exec() end to end in
@@ -51,9 +51,8 @@
 import { describe, expect, test } from "vitest";
 import { Code } from "../src/backend/wasm/code.js";
 import { I32, ModuleBuilder, type ValType } from "../src/backend/wasm/module.js";
-import { assemble, type AssembleFlags } from "../src/backend/wasm/regex-assembler.js";
-import { RE_HEADER_REGISTER_COUNT } from "../src/backend/wasm/regex-opcodes.js";
-import { parsePattern } from "../src/backend/wasm/regex-parser.js";
+import { compiled, type RegexFlags } from "./regex-compile.js";
+import { LRE_FLAG_IGNORECASE, RE_HEADER_FLAGS, RE_HEADER_LEN, RE_HEADER_REGISTER_COUNT, REOP } from "../src/backend/wasm/regex-opcodes.js";
 import { RegexInterpreterBuilder } from "../src/backend/wasm/regex-interpreter.js";
 
 interface Case {
@@ -259,8 +258,24 @@ const CASES: Case[] = [
   { pattern: "(ab)c(?<=\\1)", subject: "abcab", startIndex: 0, unicode: false }, // genuine mismatch: the 2 characters before the check point are "bc", not capture1's own "ab"
 ];
 
-function flagsFor(tc: Case): AssembleFlags {
+function flagsFor(tc: Case): RegexFlags {
   return { global: false, ignoreCase: !!tc.ignoreCase, multiLine: !!tc.multiLine, dotAll: !!tc.dotAll, unicode: tc.unicode, sticky: true };
+}
+
+/** The compiler's bytecode for the case. /iu is fenced (S102), so the one
+ * /iu case (`\b`, pinning REOP_word_boundary_i's Kelvin / long-s gate,
+ * which the interpreter keeps) is the compiler's /uy bytecode with the
+ * IGNORECASE header bit set and word_boundary swapped for its _i form —
+ * what lre_compile emits for /\b/iuy. */
+function bytecodeFor(tc: Case): { bytes: Uint8Array; captureCount: number } {
+  if (!(tc.ignoreCase && tc.unicode)) return compiled(tc.pattern, flagsFor(tc));
+  if (tc.pattern !== "\\b") throw new Error(`no hand-built /iu bytecode for /${tc.pattern}/`);
+  const c = compiled(tc.pattern, { ...flagsFor(tc), ignoreCase: false });
+  const bytes = Uint8Array.from(c.bytes);
+  bytes[RE_HEADER_FLAGS] = bytes[RE_HEADER_FLAGS]! | LRE_FLAG_IGNORECASE;
+  const at = bytes.indexOf(REOP.word_boundary, RE_HEADER_LEN);
+  bytes[at] = REOP.word_boundary_i;
+  return { bytes, captureCount: c.captureCount };
 }
 
 interface ExecExports {
@@ -295,10 +310,7 @@ async function build(): Promise<ExecExports> {
   {
     const c = new Code();
     CASES.forEach((tc, i) => {
-      const flags = flagsFor(tc);
-      const parsed = parsePattern(tc.pattern, 0, flags.unicode, flags.ignoreCase, flags.multiLine, flags.dotAll);
-      if (parsed === null || parsed.next !== tc.pattern.length) throw new Error(`parse failed for /${tc.pattern}/`);
-      const asm = assemble(parsed.ast, flags);
+      const asm = bytecodeFor(tc);
       c.localGet(0);
       c.i32Const(i);
       c.i32Eq();
@@ -360,10 +372,7 @@ async function build(): Promise<ExecExports> {
 }
 
 function captureCountFor(tc: Case): number {
-  const flags = flagsFor(tc);
-  const parsed = parsePattern(tc.pattern, 0, flags.unicode, flags.ignoreCase, flags.multiLine, flags.dotAll);
-  if (parsed === null || parsed.next !== tc.pattern.length) throw new Error(`parse failed for /${tc.pattern}/`);
-  return assemble(parsed.ast, flags).captureCount;
+  return bytecodeFor(tc).captureCount;
 }
 
 // newCaptureArray(count) allocates 2*count i32 slots — captureCountFor's
@@ -377,15 +386,12 @@ function captureCountFor(tc: Case): number {
 // below is bounded by the REAL captureCount, never by the array's own
 // (possibly padded) length.
 function captureArrayCountFor(tc: Case): number {
-  const flags = flagsFor(tc);
-  const parsed = parsePattern(tc.pattern, 0, flags.unicode, flags.ignoreCase, flags.multiLine, flags.dotAll);
-  if (parsed === null || parsed.next !== tc.pattern.length) throw new Error(`parse failed for /${tc.pattern}/`);
-  const asm = assemble(parsed.ast, flags);
+  const asm = bytecodeFor(tc);
   const registerCount = asm.bytes[RE_HEADER_REGISTER_COUNT]!;
   return asm.captureCount + Math.ceil(registerCount / 2);
 }
 
-describe("%w.re.exec: literal patterns, quantifiers, alternation, groups, and genuine backtracking — byte-verified bytecode from THIS port's own assemble(), verified against Node's own regex matching", () => {
+describe("%w.re.exec: literal patterns, quantifiers, alternation, groups, and genuine backtracking — byte-verified bytecode from the one regex compiler, verified against Node's own regex matching", () => {
   CASES.forEach((tc, i) => {
     test(`/${tc.pattern}/y against ${JSON.stringify(tc.subject)} at index ${tc.startIndex}`, async () => {
       const ex = await build();
@@ -581,12 +587,11 @@ describe("%w.re.exec: REOP_prev, hand-built bytecode (not yet reachable through 
 // the only way a single char node's codepoint exceeds 0xFFFF is under
 // /u (unicode mode), and ignoreCase+unicode together is FENCED (design
 // §6.3(a) — /iu needs simple case FOLDING, a different algorithm this
-// port refuses) — confirmed directly: parsing "\u{10428}" with both
-// ignoreCase and unicode set THROWS regex-parser's own refusal, it
-// never reaches emitChar at all. So char32_i is pinned here via
+// port refuses) — the regex compiler fences /iu (unicode-casefold) before
+// any char32_i could be emitted. So char32_i is pinned here via
 // hand-built bytecode, same technique as REOP_prev's own two blobs —
-// this does NOT reproduce the compiler's fence (that stays enforced at
-// the parser, see wasm-regex-parser.test.ts), it proves exec()'s OWN
+// this does NOT reproduce the compiler's fence (pinned in
+// wasm-regex-disposition.test.ts), it proves exec()'s OWN
 // interpretation of char32_i is correct independent of whether this
 // port's compiler currently has any way to reach it.
 describe("%w.re.exec: REOP_char32_i, hand-built bytecode (fenced by design §6.3(a) at the PARSER, not reachable through any assembled pattern — see this file's own note above)", () => {

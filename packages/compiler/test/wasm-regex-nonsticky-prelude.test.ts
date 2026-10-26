@@ -2,11 +2,11 @@
  * real exec() end to end — a gap the lead's own review surfaced before
  * value-struct+embedding: every existing exec() test (CASES, the
  * 3,000-pair corpus) forces AssembleFlags.sticky=true unconditionally,
- * so the prelude regex-assembler.ts:716-723 emits for a NON-sticky
+ * so the prelude the compiler emits for a NON-sticky
  * pattern (libregexp.c:2564-2568's own split_goto_first/any/goto loop
  * — "try here, else consume one char and retry the whole atom from the
  * next position") has never been run through the interpreter, only
- * byte-verified against lre_compile (wasm-regex-assembler-corpus.test.ts,
+ * byte-verified against lre_compile (now the compiler gate,
  * which DOES vary sticky from the real flag string — `sticky:
  * flagStr.includes("y")`).
  *
@@ -34,10 +34,9 @@
 import { describe, expect, test } from "vitest";
 import { Code } from "../src/backend/wasm/code.js";
 import { I32, ModuleBuilder, type ValType } from "../src/backend/wasm/module.js";
-import { assemble, type AssembleFlags } from "../src/backend/wasm/regex-assembler.js";
 import { RE_HEADER_REGISTER_COUNT } from "../src/backend/wasm/regex-opcodes.js";
-import { parsePattern } from "../src/backend/wasm/regex-parser.js";
 import { RegexInterpreterBuilder } from "../src/backend/wasm/regex-interpreter.js";
+import { compiled, type RegexFlags } from "./regex-compile.js";
 
 interface Case {
   pattern: string;
@@ -78,7 +77,7 @@ const CASES: Case[] = [
   { pattern: "B", subject: "xxxb", startIndex: 0, ignoreCase: true },
 ];
 
-function flagsFor(tc: Case): AssembleFlags {
+function flagsFor(tc: Case): RegexFlags {
   return { global: false, ignoreCase: !!tc.ignoreCase, multiLine: false, dotAll: false, unicode: false, sticky: false };
 }
 
@@ -114,10 +113,7 @@ async function build(): Promise<ExecExports> {
   {
     const c = new Code();
     CASES.forEach((tc, i) => {
-      const flags = flagsFor(tc);
-      const parsed = parsePattern(tc.pattern, 0, flags.unicode, flags.ignoreCase, flags.multiLine, flags.dotAll);
-      if (parsed === null || parsed.next !== tc.pattern.length) throw new Error(`parse failed for /${tc.pattern}/`);
-      const asm = assemble(parsed.ast, flags);
+      const asm = compiled(tc.pattern, flagsFor(tc));
       c.localGet(0);
       c.i32Const(i);
       c.i32Eq();
@@ -179,15 +175,11 @@ async function build(): Promise<ExecExports> {
 }
 
 function captureCountFor(tc: Case): number {
-  const flags = flagsFor(tc);
-  const parsed = parsePattern(tc.pattern, 0, flags.unicode, flags.ignoreCase, flags.multiLine, flags.dotAll)!;
-  return assemble(parsed.ast, flags).captureCount;
+  return compiled(tc.pattern, flagsFor(tc)).captureCount;
 }
 
 function captureArrayCountFor(tc: Case): number {
-  const flags = flagsFor(tc);
-  const parsed = parsePattern(tc.pattern, 0, flags.unicode, flags.ignoreCase, flags.multiLine, flags.dotAll)!;
-  const asm = assemble(parsed.ast, flags);
+  const asm = compiled(tc.pattern, flagsFor(tc));
   const registerCount = asm.bytes[RE_HEADER_REGISTER_COUNT]!;
   return asm.captureCount + Math.ceil(registerCount / 2);
 }

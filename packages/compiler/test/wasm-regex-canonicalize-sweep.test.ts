@@ -10,26 +10,17 @@
  * Node-exact too — a different, and until now unmeasured, risk.
  *
  * MECHANISM: no per-pattern module rebuild (65,960+ distinct modules is
- * impractical) and no assemble() call in the sweeps themselves.
- * regex-ast.ts's own documented contract settles the bytecode shape:
- * for ignoreCase, the PATTERN side is already Canonicalize()'d (char) /
- * case-closed (class) at "parse time" — VAL (or the range table) is
- * read RAW from bytecode by emitTestChar/emitRangeTest and compared
- * against regexCanonicalize(subjectChar), never canonicalized itself at
- * match time. So a hand-built bytecode blob using regex-canon.ts's
- * canonicalize() / regex-class-closure.ts's caseCloseClass() as the
- * literal pattern-side operand SHOULD be exactly what this port's OWN
- * assemble() would itself emit for these patterns. THIS CLAIM IS
- * MEASURED, not just argued from reading the dispatch code: BRIDGE 1/2
- * below assemble() a real /a/i and /[a-z]/i pattern and byte-diff the
- * result against this file's own hand-built construction for the
- * identical case — byte-identical once the header's own IGNORECASE bit
- * was added (the ONE discrepancy the bridge checks actually caught; see
- * their own history in findings). So this sweep is about exec()'s own
- * runtime canonicalization correctness (REOP_char_i/REOP_range_i's
- * actual dispatch), not the assembler (a separate, already-covered gate
- * leg: the byte-comparison harness against lre_compile) — and that
- * layer split is now measured at the boundary, not merely argued.
+ * impractical). For ignoreCase, the PATTERN side is already
+ * Canonicalize()'d (char) / case-closed (class) at compile time — VAL
+ * (or the range table) is read RAW from bytecode by emitTestChar/
+ * emitRangeTest and compared against regexCanonicalize(subjectChar),
+ * never canonicalized itself at match time. So the char sweep hand-
+ * builds a blob with regex-canon.ts's canonicalize() as the pattern-side
+ * operand — exactly what the regex compiler emits for /x/i, MEASURED by
+ * BRIDGE 1 below (byte-diffing the compiler's real /a/iy) — and the
+ * class sweep runs the compiler's OWN bytecode for each class under /iy,
+ * so it measures the compiler's case closure and exec()'s range_i
+ * dispatch together against Node.
  *
  * ONE wasm module, two exported test-runner functions, each building
  * its OWN tiny bytecode + one-code-unit subject array via
@@ -41,25 +32,19 @@
  *
  * runCharITest(patternVal, subjectCp): builds save_start(0)/
  * char_i(patternVal)/save_end(0)/match and runs it — patternVal is
- * ALWAYS precomputed in JS via canonicalize(c), matching what the real
- * parser would have embedded.
+ * ALWAYS precomputed in JS via canonicalize(c), matching what the
+ * compiler embeds.
  *
- * runClassTest(classIndex, subjectCp): builds save_start(0)/
- * range_i(table)/save_end(0)/match for one of 9 FIXED classes (their
- * table bytes computed once at module-build time via emitRange over
- * caseCloseClass(...), same closure function regex-class-closure.ts's
- * own tests already validate) and runs it.
+ * runClassTest(classIndex, subjectCp): runs the compiler's own /iy
+ * bytecode for one of 9 FIXED classes (save_start(0)/range_i(table)/
+ * save_end(0)/match, embedded once at module-build time).
  */
 import { describe, expect, test } from "vitest";
 import { Code } from "../src/backend/wasm/code.js";
 import { I32, ModuleBuilder, type ValType } from "../src/backend/wasm/module.js";
 import { canonicalize } from "../src/backend/wasm/regex-canon.js";
-import { caseCloseClass } from "../src/backend/wasm/regex-class-closure.js";
-import { crInvert, type CharRange } from "../src/backend/wasm/regex-charclass.js";
-import { assemble, emitRange, type AssembleFlags } from "../src/backend/wasm/regex-assembler.js";
-import { parsePattern } from "../src/backend/wasm/regex-parser.js";
-import { RegexByteWriter } from "../src/backend/wasm/regex-bytewriter.js";
 import { RegexInterpreterBuilder } from "../src/backend/wasm/regex-interpreter.js";
+import { compiled } from "./regex-compile.js";
 
 const CP = 0x10000;
 const isSurrogate = (c: number): boolean => c >= 0xd800 && c <= 0xdfff;
@@ -69,51 +54,24 @@ interface SweepExports {
   runClassTest: (classIndex: number, subjectCp: number) => number;
 }
 
-const RAW_CLASSES: Array<{ src: string; raw: CharRange; negated: boolean }> = [
-  { src: "[a-z]", raw: [0x61, 0x7b], negated: false },
-  { src: "[A-Z]", raw: [0x41, 0x5b], negated: false },
-  { src: "[a-f]", raw: [0x61, 0x67], negated: false },
-  { src: "[^a-z]", raw: [0x61, 0x7b], negated: true },
-  { src: "[aeiou]", raw: [0x61, 0x62, 0x65, 0x66, 0x69, 0x6a, 0x6f, 0x70, 0x75, 0x76], negated: false },
-  { src: "[^aeiou]", raw: [0x61, 0x62, 0x65, 0x66, 0x69, 0x6a, 0x6f, 0x70, 0x75, 0x76], negated: true },
-  { src: "[\\u00c0-\\u00ff]", raw: [0xc0, 0x100], negated: false },
-  { src: "[\\u0100-\\u017f]", raw: [0x100, 0x180], negated: false },
-  { src: "[\\u0391-\\u03a9]", raw: [0x391, 0x3aa], negated: false },
+const RAW_CLASSES: Array<{ src: string }> = [
+  { src: "[a-z]" },
+  { src: "[A-Z]" },
+  { src: "[a-f]" },
+  { src: "[^a-z]" },
+  { src: "[aeiou]" },
+  { src: "[^aeiou]" },
+  { src: "[\\u00c0-\\u00ff]" },
+  { src: "[\\u0100-\\u017f]" },
+  { src: "[\\u0391-\\u03a9]" },
 ];
 
-/** Full REOP_range_i bytecode for one class, built the SAME way this
- * port's own PARSER actually would for a bracket class: regex-
- * charclass.ts's parseCharClass closes EACH MEMBER as it's added to
- * the class body (closeMemberIfNeeded, called per-atom) and only
- * inverts the WHOLE already-closed set at the very end for `[^...]`
- * (parseCharClass's own `if (invert) cr = crInvert(cr);`, AFTER the
- * member loop — confirmed by reading that function directly, its own
- * doc comment states this explicitly: "`[^a-z]/i` negating the
- * ALREADY-closed A-Z rather than the raw a-z"). So negated classes here
- * are crInvert(caseCloseClass(raw)) — invert LAST — matching the real
- * bracket-class pipeline exactly. (caseCloseClass(crInvert(x)) — invert
- * FIRST — is what bare \D/\W under ignoreCase use instead, a DIFFERENT
- * real code path this file doesn't exercise; it happens to be safe
- * there only because \D/\W's raw complement has no split case pair
- * crossing the negation boundary, unlike a-z.) */
+/** Full REOP_range_i bytecode for one class: the one regex compiler's own
+ * output for the class under /iy (its case closure — each member closed,
+ * a `[^...]` inverted after — is what this sweep measures against Node,
+ * together with exec()'s own range_i dispatch). */
 function buildClassBytecode(entry: (typeof RAW_CLASSES)[number]): Uint8Array {
-  const cr = entry.negated ? crInvert(caseCloseClass(entry.raw)) : caseCloseClass(entry.raw);
-  const w = new RegexByteWriter();
-  w.u8(0x22); // flags: STICKY(0x20) | IGNORECASE(0x02) — matches assemble()'s own flagsToBits(), confirmed byte-identical by BRIDGE 2 below
-  w.u8(0x00);
-  w.u8(1); // captureCount
-  w.u8(0); // registerCount
-  const bodyLenPos = w.size;
-  w.u32(0); // placeholder, patched below
-  const bodyStart = w.size;
-  w.u8(19);
-  w.u8(0); // save_start(0)
-  emitRange(w, cr, true); // REOP_range_i + table
-  w.u8(20);
-  w.u8(0); // save_end(0)
-  w.u8(16); // match
-  w.patchU32(bodyLenPos, w.size - bodyStart);
-  return w.toBytes();
+  return compiled(entry.src, "iy").bytes;
 }
 
 async function build(): Promise<SweepExports> {
@@ -338,45 +296,19 @@ describe("regex canonicalize/case-closure sweeps at design scale, through real e
     120_000,
   );
 
-  // BRIDGE SPOT-CHECKS (lead's rider on the sweeps-plan message): the
-  // header comment's claim that a hand-built blob "is EXACTLY what
-  // assemble() would itself emit" was argued from reading emitTestChar/
-  // emitRangeTest — this makes it MEASURED instead, byte-diffing
-  // assemble()'s REAL output for a real /x/i and /[...]/i pattern
-  // against this file's own hand-built construction for the identical
-  // case, so the sweep's operand construction rests on the same kind of
-  // evidence as everything else in this pass, not a parallel derivation.
-  const BRIDGE_FLAGS: AssembleFlags = { global: false, ignoreCase: true, multiLine: false, dotAll: false, unicode: false, sticky: true };
-
-  test("BRIDGE 1 (char): assemble()'s real bytecode for /a/i (sticky) is byte-identical to this file's hand-built save_start/char_i(canonicalize('a'))/save_end/match blob", () => {
-    const parsed = parsePattern("a", 0, false, true, false, false);
-    expect(parsed, "parse must succeed").not.toBeNull();
-    const asm = assemble(parsed!.ast, BRIDGE_FLAGS);
+  // BRIDGE SPOT-CHECK (lead's rider on the sweeps-plan message): the
+  // char sweep's hand-built blob "is EXACTLY what the compiler would
+  // itself emit" — MEASURED, byte-diffing the compiler's REAL output for
+  // /a/iy against this file's own construction for the identical case.
+  // (The class sweep runs the compiler's own bytecode, so it needs no
+  // bridge.)
+  test("BRIDGE 1 (char): the compiler's real bytecode for /a/i (sticky) is byte-identical to this file's hand-built save_start/char_i(canonicalize('a'))/save_end/match blob", () => {
     const patternVal = canonicalize("a".charCodeAt(0));
-    const w = new RegexByteWriter();
-    w.u8(0x22); // STICKY(0x20) | IGNORECASE(0x02)
-    w.u8(0x00);
-    w.u8(1);
-    w.u8(0);
-    const bodyLenPos = w.size;
-    w.u32(0);
-    const bodyStart = w.size;
-    w.u8(19);
-    w.u8(0);
-    w.u8(2); // REOP.char_i
-    w.u16(patternVal);
-    w.u8(20);
-    w.u8(0);
-    w.u8(16);
-    w.patchU32(bodyLenPos, w.size - bodyStart);
-    expect(Array.from(asm.bytes), "assemble()'s real /a/i bytecode vs the hand-built blob").toEqual(Array.from(w.toBytes()));
-  });
-
-  test("BRIDGE 2 (class): assemble()'s real bytecode for /[a-z]/i (sticky) is byte-identical to this file's hand-built save_start/range_i(caseCloseClass([a-z]))/save_end/match blob", () => {
-    const parsed = parsePattern("[a-z]", 0, false, true, false, false);
-    expect(parsed, "parse must succeed").not.toBeNull();
-    const asm = assemble(parsed!.ast, BRIDGE_FLAGS);
-    const expectedBytes = buildClassBytecode(RAW_CLASSES[0]!); // [a-z], non-negated
-    expect(Array.from(asm.bytes), "assemble()'s real /[a-z]/i bytecode vs the hand-built blob").toEqual(Array.from(expectedBytes));
+    // header: flags STICKY(0x20)|IGNORECASE(0x02) (u16), captureCount 1,
+    // registerCount 0, body length (u32); body: save_start 0, char_i,
+    // save_end 0, match
+    const body = [19, 0, 2, patternVal & 0xff, patternVal >> 8, 20, 0, 16];
+    const blob = [0x22, 0x00, 1, 0, body.length, 0, 0, 0, ...body];
+    expect(Array.from(compiled("a", "iy").bytes), "the compiler's real /a/i bytecode vs the hand-built blob").toEqual(blob);
   });
 });

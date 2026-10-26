@@ -3518,14 +3518,11 @@ test("out-of-tier constructs refuse with SC3001 and ride the survey", async () =
 });
 
 /* INC-24 P2's eight refusal keys — each needs a pin that REACHES it
- * through a real compiled program (runWasm-level; the parser-level
- * detector tests already exist in wasm-regex-disposition.test.ts).
- * The regexLit-side unicode-casefold pin doubles as the regression
- * pin for a real bug this same pass caught: regex-parser.ts's own
- * assertNoUnicodeCasefold THROWS (not returns null) if a real parse
- * with ignoreCase+isUnicode both true ever reaches char/class
- * compilation — the emitter must rule that combination out BEFORE
- * calling parsePattern with the pattern's own real flags, not after. */
+ * through a real compiled program (runWasm-level; the compiler-level
+ * key pins are in wasm-regex-disposition.test.ts). The regexLit-side
+ * unicode-casefold pin doubles as the regression pin for a bug this pass
+ * caught in the (since retired, unit E) TypeScript parser, which threw
+ * when /iu reached char/class compilation. */
 test("expr:regexLit:annexb-brace-literal refuses through a real program (des's own primary F3 witness — a{,2}, clean: no family-6 adjacency, no group-context dependency, unlike \\1 which becomes a strict backref the moment the pattern gains a group)", async () => {
   const res = await buildWasm("refused.ts", 'const re = /a{,2}/; console.log(re.test("a"));\n');
   expect(res.ok).toBe(false);
@@ -3547,11 +3544,25 @@ test("expr:regexLit:unported-unicode-property refuses through a real program", a
   expect(res.wasmSurvey).toContain("expr:regexLit:unported-unicode-property");
 });
 
-test("libCall:regex.new:modifiers refuses through a real program", async () => {
-  const res = await buildWasm("refused.ts", 'const re = new RegExp("(?i:a)"); console.log(re.test("A"));\n');
-  expect(res.ok).toBe(false);
-  if (res.ok) return;
-  expect(res.wasmSurvey).toContain("libCall:regex.new:modifiers");
+/** Unit E (lead ruling M2): a CONSTANT `new RegExp` whose texts are
+ * outside the tier no longer refuses the build — the program builds and
+ * the call throws S102's named fence Error (catchable, `code` the key),
+ * exactly what the run-time compiler throws for the same texts, so a
+ * constant `new RegExp` on a path that never runs costs nothing. Until
+ * unit E these five shapes refused as `libCall:regex.new:<key>`. */
+async function expectFenceAtCall(patternSrc: string, flagsSrc: string, key: string): Promise<void> {
+  const res = await buildWasm(
+    `fence-${key}.ts`,
+    `console.log("before");\ntry { const re = new RegExp(${patternSrc}, ${flagsSrc}); console.log(re.source); } catch (e) { const err = e as NodeJS.ErrnoException; console.log(err.name, err.message, err.code); }\nconsole.log("after");\n`,
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(hasRuntimeCompiler(readFileSync(res.binaryPath))).toBe(false);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe(`before\nError new RegExp(): '${key}' is not supported yet libCall:regex.new:${key}\nafter\n`);
+}
+
+test("libCall:regex.new:modifiers — a constant (?i:) pattern throws the named fence at the call (unit E: no longer a build refusal)", async () => {
+  await expectFenceAtCall('"(?i:a)"', '""', "modifiers");
 });
 
 /* P5 (design §7.6): THE CONSTANT-FOLDER superseded these two pins' own
@@ -3820,30 +3831,31 @@ test("§5.5(B): new RegExp('a','x') throws V8's exact message (Invalid flags), t
   );
 });
 
-test("a constant pattern's syntax error outside the three structurally-decidable reasons (a bad quantifier range) goes through the run-time compiler and throws V8's SyntaxError — it used to refuse as unclassified-syntax-error (unit P1)", async () => {
+test("a constant pattern's syntax error outside the three structurally-decidable reasons (a bad quantifier range) throws V8's SyntaxError — it used to refuse as unclassified-syntax-error, then (unit P1) compiled at run time; since unit E the one compiler folds it at build time, so the module carries no run-time compiler", async () => {
   const res = await buildWasm(
     "unclassified.ts",
     'try { new RegExp("a{2,1}"); } catch (e) { console.log(e instanceof SyntaxError, (e as Error).message); }\n',
   );
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  expect(hasRuntimeCompiler(readFileSync(res.binaryPath))).toBe(true);
+  expect(hasRuntimeCompiler(readFileSync(res.binaryPath))).toBe(false);
   const { stdout } = await runWasm(res.binaryPath);
   // Node v24.18.1
   expect(stdout.toString("utf8")).toBe("true Invalid regular expression: /a{2,1}/: numbers out of order in {} quantifier\n");
 });
 
-test("libCall:regex.new:unicode-casefold refuses through a real program (not a mis-thrown SyntaxError) — /iu together is a VALID V8 combination (new RegExp('a','iu') never throws in real Node), so this must be a POLICY refusal, never routed through the ast===null syntax-error path this pass just added (the §5.6 canonical-flags pin's own regression: 'yusmig' first misrouted here)", async () => {
-  const res = await buildWasm("refused.ts", 'const re = new RegExp("a", "iu"); console.log(re.test("A"));\n');
-  expect(res.ok).toBe(false);
-  if (res.ok) return;
-  expect(res.wasmSurvey).toContain("libCall:regex.new:unicode-casefold");
+test("libCall:regex.new:unicode-casefold — /iu together is a VALID V8 combination (new RegExp('a','iu') never throws in real Node), so it is the POLICY fence, never a mis-thrown SyntaxError; thrown at the call since unit E", async () => {
+  await expectFenceAtCall('"a"', '"iu"', "unicode-casefold");
 });
 
-test("libCall:regex.new:annexb-brace-literal refuses through a real program — des's own primary F3 witness, via new RegExp", async () => {
-  const res = await buildWasm("refused.ts", 'const re = new RegExp("a{,2}"); console.log(re.test("a"));\n');
-  expect(res.ok).toBe(false);
-  if (res.ok) return;
-  expect(res.wasmSurvey).toContain("libCall:regex.new:annexb-brace-literal");
+test("libCall:regex.new:annexb-brace-literal — des's own primary F3 witness, via new RegExp; thrown at the call since unit E", async () => {
+  await expectFenceAtCall('"a{,2}"', '""', "annexb-brace-literal");
+});
+
+test("unit E review M2: a constant fenced `new RegExp` in a function that never runs does not cost the build (main built and ran it)", async () => {
+  const res = await buildWasm("never.ts", 'function never(): RegExp { return new RegExp("a{25,5"); }\nconst flags: number[] = [];\nif (flags.length > 0) console.log(never().source);\nconsole.log("hi");\n');
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("hi\n");
 });
 
 test("family-6-outside-a-class CONSTRUCTS via regex.new (INC-24 P5's own Annex-B slice, both surfaces) — 2284's OWN specific escape shape (\\- outside a character class, lenient IdentityEscape), byte-exact against Node. This SUPERSEDES an earlier draft of this pin, which asserted this exact source REFUSED as annexb before the shared classifyRegexLitRefusal gate was narrowed to BOTH surfaces (design-regex-v6-errata-1.txt item 4) — the flip from refuse to construct is the INTENDED effect of landing the slice, not a regression: the equivalent LITERAL (/\\-\\-\\-\\-\\-BEGIN X\\-\\-\\-\\-\\-/) now ALSO constructs (see the regexLit-side pin), dissolving the asymmetry rather than documenting it, per team-lead's own explicit correction", async () => {
@@ -3870,11 +3882,8 @@ test("family-6-outside-a-class CONSTRUCTS via a regex LITERAL too (both surfaces
   expect(stdout.toString("utf8")).toBe("true false\n");
 });
 
-test("libCall:regex.new:unicode-sets-flag refuses (never miscompiles) — /v is a LEGAL V8 flag (no throw in real Node), but this tier builds no /v-mode regex yet", async () => {
-  const res = await buildWasm("refused.ts", 'const re = new RegExp("a", "v"); console.log(re.test("a"));\n');
-  expect(res.ok).toBe(false);
-  if (res.ok) return;
-  expect(res.wasmSurvey).toContain("libCall:regex.new:unicode-sets-flag");
+test("libCall:regex.new:unicode-sets-flag (never miscompiles) — /v is a LEGAL V8 flag (no throw in real Node), but this tier builds no /v-mode regex yet; thrown at the call since unit E", async () => {
+  await expectFenceAtCall('"a"', '"v"', "unicode-sets-flag");
 });
 
 test("libCall:regexp.escape — the GENERAL RUNTIME case (a genuinely dynamic string, array-indexed at runtime, never foldable) matches Node's own RegExp.escape byte-exact across the full classification: leading-alnum \\xHH, SyntaxCharacters, the ControlEscape five, hex-escaped punctuators/whitespace both <0x100 and >=0x100, an astral code point passed through unsplit even as the string's own first character, and plain pass-through — the SAME classification foldRegexArg's compile-time regexp.escape branch already pins at fold time, now proven through %w.re.escape's own wasm-instruction reimplementation (the one-pass upper-bound-scratch construction, casing.ts's own toLower/toUpper shape). Regression pin for a real bug this pin's own first run caught: every escape arm's br(0) exited only the immediately-enclosing `if`, not the outer UNIT dispatch block, so every escaped character ALSO fell through to the unconditional pass-through arm and got duplicated ('a.b' came out '\\x61a\\..b') — fixed to br(1) (an `if` is itself one branch-target level, so exiting UNIT from directly inside one needs the next label out)", async () => {
@@ -3992,11 +4001,8 @@ test("§4 covered-by-construction, test() variant (2284's own method): a hand-bu
   expect(stdout.toString("utf8")).toBe("before\n");
 });
 
-test("libCall:regex.new:unported-unicode-property refuses through a real program", async () => {
-  const res = await buildWasm("refused.ts", 'const re = new RegExp("\\\\p{Script=Greek}", "u"); console.log(re.test("α"));\n');
-  expect(res.ok).toBe(false);
-  if (res.ok) return;
-  expect(res.wasmSurvey).toContain("libCall:regex.new:unported-unicode-property");
+test("libCall:regex.new:unported-unicode-property — thrown at the call since unit E", async () => {
+  await expectFenceAtCall('"\\\\p{Script=Greek}"', '"u"', "unported-unicode-property");
 });
 
 test("classes: a type family that references itself in every direction", async () => {

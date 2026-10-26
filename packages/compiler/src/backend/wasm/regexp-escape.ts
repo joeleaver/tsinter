@@ -12,15 +12,12 @@
  * or an equivalent code-point walk, never a naive UTF-16 loop, for the
  * same reason.
  *
- * NAMED "regexp-escape.ts", not "regex-escape.ts" — that name is ALREADY
- * TAKEN by P1's own lre_parse_escape port (a pattern-escape-sequence
- * parser, \n \t \xHH \uHHHH inside a regex literal — a completely
- * different algorithm serving get_class_atom/regex-charclass.ts). A
- * first attempt at this file used the taken name and silently overwrote
- * it; caught immediately by the next build's own two import errors
- * (regex-charclass.ts and regex-parser.ts both import parseEscape from
- * it), recovered via `git checkout` before anything else touched it.
- * Named distinctly here so the collision cannot repeat.
+ * NAMED "regexp-escape.ts", not "regex-escape.ts": that name belonged to
+ * P1's TypeScript lre_parse_escape port (a pattern-escape-sequence parser,
+ * a completely different algorithm), retired with the rest of the
+ * TypeScript regex pipeline in unit E — the regex compiler's own
+ * fParseEscape (regex-compiler.ts) is its successor. Kept distinct so
+ * the two algorithms are never confused.
  *
  * TWO CALL SITES, ONE ALGORITHM (§7.6's own "not a second algorithm"
  * requirement): this pure function is called (a) at COMPILE TIME by the

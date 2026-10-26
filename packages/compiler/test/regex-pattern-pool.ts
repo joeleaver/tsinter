@@ -1,9 +1,10 @@
 /* Unit P1: the (pattern, flags) pool the run-time compiler's gate runs —
  * every claim pattern, the generated grammar corpus, every regex literal
- * and `new RegExp(<string literal>)` in tests/corpus, every pattern string
- * the regex unit tests feed the parser or the oracle, and seeded mutations
- * of all of those (insert / delete / duplicate / replace a character, and
- * random flag strings, legal and not). Deterministic: one seed, one pool. */
+ * and `new RegExp(<string literal>)` in tests/corpus, the pattern fixtures
+ * of the retired TypeScript pipeline's unit tests (frozen in
+ * fixtures/regex/unit-test-patterns.json), and seeded mutations of all of
+ * those (insert / delete / duplicate / replace a character, and random flag
+ * strings, legal and not). Deterministic: one seed, one pool. */
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import ts from "typescript5";
@@ -30,7 +31,7 @@ function walkFiles(dir: string, out: string[]): void {
 
 /** Regex literals and `new RegExp("…", "…")` / `RegExp("…")` string-literal
  * arguments in a source file. */
-function scrapeSource(text: string, file: string, out: Map<string, PoolRow>, origin: PoolRow["origin"], fixtureMode: boolean): void {
+function scrapeSource(text: string, file: string, out: Map<string, PoolRow>, origin: PoolRow["origin"]): void {
   const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
   const add = (pattern: string, flags: string): void => {
     out.set(JSON.stringify([pattern, flags]), { pattern, flags, origin });
@@ -45,28 +46,6 @@ function scrapeSource(text: string, file: string, out: Map<string, PoolRow>, ori
     } else if ((ts.isNewExpression(n) || ts.isCallExpression(n)) && ts.isIdentifier(n.expression) && n.expression.text === "RegExp") {
       const p = strOf(n.arguments?.[0]);
       if (p !== null) add(p, strOf(n.arguments?.[1]) ?? "");
-    } else if (fixtureMode) {
-      // the unit tests' own pattern fixtures: `pattern: "…"` properties
-      // (with a sibling `flags` / boolean flags when present) and the
-      // first string argument of a parse / compile helper.
-      if (ts.isObjectLiteralExpression(n)) {
-        let pattern: string | null = null;
-        let flags = "";
-        for (const prop of n.properties) {
-          if (!ts.isPropertyAssignment(prop) || !ts.isIdentifier(prop.name)) continue;
-          const k = prop.name.text;
-          if (k === "pattern") pattern = strOf(prop.initializer);
-          else if (k === "flags") flags = strOf(prop.initializer) ?? flags;
-          else if (prop.initializer.kind === ts.SyntaxKind.TrueKeyword) {
-            const letter = { unicode: "u", ignoreCase: "i", multiLine: "m", multiline: "m", dotAll: "s", sticky: "y", global: "g" }[k];
-            if (letter !== undefined) flags += letter;
-          }
-        }
-        if (pattern !== null) add(pattern, flags);
-      } else if (ts.isCallExpression(n) && ts.isIdentifier(n.expression) && /^(parsePattern|parseOrThrow|asm|assembleOf|compile|lre|parse|bytesOf|verdict)/.test(n.expression.text)) {
-        const p = strOf(n.arguments[0]);
-        if (p !== null) add(p, "");
-      }
     }
     ts.forEachChild(n, visit);
   };
@@ -157,19 +136,19 @@ export function patternPool(mutations = 30000, seed = 0x5eed1): PoolRow[] {
   }
   const corpusFiles: string[] = [];
   walkFiles(join(REPO, "tests", "corpus"), corpusFiles);
-  for (const f of corpusFiles) scrapeSource(readFileSync(f, "utf8"), f, out, "corpus", false);
+  for (const f of corpusFiles) scrapeSource(readFileSync(f, "utf8"), f, out, "corpus");
   for (const [pattern, flags] of TARGETED) {
     const k = JSON.stringify([pattern, flags]);
     if (!out.has(k)) out.set(k, { pattern, flags, origin: "targeted" });
   }
-  const testDir = join(REPO, "packages", "compiler", "test");
-  for (const name of readdirSync(testDir)) {
-    if (!/^wasm-regex-.*\.test\.ts$/.test(name) || name === "wasm-regex-runtime-compiler.test.ts") continue;
-    const f = join(testDir, name);
-    const before = new Map(out);
-    const found = new Map<string, PoolRow>();
-    scrapeSource(readFileSync(f, "utf8"), f, found, "fixture", true);
-    for (const [k, v] of found) if (!before.has(k)) out.set(k, v);
+  // The pattern fixtures of the regex unit tests, frozen when the
+  // TypeScript pipeline's own tests (parser, assembler, char class,
+  // escape, closure, disposition) were retired with it (unit E): the rows
+  // the old scrape of test/wasm-regex-*.test.ts added, in its order.
+  const fixtures = JSON.parse(readFileSync(join(HERE, "fixtures", "regex", "unit-test-patterns.json"), "utf8")) as [string, string][];
+  for (const [pattern, flags] of fixtures) {
+    const k = JSON.stringify([pattern, flags]);
+    if (!out.has(k)) out.set(k, { pattern, flags, origin: "fixture" });
   }
   const bases = [...out.values()];
   const rnd = mulberry32(seed);

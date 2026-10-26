@@ -1,16 +1,29 @@
-/* Unit P1: a standalone module holding ONLY the run-time RegExp compiler
- * (regex-compiler.ts) and the regex value it builds, instantiated in this
- * process, so a test can call `compileViaWasm(pattern, flags)` with the
- * same signature the build-time pipeline's foldRegexNew has and compare
- * the two outcome for outcome. Built once per process. */
-import { A, Fn, I32, type X } from "../src/backend/wasm/asm.js";
-import { ModuleBuilder, type ValType } from "../src/backend/wasm/module.js";
-import { RegexCompilerBuilder } from "../src/backend/wasm/regex-compiler.js";
-import { RX, RX_FENCE_KEY } from "../src/backend/wasm/regex-compiler-tables.js";
-import { RegexInterpreterBuilder } from "../src/backend/wasm/regex-interpreter.js";
-import { RegexBuilder } from "../src/backend/wasm/regex-value.js";
+/* The ONE RegExp compiler, run at build time (follow-up unit E, "P2").
+ *
+ * The run-time compiler (regex-compiler.ts, `%w.rec.compile`) is the only
+ * regex compiler this backend has. A regex literal, the sticky clone a
+ * literal `.split()` receiver needs, and a `new RegExp(p, f)` whose texts
+ * fold at build time all get their bytecode (or their SyntaxError, or
+ * their named fence) by RUNNING that same emitted function here, in the
+ * compiler's own process: a standalone module holding only the compiler
+ * and the regex value it builds is emitted by the same builders the
+ * output module uses, instantiated once per process through the host's
+ * WebAssembly (WasmGC), and called per pattern. What a program embeds for
+ * a constant pattern is therefore exactly what it would compute for the
+ * same texts at run time; there is no second code base to drift.
+ *
+ * The outcome is data: the regex value's fields (source, canonical flags,
+ * bytecode, capture count, group names), a V8 SyntaxError message (the
+ * compiler's own errMessage text), or a fence key (SEMANTICS.md S102).
+ * Results are memoized per (pattern, flags). */
+import { A, Fn, I32, type X } from "./asm.js";
+import { ModuleBuilder, type ValType } from "./module.js";
+import { RegexCompilerBuilder } from "./regex-compiler.js";
+import { RX, RX_FENCE_KEY } from "./regex-compiler-tables.js";
+import { RegexInterpreterBuilder } from "./regex-interpreter.js";
+import { RegexBuilder } from "./regex-value.js";
 
-export type RuntimeOutcome =
+export type RegexCompileOutcome =
   | { kind: "ok"; source: string; flags: string; bytes: Uint8Array; captureCount: number; groupNames: string[] | null }
   | { kind: "syntax"; message: string }
   | { kind: "fence"; key: string; message: string; code: string };
@@ -36,9 +49,10 @@ interface Exports {
 }
 
 let instance: Exports | null = null;
+const memo = new Map<string, RegexCompileOutcome>();
 
-/** The module's size in bytes, for the size note. */
-export let runtimeModuleBytes = 0;
+/** The standalone compiler module's size in bytes (0 until first use). */
+export let regexCompilerModuleBytes = 0;
 
 function build(): Exports {
   const mb = new ModuleBuilder();
@@ -47,19 +61,15 @@ function build(): Exports {
   const interp = new RegexInterpreterBuilder(mb, strT, undefined, re.bcType);
   const rc = new RegexCompilerBuilder(mb, strT, re, () => interp.regexCanonicalize());
   const ref = (t: number): ValType => ({ kind: "ref", nullable: true, typeIndex: t });
-  const def = (name: string, params: ValType[], results: ValType[], body: ($: A) => void): void => {
+  const d = (name: string, params: ValType[], results: ValType[], body: ($: A, p: (i: number) => X) => X | void): void => {
     const idx = mb.declareFunc(mb.funcType(params, results), name);
     const f = new Fn(params.length);
     const $ = new A(f);
-    body($);
+    const v = body($, (i) => $.l(i));
+    if (v) v();
     mb.setBody(idx, f.locals, f.c.bytes());
     mb.exportFunc(name, idx);
   };
-  const d = (name: string, params: ValType[], results: ValType[], body: ($: A, p: (i: number) => X) => X | void): void =>
-    def(name, params, results, ($) => {
-      const v = body($, (i) => $.l(i));
-      if (v) v();
-    });
   d("strNew", [I32], [ref(strT)], ($, p) => $.anew(strT, p(0)));
   d("strSet", [ref(strT), I32, I32], [], ($, p) => $.aset(strT, p(0), p(1), p(2)));
   d("strLen", [ref(strT)], [I32], ($, p) => $.alen(p(0)));
@@ -79,14 +89,11 @@ function build(): Exports {
   d("reNamesLen", [R], [I32], ($, p) => $.sel(I32, $.isNull($.get(re.regexType, 4, p(0))), $.i(-1), $.alen($.get(re.regexType, 4, p(0)))));
   d("reName", [R, I32], [ref(strT)], ($, p) => $.aget(re.strArrType, $.get(re.regexType, 4, p(0)), p(1)));
   const bytes = mb.emit();
-  runtimeModuleBytes = bytes.length;
-  const mod = new WebAssembly.Module(bytes);
-  return new WebAssembly.Instance(mod, {}).exports as unknown as Exports;
-}
-
-function exportsOf(): Exports {
-  instance ??= build();
-  return instance;
+  regexCompilerModuleBytes = bytes.length;
+  // The host's WebAssembly (this package's lib is ES-only, so its shape is
+  // spelled out here rather than taken from DOM typings).
+  const WA = (globalThis as unknown as { WebAssembly: { Module: new (b: Uint8Array) => object; Instance: new (m: object, i: object) => { exports: unknown } } }).WebAssembly;
+  return new WA.Instance(new WA.Module(bytes), {}).exports as Exports;
 }
 
 function toWasm(x: Exports, s: string): unknown {
@@ -102,9 +109,22 @@ function fromWasm(x: Exports, w: unknown): string {
   return out;
 }
 
-/** The run-time compiler over (pattern, flags), as data. */
-export function compileViaWasm(pattern: string, flags: string): RuntimeOutcome {
-  const x = exportsOf();
+/** A host without WasmGC (or any other failure to build the module) is
+ * remembered, so every later call fails fast; callers turn the throw into
+ * a named refusal (regex-fold.ts). */
+let buildError: unknown = null;
+
+function run(pattern: string, flags: string): RegexCompileOutcome {
+  if (buildError !== null) throw buildError;
+  if (instance === null) {
+    try {
+      instance = build();
+    } catch (e) {
+      buildError = e;
+      throw e;
+    }
+  }
+  const x = instance;
   const r = x.compile(toWasm(x, pattern), toWasm(x, flags));
   if (!x.isNull(r)) {
     const n = x.reBcLen(r);
@@ -117,6 +137,17 @@ export function compileViaWasm(pattern: string, flags: string): RuntimeOutcome {
   const id = x.errId();
   const message = fromWasm(x, x.errMessage());
   if (x.errKind() === 1) return { kind: "syntax", message };
-  if (id < RX.FENCE_BASE) throw new Error(`regex-runtime-harness: unexpected kind for id ${id}`);
+  if (id < RX.FENCE_BASE) throw new Error(`regex-buildtime: outcome id ${id} is neither a SyntaxError nor a fence`);
   return { kind: "fence", key: RX_FENCE_KEY[id - RX.FENCE_BASE]!, message, code: fromWasm(x, x.errCode()) };
+}
+
+/** The run-time compiler's outcome over (pattern, flags), as data. */
+export function compileRegex(pattern: string, flags: string): RegexCompileOutcome {
+  const key = JSON.stringify([pattern, flags]);
+  let hit = memo.get(key);
+  if (hit === undefined) {
+    hit = run(pattern, flags);
+    memo.set(key, hit);
+  }
+  return hit;
 }

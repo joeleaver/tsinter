@@ -1,28 +1,30 @@
-/* Unit P1 — the run-time RegExp compiler's gate (regex-compiler.ts).
+/* The ONE RegExp compiler's gate (regex-compiler.ts; unit P1, and since
+ * unit E the only regex compiler: build time runs it too, through
+ * regex-buildtime.ts).
  *
- * The cross-check that would let the build-time TypeScript pipeline be
- * retired (P2): over every pattern in regex-pattern-pool.ts (claims,
- * generated grammar, every corpus literal, every regex unit-test fixture,
- * and seeded mutations), the run-time compiler (compileViaWasm), the
- * build-time pipeline (foldRegexNew — the emitter's own regex.new
- * decision sequence) and libregexp's lre_compile (regex-lre-oracle.ts),
- * and Node's own `new RegExp` as the oracle of record.
+ * Over every pattern in regex-pattern-pool.ts (claims, generated grammar,
+ * every corpus literal, the retired unit tests' fixtures, and seeded
+ * mutations), the compiler's outcome is checked against Node's own
+ * `new RegExp` (the oracle of record) and, where it accepts, against
+ * libregexp's lre_compile (regex-lre-oracle.ts) byte for byte.
  *
- * Per pattern, the run-time outcome must be one of:
+ * Per pattern, the outcome must be one of:
  *   - accepted: Node accepts with the same .source and .flags, and the
- *     bytecode (header, body, named-group trailer), capture count and
- *     group names equal the build-time pipeline's — and lre_compile's,
- *     except on the rows listed in LRE_DIFF below;
+ *     bytecode (header, body, named-group trailer) equals lre_compile's,
+ *     except on the known-difference rows (knownLreDiff below);
  *   - a SyntaxError: Node throws a SyntaxError with the identical message;
  *   - a named fence (SEMANTICS.md S102): counted by key, so fence growth
  *     shows up in the report.
- * Zero "accepted where Node throws", zero wrong messages, zero byte
- * differences against the build-time pipeline where both accept. */
+ * Zero "accepted where Node throws", zero wrong messages.
+ *
+ * Then the build-time mapping (regex-fold.ts) over the same pool: a
+ * `new RegExp` folds to exactly the compiler's outcome, and a literal is
+ * built only where Node accepts. */
 import { describe, expect, test } from "vitest";
-import { foldRegexNew, type RegexFoldOutcome } from "../src/backend/wasm/regex-fold.js";
+import { compileRegex, type RegexCompileOutcome } from "../src/backend/wasm/regex-buildtime.js";
+import { foldRegexLiteral, foldRegexNew } from "../src/backend/wasm/regex-fold.js";
 import { lreCompileBatch } from "./regex-lre-oracle.js";
 import { patternPool, type PoolRow } from "./regex-pattern-pool.js";
-import { compileViaWasm, type RuntimeOutcome } from "./regex-runtime-harness.js";
 
 type NodeOutcome = { kind: "ok"; source: string; flags: string } | { kind: "throw"; name: string; message: string };
 
@@ -32,14 +34,6 @@ function nodeOf(p: string, f: string): NodeOutcome {
     return { kind: "ok", source: r.source, flags: r.flags };
   } catch (e) {
     return { kind: "throw", name: (e as Error).name, message: (e as Error).message };
-  }
-}
-
-function tsOf(p: string, f: string): RegexFoldOutcome | { kind: "crash"; message: string } {
-  try {
-    return foldRegexNew(p, f);
-  } catch (e) {
-    return { kind: "crash", message: String(e) };
   }
 }
 
@@ -55,18 +49,15 @@ interface Report {
   sourceOrFlagsDiffer: string[];
   wrongMessage: string[];
   syntaxNodeAccepts: string[];
-  bytesDifferTs: string[];
-  /** recorded differences */
-  tsRefusesRtAccepts: string[];
-  tsAcceptsNodeThrows: string[];
-  fenceWhereTsBuilds: string[];
+  foldMismatch: string[];
+  literalBuiltNodeThrows: string[];
+  /** recorded */
   lreCompared: number;
   lreDiff: string[];
   lreDiffUnknown: string[];
   lreDiffKinds: Map<string, number>;
   lreErr: string[];
   lreSkipped: number;
-  tsDeferred: number;
   lreErrDupNames: number;
 }
 
@@ -80,27 +71,32 @@ function runGate(rows: readonly PoolRow[]): Report {
     sourceOrFlagsDiffer: [],
     wrongMessage: [],
     syntaxNodeAccepts: [],
-    bytesDifferTs: [],
-    tsRefusesRtAccepts: [],
-    tsAcceptsNodeThrows: [],
-    fenceWhereTsBuilds: [],
+    foldMismatch: [],
+    literalBuiltNodeThrows: [],
     lreCompared: 0,
     lreDiff: [],
     lreDiffUnknown: [],
     lreDiffKinds: new Map(),
     lreErr: [],
     lreSkipped: 0,
-    tsDeferred: 0,
     lreErrDupNames: 0,
   };
   const forLre: { pattern: string; flags: string; bytes: Uint8Array; tag: string }[] = [];
   for (const row of rows) {
     const { pattern: p, flags: f } = row;
     const tag = `${JSON.stringify(p)} /${f}/ (${row.origin})`;
-    const rt: RuntimeOutcome = compileViaWasm(p, f);
+    const rt: RegexCompileOutcome = compileRegex(p, f);
     const node = nodeOf(p, f);
-    const tsr = tsOf(p, f);
-    if (tsr.kind === "ok" && node.kind === "throw") rep.tsAcceptsNodeThrows.push(`${tag}: ${node.message}`);
+    // the build-time mapping: regex.new folds to the outcome itself; a
+    // literal builds only what the compiler accepts
+    const nw = foldRegexNew(p, f);
+    const expectNew = rt; // a fence too: thrown at the call, never a build refusal
+    if (JSON.stringify(nw, (_, v) => (v instanceof Uint8Array ? hex(v) : v)) !== JSON.stringify(expectNew, (_, v) => (v instanceof Uint8Array ? hex(v) : v))) {
+      rep.foldMismatch.push(`${tag}: new ${JSON.stringify(nw).slice(0, 120)}`);
+    }
+    const lit = foldRegexLiteral(p, f);
+    if (lit.kind === "ok" && node.kind === "throw") rep.literalBuiltNodeThrows.push(`${tag}: ${node.message}`);
+    if ((lit.kind === "ok") !== (rt.kind === "ok")) rep.foldMismatch.push(`${tag}: literal ${lit.kind} / compiler ${rt.kind}`);
     if (rt.kind === "ok") {
       rep.accepted++;
       if (node.kind !== "ok") {
@@ -108,19 +104,6 @@ function runGate(rows: readonly PoolRow[]): Report {
         continue;
       }
       if (node.source !== rt.source || node.flags !== rt.flags) rep.sourceOrFlagsDiffer.push(`${tag}: node ${node.source} ${node.flags} / rt ${rt.source} ${rt.flags}`);
-      if (tsr.kind === "ok") {
-        const same =
-          hex(tsr.bytes) === hex(rt.bytes) &&
-          tsr.captureCount === rt.captureCount &&
-          JSON.stringify(tsr.groupNames) === JSON.stringify(rt.groupNames) &&
-          tsr.source === rt.source &&
-          tsr.flags === rt.flags;
-        if (!same) rep.bytesDifferTs.push(`${tag}: ts ${hex(tsr.bytes)} ${tsr.source} / rt ${hex(rt.bytes)} ${rt.source}`);
-      } else if (tsr.kind === "runtime") {
-        rep.tsDeferred++; // the build time hands these texts to this compiler
-      } else {
-        rep.tsRefusesRtAccepts.push(`${tag}: ts ${JSON.stringify(tsr)}`);
-      }
       // The oracle feeds lre_compile TSV rows, and a /u row as UTF-8,
       // where a lone surrogate becomes U+FFFD: rows it cannot carry.
       if (/[\t\n\r\0]/.test(p) || (f.includes("u") && [...p].some((ch) => ch.length === 1 && ch >= "\ud800" && ch <= "\udfff"))) rep.lreSkipped++;
@@ -131,7 +114,6 @@ function runGate(rows: readonly PoolRow[]): Report {
       else if (node.name !== "SyntaxError" || node.message !== rt.message) rep.wrongMessage.push(`${tag}: node ${node.message} / rt ${rt.message}`);
     } else {
       rep.fences.set(rt.key, (rep.fences.get(rt.key) ?? 0) + 1);
-      if (tsr.kind === "ok" && node.kind === "ok") rep.fenceWhereTsBuilds.push(`${tag}: ${rt.key}`);
     }
   }
   const lre = lreCompileBatch(forLre);
@@ -158,14 +140,15 @@ function runGate(rows: readonly PoolRow[]): Report {
   return rep;
 }
 
-/** The two places the build-time pipeline (and so this compiler, which
- * follows it) emits different bytes from lre_compile, both pre-existing:
+/** The two places this compiler emits different bytes from lre_compile
+ * (inherited from the retired TypeScript pipeline it was transcribed
+ * from), with equal match results:
  *   - a `{0,N}` / `{1,N}` bound at or past 2^31-1 (parse_digits clamps it to
  *     INT32_MAX, which lre_compile then reads as "unbounded" and compiles
- *     as `*` / `+`; regex-assembler.ts keeps it a finite count);
+ *     as `*` / `+`; this compiler keeps it a finite count);
  *   - `\k<name>` when groups of that name sit both before and after it
  *     (lre_compile's find_group_name lists only the ones already parsed;
- *     regex-parser.ts's scanCaptures lists all of them).
+ *     this compiler lists all of them).
  * Any other difference is a failure. */
 export function knownLreDiff(p: string): string | null {
   for (const m of p.matchAll(/\{(\d+)(,(\d*))?\}/g)) {
@@ -189,7 +172,6 @@ function summary(rep: Report): string {
     `patterns ${rep.total}: accepted ${rep.accepted}, SyntaxError ${rep.syntax}, fenced ${[...rep.fences.values()].reduce((a, b) => a + b, 0)}`,
     `fences by key: ${JSON.stringify(Object.fromEntries([...rep.fences].sort()))}`,
     `lre_compile compared ${rep.lreCompared}, differ ${rep.lreDiff.length} ${JSON.stringify(Object.fromEntries(rep.lreDiffKinds))}, lre ERR ${rep.lreErr.length} (+${rep.lreErrDupNames} duplicate-name patterns libregexp rejects), skipped (control characters, or a lone surrogate under /u) ${rep.lreSkipped}`,
-    `ts defers to the run-time compiler and it accepts ${rep.tsDeferred}; ts refuses / rt accepts ${rep.tsRefusesRtAccepts.length}; ts accepts / Node throws ${rep.tsAcceptsNodeThrows.length}; fence where ts builds ${rep.fenceWhereTsBuilds.length}`,
   ];
   const sample = (name: string, xs: string[]): void => {
     if (xs.length > 0) lines.push(`${name} (${xs.length}):\n  ${xs.slice(0, 40).map((x) => x.slice(0, 300)).join("\n  ")}`);
@@ -198,17 +180,15 @@ function summary(rep: Report): string {
   sample("HARD source/flags differ", rep.sourceOrFlagsDiffer);
   sample("HARD wrong message", rep.wrongMessage);
   sample("HARD SyntaxError where Node accepts", rep.syntaxNodeAccepts);
-  sample("HARD bytes differ from the build-time pipeline", rep.bytesDifferTs);
-  sample("ts refuses, rt accepts", rep.tsRefusesRtAccepts);
-  sample("ts accepts, Node throws", rep.tsAcceptsNodeThrows);
-  sample("fence where ts builds", rep.fenceWhereTsBuilds);
-  sample("HARD lre differs, not a known pipeline difference", rep.lreDiffUnknown);
+  sample("HARD build-time mapping differs from the compiler", rep.foldMismatch);
+  sample("HARD literal built where Node throws", rep.literalBuiltNodeThrows);
+  sample("HARD lre differs, not a known difference", rep.lreDiffUnknown);
   sample("lre ERR", rep.lreErr);
   return lines.join("\n");
 }
 
-describe("run-time RegExp compiler gate", () => {
-  test("byte, verdict and message parity over the whole pool", () => {
+describe("the one RegExp compiler's gate", () => {
+  test("verdict, message and byte parity over the whole pool", () => {
     // REGEX_GATE_MUTATIONS / REGEX_GATE_SEED widen the sweep by hand
     // (exploration); the default is the gate of record.
     const rows = patternPool(Number(process.env["REGEX_GATE_MUTATIONS"] ?? 30000), Number(process.env["REGEX_GATE_SEED"] ?? 0x5eed1));
@@ -219,12 +199,11 @@ describe("run-time RegExp compiler gate", () => {
     expect(rep.sourceOrFlagsDiffer).toEqual([]);
     expect(rep.wrongMessage).toEqual([]);
     expect(rep.syntaxNodeAccepts).toEqual([]);
-    expect(rep.bytesDifferTs).toEqual([]);
+    expect(rep.foldMismatch).toEqual([]);
+    // #264: the build time never builds a pattern Node rejects (it used to
+    // for some duplicate group names and `\k` inside a class)
+    expect(rep.literalBuiltNodeThrows).toEqual([]);
     expect(rep.lreDiffUnknown).toEqual([]);
-    // The build-time pipeline never builds a regex Node rejects: the two
-    // classes it used to (a duplicate group name V8 rejects; `\k` inside a
-    // class when the pattern has named groups) now defer to this compiler.
-    expect(rep.tsAcceptsNodeThrows).toEqual([]);
     expect(rep.lreErr).toEqual([]);
   }, 1_200_000);
 });

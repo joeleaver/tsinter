@@ -1,16 +1,16 @@
-/* Unit P1 (runtime RegExp compiler): the build-time tables the wasm-emitted
- * compiler (regex-compiler.ts) embeds, and the outcome vocabulary it shares
- * with the build-time pipeline (regex-fold.ts).
+/* Unit P1 (the RegExp compiler): the tables the wasm-emitted compiler
+ * (regex-compiler.ts) embeds, the class tables the interpreter shares with
+ * it, and the outcome vocabulary (V8 SyntaxError texts, fence keys) its
+ * callers read.
  *
- * Every table here is DERIVED, at compiler-process time, from the same
- * primitive the build-time TypeScript pipeline already uses, so the two
- * compilers cannot drift apart on data:
+ * Every derived table is computed, at compiler-process time, from a
+ * primitive that holds the data once:
  *   - the identifier tables come from regex-ident.ts's isIdentFirst /
  *     isIdentNext (Node's own \p{ID_Start} / \p{ID_Continue});
  *   - the case-closure table comes from regex-canon.ts's canonicalize (the
  *     measured-Node-exact non-unicode Canonicalize);
  *   - the General_Category alias list comes from regex-unicode-tables.ts's
- *     GC_NAME_ROWS (the same rows regex-charclass.ts resolves).
+ *     GC_NAME_ROWS.
  * Each is computed once per process, on first use. */
 import { canonicalize } from "./regex-canon.js";
 import { isIdentFirst, isIdentNext } from "./regex-ident.js";
@@ -146,6 +146,79 @@ export function fenceMessage(key: string): string {
 export function fenceCode(key: string): string {
   return `libCall:regex.new:${key}`;
 }
+
+/* ── class tables ───────────────────────────────────────────────────── */
+
+/** A set of code points as sorted [start, end) boundary pairs (libunicode's
+ * CharRange). */
+export type CharRange = readonly number[];
+
+/** cr_invert (libunicode.c:522): a 0 boundary in front and the 0xffffffff
+ * sentinel behind, then empty intervals dropped (cr_compress's job on this
+ * input: only a leading [0, 0) or trailing [x, x) can be empty). */
+function crInvert(cr: CharRange): CharRange {
+  const pts = [0, ...cr, 0xffffffff];
+  const out: number[] = [];
+  for (let i = 0; i < pts.length; i += 2) if (pts[i] !== pts[i + 1]) out.push(pts[i]!, pts[i + 1]!);
+  return out;
+}
+
+/* \d \s \w (libregexp.c:404-433 char_range_table); the uppercase forms are
+ * cr_invert of the lowercase ones, as cr_init_char_range computes them. */
+const CHAR_RANGE_D: CharRange = [0x0030, 0x003a];
+const CHAR_RANGE_S: CharRange = [
+  0x0009, 0x000e, 0x0020, 0x0021, 0x00a0, 0x00a1, 0x1680, 0x1681, 0x2000, 0x200b, 0x2028, 0x202a, 0x202f, 0x2030,
+  0x205f, 0x2060, 0x3000, 0x3001, 0xfeff, 0xff00,
+];
+const CHAR_RANGE_W: CharRange = [0x0030, 0x003a, 0x0041, 0x005b, 0x005f, 0x0060, 0x0061, 0x007b];
+
+export type DsWClass = "d" | "D" | "s" | "S" | "w" | "W";
+
+/** cr_init_char_range (libregexp.c:452): \d\D\s\S\w\W as CharRanges. */
+export function classRangeDSW(cls: DsWClass): CharRange {
+  switch (cls) {
+    case "d":
+      return CHAR_RANGE_D;
+    case "D":
+      return crInvert(CHAR_RANGE_D);
+    case "s":
+      return CHAR_RANGE_S;
+    case "S":
+      return crInvert(CHAR_RANGE_S);
+    case "w":
+      return CHAR_RANGE_W;
+    case "W":
+      return crInvert(CHAR_RANGE_W);
+  }
+}
+
+/* General_Category masks (libunicode.c unicode_gc_mask_table): every alias
+ * of every GC_NAME_ROWS row resolves to its row index; rows up to Co are
+ * the 30 single-bit categories, the 8 after them composites. */
+const GC_IDX: Readonly<Record<string, number>> = Object.fromEntries(
+  GC_NAME_ROWS.flatMap((row, i) => row.split(",").map((alias) => [alias, i] as const)),
+);
+const GC_CO_IDX = GC_IDX["Co"]!;
+const GC_LC_IDX = GC_IDX["LC"]!;
+const gcBit = (shortName: string): number => 1 << GC_IDX[shortName]!;
+const GC_COMPOSITE_MASK: readonly number[] = [
+  gcBit("Lu") | gcBit("Ll") | gcBit("Lt"), // LC
+  gcBit("Lu") | gcBit("Ll") | gcBit("Lt") | gcBit("Lm") | gcBit("Lo"), // L
+  gcBit("Mn") | gcBit("Mc") | gcBit("Me"), // M
+  gcBit("Nd") | gcBit("Nl") | gcBit("No"), // N
+  gcBit("Sm") | gcBit("Sc") | gcBit("Sk") | gcBit("So"), // S
+  gcBit("Pc") | gcBit("Pd") | gcBit("Ps") | gcBit("Pe") | gcBit("Pi") | gcBit("Pf") | gcBit("Po"), // P
+  gcBit("Zs") | gcBit("Zl") | gcBit("Zp"), // Z
+  gcBit("Cc") | gcBit("Cf") | gcBit("Cs") | gcBit("Co") | gcBit("Cn"), // C
+];
+
+/** The category mask a GC_NAME_ROWS row resolves to. */
+export function gcRowMask(row: number): number {
+  return row <= GC_CO_IDX ? 1 << row : GC_COMPOSITE_MASK[row - GC_LC_IDX]!;
+}
+/** The Lu / Ll bits GC_TABLE's alternating-run marker decodes into. */
+export const GC_LU_BIT = gcBit("Lu");
+export const GC_LL_BIT = gcBit("Ll");
 
 /* ── derived tables ─────────────────────────────────────────────────── */
 

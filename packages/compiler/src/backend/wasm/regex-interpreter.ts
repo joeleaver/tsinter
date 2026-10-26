@@ -110,11 +110,9 @@
  * function happened to land in. */
 import { I32, type ModuleBuilder, type ValType } from "./module.js";
 import { Code } from "./code.js";
-import { REOP, RE_HEADER_FLAGS, RE_HEADER_CAPTURE_COUNT, RE_HEADER_LEN, LRE_FLAG_UNICODE, LRE_FLAG_UNICODE_SETS } from "./regex-opcodes.js";
+import { REOP, RE_HEADER_FLAGS, RE_HEADER_CAPTURE_COUNT, RE_HEADER_LEN, LRE_FLAG_GLOBAL, LRE_FLAG_STICKY, LRE_FLAG_UNICODE, LRE_FLAG_UNICODE_SETS } from "./regex-opcodes.js";
 import { CasingBuilder } from "./casing.js";
-import { emitRange } from "./regex-assembler.js";
-import { RegexByteWriter } from "./regex-bytewriter.js";
-import { classRangeDSW, type CharRange } from "./regex-charclass.js";
+import { classRangeDSW, type CharRange } from "./regex-compiler-tables.js";
 
 /** A FIXED, compile-time-embedded range table — this port's own answer
  * to REOP_space/REOP_not_space carrying no per-instance bytecode
@@ -199,36 +197,43 @@ export class RegexInterpreterBuilder {
     this.casingField = injectedCasing ?? null;
     this.bcType = injectedBcType ?? mb.arrayType("i8", false);
     this.capType = mb.arrayType(I32, true);
-    // classRangeDSW("s")/("S") is the SAME \s/\S CharRange this port's
-    // own charclass machinery already uses (and has already had
-    // gate-verified) for a BRACKETED \s (e.g. `[\s\d]`) — reusing it
+    // classRangeDSW("s")/("S") is the SAME \s/\S CharRange the regex
+    // compiler embeds for a BRACKETED \s (e.g. `[\s\d]`) — reusing it
     // here means REOP_space/not_space's fixed table is never a second,
-    // independently-derived whitespace set that could quietly drift
-    // from the one the rest of this port trusts.
+    // independently-derived whitespace set that could quietly drift.
     this.spaceTable = this.buildFixedRangeTable(classRangeDSW("s"));
     this.notSpaceTable = this.buildFixedRangeTable(classRangeDSW("S"));
   }
 
   /** Builds a FIXED range table for REOP_space/REOP_not_space (see
-   * FixedRangeTable's own doc comment on why they need one at all) by
-   * reusing regex-assembler.ts's emitRange — ALREADY oracle-verified
-   * (CP3's gate leg) — into a SCRATCH RegexByteWriter, then stripping
-   * its 3-byte instruction PREFIX (1 opcode + u16 len): the runtime
-   * here never reads an opcode or an embedded length back out of these
-   * tables (n travels as a separate compile-time-known i32 CONSTANT,
-   * not read from the array), it only wants the raw sorted (low,high)
-   * pairs that follow. `is32` is read back from WHICH opcode emitRange
-   * actually chose (REOP_range vs REOP_range32) rather than re-deriving
-   * its own width-decision threshold a second time by hand. */
+   * FixedRangeTable's own doc comment on why they need one at all): the
+   * (low, high) operand pairs of the REOP_range / REOP_range32 the
+   * compiler would emit for this class (re_emit_range, libregexp.c) —
+   * 16-bit pairs when the highest real bound fits, else 32-bit; a high
+   * bound is inclusive, and the 0xffffffff sentinel of an inverted set
+   * reads as 0xffff in a 16-bit table. The runtime reads only the pairs
+   * (n travels as a compile-time constant), never an opcode or a length. */
   private buildFixedRangeTable(cr: CharRange): FixedRangeTable {
-    const w = new RegexByteWriter();
-    emitRange(w, cr, false); // \s/\S are never case-folded — see walkTerm's own note (there isn't a "_i" variant)
-    const all = w.toBytes();
-    const opcode = w.byteAt(0);
-    const n = w.readU16(1);
-    const bytes = all.slice(3);
+    const n = cr.length / 2;
+    let high = cr[cr.length - 1]!;
+    if (high === 0xffffffff) high = cr[cr.length - 2]!;
+    const is32 = high > 0xffff;
+    const bytes = new Uint8Array(n * (is32 ? 8 : 4));
+    const dv = new DataView(bytes.buffer);
+    for (let i = 0; i < n; i++) {
+      const lo = cr[2 * i]!;
+      let hi = cr[2 * i + 1]! - 1;
+      if (is32) {
+        dv.setUint32(i * 8, lo, true);
+        dv.setUint32(i * 8 + 4, hi >>> 0, true);
+      } else {
+        if (hi === 0xfffffffe) hi = 0xffff;
+        dv.setUint16(i * 4, lo, true);
+        dv.setUint16(i * 4 + 2, hi, true);
+      }
+    }
     const offset = this.mb.internData(bytes);
-    return { offset, length: bytes.length, n, is32: opcode === REOP.range32 };
+    return { offset, length: bytes.length, n, is32 };
   }
 
   /** ECMA Default Case Conversion (casing.ts) — the constructor's own
@@ -312,7 +317,7 @@ export class RegexInterpreterBuilder {
 
   /** readU8/readU16/readU32 — little-endian operand reads from the
    * bytecode array at a given position, matching RegexByteWriter's own
-   * readU16/readU32 (regex-bytewriter.ts) but reading from a wasm GC
+   * readU16/readU32 (the retired regex-bytewriter.ts) but reading from a wasm GC
    * array instead of a JS number[]. Each returns a FUNCTION INDEX
    * (declared once, cached) taking (bc, pos) as its OWN wasm-level
    * params — this TS method has no parameters itself, it just builds
@@ -863,6 +868,70 @@ export class RegexInterpreterBuilder {
       c.end();
       c.localGet(NEW_IDX);
       this.mb.setBody(idx, [I32, I32, I32], c.bytes());
+      return idx;
+    });
+  }
+
+  /** isMidPair(subject, idx, isUnicode) -> i32 — under /u, whether idx
+   * falls BETWEEN the two halves of a surrogate pair (subject[idx] a
+   * trail, subject[idx-1] a lead). V8 (irregexp) tries a /u search at
+   * every code unit, and its /u character matchers refuse to consume
+   * half of a pair from either side (regexp-compiler-tonode.cc:
+   * AddLoneTrailSurrogates' "not preceded by a lead" lookbehind,
+   * AddLoneLeadSurrogates' "not followed by a trail" lookahead, both
+   * directions); zero-width assertions (\b \B ^ $, empty lookarounds)
+   * do match there. exec() fails every forward read and every backward
+   * step (REOP_prev) at such a position, which is what V8's matchers
+   * amount to (#269). Every load is guarded (wasm `and` does not
+   * short-circuit). */
+  isMidPair(): number {
+    return this.cached("isMidPair", () => {
+      const SUBJECT = 0;
+      const IDX = 1;
+      const IS_UNICODE = 2;
+      const idx = this.mb.declareFunc(this.mb.funcType([this.strRefType(), I32, I32], [I32]), "%w.re.isMidPair");
+      const c = new Code();
+      const retIf0 = (cond: () => void): void => {
+        cond();
+        c.ifVoid();
+        c.i32Const(0);
+        c.return_();
+        c.end();
+      };
+      retIf0(() => {
+        c.localGet(IS_UNICODE);
+        c.i32Eqz();
+      });
+      retIf0(() => {
+        c.localGet(IDX);
+        c.i32Const(0);
+        c.i32LeS();
+      });
+      retIf0(() => {
+        c.localGet(IDX);
+        c.localGet(SUBJECT);
+        c.arrayLen();
+        c.i32GeS();
+      });
+      retIf0(() => {
+        c.localGet(SUBJECT);
+        c.localGet(IDX);
+        c.arrayGetU(this.strType);
+        c.i32Const(0xfc00);
+        c.i32And();
+        c.i32Const(0xdc00);
+        c.i32Ne();
+      });
+      c.localGet(SUBJECT);
+      c.localGet(IDX);
+      c.i32Const(1);
+      c.i32Sub();
+      c.arrayGetU(this.strType);
+      c.i32Const(0xfc00);
+      c.i32And();
+      c.i32Const(0xd800);
+      c.i32Eq();
+      this.mb.setBody(idx, [], c.bytes());
       return idx;
     });
   }
@@ -1537,7 +1606,7 @@ export class RegexInterpreterBuilder {
    * runtime half: libregexp.c:2949-2951 canonicalizes the CHARACTER
    * READ FROM THE SUBJECT at match time (a value only known once the
    * module runs) — the LITERAL operand embedded in the bytecode is
-   * ALREADY canonicalized, at PARSE time, by regex-parser.ts's own
+   * ALREADY canonicalized, at PARSE time, by the compiler — the retired regex-parser.ts's own
    * `st.ignoreCase ? canonicalize(c) : c` (matching the reference's own
    * compile-time `lre_canonicalize` call sites) — so exec() only ever
    * needs to canonicalize ONE side of the comparison, not both.
@@ -1855,9 +1924,92 @@ export class RegexInterpreterBuilder {
    * opcode TRAPS (emitSwitch's own default-to-unreachable for a case
    * absent from the map) rather than silently doing nothing. This is
    * the FULL opcode set this port's own interpreter implements — the
-   * last opcode family (back_reference) closed with this pass. */
+   * last opcode family (back_reference) closed with this pass.
+   *
+   * The entry point wraps execAt (the lre_exec port, below) with V8's
+   * OptionallyStepBackToLeadSurrogate (regexp-compiler.cc, applied to a
+   * /u regex that is global or sticky): when the start index falls
+   * between the halves of a surrogate pair, the match is first tried
+   * from the lead (index - 1) and, only if that fails, from the start
+   * index itself. `/./uy` from lastIndex 2 of "a😀b" matches the pair at
+   * 1; `/\B/uy` from 2 matches at 2 (#269). The capture slots are reset
+   * between the two attempts. */
   exec(): number {
     return this.cached("exec", () => {
+      const BYTECODE = 0;
+      const SUBJECT = 1;
+      const START_INDEX = 2;
+      const CAPTURE_OUT = 3;
+      const I = 4;
+      const idx = this.mb.declareFunc(this.mb.funcType([this.bcRefType(), this.strRefType(), I32, this.capRefType()], [I32]), "%w.re.exec");
+      const c = new Code();
+      const tryAt = (start: () => void): void => {
+        c.localGet(BYTECODE);
+        c.localGet(SUBJECT);
+        start();
+        c.localGet(CAPTURE_OUT);
+        c.call(this.execAt());
+      };
+      // global or sticky ...
+      c.localGet(BYTECODE);
+      c.i32Const(RE_HEADER_FLAGS);
+      c.call(this.readU16());
+      c.i32Const(LRE_FLAG_GLOBAL | LRE_FLAG_STICKY);
+      c.i32And();
+      c.ifVoid();
+      // ... and the start index between the halves of a pair under /u
+      c.localGet(SUBJECT);
+      c.localGet(START_INDEX);
+      c.localGet(BYTECODE);
+      c.i32Const(RE_HEADER_FLAGS);
+      c.call(this.readU16());
+      c.i32Const(LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS);
+      c.i32And();
+      c.i32Const(0);
+      c.i32Ne();
+      c.call(this.isMidPair());
+      c.ifVoid();
+      tryAt(() => {
+        c.localGet(START_INDEX);
+        c.i32Const(1);
+        c.i32Sub();
+      });
+      c.ifVoid();
+      c.i32Const(1);
+      c.return_();
+      c.end();
+      // reset every slot to -1 (newCaptureArray's own initial state)
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(CAPTURE_OUT);
+      c.arrayLen();
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(CAPTURE_OUT);
+      c.localGet(I);
+      c.i32Const(-1);
+      c.arraySet(this.capType);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.end();
+      c.end();
+      tryAt(() => c.localGet(START_INDEX));
+      this.mb.setBody(idx, [I32], c.bytes());
+      return idx;
+    });
+  }
+
+  /** The lre_exec port proper (see exec() above for the entry point). */
+  private execAt(): number {
+    return this.cached("execAt", () => {
       const BYTECODE = 0;
       const SUBJECT = 1;
       const START_INDEX = 2;
@@ -1892,8 +2044,10 @@ export class RegexInterpreterBuilder {
       const CAP_END = 31;
       const S0 = 32;
       const S1 = 33;
+      const PRELUDE_PC = 34;
+      const SELF_REF = 35;
 
-      const idx = this.mb.declareFunc(this.mb.funcType([this.bcRefType(), this.strRefType(), I32, this.capRefType()], [I32]), "%w.re.exec");
+      const idx = this.mb.declareFunc(this.mb.funcType([this.bcRefType(), this.strRefType(), I32, this.capRefType()], [I32]), "%w.re.execAt");
       const c = new Code();
 
       // Setup (lre_exec, libregexp.c:3346-3363, minus the capture[]=NULL
@@ -1907,6 +2061,22 @@ export class RegexInterpreterBuilder {
       c.i32Const(0);
       c.i32Ne();
       c.localSet(IS_UNICODE);
+
+      // PRELUDE_PC: pc just past the non-sticky search prelude's `any`
+      // (lre_compile emits split_goto_first(5 bytes) / any / goto at the
+      // head of a non-sticky body), or -1 for a sticky body, which has no
+      // prelude (its body may hold an ordinary `any` at that offset).
+      c.localGet(BYTECODE);
+      c.i32Const(RE_HEADER_FLAGS);
+      c.call(this.readU16());
+      c.i32Const(LRE_FLAG_STICKY);
+      c.i32And();
+      c.ifResult(I32);
+      c.i32Const(-1);
+      c.else_();
+      c.i32Const(RE_HEADER_LEN + 6);
+      c.end();
+      c.localSet(PRELUDE_PC);
 
       // s->capture_count (libregexp.c:3348) — a NEW setup read this
       // slice needed: every earlier capture-touching opcode (save_
@@ -2020,10 +2190,26 @@ export class RegexInterpreterBuilder {
         c.end();
       };
 
+      // V8's /u character matchers never consume half of a surrogate
+      // pair (isMidPair's own doc, #269): a read or a backward step
+      // starting between the halves fails.
+      // (Only a /u body pays the call.)
+      const failIfMidPair = (continueLoopDepth: number): void => {
+        c.localGet(IS_UNICODE);
+        c.ifVoid();
+        failIf(() => {
+          c.localGet(SUBJECT);
+          c.localGet(CPTR);
+          c.localGet(IS_UNICODE);
+          c.call(this.isMidPair());
+        }, continueLoopDepth + 1);
+        c.end();
+      };
+
       // ignoreCase (REOP_char_i/char32_i, libregexp.c:2949-2951):
       // canonicalizes the character READ FROM THE SUBJECT before the
       // comparison — `val` (the bytecode operand) is ALREADY
-      // canonicalized, at PARSE time, by regex-parser.ts's own
+      // canonicalized, at PARSE time, by the compiler — the retired regex-parser.ts's own
       // `st.ignoreCase ? canonicalize(c) : c` (see regexCanonicalize's
       // own doc comment). No isUnicode branch here: §6.3(a)'s fenced
       // scope guard means an ignoreCase char node is never produced
@@ -2057,6 +2243,7 @@ export class RegexInterpreterBuilder {
             c.arrayLen();
             c.i32GeS();
           }, continueLoopDepth);
+          failIfMidPair(continueLoopDepth);
           // GET_CHAR(c, cptr, ...): advances cptr, combines a surrogate
           // pair under isUnicode (getChar's own doc/tests).
           c.localGet(SUBJECT);
@@ -2153,7 +2340,7 @@ export class RegexInterpreterBuilder {
       // capturing groups compile (`(a)*`, where a later loop iteration
       // must not see a STALE capture from an earlier iteration that
       // didn't run this time) — the assembler already emits it
-      // (last_capture_count bookkeeping, regex-assembler.ts); exec()
+      // (last_capture_count bookkeeping, the compiler); exec()
       // just has to interpret it. `val`/`val2`'s own bytecode-error
       // bounds check (libregexp.c:3055-3056) is skipped for the same
       // reason emitSaveCapture skips its own: this port's assembler is
@@ -2354,14 +2541,17 @@ export class RegexInterpreterBuilder {
       // character (failing if none is available); dot additionally
       // fails when that character is a line terminator, any accepts
       // anything. No bytecode operand for either (REOP_SIZE=1).
+      // The `any` of the non-sticky search prelude (split_goto_first /
+      // any / goto at the head of the body, PRELUDE_PC) steps ONE CODE
+      // UNIT, also under /u: V8's unanchored search loop is `.*?` over
+      // any code unit (regexp-compiler-tonode.cc UnanchoredAdvance), so a
+      // /u search tries the position between the halves of a pair too —
+      // where only zero-width assertions can match (#269:
+      // "a😀b".search(/\B/u) is 2). libregexp's own prelude steps a whole
+      // code point.
       const emitDotOrAny = (isAny: boolean): ((continueLoopDepth: number) => void) => {
-        return (continueLoopDepth: number) => {
-          failIf(() => {
-            c.localGet(CPTR);
-            c.localGet(SUBJECT);
-            c.arrayLen();
-            c.i32GeS();
-          }, continueLoopDepth);
+        const readOne = (depth: number): void => {
+          failIfMidPair(depth);
           c.localGet(SUBJECT);
           c.localGet(CPTR);
           c.localGet(IS_UNICODE);
@@ -2370,7 +2560,28 @@ export class RegexInterpreterBuilder {
           c.localSet(C_CHAR);
           c.localGet(NEW_CPTR);
           c.localSet(CPTR);
-          if (!isAny) {
+        };
+        return (continueLoopDepth: number) => {
+          failIf(() => {
+            c.localGet(CPTR);
+            c.localGet(SUBJECT);
+            c.arrayLen();
+            c.i32GeS();
+          }, continueLoopDepth);
+          if (isAny) {
+            c.localGet(PC);
+            c.localGet(PRELUDE_PC);
+            c.i32Eq();
+            c.ifVoid();
+            c.localGet(CPTR);
+            c.i32Const(1);
+            c.i32Add();
+            c.localSet(CPTR);
+            c.else_();
+            readOne(continueLoopDepth + 1);
+            c.end();
+          } else {
+            readOne(continueLoopDepth);
             failIf(() => emitIsLineTerminator(C_CHAR), continueLoopDepth);
           }
         };
@@ -2386,6 +2597,7 @@ export class RegexInterpreterBuilder {
           c.localGet(CPTR);
           c.i32Eqz();
         }, continueLoopDepth);
+        failIfMidPair(continueLoopDepth);
         c.localGet(SUBJECT);
         c.localGet(CPTR);
         c.localGet(IS_UNICODE);
@@ -2422,6 +2634,7 @@ export class RegexInterpreterBuilder {
             c.arrayLen();
             c.i32GeS();
           }, continueLoopDepth);
+          failIfMidPair(continueLoopDepth);
           c.localGet(SUBJECT);
           c.localGet(CPTR);
           c.localGet(IS_UNICODE);
@@ -2481,6 +2694,7 @@ export class RegexInterpreterBuilder {
             c.arrayLen();
             c.i32GeS();
           }, continueLoopDepth);
+          failIfMidPair(continueLoopDepth);
           c.localGet(SUBJECT);
           c.localGet(CPTR);
           c.localGet(IS_UNICODE);
@@ -3085,6 +3299,8 @@ export class RegexInterpreterBuilder {
           c.localSet(CAP_END);
           c.i32Const(0);
           c.localSet(I);
+          c.i32Const(0);
+          c.localSet(SELF_REF);
           c.loop();
           c.localGet(I);
           c.localGet(N);
@@ -3110,6 +3326,23 @@ export class RegexInterpreterBuilder {
           c.i32Add();
           c.arrayGet(this.capType);
           c.localSet(S1);
+          // SELF_REF |= exactly one end of the candidate set: the group is
+          // OPEN, i.e. this reference sits inside the group it names
+          // (forward: save_start done, save_end not yet; inside a
+          // lookbehind the other way round). V8 parses such a reference
+          // as EMPTY (regexp-parser.cc IsInsideCaptureGroup → AddEmpty),
+          // so it is no BackReferenceNode at all and escapes the surrogate
+          // check below (#269 review B2).
+          c.localGet(SELF_REF);
+          c.localGet(S0);
+          c.i32Const(-1);
+          c.i32Eq();
+          c.localGet(S1);
+          c.i32Const(-1);
+          c.i32Eq();
+          c.i32Xor();
+          c.i32Or();
+          c.localSet(SELF_REF);
           c.localGet(S0);
           c.i32Const(-1);
           c.i32Ne();
@@ -3158,6 +3391,15 @@ export class RegexInterpreterBuilder {
             c.localGet(MATCHED);
             c.i32Eqz();
           }, continueLoopDepth);
+          // V8 (BackReferenceNode::Emit): under /u a back reference —
+          // even an empty or unset one — must not END between the halves
+          // of a surrogate pair (CheckNotInSurrogatePair), #269; except a
+          // reference inside its own group, which V8 compiled as empty.
+          c.localGet(SELF_REF);
+          c.i32Eqz();
+          c.ifVoid();
+          failIfMidPair(continueLoopDepth + 1);
+          c.end();
         };
       };
 
@@ -3264,6 +3506,8 @@ export class RegexInterpreterBuilder {
           I32,
           I32,
           I32,
+          I32, // PRELUDE_PC
+          I32, // SELF_REF
         ],
         c.bytes(),
       );

@@ -2993,7 +2993,7 @@ const TIER_FLOOR: string[] = [
   // regexLit AND regex.new; no asymmetry) now IMPLEMENTS family 6 outside
   // a class (family 6 inside a class was already IMPLEMENT, errata item
   // 1's own sibling fix) via an ELIMINATION classifier (classifyAnnexBFamily,
-  // regex-disposition.ts) — eight positive detectors rule OUT families
+  // regex-disposition.ts, retired in unit E for regex-compiler.ts's fAnnexBFamily) — eight positive detectors rule OUT families
   // 1,2,3,4,5,7,8,9 (each REFUSES by its own name now, splitting the old
   // blanket "annexb" key so the census shows which legacy construct a
   // program actually needs); a pattern that's Annex-B-only but matches

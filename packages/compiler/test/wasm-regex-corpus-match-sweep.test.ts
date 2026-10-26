@@ -2,7 +2,7 @@
  * RESULTS over a generated (pattern, subject) corpus, compared against
  * Node. Random pairs, seeded, with the seed recorded so a failure
  * replays" — run through THIS PORT'S REAL pipeline end to end: the
- * real parser (regex-parser.ts), the real assembler (assemble()), and
+ * one regex compiler (regex-compiler.ts, run in-process), and
  * the real interpreter (exec()). Unlike the canonicalize/case-closure
  * sweeps (hand-built bytecode, deliberately isolating exec()'s own
  * canonicalization logic from the assembler), THIS corpus exercises
@@ -52,8 +52,7 @@
 import { describe, expect, test } from "vitest";
 import { Code } from "../src/backend/wasm/code.js";
 import { I32, ModuleBuilder, type ValType } from "../src/backend/wasm/module.js";
-import { assemble, type AssembleFlags } from "../src/backend/wasm/regex-assembler.js";
-import { parsePattern } from "../src/backend/wasm/regex-parser.js";
+import { compiled, compiles } from "./regex-compile.js";
 import { RegexInterpreterBuilder } from "../src/backend/wasm/regex-interpreter.js";
 import { RE_HEADER_REGISTER_COUNT } from "../src/backend/wasm/regex-opcodes.js";
 import { generatedCorpus, loadClaimPatterns } from "./regex-corpus.js";
@@ -154,8 +153,7 @@ function buildCorpus(count: number): CorpusEntry[] {
     // covered by their own dedicated gates. Skip anything this port
     // refuses to parse at all so a REFUSAL doesn't masquerade as a
     // match-result mismatch here.
-    const parsed = parsePattern(pattern, 0, flags.includes("u"), flags.includes("i"), flags.includes("m"), flags.includes("s"));
-    if (parsed === null || parsed.next !== pattern.length) continue;
+    if (!compiles(pattern, flags.replace(/[gy]/g, "") + "y")) continue;
     const subject = randomSubject(rng, pattern);
     const starts = realMatchStarts(pattern, flags, subject);
     let startIndex: number;
@@ -213,16 +211,9 @@ async function build(
   for (const e of entries) {
     const bcKey = `${e.pattern} ${e.flags}`;
     if (!bcOf.has(bcKey)) {
-      const flags: AssembleFlags = {
-        global: false,
-        ignoreCase: e.flags.includes("i"),
-        multiLine: e.flags.includes("m"),
-        dotAll: e.flags.includes("s"),
-        unicode: e.flags.includes("u"),
-        sticky,
-      };
-      const parsed = parsePattern(e.pattern, 0, flags.unicode, flags.ignoreCase, flags.multiLine, flags.dotAll)!;
-      const asm = assemble(parsed.ast, flags);
+      // the oracle's own flags: /y for the sticky slice, /g (a search
+      // from lastIndex) for the non-sticky one
+      const asm = compiled(e.pattern, e.flags.replace(/[gy]/g, "") + (sticky ? "y" : "g"));
       const offset = mb.internData(asm.bytes);
       bcOf.set(bcKey, { offset, length: asm.bytes.length, captureCount: asm.captureCount, registerCount: asm.bytes[RE_HEADER_REGISTER_COUNT]! });
     }
@@ -276,7 +267,7 @@ async function build(
 
 describe("regex corpus match-results sweep, seeded and real-pipeline (design §6.1's sampled instrument)", () => {
   test(
-    `3,000-pair seeded (pattern, subject, startIndex) corpus, seed=${SEED}, through the real parser+assembler+exec() pipeline vs Node`,
+    `3,000-pair seeded (pattern, subject, startIndex) corpus, seed=${SEED}, through the real compiler+exec() pipeline vs Node`,
     async () => {
       const entries = buildCorpus(3000);
       expect(entries.length, "corpus generation must reach the target count").toBe(3000);
@@ -289,8 +280,8 @@ describe("regex corpus match-results sweep, seeded and real-pipeline (design §6
         const subj = subjOf.get(e.subject)!;
         // e.flags may carry a REAL corpus pattern's own g/y (loadClaimPatterns()
         // pulls actual source flags) — strip both and add 'y' unconditionally,
-        // matching this port's assembler, which ALWAYS compiles sticky
-        // (AssembleFlags.sticky:true above, regardless of the pattern's own flags).
+        // matching the bytecode, compiled sticky here
+        // (regardless of the pattern's own flags).
         const nodeRe = new RegExp(e.pattern, e.flags.replace(/[gy]/g, "") + "y");
         nodeRe.lastIndex = e.startIndex;
         const nodeMatch = nodeRe.exec(e.subject);
@@ -348,8 +339,8 @@ describe("regex corpus match-results sweep, seeded and real-pipeline (design §6
 
   // NON-STICKY SLICE (lead's rider, alongside the hand-picked shapes in
   // wasm-regex-nonsticky-prelude.test.ts): the SAME 3,000-entry corpus,
-  // re-assembled with sticky:false so every pattern gets the real
-  // search-loop prelude (regex-assembler.ts:716-723), compared against
+  // compiled non-sticky (with /g, as the oracle) so every pattern gets the real
+  // search-loop prelude (libregexp.c lre_compile's own), compared against
   // Node's own non-sticky search oracle (a GLOBAL regex with lastIndex
   // set — the correct oracle for "search from startIndex", design
   // §3.1's own operation surface: search/test/match/... are all

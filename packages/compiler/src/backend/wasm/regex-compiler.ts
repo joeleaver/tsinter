@@ -1,20 +1,27 @@
-/* Unit P1: the RUN-TIME RegExp compiler — `%w.rec.compile(pattern, flags)`,
- * the wasm-emitted twin of the build-time pipeline (regex-parser.ts ->
- * regex-assembler.ts, driven by regex-fold.ts). A `new RegExp(p, f)` whose
- * arguments do not fold at build time calls it; it returns the SAME
- * %w.re.Regex struct (source, canonical flags, bytecode, capture count,
- * group names) the build-time path embeds, built from the SAME bytecode —
- * wasm-regex-runtime-compiler.test.ts holds the two compilers (and
- * libregexp's lre_compile) byte-identical over the claim patterns, the
- * corpus literals, the regex test fixtures and seeded mutations.
+/* Unit P1: the RegExp compiler — `%w.rec.compile(pattern, flags)` — and,
+ * since unit E, the ONLY one. A `new RegExp(p, f)` whose arguments do not
+ * fold at build time calls it in the program's module; a regex literal or
+ * a folded `new RegExp` runs this same function at build time
+ * (regex-buildtime.ts instantiates it in the compiler's own process), so
+ * a constant pattern embeds exactly what the run-time call would build:
+ * the %w.re.Regex struct (source, canonical flags, bytecode, capture
+ * count, group names), or its SyntaxError, or its fence.
+ * wasm-regex-runtime-compiler.test.ts holds it to Node (verdicts and
+ * messages) and to libregexp's lre_compile (bytes) over the claim
+ * patterns, the corpus literals, the regex test fixtures and seeded
+ * mutations.
  *
  * SHAPE. One fused parse-and-emit pass in libregexp's own style
  * (re_parse_disjunction / re_parse_alternative / re_parse_term with
- * dbuf_insert splicing), not an AST: every decision is the build-time
- * pipeline's, transcribed in the order that pipeline makes it (the
+ * dbuf_insert splicing), not an AST. It was transcribed from the
+ * TypeScript build-time pipeline that preceded it (regex-parser.ts,
+ * regex-assembler.ts, regex-charclass.ts, regex-escape.ts,
+ * regex-class-closure.ts, regex-disposition.ts — retired in unit E, see
+ * git history; the comments below cite the libregexp.c / libunicode.c
+ * function each piece mirrors), in the order that pipeline made its decisions (the
  * parser's acceptance rules, the assembler's emission, the disposition
- * layer's fences). Where the build-time pipeline and lre_compile differ,
- * this follows the build-time pipeline — the gate test lists those rows.
+ * layer's fences). Where that pipeline and lre_compile differed, this
+ * follows the pipeline — the gate test lists those rows.
  *
  * OUTCOMES. Success returns the struct. Failure returns null and leaves an
  * id in a global the call site reads (errKind / errMessage / errCode):
@@ -33,8 +40,7 @@
  * counted depth. Functions with results end in an explicit `ret`. */
 import { A, Fn, I32, type X } from "./asm.js";
 import type { ModuleBuilder, ValType } from "./module.js";
-import { classRangeDSW, GC_LL_BIT, GC_LU_BIT, gcRowMask } from "./regex-charclass.js";
-import { canonPairs, fenceId, RX_PATTERN_SIZE_LIMIT, gcAliasBlob, i32Bytes, identFirstRanges, identNextRanges, RX, RX_FENCE_KEY, RX_SYNTAX_TEXT, fenceMessage, fenceCode } from "./regex-compiler-tables.js";
+import { canonPairs, classRangeDSW, fenceId, GC_LL_BIT, GC_LU_BIT, gcRowMask, RX_PATTERN_SIZE_LIMIT, gcAliasBlob, i32Bytes, identFirstRanges, identNextRanges, RX, RX_FENCE_KEY, RX_SYNTAX_TEXT, fenceMessage, fenceCode } from "./regex-compiler-tables.js";
 import {
   CAPTURE_COUNT_MAX,
   LRE_FLAG_DOTALL,
@@ -171,7 +177,7 @@ function opcodeClasses(): Uint8Array {
   return t;
 }
 
-/** Atom kinds for the quantifier check (regex-parser.ts isQuantifiable). */
+/** Atom kinds for the quantifier check (libregexp.c re_parse_term's quantifier arm, :2206). */
 const K_ATOM = 0;
 const K_ASSERT = 1; // ^ $ \b \B — "Nothing to repeat"
 const K_LOOK_Q = 2; // forward lookahead, non-unicode: quantifiable (Annex B)
@@ -226,7 +232,7 @@ export class RegexCompilerBuilder {
     for (const n of [
       "len", "pos", "uni", "ic", "ml", "da", "topIc", "topMl", "topDa", "sticky", "flagMask",
       "capCount", "scope", "bcSize", "stFirst", "stSecond", "stCap", "totalCap", "hasNamed",
-      "modUsed", "qLook", "deferredK", "depth", "err",
+      "modUsed", "qLook", "deferredK", "depth", "err", "creSeen", "uniIcMod",
       "aKind", "aCp", "aNext", "aDsw", "escNext", "nameNext", "scanHasNamed", "matchCount", "digNext",
       "qPresent", "qMin", "qMax", "qInf", "qGreedy", "termKind", "tablesReady",
     ])
@@ -544,7 +550,7 @@ export class RegexCompilerBuilder {
     });
   }
 
-  /* ── CharRange algebra (regex-charclass.ts; points are u32) ──────── */
+  /* ── CharRange algebra (libunicode.c cr_op :455 / cr_invert :522; u32 points) ──────── */
 
   private crRef(): ValType {
     return this.ref(this.crT);
@@ -714,7 +720,7 @@ export class RegexCompilerBuilder {
     });
   }
 
-  /** caseCloseClass (regex-class-closure.ts) as a set identity:
+  /** cr_regexp_canonicalize (libunicode.c:1496) as a set identity:
    * (S minus the moved points) united with the moved points' images. */
   private get fCaseClose(): number {
     return this.fn("caseClose", [this.crRef()], [this.crRef()], ($) => {
@@ -927,7 +933,7 @@ export class RegexCompilerBuilder {
     return acc;
   }
 
-  /** parse_unicode_property (regex-charclass.ts parseUnicodeProperty),
+  /** parse_unicode_property (libregexp.c:882),
    * `p` at the `{`. Sets aCr/aNext. A name outside General_Category is the
    * unported-unicode-property fence. */
   private get fUnicodeProperty(): number {
@@ -942,7 +948,6 @@ export class RegexCompilerBuilder {
       const ROW = $.local(I32);
       const CR = $.local(this.crRef());
       const propChar = (x: X): X => $.or($.or($.inR(x, 0x30, 0x39), $.inR(x, 0x41, 0x5a)), $.or($.inR(x, 0x61, 0x7a), $.eq(x, $.i(0x5f))));
-      const FUNPORTED = fenceId("unported-unicode-property");
       $.if($.ne(this.ch($, $.l(P)), $.i(C("{"))), () => $.ret($.i(RX.INVALID_PROP_NAME)));
       $.bump(P);
       $.put(NS, $.l(P));
@@ -960,16 +965,34 @@ export class RegexCompilerBuilder {
       $.if($.ne(this.ch($, $.l(P)), $.i(C("}"))), () => $.ret($.i(RX.INVALID_PROP_NAME)));
       $.bump(P);
       $.put(ROW, $.i(-1));
+      // V8's verdicts (ParsePropertyClassName / LookupPropertyValueName),
+      // measured: `Name=Value` takes only General_Category / gc / Script /
+      // sc / Script_Extensions / scx as its name, never an empty value, and
+      // a General_Category value must be one; a lone name must not be one
+      // of those six or empty. Anything else is "Invalid property name".
+      // What only Node's property tables can decide — a Script value, or a
+      // lone name that is not a General_Category value (a binary property,
+      // or an invalid name V8 rejects right here) — is the
+      // unported-unicode-property fence, reported WHERE MET: the name may be
+      // invalid, and then V8's error is this one, not a later one.
+      const isSc = $.or($.or(this.spells($, NS, NE, "Script"), this.spells($, NS, NE, "sc")), $.or(this.spells($, NS, NE, "Script_Extensions"), this.spells($, NS, NE, "scx")));
+      const isGc = $.or(this.spells($, NS, NE, "General_Category"), this.spells($, NS, NE, "gc"));
+      const pending = (): void => $.ret($.i(fenceId("unported-unicode-property")));
       $.if(
-        $.or($.or(this.spells($, NS, NE, "Script"), this.spells($, NS, NE, "sc")), $.or(this.spells($, NS, NE, "Script_Extensions"), this.spells($, NS, NE, "scx"))),
-        () => $.ret($.i(FUNPORTED)),
+        $.l(HAS_EQ),
+        () => {
+          $.if($.eq($.l(VS), $.l(VE)), () => $.ret($.i(RX.INVALID_PROP_NAME)));
+          $.if(isSc, pending);
+          $.if($.not(isGc), () => $.ret($.i(RX.INVALID_PROP_NAME)));
+          $.put(ROW, $.call(this.fGcLookup, $.l(VS), $.l(VE)));
+          $.if($.lt($.l(ROW), $.i(0)), () => $.ret($.i(RX.INVALID_PROP_NAME)));
+        },
+        () => {
+          $.if($.or($.eq($.l(NS), $.l(NE)), $.or(isSc, isGc)), () => $.ret($.i(RX.INVALID_PROP_NAME)));
+          $.put(ROW, $.call(this.fGcLookup, $.l(NS), $.l(NE)));
+          $.if($.lt($.l(ROW), $.i(0)), pending);
+        },
       );
-      $.if(
-        $.or(this.spells($, NS, NE, "General_Category"), this.spells($, NS, NE, "gc")),
-        () => $.if($.l(HAS_EQ), () => $.put(ROW, $.call(this.fGcLookup, $.l(VS), $.l(VE)))),
-        () => $.if($.not($.l(HAS_EQ)), () => $.put(ROW, $.call(this.fGcLookup, $.l(NS), $.l(NE)))),
-      );
-      $.if($.lt($.l(ROW), $.i(0)), () => $.ret($.i(FUNPORTED)));
       $.put(CR, $.call(this.fGc1, $.aget(this.crT, this.gg($, "tGcMask"), $.l(ROW))));
       $.if($.l(INV), () => $.put(CR, $.call(this.fCrInvert, $.l(CR))));
       this.gs($, "aCr", $.l(CR));
@@ -994,7 +1017,7 @@ export class RegexCompilerBuilder {
     };
   }
 
-  /** lre_parse_escape (regex-escape.ts parseEscape): `p` just after the
+  /** lre_parse_escape (libregexp.c:749): `p` just after the
    * backslash. The value, or -1; sets escNext. */
   private get fParseEscape(): number {
     return this.fn("parseEscape", [I32, I32], [I32], ($) => {
@@ -1132,7 +1155,7 @@ export class RegexCompilerBuilder {
     this.gs($, "aNext", next);
   }
 
-  /** get_class_atom (regex-charclass.ts getClassAtom). Status; on success
+  /** get_class_atom (libregexp.c:1056). Status; on success
    * aKind 0 (aCp) or 1 (aCr, aDsw = the letter of a \d\D\s\S\w\W). */
   private get fClassAtom(): number {
     return this.fn("classAtom", [I32, I32], [I32], ($) => {
@@ -1196,7 +1219,7 @@ export class RegexCompilerBuilder {
         $.ret($.i(0));
       });
       // With named groups (or /u) `\k` is no identity escape, in a class
-      // too: V8's "Invalid escape" (regex-parser.ts takes it as `k`).
+      // too: V8's "Invalid escape" (libregexp takes it as `k`).
       $.if($.both($.both($.l(INCLASS), $.eq($.l(ESC), $.i(C("k")))), $.or(this.gg($, "uni"), this.hasNamed($))), () => $.ret($.i(RX.INVALID_ESCAPE)));
       // default_escape
       $.put(V, $.call(this.fParseEscape, $.add($.l(BS), $.i(1)), $.sel(I32, this.gg($, "uni"), $.i(2), $.i(0))));
@@ -1270,16 +1293,27 @@ export class RegexCompilerBuilder {
             $.ret($.i(RX.INVALID_CLASS));
           });
           // Without /u a class escape at either end of a range is Annex B
-          // (family 8, class-range-escape): V8 then reads `-` and the far
-          // end as literals where libregexp and regex-parser.ts start a new
-          // range at the far end (`[\d-d-a]` parses in V8, not in either).
-          // Fenced where met; the build-time pipeline refuses the same
-          // patterns by name.
-          $.if($.eq($.l(K1), $.i(1)), () => $.ret($.i(fenceId("annexb-class-range-escape"))));
+          // (family 8, class-range-escape): V8 reads the far end as one
+          // more class atom and the `-` as a literal (ParseCharacterClass,
+          // "treat the '-' verbatim"), where libregexp starts a new range
+          // at the far end (`[\d-d-a]` parses in V8, not in libregexp).
+          // The family is fenced, but only once the whole pattern has
+          // parsed: a later syntax error is V8's verdict (`[\w-a][a` is
+          // "Unterminated character class"), so the parse goes on V8's way
+          // and compile() fences on creSeen. The class built meanwhile is
+          // never used.
+          $.if($.eq($.l(K1), $.i(1)), () => {
+            this.chk($, ST, $.call(this.fClassAtom, $.add($.l(P), $.i(1)), $.i(1)));
+            this.gs($, "creSeen", $.i(1));
+            $.put(P, this.gg($, "aNext"));
+            $.br(cont);
+          });
           this.chk($, ST, $.call(this.fClassAtom, $.add($.l(P), $.i(1)), $.i(1)));
           $.if($.eq(this.gg($, "aKind"), $.i(1)), () => {
             $.if(this.gg($, "uni"), () => $.ret($.i(RX.INVALID_CLASS)));
-            $.ret($.i(fenceId("annexb-class-range-escape")));
+            this.gs($, "creSeen", $.i(1));
+            $.put(P, this.gg($, "aNext"));
+            $.br(cont);
           });
           $.if($.lt(this.gg($, "aCp"), $.l(CP1)), () => $.ret($.i(RX.RANGE_ORDER)));
           addClos(this.crPair($, $.l(CP1), $.add(this.gg($, "aCp"), $.i(1))));
@@ -1291,7 +1325,7 @@ export class RegexCompilerBuilder {
       $.bump(P);
       $.put(CR, $.l(CLOS));
       $.if($.both(this.gg($, "ic"), $.l(ANY_CLOS)), () => {
-        $.if(this.gg($, "uni"), () => $.ret($.i(fenceId("modifiers"))));
+        $.if(this.gg($, "uni"), () => this.gs($, "uniIcMod", $.i(1)));
         $.put(CR, $.call(this.fCaseClose, $.l(CR)));
       });
       $.put(CR, this.crOp($, $.l(CR), $.l(RAW), CR_UNION));
@@ -1301,7 +1335,7 @@ export class RegexCompilerBuilder {
     });
   }
 
-  /** re_emit_range (regex-assembler.ts emitRange). Status. */
+  /** re_emit_range (libregexp.c:1235). Status. */
   private get fEmitRange(): number {
     return this.fn("emitRange", [this.crRef(), I32], [I32], ($) => {
       const CR = 0;
@@ -1382,7 +1416,7 @@ export class RegexCompilerBuilder {
     });
   }
 
-  /** re_parse_group_name (regex-parser.ts parseGroupName), `p` after `<`.
+  /** re_parse_group_name (libregexp.c:1641), `p` after `<`.
    * 0 with nameStr/nameNext set, 2 for a malformed \u escape (V8's
    * "Invalid Unicode escape"), 1 for any other failure. */
   private get fGroupName(): number {
@@ -1452,7 +1486,7 @@ export class RegexCompilerBuilder {
     });
   }
 
-  /** re_parse_captures / regex-parser.ts scanCaptures. The total capture
+  /** re_parse_captures (libregexp.c:1697). The total capture
    * count; scanHasNamed; with a target, its matching indices into match. */
   private get fScanCaptures(): number {
     return this.fn("scanCaptures", [this.ref(this.strT)], [I32], ($) => {
@@ -1593,7 +1627,7 @@ export class RegexCompilerBuilder {
     });
   }
 
-  /** The quantifier suffix (regex-parser.ts parseQuantifier): status;
+  /** The quantifier suffix (libregexp.c re_parse_term :2206-2258): status;
    * qPresent 0 for none (pos untouched), else qMin/qMax/qInf/qGreedy. */
   private get fQuantifier(): number {
     return this.fn("quantifier", [], [I32], ($) => {
@@ -1645,7 +1679,7 @@ export class RegexCompilerBuilder {
           );
         });
         // V8 checks the closing brace before the bounds' order: `a{2,1`
-        // is a literal without /u (libregexp and regex-parser.ts report
+        // is a literal without /u (libregexp reports
         // the order first) and "Incomplete quantifier" with it.
         $.if($.ne(this.ch($, $.l(P)), $.i(C("}"))), () => {
           $.if($.not(this.gg($, "uni")), () => $.ret($.i(0)));
@@ -1669,7 +1703,7 @@ export class RegexCompilerBuilder {
     });
   }
 
-  /** emitQuantifier (regex-assembler.ts) over the atom at
+  /** the quantifier emission (libregexp.c re_parse_term :2258) over the atom at
    * [atomStart, bcSize), whose captures are [capBefore, capCount). */
   private get fEmitQuant(): number {
     return this.fn("emitQuant", [I32, I32], [], ($) => {
@@ -1825,7 +1859,7 @@ export class RegexCompilerBuilder {
 
   /** A flag-scoped atom whose encoding differs from what the top-level
    * flags would give marks the pattern as using a modifier group
-   * (regex-disposition.ts usesModifierGroup). */
+   * (a tier policy, no libregexp counterpart). */
   private modIf($: RA, differs: X): void {
     $.if(differs, () => this.gs($, "modUsed", $.i(1)));
   }
@@ -1837,7 +1871,7 @@ export class RegexCompilerBuilder {
       const BACK = 1;
       this.prevIf($, BACK);
       $.if(this.gg($, "ic"), () => {
-        $.if(this.gg($, "uni"), () => $.ret($.i(fenceId("modifiers"))));
+        $.if(this.gg($, "uni"), () => this.gs($, "uniIcMod", $.i(1)));
         $.put(CP, $.call(this.canonFn(), $.l(CP)));
       });
       $.if(
@@ -1881,7 +1915,7 @@ export class RegexCompilerBuilder {
             () => this.e8($, $.i(REOP.not_space)),
             () => {
               $.if($.both($.not($.l(D)), this.gg($, "ic")), () => {
-                $.if(this.gg($, "uni"), () => $.ret($.i(fenceId("modifiers"))));
+                $.if(this.gg($, "uni"), () => this.gs($, "uniIcMod", $.i(1)));
                 $.put(CR, $.call(this.fCaseClose, $.l(CR)));
               });
               this.chk($, ST, $.call(this.fEmitRange, $.l(CR), this.gg($, "ic")));
@@ -1899,7 +1933,7 @@ export class RegexCompilerBuilder {
     this.e8($, $.add($.add($.i(REOP.back_reference), $.mul($.l(back), $.i(2))), this.gg($, "ic")));
   }
 
-  /** \k<name> (regex-parser.ts parseNamedBackref), `p` at the backslash. */
+  /** \k<name> (libregexp.c re_parse_term's `k` arm and find_group_name :1769), `p` at the backslash. */
   private get fNamedBackref(): number {
     return this.fn("namedBackref", [I32, I32], [I32], ($) => {
       const P = 0;
@@ -1941,7 +1975,7 @@ export class RegexCompilerBuilder {
     });
   }
 
-  /** \0 (regex-parser.ts parseZeroEscape). */
+  /** \0 (libregexp.c re_parse_term's `0` arm). */
   private get fZeroEscape(): number {
     return this.fn("zeroEscape", [I32, I32], [I32], ($) => {
       const BS = 0;
@@ -1971,7 +2005,7 @@ export class RegexCompilerBuilder {
     });
   }
 
-  /** \1-\9 (regex-parser.ts parseNumberedBackrefOrOctal). */
+  /** \1-\9 (libregexp.c re_parse_term's digit arm). */
   private get fNumberedBackref(): number {
     return this.fn("numberedBackref", [I32, I32], [I32], ($) => {
       const BS = 0;
@@ -2031,7 +2065,6 @@ export class RegexCompilerBuilder {
       const NAMED = 2;
       const IDX = $.local(I32);
       const ST = $.local(I32);
-      const K = $.local(I32);
       const J = $.local(I32);
       const NAME = $.local(this.ref(this.strT));
       const SV = this.stateLocals($);
@@ -2197,7 +2230,7 @@ export class RegexCompilerBuilder {
     });
   }
 
-  /** The '(' dispatch (regex-parser.ts parseGroup). */
+  /** The '(' dispatch (libregexp.c re_parse_term's `(` arm, :1855). */
   private get fGroup(): number {
     return this.fn("group", [I32, I32], [I32], ($) => {
       const OPEN = 0;
@@ -2238,7 +2271,7 @@ export class RegexCompilerBuilder {
     });
   }
 
-  /** re_parse_term's atom dispatch (regex-parser.ts parseTerm). Status;
+  /** re_parse_term's atom dispatch (libregexp.c:1855). Status;
    * termKind says whether a quantifier may follow. */
   private get fAtom(): number {
     return this.fn("atom", [I32], [I32], ($) => {
@@ -2456,7 +2489,7 @@ export class RegexCompilerBuilder {
       const ANY = $.local(I32);
       const NM = $.local(this.ref(this.strT));
       const z = (n: string): void => this.gs($, n, $.i(0));
-      for (const n of ["pos", "scope", "bcSize", "stFirst", "stSecond", "stCap", "modUsed", "qLook", "deferredK", "depth"]) z(n);
+      for (const n of ["pos", "scope", "bcSize", "stFirst", "stSecond", "stCap", "modUsed", "qLook", "deferredK", "depth", "creSeen", "uniIcMod"]) z(n);
       this.gs($, "capCount", $.i(1));
       this.gs($, "totalCap", $.i(-1));
       this.gs($, "names", $.anew(this.nameArrT, $.i(CAPTURE_COUNT_MAX + 1)));
@@ -2524,7 +2557,7 @@ export class RegexCompilerBuilder {
     });
   }
 
-  /* ── Annex-B family classification (regex-disposition.ts) ───────── */
+  /* ── Annex-B family classification (a tier policy, no libregexp counterpart) ───────── */
 
   private get fBraceLeniency(): number {
     return this.fn("braceLeniency", [], [I32], ($) => {
@@ -2775,6 +2808,7 @@ export class RegexCompilerBuilder {
       const CC = $.local(I32);
       const ST = $.local(I32);
       const QL = $.local(I32);
+      const CRE = $.local(I32);
       const BYTES = $.local(this.ref(this.bufT));
       const NAMES = $.local(this.ref(this.re.strArrType));
       const NM = $.local(this.ref(this.strT));
@@ -2821,7 +2855,10 @@ export class RegexCompilerBuilder {
       this.gs($, "topDa", this.gg($, "da"));
       $.put(ST, $.call(this.fCore, $.i(0)));
       $.if($.l(ST), () => fail($.l(ST)));
-      $.if(this.gg($, "modUsed"), () => fail($.i(fenceId("modifiers"))));
+      // the pending modifiers fence: only now, so a syntax error anywhere
+      // in the pattern wins (a modifier group is valid V8 syntax)
+      $.if($.or(this.gg($, "modUsed"), this.gg($, "uniIcMod")), () => fail($.i(fenceId("modifiers"))));
+      $.put(CRE, this.gg($, "creSeen"));
       $.put(BYTES, $.anew(this.bufT, this.gg($, "bcSize")));
       $.do($.l(BYTES), $.i(0), this.gg($, "bc"), $.i(0), this.gg($, "bcSize"));
       $.c.arrayCopy(this.bufT, this.bufT);
@@ -2840,18 +2877,24 @@ export class RegexCompilerBuilder {
       });
       $.put(R, $.new_(this.re.regexType, $.call(this.fEscapeSource), $.call(this.fCanonFlags), $.l(BYTES), this.gg($, "capCount"), $.l(NAMES)));
       $.if($.not(this.gg($, "uni")), () => {
-        // Annex B (regex-disposition.ts usesAnnexBOnly): a pattern that
+        // Annex B (a tier policy): a pattern that
         // fails to parse with /u forced on relies on a legacy production.
         $.put(QL, this.gg($, "qLook"));
         this.gs($, "uni", $.i(1));
         this.gs($, "ic", $.i(0));
         $.put(ST, $.call(this.fCore, $.i(1)));
+        // A modifier group turning /i on under the forced /u counts as not
+        // parsing strictly, as it always has (it used to abort the parse
+        // there; it now only marks modUsed): the family scan decides.
+        $.if(this.gg($, "uniIcMod"), () => $.put(ST, $.i(1)));
         this.gs($, "uni", $.i(0));
         this.gs($, "ic", this.gg($, "topIc"));
         $.if($.l(ST), () => {
           $.put(ST, $.call(this.fAnnexBFamily, $.l(QL)));
           $.if($.l(ST), () => fail($.l(ST)));
         });
+        // a class-range escape the family scan did not name
+        $.if($.l(CRE), () => fail($.i(fenceId("annexb-class-range-escape"))));
       });
       // a valid pattern past the size V8 is sure to compile (S102)
       $.if($.gt(this.gg($, "len"), $.i(RX_PATTERN_SIZE_LIMIT)), () => fail($.i(fenceId("pattern-too-large"))));
