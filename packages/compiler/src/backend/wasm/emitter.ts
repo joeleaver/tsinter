@@ -194,6 +194,7 @@ import { FETCH_CLASS_NAMES, FetchBuilder } from "./fetch.js";
 import { TlsBuilder } from "./tls.js";
 import { X509Builder } from "./tls-x509.js";
 import { CryptoBuilder, X509_BAD_TIME, X509_NO_START } from "./crypto.js";
+import { ZlibBuilder, ZLIB_ERRORS } from "./zlib.js";
 import { PEM_ASN1, PEM_BAD_BASE64, PEM_BAD_END_LINE, PEM_NONCANON, PEM_TRAILING, PEM_UNSUPPORTED } from "./tls-x509.js";
 import { DgramBuilder, DGRAM_LISTS } from "./dgram.js";
 import { ENC_NAMES as HTTP_ENC_NAMES, ENC_NONE, ENC_UTF8, HL, HttpBuilder } from "./http.js";
@@ -9504,6 +9505,60 @@ class Assembler {
       default:
         return false;
     }
+  }
+
+  private zlibField: ZlibBuilder | null = null;
+
+  /** zlib.deflateSync / zlib.inflateSync's builder (zlib.ts). */
+  private get zlib(): ZlibBuilder {
+    this.zlibField ??= new ZlibBuilder(this.mb, {
+      bufType: () => this.bytesB.bufType(),
+      bytesType: () => this.bytesB.bytesType(),
+      ensureCapacity: (c, need) => this.emitEnsureCapacity(c, need),
+      stageCursor: () => this.cursorGlobal,
+    });
+    return this.zlibField;
+  }
+
+  /** node:zlib's two keys (zlib.ts): deflateSync at Node's default level
+   * (-1, i.e. 6) and inflateSync, whose failure is Node's plain Error with
+   * zlib's message and code (SEMANTICS.md S101: no errno), then the
+   * unwind. */
+  private emitZlibLibCall(e: Extract<WExpr, { kind: "libCall" }>): boolean {
+    if (e.fn !== "zlib.deflateSync" && e.fn !== "zlib.inflateSync") return false;
+    const code = this.fn.code;
+    const z = this.zlib;
+    this.walkExpr(e.args[0]!);
+    if (e.fn === "zlib.deflateSync") {
+      code.i32Const(-1);
+      code.call(z.deflateSyncFn());
+      return true;
+    }
+    code.call(z.inflateSyncFn());
+    const R = this.acquireScratch(this.bytesB.bytesRef());
+    code.localTee(R);
+    code.refIsNull();
+    this.openIf();
+    {
+      const E = this.acquireScratch(I32);
+      code.globalGet(z.errGlobal());
+      code.localSet(E);
+      for (const [id, message, errCode] of ZLIB_ERRORS) {
+        code.localGet(E);
+        code.i32Const(id);
+        code.i32Eq();
+        this.openIf();
+        this.emitSetCellErrorLit("%Error", "Error", message, errCode);
+        this.emitUnwind();
+        this.close();
+      }
+      this.releaseScratch(I32, E);
+      code.unreachable();
+    }
+    this.close();
+    code.localGet(R);
+    this.releaseScratch(this.bytesB.bytesRef(), R);
+    return true;
   }
 
   /** The X509Certificate parse's failure (crypto.ts's error global): Node's
@@ -24264,6 +24319,7 @@ class Assembler {
           return;
         }
         if (this.emitCryptoLibCall(e)) return;
+        if (this.emitZlibLibCall(e)) return;
         if (this.emitTlsLibCall(e)) return;
         if (this.emitDgramLibCall(e)) return;
         if (this.emitHttpLibCall(e)) return;

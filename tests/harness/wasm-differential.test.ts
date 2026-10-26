@@ -3578,6 +3578,9 @@ const TIER_FLOOR: string[] = [
   // Unit I: unions, URLs and Uint32/Int32/Float32 arrays cross into a
   // dynamic value (by tag, by reference, by reference): 1071 -> 1072.
   "766-any-union-boundary.ts",
+  // The zlib unit: deflateSync / inflateSync as a port of Node's bundled
+  // Chromium zlib (zlib.ts) — Node's bytes and Node's errors: 1072 -> 1073.
+  "1404-zlib-crypto-bytes.ts",
 ];
 
 interface RunResult {
@@ -9462,6 +9465,131 @@ t("month-13", bad);
       const imports: Record<string, Record<string, unknown>> = { tsinter: {} };
       for (const i of WebAssembly.Module.imports(mod)) if (i.name !== "random") imports[i.module]![i.name] = () => 0;
       await expect(WebAssembly.instantiate(mod, imports as WebAssembly.Imports)).rejects.toBeInstanceOf(WebAssembly.LinkError);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 60000);
+});
+
+// ── the zlib unit: deflateSync / inflateSync (zlib.ts) ────────────────────
+// A port of Node v24.18.1's bundled zlib (Chromium's fork, rev e00f703):
+// deflate's bytes are Node's, so rows print them (the llvm and c lanes'
+// bytes differ, board #257 — these rows are wasm against Node only), and
+// inflate fails where Node's fails with Node's message and code (SEMANTICS.md
+// S101). Every row runs Node on the same source. The broad differential
+// (every level, fuzz, every truncation and error input) is
+// packages/compiler/test/wasm-zlib.test.ts.
+describe("zlib unit rows (zlib.ts)", () => {
+  async function both(name: string, src: string): Promise<[RunResult, RunResult]> {
+    const dir = mkdtempSync(join(tmpdir(), "zlib-row-"));
+    try {
+      const path = join(dir, name);
+      writeFileSync(path, src);
+      const res = await compile(path, { outPath: join(dir, "p.wasm"), outDir: dir, dynamic: false, backend: "wasm" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+      return await Promise.all([runWasm(res.binaryPath), runNode(path)]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  const same = ([w, n]: [RunResult, RunResult]): void => {
+    expect(w.stdout.toString("utf8")).toBe(n.stdout.toString("utf8"));
+    expect(w.stderr.toString("utf8")).toBe(n.stderr.toString("utf8"));
+    expect(w.exitCode).toBe(n.exitCode);
+  };
+
+  test("ZL-RT-01 round trips of empty, 1 B, 64 KiB and 1 MiB inputs (Buffer, Uint8Array and a subarray view), the zlib header bytes, and compression of repetitive input — SINGLE-EDIT: the adler32 trailer's halves swapped", async () => {
+    same(await both("main.ts", `import { deflateSync, inflateSync } from "node:zlib";
+function filled(n: number, period: number): Buffer {
+  const b = Buffer.alloc(n);
+  for (let i = 0; i < n; i++) b[i] = (i * 7 + (i >> 9)) % period;
+  return b;
+}
+for (const n of [0, 1, 65536, 1048576]) {
+  const raw = filled(n, 251);
+  const packed = deflateSync(raw);
+  const back = inflateSync(packed);
+  console.log(n, packed[0], packed[1], packed.length < raw.length + 12, back.length, back.equals(raw));
+}
+const arr = new Uint8Array([1, 2, 3, 4, 5, 1, 2, 3, 4, 5]);
+console.log(inflateSync(deflateSync(arr)).toString("hex"));
+const view = Buffer.from("xxhello hello hello hello hello!yy").subarray(2, 32);
+console.log(inflateSync(deflateSync(view)).toString(), deflateSync(view).length);
+const rep = Buffer.alloc(100000, 0x41);
+console.log("repetitive", deflateSync(rep).length);
+`));
+  }, 60000);
+
+  test("ZL-HEX-01 deflateSync's bytes as hex for three texts and their 20x repetitions (lazy matching, the static/dynamic/stored choice), and the sha256 of a 200 KB text's, where hash-bucket collisions decide matches (Chromium's hash) — SINGLE-EDIT: insert_string's multiplier", async () => {
+    same(await both("main.ts", `import { deflateSync } from "node:zlib";
+import { createHash } from "node:crypto";
+const words = ["alpha", "beta", "gamma", "delta", "zlib", "window", "huffman", "tree", "lazy", "match", "chain", "bucket"];
+let seed = 7;
+let text = "";
+while (text.length < 200000) {
+  seed = (seed * 48271) % 2147483647;
+  text += words[seed % words.length] + (seed % 5 === 0 ? "\\n" : " ");
+}
+const big = deflateSync(Buffer.from(text));
+console.log(big.length, createHash("sha256").update(big).digest("hex"));
+const texts = [
+  "hello hello hello hello compression works",
+  "The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs.",
+  '{"id":1,"name":"user1","tags":["a","b"],"ok":true},{"id":2,"name":"user2","tags":["c"],"ok":false}',
+];
+for (const t of texts) {
+  console.log(deflateSync(Buffer.from(t)).toString("hex"));
+  console.log(deflateSync(Buffer.from(t.repeat(20))).toString("hex"));
+}
+const ramp = Buffer.alloc(300);
+for (let i = 0; i < 300; i++) ramp[i] = (i * 131) % 256;
+console.log(deflateSync(ramp).toString("hex"));
+`));
+  }, 60000);
+
+  test("ZL-ERR-01 inflateSync's errors: name, message, code and instanceof Error against Node for each failure kind — SINGLE-EDIT: the window-size check off by one", async () => {
+    same(await both("main.ts", `import { deflateSync, inflateSync } from "node:zlib";
+const ok = deflateSync(Buffer.from("hello hello hello"));
+const bad = Buffer.from(ok);
+bad[bad.length - 1] = bad[bad.length - 1]! ^ 1;
+const inputs: [string, Buffer][] = [
+  ["empty", Buffer.alloc(0)],
+  ["header", Buffer.from("789c", "hex")],
+  ["truncated", ok.subarray(0, ok.length - 4)],
+  ["bad header", Buffer.from("00112233", "hex")],
+  ["method", Buffer.from("0706030000000001", "hex")],
+  ["window", Buffer.from("881c030000000001", "hex")],
+  ["dictionary", Buffer.from("78bb00000001", "hex")],
+  ["block type", Buffer.from("789c07", "hex")],
+  ["stored", Buffer.from("789c0105000000", "hex")],
+  ["too far", Buffer.from("789c03020000", "hex")],
+  ["check", bad],
+  ["trailing bytes", Buffer.concat([ok, Buffer.from("zz")])],
+];
+for (const [label, input] of inputs) {
+  try {
+    const out = inflateSync(input);
+    console.log(label, "ok", out.toString());
+  } catch (e) {
+    if (e instanceof Error) console.log(label, e.name, e.message, (e as NodeJS.ErrnoException).code, e instanceof Error);
+  }
+}
+`));
+  }, 60000);
+
+  test("ZL-HOST-01 zlib is pure compute: a zlib module imports nothing a plain module does not", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "zlib-host-"));
+    try {
+      const importsOf = async (name: string, src: string): Promise<string[]> => {
+        const p = join(dir, name);
+        writeFileSync(p, src);
+        const res = await compile(p, { outPath: join(dir, `${name}.wasm`), outDir: dir, dynamic: false, backend: "wasm" });
+        if (!res.ok) throw new Error("refused");
+        return WebAssembly.Module.imports(await WebAssembly.compile(readFileSync(res.binaryPath))).map((i) => `${i.module}.${i.name}`);
+      };
+      const plain = await importsOf("p.ts", 'console.log(Buffer.from("ab").length);\n');
+      const z = await importsOf("z.ts", 'import { deflateSync, inflateSync } from "node:zlib";\nconsole.log(inflateSync(deflateSync(Buffer.from("ab"))).length);\n');
+      expect(z).toEqual(plain);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

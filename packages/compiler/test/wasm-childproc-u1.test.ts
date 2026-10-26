@@ -85,11 +85,11 @@ describe("INC-28 U1 child_process — host-free rows", () => {
     expect(r.diagnostics.join("\n")).toContain("(libCall:child.unref:pipe)");
   });
 
-  test("N-NL-02 (re-aimed at INC-28 U3, which lifts child.stdout, then at unit H, which lifts TextDecoder's decode) zlib's deflateSync stays refused by key: SC3001 (libCall:zlib.deflateSync) — SINGLE-EDIT: a zlib.deflateSync arm added", async () => {
-    const r = await build('import { deflateSync } from "node:zlib";\nconsole.log(deflateSync(Buffer.from("hi")).length);\n');
+  test("N-NL-02 (re-aimed at INC-28 U3, which lifts child.stdout, then at unit H, which lifts TextDecoder's decode, then at the zlib unit, which lifts deflateSync) inspecting a qs.parse result stays refused by key: SC3001 (libCall:qs.parse:null-proto-inspect) — SINGLE-EDIT: the null-prototype inspect refusal removed", async () => {
+    const r = await build('import { parse } from "node:querystring";\nconsole.log(parse("a=1&b=2"));\n');
     expect(r.ok).toBe(false);
     if (r.ok) return;
-    expect(r.diagnostics.join("\n")).toContain("(libCall:zlib.deflateSync)");
+    expect(r.diagnostics.join("\n")).toContain("(libCall:qs.parse:null-proto-inspect)");
   });
 
   test("N-NL-03 (re-aimed at INC-28 U3, which lifts the stream listeners) a piped STDIN stays refused by the front end, every lane — SINGLE-EDIT: the stdin pipe fence removed", async () => {

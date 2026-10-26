@@ -184,6 +184,59 @@ export class Code {
     this.w.uleb(0);
     this.w.uleb(0);
   }
+  /** The memarg-offset loads and stores zlib.ts's work area reads through:
+   * the address on the stack plus a constant `off` (a region's offset in
+   * the area). No alignment claimed, as the forms above. */
+  load8UAt(off: number): void {
+    this.w.u8(0x2d);
+    this.w.uleb(0);
+    this.w.uleb(off);
+  }
+  load16UAt(off: number): void {
+    this.w.u8(0x2f);
+    this.w.uleb(0);
+    this.w.uleb(off);
+  }
+  load32At(off: number): void {
+    this.w.u8(0x28);
+    this.w.uleb(0);
+    this.w.uleb(off);
+  }
+  store8At(off: number): void {
+    this.w.u8(0x3a);
+    this.w.uleb(0);
+    this.w.uleb(off);
+  }
+  store16At(off: number): void {
+    this.w.u8(0x3b);
+    this.w.uleb(0);
+    this.w.uleb(off);
+  }
+  store32At(off: number): void {
+    this.w.u8(0x36);
+    this.w.uleb(0);
+    this.w.uleb(off);
+  }
+  /** memory.copy (dest, src, n) — memmove semantics. */
+  memoryCopy(): void {
+    this.w.u8(0xfc);
+    this.w.uleb(10);
+    this.w.u8(0);
+    this.w.u8(0);
+  }
+  /** memory.fill (dest, byte, n). */
+  memoryFill(): void {
+    this.w.u8(0xfc);
+    this.w.uleb(11);
+    this.w.u8(0);
+  }
+  /** memory.init (dest, srcOffset, n) from passive data segment `seg`. */
+  memoryInit(seg: number): void {
+    this.w.u8(0xfc);
+    this.w.uleb(8);
+    this.w.uleb(seg);
+    this.w.u8(0);
+  }
   memorySize(): void {
     this.w.u8(0x3f);
     this.w.uleb(0);

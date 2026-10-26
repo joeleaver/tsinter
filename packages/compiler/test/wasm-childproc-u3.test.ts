@@ -87,7 +87,8 @@ describe("INC-28 U3 child output streams — host-free rows", () => {
     ["U3-NL-01", "libCall:child.unref:pipe", PIPED + "c.unref();\n"],
     ["U3-NL-02", "libCall:child.unref:pipe", 'import { spawn } from "node:child_process";\nconst a = spawn("true", [], { stdio: ["ignore", "pipe", "ignore"] });\nconst b = spawn("true", [], { stdio: "ignore" });\nb.unref();\na.stdout?.on("end", () => console.log("end"));\n'],
     // Re-aimed at zlib by unit H, which lifts TextDecoder's decode.
-    ["U3-NL-03", "libCall:zlib.deflateSync", 'import { deflateSync } from "node:zlib";\nconsole.log(deflateSync(Buffer.from("hi")).length);\n'],
+    // re-aimed by the zlib unit, which lifts deflateSync
+    ["U3-NL-03", "libCall:qs.parse:null-proto-inspect", 'import { parse } from "node:querystring";\nconsole.log(parse("a=1&b=2"));\n'],
     ["U3-NL-13", "libCall:cp.spawnOpts:pipeMixed", 'import { spawn } from "node:child_process";\nconst c = spawn("true", [], { stdio: ["ignore", "pipe", "inherit"] });\nc.on("exit", () => console.log("exit"));\n'],
     ["U3-NL-14", "libCall:cp.spawnOpts:pipeMixed", 'import { spawn } from "node:child_process";\nconst c = spawn("true", [], { stdio: ["ignore", 1, "pipe"] });\nc.on("exit", () => console.log("exit"));\n'],
   ];
