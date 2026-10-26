@@ -26,6 +26,15 @@ export class Code {
     this.w.u8(0x02);
     this.w.u8(0x40);
   }
+  /** A block with one f64 result. */
+  blockF64(): void {
+    this.w.u8(0x02);
+    this.w.u8(0x7c);
+  }
+  /** select (untyped: both operands numeric), the i32 condition on top. */
+  select(): void {
+    this.w.u8(0x1b);
+  }
   ifVoid(): void {
     this.w.u8(0x04);
     this.w.u8(0x40);
@@ -369,6 +378,9 @@ export class Code {
   i32Xor(): void {
     this.w.u8(0x73);
   }
+  i32Clz(): void {
+    this.w.u8(0x67);
+  }
   i32Shl(): void {
     this.w.u8(0x74);
   }
@@ -429,6 +441,9 @@ export class Code {
    * control — see wasm-math.test.ts). */
   f64Nearest(): void {
     this.w.u8(0x9e);
+  }
+  f64Copysign(): void {
+    this.w.u8(0xa6);
   }
   f64Sqrt(): void {
     this.w.u8(0x9f);

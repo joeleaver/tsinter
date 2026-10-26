@@ -743,7 +743,11 @@ import { PoisonError, newFnCtx, own } from "./lowerer.js";
       };
     }
     const mathFn = isMath ? own(ISLAND_SURFACE.math.fns, name) : undefined;
-    if (mathFn && call.arguments.length === mathFn.args.length) {
+    if (
+      mathFn &&
+      (call.arguments.length === mathFn.args.length ||
+        (mathFn.variadic === true && call.arguments.every((a) => !ts.isSpreadElement(a))))
+    ) {
       L.requireDynamicApi(`'Math.${name}'`, call);
       return finish(
         { kind: "jsOp", op: "globalGet", name: "Math", args: [], type: JSVAL, loc },

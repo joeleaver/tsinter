@@ -2123,16 +2123,15 @@ unary `+` over a non-numeric string all route through `num.fromString`
 that can produce a string-derived NaN to verify. Revisit this row if/when
 `num.fromString` lands.
 
-**Struck: Math-function NaN provenance.** `Math.sqrt`, `Math.log`,
-`Math.pow`, and every other `Math.*` call all REFUSE on this tier today
-(`SC2012` — dyn-engine-only, `milestone: M4`) — there is no in-tier
-arithmetic path that can produce a NaN outside plain `+ - * / % **`.
-Verified directly this round (`Math.sqrt(-1)`/`Math.log(-1)`/
-`Math.pow(-1,0.5)` all refuse). The reviewer's third NaN-payload pattern
-(`Math.log(-1)` → `7ff4000000000000`, neither canonical nor hardware —
-libm's own payload choice) is registered here as a KNOWN FUTURE AXIS,
-not measured against this tier, because nothing compiles today that
-could diverge on it. Revisit when any `Math.*` call lands in-tier.
+**Revisited: Math-function NaN provenance (the Math unit, S100).** This
+paragraph was struck while every `Math.*` call refused on this tier. They
+compute now (under `--dynamic`), and the third NaN-payload pattern is
+measured: `Math.log(-1)` is `7ff4000000000000` in Node — ieee754.cc's
+`std::numeric_limits<double>::signaling_NaN()`, not libm's — and the tier
+returns the same bits, as it does for every NaN a Math member returns
+(S100 lists them, and registers the one place the bits part: a signaling
+NaN stored into a `number[]`). `Math.pow`'s own NaN stays the registered
+`**` row above.
 
 **The registered risk — three items: one KNOWN divergence, two axes not
 currently measured to diverge:**
@@ -6033,8 +6032,8 @@ bits on every engine the compiler runs on.
 the tier and that host's Node can differ in the last bit of `**` for a general exponent; none of those is
 claimed. Exact on every host: the special-value ladder and the exponents 2 and 0.5. The exponents 1 and -1
 are NOT exact by construction: Node answers them from libm too, and `x ** -1` differs from `1 / x` on
-about 1 in 1,200 random bases (C07). `Math.pow` is not part of this: it stays refused (SC2012 in a plain
-build; SC3001 `expr:jsOp` under `--dynamic` on this tier; N01, N02). A NaN result is the tier's canonical
+about 1 in 1,200 random bases (C07). `Math.pow` under `--dynamic` computes through the same helper, so
+its bits are `**`'s (the Math unit, S100; N02); in a plain build it stays SC2012 (N01). A NaN result is the tier's canonical
 NaN (S036; board #158). The native lanes call the C library's `pow` without V8's pre-cases and do not fold
 `**` (board #207).
 
@@ -6643,6 +6642,24 @@ On the wasm lane the global `fetch(input, init?)`, `AbortSignal.timeout(delay)` 
 **Scope:** every lane. Literal format strings keep their compile-time fences for statically typed arguments.
 
 **Tested by:** FMT-FENCE-01 / FMT-FENCE-02 / FMT-DYN-01 in `packages/compiler/test/wasm-fmt-b237.test.ts`; corpus 2746 pins the convertible forms on every lane. Measured against Node v24.18.1.
+
+## S100 — Math's transcendental functions answer the bits of V8 13.6's `base::ieee754` in binary64 without fused multiply-add: Node's bits where Node's V8 is built that way (x86-64, measured), not claimed elsewhere; a signaling NaN a Math member returns keeps its bits when stored into a `number[]`, where V8 quiets it *(wasm tier)*
+
+Node v24.18.1 (V8 13.6.233.17-node.50) computes `Math.sin cos tan asin acos atan atan2 exp expm1 log log1p log2 log10 cbrt sinh cosh tanh asinh acosh atanh` with V8's own `src/base/ieee754.cc`: fdlibm 5.3 with V8's changes (`exp(1)` answers `Math.E`; `atan2` with `x == 1` answers `atan(y)`) and FreeBSD msun's `cosh`, `tanh`, `cbrt` and `log2`. Its `sin` and `cos` would be glibc-derived only under `V8_USE_LIBM_TRIG_FUNCTIONS`, which Node's build does not set (as Chrome's does). Measured on 101,024 inputs per function: Node equals that file compiled natively, and differs from glibc 2.43 (e.g. `Math.log(3)`, `Math.cbrt(2)`), from musl, and from the original fdlibm (Java's StrictMath: e.g. `Math.exp(1)`, `Math.cosh(1)`, `Math.cbrt(0.9991103149666114)`).
+
+**What the tier does.** Under `--dynamic` every Math method and constant is on the island surface (`surfaces.ts`; `hypot` at any plain arity), and the WasmGC tier computes each in the module, with no engine. The twenty functions above are ieee754.cc ITSELF: the file is kept verbatim (`backend/wasm/ieee754-src.ts`, upstream sha256 `1bf99980…a0c2`, its unused legacy `pow` omitted) and compiled to WebAssembly by a compiler for the C subset it is written in (`csubset.ts`: C's integer types, conversions and signedness exactly; IEEE-754 binary64, round to nearest, no contraction — WebAssembly has no fused multiply-add, and V8's x86-64 build of the file has none). A function is compiled into a module on first use, with what it calls (`sin` brings `__ieee754_rem_pio2`, `__kernel_rem_pio2`, `__kernel_sin`, `__kernel_cos`, and `scalbn`, which is musl's, exact). `hypot` is V8's `math.tq` MathHypot (an infinite argument answers Infinity before a NaN one; the 3-argument compensation term; the Kahan-summed path past three arguments). `pow` is `**` (S079). `sqrt`, `fround`, `clz32` and `imul` are the instructions (over ToUint32/ToInt32); `sign` is V8's (±0 and NaN answer themselves); `f16round` rounds the double once, ties to even, to binary16 and back, and answers a NaN as the quiet NaN with the argument's sign, as Node does. The constants are the spec's correctly rounded values. A dynamic argument to one of these island members is converted with ECMA-262 ToNumber before the call computes. (The static members — abs, floor, trunc, ceil, round, min, max — are not part of this: an `any` string argument to one of them throws instead, on every lane; that is pre-existing, board #263.)
+
+NaNs: each function returns the bits Node returns, payload and sign included — ieee754.cc's `signaling_NaN()` is `7ff4000000000000` (`Math.log(-1)`, `log2`, `log1p`, `acos`, `asin`, `acosh`, `atanh` outside their domain), its `quiet_NaN()` `7ff8000000000000` (`log10`), and an arithmetic NaN is the hardware's on both (`Math.sin(Infinity)`, `Math.sqrt(-1)`: `fff8000000000000` on x86-64; S036's "does not fold" row).
+
+**The divergences registered.**
+- **(a) Other builds of Node.** The bits are those of ieee754.cc compiled without contraction. A Node whose V8 compiles that file with fused multiply-add (for example clang's default `-ffp-contract=on` on arm64), or with `V8_USE_LIBM_TRIG_FUNCTIONS`, can differ in the last bit; neither was measured, and neither is claimed. The test rows take their expectations from the Node that runs them, so such a Node reddens them rather than passing them stale.
+- **(b) A signaling NaN stored into a `number[]`.** V8 quiets a signaling NaN on its way into a double-elements array (`[Math.log(-1)][0]` reads back `7ffc000000000000`; a record field, a Map value or a tuple slot keeps `7ff4…`). This tier stores the bits, so the array element reads back `7ff4000000000000`. The same already held for a signaling NaN read from bytes (`buf.readDoubleBE`), the only other in-tier source of one; Math is a new source.
+- **(c) `Math.pow`'s own NaN** is `**`'s: S036's registered `**` row (board #158).
+- **(d) The native lanes (c, llvm) compute these members in their embedded engine (QuickJS) over the system C library's libm, not V8's ieee754.cc,** and differ from Node in the last bit (pre-existing; measured by the unit's review over the same 5,000 inputs per function on the llvm lane, the count of non-NaN answers one ulp or more from Node's; a/b is a of the b inputs inside the function's domain): sin 190, cos 143, tan 201, exp 428, expm1 5, log 71/2985, log2 10, log10 43, log1p 3, cbrt 2268, sinh 72, cosh 308, tanh 38, asinh 829, acosh 257/1705, atanh 268/2124, asin 75, acos 94, atan 118, atan2 916, hypot 1530, pow 0. Outside their domains the NaN bits differ as well — every such input of log, log2, log1p, acos, asin, acosh and atanh (the libm's NaN, not ieee754.cc's `signaling_NaN()`). Corpus programs round transcendentals through `toFixed` for this reason. Board #262 (the native lanes to compute through the same ieee754 code).
+
+**Scope:** (a)–(c) the wasm tier; (d) the native lanes. A plain build of any of these members is SC2012 on every lane.
+
+**Tested by:** `packages/compiler/test/wasm-ieee754.test.ts` — per function about 4,000 seeded inputs plus the edges, both sides of every high-word threshold in that function's C text, and k·π/2 near and far (IEEE, ATAN2, HYPOT arities 0–6, EXACT), compared bit for bit with the live Node; DYN (ToNumber), NAN (the bits above, and (b) pinned both ways), DISC (seven inputs on which glibc or the original fdlibm answers otherwise), LAZY (a module carries only what its members reach). Offline: the twenty functions over 10,001,369 inputs each against Node, every bit equal. Corpus 1110 and 2755 on every lane. Measured against Node v24.18.1 on x86-64.
 
 ## S101 — zlib.deflateSync / zlib.inflateSync on the wasm lane: errors carry name, message and code only (no `errno`), a result's `byteOffset` is 0, and sizes past the engine trap; the llvm and c lanes' deflate bytes are not Node's *(wasm lane; (d) llvm and c, board #257)*
 

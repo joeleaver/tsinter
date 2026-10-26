@@ -535,11 +535,12 @@ test("N01 NOT-LIFTED: Math.pow stays refused (plain build) — a named refusal",
   expect(survey).toEqual([]);
 });
 
-test("N02 NOT-LIFTED: Math.pow stays refused (--dynamic build) — a named refusal", async () => {
-  const src = "// @dynamic\nconst buf = Buffer.alloc(8);\nfunction bits(v: number): string {\n  buf.writeDoubleBE(v, 0);\n  return buf.toString(\"hex\");\n}\nfunction hx(h: string): number {\n  return Buffer.from(h, \"hex\").readDoubleBE(0);\n}\nfunction out(r: number): string {\n  return (r !== r ? \"NaN\" : bits(r)) + (Object.is(r, -0) ? \" IS-NEG-ZERO\" : \"\");\n}\nfunction mp(a: number, b: number): number {\n  return Math.pow(a, b);\n}\nconsole.log(\"N02.1 \" + out(mp(2, 0.5)));\n";
-  const { diagnostics, survey } = await refuseRow("n02", src);
-  expect(diagnostics).toEqual(["SC3001: the wasm backend does not support this construct yet (expr:jsOp); build with the LLVM backend (the default) or the reference C backend (--backend c)"]);
-  expect(survey).toEqual(["expr:jsOp"]);
+test("N02 LIFTED (the Math unit, SEMANTICS.md S100): Math.pow under --dynamic computes through %w.jsPow -- the bits of `**`", async () => {
+  const src = "// @dynamic\nconst buf = Buffer.alloc(8);\nfunction bits(v: number): string {\n  buf.writeDoubleBE(v, 0);\n  return buf.toString(\"hex\");\n}\nfunction out(r: number): string {\n  return (r !== r ? \"NaN\" : bits(r)) + (Object.is(r, -0) ? \" IS-NEG-ZERO\" : \"\");\n}\nfunction mp(a: number, b: number): number {\n  return Math.pow(a, b);\n}\nconst pairs: number[][] = [[2, 0.5], [1.1, 3.7], [-8, 1 / 3], [10, -2], [-0, -3], [0.9999999, 1e10], [3, 2], [1.0000001, -1]];\nfor (const [a, b] of pairs) {\n  const m = mp(a!, b!);\n  console.log(\"N02 \" + out(m) + \" \" + (out(m) === out(a! ** b!) ? \"same\" : \"DIFFERENT\"));\n}\n";
+  const { stdout, stderr, exitCode } = await runRow("n02", src);
+  expect(stdout).toBe("N02 3ff6a09e667f3bcd same\nN02 3ff6c3e91ed0825a same\nN02 NaN same\nN02 3f847ae147ae147b same\nN02 fff0000000000000 same\nN02 0000000000000000 same\nN02 4022000000000000 same\nN02 3fefffffca501b24 same\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
 test("N03 NOT-LIFTED: a compound array-element **= stays refused (SC1090, every compound element op) — a named refusal", async () => {

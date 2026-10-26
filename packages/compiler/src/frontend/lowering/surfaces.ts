@@ -394,6 +394,9 @@ export const STR_METHODS: Record<
 export interface IslandFnEntry {
   args: IrType[];
   ret: IrType;
+  /** Declared with a rest parameter of args[0]'s type: any number of plain
+   * (non-spread) arguments lowers, not only args.length of them. */
+  variadic?: true;
 }
 
 export const ISL_N1: IslandFnEntry = { args: [F64], ret: F64 };
@@ -427,19 +430,26 @@ export const boundaryOutOfIslandMsg = (typeName: string): string =>
 export const ISLAND_SURFACE = {
   /** `Math.<fn>(...)` lowers to callMethod(globalGet("Math"), fn, args);
    * the readonly number props (`Math.PI`) to getProp(globalGet("Math")).
-   * min/max/atan2/hypot/pow are declared with exactly two parameters
-   * (rest/optional parameters aren't representable). */
+   * Every member of Node 24's Math object is here or in STATIC_MATH_FNS:
+   * hypot is declared variadic (`...values: number[]`, any plain arity);
+   * atan2/pow/imul take exactly two. */
   math: {
-    // floor, min/max (two-arg), and random are STATIC now
+    // floor, min/max (any plain arity), and random are STATIC now
     // (STATIC_MATH_FNS below).
     fns: {
-      abs: ISL_N1, acos: ISL_N1, asin: ISL_N1, atan: ISL_N1, atan2: ISL_N2,
-      cbrt: ISL_N1, ceil: ISL_N1, cos: ISL_N1, exp: ISL_N1,
-      hypot: ISL_N2, log: ISL_N1, log2: ISL_N1, log10: ISL_N1, pow: ISL_N2,
+      abs: ISL_N1, acos: ISL_N1, acosh: ISL_N1, asin: ISL_N1, asinh: ISL_N1,
+      atan: ISL_N1, atanh: ISL_N1, atan2: ISL_N2,
+      cbrt: ISL_N1, ceil: ISL_N1, clz32: ISL_N1, cos: ISL_N1, cosh: ISL_N1,
+      exp: ISL_N1, expm1: ISL_N1, f16round: ISL_N1, fround: ISL_N1,
+      hypot: { args: [F64, F64], ret: F64, variadic: true }, imul: ISL_N2,
+      log: ISL_N1, log1p: ISL_N1, log2: ISL_N1, log10: ISL_N1, pow: ISL_N2,
       round: ISL_N1,
-      sign: ISL_N1, sin: ISL_N1, sqrt: ISL_N1, tan: ISL_N1, trunc: ISL_N1,
+      sign: ISL_N1, sin: ISL_N1, sinh: ISL_N1, sqrt: ISL_N1, tan: ISL_N1,
+      tanh: ISL_N1, trunc: ISL_N1,
     } as Record<string, IslandFnEntry | undefined>,
-    props: { PI: F64, E: F64 } as Record<string, IrType | undefined>,
+    props: {
+      PI: F64, E: F64, LN10: F64, LN2: F64, LOG10E: F64, LOG2E: F64, SQRT1_2: F64, SQRT2: F64,
+    } as Record<string, IrType | undefined>,
   },
   /** Methods on `number` receivers. The receiver marshals by value; the
    * engine auto-boxes primitives on method calls, so `this` binds the

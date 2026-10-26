@@ -292,6 +292,7 @@ import { UnionBuilder, type UnionArmRep } from "./unions.js";
 import { Code } from "./code.js";
 import { buildF64ToStr } from "./numfmt.js";
 import { buildPowCore, jsPowValue } from "./pow.js";
+import { Ieee754, IEEE754_MEMBERS } from "./ieee754.js";
 import { F64, I32, I64, ModuleBuilder, type FieldType, type StorageType, type ValType } from "./module.js";
 import {
   asIrModule,
@@ -1695,6 +1696,26 @@ function isIslandObjectCreate(rec: Record<string, unknown>): boolean {
  * SAME answer Node gives for a literal expression, explicitly, rather
  * than passing through whatever bits our own fold computation produced. */
 const CANONICAL_NAN: number = new Float64Array(new BigUint64Array([0x7ff8000000000000n]).buffer)[0]!;
+
+/** Math's eight value properties (ECMA-262 21.3.1), each the correctly
+ * rounded binary64 value the spec names -- identical on every engine. */
+const MATH_CONSTANTS: ReadonlyMap<string, number> = new Map([
+  ["E", Math.E], ["LN10", Math.LN10], ["LN2", Math.LN2], ["LOG10E", Math.LOG10E],
+  ["LOG2E", Math.LOG2E], ["PI", Math.PI], ["SQRT1_2", Math.SQRT1_2], ["SQRT2", Math.SQRT2],
+]);
+
+/** The Math methods the island surface (surfaces.ts ISLAND_SURFACE.math)
+ * brings to the emitter as callMethod(globalGet("Math"), ...), at the
+ * argument counts it brings them with; emitIslandMath computes each.
+ * abs/ceil/round/trunc are tabled there too but never arrive (the static
+ * table, STATIC_MATH_FNS, takes their only arity first), so they are not
+ * served here: they would refuse. */
+function islandMathServed(name: string, nargs: number): boolean {
+  if (name === "hypot") return true;
+  if (name === "atan2" || name === "pow" || name === "imul") return nargs === 2;
+  if (IEEE754_MEMBERS.has(name)) return nargs === 1;
+  return ["sqrt", "sign", "fround", "f16round", "clz32"].includes(name) && nargs === 1;
+}
 
 /* ── increment 21 stage B, gate 3: the Function-eval recognizer ──────────
  * (design note: scratchpad/function-helper-decision.md, Option A —
@@ -28328,25 +28349,24 @@ class Assembler {
             // helper, let alone need a runtime check for them there.
             if (e.name === undefined) throw new Error("emitter bug: jsOp getProp without a name");
             const name = e.name;
-            // Math.PI / Math.E (D4-i, INC-25 P4): globalGet's CLOSED
-            // TABLE shape, matched BEFORE walkExpr ever runs on the
-            // receiver sub-expression — the SAME structural check the
-            // callMethod arm's own Promise/JSON precedent uses (~line
-            // 15737's own comment). ONLY these two: ISLAND_SURFACE.
-            // math.props (surfaces.ts) is measured to be exactly
-            // `{ PI: F64, E: F64 }`, and every OTHER Math data property
-            // (LN10, LN2, ...) refuses at the FRONTEND (SC2020, measured
-            // this pass) before any backend ever sees it — tabling them
-            // here would be genuinely unreachable code (CP1 §8, R10).
-            // A bare globalGet reached any other way still refuses
-            // named (case "globalGet" below, `expr:${e.kind}`).
+            // Math.PI, Math.E and the other six Math constants (D4-i,
+            // INC-25 P4; the Math unit, SEMANTICS.md S100):
+            // globalGet's CLOSED TABLE shape, matched BEFORE walkExpr ever
+            // runs on the receiver sub-expression — the SAME structural
+            // check the callMethod arm's own Promise/JSON precedent uses.
+            // ISLAND_SURFACE.math.props (surfaces.ts) is exactly these
+            // eight; each is the correctly rounded binary64 value ECMA-262
+            // names, the same bits on every engine. A bare globalGet
+            // reached any other way still refuses named (case
+            // "globalGet" below, `expr:${e.kind}`).
+            const mathConst = MATH_CONSTANTS.get(name);
             if (
-              (name === "PI" || name === "E") &&
+              mathConst !== undefined &&
               e.args[0]!.kind === "jsOp" &&
               e.args[0]!.op === "globalGet" &&
               e.args[0]!.name === "Math"
             ) {
-              this.dyn.boxNum(code, (x) => x.f64Const(name === "PI" ? Math.PI : Math.E));
+              this.dyn.boxNum(code, (x) => x.f64Const(mathConst));
               return;
             }
             // "__proto__"/"caller"/"arguments" ride the gate as SPECIAL
@@ -28707,6 +28727,19 @@ class Assembler {
             // ambient-object representation nothing else needs.
             const globalGetName =
               e.args[0]!.kind === "jsOp" && e.args[0]!.op === "globalGet" ? e.args[0]!.name : undefined;
+            if (globalGetName === "Math") {
+              // Math.<fn>(...) from the island surface (SEMANTICS.md S100):
+              // computed here, boxed for the dynamic value the IR asks for
+              // (the jsExit<f64> arm computes it unboxed instead).
+              const margs = e.args.slice(1);
+              if (!islandMathServed(name, margs.length)) {
+                this.refuse(`expr:${e.kind}`, e.loc);
+                code.unreachable();
+                return;
+              }
+              this.dyn.boxNum(code, () => this.emitIslandMath(name, margs));
+              return;
+            }
             if (globalGetName === "AbortSignal") {
               // #227: AbortSignal.timeout(delay) and the argument-less
               // AbortSignal.abort() (fetch.ts); a reason for abort() and
@@ -29631,6 +29664,21 @@ class Assembler {
        * plain read, no copy, no cast of the vector itself). */
       case "jsExit": {
         const t = e.type;
+        if (
+          t.kind === "f64" &&
+          e.value.kind === "jsOp" &&
+          e.value.op === "callMethod" &&
+          e.value.args[0]!.kind === "jsOp" &&
+          e.value.args[0]!.op === "globalGet" &&
+          e.value.args[0]!.name === "Math" &&
+          e.value.name !== undefined &&
+          islandMathServed(e.value.name, e.value.args.length - 1)
+        ) {
+          // A Math call's number is already the f64 the exit wants: no box
+          // (SEMANTICS.md S100).
+          this.emitIslandMath(e.value.name, e.value.args.slice(1));
+          return;
+        }
         if (t.kind === "f64" || t.kind === "bool" || t.kind === "string") {
           const wantDK = t.kind === "f64" ? DK.NUM : t.kind === "bool" ? DK.BOOL : DK.STR;
           const wantDesc = t.kind === "f64" ? "number" : t.kind === "bool" ? "boolean" : "string";
@@ -49156,6 +49204,367 @@ class Assembler {
     c.i32Or();
     c.i32Eqz();
     this.mb.setBody(idx, [I32], c.bytes());
+    return idx;
+  }
+
+  private ieee754: Ieee754 | null = null;
+  private f16roundFunc: number | null = null;
+
+  /** Math.<name>(...args) as an f64 on the stack, for a member
+   * islandMathServed accepts (SEMANTICS.md S100). Every argument is
+   * evaluated, left to right, before any is converted: a number marshalled
+   * into the call (jsMarshal of an f64) is used as is; any other argument is
+   * a dynamic value and gets ECMA-262 ToNumber (jsToNumber, which cannot
+   * throw on this tier -- no valueOf hook exists to run). Then:
+   *  - the transcendentals are V8's base::ieee754 functions (ieee754.ts);
+   *  - pow is `**` (%w.jsPow, SEMANTICS.md S079), as V8's MathPow is;
+   *  - sqrt, fround (f32.demote_f64 rounds to nearest even) and the integer
+   *    pair clz32 / imul (over ECMA-262 ToUint32 / ToInt32 -- the same 32
+   *    bits) are the instructions; sign is V8's MathSign (x < 0 ? -1 :
+   *    x > 0 ? 1 : x, so ±0 and NaN are themselves); f16round is
+   *    %w.f16round;
+   *  - hypot is V8's math.tq MathHypot (emitHypot). */
+  private emitIslandMath(name: string, args: WExpr[]): void {
+    const code = this.fn.code;
+    const dynRef = this.dyn.dynRef();
+    const xs: number[] = [];
+    const pending: [number, number][] = [];
+    for (const a of args) {
+      const x = this.acquireScratch(F64);
+      if (a.kind === "jsMarshal" && a.value.type.kind === "f64") {
+        this.walkExpr(a.value);
+        code.localSet(x);
+      } else {
+        const d = this.acquireScratch(dynRef);
+        this.walkExpr(a);
+        code.localSet(d);
+        pending.push([d, x]);
+      }
+      xs.push(x);
+    }
+    for (const [d, x] of pending) {
+      code.localGet(d);
+      code.call(this.jsToNumberHelper());
+      code.localSet(x);
+      this.releaseScratch(dynRef, d);
+    }
+    const arg = (i: number): void => code.localGet(xs[i]!);
+    if (IEEE754_MEMBERS.has(name)) {
+      this.ieee754 ??= new Ieee754(this.mb);
+      for (let i = 0; i < xs.length; i++) arg(i);
+      code.call(this.ieee754.fn(name));
+    } else if (name === "pow") {
+      arg(0);
+      arg(1);
+      code.call(this.jsPowHelper());
+    } else if (name === "sqrt") {
+      arg(0);
+      code.f64Sqrt();
+    } else if (name === "fround") {
+      arg(0);
+      code.f32DemoteF64();
+      code.f64PromoteF32();
+    } else if (name === "f16round") {
+      arg(0);
+      code.call(this.f16roundHelper());
+    } else if (name === "clz32") {
+      arg(0);
+      code.call(this.toInt32Helper());
+      code.i32Clz();
+      code.f64ConvertI32S();
+    } else if (name === "imul") {
+      arg(0);
+      code.call(this.toInt32Helper());
+      arg(1);
+      code.call(this.toInt32Helper());
+      code.i32Mul();
+      code.f64ConvertI32S();
+    } else if (name === "sign") {
+      arg(0);
+      code.f64Const(0);
+      code.f64Lt();
+      code.ifResult(F64);
+      code.f64Const(-1);
+      code.else_();
+      arg(0);
+      code.f64Const(0);
+      code.f64Gt();
+      code.ifResult(F64);
+      code.f64Const(1);
+      code.else_();
+      arg(0);
+      code.end();
+      code.end();
+    } else if (name === "hypot") {
+      this.emitHypot(xs);
+    } else {
+      throw new Error(`wasm emitter bug: Math.${name} passed islandMathServed but has no arm`);
+    }
+    for (const x of xs) this.releaseScratch(F64, x);
+  }
+
+  /** V8 13.6 src/builtins/math.tq MathHypot over the (already ToNumber'd)
+   * argument locals, leaving the f64 result: FastMathHypot for up to three
+   * arguments (an infinite argument answers Infinity before NaN is looked
+   * at; max == 0 answers 0; the 3-argument compensation term), the slow path
+   * beyond (NaN arguments stay out of max, then Infinity, NaN, 0, and a
+   * Kahan sum of (v / max)^2 in argument order). */
+  private emitHypot(xs: number[]): void {
+    const code = this.fn.code;
+    const n = xs.length;
+    if (n === 0) {
+      code.f64Const(0);
+      return;
+    }
+    // absolute values, in place
+    for (const x of xs) {
+      code.localGet(x);
+      code.f64Abs();
+      code.localSet(x);
+    }
+    if (n === 1) {
+      code.localGet(xs[0]!);
+      return;
+    }
+    const max = this.acquireScratch(F64);
+    const isInf = (x: number): void => {
+      code.localGet(x);
+      code.f64Const(Infinity);
+      code.f64Eq();
+    };
+    /** (v / max) * (v / max) */
+    const sq = (x: number): void => {
+      code.localGet(x);
+      code.localGet(max);
+      code.f64Div();
+      code.localGet(x);
+      code.localGet(max);
+      code.f64Div();
+      code.f64Mul();
+    };
+    code.blockF64();
+    if (n <= 3) {
+      isInf(xs[0]!);
+      for (let i = 1; i < n; i++) {
+        isInf(xs[i]!);
+        code.i32Or();
+      }
+      code.ifVoid();
+      code.f64Const(Infinity);
+      code.br(1);
+      code.end();
+      code.localGet(xs[0]!);
+      code.localGet(xs[1]!);
+      code.f64Max();
+      if (n === 3) {
+        code.localGet(xs[2]!);
+        code.f64Max();
+      }
+      code.localSet(max);
+      code.localGet(max);
+      code.localGet(max);
+      code.f64Ne();
+      code.ifVoid();
+      code.f64Const(CANONICAL_NAN);
+      code.br(1);
+      code.end();
+    } else {
+      const nan = this.acquireScratch(I32);
+      code.i32Const(0);
+      code.localSet(nan);
+      code.f64Const(0);
+      code.localSet(max);
+      for (const x of xs) {
+        code.localGet(x);
+        code.localGet(x);
+        code.f64Ne();
+        code.ifVoid();
+        code.i32Const(1);
+        code.localSet(nan);
+        code.else_();
+        code.localGet(x);
+        code.localGet(max);
+        code.f64Gt();
+        code.ifVoid();
+        code.localGet(x);
+        code.localSet(max);
+        code.end();
+        code.end();
+      }
+      isInf(max);
+      code.ifVoid();
+      code.f64Const(Infinity);
+      code.br(1);
+      code.end();
+      code.localGet(nan);
+      code.ifVoid();
+      code.f64Const(CANONICAL_NAN);
+      code.br(1);
+      code.end();
+      this.releaseScratch(I32, nan);
+    }
+    code.localGet(max);
+    code.f64Const(0);
+    code.f64Eq();
+    code.ifVoid();
+    code.f64Const(0);
+    code.br(1);
+    code.end();
+    if (n === 2) {
+      sq(xs[0]!);
+      sq(xs[1]!);
+      code.f64Add();
+      code.f64Sqrt();
+      code.localGet(max);
+      code.f64Mul();
+    } else if (n === 3) {
+      const pa = this.acquireScratch(F64);
+      const pb = this.acquireScratch(F64);
+      const comp = this.acquireScratch(F64);
+      sq(xs[0]!);
+      code.localSet(pa);
+      sq(xs[1]!);
+      code.localSet(pb);
+      // compensation = (powerA + powerB) - powerA - powerB
+      code.localGet(pa);
+      code.localGet(pb);
+      code.f64Add();
+      code.localGet(pa);
+      code.f64Sub();
+      code.localGet(pb);
+      code.f64Sub();
+      code.localSet(comp);
+      // sqrt(powerA + powerB + powerC) * max, powerC = (c/max)^2 - compensation
+      code.localGet(pa);
+      code.localGet(pb);
+      code.f64Add();
+      sq(xs[2]!);
+      code.localGet(comp);
+      code.f64Sub();
+      code.f64Add();
+      code.f64Sqrt();
+      code.localGet(max);
+      code.f64Mul();
+      this.releaseScratch(F64, pa);
+      this.releaseScratch(F64, pb);
+      this.releaseScratch(F64, comp);
+    } else {
+      const sum = this.acquireScratch(F64);
+      const comp = this.acquireScratch(F64);
+      const v = this.acquireScratch(F64);
+      const summand = this.acquireScratch(F64);
+      const prelim = this.acquireScratch(F64);
+      code.f64Const(0);
+      code.localSet(sum);
+      code.f64Const(0);
+      code.localSet(comp);
+      for (const x of xs) {
+        code.localGet(x);
+        code.localGet(max);
+        code.f64Div();
+        code.localSet(v);
+        // summand = n * n - compensation
+        code.localGet(v);
+        code.localGet(v);
+        code.f64Mul();
+        code.localGet(comp);
+        code.f64Sub();
+        code.localSet(summand);
+        // preliminary = sum + summand
+        code.localGet(sum);
+        code.localGet(summand);
+        code.f64Add();
+        code.localSet(prelim);
+        // compensation = (preliminary - sum) - summand
+        code.localGet(prelim);
+        code.localGet(sum);
+        code.f64Sub();
+        code.localGet(summand);
+        code.f64Sub();
+        code.localSet(comp);
+        code.localGet(prelim);
+        code.localSet(sum);
+      }
+      code.localGet(sum);
+      code.f64Sqrt();
+      code.localGet(max);
+      code.f64Mul();
+      for (const l of [sum, comp, v, summand, prelim]) this.releaseScratch(F64, l);
+    }
+    code.end();
+    this.releaseScratch(F64, max);
+  }
+
+  /** %w.f16round(x: f64) → f64 — ECMA-262 Math.f16round: x rounded to the
+   * nearest IEEE-754 binary16 value (ties to even) in ONE rounding from the
+   * double (never through binary32), back as a double. With a = |x|: any NaN
+   * is the quiet NaN with x's sign (Node's answer, payload or not); a >= 65520 (65504 plus half its ulp, which ties up to 2^16) is
+   * Infinity; otherwise q = 2^(max(e, -14) - 10) is the binary16 quantum at
+   * a's binade e, a / q and the product back are exact (powers of two), and
+   * f64.nearest rounds ties to even. The sign is copied back, so -0 and tiny
+   * negatives give -0. */
+  private f16roundHelper(): number {
+    if (this.f16roundFunc !== null) return this.f16roundFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([F64], [F64]), "%w.f16round");
+    this.f16roundFunc = idx;
+    const c = new Code();
+    const X = 0, A = 1, Q = 2;
+    const E = 3; // i32
+    c.localGet(X);
+    c.localGet(X);
+    c.f64Ne();
+    c.ifVoid();
+    // Node's answer for every NaN, whatever its payload: the quiet NaN with x's sign (measured)
+    c.f64Const(CANONICAL_NAN);
+    c.localGet(X);
+    c.f64Copysign();
+    c.return_();
+    c.end();
+    c.localGet(X);
+    c.f64Abs();
+    c.localSet(A);
+    c.localGet(A);
+    c.f64Const(65520);
+    c.f64Ge();
+    c.ifVoid();
+    c.f64Const(Infinity);
+    c.localGet(X);
+    c.f64Copysign();
+    c.return_();
+    c.end();
+    // e = a's unbiased exponent, at least -14 (a subnormal double reads -1023)
+    c.localGet(A);
+    c.i64ReinterpretF64();
+    c.i64Const(52n);
+    c.i64ShrU();
+    c.i32WrapI64();
+    c.i32Const(1023);
+    c.i32Sub();
+    c.localTee(E);
+    c.i32Const(-14);
+    c.localGet(E);
+    c.i32Const(-14);
+    c.i32GtS();
+    c.select();
+    c.localSet(E);
+    // q = 2^(e - 10), a normal double for e - 10 in [-24, 5]
+    c.localGet(E);
+    c.i32Const(1023 - 10);
+    c.i32Add();
+    c.i64ExtendI32U();
+    c.i64Const(52n);
+    c.i64Shl();
+    c.f64ReinterpretI64();
+    c.localSet(Q);
+    c.localGet(A);
+    c.localGet(Q);
+    c.f64Div();
+    c.f64Nearest();
+    c.localGet(Q);
+    c.f64Mul();
+    c.localGet(X);
+    c.f64Copysign();
+    this.mb.setBody(idx, [F64, F64, I32], c.bytes());
     return idx;
   }
 

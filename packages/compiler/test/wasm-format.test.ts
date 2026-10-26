@@ -503,7 +503,7 @@ describe("wasm dyn toString(radix) — D4-iii, a transcription of V8's DoubleToR
 // ============================================================================
 // DYN: Math.PI / Math.E (D4-i) — the getProp closed-table shape
 // ============================================================================
-describe("wasm dyn Math.PI / Math.E — D4-i, the getProp closed-table shape (CP1 ack R10: {PI, E} only)", () => {
+describe("wasm dyn Math constants — D4-i, the getProp closed-table shape (CP1 ack R10: {PI, E}; the Math unit, S100: all eight)", () => {
   test("1112's own verbatim call, plus the bare values and Math.E", async () => {
     const src =
       "console.log(`${Math.PI.toFixed(3)}`);\n" +
@@ -519,11 +519,21 @@ describe("wasm dyn Math.PI / Math.E — D4-i, the getProp closed-table shape (CP
     expect(stdout).toBe(nodeOut);
   });
 
-  test("NEGATIVE CONTROL: a Math.<fn>() island call still REFUSES named (expr:jsOp is untouched by the getProp special case)", async () => {
-    const res = await buildWasm("mathfn-negative.ts", "console.log(`${Math.LN10}`);\n", true);
+  test("the Math unit (SEMANTICS.md S100): the other six constants join the closed table, Node's digits", async () => {
+    const src = "console.log(`${Math.LN10} ${Math.LN2} ${Math.LOG10E} ${Math.LOG2E} ${Math.SQRT1_2} ${Math.SQRT2}`);\n";
+    const res = await buildWasm("mathconst-six.ts", src, true);
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => d.code + ":" + d.message).join(" | ")}`);
+    const { stdout } = await runWasm(res.binaryPath);
+    const jsFile = join(scratch, "mathconst-six.ts-oracle.js");
+    await writeFile(jsFile, stripTsForOracle(src));
+    expect(stdout).toBe(execFileSync(process.execPath, [jsFile], { encoding: "utf8" }));
+  });
+
+  test("NEGATIVE CONTROL: a Math method read as a value still REFUSES named (no value form exists)", async () => {
+    const res = await buildWasm("mathfn-negative.ts", "const f = Math.LN10 > 2 ? Math.sin : Math.cos;\nconsole.log(f(1));\n", true);
     expect(res.ok).toBe(false);
     if (res.ok) return;
-    expect(res.diagnostics[0]?.code).toBe("SC2020");
+    expect(res.diagnostics[0]?.code).toBe("SC1090");
   });
 
   test("board #124's nesting hole, closed: 1112's own Math.PI.toFixed no longer masks anything — the program claims byte-exact", async () => {

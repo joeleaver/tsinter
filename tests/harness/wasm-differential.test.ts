@@ -3581,6 +3581,11 @@ const TIER_FLOOR: string[] = [
   // The zlib unit: deflateSync / inflateSync as a port of Node's bundled
   // Chromium zlib (zlib.ts) — Node's bytes and Node's errors: 1072 -> 1073.
   "1404-zlib-crypto-bytes.ts",
+  // The Math unit: every Math method and constant on the island surface,
+  // the transcendentals compiled from V8's own src/base/ieee754.cc
+  // (ieee754.ts, csubset.ts; SEMANTICS.md S100): 1073 -> 1075.
+  "1110-math-members.ts",
+  "2755-math-full-surface.ts",
 ];
 
 interface RunResult {

@@ -115,14 +115,14 @@ es2025-fences.ts:26:13 - error SC2020: 'new Float16Array' is part of the standar
 
   hint: the type checker sees the full standard library, but only the supported surface compiles (https://scriptc.dev/limitations)
 
-es2025-fences.ts:27:13 - error SC2020: 'Math.f16round' is part of the standard library types but has no scriptc lowering yet
+es2025-fences.ts:27:13 - error SC2012: 'Math.f16round' runs in the embedded dynamic engine, which this build does not include
 
   26 | const f16 = new Float16Array(4);
   27 | console.log(Math.f16round(1.337));
-     |             ^~~~~~~~~~~~~
+     |             ^~~~~~~~~~~~~~~~~~~~
   28 | const dv = new DataView(new Uint8Array(8).buffer);
 
-  hint: the type checker sees the full standard library, but only the supported surface compiles (https://scriptc.dev/limitations)
+  hint: build with --dynamic to run this call in the embedded engine (adds ~620KB to the binary); static builds never include it
 
 es2025-fences.ts:29:1 - error SC2020: 'DataView<ArrayBuffer>.setFloat16' is part of the standard library types but has no scriptc lowering yet
 
