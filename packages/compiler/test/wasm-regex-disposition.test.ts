@@ -48,6 +48,14 @@ describe("usesModifierGroup", () => {
     const ast = parseOrThrow("(a|b)+[c-e]*\\d{2,3}", false, false, false, false);
     expect(usesModifierGroup(ast, false, false, false)).toBe(false);
   });
+  test("false: \\b under top-level /i (word_boundary has no /i form without /u) — unit P1's gate found it refused", () => {
+    const ast = parseOrThrow("\\bfoo\\B", true, false, false, false);
+    expect(usesModifierGroup(ast, true, false, false, false)).toBe(false);
+  });
+  test("true: (?i:\\b) under /u turns word_boundary_i on", () => {
+    const ast = parseOrThrow("(?i:\\b)", false, false, false, true);
+    expect(usesModifierGroup(ast, false, false, false, true)).toBe(true);
+  });
   test("false: (?:a) non-capturing group is NOT a modifier group", () => {
     const ast = parseOrThrow("(?:a)", false, false, false, false);
     expect(usesModifierGroup(ast, false, false, false)).toBe(false);

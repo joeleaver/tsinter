@@ -3076,7 +3076,10 @@ stay exact; `Object.create` over one (the built-in stand-in refusal —
 Node's accessors would throw on the non-RegExp result); and
 `structuredClone` of the value. The
 emitter's own `new RegExp(...)` arm refuses a pattern not known at
-compile time (`regexp-dynamic-pattern`), a pattern Node's `.source`
+compile time (`regexp-dynamic-pattern`) — since unit P1 only when the
+pattern or flags is not statically a string: a string known only at run
+time (a run-time regex value's own `.source` / `.flags`) compiles at run
+time as S065's run-time arm and S102 say —, a pattern Node's `.source`
 would escape (`regexp-source-escape`: an unescaped `/`, a line
 terminator, the empty pattern) and an invalid flag string
 (`regexp-invalid-flags`); the front end already refuses a regex value
@@ -5378,6 +5381,23 @@ only; the message-text axis is corpus-unpinnable (latent, per REACH
 above) and is recorded here as the measurement of record rather than
 guarded by a test.
 
+**Amendment (unit P1): the run-time arm.** A NON-CONSTANT argument no
+longer refuses (`libCall:regex.new:dynamic-pattern` / `:dynamic-flags`
+are retired): the wasm tier compiles the pattern when the program runs
+(`regex-compiler.ts`, `%w.rec.compile`) and builds the same value the
+constant arm embeds — the same bytecode, held equal by
+`packages/compiler/test/wasm-regex-runtime-compiler.test.ts`. An invalid
+run-time pattern or flags string (one holding both `u` and `v` included,
+before the /v fence) throws Node's catchable `SyntaxError`
+at the construction point with V8's exact message (the RAW pattern, the
+CANONICAL flags — `new RegExp("(", "ig")` reports `/(/gi`, at build
+time too, which this unit corrected), wherever that gate measured V8
+agreeing on the reason and on which error is reported first; a pattern
+outside the tier throws the named Error of S102. A constant pattern
+whose syntax error the build-time pipeline cannot word (the old
+`libCall:regex.new:unclassified-syntax-error`) now goes through the
+run-time compiler too and throws V8's text. Native lanes unchanged.
+
 **Board #117** tracks the native fix: make the native lanes throw a
 catchable `SyntaxError` at construction rather than aborting at first
 use, bring their message text to V8's, and rewrite the doc comment at
@@ -6792,3 +6812,79 @@ How deflate is driven and which inflate decoder runs are not observable: `inflat
 **Scope:** (a)-(c) the wasm lane; (d) the llvm and c lanes.
 
 **Tested by:** 1404 on the wasm census; the "zlib unit rows" block of `tests/harness/wasm-differential.test.ts` (ZL-RT-01 round trips, ZL-HEX-01 deflate bytes, ZL-ERR-01 every error kind's name, message and code, ZL-HOST-01 no import); `packages/compiler/test/wasm-zlib.test.ts` (Z-DEF-01..03 deflate bytes at every boundary size, 300 fuzzed lengths and every level 0-9 against live Node; Z-RT-01; Z-INF-01 Node-produced streams across levels, strategies, memLevels and windowBits; Z-ERR-01 one input per error with Node's errno pinned per (a); Z-ERR-02 every truncation of seven streams; Z-ERR-03 seeded mutation fuzz; Z-PROG-01..03 compiled programs against Node runs). (b) is measured, not pinned; (c) is not measured. Measured against Node v24.18.1.
+
+## S102 — a run-time `new RegExp` pattern or flags string outside this tier, or a syntax error whose V8 wording or precedence is unmeasured, throws a catchable named Error where Node builds the regex or throws a SyntaxError *(wasm lane only)*
+
+`new RegExp(pattern, flags)` over strings known only at run time compiles
+in the module (S065's run-time arm). Where the BUILD-TIME pipeline
+refuses a constant pattern by name, the run-time compiler throws instead:
+an `Error` (name `Error`) whose message is `new RegExp(): '<key>' is not
+supported yet` and whose `code` is `libCall:regex.new:<key>`, the
+build-time refusal key word for word, thrown at the construction point
+and catchable. Keys: `unicode-sets-flag` (/v), `unicode-casefold` (/i with
+/u), `modifiers` (a `(?ims-ims:…)` group that changes how an atom
+compiles), `unported-unicode-property` (a `\p{…}` name outside
+General_Category, including Script and binary properties Node knows),
+the eight `annexb-*` families of legacy syntax (S065's literal arm
+refuses the same ones), `too-many-captures` (255; V8 allows more),
+`too-many-registers`, `too-many-ranges`, `nesting-depth` (256 nested
+groups), `pattern-too-large` (below). Node builds every one of these that
+is valid, or throws its SyntaxError for one that is not (a fence takes
+precedence over a later syntax error Node would report — except under
+/iu, where the /u grammar runs first and a syntax error wins, as in
+Node; and a flags string with both `u` and `v` is Node's "Invalid flags"
+SyntaxError, before the /v fence).
+
+**`pattern-too-large`.** V8 compiles a regex lazily, at its first
+match, and there throws "Regular expression too large" or "Stack
+overflow" for a large pattern (a valid one it constructed without
+complaint) — at a size that depends on the construct mix and the native
+stack: measured with Node v24.18.1, 32,768 plain characters fail, 32,767
+pass; the smallest failing pattern found was 14,008 code units of `a+`
+under /u (`a?` 17,832, `(?<=a)` 34,056 — sweeps over 28 one- to
+three-character units and five nestings). No crisp limit exists to
+mirror, so a valid pattern longer than 8,192 UTF-16 code units is fenced
+at construction (every unit swept at 8,192 compiled and ran in Node), and
+a regex literal or folded constant that long refuses at build time
+(`expr:regexLit:pattern-too-large` / `libCall:regex.new:pattern-too-
+large`). Node builds and matches patterns between 8,193 code units and
+its own limit; this tier refuses them by name.
+
+**Build time follows the same verdicts.** A constant pattern the
+build-time pipeline cannot word as a SyntaxError, or one it would build
+where V8 rejects (a group name used twice — libregexp's duplicate rule is
+looser than V8's; `\k` inside a class when the pattern has named groups),
+is compiled by the run-time compiler over the constant texts, so it
+throws Node's SyntaxError at the construction point (or builds, when V8
+accepts the duplicate). Every other outcome is Node's: the
+value (source, canonical flags, bytecode) or V8's SyntaxError text. Where
+V8's checks differ from libregexp's the run-time compiler follows V8: a
+duplicate group name is checked as the group closes with V8's own
+"non-participating interval" rule (which accepts some duplicates the
+ES2025 rule rejects, e.g. `(?<a>y)(?:z|(?<a>w))`); an undefined
+`\k<name>` is reported after the whole pattern parsed; `a{2,1` without
+/u is a literal.
+
+**Measured, not assumed.** The gate of record compares the run-time
+compiler with the build-time pipeline (bytes, capture count, group
+names, source, flags), with libregexp's `lre_compile`, and with Node over
+31,114 (pattern, flags) pairs: the 140 claim patterns, the generated
+grammar corpus, every regex literal and `new RegExp(<literal>)` in
+tests/corpus, the regex unit tests' fixtures, hand-picked precedence
+rows and 30,000 seeded mutations — zero accepted where Node throws, zero
+wrong messages, zero byte differences from the build-time pipeline, and
+the build-time pipeline never builds a regex Node rejects. Four further
+300,000-mutation sweeps (seeds 7, 11, 12, 21) were run by hand, clean.
+
+**Cost.** A module that needs the run-time compiler carries it: about
+58 KB of code and tables (the review's measure, 84,886 against 26,898
+bytes for the same small program with a constant pattern).
+
+**Scope:** the wasm lane. The native lanes compile run-time patterns with
+libregexp and keep S065's native arm.
+
+**Tested by:** `packages/compiler/test/wasm-regex-runtime-compiler.test.ts`
+(the gate), `packages/compiler/test/wasm-regex-runtime-new.test.ts`
+(RTN-01..07, end to end against Node; RTN-03 pins the fence's message and
+code), corpus 2448 and 2748 on the wasm census. Measured against Node
+v24.18.1.

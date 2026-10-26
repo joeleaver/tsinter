@@ -73,8 +73,13 @@ export class RegexBuilder {
     private readonly mb: ModuleBuilder,
     private readonly strType: number,
   ) {
-    this.bcType = mb.arrayType("i8", false);
-    this.strArrType = mb.arrayType(this.strRef(), false);
+    // MUTABLE element types (unit P1, the run-time compiler): an
+    // immutable array can only be created from a data segment or a fixed
+    // operand list, and regex-compiler.ts builds both the bytecode and
+    // the group-name list of a run-time pattern element by element. No
+    // reader ever writes either array; the struct fields stay immutable.
+    this.bcType = mb.arrayType("i8", true);
+    this.strArrType = mb.arrayType(this.strRef(), true);
     // Field order below is the ORDER struct.new expects operands on the
     // stack in regexLiteral() — source, flags, bytecode, captureCount,
     // groupNames. Changing one without the other is a live miscompile,

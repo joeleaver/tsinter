@@ -225,6 +225,16 @@ const GC_COMPOSITE_MASK: readonly number[] = [
   gcBit("Cc") | gcBit("Cf") | gcBit("Cs") | gcBit("Co") | gcBit("Cn"), // C
 ];
 
+/** The category mask a GC_NAME_ROWS row resolves to (the row-to-mask half
+ * of unicodeGeneralCategory below), and the Lu/Ll bits the decode's
+ * alternating-run marker reads — exported for the run-time compiler
+ * (regex-compiler.ts), which embeds GC_TABLE and decodes it in wasm. */
+export function gcRowMask(row: number): number {
+  return row <= GC_CO_IDX ? 1 << row : GC_COMPOSITE_MASK[row - GC_LC_IDX]!;
+}
+export const GC_LU_BIT = gcBit("Lu");
+export const GC_LL_BIT = gcBit("Ll");
+
 /** unicode_general_category1 (libunicode.c:1288) — the single left-to-
  * right RLE decode over GC_TABLE: each byte's top 3 bits are a short run
  * length (7 = escape to a longer length in following bytes, itself
@@ -350,14 +360,21 @@ export function parseUnicodeProperty(pattern: string, pos: number, isInv: boolea
   let name = "";
   while (isUnicodePropChar(pattern.charCodeAt(p))) name += pattern[p++];
   let value = "";
+  let hasEq = false;
   if (pattern.charCodeAt(p) === 0x3d /* '=' */) {
     p++;
+    hasEq = true;
     while (isUnicodePropChar(pattern.charCodeAt(p))) value += pattern[p++];
   }
   if (pattern.charCodeAt(p) !== 0x7d /* '}' */) {
     return { cr: null, next: p, error: "expecting '}'" };
   }
   p++;
+  // `\p{L=}`: an EMPTY value after '=' is not the bare-name form (V8:
+  // "Invalid property name"); before the run-time compiler unit's gate
+  // found it, it resolved as \p{L}. Unresolvable here, like any name
+  // outside General_Category.
+  if (hasEq && value === "") return { cr: null, next: p };
 
   let cr: CharRange | null;
   if (value === "" && (name === "Script" || name === "sc" || name === "Script_Extensions" || name === "scx")) {

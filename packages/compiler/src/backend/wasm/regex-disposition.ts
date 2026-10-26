@@ -145,7 +145,7 @@ export function usesUnicodeCasefold(ignoreCase: boolean, unicode: boolean): bool
  * argument. `topIgnoreCase`/`topMultiline`/`topDotAll` are the
  * PATTERN's own top-level flags (what every node would carry if no
  * modifier group ever overrode them). */
-export function usesModifierGroup(ast: RegexAst, topIgnoreCase: boolean, topMultiline: boolean, topDotAll: boolean): boolean {
+export function usesModifierGroup(ast: RegexAst, topIgnoreCase: boolean, topMultiline: boolean, topDotAll: boolean, topUnicode = false): boolean {
   switch (ast.kind) {
     case "lineStart":
     case "lineEnd":
@@ -162,19 +162,24 @@ export function usesModifierGroup(ast: RegexAst, topIgnoreCase: boolean, topMult
       // char/charClass arms — unicode-casefold itself is checked
       // separately (usesUnicodeCasefold) and always fires first when it
       // applies, so this comparison is never reached under /iu.
-      return ast.ignoreCaseUnicode !== topIgnoreCase;
+      // Compared against what the TOP-LEVEL flags would give this node
+      // (ignoreCase AND unicode), not against ignoreCase alone: a plain
+      // `/\bfoo/i` carries ignoreCaseUnicode false under top-level /i and
+      // was misread as a modifier group (found by the run-time compiler
+      // unit's gate, which builds it).
+      return ast.ignoreCaseUnicode !== (topIgnoreCase && topUnicode);
     case "backreference":
       return false; // carries no scope-sensitive flag of its own
     case "group":
-      return usesModifierGroup(ast.body, topIgnoreCase, topMultiline, topDotAll);
+      return usesModifierGroup(ast.body, topIgnoreCase, topMultiline, topDotAll, topUnicode);
     case "lookahead":
-      return usesModifierGroup(ast.body, topIgnoreCase, topMultiline, topDotAll);
+      return usesModifierGroup(ast.body, topIgnoreCase, topMultiline, topDotAll, topUnicode);
     case "quantifier":
-      return usesModifierGroup(ast.body, topIgnoreCase, topMultiline, topDotAll);
+      return usesModifierGroup(ast.body, topIgnoreCase, topMultiline, topDotAll, topUnicode);
     case "alternative":
-      return ast.terms.some((t) => usesModifierGroup(t, topIgnoreCase, topMultiline, topDotAll));
+      return ast.terms.some((t) => usesModifierGroup(t, topIgnoreCase, topMultiline, topDotAll, topUnicode));
     case "disjunction":
-      return ast.alternatives.some((a) => usesModifierGroup(a, topIgnoreCase, topMultiline, topDotAll));
+      return ast.alternatives.some((a) => usesModifierGroup(a, topIgnoreCase, topMultiline, topDotAll, topUnicode));
   }
 }
 
@@ -203,7 +208,19 @@ export function usesAnnexBOnly(
   // safe.
   const actual = parseFn(pattern, 0, false, false, multiline, dotAll);
   if (actual === null || actual.next !== pattern.length) return false; // doesn't even parse under actual flags — not this detector's concern (S065's own territory)
-  const strict = parseFn(pattern, 0, true, false, multiline, dotAll);
+  let strict: { next: number } | null;
+  try {
+    strict = parseFn(pattern, 0, true, false, multiline, dotAll);
+  } catch (e) {
+    // A modifier group that turns /i on reaches regex-parser.ts's /iu
+    // assertion under the forced /u. That is not a grammar verdict; it
+    // counts as "does not parse strictly", so the Annex-B family scans
+    // below decide (the run-time compiler, regex-compiler.ts, makes the
+    // same call). Found by the run-time compiler unit's gate: before,
+    // `new RegExp("(?i:a)", "i")` threw out of the compiler.
+    if (e instanceof Error && e.message.includes("ignoreCase+isUnicode")) return true;
+    throw e;
+  }
   return strict === null || strict.next !== pattern.length;
 }
 
@@ -489,7 +506,7 @@ export function classifyRegexLitRefusal(
 ): RegexLitRefusal | null {
   if (usesUnicodeCasefold(ignoreCase, unicode)) return "unicode-casefold";
   if (usesUnportedUnicodeProperty(pattern, unicode)) return "unported-unicode-property";
-  if (ast !== null && usesModifierGroup(ast, ignoreCase, multiline, dotAll)) return "modifiers";
+  if (ast !== null && usesModifierGroup(ast, ignoreCase, multiline, dotAll, unicode)) return "modifiers";
   const annexb = classifyAnnexBFamily(pattern, ast, ignoreCase, multiline, dotAll, unicode, parseFn);
   if (annexb !== null && annexb !== "family6") return `annexb-${annexb}`;
   return null;

@@ -3351,23 +3351,17 @@ export type IrLibFn =
    * The result TYPE is the regex kind, so the link switch pulls the
    * engine exactly like a literal.
    *
-   * WASM (repoint, INC-24 P5 — SEMANTICS.md S065 is now the full,
-   * two-lane picture; this paragraph describes native only): the
-   * pattern/flags must be COMPILE-TIME CONSTANT (a literal, a strConcat
-   * chain, a provably-const global, or `regexp.escape(...)` over one of
-   * those — refuses by name, `libCall:regex.new:dynamic-pattern` /
-   * `:dynamic-flags`, otherwise). A CONSTANT-INVALID pattern or flag
-   * string does NOT approximate — S065's MESSAGE TEXT arm: the compiler
-   * knows the pattern at compile time, so an invalid-flags string gets
-   * V8's exact "Invalid flags supplied to RegExp constructor '<flags>'"
-   * unconditionally, and an invalid PATTERN gets V8's exact message for
-   * the three reasons a structural scan can decide with certainty
-   * (Unterminated group / Unmatched ')' / Unterminated character class)
-   * — any OTHER invalid-pattern reason (a bad quantifier range, a
-   * duplicate capture name, an unresolvable \p{} property, and the rest
-   * of design-regex-v6.txt §5.5(B)'s own message table) refuses by name
-   * (`libCall:regex.new:unclassified-syntax-error`) rather than emit an
-   * approximate or guessed message — never S065's "approximate fidelity"
+   * WASM (SEMANTICS.md S065 and S102 are the full two-lane picture;
+   * this paragraph describes native only): a COMPILE-TIME CONSTANT
+   * pattern/flags (a literal, a strConcat chain, a provably-const
+   * global, or `regexp.escape(...)` over one of those) is compiled at
+   * build time (backend/wasm/regex-fold.ts); anything else compiles at
+   * run time (unit P1, backend/wasm/regex-compiler.ts). Neither
+   * approximates: an invalid flags string or pattern throws V8's exact
+   * SyntaxError text (a constant pattern whose error the build-time
+   * pipeline cannot word goes through the run-time compiler), and a
+   * pattern outside the tier refuses at build time or throws a named
+   * Error at run time (S102) — never S065's "approximate fidelity"
    * shape, which is native-only. Unlike native, wasm does NOT intern
    * (design §7.5's own named non-requirement — `new RegExp("a") !==
    * new RegExp("a")`, matching Node). */

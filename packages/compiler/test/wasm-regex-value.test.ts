@@ -103,7 +103,7 @@ async function build(): Promise<ValueExports> {
     c.structGet(rb.regexType, 1);
     mb.setBody(flagsFn, [], c.bytes());
   }
-  const bcType = mb.arrayType("i8", false);
+  const bcType = rb.bcType; // mutable since unit P1 (the run-time compiler fills it element by element)
   const bcRef: ValType = { kind: "ref", nullable: true, typeIndex: bcType };
   const bytecodeFn = mb.declareFunc(mb.funcType([regexRef], [bcRef]), "bytecode");
   {
@@ -119,7 +119,7 @@ async function build(): Promise<ValueExports> {
     c.structGet(rb.regexType, 3);
     mb.setBody(captureCountFn, [], c.bytes());
   }
-  const strArrType = mb.arrayType(strRef, false);
+  const strArrType = rb.strArrType;
   const groupNamesIsNullFn = mb.declareFunc(mb.funcType([regexRef], [I32]), "groupNamesIsNull");
   {
     const c = new Code();

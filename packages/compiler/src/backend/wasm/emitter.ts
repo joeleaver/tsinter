@@ -235,6 +235,9 @@ import { StrBuilder } from "./strings.js";
 import { CasingBuilder } from "./casing.js";
 import { RegexBuilder } from "./regex-value.js";
 import { RegexInterpreterBuilder } from "./regex-interpreter.js";
+import { RegexCompilerBuilder } from "./regex-compiler.js";
+import { foldRegexNew } from "./regex-fold.js";
+import { RX_PATTERN_SIZE_LIMIT } from "./regex-compiler-tables.js";
 import { parsePattern } from "./regex-parser.js";
 import { assemble, collectGroupNames, type AssembleFlags } from "./regex-assembler.js";
 import { classifyRegexLitRefusal, usesUnicodeCasefold } from "./regex-disposition.js";
@@ -20927,180 +20930,51 @@ class Assembler {
           const patternArg = e.args[0]!;
           const flagsArg = e.args[1]!;
           const foldedPattern = this.foldRegexArg(patternArg);
-          if (!foldedPattern.ok) {
-            this.refuse("libCall:regex.new:dynamic-pattern", e.loc);
-            code.unreachable();
-            return;
-          }
           const foldedFlags = this.foldRegexArg(flagsArg);
-          if (!foldedFlags.ok) {
-            this.refuse("libCall:regex.new:dynamic-flags", e.loc);
+          if (!foldedPattern.ok || !foldedFlags.ok) {
+            // Unit P1: an argument known only at run time compiles at run
+            // time — regex-compiler.ts's %w.rec.compile builds the same
+            // %w.re.Regex the folded path embeds, or leaves a V8
+            // SyntaxError / a named fence (SEMANTICS.md S102) to throw.
+            this.emitRuntimeRegexNew(
+              () => this.walkExpr(patternArg),
+              () => this.walkExpr(flagsArg),
+            );
+            return;
+          }
+          // Both resolved to concrete text: regex-fold.ts runs the build-
+          // time pipeline (flags legality, the disposition layer, the
+          // constant-folded SyntaxError, assembly) and this case turns its
+          // outcome into code. Not interned (design §7.5's own named non-
+          // requirement) — regexConstruct emits a fresh %w.re.Regex struct
+          // on every evaluation, matching `new RegExp("a") !== new
+          // RegExp("a")`.
+          const folded = foldRegexNew(foldedPattern.value, foldedFlags.value);
+          if (folded.kind === "runtime") {
+            // The run-time compiler's verdict is V8's where the build-time
+            // pipeline has no wording for a syntax error, or accepts what
+            // V8 rejects (regex-fold.ts names the cases): the constant
+            // texts go through it rather than refusing (unit P1).
+            this.emitRuntimeRegexNew(
+              () => this.pushStrLit(foldedPattern.value),
+              () => this.pushStrLit(foldedFlags.value),
+            );
+            return;
+          }
+          if (folded.kind === "refuse") {
+            this.refuse(`libCall:regex.new:${folded.key}`, e.loc);
             code.unreachable();
             return;
           }
-          const patternText = foldedPattern.value;
-          const flagsText = foldedFlags.value;
-
-          // §5.5(B) flags LEGALITY — ECMA-262's own legal RegExp flag
-          // set (d g i m s u v y), independent of which of those this
-          // TIER can actually build (that's the unicode-sets-flag
-          // refusal just below): an illegal character, or a duplicate
-          // of a legal one, is ALWAYS a V8 SyntaxError — "Invalid flags
-          // supplied to RegExp constructor '<flags>'", the flags text
-          // echoed back verbatim (MEASURED: design §5.5's own "'x'" /
-          // "'gg'" pair) — regardless of tier support, so this check
-          // runs before any tier-capability question.
-          const LEGAL_FLAG_CHARS = "dgimsuvy";
-          const seenFlags = new Set<string>();
-          let flagsInvalid = false;
-          for (const c of flagsText) {
-            if (!LEGAL_FLAG_CHARS.includes(c) || seenFlags.has(c)) {
-              flagsInvalid = true;
-              break;
-            }
-            seenFlags.add(c);
-          }
-          if (flagsInvalid) {
-            this.emitSetCellError(
-              code,
-              "%SyntaxError",
-              "SyntaxError",
-              (c) => this.pushStrLitInto(c, `Invalid flags supplied to RegExp constructor '${flagsText}'`),
-              null,
-            );
+          if (folded.kind === "syntax") {
+            // §5.5(B): NOT refusable (2284's own assert.throws(...,
+            // SyntaxError) requires the throw to actually happen and be
+            // caught) — a constant-folded throw of V8's exact message.
+            this.emitSetCellError(code, "%SyntaxError", "SyntaxError", (c) => this.pushStrLitInto(c, folded.message), null);
             this.emitUnwind();
             return;
           }
-          if (flagsText.includes("v")) {
-            // /v (unicodeSets) is a LEGAL flag V8 accepts — this tier
-            // does not build /v-mode regexes at all yet (no claim needs
-            // it; regex-disposition.ts/regex-parser.ts have no 'v'
-            // handling anywhere, confirmed by direct search). Refuse,
-            // never miscompile a mode this tier cannot actually honor.
-            this.refuse("libCall:regex.new:unicode-sets-flag", e.loc);
-            code.unreachable();
-            return;
-          }
-
-          // Both resolved to concrete text: the SAME disposition
-          // analysis regexLit runs, over the FOLDED text rather than a
-          // strLit's own .value.
-          const flags: AssembleFlags = {
-            global: flagsText.includes("g"),
-            ignoreCase: flagsText.includes("i"),
-            multiLine: flagsText.includes("m"),
-            dotAll: flagsText.includes("s"),
-            unicode: flagsText.includes("u"),
-            sticky: flagsText.includes("y"),
-          };
-          // Same /iu guard as regexLit's own case, same reason
-          // (assertNoUnicodeCasefold THROWS, not refuses): must not
-          // reach parsePattern with the pattern's own real flags before
-          // ruling out ignoreCase+unicode.
-          let ast: RegexAst | null = null;
-          if (!usesUnicodeCasefold(flags.ignoreCase, flags.unicode)) {
-            const parsed = parsePattern(patternText, 0, flags.unicode, flags.ignoreCase, flags.multiLine, flags.dotAll);
-            ast = parsed !== null && parsed.next === patternText.length ? parsed.ast : null;
-          }
-          const refusal = classifyRegexLitRefusal(patternText, ast, flags.ignoreCase, flags.multiLine, flags.dotAll, flags.unicode, parsePattern);
-          // classifyRegexLitRefusal's own return type has FOUR members
-          // (regex-disposition.ts's own RegexLitRefusal union), not just
-          // the two this case used to special-case: "modifiers" and
-          // "unported-unicode-property" got their own regex.new-side
-          // names pre-P5 (item-8 sibling ruling); "unicode-casefold" and
-          // "annexb" did NOT, because construction itself didn't exist
-          // yet — everything else fell through to the ONE generic
-          // refusal bucket regardless of reason. Now that ast===null
-          // triggers REAL, DIFFERENT behavior (a constant-folded THROW,
-          // §5.5(B)), the distinction matters: /iu-casefold and
-          // AnnexB-only are POLICY refusals with ast===null for a
-          // reason that has NOTHING to do with pattern validity ("a","iu")
-          // is perfectly valid; this tier just can't parse it safely) —
-          // conflating them with a genuine syntax error would either
-          // wrongly refuse-as-unclassified (found by this pass's own
-          // §5.6 canonical-flags pin: "yusmig" contains i+u and got
-          // misrouted to unclassified-syntax-error before this fix) or,
-          // worse, wrongly THROW a SyntaxError Node never throws at all.
-          if (refusal === "modifiers") {
-            this.refuse("libCall:regex.new:modifiers", e.loc);
-            code.unreachable();
-            return;
-          }
-          if (refusal === "unported-unicode-property") {
-            this.refuse("libCall:regex.new:unported-unicode-property", e.loc);
-            code.unreachable();
-            return;
-          }
-          if (refusal === "unicode-casefold") {
-            this.refuse("libCall:regex.new:unicode-casefold", e.loc);
-            code.unreachable();
-            return;
-          }
-          if (refusal !== null && refusal.startsWith("annexb-")) {
-            // INC-24 P5, per-family split (design-regex-v6-errata-1.txt
-            // item 4): the old blanket "annexb" key retired into eight —
-            // one per Annex-B production family — so the census shows
-            // WHICH legacy construct a program actually needs. Family 6
-            // OUTSIDE a class no longer reaches here at all (classifyAnnexBFamily's
-            // own elimination resolves it to null, "fully supported" —
-            // see classifyRegexLitRefusal's own doc); every OTHER family
-            // still refuses, now by its own specific name.
-            this.refuse(`libCall:regex.new:${refusal}`, e.loc);
-            code.unreachable();
-            return;
-          }
-          if (ast === null) {
-            // A genuine pattern syntax error — §5.5(B): this is NOT
-            // refusable (2284's own assert.throws(..., SyntaxError)
-            // requires the throw to actually happen and be caught).
-            // Constant-folded: the compiler knows the pattern, knows it
-            // is invalid, and (for the structurally-decidable reasons)
-            // knows V8's exact message — so it emits code that THROWS
-            // at this point, rather than a runtime parser.
-            const reason = classifyRegexSyntaxErrorReason(patternText);
-            if (reason === null) {
-              // A real syntax error this narrow classifier isn't
-              // certain of the V8 wording for (an unsupported quantifier
-              // range, a bad \p{} name, etc — the design's own "sweep").
-              // Refuse by name rather than guess at a message.
-              this.refuse("libCall:regex.new:unclassified-syntax-error", e.loc);
-              code.unreachable();
-              return;
-            }
-            this.emitSetCellError(
-              code,
-              "%SyntaxError",
-              "SyntaxError",
-              (c) => this.pushStrLitInto(c, `Invalid regular expression: /${patternText}/${flagsText}: ${reason}`),
-              null,
-            );
-            this.emitUnwind();
-            return;
-          }
-
-          // Fully folded, fully valid: CONSTRUCT. Not interned (design
-          // §7.5's own named non-requirement) — regexConstruct emits a
-          // fresh %w.re.Regex struct on every evaluation, matching
-          // `new RegExp("a") !== new RegExp("a")`.
-          const asm = assemble(ast, flags);
-          const groupNamesMap = collectGroupNames(ast);
-          const hasNamed = [...groupNamesMap.values()].some((v) => v.name !== null);
-          // .source is EscapeRegExpPattern-normalised for new RegExp(str)
-          // specifically (design §5.6) — NOT the raw patternText (that's
-          // what parsePattern/assemble above ran over; storage and
-          // matching are separate concerns here).
-          const storedSource = escapeRegExpPattern(patternText);
-          // .flags is ALWAYS canonical getter order (d g i m s u y),
-          // same as regexLit's own canonicalFlags (§5.6) — 'v' is
-          // already ruled out above, so the 7-char filter set matches.
-          const canonicalFlags = "dgimsuy"
-            .split("")
-            .filter((c) => flagsText.includes(c))
-            .join("");
-          const groupNames = hasNamed
-            ? Array.from({ length: asm.captureCount - 1 }, (_, i) => groupNamesMap.get(i + 1)?.name ?? "")
-            : null;
-          this.regex.regexConstruct(code, storedSource, canonicalFlags, asm.bytes, asm.captureCount, groupNames);
+          this.regex.regexConstruct(code, folded.source, folded.flags, folded.bytes, folded.captureCount, folded.groupNames);
           return;
         }
         if (e.fn === "regexp.escape") {
@@ -26808,7 +26682,11 @@ class Assembler {
           const parsed = parsePattern(e.pattern, 0, flags.unicode, flags.ignoreCase, flags.multiLine, flags.dotAll);
           ast = parsed !== null && parsed.next === e.pattern.length ? parsed.ast : null;
         }
-        const refusal = classifyRegexLitRefusal(e.pattern, ast, flags.ignoreCase, flags.multiLine, flags.dotAll, flags.unicode, parsePattern);
+        // a literal past the size V8 is sure to compile is fenced like a
+        // run-time pattern (SEMANTICS.md S102, regex-compiler-tables.ts)
+        const refusal: string | null =
+          classifyRegexLitRefusal(e.pattern, ast, flags.ignoreCase, flags.multiLine, flags.dotAll, flags.unicode, parsePattern) ??
+          (e.pattern.length > RX_PATTERN_SIZE_LIMIT ? "pattern-too-large" : null);
         if (refusal !== null) {
           this.refuse(`expr:regexLit:${refusal}`, e.loc);
           code.unreachable();
@@ -27054,7 +26932,11 @@ class Assembler {
               const parsed = parsePattern(patArg.pattern, 0, flags.unicode, flags.ignoreCase, flags.multiLine, flags.dotAll);
               ast = parsed !== null && parsed.next === patArg.pattern.length ? parsed.ast : null;
             }
-            const refusal = classifyRegexLitRefusal(patArg.pattern, ast, flags.ignoreCase, flags.multiLine, flags.dotAll, flags.unicode, parsePattern);
+            // a literal past the size V8 is sure to compile is fenced like a
+        // run-time pattern (SEMANTICS.md S102, regex-compiler-tables.ts)
+        const refusal: string | null =
+          classifyRegexLitRefusal(patArg.pattern, ast, flags.ignoreCase, flags.multiLine, flags.dotAll, flags.unicode, parsePattern) ??
+          (patArg.pattern.length > RX_PATTERN_SIZE_LIMIT ? "pattern-too-large" : null);
             if (refusal !== null) {
               // Grammar disposition doesn't depend on sticky — the SAME
               // regexLit-side key this pattern would refuse under as an
@@ -29395,6 +29277,25 @@ class Assembler {
               // and boxed as an island RegExp (dyn.ts's objRegex). A
               // pattern known only at run time stays refused by name.
               const parts = e.args.slice(1).map((a) => (a.kind === "jsMarshal" ? this.foldRegexArgOrIntrinsic(a.value) : { ok: false as const }));
+              if (e.args.length >= 2 && e.args.length <= 3 && parts.some((p) => !p.ok)) {
+                // Unit P1: a pattern (or flags string) known only at run
+                // time compiles at run time (regex-compiler.ts) when both
+                // are statically strings, and boxes like the folded case.
+                // Anything else (a number, a dynamic value) still refuses.
+                const strArg = (a: WExpr | undefined): WExpr | null =>
+                  a !== undefined && a.kind === "jsMarshal" && a.value.type.kind === "string" ? a.value : null;
+                const pat = strArg(e.args[1]);
+                const flg = e.args.length === 3 ? strArg(e.args[2]) : null;
+                if (pat !== null && (e.args.length === 2 || flg !== null)) {
+                  this.dyn.boxRegex(code, () =>
+                    this.emitRuntimeRegexNew(
+                      () => this.walkExpr(pat),
+                      () => (flg !== null ? this.walkExpr(flg) : this.pushStrLit("")),
+                    ),
+                  );
+                  return;
+                }
+              }
               if (e.args.length < 2 || e.args.length > 3 || parts.some((p) => !p.ok)) {
                 this.refuse("expr:jsOp:regexp-dynamic-pattern", e.loc);
                 code.unreachable();
@@ -30032,6 +29933,51 @@ class Assembler {
     // RegexInterpreterBuilder's own injectedBcType doc comment.
     this.regexInterpField ??= new RegexInterpreterBuilder(this.mb, this.strType, this.casing, this.regex.bcType);
     return this.regexInterpField;
+  }
+
+  private regexCompilerField: RegexCompilerBuilder | null = null;
+
+  /** Unit P1: the run-time RegExp compiler (regex-compiler.ts), built only
+   * when a `new RegExp` argument does not fold at compile time. It shares
+   * the regex value's types and the interpreter's canonicalize. */
+  private get regexCompiler(): RegexCompilerBuilder {
+    this.regexCompilerField ??= new RegexCompilerBuilder(this.mb, this.strType, this.regex, () => this.regexInterp.regexCanonicalize());
+    return this.regexCompilerField;
+  }
+
+  /** `new RegExp(p, f)` over strings known only at run time: call
+   * %w.rec.compile and, on a null result, throw what it left — V8's
+   * SyntaxError, or the named fence Error (message and `code`, SEMANTICS.md
+   * S102). Leaves the (non-null) %w.re.Regex on the stack. */
+  private emitRuntimeRegexNew(pushPattern: () => void, pushFlags: () => void): void {
+    const code = this.fn.code;
+    const rc = this.regexCompiler;
+    const reRef: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.regexType };
+    const r = this.acquireScratch(reRef);
+    pushPattern();
+    pushFlags();
+    code.call(rc.compileFn());
+    code.localTee(r);
+    code.refIsNull();
+    this.openIf();
+    code.call(rc.errKindFn());
+    code.i32Const(1);
+    code.i32Eq();
+    this.openIf();
+    this.emitSetCellError(code, "%SyntaxError", "SyntaxError", (c) => c.call(rc.errMessageFn()), null);
+    code.else_();
+    this.emitSetCellErrorCoded(
+      code,
+      "%Error",
+      "Error",
+      (c) => c.call(rc.errMessageFn()),
+      (c) => c.call(rc.errCodeFn()),
+    );
+    this.close();
+    this.emitUnwind();
+    this.close();
+    code.localGet(r);
+    this.releaseScratch(reRef, r);
   }
 
   private getSubstitutionField: number | null = null;

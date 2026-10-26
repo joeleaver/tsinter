@@ -12,8 +12,8 @@ import { join } from "node:path";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import { compile } from "../src/index.js";
 import { I32, ModuleBuilder } from "../src/backend/wasm/module.js";
-import { parseFnEvalConstruct, surveyWasmModule } from "../src/backend/wasm/emitter.js";
-import { arrayOf, REGEX, STRING, VOID, type IrExpr, type IrGlobal, type IrModule, type IrStmt, type SrcLoc } from "../src/ir/nodes.js";
+import { emitWasmModule, parseFnEvalConstruct, surveyWasmModule } from "../src/backend/wasm/emitter.js";
+import { arrayOf, REGEX, RUNTIME_ERROR_CLASSES, STRING, VOID, type IrClassDef, type IrExpr, type IrGlobal, type IrModule, type IrStmt, type SrcLoc } from "../src/ir/nodes.js";
 
 let scratch: string;
 beforeAll(async () => {
@@ -3568,24 +3568,50 @@ test("libCall:regex.new:modifiers refuses through a real program", async () => {
  * still exist and still fire for what's actually still out of tier;
  * the fold-SUCCESS coverage those two pins used to carry moved to the
  * two "folds and constructs" pins immediately below. */
-test("libCall:regex.new:dynamic-pattern refuses through a real program (a function parameter — 2448's pragmas.0 shape, never provably const)", async () => {
-  const res = await buildWasm(
-    "refused.ts",
-    'function f(p: string): void { const re = new RegExp(p); console.log(re.test("ab")); } f("ab");\n',
-  );
-  expect(res.ok).toBe(false);
-  if (res.ok) return;
-  expect(res.wasmSurvey).toContain("libCall:regex.new:dynamic-pattern");
+/* Unit P1 retired the dynamic-pattern / dynamic-flags refusals: a pattern
+ * or flags argument that does not fold compiles at run time
+ * (regex-compiler.ts, %w.rec.compile). The two function-parameter shapes
+ * that pinned those refusals now pin that it builds and runs. */
+/** The runtime error classes every frontend-built module carries (the
+ * run-time compiler's call site throws SyntaxError / Error instances). */
+function runtimeErrorClassDefs(): IrClassDef[] {
+  const loc: SrcLoc = { file: "<builtin>", start: 0, end: 0 };
+  return [...RUNTIME_ERROR_CLASSES].map(([name, rec]) => ({
+    name,
+    runtime: true as const,
+    ...(rec.base ? { base: rec.base } : {}),
+    fields: [
+      { name: "name", type: STRING },
+      { name: "message", type: STRING },
+      { name: "%code", type: STRING },
+    ],
+    loc,
+  }));
+}
+
+const RUNTIME_COMPILER = new TextEncoder().encode("%w.rec.compile");
+function hasRuntimeCompiler(bytes: Uint8Array): boolean {
+  outer: for (let i = 0; i + RUNTIME_COMPILER.length <= bytes.length; i++) {
+    for (let k = 0; k < RUNTIME_COMPILER.length; k++) if (bytes[i + k] !== RUNTIME_COMPILER[k]) continue outer;
+    return true;
+  }
+  return false;
+}
+
+test("a non-folding pattern argument (a function parameter — 2448's pragmas.0 shape) compiles at run time", async () => {
+  const res = await buildWasm("runtime-pattern.ts", 'function f(p: string): void { const re = new RegExp(p); console.log(re.test("ab")); } f("ab");\n');
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(hasRuntimeCompiler(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("true\n");
 });
 
-test("libCall:regex.new:dynamic-flags refuses through a real program (a function parameter, same shape)", async () => {
-  const res = await buildWasm(
-    "refused.ts",
-    'function f(fl: string): void { const re = new RegExp("a", fl); console.log(re.test("A")); } f("i");\n',
-  );
-  expect(res.ok).toBe(false);
-  if (res.ok) return;
-  expect(res.wasmSurvey).toContain("libCall:regex.new:dynamic-flags");
+test("a non-folding flags argument (a function parameter, same shape) compiles at run time", async () => {
+  const res = await buildWasm("runtime-flags.ts", 'function f(fl: string): void { const re = new RegExp("a", fl); console.log(re.test("A")); } f("i");\n');
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(hasRuntimeCompiler(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("true\n");
 });
 
 test("THE CONSTANT-FOLDER: a strConcat-of-literals pattern arg folds and constructs, byte-exact against Node (the exact shape libCall:regex.new:dynamic-pattern's OWN pin used to refuse, before P5)", async () => {
@@ -3602,17 +3628,18 @@ test("THE CONSTANT-FOLDER: a varRef-to-a-const-global flags arg folds and constr
   expect(stdout.toString("utf8")).toBe("true false\n");
 });
 
-test("THE CONSTANT-FOLDER: a MUTABLE global (let, reassigned) never folds — dynamic-pattern, even though the value happens to be assigned only once on this path (IrGlobal.mutable is the gate, not whether a reassignment actually runs)", async () => {
+test("THE CONSTANT-FOLDER: a MUTABLE global (let, reassigned) never folds — it compiles at run time, even though the value happens to be assigned only once on this path (IrGlobal.mutable is the gate, not whether a reassignment actually runs)", async () => {
   const res = await buildWasm(
     "fold-mutable-global.ts",
     ["let p = \"a\" + \"b\";", "if (false) { p = \"c\"; }", "const re = new RegExp(p);", 'console.log(re.test("ab"));'].join("\n"),
   );
-  expect(res.ok).toBe(false);
-  if (res.ok) return;
-  expect(res.wasmSurvey).toContain("libCall:regex.new:dynamic-pattern");
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(hasRuntimeCompiler(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("true\n");
 });
 
-test("THE CONSTANT-FOLDER, errata item 3's own TDZ witness: a regex.new site inside a FUNCTION BODY that reads a module-scope const never folds, even though the const IS mutable===false and IS assigned exactly once — proving order needs a call graph this design does not build, so a function-body site refuses unconditionally rather than risk a used-before-init read (TSC itself does NOT reject this shape at compile time — verified directly, `tsc --noEmit` exits 0 — while real Node throws `ReferenceError: Cannot access 'pat' before initialization` at runtime; a folder gated on mutable===false ALONE would resolve pat->'b' and construct a WORKING regex here, a silent wrong answer against Node's own throw)", async () => {
+test("THE CONSTANT-FOLDER, errata item 3's own TDZ witness: a regex.new site inside a FUNCTION BODY that reads a module-scope const never folds, even though the const IS mutable===false and IS assigned exactly once — proving order needs a call graph this design does not build, so a function-body site never folds (since unit P1 it compiles at run time) rather than risk a used-before-init read (TSC itself does NOT reject this shape at compile time — verified directly, `tsc --noEmit` exits 0 — while real Node throws `ReferenceError: Cannot access 'pat' before initialization` at runtime; a folder gated on mutable===false ALONE would resolve pat->'b' and construct a WORKING regex here, a silent wrong answer against Node's own throw)", async () => {
   const res = await buildWasm(
     "fold-tdz-function-body.ts",
     [
@@ -3622,9 +3649,10 @@ test("THE CONSTANT-FOLDER, errata item 3's own TDZ witness: a regex.new site ins
       "console.log(r);",
     ].join("\n"),
   );
-  expect(res.ok).toBe(false);
-  if (res.ok) return;
-  expect(res.wasmSurvey).toContain("libCall:regex.new:dynamic-pattern");
+  // Never folded: the site reads `pat` at run time and compiles there
+  // (unit P1), so no folded 'b' regex can answer before `pat` exists.
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(hasRuntimeCompiler(readFileSync(res.binaryPath))).toBe(true);
 });
 
 test("THE CONSTANT-FOLDER, errata item 3's own ORDERING clause specifically (hand-built IrModule, bypassing TSC — real TS syntax cannot place a regex.new BEFORE its own target's textual declaration at module scope; this isolates the statement-order half of the gate from the module-init/function-body half the previous pin already covers): a %init function whose body reads a global at statement 0 and assigns it at statement 1 — SAME function, mutable===false, but the assign does NOT precede the site — must refuse dynamic-pattern, not fold", () => {
@@ -3655,6 +3683,7 @@ test("THE CONSTANT-FOLDER, errata item 3's own ORDERING clause specifically (han
     sourceFile: "tdz-ordering.ts",
     entry: "%init.0",
     globals: [patGlobal],
+    classes: runtimeErrorClassDefs(),
     functions: [
       {
         name: "%init.0",
@@ -3666,7 +3695,9 @@ test("THE CONSTANT-FOLDER, errata item 3's own ORDERING clause specifically (han
       },
     ],
   };
-  expect(surveyWasmModule(mod)).toEqual(["libCall:regex.new:dynamic-pattern"]);
+  // not folded: the run-time compiler (unit P1) carries the site
+  expect(surveyWasmModule(mod)).toEqual([]);
+  expect(hasRuntimeCompiler(emitWasmModule(mod))).toBe(true);
 });
 
 test("THE CONSTANT-FOLDER, ORDERING clause POSITIVE control (same hand-built shape, assign BEFORE site): confirms the pin above is discriminating the ORDER, not just failing on the fixture's own shape generally — swap the two statements and the SAME module NOW folds and constructs, hitting NO refusal at all", () => {
@@ -3697,6 +3728,7 @@ test("THE CONSTANT-FOLDER, ORDERING clause POSITIVE control (same hand-built sha
     sourceFile: "tdz-ordering-ok.ts",
     entry: "%init.0",
     globals: [patGlobal],
+    classes: runtimeErrorClassDefs(),
     functions: [
       {
         name: "%init.0",
@@ -3709,6 +3741,8 @@ test("THE CONSTANT-FOLDER, ORDERING clause POSITIVE control (same hand-built sha
     ],
   };
   expect(surveyWasmModule(mod)).toEqual([]);
+  // folded: no run-time compiler in the module
+  expect(hasRuntimeCompiler(emitWasmModule(mod))).toBe(false);
 });
 
 test("THE CONSTANT-FOLDER: regexp.escape(<folded string>) as a regex.new pattern arg folds through — same algorithm as the general runtime case, evaluated at fold time", async () => {
@@ -3786,11 +3820,16 @@ test("§5.5(B): new RegExp('a','x') throws V8's exact message (Invalid flags), t
   );
 });
 
-test("libCall:regex.new:unclassified-syntax-error refuses (never guesses) for a genuine syntax error outside the three structurally-decidable reasons — a bad quantifier range", async () => {
-  const res = await buildWasm("refused.ts", 'const re = new RegExp("a{2,1}"); console.log(re.test("a"));\n');
-  expect(res.ok).toBe(false);
-  if (res.ok) return;
-  expect(res.wasmSurvey).toContain("libCall:regex.new:unclassified-syntax-error");
+test("a constant pattern's syntax error outside the three structurally-decidable reasons (a bad quantifier range) goes through the run-time compiler and throws V8's SyntaxError — it used to refuse as unclassified-syntax-error (unit P1)", async () => {
+  const res = await buildWasm(
+    "unclassified.ts",
+    'try { new RegExp("a{2,1}"); } catch (e) { console.log(e instanceof SyntaxError, (e as Error).message); }\n',
+  );
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  expect(hasRuntimeCompiler(readFileSync(res.binaryPath))).toBe(true);
+  const { stdout } = await runWasm(res.binaryPath);
+  // Node v24.18.1
+  expect(stdout.toString("utf8")).toBe("true Invalid regular expression: /a{2,1}/: numbers out of order in {} quantifier\n");
 });
 
 test("libCall:regex.new:unicode-casefold refuses through a real program (not a mis-thrown SyntaxError) — /iu together is a VALID V8 combination (new RegExp('a','iu') never throws in real Node), so this must be a POLICY refusal, never routed through the ast===null syntax-error path this pass just added (the §5.6 canonical-flags pin's own regression: 'yusmig' first misrouted here)", async () => {

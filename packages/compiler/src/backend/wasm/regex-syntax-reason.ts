@@ -70,59 +70,65 @@ export function classifyRegexSyntaxErrorReason(pattern: string): string | null {
   return null;
 }
 
-// U+2028 LINE SEPARATOR / U+2029 PARAGRAPH SEPARATOR, by code point rather
-// than as raw string literals in source — an earlier draft of this file
-// embedded the actual invisible characters inline as `case " ":` labels,
-// which is fragile (indistinguishable from a plain space at a glance, and
-// a hazard for any tool or terminal that doesn't round-trip them exactly).
-const LINE_SEPARATOR = String.fromCharCode(0x2028);
-const PARAGRAPH_SEPARATOR = String.fromCharCode(0x2029);
-
 /** EscapeRegExpPattern (ECMA-262 22.2.3.2.4) — the `.source` text stored
- * for a new RegExp(str)-constructed value specifically (design §5.6).
- * Purely a STORAGE-time normalisation of what `.source` reads back:
- * matching itself always runs over the pattern's own ORIGINAL,
- * unmodified text (this function is never called before parsePattern —
- * only on the way into the %w.re.Regex struct's `source` field). A
- * regex LITERAL's own `.source` needs no normaliser at all (design
- * §5.6's own MEASURED finding: the literal grammar already forbids both
- * spellings this function exists to fix — a raw '/' or a raw
- * LineTerminator inside `/.../ ` is itself a syntax error at the
- * JS-source level, never reaches this function).
+ * for a new RegExp(str)-constructed value (design §5.6), as V8 writes it
+ * (regexp.cc's WriteEscapedRegExpSource): an unescaped `/` OUTSIDE a
+ * character class gets a backslash; a line terminator (LF, CR, U+2028,
+ * U+2029) becomes its escape sequence; a backslash that already escapes a
+ * line terminator is dropped (the terminator's own escape replaces the
+ * pair); any other backslash copies itself and the character after it
+ * unchanged (so an already-escaped `\/` stays one escape, and an escaped
+ * `\]` does not end a class). The empty pattern is `(?:)`. Storage only:
+ * matching runs over the original text.
  *
- * Verified byte-exact against live Node:
- *   ""      -> "(?:)"     "/"    -> "\\/"      "a/b"  -> "a\\/b"
- *   "\n"    -> "\\n"      "\r"   -> "\\r"
- *   U+2028 -> "\\u2028"   U+2029 -> "\\u2029"
- *   "a\nb/c\rd" -> "a\\nb\\/c\\rd"   (each occurrence escaped independently)
- * Code-UNIT walk, not code-point: every character this function treats
- * specially (/, LF, CR, LS, PS) is a single UTF-16 code unit, so there is
- * no astral case to get wrong either way; a plain index walk is simplest
- * and matches pushStrLitInto's own code-unit-oriented storage model. */
+ * Verified byte-exact against Node v24.18.1 (the run-time compiler unit
+ * replaced the earlier character-by-character version, which escaped a
+ * `/` inside a class and doubled an existing escape — `new
+ * RegExp("[/]").source` is "[/]" and `new RegExp("\\/").source` is
+ * "\\/" in Node):
+ *   ""  -> "(?:)"   "/" -> "\\/"   "a/b" -> "a\\/b"   "[/]" -> "[/]"
+ *   "\\/" -> "\\/"   "\n" -> "\\n"   "a\\\nb" -> "a\\nb"
+ *   U+2028 -> "\\u2028"   "[\\]/]" -> "[\\]/]"
+ * Code-unit walk: every character treated specially is one code unit. */
 export function escapeRegExpPattern(pattern: string): string {
   if (pattern === "") return "(?:)";
+  const isLT = (c: number): boolean => c === 0x0a || c === 0x0d || c === 0x2028 || c === 0x2029;
   let out = "";
-  for (let i = 0; i < pattern.length; i++) {
-    const ch = pattern[i]!;
-    switch (ch) {
-      case "/":
-        out += "\\/";
-        break;
-      case "\n":
-        out += "\\n";
-        break;
-      case "\r":
-        out += "\\r";
-        break;
-      case LINE_SEPARATOR:
-        out += "\\u2028";
-        break;
-      case PARAGRAPH_SEPARATOR:
-        out += "\\u2029";
-        break;
-      default:
-        out += ch;
+  let inClass = false;
+  let s = 0;
+  while (s < pattern.length) {
+    const c = pattern.charCodeAt(s);
+    if (c === 0x5c) {
+      if (s + 1 < pattern.length && isLT(pattern.charCodeAt(s + 1))) {
+        s++;
+        continue;
+      }
+      out += pattern[s++];
+      if (s === pattern.length) break;
+      out += pattern[s++];
+      continue;
     }
+    if (c === 0x2f && !inClass) out += "\\";
+    else if (c === 0x5b) inClass = true;
+    else if (c === 0x5d) inClass = false;
+    else if (c === 0x0a) {
+      out += "\\n";
+      s++;
+      continue;
+    } else if (c === 0x0d) {
+      out += "\\r";
+      s++;
+      continue;
+    } else if (c === 0x2028) {
+      out += "\\u2028";
+      s++;
+      continue;
+    } else if (c === 0x2029) {
+      out += "\\u2029";
+      s++;
+      continue;
+    }
+    out += pattern[s++];
   }
   return out;
 }

@@ -3595,6 +3595,13 @@ const TIER_FLOOR: string[] = [
   // the dyn Array.prototype.flat arm: 1075 -> 1076. The stage-C and increment-21 notes
   // above that call 2633's array<jsval> bridge "pulled" are history.
   "2633-island-promise-crossing.js",
+  // Unit P1: `new RegExp(pattern, flags)` over strings known only at run
+  // time compiles at run time (regex-compiler.ts, byte-identical to the
+  // build-time pipeline); a SyntaxError carries V8's text, a pattern
+  // outside the tier throws a named Error (SEMANTICS.md S102):
+  // 1076 -> 1078.
+  "2448-entries-null-arms-regex-arrays.ts",
+  "2748-regexp-runtime-patterns.ts",
 ];
 
 interface RunResult {
