@@ -15,6 +15,7 @@ import { expect, test } from "vitest";
 import {
   clearResolveCaches,
   projectDtsRuntimeSibling,
+  projectPkgJsonShadow,
   resolveBareModule,
   resolveProjectImport,
   resolveRelativeModule,
@@ -25,6 +26,12 @@ import { options5 } from "./harness.js";
 
 const repoRoot = join(import.meta.dirname, "../../../..");
 const OPTS = options5();
+
+/** ts5.sys with the tsgo host's project-scope package.json shadow. */
+const shadowedSys: ts5.ModuleResolutionHost = {
+  ...ts5.sys,
+  readFile: (path: string) => projectPkgJsonShadow(path) ?? ts5.sys.readFile(path),
+};
 
 /** Every source file under tests/ that scriptc's preflight could scan —
  * node_modules excluded (preflight never collects edges inside packages;
@@ -96,7 +103,14 @@ test("relative and bare specifiers across the whole test tree resolve identicall
   const failures: string[] = [];
   for (const file of files) {
     for (const spec of specifiersOf(file)) {
-      const reference = ts5.resolveModuleName(spec, file, OPTS, ts5.sys).resolvedModule ?? null;
+      // The pinned conditions delta: a PROJECT package.json's "exports" /
+      // "imports" condition objects resolve with Node's per-syntax sets
+      // (node-conditions.ts — "node"/"module-sync" ahead of "default"),
+      // not 5.9.3's bundler set. Both scriptc worlds read the reduced
+      // document (the tsgo host through projectPkgJsonShadow), so parity
+      // holds against 5.9.3 reading that same document; corpus 2757 pins
+      // the behavior differentially.
+      const reference = ts5.resolveModuleName(spec, file, OPTS, shadowedSys).resolvedModule ?? null;
       // Bare '.' and '..' are the relative directory forms (SEMANTICS 362)
       // — ts5 resolves them relative too, so they ride the relative arm.
       if (isRelativeSpecifier(spec)) {

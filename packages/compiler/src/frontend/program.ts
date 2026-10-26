@@ -49,7 +49,7 @@ import {
   tscPassthroughDiag,
   unsupportedDiag,
 } from "../diagnostics/diagnostic.js";
-import { isNodeModulesPath, nearestPkgJsonPath, projectDtsRuntimeSibling, resolveBareModule, resolveProjectImport, resolveRelativeModule, resolveTypeDirective, setProjectRealm } from "./resolve.js";
+import { isNodeModulesPath, nearestPkgJsonPath, projectDtsRuntimeSibling, projectPkgJsonShadow, resolveBareModule, resolveProjectImport, resolveRelativeModule, resolveTypeDirective, setProjectRealm } from "./resolve.js";
 import { probeNodeImportRefusal, probeNodeRequireRefusal } from "./npm.js";
 import { isNpmStaticPackage, npmStaticActive, npmStaticFsShadow, npmStaticPackageOfPath, reportNpmStaticOffender, setNpmStaticPackages } from "./npm-static.js";
 import { provenanceEntryFor, provenancePaths } from "./provenance-registry.js";
@@ -288,7 +288,12 @@ export function loadProgram(
   // resolve.ts answers the same sibling for scriptc's own edges).
   const npmShadow = npmStaticFsShadow();
   const fsShadow = {
-    readFile: (path: string) => npmShadow?.readFile(path),
+    // Project-scope package.json files (outside every node_modules) serve
+    // Node's per-syntax "exports"/"imports" answers (node-conditions.ts):
+    // the checker's #alias and self-name resolution then lands on the
+    // file Node loads, the same one resolveProjectImport answers. Opted-
+    // in --npm-static packages get their own transform from npmShadow.
+    readFile: (path: string) => npmShadow?.readFile(path) ?? projectPkgJsonShadow(path),
     hideFile: (path: string) =>
       (npmShadow?.hideFile(path) ?? false) || projectDtsRuntimeSibling(path) !== null,
   };
@@ -1125,7 +1130,15 @@ function resolveImport7(program: ts.Program, from: ts.SourceFile, specifier: str
 function resolveNpmImport7(
   fromFileName: string,
   specifier: string,
-): { packageName: string; version?: string; typesFile: string } | null {
+  /** The importing syntax (resolveBareModule's `kind`): only an opted-in
+   * --npm-static package's answer depends on it. */
+  kind: "import" | "require" = "import",
+): {
+  packageName: string;
+  version?: string;
+  typesFile: string;
+  viaWrapper?: { wrapper: string; names: ReadonlySet<string>; hasDefault: boolean };
+} | null {
   if (isRelativeSpecifier(specifier) || specifier.startsWith("node:")) {
     return null;
   }
@@ -1133,7 +1146,7 @@ function resolveNpmImport7(
   // its attested source compiles as program modules (resolveProjectImport
   // answers the entry), so no island embed and no .d.ts type surface.
   if (provenanceEntryFor(specifier) !== null) return null;
-  const resolved = resolveBareModule(fromFileName, specifier);
+  const resolved = resolveBareModule(fromFileName, specifier, undefined, kind);
   if (!resolved) return null;
   if (!isNodeModulesPath(resolved.typesFile)) {
     // A workspace-linked package (the node_modules entry is a symlink into
@@ -1150,7 +1163,57 @@ function resolveNpmImport7(
     packageName: resolved.packageName,
     ...(resolved.version !== undefined ? { version: resolved.version } : {}),
     typesFile: resolved.typesFile,
+    ...(resolved.viaWrapper !== undefined ? { viaWrapper: resolved.viaWrapper } : {}),
   };
+}
+
+/** --npm-static's CJS-first wrapper substitution (npmStaticTransformPkgJson
+ * step 3) is exact only for what the wrapper ESM file serves: the named
+ * exports it destructures off the CJS module (and a default when it
+ * re-exports one). Node links an import statement against the WRAPPER,
+ * so a default import it doesn't export, a namespace (whose shape is the
+ * wrapper's, not the CJS module's), a star re-export, or a name outside
+ * its list would observe a different module than the substituted CJS
+ * entry — the package is then an offender (the island serves the
+ * import as shipped), never a silent different entry (board #258). Null
+ * when the clause is within the wrapper's surface. */
+function npmStaticWrapperOffence7(
+  viaWrapper: { wrapper: string; names: ReadonlySet<string>; hasDefault: boolean },
+  stmt: ts.ImportDeclaration | ts.ExportDeclaration,
+): string | null {
+  const lead = `its ESM entry '${viaWrapper.wrapper}' is a named-export wrapper over its CommonJS entry`;
+  const tail = "(the static compile substitutes the CommonJS entry only for the wrapper's own named exports)";
+  const outside = (what: string): string => `${lead}, and ${what} observes the wrapper's own namespace ${tail}`;
+  const checkName = (name: string): string | null => {
+    if (name === "default" ? viaWrapper.hasDefault : viaWrapper.names.has(name)) return null;
+    return `${lead} that does not export '${name}' ${tail}`;
+  };
+  if (ts.isImportDeclaration(stmt)) {
+    const clause = stmt.importClause;
+    if (clause === undefined) return null; // side-effect import: both sides evaluate the same CJS module
+    if (clause.name !== undefined) {
+      const r = checkName("default");
+      if (r !== null) return r;
+    }
+    const nb = clause.namedBindings;
+    if (nb !== undefined) {
+      if (ts.isNamespaceImport(nb)) return outside("a namespace import");
+      for (const el of nb.elements) {
+        if (el.isTypeOnly) continue;
+        const r = checkName((el.propertyName ?? el.name).text);
+        if (r !== null) return r;
+      }
+    }
+    return null;
+  }
+  const ec = stmt.exportClause;
+  if (ec === undefined || ts.isNamespaceExport(ec)) return outside("a star / namespace re-export");
+  for (const el of ec.elements) {
+    if (el.isTypeOnly) continue;
+    const r = checkName((el.propertyName ?? el.name).text);
+    if (r !== null) return r;
+  }
+  return null;
 }
 
 function locOf7(node: ts.Node): { file: string; start: number; end: number } {
@@ -1588,12 +1651,17 @@ function preflight7(load: LoadResult): {
           // through the alias chain. Star re-exports and unresolvable
           // specifiers keep the fence (no member list to bind / nothing
           // installed to load).
-          if (
-            stmt.exportClause !== undefined &&
-            ts.isNamedExports(stmt.exportClause) &&
-            !fromSpec.startsWith("#") &&
-            resolveNpmImport7(sf.fileName, fromSpec) !== null
-          ) {
+          const reNpm = !fromSpec.startsWith("#") ? resolveNpmImport7(sf.fileName, fromSpec) : null;
+          // An opted-in package reached through its CJS-first wrapper
+          // substitution re-exports only what the wrapper serves.
+          if (reNpm?.viaWrapper !== undefined && isNpmStaticPackage(reNpm.packageName)) {
+            const offence = npmStaticWrapperOffence7(reNpm.viaWrapper, stmt);
+            if (offence !== null) {
+              reportNpmStaticOffender(reNpm.packageName, offence);
+              continue;
+            }
+          }
+          if (stmt.exportClause !== undefined && ts.isNamedExports(stmt.exportClause) && reNpm !== null) {
             continue;
           }
           diags.push(unsupportedDiag("SC1014", locOf7(stmt), "re-exports from packages or builtin modules"));
@@ -1682,6 +1750,11 @@ function preflight7(load: LoadResult): {
       let npmStaticDep: ts.SourceFile | null = null;
       if (npm !== null) {
         if (isNpmStaticPackage(npm.packageName)) {
+          const offence = npm.viaWrapper !== undefined ? npmStaticWrapperOffence7(npm.viaWrapper, stmt) : null;
+          if (offence !== null) {
+            reportNpmStaticOffender(npm.packageName, offence);
+            continue;
+          }
           npmStaticDep = npmStaticProgramDep(program, npm.packageName, npm.typesFile);
           if (npmStaticDep === null) continue;
         } else {
@@ -1885,7 +1958,7 @@ function preflight7(load: LoadResult): {
             // form above (bundle dists require their workspace siblings —
             // the same resolution, the same offender discipline on a
             // miss).
-            const npmReq = !req.spec.startsWith("#") ? resolveNpmImport7(sf.fileName, req.spec) : null;
+            const npmReq = !req.spec.startsWith("#") ? resolveNpmImport7(sf.fileName, req.spec, "require") : null;
             if (npmReq !== null && isNpmStaticPackage(npmReq.packageName)) {
               dep = npmStaticProgramDep(program, npmReq.packageName, npmReq.typesFile);
               if (dep === null) continue; // offender recorded — the fallback loop reloads
@@ -1937,7 +2010,7 @@ function preflight7(load: LoadResult): {
           if (!isRelativeSpecifier(spec)) {
             // --npm-static: opted-in packages ride the program-module edge
             // (the statement-level require branch above).
-            const npmReq = !spec.startsWith("#") ? resolveNpmImport7(sf.fileName, spec) : null;
+            const npmReq = !spec.startsWith("#") ? resolveNpmImport7(sf.fileName, spec, "require") : null;
             if (npmReq !== null && isNpmStaticPackage(npmReq.packageName)) {
               const nDep = npmStaticProgramDep(program, npmReq.packageName, npmReq.typesFile);
               if (nDep !== null) deps.push({ dep: nDep });
@@ -2110,17 +2183,23 @@ function cjsNamedImportLinkCheck(
   // check. Builtin/npm targets contribute nothing here — except opted-in
   // --npm-static packages, whose CJS entries face Node's lexer exactly
   // like program CJS files (their JS IS the program now).
-  const resolveEdge = (from: ts.SourceFile, spec: string): ts.SourceFile | null => {
+  const resolveEdge = (
+    from: ts.SourceFile,
+    spec: string,
+    kind: "import" | "require" = "import",
+  ): ts.SourceFile | null => {
     if (isRelative(spec)) return resolveImport7(program, from, spec);
-    const npmStatic = npmStaticDepSf7(program, from, spec);
+    const npmStatic = npmStaticDepSf7(program, from, spec, kind);
     if (npmStatic !== null) return npmStatic;
-    const p = resolveProjectImport(from.fileName, spec);
+    const p = resolveProjectImport(from.fileName, spec, kind);
     return p !== null ? (program.getSourceFile(p) ?? null) : null;
   };
   // Reexport targets union in only when they resolve to CommonJS program
-  // files (Node's cjsPreparseModuleExports rule).
+  // files (Node's cjsPreparseModuleExports rule) — a reexport is a
+  // require() inside the CJS module, so it resolves with require's
+  // conditions.
   const resolveCjsDep = (from: ts.SourceFile, spec: string): ts.SourceFile | null => {
-    const dep = resolveEdge(from, spec);
+    const dep = resolveEdge(from, spec, "require");
     return dep !== null && isCjsJsFile7(dep) ? dep : null;
   };
   const visible = (dep: ts.SourceFile, name: string): boolean =>
@@ -2139,6 +2218,23 @@ function cjsNamedImportLinkCheck(
   /** The first lexer-invisible CJS name request of ONE module, in V8's
    * check order: all regular named imports sorted by local binding name,
    * then `export { x } from` elements in source order. */
+  /** --npm-static: true (and the package reported an offender) when the
+   * import statement at (sf, spec) went through a CJS-first WRAPPER
+   * substitution. Node links such an import against the wrapper, whose
+   * names are destructured off the CJS module at evaluation — no lexer
+   * involved — so a wrapper name the CJS lexer cannot see is NOT Node's
+   * SyntaxError: the substitution cannot honor it, and the package is an
+   * offender instead of a fabricated startup crash. */
+  const invisibleThroughWrapper = (sf: ts.SourceFile, spec: string, name: string): boolean => {
+    if (isRelative(spec) || spec.startsWith("#") || spec.startsWith("node:")) return false;
+    const npm = resolveNpmImport7(sf.fileName, spec);
+    if (npm?.viaWrapper === undefined || !isNpmStaticPackage(npm.packageName)) return false;
+    reportNpmStaticOffender(
+      npm.packageName,
+      `its ESM entry '${npm.viaWrapper.wrapper}' is a named-export wrapper over its CommonJS entry, and the wrapper's '${name}' is not visible to Node's CommonJS export lexer in that entry (the static compile links only the CommonJS entry's lexer-visible names)`,
+    );
+    return true;
+  };
   const firstInvisibleOf = (sf: ts.SourceFile): BadCjsImport | null => {
     const entries: { local: string; exportName: string; nameNode: ts.Node; spec: string; dep: ts.SourceFile }[] = [];
     for (const stmt of sf.statements) {
@@ -2157,7 +2253,10 @@ function cjsNamedImportLinkCheck(
     }
     entries.sort((a, b) => (a.local < b.local ? -1 : a.local > b.local ? 1 : 0));
     for (const e of entries) {
-      if (!visible(e.dep, e.exportName)) return { exportName: e.exportName, spec: e.spec, nameNode: e.nameNode, sf };
+      if (!visible(e.dep, e.exportName)) {
+        if (invisibleThroughWrapper(sf, e.spec, e.exportName)) continue;
+        return { exportName: e.exportName, spec: e.spec, nameNode: e.nameNode, sf };
+      }
     }
     for (const stmt of sf.statements) {
       if (!ts.isExportDeclaration(stmt) || stmt.isTypeOnly) continue;
@@ -2169,7 +2268,10 @@ function cjsNamedImportLinkCheck(
       for (const e of stmt.exportClause.elements) {
         if (e.isTypeOnly) continue;
         const nameNode = e.propertyName ?? e.name;
-        if (!visible(dep, nameNode.text)) return { exportName: nameNode.text, spec, nameNode, sf };
+        if (!visible(dep, nameNode.text)) {
+          if (invisibleThroughWrapper(sf, spec, nameNode.text)) continue;
+          return { exportName: nameNode.text, spec, nameNode, sf };
+        }
       }
     }
     return null;
@@ -2378,10 +2480,15 @@ export function orderedImportsOf(
  * as a module edge), else null. No offender reporting here — preflight
  * already classified the import; this is the lookup the module-order and
  * lowering paths share. */
-export function npmStaticDepSf7(program: ts.Program, sf: ts.SourceFile, spec: string): ts.SourceFile | null {
+export function npmStaticDepSf7(
+  program: ts.Program,
+  sf: ts.SourceFile,
+  spec: string,
+  kind: "import" | "require" = "import",
+): ts.SourceFile | null {
   if (!npmStaticActive() || isRelativeSpecifier(spec)) return null;
   if (spec.startsWith("node:") || spec.startsWith("#")) return null;
-  const npm = resolveNpmImport7(sf.fileName, spec);
+  const npm = resolveNpmImport7(sf.fileName, spec, kind);
   if (npm === null || !isNpmStaticPackage(npm.packageName)) return null;
   if (!isJsSourceFileName(npm.typesFile)) return null;
   return program.getSourceFile(npm.typesFile) ?? null;

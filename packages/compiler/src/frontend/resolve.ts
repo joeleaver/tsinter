@@ -16,7 +16,13 @@
 
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { isNpmStaticPackage, npmStaticPackageOfPath, npmStaticTransformPkgJson } from "./npm-static.js";
+import {
+  isNpmStaticPackage,
+  npmStaticPackageOfPath,
+  npmStaticTransformPkgJson,
+  type NpmStaticWrapperSubstitution,
+} from "./npm-static.js";
+import { hasConditionTargets, projectPkgJsonShadowText, reduceConditionTargets } from "./node-conditions.js";
 import { provenanceEntryFor } from "./provenance-registry.js";
 
 function isFile(path: string): boolean {
@@ -354,6 +360,12 @@ const EXPORT_CONDITIONS = new Set(["types", "import", "default"]);
  * package.json the tsgo host serves for the same package. */
 const JS_ONLY_CONDITIONS = new Set(["import", "default"]);
 
+/** The require() twin of JS_ONLY_CONDITIONS: the opted-in transform
+ * reduced every condition object to Node's per-syntax answers
+ * ({ import, require } — npmStaticTransformPkgJson), so a require()
+ * edge reads the "require" key exactly where Node's require would. */
+const JS_ONLY_REQUIRE_CONDITIONS = new Set(["require", "default"]);
+
 /** package.json "exports" lookup: exact subpath keys, then '*' patterns
  * (longest literal prefix wins), condition objects in object-key order,
  * arrays first-resolvable. Returns the target path relative to the package
@@ -456,7 +468,11 @@ function nearestPkgDir(dir: string): string | null {
 
 /** package.json "imports" lookup — the exports machinery over "#" keys
  * (exact keys, then '*' patterns, condition objects in key order). */
-function resolveImportsField(imports: unknown, specifier: string): string | null {
+function resolveImportsField(
+  imports: unknown,
+  specifier: string,
+  conditions: ReadonlySet<string> = EXPORT_CONDITIONS,
+): string | null {
   if (!imports || typeof imports !== "object" || Array.isArray(imports)) return null;
   const map = imports as Record<string, unknown>;
   // Reuse the exports resolver by re-rooting the key space: "./" + the
@@ -466,12 +482,54 @@ function resolveImportsField(imports: unknown, specifier: string): string | null
     if (!k.startsWith("#")) continue;
     rekeyed["." + k.slice(1)] = v;
   }
-  return resolveExportsTypes(rekeyed, "." + specifier.slice(1));
+  return resolveExportsTypes(rekeyed, "." + specifier.slice(1), conditions);
+}
+
+/** The bundler set's require() twin for project-scope lookups: the scope's
+ * package.json is read through reduceConditionTargets (Node's per-syntax
+ * answers under "import"/"require", a declaration answer kept first under
+ * "types"), so the syntax picks the key. */
+const PROJECT_REQUIRE_CONDITIONS = new Set(["types", "require", "default"]);
+
+/** The package.json document a PROJECT-scope lookup (imports field,
+ * self-name) reads: an opted-in --npm-static package's transformed
+ * document (types gone — the same one the tsgo host serves), a project
+ * scope's Node-reduced document (projectPkgJsonShadowText's twin), or the
+ * raw document for a non-opted node_modules scope (the island's own
+ * resolver owns those at runtime). Cloned; the raw cache stays clean. */
+function scopePkgJsonOf(pkgDir: string): (PkgJson & Record<string, unknown>) | null {
+  const raw = pkgJsonOf(pkgDir);
+  if (raw === null) return null;
+  const opted = npmStaticPackageOfPath(join(pkgDir, "package.json")) !== null;
+  if (!opted && isNodeModulesPath(join(pkgDir, "package.json"))) return raw as PkgJson & Record<string, unknown>;
+  const clone = JSON.parse(JSON.stringify(raw)) as PkgJson & Record<string, unknown>;
+  if (opted) npmStaticTransformPkgJson(clone, pkgDir);
+  else if (hasConditionTargets(clone)) reduceConditionTargets(clone, { keepTypes: true });
+  return clone;
 }
 
 /** Absolute path of the nearest package.json at or above `fromFile`'s
  * directory — the package scope Node's imports-field refusals name
  * (ERR_PACKAGE_IMPORT_NOT_DEFINED carries it). Null outside any scope. */
+/** The tsgo host's shadow CONTENT for a project-scope package.json (one
+ * outside every node_modules and not an opted-in --npm-static workspace
+ * package, whose own transform the npm-static shadow serves): Node's
+ * per-syntax "exports"/"imports" answers, the same document
+ * scopePkgJsonOf hands resolveProjectImport. Undefined = serve the file
+ * as is. */
+export function projectPkgJsonShadow(path: string): string | undefined {
+  const norm = path.split("\\").join("/");
+  if (!norm.endsWith("/package.json") || isNodeModulesPath(norm)) return undefined;
+  if (npmStaticPackageOfPath(norm) !== null) return undefined;
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    return undefined;
+  }
+  return projectPkgJsonShadowText(text);
+}
+
 export function nearestPkgJsonPath(fromFile: string): string | null {
   const dir = nearestPkgDir(dirname(resolve(fromFile)));
   return dir === null ? null : join(dir, "package.json");
@@ -483,7 +541,13 @@ export function nearestPkgJsonPath(fromFile: string): string | null {
  * source path with the usual bundler extension substitution, or null.
  * Relative specifiers, real node_modules packages, and builtins are other
  * resolvers' business; callers try those first. */
-export function resolveProjectImport(fromFile: string, specifier: string): string | null {
+export function resolveProjectImport(
+  fromFile: string,
+  specifier: string,
+  /** The importing syntax: Node's condition set follows it (an import
+   * statement matches "import", a require() "require"). */
+  kind: "import" | "require" = "import",
+): string | null {
   // --provenance-sources (flag-gated; the registry is empty otherwise): a
   // registered bare specifier answers its attested SOURCE entry — the one
   // chokepoint that makes preflight's user-module edges, the module
@@ -493,14 +557,15 @@ export function resolveProjectImport(fromFile: string, specifier: string): strin
   if (provenance !== null) return provenance;
   const pkgDir = nearestPkgDir(dirname(resolve(fromFile)));
   if (pkgDir === null) return null;
-  const pkg = pkgJsonOf(pkgDir) as (PkgJson & { imports?: unknown; exports?: unknown; type?: string }) | null;
+  const pkg = scopePkgJsonOf(pkgDir) as (PkgJson & { imports?: unknown; exports?: unknown; type?: string }) | null;
+  const conditions = kind === "require" ? PROJECT_REQUIRE_CONDITIONS : EXPORT_CONDITIONS;
   if (!pkg) return null;
   let target: string | null = null;
   if (specifier.startsWith("#")) {
     // Node's validity rule: only the bare "#" is never resolvable ("#/..."
     // matches "#/*"-pattern keys on current Node).
     if (specifier === "#") return null;
-    target = resolveImportsField((pkg as { imports?: unknown }).imports, specifier);
+    target = resolveImportsField((pkg as { imports?: unknown }).imports, specifier, conditions);
     // An imports target that is not "./"-relative is PACKAGE_RESOLVE'd as
     // a bare specifier (Node's PACKAGE_IMPORTS_EXPORTS_RESOLVE): the
     // project-internal half of that re-entry is the self-name rule below —
@@ -508,7 +573,7 @@ export function resolveProjectImport(fromFile: string, specifier: string): strin
     // scope). Targets naming real node_modules packages answer null here;
     // callers' npm resolution owns those.
     if (target !== null && !target.startsWith("./") && !target.startsWith("#")) {
-      return resolveProjectImport(join(pkgDir, "package.json"), target);
+      return resolveProjectImport(join(pkgDir, "package.json"), target, kind);
     }
   } else if (typeof pkg.name === "string" && pkg.name !== "" && pkg.exports !== undefined) {
     // Self-name: the specifier's package-name part must equal the nearest
@@ -518,7 +583,7 @@ export function resolveProjectImport(fromFile: string, specifier: string): strin
     const pkgName = parts.slice(0, nameLen).join("/");
     if (pkgName !== pkg.name || parts.length < nameLen) return null;
     const subpath = parts.length === nameLen ? "." : "./" + parts.slice(nameLen).join("/");
-    target = resolveExportsTypes(pkg.exports, subpath);
+    target = resolveExportsTypes(pkg.exports, subpath, conditions);
   }
   if (target === null) return null;
   const path = join(pkgDir, target);
@@ -644,6 +709,11 @@ export interface BareResolution {
    * carries no node_modules segment, and callers must not read that as
    * "not an npm package". */
   workspaceDir?: string;
+  /** --npm-static, import-syntax edges only: the answer is a CJS-first
+   * substitution — Node's import target is the named-export wrapper
+   * `wrapper` over this CJS file (npmStaticTransformPkgJson step 3). The
+   * import site checks its clause against what the wrapper serves. */
+  viaWrapper?: { wrapper: string; names: ReadonlySet<string>; hasDefault: boolean };
 }
 
 /** Package name prefix of a bare specifier ("@scope/pkg/sub" → "@scope/pkg",
@@ -679,6 +749,12 @@ export function resolveBareModule(
   /** "js-only" forces the runtime-JS resolution regardless of the active
    * --npm-static set (the auto-detection probe); default follows the set. */
   mode?: "js-only",
+  /** The importing SYNTAX: an import statement / import() / export-from
+   * ("import") or a require() call ("require"). Only an opted-in
+   * --npm-static package's resolution depends on it (Node's per-syntax
+   * condition sets, board #258); every other answer is the types-first
+   * bundler lookup, syntax-blind as ever. */
+  kind: "import" | "require" = "import",
 ): BareResolution | null {
   const pkgName = packagePrefixOf(specifier);
   const rest = specifier.slice(pkgName.length).replace(/^\//, "");
@@ -687,7 +763,11 @@ export function resolveBareModule(
   // pass only, the "types" export condition dropped, the @types mangling
   // never consulted — mirroring the shadowed world the tsgo host serves.
   const npmStatic = mode === "js-only" || isNpmStaticPackage(pkgName);
-  const conditions = npmStatic ? JS_ONLY_CONDITIONS : EXPORT_CONDITIONS;
+  const conditions = npmStatic
+    ? kind === "require"
+      ? JS_ONLY_REQUIRE_CONDITIONS
+      : JS_ONLY_CONDITIONS
+    : EXPORT_CONDITIONS;
 
   const inPackage = (nmPkgDir: string, name: string, pass: NmPass): BareResolution | null => {
     // A workspace link: the answer's realpath escaped node_modules, so the
@@ -714,14 +794,16 @@ export function resolveBareModule(
     };
     const rawPkg = pkgJsonOf(nmPkgDir);
     // The opted-in exports lookup runs over the SAME transformed document
-    // the tsgo host serves (types stripped, import:=require) — the two
+    // the tsgo host serves (types stripped, condition objects reduced to
+    // Node's per-syntax answers, wrapper duals CJS-first) — the two
     // resolvers must answer one file. Cloned per lookup; never cached, so
     // the raw cache stays clean for flagless compiles.
+    let subs: NpmStaticWrapperSubstitution[] = [];
     const pkg =
       npmStatic && rawPkg !== null
         ? (() => {
             const clone = JSON.parse(JSON.stringify(rawPkg)) as PkgJson & Record<string, unknown>;
-            npmStaticTransformPkgJson(clone);
+            subs = npmStaticTransformPkgJson(clone, nmPkgDir);
             return clone;
           })()
         : rawPkg;
@@ -729,7 +811,13 @@ export function resolveBareModule(
       const target = resolveExportsTypes(pkg.exports, subpath, conditions);
       if (target !== null) {
         const file = loadTargetInPass(nmPkgDir, target, pass);
-        if (file) return withWorkspace(packageAnswer(nmPkgDir, name, file));
+        if (file) {
+          const answer = withWorkspace(packageAnswer(nmPkgDir, name, file));
+          const sub = kind === "import" ? subs.find((x) => x.subpath === subpath && x.cjs === target) : undefined;
+          return answer !== null && sub !== undefined
+            ? { ...answer, viaWrapper: { wrapper: sub.wrapper, names: sub.names, hasDefault: sub.hasDefault } }
+            : answer;
+        }
       }
       return null;
     }

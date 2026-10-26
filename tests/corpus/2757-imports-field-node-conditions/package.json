@@ -1,0 +1,16 @@
+{
+  "name": "nodecond-corpus",
+  "private": true,
+  "type": "module",
+  "imports": {
+    "#impl": { "node": "./src/node-impl.ts", "default": "./src/browser-impl.ts" },
+    "#nested": {
+      "import": { "browser": "./src/browser-impl.ts", "default": "./src/node-impl.ts" },
+      "default": "./src/browser-impl.ts"
+    }
+  },
+  "exports": {
+    ".": "./main.ts",
+    "./side": { "module-sync": "./src/sync.ts", "import": "./src/browser-impl.ts" }
+  }
+}

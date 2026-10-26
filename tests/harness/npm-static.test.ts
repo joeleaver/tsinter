@@ -57,6 +57,9 @@ async function buildStatic(entry: string, npmStatic: string[] | "auto"): Promise
     ...globSync(join(pilotRoot, "**/node_modules/**/*.{js,mjs,cjs,json,d.ts}")).sort(),
     // the bundler-emitted-CJS mini packages (cases 2465-2469, 2556-2557)
     ...globSync(join(fixturesRoot, "npm/node_modules/gt*/**/*.{js,json}")).sort(),
+    // the dual-package cases (board #258)
+    ...globSync(join(fixturesRoot, "npm/node_modules/{dual,dualsync,wrapdual,fakewrapesm,syncfirst,impalias}/**/*.{js,mjs,cjs,json}")).sort(),
+    ...globSync(join(fixturesRoot, "npm/cases/dual-syntax/*.cjs")).sort(),
   ];
   for (const f of inputs) hash.update(f).update(readFileSync(f));
   const key = hash
@@ -199,6 +202,51 @@ describe(`npm-static pilots${sanitize ? " (sanitized)" : ""}`, () => {
     expect(total).toBeGreaterThan(1000); // the whole package joined the program
     expect((total - failed) / total).toBeGreaterThanOrEqual(0.85);
   }, 180_000);
+
+  // Board #258: an opted-in DUAL package resolves the way Node resolves
+  // the importing SYNTAX — an import statement takes the "import"
+  // condition (dual-entry: Node prints "esm"; the old blanket CJS-first
+  // rewrite printed "cjs"), a require() takes require's set, where
+  // "module-sync" outranks "require" when listed first (dual-syntax's
+  // lib.cjs) and neither "browser" nor the "module" field is Node's.
+  // The CJS-first substitution survives only for a named-export wrapper
+  // (wrapdual, commander's shape) and only for the wrapper's own names.
+  test.for([
+    ["dual-entry", ["dual"]],
+    ["dual-syntax", "auto"],
+    // the review rows: a wrapper-shaped dual whose require target is an ES
+    // module (no substitution), module-sync listed before import on an
+    // import statement, and an "imports" alias whose "node" target wins
+    ["node-conditions", "auto"],
+  ] as const)("dual package %s resolves per importing syntax and byte-matches Node", async ([caseDir, npmStatic]) => {
+    const entry = join(fixturesRoot, "npm/cases", caseDir, "main.ts");
+    const { coverage } = analyze(entry, { npmStatic: npmStatic === "auto" ? "auto" : [...npmStatic] });
+    expect((coverage.npmStatic ?? []).every((s) => s.status === "static")).toBe(true);
+    expect(coverage.diagnostics).toHaveLength(0);
+    const binary = await buildStatic(entry, npmStatic === "auto" ? "auto" : [...npmStatic]);
+    const [nodeRes, nativeRes] = await Promise.all([runBinary("node", [entry]), runBinary(binary, [])]);
+    expect(nativeRes.stdout.toString("utf8")).toBe(nodeRes.stdout.toString("utf8"));
+    expect(nativeRes.exitCode).toBe(nodeRes.exitCode);
+  }, 120_000);
+
+  // A namespace import of a wrapper dual observes the WRAPPER's namespace
+  // in Node, which the CJS-first substitution cannot serve: the package
+  // is an offender with the reason, and the island serves the import.
+  test("a wrapper dual's namespace import falls back to the island by name", () => {
+    const { coverage } = analyze(join(fixturesRoot, "npm/cases/wrapper-namespace/main.ts"), {
+      dynamic: true,
+      npmStatic: "auto",
+    });
+    expect(coverage.npmStatic).toEqual([
+      {
+        package: "wrapdual",
+        status: "fallback",
+        detail:
+          "its ESM entry './esm.mjs' is a named-export wrapper over its CommonJS entry, and a namespace import observes the wrapper's own namespace (the static compile substitutes the CommonJS entry only for the wrapper's own named exports)",
+      },
+    ]);
+    expect(coverage.preflightFailed).toBe(false);
+  }, 120_000);
 
   // Tier 3: the island fallback — esbundled's chunk requires "net", an
   // unshimmed-builtin edge preflight refuses for a static package, so the

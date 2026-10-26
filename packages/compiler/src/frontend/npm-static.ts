@@ -56,6 +56,7 @@
 
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { dirname } from "node:path";
+import { reduceConditionTargets, type WrapperSubstitution } from "./node-conditions.js";
 import { rewriteBundlerCjsExports } from "./npm-static-rewrite.js";
 import { npmPackageNameOf, registerWorkspacePackage, workspacePackageOfPath } from "./shared.js";
 
@@ -175,76 +176,53 @@ function shadowTargetOf(path: string): { pkg: string; viaTypes: boolean } | null
   return null;
 }
 
+/** A CJS-first substitution the transform made (node-conditions.ts). */
+export type NpmStaticWrapperSubstitution = WrapperSubstitution;
+
 /** The opted-in package.json transform, applied identically in BOTH
  * resolution worlds (the tsgo host's fs shadow and resolve.ts):
  *   1. every types claim goes — the top-level "types"/"typings" fields
- *      and every "types"/"typings" condition key inside "exports"
- *      (recursively; condition objects nest) — so resolution lands on
- *      runtime JS;
- *   2. CJS-first: a condition object carrying BOTH "import" and "require"
- *      has its "import" value REWRITTEN to the "require" target. The
- *      import-side of a wrapper-style dual (commander's esm.mjs) is pure
- *      name plumbing over the CJS implementation — `export const {…} =
- *      cjsDefault`, a re-export shape with no static lowering — while the
- *      CJS side engages the compiler's richest machinery (the CJS lexer
- *      link check, export-identity analysis, require discipline).
- *      Behavior is identical for wrapper duals (both sides evaluate the
- *      same CJS module); genuinely dual-BEHAVIOR packages are outside the
- *      pilot's supported surface — the differential contract gates every
- *      opted-in package. Import-only (pure ESM) packages are untouched
- *      and compile as native ES modules. */
-export function npmStaticTransformPkgJson(pkg: Record<string, unknown>): void {
+ *      and every "types"/"typings" condition key inside "exports" /
+ *      "imports" — so resolution lands on runtime JS;
+ *   2. every condition object inside "exports" AND "imports" is REPLACED
+ *      by Node's own answer for each syntax: `{ import: <Node's import
+ *      target>, require: <Node's require target> }`
+ *      (node-conditions.ts reduceConditionTargets). Both worlds then pick
+ *      per importing syntax — an import statement takes the "import" key,
+ *      a require() the "require" key — and land on the file Node loads
+ *      (board #258: a dual package's import used to take its CJS entry;
+ *      an "imports" alias's "node" target used to lose to "default"). The
+ *      "node" condition (yaml's browser-vs-node split) and "module-sync"
+ *      fall out of the same reduction;
+ *   3. CJS-first, ONLY for a wrapper dual: when the import target is a
+ *      named-export wrapper over a require target Node loads as CommonJS
+ *      (wrapperShapeOf + nodeLoadsAsCjs — commander's esm.mjs), the
+ *      "import" key takes the require target. Both sides evaluate the
+ *      same CJS module, so the named imports the wrapper exports read the
+ *      same values; the wrapper's re-export shape (`export const {…} =
+ *      cjsDefault`) has no static lowering while the CJS side engages the
+ *      CJS lexer link check and export-identity analysis. What the
+ *      wrapper does NOT serve (a default it doesn't export, a namespace,
+ *      a name outside its list) is checked at the import site (program.ts
+ *      npmStaticWrapperOffence7, and the CJS link check for a wrapper name
+ *      the CJS lexer cannot see) and makes the package an offender — never
+ *      a silent different entry. Returned so resolve.ts can mark answers
+ *      that went through one.
+ * `pkgDir` locates the wrapper candidates; without it (no directory
+ * known) no substitution happens and step 2 stands alone. */
+export function npmStaticTransformPkgJson(
+  pkg: Record<string, unknown>,
+  pkgDir?: string,
+): NpmStaticWrapperSubstitution[] {
   delete pkg["types"];
   delete pkg["typings"];
-  const transform = (v: unknown): void => {
-    if (v === null || typeof v !== "object") return;
-    if (Array.isArray(v)) {
-      for (const item of v) transform(item);
-      return;
-    }
-    const obj = v as Record<string, unknown>;
-    delete obj["types"];
-    delete obj["typings"];
-    // 0. The "node" condition HOISTS: Node's runtime resolution matches it
-    //    (yaml's `{ types, node: "./dist/index.js", default: "./browser/
-    //    index.js" }` runs the node dist; the browser dist is a DIFFERENT
-    //    artifact), while the bundler condition set both resolution worlds
-    //    use ({types, import, default}) would fall through to "default".
-    //    The node target splices in AT ITS KEY POSITION — a string emits
-    //    under import+require (either matcher finds it there), an object's
-    //    entries splice inline — earlier real keys keep winning, exactly
-    //    Node's first-match-in-key-order rule.
-    if (obj["node"] !== undefined) {
-      const entries = Object.entries(obj);
-      for (const k of Object.keys(obj)) delete obj[k];
-      for (const [k, val] of entries) {
-        if (k !== "node") {
-          if (!(k in obj)) obj[k] = val;
-          continue;
-        }
-        const inner: Record<string, unknown> =
-          typeof val === "string"
-            ? { import: val, require: val }
-            : val !== null && typeof val === "object" && !Array.isArray(val)
-              ? (val as Record<string, unknown>)
-              : {};
-        for (const [ik, iv] of Object.entries(inner)) {
-          if (!(ik in obj)) obj[ik] = iv;
-        }
-      }
-    }
-    if (obj["import"] !== undefined && obj["require"] !== undefined) {
-      obj["import"] = obj["require"];
-    }
-    for (const value of Object.values(obj)) transform(value);
-  };
-  if (pkg["exports"] !== undefined) transform(pkg["exports"]);
+  return reduceConditionTargets(pkg, { keepTypes: false, ...(pkgDir !== undefined ? { wrapperPkgDir: pkgDir } : {}) });
 }
 
 /** npmStaticTransformPkgJson over a package.json TEXT (the fs shadow's
- * form). Malformed documents pass through untouched — resolution reports
- * them exactly as it always did. */
-export function npmStaticTransformPkgJsonText(text: string): string {
+ * form; `pkgDir` is the document's directory). Malformed documents pass
+ * through untouched — resolution reports them exactly as it always did. */
+export function npmStaticTransformPkgJsonText(text: string, pkgDir?: string): string {
   let doc: unknown;
   try {
     doc = JSON.parse(text);
@@ -252,7 +230,7 @@ export function npmStaticTransformPkgJsonText(text: string): string {
     return text;
   }
   if (doc === null || typeof doc !== "object" || Array.isArray(doc)) return text;
-  npmStaticTransformPkgJson(doc as Record<string, unknown>);
+  npmStaticTransformPkgJson(doc as Record<string, unknown>, pkgDir);
   return JSON.stringify(doc);
 }
 
@@ -354,7 +332,7 @@ export function npmStaticFsShadow(): NpmStaticFsShadow | null {
       if (target.viaTypes) return undefined;
       if (path.endsWith("/package.json") || path.endsWith("\\package.json")) {
         try {
-          return npmStaticTransformPkgJsonText(readFileSync(path, "utf8"));
+          return npmStaticTransformPkgJsonText(readFileSync(path, "utf8"), dirname(path));
         } catch {
           return undefined;
         }

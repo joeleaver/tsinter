@@ -3616,6 +3616,10 @@ const TIER_FLOOR: string[] = [
   "1101-island-marshal-unicode.ts",
   "1102-island-rc-stress.ts",
   "1206-regex-dynamic-mix.ts",
+  // Unit F (board #258 review N1): a project's "imports" / self-name
+  // "exports" condition objects resolve with Node's condition set for the
+  // importing syntax (node-conditions.ts): 1083 -> 1084.
+  "2757-imports-field-node-conditions/main.ts",
 ];
 
 interface RunResult {

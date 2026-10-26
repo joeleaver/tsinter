@@ -7807,6 +7807,36 @@
    ],
    "diags": []
   },
+  "<repo>/tests/fixtures/npm/cases/dual-syntax/main.ts": {
+   "order": [
+    "<repo>/tests/fixtures/npm/cases/dual-syntax/lib.cjs",
+    "<repo>/tests/fixtures/npm/cases/dual-syntax/main.ts"
+   ],
+   "diags": [
+    {
+     "code": "SC1010",
+     "message": "the 'dualsync' module is not supported yet",
+     "loc": {
+      "file": "<repo>/tests/fixtures/npm/cases/dual-syntax/lib.cjs",
+      "start": 20,
+      "end": 44
+     },
+     "milestone": "M4",
+     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, and module modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
+    },
+    {
+     "code": "SC1010",
+     "message": "the 'fakewrapesm' module is not supported yet",
+     "loc": {
+      "file": "<repo>/tests/fixtures/npm/cases/dual-syntax/lib.cjs",
+      "start": 201,
+      "end": 228
+     },
+     "milestone": "M4",
+     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, and module modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
+    }
+   ]
+  },
   "<repo>/tests/fixtures/npm/cases/dynamic-import-local/main.ts": {
    "order": [
     "<repo>/tests/fixtures/npm/cases/dynamic-import-local/main.ts"
@@ -7927,6 +7957,12 @@
    ],
    "diags": []
   },
+  "<repo>/tests/fixtures/npm/cases/node-conditions/main.ts": {
+   "order": [
+    "<repo>/tests/fixtures/npm/cases/node-conditions/main.ts"
+   ],
+   "diags": []
+  },
   "<repo>/tests/fixtures/npm/cases/npm-reexport/main.ts": {
    "order": [
     "<repo>/tests/fixtures/npm/cases/npm-reexport/facade.ts",
@@ -8023,6 +8059,12 @@
   "<repo>/tests/fixtures/npm/cases/workspace-unclean/main.ts": {
    "order": [
     "<repo>/tests/fixtures/npm/cases/workspace-unclean/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/fixtures/npm/cases/wrapper-namespace/main.ts": {
+   "order": [
+    "<repo>/tests/fixtures/npm/cases/wrapper-namespace/main.ts"
    ],
    "diags": []
   },
@@ -8164,6 +8206,25 @@
     "<repo>/tests/corpus/2747-buffer-alloc-size.ts"
    ],
    "diags": []
+  },
+  "<repo>/tests/corpus/2757-imports-field-node-conditions/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2757-imports-field-node-conditions/src/node-impl.ts",
+    "<repo>/tests/corpus/2757-imports-field-node-conditions/main.ts"
+   ],
+   "diags": [
+    {
+     "code": "SC1010",
+     "message": "the 'nodecond-corpus/side' package (nothing installed resolves it) is not supported yet",
+     "loc": {
+      "file": "<repo>/tests/corpus/2757-imports-field-node-conditions/main.ts",
+      "start": 609,
+      "end": 660
+     },
+     "milestone": "M4",
+     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, and module modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
+    }
+   ]
   }
  }
 }

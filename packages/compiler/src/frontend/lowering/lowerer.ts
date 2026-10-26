@@ -1385,7 +1385,7 @@ export class Lowerer {
               ? null
               : isRelativeSpecifier(spec)
                 ? resolveImport(this.program, recvDecl.getSourceFile(), spec)
-                : npmStaticDepSf7(this.program, recvDecl.getSourceFile(), spec);
+                : npmStaticDepSf7(this.program, recvDecl.getSourceFile(), spec, "require");
           if (dep) symbol = this.cjsModuleExportSymbol(dep, ident.text);
         } else if (recvDecl && ts.isImportClause(recvDecl)) {
           // The DEFAULT-import spelling of the same binding: the dep is
@@ -1585,7 +1585,7 @@ export class Lowerer {
       if (spec === null) return false;
       if (
         !isRelativeSpecifier(spec) &&
-        npmStaticDepSf7(this.program, decl.getSourceFile(), spec) === null
+        npmStaticDepSf7(this.program, decl.getSourceFile(), spec, "require") === null
       ) {
         return false;
       }
@@ -1808,7 +1808,7 @@ export class Lowerer {
     // run.
     const dep = isRelativeSpecifier(spec)
       ? resolveImport(this.program, node.getSourceFile(), spec)
-      : npmStaticDepSf7(this.program, node.getSourceFile(), spec);
+      : npmStaticDepSf7(this.program, node.getSourceFile(), spec, "require");
     if (!dep || dep.fileName.endsWith(".json")) return null;
     if (this.asyncInitFiles.has(dep)) {
       this.unsupported(
