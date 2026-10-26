@@ -3649,6 +3649,16 @@ export class InspectBuilder {
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
 
+      if (dyn.typedLive) {
+        // Unit I: Node prints `Uint32Array(2) [ 7, 900000001 ]`; not built
+        // for a typed array held in a dynamic value — refused by name.
+        dyn.isTyped(c, D, K);
+        c.ifVoid();
+        this.deps.throwError(c, "%Error", "Error", (x) => this.deps.lit(x, "inspecting a typed array held in a dynamic value is not supported yet"));
+        c.refNull(this.deps.strType());
+        c.return_();
+        c.end();
+      }
       /* The scalar arms: no frame, no recursion, no circular state. */
       this.kindArm(c, K, [DK.NULL], () => {
         this.deps.lit(c, "null");
@@ -4065,6 +4075,17 @@ export class InspectBuilder {
       this.kindArm(c, K, [DK.OBJ], () => {
         dyn.objPayload(c, (x) => x.localGet(D));
         c.localSet(O);
+        if (dyn.urlLive) {
+          // Unit I: Node prints a URL as its full URL { href: ..., ... }
+          // record, which is not built — refused by name.
+          c.localGet(O);
+          c.refTest(dyn.objUrlT());
+          c.ifVoid();
+          this.deps.throwError(c, "%Error", "Error", (x) => this.deps.lit(x, "inspecting a URL held in a dynamic value is not supported yet"));
+          c.refNull(this.deps.strType());
+          c.return_();
+          c.end();
+        }
         if (dyn.regexLive) {
           // Unit F1: an island RegExp prints as its literal, Node's form.
           c.localGet(O);

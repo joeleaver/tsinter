@@ -463,6 +463,21 @@ export interface DynDeps {
    * bytecode, captureCount, groupNames — regex-value.ts), `test` the
    * emitter's `(eqref re, str s) -> i32` matcher (one exec at index 0). */
   regex?: { reType: () => number; test: () => number };
+  /** Unit I: present ONLY in a module where a WHATWG URL crosses into a
+   * dynamic value (jsMarshal / dynFrom of a URL, or of a union with a URL
+   * arm): `urlType` is url-whatwg.ts's URL struct, `getters` the
+   * `(url) -> str` component readers it exposes, by property name. */
+  url?: { urlType: () => number; getters: ReadonlyArray<readonly [string, () => number]>; refuse: (c: Code) => void };
+  /** Unit I: present ONLY in a module where a non-u8 typed array (a
+   * Uint32Array, Int32Array or Float32Array) crosses into a dynamic value:
+   * `get(elem)` is typedarrays.ts's `(bytes, f64 index) -> f64` element
+   * read, `ctorThunk` the thunk a typed-array `constructor` FUNC carries
+   * (it refuses by name), and `refuse` the named uncaught refusal of a
+   * reader that cannot be catchable. */
+  typed?: { get: (elem: "u32" | "i32" | "f32") => number; refuse: (c: Code, what: string) => void };
+  /** Unit I: present ONLY in a module that reads `constructor` off a value
+   * that may be a typed array or a Buffer held in a dynamic value. */
+  bytesCtor?: { thunk: () => number };
   /** INC-27 U5: Object.assign's member PUT onto a DOMException — present
    * ONLY in a module that can mint a DOMException (the emitter's static
    * prescan), so assign's body is unchanged everywhere else. `isDomex`
@@ -822,6 +837,352 @@ export class DynBuilder {
     return this.deps.regex !== undefined;
   }
 
+  get urlLive(): boolean {
+    return this.deps.url !== undefined;
+  }
+
+  private objUrlType: number | null = null;
+
+  /** Unit I: `$dynObjUrl <: $dynObj` — a URL held in a dynamic value: an
+   * empty OBJ payload (a URL has no own enumerable keys, so keys, JSON's
+   * walk and spread answer as Node's do) carrying the URL struct. */
+  objUrlT(): number {
+    if (this.objUrlType !== null) return this.objUrlType;
+    const objT = this.objT();
+    const entries = this.entriesArrayType();
+    this.objUrlType = this.mb.subStructType(
+      "dyn:objUrl",
+      [
+        { storage: I32, mutable: true },
+        { storage: { kind: "ref", nullable: true, typeIndex: entries }, mutable: true },
+        { storage: I32, mutable: false },
+        { storage: { kind: "ref", nullable: true, typeIndex: EQ_HEAP }, mutable: false },
+      ],
+      objT,
+    );
+    return this.objUrlType;
+  }
+
+  /** Box the URL struct ref the caller pushes as a dynamic URL. */
+  boxUrl(c: Code, pushUrl: (c: Code) => void): void {
+    this.boxObj(c, (x) => {
+      x.i32Const(0);
+      x.refNull(this.entriesArrayType());
+      x.i32Const(OBJ_PROTO_PLAIN);
+      pushUrl(x);
+      x.structNew(this.objUrlT());
+    });
+  }
+
+  /** The URL struct of a dynamic-URL OBJ payload the caller pushes. */
+  private urlOf(c: Code): void {
+    c.refCast(this.objUrlT());
+    c.structGet(this.objUrlT(), 3);
+    c.refCast(this.deps.url!.urlType());
+  }
+
+  /** The URL members a read answers (the modeled getters) or fences by
+   * name (the components url-whatwg.ts does not expose, and the methods
+   * read as values). */
+  private static readonly URL_FENCED = ["hash", "port", "origin", "username", "password", "searchParams", "toString", "toJSON", "constructor"];
+
+  /** %w.dyn.urlKey(o, key) -> dyn, or null when `key` is no URL member. */
+  urlKey(): number {
+    return this.cached("urlKey", [this.objRef(), this.deps.strRef()], [this.dynRef()], (idx) => {
+      const c = new Code();
+      for (const [name, fn] of this.deps.url!.getters) {
+        c.localGet(1);
+        this.deps.lit(c, name);
+        c.call(this.deps.strEq());
+        c.ifVoid();
+        this.boxStr(c, (x) => {
+          x.localGet(0);
+          this.urlOf(x);
+          x.call(fn());
+        });
+        c.return_();
+        c.end();
+      }
+      for (const name of DynBuilder.URL_FENCED) {
+        c.localGet(1);
+        this.deps.lit(c, name);
+        c.call(this.deps.strEq());
+        c.ifVoid();
+        this.deps.throwError(c, "%Error", "Error", (x) =>
+          this.deps.lit(x, `reading '${name}' of a URL held in a dynamic value is not supported yet`),
+        );
+        c.refNull(this.dynT());
+        c.return_();
+        c.end();
+      }
+      c.refNull(this.dynT());
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  get typedLive(): boolean {
+    return this.deps.typed !== undefined;
+  }
+
+  private typedType: number | null = null;
+
+  /** Unit I: a non-u8 typed array held in a dynamic value is a `$dyn`
+   * tagged DK.JSVAL whose ref is a `$dynTyped` payload { bytes, elem } —
+   * the same trap-kind discipline as A2's accessor cell: every reader not
+   * taught about it hits its unreachable JSVAL arm (a trap, never a
+   * silent empty-object answer). The taught readers are keyGet (length,
+   * index reads, BYTES_PER_ELEMENT, byteLength, constructor), typeof,
+   * truthiness and strict equality; the readers that would walk or
+   * convert it (keys, JSON, spread, Object.assign, `in`/hasOwn, writes,
+   * method calls, String(), inspect, deep equality, iteration) refuse by
+   * name. Elem codes: 1 u32, 2 i32, 3 f32. */
+  typedT(): number {
+    this.typedType ??= this.mb.openStructType("dyn:typed", [
+      { storage: this.deps.bytesRefU8(), mutable: false },
+      { storage: I32, mutable: false },
+    ]);
+    return this.typedType;
+  }
+
+  static readonly TYPED_ELEMS: readonly (readonly ["u32" | "i32" | "f32", number, string])[] = [
+    ["u32", 1, "Uint32Array"],
+    ["i32", 2, "Int32Array"],
+    ["f32", 3, "Float32Array"],
+  ];
+
+  /** Box a non-u8 typed array (its `$bytes` ref pushed by the caller). */
+  boxTyped(c: Code, pushBytes: (c: Code) => void, elem: "u32" | "i32" | "f32"): void {
+    const code = DynBuilder.TYPED_ELEMS.find(([e]) => e === elem)![1];
+    c.i32Const(DK.JSVAL);
+    c.f64Const(0);
+    pushBytes(c);
+    c.i32Const(code);
+    c.structNew(this.typedT());
+    c.structNew(this.dynT());
+  }
+
+  /** With a `$dyn` in local `d` and its kind in local `k`, leaves i32: is
+   * it a dynamic typed array (only where they can exist). */
+  isTyped(c: Code, d: number, k: number): void {
+    c.localGet(k);
+    c.i32Const(DK.JSVAL);
+    c.i32Eq();
+    c.ifResult(I32);
+    c.localGet(d);
+    c.structGet(this.dynT(), DYN_REF);
+    c.refTest(this.typedT());
+    c.else_();
+    c.i32Const(0);
+    c.end();
+  }
+
+  /** Where typed arrays are live: if the value in local `d` (kind in `k`)
+   * is one, emit `body` and return from the enclosing function. */
+  typedArm(c: Code, d: number, k: number, body: () => void): void {
+    if (!this.typedLive) return;
+    this.isTyped(c, d, k);
+    c.ifVoid();
+    body();
+    c.return_();
+    c.end();
+  }
+
+  /** The names `in` finds on a typed array besides its indices: every
+   * %TypedArray%.prototype and Uint32Array.prototype own name (Node v24's
+   * lists, read off the prototypes). Object.prototype's names stay false,
+   * S015's stance for every dynamic object. */
+  static readonly TYPED_IN_NAMES: ReadonlySet<string> = new Set([
+    "constructor", "buffer", "byteLength", "byteOffset", "length", "entries", "keys", "values", "at",
+    "copyWithin", "every", "fill", "filter", "find", "findIndex", "findLast", "findLastIndex", "forEach",
+    "includes", "indexOf", "join", "lastIndexOf", "map", "reverse", "reduce", "reduceRight", "set", "slice",
+    "some", "sort", "subarray", "toReversed", "toSorted", "with", "toLocaleString", "toString", "BYTES_PER_ELEMENT",
+  ]);
+
+  /** Pushes f64: the element count of the dynamic typed array in local `d`. */
+  typedLength(c: Code, d: number): void {
+    c.localGet(d);
+    c.structGet(this.dynT(), DYN_REF);
+    c.refCast(this.typedT());
+    c.structGet(this.typedT(), 0);
+    c.call(this.deps.bytesLen());
+  }
+
+  /** A catchable named refusal of `what` on a dynamic typed array, then
+   * `pushNull` (the enclosing function's error answer). */
+  typedFence(c: Code, what: string, pushNull: (c: Code) => void): void {
+    this.deps.throwError(c, "%Error", "Error", (x) =>
+      this.deps.lit(x, `${what} a typed array held in a dynamic value is not supported yet`),
+    );
+    pushNull(c);
+  }
+
+  /** %w.dyn.typedKey(d, key) -> dyn: length, canonical index reads,
+   * BYTES_PER_ELEMENT, byteLength, constructor; a TypedArray.prototype
+   * method read as a value refuses by name; any other key is undefined
+   * (a typed array has no other own properties). */
+  typedKey(): number {
+    return this.cached("typedKey", [this.dynRef(), this.deps.strRef()], [this.dynRef()], (idx) => {
+      const typedT = this.typedT();
+      const c = new Code();
+      const B = 2;
+      const E = 3;
+      const IX = 4;
+      c.localGet(0);
+      c.structGet(this.dynT(), DYN_REF);
+      c.refCast(typedT);
+      c.structGet(typedT, 0);
+      c.localSet(B);
+      c.localGet(0);
+      c.structGet(this.dynT(), DYN_REF);
+      c.refCast(typedT);
+      c.structGet(typedT, 1);
+      c.localSet(E);
+      this.pushIsLength(c, (x) => x.localGet(1));
+      c.ifVoid();
+      this.boxNum(c, (x) => {
+        x.localGet(B);
+        x.call(this.deps.bytesLen());
+      });
+      c.return_();
+      c.end();
+      for (const [name, val] of [["BYTES_PER_ELEMENT", 4], ["byteLength", -1]] as const) {
+        c.localGet(1);
+        this.deps.lit(c, name);
+        c.call(this.deps.strEq());
+        c.ifVoid();
+        this.boxNum(c, (x) => {
+          if (val > 0) {
+            x.f64Const(val);
+          } else {
+            x.localGet(B);
+            x.call(this.deps.bytesLen());
+            x.f64Const(4);
+            x.f64Mul();
+          }
+        });
+        c.return_();
+        c.end();
+      }
+      if (this.deps.bytesCtor !== undefined) {
+        c.localGet(1);
+        this.deps.lit(c, "constructor");
+        c.call(this.deps.strEq());
+        c.ifVoid();
+        for (const [, code, name] of DynBuilder.TYPED_ELEMS) {
+          c.localGet(E);
+          c.i32Const(code);
+          c.i32Eq();
+          c.ifVoid();
+          c.call(this.bytesCtorFn(name, 3));
+          c.return_();
+          c.end();
+        }
+        c.unreachable();
+        c.end();
+      }
+      c.localGet(1);
+      c.call(this.canonIdx());
+      c.localTee(IX);
+      c.i32Const(0);
+      c.i32GeS();
+      c.ifVoid();
+      c.localGet(IX);
+      c.f64ConvertI32U();
+      c.localGet(B);
+      c.call(this.deps.bytesLen());
+      c.f64Lt();
+      c.ifVoid();
+      for (const [elem, code] of DynBuilder.TYPED_ELEMS) {
+        c.localGet(E);
+        c.i32Const(code);
+        c.i32Eq();
+        c.ifVoid();
+        this.boxNum(c, (x) => {
+          x.localGet(B);
+          x.localGet(IX);
+          x.f64ConvertI32U();
+          x.call(this.deps.typed!.get(elem));
+        });
+        c.return_();
+        c.end();
+      }
+      c.end();
+      c.globalGet(this.undefinedGlobal());
+      c.return_();
+      c.end();
+      for (const name of DynBuilder.TYPED_PROTO_FNS) {
+        c.localGet(1);
+        this.deps.lit(c, name);
+        c.call(this.deps.strEq());
+        c.ifVoid();
+        this.deps.throwError(c, "%Error", "Error", (x) =>
+          this.deps.lit(x, `'TypedArray.prototype.${name}' on a typed array held in a dynamic value is not supported yet`),
+        );
+        c.refNull(this.dynT());
+        c.return_();
+        c.end();
+      }
+      c.globalGet(this.undefinedGlobal());
+      this.mb.setBody(idx, [this.deps.bytesRefU8(), I32, I32], c.bytes());
+    });
+  }
+
+  private static readonly TYPED_PROTO_FNS = [
+    "at", "copyWithin", "entries", "every", "fill", "filter", "find", "findIndex", "findLast", "findLastIndex",
+    "forEach", "includes", "indexOf", "join", "keys", "lastIndexOf", "map", "reduce", "reduceRight", "reverse",
+    "set", "slice", "some", "sort", "subarray", "toLocaleString", "toReversed", "toSorted", "toString", "values",
+    "with", "buffer", "byteOffset", "hasOwnProperty", "valueOf", "propertyIsEnumerable", "isPrototypeOf",
+  ];
+
+  private readonly bytesCtorFns = new Map<string, number>();
+
+  /** %w.dyn.ctor:<Name>() -> dyn — the interned FUNC box a typed array's
+   * (or a Buffer's) `constructor` reads as: Node's name and length, the
+   * native-code ToString (S019), and a thunk that refuses by name — calling
+   * or constructing through it is not modeled. One box per name, so two
+   * reads compare `===`. */
+  bytesCtorFn(name: string, arity: number): number {
+    const hit = this.bytesCtorFns.get(name);
+    if (hit !== undefined) return hit;
+    const g = this.mb.addGlobal(this.dynRef(), true, (w) => {
+      w.u8(0xd0); // ref.null $dyn
+      w.sleb(this.dynT());
+    });
+    const idx = this.mb.declareFunc(this.mb.funcType([], [this.dynRef()]), `%w.dyn.ctor:${name}`);
+    this.bytesCtorFns.set(name, idx);
+    const thunk = this.deps.bytesCtor!.thunk();
+    this.mb.declareFuncRef(thunk);
+    const c = new Code();
+    c.globalGet(g);
+    c.refIsNull();
+    c.ifVoid();
+    this.boxFn(
+      c,
+      (x) => this.deps.lit(x, name),
+      (x) => x.refFunc(thunk),
+      -1,
+      (x) => this.deps.lit(x, name),
+      arity,
+    );
+    c.globalSet(g);
+    c.end();
+    c.globalGet(g);
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
+  /** %w.dyn.urlHref(o) -> str — the URL's href (its ToString). */
+  urlHref(): number {
+    return this.cached("urlHref", [this.objRef()], [this.deps.strRef()], (idx) => {
+      const href = this.deps.url!.getters.find(([n]) => n === "href")![1];
+      const c = new Code();
+      c.localGet(0);
+      this.urlOf(c);
+      c.call(href());
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
   private objRegexType: number | null = null;
 
   /** Unit F1: `$dynObjRegex <: $dynObj` — an island RegExp: an ordinary
@@ -860,6 +1221,7 @@ export class DynBuilder {
    * function's error answer and return. An island RegExp holds no own
    * members, so its readers stay exact. */
   regexWriteFence(c: Code, d: number, k: number, pushNull: (c: Code) => void): void {
+    this.urlWriteFence(c, d, k, pushNull);
     if (!this.regexLive) return;
     c.localGet(k);
     c.i32Const(DK.OBJ);
@@ -873,6 +1235,29 @@ export class DynBuilder {
     c.ifVoid();
     this.deps.throwError(c, "%Error", "Error", (x) =>
       this.deps.lit(x, "assigning a member of an island RegExp is not supported yet"),
+    );
+    pushNull(c);
+    c.return_();
+    c.end();
+  }
+
+  /** Unit I: the same fence for a URL held in a dynamic value — its
+   * getters answer before the own table, so an own member (`u.href = …`
+   * would land as one) would be shadowed silently. */
+  urlWriteFence(c: Code, d: number, k: number, pushNull: (c: Code) => void): void {
+    if (!this.urlLive) return;
+    c.localGet(k);
+    c.i32Const(DK.OBJ);
+    c.i32Eq();
+    c.ifResult(I32);
+    this.objPayload(c, (x) => x.localGet(d));
+    c.refTest(this.objUrlT());
+    c.else_();
+    c.i32Const(0);
+    c.end();
+    c.ifVoid();
+    this.deps.throwError(c, "%Error", "Error", (x) =>
+      this.deps.lit(x, "assigning a member of a URL held in a dynamic value is not supported yet"),
     );
     pushNull(c);
     c.return_();
@@ -1150,6 +1535,12 @@ export class DynBuilder {
           c.refTest(this.objRegexT());
           c.i32Or();
         }
+        if (this.urlLive) {
+          // Unit I: so is a URL (its getters would read a non-URL receiver).
+          this.objPayload(c, (x) => x.localGet(0));
+          c.refTest(this.objUrlT());
+          c.i32Or();
+        }
         c.ifVoid();
         this.deps.throwError(c, "%Error", "Error", (x) =>
           this.deps.lit(x, "Object.create over a null-prototype or built-in object on the island is not supported yet"),
@@ -1209,6 +1600,28 @@ export class DynBuilder {
   /** With a member value on the stack, leaves i32: is it an accessor cell.
    * Only meaningful where accessors are live. */
   isAccessorCell(c: Code): void {
+    if (this.typedLive) {
+      // Unit I: a dynamic typed array is also JSVAL-tagged; a cell is the
+      // one whose ref is a (FUNC) `$dyn` box.
+      c.call(
+        this.cached("isCell", [this.dynRef()], [I32], (idx) => {
+          const x = new Code();
+          x.localGet(0);
+          x.structGet(this.dynT(), DYN_KIND);
+          x.i32Const(DK.JSVAL);
+          x.i32Eq();
+          x.ifResult(I32);
+          x.localGet(0);
+          x.structGet(this.dynT(), DYN_REF);
+          x.refTest(this.dynT());
+          x.else_();
+          x.i32Const(0);
+          x.end();
+          this.mb.setBody(idx, [], x.bytes());
+        }),
+      );
+      return;
+    }
     c.structGet(this.dynT(), DYN_KIND);
     c.i32Const(DK.JSVAL);
     c.i32Eq();
@@ -2138,6 +2551,26 @@ export class DynBuilder {
       c.i32Const(0);
       c.return_();
       c.end();
+      // Unit I: two dynamic typed arrays are the same value when they
+      // alias the same bytes (each crossing boxes afresh, S014's bytes rule).
+      this.typedArm(c, 0, K, () => {
+        c.localGet(1);
+        c.structGet(dynT, DYN_REF);
+        c.refTest(this.typedT());
+        c.ifResult(I32);
+        c.localGet(0);
+        c.structGet(dynT, DYN_REF);
+        c.refCast(this.typedT());
+        c.structGet(this.typedT(), 0);
+        c.localGet(1);
+        c.structGet(dynT, DYN_REF);
+        c.refCast(this.typedT());
+        c.structGet(this.typedT(), 0);
+        c.refEq();
+        c.else_();
+        c.i32Const(0);
+        c.end();
+      });
       this.arm(c, K, [DK.UNDEF, DK.NULL], () => c.i32Const(1));
       this.arm(c, K, [DK.BOOL, DK.NUM], () => {
         c.localGet(0);
@@ -2291,6 +2724,7 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.typedArm(c, 0, K, () => c.i32Const(1)); // Unit I: typeof "object"
       c.localGet(K);
       c.i32Const(DK.ARR);
       c.i32Eq();
@@ -2463,6 +2897,17 @@ export class DynBuilder {
       c.localGet(B);
       c.structGet(dynT, DYN_KIND);
       c.localTee(KB);
+      const typedDeps = this.deps.typed;
+      if (typedDeps !== undefined) {
+        // Unit I: deep equality over a dynamic typed array is not modeled.
+        this.isTyped(c, A, KA);
+        this.isTyped(c, B, KB);
+        c.i32Or();
+        c.ifVoid();
+        typedDeps.refuse(c, "deep equality over a typed array held in a dynamic value is not supported yet");
+        c.unreachable();
+        c.end();
+      }
       const acc = this.deps.accessors;
       if (acc !== undefined) {
         // Unit A2: an accessor member reached as a value (the a-side walk
@@ -2719,6 +3164,19 @@ export class DynBuilder {
       c.localSet(OBJA);
       this.objPayload(c, (x) => x.localGet(B));
       c.localSet(OBJB);
+      const urlDeps = this.deps.url;
+      if (urlDeps !== undefined) {
+        // Unit I: deep equality over a URL is not modeled.
+        c.localGet(OBJA);
+        c.refTest(this.objUrlT());
+        c.localGet(OBJB);
+        c.refTest(this.objUrlT());
+        c.i32Or();
+        c.ifVoid();
+        urlDeps.refuse(c);
+        c.unreachable();
+        c.end();
+      }
       if (this.regexLive) {
         // Unit F1: two island RegExps are equal when their source and
         // flags are (Node also compares lastIndex, always 0 here); a
@@ -2879,6 +3337,7 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.typedArm(c, 0, K, () => c.i32Const(1)); // Unit I
       this.arm(c, K, [DK.BOOL], () => {
         c.localGet(0);
         c.structGet(dynT, DYN_NUM);
@@ -2927,6 +3386,7 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.typedArm(c, 0, K, () => this.deps.lit(c, "object")); // Unit I
       // C tests the island kind BEFORE the switch and early-returns into
       // the engine's own typeof (scr_json.c:1122) — so JSVAL has no answer
       // this tier can spell, and it must not fall through to the default's
@@ -2975,6 +3435,12 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.typedArm(c, 0, K, () => {
+        // Unit I: Array.prototype.join over the elements is not built; the
+        // conversion sites are not catchable, so this refuses uncaught.
+        this.deps.typed!.refuse(c, "converting a typed array held in a dynamic value to a string is not supported yet");
+        c.unreachable();
+      });
       this.arm(c, K, [DK.STR], () => {
         c.localGet(0);
         c.structGet(dynT, DYN_REF);
@@ -3078,6 +3544,16 @@ export class DynBuilder {
           c.ifVoid();
           c.localGet(O);
           c.call(this.regexStr());
+          c.return_();
+          c.end();
+        }
+        if (this.urlLive) {
+          // Unit I: a URL converts to its href.
+          c.localGet(O);
+          c.refTest(this.objUrlT());
+          c.ifVoid();
+          c.localGet(O);
+          c.call(this.urlHref());
           c.return_();
           c.end();
         }
@@ -3464,6 +3940,12 @@ export class DynBuilder {
         c.localGet(0);
         c.structGet(dynT, DYN_KIND);
         c.localSet(K);
+        // Unit I: a dynamic typed array's own surface (dyn.ts typedKey).
+        this.typedArm(c, 0, K, () => {
+          c.localGet(0);
+          c.localGet(1);
+          c.call(this.typedKey());
+        });
         // Nullish receiver: short-circuit, or Node's message.
         c.localGet(K);
         c.i32Const(DK.UNDEF);
@@ -3509,6 +3991,25 @@ export class DynBuilder {
             this.objPayload(c, (x) => x.localGet(0));
             c.localGet(1);
             c.call(this.regexKey());
+            c.localTee(M);
+            c.refIsNull();
+            c.i32Eqz();
+            c.globalGet(this.deps.excKind());
+            c.i32Or();
+            c.ifVoid();
+            c.localGet(M);
+            c.return_();
+            c.end();
+            c.end();
+          }
+          if (this.urlLive) {
+            // Unit I: a URL's modeled getters, and its fenced members.
+            this.objPayload(c, (x) => x.localGet(0));
+            c.refTest(this.objUrlT());
+            c.ifVoid();
+            this.objPayload(c, (x) => x.localGet(0));
+            c.localGet(1);
+            c.call(this.urlKey());
             c.localTee(M);
             c.refIsNull();
             c.i32Eqz();
@@ -3592,6 +4093,23 @@ export class DynBuilder {
         // shape through an unchecked-overload `Uint8Array`-declared
         // island result).
         this.arm(c, K, [DK.BYTES], () => {
+          if (this.deps.bytesCtor !== undefined) {
+            // Unit I: `constructor` reads Uint8Array's (or Buffer's)
+            // interned constructor FUNC (dyn.ts bytesCtorFn).
+            c.localGet(1);
+            this.deps.lit(c, "constructor");
+            c.call(this.deps.strEq());
+            c.ifVoid();
+            this.bytesPayload(c, (x) => x.localGet(0));
+            c.structGet(this.bytesPayloadT(), BYTES_PAYLOAD_IS_BUFFER);
+            c.ifResult(this.dynRef());
+            c.call(this.bytesCtorFn("Buffer", 3));
+            c.else_();
+            c.call(this.bytesCtorFn("Uint8Array", 3));
+            c.end();
+            c.return_();
+            c.end();
+          }
           this.pushIsLength(c, (x) => x.localGet(1));
           c.localGet(1);
           this.deps.lit(c, "byteLength");
@@ -3744,6 +4262,51 @@ export class DynBuilder {
           });
           c.return_();
           c.end();
+          if (this.deps.bytesCtor !== undefined) {
+            // Unit I: a typed-array / Buffer `constructor` box (FN_SIG -1,
+            // dyn.bytesCtorFn) answers name and length above and its
+            // BYTES_PER_ELEMENT here (1 for Uint8Array and Buffer, 4 for
+            // the 32-bit kinds); every other static member (from, of,
+            // prototype, isBuffer, …) refuses by name — the box carries
+            // none of them, so undefined would be silently wrong.
+            this.fnPayload(c, (x) => x.localGet(0));
+            c.structGet(this.fnT(), FN_SIG);
+            c.i32Const(-1);
+            c.i32Eq();
+            c.ifVoid();
+            c.localGet(1);
+            this.deps.lit(c, "BYTES_PER_ELEMENT");
+            c.call(this.deps.strEq());
+            c.ifVoid();
+            this.boxNum(c, (x) => {
+              this.fnPayload(x, (y) => y.localGet(0));
+              x.structGet(this.fnT(), FN_NAME);
+              this.deps.lit(x, "Uint8Array");
+              x.call(this.deps.strEq());
+              this.fnPayload(x, (y) => y.localGet(0));
+              x.structGet(this.fnT(), FN_NAME);
+              this.deps.lit(x, "Buffer");
+              x.call(this.deps.strEq());
+              x.i32Or();
+              x.ifResult(F64);
+              x.f64Const(1);
+              x.else_();
+              x.f64Const(4);
+              x.end();
+            });
+            c.return_();
+            c.end();
+            this.deps.lit(c, "reading '");
+            c.localGet(1);
+            c.call(this.deps.concat());
+            this.deps.lit(c, "' of a typed-array constructor read from a dynamic value is not supported yet");
+            c.call(this.deps.concat());
+            c.localSet(MSG);
+            this.deps.throwError(c, "%Error", "Error", (x) => x.localGet(MSG));
+            c.refNull(this.dynT());
+            c.return_();
+            c.end();
+          }
           c.globalGet(this.undefinedGlobal());
         });
         // BYTES has its OWN arm above now; HANDLE and JSVAL are still
@@ -3806,6 +4369,8 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.typedArm(c, 0, K, () => this.typedFence(c, "assigning a member of", () => {})); // Unit I
+      this.urlWriteFence(c, 0, K, () => {}); // Unit I
       const SETM = 8;
       this.arm(c, K, [DK.OBJ], () => {
         if (this.regexLive) {
@@ -4108,6 +4673,7 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.typedArm(c, 0, K, () => this.typedFence(c, "'in' or Object.hasOwn on", (x) => x.i32Const(0))); // Unit I
       this.arm(c, K, [DK.UNDEF, DK.NULL], () => {
         this.pushToObjectFail(c);
         c.i32Const(0);
@@ -4613,6 +5179,7 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.typedArm(c, 0, K, () => this.typedFence(c, "walking the keys of", (x) => x.refNull(dynT))); // Unit I
       this.arm(c, K, [DK.UNDEF, DK.NULL], () => {
         this.pushToObjectFail(c);
         c.refNull(dynT);
@@ -4893,6 +5460,9 @@ export class DynBuilder {
       c.localGet(1);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      // Unit I: copying FROM a dynamic typed array (its index keys) is not
+      // modeled — it would otherwise copy nothing, silently.
+      this.typedArm(c, 1, K, () => this.typedFence(c, "copying the members of", (x) => x.refNull(dynT)));
       this.arm(c, K, [DK.OBJ], () => {
         const objT = this.objT();
         const entries = this.entriesArrayType();
@@ -5074,6 +5644,13 @@ export class DynBuilder {
     return this.cached("spreadSource", [this.dynRef()], [this.dynRef()], (idx) => {
       const c = new Code();
       const FP = 1;
+      if (this.typedLive) {
+        // Unit I: a dynamic typed array's elements are not an entry table.
+        c.localGet(0);
+        c.structGet(this.dynT(), DYN_KIND);
+        c.localSet(2);
+        this.typedArm(c, 0, 2, () => this.typedFence(c, "spreading", (x) => x.refNull(this.dynT())));
+      }
       c.localGet(0);
       c.structGet(this.dynT(), DYN_KIND);
       c.i32Const(DK.OBJ);
@@ -5110,7 +5687,7 @@ export class DynBuilder {
       c.end();
       c.end();
       c.localGet(0);
-      this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: this.fnPropsT() }], c.bytes());
+      this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: this.fnPropsT() }, ...(this.typedLive ? [I32] : [])], c.bytes());
     });
   }
 
@@ -5394,6 +5971,7 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.typedArm(c, 0, K, () => this.typedFence(c, "iterating", (x) => x.refNull(dynT))); // Unit I
       // Buffers step by BYTE in C; unconstructible here, and the
       // not-iterable throw below would be a wrong claim about one.
       this.arm(c, K, [DK.BYTES, DK.JSVAL], () => c.unreachable());
@@ -5436,6 +6014,7 @@ export class DynBuilder {
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.typedArm(c, 0, K, () => this.typedFence(c, "iterating", (x) => x.refNull(dynT))); // Unit I
       this.arm(c, K, [DK.BYTES, DK.JSVAL], () => c.unreachable());
       c.localGet(K);
       c.i32Const(DK.ARR);
@@ -5509,6 +6088,7 @@ export class DynBuilder {
       c.localGet(1);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
+      this.typedArm(c, 1, K, () => this.typedFence(c, "spreading", () => {})); // Unit I
       this.arm(c, K, [DK.ARR], () => {
         this.arrPayload(c, (x) => x.localGet(1));
         c.localSet(A);
@@ -7717,6 +8297,7 @@ export class DynBuilder {
         c.localGet(0);
         c.structGet(dynT, DYN_KIND);
         c.localSet(K);
+        this.typedArm(c, 0, K, () => this.typedFence(c, `calling '${method}' on`, (x) => x.refNull(dynT))); // Unit I
         this.arrLen(c, (x) => x.localGet(1));
         c.localSet(ARGC);
 
@@ -7801,6 +8382,20 @@ export class DynBuilder {
         const objProto = DynBuilder.OBJPROTO_METHODS.has(method);
 
         this.arm(c, K, [DK.OBJ], () => {
+          if (this.urlLive && (method === "toString" || method === "toJSON")) {
+            // Unit I: a URL's toString/toJSON (its only methods) answer its
+            // href; any other name takes the ordinary object ladder below
+            // (Object.prototype's, else "<x> is not a function").
+            this.objPayload(c, (x) => x.localGet(0));
+            c.refTest(this.objUrlT());
+            c.ifVoid();
+            this.boxStr(c, (x) => {
+              this.objPayload(x, (y) => y.localGet(0));
+              x.call(this.urlHref());
+            });
+            c.return_();
+            c.end();
+          }
           if (this.regexLive && ["test", "exec", "toString", "compile"].includes(method)) {
             // Unit F1: an island RegExp's own methods. test runs one match
             // from index 0 (the static tier's matcher); the global and
@@ -9346,6 +9941,18 @@ export class DynBuilder {
             c.localGet(B);
             c.arrayCopy(bufT, bufT);
             c.end();
+          });
+        }
+        if (method === "constructor" && this.deps.bytesCtor !== undefined) {
+          // Unit I: `a.constructor(...)` on a Uint8Array / Buffer held in
+          // a dynamic value — calling the constructor is not modeled (the
+          // 32-bit kinds take typedArm's same refusal above); catchable,
+          // where the arm below would trap.
+          this.arm(c, K, [DK.BYTES], () => {
+            this.deps.throwError(c, "%Error", "Error", (x) =>
+              this.deps.lit(x, "calling 'constructor' on a typed array held in a dynamic value is not supported yet"),
+            );
+            c.refNull(dynT);
           });
         }
         const handle = this.deps.handle;

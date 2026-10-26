@@ -2556,6 +2556,14 @@ class Assembler {
   /** Unit F1: the module builds an island RegExp (the island's
    * `new RegExp(...)`, jsOp construct over globalGet("RegExp")). */
   private readonly regexIslandLive: boolean;
+  /** Unit I: a WHATWG URL crosses into a dynamic value (jsMarshal / dynFrom
+   * of a URL, or of a union with a URL arm). */
+  private readonly urlDynLive: boolean;
+  /** Unit I: a non-u8 typed array crosses into a dynamic value. */
+  private readonly typedDynLive: boolean;
+  /** Unit I: the module reads `constructor` off a dynamic value that may
+   * be a typed array or a Buffer. */
+  private readonly bytesCtorLive: boolean;
   /** `Date.now()`/`new Date()`'s wall clock reads this import and floors;
    * `performance.now()`'s ORIGIN — `now()` sampled ONCE at `_start`
    * entry, in a mutable f64 global, in any module that reaches
@@ -2820,6 +2828,36 @@ class Assembler {
       );
     this.accessorsLive = this.irNodeReachable(mod, (rec) => rec["kind"] === "jsOp" && rec["op"] === "defineGetter");
     this.tplLive = this.irNodeReachable(mod, (rec) => rec["kind"] === "jsOp" && rec["op"] === "tplStrings");
+    {
+      const unionHasUrl = (id: string): boolean => (mod.unions ?? []).some((u) => u.id === id && u.arms.some((arm) => arm.kind === "url"));
+      const unionHasTyped = (id: string): boolean =>
+        (mod.unions ?? []).some((u) => u.id === id && u.arms.some((arm) => arm.kind === "bytes" && arm.elem !== "u8"));
+      const unionHasBytes = (id: string): boolean => (mod.unions ?? []).some((u) => u.id === id && u.arms.some((arm) => arm.kind === "bytes"));
+      const crossing = (pred: (t: IrType) => boolean) => (rec: Record<string, unknown>): boolean => {
+        if (rec["kind"] !== "jsMarshal" && rec["kind"] !== "dynFrom") return false;
+        const t = (rec["value"] as { type?: IrType } | undefined)?.type;
+        return t !== undefined && pred(t);
+      };
+      this.typedDynLive = this.irNodeReachable(
+        mod,
+        crossing((t) => (t.kind === "bytes" && t.elem !== "u8") || (t.kind === "union" && unionHasTyped(t.unionId))),
+      );
+      this.bytesCtorLive =
+        this.irNodeReachable(
+          mod,
+          (rec) =>
+            (rec["kind"] === "jsOp" &&
+              (rec["op"] === "getProp" || rec["op"] === "callMethod" || rec["op"] === "optCallMethod") &&
+              rec["name"] === "constructor") ||
+            (rec["kind"] === "dynInvoke" && rec["method"] === "constructor"),
+        ) &&
+        this.irNodeReachable(mod, crossing((t) => t.kind === "bytes" || (t.kind === "union" && unionHasBytes(t.unionId))));
+      this.urlDynLive = this.irNodeReachable(mod, (rec) => {
+        if (rec["kind"] !== "jsMarshal" && rec["kind"] !== "dynFrom") return false;
+        const t = (rec["value"] as { type?: IrType } | undefined)?.type;
+        return t !== undefined && (t.kind === "url" || (t.kind === "union" && unionHasUrl(t.unionId)));
+      });
+    }
     this.regexIslandLive = this.irNodeReachable(mod, (rec) => {
       if (rec["kind"] !== "jsOp" || rec["op"] !== "construct") return false;
       const callee = (rec["args"] as Record<string, unknown>[] | undefined)?.[0];
@@ -4267,6 +4305,17 @@ class Assembler {
         ret();
         c.end();
       }
+    }
+    if (dyn.urlLive) {
+      // Unit I: Node refuses to clone a URL (DataCloneError); the copy below
+      // would be a plain object, so it refuses by name.
+      dyn.objPayload(c, (x) => x.localGet(0));
+      c.refTest(dyn.objUrlT());
+      c.ifVoid();
+      this.emitSetCellError(c, "%Error", "Error", (x) => this.pushStrLitInto(x, "structuredClone of a URL held in a dynamic value is not supported yet"), null);
+      c.refNull(dynT);
+      ret();
+      c.end();
     }
     if (dyn.regexLive) {
       // Unit F1: Node clones a RegExp as a RegExp; the copy below would be
@@ -8457,6 +8506,37 @@ class Assembler {
       ...(this.tplLive ? { tpl: true as const } : {}),
       ...(this.regexIslandLive
         ? { regex: { reType: () => this.regex.regexType, test: () => this.dynRegexTestHelper() } }
+        : {}),
+      ...(this.typedDynLive
+        ? {
+            typed: {
+              get: (elem: "u32" | "i32" | "f32") => this.bytesB.get(elem),
+              refuse: (c: Code, what: string): void => {
+                this.emitSetCellError(c, "%Error", "Error", (x) => this.pushStrLitInto(x, what), null);
+                c.call(this.reportUncaughtHelper());
+              },
+            },
+          }
+        : {}),
+      ...(this.bytesCtorLive ? { bytesCtor: { thunk: () => this.bytesCtorThunk() } } : {}),
+      ...(this.urlDynLive
+        ? {
+            url: {
+              urlType: () => this.urlEngine.urlType(),
+              getters: [
+                ["href", () => this.urlEngine.hrefFn()],
+                ["protocol", () => this.urlEngine.protocolFn()],
+                ["host", () => this.urlEngine.hostFn()],
+                ["hostname", () => this.urlEngine.hostnameFn()],
+                ["pathname", () => this.urlEngine.pathnameFn()],
+                ["search", () => this.urlEngine.searchFn()],
+              ] as const,
+              refuse: (c: Code): void => {
+                this.emitSetCellError(c, "%Error", "Error", (x) => this.pushStrLitInto(x, "deep equality over a URL held in a dynamic value is not supported yet"), null);
+                c.call(this.reportUncaughtHelper());
+              },
+            },
+          }
         : {}),
     });
     return this.dynField;
@@ -14100,8 +14180,16 @@ class Assembler {
         // real, named refusal instead of inheriting either the crash or
         // silently mishandling it).
         if (t.elem !== "u8") {
-          this.refuse(`dynFrom:bytes:${t.elem}`, loc);
-          return false;
+          // Unit I: a Uint32Array / Int32Array / Float32Array crosses BY
+          // REFERENCE (the bytes alias, S014's bytes rule) as a dynamic
+          // typed array (dyn.ts typedT — JSVAL-tagged, so a reader not
+          // taught about it traps rather than answer an empty object).
+          if (!this.typedDynLive) {
+            this.refuse(`dynFrom:bytes:${t.elem}`, loc);
+            return false;
+          }
+          dyn.boxTyped(c, (x) => x.localGet(0), t.elem);
+          return true;
         }
         // SEMANTICS.md S014's bytes exception: ALIASES, never copies —
         // the SAME `$bytes` ref the caller pushed becomes the payload's
@@ -14119,6 +14207,16 @@ class Assembler {
             (y) => y.i32Const(0),
           );
         });
+        return true;
+      }
+      case "url": {
+        // Unit I: a URL crosses BY REFERENCE (Node's own object, any view
+        // of it reads the same components) as a dynamic URL (dyn.ts objUrl).
+        if (!this.urlDynLive) {
+          this.refuse("dynFrom:url", loc);
+          return false;
+        }
+        dyn.boxUrl(c, (x) => x.localGet(0));
         return true;
       }
       case "object": {
@@ -24743,6 +24841,27 @@ class Assembler {
         const d = this.acquireScratch(this.dyn.dynRef());
         this.walkExpr(e.value);
         code.localSet(d);
+        // Unit I: a dynamic typed array answers `in` with the key known at
+        // compile time: a canonical index by a length compare, a
+        // TypedArray.prototype name true (Node's HasProperty), any other
+        // spelling false. Object.hasOwn takes hasOwn's named fence.
+        const typedK = this.typedDynLive ? this.acquireScratch(I32) : -1;
+        if (typedK >= 0) {
+          code.localGet(d);
+          code.structGet(this.dyn.dynT(), DYN_KIND);
+          code.localSet(typedK);
+          this.dyn.isTyped(code, d, typedK);
+          this.openIfResult(I32);
+          const tIdx = /^(0|[1-9][0-9]*)$/.test(e.key) ? Number(e.key) : null;
+          if (tIdx !== null && tIdx <= Number.MAX_SAFE_INTEGER) {
+            this.dyn.typedLength(code, d);
+            code.f64Const(tIdx);
+            code.f64Gt();
+          } else {
+            code.i32Const(DynBuilder.TYPED_IN_NAMES.has(e.key) ? 1 : 0);
+          }
+          code.else_();
+        }
         // INC-29 U1 (review): `in` on a net handle is fenced (SEMANTICS.md
         // S087 (f)) — the handle's members are not a table to ask. Only in
         // a module that boxes handles; the may-throw view reads dynHasKey
@@ -24827,6 +24946,10 @@ class Assembler {
           this.close();
         }
         this.close();
+        if (typedK >= 0) {
+          this.close();
+          this.releaseScratch(I32, typedK);
+        }
         if (e.negated === true) code.i32Eqz();
         this.releaseScratch(this.dyn.dynRef(), d);
         if (handleIn) this.emitPendingCheck();
@@ -25261,7 +25384,10 @@ class Assembler {
           if (e.negated === true) code.i32Eqz();
           return;
         }
-        const kinds = DYN_TEST_KINDS[e.test];
+        // Unit I: a dynamic typed array is JSVAL-tagged (dyn.ts typedT);
+        // `typeof … === "object"` must see it (an accessor cell never
+        // reaches a test as a value).
+        const kinds = e.test === "object" && this.typedDynLive ? [...DYN_TEST_KINDS.object, DK.JSVAL] : DYN_TEST_KINDS[e.test];
         this.walkExpr(e.value);
         code.structGet(this.dyn.dynT(), DYN_KIND);
         if (kinds.length === 1) {
@@ -27990,7 +28116,13 @@ class Assembler {
             this.walkExpr(e.value);
             return;
           case "record":
-          case "array": {
+          case "array":
+          // Unit I: a union crosses by its runtime tag (dynFromHelper's
+          // union arm — the arm's own conversion, a unit arm the island's
+          // own undefined/null), the same walker an `unknown` crossing uses.
+          // A URL crosses by reference (dynFromHelper's url arm).
+          case "union":
+          case "url": {
             // The composite conversion reuses dynFrom's per-typeKey
             // walker verbatim (dynFromHelper) — see the case header.
             const h = this.dynFromHelper(vt, e.loc);
@@ -29469,12 +29601,37 @@ class Assembler {
             }
           }
           code.else_();
+          const urlExit = t.kind === "string" && this.urlDynLive;
+          if (urlExit) {
+            // Unit I: a URL held in a dynamic value reaching a string slot
+            // (`new URL(u)`, a string parameter): Node ToStrings it where
+            // the API does (`new URL(u)` reads its href) and holds the
+            // object where the slot is only a type, so neither the href
+            // nor the boundary's TypeError is right for every site — it
+            // refuses by name.
+            code.localGet(d);
+            code.structGet(dynT, DYN_KIND);
+            code.i32Const(DK.OBJ);
+            code.i32Eq();
+            code.ifResult(I32);
+            this.dyn.objPayload(code, (c) => c.localGet(d));
+            code.refTest(this.dyn.objUrlT());
+            code.else_();
+            code.i32Const(0);
+            code.end();
+            code.ifVoid();
+            this.emitSetCellError(code, "%Error", "Error", (c) =>
+              this.pushStrLitInto(c, "passing a URL held in a dynamic value where a string is expected is not supported yet"),
+            null);
+            code.else_();
+          }
           this.emitSetCellError(code, "%TypeError", "TypeError", (c) => {
             this.pushStrLitInto(c, `expected ${wantDesc}, got `);
             c.localGet(d);
             c.call(this.dyn.typeOf());
             c.call(this.concatHelper());
           }, null);
+          if (urlExit) code.end();
           this.emitUnwind();
           this.close();
           this.releaseScratch(dynRef, d);
@@ -29880,6 +30037,36 @@ class Assembler {
       return { ok: true, value: "dgimsuy".split("").filter((ch) => r.kind === "regexLit" && r.flags.includes(ch)).join("") };
     }
     return this.foldRegexArg(expr);
+  }
+
+  private bytesCtorThunkFn: number | null = null;
+
+  /** Unit I: the thunk a typed-array / Buffer `constructor` FUNC read from
+   * a dynamic value carries (dyn.ts bytesCtorFn): calling or constructing
+   * through it is not modeled, so it refuses by name ("<Name>" rides the
+   * box's closure slot). Null with the Error pending, the thunk contract. */
+  private bytesCtorThunk(): number {
+    if (this.bytesCtorThunkFn !== null) return this.bytesCtorThunkFn;
+    const idx = this.mb.declareFunc(this.dyn.thunkSig(), "%w.dyn.ctorThunk");
+    this.bytesCtorThunkFn = idx;
+    const c = new Code();
+    this.emitSetCellError(
+      c,
+      "%Error",
+      "Error",
+      (x) => {
+        this.pushStrLitInto(x, "calling the ");
+        x.localGet(0);
+        x.refCast(this.strType);
+        x.call(this.concatHelper());
+        this.pushStrLitInto(x, " constructor read from a dynamic value is not supported yet");
+        x.call(this.concatHelper());
+      },
+      null,
+    );
+    c.refNull(this.dyn.dynT());
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
   }
 
   private dynRegexTestFn: number | null = null;
@@ -42655,12 +42842,32 @@ class Assembler {
     c.i32Const(wantDK);
     c.i32Ne();
     c.ifVoid();
+    const urlExit = t.kind === "string" && this.urlDynLive;
+    if (urlExit) {
+      // Unit I: jsExit's named refusal of a URL held in a dynamic value.
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.OBJ);
+      c.i32Eq();
+      c.ifResult(I32);
+      this.dyn.objPayload(c, (x) => x.localGet(0));
+      c.refTest(this.dyn.objUrlT());
+      c.else_();
+      c.i32Const(0);
+      c.end();
+      c.ifVoid();
+      this.emitSetCellError(c, "%Error", "Error", (x) =>
+        this.pushStrLitInto(x, "passing a URL held in a dynamic value where a string is expected is not supported yet"),
+      null);
+      c.else_();
+    }
     this.emitSetCellError(c, "%TypeError", "TypeError", (x) => {
       this.pushStrLitInto(x, `expected ${wantDesc}, got `);
       x.localGet(0);
       x.call(this.dyn.typeOf());
       x.call(this.concatHelper());
     }, null);
+    if (urlExit) c.end();
     this.pushZeroInto(c, val);
     c.return_();
     c.end();

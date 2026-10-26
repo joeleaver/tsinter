@@ -3575,6 +3575,9 @@ const TIER_FLOOR: string[] = [
   // Unit F1: a RegExp crossing into `any` is an island RegExp value (its
   // accessors, a non-global `test`, String() and inspect): 1070 -> 1071.
   "2172-island-regexp-boundary.ts",
+  // Unit I: unions, URLs and Uint32/Int32/Float32 arrays cross into a
+  // dynamic value (by tag, by reference, by reference): 1071 -> 1072.
+  "766-any-union-boundary.ts",
 ];
 
 interface RunResult {

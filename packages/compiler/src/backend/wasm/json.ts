@@ -5161,6 +5161,19 @@ export class JsonBuilder {
         // with skip=0 — a CHILD is always a fresh property, so its own
         // toJSON (if any) still fires (oracle-measured:
         // `{toJSON:()=>({x:{toJSON:()=>7}})}` → `{"x":7}`).
+        if (dyn.urlLive) {
+          // Unit I: a URL serializes through its toJSON — its href string.
+          dyn.objPayload(c, (x) => x.localGet(0));
+          c.refTest(dyn.objUrlT());
+          c.ifVoid();
+          dyn.boxStr(c, (x) => {
+            dyn.objPayload(x, (y) => y.localGet(0));
+            x.call(dyn.urlHref());
+          });
+          c.call(idx);
+          c.return_();
+          c.end();
+        }
         if (dyn.accessorsLive) {
           // Unit A2: a `toJSON` that is an island GETTER would run from the
           // keyGet below, outside the reentrancy bracket the call itself
@@ -5509,6 +5522,15 @@ export class JsonBuilder {
       // handles and the island bridge both refuse upstream of here), so
       // reaching this point means the dyn surface grew a kind without
       // growing this walk. INC-29 U1: a node:net handle is fenced, loudly.
+      if (dyn.typedLive) {
+        // Unit I: a typed array held in a dynamic value (JSVAL-tagged).
+        dyn.isTyped(c, 0, K);
+        c.ifVoid();
+        this.deps.throwError(c, "%Error", "Error", (x) => this.deps.lit(x, "JSON.stringify of a typed array held in a dynamic value is not supported yet"));
+        c.i32Const(0);
+        c.return_();
+        c.end();
+      }
       if (dyn.handleLive()) {
         c.localGet(K);
         c.i32Const(DK.HANDLE);

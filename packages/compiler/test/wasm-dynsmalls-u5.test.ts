@@ -525,25 +525,29 @@ test("R25b DOMEX-INSPECT: beyond the inspect depth a DOMException with a cause c
 // ----------------------------------------------------------------------
 // NOT-LIFTED — shapes that keep refusing by name
 
-test("R90n NOT-LIFTED: a Float32Array and a Uint32Array boxed into any keep refusing by name", async () => {
+test("R90n LIFTED (unit I): a Float32Array and a Uint32Array boxed into any read their length, elements and constructor", async () => {
   const src = "// @dynamic\nconst words = new Uint32Array([7, 900000001]);\nconst hw: any = words;\nconsole.log(`${hw.length}`, `${hw[1]}`, `${hw.constructor.name}`);\nconst floats = new Float32Array([1.5, -0.25]);\nconst hf: any = floats;\nconsole.log(`${hf.length}`, `${hf[1]}`, `${hf.constructor.name}`);\n";
-  const { diagnostics, survey } = await refuseRow("R90n", src, "ts");
-  expect(survey).toEqual(["dynFrom:bytes:f32","dynFrom:bytes:u32"]);
-  expect(diagnostics).toEqual(["SC3001: the wasm backend does not support this construct yet (dynFrom:bytes:u32); build with the LLVM backend (the default) or the reference C backend (--backend c)"]);
+  const { stdout, stderr, exitCode } = await runRow("R90n", src, "ts");
+  expect(stdout).toBe("2 900000001 Uint32Array\n2 -0.25 Float32Array\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
-test("R91n NOT-LIFTED: the readers of a boxed Uint32Array and Float32Array keep refusing by name", async () => {
+test("R91n LIFTED (unit I): a boxed Uint32Array's and Float32Array's readers answer; String() of one refuses by name, uncaught", async () => {
   const src = "// @dynamic\nconst hw: any = new Uint32Array([7, 4294967295, 0]);\nconst hf: any = new Float32Array([1.5, -0.25, 0.1]);\nconsole.log(`${hw.length} ${hw[0]} ${hw[1]} ${hw[5]} ${typeof hw} ${hw.constructor.name}`);\nconsole.log(`${hf.length} ${hf[0]} ${hf[1]} ${hf[2]} ${typeof hf} ${hf.constructor.name}`);\nconsole.log(`${String(hw)} | ${String(hf)}`);\nconsole.log(`${JSON.stringify(hw)} | ${JSON.stringify(hf)}`);\nconsole.log(`${hw === hw} ${hf === hw}`);\n";
-  const { diagnostics, survey } = await refuseRow("R91n", src, "ts");
-  expect(survey).toEqual(["dynFrom:bytes:f32","dynFrom:bytes:u32"]);
-  expect(diagnostics).toEqual(["SC3001: the wasm backend does not support this construct yet (dynFrom:bytes:u32); build with the LLVM backend (the default) or the reference C backend (--backend c)"]);
+  // Node continues: 7,4294967295,0 | 1.5,-0.25,0.10000000149011612, the two
+  // index-keyed JSON objects, then "true false" (SEMANTICS.md S043, unit I).
+  const { stdout, stderr } = await runRowTrap("R91n", src, "ts");
+  expect(stdout).toBe("3 7 4294967295 undefined object Uint32Array\n3 1.5 -0.25 0.10000000149011612 object Float32Array\n");
+  expect(stderr).toContain("converting a typed array held in a dynamic value to a string is not supported yet");
 });
 
-test("R94 NOT-LIFTED: an Int32Array boxed into any keeps refusing by name", async () => {
+test("R94 LIFTED (unit I): an Int32Array boxed into any reads its length, elements and constructor", async () => {
   const src = "// @dynamic\nconst hi: any = new Int32Array([-1, 2]);\nconsole.log(`${hi.length} ${hi[0]} ${hi.constructor.name}`);\n";
-  const { diagnostics, survey } = await refuseRow("R94", src, "ts");
-  expect(survey).toEqual(["dynFrom:bytes:i32"]);
-  expect(diagnostics).toEqual(["SC3001: the wasm backend does not support this construct yet (dynFrom:bytes:i32); build with the LLVM backend (the default) or the reference C backend (--backend c)"]);
+  const { stdout, stderr, exitCode } = await runRow("R94", src, "ts");
+  expect(stdout).toBe("2 -1 Int32Array\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
 test("R95 LIFTED (INC-29 U1): corpus 2596's property-type throw is built — the program compiles, and its output is pinned in the differential's INC-29 U1 block", async () => {

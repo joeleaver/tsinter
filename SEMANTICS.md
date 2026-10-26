@@ -3057,6 +3057,58 @@ whose pattern is computed at run time before it reaches the boundary.
 **Tested by:** F1-RE-01..05 and F1-CORPUS-2172 in
 `packages/compiler/test/wasm-island-a.test.ts`.
 
+**Amendment (unit I): unions, URLs and typed arrays crossing into a
+dynamic value.** A union crosses by its runtime tag (each arm's own
+conversion; an `undefined`/`null` arm is the island's own unit), Node's
+answer. A WHATWG URL crosses BY REFERENCE as an empty island object
+carrying the URL (`$dynObjUrl`): `href`, `protocol`, `host`, `hostname`,
+`pathname` and `search` read Node's values, `String(u)`, template
+conversion, `toString()`, `toJSON()` and `JSON.stringify` answer the
+href, and keys/spread see no own members (Node's own answer). Fenced by
+name where Node answers: `hash`, `port`, `origin`, `username`,
+`password`, `searchParams`, `constructor` (an inherited member, which
+S015's stance would otherwise answer undefined where Node gives URL),
+and `toString`/`toJSON` read as values; a URL reaching a string slot
+(`new URL(u)`, where Node reads its href, or a `string` parameter, where
+Node holds the object: "passing a URL held in a dynamic value where a
+string is expected is not supported yet", for jsExit and a typed
+promise adoption alike);
+`structuredClone` of one (Node throws a DataCloneError there; this text
+differs); any member write onto one (`u.href = …`, where Node's setter
+reparses, or a new member) and `Object.create` over one (Node: "Receiver
+must be an instance of class URL" at the first getter), so a URL never
+holds an own member its getters would shadow; deep equality over a URL
+refuses uncaught. A Uint32Array, Int32Array or
+Float32Array crosses BY REFERENCE (S014's bytes rule) as a JSVAL-tagged
+`$dynTyped` value, so a reader never taught the kind TRAPS rather than
+answer `{}`, `[]` or `undefined`. Answered (Node's values): `length`,
+canonical index reads (out of range `undefined`), `BYTES_PER_ELEMENT`,
+`byteLength`, `typeof` ("object"), truthiness, `===` (the same bytes),
+`"k" in u` (an index by range, a TypedArray.prototype name true, any
+other name false — S015 keeps Object.prototype's names false), and
+`constructor` — an interned function box with Node's `name`, `length`
+and `BYTES_PER_ELEMENT`, equal to itself across reads; every other
+static member read off the box (`from`, `of`, `prototype`, `isBuffer`, …)
+refuses by name. A Uint8Array's or Buffer's `constructor` read off a
+dynamic value now answers the same way; a Buffer's reads as Uint8Array's
+(`name` "Uint8Array", the same box), S037's rendering of a Buffer that
+crossed into a dynamic value.
+Refused by name, catchable, where Node answers: JSON.stringify, method
+calls and TypedArray.prototype functions read as values, member writes,
+spread, Object.assign from one, key walks, `Object.hasOwn`, iteration
+and inspect; refused by name UNCAUGHT (the sites cannot throw
+catchably): `String(u)`, template conversion, arithmetic and deep
+equality. Calling or constructing through a `constructor` read this
+way refuses by name ("calling the Uint32Array constructor read from a
+dynamic value is not supported yet"; Node: "Constructor Uint32Array
+requires 'new'", or a new array), as does `a.constructor(…)` called as a
+method on any of the four kinds, catchably ("calling 'constructor' on a
+typed array held in a dynamic value is not supported yet"). Readers not audited for the kind
+(`structuredClone`, for one) trap.
+**Tested by:** I-UNION-01, I-URL-01..04, I-TYPED-01..04, I-CTOR-01 and
+I-CORPUS-766 in `packages/compiler/test/wasm-island-a.test.ts`; R90n,
+R91n and R94 in `wasm-dynsmalls-u5.test.ts`.
+
 ## S044 — jsExit of `array<jsval>`: the SPINE aliases on the wasm tier (matching Node); the native island copies it *(per-lane split)*
 
 The validated exit of an `any[]`-declared slot crosses elements BY

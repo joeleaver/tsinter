@@ -508,3 +508,97 @@ test("F1-CORPUS-2172 the island RegExp boundary program", async () => {
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
+
+// ============================================================
+// I — unions, URLs and typed arrays held in dynamic values
+// ============================================================
+
+test("I-UNION-01 unions cross by their runtime tag: unit arms are the island's own undefined/null", async () => {
+  const { stdout, stderr, exitCode } = await runRow("I-UNION-01", "// @dynamic\n// unions cross by their runtime tag: unit arms are the island's own undefined/null\nfunction pick(flag: boolean): string | undefined {\n  return flag ? \"chosen\" : undefined;\n}\nfunction nickel(flag: boolean): string | null {\n  return flag ? \"coin\" : null;\n}\nfunction num(flag: boolean): number | boolean {\n  return flag ? 4 : false;\n}\nconst box: any = { tag: pick(true), empty: pick(false), coin: nickel(true), slot: nickel(false), n: num(true), b: num(false) };\nconsole.log(`${box.tag} ${typeof box.empty} ${box.coin} ${box.slot === null} ${box.n + 1} ${box.b}`);\nconst direct: any = nickel(false);\nconsole.log(`${direct === null} ${JSON.stringify(box)}`);", "ts");
+  expect(stdout).toBe("chosen undefined coin true 5 false\ntrue {\"tag\":\"chosen\",\"coin\":\"coin\",\"slot\":null,\"n\":4,\"b\":false}\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("I-URL-01 a URL held in an any: its getters, String(), toString(), JSON, typeof, keys, spread", async () => {
+  const { stdout, stderr, exitCode } = await runRow("I-URL-01", "// @dynamic\n// a URL held in an any: its getters, String(), toString(), JSON, typeof, keys, spread\nconst url = new URL(\"https://user@example.dev:8080/p/a.mp3?q=1&r=2#frag\");\nconst hu: any = url;\nconsole.log(`${hu.href} | ${hu.protocol} | ${hu.host} | ${hu.hostname} | ${hu.pathname} | ${hu.search}`);\nconsole.log(`${hu} ${hu.toString() === hu.href} ${hu.toJSON()} ${JSON.stringify(hu)} ${typeof hu}`);\nconst sp: any = { ...hu };\nconsole.log(`${JSON.stringify(sp)} ${hu === hu}`);\nconst u2: unknown = hu;\nif (typeof u2 === \"object\" && u2 !== null) console.log(JSON.stringify(Object.keys(u2)));", "ts");
+  expect(stdout).toBe("https://user@example.dev:8080/p/a.mp3?q=1&r=2#frag | https: | example.dev:8080 | example.dev | /p/a.mp3 | ?q=1&r=2\nhttps://user@example.dev:8080/p/a.mp3?q=1&r=2#frag true https://user@example.dev:8080/p/a.mp3?q=1&r=2#frag \"https://user@example.dev:8080/p/a.mp3?q=1&r=2#frag\" object\n{} true\n[]\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("I-URL-02 the URL members this tier does not expose refuse by name", async () => {
+  const { stdout, stderr, exitCode } = await runRow("I-URL-02", "// @dynamic\n// the URL members this tier does not expose refuse by name\nconst hu: any = new URL(\"https://example.dev:8080/p#frag\");\nfor (const name of [\"hash\", \"port\", \"origin\", \"searchParams\"]) {\n  try {\n    console.log(`ok ${hu[name]}`);\n  } catch (e) {\n    console.log(`${(e as Error).message}`);\n  }\n}", "ts");
+  // Node: ok #frag / ok 8080 / ok https://example.dev:8080 / ok (the
+  // URLSearchParams' empty string).
+  expect(stdout).toBe("reading 'hash' of a URL held in a dynamic value is not supported yet\nreading 'port' of a URL held in a dynamic value is not supported yet\nreading 'origin' of a URL held in a dynamic value is not supported yet\nreading 'searchParams' of a URL held in a dynamic value is not supported yet\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("I-URL-03 a URL held in a dynamic value holds no own members: writes and Object.create over one refuse by name", async () => {
+  const { stdout, stderr, exitCode } = await runRow("I-URL-03", "// @dynamic\n// a URL held in a dynamic value holds no own members: writes and Object.create over one refuse by name\nconst hu: any = new URL(\"https://example.dev/p\");\nconst tries: (() => any)[] = [\n  () => { hu.href = \"https://other.dev/\"; return hu.href; },\n  () => { hu.foo = 1; return hu.foo; },\n  () => Object.create(hu).href,\n];\nfor (const t of tries) {\n  try {\n    console.log(`ok ${t()}`);\n  } catch (e) {\n    console.log(`${(e as Error).message}`);\n  }\n}\nconsole.log(`${hu.href} ${JSON.stringify(hu)}`);", "ts");
+  // Node: ok https://other.dev/ / ok 1 / "Receiver must be an instance of
+  // class URL" / https://other.dev/ "https://other.dev/" (the href setter
+  // reparses). The refusals keep the getters exact.
+  expect(stdout).toBe("assigning a member of a URL held in a dynamic value is not supported yet\nassigning a member of a URL held in a dynamic value is not supported yet\nObject.create over a null-prototype or built-in object on the island is not supported yet\nhttps://example.dev/p \"https://example.dev/p\"\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("I-URL-04 a URL held in a dynamic value refuses by name at a string slot and as constructor", async () => {
+  const { stdout, stderr, exitCode } = await runRow("I-URL-04", "// @dynamic\n// a URL held in a dynamic value passed back where a string is expected\nconst u: any = new URL(\"https://a.com/p?q=1\");\ntry {\n  const v = new URL(u);\n  console.log(`ok ${v.href}`);\n} catch (e) {\n  console.log(`${(e as Error).message}`);\n}\ntry {\n  const s: string = u;\n  console.log(`ok ${s.length}`);\n} catch (e) {\n  console.log(`${(e as Error).message}`);\n}\ntry {\n  console.log(`ok ${typeof u.constructor}`);\n} catch (e) {\n  console.log(`${(e as Error).message}`);\n}\nconsole.log(\"end\");", "ts");
+  // Node: ok https://a.com/p?q=1 (new URL reads the href) / ok undefined
+  // (a string-typed slot holds the object) / ok function / end.
+  expect(stdout).toBe("passing a URL held in a dynamic value where a string is expected is not supported yet\npassing a URL held in a dynamic value where a string is expected is not supported yet\nreading 'constructor' of a URL held in a dynamic value is not supported yet\nend\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("I-TYPED-01 a non-u8 typed array held in an any: length, index reads, constructor, BYTES_PER_ELEMENT", async () => {
+  const { stdout, stderr, exitCode } = await runRow("I-TYPED-01", "// @dynamic\n// a non-u8 typed array held in an any: length, index reads, constructor, BYTES_PER_ELEMENT\nconst words = new Uint32Array([7, 900000001]);\nconst hw: any = words;\nconsole.log(`${hw.length} ${hw[0]} ${hw[1]} ${hw[2]} ${hw.constructor.name} ${hw.BYTES_PER_ELEMENT} ${hw.byteLength} ${typeof hw}`);\nconst floats = new Float32Array([1.5, -0.25]);\nconst hf: any = floats;\nconsole.log(`${hf.length} ${hf[1]} ${hf.constructor.name} ${hf.constructor.length} ${typeof hf.constructor}`);\nconst ints = new Int32Array([-3]);\nconst hi: any = ints;\nconst again: any = ints;\nconsole.log(`${hi[0]} ${hi.constructor.name} ${hi === again} ${hi === hw} ${hi.constructor === again.constructor} ${!!hi}`);\nconst bytes = new Uint8Array([1]);\nconst hb: any = bytes;\nconsole.log(`${hb.constructor.name} ${hb.constructor === hb.constructor}`);", "ts");
+  expect(stdout).toBe("2 7 900000001 undefined Uint32Array 4 8 object\n2 -0.25 Float32Array 3 function\n-3 Int32Array true false true true\nUint8Array true\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("I-TYPED-02 every reader that would walk or convert a dynamic typed array refuses by name", async () => {
+  const { stdout, stderr, exitCode } = await runRow("I-TYPED-02", "// @dynamic\n// every reader that would walk or convert a dynamic typed array refuses by name\nconst hw: any = new Uint32Array([7, 8]);\nconst tries: (() => any)[] = [\n  () => JSON.stringify(hw),\n  () => hw.map((x: any) => x),\n  () => { hw[0] = 1; },\n  () => { const s: any = { ...hw }; return s; },\n  () => hw.at(0),\n  () => hw.constructor(2),\n];\nfor (const t of tries) {\n  try {\n    console.log(`ok ${t()}`);\n  } catch (e) {\n    console.log(`${(e as Error).message}`);\n  }\n}\nconst u: unknown = hw;\nif (typeof u === \"object\" && u !== null) {\n  const more: (() => any)[] = [() => Object.keys(u), () => \"0\" in u, () => Object.hasOwn(u, \"0\")];\n  for (const t of more) {\n    try {\n      console.log(`ok ${t()}`);\n    } catch (e) {\n      console.log(`${(e as Error).message}`);\n    }\n  }\n}", "ts");
+  // Node: ok {"0":7,"1":8} / ok 7,8 / ok undefined / ok [object Object] /
+  // ok 1 / Constructor Uint32Array requires 'new' / ok 0,1 / ok true /
+  // ok true. `"0" in u` is the one reader answered (Node's true).
+  expect(stdout).toBe("JSON.stringify of a typed array held in a dynamic value is not supported yet\ncalling 'map' on a typed array held in a dynamic value is not supported yet\nassigning a member of a typed array held in a dynamic value is not supported yet\nspreading a typed array held in a dynamic value is not supported yet\ncalling 'at' on a typed array held in a dynamic value is not supported yet\ncalling 'constructor' on a typed array held in a dynamic value is not supported yet\nwalking the keys of a typed array held in a dynamic value is not supported yet\nok true\n'in' or Object.hasOwn on a typed array held in a dynamic value is not supported yet\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("I-TYPED-03 an unaudited reader of a dynamic typed array traps (never a silent {} / [] / undefined)", async () => {
+  // structuredClone's walk was not taught the typed kind: it reaches its
+  // JSVAL arm, which is unreachable. Node: before, then after.
+  const { stdout } = await runRowTrap("I-TYPED-03", "// @dynamic\nconst hw: any = new Uint32Array([7, 8]);\nconsole.log(\"before\");\nconst c: any = structuredClone(hw);\nconsole.log(`${c.length}`);\nconsole.log(\"after\");", "ts");
+  expect(stdout).toBe("before\n");
+});
+
+test("I-TYPED-04 converting a dynamic typed array to a string refuses by name, uncaught", async () => {
+  // Node: before, 7,8, after. The conversion sites are not catchable.
+  const { stdout, stderr } = await runRowTrap("I-TYPED-04", "// @dynamic\nconst hw: any = new Uint32Array([7, 8]);\nconsole.log(\"before\");\nconsole.log(`${hw}`);\nconsole.log(\"after\");", "ts");
+  expect(stdout).toBe("before\n");
+  expect(stderr).toContain("converting a typed array held in a dynamic value to a string is not supported yet");
+});
+
+test("I-CTOR-01 the constructor boxes answer name, length and BYTES_PER_ELEMENT; other statics and calls refuse by name", async () => {
+  const { stdout, stderr, exitCode } = await runRow("I-CTOR-01", "// @dynamic\n// the constructor boxes: name, length and BYTES_PER_ELEMENT answer; other statics and calls refuse by name\nconst a: any = new Uint8Array([1, 2]);\nconst b: any = Buffer.from(\"hi\");\nconst w: any = new Uint32Array(2);\nconsole.log(`${a.constructor.BYTES_PER_ELEMENT} ${b.constructor.BYTES_PER_ELEMENT} ${w.constructor.BYTES_PER_ELEMENT} ${a.constructor.name} ${w.constructor.length}`);\nconst tries: (() => any)[] = [\n  () => a.constructor.from,\n  () => w.constructor.of,\n  () => a.constructor.prototype,\n  () => b.constructor.isBuffer,\n  () => a.constructor(1),\n  () => w.constructor(1),\n];\nfor (const t of tries) {\n  try {\n    console.log(`ok ${typeof t()}`);\n  } catch (e) {\n    console.log(`${(e as Error).message}`);\n  }\n}", "ts");
+  // Node: the first line, then ok function / ok function / ok object /
+  // ok function / Constructor Uint8Array requires 'new' / Constructor
+  // Uint32Array requires 'new'.
+  expect(stdout).toBe("1 1 4 Uint8Array 3\nreading 'from' of a typed-array constructor read from a dynamic value is not supported yet\nreading 'of' of a typed-array constructor read from a dynamic value is not supported yet\nreading 'prototype' of a typed-array constructor read from a dynamic value is not supported yet\nreading 'isBuffer' of a typed-array constructor read from a dynamic value is not supported yet\ncalling 'constructor' on a typed array held in a dynamic value is not supported yet\ncalling 'constructor' on a typed array held in a dynamic value is not supported yet\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("I-CORPUS-766 the union boundary program", async () => {
+  const { stdout, stderr, exitCode } = await runCorpusRow("I-CORPUS-766", "766-any-union-boundary.ts");
+  expect(stdout).toBe("chosen undefined coin true\nundefined\nundefined true true\n3 104 33 Uint8Array\n2 900000001 Uint32Array\n2 -0.25 Float32Array\n3 105\n7 text\nhttps://example.dev/media/a.mp3?q=1#frag https: /media/a.mp3\nhttps://example.dev/media/a.mp3?q=1#frag\nhttps://example.dev/media/a.mp3?q=1#frag\n3\nchosen undefined 3\n3 chosen undefined last\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
