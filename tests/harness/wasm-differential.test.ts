@@ -3561,6 +3561,12 @@ const TIER_FLOOR: string[] = [
   "1447-stdin-closed-events.ts",
   "1475-readline-closed-stdin.ts",
   "1751-options-record-stance.ts",
+  // Boards #237/#239: runtime format strings (console.* and util.format
+  // scan the string the program holds) and Buffer.alloc's Node size
+  // validation, both front-end mechanisms shared by every lane:
+  // 1068 -> 1070.
+  "2746-format-runtime-string.ts",
+  "2747-buffer-alloc-size.ts",
 ];
 
 interface RunResult {

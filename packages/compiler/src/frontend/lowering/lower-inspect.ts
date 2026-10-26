@@ -36,7 +36,10 @@
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { isJsSourceFile } from "../program.js";
-import { BOOL, DYN, F64, IrExpr, IrStmt, IrType, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, UNDEFINED_T, isUnitType, shapeHasAccessorSlots, typeKey } from "../../ir/nodes.js";
+import { BOOL, DYN, F64, IrExpr, IrStmt, IrType, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, UNDEFINED_T, arrayOf, isUnitType, shapeHasAccessorSlots, typeKey } from "../../ir/nodes.js";
+import { noLoweringDiag, type ScrDiagnostic } from "../../diagnostics/diagnostic.js";
+import { PoisonError } from "./lowerer.js";
+import { locOf } from "../program.js";
 import type { ClassInfo } from "./lower-classes.js";
 import { pureReemittable } from "./lower-exprs.js";
 
@@ -1059,9 +1062,8 @@ function lowerInspectCall(L: Lowerer, expr: ts.CallExpression, loc: SrcLoc): IrE
 
 /** One argument as format's %s conversion (Node: numbers via
  * formatNumber, strings verbatim, objects through inspect at the given
- * depth). Null = fence with the given reason. */
-function formatSArg(L: Lowerer, node: ts.Expression, depth: number, loc: SrcLoc): IrExpr {
-  const value = L.lowerExpr(node);
+ * depth) over its already-lowered value; unsupported kinds fence. */
+function formatSArg(L: Lowerer, node: ts.Expression, value: IrExpr, depth: number, loc: SrcLoc): IrExpr {
   const t = value.type;
   if (t.kind === "string") return value;
   if (t.kind === "f64") return { kind: "libCall", fn: "insp.f64", args: [value], type: STRING, loc };
@@ -1108,8 +1110,7 @@ function formatSArg(L: Lowerer, node: ts.Expression, depth: number, loc: SrcLoc)
 /** %O (depth 2) / %o (showHidden, depth 4) — inspect with the spec's
  * option deltas; %o fences over arrays (showHidden adds their hidden
  * [length] entry, which has no lowering). */
-function formatOArg(L: Lowerer, node: ts.Expression, depth: number, loc: SrcLoc): IrExpr {
-  const value = L.lowerExpr(node);
+function formatOArg(L: Lowerer, node: ts.Expression, value: IrExpr, depth: number, loc: SrcLoc): IrExpr {
   if (value.type.kind === "bytes") {
     L.noLowering(`util.format %${depth === 4 ? "o" : "O"} of typed-array values`, node, "pass util.inspect(buf) explicitly");
   }
@@ -1131,11 +1132,267 @@ function formatOArg(L: Lowerer, node: ts.Expression, depth: number, loc: SrcLoc)
   return inspectExpr(L, value.type, value, num(0, loc), num(depth, loc), loc);
 }
 
+/** A constant conversion result whose operand the conversion never reads:
+ * the operand still evaluates for its effects (literals and pure reads
+ * fold away). */
+function constAfter(value: IrExpr, text: string, loc: SrcLoc): IrExpr {
+  const result = str(text, loc);
+  if (pureReemittable(value) || value.kind === "unitLit" || value.kind === "numLit" ||
+      value.kind === "strLit" || value.kind === "boolLit") {
+    return result;
+  }
+  return { kind: "seqExpr", stmts: [{ kind: "exprStmt", expr: value, loc }], result, type: STRING, loc };
+}
+
+/** The format specifiers that consume an argument (formatWithOptions-
+ * Internal's switch): s j d O o i f c. */
+const FORMAT_SPECS = [115, 106, 100, 79, 111, 105, 102, 99] as const;
+
+/** One consumed argument under one specifier — formatWithOptionsInternal's
+ * per-case conversion over the argument's STATIC type (the value is
+ * already lowered: a literal format's call-site argument, or a runtime
+ * format helper's parameter). %c never reaches here (it prints nothing).
+ * Unsupported kinds fence through L.noLowering. */
+function convertSpecArg(L: Lowerer, spec: number, node: ts.Expression, value: IrExpr, loc: SrcLoc): IrExpr {
+  const t = value.type;
+  const fmtNum = (n: IrExpr): IrExpr => ({ kind: "libCall", fn: "insp.f64", args: [n], type: STRING, loc });
+  const textOf = (): IrExpr => (t.kind === "string" ? value : { kind: "toString", operand: value, type: STRING, loc });
+  switch (spec) {
+    case 115: // %s
+      return formatSArg(L, node, value, 0, loc);
+    case 100: {
+      // %d — Number(arg) formatted: numbers as-is, booleans 1/0,
+      // strings through the runtime's ECMA-exact StringToNumber
+      // (num.fromString — the same lowering Number(aString) takes);
+      // Node prints 'NaN' for a symbol (it never calls Number on one).
+      if (t.kind === "f64") return fmtNum(value);
+      if (t.kind === "string") return fmtNum({ kind: "libCall", fn: "num.fromString", args: [value], type: F64, loc });
+      if (t.kind === "bool") {
+        return fmtNum({ kind: "ternary", cond: value, then: num(1, loc), else_: num(0, loc), type: F64, loc });
+      }
+      if (t.kind === "symbol" || t.kind === "undefinedT") return constAfter(value, "NaN", loc);
+      if (t.kind === "nullT") return constAfter(value, "0", loc);
+      // A checked-dynamic argument (`console.log('... actual %d.',
+      // context.actual)` — test/common's exit report): Number(arg) per
+      // its runtime kind (dynToNumberHelper), formatted.
+      if (t.kind === "dyn") {
+        return fmtNum({ kind: "call", callee: dynToNumberHelper(L, loc), args: [value], type: F64, loc });
+      }
+      L.noLowering(`util.format %d of '${L.fmt(t)}' values`, node, "numbers, booleans, and strings lower; ToNumber over other types has no static lowering");
+      break;
+    }
+    case 105:
+    case 102: {
+      // %i — parseInt(ToString(arg)), %f — parseFloat(ToString(arg)): the
+      // spec-exact compositions ('NaN' for a symbol, as Node prints it;
+      // undefined and null ToString to non-numeric text).
+      if (t.kind === "f64" || t.kind === "bool" || t.kind === "string" || t.kind === "dyn") {
+        // A checked-dynamic argument ToStrings per its runtime kind
+        // (dynToStringHelper — arrays join, a user toString runs, exactly
+        // as Node's parseInt/parseFloat would call it).
+        const text: IrExpr = t.kind === "dyn"
+          ? { kind: "call", callee: dynToStringHelper(L, loc), args: [value], type: STRING, loc }
+          : textOf();
+        const parsed: IrExpr = spec === 105
+          ? { kind: "libCall", fn: "num.parseInt", args: [text, num(0, loc)], type: F64, loc }
+          : { kind: "libCall", fn: "num.parseFloat", args: [text], type: F64, loc };
+        return fmtNum(parsed);
+      }
+      if (t.kind === "symbol" || t.kind === "undefinedT" || t.kind === "nullT") return constAfter(value, "NaN", loc);
+      L.noLowering(`util.format %${spec === 105 ? "i" : "f"} of '${L.fmt(t)}' values`, node);
+      break;
+    }
+    case 106: {
+      // %j — JSON.stringify; undefined-valued args print "undefined"
+      // (Node appends the non-string result of tryStringify).
+      if (t.kind === "undefinedT") return constAfter(value, "undefined", loc);
+      if (t.kind === "nullT") return constAfter(value, "null", loc);
+      // JSON.stringify(sym) is undefined in Node — %j prints the
+      // "undefined" text. Folding drops the operand, so only
+      // side-effect-free reads compose (the typeof-fold stance).
+      if (t.kind === "symbol") {
+        if (!pureReemittable(value)) {
+          L.noLowering(
+            `util.format %j of computed symbol values`,
+            node,
+            "bind the symbol to a const first (the %j text is always \"undefined\")",
+          );
+        }
+        return str("undefined", loc);
+      }
+      // A checked-dynamic argument (`console.error('headers: %j',
+      // headers)` — the suite's http logging idiom): the runtime dyn
+      // walk stringifies JS-exactly (root undefined/function prints
+      // "undefined"; a handle in the tree throws the loud fence).
+      if (t.kind === "dyn") return { kind: "libCall", fn: "insp.jsonDyn", args: [value], type: STRING, loc };
+      if (!L.jsonSafe(t)) {
+        L.noLowering(`util.format %j of '${L.fmt(t)}' values`, node, "only JSON-safe static types lower");
+      }
+      return { kind: "jsonStringify", value, type: STRING, loc };
+    }
+    case 79: // %O — inspect at the defaults
+      return formatOArg(L, node, value, 2, loc);
+    case 111: // %o — showHidden semantics; depth 4
+      return formatOArg(L, node, value, 4, loc);
+  }
+  throw new Error("unreachable format spec");
+}
+
+/** `%util.dynstr.<n>(v): string` — String(v) over a checked-dynamic
+ * value (format's %i / %f ToString, %d's array leg): strings as they
+ * are, numbers and booleans by their String, arrays by Array.prototype.
+ * join (",", nullish elements empty, elements by this same rule),
+ * null/undefined by their text, a plain object by its OWN toString
+ * (called through dyn.toStringCoerce) or "[object Object]". A function
+ * (Node prints its source text), a Buffer and an Error refuse by name at
+ * run time (SEMANTICS.md S099). Interned once per module. */
+function dynToStringHelper(L: Lowerer, loc: SrcLoc): string {
+  const key = "fmt:dynstr";
+  const existing = L.inspectHelpers.get(key);
+  if (existing) return existing;
+  const name = `%util.dynstr.${L.inspectHelpers.size}`;
+  L.inspectHelpers.set(key, name);
+  const v: IrExpr = { kind: "varRef", localId: "v.0", type: DYN, loc };
+  const e: IrExpr = { kind: "varRef", localId: "e.0", type: DYN, loc };
+  const n: IrExpr = { kind: "varRef", localId: "n.0", type: F64, loc };
+  const k: IrExpr = { kind: "varRef", localId: "k.0", type: F64, loc };
+  const sv: IrExpr = { kind: "varRef", localId: "s.0", type: STRING, loc };
+  const test = (x: IrExpr, t: "number" | "string" | "boolean" | "nullish" | "null" | "undefined" | "function" | "bytes" | "array" | "error" | "object"): IrExpr =>
+    ({ kind: "dynTest", test: t, value: x, type: BOOL, loc });
+  const ret = (value: IrExpr): IrStmt => ({ kind: "return", value, loc });
+  const when = (cond: IrExpr, then: IrStmt[]): IrStmt => ({ kind: "if", cond, then, else_: null, loc });
+  const fence = (what: string): IrStmt => {
+    const d = noLoweringDiag(what, loc);
+    return { kind: "runtimeFence", code: d.code, message: `${d.message} [${d.code}]`, loc };
+  };
+  const cat = (l: IrExpr, r: IrExpr): IrExpr => ({ kind: "strConcat", left: l, right: r, type: STRING, loc });
+  const body: IrStmt[] = [
+    when(test(v, "string"), [ret({ kind: "dynCheck", value: v, type: STRING, loc })]),
+    when(test(v, "number"), [ret({ kind: "toString", operand: { kind: "dynCheck", value: v, type: F64, loc }, type: STRING, loc })]),
+    when(test(v, "boolean"), [ret({ kind: "toString", operand: { kind: "dynCheck", value: v, type: BOOL, loc }, type: STRING, loc })]),
+    when(test(v, "function"), [fence("util.format ToString of a checked-dynamic function (Node prints its source text)")]),
+    when(test(v, "bytes"), [fence("util.format ToString of a checked-dynamic Buffer value")]),
+    when(test(v, "error"), [fence("util.format ToString of a checked-dynamic Error value")]),
+    when(test(v, "null"), [ret(str("null", loc))]),
+    when(test(v, "undefined"), [ret(str("undefined", loc))]),
+    when(test(v, "array"), [
+      { kind: "assign", localId: "n.0", value: { kind: "libCall", fn: "dyn.arrLen", args: [v], type: F64, loc }, loc },
+      { kind: "assign", localId: "s.0", value: str("", loc), loc },
+      { kind: "assign", localId: "k.0", value: num(0, loc), loc },
+      {
+        kind: "while",
+        cond: { kind: "bin", op: "<", left: k, right: n, type: BOOL, loc },
+        body: [
+          when({ kind: "bin", op: ">", left: k, right: num(0, loc), type: BOOL, loc }, [
+            { kind: "assign", localId: "s.0", value: cat(sv, str(",", loc)), loc },
+          ]),
+          { kind: "assign", localId: "e.0", value: { kind: "libCall", fn: "dyn.arrAt", args: [v, k], type: DYN, loc }, loc },
+          {
+            kind: "if",
+            cond: test(e, "nullish"),
+            then: [],
+            else_: [{ kind: "assign", localId: "s.0", value: cat(sv, { kind: "call", callee: name, args: [e], type: STRING, loc }), loc }],
+            loc,
+          },
+          { kind: "assign", localId: "k.0", value: { kind: "bin", op: "+", left: k, right: num(1, loc), type: F64, loc }, loc },
+        ],
+        loc,
+      },
+      ret(sv),
+    ]),
+    // A plain object: its OWN toString runs (dyn.toStringCoerce's object
+    // protocol); otherwise Object.prototype.toString's "[object Object]".
+    when(
+      { kind: "logical", op: "&&", left: test(v, "object"), right: { kind: "dynHasKey", key: "toString", negated: true, value: v, type: BOOL, loc }, type: BOOL, loc },
+      [ret(str("[object Object]", loc))],
+    ),
+    ret({ kind: "libCall", fn: "dyn.toStringCoerce", args: [v], type: STRING, loc }),
+  ];
+  L.liftedFns.push({
+    name,
+    params: [{ localId: "v.0", name: "v", type: DYN }],
+    returnType: STRING,
+    locals: [
+      { id: "v.0", name: "v", type: DYN, mutable: false },
+      { id: "n.0", name: "n", type: F64, mutable: true },
+      { id: "s.0", name: "s", type: STRING, mutable: true },
+      { id: "k.0", name: "k", type: F64, mutable: true },
+      { id: "e.0", name: "e", type: DYN, mutable: true },
+    ],
+    body: [
+      { kind: "varDecl", localId: "n.0", init: num(0, loc), loc },
+      { kind: "varDecl", localId: "s.0", init: str("", loc), loc },
+      { kind: "varDecl", localId: "k.0", init: num(0, loc), loc },
+      { kind: "varDecl", localId: "e.0", init: { kind: "dynFrom", value: str("", loc), type: DYN, loc }, loc },
+      ...body,
+    ],
+    loc,
+  });
+  return name;
+}
+
+/** `%util.dynnum.<n>(v): number` — Number(v) over a checked-dynamic
+ * value, per its runtime kind (format's %d — Node's formatNumber(Number(
+ * arg))): numbers as they are, strings through StringToNumber, booleans
+ * 1/0, null 0, undefined and functions NaN, arrays through their join
+ * (dynToStringHelper), and every other object through ToPrimitive's
+ * toString leg (dynToStringHelper: an own toString runs; a plain object
+ * is "[object Object]", NaN). An object carrying its OWN valueOf (which
+ * ToPrimitive's number hint would call first) and a Buffer refuse by
+ * name at run time (SEMANTICS.md S099). Interned once per module. */
+function dynToNumberHelper(L: Lowerer, loc: SrcLoc): string {
+  const key = "fmt:dynnum";
+  const existing = L.inspectHelpers.get(key);
+  if (existing) return existing;
+  const name = `%util.dynnum.${L.inspectHelpers.size}`;
+  L.inspectHelpers.set(key, name);
+  const v: IrExpr = { kind: "varRef", localId: "v.0", type: DYN, loc };
+  type DT = "number" | "string" | "boolean" | "null" | "undefined" | "function" | "bytes" | "object" | "array";
+  const test = (t: DT): IrExpr => ({ kind: "dynTest", test: t, value: v, type: BOOL, loc });
+  const ret = (value: IrExpr): IrStmt => ({ kind: "return", value, loc });
+  const when = (cond: IrExpr, then: IrStmt[]): IrStmt => ({ kind: "if", cond, then, else_: null, loc });
+  const fence = (what: string): IrStmt => {
+    const d = noLoweringDiag(what, loc);
+    return { kind: "runtimeFence", code: d.code, message: `${d.message} [${d.code}]`, loc };
+  };
+  const body: IrStmt[] = [
+    when(test("number"), [ret({ kind: "dynCheck", value: v, type: F64, loc })]),
+    when(test("string"), [ret({ kind: "libCall", fn: "num.fromString", args: [{ kind: "dynCheck", value: v, type: STRING, loc }], type: F64, loc })]),
+    when(test("boolean"), [ret({ kind: "ternary", cond: { kind: "dynCheck", value: v, type: BOOL, loc }, then: num(1, loc), else_: num(0, loc), type: F64, loc })]),
+    when(test("null"), [ret(num(0, loc))]),
+    when(test("undefined"), [ret(num(NaN, loc))]),
+    when(test("function"), [ret(num(NaN, loc))]),
+    when(test("bytes"), [fence("util.format %d of a checked-dynamic Buffer value")]),
+    // Arrays: Number(String(a)) — the join (dynToStringHelper).
+    when(test("array"), [ret({
+      kind: "libCall",
+      fn: "num.fromString",
+      args: [{ kind: "call", callee: dynToStringHelper(L, loc), args: [v], type: STRING, loc }],
+      type: F64,
+      loc,
+    })]),
+    when(
+      { kind: "logical", op: "&&", left: test("object"), right: { kind: "dynHasKey", key: "valueOf", value: v, type: BOOL, loc }, type: BOOL, loc },
+      [fence("util.format %d of a value with its own valueOf")],
+    ),
+    ret({ kind: "libCall", fn: "num.fromString", args: [{ kind: "call", callee: dynToStringHelper(L, loc), args: [v], type: STRING, loc }], type: F64, loc }),
+  ];
+  L.liftedFns.push({
+    name,
+    params: [{ localId: "v.0", name: "v", type: DYN }],
+    returnType: F64,
+    locals: [{ id: "v.0", name: "v", type: DYN, mutable: false }],
+    body,
+    loc,
+  });
+  return name;
+}
+
 /** util.format(...) / util.formatWithOptions({}, ...): the compile-time
  * %-substitution over a literal format string (formatWithOptionsInternal
  * ported exactly — the arg cursor, the args-exhausted guard, %c's
- * consume-and-drop), with per-static-type conversions. Non-literal
- * format strings lower only in the substitution-free shapes. */
+ * consume-and-drop), with per-static-type conversions. A non-literal
+ * format string runs the same port AT RUN TIME (lowerRuntimeFormat). */
 export function lowerFormatCall(L: Lowerer, expr: ts.CallExpression, loc: SrcLoc, withOptions: boolean): IrExpr {
   const argNodes = [...expr.arguments];
   if (withOptions) {
@@ -1154,22 +1411,20 @@ export function lowerFormatCall(L: Lowerer, expr: ts.CallExpression, loc: SrcLoc
 
   /** The rest-args tail: ` ` + (strings verbatim, everything else
    * inspected at the default depth). */
-  const restArg = (node: ts.Expression): IrExpr => formatSArg(L, node, 2, loc);
+  const restArg = (node: ts.Expression): IrExpr => formatSArg(L, node, L.lowerExpr(node), 2, loc);
 
   if (!firstIsLiteral) {
-    const firstT = L.mapTypeOf(L.typeOf(first));
-    if (firstT?.kind === "string" && argNodes.length > 1) {
-      L.noLowering(
-        "util.format with a runtime format string and further arguments",
-        first,
-        "the %-substitution positions are runtime-dependent — use a string literal",
-      );
+    const lowered = argNodes.map((n) => ({ node: n, value: L.lowerExpr(n) }));
+    if (lowered.length > 1) {
+      // A runtime format string (board #237): Node's scan runs at run time.
+      const runtime = lowerRuntimeFormat(L, lowered, "format", loc);
+      if (runtime !== null) return runtime;
     }
     // No substitutions possible: every argument joins with spaces.
     const parts: IrExpr[] = [];
-    for (let i = 0; i < argNodes.length; i++) {
+    for (let i = 0; i < lowered.length; i++) {
       if (i > 0) parts.push(str(" ", loc));
-      parts.push(restArg(argNodes[i]!));
+      parts.push(formatSArg(L, lowered[i]!.node, lowered[i]!.value, 2, loc));
     }
     return concatAll(parts, loc);
   }
@@ -1182,94 +1437,6 @@ export function lowerFormatCall(L: Lowerer, expr: ts.CallExpression, loc: SrcLoc
   let a = 0; // the arg cursor over argNodes (0 = the format string)
   let lastPos = 0;
   const args = argNodes;
-  const convert = (spec: number, node: ts.Expression): IrExpr => {
-    switch (spec) {
-      case 115: // %s
-        return formatSArg(L, node, 0, loc);
-      case 100: {
-        // %d — Number(arg) formatted: numbers as-is, booleans 1/0,
-        // strings through the runtime's ECMA-exact StringToNumber
-        // (num.fromString — the same lowering Number(aString) takes).
-        const value = L.lowerExpr(node);
-        if (value.type.kind === "f64") return { kind: "libCall", fn: "insp.f64", args: [value], type: STRING, loc };
-        if (value.type.kind === "string") {
-          const parsed: IrExpr = { kind: "libCall", fn: "num.fromString", args: [value], type: F64, loc };
-          return { kind: "libCall", fn: "insp.f64", args: [parsed], type: STRING, loc };
-        }
-        if (value.type.kind === "bool") {
-          return {
-            kind: "libCall",
-            fn: "insp.f64",
-            args: [{ kind: "ternary", cond: value, then: num(1, loc), else_: num(0, loc), type: F64, loc }],
-            type: STRING,
-            loc,
-          };
-        }
-        // A checked-dynamic argument (`console.log('... actual %d.',
-        // context.actual)` — test/common's exit report): VALIDATE it as a
-        // number (dynCheck) and format. A non-number dyn value throws the
-        // catchable TypeError where Node would print its ToNumber (NaN
-        // for objects) — loud, never a silent wrong answer (SEMANTICS.md).
-        if (value.type.kind === "dyn") {
-          return {
-            kind: "libCall",
-            fn: "insp.f64",
-            args: [{ kind: "dynCheck", value, type: F64, loc }],
-            type: STRING,
-            loc,
-          };
-        }
-        L.noLowering(`util.format %d of '${L.fmt(value.type)}' values`, node, "numbers, booleans, and strings lower; ToNumber over other types has no static lowering");
-        break;
-      }
-      case 105: {
-        // %i — parseInt(ToString(arg)): the spec-exact composition.
-        const value = L.lowerExpr(node);
-        if (value.type.kind === "f64" || value.type.kind === "bool" || value.type.kind === "string") {
-          const text: IrExpr = value.type.kind === "string" ? value : { kind: "toString", operand: value, type: STRING, loc };
-          const parsed: IrExpr = { kind: "libCall", fn: "num.parseInt", args: [text, num(0, loc)], type: F64, loc };
-          return { kind: "libCall", fn: "insp.f64", args: [parsed], type: STRING, loc };
-        }
-        L.noLowering(`util.format %i of '${L.fmt(value.type)}' values`, node);
-        break;
-      }
-      case 106: {
-        // %j — JSON.stringify; undefined-valued args print "undefined"
-        // (Node appends the non-string result of tryStringify).
-        const value = L.lowerExpr(node);
-        if (value.type.kind === "undefinedT") return str("undefined", loc);
-        // JSON.stringify(sym) is undefined in Node — %j prints the
-        // "undefined" text. Folding drops the operand, so only
-        // side-effect-free reads compose (the typeof-fold stance).
-        if (value.type.kind === "symbol") {
-          if (!pureReemittable(value)) {
-            L.noLowering(
-              `util.format %j of computed symbol values`,
-              node,
-              "bind the symbol to a const first (the %j text is always \"undefined\")",
-            );
-          }
-          return str("undefined", loc);
-        }
-        // A checked-dynamic argument (`console.error('headers: %j',
-        // headers)` — the suite's http logging idiom): the runtime dyn
-        // walk stringifies JS-exactly (root undefined/function prints
-        // "undefined"; a handle in the tree throws the loud fence).
-        if (value.type.kind === "dyn") {
-          return { kind: "libCall", fn: "insp.jsonDyn", args: [value], type: STRING, loc };
-        }
-        if (!L.jsonSafe(value.type)) {
-          L.noLowering(`util.format %j of '${L.fmt(value.type)}' values`, node, "only JSON-safe static types lower");
-        }
-        return { kind: "jsonStringify", value, type: STRING, loc };
-      }
-      case 79: // %O — inspect at the defaults
-        return formatOArg(L, node, 2, loc);
-      case 111: // %o — showHidden semantics; depth 4
-        return formatOArg(L, node, 4, loc);
-    }
-    throw new Error("unreachable format spec");
-  };
 
   for (let i = 0; i < fmt.length - 1; i++) {
     if (fmt.charCodeAt(i) === 37 /* % */) {
@@ -1281,16 +1448,14 @@ export function lowerFormatCall(L: Lowerer, expr: ts.CallExpression, loc: SrcLoc
           case 100: // d
           case 79: // O
           case 111: // o
-          case 105: { // i
+          case 105: // i
+          case 102: { // f
             const node = args[++a]!;
             if (lastPos !== i - 1) parts.push(str(fmt.slice(lastPos, i - 1), loc));
-            parts.push(convert(nextChar, node));
+            parts.push(convertSpecArg(L, nextChar, node, L.lowerExpr(node), loc));
             lastPos = i + 1;
             continue;
           }
-          case 102: // f — parseFloat's full grammar has no static lowering
-            L.noLowering("util.format %f", expr, "parseFloat has no static lowering (it runs with --dynamic)");
-            break;
           case 99: // c — consumes its argument, contributes nothing
             a += 1;
             if (lastPos !== i - 1) parts.push(str(fmt.slice(lastPos, i - 1), loc));
@@ -1323,6 +1488,489 @@ export function lowerFormatCall(L: Lowerer, expr: ts.CallExpression, loc: SrcLoc
     parts.push(restArg(args[a]!));
   }
   return concatAll(parts, loc);
+}
+
+/* ── runtime format strings (board #237) ─────────────────────────────── */
+
+/** IR construction shorthand for the synthesized scan helpers. */
+const ref = (id: string, type: IrType, loc: SrcLoc): IrExpr => ({ kind: "varRef", localId: id, type, loc });
+const f64Bin = (op: "+" | "-", l: IrExpr, r: IrExpr, loc: SrcLoc): IrExpr => ({ kind: "bin", op, left: l, right: r, type: F64, loc });
+const cmp = (op: "<" | ">=" | "===" | "!==", l: IrExpr, r: IrExpr, loc: SrcLoc): IrExpr => ({ kind: "bin", op, left: l, right: r, type: BOOL, loc });
+const and = (l: IrExpr, r: IrExpr, loc: SrcLoc): IrExpr => ({ kind: "logical", op: "&&", left: l, right: r, type: BOOL, loc });
+const assign = (localId: string, value: IrExpr, loc: SrcLoc): IrStmt => ({ kind: "assign", localId, value, loc });
+const strI = (method: "length" | "charCodeAt" | "indexOf" | "slice", receiver: IrExpr, args: IrExpr[], type: IrType, loc: SrcLoc): IrExpr => ({
+  kind: "strIntrinsic",
+  method,
+  receiver,
+  args,
+  type,
+  loc,
+});
+
+/** The scan both runtime helpers share — formatWithOptionsInternal's loop
+ * over the format string `f.0`, jumping between '%' signs with indexOf
+ * (the skipped characters are never '%', so the visit order is the
+ * original for-loop's exactly). `n1` is args.length (format included);
+ * `a.0` the argument cursor. onSpec runs when a consuming specifier
+ * (char code in `c.0`) takes argument `a.0` (already advanced); onPercent
+ * when a '%%' collapses (either guard branch). */
+function formatScanStmts(n1: IrExpr, onSpec: IrStmt[], onPercent: IrStmt[], loc: SrcLoc): IrStmt[] {
+  const f = ref("f.0", STRING, loc);
+  const i = ref("i.0", F64, loc);
+  const c = ref("c.0", F64, loc);
+  const a = ref("a.0", F64, loc);
+  let isSpec: IrExpr | null = null;
+  for (const code of FORMAT_SPECS) {
+    const test = cmp("===", c, num(code, loc), loc);
+    isSpec = isSpec === null ? test : { kind: "logical", op: "||", left: isSpec, right: test, type: BOOL, loc };
+  }
+  const isPct = cmp("===", c, num(37, loc), loc);
+  return [
+    { kind: "varDecl", localId: "a.0", init: num(0, loc), loc },
+    { kind: "varDecl", localId: "lim.0", init: f64Bin("-", strI("length", f, [], F64, loc), num(1, loc), loc), loc },
+    { kind: "varDecl", localId: "i.0", init: strI("indexOf", f, [str("%", loc), num(0, loc)], F64, loc), loc },
+    { kind: "varDecl", localId: "c.0", init: num(0, loc), loc },
+    {
+      kind: "while",
+      cond: and(cmp(">=", i, num(0, loc), loc), cmp("<", i, ref("lim.0", F64, loc), loc), loc),
+      body: [
+        assign("i.0", f64Bin("+", i, num(1, loc), loc), loc),
+        assign("c.0", strI("charCodeAt", f, [i], F64, loc), loc),
+        {
+          kind: "if",
+          cond: cmp("!==", f64Bin("+", a, num(1, loc), loc), n1, loc),
+          then: [{
+            kind: "if",
+            cond: isSpec!,
+            then: [assign("a.0", f64Bin("+", a, num(1, loc), loc), loc), ...onSpec],
+            else_: [{ kind: "if", cond: isPct, then: onPercent, else_: null, loc }],
+            loc,
+          }],
+          else_: [{ kind: "if", cond: isPct, then: onPercent, else_: null, loc }],
+          loc,
+        },
+        assign("i.0", strI("indexOf", f, [str("%", loc), f64Bin("+", i, num(1, loc), loc)], F64, loc), loc),
+      ],
+      loc,
+    },
+  ];
+}
+
+const SCAN_LOCALS = (loc: SrcLoc): { id: string; name: string; type: IrType; mutable: boolean }[] => {
+  void loc;
+  return [
+    { id: "a.0", name: "a", type: F64, mutable: true },
+    { id: "lim.0", name: "lim", type: F64, mutable: false },
+    { id: "i.0", name: "i", type: F64, mutable: true },
+    { id: "c.0", name: "c", type: F64, mutable: true },
+  ];
+};
+
+/** `%util.fmtspecs.<n>(f, n): number[]` — for each of the n arguments
+ * after the format string, the char code of the specifier that consumes
+ * it, or 0 when it is a rest argument. Interned once per module. */
+function formatSpecsHelper(L: Lowerer, loc: SrcLoc): string {
+  const existing = L.inspectHelpers.get("fmtspecs");
+  if (existing) return existing;
+  const name = `%util.fmtspecs.${L.inspectHelpers.size}`;
+  const arrT = arrayOf(F64);
+  const out = ref("out.0", arrT, loc);
+  const n = ref("n.0", F64, loc);
+  const body: IrStmt[] = [
+    { kind: "varDecl", localId: "out.0", init: { kind: "arrayLit", elems: [], type: arrT, loc }, loc },
+    { kind: "varDecl", localId: "k.0", init: num(0, loc), loc },
+    {
+      kind: "while",
+      cond: cmp("<", ref("k.0", F64, loc), n, loc),
+      body: [
+        { kind: "exprStmt", expr: { kind: "arrIntrinsic", method: "push", receiver: out, args: [num(0, loc)], type: F64, loc }, loc },
+        assign("k.0", f64Bin("+", ref("k.0", F64, loc), num(1, loc), loc), loc),
+      ],
+      loc,
+    },
+    ...formatScanStmts(
+      f64Bin("+", n, num(1, loc), loc),
+      [{
+        kind: "arraySet",
+        arr: out,
+        index: f64Bin("-", ref("a.0", F64, loc), num(1, loc), loc),
+        value: ref("c.0", F64, loc),
+        loc,
+      }],
+      [],
+      loc,
+    ),
+    { kind: "return", value: out, loc },
+  ];
+  L.inspectHelpers.set("fmtspecs", name);
+  L.liftedFns.push({
+    name,
+    params: [
+      { localId: "f.0", name: "f", type: STRING },
+      { localId: "n.0", name: "n", type: F64 },
+    ],
+    returnType: arrT,
+    locals: [
+      { id: "f.0", name: "f", type: STRING, mutable: false },
+      { id: "n.0", name: "n", type: F64, mutable: false },
+      { id: "out.0", name: "out", type: arrT, mutable: false },
+      { id: "k.0", name: "k", type: F64, mutable: true },
+      ...SCAN_LOCALS(loc),
+    ],
+    body,
+    loc,
+  });
+  return name;
+}
+
+/** `%util.fmtapply.<n>(f, head, convs): string` — the scan again, now
+ * building formatWithOptionsInternal's string: literal runs between
+ * specifiers, `convs[a - 1]` for each consumed argument (the converted
+ * text — "" for %c), '%%' collapsed, then the rest arguments' texts joined
+ * with single spaces. `head` is the format argument's own rendering when
+ * no substitution fired (Node's lastPos === 0: the first argument then
+ * prints as an ordinary argument). Interned once per module. */
+function formatApplyHelper(L: Lowerer, loc: SrcLoc): string {
+  const existing = L.inspectHelpers.get("fmtapply");
+  if (existing) return existing;
+  const name = `%util.fmtapply.${L.inspectHelpers.size}`;
+  const convT = arrayOf(STRING);
+  const f = ref("f.0", STRING, loc);
+  const s = ref("s.0", STRING, loc);
+  const a = ref("a.0", F64, loc);
+  const i = ref("i.0", F64, loc);
+  const lastPos = ref("lp.0", F64, loc);
+  const n1 = ref("n1.0", F64, loc);
+  const cat = (l: IrExpr, r: IrExpr): IrExpr => ({ kind: "strConcat", left: l, right: r, type: STRING, loc });
+  const conv = (): IrExpr => ({
+    kind: "arrayGet",
+    arr: ref("cv.0", convT, loc),
+    index: f64Bin("-", a, num(1, loc), loc),
+    type: STRING,
+    loc,
+  });
+  const body: IrStmt[] = [
+    {
+      kind: "varDecl",
+      localId: "n1.0",
+      init: f64Bin("+", { kind: "arrIntrinsic", method: "length", receiver: ref("cv.0", convT, loc), args: [], type: F64, loc }, num(1, loc), loc),
+      loc,
+    },
+    { kind: "varDecl", localId: "s.0", init: str("", loc), loc },
+    { kind: "varDecl", localId: "lp.0", init: num(0, loc), loc },
+    ...formatScanStmts(
+      n1,
+      [
+        {
+          kind: "if",
+          cond: cmp("!==", lastPos, f64Bin("-", i, num(1, loc), loc), loc),
+          then: [assign("s.0", cat(s, strI("slice", f, [lastPos, f64Bin("-", i, num(1, loc), loc)], STRING, loc)), loc)],
+          else_: null,
+          loc,
+        },
+        assign("s.0", cat(s, conv()), loc),
+        assign("lp.0", f64Bin("+", i, num(1, loc), loc), loc),
+      ],
+      [
+        assign("s.0", cat(s, strI("slice", f, [lastPos, i], STRING, loc)), loc),
+        assign("lp.0", f64Bin("+", i, num(1, loc), loc), loc),
+      ],
+      loc,
+    ),
+    {
+      kind: "if",
+      cond: cmp("!==", lastPos, num(0, loc), loc),
+      then: [
+        assign("a.0", f64Bin("+", a, num(1, loc), loc), loc),
+        {
+          kind: "if",
+          cond: cmp("<", lastPos, strI("length", f, [], F64, loc), loc),
+          then: [assign("s.0", cat(s, strI("slice", f, [lastPos], STRING, loc)), loc)],
+          else_: null,
+          loc,
+        },
+      ],
+      else_: [assign("s.0", ref("h.0", STRING, loc), loc), assign("a.0", num(1, loc), loc)],
+      loc,
+    },
+    {
+      kind: "while",
+      cond: cmp("<", a, n1, loc),
+      body: [
+        assign("s.0", cat(cat(s, str(" ", loc)), conv()), loc),
+        assign("a.0", f64Bin("+", a, num(1, loc), loc), loc),
+      ],
+      loc,
+    },
+    { kind: "return", value: s, loc },
+  ];
+  L.inspectHelpers.set("fmtapply", name);
+  L.liftedFns.push({
+    name,
+    params: [
+      { localId: "f.0", name: "f", type: STRING },
+      { localId: "h.0", name: "h", type: STRING },
+      { localId: "cv.0", name: "cv", type: convT },
+    ],
+    returnType: STRING,
+    locals: [
+      { id: "f.0", name: "f", type: STRING, mutable: false },
+      { id: "h.0", name: "h", type: STRING, mutable: false },
+      { id: "cv.0", name: "cv", type: convT, mutable: false },
+      { id: "n1.0", name: "n1", type: F64, mutable: false },
+      { id: "s.0", name: "s", type: STRING, mutable: true },
+      { id: "lp.0", name: "lp", type: F64, mutable: true },
+      ...SCAN_LOCALS(loc),
+    ],
+    body,
+    loc,
+  });
+  return name;
+}
+
+/** One argument of a runtime-format call: its source node (diagnostic
+ * anchor and checker type) and its lowered value. `noSpecs` names a
+ * value no specifier may convert (console's boxed function values: Node's
+ * %s prints a function's SOURCE text, which a binary does not carry). */
+export interface RuntimeFormatArg {
+  node: ts.Expression;
+  value: IrExpr;
+  noSpecs?: string;
+}
+
+/** Runs one conversion with its diagnostics captured: the IR, or the
+ * fence diagnostic it would have raised. */
+function tryConvert(L: Lowerer, node: ts.Node, build: () => IrExpr): { ir: IrExpr } | { diag: ScrDiagnostic } {
+  const saved = L.diagSink;
+  const sink: ScrDiagnostic[] = [];
+  L.diagSink = sink;
+  let out: IrExpr | null = null;
+  try {
+    out = build();
+  } catch (e) {
+    if (!(e instanceof PoisonError)) throw e;
+  } finally {
+    L.diagSink = saved;
+  }
+  if (out !== null) {
+    for (const d of sink) L.pushDiag(d);
+    return { ir: out };
+  }
+  return { diag: sink[0] ?? noLoweringDiag("this format conversion", locOf(node)) };
+}
+
+/** `%util.fmtarg.<n>(spec, v): string` — one argument's text under the
+ * specifier the runtime scan chose for it (0 = a rest argument): an
+ * if-chain over EXACTLY the literal-format conversions for v's static
+ * type, interned per (surface, type). A conversion that would fence at
+ * compile time becomes a runtimeFence on its branch — the program
+ * refuses BY NAME only if that specifier meets that argument at run time
+ * (SEMANTICS.md S099). The rest rendering must lower: it is the text
+ * every specifier-free call prints, so its fence stays a compile error
+ * (exactly the per-argument fence the call had before). */
+function formatArgHelper(L: Lowerer, arg: RuntimeFormatArg, surface: "console" | "format", restOf: (node: ts.Expression, v: IrExpr) => IrExpr, loc: SrcLoc): string {
+  const t = arg.value.type;
+  const bytesKey = t.kind === "bytes" ? `:${L.checker.typeToString(L.checker.getBaseTypeOfLiteralType(L.typeOf(arg.node)))}` : "";
+  const key = `fmtarg:${surface}:${arg.noSpecs ?? ""}:${typeKey(t)}${bytesKey}`;
+  const existing = L.inspectHelpers.get(key);
+  if (existing) return existing;
+  // A unit-typed argument (undefined / null) has no value to pass — no
+  // local may hold a bare unit — so its helper takes the spec alone and
+  // every conversion is the constant text (the operand never reaches it).
+  const unit = isUnitType(t);
+  const v: IrExpr = unit
+    ? { kind: "unitLit", unit: t.kind === "nullT" ? "null" : "undefined", type: t, loc }
+    : ref("v.0", t, loc);
+  const spec = ref("sp.0", F64, loc);
+  // The rest rendering first: a compile fence here leaves nothing interned.
+  const rest = restOf(arg.node, v);
+  const body: IrStmt[] = [];
+  for (const code of FORMAT_SPECS) {
+    if (code === 99) continue;
+    const res = arg.noSpecs !== undefined
+      ? { diag: noLoweringDiag(`util.format %${String.fromCharCode(code)} of ${arg.noSpecs}`, locOf(arg.node)) }
+      : tryConvert(L, arg.node, () => convertSpecArg(L, code, arg.node, v, loc));
+    const then: IrStmt[] = "ir" in res
+      ? [{ kind: "return", value: res.ir, loc }]
+      : [{ kind: "runtimeFence", code: res.diag.code, message: `${res.diag.message} [${res.diag.code}]`, loc }];
+    body.push({ kind: "if", cond: cmp("===", spec, num(code, loc), loc), then, else_: null, loc });
+  }
+  body.push({ kind: "if", cond: cmp("===", spec, num(99, loc), loc), then: [{ kind: "return", value: str("", loc), loc }], else_: null, loc });
+  body.push({ kind: "return", value: rest, loc });
+  const name = `%util.fmtarg.${L.inspectHelpers.size}`;
+  L.inspectHelpers.set(key, name);
+  L.liftedFns.push({
+    name,
+    params: [
+      { localId: "sp.0", name: "sp", type: F64 },
+      ...(unit ? [] : [{ localId: "v.0", name: "v", type: t }]),
+    ],
+    returnType: STRING,
+    locals: [
+      { id: "sp.0", name: "sp", type: F64, mutable: false },
+      ...(unit ? [] : [{ id: "v.0", name: "v", type: t, mutable: false }]),
+    ],
+    body,
+    loc,
+  });
+  return name;
+}
+
+/** The format-string view of a runtime first argument: itself when
+ * statically a string; for a checked-dynamic or string-armed union value,
+ * the string when it holds one and "" otherwise (an empty format makes
+ * Node's scan a no-op — exactly its non-string-first path). Null when the
+ * type can never hold a string (no formatting is possible). */
+function runtimeFormatString(L: Lowerer, v: IrExpr, loc: SrcLoc): IrExpr | null {
+  const t = v.type;
+  if (t.kind === "string") return v;
+  if (t.kind === "dyn") {
+    return {
+      kind: "ternary",
+      cond: { kind: "dynTest", test: "string", value: v, type: BOOL, loc },
+      then: { kind: "dynCheck", value: v, type: STRING, loc },
+      else_: str("", loc),
+      type: STRING,
+      loc,
+    };
+  }
+  if (t.kind === "union") {
+    const def = L.unions.get(t.unionId);
+    const tag = def ? def.arms.findIndex((arm) => arm.kind === "string") : -1;
+    if (tag < 0) return null;
+    return {
+      kind: "ternary",
+      cond: { kind: "unionIsTag", unionId: t.unionId, tag, negated: false, value: v, type: BOOL, loc },
+      then: { kind: "unionNarrow", unionId: t.unionId, tag, value: v, type: STRING, loc },
+      else_: str("", loc),
+      type: STRING,
+      loc,
+    };
+  }
+  return null;
+}
+
+/** formatWithOptionsInternal over a RUNTIME first argument (board #237):
+ * the call becomes `%util.fmtcall.<n>(args...)`, a helper interned per
+ * argument-type signature whose PARAMETERS are the arguments — so every
+ * argument evaluates once, in order, before any scanning, and the caller
+ * gains no hidden locals (a temp declared mid-expression would escape the
+ * native emitters' switch-case NULL-reset prescan). Inside: the scan
+ * helper picks each argument's specifier from the runtime format string,
+ * each argument converts through its interned per-type helper, and the
+ * apply helper splices the texts. `surface` picks the rest rendering —
+ * the console argument rules (console.*) or format's %s-at-depth-2
+ * (util.format) — exactly what each printed before. Null when no
+ * formatting can happen (the caller's plain join is exact). */
+export function lowerRuntimeFormat(
+  L: Lowerer,
+  args: RuntimeFormatArg[],
+  surface: "console" | "format",
+  loc: SrcLoc,
+  consoleSurface?: string,
+): IrExpr | null {
+  if (args.length < 2) return null;
+  const first = args[0]!;
+  if (runtimeFormatString(L, ref("%probe", first.value.type, loc), loc) === null) return null;
+  if (first.noSpecs !== undefined) return null;
+  // A first argument the front end already knows holds no '%' (a literal,
+  // or a folded constant) can never substitute: the plain join is exact.
+  if (first.value.kind === "strLit" && !first.value.value.includes("%")) return null;
+  // A unit-typed argument (undefined / null) is no parameter — no local
+  // holds a bare unit — so an EFFECTFUL one keeps the plain path (and its
+  // per-argument rule there).
+  if (args.some((a) => isUnitType(a.value.type) && a.value.kind !== "unitLit" && !pureReemittable(a.value))) return null;
+  const restOf = (node: ts.Expression, v: IrExpr): IrExpr =>
+    surface === "format" ? formatSArg(L, node, v, 2, loc) : consoleRestText(L, node, v, consoleSurface ?? "console.log", loc);
+  const argHelpers = args.slice(1).map((a) => formatArgHelper(L, a, surface, restOf, loc));
+  const key = `fmtcall:${surface}:${typeKey(first.value.type)}:${argHelpers.join(",")}`;
+  const passed = args.filter((a) => !isUnitType(a.value.type)).map((a) => a.value);
+  const existing = L.inspectHelpers.get(key);
+  if (existing) return { kind: "call", callee: existing, args: passed, type: STRING, loc };
+  const specsFn = formatSpecsHelper(L, loc);
+  const applyFn = formatApplyHelper(L, loc);
+  const params: { localId: string; name: string; type: IrType }[] = [];
+  const pref: (IrExpr | null)[] = args.map((a, k) => {
+    if (isUnitType(a.value.type)) return null;
+    params.push({ localId: `p${k}.0`, name: `p${k}`, type: a.value.type });
+    return ref(`p${k}.0`, a.value.type, loc);
+  });
+  const p0 = pref[0]!; // never a unit: a unit first argument is no format string
+  const head = restOf(first.node, p0);
+  const specsT = arrayOf(F64);
+  const body: IrStmt[] = [
+    { kind: "varDecl", localId: "fs.0", init: runtimeFormatString(L, p0, loc)!, loc },
+    {
+      kind: "varDecl",
+      localId: "sp.0",
+      init: { kind: "call", callee: specsFn, args: [ref("fs.0", STRING, loc), num(args.length - 1, loc)], type: specsT, loc },
+      loc,
+    },
+    {
+      kind: "return",
+      value: {
+        kind: "call",
+        callee: applyFn,
+        args: [
+          ref("fs.0", STRING, loc),
+          head,
+          {
+            kind: "arrayLit",
+            elems: pref.slice(1).map((pk, k) => ({
+              kind: "call",
+              callee: argHelpers[k]!,
+              args: [
+                { kind: "arrayGet", arr: ref("sp.0", specsT, loc), index: num(k, loc), type: F64, loc },
+                ...(pk === null ? [] : [pk]),
+              ],
+              type: STRING,
+              loc,
+            })),
+            type: arrayOf(STRING),
+            loc,
+          },
+        ],
+        type: STRING,
+        loc,
+      },
+      loc,
+    },
+  ];
+  const name = `%util.fmtcall.${L.inspectHelpers.size}`;
+  L.inspectHelpers.set(key, name);
+  L.liftedFns.push({
+    name,
+    params,
+    returnType: STRING,
+    locals: [
+      ...params.map((q) => ({ id: q.localId, name: q.name, type: q.type, mutable: false })),
+      { id: "fs.0", name: "fs", type: STRING, mutable: false },
+      { id: "sp.0", name: "sp", type: specsT, mutable: false },
+    ],
+    body,
+    loc,
+  });
+  return { kind: "call", callee: name, args: passed, type: STRING, loc };
+}
+
+/** console's rest-argument rendering of one value (formatWithOptions'
+ * rest rule under the console call site's per-argument lowering):
+ * strings verbatim, numbers/booleans as the ScrLogArg protocol prints
+ * them, checked-dynamic values through the dyn walk at depth 2, every
+ * other kind through lowerConsoleInspectArg (its fences included). */
+function consoleRestText(L: Lowerer, node: ts.Expression, v: IrExpr, surface: string, loc: SrcLoc): IrExpr {
+  switch (v.type.kind) {
+    case "string":
+      return v;
+    case "f64":
+      return { kind: "libCall", fn: "insp.f64", args: [v], type: STRING, loc };
+    case "bool":
+      return { kind: "toString", operand: v, type: STRING, loc };
+    case "dyn":
+      return { kind: "libCall", fn: "insp.dynS", args: [v, num(2, loc)], type: STRING, loc };
+    default:
+      return lowerConsoleInspectArg(L, node, v, surface, loc);
+  }
 }
 
 /** Arrays anywhere in the tree — the %o (showHidden) gate. */

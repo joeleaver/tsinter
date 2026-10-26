@@ -20454,13 +20454,20 @@ class Assembler {
           const kindArg = e.args[0]!;
           const codeArg = e.args[1]!;
           const msgArg = e.args[2]!;
-          if (kindArg.kind !== "numLit" || codeArg.kind !== "strLit" || msgArg.kind !== "strLit") {
-            throw new Error("wasm emitter bug: error.nodeThrow args must be compile-time literals (nodeThrowExpr's own construction)");
+          if (kindArg.kind !== "numLit" || codeArg.kind !== "strLit") {
+            throw new Error("wasm emitter bug: error.nodeThrow kind/code args must be compile-time literals (nodeThrowExpr's own construction)");
           }
           const className = kindArg.value === 0 ? "%Error" : kindArg.value === 1 ? "%TypeError" : "%RangeError";
           const name = kindArg.value === 0 ? "Error" : kindArg.value === 1 ? "TypeError" : "RangeError";
           const codeLit = codeArg.value === "" ? null : codeArg.value;
-          this.emitSetCellErrorLit(className, name, msgArg.value, codeLit);
+          if (msgArg.kind === "strLit") {
+            this.emitSetCellErrorLit(className, name, msgArg.value, codeLit);
+          } else {
+            // A RUNTIME-rendered message (board #239: Buffer.alloc's
+            // ERR_OUT_OF_RANGE "Received <n>" tail) — the argTypeThrow
+            // mechanics just below, the message walked in place.
+            this.emitSetCellError(code, className, name, () => this.walkExpr(msgArg), codeLit);
+          }
           this.emitUnwind();
           return;
         }

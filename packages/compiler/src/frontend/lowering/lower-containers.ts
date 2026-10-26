@@ -5974,43 +5974,51 @@ const DV_SETTERS: Record<string, { method: IrBytesIntrinsicMethod; le: boolean }
           "storage (no free-standing ArrayBuffer value exists; narrow unions first)",
       );
     }
-    if (member === "alloc" || member === "allocUnsafe") {
+    if (member === "alloc" || member === "allocUnsafe" || member === "allocUnsafeSlow") {
       const maxArgs = member === "alloc" ? 3 : 1;
       if (args.length < 1 || args.length > maxArgs || args.some(ts.isSpreadElement)) {
         L.noLowering(`Buffer.${member} with ${args.length} arguments`, call);
       }
-      // allocUnsafe's contents are UNSPECIFIED in Node (uninitialized pool
-      // memory); a zero-filled buffer is a valid instance of unspecified,
-      // and the deterministic choice — a program observing the difference
-      // is depending on garbage.
-      const size = L.lowerExprExpecting(args[0]!, F64);
-      const fresh: IrExpr = { kind: "bytesNew", source: size, type: BYTES_U8, loc };
-      if (args.length === 1) return fresh;
+      // allocUnsafe's (and allocUnsafeSlow's) contents are UNSPECIFIED in
+      // Node (uninitialized memory); a zero-filled buffer is a valid
+      // instance of unspecified, and the deterministic choice — a program
+      // observing the difference is depending on garbage.
+      //
+      // The call becomes `%buffer.alloc.<n>(size, fill?)` (board #239): its
+      // parameters ARE the arguments, so every one evaluates first (JS
+      // call order), then Node's assertSize — validateNumber(size, "size",
+      // 0, kMaxLength) — runs before anything is allocated or filled.
+      const sizeRaw = L.lowerExpr(args[0]!);
+      const size = sizeRaw.type.kind === "dyn" ? sizeRaw : L.coerceInto(args[0]!, sizeRaw, F64);
+      if (args.length === 1) return { kind: "call", callee: bufferAllocHelper(L, size.type, null, loc), args: [size], type: BYTES_U8, loc };
       // alloc(size, fill, encoding?): the fill semantics ARE fill()'s —
       // the fresh buffer is the receiver of a whole-range fill.
       const fillT = L.mapTypeOf(L.typeOf(args[1]!));
+      let fill: IrExpr;
+      let how: BufferAllocFill;
       if (fillT?.kind === "string") {
         const encName = args[2] ? bufEncoding(L, "Buffer.alloc", args[2]) : "utf8";
-        const s = L.lowerExprExpecting(args[1]!, STRING);
-        const enc: IrExpr = { kind: "strLit", value: encName, type: STRING, loc };
-        return { kind: "bytesIntrinsic", method: "fillStr", receiver: fresh, args: [s, enc], type: BYTES_U8, loc };
+        fill = L.lowerExprExpecting(args[1]!, STRING);
+        how = { method: "fillStr", enc: encName };
+      } else {
+        if (args.length > 2) {
+          L.noLowering("Buffer.alloc with an encoding on a non-string fill", args[2]!);
+        }
+        if (fillT?.kind === "f64") {
+          fill = L.lowerExprExpecting(args[1]!, F64);
+          how = { method: "fillNum" };
+        } else if (fillT?.kind === "bytes" && fillT.elem === "u8") {
+          fill = L.lowerExpr(args[1]!);
+          how = { method: "fill" };
+        } else {
+          L.noLowering(
+            `Buffer.alloc with a '${L.checker.typeToString(L.typeOf(args[1]!))}' fill`,
+            args[1]!,
+            "number, string, and Buffer/Uint8Array fills are the lowered shapes",
+          );
+        }
       }
-      if (args.length > 2) {
-        L.noLowering("Buffer.alloc with an encoding on a non-string fill", args[2]!);
-      }
-      if (fillT?.kind === "f64") {
-        const v = L.lowerExprExpecting(args[1]!, F64);
-        return { kind: "bytesIntrinsic", method: "fillNum", receiver: fresh, args: [v], type: BYTES_U8, loc };
-      }
-      if (fillT?.kind === "bytes" && fillT.elem === "u8") {
-        const pattern = L.lowerExpr(args[1]!);
-        return { kind: "bytesIntrinsic", method: "fill", receiver: fresh, args: [pattern], type: BYTES_U8, loc };
-      }
-      L.noLowering(
-        `Buffer.alloc with a '${L.checker.typeToString(L.typeOf(args[1]!))}' fill`,
-        args[1]!,
-        "number, string, and Buffer/Uint8Array fills are the lowered shapes",
-      );
+      return { kind: "call", callee: bufferAllocHelper(L, size.type, { ...how, type: fill.type }, loc), args: [size, fill], type: BYTES_U8, loc };
     }
     if (member === "concat") {
       if (args.length < 1 || args.length > 2 || args.some(ts.isSpreadElement)) {
@@ -6126,6 +6134,209 @@ const DV_SETTERS: Record<string, { method: IrBytesIntrinsicMethod; le: boolean }
     }
     return null; // of, copyBytesFrom, ... → the SC2020 member fence
   }
+
+type BufferAllocFill = { method: "fillStr"; enc: string } | { method: "fillNum" } | { method: "fill" };
+
+/** `%buffer.alloc.<n>(size, fill?): Buffer` — Buffer.alloc's body over its
+ * evaluated arguments, interned per (size kind, fill form): a checked-
+ * dynamic size runs validateNumber's TYPE gate first (a non-number throws
+ * Node's ERR_INVALID_ARG_TYPE — "The "size" argument must be of type
+ * number. Received ..."), then the range check, then the zero-filled
+ * allocation and the fill. Board #239. */
+function bufferAllocHelper(
+  L: Lowerer,
+  sizeT: IrType,
+  fill: (BufferAllocFill & { type: IrType }) | null,
+  loc: SrcLoc,
+): string {
+  const key = `bufalloc:${sizeT.kind}:${fill === null ? "" : `${fill.method}:${"enc" in fill ? fill.enc : ""}:${typeKey(fill.type)}`}`;
+  const existing = L.inspectHelpers.get(key);
+  if (existing) return existing;
+  const sizeRef: IrExpr = { kind: "varRef", localId: "n.0", type: sizeT, loc };
+  const num: IrExpr =
+    sizeT.kind !== "dyn"
+      ? sizeRef
+      : {
+          kind: "ternary",
+          cond: { kind: "dynTest", test: "number", value: sizeRef, type: BOOL, loc },
+          then: { kind: "dynCheck", value: sizeRef, type: F64, loc },
+          else_: {
+            kind: "libCall",
+            fn: "error.argTypeThrow",
+            args: [
+              { kind: "strLit", value: "size", type: STRING, loc },
+              { kind: "strLit", value: "of type number", type: STRING, loc },
+              sizeRef,
+            ],
+            type: F64,
+            loc,
+          },
+          type: F64,
+          loc,
+        };
+  const sz: IrExpr = { kind: "varRef", localId: "sz.0", type: F64, loc };
+  const fresh: IrExpr = { kind: "bytesNew", source: checkedBufferSize(L, sz, loc), type: BYTES_U8, loc };
+  const fillRef: IrExpr | null = fill === null ? null : { kind: "varRef", localId: "f.0", type: fill.type, loc };
+  let result: IrExpr = fresh;
+  if (fill !== null && fillRef !== null) {
+    const fargs: IrExpr[] = fill.method === "fillStr"
+      ? [fillRef, { kind: "strLit", value: fill.enc, type: STRING, loc }]
+      : [fillRef];
+    result = { kind: "bytesIntrinsic", method: fill.method, receiver: fresh, args: fargs, type: BYTES_U8, loc };
+  }
+  const name = `%buffer.alloc.${L.inspectHelpers.size}`;
+  L.inspectHelpers.set(key, name);
+  const params = [
+    { localId: "n.0", name: "n", type: sizeT },
+    ...(fill === null ? [] : [{ localId: "f.0", name: "f", type: fill.type }]),
+  ];
+  L.liftedFns.push({
+    name,
+    params,
+    returnType: BYTES_U8,
+    locals: [
+      ...params.map((q) => ({ id: q.localId, name: q.name, type: q.type, mutable: false })),
+      { id: "sz.0", name: "sz", type: F64, mutable: false },
+    ],
+    body: [
+      { kind: "varDecl", localId: "sz.0", init: num, loc },
+      { kind: "return", value: result, loc },
+    ],
+    loc,
+  });
+  return name;
+}
+
+/** The validated size: Node's validateNumber(size, "size", 0, kMaxLength)
+ * range clause — NaN fails it too — throwing ERR_OUT_OF_RANGE with the
+ * "Received" rendering of lib/internal/errors.js (bufferReceivedHelper).
+ * `size` is a pure read (re-emitted). */
+function checkedBufferSize(L: Lowerer, size: IrExpr, loc: SrcLoc): IrExpr {
+  const n = (value: number): IrExpr => ({ kind: "numLit", value, type: F64, loc });
+  const inRange: IrExpr = {
+    kind: "logical",
+    op: "&&",
+    left: { kind: "bin", op: ">=", left: size, right: n(0), type: BOOL, loc },
+    right: { kind: "bin", op: "<=", left: size, right: n(Number.MAX_SAFE_INTEGER), type: BOOL, loc },
+    type: BOOL,
+    loc,
+  };
+  const message: IrExpr = {
+    kind: "strConcat",
+    left: {
+      kind: "strLit",
+      value: `The value of "size" is out of range. It must be >= 0 && <= ${Number.MAX_SAFE_INTEGER}. Received `,
+      type: STRING,
+      loc,
+    },
+    right: { kind: "call", callee: bufferReceivedHelper(L, loc), args: [size], type: STRING, loc },
+    type: STRING,
+    loc,
+  };
+  return {
+    kind: "ternary",
+    cond: inRange,
+    then: size,
+    else_: {
+      kind: "libCall",
+      fn: "error.nodeThrow",
+      args: [n(2), { kind: "strLit", value: "ERR_OUT_OF_RANGE", type: STRING, loc }, message],
+      type: F64,
+      loc,
+    },
+    type: F64,
+    loc,
+  };
+}
+
+/** `%errors.received(n): string` — ERR_OUT_OF_RANGE's "Received" text for
+ * a number: an integer past 2 ** 32 in magnitude gets
+ * addNumericalSeparator over String(n) ("9_007_199_254_740_992"; the
+ * underscore walk runs over the STRING, quirks included), everything else
+ * is inspect's formatNumber (NaN, Infinity, -0). Interned once per module. */
+function bufferReceivedHelper(L: Lowerer, loc: SrcLoc): string {
+  const key = "errors:received";
+  const existing = L.inspectHelpers.get(key);
+  if (existing) return existing;
+  const name = `%errors.received.${L.inspectHelpers.size}`;
+  const num = (value: number): IrExpr => ({ kind: "numLit", value, type: F64, loc });
+  const ref = (id: string, type: IrType): IrExpr => ({ kind: "varRef", localId: id, type, loc });
+  const nv = ref("n.0", F64);
+  const sv = ref("s.0", STRING);
+  const iv = ref("i.0", F64);
+  const rv = ref("r.0", STRING);
+  const bin = (op: "+" | "-" | ">" | ">=" | "===", l: IrExpr, r: IrExpr): IrExpr => ({
+    kind: "bin",
+    op,
+    left: l,
+    right: r,
+    type: op === "+" || op === "-" ? F64 : BOOL,
+    loc,
+  });
+  const and = (l: IrExpr, r: IrExpr): IrExpr => ({ kind: "logical", op: "&&", left: l, right: r, type: BOOL, loc });
+  const slice = (args: IrExpr[]): IrExpr => ({ kind: "strIntrinsic", method: "slice", receiver: sv, args, type: STRING, loc });
+  const cat = (l: IrExpr, r: IrExpr): IrExpr => ({ kind: "strConcat", left: l, right: r, type: STRING, loc });
+  const isBigInteger = and(
+    and(
+      bin("===", { kind: "libCall", fn: "math.trunc", args: [nv], type: F64, loc }, nv),
+      bin("===", bin("-", nv, nv), num(0)), // finite
+    ),
+    bin(">", { kind: "libCall", fn: "math.abs", args: [nv], type: F64, loc }, num(2 ** 32)),
+  );
+  const body: IrStmt[] = [
+    {
+      kind: "if",
+      cond: isBigInteger,
+      then: [
+        { kind: "varDecl", localId: "s.0", init: { kind: "toString", operand: nv, type: STRING, loc }, loc },
+        { kind: "varDecl", localId: "r.0", init: { kind: "strLit", value: "", type: STRING, loc }, loc },
+        { kind: "varDecl", localId: "i.0", init: { kind: "strIntrinsic", method: "length", receiver: sv, args: [], type: F64, loc }, loc },
+        {
+          kind: "varDecl",
+          localId: "st.0",
+          init: {
+            kind: "ternary",
+            cond: bin("===", { kind: "strIntrinsic", method: "charCodeAt", receiver: sv, args: [num(0)], type: F64, loc }, num(45)),
+            then: num(1),
+            else_: num(0),
+            type: F64,
+            loc,
+          },
+          loc,
+        },
+        {
+          kind: "while",
+          cond: bin(">=", iv, bin("+", ref("st.0", F64), num(4))),
+          body: [
+            { kind: "assign", localId: "r.0", value: cat(cat({ kind: "strLit", value: "_", type: STRING, loc }, slice([bin("-", iv, num(3)), iv])), rv), loc },
+            { kind: "assign", localId: "i.0", value: bin("-", iv, num(3)), loc },
+          ],
+          loc,
+        },
+        { kind: "return", value: cat(slice([num(0), iv]), rv), loc },
+      ],
+      else_: null,
+      loc,
+    },
+    { kind: "return", value: { kind: "libCall", fn: "insp.f64", args: [nv], type: STRING, loc }, loc },
+  ];
+  L.inspectHelpers.set(key, name);
+  L.liftedFns.push({
+    name,
+    params: [{ localId: "n.0", name: "n", type: F64 }],
+    returnType: STRING,
+    locals: [
+      { id: "n.0", name: "n", type: F64, mutable: false },
+      { id: "s.0", name: "s", type: STRING, mutable: false },
+      { id: "r.0", name: "r", type: STRING, mutable: true },
+      { id: "i.0", name: "i", type: F64, mutable: true },
+      { id: "st.0", name: "st", type: F64, mutable: false },
+    ],
+    body,
+    loc,
+  });
+  return name;
+}
 
 /** `Object.keys/values/entries` over an INDEX-SIGNATURE (overflow-carrying)
    * record shape: declared fields answer first from the compile-time field

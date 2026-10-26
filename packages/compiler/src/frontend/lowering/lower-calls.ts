@@ -21,7 +21,7 @@ import { droppableStatic, lowerPromiseAllTupleCall, lowerPromiseRejectCall, prob
 import { httpClientFnBindingOf, isStreamUndefCallExpr, lowerHttpClientFnCall } from "./lower-server.js";
 import { EMITTER_API_MEMBERS, exactInstanceClassOf, findGenericMethodOn, lowerClassGenericMethodCall, lowerStaticMethodCall, type ClassInfo } from "./lower-classes.js";
 import { emitterRooted, lowerEmitterMethodCall } from "./lower-emitter.js";
-import { lowerConsoleInspectArg, lowerFormatCall } from "./lower-inspect.js";
+import { lowerConsoleInspectArg, lowerFormatCall, lowerRuntimeFormat, type RuntimeFormatArg } from "./lower-inspect.js";
 import { STREAM_API_MEMBERS, lowerStreamMethodCall, lowerStreamModuleCall, lowerStreamStaticCall, streamSidesOf } from "./lower-stream.js";
 import { ambientNsRootOf, ambientUndefReadType, ambientUndefVarRootOf, ambientUndefinedFnSymbolOf, contextualUndefReadType, fenceEarlyAliasUse, fenceEarlyNsMemberRef, nsMemberIdentOf, nsPathPrefix, nsUndefRead } from "./lower-namespaces.js";
 import { declSymbolOf } from "./lower-modules.js";
@@ -2903,7 +2903,10 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
           loc,
         };
       }
-      const args = expr.arguments.map((a) => {
+      // Each argument's VALUE first (the jsval fence, function boxing);
+      // its printed text second — the two steps a runtime format string
+      // splits (board #237).
+      const values: RuntimeFormatArg[] = expr.arguments.map((a) => {
         const lowered = L.lowerExpr(a);
         if (lowered.type.kind === "jsval") {
           // Node prints objects with util.inspect formatting, which
@@ -2915,26 +2918,10 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
             `${surface} of 'any' values (wrap it: ${surface}(\`\${v}\`), or validate with 'as <type>' first)`,
           );
         }
-        // Checked-dynamic values carry their own shape, so the runtime
-        // renders them exactly like Node's console formatter renders a
-        // non-format argument: strings VERBATIM, everything else through
-        // inspect at the rest-args depth 2 (formatWithOptions) — scalar
-        // kinds byte-exactly, boxed functions as [Function: name] /
-        // [Function (anonymous)], composites through the dyn walk
-        // (insp.dyn). Never throws — Node's console.log never does.
-        if (lowered.type.kind === "dyn") {
-          return {
-            kind: "libCall",
-            fn: "insp.dynS",
-            args: [lowered, { kind: "numLit", value: 2, type: F64, loc }],
-            type: STRING,
-            loc,
-          } satisfies IrExpr;
-        }
         // A function VALUE prints Node's [Function: name] form by boxing
         // across the checked-dynamic boundary (the box carries the
         // best-effort reference-site name — the documented naming stance)
-        // and rendering through the same dyn arm.
+        // and rendering through the dyn arm below.
         if (
           lowered.type.kind === "func" &&
           canBoxFuncIntoDyn(lowered.type, (id) => L.shapes.get(id), (id) => L.unions.get(id))
@@ -2947,10 +2934,38 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
             ...(name !== null ? { fnName: name } : {}),
             loc,
           };
+          return { node: a, value: boxed, noSpecs: "function values (Node's %s prints the function's source text)" };
+        }
+        return { node: a, value: lowered };
+      });
+      // A RUNTIME first string with further arguments (board #237): Node's
+      // formatWithOptions scan runs at run time over the format string
+      // (literal first arguments took the compile-time port above).
+      if (values.length > 1 && !expr.arguments.some(ts.isSpreadElement)) {
+        const formatted = lowerRuntimeFormat(L, values, "console", loc, surface);
+        if (formatted !== null) {
+          return {
+            kind: "intrinsic",
+            name: stdoutMember ? "console.log" : "console.error",
+            args: [formatted],
+            type: VOID,
+            loc,
+          };
+        }
+      }
+      const args = values.map(({ node: a, value: lowered }) => {
+        // Checked-dynamic values carry their own shape, so the runtime
+        // renders them exactly like Node's console formatter renders a
+        // non-format argument: strings VERBATIM, everything else through
+        // inspect at the rest-args depth 2 (formatWithOptions) — scalar
+        // kinds byte-exactly, boxed functions as [Function: name] /
+        // [Function (anonymous)], composites through the dyn walk
+        // (insp.dyn). Never throws — Node's console.log never does.
+        if (lowered.type.kind === "dyn") {
           return {
             kind: "libCall",
             fn: "insp.dynS",
-            args: [boxed, { kind: "numLit", value: 2, type: F64, loc }],
+            args: [lowered, { kind: "numLit", value: 2, type: F64, loc }],
             type: STRING,
             loc,
           } satisfies IrExpr;

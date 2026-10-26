@@ -8146,6 +8146,24 @@
     "<repo>/tests/corpus/2744-http-option-carry-dyn.cjs"
    ],
    "diags": []
+  },
+  "<repo>/tests/corpus/2745-bom-string-literals.ts": {
+   "order": [
+    "<repo>/tests/corpus/2745-bom-string-literals.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2746-format-runtime-string.ts": {
+   "order": [
+    "<repo>/tests/corpus/2746-format-runtime-string.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2747-buffer-alloc-size.ts": {
+   "order": [
+    "<repo>/tests/corpus/2747-buffer-alloc-size.ts"
+   ],
+   "diags": []
   }
  }
 }

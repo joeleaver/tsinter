@@ -510,6 +510,9 @@ const LIB_FN_SYMS: Record<string, string> = {
   "insp.dyn": "scr_insp_dyn",
   "insp.dynS": "scr_insp_dyn_s",
   "insp.dynHidden": "scr_insp_dyn_hidden",
+  // %j over a checked-dynamic value (scr_dyn_format_j) — runtime format
+  // strings reach it from every dyn argument (board #237).
+  "insp.jsonDyn": "scr_dyn_format_j",
   "fs.readFileSyncDyn": "scr_fs_read_file_sync_dyn",
   // Loose generic-shaped stragglers the burn-down surfaced alongside the
   // dyn head: the x509 PEM walks and stdin raw-mode throw catchably (the
