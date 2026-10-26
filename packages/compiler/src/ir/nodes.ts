@@ -6039,7 +6039,7 @@ export function moduleEmbedsCompressedNpm(mod: IrModule): boolean {
 
 /** True when the module contains any zlib libCall (the static lowering)
  * OR the embedded npm graph imports node:zlib (the island shim) — the
- * link switch that pulls scr_zlib.c + the system libz into the binary
+ * link switch that pulls scr_zlib.c + the vendored zlib into the binary
  * (cc.ts); zlib-free programs keep their exact link line. Same
  * generic-walk shape as moduleUsesRegex: `kind`/`fn` discriminants live
  * only on IR objects. */

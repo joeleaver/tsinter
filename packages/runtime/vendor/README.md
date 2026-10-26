@@ -21,15 +21,16 @@ The tree is a plain snapshot of the upstream commit with directories the library
 
 The engine archive (libqjs.a) is built lazily on the first `--dynamic` compile into `.cache/<commit>-<flavor>/` next to this file — one flavor per lane (plain, asan). The cache directory is gitignored and safe to delete.
 
-## zlib/
+## zlib-chromium/
 
-- Project: https://github.com/madler/zlib
-- Version: 1.3.1 (release tarball zlib-1.3.1.tar.gz, sha256 9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23)
-- License: zlib (see zlib/LICENSE)
+- Project: Chromium's fork of zlib, exactly as Node bundles it — Node v24.18.1's `deps/zlib` (https://github.com/nodejs/node/tree/v24.18.1/deps/zlib), which `process.versions.zlib` reports as `1.3.1-e00f703` (Chromium revision e00f703; upstream madler zlib 1.3.1, see README.chromium)
+- License: zlib (see zlib-chromium/LICENSE, Node's `deps/zlib/LICENSE`); the Chromium-authored files (chromeconf.h, cpu_features.*, the `*simd*` headers, contrib/optimizations/insert_string.h) are under Chromium's BSD-3-Clause licence, copied from Chromium's `src/LICENSE` to zlib-chromium/LICENSE.chromium
 
-The CROSS-target arm of node:zlib (see packages/runtime/src/scr_zlib.c): host builds keep the historical system `-lz` link (macOS ships libz), but zig's cross sysroots have no libz, so SCRIPTC_TARGET builds compile this vendored copy per target instead. Only the flat `*.c`/`*.h` at the distribution root are vendored (LICENSE beside them) — contrib, tests, build machinery, and docs are not. No vendored file is modified; the gz* file-I/O TUs are vendored for faithfulness but never compiled (nothing references the gzFile API — see ZLIB_SOURCES in packages/compiler/src/backend/cc.ts). To update, re-fetch the release tarball, copy the same flat set, and bump `ZLIB_VERSION` in cc.ts.
+node:zlib on the llvm and c lanes (see packages/runtime/src/scr_zlib.c, and scr_fetch.c's gzip/deflate response decoding). Every native zlib build compiles this copy — host and cross targets alike; no build links a system libz — because Chromium's deflate differs from canonical zlib's (a multiplicative `insert_string` hash, a four-byte `fill_window` insert, LIT_MEM symbol buffers), so a system libz's compressed bytes differ from Node's for about half of all inputs. With this copy and Node's driver (scr_zlib.c), the bytes are Node's, the same ones the wasm lane's port computes (SEMANTICS.md S101; packages/compiler/test/zlib-lanes.test.ts holds the lanes to Node over one table).
 
-The objects build lazily on the first zlib-using cross compile into `.cache/zlib-<version>-<flavor>/` next to this file — one flavor per driver/target (the lre-objects pattern). Zlib-free binaries never compile any of this; compressed OUTPUT bytes are zlib-version-dependent, which is why the corpus only compares round-trips and fixed-blob inflation.
+Vendored: the files Node's zlib.gyp compiles for a target without SIMD (adler32.c, cpu_features.c, crc32.c, deflate.c, inffast.c, inflate.c, inftrees.c, trees.c, zutil.c) and every header they include (gzguts.h only because zutil.c includes it), plus LICENSE and README.chromium. Not vendored: the gzFile units, infback.c, compress.c/uncompress.c (nothing calls them), the SIMD sources, contrib's other directories, BUILD.gn/zlib.gyp, tests. No vendored file is modified. The build is scalar exactly as zlib.gyp builds Node on such targets (`-DCPU_NO_SIMD`, plus `-DHAVE_HIDDEN` off Windows): the SIMD paths Node's x86/arm builds take are value-identical (checksums, slide_hash), so the bytes are the same on every CPU. One build choice differs from Node's: Node's copy of zconf.h comments out its `#include "chromeconf.h"` (Node exports plain zlib names to addons); cc.ts force-includes chromeconf.h (`-include`), and scr_zlib.c/scr_fetch.c include it before zlib.h, so every symbol is `Cr_z_`-prefixed as in Chromium and can never collide with a system libz another library loads — symbol names only, no code changes. To update, re-fetch the same file set from the new Node tag's `deps/zlib`, bump `ZLIB_VERSION` in packages/compiler/src/backend/cc.ts to the new `process.versions.zlib`, and re-run zlib-lanes.test.ts and wasm-zlib.test.ts (the wasm port, backend/wasm/zlib.ts, must follow the same revision).
+
+The objects build lazily on the first zlib-using compile into `.cache/zlib-<version>-<flavor>/` next to this file — one flavor per driver/target and lane (plain, asan; the lre-objects pattern). Zlib-free binaries never compile any of this.
 
 ## curl/
 

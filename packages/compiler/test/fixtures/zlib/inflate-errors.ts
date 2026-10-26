@@ -2,11 +2,12 @@
 // Z_FIXED, Z_HUFFMAN_ONLY, Z_RLE at memLevel 1, windowBits 9, Z_FILTERED at
 // memLevel 9), one hand-built input per zlib error (every message inflate
 // can raise, plus Node's "Missing dictionary" and "unexpected end of file"),
-// every truncation of several streams and a byte flip at every offset of
-// one. Each line prints the outcome: the output's length and sha256 prefix,
-// or the thrown Error's name, message and code. Node is the oracle for every
-// line (wasm-zlib.test.ts runs both); the data below was generated once with
-// Node's own zlib and a bit writer.
+// every truncation of several streams, a byte flip at every offset of one,
+// and seeded mutation fuzz. Each line prints the outcome: the output's
+// length and sha256 prefix, or the thrown Error's name, message and code.
+// Node is the oracle for every line, on every lane (zlib-lanes.test.ts runs
+// Node, wasm, c and llvm); the data below was generated once with Node's own
+// zlib and a bit writer.
 import { deflateSync, inflateSync } from "node:zlib";
 import { createHash } from "node:crypto";
 
@@ -218,4 +219,34 @@ for (let i = 0; i < l6.length; i++) {
   const m = Buffer.from(l6);
   m[i] = m[i]! ^ (1 << (i % 8));
   attempt(`flip@${i}`, m);
+}
+// seeded mutation fuzz of every stream above and of deflateSync's own
+// output (one byte, four bytes, or a byte near the header changed): the
+// decode-time errors past the header
+let seed = 20261026;
+function rnd(n: number): number {
+  seed = (seed * 48271) % 2147483647;
+  return seed % n;
+}
+const fuzzSources: [string, Buffer][] = [];
+for (const [label, hex] of STREAMS) fuzzSources.push([label, Buffer.from(hex, "hex")]);
+fuzzSources.push(["ours", ours]);
+const words: string[] = [];
+const VOCAB = ["deflate", "inflate", "window", "tree", "code", "length", "\n"];
+for (let i = 0; i < 2500; i++) words.push(VOCAB[rnd(VOCAB.length)]!);
+fuzzSources.push(["ours-words", deflateSync(Buffer.from(words.join(" ")))]);
+for (const [label, st] of fuzzSources) {
+  for (let k = 0; k < 40; k++) {
+    const m = Buffer.from(st);
+    const kind = rnd(4);
+    const at = rnd(m.length);
+    if (kind === 0) m[at] = m[at]! ^ (1 << rnd(8));
+    else if (kind === 1) m[at] = rnd(256);
+    else if (kind === 2) for (let j = 0; j < 4; j++) m[rnd(m.length)] = rnd(256);
+    else {
+      const h = Math.min(m.length - 1, 2 + rnd(8));
+      m[h] = m[h]! ^ (1 << rnd(8));
+    }
+    attempt(`mut-${label}-${k}`, m);
+  }
 }

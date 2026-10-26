@@ -9,6 +9,8 @@ const execFileAsync = promisify(execFile);
 const testDir = import.meta.dirname;
 const bin = join(testDir, "build", "test_bytes");
 let scratch: string;
+const zlibDir = join(testDir, "../vendor/zlib-chromium");
+const ZLIB_SOURCES = ["adler32.c", "cpu_features.c", "crc32.c", "deflate.c", "inffast.c", "inflate.c", "inftrees.c", "trees.c", "zutil.c"];
 
 // Compiled once with ASan + the RC audit: the assertions in test_bytes.c
 // cover the ToUint8/ToUint32 coercion matrix, ToIndex construction,
@@ -22,6 +24,12 @@ beforeAll(async () => {
     "-std=c11", "-O1", "-Wall", "-Wextra",
     "-fsanitize=address", "-DSCR_RC_AUDIT",
     "-I", join(testDir, "../src"),
+    // the vendored zlib every native build links (cc.ts's ZLIB_SOURCES /
+    // zlibDefines) — never a system libz
+    "-I", zlibDir,
+    "-DCPU_NO_SIMD",
+    "-include", join(zlibDir, "chromeconf.h"),
+    ...ZLIB_SOURCES.map((f) => join(zlibDir, f)),
     "-o", bin,
     join(testDir, "test_bytes.c"),
     join(testDir, "../src/scr_bytes.c"),
@@ -45,7 +53,6 @@ beforeAll(async () => {
     join(testDir, "../src/scr_path.c"),
     join(testDir, "../src/scr_url.c"),
     "-Wno-deprecated-declarations",
-    "-lz",
     ...(process.platform === "linux" ? ["-D_GNU_SOURCE", "-lm"] : []),
   ]);
   scratch = await mkdtemp(join(tmpdir(), "scriptc-bytes-"));

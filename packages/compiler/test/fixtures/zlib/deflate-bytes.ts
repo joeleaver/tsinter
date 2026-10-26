@@ -3,7 +3,8 @@
 // chunk, the 32 KiB window and MAX_DIST, 64 KiB, past 1 MiB), each kind of
 // data (incompressible, text, repetitive, low-entropy, structured); small
 // outputs print in full, large ones as their sha256. Every round trip is
-// checked. Node is the oracle for every line (wasm-zlib.test.ts runs both).
+// checked. Node is the oracle for every line, on every lane
+// (zlib-lanes.test.ts runs Node, wasm, c and llvm).
 import { deflateSync, inflateSync } from "node:zlib";
 import { createHash } from "node:crypto";
 

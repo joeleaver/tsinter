@@ -27,7 +27,13 @@
 #  endif /* !DYNAMIC_CRC_TABLE */
 #endif /* MAKECRCH */
 
+#include "deflate.h"
+#include "cpu_features.h"
 #include "zutil.h"      /* for Z_U4, Z_U8, z_crc_t, and FAR definitions */
+
+#if defined(CRC32_SIMD_SSE42_PCLMUL) || defined(CRC32_ARMV8_CRC32)
+#include "crc32_simd.h"
+#endif
 
  /*
   A CRC of a message is computed on N braids of words in the message, where
@@ -99,11 +105,12 @@
 #endif
 
 /* If available, use the ARM processor CRC32 instruction. */
-#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32) && W == 8
-#  define ARMCRC32
+#if defined(__aarch64__) && defined(__ARM_FEATURE_CRC32) && W == 8 \
+    && defined(USE_CANONICAL_ARMV8_CRC32)
+#  define ARMCRC32_CANONICAL_ZLIB
 #endif
 
-#if defined(W) && (!defined(ARMCRC32) || defined(DYNAMIC_CRC_TABLE))
+#if defined(W) && (!defined(ARMCRC32_CANONICAL_ZLIB) || defined(DYNAMIC_CRC_TABLE))
 /*
   Swap the bytes in a z_word_t to convert between little and big endian. Any
   self-respecting compiler will optimize this to a single machine byte-swap
@@ -306,8 +313,8 @@ local once_t made = ONCE_INIT;
   information needed to generate CRCs on data a byte at a time for all
   combinations of CRC register values and incoming bytes.
  */
-
-local void make_crc_table(void) {
+local void make_crc_table(void)
+{
     unsigned i, j, n;
     z_crc_t p;
 
@@ -562,7 +569,7 @@ const z_crc_t FAR * ZEXPORT get_crc_table(void) {
  * -march=armv8-a+crc, or -march=native if the compile machine has the crc32
  * instructions.
  */
-#ifdef ARMCRC32
+#if ARMCRC32_CANONICAL_ZLIB
 
 /*
    Constants empirically determined to maximize speed. These values are from
@@ -693,13 +700,78 @@ local z_word_t crc_word_big(z_word_t data) {
 /* ========================================================================= */
 unsigned long ZEXPORT crc32_z(unsigned long crc, const unsigned char FAR *buf,
                               z_size_t len) {
-    /* Return initial CRC, if requested. */
-    if (buf == Z_NULL) return 0;
+
+    /* If no optimizations are enabled, do it as canonical zlib. */
+#if !defined(CRC32_SIMD_SSE42_PCLMUL) && !defined(CRC32_ARMV8_CRC32) && \
+    !defined(RISCV_RVV) && !defined(CRC32_SIMD_AVX512_PCLMUL)
+    if (buf == Z_NULL) {
+        return 0UL;
+    }
+#else
+    /*
+     * zlib convention is to call crc32(0, NULL, 0); before making
+     * calls to crc32(). So this is a good, early (and infrequent)
+     * place to cache CPU features if needed for those later, more
+     * interesting crc32() calls.
+     */
+    if (buf == Z_NULL) {
+        if (!len)
+            cpu_check_features();
+        return 0UL;
+    }
+#endif
+    /* If AVX-512 is enabled, we will use it for longer inputs and fallback
+     * to SSE4.2 and eventually the portable implementation to handle the tail.
+     */
+#if defined(CRC32_SIMD_AVX512_PCLMUL)
+    if (x86_cpu_enable_avx512 && len >= Z_CRC32_AVX512_MINIMUM_LENGTH) {
+        /* crc32 64-byte chunks */
+        z_size_t chunk_size = len & ~Z_CRC32_AVX512_CHUNKSIZE_MASK;
+        crc = ~crc32_avx512_simd_(buf, chunk_size, ~(uint32_t)crc);
+        /* check remaining data */
+        len -= chunk_size;
+        if (!len)
+            return crc;
+        /* Fall into the default crc32 for the remaining data. */
+        buf += chunk_size;
+    }
+#endif
+#if defined(CRC32_SIMD_SSE42_PCLMUL)
+    if (x86_cpu_enable_simd && len >= Z_CRC32_SSE42_MINIMUM_LENGTH) {
+        /* crc32 16-byte chunks */
+        z_size_t chunk_size = len & ~Z_CRC32_SSE42_CHUNKSIZE_MASK;
+        crc = ~crc32_sse42_simd_(buf, chunk_size, ~(uint32_t)crc);
+        /* check remaining data */
+        len -= chunk_size;
+        if (!len)
+            return crc;
+        /* Fall into the default crc32 for the remaining data. */
+        buf += chunk_size;
+    }
+#elif defined(CRC32_ARMV8_CRC32)
+    if (arm_cpu_enable_crc32) {
+#if defined(__aarch64__)
+        /* PMULL is 64bit only, plus code needs at least a 64 bytes buffer. */
+        if (arm_cpu_enable_pmull && (len > Z_CRC32_PMULL_MINIMUM_LENGTH)) {
+            const size_t chunk_size = len & ~Z_CRC32_PMULL_CHUNKSIZE_MASK;
+            crc = ~armv8_crc32_pmull_little(buf, chunk_size, ~(uint32_t)crc);
+            /* Check remaining data. */
+            len -= chunk_size;
+            if (!len)
+                return crc;
+
+            /* Fall through for the remaining data. */
+            buf += chunk_size;
+        }
+#endif
+        /* This is scalar and self contained, used on Armv8@32bit or tail. */
+        return armv8_crc32_little(buf, len, crc);
+    }
+#endif /* CRC32_SIMD */
 
 #ifdef DYNAMIC_CRC_TABLE
     once(&made, make_crc_table);
 #endif /* DYNAMIC_CRC_TABLE */
-
     /* Pre-condition the CRC */
     crc = (~crc) & 0xffffffff;
 
@@ -1014,7 +1086,43 @@ unsigned long ZEXPORT crc32_z(unsigned long crc, const unsigned char FAR *buf,
 /* ========================================================================= */
 unsigned long ZEXPORT crc32(unsigned long crc, const unsigned char FAR *buf,
                             uInt len) {
-    return crc32_z(crc, buf, len);
+    /* Some bots compile with optimizations disabled, others will emulate
+     * ARM on x86 and other weird combinations.
+     */
+#if defined(CRC32_SIMD_SSE42_PCLMUL) || defined(CRC32_ARMV8_CRC32) \
+    || defined(RISCV_RVV)
+    /* We got to verify CPU features, so exploit the common usage pattern
+     * of calling this function with Z_NULL for an initial valid crc value.
+     * This allows to cache the result of the feature check and avoid extraneous
+     * function calls.
+     */
+    if (buf == Z_NULL) {
+        if (!len) /* Assume user is calling crc32(0, NULL, 0); */
+            cpu_check_features();
+        return 0UL;
+    }
+#endif
+
+#if defined(CRC32_ARMV8_CRC32)
+    if (arm_cpu_enable_crc32) {
+#if defined(__aarch64__)
+        /* PMULL is 64bit only, plus code needs at least a 64 bytes buffer. */
+        if (arm_cpu_enable_pmull && (len > Z_CRC32_PMULL_MINIMUM_LENGTH)) {
+            const size_t chunk_size = len & ~Z_CRC32_PMULL_CHUNKSIZE_MASK;
+            crc = ~armv8_crc32_pmull_little(buf, chunk_size, ~(uint32_t)crc);
+            /* Check remaining data. */
+            len -= chunk_size;
+            if (!len)
+                return crc;
+
+            /* Fall through for the remaining data. */
+            buf += chunk_size;
+        }
+#endif
+        return armv8_crc32_little(buf, len, crc); /* Armv8@32bit or tail. */
+    }
+#endif
+    return crc32_z(crc, buf, len); /* Armv7 or Armv8 w/o crypto extensions. */
 }
 
 /* ========================================================================= */
@@ -1029,7 +1137,6 @@ uLong ZEXPORT crc32_combine64(uLong crc1, uLong crc2, z_off64_t len2) {
 uLong ZEXPORT crc32_combine(uLong crc1, uLong crc2, z_off_t len2) {
     return crc32_combine64(crc1, crc2, (z_off64_t)len2);
 }
-
 /* ========================================================================= */
 uLong ZEXPORT crc32_combine_gen64(z_off64_t len2) {
 #ifdef DYNAMIC_CRC_TABLE
@@ -1046,4 +1153,40 @@ uLong ZEXPORT crc32_combine_gen(z_off_t len2) {
 /* ========================================================================= */
 uLong ZEXPORT crc32_combine_op(uLong crc1, uLong crc2, uLong op) {
     return multmodp(op, crc1) ^ (crc2 & 0xffffffff);
+}
+
+ZLIB_INTERNAL void crc_reset(deflate_state *const s)
+{
+#ifdef CRC32_SIMD_SSE42_PCLMUL
+    if (x86_cpu_enable_simd) {
+        crc_fold_init(s);
+        return;
+    }
+#endif
+    s->strm->adler = crc32(0L, Z_NULL, 0);
+}
+
+ZLIB_INTERNAL void crc_finalize(deflate_state *const s)
+{
+#ifdef QAT_COMPRESSION_ENABLED
+    if (s->qat_s) {
+        return;
+    }
+#endif
+#ifdef CRC32_SIMD_SSE42_PCLMUL
+    if (x86_cpu_enable_simd)
+        s->strm->adler = crc_fold_512to32(s);
+#endif
+}
+
+ZLIB_INTERNAL void copy_with_crc(z_streamp strm, Bytef *dst, long size)
+{
+#ifdef CRC32_SIMD_SSE42_PCLMUL
+    if (x86_cpu_enable_simd) {
+        crc_fold_copy(strm->state, dst, strm->next_in, size);
+        return;
+    }
+#endif
+    zmemcpy(dst, strm->next_in, size);
+    strm->adler = crc32(strm->adler, dst, size);
 }

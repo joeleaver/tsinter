@@ -207,6 +207,7 @@ int ZEXPORT inflateInit2_(z_streamp strm, int windowBits,
     state->strm = strm;
     state->window = Z_NULL;
     state->mode = HEAD;     /* to pass state test in inflateReset2() */
+    state->check = 1L;      /* 1L is the result of adler32() zero length data */
     ret = inflateReset2(strm, windowBits);
     if (ret != Z_OK) {
         ZFREE(strm, state);
@@ -995,11 +996,11 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
             }
 
             /* build code tables -- note: do not change the lenbits or distbits
-               values here (9 and 6) without reading the comments in inftrees.h
+               values here (10 and 9) without reading the comments in inftrees.h
                concerning the ENOUGH constants, which depend on those values */
             state->next = state->codes;
             state->lencode = (const code FAR *)(state->next);
-            state->lenbits = 9;
+            state->lenbits = 10;
             ret = inflate_table(LENS, state->lens, state->nlen, &(state->next),
                                 &(state->lenbits), state->work);
             if (ret) {
@@ -1008,7 +1009,7 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
                 break;
             }
             state->distcode = (const code FAR *)(state->next);
-            state->distbits = 6;
+            state->distbits = 9;
             ret = inflate_table(DISTS, state->lens + state->nlen, state->ndist,
                             &(state->next), &(state->distbits), state->work);
             if (ret) {
@@ -1024,7 +1025,8 @@ int ZEXPORT inflate(z_streamp strm, int flush) {
             state->mode = LEN;
                 /* fallthrough */
         case LEN:
-            if (have >= 6 && left >= 258) {
+            if (have >= INFLATE_FAST_MIN_INPUT &&
+                left >= INFLATE_FAST_MIN_OUTPUT) {
                 RESTORE();
                 inflate_fast(strm, out);
                 LOAD();

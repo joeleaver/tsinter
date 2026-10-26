@@ -2,38 +2,25 @@
  * Node v24.18.1 bundles (Chromium's fork, "1.3.1-e00f703") — against
  * Node's own zlib, live.
  *
- * Two layers. The first links the builder's real deflateSync / inflateSync
- * into a standalone module (wasm-zlib-standalone.ts) and compares them
- * in-process with this process's `node:zlib` over many inputs: deflate's
- * bytes at the default level and at every level, round trips both ways,
- * Node-produced streams, one hand-built input per inflate error, every
- * truncation of several streams, and seeded mutation fuzz. The second
- * compiles programs through the whole pipeline (the emitter's libCall
- * wiring and its error ladder) and compares their stdout with Node's run
- * of the same source: corpus 1404 and the two fixtures under
- * fixtures/zlib/.
+ * This file links the builder's real deflateSync / inflateSync into a
+ * standalone module (wasm-zlib-standalone.ts) and compares them in-process
+ * with this process's `node:zlib` over many inputs: deflate's bytes at the
+ * default level and at every level, round trips both ways, Node-produced
+ * streams, one hand-built input per inflate error, every truncation of
+ * several streams, and seeded mutation fuzz. Compiled programs — through
+ * the whole pipeline, on the wasm, c and llvm lanes alike, against Node's
+ * run of the same source — are zlib-lanes.test.ts's one shared table.
  *
- * Errors: Node's are plain Errors with `code` and `errno`; this tier
+ * Errors: Node's are plain Errors with `code` and `errno`; every lane
  * carries name, message and code (SEMANTICS.md S101 (a)), so rows compare
  * message and code, and Z-ERR-01 pins Node's errno for each code. */
-import { spawnSync } from "node:child_process";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import * as zlib from "node:zlib";
-import { afterAll, beforeAll, describe, expect, test } from "vitest";
-import { compile } from "../src/index.js";
-import { runWasm } from "./wasm-host.js";
+import { beforeAll, describe, expect, test } from "vitest";
 import { buildZlibModule, type ZlibModule } from "./wasm-zlib-standalone.js";
 
 let z: ZlibModule;
-let scratch: string;
 beforeAll(async () => {
   z = await buildZlibModule();
-  scratch = await mkdtemp(join(tmpdir(), "tsinter-wasm-zlib-"));
-});
-afterAll(async () => {
-  await rm(scratch, { recursive: true, force: true });
 });
 
 /* ── inputs ───────────────────────────────────────────────────────────── */
@@ -417,43 +404,6 @@ describe("zlib.ts in a standalone module, against node:zlib in process", () => {
     // the fuzz reaches the decode-time errors, not only the header's
     for (const m of ["invalid distance too far back", "invalid literal/lengths set", "invalid code lengths set", "incorrect data check", "unexpected end of file"]) {
       expect([...hist.keys()].some((k) => k.includes(m)), m).toBe(true);
-    }
-  }, 120000);
-});
-
-/* ── layer 2: compiled programs against Node's run of the same source ──── */
-
-describe("compiled programs: stdout equals Node's run of the same source", () => {
-  async function both(file: string): Promise<{ ours: string; node: string }> {
-    const dir = await mkdtemp(join(scratch, "p-"));
-    const res = await compile(file, { outPath: join(dir, "p.wasm"), outDir: dir, backend: "wasm" });
-    if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
-    const run = await runWasm(res.binaryPath);
-    expect(run.stderr).toBe("");
-    expect(run.exitCode).toBe(0);
-    const n = spawnSync(process.execPath, ["--experimental-transform-types", "--no-warnings", file], { maxBuffer: 1 << 26 });
-    expect(n.status).toBe(0);
-    return { ours: run.stdout, node: n.stdout.toString("utf8") };
-  }
-
-  test("Z-PROG-01 corpus 1404-zlib-crypto-bytes.ts", async () => {
-    const r = await both(join(import.meta.dirname, "../../../tests/corpus/1404-zlib-crypto-bytes.ts"));
-    expect(r.ours).toBe(r.node);
-    expect(r.ours).toContain("corrupt incorrect header check\ntruncated unexpected end of file\n");
-  }, 120000);
-
-  test("Z-PROG-02 fixtures/zlib/deflate-bytes.ts: deflate bytes over every kind and boundary size, through the emitter", async () => {
-    const r = await both(join(import.meta.dirname, "fixtures/zlib/deflate-bytes.ts"));
-    expect(r.ours.split("\n").length).toBeGreaterThan(200);
-    expect(r.ours).toBe(r.node);
-  }, 120000);
-
-  test("Z-PROG-03 fixtures/zlib/inflate-errors.ts: every error row, truncation and byte flip, through the emitter's error ladder", async () => {
-    const r = await both(join(import.meta.dirname, "fixtures/zlib/inflate-errors.ts"));
-    expect(r.ours.split("\n").length).toBeGreaterThan(2000);
-    expect(r.ours).toBe(r.node);
-    for (const m of ["Missing dictionary Z_NEED_DICT", "unexpected end of file Z_BUF_ERROR", "too many length or distance symbols Z_DATA_ERROR"]) {
-      expect(r.ours).toContain(m);
     }
   }, 120000);
 });

@@ -4884,10 +4884,11 @@ bool scr_process_stderr_write_bytes(const ScrBytes *b);
  * scr_bytes.c's fs forms. */
 void scr_fs_throw(int e, const char *op, const ScrStr *path);
 
-/* ── zlib (scr_zlib.c — compiled and linked with -lz only when the
- * program uses zlib, like scr_regex.c/libregexp; see cc.ts) ──────────
+/* ── zlib (scr_zlib.c — compiled and linked with the vendored zlib
+ * only when the program uses zlib, like scr_regex.c/libregexp; see cc.ts) ──────────
  * deflateSync/inflateSync over u8 bytes with Node's default options
- * (zlib format, default level/windowBits). deflate never throws (OOM
+ * (zlib format, default level/windowBits), driven as Node drives the same
+ * zlib so deflate bytes are Node's. deflate never throws (OOM
  * aborts); inflate of corrupt input THROWS Node's error catchably
  * ("incorrect header check", ...). Borrow their input; results +1. */
 ScrBytes *scr_zlib_deflate(const ScrBytes *data);

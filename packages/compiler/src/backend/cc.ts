@@ -21,12 +21,14 @@ const QJS_COMMIT = "3c8f3d68953955950074c41c6e4d999562ae82a7";
  * fingerprint so cached binaries re-key too. */
 const MBEDTLS_VERSION = "3.6.7";
 
-/** The pinned zlib snapshot under packages/runtime/vendor/zlib (see
- * vendor/README.md — update both together). Keys the per-target object
- * cache and joins the runtime fingerprint. Host builds never compile it —
- * they keep the historical system `-lz` link; the vendored copy exists so
- * zlib-using programs CROSS-compile (zig has no target sysroot libz). */
-const ZLIB_VERSION = "1.3.1";
+/** The pinned zlib snapshot under packages/runtime/vendor/zlib-chromium:
+ * the Chromium fork Node v24.18.1 bundles, named as Node names it
+ * (`process.versions.zlib`; see vendor/README.md — update both together).
+ * Keys the per-flavor object cache and joins the runtime fingerprint.
+ * EVERY native zlib build compiles it — host and cross alike, no system
+ * `-lz` — so deflate's bytes are Node's on every target (SEMANTICS.md
+ * S101). */
+const ZLIB_VERSION = "1.3.1-e00f703";
 
 export interface CcOptions {
   /** Path of the generated (or hand-written) program TU: a .c file, or the
@@ -78,13 +80,9 @@ export interface CcOptions {
   netIsland?: boolean;
   /** The program uses zlib (index.ts detects zlib.* libCalls on the IR):
    * compiles scr_zlib.c — the regex/curl gating precedent, so zlib-free
-   * binaries keep their exact link line. Host builds link the SYSTEM libz
-   * (macOS ships it), byte-identical to the historical line; cross targets
-   * compile the vendored zlib per target instead (ensureZlibObjects — zig
-   * has no libz in its sysroots). Compressed bytes may differ between the
-   * system and vendored libraries, which is why the corpus only ever
-   * compares round-trips and fixed-blob inflation, never raw deflate
-   * output. */
+   * binaries keep their exact link line — and links the vendored zlib
+   * Node itself bundles (ensureZlibObjects, per flavor and target; no
+   * system libz on any target), so deflate's bytes are Node's. */
   zlib?: boolean;
   /** The program uses node:assert (index.ts detects assert.* libCalls on
    * the IR): compiles scr_assert.c — the zlib gating precedent, so
@@ -236,8 +234,8 @@ export function runtimeSrcDir(): string {
  * the scr_platform.h contract with kqueue and epoll backends; libregexp,
  * zlib, mbedTLS, and the engine archive (--dynamic) build per target
  * (ensureLreObjects / ensureZlibObjects / ensureTlsArchive /
- * buildEngineArchiveCross — host zlib builds still link the system libz,
- * byte-identically).
+ * buildEngineArchiveCross — zlib builds the same vendored objects on
+ * hosts too).
  * Windows triples (x86_64-windows-gnu, mingw-w64 headers and CRT via zig)
  * have no gates left: events, net/http, fetch, watch, zlib, dgram/dns,
  * tls, and the engine archive (--dynamic) all build per target through
@@ -518,24 +516,43 @@ async function ensureLreObjects(sanitize: boolean, driver: CcDriver): Promise<st
 }
 
 function vendorZlibDir(): string {
-  return join(runtimeSrcDir(), "..", "vendor", "zlib");
+  return join(runtimeSrcDir(), "..", "vendor", "zlib-chromium");
 }
 
-/** The vendored zlib TUs behind CROSS-target zlib support: every root *.c
- * except the gzFile file-I/O units (gz*.c — nothing in scr_zlib.c
- * references the gzFile API, and those TUs alone want unistd/io headers).
- * Host builds never touch this list — they link the system libz. */
-const ZLIB_SOURCES = ["adler32.c", "compress.c", "crc32.c", "deflate.c", "infback.c", "inffast.c", "inflate.c", "inftrees.c", "trees.c", "uncompr.c", "zutil.c"];
+/** The vendored zlib TUs every native zlib build links: the codec core
+ * scr_zlib.c and scr_fetch.c's gzip decoder reach (deflate/inflate,
+ * checksums, the scalar cpu_features stub). The gzFile, infback and
+ * compress/uncompress units are not vendored — nothing calls them. */
+const ZLIB_SOURCES = ["adler32.c", "cpu_features.c", "crc32.c", "deflate.c", "inffast.c", "inflate.c", "inftrees.c", "trees.c", "zutil.c"];
+
+/** The defines Node's zlib.gyp gives its `zlib` target on a target with
+ * no SIMD path: CPU_NO_SIMD (the scalar build — every SIMD path is
+ * value-identical, the multiplicative insert_string hash is scalar
+ * arithmetic, so the bytes are Node's on every CPU) and HAVE_HIDDEN off
+ * Windows (codec internals stay out of the binary's dynamic symbols),
+ * plus the Chromium symbol prefix below. */
+function zlibDefines(driver: CcDriver): string[] {
+  return [
+    "-DCPU_NO_SIMD",
+    ...(targetPlatform(driver) === "win32" ? [] : ["-DHAVE_HIDDEN"]),
+    // Chromium's Cr_z_ symbol prefix. Node's copy of zconf.h comments
+    // out this include (Node exports plain zlib names to addons); forcing
+    // it here keeps the codec from ever binding to — or being bound by — a
+    // system libz another library drags in. Symbol names only: no
+    // generated code changes. scr_zlib.c / scr_fetch.c include it the same
+    // way before zlib.h.
+    "-include", join(vendorZlibDir(), "chromeconf.h"),
+  ];
+}
 
 /** The zlib objects for one flavor, compiled lazily on the first zlib-using
- * CROSS build (~1s) and cached like the lre objects —
+ * build (~1s) and cached like the lre objects —
  * vendor/.cache/zlib-<version>-<flavor>/*.o — with the same atomic-rename
  * publish (parallel first builds race safely; losers discard their work).
  * Plain is -Os, asan matches the final link so the sanitized lane
  * instruments the codec too. The flavor keys the driver and target exactly
- * like the lre flavor: only cross builds call this today, but the keying
- * must never hand a zig-built object set to a clang link off a shared
- * directory. */
+ * like the lre flavor, so a zig-built object set never reaches a clang
+ * link off a shared directory. */
 async function ensureZlibObjects(sanitize: boolean, driver: CcDriver): Promise<string[]> {
   const flavor =
     (sanitize ? "asan" : "plain") +
@@ -560,6 +577,7 @@ async function ensureZlibObjects(sanitize: boolean, driver: CcDriver): Promise<s
           "-std=c11",
           ...driver.targetArgs,
           ...(sanitize ? ["-O1", "-fsanitize=address"] : ["-Os"]),
+          ...zlibDefines(driver),
           "-I", vendor,
           "-c", join(vendor, f),
           "-o", join(buildDir, f.replace(/\.c$/, ".o")),
@@ -716,9 +734,9 @@ async function ensureTlsArchive(sanitize: boolean, driver: CcDriver): Promise<st
  * units a library may reach are the pure-data ones (regex + the vendored matcher, assert,
  * inspect, symbol, searchParams, emitter+dyn_handle, zlib); every
  * loop-hooked or ambient unit was refused at SC4005 before emission.
- * External-symbol contract: undefined references only to libc/libm — which
- * is why zlib rides the VENDORED per-flavor objects here even on hosts
- * (the executable lane's system `-lz` cannot ride inside an archive). */
+ * External-symbol contract: undefined references only to libc/libm — zlib
+ * rides the VENDORED per-flavor objects into the archive, the same objects
+ * every executable links. */
 
 /** The library base: the executable lane's unconditional sources minus the
  * fiber/loop and child-process units, plus the library-mode TU. */
@@ -1065,13 +1083,11 @@ export async function compileC(opts: CcOptions): Promise<void> {
   // ours would collide; see scr_regex.c) — the standalone objects are for
   // static builds only.
   const lreObjects = regex && !dynamic ? await ensureLreObjects(opts.sanitize ?? false, driver) : [];
-  // Vendored zlib is the CROSS story only — host builds keep the exact
-  // historical `-lz` system link (see CcOptions.zlib). The native fetch's
-  // gzip decoder rides the same objects/link.
+  // The vendored zlib (Node's own) on every target — host builds link it
+  // too, never the system `-lz` (see CcOptions.zlib). The native fetch's
+  // gzip decoder rides the same objects.
   const zlibObjects =
-    ((opts.zlib ?? false) || nativeFetch) && driver.target !== null
-      ? await ensureZlibObjects(opts.sanitize ?? false, driver)
-      : [];
+    (opts.zlib ?? false) || nativeFetch ? await ensureZlibObjects(opts.sanitize ?? false, driver) : [];
   // The libcurl import stub is likewise CROSS-only — host builds keep the
   // exact historical system `-lcurl` link (see CcOptions.fetch). Curl
   // reference builds only.
@@ -1120,18 +1136,12 @@ export async function compileC(opts: CcOptions): Promise<void> {
     ...(opts.dynInvoke ? [rt(join(rtDir, "scr_dyn_invoke.c"))] : []),
     ...(opts.dc ? [rt(join(rtDir, "scr_dc.c"))] : []),
     ...(opts.dynAsync || opts.dynInvoke || opts.dc ? [rt(join(rtDir, "scr_async_dyn.c"))] : []),
-    // The zlib UNIT (scr_zlib.c) gates on zlib.* IR use; the LINK (system
-    // libz on hosts, the vendored per-target objects on cross builds)
-    // also serves the native fetch's gzip decoder — spread exactly once.
-    ...(opts.zlib
-      ? driver.target !== null
-        ? ["-I", vendorZlibDir(), rt(join(rtDir, "scr_zlib.c")), ...zlibObjects]
-        : [rt(join(rtDir, "scr_zlib.c")), "-lz"]
-      : nativeFetch
-        ? driver.target !== null
-          ? ["-I", vendorZlibDir(), ...zlibObjects]
-          : ["-lz"]
-        : []),
+    // The zlib UNIT (scr_zlib.c) gates on zlib.* IR use; the vendored
+    // objects also serve the native fetch's gzip decoder — spread exactly
+    // once.
+    ...(zlibObjects.length > 0
+      ? ["-I", vendorZlibDir(), ...(opts.zlib ? [rt(join(rtDir, "scr_zlib.c"))] : []), ...zlibObjects]
+      : []),
     // The zlib ↔ island bridge: only when BOTH halves are in the build
     // (the scr_inspect_island.c pattern) — the emitted main calls its
     // installer exactly then.

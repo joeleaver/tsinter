@@ -3602,6 +3602,10 @@ const TIER_FLOOR: string[] = [
   // 1076 -> 1078.
   "2448-entries-null-arms-regex-arrays.ts",
   "2748-regexp-runtime-patterns.ts",
+  // Unit C (board #257): the llvm and c lanes link the zlib Node bundles
+  // and drive it as Node does, so deflate's bytes print on every lane;
+  // a new program, passing here from its first run: 1078 -> 1079.
+  "2756-zlib-deflate-bytes.ts",
 ];
 
 interface RunResult {
@@ -9494,12 +9498,12 @@ t("month-13", bad);
 
 // ── the zlib unit: deflateSync / inflateSync (zlib.ts) ────────────────────
 // A port of Node v24.18.1's bundled zlib (Chromium's fork, rev e00f703):
-// deflate's bytes are Node's, so rows print them (the llvm and c lanes'
-// bytes differ, board #257 — these rows are wasm against Node only), and
-// inflate fails where Node's fails with Node's message and code (SEMANTICS.md
-// S101). Every row runs Node on the same source. The broad differential
-// (every level, fuzz, every truncation and error input) is
-// packages/compiler/test/wasm-zlib.test.ts.
+// deflate's bytes are Node's, so rows print them, and inflate fails where
+// Node's fails with Node's message and code (SEMANTICS.md S101). Every row
+// runs Node on the same source. The broad differential (every level, fuzz,
+// every truncation and error input) is packages/compiler/test/
+// wasm-zlib.test.ts; zlib-lanes.test.ts holds the wasm, c and llvm lanes to
+// Node over one shared table.
 describe("zlib unit rows (zlib.ts)", () => {
   async function both(name: string, src: string): Promise<[RunResult, RunResult]> {
     const dir = mkdtempSync(join(tmpdir(), "zlib-row-"));
