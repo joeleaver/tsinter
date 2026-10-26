@@ -608,6 +608,34 @@ so the per-lane split cannot be silently "fixed" toward the copying
 side). The reverse direction (dynFromJsval, identity by construction)
 has its own pin.
 
+**Amendment (unit P): `any[]` — an array whose elements are island
+values — is a THIRD registered exception on the wasm tier, along the
+paths listed here and no others.** The two exceptions above each say
+they extend to nothing else; this one is named, not inherited. Its
+representation argument is the jsMarshal(dyn) arm's: an `any[]`'s
+vector IS an island array's payload vector (vecKeyFor interns
+array<jsval> as the dyn ARR payload's own type), so no crossing happens
+at the representation level and no new aliasing relationship can form —
+the elements were island values already. These paths ALIAS on wasm
+(Node's answer; the native lanes copy the spine, S044):
+- the checked exits into an `any[]` slot — jsExit's array<jsval> arm,
+  the array arm of a checked union exit (an `any[] | undefined`
+  parameter, `dynCheck`), and the async-return adoption cast
+  (`%w.isl.exit:arr`) (P-PARAM-01);
+- a static `any[]` boxed back into a dynamic value by `dynFromHelper` —
+  a static `Promise<any[]>`'s fulfilment as an island reader sees it,
+  and a jsMarshal of an `any[]` (P-HELD-01); dyn `===` on arrays
+  compares the payload vectors, so two boxes of one vector are one
+  array;
+- the `Promise<any[]>` bridge's fulfilment (S044).
+These paths still COPY, on every lane: the front end's own `any[]` →
+`any` lift (`%jsin.arr`, and `%jsin.rec` for records) that an
+assignment into an `any` local, an object-literal member and a property
+write go through — `const anyR: any = r`, `h.a = a`, `pass(a) === a` —
+so a static `any[]` written into the island is a fresh array per write
+(P-LIFT-01, P-LIFT-02; Node shares it). Board #259 tracks that lift.
+Every other composite kind keeps this entry's body.
+
 ## S015 — Keyed reads and `in` on `unknown` see OWN properties only *(inherited)*
 
 `u[k]` on a checked-dynamic value answers the receiver's OWN member, or
@@ -3108,6 +3136,48 @@ typed array held in a dynamic value is not supported yet"). Readers not audited 
 I-CORPUS-766 in `packages/compiler/test/wasm-island-a.test.ts`; R90n,
 R91n and R94 in `wasm-dynsmalls-u5.test.ts`.
 
+**Amendment (unit P): `Array.prototype.flat` and `Promise.all` on the
+island.** `flat` leaves the fenced list: it is modeled on island arrays
+(the depth argument through ToIntegerOrInfinity for a primitive —
+absent or `undefined` is 1, `"2"` is 2, `true` is 1, `null`, NaN and
+negatives flatten nothing, `Infinity` all the way; only arrays flatten,
+a fresh array always; a cyclic array under `flat(Infinity)` throws V8's
+catchable `RangeError: Maximum call stack size exceeded`). Three
+differences remain, measured against Node v24.18.1:
+- **An object depth refuses by name.** A depth that is an object,
+  array or function would need ToPrimitive (`valueOf`/`toString`),
+  which this tier's ToNumber does not run: it throws the catchable
+  `TypeError: <callee>.flat: non-primitive depth arguments on a dynamic
+  receiver are not supported yet` (the index-argument fence's shape),
+  where Node flattens by the converted depth (`{ valueOf() { return 2 }
+  }` is 2, `{}` is NaN, so 0).
+- **A fixed nesting cap.** Past 1000 nested levels `flat` throws that
+  RangeError — the depth S013's JSON parser stops at —
+  where Node, whose limit is its stack (about 8900
+  levels at the top of a fresh process, fewer deeper in a call chain),
+  still flattens. Arrays nested 1000 deep or less answer exactly, from
+  a call chain 3000 frames deep (measured); the cap
+  keeps the recursion inside the wasm stack, which would otherwise
+  overflow into an uncatchable host error.
+- **Padded slots are present.** A slot S016's growth write padded
+  (`a[3] = x` on a shorter array) reads as `undefined` and `flat` keeps
+  it, where Node's hole is skipped (`g = [[0]]; g[3] = [9]; g.flat()` is
+  `[0, 9]` there, `[0, undefined, undefined, 9]` here) — S016's
+  enumeration divergence, reached through one more walker.
+Island `Promise.all(x)` is modeled over the island's spread iteration
+(arrays element-wise, strings by code point): each element through
+PromiseResolve, Node's turn count, input order, the first rejection
+winning and the losers not reported. A non-iterable gives a REJECTED
+promise with V8's own text ("number 5 is not iterable (cannot read
+property Symbol(Symbol.iterator))"), never a synchronous throw. An
+element that is a thenable object (an object with a callable `then`
+that is not a promise) meets settle's named refusal ("resolving a
+promise with a non-promise thenable is not supported yet"), uncaught,
+where Node calls its `then`. `Promise.race`, `allSettled` and `any` on
+an island argument keep refusing at compile time (`expr:jsOp`).
+**Tested by:** P-ALL-01..04, P-THEN-01 and P-FLAT-01..05 in
+`packages/compiler/test/wasm-island-a.test.ts`.
+
 ## S044 — jsExit of `array<jsval>`: the SPINE aliases on the wasm tier (matching Node); the native island copies it *(per-lane split)*
 
 The validated exit of an `any[]`-declared slot crosses elements BY
@@ -3125,6 +3195,52 @@ increment-21 unit pins covering both directions (write-through and
 push-through), with the C lane's divergent values pinned beside the
 wasm/Node values so the split is explicit and cannot be silently
 "aligned" in either direction.
+
+**Amendment (unit P): `any[]` crossings alias on the paths S014's
+unit-P amendment lists, and the `Promise<any[]>` bridge settles the same
+way.** An island value reaching a `Promise<any[]>` slot (an inferred or
+declared `Promise<any[]>` return over `Promise.all(...)` or an island
+promise — corpus 2633's `loadAll`) goes through PromiseResolve. A static
+`Promise<any[]>` that crossed into the island (island `Promise.all`'s
+result, a jsMarshal'd promise, a bridged promise that crossed back)
+comes back as ITSELF. Any other source is bridged into a static promise
+that settles the moment the source does (at once when it already has),
+with waiters on it parked on the source itself, so both sides' waiters
+run in one attach order with no turn added — Node's queue order,
+measured with competing microtask chains, `queueMicrotask`, timers,
+already settled and pending sources, and waiters attached on both sides
+in both orders. Attaching to a bridged promise marks its source handled
+(V8 marks a promise handled at attach), and a bridged promise rejected
+with its source's reason is never reported itself, so the unhandled
+report is the source's alone, as in Node where the two are one promise.
+Resolving a source with its own bridged promise (through any chain of
+bridges) is Node's `TypeError: Chaining cycle detected for promise
+#<Promise>`. An async function's `return x` into `Promise<any[]>` adopts
+a promise held in `x` (Node's two jobs), as board #234 does for the
+other typed returns. A fulfilment that is an island array hands over its
+vector by reference; a rejection crosses unchanged. Differences from
+Node, where no boundary exists:
+- **Two bridges of one island source are two promises.** `viaBox() ===
+  viaBox()` over one island promise is `false` here, `true` in Node (a
+  bridged promise is a distinct static promise whose payload is the
+  vector); a crossed static promise and a bridge of a bridge DO answer
+  themselves (`true`, as in Node).
+- **A non-array fulfilment rejects.** The static promise (or the async
+  function's own promise) rejects with the jsExit array arm's own
+  catchable `TypeError: expected an array, got <typeof>` (S009's
+  footing: scriptc's boundary text, no Node oracle), where Node's
+  awaiter receives the value as it is (`ok object`, `ok number`). That
+  rejection is the bridge's own, so a promise derived from it that
+  nothing handles (`p.then(cb)` with no catch) is reported as an
+  unhandled rejection and the program exits 1, where Node runs on.
+- **A non-array argument fails at the parameter.** An island value
+  that is neither an array nor `undefined` reaching an `any[] |
+  undefined` parameter throws the checked exit's `TypeError: expected
+  array | undefined at $, got number` at the call, where Node binds it
+  and fails later at its first use (`xs.push is not a function`).
+**Tested by:** P-BRIDGE-01..13, P-ASYNC-01..03, P-CYCLE-01, P-UNH-01,
+P-IDENT-01, P-PARAM-01, P-HELD-01, P-LIFT-01/02 and P-CORPUS-2633 in
+`packages/compiler/test/wasm-island-a.test.ts`.
 
 ## S045 — A dynamic-import namespace member with no compiled crossing is a TRAP FUNCTION, not the value *(inherited; newly reachable on the wasm tier)*
 

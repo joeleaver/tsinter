@@ -538,6 +538,7 @@ export class PromiseBuilder {
       }
       c.end();
       this.mb.setBody(idx, [this.waiterRef()], c.bytes());
+      this.subscribeBody = { idx, bytes: c.bytes() };
       return idx;
     });
   }
@@ -890,12 +891,60 @@ export class PromiseBuilder {
    * never built settle. */
   prependSettleProlog(prolog: Uint8Array): boolean {
     if (this.settleBody === null) return false;
-    const body = new Uint8Array(prolog.length + this.settleBody.bytes.length);
-    body.set(prolog, 0);
-    body.set(this.settleBody.bytes, prolog.length);
-    this.mb.setBody(this.settleBody.idx, [], body);
+    this.settleProlog = prolog;
+    this.recomposeSettle();
     return true;
   }
+
+  /** Unit P: put `epilog` (self-contained instructions over settle's own
+   * six parameters, no locals) AFTER settle's body — it runs only when the
+   * body ran to its end, i.e. when `p` was pending and is now settled
+   * (an already-settled promise and a resolution the prologue took over
+   * both return early). The emitter's `Promise<any[]>` bridge settles its
+   * static promise there, the moment its island source settles. False
+   * when the module never built settle. */
+  appendSettleEpilog(epilog: Uint8Array): boolean {
+    if (this.settleBody === null) return false;
+    this.settleEpilog = epilog;
+    this.recomposeSettle();
+    return true;
+  }
+
+  private subscribeBody: { idx: number; bytes: Uint8Array } | null = null;
+
+  /** Whether this module built subscribe. */
+  subscribeBuilt(): boolean {
+    return this.subscribeBody !== null;
+  }
+
+  /** Unit P: put `prolog` (instructions over subscribe's own three
+   * parameters, which may reassign the promise parameter 0, no locals) in
+   * front of subscribe's body. The emitter's `Promise<any[]>` bridge uses
+   * it to park a waiter on a pending bridged promise on the island source
+   * instead, so the two sides' waiters keep one attach order. False when
+   * the module never built subscribe. */
+  prependSubscribeProlog(prolog: Uint8Array): boolean {
+    if (this.subscribeBody === null) return false;
+    const body = this.subscribeBody;
+    const out = new Uint8Array(prolog.length + body.bytes.length);
+    out.set(prolog, 0);
+    out.set(body.bytes, prolog.length);
+    this.mb.setBody(body.idx, [this.waiterRef()], out);
+    return true;
+  }
+
+  private settleProlog: Uint8Array = new Uint8Array(0);
+  private settleEpilog: Uint8Array = new Uint8Array(0);
+
+  private recomposeSettle(): void {
+    const body = this.settleBody!;
+    const out = new Uint8Array(this.settleProlog.length + body.bytes.length + this.settleEpilog.length);
+    out.set(this.settleProlog, 0);
+    out.set(body.bytes, this.settleProlog.length);
+    out.set(this.settleEpilog, this.settleProlog.length + body.bytes.length);
+    this.mb.setBody(body.idx, [], out);
+  }
+
 
   /** %w.async.drain() — run microtasks to quiescence. No pending check
    * after the call: a resume never returns with the exception cell set

@@ -602,3 +602,278 @@ test("I-CORPUS-766 the union boundary program", async () => {
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
+
+// ============================================================
+// P — static promises inside `any`, island Promise.all, flat
+// ============================================================
+//
+// jsMarshal's promise arm (a static promise crossing BY REFERENCE as a
+// DK.PROMISE box), the `Promise<any[]>` jsBridgePromise arm (Array-gated,
+// the vector by reference, settled the moment its source settles — at the
+// bridge or from settle's epilogue), async returns into `Promise<any[]>`
+// adopting a held promise, `any[]` values crossing both ways by reference,
+// island `Promise.all` (spreadPush + PromiseResolve + the static
+// combinator; a non-iterable rejects) and the dyn Array.prototype.flat arm.
+// Run rows: stdout is a real Node v24.18.1 run of the same source (the
+// review's repros among them). Hand rows state Node's answer beside the pin.
+
+test("P-CROSS-01 a static promise crossing into an island slot: typeof, identity across two crossings, await, then", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-CROSS-01", "// @dynamic\n// a static promise crossing into an island slot: typeof, identity across two crossings, await, then\n'use strict';\n/** @param {number} n @returns {Promise<number>} */\nasync function load(n) {\n  return n * 2;\n}\n/** @returns {Promise<any[]>} */\nasync function list() {\n  return [\"a\", \"b\"];\n}\n/** @returns {any} */\nfunction mk() {\n  return { p: null, q: null };\n}\nasync function main() {\n  const p = load(4);\n  const h = mk();\n  h.p = p;\n  h.q = p;\n  console.log(`${typeof h.p} ${h.p === h.q}`);\n  console.log(`${await h.p}`);\n  h.l = list();\n  const got = await h.l;\n  console.log(`${got.length} ${got[1]}`);\n  h.p.then((v) => console.log(`then ${v}`));\n  await null;\n  await null;\n}\nvoid main();", "js");
+  expect(stdout).toBe("object true\n8\n2 b\nthen 8\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-ALL-01 island Promise.all: every non-iterable is a REJECTED promise with V8's text, strings iterate", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-ALL-01", "// @dynamic\n// island Promise.all: non-iterables reject (never throw), strings, empty, mixed entries\nconst vals: any[] = [5, undefined, null, {}, true, \"ab\", () => 1, [1, [2]], \"\", 1.5];\nasync function main() {\n  for (const v of vals) {\n    const x: any = v;\n    let p: any;\n    try {\n      p = Promise.all(x);\n    } catch (e) {\n      console.log(\"SYNC \" + (e as Error).message);\n      continue;\n    }\n    console.log(typeof p);\n    try {\n      const r: any = await p;\n      console.log(\"ok \" + JSON.stringify(r));\n    } catch (e) {\n      console.log((e as Error).name + \": \" + (e as Error).message);\n    }\n  }\n}\nvoid main();", "ts");
+  expect(stdout).toBe("object\nTypeError: number 5 is not iterable (cannot read property Symbol(Symbol.iterator))\nobject\nTypeError: undefined is not iterable (cannot read property Symbol(Symbol.iterator))\nobject\nTypeError: object null is not iterable (cannot read property Symbol(Symbol.iterator))\nobject\nTypeError: object is not iterable (cannot read property Symbol(Symbol.iterator))\nobject\nTypeError: boolean true is not iterable (cannot read property Symbol(Symbol.iterator))\nobject\nok [\"a\",\"b\"]\nobject\nTypeError: function is not iterable (cannot read property Symbol(Symbol.iterator))\nobject\nok [1,[2]]\nobject\nok []\nobject\nTypeError: number 1.5 is not iterable (cannot read property Symbol(Symbol.iterator))\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-ALL-02 island Promise.all over mixed entries: input order, first rejection, turn interleaving, empty", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-ALL-02", "// @dynamic\n// island Promise.all over mixed static and island entries, rejection ordering, turn interleaving\n'use strict';\n/** @param {number} v @returns {Promise<number>} */\nasync function slow(v) {\n  await null;\n  await null;\n  return v;\n}\n/** @param {string} msg @returns {Promise<number>} */\nasync function boom(msg) {\n  await null;\n  throw new Error(msg);\n}\n/** @param {string} msg @returns {Promise<number>} */\nasync function boomLate(msg) {\n  await null;\n  await null;\n  await null;\n  throw new Error(msg);\n}\n/** @returns {any} */\nfunction mk() {\n  return { v: 7, list: [] };\n}\nasync function main() {\n  const box = mk();\n  box.entries = [slow(1), box.v, \"s\", slow(3)];\n  const r = await Promise.all(box.entries);\n  console.log(JSON.stringify(r));\n  box.bad = [boomLate(\"late\"), boom(\"first\"), slow(2)];\n  try {\n    await Promise.all(box.bad);\n  } catch (e) {\n    console.log(`caught ${e.message}`);\n  }\n  const log = [];\n  box.two = [slow(1), 2];\n  const all = Promise.all(box.two);\n  queueMicrotask(() => log.push(\"m1\"));\n  all.then(() => log.push(\"all\"));\n  Promise.resolve()\n    .then(() => log.push(\"t1\"))\n    .then(() => log.push(\"t2\"))\n    .then(() => log.push(\"t3\"))\n    .then(() => log.push(\"t4\"))\n    .then(() => log.push(\"t5\"));\n  await slow(0);\n  await slow(0);\n  await slow(0);\n  console.log(log.join(\",\"));\n  const z = await Promise.all(box.list);\n  console.log(`${JSON.stringify(z)} ${z.length}`);\n}\nvoid main();", "js");
+  expect(stdout).toBe("[1,7,\"s\",3]\ncaught first\nm1,t1,t2,t3,all,t4,t5\n[] 0\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-ALL-03 island Promise.all: the first rejection wins, the losers are not reported, the result is one value", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-ALL-03", "// @dynamic\n// island Promise.all: the first rejection wins, the losers are not reported; the result is one value\n'use strict';\n/** @param {string} m @returns {Promise<number>} */\nasync function rej(m) {\n  throw new Error(m);\n}\n/** @param {number} v @returns {Promise<number>} */\nasync function ok(v) {\n  return v;\n}\n/** @returns {any} */\nfunction mk() {\n  return { xs: null };\n}\nasync function main() {\n  const box = mk();\n  box.xs = [ok(1), rej(\"one\"), rej(\"two\")];\n  try {\n    await Promise.all(box.xs);\n  } catch (e) {\n    console.log(`caught ${e.message}`);\n  }\n  box.p = Promise.all(box.xs.slice(0, 1));\n  console.log(`${typeof box.p} ${box.p === box.p}`);\n  const v = await box.p;\n  console.log(`${JSON.stringify(v)} ${v === (await box.p)}`);\n}\nvoid main();", "js");
+  expect(stdout).toBe("caught one\nobject true\n[1] true\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-ALL-04 island Promise.all over a promise: a rejection, never a synchronous throw", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-ALL-04", "// @dynamic\n// island Promise.all over a promise (not iterable): a rejection, after the synchronous code\n'use strict';\n/** @returns {Promise<number>} */\nasync function one() {\n  return 1;\n}\n/** @returns {any} */\nfunction mk() {\n  return { p: null };\n}\nasync function main() {\n  const box = mk();\n  box.p = one();\n  const r = Promise.all(box.p);\n  console.log(\"sync\");\n  try {\n    await r;\n  } catch (e) {\n    console.log(`${e.name}: ${e.message}`);\n  }\n}\nvoid main();", "js");
+  expect(stdout).toBe("sync\nTypeError: object is not iterable (cannot read property Symbol(Symbol.iterator))\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-BRIDGE-02 a Promise<any[]> bridge settles at Node's turn and aliases the spine", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-BRIDGE-02", "// @dynamic\n// a Promise<any[]> bridge's settle against a competing microtask chain, and the spine aliasing\n'use strict';\n/** @returns {any} */\nfunction mk() {\n  return { list: [1, 2, 3] };\n}\nconst src = mk();\n/** @returns {Promise<any[]>} */\nfunction viaAll() {\n  return Promise.all(src.list);\n}\nasync function main() {\n  const log = [];\n  const p = viaAll();\n  p.then(() => log.push(\"bridge\"));\n  Promise.resolve()\n    .then(() => log.push(\"t1\"))\n    .then(() => log.push(\"t2\"))\n    .then(() => log.push(\"t3\"))\n    .then(() => log.push(\"t4\"))\n    .then(() => log.push(\"t5\"));\n  await null;\n  await null;\n  await null;\n  await null;\n  await null;\n  await null;\n  console.log(log.join(\",\"));\n  const got = await viaAll();\n  got.push(4);\n  console.log(`${got.length} ${got[3]}`);\n}\nvoid main();", "js");
+  expect(stdout).toBe("t1,bridge,t2,t3,t4,t5\n4 4\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-BRIDGE-03 a Promise<any[]> bridge's waiters run at Node's queue position: await, rejection, two waiters, a late waiter", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-BRIDGE-03", "// @dynamic\n// Promise<any[]> bridge timing: awaiting, a rejection, an already-settled source, two waiters\n'use strict';\n/** @returns {any} */\nfunction mk() {\n  return {\n    list: [1, 2],\n    /** @returns {Promise<any>} */\n    bad: async () => {\n      throw new Error(\"nope\");\n    },\n  };\n}\nconst src = mk();\n/** @type {string[]} */\nconst log = [];\n/** @returns {Promise<any[]>} */\nfunction viaAll() {\n  return Promise.all(src.list);\n}\n/** @returns {Promise<any[]>} */\nfunction viaBad() {\n  return src.bad();\n}\nfunction chain() {\n  Promise.resolve()\n    .then(() => log.push(\"t1\"))\n    .then(() => log.push(\"t2\"))\n    .then(() => log.push(\"t3\"))\n    .then(() => log.push(\"t4\"));\n}\nasync function waitAll() {\n  const r = await viaAll();\n  log.push(`aw${r.length}`);\n}\nasync function waitBad() {\n  try {\n    await viaBad();\n  } catch (e) {\n    log.push(`rej:${e.message}`);\n  }\n}\nasync function main() {\n  void waitAll();\n  void waitBad();\n  chain();\n  const p = viaAll();\n  p.then(() => log.push(\"w1\"));\n  p.then(() => log.push(\"w2\"));\n  for (let i = 0; i < 8; i++) await null;\n  console.log(log.join(\",\"));\n  log.splice(0, log.length);\n  const q = viaAll();\n  for (let i = 0; i < 4; i++) await null;\n  q.then(() => log.push(\"late\"));\n  chain();\n  for (let i = 0; i < 8; i++) await null;\n  console.log(log.join(\",\"));\n}\nvoid main();", "js");
+  expect(stdout).toBe("rej:nope,t1,aw2,t2,w1,w2,t3,t4\nlate,t1,t2,t3,t4\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-BRIDGE-04 a pending source held on both sides, the island reaction attached first: Node's order", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-BRIDGE-04", "// @dynamic\n// one source promise held on both sides of a Promise<any[]> bridge\n'use strict';\n/** @returns {any} */\nfunction mk() {\n  return {\n    /** @returns {Promise<any>} */\n    arr: async () => {\n      await null;\n      return [1, 2];\n    },\n    ip: null,\n  };\n}\nconst box = mk();\n/** @type {string[]} */\nconst log = [];\n/** @returns {Promise<any[]>} */\nfunction viaBox() {\n  return box.ip;\n}\nasync function main() {\n  box.ip = box.arr();\n  const p = viaBox();\n  box.ip.then(() => log.push(\"island\"));\n  p.then(() => log.push(\"static\"));\n  for (let i = 0; i < 4; i++) await null;\n  console.log(log.join(\",\"));\n}\nvoid main();", "js");
+  expect(stdout).toBe("island,static\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-BRIDGE-09 a pending source held on both sides, the static waiter attached first: Node's order", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-BRIDGE-09", "// @dynamic\n// one source promise held on both sides, the static waiter attached FIRST\n'use strict';\n/** @returns {any} */\nfunction mk() {\n  return {\n    /** @returns {Promise<any>} */\n    arr: async () => {\n      await null;\n      return [1, 2];\n    },\n    ip: null,\n  };\n}\nconst box = mk();\n/** @type {string[]} */\nconst log = [];\n/** @returns {Promise<any[]>} */\nfunction viaBox() {\n  return box.ip;\n}\nasync function main() {\n  box.ip = box.arr();\n  const p = viaBox();\n  p.then(() => log.push(\"static\"));\n  box.ip.then(() => log.push(\"island\"));\n  for (let i = 0; i < 4; i++) await null;\n  console.log(log.join(\",\"));\n}\nvoid main();", "js");
+  expect(stdout).toBe("static,island\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-BRIDGE-10 a pending source held on both sides, the static waiter attached before an island await: Node's order", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-BRIDGE-10", "// @dynamic\n// one source promise held on both sides, the static waiter attached before an island await\n'use strict';\n/** @returns {any} */\nfunction mk() {\n  return {\n    /** @returns {Promise<any>} */\n    arr: async () => {\n      await null;\n      return [1, 2];\n    },\n    ip: null,\n  };\n}\nconst box = mk();\n/** @type {string[]} */\nconst log = [];\n/** @returns {Promise<any[]>} */\nfunction viaBox() {\n  return box.ip;\n}\nasync function islandWait() {\n  await box.ip;\n  log.push(\"island\");\n}\nasync function main() {\n  box.ip = box.arr();\n  const p = viaBox();\n  p.then(() => log.push(\"static\"));\n  void islandWait();\n  for (let i = 0; i < 4; i++) await null;\n  console.log(log.join(\",\"));\n}\nvoid main();", "js");
+  expect(stdout).toBe("static,island\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-BRIDGE-05 a bridge over an ALREADY-SETTLED source: a later waiter runs after a microtask queued before it", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-BRIDGE-05", "// @dynamic\n'use strict';\n/** @returns {any} */\nfunction mk() { return {\n  /** @returns {Promise<any>} */\n  arr: async () => [1, 2], ip: null }; }\nconst box = mk();\n/** @type {string[]} */\nconst log = [];\n/** @returns {Promise<any[]>} */\nfunction viaBox() { return box.ip; }\nfunction qm() { log.push(\"qm\"); }\nasync function main() {\n  box.ip = box.arr();\n  await null; await null; await null;\n  const p = viaBox();\n  Promise.resolve().then(qm);\n  p.then(() => { log.push(\"static\"); });\n  for (let i = 0; i < 6; i++) await null;\n  console.log(log.join(\",\"));\n}\nvoid main();", "js");
+  expect(stdout).toBe("qm,static\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-BRIDGE-06 a bridge over an already-settled source, awaited against a competing chain", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-BRIDGE-06", "// @dynamic\n'use strict';\n/** @returns {any} */\nfunction mk() { return {\n  /** @returns {Promise<any>} */\n  arr: async () => [1, 2], ip: null }; }\nconst box = mk();\n/** @type {string[]} */\nconst log = [];\n/** @returns {Promise<any[]>} */\nfunction viaBox() { return box.ip; }\nasync function main() {\n  box.ip = box.arr();\n  await null; await null; await null;\n  const p = viaBox();\n  Promise.resolve().then(() => { log.push(\"t1\"); }).then(() => { log.push(\"t2\"); });\n  const r = await p;\n  log.push(\"aw\" + r.length);\n  await null; await null;\n  console.log(log.join(\",\"));\n}\nvoid main();", "js");
+  expect(stdout).toBe("t1,aw2,t2\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-BRIDGE-07 a non-promise island array through a Promise<any[]> slot, and a late waiter on a settled bridge", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-BRIDGE-07", "// @dynamic\n// a non-promise island array through a Promise<any[]> slot: settled at once, awaited after a queued microtask\n'use strict';\n/** @returns {any} */\nfunction mk() {\n  return { list: [1, 2] };\n}\nconst src = mk();\n/** @type {string[]} */\nconst log = [];\n/** @returns {Promise<any[]>} */\nasync function viaList() {\n  return src.list;\n}\n/** @returns {Promise<any[]>} */\nfunction viaAll() {\n  return Promise.all(src.list);\n}\nasync function main() {\n  const p = viaList();\n  queueMicrotask(() => log.push(\"qm\"));\n  const r = await p;\n  log.push(`aw${r.length}`);\n  await null;\n  const q = viaAll();\n  for (let i = 0; i < 3; i++) await null;\n  queueMicrotask(() => log.push(\"qm2\"));\n  q.then(() => log.push(\"late\"));\n  for (let i = 0; i < 3; i++) await null;\n  console.log(log.join(\",\"));\n}\nvoid main();", "js");
+  expect(stdout).toBe("qm,aw2,qm2,late\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-BRIDGE-08 a source pending at the bridge that settles before the static side attaches", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-BRIDGE-08", "// @dynamic\n// a source pending at the bridge that settles before the static side attaches, with a microtask queued between\n'use strict';\n/** @returns {any} */\nfunction mk() {\n  return { res: null, ip: null };\n}\nconst box = mk();\n/** @type {string[]} */\nconst log = [];\n/** @returns {Promise<any[]>} */\nfunction viaBox() {\n  return box.ip;\n}\nasync function main() {\n  box.ip = new Promise((r) => {\n    box.res = r;\n  });\n  const p = viaBox();\n  box.res([1]);\n  queueMicrotask(() => log.push(\"qm\"));\n  p.then(() => log.push(\"static\"));\n  for (let i = 0; i < 4; i++) await null;\n  console.log(log.join(\",\"));\n}\nvoid main();", "js");
+  expect(stdout).toBe("qm,static\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-ASYNC-01 an async function returning an island promise into Promise<any[]> adopts it", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-ASYNC-01", "// @dynamic\n'use strict';\n/** @returns {any} */\nfunction mk() { return {\n  /** @returns {Promise<any>} */\n  arr: async () => [1, 2] }; }\nconst src = mk();\n/** @returns {Promise<any[]>} */\nasync function via() { return src.arr(); }\nasync function main() {\n  const r = await via();\n  console.log(r.length);\n}\nvoid main();", "js");
+  expect(stdout).toBe("2\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-ASYNC-02 an async function returning island Promise.all (inferred Promise<any[]>) adopts it", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-ASYNC-02", "// @dynamic\n'use strict';\n/** @returns {any} */\nfunction mk() { return { list: [1, 2] }; }\nconst src = mk();\nasync function via() { return Promise.all(src.list); }\nasync function main() {\n  const r = await via();\n  console.log(r.length);\n}\nvoid main();", "js");
+  expect(stdout).toBe("2\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-CYCLE-01 a source resolved with its own bridge is Node's chaining-cycle TypeError, on both sides", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-CYCLE-01", "// @dynamic\n'use strict';\n/** @returns {any} */\nfunction mk() { return {\n  /** @returns {Promise<any>} */\n  arr: async () => { await null; return [1, 2]; },\n  /** @returns {Promise<any>} */\n  bad: async () => { await null; throw new Error(\"nope\"); },\n  ip: null, q: null, res: null, rej: null }; }\nconst box = mk();\n/** @type {string[]} */\nconst log = [];\n/** @returns {Promise<any[]>} */\nfunction viaBox() { return box.ip; }\n/** @returns {Promise<any[]>} */\nfunction viaQ() { return box.q; }\nasync function main() {\n  box.ip = new Promise((r) => { box.res = r; });\n  const p = viaBox();\n  box.res(p);\n  box.ip.catch((e) => log.push(\"i \" + e.message));\n  p.catch(() => log.push(\"s\"));\n  for (let i = 0; i < 6; i++) await null;\n  console.log(log.join(\",\") + \"|\");\n}\nvoid main();", "js");
+  expect(stdout).toBe("i Chaining cycle detected for promise #<Promise>,s|\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-UNH-01 a rejected source the island handles, bridged but never awaited: no unhandled report", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-UNH-01", "// @dynamic\n'use strict';\n/** @returns {any} */\nfunction mk() { return {\n  /** @returns {Promise<any>} */\n  arr: async () => { await null; return [1, 2]; },\n  /** @returns {Promise<any>} */\n  bad: async () => { await null; throw new Error(\"nope\"); },\n  ip: null, q: null, res: null, rej: null }; }\nconst box = mk();\n/** @type {string[]} */\nconst log = [];\n/** @returns {Promise<any[]>} */\nfunction viaBox() { return box.ip; }\n/** @returns {Promise<any[]>} */\nfunction viaQ() { return box.q; }\nasync function main() {\n  box.ip = box.bad();\n  const p = viaBox();\n  box.ip.catch((e) => log.push(\"caught \" + e.message));\n  for (let i = 0; i < 4; i++) await null;\n  console.log(log.join(\",\"));\n}\nvoid main();", "js");
+  expect(stdout).toBe("caught nope\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-BRIDGE-11 two bridges of one source: Node's order", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-BRIDGE-11", "// @dynamic\n'use strict';\n/** @returns {any} */\nfunction mk() { return {\n  /** @returns {Promise<any>} */\n  arr: async () => { await null; return [1, 2]; },\n  /** @returns {Promise<any>} */\n  bad: async () => { await null; throw new Error(\"nope\"); },\n  ip: null, q: null, res: null, rej: null }; }\nconst box = mk();\n/** @type {string[]} */\nconst log = [];\n/** @returns {Promise<any[]>} */\nfunction viaBox() { return box.ip; }\n/** @returns {Promise<any[]>} */\nfunction viaQ() { return box.q; }\nasync function main() {\n  box.ip = box.arr();\n  const p1 = viaBox();\n  p1.then(() => log.push(\"A\"));\n  box.ip.then(() => log.push(\"B\"));\n  const p2 = viaBox();\n  p2.then(() => log.push(\"C\"));\n  p1.then(() => log.push(\"D\"));\n  Promise.resolve().then(() => log.push(\"t1\")).then(() => log.push(\"t2\")).then(() => log.push(\"t3\")).then(() => log.push(\"t4\"));\n  for (let i = 0; i < 8; i++) await null;\n  const a = await p1, b = await p2;\n  console.log(log.join(\",\"), a === b);\n}\nvoid main();", "js");
+  expect(stdout).toBe("t1,A,B,C,D,t2,t3,t4 true\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-BRIDGE-12 a bridge of a bridge: Node's order", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-BRIDGE-12", "// @dynamic\n'use strict';\n/** @returns {any} */\nfunction mk() { return {\n  /** @returns {Promise<any>} */\n  arr: async () => { await null; return [1, 2]; },\n  /** @returns {Promise<any>} */\n  bad: async () => { await null; throw new Error(\"nope\"); },\n  ip: null, q: null, res: null, rej: null }; }\nconst box = mk();\n/** @type {string[]} */\nconst log = [];\n/** @returns {Promise<any[]>} */\nfunction viaBox() { return box.ip; }\n/** @returns {Promise<any[]>} */\nfunction viaQ() { return box.q; }\nasync function main() {\n  box.ip = box.arr();\n  const p1 = viaBox();\n  box.q = p1;\n  const p2 = viaQ();\n  p2.then(() => log.push(\"p2a\"));\n  box.ip.then(() => log.push(\"src\"));\n  p1.then(() => log.push(\"p1\"));\n  box.q.then(() => log.push(\"q\"));\n  p2.then(() => log.push(\"p2b\"));\n  queueMicrotask(() => log.push(\"qm\"));\n  for (let i = 0; i < 8; i++) await null;\n  const a = await p1, b = await p2;\n  console.log(log.join(\",\"), a === b, box.q === p1);\n}\nvoid main();", "js");
+  expect(stdout).toBe("qm,p2a,src,p1,q,p2b true true\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-HELD-01 an any[] held by a static promise crosses back into the island as the same array", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-HELD-01", "// @dynamic\n// an any[] held by a static promise crosses back into the island as the same array\n'use strict';\n/** @returns {any} */\nfunction mk() {\n  return { list: [1, 2], p: null };\n}\nconst box = mk();\n/** @param {any[]} xs @returns {Promise<any[]>} */\nasync function hold(xs) {\n  return xs;\n}\nasync function main() {\n  box.p = hold(box.list);\n  const v = await box.p;\n  v.push(3);\n  console.log(`${v === box.list} ${box.list.length} ${(await box.p) === v}`);\n}\nvoid main();", "js");
+  expect(stdout).toBe("true 3 true\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-FLAT-01 Array.prototype.flat on an island array: depths, Infinity, coercion, non-array elements, a string receiver", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-FLAT-01", "// @dynamic\n// Array.prototype.flat on an island array: depths, Infinity, coercion, non-array elements\n'use strict';\n/** @returns {any} */\nfunction mk() {\n  return [[1, [2, [3, [4]]]], \"ab\", { length: 1, k: \"x\" }, 5];\n}\nconst a = mk();\nconsole.log(JSON.stringify(a.flat()));\nconsole.log(JSON.stringify(a.flat(0)));\nconsole.log(JSON.stringify(a.flat(2)));\nconsole.log(JSON.stringify(a.flat(Infinity)));\nconsole.log(JSON.stringify(a.flat(\"2\")));\nconsole.log(JSON.stringify(a.flat(-1)), JSON.stringify(a.flat(NaN)), JSON.stringify(a.flat(1.9)));\nconsole.log(JSON.stringify(a.flat(null)), JSON.stringify(a.flat(undefined)), JSON.stringify(a.flat(true)));\n/** @returns {any} */\nfunction none() {\n  return [];\n}\nconst empty = none();\nconsole.log(JSON.stringify(empty.flat()), a.flat() !== a, a.flat(0) !== a);\nconst inner = mk();\n/** @param {any} x @returns {any} */\nfunction wrap(x) {\n  return [x, x];\n}\nconst f = wrap(inner).flat(0);\nconsole.log(`${f[0] === inner} ${f.length}`);\n/** @returns {any} */\nfunction str() {\n  return \"abc\";\n}\nconst s = str();\ntry {\n  console.log(`${s.flat()}`);\n} catch (e) {\n  console.log(`${e.name}: ${e.message}`);\n}", "js");
+  expect(stdout).toBe("[1,[2,[3,[4]]],\"ab\",{\"length\":1,\"k\":\"x\"},5]\n[[1,[2,[3,[4]]]],\"ab\",{\"length\":1,\"k\":\"x\"},5]\n[1,2,[3,[4]],\"ab\",{\"length\":1,\"k\":\"x\"},5]\n[1,2,3,4,\"ab\",{\"length\":1,\"k\":\"x\"},5]\n[1,2,[3,[4]],\"ab\",{\"length\":1,\"k\":\"x\"},5]\n[[1,[2,[3,[4]]]],\"ab\",{\"length\":1,\"k\":\"x\"},5] [[1,[2,[3,[4]]]],\"ab\",{\"length\":1,\"k\":\"x\"},5] [1,[2,[3,[4]]],\"ab\",{\"length\":1,\"k\":\"x\"},5]\n[[1,[2,[3,[4]]]],\"ab\",{\"length\":1,\"k\":\"x\"},5] [1,[2,[3,[4]]],\"ab\",{\"length\":1,\"k\":\"x\"},5] [1,[2,[3,[4]]],\"ab\",{\"length\":1,\"k\":\"x\"},5]\n[] true true\ntrue 2\nTypeError: s.flat is not a function\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-FLAT-02 flat over a cyclic array: Infinity throws V8's RangeError catchably, a finite depth terminates", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-FLAT-02", "// @dynamic\n// flat over a cyclic array: Infinity overflows (RangeError, catchable), a finite depth terminates\n'use strict';\n/** @returns {any} */\nfunction mk() {\n  return [1];\n}\nconst c = mk();\nc.push(c);\ntry {\n  c.flat(Infinity);\n  console.log(\"no throw\");\n} catch (e) {\n  console.log(`${e.name}: ${e.message}`);\n}\nconsole.log(`${c.flat(3).length}`);\nlet deep = mk();\nfor (let i = 0; i < 1000; i++) deep = [deep];\nconsole.log(`${deep.flat(Infinity).length} ${JSON.stringify(deep.flat(Infinity))}`);", "js");
+  expect(stdout).toBe("RangeError: Maximum call stack size exceeded\n5\n1 [1]\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-BRIDGE-01 a Promise<any[]> bridge: an array fulfilment crosses by reference, any other value rejects by name", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-BRIDGE-01", "// @dynamic\n// a Promise<any[]> bridge: an array fulfillment by reference, a non-array fulfillment rejects\n'use strict';\n/** @returns {any} */\nfunction mk() {\n  return {\n    /** @returns {Promise<any>} */\n    arr: async () => [1, 2],\n    /** @returns {Promise<any>} */\n    obj: async () => ({ a: 1 }),\n    /** @returns {Promise<any>} */\n    num: async () => 5,\n    /** @returns {Promise<any>} */\n    bad: async () => {\n      throw new Error(\"nope\");\n    },\n  };\n}\nconst src = mk();\n/** @returns {Promise<any[]>} */\nfunction viaArr() {\n  return src.arr();\n}\n/** @returns {Promise<any[]>} */\nfunction viaObj() {\n  return src.obj();\n}\n/** @returns {Promise<any[]>} */\nfunction viaNum() {\n  return src.num();\n}\n/** @returns {Promise<any[]>} */\nfunction viaBad() {\n  return src.bad();\n}\nasync function main() {\n  const a = await viaArr();\n  console.log(`${a.length} ${a[0]}`);\n  for (const f of [viaObj, viaNum, viaBad]) {\n    try {\n      const r = await f();\n      console.log(`ok ${typeof r}`);\n    } catch (e) {\n      console.log(`${e.name}: ${e.message}`);\n    }\n  }\n}\nvoid main();", "js");
+  // Node: 2 1 / ok object / ok number / Error: nope — there is no boundary
+  // in Node, so the value arrives as it is. The bridge's TypeError is the
+  // jsExit array arm's own (SEMANTICS.md S044's unit-P amendment).
+  expect(stdout).toBe("2 1\nTypeError: expected an array, got object\nTypeError: expected an array, got number\nError: nope\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-ASYNC-03 async returns into Promise<any[]> adopt with Node's turns; a non-array adopted value rejects by name", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-ASYNC-03", "// @dynamic\n// an async function returning an island promise into Promise<any[]>: adopted, Node's turns\n'use strict';\n/** @returns {any} */\nfunction mk() {\n  return {\n    list: [1, 2],\n    /** @returns {Promise<any>} */\n    arr: async () => [3, 4, 5],\n    /** @returns {Promise<any>} */\n    obj: async () => ({ a: 1 }),\n  };\n}\nconst src = mk();\n/** @type {string[]} */\nconst log = [];\n/** @returns {Promise<any[]>} */\nasync function viaArr() {\n  return src.arr();\n}\nasync function viaAll() {\n  return Promise.all(src.list);\n}\n/** @returns {Promise<any[]>} */\nasync function viaObj() {\n  return src.obj();\n}\nasync function main() {\n  const a = viaArr();\n  const b = viaAll();\n  Promise.resolve()\n    .then(() => log.push(\"t1\"))\n    .then(() => log.push(\"t2\"))\n    .then(() => log.push(\"t3\"))\n    .then(() => log.push(\"t4\"));\n  a.then((r) => log.push(`a${r.length}`));\n  b.then((r) => log.push(`b${r.length}`));\n  for (let i = 0; i < 6; i++) await null;\n  console.log(log.join(\",\"));\n  try {\n    const o = await viaObj();\n    console.log(`ok ${typeof o}`);\n  } catch (e) {\n    console.log(`${e.name}: ${e.message}`);\n  }\n}\nvoid main();", "js");
+  // Node: t1,t2,a3,b2,t3,t4 / ok object (S044's unit-P amendment).
+  expect(stdout).toBe("t1,t2,a3,b2,t3,t4\nTypeError: expected an array, got object\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-PARAM-01 an island array reaching an any[] | undefined parameter is the caller's array", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-PARAM-01", "// @dynamic\n// an island array reaching an `any[] | undefined` parameter is the caller's array (pushes are shared)\nfunction take(xs: any[] | undefined): number {\n  if (xs === undefined) return -1;\n  xs.push(1);\n  return xs.length;\n}\nfunction back(xs: any[] = []): any[] {\n  xs.push(\"added\");\n  return xs;\n}\nconst o: any = { a: [1, \"x\"], b: undefined, c: 5, p: [{ n: 1 }] };\nconst arr = o.a;\nconsole.log(`${take(o.a)} ${arr.length} ${take(o.b)}`);\ntry {\n  console.log(`${take(o.c)}`);\n} catch (e) {\n  console.log(`${(e as Error).name}: ${(e as Error).message}`);\n}\nconst r = back(o.p);\nconsole.log(`${o.p.length} ${r.length} ${r[0] === o.p[0]} ${r === o.p}`);", "ts");
+  // Node: 3 3 -1 / TypeError: xs.push is not a function / 2 2 true true.
+  // The non-array argument fails at the boundary with the checked exit's
+  // text (S044's unit-P amendment). `r === o.p` is false here: the front
+  // end's own any[]-to-any conversion (%jsin.arr) builds a fresh island
+  // array on every lane — a front-end matter, not this unit's.
+  expect(stdout).toBe("3 3 -1\nTypeError: expected array | undefined at $, got number\n2 2 true false\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-IDENT-01 bridged promises: a crossed static promise and a bridge of a bridge answer themselves; two bridges of one island source are two promises", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-IDENT-01", "// @dynamic\n'use strict';\n/** @returns {any} */\nfunction mk() { return {\n  /** @returns {Promise<any>} */\n  arr: async () => { await null; return [1, 2]; },\n  /** @returns {Promise<any>} */\n  bad: async () => { await null; throw new Error(\"nope\"); },\n  ip: null, q: null, res: null, rej: null }; }\nconst box = mk();\n/** @type {string[]} */\nconst log = [];\n/** @returns {Promise<any[]>} */\nfunction viaBox() { return box.ip; }\n/** @returns {Promise<any[]>} */\nfunction viaQ() { return box.q; }\n/** @param {any[]} xs @returns {Promise<any[]>} */\nasync function hold(xs) { await null; return xs; }\nasync function main() {\n  box.ip = box.arr();\n  const p1 = viaBox(), p2 = viaBox();\n  box.q = p1;\n  const p3 = viaQ();\n  const h = hold([1]);\n  box.ip = h;\n  const p4 = viaBox();\n  console.log(`${p1 === p2} ${p3 === p1} ${p4 === h}`);\n  p4.then(() => log.push(\"p4\"));\n  h.then(() => log.push(\"h\"));\n  box.ip.then(() => log.push(\"isl\"));\n  for (let i = 0; i < 6; i++) await null;\n  console.log(log.join(\",\"));\n}\nvoid main();", "js");
+  // Node: true true true / p4,h,isl (S044's unit-P amendment).
+  expect(stdout).toBe("false true true\np4,h,isl\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-BRIDGE-13 a non-array fulfilment rejects the bridge: its derived promise's rejection is reported, exit 1", async () => {
+  // Node: s1,i1,ok, exit 0 (S044's unit-P amendment).
+  const { stdout, stderr } = await runRowTrap("P-BRIDGE-13", "// @dynamic\n'use strict';\n/** @returns {any} */\nfunction mk() { return {\n  /** @returns {Promise<any>} */\n  arr: async () => { await null; return [1, 2]; },\n  /** @returns {Promise<any>} */\n  bad: async () => { await null; throw new Error(\"nope\"); },\n  ip: null, q: null, res: null, rej: null }; }\nconst box = mk();\n/** @type {string[]} */\nconst log = [];\n/** @returns {Promise<any[]>} */\nfunction viaBox() { return box.ip; }\n/** @returns {Promise<any[]>} */\nfunction viaQ() { return box.q; }\nasync function main() {\n  box.ip = new Promise((r) => { box.res = r; });\n  const p = viaBox();\n  p.then(() => log.push(\"s1\"));\n  box.res(5);\n  box.ip.then(() => log.push(\"i1\"));\n  try { await p; log.push(\"ok\"); } catch (e) { log.push(\"rej\"); }\n  console.log(log.join(\",\"));\n}\nvoid main();", "js");
+  expect(stdout).toBe("i1,rej\n");
+  expect(stderr).toContain("Unhandled promise rejection: TypeError: expected an array, got number");
+});
+
+test("P-LIFT-01 the front end's any[] lift copies through a typed local and an any assignment (board #259)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-LIFT-01", "// @dynamic\nfunction back(xs: any[] = []): any[] {\n  xs.push(\"added\");\n  return xs;\n}\nconst o: any = { p: [{ n: 1 }] };\nconst r = back(o.p);\nconst anyR: any = r;\nanyR.push(9);\nconsole.log(`${o.p.length} ${r.length} ${anyR.length} ${anyR === o.p}`);\no.p.push(7);\nconsole.log(`${r.length} ${anyR.length}`);", "ts");
+  // Node: 3 3 3 true / 4 4 (S014's unit-P amendment).
+  expect(stdout).toBe("2 2 3 false\n3 3\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-LIFT-02 a static any[] written into an island object is copied per write (board #259)", async () => {
+  const { stdout, stderr, exitCode } = await runRow("P-LIFT-02", "// @dynamic\nconst a: any[] = [1, 2];\nconst b: any[] = a;\nconst c: any[] = a.concat();\nconst h: any = {};\nh.a = a; h.b = b; h.c = c;\nconsole.log(`${h.a === h.b} ${h.a === h.c}`);\nh.a.push(3);\nconsole.log(`${a.length} ${b.length} ${c.length}`);\na.push(4);\nconsole.log(`${h.a.length} ${h.b.length}`);", "ts");
+  // Node: true false / 3 3 2 / 4 4 (S014's unit-P amendment).
+  expect(stdout).toBe("false false\n2 2 2\n3 2\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-THEN-01 island Promise.all over a thenable object element meets settle's named refusal", async () => {
+  // Node: before / after 2 (it calls the object's then).
+  const { stdout, stderr } = await runRowTrap("P-THEN-01", "// @dynamic\n// island Promise.all over a thenable object element: settle's named refusal\n'use strict';\n/** @returns {any} */\nfunction mk() {\n  return { then: (/** @type {any} */ r) => r(1) };\n}\nasync function main() {\n  console.log(\"before\");\n  /** @type {any} */\n  const xs = [mk(), 2];\n  const r = await Promise.all(xs);\n  console.log(`after ${r.length}`);\n}\nvoid main();", "js");
+  expect(stdout).toBe("before\n");
+  expect(stderr).toContain("resolving a promise with a non-promise thenable is not supported yet");
+});
+
+test("P-FLAT-03 flat over a growth write's padding sees undefined where Node has holes (S016)", async () => {
+  // Node: 2 [0,9] — the padded slots are holes there, skipped by flat.
+  const { stdout, stderr, exitCode } = await runRow("P-FLAT-03", "// @dynamic\n// flat over a growth write's padding (S016: undefined where Node has holes)\n'use strict';\n/** @returns {any} */\nfunction grow() {\n  return [[0]];\n}\nconst g = grow();\ng[3] = [9];\nconsole.log(`${g.flat().length} ${JSON.stringify(g.flat())}`);", "js");
+  expect(stdout).toBe("4 [0,null,null,9]\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-FLAT-04 flat stops at 1000 nested levels with V8's RangeError, catchably, even deep in a call chain (S043 unit-P amendment)", async () => {
+  // Node: 999 1 / 1001 1 / 999 1 / 4999 1 — V8 overflows past ~8900 levels.
+  const { stdout, stderr, exitCode } = await runRow("P-FLAT-04", "// @dynamic\n// flat at the nesting cap: 999 levels flatten, 1001 throw (Node flattens both), also from deep in a call chain\n'use strict';\n/** @returns {any} */\nfunction mk() {\n  return [1];\n}\n/** @param {number} n @returns {any} */\nfunction nest(n) {\n  let d = mk();\n  for (let i = 0; i < n; i++) d = [d];\n  return d;\n}\n/** @param {number} n */\nfunction probe(n) {\n  try {\n    console.log(`${n} ${nest(n).flat(Infinity).length}`);\n  } catch (e) {\n    console.log(`${n} ${e.name}: ${e.message}`);\n  }\n}\n/** @param {number} k @param {number} n */\nfunction recurse(k, n) {\n  if (k === 0) probe(n);\n  else recurse(k - 1, n);\n}\nprobe(999);\nprobe(1001);\nrecurse(3000, 999);\nrecurse(3000, 4999);", "js");
+  expect(stdout).toBe("999 1\n1001 RangeError: Maximum call stack size exceeded\n999 1\n4999 RangeError: Maximum call stack size exceeded\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-FLAT-05 flat with an object depth refuses by name, catchably (ToPrimitive is not run)", async () => {
+  // Node: [1,2,[3]] / [1,2,[3]] / [[1,[2,[3]]]] / [1,[2,[3]]].
+  const { stdout, stderr, exitCode } = await runRow("P-FLAT-05", "// @dynamic\n// flat with an object depth (ToPrimitive runs valueOf/toString in Node) refuses by name\n'use strict';\n/** @returns {any} */\nfunction v() {\n  return { valueOf() { return 2; } };\n}\n/** @returns {any} */\nfunction s() {\n  return { toString() { return \"2\"; } };\n}\n/** @returns {any} */\nfunction mk() {\n  return [[1, [2, [3]]]];\n}\nfor (const d of [v(), s(), {}, [1]]) {\n  try {\n    console.log(JSON.stringify(mk().flat(d)));\n  } catch (e) {\n    console.log(`${e.name}: ${e.message}`);\n  }\n}", "js");
+  const fence = "TypeError: mk(...).flat: non-primitive depth arguments on a dynamic receiver are not supported yet\n";
+  expect(stdout).toBe(fence.repeat(4));
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});
+
+test("P-CORPUS-2633 the island promise crossing program", async () => {
+  const { stdout, stderr, exitCode } = await runCorpusRow("P-CORPUS-2633", "2633-island-promise-crossing.js");
+  expect(stdout).toBe("typeof object\nheld 1 x\nlen 2 first builtin second p1\nall 2 a b\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+});

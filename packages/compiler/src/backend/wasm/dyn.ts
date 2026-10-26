@@ -2648,10 +2648,21 @@ export class DynBuilder {
       } else {
         this.arm(c, K, [DK.HANDLE, DK.JSVAL], () => c.unreachable());
       }
-      // ARR/OBJ — and ONLY those two now (BYTES has its own arm above):
-      // C's `default: return a == b` (scr_json.c:2310). Node identity is
-      // the dyn tree's object identity because those kinds are never
-      // reboxed.
+      // ARR compares its VECTOR (unit P, review B2): an `any[]` value is
+      // an island array's own vector, and crossing back into a dynamic
+      // value boxes that vector afresh (dynFromHelper's array<jsval> arm),
+      // so two boxes of one vector are one JS array — BYTES's reasoning.
+      this.arm(c, K, [DK.ARR], () => {
+        c.localGet(0);
+        c.structGet(dynT, DYN_REF);
+        c.localGet(1);
+        c.structGet(dynT, DYN_REF);
+        c.refEq();
+      });
+      // OBJ — and ONLY that one now (BYTES and ARR have their own arms
+      // above): C's `default: return a == b` (scr_json.c:2310). Node
+      // identity is the dyn tree's object identity because an object is
+      // never reboxed.
       c.localGet(0);
       c.localGet(1);
       c.refEq();
@@ -7407,8 +7418,102 @@ export class DynBuilder {
   private static readonly ARR_METHODS = new Set([
     "push", "pop", "shift", "unshift", "slice", "at", "indexOf", "lastIndexOf",
     "includes", "join", "concat", "reverse", "sort", "forEach", "map", "filter",
-    "some", "every", "find", "findIndex", "flatMap",
+    "some", "every", "find", "findIndex", "flatMap", "flat",
   ]);
+
+  /** How deep `flat`'s FlattenIntoArray recursion goes before it throws
+   * the RangeError V8's own stack overflow throws there (SEMANTICS.md
+   * S043's unit-P amendment). Node v24.18.1 overflows between 8000 and
+   * 9000 levels, depending on the stack already in use; this tier stops
+   * at a fixed depth the wasm stack always has room for. */
+  static readonly FLAT_MAX_NEST = 1000;
+
+  /** %w.dyn.flatInto(out, src, depth, nest) — ECMA-262's
+   * FlattenIntoArray over a dyn vector: every element of `src` in order
+   * onto `out`, an element that is itself an ARR flattened one level
+   * deeper while `depth` (already ToIntegerOrInfinity'd, >= 0, possibly
+   * +Infinity) is above 0. A null slot is a hole (HasProperty false) and
+   * is skipped; the source length is read once and an index the array
+   * has since shrunk past is skipped (the live vector is re-read each
+   * step, as JS reads the live array). Past FLAT_MAX_NEST nested levels —
+   * a cyclic array under `flat(Infinity)` among them — it leaves V8's
+   * own "Maximum call stack size exceeded" RangeError in the cell; the
+   * caller checks. Only DK.ARR flattens (IsArray): typed arrays, strings,
+   * objects with a length push whole, as in JS. */
+  flatInto(): number {
+    return this.cached("flatInto", [this.arrRef(), this.arrRef(), F64, I32], [], (idx) => {
+      const dynT = this.dynT();
+      const c = new Code();
+      const OUT = 0, SRC = 1, DEPTH = 2, NEST = 3;
+      const N = 4, I = 5, E = 6;
+      this.arrLen(c, (x) => x.localGet(SRC));
+      c.localSet(N);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeU();
+      c.brIf(1);
+      // Shrunk past: HasProperty is false from here on.
+      c.localGet(I);
+      this.arrLen(c, (x) => x.localGet(SRC));
+      c.i32GeU();
+      c.brIf(1);
+      this.arrAt(c, (x) => x.localGet(SRC), (x) => x.localGet(I));
+      c.localTee(E);
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifVoid();
+      c.localGet(DEPTH);
+      c.f64Const(0);
+      c.f64Gt();
+      c.ifResult(I32);
+      c.localGet(E);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.ARR);
+      c.i32Eq();
+      c.else_();
+      c.i32Const(0);
+      c.end();
+      c.ifVoid();
+      c.localGet(NEST);
+      c.i32Const(DynBuilder.FLAT_MAX_NEST);
+      c.i32GeU();
+      c.ifVoid();
+      this.deps.throwError(c, "%RangeError", "RangeError", (x) => this.deps.lit(x, "Maximum call stack size exceeded"));
+      c.return_();
+      c.end();
+      c.localGet(OUT);
+      this.arrPayload(c, (x) => x.localGet(E));
+      c.localGet(DEPTH);
+      c.f64Const(1);
+      c.f64Sub();
+      c.localGet(NEST);
+      c.i32Const(1);
+      c.i32Add();
+      c.call(idx);
+      c.globalGet(this.deps.excKind());
+      c.ifVoid();
+      c.return_();
+      c.end();
+      c.else_();
+      c.localGet(OUT);
+      c.localGet(E);
+      c.call(this.arrPush());
+      c.end();
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      this.mb.setBody(idx, [I32, I32, this.dynRef()], c.bytes());
+    });
+  }
 
   /** String.prototype names with an arm — implemented or fenced. */
   private static readonly STR_METHODS = new Set([
@@ -8813,6 +8918,80 @@ export class DynBuilder {
                     c.call(this.arrPush());
                   },
                 );
+                this.boxArr(c, (x) => x.localGet(OUT));
+                return;
+              }
+              case "flat": {
+                // Array.prototype.flat(depth): depthNum is 1 when depth is
+                // undefined (absent or passed), else ToIntegerOrInfinity
+                // (ToNumber, NaN to 0, truncate; ±Infinity kept), and a
+                // negative depth flattens nothing (FlattenIntoArray only
+                // descends while depth > 0). A fresh array, always.
+                // An object depth would need ToPrimitive (valueOf/toString),
+                // which %w.jsToNumber does not run: a loud fence, idxArg's
+                // own text shape, never a silent NaN-to-0.
+                argAt(0);
+                c.localTee(M);
+                c.structGet(dynT, DYN_KIND);
+                c.localSet(B);
+                c.localGet(B);
+                c.i32Const(DK.NUM);
+                c.i32Ne();
+                c.localGet(B);
+                c.i32Const(DK.STR);
+                c.i32Ne();
+                c.i32And();
+                c.localGet(B);
+                c.i32Const(DK.BOOL);
+                c.i32Ne();
+                c.i32And();
+                c.localGet(B);
+                c.i32Const(DK.NULL);
+                c.i32Ne();
+                c.i32And();
+                c.localGet(B);
+                c.i32Const(DK.UNDEF);
+                c.i32Ne();
+                c.i32And();
+                c.ifVoid();
+                c.localGet(2);
+                this.deps.lit(c, ": non-primitive depth arguments on a dynamic receiver are not supported yet");
+                c.call(concat);
+                c.localSet(MSG);
+                this.deps.throwTypeError(c, (x) => x.localGet(MSG));
+                c.refNull(dynT);
+                c.return_();
+                c.end();
+                c.localGet(M);
+                c.structGet(dynT, DYN_KIND);
+                c.i32Const(DK.UNDEF);
+                c.i32Eq();
+                c.ifResult(F64);
+                c.f64Const(1);
+                c.else_();
+                c.localGet(M);
+                c.call(this.deps.jsToNumber());
+                c.localSet(F0);
+                c.localGet(F0);
+                c.localGet(F0);
+                c.f64Ne();
+                c.ifResult(F64);
+                c.f64Const(0);
+                c.else_();
+                c.localGet(F0);
+                c.f64Trunc();
+                c.end();
+                c.end();
+                c.localSet(F0);
+                bailIfPending();
+                this.pushNewArr(c);
+                c.localSet(OUT);
+                c.localGet(OUT);
+                c.localGet(A);
+                c.localGet(F0);
+                c.i32Const(0);
+                c.call(this.flatInto());
+                bailIfPending();
                 this.boxArr(c, (x) => x.localGet(OUT));
                 return;
               }

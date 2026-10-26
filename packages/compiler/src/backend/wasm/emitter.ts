@@ -14432,6 +14432,16 @@ class Assembler {
         return true;
       }
       case "array": {
+        if (t.elem.kind === "jsval") {
+          // Unit P (review B2): an `any[]` value IS an island array's
+          // vector (vecKeyFor: array<jsval> interns as the dyn ARR
+          // payload's own vector), so it crosses back BY REFERENCE — the
+          // same array, `===` and every later write shared, Node's answer
+          // and the jsExit direction's (S044). Never a copy.
+          if (this.vecInfoFor(t, loc) === null) return false;
+          dyn.boxArr(c, (x) => x.localGet(0));
+          return true;
+        }
         const src = this.vecInfoFor(t, loc);
         const inner = this.dynFromHelper(t.elem, loc);
         if (src === null || inner === null) return false;
@@ -14522,24 +14532,11 @@ class Assembler {
         // conversion — exercised by every async member of the ten
         // TLA/import claims below.
         //
-        // array<jsval> (2633's `Promise<any[]>` shape) was DRAFTED here
-        // too — same representation argument, array<jsval>'s vector
-        // interns byte-identically to array<dyn>'s (vecKeyFor's jsval
-        // arm, §2b) — but PULLED before landing: no corpus program
-        // reaches it, and the corrected story is NOT "2633 refuses
-        // earlier, on jsMarshal" (an earlier draft's WRONG claim,
-        // measured false) — 2633's only diagnostic, as this tier
-        // stands, IS this pulled arm's own `expr:jsBridgePromise`
-        // refusal (emitJsBridgePromise's own doc has the full account);
-        // survey-accepting it hypothetically does not reach jsMarshal's
-        // unimplemented "promise" arm next either — the next gate is
-        // `expr:jsOp`, with jsMarshal's own gap surfacing only as a
-        // SEPARATE, non-blocking survey need alongside it. Landing this
-        // arm without a program to exercise it would still have shipped
-        // as unexecuted, unverified wasm bytecode — the stage-B
-        // "typechecks but never ran" lesson this increment's own brief
-        // warns against — so it stays pulled regardless of the order
-        // correction. Re-add under a program that actually reaches it.
+        // array<jsval> (2633's `Promise<any[]>` shape, unit P) takes the
+        // converter route below like any other composite: its payload is a
+        // typed vector, read through PROM_CONV at the first dyn read (the
+        // view is a fresh island array over the same elements). jsMarshal's
+        // own promise arm and island Promise.all's result box land here.
         //
         // Any OTHER inner type (INC-27 U4) boxes the SAME promise too —
         // identity stays the promise, so a second crossing is `===` —
@@ -15177,6 +15174,10 @@ class Assembler {
         this.emitKindIs(c, DK.UNDEF);
         return true;
       case "dyn":
+      // jsval ≡ dyn (increment 21): an island-value position (the elements
+      // of an `any[] | undefined` parameter's array arm — corpus 2633's
+      // `loadOthers(plugins)`) holds any value, exactly like `unknown`.
+      case "jsval":
         // An `unknown` arm: every dyn value fits, undefined included.
         c.i32Const(1);
         return true;
@@ -15499,6 +15500,9 @@ class Assembler {
         c.refCast(this.strType);
         return true;
       case "dyn":
+      // jsval ≡ dyn: an island-value slot passes through BY REFERENCE, the
+      // same as jsExit's own array<jsval> arm (S044).
+      case "jsval":
         // An `unknown` slot: the subtree passes through as-is — nothing
         // to validate, nothing to build.
         c.localGet(0);
@@ -15737,6 +15741,17 @@ class Assembler {
         return true;
       }
       case "array": {
+        if (t.elem.kind === "jsval") {
+          // Unit P (review B2): an `any[]` slot (an `any[] | undefined`
+          // parameter's array arm) takes the island array's vector BY
+          // REFERENCE — jsExit's own array<jsval> arm (S044), never a copy:
+          // a `push` through the parameter is the caller's array in Node.
+          // array<jsval>'s vector type IS the dyn ARR payload's (vecKeyFor).
+          if (this.vecInfoFor(t, loc) === null) return false;
+          kindGuard(DK.ARR);
+          dyn.arrPayload(c, (x) => x.localGet(0));
+          return true;
+        }
         const inner = this.dynCheckHelper(t.elem, loc);
         const out = this.vecInfoFor(t, loc);
         if (inner === null || out === null) return false;
@@ -28199,7 +28214,14 @@ class Assembler {
           // own undefined/null), the same walker an `unknown` crossing uses.
           // A URL crosses by reference (dynFromHelper's url arm).
           case "union":
-          case "url": {
+          case "url":
+          // Unit P (corpus 2633): a static promise crosses BY REFERENCE —
+          // dynFromHelper's promise arm boxes the promise struct itself as
+          // DK.PROMISE (INC-27 U4), so the island sees a real promise
+          // (`typeof` "object", `===` across crossings, `await`/`then`
+          // through %w.dynprom.resolve's identity) with Node's timing, and
+          // a non-dyn payload converts at the first dyn read (PROM_CONV).
+          case "promise": {
             // The composite conversion reuses dynFrom's per-typeKey
             // walker verbatim (dynFromHelper) — see the case header.
             const h = this.dynFromHelper(vt, e.loc);
@@ -28284,7 +28306,7 @@ class Assembler {
             return;
           }
           default:
-            // union/promise/object: legal jsMarshal sources per
+            // object: a legal jsMarshal source per
             // canMarshalIntoIsland/validate.ts, but NOT exercised by any
             // stage-A target program (op census: zero jsMarshal:in:<kind>
             // hits across the 64 for these) — each needs its own
@@ -28761,6 +28783,10 @@ class Assembler {
               }
               this.refuse(name === "abort" ? "fetch:AbortSignal.abort:reason" : `fetch:AbortSignal.${name}`, e.loc);
               code.unreachable();
+              return;
+            }
+            if (globalGetName === "Promise" && name === "all") {
+              this.emitIslandPromiseAll(e);
               return;
             }
             if (globalGetName === "Promise" && name === "resolve") {
@@ -29759,12 +29785,7 @@ class Assembler {
           this.openIfResult(this.vecs.vecRef(vecInfo));
           this.dyn.arrPayload(code, () => code.localGet(d));
           code.else_();
-          this.emitSetCellError(code, "%TypeError", "TypeError", (c) => {
-            this.pushStrLitInto(c, "expected an array, got ");
-            c.localGet(d);
-            c.call(this.dyn.typeOf());
-            c.call(this.concatHelper());
-          }, null);
+          this.emitArrExitFail(code, d);
           this.emitUnwind();
           this.close();
           this.releaseScratch(dynRef, d);
@@ -42914,7 +42935,7 @@ class Assembler {
       if (e.value.type.kind !== "jsval") return false;
       return (
         t.kind === "f64" || t.kind === "bool" || t.kind === "string" || t.kind === "record" ||
-        t.kind === "bytes" || t.kind === "union" || (t.kind === "array" && t.elem.kind !== "jsval")
+        t.kind === "bytes" || t.kind === "union" || t.kind === "array"
       );
     }
     if (e.kind !== "dynCheck" || e.value.type.kind !== "dyn") return false;
@@ -42990,6 +43011,37 @@ class Assembler {
     return idx;
   }
 
+  private jsExitArrField: number | null = null;
+
+  /** %w.isl.exit:arr(d, path) → the vector — jsExit's array<jsval> arm as
+   * a function (an island array's vector BY REFERENCE, S044; the cell set
+   * with emitArrExitFail's text otherwise), call-compatible with the
+   * %w.dyn.check walkers so the adoption reaction can take it. Null when
+   * the vector type is out of tier. */
+  private jsExitArrFn(t: IrType & { kind: "array" }, loc: SrcLoc | undefined): number | null {
+    if (this.jsExitArrField !== null) return this.jsExitArrField;
+    const info = this.vecInfoFor(t, loc);
+    if (info === null) return null;
+    const idx = this.mb.declareFunc(
+      this.mb.funcType([this.dyn.dynRef(), this.dyn.pathRef()], [this.vecs.vecRef(info)]),
+      "%w.isl.exit:arr",
+    );
+    this.jsExitArrField = idx;
+    const c = new Code();
+    c.localGet(0);
+    c.structGet(this.dyn.dynT(), DYN_KIND);
+    c.i32Const(DK.ARR);
+    c.i32Ne();
+    c.ifVoid();
+    this.emitArrExitFail(c, 0);
+    c.refNull(info.struct);
+    c.return_();
+    c.end();
+    this.dyn.arrPayload(c, (x) => x.localGet(0));
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
+
   /** %w.async.adoptAs:<T>(p, d) → 1 when `d` is a PROMISE box and the
    * resolution of `p` was taken over (adopted, ignored as already
    * resolved, or rejected as a chaining cycle); 0 for any other value.
@@ -42998,13 +43050,18 @@ class Assembler {
   private adoptAsFn(cast: TypedDynResolution, loc: SrcLoc | undefined): number | null {
     const t = cast.type;
     const exitScalar = cast.kind === "jsExit" && (t.kind === "f64" || t.kind === "bool" || t.kind === "string");
-    const key = `${exitScalar ? "exit:" : ""}${typeKey(t)}`;
+    // Unit P (review H1): jsExit's array<jsval> arm — `return x` from an
+    // async function typed `Promise<any[]>` — adopts a held promise too,
+    // and its cast is the exit's own by-reference array check.
+    const exitArr = cast.kind === "jsExit" && t.kind === "array" && t.elem.kind === "jsval";
+    const key = `${exitScalar || exitArr ? "exit:" : ""}${typeKey(t)}`;
     const hit = this.adoptAsFns.get(key);
     if (hit !== undefined) return hit;
     const val = this.mapType(t, loc);
     const check =
       val === null ? null
       : exitScalar ? this.jsExitScalarFn(t as IrType & { kind: "f64" | "bool" | "string" })
+      : exitArr ? this.jsExitArrFn(t as IrType & { kind: "array" }, loc)
       : this.dynCheckHelper(t, loc);
     const settler = val === null ? null : this.settlerFor(t, 1, loc);
     if (val === null || check === null || settler === null) {
@@ -43119,6 +43176,7 @@ class Assembler {
       c.refCast(promT);
       c.localSet(INNER);
       c.localGet(INNER);
+      c.call(this.bridgeRootFn()); // unit P: a bridged promise IS its source
       c.localGet(P);
       c.refEq();
       c.ifVoid();
@@ -43568,6 +43626,109 @@ class Assembler {
     c.localGet(RESULT);
     this.mb.setBody(idx, [promRef, I32, this.proms.allStateRef(), I32, closRef, promRef], c.bytes());
     return idx;
+  }
+
+  /** Island `Promise.all(x)` (unit P, corpus 2633): `x` is any island
+   * value. GetIterator over it is `dyn.spreadPush`'s iterator-protocol
+   * path (arrays element-wise, a hole as undefined, strings by code point,
+   * whatever else spreadPush/iterSrc iterate), and a non-iterable's
+   * TypeError — V8's own "<desc> is not iterable (cannot read property
+   * Symbol(Symbol.iterator))" — becomes a REJECTED result, never a
+   * synchronous throw (PerformPromiseAll's IfAbruptRejectPromise). Each
+   * element goes through PromiseResolve (%w.dynprom.resolve: a promise
+   * held in the value is itself, anything else a fresh fulfilled one, a
+   * thenable object settle's named refusal), and the static combinator
+   * (promiseAllFor over `Promise<any>` entries into an `any[]`) does the
+   * rest with Node's turn count. The result crosses back as a dyn PROMISE
+   * box (dynFromHelper's promise arm): a dyn reader sees its array through
+   * the PROM_CONV view. Arguments past the first are evaluated and
+   * ignored, as in JS. */
+  private emitIslandPromiseAll(e: Extract<IrExpr, { kind: "jsOp" }>): void {
+    const code = this.fn.code;
+    const valuesT: IrType = { kind: "array", elem: JSVAL };
+    const entries = this.vecInfoFor({ kind: "array", elem: { kind: "promise", inner: JSVAL } }, e.loc);
+    const values = this.vecInfoFor(valuesT, e.loc);
+    const box = this.dynFromHelper({ kind: "promise", inner: valuesT }, e.loc);
+    if (entries === null || values === null || box === null) {
+      code.unreachable();
+      return;
+    }
+    const all = this.promiseAllFor(entries, values);
+    const exc = this.exc();
+    const dynRef = this.dyn.dynRef();
+    const promRef = this.proms.promRef();
+    const psRef = this.vecs.vecRef(entries);
+    const src = this.acquireScratch(dynRef);
+    const flat = this.acquireScratch(this.dyn.arrRef());
+    const ps = this.acquireScratch(psRef);
+    const i = this.acquireScratch(I32);
+    const n = this.acquireScratch(I32);
+    const p = this.acquireScratch(promRef);
+    if (e.args.length > 1) this.walkExpr(e.args[1]!);
+    else code.globalGet(this.dyn.undefinedGlobal());
+    code.localSet(src);
+    for (const extra of e.args.slice(2)) {
+      this.walkExpr(extra);
+      code.drop();
+    }
+    this.dyn.pushNewArr(code);
+    code.localSet(flat);
+    code.localGet(flat);
+    code.localGet(src);
+    this.pushStrLitInto(code, "");
+    code.i32Const(1);
+    code.call(this.dyn.spreadPush());
+    code.globalGet(exc.kindG);
+    code.ifResult(promRef);
+    // GetIterator threw: the combinator's capability rejects with it.
+    code.call(this.proms.mint());
+    code.localSet(p);
+    code.localGet(p);
+    code.globalGet(exc.kindG);
+    code.globalGet(exc.f64G);
+    code.globalGet(exc.refG);
+    code.globalGet(exc.preG);
+    code.i32Const(2);
+    code.call(this.proms.settle());
+    this.emitCellClearInto(code);
+    code.localGet(p);
+    code.else_();
+    this.dyn.arrLen(code, (x) => x.localGet(flat));
+    code.localTee(n);
+    code.f64ConvertI32S();
+    code.call(this.vecs.newLen(entries));
+    code.localSet(ps);
+    code.i32Const(0);
+    code.localSet(i);
+    code.block();
+    code.loop();
+    code.localGet(i);
+    code.localGet(n);
+    code.i32GeU();
+    code.brIf(1);
+    code.localGet(ps);
+    code.localGet(i);
+    code.f64ConvertI32S();
+    this.dyn.arrAt(code, (x) => x.localGet(flat), (x) => x.localGet(i));
+    code.call(this.dynPromResolveFn());
+    code.call(this.vecs.set(entries));
+    code.localGet(i);
+    code.i32Const(1);
+    code.i32Add();
+    code.localSet(i);
+    code.br(0);
+    code.end();
+    code.end();
+    code.localGet(ps);
+    code.call(all);
+    code.end();
+    code.call(box);
+    this.releaseScratch(dynRef, src);
+    this.releaseScratch(this.dyn.arrRef(), flat);
+    this.releaseScratch(psRef, ps);
+    this.releaseScratch(I32, i);
+    this.releaseScratch(I32, n);
+    this.releaseScratch(promRef, p);
   }
 
   private emitPromiseAll(e: Extract<IrExpr, { kind: "intrinsic" }>): void {
@@ -44169,6 +44330,27 @@ class Assembler {
     // Boards #176/#177/#182/#184: settle adopts a PROMISE box (and refuses
     // a thenable object by name) wherever a dyn value can be a fulfilment.
     if (gated || this.settleAdoptNeeded) this.adoptInSettle(gated);
+    // Unit P: a module with a `Promise<any[]>` bridge settles its static
+    // promises from settle's epilogue and routes attaches to a bridged
+    // promise through subscribe's prologue (bridgeSettledFn, bridgeAttachFn).
+    if (this.bridgeSettledField !== null) {
+      const ep = new Code();
+      ep.localGet(0);
+      ep.call(this.bridgeSettledField);
+      if (!this.proms.appendSettleEpilog(ep.bytes())) {
+        throw new Error("wasm emitter bug: a Promise<any[]> bridge was emitted but settle was never built");
+      }
+      const sp = new Code();
+      sp.localGet(0);
+      sp.call(this.bridgeAttachFn());
+      sp.localSet(0);
+      // A module may bridge without ever subscribing to anything (nothing
+      // then attaches to a bridged promise, so there is nothing to route).
+      if (this.proms.subscribeBuilt()) {
+        if (!this.proms.prependSubscribeProlog(sp.bytes())) throw new Error("wasm emitter bug: subscribe prologue refused");
+      }
+    }
+    this.finalizeBridgeRoot();
     for (const d of this.dynPromDeferred) {
       const g = gated ? d.gated() : null;
       if (g !== null) this.mb.setBody(d.idx, g.locals, g.bytes);
@@ -44346,6 +44528,7 @@ class Assembler {
       c.localSet(INNER);
       // Resolving a promise with itself: Node's TypeError, as a rejection.
       c.localGet(INNER);
+      if (this.bridgeSettledField !== null) c.call(this.bridgeRootFn()); // unit P: a bridged promise IS its source
       c.localGet(P);
       c.refEq();
       c.ifVoid();
@@ -45095,6 +45278,7 @@ class Assembler {
     c.localSet(INNER);
     // Resolving a promise with itself: Node's TypeError.
     c.localGet(INNER);
+    c.call(this.bridgeRootFn()); // unit P: a bridged promise IS its source
     c.localGet(DST);
     c.refEq();
     c.ifVoid();
@@ -45217,6 +45401,326 @@ class Assembler {
     return idx;
   }
 
+  /** The island → static `any[]` exit's refusal, shared by jsExit's
+   * array arm and the `Promise<any[]>` bridge's reaction: the catchable
+   * TypeError "expected an array, got <typeof>" (scr_island.c's
+   * isl_exit_fail text, S009's footing — Node has no boundary here) set
+   * into the exception cell from the dyn value in local `d`. The caller
+   * unwinds or settles. */
+  private emitArrExitFail(c: Code, d: number): void {
+    this.emitSetCellError(c, "%TypeError", "TypeError", (x) => {
+      this.pushStrLitInto(x, "expected an array, got ");
+      x.localGet(d);
+      x.call(this.dyn.typeOf());
+      x.call(this.concatHelper());
+    }, null);
+  }
+
+  private bridgeArrSettleField: number | null = null;
+  private bridgeListT: number | null = null;
+  private bridgeListG: number | null = null;
+  private bridgeSettledField: number | null = null;
+
+  /** %w.jsval.bridgeArrSettle(dst, src) — settle the `Promise<any[]>`
+   * bridge's static promise DST from the SETTLED island promise SRC. A
+   * rejection copies raw; a fulfilment is read as a dyn value
+   * (%w.prom.readDyn — SRC may be a typed promise handed out by
+   * %w.dynprom.resolve's identity) and must be an island array, whose
+   * vector DST takes BY REFERENCE (S044); any other value rejects DST with
+   * emitArrExitFail's TypeError. Called the moment SRC is settled (at the
+   * bridge, or from settle's epilogue), so DST's waiters reach the queue
+   * when SRC's own reactions do — Node's position (see bridgeSettledFn). */
+  private bridgeArrSettleFn(): number {
+    if (this.bridgeArrSettleField !== null) return this.bridgeArrSettleField;
+    const promRef = this.proms.promRef();
+    const idx = this.mb.declareFunc(this.mb.funcType([promRef, promRef], []), "%w.jsval.bridgeArrSettle");
+    this.bridgeArrSettleField = idx;
+    const promT = this.proms.promT;
+    const dynT = this.dyn.dynT();
+    const exc = this.exc();
+    const settle = this.proms.settle();
+    const c = new Code();
+    const DST = 0, SRC = 1, V = 2;
+    c.localGet(SRC);
+    c.structGet(promT, PROM_STATE);
+    c.i32Const(2);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(DST);
+    c.localGet(SRC);
+    c.call(this.proms.settleFrom());
+    // The source's rejection, not a new one: in Node the static promise IS
+    // the source, so only the source's own unhandled report may fire (the
+    // caller keeps the pair linked so a later attach here handles it).
+    c.localGet(DST);
+    c.i32Const(1);
+    c.structSet(promT, PROM_OBSERVED);
+    c.return_();
+    c.end();
+    c.localGet(SRC);
+    c.call(this.promReadDynFn());
+    c.localSet(V);
+    c.localGet(V);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.ARR);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(DST);
+    c.i32Const(EXC_REF);
+    c.f64Const(0);
+    this.dyn.arrPayload(c, (x) => x.localGet(V));
+    c.i32Const(-1);
+    c.i32Const(1);
+    c.call(settle);
+    c.return_();
+    c.end();
+    this.emitArrExitFail(c, V);
+    c.localGet(DST);
+    c.globalGet(exc.kindG);
+    c.globalGet(exc.f64G);
+    c.globalGet(exc.refG);
+    c.globalGet(exc.preG);
+    c.i32Const(2);
+    c.call(settle);
+    this.emitCellClearInto(c);
+    this.mb.setBody(idx, [this.dyn.dynRef()], c.bytes());
+    return idx;
+  }
+
+  /** The bridge links: a module-global list of (src, dst, next) nodes,
+   * one per `Promise<any[]>` bridge whose static promise is still pending,
+   * or was rejected with its source's own reason (kept so a later attach
+   * to it marks the source handled). `next` is anyref (the node type
+   * cannot name itself outside a rec group); readers cast it back. */
+  private bridgeList(): { t: number; g: number } {
+    if (this.bridgeListT === null || this.bridgeListG === null) {
+      const promRef = this.proms.promRef();
+      this.bridgeListT = this.mb.structType([
+        { storage: promRef, mutable: false },
+        { storage: promRef, mutable: false },
+        { storage: ANY_REF, mutable: true },
+      ]);
+      this.bridgeListG = this.mb.addGlobal(ANY_REF, true, (w) => {
+        w.u8(0xd0);
+        w.sleb(ANY_HEAP);
+      });
+    }
+    return { t: this.bridgeListT, g: this.bridgeListG };
+  }
+
+  private bridgeAttachField: number | null = null;
+  private bridgeRootField: number | null = null;
+
+  /** %w.jsval.bridgeAttach(p) → the promise a waiter on `p` parks on —
+   * subscribe's prologue in a module with a `Promise<any[]>` bridge
+   * (finalizeDynProm prepends it). In Node the bridged static promise IS
+   * its island source, so attaching to it is attaching to the source:
+   * the source becomes handled (V8 marks a promise handled when a
+   * reaction is attached), and a waiter on a PENDING bridged promise is
+   * parked on the source itself (repeatedly, for a source that is itself
+   * a bridged promise), so static and island waiters share ONE list in
+   * attach order; settle's epilogue (bridgeSettledFn) has settled the
+   * static promise before any of them runs. Any other promise answers
+   * itself. */
+  private bridgeAttachFn(): number {
+    if (this.bridgeAttachField !== null) return this.bridgeAttachField;
+    const { t, g } = this.bridgeList();
+    const promRef = this.proms.promRef();
+    const promT = this.proms.promT;
+    const idx = this.mb.declareFunc(this.mb.funcType([promRef], [promRef]), "%w.jsval.bridgeAttach");
+    this.bridgeAttachField = idx;
+    const nodeRef: ValType = { kind: "ref", nullable: true, typeIndex: t };
+    const c = new Code();
+    const P = 0, N = 1;
+    c.block();
+    c.loop();
+    c.globalGet(g);
+    c.refCastNull(t);
+    c.localSet(N);
+    c.block();
+    c.loop();
+    c.localGet(N);
+    c.refIsNull();
+    c.brIf(3); // no node names P: done
+    c.localGet(N);
+    c.structGet(t, 1);
+    c.localGet(P);
+    c.refEq();
+    c.ifVoid();
+    c.localGet(N);
+    c.structGet(t, 0);
+    c.i32Const(1);
+    c.structSet(promT, PROM_OBSERVED);
+    c.localGet(P);
+    c.structGet(promT, PROM_STATE);
+    c.brIf(4); // a settled bridged promise keeps its waiter
+    c.localGet(N);
+    c.structGet(t, 0);
+    c.localSet(P);
+    c.br(3); // rescan for the new P
+    c.end();
+    c.localGet(N);
+    c.structGet(t, 2);
+    c.refCastNull(t);
+    c.localSet(N);
+    c.br(0);
+    c.end();
+    c.end();
+    c.br(0);
+    c.end();
+    c.end();
+    c.localGet(P);
+    this.mb.setBody(idx, [nodeRef], c.bytes());
+    return idx;
+  }
+
+  /** %w.jsval.bridgeRoot(p) → the island promise a bridged static promise
+   * stands for (followed through bridges of bridges), else `p` — what the
+   * resolve functions' self-resolution check compares, since in Node the
+   * bridged promise IS its source: resolving a source with its own bridge
+   * is Node's "Chaining cycle detected" TypeError, never two promises
+   * waiting on each other forever. Its body is set at finalizeDynProm
+   * (finalizeBridgeRoot): the identity in a module with no bridge. */
+  private bridgeRootFn(): number {
+    if (this.bridgeRootField !== null) return this.bridgeRootField;
+    const promRef = this.proms.promRef();
+    this.bridgeRootField = this.mb.declareFunc(this.mb.funcType([promRef], [promRef]), "%w.jsval.bridgeRoot");
+    return this.bridgeRootField;
+  }
+
+  private finalizeBridgeRoot(): void {
+    const idx = this.bridgeRootField;
+    if (idx === null) return;
+    const c = new Code();
+    if (this.bridgeListT === null || this.bridgeListG === null) {
+      c.localGet(0);
+      this.mb.setBody(idx, [], c.bytes());
+      return;
+    }
+    const t = this.bridgeListT, g = this.bridgeListG;
+    const P = 0, N = 1;
+    c.block();
+    c.loop();
+    c.globalGet(g);
+    c.refCastNull(t);
+    c.localSet(N);
+    c.block();
+    c.loop();
+    c.localGet(N);
+    c.refIsNull();
+    c.brIf(3);
+    c.localGet(N);
+    c.structGet(t, 1);
+    c.localGet(P);
+    c.refEq();
+    c.ifVoid();
+    c.localGet(N);
+    c.structGet(t, 0);
+    c.localSet(P);
+    c.br(3);
+    c.end();
+    c.localGet(N);
+    c.structGet(t, 2);
+    c.refCastNull(t);
+    c.localSet(N);
+    c.br(0);
+    c.end();
+    c.end();
+    c.br(0);
+    c.end();
+    c.end();
+    c.localGet(P);
+    this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: t }], c.bytes());
+  }
+
+  /** %w.jsval.bridgeSettled(p) — settle's epilogue in a module with a
+   * pending `Promise<any[]>` bridge (finalizeDynProm appends it): `p` was
+   * pending and is now settled, so every bridge whose source is `p`
+   * settles its static promise NOW, before any microtask runs, and leaves
+   * the list unless the source rejected (that link stays, see bridgeList). The static promise's waiters were parked on `p` itself
+   * (bridgeRedirectFn), so settle has just queued them with `p`'s island
+   * waiters in one attach order — Node's. A waiter attached after this
+   * point meets a settled promise and lands at the tail when it attaches,
+   * as in Node. */
+  private bridgeSettledFn(): number {
+    if (this.bridgeSettledField !== null) return this.bridgeSettledField;
+    const { t, g } = this.bridgeList();
+    const idx = this.mb.declareFunc(this.mb.funcType([this.proms.promRef()], []), "%w.jsval.bridgeSettled");
+    this.bridgeSettledField = idx;
+    const nodeRef: ValType = { kind: "ref", nullable: true, typeIndex: t };
+    const c = new Code();
+    const P = 0, N = 1, PREV = 2, NEXT = 3;
+    c.globalGet(g);
+    c.refIsNull();
+    c.ifVoid();
+    c.return_();
+    c.end();
+    c.globalGet(g);
+    c.refCast(t);
+    c.localSet(N);
+    c.block();
+    c.loop();
+    c.localGet(N);
+    c.refIsNull();
+    c.brIf(1);
+    c.localGet(N);
+    c.structGet(t, 2);
+    c.refCastNull(t);
+    c.localSet(NEXT);
+    c.localGet(N);
+    c.structGet(t, 0);
+    c.localGet(P);
+    c.refEq();
+    c.localGet(N);
+    c.structGet(t, 1);
+    c.structGet(this.proms.promT, PROM_STATE);
+    c.i32Eqz();
+    c.i32And();
+    c.ifVoid();
+    // Settle N's static promise from P.
+    c.localGet(N);
+    c.structGet(t, 1);
+    c.localGet(P);
+    c.call(this.bridgeArrSettleFn());
+    c.end();
+    // A static promise rejected with the source's own reason keeps its
+    // node (its later attaches mark the source handled, bridgeAttachFn)
+    // and is itself never reported: in Node it IS the source, whose own
+    // report stands for both. Every other settled node is unlinked.
+    c.localGet(N);
+    c.structGet(t, 1);
+    c.structGet(this.proms.promT, PROM_STATE);
+    c.i32Eqz();
+    c.localGet(N);
+    c.structGet(t, 0);
+    c.structGet(this.proms.promT, PROM_STATE);
+    c.i32Const(2);
+    c.i32Eq();
+    c.i32Or();
+    c.ifVoid();
+    c.localGet(N);
+    c.localSet(PREV);
+    c.else_();
+    c.localGet(PREV);
+    c.refIsNull();
+    c.ifVoid();
+    c.localGet(NEXT);
+    c.globalSet(g);
+    c.else_();
+    c.localGet(PREV);
+    c.localGet(NEXT);
+    c.structSet(t, 2);
+    c.end();
+    c.end();
+    c.localGet(NEXT);
+    c.localSet(N);
+    c.br(0);
+    c.end();
+    c.end();
+    this.mb.setBody(idx, [nodeRef, nodeRef, nodeRef], c.bytes());
+    return idx;
+  }
+
   /** Island → static PROMISE bridge.
    *
    * Boards #176/#184: every bridge but the import spine's is ECMA-262
@@ -45243,28 +45747,16 @@ class Assembler {
    * claims below need — the whole spine hardcodes `inner: JSVAL`
    * (lower-island.ts:318, :380).
    *
-   * `void` and `array<jsval>` (2633's `Promise<any[]>` shape, and a
-   * `Promise<void>`-typed await through a jsval boundary) were DRAFTED
-   * and PULLED before landing: no corpus program reaches either today
-   * (confirmed by disabling each in turn and re-running the full
-   * differential census — the claimed count and TIER_FLOOR were
-   * unchanged both times), so they would have shipped as unexecuted,
-   * unverified wasm bytecode — the stage-B "typechecks but never ran"
-   * lesson this increment's own brief warns against. MEASURED (not
-   * assumed): 2633's only diagnostic today IS this pulled arm's own
-   * refusal below — it is not gated any earlier by jsMarshal's own
-   * separate "promise" gap, and even survey-accepting this arm
-   * hypothetically does not reach jsMarshal next either; the next gate
-   * is `expr:jsOp` (a `Promise.all`-shaped island invoke need),
-   * jsMarshal's gap surfacing only as an ADDITIONAL, non-blocking
-   * survey need alongside it. Both pulled arms are straightforward to
-   * add back (void: settle the destination with a void payload on
-   * fulfilment, copy unread on rejection; array<jsval>: port
-   * scr_island.c's `isl_bridge_settle` SCR_ISLP_JSVAL_ARR arm +
-   * `scr_jsval_exit_jsval_arr` — Array.isArray-gated, elements BY
-   * REFERENCE, a non-array fulfillment rejecting with `isl_exit_fail`'s
-   * "expected an array, got <typeof>", S009's footing) — land each
-   * under a corpus program that actually exercises it end to end.
+   * `array<jsval>` (2633's `Promise<any[]>` shape) landed in unit P: the
+   * port of scr_island.c's `isl_bridge_settle` SCR_ISLP_JSVAL_ARR arm —
+   * Array.isArray-gated, the vector BY REFERENCE (S044), a non-array
+   * fulfilment rejecting with `isl_exit_fail`'s "expected an array, got
+   * <typeof>" (S009's footing) — through %w.jsval.bridgeArrSettle, run
+   * the moment the source settles (at the bridge, or from settle's
+   * epilogue, %w.jsval.bridgeSettled), so Node's queue order holds. `void` (a `Promise<void>`-typed
+   * await through a jsval boundary) stays pulled: no corpus program
+   * reaches it (add it back under one: settle the destination with a
+   * void payload on fulfilment, copy unread on rejection).
    * Refuses under the stable `expr:jsBridgePromise` aggregate (bucket
    * names are census currency; a fragmented per-shape name would sit
    * where the aggregate should — F12/SB11's precedent). */
@@ -45272,6 +45764,84 @@ class Assembler {
     const code = this.fn.code;
     if (e.type.kind !== "promise") throw new Error("jsBridgePromise result must be a promise (validator's contract)");
     const inner = e.type.inner;
+    if (inner.kind === "array" && inner.elem.kind === "jsval") {
+      // Unit P (corpus 2633): a `Promise<any[]>` slot. PromiseResolve
+      // over the value (the jsval arm's own first step), then a fresh
+      // static promise a reaction settles: a rejection copies, a
+      // fulfilment that is an island array hands its vector over BY
+      // REFERENCE (S044: the spine aliases, as in Node), anything else
+      // rejects with the jsExit array arm's own TypeError (the same
+      // emitArrExitFail text). The static promise settles exactly when the
+      // source does — at once when it already has, else from settle's
+      // epilogue — so no microtask turn is added (SEMANTICS.md S044's
+      // unit-P amendment).
+      if (this.vecInfoFor(inner, e.loc) === null) {
+        code.unreachable();
+        return;
+      }
+      // A static `Promise<any[]>` that crossed into the island (its
+      // PROM_CONV is array<jsval>'s converter: island Promise.all's result,
+      // a jsMarshal'd promise, a bridge that crossed back) already holds
+      // its fulfilment as the vector this slot wants: the bridge answers
+      // the promise itself, Node's identity.
+      const conv = this.dynPromConvFor(inner, e.loc);
+      if (conv === null) {
+        code.unreachable();
+        return;
+      }
+      this.markDynPromGate();
+      const promRef = this.proms.promRef();
+      const promT = this.proms.promT;
+      const srcP = this.acquireScratch(promRef);
+      const dst = this.acquireScratch(promRef);
+      this.walkExpr(e.value);
+      code.call(this.dynPromResolveFn());
+      code.localSet(srcP);
+      code.localGet(srcP);
+      code.structGet(promT, PROM_CONV);
+      code.i32Const(conv);
+      code.i32Eq();
+      code.ifResult(promRef);
+      code.localGet(srcP);
+      code.else_();
+      code.call(this.proms.mint());
+      code.localSet(dst);
+      const { t: listT, g: listG } = this.bridgeList();
+      this.bridgeSettledFn();
+      const link = (): void => {
+        code.localGet(srcP);
+        code.localGet(dst);
+        code.globalGet(listG);
+        code.structNew(listT);
+        code.globalSet(listG);
+      };
+      code.localGet(srcP);
+      code.structGet(promT, PROM_STATE);
+      code.ifVoid();
+      // Already settled: the static promise settles now, so a waiter
+      // attached later lands at the tail when it attaches — Node's place.
+      // A copied rejection stays linked (bridgeSettledFn's reasoning).
+      code.localGet(dst);
+      code.localGet(srcP);
+      code.call(this.bridgeArrSettleFn());
+      code.localGet(srcP);
+      code.structGet(promT, PROM_STATE);
+      code.i32Const(2);
+      code.i32Eq();
+      code.ifVoid();
+      link();
+      code.end();
+      code.else_();
+      // Pending: settle's epilogue settles it the moment the source does,
+      // and subscribe's prologue parks its waiters on the source.
+      link();
+      code.end();
+      code.localGet(dst);
+      code.end();
+      this.releaseScratch(this.proms.promRef(), srcP);
+      this.releaseScratch(this.proms.promRef(), dst);
+      return;
+    }
     if (inner.kind !== "jsval" && inner.kind !== "dyn") {
       this.refuse(`expr:${e.kind}`, e.loc);
       code.unreachable();

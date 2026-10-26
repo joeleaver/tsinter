@@ -1788,7 +1788,7 @@ const TIER_FLOOR: string[] = [
   // (blocked by the SAME func-arm gap this section closes); it now
   // refuses first on `dynFrom:promise:adapt` instead — a forward move
   // into stage-C (island promise bridge) territory, not a regression
-  // and not a new claim.
+  // and not a new claim. (Unit P claims it, at the end of TIER_FLOOR.)
   "2104-computed-key-destructuring.ts",
   "2170-island-array-exits.ts",
   "2171-island-json-stringify.ts",
@@ -1843,7 +1843,10 @@ const TIER_FLOOR: string[] = [
   // `jsBridgePromise` were drafted, found UNEXECUTED by the same
   // per-branch check, and pulled rather than shipped unverified — see
   // `emitJsBridgePromise`'s own doc for the native-reference port to
-  // restore each under a program that actually reaches it.
+  // restore each under a program that actually reaches it. (Unit P
+  // later landed the array<jsval> arm, with island Promise.all, jsMarshal's
+  // promise arm and dyn flat, claiming 2633 — see the end of TIER_FLOOR.
+  // `void` stays pulled.)
   //
   // Tier 646→657: 656 from the ten TLA/import claims measured against
   // the design doc's own prediction, 657 with 2685 — the mutation-
@@ -3586,6 +3589,12 @@ const TIER_FLOOR: string[] = [
   // (ieee754.ts, csubset.ts; SEMANTICS.md S100): 1073 -> 1075.
   "1110-math-members.ts",
   "2755-math-full-surface.ts",
+  // Unit P: a static promise crosses into `any` by reference (jsMarshal's
+  // promise arm), the `Promise<any[]>` bridge (array-gated, the vector by
+  // reference, settled with its source in Node's queue order), island Promise.all and
+  // the dyn Array.prototype.flat arm: 1075 -> 1076. The stage-C and increment-21 notes
+  // above that call 2633's array<jsval> bridge "pulled" are history.
+  "2633-island-promise-crossing.js",
 ];
 
 interface RunResult {
