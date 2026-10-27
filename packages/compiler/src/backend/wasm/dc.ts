@@ -46,6 +46,7 @@
  * nextTick callbacks the emitter wraps at the call site), and the
  * setImmediate function value's own capture. */
 import { Code } from "./code.js";
+import { emitFlatCast } from "./strings.js";
 import type { VecInfo } from "./arrays.js";
 import type { ByteWriter } from "./bytes.js";
 import { DK, DYN_KIND, DYN_NUM, DYN_REF, OBJ_PROTO, OBJ_PROTO_PLAIN, type DynBuilder } from "./dyn.js";
@@ -504,7 +505,7 @@ export class DcBuilder {
       pair((x) => {
         x.localGet(V);
         x.structGet(this.dyn.dynT(), DYN_REF);
-        x.refCast(this.deps.strType());
+        emitFlatCast(x, this.deps.strType());
       }, "a string");
       c.else_();
       is(DK.ARR);

@@ -94,6 +94,7 @@
  * destroy-on-exit, frontend-only; #76 repro derivation) + close-out. */
 import type { ByteWriter } from "./bytes.js";
 import { Code } from "./code.js";
+import { emitFlat } from "./strings.js";
 import { F64, I32, ModuleBuilder, type FieldType, type ValType } from "./module.js";
 import { LEN, BUF } from "./arrays.js";
 import { DK, DYN_KIND, DYN_REF } from "./dyn.js";
@@ -4080,6 +4081,8 @@ export class StreamBuilder {
       c.localSet(ELEM);
       c.localGet(ROOT);
       c.localGet(ELEM);
+      // A string[] element is a string VALUE; the queue holds it flat.
+      if (strings) emitFlat(c, this.deps.strType());
       c.i32Const(0); // front
       c.call(strings ? this.pushStrCore() : this.pushCore());
       c.drop();

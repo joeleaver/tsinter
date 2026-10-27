@@ -79,6 +79,7 @@
  * representable range, exact ties, long digit strings, and the exponent
  * overflow/underflow forms. */
 import { Code } from "./code.js";
+import { emitFlatCast } from "./strings.js";
 import { BYTES_PAYLOAD_IS_BUFFER, DK, DYN_KIND, DYN_NUM, DYN_REF, type DynBuilder } from "./dyn.js";
 import { F64, I32, I64, ModuleBuilder, type ValType } from "./module.js";
 
@@ -5030,7 +5031,7 @@ export class JsonBuilder {
       this.emitKindArm(c, K, [DK.STR], () => {
         c.localGet(0);
         c.structGet(dynT, DYN_REF);
-        c.refCast(strT);
+        emitFlatCast(c, strT);
         c.call(this.jbPutStr());
         c.i32Const(1);
         c.return_();
@@ -5372,7 +5373,7 @@ export class JsonBuilder {
           for (const [i, key] of ["%error", "name", "message", "stack"].entries()) {
             dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(0));
             c.structGet(dynT, DYN_REF);
-            c.refCast(strT);
+            emitFlatCast(c, strT);
             this.deps.lit(c, key);
             c.call(this.deps.strEq!());
             if (i > 0) c.i32Or();
@@ -5394,19 +5395,19 @@ export class JsonBuilder {
         c.localSet(FIRST);
         dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(0));
         c.structGet(dynT, DYN_REF);
-        c.refCast(strT);
+        emitFlatCast(c, strT);
         c.call(this.jbPutStr());
         c.i32Const(0x3a); // ':'
         c.call(this.jbPutc());
         // The edge, for the circular message's `property 'x'` line.
         dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(0));
         c.structGet(dynT, DYN_REF);
-        c.refCast(strT);
+        emitFlatCast(c, strT);
         c.call(this.jbEdgeProp());
         // SB8: the member's key is its OWN name.
         dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(0));
         c.structGet(dynT, DYN_REF);
-        c.refCast(strT);
+        emitFlatCast(c, strT);
         c.globalSet(this.jbToJsonKey());
         c.i32Const(0);
         c.globalSet(this.jbSkipToJson());

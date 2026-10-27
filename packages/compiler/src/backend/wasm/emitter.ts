@@ -236,7 +236,7 @@ import {
   INJECT_NEXT,
   INJECT_THROW,
 } from "./generators.js";
-import { StrBuilder } from "./strings.js";
+import { StrBuilder, emitFlat, emitFlatCast } from "./strings.js";
 import { CasingBuilder } from "./casing.js";
 import { RegexBuilder } from "./regex-value.js";
 import { RegexStateBuilder } from "./regex-state.js";
@@ -330,6 +330,66 @@ function capturesOwnBinding(init: unknown, localId: string): boolean {
   };
   return visit(init);
 }
+
+/** Child keys of an IR node whose expression only MOVES into value
+ * storage — exactly the operands the emitter walks with walkValue (a
+ * store's value, a return, call arguments, literal elements/fields, an
+ * element/field set, a union wrap). Every other operand position is
+ * walked with walkExpr, i.e. read FLAT. */
+const VALUE_POSITIONS: ReadonlyMap<string, readonly string[]> = new Map([
+  ["varDecl", ["init"]],
+  ["assign", ["value"]],
+  ["return", ["value"]],
+  ["arraySet", ["value"]],
+  ["recordSet", ["value"]],
+  ["call", ["args"]],
+  ["callValue", ["args"]],
+  ["arrayLit", ["elems"]],
+  ["unionWrap", ["value"]],
+]);
+
+/** The ids among `ids` that some `varRef` in `roots` reads in a
+ * NON-value position — the bindings with a code-unit read (strings unit
+ * S1: their flat shadow is filled at every write rather than tested at
+ * every read). A pure performance prescan: a binding it misses still
+ * reads correctly through the tested (lazy) path, and one it wrongly
+ * includes only pays a flatten per write. */
+function flatReadIds(roots: unknown, ids: ReadonlySet<string>): Set<string> {
+  const out = new Set<string>();
+  const seen = new Set<object>();
+  const visit = (v: unknown, valuePos: boolean): void => {
+    if (v === null || typeof v !== "object" || seen.has(v)) return;
+    seen.add(v);
+    if (Array.isArray(v)) {
+      for (const x of v) visit(x, valuePos);
+      return;
+    }
+    const o = v as { kind?: unknown; localId?: unknown; fields?: unknown };
+    if (o.kind === "varRef") {
+      if (!valuePos && typeof o.localId === "string" && ids.has(o.localId)) out.add(o.localId);
+      return;
+    }
+    const moves = typeof o.kind === "string" ? VALUE_POSITIONS.get(o.kind) : undefined;
+    for (const [k, x] of Object.entries(o)) {
+      if (o.kind === "recordLit" && k === "fields" && Array.isArray(x)) {
+        for (const f of x) {
+          if (f !== null && typeof f === "object") {
+            for (const [fk, fx] of Object.entries(f as object)) visit(fx, fk === "value");
+          }
+        }
+        continue;
+      }
+      visit(x, moves !== undefined && moves.includes(k));
+    }
+  };
+  visit(roots, false);
+  return out;
+}
+
+/** TSINTER_WASM_FLAT_CHECK=1: every no-test read of a filled flat shadow
+ * also re-flattens the binding and traps unless the two agree — the
+ * debug check that no write skipped the bindingSet funnel. */
+const FLAT_CHECK = process.env["TSINTER_WASM_FLAT_CHECK"] === "1";
 
 function valKey(t: ValType): string {
   return t.kind === "ref" ? `r${t.nullable ? "?" : ""}${t.typeIndex}` : t.kind;
@@ -1596,6 +1656,17 @@ interface FnState {
   localById: Map<string, IrLocal>;
   /** Non-param locals' wasm types, extended by scratch allocation. */
   localsOut: ValType[];
+  /** Strings unit S1: an unboxed string param/local's FLAT SHADOW — a
+   * `(ref null $chars)` slot caching the flat form of the value the
+   * binding holds. Every write goes through bindingSet, which keeps it
+   * in step. A hot loop over a string binding flattens once, not per
+   * access (measured: a per-read cast cost a charCodeAt lexer ~18%). */
+  flatShadow: Map<string, number>;
+  /** The shadowed bindings with a code-unit read (flatReadIds): their
+   * shadow is FILLED at every write (params also on entry) and read with
+   * no test. The others are LAZY: a write clears the shadow and a flat
+   * read tests it — so `const r = a + b; return r` never flattens. */
+  eagerFlat: Set<string>;
   /** Scratch locals, pooled per type so heavy functions don't grow a
    * local per use site. */
   scratchFree: Map<string, number[]>;
@@ -2362,6 +2433,12 @@ const BOOLEAN_PROTO_MEMBERS: ReadonlySet<string> = new Set(["toString", "valueOf
  * slot every thrown ref shares. */
 const ANY_HEAP = -0x12;
 const ANY_REF: ValType = { kind: "ref", nullable: true, typeIndex: ANY_HEAP };
+/** Expression kinds whose string result is a freshly built or interned
+ * flat `$chars` (never read back from value storage): walkExpr skips the
+ * flatten cast after them. */
+const FLAT_STRING_EXPRS: ReadonlySet<string> = new Set(["strLit", "strConcat", "strIntrinsic", "toString"]);
+/** The string value type (strings unit S1): `(ref null eq)`. See strVal. */
+const STR_VAL: ValType = { kind: "ref", nullable: true, typeIndex: -0x13 };
 
 /** The abstract `eq` heap type's s33 encoding (events.ts/dyn.ts/json.ts's
  * own EQ_HEAP) — the entry registry's `clos`/`thunk`/`orig` fields are
@@ -2412,6 +2489,10 @@ class Assembler {
   private readonly globalById = new Map<string, IrGlobal>();
   private readonly unionsById = new Map<string, IrUnionDef>();
   private readonly globalWasmIndex = new Map<string, number>();
+  /** Strings unit S1: a string global's FLAT SHADOW global (the local
+   * flatShadow, module-wide) — minted with the global itself
+   * (globalIndex), so every write site finds it. */
+  private readonly globalFlatShadow = new Map<string, number>();
   private readonly funcIndexByName = new Map<string, number>();
   private readonly funcByName = new Map<string, WFunction>();
   private readonly strType: number;
@@ -3347,7 +3428,7 @@ class Assembler {
     c.i32Eq();
     c.ifVoid();
     c.globalGet(exc.refG);
-    c.refCast(this.strType);
+    emitFlatCast(c, this.strType);
     c.call(out.stage);
     c.else_();
     c.localGet(K);
@@ -3896,7 +3977,7 @@ class Assembler {
       c.ifResult(this.strRef);
       c.localGet(V);
       c.structGet(dynT, DYN_REF);
-      c.refCast(this.strType);
+      emitFlatCast(c, this.strType);
       c.else_();
       c.refNull(this.strType);
       c.end();
@@ -4954,6 +5035,27 @@ class Assembler {
    * NULL until its first assign; definite assignment keeps reads off it). */
   private get strRef(): ValType {
     return { kind: "ref", nullable: true, typeIndex: this.strType };
+  }
+
+  /** The string VALUE type (strings unit S1): what a string-typed binding,
+   * parameter, result, field, element or capture holds — `(ref null eq)`,
+   * the one type a flat `$chars` array (`strRef` above) and the later rope
+   * and slice nodes all fit. Every reader that needs code units goes
+   * through `emitFlat`, and walkExpr applies it to every string-typed
+   * expression, so the expression walk always leaves a flat `$chars`
+   * on the stack; a raw read of value storage that skips it cannot flow
+   * where `$chars` is expected without failing validation. */
+  private get strVal(): ValType {
+    return STR_VAL;
+  }
+
+  /** Flatten-if-needed: the value on the stack (any string value — eqref
+   * or anyref storage, nullable) becomes a `(ref null $chars)`. Only flat
+   * strings exist yet, so this is a cast (free where V8 already knows the
+   * operand is flat); ropes and slices make it the inline fast path plus
+   * a `%w.flat` call. */
+  private emitFlat(code: Code = this.fn.code): void {
+    emitFlat(code, this.strType);
   }
 
   /* ── closures ───────────────────────────────────────────────────────────
@@ -7850,7 +7952,8 @@ class Assembler {
                 c.ifResult(bytesRefType);
                 c.localGet(2);
                 c.refCast(stringArmStruct!);
-                c.structGet(stringArmStruct!, 1); // PAYLOAD: strRef
+                c.structGet(stringArmStruct!, 1); // PAYLOAD: a string value
+                this.emitFlat(c);
                 c.call(this.bytesB.fromStrHelper("utf8"));
                 c.else_();
                 inner();
@@ -8063,7 +8166,7 @@ class Assembler {
       c.ifResult(bytesRefType);
       c.localGet(ARG1);
       c.structGet(this.dyn.dynT(), DYN_REF);
-      c.refCast(this.strType);
+      emitFlatCast(c, this.strType);
       c.call(this.bytesB.fromStrHelper("utf8"));
       c.else_();
       c.refNull(this.bytesB.bytesType());
@@ -8828,7 +8931,7 @@ class Assembler {
     const ENCVAL = this.acquireScratch(this.strRef);
     code.localGet(ENC);
     code.structGet(dynT, DYN_REF);
-    code.refCast(this.strType);
+    emitFlatCast(code, this.strType);
     code.localSet(ENCVAL);
     code.localGet(ENCVAL);
     this.pushStrLitInto(code, "utf8");
@@ -9867,7 +9970,7 @@ class Assembler {
       stringVecInfo: () => this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!,
       stringVecRef: () => this.vecs.vecRef(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
       stringVecNewLen: () => this.vecs.newLen(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
-      stringVecGet: () => this.vecs.get(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
+      stringVecGet: () => this.vecs.getFlat(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
       stringVecSet: () => this.vecs.set(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
       stringVecPushOne: () =>
         this.vecs.pushOne(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
@@ -9916,7 +10019,7 @@ class Assembler {
       strEq: () => this.strEqHelper(),
       stringVecInfo: () => this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!,
       stringVecRef: () => this.vecs.vecRef(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
-      stringVecGet: () => this.vecs.get(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
+      stringVecGet: () => this.vecs.getFlat(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
       stringVecNewLen: () => this.vecs.newLen(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
       stringVecSet: () => this.vecs.set(this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!),
     });
@@ -10181,7 +10284,7 @@ class Assembler {
       },
       stringVecRef: () => this.vecs.vecRef(strVec()),
       stringVecLen: (c) => c.structGet(strVec().struct, LEN),
-      stringVecGet: () => this.vecs.get(strVec()),
+      stringVecGet: () => this.vecs.getFlat(strVec()),
       bytesRef: () => this.bytesB.bytesRef(),
       bytesFromStrUtf8: () => this.bytesB.fromStrHelper("utf8"),
       bytesLength: () => this.bytesB.length(),
@@ -10647,7 +10750,7 @@ class Assembler {
       },
       voidClos: () => this.closPairFor([], []),
       errClos: () => this.closPairFor([{ kind: "ref", nullable: true, typeIndex: this.exc().errT }], []),
-      msgClos: () => this.closPairFor([this.bytesB.bytesRef(), this.strRef, this.strRef, F64, F64], []),
+      msgClos: () => this.closPairFor([this.bytesB.bytesRef(), this.strVal, this.strVal, F64, F64], []),
       nextTickEnqueue: () => this.nextTick.enqueue(),
       excKind: () => this.exc().kindG,
       errType: () => this.exc().errT,
@@ -11650,11 +11753,11 @@ class Assembler {
     c.localGet(S);
     c.localGet(D);
     c.structGet(dynT, 2);
-    c.refCast(this.strType);
+    emitFlatCast(c, this.strType);
     c.call(this.bytesB.fromStrHelper("utf8"));
     c.localGet(D);
     c.structGet(dynT, 2);
-    c.refCast(this.strType);
+    emitFlatCast(c, this.strType);
     c.arrayLen();
     c.localGet(CB);
     c.call(write ? this.net.sockWriteHelper() : this.net.sockEndHelper());
@@ -12019,7 +12122,7 @@ class Assembler {
     const strArg = (local: number, value: string): void => {
       c.localGet(local);
       c.structGet(dynT, DYN_REF);
-      c.refCast(this.strType);
+      emitFlatCast(c, this.strType);
       this.pushStrLitInto(c, value);
       c.call(this.strEqHelper());
     };
@@ -12092,7 +12195,7 @@ class Assembler {
         this.pushStrLitInto(c2, `'${method}' for the event '`);
         c2.localGet(A0);
         c2.structGet(dynT, DYN_REF);
-        c2.refCast(this.strType);
+        emitFlatCast(c2, this.strType);
         c2.call(this.concatHelper());
         this.pushStrLitInto(c2, "' on a net handle is not supported yet");
         c2.call(this.concatHelper());
@@ -12797,7 +12900,7 @@ class Assembler {
     const key = `${user.clos}:${p1 === undefined ? "-" : (p1 as { shapeId: string }).shapeId}:${cbType.params.length}`;
     const hit = this.dgramMsgAdapters.get(key);
     if (hit !== undefined) return hit;
-    const fixed = this.closPairFor([this.bytesB.bytesRef(), this.strRef, this.strRef, F64, F64], []);
+    const fixed = this.closPairFor([this.bytesB.bytesRef(), this.strVal, this.strVal, F64, F64], []);
     const env = this.mb.subStructType(
       `dgramMsgEnv:${key}`,
       [
@@ -13131,10 +13234,7 @@ class Assembler {
         code.localGet(R);
         code.call(h.incRawHeadersFn());
         code.localTee(T);
-        code.arrayLen();
-        code.localGet(T);
-        code.refAsNonNull();
-        code.structNew(strVec.struct);
+        code.call(this.vecs.fromFlatBuf(strVec));
         code.localSet(V);
         code.localGet(R);
         code.localGet(V);
@@ -13155,10 +13255,7 @@ class Assembler {
         code.localSet(T);
         this.emitPendingCheck();
         code.localGet(T);
-        code.arrayLen();
-        code.localGet(T);
-        code.refAsNonNull();
-        code.structNew(strVec.struct);
+        code.call(this.vecs.fromFlatBuf(strVec));
         this.releaseScratch({ kind: "ref", nullable: true, typeIndex: h.strArrT }, T);
         return true;
       }
@@ -13330,9 +13427,9 @@ class Assembler {
         arg(2);
         code.structGet(strVec.struct, LEN);
         arg(2);
-        code.structGet(strVec.struct, BUF);
+        code.call(this.vecs.flatBuf(strVec));
         arg(3);
-        code.structGet(strVec.struct, BUF);
+        code.call(this.vecs.flatBuf(strVec));
         code.call(h.resWriteHeadNVFn());
         this.emitPendingCheck();
         return true;
@@ -13346,7 +13443,7 @@ class Assembler {
         arg(2);
         code.structGet(strVec.struct, LEN);
         arg(2);
-        code.structGet(strVec.struct, BUF);
+        code.call(this.vecs.flatBuf(strVec));
         code.i32Const(isObject ? 1 : 2);
         code.call(h.resWriteHeadPairsFn());
         this.emitPendingCheck();
@@ -13438,7 +13535,7 @@ class Assembler {
         this.releaseScratch(this.dyn.dynRef(), TD);
         this.walkExpr(headersArg);
         code.localTee(V);
-        code.structGet(strVec.struct, BUF);
+        code.call(this.vecs.flatBuf(strVec));
         code.localGet(V);
         code.structGet(strVec.struct, LEN);
         // the agent option, evaluated once
@@ -14520,7 +14617,7 @@ class Assembler {
           this.pushStrLitInto(c2, `'${method}' for the event '`);
           c2.localGet(A0);
           c2.structGet(dynT, DYN_REF);
-          c2.refCast(this.strType);
+          emitFlatCast(c2, this.strType);
           c2.call(this.concatHelper());
           this.pushStrLitInto(c2, "' on an http handle is not supported yet");
           c2.call(this.concatHelper());
@@ -14746,7 +14843,7 @@ class Assembler {
       strRef: () => this.strRef,
       strType: () => this.strType,
       pushStrLit: (c, value) => this.pushStrLitInto(c, value),
-      strClos: () => this.closPairFor([this.strRef], []),
+      strClos: () => this.closPairFor([this.strVal], []),
       stdin: this.hevStdin,
       stdinCallFunc: () => {
         if (this.stdinCallFunc === null) throw new Error("emitter bug: process.stdin was reached but tsinter.stdinCall was never imported");
@@ -14801,7 +14898,7 @@ class Assembler {
       },
       stringVecRef: () => this.vecs.vecRef(strVec()),
       stringVecLen: (c) => c.structGet(strVec().struct, LEN),
-      stringVecGet: () => this.vecs.get(strVec()),
+      stringVecGet: () => this.vecs.getFlat(strVec()),
       envPairs: () => this.proc.envPairs(),
       stageRun: () => this.cp.stageRunHelper(),
       checkFile: () => this.cp.checkFileHelper(),
@@ -15387,7 +15484,7 @@ class Assembler {
           c.localSet(keys);
           const oi = this.wlocal(w, I32);
           const on = this.wlocal(w, I32);
-          const okey = this.wlocal(w, keysVec.elemVal);
+          const okey = this.wlocal(w, this.strRef);
           const oval = this.wlocal(w, info.overflow.valVal);
           c.localGet(keys);
           c.structGet(keysVec.struct, 0);
@@ -15404,6 +15501,7 @@ class Assembler {
           c.structGet(keysVec.struct, 1);
           c.localGet(oi);
           this.vecs.emitElemRead(c, keysVec);
+          this.emitFlat(c);
           c.localSet(okey);
           // The found flag is always true here — okey came from this
           // exact map's own keysJsOrder scan moments ago, and nothing
@@ -15740,6 +15838,7 @@ class Assembler {
         return true;
       case "string":
         c.localGet(0);
+        this.emitFlat(c);
         c.call(json.jbPutStr());
         return true;
       case "record": {
@@ -15923,7 +16022,7 @@ class Assembler {
           c.localSet(keys);
           const oi = this.wlocal(w, I32);
           const on = this.wlocal(w, I32);
-          const okey = this.wlocal(w, keysVec.elemVal);
+          const okey = this.wlocal(w, this.strRef);
           const oval = this.wlocal(w, info.overflow.valVal);
           c.localGet(keys);
           c.structGet(keysVec.struct, 0);
@@ -15940,6 +16039,7 @@ class Assembler {
           c.structGet(keysVec.struct, 1);
           c.localGet(oi);
           this.vecs.emitElemRead(c, keysVec);
+          this.emitFlat(c);
           c.localSet(okey);
           // The found flag is always true here — okey came from this
           // exact map's own keysJsOrder scan moments ago, and nothing
@@ -16497,7 +16597,7 @@ class Assembler {
         kindGuard(DK.STR);
         c.localGet(0);
         c.structGet(dyn.dynT(), DYN_REF);
-        c.refCast(this.strType);
+        emitFlatCast(c, this.strType);
         return true;
       case "dyn":
       // jsval ≡ dyn: an island-value slot passes through BY REFERENCE, the
@@ -17578,7 +17678,7 @@ class Assembler {
     this.dyn.boxStr(c, (x) => {
       x.localGet(p);
       x.structGet(this.proms.promT, PROM_REF);
-      x.refCast(this.strType);
+      emitFlatCast(x, this.strType);
     });
     c.else_();
     c.localGet(k);
@@ -17833,6 +17933,12 @@ class Assembler {
         return;
       }
     }
+    if (t.kind === "string") {
+      // A null FLAT string: valid in a string-value field and in the
+      // builtin error prefix's flat name/message/%code slots alike.
+      code.refNull(this.strType);
+      return;
+    }
     const soft = this.mapTypeSoft(t);
     switch (soft.kind) {
       case "f64":
@@ -17869,7 +17975,7 @@ class Assembler {
       case "bool":
         return I32;
       case "string":
-        return { kind: "ref", nullable: true, typeIndex: this.strType };
+        return this.strVal;
       case "array": {
         // Recursive: the ELEMENT representation is what can refuse.
         const info = this.vecInfoFor(t, loc);
@@ -18094,7 +18200,7 @@ class Assembler {
         // update it there too.
         return I32;
       case "string":
-        return { kind: "ref", nullable: true, typeIndex: this.strType };
+        return this.strVal;
       case "array": {
         // Must produce the SAME type mapType would wherever mapType
         // succeeds — a placeholder there makes two views of one
@@ -18290,6 +18396,7 @@ class Assembler {
     if (idx === undefined) return false;
     const c = new Code();
     c.localGet(1); // arg0 is the closure (uniform ABI)
+    this.emitFlat(c);
     c.call(this.strs.chars());
     this.mb.setBody(idx, [], c.bytes());
     return true;
@@ -18329,12 +18436,25 @@ class Assembler {
       localIndex.set(l.id, fn.params.length + 1 + localsOut.length);
       localsOut.push(l.boxed === true ? this.boxRefForLocal(l) : this.mapTypeSoft(l.type));
     }
+    // Flat shadows (strings unit S1) for every unboxed string binding,
+    // params included — all start null ("not yet flattened").
+    const flatShadow = new Map<string, number>();
+    const shadowed = new Set<string>();
+    for (const p of fn.params) if (p.type.kind === "string" && localById.get(p.localId)?.boxed !== true) shadowed.add(p.localId);
+    for (const l of fn.locals) if (l.type.kind === "string" && l.boxed !== true) shadowed.add(l.id);
+    for (const id of shadowed) {
+      flatShadow.set(id, fn.params.length + 1 + localsOut.length);
+      localsOut.push(this.strRef);
+    }
+    const eagerFlat = shadowed.size > 0 ? flatReadIds(fn.body, shadowed) : new Set<string>();
     this.fn = {
       fn,
       code: new Code(),
       localIndex,
       localById,
       localsOut,
+      flatShadow,
+      eagerFlat,
       scratchFree: new Map(),
       depth: 0,
       control: [],
@@ -18390,7 +18510,7 @@ class Assembler {
       captures.forEach((c, i) => {
         code.localGet(envScratch);
         code.structGet(env, 1 + i);
-        code.localSet(this.localIndex(c.localId));
+        this.rawSlotSet(c.localId);
       });
       this.releaseScratch({ kind: "ref", nullable: true, typeIndex: env }, envScratch);
     }
@@ -18422,7 +18542,21 @@ class Assembler {
 
     const index = this.funcIndexByName.get(fn.name);
     if (index === undefined) throw new Error(`walked undeclared function "${fn.name}"`);
-    this.mb.setBody(index, this.fn.localsOut, this.fn.code.bytes());
+    // Entry fill of the eager string params' shadows (the call is their
+    // first write). Built after the body only so it can sit in front.
+    const prologue = new Code();
+    for (const p of fn.params) {
+      if (!this.fn.eagerFlat.has(p.localId)) continue;
+      prologue.localGet(this.localIndex(p.localId));
+      this.emitFlat(prologue);
+      prologue.localSet(this.fn.flatShadow.get(p.localId)!);
+    }
+    const bodyBytes = this.fn.code.bytes();
+    const pro = prologue.bytes();
+    const all = new Uint8Array(pro.length + bodyBytes.length);
+    all.set(pro, 0);
+    all.set(bodyBytes, pro.length);
+    this.mb.setBody(index, this.fn.localsOut, all);
   }
 
   private walkBody(body: WStmt[]): void {
@@ -18539,7 +18673,7 @@ class Assembler {
             code.structNewDefault(box);
             code.localSet(slot);
             code.localGet(slot);
-            this.walkExpr(s.init);
+            this.walkValue(s.init);
             if (local.tdz === true) {
               const inner = this.tdzInnerFor(this.mapTypeSoft(local.type));
               if (inner !== null) code.structNew(inner);
@@ -18548,7 +18682,7 @@ class Assembler {
             return;
           }
           if (s.init !== null) {
-            this.walkExpr(s.init);
+            this.walkValue(s.init);
             if (local.tdz === true) {
               const inner = this.tdzInnerFor(this.mapTypeSoft(local.type));
               if (inner !== null) code.structNew(inner);
@@ -18557,7 +18691,7 @@ class Assembler {
           } else {
             code.structNewDefault(box);
           }
-          code.localSet(this.localIndex(s.localId));
+          this.rawSlotSet(s.localId);
           return;
         }
         // Declared-uninitialized needs nothing: wasm locals are zeroed and
@@ -18577,7 +18711,7 @@ class Assembler {
         const fin = this.fn.finallyStack[this.fn.finallyStack.length - 1];
         if (fin !== undefined) {
           if (s.value !== null) {
-            this.walkExpr(s.value);
+            this.walkValue(s.value);
             if (this.fn.pretLocal === null) {
               this.fn.pretLocal = this.acquireScratch(this.mapTypeSoft(this.fn.fn.returnType));
               // Never released: the slot is live until the function ends.
@@ -18588,7 +18722,7 @@ class Assembler {
           this.brTo(fin.pos, false);
           return;
         }
-        if (s.value !== null) this.walkExpr(s.value);
+        if (s.value !== null) this.walkValue(s.value);
         code.return_();
         return;
       }
@@ -18710,7 +18844,7 @@ class Assembler {
         if (info === null) return; // elem-type refusal already recorded
         this.walkExpr(s.arr);
         this.walkExpr(s.index);
-        this.walkExpr(s.value);
+        this.walkValue(s.value);
         code.call(this.vecs.set(info));
         return;
       }
@@ -18756,7 +18890,8 @@ class Assembler {
             code.structNew(this.boxTypeForLocal(bindingLocal));
           }
         }
-        code.localSet(this.localIndex(s.localId));
+        if (this.fn.localById.get(s.localId)?.boxed === true) this.rawSlotSet(s.localId);
+        else this.bindingSet(s.localId, s.loc, false, false);
         const continuePos = this.openBlock();
         this.fn.control.push({ kind: "loop", labels: s.labels ?? [], breakPos, continuePos });
         this.walkBody(s.body);
@@ -18780,7 +18915,7 @@ class Assembler {
         const idx = info.fieldIndex.get(s.field);
         if (idx === undefined) throw new Error(`recordSet field ${s.field} not on shape ${s.shapeId}`);
         this.walkExpr(s.obj);
-        this.walkExpr(s.value);
+        this.walkValue(s.value);
         code.structSet(info.struct, idx);
         return;
       }
@@ -18997,7 +19132,7 @@ class Assembler {
             if (local?.boxed === true) {
               code.structNew(this.boxTypeForLocal(local));
             }
-            code.localSet(this.localIndex(s.catchLocalId));
+            this.rawSlotSet(s.catchLocalId);
           }
           this.emitCellClear();
           // Exceptions from the CATCH body unwind to the exception-path
@@ -19142,7 +19277,7 @@ class Assembler {
         const local = this.fn.localById.get(s.localId);
         if (local?.boxed !== true) throw new Error(`%async.boxInit on non-boxed local "${s.localId}"`);
         code.structNewDefault(this.boxTypeForLocal(local));
-        code.localSet(this.localIndex(s.localId));
+        this.rawSlotSet(s.localId);
         return;
       }
 
@@ -19409,17 +19544,11 @@ class Assembler {
    * slot lazily, right here at first use; a boxed local writes THROUGH
    * its box (the shared binding every capture sees). */
   private storeVar(localId: string, value: WExpr, loc: SrcLoc): void {
-    const global = this.globalById.get(localId);
-    if (global !== undefined) {
-      this.walkExpr(value);
-      this.fn.code.globalSet(this.globalIndex(global, loc));
-      return;
-    }
     const local = this.fn.localById.get(localId);
     if (local?.boxed === true) {
       const box = this.boxTypeForLocal(local);
       this.fn.code.localGet(this.localIndex(localId));
-      this.walkExpr(value);
+      this.walkValue(value);
       if (local.tdz === true) {
         // The initializing assign fills the tdz slot: scalars wrap in
         // their indirection struct (the non-null ref IS "initialized").
@@ -19429,8 +19558,109 @@ class Assembler {
       this.fn.code.structSet(box, 0);
       return;
     }
-    this.walkExpr(value);
+    if (value.type.kind === "string" && this.bindingShadow(localId, loc) !== undefined) {
+      if (FLAT_STRING_EXPRS.has(value.kind)) {
+        // Statically flat: it fills the shadow as it is stored.
+        this.walkExprValue(value);
+        this.bindingSet(localId, loc, true, false);
+        return;
+      }
+      if (this.bindingEager(localId)) {
+        // Read flat somewhere: flatten once here, not at the reads.
+        this.walkExpr(value);
+        this.bindingSet(localId, loc, true, false);
+        return;
+      }
+    }
+    this.walkValue(value);
+    this.bindingSet(localId, loc, false, false);
+  }
+
+  /** A slot write that bypasses bindingSet — legal only for a binding
+   * with no flat shadow (a box, a catch binding, a capture's box). A
+   * cached string binding written here would leave its shadow stale, so
+   * this refuses to emit that write at all. */
+  private rawSlotSet(localId: string): void {
+    if (this.fn.flatShadow.has(localId)) {
+      throw new Error(`wasm emitter bug: raw write to flat-shadowed string binding "${localId}" (route it through bindingSet)`);
+    }
     this.fn.code.localSet(this.localIndex(localId));
+  }
+
+  /** The string binding's flat shadow — a local's shadow slot or a
+   * global's shadow global — or undefined (no shadow: not a string, or
+   * boxed). */
+  private bindingShadow(localId: string, loc: SrcLoc): { slot: number; global: boolean } | undefined {
+    const global = this.globalById.get(localId);
+    if (global !== undefined) {
+      this.globalIndex(global, loc);
+      const g = this.globalFlatShadow.get(global.id);
+      return g === undefined ? undefined : { slot: g, global: true };
+    }
+    const s = this.fn.flatShadow.get(localId);
+    return s === undefined ? undefined : { slot: s, global: false };
+  }
+
+  private bindingEager(localId: string): boolean {
+    const global = this.globalById.get(localId);
+    if (global !== undefined) return this.globalEagerFlat().has(global.id);
+    return this.fn.eagerFlat.has(localId);
+  }
+
+  /** THE funnel for writing an unboxed local's slot or a global (every
+   * write after the prologue: storeVar, a for-of binding, assignExpr —
+   * locals and globals are set nowhere else). The new value is on the
+   * stack; `flat`: it is statically `$chars`; `keep`: leave the assigned
+   * value on the stack. A string binding's flat shadow is kept in step
+   * here, and only here: filled when the value is flat or the binding is
+   * eager (read flat somewhere — its reads then do no test), cleared
+   * otherwise (lazy: the next flat read fills it). */
+  private bindingSet(localId: string, loc: SrcLoc, flat: boolean, keep: boolean): void {
+    const code = this.fn.code;
+    const global = this.globalById.get(localId);
+    const slot = global !== undefined ? this.globalIndex(global, loc) : this.localIndex(localId);
+    const set = (i: number, g: boolean): void => (g ? code.globalSet(i) : code.localSet(i));
+    const get = (i: number, g: boolean): void => (g ? code.globalGet(i) : code.localGet(i));
+    const isG = global !== undefined;
+    const shadow = this.bindingShadow(localId, loc);
+    if (shadow === undefined) {
+      if (keep && !isG) {
+        code.localTee(slot);
+      } else {
+        set(slot, isG);
+        if (keep) get(slot, isG);
+      }
+      return;
+    }
+    if (flat) {
+      set(shadow.slot, isG);
+      get(shadow.slot, isG);
+      set(slot, isG);
+      if (keep) get(shadow.slot, isG);
+      return;
+    }
+    set(slot, isG);
+    if (this.bindingEager(localId)) {
+      get(slot, isG);
+      this.emitFlat();
+    } else {
+      code.refNull(this.strType);
+    }
+    set(shadow.slot, isG);
+    if (keep) get(slot, isG);
+  }
+
+  private globalEagerFlatField: Set<string> | null = null;
+
+  /** The string globals some function reads flat (flatReadIds over every
+   * function body) — eager shadows, like an eager local's. */
+  private globalEagerFlat(): Set<string> {
+    if (this.globalEagerFlatField === null) {
+      const ids = new Set<string>();
+      for (const g of this.globalById.values()) if (g.type.kind === "string") ids.add(g.id);
+      this.globalEagerFlatField = ids.size > 0 ? flatReadIds(this.mod.functions.map((f) => f.body), ids) : new Set();
+    }
+    return this.globalEagerFlatField;
   }
 
   /** Nested statement bodies of REFUSED statements. Only the survey path
@@ -19497,8 +19727,93 @@ class Assembler {
   /* ── expressions ────────────────────────────────────────────────────── */
 
   /** Emits the expression's value onto the wasm stack. On refusal (survey
-   * path) the value is one `unreachable` and the operands stay unwalked. */
+   * path) the value is one `unreachable` and the operands stay unwalked.
+   * A string-typed expression always leaves a FLAT `(ref null $chars)`
+   * (emitFlat) whatever storage it was read from — the strings unit S1
+   * boundary; a string binding reads through its flat shadow, and
+   * producers that build a flat array themselves skip the (free, but
+   * sized) cast. walkValue is the non-flattening twin for pure moves. */
   private walkExpr(e: WExpr): void {
+    if (e.kind === "varRef" && e.type.kind === "string" && this.readFlatShadow(e.localId, e.loc)) return;
+    this.walkExprValue(e);
+    if (e.type.kind === "string" && !FLAT_STRING_EXPRS.has(e.kind)) this.emitFlat();
+  }
+
+  /** A code-unit read of a string binding through its flat shadow (a
+   * local's slot, a global's shadow global): the cached flat form, or —
+   * the first read since a write — flatten the binding's value and cache
+   * it. False when the binding has no shadow (a boxed local), leaving the
+   * plain read + flatten. */
+  private readFlatShadow(localId: string, loc: SrcLoc): boolean {
+    const code = this.fn.code;
+    const global = this.globalById.get(localId);
+    if (global !== undefined) {
+      const index = this.globalIndex(global, loc);
+      const gshadow = this.globalFlatShadow.get(global.id);
+      if (gshadow === undefined) return false;
+      if (this.globalEagerFlat().has(global.id)) {
+        if (FLAT_CHECK) this.emitFlatCheck(gshadow, index, true);
+        code.globalGet(gshadow);
+        return true;
+      }
+      code.globalGet(gshadow);
+      code.refIsNull();
+      code.ifVoid();
+      code.globalGet(index);
+      this.emitFlat();
+      code.globalSet(gshadow);
+      code.end();
+      code.globalGet(gshadow);
+      return true;
+    }
+    const shadow = this.fn.flatShadow.get(localId);
+    if (shadow === undefined) return false;
+    if (this.fn.eagerFlat.has(localId)) {
+      if (FLAT_CHECK) this.emitFlatCheck(shadow, this.localIndex(localId), false);
+      code.localGet(shadow);
+      return true;
+    }
+    code.localGet(shadow);
+    code.refIsNull();
+    code.ifResult(this.strRef);
+    code.localGet(this.localIndex(localId));
+    this.emitFlat();
+    code.localTee(shadow);
+    code.else_();
+    code.localGet(shadow);
+    code.end();
+    return true;
+  }
+
+  /** FLAT_CHECK: trap unless an eager shadow equals the binding's value,
+   * flattened now (identity today: flat strings flatten to themselves). */
+  private emitFlatCheck(shadow: number, slot: number, global: boolean): void {
+    const code = this.fn.code;
+    if (global) {
+      code.globalGet(shadow);
+      code.globalGet(slot);
+    } else {
+      code.localGet(shadow);
+      code.localGet(slot);
+    }
+    this.emitFlat();
+    code.refEq();
+    code.i32Eqz();
+    code.ifVoid();
+    code.unreachable();
+    code.end();
+  }
+
+  /** Walk an expression whose result only MOVES into string-value
+   * storage (a local, global, box, parameter, result, record field,
+   * array element or union payload — all typed `strVal`): no flatten,
+   * since nothing reads its code units here. Every destination it feeds
+   * must be value-typed, or validation fails. */
+  private walkValue(e: WExpr): void {
+    this.walkExprValue(e);
+  }
+
+  private walkExprValue(e: WExpr): void {
     const code = this.fn.code;
     switch (e.kind) {
       case "boolLit":
@@ -19553,7 +19868,7 @@ class Assembler {
         }
         // Direct calls pass a null closure — the uniform-ABI dead arg.
         code.refNull(this.fnClosPair(callee).clos);
-        for (const a of e.args) this.walkExpr(a);
+        for (const a of e.args) this.walkValue(a);
         code.call(index);
         if (this.mayThrow.has(e.callee)) this.emitPendingCheck();
         return;
@@ -19654,7 +19969,7 @@ class Assembler {
           return;
         }
         code.localGet(c); // arg0: the closure itself (selfRef, env)
-        for (const a of e.args) this.walkExpr(a);
+        for (const a of e.args) this.walkValue(a);
         code.localGet(c);
         code.structGet(pair.clos, 0);
         code.callRef(pair.fn);
@@ -19770,13 +20085,6 @@ class Assembler {
 
       case "assignExpr": {
         this.walkExpr(e.value);
-        const global = this.globalById.get(e.localId);
-        if (global !== undefined) {
-          const idx = this.globalIndex(global, e.loc);
-          code.globalSet(idx);
-          code.globalGet(idx);
-          return;
-        }
         const local = this.fn.localById.get(e.localId);
         if (local?.boxed === true) {
           const soft = this.mapTypeSoft(local.type);
@@ -19790,7 +20098,7 @@ class Assembler {
           this.releaseScratch(soft, v);
           return;
         }
-        code.localTee(this.localIndex(e.localId));
+        this.bindingSet(e.localId, e.loc, e.value.type.kind === "string", true);
         return;
       }
 
@@ -19985,7 +20293,7 @@ class Assembler {
         // off the stack (array.new_fixed caps at 10000 operands).
         if (spreads.size === 0 && e.elems.length <= 10000) {
           code.i32Const(e.elems.length);
-          for (const el of e.elems) this.walkExpr(el);
+          for (const el of e.elems) this.walkValue(el);
           code.arrayNewFixed(info.bufType, e.elems.length);
           code.structNew(info.struct);
           return;
@@ -20002,7 +20310,7 @@ class Assembler {
         code.localSet(vec);
         e.elems.forEach((el, i) => {
           code.localGet(vec);
-          this.walkExpr(el);
+          this.walkValue(el);
           code.call(spreads.has(i) ? this.vecs.pushSpread(info) : this.vecs.pushOne(info));
         });
         code.localGet(vec);
@@ -20198,7 +20506,7 @@ class Assembler {
           const idx = info.fieldIndex.get(f.name);
           if (idx === undefined) throw new Error(`recordLit field ${f.name} not on shape ${e.type.shapeId}`);
           code.localGet(rec);
-          this.walkExpr(f.value);
+          this.walkValue(f.value);
           code.structSet(info.struct, idx);
         }
         code.localGet(rec);
@@ -20341,7 +20649,7 @@ class Assembler {
           this.openIfResult(this.strRef);
           code.localGet(c);
           code.structGet(exc.caughtT, 2);
-          code.refCast(this.strType);
+          emitFlatCast(code, this.strType);
           code.else_();
           // OBJ AND inside %Error's interval — everything else (including
           // REF) falls to the default text. The interval read is only
@@ -20450,7 +20758,7 @@ class Assembler {
           return;
         }
         code.i32Const(e.tag);
-        this.walkExpr(e.value);
+        this.walkValue(e.value);
         code.structNew(st);
         return;
       }
@@ -23755,7 +24063,7 @@ class Assembler {
             (c) => c.localGet(I_),
           );
           code.structGet(this.dyn.dynT(), DYN_REF);
-          code.refCast(this.strType);
+          emitFlatCast(code, this.strType);
           const ELEM = this.acquireScratch(this.strRef);
           code.localSet(ELEM);
           code.localGet(RESULTVEC);
@@ -24694,7 +25002,7 @@ class Assembler {
           this.pushStrLit("name");
           code.call(this.dyn.objGet());
           code.structGet(this.dyn.dynT(), DYN_REF);
-          code.refCast(this.strType);
+          emitFlatCast(code, this.strType);
           code.structSet(recInfo.struct, nameIdx);
           // parentPath: the CALL's own path argument, every row (never
           // read from JSON — the LLVM lane's own precedent).
@@ -24886,7 +25194,7 @@ class Assembler {
               this.pushStrLit(name);
               code.call(this.dyn.objGet());
               code.structGet(this.dyn.dynT(), DYN_REF);
-              code.refCast(this.strType);
+              emitFlatCast(code, this.strType);
               code.structSet(struct, idx);
             }
             const internalIdx = fieldIndex.get("internal")!;
@@ -24920,7 +25228,7 @@ class Assembler {
             code.i32Const(cidrStrTag);
             code.localGet(CIDRDYN);
             code.structGet(this.dyn.dynT(), DYN_REF);
-            code.refCast(this.strType);
+            emitFlatCast(code, this.strType);
             code.structNew(cidrStrStruct);
             code.end();
             code.structSet(struct, cidrIdx);
@@ -25214,7 +25522,7 @@ class Assembler {
               (c) => c.localGet(I_),
             );
             code.structGet(this.dyn.dynT(), DYN_REF);
-            code.refCast(this.strType);
+            emitFlatCast(code, this.strType);
             const ELEM = this.acquireScratch(this.strRef);
             code.localSet(ELEM);
             code.localGet(RESULTVEC);
@@ -25285,7 +25593,7 @@ class Assembler {
             }
             shape = cbType.params.length === 0 ? 1 : 2;
             const pair = this.closSigFor(cbType, e.loc);
-            const want = shape === 1 ? this.closPairFor([], []) : this.closPairFor([this.strRef], []);
+            const want = shape === 1 ? this.closPairFor([], []) : this.closPairFor([this.strVal], []);
             if (pair === null || pair.clos !== want.clos) {
               this.refuse("libCall:fs.watchCb:unexpected-callback-shape", e.loc);
               code.unreachable();
@@ -25357,7 +25665,7 @@ class Assembler {
           }
           const shape = cbType.params.length === 0 ? 1 : 2;
           const pair = this.closSigFor(cbType, e.loc);
-          const want = shape === 1 ? this.closPairFor([], []) : this.closPairFor([this.strRef], []);
+          const want = shape === 1 ? this.closPairFor([], []) : this.closPairFor([this.strVal], []);
           if (pair === null || pair.clos !== want.clos) {
             this.refuse("libCall:rl.question:unexpected-callback-shape", e.loc);
             code.unreachable();
@@ -25679,7 +25987,7 @@ class Assembler {
         if (t.kind === "string") {
           this.walkExpr(e.value);
           code.structGet(exc.caughtT, 2);
-          code.refCast(this.strType);
+          emitFlatCast(code, this.strType);
           return;
         }
         if (t.kind === "object") {
@@ -25920,7 +26228,7 @@ class Assembler {
         code.localGet(d);
         if (t.kind === "string") {
           code.structGet(dynT, DYN_REF);
-          code.refCast(this.strType);
+          emitFlatCast(code, this.strType);
         } else {
           code.structGet(dynT, DYN_NUM);
           if (t.kind === "bool") {
@@ -26135,7 +26443,7 @@ class Assembler {
           } else {
             code.localGet(d);
             code.structGet(this.dyn.dynT(), DYN_REF);
-            code.refCast(this.strType);
+            emitFlatCast(code, this.strType);
             code.localGet(s);
             code.call(this.strEqHelper());
           }
@@ -26448,7 +26756,7 @@ class Assembler {
         this.dyn.boxStr(code, (x) => {
           x.localGet(c);
           x.structGet(exc.caughtT, 2);
-          x.refCast(this.strType);
+          emitFlatCast(x, this.strType);
         });
         code.else_();
         // An OBJ payload inside %Error's interval — a builtin or any
@@ -28590,7 +28898,7 @@ class Assembler {
               code.localGet(o);
               this.walkExpr(e.args[i]!);
               code.structGet(dynT, DYN_REF);
-              code.refCast(this.strType);
+              emitFlatCast(code, this.strType);
               this.walkExpr(e.args[i + 1]!);
               code.call(this.dyn.objPut());
             }
@@ -29002,7 +29310,7 @@ class Assembler {
                   code.ifResult(this.strRef);
                   code.localGet(space);
                   code.structGet(this.dyn.dynT(), DYN_REF);
-                  code.refCast(this.strType);
+                  emitFlatCast(code, this.strType);
                   code.f64Const(0);
                   code.f64Const(10);
                   code.call(this.strs.slice());
@@ -29118,7 +29426,7 @@ class Assembler {
               this.dyn.boxStr(code, (c) => {
                 c.localGet(recv);
                 c.structGet(this.dyn.dynT(), DYN_REF);
-                c.refCast(this.strType);
+                emitFlatCast(c, this.strType);
                 c.call(name === "toUpperCase" ? this.casing.toUpperCase() : this.casing.toLowerCase());
               });
               code.else_();
@@ -29151,7 +29459,7 @@ class Assembler {
             // `["a","b2c","d"]`, a bare `refCast` on a non-STR argument
             // would trap instead).
             if (name === "split") {
-              const strValType: ValType = { kind: "ref", nullable: true, typeIndex: this.strType };
+              const strValType: ValType = this.strVal;
               const vecInfo = this.vecs.info("vec(str)", strValType, strValType, "string");
               const vecOfStrType: ValType = { kind: "ref", nullable: true, typeIndex: vecInfo.struct };
               code.localGet(recv);
@@ -29163,7 +29471,7 @@ class Assembler {
                 const vecOfStr = this.acquireScratch(vecOfStrType);
                 code.localGet(recv);
                 code.structGet(this.dyn.dynT(), DYN_REF);
-                code.refCast(this.strType);
+                emitFlatCast(code, this.strType);
                 this.walkExpr(e.args[1]!);
                 const sepRecv = this.acquireScratch(this.dyn.dynRef());
                 code.localSet(sepRecv);
@@ -29838,7 +30146,7 @@ class Assembler {
           code.localGet(d);
           if (t.kind === "string") {
             code.structGet(dynT, DYN_REF);
-            code.refCast(this.strType);
+            emitFlatCast(code, this.strType);
           } else {
             code.structGet(dynT, DYN_NUM);
             if (t.kind === "bool") {
@@ -30079,6 +30387,16 @@ class Assembler {
       }
     });
     this.globalWasmIndex.set(g.id, index);
+    if (g.type.kind === "string") {
+      const strType = this.strType;
+      this.globalFlatShadow.set(
+        g.id,
+        this.mb.addGlobal(this.strRef, true, (w) => {
+          w.u8(0xd0);
+          w.sleb(strType);
+        }),
+      );
+    }
     return index;
   }
 
@@ -30088,6 +30406,8 @@ class Assembler {
   private get vecs(): VecBuilder {
     this.vecsField ??= new VecBuilder(this.mb, {
       strEq: () => this.strEqHelper(),
+      flat: (c) => this.emitFlat(c),
+      strRef: () => this.strRef,
       f64ToStr: () => this.f64ToStrHelper(),
       concat: () => this.concatHelper(),
       lit: (c, s) => this.pushStrLitInto(c, s),
@@ -30149,8 +30469,7 @@ class Assembler {
   private get strs(): StrBuilder {
     this.strsField ??= new StrBuilder(this.mb, this.strType, {
       vecStr: () => {
-        const strRef: ValType = { kind: "ref", nullable: true, typeIndex: this.strType };
-        const info = this.vecs.info("vec(str)", strRef, strRef, "string");
+        const info = this.vecs.info("vec(str)", this.strVal, this.strVal, "string");
         return { info, push1: this.vecs.pushOne(info) };
       },
       // INC-25 P5: string.fromCharCode's packed-argument `array<f64>`
@@ -30363,7 +30682,7 @@ class Assembler {
       (x) => {
         this.pushStrLitInto(x, "calling the ");
         x.localGet(0);
-        x.refCast(this.strType);
+        emitFlatCast(x, this.strType);
         x.call(this.concatHelper());
         this.pushStrLitInto(x, " constructor read from a dynamic value is not supported yet");
         x.call(this.concatHelper());
@@ -31755,7 +32074,7 @@ class Assembler {
       this.openIf();
       code.localGet(OTYPE);
       code.structGet(dynT, DYN_REF);
-      code.refCast(this.strType);
+      emitFlatCast(code, this.strType);
       code.localSet(TYPE);
       this.close();
       this.releaseScratch(dynRefT, OTYPE);
@@ -31775,7 +32094,7 @@ class Assembler {
     this.openIf();
     code.localGet(POS1);
     code.structGet(dynT, DYN_REF);
-    code.refCast(this.strType);
+    emitFlatCast(code, this.strType);
     code.localSet(TYPE);
     this.close();
 
@@ -31841,7 +32160,7 @@ class Assembler {
         (c) => {
           c.localGet(POS0);
           c.structGet(dynT, DYN_REF);
-          c.refCast(this.strType);
+          emitFlatCast(c, this.strType);
         },
         (c) => c.refNull(this.strType),
       );
@@ -31987,7 +32306,7 @@ class Assembler {
     c.call(this.concatHelper());
     c.localGet(CODED);
     c.structGet(dynT, DYN_REF);
-    c.refCast(this.strType);
+    emitFlatCast(c, this.strType);
     c.call(this.concatHelper());
     this.pushStrLitInto(c, "] ");
     c.call(this.concatHelper());
@@ -31997,13 +32316,13 @@ class Assembler {
     c.localGet(REPORT);
     c.localGet(NAMED);
     c.structGet(dynT, DYN_REF);
-    c.refCast(this.strType);
+    emitFlatCast(c, this.strType);
     c.call(this.concatHelper());
     this.pushStrLitInto(c, ": ");
     c.call(this.concatHelper());
     c.localGet(MSGD);
     c.structGet(dynT, DYN_REF);
-    c.refCast(this.strType);
+    emitFlatCast(c, this.strType);
     c.call(this.concatHelper());
     this.pushStrLitInto(c, "\n");
     c.call(this.concatHelper());
@@ -32021,7 +32340,7 @@ class Assembler {
     c.localGet(REPORT);
     c.localGet(DETAILD);
     c.structGet(dynT, DYN_REF);
-    c.refCast(this.strType);
+    emitFlatCast(c, this.strType);
     c.call(this.concatHelper());
     this.pushStrLitInto(c, "\n");
     c.call(this.concatHelper());
@@ -33686,7 +34005,7 @@ class Assembler {
     c.brIf(1);
     dyn.arrAt(c, (x) => x.localGet(keysPayload), (x) => x.localGet(i));
     c.structGet(dyn.dynT(), DYN_REF);
-    c.refCast(this.strType);
+    emitFlatCast(c, this.strType);
     c.localSet(k);
     if (consumedKeys.length === 0) {
       c.i32Const(0);
@@ -34061,7 +34380,7 @@ class Assembler {
     this.openIfResult(this.strRef);
     code.localGet(d);
     code.structGet(dynT, DYN_REF);
-    code.refCast(this.strType);
+    emitFlatCast(code, this.strType);
     code.else_();
     code.localGet(d);
     code.call(this.dyn.toStr());
@@ -37122,7 +37441,8 @@ class Assembler {
             code.localGet(recv);
             code.localGet(chunk);
             code.refCast(strSt!);
-            code.structGet(strSt!, 1); // PAYLOAD: the string ref
+            code.structGet(strSt!, 1); // PAYLOAD: the string value
+            this.emitFlat();
             code.i32Const(0); // front
             code.call(this.stream.pushStrCore());
           }
@@ -38923,12 +39243,12 @@ class Assembler {
             code.localSet(msgMemberLocal);
             code.localGet(msgMemberLocal);
             code.structGet(dynT, DYN_REF);
-            code.refCast(this.strType);
+            emitFlatCast(code, this.strType);
             code.arrayLen();
             this.openIf(); // #3a-i message.length>0
             code.localGet(msgMemberLocal);
             code.structGet(dynT, DYN_REF);
-            code.refCast(this.strType);
+            emitFlatCast(code, this.strType);
             code.localSet(detailLocal);
             code.else_();
             code.localGet(oLocal);
@@ -38937,7 +39257,7 @@ class Assembler {
             code.localSet(nameMemberLocal);
             code.localGet(nameMemberLocal);
             code.structGet(dynT, DYN_REF);
-            code.refCast(this.strType);
+            emitFlatCast(code, this.strType);
             code.localSet(detailLocal);
             this.close(); // #3a-i
             this.emitIfErrorFail(code, () => code.localGet(detailLocal));
@@ -38992,7 +39312,7 @@ class Assembler {
           const strValLocal = this.acquireScratch(this.strRef);
           code.localGet(vLocal);
           code.structGet(dynT, DYN_REF);
-          code.refCast(this.strType);
+          emitFlatCast(code, this.strType);
           code.localSet(strValLocal);
           const quotedLocal = this.acquireScratch(this.strRef);
           this.emitInspectStrInto(code, () => code.localGet(strValLocal), quotedLocal);
@@ -42079,7 +42399,7 @@ class Assembler {
       // emitMaxListenersArgCheck's identical, already-documented note.
       code.localGet(dynLocal);
       code.structGet(dynT, DYN_REF);
-      code.refCast(this.strType);
+      emitFlatCast(code, this.strType);
       m.call(this.concatHelper());
       this.pushStrLitInto(m, "')");
       m.call(this.concatHelper());
@@ -42232,7 +42552,7 @@ class Assembler {
       // un-truncated here, a real (named) divergence from Node.
       code.localGet(dynLocal);
       code.structGet(dynT, DYN_REF);
-      code.refCast(this.strType);
+      emitFlatCast(code, this.strType);
       m.call(this.concatHelper());
       this.pushStrLitInto(m, "')");
       m.call(this.concatHelper());
@@ -42651,7 +42971,7 @@ class Assembler {
     c.ifResult(dynRef);
     this.dyn.boxStr(c, (x) => {
       x.globalGet(exc.refG);
-      x.refCast(this.strType);
+      emitFlatCast(x, this.strType);
     });
     c.else_();
     kindIs(EXC_OBJ);
@@ -43382,7 +43702,7 @@ class Assembler {
     c.localGet(0);
     if (t.kind === "string") {
       c.structGet(dynT, DYN_REF);
-      c.refCast(this.strType);
+      emitFlatCast(c, this.strType);
     } else {
       c.structGet(dynT, DYN_NUM);
       if (t.kind === "bool") {
@@ -45196,7 +45516,7 @@ class Assembler {
     c.ifResult(dynRef);
     this.dyn.boxStr(c, (x) => {
       x.localGet(R);
-      x.refCast(this.strType);
+      emitFlatCast(x, this.strType);
     });
     c.else_();
     kindIs(EXC_OBJ);
@@ -50109,7 +50429,7 @@ class Assembler {
     c.ifVoid();
     c.localGet(0);
     c.structGet(dynT, DYN_REF);
-    c.refCast(this.strType);
+    emitFlatCast(c, this.strType);
     c.call(this.strToNumHelper());
     c.return_();
     c.end();

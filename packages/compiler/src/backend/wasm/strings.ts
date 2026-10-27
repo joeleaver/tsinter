@@ -29,6 +29,29 @@ import { F64, I32, ModuleBuilder, type ValType } from "./module.js";
 import { BUF, LEN, type VecInfo } from "./arrays.js";
 import type { BytesElem } from "./typedarrays.js";
 
+/** Strings unit S1 — flatten-if-needed: the string VALUE on top of the
+ * stack (read from value storage typed `(ref null eq)`, or from generic
+ * eqref/anyref storage, nullable) becomes the `(ref null $chars)` flat
+ * array every reader of code units takes. Only flat strings exist yet, so
+ * this is a `ref.cast null $chars` — free where V8 already knows the
+ * operand is flat. Ropes and slices (S2/S3) make it the inline fast path
+ * plus a `%w.flat` call, so EVERY site that turns a string value into
+ * code units must come through here (a raw `$chars` use of value storage
+ * fails validation; this is the one sanctioned crossing). */
+export function emitFlat(c: Code, strType: number): void {
+  c.refCastNull(strType);
+}
+
+/** emitFlat for a string recovered from GENERIC storage (an anyref/eqref
+ * slot whose tag says it holds a string: a dyn box, the exception cell, a
+ * promise payload, an event argument): flatten, and trap on null as the
+ * `ref.cast $chars` it replaces always did. One instruction today; the
+ * rope/slice-aware crossing once those shapes exist (a string value may
+ * have reached such a slot without passing walkExpr). */
+export function emitFlatCast(c: Code, strType: number): void {
+  c.refCast(strType);
+}
+
 export interface StrDeps {
   /** The string[] vector machinery for split: the interned vec(str) info
    * plus %w.vec.push1's index (growth included). */
@@ -1728,6 +1751,7 @@ export class StrBuilder {
       c.i32Const(0);
       c.arrayGet(info.bufType);
       c.refAsNonNull();
+      emitFlat(c, this.strType);
       c.localSet(ACC);
       c.i32Const(0);
       c.localSet(I);
@@ -1749,6 +1773,7 @@ export class StrBuilder {
       c.localGet(I);
       c.arrayGet(info.bufType);
       c.refAsNonNull();
+      emitFlat(c, this.strType);
       c.call(this.deps.concat());
       c.localSet(ACC);
       c.end();
@@ -1760,6 +1785,7 @@ export class StrBuilder {
       c.i32Add();
       c.arrayGet(info.bufType);
       c.refAsNonNull();
+      emitFlat(c, this.strType);
       c.call(this.deps.concat());
       c.localSet(ACC);
       c.localGet(I);

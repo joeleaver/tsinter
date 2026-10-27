@@ -56,6 +56,7 @@
  * this.emitPendingCheck();` immediately after") — never calling unwind
  * itself. */
 import { Code } from "./code.js";
+import { emitFlatCast } from "./strings.js";
 import { F64, I32, ModuleBuilder, type FieldType, type ValType } from "./module.js";
 import { DK, DYN_KIND, DYN_NUM, DYN_REF, OBJ_LEN, OBJ_ENTRIES, ENTRY_KEY, ENTRY_VALUE, BYTES_PAYLOAD_REF } from "./dyn.js";
 
@@ -223,7 +224,7 @@ export class FsLaddersBuilder {
       c.ifVoid();
       c.localGet(T);
       c.structGet(dynT, DYN_REF);
-      c.refCast(this.deps.strType());
+      emitFlatCast(c, this.deps.strType());
       c.call(this.deps.strToNum());
       c.localSet(N);
       c.localGet(N);
@@ -340,7 +341,7 @@ export class FsLaddersBuilder {
     c.ifVoid();
     c.localGet(PATH);
     c.structGet(dynT, DYN_REF);
-    c.refCast(this.deps.strType());
+    emitFlatCast(c, this.deps.strType());
     c.call(this.deps.existsSyncHelper());
     c.localSet(ANS);
     c.else_();
@@ -507,7 +508,7 @@ export class FsLaddersBuilder {
       c.ifVoid();
       c.localGet(ENC);
       c.structGet(dynT, DYN_REF);
-      c.refCast(this.deps.strType());
+      emitFlatCast(c, this.deps.strType());
       c.localSet(S);
       c.localGet(S);
       c.arrayLen();
@@ -723,12 +724,12 @@ export class FsLaddersBuilder {
       c.else_();
       c.localGet(ENCV);
       c.structGet(dynT, DYN_REF);
-      c.refCast(this.deps.strType());
+      emitFlatCast(c, this.deps.strType());
       this.pushLitAsStr(c, "utf8");
       c.call(this.deps.strEq());
       c.localGet(ENCV);
       c.structGet(dynT, DYN_REF);
-      c.refCast(this.deps.strType());
+      emitFlatCast(c, this.deps.strType());
       this.pushLitAsStr(c, "utf-8");
       c.call(this.deps.strEq());
       c.i32Or();
@@ -757,12 +758,12 @@ export class FsLaddersBuilder {
       c.ifVoid();
       c.localGet(OPTS);
       c.structGet(dynT, DYN_REF);
-      c.refCast(this.deps.strType());
+      emitFlatCast(c, this.deps.strType());
       this.pushLitAsStr(c, "utf8");
       c.call(this.deps.strEq());
       c.localGet(OPTS);
       c.structGet(dynT, DYN_REF);
-      c.refCast(this.deps.strType());
+      emitFlatCast(c, this.deps.strType());
       this.pushLitAsStr(c, "utf-8");
       c.call(this.deps.strEq());
       c.i32Or();
@@ -801,7 +802,7 @@ export class FsLaddersBuilder {
 
       c.localGet(PREFIX);
       c.structGet(dynT, DYN_REF);
-      c.refCast(this.deps.strType());
+      emitFlatCast(c, this.deps.strType());
       c.call(this.deps.mkdtempSyncHelper());
       this.mb.setBody(idx, [I32, I32, I32, this.deps.entryRef(), this.deps.dynRef(), this.deps.objRef()], c.bytes());
     });

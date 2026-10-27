@@ -114,6 +114,7 @@
  * the whole exposure. (scr_inspect.c:142-143 attributes the difference to
  * NFC alone; fixing the C is not this increment's business.) */
 import { Code } from "./code.js";
+import { emitFlatCast } from "./strings.js";
 import {
   BYTES_PAYLOAD_IS_BUFFER,
   DK,
@@ -3701,7 +3702,7 @@ export class InspectBuilder {
         // which is `insp.dynS`'s whole job.
         c.localGet(D);
         c.structGet(dynT, DYN_REF);
-        c.refCast(strT);
+        emitFlatCast(c, strT);
         c.call(this.str());
         c.return_();
       });
@@ -3720,7 +3721,7 @@ export class InspectBuilder {
         c.i32Const(0);
         c.call(dyn.keyGet());
         c.structGet(dynT, DYN_REF);
-        c.refCast(strT);
+        emitFlatCast(c, strT);
         c.localSet(NAME);
 
         // properties: ENUMERABLE-only (H-4), insertion order — LOG's
@@ -3842,7 +3843,7 @@ export class InspectBuilder {
         c.localSet(P);
         dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(0));
         c.structGet(dynT, DYN_REF);
-        c.refCast(strT);
+        emitFlatCast(c, strT);
         c.call(this.key());
         c.localSet(KS);
         dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(1));
@@ -4217,7 +4218,7 @@ export class InspectBuilder {
         // this walker out of the nested-open-region case entirely.
         dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(0));
         c.structGet(dynT, DYN_REF);
-        c.refCast(strT);
+        emitFlatCast(c, strT);
         c.call(this.key());
         c.localSet(KS);
         dyn.arrAt(c, (x) => x.localGet(P), (x) => x.i32Const(1));
@@ -4443,7 +4444,7 @@ export class InspectBuilder {
       c.ifVoid();
       c.localGet(D);
       c.structGet(dyn.dynT(), DYN_REF);
-      c.refCast(this.deps.strType());
+      emitFlatCast(c, this.deps.strType());
       c.return_();
       c.end();
       c.localGet(D);
@@ -4668,7 +4669,7 @@ export class InspectBuilder {
       c.globalSet(this.indentGlobal());
       c.localGet(D);
       c.structGet(dynT, DYN_REF);
-      c.refCast(this.deps.strType());
+      emitFlatCast(c, this.deps.strType());
       c.call(this.str());
       c.call(this.ibPuts());
       c.return_();
@@ -4692,7 +4693,7 @@ export class InspectBuilder {
       c.i32Const(0);
       c.call(dyn.keyGet());
       c.structGet(dynT, DYN_REF);
-      c.refCast(this.deps.strType());
+      emitFlatCast(c, this.deps.strType());
       c.localSet(FNM);
 
       c.localGet(D);
@@ -4776,7 +4777,7 @@ export class InspectBuilder {
       c.localSet(FPP);
       dyn.arrAt(c, (x) => x.localGet(FPP), (x) => x.i32Const(0));
       c.structGet(dynT, DYN_REF);
-      c.refCast(this.deps.strType());
+      emitFlatCast(c, this.deps.strType());
       c.call(this.key());
       c.call(this.ibPuts());
       putLit(": ");

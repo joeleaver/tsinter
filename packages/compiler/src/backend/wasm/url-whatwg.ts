@@ -2152,7 +2152,8 @@ export class UrlEngine {
     });
   }
   private item($: A, sp: X, i: X): X {
-    return $.aget(this.listT, $.get(this.spType(), SP_LIST, sp), i);
+    // The list is a string[] buffer: string VALUES, read flat.
+    return $.flat(this.S, $.aget(this.listT, $.get(this.spType(), SP_LIST, sp), i));
   }
   private setItem($: A, sp: X, i: X, v: X): void {
     $.aset(this.listT, $.get(this.spType(), SP_LIST, sp), i, v);
@@ -2581,7 +2582,7 @@ export class UrlEngine {
       $.c.arrayCopy(T, T);
       $.put(O, $.l(START));
       $.while($.both($.lt($.l(LI), $.l(SL)), $.lt($.l(RI), $.l(SR))), () => {
-        $.if($.le($.call(this.strCmpFn(), $.aget(T, $.l(LB), $.l(LI)), $.aget(T, $.l(RB), $.l(RI))), $.i(0)), () => {
+        $.if($.le($.call(this.strCmpFn(), $.flat(this.S, $.aget(T, $.l(LB), $.l(LI))), $.flat(this.S, $.aget(T, $.l(RB), $.l(RI)))), $.i(0)), () => {
           take(LB, LI);
           take(LB, LI);
         }, () => {
@@ -2622,8 +2623,8 @@ export class UrlEngine {
           this.throwType($, "Each query pair must be an iterable [name, value] tuple", "ERR_INVALID_TUPLE");
           $.ret($.nul(this.spType()));
         });
-        $.run(this.spPushFn(), $.l(SP), $.call(this.wellFormedFn(), $.aget(inner.bufType, $.get(inner.struct, BUF, $.l(ROW)), $.i(0))));
-        $.run(this.spPushFn(), $.l(SP), $.call(this.wellFormedFn(), $.aget(inner.bufType, $.get(inner.struct, BUF, $.l(ROW)), $.i(1))));
+        $.run(this.spPushFn(), $.l(SP), $.call(this.wellFormedFn(), $.flat(this.S, $.aget(inner.bufType, $.get(inner.struct, BUF, $.l(ROW)), $.i(0)))));
+        $.run(this.spPushFn(), $.l(SP), $.call(this.wellFormedFn(), $.flat(this.S, $.aget(inner.bufType, $.get(inner.struct, BUF, $.l(ROW)), $.i(1)))));
       });
       $.do($.l(SP));
     });

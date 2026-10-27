@@ -18,10 +18,16 @@
  * equality, f64ToStr and literal pushing for join). */
 import { Code } from "./code.js";
 import { F64, I32, ModuleBuilder, type StorageType, type ValType } from "./module.js";
+import { emitFlat } from "./strings.js";
 
 export interface VecDeps {
   /** %w.strEq's index (content equality for string elements). */
   strEq: () => number;
+  /** Flatten the string value on the stack to `$chars` (strings.ts
+   * emitFlat) — string elements are stored as string VALUES. */
+  flat: (c: Code) => void;
+  /** The flat string type `(ref null $chars)`. */
+  strRef: () => ValType;
   /** %w.f64ToStr's index (join over number elements). */
   f64ToStr: () => number;
   /** %w.concat's index (join accumulates by concatenation). */
@@ -251,6 +257,119 @@ export class VecBuilder {
     });
   }
 
+  /** %w.vec.getFlat:<key> — `get` over a string[] whose element arrives
+   * FLAT (`$chars`, deps.flat): the element read for helpers that walk a
+   * string array's code units (path.join, argv/env vectors, spawn args). */
+  getFlat(v: VecInfo): number {
+    return this.cached(`${v.key}:getFlat`, () => {
+      const strRefT = this.deps.strRef();
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.vecRef(v), F64], [strRefT]),
+        `%w.vec.getFlat:${v.key}`,
+      );
+      const c = new Code();
+      c.localGet(0);
+      c.localGet(1);
+      c.call(this.get(v));
+      this.deps.flat(c);
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.vec.flatBuf:<key> — (vec) → a fresh `(array (mut (ref null
+   * $chars)))` the size of a string[]'s buffer, every slot flattened
+   * (deps.flat; an absent slot stays null). The crossing for helpers that
+   * take a string array's raw buffer (http's header lists): their own
+   * flat string array, never the vector's string-VALUE buffer. A COPY:
+   * sound because every such consumer only reads it (http.ts
+   * resWriteHeadNV/resWriteHeadPairs/writeHeadOdd/clientRequestNew read
+   * names and values with array.get, never array.set), and the copy is
+   * never handed back to user code. */
+  flatBuf(v: VecInfo): number {
+    return this.cached(`${v.key}:flatBuf`, () => {
+      const strRefT = this.deps.strRef();
+      const flatT = this.mb.arrayType(strRefT, true);
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([this.vecRef(v)], [{ kind: "ref", nullable: true, typeIndex: flatT }]),
+        `%w.vec.flatBuf:${v.key}`,
+      );
+      const c = new Code();
+      const V = 0;
+      const B = 1;
+      const N = 2;
+      const I = 3;
+      const OUT = 4;
+      c.localGet(V);
+      c.structGet(v.struct, BUF);
+      c.localTee(B);
+      c.arrayLen();
+      c.localTee(N);
+      c.arrayNewDefault(flatT);
+      c.localSet(OUT);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(OUT);
+      c.localGet(I);
+      c.localGet(B);
+      c.localGet(I);
+      c.arrayGet(v.bufType);
+      this.deps.flat(c);
+      c.arraySet(flatT);
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(OUT);
+      this.mb.setBody(idx, [this.nullableBuf(v), I32, I32, { kind: "ref", nullable: true, typeIndex: flatT }], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.vec.fromFlatBuf:<key> — (flat string array) → a string[] of
+   * exactly its elements: flatBuf's inverse, for helpers that build their
+   * own `(array (mut (ref null $chars)))` (http's raw header lists). A
+   * flat string IS a string value, so this is one array.copy into a
+   * value buffer. */
+  fromFlatBuf(v: VecInfo): number {
+    return this.cached(`${v.key}:fromFlatBuf`, () => {
+      const flatT = this.mb.arrayType(this.deps.strRef(), true);
+      const idx = this.mb.declareFunc(
+        this.mb.funcType([{ kind: "ref", nullable: true, typeIndex: flatT }], [this.vecRef(v)]),
+        `%w.vec.fromFlatBuf:${v.key}`,
+      );
+      const c = new Code();
+      const SRC = 0;
+      const N = 1;
+      const B = 2;
+      c.localGet(SRC);
+      c.arrayLen();
+      c.localTee(N);
+      c.arrayNewDefault(v.bufType);
+      c.localTee(B);
+      c.i32Const(0);
+      c.localGet(SRC);
+      c.i32Const(0);
+      c.localGet(N);
+      c.arrayCopy(v.bufType, flatT);
+      c.localGet(N);
+      c.localGet(B);
+      c.refAsNonNull();
+      c.structNew(v.struct);
+      this.mb.setBody(idx, [I32, this.nullableBuf(v)], c.bytes());
+      return idx;
+    });
+  }
+
   /** %w.vec.set — (vec, f64, elem) → (); [0, len] with i == len append. */
   set(v: VecInfo): number {
     return this.cached(`${v.key}:set`, () => {
@@ -445,7 +564,9 @@ export class VecBuilder {
         c.i32Const(0);
         c.else_();
         c.localGet(A);
+        this.deps.flat(c);
         c.localGet(B);
+        this.deps.flat(c);
         c.call(this.deps.strEq());
         c.end();
         return;
@@ -575,6 +696,7 @@ export class VecBuilder {
           c.structGet(v.struct, BUF);
           c.localGet(I);
           this.emitElemRead(c, v);
+          emitFlat(c, strType);
         } else {
           c.localGet(PARTS);
           c.localGet(I);

@@ -27,6 +27,7 @@
  * refuses; refusals for arms a helper genuinely must read stay at the
  * emitter where the census lives. */
 import { Code } from "./code.js";
+import { emitFlat } from "./strings.js";
 import { isUnitType, type IrType } from "../../ir/nodes.js";
 import { F64, I32, type FieldType, ModuleBuilder, type ValType } from "./module.js";
 
@@ -163,12 +164,15 @@ export class UnionBuilder {
     c.unreachable();
   }
 
-  /** Pushes param `p`'s payload for arm `rep` (cast + read). */
+  /** Pushes param `p`'s payload for arm `rep` (cast + read). A string
+   * arm holds a string VALUE; every helper here reads its code units, so
+   * it arrives flattened (strings.ts emitFlat). */
   private payload(c: Code, rep: UnionArmRep, p: number): void {
     if (rep.struct === null) throw new Error("payload read on an arm resolved without a struct");
     c.localGet(p);
     c.refCast(rep.struct);
     c.structGet(rep.struct, PAYLOAD);
+    if (rep.kind === "string") emitFlat(c, (this.deps.strRef() as { typeIndex: number }).typeIndex);
   }
 
   /** %w.u.truthy:<id> — JS ToBoolean of the ARM value: unit arms false,

@@ -40,6 +40,7 @@
  * timer runs, exactly where scr_loop_run breaks on a rejected root. */
 import type { ByteWriter } from "./bytes.js";
 import { Code } from "./code.js";
+import { emitFlatCast } from "./strings.js";
 import { FD_STDERR } from "./abi.js";
 import { F64, I32, ModuleBuilder, type FieldType, type ValType } from "./module.js";
 
@@ -1060,7 +1061,7 @@ export class PromiseBuilder {
     c.ifVoid();
     c.localGet(p);
     c.structGet(this.promT, PROM_REF);
-    c.refCast(this.strType);
+    emitFlatCast(c, this.strType);
     c.call(out.stage);
     c.else_();
     c.localGet(k);

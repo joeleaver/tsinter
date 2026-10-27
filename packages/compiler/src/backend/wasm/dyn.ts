@@ -133,6 +133,7 @@
  * here — see `$dynFn` below), so S016 registers the write. */
 import type { VecInfo } from "./arrays.js";
 import { Code } from "./code.js";
+import { emitFlatCast } from "./strings.js";
 import { F64, I32, ModuleBuilder, type ValType } from "./module.js";
 
 /** ScrDynKind's numeric values (scr_runtime.h), shared verbatim with
@@ -2920,7 +2921,7 @@ export class DynBuilder {
       c.brIf(1);
       this.arrAt(c, (x) => x.localGet(KS), (x) => x.localGet(I));
       c.structGet(this.dynT(), DYN_REF);
-      c.refCast(this.deps.strType());
+      emitFlatCast(c, this.deps.strType());
       c.localSet(KX);
       c.localGet(O);
       c.localGet(KX);
@@ -3641,7 +3642,7 @@ export class DynBuilder {
         c.localGet(0);
         this.arrAt(c, (x) => this.arrPayload(x, (y) => y.localGet(P)), (x) => x.i32Const(0));
         c.structGet(dynT, DYN_REF);
-        c.refCast(this.deps.strType());
+        emitFlatCast(c, this.deps.strType());
         this.arrAt(c, (x) => this.arrPayload(x, (y) => y.localGet(P)), (x) => x.i32Const(1));
         c.call(this.keySet());
         c.globalGet(this.deps.excKind());
@@ -3873,10 +3874,10 @@ export class DynBuilder {
       this.arm(c, K, [DK.STR], () => {
         c.localGet(0);
         c.structGet(dynT, DYN_REF);
-        c.refCast(this.deps.strType());
+        emitFlatCast(c, this.deps.strType());
         c.localGet(1);
         c.structGet(dynT, DYN_REF);
-        c.refCast(this.deps.strType());
+        emitFlatCast(c, this.deps.strType());
         c.call(this.deps.strEq());
       });
       // FUNC: identity is the boxed CLOSURE, never the box — one closure
@@ -4279,10 +4280,10 @@ export class DynBuilder {
       c.ifVoid();
       c.localGet(A);
       c.structGet(dynT, DYN_REF);
-      c.refCast(this.deps.strType());
+      emitFlatCast(c, this.deps.strType());
       c.localGet(B);
       c.structGet(dynT, DYN_REF);
-      c.refCast(this.deps.strType());
+      emitFlatCast(c, this.deps.strType());
       c.call(strEqFn);
       c.return_();
       c.end();
@@ -4661,7 +4662,7 @@ export class DynBuilder {
       this.arm(c, K, [DK.STR], () => {
         c.localGet(0);
         c.structGet(dynT, DYN_REF);
-        c.refCast(this.deps.strType());
+        emitFlatCast(c, this.deps.strType());
         c.arrayLen();
         c.i32Const(0);
         c.i32Ne();
@@ -4746,7 +4747,7 @@ export class DynBuilder {
       this.arm(c, K, [DK.STR], () => {
         c.localGet(0);
         c.structGet(dynT, DYN_REF);
-        c.refCast(this.deps.strType());
+        emitFlatCast(c, this.deps.strType());
       });
       this.arm(c, K, [DK.UNDEF], () => this.deps.lit(c, "undefined"));
       this.arm(c, K, [DK.NULL], () => this.deps.lit(c, "null"));
@@ -5040,7 +5041,7 @@ export class DynBuilder {
         c.ifVoid();
         c.localGet(M);
         c.structGet(dynT, DYN_REF);
-        c.refCast(this.deps.strType());
+        emitFlatCast(c, this.deps.strType());
         c.localSet(slot);
         c.end();
         c.end();
@@ -5451,7 +5452,7 @@ export class DynBuilder {
           this.boxNum(c, (x) => {
             x.localGet(0);
             x.structGet(dynT, DYN_REF);
-            x.refCast(this.deps.strType());
+            emitFlatCast(x, this.deps.strType());
             x.arrayLen();
             x.f64ConvertI32U();
           });
@@ -5466,7 +5467,7 @@ export class DynBuilder {
           c.localGet(IDX);
           c.localGet(0);
           c.structGet(dynT, DYN_REF);
-          c.refCast(this.deps.strType());
+          emitFlatCast(c, this.deps.strType());
           c.arrayLen();
           c.i32LtU();
           c.ifVoid();
@@ -5479,7 +5480,7 @@ export class DynBuilder {
             x.i32Const(0);
             x.localGet(0);
             x.structGet(dynT, DYN_REF);
-            x.refCast(this.deps.strType());
+            emitFlatCast(x, this.deps.strType());
             x.localGet(IDX);
             x.arrayGetU(this.deps.strType());
             x.arraySet(this.deps.strType());
@@ -5992,7 +5993,7 @@ export class DynBuilder {
         c.ifResult(this.deps.strRef());
         c.localGet(0);
         c.structGet(dynT, DYN_REF);
-        c.refCast(this.deps.strType());
+        emitFlatCast(c, this.deps.strType());
         c.else_();
         c.localGet(0);
         c.structGet(dynT, DYN_NUM);
@@ -6127,7 +6128,7 @@ export class DynBuilder {
         c.else_();
         c.localGet(0);
         c.structGet(dynT, DYN_REF);
-        c.refCast(this.deps.strType());
+        emitFlatCast(c, this.deps.strType());
         c.arrayLen();
         c.end();
         c.i32LtU();
@@ -6696,7 +6697,7 @@ export class DynBuilder {
       this.arm(c, K, [DK.STR], () => {
         c.localGet(0);
         c.structGet(dynT, DYN_REF);
-        c.refCast(this.deps.strType());
+        emitFlatCast(c, this.deps.strType());
         c.localTee(S);
         c.arrayLen();
         c.localSet(N);
@@ -6969,7 +6970,7 @@ export class DynBuilder {
           (x) => x.i32Const(0),
         );
         c.structGet(dynT, DYN_REF);
-        c.refCast(this.deps.strType());
+        emitFlatCast(c, this.deps.strType());
         this.arrAt(
           c,
           (x) => this.arrPayload(x, (y) => y.localGet(P)),
@@ -7156,7 +7157,7 @@ export class DynBuilder {
         this.deps.lit(c, 'string "');
         c.localGet(0);
         c.structGet(dynT, DYN_REF);
-        c.refCast(this.deps.strType());
+        emitFlatCast(c, this.deps.strType());
         c.call(concat);
         this.deps.lit(c, '"');
         c.call(concat);
@@ -7282,7 +7283,7 @@ export class DynBuilder {
     // every step (its own O(n²) shape); the cursor answers identically.
     c.localGet(0);
     c.structGet(dynT, DYN_REF);
-    c.refCast(this.deps.strType());
+    emitFlatCast(c, this.deps.strType());
     c.localTee(S);
     c.arrayLen();
     c.localSet(N);
@@ -7511,7 +7512,7 @@ export class DynBuilder {
       this.arm(c, K, [DK.STR], () => {
         c.localGet(1);
         c.structGet(dynT, DYN_REF);
-        c.refCast(this.deps.strType());
+        emitFlatCast(c, this.deps.strType());
         c.localTee(S);
         c.arrayLen();
         c.localSet(N);
@@ -7874,7 +7875,7 @@ export class DynBuilder {
       this.arm(c, K, [DK.STR], () => {
         c.localGet(0);
         c.structGet(dynT, DYN_REF);
-        c.refCast(this.deps.strType());
+        emitFlatCast(c, this.deps.strType());
         c.localSet(S);
         // `value.length > 28 && (value = value.slice(0, 25) + "...")` —
         // the quote check below runs on this (possibly truncated) value,
@@ -8607,7 +8608,7 @@ export class DynBuilder {
       c.localSet(PP);
       this.arrAt(c, (x) => x.localGet(PP), (x) => x.i32Const(0));
       c.structGet(dynT, DYN_REF);
-      c.refCast(this.deps.strType());
+      emitFlatCast(c, this.deps.strType());
       c.localSet(KEY);
       this.arrAt(c, (x) => x.localGet(PP), (x) => x.i32Const(1));
       c.localTee(DV);
@@ -11512,7 +11513,7 @@ export class DynBuilder {
           this.arm(c, K, [DK.STR], () => {
             c.localGet(0);
             c.structGet(dynT, DYN_REF);
-            c.refCast(this.deps.strType());
+            emitFlatCast(c, this.deps.strType());
             c.localSet(S);
             if (method === "slice") {
               c.localGet(1);
@@ -11671,10 +11672,10 @@ export class DynBuilder {
                 x.localGet(S);
                 x.localGet(M);
                 x.structGet(dynT, DYN_REF);
-                x.refCast(this.deps.strType());
+                emitFlatCast(x, this.deps.strType());
                 this.arrAt(x, (y) => y.localGet(1), (y) => y.i32Const(1));
                 x.structGet(dynT, DYN_REF);
-                x.refCast(this.deps.strType());
+                emitFlatCast(x, this.deps.strType());
                 x.call(this.strReplaceHelper(method === "replaceAll"));
               });
               c.return_();
@@ -11698,7 +11699,7 @@ export class DynBuilder {
             c.ifVoid();
             c.localGet(M);
             c.structGet(dynT, DYN_REF);
-            c.refCast(this.deps.strType());
+            emitFlatCast(c, this.deps.strType());
             c.localSet(MSG);
             // Argument 1 is the position. A STRING's is CLAMPED to
             // [0, len] rather than taken relatively — `"abcabc"

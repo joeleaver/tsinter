@@ -50,6 +50,7 @@
  *
  * SEMANTICS.md S087 registers where this tier and Node part. */
 import { Code } from "./code.js";
+import { emitFlatCast } from "./strings.js";
 import { F64, I32, ModuleBuilder, type ValType } from "./module.js";
 
 const EQ_HEAP = -0x13;
@@ -5770,7 +5771,7 @@ export class NetBuilder {
       c.localGet(e.srv);
       c.refNull(this.deps.errType());
       c.localGet(e.x);
-      c.refCast(this.deps.strType());
+      emitFlatCast(c, this.deps.strType());
       c.localGet(e.n);
       c.call(this.listenLookupDoneHelper());
     });

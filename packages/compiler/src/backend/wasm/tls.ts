@@ -1963,7 +1963,7 @@ export class TlsBuilder {
         $.ret();
       });
       $.for(I, $.i(0), $.l(N), () => {
-        $.put(B8, $.call(this.deps.strToBytes(), $.aget(sv.bufType, $.get(sv.struct, 1, $.l(CERTS)), $.l(I))));
+        $.put(B8, $.call(this.deps.strToBytes(), $.flat(this.S, $.aget(sv.bufType, $.get(sv.struct, 1, $.l(CERTS)), $.l(I)))));
         $.put(D, $.call(this.bytesCopyFn(), $.l(B8)));
         $.put(DERS, $.call(x.pemReadFn(), $.get(this.BT, 0, $.l(D)), $.get(this.BT, 2, $.l(D))));
         $.put(E, $.g(x.errGlobal()));

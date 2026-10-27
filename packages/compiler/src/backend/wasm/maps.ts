@@ -95,6 +95,7 @@
  * here assumes val is scalar or non-recursive. */
 import { BUF, LEN } from "./arrays.js";
 import { Code } from "./code.js";
+import { emitFlat } from "./strings.js";
 import { F64, I32, ModuleBuilder, type FieldType, type StorageType, type ValType } from "./module.js";
 
 /** "ref" (INC-29 U2): a handle key compared by reference identity — a
@@ -1654,6 +1655,8 @@ export class MapBuilder {
       c.localGet(I);
       c.arrayGet(vecBufType);
       if (this.isRefKeyKind(m.keyKind)) c.refAsNonNull();
+      // A string[] seed holds string VALUES; the key store is flat.
+      if (m.keyKind === "str") emitFlat(c, this.deps.strType());
       c.f64Const(0);
       c.call(this.set(m));
       c.localGet(I);

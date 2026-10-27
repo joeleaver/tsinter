@@ -4,6 +4,7 @@
  * bytes stay exactly what the equivalent straight-line Code calls emit.
  * Nothing here knows any runtime type; it only spells instructions. */
 import { Code } from "./code.js";
+import { emitFlat } from "./strings.js";
 import { F64, I32, I64, type ValType } from "./module.js";
 
 /** A value: pushes its result(s) onto the stack when called. */
@@ -114,6 +115,14 @@ export class A {
     return () => {
       o();
       this.c.refCast(T);
+    };
+  }
+  /** A string VALUE made flat `$chars` (strings.ts emitFlat): `strType`
+   * is the flat array type. */
+  flat(strType: number, o: X): X {
+    return () => {
+      o();
+      emitFlat(this.c, strType);
     };
   }
   test(T: number, o: X): X {
