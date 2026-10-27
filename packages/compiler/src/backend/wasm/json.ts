@@ -716,9 +716,24 @@ export class JsonBuilder {
    * pair combines for free and a lone `\uD800` survives, which is Node's
    * answer and S002's stance (C substitutes U+FFFD here; not inherited).
    *
-   * The buffer is sized at the remaining input, which is an upper bound
-   * on the decoded length because every escape shrinks: no output unit
-   * can come from fewer than one input unit. */
+   * SCAN FIRST (board #317). A pre-pass finds the token's extent: it stops
+   * at the first quote not consumed by an escape pair, or at the first
+   * control character, or at the end of input, and notes whether it saw a
+   * backslash. A token with neither escapes nor control characters that
+   * the scan saw close is the common case, and it is ONE exact span copy.
+   * Anything else runs the decoding loop below over a buffer sized at the
+   * scanned extent — never at the remaining input, which made every
+   * string token allocate (and zero) the rest of the document: quadratic
+   * in document size (b4: ~1M tokens averaging 320 KB of scratch each).
+   *
+   * The extent bounds the decoded length: the decoder pairs a backslash
+   * with the unit after it exactly as the scan does (a `\u`'s four digits
+   * are scanned as plain units, and any digit that is a quote, backslash
+   * or control unit makes hex4 throw at or before it), every escape
+   * shrinks, and no output unit comes from fewer than one input unit — so
+   * the decoder stops, or throws, having written at most extent units.
+   * Every error therefore comes from the decoder, at the position and
+   * with the text it always had. */
   private jstring(): number {
     return this.cached("string", [], [this.deps.strRef()], (idx) => {
       const strRef = this.deps.strRef();
@@ -727,8 +742,86 @@ export class JsonBuilder {
       const N = 1;
       const U = 2;
       const R = 3;
+      const J = 4;
+      const SLOW = 5;
       this.bump(c, 1); // the opening quote
+      // The scan: J walks from pos; SLOW records a backslash or a control
+      // unit (which stops the scan — the decoder throws there).
+      c.globalGet(this.pos());
+      c.localSet(J);
+      c.i32Const(0);
+      c.localSet(SLOW);
+      c.block();
+      c.loop();
+      c.localGet(J);
       this.pushLen(c);
+      c.i32GeU();
+      c.brIf(1);
+      this.pushAt(c, (x) => x.localGet(J));
+      c.localTee(U);
+      c.i32Const(0x22); // '"'
+      c.i32Eq();
+      c.brIf(1);
+      c.localGet(U);
+      c.i32Const(0x20);
+      c.i32LtU();
+      c.ifVoid();
+      c.i32Const(1);
+      c.localSet(SLOW);
+      c.br(2);
+      c.end();
+      c.localGet(U);
+      c.i32Const(0x5c); // '\\' — it and the unit after it are one pair
+      c.i32Eq();
+      c.ifVoid();
+      c.i32Const(1);
+      c.localSet(SLOW);
+      c.localGet(J);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(J);
+      c.end();
+      c.localGet(J);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(J);
+      c.br(0);
+      c.end();
+      c.end();
+      // A pair at the very end can carry J one past the length.
+      c.localGet(J);
+      this.pushLen(c);
+      c.i32GtU();
+      c.ifVoid();
+      this.pushLen(c);
+      c.localSet(J);
+      c.end();
+      // The fast path: no escapes, no control units, and closed (the scan
+      // only stops short of the end at a quote when SLOW is clear).
+      c.localGet(SLOW);
+      c.i32Eqz();
+      c.localGet(J);
+      this.pushLen(c);
+      c.i32LtU();
+      c.i32And();
+      c.ifVoid();
+      this.emitSlice(
+        c,
+        R,
+        (x) => x.globalGet(this.pos()),
+        (x) => {
+          x.localGet(J);
+          x.globalGet(this.pos());
+          x.i32Sub();
+        },
+      );
+      c.localGet(J);
+      c.i32Const(1);
+      c.i32Add();
+      c.globalSet(this.pos());
+      c.return_();
+      c.end();
+      c.localGet(J);
       c.globalGet(this.pos());
       c.i32Sub();
       c.arrayNewDefault(this.deps.strType());
@@ -830,7 +923,7 @@ export class JsonBuilder {
       c.end();
       c.end();
       c.refNull(this.deps.strType());
-      this.mb.setBody(idx, [strRef, I32, I32, strRef], c.bytes());
+      this.mb.setBody(idx, [strRef, I32, I32, strRef, I32, I32], c.bytes());
     });
   }
 
@@ -4984,12 +5077,13 @@ export class JsonBuilder {
       // state): `JSON.stringify({a:{toJSON:k=>JSON.stringify({inner:k})},
       // b:{toJSON:k=>\`k2=\${k}\`}})` → both members print correctly,
       // independently, with the outer object's own punctuation intact.
-      const SAVEDBUF = 17; // the outer walk's progress so far, as text
+      const SAVEDBUF = 17; // the outer walk's buffer array, swapped out (emitJbSwapOut)
       const SAVEDSEEN = 18; // the outer walk's OWN seen-stack array (swapped out, not copied — jbEnter allocates fresh on a null array)
       const SAVEDSEENLEN = 19;
       const SAVEDDEPTH = 20;
       const SAVEDCIRC = 21;
       const ISERR = 22; // hideErr: the OBJ is the %error encoding
+      const SAVEDLEN = hideErr ? 23 : 22; // the outer walk's buffer length (SAVEDBUF is its buffer)
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
       c.localSet(K);
@@ -5210,8 +5304,7 @@ export class JsonBuilder {
           c.ifVoid();
           // SAVE: the outer walk's own progress, before handing control
           // to arbitrary user code that may reenter this SAME machinery.
-          c.call(this.jbFinish()); // snapshots the text AND resets jbLen to 0
-          c.localSet(SAVEDBUF);
+          this.emitJbSwapOut(c, SAVEDBUF, SAVEDLEN);
           c.globalGet(this.seen());
           c.localSet(SAVEDSEEN);
           c.refNull(this.seenArr()); // isolate: the reentrant call gets a FRESH stack (jbEnter allocates on null), never touching the outer's frames
@@ -5245,8 +5338,7 @@ export class JsonBuilder {
           // call's own to have leaked in the first place — N1's earlier
           // "add jbLeave here" patch is GONE, not merely redundant: with
           // jbEnter relocated below, this branch has no frame to leave).
-          c.localGet(SAVEDBUF);
-          c.call(this.jbPuts());
+          this.emitJbSwapIn(c, SAVEDBUF, SAVEDLEN);
           c.localGet(SAVEDSEEN);
           c.globalSet(this.seen());
           c.localGet(SAVEDSEENLEN);
@@ -5279,8 +5371,7 @@ export class JsonBuilder {
           // user code — so it runs FIRST, inside the same save/restore
           // bracket a toJSON call gets (a getter may stringify too), and
           // a getter that throws ends the walk with its error pending.
-          c.call(this.jbFinish());
-          c.localSet(SAVEDBUF);
+          this.emitJbSwapOut(c, SAVEDBUF, SAVEDLEN);
           c.globalGet(this.seen());
           c.localSet(SAVEDSEEN);
           c.refNull(this.seenArr());
@@ -5295,8 +5386,7 @@ export class JsonBuilder {
           c.i32Const(2); // Object.entries mode
           c.call(dyn.objWalk());
           c.localSet(ENTS);
-          c.localGet(SAVEDBUF);
-          c.call(this.jbPuts());
+          this.emitJbSwapIn(c, SAVEDBUF, SAVEDLEN);
           c.localGet(SAVEDSEEN);
           c.globalSet(this.seen());
           c.localGet(SAVEDSEENLEN);
@@ -5568,10 +5658,36 @@ export class JsonBuilder {
           I32,
           I32,
           ...(hideErr ? [I32] : []),
+          I32, // SAVEDLEN
         ],
         c.bytes(),
       );
     }
+  }
+
+  /** The reentrancy bracket's buffer half (board #317): the outer walk's
+   * buffer is SWAPPED OUT — its array and length parked in two locals,
+   * the global left empty (null, 0) for whatever the user code runs, which
+   * allocates afresh exactly as a first stringify does — and swapped back
+   * in afterwards. It used to snapshot the text with jbFinish and replay it
+   * with jbPuts: a copy of the whole output so far per toJSON call (and
+   * per object when accessors are live), quadratic in the document. */
+  private emitJbSwapOut(c: Code, bufLocal: number, lenLocal: number): void {
+    c.globalGet(this.jbBuf());
+    c.localSet(bufLocal);
+    c.globalGet(this.jbLen());
+    c.localSet(lenLocal);
+    c.refNull(this.deps.strType());
+    c.globalSet(this.jbBuf());
+    c.i32Const(0);
+    c.globalSet(this.jbLen());
+  }
+
+  private emitJbSwapIn(c: Code, bufLocal: number, lenLocal: number): void {
+    c.localGet(bufLocal);
+    c.globalSet(this.jbBuf());
+    c.localGet(lenLocal);
+    c.globalSet(this.jbLen());
   }
 
   /** `if (kind is one of ks) { body }` — the kind-dispatch shape dyn.ts

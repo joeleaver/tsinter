@@ -838,63 +838,125 @@ export class BytesBuilder {
   /** %w.bytes.join:<elem> — (bytes, str sep) → str; Array.prototype.join
    * over the elements' Number ToString (Uint8Array.prototype.join, u8-
    * only at the lowering — this file stays generic like everything
-   * else). Mirrors VecBuilder.join's f64-element arm exactly, reading
-   * bytes storage directly instead of a vec buffer. */
+   * else). Mirrors VecBuilder.join's f64-element arm (board #291's
+   * measure-then-copy shape, which board #317 brought here: this body
+   * still accumulated with one %w.concat per element, quadratic in the
+   * element count), reading bytes storage directly instead of a vec
+   * buffer. Pass 1 formats each element once into PARTS and sums the
+   * lengths; pass 2 copies separators and parts into one fresh array. */
   joinHelper(elem: BytesElem): number {
     const esz = this.esize(elem);
     return this.cached(`join:${elem}`, () => {
+      const strRefT = this.deps.strRef();
+      const strT = this.deps.strType();
+      const partsType = this.mb.arrayType(strRefT, true);
+      const partsRefT: ValType = { kind: "ref", nullable: true, typeIndex: partsType };
       const idx = this.mb.declareFunc(
-        this.mb.funcType([this.bytesRef(), this.deps.strRef()], [this.deps.strRef()]),
+        this.mb.funcType([this.bytesRef(), strRefT], [strRefT]),
         `%w.bytes.join:${elem}`,
       );
       const c = new Code();
       const V = 0, SEP = 1, LENI = 2, I = 3, ACC = 4, BUFL = 5, ADDR = 6, BITS = 7;
+      const TOT = 8, POS = 9, PARTS = 10, S = 11;
+      const forEach = (body: () => void): void => {
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(LENI);
+        c.i32GeS();
+        c.brIf(1);
+        body();
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+      };
       c.localGet(V);
       c.structGet(this.bytesType(), BLEN);
       c.localSet(LENI);
-      this.deps.lit(c, "");
-      c.localSet(ACC);
       c.localGet(V);
       c.structGet(this.bytesType(), STORAGE);
       c.localSet(BUFL);
-      c.i32Const(0);
-      c.localSet(I);
-      c.block();
-      c.loop();
-      c.localGet(I);
       c.localGet(LENI);
-      c.i32GeS();
-      c.brIf(1);
-      c.localGet(I);
-      c.ifVoid();
-      c.localGet(ACC);
-      c.localGet(SEP);
-      c.call(this.deps.concat());
-      c.localSet(ACC);
-      c.end();
-      c.localGet(ACC);
-      c.localGet(V);
-      c.structGet(this.bytesType(), OFF);
-      c.localGet(I);
-      if (esz > 1) {
-        c.i32Const(esz);
-        c.i32Mul();
-      }
-      c.i32Add();
-      c.localSet(ADDR);
-      this.emitWidenElem(c, elem, BUFL, ADDR, BITS);
-      c.call(this.deps.f64ToStr());
-      c.call(this.deps.concat());
-      c.localSet(ACC);
-      c.localGet(I);
+      c.arrayNewDefault(partsType);
+      c.localSet(PARTS);
+      // separators: (n - 1) * |sep| when n > 0
+      c.localGet(LENI);
+      c.ifResult(I32);
+      c.localGet(LENI);
       c.i32Const(1);
-      c.i32Add();
-      c.localSet(I);
-      c.br(0);
+      c.i32Sub();
+      c.localGet(SEP);
+      c.arrayLen();
+      c.i32Mul();
+      c.else_();
+      c.i32Const(0);
       c.end();
-      c.end();
+      c.localSet(TOT);
+      forEach(() => {
+        c.localGet(V);
+        c.structGet(this.bytesType(), OFF);
+        c.localGet(I);
+        if (esz > 1) {
+          c.i32Const(esz);
+          c.i32Mul();
+        }
+        c.i32Add();
+        c.localSet(ADDR);
+        this.emitWidenElem(c, elem, BUFL, ADDR, BITS);
+        c.call(this.deps.f64ToStr());
+        c.localSet(S);
+        c.localGet(PARTS);
+        c.localGet(I);
+        c.localGet(S);
+        c.arraySet(partsType);
+        c.localGet(S);
+        c.arrayLen();
+        c.localGet(TOT);
+        c.i32Add();
+        c.localSet(TOT);
+      });
+      c.localGet(TOT);
+      c.arrayNewDefault(strT);
+      c.localSet(ACC);
+      c.i32Const(0);
+      c.localSet(POS);
+      const copyIn = (pushSrc: () => void): void => {
+        c.localGet(ACC);
+        c.localGet(POS);
+        pushSrc();
+        c.i32Const(0);
+        pushSrc();
+        c.arrayLen();
+        c.arrayCopy(strT, strT);
+        c.localGet(POS);
+        pushSrc();
+        c.arrayLen();
+        c.i32Add();
+        c.localSet(POS);
+      };
+      forEach(() => {
+        c.localGet(I);
+        c.ifVoid();
+        copyIn(() => c.localGet(SEP));
+        c.end();
+        c.localGet(PARTS);
+        c.localGet(I);
+        c.arrayGet(partsType);
+        c.localSet(S);
+        copyIn(() => c.localGet(S));
+      });
       c.localGet(ACC);
-      this.mb.setBody(idx, [I32, I32, this.deps.strRef(), this.bufRefNN(), I32, I32], c.bytes());
+      this.mb.setBody(
+        idx,
+        [I32, I32, strRefT, this.bufRefNN(), I32, I32, I32, I32, partsRefT, strRefT],
+        c.bytes(),
+      );
       return idx;
     });
   }
