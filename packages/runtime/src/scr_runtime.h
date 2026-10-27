@@ -949,13 +949,15 @@ ScrStr *scr_str_raw(ScrArr *raw, ScrArr *subs);
 
 /* ── regular expressions (scr_regex.c — linked ONLY when the program
  * contains a regex literal; see cc.ts) ────────────────────────────────
- * The engine is quickjs-ng's libregexp (the same bytecode interpreter the
- * dynamic island uses), compiled standalone. A ScrRegex is today ALWAYS an
- * immortal interned literal: the compiler emits one static per distinct
- * (pattern, flags) pair, exactly like string literals, and the bytecode is
- * compiled lazily on first use (cached on the struct, freed at exit).
- * Subjects are matched as UTF-16 (converted per call from the UTF-8
- * storage), so all observable index behavior is UTF-16-exact like Node.
+ * The engine is the WasmGC tier's regex engine translated to C
+ * (scr_regex_engine.h, generated — the same compiler and matcher every
+ * lane runs; SEMANTICS.md S065, S102). A regex LITERAL is an immortal
+ * interned static: the compiler emits one per distinct (pattern, flags)
+ * pair, exactly like string literals, and the bytecode is compiled lazily
+ * on first use (cached on the struct, freed at exit); `new RegExp` builds
+ * a heap one. Subjects are matched as UTF-16 (converted per call from the
+ * UTF-8 storage), so all observable index behavior is UTF-16-exact like
+ * Node.
  *
  * Statefulness fence: /g and /y regexes carry mutable lastIndex in JS.
  * Supported only where iteration is internal (replace/replaceAll/split);
@@ -968,9 +970,9 @@ ScrStr *scr_str_raw(ScrArr *raw, ScrArr *subs);
  */
 typedef struct ScrRegex {
   size_t rc;      /* SIZE_MAX = immortal (every regex literal) */
-  ScrStr *source; /* pattern text between the slashes */
-  ScrStr *flags;  /* flags text, source order (alphabet fenced to gimsuy) */
-  uint8_t *bc;    /* lazily compiled libregexp bytecode; NULL until first use */
+  ScrStr *source; /* .source: a literal's text between the slashes, or V8's escaped source */
+  ScrStr *flags;  /* .flags, canonical order (dgimsuvy) */
+  void *bc;       /* the engine's compiled bytecode (a foreign engine object); a literal's is NULL until first use */
 } ScrRegex;
 
 static inline ScrRegex *scr_regex_retain(ScrRegex *re) {
@@ -983,10 +985,10 @@ void *scr_regex_retain_v(void *re);
 void scr_regex_release_v(void *re);
 
 /* new RegExp(pattern, flags): a heap ScrRegex over the same engine. The
- * pattern compiles EAGERLY — an invalid pattern or flag throws Node's
- * catchable SyntaxError at construction (detail text is libregexp's,
- * approximate fidelity; e.name exact). An empty pattern stores the
- * spec's "(?:)" source. Borrows both; +1, NULL after a throw. */
+ * pattern compiles EAGERLY — an invalid pattern or flags string throws
+ * V8's catchable SyntaxError (exact text) at construction, and a pattern
+ * outside the tier the named fence Error with its `code` (SEMANTICS.md
+ * S102). Borrows both; +1, NULL after a throw. */
 ScrRegex *scr_regex_new(ScrStr *pattern, ScrStr *flags);
 
 bool scr_regex_test(ScrRegex *re, ScrStr *s); /* aborts on /g or /y */

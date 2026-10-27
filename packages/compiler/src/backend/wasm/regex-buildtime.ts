@@ -5,23 +5,21 @@
  * literal `.split()` receiver needs, and a `new RegExp(p, f)` whose texts
  * fold at build time all get their bytecode (or their SyntaxError, or
  * their named fence) by RUNNING that same emitted function here, in the
- * compiler's own process: a standalone module holding only the compiler
- * and the regex value it builds is emitted by the same builders the
- * output module uses, instantiated once per process through the host's
- * WebAssembly (WasmGC), and called per pattern. What a program embeds for
- * a constant pattern is therefore exactly what it would compute for the
- * same texts at run time; there is no second code base to drift.
+ * compiler's own process: the standalone regex engine module
+ * (regex-engine-module.ts — the compiler, the matcher and the regex value,
+ * emitted by the same builders the output module uses) is instantiated
+ * once per process through the host's WebAssembly (WasmGC) and called per
+ * pattern. What a program embeds for a constant pattern is therefore
+ * exactly what it would compute for the same texts at run time; there is
+ * no second code base to drift. The native lanes run that same module,
+ * translated to C (backend/regex-native.ts, follow-up unit D).
  *
  * The outcome is data: the regex value's fields (source, canonical flags,
  * bytecode, capture count, group names), a V8 SyntaxError message (the
  * compiler's own errMessage text), or a fence key (SEMANTICS.md S102).
  * Results are memoized per (pattern, flags). */
-import { A, Fn, I32, type X } from "./asm.js";
-import { ModuleBuilder, type ValType } from "./module.js";
-import { RegexCompilerBuilder } from "./regex-compiler.js";
 import { RX, RX_FENCE_KEY } from "./regex-compiler-tables.js";
-import { RegexInterpreterBuilder } from "./regex-interpreter.js";
-import { RegexBuilder } from "./regex-value.js";
+import { regexEngineModule } from "./regex-engine-module.js";
 
 export type RegexCompileOutcome =
   | { kind: "ok"; source: string; flags: string; bytes: Uint8Array; captureCount: number; groupNames: string[] | null }
@@ -55,40 +53,7 @@ const memo = new Map<string, RegexCompileOutcome>();
 export let regexCompilerModuleBytes = 0;
 
 function build(): Exports {
-  const mb = new ModuleBuilder();
-  const strT = mb.arrayType("i16", true);
-  const re = new RegexBuilder(mb, strT);
-  const interp = new RegexInterpreterBuilder(mb, strT, undefined, re.bcType);
-  const rc = new RegexCompilerBuilder(mb, strT, re, () => interp.regexCanonicalize());
-  const ref = (t: number): ValType => ({ kind: "ref", nullable: true, typeIndex: t });
-  const d = (name: string, params: ValType[], results: ValType[], body: ($: A, p: (i: number) => X) => X | void): void => {
-    const idx = mb.declareFunc(mb.funcType(params, results), name);
-    const f = new Fn(params.length);
-    const $ = new A(f);
-    const v = body($, (i) => $.l(i));
-    if (v) v();
-    mb.setBody(idx, f.locals, f.c.bytes());
-    mb.exportFunc(name, idx);
-  };
-  d("strNew", [I32], [ref(strT)], ($, p) => $.anew(strT, p(0)));
-  d("strSet", [ref(strT), I32, I32], [], ($, p) => $.aset(strT, p(0), p(1), p(2)));
-  d("strLen", [ref(strT)], [I32], ($, p) => $.alen(p(0)));
-  d("strAt", [ref(strT), I32], [I32], ($, p) => $.agetU(strT, p(0), p(1)));
-  mb.exportFunc("compile", rc.compileFn());
-  mb.exportFunc("errId", rc.errIdFn());
-  mb.exportFunc("errKind", rc.errKindFn());
-  mb.exportFunc("errMessage", rc.errMessageFn());
-  mb.exportFunc("errCode", rc.errCodeFn());
-  const R = ref(re.regexType);
-  d("isNull", [R], [I32], ($, p) => $.isNull(p(0)));
-  d("reSource", [R], [ref(strT)], ($, p) => $.get(re.regexType, 0, p(0)));
-  d("reFlags", [R], [ref(strT)], ($, p) => $.get(re.regexType, 1, p(0)));
-  d("reBcLen", [R], [I32], ($, p) => $.alen($.get(re.regexType, 2, p(0))));
-  d("reBcAt", [R, I32], [I32], ($, p) => $.agetU(re.bcType, $.get(re.regexType, 2, p(0)), p(1)));
-  d("reCap", [R], [I32], ($, p) => $.get(re.regexType, 3, p(0)));
-  d("reNamesLen", [R], [I32], ($, p) => $.sel(I32, $.isNull($.get(re.regexType, 4, p(0))), $.i(-1), $.alen($.get(re.regexType, 4, p(0)))));
-  d("reName", [R, I32], [ref(strT)], ($, p) => $.aget(re.strArrType, $.get(re.regexType, 4, p(0)), p(1)));
-  const bytes = mb.emit();
+  const { bytes } = regexEngineModule();
   regexCompilerModuleBytes = bytes.length;
   // The host's WebAssembly (this package's lib is ES-only, so its shape is
   // spelled out here rather than taken from DOM typings).

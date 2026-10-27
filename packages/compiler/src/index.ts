@@ -2,6 +2,7 @@ import { mkdir, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { CcCompileError, compileC, compileLibArchive, resolveCc, targetPlatform } from "./backend/cc.js";
 import { emitModule } from "./backend/emission/emitter.js";
+import { nativeRegexLiteralRefusal } from "./backend/regex-native.js";
 import { emitLlvmModule, LlvmUnsupportedError } from "./backend/llvm/emitter.js";
 import { emitWasmModule, surveyWasmModule, WasmUnsupportedError } from "./backend/wasm/emitter.js";
 import { EngineFormatError } from "./backend/wasm/engine.js";
@@ -175,6 +176,21 @@ function backendRefusalDiag(err: LlvmUnsupportedError | WasmUnsupportedError, en
     code: "SC3001",
     message: err.message,
     loc: err.loc ?? { file: entryPath, start: 0, end: 0 },
+  };
+}
+
+/** A regex literal outside the tier, on the native lanes: SC3001 with the
+ * wasm tier's own key (`expr:regexLit:<key>`), so the census and the
+ * refusal read the same on every lane (SEMANTICS.md S102). */
+function nativeRegexRefusalDiag(r: { kind: string; loc: SrcLoc }, entryPath: string): ScrDiagnostic {
+  // A pattern Node itself rejects is not a coverage gap: say so.
+  const head = r.kind.endsWith(":invalid-pattern")
+    ? `this regular expression is invalid — Node rejects it with a SyntaxError before the program runs (${r.kind})`
+    : `the native backends do not support this construct yet (${r.kind})`;
+  return {
+    code: "SC3001",
+    message: `${head}; the wasm backend refuses it the same way (one regex compiler on every lane)`,
+    loc: r.loc ?? { file: entryPath, start: 0, end: 0 },
   };
 }
 
@@ -756,6 +772,13 @@ export async function compile(entryPath: string, opts: CompileOptions): Promise<
   // command line below — compileC accepts either. The default lane tries
   // LLVM first; a tier refusal retries ONLY the emit with the C backend
   // (the frontend ran once, the IR is backend-agnostic — nothing recompiles).
+  // A regex literal the one regex compiler refuses refuses on the native
+  // lanes too, by the wasm tier's key (SEMANTICS.md S102) — both native
+  // backends, so it is checked once here, before either emits.
+  const regexRefusal = nativeRegexLiteralRefusal(lowered.module!);
+  if (regexRefusal !== null) {
+    return { ok: false, diagnostics: [nativeRegexRefusalDiag(regexRefusal, entryPath)], sourceTexts };
+  }
   let cPath = join(opts.outDir, `${stem}.c`);
   let backend: "c" | "llvm" = "c";
   let llvmRefusal: string | undefined;
@@ -1382,6 +1405,9 @@ export async function compileLibrary(opts: CompileLibraryOptions): Promise<Compi
 
   const validation = validateModule(mod);
   if (validation.length > 0) return fail(validation.map((v) => iceDiag(v.message, v.loc)));
+
+  const regexRefusal = nativeRegexLiteralRefusal(mod);
+  if (regexRefusal !== null) return fail([nativeRegexRefusalDiag(regexRefusal, entryPath)]);
 
   await mkdir(opts.outDir, { recursive: true });
   const stem = basename(entryPath).replace(/\.(ts|js|mjs|cjs)$/, "");

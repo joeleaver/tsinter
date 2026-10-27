@@ -9150,12 +9150,13 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
    * by the backend). The TS parser has already syntax-checked the literal;
    * what remains here is the flag-alphabet fence (d and v are
    * declared-valid TS flags outside this slice). Named capture groups
-   * `(?<name>...)` and `\k<name>` backreferences compile — libregexp
-   * executes them natively, replace templates resolve `$<name>` at
+   * `(?<name>...)` and `\k<name>` backreferences compile — the regex
+   * engine executes them, replace templates resolve `$<name>` at
    * runtime, and `.groups` reads desugar at their access sites
-   * (matchResultNamedGroupsOf). The engine validates the pattern itself
-   * lazily at first use (SEMANTICS.md documents the divergence from
-   * Node's parse-time SyntaxError). */
+   * (matchResultNamedGroupsOf). The pattern itself is judged at build
+   * time by the one regex compiler on every lane (the wasm emitter, and
+   * backend/regex-native.ts for the native lanes): a literal it refuses
+   * refuses the build by its key (SEMANTICS.md S065, S102). */
   export function lowerRegexLiteral(L: Lowerer, expr: ts.RegularExpressionLiteral): IrExpr {
     const text = expr.text;
     const lastSlash = text.lastIndexOf("/");

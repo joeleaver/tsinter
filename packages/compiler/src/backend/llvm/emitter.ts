@@ -88,6 +88,7 @@ import {
 import { DK, LlDyn } from "./dyn.js";
 import { LlvmUnsupportedError } from "./unsupported.js";
 import { foldFloatConst, foldNegation } from "../float-fold.js";
+import { nativeRegexLiteralFlags } from "../regex-native.js";
 import { LlWalkers } from "./walkers.js";
 import {
   arrNewCall,
@@ -4430,13 +4431,17 @@ class LlEmitter {
         // a no-op on immortals but keeps the owned-temps discipline
         // uniform. Pattern/flags strings intern NOW (the literal table is
         // still open — the C emitter's regex-literal discipline).
-        const key = `${e.flags}/${e.pattern}`;
+        // The flags are the canonical .flags (dgimsuvy order) the one regex
+        // compiler reports at build time (backend/regex-native.ts; the
+        // literal was checked before emission).
+        const flags = nativeRegexLiteralFlags(e.pattern, e.flags);
+        const key = `${flags}/${e.pattern}`;
         let re = this.regexInstances.get(key);
         if (!re) {
           re = {
             sym: `sc_re_${this.regexInstances.size}`,
             src: this.internLiteral(e.pattern),
-            fl: this.internLiteral(e.flags),
+            fl: this.internLiteral(flags),
           };
           this.regexInstances.set(key, re);
         }

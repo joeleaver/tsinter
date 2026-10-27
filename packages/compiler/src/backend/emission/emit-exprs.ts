@@ -9,6 +9,7 @@ import { OVERFLOW_MEMBER } from "./emit-shapes.js";
 import { arityDropTrampolineHelper, dynDestrCheckHelper, dynIterNHelper, dynKeyGetHelper } from "./emit-walkers.js";
 import { genResultThunkFor } from "./emit-async.js";
 import { foldFloatConst, foldNegation } from "../float-fold.js";
+import { nativeRegexLiteralFlags } from "../regex-native.js";
 
 
 
@@ -727,13 +728,17 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
         // no-op on immortals but keeps the owned-temps discipline uniform.
         // Pattern/flags strings are interned NOW so the literal table is
         // complete when emit() assembles the file.
-        const key = `${e.flags}/${e.pattern}`;
+        // The flags are the canonical .flags (dgimsuvy order) the one regex
+        // compiler reports at build time (backend/regex-native.ts; the
+        // literal was checked before emission).
+        const flags = nativeRegexLiteralFlags(e.pattern, e.flags);
+        const key = `${flags}/${e.pattern}`;
         let sym = E.regexInstances.get(key);
         if (!sym) {
           sym = `sc_re_${E.regexInstances.size}`;
           E.regexInstances.set(key, sym);
           E.internLiteral(e.pattern);
-          E.internLiteral(e.flags);
+          E.internLiteral(flags);
         }
         return E.newTemp(e.type, `scr_regex_retain(&${sym})`);
       }

@@ -9,14 +9,17 @@
  *   the limitation instead, so the caught branch is asserted here.
  * - The two size/stability pins: a regex-free program must not reference
  *   the regex runtime at all (byte-identical link line — its C names no
- *   ScrRegex symbol), and a regex-USING static binary pays libregexp
- *   (~110KB), never the ~620KB engine class: well under 300KB.
+ *   ScrRegex symbol), and a regex-USING static binary pays the regex
+ *   engine (the wasm tier's, translated — scr_regex_engine.h) plus
+ *   libunicode, never the ~620KB embedded-engine class: well under 300KB.
+ * - A regex literal outside the tier refuses the native build by the wasm
+ *   tier's own key (SEMANTICS.md S102).
  *
  * SCRIPTC_SAN=1 builds the programs with ASan + the RC audit.
  */
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
@@ -103,27 +106,42 @@ console.log(check(/a/g, "abc"));
     expect(stdout).toBe("caught\n");
   });
 
-  test("a pattern the engine rejects aborts at first use with a SyntaxError message", async () => {
-    // tsc's parser (and V8) accept 300 capture groups; libregexp caps
-    // captures at 255, so the engine rejects the pattern at its LAZY
-    // compile on first use — Node would run it fine (the abort is the
-    // documented divergence surface: engine-level rejections happen at
-    // first use, not at program parse time).
-    const r = await build(
-      "lazy-compile-error",
-      `console.log("before");
-console.log(/${"(a)".repeat(300)}/.test("a"));
-`,
-    );
-    const err = await execFileAsync(r.binaryPath, []).then(
-      () => {
-        throw new Error("expected the invalid pattern to abort");
-      },
-      (e: Error & { signal?: string; stdout?: string; stderr?: string }) => e,
-    );
-    expect(err.signal).toBe("SIGABRT");
-    expect(err.stdout).toContain("before");
-    expect(err.stderr).toContain("SyntaxError: Invalid regular expression:");
+  test("a literal outside the tier refuses the build by the wasm tier's key", async () => {
+    // tsc's parser (and V8) accept 300 capture groups; the one regex
+    // compiler fences captures at 255 (SEMANTICS.md S102), and the native
+    // lanes run it at build time over every literal, as the wasm tier does:
+    // the build refuses by the same key — never a program that starts and
+    // aborts at the regex's first use (the retired native behavior).
+    const dir = join(cacheDir, "regex-literal-fence");
+    mkdirSync(dir, { recursive: true });
+    const file = join(dir, "main.ts");
+    writeFileSync(file, `console.log("before");\nconsole.log(/${"(a)".repeat(300)}/.test("a"));\n`);
+    for (const backend of ["c", "llvm"] as const) {
+      const result = await compile(file, { outPath: join(dir, `p-${backend}`), outDir: dir, sanitize, backend });
+      expect(result.ok).toBe(false);
+      if (result.ok) continue;
+      expect(result.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
+      expect(result.diagnostics[0]!.message).toContain("(expr:regexLit:too-many-captures)");
+    }
+  });
+
+  // Linux /usr/bin/time reports the peak RSS; plain builds only (ASan's
+  // quarantine holds freed memory by design).
+  const memTest = !sanitize && process.platform === "linux" && existsSync("/usr/bin/time") ? platformTest : test.skip;
+  memTest("a match loop's memory is bounded by one exec, not the sum of all of them", async () => {
+    // Review B1 (unit D): the regex engine's collector ran only at the end
+    // of an entry point, so every exec of one global replace kept its
+    // allocations (subject-sized backtrack stacks included) until the loop
+    // ended — 326 MB for the first program, 1.5 GB at 12,000 units for the
+    // second (Node: 193 MB and 62 MB). The loop now collects between execs.
+    const peakMb = async (bin: string): Promise<number> => {
+      const { stderr } = await execFileAsync("/usr/bin/time", ["-f", "%M", bin], { maxBuffer: 1 << 26 });
+      return Number(stderr.trim().split("\n").pop()) / 1024;
+    };
+    const many = await build("mem-many-execs", `const s = "a1 ".repeat(1000000);\nconst r = s.replace(/\\d/g, "#");\nconsole.log(r.length);\n`);
+    const deep = await build("mem-deep-execs", `const s = "ab".repeat(6000);\nconst r = s.replace(/(?:a|b)*?x|a/g, "#");\nconsole.log(r.length);\n`);
+    expect(await peakMb(many.binaryPath)).toBeLessThan(64);
+    expect(await peakMb(deep.binaryPath)).toBeLessThan(32);
   });
 
   platformTest("regex-free programs never reference the regex runtime; regex use stays in its size class", async () => {

@@ -3384,17 +3384,16 @@ export type IrLibFn =
   | "dyn.structuredClone"
   | "dyn.cloneMissing"
   /** `new RegExp(pattern, flags?)`: NATIVE (scr_regex.c) — a heap regex
-   * over the same libregexp engine the literals use, compiled EAGERLY,
-   * so an invalid pattern (or an unknown flag letter) throws Node's
-   * catchable SyntaxError at construction — Node's message shape with
-   * libregexp's detail text (approximate fidelity; e.name exact). An
-   * empty pattern stores the spec's "(?:)" source. Both args borrowed
-   * strings (the lowering completes an absent flags to ""); result +1.
-   * The result TYPE is the regex kind, so the link switch pulls the
-   * engine exactly like a literal.
+   * compiled EAGERLY by the wasm tier's own regex compiler, translated to
+   * C (scr_regex_engine.h; SEMANTICS.md S065/S102, follow-up unit D), so
+   * every lane's outcome is the same: the value (V8's escaped .source,
+   * "(?:)" for an empty pattern, canonical .flags), V8's catchable
+   * SyntaxError with V8's text, or S102's named fence Error with its
+   * `code`. Both args borrowed strings (the lowering completes an absent
+   * flags to ""); result +1. The result TYPE is the regex kind, so the
+   * link switch pulls the engine exactly like a literal.
    *
-   * WASM (SEMANTICS.md S065 and S102 are the full two-lane picture;
-   * this paragraph describes native only): a COMPILE-TIME CONSTANT
+   * WASM (SEMANTICS.md S065 and S102 are the full picture): a COMPILE-TIME CONSTANT
    * pattern/flags (a literal, a strConcat chain, a provably-const
    * global, or `regexp.escape(...)` over one of those) is compiled at
    * build time (backend/wasm/regex-fold.ts); anything else compiles at
@@ -3402,11 +3401,10 @@ export type IrLibFn =
    * approximates: an invalid flags string or pattern throws V8's exact
    * SyntaxError text (a constant pattern whose error the build-time
    * pipeline cannot word goes through the run-time compiler), and a
-   * pattern outside the tier refuses at build time or throws a named
-   * Error at run time (S102) — never S065's "approximate fidelity"
-   * shape, which is native-only. Unlike native, wasm does NOT intern
-   * (design §7.5's own named non-requirement — `new RegExp("a") !==
-   * new RegExp("a")`, matching Node). */
+   * pattern outside the tier throws S102's named Error at the call. The
+   * native lanes compile even a constant at run time — the same compiler,
+   * so the same outcome at the same point. Neither lane interns
+   * (`new RegExp("a") !== new RegExp("a")`, matching Node). */
   | "regex.new"
   /** structuredClone with a NON-EMPTY transfer array of static values:
    * nothing static is transferable, so the call always throws Node's

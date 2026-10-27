@@ -715,6 +715,67 @@ async function ensureIeee754Object(sanitize: boolean, driver: CcDriver): Promise
   return object;
 }
 
+/** The inputs of the regex engine object (relative to the runtime package
+ * root): the unit and the generated engine it includes. */
+const REGEX_ENGINE_INPUTS = ["src/scr_regex_engine.c", "src/scr_regex_engine.h"];
+
+let regexEngineHashMemo: Promise<string> | null = null;
+function regexEngineInputsHash(): Promise<string> {
+  regexEngineHashMemo ??= (async () => {
+    const root = join(runtimeSrcDir(), "..");
+    const h = createHash("sha256");
+    for (const f of REGEX_ENGINE_INPUTS) h.update(f).update("\0").update(await readFile(join(root, f))).update("\0");
+    return h.digest("hex").slice(0, 16);
+  })();
+  return regexEngineHashMemo;
+}
+
+/** The native regex engine as an object: scr_regex_engine.c over the
+ * generated scr_regex_engine.h (the wasm tier's regex engine translated to
+ * C — SEMANTICS.md S065/S102, follow-up unit D). ~10k lines of generated C
+ * that depend on nothing else in the runtime, so they compile ONCE per
+ * flavor and target, on the first regex-using build, and are cached like
+ * the lre/zlib/ieee754 objects (vendor/.cache/regex-engine-<input
+ * hash>-<flavor>/scr_regex_engine.o, atomic-rename publish) — never
+ * recompiled per build. Flags follow the lane (-O2 plain, -O1 + ASan
+ * sanitized) with the runtime's -ffp-contract=off / -fno-strict-aliasing. */
+async function ensureRegexEngineObject(sanitize: boolean, driver: CcDriver): Promise<string> {
+  const flavor =
+    (sanitize ? "asan" : "plain") +
+    (driver.argv.length === 1 && driver.argv[0] === "clang" ? "" : "-zigcc") +
+    (driver.target !== null ? `-${driver.target}` : "");
+  const cacheRoot = join(runtimeSrcDir(), "..", "vendor", ".cache");
+  const cacheDir = join(cacheRoot, `regex-engine-${await regexEngineInputsHash()}-${flavor}`);
+  const object = join(cacheDir, "scr_regex_engine.o");
+  if (await fileExists(object)) return object;
+
+  await mkdir(cacheRoot, { recursive: true });
+  const buildDir = await mkdtemp(join(cacheRoot, `build-regex-engine-${flavor}-`));
+  try {
+    await execFileAsync(
+      driver.argv[0] ?? "clang",
+      [
+        ...driver.argv.slice(1),
+        "-std=c11",
+        ...driver.targetArgs,
+        ...(sanitize ? ["-O1", "-fsanitize=address"] : ["-O2"]),
+        "-fno-math-errno",
+        "-ffp-contract=off",
+        "-fno-strict-aliasing",
+        "-c", join(runtimeSrcDir(), "scr_regex_engine.c"),
+        "-o", join(buildDir, "scr_regex_engine.o"),
+      ],
+      { cwd: buildDir },
+    );
+    // Atomic publish: rename fails if a concurrent build won the race, and
+    // the winner's object is just as good.
+    await rename(buildDir, cacheDir).catch(() => undefined);
+  } finally {
+    await rm(buildDir, { recursive: true, force: true });
+  }
+  return object;
+}
+
 function vendorCurlDir(): string {
   return join(runtimeSrcDir(), "..", "vendor", "curl");
 }
@@ -892,6 +953,7 @@ export async function compileLibArchive(opts: LibArchiveOptions): Promise<void> 
   const lreObjects = regex ? await ensureLreObjects(sanitize, driver) : [];
   const zlibObjects = opts.zlib ? await ensureZlibObjects(sanitize, driver) : [];
   const ieee754Objects = opts.ieee754 ? [await ensureIeee754Object(sanitize, driver)] : [];
+  const regexEngineObjects = regex ? [await ensureRegexEngineObject(sanitize, driver)] : [];
   const sources = [
     ...LIB_RUNTIME_SOURCES,
     // win32 targets compile the libc-shim TU into the archive (stpcpy,
@@ -959,7 +1021,7 @@ export async function compileLibArchive(opts: LibArchiveOptions): Promise<void> 
     for (let i = 0; i < sources.length; i += width) {
       await Promise.all(sources.slice(i, i + width).map((f) => compileOne(join(rtDir, f), f.replace(/\.c$/, ".o"))));
     }
-    objects.push(...lreObjects, ...zlibObjects, ...ieee754Objects);
+    objects.push(...lreObjects, ...zlibObjects, ...ieee754Objects, ...regexEngineObjects);
     await rm(opts.outPath, { force: true }); // `ar r` would append into a stale archive
     await mkdir(dirname(opts.outPath), { recursive: true });
     await execFileAsync(arArgv[0] ?? "ar", [...arArgv.slice(1), "rcs", opts.outPath, ...objects]);
@@ -1215,6 +1277,9 @@ export async function compileC(opts: CcOptions): Promise<void> {
   // ours would collide; see scr_regex.c) — the standalone objects are for
   // static builds only.
   const lreObjects = regex && !dynamic ? await ensureLreObjects(opts.sanitize ?? false, driver) : [];
+  // The regex engine (static and --dynamic alike: it shares nothing with
+  // the engine archive).
+  const regexEngineObject = regex ? await ensureRegexEngineObject(opts.sanitize ?? false, driver) : null;
   // The vendored zlib (Node's own) on every target — host builds link it
   // too, never the system `-lz` (see CcOptions.zlib). The native fetch's
   // gzip decoder rides the same objects.
@@ -1268,7 +1333,7 @@ export async function compileC(opts: CcOptions): Promise<void> {
       ? [rt(join(rtDir, "scr_win.c")), "-ladvapi32", "-liphlpapi", "-lws2_32"]
       : []),
     ...(regex
-      ? ["-I", vendorEngineDir(), rt(join(rtDir, "scr_regex.c")), ...lreObjects]
+      ? ["-I", vendorEngineDir(), rt(join(rtDir, "scr_regex.c")), regexEngineObject!, ...lreObjects]
       : []),
     ...(opts.assert || regex || opts.symbol ? [rt(join(rtDir, "scr_assert.c"))] : []),
     ...(opts.inspect ? [rt(join(rtDir, "scr_inspect.c"))] : []),

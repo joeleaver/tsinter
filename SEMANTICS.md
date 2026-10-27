@@ -5285,7 +5285,7 @@ corpus program can pin it — the differential would fail by
 construction on the unguarded shape, S003's "cannot be differential-
 tested" case.
 
-## S065 — an invalid pattern: the WASM tier reports at compile time and throws Node's catchable `SyntaxError` from `new RegExp`; the NATIVE lanes abort at first use *(per-lane split)*
+## S065 — an invalid pattern: a regex literal refuses at compile time and `new RegExp` throws Node's catchable `SyntaxError` with V8's text *(every lane since follow-up unit D, below; the NATIVE lanes used to abort at first use)*
 
 Two axes, one entry (S055 is the precedent for a single entry carrying
 both): WHEN the failure is reported, and WHAT TEXT the thrown error
@@ -5460,6 +5460,33 @@ use, bring their message text to V8's, and rewrite the doc comment at
 comment goes false when the WASM behavior lands, not when board #117
 does).
 
+**Amendment (follow-up unit D): every lane, one compiler.** The native
+lanes no longer compile with libregexp. They run the wasm tier's own
+regex engine — the module regex-engine-module.ts builds (the one
+compiler, the matcher, the regex value), translated to C by
+`backend/wasm2c.ts` into `packages/runtime/src/scr_regex_engine.h`
+(generated; `native-regex-engine-drift.test.ts` holds it equal to a
+fresh translation) — so this entry's native arms are retired and its
+wasm arms are every lane's: (1) a regex LITERAL is compiled at build time
+by the same compiler on every lane, and one it refuses refuses the native
+build too, by the same key (`expr:regexLit:<key>`, SC3001 — a pattern
+Node rejects is `invalid-pattern`; a native program no longer starts and
+aborts at the regex's first use); (2) `new RegExp` throws V8's catchable
+`SyntaxError` with V8's exact text on every lane (the native lanes
+compile a constant pattern at run time where the wasm tier folds it at
+build time — the same outcome at the same point of the program); the
+"approximate fidelity" message arm is gone. A native literal is still
+compiled lazily at its first use (the build-time verdict already said it
+compiles); its `.flags` are the build-time compiler's canonical ones
+(S067). Measured: the regex gate's pool through one program on wasm, c
+and llvm (`packages/compiler/test/native-regex-lanes.test.ts` — 30,711
+rows, the 403 holding a lone surrogate left out because the native
+lanes' strings cannot carry one) prints the same bytes on all three,
+equal to Node's on every row but S102's fenced ones; and the translation
+equals the module it came from over the whole pool and 395,402 exec
+rows (`native-regex-engine.test.ts`), plain and under ASan + UBSan.
+Board #117 is closed by this unit.
+
 ## S066 — `split()` with capture groups: the WASM tier SPLICES as Node does; the NATIVE lanes throw a `TypeError` *(per-lane split)*
 
 On `"a1b".split(/(\d)/)`: Node answers `["a","1","b"]`; wasm answers
@@ -5497,7 +5524,7 @@ and it goes false the moment the WASM tier splices in P3, whether or
 not board #118 ever lands, so the repoint is tied to P3's own landing
 rather than to the native fix's timing.
 
-## S067 — `.flags`: the WASM tier renders Node's CANONICAL order; the NATIVE lanes render SOURCE order *(per-lane split)*
+## S067 — `.flags`: the WASM tier renders Node's CANONICAL order; the NATIVE lanes render SOURCE order *(per-lane split until follow-up unit D: every lane renders canonical order now — the native arm is retired, see the unit D note below)*
 
 `RegExp.prototype.flags` reads the flag getters in a fixed order, so
 Node answers `"gimsuy"` for a regex written `/b/yusmig`. MEASURED on
@@ -5535,6 +5562,15 @@ above) is the measurement of record; corpus-unpinnable per REACH
 (latent), so board #119 tracks the fix without a corpus witness.
 
 **Board #119** tracks canonicalizing `.flags` on the native lanes.
+
+**Unit D note (follow-up unit D): the native arm is retired.** The native
+lanes run the wasm tier's regex compiler (S065's unit D amendment): a
+literal's `.flags` are the canonical string that compiler reports at
+build time, and `new RegExp(p, f).flags` is the canonical string it
+builds at run time — `/b/ysmig` and `new RegExp("x", "yg")` answer
+`gimsy` and `gy` on every lane, as Node does (`/b/yusmig` itself, /i
+with /u, is S102's `unicode-casefold` fence on every lane now). `assert.match` messages and
+`util.inspect` render the same string. Board #119 is closed by that unit.
 
 **Amendment (increment 24 P4, a regex VALUE reaching a lastIndex-consulting method with a stateful flag):**
 a FOURTH site reaches the SAME "representation-impossible, trap rather than lie" stance — a regex reaching
@@ -6890,7 +6926,7 @@ Until 2026-10-26 a clause (d) registered that the llvm and c lanes' deflate byte
 
 **Tested by:** `packages/compiler/test/zlib-lanes.test.ts`, the one shared table: corpus 1404 and 2756 and the fixtures `fixtures/zlib/deflate-bytes.ts` (deflate bytes over every kind of input at every boundary size) and `fixtures/zlib/inflate-errors.ts` (every error input, every truncation of several streams, a byte flip at every offset of one, seeded mutation fuzz) compiled for the wasm, c and llvm lanes, each lane's stdout equal to Node's run of the same program (Z-LANES-01..04; replacing a system libz on the native lanes turns Z-LANES-02..04 red); 1404 and 2756 on the c, llvm and wasm differential lanes; the "zlib unit rows" block of `tests/harness/wasm-differential.test.ts` (ZL-RT-01 round trips, ZL-HEX-01 deflate bytes, ZL-ERR-01 every error kind's name, message and code, ZL-HOST-01 no import); `packages/compiler/test/wasm-zlib.test.ts` (the wasm port in-process: Z-DEF-01..03 deflate bytes at every boundary size, 300 fuzzed lengths and every level 0-9 against live Node; Z-RT-01; Z-INF-01 Node-produced streams across levels, strategies, memLevels and windowBits; Z-ERR-01 one input per error with Node's errno pinned per (a); Z-ERR-02 every truncation of seven streams; Z-ERR-03 seeded mutation fuzz); the npm case `zlib-shims` (the island's node:zlib shim on the c lane: zlib, raw and gzip bytes at levels 0, 1, default and 9, "Missing dictionary", and (e)'s level validation: NaN, 3.7, 10, -Infinity and a string). (b) is measured, not pinned; (c) is not measured. Measured against Node v24.18.1.
 
-## S102 — a run-time `new RegExp` pattern or flags string outside this tier, or a syntax error whose V8 wording or precedence is unmeasured, throws a catchable named Error where Node builds the regex or throws a SyntaxError *(wasm lane only)*
+## S102 — a run-time `new RegExp` pattern or flags string outside this tier, or a syntax error whose V8 wording or precedence is unmeasured, throws a catchable named Error where Node builds the regex or throws a SyntaxError *(every lane since follow-up unit D — see its amendment below; wasm lane only before it)*
 
 `new RegExp(pattern, flags)` over strings known only at run time compiles
 in the module (S065's run-time arm). For a pattern outside the tier it
@@ -6979,13 +7015,51 @@ hand at unit P1, clean.
 58 KB of code and tables (the review's measure, 84,886 against 26,898
 bytes for the same small program with a constant pattern). Since unit E
 the compiler PROCESS pays once for its first constant pattern: it emits
-and instantiates the standalone compiler module (62,249 bytes) and
+and instantiates the standalone compiler module (62,249 bytes; 72,029
+since unit D, which put the matcher in the same module for the native
+lanes' translation) and
 derives its tables (Canonicalize pairs and the identifier ranges, one
 pass over every code point) — measured about 0.2–0.3 s, once per
 process; each pattern after that costs microseconds.
 
-**Scope:** the wasm lane. The native lanes compile run-time patterns with
-libregexp and keep S065's native arm.
+**Scope:** every lane since follow-up unit D (below); before it, the wasm
+lane only, the native lanes compiling with libregexp under S065's native
+arm.
+
+**Amendment (follow-up unit D): every lane.** The native lanes run this
+compiler and the wasm tier's matcher, translated to C
+(`packages/runtime/src/scr_regex_engine.h`, generated from the module
+`regex-engine-module.ts` builds by `backend/wasm2c.ts`; S065's unit D
+amendment), so everything above holds on c and llvm word for word: the
+same fences by the same keys, messages and `code`s, the same V8
+SyntaxError texts and precedence, the same canonical `.flags` and
+escaped `.source` (`new RegExp("a/b").source` is `a\/b`, a line
+terminator `\n`), the same `d` handling (`"dg"` builds, `"gg"` is
+"Invalid flags"), the same duplicate-group-name and `\k`-in-a-class
+verdicts (`((?<a>x)|y)(?<a>z)` and `(?<a>x)[\k]` are V8's SyntaxError,
+where libregexp built them), and the same matcher — V8's rules between
+the halves of a surrogate pair under /u included (#269: `"a😀b".search(/\B/u)`
+is 2 on every lane). A regex LITERAL outside the tier refuses the native
+build by `expr:regexLit:<key>` as it refuses the wasm one (a pattern Node
+itself rejects says so: `expr:regexLit:invalid-pattern`, worded as an
+invalid regular expression, not a coverage gap). A native build with a
+regex literal therefore needs a compiler HOST that runs WasmGC — Node 22
+or later, as the wasm lane already did; elsewhere the literal refuses by
+`expr:regexLit:build-time-compiler-unavailable`, as on wasm. Consequence,
+by Joe's ruling D4 (one outcome on every lane until both lanes support a
+feature): a native program that used one of these features now refuses
+or throws the named Error where it used to run — /i with /u, /v, modifier
+groups, `\p{Script=…}` and the other table-only property names, the
+Annex-B legacy forms, more than 255 captures, patterns past 8,192 code
+units. No corpus or fixture program is affected (every regex literal
+and constant `new RegExp` under tests/ was swept: none is fenced; the 44
+regex corpus programs pass on c and llvm, plain and sanitized). Measured
+by `packages/compiler/test/native-regex-lanes.test.ts`: the pool above
+through one program on wasm, c and llvm — the three outputs identical
+byte for byte, and equal to Node's on every row but the fenced ones
+(4,481 fenced, by key) — with the exec sweep's search / test / match /
+replace / replaceAll / matchAll over 12 subjects for 3,671 of the
+accepted rows.
 
 **Tested by:** `packages/compiler/test/wasm-regex-runtime-compiler.test.ts`
 (the gate), `packages/compiler/test/wasm-regex-runtime-new.test.ts`
