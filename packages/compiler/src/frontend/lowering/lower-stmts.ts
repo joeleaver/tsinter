@@ -4108,7 +4108,7 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
           }
         }
       }
-      if (isJsSourceFile(sf) && !ts.isExternalModule(sf)) {
+      if (isCjsJsFile(sf)) {
         const init = L.requireInitStmt(requireSpecOf(expr)!, expr);
         if (init) return init;
         return { kind: "block", body: [], loc: locOf(expr) };

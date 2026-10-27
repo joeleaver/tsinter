@@ -955,21 +955,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2695-string-split-static.ts": {
-   "order": [
-    "<repo>/tests/corpus/2695-string-split-static.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/1521-fs-lstat-lock.ts": {
    "order": [
     "<repo>/tests/corpus/1521-fs-lstat-lock.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2696-string-trim-pad-static.ts": {
-   "order": [
-    "<repo>/tests/corpus/2696-string-trim-pad-static.ts"
    ],
    "diags": []
   },
@@ -979,21 +967,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2697-spawnsync-options.ts": {
-   "order": [
-    "<repo>/tests/corpus/2697-spawnsync-options.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/1523-isnan-floor-static.ts": {
    "order": [
     "<repo>/tests/corpus/1523-isnan-floor-static.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2698-spawn-options.ts": {
-   "order": [
-    "<repo>/tests/corpus/2698-spawn-options.ts"
    ],
    "diags": []
   },
@@ -1003,21 +979,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2699-catch-narrowing.ts": {
-   "order": [
-    "<repo>/tests/corpus/2699-catch-narrowing.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/1525-child-exit-signal.ts": {
    "order": [
     "<repo>/tests/corpus/1525-child-exit-signal.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2700-unknown-typeof-validation.ts": {
-   "order": [
-    "<repo>/tests/corpus/2700-unknown-typeof-validation.ts"
    ],
    "diags": []
   },
@@ -1051,21 +1015,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2701-spread-override-completion.ts": {
-   "order": [
-    "<repo>/tests/corpus/2701-spread-override-completion.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/1531-delete-optional-fields.ts": {
    "order": [
     "<repo>/tests/corpus/1531-delete-optional-fields.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2702-process-arch-versions.ts": {
-   "order": [
-    "<repo>/tests/corpus/2702-process-arch-versions.ts"
    ],
    "diags": []
   },
@@ -1075,21 +1027,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2703-union-shared-field-read.ts": {
-   "order": [
-    "<repo>/tests/corpus/2703-union-shared-field-read.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/1533-bool-equality.ts": {
    "order": [
     "<repo>/tests/corpus/1533-bool-equality.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2704-path-platform-namespaces.ts": {
-   "order": [
-    "<repo>/tests/corpus/2704-path-platform-namespaces.ts"
    ],
    "diags": []
   },
@@ -1099,33 +1039,15 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2705-union-as-arm-cast.ts": {
-   "order": [
-    "<repo>/tests/corpus/2705-union-as-arm-cast.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/1535-spawn-fd-stdio.ts": {
    "order": [
     "<repo>/tests/corpus/1535-spawn-fd-stdio.ts"
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2706-union-param-defaults.ts": {
-   "order": [
-    "<repo>/tests/corpus/2706-union-param-defaults.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/1536-destructuring-defaults.ts": {
    "order": [
     "<repo>/tests/corpus/1536-destructuring-defaults.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2707-string-array-sweep.ts": {
-   "order": [
-    "<repo>/tests/corpus/2707-string-array-sweep.ts"
    ],
    "diags": []
   },
@@ -1136,21 +1058,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2708-os-release-spawnsync-stdio.ts": {
-   "order": [
-    "<repo>/tests/corpus/2708-os-release-spawnsync-stdio.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/1538-await-promiselike-return.ts": {
    "order": [
     "<repo>/tests/corpus/1538-await-promiselike-return.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2709-math-static-scalar.ts": {
-   "order": [
-    "<repo>/tests/corpus/2709-math-static-scalar.ts"
    ],
    "diags": []
   },
@@ -1160,21 +1070,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2710-unknown-truthiness.ts": {
-   "order": [
-    "<repo>/tests/corpus/2710-unknown-truthiness.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/1540-os-userinfo.ts": {
    "order": [
     "<repo>/tests/corpus/1540-os-userinfo.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2711-void-statement.ts": {
-   "order": [
-    "<repo>/tests/corpus/2711-void-statement.ts"
    ],
    "diags": []
   },
@@ -1184,21 +1082,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2712-union-keyed-reads.ts": {
-   "order": [
-    "<repo>/tests/corpus/2712-union-keyed-reads.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/1542-map-promise-values.ts": {
    "order": [
     "<repo>/tests/corpus/1542-map-promise-values.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2713-record-literal-into-union.ts": {
-   "order": [
-    "<repo>/tests/corpus/2713-record-literal-into-union.ts"
    ],
    "diags": []
   },
@@ -1208,21 +1094,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2714-set-server-handles.ts": {
-   "order": [
-    "<repo>/tests/corpus/2714-set-server-handles.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/1544-dyn-json-reads.ts": {
    "order": [
     "<repo>/tests/corpus/1544-dyn-json-reads.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2715-string-matchall.ts": {
-   "order": [
-    "<repo>/tests/corpus/2715-string-matchall.ts"
    ],
    "diags": []
   },
@@ -1328,21 +1202,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2716-promise-then.ts": {
-   "order": [
-    "<repo>/tests/corpus/2716-promise-then.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/1562-optional-chain-tails.ts": {
    "order": [
     "<repo>/tests/corpus/1562-optional-chain-tails.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2717-spawn-conditional-spread.ts": {
-   "order": [
-    "<repo>/tests/corpus/2717-spawn-conditional-spread.ts"
    ],
    "diags": []
   },
@@ -1352,33 +1214,15 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2718-string-raw-fold.ts": {
-   "order": [
-    "<repo>/tests/corpus/2718-string-raw-fold.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/1564-fs-watch.ts": {
    "order": [
     "<repo>/tests/corpus/1564-fs-watch.ts"
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2719-string-raw.ts": {
-   "order": [
-    "<repo>/tests/corpus/2719-string-raw.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/1565-spawn-pipe-streams.ts": {
    "order": [
     "<repo>/tests/corpus/1565-spawn-pipe-streams.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2720-union-element-join.ts": {
-   "order": [
-    "<repo>/tests/corpus/2720-union-element-join.ts"
    ],
    "diags": []
   },
@@ -1418,21 +1262,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2721-stdin-set-raw-mode-non-tty.ts": {
-   "order": [
-    "<repo>/tests/corpus/2721-stdin-set-raw-mode-non-tty.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/1572-promise-reject-all-tuple.ts": {
    "order": [
     "<repo>/tests/corpus/1572-promise-reject-all-tuple.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2722-x509-validity-date-gettime.ts": {
-   "order": [
-    "<repo>/tests/corpus/2722-x509-validity-date-gettime.ts"
    ],
    "diags": []
   },
@@ -1442,21 +1274,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2723-tdz-scalar-forward-capture.ts": {
-   "order": [
-    "<repo>/tests/corpus/2723-tdz-scalar-forward-capture.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/1574-dyn-optional-method-number-keys.ts": {
    "order": [
     "<repo>/tests/corpus/1574-dyn-optional-method-number-keys.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2724-promise-all-tuple-literal.ts": {
-   "order": [
-    "<repo>/tests/corpus/2724-promise-all-tuple-literal.ts"
    ],
    "diags": []
   },
@@ -1812,12 +1632,6 @@
   "<repo>/tests/corpus/1630-inspect-scalars.ts": {
    "order": [
     "<repo>/tests/corpus/1630-inspect-scalars.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2725-rmsync-retry-options.cjs": {
-   "order": [
-    "<repo>/tests/corpus/2725-rmsync-retry-options.cjs"
    ],
    "diags": []
   },
@@ -3153,21 +2967,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2726-mixin-heritage.ts": {
-   "order": [
-    "<repo>/tests/corpus/2726-mixin-heritage.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/2041-any-params-returns.ts": {
    "order": [
     "<repo>/tests/corpus/2041-any-params-returns.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2727-mixin-values.ts": {
-   "order": [
-    "<repo>/tests/corpus/2727-mixin-values.ts"
    ],
    "diags": []
   },
@@ -3177,22 +2979,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2728-mixin-modules/main.ts": {
-   "order": [
-    "<repo>/tests/corpus/2728-mixin-modules/zoo.ts",
-    "<repo>/tests/corpus/2728-mixin-modules/main.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/2043-any-dom-values.ts": {
    "order": [
     "<repo>/tests/corpus/2043-any-dom-values.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2729-mixin-rc-stress.ts": {
-   "order": [
-    "<repo>/tests/corpus/2729-mixin-rc-stress.ts"
    ],
    "diags": []
   },
@@ -3208,33 +2997,15 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2730-parameter-properties.ts": {
-   "order": [
-    "<repo>/tests/corpus/2730-parameter-properties.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/2046-abstract-classes.ts": {
    "order": [
     "<repo>/tests/corpus/2046-abstract-classes.ts"
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2731-objlit-accessors-effects.ts": {
-   "order": [
-    "<repo>/tests/corpus/2731-objlit-accessors-effects.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/2047-objlit-accessors-shapes.ts": {
    "order": [
     "<repo>/tests/corpus/2047-objlit-accessors-shapes.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2732-optional-class-fields.ts": {
-   "order": [
-    "<repo>/tests/corpus/2732-optional-class-fields.ts"
    ],
    "diags": []
   },
@@ -4736,33 +4507,15 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2733-width-hybrid-shapes.ts": {
-   "order": [
-    "<repo>/tests/corpus/2733-width-hybrid-shapes.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/2557-tls-ca-store.ts": {
    "order": [
     "<repo>/tests/corpus/2557-tls-ca-store.ts"
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2734-width-field-lifts.ts": {
-   "order": [
-    "<repo>/tests/corpus/2734-width-field-lifts.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/2558-index-signature-func-values.ts": {
    "order": [
     "<repo>/tests/corpus/2558-index-signature-func-values.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2735-rejection-events.cjs": {
-   "order": [
-    "<repo>/tests/corpus/2735-rejection-events.cjs"
    ],
    "diags": []
   },
@@ -4910,21 +4663,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2736-jsval-routed-keyed-ops.js": {
-   "order": [
-    "<repo>/tests/corpus/2736-jsval-routed-keyed-ops.js"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/2583-dyn-nullish-coalesce.js": {
    "order": [
     "<repo>/tests/corpus/2583-dyn-nullish-coalesce.js"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2737-jsval-routed-calls.js": {
-   "order": [
-    "<repo>/tests/corpus/2737-jsval-routed-calls.js"
    ],
    "diags": []
   },
@@ -4934,21 +4675,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2738-union-dyn-collapse.ts": {
-   "order": [
-    "<repo>/tests/corpus/2738-union-dyn-collapse.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/2585-dyn-nullish-coalesce.js": {
    "order": [
     "<repo>/tests/corpus/2585-dyn-nullish-coalesce.js"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2739-unknown-array.ts": {
-   "order": [
-    "<repo>/tests/corpus/2739-unknown-array.ts"
    ],
    "diags": []
   },
@@ -5614,6 +5343,404 @@
    ],
    "diags": []
   },
+  "<repo>/tests/corpus/2695-string-split-static.ts": {
+   "order": [
+    "<repo>/tests/corpus/2695-string-split-static.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2696-string-trim-pad-static.ts": {
+   "order": [
+    "<repo>/tests/corpus/2696-string-trim-pad-static.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2697-spawnsync-options.ts": {
+   "order": [
+    "<repo>/tests/corpus/2697-spawnsync-options.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2698-spawn-options.ts": {
+   "order": [
+    "<repo>/tests/corpus/2698-spawn-options.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2699-catch-narrowing.ts": {
+   "order": [
+    "<repo>/tests/corpus/2699-catch-narrowing.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2700-unknown-typeof-validation.ts": {
+   "order": [
+    "<repo>/tests/corpus/2700-unknown-typeof-validation.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2701-spread-override-completion.ts": {
+   "order": [
+    "<repo>/tests/corpus/2701-spread-override-completion.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2702-process-arch-versions.ts": {
+   "order": [
+    "<repo>/tests/corpus/2702-process-arch-versions.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2703-union-shared-field-read.ts": {
+   "order": [
+    "<repo>/tests/corpus/2703-union-shared-field-read.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2704-path-platform-namespaces.ts": {
+   "order": [
+    "<repo>/tests/corpus/2704-path-platform-namespaces.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2705-union-as-arm-cast.ts": {
+   "order": [
+    "<repo>/tests/corpus/2705-union-as-arm-cast.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2706-union-param-defaults.ts": {
+   "order": [
+    "<repo>/tests/corpus/2706-union-param-defaults.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2707-string-array-sweep.ts": {
+   "order": [
+    "<repo>/tests/corpus/2707-string-array-sweep.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2708-os-release-spawnsync-stdio.ts": {
+   "order": [
+    "<repo>/tests/corpus/2708-os-release-spawnsync-stdio.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2709-math-static-scalar.ts": {
+   "order": [
+    "<repo>/tests/corpus/2709-math-static-scalar.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2710-unknown-truthiness.ts": {
+   "order": [
+    "<repo>/tests/corpus/2710-unknown-truthiness.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2711-void-statement.ts": {
+   "order": [
+    "<repo>/tests/corpus/2711-void-statement.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2712-union-keyed-reads.ts": {
+   "order": [
+    "<repo>/tests/corpus/2712-union-keyed-reads.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2713-record-literal-into-union.ts": {
+   "order": [
+    "<repo>/tests/corpus/2713-record-literal-into-union.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2714-set-server-handles.ts": {
+   "order": [
+    "<repo>/tests/corpus/2714-set-server-handles.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2715-string-matchall.ts": {
+   "order": [
+    "<repo>/tests/corpus/2715-string-matchall.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2716-promise-then.ts": {
+   "order": [
+    "<repo>/tests/corpus/2716-promise-then.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2717-spawn-conditional-spread.ts": {
+   "order": [
+    "<repo>/tests/corpus/2717-spawn-conditional-spread.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2718-string-raw-fold.ts": {
+   "order": [
+    "<repo>/tests/corpus/2718-string-raw-fold.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2719-string-raw.ts": {
+   "order": [
+    "<repo>/tests/corpus/2719-string-raw.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2720-union-element-join.ts": {
+   "order": [
+    "<repo>/tests/corpus/2720-union-element-join.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2721-stdin-set-raw-mode-non-tty.ts": {
+   "order": [
+    "<repo>/tests/corpus/2721-stdin-set-raw-mode-non-tty.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2722-x509-validity-date-gettime.ts": {
+   "order": [
+    "<repo>/tests/corpus/2722-x509-validity-date-gettime.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2723-tdz-scalar-forward-capture.ts": {
+   "order": [
+    "<repo>/tests/corpus/2723-tdz-scalar-forward-capture.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2724-promise-all-tuple-literal.ts": {
+   "order": [
+    "<repo>/tests/corpus/2724-promise-all-tuple-literal.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2725-rmsync-retry-options.cjs": {
+   "order": [
+    "<repo>/tests/corpus/2725-rmsync-retry-options.cjs"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2726-mixin-heritage.ts": {
+   "order": [
+    "<repo>/tests/corpus/2726-mixin-heritage.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2727-mixin-values.ts": {
+   "order": [
+    "<repo>/tests/corpus/2727-mixin-values.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2728-mixin-modules/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2728-mixin-modules/zoo.ts",
+    "<repo>/tests/corpus/2728-mixin-modules/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2729-mixin-rc-stress.ts": {
+   "order": [
+    "<repo>/tests/corpus/2729-mixin-rc-stress.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2730-parameter-properties.ts": {
+   "order": [
+    "<repo>/tests/corpus/2730-parameter-properties.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2731-objlit-accessors-effects.ts": {
+   "order": [
+    "<repo>/tests/corpus/2731-objlit-accessors-effects.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2732-optional-class-fields.ts": {
+   "order": [
+    "<repo>/tests/corpus/2732-optional-class-fields.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2733-width-hybrid-shapes.ts": {
+   "order": [
+    "<repo>/tests/corpus/2733-width-hybrid-shapes.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2734-width-field-lifts.ts": {
+   "order": [
+    "<repo>/tests/corpus/2734-width-field-lifts.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2735-rejection-events.cjs": {
+   "order": [
+    "<repo>/tests/corpus/2735-rejection-events.cjs"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2736-jsval-routed-keyed-ops.js": {
+   "order": [
+    "<repo>/tests/corpus/2736-jsval-routed-keyed-ops.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2737-jsval-routed-calls.js": {
+   "order": [
+    "<repo>/tests/corpus/2737-jsval-routed-calls.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2738-union-dyn-collapse.ts": {
+   "order": [
+    "<repo>/tests/corpus/2738-union-dyn-collapse.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2739-unknown-array.ts": {
+   "order": [
+    "<repo>/tests/corpus/2739-unknown-array.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2740-promise-void-union-callbacks.ts": {
+   "order": [
+    "<repo>/tests/corpus/2740-promise-void-union-callbacks.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2741-promise-union-await-values.ts": {
+   "order": [
+    "<repo>/tests/corpus/2741-promise-union-await-values.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2742-unions-retag.ts": {
+   "order": [
+    "<repo>/tests/corpus/2742-unions-retag.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2743-http-option-carry.ts": {
+   "order": [
+    "<repo>/tests/corpus/2743-http-option-carry.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2744-http-option-carry-dyn.cjs": {
+   "order": [
+    "<repo>/tests/corpus/2744-http-option-carry-dyn.cjs"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2745-bom-string-literals.ts": {
+   "order": [
+    "<repo>/tests/corpus/2745-bom-string-literals.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2746-format-runtime-string.ts": {
+   "order": [
+    "<repo>/tests/corpus/2746-format-runtime-string.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2747-buffer-alloc-size.ts": {
+   "order": [
+    "<repo>/tests/corpus/2747-buffer-alloc-size.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2748-regexp-runtime-patterns.ts": {
+   "order": [
+    "<repo>/tests/corpus/2748-regexp-runtime-patterns.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2755-math-full-surface.ts": {
+   "order": [
+    "<repo>/tests/corpus/2755-math-full-surface.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2756-zlib-deflate-bytes.ts": {
+   "order": [
+    "<repo>/tests/corpus/2756-zlib-deflate-bytes.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2757-imports-field-node-conditions/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2757-imports-field-node-conditions/src/node-impl.ts",
+    "<repo>/tests/corpus/2757-imports-field-node-conditions/main.ts"
+   ],
+   "diags": [
+    {
+     "code": "SC1010",
+     "message": "the 'nodecond-corpus/side' package (nothing installed resolves it) is not supported yet",
+     "loc": {
+      "file": "<repo>/tests/corpus/2757-imports-field-node-conditions/main.ts",
+      "start": 609,
+      "end": 660
+     },
+     "milestone": "M4",
+     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, and module modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
+    }
+   ]
+  },
+  "<repo>/tests/corpus/2758-math-static-raw.ts": {
+   "order": [
+    "<repo>/tests/corpus/2758-math-static-raw.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2781-island-binary-toprimitive.ts": {
+   "order": [
+    "<repo>/tests/corpus/2781-island-binary-toprimitive.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2782-promise-catch-any-reason.js": {
+   "order": [
+    "<repo>/tests/corpus/2782-promise-catch-any-reason.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2783-js-package-type-module.js": {
+   "order": [
+    "<repo>/tests/corpus/2783-js-package-type-module.js"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2784-island-shorthand-module-bindings/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2784-island-shorthand-module-bindings/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2785-promise-catch-engine-reasons/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2785-promise-catch-engine-reasons/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2786-island-toprimitive-proto-fn.js": {
+   "order": [
+    "<repo>/tests/corpus/2786-island-toprimitive-proto-fn.js"
+   ],
+   "diags": []
+  },
   "<repo>/tests/corpus/300-if-else.ts": {
    "order": [
     "<repo>/tests/corpus/300-if-else.ts"
@@ -5808,21 +5935,9 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2740-promise-void-union-callbacks.ts": {
-   "order": [
-    "<repo>/tests/corpus/2740-promise-void-union-callbacks.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/519-array-from-length.ts": {
    "order": [
     "<repo>/tests/corpus/519-array-from-length.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2741-promise-union-await-values.ts": {
-   "order": [
-    "<repo>/tests/corpus/2741-promise-union-await-values.ts"
    ],
    "diags": []
   },
@@ -6397,12 +6512,6 @@
    ],
    "diags": []
   },
-  "<repo>/tests/corpus/2742-unions-retag.ts": {
-   "order": [
-    "<repo>/tests/corpus/2742-unions-retag.ts"
-   ],
-   "diags": []
-  },
   "<repo>/tests/corpus/966-unions-retag-rc-stress.ts": {
    "order": [
     "<repo>/tests/corpus/966-unions-retag-rc-stress.ts"
@@ -6664,6 +6773,14 @@
     }
    ]
   },
+  "<repo>/tests/diagnostics/cjs-esmodule-default-import/main.ts": {
+   "order": [
+    "<repo>/tests/diagnostics/cjs-esmodule-default-import/m.cjs",
+    "<repo>/tests/diagnostics/cjs-esmodule-default-import/mid.ts",
+    "<repo>/tests/diagnostics/cjs-esmodule-default-import/main.ts"
+   ],
+   "diags": []
+  },
   "<repo>/tests/diagnostics/cjs-require-cycle/main.js": {
    "order": [
     "<repo>/tests/diagnostics/cjs-require-cycle/b.js",
@@ -6896,6 +7013,50 @@
     "<repo>/tests/diagnostics/es2025-fences.ts"
    ],
    "diags": []
+  },
+  "<repo>/tests/diagnostics/esm-scope-nested-require/main.js": {
+   "order": [
+    "<repo>/tests/diagnostics/esm-scope-nested-require/main.js"
+   ],
+   "diags": [
+    {
+     "code": "SC1013",
+     "message": "require() in an ES module (Node throws ReferenceError — use import) is not supported yet",
+     "loc": {
+      "file": "<repo>/tests/diagnostics/esm-scope-nested-require/main.js",
+      "start": 361,
+      "end": 381
+     },
+     "milestone": "later"
+    },
+    {
+     "code": "SC1013",
+     "message": "require() in an ES module (Node throws ReferenceError — use import) is not supported yet",
+     "loc": {
+      "file": "<repo>/tests/diagnostics/esm-scope-nested-require/main.js",
+      "start": 502,
+      "end": 520
+     },
+     "milestone": "later"
+    }
+   ]
+  },
+  "<repo>/tests/diagnostics/esm-syntax-in-cjs-scope/main.js": {
+   "order": [
+    "<repo>/tests/diagnostics/esm-syntax-in-cjs-scope/main.js"
+   ],
+   "diags": [
+    {
+     "code": "SC1013",
+     "message": "ES module syntax in a file Node loads as CommonJS (a .cjs/.cts file, or a .js/.ts file under a package.json \"type\": \"commonjs\" scope — Node throws SyntaxError at load) is not supported yet",
+     "loc": {
+      "file": "<repo>/tests/diagnostics/esm-syntax-in-cjs-scope/main.js",
+      "start": 299,
+      "end": 324
+     },
+     "milestone": "later"
+    }
+   ]
   },
   "<repo>/tests/diagnostics/exceptions.ts": {
    "order": [
@@ -7623,6 +7784,34 @@
    ],
    "diags": []
   },
+  "<repo>/tests/diagnostics/ts-esm-in-cjs-scope/main.ts": {
+   "order": [
+    "<repo>/tests/diagnostics/ts-esm-in-cjs-scope/dep.ts",
+    "<repo>/tests/diagnostics/ts-esm-in-cjs-scope/main.ts"
+   ],
+   "diags": [
+    {
+     "code": "SC1013",
+     "message": "ES module syntax in a file Node loads as CommonJS (a .cjs/.cts file, or a .js/.ts file under a package.json \"type\": \"commonjs\" scope — Node throws SyntaxError at load) is not supported yet",
+     "loc": {
+      "file": "<repo>/tests/diagnostics/ts-esm-in-cjs-scope/dep.ts",
+      "start": 0,
+      "end": 42
+     },
+     "milestone": "later"
+    },
+    {
+     "code": "SC1013",
+     "message": "ES module syntax in a file Node loads as CommonJS (a .cjs/.cts file, or a .js/.ts file under a package.json \"type\": \"commonjs\" scope — Node throws SyntaxError at load) is not supported yet",
+     "loc": {
+      "file": "<repo>/tests/diagnostics/ts-esm-in-cjs-scope/main.ts",
+      "start": 329,
+      "end": 358
+     },
+     "milestone": "later"
+    }
+   ]
+  },
   "<repo>/tests/diagnostics/tuples.ts": {
    "order": [
     "<repo>/tests/diagnostics/tuples.ts"
@@ -8176,55 +8365,6 @@
     "<repo>/tests/fixtures/node-types/stream-capture.ts"
    ],
    "diags": []
-  },
-  "<repo>/tests/corpus/2743-http-option-carry.ts": {
-   "order": [
-    "<repo>/tests/corpus/2743-http-option-carry.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2744-http-option-carry-dyn.cjs": {
-   "order": [
-    "<repo>/tests/corpus/2744-http-option-carry-dyn.cjs"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2745-bom-string-literals.ts": {
-   "order": [
-    "<repo>/tests/corpus/2745-bom-string-literals.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2746-format-runtime-string.ts": {
-   "order": [
-    "<repo>/tests/corpus/2746-format-runtime-string.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2747-buffer-alloc-size.ts": {
-   "order": [
-    "<repo>/tests/corpus/2747-buffer-alloc-size.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2757-imports-field-node-conditions/main.ts": {
-   "order": [
-    "<repo>/tests/corpus/2757-imports-field-node-conditions/src/node-impl.ts",
-    "<repo>/tests/corpus/2757-imports-field-node-conditions/main.ts"
-   ],
-   "diags": [
-    {
-     "code": "SC1010",
-     "message": "the 'nodecond-corpus/side' package (nothing installed resolves it) is not supported yet",
-     "loc": {
-      "file": "<repo>/tests/corpus/2757-imports-field-node-conditions/main.ts",
-      "start": 609,
-      "end": 660
-     },
-     "milestone": "M4",
-     "hint": "relative imports (./file, ../dir/file), package.json-mediated project imports (#alias via the imports field, self-name references via exports), installed npm packages (their code runs under --dynamic), and the built-in fs, fs/promises, path, os, url, crypto, zlib, child_process, net, http, tls, https, http2, dgram, dns, util, util/types, string_decoder, querystring, readline, events, stream, stream/promises, stream/consumers, buffer, assert, assert/strict, worker_threads, cluster, tty, async_hooks, timers, timers/promises, diagnostics_channel, perf_hooks, and module modules (bare or node:-prefixed) and node:test (node:-prefixed only, like in Node) are supported"
-    }
-   ]
   }
  }
 }

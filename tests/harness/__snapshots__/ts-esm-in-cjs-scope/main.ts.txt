@@ -1,0 +1,12 @@
+ts-esm-in-cjs-scope/dep.ts:1:1 - error SC1013: ES module syntax in a file Node loads as CommonJS (a .cjs/.cts file, or a .js/.ts file under a package.json "type": "commonjs" scope — Node throws SyntaxError at load) is not supported yet
+
+  1 | export const v = await Promise.resolve(5);
+    | ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  2 | console.log("dep");
+
+ts-esm-in-cjs-scope/main.ts:6:1 - error SC1013: ES module syntax in a file Node loads as CommonJS (a .cjs/.cts file, or a .js/.ts file under a package.json "type": "commonjs" scope — Node throws SyntaxError at load) is not supported yet
+
+  5 | // which used to crash the compiler.
+  6 | import { v } from "./dep.ts";
+    | ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  7 | console.log("main", v);

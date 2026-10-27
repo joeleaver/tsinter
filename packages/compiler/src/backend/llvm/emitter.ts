@@ -699,6 +699,7 @@ const LIB_FN_SYMS: Record<string, string> = {
   "island.eval": "scr_island_eval",
   "island.import": "scr_jsval_import",
   "island.importDyn": "scr_jsval_import_dyn",
+  "island.caughtToJsval": "scr_caught_to_jsval",
   "insp.jsval": "scr_insp_jsval",
   // timers/promises (+1 promises; the await parks a fiber, so the async
   // loop gate already runs) and diagnostics_channel (scr_dc.c): all

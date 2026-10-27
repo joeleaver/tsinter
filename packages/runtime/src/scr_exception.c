@@ -317,6 +317,14 @@ static int scr_exit_code_hint = 0;
 void scr_exit_code_note(int code) { scr_exit_code_hint = code; }
 int scr_exit_code_hint_get(void) { return scr_exit_code_hint; }
 
+static ScrStr *(*scr_exc_ref_str_hook)(void *payload, void *(*retain)(void *)) = NULL;
+void scr_exc_install_ref_str_hook(ScrStr *(*hook)(void *payload, void *(*retain)(void *))) {
+  scr_exc_ref_str_hook = hook;
+}
+ScrStr *scr_exc_ref_to_str(void *payload, void *(*retain)(void *)) {
+  return scr_exc_ref_str_hook ? scr_exc_ref_str_hook(payload, retain) : NULL;
+}
+
 void scr_exc_print_uncaught(void) {
   scr_exit_code_note(1);
   /* Settle any runtime-internal stdout fragment before the stderr line when
@@ -349,9 +357,20 @@ void scr_exc_print_uncaught(void) {
       break;
     }
     /* fall through: non-Error hierarchy objects render like other refs */
-  case SCR_EXC_REF:
-    fputs("[object]", stderr);
+  case SCR_EXC_REF: {
+    /* An engine value the island bridge threw by reference renders as
+     * String(v) — the text the bridge's string payload used to carry. */
+    ScrStr *s = scr_exc_kind == SCR_EXC_REF && scr_exc_ref_str_hook
+                    ? scr_exc_ref_str_hook(scr_exc_payload, scr_exc_retain_fn)
+                    : NULL;
+    if (s) {
+      fwrite(s->data, 1, s->len, stderr);
+      scr_str_release(s);
+    } else {
+      fputs("[object]", stderr);
+    }
     break;
+  }
   case SCR_EXC_NONE: /* main only calls this when pending */
   case SCR_EXC_GENRET: /* unreachable: the trampoline consumes the sentinel */
     fputs("(no exception)", stderr);

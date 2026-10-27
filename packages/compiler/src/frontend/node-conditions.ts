@@ -98,7 +98,23 @@ export function nodeConditionLeaf(
 export function nodeLoadsAsCjs(file: string): boolean {
   if (file.endsWith(".cjs")) return true;
   if (!file.endsWith(".js")) return false;
+  const type = nodePackageTypeOf(file);
+  if (type === "invalid" || type === "module") return false;
+  if (type === "commonjs") return true;
+  return nodeSyntaxDetectsCjs(file);
+}
+
+/** Node's package scope "type" for `file` (LOOKUP_PACKAGE_SCOPE + the
+ * "type" field): the NEAREST package.json walking up from the file's
+ * directory, stopping at a node_modules boundary — "module" / "commonjs"
+ * when it says so, null when no scope is found or the scope names neither
+ * (syntax detection then decides an ambiguous file), "invalid" when the
+ * nearest package.json does not parse. Board #281: the program's own
+ * .js/.ts files classify through this too (program.ts isNodeEsmFile). */
+export function nodePackageTypeOf(file: string): "module" | "commonjs" | "invalid" | null {
   for (let dir = dirname(resolvePath(file)); ; ) {
+    // Node checks the boundary BEFORE probing the directory's package.json.
+    if (dir.endsWith("/node_modules") || dir.endsWith("\\node_modules")) return null;
     let text: string | null = null;
     try {
       text = readFileSync(join(dir, "package.json"), "utf8");
@@ -110,16 +126,21 @@ export function nodeLoadsAsCjs(file: string): boolean {
       try {
         type = (JSON.parse(text) as { type?: unknown }).type;
       } catch {
-        return false;
+        return "invalid";
       }
-      if (type === "module") return false;
-      if (type === "commonjs") return true;
-      break; // the scope names no type: syntax detection decides
+      if (type === "module") return "module";
+      if (type === "commonjs") return "commonjs";
+      return null; // the scope names no type: syntax detection decides
     }
     const parent = dirname(dir);
-    if (parent === dir || dir.endsWith("/node_modules") || dir.endsWith("\\node_modules")) break;
+    if (parent === dir) return null;
     dir = parent;
   }
+}
+
+/** Node 24's syntax detection over an ambiguous file's text (see
+ * nodeLoadsAsCjs). */
+function nodeSyntaxDetectsCjs(file: string): boolean {
   let src: string;
   try {
     src = readFileSync(file, "utf8");

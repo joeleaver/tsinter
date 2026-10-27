@@ -671,7 +671,10 @@ the same answer `String(o)` gives). On the wasm tier one shape does have a
 chain (unit A2): an island object built by `Object.create(proto)` reads,
 calls methods and answers `in` through its prototype objects, live, as in
 Node — its conversion still ignores a `toString` member, own or inherited,
-the same way. **Rationale:** inherited
+the same way. (The ARITHMETIC and RELATIONAL operators on an island value
+are not this conversion: they run ToPrimitive over the object's
+`valueOf` and `toString` — own, else through the prototype link, a
+function's own too — on every lane: S104, board #251.) **Rationale:** inherited
 from the C runtime's dyn tree, which stores own entries and has no
 prototype chain; giving it one means materializing Object/Array/String
 prototypes as real function values on every lane, which is a feature
@@ -6849,7 +6852,7 @@ NaNs: each function returns the bits Node returns, payload and sign included —
 
 **The divergences registered.**
 - **(a) Other builds of Node.** The bits are those of ieee754.cc compiled without contraction, and of V8's builtins on x86-64. A Node whose V8 compiles that file with fused multiply-add (for example clang's default `-ffp-contract=on` on arm64), or with `V8_USE_LIBM_TRIG_FUNCTIONS`, can differ in the last bit; a non-x86 machine's invalid-operation NaN (the min/max and negative-base `**` NaNs) differs in sign. None of these was measured, and none is claimed. The test rows take their expectations from the Node that runs them, so such a Node reddens them rather than passing them stale.
-- **(b) A signaling NaN stored into a `number[]`.** V8 quiets a signaling NaN on its way into a double-elements array (`[Math.log(-1)][0]` reads back `7ffc000000000000`; a record field, a Map value or a tuple slot keeps `7ff4…`). Every lane stores the bits, so the array element reads back `7ff4000000000000`. The same already held for a signaling NaN read from bytes (`buf.readDoubleBE`), the only other in-tier source of one; Math is a new source.
+- **(b) A signaling NaN stored into a `number[]`.** V8 quiets a signaling NaN on its way into a double-elements array (`[Math.log(-1)][0]` reads back `7ffc000000000000`; a record field, a Map value or a tuple slot keeps `7ff4…`). Every lane stores the bits, so the array element reads back `7ff4000000000000`. The same already held for a signaling NaN read from bytes (`buf.readDoubleBE`), the only other in-tier source of one; Math is a new source. Board #261 measured V8's own answer per operation (Node v24.18.1, `7ff4000000000000` from bytes): an array literal, `push` (onto an empty, small-integer or double array), an index write, `map`, `concat`, spread, `slice` of a quieted array and `new Float64Array([x])` set the quiet bit (`7ffc…`; `fff4…0001` gives `fffc…0001`), while `fill` and `unshift` store the canonical `7ff8000000000000`, and an array holding a string keeps `7ff4…`. That is two rules depending on which V8 path stores the element, not one conversion, so this tier keeps the bits on every lane (c, llvm and wasm agree, measured) rather than imitating a per-method answer.
 - **(c)** (retired) `Math.pow`'s own NaN: now Node's (S036's `**` row, board #158 fixed).
 - **(e) `Math.max` / `Math.min` with a NaN argument depend on Node's JIT tier.** The builtin answers the machine's invalid-operation NaN (`fff8000000000000`) whatever the argument's payload; optimized code can answer otherwise: `Math.max(x)` returns x's own payload once hot (measured: `7ff8dead0000beef` after ~15,000 calls), and the unit's review observed `7ff8000000000000` from optimized two-argument forms (a hot two-argument loop here stayed `fff8…`). Every lane, and the native engine's own members, answer the builtin's `fff8000000000000` (S104 (b) is the same kind of row for floor/ceil/trunc).
 - **(d)** (retired) The native lanes computed these members in their embedded engine over the system libm (board #262): they compute ieee754.cc now, as above.
@@ -7122,11 +7125,19 @@ a dyn value first); a checked-dynamic `any` value goes through
 `dyn.toNumber` (`scr_dyn_to_number` on the native lanes, `%w.dyn.toNumber` on the wasm tier) and an
 island value through the unary plus — on the native lanes the engine's own conversion, on the wasm tier
 `%w.dyn.toNumber`, which `+v` and `-v` on an island value now use too (an own `valueOf` used to be
-ignored there: the unary half of board #251; the binary operators keep that board). An object runs
-OrdinaryToPrimitive with the number hint over its OWN `valueOf` / `toString` (a call's throw
-propagates; neither giving a primitive is Node's "Cannot convert object to primitive value"); with no
-own members the inherited ones answer (`{"a":1}` is NaN, `[9]` is 9, `[1,2]` NaN); members nested inside
-an array are not consulted (S015).
+ignored there: the unary half of board #251). The binary operators on island values (`+ - * / % **`
+and `< <= > >=`) now convert each operand the same way first, left operand then right, on the wasm tier
+through `%w.dyn.toPrimitive` (board #251's binary half: `o + 1` with an own `valueOf` answering 42 is
+43, as on the native lanes' engine; an own `toString` serves `+` when there is no own `valueOf`; a
+throw propagates before the right operand converts). An object runs
+OrdinaryToPrimitive with the number hint over its `valueOf` / `toString` (a call's throw
+propagates; neither giving a primitive is Node's "Cannot convert object to primitive value"). On the
+wasm tier both conversions find each member as a read would: an object's own member, else its
+prototype chain's (an island object built by `Object.create`, S015's unit A2 link), an accessor through
+its getter, and a function's own property; when none is found the inherited Object.prototype /
+Function.prototype member answers (`{"a":1}` is NaN, `[9]` is 9, `[1,2]` NaN, a function its source
+text's stand-in, S015); a member that is present but not callable (`toString: undefined`) is skipped,
+as in Node, so with no primitive from the other one it is the TypeError above.
 
 **The divergences registered.**
 - **(a)** (not a divergence; recorded because an earlier draft of the unit got it wrong) **Argument
@@ -7162,5 +7173,5 @@ null, booleans, strings from a .js file, plain and `--dynamic`), DYN (every memb
 booleans, arrays and objects, plain and `--dynamic`; island objects' valueOf/toString and their throws,
 on every lane — (d) is why that row's failing conversion checks the error's name, not its message),
 NAN ((b) pinned: every lane `7ffc…`, Node either), ENGINE (the engine's Math, which (c) leaves intact).
-Corpus 2757. Measured against Node
+Corpus 2757; corpus 2781 and 2786 (the binary operators on island values — own, prototype-chain, accessor and function members — board #251, every lane). Measured against Node
 v24.18.1 on x86-64.

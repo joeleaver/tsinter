@@ -492,6 +492,20 @@ bool scr_error_is(const void *obj);
 void scr_throw_error(int kind, ScrStr *message);
 void scr_throw_error_msg(int kind, const char *message, size_t len);
 void scr_throw_error_named(ScrStr *name, ScrStr *message);
+/* Board #260: the island bridge's form — the same static Error, which
+ * also OWNS `origin` (the engine Error it was converted from, released
+ * through `origin_release` with the error), so a read that wants the
+ * engine value back (scr_caught_to_jsval) gets the SAME object. */
+void scr_throw_error_named_origin(ScrStr *name, ScrStr *message, void *origin,
+                                  void (*origin_release)(void *));
+/* The origin a bridged error carries (borrowed), or NULL for every other
+ * error — every error the program or the runtime built itself. */
+void *scr_error_origin(const void *e);
+/* Uncaught printing of a REF payload the core cannot render (an engine
+ * value thrown through the island bridge): the island installs a hook
+ * answering String(v) (+1, or NULL to fall back to "[object]"). */
+void scr_exc_install_ref_str_hook(ScrStr *(*hook)(void *payload, void *(*retain)(void *)));
+ScrStr *scr_exc_ref_to_str(void *payload, void *(*retain)(void *)); /* +1 or NULL */
 /* A read of a declare-d const nothing defines: throws Node's catchable
  * ReferenceError "<name> is not defined". Borrows name; always throws. */
 void scr_undef_global_read(ScrStr *name);
@@ -4268,6 +4282,14 @@ int scr_jsval_truthy(ScrJsval *a);
 ScrStr *scr_jsval_typeof(ScrJsval *a);
 ScrStr *scr_jsval_to_str(ScrJsval *a); /* String(v); NULL = bridged */
 ScrStr *scr_caught_to_string_isl(const ScrCaught *c, ScrStr *(*ds)(const ScrDyn *)); /* board #195; NULL = bridged */
+/* Board #260: a catch value read as an island value (a promise .catch
+ * handler's `any` reason): the ENGINE value itself wherever the reason came
+ * from the engine (a bridged Error's origin, a thrown engine object or
+ * function by reference), primitives by value, a thrown dyn value through
+ * the boundary marshal; any other statically thrown object THROWS a
+ * catchable named Error (it has no island form that keeps its identity).
+ * Borrows; +1, NULL = thrown. */
+ScrJsval *scr_caught_to_jsval(const ScrCaught *c);
 
 /* Property/element access and calls. Names are NUL-terminated ScrStr
  * (identifier property names from source); computed keys are jsvals. */

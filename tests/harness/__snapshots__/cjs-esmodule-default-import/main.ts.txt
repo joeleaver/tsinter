@@ -1,0 +1,44 @@
+cjs-esmodule-default-import/main.ts:11:16 - error SC1090: the default import of a CommonJS module that sets __esModule (Node binds it to module.exports, not to exports.default as TypeScript's interop types it) is not supported yet
+
+  10 | 
+  11 | const w: any = W;
+     |                ^
+  12 | console.log(label, typeof w);
+
+  hint: import the members by name instead (import { x } from ...)
+
+cjs-esmodule-default-import/main.ts:12:27 - error SC2004: uses of 'w' inherit the blocker on its declaration
+
+  11 | const w: any = W;
+  12 | console.log(label, typeof w);
+     |                           ^
+  13 | console.log(W.length);
+
+  hint: the declaration of 'w' did not compile — fix the diagnostic reported there and these sites clear with it
+
+cjs-esmodule-default-import/main.ts:13:13 - error SC1090: the default import of a CommonJS module that sets __esModule (Node binds it to module.exports, not to exports.default as TypeScript's interop types it) is not supported yet
+
+  12 | console.log(label, typeof w);
+  13 | console.log(W.length);
+     |             ^
+  14 | console.log(D);
+
+  hint: import the members by name instead (import { x } from ...)
+
+cjs-esmodule-default-import/main.ts:14:13 - error SC1090: the default import of a CommonJS module that sets __esModule (Node binds it to module.exports, not to exports.default as TypeScript's interop types it) is not supported yet
+
+  13 | console.log(W.length);
+  14 | console.log(D);
+     |             ^
+  15 | console.log(R);
+
+  hint: import the members by name instead (import { x } from ...)
+
+cjs-esmodule-default-import/main.ts:15:13 - error SC1090: the default import of a CommonJS module that sets __esModule (Node binds it to module.exports, not to exports.default as TypeScript's interop types it) is not supported yet
+
+  14 | console.log(D);
+  15 | console.log(R);
+     |             ^
+  16 | 
+
+  hint: import the members by name instead (import { x } from ...)

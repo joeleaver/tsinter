@@ -328,7 +328,18 @@ export interface FileParts {
         const bind = (nameNode: ts.Identifier | ts.StringLiteral, exportName: string): void => {
           let symbol = L.checker.getSymbolAtLocation(nameNode);
           if (symbol && symbol.flags & ts.SymbolFlags.Alias) {
-            symbol = L.checker.getAliasedSymbol(symbol);
+            const target = L.checker.getAliasedSymbol(symbol);
+            // A SHORTHAND ambient module (`declare module "pkg";`) answers
+            // its one module symbol for EVERY binding — default, named and
+            // namespace alike — so keying by it would collapse them into
+            // one global (the last import assigned wins: `import W, {
+            // label }` read W as label's value). Those bindings key by
+            // their own local alias symbol instead, which
+            // resolveValueSymbol answers first for registered aliases.
+            const shorthand = L.checker
+              .declarationsOf(target)
+              .some((d) => ts.isModuleDeclaration(d) && d.body === undefined);
+            if (!shorthand) symbol = target;
           }
           if (!symbol) return;
           let g = L.globalsBySymbol.get(symbol);

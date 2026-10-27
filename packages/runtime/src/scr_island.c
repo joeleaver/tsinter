@@ -627,6 +627,26 @@ static void isl_install_math(JSContext *ctx) {
   JS_FreeValue(ctx, global);
 }
 
+static ScrJsval *isl_cell_new(JSValue v);
+
+static JSValue isl_cell_v(const ScrJsval *c);
+/* The uncaught/unhandled printers' rendering of a jsval REF payload (an
+ * engine value thrown by reference): String(v), NULL when ToString throws
+ * (the printer's "[object]" fallback) or the payload is not a jsval. */
+static ScrStr *isl_ref_payload_str(void *payload, void *(*retain)(void *)) {
+  if (retain != scr_jsval_retain_v || !isl_ctx) return NULL;
+  size_t len;
+  const char *cs = JS_ToCStringLen(isl_ctx, &len, isl_cell_v((const ScrJsval *)payload));
+  if (!cs) {
+    JSValue second = JS_GetException(isl_ctx);
+    JS_FreeValue(isl_ctx, second);
+    return NULL;
+  }
+  ScrStr *s = scr_str_new(cs, len);
+  JS_FreeCString(isl_ctx, cs);
+  return s;
+}
+
 static void isl_init(void) {
   isl_rt = JS_NewRuntime2(&isl_mf, NULL);
   if (!isl_rt) {
@@ -682,6 +702,8 @@ static void isl_init(void) {
   /* Host-function class (closures entering the island): registered
    * eagerly — the id must exist before any from_closure call. */
   isl_register_hostfn_class();
+  /* Board #260: an engine value thrown by reference prints as String(v). */
+  scr_exc_install_ref_str_hook(isl_ref_payload_str);
   /* LIFO: registered after scr_init's handlers, so teardown runs before
    * the cycle collection + RC audit — the audit sees the engine gone. */
   atexit(isl_teardown_at_exit);
@@ -870,8 +892,29 @@ static ScrStr *isl_prop_str(JSValueConst obj, const char *prop, const char *fall
  * promise bridge (isl_bridge_settle). */
 static void isl_throw_reason(JSValueConst exc) {
   if (JS_IsError(exc)) {
-    scr_throw_error_named(isl_prop_str(exc, "name", "Error"),
-                           isl_prop_str(exc, "message", ""));
+    /* Board #260: the static Error keeps the engine object as its origin,
+     * so a read of the reason as an island value is the same object. */
+    scr_throw_error_named_origin(isl_prop_str(exc, "name", "Error"),
+                                 isl_prop_str(exc, "message", ""),
+                                 isl_cell_new(JS_DupValue(isl_ctx, exc)), scr_jsval_release_v);
+    return;
+  }
+  /* Primitives cross by value with their own kind; every other engine
+   * value (objects, arrays, functions, symbols, null, undefined) is thrown
+   * BY REFERENCE as a jsval payload — String(e) and the uncaught line
+   * still render String(v), and an island read gets the value itself. */
+  if (JS_IsNumber(exc)) {
+    double d = 0;
+    JS_ToFloat64(isl_ctx, &d, exc);
+    scr_throw_f64(d);
+    return;
+  }
+  if (JS_IsBool(exc)) {
+    scr_throw_bool(JS_ToBool(isl_ctx, exc) > 0);
+    return;
+  }
+  if (!JS_IsString(exc)) {
+    scr_throw_ref(isl_cell_new(JS_DupValue(isl_ctx, exc)), scr_jsval_retain_v, scr_jsval_release_v, NULL);
     return;
   }
   size_t len;
@@ -1015,6 +1058,8 @@ long scr_jsval_live_count(void) { return isl_live_jsvals; }
 #endif
 
 /* Fresh cell taking ownership of an engine value (+1 cell out). */
+static JSValue isl_cell_v(const ScrJsval *c) { return c->v; }
+
 static ScrJsval *isl_cell_new(JSValue v) {
   ScrJsval *c = malloc(sizeof *c);
   if (!c) {
@@ -1845,6 +1890,21 @@ static void isl_register_hostfn_class(void) {
   isl_register_bridge_class();
 }
 
+/* A statically thrown record, array, closure, union box or non-Error class
+ * instance crossing into the engine (board #260): it has no engine form
+ * that keeps its identity and fields (the cell type-erases it), and the
+ * "[object]" string it used to cross as was a silent wrong value — so an
+ * engine Error naming the gap crosses instead, catchable by name. */
+static JSValue isl_unrepresentable_throw(JSContext *ctx) {
+  static const char msg[] =
+      "a statically thrown object crossing into dynamically-executed ('any'-typed) code "
+      "(a record, array, function or class instance thrown by compiled code has no island "
+      "form — throw an Error) is not supported yet [SC1063]";
+  JSValue e = JS_NewError(ctx);
+  JS_SetPropertyStr(ctx, e, "message", JS_NewStringLen(ctx, msg, sizeof msg - 1));
+  return e;
+}
+
 /* Pending scriptc exception → engine VALUE (reverse bridge); clears the
  * cell. Shared by the host-call throw path and the promise bridge's
  * rejection path. */
@@ -1863,7 +1923,35 @@ static JSValue isl_pending_to_value(JSContext *ctx) {
     v = JS_NewStringLen(ctx, s->data, s->len);
     break;
   }
+  case SCR_EXC_REF:
+    /* An engine value the forward bridge threw by reference goes back as
+     * itself (board #260). Other refs fall to the default below. */
+    if (cell->retain_fn == scr_jsval_retain_v) {
+      v = JS_DupValue(ctx, ((ScrJsval *)cell->payload)->v);
+      break;
+    }
+    if (cell->retain_fn == scr_dyn_retain_v) {
+      /* A thrown checked-dynamic value: the boundary marshal. */
+      ScrDyn *d = scr_dyn_retain((ScrDyn *)cell->payload);
+      scr_exc_clear();
+      ScrJsval *j = scr_jsval_from_dyn(d);
+      scr_dyn_release(d);
+      if (j) {
+        v = JS_DupValue(ctx, j->v);
+        scr_jsval_release(j);
+        return v;
+      }
+      /* the marshal threw: that exception is the one crossing in */
+      return isl_pending_to_value(ctx);
+    }
+    v = isl_unrepresentable_throw(ctx);
+    break;
   case SCR_EXC_OBJ:
+    if (scr_error_is(cell->payload) && scr_error_origin(cell->payload) != NULL) {
+      /* A bridged engine Error going back in: the SAME engine object. */
+      v = JS_DupValue(ctx, ((ScrJsval *)scr_error_origin(cell->payload))->v);
+      break;
+    }
     if (scr_error_is(cell->payload)) {
       /* A scriptc Error crossing in: a real engine Error with the same
        * name/message, so package code can read e.message and String(e).
@@ -1906,8 +1994,7 @@ static JSValue isl_pending_to_value(JSContext *ctx) {
     }
     /* fall through: non-Error hierarchy objects render like other refs */
   default:
-    /* Ref payloads render "[object]" like the uncaught printer. */
-    v = JS_NewString(ctx, "[object]");
+    v = isl_unrepresentable_throw(ctx);
     break;
   }
   scr_exc_clear();
@@ -9473,14 +9560,21 @@ static const char isl_modules_bootstrap[] =
     "  }\n"
     "  if (globalThis.global === undefined) globalThis.global = globalThis;\n"
     "  globalThis.__scr_require = requireKey;\n"
+    /* A CommonJS namespace's `default` IS module.exports, always — an own
+     * `exports.default` (the __esModule interop shape) never replaces it
+     * (board #279's island half; Node's lexer never exports "default"). */
     "  return (key, name) => {\n"
     "    const exports = requireKey(key);\n"
     "    if (name === 'default') return exports;\n"
     "    if (name === '*') {\n"
     "      const ns = { default: exports };\n"
     "      for (const k in exports) {\n"
-    "        if (Object.prototype.hasOwnProperty.call(exports, k)) ns[k] = exports[k];\n"
+    "        if (k !== 'default' && Object.prototype.hasOwnProperty.call(exports, k)) ns[k] = exports[k];\n"
     "      }\n"
+    /* the (non-enumerable) interop stamp Node's lexer exports too, and
+     * Node 24's 'module.exports' name */
+    "      if (Object.prototype.hasOwnProperty.call(exports, '__esModule')) ns.__esModule = exports.__esModule;\n"
+    "      ns['module.exports'] = exports;\n"
     "      return ns;\n"
     "    }\n"
     "    return exports[name];\n"
@@ -10131,6 +10225,38 @@ ScrJsval *scr_jsval_from_url(ScrUrl *u) {
 ScrStr *scr_caught_to_string_isl(const ScrCaught *c, ScrStr *(*ds)(const ScrDyn *)) {
   if (c->kind == SCR_EXC_REF && c->retain_fn == scr_jsval_retain_v) return scr_jsval_to_str((ScrJsval *)c->payload);
   return scr_caught_to_string_dyn(c, ds);
+}
+
+/* Board #260 (see scr_runtime.h). */
+ScrJsval *scr_caught_to_jsval(const ScrCaught *c) {
+  isl_entry();
+  switch (c->kind) {
+  case SCR_EXC_F64: return isl_cell_new(JS_NewFloat64(isl_ctx, c->f64));
+  case SCR_EXC_BOOL: return isl_cell_new(JS_NewBool(isl_ctx, c->b));
+  case SCR_EXC_STR: {
+    const ScrStr *s = (const ScrStr *)c->payload;
+    return isl_cell_new(JS_NewStringLen(isl_ctx, s->data, s->len));
+  }
+  case SCR_EXC_REF:
+    if (c->retain_fn == scr_jsval_retain_v) return scr_jsval_retain((ScrJsval *)c->payload);
+    /* A thrown checked-dynamic value: the boundary marshal (wrapped
+     * island values unwrap by reference; dyn data copies, the registered
+     * dyn-into-island stance). */
+    if (c->retain_fn == scr_dyn_retain_v) return scr_jsval_from_dyn((const ScrDyn *)c->payload);
+    break;
+  case SCR_EXC_OBJ:
+    if (scr_error_is(c->payload) && scr_error_origin(c->payload) != NULL) {
+      return scr_jsval_retain((ScrJsval *)scr_error_origin(c->payload));
+    }
+    break;
+  default:
+    break;
+  }
+  static const char msg[] =
+      "a statically thrown object read as an 'any' rejection reason or catch value "
+      "(it has no island form that keeps its identity) is not supported yet [SC1063]";
+  scr_throw_error_msg(SCR_ERR_ERROR, msg, sizeof msg - 1);
+  return NULL;
 }
 
 #endif /* SCR_DYNAMIC */

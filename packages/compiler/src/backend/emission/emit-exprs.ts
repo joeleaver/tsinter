@@ -2471,6 +2471,11 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
             // itself never throws; the frontend's jsBridgePromise carries
             // the settlement across. +1 jsval holding the engine promise.
             return finish(`scr_jsval_import_dyn(${arg(0)})`);
+          case "island.caughtToJsval":
+            // Board #260: the catch snapshot as an island value — the
+            // engine value itself for engine-origin reasons; a statically
+            // thrown object throws the named Error (may-throw seed set).
+            return finish(`scr_caught_to_jsval(${arg(0)})`);
           case "island.castFail":
             // The deferred boundary failure: the island value was
             // evaluated (arg 0 — its side effects are real), the throw is

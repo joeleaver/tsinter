@@ -2207,7 +2207,17 @@ bool scr_report_unhandled_rejections(void) {
             break;
           }
           /* fall through */
-        default: fputs("[object]", stderr); break;
+        default: {
+          /* An engine value bridged by reference renders String(v). */
+          ScrStr *s = p->payload_kind == SCR_EXC_REF ? scr_exc_ref_to_str(p->payload, p->retain_fn) : NULL;
+          if (s) {
+            fwrite(s->data, 1, s->len, stderr);
+            scr_str_release(s);
+          } else {
+            fputs("[object]", stderr);
+          }
+          break;
+        }
         }
         fputc('\n', stderr);
       }

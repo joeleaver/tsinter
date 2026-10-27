@@ -282,6 +282,7 @@ export function stmtUsesIsland(stmts: IrStmt | IrStmt[]): boolean {
     if (
       kind === "jsOp" || kind === "jsExit" || kind === "jsBridgePromise" ||
       fn === "island.eval" || fn === "island.import" || fn === "island.importDyn" ||
+      fn === "island.caughtToJsval" ||
       fn === "island.castFail"
     ) {
       found = true;
@@ -1401,6 +1402,7 @@ export class Lowerer {
     // lower-namespaces.ts); a no-op for programs without namespaces.
     fenceCrossBlockNsRef(this, ident, symbol);
     if (symbol.flags & ts.SymbolFlags.Alias) {
+      this.fenceCjsInteropDefault(ident, symbol);
       // SNAPSHOT aliases own storage keyed by the PRE-alias symbol
       // (`import x = N.y` of a mutable target — collectGlobals): the
       // reference reads the snapshot, never the live target, exactly like
@@ -1536,6 +1538,73 @@ export class Lowerer {
     return isClass ? value : null;
   }
 
+  /** Board #279: the CommonJS JS module whose `default` an import alias
+   * chain lands on — `import d from "./m.cjs"`, `import { default as d }`,
+   * or an ESM re-export hop (`export { default } from "./m.cjs"`) — or
+   * null. Node's ESM-imports-CJS rule binds that name to module.exports,
+   * ALWAYS (cjs-module-lexer never exports a `default` name; the
+   * `__esModule` stamp changes nothing for an ESM importer). The checker
+   * models the bundler/tsc interop instead: an `__esModule`-stamped
+   * module's default import types as `exports.default`. */
+  private cjsDefaultDepOfAlias(alias: ts.Symbol): ts.SourceFile | null {
+    let sym: ts.Symbol | undefined = alias;
+    for (let hop = 0; sym !== undefined && hop < 32; hop++) {
+      const d = this.checker
+        .declarationsOf(sym)
+        .find((x) => ts.isImportClause(x) || ts.isImportSpecifier(x) || ts.isExportSpecifier(x));
+      let spec: ts.Expression | undefined;
+      let name: string | undefined;
+      if (d && ts.isImportClause(d) && ts.isImportDeclaration(d.parent)) {
+        spec = d.parent.moduleSpecifier;
+        name = "default";
+      } else if (d && ts.isImportSpecifier(d)) {
+        const idecl: ts.Node = d.parent.parent.parent;
+        if (ts.isImportDeclaration(idecl)) spec = idecl.moduleSpecifier;
+        name = (d.propertyName ?? d.name).text;
+      } else if (d && ts.isExportSpecifier(d)) {
+        const edecl: ts.Node = d.parent.parent;
+        if (ts.isExportDeclaration(edecl)) spec = edecl.moduleSpecifier;
+        name = (d.propertyName ?? d.name).text;
+      }
+      if (d === undefined || spec === undefined || !ts.isStringLiteral(spec) || name === undefined) return null;
+      const dep = isRelativeSpecifier(spec.text)
+        ? resolveImport(this.program, d.getSourceFile(), spec.text)
+        : npmStaticDepSf7(this.program, d.getSourceFile(), spec.text);
+      if (!dep) return null;
+      if (isJsSourceFile(dep) && !isNodeEsmFile(dep)) return name === "default" ? dep : null;
+      const next = this.cjsModuleExportSymbol(dep, name);
+      if (!next || !(next.flags & ts.SymbolFlags.Alias)) return null;
+      sym = next;
+    }
+    return null;
+  }
+
+  private readonly cjsInteropDefaultAliases = new Map<ts.Symbol, boolean>();
+
+  /** Board #279's fence: a reference through an import alias that the
+   * checker resolved to a CommonJS module's `exports.default` member (the
+   * `__esModule` interop) — where Node binds module.exports. Reading the
+   * member would be a silent wrong value, so the reference refuses by
+   * name. Aliases resolving to the module itself (no stamp) keep the CJS
+   * namespace machinery. */
+  fenceCjsInteropDefault(node: ts.Node, alias: ts.Symbol): void {
+    if (this.collecting || !(alias.flags & ts.SymbolFlags.Alias)) return;
+    let hit = this.cjsInteropDefaultAliases.get(alias);
+    if (hit === undefined) {
+      const dep = this.cjsDefaultDepOfAlias(alias);
+      const def = dep ? this.cjsModuleExportSymbol(dep, "default") : undefined;
+      hit = def !== undefined && this.checker.getAliasedSymbol(alias) === def;
+      this.cjsInteropDefaultAliases.set(alias, hit);
+    }
+    if (!hit) return;
+    this.unsupported(
+      "SC1090",
+      node,
+      `the default import of a CommonJS module that sets __esModule (Node binds it to module.exports, not to exports.default as TypeScript's interop types it)`,
+      "import the members by name instead (import { x } from ...)",
+    );
+  }
+
   /** The CommonJS JS module a DEFAULT-import binding's declaration loads
    * (`import d from "./lib.cjs"`), or null: Node's ESM-CJS interop binds
    * the default to module.exports — exactly a require binding — so those
@@ -1577,6 +1646,7 @@ export class Lowerer {
     if (!decl) return false;
     if (ts.isImportClause(decl)) {
       if (decl.name === undefined || this.cjsDefaultImportDepOf(decl) === null) return false;
+      if (sym) this.fenceCjsInteropDefault(expr, sym);
     } else {
       if (!ts.isVariableDeclaration(decl) || !ts.isIdentifier(decl.name) || !decl.initializer) {
         return false;

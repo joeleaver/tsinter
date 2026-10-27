@@ -1727,6 +1727,12 @@ export type IrLibFn =
    * awaiting parks the fiber and a rejection crosses catchably. --dynamic
    * only; result is an owned jsval holding the engine promise. */
   | "island.importDyn"
+  /** Board #260: a catch binding read as an island value (a promise
+   * `.catch` handler's `any` reason): the engine value itself where the
+   * reason came from the engine, primitives by value; any other statically
+   * thrown object throws a catchable named Error. --dynamic only; arg is
+   * the CAUGHT snapshot (borrowed); result an owned jsval. May throw. */
+  | "island.caughtToJsval"
   /** A checked cast the boundary can never satisfy, DEFERRED to runtime:
    * `islandValue as Promise<T>` — the value is an ENGINE promise and T
    * has no validated exit (Node-typed async APIs put class-shaped
@@ -7084,6 +7090,7 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   "rl.question",
   "island.eval",
   "island.import",
+  "island.caughtToJsval",
   "island.castFail",
   "json.parse",
   // decodeURIComponent throws the spec's URIError on bad hex/invalid

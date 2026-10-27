@@ -32,7 +32,8 @@
  *    .mjs/.cjs-family files (probed) and falls back to syntactic module
  *    detection for .js/.ts; 7's client SourceFile has no impliedNodeFormat,
  *    so this lane spells exactly that observed behavior: extensions first,
- *    then externalModuleIndicator.
+ *    then externalModuleIndicator — and since board #281, Node's own
+ *    package.json "type" between the two.
  *  - Malformed tsconfig.json: tsgo's parseConfigFile swallows JSONC syntax
  *    errors (recovers to empty options) where 5.9.3 reported a passthrough
  *    diagnostic, so this lane validates the config's JSONC syntax itself
@@ -54,6 +55,7 @@ import { probeNodeImportRefusal, probeNodeRequireRefusal } from "./npm.js";
 import { isNpmStaticPackage, npmStaticActive, npmStaticFsShadow, npmStaticPackageOfPath, reportNpmStaticOffender, setNpmStaticPackages } from "./npm-static.js";
 import { provenanceEntryFor, provenancePaths } from "./provenance-registry.js";
 import { cjsLexerVisibleNames } from "./cjs-lexer.js";
+import { nodePackageTypeOf } from "./node-conditions.js";
 import {
   ADOPTED_OPTIONS,
   ambientDtsPath,
@@ -513,14 +515,32 @@ function nestedBareRequiresOf7(sf: ts.SourceFile): ts.CallExpression[] {
   return out;
 }
 
+const packageTypeBySf = new WeakMap<ts.SourceFile, ReturnType<typeof nodePackageTypeOf>>();
+
 /** True when Node would treat this file as an ES MODULE (never defining
- * require/__dirname there): .mjs always, .cjs never, and .js/.ts by
- * syntactic module detection — spelled to 5.9.3's OBSERVED bundler-mode
- * behavior (it set impliedNodeFormat only for the mjs/cjs families; 7's
- * client SourceFile has no impliedNodeFormat at all). */
+ * require/__dirname there): .mjs always, .cjs never, and .js/.ts by the
+ * nearest package.json "type", then syntactic module detection when the
+ * scope names none (board #281; 5.9.3's bundler mode set
+ * impliedNodeFormat only for the mjs/cjs families, and 7's client
+ * SourceFile has no impliedNodeFormat at all). */
 function isNodeEsmFile7(sf: ts.SourceFile): boolean {
   if (sf.fileName.endsWith(".cjs") || sf.fileName.endsWith(".cts")) return false;
   if (sf.fileName.endsWith(".mjs") || sf.fileName.endsWith(".mts")) return true;
+  // Board #281: Node decides a .js (and, type-stripping, a .ts) file by
+  // its nearest package.json "type" FIRST — "module" loads it as ESM even
+  // with no import/export, "commonjs" as CommonJS — and only an ambiguous
+  // scope falls to syntax detection.
+  if (!sf.isDeclarationFile && /\.(js|ts)$/.test(sf.fileName)) {
+    // Per SourceFile (a program's own objects): the lowering asks often,
+    // and the answer reads package.json files up the tree.
+    let type = packageTypeBySf.get(sf);
+    if (type === undefined) {
+      type = nodePackageTypeOf(sf.fileName);
+      packageTypeBySf.set(sf, type);
+    }
+    if (type === "module") return true;
+    if (type === "commonjs") return false;
+  }
   return ts.isExternalModule(sf);
 }
 
@@ -1919,6 +1939,44 @@ function preflight7(load: LoadResult): {
         depPositions.get(sf)!.push({ dep, pos: stmt.getStart(sf) });
       }
     }
+    if (
+      !sf.isDeclarationFile && /\.(js|mjs|cjs|ts|mts|cts)$/.test(sf.fileName) &&
+      nodePackageTypeOf(sf.fileName) === "invalid"
+    ) {
+      // Node reads the nearest package.json of every module it loads and
+      // refuses an unparsable one: Error [ERR_INVALID_PACKAGE_CONFIG].
+      diags.push(
+        unsupportedDiag(
+          "SC1013",
+          { file: sf.fileName, start: 0, end: 0 },
+          "a module whose nearest package.json is not valid JSON (Node throws ERR_INVALID_PACKAGE_CONFIG at load)",
+        ),
+      );
+    }
+    if (
+      (isJsSourceFileName(sf.fileName) || (!sf.isDeclarationFile && /\.(ts|tsx|cts)$/.test(sf.fileName))) &&
+      !isNodeEsmFile7(sf) && ts.isExternalModule(sf)
+    ) {
+      // Board #281: ES module syntax in a file Node loads as CommonJS
+      // (.cjs/.cts, or a .js/.ts under a package.json "type": "commonjs"
+      // scope — type stripping keeps import/export as written) — Node
+      // refuses the file at load with a SyntaxError ("Cannot use import
+      // statement outside a module"); compiling it as either kind would
+      // run a program Node never runs.
+      const esm = sf.statements.find(
+        (s) => ts.isImportDeclaration(s) || ts.isExportDeclaration(s) ||
+          (ts.canHaveModifiers(s) && (ts.getModifiers(s) ?? []).some((m) => m.kind === ts.SyntaxKind.ExportKeyword)),
+      );
+      if (esm !== undefined) {
+        diags.push(
+          unsupportedDiag(
+            "SC1013",
+            locOf7(esm),
+            "ES module syntax in a file Node loads as CommonJS (a .cjs/.cts file, or a .js/.ts file under a package.json \"type\": \"commonjs\" scope — Node throws SyntaxError at load)",
+          ),
+        );
+      }
+    }
     if (isJsSourceFileName(sf.fileName)) {
       const stmts = sf.statements;
       let firstRunnable = -1;
@@ -2003,7 +2061,31 @@ function preflight7(load: LoadResult): {
           if (dep) deps.push({ dep });
         }
       }
-      if (!ts.isExternalModule(sf)) {
+      if (isNodeEsmFile7(sf)) {
+        // Board #281: a require() NESTED in a block or function of a file
+        // Node loads as an ES module (ESM syntax, .mjs, or a "type":
+        // "module" scope) — Node throws ReferenceError "require is not
+        // defined in ES module scope" when it runs, catchably; it never
+        // loads. Refused like the top-level form above (whose statements
+        // already reported), so no spelling of it silently loads.
+        const topLevel = new Set<ts.Node>();
+        for (const stmt of stmts) for (const req of requiresOf7(stmt)) topLevel.add(req.decl ? req.decl.initializer! : req.node);
+        ts.walkPreorder(sf, (n) => {
+          if (ts.isCallExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === "require" && !topLevel.has(n)) {
+            const sym = program.getTypeChecker().getSymbolAtLocation(n.expression);
+            const decls = sym ? program.getTypeChecker().declarationsOf(sym) : [];
+            if (decls.some((d) => !d.getSourceFile().isDeclarationFile)) return; // a local `require`
+            diags.push(
+              unsupportedDiag(
+                "SC1013",
+                { file: sf.fileName, start: n.getStart(sf), end: n.getEnd() },
+                "require() in an ES module (Node throws ReferenceError — use import)",
+              ),
+            );
+          }
+        });
+      }
+      if (!isNodeEsmFile7(sf)) {
         for (const call of nestedBareRequiresOf7(sf)) {
           const spec = requireSpecOf7(call)!;
           const loc = { file: sf.fileName, start: call.getStart(sf), end: call.getEnd() };

@@ -1,0 +1,13 @@
+esm-scope-nested-require/main.js:7:13 - error SC1013: require() in an ES module (Node throws ReferenceError — use import) is not supported yet
+
+  6 | try {
+  7 |   const p = require("node:path");
+    |             ^~~~~~~~~~~~~~~~~~~~
+  8 |   console.log("loaded", p.join("a", "b"));
+
+esm-scope-nested-require/main.js:13:10 - error SC1013: require() in an ES module (Node throws ReferenceError — use import) is not supported yet
+
+  12 | function late() {
+  13 |   return require("node:os").EOL;
+     |          ^~~~~~~~~~~~~~~~~~
+  14 | }

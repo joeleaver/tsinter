@@ -9400,14 +9400,7 @@ class Assembler {
       c.return_();
       c.end();
     };
-    const getOwn = (name: string): void => {
-      c.localGet(D);
-      c.structGet(dynT, DYN_REF);
-      c.refCast(dyn.objT());
-      this.pushStrLitInto(c, name);
-      c.call(dyn.objGet());
-      c.localSet(M);
-    };
+    const getOwn = (name: string): void => this.emitPrimMemberGet(c, D, M, name, (x) => x.f64Const(CANONICAL_NAN));
     const mIsFunc = (): void => {
       c.localGet(M);
       c.structGet(dynT, DYN_KIND);
@@ -9416,8 +9409,13 @@ class Assembler {
     };
     c.localGet(D);
     c.structGet(dynT, DYN_KIND);
+    c.localTee(K);
     c.i32Const(DK.OBJ);
     c.i32Eq();
+    c.localGet(K);
+    c.i32Const(DK.FUNC);
+    c.i32Eq();
+    c.i32Or();
     c.ifVoid();
     {
       getOwn("valueOf");
@@ -9447,6 +9445,166 @@ class Assembler {
     c.end();
     c.localGet(D);
     c.call(this.jsToNumberHelper());
+    this.mb.setBody(idx, [I32, dyn.dynRef(), dyn.dynRef()], c.bytes());
+    return idx;
+  }
+
+  /** Local `m` = the member `name` OrdinaryToPrimitive consults on the
+   * object or function in local `d`, or null when there is none to find
+   * (the inherited Object.prototype / Function.prototype member then
+   * answers): an object's own member, else its A2 prototype chain's, with
+   * an accessor read through its getter (`this` = the object; a getter
+   * throw returns `onPending`'s value from the enclosing function); a
+   * function's own property. */
+  private emitPrimMemberGet(c: Code, d: number, m: number, name: string, onPending: (c: Code) => void): void {
+    const dyn = this.dyn;
+    const dynT = dyn.dynT();
+    c.localGet(d);
+    c.structGet(dynT, DYN_KIND);
+    c.i32Const(DK.FUNC);
+    c.i32Eq();
+    c.ifVoid();
+    c.localGet(d);
+    this.pushStrLitInto(c, name);
+    c.call(dyn.fnOwnGet());
+    c.localSet(m);
+    c.else_();
+    c.localGet(d);
+    c.structGet(dynT, DYN_REF);
+    c.refCast(dyn.objT());
+    this.pushStrLitInto(c, name);
+    c.call(dyn.protoLinkLive || dyn.accessorsLive ? dyn.memberLookup() : dyn.objGet());
+    c.localSet(m);
+    c.localGet(m);
+    c.refIsNull();
+    c.i32Eqz();
+    c.ifVoid();
+    dyn.resolveCellInto(c, d, m, onPending);
+    c.end();
+    c.end();
+  }
+
+  /** Replaces the dyn in local `l` with its ToPrimitive (number/default
+   * hint, %w.dyn.toPrimitive), unwinding when a valueOf / toString
+   * threw. */
+  private emitDynToPrimInPlace(l: number): void {
+    const code = this.fn.code;
+    code.localGet(l);
+    code.call(this.dynToPrimNumFn());
+    code.localSet(l);
+    this.emitPendingCheck();
+  }
+
+  private dynToPrimNumIdx: number | null = null;
+
+  /** `%w.dyn.toPrimitive(d) -> dyn` — ECMA-262 ToPrimitive with the
+   * NUMBER / DEFAULT hint (the same order for every ordinary object) over
+   * a dyn value, the conversion the binary island operators run on each
+   * operand before they add, compare or do arithmetic (board #251, as the
+   * native lanes' engine does): an object's OWN callable valueOf is called
+   * with the object as `this`, then its own toString; the first primitive
+   * answer is the result, a throw propagates (null with the exception
+   * pending), and an own toString that is not callable or answers an
+   * object after valueOf did not is Node's "Cannot convert object to
+   * primitive value". With no own toString the inherited
+   * Object.prototype.toString answers, so the object itself is returned
+   * and the operator's existing conversion renders it ("[object
+   * Object]"). Every other kind is already primitive or keeps its existing
+   * conversion, and is returned as is. */
+  private dynToPrimNumFn(): number {
+    if (this.dynToPrimNumIdx !== null) return this.dynToPrimNumIdx;
+    const dyn = this.dyn;
+    const dynT = dyn.dynT();
+    const idx = this.mb.declareFunc(this.mb.funcType([dyn.dynRef()], [dyn.dynRef()]), "%w.dyn.toPrimitive");
+    this.dynToPrimNumIdx = idx;
+    const c = new Code();
+    const D = 0;
+    const K = 1;
+    const M = 2;
+    const R = 3;
+    const vec = this.dynVecInfo();
+    /** Calls the own member in M (a FUNC) with D as `this`: a throw
+     * returns null (pending), a primitive answer is returned. */
+    const callM = (name: string): void => {
+      c.localGet(D);
+      c.call(dyn.thisPush());
+      c.localGet(M);
+      c.i32Const(0);
+      c.i32Const(0);
+      c.arrayNewDefault(vec.bufType);
+      c.structNew(vec.struct);
+      this.pushStrLitInto(c, name);
+      c.call(dyn.callFn());
+      c.localSet(R);
+      c.call(dyn.thisPop());
+      c.localGet(R);
+      c.refIsNull();
+      c.ifVoid();
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      // NULL BOOL NUM STR UNDEF
+      c.localGet(R);
+      c.structGet(dynT, DYN_KIND);
+      c.localSet(K);
+      c.localGet(K);
+      c.i32Const(DK.STR);
+      c.i32LeU();
+      c.localGet(K);
+      c.i32Const(DK.UNDEF);
+      c.i32Eq();
+      c.i32Or();
+      c.ifVoid();
+      c.localGet(R);
+      c.return_();
+      c.end();
+    };
+    const getOwn = (name: string): void => this.emitPrimMemberGet(c, D, M, name, (x) => x.refNull(dynT));
+    const mIsFunc = (): void => {
+      c.localGet(M);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.FUNC);
+      c.i32Eq();
+    };
+    c.localGet(D);
+    c.structGet(dynT, DYN_KIND);
+    c.localTee(K);
+    c.i32Const(DK.OBJ);
+    c.i32Eq();
+    c.localGet(K);
+    c.i32Const(DK.FUNC);
+    c.i32Eq();
+    c.i32Or();
+    c.ifVoid();
+    {
+      getOwn("valueOf");
+      c.localGet(M);
+      c.refIsNull();
+      c.i32Eqz();
+      c.ifVoid();
+      mIsFunc();
+      c.ifVoid();
+      callM("valueOf");
+      c.end();
+      c.end();
+      getOwn("toString");
+      // no own toString: the inherited one answers a primitive
+      c.localGet(M);
+      c.refIsNull();
+      c.ifVoid();
+      c.localGet(D);
+      c.return_();
+      c.end();
+      mIsFunc();
+      c.ifVoid();
+      callM("toString");
+      c.end();
+      this.emitSetCellError(c, "%TypeError", "TypeError", (x) => this.pushStrLitInto(x, "Cannot convert object to primitive value"), null);
+      c.refNull(dynT);
+      c.return_();
+    }
+    c.end();
+    c.localGet(D);
     this.mb.setBody(idx, [I32, dyn.dynRef(), dyn.dynRef()], c.bytes());
     return idx;
   }
@@ -20703,6 +20861,53 @@ class Assembler {
             return;
           }
         }
+        if (e.fn === "island.caughtToJsval") {
+          // Board #260: jsval ≡ dyn on this tier, and caughtToDyn is
+          // identity-preserving for thrown dyn values and Error instances
+          // (the cached crossing), so the snapshot's dyn IS the reason —
+          // the jsMarshal(dyn) arm aliases. A TYPE-ERASED payload (a
+          // statically thrown record, array, closure or non-Error class)
+          // has no such form — caughtToDyn's empty-object approximation
+          // would be a silent wrong value here — so it throws the same
+          // named Error the native runtime does (scr_caught_to_jsval).
+          const exc = this.exc();
+          const c = this.acquireScratch(this.caughtRef());
+          this.walkExpr(e.args[0]!);
+          code.localSet(c);
+          code.localGet(c);
+          code.structGet(exc.caughtT, 0);
+          code.i32Const(EXC_OBJ);
+          code.i32Eq();
+          this.openIfResult(I32);
+          code.localGet(c);
+          code.structGet(exc.caughtT, 3);
+          this.emitErrIntervalTest(code);
+          code.i32Eqz();
+          code.else_();
+          code.localGet(c);
+          code.structGet(exc.caughtT, 0);
+          code.i32Const(EXC_REF);
+          code.i32Eq();
+          this.openIfResult(I32);
+          code.localGet(c);
+          code.structGet(exc.caughtT, 2);
+          code.refTest(this.dyn.dynT());
+          code.i32Eqz();
+          code.else_();
+          code.i32Const(0);
+          this.close();
+          this.close();
+          this.openIf();
+          this.emitSetCellError(code, "%Error", "Error", (x) => this.pushStrLitInto(x,
+            "a statically thrown object read as an 'any' rejection reason or catch value " +
+            "(it has no island form that keeps its identity) is not supported yet [SC1063]"), null);
+          this.emitUnwind();
+          this.close();
+          this.releaseScratch(this.caughtRef(), c);
+          // The operand is the catch binding's varRef (pure): read again.
+          this.walkExpr({ kind: "caughtToDyn", value: e.args[0]!, type: { kind: "dyn" }, loc: e.loc });
+          return;
+        }
         if (e.fn === "island.eval") {
           // __island_eval through the engine this module carries
           // (phase 2 E1; islandEvalHelper). Source text the compiler can
@@ -28999,21 +29204,29 @@ class Assembler {
           // jsToNumber/dyn.toStr, never engine hooks — this closed
           // island world has none, so the "default"/"number" ToPrimitive
           // hints land the SAME place, see jsToNumber's own header).
-          // None of these can throw in this backend's static semantics
-          // (no valueOf/toString hook exists to run user code, and
-          // strToNum's own grammar failures are NaN, not exceptions) —
-          // `pow` included: jsPowHelper computes every operand pair and
-          // needs no pending check. Every op still seeds may-throw in the IR contract
+          // Board #251 changed the picture for the arithmetic and
+          // relational ops: each operand first runs %w.dyn.toPrimitive,
+          // which CALLS an object's own valueOf / toString and propagates
+          // its throw (a pending check after each operand). The rest of
+          // the conversion cannot throw (strToNum's own grammar failures
+          // are NaN, not exceptions; jsPowHelper computes every operand
+          // pair). Every op still seeds may-throw in the IR contract
           // (nodes.ts:4864) for uniformity with the native/engine lanes;
           // this static implementation is STRONGER (§8's "objLit cannot
           // run engine getters" precedent, same shape here).
           case "add": {
+            // Board #251: both operands evaluate, then each runs
+            // ToPrimitive (an own valueOf / toString is called, its throw
+            // propagates) left to right, before the string-or-number
+            // decision — the engine's order on the native lanes.
             this.walkExpr(e.args[0]!);
             const a = this.acquireScratch(this.dyn.dynRef());
             code.localSet(a);
             this.walkExpr(e.args[1]!);
             const b = this.acquireScratch(this.dyn.dynRef());
             code.localSet(b);
+            this.emitDynToPrimInPlace(a);
+            this.emitDynToPrimInPlace(b);
             code.localGet(a);
             code.call(this.jsIsStrLikeHelper());
             code.localGet(b);
@@ -29047,6 +29260,11 @@ class Assembler {
             this.walkExpr(e.args[1]!);
             const b = this.acquireScratch(this.dyn.dynRef());
             code.localSet(b);
+            // Board #251: ToPrimitive with the object protocol, left then
+            // right (an own valueOf / toString is called, its throw
+            // propagates before the right operand converts).
+            this.emitDynToPrimInPlace(a);
+            this.emitDynToPrimInPlace(b);
             this.dyn.boxNum(code, (c) => {
               c.localGet(a);
               c.call(this.jsToNumberHelper());
@@ -29068,6 +29286,8 @@ class Assembler {
             this.walkExpr(e.args[1]!);
             const b = this.acquireScratch(this.dyn.dynRef());
             code.localSet(b);
+            this.emitDynToPrimInPlace(a);
+            this.emitDynToPrimInPlace(b);
             this.dyn.boxNum(code, (c) => {
               c.localGet(a);
               c.call(this.jsToNumberHelper());
@@ -29114,6 +29334,11 @@ class Assembler {
             this.walkExpr(e.args[1]!);
             const b = this.acquireScratch(this.dyn.dynRef());
             code.localSet(b);
+            // Board #251: ToPrimitive (number hint) on the left operand,
+            // then the right — for `>` / `>=` too (IsLessThan with
+            // LeftFirst false still converts the source-left one first).
+            this.emitDynToPrimInPlace(a);
+            this.emitDynToPrimInPlace(b);
             // Abstract Relational Comparison (7.2.14): both operands are
             // strings (post-ToPrimitive) → code-UNIT order (strCmpU16,
             // S005's own comparator); otherwise numeric — IEEE f64

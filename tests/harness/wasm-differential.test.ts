@@ -3624,6 +3624,16 @@ const TIER_FLOOR: string[] = [
   // vendored copy of V8's ieee754.cc; raw transcendentals, `any` arguments
   // through ToNumber (SEMANTICS.md S100, S104): 1084 -> 1085.
   "2758-math-static-raw.ts",
+  // Unit G: the binary operators on island values run ToPrimitive over
+  // valueOf/toString — own, through the prototype link, an accessor's, a
+  // function's (board #251, %w.dyn.toPrimitive), a promise .catch
+  // handler's `any` reason is the island value itself (board #260), and a
+  // .js file under a "type": "module" scope is an ES module (board #281)
+  // — new programs passing from their first run: 1085 -> 1089.
+  "2781-island-binary-toprimitive.ts",
+  "2782-promise-catch-any-reason.js",
+  "2783-js-package-type-module.js",
+  "2786-island-toprimitive-proto-fn.js",
 ];
 
 interface RunResult {

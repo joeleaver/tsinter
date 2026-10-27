@@ -1,0 +1,6 @@
+esm-syntax-in-cjs-scope/main.js:5:1 - error SC1013: ES module syntax in a file Node loads as CommonJS (a .cjs/.cts file, or a .js/.ts file under a package.json "type": "commonjs" scope — Node throws SyntaxError at load) is not supported yet
+
+  4 | // The build refuses by name instead of running a program Node never runs.
+  5 | import os from "node:os";
+    | ^~~~~~~~~~~~~~~~~~~~~~~~~
+  6 | 

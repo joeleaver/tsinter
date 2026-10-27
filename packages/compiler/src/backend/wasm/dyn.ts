@@ -6961,6 +6961,45 @@ export class DynBuilder {
    * (keyGet/hasOwn/objWalk) calls THIS, never `fnPropsEnsure`, and pays
    * nothing beyond the scan on the fast (no-defineProps-ever-called)
    * path. */
+  /** `%w.dyn.fnOwnGet(fn, name)` → a FUNC dyn's own property (enumerable
+   * table first, then the hidden one — keyGet's order), or null when it
+   * has none: unlike keyGet, an own property holding undefined answers
+   * that undefined, not null (OrdinaryToPrimitive's "present but not
+   * callable", board #251). */
+  fnOwnGet(): number {
+    return this.cached("fnOwnGet", [this.dynRef(), this.deps.strRef()], [this.dynRef()], (idx) => {
+      const c = new Code();
+      const FP = 2;
+      const R = 3;
+      this.fnPayload(c, (x) => x.localGet(0));
+      c.structGet(this.fnT(), FN_CLOS);
+      c.call(this.fnPropsFind());
+      c.localTee(FP);
+      c.refIsNull();
+      c.ifVoid();
+      c.refNull(this.dynT());
+      c.return_();
+      c.end();
+      for (const field of [1, 2]) {
+        this.objPayload(c, (x) => {
+          x.localGet(FP);
+          x.structGet(this.fnPropsT(), field);
+        });
+        c.localGet(1);
+        c.call(this.objGet());
+        c.localTee(R);
+        c.refIsNull();
+        c.i32Eqz();
+        c.ifVoid();
+        c.localGet(R);
+        c.return_();
+        c.end();
+      }
+      c.refNull(this.dynT());
+      this.mb.setBody(idx, [{ kind: "ref", nullable: true, typeIndex: this.fnPropsT() }, this.dynRef()], c.bytes());
+    });
+  }
+
   fnPropsFind(): number {
     return this.cached(
       "fnPropsFind",

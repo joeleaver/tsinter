@@ -593,6 +593,18 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       // `typeof queueMicrotask === 'function'` probes). Shadowing locals
       // have non-stdlib symbols and keep the ordinary path.
       if (ts.isIdentifier(expr.expression)) {
+        // The CommonJS module globals in a file Node loads as an ES
+        // module (.mjs, ESM syntax, or a package.json "type": "module"
+        // scope — board #281): never defined there, and `typeof` of an
+        // unbound name is "undefined" (no ReferenceError).
+        const name = expr.expression.text;
+        if (
+          (name === "require" || name === "__filename" || name === "__dirname") &&
+          L.isStdlibGlobal(expr.expression, name) &&
+          isNodeEsmFile(expr.getSourceFile())
+        ) {
+          return { kind: "strLit", value: "undefined", type: STRING, loc };
+        }
         const sym = L.checker.getSymbolAtLocation(expr.expression);
         if (L.isStdlibSymbol(sym)) {
           const t = L.typeOf(expr.expression);
@@ -8283,6 +8295,15 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
     // convert to the "[object Object]" approximation — SEMANTICS.md 67.
     if (narrowed?.kind === "dyn") {
       return { kind: "caughtToDyn", value: ref, type: DYN, loc };
+    }
+    // Board #260: an `any`-typed use under --dynamic (a promise `.catch`
+    // handler's parameter — the lib types the reason `any`, where a catch
+    // clause's binding is `unknown`) is an island value: the ENGINE value
+    // the reason came from, by reference (identity, kind, aliasing as in
+    // Node); a statically thrown object has no such form and throws a
+    // catchable named Error at the read instead of crossing as a copy.
+    if (narrowed?.kind === "jsval") {
+      return { kind: "libCall", fn: "island.caughtToJsval", args: [ref], type: JSVAL, loc };
     }
     L.unsupported("SC1063", node);
   }

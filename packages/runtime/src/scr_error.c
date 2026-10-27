@@ -337,6 +337,85 @@ void scr_throw_domex_str(const char *name, ScrStr *message) {
 }
 
 
+/* ── bridged errors carrying their engine origin (board #260) ───────────
+ * The island bridge converts an engine Error into a builtin static Error
+ * (instanceof, .message and the uncaught line work as for any static
+ * error) and keeps the ENGINE object alongside, owned, so a read that
+ * wants the island value back answers the same object. A wider layout
+ * (the ScrError prefix, then the origin) with its own vtables: each copies
+ * the preorder stamp of the builtin kind it mirrors at allocation (main()
+ * stamps scr_error_vts before any code runs), and its release drops the
+ * origin with the error. */
+typedef struct ScrOriginError {
+  ScrError base;
+  void *origin;
+  void (*origin_release)(void *);
+} ScrOriginError;
+
+static void scr_origin_error_drop(ScrOriginError *x) {
+  if (x->origin) {
+    void *o = x->origin;
+    x->origin = NULL;
+    x->origin_release(o);
+  }
+}
+
+static void scr_origin_error_gcfree(void *obj) {
+  scr_origin_error_drop((ScrOriginError *)obj);
+  scr_error_gcfree(obj);
+}
+
+static void scr_origin_error_reld(void *obj) {
+  if (((ScrError *)obj)->rc == 1) scr_origin_error_drop((ScrOriginError *)obj);
+  scr_error_reld(obj);
+}
+
+static ScrVt scr_origin_error_vts[4] = {
+    {0, 0, &scr_origin_error_reld},
+    {0, 0, &scr_origin_error_reld},
+    {0, 0, &scr_origin_error_reld},
+    {0, 0, &scr_origin_error_reld},
+};
+
+void *scr_error_origin(const void *e) {
+  const ScrVt *vt = ((const ScrError *)e)->vt;
+  if (vt < &scr_origin_error_vts[0] || vt > &scr_origin_error_vts[3]) return NULL;
+  return ((const ScrOriginError *)e)->origin;
+}
+
+void scr_throw_error_named_origin(ScrStr *name, ScrStr *message, void *origin,
+                                  void (*origin_release)(void *)) {
+  int kind = SCR_ERR_ERROR;
+  for (int i = 1; i < 4; i++) {
+    const char *n = scr_error_names[i];
+    if (name->len == strlen(n) && memcmp(name->data, n, name->len) == 0) {
+      kind = i;
+      break;
+    }
+  }
+  ScrOriginError *x;
+  if (scr_error_traced) {
+    x = scr_cyc_alloc(sizeof *x, &scr_error_trace, &scr_origin_error_gcfree);
+  } else {
+    x = calloc(1, sizeof *x);
+    if (!x) scr_error_oom();
+  }
+  scr_origin_error_vts[kind].pre = scr_error_vts[kind].pre;
+  scr_origin_error_vts[kind].post = scr_error_vts[kind].post;
+  x->base.rc = 1;
+  x->base.vt = &scr_origin_error_vts[kind];
+  scr_obj_alloc_note();
+#if defined(SCR_LIB) && defined(SCR_RC_AUDIT)
+  scr_library_live_insert(x, scr_error_release_v); /* #147 */
+#endif
+  x->base.name = name;       /* ownership moves in */
+  x->base.message = message; /* ownership moves in */
+  x->origin = origin;        /* ownership moves in */
+  x->origin_release = origin_release;
+  scr_throw_obj(x, &scr_error_retain_v, &scr_error_release_v,
+                scr_error_traced ? &scr_error_trace : NULL);
+}
+
 void scr_throw_error_named(ScrStr *name, ScrStr *message) {
   int kind = SCR_ERR_ERROR;
   for (int i = 1; i < 4; i++) {
