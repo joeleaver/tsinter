@@ -132,6 +132,11 @@ export interface FsDeps {
   /** Unit G3: `tsinter.watchCall`'s index (abi.ts), or a descriptive throw
    * in a module that never reaches fs.watch. */
   watchCallFunc: () => number;
+  /** `%w.cp.checkNul(value, lead) -> i32` (childproc.ts): ERR_INVALID_ARG_VALUE
+   * into the pending cell when the value holds U+0000 (answers 0), else 1. */
+  checkNul: () => number;
+  /** `%w.cp.hasNul(s) -> i32`. */
+  hasNul: () => number;
 }
 
 /** The fourteen codes (E-P4-3, delta-3e: appended 13 ELOOP/14
@@ -263,6 +268,24 @@ export class FsBuilder {
     this.fns.set(name, idx);
     build(idx);
     return idx;
+  }
+
+  /** Node's path validation, before any syscall: a path holding U+0000
+   * throws TypeError ERR_INVALID_ARG_VALUE "The argument '<arg>' must be a
+   * string, Uint8Array, or URL without null bytes. Received <inspected>"
+   * (written into the pending cell; the helper answers `dummy` and the
+   * caller's pending check unwinds). Never reaching the host matters: a C
+   * host's path is a C string, cut at the first NUL — rmSync("d\0x")
+   * would remove "d". */
+  private emitNulGuard(c: Code, local: number, arg: string, dummy: (c: Code) => void): void {
+    c.localGet(local);
+    this.deps.pushStrLit(c, `The argument '${arg}' must be a string, Uint8Array, or URL without null bytes. Received `);
+    c.call(this.deps.checkNul());
+    c.i32Eqz();
+    c.ifVoid();
+    dummy(c);
+    c.return_();
+    c.end();
   }
 
   /* ── the two-slot staging primitive ───────────────────────────────────
@@ -597,6 +620,7 @@ export class FsBuilder {
   private buildReadLengthOp(name: string, op: number, defaultSyscall: string, codeOverrides: FsCodeOverrides, needsXXXXXX: boolean, xFlag = 0): number {
     return this.cached(name, [this.strRef()], [this.strRef()], (idx) => {
       const c = new Code();
+      this.emitNulGuard(c, 0, name === "mkdtempSync" ? "prefix" : "path", (c2) => c2.refNull(this.strType()));
       const PATH = 0;
       const STAGE_STR = 1;
       const A_LEN = 2;
@@ -701,6 +725,7 @@ export class FsBuilder {
   watchStartHelper(): number {
     return this.cached("watchStart", [this.strRef()], [I32], (idx) => {
       const c = new Code();
+      this.emitNulGuard(c, 0, "path", (c2) => c2.i32Const(-1));
       const PATH = 0;
       const A_LEN = 1;
       const A_BASE = 2;
@@ -784,6 +809,7 @@ export class FsBuilder {
   readFileSyncBytesHelper(): number {
     return this.cached("readFileSyncBytes", [this.strRef()], [this.deps.bytesRef()], (idx) => {
       const c = new Code();
+      this.emitNulGuard(c, 0, "path", (c2) => c2.refNull(this.deps.bytesType()));
       const PATH = 0;
       const A_LEN = 1;
       const A_BASE = 2;
@@ -911,6 +937,7 @@ export class FsBuilder {
   private buildWriteOp(name: string, op: number, defaultSyscall: string, hasMode = false): number {
     return this.cached(name, hasMode ? [this.strRef(), this.strRef(), I32] : [this.strRef(), this.strRef()], [], (idx) => {
       const c = new Code();
+      this.emitNulGuard(c, 0, "path", () => {});
       const PATH = 0;
       const CONTENT = 1;
       const MODE = 2; // only meaningful when hasMode
@@ -1012,6 +1039,7 @@ export class FsBuilder {
   writeFileSyncBytesHelper(): number {
     return this.cached("writeFileSyncBytes", [this.strRef(), this.deps.bytesRef()], [], (idx) => {
       const c = new Code();
+      this.emitNulGuard(c, 0, "path", () => {});
       const PATH = 0;
       const CONTENT = 1;
       const A_LEN = 2;
@@ -1102,6 +1130,7 @@ export class FsBuilder {
   private buildSimpleOp(name: string, op: number, extraParams: ValType[], pushXY: (c: Code, path: number, extras: number[]) => void, defaultSyscall: string, rmEisdirSpecial: boolean, retryExtras: readonly [number, number] | null = null): number {
     return this.cached(name, [this.strRef(), ...extraParams], [], (idx) => {
       const c = new Code();
+      this.emitNulGuard(c, 0, "path", () => {});
       const PATH = 0;
       const extras = extraParams.map((_, i) => 1 + i);
       const base = 1 + extraParams.length;
@@ -1464,6 +1493,8 @@ export class FsBuilder {
   copyFileSyncHelper(): number {
     return this.cached("copyFileSync", [this.strRef(), this.strRef()], [], (idx) => {
       const c = new Code();
+      this.emitNulGuard(c, 0, "src", () => {});
+      this.emitNulGuard(c, 1, "dest", () => {});
       const SRC = 0;
       const DST = 1;
       const A_LEN = 2;
@@ -1545,6 +1576,7 @@ export class FsBuilder {
   openSyncHelper(): number {
     return this.cached("openSync", [this.strRef(), I32], [{ kind: "f64" }], (idx) => {
       const c = new Code();
+      this.emitNulGuard(c, 0, "path", (c2) => c2.f64Const(-1));
       const PATH = 0;
       const FLAGS = 1;
       const A_LEN = 2;
@@ -1835,6 +1867,14 @@ export class FsBuilder {
   existsSyncHelper(): number {
     return this.cached("existsSync", [this.strRef()], [I32], (idx) => {
       const c = new Code();
+      // Node's existsSync answers false for a path holding U+0000 (its
+      // validation throw is caught), before any syscall.
+      c.localGet(0);
+      c.call(this.deps.hasNul());
+      c.ifVoid();
+      c.i32Const(0);
+      c.return_();
+      c.end();
       const PATH = 0;
       const A_LEN = 1;
       const A_BASE = 2;
@@ -1930,6 +1970,7 @@ export class FsBuilder {
   private buildStatOp(name: string, op: number, defaultSyscall: string): number {
     return this.cached(name, [this.strRef()], [this.statsRef()], (idx) => {
       const c = new Code();
+      this.emitNulGuard(c, 0, "path", (c2) => c2.refNull(this.statsType()));
       const PATH = 0;
       const A_LEN = 1;
       const A_BASE = 2;
@@ -2039,6 +2080,7 @@ export class FsBuilder {
   realpathSyncHelper(): number {
     return this.cached("realpathSync", [this.strRef()], [this.strRef()], (idx) => {
       const c = new Code();
+      this.emitNulGuard(c, 0, "path", (c2) => c2.refNull(this.strType()));
       const PATH = 0;
       const A_LEN = 1;
       const A_BASE = 2;

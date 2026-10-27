@@ -9941,6 +9941,8 @@ class Assembler {
         if (this.watchCallFunc === null) throw new Error("emitter bug: fs.watch was reached but tsinter.watchCall was never imported");
         return this.watchCallFunc;
       },
+      checkNul: () => this.cp.checkNulHelper(),
+      hasNul: () => this.cp.hasNulHelper(),
       ensureCapacity: (c, need) => this.emitEnsureCapacity(c, need),
       stageCursor: () => this.cursorGlobal,
       pushStrLit: (c, value) => this.pushStrLitInto(c, value),

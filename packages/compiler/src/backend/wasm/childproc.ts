@@ -934,7 +934,7 @@ export class ChildProcBuilder {
   }
 
   /** `%w.cp.hasNul(s) -> i32`. */
-  private hasNulHelper(): number {
+  hasNulHelper(): number {
     return this.cached("hasNul", [this.strRef()], [I32], (idx) => {
       const c = new Code();
       const S = 0;

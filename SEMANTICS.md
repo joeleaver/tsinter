@@ -8247,3 +8247,88 @@ lane; `tests/harness/npm.test.ts` ("a typed record callback parameter is
 refused at compile time, by name");
 `tests/harness/island.test.ts` ("a typed record crossing into an 'any'
 binding is a live view"). Measured against Node v24.18.1.
+
+## S117 — The wasm-native lane runs the wasm module natively; it parts from Node where the native lanes do (argv, execPath, versions, a real clock), and in its stack depth, its heap limit and the text of a trap *(wasm-native lane)*
+
+The wasm-native lane (`backend: "wasm-native"`, native-runner phase N0) is
+the wasm lane's own module translated to C (`backend/wasm2c.ts`, the
+whole-program profile) and linked with the native runner
+(`packages/runtime/src/wasmnative`: the collector `wn_gc.c`, the C host for
+abi.ts's imports `wn_host.c`, the driver `wn_main.c`). Every behavior is the
+module's, so everything the wasm lane registers applies unchanged; this
+entry lists only what the runner itself decides:
+
+(a) **Process facts are a native process's**: `process.argv` is
+`["scriptc", <the invocation>, ...]` and `process.execPath` the
+executable's resolved path, as on the c and llvm lanes (S070, S071);
+`process.versions.node`/`.openssl` are the S072 constants. The clock is
+real (`now`, `wallClock`, timers wait with nanosleep), as on the native
+lanes — the wasm lane's differential host runs a virtual clock instead.
+Local time is the C library's, so S113's (a) (zone data) and (b) (the
+zone names table) apply to this lane exactly as to the c and llvm lanes.
+A signal the process sends itself (`process.kill(process.pid, "SIGSEGV")`)
+ends it as it ends Node, killed by that signal.
+
+(b) **Stack depth.** The program runs on a 512 MiB stack. Node overflows
+at roughly ten thousand frames of a simple recursive function and throws
+a catchable `RangeError`; here such a recursion completes (`f(50000)`
+answers where Node throws). Past 512 MiB the overflow is the runner's
+trap: `RangeError: Maximum call stack size exceeded` on stderr and exit
+status 1, uncatchable — the wasm lane's own outcome for a stack
+overflow (the module has no way to catch one). The study's phase N2 makes
+the depth the same on every runner. A frame larger than the 64 KiB guard
+cannot step over it: the translation is compiled with
+`-fstack-clash-protection`.
+
+(c) **Heap limit.** The collector's arena is 64 GiB of address space; a
+program whose live heap passes V8's limit (Node aborts with a fatal
+out-of-memory error) keeps running here.
+
+(d) **Trap text.** A trap other than the module's own `unreachable` (the
+uncaught-error path, which has already printed its report — S007, S010)
+prints V8's own RuntimeError text for that trap (`divide by zero`,
+`divide result unrepresentable`, `remainder by zero`, `float
+unrepresentable in integer range`, `memory access out of bounds`, `data
+segment out of bounds`, `requested new array is too large` past V8's own
+array limits, `null function or function signature mismatch`, …) to
+stderr before exit status 1, where it happens in the program — every
+memory access is bounds-checked where wasm makes it, never left to a fault
+the C compiler may move or delete. Nonzero-exit stderr is not Node's on
+the wasm lane either (S007). A fault the runner cannot attribute to the
+program (a runner bug) says so and exits 70, never 1.
+
+(e) **NaN bits.** Every float operation runs as the instruction it is —
+the translation is compiled with `-ffp-model=strict`, so `x * -1`,
+`x / 1`, `x - 0`, `-0 - x` and their kin keep a NaN operand's bits as V8
+does (JS-observable through a Float64Array or Buffer), never folded into a
+sign flip or the operand. `min`/`max` with a NaN operand answer V8's NaN
+on x86-64 (the processor's default NaN, whatever the operands); on other
+architectures the NaN operand propagates, quieted (V8 there unmeasured).
+The one residue: when BOTH operands of a commutative operation are NaNs,
+which payload survives is the instruction's operand order, which the C
+compiler chooses — and so does V8's (the instruction set keeps the first
+operand's); measured on constants, V8 kept the first and this lane the
+second.
+
+(f) **Imports the host does not provide refuse at build time.** A module
+importing `cpCall`, `evPoll`, `netCall`, `tlsCall`, `sigCall`,
+`watchCall`, `stdinCall` or `fetch` (the event sources — phase N1) does
+not build on this lane: SC3001 naming `host:<import>`, the LinkError of
+abi.ts moved to build time, never a stub that fails late.
+
+(g) **The translator trusts a valid module.** `wasm2c` assumes the
+module's types and stack discipline hold; the lane validates every module
+with the engine's own `WebAssembly.validate` before translating, and an
+invalid one refuses (`wasm2c:the module does not validate`).
+
+**Tested by:** `tests/harness/wasmnative-differential.test.ts` (the whole
+corpus against Node; `SCRIPTC_WASMNATIVE_GC_STRESS=n` runs it with the
+collector forced every n allocations), and
+`packages/compiler/test/wasm2c-whole.test.ts` (the translation against
+Node's own WebAssembly: every numeric operator and conversion bit for bit,
+linear memory to its end, the GC instructions under a stressed
+collector, NaN operands of the folded identities, every trap's text
+through the real runner), and `packages/compiler/test/wasm-native.test.ts`
+(the host end to end: paths holding U+0000, copyFileSync onto itself, a
+self-sent SIGSEGV). (b) was measured by hand (`f(50000)`, then unbounded
+recursion: the native trap in 0.2 s, exit 1).

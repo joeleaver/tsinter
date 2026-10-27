@@ -6,6 +6,8 @@ import { nativeRegexLiteralRefusal } from "./backend/regex-native.js";
 import { emitLlvmModule, LlvmUnsupportedError } from "./backend/llvm/emitter.js";
 import { emitWasmModule, surveyWasmModule, WasmUnsupportedError } from "./backend/wasm/emitter.js";
 import { EngineFormatError } from "./backend/wasm/engine.js";
+import { compileWasmNative, translateForNativeRunner } from "./backend/wasm-native.js";
+import { Wasm2cHostImportError } from "./backend/wasm2c.js";
 import { checkerPanicDiag, ffiNativeBuildDiag, libAsyncExportDiag, libAsyncSurfaceDiag, libExportUnresolvedDiag, libGenericExportDiag, libIntBoundaryDiag, libNpmIneligibleDiag, libUnmappableSignatureDiag, iceDiag, isCheckerPanic, LIB_INBOUND_BYTES_TRAP_CODE, LIB_RUNTIME_TRAP_CODES, type ScrDiagnostic } from "./diagnostics/diagnostic.js";
 import { checkLibraryIntegerSlots, classSeed, hasIntSlots, type FnIntSlots, type IntSlotConfig } from "./library/int-infer.js";
 import { loadLibraryProfile, profileRemediation, profileTeaching, type LibraryProfile } from "./library/profile.js";
@@ -129,8 +131,17 @@ export interface CompileOptions {
    * direction: it emits a WebAssembly module (.wasm bytes at outPath) and
    * skips clang and the link entirely, so there is no native executable
    * for the C backend to stand in for and nothing it could fall back to.
-   * Every out-of-tier program is SC3001, unconditionally. */
-  backend?: "c" | "llvm" | "wasm";
+   * Every out-of-tier program is SC3001, unconditionally.
+   *
+   * `wasm-native` (native-runner phase N0, an explicit pin, no fallback) is
+   * the wasm module itself made native: the SAME module `wasm` emits,
+   * translated to C by backend/wasm2c.ts and linked with the native runner
+   * (packages/runtime/src/wasmnative: collector, C host, driver) into an
+   * executable at outPath. Out of tier is SC3001 exactly as for `wasm`;
+   * a module the translator or the runner's host cannot take (an import
+   * the host lacks — `host:<import>` — or an instruction outside the
+   * translator's subset — `wasm2c:...`) is SC3001 too, by name. */
+  backend?: "c" | "llvm" | "wasm" | "wasm-native";
   /** --npm-static: package names whose shipped, unminified JS compiles
    * STATICALLY as program modules (inference types the bodies; statements
    * the lowering cannot prove become runtime fences). "auto" opts in every
@@ -157,7 +168,7 @@ export type CompileResult =
    * Under the wasm backend the module IS the artifact: `binaryPath` and
    * `cPath` name the same .wasm file (no separate TU, no link step), which
    * is also how `--no-keep-c` knows there is nothing to delete. */
-  | { ok: true; binaryPath: string; cPath: string; irPath?: string; backend: "c" | "llvm" | "wasm"; llvmRefusal?: string }
+  | { ok: true; binaryPath: string; cPath: string; irPath?: string; backend: "c" | "llvm" | "wasm" | "wasm-native"; llvmRefusal?: string }
   /** `wasmSurvey` rides a wasm tier refusal only: EVERY distinct construct
    * the program needs from that backend, not just the first one the
    * refusal names. The diagnostic answers "does it compile?"; the survey
@@ -690,7 +701,7 @@ export async function compile(entryPath: string, opts: CompileOptions): Promise<
         // The WasmGC tier's host supplies fetch (one `fetch` import,
         // SEMANTICS.md S098): the fetch slice lowers without --dynamic
         // there; the native lanes keep the requires-dynamic diagnostic.
-        ...(opts.backend === "wasm" ? { hostFetch: true } : {}),
+        ...(opts.backend === "wasm" || opts.backend === "wasm-native" ? { hostFetch: true } : {}),
         ...(ffi !== null ? { ffiImports: ffi.functions } : {}),
       });
     } catch (e) {
@@ -721,13 +732,17 @@ export async function compile(entryPath: string, opts: CompileOptions): Promise<
   // module, so there is no program TU, no clang command line, and no link
   // — and no fallback either way (an explicit pin is the only way to
   // reach this, and a refusal is SC3001, never a silent lane change).
-  if (opts.backend === "wasm") {
+  if (opts.backend === "wasm" || opts.backend === "wasm-native") {
     // The executable path becomes the module path: .exe (the Windows
     // default name) is not what a .wasm is called, and a caller that
-    // already asked for .wasm keeps exactly the path it named.
-    const wasmPath = opts.outPath.endsWith(".wasm")
-      ? opts.outPath
-      : `${opts.outPath.replace(/\.exe$/i, "")}.wasm`;
+    // already asked for .wasm keeps exactly the path it named. The
+    // wasm-native lane keeps its module beside its translation instead.
+    const wasmPath =
+      opts.backend === "wasm-native"
+        ? join(opts.outDir, `${stem}.wasm`)
+        : opts.outPath.endsWith(".wasm")
+          ? opts.outPath
+          : `${opts.outPath.replace(/\.exe$/i, "")}.wasm`;
     let bytes: Uint8Array;
     try {
       bytes = emitWasmModule(lowered.module!);
@@ -756,6 +771,54 @@ export async function compile(entryPath: string, opts: CompileOptions): Promise<
     if (opts.emitIr) {
       wasmIrPath = join(opts.outDir, `${stem}.ir.json`);
       await writeFile(wasmIrPath, serializeModule(lowered.module));
+    }
+    if (opts.backend === "wasm-native") {
+      // The module, made native: translate it, then link the translation
+      // with the runner. What the translator or the runner's host cannot
+      // take refuses loudly, by name (a LinkError's moment moved to build
+      // time), never a stub.
+      if (resolveCc().target !== null) {
+        return {
+          ok: false,
+          diagnostics: [
+            {
+              code: "SC3001",
+              message: "the wasm-native lane does not cross-compile yet: SCRIPTC_TARGET is set (wasm-native:cross)",
+              loc: { file: entryPath, start: 0, end: 0 },
+            },
+          ],
+          sourceTexts,
+        };
+      }
+      let c: string;
+      try {
+        c = translateForNativeRunner(bytes);
+      } catch (err) {
+        if (!(err instanceof Error)) throw err;
+        const kind = err instanceof Wasm2cHostImportError ? `host:${err.importName}` : `wasm2c:${err.message.replace(/^wasm2c: /, "").replace(/ \((function|a constant expression)[^)]*\)$/, "")}`;
+        return {
+          ok: false,
+          diagnostics: [
+            {
+              code: "SC3001",
+              message: `the wasm-native lane cannot run this module yet: ${err.message} (${kind})`,
+              loc: { file: entryPath, start: 0, end: 0 },
+            },
+          ],
+          sourceTexts,
+        };
+      }
+      const nativeC = join(opts.outDir, `${stem}.c`);
+      await writeFile(nativeC, c);
+      await mkdir(dirname(opts.outPath), { recursive: true });
+      await compileWasmNative({ cPath: nativeC, outPath: opts.outPath, sanitize: opts.sanitize ?? false });
+      return {
+        ok: true,
+        binaryPath: opts.outPath,
+        cPath: nativeC,
+        backend: "wasm-native",
+        ...(wasmIrPath !== undefined ? { irPath: wasmIrPath } : {}),
+      };
     }
     return {
       ok: true,

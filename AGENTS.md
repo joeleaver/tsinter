@@ -36,6 +36,7 @@ our file.)
 
 - `packages/compiler` — the frontend (tsc API to IR), the typed IR with validator and serializer, the WasmGC backend (`src/backend/wasm`, this fork's main work), and the LLVM and C backends (transitional: kept as executable semantics references until the wasm lane stands alone).
 - `packages/runtime` — the C runtime compiled into native binaries (transitional, same caveat).
+  `packages/runtime/src/wasmnative` is the native runner: the wasm module translated to C (`backend/wasm2c.ts`) plus its collector, C host and driver — the `wasm-native` lane, `tests/harness/wasmnative-differential.test.ts`.
 - `packages/cli` — `tsinter build | run | coverage`.
 - `tests/` — the differential corpus, diagnostics snapshots, and the harness.
 - `docs/` — the documentation site (standalone pnpm workspace); see `docs/AGENTS.md`.

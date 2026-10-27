@@ -34,7 +34,10 @@ Options:
                      native executable — no clang, no link — and is an
                      explicit pin only: it never joins the fallback chain,
                      and a construct outside its tier always fails with
-                     that construct named
+                     that construct named. wasm-native is that same module
+                     made a native executable (translated to C and linked
+                     with the native runner) — an explicit pin, the third
+                     native lane while it grows
       --from-c       treat input as a C (or .ll) file (toolchain plumbing/debugging)
       --keep-c       keep the generated program TU next to the executable
                      (default; the .ll — or the .c under --backend=c or
@@ -188,8 +191,8 @@ async function main(): Promise<number> {
   const input = resolve(inputArg);
   const ffiProfilePath = values.ffi !== undefined ? resolve(values.ffi) : undefined;
   const backend = values.backend;
-  if (backend !== undefined && backend !== "c" && backend !== "llvm" && backend !== "wasm") {
-    fail(`unknown backend "${backend}" (supported: c, llvm, wasm)\n\n${USAGE}`);
+  if (backend !== undefined && backend !== "c" && backend !== "llvm" && backend !== "wasm" && backend !== "wasm-native") {
+    fail(`unknown backend "${backend}" (supported: c, llvm, wasm, wasm-native)\n\n${USAGE}`);
   }
   // `run` spawns the build's output as a process; a wasm module needs a
   // host to instantiate it and this CLI ships none, so the combination is
