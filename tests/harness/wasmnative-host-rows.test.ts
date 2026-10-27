@@ -26,6 +26,9 @@
  * Runs concurrently within the file, at most SCRIPTC_TEST_WORKERS (default
  * 4) rows at once. */
 import { spawn } from "node:child_process";
+import { createServer as createHttpsServer } from "node:https";
+import { createServer as createNetServer, type AddressInfo, type Server } from "node:net";
+import { createServer as createTlsServer, type Server as TlsServer } from "node:tls";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -325,10 +328,10 @@ describe("the fetch fixtures on the wasm-native lane", () => {
       expectSame(await both(subst(readFileSync(join(fixtures, "wasm", `${name}.ts`), "utf8")), false));
     }, 120_000);
   }
-  test("wasm/unhandled.ts: an unhandled 'fetch failed' ends the run with exit 1 and the tier's report (S007), as on the wasm lane", async () => {
+  test("wasm/unhandled.ts: an unhandled 'fetch failed' ends the run with exit 1: the tier's report (S007), then the trap's own V8 text (S117 (d))", async () => {
     const r = await both(subst(readFileSync(join(fixtures, "wasm", "unhandled.ts"), "utf8")), false);
     expectSame(r, true);
-    expect(r.native.stderr.toString("utf8")).toBe("Unhandled promise rejection: TypeError: fetch failed\n");
+    expect(r.native.stderr.toString("utf8")).toBe("Unhandled promise rejection: TypeError: fetch failed\nRuntimeError: unreachable\n");
   }, 120_000);
   test("wasm/fences.ts: the module's fences (S098 (d)), as on the wasm lane", async () => {
     const { node, native } = await both(subst(readFileSync(join(fixtures, "wasm", "fences.ts"), "utf8")), false);
@@ -337,5 +340,275 @@ describe("the fetch fixtures on the wasm-native lane", () => {
       "body: Error Response.body (a ReadableStream) is not supported yet\njson: Error JSON.stringify of a fetch value is not supported yet\ntypeof: object\n",
     );
     expect(native.code).toBe(0);
+  }, 120_000);
+});
+
+/* ── host defects found in N1's review, pinned against Node ───────────────
+ * Each row is a program the reviewer broke the host with, run on both
+ * sides. The two TLS rows are SECURITY regression tests: a certificate
+ * that does not name the host it was fetched from, and a redirect onto a
+ * server whose chain is not trusted, must fail exactly as Node fails them
+ * — never be accepted. The servers live in this process; the fixture CA
+ * is trusted through NODE_EXTRA_CA_CERTS on both sides (Node's own
+ * variable, honoured by the native host's default store). */
+describe("N1 review rows: the host against Node", () => {
+  const certs = join(repoRoot, "tests/fixtures/server/certs");
+  const pem = (n: string): Buffer => readFileSync(join(certs, n));
+  const env = { NODE_EXTRA_CA_CERTS: join(certs, "ca.pem") };
+  const servers: { close: () => void }[] = [];
+  let altPort = 0;
+  let goodPort = 0;
+  let selfPort = 0;
+  let redirPort = 0;
+  let evilPort = 0;
+  let floodPort = 0;
+  /* malformed responses, as llhttp / undici see them */
+  const EVIL: Record<string, string> = {
+    a: "HTTP/1.1 2\r\n\r\n",
+    b: "HTTP/1.1\n\n",
+    c: "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nzz\r\nhello\r\n0\r\n\r\n",
+    d: "HTTP/1.1 200 OK\r\ncontent-length: -5\r\n\r\nhello",
+    e: "HTTP/1.1 200 OK\r\ncontent-length: 3\r\ncontent-length: 5\r\n\r\nhello",
+    h: "HTTP/1.1 200 OK\r\ncontent-length: 5\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
+    i: "HTTP/1.1 999999999999 X\r\ncontent-length: 0\r\n\r\n",
+    j: "HTTP/1.1 200 OK\r\nX-A: " + "a".repeat(100000) + "\r\ncontent-length: 2\r\n\r\nok",
+    l: "HTTP/1.1 200 OK\r\ncontent-length: 99999999999999999999\r\n\r\nhi",
+    m: "HTTP/1.1 200\r\ncontent-length: 2\r\n\r\nok",
+    n: "HTTP/1.1 200 OK\nx-a: 1\ncontent-length: 2\n\nok",
+    o: "HTTP/1.1 200 OK\r\nfoo : bar\r\ncontent-length: 2\r\n\r\nok",
+    r: "HTTP/1.1 abc OK\r\ncontent-length: 2\r\n\r\nok",
+    t: "HTTP/1.1 200 OK\r\ncontent-length:  2 \r\n\r\nok",
+    u: "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5;ext=1\r\nhello\r\n0\r\n\r\n",
+    w: "HTTP/1.1 200 OK\r\nx: a\x00b\r\ncontent-length: 2\r\n\r\nok",
+    x: "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhelloXX0\r\n\r\n",
+    y: "XTTP/1.1 200 OK\r\n\r\n",
+    ab: "HTTP/1.1 200 OK\r\ntransfer-encoding: gzip, chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n",
+    ae: "HTTP/1.1 200  OK\r\ncontent-length: 2\r\n\r\nok",
+    ag: "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFFFF\r\nhello\r\n0\r\n\r\n",
+    ah: "HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r",
+  };
+  beforeAll(async () => {
+    const listen = (srv: Server | TlsServer): Promise<number> =>
+      new Promise((resolve) => {
+        srv.listen(0, "127.0.0.1", () => resolve((srv.address() as AddressInfo).port));
+        servers.push(srv);
+      });
+    altPort = await listen(createHttpsServer({ key: pem("alt-key.pem"), cert: pem("alt.pem") }, (_q, r) => r.end("alt")));
+    goodPort = await listen(createHttpsServer({ key: pem("localhost-key.pem"), cert: pem("localhost.pem") }, (q, r) => r.end(`good ${q.url}`)));
+    selfPort = await listen(createHttpsServer({ key: pem("selfsigned-key.pem"), cert: pem("selfsigned.pem") }, (q, r) => r.end(`SECRET ${q.url}`)));
+    redirPort = await listen(
+      createHttpsServer({ key: pem("localhost-key.pem"), cert: pem("localhost.pem") }, (_q, r) => {
+        r.writeHead(302, { location: `https://localhost:${selfPort}/secret` });
+        r.end();
+      }),
+    );
+    evilPort = await listen(
+      createNetServer((s) => {
+        let buf = "";
+        s.on("data", (d) => {
+          buf += d.toString("latin1");
+          const m = /^[A-Z]+ \/(\S+)/.exec(buf);
+          if (m && buf.includes("\r\n\r\n")) s.end(Buffer.from(EVIL[m[1]!] ?? "HTTP/1.1 404 NF\r\ncontent-length: 0\r\n\r\n", "latin1"));
+        });
+        s.on("error", () => {});
+      }),
+    );
+    const chunk = Buffer.alloc(1 << 20, 97);
+    floodPort = await listen(
+      createTlsServer({ key: pem("localhost-key.pem"), cert: pem("localhost.pem") }, (s) => {
+        let sent = 0;
+        const pump = (): void => {
+          while (sent < 256) {
+            sent++;
+            if (!s.write(chunk)) {
+              s.once("drain", pump);
+              return;
+            }
+          }
+          s.end();
+        };
+        pump();
+        s.on("error", () => {});
+      }),
+    );
+  });
+  afterAll(() => {
+    for (const s of servers) s.close();
+  });
+
+  async function both(src: string, opts: { env?: Record<string, string>; ulimitFiles?: number; rss?: boolean } = {}): Promise<{ node: Out; native: Out; nativeMaxRssKb: number }> {
+    const dir = mkdtempSync(join(tmpdir(), "wn-review-"));
+    try {
+      const entry = join(dir, "main.ts");
+      writeFileSync(entry, src);
+      const res = await compile(entry, { outPath: join(dir, "out", "program"), outDir: join(dir, "out"), dynamic: false, backend: "wasm-native" });
+      if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+      const wrap = (cmd: string, args: string[]): [string, string[]] => {
+        const pre = opts.ulimitFiles !== undefined ? `ulimit -n ${opts.ulimitFiles}; ` : "";
+        const time = opts.rss ? `/usr/bin/time -f "maxrss %M" -o ${join(dir, "rss.txt")} ` : "";
+        return ["/bin/sh", ["-c", `${pre}exec ${time}"$0" "$@"`, cmd, ...args]];
+      };
+      const [nc, na] = wrap(process.execPath, ["--import", comptimeShim, "--import", islandShim, entry]);
+      const node = await run(nc, na, repoRoot, undefined, opts.env);
+      const [xc, xa] = wrap(res.binaryPath, []);
+      const native = await run(xc, xa, repoRoot, undefined, opts.env);
+      let nativeMaxRssKb = 0;
+      if (opts.rss) nativeMaxRssKb = Number(/maxrss (\d+)/.exec(readFileSync(join(dir, "rss.txt"), "utf8"))?.[1] ?? "0");
+      return { node, native, nativeMaxRssKb };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  const fetchProbe = (urls: string[]): string => `async function go(u: string): Promise<void> {
+  try {
+    const r = await fetch(u);
+    console.log(u, "OK", r.status, r.url, await r.text());
+  } catch (e) {
+    const x: unknown = e;
+    const c = (x as { cause: { code: string; message: string } }).cause;
+    console.log(u, "ERR", c.code, c.message);
+  }
+}
+async function main(): Promise<void> {
+${urls.map((u) => `  await go(${JSON.stringify(u)});`).join("\n")}
+}
+main();
+`;
+
+  test("SECURITY B1: fetch checks the host name against the certificate as Node does — an IP literal must be one of its IP-address names, a DNS name one of its DNS names; a certificate naming another host is ERR_TLS_CERT_ALTNAME_INVALID, never accepted", async () => {
+    const { node, native } = await both(
+      fetchProbe([`https://127.0.0.1:${altPort}/ip`, `https://localhost:${altPort}/dns`, `https://127.0.0.1:${goodPort}/ok-ip`, `https://localhost:${goodPort}/ok-dns`]),
+      { env },
+    );
+    const out = node.stdout.toString("utf8");
+    expect(out).toContain("ERR_TLS_CERT_ALTNAME_INVALID Hostname/IP does not match certificate's altnames: IP: 127.0.0.1 is not in the cert's list: ");
+    expect(out).toContain("ERR_TLS_CERT_ALTNAME_INVALID Hostname/IP does not match certificate's altnames: Host: localhost. is not in the cert's altnames: DNS:alt.localhost");
+    expect(native.stdout.toString("utf8")).toBe(out);
+    expect(native.code).toBe(node.code);
+  }, 120_000);
+
+  test("SECURITY B2: a redirect onto a server whose certificate is not trusted fails as Node fails it — no verification state survives from the hop before", async () => {
+    const { node, native } = await both(fetchProbe([`https://localhost:${redirPort}/go`, `https://localhost:${selfPort}/direct`]), { env });
+    const out = node.stdout.toString("utf8");
+    expect(out).not.toContain("SECRET");
+    expect(native.stdout.toString("utf8")).toBe(out);
+    expect(native.code).toBe(node.code);
+  }, 120_000);
+
+  test("B3: malformed responses fail as llhttp and undici fail them (status line, header tokens and values, Content-Length, chunk framing, the header-size limit) — a short status line is never read past", async () => {
+    const src = `async function go(k: string): Promise<void> {
+  try {
+    const r = await fetch("http://127.0.0.1:${evilPort}/" + k);
+    const names: string[] = [];
+    r.headers.forEach((v, n) => {
+      if (n !== "date") names.push(n + "=" + v);
+    });
+    let t = "";
+    try {
+      t = await r.text();
+    } catch (e) {
+      const x: unknown = e;
+      const c = x as { message: string; cause: { name: string; message: string } };
+      console.log(k, "BODY", c.message, c.cause.name, c.cause.message);
+      return;
+    }
+    console.log(k, "OK", r.status, JSON.stringify(r.statusText), names.join(" "), t.length);
+  } catch (e) {
+    const x: unknown = e;
+    const c = x as { message: string; cause: { name: string; message: string } };
+    console.log(k, "ERR", c.message, c.cause.name, c.cause.message);
+  }
+}
+async function main(): Promise<void> {
+  for (const k of ${JSON.stringify(Object.keys(EVIL))}) await go(k);
+}
+main();
+`;
+    const { node, native } = await both(src);
+    expect(node.stdout.toString("utf8")).toContain("a ERR fetch failed HTTPParserError Response does not match the HTTP/1.1 protocol (Invalid status code)");
+    expect(native.stdout.toString("utf8")).toBe(node.stdout.toString("utf8"));
+    expect(native.code).toBe(0);
+  }, 120_000);
+
+  test("B4: out of descriptors, the listener does not spin — libuv's EMFILE reserve, taken at the first stream, is spent to accept and close what waits; the program finishes", async () => {
+    const src = `import * as net from "node:net";
+const M = 1500;
+const srv = net.createServer((s) => {
+  s.on("data", (d: Buffer) => {
+    s.end(d);
+  });
+});
+srv.on("error", () => {});
+srv.listen(0, "127.0.0.1", () => {
+  const port = srv.address().port;
+  let done = 0;
+  let ok = 0;
+  let errs = 0;
+  let code = "";
+  for (let i = 0; i < M; i++) {
+    const c = net.connect(port, "127.0.0.1");
+    let got = "";
+    c.on("connect", () => {
+      c.write("m" + i);
+    });
+    c.on("data", (d: Buffer) => {
+      got += d.toString();
+    });
+    c.on("error", (e) => {
+      errs++;
+      if (errs === 1) code = String((e as NodeJS.ErrnoException).code);
+    });
+    c.on("close", () => {
+      if (got === "m" + i) ok++;
+      if (++done === M) {
+        console.log("done", errs > 0, code);
+        srv.close();
+      }
+    });
+  }
+});
+`;
+    const t0 = Date.now();
+    const { node, native } = await both(src, { ulimitFiles: 300 });
+    expect(node.stdout.toString("utf8")).toBe("done true EMFILE\n");
+    expect(native.stdout.toString("utf8")).toBe(node.stdout.toString("utf8"));
+    expect(native.code).toBe(node.code);
+    expect(Date.now() - t0).toBeLessThan(60_000);
+  }, 120_000);
+
+  test("spawnSync with a timeout past an int's milliseconds (1e11) waits as long as the child runs and reports its status, as Node does", async () => {
+    const src = `import { spawnSync } from "node:child_process";
+const r = spawnSync("/bin/sh", ["-c", "exit 3"], { timeout: 1e11 });
+console.log(r.status, r.signal, r.error === undefined);
+`;
+    const { node, native } = await both(src);
+    expect(node.stdout.toString("utf8")).toBe("3 null true\n");
+    expect(native.stdout.toString("utf8")).toBe(node.stdout.toString("utf8"));
+  }, 120_000);
+
+  test("TLS back-pressure: a secured socket the program has not read from stops reading the peer (Node's readStop reaches the socket) — 256 MiB from a flooding server never pile up in the runner", async () => {
+    const src = `import * as tls from "node:tls";
+import * as fs from "node:fs";
+const ca = fs.readFileSync("tests/fixtures/server/certs/ca.pem", "utf8");
+const s = tls.connect(${floodPort}, "localhost", { ca }, () => {
+  console.log("secure", s.authorized);
+  setTimeout(() => {
+    let n = 0;
+    s.on("data", (d: Buffer) => {
+      n += d.length;
+    });
+    s.on("end", () => {
+      console.log("got", n);
+    });
+  }, 1500);
+});
+`;
+    const { node, native, nativeMaxRssKb } = await both(src, { rss: true });
+    expect(node.stdout.toString("utf8")).toBe(`secure true\ngot ${256 << 20}\n`);
+    expect(native.stdout.toString("utf8")).toBe(node.stdout.toString("utf8"));
+    expect(nativeMaxRssKb).toBeGreaterThan(0);
+    // bounded by the collector, not by what the peer sent: buffering the
+    // flood would take more than its 256 MiB
+    expect(nativeMaxRssKb).toBeLessThan(160 * 1024);
   }, 120_000);
 });

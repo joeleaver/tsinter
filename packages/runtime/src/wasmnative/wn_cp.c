@@ -379,7 +379,9 @@ static int32_t cp_run(uint32_t ptr, uint32_t len) {
     int wait = -1;
     if (deadline > 0 && !killed) {
       double left = deadline - mono_ms();
-      wait = left <= 0 ? 0 : (int)ceil(left);
+      /* any accepted timeout, however large: a wait is at most ~12 days
+       * long, and the loop waits again */
+      wait = left <= 0 ? 0 : left > 1e9 ? 1000000000 : (int)ceil(left);
     }
     int rc = poll(p, (nfds_t)n, wait);
     if (rc < 0) {
@@ -476,9 +478,12 @@ typedef struct Child {
   WnIo pio;
   int reaped, exit_queued, exit_read, released;
   CPipe pipes[2];
+  struct Child *next_live; /* the unreaped children, in spawn order */
+  int pid_status;
 } Child;
 static Child **kids;
 static uint32_t n_kids;
+static Child *live_head, **live_tail = &live_head;
 
 #define HWM 65536
 
@@ -600,24 +605,44 @@ static void exit_scope(Child *ch, int st) {
 static void child_reaped(WnIo *io, uint32_t evs) {
   (void)io;
   (void)evs;
-  int *sts = calloc(n_kids ? n_kids : 1, sizeof(int));
-  uint8_t *got = calloc(n_kids ? n_kids : 1, 1);
-  if (!sts || !got) abort();
-  for (uint32_t i = 0; i < n_kids; i++) {
-    Child *ch = kids[i];
-    if (!ch || ch->released || ch->reaped || ch->pid == 0) continue;
+  /* the unreaped children only, in spawn order: reaped first, all of
+   * them, then each exit queued */
+  Child *batch = NULL, **bt = &batch;
+  int sts[64];
+  int nb = 0;
+  Child *got[64];
+  for (Child **pp = &live_head; *pp;) {
+    Child *ch = *pp;
+    int st;
     pid_t r;
-    do r = waitpid(ch->pid, &sts[i], WNOHANG);
+    do r = waitpid(ch->pid, &st, WNOHANG);
     while (r < 0 && errno == EINTR);
-    if (r != ch->pid) continue;
+    if (r != ch->pid) {
+      pp = &ch->next_live;
+      continue;
+    }
+    *pp = ch->next_live;
+    if (!*pp) live_tail = pp;
+    ch->next_live = NULL;
     ch->reaped = 1;
-    got[i] = 1;
     wn_io_close(&ch->pio);
+    if (nb < 64) {
+      got[nb] = ch;
+      sts[nb++] = st;
+    } else {
+      /* a batch past 64: the rest are queued in a second pass, still in order */
+      *bt = ch;
+      bt = &ch->next_live;
+      ch->pid_status = st;
+    }
   }
-  for (uint32_t i = 0; i < n_kids; i++)
-    if (got[i] && kids[i]) exit_scope(kids[i], sts[i]);
-  free(sts);
-  free(got);
+  for (int i = 0; i < nb; i++) exit_scope(got[i], sts[i]);
+  for (Child *ch = batch; ch;) {
+    Child *n = ch->next_live;
+    ch->next_live = NULL;
+    exit_scope(ch, ch->pid_status);
+    ch = n;
+  }
 }
 
 static Child *child_of(int32_t h) {
@@ -707,6 +732,8 @@ static int32_t cp_spawn(uint32_t ptr, uint32_t len) {
     int pfd = pidfd_open_(pid);
     if (pfd < 0) wn_host_fail("cpCall: pidfd_open failed (Linux 5.3 or later is required)");
     wn_io_init(&ch->pio, pfd, child_reaped, ch);
+    *live_tail = ch;
+    live_tail = &ch->next_live;
     ch->pio.last = 1;
     wn_io_want(&ch->pio, EPOLLIN);
   } else {

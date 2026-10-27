@@ -36,6 +36,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +48,7 @@
 
 #include "mbedtls/error.h"
 #include "mbedtls/net_sockets.h"
+#include "mbedtls/oid.h"
 #include "mbedtls/ssl.h"
 #include "mbedtls/x509_crt.h"
 #include "psa/crypto.h"
@@ -619,7 +621,11 @@ typedef struct Req {
   int has_body, body_is_text;
   int redirect; /* 0 follow, 1 error, 2 manual */
   int hops, redirected;
-  /* the hop */
+  /* ── the hop: everything from hop_first_ to hop_last_ is per connection
+   * and is zeroed WHOLE at every hop (req_free_hop) — a redirect starts
+   * with no verification verdict, no parse state, nothing of the hop
+   * before it */
+  int hop_first_;
   int state;
   int https, via_proxy, tunnel;
   char *dial_host;
@@ -647,6 +653,12 @@ typedef struct Req {
   WnBuf body_raw;
   size_t chunk_left;
   int chunk_state; /* 0 size line, 1 data, 2 data CRLF, 3 trailers */
+  /* llhttp's view, as undici reads it */
+  Str cl_str;              /* every content-length value undici collected */
+  unsigned long long bytes_read;
+  size_t headers_size;     /* name and value bytes (undici's headersSize) */
+  int have_cl, have_te;
+  int hop_last_;
 } Req;
 
 static Req **reqs;
@@ -675,11 +687,11 @@ static void req_free_hop(Req *r) {
   r->status_text = NULL;
   h_free(&r->rh);
   wn_buf_free(&r->body_raw);
-  r->status = 0;
-  r->head_done = r->head_sent = r->chunked = r->until_close = r->no_body = 0;
+  free(r->cl_str.p);
+  /* everything per hop, zeroed whole (the verification verdict included) */
+  memset(&r->hop_first_, 0, offsetof(Req, hop_last_) - offsetof(Req, hop_first_));
+  r->fd = -1;
   r->clen = -1;
-  r->chunk_left = 0;
-  r->chunk_state = 0;
 }
 
 static void req_finish(Req *r) {
@@ -820,10 +832,6 @@ static void tls_verdict_fail(Req *r) {
   } else if (g == 0 && !r->top_self) {
     msg = "unable to get issuer certificate";
     code = "UNABLE_TO_GET_ISSUER_CERT";
-  } else if (g == 0 && (f & MBEDTLS_X509_BADCERT_CN_MISMATCH)) {
-    snprintf(buf, sizeof buf, "Hostname/IP does not match certificate's altnames: Host: %s. is not in the cert's altnames", r->url.host);
-    msg = buf;
-    code = "ERR_TLS_CERT_ALTNAME_INVALID";
   }
   req_fail(r, "Error", msg, code);
 }
@@ -1105,7 +1113,8 @@ static void tls_begin(Req *r) {
   mbedtls_ssl_conf_ca_chain(&r->conf, wn_trust_default(), NULL);
   mbedtls_ssl_conf_verify(&r->conf, vrfy_cb, r);
   mbedtls_ssl_setup(&r->ssl, &r->conf);
-  /* SNI and the name check for a DNS name; an IP literal gets neither */
+  /* SNI for a DNS name (an IP literal gets none); the name itself is
+   * checked by check_identity, as Node checks it, never by the engine */
   struct in6_addr a6;
   struct in_addr a4;
   if (r->url.host[0] == '[' || inet_pton(AF_INET, r->url.host, &a4) == 1 || inet_pton(AF_INET6, r->url.host, &a6) == 1)
@@ -1139,6 +1148,16 @@ static void connected(Req *r) {
 /* ── the response ─────────────────────────────────────────────────────── */
 static int hdr_cmp(const void *a, const void *b) { return strcmp(((const Hdr *)a)->name, ((const Hdr *)b)->name); }
 
+/* a byte string (undici reads the status text and the headers as latin1) */
+static void run_latin1(WnBuf *b, const char *s) {
+  size_t n = strlen(s);
+  uint16_t *u = malloc(n * 2 + 2);
+  if (!u) abort();
+  for (size_t i = 0; i < n; i++) u[i] = (unsigned char)s[i];
+  wn_buf_run16(b, u, n);
+  free(u);
+}
+
 /* the HEAD event: status text, url, type, then the header list as
  * undici's Headers iterates it — lowercase names, sorted, duplicates
  * combined with ", ", each set-cookie its own entry */
@@ -1165,15 +1184,15 @@ static void send_head(Req *r) {
       l.v[j - 1] = t;
     }
   WnBuf b = {0};
-  wn_buf_run8(&b, r->status_text, strlen(r->status_text));
+  run_latin1(&b, r->status_text);
   char *u = url_ser(&r->url, 0);
   wn_buf_run8(&b, u, strlen(u));
   free(u);
   wn_buf_run8(&b, "basic", 5);
   wn_buf_u32(&b, (uint32_t)l.n);
   for (size_t i = 0; i < l.n; i++) {
-    wn_buf_run8(&b, l.v[i].name, strlen(l.v[i].name));
-    wn_buf_run8(&b, l.v[i].value, strlen(l.v[i].value));
+    run_latin1(&b, l.v[i].name);
+    run_latin1(&b, l.v[i].value);
   }
   h_free(&l);
   int null_body = r->no_body;
@@ -1323,80 +1342,208 @@ static int follow(Req *r) {
   return 1;
 }
 
+/* a parse failure as undici reports it (Parser.createError): when undici
+ * has collected a content-length that the body read so far does not
+ * match, the ResponseContentLengthMismatchError; otherwise llhttp's
+ * reason inside "Response does not match the HTTP/1.1 protocol (...)" */
+static void http_error(Req *r, const char *reason) {
+  if (r->cl_str.n > 0) {
+    /* bytesRead !== parseInt(contentLength, 10): leading whitespace, a
+     * sign, the digits; no digits is NaN, which matches nothing */
+    const char *q = r->cl_str.p;
+    while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r' || *q == '\f' || *q == '\v') q++;
+    int neg = 0;
+    if (*q == '+' || *q == '-') neg = *q++ == '-';
+    int any = 0;
+    long double v = 0;
+    while (*q >= '0' && *q <= '9') v = v * 10 + (*q++ - '0'), any = 1;
+    if (neg) v = -v;
+    if (!any || v != (long double)r->bytes_read) {
+      req_fail(r, "ResponseContentLengthMismatchError", "Response body length does not match content-length header", "UND_ERR_RES_CONTENT_LENGTH_MISMATCH");
+      return;
+    }
+  }
+  char msg[200];
+  snprintf(msg, sizeof msg, "Response does not match the HTTP/1.1 protocol (%s)", reason);
+  req_fail(r, "HTTPParserError", msg, NULL);
+}
+
+#define MAX_HEADERS_SIZE 16384 /* http.maxHeaderSize, undici's default */
+
+/* the status line, as llhttp reads a response's; NULL or the reason */
+static const char *status_line(Req *r, const char *p, size_t n, int *status, char **reason) {
+  size_t i = 0;
+  if (n < 5 || memcmp(p, "HTTP/", 5) != 0) return "Expected HTTP/, RTSP/ or ICE/";
+  i = 5;
+  if (i >= n || p[i] < '0' || p[i] > '9') return "Invalid major version";
+  i++;
+  if (i >= n || p[i] != '.') return "Expected dot";
+  i++;
+  if (i >= n || p[i] < '0' || p[i] > '9') return "Invalid minor version";
+  i++;
+  if (i >= n || p[i] != ' ') return "Expected space after version";
+  i++;
+  int code = 0, digits = 0;
+  while (i < n && p[i] >= '0' && p[i] <= '9' && digits < 3) code = code * 10 + (p[i++] - '0'), digits++;
+  if (digits < 3) return "Invalid status code";
+  if (i < n && p[i] != ' ' && p[i] != '\r') return "Invalid response status";
+  if (i >= n) return "Invalid response status";
+  const char *rs = p + i;
+  if (*rs == ' ') rs++;
+  const char *cr = memchr(rs, '\r', (size_t)(p + n - rs));
+  if (!cr || cr + 1 != p + n - 1) return "Missing expected CR after response line";
+  (void)r;
+  *status = code;
+  *reason = xstrndup(rs, (size_t)(cr - rs));
+  return NULL;
+}
+
+/* one header line (without its LF); NULL or the reason */
+static const char *header_line(Req *r, const char *p, size_t n) {
+  if (n == 0 || p[n - 1] != '\r') return "Missing expected CR after header value";
+  n--;
+  if (n > 0 && (p[0] == ' ' || p[0] == '\t')) return "Unexpected whitespace after header value";
+  size_t c = 0;
+  while (c < n && p[c] != ':') {
+    unsigned char ch = (unsigned char)p[c];
+    if (!(ch > 0x20 && ch < 0x7f && !strchr("\"(),/:;<=>?@[\\]{}", ch))) return "Invalid header token";
+    c++;
+  }
+  if (c == n || c == 0) return "Invalid header token";
+  size_t v = c + 1;
+  while (v < n && (p[v] == ' ' || p[v] == '\t')) v++;
+  for (size_t k = v; k < n; k++) {
+    unsigned char ch = (unsigned char)p[k];
+    if ((ch < 0x20 && ch != '\t')) return "Invalid header value char";
+  }
+  char *name = xstrndup(p, c);
+  char *value = xstrndup(p + v, n - v);
+  r->headers_size += c + (n - v);
+  const char *bad = NULL;
+  if (!strcasecmp(name, "content-length")) {
+    if (r->have_cl) bad = "Duplicate Content-Length";
+    else {
+      r->have_cl = 1;
+      unsigned long long acc = 0;
+      size_t k = 0;
+      for (; k < strlen(value) && value[k] >= '0' && value[k] <= '9'; k++) {
+        unsigned d = (unsigned)(value[k] - '0');
+        if (acc > (18446744073709551615ULL - d) / 10) {
+          s_put(&r->cl_str, value, k);
+          bad = "Content-Length overflow";
+          break;
+        }
+        acc = acc * 10 + d;
+      }
+      if (!bad) {
+        size_t t = k;
+        while (t < strlen(value) && (value[t] == ' ' || value[t] == '\t')) t++;
+        if (k == 0 || t != strlen(value)) {
+          s_put(&r->cl_str, value, k);
+          bad = "Invalid character in Content-Length";
+        } else {
+          s_cat(&r->cl_str, value);
+          r->clen = (long long)acc;
+        }
+      }
+    }
+  } else if (!strcasecmp(name, "transfer-encoding")) {
+    r->have_te = 1;
+    /* chunked only as the final coding */
+    const char *last = strrchr(value, ',');
+    last = last ? last + 1 : value;
+    while (*last == ' ' || *last == '\t') last++;
+    size_t ll = strlen(last);
+    while (ll && (last[ll - 1] == ' ' || last[ll - 1] == '\t')) ll--;
+    r->chunked = ll == 7 && !strncasecmp(last, "chunked", 7);
+  }
+  if (!bad) h_add(&r->rh, name, value);
+  free(name);
+  free(value);
+  return bad;
+}
+
 /* parses what has arrived; returns after the request moved on */
 static void parse_in(Req *r, int eof) {
   for (;;) {
     if (r->dead) return;
     if (!r->head_done) {
-      uint8_t *p = r->in.p;
-      size_t n = r->in.n;
-      size_t he = 0, skip = 0;
-      for (size_t i = 0; i + 1 < n; i++) {
-        if (p[i] == '\n' && p[i + 1] == '\n') {
-          he = i;
-          skip = 2;
-          break;
+      /* line by line, each line checked as it completes */
+      for (;;) {
+        uint8_t *p = r->in.p;
+        size_t n = r->in.n;
+        uint8_t *lf = n ? memchr(p, '\n', n) : NULL;
+        if (!lf) {
+          if (r->status != 0 && r->headers_size + n >= MAX_HEADERS_SIZE) {
+            req_fail(r, "HeadersOverflowError", "Headers Overflow Error", "UND_ERR_HEADERS_OVERFLOW");
+            return;
+          }
+          if (eof) req_fail(r, "SocketError", "other side closed", "UND_ERR_SOCKET");
+          return;
         }
-        if (i + 3 < n && p[i] == '\r' && p[i + 1] == '\n' && p[i + 2] == '\r' && p[i + 3] == '\n') {
-          he = i;
-          skip = 4;
-          break;
+        size_t ll = (size_t)(lf - p);
+        char *line = xstrndup((char *)p, ll + 1);
+        memmove(r->in.p, r->in.p + ll + 1, n - ll - 1);
+        r->in.n = n - ll - 1;
+        const char *bad = NULL;
+        if (r->status == 0) {
+          int st = 0;
+          char *reason = NULL;
+          bad = status_line(r, line, ll + 1, &st, &reason);
+          if (!bad) {
+            r->status = st;
+            free(r->status_text);
+            r->status_text = reason;
+            h_free(&r->rh);
+          }
+        } else if (ll == 1 && line[0] == '\r') {
+          free(line);
+          break; /* the end of the head */
+        } else if (ll == 0) {
+          bad = "Missing expected CR after header value";
+        } else {
+          bad = header_line(r, line, ll);
+          if (!bad && r->headers_size >= MAX_HEADERS_SIZE) {
+            free(line);
+            req_fail(r, "HeadersOverflowError", "Headers Overflow Error", "UND_ERR_HEADERS_OVERFLOW");
+            return;
+          }
+        }
+        free(line);
+        if (bad) {
+          http_error(r, bad);
+          return;
         }
       }
-      if (!skip) {
-        if (eof) req_fail(r, "SocketError", "other side closed", "UND_ERR_SOCKET");
+      int status = r->status;
+      if (status < 100) {
+        req_fail(r, "AssertionError", "The expression evaluated to a falsy value:\n\n  assert(statusCode >= 100)\n", "ERR_ASSERTION");
         return;
       }
-      char *head = xstrndup((char *)p, he);
-      size_t used = he + skip;
-      memmove(r->in.p, r->in.p + used, n - used);
-      r->in.n = n - used;
-      /* status line */
-      char *line = strtok(head, "\n");
-      int status = 0;
-      char reason[256] = "";
-      if (!line || strncmp(line, "HTTP/1.", 7) != 0 || sscanf(line + 9, "%d", &status) != 1) {
-        free(head);
-        req_fail(r, "Error", "Parse Error: Invalid status code", "HPE_INVALID_STATUS");
+      if (r->have_cl && r->have_te) {
+        http_error(r, "Content-Length can't be present with Transfer-Encoding");
         return;
       }
-      const char *rs = line + 12;
-      while (*rs == ' ') rs++;
-      snprintf(reason, sizeof reason, "%s", rs);
-      size_t rl = strlen(reason);
-      while (rl && (reason[rl - 1] == '\r' || reason[rl - 1] == ' ')) reason[--rl] = 0;
-      h_free(&r->rh);
-      for (char *l = strtok(NULL, "\n"); l; l = strtok(NULL, "\n")) {
-        size_t ll = strlen(l);
-        if (ll && l[ll - 1] == '\r') l[--ll] = 0;
-        char *c = strchr(l, ':');
-        if (!c) continue;
-        *c = 0;
-        char *v = c + 1;
-        while (*v == ' ' || *v == '\t') v++;
-        char *e = v + strlen(v);
-        while (e > v && (e[-1] == ' ' || e[-1] == '\t')) *--e = 0;
-        h_add(&r->rh, l, v);
+      if (status < 200 && status != 101) {
+        /* an informational response: the next head follows */
+        r->status = 0;
+        r->headers_size = 0;
+        r->have_cl = r->have_te = r->chunked = 0;
+        r->clen = -1;
+        free(r->cl_str.p);
+        memset(&r->cl_str, 0, sizeof r->cl_str);
+        h_free(&r->rh);
+        continue;
       }
-      free(head);
-      if (status >= 100 && status < 200 && status != 101) continue; /* an informational response */
-      r->status = status;
-      free(r->status_text);
-      r->status_text = xstrdup(reason);
       r->head_done = 1;
       r->no_body = !strcmp(r->method, "HEAD") || status == 204 || status == 205 || status == 304 || status == 101 || status == 103;
-      Hdr *te = h_find(&r->rh, "transfer-encoding");
-      Hdr *cl = h_find(&r->rh, "content-length");
-      r->clen = -1;
-      if (r->no_body && strcmp(r->method, "HEAD") && status != 205) {
+      if (r->no_body) {
         r->clen = 0;
-      } else if (!strcmp(r->method, "HEAD") || status == 204 || status == 304) {
-        r->clen = 0;
-      } else if (te && strcasestr(te->value, "chunked")) {
-        r->chunked = 1;
-      } else if (cl) {
-        r->clen = atoll(cl->value);
-      } else {
+        r->chunked = 0;
+      } else if (r->chunked) {
+        r->clen = -1;
+      } else if (r->have_te || r->clen < 0) {
+        r->clen = -1;
         r->until_close = 1;
       }
       int redirect_hop = is_redirect(status) && h_find(&r->rh, "location") && r->redirect != 2;
@@ -1406,30 +1553,65 @@ static void parse_in(Req *r, int eof) {
     /* the body */
     if (r->chunked) {
       for (;;) {
-        if (r->chunk_state == 0 || r->chunk_state == 3) {
+        if (r->chunk_state == 0) {
+          /* the size line: hex digits, then extensions, then CRLF */
+          size_t i = 0;
+          unsigned long long size = 0;
+          int digits = 0;
+          while (i < r->in.n && isxdigit(r->in.p[i])) {
+            if (size >> 60) {
+              http_error(r, "Chunk size overflow");
+              return;
+            }
+            size = size * 16 + (unsigned)hexv(r->in.p[i]);
+            i++, digits++;
+          }
+          if (i == r->in.n) {
+            if (eof) goto cut;
+            return;
+          }
+          if (digits == 0) {
+            http_error(r, "Invalid character in chunk size");
+            return;
+          }
+          uint8_t c = r->in.p[i];
+          if (c != '\r' && c != ';' && c != ' ' && c != '\t') {
+            http_error(r, "Invalid character in chunk size");
+            return;
+          }
+          uint8_t *nl = memchr(r->in.p + i, '\n', r->in.n - i);
+          if (!nl) {
+            if (eof) goto cut;
+            return;
+          }
+          if (nl == r->in.p || nl[-1] != '\r') {
+            http_error(r, "Missing expected CR after chunk size");
+            return;
+          }
+          size_t ll = (size_t)(nl - r->in.p) + 1;
+          memmove(r->in.p, r->in.p + ll, r->in.n - ll);
+          r->in.n -= ll;
+          r->chunk_left = (size_t)size;
+          r->chunk_state = size == 0 ? 3 : 1;
+          continue;
+        }
+        if (r->chunk_state == 3) {
           uint8_t *nl = memchr(r->in.p, '\n', r->in.n);
           if (!nl) {
             if (eof) goto cut;
             return;
           }
           size_t ll = (size_t)(nl - r->in.p) + 1;
-          char *line = xstrndup((char *)r->in.p, ll);
+          int empty = ll == 2 && r->in.p[0] == '\r';
           memmove(r->in.p, r->in.p + ll, r->in.n - ll);
           r->in.n -= ll;
-          if (r->chunk_state == 3) {
-            int empty = line[0] == '\r' || line[0] == '\n';
-            free(line);
-            if (empty) goto complete;
-            continue;
-          }
-          r->chunk_left = strtoull(line, NULL, 16);
-          free(line);
-          r->chunk_state = r->chunk_left == 0 ? 3 : 1;
-          continue;
+          if (empty) goto complete;
+          continue; /* a trailer */
         }
         if (r->chunk_state == 1) {
           size_t k = r->in.n < r->chunk_left ? r->in.n : r->chunk_left;
           wn_buf_put(&r->body_raw, r->in.p, k);
+          r->bytes_read += k;
           memmove(r->in.p, r->in.p + k, r->in.n - k);
           r->in.n -= k;
           r->chunk_left -= k;
@@ -1440,30 +1622,38 @@ static void parse_in(Req *r, int eof) {
           r->chunk_state = 2;
         }
         if (r->chunk_state == 2) {
-          uint8_t *nl = memchr(r->in.p, '\n', r->in.n);
-          if (!nl) {
+          if (r->in.n < 2) {
+            if (r->in.n == 1 && r->in.p[0] != '\r') {
+              http_error(r, "Expected LF after chunk data");
+              return;
+            }
             if (eof) goto cut;
             return;
           }
-          size_t ll = (size_t)(nl - r->in.p) + 1;
-          memmove(r->in.p, r->in.p + ll, r->in.n - ll);
-          r->in.n -= ll;
+          if (r->in.p[0] != '\r' || r->in.p[1] != '\n') {
+            http_error(r, "Expected LF after chunk data");
+            return;
+          }
+          memmove(r->in.p, r->in.p + 2, r->in.n - 2);
+          r->in.n -= 2;
           r->chunk_state = 0;
         }
       }
     }
     if (r->clen >= 0) {
-      size_t need = (size_t)r->clen - r->body_raw.n;
-      size_t k = r->in.n < need ? r->in.n : need;
+      unsigned long long need = (unsigned long long)r->clen - r->bytes_read;
+      size_t k = (unsigned long long)r->in.n < need ? r->in.n : (size_t)need;
       wn_buf_put(&r->body_raw, r->in.p, k);
+      r->bytes_read += k;
       memmove(r->in.p, r->in.p + k, r->in.n - k);
       r->in.n -= k;
-      if (r->body_raw.n >= (size_t)r->clen) goto complete;
+      if (r->bytes_read >= (unsigned long long)r->clen) goto complete;
       if (eof) goto cut;
       return;
     }
     /* until close */
     wn_buf_put(&r->body_raw, r->in.p, r->in.n);
+    r->bytes_read += r->in.n;
     r->in.n = 0;
     if (eof) goto complete;
     return;
@@ -1498,6 +1688,185 @@ static void on_proxy_reply(Req *r) {
     }
 }
 
+/* Node's tls.checkServerIdentity, which undici's connections run: an IP
+ * literal must be one of the certificate's IP-address names (never the
+ * CN); a DNS name one of its DNS names (RFC 6125 wildcards: one, in the
+ * leftmost label, never for a two-label pattern nor an xn-- label), or —
+ * only with no DNS names — its CN. 1 when it matches; otherwise the
+ * request fails with ERR_TLS_CERT_ALTNAME_INVALID and Node's reason. */
+static int split_host(const char *h, char ***parts) {
+  char *c = xstrdup(h);
+  size_t n = strlen(c);
+  if (n && c[n - 1] == '.') c[--n] = 0;
+  for (char *q = c; *q; q++)
+    if (*q >= 'A' && *q <= 'Z') *q = (char)(*q - 'A' + 'a');
+  int k = 1;
+  for (char *q = c; *q; q++)
+    if (*q == '.') k++;
+  char **v = calloc((size_t)k + 1, sizeof *v);
+  if (!v) abort();
+  int i = 0;
+  char *start = c;
+  for (char *q = c;; q++)
+    if (*q == '.' || *q == 0) {
+      int end = *q == 0;
+      *q = 0;
+      v[i++] = xstrdup(start);
+      start = q + 1;
+      if (end) break;
+    }
+  free(c);
+  *parts = v;
+  return i;
+}
+static void free_parts(char **v, int n) {
+  for (int i = 0; i < n; i++) free(v[i]);
+  free(v);
+}
+static int wild_match(char **hp, int hn, const char *pattern) {
+  if (!pattern || !*pattern) return 0;
+  char **pp;
+  int pn = split_host(pattern, &pp);
+  int ok = 0;
+  if (pn != hn) goto out;
+  for (int i = 0; i < pn; i++) {
+    if (!*pp[i]) goto out;
+    for (const char *q = pp[i]; *q; q++)
+      if ((unsigned char)*q < 0x21 || (unsigned char)*q > 0x7f) goto out;
+  }
+  for (int i = hn - 1; i > 0; i--)
+    if (strcmp(hp[i], pp[i]) != 0) goto out;
+  {
+    const char *ps = pp[0], *hs = hp[0];
+    const char *star = strchr(ps, '*');
+    if (!star || strstr(ps, "xn--")) {
+      ok = strcmp(hs, ps) == 0;
+      goto out;
+    }
+    if (strchr(star + 1, '*')) goto out;
+    if (pn <= 2) goto out;
+    size_t pre = (size_t)(star - ps), suf = strlen(star + 1), hl = strlen(hs);
+    if (pre + suf > hl) goto out;
+    if (strncmp(hs, ps, pre) != 0) goto out;
+    if (strcmp(hs + hl - suf, star + 1) != 0) goto out;
+    ok = 1;
+  }
+out:
+  free_parts(pp, pn);
+  return ok;
+}
+static int check_identity(Req *r) {
+  const mbedtls_x509_crt *peer = mbedtls_ssl_get_peer_cert(&r->ssl);
+  if (!peer) return 1;
+  char host[300];
+  snprintf(host, sizeof host, "%s", r->url.host);
+  if (host[0] == '[') {
+    memmove(host, host + 1, strlen(host));
+    host[strlen(host) - 1] = 0;
+  }
+  size_t hl = strlen(host);
+  if (hl && host[hl - 1] == '.') host[--hl] = 0;
+  /* the altnames as Node prints them, and the DNS and IP lists */
+  Str alt = {0}, ips = {0};
+  char **dns = NULL;
+  int ndns = 0, nips = 0;
+  for (const mbedtls_x509_sequence *cur = &peer->subject_alt_names; cur && cur->buf.p; cur = cur->next) {
+    mbedtls_x509_subject_alternative_name san;
+    if (mbedtls_x509_parse_subject_alt_name(&cur->buf, &san) != 0) continue;
+    const mbedtls_x509_buf *u = &san.san.unstructured_name;
+    char item[512] = "";
+    if (san.type == MBEDTLS_X509_SAN_DNS_NAME) {
+      char *d = xstrndup((const char *)u->p, u->len);
+      snprintf(item, sizeof item, "DNS:%s", d);
+      dns = realloc(dns, sizeof *dns * (size_t)(ndns + 1));
+      if (!dns) abort();
+      dns[ndns++] = d;
+    } else if (san.type == MBEDTLS_X509_SAN_IP_ADDRESS && (u->len == 4 || u->len == 16)) {
+      char ip[INET6_ADDRSTRLEN];
+      inet_ntop(u->len == 4 ? AF_INET : AF_INET6, u->p, ip, sizeof ip);
+      snprintf(item, sizeof item, "IP Address:%s", ip);
+      if (nips++) s_cat(&ips, ", ");
+      s_cat(&ips, ip);
+    } else if (san.type == MBEDTLS_X509_SAN_RFC822_NAME) {
+      snprintf(item, sizeof item, "email:%.*s", (int)u->len, (const char *)u->p);
+    } else if (san.type == MBEDTLS_X509_SAN_UNIFORM_RESOURCE_IDENTIFIER) {
+      snprintf(item, sizeof item, "URI:%.*s", (int)u->len, (const char *)u->p);
+    }
+    mbedtls_x509_free_subject_alt_name(&san);
+    if (!*item) continue;
+    if (alt.n) s_cat(&alt, ", ");
+    s_cat(&alt, item);
+  }
+  char *cn = NULL;
+  for (const mbedtls_x509_name *nm = &peer->subject; nm; nm = nm->next)
+    if (nm->oid.p && MBEDTLS_OID_CMP(MBEDTLS_OID_AT_CN, &nm->oid) == 0) {
+      free(cn);
+      cn = xstrndup((const char *)nm->val.p, nm->val.len);
+    }
+  int valid = 0;
+  Str reason = {0};
+  struct in6_addr a6, b6;
+  struct in_addr a4;
+  int is4 = inet_pton(AF_INET, host, &a4) == 1, is6 = !is4 && inet_pton(AF_INET6, host, &a6) == 1;
+  if (is4 || is6) {
+    for (const mbedtls_x509_sequence *cur = &peer->subject_alt_names; cur && cur->buf.p && !valid; cur = cur->next) {
+      mbedtls_x509_subject_alternative_name san;
+      if (mbedtls_x509_parse_subject_alt_name(&cur->buf, &san) != 0) continue;
+      const mbedtls_x509_buf *u = &san.san.unstructured_name;
+      if (san.type == MBEDTLS_X509_SAN_IP_ADDRESS) {
+        if (is4 && u->len == 4 && memcmp(u->p, &a4, 4) == 0) valid = 1;
+        if (is6 && u->len == 16) {
+          memcpy(&b6, u->p, 16);
+          if (memcmp(&a6, &b6, 16) == 0) valid = 1;
+        }
+      }
+      mbedtls_x509_free_subject_alt_name(&san);
+    }
+    if (!valid) {
+      s_cat(&reason, "IP: ");
+      s_cat(&reason, host);
+      s_cat(&reason, " is not in the cert's list: ");
+      if (ips.p) s_cat(&reason, ips.p);
+    }
+  } else if (ndns > 0 || (cn && *cn)) {
+    char **hp;
+    int hn = split_host(host, &hp);
+    if (ndns > 0) {
+      for (int i = 0; i < ndns && !valid; i++) valid = wild_match(hp, hn, dns[i]);
+      if (!valid) {
+        s_cat(&reason, "Host: ");
+        s_cat(&reason, host);
+        s_cat(&reason, ". is not in the cert's altnames: ");
+        if (alt.p) s_cat(&reason, alt.p);
+      }
+    } else {
+      valid = wild_match(hp, hn, cn);
+      if (!valid) {
+        s_cat(&reason, "Host: ");
+        s_cat(&reason, host);
+        s_cat(&reason, ". is not cert's CN: ");
+        s_cat(&reason, cn);
+      }
+    }
+    free_parts(hp, hn);
+  } else
+    s_cat(&reason, "Cert does not contain a DNS name");
+  for (int i = 0; i < ndns; i++) free(dns[i]);
+  free(dns);
+  free(cn);
+  free(alt.p);
+  free(ips.p);
+  if (!valid) {
+    Str m = {0};
+    s_cat(&m, "Hostname/IP does not match certificate's altnames: ");
+    s_cat(&m, reason.p ? reason.p : "");
+    req_fail(r, "Error", m.p, "ERR_TLS_CERT_ALTNAME_INVALID");
+    free(m.p);
+  }
+  free(reason.p);
+  return valid;
+}
+
 static void tls_pump(Req *r) {
   if (r->state == ST_TLS) {
     int k = mbedtls_ssl_handshake(&r->ssl);
@@ -1513,11 +1882,14 @@ static void tls_pump(Req *r) {
       req_fail(r, "Error", msg, "ERR_SSL_SSL_HANDSHAKE_FAILURE");
       return;
     }
-    uint32_t f = mbedtls_ssl_get_verify_result(&r->ssl);
+    /* the chain first, then the name (Node's order); the engine's own
+     * name check is never consulted */
+    uint32_t f = mbedtls_ssl_get_verify_result(&r->ssl) & ~(uint32_t)MBEDTLS_X509_BADCERT_CN_MISMATCH;
     if (f != 0 || !r->top_self) {
       tls_verdict_fail(r);
       return;
     }
+    if (!check_identity(r)) return;
     write_head(r);
     r->state = ST_HEAD;
   }

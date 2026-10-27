@@ -109,7 +109,14 @@ typedef struct {
   uint8_t *rbuf;
   size_t rlen, roff;
   int reads_left, raw_eof, raw_err;
+  /* plaintext a WRITE handed over that the engine has not taken yet (it
+   * answered WANT_READ / WANT_WRITE): taken as the engine can */
+  WnBuf wp;
+  size_t wp_off;
 } Tls;
+
+enum { EV_WRITE_DONE = 6 };
+static void flush_plain(WnSock *s);
 
 static int bio_send(void *ctx, const unsigned char *buf, size_t len) {
   WnSock *s = ctx;
@@ -262,8 +269,18 @@ static void pump(WnSock *s) {
     wn_sock_push(s, EV_SECURE, 0, b.p, (uint32_t)b.n);
     wn_buf_free(&b);
   }
+  flush_plain(s);
+  if (t->dead) return;
   static unsigned char buf[16384];
   for (;;) {
+    /* after the handshake the engine reads only while the module does
+     * (Node's TLSWrap passes readStop down to the socket): what the peer
+     * sends meanwhile waits in the kernel, back-pressuring it */
+    if (!s->reading) {
+      s->tls_reads = 0;
+      wn_sock_update(s);
+      return;
+    }
     int r = mbedtls_ssl_read(&t->ssl, buf, sizeof buf);
     if (r > 0) {
       wn_sock_queue_read(s, EV_DATA, 0, buf, (uint32_t)r);
@@ -291,6 +308,35 @@ static void t_readable(WnSock *s) {
 static void t_writable(WnSock *s) {
   Tls *t = s->tctx;
   if (!t->handshaken) pump(s);
+  else flush_plain(s);
+}
+/* hands the engine what it has not taken yet; a WRITE whose plaintext is
+ * all taken and whose records are all sent completes */
+static void flush_plain(WnSock *s) {
+  Tls *t = s->tctx;
+  while (!t->dead && t->wp_off < t->wp.n) {
+    int r = mbedtls_ssl_write(&t->ssl, t->wp.p + t->wp_off, t->wp.n - t->wp_off);
+    if (r >= 0) {
+      t->wp_off += (size_t)r;
+      continue;
+    }
+    if (r == MBEDTLS_ERR_SSL_WANT_WRITE || r == MBEDTLS_ERR_SSL_WANT_READ) return;
+    t->wp.n = t->wp_off = 0;
+    if (s->pending_write) {
+      s->pending_write = 0;
+      wn_sock_push(s, EV_WRITE_DONE, r == MBEDTLS_ERR_NET_CONN_RESET ? -ECONNRESET : -EPIPE, NULL, 0);
+    }
+    return;
+  }
+  if (t->wp.n) t->wp.n = t->wp_off = 0;
+  if (s->pending_write && !wn_sock_out_pending(s)) {
+    s->pending_write = 0;
+    wn_sock_push(s, EV_WRITE_DONE, 0, NULL, 0);
+  }
+}
+static int t_busy(WnSock *s) {
+  Tls *t = s->tctx;
+  return t->wp_off < t->wp.n;
 }
 static void t_connected(WnSock *s) { pump(s); }
 static int32_t t_write(WnSock *s, const uint8_t *p, size_t n) {
@@ -303,7 +349,12 @@ static int32_t t_write(WnSock *s, const uint8_t *p, size_t n) {
       off += (size_t)r;
       continue;
     }
-    if (r == MBEDTLS_ERR_SSL_WANT_WRITE || r == MBEDTLS_ERR_SSL_WANT_READ) continue;
+    if (r == MBEDTLS_ERR_SSL_WANT_WRITE || r == MBEDTLS_ERR_SSL_WANT_READ) {
+      /* the engine cannot take more now (never a spin): the rest waits,
+       * and the WRITE completes when it is taken and sent */
+      wn_buf_put(&t->wp, p + off, n - off);
+      return 1;
+    }
     return r == MBEDTLS_ERR_NET_CONN_RESET ? -ECONNRESET : -EPIPE;
   }
   return wn_sock_out_pending(s) ? 1 : 0;
@@ -316,7 +367,18 @@ static void t_shutdown(WnSock *s) {
   }
   wn_sock_shutdown_after_drain(s);
 }
-static void t_read_start(WnSock *s) { (void)s; }
+static void t_read_start(WnSock *s) {
+  Tls *t = s->tctx;
+  if (t->dead) return;
+  s->tls_reads = 1;
+  /* what the engine already holds flows now; the descriptor is read again */
+  if (t->handshaken) pump(s);
+  wn_sock_update(s);
+}
+static void t_read_stop(WnSock *s) {
+  Tls *t = s->tctx;
+  if (t->handshaken && !t->dead) s->tls_reads = 0;
+}
 static void t_free(WnSock *s) {
   Tls *t = s->tctx;
   if (!t) return;
@@ -324,10 +386,11 @@ static void t_free(WnSock *s) {
   mbedtls_ssl_config_free(&t->conf);
   mbedtls_x509_crt_free(&t->chain);
   free(t->rbuf);
+  wn_buf_free(&t->wp);
   free(t);
   s->tctx = NULL;
 }
-static const WnTlsOps OPS = {t_readable, t_writable, t_connected, t_write, t_shutdown, t_read_start, t_free};
+static const WnTlsOps OPS = {t_readable, t_writable, t_connected, t_write, t_shutdown, t_read_start, t_read_stop, t_busy, t_free};
 
 /* appends every certificate of `from` to `to` */
 static void chain_add(mbedtls_x509_crt *to, const mbedtls_x509_crt *from) {

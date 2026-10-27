@@ -8297,9 +8297,10 @@ cannot step over it: the translation is compiled with
 program whose live heap passes V8's limit (Node aborts with a fatal
 out-of-memory error) keeps running here.
 
-(d) **Trap text.** A trap other than the module's own `unreachable` (the
-uncaught-error path, which has already printed its report — S007, S010)
-prints V8's own RuntimeError text for that trap (`divide by zero`,
+(d) **Trap text.** Every trap prints V8's own RuntimeError text for it —
+the module's own `unreachable` included (`RuntimeError: unreachable`, after
+the uncaught-error report the module has already printed on that path —
+S007, S010), and the others (`divide by zero`,
 `divide result unrepresentable`, `remainder by zero`, `float
 unrepresentable in integer range`, `memory access out of bounds`, `data
 segment out of bounds`, `requested new array is too large` past V8's own
@@ -8405,9 +8406,19 @@ pool shows only to the server); `br` and `zstd` bodies are delivered as
 they came (undici decodes them); a host name holding a non-ASCII character
 is "Invalid URL" (no IDNA); a proxied `http:` request is an absolute-URI
 request (undici tunnels it with CONNECT; `https:` is tunnelled here too);
-undici's process warnings (a lowercase `patch`) are not printed; there is
-no connect timeout (undici's is 10 s); TLS verification is (g)'s engine,
-over (g)'s default store (Node's).
+undici's process warnings (a lowercase `patch`) are not printed; there are
+no connect, headers or body timeouts (undici's are 10 s, 300 s and 300 s:
+a server that stalls holds the request until the program aborts it); TLS
+verification is (g)'s engine, over (g)'s default store (Node's), and the
+host name is checked as Node's `tls.checkServerIdentity` checks it (an IP
+literal against the certificate's IP-address names, a DNS name against its
+DNS names with RFC 6125 wildcards, or its CN when it has none). A response
+is read as llhttp and undici read it — the status line, header tokens and
+values, Content-Length (undici's mismatch error where it has collected a
+length the body does not match), chunk framing and the 16 KiB header limit
+fail with their messages ("Response does not match the HTTP/1.1 protocol
+(...)", "Headers Overflow Error"); llhttp's rarer reasons are this host's
+nearest wording.
 
 (i) **The translator trusts a valid module.** `wasm2c` assumes the
 module's types and stack discipline hold; the lane validates every module

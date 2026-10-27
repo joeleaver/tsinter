@@ -421,7 +421,13 @@ void wn_ev_hold(int delta) {
 }
 
 static void stdin_round(void);
-int wn_reserve_fd = -2; /* the net unit's EMFILE reserve (wn_net.c) */
+static void sig_init(void);
+void wn_ev_init(void) {
+  ep_init();
+  post_init();
+  sig_init();
+}
+int wn_reserve_fd = -1; /* the net unit's EMFILE reserve (wn_net.c) */
 
 /* WN_FD_AUDIT: the descriptors open at the program's normal end, beyond
  * 0-2 and the host's own (the poller, the wake descriptor, the signal
@@ -656,6 +662,13 @@ int32_t host_watchCall(int32_t op, int32_t ptr, int32_t len, int32_t h) {
 /* ── stdin (abi.ts stdinCall; uv_read_start / uv_read_stop on fd 0) ───── */
 static WnIo in_io;
 static int in_init, in_reading, in_eof;
+static int in_flags = -1;
+/* libuv opens a pipe or socket stdin non-blocking (uv_pipe_open); the
+ * descriptor's description is shared with whoever else holds it, so its
+ * flags go back as they were at exit (Node resets its stdio too) */
+static void in_restore(void) {
+  if (in_flags >= 0) fcntl(0, F_SETFL, in_flags);
+}
 static WnEv *in_held;
 
 static void in_read_once(void) {
@@ -691,7 +704,14 @@ int32_t host_stdinCall(int32_t op) {
     if (!in_init) {
       in_init = 1;
       wn_io_init(&in_io, 0, in_ready, NULL);
-      if (fcntl(0, F_GETFL) < 0) {
+      struct stat st;
+      int fl = fcntl(0, F_GETFL);
+      if (fl >= 0 && fstat(0, &st) == 0 && (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode)) && !(fl & O_NONBLOCK)) {
+        in_flags = fl;
+        atexit(in_restore);
+        fcntl(0, F_SETFL, fl | O_NONBLOCK);
+      }
+      if (fl < 0) {
         /* no fd 0 at all: Node reads /dev/null there — end of file */
         in_reading = 1;
         in_eof = 1;

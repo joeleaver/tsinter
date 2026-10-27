@@ -177,6 +177,21 @@ async function isWholeElf(p: string, executable: boolean): Promise<boolean> {
     return false;
   }
 }
+/** Publishes a freshly built cache directory: renamed into place when
+ * there is none; when another process published one first and it is whole,
+ * that one stays (ours is dropped by the caller's cleanup); only a
+ * directory found BROKEN at that moment is swapped out — moved aside by
+ * rename, never removed in place, so a reader holding a good published
+ * directory is never left with nothing (#323). */
+async function publishDir(build: string, dir: string, files: string[]): Promise<void> {
+  if (await rename(build, dir).then(() => true, () => false)) return;
+  const whole = async (): Promise<boolean> => (await Promise.all(files.map((f) => isWholeElf(join(dir, f), false)))).every(Boolean);
+  if (await whole()) return;
+  const stale = `${dir}.stale-${process.pid}-${Math.random().toString(36).slice(2)}`;
+  if (!(await rename(dir, stale).then(() => true, () => false))) return;
+  await rename(build, dir).catch(() => undefined);
+  await rm(stale, { recursive: true, force: true });
+}
 async function digestOf(p: string): Promise<string> {
   const b = await readFile(p);
   return `${b.length} ${createHash("sha256").update(b).digest("hex")}`;
@@ -201,9 +216,6 @@ async function ensureRunnerObjects(sanitize: boolean): Promise<string[]> {
   const dir = join(cacheRoot, `wasmnative-${key}-${flavor}`);
   const objs = RUNNER_SOURCES.map((s) => join(dir, s.replace(/\.c$/, ".o")));
   if ((await Promise.all(objs.map((o) => isWholeElf(o, false)))).every(Boolean)) return objs;
-  // a directory holding a broken object (an older publish, before #323):
-  // gone, then rebuilt
-  if (await stat(dir).then(() => true, () => false)) await rm(dir, { recursive: true, force: true });
   await mkdir(cacheRoot, { recursive: true });
   const build = await mkdtemp(join(cacheRoot, `build-wasmnative-${flavor}-`));
   try {
@@ -227,7 +239,7 @@ async function ensureRunnerObjects(sanitize: boolean): Promise<string[]> {
     if (!(await Promise.all(built.map((o) => isWholeElf(o, false)))).every(Boolean)) {
       throw new Error("wasm-native: the compiler left a runner object that is not a whole ELF file");
     }
-    await rename(build, dir).catch(() => undefined);
+    await publishDir(build, dir, objs.map((o) => o.slice(dir.length + 1)));
   } finally {
     await rm(build, { recursive: true, force: true });
   }
@@ -246,7 +258,6 @@ async function ensureRootsObject(): Promise<string> {
   const dir = join(cacheRoot, `wasmnative-roots-${key}`);
   const obj = join(dir, "wn_roots.o");
   if (await isWholeElf(obj, false)) return obj;
-  if (await stat(dir).then(() => true, () => false)) await rm(dir, { recursive: true, force: true });
   await mkdir(cacheRoot, { recursive: true });
   const build = await mkdtemp(join(cacheRoot, "build-wasmnative-roots-"));
   try {
@@ -262,7 +273,7 @@ const unsigned int wn_tls_roots_len = ${bytes.length};
     await writeFile(join(build, "wn_roots.c"), c);
     await execFileAsync(driver.argv[0] ?? "clang", [...driver.argv.slice(1), "-O0", "-w", ...driver.targetArgs, "-c", join(build, "wn_roots.c"), "-o", join(build, "wn_roots.o")], { maxBuffer: 64 << 20 });
     if (!(await isWholeElf(join(build, "wn_roots.o"), false))) throw new Error("wasm-native: the compiler left a roots object that is not a whole ELF file");
-    await rename(build, dir).catch(() => undefined);
+    await publishDir(build, dir, ["wn_roots.o"]);
   } finally {
     await rm(build, { recursive: true, force: true });
   }
@@ -348,8 +359,8 @@ export async function compileWasmNative(opts: { cPath: string; outPath: string; 
         await utimes(cached, now, now).catch(() => undefined);
         return;
       }
-      await rm(cached, { force: true });
-      await rm(`${cached}.ok`, { force: true });
+      // not whole (or mid-publish by another process): rebuilt below and
+      // published over it by rename — never deleted in place (#323)
     }
   }
   // the link goes to a temporary name; the output appears only whole

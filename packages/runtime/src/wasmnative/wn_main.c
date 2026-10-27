@@ -33,6 +33,7 @@ void w_gc_set_stack_top(void *top);
 void wn_ev_wait(double due);
 void wn_ev_begin_poll(void);
 void wn_ev_audit(void);
+void wn_ev_init(void);
 
 #define MEM_RESERVE ((size_t)8 << 30)
 #define STACK_BYTES ((size_t)512 << 20)
@@ -45,7 +46,7 @@ static void say(const char *s) { (void)!write(2, s, strlen(s)); }
 
 _Noreturn void w_trap(int kind) {
   static const char *const msg[] = {
-      [W_TRAP_UNREACHABLE] = NULL,
+      [W_TRAP_UNREACHABLE] = "RuntimeError: unreachable\n",
       [W_TRAP_NULL] = "RuntimeError: dereferencing a null pointer\n",
       [W_TRAP_BOUNDS] = "RuntimeError: array element access out of bounds\n",
       [W_TRAP_DIV0] = "RuntimeError: divide by zero\n",
@@ -131,6 +132,9 @@ static void *run(void *arg) {
   w_gc_set_stack_top((void *)(&top_marker + 64));
   static char alt[1 << 16];
   install_fault_handler(alt, sizeof alt);
+  /* the host's own descriptors exist before the program can exhaust
+   * them (the poller, the wake descriptor, the signal pipe) */
+  wn_ev_init();
   w_init();
   w_export__start();
   if (w_has__tick) {
@@ -160,6 +164,10 @@ static void *run(void *arg) {
   /* WN_FD_AUDIT=1: what the host still holds at the program's normal end
    * (the leak measurement; nothing prints otherwise) */
   if (getenv("WN_FD_AUDIT") != NULL) wn_ev_audit();
+  /* the alternate stack is static storage: no one may unmap it as the
+   * thread ends (a sanitizer runtime would try) */
+  stack_t off = {.ss_flags = SS_DISABLE};
+  sigaltstack(&off, NULL);
   return NULL;
 }
 

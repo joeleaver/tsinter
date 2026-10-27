@@ -58,9 +58,15 @@ enum {
 };
 
 static WnSock **hs;
+extern int wn_net_paused_listeners;
 static uint32_t n_hs;
 
+static void reserve_init(void);
 static WnSock *sock_new(int kind, int fd) {
+  /* libuv's uv__stream_init: the EMFILE reserve is taken while a
+   * descriptor is still to be had (on the first stream), not when the
+   * process has run out */
+  if (kind == K_SERVER || kind == K_SOCKET) reserve_init();
   WnSock *s = calloc(1, sizeof *s);
   if (!s) abort();
   hs = realloc(hs, sizeof *hs * (n_hs + 1));
@@ -165,7 +171,8 @@ void wn_sock_queue_read(WnSock *s, uint32_t kind, int32_t a, const void *p, uint
 static void sock_update(WnSock *s) {
   if (s->closed || s->io.fd < 0) return;
   uint32_t want = 0;
-  if (s->kind == K_SERVER || s->kind == K_UDP) want = EPOLLIN;
+  if (s->kind == K_SERVER) want = s->accept_paused ? 0 : EPOLLIN;
+  else if (s->kind == K_UDP) want = EPOLLIN;
   else {
     if (s->connecting || s->out.n > s->out_off) want |= EPOLLOUT;
     if ((s->tls ? s->tls_reads : s->reading) && !s->rd_done && !s->connecting) want |= EPOLLIN;
@@ -238,6 +245,9 @@ static void read_plain(WnSock *s) {
 static void after_write_progress(WnSock *s) {
   int r = out_flush(s);
   if (r == 1) return;
+  if (r < 0) s->out.n = s->out_off = 0; /* a failed send drops what waited */
+  /* the TLS engine may still hold plaintext it could not take yet */
+  if (r == 0 && s->tls && s->tls->busy && s->tls->busy(s)) return;
   if (s->pending_write) {
     s->pending_write = 0;
     wn_sock_push(s, EV_WRITE_DONE, r < 0 ? r : 0, NULL, 0);
@@ -248,9 +258,11 @@ static void after_write_progress(WnSock *s) {
 static void sock_ready(WnIo *io, uint32_t evs) {
   WnSock *s = io->ctx;
   if (s->connecting) {
-    int err = 0;
-    socklen_t el = sizeof err;
-    getsockopt(io->fd, SOL_SOCKET, SO_ERROR, &err, &el);
+    int err = s->delayed_err;
+    if (!err) {
+      socklen_t el = sizeof err;
+      getsockopt(io->fd, SOL_SOCKET, SO_ERROR, &err, &el);
+    }
     if (err == 0 && !(evs & (EPOLLOUT | EPOLLERR | EPOLLHUP))) return;
     s->connecting = 0;
     if (err != 0) {
@@ -290,8 +302,11 @@ static void sock_ready(WnIo *io, uint32_t evs) {
  * what is waiting, then taken back */
 extern int wn_reserve_fd; /* defined in wn_ev.c (its audit skips it) */
 #define reserve_fd wn_reserve_fd
+static void reserve_init(void) {
+  if (reserve_fd < 0) reserve_fd = open("/", O_PATH | O_CLOEXEC);
+}
 static int emfile_trick(int lfd) {
-  if (reserve_fd == -1) return EMFILE;
+  if (reserve_fd < 0) return EMFILE;
   close(reserve_fd);
   reserve_fd = -1;
   int err;
@@ -312,7 +327,6 @@ static int emfile_trick(int lfd) {
 static void server_ready(WnIo *io, uint32_t evs) {
   (void)evs;
   WnSock *srv = io->ctx;
-  if (reserve_fd == -2) reserve_fd = open("/", O_PATH | O_CLOEXEC);
   for (;;) {
     struct sockaddr_storage ss;
     socklen_t sl = sizeof ss;
@@ -322,8 +336,19 @@ static void server_ready(WnIo *io, uint32_t evs) {
       if (e == EINTR) continue;
       if (e == EAGAIN || e == EWOULDBLOCK || e == ECONNABORTED) return;
       if (e == EMFILE || e == ENFILE) {
+        int had = reserve_fd >= 0;
         int t = emfile_trick(io->fd);
         if (t == EAGAIN || t == EWOULDBLOCK) return;
+        wn_sock_push(srv, EV_ACCEPT_ERROR, -e, NULL, 0);
+        if (!had) {
+          /* nothing to spend: stop accepting until a descriptor frees
+           * (any close re-arms it), never spin on a ready listener */
+          srv->accept_paused = 1;
+          wn_io_want(&srv->io, 0);
+          wn_net_paused_listeners++;
+          return;
+        }
+        continue;
       }
       wn_sock_push(srv, EV_ACCEPT_ERROR, -e, NULL, 0);
       return;
@@ -464,7 +489,23 @@ static int is_read_ev(const WnEv *e, void *ctx) {
   return e->source == WN_SRC_NET && e->handle == (uint32_t)(uintptr_t)ctx && (k == EV_DATA || k == EV_EOF || k == EV_READ_ERROR);
 }
 
+int wn_net_paused_listeners;
+/* a descriptor came free: listeners paused out of descriptors listen again */
+static void resume_listeners(void) {
+  if (!wn_net_paused_listeners) return;
+  for (uint32_t i = 0; i < n_hs; i++) {
+    WnSock *l = hs[i];
+    if (l && l->kind == K_SERVER && l->accept_paused && !l->closed) {
+      l->accept_paused = 0;
+      wn_net_paused_listeners--;
+      reserve_init();
+      sock_update(l);
+    }
+  }
+}
+
 static void sock_destroy(WnSock *s) {
+  if (s->kind == K_SERVER && s->accept_paused) wn_net_paused_listeners--;
   s->closed = 1;
   if (s->tls && s->tls->free) s->tls->free(s);
   if (s->io.fd >= 0) wn_io_close(&s->io);
@@ -481,6 +522,7 @@ static void sock_destroy(WnSock *s) {
   }
   hs[s->handle - 1] = NULL;
   free(s);
+  resume_listeners();
 }
 
 /* a queued ACCEPT's socket goes with its server's CLOSE */
@@ -565,6 +607,9 @@ int32_t host_netCall(int32_t op, int32_t ptr, int32_t len, int32_t h, int32_t x)
       WnSock *s = sock_new(K_SOCKET, fd);
       s->io.cb = sock_ready;
       s->connecting = 1;
+      /* libuv keeps a refusal connect(2) answered at once as the handle's
+       * delayed error (SO_ERROR has already been consumed) */
+      if (r < 0 && errno == ECONNREFUSED) s->delayed_err = ECONNREFUSED;
       sock_update(s);
       return (int32_t)s->handle;
     }
@@ -590,6 +635,7 @@ int32_t host_netCall(int32_t op, int32_t ptr, int32_t len, int32_t h, int32_t x)
       if (!s) wn_host_fail("netCall: READ_STOP of a handle that is not an open socket");
       if (s->reading) {
         s->reading = 0;
+        if (s->tls && s->tls->read_stop) s->tls->read_stop(s);
         sock_update(s);
         WnEv *t = wn_ev_take(is_read_ev, (void *)(uintptr_t)h);
         if (t) {

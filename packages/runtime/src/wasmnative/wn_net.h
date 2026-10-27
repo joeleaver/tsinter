@@ -23,8 +23,12 @@ typedef struct {
   int32_t (*write)(WnSock *s, const uint8_t *p, size_t n);
   /* netCall SHUTDOWN: close_notify, then the write side */
   void (*shutdown)(WnSock *s);
-  /* netCall READ_START: plaintext the engine already holds can flow */
+  /* netCall READ_START / READ_STOP: after the handshake the engine reads
+   * the descriptor only while the module reads (Node's TLSWrap readStop) */
   void (*read_start)(WnSock *s);
+  void (*read_stop)(WnSock *s);
+  /* plaintext a WRITE handed over that the engine has not taken yet */
+  int (*busy)(WnSock *s);
   void (*free)(WnSock *s);
 } WnTlsOps;
 
@@ -42,6 +46,8 @@ struct WnSock {
   WnIo io;
   int connecting, connected, reading, rd_done, closed;
   int shut, shut_pending, pending_write;
+  int delayed_err;   /* libuv's delayed_error: a refusal connect(2) answered at once */
+  int accept_paused; /* a listener out of descriptors, waiting for one to free */
   WnEv *held, **held_tail;
   WnBuf out;
   size_t out_off;
