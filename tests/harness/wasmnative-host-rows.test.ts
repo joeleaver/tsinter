@@ -25,9 +25,10 @@
  *
  * Runs concurrently within the file, at most SCRIPTC_TEST_WORKERS (default
  * 4) rows at once. */
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { createServer as createHttpServer, type Server as HttpServer } from "node:http";
 import { createServer as createHttpsServer } from "node:https";
-import { createServer as createNetServer, type AddressInfo, type Server } from "node:net";
+import { createConnection, createServer as createNetServer, type AddressInfo, type Server } from "node:net";
 import { createServer as createTlsServer, type Server as TlsServer } from "node:tls";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -610,5 +611,322 @@ const s = tls.connect(${floodPort}, "localhost", { ca }, () => {
     // bounded by the collector, not by what the peer sent: buffering the
     // flood would take more than its 256 MiB
     expect(nativeMaxRssKb).toBeLessThan(160 * 1024);
+  }, 120_000);
+});
+
+/* ── the security re-review of N1's TLS and fetch ────────────────────────
+ * The certificate cases come from tests/fixtures/tls-review/gen.py (python3
+ * with `cryptography`; without it these rows fail, loudly); every case is
+ * served by its own TLS server, and fetch reaches each through a CONNECT
+ * proxy (NODE_USE_ENV_PROXY), so any host name works without DNS. Node and
+ * the native executable run the same program; their output must be equal,
+ * byte for byte (a certificate name holding a NUL included). The
+ * malformed responses are tests/fixtures/tls-review/responses.mjs. */
+describe("N1 security re-review rows: the host against Node", () => {
+  const servers: { close: () => void }[] = [];
+  let pki = "";
+  const cases: { name: string; host: string; port: number }[] = [];
+  let pxPort = 0;
+  let rawPort = 0;
+  let plainPort = 0;
+  const proxyLog: string[] = [];
+  let proxyReply = "HTTP/1.1 200 OK\r\n\r\n";
+  let R: Record<string, string> = {};
+  let gen: (i: number) => Buffer = () => Buffer.alloc(0);
+  const FUZZ = 900;
+  beforeAll(async () => {
+    pki = mkdtempSync(join(tmpdir(), "wn-pki-"));
+    execFileSync("python3", [join(repoRoot, "tests/fixtures/tls-review/gen.py"), pki], { stdio: "pipe" });
+    const listen = (srv: Server | TlsServer | HttpServer): Promise<number> =>
+      new Promise((resolve) => {
+        srv.listen(0, "127.0.0.1", () => resolve((srv.address() as AddressInfo).port));
+        servers.push(srv);
+      });
+    const list = JSON.parse(readFileSync(join(pki, "cases.json"), "utf8")) as { name: string; host: string }[];
+    for (const c of list) {
+      const srv = createHttpsServer(
+        { key: readFileSync(join(pki, `${c.name}.key`)), cert: readFileSync(join(pki, `${c.name}.pem`)), minVersion: "TLSv1.2", ciphers: "DEFAULT:@SECLEVEL=0" },
+        (_q, r) => r.end(`hi ${c.name}`),
+      );
+      srv.on("tlsClientError", () => {});
+      cases.push({ ...c, port: await listen(srv) });
+    }
+    // the CONNECT proxy: routes by port to 127.0.0.1, logs each request head
+    pxPort = await listen(
+      createNetServer((s) => {
+        let buf = Buffer.alloc(0);
+        const on = (d: Buffer): void => {
+          buf = Buffer.concat([buf, d]);
+          const i = buf.indexOf("\r\n\r\n");
+          if (i < 0) return;
+          s.off("data", on);
+          const head = buf.subarray(0, i).toString("latin1");
+          proxyLog.push(head);
+          const m = /^CONNECT .*:(\d+) HTTP/.exec(head);
+          if (!m) {
+            s.end("HTTP/1.1 400 Bad\r\n\r\n");
+            return;
+          }
+          if (proxyReply !== "HTTP/1.1 200 OK\r\n\r\n") {
+            s.end(Buffer.from(proxyReply, "latin1"));
+            return;
+          }
+          const u = createConnection(Number(m[1]), "127.0.0.1", () => {
+            s.write(proxyReply);
+            u.write(buf.subarray(i + 4));
+            s.pipe(u);
+            u.pipe(s);
+          });
+          u.on("error", () => s.destroy());
+          s.on("error", () => u.destroy());
+        };
+        s.on("data", on);
+        s.on("error", () => {});
+      }),
+    );
+    const resp = (await import("../fixtures/tls-review/responses.mjs")) as { R: Record<string, string>; gen: (i: number) => Buffer };
+    R = resp.R;
+    gen = resp.gen;
+    rawPort = await listen(
+      createNetServer((s) => {
+        let buf = "";
+        s.on("data", (d) => {
+          buf += d.toString("latin1");
+          const m = /^[A-Z]+ \/(r|f)\/(\S+)/.exec(buf);
+          if (m && buf.includes("\r\n\r\n")) s.end(m[1] === "r" ? Buffer.from(R[m[2]!] ?? "HTTP/1.1 404 NF\r\n\r\n", "latin1") : gen(Number(m[2])));
+        });
+        s.on("error", () => {});
+      }),
+    );
+    plainPort = await listen(
+      createHttpServer((q, r) => {
+        const loc: Record<string, string> = {
+          "/cred-same": `http://u:p@127.0.0.1:${plainPort}/ok`,
+          "/cred-cross": `http://u:p@localhost:${plainPort}/ok`,
+          "/cred-user": `http://u@127.0.0.1:${plainPort}/ok`,
+          "/to-bad-puny": "http://xn--abc.example/",
+        };
+        const l = loc[q.url ?? ""];
+        if (l !== undefined) {
+          r.writeHead(302, { location: l });
+          r.end();
+        } else r.end(`ok ${q.url}`);
+      }),
+    );
+  }, 120_000);
+  afterAll(() => {
+    for (const s of servers) s.close();
+    if (pki) rmSync(pki, { recursive: true, force: true });
+  });
+
+  async function build(src: string): Promise<{ dir: string; entry: string; bin: string }> {
+    const dir = mkdtempSync(join(tmpdir(), "wn-sec-"));
+    const entry = join(dir, "main.ts");
+    writeFileSync(entry, src);
+    const res = await compile(entry, { outPath: join(dir, "out", "program"), outDir: join(dir, "out"), dynamic: false, backend: "wasm-native" });
+    if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+    return { dir, entry, bin: res.binaryPath };
+  }
+  async function both(src: string, env?: Record<string, string>): Promise<{ node: Out; native: Out }> {
+    const b = await build(src);
+    try {
+      const node = await run(process.execPath, ["--import", comptimeShim, "--import", islandShim, b.entry], repoRoot, undefined, env);
+      const native = await run(b.bin, [], repoRoot, undefined, env);
+      return { node, native };
+    } finally {
+      rmSync(b.dir, { recursive: true, force: true });
+    }
+  }
+  const proxied = (): Record<string, string> => ({
+    NODE_USE_ENV_PROXY: "1",
+    https_proxy: `http://127.0.0.1:${pxPort}`,
+    http_proxy: `http://127.0.0.1:${pxPort}`,
+    HTTPS_PROXY: "",
+    HTTP_PROXY: "",
+    no_proxy: "",
+    NO_PROXY: "",
+    NODE_EXTRA_CA_CERTS: join(pki, "extra.pem"),
+  });
+  const probe = (urls: [string, string, [string, string][]?][]): string => `async function go(n: string, p: Promise<Response>): Promise<void> {
+  try {
+    const r = await p;
+    console.log(n, "OK", r.status, r.url, await r.text());
+  } catch (e) {
+    const x: unknown = e;
+    const c = x as { message: string; cause?: { name: string; code?: string; message: string } };
+    console.log(n, "ERR", c.message, c.cause ? c.cause.name + " " + String(c.cause.code) + " " + c.cause.message : "");
+  }
+}
+async function main(): Promise<void> {
+${urls.map(([n, u, h]) => `  await go(${JSON.stringify(n)}, fetch(${JSON.stringify(u)}${h ? `, { headers: { ${h.map(([k, v]) => `${JSON.stringify(k)}: ${JSON.stringify(v)}`).join(", ")} } }` : ""}));`).join("\n")}
+}
+main();
+`;
+
+  test("SECURITY 1-4: fetch checks every name and chain case as Node does — a NUL in a SAN or CN, Node's escaped altnames, IPv6 hosts, punycode, a host past 299 characters, a CA's EKU, its name constraints (critical or not), an unknown critical extension, OpenSSL's last-error verdicts", async () => {
+    const { node, native } = await both(probe(cases.map((c) => [c.name, `https://${c.host}:${c.port}/`])), proxied());
+    const out = node.stdout.toString("latin1");
+    const line = (n: string): string => out.split("\n").find((l) => l.startsWith(`${n} `)) ?? "";
+    // the bypasses the review found, as Node refuses them
+    expect(line("nul_san")).toContain("ERR_TLS_CERT_ALTNAME_INVALID");
+    expect(line("nul_cn")).toContain("ERR_TLS_CERT_ALTNAME_INVALID");
+    expect(line("nul_san_wild")).toContain("ERR_TLS_CERT_ALTNAME_INVALID");
+    expect(line("inter_eku_client")).toContain("INVALID_PURPOSE unsuitable certificate purpose");
+    expect(line("nc_noncrit_viol")).toContain("permitted subtree violation");
+    expect(line("nc_excl_noncrit")).toContain("excluded subtree violation");
+    expect(line("nc_ip_noncrit")).toContain("permitted subtree violation");
+    expect(line("nc_crit_ok")).toContain(" OK 200 ");
+    expect(line("long_trunc")).toContain("ERR_TLS_CERT_ALTNAME_INVALID");
+    expect(line("wild_xn")).toContain("Invalid URL");
+    expect(native.stdout.toString("latin1")).toBe(out);
+    expect(native.code).toBe(node.code);
+  }, 300_000);
+
+  test("SECURITY 2-3: tls.connect reports the chain verdict Node's OpenSSL reaches (the module reads it) — a CA's EKU and name constraints included", async () => {
+    const pick = [
+      "inter_ok", "inter_cafalse", "inter_nobc", "inter_nokucs", "inter_eku_client", "inter_eku_any", "inter_eku_server", "inter_eku_both",
+      "nc_noncrit_viol", "nc_crit_viol", "nc_excl_noncrit", "m_nc_dns_dot_apex", "m_nc_excl_dns_sub", "m_nc_two_dns_one_bad", "m_expired_and_nc",
+      "m_nc_dirname_ok", "m_nc_dirname_viol", "pathlen0", "untrusted_root", "v20_missing_root", "selfsigned", "v21_leaf_alone", "partial_chain",
+      "partial_chain_leafonly", "inter_expired", "inter_noext", "v_out_of_order", "v_two_inters", "v_only_old_inter", "expired", "future",
+      "eku_client", "eku_any", "rsa1024", "unk_crit", "crit_akid", "crit_policies", "v7_bad_signature", "v_selfsigned_expired", "v_mimic_root",
+    ];
+    const list = pick.map((n) => {
+      const c = cases.find((x) => x.name === n);
+      if (!c) throw new Error(`no case ${n}`);
+      return [n, c.host, String(c.port)];
+    });
+    const src = `import * as tls from "node:tls";
+import * as fs from "node:fs";
+const ca = fs.readFileSync(${JSON.stringify(join(pki, "extra.pem"))}, "utf8");
+const C: string[][] = ${JSON.stringify(list)};
+function one(i: number): void {
+  if (i >= C.length) return;
+  const n = C[i][0];
+  const s = tls.connect({ host: "127.0.0.1", port: Number(C[i][2]), servername: C[i][1], ca, rejectUnauthorized: true }, () => {
+    console.log(n, "SECURE", String(s.authorized));
+    s.end();
+    one(i + 1);
+  });
+  s.on("error", (e: Error) => {
+    console.log(n, "ERR", e.message);
+    one(i + 1);
+  });
+}
+one(0);
+`;
+    const { node, native } = await both(src);
+    const out = node.stdout.toString("latin1");
+    expect(out).toContain("inter_eku_client ERR unsuitable certificate purpose");
+    expect(out).toContain("nc_noncrit_viol ERR permitted subtree violation");
+    expect(native.stdout.toString("latin1")).toBe(out);
+    expect(native.code).toBe(node.code);
+  }, 300_000);
+
+  test("SECURITY 5: malformed responses (the review's cases, and a deterministic fuzz of them) fail exactly as Node's fetch fails them — undici's own llhttp, never a looser parser", async () => {
+    // p49's 200 kB status line reaches the parser in as many pieces as the
+    // socket's reads cut it into, and undici keeps the last piece as the
+    // status text: a function of the kernel's timing, on either side
+    const keys = [...Object.keys(R).filter((k) => k !== "p49").map((k) => `r/${k}`), ...Array.from({ length: FUZZ }, (_, i) => `f/${i}`)];
+    const src = `async function go(k: string): Promise<void> {
+  try {
+    const r = await fetch("http://127.0.0.1:${rawPort}/" + k);
+    const hs: string[] = [];
+    r.headers.forEach((v, n) => {
+      hs.push(n + "=" + JSON.stringify(v));
+    });
+    let t = "";
+    try {
+      t = await r.text();
+    } catch (e) {
+      const x: unknown = e;
+      const c = x as { message: string; cause: { name: string; message: string } };
+      console.log(k, "BODY", r.status, c.message, c.cause.name, JSON.stringify(c.cause.message));
+      return;
+    }
+    console.log(k, "OK", r.status, JSON.stringify(r.statusText), hs.join(" "), t.length, JSON.stringify(t.slice(0, 24)));
+  } catch (e) {
+    const x: unknown = e;
+    const c = x as { message: string; cause: { name: string; message: string } };
+    console.log(k, "ERR", c.message, c.cause.name, JSON.stringify(c.cause.message));
+  }
+}
+async function main(): Promise<void> {
+  const K: string[] = ${JSON.stringify(keys)};
+  for (const k of K) await go(k);
+}
+main();
+`;
+    const { node, native } = await both(src);
+    const out = node.stdout.toString("latin1");
+    const line = (n: string): string => out.split("\n").find((l) => l.startsWith(`${n} `)) ?? "";
+    // the review's cases: Node refuses each, so must the lane
+    for (const k of ["p01", "p02", "p04", "p05", "p08", "p15", "p18", "p51"]) expect(line(`r/${k}`)).not.toContain(" OK ");
+    expect(line("r/p24")).toContain(" OK 200 ");
+    expect(line("r/p26")).toContain(" OK 200 ");
+    expect(native.stdout.toString("latin1")).toBe(out);
+    expect(native.code).toBe(node.code);
+  }, 600_000);
+
+  test("SECURITY 4, 6: the proxy's CONNECT carries the whole host (any length), its answer is read by the same parser (a malformed one fails as Node fails it), and a program's own Proxy-Authorization is refused as undici refuses it", async () => {
+    const long = `${"a".repeat(60)}.${"b".repeat(60)}.${"c".repeat(60)}.${"d".repeat(60)}.${"e".repeat(60)}.example.com`;
+    const base = cases.find((c) => c.name === "base")!;
+    proxyLog.length = 0;
+    const { node, native } = await both(
+      probe([
+        ["long", `https://${long}:${base.port}/`],
+        ["proxy-auth", `https://example.com:${base.port}/`, [["proxy-authorization", "Basic eA=="]]],
+        ["proxy-auth-case", `https://example.com:${base.port}/`, [["Proxy-Authorization", "Basic eA=="]]],
+      ]),
+      proxied(),
+    );
+    const out = node.stdout.toString("utf8");
+    expect(out).toContain("proxy-auth ERR fetch failed InvalidArgumentError UND_ERR_INVALID_ARG Proxy-Authorization should be sent in ProxyAgent constructor");
+    expect(native.stdout.toString("utf8")).toBe(out);
+    // both sides' CONNECT carried the whole long name
+    expect(proxyLog.filter((h) => h.startsWith(`CONNECT ${long}:${base.port} HTTP/1.1\r\nhost: ${long}:${base.port}\r\n`)).length).toBe(2);
+    // a malformed answer to the CONNECT
+    proxyReply = "HTTP/1.1 200 OK\r\nX: a\x7fb\r\n\r\n";
+    try {
+      const r = await both(probe([["bad-answer", `https://example.com:${base.port}/`]]), proxied());
+      expect(r.node.stdout.toString("utf8")).toContain("HTTPParserError undefined Response does not match the HTTP/1.1 protocol (Invalid header value char)");
+      expect(r.native.stdout.toString("utf8")).toBe(r.node.stdout.toString("utf8"));
+    } finally {
+      proxyReply = "HTTP/1.1 200 OK\r\n\r\n";
+    }
+  }, 300_000);
+
+  test("S117 (h): a proxy that refuses the tunnel (an answer other than 200) fails the request with undici's text — Node's undici retries such a CONNECT without end, so this row holds the lane alone", async () => {
+    const base = cases.find((c) => c.name === "base")!;
+    const b = await build(probe([["refused", `https://example.com:${base.port}/`]]));
+    proxyReply = "HTTP/1.1 407 Proxy Authentication Required\r\n\r\n";
+    try {
+      const native = await run(b.bin, [], repoRoot, undefined, proxied());
+      expect(native.stdout.toString("utf8")).toBe("refused ERR fetch failed AbortError UND_ERR_ABORTED Proxy response (407) !== 200 when HTTP Tunneling\n");
+    } finally {
+      proxyReply = "HTTP/1.1 200 OK\r\n\r\n";
+      rmSync(b.dir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  test("notes: a redirect to a URL with credentials is refused as Node refuses it (request mode cors), an invalid punycode label is an Invalid URL, an IPv6 host prints as the WHATWG serializer prints it", async () => {
+    const P = `http://127.0.0.1:${plainPort}`;
+    const { node, native } = await both(
+      probe([
+        ["cred-same", `${P}/cred-same`],
+        ["cred-cross", `${P}/cred-cross`],
+        ["cred-user", `${P}/cred-user`],
+        ["to-bad-puny", `${P}/to-bad-puny`],
+        ["puny-bad", "http://xn--abc.example/"],
+        ["puny-c1", "http://xn--a.example/"],
+        ["puny-ascii", "http://xn--abc-.example/"],
+        ["v6-mapped", `http://[::ffff:127.0.0.1]:${plainPort}/v6`],
+        ["v6-zeros", "http://[0:0:0:0:0:0:0:1]:1/"],
+      ]),
+    );
+    const out = node.stdout.toString("utf8");
+    expect(out).toContain('cred-same ERR fetch failed Error undefined cross origin not allowed for request mode "cors"');
+    expect(out).toContain("puny-bad ERR Failed to parse URL from http://xn--abc.example/ TypeError ERR_INVALID_URL Invalid URL");
+    expect(out).toContain("v6-mapped OK 200 http://[::ffff:7f00:1]:");
+    expect(native.stdout.toString("utf8")).toBe(out);
   }, 120_000);
 });

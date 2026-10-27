@@ -1,4 +1,12 @@
 /*
+ * tsinter: TSINTER_X509_KEEP_CRITICAL (defined only for the wasm-native
+ * lane's build of this library, backend/wasm-native.ts) keeps a
+ * certificate whose critical extension mbedTLS does not parse instead of
+ * refusing it: that lane's verifier (runtime/src/wasmnative/wn_x509.c)
+ * decides on such a certificate as OpenSSL does. Undefined (every other
+ * build), this file is upstream's.
+ */
+/*
  *  X.509 certificate parsing and verification
  *
  *  Copyright The Mbed TLS Contributors
@@ -950,11 +958,13 @@ static int x509_get_crt_ext(unsigned char **p,
             /* No parser found, skip extension */
             *p = end_ext_octet;
 
+#if !defined(TSINTER_X509_KEEP_CRITICAL)
             if (is_critical) {
                 /* Data is marked as critical: fail */
                 return MBEDTLS_ERROR_ADD(MBEDTLS_ERR_X509_INVALID_EXTENSIONS,
                                          MBEDTLS_ERR_ASN1_UNEXPECTED_TAG);
             }
+#endif
             continue;
         }
 
@@ -1035,6 +1045,11 @@ static int x509_get_crt_ext(unsigned char **p,
                         break;
                     }
 
+#if defined(TSINTER_X509_KEEP_CRITICAL)
+                    if (ret == MBEDTLS_ERR_X509_FEATURE_UNAVAILABLE) {
+                        break;
+                    }
+#endif
                     if (is_critical) {
                         return ret;
                     } else
@@ -1056,9 +1071,12 @@ static int x509_get_crt_ext(unsigned char **p,
                  * supports, but there isn't an x509 parser for it,
                  * skip the extension.
                  */
+#if !defined(TSINTER_X509_KEEP_CRITICAL)
                 if (is_critical) {
                     return MBEDTLS_ERR_X509_FEATURE_UNAVAILABLE;
-                } else {
+                } else
+#endif
+                {
                     *p = end_ext_octet;
                 }
         }

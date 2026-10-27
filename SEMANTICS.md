@@ -8375,18 +8375,37 @@ the system bundle (`SSL_CERT_FILE`, else
 `/etc/ssl/ca-bundle.pem`, `/etc/ssl/cert.pem` — OpenSSL's default file;
 Node's OpenSSL also reads the hashed certificate directory, so a
 certificate only there is in Node's system store and not in this one), and
-`"extra"` is `NODE_EXTRA_CA_CERTS`. A verdict is reported in OpenSSL's numbering: a
-chain to no trusted root is 18 (a self-signed leaf alone), 19 (a
-self-signed certificate in the chain), 21 (a leaf alone) or 20, and a chain
-mbedTLS accepted at a trusted certificate that is not self-signed is 2
-(OpenSSL anchors only at a root: no partial chains, Node's default).
-Material errors answer OpenSSL's texts for the shapes Node meets (`no start
+`"extra"` is `NODE_EXTRA_CA_CERTS`. mbedTLS carries the handshake only:
+the verdict on a peer's chain is OpenSSL's, transcribed (`wn_x509.c`, from
+OpenSSL 3's `x509_vfy.c`, `v3_purp.c`, `v3_ncons.c` and `x_name.c`) with
+Node's settings — the SSL-server purpose, trusted-first chain building, no
+partial chains, depth 100, security level 2 — and Node's verify callback,
+which lets every check run, so the verdict is the LAST error OpenSSL's
+checks meet (an expired self-signed leaf is "certificate has expired"):
+the peer's key size, the chain (18, 19, 20, 2; 21 for a lone leaf), each
+certificate's extensions (an unhandled critical extension, a CA that is
+not one — 79 —, the purpose: a CA's or a leaf's extended key usage must
+allow serverAuth, anyExtendedKeyUsage does not, key usage, Netscape cert
+type —, path length), the CA keys' and signatures' strength, then from
+the top down each issuer's keyCertSign, each signature and each validity,
+then every CA's name constraints over every name below it (dNSName,
+rfc822Name, URI, iPAddress and directoryName subtrees, the subject's
+emailAddress attributes, and a leaf's CN read as a DNS name when it has no
+DNS name — OpenSSL's 47, 48, 49, 51, 52, 53). Names are compared in
+OpenSSL's canonical encoding. The lane builds the vendored mbedTLS with
+TSINTER_X509_KEEP_CRITICAL (its `x509_crt.c`: a certificate with a
+critical extension mbedTLS does not parse — a CA's nameConstraints —
+parses; the verdict on it is the check above), so the engine never refuses
+what OpenSSL accepts; the c and llvm lanes' archive is upstream's code.
+What is not transcribed: CRLs and policies (Node checks neither by
+default), RFC 3779 resources (accepted), an otherName constraint
+(refused, 51, where OpenSSL matches a SmtpUTF8Mailbox). Material errors answer OpenSSL's texts for the shapes Node meets (`no start
 line`, `wrong tag`, `DECODER routines::unsupported`, `key values
 mismatch`); a protocol failure answers OpenSSL's `wrong version number`,
 `sslv3 alert handshake failure` or `unsupported protocol` where mbedTLS's
 error maps to one, and otherwise mbedTLS's own text under
-`ERR_SSL_SSL_HANDSHAKE_FAILURE`. An IP-literal host is not name-checked by
-the engine (the module's checkServerIdentity still runs).
+`ERR_SSL_SSL_HANDSHAKE_FAILURE`. The engine checks no name (the module's
+checkServerIdentity runs over the certificate).
 
 (h) **fetch is the runner's own HTTP/1.1 client** (`wn_fetch.c`), made to
 answer as Node's undici does (measured against Node v24.18.1; S098 (a)
@@ -8409,16 +8428,37 @@ request (undici tunnels it with CONNECT; `https:` is tunnelled here too);
 undici's process warnings (a lowercase `patch`) are not printed; there are
 no connect, headers or body timeouts (undici's are 10 s, 300 s and 300 s:
 a server that stalls holds the request until the program aborts it); TLS
-verification is (g)'s engine, over (g)'s default store (Node's), and the
-host name is checked as Node's `tls.checkServerIdentity` checks it (an IP
-literal against the certificate's IP-address names, a DNS name against its
-DNS names with RFC 6125 wildcards, or its CN when it has none). A response
-is read as llhttp and undici read it — the status line, header tokens and
-values, Content-Length (undici's mismatch error where it has collected a
-length the body does not match), chunk framing and the 16 KiB header limit
-fail with their messages ("Response does not match the HTTP/1.1 protocol
-(...)", "Headers Overflow Error"); llhttp's rarer reasons are this host's
-nearest wording.
+verification is (g)'s verdict, over (g)'s default store (Node's), and the
+host name is checked as Node's `tls.checkServerIdentity` checks it, over
+the certificate as Node hands it to that function: its `subjectaltname`
+(Node's escaping of an unsafe name — a NUL, a comma, a DEL — included, and
+names compared with their lengths, so a NUL never ends one), its subject's
+CNs (any of several may match); an IP literal against the IP-address
+names, a DNS name against the DNS names with RFC 6125 wildcards, or the
+CN when there are none; an IPv6 host (the URL's, without brackets) never
+matches, as under Node. A directoryName among the altnames of a mismatch
+message is printed in RFC 2253's shape (Node prints OpenSSL's; nearest
+wording). A response is read by undici's own parser: the llhttp wasm
+module Node's undici instantiates (`backend/wasm/undici-llhttp.ts`,
+translated by wasm2c), driven by a transcription of undici's client-h1
+Parser callbacks, so a response is accepted, or refused with its reason,
+as Node's fetch accepts or refuses it (undici's errors: "Response does not
+match the HTTP/1.1 protocol (...)", the content-length mismatch, "Headers
+Overflow Error", "bad response" for a 100, "bad upgrade", "other side
+closed"); the status text is the last piece of the status line a read
+delivered, as undici keeps it. The proxy's answer to a CONNECT is read by
+the same parser; an answer other than 200, or a proxy that closes before
+answering, fails the request (undici's "Proxy response (407) !== 200 when
+HTTP Tunneling", "other side closed") where Node's undici retries the
+CONNECT without end. A redirect to a URL with credentials is undici's
+'cross origin not allowed for request mode "cors"', and a program's own
+Proxy-Authorization header on a proxied request is undici's
+InvalidArgumentError. An `xn--` label must decode as Punycode to something
+that is not plain ASCII and holds no control, ASCII capital or symbol,
+surrogate or noncharacter, else "Invalid URL"; UTS #46's mapping table is
+not consulted, so a label decoding to a code point UTS #46 maps or
+disallows (`xn--a-ecp`, "a⒈") is accepted here where Node's URL refuses
+it.
 
 (i) **The translator trusts a valid module.** `wasm2c` assumes the
 module's types and stack discipline hold; the lane validates every module
@@ -8432,7 +8472,12 @@ collector forced every n allocations);
 lane's host rows — child_process, node:net / http / tls / https / dgram,
 signals, fs.watch, stdin and readline — and the fetch fixtures, natively,
 against Node: (f)'s second item is its `UNPINNED` U3-ORD-01; its `KNOWN`
-list names the module's own divergences, which this lane shares);
+list names the module's own divergences, which this lane shares; its
+security re-review rows hold (g)'s verdicts and (h)'s name check over the
+certificates `tests/fixtures/tls-review/gen.py` makes, through a CONNECT
+proxy, and (h)'s parser over `tests/fixtures/tls-review/responses.mjs`'s
+malformed responses and its fuzz of them; the proxy's refusal row holds
+the lane alone, Node retrying);
 `tests/harness/event-loop.test.ts`, `console-io.test.ts` and
 `dgram.test.ts` (each case on the c and wasm-native lanes); and
 `packages/compiler/test/wasm2c-whole.test.ts` (the translation against
@@ -8441,5 +8486,6 @@ linear memory to its end, the GC instructions under a stressed
 collector, NaN operands of the folded identities, every trap's text
 through the real runner), and `packages/compiler/test/wasm-native.test.ts`
 (the host end to end: paths holding U+0000, copyFileSync onto itself, a
-self-sent SIGSEGV). (b) was measured by hand (`f(50000)`, then unbounded
+self-sent SIGSEGV, the descriptor audits, and that the vendored llhttp is
+the running Node's undici's). (b) was measured by hand (`f(50000)`, then unbounded
 recursion: the native trap in 0.2 s, exit 1).

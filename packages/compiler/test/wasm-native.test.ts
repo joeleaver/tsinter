@@ -259,6 +259,58 @@ server.listen(0, "127.0.0.1", () => {
     }
   });
 
+  test("the host keeps nothing the program released — thirty fetches (each a connection, a parser and a request record), and ten refused, leave no descriptor and no registration behind (WN_FD_AUDIT)", async () => {
+    const { createServer } = await import("node:http");
+    const server = createServer((q, r) => r.end(`ok ${q.url}`));
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const port = (server.address() as { port: number }).port;
+    const closed = createServer();
+    await new Promise<void>((r) => closed.listen(0, "127.0.0.1", r));
+    const dead = (closed.address() as { port: number }).port;
+    await new Promise<void>((r) => closed.close(() => r()));
+    process.env["WN_FD_AUDIT"] = "1";
+    try {
+      const src = `async function main(): Promise<void> {
+  let ok = 0;
+  for (let i = 0; i < 30; i++) {
+    const r = await fetch("http://127.0.0.1:${port}/" + i);
+    if ((await r.text()) === "ok /" + i) ok++;
+  }
+  let refused = 0;
+  for (let i = 0; i < 10; i++) {
+    try {
+      await fetch("http://127.0.0.1:${dead}/");
+    } catch {
+      refused++;
+    }
+  }
+  console.log("fetch", ok, refused);
+}
+main();
+`;
+      const { node, native } = await both(src);
+      expect(node.stdout).toBe("fetch 30 10\n");
+      expect(native.stdout).toBe(node.stdout);
+      expect(native.code).toBe(0);
+      expect(native.stderr).toBe("wn-audit: fds 0 live 0 queued 0\n");
+    } finally {
+      delete process.env["WN_FD_AUDIT"];
+      server.close();
+    }
+  });
+
+  test("fetch links undici's own parser: the vendored llhttp wasm is the very module this Node's fetch instantiates (lib/llhttp/llhttp-wasm.js)", async () => {
+    const { UNDICI_VERSION, UNDICI_LLHTTP_SHA256, undiciLlhttpWasm } = await import("../src/backend/wasm/undici-llhttp.js");
+    const { createHash } = await import("node:crypto");
+    expect(createHash("sha256").update(undiciLlhttpWasm()).digest("hex")).toBe(UNDICI_LLHTTP_SHA256);
+    // the Node the oracle runs: its bundled undici carries the same bytes
+    expect(process.versions["undici"]).toBe(UNDICI_VERSION);
+    const natives = (process as unknown as { binding(n: string): Record<string, string> }).binding("natives");
+    const m = /var require_llhttp_wasm = __commonJS\(\{[\s\S]*?var wasmBase64 = "([A-Za-z0-9+/=]+)"/.exec(natives["internal/deps/undici/undici"] ?? "");
+    expect(m).not.toBeNull();
+    expect(createHash("sha256").update(Buffer.from(m![1]!, "base64")).digest("hex")).toBe(UNDICI_LLHTTP_SHA256);
+  });
+
   test("a SIGSEGV the process sends itself kills it, as it kills Node", async () => {
     const src = `console.log("before");
 process.kill(process.pid, "SIGSEGV");

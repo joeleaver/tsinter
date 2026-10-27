@@ -39,6 +39,7 @@
 #include "wn_host.h"
 #include "wn_net.h"
 #include "wn_trust.h"
+#include "wn_x509.h"
 
 enum { EV_DATA = 3, EV_EOF = 4, EV_READ_ERROR = 5, EV_SECURE = 10, EV_TLS_ERROR = 11 };
 
@@ -101,8 +102,6 @@ typedef struct {
   mbedtls_x509_crt chain; /* the client's trust: roots and added CAs */
   int server;
   int handshaken, dead, notify;
-  /* what the verify callback saw, by depth */
-  int leaf_self, chain_self, depth_max, top_self;
   /* the raw side read as libuv's uv__read reads it: 64 KiB at a time, at
    * most 32 reads per readiness, and none after a short one (the next
    * iteration's) — the engine consumes these bytes */
@@ -159,42 +158,10 @@ static int bio_recv(void *ctx, unsigned char *buf, size_t len) {
   return (int)k;
 }
 
-static int vrfy_cb(void *ctx, mbedtls_x509_crt *crt, int depth, uint32_t *flags) {
-  Tls *t = ctx;
-  int self = crt->issuer_raw.len == crt->subject_raw.len && memcmp(crt->issuer_raw.p, crt->subject_raw.p, crt->subject_raw.len) == 0;
-  if (depth >= t->depth_max) {
-    t->depth_max = depth;
-    t->top_self = self;
-  }
-  if (*flags & MBEDTLS_X509_BADCERT_NOT_TRUSTED) {
-    if (depth == 0 && self) t->leaf_self = 1;
-    if (depth > 0 && self) t->chain_self = 1;
-  }
-  return 0;
-}
-
-/* mbedTLS's verdict in OpenSSL's X509_V_ERR numbers (abi.ts tlsCall) */
-static uint32_t verify_code(Tls *t) {
-  uint32_t f = mbedtls_ssl_get_verify_result(&t->ssl) & ~(uint32_t)MBEDTLS_X509_BADCERT_CN_MISMATCH;
-  /* OpenSSL anchors a chain only at a self-signed root (no
-   * X509_V_FLAG_PARTIAL_CHAIN, Node's default): a chain mbedTLS accepted
-   * at a trusted intermediate is, there, one whose issuer is missing */
-  if (f == 0) return t->top_self ? 0 : 2; /* UNABLE_TO_GET_ISSUER_CERT */
-  if (f & MBEDTLS_X509_BADCERT_NOT_TRUSTED) {
-    const mbedtls_x509_crt *peer = mbedtls_ssl_get_peer_cert(&t->ssl);
-    int alone = peer != NULL && peer->next == NULL;
-    if (t->leaf_self && alone) return 18;   /* DEPTH_ZERO_SELF_SIGNED_CERT */
-    if (t->chain_self) return 19;           /* SELF_SIGNED_CERT_IN_CHAIN */
-    if (alone) return 21;                   /* UNABLE_TO_VERIFY_LEAF_SIGNATURE */
-    return 20;                              /* UNABLE_TO_GET_ISSUER_CERT_LOCALLY */
-  }
-  if (f & MBEDTLS_X509_BADCERT_EXPIRED) return 10;
-  if (f & MBEDTLS_X509_BADCERT_FUTURE) return 9;
-  if (f & MBEDTLS_X509_BADCERT_REVOKED) return 23;
-  if (f & MBEDTLS_X509_BADCERT_BAD_KEY) return t->chain_self || t->depth_max > 0 ? 67 : 66;
-  if (f & MBEDTLS_X509_BADCERT_BAD_MD) return 68;
-  return 1;
-}
+/* the verdict on the peer's chain in OpenSSL's X509_V_ERR numbers (abi.ts
+ * tlsCall): OpenSSL's own checks, transcribed (wn_x509.c) — the engine
+ * carries the handshake only */
+static uint32_t verify_code(Tls *t) { return (uint32_t)wn_x509_verify(mbedtls_ssl_get_peer_cert(&t->ssl), &t->chain); }
 
 /* an engine failure as OpenSSL would name it (the nearest text) */
 static void tls_error(WnSock *s, int r) {
@@ -421,12 +388,11 @@ static int32_t secure(uint32_t ptr, int32_t h) {
     if (c->has_cert && c->has_key) mbedtls_ssl_conf_own_cert(&t->conf, &c->cert, &c->key);
   } else {
     /* the verdict is recorded, never enforced (Node's verify callback
-     * accepts; the module decides) */
-    mbedtls_ssl_conf_authmode(&t->conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
+     * accepts; the module decides): judged after the handshake, by
+     * wn_x509.c against this trust */
+    mbedtls_ssl_conf_authmode(&t->conf, MBEDTLS_SSL_VERIFY_NONE);
     if (c->roots) chain_add(&t->chain, wn_trust_default());
     if (c->has_ca) chain_add(&t->chain, &c->ca);
-    mbedtls_ssl_conf_ca_chain(&t->conf, &t->chain, NULL);
-    mbedtls_ssl_conf_verify(&t->conf, vrfy_cb, t);
     if (c->has_cert && c->has_key) mbedtls_ssl_conf_own_cert(&t->conf, &c->cert, &c->key);
   }
   if (mbedtls_ssl_setup(&t->ssl, &t->conf) != 0) wn_host_fail("tlsCall: the engine could not set up a session");

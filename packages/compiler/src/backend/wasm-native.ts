@@ -19,11 +19,11 @@
  * fetch, the vendored zlib) behind them. */
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmod, copyFile, mkdir, mkdtemp, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { chmod, copyFile, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { availableParallelism, tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { ensureTlsArchive, ensureZlibObjects, resolveCc, runtimeSrcDir } from "./cc.js";
+import { type CcDriver, ensureZlibObjects, resolveCc, runtimeSrcDir } from "./cc.js";
 import {
   IMPORT_CHDIR,
   IMPORT_CP_CALL,
@@ -49,6 +49,7 @@ import {
   IMPORT_WRITE,
 } from "./wasm/abi.js";
 import { TLS_ROOTS_SHA256, tlsRootsBytes } from "./wasm/tls-roots.js";
+import { UNDICI_LLHTTP_SHA256, UNDICI_VERSION, undiciLlhttpWasm } from "./wasm/undici-llhttp.js";
 import { type HostImportSig, wasmModuleToC } from "./wasm2c.js";
 
 const execFileAsync = promisify(execFile);
@@ -101,7 +102,7 @@ export function wasmNativeRuntimeDir(): string {
 }
 
 /** The runner's C units, compiled once per flavor into objects. */
-const RUNNER_SOURCES = ["wn_gc.c", "wn_host.c", "wn_main.c", "wn_ev.c", "wn_cp.c", "wn_net.c", "wn_tls.c", "wn_fetch.c", "wn_trust.c"];
+const RUNNER_SOURCES = ["wn_gc.c", "wn_host.c", "wn_main.c", "wn_ev.c", "wn_cp.c", "wn_net.c", "wn_tls.c", "wn_fetch.c", "wn_trust.c", "wn_x509.c"];
 /** The units a module links only when it imports what they serve (the
  * translation declares `host_<import>` for each import it has): the TLS
  * engine (and the vendored mbedTLS archive behind it). */
@@ -110,6 +111,8 @@ const OPTIONAL_UNITS: readonly { obj: string; needs: RegExp }[] = [
   { obj: "wn_fetch.o", needs: /\bhost_fetch\(/ },
   // the trust stores both use (Node's bundled roots: ensureRootsObject)
   { obj: "wn_trust.o", needs: /\bhost_(tlsCall|fetch)\(/ },
+  // OpenSSL's verification of a peer's chain and Node's name check
+  { obj: "wn_x509.o", needs: /\bhost_(tlsCall|fetch)\(/ },
 ];
 /** Everything the runner's objects and the translation include. */
 const RUNNER_INPUTS = [
@@ -117,6 +120,8 @@ const RUNNER_INPUTS = [
   "wasmnative/wn_host.h",
   "wasmnative/wn_net.h",
   "wasmnative/wn_trust.h",
+  "wasmnative/wn_llw.h",
+  "wasmnative/wn_x509.h",
   ...RUNNER_SOURCES.map((s) => `wasmnative/${s}`),
   "scr_zone_names.h",
   "scr_zlib_prefix.h",
@@ -191,6 +196,16 @@ async function publishDir(build: string, dir: string, files: string[]): Promise<
   if (!(await rename(dir, stale).then(() => true, () => false))) return;
   await rename(build, dir).catch(() => undefined);
   await rm(stale, { recursive: true, force: true });
+}
+/** an ar archive past its header, with at least one member (#323) */
+async function isWholeArchive(p: string): Promise<boolean> {
+  try {
+    const st = await stat(p);
+    if (!st.isFile() || st.size < 68) return false;
+    return (await readFile(p)).subarray(0, 8).toString("latin1") === "!<arch>\n";
+  } catch {
+    return false;
+  }
 }
 async function digestOf(p: string): Promise<string> {
   const b = await readFile(p);
@@ -280,6 +295,122 @@ const unsigned int wn_tls_roots_len = ${bytes.length};
   return obj;
 }
 
+/** undici's HTTP/1 parser for the runner's fetch (wn_fetch.c): the llhttp
+ * wasm module Node's fetch instantiates (wasm/undici-llhttp.ts), translated
+ * by wasm2c into one C unit whose runner-facing names are kept apart from
+ * the program's (#define'd to wn_llw_*), its callbacks (env.wasm_on_*)
+ * bound to wn_fetch.c's transcription of undici's Parser, and the exports
+ * fetch calls exposed as wn_llw_<name>. Running undici's own parser is
+ * what makes a malformed response fail exactly as Node's fetch fails: its
+ * llhttp is not node:http's (llhttp-tables.ts), and the two disagree. */
+const LLHTTP_CALLBACKS: [string, number][] = [
+  ["wasm_on_headers_complete", 4],
+  ["wasm_on_message_begin", 1],
+  ["wasm_on_url", 3],
+  ["wasm_on_status", 3],
+  ["wasm_on_header_field", 3],
+  ["wasm_on_header_value", 3],
+  ["wasm_on_body", 3],
+  ["wasm_on_message_complete", 1],
+];
+const LLHTTP_EXPORTS = ["_initialize", "llhttp_alloc", "llhttp_free", "llhttp_execute", "llhttp_finish", "llhttp_get_error_reason", "llhttp_get_error_pos", "malloc", "free"];
+const RENAMED = ["w_types", "w_ntypes", "w_disp", "w_refoffs", "w_gc_roots", "w_gc_nroots", "w_init", "w_hostmem", "w_export_memory", ...["_start", "_tick", "_loop", "_status"].flatMap((e) => [`w_export_${e}`, `w_has_${e}`])];
+let llhttpCMemo: string | null = null;
+export function llhttpUnitC(): string {
+  if (llhttpCMemo !== null) return llhttpCMemo;
+  const hostImports = new Map(LLHTTP_CALLBACKS.map(([n, k]) => [n, sig(Array.from({ length: k }, () => "i32" as const), ["i32"])]));
+  const body = wasmModuleToC(undiciLlhttpWasm(), { hostImports, importModule: "env", exportFunctions: { prefix: "wn_llw_", names: LLHTTP_EXPORTS } });
+  llhttpCMemo = [
+    `/* GENERATED by backend/wasm-native.ts: undici ${UNDICI_VERSION}'s llhttp wasm (sha256 ${UNDICI_LLHTTP_SHA256}) through wasm2c */`,
+    `#include "wn_llw.h"`,
+    ...RENAMED.map((n) => `#define ${n} wn_llw_${n.replace(/^w_/, "")}`),
+    ...LLHTTP_CALLBACKS.map(([n]) => `#define host_${n} wn_llw_on_${n.slice("wasm_on_".length)}`),
+    body,
+    "uint8_t *wn_llw_hostmem;",
+    "",
+  ].join("\n");
+  return llhttpCMemo;
+}
+async function ensureLlhttpObject(sanitize: boolean): Promise<string> {
+  const driver = resolveCc();
+  const cacheRoot = join(runtimeSrcDir(), "..", "vendor", ".cache");
+  const c = llhttpUnitC();
+  const key = createHash("sha256")
+    .update(c)
+    .update("\0")
+    .update(await readFile(join(wasmNativeRuntimeDir(), "wn_rt.h")))
+    .update(await readFile(join(wasmNativeRuntimeDir(), "wn_llw.h")))
+    .update("\0")
+    .update([...cflags(sanitize), ...driver.targetArgs].join("\x1f"))
+    .update("\0")
+    .update(await ccVersion())
+    .digest("hex")
+    .slice(0, 16);
+  const dir = join(cacheRoot, `wasmnative-llhttp-${key}-${sanitize ? "ubsan" : "plain"}`);
+  const obj = join(dir, "wn_llhttp.o");
+  if (await isWholeElf(obj, false)) return obj;
+  await mkdir(cacheRoot, { recursive: true });
+  const build = await mkdtemp(join(cacheRoot, "build-wasmnative-llhttp-"));
+  try {
+    // the source stays beside the object (a sanitizer build links it too)
+    await writeFile(join(build, "wn_llhttp.c"), c);
+    await execFileAsync(driver.argv[0] ?? "clang", [...driver.argv.slice(1), ...cflags(sanitize), ...driver.targetArgs, `-I${wasmNativeRuntimeDir()}`, "-c", join(build, "wn_llhttp.c"), "-o", join(build, "wn_llhttp.o")], { maxBuffer: 64 << 20 });
+    if (!(await isWholeElf(join(build, "wn_llhttp.o"), false))) throw new Error("wasm-native: the compiler left an llhttp object that is not a whole ELF file");
+    await publishDir(build, dir, ["wn_llhttp.o"]);
+  } finally {
+    await rm(build, { recursive: true, force: true });
+  }
+  return obj;
+}
+
+/** The vendored mbedTLS as this lane links it: built with
+ * TSINTER_X509_KEEP_CRITICAL, so a certificate whose critical extension
+ * mbedTLS does not parse (a CA's nameConstraints, an unknown extension)
+ * still parses — the verdict on it is wn_x509.c's, OpenSSL's (an unknown
+ * critical extension is "unhandled critical extension" there, as in
+ * Node). The c and llvm lanes' archive (cc.ts ensureTlsArchive) is
+ * upstream's code. Cached by the library's sources, whole-published. */
+async function ensureWnTlsArchive(driver: CcDriver): Promise<string> {
+  const vendor = join(runtimeSrcDir(), "..", "vendor", "mbedtls");
+  const cacheRoot = join(runtimeSrcDir(), "..", "vendor", ".cache");
+  const sources = (await readdir(join(vendor, "library"))).filter((n) => n.endsWith(".c")).sort();
+  const h = createHash("sha256");
+  for (const f of sources) h.update(f).update("\0").update(await readFile(join(vendor, "library", f))).update("\0");
+  h.update(await ccVersion()).update("\0").update(driver.targetArgs.join("\x1f"));
+  const dir = join(cacheRoot, `wasmnative-mbedtls-${h.digest("hex").slice(0, 16)}`);
+  const archive = join(dir, "libmbedtls.a");
+  if (await isWholeArchive(archive)) return archive;
+  await mkdir(cacheRoot, { recursive: true });
+  const build = await mkdtemp(join(cacheRoot, "build-wasmnative-mbedtls-"));
+  try {
+    const flags = ["-std=c11", ...driver.targetArgs, "-Os", "-DTSINTER_X509_KEEP_CRITICAL", "-I", join(vendor, "include"), "-I", join(vendor, "library")];
+    const width = availableParallelism();
+    for (let i = 0; i < sources.length; i += width) {
+      await Promise.all(
+        sources
+          .slice(i, i + width)
+          .map((src) => execFileAsync(driver.argv[0] ?? "clang", [...driver.argv.slice(1), ...flags, "-c", join(vendor, "library", src), "-o", join(build, src.replace(/\.c$/, ".o"))])),
+      );
+    }
+    const objs = sources.map((src) => join(build, src.replace(/\.c$/, ".o")));
+    if (!(await Promise.all(objs.map((o) => isWholeElf(o, false)))).every(Boolean)) throw new Error("wasm-native: the compiler left an mbedTLS object that is not a whole ELF file");
+    await execFileAsync("ar", ["rcs", join(build, "libmbedtls.a"), ...objs]);
+    for (const o of objs) await rm(o, { force: true });
+    if (!(await isWholeArchive(join(build, "libmbedtls.a")))) throw new Error("wasm-native: ar left an mbedTLS archive that is not whole");
+    if (!(await rename(build, dir).then(() => true, () => false)) && !(await isWholeArchive(archive))) {
+      // a broken directory in the way: moved aside, never removed in place (#323)
+      const stale = `${dir}.stale-${process.pid}-${Math.random().toString(36).slice(2)}`;
+      if (await rename(dir, stale).then(() => true, () => false)) {
+        await rename(build, dir).catch(() => undefined);
+        await rm(stale, { recursive: true, force: true });
+      }
+    }
+  } finally {
+    await rm(build, { recursive: true, force: true });
+  }
+  return archive;
+}
+
 let ccVersionMemo: Promise<string> | null = null;
 function ccVersion(): Promise<string> {
   const driver = resolveCc();
@@ -311,9 +442,11 @@ export async function compileWasmNative(opts: { cPath: string; outPath: string; 
   // plain flavor — its objects carry no sanitizer runtime)
   const libs = [
     ...(wanted.has("wn_trust.o") ? [await ensureRootsObject()] : []),
-    ...(wanted.has("wn_tls.o") || wanted.has("wn_fetch.o") ? [await ensureTlsArchive(false, driver)] : []),
+    ...(wanted.has("wn_tls.o") || wanted.has("wn_fetch.o") ? [await ensureWnTlsArchive(driver)] : []),
     // fetch's content decoding: the vendored zlib Node bundles
     ...(wanted.has("wn_fetch.o") ? await ensureZlibObjects(false, driver) : []),
+    // the response parser: undici's own llhttp (ensureLlhttpObject)
+    ...(wanted.has("wn_fetch.o") ? [await ensureLlhttpObject(opts.sanitize)] : []),
   ];
   const args = [
     ...driver.argv.slice(1),
@@ -337,6 +470,9 @@ export async function compileWasmNative(opts: { cPath: string; outPath: string; 
       .update(await runnerInputsHash())
       .update("\0")
       .update(cflags(opts.sanitize).join("\x1f"))
+      .update("\0")
+      // the generated units it links (by what they are made from)
+      .update(`${TLS_ROOTS_SHA256} ${UNDICI_LLHTTP_SHA256}`)
       .update("\0")
       .update(await readFile(opts.cPath))
       .digest("hex");

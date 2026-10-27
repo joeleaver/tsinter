@@ -766,6 +766,12 @@ export interface HostImportSig {
 export interface WholeOptions {
   /** the runner's host imports, by abi.ts name (module "tsinter") */
   hostImports: ReadonlyMap<string, HostImportSig>;
+  /** the module the imports come from (default "tsinter"; undici's llhttp,
+   * which the runner's fetch links, imports its callbacks from "env") */
+  importModule?: string;
+  /** function exports to expose as `<prefix><name>` beside the runner's
+   * entry points (each must exist) */
+  exportFunctions?: { prefix: string; names: readonly string[] };
 }
 
 /** A module import the runner's host does not provide (or provides with
@@ -880,7 +886,7 @@ export function wasmModuleToC(bytes: Uint8Array, opts: WholeOptions): string {
   // ── imports: every one must be a host import the runner provides, with
   // the same signature.
   for (const im of m.imports) {
-    if (im.module !== "tsinter") throw new Wasm2cHostImportError(`${im.module}.${im.name}`, `wasm2c: import ${im.module}.${im.name} has no native host`);
+    if (im.module !== (opts.importModule ?? "tsinter")) throw new Wasm2cHostImportError(`${im.module}.${im.name}`, `wasm2c: import ${im.module}.${im.name} has no native host`);
     const want = opts.hostImports.get(im.name);
     if (want === undefined) throw new Wasm2cHostImportError(im.name, `wasm2c: the native host does not provide import tsinter.${im.name} yet`);
     const ft = ftOf(im.type);
@@ -1111,6 +1117,13 @@ export function wasmModuleToC(bytes: Uint8Array, opts: WholeOptions): string {
     if (!has.has(name)) out.push(`${ret} w_export_${name}(${params}) { ${params === "void" ? "" : "(void)a0; "}w_trap(W_TRAP_UNREACHABLE); }`);
   }
   if (!has.has("memory")) out.push(`uint8_t *w_export_memory(void) { return 0; }`);
+  for (const name of opts.exportFunctions?.names ?? []) {
+    const e = m.allExports.find((x) => x.kind === 0 && x.name === name);
+    if (e === undefined) throw new Error(`wasm2c: the module exports no function ${name}`);
+    const ft = ftOf(m.funcTypes[e.idx]!);
+    const args = ft.params.map((_, k) => `a${k}`).join(", ");
+    out.push(`${retType(ft)} ${opts.exportFunctions!.prefix}${cName(name)}(${paramList(ft, "a")}) { ${ft.results.length > 0 ? "return " : ""}${fnName.get(e.idx)!}(${args}); }`);
+  }
   return out.join("\n") + "\n";
 }
 

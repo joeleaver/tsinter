@@ -57,7 +57,9 @@
 #include "zlib.h"
 
 #include "wn_host.h"
+#include "wn_llw.h"
 #include "wn_trust.h"
+#include "wn_x509.h"
 
 extern void (*wn_fetch_delivered)(const WnEv *e);
 
@@ -193,6 +195,99 @@ static long long v4_part(const char *p, size_t n) {
   }
   return v;
 }
+/* the WHATWG URL serializer's IPv6 address: lowercase hex pieces, the
+ * first longest run of two or more zero pieces compressed to "::" (never
+ * a dotted IPv4 tail — "::ffff:7f00:1", as Node's URL prints it) */
+static void ipv6_ser(const uint8_t a[16], Str *s) {
+  unsigned w[8];
+  for (int i = 0; i < 8; i++) w[i] = (unsigned)(a[2 * i] << 8 | a[2 * i + 1]);
+  int best = -1, bestlen = 0;
+  for (int i = 0; i < 8;) {
+    if (w[i] != 0) {
+      i++;
+      continue;
+    }
+    int j = i;
+    while (j < 8 && w[j] == 0) j++;
+    if (j - i > bestlen) best = i, bestlen = j - i;
+    i = j;
+  }
+  if (bestlen < 2) best = -1;
+  int ignore0 = 0;
+  for (int i = 0; i < 8; i++) {
+    if (ignore0 && w[i] == 0) continue;
+    ignore0 = 0;
+    if (best == i) {
+      s_cat(s, i == 0 ? "::" : ":");
+      ignore0 = 1;
+      continue;
+    }
+    char h[8];
+    snprintf(h, sizeof h, "%x", w[i]);
+    s_cat(s, h);
+    if (i != 7) s_chr(s, ':');
+  }
+}
+
+/* an "xn--" label as the URL parser's domain-to-ASCII accepts one: its
+ * Punycode (RFC 3492) must decode, to something that is not plain ASCII,
+ * holding no code point UTS #46 never lets through (an ASCII capital or
+ * symbol, a control, a surrogate, a noncharacter). The rest of UTS #46's
+ * table (mapped and disallowed code points) is not consulted: SEMANTICS.md
+ * S117 (h). 1 when acceptable. */
+static int puny_ok(const char *p, size_t n) {
+  enum { BASE = 36, TMIN = 1, TMAX = 26, SKEW = 38, DAMP = 700 };
+  uint32_t out[256];
+  size_t on = 0;
+  size_t b = 0;
+  for (size_t j = 0; j < n; j++)
+    if (p[j] == '-') b = j + 1;
+  size_t in = 0;
+  if (b > 0) {
+    if (b - 1 > sizeof out / sizeof *out) return 0;
+    for (size_t j = 0; j + 1 < b; j++) out[on++] = (unsigned char)p[j];
+    in = b;
+  }
+  uint32_t nn = 128, i = 0, bias = 72;
+  while (in < n) {
+    uint32_t oldi = i, w = 1;
+    for (uint32_t k = BASE;; k += BASE) {
+      if (in >= n) return 0;
+      int c = (unsigned char)p[in++];
+      uint32_t d = c >= 'a' && c <= 'z' ? (uint32_t)(c - 'a') : c >= 'A' && c <= 'Z' ? (uint32_t)(c - 'A') : c >= '0' && c <= '9' ? (uint32_t)(c - '0' + 26) : 99;
+      if (d >= BASE) return 0;
+      if (d > (UINT32_MAX - i) / w) return 0;
+      i += d * w;
+      uint32_t t = k <= bias ? TMIN : k >= bias + TMAX ? TMAX : k - bias;
+      if (d < t) break;
+      if (w > UINT32_MAX / (BASE - t)) return 0;
+      w *= BASE - t;
+    }
+    /* adapt */
+    uint32_t delta = oldi == 0 ? (i - oldi) / DAMP : (i - oldi) / 2;
+    delta += delta / (uint32_t)(on + 1);
+    uint32_t kk = 0;
+    while (delta > ((BASE - TMIN) * TMAX) / 2) delta /= BASE - TMIN, kk += BASE;
+    bias = kk + (BASE - TMIN + 1) * delta / (delta + SKEW);
+    if (i / (on + 1) > UINT32_MAX - nn) return 0;
+    nn += i / (uint32_t)(on + 1);
+    i %= (uint32_t)(on + 1);
+    if (on >= sizeof out / sizeof *out) return 0;
+    memmove(out + i + 1, out + i, (on - i) * sizeof *out);
+    out[i++] = nn;
+    on++;
+  }
+  if (on == 0) return 0;
+  int non_ascii = 0;
+  for (size_t j = 0; j < on; j++) {
+    uint32_t c = out[j];
+    if (c >= 0x80) non_ascii = 1;
+    if (c < 0xa0 && !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-')) return 0;
+    if ((c >= 0xd800 && c <= 0xdfff) || c > 0x10ffff || (c >= 0xfdd0 && c <= 0xfdef) || (c & 0xfffe) == 0xfffe) return 0;
+  }
+  return non_ascii;
+}
+
 /* host: 0 ok (*out set), -1 invalid */
 static int parse_host(const char *p, size_t n, char **out) {
   if (n == 0) return -1;
@@ -204,11 +299,9 @@ static int parse_host(const char *p, size_t n, char **out) {
     buf[n - 2] = 0;
     struct in6_addr a;
     if (inet_pton(AF_INET6, buf, &a) != 1) return -1;
-    char txt[INET6_ADDRSTRLEN];
-    inet_ntop(AF_INET6, &a, txt, sizeof txt);
     Str s = {0};
     s_chr(&s, '[');
-    s_cat(&s, txt);
+    ipv6_ser(a.s6_addr, &s);
     s_chr(&s, ']');
     *out = s_take(&s);
     return 0;
@@ -223,6 +316,16 @@ static int parse_host(const char *p, size_t n, char **out) {
       return -1;
     }
     d[i] = (char)tolower(c);
+  }
+  /* a Punycode label must decode (domain to ASCII) */
+  for (size_t st = 0; st <= dn;) {
+    size_t en = st;
+    while (en < dn && d[en] != '.') en++;
+    if (en - st >= 4 && !memcmp(d + st, "xn--", 4) && !puny_ok(d + st + 4, en - st - 4)) {
+      free(d);
+      return -1;
+    }
+    st = en + 1;
   }
   /* an IPv4 address in any of its number forms ends in a number */
   const char *last = strrchr(d, '.');
@@ -610,8 +713,14 @@ static void h_free(Hdrs *h) {
 
 enum { ST_RESOLVE = 1, ST_CONNECT, ST_PROXY, ST_TLS, ST_SEND, ST_HEAD, ST_BODY, ST_DONE };
 
+typedef struct {
+  uint8_t *p;
+  size_t n;
+} Bytes;
+
 typedef struct Req {
   uint32_t handle;
+  unsigned hop_gen; /* counts hops: a loop that ran a parser callback stops when it moved */
   int dead;
   char *method;
   Url url;
@@ -638,26 +747,34 @@ typedef struct Req {
   WnIo io;
   WnBuf out;
   size_t out_off;
-  WnBuf in;
+  WnBuf tunnel_in; /* the bytes behind the proxy's CONNECT answer */
+  size_t tunnel_off;
   mbedtls_ssl_config conf;
   mbedtls_ssl_context ssl;
-  mbedtls_x509_crt chain;
   int tls_on;
-  int leaf_self, chain_self, depth_max, top_self;
-  /* the response */
+  /* the response, as fetch holds it */
   int status;
-  char *status_text;
+  char *resp_text; /* its status text (UTF-8 bytes, as undici took them) */
+  size_t resp_text_n;
   Hdrs rh;
-  int head_done, head_sent, chunked, until_close, no_body;
-  long long clen;
+  int head_sent, no_body;
   WnBuf body_raw;
-  size_t chunk_left;
-  int chunk_state; /* 0 size line, 1 data, 2 data CRLF, 3 trailers */
-  /* llhttp's view, as undici reads it */
-  Str cl_str;              /* every content-length value undici collected */
+  /* undici's Parser (client-h1.js) over undici's llhttp */
+  int32_t llp;           /* the parser (in the parser module's memory); 0 none */
+  int u_connect;         /* reading the proxy's answer to a CONNECT */
+  int u_status;          /* statusCode */
+  int u_keepalive;       /* shouldKeepAlive */
+  int u_upgrade;         /* upgrade */
+  Str status_text;       /* statusText */
+  Bytes *raw;            /* headers: name, value, name, value, ... */
+  size_t raw_n, raw_cap;
+  size_t headers_size;   /* headersSize */
+  Str keep_alive, connection, cl_str;
   unsigned long long bytes_read;
-  size_t headers_size;     /* name and value bytes (undici's headersSize) */
-  int have_cl, have_te;
+  int completed;         /* request.onComplete ran */
+  int destroyed;         /* util.destroy(socket, err) ran: its error */
+  char *d_name, *d_msg, *d_code;
+  unsigned long long rx; /* bytes read on this hop */
   int hop_last_;
 } Req;
 
@@ -670,7 +787,6 @@ static void req_free_hop(Req *r) {
   if (r->tls_on) {
     mbedtls_ssl_free(&r->ssl);
     mbedtls_ssl_config_free(&r->conf);
-    mbedtls_x509_crt_free(&r->chain);
     r->tls_on = 0;
   }
   if (r->ai) freeaddrinfo(r->ai);
@@ -682,16 +798,24 @@ static void req_free_hop(Req *r) {
   r->conn_errs = r->first_err = 0;
   wn_buf_free(&r->out);
   r->out_off = 0;
-  wn_buf_free(&r->in);
-  free(r->status_text);
-  r->status_text = NULL;
+  wn_buf_free(&r->tunnel_in);
+  free(r->resp_text);
   h_free(&r->rh);
   wn_buf_free(&r->body_raw);
+  if (r->llp) wn_llw_llhttp_free(r->llp);
+  free(r->status_text.p);
+  for (size_t i = 0; i < r->raw_n; i++) free(r->raw[i].p);
+  free(r->raw);
+  free(r->keep_alive.p);
+  free(r->connection.p);
   free(r->cl_str.p);
+  free(r->d_name);
+  free(r->d_msg);
+  free(r->d_code);
   /* everything per hop, zeroed whole (the verification verdict included) */
   memset(&r->hop_first_, 0, offsetof(Req, hop_last_) - offsetof(Req, hop_first_));
   r->fd = -1;
-  r->clen = -1;
+  r->hop_gen++;
 }
 
 static void req_finish(Req *r) {
@@ -709,28 +833,35 @@ static void req_finish(Req *r) {
 
 /* an ERROR RECORD (abi.ts fetch): name, message, hasCause, then the
  * cause's name, message and code (empty = none) */
-static void err_record(WnBuf *b, const char *name, const char *msg, const char *cname, const char *cmsg, const char *ccode) {
+static void err_record(WnBuf *b, const char *name, const char *msg, const char *cname, const char *cmsg, size_t cmsg_len, const char *ccode) {
   wn_buf_run8(b, name, strlen(name));
   wn_buf_run8(b, msg, strlen(msg));
   wn_buf_u32(b, cname != NULL);
   if (cname) {
     wn_buf_run8(b, cname, strlen(cname));
-    wn_buf_run8(b, cmsg, strlen(cmsg));
+    wn_buf_run8(b, cmsg, cmsg_len);
     wn_buf_run8(b, ccode ? ccode : "", ccode ? strlen(ccode) : 0);
   }
 }
 /* the request failed: before its head, fetch() rejects with "fetch
  * failed"; after it, the body readers with "terminated" */
-static void req_fail(Req *r, const char *cname, const char *cmsg, const char *ccode) {
+static void req_fail_len(Req *r, const char *cname, const char *cmsg, size_t cmsg_len, const char *ccode) {
   if (r->dead) return;
+  if (r->head_sent && r->no_body) {
+    /* the response's body is null (a null-body status, or HEAD): what
+     * fails behind its head is nothing the program can read (Node's
+     * stream errors where no reader is) */
+    wn_ev_push(wn_ev_new(WN_SRC_FETCH, r->handle, EV_BODY, 0, 0, NULL, 0));
+    req_finish(r);
+    return;
+  }
   WnBuf b = {0};
-  err_record(&b, "TypeError", r->head_sent ? "terminated" : "fetch failed", cname, cmsg, ccode);
+  err_record(&b, "TypeError", r->head_sent ? "terminated" : "fetch failed", cname, cmsg, cmsg_len, ccode);
   wn_ev_push(wn_ev_new(WN_SRC_FETCH, r->handle, EV_FAIL, 0, 0, b.p, (uint32_t)b.n));
   wn_buf_free(&b);
   req_finish(r);
 }
-static void req_fail_errno(Req *r, const char *syscall, int e, const char *where) {
-  char msg[300];
+static const char *errno_code(int e) {
   const char *code = NULL;
   static char codebuf[32];
   switch (e) {
@@ -747,6 +878,12 @@ static void req_fail_errno(Req *r, const char *syscall, int e, const char *where
       snprintf(codebuf, sizeof codebuf, "E%d", e);
       code = codebuf;
   }
+  return code;
+}
+static void req_fail(Req *r, const char *cname, const char *cmsg, const char *ccode) { req_fail_len(r, cname, cmsg, cmsg ? strlen(cmsg) : 0, ccode); }
+static void req_fail_errno(Req *r, const char *syscall, int e, const char *where) {
+  char msg[300];
+  const char *code = errno_code(e);
   if (where) snprintf(msg, sizeof msg, "%s %s %s", syscall, code, where);
   else snprintf(msg, sizeof msg, "%s %s", syscall, code);
   req_fail(r, "Error", msg, code);
@@ -774,6 +911,13 @@ static int bio_send(void *ctx, const unsigned char *buf, size_t len) {
 }
 static int bio_recv(void *ctx, unsigned char *buf, size_t len) {
   Req *r = ctx;
+  if (r->tunnel_off < r->tunnel_in.n) {
+    size_t k = r->tunnel_in.n - r->tunnel_off;
+    if (k > len) k = len;
+    memcpy(buf, r->tunnel_in.p + r->tunnel_off, k);
+    r->tunnel_off += k;
+    return (int)k;
+  }
   ssize_t n;
   do n = recv(r->fd, buf, len, 0);
   while (n < 0 && errno == EINTR);
@@ -781,63 +925,19 @@ static int bio_recv(void *ctx, unsigned char *buf, size_t len) {
   if (errno == EAGAIN || errno == EWOULDBLOCK) return MBEDTLS_ERR_SSL_WANT_READ;
   return errno == ECONNRESET ? MBEDTLS_ERR_NET_CONN_RESET : MBEDTLS_ERR_NET_RECV_FAILED;
 }
-static int vrfy_cb(void *ctx, mbedtls_x509_crt *crt, int depth, uint32_t *flags) {
-  Req *r = ctx;
-  int self = crt->issuer_raw.len == crt->subject_raw.len && memcmp(crt->issuer_raw.p, crt->subject_raw.p, crt->subject_raw.len) == 0;
-  if (depth >= r->depth_max) {
-    r->depth_max = depth;
-    r->top_self = self;
-  }
-  if (*flags & MBEDTLS_X509_BADCERT_NOT_TRUSTED) {
-    if (depth == 0 && self) r->leaf_self = 1;
-    if (depth > 0 && self) r->chain_self = 1;
-  }
-  return 0;
-}
-
-/* a verdict as Node's TLS error: the OpenSSL text and code */
-static void tls_verdict_fail(Req *r) {
-  uint32_t f = mbedtls_ssl_get_verify_result(&r->ssl);
-  const mbedtls_x509_crt *peer = mbedtls_ssl_get_peer_cert(&r->ssl);
-  int alone = peer != NULL && peer->next == NULL;
-  const char *msg = "unspecified certificate verification error", *code = "UNSPECIFIED";
-  const char *hint = "; if the root CA is installed locally, try running Node.js with --use-system-ca";
-  char buf[300];
-  uint32_t g = f & ~(uint32_t)MBEDTLS_X509_BADCERT_CN_MISMATCH;
-  if (g & MBEDTLS_X509_BADCERT_NOT_TRUSTED) {
-    if (r->leaf_self && alone) {
-      snprintf(buf, sizeof buf, "self-signed certificate%s", hint);
-      msg = buf;
-      code = "DEPTH_ZERO_SELF_SIGNED_CERT";
-    } else if (r->chain_self) {
-      msg = "self-signed certificate in certificate chain";
-      code = "SELF_SIGNED_CERT_IN_CHAIN";
-    } else if (alone) {
-      snprintf(buf, sizeof buf, "unable to verify the first certificate%s", hint);
-      msg = buf;
-      code = "UNABLE_TO_VERIFY_LEAF_SIGNATURE";
-    } else {
-      msg = "unable to get local issuer certificate";
-      code = "UNABLE_TO_GET_ISSUER_CERT_LOCALLY";
-    }
-  } else if (g & MBEDTLS_X509_BADCERT_EXPIRED) {
-    msg = "certificate has expired";
-    code = "CERT_HAS_EXPIRED";
-  } else if (g & MBEDTLS_X509_BADCERT_FUTURE) {
-    msg = "certificate is not yet valid";
-    code = "CERT_NOT_YET_VALID";
-  } else if (g & MBEDTLS_X509_BADCERT_REVOKED) {
-    msg = "certificate revoked";
-    code = "CERT_REVOKED";
-  } else if (g == 0 && !r->top_self) {
-    msg = "unable to get issuer certificate";
-    code = "UNABLE_TO_GET_ISSUER_CERT";
-  }
-  req_fail(r, "Error", msg, code);
+static int32_t ll_new(void);
+/* a verdict as Node's TLS error: OpenSSL's text (with Node's hint where it
+ * gives one) and Node's code */
+static void tls_verdict_fail(Req *r, int code) {
+  char msg[300];
+  const char *hint = code == 18 || code == 21 ? "; if the root CA is installed locally, try running Node.js with --use-system-ca" : "";
+  snprintf(msg, sizeof msg, "%s%s", wn_x509_err_text(code), hint);
+  req_fail(r, "Error", msg, wn_x509_err_name(code));
 }
 
 /* the request head, as undici writes it */
 static void write_head(Req *r) {
+  if (!r->llp) r->llp = ll_new();
   Str h = {0};
   s_cat(&h, r->method);
   s_chr(&h, ' ');
@@ -1062,6 +1162,10 @@ static void hop_start(Req *r) {
     free(r->dial_host);
     r->dial_host = xstrdup(host);
     r->dial_port = port;
+  } else if (h_find(&r->hdrs, "proxy-authorization")) {
+    /* undici's ProxyAgent refuses the program's own (throwIfProxyAuthIsSent) */
+    req_fail(r, "InvalidArgumentError", "Proxy-Authorization should be sent in ProxyAgent constructor", "UND_ERR_INVALID_ARG");
+    return;
   }
   /* strip IPv6 brackets for the lookup */
   char *bare = xstrdup(r->dial_host);
@@ -1105,13 +1209,12 @@ static void tls_begin(Req *r) {
   }
   mbedtls_ssl_config_init(&r->conf);
   mbedtls_ssl_init(&r->ssl);
-  mbedtls_x509_crt_init(&r->chain);
   r->tls_on = 1;
   mbedtls_ssl_config_defaults(&r->conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
   mbedtls_ssl_conf_rng(&r->conf, rng, NULL);
-  mbedtls_ssl_conf_authmode(&r->conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
-  mbedtls_ssl_conf_ca_chain(&r->conf, wn_trust_default(), NULL);
-  mbedtls_ssl_conf_verify(&r->conf, vrfy_cb, r);
+  /* the engine only carries the handshake: the chain is judged by
+   * wn_x509.c as OpenSSL judges it, the name as Node checks it */
+  mbedtls_ssl_conf_authmode(&r->conf, MBEDTLS_SSL_VERIFY_NONE);
   mbedtls_ssl_setup(&r->ssl, &r->conf);
   /* SNI for a DNS name (an IP literal gets none); the name itself is
    * checked by check_identity, as Node checks it, never by the engine */
@@ -1127,13 +1230,21 @@ static void tls_begin(Req *r) {
 
 static void connected(Req *r) {
   if (r->tunnel) {
+    /* the tunnel, as undici's proxy agent asks for it (any host length) */
     Str h = {0};
-    char b[300];
-    int port = r->url.port >= 0 ? r->url.port : 443;
-    snprintf(b, sizeof b, "CONNECT %s:%d HTTP/1.1\r\nhost: %s:%d\r\nconnection: close\r\n\r\n", r->url.host, port, r->url.host, port);
-    s_cat(&h, b);
+    char port[16];
+    snprintf(port, sizeof port, ":%d", r->url.port >= 0 ? r->url.port : 443);
+    s_cat(&h, "CONNECT ");
+    s_cat(&h, r->url.host);
+    s_cat(&h, port);
+    s_cat(&h, " HTTP/1.1\r\nhost: ");
+    s_cat(&h, r->url.host);
+    s_cat(&h, port);
+    s_cat(&h, "\r\nconnection: close\r\nproxy-connection: keep-alive\r\n\r\n");
     wn_buf_put(&r->out, h.p, h.n);
     free(h.p);
+    r->llp = ll_new();
+    r->u_connect = 1;
     r->state = ST_PROXY;
     return;
   }
@@ -1184,7 +1295,15 @@ static void send_head(Req *r) {
       l.v[j - 1] = t;
     }
   WnBuf b = {0};
-  run_latin1(&b, r->status_text);
+  {
+    /* statusText = buf.toString(): UTF-8 */
+    size_t m = wn_utf8_to_16((const uint8_t *)r->resp_text, r->resp_text_n, NULL);
+    uint16_t *u = malloc(m * 2 + 2);
+    if (!u) abort();
+    wn_utf8_to_16((const uint8_t *)r->resp_text, r->resp_text_n, u);
+    wn_buf_run16(&b, u, m);
+    free(u);
+  }
   char *u = url_ser(&r->url, 0);
   wn_buf_run8(&b, u, strlen(u));
   free(u);
@@ -1284,8 +1403,6 @@ static void finish_body(Req *r) {
   req_finish(r);
 }
 
-static int is_redirect(int s) { return s == 301 || s == 302 || s == 303 || s == 307 || s == 308; }
-
 /* a redirect hop per the fetch spec; 1 when a new hop started */
 static int follow(Req *r) {
   Hdr *loc = h_find(&r->rh, "location");
@@ -1313,6 +1430,13 @@ static int follow(Req *r) {
     return 1;
   }
   r->hops++;
+  /* a location with credentials: request mode "cors" refuses it (the
+   * request's origin is never the location's under Node — measured) */
+  if ((next.user && *next.user) || (next.pass && *next.pass)) {
+    url_free(&next);
+    req_fail(r, "Error", "cross origin not allowed for request mode \"cors\"", NULL);
+    return 1;
+  }
   int status = r->status;
   if ((status == 303 && strcmp(r->method, "GET") && strcmp(r->method, "HEAD")) || ((status == 301 || status == 302) && !strcmp(r->method, "POST"))) {
     free(r->method);
@@ -1342,529 +1466,404 @@ static int follow(Req *r) {
   return 1;
 }
 
-/* a parse failure as undici reports it (Parser.createError): when undici
- * has collected a content-length that the body read so far does not
- * match, the ResponseContentLengthMismatchError; otherwise llhttp's
- * reason inside "Response does not match the HTTP/1.1 protocol (...)" */
-static void http_error(Req *r, const char *reason) {
-  if (r->cl_str.n > 0) {
-    /* bytesRead !== parseInt(contentLength, 10): leading whitespace, a
-     * sign, the digits; no digits is NaN, which matches nothing */
-    const char *q = r->cl_str.p;
-    while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r' || *q == '\f' || *q == '\v') q++;
-    int neg = 0;
-    if (*q == '+' || *q == '-') neg = *q++ == '-';
-    int any = 0;
-    long double v = 0;
-    while (*q >= '0' && *q <= '9') v = v * 10 + (*q++ - '0'), any = 1;
-    if (neg) v = -v;
-    if (!any || v != (long double)r->bytes_read) {
-      req_fail(r, "ResponseContentLengthMismatchError", "Response body length does not match content-length header", "UND_ERR_RES_CONTENT_LENGTH_MISMATCH");
-      return;
-    }
-  }
-  char msg[200];
-  snprintf(msg, sizeof msg, "Response does not match the HTTP/1.1 protocol (%s)", reason);
-  req_fail(r, "HTTPParserError", msg, NULL);
-}
-
+/* ── the response: undici's Parser over undici's own llhttp ─────────────
+ * Node's fetch reads a response with undici's client-h1 Parser driving
+ * the llhttp wasm module undici ships; this host links that very module
+ * (translated: wn_llw.h) and transcribes the Parser's callbacks below, so
+ * a response is accepted, or refused with its reason, exactly as Node's
+ * fetch accepts or refuses it. The Parser's state lives in the request's
+ * hop (u_*). util.destroy(socket, err) is u_destroy: the first error
+ * wins, and the socket counts as destroyed from then on (the callbacks
+ * that check `socket.destroyed` answer -1). The proxy's answer to a
+ * CONNECT is read by the same parser (undici's connect() goes through
+ * it): u_connect. */
 #define MAX_HEADERS_SIZE 16384 /* http.maxHeaderSize, undici's default */
+enum { LL_TYPE_RESPONSE = 2, LL_OK = 0, LL_PAUSED = 21, LL_PAUSED_UPGRADE = 22 };
 
-/* the status line, as llhttp reads a response's; NULL or the reason */
-static const char *status_line(Req *r, const char *p, size_t n, int *status, char **reason) {
+static uint8_t *llmem;           /* the parser module's memory */
+static Req *ll_cur;              /* undici's currentParser */
+static int32_t ll_buf, ll_bufsz; /* currentBufferPtr / currentBufferSize */
+
+static int32_t ll_new(void) {
+  static int ready;
+  if (!ready) {
+    wn_llw_init();
+    wn_llw_initialize();
+    llmem = wn_llw_export_memory();
+    ready = 1;
+  }
+  return wn_llw_llhttp_alloc(LL_TYPE_RESPONSE);
+}
+
+static void u_destroy(Req *r, const char *name, const char *msg, const char *code) {
+  if (r->destroyed) return;
+  r->destroyed = 1;
+  r->d_name = xstrdup(name);
+  r->d_msg = xstrdup(msg);
+  r->d_code = code ? xstrdup(code) : NULL;
+}
+
+static void bytes_add(Bytes *b, const uint8_t *p, size_t n) {
+  b->p = realloc(b->p, b->n + n + 1);
+  if (!b->p) abort();
+  memcpy(b->p + b->n, p, n);
+  b->n += n;
+  b->p[b->n] = 0;
+}
+static void raw_free(Req *r) {
+  for (size_t i = 0; i < r->raw_n; i++) free(r->raw[i].p);
+  free(r->raw);
+  r->raw = NULL;
+  r->raw_n = r->raw_cap = 0;
+}
+static Bytes *raw_push(Req *r) {
+  if (r->raw_n == r->raw_cap) {
+    r->raw_cap = r->raw_cap ? r->raw_cap * 2 : 16;
+    r->raw = realloc(r->raw, r->raw_cap * sizeof *r->raw);
+    if (!r->raw) abort();
+  }
+  Bytes *b = &r->raw[r->raw_n++];
+  b->p = NULL;
+  b->n = 0;
+  return b;
+}
+
+/* JavaScript's parseInt(s, 10) of a UTF-8 string, as a double (NaN when no
+ * digit): StrWhiteSpaceChar skipped, a sign, the longest digit run
+ * (correctly rounded) */
+static double js_parse_int10(const uint8_t *s, size_t n) {
+  size_t m = wn_utf8_to_16(s, n, NULL);
+  uint16_t *u = malloc((m + 1) * 2);
+  if (!u) abort();
+  wn_utf8_to_16(s, n, u);
   size_t i = 0;
-  if (n < 5 || memcmp(p, "HTTP/", 5) != 0) return "Expected HTTP/, RTSP/ or ICE/";
-  i = 5;
-  if (i >= n || p[i] < '0' || p[i] > '9') return "Invalid major version";
-  i++;
-  if (i >= n || p[i] != '.') return "Expected dot";
-  i++;
-  if (i >= n || p[i] < '0' || p[i] > '9') return "Invalid minor version";
-  i++;
-  if (i >= n || p[i] != ' ') return "Expected space after version";
-  i++;
-  int code = 0, digits = 0;
-  while (i < n && p[i] >= '0' && p[i] <= '9' && digits < 3) code = code * 10 + (p[i++] - '0'), digits++;
-  if (digits < 3) return "Invalid status code";
-  if (i < n && p[i] != ' ' && p[i] != '\r') return "Invalid response status";
-  if (i >= n) return "Invalid response status";
-  const char *rs = p + i;
-  if (*rs == ' ') rs++;
-  const char *cr = memchr(rs, '\r', (size_t)(p + n - rs));
-  if (!cr || cr + 1 != p + n - 1) return "Missing expected CR after response line";
-  (void)r;
-  *status = code;
-  *reason = xstrndup(rs, (size_t)(cr - rs));
-  return NULL;
+  for (; i < m; i++) {
+    uint16_t c = u[i];
+    int ws = c == 9 || c == 10 || c == 11 || c == 12 || c == 13 || c == 32 || c == 0xa0 || c == 0x1680 || (c >= 0x2000 && c <= 0x200a) ||
+             c == 0x2028 || c == 0x2029 || c == 0x202f || c == 0x205f || c == 0x3000 || c == 0xfeff;
+    if (!ws) break;
+  }
+  int neg = 0;
+  if (i < m && (u[i] == '+' || u[i] == '-')) neg = u[i++] == '-';
+  Str d = {0};
+  while (i < m && u[i] >= '0' && u[i] <= '9') s_chr(&d, (char)u[i++]);
+  free(u);
+  if (d.n == 0) {
+    free(d.p);
+    return __builtin_nan("");
+  }
+  double v = strtod(d.p, NULL);
+  free(d.p);
+  return neg ? -v : v;
 }
-
-/* one header line (without its LF); NULL or the reason */
-static const char *header_line(Req *r, const char *p, size_t n) {
-  if (n == 0 || p[n - 1] != '\r') return "Missing expected CR after header value";
-  n--;
-  if (n > 0 && (p[0] == ' ' || p[0] == '\t')) return "Unexpected whitespace after header value";
-  size_t c = 0;
-  while (c < n && p[c] != ':') {
-    unsigned char ch = (unsigned char)p[c];
-    if (!(ch > 0x20 && ch < 0x7f && !strchr("\"(),/:;<=>?@[\\]{}", ch))) return "Invalid header token";
-    c++;
-  }
-  if (c == n || c == 0) return "Invalid header token";
-  size_t v = c + 1;
-  while (v < n && (p[v] == ' ' || p[v] == '\t')) v++;
-  for (size_t k = v; k < n; k++) {
-    unsigned char ch = (unsigned char)p[k];
-    if ((ch < 0x20 && ch != '\t')) return "Invalid header value char";
-  }
-  char *name = xstrndup(p, c);
-  char *value = xstrndup(p + v, n - v);
-  r->headers_size += c + (n - v);
-  const char *bad = NULL;
-  if (!strcasecmp(name, "content-length")) {
-    if (r->have_cl) bad = "Duplicate Content-Length";
-    else {
-      r->have_cl = 1;
-      unsigned long long acc = 0;
-      size_t k = 0;
-      for (; k < strlen(value) && value[k] >= '0' && value[k] <= '9'; k++) {
-        unsigned d = (unsigned)(value[k] - '0');
-        if (acc > (18446744073709551615ULL - d) / 10) {
-          s_put(&r->cl_str, value, k);
-          bad = "Content-Length overflow";
-          break;
-        }
-        acc = acc * 10 + d;
-      }
-      if (!bad) {
-        size_t t = k;
-        while (t < strlen(value) && (value[t] == ' ' || value[t] == '\t')) t++;
-        if (k == 0 || t != strlen(value)) {
-          s_put(&r->cl_str, value, k);
-          bad = "Invalid character in Content-Length";
-        } else {
-          s_cat(&r->cl_str, value);
-          r->clen = (long long)acc;
-        }
-      }
-    }
-  } else if (!strcasecmp(name, "transfer-encoding")) {
-    r->have_te = 1;
-    /* chunked only as the final coding */
-    const char *last = strrchr(value, ',');
-    last = last ? last + 1 : value;
-    while (*last == ' ' || *last == '\t') last++;
-    size_t ll = strlen(last);
-    while (ll && (last[ll - 1] == ' ' || last[ll - 1] == '\t')) ll--;
-    r->chunked = ll == 7 && !strncasecmp(last, "chunked", 7);
-  }
-  if (!bad) h_add(&r->rh, name, value);
-  free(name);
-  free(value);
-  return bad;
+/* contentLength && bytesRead !== parseInt(contentLength, 10) */
+static int cl_mismatch(Req *r) {
+  if (r->cl_str.n == 0) return 0;
+  return (double)r->bytes_read != js_parse_int10((const uint8_t *)r->cl_str.p, r->cl_str.n);
 }
+static const char *const MISMATCH[3] = {"ResponseContentLengthMismatchError", "Response body length does not match content-length header",
+                                        "UND_ERR_RES_CONTENT_LENGTH_MISMATCH"};
 
-/* parses what has arrived; returns after the request moved on */
-static void parse_in(Req *r, int eof) {
-  for (;;) {
-    if (r->dead) return;
-    if (!r->head_done) {
-      /* line by line, each line checked as it completes */
-      for (;;) {
-        uint8_t *p = r->in.p;
-        size_t n = r->in.n;
-        uint8_t *lf = n ? memchr(p, '\n', n) : NULL;
-        if (!lf) {
-          if (r->status != 0 && r->headers_size + n >= MAX_HEADERS_SIZE) {
-            req_fail(r, "HeadersOverflowError", "Headers Overflow Error", "UND_ERR_HEADERS_OVERFLOW");
-            return;
-          }
-          if (eof) req_fail(r, "SocketError", "other side closed", "UND_ERR_SOCKET");
-          return;
-        }
-        size_t ll = (size_t)(lf - p);
-        char *line = xstrndup((char *)p, ll + 1);
-        memmove(r->in.p, r->in.p + ll + 1, n - ll - 1);
-        r->in.n = n - ll - 1;
-        const char *bad = NULL;
-        if (r->status == 0) {
-          int st = 0;
-          char *reason = NULL;
-          bad = status_line(r, line, ll + 1, &st, &reason);
-          if (!bad) {
-            r->status = st;
-            free(r->status_text);
-            r->status_text = reason;
-            h_free(&r->rh);
-          }
-        } else if (ll == 1 && line[0] == '\r') {
-          free(line);
-          break; /* the end of the head */
-        } else if (ll == 0) {
-          bad = "Missing expected CR after header value";
-        } else {
-          bad = header_line(r, line, ll);
-          if (!bad && r->headers_size >= MAX_HEADERS_SIZE) {
-            free(line);
-            req_fail(r, "HeadersOverflowError", "Headers Overflow Error", "UND_ERR_HEADERS_OVERFLOW");
-            return;
-          }
-        }
-        free(line);
-        if (bad) {
-          http_error(r, bad);
-          return;
-        }
-      }
-      int status = r->status;
-      if (status < 100) {
-        req_fail(r, "AssertionError", "The expression evaluated to a falsy value:\n\n  assert(statusCode >= 100)\n", "ERR_ASSERTION");
-        return;
-      }
-      if (r->have_cl && r->have_te) {
-        http_error(r, "Content-Length can't be present with Transfer-Encoding");
-        return;
-      }
-      if (status < 200 && status != 101) {
-        /* an informational response: the next head follows */
-        r->status = 0;
-        r->headers_size = 0;
-        r->have_cl = r->have_te = r->chunked = 0;
-        r->clen = -1;
-        free(r->cl_str.p);
-        memset(&r->cl_str, 0, sizeof r->cl_str);
-        h_free(&r->rh);
-        continue;
-      }
-      r->head_done = 1;
-      r->no_body = !strcmp(r->method, "HEAD") || status == 204 || status == 205 || status == 304 || status == 101 || status == 103;
-      if (r->no_body) {
-        r->clen = 0;
-        r->chunked = 0;
-      } else if (r->chunked) {
-        r->clen = -1;
-      } else if (r->have_te || r->clen < 0) {
-        r->clen = -1;
-        r->until_close = 1;
-      }
-      int redirect_hop = is_redirect(status) && h_find(&r->rh, "location") && r->redirect != 2;
-      if (!redirect_hop) send_head(r);
-      r->state = ST_BODY;
-    }
-    /* the body */
-    if (r->chunked) {
-      for (;;) {
-        if (r->chunk_state == 0) {
-          /* the size line: hex digits, then extensions, then CRLF */
-          size_t i = 0;
-          unsigned long long size = 0;
-          int digits = 0;
-          while (i < r->in.n && isxdigit(r->in.p[i])) {
-            if (size >> 60) {
-              http_error(r, "Chunk size overflow");
-              return;
-            }
-            size = size * 16 + (unsigned)hexv(r->in.p[i]);
-            i++, digits++;
-          }
-          if (i == r->in.n) {
-            if (eof) goto cut;
-            return;
-          }
-          if (digits == 0) {
-            http_error(r, "Invalid character in chunk size");
-            return;
-          }
-          uint8_t c = r->in.p[i];
-          if (c != '\r' && c != ';' && c != ' ' && c != '\t') {
-            http_error(r, "Invalid character in chunk size");
-            return;
-          }
-          uint8_t *nl = memchr(r->in.p + i, '\n', r->in.n - i);
-          if (!nl) {
-            if (eof) goto cut;
-            return;
-          }
-          if (nl == r->in.p || nl[-1] != '\r') {
-            http_error(r, "Missing expected CR after chunk size");
-            return;
-          }
-          size_t ll = (size_t)(nl - r->in.p) + 1;
-          memmove(r->in.p, r->in.p + ll, r->in.n - ll);
-          r->in.n -= ll;
-          r->chunk_left = (size_t)size;
-          r->chunk_state = size == 0 ? 3 : 1;
-          continue;
-        }
-        if (r->chunk_state == 3) {
-          uint8_t *nl = memchr(r->in.p, '\n', r->in.n);
-          if (!nl) {
-            if (eof) goto cut;
-            return;
-          }
-          size_t ll = (size_t)(nl - r->in.p) + 1;
-          int empty = ll == 2 && r->in.p[0] == '\r';
-          memmove(r->in.p, r->in.p + ll, r->in.n - ll);
-          r->in.n -= ll;
-          if (empty) goto complete;
-          continue; /* a trailer */
-        }
-        if (r->chunk_state == 1) {
-          size_t k = r->in.n < r->chunk_left ? r->in.n : r->chunk_left;
-          wn_buf_put(&r->body_raw, r->in.p, k);
-          r->bytes_read += k;
-          memmove(r->in.p, r->in.p + k, r->in.n - k);
-          r->in.n -= k;
-          r->chunk_left -= k;
-          if (r->chunk_left > 0) {
-            if (eof) goto cut;
-            return;
-          }
-          r->chunk_state = 2;
-        }
-        if (r->chunk_state == 2) {
-          if (r->in.n < 2) {
-            if (r->in.n == 1 && r->in.p[0] != '\r') {
-              http_error(r, "Expected LF after chunk data");
-              return;
-            }
-            if (eof) goto cut;
-            return;
-          }
-          if (r->in.p[0] != '\r' || r->in.p[1] != '\n') {
-            http_error(r, "Expected LF after chunk data");
-            return;
-          }
-          memmove(r->in.p, r->in.p + 2, r->in.n - 2);
-          r->in.n -= 2;
-          r->chunk_state = 0;
-        }
-      }
-    }
-    if (r->clen >= 0) {
-      unsigned long long need = (unsigned long long)r->clen - r->bytes_read;
-      size_t k = (unsigned long long)r->in.n < need ? r->in.n : (size_t)need;
-      wn_buf_put(&r->body_raw, r->in.p, k);
-      r->bytes_read += k;
-      memmove(r->in.p, r->in.p + k, r->in.n - k);
-      r->in.n -= k;
-      if (r->bytes_read >= (unsigned long long)r->clen) goto complete;
-      if (eof) goto cut;
-      return;
-    }
-    /* until close */
-    wn_buf_put(&r->body_raw, r->in.p, r->in.n);
-    r->bytes_read += r->in.n;
-    r->in.n = 0;
-    if (eof) goto complete;
+/* Parser.createError */
+static void u_create_error(Req *r, int32_t ret) {
+  (void)ret;
+  if (cl_mismatch(r)) {
+    u_destroy(r, MISMATCH[0], MISMATCH[1], MISMATCH[2]);
     return;
-  complete:
+  }
+  int32_t rp = wn_llw_llhttp_get_error_reason(r->llp);
+  Str m = {0};
+  if (rp) {
+    s_cat(&m, "Response does not match the HTTP/1.1 protocol (");
+    s_cat(&m, (const char *)llmem + rp);
+    s_chr(&m, ')');
+  }
+  /* undici's code is `HPE_${constants.ERROR[ret]}` — constants.ERROR maps
+   * names to numbers, so it is undefined */
+  u_destroy(r, "HTTPParserError", m.p ? m.p : "", NULL);
+  free(m.p);
+}
+
+/* the response head as fetch keeps it (request.onHeaders): the raw list */
+static void keep_head(Req *r) {
+  h_free(&r->rh);
+  for (size_t i = 0; i + 1 < r->raw_n; i += 2) h_add(&r->rh, (const char *)r->raw[i].p, (const char *)r->raw[i + 1].p);
+  free(r->resp_text);
+  r->resp_text = malloc(r->status_text.n + 1);
+  if (!r->resp_text) abort();
+  memcpy(r->resp_text, r->status_text.p ? r->status_text.p : "", r->status_text.n);
+  r->resp_text_n = r->status_text.n;
+}
+
+int32_t wn_llw_on_message_begin(int32_t p) {
+  Req *r = ll_cur;
+  (void)p;
+  if (r->destroyed) return -1;
+  if (r->completed) {
+    /* client[kRunning] === 0 */
+    u_destroy(r, "SocketError", "bad response", "UND_ERR_SOCKET");
+    return -1;
+  }
+  return 0;
+}
+int32_t wn_llw_on_url(int32_t p, int32_t at, int32_t len) {
+  (void)p, (void)at, (void)len;
+  return 0;
+}
+int32_t wn_llw_on_status(int32_t p, int32_t at, int32_t len) {
+  Req *r = ll_cur;
+  (void)p;
+  /* this.statusText = buf.toString(): each piece replaces the last */
+  r->status_text.n = 0;
+  s_put(&r->status_text, (const char *)llmem + at, (size_t)len);
+  return 0;
+}
+static void track_header(Req *r, size_t n) {
+  r->headers_size += n;
+  if (r->headers_size >= MAX_HEADERS_SIZE) u_destroy(r, "HeadersOverflowError", "Headers Overflow Error", "UND_ERR_HEADERS_OVERFLOW");
+}
+int32_t wn_llw_on_header_field(int32_t p, int32_t at, int32_t len) {
+  Req *r = ll_cur;
+  (void)p;
+  Bytes *b = (r->raw_n & 1) == 0 ? raw_push(r) : &r->raw[r->raw_n - 1];
+  bytes_add(b, llmem + at, (size_t)len);
+  track_header(r, (size_t)len);
+  return 0;
+}
+int32_t wn_llw_on_header_value(int32_t p, int32_t at, int32_t len) {
+  Req *r = ll_cur;
+  (void)p;
+  Bytes *b = (r->raw_n & 1) == 1 ? raw_push(r) : &r->raw[r->raw_n - 1];
+  bytes_add(b, llmem + at, (size_t)len);
+  const Bytes *key = &r->raw[r->raw_n - 2];
+  const char *v = (const char *)llmem + at;
+  if (key->n == 10 && !strncasecmp((const char *)key->p, "keep-alive", 10)) s_put(&r->keep_alive, v, (size_t)len);
+  else if (key->n == 10 && !strncasecmp((const char *)key->p, "connection", 10)) s_put(&r->connection, v, (size_t)len);
+  else if (key->n == 14 && !strncasecmp((const char *)key->p, "content-length", 14)) s_put(&r->cl_str, v, (size_t)len);
+  track_header(r, (size_t)len);
+  return 0;
+}
+
+static int is_redirect(int s) { return s == 301 || s == 302 || s == 303 || s == 307 || s == 308; }
+static void send_head(Req *r);
+
+int32_t wn_llw_on_headers_complete(int32_t p, int32_t status, int32_t upgrade, int32_t keep_alive) {
+  Req *r = ll_cur;
+  (void)p;
+  if (r->destroyed) return -1;
+  if (r->completed) {
+    u_destroy(r, "SocketError", "bad response", "UND_ERR_SOCKET");
+    return -1;
+  }
+  if (status == 100) {
+    u_destroy(r, "SocketError", "bad response", "UND_ERR_SOCKET");
+    return -1;
+  }
+  /* neither fetch nor connect() asks for an upgrade */
+  if (upgrade) {
+    u_destroy(r, "SocketError", "bad upgrade", "UND_ERR_SOCKET");
+    return -1;
+  }
+  r->u_status = status;
+  /* keep-alive as llhttp says (undici's HEAD override needs a socket that
+   * is not reset, and a HEAD request resets it) */
+  r->u_keepalive = keep_alive;
+  if (r->u_connect) {
+    r->u_upgrade = 1;
+    return 2;
+  }
+  /* request.onHeaders(statusCode, headers, resume, statusText): fetch
+   * ignores an informational response */
+  if (status >= 200) {
+    keep_head(r);
+    r->status = status;
+    r->no_body = !strcmp(r->method, "HEAD") || status == 204 || status == 205 || status == 304 || status == 101 || status == 103;
+    int redirect_hop = is_redirect(status) && h_find(&r->rh, "location") && r->redirect != 2;
+    if (!redirect_hop) send_head(r);
+  }
+  raw_free(r);
+  r->headers_size = 0;
+  if (!strcmp(r->method, "HEAD")) return 1;
+  if (status < 200) return 1;
+  return 0;
+}
+
+int32_t wn_llw_on_body(int32_t p, int32_t at, int32_t len) {
+  Req *r = ll_cur;
+  (void)p;
+  if (r->destroyed) return -1;
+  r->bytes_read += (unsigned long long)len;
+  wn_buf_put(&r->body_raw, llmem + at, (size_t)len);
+  return 0;
+}
+
+int32_t wn_llw_on_message_complete(int32_t p) {
+  Req *r = ll_cur;
+  (void)p;
+  int status = r->u_status;
+  if (r->destroyed && (!status || r->u_keepalive)) return -1;
+  if (r->u_upgrade) return 0;
+  if (status < 100) {
+    /* assert(statusCode >= 100) throws out of the parser */
+    u_destroy(r, "AssertionError", "The expression evaluated to a falsy value:\n\n  assert(statusCode >= 100)\n", "ERR_ASSERTION");
+    return -1;
+  }
+  int mismatch = strcmp(r->method, "HEAD") && cl_mismatch(r);
+  r->u_status = 0;
+  r->status_text.n = 0;
+  r->bytes_read = 0;
+  r->cl_str.n = 0;
+  r->keep_alive.n = 0;
+  r->connection.n = 0;
+  raw_free(r);
+  r->headers_size = 0;
+  if (status < 200) return 0;
+  if (mismatch) {
+    u_destroy(r, MISMATCH[0], MISMATCH[1], MISMATCH[2]);
+    return -1;
+  }
+  r->completed = 1; /* request.onComplete */
+  if (!r->u_keepalive) {
+    u_destroy(r, "InformationalError", "reset", "UND_ERR_INFO");
+    return LL_PAUSED;
+  }
+  return 0;
+}
+
+static void tls_begin(Req *r);
+static int follow(Req *r);
+static void finish_body(Req *r);
+
+/* the parser's verdict, once a read (or the end) is through it */
+static void settle(Req *r) {
+  if (r->dead) return;
+  if (r->completed) {
     if (is_redirect(r->status) && !r->head_sent) {
       if (follow(r)) return;
       send_head(r);
     }
     finish_body(r);
     return;
-  cut:
-    req_fail(r, "SocketError", "other side closed", "UND_ERR_SOCKET");
+  }
+  if (r->destroyed) req_fail(r, r->d_name, r->d_msg, r->d_code);
+}
+
+/* the proxy's answer to the CONNECT (undici's connect handler, then the
+ * proxy agent: anything but 200 aborts the tunnel); what follows the
+ * answer's head is the tunnel's first bytes */
+static void tunnel_open(Req *r, const uint8_t *rest, size_t n) {
+  int status = r->u_status;
+  r->u_status = 0;
+  r->u_upgrade = 0;
+  r->u_connect = 0;
+  raw_free(r);
+  r->headers_size = 0;
+  wn_llw_llhttp_free(r->llp);
+  r->llp = 0;
+  if (status != 200) {
+    char m[96];
+    snprintf(m, sizeof m, "Proxy response (%d) !== 200 when HTTP Tunneling", status);
+    req_fail(r, "AbortError", m, "UND_ERR_ABORTED");
     return;
   }
+  wn_buf_put(&r->tunnel_in, rest, n);
+  tls_begin(r);
 }
 
-static void on_proxy_reply(Req *r) {
-  uint8_t *p = r->in.p;
-  size_t n = r->in.n;
-  for (size_t i = 0; i + 3 < n; i++)
-    if (p[i] == '\r' && p[i + 1] == '\n' && p[i + 2] == '\r' && p[i + 3] == '\n') {
-      int status = 0;
-      sscanf((char *)p + 9, "%d", &status);
-      memmove(r->in.p, r->in.p + i + 4, n - i - 4);
-      r->in.n = n - i - 4;
-      if (status != 200) {
-        req_fail(r, "Error", "Proxy response !== 200 when HTTP Tunneling", "UND_ERR_ABORTED");
+/* Parser.execute(chunk) */
+static void feed(Req *r, const uint8_t *data, size_t n) {
+  if (r->dead) return;
+  r->rx += n;
+  if (r->completed || r->destroyed || r->llp == 0) return;
+  if ((int64_t)n > ll_bufsz) {
+    if (ll_buf) wn_llw_free(ll_buf);
+    ll_bufsz = (int32_t)((n + 4095) / 4096 * 4096);
+    ll_buf = wn_llw_malloc(ll_bufsz);
+    if (ll_buf == 0) wn_host_fail("fetch: the HTTP parser is out of memory");
+  }
+  memcpy(llmem + ll_buf, data, n);
+  ll_cur = r;
+  int32_t ret = wn_llw_llhttp_execute(r->llp, ll_buf, (int32_t)n);
+  ll_cur = NULL;
+  if (ret != LL_OK) {
+    size_t off = (size_t)(wn_llw_llhttp_get_error_pos(r->llp) - ll_buf);
+    if (off > n) off = n;
+    if (ret == LL_PAUSED_UPGRADE) {
+      if (r->u_upgrade && !r->destroyed) {
+        tunnel_open(r, data + off, n - off);
         return;
       }
-      tls_begin(r);
-      return;
-    }
+      u_destroy(r, "AssertionError", "The expression evaluated to a falsy value:\n\n  assert(upgrade)\n", "ERR_ASSERTION");
+    } else if (ret != LL_PAUSED)
+      u_create_error(r, ret);
+  }
+  settle(r);
 }
 
-/* Node's tls.checkServerIdentity, which undici's connections run: an IP
- * literal must be one of the certificate's IP-address names (never the
- * CN); a DNS name one of its DNS names (RFC 6125 wildcards: one, in the
- * leftmost label, never for a two-label pattern nor an xn-- label), or —
- * only with no DNS names — its CN. 1 when it matches; otherwise the
- * request fails with ERR_TLS_CERT_ALTNAME_INVALID and Node's reason. */
-static int split_host(const char *h, char ***parts) {
-  char *c = xstrdup(h);
-  size_t n = strlen(c);
-  if (n && c[n - 1] == '.') c[--n] = 0;
-  for (char *q = c; *q; q++)
-    if (*q >= 'A' && *q <= 'Z') *q = (char)(*q - 'A' + 'a');
-  int k = 1;
-  for (char *q = c; *q; q++)
-    if (*q == '.') k++;
-  char **v = calloc((size_t)k + 1, sizeof *v);
-  if (!v) abort();
-  int i = 0;
-  char *start = c;
-  for (char *q = c;; q++)
-    if (*q == '.' || *q == 0) {
-      int end = *q == 0;
-      *q = 0;
-      v[i++] = xstrdup(start);
-      start = q + 1;
-      if (end) break;
-    }
-  free(c);
-  *parts = v;
-  return i;
+/* Parser.finish(): 1 when it produced an error (destroyed with it) */
+static void u_finish(Req *r) {
+  if (r->llp == 0) return;
+  ll_cur = r;
+  int32_t ret = wn_llw_llhttp_finish(r->llp);
+  ll_cur = NULL;
+  if (ret == LL_OK || ret == LL_PAUSED || ret == LL_PAUSED_UPGRADE) return;
+  u_create_error(r, ret);
 }
-static void free_parts(char **v, int n) {
-  for (int i = 0; i < n; i++) free(v[i]);
-  free(v);
+
+/* the socket closed (onHttpSocketClose): the request still running fails
+ * with the error the socket was destroyed with, or "closed" */
+static void on_close(Req *r) {
+  if (r->dead) return;
+  if (!r->destroyed && r->u_status && !r->u_keepalive) u_finish(r);
+  settle(r);
+  if (!r->dead) req_fail(r, "SocketError", "closed", "UND_ERR_SOCKET");
 }
-static int wild_match(char **hp, int hn, const char *pattern) {
-  if (!pattern || !*pattern) return 0;
-  char **pp;
-  int pn = split_host(pattern, &pp);
-  int ok = 0;
-  if (pn != hn) goto out;
-  for (int i = 0; i < pn; i++) {
-    if (!*pp[i]) goto out;
-    for (const char *q = pp[i]; *q; q++)
-      if ((unsigned char)*q < 0x21 || (unsigned char)*q > 0x7f) goto out;
+/* the end of the stream (onHttpSocketEnd) */
+static void on_eof(Req *r) {
+  if (r->dead) return;
+  if (r->u_status && !r->u_keepalive) u_finish(r);
+  else u_destroy(r, "SocketError", "other side closed", "UND_ERR_SOCKET");
+  on_close(r);
+}
+/* a read error (onHttpSocketError): a reset after a head that asked for
+ * the connection's end finishes the parser instead */
+static void on_read_error(Req *r, int e) {
+  if (r->dead) return;
+  if (e == ECONNRESET && r->u_status && !r->u_keepalive) {
+    u_finish(r);
+  } else if (e == ECONNRESET && r->rx == 0) {
+    /* measured: a peer that resets before it answers reads as an end */
+    u_destroy(r, "SocketError", "other side closed", "UND_ERR_SOCKET");
+  } else {
+    char msg[64];
+    snprintf(msg, sizeof msg, "read %s", e == ECONNRESET ? "ECONNRESET" : "EIO");
+    u_destroy(r, "Error", msg, e == ECONNRESET ? "ECONNRESET" : "EIO");
   }
-  for (int i = hn - 1; i > 0; i--)
-    if (strcmp(hp[i], pp[i]) != 0) goto out;
-  {
-    const char *ps = pp[0], *hs = hp[0];
-    const char *star = strchr(ps, '*');
-    if (!star || strstr(ps, "xn--")) {
-      ok = strcmp(hs, ps) == 0;
-      goto out;
-    }
-    if (strchr(star + 1, '*')) goto out;
-    if (pn <= 2) goto out;
-    size_t pre = (size_t)(star - ps), suf = strlen(star + 1), hl = strlen(hs);
-    if (pre + suf > hl) goto out;
-    if (strncmp(hs, ps, pre) != 0) goto out;
-    if (strcmp(hs + hl - suf, star + 1) != 0) goto out;
-    ok = 1;
-  }
-out:
-  free_parts(pp, pn);
-  return ok;
+  on_close(r);
 }
+
+/* Node's tls.checkServerIdentity, which undici's connections run, over
+ * the URL's host name (an IPv6 address without its brackets) as Node
+ * hands it over: 1 when it matches; otherwise the request fails with
+ * ERR_TLS_CERT_ALTNAME_INVALID and Node's reason (wn_x509.c). No
+ * certificate at all fails too. */
 static int check_identity(Req *r) {
   const mbedtls_x509_crt *peer = mbedtls_ssl_get_peer_cert(&r->ssl);
-  if (!peer) return 1;
-  char host[300];
-  snprintf(host, sizeof host, "%s", r->url.host);
-  if (host[0] == '[') {
-    memmove(host, host + 1, strlen(host));
-    host[strlen(host) - 1] = 0;
-  }
-  size_t hl = strlen(host);
-  if (hl && host[hl - 1] == '.') host[--hl] = 0;
-  /* the altnames as Node prints them, and the DNS and IP lists */
-  Str alt = {0}, ips = {0};
-  char **dns = NULL;
-  int ndns = 0, nips = 0;
-  for (const mbedtls_x509_sequence *cur = &peer->subject_alt_names; cur && cur->buf.p; cur = cur->next) {
-    mbedtls_x509_subject_alternative_name san;
-    if (mbedtls_x509_parse_subject_alt_name(&cur->buf, &san) != 0) continue;
-    const mbedtls_x509_buf *u = &san.san.unstructured_name;
-    char item[512] = "";
-    if (san.type == MBEDTLS_X509_SAN_DNS_NAME) {
-      char *d = xstrndup((const char *)u->p, u->len);
-      snprintf(item, sizeof item, "DNS:%s", d);
-      dns = realloc(dns, sizeof *dns * (size_t)(ndns + 1));
-      if (!dns) abort();
-      dns[ndns++] = d;
-    } else if (san.type == MBEDTLS_X509_SAN_IP_ADDRESS && (u->len == 4 || u->len == 16)) {
-      char ip[INET6_ADDRSTRLEN];
-      inet_ntop(u->len == 4 ? AF_INET : AF_INET6, u->p, ip, sizeof ip);
-      snprintf(item, sizeof item, "IP Address:%s", ip);
-      if (nips++) s_cat(&ips, ", ");
-      s_cat(&ips, ip);
-    } else if (san.type == MBEDTLS_X509_SAN_RFC822_NAME) {
-      snprintf(item, sizeof item, "email:%.*s", (int)u->len, (const char *)u->p);
-    } else if (san.type == MBEDTLS_X509_SAN_UNIFORM_RESOURCE_IDENTIFIER) {
-      snprintf(item, sizeof item, "URI:%.*s", (int)u->len, (const char *)u->p);
-    }
-    mbedtls_x509_free_subject_alt_name(&san);
-    if (!*item) continue;
-    if (alt.n) s_cat(&alt, ", ");
-    s_cat(&alt, item);
-  }
-  char *cn = NULL;
-  for (const mbedtls_x509_name *nm = &peer->subject; nm; nm = nm->next)
-    if (nm->oid.p && MBEDTLS_OID_CMP(MBEDTLS_OID_AT_CN, &nm->oid) == 0) {
-      free(cn);
-      cn = xstrndup((const char *)nm->val.p, nm->val.len);
-    }
-  int valid = 0;
-  Str reason = {0};
-  struct in6_addr a6, b6;
-  struct in_addr a4;
-  int is4 = inet_pton(AF_INET, host, &a4) == 1, is6 = !is4 && inet_pton(AF_INET6, host, &a6) == 1;
-  if (is4 || is6) {
-    for (const mbedtls_x509_sequence *cur = &peer->subject_alt_names; cur && cur->buf.p && !valid; cur = cur->next) {
-      mbedtls_x509_subject_alternative_name san;
-      if (mbedtls_x509_parse_subject_alt_name(&cur->buf, &san) != 0) continue;
-      const mbedtls_x509_buf *u = &san.san.unstructured_name;
-      if (san.type == MBEDTLS_X509_SAN_IP_ADDRESS) {
-        if (is4 && u->len == 4 && memcmp(u->p, &a4, 4) == 0) valid = 1;
-        if (is6 && u->len == 16) {
-          memcpy(&b6, u->p, 16);
-          if (memcmp(&a6, &b6, 16) == 0) valid = 1;
-        }
-      }
-      mbedtls_x509_free_subject_alt_name(&san);
-    }
-    if (!valid) {
-      s_cat(&reason, "IP: ");
-      s_cat(&reason, host);
-      s_cat(&reason, " is not in the cert's list: ");
-      if (ips.p) s_cat(&reason, ips.p);
-    }
-  } else if (ndns > 0 || (cn && *cn)) {
-    char **hp;
-    int hn = split_host(host, &hp);
-    if (ndns > 0) {
-      for (int i = 0; i < ndns && !valid; i++) valid = wild_match(hp, hn, dns[i]);
-      if (!valid) {
-        s_cat(&reason, "Host: ");
-        s_cat(&reason, host);
-        s_cat(&reason, ". is not in the cert's altnames: ");
-        if (alt.p) s_cat(&reason, alt.p);
-      }
-    } else {
-      valid = wild_match(hp, hn, cn);
-      if (!valid) {
-        s_cat(&reason, "Host: ");
-        s_cat(&reason, host);
-        s_cat(&reason, ". is not cert's CN: ");
-        s_cat(&reason, cn);
-      }
-    }
-    free_parts(hp, hn);
-  } else
-    s_cat(&reason, "Cert does not contain a DNS name");
-  for (int i = 0; i < ndns; i++) free(dns[i]);
-  free(dns);
-  free(cn);
-  free(alt.p);
-  free(ips.p);
-  if (!valid) {
-    Str m = {0};
-    s_cat(&m, "Hostname/IP does not match certificate's altnames: ");
-    s_cat(&m, reason.p ? reason.p : "");
-    req_fail(r, "Error", m.p, "ERR_TLS_CERT_ALTNAME_INVALID");
-    free(m.p);
-  }
-  free(reason.p);
-  return valid;
+  const char *h = r->url.host;
+  size_t hl = strlen(h);
+  if (hl >= 2 && h[0] == '[') h++, hl -= 2;
+  size_t n = 0;
+  char *why = wn_x509_check_identity(peer, h, hl, &n);
+  if (!why) return 1;
+  static const char pre[] = "Hostname/IP does not match certificate's altnames: ";
+  char *m = malloc(sizeof pre + n);
+  if (!m) abort();
+  memcpy(m, pre, sizeof pre - 1);
+  memcpy(m + sizeof pre - 1, why, n);
+  req_fail_len(r, "Error", m, sizeof pre - 1 + n, "ERR_TLS_CERT_ALTNAME_INVALID");
+  free(m);
+  free(why);
+  return 0;
 }
 
 static void tls_pump(Req *r) {
@@ -1882,11 +1881,10 @@ static void tls_pump(Req *r) {
       req_fail(r, "Error", msg, "ERR_SSL_SSL_HANDSHAKE_FAILURE");
       return;
     }
-    /* the chain first, then the name (Node's order); the engine's own
-     * name check is never consulted */
-    uint32_t f = mbedtls_ssl_get_verify_result(&r->ssl) & ~(uint32_t)MBEDTLS_X509_BADCERT_CN_MISMATCH;
-    if (f != 0 || !r->top_self) {
-      tls_verdict_fail(r);
+    /* the chain first, then the name (Node's order) */
+    int code = wn_x509_verify(mbedtls_ssl_get_peer_cert(&r->ssl), wn_trust_default());
+    if (code != 0) {
+      tls_verdict_fail(r, code);
       return;
     }
     if (!check_identity(r)) return;
@@ -1894,25 +1892,24 @@ static void tls_pump(Req *r) {
     r->state = ST_HEAD;
   }
   uint8_t buf[16384];
+  unsigned gen = r->hop_gen;
   for (;;) {
     int k = mbedtls_ssl_read(&r->ssl, buf, sizeof buf);
     if (k > 0) {
-      wn_buf_put(&r->in, buf, (size_t)k);
+      feed(r, buf, (size_t)k);
+      if (r->dead || r->hop_gen != gen) return;
       continue;
     }
-    if (k == MBEDTLS_ERR_SSL_WANT_READ || k == MBEDTLS_ERR_SSL_WANT_WRITE) {
-      parse_in(r, 0);
-      return;
-    }
+    if (k == MBEDTLS_ERR_SSL_WANT_READ || k == MBEDTLS_ERR_SSL_WANT_WRITE) return;
 #ifdef MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET
     if (k == MBEDTLS_ERR_SSL_RECEIVED_NEW_SESSION_TICKET) continue;
 #endif
     if (k == 0 || k == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY || k == MBEDTLS_ERR_SSL_CONN_EOF) {
-      parse_in(r, 1);
+      on_eof(r);
       return;
     }
     if (k == MBEDTLS_ERR_NET_CONN_RESET) {
-      req_fail(r, "Error", "read ECONNRESET", "ECONNRESET");
+      on_read_error(r, ECONNRESET);
       return;
     }
     char d[120];
@@ -1969,33 +1966,27 @@ static void fx_ready(WnIo *io, uint32_t evs) {
     if (r->tls_on && r->state != ST_PROXY) tls_pump(r);
     else {
       uint8_t buf[65536];
+      unsigned gen = r->hop_gen;
       for (;;) {
         ssize_t n = recv(r->fd, buf, sizeof buf, 0);
         if (n < 0) {
           if (errno == EINTR) continue;
           if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-          int e = errno;
-          if (e == ECONNRESET && !r->head_done && r->in.n == 0) req_fail(r, "SocketError", "other side closed", "UND_ERR_SOCKET");
-          else req_fail_errno(r, "read", e, NULL);
+          on_read_error(r, errno);
           return;
         }
         if (n == 0) {
-          if (r->state == ST_PROXY) {
-            req_fail(r, "SocketError", "other side closed", "UND_ERR_SOCKET");
-            return;
-          }
-          parse_in(r, 1);
+          on_eof(r);
           return;
         }
-        wn_buf_put(&r->in, buf, (size_t)n);
-        if (r->state == ST_PROXY) {
-          on_proxy_reply(r);
-          if (r->dead) return;
-          if (r->state == ST_TLS) tls_pump(r);
+        int proxy = r->state == ST_PROXY;
+        feed(r, buf, (size_t)n);
+        if (r->dead || r->hop_gen != gen) return;
+        if (proxy && r->state == ST_TLS) {
+          /* the tunnel is open: TLS reads the socket from here on */
+          tls_pump(r);
           break;
         }
-        parse_in(r, 0);
-        if (r->dead || r->fd < 0) return;
       }
     }
   } else if (r->tls_on && r->state == ST_TLS)
@@ -2023,7 +2014,7 @@ static int valid_token(const char *s) {
 /* the reply when the Request constructor throws: -1 and the record */
 static int32_t refuse(uint32_t ptr, uint32_t room, const char *name, const char *msg, const char *cname, const char *cmsg, const char *ccode) {
   WnBuf b = {0};
-  err_record(&b, name, msg, cname, cmsg, ccode);
+  err_record(&b, name, msg, cname, cmsg, cmsg ? strlen(cmsg) : 0, ccode);
   if (b.n > room) wn_host_fail("fetch: an error record larger than the room the module left");
   memcpy(w_hostmem + ptr, b.p, b.n);
   wn_buf_free(&b);
@@ -2261,7 +2252,6 @@ static int32_t start(uint32_t ptr, uint32_t len, uint32_t room) {
   r->has_body = bodyKind != 0;
   r->redirect = redir;
   r->fd = -1;
-  r->clen = -1;
   wn_ev_hold(1);
   wn_fetch_delivered = fetch_delivered;
   ans = (int32_t)r->handle;
