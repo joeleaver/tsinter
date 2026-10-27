@@ -13,7 +13,7 @@
  *    sockets, watches and signal subscriptions came and went.
  * Each program runs in its own temporary directory, the oracle first. */
 import { execFile } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, globSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -114,10 +114,13 @@ console.log(JSON.stringify(fs.readFileSync("b.txt", "utf8")));
     expect(native.stdout).toContain("hello world");
   });
 
-  test("the host keeps nothing the program released: children, pipes, sockets, a server, watches and signal subscriptions, each opened and closed many times, leave no descriptor and no registration behind (WN_FD_AUDIT)", async () => {
-    const src = `import { spawn, spawnSync } from "node:child_process";
+  // Two programs: the wasm tier does not build node:net beside an
+  // asynchronous spawn in one module (net:with-spawn).
+  const auditPrograms: [string, string, string][] = [
+    [
+      "children (spawnSync and spawn with a piped stdout), watches and signal subscriptions",
+      `import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
-import * as net from "node:net";
 let syncOk = 0;
 for (let i = 0; i < 30; i++) {
   const r = spawnSync("/bin/sh", ["-c", "echo x"]);
@@ -128,7 +131,7 @@ let asyncOk = 0;
 function child(n: number): void {
   if (n === 0) {
     console.log("async", asyncOk);
-    tcp();
+    watchesAndSignals();
     return;
   }
   const c = spawn("/bin/sh", ["-c", "echo y"], { stdio: ["ignore", "pipe", "ignore"] });
@@ -152,32 +155,6 @@ function child(n: number): void {
     next();
   });
 }
-function tcp(): void {
-  const server = net.createServer((s) => {
-    s.on("data", (d) => s.end(d));
-  });
-  server.listen(0, "127.0.0.1", () => {
-    const port = (server.address() as net.AddressInfo).port;
-    let left = 30;
-    let ok = 0;
-    const one = (): void => {
-      if (left-- === 0) {
-        console.log("tcp", ok);
-        server.close();
-        watchesAndSignals();
-        return;
-      }
-      const c = net.connect(port, "127.0.0.1", () => {
-        c.write("ping");
-      });
-      c.on("data", (d) => {
-        if (d.toString() === "ping") ok++;
-      });
-      c.on("close", one);
-    };
-    one();
-  });
-}
 function watchesAndSignals(): void {
   fs.writeFileSync("w.txt", "x");
   for (let i = 0; i < 20; i++) {
@@ -186,22 +163,99 @@ function watchesAndSignals(): void {
   }
   const h = (): void => {};
   for (let i = 0; i < 20; i++) {
-    process.on("SIGUSR2", h);
-    process.off("SIGUSR2", h);
+    process.on("SIGTERM", h);
+    process.off("SIGTERM", h);
   }
   console.log("done");
 }
 child(30);
-`;
-    process.env["WN_FD_AUDIT"] = "1";
+`,
+      "sync 30\nasync 30\ndone\n",
+    ],
+    [
+      "a server and thirty connections to it",
+      `import * as net from "node:net";
+const server = net.createServer((s) => {
+  s.on("data", (d) => s.end(d));
+});
+server.listen(0, "127.0.0.1", () => {
+  const port = server.address().port;
+  let left = 30;
+  let ok = 0;
+  const one = (): void => {
+    if (left-- === 0) {
+      console.log("tcp", ok);
+      server.close();
+      return;
+    }
+    const c = net.connect(port, "127.0.0.1", () => {
+      c.write("ping");
+    });
+    c.on("data", (d) => {
+      if (d.toString() === "ping") ok++;
+    });
+    c.on("close", one);
+  };
+  one();
+});
+`,
+      "tcp 30\n",
+    ],
+  ];
+  for (const [what, src, expected] of auditPrograms) {
+    test(`the host keeps nothing the program released — ${what}, each opened and closed many times, leave no descriptor and no registration behind (WN_FD_AUDIT)`, async () => {
+      process.env["WN_FD_AUDIT"] = "1";
+      try {
+        const { node, native } = await both(src);
+        expect(node.stdout).toBe(expected);
+        expect(native.stdout).toBe(node.stdout);
+        expect(native.code).toBe(0);
+        expect(native.stderr).toBe("wn-audit: fds 0 live 0 queued 0\n");
+      } finally {
+        delete process.env["WN_FD_AUDIT"];
+      }
+    });
+  }
+
+  test("board #323: a cached executable that is not whole (empty, not executable, or not what was recorded) is rebuilt, never reused", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tsinter-wasm-native-cache-"));
+    const saved = process.env["SCRIPTC_CACHE_DIR"];
+    const savedNo = process.env["SCRIPTC_NO_CACHE"];
+    process.env["SCRIPTC_CACHE_DIR"] = join(dir, "cas");
+    delete process.env["SCRIPTC_NO_CACHE"];
     try {
-      const { node, native } = await both(src);
-      expect(node.stdout).toBe("sync 30\nasync 30\ntcp 30\ndone\n");
-      expect(native.stdout).toBe(node.stdout);
-      expect(native.code).toBe(0);
-      expect(native.stderr).toBe("wn-audit: fds 0 live 0 queued 0\n");
+      const file = join(dir, "main.ts");
+      writeFileSync(file, `console.log("cached ${Date.now()}-${Math.random()}");\n`);
+      const build = async (): Promise<string> => {
+        const res = await compile(file, { outPath: join(dir, "out", "program"), outDir: join(dir, "out"), backend: "wasm-native" });
+        if (!res.ok) throw new Error(res.diagnostics.map((d) => d.message).join("\n"));
+        return res.binaryPath;
+      };
+      const first = await build();
+      const want = (await exec(first, [], dir)).stdout;
+      expect(want).toMatch(/^cached /);
+      const entries = globSync(join(dir, "cas", "wnbin", "*", "*")).filter((p) => !p.endsWith(".ok"));
+      expect(entries.length).toBe(1);
+      const entry = entries[0]!;
+      for (const breakIt of [
+        () => writeFileSync(entry, ""),
+        () => {
+          writeFileSync(entry, readFileSync(first).subarray(0, 4096));
+          chmodSync(entry, 0o755);
+        },
+        () => chmodSync(entry, 0o644),
+      ]) {
+        breakIt();
+        const again = await build();
+        const r = await exec(again, [], dir);
+        expect(r.stdout).toBe(want);
+        expect(r.code).toBe(0);
+      }
     } finally {
-      delete process.env["WN_FD_AUDIT"];
+      if (saved === undefined) delete process.env["SCRIPTC_CACHE_DIR"];
+      else process.env["SCRIPTC_CACHE_DIR"] = saved;
+      if (savedNo !== undefined) process.env["SCRIPTC_NO_CACHE"] = savedNo;
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 

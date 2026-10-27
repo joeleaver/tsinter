@@ -19,7 +19,7 @@
  * fetch, the vendored zlib) behind them. */
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { copyFile, mkdir, mkdtemp, readFile, rename, rm, stat, utimes } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -154,6 +154,30 @@ async function exists(p: string): Promise<boolean> {
   );
 }
 
+/* Board #323: a cached artefact is used only once it is proven whole. A
+ * build writes to a temporary name and is published by rename only after
+ * the compiler succeeded and the output checks out (an ELF file, past its
+ * header, executable where it should be); a reuse checks the same, and a
+ * cached executable must also match the size and digest recorded beside it
+ * when it was published — an empty or truncated file left by a crashed
+ * compiler (or a crashed copy) is removed and rebuilt, never run. */
+const ELF_MAGIC = Buffer.from([0x7f, 0x45, 0x4c, 0x46]);
+async function isWholeElf(p: string, executable: boolean): Promise<boolean> {
+  try {
+    const st = await stat(p);
+    if (!st.isFile() || st.size < 64) return false;
+    if (executable && (st.mode & 0o100) === 0) return false;
+    const head = await readFile(p).then((b) => b.subarray(0, 4));
+    return head.equals(ELF_MAGIC);
+  } catch {
+    return false;
+  }
+}
+async function digestOf(p: string): Promise<string> {
+  const b = await readFile(p);
+  return `${b.length} ${createHash("sha256").update(b).digest("hex")}`;
+}
+
 /** The runner's objects for one flavor, cached under the runtime package's
  * vendor/.cache (atomic-rename publish, like the regex engine object). */
 async function ensureRunnerObjects(sanitize: boolean): Promise<string[]> {
@@ -172,7 +196,10 @@ async function ensureRunnerObjects(sanitize: boolean): Promise<string[]> {
     .slice(0, 16);
   const dir = join(cacheRoot, `wasmnative-${key}-${flavor}`);
   const objs = RUNNER_SOURCES.map((s) => join(dir, s.replace(/\.c$/, ".o")));
-  if ((await Promise.all(objs.map(exists))).every(Boolean)) return objs;
+  if ((await Promise.all(objs.map((o) => isWholeElf(o, false)))).every(Boolean)) return objs;
+  // a directory holding a broken object (an older publish, before #323):
+  // gone, then rebuilt
+  if (await stat(dir).then(() => true, () => false)) await rm(dir, { recursive: true, force: true });
   await mkdir(cacheRoot, { recursive: true });
   const build = await mkdtemp(join(cacheRoot, `build-wasmnative-${flavor}-`));
   try {
@@ -192,6 +219,10 @@ async function ensureRunnerObjects(sanitize: boolean): Promise<string[]> {
         ]),
       ),
     );
+    const built = RUNNER_SOURCES.map((s) => join(build, s.replace(/\.c$/, ".o")));
+    if (!(await Promise.all(built.map((o) => isWholeElf(o, false)))).every(Boolean)) {
+      throw new Error("wasm-native: the compiler left a runner object that is not a whole ELF file");
+    }
     await rename(build, dir).catch(() => undefined);
   } finally {
     await rm(build, { recursive: true, force: true });
@@ -260,20 +291,53 @@ export async function compileWasmNative(opts: { cPath: string; outPath: string; 
       .digest("hex");
     cached = join(root, "wnbin", key.slice(0, 2), key);
     if (await exists(cached)) {
-      const tmp = `${opts.outPath}.${process.pid}.tmp`;
-      await copyFile(cached, tmp);
-      await rename(tmp, opts.outPath);
-      const now = new Date();
-      await utimes(cached, now, now).catch(() => undefined);
-      return;
+      // reused only when whole: an ELF executable matching the size and
+      // digest recorded when it was published (#323)
+      const recorded = await readFile(`${cached}.ok`, "utf8").catch(() => null);
+      if (recorded !== null && (await isWholeElf(cached, true)) && (await digestOf(cached)) === recorded) {
+        const tmp = `${opts.outPath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+        try {
+          await copyFile(cached, tmp);
+          await chmod(tmp, 0o755);
+          if ((await digestOf(tmp)) !== recorded) throw new Error("wasm-native: a cached executable changed while it was copied");
+          await rename(tmp, opts.outPath);
+        } finally {
+          await rm(tmp, { force: true });
+        }
+        const now = new Date();
+        await utimes(cached, now, now).catch(() => undefined);
+        return;
+      }
+      await rm(cached, { force: true });
+      await rm(`${cached}.ok`, { force: true });
     }
   }
-  await execFileAsync(driver.argv[0] ?? "clang", args, { maxBuffer: 64 << 20 });
+  // the link goes to a temporary name; the output appears only whole
+  const out = `${opts.outPath}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+  const linkArgs = args.map((a) => (a === opts.outPath ? out : a));
+  try {
+    await execFileAsync(driver.argv[0] ?? "clang", linkArgs, { maxBuffer: 64 << 20 });
+    if (!(await isWholeElf(out, true))) throw new Error("wasm-native: the link left an executable that is not a whole ELF file");
+    await rename(out, opts.outPath);
+  } finally {
+    await rm(out, { force: true });
+  }
   if (cached !== null) {
     await mkdir(join(cached, ".."), { recursive: true }).catch(() => undefined);
-    const tmp = `${cached}.${process.pid}.tmp`;
-    await copyFile(opts.outPath, tmp)
-      .then(() => rename(tmp, cached))
-      .catch(() => rm(tmp, { force: true }));
+    const tmp = `${cached}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`;
+    try {
+      await copyFile(opts.outPath, tmp);
+      const d = await digestOf(tmp);
+      // the record first, then the executable: a reader that sees the
+      // executable sees its record (a stale record only fails the check)
+      await writeFile(`${tmp}.ok`, d);
+      await rename(`${tmp}.ok`, `${cached}.ok`);
+      await rename(tmp, cached);
+    } catch {
+      // best effort: an unpublished build is only a cache miss later
+    } finally {
+      await rm(tmp, { force: true });
+      await rm(`${tmp}.ok`, { force: true });
+    }
   }
 }
