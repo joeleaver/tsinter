@@ -1875,6 +1875,21 @@ export class RegexInterpreterBuilder {
     });
   }
 
+  private readonly scratchGlobals = new Map<string, number>();
+
+  /** A module-level nullable ref global (null-initialized), one per name —
+   * execAt's lazily-allocated shared arrays (board #291). */
+  private scratchGlobal(name: string, typeIndex: number): number {
+    const hit = this.scratchGlobals.get(name);
+    if (hit !== undefined) return hit;
+    const g = this.mb.addGlobal({ kind: "ref", nullable: true, typeIndex }, true, (w) => {
+      w.u8(0xd0); // ref.null
+      w.sleb(typeIndex);
+    });
+    this.scratchGlobals.set(name, g);
+    return g;
+  }
+
   /** exec(bytecode, subject, startIndex, captureOut) -> i32 — design
    * §2.1's own signature, this file's central deliverable. THIS SLICE
    * covers REOP_char, REOP_char32, REOP_char_i, REOP_char32_i (the
@@ -2099,26 +2114,41 @@ export class RegexInterpreterBuilder {
       c.localSet(SP);
       c.i32Const(0);
       c.localSet(BP);
-      // Initial backtrack-stack size matches C's static_stack_buf[32].
-      c.i32Const(32);
-      c.arrayNewDefault(this.capType);
-      c.localSet(STACK);
-
-      // REOP_space/not_space's fixed \s/\S tables (buildFixedRangeTable's
-      // own doc comment): materialized fresh EVERY call, unconditionally,
-      // the SAME "just allocate it, it's cheap" choice STACK above
-      // already makes — these tables are at most a few dozen bytes, and
-      // a lazy-global guard (casing.ts's OWN pattern, for its genuinely
-      // large shared tables) would add real complexity here to save an
-      // allocation this small.
-      c.i32Const(this.spaceTable.offset);
-      c.i32Const(this.spaceTable.length);
-      c.arrayNewData(this.bcType, 0);
-      c.localSet(SPACE_TABLE);
-      c.i32Const(this.notSpaceTable.offset);
-      c.i32Const(this.notSpaceTable.length);
-      c.arrayNewData(this.bcType, 0);
-      c.localSet(NOT_SPACE_TABLE);
+      // Board #291: the initial backtrack stack (C's static_stack_buf[32])
+      // and the fixed \s/\S tables (buildFixedRangeTable's own doc
+      // comment) are allocated ONCE per module, lazily, into globals —
+      // they used to be allocated fresh on every call, and a global
+      // replace/split/matchAll calls this once per match, so those three
+      // arrays were most of the per-match garbage. Sharing is sound:
+      // execAt never re-enters itself (nothing it calls runs user code or
+      // another match), every stack slot is written before it is read
+      // (push before pop — sp starts at 0), the tables are never written,
+      // and a stack that outgrows 32 is a NEW array (ensureStackSpace's
+      // copy), so the shared one is never resized or retained beyond 32.
+      const lazyGlobal = (g: number, make: () => void, local: number): void => {
+        c.globalGet(g);
+        c.refIsNull();
+        c.ifVoid();
+        make();
+        c.globalSet(g);
+        c.end();
+        c.globalGet(g);
+        c.localSet(local);
+      };
+      lazyGlobal(this.scratchGlobal("stack", this.capType), () => {
+        c.i32Const(32);
+        c.arrayNewDefault(this.capType);
+      }, STACK);
+      lazyGlobal(this.scratchGlobal("space", this.bcType), () => {
+        c.i32Const(this.spaceTable.offset);
+        c.i32Const(this.spaceTable.length);
+        c.arrayNewData(this.bcType, 0);
+      }, SPACE_TABLE);
+      lazyGlobal(this.scratchGlobal("notSpace", this.bcType), () => {
+        c.i32Const(this.notSpaceTable.offset);
+        c.i32Const(this.notSpaceTable.length);
+        c.arrayNewData(this.bcType, 0);
+      }, NOT_SPACE_TABLE);
 
       // unwindToType(stopType): calls this.noMatch() with the given
       // compareType/continueOnEqual, unpacks its results into PC/CPTR/

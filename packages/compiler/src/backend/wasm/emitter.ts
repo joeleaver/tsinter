@@ -27844,10 +27844,11 @@ class Assembler {
               // case (the SAME array-reuse shape split has here); no
               // corpus split pattern happens to toggle a group's own
               // participation across segments, so this exact instance
-              // was silent until traced deliberately.
-              code.i32Const(captureArrayCount);
-              code.call(this.regexInterp.newCaptureArray());
-              code.localSet(capLocal);
+              // was silent until traced deliberately. Board #291: the
+              // array allocated above is reset to that -1 state here
+              // rather than replaced — this loop probes once per POSITION,
+              // and the previous probe's slots were copied out already.
+              this.emitCaptureReset(code, capLocal);
               code.localGet(bcLocal);
               code.localGet(subjLocal);
               code.localGet(qLocal);
@@ -28183,6 +28184,9 @@ class Assembler {
             code.localSet(posLocal);
             code.i32Const(0);
             code.localSet(flushedLocal);
+            code.localGet(captureArrayCountLocal);
+            code.call(this.regexInterp.newCaptureArray());
+            code.localSet(capLocal);
 
             // Match-collect-and-substitute loop (js_regexp_Symbol_
             // replace, read directly — the two-phase collect-then-build
@@ -28201,12 +28205,14 @@ class Assembler {
               code.i32GtS();
               code.brIf(1);
 
-              // Fresh captureOut every iteration — see this local's own
-              // acquisition comment above for why reusing one across
-              // matches is wrong.
-              code.localGet(captureArrayCountLocal);
-              code.call(this.regexInterp.newCaptureArray());
-              code.localSet(capLocal);
+              // A clean captureOut every iteration — see this local's own
+              // acquisition comment above for why carrying one match's
+              // slots into the next is wrong. Board #291: ONE array,
+              // allocated before the loop and reset to newCaptureArray's
+              // own all -1 state here (getSubstitution has consumed the
+              // previous match's slots by now), instead of a fresh array
+              // per match.
+              this.emitCaptureReset(code, capLocal);
 
               code.localGet(bcLocal);
               code.localGet(subjLocal);
@@ -28235,6 +28241,13 @@ class Assembler {
               code.i32GeS();
               code.ifVoid();
               {
+                // The unchanged span before this match — skipped when
+                // empty (adjacent matches): an empty piece adds nothing
+                // to the final join, only an allocation (board #291).
+                code.localGet(matchStartLocal);
+                code.localGet(flushedLocal);
+                code.i32GtS();
+                code.ifVoid();
                 code.localGet(pieces);
                 code.localGet(subjLocal);
                 code.localGet(flushedLocal);
@@ -28243,6 +28256,7 @@ class Assembler {
                 code.f64ConvertI32S();
                 code.call(this.strs.slice());
                 code.call(this.vecs.pushOne(vecInfo));
+                code.end();
 
                 code.localGet(pieces);
                 code.localGet(subjLocal);
@@ -28626,6 +28640,9 @@ class Assembler {
             const posLocal = this.acquireScratch(I32);
             code.i32Const(0);
             code.localSet(posLocal);
+            code.localGet(captureArrayCountLocal);
+            code.call(this.regexInterp.newCaptureArray());
+            code.localSet(capLocal);
 
             // Drain loop — replaceAll's own probe/advance structure
             // (js_regexp_Symbol_replace's g-branch), minus the
@@ -28640,12 +28657,13 @@ class Assembler {
               code.i32GtS();
               code.brIf(1);
 
-              // Fresh captureOut every iteration — see split's/replace's
-              // own acquisition comment for why reusing one across
-              // matches is wrong (the stale-capture-reuse bug).
-              code.localGet(captureArrayCountLocal);
-              code.call(this.regexInterp.newCaptureArray());
-              code.localSet(capLocal);
+              // A clean captureOut every iteration — see split's/replace's
+              // own acquisition comment for why carrying one match's
+              // slots into the next is wrong (the stale-capture-reuse
+              // bug). ONE array, allocated before the loop and reset here
+              // (emitMatchRow has copied the previous match out by now;
+              // board #291).
+              this.emitCaptureReset(code, capLocal);
 
               code.localGet(bcLocal);
               code.localGet(subjLocal);
@@ -31195,6 +31213,33 @@ class Assembler {
     this.releaseScratch(rowRefT, rowLocal);
   }
 
+  /** Resets every slot of the capture array in local `cap` to -1 —
+   * newCaptureArray's own initial state — so one array can serve every
+   * match of a drain loop (board #291). */
+  private emitCaptureReset(code: Code, cap: number): void {
+    const iLocal = this.acquireScratch(I32);
+    code.localGet(cap);
+    code.arrayLen();
+    code.localSet(iLocal);
+    code.block();
+    code.loop();
+    code.localGet(iLocal);
+    code.i32Eqz();
+    code.brIf(1);
+    code.localGet(iLocal);
+    code.i32Const(1);
+    code.i32Sub();
+    code.localSet(iLocal);
+    code.localGet(cap);
+    code.localGet(iLocal);
+    code.i32Const(-1);
+    code.arraySet(this.regexInterp.capType);
+    code.br(0);
+    code.end();
+    code.end();
+    this.releaseScratch(I32, iLocal);
+  }
+
   private getSubstitutionHelper(): number {
     if (this.getSubstitutionField !== null) return this.getSubstitutionField;
     const strRefT = this.strRef;
@@ -31229,12 +31274,44 @@ class Assembler {
     const START = 19; // capture start (both digit- and name-rule resolution); the matching end offset is read inline where needed, never stashed in its own local
     const c = new Code();
 
-    c.f64Const(0);
-    c.call(this.vecs.newLen(vecInfo));
-    c.localSet(PIECES);
     c.localGet(TEMPLATE);
     c.arrayLen();
     c.localSet(LEN);
+    // Board #291 fast path: a template with no '$' before its last
+    // character has no rule to dispatch (a trailing lone '$' is literal —
+    // the main loop's own stop condition below), so the substitution IS
+    // the template: answer it without building and joining a pieces
+    // vector once per match. Strings are immutable; sharing is unobservable.
+    c.i32Const(0);
+    c.localSet(J);
+    c.block();
+    c.loop();
+    c.localGet(J);
+    c.i32Const(1);
+    c.i32Add();
+    c.localGet(LEN);
+    c.i32GeS();
+    c.ifVoid();
+    c.localGet(TEMPLATE);
+    c.return_();
+    c.end();
+    c.localGet(TEMPLATE);
+    c.localGet(J);
+    c.arrayGetU(this.strType);
+    c.i32Const(0x24); // '$'
+    c.i32Eq();
+    c.brIf(1);
+    c.localGet(J);
+    c.i32Const(1);
+    c.i32Add();
+    c.localSet(J);
+    c.br(0);
+    c.end();
+    c.end();
+
+    c.f64Const(0);
+    c.call(this.vecs.newLen(vecInfo));
+    c.localSet(PIECES);
     c.i32Const(0);
     c.localSet(I);
 

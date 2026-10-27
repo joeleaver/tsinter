@@ -546,66 +546,154 @@ export class VecBuilder {
         this.mb.funcType([this.vecRef(v), strRefT], [strRefT]),
         `%w.vec.join:${v.key}`,
       );
+      // Board #291: measure, then copy ONCE. The old body accumulated
+      // with %w.concat per element — every step copied everything built
+      // so far, O(total * count), which made a global regex replace (its
+      // result is a join of the pieces) quadratic. Pass 1 formats each
+      // element (a string element is read as is; any other kind is
+      // formatted once into PARTS so pass 2 never formats twice) and sums
+      // the lengths; pass 2 copies separator and parts into one fresh
+      // array. Element order, the formatter calls and the absent-slot
+      // trap are unchanged.
+      const strType = (strRefT as { typeIndex: number }).typeIndex;
+      const partsType = this.mb.arrayType(strRefT, true);
+      const partsRefT: ValType = { kind: "ref", nullable: true, typeIndex: partsType };
       const c = new Code();
       const V = 0;
       const SEP = 1;
       const L = 2; // i32
       const I = 3; // i32
-      const ACC = 4; // str
+      const TOT = 4; // i32
+      const POS = 5; // i32
+      const S = 6; // str
+      const DEST = 7; // str
+      const PARTS = 8; // parts (non-string elements only)
+      const stringElems = v.elemKind === "string";
+      const pushElem = (): void => {
+        if (stringElems) {
+          c.localGet(V);
+          c.structGet(v.struct, BUF);
+          c.localGet(I);
+          this.emitElemRead(c, v);
+        } else {
+          c.localGet(PARTS);
+          c.localGet(I);
+          c.arrayGet(partsType);
+        }
+      };
+      const forEach = (body: () => void): void => {
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(L);
+        c.i32GeS();
+        c.brIf(1);
+        body();
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+      };
       c.localGet(V);
       c.structGet(v.struct, LEN);
       c.localSet(L);
-      this.deps.lit(c, "");
-      c.localSet(ACC);
-      c.i32Const(0);
-      c.localSet(I);
-      c.block();
-      c.loop();
-      c.localGet(I);
-      c.localGet(L);
-      c.i32GeS();
-      c.brIf(1);
-      c.localGet(I);
-      c.ifVoid();
-      c.localGet(ACC);
-      c.localGet(SEP);
-      c.call(this.deps.concat());
-      c.localSet(ACC);
-      c.end();
-      c.localGet(ACC);
-      c.localGet(V);
-      c.structGet(v.struct, BUF);
-      c.localGet(I);
-      this.emitElemRead(c, v);
-      switch (v.elemKind) {
-        case "f64":
-          c.call(this.deps.f64ToStr());
-          break;
-        case "bool":
-          c.ifResult(strRefT);
-          this.deps.lit(c, "true");
-          c.else_();
-          this.deps.lit(c, "false");
-          c.end();
-          break;
-        case "string":
-          break; // already a string
-        case "ref":
-          if (refIdx === null) throw new Error("join over ref elements needs refJoinToStr (emitter bug)");
-          c.call(refIdx);
-          break;
+      if (!stringElems) {
+        c.localGet(L);
+        c.arrayNewDefault(partsType);
+        c.localSet(PARTS);
       }
-      c.call(this.deps.concat());
-      c.localSet(ACC);
-      c.localGet(I);
+      // separators: (L - 1) * |sep| when L > 0
+      c.localGet(L);
+      c.ifResult(I32);
+      c.localGet(L);
       c.i32Const(1);
-      c.i32Add();
-      c.localSet(I);
-      c.br(0);
+      c.i32Sub();
+      c.localGet(SEP);
+      c.arrayLen();
+      c.i32Mul();
+      c.else_();
+      c.i32Const(0);
       c.end();
-      c.end();
-      c.localGet(ACC);
-      this.mb.setBody(idx, [I32, I32, strRefT], c.bytes());
+      c.localSet(TOT);
+      forEach(() => {
+        if (stringElems) {
+          pushElem();
+        } else {
+          c.localGet(V);
+          c.structGet(v.struct, BUF);
+          c.localGet(I);
+          this.emitElemRead(c, v);
+          switch (v.elemKind) {
+            case "f64":
+              c.call(this.deps.f64ToStr());
+              break;
+            case "bool":
+              c.ifResult(strRefT);
+              this.deps.lit(c, "true");
+              c.else_();
+              this.deps.lit(c, "false");
+              c.end();
+              break;
+            case "ref":
+              if (refIdx === null) throw new Error("join over ref elements needs refJoinToStr (emitter bug)");
+              c.call(refIdx);
+              break;
+          }
+          c.localSet(S);
+          c.localGet(PARTS);
+          c.localGet(I);
+          c.localGet(S);
+          c.arraySet(partsType);
+          c.localGet(S);
+        }
+        c.arrayLen();
+        c.localGet(TOT);
+        c.i32Add();
+        c.localSet(TOT);
+      });
+      c.localGet(TOT);
+      c.arrayNewDefault(strType);
+      c.localSet(DEST);
+      c.i32Const(0);
+      c.localSet(POS);
+      forEach(() => {
+        c.localGet(I);
+        c.ifVoid();
+        c.localGet(DEST);
+        c.localGet(POS);
+        c.localGet(SEP);
+        c.i32Const(0);
+        c.localGet(SEP);
+        c.arrayLen();
+        c.arrayCopy(strType, strType);
+        c.localGet(POS);
+        c.localGet(SEP);
+        c.arrayLen();
+        c.i32Add();
+        c.localSet(POS);
+        c.end();
+        pushElem();
+        c.localSet(S);
+        c.localGet(DEST);
+        c.localGet(POS);
+        c.localGet(S);
+        c.i32Const(0);
+        c.localGet(S);
+        c.arrayLen();
+        c.arrayCopy(strType, strType);
+        c.localGet(POS);
+        c.localGet(S);
+        c.arrayLen();
+        c.i32Add();
+        c.localSet(POS);
+      });
+      c.localGet(DEST);
+      this.mb.setBody(idx, [I32, I32, I32, I32, strRefT, strRefT, partsRefT], c.bytes());
       return idx;
     });
   }
