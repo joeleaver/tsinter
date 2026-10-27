@@ -17,9 +17,10 @@ The double-to-shortest-decimal core of Ryū (d2s and its headers only — the fl
 
 The QuickJS-ng JavaScript engine, embedded by the opt-in `--dynamic` build mode (see packages/runtime/src/scr_island.c). Static builds never compile or link any of this.
 
-The tree is a plain snapshot of the upstream commit with directories the library build does not need removed (tests/, docs/, examples/, test262 fixtures, CI config, generator scripts). ONE local patch is applied (to update: re-clone upstream at the new commit, delete its .git directory, apply the same trim, re-apply the patch, update this file, and rebuild quickjs-ng-wasm/ below):
+The tree is a plain snapshot of the upstream commit with directories the library build does not need removed (tests/, docs/, examples/, test262 fixtures, CI config, generator scripts). TWO local patches are applied (to update: re-clone upstream at the new commit, delete its .git directory, apply the same trim, re-apply the patches, update this file, and rebuild quickjs-ng-wasm/ below):
 
 - `quickjs.c`, `update_stack_limit`: upstream forces `rt->stack_limit = 0` ("no limit") under `#if defined(__wasi__)`; the patch drops that branch, so the wasi build honors `JS_SetMaxStackSize` like every other platform. Without it, unbounded recursion in the WasmGC tier's engine overflows the host's wasm stack (an uncatchable trap) instead of throwing the engine's catchable RangeError (SEMANTICS.md S103 (a)). Native builds never define `__wasi__`, so their code is unchanged.
+- `quickjs.c`, Date's local time (the `TSINTER_ZONE_HOOKS` block before `getTimezoneOffset`): in every build but wasi, `get_date_fields`, `set_date_fields` and `getTimezoneOffset()` read the zone through the runtime's `scr_tz_offset_ms` / `scr_tz_local_to_utc` (scr_lib.c) — the offset in milliseconds rather than whole minutes, V8's ToUTC for a local time, V8's truncated minutes (SEMANTICS.md S113). The wasi build defines no hooks, so engine.wasm is byte-identical to the unpatched build (`build-engine-wasm.mjs --check`). Native builds key the engine archive and the binary cache by quickjs.c's own digest (cc.ts), so editing a patch never reuses a stale engine.
 
 ## quickjs-ng-wasm/
 

@@ -125,7 +125,9 @@ with a LinkError (SEMANTICS.md S097 registers what differs from Node). Since #22
 tier only through the `tsinter.fetch` import — the host's own fetch, asked
 for plain data (S098) — and `tsinter.evPoll`, with the same LinkError when a
 host declines either; a module that reaches only the AbortSignal statics
-imports neither.
+imports neither. Since S113, the host's local time zone enters only through
+the `tsinter.tzCall` import (an offset at an instant, a zone name, and the
+program's own TZ writes), with the same LinkError when a host declines it.
 **Rationale:** the output is a
 sandboxed wasm module; ambient OS authority would be a lie at best and a
 sandbox hole at worst. **Tested by:** wasm-differential harness refusal
@@ -5832,6 +5834,16 @@ outside both grammars still fences ("bogus 2020", the other eight Node-NaN strin
 and the five numeric lenient-ISO/legacy shapes), because Node answers a real time for some such strings. The check runs only after both grammars declined, so no modelled
 answer moves.
 
+**Amendment (local time zone unit, 2026-10-26, S113): the offset-less ECMA date-time is no longer fenced or
+NaN — it is LOCAL time on every lane.** `"2026-07-17T12:00:00"`, `"2026-07-17T12:00"`, `"2020T12:00"` and every
+other grammar-2 date-time with no `Z` or `±HH:MM` answer Node's value: V8's ParseDateTimeString bounds the
+local value to ±(8.64e15 + 10 days), converts it with ToUTC under the host's zone (S113: the wasm tier asks
+its host through `tsinter.tzCall`, the native lanes ask the C library), then TimeClips. The native lanes'
+silent NaN for this form (this entry's "outside both grammars" paragraph listed it) is gone, and the fence
+message now spells the offset as optional: `("YYYY[-MM[-DD]][THH:mm[:ss[.sss]][Z|±HH:MM]]")`. Every other
+fenced shape above — the legacy forms, the lenient ISO shapes, the reinterpretation classes — is unchanged:
+those need V8's legacy parser, not a zone.
+
 **Tested by:** 1572 (native lanes ONLY — it is NOT a wasm-tier member: under the per-pass stub sweep it
 refuses on `crypto.x509FingerprintStr`, a key outside this pass), plus `wasm-date.test.ts`'s genuine
 differential rows (the modelled grammars, computed against `new Date(x).getTime()` in-process, including
@@ -7074,7 +7086,9 @@ except:
   inside the engine `getTimezoneOffset()` is 0 and every local-time method and
   `toString` answers in UTC; measured under `TZ=America/New_York`, Node
   answers `new Date(0).getTimezoneOffset()` with 300. The native lanes use the
-  host's zone.
+  host's zone, through the engine's zone hooks (S113). The import this engine
+  will ask exists — `tsinter.tzCall` (S113), already serving the static tier's
+  local date strings — and the engine's localtime is wired to it next.
 - **(f) Transcendental Math inside the engine is wasi-libc's (musl's).**
   Measured over 2,000 inputs in (-10, 10) (|x| for log/log1p), the count that
   differ from Node in the last bit: sin 19, cos 25, exp 206, log 142, log1p 1;
@@ -7189,3 +7203,80 @@ in `cond && void late` (or a `?:` arm) the check runs even when the branch is no
 taken — where Node evaluates nothing and throws nothing, this tier throws the
 ReferenceError. Statement-level `void late;` is exact. Measured against Node
 v24.18.1; pinned by packages/compiler/test/module-tdz.test.ts and corpus 2765.
+
+## S113 — Local time follows the HOST's zone: the wasm tier asks its host through `tsinter.tzCall`, the native lanes ask the C library; where the host's zone data, zone choice or DST flag differs from Node's ICU, the answers differ *(every lane; (b), (c) and (d) native only)*
+
+**The contract.** One OS-level import, `tsinter.tzCall(op, ms, ptr, len) -> f64` (abi.ts), answers three
+questions about the host's local time zone: OFFSET — the zone's offset from UTC at a UTC instant, in
+milliseconds with seconds kept (Chicago before 1883 is -5:50:36, not -5:51); NAME — the zone's display
+name at an instant, as Node's `Date#toString` prints it without the parentheses; ZONE — the program set
+or deleted its TZ variable, so answer for that zone from now on (Node re-reads its zone whenever
+`process.env.TZ` is assigned). A browser implements it in a few lines with its own `Date` and `Intl`, a C
+host with `localtime_r` / `tm_gmtoff` and `setenv` + `tzset`; a host that will not answer does not supply
+the import, and the module fails to instantiate with a LinkError naming it (S004's precedent); an answer
+that is not an integer is the uncatchable named trap `tzCall: host failure`. Every Node rule lives in the
+module (date.ts): V8's ParseDateTimeString range (a local value beyond ±(8.64e15 + 10 days) is NaN) and
+DateCache::ToUTC — a local time in a DST gap or overlap takes the offset in force BEFORE the transition
+(ICU's UCAL_TZ_LOCAL_FORMER, so `"2020-03-08T02:30:00"` in Chicago is 08:30Z and `"2020-11-01T01:30:00"`
+is the first 01:30, 06:30Z), computed as the offset at L - max(offset a day before, offset a day after);
+queries are clamped into ±8.64e15. Measured against Node v24.18.1 over every transition of 598 zones from
+1850 to 2040 (570,430 local times around each transition's two edges): equal, except 19 local times on
+one day — Europe/Riga, 1944-10-02 — where Node itself answers differently for the same instant
+depending on what it was asked before (its DateCache; two fresh processes disagree), see (e).
+
+Today the wasm tier reaches local time in ONE place, `date.parseGetTime`'s offset-less date-time (S069's
+amendment): the import is minted in every module that parses a date string, and a module that also
+writes `process.env` sends ZONE when the key is `TZ`. Its embedded engine still answers in UTC (S103 (e))
+until that engine's localtime asks the same import. The native lanes read the C library's zone directly
+(scr_lib.c `scr_tz_offset_ms`, `scr_tz_local_to_utc`; `process.env.TZ` writes and deletes call `tzset`),
+in their static parse and in their engine: the vendored quickjs-ng carries a second local patch
+(vendor/README.md) routing its Date's local time through those two functions — milliseconds instead of
+whole minutes (board #290's 07:14:20 vs 07:13:24), V8's ToUTC instead of a single lookup at the local
+time (Lord Howe's half-hour gap and overlap), and V8's truncation toward zero for `getTimezoneOffset`
+and the `GMT±hhmm` field. Its `Date#toString` name is Node's (board #283): V8 picks the zone's long
+standard or daylight name by ICU's DST flag, after mapping an instant before 1970 or past 2^31 seconds
+to the "equivalent" instant in 2008-2035 with the same leap-ness and January-1 weekday — which is why
+Node prints Chicago in July 1800 as "(Central Daylight Time)" at a local-mean-time offset — and the
+native lanes read the C library's DST flag at that same equivalent instant and look the name up in
+`scr_zone_names.h`, generated from Node by `scripts/gen-zone-names.mjs`. The zone is ICU's choice: TZ
+less a leading `:` and a `posix/` / `right/` prefix, else the `/etc/localtime` link's target; a zone the
+table does not name prints ICU's unknown-zone name, `GMT±hh:mm` of its offset (`TZ=Invalid/Zone` and
+`TZ=` print `(GMT+00:00)` with offset 0 on Node and every lane).
+
+**The divergences registered.**
+- **(a) Zone DATA is the host's.** Node's offsets come from its bundled ICU (tz 2026b in v24.18.1); the
+  native lanes' from the C library's tzdata (this box: 2026e, built with backzone history); a wasm host's
+  from wherever its Date gets them (the harness host IS this process's Node, so the wasm lane is Node's
+  exactly). Measured with the native engine over 598 zone names x 1,255 instants from 1850 to 2100: 474
+  zones identical; 120 differ in offset, only where the two data sets differ — pre-1970 history of zones
+  the IANA main data folds into links (Europe/Oslo, America/Nassau, ...), Canadian provinces' rules
+  after 2026 (America/Winnipeg, America/Edmonton, America/Vancouver), Africa/Casablanca's.
+- **(b) Names follow the C library's DST flag (native).** Where it differs from ICU's for an instant,
+  the other of the zone's two names prints: negative DST in the main data format (Europe/Dublin
+  1970-1971, Africa/Windhoek before 2017, Africa/Casablanca), and tzdata version differences — 13 zones
+  in the measurement above, counted per zone in the generated header. The names are English: Node's
+  follow the locale (`LANG=de_DE.UTF-8` prints "(Mitteleuropäische Normalzeit)"), the native lanes
+  print the en-US name under every locale.
+- **(c) Zone CHOICE (native).** ICU accepts only zone names in TZ, the C library also POSIX rule strings
+  and paths: `TZ=EST5EDT,M3.2.0,M11.1.0` is the system zone on Node and US Eastern rules natively;
+  `TZ=/usr/share/zoneinfo/Asia/Tokyo` is a fixed +09:00 named "GMT+09:00" on Node and Tokyo's full history
+  natively (equal after 1951); an `/etc/localtime` that is a copy rather than a link gets the
+  `GMT±hh:mm` name natively where ICU searches zoneinfo for the matching file.
+- **(d) Windows (native).** The CRT's zone: TZ is not IANA-shaped and there is no history before 1970
+  (offset 0 there). Corpus 2771 is on the Windows lane's skip list.
+- **(e) Node's own cache.** V8 answers UTC-to-local offsets through its DateCache, which can answer a
+  different offset for the same instant depending on the queries before it (measured: Europe/Riga,
+  1944-10-02T01:00Z, +3:00 after a forward scan, +1:00 in a fresh process). Every lane answers the zone
+  data's offset; a program reaching such an instant can differ from Node, as Node can differ from
+  itself.
+- **(f) The clamp.** The wasm tier asks about instants in ±8.64e15 only; a local time within a day of the
+  range's edge takes the offset at the edge, which differs from Node only if a zone transition fell in
+  that day (measured: no zone of the 598 changes offset within two days of either edge in Node's data).
+
+**Tested by:** `tests/harness/tz-matrix.test.ts` (a static program on c, llvm and wasm and an engine
+program on c and llvm, against Node, under eleven TZ values: Chicago, Kolkata, Lord Howe, London, UTC,
+St John's, Chatham, Kathmandu, an invalid name, the empty string and unset); `packages/compiler/test/
+wasm-date.test.ts` (local rows against this process's Date under seven zones, the import-section pin,
+the non-integer-answer trap, the ZONE op's order); corpus 2771 (the program sets its own zones). Broken
+once by hand: the max of the two offsets turned into a min (static rows red, wasm included), the engine
+hook rounded to minutes and the name table's daylight column ignored (engine rows red).

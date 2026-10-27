@@ -97,12 +97,23 @@
  * underlying primitives (`openIf`/`close`/`emitSetCellErrorLit`/
  * `emitUnwind`) `emitPendingCheck()` is itself built from. */
 import { Code } from "./code.js";
+import { TZ_OP_OFFSET } from "./abi.js";
 import { F64, I32, ModuleBuilder, type ValType } from "./module.js";
 
 export interface DateDeps {
   strRef: () => ValType;
   strType: () => number;
+  /** `tsinter.tzCall`'s function index (abi.ts) — minted in every module
+   * that reaches `date.parseGetTime`, the one static surface that reads
+   * local time (an offset-less date-time). */
+  tzCall: () => number;
+  /** Emits the module's named trap (an uncatchable report) with `message`. */
+  namedTrap: (c: Code, message: string) => void;
 }
+
+/** V8's DateCache::kMaxTimeBeforeUTCInMs: a local time value outside
+ * ±(8.64e15 + 10 days) is NaN before any zone is asked (date.h). */
+const MAX_TIME_BEFORE_UTC_MS = 8640000000000000 + 864000000;
 
 /** The fence sentinel `%w.date.parseGetTime` returns when NEITHER grammar
  * produced a disposition: NaN's own bit pattern is a legitimate MODELLED
@@ -1323,14 +1334,15 @@ export class DateBuilder {
   private g2FinishHelper(): number {
     return this.cached(
       "g2Finish",
-      [I32, I32, I32, I32, I32, I32, I32, I32, F64],
+      [I32, I32, I32, I32, I32, I32, I32, I32, F64, I32],
       [I32, F64],
       (idx) => {
         const c = new Code();
         const YY = 0, BARE = 1, MO = 2, D = 3, HH = 4, MI = 5, SS = 6, MS = 7; // i32 params
         const OFF = 8; // f64 param
-        const DAYS = 9; // i32
-        const DAYSF = 10, T = 11; // f64
+        const LOCALZ = 9; // i32 param: 1 = no offset was written (local time, S113)
+        const DAYS = 10; // i32
+        const DAYSF = 11, T = 12; // f64
         const locals: ValType[] = [I32, F64, F64];
 
         const fail = (): void => {
@@ -1447,10 +1459,18 @@ export class DateBuilder {
         c.f64Add();
         c.localSet(DAYSF); // DAYSF now holds the PRE-offset total ms (name kept for local budget)
 
-        // D-beta: subtract the offset, THEN TimeClip — once, here.
+        // D-beta: subtract the offset, THEN TimeClip — once, here. An
+        // offset-less date-time is LOCAL (SEMANTICS.md S113): V8's
+        // ParseDateTimeString bounds the local value, then ToUTC.
+        c.localGet(LOCALZ);
+        c.ifResult(F64);
+        c.localGet(DAYSF);
+        c.call(this.localToUtcHelper());
+        c.else_();
         c.localGet(DAYSF);
         c.localGet(OFF);
         c.f64Sub();
+        c.end();
         c.localSet(T);
         c.localGet(T);
         c.f64Abs();
@@ -1652,6 +1672,7 @@ export class DateBuilder {
       c.i32Const(0);
       c.i32Const(0);
       c.f64Const(0);
+      c.i32Const(0);
       c.call(this.g2FinishHelper());
       c.return_();
       c.end();
@@ -1700,12 +1721,24 @@ export class DateBuilder {
       }
       c.end();
 
-      // offset-less date-time: FENCE (D6-ii), not NaN — ok=0.
+      // offset-less date-time: LOCAL time through the host's zone
+      // (tzCall, SEMANTICS.md S113) — fenced (D6-ii) until the zone import.
       c.localGet(POS);
       c.localGet(LEN);
       c.i32Eq();
       c.ifVoid();
-      fail();
+      c.localGet(YY);
+      c.localGet(BARE);
+      c.localGet(MO);
+      c.localGet(D);
+      c.localGet(HH);
+      c.localGet(MI);
+      c.localGet(SS);
+      c.localGet(MS);
+      c.f64Const(0);
+      c.i32Const(1);
+      c.call(this.g2FinishHelper());
+      c.return_();
       c.end();
 
       c.f64Const(0);
@@ -1818,8 +1851,87 @@ export class DateBuilder {
       c.localGet(SS);
       c.localGet(MS);
       c.localGet(OFF);
+      c.i32Const(0);
       c.call(this.g2FinishHelper());
       this.mb.setBody(idx, locals, c.bytes());
+    });
+  }
+
+  /** `%w.date.zoneOffset(t) -> f64` — the host zone's offset (local -
+   * UTC, milliseconds) at the UTC instant `t`, through `tzCall` OFFSET
+   * (abi.ts). `t` is clamped into TimeClip's range first: the host is only
+   * ever asked about an instant its own Date can represent, and the
+   * clamped query differs only where a zone transition falls within a day
+   * of ±8.64e15 (SEMANTICS.md S113). A non-integral (or non-finite) answer
+   * is the named trap "tzCall: host failure". */
+  zoneOffsetHelper(): number {
+    return this.cached("zoneOffset", [F64], [F64], (idx) => {
+      const c = new Code();
+      const T = 0, V = 1;
+      c.i32Const(TZ_OP_OFFSET);
+      c.localGet(T);
+      c.f64Const(-8640000000000000);
+      c.f64Max();
+      c.f64Const(8640000000000000);
+      c.f64Min();
+      c.i32Const(0);
+      c.i32Const(0);
+      c.call(this.deps.tzCall());
+      c.localSet(V);
+      c.localGet(V);
+      c.localGet(V);
+      c.f64Trunc();
+      c.f64Sub();
+      c.f64Const(0);
+      c.f64Ne();
+      c.ifVoid();
+      this.deps.namedTrap(c, "tzCall: host failure");
+      c.unreachable();
+      c.end();
+      c.localGet(V);
+      this.mb.setBody(idx, [F64], c.bytes());
+    });
+  }
+
+  /** `%w.date.localToUtc(local) -> f64` — V8's ParseDateTimeString local
+   * arm: NaN outside ±kMaxTimeBeforeUTCInMs, else DateCache::ToUTC — the
+   * local time minus ICU's offset with UCAL_TZ_LOCAL_FORMER for both a
+   * skipped and a repeated local time (V8's ICUTimezoneCache::
+   * LocalTimeOffset). FORMER means: a local time inside a transition's
+   * gap or overlap takes the offset in force BEFORE the transition, so a
+   * local time L takes the later offset exactly when L - max(before,
+   * after) is at or past the transition instant. With `before` and
+   * `after` sampled a day either side of L, that is one more question:
+   * the offset at L - max(before, after). The caller TimeClips. */
+  localToUtcHelper(): number {
+    return this.cached("localToUtc", [F64], [F64], (idx) => {
+      const c = new Code();
+      const L = 0, M = 1;
+      c.localGet(L);
+      c.f64Abs();
+      c.f64Const(MAX_TIME_BEFORE_UTC_MS);
+      c.f64Gt();
+      c.ifVoid();
+      c.f64Const(NaN);
+      c.return_();
+      c.end();
+      c.localGet(L);
+      c.f64Const(86400000);
+      c.f64Sub();
+      c.call(this.zoneOffsetHelper());
+      c.localGet(L);
+      c.f64Const(86400000);
+      c.f64Add();
+      c.call(this.zoneOffsetHelper());
+      c.f64Max();
+      c.localSet(M);
+      c.localGet(L);
+      c.localGet(L);
+      c.localGet(M);
+      c.f64Sub();
+      c.call(this.zoneOffsetHelper());
+      c.f64Sub();
+      this.mb.setBody(idx, [F64], c.bytes());
     });
   }
 

@@ -221,10 +221,10 @@ describe(`island web globals (scriptc-only${sanitize ? ", sanitized" : ""})`, ()
     expect(out).toBe("true true true true QuotaExceededError TypeMismatchError");
   });
 
-  // The prelude's Date patch (divergence 289): quickjs-ng stops at the GMT
-  // offset; Node appends the parenthesized timezone name. Shape-asserted —
-  // the machine's zone decides the name (UTC's is byte-exact vs Node, other
-  // zones render C-library names; the vercel e2e suite pins UTC end to end).
+  // The prelude's Date patch: quickjs-ng stops at the GMT offset; Node
+  // appends the parenthesized timezone name. Shape-asserted here — the
+  // machine's zone decides the name; tz-matrix.test.ts compares it with
+  // Node's under several zones (SEMANTICS.md S113).
   test("Date#toString/#toTimeString carry the timezone-name suffix Node prints", async () => {
     const out = await islandEval(
       "web-date-tzname",

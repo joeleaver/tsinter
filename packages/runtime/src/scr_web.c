@@ -46,6 +46,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 #include "quickjs.h"
 
@@ -1475,9 +1478,8 @@ static const char web_prelude[] =
     "  /* Date#toString/#toTimeString: the engine stops at the GMT offset\n"
     "   * (\"Tue Jan 02 2024 00:00:00 GMT+0000\"); Node/V8 appends the zone's\n"
     "   * long name (\"(Coordinated Universal Time)\"). The suffix rides\n"
-    "   * host.tzname(ms) — exact for UTC, the C library's zone name for\n"
-    "   * other zones (long names outside UTC are ICU data the runtime does\n"
-    "   * not carry; SEMANTICS.md). */\n"
+    "   * host.tzname(ms) — Node's name for the zone at that instant\n"
+    "   * (scr_zone_names.h; SEMANTICS.md S113). */\n"
     "  {\n"
     "    const dToString = Date.prototype.toString;\n"
     "    const dToTimeString = Date.prototype.toTimeString;\n"
@@ -1699,12 +1701,77 @@ static JSValue web_host_uuid(JSContext *ctx, JSValueConst this_val, int argc,
   return r;
 }
 
-/* Date#toString's timezone-name suffix (the prelude's Date patch): Node
- * prints the zone's CLDR long name ("Coordinated Universal Time"); without
- * ICU data the C library only knows the zone's own name for the instant
- * (tm_zone: "UTC", "CST" — DST-correct via localtime). UTC maps to its
- * exact CLDR spelling; every other zone renders the C library name — the
- * documented divergence in SEMANTICS.md. */
+/* Date#toString's timezone-name suffix (the prelude's Date patch;
+ * SEMANTICS.md S113). Node prints ICU's long name of the zone for standard
+ * or daylight time ("Central Standard Time" / "Central Daylight Time"),
+ * deciding which by ICU's DST flag at the instant — after V8 maps an
+ * instant before 1970 or past 2^31 seconds to its "equivalent" one
+ * (DateCache::LocalTimezone / EquivalentTime: the same month and day in
+ * the year of 2008..2035 with the same leap-ness and January 1st weekday).
+ * Here the flag is the C library's tm_isdst at that equivalent instant, and
+ * scr_zone_names.h (generated from Node by scripts/gen-zone-names.mjs) maps
+ * (zone, flag) to Node's name. The zone is ICU's choice: TZ (less a leading
+ * ':' and a "posix/" or "right/" prefix), else the /etc/localtime link's
+ * target under zoneinfo/. A zone the table does not name gets ICU's
+ * fallback for an unknown zone, "GMT±hh:mm" of its offset (Node:
+ * TZ=Invalid/Zone prints "(GMT+00:00)"). */
+#include "scr_zone_names.h"
+
+static long long web_days_from_civil(long long y, int m, int d) {
+  y -= m <= 2;
+  long long era = (y >= 0 ? y : y - 399) / 400;
+  unsigned long long yoe = (unsigned long long)(y - era * 400);
+  unsigned long long doy = (unsigned long long)((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1);
+  unsigned long long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + (long long)doe - 719468;
+}
+
+/* V8's DateCache::EquivalentTime for an instant outside [0, kMaxInt s]. */
+static double web_equivalent_time(double ms) {
+  if (ms >= 0 && ms <= 2147483647000.0) return ms;
+  long long days = (long long)floor(ms / 86400000.0);
+  double within = ms - (double)days * 86400000.0;
+  long long z = days + 719468;
+  long long era = (z >= 0 ? z : z - 146096) / 146097;
+  unsigned long long doe = (unsigned long long)(z - era * 146097);
+  unsigned long long yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  unsigned long long doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  unsigned long long mp = (5 * doy + 2) / 153;
+  int d = (int)(doy - (153 * mp + 2) / 5 + 1);
+  int m = (int)(mp < 10 ? mp + 3 : mp - 9);
+  long long y = (long long)yoe + era * 400 + (m <= 2);
+  bool leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+  int week_day = (int)(((web_days_from_civil(y, 1, 1) + 4) % 7 + 7) % 7);
+  int recent_year = (leap ? 1956 : 1967) + (week_day * 12) % 28;
+  int year = 2008 + (recent_year + 3 * 28 - 2008) % 28;
+  return (double)(web_days_from_civil(year, m, 1) + d - 1) * 86400000.0 + within;
+}
+
+static int web_zone_cmp(const void *key, const void *elem) {
+  return strcmp((const char *)key, ((const ScrZoneName *)elem)->id);
+}
+
+/* The zone ICU would pick, or NULL. */
+static const char *web_zone_id(char *buf, size_t cap) {
+  const char *tz = getenv("TZ");
+  if (tz != NULL) {
+    if (*tz == ':') tz++;
+    if (strncmp(tz, "posix/", 6) == 0 || strncmp(tz, "right/", 6) == 0) tz += 6;
+    return tz;
+  }
+#if defined(_WIN32)
+  (void)buf;
+  (void)cap;
+  return NULL;
+#else
+  ssize_t n = readlink("/etc/localtime", buf, cap - 1);
+  if (n <= 0) return NULL;
+  buf[n] = '\0';
+  const char *tail = strstr(buf, "zoneinfo/");
+  return tail != NULL ? tail + 9 : NULL;
+#endif
+}
+
 static JSValue web_host_tzname(JSContext *ctx, JSValueConst this_val, int argc,
                                JSValueConst *argv) {
   (void)this_val;
@@ -1712,22 +1779,35 @@ static JSValue web_host_tzname(JSContext *ctx, JSValueConst this_val, int argc,
   double ms = 0;
   if (JS_ToFloat64(ctx, &ms, argv[0])) return JS_EXCEPTION;
   if (!isfinite(ms)) return JS_NewString(ctx, "");
-  time_t t = (time_t)floor(ms / 1000.0);
+  scr_tz_offset_ms(0); /* the zone is read (tzset) before the flag is */
+  char link[4096];
+  const char *id = web_zone_id(link, sizeof link);
+  const ScrZoneName *row =
+      id == NULL ? NULL
+                 : bsearch(id, scr_zone_names, sizeof scr_zone_names / sizeof scr_zone_names[0],
+                           sizeof scr_zone_names[0], web_zone_cmp);
+  if (row != NULL) {
+    time_t t = (time_t)floor(web_equivalent_time(ms) / 1000.0);
+    int isdst = 0;
 #if defined(_WIN32)
-  /* MinGW's struct tm carries no tm_zone; tzname[] (after tzset) holds the
-   * CRT's zone names — full names on Windows ("Central Standard Time"). */
-  struct tm *lt = localtime(&t);
-  if (lt == NULL) return JS_NewString(ctx, "");
-  tzset();
-  const char *name = tzname[lt->tm_isdst > 0 ? 1 : 0];
+    struct tm tmv;
+    if (_localtime64_s(&tmv, &t) == 0) isdst = tmv.tm_isdst > 0;
 #else
-  struct tm tmv;
-  if (localtime_r(&t, &tmv) == NULL) return JS_NewString(ctx, "");
-  const char *name = tmv.tm_zone;
+    struct tm tmv;
+    if (localtime_r(&t, &tmv) != NULL) isdst = tmv.tm_isdst > 0;
 #endif
-  if (name == NULL) name = "";
-  if (strcmp(name, "UTC") == 0) name = "Coordinated Universal Time";
-  return JS_NewString(ctx, name);
+    return JS_NewString(ctx, scr_zone_name_strs[isdst ? row->dst_name : row->std_name]);
+  }
+  /* ICU's unknown zone: a fixed zone at the C library's offset. */
+  long east = (long)(scr_tz_offset_ms(ms) / 1000.0);
+  char buf[32];
+  long a = east < 0 ? -east : east;
+  if (a % 60 != 0) {
+    snprintf(buf, sizeof buf, "GMT%c%02ld:%02ld:%02ld", east < 0 ? '-' : '+', a / 3600, a / 60 % 60, a % 60);
+  } else {
+    snprintf(buf, sizeof buf, "GMT%c%02ld:%02ld", east < 0 ? '-' : '+', a / 3600, a / 60 % 60);
+  }
+  return JS_NewString(ctx, buf);
 }
 
 static JSValue web_host_write(JSContext *ctx, JSValueConst this_val, int argc,

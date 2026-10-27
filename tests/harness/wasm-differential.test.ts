@@ -79,6 +79,7 @@ import { makeHostFacts, type HostFactSnapshot } from "./host-facts.js";
 // #227: the `fetch` import's host half over Node's own fetch, shared with
 // packages/compiler/test/wasm-host.ts.
 import { makeFetchHost } from "../../packages/compiler/test/wasm-fetch-host.js";
+import { makeTzHost } from "../../packages/compiler/test/wasm-tz-host.js";
 // eslint-disable-next-line import/no-relative-packages
 import { startFetchServers } from "../fixtures/fetch/servers.mjs";
 
@@ -3639,6 +3640,10 @@ const TIER_FLOOR: string[] = [
   // catchable ReferenceError (module-tdz.ts); a new program, passing here
   // from its first run: 1089 -> 1090.
   "2765-module-tdz/main.ts",
+  // The local time zone: offset-less date-times are local time through the
+  // host's tzCall, and process.env.TZ writes reach it (SEMANTICS.md S113):
+  // 1090 -> 1091.
+  "2771-date-local-zones.ts",
 ];
 
 interface RunResult {
@@ -5393,6 +5398,12 @@ async function runWasm(modulePath: string, opts?: { stdin?: Buffer }): Promise<R
     }
     throw new Error(`stdinCall: unknown op ${op}`);
   };
+  // S113 (abi.ts tzCall): the zone host — this process's own Date, under
+  // the TZ the Node oracle child inherits too.
+  const tzHost = makeTzHost(() => {
+    if (memory === null) throw new Error("tzCall before instantiation completed");
+    return memory;
+  });
   // #227 (abi.ts fetch, evPoll source 6): the fetch host — Node's own
   // fetch. A request in flight holds the clock in real time, as a socket
   // does.
@@ -6348,6 +6359,8 @@ async function runWasm(modulePath: string, opts?: { stdin?: Buffer }): Promise<R
       fetch(op: number, ptr: number, len: number, h: number, x: number): number {
         return fetchHost.fetchCall(op, ptr, len, h, x);
       },
+      // S113 (abi.ts tzCall): the host's local time zone.
+      tzCall: tzHost.tzCall,
       // INC-28 U2 (abi.ts evPoll): the oldest queued event, or 0; a short
       // buffer answers -(the length needed) and keeps the event. Reading an
       // EXIT ends that child's life for the clock.
@@ -6489,6 +6502,8 @@ async function runWasm(modulePath: string, opts?: { stdin?: Buffer }): Promise<R
     watches.clear();
     // #227: every request still in flight is aborted.
     fetchHost.finish();
+    // S113: a program's ZONE never outlives its run.
+    tzHost.finish();
     for (const rec of evChildren.values()) {
       rec.proc.removeAllListeners("close");
       rec.proc.removeAllListeners("exit");

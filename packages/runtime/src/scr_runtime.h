@@ -4537,6 +4537,12 @@ ScrStr *scr_date_to_iso(double ms);
 /* new Date(dateString).getTime(): the BOUNDED parse (the X509 validity
  * shape + ECMA's format with an explicit offset); NaN elsewhere. */
 double scr_date_parse_get_time(ScrStr *s);
+/* The local time zone (scr_lib.c; SEMANTICS.md S113): the C library's
+ * offset (ms, seconds kept) at a UTC instant, V8's ToUTC of a local time
+ * value, and the re-read after process.env.TZ changes. */
+double scr_tz_offset_ms(double t);
+double scr_tz_local_to_utc(double local);
+void scr_tz_changed(void);
 /* Date.UTC over already-number arguments (frontend completes the spec's
  * defaults): MakeDay/MakeTime/TimeClip exactly — 0–99 maps to 1900+year,
  * month/date rollover, NaN for non-finite parts, out-of-range results,

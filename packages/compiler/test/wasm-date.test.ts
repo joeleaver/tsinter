@@ -183,7 +183,6 @@ describe("date.parseGetTime — the S069 fence, asserted on its OWN text (no Nod
     "Jul 1 00:00:60 2026 GMT", // ASN1 ss>59 — reinterpreted as a year
     "2026-07-17T12:00:00.1Z", // lenient fraction-digit count
     "2026-07-17t12:00:00Z", // lowercase t
-    "2026-07-17T12:00:00", // offset-less date-time
     "Jan 1 2020", // legacy form
     "-000000-01-01", // "-000000", date-only sub-case (Node gives a real value here)
     "Feb 0 00:00:00 0001 GMT", // grammar 1's own year-1..31 day-violation guard
@@ -225,6 +224,87 @@ describe("date.parseGetTime — the S069 fence, asserted on its OWN text (no Nod
       expect(stdout).toBe("Error SC1090\n");
     });
   }
+});
+
+// ── date.parseGetTime — offset-less date-times are LOCAL time (S113) ───
+// Genuine differential under several zones: this process sets
+// process.env.TZ (Node re-reads its zone), computes each expectation with
+// its own `new Date(s).getTime()`, and runs the module through the shared
+// host, whose tzCall answers from this same process's Date — the module's
+// part is V8's ToUTC (the offset before a gap or an overlap) and range.
+describe("date.parseGetTime — offset-less date-times are local time under the host's zone (S113), genuine differential", () => {
+  const rows = [
+    "2020-03-08T02:30:00", "2020-03-08T03:30:00", "2020-11-01T01:30:00", "2020-11-01T01:59:59.999",
+    "2020-11-01T02:00:00", "2020-03-29T01:30:00", "2020-10-25T01:30:00", "2020-10-04T02:15:00",
+    "2020-04-05T01:45:00", "1880-01-01T00:00:00", "1800-06-15T12:34:56.789", "2020-06-01T24:00",
+    "2020-06-01T24:00:01", "2020-02-30T12:00", "+275760-09-12T23:00", "+275760-09-13T00:00",
+    "-271821-04-20T00:00", "-271821-04-19T23:59", "0099-12-31T23:59:59", "2020T12:00", "2020-06T12:00",
+    "2020-13-01T00:00", "0005-13-01T00:00",
+  ];
+  const fenced = new Set(["0005-13-01T00:00"]); // D-delta: still the S069 fence
+  for (const tz of ["America/Chicago", "Asia/Kolkata", "Australia/Lord_Howe", "Europe/London", "UTC", "Pacific/Chatham", "Invalid/Zone"]) {
+    test(`TZ=${tz} — SINGLE-EDIT: localToUtc's max of the two offsets turned into a min, or the clamp dropped`, async () => {
+      const path = await build(
+        "local-rows.ts",
+        rows
+          .map((s) =>
+            fenced.has(s)
+              ? `try { new Date(${JSON.stringify(s)}).getTime(); console.log("NOT FENCED"); } catch (e) { console.log("fenced"); }`
+              : `console.log(new Date(${JSON.stringify(s)}).getTime());`,
+          )
+          .join("\n"),
+      );
+      const had = Object.prototype.hasOwnProperty.call(process.env, "TZ");
+      const saved = process.env["TZ"];
+      process.env["TZ"] = tz;
+      try {
+        const want = rows.map((s) => (fenced.has(s) ? "fenced" : String(new Date(s).getTime()))).join("\n") + "\n";
+        const { stdout } = await runWasm(path);
+        expect(stdout).toBe(want);
+      } finally {
+        if (had) process.env["TZ"] = saved;
+        else delete process.env["TZ"];
+      }
+    });
+  }
+  test("tzCall answering a non-integer offset is the named trap, never a value", async () => {
+    const path = await build("local-badhost.ts", `console.log("before");\nconsole.log(new Date("2020-01-01T00:00").getTime());`);
+    const { stdout, stderr } = await runWasmToTrap(path, { imports: { tzCall: (): number => 0.5 } });
+    expect(stdout).toBe("before\n");
+    expect(stderr).toMatch(/tzCall: host failure/);
+  });
+  test("process.env.TZ writes and deletes reach the host as ZONE, before the next local-time question", async () => {
+    const path = await build(
+      "local-zone-op.ts",
+      `process.env.TZ = "Asia/Kolkata";
+       console.log(new Date("2020-01-01T00:00").getTime());
+       delete process.env.TZ;
+       process.env.OTHER = "x";
+       console.log(new Date("2020-01-01T00:00").getTime());`,
+    );
+    const calls: string[] = [];
+    let mem: WebAssembly.Memory | null = null;
+    const { stdout } = await runWasm(path, {
+      onInstance: (inst) => {
+        mem = inst.exports["memory"] as WebAssembly.Memory;
+      },
+      imports: {
+        tzCall: (op: number, ms: number, ptr: number, len: number): number => {
+          if (op === 2) {
+            calls.push(len < 0 ? "ZONE unset" : `ZONE ${String.fromCharCode(...new Uint16Array(mem!.buffer, ptr, len))}`);
+            return 0;
+          }
+          if (op === 0) {
+            if (calls.at(-1) !== "OFFSET") calls.push("OFFSET");
+            return calls.includes("ZONE unset") ? 0 : 19800000;
+          }
+          throw new Error(`op ${op}`);
+        },
+      },
+    });
+    expect(calls).toEqual(["ZONE Asia/Kolkata", "OFFSET", "ZONE unset", "OFFSET"]);
+    expect(stdout).toBe(`${Date.UTC(2020, 0, 1) - 19800000}\n${Date.UTC(2020, 0, 1)}\n`);
+  });
 });
 
 // ── date.parseGetTime — a string with no ASCII digit is NaN (S069) ─────
@@ -446,6 +526,10 @@ describe("the `wallClock`/`now` import-section pins (WebAssembly.Module.imports)
     const names = await importsOf(path);
     expect(names).toContain("tsinter.now");
     expect(names).not.toContain("tsinter.wallClock");
+  });
+  test("a date-string parse declares tzCall (S113); Date.UTC and toISOString alone do not", async () => {
+    expect(await importsOf(await build("imp-tz-parse.ts", `console.log(new Date("2020-01-01").getTime());`))).toContain("tsinter.tzCall");
+    expect(await importsOf(await build("imp-tz-utc.ts", `console.log(Date.UTC(2020, 0), new Date(0).toISOString());`))).not.toContain("tsinter.tzCall");
   });
   test("new Date(ms).toISOString() with an explicit ms declares NEITHER (D-alpha's own DELTA-3 discriminator: this is the row a date.-PREFIX prescan would over-mint on)", async () => {
     const path = await build("imp-iso.ts", `console.log(new Date(0).toISOString());`);

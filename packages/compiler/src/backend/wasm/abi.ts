@@ -1247,6 +1247,68 @@
  *     fetch's EFFECT TIER: that the host did what it reports is enforced by
  *     NOTHING — the harness's own rows are the check.
  *
+ *   (import "tsinter" "tzCall" (func (param i32 f64 i32 i32) (result f64)))
+ *     [local-time modules only — those reaching `date.parseGetTime`, whose
+ *     offset-less date-time form is local time; minted after fetch, so no
+ *     earlier import index moves. SEMANTICS.md S113.]
+ *     tzCall(op, ms, ptr, len) -> f64: the host's LOCAL TIME ZONE, asked
+ *     about one instant at a time — localtime_r's shape (a native host:
+ *     localtime_r's tm_gmtoff; a browser: its own Date and Intl). The zone
+ *     is the one the host's process is in, unless op 2 has named another.
+ *     Every Node rule — which instant to ask about, gaps and overlaps,
+ *     the ±8.64e15 range, the minute truncation of getTimezoneOffset — is
+ *     the module's; the host answers only these three questions:
+ *       op 0 OFFSET(ms)           -> the zone's offset from UTC at the UTC
+ *                                    instant `ms`, in MILLISECONDS, DST
+ *                                    included: local wall time = ms +
+ *                                    answer (Chicago in January: -21600000;
+ *                                    Chicago in 1880, local mean time:
+ *                                    -21036000 — seconds are kept, never
+ *                                    rounded to minutes). `ms` is an
+ *                                    integer in [-8.64e15, 8.64e15]; the
+ *                                    answer must be an integer. ptr and len
+ *                                    are 0. A browser answers
+ *                                    `localMs - ms` from its Date's local
+ *                                    getters (NOT getTimezoneOffset, which
+ *                                    is truncated to whole minutes; and
+ *                                    localMs by arithmetic, not Date.UTC,
+ *                                    which answers NaN for a local time
+ *                                    just past the range's edge); a C
+ *                                    host `tm_gmtoff * 1000`.
+ *       op 1 NAME(ms, ptr, cap)   -> writes the zone's display name in
+ *                                    effect at the instant `ms` — Node's
+ *                                    Date#toString suffix without its
+ *                                    parentheses ("Central Standard Time",
+ *                                    "Central Daylight Time") — as UTF-16
+ *                                    code units at ptr, and answers its
+ *                                    length in code units: hostStr's retry
+ *                                    contract (an answer > cap means
+ *                                    NOTHING was written; ask again with
+ *                                    room for it). The module asks only
+ *                                    about instants in [0, 2^31 s) — it
+ *                                    maps every other instant to V8's
+ *                                    equivalent one itself. A browser
+ *                                    answers the parenthesized suffix of
+ *                                    its own `String(new Date(ms))`.
+ *       op 2 ZONE(0, ptr, len)    -> 0. The program set its TZ variable to
+ *                                    the UTF-16 string at ptr (len code
+ *                                    units), or removed it (len -1): answer
+ *                                    every later OFFSET and NAME for the
+ *                                    zone that TZ value selects, as the
+ *                                    host's own TZ variable would (Node:
+ *                                    `process.env.TZ = s`; a C host:
+ *                                    setenv / unsetenv, then tzset; a
+ *                                    browser: Intl's timeZone option, or
+ *                                    its default zone after a removal).
+ *     A host that has no local zone to report answers OFFSET 0 and the name
+ *     its own Date prints for UTC; a host that will not answer at all DOES
+ *     NOT SUPPLY THE IMPORT (S004's precedent: a LinkError at
+ *     instantiation, naming tzCall). Any other op, or an answer that is not
+ *     an integer, is the module's named trap "tzCall: host failure".
+ *     tzCall's VALUE TIER: that the offset and name are the host zone's own
+ *     is enforced by NOTHING — the harness's rows (the TZ matrix, run
+ *     against Node under several zones) are the check.
+ *
  *   (export "_start" (func))            — the program; run it once.
  *   (export "_tick" (func (param f64) (result f64)))  [timer modules only]
  *   (export "_loop" (func (param f64) (result f64)))  [event modules only,
@@ -1378,6 +1440,11 @@ export const IMPORT_SIG_CALL = "sigCall";
 export const IMPORT_WATCH_CALL = "watchCall";
 export const IMPORT_STDIN_CALL = "stdinCall";
 export const IMPORT_FETCH = "fetch";
+export const IMPORT_TZ_CALL = "tzCall";
+/** tzCall's ops (the numbers ARE the ABI). */
+export const TZ_OP_OFFSET = 0;
+export const TZ_OP_NAME = 1;
+export const TZ_OP_ZONE = 2;
 export const EXPORT_ENTRY = "_start";
 export const EXPORT_TICK = "_tick";
 export const EXPORT_LOOP = "_loop";

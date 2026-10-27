@@ -85,11 +85,16 @@
  * REAL fetch host (wasm-fetch-host.ts, Node's own fetch) unless a test
  * overrides `fetch`: its evPoll serves that host's queue, its clock is
  * real time, and its `_loop` is driven asynchronously so Node's own event
- * loop runs the requests between turns. */
+ * loop runs the requests between turns.
+ *
+ * S113: `tzCall` is the REAL zone host (wasm-tz-host.ts) — Node's own Date
+ * in this process answers the module's local-time questions, so a test's
+ * local time is Node's under whatever TZ the test runs with. */
 import { randomBytes, randomFillSync } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { expect } from "vitest";
 import { makeFetchHost, writeFetchEvent, type FetchHostEvent } from "./wasm-fetch-host.js";
+import { makeTzHost } from "./wasm-tz-host.js";
 
 /** `tsinter.exit`'s sentinel (abi.ts §2.5) — thrown by the host, caught
  * inside `drive()` before it can propagate as an unhandled rejection. */
@@ -162,6 +167,10 @@ async function instantiate(modulePath: string, overrides?: HostOverrides) {
       })
     : null;
   const fetchNow = (): number => performance.now() - t0;
+  const tzHost = makeTzHost(() => {
+    if (memory === null) throw new Error("tzCall before instantiation completed");
+    return memory;
+  });
   const fetchImports = fetchHost
     ? {
         now: fetchNow,
@@ -392,6 +401,7 @@ async function instantiate(modulePath: string, overrides?: HostOverrides) {
       stdinCall(op: number): number {
         throw new Error(`stdinCall: op ${op} reached with no forced host (default stub is loud by design)`);
       },
+      tzCall: tzHost.tzCall,
       ...fetchImports,
       ...(overrides?.imports ?? {}),
     },
@@ -432,7 +442,7 @@ async function instantiate(modulePath: string, overrides?: HostOverrides) {
     }
   };
   const drive = (): void | Promise<void> => {
-    if (fetchHost !== null) return driveFetch();
+    if (fetchHost !== null) return driveFetch().finally(() => tzHost.finish());
     try {
       (instance.exports["_start"] as () => void)();
       const tick = instance.exports["_tick"] as ((now: number) => number) | undefined;
@@ -476,6 +486,8 @@ async function instantiate(modulePath: string, overrides?: HostOverrides) {
       // exit code instead of failing the test that called it.
       if (!(err instanceof WasmHostExitSignal)) throw err;
       exitCode = err.code;
+    } finally {
+      tzHost.finish();
     }
   };
   const out = (): HostRun => ({

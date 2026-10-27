@@ -15,6 +15,19 @@ const RUNTIME_SOURCES = ["scr_number.c", "scr_string.c", "scr_array.c", "scr_byt
  * a vendor bump can never reuse a stale engine build. */
 const QJS_COMMIT = "3c8f3d68953955950074c41c6e4d999562ae82a7";
 
+/** The vendored engine carries local patches (vendor/README.md), so the
+ * commit alone does not name what a native build compiles: the engine
+ * archive cache and the binary cache are keyed by the patched source's own
+ * digest too, so an edit to quickjs.c can never reuse a stale engine. */
+let qjsPatchMemo: string | null = null;
+async function qjsPatchDigest(): Promise<string> {
+  qjsPatchMemo ??= createHash("sha256")
+    .update(await readFile(join(vendorEngineDir(), "quickjs.c")))
+    .digest("hex")
+    .slice(0, 12);
+  return qjsPatchMemo;
+}
+
 /** The pinned mbedTLS snapshot under packages/runtime/vendor/mbedtls (see
  * vendor/README.md — update both together). Keys the archive cache so a
  * vendor bump can never reuse a stale TLS build, and joins the runtime
@@ -347,7 +360,7 @@ async function ensureEngineArchive(sanitize: boolean, driver: CcDriver): Promise
   const flavor = `${sanitize ? "asan" : "plain"}${driver.target !== null ? `-${driver.target}` : ""}`;
   const vendor = vendorEngineDir();
   const cacheRoot = join(vendor, "..", ".cache");
-  const cacheDir = join(cacheRoot, `${QJS_COMMIT.slice(0, 12)}-${flavor}`);
+  const cacheDir = join(cacheRoot, `${QJS_COMMIT.slice(0, 12)}-${await qjsPatchDigest()}-${flavor}`);
   const archive = join(cacheDir, "libqjs.a");
   if (await fileExists(archive)) return archive;
   if (driver.target !== null) return buildEngineArchiveCross(sanitize, driver, cacheRoot, cacheDir);
@@ -1036,7 +1049,7 @@ async function runtimeFingerprint(rtDir: string): Promise<string> {
   const stats = await Promise.all(names.map((n) => stat(join(rtDir, n))));
   const sig = stats.map((s, i) => `${names[i] ?? ""}:${s.size}:${s.mtimeMs}`).join("|");
   if (rtFingerprintMemo !== null && rtFingerprintMemo.sig === sig) return rtFingerprintMemo.hash;
-  const h = createHash("sha256").update(QJS_COMMIT).update(MBEDTLS_VERSION).update(ZLIB_VERSION);
+  const h = createHash("sha256").update(QJS_COMMIT).update(await qjsPatchDigest()).update(MBEDTLS_VERSION).update(ZLIB_VERSION);
   for (const n of names) h.update(n).update("\0").update(await readFile(join(rtDir, n))).update("\0");
   const hash = h.digest("hex");
   rtFingerprintMemo = { sig, hash };

@@ -148,6 +148,9 @@ const WINDOWS_SKIPS: Record<string, string> = {
   // os.userInfo: shell is null on Windows Node; the scriptc surface types
   // it string ("" here) — and username/homedir differ per box anyway.
   "1540-os-userinfo.ts": "userInfo().shell null on Windows Node (typed string here)",
+  // Local time on Windows is the CRT's zone (SEMANTICS.md S113): no IANA
+  // names in TZ and no history before 1970, where Node's ICU has both.
+  "2771-date-local-zones.ts": "IANA zones in process.env.TZ: the Windows CRT's TZ is not IANA-shaped (S113's Windows note)",
 };
 
 // The lane attempts the WHOLE corpus — `// @dynamic` programs included

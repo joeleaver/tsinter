@@ -298,6 +298,8 @@ void scr_env_set(const ScrStr *name, const ScrStr *value) {
 #else
   setenv(name->data, value->data, 1);
 #endif
+  /* Node re-reads its zone when TZ is assigned (SEMANTICS.md S113). */
+  if (strcmp(name->data, "TZ") == 0) scr_tz_changed();
 }
 
 /* `delete process.env.NAME` — unsetenv(3): later reads answer absent and
@@ -308,6 +310,7 @@ void scr_env_unset(const ScrStr *name) {
 #else
   unsetenv(name->data);
 #endif
+  if (strcmp(name->data, "TZ") == 0) scr_tz_changed();
 }
 
 /* The whole environment as one fresh string[] of alternating
@@ -3492,12 +3495,64 @@ ScrStr *scr_date_to_iso(double ms) {
  *      ("Jul  1 00:00:00 2026 GMT", "Jul 17 17:52:11 2026 GMT") — the
  *      portless cert-expiry read. Month names match case-insensitively;
  *      one or two spaces precede the day (%2d's padding).
- *   2. ECMA's own date-time string format with an EXPLICIT offset:
- *      YYYY[-MM[-DD]] date-only forms (UTC, per the spec) and full
- *      date-times YYYY-MM-DDTHH:mm[:ss[.sss]] ending in Z or ±HH:MM.
- *      Offset-less date-times are LOCAL time in JS; that arm answers NaN
- *      here rather than guessing a zone (the divergence note).
+ *   2. ECMA's own date-time string format: YYYY[-MM[-DD]] date-only
+ *      forms (UTC, per the spec) and full date-times
+ *      YYYY-MM-DDTHH:mm[:ss[.sss]] ending in Z or ±HH:MM — or in nothing:
+ *      an offset-less date-time is LOCAL time (scr_tz_local_to_utc,
+ *      SEMANTICS.md S113).
  */
+
+/* ── the local time zone (SEMANTICS.md S113) ─────────────────────────────
+ *
+ * The C library's zone (TZ, else the system zone), asked one instant at a
+ * time — what the WasmGC tier asks its host through tzCall OFFSET. Every
+ * Node rule lives in the callers: scr_tz_local_to_utc is V8's ToUTC, and
+ * the engine's Date (quickjs.c's tsinter zone hooks) and Date#toString's
+ * zone name (scr_web.c) read the offset from here. Seconds are kept: a
+ * local-mean-time offset (Chicago before 1883: -5:50:36) is exact, as in
+ * Node. localtime_r need not re-read TZ, so the first use and every
+ * process.env.TZ write or delete call tzset (Node re-reads its zone then
+ * too). */
+static bool scr_tz_ready = false;
+
+void scr_tz_changed(void) {
+  tzset();
+  scr_tz_ready = true;
+}
+
+double scr_tz_offset_ms(double t) {
+  if (!scr_tz_ready) scr_tz_changed();
+  /* Only instants a Date can hold are asked about (TimeClip's range). */
+  if (t < -8640000000000000.0) t = -8640000000000000.0;
+  if (t > 8640000000000000.0) t = 8640000000000000.0;
+  time_t s = (time_t)floor(t / 1000.0);
+  struct tm tm;
+#if defined(_WIN32)
+  /* The CRT's zone: no history before 1970 (localtime fails there) —
+   * SEMANTICS.md S113's Windows note. */
+  if (_localtime64_s(&tm, &s) != 0) return 0;
+  return (double)(_mkgmtime64(&tm) - s) * 1000.0;
+#else
+  if (localtime_r(&s, &tm) == NULL) return 0;
+  return (double)tm.tm_gmtoff * 1000.0;
+#endif
+}
+
+/* V8's DateCache::ToUTC for a local time value: NaN outside
+ * ±kMaxTimeBeforeUTCInMs (TimeClip's range plus ten days), else the local
+ * time minus the offset ICU answers with UCAL_TZ_LOCAL_FORMER for a skipped
+ * and a repeated local time alike — the offset in force BEFORE the
+ * transition. A local time L takes the later offset exactly when
+ * L - max(before, after) is at or past the transition, so with `before` and
+ * `after` sampled a day either side it is the offset at L - max(before,
+ * after). The caller TimeClips. Mirrored by the WasmGC tier's
+ * %w.date.localToUtc (date.ts). */
+double scr_tz_local_to_utc(double local) {
+  if (!(fabs(local) <= 8640000000000000.0 + 864000000.0)) return NAN;
+  double before = scr_tz_offset_ms(local - 86400000.0);
+  double after = scr_tz_offset_ms(local + 86400000.0);
+  return local - scr_tz_offset_ms(local - (before > after ? before : after));
+}
 
 /* Howard Hinnant's days_from_civil (the to_iso walk inverted). */
 static double scr_days_from_civil(long long y, int m, int d) {
@@ -3601,7 +3656,18 @@ double scr_date_parse_get_time(ScrStr *s) {
         if (!scr_date_digits(&p, end, 3, &ms)) return NAN;
       }
     }
-    if (p == end) return NAN; /* offset-less date-time: LOCAL in JS — the divergence */
+    if (p == end) {
+      /* Offset-less: LOCAL time — V8's ParseDateTimeString bounds the local
+       * value, converts it with ToUTC, then TimeClips (SEMANTICS.md S113).
+       * The field checks are scr_date_ms_of's, without its TimeClip. */
+      if (mo < 1 || mo > 12 || d < 1 || d > 31) return NAN;
+      if (hh > 24 || mi > 59 || ss > 59 || (hh == 24 && (mi || ss || ms))) return NAN;
+      double local = scr_days_from_civil(yy, mo, d) * 86400000.0 +
+                     hh * 3600000.0 + mi * 60000.0 + ss * 1000.0 + ms;
+      double t = scr_tz_local_to_utc(local);
+      if (!(fabs(t) <= 8640000000000000.0)) return NAN;
+      return t == 0 ? 0 : t;
+    }
     double off = 0;
     if (*p == 'Z') {
       p++;

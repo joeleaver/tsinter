@@ -48475,6 +48475,22 @@ static const JSCFunctionListEntry js_math_obj[] = {
 
 /* Date */
 
+/* tsinter patch (packages/runtime/vendor/README.md; SEMANTICS.md S113):
+ * in native builds the engine's local time is the tsinter runtime's zone
+ * (scr_lib.c) — the offset in MILLISECONDS (a local-mean-time offset keeps
+ * its seconds, where upstream rounds to whole minutes), V8's ToUTC for a
+ * local time (the offset in force before a gap or an overlap, ICU's
+ * UCAL_TZ_LOCAL_FORMER), and V8's truncated minutes for
+ * getTimezoneOffset and the GMT±hhmm field. The wasi build (the WasmGC
+ * tier's engine.wasm) keeps upstream's code until its host zone is wired
+ * (S103 (e)). */
+#if !defined(__wasi__)
+#define TSINTER_ZONE_HOOKS 1
+double scr_tz_offset_ms(double t);
+double scr_tz_local_to_utc(double local);
+#endif
+
+#ifndef TSINTER_ZONE_HOOKS
 /* OS dependent. d = argv[0] is in ms from 1970. Return the difference
    between UTC time and local time 'd' in minutes */
 static int getTimezoneOffset(int64_t time) {
@@ -48527,6 +48543,7 @@ static int getTimezoneOffset(int64_t time) {
 #endif /* NO_TM_GMTOFF */
 #endif
 }
+#endif /* TSINTER_ZONE_HOOKS */
 
 /* RegExp */
 
@@ -56616,8 +56633,14 @@ static __exception int get_date_fields(JSContext *ctx, JSValueConst obj,
     } else {
         d = dval;     /* assuming -8.64e15 <= dval <= -8.64e15 */
         if (is_local) {
+#ifdef TSINTER_ZONE_HOOKS
+            int64_t off = (int64_t)scr_tz_offset_ms((double)d);
+            d += off;
+            tz = off / 60000; /* V8: truncated toward zero */
+#else
             tz = -getTimezoneOffset(d);
             d += tz * 60000;
+#endif
         }
     }
 
@@ -56715,8 +56738,12 @@ static double set_date_fields(double fields[minimum_length(7)], int is_local) {
 
     /* adjust for local time and clip */
     if (is_local) {
+#ifdef TSINTER_ZONE_HOOKS
+        tv = scr_tz_local_to_utc(tv);
+#else
         int64_t ti = tv < INT64_MIN ? INT64_MIN : tv >= 0x1p63 ? INT64_MAX : (int64_t)tv;
         tv += getTimezoneOffset(ti) * 60000;
+#endif
     }
     d = time_clip(tv);
 out:
@@ -57509,7 +57536,11 @@ static JSValue js_date_getTimezoneOffset(JSContext *ctx, JSValueConst this_val,
         return JS_NAN;
     else
         /* assuming -8.64e15 <= v <= -8.64e15 */
+#ifdef TSINTER_ZONE_HOOKS
+        return js_int64(-(int64_t)scr_tz_offset_ms(trunc(v)) / 60000);
+#else
         return js_int64(getTimezoneOffset((int64_t)trunc(v)));
+#endif
 }
 
 static JSValue js_date_getTime(JSContext *ctx, JSValueConst this_val,

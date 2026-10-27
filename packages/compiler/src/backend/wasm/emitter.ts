@@ -152,6 +152,8 @@ import {
   IMPORT_SEED,
   IMPORT_UMASK,
   IMPORT_WALL_CLOCK,
+  IMPORT_TZ_CALL,
+  TZ_OP_ZONE,
   IMPORT_WRITE,
 } from "./abi.js";
 import { BUF, LEN, VecBuilder, type VecInfo } from "./arrays.js";
@@ -2487,6 +2489,9 @@ class Assembler {
   private readonly hevModule: boolean;
   /** #227: `tsinter.fetch`'s index, or null outside a fetch module. */
   private readonly fetchCallFunc: number | null;
+  /** `tsinter.tzCall`'s index (the host's local time zone, abi.ts), or null
+   * in a module that reads no local time (SEMANTICS.md S113). */
+  private readonly tzCallFunc: number | null;
   /** #227: the module reaches the global fetch() or the AbortSignal
    * statics (fetchModuleReachable) and no other event source: it boxes
    * fetch values (fetch.ts). */
@@ -2817,6 +2822,13 @@ class Assembler {
     // only, minted LAST so no earlier import index moves.
     this.fetchCallFunc = fetchCalled
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_FETCH, this.mb.funcType([I32, I32, I32, I32, I32], [I32]))
+      : null;
+    // `tzCall`'s decision (SEMANTICS.md S113, abi.ts): the host's local
+    // time zone, in modules that parse a date string (an offset-less
+    // date-time is local time), minted after fetch so no earlier import
+    // index moves.
+    this.tzCallFunc = libCallWhere(mod, (fn) => fn === "date.parseGetTime")
+      ? this.mb.importFunc(IMPORT_MODULE, IMPORT_TZ_CALL, this.mb.funcType([I32, F64, I32, I32], [F64]))
       : null;
     // ── end INC-26 host-import block ──
     // The exit-drain gate's STATIC fact (see exitListenerSurfaceReachable's
@@ -9659,6 +9671,18 @@ class Assembler {
     this.dateField ??= new DateBuilder(this.mb, {
       strRef: () => this.strRef,
       strType: () => this.strType,
+      tzCall: () => {
+        if (this.tzCallFunc === null) throw new Error("wasm emitter bug: local time without the tzCall import");
+        return this.tzCallFunc;
+      },
+      namedTrap: (c, message) => {
+        const exc = this.exc();
+        this.pushStrLitInto(c, message);
+        c.globalSet(exc.refG);
+        c.i32Const(EXC_STR);
+        c.globalSet(exc.kindG);
+        c.call(this.reportUncaughtHelper());
+      },
     });
     return this.dateField;
   }
@@ -9889,6 +9913,52 @@ class Assembler {
       throw new Error("emitter bug: process.kill/killNum was reached but tsinter.kill was never imported");
     }
     return this.killFunc;
+  }
+
+  /** process.env.NAME = v / delete process.env.NAME in a module that reads
+   * local time (SEMANTICS.md S113): the write, then — when NAME is "TZ" —
+   * tzCall ZONE with the new value (len -1 for a delete), because Node
+   * re-reads its zone when TZ is assigned or deleted. */
+  private emitEnvWriteWithZone(code: Code, keyExpr: IrExpr, valueExpr: IrExpr | null): void {
+    const KEY = this.acquireScratch(this.strRef);
+    const VALUE = this.acquireScratch(this.strRef);
+    this.walkExpr(keyExpr);
+    code.localSet(KEY);
+    if (valueExpr !== null) {
+      this.walkExpr(valueExpr);
+      code.localSet(VALUE);
+      code.localGet(KEY);
+      code.localGet(VALUE);
+      code.call(this.proc.envSet());
+    } else {
+      code.localGet(KEY);
+      code.call(this.proc.envUnset());
+    }
+    code.localGet(KEY);
+    this.pushStrLitInto(code, "TZ");
+    code.call(this.strEqHelper());
+    code.ifVoid();
+    if (valueExpr !== null) {
+      const LEN = this.acquireScratch(I32);
+      code.localGet(VALUE);
+      code.call(this.stageStrUtf16Helper());
+      code.localSet(LEN);
+      code.i32Const(TZ_OP_ZONE);
+      code.f64Const(0);
+      code.globalGet(this.cursorGlobal); // the staged value (chdir's shape)
+      code.localGet(LEN);
+      this.releaseScratch(I32, LEN);
+    } else {
+      code.i32Const(TZ_OP_ZONE);
+      code.f64Const(0);
+      code.i32Const(0);
+      code.i32Const(-1);
+    }
+    code.call(this.tzCallFunc!);
+    code.drop();
+    code.end();
+    this.releaseScratch(this.strRef, VALUE);
+    this.releaseScratch(this.strRef, KEY);
   }
 
   /** `this.chdirFunc`, or a descriptive throw. */
@@ -22377,7 +22447,7 @@ class Assembler {
           this.emitSetCellErrorLit(
             "%Error",
             "Error",
-            'date.parseGetTime: this string is not one of the two modelled date formats (SEMANTICS.md S069) — the certificate-validity form ("Mon D HH:MM:SS YYYY GMT") or the strict ECMA date-time string format ("YYYY[-MM[-DD]][THH:mm[:ss[.sss]]](Z|±HH:MM)")',
+            'date.parseGetTime: this string is not one of the two modelled date formats (SEMANTICS.md S069) — the certificate-validity form ("Mon D HH:MM:SS YYYY GMT") or the strict ECMA date-time string format ("YYYY[-MM[-DD]][THH:mm[:ss[.sss]][Z|±HH:MM]]")',
             "SC1090",
           );
           this.emitUnwind();
@@ -22411,12 +22481,20 @@ class Assembler {
           return;
         }
         if (e.fn === "process.envSet") {
+          if (this.tzCallFunc !== null) {
+            this.emitEnvWriteWithZone(code, e.args[0]!, e.args[1]!);
+            return;
+          }
           this.walkExpr(e.args[0]!);
           this.walkExpr(e.args[1]!);
           code.call(this.proc.envSet());
           return;
         }
         if (e.fn === "process.envUnset") {
+          if (this.tzCallFunc !== null) {
+            this.emitEnvWriteWithZone(code, e.args[0]!, null);
+            return;
+          }
           this.walkExpr(e.args[0]!);
           code.call(this.proc.envUnset());
           return;
