@@ -5909,6 +5909,35 @@ export function moduleUsesCopying(mod: IrModule): boolean {
   return found;
 }
 
+/** The program reaches the dynamic island's engine at all (an island op,
+ * an `__island_eval`/import, an island-backed value): its main must run
+ * the event loop so engine jobs queued by an eval drain — and engine
+ * rejections report — at the exit checkpoint even when the static program
+ * itself has no async work (board #272; the wasm lane drains at every
+ * checkpoint). */
+export function moduleUsesIslandEngine(mod: IrModule): boolean {
+  if (mod.embedded && mod.embedded.modules.length > 0) return true;
+  let found = false;
+  const visit = (v: unknown): void => {
+    if (found || v === null || typeof v !== "object") return;
+    if (Array.isArray(v)) {
+      for (const item of v) visit(item);
+      return;
+    }
+    const node = v as { kind?: unknown; fn?: unknown };
+    if (
+      node.kind === "jsOp" || node.kind === "jsExit" || node.kind === "jsBridgePromise" ||
+      (typeof node.fn === "string" && node.fn.startsWith("island."))
+    ) {
+      found = true;
+      return;
+    }
+    for (const key of Object.keys(v)) visit((v as Record<string, unknown>)[key]);
+  };
+  visit(mod.functions);
+  return found;
+}
+
 /** True when the embedded npm graph references fetch — the link switch
  * that pulls scr_fetch.c + its socket/tls/zlib dependencies into the binary (cc.ts) and
  * has the emitted main call scr_fetch_install. A word-boundary scan over

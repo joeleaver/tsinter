@@ -36,8 +36,8 @@
  * number[] divergence), DISC (inputs on which a system libm or the original
  * fdlibm answers differently from Node -- the negative controls), DYNAMIC
  * (every member in a --dynamic build, which lowers them the same static way).
- * Per lane class: ENGINE (c, llvm: the embedded engine's OWN Math, which
- * scr_island.c points at the same functions), LINK (c: the ieee754 object is
+ * Per lane class: ENGINE (c, llvm, wasm: the embedded engine's OWN Math,
+ * which scr_island_math.h points at the same functions), LINK (c: the ieee754 object is
  * linked exactly when a transcendental is called), LAZY (wasm: a module
  * carries only the C functions its Math members reach), CSUB (csubset.ts
  * refuses, by name, the C it does not model, rather than compile it wrongly). */
@@ -567,8 +567,10 @@ describe.for(LANES)("DYNAMIC [%s]", (lane) => {
  * a value, __island_eval) calls the ENGINE's Math members. scr_island.c points
  * them at the same functions the compiled program calls, so they answer
  * Node's bits too. Node runs the same JavaScript text through eval. The wasm
- * tier has no engine yet (__island_eval is a phase-2 refusal there). */
-describe.for(["c", "llvm"] as const)("ENGINE [%s]", (lane) => {
+ * lane's engine (phase 2) runs the SAME override (scr_island_math.h) over the
+ * same ieee754.cc compiled into engine.wasm, its pow bound to the module's
+ * own %w.jsPow. */
+describe.for(["c", "llvm", "wasm"] as const)("ENGINE [%s]", (lane) => {
   test("ENGINE: Math evaluated by the embedded engine answers Node's bits", async () => {
     const next = xorshift(0x2468ace013579bdfn);
     const xs: number[] = [...EDGES, ...nanInputs()];
@@ -593,15 +595,25 @@ describe.for(["c", "llvm"] as const)("ENGINE [%s]", (lane) => {
     const id = `e${serial++}`;
     const entry = join(scratch, `${id}.ts`);
     await writeFile(entry, src);
-    const res = await compile(entry, { outPath: join(scratch, id), outDir: scratch, backend: lane, dynamic: true });
+    const res = await compile(entry, { outPath: join(scratch, lane === "wasm" ? `${id}.wasm` : id), outDir: scratch, backend: lane, dynamic: true });
     if (!res.ok) throw new Error(`${id} refused: ${res.diagnostics.map((d) => `${d.code}: ${d.message}`).join(" | ")}`);
-    const run = await execFileAsync(res.binaryPath, [], { encoding: "utf8", maxBuffer: 64 << 20 });
+    const run =
+      lane === "wasm"
+        ? { stdout: String((await runWasm(res.binaryPath)).stdout) }
+        : await execFileAsync(res.binaryPath, [], { encoding: "utf8", maxBuffer: 64 << 20 });
     const nodeEntry = join(scratch, `${id}-node.mjs`);
     await writeFile(nodeEntry, nodeSrc);
     const node = await execFileAsync(process.execPath, [nodeEntry], { encoding: "utf8", maxBuffer: 64 << 20 });
     const got = run.stdout.trim().split(" ");
     const want = node.stdout.trim().split(" ");
-    const bad = got.map((g, i) => (g === want[i] ? null : `#${i} engine=${g} node=${want[i]}`)).filter((x) => x !== null);
+    // The wasm engine is a 32-bit build, so quickjs NaN-boxes its values:
+    // every NaN a value holds is the canonical 7ff8000000000000 (SEMANTICS.md
+    // S103 (f)) — a NaN Node answers must be that one there; every other
+    // answer is bit-exact.
+    const isNaNHex = (h: string | undefined): boolean => h !== undefined && /^[7f]ff/.test(h) && !/^[7f]ff0000000000000$/.test(h);
+    const same = (g: string, w: string | undefined): boolean =>
+      g === w || (lane === "wasm" && isNaNHex(w) && g === "7ff8000000000000");
+    const bad = got.map((g, i) => (same(g, want[i]) ? null : `#${i} engine=${g} node=${want[i]}`)).filter((x) => x !== null);
     expect(bad.slice(0, 5), "engine-evaluated Math answers that differ from Node").toEqual([]);
     expect(got.length).toBe(want.length);
   });

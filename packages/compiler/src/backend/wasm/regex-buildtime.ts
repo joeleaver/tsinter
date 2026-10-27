@@ -19,7 +19,7 @@
  * compiler's own errMessage text), or a fence key (SEMANTICS.md S102).
  * Results are memoized per (pattern, flags). */
 import { RX, RX_FENCE_KEY } from "./regex-compiler-tables.js";
-import { regexEngineModule } from "./regex-engine-module.js";
+import { regexEngineModule, resetRegexEngineModuleForTests } from "./regex-engine-module.js";
 
 export type RegexCompileOutcome =
   | { kind: "ok"; source: string; flags: string; bytes: Uint8Array; captureCount: number; groupNames: string[] | null }
@@ -115,4 +115,13 @@ export function compileRegex(pattern: string, flags: string): RegexCompileOutcom
     memo.set(key, hit);
   }
   return hit;
+}
+
+/** Tests only: forget the built compiler module, so the next compile builds
+ * it again (inside whatever module walk is current). */
+export function resetRegexBuildtimeForTests(): void {
+  instance = null;
+  buildError = null;
+  memo.clear();
+  resetRegexEngineModuleForTests();
 }

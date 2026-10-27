@@ -6894,7 +6894,7 @@ On the wasm lane the global `fetch(input, init?)`, `AbortSignal.timeout(delay)` 
 
 Node v24.18.1 (V8 13.6.233.17-node.50) computes `Math.sin cos tan asin acos atan atan2 exp expm1 log log1p log2 log10 cbrt sinh cosh tanh asinh acosh atanh` with V8's own `src/base/ieee754.cc`: fdlibm 5.3 with V8's changes (`exp(1)` answers `Math.E`; `atan2` with `x == 1` answers `atan(y)`) and FreeBSD msun's `cosh`, `tanh`, `cbrt` and `log2`. Its `sin` and `cos` would be glibc-derived only under `V8_USE_LIBM_TRIG_FUNCTIONS`, which Node's build does not set (as Chrome's does). Measured on 101,024 inputs per function: Node equals that file compiled natively, and differs from glibc 2.43 (e.g. `Math.log(3)`, `Math.cbrt(2)`), from musl, and from the original fdlibm (Java's StrictMath: e.g. `Math.exp(1)`, `Math.cosh(1)`, `Math.cbrt(0.9991103149666114)`).
 
-**What every lane does.** Every member of Node 24's Math object is STATIC on every lane: one libCall per call (`surfaces.ts` STATIC_MATH_FNS; `hypot`, `min` and `max` at any plain arity), no engine and no `--dynamic`, and the eight constants fold to their numbers. The twenty functions above are ieee754.cc ITSELF, kept ONCE: `packages/runtime/vendor/v8-ieee754/src/base/ieee754.cc`, upstream sha256 `1bf99980…a0c2`, unmodified. The native lanes compile it as C++ (`packages/runtime/src/scr_ieee754.cc`, which `#include`s it and exports `scr_ieee754_<fn>`; `cc.ts` ensureIeee754Object: C++17, `-ffp-contract=off`, no exceptions/RTTI, `-nostdinc++` against small header shims, so no C++ library is needed or linked; linked when the IR calls one of them, and in every `--dynamic` build). The WasmGC tier compiles the text `scripts/gen-wasm-ieee754-src.mjs` renders from that file (`backend/wasm/ieee754-src.ts`: the file minus its unused legacy `pow`; a drift test holds the two byte for byte) with a compiler for the C subset it is written in (`csubset.ts`: C's integer types, conversions and signedness exactly; IEEE-754 binary64, round to nearest, no contraction), a function per module on first use, with what it calls (`scalbn` is musl's, exact). One native wrapper detail: `atan2` with BOTH arguments NaN answers the first NaN operand of ieee754.cc's `x + y` in Node's operand order (the C++ compiler is free to swap a commutative addition; Node's build does not). The members V8 computes in its builtins are ported from V8's source per runtime and held to the same rows: `hypot` is `math.tq` MathHypot (an infinite argument answers Infinity before a NaN one; the 3-argument compensation term; the Kahan-summed path past three arguments); `pow` is `**` (S079, V8's `math::pow`); `sqrt`, `fround`, `clz32` and `imul` are the instructions (over ToUint32/ToInt32); `sign` is V8's (±0 and NaN answer themselves); `f16round` rounds the double once, ties to even, to binary16 and back, and answers a NaN as the quiet NaN with the argument's sign; `min`/`max` answer the machine's invalid-operation NaN for any NaN operand (`fff8000000000000` on x86-64, whatever the operands' payloads, measured; one argument is compared with the fold's seed, as V8 does); `round` answers a NaN quieted. The runtime's C and the emitted C program are compiled with `-ffp-contract=off` too, so no helper's arithmetic (hypot's Kahan step, say) is contracted into a fused multiply-add on a target whose compiler would. An `any` argument is converted with ECMA-262 ToNumber (S104). Under `--dynamic` on the native lanes, the embedded engine's own Math members — what the engine itself evaluates: packages, a Math object reached as a value, `__island_eval` — are replaced at context creation (`scr_island.c` isl_install_math, the vendored engine unmodified) by functions over the same code — the twenty transcendentals, `pow`, `hypot`, `sign`, `f16round`, `round`, `min` and `max` — so they answer the same bits (S104 (c) is what this cannot reach).
+**What every lane does.** Every member of Node 24's Math object is STATIC on every lane: one libCall per call (`surfaces.ts` STATIC_MATH_FNS; `hypot`, `min` and `max` at any plain arity), no engine and no `--dynamic`, and the eight constants fold to their numbers. The twenty functions above are ieee754.cc ITSELF, kept ONCE: `packages/runtime/vendor/v8-ieee754/src/base/ieee754.cc`, upstream sha256 `1bf99980…a0c2`, unmodified. The native lanes compile it as C++ (`packages/runtime/src/scr_ieee754.cc`, which `#include`s it and exports `scr_ieee754_<fn>`; `cc.ts` ensureIeee754Object: C++17, `-ffp-contract=off`, no exceptions/RTTI, `-nostdinc++` against small header shims, so no C++ library is needed or linked; linked when the IR calls one of them, and in every `--dynamic` build). The WasmGC tier compiles the text `scripts/gen-wasm-ieee754-src.mjs` renders from that file (`backend/wasm/ieee754-src.ts`: the file minus its unused legacy `pow`; a drift test holds the two byte for byte) with a compiler for the C subset it is written in (`csubset.ts`: C's integer types, conversions and signedness exactly; IEEE-754 binary64, round to nearest, no contraction), a function per module on first use, with what it calls (`scalbn` is musl's, exact). One native wrapper detail: `atan2` with BOTH arguments NaN answers the first NaN operand of ieee754.cc's `x + y` in Node's operand order (the C++ compiler is free to swap a commutative addition; Node's build does not). The members V8 computes in its builtins are ported from V8's source per runtime and held to the same rows: `hypot` is `math.tq` MathHypot (an infinite argument answers Infinity before a NaN one; the 3-argument compensation term; the Kahan-summed path past three arguments); `pow` is `**` (S079, V8's `math::pow`); `sqrt`, `fround`, `clz32` and `imul` are the instructions (over ToUint32/ToInt32); `sign` is V8's (±0 and NaN answer themselves); `f16round` rounds the double once, ties to even, to binary16 and back, and answers a NaN as the quiet NaN with the argument's sign; `min`/`max` answer the machine's invalid-operation NaN for any NaN operand (`fff8000000000000` on x86-64, whatever the operands' payloads, measured; one argument is compared with the fold's seed, as V8 does); `round` answers a NaN quieted. The runtime's C and the emitted C program are compiled with `-ffp-contract=off` too, so no helper's arithmetic (hypot's Kahan step, say) is contracted into a fused multiply-add on a target whose compiler would. An `any` argument is converted with ECMA-262 ToNumber (S104). Under `--dynamic` on the native lanes, the embedded engine's own Math members — what the engine itself evaluates: packages, a Math object reached as a value, `__island_eval` — are replaced at context creation (isl_install_math in `scr_island_math.h`, the vendored engine unmodified; the wasm lane's engine runs the same file, S103 (f)) by functions over the same code — the twenty transcendentals, `pow`, `hypot`, `sign`, `f16round`, `round`, `min` and `max` — so they answer the same bits (S104 (c) is what this cannot reach).
 
 NaNs: each function returns the bits Node returns, payload and sign included — ieee754.cc's `signaling_NaN()` is `7ff4000000000000` (`Math.log(-1)`, `log2`, `log1p`, `acos`, `asin`, `acosh`, `atanh` outside their domain), its `quiet_NaN()` `7ff8000000000000` (`log10`), and an arithmetic NaN is the hardware's (`Math.sin(Infinity)`, `Math.sqrt(-1)`: `fff8000000000000` on x86-64; S036's "does not fold" row).
 
@@ -7069,7 +7069,7 @@ witness per fence key, and the syntax errors a fence must not hide),
 corpus 2448 and 2748 on the wasm census. Measured against Node
 v24.18.1.
 
-## S103 — `__island_eval` on the wasm lane runs in the embedded engine: its recursion depth is about a tenth of Node's and some deep engine recursion overflows the host stack uncatchably, Node globals and locale methods it lacks are fenced by name, its jobs run at the checkpoint instead of in Node's microtask queue, its error messages and some limits are QuickJS's, its local time is UTC, its transcendental Math is musl's, an error crossing out keeps name, message and a string code only, and a rejection with an 'unhandledRejection' listener is fenced *(wasm lane; (c) and (d) are shared with the native lanes)*
+## S103 — `__island_eval` on the wasm lane runs in the embedded engine: its recursion depth is about a tenth of Node's and some deep engine recursion overflows the host stack uncatchably, Node globals and locale methods it lacks are fenced by name, its jobs run at the checkpoint instead of in Node's microtask queue, its error messages and some limits are QuickJS's, its local time is UTC, its NaNs are canonical and its `**` operator is musl's pow, an error crossing out keeps name, message and a string code only, and a rejection with an 'unhandledRejection' listener is fenced *(wasm lane; (c) and (d) are shared with the native lanes)*
 
 A module that reaches `__island_eval` carries the quickjs-ng engine the native
 lanes embed, at the same pin, compiled to wasm32 with wasi-libc
@@ -7121,11 +7121,22 @@ except:
   script) that the engine lacks is an accessor that throws a catchable
   `Error` whose message is `<name> inside __island_eval is not supported yet
   on the wasm lane (SEMANTICS.md S103)` — `typeof` included — where Node
-  answers its object: 67 names, recorded in
-  `vendor/quickjs-ng-wasm/engine-fence.json` (among them `console`,
-  `setTimeout`, `TextEncoder`, `URL`, `Intl`, `Atomics`, `WebSocket`,
-  `process`, `Buffer`, `crypto`, `fetch`, `structuredClone`, the stream,
-  event and performance classes). Assigning one replaces the fence with an
+  answers its object: 43 names, recorded in
+  `vendor/quickjs-ng-wasm/engine-fence.json` (among them `setTimeout`,
+  `setInterval`, `clearTimeout`, `clearInterval`, `URL`, `Intl`, `Atomics`,
+  `WebSocket`, `WritableStream`, `FormData`, `process`, `Buffer`, `fetch`,
+  and the performance classes). The engine boots the native island's own
+  web-platform globals first (S108: `console`, `TextEncoder`,
+  `TextDecoder`, `URLSearchParams`, `btoa`/`atob`, the streams, `crypto`
+  `Crypto` and `SubtleCrypto`, `structuredClone`, the event, abort, fetch-value and message
+  classes; 67 fenced names before phase 2 E2), so only what neither has is fenced. The
+  four timer functions are the exception: the shared text defines them, but
+  this lane has no bridge from the engine onto the module's timers yet, so
+  they are removed again and fenced like the rest, and
+  `AbortSignal.timeout` — the other timer user — throws the same named
+  error (`AbortSignal.timeout inside __island_eval ...`). Its `crypto`
+  draws from the module's `random` import (abi.ts), which every
+  engine-carrying module now imports. Assigning one replaces the fence with an
   ordinary global. Without `Intl` the engine's locale-sensitive methods
   answer differently from Node (`(1234567.891).toLocaleString()` is
   `1234567.891`, Node prints `1,234,567.891`), so `Number`, `BigInt` and
@@ -7147,7 +7158,10 @@ except:
   `await null`, an eval that queues `globalThis.w = 7` and, after a second
   `await null`, an eval reading `w`, prints `undefined` where Node prints `7`.
   A job the engine cannot complete prints `Uncaught <String(error)>` and exits
-  1, as native does.
+  1, as native does. The native lanes run their event loop in every program
+  that reaches the engine, so jobs an eval queues — and the engine's
+  unhandled rejections — are drained and reported at the exit checkpoint
+  even when the static program has no async work of its own (board #272).
 - **(d) Engine error messages and limits are QuickJS's.** The name is right;
   the text can differ from V8's: `null.x` is `cannot read property 'x' of
   null` (Node: `Cannot read properties of null (reading 'x')`), `undefined()`
@@ -7163,11 +7177,27 @@ except:
   host's zone, through the engine's zone hooks (S113). The import this engine
   will ask exists — `tsinter.tzCall` (S113), already serving the static tier's
   local date strings — and the engine's localtime is wired to it next.
-- **(f) Transcendental Math inside the engine is wasi-libc's (musl's).**
-  Measured over 2,000 inputs in (-10, 10) (|x| for log/log1p), the count that
-  differ from Node in the last bit: sin 19, cos 25, exp 206, log 142, log1p 1;
-  tan, atan, cbrt, sinh and expm1 0. (The tier's own Math is S100's; the
-  native lanes' engine uses glibc — S100 (d).)
+  `toString` and `toTimeString` carry the suffix ` (Coordinated Universal Time)`,
+  Node's under `TZ=UTC` (S108's Date patch).
+- **(f) Math inside the engine is Node's, but a NaN loses its bits and the
+  `**` operator is musl's.** The engine's Math members are replaced at
+  context creation exactly as on the native lanes — the same code,
+  `packages/runtime/src/scr_island_math.h` over `scr_jsmath.h`'s ports and
+  the vendored V8 `ieee754.cc` (`scr_ieee754.cc`), all compiled into
+  `engine.wasm`; `Math.pow`'s general case is the module's own `**`
+  (`%w.jsPow`, S079), since wasi-libc's `pow` is musl's — so every Math
+  member answers Node's bits (`math-ieee754.test.ts` ENGINE [wasm]). Two
+  things stay apart. The engine is a 32-bit build, so it NaN-boxes its
+  values: every NaN a value holds is `7ff8000000000000` — `Math.min(NaN,
+  1)` read back through a `Float64Array` is `7ff8000000000000` where Node
+  and the native lanes' 64-bit engine answer `fff8000000000000` (measured);
+  only a NaN's bits differ, never whether a value is NaN. And the `**` OPERATOR (QuickJS's own,
+  which no Math override reaches) is musl's `pow` without V8's `y = 2` /
+  `y = 0.5` pre-cases: over 2,000 pseudo-random `a` in [0, 20), the last
+  bit differs from Node for `a ** b` (b in [-3, 3)) 2 times, `a ** 2` 19
+  and `a ** 0.5` 2 (the native lanes' engine, over glibc: 0, 41 and 1 —
+  S104 (c)); `Math.pow` 0 on both. (Before the shared override, measured
+  over 2,000 inputs: sin 19, cos 25, exp 206, log 142 and log1p 1 differed.)
 - **(g) An unhandled engine rejection** prints the native lanes' line,
   `Unhandled promise rejection: <String(reason)>`, and exits 1 (S010's shape)
   at the checkpoint after the engine's jobs ran (a handler attached by then
@@ -7188,9 +7218,10 @@ except:
 
 The engine's heap is never torn down; its counting allocator returns to the
 same live count after any number of evals, throws and job drains (the unit
-test reads it). A module that reaches `__island_eval` is about 666 KB larger
-than one that does not (665,633 bytes: a one-eval hello world, 666,510
-bytes, against the same program written without the eval, 877).
+test reads it). A module that reaches `__island_eval` is about 842 KB larger
+than one that does not (841,906 bytes: a one-eval hello world, 842,783
+bytes, against the same program written without the eval, 877; phase 2 E2
+added 176,273 of them — S108's shared web globals and (f)'s Math).
 
 **Tested by:** `packages/compiler/test/wasm-island-engine.test.ts` — (a)
 the catchable overflow with 2,000 static frames below it and a host
@@ -7199,9 +7230,11 @@ and the build-time refusal, (c) job timing against timers, (d) and (e) the
 texts and the zone, (g) the rejection line and the listener fence, (h) the
 carried code and the lost properties, the shared Math.random sequence, plus
 the leak oracle, the artifact's format check, its SC3002 diagnostic and the
-zero-cost rule — and corpus 1100, 1101, 1102 and 1206 on the wasm census.
-(f), the depth figures and the host-stack shapes in (a), and the limits in
-(d) were measured by hand, outside the suite. Measured against Node v24.18.1.
+zero-cost rule, the timer fences and the UTC Date suffix (E2);
+`math-ieee754.test.ts` ENGINE [wasm] — (f)'s Math members against Node — and corpus
+1100, 1101, 1102, 1120 and 1206 on the wasm census.
+(f)'s `**` and NaN figures, the depth figures and the host-stack shapes in
+(a), and the limits in (d) were measured by hand, outside the suite. Measured against Node v24.18.1.
 
 ## S104 — Math converts its arguments with ToNumber as Node does, after evaluating all of them; floor, ceil and trunc of a signaling NaN answer optimized Node's quieted bits; code the native lanes' embedded engine evaluates keeps QuickJS's `**` operator and its ToNumber error text *(llvm, c and wasm; (c) and (d) the native lanes under `--dynamic`)*
 
@@ -7378,3 +7411,232 @@ the ZONE op's order, a 200,000-unit TZ value); corpus 2771 (the program sets its
 hand: the max of the two offsets turned into a min (static rows red, wasm included), the engine hook
 rounded to minutes and the name table's daylight column ignored (engine rows red), the `posix/` strip
 dropped (the `posix/` and `right/` rows red).
+
+## S108 — The island's web-platform globals are one shared set of ports of Node's own classes on every lane; what parts from Node: `console` cannot inspect an object in a plain `--dynamic` build and fences the inspection and wall-clock methods, `TextDecoder` decodes UTF-8 only, the streams are a subset whose promise jobs interleave differently, MessagePort delivery and WebCrypto are fenced, Node globals outside the set are absent on the native lanes, the wasm engine's zone is UTC, a throwing event listener is reported later, and the engine's own builtins differ where listed *(every lane: the c and llvm lanes' island and the wasm lane's engine)*
+
+The globals island code sees beyond the engine's own builtins — `console`,
+`TextEncoder`, `TextDecoder`, `TextDecoderStream`, `URLSearchParams`,
+`btoa`/`atob`, `ReadableStream`, `TransformStream`, `Headers`, `Blob`,
+`File`, `Event`, `EventTarget`, `CustomEvent`, `DOMException`,
+`AbortController`/`AbortSignal`, `structuredClone`, `MessageChannel`/
+`MessagePort`/`MessageEvent`, `Request`/`Response`, `Crypto`/`crypto`,
+`SubtleCrypto` and the timer functions — come from ONE JavaScript text,
+`packages/runtime/src/scr_web_prelude.js` (rendered into the C literal
+`scr_web_prelude.h` by `scripts/gen-web-prelude.mjs`; a unit test holds the
+two together and another fails when `engine.wasm`'s copy is stale),
+evaluated at engine boot by the native island (`scr_web.c`) and by the wasm
+lane's engine (`isl_core.c`). Each lane implements only the host functions
+the text calls (an fd write, entropy, the zone name, timers, and three
+internal-slot checks — is a promise, is a proxy, a proxy's target), so both
+lanes answer every row the same way. The classes are ports of Node
+v24.18.1's own code — `lib/internal/encoding.js`, `url.js` with
+`querystring.js`, `per_context/domexception.js`, `event_target.js`,
+`abort_controller.js`, `errors.js` and `validators.js` for the error
+shapes, `util/inspect.js`'s `formatWithOptions`, `buffer.js` with simdutf's
+base64 order of checks, undici's `Headers`, V8's `ValueSerializer` for
+`structuredClone` — with every bit of internal state private (WeakMaps and
+private fields; nothing a program can read, enumerate or clobber), so their
+answers, argument checks, error classes, codes and messages,
+`Symbol.toStringTag`s, iterator objects, constructor lengths, the
+prototypes' members and their enumerability, and the globals' property
+shapes are Node's, except where (c), (h) and (k) say otherwise;
+`tests/harness/web-globals.test.ts` compares those rows with Node live, on
+the native and the wasm lane, and corpus 1120 runs the encoders under both.
+Where the island parts from Node, measured against Node v24.18.1:
+
+- **(a) `console` cannot inspect in a plain build.** There is ONE console
+  on every island build: `log`/`info`/`debug` (stdout) and `warn`/`error`
+  (stderr) are Node's `formatWithOptions` branch for branch — every
+  specifier (`%d`/`%i`/`%f` run `Number`/`parseInt`/`parseFloat` over
+  objects too, `%s` takes `String()` of an object with its own `toString`,
+  `%j` prints `[Circular]`), `-0`, bigints, symbols, quoted strings — and
+  `group`/`groupCollapsed`/`groupEnd`, `count`, `countReset`, `assert`,
+  `clear`, `profile`, `profileEnd` and `timeStamp` are Node's; writes go to
+  the stream static output uses, in order with it, lone surrogates as
+  U+FFFD. Where Node would call `util.inspect` (an object or a function
+  as a plain argument, `%o`/`%O`, `%s` with an object whose `toString` is
+  a builtin), a plain `--dynamic` build has none and prints `String()` —
+  `console.log([1, [2]], { x: 1 })` prints `1,2 [object Object]` where
+  Node prints `[ 1, [ 2 ] ] { x: 1 }`, and an argument whose `String()`
+  throws prints `[value]` — while a build that embeds npm packages lends
+  the console its bootstrap's `util.inspect` port (the npm differential
+  holds it to Node). The methods that are nothing but inspection or
+  wall-clock time — `dir`, `dirxml`, `table`, `time`, `timeEnd`, `timeLog`,
+  `trace` (Node prints a V8 stack), `Console`, `context`, `createTask` —
+  and `countReset` of a label never counted (Node reports it through a
+  process warning) throw a named `Error` (`console.<name> inside the
+  scriptc island is not supported yet (it needs util.inspect or the wall
+  clock)`), on every build. The bootstrap's `util.inspect` does not honour
+  `showHidden` or `showProxy`, so in an npm build `%o` prints what `%O`
+  would at depth 4 — `console.log('%o', [])` prints `[]` where Node prints
+  `[ [length]: 0 ]`, a function without its `[length]`/`[name]`/
+  `[prototype]` members, a proxy as its target — and an error prints its
+  own `name: message` line followed by the engine's frames ((i)). Error
+  messages Node builds with `util.inspect` of an object (webidl's
+  `Expected eventInitDict.source ("{}") …`, `ERR_ARG_NOT_ITERABLE`'s
+  `{} must be iterable`) quote it as `[object Object]` in a plain build.
+- **(b) `TextDecoder` decodes UTF-8 only.** Node's six UTF-8 labels decode;
+  every other label in Node's table throws `RangeError: the scriptc
+  island's TextDecoder supports utf-8 only (got 'latin1')` where Node
+  decodes; the six labels of the "replacement" encoding and an unknown
+  label are Node's `ERR_ENCODING_NOT_SUPPORTED`. `TextEncoderStream` is
+  absent ((d)).
+- **(c) The streams are a subset.** `ReadableStream` (with `from`),
+  `TransformStream` and `TextDecoderStream`: `type: 'bytes'`, BYOB readers,
+  `tee()` and `pipeTo()` throw named errors; `Request`/`Response`
+  `clone()` and `formData()` throw one too; by the implementation's
+  design, not pinned here, queuing strategies are accepted and ignored (a
+  high-water mark of 1) and a transform runs eagerly on write. The
+  readers, writers and controllers are plain objects carrying the right
+  members and toStringTags, not instances of Node's (unexposed) classes.
+  Their promise jobs take different numbers of microtask turns than
+  Node's, so independent async chains interleave differently. Measured
+  with four evals in one tick — one awaiting `Response.text()`,
+  `Response.json()`, `Blob.arrayBuffer()` and `Blob.text()` in turn, one
+  `for await` over a `ReadableStream`, one reading a `TransformStream`,
+  one reading a `TextDecoderStream` — the lines print in the order
+  resp.text, tds, ts, json, blob, rs, blobtext on every lane; Node's is
+  resp.text, json, blob, rs, tds, blobtext, ts. Each chain's own result is
+  Node's.
+- **(d) Node globals outside the set are absent on the native lanes.** In
+  a plain `__island_eval` program, 38 of the 43 Node globals S103 (b)
+  fences on the wasm lane answer `typeof` `undefined` there (the other five
+  are the four timers and `Atomics`), among them `URL` (installed only once
+  an npm package or a URL value reaches the island), `fetch` (only in
+  fetch-using builds), `process`, `global` and `Buffer` (only for
+  npm-importing programs), `WritableStream`, `FormData`, `WebSocket`,
+  `Intl`, `WebAssembly`, `navigator`, `setImmediate`, `TextEncoderStream`,
+  `CompressionStream`, `CryptoKey` and the performance classes.
+- **(e) The zone name in `Date#toString`.** The text appends Node's
+  parenthesised zone name to `toString` and `toTimeString` through the
+  host's `tzname`: the native lanes answer S113's name for the zone at that
+  instant (Node's own table, `scr_zone_names.h`), the wasm lane's engine is
+  always UTC (`Coordinated Universal Time`; S103 (e)), so outside UTC the
+  wasm lane prints a different time and name than Node.
+- **(f) Timers on the native lanes** share the static timer heap; the
+  returned object's `unref()` is accepted and not honoured, and its
+  primitive value is the heap's id, not Node's async id. The wasm lane
+  fences the timers (S103 (b)).
+- **(g) WebCrypto is not carried.** `SubtleCrypto` has Node's shape (illegal
+  to construct, its methods on the prototype, `crypto.subtle` its
+  instance), but every method — and `SubtleCrypto.supports` — throws a
+  named `Error` synchronously (`crypto.subtle.<name> inside the scriptc
+  island is not supported yet`) where Node returns a promise.
+  `getRandomValues` and `randomUUID` are Node's, errors included.
+- **(h) MessagePort delivery is fenced.** `postMessage` queues a
+  `structuredClone` copy, which worker_threads' `receiveMessageOnPort`
+  drains as in Node; but Node delivers queued messages as `'message'`
+  events on a later macrotask, which the island has no task source for, so
+  every way to start delivery — `start()`, the `onmessage` and
+  `onmessageerror` setters, a `'message'`, `'messageerror'` or `'close'`
+  listener (`addEventListener`, `on`, `once`, `addListener`) — throws a
+  named `Error` (`MessagePort … is not supported in the scriptc island (no
+  task source delivers port messages)`), and `close()` fires no `'close'`
+  event. `MessagePort`'s prototype therefore carries its own
+  `addEventListener`, `on`, `once`, `off`, `addListener` and
+  `removeListener` above `EventTarget` (Node: `NodeEventTarget` between
+  them), and `MessageChannel`/`MessagePort` are classes (Node's are
+  functions, with own `arguments`/`caller`). `postMessage` itself is
+  Node's (`src/node_messaging.cc`): the second argument is a transfer
+  list or an options bag with `transfer`, checked with Node's
+  `ERR_MISSING_ARGS`/`ERR_INVALID_ARG_TYPE` texts, and the ArrayBuffers it
+  lists are detached once the clone succeeds, on a closed port too.
+- **(i) The engine's own builtins.** What quickjs-ng has and Node 24 does
+  not is removed at boot (the `InternalError` global, `Function.prototype`
+  `fileName`/`lineNumber`/`columnNumber`, `Math.sumPrecise`,
+  `Map`/`WeakMap` `getOrInsert`/`getOrInsertComputed`, the immutable
+  `ArrayBuffer` methods, `Uint8Array` base64/hex, `Iterator.concat`/`zip`/
+  `zipKeyed`); what Node has and the engine lacks — RegExp's legacy static
+  match properties (`RegExp.$1`…`$9`, `input`, `lastMatch`, …) and
+  `Atomics.waitAsync` — throws a named `Error` on read and write. An
+  error's `stack` is QuickJS's: ONE accessor on `Error.prototype` (V8 13.6:
+  an own accessor on each error, none on the prototype) whose text is
+  QuickJS's frames without V8's opening `name: message` line. Its setter
+  stores any value the way V8's does — on a frozen or non-extensible
+  error too, and for an object with an error on its prototype chain (the
+  value is read back through that object, which gets no own property);
+  assigning to an object that only inherits `Error.prototype` makes an own
+  enumerable property, V8's ordinary assignment. What differs is
+  ownership: `Object.getOwnPropertyNames(new Error('x'))` is `message`
+  (Node: `stack,message`), `Object.hasOwn(e, 'stack')` is false before and
+  after an assignment (Node: true), its descriptor is `undefined` (Node: an
+  accessor), `delete e.stack` leaves `e.stack` readable (Node:
+  `undefined`), and the setter called directly on a primitive throws
+  `TypeError: not an object` (Node has no prototype setter to call). The
+  engine's own error messages
+  are QuickJS's (`cannot convert symbol to string`; Node: `Cannot convert
+  a Symbol value to a string`; S103 (d)).
+- **(j) `structuredClone`** is V8's serializer over the island's values:
+  one identity memo (shared and cyclic references, two views of one
+  buffer), the primitive wrappers, `Date`, `RegExp` (source and flags),
+  `Map`, `Set`, `ArrayBuffer` (resizable ones keep `maxByteLength`), typed
+  arrays and `DataView` as views onto the cloned buffer, arrays with their
+  holes and extra properties, errors as V8 writes them, everything else a
+  plain object of its own enumerable properties (prototypes dropped), and
+  Node's answers for its own host objects (`Blob`/`File`/`DOMException`
+  clone; `Headers`/`URLSearchParams`/`Request`/`Response` are
+  "unsupported"; `MessagePort`/`ReadableStream`/`TransformStream` need a
+  transfer list) — `DataCloneError` with V8's `<value> could not be
+  cloned.` for functions, symbols, the Symbol wrapper, weak collections,
+  promises, generators, built-in iterators, proxies, arguments objects and
+  the global object; a transfer list moves `ArrayBuffer`s as Node does
+  (the clone owns the bytes, the source is detached; Node's duplicate,
+  detached and non-transferable errors). As V8 does, it snapshots an
+  object's own enumerable keys and a `Map`'s or `Set`'s entries before
+  cloning any of them (a key a getter deletes meanwhile is skipped, an
+  entry it adds is not cloned, one it deletes still is), clones a packed
+  array element by element (an element deleted meanwhile is a hole, a
+  named property added meanwhile is cloned) and any other array by its
+  snapshotted keys, creates each property rather than assigning it (no
+  setter runs, `__proto__` stays an own key), refuses a view out of
+  bounds of its shrunk resizable buffer (a typed array as `[object
+  Object] could not be cloned.`, a `DataView` as `#<DataView> …`), and
+  refuses a `MessageEvent` as unsupported. A function's text in the
+  message is the engine's `Function.prototype.toString` — QuickJS's
+  three-line native form (`function max() {⏎    [native code]⏎}`; V8: one
+  line), which island functions take too, since the island keeps no
+  source (S019). Not carried: a `SharedArrayBuffer`
+  throws a named `Error` (Node shares it), and so does a port or a stream
+  in a transfer list (Node transfers them).
+- **(k) Smaller shape differences.** `Request.prototype` lacks undici's
+  stray `attribute` member; Request's fetch-only attributes (`cache`,
+  `credentials`, `mode`, …) answer Node's defaults and are read-only
+  constants. The island's web text carries no WHATWG URL parser, so a
+  `Request`'s URL and `Response.redirect`'s are checked for a scheme only:
+  without one they fail as Node's do (`TypeError: Failed to parse URL from
+  /rel`, its cause `ERR_INVALID_URL`), with one they are kept as written —
+  `new Request('http://a').url` is `http://a` (Node: `http://a/`), and a
+  string Node's parser rejects past the scheme (`http:`) is accepted.
+  Node's instances carry symbol-keyed internal slots
+  (`Object.getOwnPropertySymbols` lists 4 on an `Event` and on an
+  `EventTarget`, 3 on a cloned `Blob`); the island's carry none. A
+  `DOMException` has no own `stack` ((i): the engine's stack is an
+  inherited accessor). `Event#timeStamp` is Node's `performance.now()` —
+  the host's monotonic clock, in ms since the process started (natively
+  the static `performance.now`'s clock; on the wasm lane the module's
+  `now` import, which the differential test host serves as a virtual
+  clock that reads 0).
+- **(l) A throwing event listener** is reported after the dispatch as an
+  uncaught exception thrown from an engine job (the island's uncaught
+  report, S103 (c)), where Node throws it on `process.nextTick`; the other
+  listeners still run, as in Node. A `null` or `undefined` listener is
+  ignored as in Node, but without Node's
+  `AddEventListenerArgumentTypeWarning` on stderr (the island has no
+  process warnings).
+
+**Tested by:** `tests/harness/web-globals.test.ts` — every row on the
+native and the wasm lane, most compared with Node live in the test process
+(URLSearchParams; `structuredClone`'s kinds, identities, views, wrappers,
+prototypes, errors and refusals; `Headers`; base64, `crypto` and
+`DOMException`; the encoders and labels; `Event`/`EventTarget`/
+`AbortSignal` behaviour and privacy; the classes' shapes; the
+toStringTags; the globals' shapes; the removed builtins; `console`'s
+formatting of every specifier, grouping, counting, assertions and U+FFFD,
+against `node -e`; island jobs at the exit checkpoint), and the fences of
+(a), (b), (c), (g), (h) and (i) by message; the npm differential's
+`console-npm` case (stdout and stderr against Node: the one console in an
+npm build); the E2 rows of `packages/compiler/test/wasm-island-engine.test.ts`
+(the header and the artifact against the `.js`, `console`'s stream order,
+`crypto` through the module's `random` import, the timer fences); corpus
+1120 on the c, llvm and wasm lanes against Node. (c)'s interleaving, (d)'s
+list and (e) were measured by hand, outside the suite.

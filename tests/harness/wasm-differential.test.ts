@@ -3644,6 +3644,11 @@ const TIER_FLOOR: string[] = [
   // host's tzCall, and process.env.TZ writes reach it (SEMANTICS.md S113):
   // 1090 -> 1091.
   "2771-date-local-zones.ts",
+  // Phase 2 unit E2: the engine boots the native island's own web-platform
+  // globals (ONE text, packages/runtime/src/scr_web_prelude.js; SEMANTICS.md
+  // S108), so TextEncoder/TextDecoder, URLSearchParams, btoa/atob and
+  // console answer as on the native lanes: 1091 -> 1092.
+  "1120-web-globals-encoders.ts",
 ];
 
 interface RunResult {

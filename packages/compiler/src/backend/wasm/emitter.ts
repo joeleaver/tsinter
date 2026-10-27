@@ -195,7 +195,7 @@ import { HostEvBuilder } from "./hostev.js";
 import { FETCH_CLASS_NAMES, FetchBuilder } from "./fetch.js";
 import { TlsBuilder } from "./tls.js";
 import { X509Builder } from "./tls-x509.js";
-import { CryptoBuilder, X509_BAD_TIME, X509_NO_START } from "./crypto.js";
+import { CryptoBuilder, RANDOM_CHUNK, X509_BAD_TIME, X509_NO_START } from "./crypto.js";
 import { ZlibBuilder, ZLIB_ERRORS } from "./zlib.js";
 import { PEM_ASN1, PEM_BAD_BASE64, PEM_BAD_END_LINE, PEM_NONCANON, PEM_TRAILING, PEM_UNSUPPORTED } from "./tls-x509.js";
 import { DgramBuilder, DGRAM_LISTS } from "./dgram.js";
@@ -2806,8 +2806,9 @@ class Assembler {
       : null;
     // `random`'s decision: node:crypto's entropy read, in modules that
     // reach randomUUID / randomBytes, minted after tlsCall so no earlier
-    // import index moves.
-    this.randomFunc = libCallWhere(mod, isCryptoRandomKey)
+    // import index moves. Phase 2 E2: the island engine reads it too (the
+    // shared web prelude's crypto.getRandomValues / randomUUID).
+    this.randomFunc = libCallWhere(mod, isCryptoRandomKey) || this.engineLive
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_RANDOM, this.mb.funcType([I32, I32], []))
       : null;
     // `sleep`'s decision (unit H, abi.ts): Atomics.wait's synchronous
@@ -6693,6 +6694,14 @@ class Assembler {
       // xorshift128+, seeded once from `seed`): one sequence, as in Node.
       return this.randomHelper();
     }
+    if (imp.module === "tsinter_engine" && imp.name === "random" && sig === "i32,i32->") {
+      return this.islandRandomShim(t);
+    }
+    if (imp.module === "tsinter_engine" && imp.name === "pow" && sig === "f64,f64->f64") {
+      // The engine's Math.pow (scr_jsmath.h's scr_js_pow, general case) IS
+      // the static `**`: V8's math::pow over the tier's glibc pow (S079).
+      return this.jsPowHelper();
+    }
     const want: Record<string, string> = {
       clock_time_get: "i32,i64,i32->i32",
       fd_close: "i32->i32",
@@ -6827,6 +6836,51 @@ class Assembler {
       }
     }
     this.mb.setBody(idx, locals, c.bytes());
+    return idx;
+  }
+
+  /** The engine's entropy read (isl_core.c's `tsinter_engine.random(p, n)`,
+   * the web prelude's crypto): the module's own `tsinter.random` import
+   * fills RANDOM_CHUNK-sized pieces above OUR staging cursor (never over a
+   * staged line), each copied into the engine's memory at p. */
+  private islandRandomShim(t: { params: ValType[]; results: ValType[] }): number {
+    const random = this.randomFunc;
+    if (random === null) throw new Error("emitter bug: an engine module without tsinter.random");
+    const idx = this.mb.declareFunc(this.mb.funcType(t.params, t.results), "%isl.random");
+    const c = new Code();
+    const P = 0, N = 1, CH = 2;
+    c.block();
+    c.loop();
+    c.localGet(N);
+    c.i32Eqz();
+    c.brIf(1);
+    c.localGet(N);
+    c.i32Const(RANDOM_CHUNK);
+    c.localGet(N);
+    c.i32Const(RANDOM_CHUNK);
+    c.i32LtU();
+    c.select();
+    c.localSet(CH);
+    this.emitEnsureCapacity(c, () => c.localGet(CH));
+    c.globalGet(this.cursorGlobal);
+    c.localGet(CH);
+    c.call(random);
+    c.localGet(P);
+    c.globalGet(this.cursorGlobal);
+    c.localGet(CH);
+    c.memoryCopy(ENGINE_MEMORY, undefined);
+    c.localGet(P);
+    c.localGet(CH);
+    c.i32Add();
+    c.localSet(P);
+    c.localGet(N);
+    c.localGet(CH);
+    c.i32Sub();
+    c.localSet(N);
+    c.br(0);
+    c.end();
+    c.end();
+    this.mb.setBody(idx, [I32], c.bytes());
     return idx;
   }
 

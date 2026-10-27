@@ -7,7 +7,11 @@
  * the program reaches the engine (packages/compiler/src/backend/wasm/
  * engine.ts), re-indexing it in place through the relocation sections, so
  * a compile never needs clang or wasi-libc. This script is the maintainer
- * half: run it after changing isl_core.c or bumping the vendored engine.
+ * half: run it after changing isl_core.c, the island sources it shares with
+ * the native island (packages/runtime/src/scr_web_prelude.h — the web
+ * globals; wasm-island-engine.test.ts goes red when the artifact's copy is
+ * stale — scr_island_math.h, scr_jsmath.h, scr_ieee754.cc), or bumping the
+ * vendored engine or vendor/v8-ieee754.
  *
  *   node scripts/build-engine-wasm.mjs           # rebuild the artifact
  *   node scripts/build-engine-wasm.mjs --check   # rebuild into a temp dir
@@ -21,7 +25,8 @@
  *   that runs this script: the pinned Node 24 (v24.18.1 at this writing).
  * - vendor/quickjs-ng-wasm/engine.wasm (+ .sha256) — the engine.
  * - vendor/quickjs-ng-wasm/engine-fence.json — the names the built engine
- *   actually fences (node_globals.h minus what the engine has), read from
+ *   actually fences (node_globals.h minus what the engine has, the web
+ *   prelude's globals included), read from
  *   the engine itself; the compiler's build-time fence uses it.
  *
  * Toolchain (Ubuntu packages, nothing else): clang-21 + wasm-ld-21
@@ -52,6 +57,9 @@ const vendor = join(root, "packages/runtime/vendor/quickjs-ng");
 const outDir = join(root, "packages/runtime/vendor/quickjs-ng-wasm");
 const coreDir = join(root, "packages/runtime/src/wasm");
 const coreSrc = join(coreDir, "isl_core.c");
+// The shared web prelude (scr_web_prelude.h) lives beside the native runtime.
+const runtimeSrc = join(root, "packages/runtime/src");
+const ieeeVendor = join(root, "packages/runtime/vendor/v8-ieee754");
 const CLANG = "/usr/bin/clang-21";
 const WASM_LD = "/usr/bin/wasm-ld-21";
 const SYSROOT_LIB = "/usr/lib/wasm32-wasi";
@@ -109,7 +117,7 @@ async function fenceList(bytes) {
     fd_seek: () => 70,
     fd_write: () => 0,
   };
-  const { instance } = await WebAssembly.instantiate(bytes, { wasi_snapshot_preview1: wasi, tsinter_engine: { math_random: () => 0.5 } });
+  const { instance } = await WebAssembly.instantiate(bytes, { wasi_snapshot_preview1: wasi, tsinter_engine: { math_random: () => 0.5, random: () => {}, pow: Math.pow } });
   mem = instance.exports.memory;
   instance.exports._initialize();
   const p = instance.exports.isl_fence_list();
@@ -124,9 +132,38 @@ function build(dir) {
   const objs = [];
   for (const src of [...ENGINE_SOURCES.map((s) => join(vendor, s)), coreSrc]) {
     const obj = join(dir, src.split("/").pop().replace(/\.c$/, ".o"));
-    execFileSync(CLANG, [...CFLAGS, "-I", vendor, "-I", dir, "-c", src, "-o", obj], { env, stdio: "inherit" });
+    execFileSync(CLANG, [...CFLAGS, "-I", vendor, "-I", dir, "-I", runtimeSrc, "-c", src, "-o", obj], { env, stdio: "inherit" });
     objs.push(obj);
   }
+  // V8's ieee754.cc — the ONE vendored copy every lane runs (SEMANTICS.md
+  // S100) — through the native lanes' own wrapper, scr_ieee754.cc, with
+  // cc.ts ensureIeee754Object's C++ flags (no C++ library: the shims stand
+  // in for the headers it includes; -ffp-contract=off), at -Oz.
+  const ieeeObj = join(dir, "scr_ieee754.o");
+  execFileSync(
+    CLANG,
+    [
+      "-x", "c++",
+      "--target=wasm32-wasi",
+      "-std=c++17",
+      "-nostdinc++",
+      "-Oz",
+      "-DNDEBUG",
+      "-ffp-contract=off",
+      "-fno-exceptions",
+      "-fno-rtti",
+      "-fno-math-errno",
+      "-fvisibility=hidden",
+      "-fno-ident",
+      "-ffile-prefix-map=" + root + "=.",
+      "-I", join(ieeeVendor, "shim"),
+      "-I", ieeeVendor,
+      "-c", join(runtimeSrc, "scr_ieee754.cc"),
+      "-o", ieeeObj,
+    ],
+    { env, stdio: "inherit" },
+  );
+  objs.push(ieeeObj);
   const out = join(dir, "engine.wasm");
   execFileSync(
     WASM_LD,

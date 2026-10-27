@@ -1,7 +1,8 @@
 /* isl_core.c — the engine half of the island on the WasmGC tier.
  *
- * Linked INSIDE the prebuilt engine module (scripts/build-engine-wasm.sh:
- * quickjs-ng + this file + wasi-libc, `wasm-ld --emit-relocs`), which the
+ * Linked INSIDE the prebuilt engine module (scripts/build-engine-wasm.mjs:
+ * quickjs-ng + this file + scr_ieee754.cc over the vendored V8 ieee754.cc +
+ * wasi-libc, `wasm-ld --emit-relocs`), which the
  * wasm emitter splices into a program's own module only when the program
  * reaches the engine (packages/compiler/src/backend/wasm/engine.ts). It is
  * the wasm counterpart of the JSValue-touching half of the native island
@@ -30,15 +31,25 @@
  *
  * The runtime is created on first entry: one runtime + one context for the
  * instance, so island globals persist across evals (native's
- * one-context-per-process model). Nothing is ever torn down — a wasm
+ * one-context-per-process model). Its context boots as native's does: the
+ * shared web-platform prelude (scr_web_prelude.h — the SAME text, over this
+ * file's host functions; SEMANTICS.md S108), then the fence of whatever
+ * Node global is still missing. Nothing is ever torn down — a wasm
  * instance's memory dies with it; isl_live_allocs is what the unit tests
  * read instead of native's teardown audit. */
+#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 #include "quickjs.h"
 #include "node_globals.h"
+/* The web-platform globals — the SAME text the native island evaluates
+ * (packages/runtime/src/scr_web_prelude.h; the build puts that directory
+ * on the include path). */
+#include "scr_web_prelude.h"
 
 #define ISL_EXPORT(n) __attribute__((export_name(n)))
 
@@ -48,6 +59,28 @@
  * sequence — Node's single per-isolate generator, `--random-seed`
  * included. */
 __attribute__((import_module("tsinter_engine"), import_name("math_random"))) double isl_host_math_random(void);
+
+/* The second: the host module's entropy read (its `tsinter.random`
+ * import, abi.ts) filling n bytes of THIS module's memory at p — the web
+ * prelude's crypto.getRandomValues/randomUUID, as native bridges them to
+ * the same arc4random_buf behind its static crypto. */
+__attribute__((import_module("tsinter_engine"), import_name("random"))) void isl_host_random(void *p, size_t n);
+
+/* The third: the module's own `x ** y` (%w.jsPow — V8's math::pow over the
+ * tier's port of the glibc pow Node's x86-64 build calls, S079), behind
+ * scr_jsmath.h's scr_js_pow: wasi-libc's pow is musl's, which Node never
+ * runs. */
+__attribute__((import_module("tsinter_engine"), import_name("pow"))) double isl_host_pow(double x, double y);
+
+/* The engine's Math, as Node computes it (SEMANTICS.md S100): the native
+ * island's own override (scr_island_math.h) over the same ports
+ * (scr_jsmath.h, defined here) and the same V8 ieee754.cc (scr_ieee754.cc,
+ * linked into this module by the build). */
+#define SCR_JSMATH_POW(x, y) isl_host_pow(x, y)
+#define SCR_JSMATH_NAN
+#define SCR_JSMATH_LIB
+#include "scr_jsmath.h"
+#include "scr_island_math.h"
 
 /* The engine's stack-overflow budget, in bytes of the C (shadow) stack.
  * The shadow stack lives in linear memory, but every engine C frame is
@@ -309,6 +342,168 @@ static const char isl_fence_src[] =
     "  return fenced.join(',');\n"
     "})()";
 
+/* ── the web prelude's host object (native: scr_web.c) ──────────────
+ * scr_web_prelude.h is shared verbatim; these are the wasm lane's
+ * implementations of its seven host functions. Engine ownership rules as
+ * ever: argv borrowed, results owned. */
+
+/* host.write(fd, s): console's write — straight to WASI fd_write (no stdio
+ * buffer), which the module serves through its own `write` import, so a
+ * line lands in order with the static side's console output. */
+static JSValue isl_web_write(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  (void)argc;
+  int32_t fd = 1;
+  JS_ToInt32(ctx, &fd, argv[0]);
+  size_t len;
+  const char *s = JS_ToCStringLen(ctx, &len, argv[1]);
+  if (!s) return JS_EXCEPTION;
+  size_t at = 0;
+  while (at < len) {
+    ssize_t n = write(fd, s + at, len - at);
+    if (n <= 0) break;
+    at += (size_t)n;
+  }
+  JS_FreeCString(ctx, s);
+  return JS_UNDEFINED;
+}
+
+/* host.fill(typedArray): the view's bytes from the host's entropy. The
+ * prelude already validated the view kind and the 65536-byte quota. */
+static JSValue isl_web_fill(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  (void)argc;
+  size_t off = 0, len = 0, bpe = 0;
+  JSValue ab = JS_GetTypedArrayBuffer(ctx, argv[0], &off, &len, &bpe);
+  if (JS_IsException(ab)) return JS_EXCEPTION;
+  size_t absize = 0;
+  uint8_t *buf = JS_GetArrayBuffer(ctx, &absize, ab);
+  JS_FreeValue(ctx, ab);
+  if (!buf) return JS_EXCEPTION;
+  if (len > 0) isl_host_random(buf + off, len);
+  return JS_UNDEFINED;
+}
+
+/* host.uuid(): Node's randomUUID shape (16 random bytes, version 4,
+ * variant 10xx, lowercase 8-4-4-4-12) — native's scr_crypto_random_uuid. */
+static JSValue isl_web_uuid(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  (void)argc;
+  (void)argv;
+  uint8_t b[16];
+  isl_host_random(b, sizeof b);
+  b[6] = (uint8_t)((b[6] & 0x0f) | 0x40);
+  b[8] = (uint8_t)((b[8] & 0x3f) | 0x80);
+  static const char hex[] = "0123456789abcdef";
+  char out[36];
+  int o = 0;
+  for (int i = 0; i < 16; i++) {
+    if (i == 4 || i == 6 || i == 8 || i == 10) out[o++] = '-';
+    out[o++] = hex[b[i] >> 4];
+    out[o++] = hex[b[i] & 15];
+  }
+  return JS_NewStringLen(ctx, out, sizeof out);
+}
+
+/* host.now(): performance.now — the module's monotonic clock (the WASI
+ * clock_time_get shim's non-realtime arm, abi.ts's `now`), in ms. */
+static JSValue isl_web_now(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  (void)argc;
+  (void)argv;
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return JS_NewFloat64(ctx, 0);
+  return JS_NewFloat64(ctx, (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6);
+}
+
+/* host.tzname(ms): Date#toString's zone-name suffix — native's
+ * web_host_tzname over wasi-libc, whose local time is UTC (S103 (e)), so
+ * the answer is "Coordinated Universal Time", Node's spelling under UTC. */
+static JSValue isl_web_tzname(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  (void)argc;
+  double ms = 0;
+  if (JS_ToFloat64(ctx, &ms, argv[0])) return JS_EXCEPTION;
+  if (!isfinite(ms)) return JS_NewString(ctx, "");
+  time_t t = (time_t)floor(ms / 1000.0);
+  struct tm tmv;
+  if (localtime_r(&t, &tmv) == NULL) return JS_NewString(ctx, "");
+  const char *name = tmv.tm_zone;
+  if (name == NULL) name = "";
+  if (strcmp(name, "UTC") == 0) name = "Coordinated Universal Time";
+  return JS_NewString(ctx, name);
+}
+
+/* host.timer / host.setTimer / host.clearTimer: the engine has no timer
+ * bridge onto the module's loop yet, so the timer globals stay FENCED
+ * (isl_web_boot deletes them before the fence runs) and
+ * AbortSignal.timeout — the one other caller — throws the fence's named
+ * error. */
+static JSValue isl_web_no_timer(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic) {
+  (void)this_val;
+  (void)argc;
+  (void)argv;
+  return JS_ThrowPlainError(ctx, "%s inside __island_eval is not supported yet on the wasm lane (SEMANTICS.md S103)",
+                            magic == 0 ? "AbortSignal.timeout" : "setTimeout");
+}
+
+/* host.isPromise / isProxy / proxyTarget: native's (scr_web.c), the
+ * internal-slot checks structuredClone needs. */
+static JSValue isl_web_is_promise(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  (void)argc;
+  return JS_NewBool(ctx, JS_IsPromise(argv[0]));
+}
+static JSValue isl_web_is_proxy(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  (void)argc;
+  return JS_NewBool(ctx, JS_IsProxy(argv[0]));
+}
+static JSValue isl_web_proxy_target(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  (void)argc;
+  return JS_GetProxyTarget(ctx, argv[0]);
+}
+
+/* Evaluates the shared prelude and calls it with the host object, then
+ * removes the timer globals it defined, which this lane cannot serve (the
+ * fence that runs next covers them by name). 0 = ok. */
+static int isl_web_boot(void) {
+  JSValue fn = JS_Eval(isl_ctx, web_prelude, sizeof web_prelude - 1, "<scr-web>", JS_EVAL_TYPE_GLOBAL);
+  if (JS_IsException(fn)) return -1;
+  JSValue host = JS_NewObject(isl_ctx);
+  /* JS_SetPropertyStr consumes the function values. */
+  JS_SetPropertyStr(isl_ctx, host, "fill", JS_NewCFunction(isl_ctx, isl_web_fill, "fill", 1));
+  JS_SetPropertyStr(isl_ctx, host, "uuid", JS_NewCFunction(isl_ctx, isl_web_uuid, "uuid", 0));
+  JS_SetPropertyStr(isl_ctx, host, "write", JS_NewCFunction(isl_ctx, isl_web_write, "write", 2));
+  JS_SetPropertyStr(isl_ctx, host, "tzname", JS_NewCFunction(isl_ctx, isl_web_tzname, "tzname", 1));
+  JS_SetPropertyStr(isl_ctx, host, "now", JS_NewCFunction(isl_ctx, isl_web_now, "now", 0));
+  JS_SetPropertyStr(isl_ctx, host, "timer",
+                    JS_NewCFunctionMagic(isl_ctx, isl_web_no_timer, "timer", 2, JS_CFUNC_generic_magic, 0));
+  JS_SetPropertyStr(isl_ctx, host, "setTimer",
+                    JS_NewCFunctionMagic(isl_ctx, isl_web_no_timer, "setTimer", 3, JS_CFUNC_generic_magic, 1));
+  JS_SetPropertyStr(isl_ctx, host, "clearTimer",
+                    JS_NewCFunctionMagic(isl_ctx, isl_web_no_timer, "clearTimer", 1, JS_CFUNC_generic_magic, 1));
+  JS_SetPropertyStr(isl_ctx, host, "isPromise", JS_NewCFunction(isl_ctx, isl_web_is_promise, "isPromise", 1));
+  JS_SetPropertyStr(isl_ctx, host, "isProxy", JS_NewCFunction(isl_ctx, isl_web_is_proxy, "isProxy", 1));
+  JS_SetPropertyStr(isl_ctx, host, "proxyTarget", JS_NewCFunction(isl_ctx, isl_web_proxy_target, "proxyTarget", 1));
+  JSValue r = JS_Call(isl_ctx, fn, JS_UNDEFINED, 1, (JSValueConst *)&host);
+  JS_FreeValue(isl_ctx, host);
+  JS_FreeValue(isl_ctx, fn);
+  if (JS_IsException(r)) return -2;
+  JS_FreeValue(isl_ctx, r);
+  JSValue g = JS_GetGlobalObject(isl_ctx);
+  static const char *const timers[] = {"setTimeout", "setInterval", "clearTimeout", "clearInterval"};
+  int rc = 0;
+  for (size_t i = 0; i < sizeof timers / sizeof timers[0]; i++) {
+    JSAtom a = JS_NewAtom(isl_ctx, timers[i]);
+    if (JS_DeleteProperty(isl_ctx, g, a, 0) < 0) rc = -3;
+    JS_FreeAtom(isl_ctx, a);
+  }
+  JS_FreeValue(isl_ctx, g);
+  return rc;
+}
+
 /* The fenced names, kept from init for isl_fence_list (plain malloc: not
  * an engine allocation). */
 static char *isl_fenced_names;
@@ -330,6 +525,11 @@ static int isl_init(void) {
   isl_ctx = JS_NewContext(isl_rt);
   if (!isl_ctx) return -2;
   JS_SetHostPromiseRejectionTracker(isl_rt, isl_rejection_tracker, NULL);
+  /* Native's boot order: Math's members first (scr_island.c isl_init). */
+  isl_install_math(isl_ctx);
+  /* The web globals next (as native boots them), so the fence below covers
+   * only what is still missing. */
+  if (isl_web_boot() != 0) return -5;
   JSValue r = JS_Eval(isl_ctx, isl_fence_src, sizeof isl_fence_src - 1, "<scr-fence>", JS_EVAL_TYPE_GLOBAL);
   if (JS_IsException(r)) return -3;
   const char *names = JS_ToCString(isl_ctx, r);

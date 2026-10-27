@@ -493,6 +493,7 @@ static void isl_teardown_at_exit(void) {
   /* Unfired island timers (an AbortSignal.timeout that never mattered)
    * hold engine callbacks: freed like the fetch transfers above. */
   scr_island_timers_teardown();
+  scr_island_web_teardown();
   /* Armed static-heap timers may hold engine callbacks too (the island's
    * setTimeout/setInterval bridge): the loop only exits with entries
    * still armed on the uncaught/unhandled paths — release them before
@@ -539,93 +540,9 @@ static void isl_teardown_at_exit(void) {
 #endif
 }
 
-/* ── the engine's Math, computed as Node computes it (SEMANTICS.md S100) ──
- * Code the engine itself evaluates (embedded packages, a Math object
- * reached as a value) calls the engine's Math members, which quickjs-ng
- * computes with the C library (sin, cbrt, hypot, ...) where Node runs V8's
- * ieee754.cc and builtins. The vendored engine stays unmodified: at context
- * creation the members that can differ are replaced, as ordinary writable
- * properties of Math, by functions over the SAME code the compiled program
- * calls -- scr_ieee754_* (vendor/v8-ieee754's ieee754.cc) and scr_lib.c's
- * pow/hypot/sign/f16round/round/min/max. Each keeps its name and length;
- * the unary and binary ones use the engine's own f_f / f_f_f calling
- * convention, so the arguments convert exactly as the originals' did.
- * Members whose engine answer already is Node's, NaN bits included (abs,
- * floor, ceil, trunc, sqrt, fround, clz32, imul, random), keep the
- * engine's functions. What this cannot
- * reach is the engine's `**` OPERATOR (QuickJS's js_math_pow: libm pow
- * without V8's y = 2 / y = 0.5 pre-cases) -- S100 registers it. */
-static JSValue isl_math_hypot(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-  (void)this_val;
-  double small[8];
-  double *xs = argc <= 8 ? small : js_malloc(ctx, sizeof(double) * (size_t)argc);
-  if (!xs) return JS_EXCEPTION;
-  for (int i = 0; i < argc; i++) {
-    if (JS_ToFloat64(ctx, &xs[i], argv[i])) {
-      if (xs != small) js_free(ctx, xs);
-      return JS_EXCEPTION;
-    }
-  }
-  double r = scr_math_hypot(xs, (size_t)argc);
-  if (xs != small) js_free(ctx, xs);
-  return JS_NewFloat64(ctx, r);
-}
-
-/* Math.max / Math.min: every argument ToNumber'd first (in order, a throw
- * propagating), then the fold from the seed over scr_lib.c's two-argument
- * compare -- the compiled program's own path, so a NaN answer is V8's
- * (scr_math_minmax_nan) rather than an operand's payload. */
-static JSValue isl_math_minmax(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic) {
-  (void)this_val;
-  double acc = magic ? -INFINITY : INFINITY;
-  double small[8];
-  double *xs = argc <= 8 ? small : js_malloc(ctx, sizeof(double) * (size_t)argc);
-  if (!xs) return JS_EXCEPTION;
-  for (int i = 0; i < argc; i++) {
-    if (JS_ToFloat64(ctx, &xs[i], argv[i])) {
-      if (xs != small) js_free(ctx, xs);
-      return JS_EXCEPTION;
-    }
-  }
-  for (int i = 0; i < argc; i++) acc = magic ? scr_math_max(acc, xs[i]) : scr_math_min(acc, xs[i]);
-  if (xs != small) js_free(ctx, xs);
-  return JS_NewFloat64(ctx, acc);
-}
-
-static void isl_install_math(JSContext *ctx) {
-  static const struct { const char *name; double (*f)(double); } unary[] = {
-    { "acos", scr_ieee754_acos }, { "acosh", scr_ieee754_acosh }, { "asin", scr_ieee754_asin },
-    { "asinh", scr_ieee754_asinh }, { "atan", scr_ieee754_atan }, { "atanh", scr_ieee754_atanh },
-    { "cbrt", scr_ieee754_cbrt }, { "cos", scr_ieee754_cos }, { "cosh", scr_ieee754_cosh },
-    { "exp", scr_ieee754_exp }, { "expm1", scr_ieee754_expm1 }, { "log", scr_ieee754_log },
-    { "log1p", scr_ieee754_log1p }, { "log2", scr_ieee754_log2 }, { "log10", scr_ieee754_log10 },
-    { "sin", scr_ieee754_sin }, { "sinh", scr_ieee754_sinh }, { "tan", scr_ieee754_tan },
-    { "tanh", scr_ieee754_tanh }, { "sign", scr_math_sign }, { "f16round", scr_math_f16round },
-    { "round", scr_math_round },
-  };
-  static const struct { const char *name; double (*f)(double, double); } binary[] = {
-    { "atan2", scr_ieee754_atan2 }, { "pow", scr_js_pow },
-  };
-  JSValue global = JS_GetGlobalObject(ctx);
-  JSValue math = JS_GetPropertyStr(ctx, global, "Math");
-  for (size_t i = 0; i < sizeof unary / sizeof unary[0]; i++) {
-    JSCFunctionType ft;
-    ft.f_f = unary[i].f;
-    JS_SetPropertyStr(ctx, math, unary[i].name,
-                      JS_NewCFunction2(ctx, ft.generic, unary[i].name, 1, JS_CFUNC_f_f, 0));
-  }
-  for (size_t i = 0; i < sizeof binary / sizeof binary[0]; i++) {
-    JSCFunctionType ft;
-    ft.f_f_f = binary[i].f;
-    JS_SetPropertyStr(ctx, math, binary[i].name,
-                      JS_NewCFunction2(ctx, ft.generic, binary[i].name, 2, JS_CFUNC_f_f_f, 0));
-  }
-  JS_SetPropertyStr(ctx, math, "hypot", JS_NewCFunction(ctx, isl_math_hypot, "hypot", 2));
-  JS_SetPropertyStr(ctx, math, "max", JS_NewCFunctionMagic(ctx, isl_math_minmax, "max", 2, JS_CFUNC_generic_magic, 1));
-  JS_SetPropertyStr(ctx, math, "min", JS_NewCFunctionMagic(ctx, isl_math_minmax, "min", 2, JS_CFUNC_generic_magic, 0));
-  JS_FreeValue(ctx, math);
-  JS_FreeValue(ctx, global);
-}
+/* The engine's Math (isl_install_math): scr_island_math.h, shared verbatim
+ * with the WasmGC tier's engine (packages/runtime/src/wasm/isl_core.c). */
+#include "scr_island_math.h"
 
 static ScrJsval *isl_cell_new(JSValue v);
 
@@ -2550,6 +2467,9 @@ ScrJsval *scr_jsval_arr_lit(int n, ScrJsval **elems) {
 #ifdef _WIN32
 #include <winsock2.h>
 #endif
+
+/* scr_web.c: the web prelude's internals object (owned reference). */
+JSValue scr_island_web_internals(void *jsctx);
 
 #define ISL_IMPORT_BASE "<scr-import>"
 
@@ -5822,7 +5742,10 @@ static const char isl_modules_bootstrap[] =
     "    setFips: () => {},\n"
     "    getFips: () => 0,\n"
     "  };\n"
-    "  crypto.subtle = webcrypto ? webcrypto.subtle : undefined;\n"
+    /* A getter, as Node's is: reading it reaches the web prelude's
+     * crypto.subtle (a named fence, SEMANTICS.md S108 (g)) only when a
+     * program actually asks. */
+    "  Object.defineProperty(crypto, 'subtle', { get() { return webcrypto ? webcrypto.subtle : undefined; }, enumerable: true, configurable: true });\n"
     "  return crypto;\n"
     "}\n"
     "    const mod = makeCrypto({ digest: (a, d) => host.digest(a, d), hmac: (a, k, d) => host.hmac(a, k, d), Buffer: builtins.buffer().Buffer });\n"
@@ -7464,10 +7387,14 @@ static const char isl_modules_bootstrap[] =
     "      formatter = () => [];\n"
     "    } else if (value instanceof Error) {\n"
     "      base = value.stack;\n"
+    "      const name = value.name === undefined ? \"Error\" : String(value.name);\n"
+    "      const msg = value.message === undefined || value.message === \"\" ? \"\" : \": \" + String(value.message);\n"
     "      if (typeof base !== \"string\" || base === \"\") {\n"
-    "        const name = value.name === undefined ? \"Error\" : String(value.name);\n"
-    "        const msg = value.message === undefined || value.message === \"\" ? \"\" : \": \" + String(value.message);\n"
     "        base = \"[\" + name + msg + \"]\";\n"
+    "      } else if (base.startsWith(\"    at \")) {\n"
+    "        /* the engine's stack is its frames alone; V8's opens with the\n"
+    "         * error's own line, which Node prints (S108 (a)) */\n"
+    "        base = name + msg + \"\\n\" + base;\n"
     "      }\n"
     "      keys = keys.filter((k) => k !== \"message\" && k !== \"stack\");\n"
     "      if (keys.length === 0) return base;\n"
@@ -8368,7 +8295,7 @@ static const char isl_modules_bootstrap[] =
     "     * structuredClone copies through the prelude's serializer. */\n"
     "    const MessagePort = globalThis.MessagePort;\n"
     "    const MessageChannel = globalThis.MessageChannel;\n"
-    "    const receiveMessageOnPort = (port) => (port._queue.length > 0 ? port._queue.shift() : undefined);\n"
+    "    const receiveMessageOnPort = host.web.receiveMessageOnPort;\n"
     "    class Worker {\n"
     "      constructor() { throw new Error(\"node:worker_threads 'Worker' is not supported in the scriptc island (the embedded engine has no worker runtime)\"); }\n"
     "    }\n"
@@ -9547,17 +9474,10 @@ static const char isl_modules_bootstrap[] =
     "    globalThis.setImmediate = (fn, ...args) => globalThis.setTimeout(fn, 0, ...args);\n"
     "    globalThis.clearImmediate = (t) => globalThis.clearTimeout(t);\n"
     "  }\n"
-    "  {\n"
-    "    const fmt = (...a) => builtins.util().formatWithOptions({}, ...a);\n"
-    "    const to = (fd, prefix) => (...a) => { host.write(fd, (prefix || '') + fmt(...a) + '\\n'); };\n"
-    "    const c = globalThis.console;\n"
-    "    c.log = to(1);\n"
-    "    c.info = to(1);\n"
-    "    c.debug = to(1);\n"
-    "    c.warn = to(2);\n"
-    "    c.error = to(2);\n"
-    "    c.trace = to(2, 'Trace: ');\n"
-    "  }\n"
+    /* ONE console on every island build (the web prelude's: its
+     * formatter, group indentation and U+FFFD writes); an npm build only
+     * lends it this bootstrap's util.inspect port for objects (S108 (a)). */
+    "  host.web.setInspect((v, opts) => builtins.util().inspect(v, opts));\n"
     "  if (globalThis.global === undefined) globalThis.global = globalThis;\n"
     "  globalThis.__scr_require = requireKey;\n"
     /* A CommonJS namespace's `default` IS module.exports, always — an own
@@ -9636,6 +9556,9 @@ static void isl_modules_boot(void) {
    * httpSetTimeout. The bootstrap's http/https shims register exactly
    * when host.httpStart exists — without the bridge the builtins table
    * keeps the "does not provide" refusal. */
+  /* The web prelude's internals (scr_web.c): receiveMessageOnPort for
+   * worker_threads. */
+  JS_SetPropertyStr(isl_ctx, host, "web", scr_island_web_internals(isl_ctx));
   if (isl_netmod_attach) isl_netmod_attach(isl_ctx, &host);
   isl_cjs_import = JS_Call(isl_ctx, fn, JS_UNDEFINED, 1, &host);
   JS_FreeValue(isl_ctx, host);
@@ -10060,7 +9983,7 @@ static JSValue isl_url_parse_host(JSContext *ctx, JSValueConst this_val,
 }
 
 static const char isl_url_src[] =
-    "(function (parse) {\n"
+    "(function (parse, web) {\n"
     "  'use strict';\n"
     "  const def = (o, n, v) => Object.defineProperty(o, n, { value: v, enumerable: true });\n"
     "  class URL {\n"
@@ -10104,10 +10027,7 @@ static const char isl_url_src[] =
     "        get: () => self._search,\n"
     "        set: (v) => {\n"
     "          self._applySearch(String(v));\n"
-    "          if (self._sp !== undefined) {\n"
-    "            self._sp._pairs.length = 0;\n"
-    "            for (const [k, val] of new globalThis.URLSearchParams(self._search)) self._sp._pairs.push([k, val]);\n"
-    "          }\n"
+    "          if (self._sp !== undefined) web.uspReset(self._sp, self._search);\n"
     "        },\n"
     "      });\n"
     "      def(this, 'protocol', c[1]);\n"
@@ -10186,7 +10106,9 @@ static void isl_install_url_class(void) {
       abort(); /* fixed source; failing to parse is a build defect */
     }
     JSValue parse = JS_NewCFunction(isl_ctx, isl_url_parse_host, "__scr_url_parse", 1);
-    JSValue r = JS_Call(isl_ctx, installer, JS_UNDEFINED, 1, &parse);
+    JSValue args[2] = {parse, scr_island_web_internals(isl_ctx)};
+    JSValue r = JS_Call(isl_ctx, installer, JS_UNDEFINED, 2, args);
+    JS_FreeValue(isl_ctx, args[1]);
     JS_FreeValue(isl_ctx, parse);
     JS_FreeValue(isl_ctx, installer);
     if (JS_IsException(r)) {

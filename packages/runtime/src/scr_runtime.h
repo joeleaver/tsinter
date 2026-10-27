@@ -4136,6 +4136,10 @@ size_t scr_island_exit_code_version(void);
  * the island's JSContext as an opaque pointer — engine types stay out of
  * this header. */
 void scr_island_web_boot(void *jsctx);
+/* Releases the prelude's internals object (engine teardown). The object
+ * itself is reached through scr_island_web_internals(ctx), declared where
+ * engine types are in scope (scr_island.c, scr_fetch.c). */
+void scr_island_web_teardown(void);
 
 /* Runs the engine's pending promise-reaction jobs to exhaustion (no-op
  * before the engine boots). Returns the number executed. The loop's io

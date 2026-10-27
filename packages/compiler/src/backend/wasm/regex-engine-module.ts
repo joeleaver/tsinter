@@ -16,6 +16,7 @@
  * So the wasm tier's run-time compiler, its build time and the native
  * lanes all decide a pattern with one code base. */
 import { A, Fn, I32, type X } from "./asm.js";
+import { currentOurMemoryIndex, setOurMemoryIndex } from "./code.js";
 import { ModuleBuilder, type ValType } from "./module.js";
 import { RegexCompilerBuilder } from "./regex-compiler.js";
 import { RegexInterpreterBuilder } from "./regex-interpreter.js";
@@ -31,6 +32,24 @@ let memo: RegexEngineModule | null = null;
 
 export function regexEngineModule(): RegexEngineModule {
   if (memo !== null) return memo;
+  // Built on first use, possibly in the middle of a program's own walk —
+  // whose memory index (1 in a module that carries the island engine) a
+  // fresh ModuleBuilder and its emit() reset to 0: restore it.
+  const ourMem = currentOurMemoryIndex();
+  try {
+    return buildModule();
+  } finally {
+    setOurMemoryIndex(ourMem);
+  }
+}
+
+/** Tests only: forget the built module, so the next use builds it again
+ * (inside whatever module walk is current). */
+export function resetRegexEngineModuleForTests(): void {
+  memo = null;
+}
+
+function buildModule(): RegexEngineModule {
   const mb = new ModuleBuilder();
   const strT = mb.arrayType("i16", true);
   const re = new RegexBuilder(mb, strT);

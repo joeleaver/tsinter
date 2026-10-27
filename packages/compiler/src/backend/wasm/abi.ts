@@ -1056,7 +1056,9 @@
  *     shape: a native host calls getrandom / arc4random_buf, a browser
  *     crypto.getRandomValues, an engine its OS RNG. Present only in modules
  *     that reach crypto.randomUUID or crypto.randomBytes (with or without
- *     the composed .toString). The module asks for at most 4096 bytes per
+ *     the composed .toString), and in modules that carry the island engine
+ *     (its web globals' crypto.getRandomValues / randomUUID, phase 2 E2).
+ *     The module asks for at most 4096 bytes per
  *     call (inside getRandomValues' 65536-byte cap) and copies them out
  *     before anything else touches the staging region. It is NOT `seed`:
  *     that is one PRNG seed per instance that a host may make reproducible

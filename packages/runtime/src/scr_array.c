@@ -183,14 +183,10 @@ double scr_arr_len(ScrArr *a) { return (double)a->len; }
  * The JS fold exactly (ECMA Math.max/min applied to the elements): any
  * NaN poisons the result, +0 beats -0 for max (the reverse for min), and
  * the empty array yields the zero-argument constants. Borrows the array. */
-/* The NaN V8's Float64Min/Float64Max answer for any NaN operand: the one
- * the machine's invalid operation produces (0xfff8000000000000 on x86-64,
- * measured -- whatever the operands' payloads), computed at run time so it
- * is the machine's, not a folded constant. */
-double scr_math_minmax_nan(void) {
-  volatile double z = 0.0;
-  return z / z;
-}
+/* scr_math_minmax_nan, the NaN V8's Float64Min/Max answer: scr_jsmath.h's
+ * (shared with the wasm engine). */
+#define SCR_JSMATH_NAN
+#include "scr_jsmath.h"
 
 double scr_math_max_arr(ScrArr *a) {
   double best = -INFINITY;

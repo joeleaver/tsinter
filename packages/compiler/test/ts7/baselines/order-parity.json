@@ -5705,6 +5705,24 @@
    ],
    "diags": []
   },
+  "<repo>/tests/corpus/2765-module-tdz/main.ts": {
+   "order": [
+    "<repo>/tests/corpus/2765-module-tdz/early.ts",
+    "<repo>/tests/corpus/2765-module-tdz/pair-b.ts",
+    "<repo>/tests/corpus/2765-module-tdz/pair-a.ts",
+    "<repo>/tests/corpus/2765-module-tdz/ring-b.ts",
+    "<repo>/tests/corpus/2765-module-tdz/ring-a.ts",
+    "<repo>/tests/corpus/2765-module-tdz/tla.ts",
+    "<repo>/tests/corpus/2765-module-tdz/main.ts"
+   ],
+   "diags": []
+  },
+  "<repo>/tests/corpus/2771-date-local-zones.ts": {
+   "order": [
+    "<repo>/tests/corpus/2771-date-local-zones.ts"
+   ],
+   "diags": []
+  },
   "<repo>/tests/corpus/2781-island-binary-toprimitive.ts": {
    "order": [
     "<repo>/tests/corpus/2781-island-binary-toprimitive.ts"
@@ -7972,6 +7990,12 @@
    ],
    "diags": []
   },
+  "<repo>/tests/fixtures/npm/cases/console-npm/main.ts": {
+   "order": [
+    "<repo>/tests/fixtures/npm/cases/console-npm/main.ts"
+   ],
+   "diags": []
+  },
   "<repo>/tests/fixtures/npm/cases/create-require/main.ts": {
    "order": [
     "<repo>/tests/fixtures/npm/cases/create-require/main.ts"
@@ -8363,18 +8387,6 @@
   "<repo>/tests/fixtures/node-types/stream-capture.ts": {
    "order": [
     "<repo>/tests/fixtures/node-types/stream-capture.ts"
-   ],
-   "diags": []
-  },
-  "<repo>/tests/corpus/2765-module-tdz/main.ts": {
-   "order": [
-    "<repo>/tests/corpus/2765-module-tdz/early.ts",
-    "<repo>/tests/corpus/2765-module-tdz/pair-b.ts",
-    "<repo>/tests/corpus/2765-module-tdz/pair-a.ts",
-    "<repo>/tests/corpus/2765-module-tdz/ring-b.ts",
-    "<repo>/tests/corpus/2765-module-tdz/ring-a.ts",
-    "<repo>/tests/corpus/2765-module-tdz/tla.ts",
-    "<repo>/tests/corpus/2765-module-tdz/main.ts"
    ],
    "diags": []
   }

@@ -28,6 +28,9 @@ import { compile } from "../src/index.js";
 import { EngineFormatError, engineArtifactPath, engineFencedGlobals, loadEngine, parseEngine, setEngineArtifactPathForTests } from "../src/backend/wasm/engine.js";
 import { execFileSync } from "node:child_process";
 import { runWasm, runWasmToTrap } from "./wasm-host.js";
+import { resetRegexBuildtimeForTests } from "../src/backend/wasm/regex-buildtime.js";
+// @ts-expect-error -- a plain .mjs repo script, no declaration file
+import { renderWebPrelude } from "../../../scripts/gen-web-prelude.mjs";
 
 let scratch: string;
 beforeAll(async () => {
@@ -87,6 +90,8 @@ describe("E0: the engine artifact and the merger", () => {
     const img = loadEngine();
     expect(img.imports.map((i) => `${i.module}.${i.name}`).sort()).toEqual([
       "tsinter_engine.math_random",
+      "tsinter_engine.pow",
+      "tsinter_engine.random",
       "wasi_snapshot_preview1.clock_time_get",
       "wasi_snapshot_preview1.fd_close",
       "wasi_snapshot_preview1.fd_fdstat_get",
@@ -151,12 +156,14 @@ describe("E0: the engine artifact and the merger", () => {
     expect(countOf(bytes, 4)).toBe(1);
     const mod = new WebAssembly.Module(bytes);
     // The host contract is unchanged: the same import names a non-engine
-    // module of this shape would mint, plus the two clocks — no WASI.
+    // module of this shape would mint, plus the two clocks and the entropy
+    // read (the web prelude's crypto, E2) — no WASI.
     expect(WebAssembly.Module.imports(mod).map((i) => `${i.module}.${i.name}`)).toEqual([
       "tsinter.write",
       "tsinter.now",
       "tsinter.seed",
       "tsinter.wallClock",
+      "tsinter.random",
     ]);
     const exp = sections(bytes).find((s) => s.id === 7)!;
     const [n, first] = uleb(bytes, exp.start);
@@ -180,11 +187,14 @@ describe("E0: the engine artifact and the merger", () => {
     const withEngine = (await readFile(await build("size-engine", `console.log(__island_eval("'hello ' + 'world'"));`))).length;
     const without = (await readFile(await build("size-static", `console.log(String("hello ") + "world");`, false))).length;
     const cost = withEngine - without;
-    // Measured at this unit: the engine's code (506KB), data (107KB) and
-    // function names (31KB) plus the bridge. Bounds, not a pin: a vendor
-    // bump moves it.
-    expect(cost).toBeGreaterThan(550_000);
-    expect(cost).toBeLessThan(720_000);
+    // Measured at E1: the engine's code (506KB), data (107KB) and function
+    // names (31KB) plus the bridge, 665,633 bytes; E2's shared web prelude
+    // (its source text rides in the data) and the engine's Node Math
+    // (ieee754.cc, the shared ports, %w.jsPow) brought it to 751,908, and the review ports of
+    // Node's web classes to 841,906. Bounds,
+    // not a pin: a vendor bump moves it.
+    expect(cost).toBeGreaterThan(600_000);
+    expect(cost).toBeLessThan(860_000);
   });
 });
 
@@ -330,11 +340,11 @@ describe("E1: __island_eval through the engine", () => {
 
   test("eval source the compiler can see that references a fenced global refuses at build time, by name", async () => {
     const entry = join(scratch, "fence-static.ts");
-    await writeFile(entry, `console.log(__island_eval("new TextEncoder().encode('a').length"));\n`);
+    await writeFile(entry, `console.log(__island_eval("new WebSocket('ws://x').url"));\n`);
     const res = await compile(entry, { outPath: join(scratch, "fence-static.wasm"), outDir: scratch, backend: "wasm", dynamic: true });
     expect(res.ok).toBe(false);
     expect(res.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
-    expect(res.diagnostics[0]!.message).toContain("libCall:island.eval:engine-global:TextEncoder");
+    expect(res.diagnostics[0]!.message).toContain("libCall:island.eval:engine-global:WebSocket");
     // Identifier position only: inside a quoted string, a comment, after
     // `.` / `?.`, an object key, or as part of a longer word, a fenced name
     // does not refuse.
@@ -348,7 +358,11 @@ describe("E1: __island_eval through the engine", () => {
   test("the fence list is generated: engine-fence.json is exactly what the engine fences, every name a Node global it lacks", async () => {
     const fenced = [...engineFencedGlobals()];
     expect(fenced).toContain("Intl");
-    expect(fenced).toContain("console");
+    expect(fenced).toContain("setTimeout");
+    // The shared web prelude's globals are the engine's own now (E2).
+    for (const n of ["console", "TextEncoder", "TextDecoder", "URLSearchParams", "crypto", "structuredClone", "ReadableStream"]) {
+      expect(fenced).not.toContain(n);
+    }
     const bytes = readFileSync(engineArtifactPath());
     const box: { mem: WebAssembly.Memory | null } = { mem: null };
     const { instance } = await WebAssembly.instantiate(bytes, {
@@ -362,7 +376,7 @@ describe("E1: __island_eval through the engine", () => {
         fd_seek: () => 70,
         fd_write: () => 0,
       },
-      tsinter_engine: { math_random: () => 0.5 },
+      tsinter_engine: { math_random: () => 0.5, random: () => {}, pow: Math.pow },
     });
     box.mem = instance.exports["memory"] as WebAssembly.Memory;
     (instance.exports["_initialize"] as () => void)();
@@ -379,17 +393,17 @@ describe("E1: __island_eval through the engine", () => {
     const r = await run(
       "fences",
       [
-        `for (const name of ["console", "setTimeout", "TextEncoder", "URL", "process", "structuredClone", "Intl", "Atomics", "WebSocket", "CompressionStream"]) {`,
+        `for (const name of ["setTimeout", "clearInterval", "URL", "process", "fetch", "Intl", "Atomics", "WebSocket", "WritableStream", "CompressionStream"]) {`,
         `  try { console.log(__island_eval("typeof " + name)); } catch (e) { if (e instanceof Error) console.log(e.name, e.message); }`,
         `}`,
-        `const te = ["Text", "Encoder"].join("");`,
-        `console.log(__island_eval("globalThis." + te + " = 'mine'; " + te), __island_eval("typeof queueMicrotask"), __island_eval("typeof performance.now"));`,
+        `const ws = ["Web", "Socket"].join("");`,
+        `console.log(__island_eval("globalThis." + ws + " = 'mine'; " + ws), __island_eval("typeof queueMicrotask"), __island_eval("typeof performance.now"));`,
       ].join("\n"),
     );
     expect(r.exitCode).toBe(0);
     const fence = (n: string): string => `Error ${n} inside __island_eval is not supported yet on the wasm lane (SEMANTICS.md S103)\n`;
     expect(r.stdout).toBe(
-      ["console", "setTimeout", "TextEncoder", "URL", "process", "structuredClone", "Intl", "Atomics", "WebSocket", "CompressionStream"].map(fence).join("") +
+      ["setTimeout", "clearInterval", "URL", "process", "fetch", "Intl", "Atomics", "WebSocket", "WritableStream", "CompressionStream"].map(fence).join("") +
         "mine function function\n",
     );
   });
@@ -440,6 +454,15 @@ describe("E1: __island_eval through the engine", () => {
     expect(r.stdout).toBe(node);
   });
 
+  test("a regex literal whose build-time compiler is built mid-walk keeps the engine module's memory index (1206)", async () => {
+    // The build-time regex compiler is a separate ModuleBuilder, built on
+    // first use; building it inside an engine module's walk used to reset
+    // the walk's memory index to 0 ("%w.re.lit ... built for memory 0").
+    resetRegexBuildtimeForTests();
+    const r = await run("regex-mid-walk", `console.log("a-b".replace(/-/g, "+"), __island_eval("'x-y'.replace(/-/g, '+')"));`);
+    expect(r.stdout).toBe("a+b x+y\n");
+  });
+
   test("a broken engine artifact is an SC3002 diagnostic, not an exception out of compile()", async () => {
     const dir = join(scratch, "bad-engine");
     await mkdir(dir, { recursive: true });
@@ -461,6 +484,115 @@ describe("E1: __island_eval through the engine", () => {
   });
 });
 
+const PRELUDE_JS = join(dirname(engineArtifactPath()), "../../src/scr_web_prelude.js");
+const PRELUDE_H = join(dirname(engineArtifactPath()), "../../src/scr_web_prelude.h");
+
+describe("E2: the web globals are the native island's own text", () => {
+  test("scr_web_prelude.h is the generator's rendering of scr_web_prelude.js (a hand-edited header goes red here)", () => {
+    expect(readFileSync(PRELUDE_H, "utf8")).toBe(renderWebPrelude(readFileSync(PRELUDE_JS, "utf8")));
+  });
+
+  test("the engine artifact embeds scr_web_prelude.js byte for byte (a stale engine.wasm goes red here)", () => {
+    const text = readFileSync(PRELUDE_JS, "utf8");
+    expect(text.length).toBeGreaterThan(50_000);
+    const bytes = readFileSync(engineArtifactPath());
+    // NUL-terminated, as the C array lays it out.
+    expect(bytes.indexOf(Buffer.concat([Buffer.from(text, "utf8"), Buffer.from([0])]))).toBeGreaterThan(0);
+  });
+
+  test("console writes the same stdout and stderr as static output, in order, formatted like native (S108 (a))", async () => {
+    const r = await run(
+      "console-order",
+      [
+        `console.log("static 1");`,
+        `console.log(__island_eval("console.log('island', 1.5, -0, true, null, undefined, [1, [2]], { x: 1 }, 5n, Symbol('s')); console.info('i'); console.debug('d'); 'ret'"));`,
+        `console.error("static err");`,
+        `console.log(__island_eval("console.warn('w'); console.error('e', 2); console.log(); console.log('%s!', 'x'); 'ret2'"));`,
+        `console.log(__island_eval("console.log({ toString() { throw 1; } }); typeof console.dir"));`,
+        `console.log("static 2");`,
+      ].join("\n"),
+    );
+    expect(r.exitCode).toBe(0);
+    // Byte-identical to the c and llvm lanes (the same prelude); Node
+    // inspects objects instead (S108 (a)): "[ 1, [ 2 ] ] { x: 1 }" and
+    // "{ toString: [Function: toString] }". Primitives, %s and the rest are
+    // Node's (web-globals.test.ts holds them to Node live).
+    expect(r.stdout).toBe(
+      "static 1\nisland 1.5 -0 true null undefined 1,2 [object Object] 5n Symbol(s)\ni\nd\nret\n\nx!\nret2\n[value]\nfunction\nstatic 2\n",
+    );
+    expect(r.stderr).toBe("static err\nw\ne 2\n");
+  });
+
+  test("crypto reads the module's own `random` import: chunked past 4096 bytes, offset views, v4 UUIDs", async () => {
+    // A scripted entropy source: the byte stream 0, 1, 2, ... (mod 256)
+    // across calls, so chunking and the copy into the engine's memory are
+    // both visible.
+    let k = 0;
+    let mem: WebAssembly.Memory | null = null;
+    const path = await build(
+      "crypto-random",
+      [
+        `console.log(__island_eval("crypto.randomUUID()"));`,
+        `console.log(__island_eval("(() => { const a = crypto.getRandomValues(new Uint8Array(5000)); let ok = true; for (let i = 0; i < a.length; i++) if (a[i] !== (16 + i) % 256) ok = false; return ok + ' ' + a[4095] + ' ' + a[4096] + ' ' + a[4999]; })()"));`,
+        `console.log(__island_eval("(() => { const b = new Uint8Array(8); crypto.getRandomValues(new Uint8Array(b.buffer, 3, 2)); return b.join(','); })()"));`,
+        `console.log(__island_eval("(() => { try { crypto.getRandomValues(new Uint8Array(65537)); } catch (e) { return e.name + ': ' + e.message; } })()"));`,
+      ].join("\n"),
+    );
+    const r = await runWasm(path, {
+      imports: {
+        random(ptr: number, len: number): void {
+          const u8 = new Uint8Array(mem!.buffer, ptr, len);
+          for (let i = 0; i < len; i++) u8[i] = k++ % 256;
+        },
+      },
+      onInstance: (inst) => {
+        mem = inst.exports["memory"] as WebAssembly.Memory;
+      },
+    });
+    expect(r.exitCode).toBe(0);
+    // 16 + 5000 bytes drawn so far: the third eval's two bytes are
+    // (5016, 5017) mod 256 = 152, 153.
+    expect(String(r.stdout)).toBe(
+      "00010203-0405-4607-8809-0a0b0c0d0e0f\n" +
+        "true 15 16 151\n" +
+        "0,0,0,152,153,0,0,0\n" +
+        "QuotaExceededError: The requested length exceeds 65,536 bytes\n",
+    );
+  });
+
+  test("Date#toString carries Node's zone-name suffix (the engine's zone is UTC, S103 (e))", async () => {
+    const r = await run(
+      "date-suffix",
+      `console.log(__island_eval("new Date(0).toString() + ' | ' + new Date(86400000).toTimeString() + ' | ' + String(new Date(NaN))"));`,
+    );
+    // Node under TZ=UTC prints the same line.
+    expect(r.stdout).toBe("Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time) | 00:00:00 GMT+0000 (Coordinated Universal Time) | Invalid Date\n");
+  });
+
+  test("tier-only (S103 (b)): the timer globals stay fenced, and AbortSignal.timeout throws the same named error", async () => {
+    const r = await run(
+      "timer-fences",
+      [
+        `const st = ["set", "Timeout"].join("");`,
+        `try { __island_eval(st + "(() => {}, 1)"); } catch (e) { if (e instanceof Error) console.log(e.message); }`,
+        `try { __island_eval("AbortSignal.timeout(5)"); } catch (e) { if (e instanceof Error) console.log(e.message); }`,
+        `console.log(__island_eval("AbortSignal.abort().aborted + ' ' + AbortSignal.abort().reason.name + ' ' + new AbortController().signal.aborted"));`,
+      ].join("\n"),
+    );
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toBe(
+      "setTimeout inside __island_eval is not supported yet on the wasm lane (SEMANTICS.md S103)\n" +
+        "AbortSignal.timeout inside __island_eval is not supported yet on the wasm lane (SEMANTICS.md S103)\n" +
+        "true AbortError false\n",
+    );
+    const entry = join(scratch, "timer-static.ts");
+    await writeFile(entry, `console.log(__island_eval("setTimeout(() => {}, 0); 1"));\n`);
+    const res = await compile(entry, { outPath: join(scratch, "timer-static.wasm"), outDir: scratch, backend: "wasm", dynamic: true });
+    expect(res.ok).toBe(false);
+    expect(res.diagnostics[0]!.message).toContain("libCall:island.eval:engine-global:setTimeout");
+  });
+});
+
 describe("E1: the counting allocator (the engine's leak oracle)", () => {
   test("evals, throws and job drains return the engine's live allocations to their baseline", async () => {
     const bytes = readFileSync(engineArtifactPath());
@@ -475,7 +607,7 @@ describe("E1: the counting allocator (the engine's leak oracle)", () => {
       fd_seek: () => 0,
       fd_write: () => 0,
     };
-    const { instance } = await WebAssembly.instantiate(bytes, { wasi_snapshot_preview1: wasi, tsinter_engine: { math_random: () => 0.5 } });
+    const { instance } = await WebAssembly.instantiate(bytes, { wasi_snapshot_preview1: wasi, tsinter_engine: { math_random: () => 0.5, random: () => {}, pow: Math.pow } });
     const e = instance.exports as Record<string, (...a: number[]) => number>;
     const mem = instance.exports["memory"] as WebAssembly.Memory;
     memBox.mem = mem;
@@ -491,7 +623,20 @@ describe("E1: the counting allocator (the engine's leak oracle)", () => {
     };
     const body = (i: number): string =>
       `(function () { var o = { n: ${i}, tag: 'it' + ${i}, arr: [${i}, ${i} * 2] }; return o.tag + ':' + (o.n + o.arr[1]); })()`;
+    // E2: the shared web globals in the loop too (encoders, form encoding,
+    // base64, structuredClone, a promise job). Not streams: a stream and
+    // its controller form a reference cycle, freed only when the engine's
+    // cycle collector next runs (its own allocation threshold), so the live
+    // count after a stream eval depends on when that was (measured at E2:
+    // it oscillates between 282 and 373, unbounded growth absent, over
+    // 4,000 stream evals) — native's teardown audit is what proves
+    // streams leak-free.
+    const web = (i: number): string =>
+      `new TextDecoder().decode(new TextEncoder().encode('é${i}😀')) + new URLSearchParams('a=${i}&b=2').toString() + atob(btoa('x${i}')) + ` +
+      `JSON.stringify(structuredClone({ m: new Map([[${i}, [1]]]) }).m.size) + ` +
+      `(Promise.resolve(${i}).then((v) => v + 1), '')`;
     for (let i = 0; i < 5; i++) ev(body(i));
+    for (let i = 0; i < 5; i++) ev(web(i));
     ev("throw new TypeError('warm')");
     ev("Symbol('warm')");
     e["isl_drain_jobs"]!();
@@ -502,6 +647,8 @@ describe("E1: the counting allocator (the engine's leak oracle)", () => {
     for (let i = 0; i < 20; i++) expect(ev("Symbol('s')")).toBe(0);
     for (let i = 0; i < 20; i++) ev("Promise.resolve(1).then(x => x + 1); 'p'");
     expect(e["isl_drain_jobs"]!()).toBe(20);
+    for (let i = 0; i < 100; i++) expect(ev(web(i))).toBe(0);
+    expect(e["isl_drain_jobs"]!()).toBeGreaterThan(0);
     expect(e["isl_live_allocs"]!()).toBe(baseline);
   });
 });

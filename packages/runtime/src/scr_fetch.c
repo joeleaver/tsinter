@@ -958,8 +958,8 @@ static const char fx_glue[] =
     "        url = input.url;\n"
     "        method = input.method;\n"
     "        headers = new g.Headers(input.headers);\n"
-    "        body = input._body instanceof Uint8Array ? input._body : null;\n"
-    "        signal = input._signal;\n"
+    "        body = host.web.requestBody(input);\n"
+    "        signal = host.web.requestSignal(input);\n"
     "      } else {\n"
     "        url = String(input);\n"
     "      }\n"
@@ -986,7 +986,7 @@ static const char fx_glue[] =
     "        const r = new g.Request(base, reqInit);\n"
     "        method = r.method;\n"
     "        headers = r.headers;\n"
-    "        if (r._body instanceof Uint8Array) body = r._body;\n"
+    "        if (host.web.requestBody(r) !== null) body = host.web.requestBody(r);\n"
     "      }\n"
     "      if (body !== null && !(body instanceof Uint8Array)) {\n"
     "        throw new TypeError('streaming request bodies are not supported in the scriptc island');\n"
@@ -1039,7 +1039,7 @@ static const char fx_glue[] =
     "                cancel() { controller = null; finish(); host.abort(id); },\n"
     "              });\n"
     "            }\n"
-    "            resolve(g.__scr_mk_response(status, statusText, h, finalUrl, redirected, stream));\n"
+    "            resolve(host.web.mkResponse(status, statusText, h, finalUrl, redirected, stream));\n"
     "          },\n"
     "          onData(chunk) {\n"
     "            if (controller !== null) {\n"
@@ -1079,6 +1079,9 @@ static const char fx_glue[] =
 
 /* ── boot / teardown (registered with the island) ────────────────────── */
 
+/* scr_web.c: the web prelude's internals object (owned reference). */
+JSValue scr_island_web_internals(void *jsctx);
+
 static void fx_boot(void *jsctx) {
   JSContext *ctx = (JSContext *)jsctx;
   JSValue fn = JS_Eval(ctx, fx_glue, sizeof fx_glue - 1, "<scr-fetch>", JS_EVAL_TYPE_GLOBAL);
@@ -1089,6 +1092,8 @@ static void fx_boot(void *jsctx) {
   JSValue host = JS_NewObject(ctx);
   JS_SetPropertyStr(ctx, host, "start", JS_NewCFunction(ctx, fx_host_start, "start", 2));
   JS_SetPropertyStr(ctx, host, "abort", JS_NewCFunction(ctx, fx_host_abort, "abort", 1));
+  /* The web prelude's internals: mkResponse builds wire responses. */
+  JS_SetPropertyStr(ctx, host, "web", scr_island_web_internals(ctx));
   JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 1, (JSValueConst *)&host);
   JS_FreeValue(ctx, host);
   JS_FreeValue(ctx, fn);

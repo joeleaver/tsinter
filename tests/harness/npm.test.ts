@@ -179,3 +179,23 @@ describe(`npm differential (${cases.length} programs${sanitize ? ", sanitized" :
     }
   }, 120_000);
 });
+
+describe("the island console in an npm build (board #306)", () => {
+  // npm differential compares stdout; consolezoo also writes stderr
+  // (console.error inside a group, console.warn, console.assert) — held
+  // to Node byte for byte here.
+  test("console-npm: stderr matches Node too", async () => {
+    const entry = join(fixturesRoot, "npm/cases/console-npm/main.ts");
+    const binary = await build(entry);
+    const run = async (cmd: string, args: string[]): Promise<Buffer> => {
+      const pending = execFileAsync(cmd, args, { encoding: "buffer" });
+      pending.child.stdin?.end();
+      return (await pending).stderr;
+    };
+    // --no-warnings: the fixture case has no package.json "type" (Node's
+    // MODULE_TYPELESS_PACKAGE_JSON warning is not program output).
+    const [nodeErr, nativeErr] = await Promise.all([run("node", ["--no-warnings", entry]), run(binary, [])]);
+    expect(nativeErr.toString("utf8")).toBe(nodeErr.toString("utf8"));
+    expect(nativeErr.equals(nodeErr)).toBe(true);
+  }, 120_000);
+});
