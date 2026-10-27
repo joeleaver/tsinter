@@ -8351,20 +8351,30 @@ process does — and so, for S086, as Node does:
   process's own, passed as libuv passes it (S086 (j) does not apply); and
   children still running when the program ends are left running, as Node
   leaves them (S086 (i) does not apply). S086 (d)'s `"ignore"` half (the
-  lowering's), (e), (k) and (l) apply. A child's pipes are socketpairs, as
-  libuv's are.
+  lowering's), (e), (k) and (l) apply. In short: **S086 (a)–(c) and
+  (f)–(j) do not apply to this lane** (a deliberate choice: the real
+  descriptors are the more Node-exact host). A child's pipes are
+  socketpairs, as libuv's are.
 - the runner starts in well under a millisecond and reaches its first poll
   phase long before Node's module loader settles: a child's first output
   that Node sees in its first poll phase can arrive after this lane's
   (U3-ORD-01, measured).
 
 (g) **TLS is vendored mbedTLS 3.6** (the engine the c and llvm lanes use),
-where Node's is OpenSSL; S090 (b) applies. The host's default store — what
-CTX_ROOTS trusts and what `getCACertificates("system")` lists — is the
-system bundle (`SSL_CERT_FILE`, else `/etc/ssl/certs/ca-certificates.crt`,
-`/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/ca-bundle.pem`,
-`/etc/ssl/cert.pem`), not Node's bundled Mozilla roots; `"extra"` is
-`NODE_EXTRA_CA_CERTS`. A verdict is reported in OpenSSL's numbering: a
+where Node's is OpenSSL; S090 (b) applies. The trust stores are Node's
+(`wn_trust.c`), so wasm, wasm-native and Node trust exactly the same roots:
+the default store — what CTX_ROOTS trusts, and what fetch verifies against
+— is Node's bundled root set, the very bytes the module carries for
+`tls.rootCertificates` (`backend/wasm/tls-roots.ts`, compiled into the
+runner from that module), plus `NODE_EXTRA_CA_CERTS`'s certificates, plus
+the system store when Node would add it (`NODE_USE_SYSTEM_CA=1`, or
+`--use-system-ca` in `NODE_OPTIONS`); `getCACertificates("system")` lists
+the system bundle (`SSL_CERT_FILE`, else
+`/etc/ssl/certs/ca-certificates.crt`, `/etc/pki/tls/certs/ca-bundle.crt`,
+`/etc/ssl/ca-bundle.pem`, `/etc/ssl/cert.pem` — OpenSSL's default file;
+Node's OpenSSL also reads the hashed certificate directory, so a
+certificate only there is in Node's system store and not in this one), and
+`"extra"` is `NODE_EXTRA_CA_CERTS`. A verdict is reported in OpenSSL's numbering: a
 chain to no trusted root is 18 (a self-signed leaf alone), 19 (a
 self-signed certificate in the chain), 21 (a leaf alone) or 20, and a chain
 mbedTLS accepted at a trusted certificate that is not self-signed is 2
@@ -8396,8 +8406,8 @@ they came (undici decodes them); a host name holding a non-ASCII character
 is "Invalid URL" (no IDNA); a proxied `http:` request is an absolute-URI
 request (undici tunnels it with CONNECT; `https:` is tunnelled here too);
 undici's process warnings (a lowercase `patch`) are not printed; there is
-no connect timeout (undici's is 10 s); TLS verification uses (g)'s store and
-engine.
+no connect timeout (undici's is 10 s); TLS verification is (g)'s engine,
+over (g)'s default store (Node's).
 
 (i) **The translator trusts a valid module.** `wasm2c` assumes the
 module's types and stack discipline hold; the lane validates every module

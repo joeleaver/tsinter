@@ -38,6 +38,7 @@
 
 #include "wn_host.h"
 #include "wn_net.h"
+#include "wn_trust.h"
 
 enum { EV_DATA = 3, EV_EOF = 4, EV_READ_ERROR = 5, EV_SECURE = 10, EV_TLS_ERROR = 11 };
 
@@ -54,26 +55,7 @@ static void rng_init(void) {
   rng_ready = 1;
 }
 
-/* ── the host's default store: the system bundle (S117 (g)) ───────────────── */
-static const char *const BUNDLES[] = {
-    "/etc/ssl/certs/ca-certificates.crt", /* Debian/Ubuntu */
-    "/etc/pki/tls/certs/ca-bundle.crt",   /* Fedora/RHEL */
-    "/etc/ssl/ca-bundle.pem",             /* openSUSE */
-    "/etc/ssl/cert.pem",                  /* Alpine */
-};
-static mbedtls_x509_crt sys_roots;
-static int sys_loaded;
-static mbedtls_x509_crt *system_roots(void) {
-  if (!sys_loaded) {
-    sys_loaded = 1;
-    mbedtls_x509_crt_init(&sys_roots);
-    const char *env = getenv("SSL_CERT_FILE");
-    if (env && *env && mbedtls_x509_crt_parse_file(&sys_roots, env) >= 0) return &sys_roots;
-    for (size_t i = 0; i < sizeof BUNDLES / sizeof BUNDLES[0]; i++)
-      if (mbedtls_x509_crt_parse_file(&sys_roots, BUNDLES[i]) >= 0 && sys_roots.raw.p != NULL) break;
-  }
-  return &sys_roots;
-}
+/* the stores are Node's (wn_trust.c, SEMANTICS.md S117 (g)) */
 
 /* ── contexts ─────────────────────────────────────────────────────────── */
 typedef struct {
@@ -378,7 +360,7 @@ static int32_t secure(uint32_t ptr, int32_t h) {
     /* the verdict is recorded, never enforced (Node's verify callback
      * accepts; the module decides) */
     mbedtls_ssl_conf_authmode(&t->conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
-    if (c->roots) chain_add(&t->chain, system_roots());
+    if (c->roots) chain_add(&t->chain, wn_trust_default());
     if (c->has_ca) chain_add(&t->chain, &c->ca);
     mbedtls_ssl_conf_ca_chain(&t->conf, &t->chain, NULL);
     mbedtls_ssl_conf_verify(&t->conf, vrfy_cb, t);
@@ -400,11 +382,7 @@ static int32_t secure(uint32_t ptr, int32_t h) {
 static int32_t ca_store(uint32_t ptr, uint32_t cap, int32_t which) {
   mbedtls_x509_crt chain;
   mbedtls_x509_crt_init(&chain);
-  if (which == 1) chain_add(&chain, system_roots());
-  else {
-    const char *f = getenv("NODE_EXTRA_CA_CERTS");
-    if (f && *f) mbedtls_x509_crt_parse_file(&chain, f);
-  }
+  chain_add(&chain, which == 1 ? wn_trust_system() : wn_trust_extra());
   WnBuf b = {0};
   uint32_t count = 0;
   wn_buf_u32(&b, 0);

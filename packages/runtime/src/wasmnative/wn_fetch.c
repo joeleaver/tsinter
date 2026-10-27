@@ -55,6 +55,7 @@
 #include "zlib.h"
 
 #include "wn_host.h"
+#include "wn_trust.h"
 
 extern void (*wn_fetch_delivered)(const WnEv *e);
 
@@ -782,23 +783,6 @@ static int vrfy_cb(void *ctx, mbedtls_x509_crt *crt, int depth, uint32_t *flags)
   return 0;
 }
 
-static mbedtls_x509_crt roots;
-static int roots_loaded;
-static mbedtls_x509_crt *system_roots(void) {
-  static const char *const bundles[] = {"/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt", "/etc/ssl/ca-bundle.pem", "/etc/ssl/cert.pem"};
-  if (!roots_loaded) {
-    roots_loaded = 1;
-    mbedtls_x509_crt_init(&roots);
-    const char *env = getenv("SSL_CERT_FILE");
-    if (env && *env && mbedtls_x509_crt_parse_file(&roots, env) >= 0 && roots.raw.p) return &roots;
-    for (size_t i = 0; i < sizeof bundles / sizeof bundles[0]; i++)
-      if (mbedtls_x509_crt_parse_file(&roots, bundles[i]) >= 0 && roots.raw.p) break;
-    const char *extra = getenv("NODE_EXTRA_CA_CERTS");
-    if (extra && *extra) mbedtls_x509_crt_parse_file(&roots, extra);
-  }
-  return &roots;
-}
-
 /* a verdict as Node's TLS error: the OpenSSL text and code */
 static void tls_verdict_fail(Req *r) {
   uint32_t f = mbedtls_ssl_get_verify_result(&r->ssl);
@@ -1118,7 +1102,7 @@ static void tls_begin(Req *r) {
   mbedtls_ssl_config_defaults(&r->conf, MBEDTLS_SSL_IS_CLIENT, MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT);
   mbedtls_ssl_conf_rng(&r->conf, rng, NULL);
   mbedtls_ssl_conf_authmode(&r->conf, MBEDTLS_SSL_VERIFY_OPTIONAL);
-  mbedtls_ssl_conf_ca_chain(&r->conf, system_roots(), NULL);
+  mbedtls_ssl_conf_ca_chain(&r->conf, wn_trust_default(), NULL);
   mbedtls_ssl_conf_verify(&r->conf, vrfy_cb, r);
   mbedtls_ssl_setup(&r->ssl, &r->conf);
   /* SNI and the name check for a DNS name; an IP literal gets neither */
