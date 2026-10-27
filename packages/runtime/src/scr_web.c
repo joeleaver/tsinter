@@ -361,6 +361,52 @@ static JSValue web_host_proxy_target(JSContext *ctx, JSValueConst this_val, int 
   return JS_GetProxyTarget(ctx, argv[0]);
 }
 
+/* host.promiseState(p) -> [state, result] (0 pending / 1 fulfilled /
+ * 2 rejected; V8's Promise::PromiseState, which util.inspect prints) and
+ * host.proxyHandler(v): the inspector's two other internal-slot reads
+ * (getPromiseDetails, getProxyDetails). Peeking never marks a rejection
+ * handled. The same two live in wasm/isl_core.c. */
+static JSValue web_host_promise_state(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  (void)argc;
+  JSPromiseStateEnum st = JS_PromiseState(ctx, argv[0]);
+  if ((int)st < 0) return JS_UNDEFINED;
+  JSValue arr = JS_NewArray(ctx);
+  JS_SetPropertyUint32(ctx, arr, 0, JS_NewInt32(ctx, (int32_t)st));
+  JS_SetPropertyUint32(ctx, arr, 1, st == JS_PROMISE_PENDING ? JS_UNDEFINED : JS_PromiseResult(ctx, argv[0]));
+  return arr;
+}
+static JSValue web_host_proxy_handler(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  (void)argc;
+  return JS_GetProxyHandler(ctx, argv[0]);
+}
+
+/* host.classId(v): the engine's class of an object (0 for a primitive)
+ * — the inspector's brand for Map/Set iterators, arguments objects and
+ * module namespaces, which a program can neither fake nor observe being
+ * asked; host.moduleNamespaceClassId(): a module namespace's class,
+ * from the namespace of an empty module compiled (never run) here,
+ * since JavaScript cannot make one without a loader. The same two live in wasm/isl_core.c. */
+static JSValue web_host_class_id(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  (void)argc;
+  return JS_NewInt32(ctx, JS_IsObject(argv[0]) ? (int32_t)JS_GetClassID(argv[0]) : 0);
+}
+static JSValue web_host_module_ns_class_id(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  (void)argc;
+  (void)argv;
+  JSValue m = JS_Eval(ctx, "", 0, "<scr-module-ns>", JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+  if (JS_IsException(m)) return m;
+  JSValue ns = JS_GetModuleNamespace(ctx, (JSModuleDef *)JS_VALUE_GET_PTR(m));
+  JS_FreeValue(ctx, m);
+  if (JS_IsException(ns)) return ns;
+  int32_t id = (int32_t)JS_GetClassID(ns);
+  JS_FreeValue(ctx, ns);
+  return JS_NewInt32(ctx, id);
+}
+
 /* Valid while web_internals_ctx is non-NULL. */
 static JSValue web_internals;
 static JSContext *web_internals_ctx = NULL;
@@ -388,6 +434,11 @@ void scr_island_web_boot(void *jsctx) {
   JS_SetPropertyStr(ctx, host, "isPromise", JS_NewCFunction(ctx, web_host_is_promise, "isPromise", 1));
   JS_SetPropertyStr(ctx, host, "isProxy", JS_NewCFunction(ctx, web_host_is_proxy, "isProxy", 1));
   JS_SetPropertyStr(ctx, host, "proxyTarget", JS_NewCFunction(ctx, web_host_proxy_target, "proxyTarget", 1));
+  JS_SetPropertyStr(ctx, host, "proxyHandler", JS_NewCFunction(ctx, web_host_proxy_handler, "proxyHandler", 1));
+  JS_SetPropertyStr(ctx, host, "promiseState", JS_NewCFunction(ctx, web_host_promise_state, "promiseState", 1));
+  JS_SetPropertyStr(ctx, host, "classId", JS_NewCFunction(ctx, web_host_class_id, "classId", 1));
+  JS_SetPropertyStr(ctx, host, "moduleNamespaceClassId",
+                    JS_NewCFunction(ctx, web_host_module_ns_class_id, "moduleNamespaceClassId", 0));
   JSValue r = JS_Call(ctx, fn, JS_UNDEFINED, 1, (JSValueConst *)&host);
   JS_FreeValue(ctx, host);
   JS_FreeValue(ctx, fn);

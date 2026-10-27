@@ -45,7 +45,10 @@
 #include <unistd.h>
 
 #include "quickjs.h"
-#include "node_globals.h"
+/* Angle brackets: the build script generates the header into a temp dir
+ * ahead of the checked-in copy on the include path; a quoted include
+ * would find the checked-in copy beside this file first. */
+#include <node_globals.h>
 /* The web-platform globals — the SAME text the native island evaluates
  * (packages/runtime/src/scr_web_prelude.h; the build puts that directory
  * on the include path). */
@@ -324,48 +327,14 @@ static void isl_rejection_tracker(JSContext *ctx, JSValueConst promise, JSValueC
   isl_rejections_tail = &r->next;
 }
 
-/* Names Node's global scope has that this engine does not (yet): reading
- * one inside an island eval would silently answer `undefined` (or
- * `typeof x === "undefined"`) where Node answers a real object, so each
- * absent one becomes an accessor that throws a NAMED error instead —
- * SEMANTICS.md S103 (b). The candidate list is GENERATED: node_globals.h
- * holds every own property name of a fresh Node CommonJS global
- * (scripts/build-engine-wasm.mjs); the names the engine already has are
- * skipped. Assigning one replaces the fence with an ordinary global, so a
- * program that defines its own `console` keeps working.
- *
- * The locale-sensitive methods answer differently without Intl (the
- * engine has none: `1234567.891.toLocaleString()` is "1234567.891" where
- * Node prints "1,234,567.891"), so they throw the same named error
- * (S103 (b)); Array and TypedArray toLocaleString reach them through
- * their elements. The script answers the fenced global names (the build
- * script records them for the compiler's build-time fence). */
-static const char isl_fence_src[] =
-    "(() => {\n"
-    "  const g = globalThis;\n"
-    "  const msg = (n) => n + ' inside __island_eval is not supported yet on the wasm lane (SEMANTICS.md S103)';\n"
-    "  const fenced = [];\n"
-    "  for (const n of " ISL_NODE_GLOBALS ") {\n"
-    "    if (n in g) continue;\n"
-    "    fenced.push(n);\n"
-    "    Object.defineProperty(g, n, {\n"
-    "      configurable: true,\n"
-    "      enumerable: false,\n"
-    "      get() { throw new Error(msg(n)); },\n"
-    "      set(v) { Object.defineProperty(g, n, { value: v, writable: true, configurable: true, enumerable: true }); },\n"
-    "    });\n"
-    "  }\n"
-    "  const lf = (o, cls, k) => {\n"
-    "    const f = { [k]() { throw new Error(msg(cls + '.prototype.' + k)); } }[k];\n"
-    "    Object.defineProperty(f, 'length', { value: o[k].length });\n"
-    "    Object.defineProperty(o, k, { value: f, writable: true, configurable: true, enumerable: false });\n"
-    "  };\n"
-    "  lf(Number.prototype, 'Number', 'toLocaleString');\n"
-    "  lf(BigInt.prototype, 'BigInt', 'toLocaleString');\n"
-    "  for (const k of ['toLocaleString', 'toLocaleDateString', 'toLocaleTimeString']) lf(Date.prototype, 'Date', k);\n"
-    "  for (const k of ['localeCompare', 'toLocaleLowerCase', 'toLocaleUpperCase']) lf(String.prototype, 'String', k);\n"
-    "  return fenced.join(',');\n"
-    "})()";
+/* Names Node's global scope has that this engine does not (yet) are
+ * fenced by name, and so are the locale-sensitive methods — SEMANTICS.md
+ * S103 (b). The fence is the web prelude's own internals.fenceGlobals
+ * (scr_web_prelude.js: the SAME code the native lanes run), called last
+ * in isl_init with the GENERATED candidate list node_globals.h (every own
+ * property name of a fresh Node CommonJS global,
+ * scripts/build-engine-wasm.mjs); it answers the fenced global names,
+ * which the build script records for the compiler's build-time fence. */
 
 /* ── the web prelude's host object (native: scr_web.c) ──────────────
  * scr_web_prelude.h is shared verbatim; these are the wasm lane's
@@ -502,7 +471,7 @@ static JSValue isl_web_no_timer(JSContext *ctx, JSValueConst this_val, int argc,
   (void)this_val;
   (void)argc;
   (void)argv;
-  return JS_ThrowPlainError(ctx, "%s inside __island_eval is not supported yet on the wasm lane (SEMANTICS.md S103)",
+  return JS_ThrowPlainError(ctx, "%s inside the scriptc island is not supported yet on the wasm lane (SEMANTICS.md S103)",
                             magic == 0 ? "AbortSignal.timeout" : "setTimeout");
 }
 
@@ -523,6 +492,56 @@ static JSValue isl_web_proxy_target(JSContext *ctx, JSValueConst this_val, int a
   (void)argc;
   return JS_GetProxyTarget(ctx, argv[0]);
 }
+
+/* host.promiseState(p) -> [state, result] (0 pending / 1 fulfilled /
+ * 2 rejected; V8's Promise::PromiseState, which util.inspect prints) and
+ * host.proxyHandler(v): the inspector's two other internal-slot reads
+ * (getPromiseDetails, getProxyDetails). Peeking never marks a rejection
+ * handled. Native's (scr_web.c). */
+static JSValue isl_web_promise_state(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  (void)argc;
+  JSPromiseStateEnum st = JS_PromiseState(ctx, argv[0]);
+  if ((int)st < 0) return JS_UNDEFINED;
+  JSValue arr = JS_NewArray(ctx);
+  JS_SetPropertyUint32(ctx, arr, 0, JS_NewInt32(ctx, (int32_t)st));
+  JS_SetPropertyUint32(ctx, arr, 1, st == JS_PROMISE_PENDING ? JS_UNDEFINED : JS_PromiseResult(ctx, argv[0]));
+  return arr;
+}
+static JSValue isl_web_proxy_handler(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  (void)argc;
+  return JS_GetProxyHandler(ctx, argv[0]);
+}
+
+/* host.classId(v): the engine's class of an object (0 for a primitive)
+ * — the inspector's brand for Map/Set iterators, arguments objects and
+ * module namespaces, which a program can neither fake nor observe being
+ * asked; host.moduleNamespaceClassId(): a module namespace's class,
+ * from the namespace of an empty module compiled (never run) here,
+ * since JavaScript cannot make one without a loader. Native's (scr_web.c). */
+static JSValue isl_web_class_id(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  (void)argc;
+  return JS_NewInt32(ctx, JS_IsObject(argv[0]) ? (int32_t)JS_GetClassID(argv[0]) : 0);
+}
+static JSValue isl_web_module_ns_class_id(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+  (void)this_val;
+  (void)argc;
+  (void)argv;
+  JSValue m = JS_Eval(ctx, "", 0, "<scr-module-ns>", JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+  if (JS_IsException(m)) return m;
+  JSValue ns = JS_GetModuleNamespace(ctx, (JSModuleDef *)JS_VALUE_GET_PTR(m));
+  JS_FreeValue(ctx, m);
+  if (JS_IsException(ns)) return ns;
+  int32_t id = (int32_t)JS_GetClassID(ns);
+  JS_FreeValue(ctx, ns);
+  return JS_NewInt32(ctx, id);
+}
+
+/* The prelude's internals object (never freed: the engine lives as long
+ * as the instance). */
+static JSValue isl_web_internals;
 
 /* Evaluates the shared prelude and calls it with the host object, then
  * removes the timer globals it defined, which this lane cannot serve (the
@@ -546,11 +565,16 @@ static int isl_web_boot(void) {
   JS_SetPropertyStr(isl_ctx, host, "isPromise", JS_NewCFunction(isl_ctx, isl_web_is_promise, "isPromise", 1));
   JS_SetPropertyStr(isl_ctx, host, "isProxy", JS_NewCFunction(isl_ctx, isl_web_is_proxy, "isProxy", 1));
   JS_SetPropertyStr(isl_ctx, host, "proxyTarget", JS_NewCFunction(isl_ctx, isl_web_proxy_target, "proxyTarget", 1));
+  JS_SetPropertyStr(isl_ctx, host, "proxyHandler", JS_NewCFunction(isl_ctx, isl_web_proxy_handler, "proxyHandler", 1));
+  JS_SetPropertyStr(isl_ctx, host, "promiseState", JS_NewCFunction(isl_ctx, isl_web_promise_state, "promiseState", 1));
+  JS_SetPropertyStr(isl_ctx, host, "classId", JS_NewCFunction(isl_ctx, isl_web_class_id, "classId", 1));
+  JS_SetPropertyStr(isl_ctx, host, "moduleNamespaceClassId",
+                    JS_NewCFunction(isl_ctx, isl_web_module_ns_class_id, "moduleNamespaceClassId", 0));
   JSValue r = JS_Call(isl_ctx, fn, JS_UNDEFINED, 1, (JSValueConst *)&host);
   JS_FreeValue(isl_ctx, host);
   JS_FreeValue(isl_ctx, fn);
   if (JS_IsException(r)) return -2;
-  JS_FreeValue(isl_ctx, r);
+  isl_web_internals = r; /* the prelude's internals: fenceGlobals, below */
   JSValue g = JS_GetGlobalObject(isl_ctx);
   static const char *const timers[] = {"setTimeout", "setInterval", "clearTimeout", "clearInterval"};
   int rc = 0;
@@ -589,7 +613,17 @@ static int isl_init(void) {
   /* The web globals next (as native boots them), so the fence below covers
    * only what is still missing. */
   if (isl_web_boot() != 0) return -5;
-  JSValue r = JS_Eval(isl_ctx, isl_fence_src, sizeof isl_fence_src - 1, "<scr-fence>", JS_EVAL_TYPE_GLOBAL);
+  JSValue list = JS_Eval(isl_ctx, ISL_NODE_GLOBALS, sizeof ISL_NODE_GLOBALS - 1, "<scr-fence>", JS_EVAL_TYPE_GLOBAL);
+  if (JS_IsException(list)) return -3;
+  JSValue en = JS_Eval(isl_ctx, ISL_NODE_GLOBALS_ENUMERABLE, sizeof ISL_NODE_GLOBALS_ENUMERABLE - 1, "<scr-fence>",
+                       JS_EVAL_TYPE_GLOBAL);
+  if (JS_IsException(en)) return -3;
+  JSValue fence = JS_GetPropertyStr(isl_ctx, isl_web_internals, "fenceGlobals");
+  JSValue args[2] = {list, en};
+  JSValue r = JS_Call(isl_ctx, fence, isl_web_internals, 2, args);
+  JS_FreeValue(isl_ctx, fence);
+  JS_FreeValue(isl_ctx, list);
+  JS_FreeValue(isl_ctx, en);
   if (JS_IsException(r)) return -3;
   const char *names = JS_ToCString(isl_ctx, r);
   JS_FreeValue(isl_ctx, r);
@@ -628,20 +662,22 @@ ISL_EXPORT("isl_eval16") int isl_eval16(const uint16_t *p, int n) {
   /* An INDIRECT eval — `(0, eval)(code)`, the corpus oracle's own shim
    * (tests/harness/island-shim.mjs) — not a script: `let`/`const` stay
    * local to the one eval while `var` and functions land on the global
-   * object, exactly as in Node. The global `eval` is looked up at every
-   * call, as the shim's is. */
-  JSValue g = JS_GetGlobalObject(isl_ctx);
-  JSValue ev = JS_GetPropertyStr(isl_ctx, g, "eval");
-  JS_FreeValue(isl_ctx, g);
-  if (JS_IsException(ev)) {
-    JS_FreeValue(isl_ctx, src);
-    return isl_bridge_exception();
-  }
-  isl_depth++;
-  JSValue r = JS_Call(isl_ctx, ev, JS_UNDEFINED, 1, (JSValueConst *)&src);
-  isl_depth--;
-  JS_FreeValue(isl_ctx, ev);
+   * object, exactly as in Node. Evaluated as the engine's own indirect
+   * eval does (its UTF-8 form, lone surrogates as the engine encodes
+   * them) but under the native lanes' file name `<island>` and without
+   * a frame for the `eval` builtin, so an island error's stack — which
+   * console.log prints — reads the same on every lane (SEMANTICS.md
+   * S114). */
+  size_t len;
+  const char *code = JS_ToCStringLen(isl_ctx, &len, src);
   JS_FreeValue(isl_ctx, src);
+  if (code == NULL) return isl_bridge_exception();
+  JSValue g = JS_GetGlobalObject(isl_ctx);
+  isl_depth++;
+  JSValue r = JS_EvalThis(isl_ctx, g, code, len, "<island>", JS_EVAL_TYPE_INDIRECT);
+  isl_depth--;
+  JS_FreeValue(isl_ctx, g);
+  JS_FreeCString(isl_ctx, code);
   if (JS_IsException(r)) return isl_bridge_exception();
   int kind;
   if (JS_IsNumber(r)) {

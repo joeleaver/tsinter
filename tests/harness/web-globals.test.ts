@@ -13,9 +13,8 @@
  * scr_web_prelude.h) evaluated by the native island AND by the WasmGC
  * tier's engine, so every row runs on both lanes (the wasm arm in the
  * plain lane only — sanitizing is a native concept) and must print the
- * same thing. The one row that differs states why: the globals neither
- * lane has (WritableStream, FormData, WebSocket) are silently absent on
- * native and a named build-time fence on wasm (SEMANTICS.md S103 (b)).
+ * same thing. The globals neither lane has (WritableStream, FormData,
+ * WebSocket) are a named fence on both (SEMANTICS.md S103 (b)).
  */
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -119,14 +118,15 @@ describe(`island web globals (scriptc-only, ${lane}${sanitize ? ", sanitized" : 
     // Event and buffer.Blob at LOAD); structuredClone joined with the
     // globals lane (the HTML StructuredSerialize subset, cycles
     // included); WritableStream/FormData/WebSocket are in neither lane:
-    // absent on native, a named fence on wasm (their names are spelled
-    // by concatenation so the wasm build-time fence lets the row build).
+    // a named fence on both (SEMANTICS.md S103 (b); their names are
+    // spelled by concatenation so the wasm build-time fence lets the row
+    // build).
     expect(out).toBe(
       "function function function function function function " +
         "function function function object object " +
         "function function function function function " +
         "function function function function function function function " +
-        (lane === "native" ? "undefined undefined undefined" : "fenced fenced fenced"),
+        "fenced fenced fenced",
     );
   });
 
@@ -564,16 +564,35 @@ describe(`island web globals (scriptc-only, ${lane}${sanitize ? ", sanitized" : 
     expect(r.stderr).toBe(node.stderr);
   });
 
-  test("console methods that need util.inspect or the wall clock are fenced by name (S108 (a))", async () => {
+  test("console methods that need the wall clock, V8's stack or Node's classes are fenced by name (S108 (a))", async () => {
     const out = await islandEval(
       lane,
       "web-console-fences",
-      `(() => { const grab = (f) => { try { f(); return 'no-throw'; } catch (e) { return e.message; } }; return ['dir', 'dirxml', 'table', 'time', 'timeEnd', 'timeLog', 'trace', 'Console', 'context', 'createTask'].map((k) => grab(() => console[k]('x'))).concat([grab(() => console.countReset('never'))]).join(' | '); })()`,
+      `(() => { const grab = (f) => { try { f(); return 'no-throw'; } catch (e) { return e.message; } }; return ['time', 'timeEnd', 'timeLog', 'trace', 'Console', 'context', 'createTask'].map((k) => grab(() => console[k]('x'))).concat([grab(() => console.countReset('never'))]).join(' | '); })()`,
     );
-    const fence = (k: string): string => `console.${k} inside the scriptc island is not supported yet (it needs util.inspect or the wall clock)`;
+    const fence = (k: string): string => `console.${k} inside the scriptc island is not supported yet (SEMANTICS.md S108)`;
     expect(out).toBe(
-      [...["dir", "dirxml", "table", "time", "timeEnd", "timeLog", "trace", "Console", "context", "createTask"].map(fence), fence("countReset (of a label never counted)")].join(" | "),
+      [...["time", "timeEnd", "timeLog", "trace", "Console", "context", "createTask"].map(fence), fence("countReset (of a label never counted)")].join(" | "),
     );
+  });
+
+  test("the island's performance.now() reads the static side's clock origin (S108 (m))", async () => {
+    // Before: the engine's own performance counted from the engine
+    // context's creation, so an island reading taken after a static one
+    // came out SMALLER (the engine boots after the program starts).
+    const r = await compileAndRun(
+      lane,
+      "web-perf-origin",
+      [
+        `let s = 0; for (let i = 0; i < 2000000; i++) s += i;`,
+        `const a = performance.now();`,
+        `const b = Number(__island_eval("performance.now()"));`,
+        `const c = performance.now();`,
+        `console.log(a <= b && b <= c, s > 0, __island_eval("typeof performance.timeOrigin + ' ' + Object.keys(performance).length"));`,
+      ].join("\n"),
+    );
+    expect(r.stderr).toBe("");
+    expect(r.stdout).toBe("true true number 0\n");
   });
 
   test("crypto bridges the runtime's CSPRNG: v4 UUIDs, real fills, spec limits", async () => {

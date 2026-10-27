@@ -209,11 +209,12 @@ describe("E0: the engine artifact and the merger", () => {
     // Measured at E1: the engine's code (506KB), data (107KB) and function
     // names (31KB) plus the bridge, 665,633 bytes; E2's shared web prelude
     // (its source text rides in the data) and the engine's Node Math
-    // (ieee754.cc, the shared ports, %w.jsPow) brought it to 751,908, and the review ports of
-    // Node's web classes to 841,906. Bounds,
-    // not a pin: a vendor bump moves it.
+    // (ieee754.cc, the shared ports, %w.jsPow) brought it to 751,908, the review ports of
+    // Node's web classes to 841,906, and Node's util.inspect (S114; its
+    // text and the string-width table ride in the data) to 938,948.
+    // Bounds, not a pin: a vendor bump moves it.
     expect(cost).toBeGreaterThan(600_000);
-    expect(cost).toBeLessThan(860_000);
+    expect(cost).toBeLessThan(960_000);
   });
 });
 
@@ -422,7 +423,7 @@ describe("E1: __island_eval through the engine", () => {
       ].join("\n"),
     );
     expect(r.exitCode).toBe(0);
-    const fence = (n: string): string => `Error ${n} inside __island_eval is not supported yet on the wasm lane (SEMANTICS.md S103)\n`;
+    const fence = (n: string): string => `Error ${n} inside the scriptc island is not supported yet (SEMANTICS.md S103)\n`;
     expect(r.stdout).toBe(
       ["setTimeout", "clearInterval", "URL", "process", "fetch", "Intl", "Atomics", "WebSocket", "WritableStream", "CompressionStream"].map(fence).join("") +
         "mine function function\n",
@@ -534,12 +535,11 @@ describe("E2: the web globals are the native island's own text", () => {
       ].join("\n"),
     );
     expect(r.exitCode).toBe(0);
-    // Byte-identical to the c and llvm lanes (the same prelude); Node
-    // inspects objects instead (S108 (a)): "[ 1, [ 2 ] ] { x: 1 }" and
-    // "{ toString: [Function: toString] }". Primitives, %s and the rest are
-    // Node's (web-globals.test.ts holds them to Node live).
+    // Byte-identical to the c and llvm lanes and to Node (the same
+    // prelude, Node's util.inspect: S108 (a); island-inspect.test.ts holds
+    // the inspector to Node live).
     expect(r.stdout).toBe(
-      "static 1\nisland 1.5 -0 true null undefined 1,2 [object Object] 5n Symbol(s)\ni\nd\nret\n\nx!\nret2\n[value]\nfunction\nstatic 2\n",
+      "static 1\nisland 1.5 -0 true null undefined [ 1, [ 2 ] ] { x: 1 } 5n Symbol(s)\ni\nd\nret\n\nx!\nret2\n{ toString: [Function: toString] }\nfunction\nstatic 2\n",
     );
     expect(r.stderr).toBe("static err\nw\ne 2\n");
   });
@@ -608,8 +608,8 @@ describe("E2: the web globals are the native island's own text", () => {
     );
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toBe(
-      "setTimeout inside __island_eval is not supported yet on the wasm lane (SEMANTICS.md S103)\n" +
-        "AbortSignal.timeout inside __island_eval is not supported yet on the wasm lane (SEMANTICS.md S103)\n" +
+      "setTimeout inside the scriptc island is not supported yet (SEMANTICS.md S103)\n" +
+        "AbortSignal.timeout inside the scriptc island is not supported yet on the wasm lane (SEMANTICS.md S103)\n" +
         "true AbortError false\n",
     );
     const entry = join(scratch, "timer-static.ts");

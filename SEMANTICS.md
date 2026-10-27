@@ -7069,7 +7069,7 @@ witness per fence key, and the syntax errors a fence must not hide),
 corpus 2448 and 2748 on the wasm census. Measured against Node
 v24.18.1.
 
-## S103 — `__island_eval` on the wasm lane runs in the embedded engine: its recursion depth is about a tenth of Node's and some deep engine recursion overflows the host stack uncatchably, Node globals and locale methods it lacks are fenced by name, its jobs run at the checkpoint instead of in Node's microtask queue, its error messages and some limits are QuickJS's, its local time is the host's (S113; once UTC), its NaNs are canonical and its `**` operator is musl's pow, an error crossing out keeps name, message and a string code only, and a rejection with an 'unhandledRejection' listener is fenced *(wasm lane; (c) and (d) are shared with the native lanes)*
+## S103 — `__island_eval` on the wasm lane runs in the embedded engine: its recursion depth is about a tenth of Node's and some deep engine recursion overflows the host stack uncatchably, Node globals and locale methods it lacks are fenced by name, its jobs run at the checkpoint instead of in Node's microtask queue, its error messages and some limits are QuickJS's, its local time is the host's (S113; once UTC), its NaNs are canonical and its `**` operator is musl's pow, an error crossing out keeps name, message and a string code only, a rejection with an 'unhandledRejection' listener is fenced, and replacing `globalThis.eval` does not change what `__island_eval` runs *(wasm lane; (b), (c), (d) and (i) are shared with the native lanes)*
 
 A module that reaches `__island_eval` carries the quickjs-ng engine the native
 lanes embed, at the same pin, compiled to wasm32 with wasi-libc
@@ -7083,7 +7083,9 @@ module keeps one memory and is byte-identical to a build without engine
 support. The engine evaluates the source as an indirect eval — `(0,
 eval)(code)`, the corpus oracle's own shim (`tests/harness/island-shim.mjs`):
 `let`/`const` stay local to one eval, `var` and functions land on the global
-object, and globals persist for the whole run. The answer is
+object, and globals persist for the whole run. It is the engine's own
+indirect eval entered directly ((i)), under the native lanes' file name
+`<island>`, so an engine stack reads the same on every lane (S114). The answer is
 `String(result)` (a symbol renders `Symbol(desc)`), numbers formatted by the
 tier's own formatter. The engine's `Math.random` is the module's own
 generator (S068), so static and island draws share one sequence, as in Node.
@@ -7116,34 +7118,54 @@ except:
   different subset of these shapes and smaller budgets halve the depth. The
   native lanes budget 128 KiB on a fiber and 4 MiB on the main stack.
 - **(b) Node globals and locale methods the engine does not have are
-  fenced.** Every own property name of Node's global object (generated from
-  Node v24.18.1 into `packages/runtime/src/wasm/node_globals.h` by the build
-  script) that the engine lacks is an accessor that throws a catchable
-  `Error` whose message is `<name> inside __island_eval is not supported yet
-  on the wasm lane (SEMANTICS.md S103)` — `typeof` included — where Node
-  answers its object: 43 names, recorded in
+  fenced — on every lane.** Every own property name of Node's global
+  object (generated from Node v24.18.1 into
+  `packages/runtime/src/wasm/node_globals.h` by the build script) that the
+  island still lacks once it has booted is an accessor that throws a
+  catchable `Error` whose message is `<name> inside the scriptc island is
+  not supported yet (SEMANTICS.md S103)` — `typeof` included — where Node
+  answers its object. The fence is ONE piece of the shared web prelude
+  (`internals.fenceGlobals` in `scr_web_prelude.js`), which each lane
+  calls last at boot with the same generated list: the wasm engine in
+  `isl_core.c`, the c and llvm lanes' island in `scr_island.c` after
+  every boot script of the build (the npm bootstrap, the fetch glue) has
+  defined what it carries. So the fenced set is what that build lacks: on
+  the wasm lane 43 names, recorded in
   `vendor/quickjs-ng-wasm/engine-fence.json` (among them `setTimeout`,
   `setInterval`, `clearTimeout`, `clearInterval`, `URL`, `Intl`, `Atomics`,
   `WebSocket`, `WritableStream`, `FormData`, `process`, `Buffer`, `fetch`,
-  and the performance classes). The engine boots the native island's own
-  web-platform globals first (S108: `console`, `TextEncoder`,
+  and the performance classes); in a plain native `__island_eval` program
+  the same list less the four timers and `Atomics`, which the native
+  engine has (38 names, measured); fewer in a build that carries more
+  (`process`, `Buffer`, `global`, `setImmediate` in npm-importing
+  programs, `fetch` in fetch-using ones). `URL`, which the native lanes
+  install lazily (when an npm package or a URL value first reaches the
+  island), replaces its fence when it is installed. The island boots its
+  own web-platform globals first (S108: `console`, `TextEncoder`,
   `TextDecoder`, `URLSearchParams`, `btoa`/`atob`, the streams, `crypto`
-  `Crypto` and `SubtleCrypto`, `structuredClone`, the event, abort, fetch-value and message
-  classes; 67 fenced names before phase 2 E2), so only what neither has is fenced. The
-  four timer functions are the exception: the shared text defines them, but
-  this lane has no bridge from the engine onto the module's timers yet, so
-  they are removed again and fenced like the rest, and
-  `AbortSignal.timeout` — the other timer user — throws the same named
-  error (`AbortSignal.timeout inside __island_eval ...`). Its `crypto`
-  draws from the module's `random` import (abi.ts), which every
-  engine-carrying module now imports. Assigning one replaces the fence with an
-  ordinary global. Without `Intl` the engine's locale-sensitive methods
+  `Crypto` and `SubtleCrypto`, `structuredClone`, `performance`, the
+  event, abort, fetch-value and message classes; 67 fenced names before
+  phase 2 E2), so only what neither has is fenced. On the wasm lane the
+  four timer functions are the exception: the shared text defines them,
+  but this lane has no bridge from the engine onto the module's timers
+  yet, so they are removed again and fenced like the rest, and
+  `AbortSignal.timeout` — the other timer user — throws a named error
+  (`AbortSignal.timeout inside the scriptc island is not supported yet on
+  the wasm lane (SEMANTICS.md S103)`). Its `crypto` draws from the
+  module's `random` import (abi.ts), which every engine-carrying module
+  now imports. Assigning a fenced global replaces the fence with an
+  ordinary global of Node's enumerability for that name (the build script
+  records Node's enumerable global names beside the list). Without `Intl` the engine's locale-sensitive methods
   answer differently from Node (`(1234567.891).toLocaleString()` is
-  `1234567.891`, Node prints `1,234,567.891`), so `Number`, `BigInt` and
-  `Date` `toLocaleString`, `Date` `toLocaleDateString` and
-  `toLocaleTimeString`, and `String` `localeCompare`, `toLocaleLowerCase` and
-  `toLocaleUpperCase` throw the same named error (message
-  `<Class>.prototype.<method> inside __island_eval ...`); array and typed-array
+  `1234567.891`, Node prints `1,234,567.891`; the native engine's
+  `'a'.localeCompare('B')` compares code points where Node's ICU
+  collates, and the wasm engine had no `localeCompare` at all, board
+  #309), so on every lane `Number`, `BigInt` and `Date`
+  `toLocaleString`, `Date` `toLocaleDateString` and
+  `toLocaleTimeString`, and `String` `localeCompare`, `toLocaleLowerCase`
+  and `toLocaleUpperCase` throw the same named error (message
+  `<Class>.prototype.<method> inside the scriptc island ...`, each with
+  Node's `length`); array and typed-array
   `toLocaleString` reach them through their elements. Where the compiler can
   see the eval's source — a string literal in the argument that references
   a fenced global in identifier position (not inside a quoted string, a
@@ -7217,6 +7239,12 @@ except:
   `String()` — the string `Symbol(desc)` — where Node's catch sees the
   symbol itself (native: the string `Error: unrepresentable island
   exception`).
+- **(i) `__island_eval` is not `globalThis.eval`.** The oracle's shim calls
+  whatever `globalThis.eval` is at that moment; the island enters its
+  engine directly — the wasm lane the engine's own indirect eval, the
+  native lanes a global script (`JS_Eval`) — so a program that replaces
+  `globalThis.eval` (inside an eval: `globalThis.eval = (s) => 'mine'`)
+  changes what later evals run in Node and not on any lane here.
 
 The engine's heap is never torn down; its counting allocator returns to the
 same live count after any number of evals, throws and job drains (the unit
@@ -7228,7 +7256,9 @@ added 176,273 of them — S108's shared web globals and (f)'s Math).
 **Tested by:** `packages/compiler/test/wasm-island-engine.test.ts` — (a)
 the catchable overflow with 2,000 static frames below it and a host
 overflow, (b) the global and locale fences, the generated lists' agreement
-and the build-time refusal, (c) job timing against timers, (d) and (e) the
+and the build-time refusal (and `tests/harness/island-inspect.test.ts`'s
+fence row: the same messages on the c, llvm and wasm lanes, a replaced
+fence; `web-globals.test.ts`'s presence row on both lanes), (c) job timing against timers, (d) and (e) the
 texts and the zone, (g) the rejection line and the listener fence, (h) the
 carried code and the lost properties, the shared Math.random sequence, plus
 the leak oracle, the artifact's format check, its SC3002 diagnostic and the
@@ -7415,7 +7445,7 @@ hand: the max of the two offsets turned into a min (static rows red, wasm includ
 rounded to minutes and the name table's daylight column ignored (engine rows red), the `posix/` strip
 dropped (the `posix/` and `right/` rows red).
 
-## S108 — The island's web-platform globals are one shared set of ports of Node's own classes on every lane; what parts from Node: `console` cannot inspect an object in a plain `--dynamic` build and fences the inspection and wall-clock methods, `TextDecoder` decodes UTF-8 only, the streams are a subset whose promise jobs interleave differently, MessagePort delivery and WebCrypto are fenced, Node globals outside the set are absent on the native lanes, the wasm engine's zone is UTC, a throwing event listener is reported later, and the engine's own builtins differ where listed *(every lane: the c and llvm lanes' island and the wasm lane's engine)*
+## S108 — The island's web-platform globals are one shared set of ports of Node's own classes on every lane; what parts from Node: `console` prints through Node's own util.inspect (S114's residue aside) and fences the wall-clock and V8-stack methods, `TextDecoder` decodes UTF-8 only, the streams are a subset whose promise jobs interleave differently, MessagePort delivery and WebCrypto are fenced, Node globals outside the set are fenced by name on every lane, `performance` carries `now` and `timeOrigin` only, a throwing event listener is reported later, and the engine's own builtins differ where listed *(every lane: the c and llvm lanes' island and the wasm lane's engine)*
 
 The globals island code sees beyond the engine's own builtins — `console`,
 `TextEncoder`, `TextDecoder`, `TextDecoderStream`, `URLSearchParams`,
@@ -7447,43 +7477,48 @@ shapes are Node's, except where (c), (h) and (k) say otherwise;
 the native and the wasm lane, and corpus 1120 runs the encoders under both.
 Where the island parts from Node, measured against Node v24.18.1:
 
-- **(a) `console` cannot inspect in a plain build.** There is ONE console
-  on every island build: `log`/`info`/`debug` (stdout) and `warn`/`error`
-  (stderr) are Node's `formatWithOptions` branch for branch — every
-  specifier (`%d`/`%i`/`%f` run `Number`/`parseInt`/`parseFloat` over
-  objects too, `%s` takes `String()` of an object with its own `toString`,
-  `%j` prints `[Circular]`), `-0`, bigints, symbols, quoted strings — and
+- **(a) `console` is Node's, over Node's util.inspect.** There is ONE
+  console on every island build and lane: `log`/`info`/`debug`/`dirxml`
+  (stdout) and `warn`/`error` (stderr) are Node's `formatWithOptions`
+  branch for branch — every specifier (`%d`/`%i`/`%f` run
+  `Number`/`parseInt`/`parseFloat` over objects too, `%s` takes `String()`
+  of an object with its own `toString`, `%j` prints `[Circular]`) — and
   `group`/`groupCollapsed`/`groupEnd`, `count`, `countReset`, `assert`,
   `clear`, `profile`, `profileEnd` and `timeStamp` are Node's; writes go to
   the stream static output uses, in order with it, lone surrogates as
-  U+FFFD. Where Node would call `util.inspect` (an object or a function
-  as a plain argument, `%o`/`%O`, `%s` with an object whose `toString` is
-  a builtin), a plain `--dynamic` build has none and prints `String()` —
-  `console.log([1, [2]], { x: 1 })` prints `1,2 [object Object]` where
-  Node prints `[ 1, [ 2 ] ] { x: 1 }`, and an argument whose `String()`
-  throws prints `[value]` — while a build that embeds npm packages lends
-  the console its bootstrap's `util.inspect` port (the npm differential
-  holds it to Node). The methods that are nothing but inspection or
-  wall-clock time — `dir`, `dirxml`, `table`, `time`, `timeEnd`, `timeLog`,
-  `trace` (Node prints a V8 stack), `Console`, `context`, `createTask` —
-  and `countReset` of a label never counted (Node reports it through a
-  process warning) throw a named `Error` (`console.<name> inside the
-  scriptc island is not supported yet (it needs util.inspect or the wall
-  clock)`), on every build. The bootstrap's `util.inspect` does not honour
-  `showHidden` or `showProxy`, so in an npm build `%o` prints what `%O`
-  would at depth 4 — `console.log('%o', [])` prints `[]` where Node prints
-  `[ [length]: 0 ]`, a function without its `[length]`/`[name]`/
-  `[prototype]` members, a proxy as its target — and an error prints its
-  own `name: message` line followed by the engine's frames ((i)). Error
-  messages Node builds with `util.inspect` of an object (webidl's
-  `Expected eventInitDict.source ("{}") …`, `ERR_ARG_NOT_ITERABLE`'s
-  `{} must be iterable`) quote it as `[object Object]` in a plain build.
+  U+FFFD. Where Node calls `util.inspect` (an object or a function as a
+  plain argument, `%o`/`%O`, `%s` with an object whose `toString` is a
+  builtin, `console.dir`, `console.table`), the island calls Node's own
+  `lib/internal/util/inspect.js`, ported function for function into the
+  shared prelude (with `cli_table.js` for `table`) — every option
+  (`depth`, `showHidden`, `showProxy`, `colors`, `compact`,
+  `breakLength`, `sorted`, `getters`, `maxArrayLength`,
+  `maxStringLength`, `numericSeparator`, `customInspect` and the
+  `util.inspect.custom` hook), class instances, null prototypes,
+  accessors, symbols, circular references, holes, truncation and line
+  breaking, Maps, Sets, typed arrays, buffers, dates, regexps, errors
+  with their causes, boxed primitives, functions and classes, proxies,
+  promises and weak collections — with what parts from Node registered in
+  S114. `%s` of a builtin or bound function prints its
+  `Function.prototype.toString`, which is QuickJS's three-line native form
+  (`function max() {⏎    [native code]⏎}`; V8's is one line — (j)). The same inspector is `util.inspect`/`util.format`/
+  `util.formatWithOptions`/`util.stripVTControlCharacters` in an npm
+  build's `node:util` (the bootstrap's own port is gone), and quotes the
+  values in the error messages Node builds with it (webidl's `Expected
+  eventInitDict.source ("{}") …`, `ERR_ARG_NOT_ITERABLE`'s `{} must be
+  iterable`, `ERR_INVALID_ARG_TYPE`'s `Received …`). The console never
+  colors (Node colors a TTY; S114). The methods that are nothing but
+  wall-clock time, V8's stack or Node's classes — `time`, `timeEnd`,
+  `timeLog`, `trace` (Node prints a V8 stack), `Console`, `context`,
+  `createTask` — and `countReset` of a label never counted (Node reports
+  it through a process warning) throw a named `Error` (`console.<name>
+  inside the scriptc island is not supported yet (SEMANTICS.md S108)`).
 - **(b) `TextDecoder` decodes UTF-8 only.** Node's six UTF-8 labels decode;
   every other label in Node's table throws `RangeError: the scriptc
   island's TextDecoder supports utf-8 only (got 'latin1')` where Node
   decodes; the six labels of the "replacement" encoding and an unknown
   label are Node's `ERR_ENCODING_NOT_SUPPORTED`. `TextEncoderStream` is
-  absent ((d)).
+  fenced by name ((d)).
 - **(c) The streams are a subset.** `ReadableStream` (with `from`),
   `TransformStream` and `TextDecoderStream`: `type: 'bytes'`, BYOB readers,
   `tee()` and `pipeTo()` throw named errors; `Request`/`Response`
@@ -7501,21 +7536,20 @@ Where the island parts from Node, measured against Node v24.18.1:
   resp.text, tds, ts, json, blob, rs, blobtext on every lane; Node's is
   resp.text, json, blob, rs, tds, blobtext, ts. Each chain's own result is
   Node's.
-- **(d) Node globals outside the set are absent on the native lanes.** In
-  a plain `__island_eval` program, 38 of the 43 Node globals S103 (b)
-  fences on the wasm lane answer `typeof` `undefined` there (the other five
-  are the four timers and `Atomics`), among them `URL` (installed only once
-  an npm package or a URL value reaches the island), `fetch` (only in
-  fetch-using builds), `process`, `global` and `Buffer` (only for
-  npm-importing programs), `WritableStream`, `FormData`, `WebSocket`,
-  `Intl`, `WebAssembly`, `navigator`, `setImmediate`, `TextEncoderStream`,
+- **(d) Node globals outside the set are fenced by name on every lane.**
+  What neither the engine nor the set (nor the build's npm or fetch boot)
+  provides is S103 (b)'s fence on the native lanes too: in a plain
+  `__island_eval` program, 38 names (S103 (b)'s 43 less the four timers
+  and `Atomics`, which the native engine has), among them `URL` (until an
+  npm package or a URL value installs it), `fetch`, `process`, `global`,
+  `Buffer`, `WritableStream`, `FormData`, `WebSocket`, `Intl`,
+  `WebAssembly`, `navigator`, `setImmediate`, `TextEncoderStream`,
   `CompressionStream`, `CryptoKey` and the performance classes.
 - **(e) The zone name in `Date#toString`.** The text appends Node's
   parenthesised zone name to `toString` and `toTimeString` through the
   host's `tzname`: the native lanes answer S113's name for the zone at that
-  instant (Node's own table, `scr_zone_names.h`), the wasm lane's engine is
-  always UTC (`Coordinated Universal Time`; S103 (e)), so outside UTC the
-  wasm lane prints a different time and name than Node.
+  instant (Node's own table, `scr_zone_names.h`), the wasm lane's engine
+  the name its host answers through `tsinter.tzCall` (S113).
 - **(f) Timers on the native lanes** share the static timer heap; the
   returned object's `unref()` is accepted and not honoured, and its
   primitive value is the heap's id, not Node's async id. The wasm lane
@@ -7626,8 +7660,20 @@ Where the island parts from Node, measured against Node v24.18.1:
   ignored as in Node, but without Node's
   `AddEventListenerArgumentTypeWarning` on stderr (the island has no
   process warnings).
+- **(m) `performance`** is an object with `now()` and `timeOrigin` only
+  (Node's is a `Performance` with marks, measures, `toJSON`,
+  `eventLoopUtilization` and more; the island's npm `node:perf_hooks`
+  adds inert ones). `now()` reads the static side's clock — the native
+  lanes' `scr_perf_now`, the wasm module's `perf_now` import — so island
+  and static readings at the same instant agree, as in Node (the
+  engine's own object counted from its context's creation); `timeOrigin`
+  is that origin as an epoch time. Neither is an own enumerable key,
+  as in Node.
 
-**Tested by:** `tests/harness/web-globals.test.ts` — every row on the
+**Tested by:** `tests/harness/island-inspect.test.ts` — (a)'s inspector
+and console against Node live on the c, llvm and wasm lanes (every lane
+byte-identical, engine frames included; Node with frames set aside), with
+S114's residue rows and the fences; `tests/harness/web-globals.test.ts` — every row on the
 native and the wasm lane, most compared with Node live in the test process
 (URLSearchParams; `structuredClone`'s kinds, identities, views, wrappers,
 prototypes, errors and refusals; `Headers`; base64, `crypto` and
@@ -7643,3 +7689,109 @@ npm build); the E2 rows of `packages/compiler/test/wasm-island-engine.test.ts`
 `crypto` through the module's `random` import, the timer fences); corpus
 1120 on the c, llvm and wasm lanes against Node. (c)'s interleaving, (d)'s
 list and (e) were measured by hand, outside the suite.
+
+## S114 — The island's util.inspect is Node's own, ported; what parts from Node: an error prints the engine's stack frames, `%o`/showHidden lack V8's own `arguments`/`caller`/`stack` members, a null-prototype object V8 can still name after its class prints `Object` and a function's kind is read from its prototype, a Map or Set iterator and showHidden over a weak collection throw a named Error, the console never colors, and inspection gives up past 100 levels of nesting on every lane *(every lane: the c and llvm lanes' island and the wasm lane's engine)*
+
+S108 (a)'s inspector is Node v24.18.1's `lib/internal/util/inspect.js`
+(and `cli_table.js` for `console.table`), ported function for function
+into the shared prelude (`scr_web_prelude.js`) over primordials captured
+at boot, so every lane runs the same code and prints the same bytes.
+What V8 answers from internal slots comes from the intrinsics' own brand
+checks (Map/Set `size`, Date `getTime`, RegExp `source`, the typed-array
+tag, the boxed-primitive `valueOf`s, `Error.isError`) or from the host
+(`promiseState`, `proxyTarget`/`proxyHandler`, `isPromise`/`isProxy`, and
+`classId` — the engine's class of an object, compared with the classes
+of a real Map iterator, Set iterator, arguments object and module
+namespace, so none of these can be faked by a prototype or a
+`Symbol.toStringTag`: `scr_web.c` and `wasm/isl_core.c`, the same host
+functions over the same engine API); a `Symbol.toStringTag` getter is
+read once, guarded, as in Node. String widths — which decide how arrays group into columns and
+how `console.table` pads — are Node's ICU `GetStringWidth` (ambiguous
+as narrow, emoji sequences expanded) from a table generated out of
+Node's own ICU (`scripts/gen-string-width.mjs`: ICU 78.3, Unicode 17.0;
+`--check` holds the table to the running Node) after NFC, as Node does;
+the NFC is the engine's own `normalize`, whose Unicode tables are
+quickjs-ng's, so a code point whose normalization changed in a Unicode
+version the engine predates can measure differently (not measured).
+Everything else is Node's, except:
+
+- **(a) An error prints the engine's stack frames.** The engine's
+  `stack` is its frames alone (S108 (i)); an error whose stack is still
+  the engine's own prints as V8 would have written it — the `name:
+  message` header V8 formats at the FIRST read of the stack (the island
+  records it at the first read of `stack` through its accessor, or at
+  this print if none came first; a `name` or `message` getter that throws
+  makes that read throw, so the error prints `[object Error]`, as in
+  Node), then the frames — and goes through Node's formatError (brackets
+  when there are no frames, the class prefix, `[cause]`, `[errors]`, own
+  extra properties). The frames are QuickJS's: `    at <name>
+  (<island>:<line>:<column>)`, one per engine frame, positions the
+  engine's (a constructor's own frame is listed; Node's eval frames name
+  the eval site), so Node's collapsing of frames shared with a cause
+  (`... N lines matching cause stack trace ...`) and of repeated frames
+  happens over different lines. A stack a program assigned prints as it
+  is, as in Node. The frames are the same on every lane: the wasm lane
+  evaluates `__island_eval` under the native lanes' file name with no
+  frame for `eval` (S103).
+- **(b) `%o` and showHidden see the engine's object shapes.** A sloppy
+  function lacks V8's own `[arguments]: null` and `[caller]: null` (the
+  engine's sit on `Function.prototype`), and an error lacks `[stack]:
+  [Getter/Setter]` (S108 (i): one accessor on `Error.prototype`).
+- **(c) Names V8 reads from an object's map.** An object whose prototype
+  was replaced keeps, in V8, the constructor that built it:
+  `Object.setPrototypeOf(new Foo(), null)` prints `[Foo: null prototype]
+  {}` in Node and `[Object: null prototype] {}` here; V8's
+  GetConstructorName is otherwise followed as far as JavaScript can (a
+  string `Symbol.toStringTag` data property, then a named `constructor`
+  above the object, then the object's class). A function's kind
+  (async, generator) is read from its intrinsic prototype, so a function
+  whose prototype was replaced prints as a plain `[Function]`.
+- **(d) What V8's previewEntries reads is fenced.** The entries a Map or
+  Set iterator has left (`console.log(map.entries())`,
+  `console.table(map.keys())`) and the entries of a WeakMap or WeakSet
+  under showHidden (`%o`, `{ showHidden: true }`) have no JavaScript
+  view without consuming or holding them; inspecting one throws a named
+  `Error` (`util.inspect of a Map iterator's entries inside the scriptc
+  island is not supported yet (SEMANTICS.md S114)`, likewise `a Set
+  iterator`, `a WeakMap`, `a WeakSet`) where Node prints them. A weak
+  collection without showHidden prints Node's `<items unknown>`.
+- **(e) The console never colors.** Node's console colors its output when
+  the stream is a terminal that supports color; the island's never does
+  (`util.inspect`'s `colors` option is Node's).
+- **(f) One nesting cap.** Node inspects nested objects until V8's stack
+  runs out (`console.dir(o, { depth: Infinity })` of a chain 1,000–1,500
+  deep, measured) and prints that level as `[Object: Inspection
+  interrupted prematurely. Maximum call stack size exceeded.]`; the
+  engines' stacks run out at different depths per lane (the wasm
+  engine's at 100–300 levels, measured), so the island gives up at the
+  SAME depth on every lane — past 100 levels of nesting — with Node's
+  text (`kMaxInspectNesting` in `scr_web_prelude.js`; S029 is the static
+  tier's counterpart). A structure 101 or more levels deep printed with
+  an unbounded `depth` therefore stops sooner than in Node; the default
+  `depth` of 2 never reaches it.
+
+Booting the inspector costs every island program about 5 ms (a trivial
+`__island_eval` native c binary: median 8.5 ms before, about 13.5 ms
+after, measured in review; the implementer's 30-run means were 10.6 and
+13.4 ms) and the wasm engine about 100 KB (engine.wasm 970,267 →
+1,070,405 bytes).
+
+**Tested by:** `tests/harness/island-inspect.test.ts` — a matrix of
+values (primitives, strings and escapes, nesting, holes, long and
+grouped arrays, wide characters, keys, accessors, Maps, Sets, typed
+arrays, buffers, dates, regexps, boxed primitives, functions, classes,
+toStringTags, null prototypes, circular structures, promises, proxies,
+arguments, weak collections, custom inspectors) through `console.log`,
+`%s`/`%O`/`%o` and `console.dir` under every option, errors, the format
+specifiers, `dir`/`dirxml`/`table`/`group`/`assert`, and the error
+messages that quote values — against Node live, every lane byte-identical
+to the others (frames included) and to Node with frame lines set aside;
+(a)'s header timing (a throwing `name` getter, a message changed before
+and after the first read) and the brands a program cannot fake against
+Node; (b), (c) and S108 (j)'s `%s` of a native function as residue rows
+(lane-identical, Node differing by exactly the registered text); (d) by
+message on every lane; (f) by the cap's text at 101 and 2,000 levels and
+none at 100, identical on every lane. The class-id brand was also broken
+by hand (a prototype compare again): the brands row went red. Broken
+once by hand (breakLength 128 for Node's 80; the native fence call
+removed): every group and the fence row went red.
