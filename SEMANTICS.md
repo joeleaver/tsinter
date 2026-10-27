@@ -8256,15 +8256,20 @@ refused at compile time, by name");
 `tests/harness/island.test.ts` ("a typed record crossing into an 'any'
 binding is a live view"). Measured against Node v24.18.1.
 
-## S117 — The wasm-native lane runs the wasm module natively; it parts from Node where the native lanes do (argv, execPath, versions, a real clock), and in its stack depth, its heap limit and the text of a trap *(wasm-native lane)*
+## S117 — The wasm-native lane runs the wasm module natively; it parts from Node where the native lanes do (argv, execPath, versions, a real clock), in its stack depth, its heap limit and the text of a trap, and where its own host answers for the event sources (its TLS engine and trust store, its fetch client) *(wasm-native lane)*
 
 The wasm-native lane (`backend: "wasm-native"`, native-runner phase N0) is
 the wasm lane's own module translated to C (`backend/wasm2c.ts`, the
 whole-program profile) and linked with the native runner
 (`packages/runtime/src/wasmnative`: the collector `wn_gc.c`, the C host for
-abi.ts's imports `wn_host.c`, the driver `wn_main.c`). Every behavior is the
-module's, so everything the wasm lane registers applies unchanged; this
-entry lists only what the runner itself decides:
+abi.ts's imports — `wn_host.c` for the process, clocks, files and zones and,
+since phase N1, the event sources: `wn_ev.c` (the event queue and the
+loop's wait, signals, fs.watch, stdin), `wn_cp.c` (child processes),
+`wn_net.c` (TCP, UDP, lookups), `wn_tls.c` (the TLS engine) and
+`wn_fetch.c` (fetch) — and the driver `wn_main.c`). Every behavior is the
+module's, so everything the wasm lane registers applies unchanged except
+where a clause below says the wasm lane's differential HOST decided it;
+this entry lists what the runner itself decides:
 
 (a) **Process facts are a native process's**: `process.argv` is
 `["scriptc", <the invocation>, ...]` and `process.execPath` the
@@ -8318,20 +8323,97 @@ compiler chooses — and so does V8's (the instruction set keeps the first
 operand's); measured on constants, V8 kept the first and this lane the
 second.
 
-(f) **Imports the host does not provide refuse at build time.** A module
-importing `cpCall`, `evPoll`, `netCall`, `tlsCall`, `sigCall`,
-`watchCall`, `stdinCall` or `fetch` (the event sources — phase N1) does
-not build on this lane: SC3001 naming `host:<import>`, the LinkError of
-abi.ts moved to build time, never a stub that fails late.
+(f) **Every import of abi.ts is the runner's own host's.** None refuses at
+build time any more (phase N0 refused the event sources by name,
+`host:<import>`). The host is libuv's level transcribed onto epoll, on the
+real clock: the module's `_loop` is called again once an event is queued or
+its deadline is reached (an epoll wait — never a spin; a wait no source can
+end is the runner's loud error, exit 70); one epoll round is one host
+iteration, so its net events form one poll phase (abi.ts evPoll); a
+descriptor's new interest reaches epoll at the next wait, in the order it
+was asked for (libuv's watcher queue — so a client's connect is reported
+after the server's accept of it, as under Node); a read that does not fill
+its 64 KiB buffer ends that descriptor's turn (uv__read: an end of file
+read behind it is the next iteration's); a signal and a child's exit are
+handled after the round's other descriptors (libuv runs its signal watcher
+last), and every exited child is reaped then, in spawn order, before any
+exit is queued (uv__wait_children: inside one child's `'exit'` a sibling of
+the same batch is already reaped). Lookups run getaddrinfo on a thread, as
+libuv's do. Where the wasm lane's differential host (Node itself, in
+process) decided an answer, this host decides it as a separate native
+process does — and so, for S086, as Node does:
+- a child's inherited stream, or the program's fd 1 or 2 in a stdio slot,
+  is passed to the child as the real descriptor (abi.ts allows it when the
+  host's descriptors are the program's own), so S086 (a), (b), (c), (f)
+  and (g) do not apply: output lands where Node's child's does, unlimited
+  and in real time; an `"inherit"` stdin is the real fd 0 (S086 (h) does not
+  apply, nor (d)'s `"inherit"` half); a numbered descriptor is the
+  process's own, passed as libuv passes it (S086 (j) does not apply); and
+  children still running when the program ends are left running, as Node
+  leaves them (S086 (i) does not apply). S086 (d)'s `"ignore"` half (the
+  lowering's), (e), (k) and (l) apply. A child's pipes are socketpairs, as
+  libuv's are.
+- the runner starts in well under a millisecond and reaches its first poll
+  phase long before Node's module loader settles: a child's first output
+  that Node sees in its first poll phase can arrive after this lane's
+  (U3-ORD-01, measured).
 
-(g) **The translator trusts a valid module.** `wasm2c` assumes the
+(g) **TLS is vendored mbedTLS 3.6** (the engine the c and llvm lanes use),
+where Node's is OpenSSL; S090 (b) applies. The host's default store — what
+CTX_ROOTS trusts and what `getCACertificates("system")` lists — is the
+system bundle (`SSL_CERT_FILE`, else `/etc/ssl/certs/ca-certificates.crt`,
+`/etc/pki/tls/certs/ca-bundle.crt`, `/etc/ssl/ca-bundle.pem`,
+`/etc/ssl/cert.pem`), not Node's bundled Mozilla roots; `"extra"` is
+`NODE_EXTRA_CA_CERTS`. A verdict is reported in OpenSSL's numbering: a
+chain to no trusted root is 18 (a self-signed leaf alone), 19 (a
+self-signed certificate in the chain), 21 (a leaf alone) or 20, and a chain
+mbedTLS accepted at a trusted certificate that is not self-signed is 2
+(OpenSSL anchors only at a root: no partial chains, Node's default).
+Material errors answer OpenSSL's texts for the shapes Node meets (`no start
+line`, `wrong tag`, `DECODER routines::unsupported`, `key values
+mismatch`); a protocol failure answers OpenSSL's `wrong version number`,
+`sslv3 alert handshake failure` or `unsupported protocol` where mbedTLS's
+error maps to one, and otherwise mbedTLS's own text under
+`ERR_SSL_SSL_HANDSHAKE_FAILURE`. An IP-literal host is not name-checked by
+the engine (the module's checkServerIdentity still runs).
+
+(h) **fetch is the runner's own HTTP/1.1 client** (`wn_fetch.c`), made to
+answer as Node's undici does (measured against Node v24.18.1; S098 (a)
+names these the host's answers): the Request constructor's refusals and
+their texts, the request head (`host`, `connection`, the program's headers
+in its order with same names combined, `content-type`, then undici's
+defaults, then `content-length`), the fetch spec's bad ports, redirects (20
+hops, the 303 and POST rewrites, credentials dropped across origins,
+"unexpected redirect", "redirect count exceeded", "URL scheme must be a
+HTTP(S) scheme"), `data:` URLs, the other schemes' failures, gzip / x-gzip
+/ deflate decoding, `NODE_USE_ENV_PROXY` with `http_proxy` and `no_proxy`,
+and the failures ("fetch failed" over `connect ECONNREFUSED <ip>:<port>`,
+`getaddrinfo ENOTFOUND <host>`, undici's "other side closed", "terminated"
+for a body cut short, an AggregateError for a name whose every address
+refused). These differ from Node: no connection is kept for reuse (undici's
+pool shows only to the server); `br` and `zstd` bodies are delivered as
+they came (undici decodes them); a host name holding a non-ASCII character
+is "Invalid URL" (no IDNA); a proxied `http:` request is an absolute-URI
+request (undici tunnels it with CONNECT; `https:` is tunnelled here too);
+undici's process warnings (a lowercase `patch`) are not printed; there is
+no connect timeout (undici's is 10 s); TLS verification uses (g)'s store and
+engine.
+
+(i) **The translator trusts a valid module.** `wasm2c` assumes the
 module's types and stack discipline hold; the lane validates every module
 with the engine's own `WebAssembly.validate` before translating, and an
 invalid one refuses (`wasm2c:the module does not validate`).
 
 **Tested by:** `tests/harness/wasmnative-differential.test.ts` (the whole
 corpus against Node; `SCRIPTC_WASMNATIVE_GC_STRESS=n` runs it with the
-collector forced every n allocations), and
+collector forced every n allocations);
+`tests/harness/wasmnative-host-rows.test.ts` (every program of the wasm
+lane's host rows — child_process, node:net / http / tls / https / dgram,
+signals, fs.watch, stdin and readline — and the fetch fixtures, natively,
+against Node: (f)'s second item is its `UNPINNED` U3-ORD-01; its `KNOWN`
+list names the module's own divergences, which this lane shares);
+`tests/harness/event-loop.test.ts`, `console-io.test.ts` and
+`dgram.test.ts` (each case on the c and wasm-native lanes); and
 `packages/compiler/test/wasm2c-whole.test.ts` (the translation against
 Node's own WebAssembly: every numeric operator and conversion bit for bit,
 linear memory to its end, the GC instructions under a stressed

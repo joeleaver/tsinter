@@ -13,11 +13,13 @@
  * subpart with U+FFFD (V8's and WHATWG's rule), encoding replaces a lone
  * surrogate with U+FFFD (what Node does to a path or a string it writes).
  *
- * N0 provides the process, clock, randomness, file-system, zone and sleep
- * imports; what a native process answers differently from Node (argv,
- * execPath, versions, a real clock) is SEMANTICS.md S117 (a). The event sources (cpCall, evPoll, netCall, tlsCall, sigCall,
- * watchCall, stdinCall, fetch) are phase N1's: a module that imports one
- * refuses to build on this lane, naming the import. */
+ * This unit provides the process, clock, randomness, file-system, zone and
+ * sleep imports; what a native process answers differently from Node (argv,
+ * execPath, versions, a real clock) is SEMANTICS.md S117 (a). The event
+ * sources (phase N1) are the other units' — wn_ev.c (evPoll, sigCall,
+ * watchCall, stdinCall), wn_cp.c (cpCall), wn_net.c (netCall), wn_tls.c
+ * (tlsCall), wn_fetch.c (fetch) — over the shared declarations in
+ * wn_host.h. */
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
@@ -83,7 +85,7 @@ static void buf_str(Buf *b, const char *s) { buf_put(b, s, strlen(s)); }
 static void buf_chr(Buf *b, char c) { buf_put(b, &c, 1); }
 
 /* ── UTF-8 → UTF-16 (maximal-subpart replacement) ─────────────────────── */
-static size_t utf8_to_16(const uint8_t *s, size_t n, uint16_t *out) {
+size_t wn_utf8_to_16(const uint8_t *s, size_t n, uint16_t *out) {
   size_t len = 0, i = 0;
   while (i < n) {
     uint32_t c = s[i];
@@ -143,7 +145,7 @@ static size_t utf8_to_16(const uint8_t *s, size_t n, uint16_t *out) {
 }
 
 /* ── UTF-16 (module memory) → UTF-8, NUL-terminated, malloc'd ────────── */
-static char *utf16_to_8(uint32_t ptr, uint32_t n, size_t *outlen) {
+char *wn_utf16_to_8(uint32_t ptr, uint32_t n, size_t *outlen) {
   const uint8_t *p = w_hostmem + ptr;
   char *o = malloc((size_t)n * 3 + 1);
   if (!o) abort();
@@ -182,11 +184,11 @@ static char *utf16_to_8(uint32_t ptr, uint32_t n, size_t *outlen) {
 /* hostStr's retry contract: write the UTF-16 of `s` (n bytes of UTF-8) at
  * ptr when it fits in cap code units; answer its length either way */
 static int32_t put_utf8(const char *s, size_t n, uint32_t ptr, uint32_t cap) {
-  size_t len = utf8_to_16((const uint8_t *)s, n, NULL);
+  size_t len = wn_utf8_to_16((const uint8_t *)s, n, NULL);
   if (len > cap) return (int32_t)len;
   uint16_t *tmp = malloc(len * 2 + 2);
   if (!tmp) abort();
-  utf8_to_16((const uint8_t *)s, n, tmp);
+  wn_utf8_to_16((const uint8_t *)s, n, tmp);
   memcpy(w_hostmem + ptr, tmp, len * 2);
   free(tmp);
   return (int32_t)len;
@@ -564,7 +566,7 @@ int32_t host_kill(int32_t pid, int32_t sig) {
 }
 
 int32_t host_chdir(int32_t ptr, int32_t len) {
-  char *p = utf16_to_8((uint32_t)ptr, (uint32_t)len, NULL);
+  char *p = wn_utf16_to_8((uint32_t)ptr, (uint32_t)len, NULL);
   int rc = chdir(p);
   int e = errno;
   free(p);
@@ -594,7 +596,7 @@ int32_t host_umask(int32_t isRead, int32_t mask) {
 
 /* ── fsCall ───────────────────────────────────────────────────────────── */
 /* the module's own errno enumeration (fs.ts), else the 256-based carrier */
-static int32_t fs_err(int e) {
+int32_t wn_fs_err(int e) {
   static const int order[] = {ENOENT, EEXIST, EACCES, ENOTDIR, EISDIR, ENOTEMPTY, EPERM, EBADF, EMFILE, ENOSPC, EINVAL, EROFS, ELOOP, ENAMETOOLONG};
   for (int i = 0; i < 14; i++)
     if (order[i] == e) return -(i + 1);
@@ -633,11 +635,11 @@ static int32_t put_content(const uint8_t *b, size_t n, int bytes, uint32_t bPtr,
     if (n <= bLen) memcpy(w_hostmem + bPtr, b, n);
     return (int32_t)n;
   }
-  size_t len = utf8_to_16(b, n, NULL);
+  size_t len = wn_utf8_to_16(b, n, NULL);
   if (len <= bLen) {
     uint16_t *tmp = malloc(len * 2 + 2);
     if (!tmp) abort();
-    utf8_to_16(b, n, tmp);
+    wn_utf8_to_16(b, n, tmp);
     memcpy(w_hostmem + bPtr, tmp, len * 2);
     free(tmp);
   }
@@ -650,10 +652,10 @@ static int str_cmp(const void *a, const void *b) { return strcmp(*(char *const *
  * decoded from it */
 static void json_name(Buf *b, const char *name) {
   size_t n = strlen(name);
-  size_t len = utf8_to_16((const uint8_t *)name, n, NULL);
+  size_t len = wn_utf8_to_16((const uint8_t *)name, n, NULL);
   uint16_t *u = malloc(len * 2 + 2);
   if (!u) abort();
-  utf8_to_16((const uint8_t *)name, n, u);
+  wn_utf8_to_16((const uint8_t *)name, n, u);
   buf_chr(b, '"');
   for (size_t i = 0; i < len; i++) {
     uint32_t c = u[i];
@@ -907,7 +909,7 @@ static size_t held_n;
  * host's own line behind it — refuse loudly, never act on a cut path. */
 static char *path_arg(uint32_t ptr, uint32_t len, const char *what) {
   size_t n;
-  char *p = utf16_to_8(ptr, len, &n);
+  char *p = wn_utf16_to_8(ptr, len, &n);
   if (strlen(p) != n) {
     fprintf(stderr, "native runner: %s holding U+0000 reached the host (the module must reject it, as Node does)\n", what);
     exit(70);
@@ -923,13 +925,13 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
     case 1: {
       int fd = open(path, O_RDONLY | O_CLOEXEC);
       if (fd < 0) {
-        rc = fs_err(errno);
+        rc = wn_fs_err(errno);
         break;
       }
       struct stat st;
       if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode)) {
         close(fd);
-        rc = fs_err(EISDIR);
+        rc = wn_fs_err(EISDIR);
         break;
       }
       uint8_t *b;
@@ -937,7 +939,7 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
       int e = read_all(fd, &b, &n);
       close(fd);
       if (e) {
-        rc = fs_err(e);
+        rc = wn_fs_err(e);
         break;
       }
       rc = put_content(b, n, x == 1, B, BL);
@@ -947,7 +949,7 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
     case 2: {
       DIR *d = opendir(path);
       if (!d) {
-        rc = fs_err(errno);
+        rc = wn_fs_err(errno);
         break;
       }
       char **names = NULL;
@@ -1001,7 +1003,7 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
       if (!t) abort();
       memcpy(t, path, n);
       memcpy(t + n, "XXXXXX", 7);
-      if (!mkdtemp(t)) rc = fs_err(errno);
+      if (!mkdtemp(t)) rc = wn_fs_err(errno);
       else rc = put_str(t, B, BL);
       free(t);
       break;
@@ -1015,16 +1017,16 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
       } else {
         /* the failing path: u16 count at slot B, then the code units */
         size_t ln = strlen(errp);
-        size_t len = utf8_to_16((const uint8_t *)errp, ln, NULL);
+        size_t len = wn_utf8_to_16((const uint8_t *)errp, ln, NULL);
         if (len + 1 > BL) rc = (int32_t)(len + 1);
         else {
           uint16_t *u = malloc(len * 2 + 2);
           if (!u) abort();
           u[0] = (uint16_t)len;
-          utf8_to_16((const uint8_t *)errp, ln, u + 1);
+          wn_utf8_to_16((const uint8_t *)errp, ln, u + 1);
           memcpy(w_hostmem + B, u, (len + 1) * 2);
           free(u);
-          rc = fs_err(e);
+          rc = wn_fs_err(e);
         }
         free(errp);
       }
@@ -1044,7 +1046,7 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
       size_t n;
       int e = read_all(x, &b, &n);
       if (e) {
-        rc = fs_err(e);
+        rc = wn_fs_err(e);
         break;
       }
       rc = put_content(b, n, 0, B, BL);
@@ -1061,14 +1063,14 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
       ssize_t r;
       do r = read(x, w_hostmem + B, BL);
       while (r < 0 && errno == EINTR);
-      rc = r < 0 ? fs_err(errno) : (int32_t)r;
+      rc = r < 0 ? wn_fs_err(errno) : (int32_t)r;
       break;
     }
     case 7:
     case 8: {
       struct stat st;
       if ((op == 7 ? stat(path, &st) : lstat(path, &st)) != 0) {
-        rc = fs_err(errno);
+        rc = wn_fs_err(errno);
         break;
       }
       uint8_t *p = w_hostmem + B;
@@ -1085,7 +1087,7 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
     case 10: {
       int fd = open(path, O_WRONLY | O_CREAT | O_CLOEXEC | (op == 9 ? O_TRUNC : O_APPEND), (op == 9 && x) ? (mode_t)(x - 1) : 0666);
       if (fd < 0) {
-        rc = fs_err(errno);
+        rc = wn_fs_err(errno);
         break;
       }
       size_t n;
@@ -1095,11 +1097,11 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
         data = (char *)(w_hostmem + B);
         n = BL;
       } else {
-        data = utf16_to_8(B, BL, &n);
+        data = wn_utf16_to_8(B, BL, &n);
         own = 1;
       }
       int e = write_all(fd, data, n);
-      if (e) rc = fs_err(e);
+      if (e) rc = wn_fs_err(e);
       if (own) free(data);
       close(fd);
       break;
@@ -1107,38 +1109,38 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
     case 11: {
       mode_t mode = x ? (mode_t)(x - 1) : 0777;
       if (y == 1) {
-        if (mkdir_p(path, mode) != 0) rc = fs_err(errno);
+        if (mkdir_p(path, mode) != 0) rc = wn_fs_err(errno);
       } else if (mkdir(path, mode) != 0)
-        rc = fs_err(errno);
+        rc = wn_fs_err(errno);
       break;
     }
     case 12:
-      if (rmdir(path) != 0) rc = fs_err(errno);
+      if (rmdir(path) != 0) rc = wn_fs_err(errno);
       break;
     case 13:
-      if (unlink(path) != 0) rc = fs_err(errno);
+      if (unlink(path) != 0) rc = wn_fs_err(errno);
       break;
     case 14: {
       struct stat st;
       if (lstat(path, &st) != 0) {
-        rc = (errno == ENOENT && y == 1) ? 0 : fs_err(errno);
+        rc = (errno == ENOENT && y == 1) ? 0 : wn_fs_err(errno);
         break;
       }
       if (S_ISDIR(st.st_mode)) {
         if (x != 1) {
-          rc = fs_err(EISDIR);
+          rc = wn_fs_err(EISDIR);
           break;
         }
-        if (nftw(path, rm_cb, 64, FTW_DEPTH | FTW_PHYS) != 0) rc = fs_err(errno);
+        if (nftw(path, rm_cb, 64, FTW_DEPTH | FTW_PHYS) != 0) rc = wn_fs_err(errno);
       } else if (unlink(path) != 0)
-        rc = fs_err(errno);
+        rc = wn_fs_err(errno);
       break;
     }
     case 15: {
       char *dst = path_arg(B, BL, "an fs path");
       int in = open(path, O_RDONLY | O_CLOEXEC);
       if (in < 0) {
-        rc = fs_err(errno);
+        rc = wn_fs_err(errno);
         free(dst);
         break;
       }
@@ -1147,7 +1149,7 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
       if (S_ISDIR(st.st_mode)) {
         close(in);
         free(dst);
-        rc = fs_err(EISDIR);
+        rc = wn_fs_err(EISDIR);
         break;
       }
       /* libuv's uv__fs_copyfile: open without truncating, and when the
@@ -1155,7 +1157,7 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
        * empty the file) */
       int out = open(dst, O_WRONLY | O_CREAT | O_CLOEXEC, st.st_mode & 07777);
       if (out < 0) {
-        rc = fs_err(errno);
+        rc = wn_fs_err(errno);
         close(in);
         free(dst);
         break;
@@ -1168,7 +1170,7 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
         break;
       }
       if (ftruncate(out, 0) != 0) {
-        rc = fs_err(errno);
+        rc = wn_fs_err(errno);
         close(in);
         close(out);
         free(dst);
@@ -1181,7 +1183,7 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
         e = write_all(out, (const char *)b, n);
         free(b);
       }
-      if (e) rc = fs_err(e);
+      if (e) rc = wn_fs_err(e);
       fchmod(out, st.st_mode & 07777);
       close(in);
       close(out);
@@ -1189,10 +1191,10 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
       break;
     }
     case 16:
-      if (chmod(path, (mode_t)x) != 0) rc = fs_err(errno);
+      if (chmod(path, (mode_t)x) != 0) rc = wn_fs_err(errno);
       break;
     case 17:
-      if (chown(path, (uid_t)x, (gid_t)y) != 0) rc = fs_err(errno);
+      if (chown(path, (uid_t)x, (gid_t)y) != 0) rc = wn_fs_err(errno);
       break;
     case 18:
       if (x == held_fd) {
@@ -1200,13 +1202,13 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
         held_buf = NULL;
         held_fd = -1;
       }
-      if (x != 0 && close(x) != 0) rc = fs_err(errno);
+      if (x != 0 && close(x) != 0) rc = wn_fs_err(errno);
       break;
     case 19:
       rc = access(path, F_OK) == 0 ? 0 : -1;
       break;
     case 20:
-      if (access(path, x) != 0) rc = fs_err(errno);
+      if (access(path, x) != 0) rc = wn_fs_err(errno);
       break;
     case 21: {
       int fl = open_flags(x);
@@ -1215,12 +1217,12 @@ int32_t host_fsCall(int32_t op, int32_t aPtr, int32_t aLen, int32_t bPtr, int32_
         exit(70);
       }
       int fd = open(path, fl | O_CLOEXEC, (mode_t)y);
-      rc = fd < 0 ? fs_err(errno) : fd;
+      rc = fd < 0 ? wn_fs_err(errno) : fd;
       break;
     }
     case 22: {
       struct stat st;
-      if (fstat(x, &st) != 0) rc = fs_err(errno);
+      if (fstat(x, &st) != 0) rc = wn_fs_err(errno);
       else rc = (int32_t)st.st_size;
       break;
     }
@@ -1337,7 +1339,7 @@ double host_tzCall(int32_t op, double ms, int32_t ptr, int32_t len) {
   if (op == 2) {
     if (len < 0) unsetenv("TZ");
     else {
-      char *z = utf16_to_8((uint32_t)ptr, (uint32_t)len, NULL);
+      char *z = wn_utf16_to_8((uint32_t)ptr, (uint32_t)len, NULL);
       setenv("TZ", z, 1);
       free(z);
     }

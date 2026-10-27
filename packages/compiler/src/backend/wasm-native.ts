@@ -1,5 +1,5 @@
-/* The wasm-native lane (native-runner phase N0): a native executable that
- * IS the WasmGC backend's module, translated to C by wasm2c.ts (the
+/* The wasm-native lane (native-runner phases N0-N1): a native executable
+ * that IS the WasmGC backend's module, translated to C by wasm2c.ts (the
  * whole-program profile) and linked with the native runner — the collector,
  * the C host for abi.ts's imports, and the driver under
  * packages/runtime/src/wasmnative/. Node is the oracle through the module:
@@ -10,31 +10,42 @@
  * them with it (design: native = the wasm module + a C host).
  *
  * The runner's host provides the imports listed in NATIVE_HOST_IMPORTS, with
- * exactly these signatures. A module importing anything else (the event
- * sources: cpCall, evPoll, netCall, tlsCall, sigCall, watchCall, stdinCall,
- * fetch — phase N1) refuses to build on this lane, naming the import: a
- * LinkError's moment, moved to build time, never a stub that fails late. */
+ * exactly these signatures — since phase N1 every import of abi.ts,
+ * the event sources included (wn_ev.c, wn_cp.c, wn_net.c, wn_tls.c,
+ * wn_fetch.c). A module importing anything else refuses to build on this
+ * lane, naming the import: a LinkError's moment, moved to build time, never
+ * a stub that fails late. The TLS and fetch units link only into a module
+ * that imports tlsCall / fetch, with the vendored mbedTLS archive (and, for
+ * fetch, the vendored zlib) behind them. */
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFile, mkdir, mkdtemp, readFile, rename, rm, stat, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
-import { resolveCc, runtimeSrcDir } from "./cc.js";
+import { ensureTlsArchive, ensureZlibObjects, resolveCc, runtimeSrcDir } from "./cc.js";
 import {
   IMPORT_CHDIR,
+  IMPORT_CP_CALL,
+  IMPORT_EV_POLL,
   IMPORT_EXIT,
+  IMPORT_FETCH,
   IMPORT_FS_CALL,
   IMPORT_HOST_NUM,
   IMPORT_HOST_STR,
   IMPORT_KILL,
+  IMPORT_NET_CALL,
   IMPORT_NOW,
   IMPORT_RANDOM,
   IMPORT_SEED,
+  IMPORT_SIG_CALL,
   IMPORT_SLEEP,
+  IMPORT_STDIN_CALL,
+  IMPORT_TLS_CALL,
   IMPORT_TZ_CALL,
   IMPORT_UMASK,
   IMPORT_WALL_CLOCK,
+  IMPORT_WATCH_CALL,
   IMPORT_WRITE,
 } from "./wasm/abi.js";
 import { type HostImportSig, wasmModuleToC } from "./wasm2c.js";
@@ -43,8 +54,9 @@ const execFileAsync = promisify(execFile);
 
 const sig = (params: HostImportSig["params"], results: HostImportSig["results"]): HostImportSig => ({ params, results });
 
-/** The imports wn_host.c implements, by abi.ts name, with their wasm
- * signatures (wn_host.c defines host_<name> with the matching C types). */
+/** The imports the runner's host implements (every one of abi.ts's since
+ * phase N1), by abi.ts name, with their wasm signatures (the host units
+ * define host_<name> with the matching C types). */
 export const NATIVE_HOST_IMPORTS: ReadonlyMap<string, HostImportSig> = new Map([
   [IMPORT_WRITE, sig(["i32", "i32", "i32"], [])],
   [IMPORT_NOW, sig([], ["f64"])],
@@ -60,6 +72,15 @@ export const NATIVE_HOST_IMPORTS: ReadonlyMap<string, HostImportSig> = new Map([
   [IMPORT_RANDOM, sig(["i32", "i32"], [])],
   [IMPORT_SLEEP, sig(["f64"], [])],
   [IMPORT_TZ_CALL, sig(["i32", "f64", "i32", "i32"], ["f64"])],
+  // N1: the event sources (wn_ev.c, wn_cp.c)
+  [IMPORT_EV_POLL, sig(["i32", "i32"], ["i32"])],
+  [IMPORT_CP_CALL, sig(["i32", "i32", "i32", "i32", "i32"], ["i32"])],
+  [IMPORT_SIG_CALL, sig(["i32", "i32"], ["i32"])],
+  [IMPORT_WATCH_CALL, sig(["i32", "i32", "i32", "i32"], ["i32"])],
+  [IMPORT_STDIN_CALL, sig(["i32"], ["i32"])],
+  [IMPORT_NET_CALL, sig(["i32", "i32", "i32", "i32", "i32"], ["i32"])],
+  [IMPORT_TLS_CALL, sig(["i32", "i32", "i32", "i32", "i32"], ["i32"])],
+  [IMPORT_FETCH, sig(["i32", "i32", "i32", "i32", "i32"], ["i32"])],
 ]);
 
 const WA = (globalThis as unknown as { WebAssembly: { validate: (b: Uint8Array) => boolean } }).WebAssembly;
@@ -79,9 +100,23 @@ export function wasmNativeRuntimeDir(): string {
 }
 
 /** The runner's C units, compiled once per flavor into objects. */
-const RUNNER_SOURCES = ["wn_gc.c", "wn_host.c", "wn_main.c"];
+const RUNNER_SOURCES = ["wn_gc.c", "wn_host.c", "wn_main.c", "wn_ev.c", "wn_cp.c", "wn_net.c", "wn_tls.c", "wn_fetch.c"];
+/** The units a module links only when it imports what they serve (the
+ * translation declares `host_<import>` for each import it has): the TLS
+ * engine (and the vendored mbedTLS archive behind it). */
+const OPTIONAL_UNITS: readonly { obj: string; needs: RegExp }[] = [
+  { obj: "wn_tls.o", needs: /\bhost_tlsCall\(/ },
+  { obj: "wn_fetch.o", needs: /\bhost_fetch\(/ },
+];
 /** Everything the runner's objects and the translation include. */
-const RUNNER_INPUTS = ["wasmnative/wn_rt.h", "wasmnative/wn_gc.c", "wasmnative/wn_host.c", "wasmnative/wn_main.c", "scr_zone_names.h"];
+const RUNNER_INPUTS = [
+  "wasmnative/wn_rt.h",
+  "wasmnative/wn_host.h",
+  "wasmnative/wn_net.h",
+  ...RUNNER_SOURCES.map((s) => `wasmnative/${s}`),
+  "scr_zone_names.h",
+  "scr_zlib_prefix.h",
+];
 
 let inputsHashMemo: Promise<string> | null = null;
 function runnerInputsHash(): Promise<string> {
@@ -147,6 +182,9 @@ async function ensureRunnerObjects(sanitize: boolean): Promise<string[]> {
           ...driver.argv.slice(1),
           ...cflags(sanitize),
           ...driver.targetArgs,
+          `-I${join(runtimeSrcDir(), "..", "vendor", "mbedtls", "include")}`,
+          `-I${join(runtimeSrcDir(), "..", "vendor", "zlib-chromium")}`,
+          `-I${runtimeSrcDir()}`,
           "-c",
           join(wasmNativeRuntimeDir(), s),
           "-o",
@@ -181,7 +219,20 @@ function cacheRootDir(): string | null {
  * inputs, the flags and the C bytes). */
 export async function compileWasmNative(opts: { cPath: string; outPath: string; sanitize: boolean }): Promise<void> {
   const driver = resolveCc();
-  const objs = await ensureRunnerObjects(opts.sanitize);
+  const allObjs = await ensureRunnerObjects(opts.sanitize);
+  const cText = await readFile(opts.cPath, "utf8");
+  const wanted = new Set(OPTIONAL_UNITS.filter((u) => u.needs.test(cText)).map((u) => u.obj));
+  const objs = allObjs.filter((o) => {
+    const opt = OPTIONAL_UNITS.find((u) => o.endsWith(`/${u.obj}`));
+    return opt === undefined || wanted.has(opt.obj);
+  });
+  // the TLS engine: the vendored mbedTLS archive (built once, cached; the
+  // plain flavor — its objects carry no sanitizer runtime)
+  const libs = [
+    ...(wanted.has("wn_tls.o") || wanted.has("wn_fetch.o") ? [await ensureTlsArchive(false, driver)] : []),
+    // fetch's content decoding: the vendored zlib Node bundles
+    ...(wanted.has("wn_fetch.o") ? await ensureZlibObjects(false, driver) : []),
+  ];
   const args = [
     ...driver.argv.slice(1),
     ...cflags(opts.sanitize),
@@ -189,6 +240,7 @@ export async function compileWasmNative(opts: { cPath: string; outPath: string; 
     `-I${wasmNativeRuntimeDir()}`,
     opts.cPath,
     ...objs,
+    ...libs,
     "-o",
     opts.outPath,
     "-lpthread",

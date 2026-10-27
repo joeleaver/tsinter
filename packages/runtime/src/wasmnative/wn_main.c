@@ -30,6 +30,9 @@ void host_setup(int argc, char **argv);
 double host_now(void);
 void host_sleep(double ms);
 void w_gc_set_stack_top(void *top);
+void wn_ev_wait(double due);
+void wn_ev_begin_poll(void);
+void wn_ev_audit(void);
 
 #define MEM_RESERVE ((size_t)8 << 30)
 #define STACK_BYTES ((size_t)512 << 20)
@@ -143,24 +146,20 @@ static void *run(void *arg) {
       }
     }
   } else if (w_has__loop) {
-    double now = host_now();
-    for (;;) {
-      double due = w_export__loop(now);
-      if (due < 0) break;
-      if (isinf(due)) {
-        say("native runner: the module waits for an event no source can deliver\n");
-        status = 70;
-        return NULL;
-      }
-      now = host_now();
-      if (due > now) {
-        host_sleep(due - now);
-        now = host_now();
-        if (now < due) now = due;
-      }
+    /* abi.ts's event-module contract on a real clock: between calls the
+     * host waits (wn_ev.c) until an event is queued or `due` is reached */
+    wn_ev_begin_poll();
+    double due = w_export__loop(host_now());
+    while (due >= 0) {
+      wn_ev_wait(due);
+      wn_ev_begin_poll();
+      due = w_export__loop(host_now());
     }
   }
   status = w_has__status ? (int)w_export__status() : 0;
+  /* WN_FD_AUDIT=1: what the host still holds at the program's normal end
+   * (the leak measurement; nothing prints otherwise) */
+  if (getenv("WN_FD_AUDIT") != NULL) wn_ev_audit();
   return NULL;
 }
 

@@ -6,7 +6,9 @@
  * These probes keep the child alive after writing and observe its stdout
  * pipe directly. The abrupt-death case additionally proves byte parity when
  * no exit hook can rescue retained output. SCRIPTC_SAN=1 builds the native
- * probes with the same ASan + refcount-audit instrumentation as the corpus. */
+ * probes with the same ASan + refcount-audit instrumentation as the corpus.
+ * Each probe runs on the c lane and on the wasm-native lane (native-runner
+ * phase N1). */
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync } from "node:fs";
@@ -26,12 +28,16 @@ interface ClosedChild {
   signal: NodeJS.Signals | null;
 }
 
-async function build(name: string): Promise<{ binary: string; sourceFile: string }> {
+const BACKENDS = ["c", "wasm-native"] as const;
+type Backend = (typeof BACKENDS)[number];
+
+async function build(name: string, backend: Backend): Promise<{ binary: string; sourceFile: string }> {
   const sourceFile = join(fixtureDir, `${name}.ts`);
   const key = createHash("sha256")
     .update(sourceFile)
     .update(readFileSync(sourceFile))
     .update(sanitize ? "san" : "plain")
+    .update(backend === "c" ? "" : backend)
     .digest("hex")
     .slice(0, 16);
   const outDir = join(cacheDir, `console-io-${key}`);
@@ -40,7 +46,7 @@ async function build(name: string): Promise<{ binary: string; sourceFile: string
     outPath: join(outDir, name),
     outDir,
     sanitize,
-    backend: "c",
+    backend,
   });
   if (!result.ok) {
     throw new Error(
@@ -125,10 +131,10 @@ function runToClose(cmd: string, args: string[]): Promise<ClosedChild> {
   });
 }
 
-describe(`console/process output visibility${sanitize ? " (sanitized)" : ""}`, () => {
+describe.each(BACKENDS)(`console/process output visibility${sanitize ? " (sanitized)" : ""} [%s]`, (backend) => {
   test("console.log and string/byte stdout writes are visible before exit", async () => {
     const expected = Buffer.from("log-ready\nstring-ready|bytes-ready");
-    const probe = await build("live-stdout");
+    const probe = await build("live-stdout", backend);
 
     const [nodeOut, nativeOut] = await Promise.all([
       observeLiveStdout("node", [probe.sourceFile], expected),
@@ -140,7 +146,7 @@ describe(`console/process output visibility${sanitize ? " (sanitized)" : ""}`, (
 
   test("stdout already submitted before an unflushable SIGKILL matches Node", async () => {
     const expected = Buffer.from("before-sigkill\n");
-    const probe = await build("sigkill-stdout");
+    const probe = await build("sigkill-stdout", backend);
 
     const [nodeRes, nativeRes] = await Promise.all([
       runToClose("node", [probe.sourceFile]),

@@ -78,9 +78,23 @@ function runLane(cmd: string, args: string[], driver: string | null): Promise<Pr
   });
 }
 
-async function build(entry: string): Promise<string> {
+/** The lanes each program runs on: the c lane (the reference) and the
+ * wasm-native lane (native-runner phase N1: node:dgram in the wasm module
+ * over the runner's host). A program the wasm tier does not build refuses
+ * there by name and is not run on that lane. */
+const BACKENDS = ["c", "wasm-native"] as const;
+type Backend = (typeof BACKENDS)[number];
+
+/** Programs the wasm-native lane does not yet match, pinned as failing (a
+ * fix makes the program pass and this test fail until the entry goes). */
+const WASM_NATIVE_KNOWN: Record<string, string> = {
+  "udp-implicit-bind-unref":
+    "dgram.ts connectNow casts the absent connect callback to a non-null reference: c.connect(port, address) with no callback traps (\"illegal cast\") after the implicit bind",
+};
+
+async function build(entry: string, backend: Backend): Promise<string | null> {
   const hash = createHash("sha256");
-  hash.update(entry).update(readFileSync(entry));
+  hash.update(entry).update(readFileSync(entry)).update(backend === "c" ? "" : backend);
   const key = hash.update(sanitize ? "san" : "plain").digest("hex").slice(0, 16);
   const outDir = join(cacheDir, `dgram-${key}`);
   mkdirSync(outDir, { recursive: true });
@@ -91,8 +105,13 @@ async function build(entry: string): Promise<string> {
     // Pinned: a networking suite whose flake surface is already the
     // sockets — the compiled lane stays the C reference so any diff is
     // network behavior, never a backend-lane change.
-    backend: "c",
+    backend,
   });
+  if (!result.ok && backend === "wasm-native") {
+    // out of the wasm tier: loud, exactly one SC3001 naming why
+    expect(result.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
+    return null;
+  }
   if (!result.ok) {
     throw new Error(
       "dgram fixture failed to compile:\n" +
@@ -111,8 +130,16 @@ const cases = globSync(join(fixturesRoot, "cases/*/main.ts"))
   }));
 
 describe(`dgram differential (${cases.length} programs${sanitize ? ", sanitized" : ""})`, () => {
-  test.for(cases.map((c) => [c.name, c] as const))("%s", async ([, c]) => {
-    const binary = await build(c.entry);
+  const runs: [string, (typeof cases)[number], Backend][] = BACKENDS.flatMap((b) => cases.map((c): [string, (typeof cases)[number], Backend] => [`${c.name} [${b}]`, c, b]));
+  test.for(runs)("%s", { timeout: 120_000 }, async ([, c, b]) => {
+    const binary = await build(c.entry, b);
+    if (binary === null) return;
+    if (b === "wasm-native" && c.name in WASM_NATIVE_KNOWN) {
+      const nodeRes = await runLane("node", [c.entry], c.driver);
+      const nativeRes = await runLane(binary, [], c.driver).catch(() => null);
+      expect(nativeRes !== null && nativeRes.stdout.equals(nodeRes.stdout) && nativeRes.exitCode === nodeRes.exitCode).toBe(false);
+      return;
+    }
     // Sequential, not parallel: both lanes bind ephemeral ports and drive
     // real sockets — parallelism buys little and interleaves kernel state.
     const nodeRes = await runLane("node", [c.entry], c.driver);
@@ -123,5 +150,5 @@ describe(`dgram differential (${cases.length} programs${sanitize ? ", sanitized"
     }
     expect(nativeRes.exitCode).toBe(nodeRes.exitCode);
     expect(nativeRes.driverStdout).toBe(nodeRes.driverStdout);
-  }, 120_000);
+  });
 });

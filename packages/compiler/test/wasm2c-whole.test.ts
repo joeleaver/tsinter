@@ -634,7 +634,7 @@ ${bodies.map((_, j) => `    case ${j + 1}: f${j + 1}(); break;`).join("\n")}
         "-o",
         join(dir, "wn_main.o"),
       ]);
-      execFileSync("clang", [...wasmNativeCflags(false), `-I${RT}`, join(dir, "drv.c"), join(dir, "wn_main.o"), join(RT, "wn_gc.c"), join(RT, "wn_host.c"), "-o", join(dir, "t"), "-lpthread", "-lm"]);
+      execFileSync("clang", [...wasmNativeCflags(false), `-I${RT}`, join(dir, "drv.c"), join(dir, "wn_main.o"), join(RT, "wn_gc.c"), join(RT, "wn_host.c"), join(RT, "wn_ev.c"), "-o", join(dir, "t"), "-lpthread", "-lm"]);
       const got = bodies.map((_, j) => {
         try {
           execFileSync(join(dir, "t"), [String(j + 1)], { stdio: ["ignore", "pipe", "pipe"] });

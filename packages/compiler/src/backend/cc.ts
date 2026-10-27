@@ -575,7 +575,7 @@ export function zlibDefines(platform: string): string[] {
  * instruments the codec too. The flavor keys the driver and target exactly
  * like the lre flavor, so a zig-built object set never reaches a clang
  * link off a shared directory. */
-async function ensureZlibObjects(sanitize: boolean, driver: CcDriver): Promise<string[]> {
+export async function ensureZlibObjects(sanitize: boolean, driver: CcDriver): Promise<string[]> {
   const flavor =
     (sanitize ? "asan" : "plain") +
     (driver.argv.length === 1 && driver.argv[0] === "clang" ? "" : "-zigcc") +
@@ -856,7 +856,7 @@ function vendorTlsDir(): string {
  * TUs compile with `zig cc -target <triple>` and the archive is packed
  * with `zig ar` (llvm-ar — the host BSD ar has no business indexing ELF
  * objects). Host builds keep the exact historical clang + ar recipe. */
-async function ensureTlsArchive(sanitize: boolean, driver: CcDriver): Promise<string> {
+export async function ensureTlsArchive(sanitize: boolean, driver: CcDriver): Promise<string> {
   const flavor = `${sanitize ? "asan" : "plain"}${driver.target !== null ? `-${driver.target}` : ""}`;
   const compileArgv = driver.target !== null ? driver.argv : ["clang"];
   const arArgv = driver.target !== null ? [...driver.argv.slice(0, 1), "ar"] : ["ar"];

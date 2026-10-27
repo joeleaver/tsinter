@@ -7,7 +7,10 @@
  *    writeFileSync("w.txt\0.js") cannot write "w.txt";
  *  - copyFileSync(a, a) leaves the file alone (libuv's same-file check);
  *  - a SIGSEGV the process sends itself kills it as it kills Node (the
- *    runner's fault handler re-raises a signal no access raised).
+ *    runner's fault handler re-raises a signal no access raised);
+ *  - (phase N1) the event sources' host keeps nothing the program
+ *    released: the runner's WN_FD_AUDIT line after children, pipes,
+ *    sockets, watches and signal subscriptions came and went.
  * Each program runs in its own temporary directory, the oracle first. */
 import { execFile } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -109,6 +112,97 @@ console.log(JSON.stringify(fs.readFileSync("b.txt", "utf8")));
     const { node, native } = await both(src);
     expect(native.stdout).toBe(node.stdout);
     expect(native.stdout).toContain("hello world");
+  });
+
+  test("the host keeps nothing the program released: children, pipes, sockets, a server, watches and signal subscriptions, each opened and closed many times, leave no descriptor and no registration behind (WN_FD_AUDIT)", async () => {
+    const src = `import { spawn, spawnSync } from "node:child_process";
+import * as fs from "node:fs";
+import * as net from "node:net";
+let syncOk = 0;
+for (let i = 0; i < 30; i++) {
+  const r = spawnSync("/bin/sh", ["-c", "echo x"]);
+  if (r.status === 0 && r.stdout.toString() === "x\\n") syncOk++;
+}
+console.log("sync", syncOk);
+let asyncOk = 0;
+function child(n: number): void {
+  if (n === 0) {
+    console.log("async", asyncOk);
+    tcp();
+    return;
+  }
+  const c = spawn("/bin/sh", ["-c", "echo y"], { stdio: ["ignore", "pipe", "ignore"] });
+  let got = "";
+  let ended = false;
+  let exited = false;
+  const next = (): void => {
+    if (!ended || !exited) return;
+    if (got === "y\\n") asyncOk++;
+    child(n - 1);
+  };
+  c.stdout?.on("data", (d: Buffer) => {
+    got += d.toString();
+  });
+  c.stdout?.on("end", () => {
+    ended = true;
+    next();
+  });
+  c.on("exit", () => {
+    exited = true;
+    next();
+  });
+}
+function tcp(): void {
+  const server = net.createServer((s) => {
+    s.on("data", (d) => s.end(d));
+  });
+  server.listen(0, "127.0.0.1", () => {
+    const port = (server.address() as net.AddressInfo).port;
+    let left = 30;
+    let ok = 0;
+    const one = (): void => {
+      if (left-- === 0) {
+        console.log("tcp", ok);
+        server.close();
+        watchesAndSignals();
+        return;
+      }
+      const c = net.connect(port, "127.0.0.1", () => {
+        c.write("ping");
+      });
+      c.on("data", (d) => {
+        if (d.toString() === "ping") ok++;
+      });
+      c.on("close", one);
+    };
+    one();
+  });
+}
+function watchesAndSignals(): void {
+  fs.writeFileSync("w.txt", "x");
+  for (let i = 0; i < 20; i++) {
+    const w = fs.watch("w.txt");
+    w.close();
+  }
+  const h = (): void => {};
+  for (let i = 0; i < 20; i++) {
+    process.on("SIGUSR2", h);
+    process.off("SIGUSR2", h);
+  }
+  console.log("done");
+}
+child(30);
+`;
+    process.env["WN_FD_AUDIT"] = "1";
+    try {
+      const { node, native } = await both(src);
+      expect(node.stdout).toBe("sync 30\nasync 30\ntcp 30\ndone\n");
+      expect(native.stdout).toBe(node.stdout);
+      expect(native.code).toBe(0);
+      expect(native.stderr).toBe("wn-audit: fds 0 live 0 queued 0\n");
+    } finally {
+      delete process.env["WN_FD_AUDIT"];
+    }
   });
 
   test("a SIGSEGV the process sends itself kills it, as it kills Node", async () => {
