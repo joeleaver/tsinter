@@ -304,15 +304,13 @@ test("A2-REF-03 a getter written before a data member refuses at compile time (i
   expect(diags.some((d) => d.startsWith("SC3001:") && d.includes("(jsOp:defineGetter-order)"))).toBe(true);
 });
 
-test("A2-REF-04 a typed conversion of an object carrying an island getter refuses by name, uncaught", async () => {
+test("A2-REF-04 a typed conversion of an object carrying an island getter: the typed callback parameter that would take it is refused at compile time (unit H, SEMANTICS.md S115 (d))", async () => {
   const src =
-    '// @dynamic\nconst o: any = {\n  n: 1,\n  get g() {\n    return 2;\n  },\n};\nfunction sum(r: { n: number; g: number }): number {\n  return r.n + r.g;\n}\nconsole.log("before");\nconsole.log(sum(o));';
-  const { stdout, stderr } = await runRowTrap("A2-REF-04", src, "ts");
-  // Node: before, then 3.
-  expect(stdout).toBe("before\n");
-  expect(stderr).toContain(
-    "Uncaught Error: reading a getter-defined property of an island object here (a typed conversion, an option record, deep equality) is not supported yet",
-  );
+    '// @dynamic\nconst o: any = {\n  n: 1,\n  get g() {\n    return 2;\n  },\n};\nconst api: any = { each(f: any) { return f(o); } };\nconsole.log("before");\nconsole.log(api.each((r: { n: number; g: number }) => r.n + r.g));';
+  // Node: before, then 3. Before unit H the conversion refused at run
+  // time (the getter could not be read by the typed conversion); the
+  // typed parameter is now a compile-time refusal on every lane.
+  await expect(build("A2-REF-04", src, "ts")).rejects.toThrow(/SC1090|a function called from dynamic code with a typed/);
 });
 
 test("A2-REF-05 Object.assign onto an island getter refuses by name; deep equality over a linked object refuses uncaught", async () => {
@@ -359,14 +357,13 @@ test("A2-TAG-02 a non-callable island tag names itself", async () => {
   expect(exitCode).toBe(0);
 });
 
-test("A2-REF-06 an index-signature typed conversion of an object carrying an island getter refuses by name, uncaught", async () => {
+test("A2-REF-06 a typed conversion of an object carrying an island getter: the typed callback parameter that would take it is refused at compile time (unit H, SEMANTICS.md S115 (d))", async () => {
   const src =
-    '// @dynamic\nconst o: any = {\n  n: 1,\n  get g() {\n    return 2;\n  },\n};\nfunction sum(r: { [k: string]: number }): number {\n  let t = 0;\n  for (const k in r) t += r[k]!;\n  return t;\n}\nconsole.log("before");\nconsole.log(sum(o));';
-  const { stdout, stderr } = await runRowTrap("A2-REF-06", src, "ts");
-  // Node: before, then 3. (The record walkers' raw entry reads take the
-  // same refusal as dyn.objGet.)
-  expect(stdout).toBe("before\n");
-  expect(stderr).toContain("Uncaught Error: reading a getter-defined property of an island object here");
+    '// @dynamic\nconst o: any = {\n  n: 1,\n  get g() {\n    return 2;\n  },\n};\nconst api: any = { each(f: any) { return f(o); } };\nconsole.log("before");\nconsole.log(api.each((r: { [k: string]: number }) => r["n"]! + r["g"]!));';
+  // Node: before, then 3. Before unit H the conversion refused at run
+  // time (the getter could not be read by the typed conversion); the
+  // typed parameter is now a compile-time refusal on every lane.
+  await expect(build("A2-REF-06", src, "ts")).rejects.toThrow(/SC1090|a function called from dynamic code with a typed/);
 });
 
 // ============================================================
@@ -778,63 +775,63 @@ test("P-FLAT-02 flat over a cyclic array: Infinity throws V8's RangeError catcha
   expect(exitCode).toBe(0);
 });
 
-test("P-BRIDGE-01 a Promise<any[]> bridge: an array fulfilment crosses by reference, any other value rejects by name", async () => {
+test("P-BRIDGE-01 a Promise<any[]> fulfilment is the island value itself, whatever it is (unit H)", async () => {
   const { stdout, stderr, exitCode } = await runRow("P-BRIDGE-01", "// @dynamic\n// a Promise<any[]> bridge: an array fulfillment by reference, a non-array fulfillment rejects\n'use strict';\n/** @returns {any} */\nfunction mk() {\n  return {\n    /** @returns {Promise<any>} */\n    arr: async () => [1, 2],\n    /** @returns {Promise<any>} */\n    obj: async () => ({ a: 1 }),\n    /** @returns {Promise<any>} */\n    num: async () => 5,\n    /** @returns {Promise<any>} */\n    bad: async () => {\n      throw new Error(\"nope\");\n    },\n  };\n}\nconst src = mk();\n/** @returns {Promise<any[]>} */\nfunction viaArr() {\n  return src.arr();\n}\n/** @returns {Promise<any[]>} */\nfunction viaObj() {\n  return src.obj();\n}\n/** @returns {Promise<any[]>} */\nfunction viaNum() {\n  return src.num();\n}\n/** @returns {Promise<any[]>} */\nfunction viaBad() {\n  return src.bad();\n}\nasync function main() {\n  const a = await viaArr();\n  console.log(`${a.length} ${a[0]}`);\n  for (const f of [viaObj, viaNum, viaBad]) {\n    try {\n      const r = await f();\n      console.log(`ok ${typeof r}`);\n    } catch (e) {\n      console.log(`${e.name}: ${e.message}`);\n    }\n  }\n}\nvoid main();", "js");
-  // Node: 2 1 / ok object / ok number / Error: nope — there is no boundary
-  // in Node, so the value arrives as it is. The bridge's TypeError is the
-  // jsExit array arm's own (SEMANTICS.md S044's unit-P amendment).
-  expect(stdout).toBe("2 1\nTypeError: expected an array, got object\nTypeError: expected an array, got number\nError: nope\n");
+  // Node's answer: `any[]` IS the island array (SEMANTICS.md S014's unit-H
+  // amendment), so a Promise<any[]> settles with the island value as it
+  // is — no array exit runs, and a non-array arrives unchanged.
+  expect(stdout).toBe("2 1\nok object\nok number\nError: nope\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
 
-test("P-ASYNC-03 async returns into Promise<any[]> adopt with Node's turns; a non-array adopted value rejects by name", async () => {
+test("P-ASYNC-03 async returns into Promise<any[]> adopt with Node's turns; a non-array adopted value arrives as it is (unit H)", async () => {
   const { stdout, stderr, exitCode } = await runRow("P-ASYNC-03", "// @dynamic\n// an async function returning an island promise into Promise<any[]>: adopted, Node's turns\n'use strict';\n/** @returns {any} */\nfunction mk() {\n  return {\n    list: [1, 2],\n    /** @returns {Promise<any>} */\n    arr: async () => [3, 4, 5],\n    /** @returns {Promise<any>} */\n    obj: async () => ({ a: 1 }),\n  };\n}\nconst src = mk();\n/** @type {string[]} */\nconst log = [];\n/** @returns {Promise<any[]>} */\nasync function viaArr() {\n  return src.arr();\n}\nasync function viaAll() {\n  return Promise.all(src.list);\n}\n/** @returns {Promise<any[]>} */\nasync function viaObj() {\n  return src.obj();\n}\nasync function main() {\n  const a = viaArr();\n  const b = viaAll();\n  Promise.resolve()\n    .then(() => log.push(\"t1\"))\n    .then(() => log.push(\"t2\"))\n    .then(() => log.push(\"t3\"))\n    .then(() => log.push(\"t4\"));\n  a.then((r) => log.push(`a${r.length}`));\n  b.then((r) => log.push(`b${r.length}`));\n  for (let i = 0; i < 6; i++) await null;\n  console.log(log.join(\",\"));\n  try {\n    const o = await viaObj();\n    console.log(`ok ${typeof o}`);\n  } catch (e) {\n    console.log(`${e.name}: ${e.message}`);\n  }\n}\nvoid main();", "js");
-  // Node: t1,t2,a3,b2,t3,t4 / ok object (S044's unit-P amendment).
-  expect(stdout).toBe("t1,t2,a3,b2,t3,t4\nTypeError: expected an array, got object\n");
+  // Node's answer (S014's unit-H amendment: no array exit at the adoption).
+  expect(stdout).toBe("t1,t2,a3,b2,t3,t4\nok object\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
 
 test("P-PARAM-01 an island array reaching an any[] | undefined parameter is the caller's array", async () => {
   const { stdout, stderr, exitCode } = await runRow("P-PARAM-01", "// @dynamic\n// an island array reaching an `any[] | undefined` parameter is the caller's array (pushes are shared)\nfunction take(xs: any[] | undefined): number {\n  if (xs === undefined) return -1;\n  xs.push(1);\n  return xs.length;\n}\nfunction back(xs: any[] = []): any[] {\n  xs.push(\"added\");\n  return xs;\n}\nconst o: any = { a: [1, \"x\"], b: undefined, c: 5, p: [{ n: 1 }] };\nconst arr = o.a;\nconsole.log(`${take(o.a)} ${arr.length} ${take(o.b)}`);\ntry {\n  console.log(`${take(o.c)}`);\n} catch (e) {\n  console.log(`${(e as Error).name}: ${(e as Error).message}`);\n}\nconst r = back(o.p);\nconsole.log(`${o.p.length} ${r.length} ${r[0] === o.p[0]} ${r === o.p}`);", "ts");
-  // Node: 3 3 -1 / TypeError: xs.push is not a function / 2 2 true true.
-  // The non-array argument fails at the boundary with the checked exit's
-  // text (S044's unit-P amendment). `r === o.p` is false here: the front
-  // end's own any[]-to-any conversion (%jsin.arr) builds a fresh island
-  // array on every lane — a front-end matter, not this unit's.
-  expect(stdout).toBe("3 3 -1\nTypeError: expected array | undefined at $, got number\n2 2 true false\n");
+  // Node's answer: the parameter IS the caller's island array (S014's
+  // unit-H amendment) — a non-array binds as it is and fails at its first
+  // use, and `r === o.p` holds.
+  expect(stdout).toBe("3 3 -1\nTypeError: xs.push is not a function\n2 2 true true\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
 
 test("P-IDENT-01 bridged promises: a crossed static promise and a bridge of a bridge answer themselves; two bridges of one island source are two promises", async () => {
   const { stdout, stderr, exitCode } = await runRow("P-IDENT-01", "// @dynamic\n'use strict';\n/** @returns {any} */\nfunction mk() { return {\n  /** @returns {Promise<any>} */\n  arr: async () => { await null; return [1, 2]; },\n  /** @returns {Promise<any>} */\n  bad: async () => { await null; throw new Error(\"nope\"); },\n  ip: null, q: null, res: null, rej: null }; }\nconst box = mk();\n/** @type {string[]} */\nconst log = [];\n/** @returns {Promise<any[]>} */\nfunction viaBox() { return box.ip; }\n/** @returns {Promise<any[]>} */\nfunction viaQ() { return box.q; }\n/** @param {any[]} xs @returns {Promise<any[]>} */\nasync function hold(xs) { await null; return xs; }\nasync function main() {\n  box.ip = box.arr();\n  const p1 = viaBox(), p2 = viaBox();\n  box.q = p1;\n  const p3 = viaQ();\n  const h = hold([1]);\n  box.ip = h;\n  const p4 = viaBox();\n  console.log(`${p1 === p2} ${p3 === p1} ${p4 === h}`);\n  p4.then(() => log.push(\"p4\"));\n  h.then(() => log.push(\"h\"));\n  box.ip.then(() => log.push(\"isl\"));\n  for (let i = 0; i < 6; i++) await null;\n  console.log(log.join(\",\"));\n}\nvoid main();", "js");
-  // Node: true true true / p4,h,isl (S044's unit-P amendment).
-  expect(stdout).toBe("false true true\np4,h,isl\n");
+  // Node's answer: a Promise<any[]> read of an island promise is that
+  // promise itself (S014's unit-H amendment), so two reads are one promise.
+  expect(stdout).toBe("true true true\np4,h,isl\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
 
-test("P-BRIDGE-13 a non-array fulfilment rejects the bridge: its derived promise's rejection is reported, exit 1", async () => {
-  // Node: s1,i1,ok, exit 0 (S044's unit-P amendment).
-  const { stdout, stderr } = await runRowTrap("P-BRIDGE-13", "// @dynamic\n'use strict';\n/** @returns {any} */\nfunction mk() { return {\n  /** @returns {Promise<any>} */\n  arr: async () => { await null; return [1, 2]; },\n  /** @returns {Promise<any>} */\n  bad: async () => { await null; throw new Error(\"nope\"); },\n  ip: null, q: null, res: null, rej: null }; }\nconst box = mk();\n/** @type {string[]} */\nconst log = [];\n/** @returns {Promise<any[]>} */\nfunction viaBox() { return box.ip; }\n/** @returns {Promise<any[]>} */\nfunction viaQ() { return box.q; }\nasync function main() {\n  box.ip = new Promise((r) => { box.res = r; });\n  const p = viaBox();\n  p.then(() => log.push(\"s1\"));\n  box.res(5);\n  box.ip.then(() => log.push(\"i1\"));\n  try { await p; log.push(\"ok\"); } catch (e) { log.push(\"rej\"); }\n  console.log(log.join(\",\"));\n}\nvoid main();", "js");
-  expect(stdout).toBe("i1,rej\n");
-  expect(stderr).toContain("Unhandled promise rejection: TypeError: expected an array, got number");
+test("P-BRIDGE-13 a non-array fulfilment of a Promise<any[]> arrives as it is (unit H)", async () => {
+  // Node's answer: s1,i1,ok, exit 0 (S014's unit-H amendment).
+  const { stdout, stderr, exitCode } = await runRow("P-BRIDGE-13", "// @dynamic\n'use strict';\n/** @returns {any} */\nfunction mk() { return {\n  /** @returns {Promise<any>} */\n  arr: async () => { await null; return [1, 2]; },\n  /** @returns {Promise<any>} */\n  bad: async () => { await null; throw new Error(\"nope\"); },\n  ip: null, q: null, res: null, rej: null }; }\nconst box = mk();\n/** @type {string[]} */\nconst log = [];\n/** @returns {Promise<any[]>} */\nfunction viaBox() { return box.ip; }\n/** @returns {Promise<any[]>} */\nfunction viaQ() { return box.q; }\nasync function main() {\n  box.ip = new Promise((r) => { box.res = r; });\n  const p = viaBox();\n  p.then(() => log.push(\"s1\"));\n  box.res(5);\n  box.ip.then(() => log.push(\"i1\"));\n  try { await p; log.push(\"ok\"); } catch (e) { log.push(\"rej\"); }\n  console.log(log.join(\",\"));\n}\nvoid main();", "js");
+  expect(stdout).toBe("s1,i1,ok\n");
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
 });
 
-test("P-LIFT-01 the front end's any[] lift copies through a typed local and an any assignment (board #259)", async () => {
+test("P-LIFT-01 an any[] through a typed local and an any assignment is one array (board #259, unit H)", async () => {
   const { stdout, stderr, exitCode } = await runRow("P-LIFT-01", "// @dynamic\nfunction back(xs: any[] = []): any[] {\n  xs.push(\"added\");\n  return xs;\n}\nconst o: any = { p: [{ n: 1 }] };\nconst r = back(o.p);\nconst anyR: any = r;\nanyR.push(9);\nconsole.log(`${o.p.length} ${r.length} ${anyR.length} ${anyR === o.p}`);\no.p.push(7);\nconsole.log(`${r.length} ${anyR.length}`);", "ts");
-  // Node: 3 3 3 true / 4 4 (S014's unit-P amendment).
-  expect(stdout).toBe("2 2 3 false\n3 3\n");
+  // Node's answer (S014's unit-H amendment: `any[]` IS the island array).
+  expect(stdout).toBe("3 3 3 true\n4 4\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
 
-test("P-LIFT-02 a static any[] written into an island object is copied per write (board #259)", async () => {
+test("P-LIFT-02 an any[] written into an island object is shared, not copied (board #259, unit H)", async () => {
   const { stdout, stderr, exitCode } = await runRow("P-LIFT-02", "// @dynamic\nconst a: any[] = [1, 2];\nconst b: any[] = a;\nconst c: any[] = a.concat();\nconst h: any = {};\nh.a = a; h.b = b; h.c = c;\nconsole.log(`${h.a === h.b} ${h.a === h.c}`);\nh.a.push(3);\nconsole.log(`${a.length} ${b.length} ${c.length}`);\na.push(4);\nconsole.log(`${h.a.length} ${h.b.length}`);", "ts");
-  // Node: true false / 3 3 2 / 4 4 (S014's unit-P amendment).
-  expect(stdout).toBe("false false\n2 2 2\n3 2\n");
+  // Node's answer (S014's unit-H amendment: `any[]` IS the island array).
+  expect(stdout).toBe("true false\n3 3 2\n4 4\n");
   expect(stderr).toBe("");
   expect(exitCode).toBe(0);
 });
@@ -846,12 +843,13 @@ test("P-THEN-01 island Promise.all over a thenable object element meets settle's
   expect(stderr).toContain("resolving a promise with a non-promise thenable is not supported yet");
 });
 
-test("P-FLAT-03 flat over a growth write's padding sees undefined where Node has holes (S016)", async () => {
-  // Node: 2 [0,9] — the padded slots are holes there, skipped by flat.
-  const { stdout, stderr, exitCode } = await runRow("P-FLAT-03", "// @dynamic\n// flat over a growth write's padding (S016: undefined where Node has holes)\n'use strict';\n/** @returns {any} */\nfunction grow() {\n  return [[0]];\n}\nconst g = grow();\ng[3] = [9];\nconsole.log(`${g.flat().length} ${JSON.stringify(g.flat())}`);", "js");
-  expect(stdout).toBe("4 [0,null,null,9]\n");
-  expect(stderr).toBe("");
-  expect(exitCode).toBe(0);
+test("P-FLAT-03 an island growth write past the length (Node leaves holes) refuses by name (S110 (f))", async () => {
+  // Node: 2 [0,9] — the slots between are holes there, skipped by flat.
+  // The dense vector would pad with undefined (silently "4 [0,null,null,9]");
+  // since unit H the island write past the length throws by name instead.
+  const { stdout, stderr } = await runRowTrap("P-FLAT-03", "// @dynamic\n// flat over a growth write's padding (S016: undefined where Node has holes)\n'use strict';\n/** @returns {any} */\nfunction grow() {\n  return [[0]];\n}\nconst g = grow();\ng[3] = [9];\nconsole.log(`${g.flat().length} ${JSON.stringify(g.flat())}`);", "js");
+  expect(stdout).toBe("");
+  expect(stderr).toContain("writing an island array at index 3 past its length (the holes Node leaves) is not supported yet on the wasm lane");
 });
 
 test("P-FLAT-04 flat stops at 1000 nested levels with V8's RangeError, catchably, even deep in a call chain (S043 unit-P amendment)", async () => {

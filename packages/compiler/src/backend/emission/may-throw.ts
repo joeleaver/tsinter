@@ -162,6 +162,8 @@ export function computeMayThrow(mod: IrModule): { fns: Set<string>; indirect: bo
         case "jsExit":
         case "jsMarshal":
         case "jsBridgePromise":
+        case "jsView":
+        case "jsUnview":
           // Island operations bridge engine exceptions into the cell
           // (jsMarshal only on engine-level surprise, but the emitted
           // pending check exists — seed conservatively).

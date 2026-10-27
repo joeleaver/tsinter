@@ -2318,6 +2318,18 @@ static ScrDyn *scr_json_value(ScrJsonP *p) {
   return NULL;
 }
 
+ScrDyn *scr_dyn_island_plain(ScrDyn *d) {
+  if (!d || d->kind != SCR_DYN_JSVAL) return scr_dyn_retain(d);
+  ScrDyn *snap = scr_dyn_jsval_ops()->inspect_snapshot(d->v.jsval.cell, 1e9);
+  if (snap) return snap;
+  if (scr_exc_pending()) return NULL;
+  ScrStr *js = scr_dyn_jsval_ops()->to_json(d->v.jsval.cell);
+  if (!js) return NULL;
+  ScrDyn *out = scr_json_parse(js);
+  scr_str_release(js);
+  return out;
+}
+
 ScrDyn *scr_json_parse(ScrStr *text) {
   ScrJsonP p = { text->data, text->len, 0, 0 };
   scr_json_ws(&p);
@@ -2538,6 +2550,8 @@ static ScrDyn *scr_sc_clone(const ScrDyn *v, const ScrScParent *up) {
 ScrDyn *scr_structured_clone(const ScrDyn *value, const ScrDyn *options) {
   scr_sc_validate_options(options);
   if (scr_exc_pending()) return NULL;
+  /* An island value: the engine's own structuredClone (unit H). */
+  if (value && value->kind == SCR_DYN_JSVAL) return scr_dyn_jsval_ops()->structured_clone(value->v.jsval.cell);
   return scr_sc_clone(value, NULL);
 }
 

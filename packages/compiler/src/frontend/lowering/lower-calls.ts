@@ -10,6 +10,7 @@ import type { IrFfiImport } from "../../ir/nodes.js";
 import { isJsSourceFile, locOf } from "../program.js";
 import { isGenericCallableMemberType, typeKey } from "../types.js";
 import { PoisonError, dynFallbackType, dynUndefinedExpr, importCallHandleType, jsFuncNameOf, newFnCtx, nodeThrowExpr } from "./lowerer.js";
+import { isTypedComposite } from "./island-views.js";
 import { enforceLibBoundary } from "./lib-boundary.js";
 import { NARROW_FIRST, builtinFenceHintOf, builtinModuleFnOf } from "./surfaces.js";
 import { ffiBindingDiag, ffiSignatureDiag, requiresDynamicDiag } from "../../diagnostics/diagnostic.js";
@@ -241,7 +242,7 @@ export interface GenericInstance {
         // value crosses as a REST host function (the withPlugins
         // `async (...args) =>` shape). Static builds keep the variadic
         // dyn form for every unmappable JS rest.
-        if (restMapped?.kind === "array" && restMapped.elem.kind === "jsval" && L.dynamic) {
+        if (restMapped?.kind === "jsval" && L.dynamic) {
           return { type: JSVAL, mode: "islandRest" };
         }
         if (restMapped?.kind !== "array") {
@@ -249,6 +250,10 @@ export interface GenericInstance {
         }
       }
       const type = L.irTypeOf(param.name);
+      // An `any[]` rest (`...args: any[]`) IS the island array itself
+      // (SEMANTICS.md S014's unit-H amendment): the binding is a fresh
+      // engine array per call, exactly the JS `(...args)` island form.
+      if (type.kind === "jsval" && L.dynamic) return { type: JSVAL, mode: "islandRest" };
       // Tuple-typed rest params don't map to an array; generic rest is the
       // generic path's business. Anything non-array here is unmappable.
       if (type.kind !== "array") L.badType(param.name, L.typeOf(param.name));
@@ -2909,14 +2914,15 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       const values: RuntimeFormatArg[] = expr.arguments.map((a) => {
         const lowered = L.lowerExpr(a);
         if (lowered.type.kind === "jsval") {
-          // Node prints objects with util.inspect formatting, which
-          // String() cannot match — silent divergence is banned. Templates
-          // are ToString (Node-exact), casts are validated: both honest.
-          L.unsupported(
-            "SC1090",
-            a,
-            `${surface} of 'any' values (wrap it: ${surface}(\`\${v}\`), or validate with 'as <type>' first)`,
-          );
+          // An island value prints through the checked-dynamic renderer
+          // (the jsval→dyn crossing wraps BY REFERENCE; nothing is
+          // copied): primitives and plain data — dense Arrays, plain
+          // objects — render as Node's util.inspect does (on the native
+          // lanes through a read-only snapshot of the engine value, which
+          // printing cannot observe), every other engine shape keeps the
+          // renderer's loud fence. Unit H: `any[]` IS the island array, so
+          // `console.log(xs)` over one lands here.
+          return { node: a, value: { kind: "dynFromJsval", value: lowered, type: DYN, loc: lowered.loc } };
         }
         // A function VALUE prints Node's [Function: name] form by boxing
         // across the checked-dynamic boundary (the box carries the
@@ -3259,6 +3265,7 @@ export function lowerCall(L: Lowerer, expr: ts.CallExpression): IrExpr {
       if (expr.arguments.some((a) => ts.isSpreadElement(a))) {
         return islandMethodSpreadCall(L, expr, receiver, expr.expression.name.text, expr.expression.getText(), loc);
       }
+      L.markIslandArrayCallbackParams(expr, expr.expression.expression);
       const args = expr.arguments.map((a) => L.jsvalIn(L.lowerExpr(a), a));
       const spelling = v8SpreadSpelling(expr.expression.getText());
       const result: IrExpr = {
@@ -4593,6 +4600,12 @@ const DYN_STRING_ONLY_METHODS = new Set([
     if (arg.type.kind === "dyn") {
       return { kind: "dynTest", test: "array", value: arg, type: BOOL, loc };
     }
+    // An island value (an `any[]` IS the island array — SEMANTICS.md
+    // S014's unit-H amendment): the engine's own answer through the
+    // by-reference jsval→dyn wrap (Array.isArray engine-side natively).
+    if (arg.type.kind === "jsval") {
+      return { kind: "dynTest", test: "array", value: { kind: "dynFromJsval", value: arg, type: DYN, loc }, type: BOOL, loc };
+    }
     if (arg.type.kind === "union") {
       // A union answers by its RUNTIME TAG: true iff the active arm is an
       // array kind (bytes arms answer false — Array.isArray(new Uint8Array)
@@ -4624,7 +4637,7 @@ const DYN_STRING_ONLY_METHODS = new Set([
         `Array.isArray on '${L.fmt(arg.type)}' values (narrow first: check a discriminant field, or compare with '!== undefined'/'!== null' for unit arms)`,
       );
     }
-    if (arg.type.kind === "jsval" || arg.type.kind === "caught") return null;
+    if (arg.type.kind === "caught") return null;
     if (arg.kind === "varRef" || arg.kind === "recordGet" || arg.kind === "fieldGet") {
       return { kind: "boolLit", value: arg.type.kind === "array", type: BOOL, loc };
     }
@@ -7165,7 +7178,7 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
         if (tProbe?.type.kind === "dyn") {
           const loc = locOf(call);
           const target = L.lowerExpr(call.arguments[0]!);
-          const source = L.coerceToExpected(L.lowerExpr(call.arguments[1]!), DYN);
+          const source = assignSourceDyn(L, L.lowerExpr(call.arguments[1]!), call.arguments[1]!);
           if (target.type.kind === "dyn" && source.type.kind === "dyn") {
             return { kind: "libCall", fn: "dyn.assign", args: [target, source], type: DYN, loc };
           }
@@ -7242,7 +7255,7 @@ export function lowerPromiseMethodCall(L: Lowerer, call: ts.CallExpression,
               const argNode = sources[i]!;
               const spread = ts.isSpreadElement(argNode);
               const srcNode = spread ? argNode.expression : argNode;
-              const src = L.coerceToExpected(L.lowerExpr(srcNode), DYN);
+              const src = assignSourceDyn(L, L.lowerExpr(srcNode), srcNode);
               if (src.type.kind !== "dyn") {
                 ok = false;
                 break;
@@ -8913,4 +8926,16 @@ function islandMethodSpreadCall(
     loc,
   };
   return islandPrimitiveExit(L, expr, result);
+}
+
+/** An Object.assign SOURCE entering the dyn copy walk. Under --dynamic a
+ * typed array/tuple/record source crosses as its live VIEW (unit H,
+ * SEMANTICS.md S115): the walk then copies its own members as JS does —
+ * nested composites by reference — where the checked-dynamic conversion
+ * would deep-copy them. */
+function assignSourceDyn(L: Lowerer, src: IrExpr, node: ts.Node): IrExpr {
+  if (L.dynamic && isTypedComposite(L, src.type)) {
+    return { kind: "dynFromJsval", value: L.jsvalIn(src, node), type: DYN, loc: src.loc };
+  }
+  return L.coerceToExpected(src, DYN);
 }

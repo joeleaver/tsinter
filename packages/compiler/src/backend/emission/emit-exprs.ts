@@ -6327,8 +6327,13 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
         // TypeError-shaped, path-annotated string. The dyn temp is BORROWED;
         // the result joins the frame BEFORE the pending check so an unwind
         // releases the dummy (NULL for refcounted targets) harmlessly.
-        const dyn = E.emitExpr(e.value);
+        let dyn = E.emitExpr(e.value);
         const helper = E.dynCheckHelper(e.type);
+        // A composite target over a value that may wrap a fresh island
+        // value (unit H): validate its plain data tree.
+        if (e.type.kind === "array" || e.type.kind === "record" || e.type.kind === "union") {
+          dyn = E.fallibleTemp(DYN, `scr_dyn_island_plain(${dyn.name})`);
+        }
         return E.fallibleTemp(e.type, `${helper}(${dyn.name}, NULL)`);
       }
       case "yieldExpr": {
@@ -6916,8 +6921,7 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
                 E.moveTemp(arr);
                 E.line(`${name} = scr_union_new_ref(${jsvalArr.i}, ${arr.name}, &scr_arr_retain_v, &scr_arr_release_v, NULL);`);
               } else {
-                const json = E.fallibleTemp(STRING, `scr_jsval_to_json(${v.name})`);
-                const dom = E.fallibleTemp(DYN, `scr_json_parse(${json.name})`);
+                const dom = E.fallibleTemp(DYN, `scr_jsval_plain_dyn(${v.name})`);
                 const out = E.fallibleTemp(e.type, `${E.dynCheckHelper(e.type)}(${dom.name}, NULL)`);
                 E.moveTemp(out);
                 E.line(`${name} = ${out.name};`);
@@ -6928,8 +6932,9 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
               E.currentFrame().push({ name, type: e.type });
               return { name, type: e.type };
             }
-            const json = E.fallibleTemp(STRING, `scr_jsval_to_json(${v.name})`);
-            const dom = E.fallibleTemp(DYN, `scr_json_parse(${json.name})`);
+            // The value as it is (undefined elements included), JSON only
+            // for shapes that are not plain data.
+            const dom = E.fallibleTemp(DYN, `scr_jsval_plain_dyn(${v.name})`);
             return E.fallibleTemp(e.type, `${E.dynCheckHelper(e.type)}(${dom.name}, NULL)`);
           }
         }
@@ -6948,6 +6953,32 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
               ? "SCR_ISLP_JSVAL_ARR" // `any[]` fulfillment: the Array.isArray-gated by-reference exit at settle
               : "SCR_ISLP_JSVAL";
         return E.fallibleTemp(e.type, `scr_jsval_bridge_promise(${v.name}, ${payload})`);
+      }
+      case "jsView": {
+        // Unit H (SEMANTICS.md S115): the typed composite's live island
+        // view — the prelude's Proxy over the compiled accessor closures,
+        // one per static pointer + type key. Operands borrowed; +1 cell.
+        const v = E.emitExpr(e.value);
+        const fns = e.fns.map((f) => E.emitExpr(f));
+        const arr = `sc_t${E.tempCounter++}`;
+        E.line(`ScrJsval *${arr}[] = { ${fns.map((f) => f.name).join(", ")} };`);
+        return E.fallibleTemp(
+          e.type,
+          `scr_jsval_view((void *)${v.name}, ${e.record ? 1 : 0}, (ScrStr *)&${E.internLiteral(e.typeKey)}, (ScrStr *)&${E.internLiteral(e.label)}, ${fns.length}, ${arr})`,
+        );
+      }
+      case "jsUnview": {
+        // A view of this static type unwraps to its static value (the
+        // runtime answers it BORROWED: retained past the check); anything
+        // else throws the named TypeError (NULL dummy, NULL-tolerant
+        // release on the unwind).
+        const v = E.emitExpr(e.value);
+        const t = E.fallibleTemp(
+          e.type,
+          `(${cType(e.type).trim()})scr_jsval_unview(${v.name}, (ScrStr *)&${E.internLiteral(e.typeKey)}, (ScrStr *)&${E.internLiteral(e.what)})`,
+        );
+        E.line(`${retainCallC(e.type, t.name)};`);
+        return t;
       }
       default: {
         const _exhaustive: never = e;

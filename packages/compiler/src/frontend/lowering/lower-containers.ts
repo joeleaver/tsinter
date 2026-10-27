@@ -136,6 +136,14 @@ function lowerOptionalDefaultArg(
     {
       const receiver = L.lowerExpr(access.expression);
       if (receiver.type.kind === "jsval") {
+        // The receiver's elements are ENGINE values whatever the checker
+        // spelled (an evolving-`any` array tsc retyped by its pushes —
+        // `const fns = []; fns.push(() => 1); fns.map(fn => fn())` — is
+        // the island array itself, SEMANTICS.md S014's unit-H amendment):
+        // an unannotated callback parameter binds the engine value it is
+        // handed (the then-handler rule, paramShape's island-handle
+        // early-out), so the host function needs no exit per parameter.
+        L.markIslandArrayCallbackParams(call, access.expression);
         const args = call.arguments.map((a) => L.jsvalIn(L.lowerExpr(a), a));
         const result: IrExpr = { kind: "jsOp", op: "callMethod", name, args: [receiver, ...args], type: JSVAL, loc };
         return islandPrimitiveExit(L, call, result);
@@ -2396,6 +2404,16 @@ function lowerOptionalDefaultArg(
     if (args.length === 1 && !ts.isObjectLiteralExpression(args[0]!)) {
       const src = L.lowerExpr(args[0]!);
       if (src.type.kind === "string") return strCharsCall(L, src, loc);
+      // An ISLAND source (`Array.from(x)`, `x: any`): the engine's own
+      // Array.from — a fresh island array (unit H: it then enters a typed
+      // slot as a fresh, element-checked copy, SEMANTICS.md S115 (d)).
+      if (src.type.kind === "jsval" && L.dynamic) {
+        return {
+          kind: "jsOp", op: "callMethod", name: "from",
+          args: [{ kind: "jsOp", op: "globalGet", name: "Array", args: [], type: JSVAL, loc }, src],
+          type: JSVAL, loc,
+        };
+      }
       L.noLowering(
         "Array.from with this argument shape",
         call,

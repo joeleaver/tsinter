@@ -3380,6 +3380,17 @@ typedef struct ScrDynJsvalOps {
    * bridges with the ENGINE's message. +1, or NULL with the exception
    * pending. */
   ScrDyn *(*iter_drain)(ScrJsval *cell, bool spread, const ScrStr *spell);
+  /* The inspect snapshot (unit H): a fresh dyn tree (+1) read from the
+   * engine value WITHOUT running user code — primitives, dense plain
+   * Arrays, and Object.prototype/null-prototype objects of enumerable
+   * data members, `levels` deep (deeper composites become one-member
+   * placeholders of their kind). NULL with NOTHING pending when the value
+   * holds any other shape (the renderer keeps its fence). */
+  ScrDyn *(*inspect_snapshot)(ScrJsval *cell, double levels);
+  /* structuredClone(v) in the ENGINE (unit H: a dynamic value cloned on
+   * the native lanes is the engine's own clone, DataCloneError and all).
+   * +1, or NULL with the exception pending. */
+  ScrDyn *(*structured_clone)(ScrJsval *cell);
 } ScrDynJsvalOps;
 
 /* The allocator view the gated constructor uses (installs the ops);
@@ -3388,6 +3399,17 @@ ScrDyn *scr_dyn_alloc_jsval(ScrJsval *cell, const ScrDynJsvalOps *ops);
 /* The installed ops (traps on a missing install — impossible unless a
  * JSVAL node was forged without the constructor). */
 const ScrDynJsvalOps *scr_dyn_jsval_ops(void);
+/* Unit H (SEMANTICS.md S115 (d)): the checked-dynamic value `d` as a plain
+ * data tree for a validated copy into typed storage — an island value
+ * wrapped in it (a fresh engine object the lowering proved nothing else
+ * holds) converts through its JSON text; any other node is retained as
+ * is. +1, or NULL with the exception pending. */
+ScrDyn *scr_dyn_island_plain(ScrDyn *d);
+/* The engine value `v` as a plain data tree for a validated exit: read
+ * as it is (undefined elements stay undefined — no user code runs) where
+ * it is plain data, else through its JSON text (toJSON protocols, the
+ * cycle TypeError). +1, or NULL with the exception pending. */
+ScrDyn *scr_jsval_plain_dyn(ScrJsval *v);
 /* dynTest arms that need the ENGINE's answer on a JSVAL node. Each
  * answers false for every other kind (callers test unconditionally —
  * the emitted narrowing tests stay branch-free). Never throw. */
@@ -4292,6 +4314,13 @@ ScrJsval *scr_jsval_from_json(const ScrStr *json);
  * fresh engine function (identity is not preserved for re-crossings;
  * SEMANTICS.md). NULL with a pending exception on failure. Borrows d. */
 ScrJsval *scr_jsval_from_dyn(const ScrDyn *d);
+/* Unit H (SEMANTICS.md S115): a typed composite's live island VIEW (+1,
+ * NULL + pending on an engine surprise; fns borrowed), and the unwrap of
+ * a view of the given type key back to its static pointer (BORROWED; NULL
+ * + the named TypeError otherwise). */
+ScrJsval *scr_jsval_view(void *p, int32_t record, const ScrStr *key, const ScrStr *label, int32_t n,
+                         ScrJsval **fns);
+void *scr_jsval_unview(ScrJsval *v, const ScrStr *key, const ScrStr *what);
 
 /* The jsval→dyn crossing (the IR's dynFromJsval): wraps an island value
  * as a SCR_DYN_JSVAL node, SCALAR-NORMALIZING first — engine numbers/

@@ -3,13 +3,14 @@
 // dashed header keys and union-typed fields (typed-array / URL /
 // undefined arms), optional chaining on package results, package members
 // DECLARED primitive exiting eagerly to static types (string intrinsics
-// work on them directly), and `Record<string, string> | undefined`
-// results exiting into typed slots.
+// work on them directly), and a `Record<string, string> | undefined`
+// result read through an `any` parameter (a typed record parameter would
+// be a COPY of the package's object — SEMANTICS.md S115 refuses it).
 import { generate, type MediaFile } from "mediakit";
 
-function idFromHeaders(headers: Record<string, string> | undefined): string {
+function idFromHeaders(headers: any): string {
   if (headers === undefined) return "none";
-  return headers["x-id"];
+  return `${headers["x-id"]}`;
 }
 
 // Dashed header keys build as engine property names; the payload union
@@ -34,8 +35,8 @@ if (!image) {
   console.log(`${image.mediaType}`, `${image.size}`);
 }
 
-// The headers result crosses OUT into a `Record<string, string> |
-// undefined` slot — undefined takes the undefined arm, data validates.
+// The headers result stays the package's object (an `any` parameter) —
+// undefined or the record, read as it is.
 console.log(idFromHeaders(first.headers));
 
 // Union arms the other way: string payload, URL source, both branches of

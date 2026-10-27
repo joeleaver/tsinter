@@ -196,6 +196,18 @@ export const FN_SIG = 2;
 export const FN_NAME = 3;
 export const FN_ARITY = 4;
 
+/** `$dynView`'s field indices (unit H, SEMANTICS.md S115): the static
+ * value as the identity token, the interned type-key id, the type's
+ * label, and the accessor FUNC boxes (array/tuple: len, get, set, trunc;
+ * record: keys, get, set). */
+export const VIEW_TOKEN = 0;
+export const VIEW_SIG = 1;
+export const VIEW_LABEL = 2;
+export const VIEW_F0 = 3;
+export const VIEW_F1 = 4;
+export const VIEW_F2 = 5;
+export const VIEW_F3 = 6;
+
 /** `$dynObj`'s field indices. `proto` is the prototype code C carries as
  * its nullProto flag beside the kind — it rides the PAYLOAD here (the
  * header's rule: flags never become kind ids): Object.prototype (0),
@@ -440,6 +452,11 @@ export interface DynDeps {
    * proto codes 2-4) — the emitter's static prescan — so every OBJ_PROTO
    * reader is byte-identical everywhere else. */
   builtinObjs?: true;
+  /** Unit H (SEMANTICS.md S115): present ONLY in a module that shares a
+   * typed composite with dynamic code as a live VIEW (jsView — the
+   * emitter's static prescan), so every reader is byte-identical
+   * everywhere else. */
+  views?: true;
   /** Unit A2: present ONLY in a module that defines an island GETTER
    * (jsOp defineGetter — the emitter's static prescan), so every OBJ
    * reader is byte-identical everywhere else. `refuse` is the named
@@ -586,6 +603,11 @@ export class DynBuilder {
    * the caller's to establish first (C reads `d->v.arr` the same way). */
   arrPayload(c: Code, pushDyn: (c: Code) => void): void {
     pushDyn(c);
+    if (this.viewsLive) {
+      // Unit H: a view's payload is a snapshot of its static value.
+      c.call(this.arrOf());
+      return;
+    }
     c.structGet(this.dynT(), DYN_REF);
     c.refCast(this.deps.arrVec().struct);
   }
@@ -776,6 +798,11 @@ export class DynBuilder {
   /** From a `$dyn` the caller pushes, its OBJ payload. */
   objPayload(c: Code, pushDyn: (c: Code) => void): void {
     pushDyn(c);
+    if (this.viewsLive) {
+      // Unit H: a view's payload is a snapshot of its static value.
+      c.call(this.objOf());
+      return;
+    }
     c.structGet(this.dynT(), DYN_REF);
     c.refCast(this.objT());
   }
@@ -2060,6 +2087,20 @@ export class DynBuilder {
         c.refIsNull();
         c.ifResult(dynRef);
         {
+          // An error's constructor read off a dynamic value (SIG -2, the
+          // emitter's errCtorGetHelper): a name-carrying stand-in, not
+          // callable here.
+          this.fnPayload(c, (x) => x.localGet(0));
+          c.structGet(fnT, FN_SIG);
+          c.i32Const(-2);
+          c.i32Eq();
+          c.ifVoid();
+          this.deps.throwError(c, "%Error", "Error", (x) =>
+            this.deps.lit(x, "calling an error's constructor read from a dynamic value is not supported yet on the wasm lane"),
+          );
+          c.refNull(dynT);
+          c.return_();
+          c.end();
           // A placeholder (nativeMethodPlaceholderHelper's null-thunk
           // FUNC): FN_NAME carries the extracted Number.prototype name
           // directly (a plain strRef field, set to the same value as
@@ -2517,6 +2558,1256 @@ export class DynBuilder {
     c.end();
   }
 
+  /* ── unit H: VIEWS (SEMANTICS.md S115) ──────────────────────────────────
+   *
+   * A typed array, tuple or record entering an `any` slot is shared, not
+   * copied: a LIVE VIEW over the static value. Its box is an ordinary ARR
+   * (arrays, tuples) or OBJ (records) whose ref slot is a `$dynView`
+   * payload instead of the kind's vector / entry table: the static value
+   * itself as the identity TOKEN, the interned type-key SIG (jsUnview's
+   * check), the type's LABEL for the messages, and the compiled accessor
+   * closures the frontend built per static type (island-views.ts) — for
+   * an array or tuple [len, get, set, trunc], for a record [keys, get,
+   * set] — every lane runs the same accessors.
+   *
+   * Present ONLY in a module that builds a view (DynDeps.views, the
+   * emitter's prescan), so every other module is byte-identical. Where
+   * live, the READERS see a view through `arrPayload`/`objPayload`, which
+   * answer a fresh SNAPSHOT of the static value's current state (nested
+   * composites as their own views) — reading a snapshot taken at the read
+   * is reading the value. The WRITERS are taught explicitly, because a
+   * write into a snapshot would be lost: keyed reads and writes, index
+   * writes and `length` go straight to the accessors (keyGet/keySet/
+   * islandSetIdx); the mutating Array methods run over a snapshot and
+   * write it back; Object.assign writes member by member; strict
+   * equality compares the TOKENS (two views of one static value are one
+   * JS value). Every other reader that casts the ref slot to a vector or
+   * entry table directly traps on a view — loud, never a wrong answer. */
+
+  get viewsLive(): boolean {
+    return this.deps.views === true;
+  }
+
+  private viewType: number | null = null;
+  private walkTokG: number | null = null;
+  private walkVecG: number | null = null;
+
+  /** The view a callback-walking Array method is walking (its token) and
+   * the snapshot the walk reads: a write through that view while the
+   * walk runs lands in the snapshot too, so the walk reads it where
+   * Node's live walk would (null when no walk runs). */
+  private walkTok(): number {
+    this.walkTokG ??= this.mb.addGlobal({ kind: "ref", nullable: true, typeIndex: EQ_HEAP }, true, (w) => {
+      w.u8(0xd0); // ref.null eq
+      w.sleb(EQ_HEAP);
+    });
+    return this.walkTokG;
+  }
+
+  private walkVec(): number {
+    this.walkVecG ??= this.mb.addGlobal(this.arrRef(), true, (w) => {
+      w.u8(0xd0); // ref.null
+      w.sleb(this.deps.arrVec().struct);
+    });
+    return this.walkVecG;
+  }
+
+  viewT(): number {
+    this.viewType ??= this.mb.openStructType("dyn:view", [
+      { storage: { kind: "ref", nullable: true, typeIndex: EQ_HEAP }, mutable: false },
+      { storage: I32, mutable: false },
+      { storage: this.deps.strRef(), mutable: false },
+      { storage: this.dynRef(), mutable: false },
+      { storage: this.dynRef(), mutable: false },
+      { storage: this.dynRef(), mutable: false },
+      { storage: this.dynRef(), mutable: false },
+    ]);
+    return this.viewType;
+  }
+
+  /** Box a view: the static value (`pushToken`), the type key's interned
+   * id, the label, and the accessor FUNC boxes (three or four). */
+  boxView(
+    c: Code,
+    record: boolean,
+    pushToken: (c: Code) => void,
+    sig: number,
+    pushLabel: (c: Code) => void,
+    pushFns: readonly ((c: Code) => void)[],
+  ): void {
+    c.i32Const(record ? DK.OBJ : DK.ARR);
+    c.f64Const(0);
+    pushToken(c);
+    c.i32Const(sig);
+    pushLabel(c);
+    for (let i = 0; i < 4; i++) {
+      const f = pushFns[i];
+      if (f) f(c);
+      else c.refNull(this.dynT());
+    }
+    c.structNew(this.viewT());
+    c.structNew(this.dynT());
+  }
+
+  /** Leaves i32: is the `$dyn` the caller pushes a view. */
+  isView(c: Code, pushDyn: (c: Code) => void): void {
+    pushDyn(c);
+    c.structGet(this.dynT(), DYN_REF);
+    c.refTest(this.viewT());
+  }
+
+  /** Field `f` of the view the caller pushes (VIEW_* indices). */
+  viewField(c: Code, pushDyn: (c: Code) => void, f: number): void {
+    pushDyn(c);
+    c.structGet(this.dynT(), DYN_REF);
+    c.refCast(this.viewT());
+    c.structGet(this.viewT(), f);
+  }
+
+  /** %w.dyn.viewCall<n>(fn, args...) → the accessor's answer (null with
+   * an exception pending). */
+  private viewArgsG: (number | null)[] = [null, null, null];
+
+  /** The reusable argument vector of arity `n` for the accessor calls —
+   * no accessor re-enters another accessor call while its thunk reads
+   * its arguments, so one vector per arity serves every call. */
+  private viewArgs(n: number): number {
+    const hit = this.viewArgsG[n];
+    if (hit !== null && hit !== undefined) return hit;
+    const g = this.mb.addGlobal(this.arrRef(), true, (w) => {
+      w.u8(0xd0); // ref.null
+      w.sleb(this.deps.arrVec().struct);
+    });
+    this.viewArgsG[n] = g;
+    return g;
+  }
+
+  /** %w.dyn.viewCall<n>(fn, args...) → the accessor's answer (null with
+   * an exception pending): straight through the FUNC box's thunk (the
+   * accessors are compiled closures the view itself built — no callee
+   * check is needed) with the reusable argument vector. */
+  private viewCall(n: 0 | 1 | 2): number {
+    const params = [this.dynRef(), ...Array.from({ length: n }, () => this.dynRef())];
+    return this.cached(`viewCall${n}`, params, [this.dynRef()], (idx) => {
+      const c = new Code();
+      const V = n + 1;
+      const g = this.viewArgs(n);
+      c.globalGet(g);
+      c.localTee(V);
+      c.refIsNull();
+      c.ifVoid();
+      this.pushNewArr(c);
+      c.localSet(V);
+      for (let j = 0; j < n; j++) {
+        c.localGet(V);
+        c.globalGet(this.undefinedGlobal());
+        c.call(this.deps.arrPush());
+      }
+      c.localGet(V);
+      c.globalSet(g);
+      c.end();
+      for (let j = 0; j < n; j++) {
+        this.arrSet(c, (x) => x.localGet(V), (x) => x.i32Const(j), (x) => x.localGet(1 + j));
+      }
+      this.fnPayload(c, (x) => x.localGet(0));
+      c.structGet(this.fnT(), FN_CLOS);
+      c.localGet(V);
+      this.fnPayload(c, (x) => x.localGet(0));
+      c.structGet(this.fnT(), FN_THUNK);
+      c.callRef(this.thunkSig());
+      this.mb.setBody(idx, [this.arrRef()], c.bytes());
+    });
+  }
+
+  /** %w.dyn.viewLen(d) → i32: an array or tuple view's current length. */
+  viewLen(): number {
+    return this.cached("viewLen", [this.dynRef()], [I32], (idx) => {
+      const c = new Code();
+      const R = 1;
+      this.viewField(c, (x) => x.localGet(0), VIEW_F0);
+      c.call(this.viewCall(0));
+      c.localTee(R);
+      c.refIsNull();
+      c.ifResult(I32);
+      c.i32Const(0);
+      c.else_();
+      c.localGet(R);
+      c.structGet(this.dynT(), DYN_NUM);
+      c.i32TruncF64U();
+      c.end();
+      this.mb.setBody(idx, [this.dynRef()], c.bytes());
+    });
+  }
+
+  /** %w.dyn.viewGetI(d, i) → element i (undefined past the end). */
+  viewGetI(): number {
+    return this.cached("viewGetI", [this.dynRef(), I32], [this.dynRef()], (idx) => {
+      const c = new Code();
+      this.viewField(c, (x) => x.localGet(0), VIEW_F1);
+      this.boxNum(c, (x) => {
+        x.localGet(1);
+        x.f64ConvertI32U();
+      });
+      c.call(this.viewCall(1));
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** %w.dyn.viewSetI(d, i, v): element i = v (the declared-type check and
+   * the hole / tuple-length refusals are the accessor's). */
+  viewSetI(): number {
+    return this.cached("viewSetI", [this.dynRef(), I32, this.dynRef()], [], (idx) => {
+      const c = new Code();
+      this.viewField(c, (x) => x.localGet(0), VIEW_F2);
+      this.boxNum(c, (x) => {
+        x.localGet(1);
+        x.f64ConvertI32U();
+      });
+      c.localGet(2);
+      c.call(this.viewCall(2));
+      c.drop();
+      // The walk mirror (walkTok's doc): only after a write that landed.
+      c.globalGet(this.deps.excKind());
+      c.ifVoid();
+      c.return_();
+      c.end();
+      c.globalGet(this.walkVec());
+      c.refIsNull();
+      c.ifVoid();
+      c.return_();
+      c.end();
+      this.viewField(c, (x) => x.localGet(0), VIEW_TOKEN);
+      c.globalGet(this.walkTok());
+      c.refEq();
+      c.i32Eqz();
+      c.ifVoid();
+      c.return_();
+      c.end();
+      c.globalGet(this.walkVec());
+      c.localSet(3);
+      c.localGet(1);
+      this.arrLen(c, (x) => x.localGet(3));
+      c.i32LtU();
+      c.ifVoid();
+      this.arrSet(c, (x) => x.localGet(3), (x) => x.localGet(1), (x) => x.localGet(2));
+      c.return_();
+      c.end();
+      c.localGet(1);
+      this.arrLen(c, (x) => x.localGet(3));
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(3);
+      c.localGet(2);
+      c.call(this.deps.arrPush());
+      c.end();
+      this.mb.setBody(idx, [this.arrRef()], c.bytes());
+    });
+  }
+
+  /** %w.dyn.viewTrunc(d, n): length = n (growing refuses in the accessor). */
+  viewTrunc(): number {
+    return this.cached("viewTrunc", [this.dynRef(), I32], [], (idx) => {
+      const c = new Code();
+      this.viewField(c, (x) => x.localGet(0), VIEW_F3);
+      this.boxNum(c, (x) => {
+        x.localGet(1);
+        x.f64ConvertI32U();
+      });
+      c.call(this.viewCall(1));
+      c.drop();
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** %w.dyn.viewKeys(d) → a fresh ARR of a record view's own keys. */
+  viewKeys(): number {
+    return this.cached("viewKeys", [this.dynRef()], [this.dynRef()], (idx) => {
+      const c = new Code();
+      this.viewField(c, (x) => x.localGet(0), VIEW_F0);
+      c.call(this.viewCall(0));
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** %w.dyn.viewGetK(d, k) → a record view's member k (undefined when absent). */
+  viewGetK(): number {
+    return this.cached("viewGetK", [this.dynRef(), this.deps.strRef()], [this.dynRef()], (idx) => {
+      const c = new Code();
+      this.viewField(c, (x) => x.localGet(0), VIEW_F1);
+      this.boxStr(c, (x) => x.localGet(1));
+      c.call(this.viewCall(1));
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** %w.dyn.viewSetK(d, k, v): a record view's member k = v. */
+  viewSetK(): number {
+    return this.cached("viewSetK", [this.dynRef(), this.deps.strRef(), this.dynRef()], [], (idx) => {
+      const c = new Code();
+      this.viewField(c, (x) => x.localGet(0), VIEW_F2);
+      this.boxStr(c, (x) => x.localGet(1));
+      c.localGet(2);
+      c.call(this.viewCall(2));
+      c.drop();
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** %w.dyn.viewArrSnap(d) → a fresh dyn vector of an array view's
+   * current elements. */
+  viewArrSnap(): number {
+    return this.cached("viewArrSnap", [this.dynRef()], [this.arrRef()], (idx) => {
+      const c = new Code();
+      const N = 1;
+      const I = 2;
+      const V = 3;
+      c.localGet(0);
+      c.call(this.viewLen());
+      c.localSet(N);
+      this.pushNewArr(c);
+      c.localSet(V);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeU();
+      c.brIf(1);
+      c.localGet(V);
+      c.localGet(0);
+      c.localGet(I);
+      c.call(this.viewGetI());
+      c.call(this.deps.arrPush());
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(V);
+      this.mb.setBody(idx, [I32, I32, this.arrRef()], c.bytes());
+    });
+  }
+
+  /** %w.dyn.viewObjSnap(d) → a fresh entry table of a record view's
+   * current own members, in its own-key order. */
+  viewObjSnap(): number {
+    return this.cached("viewObjSnap", [this.dynRef()], [this.objRef()], (idx) => {
+      const c = new Code();
+      const O = 1;
+      const KS = 2;
+      const N = 3;
+      const I = 4;
+      const KX = 5;
+      this.pushNewObj(c, false);
+      c.localSet(O);
+      c.localGet(0);
+      c.call(this.viewKeys());
+      c.structGet(this.dynT(), DYN_REF);
+      c.refCast(this.deps.arrVec().struct);
+      c.localTee(KS);
+      c.structGet(this.deps.arrVec().struct, VEC_LEN);
+      c.localSet(N);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeU();
+      c.brIf(1);
+      this.arrAt(c, (x) => x.localGet(KS), (x) => x.localGet(I));
+      c.structGet(this.dynT(), DYN_REF);
+      c.refCast(this.deps.strType());
+      c.localSet(KX);
+      c.localGet(O);
+      c.localGet(KX);
+      c.localGet(0);
+      c.localGet(KX);
+      c.call(this.viewGetK());
+      c.call(this.objPut());
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(O);
+      this.mb.setBody(idx, [this.objRef(), this.arrRef(), I32, I32, this.deps.strRef()], c.bytes());
+    });
+  }
+
+  /** %w.dyn.arrOf(d) → the ARR payload vector, a view's snapshot. */
+  private arrOf(): number {
+    return this.cached("arrOf", [this.dynRef()], [this.arrRef()], (idx) => {
+      const c = new Code();
+      this.isView(c, (x) => x.localGet(0));
+      c.ifResult(this.arrRef());
+      c.localGet(0);
+      c.call(this.viewArrSnap());
+      c.else_();
+      c.localGet(0);
+      c.structGet(this.dynT(), DYN_REF);
+      c.refCast(this.deps.arrVec().struct);
+      c.end();
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** %w.dyn.objOf(d) → the OBJ payload, a view's snapshot. */
+  private objOf(): number {
+    return this.cached("objOf", [this.dynRef()], [this.objRef()], (idx) => {
+      const c = new Code();
+      this.isView(c, (x) => x.localGet(0));
+      c.ifResult(this.objRef());
+      c.localGet(0);
+      c.call(this.viewObjSnap());
+      c.else_();
+      c.localGet(0);
+      c.structGet(this.dynT(), DYN_REF);
+      c.refCast(this.objT());
+      c.end();
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** %w.dyn.viewKeyGet(d, k) → `view[k]`: indices and `length` (arrays)
+   * and own members (records) straight from the accessors; any other
+   * key reads the snapshot (prototype members answer as for any array or
+   * object). */
+  private viewKeyGet(): number {
+    return this.cached("viewKeyGet", [this.dynRef(), this.deps.strRef()], [this.dynRef()], (idx) => {
+      const dynT = this.dynT();
+      const c = new Code();
+      const I = 2;
+      const R = 3;
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.OBJ);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(0);
+      c.localGet(1);
+      c.call(this.viewGetK());
+      c.localTee(R);
+      c.refIsNull();
+      c.ifVoid();
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      c.localGet(R);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.UNDEF);
+      c.i32Ne();
+      c.ifVoid();
+      c.localGet(R);
+      c.return_();
+      c.end();
+      this.boxObj(c, (x) => {
+        x.localGet(0);
+        x.call(this.viewObjSnap());
+      });
+      c.localGet(1);
+      c.i32Const(0);
+      c.call(this.keyGetRaw());
+      c.return_();
+      c.end();
+      this.pushIsLength(c, (x) => x.localGet(1));
+      c.ifVoid();
+      this.boxNum(c, (x) => {
+        x.localGet(0);
+        x.call(this.viewLen());
+        x.f64ConvertI32U();
+      });
+      c.return_();
+      c.end();
+      c.localGet(1);
+      c.call(this.canonIdx());
+      c.localTee(I);
+      c.i32Const(0);
+      c.i32GeS();
+      c.ifVoid();
+      c.localGet(I);
+      c.localGet(0);
+      c.call(this.viewLen());
+      c.i32LtU();
+      c.ifResult(this.dynRef());
+      c.localGet(0);
+      c.localGet(I);
+      c.call(this.viewGetI());
+      c.else_();
+      c.globalGet(this.undefinedGlobal());
+      c.end();
+      c.return_();
+      c.end();
+      this.boxArr(c, (x) => {
+        x.localGet(0);
+        x.call(this.viewArrSnap());
+      });
+      c.localGet(1);
+      c.i32Const(0);
+      c.call(this.keyGetRaw());
+      this.mb.setBody(idx, [I32, this.dynRef()], c.bytes());
+    });
+  }
+
+  /** %w.dyn.viewKeySet(d, k, v): `view[k] = v`. Records: the accessor
+   * (the declared-type check, the fixed-shape refusal). Arrays: an index
+   * through the accessor, `length` truncating (growing refuses there), any
+   * other key the fixed-shape TypeError. */
+  private viewKeySet(): number {
+    return this.cached("viewKeySet", [this.dynRef(), this.deps.strRef(), this.dynRef()], [], (idx) => {
+      const dynT = this.dynT();
+      const concat = this.deps.concat();
+      const c = new Code();
+      const I = 3;
+      const F = 4;
+      c.localGet(0);
+      c.structGet(dynT, DYN_KIND);
+      c.i32Const(DK.OBJ);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(0);
+      c.localGet(1);
+      c.localGet(2);
+      c.call(this.viewSetK());
+      c.return_();
+      c.end();
+      this.pushIsLength(c, (x) => x.localGet(1));
+      c.ifVoid();
+      c.localGet(2);
+      c.call(this.deps.jsToNumber());
+      c.localTee(F);
+      c.f64Const(0);
+      c.f64Ge();
+      c.localGet(F);
+      c.f64Const(4294967295);
+      c.f64Le();
+      c.i32And();
+      c.localGet(F);
+      c.f64Trunc();
+      c.localGet(F);
+      c.f64Eq();
+      c.i32And();
+      c.i32Eqz();
+      c.ifVoid();
+      this.deps.throwError(c, "%RangeError", "RangeError", (x) => this.deps.lit(x, "Invalid array length"));
+      c.return_();
+      c.end();
+      c.localGet(0);
+      c.localGet(F);
+      c.i32TruncF64U();
+      c.call(this.viewTrunc());
+      c.return_();
+      c.end();
+      c.localGet(1);
+      c.call(this.canonIdx());
+      c.localTee(I);
+      c.i32Const(0);
+      c.i32GeS();
+      c.ifVoid();
+      c.localGet(0);
+      c.localGet(I);
+      c.localGet(2);
+      c.call(this.viewSetI());
+      c.return_();
+      c.end();
+      this.deps.throwTypeError(c, (x) => {
+        this.deps.lit(x, "Cannot add property '");
+        x.localGet(1);
+        x.call(concat);
+        this.deps.lit(x, "': ");
+        x.call(concat);
+        this.viewField(x, (y) => y.localGet(0), VIEW_LABEL);
+        x.call(concat);
+        this.deps.lit(x, " shared from typed code has a fixed shape (SEMANTICS.md S115)");
+        x.call(concat);
+      });
+      this.mb.setBody(idx, [I32, F64], c.bytes());
+    });
+  }
+
+  /** %w.dyn.viewWriteBack(d, vec): store a snapshot an Array method
+   * mutated back through the accessors, in index order (so growth is
+   * append by append), then truncate to its length. */
+  private viewWriteBack(): number {
+    return this.cached("viewWriteBack", [this.dynRef(), this.arrRef()], [], (idx) => {
+      const c = new Code();
+      const N = 2;
+      const I = 3;
+      this.arrLen(c, (x) => x.localGet(1));
+      c.localSet(N);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeU();
+      c.brIf(1);
+      c.localGet(0);
+      c.localGet(I);
+      this.arrAt(c, (x) => x.localGet(1), (x) => x.localGet(I));
+      c.call(this.viewSetI());
+      c.globalGet(this.deps.excKind());
+      c.ifVoid();
+      c.return_();
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(N);
+      c.localGet(0);
+      c.call(this.viewLen());
+      c.i32LtU();
+      c.ifVoid();
+      c.localGet(0);
+      c.localGet(N);
+      c.call(this.viewTrunc());
+      c.end();
+      this.mb.setBody(idx, [I32, I32], c.bytes());
+    });
+  }
+
+  /** %w.dyn.viewSame(d, vec) → i32: does the view still hold exactly the
+   * snapshot's elements (strict equality, views by token). */
+  private viewSame(): number {
+    return this.cached("viewSame", [this.dynRef(), this.arrRef()], [I32], (idx) => {
+      const c = new Code();
+      const N = 2;
+      const I = 3;
+      this.arrLen(c, (x) => x.localGet(1));
+      c.localTee(N);
+      c.localGet(0);
+      c.call(this.viewLen());
+      c.i32Ne();
+      c.ifVoid();
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeU();
+      c.brIf(1);
+      c.localGet(0);
+      c.localGet(I);
+      c.call(this.viewGetI());
+      this.arrAt(c, (x) => x.localGet(1), (x) => x.localGet(I));
+      c.call(this.strictEq());
+      c.i32Eqz();
+      c.ifVoid();
+      c.i32Const(0);
+      c.return_();
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      c.i32Const(1);
+      this.mb.setBody(idx, [I32, I32], c.bytes());
+    });
+  }
+
+  static readonly VIEW_MUTATORS: ReadonlySet<string> = new Set([
+    "push", "pop", "shift", "unshift", "splice", "sort", "reverse", "fill", "copyWithin",
+  ]);
+  static readonly VIEW_WALKERS: ReadonlySet<string> = new Set([
+    "forEach", "map", "filter", "some", "every", "find", "findIndex", "findLast", "findLastIndex",
+    "reduce", "reduceRight", "flatMap",
+  ]);
+
+  /** The view-aware front of a dispatch helper: `isView(param 0)` runs
+   * `onView` (which returns), anything else forwards every parameter to
+   * `raw` unchanged. */
+  private viewFront(
+    name: string,
+    params: ValType[],
+    results: ValType[],
+    locals: ValType[],
+    raw: () => number,
+    onView: (c: Code) => void,
+  ): number {
+    return this.cached(name, params, results, (idx) => {
+      const c = new Code();
+      this.isView(c, (x) => x.localGet(0));
+      c.ifVoid();
+      onView(c);
+      c.return_();
+      c.end();
+      params.forEach((_, i) => c.localGet(i));
+      c.call(raw());
+      this.mb.setBody(idx, locals, c.bytes());
+    });
+  }
+
+  static readonly VIEW_LIVE_WALKERS: ReadonlySet<string> = new Set([
+    "forEach", "map", "filter", "some", "every", "find", "findIndex", "findLast", "findLastIndex",
+  ]);
+
+  /** %w.dyn.viewWalk:<m>(d, args, what) — a callback-walking Array method
+   * over an array VIEW, walked LIVE as Node walks it: the length is read
+   * once, each step reads the element through the accessor at that
+   * moment (so a write from the callback — through the view or straight
+   * to the typed array — is seen exactly where Node sees it), the
+   * forward methods skip indices the array no longer has (HasProperty),
+   * find/findLast read them as undefined (Get), and the callback's third
+   * argument is the view itself. */
+  private viewWalk(method: string): number {
+    return this.cached(`viewWalk:${method}`, [this.dynRef(), this.arrRef(), this.deps.strRef()], [this.dynRef()], (idx) => {
+      const dynT = this.dynT();
+      const c = new Code();
+      const CB = 3;
+      const N = 4;
+      const I = 5;
+      const X = 6;
+      const R = 7;
+      const OUT = 8;
+      const rev = method === "findLast" || method === "findLastIndex";
+      const getSemantics = method === "find" || method === "findIndex" || rev;
+      c.localGet(1);
+      c.call(this.cbGate());
+      c.i32Eqz();
+      c.ifVoid();
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      this.arrAt(c, (x) => x.localGet(1), (x) => x.i32Const(0));
+      c.localSet(CB);
+      c.localGet(0);
+      c.call(this.viewLen());
+      c.localSet(N);
+      if (method === "map" || method === "filter") {
+        this.pushNewArr(c);
+        c.localSet(OUT);
+      }
+      if (rev) {
+        c.localGet(N);
+        c.localSet(I);
+      } else {
+        c.i32Const(0);
+        c.localSet(I);
+      }
+      c.block();
+      c.loop();
+      if (rev) {
+        c.localGet(I);
+        c.i32Eqz();
+        c.brIf(1);
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Sub();
+        c.localSet(I);
+      } else {
+        c.localGet(I);
+        c.localGet(N);
+        c.i32GeU();
+        c.brIf(1);
+      }
+      // The element now: present → the accessor; gone → skipped (forward
+      // HasProperty methods) or undefined (Get methods).
+      c.localGet(I);
+      c.localGet(0);
+      c.call(this.viewLen());
+      c.i32LtU();
+      c.ifResult(I32);
+      c.localGet(0);
+      c.localGet(I);
+      c.call(this.viewGetI());
+      c.localSet(X);
+      c.i32Const(1);
+      c.else_();
+      c.globalGet(this.undefinedGlobal());
+      c.localSet(X);
+      c.i32Const(getSemantics ? 1 : 0);
+      c.end();
+      c.ifVoid();
+      c.localGet(CB);
+      c.localGet(X);
+      c.localGet(I);
+      c.localGet(0);
+      c.call(this.callCb());
+      c.localTee(R);
+      c.refIsNull();
+      c.ifVoid();
+      c.refNull(dynT);
+      c.return_();
+      c.end();
+      const truthyR = (): void => {
+        c.localGet(R);
+        c.call(this.truthy());
+      };
+      switch (method) {
+        case "map":
+          c.localGet(OUT);
+          c.localGet(R);
+          c.call(this.deps.arrPush());
+          break;
+        case "filter":
+          truthyR();
+          c.ifVoid();
+          c.localGet(OUT);
+          c.localGet(X);
+          c.call(this.deps.arrPush());
+          c.end();
+          break;
+        case "some":
+          truthyR();
+          c.ifVoid();
+          c.globalGet(this.boolGlobal(true));
+          c.return_();
+          c.end();
+          break;
+        case "every":
+          truthyR();
+          c.i32Eqz();
+          c.ifVoid();
+          c.globalGet(this.boolGlobal(false));
+          c.return_();
+          c.end();
+          break;
+        case "find":
+        case "findLast":
+          truthyR();
+          c.ifVoid();
+          c.localGet(X);
+          c.return_();
+          c.end();
+          break;
+        case "findIndex":
+        case "findLastIndex":
+          truthyR();
+          c.ifVoid();
+          this.boxNum(c, (x) => {
+            x.localGet(I);
+            x.f64ConvertI32U();
+          });
+          c.return_();
+          c.end();
+          break;
+        default:
+          break;
+      }
+      c.end();
+      if (!rev) {
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+      }
+      c.br(0);
+      c.end();
+      c.end();
+      switch (method) {
+        case "map":
+        case "filter":
+          this.boxArr(c, (x) => x.localGet(OUT));
+          break;
+        case "some":
+          c.globalGet(this.boolGlobal(false));
+          break;
+        case "every":
+          c.globalGet(this.boolGlobal(true));
+          break;
+        case "findIndex":
+        case "findLastIndex":
+          this.boxNum(c, (x) => x.f64Const(-1));
+          break;
+        default:
+          c.globalGet(this.undefinedGlobal());
+      }
+      this.mb.setBody(idx, [this.dynRef(), I32, I32, this.dynRef(), this.dynRef(), this.arrRef()], c.bytes());
+    });
+  }
+
+  /** %w.dyn.viewPush(d, args) — `push` on an array view: each argument
+   * appended through the accessor (its element check), in order, in
+   * place — linear, no snapshot. Answers the new length. */
+  private viewPush(): number {
+    return this.cached("viewPush", [this.dynRef(), this.arrRef()], [this.dynRef()], (idx) => {
+      const c = new Code();
+      const N = 2;
+      const I = 3;
+      this.arrLen(c, (x) => x.localGet(1));
+      c.localSet(N);
+      c.i32Const(0);
+      c.localSet(I);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(N);
+      c.i32GeU();
+      c.brIf(1);
+      c.localGet(0);
+      c.localGet(0);
+      c.call(this.viewLen());
+      this.arrAt(c, (x) => x.localGet(1), (x) => x.localGet(I));
+      c.call(this.viewSetI());
+      c.globalGet(this.deps.excKind());
+      c.ifVoid();
+      c.refNull(this.dynT());
+      c.return_();
+      c.end();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.br(0);
+      c.end();
+      c.end();
+      this.boxNum(c, (x) => {
+        x.localGet(0);
+        x.call(this.viewLen());
+        x.f64ConvertI32U();
+      });
+      this.mb.setBody(idx, [I32, I32], c.bytes());
+    });
+  }
+
+  /** %w.dyn.viewPop(d) — `pop` on an array view, in place. */
+  private viewPop(): number {
+    return this.cached("viewPop", [this.dynRef()], [this.dynRef()], (idx) => {
+      const c = new Code();
+      const N = 1;
+      const X = 2;
+      c.localGet(0);
+      c.call(this.viewLen());
+      c.localTee(N);
+      c.i32Eqz();
+      c.ifVoid();
+      c.globalGet(this.undefinedGlobal());
+      c.return_();
+      c.end();
+      c.localGet(0);
+      c.localGet(N);
+      c.i32Const(1);
+      c.i32Sub();
+      c.call(this.viewGetI());
+      c.localSet(X);
+      c.localGet(0);
+      c.localGet(N);
+      c.i32Const(1);
+      c.i32Sub();
+      c.call(this.viewTrunc());
+      c.globalGet(this.deps.excKind());
+      c.ifVoid();
+      c.refNull(this.dynT());
+      c.return_();
+      c.end();
+      c.localGet(X);
+      this.mb.setBody(idx, [I32, this.dynRef()], c.bytes());
+    });
+  }
+
+  /* ── the view-aware fronts (unit H) — only where views are live ───── */
+
+  keyGet(): number {
+    if (!this.viewsLive) return this.keyGetRaw();
+    return this.viewFront("keyGetV", [this.dynRef(), this.deps.strRef(), I32], [this.dynRef()], [], () => this.keyGetRaw(), (c) => {
+      c.localGet(0);
+      c.localGet(1);
+      c.call(this.viewKeyGet());
+    });
+  }
+
+  keySet(): number {
+    if (!this.viewsLive) return this.keySetRaw();
+    return this.viewFront("keySetV", [this.dynRef(), this.deps.strRef(), this.dynRef()], [], [], () => this.keySetRaw(), (c) => {
+      c.localGet(0);
+      c.localGet(1);
+      c.localGet(2);
+      c.call(this.viewKeySet());
+    });
+  }
+
+  islandSetIdx(): number {
+    if (!this.viewsLive) return this.islandSetIdxRaw();
+    return this.viewFront(
+      "islandSetIdxV",
+      [this.dynRef(), this.deps.strRef(), this.dynRef()],
+      [],
+      [],
+      () => this.islandSetIdxRaw(),
+      (c) => {
+        c.localGet(0);
+        c.localGet(1);
+        c.localGet(2);
+        c.call(this.viewKeySet());
+      },
+    );
+  }
+
+  /** Strict equality where views are live: two views are one JS value
+   * exactly when they show one static value (the TOKEN); a view never
+   * equals anything else. */
+  strictEq(): number {
+    if (!this.viewsLive) return this.strictEqRaw();
+    return this.cached("strictEqV", [this.dynRef(), this.dynRef()], [I32], (idx) => {
+      const c = new Code();
+      const token = (i: number): void => {
+        c.localGet(i);
+        c.structGet(this.dynT(), DYN_REF);
+        c.refCast(this.viewT());
+        c.structGet(this.viewT(), VIEW_TOKEN);
+      };
+      this.isView(c, (x) => x.localGet(0));
+      this.isView(c, (x) => x.localGet(1));
+      c.i32Or();
+      c.ifVoid();
+      this.isView(c, (x) => x.localGet(0));
+      this.isView(c, (x) => x.localGet(1));
+      c.i32And();
+      c.ifResult(I32);
+      token(0);
+      token(1);
+      c.refEq();
+      c.else_();
+      c.i32Const(0);
+      c.end();
+      c.return_();
+      c.end();
+      c.localGet(0);
+      c.localGet(1);
+      c.call(this.strictEqRaw());
+      this.mb.setBody(idx, [], c.bytes());
+    });
+  }
+
+  /** Object.assign onto a view: member by member through keySet (the
+   * accessors' checks), the source's own enumerable entries in order. */
+  assign(): number {
+    if (!this.viewsLive) return this.assignRaw();
+    const PAIRS = 2;
+    const N = 3;
+    const I = 4;
+    const P = 5;
+    return this.viewFront(
+      "assignV",
+      [this.dynRef(), this.dynRef()],
+      [this.dynRef()],
+      [this.arrRef(), I32, I32, this.dynRef()],
+      () => this.assignRaw(),
+      (c) => {
+        const dynT = this.dynT();
+        c.localGet(1);
+        c.structGet(dynT, DYN_KIND);
+        c.i32Const(DK.UNDEF);
+        c.i32Eq();
+        c.localGet(1);
+        c.structGet(dynT, DYN_KIND);
+        c.i32Const(DK.NULL);
+        c.i32Eq();
+        c.i32Or();
+        c.ifVoid();
+        c.localGet(0);
+        c.return_();
+        c.end();
+        c.localGet(1);
+        c.i32Const(2);
+        c.call(this.objWalk());
+        c.localTee(P);
+        c.refIsNull();
+        c.ifVoid();
+        c.refNull(dynT);
+        c.return_();
+        c.end();
+        this.arrPayload(c, (x) => x.localGet(P));
+        c.localTee(PAIRS);
+        c.structGet(this.deps.arrVec().struct, VEC_LEN);
+        c.localSet(N);
+        c.i32Const(0);
+        c.localSet(I);
+        c.block();
+        c.loop();
+        c.localGet(I);
+        c.localGet(N);
+        c.i32GeU();
+        c.brIf(1);
+        this.arrAt(c, (x) => x.localGet(PAIRS), (x) => x.localGet(I));
+        c.localSet(P);
+        c.localGet(0);
+        this.arrAt(c, (x) => this.arrPayload(x, (y) => y.localGet(P)), (x) => x.i32Const(0));
+        c.structGet(dynT, DYN_REF);
+        c.refCast(this.deps.strType());
+        this.arrAt(c, (x) => this.arrPayload(x, (y) => y.localGet(P)), (x) => x.i32Const(1));
+        c.call(this.keySet());
+        c.globalGet(this.deps.excKind());
+        c.ifVoid();
+        c.refNull(dynT);
+        c.return_();
+        c.end();
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.localSet(I);
+        c.br(0);
+        c.end();
+        c.end();
+        c.localGet(0);
+      },
+    );
+  }
+
+  defineProps(): number {
+    if (!this.viewsLive) return this.definePropsRaw();
+    return this.viewFront("definePropsV", [this.dynRef(), this.dynRef()], [this.dynRef()], [], () => this.definePropsRaw(), (c) => {
+      this.deps.throwTypeError(c, (x) => {
+        this.deps.lit(x, "Cannot define properties on ");
+        this.viewField(x, (y) => y.localGet(0), VIEW_LABEL);
+        x.call(this.deps.concat());
+        this.deps.lit(x, " shared from typed code: only plain member writes reach typed storage (SEMANTICS.md S115)");
+        x.call(this.deps.concat());
+      });
+      c.refNull(this.dynT());
+    });
+  }
+
+  /** A method call on a view: over a SNAPSHOT, the receiver's own result
+   * answered as the view. A mutating Array method writes the snapshot
+   * back through the accessors; a callback-walking one checks the view
+   * still holds the snapshot afterwards (a callback that wrote the array
+   * while the method walked it refuses by name — the walk saw the
+   * snapshot, Node's sees each write). */
+  invoke(method: string): number {
+    if (!this.viewsLive) return this.invokeRaw(method);
+    const S = 3;
+    const R = 4;
+    const V = 5;
+    const OT = 6;
+    const OV = 7;
+    const walker = DynBuilder.VIEW_WALKERS.has(method);
+    return this.viewFront(
+      `invokeV:${method}`,
+      [this.dynRef(), this.arrRef(), this.deps.strRef()],
+      [this.dynRef()],
+      [this.dynRef(), this.dynRef(), this.arrRef(), ...(walker ? [{ kind: "ref", nullable: true, typeIndex: EQ_HEAP } as ValType, this.arrRef()] : [])],
+      () => this.invokeRaw(method),
+      (c) => {
+        const dynT = this.dynT();
+        const finish = (): void => {
+          c.localGet(R);
+          c.localGet(S);
+          c.refEq();
+          c.ifResult(this.dynRef());
+          c.localGet(0);
+          c.else_();
+          c.localGet(R);
+          c.end();
+        };
+        c.localGet(0);
+        c.structGet(dynT, DYN_KIND);
+        c.i32Const(DK.OBJ);
+        c.i32Eq();
+        c.ifVoid();
+        this.boxObj(c, (x) => {
+          x.localGet(0);
+          x.call(this.viewObjSnap());
+        });
+        c.localSet(S);
+        c.localGet(S);
+        c.localGet(1);
+        c.localGet(2);
+        c.call(this.invokeRaw(method));
+        c.localSet(R);
+        finish();
+        c.return_();
+        c.end();
+        // In place on the typed storage: push/pop append and remove through
+        // the accessors (linear), the callback walkers walk live.
+        if (DynBuilder.VIEW_LIVE_WALKERS.has(method)) {
+          c.localGet(0);
+          c.localGet(1);
+          c.localGet(2);
+          c.call(this.viewWalk(method));
+          c.return_();
+        }
+        if (method === "push") {
+          c.localGet(0);
+          c.localGet(1);
+          c.call(this.viewPush());
+          c.return_();
+        }
+        if (method === "pop") {
+          c.localGet(0);
+          c.call(this.viewPop());
+          c.return_();
+        }
+        c.localGet(0);
+        c.call(this.viewArrSnap());
+        c.localSet(V);
+        this.boxArr(c, (x) => x.localGet(V));
+        c.localSet(S);
+        if (walker) {
+          c.globalGet(this.walkTok());
+          c.localSet(OT);
+          c.globalGet(this.walkVec());
+          c.localSet(OV);
+          this.viewField(c, (x) => x.localGet(0), VIEW_TOKEN);
+          c.globalSet(this.walkTok());
+          c.localGet(V);
+          c.globalSet(this.walkVec());
+        }
+        c.localGet(S);
+        c.localGet(1);
+        c.localGet(2);
+        c.call(this.invokeRaw(method));
+        c.localSet(R);
+        if (walker) {
+          c.localGet(OT);
+          c.globalSet(this.walkTok());
+          c.localGet(OV);
+          c.globalSet(this.walkVec());
+        }
+        c.localGet(R);
+        c.refIsNull();
+        c.ifVoid();
+        c.refNull(dynT);
+        c.return_();
+        c.end();
+        if (DynBuilder.VIEW_MUTATORS.has(method)) {
+          c.localGet(0);
+          c.localGet(V);
+          c.call(this.viewWriteBack());
+          c.globalGet(this.deps.excKind());
+          c.ifVoid();
+          c.refNull(dynT);
+          c.return_();
+          c.end();
+        } else if (DynBuilder.VIEW_WALKERS.has(method)) {
+          c.localGet(0);
+          c.localGet(V);
+          c.call(this.viewSame());
+          c.i32Eqz();
+          c.ifVoid();
+          this.deps.throwError(c, "%Error", "Error", (x) => {
+            this.deps.lit(x, `a '${method}' callback changed `);
+            this.viewField(x, (y) => y.localGet(0), VIEW_LABEL);
+            x.call(this.deps.concat());
+            this.deps.lit(x, " shared from typed code while the method walked it, which the wasm lane does not support yet (SEMANTICS.md S115)");
+            x.call(this.deps.concat());
+          });
+          c.refNull(dynT);
+          c.return_();
+          c.end();
+        }
+        finish();
+      },
+    );
+  }
+
   /* ── the dispatch helpers ───────────────────────────────────────────── */
 
   /** %w.dyn.strictEq(a, b) → i32 — JS `===` over two dyn values, exactly
@@ -2536,7 +3827,7 @@ export class DynBuilder {
    * be sourced from the closure value itself. Two boxes built over a null
    * closure would answer `true` (ref.eq on two nulls is true), silently;
    * `boxFn` spells the discipline that prevents it. */
-  strictEq(): number {
+  private strictEqRaw(): number {
     return this.cached("strictEq", [this.dynRef(), this.dynRef()], [I32], (idx) => {
       const dynT = this.dynT();
       const c = new Code();
@@ -3934,7 +5225,7 @@ export class DynBuilder {
    * undefined too. An undefined or null RECEIVER throws Node's catchable
    * TypeError naming the key, unless `opt` (a `?.` step) short-circuits to
    * undefined instead. */
-  keyGet(): number {
+  private keyGetRaw(): number {
     return this.cached(
       "keyGet",
       [this.dynRef(), this.deps.strRef(), I32],
@@ -4367,7 +5658,49 @@ export class DynBuilder {
    * — throws where Node grows the array. C would instead push undefined
    * two billion times, so the throw is the same disagreement arriving in
    * finite time. Every OTHER receiver's refusal is Node's own text. */
-  keySet(): number {
+  /** %w.dyn.islandSetIdx(recv, key, value) — an ISLAND write `o[k] = v`
+   * (jsOp setIdx): keySet, except that an ARR receiver written at an index
+   * PAST its length throws a named Error. The engine leaves holes there
+   * (`length` grows, the skipped slots are absent: forEach, indexOf,
+   * filter, join and inspect all see them), and this tier's dense vector
+   * would pad with undefined instead (S016) — silently different; since
+   * `any[]` became the island array (unit H) that write is refused here
+   * rather than answered (SEMANTICS.md S110 (f)). The checked-dynamic
+   * (`unknown`) write keeps S016's padding. */
+  private islandSetIdxRaw(): number {
+    return this.cached("islandSetIdx", [this.dynRef(), this.deps.strRef(), this.dynRef()], [], (idx) => {
+      const c = new Code();
+      const I = 3;
+      c.localGet(0);
+      c.structGet(this.dynT(), DYN_KIND);
+      c.i32Const(DK.ARR);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(1);
+      c.call(this.canonIdx());
+      c.localTee(I);
+      this.arrLen(c, (x) => this.arrPayload(x, (y) => y.localGet(0)));
+      c.i32GtS();
+      c.ifVoid();
+      this.deps.throwError(c, "%Error", "Error", (x) => {
+        this.deps.lit(x, "writing an island array at index ");
+        x.localGet(1);
+        x.call(this.deps.concat());
+        this.deps.lit(x, " past its length (the holes Node leaves) is not supported yet on the wasm lane");
+        x.call(this.deps.concat());
+      });
+      c.return_();
+      c.end();
+      c.end();
+      c.localGet(0);
+      c.localGet(1);
+      c.localGet(2);
+      c.call(this.keySet());
+      this.mb.setBody(idx, [I32], c.bytes());
+    });
+  }
+
+  private keySetRaw(): number {
     return this.cached("keySet", [this.dynRef(), this.deps.strRef(), this.dynRef()], [], (idx) => {
       const dynT = this.dynT();
       const c = new Code();
@@ -4376,6 +5709,7 @@ export class DynBuilder {
       const A = 5;
       const MSG = 6;
       const FP = 7;
+      const LF = this.accessorsLive ? 9 : 8;
       const concat = this.deps.concat();
       c.localGet(0);
       c.structGet(dynT, DYN_KIND);
@@ -4463,6 +5797,48 @@ export class DynBuilder {
         (x) => x.localGet(IDX),
         (x) => x.localGet(2),
       );
+      c.return_();
+      c.end();
+      // Unit H: `length` truncates (Node's own answer); growing it would
+      // leave the holes the dense vector cannot hold, so it refuses by
+      // name, like an index write past the end (S110 (f)).
+      this.pushIsLength(c, (x) => x.localGet(1));
+      c.ifVoid();
+      c.localGet(2);
+      c.call(this.deps.jsToNumber());
+      c.localTee(LF);
+      c.f64Const(0);
+      c.f64Ge();
+      c.localGet(LF);
+      c.f64Const(4294967295);
+      c.f64Le();
+      c.i32And();
+      c.localGet(LF);
+      c.f64Trunc();
+      c.localGet(LF);
+      c.f64Eq();
+      c.i32And();
+      c.i32Eqz();
+      c.ifVoid();
+      this.deps.throwError(c, "%RangeError", "RangeError", (x) => this.deps.lit(x, "Invalid array length"));
+      c.return_();
+      c.end();
+      this.arrPayload(c, (x) => x.localGet(0));
+      c.localSet(A);
+      c.localGet(LF);
+      this.arrLen(c, (x) => x.localGet(A));
+      c.f64ConvertI32U();
+      c.f64Gt();
+      c.ifVoid();
+      this.deps.throwError(c, "%Error", "Error", (x) =>
+        this.deps.lit(x, "growing a dynamic array's length past its elements (the holes Node leaves) is not supported yet on the wasm lane"),
+      );
+      c.return_();
+      c.end();
+      c.localGet(A);
+      c.localGet(LF);
+      c.i32TruncF64U();
+      c.structSet(this.deps.arrVec().struct, VEC_LEN);
       c.return_();
       c.end();
       c.end();
@@ -4647,6 +6023,7 @@ export class DynBuilder {
           this.deps.strRef() /* MSG=6 */,
           { kind: "ref", nullable: true, typeIndex: this.fnPropsT() } /* FP=7 */,
           ...(this.accessorsLive ? [this.dynRef() /* SETM=8 */] : []),
+          F64 /* LF */,
         ],
         c.bytes(),
       );
@@ -5403,7 +6780,7 @@ export class DynBuilder {
    * not written: in a module that can mint one, such a put refuses by
    * name (board #198), as a direct member write does; every other key
    * copies. */
-  assign(): number {
+  private assignRaw(): number {
     return this.cached("assign", [this.dynRef(), this.dynRef()], [this.dynRef()], (idx) => {
       const dynT = this.dynT();
       const c = new Code();
@@ -7121,7 +8498,7 @@ export class DynBuilder {
    * pending-check between them — DK.JSVAL is permanently unreachable on
    * this tier (dyn.ts:93-108's own deletion), so an island fence here
    * would be dead code, the same omission P2 already made elsewhere. */
-  defineProps(): number {
+  private definePropsRaw(): number {
     return this.cached("defineProps", [this.dynRef(), this.dynRef()], [this.dynRef()], (idx) => {
       const dynT = this.dynT();
       const c = new Code();
@@ -7458,6 +8835,17 @@ export class DynBuilder {
     "push", "pop", "shift", "unshift", "slice", "at", "indexOf", "lastIndexOf",
     "includes", "join", "concat", "reverse", "sort", "forEach", "map", "filter",
     "some", "every", "find", "findIndex", "flatMap", "flat",
+    // Unit H (`any[]` is the island array): the rest of the methods a
+    // static any[] answered through its own intrinsics.
+    "reduce", "reduceRight", "findLast", "findLastIndex", "toReversed", "toSorted",
+    "with", "splice", "fill", "toString",
+  ]);
+
+  /** Array.prototype names with NO arm here: an island array calling one
+   * takes the loud named fence, never the is-not-a-function tail (a
+   * TypeError Node would not throw). */
+  private static readonly ARR_UNSUPPORTED = new Set([
+    "copyWithin", "keys", "values", "entries", "toSpliced", "toLocaleString",
   ]);
 
   /** How deep `flat`'s FlattenIntoArray recursion goes before it throws
@@ -7759,6 +9147,7 @@ export class DynBuilder {
         const c = new Code();
         const A = 6;
         const MSG = 7;
+        const N = 8;
         c.localGet(1);
         c.localGet(0);
         c.structGet(this.deps.arrVec().struct, VEC_LEN);
@@ -7799,13 +9188,45 @@ export class DynBuilder {
         c.end();
         c.return_();
         c.end();
+        // A string, boolean or null index: ToNumber as JS runs it (no user
+        // code can run for a primitive), then the same NaN/truncate rule —
+        // `xs.splice("2", "1")` is `xs.splice(2, 1)` in Node (unit H).
+        c.localGet(A);
+        c.structGet(this.dynT(), DYN_KIND);
+        c.i32Const(DK.STR);
+        c.i32Eq();
+        c.localGet(A);
+        c.structGet(this.dynT(), DYN_KIND);
+        c.i32Const(DK.BOOL);
+        c.i32Eq();
+        c.i32Or();
+        c.localGet(A);
+        c.structGet(this.dynT(), DYN_KIND);
+        c.i32Const(DK.NULL);
+        c.i32Eq();
+        c.i32Or();
+        c.ifVoid();
+        c.localGet(A);
+        c.call(this.deps.jsToNumber());
+        c.localSet(N);
+        c.localGet(N);
+        c.localGet(N);
+        c.f64Ne();
+        c.ifResult(F64);
+        c.localGet(4);
+        c.else_();
+        c.localGet(N);
+        c.f64Trunc();
+        c.end();
+        c.return_();
+        c.end();
         c.localGet(5);
         this.deps.lit(c, ": non-number index arguments on a dynamic receiver are not supported yet");
         c.call(this.deps.concat());
         c.localSet(MSG);
         this.deps.throwTypeError(c, (x) => x.localGet(MSG));
         c.f64Const(0);
-        this.mb.setBody(idx, [this.dynRef(), this.deps.strRef()], c.bytes());
+        this.mb.setBody(idx, [this.dynRef(), this.deps.strRef(), F64], c.bytes());
       },
     );
   }
@@ -8346,7 +9767,7 @@ export class DynBuilder {
   /** %w.dyn.invoke:&lt;method&gt;(recv, args, what) → the call's result, or
    * null with an exception pending. See the section header for the
    * ladder and for why there is one of these per method NAME. */
-  invoke(method: string): number {
+  private invokeRaw(method: string): number {
     return this.cached(
       `invoke:${method}`,
       [this.dynRef(), this.arrRef(), this.deps.strRef()],
@@ -9212,7 +10633,14 @@ export class DynBuilder {
                 else this.boxNum(c, (x) => x.f64Const(-1));
                 return;
               }
+              case "toString":
               case "join": {
+                // Array.prototype.toString is join() with no separator
+                // argument (unit H — the island array's own toString).
+                if (method === "toString") {
+                  c.i32Const(0);
+                  c.localSet(ARGC);
+                }
                 // The separator: an explicit non-undefined argument's
                 // TEXT, "," otherwise. Nested rather than `i32.and` —
                 // the kind read below indexes the vector.
@@ -9592,12 +11020,492 @@ export class DynBuilder {
                 else c.globalGet(this.undefinedGlobal()); // forEach, find
                 return;
               }
+              // ── unit H: `any[]` IS the island array, so the methods a
+              // static any[] answered through its own intrinsics now run
+              // here — each arm is ECMA-262's algorithm over the dense
+              // vector (elements read live, the length captured where the
+              // spec captures it), Node-measured texts.
+              case "reduce":
+              case "reduceRight": {
+                const right = method === "reduceRight";
+                c.localGet(1);
+                c.call(this.cbGate());
+                c.i32Eqz();
+                c.ifVoid();
+                c.refNull(dynT);
+                c.return_();
+                c.end();
+                this.arrAt(c, (x) => x.localGet(1), (x) => x.i32Const(0));
+                c.localSet(CB);
+                if (right) {
+                  c.localGet(N);
+                  c.i32Const(1);
+                  c.i32Sub();
+                } else {
+                  c.i32Const(0);
+                }
+                c.localSet(I);
+                c.localGet(ARGC);
+                c.i32Const(2);
+                c.i32GeU();
+                c.ifVoid();
+                argAt(1);
+                c.localSet(R);
+                c.else_();
+                c.localGet(N);
+                c.i32Eqz();
+                c.ifVoid();
+                this.deps.throwTypeError(c, (x) => this.deps.lit(x, "Reduce of empty array with no initial value"));
+                c.refNull(dynT);
+                c.return_();
+                c.end();
+                elemAt(I);
+                c.localSet(R);
+                c.localGet(I);
+                c.i32Const(right ? -1 : 1);
+                c.i32Add();
+                c.localSet(I);
+                c.end();
+                c.block();
+                c.loop();
+                // Forward: k < len (the captured length); backward: k >= 0.
+                c.localGet(I);
+                if (right) {
+                  c.i32Const(0);
+                  c.i32LtS();
+                } else {
+                  c.localGet(N);
+                  c.i32GeU();
+                }
+                c.brIf(1);
+                // An index the array has since shrunk past is absent
+                // (HasProperty false) and skipped, as the spec skips it.
+                c.localGet(I);
+                liveLen();
+                c.i32LtU();
+                c.ifVoid();
+                this.pushNewArr(c);
+                c.localSet(A2);
+                c.localGet(A2);
+                c.localGet(R);
+                c.call(this.arrPush());
+                c.localGet(A2);
+                elemAt(I);
+                c.call(this.arrPush());
+                c.localGet(A2);
+                this.boxNum(c, (x) => {
+                  x.localGet(I);
+                  x.f64ConvertI32U();
+                });
+                c.call(this.arrPush());
+                c.localGet(A2);
+                c.localGet(0);
+                c.call(this.arrPush());
+                c.localGet(CB);
+                c.localGet(A2);
+                this.deps.lit(c, "callback");
+                c.call(this.callFn());
+                c.localTee(R);
+                c.refIsNull();
+                c.ifVoid();
+                c.refNull(dynT);
+                c.return_();
+                c.end();
+                c.end();
+                c.localGet(I);
+                c.i32Const(right ? -1 : 1);
+                c.i32Add();
+                c.localSet(I);
+                c.br(0);
+                c.end();
+                c.end();
+                c.localGet(R);
+                return;
+              }
+              case "findLast":
+              case "findLastIndex": {
+                c.localGet(1);
+                c.call(this.cbGate());
+                c.i32Eqz();
+                c.ifVoid();
+                c.refNull(dynT);
+                c.return_();
+                c.end();
+                this.arrAt(c, (x) => x.localGet(1), (x) => x.i32Const(0));
+                c.localSet(CB);
+                c.localGet(N);
+                c.i32Const(1);
+                c.i32Sub();
+                c.localSet(I);
+                c.block();
+                c.loop();
+                c.localGet(I);
+                c.i32Const(0);
+                c.i32LtS();
+                c.brIf(1);
+                // Get(O, k) for every k — an index past a shrink reads
+                // undefined (findLast does not skip absent indices).
+                c.localGet(I);
+                liveLen();
+                c.i32LtU();
+                c.ifResult(this.dynRef());
+                elemAt(I);
+                c.else_();
+                c.globalGet(this.undefinedGlobal());
+                c.end();
+                c.localSet(E);
+                c.localGet(CB);
+                c.localGet(E);
+                c.localGet(I);
+                c.localGet(0);
+                c.call(this.callCb());
+                c.localTee(R);
+                c.refIsNull();
+                c.ifVoid();
+                c.refNull(dynT);
+                c.return_();
+                c.end();
+                c.localGet(R);
+                c.call(this.truthy());
+                c.ifVoid();
+                if (method === "findLast") {
+                  c.localGet(E);
+                } else {
+                  this.boxNum(c, (x) => {
+                    x.localGet(I);
+                    x.f64ConvertI32U();
+                  });
+                }
+                c.return_();
+                c.end();
+                c.localGet(I);
+                c.i32Const(1);
+                c.i32Sub();
+                c.localSet(I);
+                c.br(0);
+                c.end();
+                c.end();
+                if (method === "findLast") c.globalGet(this.undefinedGlobal());
+                else this.boxNum(c, (x) => x.f64Const(-1));
+                return;
+              }
+              case "toReversed": {
+                this.pushNewArr(c);
+                c.localSet(OUT);
+                c.i32Const(0);
+                c.localSet(I);
+                forLoop(
+                  () => c.localGet(N),
+                  () => {
+                    c.localGet(N);
+                    c.i32Const(1);
+                    c.i32Sub();
+                    c.localGet(I);
+                    c.i32Sub();
+                    c.localSet(J);
+                    c.localGet(OUT);
+                    elemAt(J);
+                    c.call(this.arrPush());
+                  },
+                );
+                this.boxArr(c, (x) => x.localGet(OUT));
+                return;
+              }
+              case "toSorted": {
+                argAt(0);
+                c.localTee(CB);
+                c.structGet(dynT, DYN_KIND);
+                c.localSet(B);
+                c.localGet(B);
+                c.i32Const(DK.UNDEF);
+                c.i32Ne();
+                c.localGet(B);
+                c.i32Const(DK.FUNC);
+                c.i32Ne();
+                c.i32And();
+                c.ifVoid();
+                this.deps.lit(c, "The comparison function must be either a function or undefined: ");
+                c.localGet(CB);
+                c.call(this.v8Str());
+                c.call(concat);
+                c.localSet(MSG);
+                this.deps.throwTypeError(c, (x) => x.localGet(MSG));
+                c.refNull(dynT);
+                c.return_();
+                c.end();
+                // The copy first (ArrayCreate(len) + SortIndexedProperties
+                // over the receiver), then the receiver's own sort over it.
+                this.pushNewArr(c);
+                c.localSet(OUT);
+                c.i32Const(0);
+                c.localSet(I);
+                forLoop(
+                  () => c.localGet(N),
+                  () => {
+                    c.localGet(OUT);
+                    elemAt(I);
+                    c.call(this.arrPush());
+                  },
+                );
+                c.localGet(N);
+                c.i32Const(1);
+                c.i32GtU();
+                c.ifVoid();
+                c.localGet(OUT);
+                c.localGet(B);
+                c.i32Const(DK.FUNC);
+                c.i32Eq();
+                c.ifResult(this.dynRef());
+                c.localGet(CB);
+                c.else_();
+                c.refNull(dynT);
+                c.end();
+                c.call(this.sortArr());
+                c.i32Eqz();
+                c.ifVoid();
+                c.refNull(dynT);
+                c.return_();
+                c.end();
+                c.end();
+                this.boxArr(c, (x) => x.localGet(OUT));
+                return;
+              }
+              case "with": {
+                c.localGet(1);
+                c.i32Const(0);
+                c.f64Const(0);
+                c.f64Const(0);
+                c.f64Const(0);
+                c.localGet(2);
+                c.call(this.idxArg());
+                c.localSet(F0);
+                bailIfPending();
+                // actualIndex = rel >= 0 ? rel : len + rel; out of
+                // [0, len) is V8's RangeError over the argument's text.
+                c.localGet(F0);
+                c.f64Const(0);
+                c.f64Lt();
+                c.ifVoid();
+                c.localGet(F0);
+                c.localGet(N);
+                c.f64ConvertI32U();
+                c.f64Add();
+                c.localSet(F0);
+                c.end();
+                c.localGet(F0);
+                c.f64Const(0);
+                c.f64Lt();
+                c.localGet(F0);
+                c.localGet(N);
+                c.f64ConvertI32U();
+                c.f64Ge();
+                c.i32Or();
+                c.ifVoid();
+                this.deps.lit(c, "Invalid index : ");
+                argAt(0);
+                c.call(this.toStr());
+                c.call(concat);
+                c.localSet(MSG);
+                this.deps.throwError(c, "%RangeError", "RangeError", (x) => x.localGet(MSG));
+                c.refNull(dynT);
+                c.return_();
+                c.end();
+                c.localGet(F0);
+                c.i32TruncF64S();
+                c.localSet(J);
+                this.pushNewArr(c);
+                c.localSet(OUT);
+                c.i32Const(0);
+                c.localSet(I);
+                forLoop(
+                  () => c.localGet(N),
+                  () => {
+                    c.localGet(OUT);
+                    c.localGet(I);
+                    c.localGet(J);
+                    c.i32Eq();
+                    c.ifResult(this.dynRef());
+                    argAt(1);
+                    c.else_();
+                    elemAt(I);
+                    c.end();
+                    c.call(this.arrPush());
+                  },
+                );
+                this.boxArr(c, (x) => x.localGet(OUT));
+                return;
+              }
+              case "splice": {
+                // start (relative), then deleteCount: absent with no
+                // start → 0, absent with a start → len - start, else
+                // clamp(ToIntegerOrInfinity(dc), 0, len - start).
+                c.localGet(1);
+                c.i32Const(0);
+                c.f64Const(0);
+                c.f64Const(0);
+                c.f64Const(0);
+                c.localGet(2);
+                c.call(this.idxArg());
+                c.localSet(F0);
+                bailIfPending();
+                c.localGet(F0);
+                c.localGet(N);
+                c.call(this.relIdx());
+                c.localSet(B);
+                c.localGet(ARGC);
+                c.i32Eqz();
+                c.ifVoid();
+                c.i32Const(0);
+                c.localSet(J);
+                c.else_();
+                c.localGet(N);
+                c.localGet(B);
+                c.i32Sub();
+                c.localSet(J);
+                c.localGet(ARGC);
+                c.i32Const(2);
+                c.i32GeU();
+                c.ifVoid();
+                c.localGet(1);
+                c.i32Const(1);
+                c.f64Const(0);
+                c.f64Const(0);
+                c.f64Const(0);
+                c.localGet(2);
+                c.call(this.idxArg());
+                c.localSet(F1);
+                bailIfPending();
+                c.localGet(F1);
+                c.f64Const(0);
+                c.f64Lt();
+                c.ifVoid();
+                c.f64Const(0);
+                c.localSet(F1);
+                c.end();
+                c.localGet(F1);
+                c.localGet(J);
+                c.f64ConvertI32U();
+                c.f64Lt();
+                c.ifVoid();
+                c.localGet(F1);
+                c.i32TruncF64U();
+                c.localSet(J);
+                c.end();
+                c.end();
+                c.end();
+                // The removed run, then the tail, then the rebuild:
+                // truncate to start, the new items, the tail back on.
+                this.pushNewArr(c);
+                c.localSet(OUT);
+                c.localGet(B);
+                c.localSet(I);
+                forLoop(
+                  () => {
+                    c.localGet(B);
+                    c.localGet(J);
+                    c.i32Add();
+                  },
+                  () => {
+                    c.localGet(OUT);
+                    elemAt(I);
+                    c.call(this.arrPush());
+                  },
+                );
+                this.pushNewArr(c);
+                c.localSet(A2);
+                c.localGet(B);
+                c.localGet(J);
+                c.i32Add();
+                c.localSet(I);
+                forLoop(
+                  () => c.localGet(N),
+                  () => {
+                    c.localGet(A2);
+                    elemAt(I);
+                    c.call(this.arrPush());
+                  },
+                );
+                c.localGet(A);
+                c.localGet(B);
+                c.structSet(vecT, VEC_LEN);
+                c.i32Const(2);
+                c.localSet(I);
+                forLoop(
+                  () => c.localGet(ARGC),
+                  () => {
+                    c.localGet(A);
+                    this.arrAt(c, (x) => x.localGet(1), (x) => x.localGet(I));
+                    c.call(this.arrPush());
+                  },
+                );
+                c.i32Const(0);
+                c.localSet(I);
+                forLoop(
+                  () => this.arrLen(c, (x) => x.localGet(A2)),
+                  () => {
+                    c.localGet(A);
+                    this.arrAt(c, (x) => x.localGet(A2), (x) => x.localGet(I));
+                    c.call(this.arrPush());
+                  },
+                );
+                this.boxArr(c, (x) => x.localGet(OUT));
+                return;
+              }
+              case "fill": {
+                c.localGet(1);
+                c.i32Const(1);
+                c.f64Const(0);
+                c.f64Const(0);
+                c.f64Const(0);
+                c.localGet(2);
+                c.call(this.idxArg());
+                c.localSet(F0);
+                bailIfPending();
+                c.localGet(1);
+                c.i32Const(2);
+                c.localGet(N);
+                c.f64ConvertI32U();
+                c.localGet(N);
+                c.f64ConvertI32U();
+                c.f64Const(0);
+                c.localGet(2);
+                c.call(this.idxArg());
+                c.localSet(F1);
+                bailIfPending();
+                c.localGet(F0);
+                c.localGet(N);
+                c.call(this.relIdx());
+                c.localSet(I);
+                c.localGet(F1);
+                c.localGet(N);
+                c.call(this.relIdx());
+                c.localSet(J);
+                argAt(0);
+                c.localSet(E);
+                forLoop(
+                  () => c.localGet(J),
+                  () => {
+                    this.arrSet(
+                      c,
+                      (x) => x.localGet(A),
+                      (x) => x.localGet(I),
+                      (x) => x.localGet(E),
+                    );
+                  },
+                );
+                c.localGet(0);
+                return;
+              }
               default:
                 // ARR_METHODS and this switch are one list; a name in the
                 // set with no arm is an emitter bug, not a runtime one.
                 throw new Error(`wasm emitter bug: no ARR arm for dyn invoke '${method}'`);
             }
           });
+        }
+
+        if (DynBuilder.ARR_UNSUPPORTED.has(method)) {
+          this.arm(c, K, [DK.ARR], () => throwUnsupported("Array"));
         }
 
         if (DynBuilder.STR_METHODS.has(method)) {

@@ -1942,7 +1942,7 @@ test("dyn keyed write: V8's refusal texts on every receiver that has no slot", a
       "Cannot create property 'q' on boolean 'true'",
       "Cannot create property 'q' on boolean 'false'",
       "Cannot create property 'nope' on array", // S016 — Node adds it
-      "Cannot create property 'length' on array", // S016 — Node truncates
+      // (truncates, as Node does — no line: unit H, S110 (f))
       "Cannot create property '0' on string 'abc'", // S016 — Node: read only
       "Cannot create property 'length' on string 'abc'", // S016 — same
       "Cannot create property '9' on string 'abc'", // agrees with Node
@@ -2702,7 +2702,9 @@ test("S023: the dyn invoke ladder — Node's refusals, and the fences that are o
       // `.indexOf` with a non-string needle stays the S023 fence.
       "(no throw)",
       "Error: 'String.prototype.indexOf' on a dynamic value is not supported yet",
-      "TypeError: arr.slice: non-number index arguments on a dynamic receiver are not supported yet",
+      // A string index runs ToNumber now, as in Node (unit H, S110 (f)):
+      // 'x' is NaN, so slice(0) answers without a throw.
+      "(no throw)",
       // Rung one: the implemented String pairs, exact.
       "str.slice bc indexOf 1 lastIndexOf 2 includes true",
       // The callback gate, V8's typed wording. Node agrees with every
@@ -8425,8 +8427,14 @@ test("increment 21 stage A: jsExit array<jsval> — the sanctioned `any[]` exit 
   const { promisify } = await import("node:util");
   const cOut = await promisify(execFile)(c.binaryPath);
   expect(stdout.toString("utf8")).toBe(cOut.stdout);
+  // Unit H (SEMANTICS.md S014's unit-H amendment): an `any[]` parameter IS
+  // the island array, so no exit runs at the call — a non-array argument
+  // binds as it is. The lie surfaces one step later instead: `p.length` is
+  // checker-typed `number`, and the validated exit of the engine's
+  // `undefined` there throws (S110 (d)) where Node
+  // prints "undefined undefined undefined undefined". Same on both lanes.
   expect(stdout.toString("utf8")).toBe(
-    ["1 2 3 3", "caught: TypeError: expected an array, got number", "done", ""].join("\n"),
+    ["1 2 3 3", "caught: TypeError: expected number, got undefined", "done", ""].join("\n"),
   );
 });
 
@@ -8591,7 +8599,7 @@ test("increment 21 stage A gate fix F3: island-array NON-INDEX keyed writes thro
   );
 });
 
-test("increment 21 stage A gate fix F4: jsExit array<jsval> SPINE aliasing — a write OR a push through the exited array is observed from the ORIGINAL jsval binding, byte-exact against Node (the whole dyn ARR vector hands over by reference, not just element identity); the reference C backend instead COPIES at the exit boundary and diverges from Node here — a per-lane split the wasm lane's aliasing avoids, registered separately", async () => {
+test("increment 21 stage A gate fix F4: jsExit array<jsval> SPINE aliasing — a write OR a push through the exited array is observed from the ORIGINAL jsval binding, byte-exact against Node (the whole dyn ARR vector hands over by reference, not just element identity); unit H closed the per-lane split: `any[]` IS the island array, so the reference C backend shares it too", async () => {
   const writeSource = [
     "function mintArr(): any { return [1, 2, 3]; }",
     "function poke(p: any[]): void { p[0] = 99; }",
@@ -8614,10 +8622,10 @@ test("increment 21 stage A gate fix F4: jsExit array<jsval> SPINE aliasing — a
   const { execFile } = await import("node:child_process");
   const { promisify } = await import("node:util");
   const cWriteOut = await promisify(execFile)(cWrite.binaryPath);
-  // The registered per-lane split: C COPIES at the exit (the write is
-  // invisible on the original), wasm ALIASES (Node-exact). Pinned
-  // explicitly so nothing later "fixes" wasm to match C by accident.
-  expect(cWriteOut.stdout).toBe("1 2\n");
+  // Unit H closed the per-lane split (SEMANTICS.md S014/S044's unit-H
+  // amendments): an `any[]` parameter IS the island array on every lane,
+  // so C shares the array too — Node's answer on both.
+  expect(cWriteOut.stdout).toBe("99 2\n");
 
   const growSource = [
     "function mintArr(): any { return [1, 2, 3]; }",
@@ -8638,7 +8646,7 @@ test("increment 21 stage A gate fix F4: jsExit array<jsval> SPINE aliasing — a
   });
   if (!cGrow.ok) throw new Error(`c reference refused: ${cGrow.diagnostics[0]?.message}`);
   const cGrowOut = await promisify(execFile)(cGrow.binaryPath);
-  expect(cGrowOut.stdout).toBe("4 3\n"); // C copies: held.length stays stale
+  expect(cGrowOut.stdout).toBe("4 4\n"); // unit H: C shares the array too (Node-exact)
 });
 
 test("increment 21 stage A gate round 2 fix D1: Function.prototype members on a FUNC-kind jsval receiver fence as 'Function.prototype.<name>', not 'Object.prototype.<name>' — reachable through F2's OWN placeholders (a placeholder IS a real FUNC-kind jsval): `const f: any = v.toString; typeof f.call` used to silently answer undefined (no table had 'call' at all); apply/bind/call/toString are the closed Function.prototype own-member set (Node-measured, caller/arguments excluded as throwing accessors)", async () => {

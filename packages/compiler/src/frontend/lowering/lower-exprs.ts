@@ -21,9 +21,10 @@ import { ambientNsRootOf, ambientUndefReadType, ambientUndefVarRootOf, ambientUn
 import { expandoMemberRead, expandoWritableTarget } from "./lower-expando.js";
 import { lowerSocketInstanceOf, lowerTlsRootCertificates } from "./lower-server.js";
 import { findGenericMethodOn, lowerStaticFieldRead } from "./lower-classes.js";
-import { bindingNeverReassigned, implicitMonoFile, lowerTaggedTemplate, nullishGenericBindingUnitOf, objLitGenericFnInfoOf, objLitGenericFnNodeOf, requireObjLitGenericReceiver } from "./lower-calls.js";
+import { bindingNeverReassigned, implicitMonoFile, lowerTaggedTemplate, v8SpreadSpelling, nullishGenericBindingUnitOf, objLitGenericFnInfoOf, objLitGenericFnNodeOf, requireObjLitGenericReceiver } from "./lower-calls.js";
 import { mixinFnOfCallee } from "./lower-mixins.js";
 import { lowerExecCompanionRead, lowerRegexMemberRead } from "./lower-regex.js";
+import { exitIsConsumedCopy, exitIsFresh, exitIsOwnView, exitRefusal, s115Diag, unviewWhat } from "./island-views.js";
 import { isConstAssertionTypeNode, isGenericCallableMemberType, underConstAssertion, unitOnlyUnion } from "../types.js";
 import { lowerYield } from "./lower-generators.js";
 import { lowerStreamProperty, lowerStreamStateProperty, streamSidesOf } from "./lower-stream.js";
@@ -286,8 +287,23 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
     if (
       (ts.isObjectLiteralExpression(expr) || ts.isArrayLiteralExpression(expr)) &&
       (() => {
+        // Unit H (S115 (d)): a literal SPREADING an island value (`[...x]`,
+        // `{ ...x }` with `x: any`) builds as the island literal — the
+        // copy-out idiom — and enters a typed slot as a fresh value,
+        // element- / field-checked by the exit.
+        const islandSrc = (e: ts.Expression): boolean =>
+          (L.typeOf(e).flags & ts.TypeFlags.Any) !== 0 || L.mapTypeOf(L.typeOf(e))?.kind === "jsval";
+        if (L.dynamic && (ts.isObjectLiteralExpression(expr)
+          ? expr.properties.some((p) => ts.isSpreadAssignment(p) && islandSrc(p.expression))
+          : expr.elements.some((el) => ts.isSpreadElement(el) && islandSrc(el.expression)))) {
+          return true;
+        }
         const ctxTs = L.checker.getContextualType(expr);
         const mapped = (ctxTs ? L.mapTypeOf(ctxTs) : null) ?? L.mapTypeOf(L.typeOf(expr));
+        // An `unknown` slot (console.log's `...data`, an `unknown` binding)
+        // taking a literal of island members: the island literal, which
+        // the slot then wraps.
+        if (L.dynamic && mapped?.kind === "dyn" && L.mapTypeOf(L.typeOf(expr))?.kind === "jsval") return true;
         if (mapped?.kind !== "jsval") return false;
         // The tsgo readonly-[] panic repair (see lowerArrayLiteral): an
         // EMPTY array literal under a const assertion is the empty tuple —
@@ -614,6 +630,82 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
           type: JSVAL,
           loc,
         };
+      }
+      const firstSpread = expr.elements.findIndex(ts.isSpreadElement);
+      if (firstSpread >= 0) {
+        // SPREAD elements in an island array literal (`[...xs, 9]` over an
+        // `any[]` — the island array itself, SEMANTICS.md S014's unit-H
+        // amendment): the leading elements build the engine array, then
+        // each later element appends in source order — a spread through
+        // the engine's own `push(...src)` (its iterator protocol and V8's
+        // spread TypeError texts), a plain element through `push(v)`.
+        const acc = L.declareHiddenLocal("%arrlit", JSVAL);
+        const accRef = (): IrExpr => ({ kind: "varRef", localId: acc.id, type: JSVAL, loc });
+        const str = (value: string): IrExpr => ({ kind: "jsMarshal", value: { kind: "strLit", value, type: STRING, loc }, type: JSVAL, loc });
+        const stmts: IrStmt[] = [{
+          kind: "varDecl",
+          localId: acc.id,
+          init: {
+            kind: "jsOp",
+            op: "arrLit",
+            args: expr.elements.slice(0, firstSpread).map((el) => L.jsvalIn(L.lowerExpr(el), el)),
+            type: JSVAL,
+            loc,
+          },
+          loc,
+        }];
+        for (const el of expr.elements.slice(firstSpread)) {
+          if (ts.isSpreadElement(el)) {
+            const lowered = L.lowerExpr(el.expression);
+            // A typed array of primitives spreads VALUES: no part of it is
+            // shared, so its crossing needs no copy check.
+            const src = L.jsvalIn(lowered, el.expression);
+            // The source drains through the iterator protocol with V8's
+            // ARRAY-literal wording for a non-iterable (`n is not
+            // iterable`, `f is not a function or its return value is not
+            // iterable`), never the call-spread text; the drained elements
+            // then append in order.
+            const pack: IrExpr = {
+              kind: "libCall",
+              fn: "dyn.iterPack",
+              args: [
+                { kind: "dynFromJsval", value: src, type: DYN, loc },
+                { kind: "strLit", value: arraySpreadSpelling(el.expression), type: STRING, loc },
+              ],
+              type: DYN,
+              loc,
+            };
+            stmts.push({
+              kind: "exprStmt",
+              expr: {
+                kind: "jsOp",
+                op: "callSpread",
+                name: v8SpreadSpelling(el.expression.getText()),
+                args: [
+                  accRef(),
+                  { kind: "jsOp", op: "arrLit", args: [], type: JSVAL, loc },
+                  { kind: "jsMarshal", value: pack, type: JSVAL, loc },
+                  str("push"),
+                  str("push"),
+                ],
+                type: JSVAL,
+                loc,
+              },
+              loc,
+            });
+          } else {
+            if (ts.isOmittedExpression(el)) {
+              L.unsupported("SC1090", el, "holes after a spread element in an 'any'-typed array literal");
+            }
+            const v = L.jsvalIn(L.lowerExpr(el), el);
+            stmts.push({
+              kind: "exprStmt",
+              expr: { kind: "jsOp", op: "callMethod", name: "push", args: [accRef(), v], type: JSVAL, loc },
+              loc,
+            });
+          }
+        }
+        return { kind: "seqExpr", stmts, result: accRef(), type: JSVAL, loc };
       }
       const args = expr.elements.map((el) => L.jsvalIn(L.lowerExpr(el), el));
       return { kind: "jsOp", op: "arrLit", args, type: JSVAL, loc };
@@ -3757,6 +3849,50 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
           const w = L.widthCoerce(src, type);
           if (w) src = w;
         }
+        // `[...x]` of an ISLAND value into a typed literal (unit H,
+        // S115 (d)): the engine drains x into a fresh island array, which
+        // leaves as a fresh, element-checked copy — when the elements are
+        // not typed composites (those would be shared).
+        if (src.type.kind === "jsval" && L.dynamic && !L.copiesOnCrossing(type.elem)) {
+          const sloc = locOf(el);
+          const acc = L.declareHiddenLocal("%arrcopy", JSVAL);
+          const accRef = (): IrExpr => ({ kind: "varRef", localId: acc.id, type: JSVAL, loc: sloc });
+          const mstr = (value: string): IrExpr => ({ kind: "jsMarshal", value: { kind: "strLit", value, type: STRING, loc: sloc }, type: JSVAL, loc: sloc });
+          const pack: IrExpr = {
+            kind: "libCall",
+            fn: "dyn.iterPack",
+            args: [
+              { kind: "dynFromJsval", value: src, type: DYN, loc: sloc },
+              { kind: "strLit", value: arraySpreadSpelling(el.expression), type: STRING, loc: sloc },
+            ],
+            type: DYN,
+            loc: sloc,
+          };
+          src = {
+            kind: "jsExit",
+            fresh: true,
+            type,
+            loc: sloc,
+            value: {
+              kind: "seqExpr",
+              stmts: [
+                { kind: "varDecl", localId: acc.id, init: { kind: "jsOp", op: "arrLit", args: [], type: JSVAL, loc: sloc }, loc: sloc },
+                {
+                  kind: "exprStmt",
+                  expr: {
+                    kind: "jsOp", op: "callSpread", name: v8SpreadSpelling(el.expression.getText()),
+                    args: [accRef(), { kind: "jsOp", op: "arrLit", args: [], type: JSVAL, loc: sloc }, { kind: "jsMarshal", value: pack, type: JSVAL, loc: sloc }, mstr("push"), mstr("push")],
+                    type: JSVAL, loc: sloc,
+                  },
+                  loc: sloc,
+                },
+              ],
+              result: accRef(),
+              type: JSVAL,
+              loc: sloc,
+            },
+          };
+        }
         if (!typeEquals(src.type, type)) {
           L.unsupported(
             "SC1090",
@@ -6782,6 +6918,11 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
       if (targetTs0.flags & ts.TypeFlags.Any && L.dynamic) {
         return L.jsvalIn(inner, expr.expression);
       }
+      // `xs as any[]` (and every other target that IS an island value —
+      // SEMANTICS.md S014's unit-H amendment): the island entrance too.
+      if (L.dynamic && L.mapTypeOf(targetTs0)?.kind === "jsval") {
+        return L.jsvalIn(inner, expr.expression);
+      }
       // `u as Arm` on a UNION value is `u!`'s spelling with a named arm
       // (`req.headers[h] as string`): the CHECKED single-arm extraction —
       // the asserted arm's payload comes out, any other arm throws the
@@ -6810,6 +6951,9 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
       if (targetTs.flags & ts.TypeFlags.Any) return inner;
       const target = L.mapTypeOf(targetTs);
       if (!target) L.badType(expr.type, targetTs);
+      // A target that IS an island value (`as any[]`, `as Record<string,
+      // any>` — SEMANTICS.md S014's unit-H amendment): erasure, like `as any`.
+      if (target.kind === "jsval") return inner;
       if (!L.boundarySafe(target)) {
         L.unsupported(
           "SC1090",
@@ -6818,6 +6962,21 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
             `(an 'any' value can only be validated against JSON-representable types: ` +
             `number, string, boolean, records, arrays, and unions of those)`,
         );
+      }
+      if (L.copiesOnCrossing(target)) {
+        // Unit H (SEMANTICS.md S115): typed storage takes an island value
+        // only as a copy of a FRESH one.
+        if (exitIsConsumedCopy(L, expr, target)) {
+          return { kind: "jsExit", value: inner, type: target, fresh: true, loc: locOf(expr) };
+        }
+        if (exitIsOwnView(L, expr.expression, target)) {
+          return { kind: "jsUnview", value: inner, typeKey: typeKey(target), what: unviewWhat(L, target), type: target, loc: locOf(expr) };
+        }
+        if (!exitIsFresh(L, expr.expression, target)) {
+          L.pushDiag(s115Diag(locOf(expr), exitRefusal(L, target)));
+          throw new PoisonError();
+        }
+        return { kind: "jsExit", value: inner, type: target, fresh: true, loc: locOf(expr) };
       }
       return { kind: "jsExit", value: inner, type: target, loc: locOf(expr) };
     }
@@ -6834,7 +6993,7 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
       // contains undefined, so casts over parse results keep failing on
       // non-string values with the usual path-annotated TypeError.
       if (target.kind === "union" && L.dynConvertible(target)) {
-        return { kind: "dynCheck", value: inner, type: target, loc: locOf(expr) };
+        return L.dynExitGate(expr.expression, inner, { kind: "dynCheck", value: inner, type: target, loc: locOf(expr) });
       }
       // Uint8Array targets: the checked-dynamic tree carries a bytes kind now (converted
       // stdin chunks) — the extraction validates the kind and copies out.
@@ -6881,7 +7040,7 @@ export function lowerTemplate(L: Lowerer, expr: ts.TemplateExpression): IrExpr {
           `number, string, boolean, records, arrays, and unions of those)`,
       );
     }
-    return { kind: "dynCheck", value: inner, type: target, loc: locOf(expr) };
+    return L.dynExitGate(expr.expression, inner, { kind: "dynCheck", value: inner, type: target, loc: locOf(expr) });
   }
 
 export function lowerPrefixUnary(L: Lowerer, expr: ts.PrefixUnaryExpression): IrExpr {
@@ -7535,6 +7694,11 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
       if (jop === undefined) {
         L.unsupported("SC1090", expr, `operator '${ts.tokenToString(op) ?? ts.SyntaxKind[op]}' on 'any' values`);
       }
+      // Unit H (D2): identity between an island value and a TYPED composite
+      // can never hold here — the typed side crosses as a fresh copy — where
+      // Node compares one object with itself. Loud, not a silent `false`.
+      // A typed composite operand crosses as its VIEW, and views of one
+      // static value are one island value: identity is exact (S115).
       const type = jsOpResultKind(jop) === "bool" ? BOOL : JSVAL;
       return {
         kind: "jsOp", op: jop,
@@ -10335,6 +10499,10 @@ export function lowerBinary(L: Lowerer, expr: ts.BinaryExpression): IrExpr {
     const mapped = argNode.elements.map((el) => L.mapTypeOf(L.typeOf(el)));
     const first = mapped[0];
     if (first?.kind !== "promise") return null;
+    // Promises of ISLAND values combine engine-side (the result `any[]` IS
+    // the island array — SEMANTICS.md S014's unit-H amendment): the
+    // array-path's island route builds it.
+    if (first.inner.kind === "jsval") return null;
     if (!mapped.every((m) => m?.kind === "promise" && typeEquals(m.inner, first.inner))) {
       return null;
     }
@@ -10497,4 +10665,47 @@ export function primitiveCtorClosure(
     L.liftedFns.push(fn);
   }
   return { kind: "closure", fnName, captures: [], type: fnT, loc };
+}
+
+/** V8's CallPrinter rendering for a non-iterable ARRAY-literal spread
+ * source: the printed source — a name, a property chain, an element
+ * access, a literal (`5`, `true`, `null`, `{}`) — then "is not iterable";
+ * a call with a printable callee "<callee> is not a function or its return
+ * value is not iterable". A shape this printer does not render answers ""
+ * and the runtime's kind wording applies. */
+function arraySpreadSpelling(e: ts.Expression): string {
+  const strip = (n: ts.Expression): ts.Expression => {
+    let x = n;
+    while (ts.isParenthesizedExpression(x) || ts.isAsExpression(x) || ts.isNonNullExpression(x) || ts.isSatisfiesExpression(x)) {
+      x = x.expression;
+    }
+    return x;
+  };
+  const print = (n0: ts.Expression): string | null => {
+    const n = strip(n0);
+    if (ts.isIdentifier(n)) return n.text;
+    if (n.kind === ts.SyntaxKind.NullKeyword) return "null";
+    if (n.kind === ts.SyntaxKind.TrueKeyword) return "true";
+    if (n.kind === ts.SyntaxKind.FalseKeyword) return "false";
+    if (n.kind === ts.SyntaxKind.ThisKeyword) return "this";
+    if (ts.isNumericLiteral(n)) return n.getText();
+    if (ts.isObjectLiteralExpression(n) && n.properties.length === 0) return "{}";
+    if (ts.isPropertyAccessExpression(n) && !n.questionDotToken && ts.isIdentifier(n.name)) {
+      const b = print(n.expression);
+      return b !== null ? `${b}.${n.name.text}` : null;
+    }
+    if (ts.isElementAccessExpression(n) && !n.questionDotToken) {
+      const b = print(n.expression);
+      const k = print(n.argumentExpression);
+      return b !== null && k !== null ? `${b}[${k}]` : null;
+    }
+    return null;
+  };
+  const x = strip(e);
+  if (ts.isCallExpression(x)) {
+    const callee = print(x.expression);
+    return callee !== null ? `${callee} is not a function or its return value is not iterable` : "";
+  }
+  const head = print(x);
+  return head !== null ? `${head} is not iterable` : "";
 }

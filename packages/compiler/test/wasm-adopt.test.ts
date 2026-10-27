@@ -384,11 +384,15 @@ test("TY07 TYPED: a boxed TYPED promise (gated module) adopted through both a ty
   expect(exitCode).toBe(0);
 });
 
-test("TY08 TYPED: a record-typed destination: the adopted record is cast by the composite walker", async () => {
-  const { stdout, stderr, exitCode } = await runRow("TY08", "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function n(): Promise<unknown> { return 7; }\nasync function t(): Promise<number> { return 9; }\nasync function rec(): Promise<unknown> { return { a: 3, b: \"s\" }; }\nconst x: any = id(rec());\nasync function g(): Promise<{ a: number; b: string }> { return x; }\ng().then((v) => console.log(`g ${v.a} ${v.b}`));\nnew Promise<{ a: number; b: string }>((r) => r(x)).then((v) => console.log(`np ${v.a} ${v.b}`));\nPromise.resolve().then(() => console.log(\"o1\")).then(() => console.log(\"o2\")).then(() => console.log(\"o3\")).then(() => console.log(\"o4\")).then(() => console.log(\"o5\"));\nconsole.log(\"sync\");", "ts");
-  expect(stdout).toBe("sync\no1\no2\ng 3 s\nnp 3 s\no3\no4\no5\n");
-  expect(stderr).toBe("");
-  expect(exitCode).toBe(0);
+test("TY08 TYPED: a record-typed destination adopting an `any`-held value refuses at compile time (unit H, SEMANTICS.md S115 (d))", async () => {
+  // The island value would enter typed storage as a COPY of a value the
+  // compiler cannot see is fresh. (Before unit H the adopted record was
+  // cast by the composite walker; Node: sync, o1, o2, g 3 s, np 3 s, o3..o5.)
+  const entry = join(scratch, "TY08.ts");
+  await writeFile(entry, "// @dynamic\nfunction id(v: unknown): unknown { return v; }\nasync function rec(): Promise<unknown> { return { a: 3, b: \"s\" }; }\nconst x: any = id(rec());\nasync function g(): Promise<{ a: number; b: string }> { return x; }\ng().then((v) => console.log(`g ${v.a} ${v.b}`));\n");
+  const res = await compile(entry, { outPath: join(scratch, "TY08.wasm"), outDir: scratch, backend: "wasm", dynamic: true });
+  expect(res.ok).toBe(false);
+  expect(res.diagnostics.map((d) => d.message).join("\n")).toContain("an 'any' value flowing into a typed '{ a: number; b: string }' slot");
 });
 
 test("TY09 TYPED: Promise.withResolvers' typed resolve adopts an any-held promise", async () => {

@@ -416,8 +416,7 @@ console.log("unreachable", direct);
   test("a composite exit inherits dynCheck's path-annotated failures", async () => {
     const r = await compileAndRun(
       "any-lying-record",
-      `const o: any = { a: 1, b: 2 };
-const r = o as { a: number; b: string };
+      `const r = JSON.parse('{"a":1,"b":2}') as { a: number; b: string };
 console.log("unreachable", r.b);
 `,
     );
@@ -453,7 +452,8 @@ try {
 for (let i = 0; i < 300; i = i + 1) {
   const v: any = { n: i, s: \`x\${i}\` };
   try {
-    const bad = v as { n: number; s: number }; // s is a string: throws
+    // A fresh island copy (S115 (d)); s is a string: throws.
+    const bad = JSON.parse(JSON.stringify(v)) as { n: number; s: number };
     console.log("unreachable", bad.n);
   } catch {
     recovered = recovered + 1;
@@ -516,20 +516,25 @@ main();
     expect(r.stderr).toBe("");
   });
 
-  test("composites cross the boundary as deep copies (the documented aliasing divergence)", async () => {
-    // In Node `const d: any = point` aliases; scriptc deep-copies at the
-    // boundary (SEMANTICS.md). This is exactly the case that cannot be a
-    // differential test — pinned here so the divergence stays deliberate.
+  test("a typed record crossing into an 'any' binding is a live view (unit H)", async () => {
+    // In Node `const d: any = point` aliases; a typed record crosses the
+    // boundary as a live VIEW of the static record (SEMANTICS.md S115), so
+    // writes through either side are seen through the other — Node's
+    // "3 3" — and a write that does not fit the declared type throws by
+    // name.
     const r = await compileAndRun(
-      "any-copy-divergence",
+      "any-view-alias",
       `const point = { x: 1.5 };
 const d: any = point;
 d.x = d.x * 2;
 console.log(\`\${d.x}\`, point.x);
+try { d.x = "no"; } catch (e) { console.log((e as Error).message); }
 `,
     );
     expect(r.exitCode).toBe(0);
-    expect(r.stdout).toBe("3 1.5\n"); // Node would print "3 3"
+    expect(r.stdout).toBe(
+      "3 3\nCannot store string into the 'x' field of a '{ x: number }' shared from typed code (it holds numbers only — SEMANTICS.md S115)\n",
+    );
   });
 
   test("typed arrays cross as copies too — island writes stay island-side", async () => {

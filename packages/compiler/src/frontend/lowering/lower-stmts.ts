@@ -3328,6 +3328,15 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
     if (init.type.kind === "jsval" && type.kind === "array" && type.elem.kind === "jsval") {
       type = JSVAL;
     }
+    // An island ARRAY under an unannotated declaration whose checker type
+    // spells elements no exit can carry (`const kept = fns.filter(...)`
+    // over an evolving-`any` closure array — tsc types the result by the
+    // pushed elements, `(() => number)[]`): the value IS the engine array
+    // (SEMANTICS.md S014's unit-H amendment), so the binding keeps it —
+    // later method calls ride the engine's own Array.prototype.
+    if (init.type.kind === "jsval" && !decl.type && type.kind === "array" && !L.boundaryExitSafe(type)) {
+      type = JSVAL;
+    }
     // A STATIC array of island HANDLES under an unannotated declared type
     // spelling evolved elements (`const kept = fns.filter(...)` over an
     // evolving-`any` receiver — the handle-element lowering keeps the
@@ -6877,7 +6886,15 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
     const rLocal = L.declareHiddenLocal("%vofr", JSVAL);
     const itRef: IrExpr = { kind: "varRef", localId: itLocal.id, type: JSVAL, loc };
     const rRef: IrExpr = { kind: "varRef", localId: rLocal.id, type: JSVAL, loc };
-    const valueOf: IrExpr = { kind: "jsOp", op: "getProp", name: "value", args: [rRef], type: JSVAL, loc };
+    // An island value the checker types as an ARRAY (`any[]` IS the
+    // island array — SEMANTICS.md S014's unit-H amendment): an engine
+    // Array iterates as ArrayIterator does — the LIVE length and element
+    // read per step, so a body push extends the walk exactly as in Node —
+    // with no iterator object on any lane; a value that is not an Array
+    // at run time (the type lied) drains through the checked-dynamic
+    // pack (the engine's own protocol on the native lanes).
+    const arrayMode = L.checker.isArrayType(L.typeOf(stmt.expression)) || L.checker.isTupleType(L.typeOf(stmt.expression));
+    const valueOf: IrExpr = arrayMode ? rRef : { kind: "jsOp", op: "getProp", name: "value", args: [rRef], type: JSVAL, loc };
     L.scopes.push(new Map());
     try {
       const binds: IrStmt[] = [];
@@ -6901,6 +6918,93 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
         L.unsupported("SC1031", decl.name);
       }
       const body = L.inCtl("loop", () => L.lowerScopedBlock(stmt.statement), labels);
+      if (arrayMode) {
+        const srcL = L.declareHiddenLocal("%vofsrc", JSVAL);
+        const isArrL = L.declareHiddenLocal("%vofarr", BOOL);
+        const packL = L.declareHiddenLocal("%vofpack", DYN);
+        const iL = L.declareHiddenLocal("%vofi", F64);
+        iL.mutable = true;
+        const src: IrExpr = { kind: "varRef", localId: srcL.id, type: JSVAL, loc };
+        const isArr: IrExpr = { kind: "varRef", localId: isArrL.id, type: BOOL, loc };
+        const pack: IrExpr = { kind: "varRef", localId: packL.id, type: DYN, loc };
+        const i: IrExpr = { kind: "varRef", localId: iL.id, type: F64, loc };
+        const asDyn: IrExpr = { kind: "dynFromJsval", value: src, type: DYN, loc };
+        return {
+          kind: "block",
+          body: [
+            { kind: "varDecl", localId: srcL.id, init: iterable, loc },
+            { kind: "varDecl", localId: isArrL.id, init: { kind: "dynTest", test: "array", value: asDyn, type: BOOL, loc }, loc },
+            {
+              kind: "varDecl",
+              localId: packL.id,
+              init: {
+                kind: "ternary",
+                cond: isArr,
+                then: dynUndefinedExpr(loc),
+                else_: { kind: "libCall", fn: "dyn.iterPack", args: [asDyn, { kind: "strLit", value: "", type: STRING, loc }], type: DYN, loc },
+                type: DYN,
+                loc,
+              },
+              loc,
+            },
+            {
+              kind: "for",
+              init: { kind: "varDecl", localId: iL.id, init: { kind: "numLit", value: 0, type: F64, loc }, loc },
+              cond: {
+                kind: "bin",
+                op: "<",
+                left: i,
+                right: {
+                  kind: "ternary",
+                  cond: isArr,
+                  then: {
+                    kind: "jsExit",
+                    value: { kind: "jsOp", op: "getProp", name: "length", args: [src], type: JSVAL, loc },
+                    type: F64,
+                    loc,
+                  },
+                  else_: { kind: "libCall", fn: "dyn.arrLen", args: [pack], type: F64, loc },
+                  type: F64,
+                  loc,
+                },
+                type: BOOL,
+                loc,
+              },
+              update: {
+                kind: "assign",
+                localId: iL.id,
+                value: { kind: "bin", op: "+", left: i, right: { kind: "numLit", value: 1, type: F64, loc }, type: F64, loc },
+                loc,
+              },
+              body: [
+                {
+                  kind: "varDecl",
+                  localId: rLocal.id,
+                  init: {
+                    kind: "ternary",
+                    cond: isArr,
+                    then: { kind: "jsOp", op: "getIdx", args: [src, { kind: "jsMarshal", value: i, type: JSVAL, loc }], type: JSVAL, loc },
+                    else_: {
+                      kind: "jsMarshal",
+                      value: { kind: "libCall", fn: "dyn.arrAt", args: [pack, i], type: DYN, loc },
+                      type: JSVAL,
+                      loc,
+                    },
+                    type: JSVAL,
+                    loc,
+                  },
+                  loc,
+                },
+                ...binds,
+                ...body,
+              ],
+              ...(labels && { labels }),
+              loc,
+            },
+          ],
+          loc,
+        };
+      }
       return {
         kind: "block",
         body: [

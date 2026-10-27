@@ -5184,7 +5184,21 @@ export type IrExpr =
    * path-annotated failures — identical semantics to `dyn as T`). MAY
    * THROW a catchable TypeError-shaped string. The operand is borrowed;
    * the result is owned (+1) for refcounted targets. */
-  | { kind: "jsExit"; value: IrExpr; type: IrType; loc: SrcLoc }
+  | { kind: "jsExit"; value: IrExpr; type: IrType; fresh?: true; loc: SrcLoc }
+  /** A typed composite (array, tuple or record) shared INTO the island as
+   * a live VIEW (unit H, SEMANTICS.md S115) — no copy. `value` is the
+   * static composite (borrowed; it is the view's identity: two views of
+   * one static value are one island value); `fns` are island functions
+   * (jsMarshal'd closures over `value`) the view's operations call — for
+   * an array or tuple [len(), get(i), set(i, v), truncate(n)], for a
+   * record [keys(), get(k), set(k, v)]; `typeKey` names the static type
+   * (jsUnview's check). Result: an island value (+1). May throw (an
+   * engine surprise minting the view). */
+  | { kind: "jsView"; value: IrExpr; typeKey: string; record: boolean; label: string; fns: IrExpr[]; type: IrType; loc: SrcLoc }
+  /** The reverse of jsView: an island value that IS a view of a `type`
+   * static value (same typeKey) answers that static value itself (+1); any
+   * other value throws the catchable named TypeError carrying `what`. */
+  | { kind: "jsUnview"; value: IrExpr; typeKey: string; what: string; type: IrType; loc: SrcLoc }
   /** Island → static PROMISE bridge (--dynamic builds only): `value` is a
    * jsval whose declared type is Promise<T> (a package call's promise —
    * it lives in the engine); the result is a fresh pending static promise
@@ -5968,6 +5982,7 @@ export function moduleUsesIslandEngine(mod: IrModule): boolean {
     const node = v as { kind?: unknown; fn?: unknown };
     if (
       node.kind === "jsOp" || node.kind === "jsExit" || node.kind === "jsBridgePromise" ||
+      node.kind === "jsView" || node.kind === "jsUnview" ||
       (typeof node.fn === "string" && node.fn.startsWith("island."))
     ) {
       found = true;

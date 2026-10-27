@@ -98,11 +98,17 @@ describe(`typed-callback boundary (scriptc-only${sanitize ? ", sanitized" : ""})
   test("a lying engine argument throws a TypeError into the package", async () => {
     const binary = await build(join(fixturesRoot, "npm/divergent/main.ts"));
     const res = await runBinary(binary, []);
-    expect(res.stdout.toString("utf8")).toBe(
-      "caught:true:expected number, got string\n" +
-        "caught:true:expected object at $, got number\n",
-    );
+    expect(res.stdout.toString("utf8")).toBe("caught:true:expected number, got string\n");
     expect(res.exitCode).toBe(0);
+  }, 120_000);
+
+  // A typed RECORD parameter on a callback the package calls is refused at
+  // compile time (SEMANTICS.md S115 (d)): each call would copy the
+  // package's object into typed storage. `any` shares it instead.
+  test("a typed record callback parameter is refused at compile time, by name", async () => {
+    await expect(build(join(fixturesRoot, "npm/divergent/composite.ts"))).rejects.toThrow(
+      /SC1090: a function called from dynamic code with a typed '\{ name: string \}' parameter 'o': each call would COPY the dynamic argument into typed storage/,
+    );
   }, 120_000);
 
   // The lazy-builtin trap (the divergent third of the lazy edge semantics

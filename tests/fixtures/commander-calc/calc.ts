@@ -39,27 +39,24 @@ program
 // The TYPED-callback boundary (the real-CLI `.action` shape): declared param
 // types on a callback crossing into the island — the optional command
 // argument arrives as `string | undefined` (the undefined arm when
-// omitted), commander's options object converts to a static record at
-// call time (missing options take the optional fields' undefined arms),
+// omitted), commander's options object arrives as itself (typed `any`:
+// a typed record parameter would be a COPY of commander's object, which
+// SEMANTICS.md S115 refuses — `any` shares the real object, as in Node),
 // the trailing Command argument drops (declared arity), and the async
 // body's promise wraps as a real engine thenable.
-interface EchoOptions {
-  upper?: boolean;
-  prefix?: string;
-}
 
 program
   .command("echo [text]")
   .description("echo text through an async typed action")
   .option("-u, --upper", "uppercase the output")
   .option("-p, --prefix <prefix>", "prefix the output")
-  .action(async (rawText: string | undefined, opts: EchoOptions) => {
+  .action(async (rawText: string | undefined, opts: any) => {
     await new Promise<void>((resolve) => {
       setTimeout(resolve, 1);
     });
     const text = rawText !== undefined ? rawText : "(silence)";
-    const prefixed = opts.prefix !== undefined ? opts.prefix + text : text;
-    const upper = opts.upper !== undefined && opts.upper;
+    const prefixed: string = opts.prefix !== undefined ? `${opts.prefix}${text}` : text;
+    const upper: boolean = opts.upper === true;
     console.log(upper ? prefixed.toUpperCase() : prefixed);
   });
 

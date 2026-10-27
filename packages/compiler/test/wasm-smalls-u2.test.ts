@@ -452,18 +452,16 @@ test("row43 S080 plain shape: `as unknown as string[]` + push succeeds and MUTAT
   expect(out.trimEnd()).toBe("3\n3");
 });
 
-test("row44 S080 --dynamic shape: crossing into `any` copies (S014) — the write succeeds on the COPY, the interned original is UNCHANGED", async () => {
+test("row44 S080 --dynamic shape: the strings array crosses into `any` as a FROZEN view (unit H, S115) — Node's strict-mode TypeErrors, the interned original UNCHANGED", async () => {
   const out = await runRowDyn(
     "row44",
-    'function tag(strings: TemplateStringsArray, ...values: number[]){ return strings; } function site2(){ return tag`c${1}d`; } const q: any = site2(); q[0]="Q"; console.log(`${q[0]}`); console.log(`${site2()[0]}`);',
+    'function tag(strings: TemplateStringsArray, ...values: number[]){ return strings; } function site2(){ return tag`c${1}d`; } const q: any = site2(); try { q[0]="Q"; } catch (e) { console.log(String(e)); } try { q.push("x"); } catch (e) { console.log(String(e)); } console.log(`${q[0]}`); console.log(`${site2()[0]}`, q === site2());',
   );
-  // Node (strict-mode ESM): q[0]="Q" throws "TypeError: Cannot assign to
-  // read only property '0' of object '[object Array]'" and the site
-  // re-read is unchanged ("c"). This tier's measured (registered, S080 +
-  // S014) behavior: the write succeeds (no throw) on a COPY made at the
-  // unknown boundary, so the ORIGINAL interned array — read back through
-  // a SECOND, un-widened call to the same site — stays "c".
-  expect(out.trimEnd()).toBe("Q\nc");
+  // Node (strict-mode ESM), measured: both writes throw these texts; the
+  // site's array is unchanged and is the same array at every evaluation.
+  expect(out.trimEnd()).toBe(
+    "TypeError: Cannot assign to read only property '0' of object '[object Array]'\nTypeError: Cannot add property 2, object is not extensible\nc\nc true",
+  );
 });
 
 test("row75 S080 CommonJS/sloppy shape: an in-bounds index write is SILENTLY IGNORED by Node; this tier's own answer is the SAME shape as row44's", async () => {

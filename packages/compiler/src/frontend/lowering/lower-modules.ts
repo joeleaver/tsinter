@@ -1408,21 +1408,20 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
             let type = handleT ?? L.irTypeOf(nameNode);
             // An evolving-`any` array's DERIVED file-scope binding under
             // --dynamic (`const kept = fns.filter(...)` where `fns`
-            // registered array<jsval> at its `any[]` declaration): the
-            // receiver-type-preserving methods answer the receiver's
-            // handle-element array, while tsc's evolving-array analysis
-            // spells the pushed element type here — the value's element
-            // type is the truth, so the global slot takes the handle-
-            // element array (lowerVarDecl's adoption, the file-scope
-            // face). Annotated declarations keep the validated-boundary
-            // fence.
+            // registered as the island array at its `any[]` declaration —
+            // SEMANTICS.md S014's unit-H amendment): the receiver-type-
+            // preserving methods answer an engine array, while tsc's
+            // evolving-array analysis spells the pushed element type here
+            // — the value is the truth, so the global slot holds the
+            // island array (lowerVarDecl's adoption, the file-scope face).
+            // Annotated declarations keep the validated-boundary fence.
             if (
               L.dynamic && ts.isIdentifier(decl.name) && nameNode === decl.name &&
               decl.type === undefined && decl.initializer !== undefined &&
-              type.kind === "array" && type.elem.kind !== "jsval" &&
+              type.kind === "array" &&
               handleArrayPreservingCall(L, decl.initializer)
             ) {
-              type = arrayOf(JSVAL);
+              type = JSVAL;
             }
             // `const r: Repo = new MemRepo()` over an all-generic-method
             // interface: the binding keeps the initializer's CLASS
@@ -1543,7 +1542,7 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
     if (!ts.isIdentifier(cur)) return false;
     const sym = L.checker.getSymbolAtLocation(cur);
     const g = sym ? L.globalsBySymbol.get(sym) : undefined;
-    return g?.type.kind === "array" && g.type.elem.kind === "jsval";
+    return g?.type.kind === "jsval";
   }
 
 /** Registers the entry-init note for a `var` module global: JS hoists

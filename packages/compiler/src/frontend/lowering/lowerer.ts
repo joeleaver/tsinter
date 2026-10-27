@@ -87,6 +87,7 @@ import {
   UnionRegistry,
   withUndefinedArm as withUndefinedArmCanonical,
 } from "../types.js";
+import { exitIsConsumedCopy, exitIsFresh, fnReturnsFresh, fnReturnsFreshArray, exitIsOwnView, isTemplateStrings, exitRefusal, isTypedComposite, islandViewPass, s115Diag, unviewWhat, viewOf } from "./island-views.js";
 import { CompoundOp, IslandFnEntry, boundaryIntoIslandMsg, boundaryOutOfIslandMsg, BuiltinModuleFn, builtinConstLit, builtinModuleConstOf, builtinModulesArrayLit, builtinFenceHintOf, builtinModuleFnOf, stdlibMemberFence, isStdlibMember, isStdlibSymbol, isStdlibGlobal, stdlibGlobalMember, nodeTypesOnlySymbol } from "./surfaces.js";
 import { FileParts, splitFiles, collectProgram, collectNpmImports, collectJsonImports, moduleArtifacts, collectGlobals, declSymbolOf, defaultExportSymbolOf, lowerFileInit, lowerDefaultExport, buildMain, appendDynamicImportModules } from "./lower-modules.js";
 import { ClassInfo, ClassIteratorInfo, GenericClassInfo, registerBuiltinErrorClasses, registerBuiltinEmitterClass, registerBuiltinStreamClasses, builtinErrorInfoOf, builtinEmitterInfoOf, builtinStreamInfoOf, analyzeClassDecoration, classIteratorDrainCall, classIteratorNextCall, classIteratorOf, classIteratorOpenCall, classIteratorRestDrainCall, classMemberNameOf, classValueRef, collectClassShape, exactClassOfReceiver, collectClassShapeInner, ctorAbiEquals, findMethodOn, findStaticOn, findGenericMethodOn, findGenericStaticOn, genericClassInstanceType, isSubclassOf, inHierarchy, overrideBelow, staticShadowBelow, upcastTo, lowerClassMembers, lowerClassCtor, lowerClassExpression, lowerClassExpressionInfo, lowerClassMethodMember, lowerClassValueProperty, lowerStaticMethod, throwingSetterFn, fieldInitStmts, lowerStaticFieldInits, lowerStaticFieldRead, lowerDerivedCtorBody, superCallStmt, lowerSuperMethodCall, superThisRef, lowerSuperAccessorRead, lowerSuperAccessorWrite, inheritsBuiltinErrorCtor, inheritsBuiltinEmitterCtor, errorMessageArg, lowerNew, accessorCall } from "./lower-classes.js";
@@ -2036,6 +2037,9 @@ export class Lowerer {
     // Lambdas lifted while lowering any of the above (plus synthetic
     // array-HOF loop functions, which ride the same list), and the
     // implicit-any instances lowered eagerly at their first call sites.
+    // Unit H: typed composites cross into the island as VIEWS, and every
+    // composite exit not proven fresh refuses (SEMANTICS.md S115).
+    islandViewPass(this, [...functions, ...this.implicitFns]);
     functions.push(...this.liftedFns);
     functions.push(...this.implicitFns);
     // Module-scope TDZ guards (board #265): every access the analysis
@@ -2467,6 +2471,33 @@ export class Lowerer {
       return;
     }
     this.diags.push(d);
+  }
+
+  /** A checked-dynamic (`unknown`) value leaving into typed storage
+   * (`check` is its dynCheck): `any`'s rule (S115 (d)) — its own view
+   * unwraps, a fresh value copies, anything else refuses by name. */
+  dynExitGate(node: ts.Node, value: IrExpr, check: IrExpr): IrExpr {
+    if (!this.dynamic || !this.copiesOnCrossing(check.type)) return check;
+    const t = check.type;
+    if (ts.isExpression(node) && exitIsOwnView(this, node, t)) {
+      return {
+        kind: "jsUnview",
+        value: { kind: "jsMarshal", value, type: JSVAL, loc: value.loc },
+        typeKey: typeKey(t),
+        what: unviewWhat(this, t),
+        type: t,
+        loc: check.loc,
+      };
+    }
+    if (ts.isExpression(node) && (exitIsFresh(this, node, t) || exitIsConsumedCopy(this, node, t))) return check;
+    this.refuse115(node, exitRefusal(this, t, "an 'unknown'"));
+  }
+
+  /** A unit-H refusal (SEMANTICS.md S115): SC1090 with its full
+   * sentence, poisoning the statement like `unsupported`. */
+  refuse115(node: ts.Node, message: string): never {
+    this.pushDiag(s115Diag(locOf(node), message));
+    throw new PoisonError();
   }
 
   unsupported(
@@ -5557,14 +5588,18 @@ export class Lowerer {
     }
     if (t.kind === "record") {
       const shape = this.shapes.get(t.shapeId);
-      if (!shape || shape.tuple) return false;
+      if (!shape) return false;
       // Recursive shapes reaching here answer FALSE: this branch is the
       // per-field island lift (jsval/bytes-bearing composites — the
       // JSON-safe ones already answered true through boundarySafe, where
       // a cyclic value throws the circular TypeError at the marshal), and
       // the lift helpers walk values with no circular guard — fencing the
       // TYPE is the honest answer.
-      if (visiting.has(t.shapeId)) return false;
+      // Under --dynamic a record or tuple crosses as a lazy VIEW (unit H,
+      // S115): a recursive shape lifts field by field on each read, so a
+      // knot answers true; elsewhere the eager lift has no circular guard.
+      if (visiting.has(t.shapeId)) return this.dynamic;
+      if (shape.tuple && !this.dynamic) return false;
       visiting.add(t.shapeId);
       // An INDEX-SIGNATURE record lifts when its value slot does (dyn
       // included): declared fields write first, then the overflow keys.
@@ -5592,19 +5627,17 @@ export class Lowerer {
    * always evaluated exactly once (as the helper's argument). */
   jsvalLiftExpr(e: IrExpr, loc: SrcLoc): IrExpr {
     if (e.type.kind === "jsval") return e;
+    // Typed storage crosses as a live VIEW (unit H, SEMANTICS.md S115).
+    if (e.type.kind === "array" || e.type.kind === "record") return viewOf(this, e, loc);
+    if (e.type.kind === "union" && isTypedComposite(this, e.type)) {
+      const helper = this.unionToJsvalHelper(e.type.unionId, loc);
+      return { kind: "call", callee: helper, args: [e], type: JSVAL, loc };
+    }
     if (this.boundarySafe(e.type)) {
       return { kind: "jsMarshal", value: e, type: JSVAL, loc };
     }
     if (e.type.kind === "bytes" || e.type.kind === "url") {
       return { kind: "jsMarshal", value: e, type: JSVAL, loc };
-    }
-    if (e.type.kind === "record") {
-      const helper = this.recordToJsvalHelper(e.type.shapeId, loc);
-      return { kind: "call", callee: helper, args: [e], type: JSVAL, loc };
-    }
-    if (e.type.kind === "array") {
-      const helper = this.arrayToJsvalHelper(e.type.elem, loc);
-      return { kind: "call", callee: helper, args: [e], type: JSVAL, loc };
     }
     if (e.type.kind === "union") {
       const helper = this.unionToJsvalHelper(e.type.unionId, loc);
@@ -5910,7 +5943,97 @@ export class Lowerer {
   }
 
   jsvalIn(e: IrExpr, node: ts.Node): IrExpr {
-    return jsvalIn(this, e, node);
+    this.lastHostShallow = false;
+    const fresh = this.dynamic && e.type.kind === "func" ? this.checkHostFunctionCopies(node, e.type) : true;
+    const shallow = this.lastHostShallow;
+    const out = jsvalIn(this, e, node);
+    if (e.type.kind === "func" && fresh) this.checkedHostMarshals.add(out);
+    if (e.type.kind === "func" && shallow) this.shallowHostMarshals.add(out);
+    return out;
+  }
+
+  /** Host-function marshals whose typed-composite result the lowering
+   * proved fresh (checkHostFunctionCopies) — the view pass refuses the
+   * rest (unit H). */
+  readonly checkedHostMarshals = new WeakSet<object>();
+  /** Host-function marshals whose array result is a fresh CONTAINER of
+   * shared elements: the island gets a fresh island array of element
+   * views (unit H). */
+  readonly shallowHostMarshals = new WeakSet<object>();
+  private lastHostShallow = false;
+
+  /** True when a value of type `t` is typed storage — an array, a tuple
+   * or record, or a union carrying one — which crosses into the island as
+   * a VIEW and out of it only fresh (SEMANTICS.md S115). `any[]` and the
+   * composites holding `any` never answer true: they ARE island values. */
+  copiesOnCrossing(t: IrType): boolean {
+    return isTypedComposite(this, t);
+  }
+
+  /** A compiled function crossing INTO the island as a host function
+   * (unit H, SEMANTICS.md S115): a typed-composite PARAMETER would receive
+   * a copy of the island argument at every call — refused by name (leave
+   * it unannotated / `any` to share); a typed-composite RESULT crosses
+   * back as a copy too, allowed only where every return builds a fresh
+   * value. */
+  checkHostFunctionCopies(node: ts.Node, t: IrType & { kind: "func" }): boolean {
+    let fn: ts.Node | undefined = ts.isExpression(node) ? node : undefined;
+    while (fn && (ts.isParenthesizedExpression(fn) || ts.isAsExpression(fn))) fn = fn.expression;
+    if (fn && ts.isIdentifier(fn)) {
+      const s = this.resolveValueSymbol(fn);
+      const d = s ? this.checker.valueDeclarationOf(s) : undefined;
+      fn = d && ts.isVariableDeclaration(d) && d.initializer ? d.initializer : d;
+    }
+    const lit = fn && (ts.isArrowFunction(fn) || ts.isFunctionExpression(fn) || ts.isFunctionDeclaration(fn) || ts.isMethodDeclaration(fn)) ? fn : null;
+    t.params.forEach((p, i) => {
+      if (!isTypedComposite(this, p)) return;
+      const pn = lit?.parameters[i];
+      this.refuse115(
+        pn ?? node,
+        `a function called from dynamic code with a typed '${this.fmt(p)}' parameter${pn && ts.isIdentifier(pn.name) ? ` '${pn.name.text}'` : ""}: ` +
+          `each call would COPY the dynamic argument into typed storage, where the caller's object could change under it or carry more than the type declares (SEMANTICS.md S115) — ` +
+          `type the parameter 'any' so it shares the caller's value, or copy explicitly inside the function with [...x] / { ...x }`,
+      );
+    });
+    // A typed-composite result: a fresh one crosses as the adapter's copy
+    // (nothing else holds it); any other answers its VIEW — false here
+    // leaves the marshal to the view pass's wrapper.
+    if (isTypedComposite(this, t.ret)) {
+      if (lit !== null && this.returnsFreshFor(lit, t.ret)) return true;
+      // A fresh array of shared elements: a fresh island array of views.
+      this.lastHostShallow = lit !== null && t.ret.kind === "array" && fnReturnsFreshArray(lit, this);
+      return false;
+    }
+    return true;
+  }
+
+  /** Every return of `fn` builds a fresh value — parts included: a
+   * literal holding a shared typed value, or an Array-building call over
+   * shared elements, is NOT fresh (its result crosses as a view). */
+  private returnsFreshFor(fn: ts.Node, t: IrType): boolean {
+    return fnReturnsFresh(this, fn, t);
+  }
+
+  /** An ENGINE method call on an island ARRAY whose checker type spells
+   * array elements (an evolving-`any` array tsc retyped by its pushes —
+   * `const fns = []; fns.push(() => 1); fns.map(fn => fn())` — is the
+   * island array itself, SEMANTICS.md S014's unit-H amendment): the
+   * elements the engine hands a callback are engine values whatever the
+   * checker spelled, so each unannotated callback parameter binds the
+   * engine value as it is (paramShape's island-handle early-out — the
+   * then-handler rule), never a typed slot the host function would have
+   * to exit into. Receivers the checker types `any` are untouched (their
+   * callback params are `any` already). */
+  markIslandArrayCallbackParams(call: ts.CallExpression, receiverNode: ts.Expression): void {
+    const rt = this.typeOf(receiverNode);
+    if (!this.checker.isArrayType(rt) && !this.checker.isTupleType(rt)) return;
+    for (const a of call.arguments) {
+      if (!ts.isArrowFunction(a) && !ts.isFunctionExpression(a)) continue;
+      for (const p of a.parameters) {
+        if (!ts.isIdentifier(p.name) || p.type || p.initializer || p.dotDotDotToken) continue;
+        this.jsvalParamOverrides.add(p);
+      }
+    }
   }
 
   /** THE coercion path for values flowing into a typed slot: union arms
@@ -5920,6 +6043,33 @@ export class Lowerer {
    * directly when the expression was already lowered. */
   coerceInto(node: ts.Node, expr: IrExpr, expected: IrType): IrExpr {
     let e = this.coerceToExpected(expr, expected);
+    // Unit H (SEMANTICS.md S115): an island value leaving into typed
+    // storage is a COPY — allowed only when the value is FRESH (built right
+    // here, held by nothing else); everything else refuses by name.
+    // A template literal's strings array crossing into `any`: a FROZEN view.
+    if (e !== expr && this.dynamic && e.kind === "jsMarshal" && expr.type.kind === "array" && isTemplateStrings(this, node)) {
+      e = viewOf(this, expr, e.loc, true);
+    }
+    if (e !== expr && this.dynamic && e.kind === "jsMarshal" && expr.type.kind === "func") {
+      this.lastHostShallow = false;
+      if (this.checkHostFunctionCopies(node, expr.type)) this.checkedHostMarshals.add(e);
+      if (this.lastHostShallow) this.shallowHostMarshals.add(e);
+    }
+    if (e !== expr && this.dynamic && e.kind === "jsExit" && expr.type.kind === "jsval" && this.copiesOnCrossing(e.type)) {
+      if (ts.isExpression(node) && exitIsOwnView(this, node, e.type)) {
+        e = { kind: "jsUnview", value: e.value, typeKey: typeKey(e.type), what: unviewWhat(this, e.type), type: e.type, loc: e.loc };
+      } else if (ts.isExpression(node) && (exitIsFresh(this, node, e.type) || exitIsConsumedCopy(this, node, e.type))) e.fresh = true;
+      else this.refuse115(node, exitRefusal(this, e.type));
+    }
+    // `unknown` crosses exactly like `any` (S115): a typed composite enters
+    // as its VIEW (the checked-dynamic value wraps the island value), and
+    // leaves only fresh, or unwrapped when it is its own view.
+    if (e !== expr && this.dynamic && e.kind === "dynFrom" && this.copiesOnCrossing(expr.type)) {
+      e = { kind: "dynFromJsval", value: this.jsvalLiftExpr(expr, expr.loc), type: DYN, loc: expr.loc };
+    }
+    if (e !== expr && this.dynamic && e.kind === "dynCheck" && expr.type.kind === "dyn" && this.copiesOnCrossing(e.type)) {
+      e = this.dynExitGate(node, expr, e);
+    }
     // An 'any' value PROVABLY null/undefined (the unit literal itself, or
     // a read of a binding nothing ever assigns a non-unit value) flowing
     // implicitly into a primitive slot: the validated exit refuses units

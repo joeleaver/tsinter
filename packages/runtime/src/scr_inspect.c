@@ -868,9 +868,24 @@ ScrStr *scr_insp_dyn(ScrDyn *d, double recurse, double depth) {
       return scr_str_new("", 0);
     }
     case SCR_DYN_JSVAL: {
-      /* An island value inside the checked-dynamic tree: Node prints the engine object's
-       * property dump — fence loudly, naming the engine typeof (the
-       * scr_insp_jsval wording for bare 'any' composites). */
+      /* An island value inside the checked-dynamic tree: plain data (dense
+       * Arrays, plain/null-prototype objects of enumerable data members,
+       * primitives) renders through a read-only dyn snapshot of the engine
+       * value — printing is unobservable, so the snapshot is too (unit H:
+       * `any[]` IS the island array, so console.log of one lands here).
+       * Every other engine shape keeps the loud fence, naming the engine
+       * typeof (the scr_insp_jsval wording for bare 'any' composites;
+       * SEMANTICS.md S110 (e)). */
+      {
+        double levels = (depth - recurse) + 2;
+        if (levels > 1e9) levels = 1e9;
+        ScrDyn *snap = scr_dyn_jsval_ops()->inspect_snapshot(d->v.jsval.cell, levels);
+        if (snap) {
+          ScrStr *r = scr_insp_dyn(snap, recurse, depth);
+          scr_dyn_release(snap);
+          return r;
+        }
+      }
       ScrStr *t = scr_dyn_typeof(d); /* routes to the engine; +1 */
       InspBuf out = {0};
       ib_cstr(&out, "util.inspect of a composite 'any' value (typeof '");

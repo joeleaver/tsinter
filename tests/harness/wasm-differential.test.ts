@@ -3625,7 +3625,7 @@ const TIER_FLOOR: string[] = [
   // vendored copy of V8's ieee754.cc; raw transcendentals, `any` arguments
   // through ToNumber (SEMANTICS.md S100, S104): 1084 -> 1085.
   "2758-math-static-raw.ts",
-  // Unit G: the binary operators on island values run ToPrimitive over
+  // Unit G:the binary operators on island values run ToPrimitive over
   // valueOf/toString — own, through the prototype link, an accessor's, a
   // function's (board #251, %w.dyn.toPrimitive), a promise .catch
   // handler's `any` reason is the island value itself (board #260), and a
@@ -3656,6 +3656,15 @@ const TIER_FLOOR: string[] = [
   // .input companions: new programs passing from their first run.
   "2795-regex-lastindex-state.ts",
   "2796-regex-replace-callbacks.ts",
+  // Unit H (boards #259/#268): `any[]` IS the island array on every lane,
+  // so every any[]↔any crossing shares one array (SEMANTICS.md S014's
+  // unit-H amendment); a new program, passing here from its first run.
+  "2787-any-array-shared.ts",
+  // Unit H: a typed composite in an `any` slot is a live view of the
+  // static value, and island values leave into typed slots only when
+  // fresh (SEMANTICS.md S115); a new program, passing here from its first
+  // run.
+  "2788-typed-views.ts",
 ];
 
 interface RunResult {

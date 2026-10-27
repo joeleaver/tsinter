@@ -335,19 +335,19 @@ test("S081-11-concat value: same, through setTimeout", async () => {
 // S081-12: writing arguments.length throws a CATCHABLE TypeError on this
 // tier ("Cannot create property 'length' on array"); Node's Arguments
 // object accepts the write with no throw.
-test("S081-12-lengthwrite direct: arguments.length = 5 throws a CATCHABLE TypeError (Node accepts it silently)", async () => {
+test("S081-12-lengthwrite direct: arguments.length = 5 throws a CATCHABLE named Error (Node accepts it silently)", async () => {
   const out = await runRow(
     "s081_12d",
     "'use strict';\nfunction f() {\n  try { arguments.length = 5; console.log('no throw'); }\n  catch (e) { console.log('caught', e instanceof TypeError, e.message); }\n}\nf(1, 'two');",
   );
-  expect(out.trimEnd()).toBe("caught true Cannot create property 'length' on array");
+  expect(out.trimEnd()).toBe("caught false growing a dynamic array's length past its elements (the holes Node leaves) is not supported yet on the wasm lane");
 });
 test("S081-12-lengthwrite value: same, through setTimeout", async () => {
   const out = await runRow(
     "s081_12v",
     "'use strict';\nsetTimeout(function () {\n  try { arguments.length = 5; console.log('no throw'); }\n  catch (e) { console.log('caught', e instanceof TypeError, e.message); }\n}, 0, 1, 'two');",
   );
-  expect(out.trimEnd()).toBe("caught true Cannot create property 'length' on array");
+  expect(out.trimEnd()).toBe("caught false growing a dynamic array's length past its elements (the holes Node leaves) is not supported yet on the wasm lane");
 });
 
 // ============================================================

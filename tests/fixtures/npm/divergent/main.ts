@@ -13,8 +13,5 @@ const primitive: string = catching((n: number) => {
 }, "lie");
 console.log(primitive);
 
-const composite: string = catching((o: { name: string }) => {
-  console.log("composite body ran");
-  return o.name;
-}, 42);
-console.log(composite);
+// (A typed RECORD parameter is refused at compile time since unit H —
+// SEMANTICS.md S115; divergent/composite.ts pins it.)

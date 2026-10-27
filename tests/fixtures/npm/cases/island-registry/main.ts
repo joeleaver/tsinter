@@ -11,7 +11,7 @@ interface Entry {
   label: string;
   initConfig: Record<string, unknown>;
   load(): Promise<string>;
-  defaultFallback(cfg: Record<string, unknown> | undefined): { login: string; id: number };
+  defaultFallback(cfg: any): { login: string; id: number };
 }
 
 const entry: Entry = {
@@ -21,7 +21,7 @@ const entry: Entry = {
     await Promise.resolve();
     return "gh-loaded";
   },
-  defaultFallback(cfg: Record<string, unknown> | undefined) {
+  defaultFallback(cfg: any) {
     return { login: cfg ? "seeded-admin" : "admin", id: cfg ? 2 : 1 };
   },
 };

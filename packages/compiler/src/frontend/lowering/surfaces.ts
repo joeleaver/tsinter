@@ -1516,7 +1516,19 @@ export const BUILTIN_MODULE_FENCE_HINTS: Record<string, Record<string, string | 
    * with lib interfaces, so a member can carry declarations from both. A
    * user's own declaration is in neither, so shadowing never matches. */
   export function isStdlibSymbol(L: Lowerer, symbol: ts.Symbol | undefined): boolean {
-    return !!symbol && L.checker.declarationsOf(symbol).some((d) => L.isStdlibFile(d.getSourceFile()));
+    if (!symbol) return false;
+    const decls = L.checker.declarationsOf(symbol);
+    // A script-scope USER function or variable of a global's name merges
+    // with the lib declaration but replaces its VALUE (`function
+    // structuredClone(x) {...}` is what a call reaches): not the stdlib's.
+    // Ambient declarations (`declare function parseInt(...)`, a bodiless
+    // overload, `declare const`) only describe the global and keep it.
+    if (decls.some((d) =>
+      ((ts.isFunctionDeclaration(d) && d.body !== undefined) || (ts.isVariableDeclaration(d) && d.initializer !== undefined)) &&
+      !d.getSourceFile().isDeclarationFile && !L.isStdlibFile(d.getSourceFile()))) {
+      return false;
+    }
+    return decls.some((d) => L.isStdlibFile(d.getSourceFile()));
   }
 
 /** The canonical stdlib-global name `expr` denotes, or null. Three

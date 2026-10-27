@@ -896,16 +896,16 @@ function mapTypeInner(type: ts.Type, ctx: TypeMapperCtx): IrType | null {
     // the element rides the unit-only union like a record field would; the
     // VOID mapping is a return-position artifact, not a value.
     if (elem?.kind === "void" && isUnitOnlyTsType(elemTs)) elem = unitOnlyUnion(unions);
-    // A jsval element ABSORBS the array — with one carve-out. An array
-    // type entangled with package-declared ('npm-jsval') elements
-    // (`GeneratedFile[]`, `ModelMessage[]`) describes ISLAND values: the
-    // handles those APIs produce are engine arrays, never the static
-    // ScrArr this mapping would otherwise claim, so the whole array is
-    // one handle and every operation on it is an engine op. The carve-out
-    // is literal `any[]`: an EXPLICIT static array of dynamic values —
-    // the messages-building pattern (`const content: any[] = []`) — which
-    // keeps its static array-of-handles representation.
-    if (elem?.kind === "jsval" && !(elemTs.flags & ts.TypeFlags.Any)) return JSVAL;
+    // A jsval element ABSORBS the array: `any[]` (and every array whose
+    // element is an island value — `GeneratedFile[]`, `ModelMessage[]`,
+    // `any[][]`) IS the island array, one engine value, every operation on
+    // it an engine op. Unit H (board #259, Joe's ruling D2) retired the old
+    // literal-`any[]` carve-out — a static array of handles — because that
+    // representation made every crossing between `any[]` and `any` a COPY
+    // (a push through one side was lost, `===` was false) on every lane;
+    // with no second representation there is nothing to copy
+    // (SEMANTICS.md S014's unit-H amendment).
+    if (elem?.kind === "jsval") return JSVAL;
     // RegExp elements ride REF (scr_regex_retain_v/release_v, no trace —
     // a regex holds only its bytecode and source): the derived-pattern
     // idiom `[bases].map(ps => new RegExp(...))` builds real regex

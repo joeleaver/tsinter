@@ -299,12 +299,11 @@ describe(`npm-static pilots${sanitize ? " (sanitized)" : ""}`, () => {
     });
     expect(coverage.preflightFailed).toBe(false);
     expect(coverage.npmStatic).toEqual([{ package: "escape-string-regexp", status: "static" }]);
-    // typegapped's own checker errors never gate; the one report is the
-    // consumer's any-value fence — the same story a flagless island
-    // import of an untyped package tells.
-    expect(coverage.diagnostics).toHaveLength(1);
-    expect(coverage.diagnostics[0]?.code).toBe("SC1090");
-    expect(coverage.diagnostics[0]?.message).toMatch(/console\.log of 'any'/);
+    // typegapped's own checker errors never gate. (The consumer's
+    // `console.log(label(3))` over the `any` result used to be the one
+    // report — the any-value console fence; island values print now,
+    // SEMANTICS.md S110 (e), so the program builds clean.)
+    expect(coverage.diagnostics).toHaveLength(0);
   }, 120_000);
 
   // WORKSPACE-LINKED packages: node_modules/wslinked is a symlink whose

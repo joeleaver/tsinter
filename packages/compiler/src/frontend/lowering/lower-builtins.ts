@@ -6691,6 +6691,7 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
         const first = elems[0]!.type;
         if (
           first.kind === "promise" &&
+          first.inner.kind !== "jsval" &&
           elems.every((e) => e.type.kind === "promise" && typeEquals(e.type, first))
         ) {
           const entriesArr: IrExpr = { kind: "arrayLit", elems, type: arrayOf(first), loc };
@@ -6711,7 +6712,11 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
         // reads are the routed keyed ops). All-static tuples keep the
         // typed fence hint below. --dynamic only by construction: jsval
         // entries exist only there.
-        if (elems.some((e) => e.type.kind === "jsval")) {
+        // Static promises of ISLAND values (`Promise.all([Promise.resolve
+        // (x), ...])` with x: any) take the same engine route: the result
+        // `any[]` IS the island array (SEMANTICS.md S014's unit-H
+        // amendment), so the engine builds it.
+        if (elems.some((e) => e.type.kind === "jsval" || (e.type.kind === "promise" && e.type.inner.kind === "jsval"))) {
           const diagsBefore = L.diags.length;
           try {
             const marshaled = argNode.elements.map((el, i) => L.jsvalIn(elems[i]!, el));
@@ -6792,10 +6797,17 @@ const NUMBER_CONSTANTS: Record<string, number | undefined> = {
         );
       }
       const inner = entries.type.elem.inner;
+      // Promises of ISLAND values: the checker's `Promise<any[]>` maps to a
+      // promise of the island array, but the countdown combinator fills a
+      // fresh STATIC array of the handles — the result keeps that static
+      // spine (a fresh value nothing else holds; a slot expecting the
+      // island array lifts it there, which nothing can observe).
       const resultT: IrType | null =
         inner.kind === "void"
           ? { kind: "promise", inner: VOID }
-          : L.mapTypeOf(L.typeOf(call));
+          : inner.kind === "jsval"
+            ? { kind: "promise", inner: arrayOf(JSVAL) }
+            : L.mapTypeOf(L.typeOf(call));
       if (
         resultT?.kind !== "promise" ||
         (inner.kind !== "void" &&

@@ -4803,6 +4803,14 @@ function validateFunction(
         checkExpr(e.value);
         if (e.type.kind !== "jsval") err(`jsMarshal must be jsval, got ${e.type.kind}`, e.loc);
         const src = e.value.type;
+        // Unit H (SEMANTICS.md S115): a typed composite crosses as a VIEW
+        // (jsView), never a marshal copy.
+        if (
+          src.kind === "array" || src.kind === "record" ||
+          (src.kind === "union" && (unions.get(src.unionId)?.arms ?? []).some((a) => a.kind === "array" || a.kind === "record"))
+        ) {
+          err(`jsMarshal of a typed composite (${src.kind}) — it must cross as a view`, e.loc);
+        }
         // The marshal direction admits qualifying closures (host-function
         // wrapping) on top of the JSON-safe set; jsExit does not. Typed
         // closures (per-param call-time conversion through the exit
@@ -4883,6 +4891,25 @@ function validateFunction(
         if (!canExitIslandToType(e.type, (id) => records.get(id), (id) => unions.get(id))) {
           err(`jsExit to non-extractable type ${e.type.kind}`, e.loc);
         }
+        break;
+      }
+      case "jsView": {
+        checkExpr(e.value);
+        if (e.value.type.kind !== "array" && e.value.type.kind !== "record") {
+          err(`jsView of a ${e.value.type.kind} (arrays, tuples and records only)`, e.loc);
+        }
+        expectType(e, JSVAL, "jsView result");
+        if (e.fns.length !== (e.record ? 3 : 4)) err("jsView takes 4 array / 3 record functions", e.loc);
+        for (const f of e.fns) {
+          checkExpr(f);
+          expectType(f, JSVAL, "jsView function");
+        }
+        break;
+      }
+      case "jsUnview": {
+        checkExpr(e.value);
+        expectType(e.value, JSVAL, "jsUnview operand");
+        if (e.type.kind !== "array" && e.type.kind !== "record") err(`jsUnview to a ${e.type.kind}`, e.loc);
         break;
       }
       case "jsBridgePromise": {

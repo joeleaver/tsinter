@@ -36,7 +36,7 @@
 import * as ts from "../ts7/adapter.js";
 import type { Lowerer } from "./lowerer.js";
 import { isJsSourceFile } from "../program.js";
-import { BOOL, DYN, F64, IrExpr, IrStmt, IrType, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, UNDEFINED_T, arrayOf, isUnitType, shapeHasAccessorSlots, typeKey } from "../../ir/nodes.js";
+import { BOOL, DYN, F64, JSVAL, IrExpr, IrStmt, IrType, RUNTIME_ERROR_CLASSES, STRING, SrcLoc, UNDEFINED_T, arrayOf, isUnitType, shapeHasAccessorSlots, typeKey } from "../../ir/nodes.js";
 import { noLoweringDiag, type ScrDiagnostic } from "../../diagnostics/diagnostic.js";
 import { PoisonError } from "./lowerer.js";
 import { locOf } from "../program.js";
@@ -1064,6 +1064,7 @@ function lowerInspectCall(L: Lowerer, expr: ts.CallExpression, loc: SrcLoc): IrE
  * formatNumber, strings verbatim, objects through inspect at the given
  * depth) over its already-lowered value; unsupported kinds fence. */
 function formatSArg(L: Lowerer, node: ts.Expression, value: IrExpr, depth: number, loc: SrcLoc): IrExpr {
+  value = jsvalAsDyn(value);
   const t = value.type;
   if (t.kind === "string") return value;
   if (t.kind === "f64") return { kind: "libCall", fn: "insp.f64", args: [value], type: STRING, loc };
@@ -1105,6 +1106,16 @@ function formatSArg(L: Lowerer, node: ts.Expression, value: IrExpr, depth: numbe
   const reason = inspectSupport(L, t, new Set(), walk);
   if (reason !== null) L.noLowering(`util.format %s of '${L.fmt(t)}' values`, node, reason);
   return inspectExpr(L, t, value, num(0, loc), num(depth, loc), loc);
+}
+
+/** An island (`any`) format argument rides the checked-dynamic arms: the
+ * jsval→dyn crossing wraps BY REFERENCE (nothing is copied), and the dyn
+ * renderers serve every specifier — %o's showHidden walk included, which
+ * the bare insp.jsval leaf cannot honor (unit H: `any[]` IS the island
+ * array, so `console.log("%o", xs)` over one must render its [length]). */
+function jsvalAsDyn(value: IrExpr): IrExpr {
+  if (value.type.kind !== "jsval") return value;
+  return { kind: "dynFromJsval", value, type: DYN, loc: value.loc };
 }
 
 /** %O (depth 2) / %o (showHidden, depth 4) — inspect with the spec's
@@ -1154,8 +1165,25 @@ const FORMAT_SPECS = [115, 106, 100, 79, 111, 105, 102, 99] as const;
  * format helper's parameter). %c never reaches here (it prints nothing).
  * Unsupported kinds fence through L.noLowering. */
 function convertSpecArg(L: Lowerer, spec: number, node: ts.Expression, value: IrExpr, loc: SrcLoc): IrExpr {
-  const t = value.type;
   const fmtNum = (n: IrExpr): IrExpr => ({ kind: "libCall", fn: "insp.f64", args: [n], type: STRING, loc });
+  // The numeric specifiers over an island value run the ENGINE's own
+  // conversions — %d is Number(arg) (unary plus), %i/%f parse String(arg)
+  // — rather than the checked-dynamic kind ladders, which see a wrapped
+  // engine composite as an opaque leaf.
+  if (value.type.kind === "jsval" && (spec === 100 || spec === 105 || spec === 102)) {
+    if (spec === 100) {
+      const n: IrExpr = { kind: "jsOp", op: "plus", args: [value], type: JSVAL, loc };
+      return fmtNum({ kind: "jsExit", value: n, type: F64, loc });
+    }
+    const text: IrExpr = { kind: "jsOp", op: "toStr", args: [value], type: STRING, loc };
+    return fmtNum(
+      spec === 105
+        ? { kind: "libCall", fn: "num.parseInt", args: [text, num(0, loc)], type: F64, loc }
+        : { kind: "libCall", fn: "num.parseFloat", args: [text], type: F64, loc },
+    );
+  }
+  value = jsvalAsDyn(value);
+  const t = value.type;
   const textOf = (): IrExpr => (t.kind === "string" ? value : { kind: "toString", operand: value, type: STRING, loc });
   switch (spec) {
     case 115: // %s

@@ -5277,10 +5277,11 @@ export function lowerNew(L: Lowerer, expr: ts.NewExpression): IrExpr {
               // static array): the VALIDATED exit copies the engine
               // array out (strict elements, the catchable TypeError on a
               // lying handle), and the bulk add proceeds on the copy —
-              // construction reads the seed once, so the aliasing
-              // divergence has nothing to observe.
+              // construction reads the seed once and keeps only its
+              // (string/number) elements, so nothing can observe the copy
+              // — it counts as fresh (SEMANTICS.md S115 (d)).
               if (seed.type.kind === "jsval" && L.boundaryExitSafe(arrayOf(mapped.elem))) {
-                seed = { kind: "jsExit", value: seed, type: arrayOf(mapped.elem), loc: seed.loc };
+                seed = { kind: "jsExit", value: seed, type: arrayOf(mapped.elem), fresh: true, loc: seed.loc };
               }
               if (typeEquals(seed.type, arrayOf(mapped.elem))) {
                 return { kind: "setNew", seed, type: mapped, loc };

@@ -385,6 +385,8 @@ enum {
   ISL_H_ASSIGN,
   ISL_H_ITERDRAIN,
   ISL_H_CALLSPREADM,
+  ISL_H_VIEW,
+  ISL_H_SCLONE,
   ISL_H_COUNT,
 };
 
@@ -470,7 +472,72 @@ static const char isl_prelude[] =
     "throw new TypeError(\"Spread syntax requires ...iterable[Symbol.iterator] to be a function\");"
     "const a=[...p,...s];const f=o[k];"
     "if(typeof f!==\"function\")throw new TypeError(n+\" is not a function\");"
-    "return Reflect.apply(f,o,a)}]";
+    "return Reflect.apply(f,o,a)},"
+    /* ISL_H_VIEW (unit H, SEMANTICS.md S115): typed composites shared
+     * with the engine as live VIEWS — a Proxy per static value (cached by
+     * the static pointer + type key, so two crossings are one engine
+     * value) whose traps call the compiled len/get/set/trunc (arrays,
+     * tuples) or keys/get/set (records) closures. m=0 makes/finds the
+     * view, m=1 unwraps one of the given type (the pointer as a number,
+     * else the value's typeof), m=2 is the shallow plain read the
+     * inspect snapshot renders (undefined for a non-view). */
+    "(()=>{"
+    "const C=new Map(),I=new WeakMap(),AP=Array.prototype,RF=Reflect;"
+    "const R=typeof FinalizationRegistry===\"function\"?new FinalizationRegistry(k=>{const w=C.get(k);if(w!==undefined&&w.deref()===undefined)C.delete(k)}):null;"
+    "const S=\" shared from typed code\";"
+    "const T=\" (SEMANTICS.md S115)\";"
+    "const ix=k=>{if(typeof k!==\"string\")return -1;const n=+k;return n>>>0===n&&n!==4294967295&&String(n)===k?n:-1};"
+    "const ks=k=>typeof k===\"symbol\"?k.toString():\"'\"+k+\"'\";"
+    "const plain=(d)=>!(\"get\" in d)&&!(\"set\" in d)&&\"value\" in d&&d.writable!==false&&d.enumerable!==false&&d.configurable!==false;"
+    "function mkArr(nm,f){"
+    "const len=f[0],get=f[1],set=f[2],trunc=f[3];"
+    "let P;"
+    "const wrap=m=>function(...a){if(this!==P)return AP[m].apply(this,a);const c=AP.slice.call(P);const r=AP[m].apply(c,a);for(let i=0;i<c.length;i++)set(i,c[i]);if(c.length<len())trunc(c.length);return r};"
+    "const W={unshift:wrap(\"unshift\"),splice:wrap(\"splice\")};"
+    "const h={"
+    "get(t,k,r){if(k===\"length\")return len();const i=ix(k);if(i>=0)return get(i);if(k===\"unshift\"||k===\"splice\")return W[k];return RF.get(t,k,r)},"
+    "set(t,k,v,r){if(k===\"length\"){const n=Number(v);if(n>>>0!==n)throw new RangeError(\"Invalid array length\");trunc(n);return true}"
+    "const i=ix(k);if(i>=0){set(i,v);return true}"
+    "throw new TypeError(\"Cannot add property \"+ks(k)+\": \"+nm+S+\" has a fixed shape\"+T)},"
+    "has(t,k){if(k===\"length\")return true;const i=ix(k);if(i>=0)return i<len();return RF.has(t,k)},"
+    "ownKeys(){const n=len(),o=[];for(let i=0;i<n;i++)o.push(String(i));o.push(\"length\");return o},"
+    "getOwnPropertyDescriptor(t,k){if(k===\"length\")return {value:len(),writable:true,enumerable:false,configurable:false};"
+    "const i=ix(k);if(i>=0&&i<len())return {value:get(i),writable:true,enumerable:true,configurable:true};return undefined},"
+    "defineProperty(t,k,d){if(plain(d)){if(k===\"length\"){h.set(t,k,d.value);return true}const i=ix(k);if(i>=0){set(i,d.value);return true}}"
+    "throw new TypeError(\"Cannot define property \"+ks(k)+\" on \"+nm+S+\": only plain element writes reach typed storage\"+T)},"
+    "deleteProperty(t,k){const i=ix(k);if(i>=0){const n=len();if(i>=n)return true;if(i===n-1){trunc(i);return true}"
+    "throw new TypeError(\"Cannot delete element \"+k+\" of \"+nm+S+\": typed storage cannot hold holes\"+T)}"
+    "return k!==\"length\"},"
+    "preventExtensions(){throw new TypeError(\"Cannot freeze, seal or prevent extensions of \"+nm+S+T)},"
+    "setPrototypeOf(){throw new TypeError(\"Cannot change the prototype of \"+nm+S+T)}};"
+    "P=new Proxy([],h);return P}"
+    "function mkRec(nm,f){"
+    "const keys=f[0],get=f[1],set=f[2];"
+    "const own=k=>typeof k===\"string\"&&keys().includes(k);"
+    "const h={"
+    "get(t,k,r){if(typeof k===\"string\"){const v=get(k);if(v!==undefined||own(k))return v}return RF.get(t,k,r)},"
+    "set(t,k,v){if(typeof k!==\"string\")throw new TypeError(\"Cannot add property \"+ks(k)+\": \"+nm+S+\" has a fixed shape\"+T);set(k,v);return true},"
+    "has(t,k){return own(k)||RF.has(t,k)},"
+    "ownKeys(){return keys()},"
+    "getOwnPropertyDescriptor(t,k){if(own(k))return {value:get(k),writable:true,enumerable:true,configurable:true};return undefined},"
+    "defineProperty(t,k,d){if(plain(d)&&typeof k===\"string\"){set(k,d.value);return true}"
+    "throw new TypeError(\"Cannot define property \"+ks(k)+\" on \"+nm+S+\": only plain field writes reach typed storage\"+T)},"
+    "deleteProperty(t,k){if(!own(k))return true;throw new TypeError(\"Cannot delete property \"+ks(k)+\" of \"+nm+S+\": it has a fixed shape\"+T)},"
+    "preventExtensions(){throw new TypeError(\"Cannot freeze, seal or prevent extensions of \"+nm+S+T)},"
+    "setPrototypeOf(){throw new TypeError(\"Cannot change the prototype of \"+nm+S+T)}};"
+    "return new Proxy({},h)}"
+    "return (m,a,b,c,d,e)=>{"
+    "if(m===0){const k=b+\"@\"+a;const w=C.get(k);const hit=w===undefined?undefined:w.deref();if(hit!==undefined)return hit;"
+    "const p=d?mkRec(c,e):mkArr(c,e);I.set(p,{p:a,k:b,r:d,f:e});C.set(k,new WeakRef(p));if(R)R.register(p,k);return p}"
+    "if(m===1){const x=typeof a===\"object\"&&a!==null?I.get(a):undefined;if(x!==undefined&&x.k===b)return x.p;return typeof a}"
+    "if(m===2){const x=typeof a===\"object\"&&a!==null?I.get(a):undefined;if(x===undefined)return undefined;"
+    "if(x.r){const o={};for(const k of x.f[0]())o[k]=x.f[1](k);return o}"
+    "const n=x.f[0](),o=[];for(let i=0;i<n;i++)o.push(x.f[1](i));return o}"
+    "return undefined}})()"
+    ","
+    /* ISL_H_SCLONE: the engine's own structuredClone. */
+    "v=>structuredClone(v)"
+    "]";
 
 static void isl_free_boot(void);
 static void isl_prom_wraps_teardown(void);
@@ -626,6 +693,36 @@ static void isl_init(void) {
     abort();
   }
   isl_install_math(isl_ctx);
+  {
+    /* Unit H: `any[]` IS the island array, so Array.prototype errors on it
+     * are the engine's — V8's texts restored where quickjs-ng words them
+     * differently (SEMANTICS.md S110 (c)): reduce/reduceRight of an empty
+     * array, `with` out of range (quoting the argument), and a non-function
+     * comparator for sort/toSorted. Names and lengths stay the builtins'. */
+    static const char patch[] =
+        "(()=>{const AP=Array.prototype,dp=(n,f)=>Object.defineProperty(AP,n,"
+        "{value:f,writable:true,enumerable:false,configurable:true});"
+        "const R=AP.reduce,RR=AP.reduceRight,W=AP.with,TS=AP.toSorted,S=AP.sort;"
+        "const red=e=>e instanceof TypeError&&e.message===\"empty array\"?"
+        "new TypeError(\"Reduce of empty array with no initial value\"):e;"
+        "const cd=v=>v===null?\"null\":Array.isArray(v)?\"[object Array]\":typeof v===\"object\"?"
+        "\"#<\"+((v.constructor&&v.constructor.name)||\"Object\")+\">\":typeof v===\"symbol\"?"
+        "v.toString():typeof v===\"string\"?v:String(v);"
+        "const cc=c=>{if(c!==undefined&&typeof c!==\"function\")throw new TypeError("
+        "\"The comparison function must be either a function or undefined: \"+cd(c))};"
+        "dp(\"reduce\",{reduce(cb){try{return R.apply(this,arguments)}catch(e){throw red(e)}}}.reduce);"
+        "dp(\"reduceRight\",{reduceRight(cb){try{return RR.apply(this,arguments)}catch(e){throw red(e)}}}.reduceRight);"
+        "dp(\"with\",{with(index,value){try{return W.apply(this,arguments)}catch(e){"
+        "if(e instanceof RangeError)throw new RangeError(\"Invalid index : \"+String(index));throw e}}}.with);"
+        "dp(\"toSorted\",{toSorted(compareFn){cc(compareFn);return TS.apply(this,arguments)}}.toSorted);"
+        "dp(\"sort\",{sort(compareFn){cc(compareFn);return S.apply(this,arguments)}}.sort);})()";
+    JSValue r = JS_Eval(isl_ctx, patch, sizeof patch - 1, "<scr-array-texts>", JS_EVAL_TYPE_GLOBAL);
+    if (JS_IsException(r)) {
+      fprintf(stderr, "scriptc: island array-text patch failed to evaluate\n");
+      abort();
+    }
+    JS_FreeValue(isl_ctx, r);
+  }
   JSValue arr = JS_Eval(isl_ctx, isl_prelude, sizeof isl_prelude - 1,
                         "<scr-prelude>", JS_EVAL_TYPE_GLOBAL);
   if (JS_IsException(arr)) {
@@ -1234,7 +1331,26 @@ static bool isl_dynjs_strict_eq(ScrJsval *a, ScrJsval *b) {
    * answers false — strict equality itself cannot throw in JS). */
   return scr_jsval_cmp(SCR_JSOP_EQ, a, b) == 1;
 }
-static bool isl_dynjs_is_array(ScrJsval *cell) { return JS_IsArray(cell->v); }
+/* Array.isArray's IsArray: through proxies to their targets (a typed
+ * array's VIEW — unit H, S115 — is a Proxy over an Array). JS_IsArray
+ * no longer punches through proxies (quickjs.h). */
+static bool isl_is_array(JSValueConst v) {
+  JSValue cur = JS_DupValue(isl_ctx, v);
+  for (int depth = 0; depth < 64 && JS_IsProxy(cur); depth++) {
+    JSValue t = JS_GetProxyTarget(isl_ctx, cur);
+    JS_FreeValue(isl_ctx, cur);
+    if (JS_IsException(t)) {
+      JS_FreeValue(isl_ctx, JS_GetException(isl_ctx));
+      return false;
+    }
+    cur = t;
+  }
+  bool r = JS_IsArray(cur);
+  JS_FreeValue(isl_ctx, cur);
+  return r;
+}
+
+static bool isl_dynjs_is_array(ScrJsval *cell) { return isl_is_array(cell->v); }
 static bool isl_dynjs_is_error(ScrJsval *cell) { return JS_IsError(cell->v); }
 
 static const ScrDynJsvalOps isl_dynjs_ops;
@@ -1447,6 +1563,271 @@ static bool isl_dynjs_assign(ScrJsval *cell, const ScrDyn *src) {
 
 static ScrStr *isl_dynjs_to_json(ScrJsval *cell) { return scr_jsval_to_json(cell); }
 
+/* ── views (unit H, SEMANTICS.md S115) ─────────────────────────────────
+ * A typed array/tuple/record entering the island is a live VIEW: the
+ * prelude's Proxy over the compiled accessor closures `fns` (borrowed
+ * cells), one per static pointer + type key while it lives. +1 cell, or
+ * NULL + pending on an engine surprise. */
+ScrJsval *scr_jsval_view(void *p, int32_t record, const ScrStr *key, const ScrStr *label, int32_t n,
+                         ScrJsval **fns) {
+  isl_entry();
+  JSValue fa = JS_NewArray(isl_ctx);
+  for (int32_t i = 0; i < n; i++) JS_SetPropertyUint32(isl_ctx, fa, (uint32_t)i, JS_DupValue(isl_ctx, fns[i]->v));
+  JSValue argv[6] = {
+      JS_NewInt32(isl_ctx, 0),
+      JS_NewFloat64(isl_ctx, (double)(uintptr_t)p),
+      JS_NewStringLen(isl_ctx, key->data, key->len),
+      JS_NewStringLen(isl_ctx, label->data, label->len),
+      JS_NewBool(isl_ctx, record != 0),
+      fa,
+  };
+  JSValue r = JS_Call(isl_ctx, isl_helpers[ISL_H_VIEW], JS_UNDEFINED, 6, argv);
+  JS_FreeValue(isl_ctx, argv[2]);
+  JS_FreeValue(isl_ctx, argv[3]);
+  JS_FreeValue(isl_ctx, fa);
+  if (JS_IsException(r)) {
+    isl_bridge_exception();
+    return NULL;
+  }
+  return isl_cell_new(r);
+}
+
+/* An island value entering a typed composite slot inside a view's own
+ * set accessor: it must BE a view of that static type, and unwraps to the
+ * static pointer (BORROWED — the caller retains). Anything else throws the
+ * named TypeError ("Cannot store <typeof> into <what>") and answers NULL. */
+void *scr_jsval_unview(ScrJsval *v, const ScrStr *key, const ScrStr *what) {
+  isl_entry();
+  JSValue argv[3] = {JS_NewInt32(isl_ctx, 1), v->v, JS_NewStringLen(isl_ctx, key->data, key->len)};
+  JSValue r = JS_Call(isl_ctx, isl_helpers[ISL_H_VIEW], JS_UNDEFINED, 3, argv);
+  JS_FreeValue(isl_ctx, argv[2]);
+  if (JS_IsException(r)) {
+    isl_bridge_exception();
+    return NULL;
+  }
+  if (JS_IsNumber(r)) {
+    double d = 0;
+    JS_ToFloat64(isl_ctx, &d, r);
+    return (void *)(uintptr_t)d;
+  }
+  size_t tl = 0;
+  const char *ty = JS_ToCStringLen(isl_ctx, &tl, r);
+  JS_FreeValue(isl_ctx, r);
+  static const char pre[] = "Cannot store ";
+  static const char mid[] = " into ";
+  static const char post[] = " (SEMANTICS.md S115)";
+  size_t ml = (sizeof pre - 1) + tl + (sizeof mid - 1) + what->len + (sizeof post - 1);
+  char *m = malloc(ml + 1);
+  if (!m) {
+    fprintf(stderr, "scriptc: out of memory\n");
+    abort();
+  }
+  size_t o = 0;
+  memcpy(m + o, pre, sizeof pre - 1), o += sizeof pre - 1;
+  if (ty) memcpy(m + o, ty, tl), o += tl;
+  memcpy(m + o, mid, sizeof mid - 1), o += sizeof mid - 1;
+  memcpy(m + o, what->data, what->len), o += what->len;
+  memcpy(m + o, post, sizeof post - 1), o += sizeof post - 1;
+  if (ty) JS_FreeCString(isl_ctx, ty);
+  ScrStr *msg = scr_str_new(m, o);
+  ScrStr *code = scr_str_new("", 0);
+  free(m);
+  scr_throw_node_coded(1, code, msg);
+  scr_str_release(code);
+  scr_str_release(msg);
+  return NULL;
+}
+
+/* ── the inspect snapshot (unit H) ─────────────────────────────────────
+ * util.inspect / console.log of an island value: the engine value is read
+ * (never mutated, no getter runs, no user code at all) into a fresh dyn
+ * tree the dyn walker renders exactly as it renders a parsed value. A
+ * read-only snapshot taken for printing is unobservable — nothing holds
+ * it after the render. Only the shapes the dyn tree renders the way Node
+ * renders the engine value take it: primitives, dense Arrays with
+ * Array.prototype and no own member beyond their indices, and objects
+ * whose prototype is Object.prototype or null holding only enumerable
+ * string-keyed data members (non-enumerable members are hidden in Node
+ * too). Anything else — functions, class instances, holes, accessors,
+ * symbol keys, cycles, BigInt/symbol values — answers NULL with nothing
+ * pending, and the caller keeps its loud fence. `levels` bounds the walk
+ * (the renderer's remaining depth + 2): a composite past it snapshots as
+ * a one-member placeholder of its kind, which the renderer only ever
+ * prints as [Array]/[Object] (SEMANTICS.md S110 (e)). */
+typedef struct {
+  JSValue arr_proto, obj_proto;
+  void *path[256];
+  int npath;
+} IslSnap;
+
+static ScrDyn *isl_snap_value(IslSnap *st, JSValueConst v, double levels);
+
+static ScrDyn *isl_snap_composite(IslSnap *st, JSValueConst v, double levels) {
+  void *self = JS_VALUE_GET_PTR(v);
+  for (int i = 0; i < st->npath; i++) {
+    if (st->path[i] == self) return NULL; /* a cycle: [Circular] is not modeled */
+  }
+  if (st->npath >= (int)(sizeof st->path / sizeof *st->path)) return NULL;
+  if (JS_IsProxy(v)) {
+    /* A typed composite's VIEW (unit H, S115) renders as the static
+     * value it shows: its shallow plain read (compiled accessors only —
+     * no user code runs), walked under the view's own identity so a
+     * cyclic static structure stays a refused cycle. Other proxies keep
+     * the fence. */
+    JSValue argv[2] = {JS_NewInt32(isl_ctx, 2), v};
+    JSValue plain = JS_Call(isl_ctx, isl_helpers[ISL_H_VIEW], JS_UNDEFINED, 2, argv);
+    if (JS_IsException(plain)) {
+      JS_FreeValue(isl_ctx, JS_GetException(isl_ctx));
+      return NULL;
+    }
+    if (!JS_IsObject(plain)) {
+      JS_FreeValue(isl_ctx, plain);
+      return NULL;
+    }
+    st->path[st->npath++] = self;
+    ScrDyn *out = isl_snap_composite(st, plain, levels);
+    st->npath--;
+    JS_FreeValue(isl_ctx, plain);
+    return out;
+  }
+  if (JS_IsFunction(isl_ctx, v)) return NULL;
+  JSValue proto = JS_GetPrototype(isl_ctx, v);
+  if (JS_IsException(proto)) {
+    JS_FreeValue(isl_ctx, JS_GetException(isl_ctx));
+    return NULL;
+  }
+  bool is_arr = JS_IsArray(v);
+  bool null_proto = JS_IsNull(proto);
+  bool proto_ok = is_arr ? JS_VALUE_GET_PTR(proto) == JS_VALUE_GET_PTR(st->arr_proto) && JS_IsObject(proto)
+                         : null_proto || (JS_IsObject(proto) &&
+                                          JS_VALUE_GET_PTR(proto) == JS_VALUE_GET_PTR(st->obj_proto));
+  JS_FreeValue(isl_ctx, proto);
+  if (!proto_ok) return NULL;
+  JSPropertyEnum *tab = NULL;
+  uint32_t n = 0;
+  if (JS_GetOwnPropertyNames(isl_ctx, &tab, &n, v, JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK | JS_GPN_SET_ENUM) < 0) {
+    JS_FreeValue(isl_ctx, JS_GetException(isl_ctx));
+    return NULL;
+  }
+  ScrDyn *out = NULL;
+  st->path[st->npath++] = self;
+  if (is_arr) {
+    int64_t len = 0;
+    if (JS_GetLength(isl_ctx, v, &len) < 0) {
+      JS_FreeValue(isl_ctx, JS_GetException(isl_ctx));
+      goto done;
+    }
+    /* Dense and member-free: exactly `length` plus every index. */
+    if ((int64_t)n != len + 1 || len > 0xFFFFFFFELL) goto done;
+    out = scr_dyn_new_arr();
+    if (len > 0 && levels <= 0) {
+      scr_dyn_arr_push(out, scr_dyn_retain(scr_dyn_undefined()));
+      goto done;
+    }
+    for (int64_t i = 0; i < len; i++) {
+      JSAtom a = JS_NewAtomUInt32(isl_ctx, (uint32_t)i);
+      JSPropertyDescriptor desc;
+      int has = JS_GetOwnProperty(isl_ctx, &desc, v, a);
+      JS_FreeAtom(isl_ctx, a);
+      if (has <= 0) {
+        if (has < 0) JS_FreeValue(isl_ctx, JS_GetException(isl_ctx));
+        scr_dyn_release(out);
+        out = NULL;
+        goto done;
+      }
+      bool accessor = (desc.flags & JS_PROP_GETSET) != 0;
+      ScrDyn *item = accessor ? NULL : isl_snap_value(st, desc.value, levels - 1);
+      JS_FreeValue(isl_ctx, desc.value);
+      JS_FreeValue(isl_ctx, desc.getter);
+      JS_FreeValue(isl_ctx, desc.setter);
+      if (!item) {
+        scr_dyn_release(out);
+        out = NULL;
+        goto done;
+      }
+      scr_dyn_arr_push(out, item);
+    }
+    goto done;
+  }
+  out = null_proto ? scr_dyn_new_obj_null_proto() : scr_dyn_new_obj();
+  for (uint32_t i = 0; i < n; i++) {
+    if (!tab[i].is_enumerable) continue; /* hidden in Node's rendering too */
+    JSValue key = JS_AtomToValue(isl_ctx, tab[i].atom);
+    bool is_sym = JS_IsSymbol(key);
+    JS_FreeValue(isl_ctx, key);
+    if (is_sym) goto fail_obj;
+    if (levels <= 0) {
+      /* The placeholder: one member is all the [Object] answer reads. */
+      scr_dyn_obj_set(out, "_", 1, scr_dyn_retain(scr_dyn_undefined()));
+      goto done;
+    }
+    JSPropertyDescriptor desc;
+    int has = JS_GetOwnProperty(isl_ctx, &desc, v, tab[i].atom);
+    if (has <= 0) {
+      if (has < 0) JS_FreeValue(isl_ctx, JS_GetException(isl_ctx));
+      goto fail_obj;
+    }
+    bool accessor = (desc.flags & JS_PROP_GETSET) != 0;
+    ScrDyn *item = accessor ? NULL : isl_snap_value(st, desc.value, levels - 1);
+    JS_FreeValue(isl_ctx, desc.value);
+    JS_FreeValue(isl_ctx, desc.getter);
+    JS_FreeValue(isl_ctx, desc.setter);
+    if (!item) goto fail_obj;
+    size_t klen = 0;
+    const char *k = JS_AtomToCStringLen(isl_ctx, &klen, tab[i].atom);
+    if (!k) {
+      scr_dyn_release(item);
+      JS_FreeValue(isl_ctx, JS_GetException(isl_ctx));
+      goto fail_obj;
+    }
+    scr_dyn_obj_set(out, k, klen, item);
+    JS_FreeCString(isl_ctx, k);
+  }
+  goto done;
+fail_obj:
+  scr_dyn_release(out);
+  out = NULL;
+done:
+  st->npath--;
+  JS_FreePropertyEnum(isl_ctx, tab, n);
+  return out;
+}
+
+static ScrDyn *isl_snap_value(IslSnap *st, JSValueConst v, double levels) {
+  if (JS_IsUndefined(v)) return scr_dyn_retain(scr_dyn_undefined());
+  if (JS_IsNull(v)) return scr_dyn_new_null();
+  if (JS_IsBool(v)) return scr_dyn_new_bool(JS_ToBool(isl_ctx, v) > 0);
+  if (JS_IsNumber(v)) {
+    double num = 0;
+    JS_ToFloat64(isl_ctx, &num, v);
+    return scr_dyn_new_num(num);
+  }
+  if (JS_IsString(v)) {
+    ScrStr *s = isl_js_to_str(v);
+    ScrDyn *d = scr_dyn_new_str(s);
+    scr_str_release(s);
+    return d;
+  }
+  if (!JS_IsObject(v)) return NULL; /* symbol, BigInt */
+  return isl_snap_composite(st, v, levels);
+}
+
+static ScrDyn *isl_dynjs_inspect_snapshot(ScrJsval *cell, double levels) {
+  isl_entry();
+  IslSnap st;
+  st.npath = 0;
+  JSValue a = JS_NewArray(isl_ctx);
+  JSValue o = JS_NewObject(isl_ctx);
+  st.arr_proto = JS_GetPrototype(isl_ctx, a);
+  st.obj_proto = JS_GetPrototype(isl_ctx, o);
+  ScrDyn *out = isl_snap_value(&st, cell->v, levels);
+  JS_FreeValue(isl_ctx, st.arr_proto);
+  JS_FreeValue(isl_ctx, st.obj_proto);
+  JS_FreeValue(isl_ctx, a);
+  JS_FreeValue(isl_ctx, o);
+  return out;
+}
+
 static ScrDyn *isl_dynjs_iter_drain(ScrJsval *cell, bool spread, const ScrStr *spell) {
   isl_entry();
   JSValue m = JS_NewInt32(isl_ctx, spread ? 1 : 0);
@@ -1477,6 +1858,31 @@ static ScrDyn *isl_dynjs_iter_drain(ScrJsval *cell, bool spread, const ScrStr *s
   return out;
 }
 
+ScrDyn *scr_jsval_plain_dyn(ScrJsval *v) {
+  ScrDyn *d = isl_dynjs_inspect_snapshot(v, 1e9);
+  if (d) return d;
+  if (scr_exc_pending()) return NULL;
+  ScrStr *js = scr_jsval_to_json(v);
+  if (!js) return NULL;
+  d = scr_json_parse(js);
+  scr_str_release(js);
+  return d;
+}
+
+static ScrDyn *isl_dynjs_structured_clone(ScrJsval *cell) {
+  isl_entry();
+  JSValue argv[1] = {cell->v};
+  JSValue r = JS_Call(isl_ctx, isl_helpers[ISL_H_SCLONE], JS_UNDEFINED, 1, argv);
+  if (JS_IsException(r)) {
+    isl_bridge_exception();
+    return NULL;
+  }
+  ScrJsval *c = isl_cell_new(r);
+  ScrDyn *d = scr_dyn_from_jsval(c);
+  scr_jsval_release(c);
+  return d;
+}
+
 static const ScrDynJsvalOps isl_dynjs_ops = {
   isl_dynjs_release,
   isl_dynjs_typeof,
@@ -1495,6 +1901,8 @@ static const ScrDynJsvalOps isl_dynjs_ops = {
   isl_dynjs_assign,
   isl_dynjs_to_json,
   isl_dynjs_iter_drain,
+  isl_dynjs_inspect_snapshot,
+  isl_dynjs_structured_clone,
 };
 
 ScrDyn *scr_dyn_from_jsval(ScrJsval *cell) {
@@ -9316,7 +9724,7 @@ ScrBytes *scr_jsval_exit_bytes(ScrJsval *v) {
  * spine is a copy). +1, or NULL with the exception pending. */
 ScrArr *scr_jsval_exit_jsval_arr(ScrJsval *v) {
   isl_entry();
-  if (JS_IsArray(v->v) <= 0) {
+  if (!isl_is_array(v->v)) {
     isl_exit_fail("an array", v);
     return NULL;
   }

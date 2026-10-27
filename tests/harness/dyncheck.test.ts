@@ -812,19 +812,17 @@ console.log(\`\${walk(eng).length}\`);
     expect(r.stdout).toBe('{"a":1,"list":[1,2,3]}\n');
   });
 
-  test("structuredClone of an island-held unknown fences loudly", async () => {
+  test("structuredClone of an island-held unknown is the engine's own clone (unit H)", async () => {
     const r = await compileAndRun(
       "jsval-clone",
       wrapPreamble + `const c = structuredClone(u);
-console.log("unreachable", typeof c);
+console.log(typeof c, c === u, JSON.stringify(c));
 `,
       "ts",
       true,
     );
-    expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain(
-      "structuredClone on an island value held in 'unknown' is not supported yet",
-    );
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toBe('object false {"a":1,"list":[1,2,3]}\n');
   });
 
   test("Object.keys over an island-held unknown walks the engine object", async () => {
@@ -868,7 +866,10 @@ console.log("unreachable");
     );
   });
 
-  test("util.inspect (console.log) of an island-held unknown fences with the engine typeof", async () => {
+  test("util.inspect (console.log) of an island-held unknown renders plain data and fences other engine shapes with the engine typeof", async () => {
+    // Unit H: plain engine data (dense Arrays, plain objects of enumerable
+    // data members) renders through a read-only dyn snapshot — Node's own
+    // output (SEMANTICS.md S110 (e)).
     const r = await compileAndRun(
       "jsval-inspect",
       wrapPreamble + `console.log(u);
@@ -876,8 +877,21 @@ console.log("unreachable");
       "ts",
       true,
     );
-    expect(r.exitCode).toBe(1);
-    expect(r.stderr).toContain(
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toBe("{ a: 1, list: [ 1, 2, 3 ] }\n");
+    // An accessor member is not plain data (Node prints [Getter]): the
+    // loud fence, naming the engine typeof.
+    const g = await compileAndRun(
+      "jsval-inspect-getter",
+      `const eng: any = { get a() { return 1; } };
+const u: unknown = eng;
+console.log(u);
+`,
+      "ts",
+      true,
+    );
+    expect(g.exitCode).toBe(1);
+    expect(g.stderr).toContain(
       "util.inspect of a composite 'any' value (typeof 'object') is not supported yet",
     );
   });
@@ -952,14 +966,15 @@ console.log(has(eng));
     expect(r.stderr).toContain("'in' on an island value held in 'unknown' is not supported yet");
   });
 
-  test("a wrapped island value RC-balances through catch-and-continue fences", async () => {
-    // The fence throws are catchable; the wrapped cell must release
-    // cleanly through the unwind (the SAN lane's RC audit is the check).
+  test("a wrapped island value RC-balances through catch-and-continue unwinds", async () => {
+    // The engine clone's DataCloneError (a function member) is catchable;
+    // the wrapped cell must release cleanly through the unwind (the SAN
+    // lane's RC audit is the check).
     // The crossing rides a real dyn PARAM slot — a local initialized from
     // an island value stays island-world by the runtime-world dispatch.
     const r = await compileAndRun(
       "jsval-fence-unwind",
-      `const eng: any = { a: 1 };
+      `const eng: any = { a: 1, f() { return 1; } };
 let caught = 0;
 function probe(u: unknown): void {
   try {

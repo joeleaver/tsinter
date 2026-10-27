@@ -6283,9 +6283,18 @@ class LlEmitter {
         // path-annotated TypeError. The dyn temp is BORROWED; the result
         // joins the frame BEFORE the pending check so an unwind releases
         // the dummy harmlessly.
-        const dynV = this.emitExpr(e.value);
+        let dynV = this.emitExpr(e.value);
         const helper = this.dyn.dynCheckHelper(e.type);
         const ty = this.llType(e.type);
+        // A composite target over a value that may wrap a fresh island
+        // value (unit H): validate its plain data tree (the C rule).
+        if (e.type.kind === "array" || e.type.kind === "record" || e.type.kind === "union") {
+          this.declare(`declare ptr @scr_dyn_island_plain(ptr)`);
+          const pt = B.tmp();
+          B.line(`${pt} = call ptr @scr_dyn_island_plain(ptr ${dynV.name})`);
+          dynV = this.own({ name: pt, type: DYN });
+          this.emitPendingCheck();
+        }
         const t = B.tmp();
         B.line(`${t} = call ${ty === "i1" ? "zeroext i1" : ty} @${helper}(ptr ${dynV.name}, ptr null)`);
         const out = this.own({ name: t, type: e.type });
@@ -6682,6 +6691,39 @@ class LlEmitter {
         return this.emitJsOp(e);
       case "jsExit":
         return this.emitJsExit(e);
+      case "jsView": {
+        // Unit H (SEMANTICS.md S115): the typed composite's live island
+        // view — the C emitter's rule, mirrored. Operands borrowed; +1.
+        const v = this.emitExpr(e.value);
+        const fns = e.fns.map((f) => this.emitExpr(f));
+        const arr = B.slot();
+        B.entryAllocas.push(`${arr} = alloca [${fns.length} x ptr]`);
+        fns.forEach((f, i) => {
+          const p = B.tmp();
+          B.line(`${p} = getelementptr inbounds [${fns.length} x ptr], ptr ${arr}, i64 0, i64 ${i}`);
+          B.line(`store ptr ${f.name}, ptr ${p}`);
+        });
+        this.declare(`declare ptr @scr_jsval_view(ptr, i32, ptr, ptr, i32, ptr)`);
+        const t = B.tmp();
+        B.line(
+          `${t} = call ptr @scr_jsval_view(ptr ${v.name}, i32 ${e.record ? 1 : 0}, ptr ${this.internLiteral(e.typeKey)}, ptr ${this.internLiteral(e.label)}, i32 ${fns.length}, ptr ${arr})`,
+        );
+        const out = this.own({ name: t, type: e.type });
+        this.emitPendingCheck();
+        return out;
+      }
+      case "jsUnview": {
+        // The unwrap answers the static pointer BORROWED (NULL + the named
+        // TypeError otherwise): retained past the check.
+        const v = this.emitExpr(e.value);
+        this.declare(`declare ptr @scr_jsval_unview(ptr, ptr, ptr)`);
+        const t = B.tmp();
+        B.line(`${t} = call ptr @scr_jsval_unview(ptr ${v.name}, ptr ${this.internLiteral(e.typeKey)}, ptr ${this.internLiteral(e.what)})`);
+        this.own({ name: t, type: e.type });
+        this.emitPendingCheck();
+        this.retainValue(t, e.type);
+        return { name: t, type: e.type };
+      }
       case "jsBridgePromise": {
         // Island → static promise bridge: a fresh pending ScrPromise the
         // engine promise settles. Operand borrowed; the +1 promise joins
@@ -7184,14 +7226,9 @@ class LlEmitter {
         // data ride the round trip into the union's dynCheck like any
         // composite.
         const roundTrip = (): string => {
-          this.declare(`declare ptr @scr_jsval_to_json(ptr)`);
-          this.declare(`declare ptr @scr_json_parse(ptr)`);
-          const js = B.tmp();
-          B.line(`${js} = call ptr @scr_jsval_to_json(ptr ${v.name})`);
-          this.own({ name: js, type: STRING });
-          this.emitPendingCheck();
+          this.declare(`declare ptr @scr_jsval_plain_dyn(ptr)`);
           const dom = B.tmp();
-          B.line(`${dom} = call ptr @scr_json_parse(ptr ${js})`);
+          B.line(`${dom} = call ptr @scr_jsval_plain_dyn(ptr ${v.name})`);
           this.own({ name: dom, type: { kind: "dyn" } });
           this.emitPendingCheck();
           const helper = this.dyn.dynCheckHelper(e.type);

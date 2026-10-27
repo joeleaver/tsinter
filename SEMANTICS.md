@@ -640,6 +640,36 @@ so a static `any[]` written into the island is a fresh array per write
 (P-LIFT-01, P-LIFT-02; Node shares it). Board #259 tracks that lift.
 Every other composite kind keeps this entry's body.
 
+**Amendment (unit H, boards #259/#268, Joe's ruling D2 2026-10-26):
+`any[]` IS the island array, on every lane; the unit-P alias/copy lists
+above are retired.** The type mapping no longer carves out literal
+`any[]`: an array whose element is an island value (`any[]`,
+`Array<any>`, `any[][]`, a package's `GeneratedFile[]`), a record or
+tuple with an `any`-typed member (`{ items: any[]; name: string }`), and
+`Record<string, any>` all map to the island value itself (`jsval`) — one
+engine array/object, every operation on it an engine operation — where
+`any[]` used to be a STATIC array of island handles. With one
+representation there is nothing to copy, so every crossing the lists
+above named — the front end's `%jsin.arr`/`%jsin.rec` lift through an
+`any` local, an object-literal member and a property write; a typed
+`any[]` (or `any[] | undefined`, or defaulted) parameter receiving an
+island array; a returned `any[]`; empty-array identity (board #268); a
+`Promise<any[]>` fulfilment, which now arrives as it is, array or not —
+SHARES one array on wasm, c and llvm, as in Node: a push through either
+side is seen through the other and `===` holds. S044's native spine copy
+no longer arises for `any[]` slots (no exit runs). Rest parameters typed
+`any[]` bind a fresh engine array per call (the JS `(...args)` island
+form). TYPED composites (`string[]`, `number[]`, records and tuples of
+static data) are S115's subject: they enter the island as live VIEWS of
+the static value (shared, as in Node) and leave it only when fresh —
+every other exit refuses at compile time.
+**Tested by:** `packages/compiler/test/wasm-any-array-shared.test.ts`
+(H-SHARE-01..04 — the review's a01/a02/a04/b04 repros — H-METHODS-01,
+H-INSPECT-01, H-CORPUS-2787), P-LIFT-01/02, P-PARAM-01, P-BRIDGE-01/13,
+P-ASYNC-03, P-IDENT-01 (now Node's answers), the increment-21 jsExit pins
+in `wasm-emitter.test.ts` (the C lane now shares too), and corpus 2787
+on every lane.
+
 ## S015 — Keyed reads and `in` on `unknown` see OWN properties only *(inherited)*
 
 `u[k]` on a checked-dynamic value answers the receiver's OWN member, or
@@ -812,6 +842,13 @@ differential on every lane by construction, and the program that
 exercises the index writes (`2601-dyn-keyed-write-ops.js`) still refuses
 on the wasm lane for an unrelated reason — it prints its dyn values, and
 the inspect surface has not landed.
+
+**Amendment (unit H): ISLAND arrays no longer pad on the wasm lane.**
+Since `any[]` became the island array (S014's unit-H amendment), the
+padding would have answered silently for every `any[]` growth write; an
+island write past the length (jsOp setIdx) now throws a named Error
+instead (S110 (f)). The checked-dynamic (`unknown`) keyed write described
+above keeps its padding.
 
 ## S017 — `for...of` over a COMPUTED member names the value, not the source *(inherited)*
 
@@ -3251,6 +3288,26 @@ Node, where no boundary exists:
 **Tested by:** P-BRIDGE-01..13, P-ASYNC-01..03, P-CYCLE-01, P-UNH-01,
 P-IDENT-01, P-PARAM-01, P-HELD-01, P-LIFT-01/02 and P-CORPUS-2633 in
 `packages/compiler/test/wasm-island-a.test.ts`.
+
+**Amendment (unit H): for `any[]` slots this entry no longer applies —
+on any lane.** An `any[]` is the island array itself (S014's unit-H
+amendment), so a value reaching an `any[]` parameter, local or field
+crosses no exit and neither copies its spine (the native split this
+entry registered) nor needs the wasm hand-over: the C and LLVM lanes now
+print Node's `99` / length 4 on the write-through and push-through probes
+(the increment-21 pins, updated). Three of the unit-P differences listed
+above are retired with it: a non-array `Promise<any[]>` fulfilment
+arrives as it is (Node's `ok object` / `ok number`, no rejection, no
+unhandled report — P-BRIDGE-01/13, P-ASYNC-03), two reads of one island
+promise through a `Promise<any[]>` function are one promise (`true` —
+P-IDENT-01), and a non-array reaching an `any[] | undefined` parameter
+binds as it is and fails at its first use, with the engine's own text
+(`xs.push is not a function` on wasm; quickjs-ng's `not a function` on
+the native lanes — P-PARAM-01). A read the checker types as a primitive
+over such a value still exits validated (S110 (d)). The bridge machinery
+remains for promises of static payloads; the jsExit array<jsval> arm
+remains for the static arrays of handles the runtime still builds
+internally (a static `Promise.all` result), whose spines are fresh.
 
 ## S045 — A dynamic-import namespace member with no compiled crossing is a TRAP FUNCTION, not the value *(inherited; newly reachable on the wasm tier)*
 
@@ -6408,6 +6465,15 @@ on, and a second, independent evaluation of the same site is unaffected (row75) 
 module mode changes which mechanism produces the copy (an explicit cast vs. an untyped source),
 not the observable answer.
 
+**Amendment (unit H, S115): --DYNAMIC now matches Node's strict code.** A typed value crossing into
+`any` is a live VIEW of the static value, not a copy, and a template literal's strings array (TS
+`TemplateStringsArray`) crosses as a FROZEN view: an in-bounds index write throws `TypeError: Cannot
+assign to read only property 'N' of object '[object Array]'`, growth throws `TypeError: Cannot add
+property N, object is not extensible`, a `length` write throws the read-only text, and the site's
+interned array is untouched and is the same array at every evaluation (`q === site2()`), on every
+lane. Node's sloppy code ignores the in-bounds write instead of throwing. The untyped `.cjs` shape
+(row75) still crosses through the `unknown` boundary and keeps the answer above.
+
 **ISLAND TAG** (unit A2, wasm tier: an `any`-typed tag in a `--dynamic` build,
 jsOp tplStrings): the strings array, with its `raw` member, interns per site like the
 PLAIN array — the same object at every evaluation, as in Node — and is likewise not
@@ -6425,8 +6491,9 @@ to fix; this entry documents the template-strings-array shape of the same underl
 representation at all, not an `Object.freeze` call this tier mishandles).
 
 **Tested by:** row43 (PLAIN — the value after the write, AND a second evaluation of the same site showing
-the array still carrying the mutation), row44 (--DYNAMIC — the no-throw write's own value, AND a
-second evaluation of the same site showing the ORIGINAL, unmutated array), and row75 (a `.cjs`/sloppy-
+the array still carrying the mutation), row44 (--DYNAMIC — since unit H the frozen view's two
+TypeErrors, AND a second evaluation of the same site showing the ORIGINAL, unmutated, identical
+array), and row75 (a `.cjs`/sloppy-
 mode program pinning the silently-ignored index write, contrasted with Node's own sloppy-mode answer) in
 `packages/compiler/test/wasm-smalls-u2.test.ts`. All three rows pin the ABSENCE of a check — no mutation
 is expected to redden any of them on its own; a mutant that allocates a FRESH template-site array on
@@ -6495,7 +6562,10 @@ array) (S081-11, strict `.cjs`).
 
 Writing `.length` directly — Node's Arguments object accepts the write as an ordinary own-property
 assignment with no truncating/padding side effect on the actual indexed values (no throw); this tier
-throws a CATCHABLE TypeError, `"Cannot create property 'length' on array"` (S081-12, strict `.cjs`).
+treats `arguments` as the dense array it is here (S110 (f), unit H): a shorter length TRUNCATES it,
+a longer one throws the catchable `Error: growing a dynamic array's length past its elements (the
+holes Node leaves) is not supported yet on the wasm lane` (S081-12, strict `.cjs`; before unit H the
+TypeError `"Cannot create property 'length' on array"`).
 
 **LOUD REFUSALS** (not divergences, and not compile-time refusals either — each of these four constructs
 COMPILES on every lane and fails at RUN TIME with a named, deferred diagnostic, `"Uncaught Error: ...
@@ -7934,3 +8004,246 @@ throw were measured by hand on wasm, c and llvm (the crossing:
 `const re = /a/g; re.lastIndex = 3; f(re)` with an untyped JS `f` —
 Node 3, every lane the named Error). (c) is measured, not pinned (a
 corpus program cannot pin a divergence it fails on by construction).
+
+## S110 — island values print; island-array edge cases *(llvm, c and wasm under `--dynamic`; (c) the llvm and c lanes; (e), (f) per lane)*
+
+`any[]` and the composites holding `any` ARE island values and never copy
+(S014's unit-H amendment). How TYPED composites (`string[]`, `number[]`,
+records, tuples) cross is S115's subject: shared as live views into the
+island, and out of it only when fresh. (a) and (b) of this entry — the
+copy-observability analysis that refused observed copies and registered
+the rest — are retired with that model (follow-up unit H).
+
+- **(c) An island array's own errors on the llvm and c lanes.** The
+  island glue restores V8's texts for `reduce`/`reduceRight` of an empty
+  array, `with` out of range (`Invalid index : <argument>`) and a
+  non-function `sort`/`toSorted` comparator. Other Array.prototype
+  errors keep quickjs-ng's wording: a non-callable callback says `not a
+  function` (V8: `xs.push is not a function`, `number 3 is not a
+  function`). Code `__island_eval` runs on the wasm lane keeps
+  quickjs-ng's texts throughout (S103).
+- **(d) A read the checker types as a primitive exits validated.** With
+  `xs: any[]` holding a non-array at run time (only a lying annotation or
+  cast can do that), `xs.length` and the like throw `TypeError: expected
+  number, got undefined` where Node reads `undefined`.
+- **(e) Printing island values.** `console.log`, `util.format`'s
+  specifiers and `util.inspect` render plain data as Node does on every
+  lane — on wasm through the dyn walker (an island value IS a dyn value
+  there), on the native lanes through a read-only snapshot of the engine
+  value (dense Arrays with Array.prototype; objects with Object.prototype
+  or a null prototype holding only enumerable string-keyed data members;
+  primitives; a typed composite's VIEW, read through its compiled
+  accessors — S115). Any other engine shape — a function, a class
+  instance, an accessor, a hole, a symbol key, a cycle, a BigInt or
+  symbol value, any other Proxy — keeps the loud `util.inspect of a
+  composite 'any' value (typeof '<t>') is not supported yet` TypeError on
+  the native lanes, while wasm renders what its walker renders (a
+  function prints `[Function (anonymous)]` where Node names it — the
+  island crossing does not carry function names, a wasm-lane gap that
+  predates this unit).
+- **(f) Island arrays on the wasm lane.** The vector is dense (S016):
+  a write past an island array's length — where Node leaves holes —
+  throws a catchable `Error: writing an island array at index <k> past
+  its length (the holes Node leaves) is not supported yet on the wasm
+  lane`, and growing its `length` throws `Error: growing a dynamic
+  array's length past its elements (the holes Node leaves) is not
+  supported yet on the wasm lane` (shrinking it truncates, as in Node;
+  the native engine has holes and answers as Node; the checked-dynamic
+  `unknown` index write keeps S016's padding). Index arguments of the
+  Array methods run ToNumber for strings, booleans and null; an object
+  index (ToPrimitive) is a named `non-number index arguments on a dynamic
+  receiver` TypeError. `keys`, `values`, `entries`, `toSpliced`,
+  `copyWithin` and `toLocaleString` on an island array are named
+  `'Array.prototype.<m>' on a dynamic value is not supported yet` Errors.
+  A comparator's CALL SEQUENCE (how many calls, which pairs) is the merge
+  sort's, not V8's (S024).
+
+**Tested by:** `packages/compiler/test/wasm-any-array-shared.test.ts` —
+H-B2, H-S2 and H-S2b ((f), wasm and c), H-S3, H-S110c (wasm and c),
+H-INSPECT-01, H-VIEW-INSPECT ((e) for views); `tests/harness/dyncheck.test.ts`
+((e)); the `wasm-emitter.test.ts` jsExit pin ((d)). Measured against Node
+v24.18.1.
+
+## S115 — a TYPED composite is SHARED with dynamic code (`any` and `unknown` alike) as a live view, whose writes must fit the declared types and shape; a dynamic value enters typed storage only when it is fresh or its own view — every other exit, typed callback parameters and package results included, is refused at compile time *(llvm, c and wasm under `--dynamic`; (c) per lane)*
+
+Joe's ruling D2 as approved 2026-10-26 (follow-up unit H, boards
+#259/#268). Node has one object on both sides of every assignment; this
+tier keeps typed composites (`string[]`, `number[]`, records, tuples, and
+unions carrying them) in typed storage, which an engine value cannot be.
+`unknown` crosses exactly like `any` under `--dynamic` (a typed value
+entering an `unknown` slot is its view, wrapped; an `unknown` value
+leaving into typed storage follows (d)). So:
+
+- **(a) LIFTS share: a typed composite entering an `any` slot is a live
+  VIEW of the static value, never a copy.** Assignments, arguments,
+  returns, object-literal members, array elements, `Object.assign`
+  sources, a compiled function's typed result handed to dynamic code (its
+  view — or, when every return builds a fresh array of shared elements
+  such as `ps.slice()`, a fresh island array of the elements' views; a
+  result fresh all the way down crosses as a plain copy) — every way a
+  typed array, tuple or record reaches `any` / `unknown` / `any[]` / an
+  island member. (An array or object LITERAL lifted straight into an
+  `any` slot is fresh, so it is built as the island literal Node builds —
+  no view, no type lock — its non-literal parts crossing as views. A
+  template literal's strings array, frozen in JS, crosses as a FROZEN
+  view whose writes throw Node's strict-mode TypeErrors — S080's
+  amendment.)
+  Reads through the view box the typed value
+  as it is NOW; writes land in the typed storage; nested composites read
+  as their own views. Identity is exact: two crossings of one static
+  value are one JS value (`===`, `indexOf`, `includes`). The view is an
+  ordinary array (`Array.isArray` true; arrays and tuples) or object
+  (records) to everything the island does — Array methods, spread,
+  `JSON.stringify`, printing, `Object.keys`. The accessors are compiled
+  per static type by the front end and are the same code on every lane:
+  on the llvm and c lanes the container is an engine Proxy over an
+  empty Array or object, cached per static value while it lives; on
+  wasm it is a dyn array/object box carrying the static value.
+- **(b) A write through a view must fit the static type; the shape is
+  fixed.** Each refusal is a catchable error where Node succeeds:
+  - a value of the wrong primitive kind: `TypeError: Cannot store
+    <typeof> into <container> shared from typed code (it holds <kind>
+    only — SEMANTICS.md S115)` (`<container>` is e.g. `a 'number[]'
+    element`, `the 'x' field of a '{ x: number }'`);
+  - an island value into a nested typed slot that is not a view of
+    exactly that slot's type (a fresh `{...}` or `[...]` included — the
+    copy would be unobservable only when nothing else holds it, which no
+    run-time check can see): `TypeError: Cannot store object into ... (a
+    'T' slot takes only a value shared from a typed 'T') (SEMANTICS.md
+    S115)`;
+  - a member a record does not declare: `TypeError: Cannot add property
+    'k': a 'T' shared from typed code has a fixed shape`; a non-index
+    member on an array view likewise; a `Record<string, T>` /
+    index-signature record takes new keys of its value type;
+  - holes: an index write past the end (`Error: Writing past the end of
+    a 'T[]' shared from typed code would leave holes, ...`), growing
+    `length` (`Error: Growing the length of ...`); shrinking `length`,
+    `pop`, `shift`, `splice` and the like work; deleting the last element
+    truncates, any other element delete throws;
+  - a tuple's length is fixed: any write changing it throws `Error: a
+    '[...]' shared from typed code is a tuple: its length is fixed`;
+  - a slot of a union type takes what the validated exit takes, and
+    anything else throws its `expected <T> at $, got <kind>` TypeError; a
+    slot of a type that cannot leave the island at all (a bytes-or-string
+    union) throws `Cannot store into ... a '<T>' slot cannot be written
+    from dynamic code yet`;
+  - in engine code on the llvm and c lanes (compiled code cannot spell
+    these on `any` — they refuse at compile time on every lane):
+    `Object.freeze` / `seal` / `preventExtensions`, `Object.defineProperty`
+    with anything but a plain writable value, deleting an element other
+    than the last (deleting the last truncates), deleting a record
+    member, and `Object.setPrototypeOf` throw named TypeErrors; the wasm
+    lane refuses `Object.defineProperties` onto a view outright.
+  A mutating Array method that throws part way (a wrong-typed element
+  pushed by `splice`) leaves the elements before the failing one written.
+- **(c) Per lane.** On wasm, index reads and writes, `length`, `push`
+  and `pop` go straight to the view's accessors, and the callback walkers
+  (`forEach`, `map`, `filter`, `some`, `every`, `find`, `findIndex`,
+  `findLast`, `findLastIndex`) walk the view LIVE as Node does — each
+  step reads the element at that moment (a write from the callback, through
+  the view or straight to the typed array, is seen where Node sees it),
+  skipped indices follow HasProperty/Get as in Node, and the callback's
+  third argument is the view. The other Array methods run over a
+  snapshot taken at the call and write a mutated snapshot back through
+  the accessors (`shift`, `unshift`, `splice`, `sort`, `reverse`, `fill`
+  are O(n) per call, as in V8; `copyWithin`, `keys`, `values`,
+  `entries`, `toSpliced` and `toLocaleString` are the named `'Array.prototype.<m>'
+  on a dynamic value is not supported yet` Errors of S110 (f)); `reduce`, `reduceRight` and `flatMap`
+  walk that snapshot, and one whose callback changed the view meanwhile
+  throws `Error: a '<m>' callback changed ... while the method walked it,
+  which the wasm lane does not support yet` afterwards. A view of a
+  record that also holds functions calls them with `this` = a snapshot.
+  On the native lanes the Proxy is real: `unshift` and `splice` on an
+  array view run over a copy written back (so their own function
+  identities differ from `Array.prototype`'s), every other access goes
+  through the traps live. A cyclic typed structure seen through views
+  prints with the native fence (`util.inspect of a composite ...`) and
+  overflows on wasm, where Node prints `[Circular *1]`. On wasm an error
+  caught from dynamic code answers `e.constructor.name` (the error's own
+  name); calling that constructor is a named Error.
+- **(d) EXITS: a dynamic value enters typed storage only when it is
+  FRESH or its own VIEW; every other exit refuses at compile time,
+  SC1090, the same text on every lane** (Joe's ruling, 2026-10-27:
+  STRICT). Typed storage
+  cannot hold an engine value, so an exit is a copy; it is allowed
+  exactly where the copy cannot be told from the original. FRESHNESS is
+  proven from the source expression by PROVENANCE, never by spelling: a
+  call counts only when its resolved symbol is the standard library's
+  own (every declaration in the lib — a user function merging with a
+  global's name, a local `JSON` or a user class named `Response` never
+  count), a method only on a receiver whose static type is the builtin
+  Array (or a string) — never `any`, never a user subclass — and a user
+  function only when it is a function declaration or a `const` binding
+  of a function literal (methods are overridable, `let`s reassignable),
+  non-async, non-generator, every return fresh. The fresh forms:
+  `JSON.parse(text)`, `structuredClone(...)` (of a dynamic value the
+  engine's own clone on the native lanes), `await response.json()`
+  (the lib's Response/Request), array and object literals whose members
+  are primitives or themselves fresh — `[...x]` and `{ ...x }` of a
+  dynamic `x` included (the idiomatic copy-out: element/field-checked,
+  when the elements/fields are not typed composites) — `Object.keys`,
+  `Object.assign({}, ...)`, `Array.from` / `Object.values` /
+  `Object.entries` (on the native lanes `Array.from(x)` of a dynamic `x`
+  is the engine's own; the wasm lane refuses it by name — spell it
+  `[...x]`), the builtin array-building methods (`map`, `filter`,
+  `slice`, `concat`, `flat`, `flatMap`, `toSorted`, `toReversed`,
+  `toSpliced`, `with`) and the in-place `sort`/`reverse`/`fill`/
+  `copyWithin` of a fresh receiver when the elements are primitives (a
+  `map` whose literal callback returns fresh values too), string `split`
+  / `match`, fresh-returning user functions as above, and conditionals /
+  `??` / `||` over fresh branches. A copy CONSUMED on the spot counts
+  too: the seed of `new Set(x)` / `new Map(x)`, the source of
+  `Array.from(x)`, the subject of `for (... of x)` (primitive elements).
+  A VIEW returning to its own static type UNWRAPS — no copy, identity
+  kept — where the compiler can see it is one: inside a view's own write
+  (b), from a `const` binding typed `any`/`unknown` initialized from a
+  non-literal value of exactly that static type (`const d: any = point;
+  d as P`), and from a member of the program's own compiled module (a
+  dynamic `import()` namespace's member); the unwrap still checks at run
+  time. A typed callback PARAMETER that dynamic or package code passes
+  a value into, and a PACKAGE-declared typed result bound into a typed
+  slot, are exits like any other: each would copy the package's object,
+  which the package could change while the copy is read (across a call
+  or an `await`), and which can carry keys the type does not declare
+  (visible to printing, `JSON.stringify`, key order, `toString`) —
+  refused; type them `any` (sharing the real object) or copy explicitly
+  with `[...x]` / `{ ...x }`. The copies that remain are checked copies
+  of FRESH values, built where nothing else holds them: their content is
+  the value's own; a RECORD copy (`{ ...x }`, `Object.assign({}, x)`,
+  `JSON.parse` into a record type) keeps the record type's declared
+  fields in declaration order — keys the type does not declare are
+  dropped and key order is the type's (S009's width-tolerant
+  conversion), and a value that does not fit throws the checked
+  conversion's `expected <T> at <path>, got <kind>` TypeError where Node
+  runs on (the TypeScript lie); array copies (`[...x]`) keep every
+  element in order and are exact. A `for (... of x)` subject counts as
+  consumed only over primitive elements — composite elements are shared
+  in Node, so that exit refuses. Anything else refuses with
+  `an 'any' value flowing into a typed 'T' slot: typed storage cannot
+  hold an island value, so this would be a COPY, and the compiler cannot
+  see that nothing else holds the value (SEMANTICS.md S115) — keep the
+  slot 'any'/'any[]' so both sides share one value, or copy explicitly
+  where the copy is meant: [...x] or { ...x } (JSON.parse(JSON.stringify(x))
+  for nested data)` (`an 'unknown' value` from `unknown`); a typed
+  callback parameter refuses with `a function called from dynamic code
+  with a typed 'T' parameter 'x': each call would COPY the dynamic
+  argument into typed storage, ... — type the parameter 'any' so it
+  shares the caller's value, or copy explicitly inside the function with
+  [...x] / { ...x }`.
+
+**Tested by:** `packages/compiler/test/wasm-any-array-shared.test.ts` —
+H-VIEW-01..09 ((a), wasm and c against Node), H-VERR-01..08 ((b), wasm and
+c), H-VWASM-01 ((c), every lane against Node), H-EXIT-01..20 ((d)
+refusals, wasm and c identical; H-EXIT-20 the callback parameter,
+H-EXIT-20c the explicit copy), H-FRESH-01..03 and
+H-UNVIEW-01 ((d) fresh exits and unwraps), H-UNK-01 (`unknown`),
+H-HOST-01 (host results), `wasm-view-scaling.test.ts` H-SCALE-01
+(linear view mutation on wasm), H-CORPUS-2787
+and H-CORPUS-2788; corpus `2787-any-array-shared.ts`,
+`2788-typed-views.ts`, `762-any-boundary.ts` (the unwrap),
+`766-any-union-boundary.ts` (union fields) and
+`2050-dynamic-import-own-module` (a namespace member's unwrap) on every
+lane; `tests/harness/npm.test.ts` ("a typed record callback parameter is
+refused at compile time, by name");
+`tests/harness/island.test.ts` ("a typed record crossing into an 'any'
+binding is a live view"). Measured against Node v24.18.1.

@@ -170,6 +170,8 @@ import {
   FN_CLOS,
   FN_NAME,
   FN_SIG,
+  VIEW_SIG,
+  VIEW_TOKEN,
   OBJ_ENTRIES,
   OBJ_LEN,
   OBJ_PROTO,
@@ -2583,6 +2585,9 @@ class Assembler {
    * dyn.ts OBJ_PROTO codes 2-4), so the OBJ_PROTO readers test codes
    * exactly. */
   private readonly builtinObjLive: boolean;
+  /** Unit H (SEMANTICS.md S115): the module shares a typed composite with
+   * dynamic code as a live view (jsView). */
+  private readonly viewsLive: boolean;
   /** Unit A2: the module defines an island getter (jsOp defineGetter). */
   private readonly accessorsLive: boolean;
   /** Unit A2: the module calls the island's `Object.create`. */
@@ -2930,6 +2935,7 @@ class Assembler {
       return t !== null && typeof t === "object" && (t as Record<string, unknown>)["kind"] === "dyn";
     });
     this.builtinObjLive = this.irNodeReachable(mod, (rec) => rec["kind"] === "dynObjLit" && rec["builtin"] !== undefined);
+    this.viewsLive = this.irNodeReachable(mod, (rec) => rec["kind"] === "jsView");
     // INC-26 P3 (brief-p3-v2.md §3D, rev-26 CP1 pre-read D-3/E-1): force
     // `this.nextTick` (the GETTER, interning the queue NOW) in any module
     // that reaches `process.emitWarning`, BEFORE any function body is
@@ -9148,6 +9154,7 @@ class Assembler {
           }
         : {}),
       ...(this.builtinObjLive ? { builtinObjs: true as const } : {}),
+      ...(this.viewsLive ? { views: true as const } : {}),
       ...(this.nullProtoLive
         ? {
             nullProtoToStr: (c: Code): void => {
@@ -16959,6 +16966,17 @@ class Assembler {
   private readonly dynFnThunks = new Map<string, number>();
   private readonly dynFnBoxes = new Map<string, number>();
   private readonly dynFnAdapters = new Map<string, { fn: number; env: number }>();
+
+  private readonly viewSigIds = new Map<string, number>();
+
+  /** Unit H: a view's static type key, interned (jsUnview's check). */
+  private viewSigId(key: string): number {
+    const hit = this.viewSigIds.get(key);
+    if (hit !== undefined) return hit;
+    const id = this.viewSigIds.size;
+    this.viewSigIds.set(key, id);
+    return id;
+  }
 
   /** The signature's interned id — dense, assigned on first sight. */
   private dynFnSigId(key: string): number {
@@ -28437,6 +28455,40 @@ class Assembler {
             // method name (this case's own header comment already makes
             // that argument for the tables; it applies identically here).
             this.walkExpr(e.args[0]!);
+            if (name === "length") {
+              // Unit H: an island ARRAY's length (the `any[]` loop bound)
+              // straight off its vector; every other kind keeps keyGet.
+              const dynRef = this.dyn.dynRef();
+              const r = this.acquireScratch(dynRef);
+              code.localSet(r);
+              code.localGet(r);
+              code.structGet(this.dyn.dynT(), DYN_KIND);
+              code.i32Const(DK.ARR);
+              code.i32Eq();
+              this.openIfResult(dynRef);
+              this.dyn.boxNum(code, (c) => {
+                if (this.viewsLive) {
+                  // An array view's length is its accessor's.
+                  this.dyn.isView(c, (x) => x.localGet(r));
+                  c.ifResult(I32);
+                  c.localGet(r);
+                  c.call(this.dyn.viewLen());
+                  c.else_();
+                  this.dyn.arrLen(c, (x) => this.dyn.arrPayload(x, (y) => y.localGet(r)));
+                  c.end();
+                } else {
+                  this.dyn.arrLen(c, (x) => this.dyn.arrPayload(x, (y) => y.localGet(r)));
+                }
+                c.f64ConvertI32U();
+              });
+              code.else_();
+              code.localGet(r);
+              this.emitDynGetProp(code, name);
+              this.close();
+              this.releaseScratch(dynRef, r);
+              this.emitPendingCheck();
+              return;
+            }
             this.emitDynGetProp(code, name);
             this.emitPendingCheck();
             return;
@@ -28451,6 +28503,14 @@ class Assembler {
             return;
           }
           case "getIdx": {
+            // Unit H: `any[]` IS the island array, so `xs[i]` over a
+            // number index is the hot path — an ARR receiver with an
+            // in-range integral index reads its slot directly; everything
+            // else takes the generic key route below.
+            if (e.args[1]!.kind === "jsMarshal" && e.args[1]!.value.type.kind === "f64") {
+              this.emitIslandNumIndex(e.args[0]!, e.args[1]!.value, null);
+              return;
+            }
             // The index is a full jsval (validate.ts: every jsOp arg is
             // jsval-typed) — emitJsvalIndexKeyString reduces it to the
             // strRef keyGet wants; keyGet's OWN canonIdx call handles the
@@ -28464,10 +28524,14 @@ class Assembler {
             return;
           }
           case "setIdx": {
+            if (e.args[1]!.kind === "jsMarshal" && e.args[1]!.value.type.kind === "f64") {
+              this.emitIslandNumIndex(e.args[0]!, e.args[1]!.value, e.args[2]!);
+              return;
+            }
             this.walkExpr(e.args[0]!);
             this.emitJsvalIndexKeyString(e.args[1]!);
             this.walkExpr(e.args[2]!);
-            code.call(this.dyn.keySet());
+            code.call(this.dyn.islandSetIdx());
             this.emitPendingCheck();
             return;
           }
@@ -29887,6 +29951,61 @@ class Assembler {
         // "expr:jsExit" aggregate, not a fragmented per-target-type name.
         this.refuse(`expr:${e.kind}`, e.loc);
         code.unreachable();
+        return;
+      }
+
+      case "jsView": {
+        // Unit H (SEMANTICS.md S115): the typed composite's live view —
+        // the static value itself as the token, the accessor closures
+        // (FUNC boxes) the frontend built per static type.
+        const sig = this.viewSigId(e.typeKey);
+        this.dyn.boxView(
+          code,
+          e.record,
+          () => this.walkExpr(e.value),
+          sig,
+          () => this.pushStrLit(e.label),
+          e.fns.map((f) => () => this.walkExpr(f)),
+        );
+        return;
+      }
+      case "jsUnview": {
+        // A view of this static type unwraps to its static value (no
+        // copy); anything else throws the named TypeError.
+        const vt = this.mapType(e.type, e.loc);
+        if (vt === null || vt.kind !== "ref") {
+          this.refuse(`expr:${e.kind}`, e.loc);
+          code.unreachable();
+          return;
+        }
+        const dynRef = this.dyn.dynRef();
+        const d = this.acquireScratch(dynRef);
+        this.walkExpr(e.value);
+        code.localSet(d);
+        this.dyn.isView(code, (c) => c.localGet(d));
+        this.openIfResult(I32);
+        this.dyn.viewField(code, (c) => c.localGet(d), VIEW_SIG);
+        code.i32Const(this.viewSigId(e.typeKey));
+        code.i32Eq();
+        code.else_();
+        code.i32Const(0);
+        this.close();
+        this.openIfResult(vt);
+        this.dyn.viewField(code, (c) => c.localGet(d), VIEW_TOKEN);
+        code.refCast(vt.typeIndex);
+        code.else_();
+        this.emitSetCellError(code, "%TypeError", "TypeError", (c) => {
+          this.pushStrLitInto(c, "Cannot store ");
+          c.localGet(d);
+          c.call(this.dyn.typeOf());
+          c.call(this.concatHelper());
+          this.pushStrLitInto(c, ` into ${e.what} (SEMANTICS.md S115)`);
+          c.call(this.concatHelper());
+        }, null);
+        code.refNull(vt.typeIndex);
+        this.close();
+        this.releaseScratch(dynRef, d);
+        this.emitPendingCheck();
         return;
       }
 
@@ -32890,6 +33009,65 @@ class Assembler {
    * — so a placeholder can never coincidentally `===` a real function
    * either (zz6c's own probe). */
   private nativeMethodPlaceholderFns = new Map<string, number>();
+  private errCtorGetFn: number | null = null;
+  /** `e.constructor` on a dynamic value: an ERROR (the %error encoding —
+   * a caught or thrown error, the unit-H view-write and hole errors among
+   * them) answers a function value NAMED like its constructor, so
+   * `e.constructor.name` reads "TypeError" as in Node; calling it is a
+   * named refusal (callFn's SIG -2). Every other value reads as before. */
+  private errCtorGetHelper(): number {
+    if (this.errCtorGetFn !== null) return this.errCtorGetFn;
+    const dynRef = this.dyn.dynRef();
+    const idx = this.mb.declareFunc(this.mb.funcType([dynRef], [dynRef]), "%w.jsval.getProp:constructor:err");
+    this.errCtorGetFn = idx;
+    const w = this.newWalker(1);
+    const c = w.c;
+    const nm = this.wlocal(w, dynRef);
+    c.localGet(0);
+    c.call(this.dyn.isError());
+    c.ifVoid();
+    c.localGet(0);
+    this.pushStrLitInto(c, "name");
+    c.i32Const(0);
+    c.call(this.dyn.keyGet());
+    c.localSet(nm);
+    this.dyn.boxFn(
+      c,
+      (x) => x.localGet(0),
+      (x) => x.refNull(this.dyn.thunkSig()),
+      -2,
+      (x) => {
+        x.localGet(nm);
+        x.call(this.dyn.toStr());
+      },
+      1,
+    );
+    c.return_();
+    c.end();
+    c.localGet(0);
+    this.emitDynGetPropFenced(c, "constructor");
+    this.mb.setBody(idx, w.locals, c.bytes());
+    return idx;
+  }
+
+  /** emitDynGetProp's own route for `name` (no constructor special case). */
+  private emitDynGetPropFenced(code: Code, name: string): void {
+    const needsProtoFence =
+      NUM_PROTO_METHOD_ARITY.has(name) ||
+      OBJECT_PROTO_MEMBERS.has(name) ||
+      ARRAY_PROTO_MEMBERS.has(name) ||
+      STRING_PROTO_MEMBERS.has(name) ||
+      BOOLEAN_PROTO_MEMBERS.has(name) ||
+      FUNCTION_PROTO_MEMBERS.has(name);
+    if (needsProtoFence) {
+      code.call(this.protoFenceGetPropHelper(name));
+    } else {
+      this.pushStrLitInto(code, name);
+      code.i32Const(0);
+      code.call(this.dyn.keyGet());
+    }
+  }
+
   private nativeMethodPlaceholderHelper(name: string, arity: number): number {
     const hit = this.nativeMethodPlaceholderFns.get(name);
     if (hit !== undefined) return hit;
@@ -32983,6 +33161,10 @@ class Assembler {
    * (a nullish receiver, or the fence itself) — the caller owns the
    * pending check. */
   private emitDynGetProp(code: Code, name: string): void {
+    if (name === "constructor") {
+      code.call(this.errCtorGetHelper());
+      return;
+    }
     const needsProtoFence =
       NUM_PROTO_METHOD_ARITY.has(name) ||
       OBJECT_PROTO_MEMBERS.has(name) ||
@@ -33730,6 +33912,139 @@ class Assembler {
    * dyn.toStr() too, which is spec-honest for the "ToPrimitive already
    * ran" object/array/etc. cases dyn.toStr() itself renders — untested
    * by any stage-A target program, flagged rather than silently trusted. */
+  /** jsOp getIdx (`value` null) / setIdx over a NUMBER index (unit H —
+   * `any[]` loops): receiver and index evaluate once, in order (then the
+   * value, for a write); an ARR receiver with an integral index in
+   * [0, length) reads or writes its slot directly (a hole slot reads
+   * undefined), and every other case — other kinds, fractions, negatives,
+   * NaN, out-of-range (a write past the end grows the array there) — runs
+   * the generic keyed route over the number's ToString, exactly what
+   * emitJsvalIndexKeyString would hand it. Same answers, no key string on
+   * the hot path. */
+  private emitIslandNumIndex(recvExpr: WExpr, indexExpr: WExpr, value: WExpr | null): void {
+    const code = this.fn.code;
+    const dynT = this.dyn.dynT();
+    const dynRef = this.dyn.dynRef();
+    const r = this.acquireScratch(dynRef);
+    const f = this.acquireScratch(F64);
+    const v = value !== null ? this.acquireScratch(dynRef) : -1;
+    this.walkExpr(recvExpr);
+    code.localSet(r);
+    this.walkExpr(indexExpr);
+    code.localSet(f);
+    if (value !== null) {
+      this.walkExpr(value);
+      code.localSet(v);
+    }
+    const vec = (c: Code): void => this.dyn.arrPayload(c, (x) => x.localGet(r));
+    const slow = (): void => {
+      code.localGet(r);
+      this.dyn.boxNum(code, (c) => c.localGet(f));
+      code.call(this.dyn.toStr());
+      if (value === null) {
+        code.i32Const(0);
+        code.call(this.dyn.keyGet());
+      } else {
+        code.localGet(v);
+        code.call(this.dyn.islandSetIdx());
+      }
+    };
+    if (this.viewsLive) {
+      // An array VIEW with an integral non-negative index: straight to its
+      // element accessor (which answers undefined past the end, and owns
+      // the hole / type refusals on a write) — no key string, no length
+      // call. Every other index takes the keyed route's view front.
+      code.localGet(r);
+      code.structGet(dynT, DYN_KIND);
+      code.i32Const(DK.ARR);
+      code.i32Eq();
+      this.dyn.isView(code, (c) => c.localGet(r));
+      code.i32And();
+      code.localGet(f);
+      code.f64Const(0);
+      code.f64Ge();
+      code.i32And();
+      code.localGet(f);
+      code.f64Const(2147483647);
+      code.f64Le();
+      code.i32And();
+      code.localGet(f);
+      code.localGet(f);
+      code.f64Trunc();
+      code.f64Eq();
+      code.i32And();
+      if (value === null) this.openIfResult(dynRef);
+      else this.openIf();
+      code.localGet(r);
+      code.localGet(f);
+      code.i32TruncF64S();
+      if (value === null) {
+        code.call(this.dyn.viewGetI());
+      } else {
+        code.localGet(v);
+        code.call(this.dyn.viewSetI());
+      }
+      code.else_();
+    }
+    code.localGet(r);
+    code.structGet(dynT, DYN_KIND);
+    code.i32Const(DK.ARR);
+    code.i32Eq();
+    if (this.viewsLive) {
+      // A view reads and writes through its accessors (the keyed route's
+      // view fronts), never a vector slot.
+      this.dyn.isView(code, (c) => c.localGet(r));
+      code.i32Eqz();
+      code.i32And();
+    }
+    if (value === null) this.openIfResult(dynRef);
+    else this.openIf();
+    code.localGet(f);
+    code.f64Const(0);
+    code.f64Ge();
+    code.localGet(f);
+    this.dyn.arrLen(code, vec);
+    code.f64ConvertI32U();
+    code.f64Lt();
+    code.i32And();
+    code.localGet(f);
+    code.localGet(f);
+    code.f64Trunc();
+    code.f64Eq();
+    code.i32And();
+    if (value === null) {
+      this.openIfResult(dynRef);
+      this.dyn.arrAt(code, vec, (c) => {
+        c.localGet(f);
+        c.i32TruncF64U();
+      });
+      code.localTee(r);
+      code.refIsNull();
+      this.openIfResult(dynRef);
+      code.globalGet(this.dyn.undefinedGlobal());
+      code.else_();
+      code.localGet(r);
+      this.close();
+    } else {
+      this.openIf();
+      this.dyn.arrSet(code, vec, (c) => {
+        c.localGet(f);
+        c.i32TruncF64U();
+      }, (c) => c.localGet(v));
+    }
+    code.else_();
+    slow();
+    this.close();
+    code.else_();
+    slow();
+    this.close();
+    if (this.viewsLive) this.close();
+    if (value !== null) this.releaseScratch(dynRef, v);
+    this.releaseScratch(F64, f);
+    this.releaseScratch(dynRef, r);
+    this.emitPendingCheck();
+  }
+
   private emitJsvalIndexKeyString(indexExpr: WExpr): void {
     const code = this.fn.code;
     const dynT = this.dyn.dynT();
