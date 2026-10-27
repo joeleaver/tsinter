@@ -1,12 +1,11 @@
 /* Regex behavior that is scriptc-only by nature — deliberately NOT in the
  * differential corpus (tests/corpus/1200.. holds everything Node-comparable):
  *
- * - The statefulness fence at runtime: test() on a g/y regex that flowed
- *   through a variable (the frontend only sees literal receivers) must
- *   abort with the fence message, never silently model lastIndex.
- * - split() on a pattern with capture groups: Node splices the captured
- *   values into the result — scriptc throws a catchable TypeError naming
- *   the limitation instead, so the caught branch is asserted here.
+ * - The one statefulness fence left after board #301 (lastIndex is
+ *   modelled on every lane — corpus 2795/2796 pin it against Node):
+ *   assert.throws's shape form over a global/sticky regex VALUE aborts by
+ *   name, because Node runs a shape key's regex a second time when it
+ *   reports a failed comparison.
  * - The two size/stability pins: a regex-free program must not reference
  *   the regex runtime at all (byte-identical link line — its C names no
  *   ScrRegex symbol), and a regex-USING static binary pays the regex
@@ -66,44 +65,31 @@ async function build(
 }
 
 describe("regex (scriptc-only behavior)", () => {
-  test("test() on a g-flagged regex reaching runtime aborts with the fence message", async () => {
-    // The g flag is invisible to the frontend here: the regex flows through
-    // a function parameter, so the RUNTIME fence must catch it.
+  test("assert.throws's shape form aborts by name on a global/sticky regex VALUE (board #301)", async () => {
+    // lastIndex is modelled (SEMANTICS.md S003's regex amendment), but
+    // Node runs a shape key's regex a SECOND time when it reports a failed
+    // comparison — one verdict cannot reproduce that, so a value-path g/y
+    // regex in a shape key aborts by name (the wasm tier traps there too).
+    // A literal at the call is a fresh object and stays Node-exact.
     const r = await build(
-      "g-test-runtime",
-      `function check(re: RegExp, s: string): boolean {
-  return re.test(s);
-}
-console.log("before");
-console.log(check(/a/g, "abc"));
+      "shape-re-sticky-value",
+      `import assert from "node:assert";
+assert.throws(() => { throw new Error("boom"); }, { message: /boom/y });
+console.log("literal ok");
+const re = /boom/y;
+assert.throws(() => { throw new Error("boom"); }, { message: re });
+console.log("unreachable");
 `,
     );
     const err = await execFileAsync(r.binaryPath, []).then(
       () => {
-        throw new Error("expected the g-flagged test() to abort");
+        throw new Error("expected the value-path sticky shape regex to abort");
       },
       (e: Error & { signal?: string; stdout?: string; stderr?: string }) => e,
     );
     expect(err.signal).toBe("SIGABRT");
-    expect(err.stdout).toContain("before");
-    expect(err.stderr).toContain(
-      "test() on a regex with the 'g' or 'y' flag is not supported",
-    );
-  });
-
-  test("split() with capture groups throws a catchable TypeError (Node would splice them in)", async () => {
-    const r = await build(
-      "split-captures",
-      `try {
-  const parts = "a,b".split(/(,)/);
-  console.log("unreachable", parts.length);
-} catch {
-  console.log("caught");
-}
-`,
-    );
-    const { stdout } = await execFileAsync(r.binaryPath, []);
-    expect(stdout).toBe("caught\n");
+    expect(err.stdout).toBe("literal ok\n");
+    expect(err.stderr).toContain("assert.throws with a shape key holding a global or sticky regex value is not supported");
   });
 
   test("a literal outside the tier refuses the build by the wasm tier's key", async () => {

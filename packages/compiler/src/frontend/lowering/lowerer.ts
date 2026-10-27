@@ -93,6 +93,7 @@ import { ClassInfo, ClassIteratorInfo, GenericClassInfo, registerBuiltinErrorCla
 import { MixinFnShape, mixinCallClassInfoOf, mixinIntersectionInstanceType } from "./lower-mixins.js";
 import { ParamShape, FnSig, GenericFnInfo, GenericInstance, bindingNeverReassigned, bodyReadsArguments, isThisParameter, paramShape, paramShapes, checkDefaultParamBodyType, completeArgs, wrappedUndefined, undefinedArgFor, requireExactArityValue, bodyReturnType, declaredReturnType, collectSignature, collectSignatureInner, collectGenericSignature, genericFnOf, lowerGenericCall, lowerGenericFnValue, inferTypeParamBindings, lowerGenericInstance, lowerCall, lowerFfiCall, lowerTimersMemberCall, lowerPromiseMethodCall, lowerFilterNarrowCall, isTopLevelFnSymbol, lowerNestedFunctionDecl, lambdaSignature, lowerLambda, lowerFunction, validateFfiImports } from "./lower-calls.js";
 import { lowerArrayMethodCall, lowerBufferStaticCall, lowerBytesMethodCall, lowerBytesNew, lowerMapMethodCall, lowerMapForEachCall, buildMapForEachFn, lowerRecordOvfCaptureHelper, lowerEnvToPairsHelper, lowerSetMethodCall, lowerSetForEachCall, buildSetForEachFn, lowerRegexMethodCall, lowerStringMethodCall } from "./lower-containers.js";
+import { companionRejectionReason, execCompanionFor, type ExecCompanionEntry, type ExecCompanionUse } from "./lower-regex.js";
 import { lowerStreamModuleCall } from "./lower-stream.js";
 import { lowerEmitOverrideSpec, type EmitSpecCtx, type EmitSpecRequest } from "./lower-emitter.js";
 import { builtinImportOf, createRequireBindingDecl, createRequireNamespaceDecl, createRequireSpecOf, stripTypeCasts, lowerBuiltinModuleCall, lowerFsToUnixTimestampCall, lowerFsLadderCall, lowerChildArgsArg, lowerSpawnSyncCall, lowerSpawnCall, lowerExecSyncCall, recordToEnvPairs, lowerJsonMethodCall, fencedBuiltinImportOf, lowerCryptoComposedCall, lowerUrlMethodCall, lowerSearchParamsMethodCall, lowerStatsMethodCall, lowerChildMethodCall, lowerAtomicsCall, lowerBuiltinExtraProperty, promisifiedExecFileDecl, lowerExecFileAsyncCall, execFileAsyncHelper, lowerStringDecoderMethodCall, strdecHelper, lowerReadlineMethodCall, lowerDcChannelMethodCall, lowerDcChannelProperty, lowerAlsMethodCall, lowerDcTracingChannelMethodCall, lowerDcTracingChannelProperty, lowerJsonProperty, lowerErrorCodeProperty, lowerProcessProperty, isProcessEnv, envValueType, lowerProcessEnvGet, lowerProcessMethodCall, lowerProcessOptionalMethodCall, lowerTimeoutMethodCall, envSnapshotHelper, isConsoleLog, consoleCallMember, lowerNumberStaticCall, lowerNumberStaticProperty, lowerDateCall, lowerTextCodecCall, lowerCryptoModuleCall, lowerFsConstantsProperty, lowerBuiltinConstantsProperty, builtinConstantBindingOf, builtinConstantsDestructureDecl, lowerProcessStreamProperty, lowerStringStaticCall, lowerStringLastIndexOfCall, lowerPromiseStaticCall } from "./lower-builtins.js";
@@ -105,7 +106,7 @@ import { lowerUtilModuleCall } from "./lower-inspect.js";
 import { lowerComptime, comptimeBakeable, rejectComptimeCaptures, comptimeValueToIr } from "./lower-comptime.js";
 import { ModuleTdz, analyzeModuleTdz, insertModuleTdzChecks } from "./module-tdz.js";
 import { lowerStmts, noteBlockedBindings, isBlockedBinding, lowerScopedBlock, predeclareForwardCapture, predeclareForwardFnDecl, predeclareForwardVar, rejectJumpCrossingFinally, lowerStmt, lowerVarStatement, lowerDestructuringDecl, lowerDestructuringAssignParts, lowerBindingPattern, lowerJsvalBindingPattern, checkBindingElement, bindPatternTarget, lowerVarDeclList, lowerVarDecl, lowerSwitch, lowerTry, lowerExprStatement, lowerForOf, lowerForStatement } from "./lower-stmts.js";
-import { FieldTarget, droppableStatic, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf } from "./lower-exprs.js";
+import { isMatchSliceType, FieldTarget, droppableStatic, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf } from "./lower-exprs.js";
 import type { ExpandoMember } from "./lower-expando.js";
 import { lowerRecordFieldCall, lowerObjectMethodCall } from "./lower-calls.js";
 import { fenceCrossBlockNsRef, nsPathPrefix } from "./lower-namespaces.js";
@@ -1010,6 +1011,15 @@ export class Lowerer {
    * (the ctx guard keeps hidden locals out of closures — a cross-function
    * walk falls back to the plain array walk and the fence). */
   readonly matchAllDrainIndexes = new Map<ts.Symbol, { idxsLocalId: string; ctx: FnCtx }>();
+  /** Board #301: exec/match result bindings whose `.index` / `.input` /
+   * `.groups` live in hidden companions (lower-regex.ts): every write to
+   * the binding is a direct exec/match call (or null) in the declaring
+   * function, so the companions always describe the current value. */
+  readonly execCompanions = new Map<ts.Symbol, ExecCompanionEntry>();
+  /** Board #301: lambdas whose ABI return type is fixed by their call
+   * site (a function replacer returns string), consulted by
+   * lambdaSignature before the declared/inferred return. */
+  readonly lambdaRetOverrides = new Map<ts.Node, IrType>();
   /** STORED numeric value iterators: `const it = numbers.values()` (and
    * the equivalent `[Symbol.iterator]()` spelling) over number[] or a
    * represented typed array has no first-class IR value, so its statically
@@ -3313,7 +3323,7 @@ export class Lowerer {
       // rebuild (see jsvalIn's regex rule); computed regex values fall
       // through to requireExactShape's fence.
       if (expr.type.kind === "regex") {
-        const re = islandRegexpOf(expr);
+        const re = islandRegexpOf(expr, this);
         if (re) return re;
       }
       return expr;
@@ -7733,6 +7743,18 @@ export class Lowerer {
   lowerRegexMethodCall(call: ts.CallExpression,
     access: ts.PropertyAccessExpression,): IrExpr | null {
     return lowerRegexMethodCall(this, call, access);
+  }
+
+  execCompanionFor(call: ts.CallExpression): ExecCompanionUse | null {
+    return execCompanionFor(this, call);
+  }
+
+  companionRejectionReason(recv: ts.Expression, member: string): string {
+    return companionRejectionReason(this, recv, member);
+  }
+
+  isMatchSliceType(t: IrType): boolean {
+    return isMatchSliceType(this, t);
   }
 
   lowerStringMethodCall(call: ts.CallExpression,

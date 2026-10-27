@@ -10,6 +10,7 @@ import { requiresDynamicApiDiag, requiresDynamicPackageDiag } from "../../diagno
 import { isCjsJsFile, isJsSourceFile, locOf, npmPackageNameOf } from "../program.js";
 import { pureReemittable } from "./lower-exprs.js";
 import { PoisonError, newFnCtx, own } from "./lowerer.js";
+import { regexCrossingChecked } from "./lower-regex.js";
 
 /** True iff the checker's type for this node maps to jsval ('any') —
    * the island test in front of every engine-op lowering (receivers,
@@ -161,7 +162,7 @@ import { PoisonError, newFnCtx, own } from "./lowerer.js";
       // and pure-read spellings lower (the rebuild reads the operand
       // twice); computed regex values keep the boundary fence.
       if (e.type.kind === "regex") {
-        const re = islandRegexpOf(e);
+        const re = islandRegexpOf(e, L);
         if (re) return re;
       }
       // jsval-BEARING composites (an `any[]` value, a record holding one)
@@ -179,7 +180,7 @@ import { PoisonError, newFnCtx, own } from "./lowerer.js";
    * pure reads (a regex-typed binding) read the source/flags intrinsics —
    * the rebuild emits the operand twice, so effectful producers return
    * null into the caller's boundary fence. */
-  export function islandRegexpOf(e: IrExpr): IrExpr | null {
+  export function islandRegexpOf(e: IrExpr, L: Lowerer): IrExpr | null {
     if (e.type.kind !== "regex") return null;
     const loc = e.loc;
     let src: IrExpr;
@@ -188,7 +189,9 @@ import { PoisonError, newFnCtx, own } from "./lowerer.js";
       src = { kind: "strLit", value: e.pattern, type: STRING, loc };
       flags = { kind: "strLit", value: e.flags, type: STRING, loc };
     } else if (pureReemittable(e)) {
-      src = { kind: "regexIntrinsic", method: "source", receiver: e, args: [], type: STRING, loc };
+      // Board #301: lastIndex cannot be shared across the rebuild — a
+      // global/sticky value (or a nonzero lastIndex) throws by name.
+      src = { kind: "regexIntrinsic", method: "source", receiver: regexCrossingChecked(L, e), args: [], type: STRING, loc };
       flags = { kind: "regexIntrinsic", method: "flags", receiver: e, args: [], type: STRING, loc };
     } else {
       return null;

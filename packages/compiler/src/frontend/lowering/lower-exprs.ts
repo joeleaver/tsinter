@@ -23,6 +23,7 @@ import { lowerSocketInstanceOf, lowerTlsRootCertificates } from "./lower-server.
 import { findGenericMethodOn, lowerStaticFieldRead } from "./lower-classes.js";
 import { bindingNeverReassigned, implicitMonoFile, lowerTaggedTemplate, nullishGenericBindingUnitOf, objLitGenericFnInfoOf, objLitGenericFnNodeOf, requireObjLitGenericReceiver } from "./lower-calls.js";
 import { mixinFnOfCallee } from "./lower-mixins.js";
+import { lowerExecCompanionRead, lowerRegexMemberRead } from "./lower-regex.js";
 import { isConstAssertionTypeNode, isGenericCallableMemberType, underConstAssertion, unitOnlyUnion } from "../types.js";
 import { lowerYield } from "./lower-generators.js";
 import { lowerStreamProperty, lowerStreamStateProperty, streamSidesOf } from "./lower-stream.js";
@@ -1404,6 +1405,12 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       // the compile-time record projection over the honest slice (or
       // Node's undefined when the pattern has no named groups) — see
       // lowerMatchGroupsRead.
+      // Board #301: `.index` / `.input` / `.groups` of an exec/match result
+      // binding with hidden companions (lower-regex.ts).
+      {
+        const c = lowerExecCompanionRead(L, expr);
+        if (c !== null) return c;
+      }
       {
         const g = lowerMatchGroupsRead(L, expr);
         if (g !== null) return g;
@@ -2565,8 +2572,14 @@ export function pureReemittable(e: IrExpr): boolean {
     const def = L.unions.get(left.type.unionId);
     if (!def) L.badType(expr.left, L.typeOf(expr.left));
     if (!def.arms.some(isUnitType)) return left;
-    const type = L.irTypeOf(expr);
     const rest = def.arms.filter((a) => !isUnitType(a));
+    // An implicit-any binding (a function replacer's `string | undefined`
+    // capture, an implicit-any instance's param): the checker still types
+    // the whole expression `any` — the narrowed left arm is its type.
+    const type =
+      L.implicitParamTypes !== null && (L.typeOf(expr).flags & ts.TypeFlags.Any) !== 0 && rest.length === 1
+        ? rest[0]!
+        : L.irTypeOf(expr);
     if (typeEquals(type, left.type) || (rest.length === 1 && typeEquals(type, rest[0]!))) {
       const right = L.lowerExprExpecting(expr.right, type);
       return { kind: "nullish", left, right, type, loc };
@@ -3381,7 +3394,8 @@ export function lowerOptionalChain(L: Lowerer, expr: ts.CallExpression | ts.Prop
       if (name === "test") {
         L.unsupported("SC1090", expr, "regex methods as values (call 'test' directly)");
       }
-      return null;
+      // Board #301: lastIndex and the flag accessors.
+      return lowerRegexMemberRead(L, expr);
     }
     if (kind === "f64") {
       // The only ambient members on numbers are island-backed methods; a

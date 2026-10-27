@@ -239,6 +239,16 @@ export class CheckerFacade {
     return this.anyType();
   }
 
+  /** The intrinsic `string` / `number` (board #301: a function replacer's
+   * implicit-any parameters bind to the types its arguments have). */
+  getStringType(): Type {
+    return this.intrinsic("string", () => this.raw.getStringType());
+  }
+
+  getNumberType(): Type {
+    return this.intrinsic("number", () => this.raw.getNumberType());
+  }
+
   /** Batch-prefetches getTypeAtLocation and getSymbolAtLocation for every
    * node of the file, plus getTypeOfSymbol for every symbol those answers
    * surfaced — the per-file hook that turns the lowering's walk into three

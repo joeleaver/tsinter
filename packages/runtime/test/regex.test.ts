@@ -53,16 +53,3 @@ test("regex runtime: matching, substitutions, split, throws, RC accounting", asy
   const { stderr } = await execFileAsync(bin, []);
   expect(stderr.trim()).toMatch(/^(\d+)\/\1 cases passed$/);
 });
-
-test("test() on a g-flagged regex aborts with the statefulness fence", async () => {
-  const err = await execFileAsync(bin, ["--crash-global-test"]).then(
-    () => {
-      throw new Error("expected scr_regex_test to abort");
-    },
-    (e: Error & { signal?: string; stderr?: string }) => e,
-  );
-  expect(err.signal).toBe("SIGABRT");
-  expect(err.stderr).toContain(
-    "scriptc: test() on a regex with the 'g' or 'y' flag is not supported",
-  );
-});

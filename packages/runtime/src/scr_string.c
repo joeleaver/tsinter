@@ -44,10 +44,15 @@ typedef struct {
 static ScrSidx scr_sidx_tab[SCR_SIDX_N];
 static unsigned scr_sidx_clock;
 
+/* Another address-keyed cache's purge (the regex runtime's subject cache,
+ * scr_regex.c — set only by a program that runs a regex). */
+void (*scr_str_purge_hook)(const ScrStr *) = NULL;
+
 static void scr_sidx_purge(const ScrStr *s) {
   for (int i = 0; i < SCR_SIDX_N; i++) {
     if (scr_sidx_tab[i].s == s) scr_sidx_tab[i].s = NULL;
   }
+  if (scr_str_purge_hook) scr_str_purge_hook(s);
 }
 
 static ScrSidx *scr_sidx(const ScrStr *s) {

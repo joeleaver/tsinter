@@ -95,6 +95,10 @@ export class CEmitter {
    * the bytecode slot starts NULL and the runtime compiles it lazily on
    * first use. The source/flags strings ride the ordinary literal table. */
   readonly regexInstances = new Map<string, string>();
+  /** Board #301: set while emitting a regexIntrinsic operand that is a
+   * regex literal — the literal then lowers to its immortal static (which
+   * stands for the fresh object), not a heap copy. */
+  regexLitDirect = false;
   /** Interned tagged-template strings objects: per-site key → symbol +
    * cooked spans. One immortal (rc == SIZE_MAX) ScrArr of interned string
    * literals per template-literal SITE — the spec's per-occurrence

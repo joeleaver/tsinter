@@ -1,8 +1,24 @@
-regex-checker.ts:5:31 - error SC1120: function replacement values (replacements must be string templates) are not supported yet
+regex-checker.ts:6:24 - error SC1120: a function replacer with capture or offset parameters over a regex whose captures are not known at compile time (use a regex literal, or a const bound to one) is not supported yet
 
-  4 | const m = /a(b)/.exec("ab");
-  5 | const fn = "abc".replace(/b/, (s: string) => s);
-    |                               ^~~~~~~~~~~~~~~~
-  6 | 
+  5 | function swap(re: RegExp, s: string): string {
+  6 |   return s.replace(re, (m: string, a: string) => a);
+    |                        ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+  7 | }
 
-  hint: supported: literal regexes with the g/i/m/s/u/y flags — .test(), .exec()/.match()/.matchAll(), named capture groups (.groups, $<name> templates, \k<name>), .source/.flags, and string replace/replaceAll/split with string replacement templates
+  hint: supported: regexes with the g/i/m/s/u/y flags — .test()/.exec() (stateful through lastIndex with g/y), .match()/.matchAll()/.search(), replace/replaceAll with replacement templates or function replacers, split (with a limit), named capture groups (.groups, $<name> templates, \k<name>), and .source/.flags/.lastIndex
+
+regex-checker.ts:8:33 - error SC1090: functions with rest parameters as values (call them directly) are not supported yet
+
+  7 | }
+  8 | const rest = "abc".replace(/b/, (...xs: string[]) => xs[0]!);
+    |                                 ^~~~~~~~~~~~~~~~~~~~~~~~~~~
+  9 | console.log(swap(/(a)/, "a"), rest);
+
+regex-checker.ts:11:31 - error SC1120: a function replacer that reads `arguments` (Node passes match, captures, offset, string and groups — declare them as parameters) is not supported yet
+
+  10 | function counts(m: string): string { return m + arguments.length; }
+  11 | console.log("ab".replace(/a/, counts));
+     |                               ^~~~~~
+  12 | 
+
+  hint: supported: regexes with the g/i/m/s/u/y flags — .test()/.exec() (stateful through lastIndex with g/y), .match()/.matchAll()/.search(), replace/replaceAll with replacement templates or function replacers, split (with a limit), named capture groups (.groups, $<name> templates, \k<name>), and .source/.flags/.lastIndex

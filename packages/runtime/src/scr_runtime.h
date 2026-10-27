@@ -305,6 +305,9 @@ typedef struct ScrStr {
 } ScrStr;
 
 ScrStr *scr_str_new(const char *bytes, size_t len); /* returns +1 */
+/* Called with a string about to be freed or relocated (scr_string.c), for
+ * address-keyed caches outside scr_string.c; NULL when none is live. */
+extern void (*scr_str_purge_hook)(const ScrStr *);
 
 /* Internal allocators for buffer builders (scr_json.c): a +1 string with
  * UNINITIALIZED data (the builder fills bytes, then len and the NUL), and
@@ -959,20 +962,25 @@ ScrStr *scr_str_raw(ScrArr *raw, ScrArr *subs);
  * UTF-8 storage), so all observable index behavior is UTF-16-exact like
  * Node.
  *
- * Statefulness fence: /g and /y regexes carry mutable lastIndex in JS.
- * Supported only where iteration is internal (replace/replaceAll/split);
- * test() on a g/y-flagged regex aborts with a clear message.
+ * lastIndex (board #301): every regex carries it, and every method follows
+ * the spec's rules for it (RegExpBuiltinExec reads ToLength(lastIndex) on a
+ * global or sticky regex and stores the match end or 0). A literal's
+ * EVALUATION is a fresh heap copy of its static (scr_regex_fresh); the
+ * static itself only reaches a method directly at its literal's own site,
+ * where it stands for a fresh object (lastIndex 0 on entry).
  *
  * Ownership: subjects/replacements are BORROWED; string/array results
- * return +1. replace_all without /g and split on a pattern with capture
- * groups THROW catchable TypeErrors (callers are compiler-emitted pending
- * checks); every other failure mode aborts.
+ * return +1. replace_all/collect_all/match_all without /g THROW catchable
+ * TypeErrors (callers are compiler-emitted pending checks); every other
+ * failure mode aborts.
  */
 typedef struct ScrRegex {
   size_t rc;      /* SIZE_MAX = immortal (every regex literal) */
   ScrStr *source; /* .source: a literal's text between the slashes, or V8's escaped source */
   ScrStr *flags;  /* .flags, canonical order (dgimsuvy) */
   void *bc;       /* the engine's compiled bytecode (a foreign engine object); a literal's is NULL until first use */
+  struct ScrRegex *proto; /* a literal's fresh copy: the static whose bytecode it runs (NULL otherwise) */
+  double last_index;      /* the lastIndex property's number */
 } ScrRegex;
 
 static inline ScrRegex *scr_regex_retain(ScrRegex *re) {
@@ -991,11 +999,34 @@ void scr_regex_release_v(void *re);
  * S102). Borrows both; +1, NULL after a throw. */
 ScrRegex *scr_regex_new(ScrStr *pattern, ScrStr *flags);
 
-bool scr_regex_test(ScrRegex *re, ScrStr *s); /* aborts on /g or /y */
-/* s.match(re): +1 string[] of [whole, ...captures] (nonparticipating
- * captures hold "" — SEMANTICS.md), or NULL for no match. Aborts on /g
- * or /y like test(). Borrows both. */
+/* A literal's evaluation: a fresh +1 regex over the literal's static. */
+ScrRegex *scr_regex_fresh(ScrRegex *lit);
+double scr_regex_last_index(ScrRegex *re);
+void scr_regex_set_last_index(ScrRegex *re, double v);
+
+bool scr_regex_test(ScrRegex *re, ScrStr *s);
+/* s.match(re): without /g, +1 string[] of [whole, ...captures]
+ * (nonparticipating captures hold "" — SEMANTICS.md S064); with /g, every
+ * whole match; NULL for no match. Borrows both. */
 ScrArr *scr_regex_match(ScrStr *s, ScrRegex *re);
+/* match that also clears `pos` and fills it with the capture positions
+ * (2 per capture, -1 unset; left empty for the /g form). */
+ScrArr *scr_regex_match_into(ScrStr *s, ScrRegex *re, ScrArr *pos);
+/* re.exec(s): the row or NULL (never the every-match form). */
+ScrArr *scr_regex_exec(ScrRegex *re, ScrStr *s);
+ScrArr *scr_regex_exec_into(ScrRegex *re, ScrStr *s, ScrArr *pos);
+/* A function replacer's collection phase: every result row (+1
+ * string[][]), positions appended to the cleared `pos`. collect_all throws
+ * replaceAll's TypeError on a non-global regex. */
+ScrArr *scr_regex_collect(ScrStr *s, ScrRegex *re, ScrArr *pos);
+ScrArr *scr_regex_collect_all(ScrStr *s, ScrRegex *re, ScrArr *pos);
+/* split(re, limit): `lim` is the raw limit (ToUint32 applied inside). */
+ScrArr *scr_regex_split_limit(ScrStr *s, ScrRegex *re, double lim);
+/* replace / replaceAll with a STRING pattern and a template. +1. */
+ScrStr *scr_regex_str_replace(ScrStr *s, ScrStr *pat, ScrStr *rep, bool all);
+/* A string pattern's function-replacer collection (rows [match, gap] +
+ * a final [tail]; [start, end] per occurrence into the cleared pos). +1. */
+ScrArr *scr_regex_str_collect(ScrStr *s, ScrStr *pat, ScrArr *pos, bool all);
 /* s.search(re): the first match's UTF-16 index, or -1 — a fresh exec from
  * position 0 (Symbol.search never touches lastIndex, so no flag fence:
  * /g is irrelevant, /y anchors at 0). Borrows both; never throws. */
@@ -1006,7 +1037,7 @@ ScrStr *scr_regex_flags(ScrRegex *re);        /* +1 */
 ScrStr *scr_regex_replace(ScrStr *s, ScrRegex *re, ScrStr *rep);
 /* replaceAll: throws Node's TypeError when /g is missing (may-throw). */
 ScrStr *scr_regex_replace_all(ScrStr *s, ScrRegex *re, ScrStr *rep);
-/* split: capture-free patterns only — capture groups throw (may-throw). */
+/* split: captures splice into the result (S066). */
 ScrArr *scr_regex_split(ScrStr *s, ScrRegex *re);
 /* matchAll drained eagerly: +1 string[][] of honest match slices; throws
  * Node's TypeError on a non-global regex (catchable). */
@@ -6156,7 +6187,7 @@ void scr_assert_throws_regex(ScrRegex *re, ScrError *err, ScrStr *msg, bool has_
 /* assert.throws(fn, {message: /re/, ...}): the regex-valued shape slot —
  * tests the stashed actual key eagerly, stores verdict + rendered
  * /source/flags into the accumulator (scr_regex.c). */
-void scr_assert_shape_re(int key, ScrRegex *re);
+void scr_assert_shape_re(int key, ScrRegex *re, bool is_literal);
 /* assert.doesNotReject's regex predicate over String(error) — never
  * throws (scr_regex.c). */
 bool scr_assert_regex_err_test(ScrRegex *re, ScrError *err);

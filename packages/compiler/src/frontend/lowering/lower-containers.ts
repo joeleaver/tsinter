@@ -8,6 +8,7 @@ import { BOOL, BYTES_U8, CAUGHT, DYN, F64, IrBytesElem, IrBytesIntrinsicMethod, 
 import { ARRAY_METHODS, MAP_METHODS, SET_COMBINE_METHODS, SET_METHODS, STR_METHODS } from "./surfaces.js";
 import { droppableStatic, isRequireMainFilename, lowerDynObjectLiteral, probeLower, pureReemittable } from "./lower-exprs.js";
 import { forOfVarTarget, lowerDestructuringAssign } from "./lower-stmts.js";
+import { lowerReplaceCall } from "./lower-regex.js";
 import { isJsSourceFile, locOf } from "../program.js";
 import { DYN_DISPATCH_METHODS, islandPrimitiveExit } from "./lower-calls.js";
 import { typeKey } from "../types.js";
@@ -4845,45 +4846,27 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
     const lowerReceiver = (): IrExpr => (dynReceiver ? dynReceiver() : L.lowerExpr(access.expression));
     const loc = locOf(call);
     if (receiverKind === "regex" && name === "test") {
-      // The statefulness fence, at compile time where the flags are
-      // visible: a literal receiver (possibly parenthesized). Values that
-      // flow through variables hit the same fence at runtime.
-      let recv: ts.Expression = access.expression;
-      while (ts.isParenthesizedExpression(recv)) recv = recv.expression;
-      if (ts.isRegularExpressionLiteral(recv)) {
-        const flags = recv.text.slice(recv.text.lastIndexOf("/") + 1);
-        if (flags.includes("g") || flags.includes("y")) {
-          L.unsupported("SC1121", call);
-        }
-      }
+      // RegExp.prototype.test — stateful on a global or sticky regex
+      // (board #301: lastIndex is modelled on every lane).
       const receiver = L.lowerExpr(access.expression);
       const args = call.arguments.map((a) => L.lowerExpr(a));
       return { kind: "regexIntrinsic", method: "test", receiver, args, type: BOOL, loc };
     }
-    // `re.exec(s)` for non-g/y regexes: spec-identical to `s.match(re)`
-    // (Symbol.match delegates to exec when lastIndex is out of play), so
-    // it lowers to the SAME match intrinsic with the operands swapped —
-    // the honest `string[] | null` slice, nonparticipating captures ""
-    // (match's documented rule). The g/y statefulness fence applies at
-    // compile time on literal receivers, exactly test()'s stance; values
-    // reaching the runtime with those flags abort there.
+    // `re.exec(s)`: RegExpBuiltinExec's honest `string[] | null` row
+    // ([whole, ...captures], nonparticipating captures "" — S064), reading
+    // and writing lastIndex on a global or sticky regex (board #301). A
+    // result bound to a local keeps its `.index`/`.input` in hidden
+    // companions (lower-regex.ts execCompanionFor).
     if (receiverKind === "regex" && name === "exec") {
       if (call.arguments.length !== 1) return null; // exec takes exactly the subject
-      let recv: ts.Expression = access.expression;
-      while (ts.isParenthesizedExpression(recv)) recv = recv.expression;
-      if (ts.isRegularExpressionLiteral(recv)) {
-        const flags = recv.text.slice(recv.text.lastIndexOf("/") + 1);
-        if (flags.includes("g") || flags.includes("y")) {
-          // A1: name the construct the user actually wrote — SC1121's
-          // default feature text says "'.test()'", wrong here without an
-          // override (the hint stays accurate for exec too, unchanged).
-          L.unsupported("SC1121", call, "'.exec()' on a regex with the 'g' or 'y' flag");
-        }
-      }
+      const companion = L.execCompanionFor(call);
       const re = L.lowerExpr(access.expression);
       const subject = L.lowerExprExpecting(call.arguments[0]!, STRING);
       const resultT: IrType = { kind: "union", unionId: L.unions.intern([arrayOf(STRING), { kind: "nullT" }]) };
-      return { kind: "regexIntrinsic", method: "match", receiver: subject, args: [re], type: resultT, loc };
+      if (companion) {
+        return { kind: "regexIntrinsic", method: "execInto", receiver: re, args: [companion.subject(subject), companion.pos()], type: resultT, loc };
+      }
+      return { kind: "regexIntrinsic", method: "exec", receiver: re, args: [subject], type: resultT, loc };
     }
     // `s.match(re)` for non-g/y regexes: Node's exec-shaped result reduced
     // to the honest slice — the `string[] | null` union holding
@@ -4913,18 +4896,10 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
       const arg0 = call.arguments[0];
       if (!arg0 || L.mapTypeOf(L.typeOf(arg0))?.kind !== "regex") return null; // string-pattern match: the SC2020 fence
       if (call.arguments.length !== 1) return null;
-      let reNode: ts.Expression = arg0;
-      while (ts.isParenthesizedExpression(reNode)) reNode = reNode.expression;
-      if (ts.isRegularExpressionLiteral(reNode)) {
-        const flags = reNode.text.slice(reNode.text.lastIndexOf("/") + 1);
-        if (flags.includes("g") || flags.includes("y")) {
-          L.unsupported(
-            "SC1120",
-            call,
-            "'.match()' with the 'g' or 'y' flag (an every-match array is a different shape — use replaceAll/split, or test() per position)",
-          );
-        }
-      }
+      // Board #301: a g/y regex is stateful now on every lane — the g
+      // form answers every whole match (the same `string[] | null`
+      // shape), /y reads and writes lastIndex.
+      const companion = L.execCompanionFor(call);
       const receiver = nullableStringRecv ? L.lowerExprExpecting(access.expression, STRING) : lowerReceiver();
       const re = L.lowerExpr(arg0);
       // RegExpMatchArray | null maps to the string[] | null union by
@@ -4935,6 +4910,9 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
       const exactT: IrType = { kind: "union", unionId: L.unions.intern([arrayOf(STRING), { kind: "nullT" }]) };
       const mapped = L.mapTypeOf(L.typeOf(call));
       const resultT: IrType = mapped && typeEquals(mapped, exactT) ? mapped : exactT;
+      if (companion) {
+        return { kind: "regexIntrinsic", method: "matchInto", receiver: companion.subject(receiver), args: [re, companion.pos()], type: resultT, loc };
+      }
       return { kind: "regexIntrinsic", method: "match", receiver, args: [re], type: resultT, loc };
     }
     // `s.matchAll(re)` — the every-match iterator drained EAGERLY into a
@@ -4977,13 +4955,30 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
       receiverKind === "string" &&
       (name === "replace" || name === "replaceAll" || name === "split")
     ) {
+      // Board #301: function replacers (either pattern kind) and the
+      // string-pattern template forms — lower-regex.ts.
+      if (name !== "split" && dynReceiver === undefined) {
+        const r = lowerReplaceCall(L, call, access, lowerReceiver);
+        if (r !== null) return r;
+      }
       const arg0 = call.arguments[0];
       if (!arg0 || L.mapTypeOf(L.typeOf(arg0))?.kind !== "regex") return null;
-      // The lib declares forms beyond the lowered slice: split's limit
-      // parameter and function replacement values both typecheck now —
-      // fenced with the regex-surface code (its hint lists what works).
+      if (name === "split" && call.arguments.length === 2) {
+        // split(re, limit): the RAW limit — the runtime applies ToUint32,
+        // and V8's split path depends on the raw value (a non-negative Smi
+        // stays on its fast path); an undefined limit is the no-limit form.
+        const receiver = lowerReceiver();
+        const re = L.lowerExpr(arg0);
+        const limNode = call.arguments[1]!;
+        const lim = L.lowerExpr(limNode);
+        if (lim.kind === "unitLit" && lim.unit === "undefined") {
+          return { kind: "regexIntrinsic", method: "split", receiver, args: [re], type: arrayOf(STRING), loc };
+        }
+        if (lim.type.kind !== "f64") L.unsupported("SC1120", limNode, "'.split()' with a non-number limit");
+        return { kind: "regexIntrinsic", method: "splitLimit", receiver, args: [re, lim], type: arrayOf(STRING), loc };
+      }
       if (name === "split" && call.arguments.length !== 1) {
-        L.unsupported("SC1120", call, "'.split()' with a limit argument");
+        L.unsupported("SC1120", call, "'.split()' with this many arguments");
       }
       const receiver = lowerReceiver();
       const args = call.arguments.map((a) => L.lowerExpr(a));
@@ -4991,7 +4986,7 @@ const ITER_TERMINALS = new Set(["toArray", "forEach", "reduce", "some", "every",
         L.unsupported(
           "SC1120",
           call.arguments[1] ?? call,
-          "function replacement values (replacements must be string templates)",
+          "a replacement value of this type (pass a string template or a function)",
         );
       }
       return {

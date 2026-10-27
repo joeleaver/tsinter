@@ -923,6 +923,9 @@ class LlEmitter {
    * compiles it lazily on first use. The source/flags strings intern at
    * REGISTRATION (bodies emit before the literal table flushes). */
   private readonly regexInstances = new Map<string, { sym: string; src: string; fl: string }>();
+  /** Board #301: a regex-literal operand of a regexIntrinsic lowers to its
+   * immortal static (standing for the fresh object), not a heap copy. */
+  private regexLitDirect = false;
   /** Interned tagged-template strings objects: per-site key → { symbol,
    * interned cooked-literal refs }. One immortal ScrArr of string slots
    * per template SITE (the spec's per-occurrence identity — the C
@@ -1371,7 +1374,7 @@ class LlEmitter {
       // running the full suite after this landed (board #89's own
       // regression, see fix-89/FINDINGS.txt §2 bug 3). Five sites total.
       `%ScrClosure = type { i64, ptr, i64, ptr, ptr }`,
-      `%ScrRegex = type { i64, ptr, ptr, ptr }`,
+      `%ScrRegex = type { i64, ptr, ptr, ptr, ptr, double }`,
       // ScrArr mirror { rc, len, cap, elem(i32+pad), elem_retain,
       // elem_release, elem_trace, data } — the immortal tagged-template
       // strings objects lay out through it (nothing GEPs into live heap
@@ -1437,7 +1440,7 @@ class LlEmitter {
       // the interned source/flags strings. The bc slot starts null (lazy
       // compile, cached by the runtime) — a mutable global, not constant.
       out.push(
-        `@${re.sym} = internal global %ScrRegex { i64 -1, ptr ${re.src}, ptr ${re.fl}, ptr null } ; ${key.replace(/\n/g, "\\n")}`,
+        `@${re.sym} = internal global %ScrRegex { i64 -1, ptr ${re.src}, ptr ${re.fl}, ptr null, ptr null, double 0.0 } ; ${key.replace(/\n/g, "\\n")}`,
       );
     }
     if (this.regexInstances.size > 0) out.push(``);
@@ -4446,7 +4449,14 @@ class LlEmitter {
           };
           this.regexInstances.set(key, re);
         }
-        return this.own({ name: this.retainValue(`@${re.sym}`, e.type), type: e.type });
+        // A fresh object per EVALUATION (board #301: lastIndex is state) —
+        // except straight into a regex method, where the immortal stands
+        // for the fresh object itself (the C emitter's regexLitDirect).
+        if (this.regexLitDirect) return this.own({ name: this.retainValue(`@${re.sym}`, e.type), type: e.type });
+        this.declare(`declare ptr @scr_regex_fresh(ptr)`);
+        const fresh = this.B.tmp();
+        this.B.line(`${fresh} = call ptr @scr_regex_fresh(ptr @${re.sym})`);
+        return this.own({ name: fresh, type: e.type });
       }
       case "templateStrings": {
         // One immortal static string array per template SITE (the key);
@@ -9839,8 +9849,18 @@ class LlEmitter {
   private emitRegexIntrinsic(e: IrExpr & { kind: "regexIntrinsic" }): LlValue {
     const B = this.B;
     const method = e.method;
-    const r = this.emitExpr(e.receiver);
-    const args = e.args.map((a) => this.emitExpr(a));
+    // A regex LITERAL operand is its immortal static (board #301).
+    const operand = (a: IrExpr): LlValue => {
+      if (a.kind !== "regexLit") return this.emitExpr(a);
+      this.regexLitDirect = true;
+      try {
+        return this.emitExpr(a);
+      } finally {
+        this.regexLitDirect = false;
+      }
+    };
+    const r = operand(e.receiver);
+    const args = e.args.map((a) => operand(a));
     const fallible = (sym: string, argText: string): LlValue => {
       this.declare(`declare ptr @${sym}(${argText.split(", ").map(() => "ptr").join(", ")})`);
       const t = B.tmp();
@@ -9848,6 +9868,25 @@ class LlEmitter {
       const out = this.own({ name: t, type: e.type });
       this.emitPendingCheck();
       return out;
+    };
+    const ptrCall = (sym: string, ptrArgs: string[]): LlValue => {
+      this.declare(`declare ptr @${sym}(${ptrArgs.map(() => "ptr").join(", ")})`);
+      const t = B.tmp();
+      B.line(`${t} = call ptr @${sym}(${ptrArgs.map((a) => `ptr ${a}`).join(", ")})`);
+      return this.own({ name: t, type: e.type });
+    };
+    const row = (sym: string, ptrArgs: string[]): LlValue => {
+      // +1 string[] or NULL from the runtime; the `string[] | null`
+      // union wraps type-directedly, the envGet convention.
+      if (e.type.kind !== "union") throw new Error("llvm emitter bug: match result not a union");
+      const def = this.unionsById.get(e.type.unionId);
+      const arrTag = def ? def.arms.findIndex((a) => a.kind === "array") : -1;
+      const nullTag = def ? def.arms.findIndex((a) => a.kind === "nullT") : -1;
+      if (arrTag < 0 || nullTag < 0 || !def) throw new Error("llvm emitter bug: match union lacks its arms");
+      this.declare(`declare ptr @${sym}(${ptrArgs.map(() => "ptr").join(", ")})`);
+      const raw = B.tmp();
+      B.line(`${raw} = call ptr @${sym}(${ptrArgs.map((a) => `ptr ${a}`).join(", ")})`);
+      return this.wrapNullable(raw, raw, def.arms[arrTag]!, arrTag, e.type, nullTag);
     };
     switch (method) {
       case "matchAll":
@@ -9860,51 +9899,68 @@ class LlEmitter {
         return fallible("scr_regex_match_all_into", `ptr ${r.name}, ptr ${args[0]!.name}, ptr ${args[1]!.name}`);
       case "replaceAll":
         return fallible("scr_regex_replace_all", `ptr ${r.name}, ptr ${args[0]!.name}, ptr ${args[1]!.name}`);
+      case "collectAll":
+        return fallible("scr_regex_collect_all", `ptr ${r.name}, ptr ${args[0]!.name}, ptr ${args[1]!.name}`);
+      case "collect":
+        return ptrCall("scr_regex_collect", [r.name, args[0]!.name, args[1]!.name]);
       case "split":
-        return fallible("scr_regex_split", `ptr ${r.name}, ptr ${args[0]!.name}`);
+        return ptrCall("scr_regex_split", [r.name, args[0]!.name]);
+      case "strReplace":
+      case "strReplaceAll": {
+        this.declare(`declare ptr @scr_regex_str_replace(ptr, ptr, ptr, i1 zeroext)`);
+        const t = B.tmp();
+        B.line(`${t} = call ptr @scr_regex_str_replace(ptr ${r.name}, ptr ${args[0]!.name}, ptr ${args[1]!.name}, i1 zeroext ${method === "strReplaceAll" ? "true" : "false"})`);
+        return this.own({ name: t, type: e.type });
+      }
+      case "strCollect":
+      case "strCollectAll": {
+        this.declare(`declare ptr @scr_regex_str_collect(ptr, ptr, ptr, i1 zeroext)`);
+        const t = B.tmp();
+        B.line(`${t} = call ptr @scr_regex_str_collect(ptr ${r.name}, ptr ${args[0]!.name}, ptr ${args[1]!.name}, i1 zeroext ${method === "strCollectAll" ? "true" : "false"})`);
+        return this.own({ name: t, type: e.type });
+      }
+      case "splitLimit": {
+        this.declare(`declare ptr @scr_regex_split_limit(ptr, ptr, double)`);
+        const t = B.tmp();
+        B.line(`${t} = call ptr @scr_regex_split_limit(ptr ${r.name}, ptr ${args[0]!.name}, double ${args[1]!.name})`);
+        return this.own({ name: t, type: e.type });
+      }
       case "test": {
         this.declare(`declare zeroext i1 @scr_regex_test(ptr, ptr)`);
         const t = B.tmp();
         B.line(`${t} = call zeroext i1 @scr_regex_test(ptr ${r.name}, ptr ${args[0]!.name})`);
         return { name: t, type: e.type };
       }
-      case "match": {
-        // +1 string[] or NULL from the runtime; the `string[] | null`
-        // union wraps type-directedly, the envGet convention.
-        if (e.type.kind !== "union") throw new Error("llvm emitter bug: match result not a union");
-        const def = this.unionsById.get(e.type.unionId);
-        const arrTag = def ? def.arms.findIndex((a) => a.kind === "array") : -1;
-        const nullTag = def ? def.arms.findIndex((a) => a.kind === "nullT") : -1;
-        if (arrTag < 0 || nullTag < 0 || !def) throw new Error("llvm emitter bug: match union lacks its arms");
-        this.declare(`declare ptr @scr_regex_match(ptr, ptr)`);
-        const raw = B.tmp();
-        B.line(`${raw} = call ptr @scr_regex_match(ptr ${r.name}, ptr ${args[0]!.name})`);
-        return this.wrapNullable(raw, raw, def.arms[arrTag]!, arrTag, e.type, nullTag);
+      case "match":
+        return row("scr_regex_match", [r.name, args[0]!.name]);
+      case "matchInto":
+        return row("scr_regex_match_into", [r.name, args[0]!.name, args[1]!.name]);
+      case "exec":
+        return row("scr_regex_exec", [r.name, args[0]!.name]);
+      case "execInto":
+        return row("scr_regex_exec_into", [r.name, args[0]!.name, args[1]!.name]);
+      case "lastIndex": {
+        this.declare(`declare double @scr_regex_last_index(ptr)`);
+        const t = B.tmp();
+        B.line(`${t} = call double @scr_regex_last_index(ptr ${r.name})`);
+        return { name: t, type: e.type };
       }
+      case "setLastIndex":
+        this.declare(`declare void @scr_regex_set_last_index(ptr, double)`);
+        B.line(`call void @scr_regex_set_last_index(ptr ${r.name}, double ${args[0]!.name})`);
+        return { name: "", type: e.type };
       case "search": {
         this.declare(`declare double @scr_regex_search(ptr, ptr)`);
         const t = B.tmp();
         B.line(`${t} = call double @scr_regex_search(ptr ${r.name}, ptr ${args[0]!.name})`);
         return { name: t, type: e.type };
       }
-      case "source": {
-        this.declare(`declare ptr @scr_regex_source(ptr)`);
-        const t = B.tmp();
-        B.line(`${t} = call ptr @scr_regex_source(ptr ${r.name})`);
-        return this.own({ name: t, type: e.type });
-      }
-      case "flags": {
-        this.declare(`declare ptr @scr_regex_flags(ptr)`);
-        const t = B.tmp();
-        B.line(`${t} = call ptr @scr_regex_flags(ptr ${r.name})`);
-        return this.own({ name: t, type: e.type });
-      }
-      case "replace": {
-        this.declare(`declare ptr @scr_regex_replace(ptr, ptr, ptr)`);
-        const t = B.tmp();
-        B.line(`${t} = call ptr @scr_regex_replace(ptr ${r.name}, ptr ${args[0]!.name}, ptr ${args[1]!.name})`);
-        return this.own({ name: t, type: e.type });
-      }
+      case "source":
+        return ptrCall("scr_regex_source", [r.name]);
+      case "flags":
+        return ptrCall("scr_regex_flags", [r.name]);
+      case "replace":
+        return ptrCall("scr_regex_replace", [r.name, args[0]!.name, args[1]!.name]);
       default: {
         const _exhaustive: never = method;
         void _exhaustive;
@@ -9912,7 +9968,6 @@ class LlEmitter {
       }
     }
   }
-
   /** Dynamic-keyed record read (the C per-(shape, result) helper, emitted
    * inline): declared fields answer through a string-equality chain, an
    * index-signature shape falls through to the overflow map, and a miss
@@ -11052,11 +11107,18 @@ class LlEmitter {
       // Never throw.
       const key = this.emitExpr(e.args[0]!);
       const v = this.emitExpr(e.args[1]!);
-      const sym = e.fn === "assert.shapeStr" ? "scr_assert_shape_str" : "scr_assert_shape_re";
-      this.declare(`declare void @${sym}(i32, ptr)`);
       const k32 = B.tmp();
       B.line(`${k32} = fptosi double ${key.name} to i32`);
-      B.line(`call void @${sym}(i32 ${k32}, ptr ${v.name})`);
+      if (e.fn === "assert.shapeStr") {
+        this.declare(`declare void @scr_assert_shape_str(i32, ptr)`);
+        B.line(`call void @scr_assert_shape_str(i32 ${k32}, ptr ${v.name})`);
+      } else {
+        // shapeRe's third argument: the call site's regex is a literal
+        // (board #301 — a value-path g/y regex traps, as on wasm).
+        const lit = this.emitExpr(e.args[2]!);
+        this.declare(`declare void @scr_assert_shape_re(i32, ptr, i1 zeroext)`);
+        B.line(`call void @scr_assert_shape_re(i32 ${k32}, ptr ${v.name}, i1 zeroext ${lit.name})`);
+      }
       return { name: "", type: e.type };
     }
     if (e.fn === "emitter.on") {

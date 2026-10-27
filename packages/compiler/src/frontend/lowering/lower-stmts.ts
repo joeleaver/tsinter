@@ -27,6 +27,7 @@ import { UNSUPPORTED, checkerPanicDiag, isCheckerPanic, requiresDynamicDiag } fr
 import { isUnitOnlyTsType, unitOnlyUnion } from "../types.js";
 import { canonicalBuiltinModule, isRelativeSpecifier } from "../shared.js";
 import { probeNodeRequireRefusal } from "../npm.js";
+import { lowerExecCompanionDecl, lowerRegexLastIndexIncDec, lowerRegexLastIndexWrite } from "./lower-regex.js";
 
 /** `const X = /* @__PURE__ *\/ makeX()` at a module's top level: every
  * declarator initialized by a call (or `new`) carrying the bundler PURE
@@ -923,8 +924,11 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
       if (numericIterator) return numericIterator;
       const drained = lowerMatchAllDrainDecl(L, decl, isConst);
       if (drained) return drained;
+      // Board #301: an exec/match result binding reading `.index` /
+      // `.input` / `.groups` gets its hidden companions first.
+      const companion = lowerExecCompanionDecl(L, decl) ?? [];
       const lowered = L.lowerVarDecl(decl, isLet);
-      return lowered ? [lowered] : [];
+      return lowered ? [...companion, lowered] : companion;
     })()));
   }
 
@@ -4196,6 +4200,11 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
           loc: locOf(expr),
         };
       }
+      // Board #301: `re.lastIndex = v` (and `+=`/`-=`).
+      {
+        const li = lowerRegexLastIndexWrite(L, expr);
+        if (li) return li;
+      }
       if (opKind === ts.SyntaxKind.EqualsToken) {
         // Expando function members (`foo.bar = 12`, `foo[SYM] = v` on a
         // module-level function/callable const): the member's module
@@ -4547,6 +4556,9 @@ function isEsModuleStamp(expr: ts.Expression): boolean {
         // increment (the member's global IS the variable); expando
         // function members (`foo.count++`) are module globals too.
         if (ts.isPropertyAccessExpression(expr.operand) && !expr.operand.questionDotToken) {
+          // Board #301: `re.lastIndex++`.
+          const li = lowerRegexLastIndexIncDec(L, expr.operand, expr.operator === ts.SyntaxKind.PlusPlusToken ? "+" : "-", locOf(expr));
+          if (li) return li;
           const exT = expandoWritableTarget(L, expr.operand);
           if (exT) return lowerIncDecToTarget(L, expr, exT);
           const nsT = nsWritableTarget(L, expr.operand);

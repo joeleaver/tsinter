@@ -1372,24 +1372,26 @@ export const BUILTIN_MODULE_FENCE_HINTS: Record<string, Record<string, string | 
         `Math.${member} lowers with any number of plain arguments or ONE number[] spread — ` +
         `mixed spread/positional lists don't: spread a single array (Math.${member}(...xs))`;
     } else if (
-      recvIr?.kind === "array" &&
-      member === "index" &&
+      (member === "index" || member === "input") &&
+      recvIr !== null && recvIr !== undefined && L.isMatchSliceType(recvIr) &&
       (container === "RegExpExecArray" || container === "RegExpMatchArray")
     ) {
       hint =
-        "'.index' is supported on the const binding of a for-of over a DIRECT matchAll call " +
-        "(for (const m of s.matchAll(re)) { ... m.index ... }); stored rows are honest " +
-        "string[] slices without it";
+        `'.${member}' reads Node's value on a variable assigned ONLY from direct re.exec(s) / ` +
+        `s.match(re) calls (or null) and read in the function that assigns it — ` +
+        `while ((m = re.exec(s)) !== null) { ... m.${member} ... }` +
+        (member === "index" ? ", and on the const binding of a for-of over s.matchAll(re)" : "") +
+        `; here ${L.companionRejectionReason(recv, member)}`;
     } else if (
-      recvIr?.kind === "array" &&
+      recvIr !== null && recvIr !== undefined && L.isMatchSliceType(recvIr) &&
       member === "groups" &&
       (container === "RegExpExecArray" || container === "RegExpMatchArray")
     ) {
       hint =
         "'.groups' lowers when the match's regex is STATICALLY known — a regex literal, or a " +
         "const initialized with one (the group-name table is built at compile time) — and the " +
-        "read is not an optional-chain step: narrow the match instead (if (m) { m.groups } or " +
-        "m!.groups)";
+        "result is a variable assigned only from direct exec/match calls over that one pattern, " +
+        `read in the function that assigns it; here ${L.companionRejectionReason(recv, member)}`;
     } else if (recvIr?.kind === "array" && member === "flat") {
       hint =
         "flat has no lowering (flatMap does) — flatten into an accumulator instead: " +

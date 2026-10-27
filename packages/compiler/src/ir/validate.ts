@@ -75,6 +75,19 @@ export const REGEX_INTRINSIC_SIGS: Record<
   replace: { receiver: STRING, argTypes: [REGEX, STRING], result: STRING },
   replaceAll: { receiver: STRING, argTypes: [REGEX, STRING], result: STRING },
   split: { receiver: STRING, argTypes: [REGEX], result: arrayOf(STRING) },
+  // Board #301 (lastIndex modelled): see IrRegexIntrinsicMethod.
+  matchInto: { receiver: STRING, argTypes: [REGEX, arrayOf(F64)], result: VOID },
+  exec: { receiver: REGEX, argTypes: [STRING], result: VOID },
+  execInto: { receiver: REGEX, argTypes: [STRING, arrayOf(F64)], result: VOID },
+  lastIndex: { receiver: REGEX, argTypes: [], result: F64 },
+  setLastIndex: { receiver: REGEX, argTypes: [F64], result: VOID },
+  collect: { receiver: STRING, argTypes: [REGEX, arrayOf(F64)], result: arrayOf(arrayOf(STRING)) },
+  collectAll: { receiver: STRING, argTypes: [REGEX, arrayOf(F64)], result: arrayOf(arrayOf(STRING)) },
+  splitLimit: { receiver: STRING, argTypes: [REGEX, F64], result: arrayOf(STRING) },
+  strReplace: { receiver: STRING, argTypes: [STRING, STRING], result: STRING },
+  strReplaceAll: { receiver: STRING, argTypes: [STRING, STRING], result: STRING },
+  strCollect: { receiver: STRING, argTypes: [STRING, arrayOf(F64)], result: arrayOf(arrayOf(STRING)) },
+  strCollectAll: { receiver: STRING, argTypes: [STRING, arrayOf(F64)], result: arrayOf(arrayOf(STRING)) },
 };
 
 /** Closed-union signature table for `libCall` (mirrors ambient/scriptc.d.ts).
@@ -2163,7 +2176,7 @@ function validateFunction(
           const want = sig.argTypes[i];
           if (want) expectType(a, want, `regexIntrinsic ${e.method} arg ${i}`);
         });
-        if (e.method === "match") {
+        if (e.method === "match" || e.method === "matchInto" || e.method === "exec" || e.method === "execInto") {
           // The `string[] | null` union (program-dependent id) — checked
           // by arms, like the libCall case checks process.envGet.
           const def = e.type.kind === "union" ? unions.get(e.type.unionId) : undefined;

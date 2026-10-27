@@ -42,6 +42,7 @@
  */
 #include "scr_runtime.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -73,7 +74,9 @@ _Noreturn void scr_rx_oom(void) {
 /* The engine's objects die at exit (and at a library reset, which also
  * puts its globals back). Registered on first use. */
 static bool scr_rx_registered = false;
+static void scr_rx_subj_drop(void);
 static void scr_rx_shutdown(void) {
+  scr_rx_subj_drop();
   scr_rx_free_all();
   scr_rx_registered = false;
 }
@@ -267,6 +270,7 @@ static void scr_note_compiled(ScrRegex *re) {
  * failure is an internal error, loud. */
 static RxObj *scr_regex_bc(ScrRegex *re) {
   if (re->bc) return (RxObj *)re->bc;
+  if (re->proto) return scr_regex_bc(re->proto); /* a literal's fresh copy */
   RxObj *r = scr_rx_compile_str(re->source, re->flags);
   if (scr_rx_isNull(r)) {
     ScrStr *msg = scr_rx_to_str(scr_rx_errMessage());
@@ -293,6 +297,23 @@ void scr_regex_release(ScrRegex *re) {
 #endif
     free(re);
   }
+}
+
+/* A regex LITERAL's evaluation (board #301): a fresh +1 object over the
+ * literal's immortal static — JS builds a new RegExp per evaluation, and
+ * lastIndex makes that observable. The texts are shared (retained), the
+ * bytecode is the static's (compiled once, through `proto`). */
+ScrRegex *scr_regex_fresh(ScrRegex *lit) {
+  ScrRegex *re = calloc(1, sizeof *re);
+  if (!re) scr_regex_oom();
+  re->rc = 1;
+  re->source = scr_str_retain(lit->source);
+  re->flags = scr_str_retain(lit->flags);
+  re->proto = lit;
+#if defined(SCR_LIB) && defined(SCR_RC_AUDIT)
+  scr_library_live_insert(re, scr_regex_release_v);
+#endif
+  return re;
 }
 
 void *scr_regex_retain_v(void *re) { return scr_regex_retain(re); }
@@ -354,9 +375,52 @@ typedef struct {
   int ncap;
 } ScrRxRun;
 
+/* The subject cache (board #301): a match loop over one big subject —
+ * `while ((m = re.exec(big)) !== null)`, a test() per line over the same
+ * buffer — would otherwise re-convert the whole UTF-8 subject to UTF-16 on
+ * every call, quadratic in the subject. The last big subject's units are
+ * kept as a FOREIGN engine string (outside the collector), keyed by the
+ * string's address and length: strings are immutable except for the
+ * in-place append of a uniquely owned one (which grows len — the key
+ * misses), and scr_string.c reports every free or relocation through
+ * scr_str_purge_hook, so a recycled address never hits. */
+#define SCR_RX_SUBJ_MIN 256
+static const ScrStr *scr_rx_subj_key = NULL;
+static size_t scr_rx_subj_len = 0;
+static RxObj *scr_rx_subj_obj = NULL;
+
+static void scr_rx_subj_drop(void) {
+  free(scr_rx_subj_obj);
+  scr_rx_subj_obj = NULL;
+  scr_rx_subj_key = NULL;
+}
+
+static void scr_rx_subj_purge(const ScrStr *s) {
+  if (s == scr_rx_subj_key) scr_rx_subj_drop();
+}
+
+static RxObj *scr_rx_subject(const ScrStr *s) {
+  if (s->len < SCR_RX_SUBJ_MIN) return scr_rx_str(s);
+  if (s == scr_rx_subj_key && s->len == scr_rx_subj_len) return scr_rx_subj_obj;
+  scr_rx_subj_drop();
+  RxObj *t = scr_rx_str(s);
+  size_t bytes = (size_t)t->len * 2;
+  RxObj *o = (RxObj *)calloc(1, SCR_RX_HDR + (bytes ? bytes : 1));
+  if (!o) scr_regex_oom();
+  o->type = t->type;
+  o->len = t->len;
+  o->foreign = 1;
+  memcpy(SCR_RX_PAYLOAD(o), SCR_RX_PAYLOAD(t), bytes);
+  scr_rx_subj_obj = o;
+  scr_rx_subj_key = s;
+  scr_rx_subj_len = s->len;
+  scr_str_purge_hook = scr_rx_subj_purge;
+  return o;
+}
+
 static void scr_rx_run_init(ScrRxRun *r, RxObj *bc, const ScrStr *s) {
   r->bc = bc;
-  r->subj = scr_rx_str(s);
+  r->subj = scr_rx_subject(s);
   r->u = (const uint16_t *)SCR_RX_PAYLOAD(r->subj);
   r->len = r->subj->len;
   /* capture pairs, then the register slots (newCaptureArray's sizing, the
@@ -409,55 +473,144 @@ static ScrStr *scr_rx_capture_str(ScrRxRun *r, int k) {
   return scr_str_from_utf16(r->u, cs, ce);
 }
 
+/* ── lastIndex (board #301) ───────────────────────────────────────────
+ * Every regex value carries lastIndex: the stored number, ToLength'd where
+ * RegExpBuiltinExec reads it. An IMMORTAL regex (a literal's static) is
+ * only ever handed straight to a method at its literal's own site — every
+ * other evaluation of a literal is a fresh heap copy (scr_regex_fresh) —
+ * so it stands for a FRESH object: each entry point starts it at
+ * lastIndex 0 (scr_rx_enter), and whatever it stores is unobservable once
+ * the call returns. The wasm tier runs the same algorithms
+ * (backend/wasm/regex-state.ts). */
+
+static void scr_rx_enter(ScrRegex *re) {
+  if (re->rc == SIZE_MAX) re->last_index = 0;
+}
+
+static double scr_rx_li_get(const ScrRegex *re) { return re->last_index; }
+
+static void scr_rx_li_set(ScrRegex *re, double v) { re->last_index = v; }
+
+double scr_regex_last_index(ScrRegex *re) {
+  scr_rx_enter(re);
+  return re->last_index;
+}
+
+void scr_regex_set_last_index(ScrRegex *re, double v) { re->last_index = v; }
+
+/* ToLength as an index candidate: NaN and non-positive values are 0,
+ * fractions truncate, and anything past every subject is 2^31. */
+static double scr_rx_to_index(double x) {
+  if (!(x > 0)) return 0;
+  if (x >= 2147483648.0) return 2147483648.0;
+  return floor(x);
+}
+
+static bool scr_rx_unicode(const void *bc) {
+  return (scr_bc_flags(bc) & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) != 0;
+}
+
+/* RegExpBuiltinExec(re, S) over a matching session: 1 on a match (the
+ * slots in r->cap), 0 otherwise. A global or sticky regex starts at
+ * ToLength(lastIndex) and stores the match end (0 on failure); any other
+ * starts at 0 and leaves lastIndex alone. */
+static int scr_bexec(ScrRegex *re, ScrRxRun *r) {
+  bool gy = (scr_bc_flags(r->bc) & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY)) != 0;
+  double li = gy ? scr_rx_to_index(scr_rx_li_get(re)) : 0;
+  if (li > (double)r->len || scr_exec(r, (int)li) != 1) {
+    if (gy) scr_rx_li_set(re, 0);
+    return 0;
+  }
+  if (gy) scr_rx_li_set(re, (double)r->cap[1]);
+  return 1;
+}
+
+/* The honest row of the last match: [whole, ...captures], "" for a capture
+ * that did not participate (S064). +1. */
+static ScrArr *scr_rx_row(ScrRxRun *r) {
+  int count = scr_bc_capture_count(r->bc);
+  ScrArr *out = scr_arr_new(SCR_ELEM_STR, (size_t)count);
+  for (int k = 0; k < count; k++) scr_arr_push_ref(out, scr_rx_capture_str(r, k));
+  return out;
+}
+
+/* Appends the last match's capture positions (start, end; -1 unset). */
+static void scr_rx_push_pos(ScrRxRun *r, ScrArr *pos) {
+  int count = scr_bc_capture_count(r->bc);
+  for (int k = 0; k < 2 * count; k++) scr_arr_push_f64(pos, (double)r->cap[k]);
+}
+
+/* After an empty match of a global loop: lastIndex = AdvanceStringIndex(S,
+ * ToLength(lastIndex), unicode) — lastIndex holds the end the last bexec
+ * stored, an index within S. */
+static void scr_rx_bump_empty(ScrRegex *re, ScrRxRun *r, bool unicode) {
+  int li = (int)scr_rx_to_index(scr_rx_li_get(re));
+  scr_rx_li_set(re, (double)scr_advance(r->u, r->len, li, unicode));
+}
+
 /* ── test ─────────────────────────────────────────────────────────────── */
 
 bool scr_regex_test(ScrRegex *re, ScrStr *s) {
-  RxObj *bc = scr_regex_bc(re);
-  if (scr_bc_flags(bc) & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY)) {
-    /* JS test() on a g/y regex reads AND writes lastIndex — stateful
-     * iteration this slice does not model (the frontend rejects the sites
-     * it can see; values that flow through variables land here). */
-    fflush(stdout);
-    scr_trap("scriptc: test() on a regex with the 'g' or 'y' flag is not "
-             "supported (stateful lastIndex); drop the flag, or use "
-             "replace/replaceAll/split\n");
-  }
+  scr_rx_enter(re);
   ScrRxRun r;
-  scr_rx_run_init(&r, bc, s);
-  bool out = scr_exec(&r, 0) == 1;
+  scr_rx_run_init(&r, scr_regex_bc(re), s);
+  bool out = scr_bexec(re, &r) == 1;
   scr_rx_safepoint();
   return out;
 }
 
-/* ── match ────────────────────────────────────────────────────────────── */
+/* ── exec / match ─────────────────────────────────────────────────────── */
 
-/* s.match(re) for non-g/y regexes: Node's exec-shaped result reduced to
- * the honest slice — a fresh string[] of [whole match, ...captures], or
- * NULL for no match (the compiler wraps the `string[] | null` union). A
- * NONPARTICIPATING capture holds "" where Node's slot is undefined
- * (truthiness tests agree; SEMANTICS.md documents the divergence). g/y
- * regexes abort like test() — a g-flagged match returns EVERY match, a
- * different shape the frontend fences on literals. */
-ScrArr *scr_regex_match(ScrStr *s, ScrRegex *re) {
-  RxObj *bc = scr_regex_bc(re);
-  if (scr_bc_flags(bc) & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY)) {
-    fflush(stdout);
-    scr_trap("scriptc: match() on a regex with the 'g' or 'y' flag is not "
-             "supported (an every-match array is a different shape); drop the "
-             "flag, or use replace/replaceAll/split\n");
-  }
+/* re.exec(s): the row, or NULL (the compiler wraps the `string[] | null`
+ * union). `pos`, when non-NULL, is cleared and receives the capture
+ * positions — the .index companion. */
+static ScrArr *scr_regex_exec_core(ScrRegex *re, ScrStr *s, ScrArr *pos) {
+  scr_rx_enter(re);
+  if (pos) pos->len = 0;
   ScrRxRun r;
-  scr_rx_run_init(&r, bc, s);
+  scr_rx_run_init(&r, scr_regex_bc(re), s);
   ScrArr *out = NULL;
-  if (scr_exec(&r, 0) == 1) {
-    int count = scr_bc_capture_count(bc);
-    out = scr_arr_new(SCR_ELEM_STR, (size_t)count);
-    for (int k = 0; k < count; k++) scr_arr_push_ref(out, scr_rx_capture_str(&r, k));
+  if (scr_bexec(re, &r) == 1) {
+    out = scr_rx_row(&r);
+    if (pos) scr_rx_push_pos(&r, pos);
   }
   scr_rx_safepoint();
   return out; /* +1, or NULL (no match) */
 }
 
+ScrArr *scr_regex_exec(ScrRegex *re, ScrStr *s) { return scr_regex_exec_core(re, s, NULL); }
+
+ScrArr *scr_regex_exec_into(ScrRegex *re, ScrStr *s, ScrArr *pos) {
+  return scr_regex_exec_core(re, s, pos);
+}
+
+/* s.match(re) — Symbol.match: exec when the regex is not global;
+ * otherwise every whole match (lastIndex reset to 0 first, empty matches
+ * advancing), or NULL when there is none. */
+static ScrArr *scr_regex_match_core(ScrStr *s, ScrRegex *re, ScrArr *pos) {
+  RxObj *bc = scr_regex_bc(re);
+  if (!(scr_bc_flags(bc) & LRE_FLAG_GLOBAL)) return scr_regex_exec_core(re, s, pos);
+  scr_rx_enter(re);
+  if (pos) pos->len = 0;
+  bool unicode = scr_rx_unicode(bc);
+  ScrRxRun r;
+  scr_rx_run_init(&r, bc, s);
+  scr_rx_li_set(re, 0);
+  ScrArr *out = NULL;
+  while (scr_bexec(re, &r) == 1) {
+    if (!out) out = scr_arr_new(SCR_ELEM_STR, 4);
+    scr_arr_push_ref(out, scr_rx_capture_str(&r, 0));
+    if (r.cap[0] == r.cap[1]) scr_rx_bump_empty(re, &r, unicode);
+  }
+  scr_rx_safepoint();
+  return out;
+}
+
+ScrArr *scr_regex_match(ScrStr *s, ScrRegex *re) { return scr_regex_match_core(s, re, NULL); }
+
+ScrArr *scr_regex_match_into(ScrStr *s, ScrRegex *re, ScrArr *pos) {
+  return scr_regex_match_core(s, re, pos);
+}
 /* ── search ───────────────────────────────────────────────────────────── */
 
 /* s.search(re): the first match's UTF-16 index, or -1 — Symbol.search's
@@ -498,7 +651,11 @@ static ScrArr *scr_regex_match_all_core(ScrStr *s, ScrRegex *re, ScrArr *indices
   ScrRxRun r;
   scr_rx_run_init(&r, bc, s);
   ScrArr *out = scr_arr_new(SCR_ELEM_ARR, 4);
-  int pos = 0;
+  /* The spec drains a CLONE whose lastIndex starts at ToLength of the
+   * regex's own (board #301); the regex itself is never written. */
+  scr_rx_enter(re);
+  double start_li = scr_rx_to_index(scr_rx_li_get(re));
+  int pos = start_li > (double)r.len ? r.len + 1 : (int)start_li;
   while (pos <= r.len) {
     if (scr_exec(&r, pos) != 1) break;
     int start = r.cap[0];
@@ -617,26 +774,31 @@ static void scr_put_substitution(ScrJsonBuf *b, ScrRxRun *r, int start, int end,
  * from `pos`, copy the gap, emit the substitution, continue from the match
  * end when global — advancing zero-length matches per AdvanceStringIndex. */
 static ScrStr *scr_replace_impl(ScrStr *s, ScrRegex *re, ScrStr *rep) {
+  scr_rx_enter(re);
   RxObj *bc = scr_regex_bc(re);
   int re_flags = scr_bc_flags(bc);
   bool global = (re_flags & LRE_FLAG_GLOBAL) != 0;
-  bool unicode = (re_flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) != 0;
+  bool unicode = scr_rx_unicode(bc);
   int capture_count = scr_bc_capture_count(bc);
   const char *groupnames = scr_bc_groupnames(bc);
   ScrRxRun r;
   scr_rx_run_init(&r, bc, s);
   ScrJsonBuf b;
   scr_jb_init(&b);
-  int next = 0, pos = 0;
-  while (pos <= r.len) {
-    if (scr_exec(&r, pos) != 1) break;
+  int next = 0;
+  /* Symbol.replace (board #301): a global regex starts from lastIndex 0;
+   * a sticky one reads and writes lastIndex through RegExpBuiltinExec. */
+  if (global) scr_rx_li_set(re, 0);
+  while (scr_bexec(re, &r) == 1) {
     int start = r.cap[0];
     int end = r.cap[1];
-    scr_jb_put_utf16(&b, r.u, next, start);
-    scr_put_substitution(&b, &r, start, end, capture_count, groupnames, rep);
-    next = end;
+    if (start >= next) {
+      scr_jb_put_utf16(&b, r.u, next, start);
+      scr_put_substitution(&b, &r, start, end, capture_count, groupnames, rep);
+      next = end;
+    }
     if (!global) break;
-    pos = end == start ? scr_advance(r.u, r.len, end, unicode) : end;
+    if (end == start) scr_rx_bump_empty(re, &r, unicode);
   }
   scr_jb_put_utf16(&b, r.u, next, r.len);
   scr_rx_safepoint();
@@ -647,51 +809,199 @@ ScrStr *scr_regex_replace(ScrStr *s, ScrRegex *re, ScrStr *rep) {
   return scr_replace_impl(s, re, rep);
 }
 
+static bool scr_rx_require_global(ScrRegex *re, const char *msg, size_t len) {
+  if (scr_bc_flags(scr_regex_bc(re)) & LRE_FLAG_GLOBAL) return true;
+  /* Node's exact TypeError — catchable; e.message is V8's text. */
+  scr_throw_error_msg(SCR_ERR_TYPE, msg, len);
+  return false;
+}
+
+static const char scr_replace_all_msg[] =
+    "String.prototype.replaceAll called with a non-global RegExp argument";
+
 ScrStr *scr_regex_replace_all(ScrStr *s, ScrRegex *re, ScrStr *rep) {
-  if (!(scr_bc_flags(scr_regex_bc(re)) & LRE_FLAG_GLOBAL)) {
-    /* Node's exact TypeError — a real instance now: catch bindings narrow
-     * it and e.message carries V8's text byte-for-byte. */
-    static const char msg[] =
-        "String.prototype.replaceAll called with a non-global RegExp argument";
-    scr_throw_error_msg(SCR_ERR_TYPE, msg, sizeof msg - 1);
+  if (!scr_rx_require_global(re, scr_replace_all_msg, sizeof scr_replace_all_msg - 1)) {
     return NULL; /* callers are compiler-emitted pending checks */
   }
   return scr_replace_impl(s, re, rep);
 }
 
+/* The collection phase of a FUNCTION replacer (Symbol.replace's results
+ * list): every result's row, its capture positions appended to `pos`
+ * (cleared first). The compiled code calls the replacer over the rows
+ * afterwards, so no user code runs while a match is in progress. */
+ScrArr *scr_regex_collect(ScrStr *s, ScrRegex *re, ScrArr *pos) {
+  scr_rx_enter(re);
+  RxObj *bc = scr_regex_bc(re);
+  bool global = (scr_bc_flags(bc) & LRE_FLAG_GLOBAL) != 0;
+  bool unicode = scr_rx_unicode(bc);
+  pos->len = 0;
+  ScrRxRun r;
+  scr_rx_run_init(&r, bc, s);
+  ScrArr *out = scr_arr_new(SCR_ELEM_ARR, 4);
+  int next = 0;
+  if (global) scr_rx_li_set(re, 0);
+  while (scr_bexec(re, &r) == 1) {
+    /* the row, then the gap before it (results are in subject order) */
+    ScrArr *row = scr_rx_row(&r);
+    scr_arr_push_ref(row, scr_str_from_utf16(r.u, next, r.cap[0]));
+    next = r.cap[1];
+    scr_arr_push_ref(out, row);
+    scr_rx_push_pos(&r, pos);
+    if (!global) break;
+    if (r.cap[0] == r.cap[1]) scr_rx_bump_empty(re, &r, unicode);
+  }
+  ScrArr *tail = scr_arr_new(SCR_ELEM_STR, 1);
+  scr_arr_push_ref(tail, scr_str_from_utf16(r.u, next, r.len));
+  scr_arr_push_ref(out, tail);
+  scr_rx_safepoint();
+  return out;
+}
+
+ScrArr *scr_regex_collect_all(ScrStr *s, ScrRegex *re, ScrArr *pos) {
+  if (!scr_rx_require_global(re, scr_replace_all_msg, sizeof scr_replace_all_msg - 1)) {
+    return NULL;
+  }
+  return scr_regex_collect(s, re, pos);
+}
+
+/* String.prototype.replace / replaceAll with a STRING pattern and a
+ * replacement template (board #301): every occurrence (replaceAll —
+ * advancing by max(1, |P|), so an empty pattern inserts between every code
+ * unit and at both ends) or the first, with GetSubstitution over the
+ * template (the occurrence is the match; no captures, no groups). Works in
+ * UTF-16 like the regex paths. Borrows all three; +1. */
+ScrStr *scr_regex_str_replace(ScrStr *s, ScrStr *pat, ScrStr *rep, bool all) {
+  scr_rx_use();
+  RxObj *so = scr_rx_subject(s);
+  RxObj *po = scr_rx_str(pat);
+  const uint16_t *u = (const uint16_t *)SCR_RX_PAYLOAD(so);
+  const uint16_t *pu = (const uint16_t *)SCR_RX_PAYLOAD(po);
+  int len = so->len, plen = po->len;
+  int32_t cap[2] = {0, 0};
+  ScrRxRun r = {0};
+  r.u = u;
+  r.len = len;
+  r.cap = cap;
+  r.ncap = 2;
+  ScrJsonBuf b;
+  scr_jb_init(&b);
+  int next = 0, from = 0;
+  bool any = false;
+  while (from + plen <= len) {
+    int p = -1;
+    for (int i = from; i + plen <= len; i++) {
+      if (plen == 0 || memcmp(u + i, pu, (size_t)plen * sizeof(uint16_t)) == 0) {
+        p = i;
+        break;
+      }
+    }
+    if (p < 0) break;
+    any = true;
+    scr_jb_put_utf16(&b, u, next, p);
+    cap[0] = p;
+    cap[1] = p + plen;
+    scr_put_substitution(&b, &r, p, p + plen, 1, NULL, rep);
+    next = p + plen;
+    if (!all) break;
+    from = p + (plen > 1 ? plen : 1);
+  }
+  scr_jb_put_utf16(&b, u, next, len);
+  ScrStr *out = scr_jb_finish(&b);
+  if (!any) {
+    /* No occurrence: the subject itself (strings are immutable). */
+    scr_str_release(out);
+    out = scr_str_retain(s);
+  }
+  scr_rx_safepoint();
+  return out;
+}
+
+/* A STRING pattern's collection for a function replacer: rows [match,
+ * gap] per occurrence (every one for replaceAll, advancing by max(1, |P|);
+ * the first otherwise), then a final [tail] row; [start, end] per
+ * occurrence appended to the cleared `pos`. +1. */
+ScrArr *scr_regex_str_collect(ScrStr *s, ScrStr *pat, ScrArr *pos, bool all) {
+  scr_rx_use();
+  RxObj *so = scr_rx_subject(s);
+  RxObj *po = scr_rx_str(pat);
+  const uint16_t *u = (const uint16_t *)SCR_RX_PAYLOAD(so);
+  const uint16_t *pu = (const uint16_t *)SCR_RX_PAYLOAD(po);
+  int len = so->len, plen = po->len;
+  pos->len = 0;
+  ScrArr *out = scr_arr_new(SCR_ELEM_ARR, 4);
+  int next = 0, from = 0;
+  while (from + plen <= len) {
+    int p = -1;
+    for (int i = from; i + plen <= len; i++) {
+      if (plen == 0 || memcmp(u + i, pu, (size_t)plen * sizeof(uint16_t)) == 0) {
+        p = i;
+        break;
+      }
+    }
+    if (p < 0) break;
+    ScrArr *row = scr_arr_new(SCR_ELEM_STR, 2);
+    scr_arr_push_ref(row, scr_str_retain(pat));
+    scr_arr_push_ref(row, scr_str_from_utf16(u, next, p));
+    scr_arr_push_ref(out, row);
+    scr_arr_push_f64(pos, (double)p);
+    scr_arr_push_f64(pos, (double)(p + plen));
+    next = p + plen;
+    if (!all) break;
+    from = p + (plen > 1 ? plen : 1);
+  }
+  ScrArr *tail = scr_arr_new(SCR_ELEM_STR, 1);
+  scr_arr_push_ref(tail, scr_str_from_utf16(u, next, len));
+  scr_arr_push_ref(out, tail);
+  scr_rx_safepoint();
+  return out;
+}
+
 /* ── split ────────────────────────────────────────────────────────────── */
 
-ScrArr *scr_regex_split(ScrStr *s, ScrRegex *re) {
+/* V8 holds `x` as a non-negative Smi: an integer in [0, 2^31-1], not -0 —
+ * what its fast split path requires of the limit and of lastIndex. */
+static bool scr_rx_fast_smi(double x) {
+  return x == trunc(x) && x >= 0 && x <= 2147483647.0 && !signbit(x);
+}
+
+static double scr_rx_to_uint32(double x) {
+  if (!(x == x)) return 0;
+  double t = trunc(x);
+  double m = t - floor(t / 4294967296.0) * 4294967296.0;
+  return m == m ? m : 0; /* ±Infinity: NaN here, ToUint32 0 */
+}
+
+/* ECMA-262 Symbol.split. `raw` is the limit argument (`has` false when
+ * absent: 2^32-1), ToUint32'd here. The spec splits with a sticky CLONE
+ * (the regex's own lastIndex is untouched) probing every position; for a
+ * non-sticky pattern a forward SEARCH from q stops at the same first
+ * position, so one exec replaces the per-position loop (a match the search
+ * finds AT the end is no split point — the spec probes only q < size) —
+ * V8's fast path. A sticky pattern keeps the probe-and-advance. V8 takes
+ * its SLOW (spec) path when the regex is sticky, the limit is not a
+ * non-negative Smi, or lastIndex is not one: there, under /u, probes step
+ * whole code points, so a search hit between the halves of a surrogate
+ * pair is no split point (S066). Captures splice into the result (S066),
+ * a nonparticipating one as "" (S064). The wasm tier's split is the same
+ * algorithm (regex-state.ts). */
+static ScrArr *scr_regex_split_core(ScrStr *s, ScrRegex *re, double raw, bool has) {
+  scr_rx_enter(re);
+  double lim = has ? scr_rx_to_uint32(raw) : 4294967295.0;
+  ScrArr *out = scr_arr_new(SCR_ELEM_STR, 0);
+  if (lim == 0) return out;
   RxObj *bc = scr_regex_bc(re);
-  if (scr_bc_capture_count(bc) > 1) {
-    /* JS splices every capture group's value into the result between the
-     * pieces, changing the array's SHAPE per match — not modeled this
-     * slice. Catchable, scriptc-specific. */
-    static const char msg[] =
-        "split() with capture groups in the pattern is not "
-        "supported (JS splices the captured values into the result); use a "
-        "non-capturing group (?:...)";
-    scr_throw_error_msg(SCR_ERR_TYPE, msg, sizeof msg - 1);
-    return NULL; /* callers are compiler-emitted pending checks */
-  }
   int re_flags = scr_bc_flags(bc);
-  bool unicode = (re_flags & (LRE_FLAG_UNICODE | LRE_FLAG_UNICODE_SETS)) != 0;
+  bool unicode = scr_rx_unicode(bc);
   bool sticky = (re_flags & LRE_FLAG_STICKY) != 0;
+  bool slow = sticky || (has && !scr_rx_fast_smi(raw)) || !scr_rx_fast_smi(scr_rx_li_get(re));
+  int count = scr_bc_capture_count(bc);
   ScrRxRun r;
   scr_rx_run_init(&r, bc, s);
   int len = r.len;
-  ScrArr *out = scr_arr_new(SCR_ELEM_STR, 0);
-
-  /* ECMA-262 22.2.6.14 (Symbol.split, no limit). The spec probes every
-   * position with a sticky matcher; for non-sticky patterns a forward
-   * SEARCH from q is equivalent (the earliest match position >= q is the
-   * first probe that would succeed) and one exec replaces the per-position
-   * loop. A genuinely sticky pattern keeps the spec's probe-and-advance. */
   if (len == 0) {
-    /* Empty subject: one probe — a match yields [], no match yields [""]. */
-    if (scr_exec(&r, 0) != 1) {
-      scr_arr_push_ref(out, scr_str_new("", 0));
-    }
+    /* Empty subject: one probe — a match yields [], no match yields [S]. */
+    if (scr_exec(&r, 0) != 1) scr_arr_push_ref(out, scr_str_new("", 0));
     scr_rx_safepoint();
     return out;
   }
@@ -704,19 +1014,37 @@ ScrArr *scr_regex_split(ScrStr *s, ScrRegex *re) {
     }
     int start = r.cap[0];
     int end = r.cap[1];
+    if (start >= len) break;
+    if (slow && unicode && start > 0 && r.u[start - 1] >= 0xD800 && r.u[start - 1] < 0xDC00 &&
+        r.u[start] >= 0xDC00 && r.u[start] < 0xE000) {
+      q = start + 1; /* inside a pair: no probe position on the slow path */
+      continue;
+    }
     if (end == p) {
       /* Zero-length match adjacent to the previous split point: advance
        * (start == q == p here — the search cannot skip a match). */
       q = scr_advance(r.u, len, start, unicode);
-    } else {
-      scr_arr_push_ref(out, scr_str_from_utf16(r.u, p, start));
-      p = end;
-      q = p;
+      continue;
     }
+    scr_arr_push_ref(out, scr_str_from_utf16(r.u, p, start));
+    if ((double)out->len == lim) goto done;
+    p = end;
+    for (int k = 1; k < count; k++) {
+      scr_arr_push_ref(out, scr_rx_capture_str(&r, k));
+      if ((double)out->len == lim) goto done;
+    }
+    q = p;
   }
   scr_arr_push_ref(out, scr_str_from_utf16(r.u, p, len));
+done:
   scr_rx_safepoint();
   return out;
+}
+
+ScrArr *scr_regex_split(ScrStr *s, ScrRegex *re) { return scr_regex_split_core(s, re, 0, false); }
+
+ScrArr *scr_regex_split_limit(ScrStr *s, ScrRegex *re, double lim) {
+  return scr_regex_split_core(s, re, lim, true);
 }
 
 /* ── String.prototype.toLowerCase / toUpperCase (the static path) ──────
@@ -837,19 +1165,16 @@ ScrStr *scr_str_to_upper(const ScrStr *s) { return scr_str_case_conv(s, 0); }
 /* ── assert.match / assert.doesNotMatch ──────────────────────────────────
  * Lives here (not scr_assert.c) because it needs the matcher, and every
  * call site carries a regex value — the regex link switch is already on,
- * so assert-only binaries never pull libregexp. A fresh exec from index 0:
- * Node's exec on a fresh regex literal; lastIndex statefulness is not
- * modeled anywhere in this runtime, so g/y-flagged regexes test like
- * their flag-free twins here instead of aborting (assert.match(s, /x/g)
- * works in Node — matching that beats scr_regex_test's fence;
- * SEMANTICS.md 107 covers reused stateful regexes). */
-/* A fresh exec from index 0 (assert.match's stance: g/y-flagged regexes
- * test like their flag-free twins here — SEMANTICS.md 107 covers reused
- * stateful regexes). */
+ * so assert-only binaries never pull libregexp. Every form tests with
+ * RegExpBuiltinExec (lastIndex read and written on a global or sticky
+ * regex — board #301), as Node's RegExpPrototypeExec does. */
+/* Node's RegExpPrototypeExec (board #301): a global or sticky regex reads
+ * and writes its lastIndex, as everywhere else. */
 static bool scr_assert_regex_hits(ScrRegex *re, ScrStr *s) {
+  scr_rx_enter(re);
   ScrRxRun r;
   scr_rx_run_init(&r, scr_regex_bc(re), s);
-  bool matched = scr_exec(&r, 0) == 1;
+  bool matched = scr_bexec(re, &r) == 1;
   scr_rx_safepoint();
   return matched;
 }
@@ -949,9 +1274,27 @@ bool scr_assert_regex_err_test(ScrRegex *re, ScrError *err) {
  * test the stashed actual key eagerly and store verdict + rendering, so
  * scr_assert.c's comparison and diff stay libregexp-free. An absent
  * actual key (NULL code) is a mismatch — Node's `key in actual` test. */
-void scr_assert_shape_re(int key, ScrRegex *re) {
+void scr_assert_shape_re(int key, ScrRegex *re, bool is_literal) {
   ScrStr *actual = scr_assert_shape_actual(key);
-  bool matched = actual != NULL && scr_assert_regex_hits(re, actual);
+  /* Node runs a regex key a SECOND time when it renders a failed
+   * comparison (its Comparison constructor), moving a global or sticky
+   * regex's lastIndex again — which one verdict cannot reproduce. A
+   * value-path g/y regex aborts here, as the wasm tier traps (SEMANTICS.md
+   * S003's regex amendment, board #301); a literal is a fresh object, so
+   * one exec from index 0 is exactly Node's. */
+  if (!is_literal && (scr_bc_flags(scr_regex_bc(re)) & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY))) {
+    fflush(stdout);
+    scr_trap("scriptc: assert.throws with a shape key holding a global or sticky regex value is "
+             "not supported (Node runs the regex again when it reports a failed comparison); "
+             "spell the regex as a literal at the call, or drop the g/y flag\n");
+  }
+  bool matched = false;
+  if (actual != NULL) {
+    ScrRxRun r;
+    scr_rx_run_init(&r, scr_regex_bc(re), actual);
+    matched = scr_exec(&r, 0) == 1;
+    scr_rx_safepoint();
+  }
   scr_assert_shape_slot_re(key, matched, scr_assert_regex_render(re));
 }
 

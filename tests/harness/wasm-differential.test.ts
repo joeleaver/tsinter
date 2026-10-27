@@ -3649,6 +3649,13 @@ const TIER_FLOOR: string[] = [
   // S108), so TextEncoder/TextDecoder, URLSearchParams, btoa/atob and
   // console answer as on the native lanes: 1091 -> 1092.
   "1120-web-globals-encoders.ts",
+  // Board #301: a regex value's lastIndex is modelled on every lane (the
+  // S003 regex amendment retired) — stateful test/exec/match, every-match
+  // match with /g, function replacers, string-pattern replace/replaceAll,
+  // split over a regex variable or with a limit, exec results' .index /
+  // .input companions: new programs passing from their first run.
+  "2795-regex-lastindex-state.ts",
+  "2796-regex-replace-callbacks.ts",
 ];
 
 interface RunResult {

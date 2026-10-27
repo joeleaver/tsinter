@@ -47,7 +47,7 @@
  * first actual reference" convention exactly. */
 import type { ByteWriter } from "./bytes.js";
 import { Code } from "./code.js";
-import { I32, ModuleBuilder, type ValType } from "./module.js";
+import { F64, I32, ModuleBuilder, type ValType } from "./module.js";
 
 export class RegexBuilder {
   private readonly literals = new Map<string, number>();
@@ -72,6 +72,11 @@ export class RegexBuilder {
   constructor(
     private readonly mb: ModuleBuilder,
     private readonly strType: number,
+    /** Board #301: the output module's regex values carry lastIndex; the
+     * standalone engine module (regex-engine-module.ts — the build time and
+     * the native lanes, which keep lastIndex on their own ScrRegex) does
+     * not, so its translation to C stays f64-free. */
+    readonly hasLastIndex = true,
   ) {
     // MUTABLE element types (unit P1, the run-time compiler): an
     // immutable array can only be created from a data segment or a fixed
@@ -91,6 +96,10 @@ export class RegexBuilder {
       { storage: this.bcRef(), mutable: false }, // bytecode
       { storage: I32, mutable: false }, // captureCount
       { storage: this.strArrRef(), mutable: false }, // groupNames
+      // lastIndex (board #301): the ONE mutable field — the JS property's
+      // raw number (ToLength applies where RegExpBuiltinExec reads it).
+      // Every construction site pushes f64 0 last (pushLastIndexInit).
+      ...(hasLastIndex ? [{ storage: F64, mutable: true }] : []), // lastIndex
     ]);
   }
 
@@ -176,6 +185,7 @@ export class RegexBuilder {
       for (const name of groupNames) this.pushStrLit(c, name);
       c.arrayNewFixed(this.strArrType, groupNames.length);
     }
+    if (this.hasLastIndex) c.f64Const(0); // lastIndex
     c.structNew(this.regexType);
     c.globalSet(g);
     c.end();
@@ -183,6 +193,29 @@ export class RegexBuilder {
     this.mb.setBody(idx, [], c.bytes());
 
     this.literals.set(key, idx);
+    return idx;
+  }
+
+  private freshFnIdx: number | null = null;
+
+  /** `%w.re.fresh(re)`: a NEW regex value sharing `re`'s immutable fields,
+   * its lastIndex 0 (board #301). A regex LITERAL evaluates to a fresh
+   * object every time in JS — observable now that lastIndex is state — so
+   * every literal evaluation copies its interned template through this
+   * (the compiled bytecode and texts stay shared; only the small struct
+   * is new). */
+  freshFn(): number {
+    if (this.freshFnIdx !== null) return this.freshFnIdx;
+    const idx = this.mb.declareFunc(this.mb.funcType([this.regexRef()], [this.regexRef()]), "%w.re.fresh");
+    this.freshFnIdx = idx;
+    const c = new Code();
+    for (let f = 0; f < 5; f++) {
+      c.localGet(0);
+      c.structGet(this.regexType, f);
+    }
+    c.f64Const(0);
+    c.structNew(this.regexType);
+    this.mb.setBody(idx, [], c.bytes());
     return idx;
   }
 
@@ -213,6 +246,7 @@ export class RegexBuilder {
       for (const name of groupNames) this.pushStrLit(c, name);
       c.arrayNewFixed(this.strArrType, groupNames.length);
     }
+    if (this.hasLastIndex) c.f64Const(0); // lastIndex
     c.structNew(this.regexType);
   }
 

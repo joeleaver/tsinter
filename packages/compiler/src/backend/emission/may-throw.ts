@@ -202,7 +202,7 @@ export function computeMayThrow(mod: IrModule): { fns: Set<string>; indirect: bo
           // access, "never throws," see emitGlobalRegexValueGuard's own
           // doc comment), which never touches the pending-exception
           // system this table feeds at all.
-          if (rec["method"] === "replaceAll" || rec["method"] === "split" || rec["method"] === "matchAll" || rec["method"] === "matchAllInto") {
+          if (rec["method"] === "replaceAll" || rec["method"] === "split" || rec["method"] === "splitLimit" || rec["method"] === "matchAll" || rec["method"] === "matchAllInto" || rec["method"] === "collectAll") {
             f.throws = true;
           }
           break;

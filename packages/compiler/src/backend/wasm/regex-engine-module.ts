@@ -52,7 +52,7 @@ export function resetRegexEngineModuleForTests(): void {
 function buildModule(): RegexEngineModule {
   const mb = new ModuleBuilder();
   const strT = mb.arrayType("i16", true);
-  const re = new RegexBuilder(mb, strT);
+  const re = new RegexBuilder(mb, strT, false);
   const interp = new RegexInterpreterBuilder(mb, strT, undefined, re.bcType);
   const rc = new RegexCompilerBuilder(mb, strT, re, () => interp.regexCanonicalize());
   const ref = (t: number): ValType => ({ kind: "ref", nullable: true, typeIndex: t });

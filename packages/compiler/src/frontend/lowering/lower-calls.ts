@@ -5284,10 +5284,13 @@ const inliningPredicates = new Set<ts.Symbol>();
     // (stream is undefined — the streamUndefCall precedent), so the body
     // is throw-only and the declared return type (ServerHttp2Stream,
     // unmappable) must not decide the ABI — void, the `never` stance.
+    // Board #301: a function replacer's ABI returns string whatever its
+    // body infers (an implicit-any capture parameter infers `any`).
     let ret =
-      ts.isArrowFunction(node) && !ts.isBlock(node.body) && isStreamUndefCallExpr(L, node.body)
+      L.lambdaRetOverrides.get(node) ??
+      (ts.isArrowFunction(node) && !ts.isBlock(node.body) && isStreamUndefCallExpr(L, node.body)
         ? VOID
-        : L.declaredReturnType(node, node);
+        : L.declaredReturnType(node, node));
     // A contextually-typed arrow/function EXPRESSION whose slot signature
     // returns a UNION the inferred return doesn't spell adopts the slot's
     // return as its ABI: `(n) => work()` (inferring Promise<void>) against

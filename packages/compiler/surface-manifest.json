@@ -190,15 +190,7 @@
       "name": "this regex feature",
       "status": "unsupported",
       "code": "SC1120",
-      "note": "supported: literal regexes with the g/i/m/s/u/y flags — .test(), .exec()/.match()/.matchAll(), named capture groups (.groups, $<name> templates, \\k<name>), .source/.flags, and string replace/replaceAll/split with string replacement templates"
-    },
-    {
-      "id": "diagnostic.sc1121",
-      "kind": "diagnostic-fence",
-      "name": "'.test()' on a regex with the 'g' or 'y' flag",
-      "status": "unsupported",
-      "code": "SC1121",
-      "note": "g/y regexes carry mutable lastIndex state between calls, which is not modeled; drop the flag for a plain match test, or use replace/replaceAll/split (their iteration is internal)"
+      "note": "supported: regexes with the g/i/m/s/u/y flags — .test()/.exec() (stateful through lastIndex with g/y), .match()/.matchAll()/.search(), replace/replaceAll with replacement templates or function replacers, split (with a limit), named capture groups (.groups, $<name> templates, \\k<name>), and .source/.flags/.lastIndex"
     },
     {
       "id": "diagnostic.sc2001",
@@ -2555,15 +2547,15 @@
       "id": "stdlib.string.replace",
       "kind": "stdlib",
       "name": "string.prototype.replace",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically with a string or regex pattern and a string template or function replacement"
     },
     {
       "id": "stdlib.string.replaceAll",
       "kind": "stdlib",
       "name": "string.prototype.replaceAll",
-      "status": "dynamic-only",
-      "code": "SC2012"
+      "status": "static",
+      "note": "compiles statically with a string or regex pattern and a string template or function replacement"
     },
     {
       "id": "stdlib.string.slice",

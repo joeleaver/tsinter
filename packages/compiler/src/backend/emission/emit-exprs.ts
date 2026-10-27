@@ -740,7 +740,10 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           E.internLiteral(e.pattern);
           E.internLiteral(flags);
         }
-        return E.newTemp(e.type, `scr_regex_retain(&${sym})`);
+        // A fresh object per EVALUATION (board #301: lastIndex is state) —
+        // except straight into a regex method (regexIntrinsic below), where
+        // the immortal stands for the fresh object itself.
+        return E.newTemp(e.type, E.regexLitDirect ? `scr_regex_retain(&${sym})` : `scr_regex_fresh(&${sym})`);
       }
       case "templateStrings": {
         // One immortal static string array per template SITE (the key);
@@ -757,30 +760,58 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
       }
       case "regexIntrinsic": {
         // Receiver and args are borrowed frame temps; string/array results
-        // come back +1 and join the frame via newTemp. replaceAll and split
-        // may THROW (catchable) — fallibleTemp emits the pending check.
-        const r = E.emitExpr(e.receiver);
-        const args = e.args.map((a) => E.emitExpr(a));
+        // come back +1 and join the frame via newTemp. replaceAll, the
+        // collectAll/matchAll family and split may THROW (catchable) —
+        // fallibleTemp emits the pending check. A regex LITERAL operand is
+        // its immortal static (regexLitDirect — board #301).
+        const operand = (a: IrExpr): Temp => {
+          if (a.kind !== "regexLit") return E.emitExpr(a);
+          E.regexLitDirect = true;
+          try {
+            return E.emitExpr(a);
+          } finally {
+            E.regexLitDirect = false;
+          }
+        };
+        const r = operand(e.receiver);
+        const args = e.args.map((a) => operand(a));
         const method = e.method;
+        const wrapRow = (call: string): Temp => {
+          // +1 string[] or NULL from the runtime; the `string[] | null`
+          // union wraps type-directedly, the process.envGet convention.
+          if (e.type.kind !== "union") throw new Error("emitter bug: match result not a union");
+          const def = E.unionsById.get(e.type.unionId);
+          const arrTag = def ? def.arms.findIndex((a) => a.kind === "array") : -1;
+          const nullTag = def ? def.arms.findIndex((a) => a.kind === "nullT") : -1;
+          if (arrTag < 0 || nullTag < 0) {
+            throw new Error("emitter bug: match union lacks its arms");
+          }
+          const m = E.newTemp(arrayOf(STRING), call);
+          E.moveTemp(m); // moves into the union box when present; NULL otherwise
+          const present = `scr_union_new_ref(${arrTag}, ${m.name}, &scr_arr_retain_v, &scr_arr_release_v, NULL)`;
+          const absent = E.unitInstanceRef(e.type.unionId, nullTag);
+          return E.newTemp(e.type, `${m.name} ? ${present} : ${absent}`);
+        };
         switch (method) {
           case "test":
             return E.newTemp(e.type, `scr_regex_test(${r.name}, ${args[0]!.name})`);
-          case "match": {
-            // +1 string[] or NULL from the runtime; the `string[] | null`
-            // union wraps type-directedly, the process.envGet convention.
-            if (e.type.kind !== "union") throw new Error("emitter bug: match result not a union");
-            const def = E.unionsById.get(e.type.unionId);
-            const arrTag = def ? def.arms.findIndex((a) => a.kind === "array") : -1;
-            const nullTag = def ? def.arms.findIndex((a) => a.kind === "nullT") : -1;
-            if (arrTag < 0 || nullTag < 0) {
-              throw new Error("emitter bug: match union lacks its arms");
-            }
-            const m = E.newTemp(arrayOf(STRING), `scr_regex_match(${r.name}, ${args[0]!.name})`);
-            E.moveTemp(m); // moves into the union box when present; NULL otherwise
-            const present = `scr_union_new_ref(${arrTag}, ${m.name}, &scr_arr_retain_v, &scr_arr_release_v, NULL)`;
-            const absent = E.unitInstanceRef(e.type.unionId, nullTag);
-            return E.newTemp(e.type, `${m.name} ? ${present} : ${absent}`);
-          }
+          case "match":
+            return wrapRow(`scr_regex_match(${r.name}, ${args[0]!.name})`);
+          case "matchInto":
+            return wrapRow(`scr_regex_match_into(${r.name}, ${args[0]!.name}, ${args[1]!.name})`);
+          case "exec":
+            return wrapRow(`scr_regex_exec(${r.name}, ${args[0]!.name})`);
+          case "execInto":
+            return wrapRow(`scr_regex_exec_into(${r.name}, ${args[0]!.name}, ${args[1]!.name})`);
+          case "lastIndex":
+            return E.newTemp(e.type, `scr_regex_last_index(${r.name})`);
+          case "setLastIndex":
+            E.line(`scr_regex_set_last_index(${r.name}, ${args[0]!.name});`);
+            return { name: "", type: e.type };
+          case "collect":
+            return E.newTemp(e.type, `scr_regex_collect(${r.name}, ${args[0]!.name}, ${args[1]!.name})`);
+          case "collectAll":
+            return E.fallibleTemp(e.type, `scr_regex_collect_all(${r.name}, ${args[0]!.name}, ${args[1]!.name})`);
           case "matchAll":
             // Every match drained eagerly into a fresh +1 string[][];
             // throws Node's TypeError on a non-global regex (catchable —
@@ -811,7 +842,16 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
               `scr_regex_replace_all(${r.name}, ${args[0]!.name}, ${args[1]!.name})`,
             );
           case "split":
-            return E.fallibleTemp(e.type, `scr_regex_split(${r.name}, ${args[0]!.name})`);
+            return E.newTemp(e.type, `scr_regex_split(${r.name}, ${args[0]!.name})`);
+          case "strReplace":
+            return E.newTemp(e.type, `scr_regex_str_replace(${r.name}, ${args[0]!.name}, ${args[1]!.name}, false)`);
+          case "strCollect":
+          case "strCollectAll":
+            return E.newTemp(e.type, `scr_regex_str_collect(${r.name}, ${args[0]!.name}, ${args[1]!.name}, ${method === "strCollectAll" ? "true" : "false"})`);
+          case "strReplaceAll":
+            return E.newTemp(e.type, `scr_regex_str_replace(${r.name}, ${args[0]!.name}, ${args[1]!.name}, true)`);
+          case "splitLimit":
+            return E.newTemp(e.type, `scr_regex_split_limit(${r.name}, ${args[0]!.name}, ${args[1]!.name})`);
           default: {
             const _exhaustive: never = method;
             void _exhaustive;
@@ -5998,7 +6038,7 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
           case "assert.shapeStr":
             return finish(`scr_assert_shape_str(${arg(0)}, ${arg(1)})`);
           case "assert.shapeRe":
-            return finish(`scr_assert_shape_re(${arg(0)}, ${arg(1)})`);
+            return finish(`scr_assert_shape_re(${arg(0)}, ${arg(1)}, ${arg(2)})`);
           case "assert.shapeEnd":
             return finish(`scr_assert_shape_end(${arg(0)}, ${arg(1)})`);
           case "assert.regexErrTest":

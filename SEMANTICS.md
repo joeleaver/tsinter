@@ -81,7 +81,9 @@ amendment in this file, which lives inside its own entry. That placement is PRE-
 (P6 simply followed it) and is left as-is here — relocating ~5,000 lines of content carries more
 risk than the reader problem it would solve — but a reader arriving at S003 looking for the
 class-wide value-path regex trap should search this file for "Amendment (increment 24" rather than
-assume this entry's own text above is the complete account.
+assume this entry's own text above is the complete account. **Board #301 retired both** (filed right
+after them: "Amendment (board #301)"): a regex value's lastIndex is modelled on every lane, and only
+`assert.throws`'s shape form still refuses a value-path g/y regex at run time.
 
 ## S004 — Node platform APIs are refused, not emulated
 
@@ -5285,6 +5287,31 @@ corpus program can pin it — the differential would fail by
 construction on the unguarded shape, S003's "cannot be differential-
 tested" case.
 
+**Amendment (board #301): function replacers are Node-exact; two
+readers keep this entry's "".** A FUNCTION replacer (`s.replace(re, fn)` /
+`replaceAll`) receives Node's `undefined` for a capture that did not
+participate whenever its parameter can hold it: a parameter LEFT
+UNANNOTATED (TypeScript types it `any`) is bound by the replacer's
+lowering to `string` when the capture always participates in a match —
+no alternation, zero-admitting quantifier or lookaround around it
+(`(_, c) => c.toUpperCase()` over `/-(\w)/`) — and to `string | undefined`
+otherwise (`(m, a, b) => b ?? "dflt"` over `/(a)(z)?/` answers Node's
+`dfltb`); a parameter annotated `string | undefined` or optional
+(`p?: string`) gets the same exact value, and a parameter past Node's
+arguments is `undefined`. A groups parameter annotated
+`{ [name: string]: string | undefined }` holds `undefined` for a group
+that did not participate (an unannotated one refuses by name — annotate
+it). What still reads "": a capture parameter the program ANNOTATES as
+plain `string` (its own claim that the capture is a string — this entry's
+stance; Node passes undefined there), a groups parameter annotated with
+`string` values, and an exec/match result's `.groups` read through its
+hidden companions (lower-regex.ts), the same projection as before. A
+replacer that reads `arguments` refuses by name (Node passes match,
+captures, offset, input and groups; the call through the replacer's own
+signature cannot). **Tested by:** corpus 2796 (the unannotated,
+`string | undefined`, optional and groups spellings, Node-exact) and the
+regex state fuzz (`string | undefined` captures).
+
 ## S065 — an invalid pattern: a regex literal refuses at compile time and `new RegExp` throws Node's catchable `SyntaxError` with V8's text *(every lane since follow-up unit D, below; the NATIVE lanes used to abort at first use)*
 
 Two axes, one entry (S055 is the precedent for a single entry carrying
@@ -5487,7 +5514,7 @@ equals the module it came from over the whole pool and 395,402 exec
 rows (`native-regex-engine.test.ts`), plain and under ASan + UBSan.
 Board #117 is closed by this unit.
 
-## S066 — `split()` with capture groups: the WASM tier SPLICES as Node does; the NATIVE lanes throw a `TypeError` *(per-lane split)*
+## S066 — `split()` with capture groups: the WASM tier SPLICES as Node does; the NATIVE lanes throw a `TypeError` *(per-lane split until board #301: every lane splices now — see its amendment)*
 
 On `"a1b".split(/(\d)/)`: Node answers `["a","1","b"]`; wasm answers
 the same, `["a","1","b"]` (Node-exact); the native lanes throw
@@ -5523,6 +5550,34 @@ comment block `1627-1637`) states the throw as an ALL-LANE contract,
 and it goes false the moment the WASM tier splices in P3, whether or
 not board #118 ever lands, so the repoint is tied to P3's own landing
 rather than to the native fix's timing.
+
+**Amendment (board #301): every lane splices — the per-lane split is
+over.** The native lanes' `split()` now splices capture values into the
+result like the wasm tier (nonparticipating slots "" per S064), so the
+TypeError arm above is retired and board #118 is closed. Both sides run
+the same algorithm (`backend/wasm/regex-state.ts`'s split, `scr_regex.c`'s
+`scr_regex_split_core`): Symbol.split with the limit argument (ToUint32;
+`split(re, limit)` lowers on every lane now), and the regex's own
+lastIndex untouched; a regex held in a VARIABLE splits on the wasm tier
+too (it used to refuse as `expr:regexIntrinsic:split`). The split POINTS
+follow V8's two paths, which differ under /u: its fast path SEARCHES from
+q with the regex itself (a match the search finds AT the end is no split
+point — the spec probes only q < size), stepping by code unit, so a
+zero-width match between the halves of a surrogate pair splits there
+(#269); its slow (spec) path probes per position, stepping whole code
+points, and never splits inside a pair. V8 takes the slow path when the
+regex is sticky, when the limit is present and not a non-negative Smi,
+or when lastIndex is not a non-negative Smi — every lane decides the same
+way BY VALUE: an integer in [0, 2^31-1] that is not -0 counts as a Smi
+(`"😀a😀".split(/\B/u)` → 2 pieces; with `lastIndex = -1`, or a limit of
+2^31, → 1, as in Node). THE RESIDUAL: V8 decides by REPRESENTATION, and
+holds some integer-valued numbers as heap numbers — one read from an
+array that also holds a non-integer, or produced by floating-point
+arithmetic — which send it down the slow path where this tier, seeing an
+integer, takes the fast one. Only a /u split with a zero-width match
+inside a surrogate pair can tell the paths apart. **Tested by:** corpus
+2795 (limits, capture splicing, `/$/`, the /u path pairs above) and the
+regex state fuzz, on all three lanes.
 
 ## S067 — `.flags`: the WASM tier renders Node's CANONICAL order; the NATIVE lanes render SOURCE order *(per-lane split until follow-up unit D: every lane renders canonical order now — the native arm is retired, see the unit D note below)*
 
@@ -5736,6 +5791,35 @@ these pins used a non-matching pair for three of the four and could not have cau
 above even though all four appeared to pass — and "F5 safe controls (INC-24 P6)" (the literal forms at all
 four sites, byte-exact, the pin that actually found that bug) — all `packages/compiler/test/wasm-emitter.
 test.ts`.
+
+**Amendment (board #301): lastIndex is MODELLED — the two amendments above are retired, except assert.throws's
+shape form.** Every regex value on every lane now carries `lastIndex` (the wasm lane's `%w.re.Regex` has a
+mutable f64 field; the native `ScrRegex` a `last_index`), and every method follows the spec's rules for it,
+one algorithm per method on each side (`backend/wasm/regex-state.ts`; `scr_regex.c`, held equal by
+`packages/compiler/test/regex-state-fuzz.test.ts`): RegExpBuiltinExec reads ToLength(lastIndex) on a global
+or sticky regex and stores the match end, or 0 on failure (`test`, `exec`, `match` without /g, `replace`'s
+non-global branch with /y); `match` with /g answers EVERY whole match (it used to be fenced as a different
+shape — it is the same `string[] | null`), resetting lastIndex to 0; `replace`/`replaceAll` with /g reset it
+to 0 and advance past empty matches by AdvanceStringIndex (/u included); `matchAll` drains the spec's clone,
+which starts at ToLength(lastIndex) and never writes the regex; `search` restores it; `split` uses a clone
+and leaves it alone. `re.lastIndex` reads and writes (`=`, `+=`, `-=`, `++`, `--`) lower on every lane, and
+the flag accessors (`global` … `unicodeSets`) read `.flags`. A regex LITERAL evaluates to a FRESH object
+every time, as in JS (the compiled program stays interned; the native emitters hand a literal that is the
+direct operand of a regex method its immortal static, which the runtime starts at lastIndex 0 — the
+object is unreachable afterwards). Board #302 (a sticky regex value reused in `replace` on the native lanes
+— a silent wrong answer) is closed by the same change. The P4 trap sites (test/exec/match/replace) and three
+of the four P6 sites (`assert.match`/`doesNotMatch`, `assert.throws`'s regex form, `assert.doesNotReject`'s
+regex form) now answer as Node does: Node runs each of them through RegExpPrototypeExec once. The SHAPE form
+(`assert.throws(fn, { message: re })`) KEEPS its wasm trap on a value-path g/y regex: on a failed comparison
+Node's Comparison constructor runs every regex key a SECOND time, in the expected object's key order,
+moving lastIndex again and changing the generated message ("Values have same structure but are not
+reference-equal" when the second run matches) — a single verdict cannot reproduce that. The native lanes,
+which used to test such a value statelessly from index 0 (a silent divergence on a reused g/y value),
+now abort there by name too (`scr_assert_shape_re`). **Tested by:** corpus 2795 and 2796 (c, llvm, wasm against Node); the regex state
+fuzz (`regex-state-fuzz.test.ts` — 400 generated rows by default, 2,500 measured, of operation sequences over
+one regex object, function replacers that run regexes included, on all three lanes against Node; a
+mutation dropping the failure-path lastIndex reset turns it red on each side); the wasm emitter pins that
+used to assert the P4/P6 traps now assert Node's stateful answers ("board #301 (was …)").
 
 ## S068 — `Math.random`: the same distribution on every lane, deliberately different SEQUENCES; the wasm tier draws once from a host seed *(per-lane split)*
 
@@ -7795,3 +7879,58 @@ none at 100, identical on every lane. The class-id brand was also broken
 by hand (a prototype compare again): the brands row went red. Broken
 once by hand (breakLength 128 for Node's 80; the native fence call
 removed): every group and the fence row went red.
+
+## S116 — regex results and values around the lastIndex model: `.index`/`.input` of a GLOBAL match() result and a global/sticky regex VALUE crossing into dynamically-typed code throw named Errors where Node answers; an exec/match result prints without its `index`/`input`/`groups` *(every lane)*
+
+Board #301 modelled lastIndex (S003's regex amendment). What it leaves:
+
+(a) **Companions, and the every-match array.** A match result is the
+honest `string[]` row (S064); its `.index`, `.input` and `.groups` live
+in hidden COMPANION locals of the binding it is assigned to
+(`frontend/lowering/lower-regex.ts`) — a binding every write of which is
+a direct `re.exec(s)` / `s.match(re)` call, or null, inside its declaring
+function (`while ((m = re.exec(s)) !== null) { m.index … }`, `const m =
+s.match(re); if (m) m.input`). Anywhere else (a result passed to a
+function, stored in a container, read in a closure) those reads keep
+their compile-time fence by name — a refusal, not a divergence. The refusal's
+hint says which rule the binding broke. A GLOBAL regex's `match()`
+answers the every-match array, which in Node has no `index` or `input`
+(they read `undefined`): when every write to the binding is a `match()`
+over a statically global regex, reading either refuses at compile time;
+when the shapes mix (a global and a non-global match, or a regex the
+compiler cannot see), reading either after a global match throws a named
+Error at run time ("'.index' of a global match() result (Node:
+undefined) is not supported …") — the one divergence here — instead of
+answering a number or a string the IR's `number`/`string` types cannot
+make undefined.
+
+(b) **A regex VALUE crossing into dynamically-typed code** (an `any`
+slot, an npm package call, a JS function's untyped parameter) is rebuilt
+there as a fresh engine RegExp from its source and flags
+(`islandRegexpOf`), where Node passes the same object — so lastIndex
+would neither cross nor come back. Since lastIndex is observable now, a
+crossing value that is global or sticky (whose methods move lastIndex on
+either side), or whose lastIndex is not 0, throws a named Error at the
+crossing ("passing a global or sticky RegExp value … into dynamically-
+typed code is not supported …"); a regex LITERAL crossing directly is a
+fresh object in Node too and crosses as before. A non-global,
+non-sticky value crosses with lastIndex 0 on both sides; only an
+explicit `lastIndex` WRITE on the engine side would then differ (the
+wasm island fences member writes on its RegExp — unit F1's amendment).
+
+(c) **Printing a match result.** `console.log(re.exec(s))` /
+`util.inspect` print the row's elements only — `[ 'a', 'a', '' ]` — where
+Node prints the array's own `index`, `input` and `groups` properties too
+(`[ 'a', 'a', undefined, index: 1, input: 'xay', groups: undefined ]`;
+the `''` is S064). PRE-EXISTING (it predates board #301 on every lane)
+and SILENT: recorded here when this unit measured it, and reported for
+its own fix — the row has no slot for the properties, so the fix is a
+representation question (the companions are per binding, not per
+value).
+
+**Tested by:** (a) the companion reads are exercised by corpus 2795 and
+the regex state fuzz on all three lanes; the global-match throw and (b)'s
+throw were measured by hand on wasm, c and llvm (the crossing:
+`const re = /a/g; re.lastIndex = 3; f(re)` with an untyped JS `f` —
+Node 3, every lane the named Error). (c) is measured, not pinned (a
+corpus program cannot pin a divergence it fails on by construction).

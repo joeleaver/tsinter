@@ -3981,24 +3981,24 @@ test("§4 must-not-trap: a non-g/y regex.new value on test(), called twice, is b
   expect(stdout.toString("utf8")).toBe("true true\n");
 });
 
-test("§4 covered-by-construction: a HAND-BUILT g/y regex.new value reaches match() and TRAPS — the SAME guard a regexLit-derived value already trips, now proven for the regex.new producer specifically (NOT a formality: a non-firing guard here would silently answer Node's FIRST match only, a DIFFERENT, WRONG value — 'abab'.match(/ab/g) is Node's own [\"ab\",\"ab\"], not a single match, so a silently-succeeding tier would need to visibly diverge, not coincidentally agree)", async () => {
+test("board #301 (was \u00a74's trap pin): a g/y regex.new value's match() is Node's every-match answer and leaves lastIndex 0; a sticky miss at 0 is null", async () => {
   const res = await buildWasm(
     "guard-covered.ts",
-    ['const re = new RegExp("ab", "gy");', 'console.log("before");', '"abab".match(re);', 'console.log("after");'].join("\n"),
+    "const re = new RegExp(\"ab\", \"gy\");\nconsole.log(JSON.stringify(\"abab\".match(re)), re.lastIndex);\nconsole.log(JSON.stringify(\"xab\".match(re)));",
   );
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  const { stdout } = await runWasmToTrap(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe("before\n");
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("[\"ab\",\"ab\"] 0\nnull\n");
 });
 
-test("§4 covered-by-construction, test() variant (2284's own method): a hand-built sticky-only regex.new value on test() TRAPS too, same guard, same producer-independence", async () => {
+test("board #301 (was \u00a74's test() trap pin): a sticky regex.new value's test() reads and writes lastIndex", async () => {
   const res = await buildWasm(
     "guard-covered-test.ts",
-    ['const re = new RegExp("ab", "y");', 'console.log("before");', 're.test("ab");', 'console.log("after");'].join("\n"),
+    "const re = new RegExp(\"ab\", \"y\");\nconsole.log(re.test(\"abab\"), re.lastIndex, re.test(\"abab\"), re.lastIndex, re.test(\"abab\"), re.lastIndex);",
   );
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  const { stdout } = await runWasmToTrap(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe("before\n");
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("true 2 true 4 false 0\n");
 });
 
 test("libCall:regex.new:unported-unicode-property — thrown at the call since unit E", async () => {
@@ -9041,25 +9041,14 @@ test("replace() stale-capture-reuse regression: duplicate-named-group global rep
   expect(stdout.toString("utf8")).toBe("[14] [9]\n");
 });
 
-test("split() with a non-literal pattern refuses under its own pre-existing name — proving the refuse path fires", async () => {
-  // split's own scoping (this pass's own findings entry): only a
-  // LITERAL regex receiver gets the sticky-forced-bytecode treatment —
-  // a regex flowing through a variable has no compile-time pattern
-  // text to re-assemble sticky, so it stays on split's OWN pre-
-  // existing refusal name rather than minting a new one (nothing in
-  // the corpus needs the non-literal shape; a future pass can widen
-  // this without renaming anything). Proven, not asserted: a real
-  // program that reaches this exact path.
+test("board #301: split() over a regex held in a variable (was a refusal) splits as Node does", async () => {
   const res = await buildWasm(
     "split-non-literal.ts",
-    ['function s(r: RegExp, str: string): string[] { return str.split(r); }', "console.log(s(/,/, 'a,b'));"].join(
-      "\n",
-    ),
+    "function s(r: RegExp, str: string): string[] { return str.split(r); }\nconsole.log(s(/,/, 'a,b'), s(/(,)/, 'a,b'));",
   );
-  expect(res.ok).toBe(false);
-  if (res.ok) return;
-  expect(res.diagnostics.map((d) => d.code)).toEqual(["SC3001"]);
-  expect(res.wasmSurvey).toContain("expr:regexIntrinsic:split");
+  if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("[ 'a', 'b' ] [ 'a', ',', 'b' ]\n");
 });
 
 /* Gate F1 (p3): expr:regexLit:invalid-pattern is minted at TWO
@@ -9349,39 +9338,34 @@ test("matchAllInto() non-global regex, through the for-of-over-matchAll desugar:
  * try/catch in the source and no stderr assertion (a bare trap prints no
  * scriptc message, exactly like every other S003-class trap here). */
 
-test("F1: match() on a global-flagged regex VALUE (no regex.new needed — an ordinary literal bound to a const) TRAPS instead of silently answering Node's FIRST match only", async () => {
+test("board #301 (was F1's trap pin): match() on a global regex value answers every match, lastIndex back to 0", async () => {
   const res = await buildWasm(
     "f1-match-global-value.ts",
-    ["const re = /ab/g;", 'console.log("before");', '"abab".match(re);', 'console.log("after");'].join("\n"),
+    "const re = /ab/g;\nre.lastIndex = 3;\nconsole.log(JSON.stringify(\"abab\".match(re)), re.lastIndex);",
   );
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  const { stdout } = await runWasmToTrap(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe("before\n");
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("[\"ab\",\"ab\"] 0\n");
 });
 
-test("F1b: test() on a global-flagged regex VALUE — the SAME pre-existing (P2) unfenced bug, the SAME shared guard, the SAME trap", async () => {
+test("board #301 (was F1b's trap pin): test() on a global regex value is stateful", async () => {
   const res = await buildWasm(
     "f1b-test-global-value.ts",
-    ["const re = /ab/g;", 'console.log("before");', 're.test("ab");', 'console.log("after");'].join("\n"),
+    "const re = /ab/g;\nconsole.log(re.test(\"ab\"), re.lastIndex, re.test(\"ab\"), re.lastIndex);",
   );
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  const { stdout } = await runWasmToTrap(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe("before\n");
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("true 2 false 0\n");
 });
 
-test("F1/F1b dynamic value: a genuinely DYNAMIC global regex (a function's own return, not even const-bound) TRAPS too — rev's own third measurement, the one that ruled out a compile-time-only fix", async () => {
+test("board #301 (was the dynamic-value trap pin): a function's own global regex value matches every occurrence", async () => {
   const res = await buildWasm(
     "f1-dynamic-value.ts",
-    [
-      "function mk(): RegExp { return /ab/g; }",
-      'console.log("before");',
-      '"abab".match(mk());',
-      'console.log("after");',
-    ].join("\n"),
+    "function mk(): RegExp { return /ab/g; }\nconsole.log(JSON.stringify(\"abab\".match(mk())));",
   );
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  const { stdout } = await runWasmToTrap(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe("before\n");
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("[\"ab\",\"ab\"]\n");
 });
 
 test("F1 hard constraint: a NON-global value regex (1574's own re() shape) still compiles and runs byte-exact — the fence must discriminate, not blanket-refuse every value receiver", async () => {
@@ -9523,44 +9507,44 @@ test("expr:regexIntrinsic:match:unexpected-arms fires at the defensive backstop 
  * "abab"/"aaa" shape that reads identically whether the defect exists or
  * not. */
 
-test("F5: match() on a sticky-ONLY (no global) value regex TRAPS — the corrected hole rev's own non-discriminating witness first missed", async () => {
+test("board #301 (was F5's match() trap pin): a sticky value's match() resumes at lastIndex", async () => {
   const res = await buildWasm(
     "f5-match-sticky.ts",
-    ["const re = /ab/y;", 'console.log("before");', '"ab".match(re);', 'console.log("after");'].join("\n"),
+    "const re = /ab/y;\nconsole.log(JSON.stringify(\"ab\".match(re)), JSON.stringify(\"ab\".match(re)));",
   );
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  const { stdout } = await runWasmToTrap(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe("before\n");
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("[\"ab\"] null\n");
 });
 
-test("F5: test() on a sticky-ONLY value regex TRAPS — the original finding", async () => {
+test("board #301 (was F5's test() trap pin): a sticky value's test() resumes at lastIndex", async () => {
   const res = await buildWasm(
     "f5-test-sticky.ts",
-    ["const re = /ab/y;", 'console.log("before");', 're.test("ab");', 'console.log("after");'].join("\n"),
+    "const re = /ab/y;\nconsole.log(re.test(\"ab\"), re.test(\"ab\"));",
   );
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  const { stdout } = await runWasmToTrap(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe("before\n");
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("true false\n");
 });
 
-test("F5: exec() on a sticky-ONLY value regex TRAPS — MEASURED with actual .exec() syntax, not inferred from match()'s own pin (exec lowers to match's IR node, but the source form is a different reaching path and must be proven separately)", async () => {
+test("board #301 (was F5's exec() trap pin): a sticky value's exec() resumes at lastIndex", async () => {
   const res = await buildWasm(
     "f5-exec-sticky.ts",
-    ["const re = /ab/y;", 'console.log("before");', 're.exec("ab");', 'console.log("after");'].join("\n"),
+    "const re = /ab/y;\nconsole.log(JSON.stringify(re.exec(\"ab\")), JSON.stringify(re.exec(\"ab\")));",
   );
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  const { stdout } = await runWasmToTrap(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe("before\n");
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("[\"ab\"] null\n");
 });
 
-test("F5: replace()'s own NON-GLOBAL branch on a sticky-ONLY value regex TRAPS — a THIRD site, not in the original gate verdict, found building this fix's own matrix", async () => {
+test("board #301 (was F5's replace() trap pin; board #302): a sticky value's non-global replace() resumes at lastIndex", async () => {
   const res = await buildWasm(
     "f5-replace-sticky.ts",
-    ["const re = /ab/y;", 'console.log("before");', '"abab".replace(re, "X");', 'console.log("after");'].join("\n"),
+    "const re = /ab/y;\nconsole.log(\"abab\".replace(re, \"X\"), \"abab\".replace(re, \"X\"), \"abab\".replace(re, \"X\"));",
   );
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  const { stdout } = await runWasmToTrap(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe("before\n");
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("Xab abX abab\n");
 });
 
 test("F5 safe controls: replace()'s GLOBAL branch is UNAFFECTED regardless of sticky (forces its own lastIndex=0 reset every call, matching Symbol.replace's own spec algorithm) — byte-exact against Node for both /gy and no-flags, repeated calls", async () => {
@@ -9639,39 +9623,24 @@ test("F5 hard constraint: a LITERAL sticky-only regex at replace()'s own non-glo
  * catches) — so reaching "after" is impossible unless the guard is
  * missing, and a trap can only mean the guard fired. */
 
-test("F5 (INC-24 P6): assert.match()/doesNotMatch() TRAPS for a sticky-ONLY value regex — ONE case handles both spellings (a compile-time negate literal), so this pin covers the shared guard site", async () => {
+test("board #301 (was the P6 assert.match() trap pin): assert.match/doesNotMatch run RegExpPrototypeExec \u2014 a sticky value's lastIndex moves, as in Node", async () => {
   const res = await buildWasm(
     "f5-assert-match-sticky.ts",
-    [
-      'import assert from "node:assert";',
-      "const re = /ab/y;", // matches "ab" at position 0 — absent the guard, succeeds silently
-      'console.log("before");',
-      'assert.match("ab", re);',
-      'console.log("after");',
-    ].join("\n"),
+    "import assert from \"node:assert\";\nconst re = /ab/y;\nassert.match(\"ab\", re);\nconsole.log(\"first ok\", re.lastIndex);\ntry { assert.match(\"ab\", re); console.log(\"second ok\"); } catch (e) { console.log(\"second\", (e as Error).name, re.lastIndex); }\ntry { assert.doesNotMatch(\"ab\", re); console.log(\"dnm ok\", re.lastIndex); } catch (e) { console.log(\"dnm\", (e as Error).name, re.lastIndex); }",
   );
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  const { stdout } = await runWasmToTrap(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe("before\n");
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("first ok 2\nsecond AssertionError 0\ndnm AssertionError 2\n");
 });
 
-test("F5 (INC-24 P6): assert.throws()'s regex form TRAPS for a sticky-ONLY value regex — regex is the FIRST arg here (assert.match's own is the second), a genuinely different reaching path", async () => {
+test("board #301 (was the P6 assert.throws() regex-form trap pin): the regex form is RegExpPrototypeExec over String(error), stateful for a sticky value", async () => {
   const res = await buildWasm(
     "f5-assert-throws-regex-sticky.ts",
-    [
-      'import assert from "node:assert";',
-      // /Error: boom/y matches String(error) = "Error: boom" AT POSITION
-      // 0 — absent the guard, assert.throws succeeds silently (no throw
-      // at all), reaching "after" cleanly.
-      "const re = /Error: boom/y;",
-      'console.log("before");',
-      'assert.throws(() => { throw new Error("boom"); }, re);',
-      'console.log("after");',
-    ].join("\n"),
+    "import assert from \"node:assert\";\nconst re = /Error: boom/y;\nassert.throws(() => { throw new Error(\"boom\"); }, re);\nconsole.log(\"first ok\", re.lastIndex);\ntry { assert.throws(() => { throw new Error(\"boom\"); }, re); console.log(\"second ok\"); } catch (e) { console.log(\"second\", (e as Error).name, re.lastIndex); }",
   );
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  const { stdout } = await runWasmToTrap(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe("before\n");
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("first ok 11\nsecond AssertionError 0\n");
 });
 
 test("F5 (INC-24 P6): assert.throws()'s shape form TRAPS for a sticky-ONLY value regex bound to a shape key's expected value — MEASURED directly that Node itself is stateful here too (the shape comparator's own regex.test(), same class), not inferred from the other three", async () => {
@@ -9696,34 +9665,14 @@ test("F5 (INC-24 P6): assert.throws()'s shape form TRAPS for a sticky-ONLY value
   expect(stdout.toString("utf8")).toBe("before\n");
 });
 
-test("F5 (INC-24 P6): assert.doesNotReject()'s regex form (assert.regexErrTest, a pure predicate) TRAPS for a sticky-ONLY value regex", async () => {
+test("board #301 (was the P6 assert.doesNotReject() trap pin): the regex predicate is RegExpPrototypeExec, stateful for a sticky value", async () => {
   const res = await buildWasm(
     "f5-assert-regexerrtest-sticky.ts",
-    [
-      'import assert from "node:assert";',
-      // Matching, so absent the guard doesNotReject would reach its own
-      // "Got unwanted rejection" arm — a CATCHABLE AssertionError, which
-      // this pin's own try/catch swallows (the callback here MUST throw
-      // to reach assert.regexErrTest's case at all, so EVERY no-guard
-      // outcome is some catchable exception — this wrapping is what
-      // makes "reaches after" mean "the guard is missing," not the bare
-      // trap-or-not check alone).
-      "const re = /Error: boom/y;",
-      "async function main(): Promise<void> {",
-      '  console.log("before");',
-      "  try {",
-      '    await assert.doesNotReject(async () => { throw new Error("boom"); }, re);',
-      "  } catch {",
-      '    console.log("caught (guard absent)");',
-      "  }",
-      '  console.log("after");',
-      "}",
-      "main();",
-    ].join("\n"),
+    "import assert from \"node:assert\";\nconst re = /Error: boom/y;\nasync function main(): Promise<void> {\n  for (let i = 0; i < 2; i++) {\n    try {\n      await assert.doesNotReject(async () => { throw new Error(\"boom\"); }, re);\n      console.log(i, \"resolved\");\n    } catch (e) {\n      console.log(i, (e as Error).name, (e as Error).message.split(\"\\n\")[0], re.lastIndex);\n    }\n  }\n}\nmain();",
   );
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  const { stdout } = await runWasmToTrap(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe("before\n");
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("0 AssertionError Got unwanted rejection. 11\n1 Error boom 0\n");
 });
 
 test("F5 safe controls (INC-24 P6): LITERAL sticky regexes at ALL FOUR new sites — assert.match, assert.throws's regex form, assert.throws's shape form, AND assert.doesNotReject's regex form (regexErrTest) — are UNGUARDED BY DESIGN and Node-exact, each spelled fresh at its own call site, matching the same literal-exclusion argument as the {test,exec,match,replace} pins above. (rev-24's own P6 gate, advisory 1: the first draft's title and this findings line both claimed all four sites while the body exercised only three — doesNotReject/regexErrTest, one of the two sites in emitter.ts's own dropsIsLiteral list, appeared zero times, and no corpus claim covers it either since no P6 claim passes a g/y regex to any assert. Fixed by adding the fourth block below, rev's own witness taken verbatim.)", async () => {
@@ -10001,12 +9950,12 @@ test("value-path-flag matrix completion: matchAllInto (the for-of-over-matchAll 
   );
 });
 
-test("value-path-flag matrix completion: match()'s own /gy cell traps too — BOTH failure axes present at once (shape: an all-matches array vs the single-match answer; statefulness: sticky's own lastIndex advance), confirming the shared guard fires regardless of which axis a caller happens to be thinking about", async () => {
+test("board #301 (was the /gy match() trap pin): both axes \u2014 the every-match shape AND sticky anchoring", async () => {
   const res = await buildWasm(
     "matrix-match-gy.ts",
-    ["const re = /ab/gy;", 'console.log("before");', '"abab".match(re);', 'console.log("after");'].join("\n"),
+    "const re = /ab/gy;\nconsole.log(JSON.stringify(\"abab\".match(re)), JSON.stringify(\"xabab\".match(re)), JSON.stringify(\"abxab\".match(re)));",
   );
   if (!res.ok) throw new Error(`refused: ${res.diagnostics[0]?.message}`);
-  const { stdout } = await runWasmToTrap(res.binaryPath);
-  expect(stdout.toString("utf8")).toBe("before\n");
+  const { stdout } = await runWasm(res.binaryPath);
+  expect(stdout.toString("utf8")).toBe("[\"ab\",\"ab\"] null [\"ab\"]\n");
 });

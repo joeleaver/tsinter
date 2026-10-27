@@ -244,6 +244,19 @@ export function generateSurfaceManifest(compilerVersion: string): SurfaceManifes
     }
   }
   for (const name of Object.keys(ISLAND_SURFACE.string)) {
+    if (name === "replace" || name === "replaceAll") {
+      // Board #301: static with a string pattern or a regex and a string
+      // template or function replacement (lower-regex.ts); only other
+      // replacement types still reach the island table under --dynamic.
+      add({
+        id: `stdlib.string.${name}`,
+        kind: "stdlib",
+        name: `string.prototype.${name}`,
+        status: "static",
+        note: "compiles statically with a string or regex pattern and a string template or function replacement",
+      });
+      continue;
+    }
     add({
       id: `stdlib.string.${name}`,
       kind: "stdlib",

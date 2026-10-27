@@ -5,12 +5,8 @@
  * Focus areas beside the differential corpus (which re-checks the
  * observable results against Node): the C-level contracts — RC accounting
  * of results, catchable throws through the exception cell (replaceAll
- * without /g, split with capture groups), the CESU-8 pattern re-encoding
+ * without /g), lastIndex (board #301), the CESU-8 pattern re-encoding
  * for non-/u astral patterns, and the UTF-16 buffer round-trip.
- *
- * Special mode: --crash-global-test calls test() on a /g regex and must
- * abort() after printing the statefulness fence message (checked by
- * regex.test.ts, like test_string.c's --crash-repeat).
  */
 #include "../src/scr_runtime.h"
 
@@ -265,22 +261,29 @@ static void test_split(void) {
   scr_str_release(s);
 
   s = S("a,b");
-  check(!scr_exc_pending(), "no pending exception before the capture fence");
-  ScrArr *r = scr_regex_split(s, &re_split_group);
-  check(r == NULL && scr_exc_pending(),
-        "split with capture groups throws catchably and returns NULL");
-  scr_exc_clear();
+  expect_split(s, &re_split_group, (const char *[]){"a", ",", "b"}, 3,
+               "split with capture groups splices them in (board #301, S066)");
+  scr_str_release(s);
+}
+
+/* lastIndex (board #301): a literal's fresh copy is stateful; the
+ * immortal itself stands for a fresh object at every call. */
+static void test_last_index(void) {
+  ScrStr *s = S("a");
+  ScrRegex *re = scr_regex_fresh(&re_a_g);
+  check(scr_regex_test(re, s) && scr_regex_last_index(re) == 1, "test: /a/g matches, lastIndex 1");
+  check(!scr_regex_test(re, s) && scr_regex_last_index(re) == 0, "test: /a/g misses from 1, lastIndex back to 0");
+  scr_regex_set_last_index(re, 0.5);
+  check(scr_regex_test(re, s), "test: lastIndex 0.5 is ToLength'd to 0");
+  scr_regex_release(re);
+  check(scr_regex_test(&re_a_g, s) && scr_regex_test(&re_a_g, s), "test: the immortal starts at 0 every call");
   scr_str_release(s);
 }
 
 int main(int argc, char **argv) {
-  if (argc > 1 && strcmp(argv[1], "--crash-global-test") == 0) {
-    ScrStr *s = S("aaa");
-    scr_regex_test(&re_a_g, s); /* must abort with the fence message */
-    fprintf(stderr, "UNREACHABLE: g-flagged test returned\n");
-    return 0;
-  }
-
+  (void)argc;
+  (void)argv;
+  test_last_index();
   test_test();
   test_source_flags();
   test_replace();

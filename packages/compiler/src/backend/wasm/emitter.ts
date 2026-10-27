@@ -237,6 +237,7 @@ import {
 import { StrBuilder } from "./strings.js";
 import { CasingBuilder } from "./casing.js";
 import { RegexBuilder } from "./regex-value.js";
+import { RegexStateBuilder } from "./regex-state.js";
 import { RegexInterpreterBuilder } from "./regex-interpreter.js";
 import { RegexCompilerBuilder } from "./regex-compiler.js";
 import { foldRegexLiteral, foldRegexNew } from "./regex-fold.js";
@@ -27793,6 +27794,8 @@ class Assembler {
         // back directly, S067's own register contract).
         const fnIdx = this.regex.regexLiteral(e.pattern, lit.flags, lit.bytes, lit.captureCount, lit.groupNames);
         code.call(fnIdx);
+        // A fresh object per evaluation (board #301): lastIndex is state.
+        code.call(this.regex.freshFn());
         return;
       }
 
@@ -27811,81 +27814,17 @@ class Assembler {
             code.structGet(this.regex.regexType, 1); // flags — already CANONICAL order, baked in at regexLiteral() time
             return;
           case "test": {
-            const regexRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.regexType };
-            const bcRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.bcType };
-            // Receiver evaluated ONCE into a local — it may be an
-            // arbitrary expression (a call, a property read); reading
-            // its bytecode/captureCount fields twice by re-walking it
-            // would re-run any side effect a second time.
-            const reLocal = this.acquireScratch(regexRefT);
+            // RegExp.prototype.test: RegExpBuiltinExec !== null (board
+            // #301 — a global or sticky regex reads and writes lastIndex).
+            const rs = this.regexState;
+            const reLocal = this.acquireScratch(rs.reT);
             this.walkExpr(e.receiver);
-            code.localSet(reLocal);
-            const bcLocal = this.acquireScratch(bcRefT);
+            code.localTee(reLocal);
+            this.walkExpr(e.args[0]!);
             code.localGet(reLocal);
-            code.structGet(this.regex.regexType, 2); // bytecode
-            code.localSet(bcLocal);
-            // GATE FIX F1b/F5 (INC-24 P4): a value-path regex carrying
-            // 'g' OR 'y' reaching .test() TRAPS here, before any exec()
-            // runs — see emitRegexValueFlagGuard's own doc comment
-            // (SEMANTICS.md S003 amendment) for the mechanism, the mask,
-            // and why a runtime check is required (no compile-time
-            // detection covers every shape).
-            this.emitRegexValueFlagGuard(code, bcLocal, LRE_FLAG_GLOBAL | LRE_FLAG_STICKY);
-            // newCaptureArray's own unit is 2*count i32 slots, sized to
-            // hold BOTH the real capture slots (captureCount, a struct
-            // field baked in at regexLiteral() time) AND the bounded-
-            // quantifier register family's slots, which share the same
-            // array but aren't a struct field — read back from the
-            // bytecode's own header byte instead (RE_HEADER_REGISTER_
-            // COUNT; wasm-regex-interpreter-exec.test.ts's own
-            // captureArrayCountFor established this exact ceil-div-2
-            // padding unit at the TS level; here it's the same
-            // arithmetic done in wasm since the receiver isn't a
-            // compile-time-known literal in general).
-            code.localGet(bcLocal);
-            code.i32Const(RE_HEADER_REGISTER_COUNT);
-            code.call(this.regexInterp.readU8());
-            code.i32Const(1);
-            code.i32Add();
-            code.i32Const(1);
-            code.i32ShrU();
-            code.localGet(reLocal);
-            code.structGet(this.regex.regexType, 3); // captureCount
-            code.i32Add();
-            this.releaseScratch(regexRefT, reLocal);
-            const countLocal = this.acquireScratch(I32);
-            code.localSet(countLocal);
-            code.localGet(bcLocal);
-            this.walkExpr(e.args[0]!); // subject
-            // startIndex is always 0 — now ACTIVELY GUARDED, not argued
-            // safe from a construction-path premise. GATE FIX F1b (INC-24
-            // P4): the ORIGINAL version of this comment argued "P2's only
-            // construction path for a RegExp value IS a literal, and
-            // regex.new stays refused, so no runtime value here can carry
-            // a stateful lastIndex a constant 0 would get wrong" — a hole
-            // rev caught by COMPILING the counterexample, not by
-            // reasoning about it: `const re = /ab/g; re.test("ab"),
-            // re.test("ab")` needs NO regex.new at all. An ORDINARY
-            // literal bound to a variable is ALREADY a value-path regex —
-            // SC1121's own fence (lower-containers.ts) only sees a
-            // LITERAL AT THE CALL SITE (ts.isRegularExpressionLiteral on
-            // the receiver expression), never what a variable's own
-            // initializer was. The premise was false from P2's first day,
-            // not something that would only break once P5 landed.
-            // emitGlobalRegexValueGuard (called above, right after bcLocal
-            // is read) now closes this for GLOBAL specifically — a
-            // value-path regex that turns out global throws before
-            // reaching this constant 0 at all. Sticky-only (non-global)
-            // value receivers are UNAFFECTED by that guard and still rely
-            // on the sticky bit's own bytecode-baked matching being
-            // correct for a single exec() at position 0 (verified at
-            // gate, out of this fix's own scope — SEMANTICS.md S068).
-            code.i32Const(0);
-            code.localGet(countLocal);
-            code.call(this.regexInterp.newCaptureArray());
-            this.releaseScratch(bcRefT, bcLocal);
-            this.releaseScratch(I32, countLocal);
-            code.call(this.regexInterp.exec()); // -> i32, 1/0 — already BOOL's own representation, no conversion needed
+            code.call(rs.capNew());
+            code.call(rs.bexec());
+            this.releaseScratch(rs.reT, reLocal);
             return;
           }
           case "search": {
@@ -27949,7 +27888,7 @@ class Assembler {
             this.releaseScratch(I32, countLocal);
             code.localGet(bcLocal);
             code.localGet(subjLocal); // the subject, already evaluated above
-            code.i32Const(0); // startIndex — always 0, same SC1121/regex.new-refused reasoning as "test"
+            code.i32Const(0); // startIndex 0 — Symbol.search execs from 0 (lastIndex saved and restored)
             code.localGet(capLocal);
             code.call(this.regexInterp.exec());
             this.releaseScratch(strRefT, subjLocal);
@@ -27966,703 +27905,67 @@ class Assembler {
             this.releaseScratch(capRefT, capLocal);
             return;
           }
-          case "split": {
-            // Node's own splitter clones the regex with 'y' forced on
-            // (js_regexp_Symbol_split, read directly) — sticky-anchored
-            // exec is what makes "the probe position IS the match start
-            // when it matches" hold, which the whole segment-building
-            // loop below depends on. This tier's regex values carry ONE
-            // compiled bytecode, matching their own literal's actual
-            // flags — there's no second, sticky-forced variant stored
-            // anywhere. SCOPED to literal receivers only (both actual
-            // claims, 1203/1483, pass a regex literal directly at every
-            // .split() call site, no exceptions — checked by reading
-            // both programs, not assumed): a literal's pattern text is
-            // available at compile time, so a FRESH, sticky-forced
-            // assembly can be built and interned right here, under the
-            // canonical flags with "y" added — the SAME public
-            // RegexBuilder.regexLiteral() API every other case already
-            // calls, not an engine edit. A non-literal pattern (e.g. a
-            // regex variable) refuses under split's own PRE-EXISTING
-            // bucket name — split simply doesn't open for that shape
-            // yet; nothing in the corpus needs it, and a future pass can
-            // widen this without renaming anything.
-            const patArg = e.args[0]!;
-            if (patArg.kind !== "regexLit") {
-              this.refuse("expr:regexIntrinsic:split", e.loc);
-              code.unreachable();
-              return;
-            }
-            // The literal compiled with /y FORCED regardless of its own,
-            // by the same one compiler as any literal; grammar disposition
-            // doesn't depend on sticky, so a refusal is the SAME
-            // regexLit-side key the pattern refuses under as a literal.
-            const unicode = patArg.flags.includes("u");
-            const asm = foldRegexLiteral(patArg.pattern, patArg.flags.includes("y") ? patArg.flags : patArg.flags + "y");
-            if (asm.kind === "refuse") {
-              this.refuse(`expr:regexLit:${asm.key}`, e.loc);
-              code.unreachable();
-              return;
-            }
-            const stickyFnIdx = this.regex.regexLiteral(patArg.pattern, asm.flags, asm.bytes, asm.captureCount, asm.groupNames);
-            // captureCount/registerCount are COMPILE-TIME known here
-            // (unlike test/search, whose receiver can be an arbitrary
-            // expression) — no runtime header read needed.
-            const registerCount = asm.bytes[RE_HEADER_REGISTER_COUNT]!;
-            const captureArrayCount = asm.captureCount + Math.ceil(registerCount / 2);
-            const captureCount = asm.captureCount;
-
-            const strRefT = this.strRef;
-            const bcRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.bcType };
-            const capRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regexInterp.capType };
-            const vecInfo = this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!;
-            const vecRefT = this.vecs.vecRef(vecInfo);
-
-            const subjLocal = this.acquireScratch(strRefT);
-            this.walkExpr(e.receiver); // the subject string
-            code.localSet(subjLocal);
-
-            const bcLocal = this.acquireScratch(bcRefT);
-            code.call(stickyFnIdx);
-            code.structGet(this.regex.regexType, 2); // bytecode
-            code.localSet(bcLocal);
-
-            const capLocal = this.acquireScratch(capRefT);
-            code.i32Const(captureArrayCount);
-            code.call(this.regexInterp.newCaptureArray());
-            code.localSet(capLocal);
-
-            const resultLocal = this.acquireScratch(vecRefT);
-            code.f64Const(0);
-            code.call(this.vecs.newLen(vecInfo));
-            code.localSet(resultLocal);
-
-            const sizeLocal = this.acquireScratch(I32);
-            code.localGet(subjLocal);
-            code.arrayLen();
-            code.localSet(sizeLocal);
-
-            const pLocal = this.acquireScratch(I32);
-            const qLocal = this.acquireScratch(I32);
-            code.i32Const(0);
-            code.localSet(pLocal);
-            code.i32Const(0);
-            code.localSet(qLocal);
-
-            // size === 0 (js_regexp_Symbol_split's own early branch): one
-            // exec at position 0 — a match means "no pieces at all", no
-            // match means "one empty piece".
-            code.localGet(sizeLocal);
-            code.i32Eqz();
-            code.ifVoid();
-            {
-              code.localGet(bcLocal);
-              code.localGet(subjLocal);
+          case "split":
+          case "splitLimit": {
+            // Symbol.split over any regex value (board #301: a regex held
+            // in a variable no longer refuses) — regex-state.ts's split,
+            // capture splicing included (S066). The regex's lastIndex is
+            // untouched (the spec splits with a clone).
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!);
+            if (e.method === "splitLimit") {
+              this.walkExpr(e.args[1]!); // the raw limit (ToUint32 in the helper)
+              code.i32Const(1);
+            } else {
+              code.f64Const(0);
               code.i32Const(0);
-              code.localGet(capLocal);
-              code.call(this.regexInterp.exec());
-              code.ifVoid();
-              // matched: result stays empty.
-              code.else_();
-              code.localGet(resultLocal);
-              this.pushStrLitInto(code, "");
-              code.call(this.vecs.pushOne(vecInfo));
-              code.end();
             }
-            code.else_();
-            {
-              // Main probe loop: while (q < size).
-              code.block();
-              code.loop();
-              code.localGet(qLocal);
-              code.localGet(sizeLocal);
-              code.i32GeS();
-              code.brIf(1); // q >= size: done
-              // FRESH captureOut every iteration: exec() does NOT reset
-              // untouched slots itself (newCaptureArray()'s own -1 fill
-              // is a ONE-TIME thing at creation, per its own doc
-              // comment — "captureOut is caller-owned") — a slot a
-              // PREVIOUS match set but this one's own taken branch
-              // never touches would otherwise leak forward. A REAL bug
-              // this session caught via a duplicate-named-group replace
-              // case (the SAME array-reuse shape split has here); no
-              // corpus split pattern happens to toggle a group's own
-              // participation across segments, so this exact instance
-              // was silent until traced deliberately. Board #291: the
-              // array allocated above is reset to that -1 state here
-              // rather than replaced — this loop probes once per POSITION,
-              // and the previous probe's slots were copied out already.
-              this.emitCaptureReset(code, capLocal);
-              code.localGet(bcLocal);
-              code.localGet(subjLocal);
-              code.localGet(qLocal);
-              code.localGet(capLocal);
-              code.call(this.regexInterp.exec());
-              code.ifVoid();
-              {
-                // Matched — sticky, so the match starts exactly at q.
-                // e = captureOut[1] (match end).
-                const eLocal = this.acquireScratch(I32);
-                code.localGet(capLocal);
-                code.i32Const(1);
-                code.arrayGet(this.regexInterp.capType);
-                code.localSet(eLocal);
-                code.localGet(eLocal);
-                code.localGet(pLocal);
-                code.i32Eq();
-                code.ifVoid();
-                {
-                  // A zero-length match right at the current segment's
-                  // own start: R4's own "zero-length-advance interaction"
-                  // shape (js_regexp_Symbol_split's own `e === p` check,
-                  // read directly) — treated as no-match, q advances.
-                  code.localGet(subjLocal);
-                  code.localGet(qLocal);
-                  code.i32Const(unicode ? 1 : 0);
-                  code.call(this.regexInterp.getChar());
-                  code.localSet(qLocal); // newIdx (getChar's own result order — see its doc comment)
-                  code.drop(); // discard the codePoint
-                }
-                code.else_();
-                {
-                  // Push subject[p, q) — the pre-match segment.
-                  code.localGet(resultLocal);
-                  code.localGet(subjLocal);
-                  code.localGet(pLocal);
-                  code.f64ConvertI32S();
-                  code.localGet(qLocal);
-                  code.f64ConvertI32S();
-                  code.call(this.strs.slice()); // F64 args, but p/q are always non-negative and in-bounds — the clamp is a no-op
-                  code.call(this.vecs.pushOne(vecInfo));
-                  code.localGet(eLocal);
-                  code.localSet(pLocal);
-                  // Splice user captures 1..captureCount-1 — S066. A
-                  // nonparticipating slot (start === -1) renders "" per
-                  // S064, exactly matching match's own convention.
-                  for (let gi = 1; gi < captureCount; gi++) {
-                    code.localGet(resultLocal);
-                    const startLocal = this.acquireScratch(I32);
-                    code.localGet(capLocal);
-                    code.i32Const(2 * gi);
-                    code.arrayGet(this.regexInterp.capType);
-                    code.localSet(startLocal);
-                    code.localGet(startLocal);
-                    code.i32Const(-1);
-                    code.i32Eq();
-                    code.ifResult(strRefT);
-                    this.pushStrLitInto(code, "");
-                    code.else_();
-                    code.localGet(subjLocal);
-                    code.localGet(startLocal);
-                    code.f64ConvertI32S();
-                    code.localGet(capLocal);
-                    code.i32Const(2 * gi + 1);
-                    code.arrayGet(this.regexInterp.capType);
-                    code.f64ConvertI32S();
-                    code.call(this.strs.slice());
-                    code.end();
-                    code.call(this.vecs.pushOne(vecInfo));
-                    this.releaseScratch(I32, startLocal);
-                  }
-                  code.localGet(pLocal);
-                  code.localSet(qLocal); // q = p
-                }
-                code.end(); // e === p ifVoid
-                this.releaseScratch(I32, eLocal);
-              }
-              code.else_();
-              {
-                // No match at q: advance ONE CODE UNIT, also under /u.
-                // Node's split (V8's RegExpPrototypeSplitBody) searches
-                // from q with the non-sticky regex, whose unanchored
-                // prelude steps by code unit (regexp-compiler.cc
-                // UnanchoredAdvance), so a zero-width match between the
-                // halves of a surrogate pair splits there:
-                // "a😀b".split(/\B/u) is ["a\ud83d", "\ude00b"] (#269).
-                // A STICKY receiver is not on that fast path (V8's
-                // RegExpSplit builtin hands it to the runtime's spec
-                // algorithm), which steps AdvanceStringIndex — a whole
-                // code point under /u: "a😀b".split(/\B/uy) is ["a😀b"].
-                // (Without /u getChar's step is that same one unit.)
-                if (unicode && !patArg.flags.includes("y")) {
-                  code.localGet(qLocal);
-                  code.i32Const(1);
-                  code.i32Add();
-                  code.localSet(qLocal);
-                } else {
-                  code.localGet(subjLocal);
-                  code.localGet(qLocal);
-                  code.i32Const(unicode ? 1 : 0);
-                  code.call(this.regexInterp.getChar());
-                  code.localSet(qLocal);
-                  code.drop();
-                }
-              }
-              code.end(); // matched ifVoid
-              code.br(0);
-              code.end(); // loop
-              code.end(); // block
-
-              // Trailing piece: subject[p, size).
-              code.localGet(resultLocal);
-              code.localGet(subjLocal);
-              code.localGet(pLocal);
-              code.f64ConvertI32S();
-              code.localGet(sizeLocal);
-              code.f64ConvertI32S();
-              code.call(this.strs.slice());
-              code.call(this.vecs.pushOne(vecInfo));
-            }
-            code.end(); // size === 0 ifVoid/else
-
-            code.localGet(resultLocal);
-            this.releaseScratch(strRefT, subjLocal);
-            this.releaseScratch(bcRefT, bcLocal);
-            this.releaseScratch(capRefT, capLocal);
-            this.releaseScratch(vecRefT, resultLocal);
-            this.releaseScratch(I32, sizeLocal);
-            this.releaseScratch(I32, pLocal);
-            this.releaseScratch(I32, qLocal);
+            code.call(this.regexState.split());
             return;
           }
           case "replace":
-          case "replaceAll": {
-            // The receiver is the SUBJECT (`str.replace(re, tpl)`); args
-            // are [regex, template] (SC1120 already fenced out function
-            // replacers and split's own limit argument at the frontend —
-            // args[1] is always a string, confirmed by reading lower-
-            // containers.ts directly). Unlike split, replace/replaceAll
-            // work over an ARBITRARY regex expression, not just a
-            // literal — there is no sticky-forced-bytecode need here,
-            // since a genuine SEARCH (not a sticky anchor) is exactly
-            // what the regex's own already-interned bytecode already
-            // does at each probe position (its own non-sticky prelude,
-            // P2's own discovery).
-            const strRefT = this.strRef;
-            const regexRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.regexType };
-            const bcRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.bcType };
-            const capRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regexInterp.capType };
-            const gnRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.strArrType };
-            const vecInfo = this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!;
-            const vecRefT = this.vecs.vecRef(vecInfo);
-
-            // JS evaluation order: receiver (subject), then args[0]
-            // (regex), then args[1] (template).
-            const subjLocal = this.acquireScratch(strRefT);
+          case "replaceAll":
+          case "collect":
+          case "collectAll": {
+            // Symbol.replace (regex-state.ts): a global regex starts from
+            // lastIndex 0 (and ends there); a sticky one reads and writes
+            // it. collect/collectAll are the function-replacer form's
+            // collection phase. JS order: subject, regex, then the
+            // template / positions array; replaceAll's non-global
+            // TypeError comes after every argument is evaluated.
+            const rs = this.regexState;
+            const isAll = e.method === "replaceAll" || e.method === "collectAll";
+            const isCollect = e.method === "collect" || e.method === "collectAll";
+            const thirdT = isCollect ? rs.numT : this.strRef;
+            const subjLocal = this.acquireScratch(this.strRef);
+            const reLocal = this.acquireScratch(rs.reT);
+            const thirdLocal = this.acquireScratch(thirdT);
             this.walkExpr(e.receiver);
             code.localSet(subjLocal);
-            const reLocal = this.acquireScratch(regexRefT);
             this.walkExpr(e.args[0]!);
             code.localSet(reLocal);
-            const templateLocal = this.acquireScratch(strRefT);
             this.walkExpr(e.args[1]!);
-            code.localSet(templateLocal);
-
-            const bcLocal = this.acquireScratch(bcRefT);
-            code.localGet(reLocal);
-            code.structGet(this.regex.regexType, 2); // bytecode
-            code.localSet(bcLocal);
-
-            // isGlobal/isUnicode: read straight from the bytecode's own
-            // header bits — no runtime .flags string search needed,
-            // since regexLiteral()'s own construction already baked
-            // both into the assembled header (flagsToBits, regex-
-            // assembler.ts).
-            const isGlobalLocal = this.acquireScratch(I32);
-            code.localGet(bcLocal);
-            code.i32Const(RE_HEADER_FLAGS);
-            code.call(this.regexInterp.readU16());
-            code.i32Const(LRE_FLAG_GLOBAL);
-            code.i32And();
-            code.localSet(isGlobalLocal);
-
-            if (e.method === "replaceAll") {
-              // Non-global regex passed to replaceAll: Node's exact
-              // TypeError (design §6.4's own byte-exact target,
-              // verified live against Node this session: TypeError,
-              // no .code property).
-              //
-              // openIf()/close() here, NOT the raw code.ifVoid()/code.
-              // end() this whole file's helper functions otherwise use:
-              // emitUnwind() -> brTo() computes its branch depth from
-              // this.fn.depth, which ONLY the open*/close wrappers keep
-              // synchronized with the actual nesting. A raw ifVoid here
-              // (a REAL bug this session caught: the exception cell got
-              // set correctly — the message printed byte-exact — but
-              // the branch landed one level too shallow, only exiting
-              // this if rather than reaching the try's own catch
-              // handler, so it fell through to the rest of this case
-              // and was reported UNCAUGHT at top level instead).
-              code.localGet(isGlobalLocal);
-              code.i32Eqz();
-              this.openIf();
-              this.emitSetCellErrorLit(
-                "%TypeError",
-                "TypeError",
-                "String.prototype.replaceAll called with a non-global RegExp argument",
-                null,
-              );
-              this.emitUnwind();
-              this.close();
+            code.localSet(thirdLocal);
+            if (isAll) {
+              this.emitRegexGlobalTypeError(reLocal, "String.prototype.replaceAll called with a non-global RegExp argument");
             }
-
-            if (e.method === "replace" && e.args[0]!.kind !== "regexLit") {
-              // GATE FIX F5 (INC-24 P4 fix round): plain replace()'s own
-              // NON-GLOBAL branch is ALSO stateful for a VALUE-path
-              // STICKY-only regex — measured, live: `const re = /ab/y;
-              // "abab".replace(re,"X")` called twice gives Node
-              // "Xab" then "abX" (the second call resumes from
-              // lastIndex=2, RegExpBuiltinExec's own `global || sticky`
-              // check engaging even though replace() itself never went
-              // global). This tier's own non-global branch always starts
-              // its one exec() at position 0 (below), matching Node's
-              // own no-flags answer exactly but silently wrong for
-              // sticky-only — confirmed on THIS tier before writing this
-              // guard: same program compiled clean, printed "Xab" twice.
-              // GLOBAL is UNAFFECTED and untouched here: replace()'s own
-              // global branch (this case's own loop, guarded by
-              // isGlobalLocal below) forces a fresh restart every call
-              // exactly like Symbol.replace's own spec algorithm does
-              // (measured safe: `/ab/gy` repeated replace() calls both
-              // give "XX", lastIndex resetting to 0 both times) — so this
-              // guard fires ONLY on the non-global path, checking STICKY
-              // alone (emitRegexValueFlagGuard's own mask parameter).
-              //
-              // LITERAL RECEIVERS ARE EXCLUDED — a REAL regression this
-              // fix round caught in its own first pass: unlike test()/
-              // match() (where SC1120/SC1121 fence a literal g/y receiver
-              // at COMPILE TIME, so their own runtime guard structurally
-              // never sees a literal), replace() has NO such frontend
-              // fence — 1201-regex-replace.ts's own line 19
-              // (`"bab".replace(/b/y, "X"), "abb".replace(/b/y, "X")`,
-              // TWO SEPARATE literal expressions) reached this guard
-              // unconditionally and TRAPPED, breaking an already-landed
-              // claim. A regex LITERAL is freshly constructed on EVERY
-              // evaluation (ES2015+ semantics — never cached/shared
-              // across evaluations the way ES5 sometimes did), so it can
-              // NEVER carry a stale nonzero lastIndex the way a VALUE
-              // bound to a variable (or returned from a function) can —
-              // the risk this guard exists for is specifically about
-              // REUSE, which only a value expression, not a fresh
-              // literal, can exhibit. Caught by running the FULL corpus
-              // after the fix, not assumed safe from the code's own
-              // shape — the same discipline that found F5 itself.
-              code.localGet(isGlobalLocal);
-              code.i32Eqz();
-              code.ifVoid();
-              this.emitRegexValueFlagGuard(code, bcLocal, LRE_FLAG_STICKY);
-              code.end();
-            }
-
-            // Normalized to EXACTLY 0 or 1, not the raw masked bit (LRE_
-            // FLAG_UNICODE = 1<<4 = 16) — a real bug this session caught:
-            // getChar()'s own internal "is this a surrogate pair" check
-            // composes IS_UNICODE with other 0/1 conditions via i32And
-            // (bitwise), and 16 AND 1 = 0 — passing the raw 16 silently
-            // made every astral-with-/u empty-match advance behave as if
-            // /u were ABSENT, splitting the pair (Node prints the whole
-            // astral char; wasm printed two lone-surrogate replacement
-            // chars instead). split's own isUnicode is a compile-time
-            // ternary (already exactly 0/1) and never hit this; only
-            // this RUNTIME bit-masked read needed the fix.
-            const isUnicodeLocal = this.acquireScratch(I32);
-            code.localGet(bcLocal);
-            code.i32Const(RE_HEADER_FLAGS);
-            code.call(this.regexInterp.readU16());
-            code.i32Const(LRE_FLAG_UNICODE);
-            code.i32And();
-            code.i32Const(0);
-            code.i32Ne();
-            code.localSet(isUnicodeLocal);
-
-            // captureArrayCount is a RUNTIME read here (unlike split,
-            // the regex isn't necessarily a literal) — same computation
-            // as "test"/"search" above.
-            const captureCountLocal = this.acquireScratch(I32);
-            code.localGet(reLocal);
-            code.structGet(this.regex.regexType, 3); // captureCount
-            code.localSet(captureCountLocal);
-            // The COUNT is fixed across every iteration (the regex's own
-            // capture/register shape doesn't change match to match) —
-            // stashed once. The ARRAY, though, must be re-created FRESH
-            // before every exec() call inside the loop below: exec()
-            // does not itself reset a slot it never touches, and
-            // newCaptureArray()'s own -1 fill only happens once, at
-            // creation ("captureOut is caller-owned", its own doc
-            // comment) — reusing one array across matches would leak a
-            // capture's stale value from an earlier match into a later
-            // one that doesn't set it (a real bug this session caught
-            // via a duplicate-named-group global replace: the second
-            // match's own $<n> read back the FIRST match's value).
-            const captureArrayCountLocal = this.acquireScratch(I32);
-            code.localGet(bcLocal);
-            code.i32Const(RE_HEADER_REGISTER_COUNT);
-            code.call(this.regexInterp.readU8());
-            code.i32Const(1);
-            code.i32Add();
-            code.i32Const(1);
-            code.i32ShrU();
-            code.localGet(captureCountLocal);
-            code.i32Add();
-            code.localSet(captureArrayCountLocal);
-            const capLocal = this.acquireScratch(capRefT);
-
-            const groupNamesLocal = this.acquireScratch(gnRefT);
-            code.localGet(reLocal);
-            code.structGet(this.regex.regexType, 4); // groupNames
-            code.localSet(groupNamesLocal);
-
-            const sizeLocal = this.acquireScratch(I32);
             code.localGet(subjLocal);
-            code.arrayLen();
-            code.localSet(sizeLocal);
-
-            const pieces = this.acquireScratch(vecRefT);
-            code.f64Const(0);
-            code.call(this.vecs.newLen(vecInfo));
-            code.localSet(pieces);
-
-            const posLocal = this.acquireScratch(I32);
-            const flushedLocal = this.acquireScratch(I32);
-            code.i32Const(0);
-            code.localSet(posLocal);
-            code.i32Const(0);
-            code.localSet(flushedLocal);
-            code.localGet(captureArrayCountLocal);
-            code.call(this.regexInterp.newCaptureArray());
-            code.localSet(capLocal);
-
-            // Match-collect-and-substitute loop (js_regexp_Symbol_
-            // replace, read directly — the two-phase collect-then-build
-            // structure collapses into one pass here since this tier's
-            // regex values have no lastIndex object to mutate, so each
-            // match is processed as it's found rather than buffered).
-            code.block();
-            code.loop();
-            {
-              // Defensive bound check (never fires for well-formed
-              // input; matches RegExpExec's own natural null-on-past-
-              // end behavior rather than trusting exec() with an
-              // out-of-range startIndex).
-              code.localGet(posLocal);
-              code.localGet(sizeLocal);
-              code.i32GtS();
-              code.brIf(1);
-
-              // A clean captureOut every iteration — see this local's own
-              // acquisition comment above for why carrying one match's
-              // slots into the next is wrong. Board #291: ONE array,
-              // allocated before the loop and reset to newCaptureArray's
-              // own all -1 state here (getSubstitution has consumed the
-              // previous match's slots by now), instead of a fresh array
-              // per match.
-              this.emitCaptureReset(code, capLocal);
-
-              code.localGet(bcLocal);
-              code.localGet(subjLocal);
-              code.localGet(posLocal);
-              code.localGet(capLocal);
-              code.call(this.regexInterp.exec());
-              code.i32Eqz();
-              code.brIf(1); // no match: done
-
-              const matchStartLocal = this.acquireScratch(I32);
-              const matchEndLocal = this.acquireScratch(I32);
-              code.localGet(capLocal);
-              code.i32Const(0);
-              code.arrayGet(this.regexInterp.capType);
-              code.localSet(matchStartLocal);
-              code.localGet(capLocal);
-              code.i32Const(1);
-              code.arrayGet(this.regexInterp.capType);
-              code.localSet(matchEndLocal);
-
-              // "ignore substitution if going backward" (the reference's
-              // own guard against a custom regexp object; always true
-              // for this tier's own exec(), kept for parity).
-              code.localGet(matchStartLocal);
-              code.localGet(flushedLocal);
-              code.i32GeS();
-              code.ifVoid();
-              {
-                // The unchanged span before this match — skipped when
-                // empty (adjacent matches): an empty piece adds nothing
-                // to the final join, only an allocation (board #291).
-                code.localGet(matchStartLocal);
-                code.localGet(flushedLocal);
-                code.i32GtS();
-                code.ifVoid();
-                code.localGet(pieces);
-                code.localGet(subjLocal);
-                code.localGet(flushedLocal);
-                code.f64ConvertI32S();
-                code.localGet(matchStartLocal);
-                code.f64ConvertI32S();
-                code.call(this.strs.slice());
-                code.call(this.vecs.pushOne(vecInfo));
-                code.end();
-
-                code.localGet(pieces);
-                code.localGet(subjLocal);
-                code.localGet(matchStartLocal);
-                code.localGet(matchEndLocal);
-                code.localGet(capLocal);
-                code.localGet(captureCountLocal);
-                code.localGet(groupNamesLocal);
-                code.localGet(templateLocal);
-                code.call(this.getSubstitutionHelper());
-                code.call(this.vecs.pushOne(vecInfo));
-
-                code.localGet(matchEndLocal);
-                code.localSet(flushedLocal);
-              }
-              code.end();
-
-              // Single match only for a plain (non-/g) replace.
-              code.localGet(isGlobalLocal);
-              code.i32Eqz();
-              code.brIf(1);
-
-              // Empty-match advance (§4.6): the next probe must move
-              // forward by at least one char/codepoint.
-              code.localGet(matchEndLocal);
-              code.localGet(matchStartLocal);
-              code.i32Eq();
-              code.ifVoid();
-              {
-                // string_advance_index's OWN guard (quickjs.c:46647-
-                // 46657, read directly), not just getChar() blindly: "if
-                // (!unicode || index >= p->len...) index++;" — ELSE
-                // combine. getChar() itself has no such guard (nothing
-                // in the regex MATCHER ever calls it at idx===len by
-                // construction), so calling it unconditionally here traps
-                // out-of-bounds the moment a global pattern's LAST match
-                // is an EMPTY match landing exactly at the subject's own
-                // end (e.g. "a<astral>b".replace(/(?:)/g,"-") — a real
-                // bug this session caught: 1204's own case, unexercised
-                // until deliberately probed since no other line in any
-                // claim has a pattern that can match empty at the string's
-                // end AND is global).
-                code.localGet(isUnicodeLocal);
-                code.i32Eqz();
-                code.localGet(matchEndLocal);
-                code.localGet(sizeLocal);
-                code.i32GeS();
-                code.i32Or();
-                code.ifVoid();
-                {
-                  code.localGet(matchEndLocal);
-                  code.i32Const(1);
-                  code.i32Add();
-                  code.localSet(posLocal);
-                }
-                code.else_();
-                {
-                  code.localGet(subjLocal);
-                  code.localGet(matchEndLocal);
-                  code.localGet(isUnicodeLocal);
-                  code.call(this.regexInterp.getChar());
-                  code.localSet(posLocal); // newIdx
-                  code.drop(); // codePoint, unused
-                }
-                code.end();
-              }
-              code.else_();
-              {
-                code.localGet(matchEndLocal);
-                code.localSet(posLocal);
-              }
-              code.end();
-              this.releaseScratch(I32, matchStartLocal);
-              this.releaseScratch(I32, matchEndLocal);
-            }
-            code.br(0);
-            code.end(); // loop
-            code.end(); // block
-
-            // Trailing unchanged suffix.
-            code.localGet(pieces);
-            code.localGet(subjLocal);
-            code.localGet(flushedLocal);
-            code.f64ConvertI32S();
-            code.localGet(sizeLocal);
-            code.f64ConvertI32S();
-            code.call(this.strs.slice());
-            code.call(this.vecs.pushOne(vecInfo));
-
-            code.localGet(pieces);
-            this.pushStrLitInto(code, "");
-            code.call(this.vecs.join(vecInfo, strRefT));
-
-            this.releaseScratch(strRefT, subjLocal);
-            this.releaseScratch(regexRefT, reLocal);
-            this.releaseScratch(strRefT, templateLocal);
-            this.releaseScratch(bcRefT, bcLocal);
-            this.releaseScratch(I32, isGlobalLocal);
-            this.releaseScratch(I32, isUnicodeLocal);
-            this.releaseScratch(I32, captureCountLocal);
-            this.releaseScratch(I32, captureArrayCountLocal);
-            this.releaseScratch(capRefT, capLocal);
-            this.releaseScratch(gnRefT, groupNamesLocal);
-            this.releaseScratch(I32, sizeLocal);
-            this.releaseScratch(vecRefT, pieces);
-            this.releaseScratch(I32, posLocal);
-            this.releaseScratch(I32, flushedLocal);
+            code.localGet(reLocal);
+            code.localGet(thirdLocal);
+            code.call(isCollect ? rs.collect() : rs.replace());
+            this.releaseScratch(this.strRef, subjLocal);
+            this.releaseScratch(rs.reT, reLocal);
+            this.releaseScratch(thirdT, thirdLocal);
             return;
           }
-          case "match": {
-            // s.match(re) / re.exec(s) (operands swapped at lowering,
-            // lower-containers.ts's own two sites, read directly — both
-            // construct the IDENTICAL final IR shape) — ruled: this
-            // tier's match serves the NON-GLOBAL exec-shaped form only
-            // (design §3, R1's own re-ruling, retracting the v2 draft's
-            // F9). A literal g/y receiver never reaches here — SC1120/
-            // SC1121 fence it at compile time before construction.
-            //
-            // GATE FIX F1/F5 (INC-24 P4, BLOCKING — TWO LIVE silent
-            // miscompiles, not the "unreachable this pass" disposition
-            // findings-p4-v1.txt entries 1-2 first gave it): a value-path
-            // regex carrying 'g' — no regex.new needed, an ORDINARY
-            // literal bound to a const already does it (`const re =
-            // /ab/g; "abab".match(re)`), and a genuinely DYNAMIC value
-            // does too (`function mk(): RegExp { return /ab/g; }
-            // "abab".match(mk())`, rev's own third measurement) — reached
-            // this case UNGUARDED, always exec()-ing from position 0 and
-            // silently answering Node's FIRST match only (`["ab"]` where
-            // Node answers `["ab","ab"]`), no diagnostic. rev caught it
-            // by COMPILING the two-line program the "unreachable"
-            // disposition only REASONED about — measure, don't reason.
-            // F5 (found building this fix's own value-path-flag matrix,
-            // NOT in rev's own gate verdict): 'y' ALONE, no global, is
-            // ALSO stateful here — `const re = /ab/y;
-            // "ab".match(re),"ab".match(re)` gives `["ab"],["ab"]`, Node
-            // `["ab"],null` (RegExpBuiltinExec consults lastIndex on
-            // `global || sticky`, not `global` alone). An EARLIER version
-            // of this comment (and of the S003 amendment) claimed sticky
-            // was safe for match, "the sticky bit's own matching is baked
-            // into the bytecode" — built on a NON-DISCRIMINATING witness
-            // (`/a/y` repeated on "aaa": "a" occurs at every offset, so
-            // the printed result looks the same whether or not lastIndex
-            // actually advances). A witness that matches EXACTLY ONCE in
-            // its own subject (`/ab/y` on "ab") exposes the real answer —
-            // measure, don't reason, now doubly binding on a REVIEW'S own
-            // witness too, not just on this pass's own first drafts.
-            // emitRegexValueFlagGuard (called below, right after bcLocal
-            // is read, mask GLOBAL|STICKY) closes both: either flag
-            // TRAPS (a bare unreachable, SEMANTICS.md's S003 amendment —
-            // NOT a throw, NOT a compile-time key; mechanism-attribution,
-            // rev's own sealed criterion) before exec() runs. One RUNTIME
-            // check covers the literal-bound, const-bound, AND dynamic
-            // shapes uniformly — no static/compile-time detection was
-            // ever needed.
-            //
-            // e.type is the PROGRAM-DEPENDENT `string[] | null` union
-            // (validate.ts's own REGEX_INTRINSIC_SIGS comment: "the
-            // regexIntrinsic case checks the union's arms") — arms are
-            // looked up rather than assumed to be exactly two, matching
-            // the stream.destroy err-param precedent (unionVal/nullTag/
-            // armSt all resolved before any emission, one refusal covers
-            // every unmappable case).
+          case "match":
+          case "matchInto":
+          case "exec":
+          case "execInto": {
+            // match: Symbol.match (every whole match for a global regex);
+            // exec: RegExpBuiltinExec's row. Both answer the
+            // `string[] | null` union; the *Into forms fill the positions
+            // companion (matchInto leaves it empty for the every-match form).
             if (e.type.kind !== "union") {
               this.refuse("expr:regexIntrinsic:match:non-union-result", e.loc);
               code.unreachable();
@@ -28679,325 +27982,91 @@ class Assembler {
               code.unreachable();
               return;
             }
-
-            const strRefT = this.strRef;
-            const regexRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.regexType };
-            const bcRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.bcType };
-            const capRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regexInterp.capType };
-            const rowVecInfo = this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!;
-
-            // eval-order stash-first: match's operand orientation is
-            // receiver=SUBJECT, args[0]=REGEX (both lowering sites
-            // agree). JS evaluates the subject first; the regex's own
-            // bytecode/captureCount are needed early to size captureOut,
-            // so the subject is stashed in its own local first and
-            // consumed later as exec()'s own operand (the P3 stash-first
-            // lesson, search's own precedent).
-            const subjLocal = this.acquireScratch(strRefT);
+            const rs = this.regexState;
+            const isExec = e.method === "exec" || e.method === "execInto";
+            const into = e.method === "matchInto" || e.method === "execInto";
+            const reLocal = this.acquireScratch(rs.reT);
+            const subjLocal = this.acquireScratch(this.strRef);
+            // JS order: match's receiver is the subject, exec's the regex.
             this.walkExpr(e.receiver);
-            code.localSet(subjLocal);
-            const reLocal = this.acquireScratch(regexRefT);
+            code.localSet(isExec ? reLocal : subjLocal);
             this.walkExpr(e.args[0]!);
-            code.localSet(reLocal);
-
-            const bcLocal = this.acquireScratch(bcRefT);
+            code.localSet(isExec ? subjLocal : reLocal);
             code.localGet(reLocal);
-            code.structGet(this.regex.regexType, 2); // bytecode
-            code.localSet(bcLocal);
-            // GATE FIX F1/F5 (INC-24 P4): see this case's own header comment.
-            this.emitRegexValueFlagGuard(code, bcLocal, LRE_FLAG_GLOBAL | LRE_FLAG_STICKY);
-
-            const captureCountLocal = this.acquireScratch(I32);
-            code.localGet(reLocal);
-            code.structGet(this.regex.regexType, 3); // captureCount
-            code.localSet(captureCountLocal);
-            this.releaseScratch(regexRefT, reLocal);
-
-            const captureArrayCountLocal = this.acquireScratch(I32);
-            code.localGet(bcLocal);
-            code.i32Const(RE_HEADER_REGISTER_COUNT);
-            code.call(this.regexInterp.readU8());
-            code.i32Const(1);
-            code.i32Add();
-            code.i32Const(1);
-            code.i32ShrU();
-            code.localGet(captureCountLocal);
-            code.i32Add();
-            code.localSet(captureArrayCountLocal);
-
-            const capLocal = this.acquireScratch(capRefT);
-            code.localGet(captureArrayCountLocal);
-            code.call(this.regexInterp.newCaptureArray());
-            code.localSet(capLocal);
-            this.releaseScratch(I32, captureArrayCountLocal);
-
-            code.localGet(bcLocal);
             code.localGet(subjLocal);
-            code.i32Const(0); // startIndex — always 0; the guard above already threw if global
-            code.localGet(capLocal);
-            code.call(this.regexInterp.exec());
-            this.releaseScratch(bcRefT, bcLocal);
-
+            if (into) this.walkExpr(e.args[1]!);
+            else code.refNull(rs.numT.kind === "ref" ? rs.numT.typeIndex : 0);
+            code.call(isExec ? rs.exec() : rs.match());
+            this.releaseScratch(rs.reT, reLocal);
+            this.releaseScratch(this.strRef, subjLocal);
+            const rowLocal = this.acquireScratch(rs.rowT);
+            code.localTee(rowLocal);
+            code.refIsNull();
             code.ifResult(unionVal);
-            {
-              const matchStartLocal = this.acquireScratch(I32);
-              const matchEndLocal = this.acquireScratch(I32);
-              code.localGet(capLocal);
-              code.i32Const(0);
-              code.arrayGet(this.regexInterp.capType);
-              code.localSet(matchStartLocal);
-              code.localGet(capLocal);
-              code.i32Const(1);
-              code.arrayGet(this.regexInterp.capType);
-              code.localSet(matchEndLocal);
-
-              code.i32Const(arrTag);
-              this.emitMatchRow(code, rowVecInfo, strRefT, subjLocal, capLocal, captureCountLocal, matchStartLocal, matchEndLocal);
-              code.structNew(arrSt);
-
-              this.releaseScratch(I32, matchStartLocal);
-              this.releaseScratch(I32, matchEndLocal);
-            }
+            code.globalGet(this.unions.unitGlobal(nullTag));
             code.else_();
-            {
-              code.globalGet(this.unions.unitGlobal(nullTag));
-            }
+            code.i32Const(arrTag);
+            code.localGet(rowLocal);
+            code.structNew(arrSt);
             code.end();
-
-            this.releaseScratch(strRefT, subjLocal);
-            this.releaseScratch(capRefT, capLocal);
-            this.releaseScratch(I32, captureCountLocal);
+            this.releaseScratch(rs.rowT, rowLocal);
             return;
           }
           case "matchAll":
           case "matchAllInto": {
-            // s.matchAll(re) — the every-match iterator drained EAGERLY
-            // into a string[][] (lazy vs eager is unobservable here:
-            // strings are immutable, design's own note). matchAllInto
-            // shares the SAME drain — it additionally writes each
-            // match's own start index into args[1], the hidden companion
-            // array the for-of-over-matchAll desugar pre-declares
-            // (lower-stmts.ts's own lowerForOfMatchAll, read directly).
-            //
-            // BOTH methods require a global regex — Node's exact
-            // TypeError (measured live against Node this session, F2):
-            // the SAME message for both, since matchAllInto is just the
-            // desugared path through the identical spec algorithm.
-            const strRefT = this.strRef;
-            const regexRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.regexType };
-            const bcRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.bcType };
-            const capRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regexInterp.capType };
-            const rowVecInfo = this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!;
-            const rowsVecInfo = this.vecInfoFor(arrayOf(arrayOf(STRING)) as IrType & { kind: "array" }, undefined)!;
-            const rowsVecRefT = this.vecs.vecRef(rowsVecInfo);
-
-            // JS eval order: receiver (subject), then args[0] (regex),
-            // then args[1] (idxs, matchAllInto only — a frontend-hidden
-            // local already holding [], so walking it now vs later is
-            // unobservable, but reading args in declared order keeps the
-            // convention uniform with every other case here).
-            const subjLocal = this.acquireScratch(strRefT);
+            // The every-match drain, EAGER (unobservable: strings are
+            // immutable and the spec drains a clone). Board #301: the
+            // clone starts at the regex's lastIndex, which it never
+            // writes. A non-global regex throws Node's TypeError.
+            const rs = this.regexState;
+            const subjLocal = this.acquireScratch(this.strRef);
+            const reLocal = this.acquireScratch(rs.reT);
+            const idxLocal = this.acquireScratch(rs.numT);
             this.walkExpr(e.receiver);
             code.localSet(subjLocal);
-            const reLocal = this.acquireScratch(regexRefT);
             this.walkExpr(e.args[0]!);
             code.localSet(reLocal);
-            let idxsLocal = -1;
-            let idxsVecInfo: VecInfo | null = null;
             if (e.method === "matchAllInto") {
-              idxsVecInfo = this.vecInfoFor(arrayOf({ kind: "f64" } as IrType) as IrType & { kind: "array" }, undefined)!;
-              idxsLocal = this.acquireScratch(this.vecs.vecRef(idxsVecInfo));
               this.walkExpr(e.args[1]!);
-              code.localSet(idxsLocal);
+              code.localSet(idxLocal);
+            } else {
+              code.refNull(rs.numT.kind === "ref" ? rs.numT.typeIndex : 0);
+              code.localSet(idxLocal);
             }
-
-            const bcLocal = this.acquireScratch(bcRefT);
-            code.localGet(reLocal);
-            code.structGet(this.regex.regexType, 2); // bytecode
-            code.localSet(bcLocal);
-
-            // isGlobal — same header-bit read as replaceAll's own fence.
-            const isGlobalLocal = this.acquireScratch(I32);
-            code.localGet(bcLocal);
-            code.i32Const(RE_HEADER_FLAGS);
-            code.call(this.regexInterp.readU16());
-            code.i32Const(LRE_FLAG_GLOBAL);
-            code.i32And();
-            code.localSet(isGlobalLocal);
-
-            // openIf()/close(), not raw ifVoid/end — see the depth-desync
-            // convention note at those wrappers' own definitions.
-            code.localGet(isGlobalLocal);
-            code.i32Eqz();
-            this.openIf();
-            this.emitSetCellErrorLit(
-              "%TypeError",
-              "TypeError",
-              "String.prototype.matchAll called with a non-global RegExp argument",
-              null,
-            );
-            this.emitUnwind();
-            this.close();
-            this.releaseScratch(I32, isGlobalLocal);
-
-            // Normalized to exactly 0/1 — replaceAll's own BUG 4b fix
-            // (the raw masked bit breaks getChar()'s internal i32And).
-            const isUnicodeLocal = this.acquireScratch(I32);
-            code.localGet(bcLocal);
-            code.i32Const(RE_HEADER_FLAGS);
-            code.call(this.regexInterp.readU16());
-            code.i32Const(LRE_FLAG_UNICODE);
-            code.i32And();
-            code.i32Const(0);
-            code.i32Ne();
-            code.localSet(isUnicodeLocal);
-
-            const captureCountLocal = this.acquireScratch(I32);
-            code.localGet(reLocal);
-            code.structGet(this.regex.regexType, 3); // captureCount
-            code.localSet(captureCountLocal);
-            this.releaseScratch(regexRefT, reLocal);
-
-            const captureArrayCountLocal = this.acquireScratch(I32);
-            code.localGet(bcLocal);
-            code.i32Const(RE_HEADER_REGISTER_COUNT);
-            code.call(this.regexInterp.readU8());
-            code.i32Const(1);
-            code.i32Add();
-            code.i32Const(1);
-            code.i32ShrU();
-            code.localGet(captureCountLocal);
-            code.i32Add();
-            code.localSet(captureArrayCountLocal);
-            const capLocal = this.acquireScratch(capRefT);
-
-            const sizeLocal = this.acquireScratch(I32);
+            this.emitRegexGlobalTypeError(reLocal, "String.prototype.matchAll called with a non-global RegExp argument");
             code.localGet(subjLocal);
-            code.arrayLen();
-            code.localSet(sizeLocal);
-
-            const rowsLocal = this.acquireScratch(rowsVecRefT);
-            code.f64Const(0);
-            code.call(this.vecs.newLen(rowsVecInfo));
-            code.localSet(rowsLocal);
-
-            const posLocal = this.acquireScratch(I32);
-            code.i32Const(0);
-            code.localSet(posLocal);
-            code.localGet(captureArrayCountLocal);
-            code.call(this.regexInterp.newCaptureArray());
-            code.localSet(capLocal);
-
-            // Drain loop — replaceAll's own probe/advance structure
-            // (js_regexp_Symbol_replace's g-branch), minus the
-            // substitution-building half: every match becomes one row,
-            // and the loop never takes a single-shot exit (the TypeError
-            // fence above already guarantees global).
-            code.block();
-            code.loop();
-            {
-              code.localGet(posLocal);
-              code.localGet(sizeLocal);
-              code.i32GtS();
-              code.brIf(1);
-
-              // A clean captureOut every iteration — see split's/replace's
-              // own acquisition comment for why carrying one match's
-              // slots into the next is wrong (the stale-capture-reuse
-              // bug). ONE array, allocated before the loop and reset here
-              // (emitMatchRow has copied the previous match out by now;
-              // board #291).
-              this.emitCaptureReset(code, capLocal);
-
-              code.localGet(bcLocal);
-              code.localGet(subjLocal);
-              code.localGet(posLocal);
-              code.localGet(capLocal);
-              code.call(this.regexInterp.exec());
-              code.i32Eqz();
-              code.brIf(1); // no match: done
-
-              const matchStartLocal = this.acquireScratch(I32);
-              const matchEndLocal = this.acquireScratch(I32);
-              code.localGet(capLocal);
-              code.i32Const(0);
-              code.arrayGet(this.regexInterp.capType);
-              code.localSet(matchStartLocal);
-              code.localGet(capLocal);
-              code.i32Const(1);
-              code.arrayGet(this.regexInterp.capType);
-              code.localSet(matchEndLocal);
-
-              code.localGet(rowsLocal);
-              this.emitMatchRow(code, rowVecInfo, strRefT, subjLocal, capLocal, captureCountLocal, matchStartLocal, matchEndLocal);
-              code.call(this.vecs.pushOne(rowsVecInfo));
-
-              if (e.method === "matchAllInto") {
-                code.localGet(idxsLocal);
-                code.localGet(matchStartLocal);
-                code.f64ConvertI32S();
-                code.call(this.vecs.pushOne(idxsVecInfo!));
-              }
-
-              // Empty-match advance — string_advance_index's own guard,
-              // exactly replaceAll's tail (BUG 4a's own fix): getChar()
-              // unconditionally at idx===len traps.
-              code.localGet(matchEndLocal);
-              code.localGet(matchStartLocal);
-              code.i32Eq();
-              code.ifVoid();
-              {
-                code.localGet(isUnicodeLocal);
-                code.i32Eqz();
-                code.localGet(matchEndLocal);
-                code.localGet(sizeLocal);
-                code.i32GeS();
-                code.i32Or();
-                code.ifVoid();
-                {
-                  code.localGet(matchEndLocal);
-                  code.i32Const(1);
-                  code.i32Add();
-                  code.localSet(posLocal);
-                }
-                code.else_();
-                {
-                  code.localGet(subjLocal);
-                  code.localGet(matchEndLocal);
-                  code.localGet(isUnicodeLocal);
-                  code.call(this.regexInterp.getChar());
-                  code.localSet(posLocal); // newIdx
-                  code.drop(); // codePoint, unused
-                }
-                code.end();
-              }
-              code.else_();
-              {
-                code.localGet(matchEndLocal);
-                code.localSet(posLocal);
-              }
-              code.end();
-              this.releaseScratch(I32, matchStartLocal);
-              this.releaseScratch(I32, matchEndLocal);
-            }
-            code.br(0);
-            code.end(); // loop
-            code.end(); // block
-
-            code.localGet(rowsLocal);
-            this.releaseScratch(strRefT, subjLocal);
-            this.releaseScratch(bcRefT, bcLocal);
-            this.releaseScratch(capRefT, capLocal);
-            this.releaseScratch(I32, captureCountLocal);
-            this.releaseScratch(I32, isUnicodeLocal);
-            this.releaseScratch(I32, sizeLocal);
-            this.releaseScratch(I32, posLocal);
-            this.releaseScratch(rowsVecRefT, rowsLocal);
-            if (e.method === "matchAllInto") {
-              this.releaseScratch(this.vecs.vecRef(idxsVecInfo!), idxsLocal);
-            }
+            code.localGet(reLocal);
+            code.localGet(idxLocal);
+            code.call(rs.matchAll());
+            this.releaseScratch(this.strRef, subjLocal);
+            this.releaseScratch(rs.reT, reLocal);
+            this.releaseScratch(rs.numT, idxLocal);
             return;
           }
+          case "lastIndex":
+            this.walkExpr(e.receiver);
+            code.structGet(this.regex.regexType, 5);
+            return;
+          case "strReplace":
+          case "strReplaceAll":
+            // A STRING pattern with a template (board #301).
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!);
+            this.walkExpr(e.args[1]!);
+            code.call(this.regexState.strReplace(e.method === "strReplaceAll"));
+            return;
+          case "strCollect":
+          case "strCollectAll":
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!);
+            this.walkExpr(e.args[1]!);
+            code.call(this.regexState.strCollect(e.method === "strCollectAll"));
+            return;
+          case "setLastIndex":
+            this.walkExpr(e.receiver);
+            this.walkExpr(e.args[0]!);
+            code.structSet(this.regex.regexType, 5);
+            return;
           default: {
             // Every IrRegexIntrinsicMethod member has a case above (3
             // real, 7 refused) — this switch is PROVABLY exhaustive (TS
@@ -30992,6 +30061,32 @@ class Assembler {
     return this.regexInterpField;
   }
 
+  private regexStateField: RegexStateBuilder | null = null;
+
+  /** Board #301: the stateful regex methods (regex-state.ts). */
+  private get regexState(): RegexStateBuilder {
+    if (this.regexStateField === null) {
+      const rowVec = this.vecInfoFor(arrayOf(STRING) as IrType & { kind: "array" }, undefined)!;
+      const rowsVec = this.vecInfoFor(arrayOf(arrayOf(STRING)) as IrType & { kind: "array" }, undefined)!;
+      const numVec = this.vecInfoFor(arrayOf(IR_F64) as IrType & { kind: "array" }, undefined)!;
+      this.regexStateField = new RegexStateBuilder({
+        mb: this.mb,
+        strT: this.strType,
+        re: this.regex,
+        interp: this.regexInterp,
+        vecs: this.vecs,
+        rowVec,
+        rowsVec,
+        numVec,
+        slice: () => this.strs.slice(),
+        join: () => this.vecs.join(rowVec, this.strRef),
+        getSubstitution: () => this.getSubstitutionHelper(),
+        indexOf: () => this.strs.indexOf(),
+      });
+    }
+    return this.regexStateField;
+  }
+
   private regexCompilerField: RegexCompilerBuilder | null = null;
 
   /** Unit P1: the run-time RegExp compiler (regex-compiler.ts), built only
@@ -31069,80 +30164,19 @@ class Assembler {
    * group. Literal fallback for `$<...>` is ONLY for a pattern with NO
    * named groups at all (groupNames itself null) or an UNTERMINATED
    * $<name (no closing >) — never for a merely-unknown name. */
-  /** Runtime fence for a regex VALUE carrying a flag that makes lastIndex
-   * STATEFUL reaching a method whose own spec algorithm consults it —
-   * SC1120/SC1121 (lower-containers.ts) only see a LITERAL receiver's own
-   * syntax at the call site (ts.isRegularExpressionLiteral-gated); a
-   * value flowing through a variable was UNCHECKED, silently reusing a
-   * constant startIndex-0 every call where Node tracks lastIndex
-   * statefully. GATE FIX F1/F1b/F5 (INC-24 P4) — THREE LIVE silent
-   * miscompiles, each caught by COMPILING a counterexample, never by
-   * reasoning about construction paths or trusting a non-discriminating
-   * witness (the class of error this project's own "measure, don't
-   * reason" rule exists for, doubly so once a review's OWN witness turns
-   * out non-discriminating):
-   *   `const re = /ab/g; "abab".match(re)` -> `["ab"]`, Node `["ab","ab"]`
-   *   `const re = /ab/g; re.test("ab"),re.test("ab")` -> `true true`, Node `true false`
-   *   `function mk() { return /ab/g; } "abab".match(mk())` -> the SAME wrong
-   *     answer, a genuinely DYNAMIC value, not even const-bound
-   *   `const re = /ab/y; "ab".match(re),"ab".match(re)` -> `["ab"],["ab"]`,
-   *     Node `["ab"],null` (F5 — sticky ALONE, no global, is ALSO stateful;
-   *     RegExpBuiltinExec checks `global || sticky`, not `global` alone)
-   * None need regex.new: an ORDINARY literal reachable through ANY value
-   * path already builds every counterexample. A compile-time (const-fold)
-   * fence would fix only the const-bound shapes and leave the dynamic one
-   * silently wrong — this check reads the RUNTIME header flags uniformly,
-   * covering every construction shape by one mechanism, no static
-   * detection needed.
-   *
-   * MASK IS METHOD-SPECIFIC, not one constant — the single-exec group
-   * {test, exec, match} (exec lowers to match's own IR node, operands
-   * swapped, so they are genuinely ONE group sharing this call, not two)
-   * needs GLOBAL|STICKY: both flags make RegExpBuiltinExec consult
-   * incoming lastIndex. replace()'s own NON-GLOBAL branch needs STICKY
-   * ALONE — its global branch forces its own lastIndex=0 reset every
-   * call (Symbol.replace's own spec algorithm) and is measured safe,
-   * untouched by this guard. GLOBAL-ONLY WAS WRONG FOR MATCH (an earlier
-   * version of this comment, and of the S003 amendment, claimed sticky
-   * was safe for match — built on a NON-DISCRIMINATING witness, `/a/y`
-   * repeated on "aaa": "a" occurs at every offset, so the answer looks
-   * identical whether or not lastIndex actually advances. A pattern that
-   * matches EXACTLY ONCE in its own subject — `/ab/y` on "ab" — exposes
-   * the real answer. Confirmed-safe with NO guard needed (measured):
-   * search() (saves/forces-0/restores lastIndex every call, regardless
-   * of flags); replaceAll()/matchAll()/matchAllInto() (REQUIRE global,
-   * and every global operation forces its own fresh lastIndex=0 reset,
-   * matching what these methods' own loops already do); split() (refuses
-   * at compile time for any non-literal receiver, regardless of flags —
-   * safe by construction, not a guarded cell at all).
-   *
-   * TRAPS — a bare `unreachable`, NEVER throws (mechanism-attribution,
-   * rev's own sealed criterion): this is the SAME S003 stance and
-   * "exit-1 bridge" every other representation-impossible condition on
-   * this tier uses (OOB array/typed-array access, emitIndexCheck's own
-   * exact minimal pattern — no message construction, no exception
-   * cell, no may-throw.ts registration; a raw trap never touches the
-   * pending-exception system at all). NOT a compile-time refuse() key
-   * either — the program compiles cleanly; only a genuinely stateful-
-   * flagged VALUE at runtime traps, so this mints no census key and
-   * needs no F2-style reconciliation. Node itself never throws or traps
-   * here (it runs statefully instead) — no Node oracle, a pure
-   * scriptc-tier limitation, named in SEMANTICS.md as an S003 amendment. */
-  private emitRegexValueFlagGuard(code: Code, bcLocal: number, mask: number): void {
-    // Raw ifVoid/unreachable/end — NOT openIf()/close(): the depth-
-    // desync hazard those wrappers guard against is specifically about
-    // emitUnwind()'s own brTo() needing this.fn.depth in sync; a bare
-    // unreachable is a terminal instruction, not a branch, so it has no
-    // such dependency (emitIndexCheck's own identical precedent,
-    // arrays.ts — no scratch local needed either, same reason).
-    code.localGet(bcLocal);
-    code.i32Const(RE_HEADER_FLAGS);
-    code.call(this.regexInterp.readU16());
-    code.i32Const(mask);
+  /** Throws Node's TypeError (catchable) when the regex in `reLocal` is
+   * not global — replaceAll's and matchAll's own check (board #301). */
+  private emitRegexGlobalTypeError(reLocal: number, message: string): void {
+    const code = this.fn.code;
+    code.localGet(reLocal);
+    code.call(this.regexState.flags());
+    code.i32Const(LRE_FLAG_GLOBAL);
     code.i32And();
-    code.ifVoid();
-    code.unreachable();
-    code.end();
+    code.i32Eqz();
+    this.openIf();
+    this.emitSetCellErrorLit("%TypeError", "TypeError", message, null);
+    this.emitUnwind();
+    this.close();
   }
 
   /** Unit F1: foldRegexArg, plus `.source` / `.flags` of a regex literal
@@ -39364,7 +38398,20 @@ class Assembler {
         this.releaseScratch(I32, isLiteralLocal);
         code.i32Eqz();
         this.openIf(); // !isLiteral -> value path, guard needed
-        this.emitRegexValueFlagGuard(code, bcLocal, LRE_FLAG_GLOBAL | LRE_FLAG_STICKY);
+        // Board #301 left THIS site's trap in place (SEMANTICS.md S003's
+        // regex amendment): on a failed comparison Node's Comparison
+        // constructor runs every regex key a SECOND time, in the expected
+        // object's key order, moving a global/sticky regex's lastIndex
+        // again and changing the rendering — a value-path g/y regex here
+        // still traps rather than answer one run's verdict.
+        code.localGet(bcLocal);
+        code.i32Const(RE_HEADER_FLAGS);
+        code.call(this.regexInterp.readU16());
+        code.i32Const(LRE_FLAG_GLOBAL | LRE_FLAG_STICKY);
+        code.i32And();
+        code.ifVoid();
+        code.unreachable();
+        code.end();
         this.close();
         this.releaseScratch(bcRefT, bcLocal);
         code.localGet(reLocal);
@@ -39953,9 +39000,6 @@ class Assembler {
         code.structGet(this.regex.regexType, 2); // bytecode
         code.localSet(bcLocal);
 
-        if (e.args[1]!.kind !== "regexLit") {
-          this.emitRegexValueFlagGuard(code, bcLocal, LRE_FLAG_GLOBAL | LRE_FLAG_STICKY);
-        }
 
         // registerCount+captureCount sizing, exactly regexIntrinsic:test's
         // own pattern (emitter.ts's own "test" case, above).
@@ -39973,17 +39017,14 @@ class Assembler {
         code.localSet(countLocal);
 
         const matchedLocal = this.acquireScratch(I32);
-        code.localGet(bcLocal);
+        // Board #301: Node's assert.match is RegExpPrototypeExec — it
+        // reads and writes a global or sticky regex's lastIndex, modelled
+        // now (bexec), so the value-path trap is gone.
+        code.localGet(reLocal);
         code.localGet(inputLocal);
-        // startIndex is always 0 — exactly regexIntrinsic:test's own
-        // rationale (that case's own doc comment above): a value-path
-        // regex carrying a stateful flag now traps via the guard just
-        // emitted, so nothing reaching this point could have a runtime
-        // lastIndex a constant 0 would get wrong.
-        code.i32Const(0);
-        code.localGet(countLocal);
-        code.call(this.regexInterp.newCaptureArray());
-        code.call(this.regexInterp.exec());
+        code.localGet(reLocal);
+        code.call(this.regexState.capNew());
+        code.call(this.regexState.bexec());
         code.localSet(matchedLocal);
         this.releaseScratch(I32, countLocal);
         this.releaseScratch(bcRefT, bcLocal);
@@ -40137,7 +39178,7 @@ class Assembler {
         this.releaseScratch(I32, isLiteralLocal);
         code.i32Eqz();
         this.openIf(); // !isLiteral -> value path, guard needed
-        this.emitRegexValueFlagGuard(code, bcLocal, LRE_FLAG_GLOBAL | LRE_FLAG_STICKY);
+        // (board #301: lastIndex is modelled — the value-path trap is gone)
         this.close();
 
         const countLocal = this.acquireScratch(I32);
@@ -40154,15 +39195,12 @@ class Assembler {
         code.localSet(countLocal);
 
         const matchedLocal = this.acquireScratch(I32);
-        code.localGet(bcLocal);
+        // Board #301: RegExpPrototypeExec, lastIndex-aware (assert.match's).
+        code.localGet(reLocal);
         code.localGet(stringifiedLocal);
-        // startIndex is always 0 — same rationale as assert.match's own
-        // case above (the value-path guard just emitted rules out any
-        // carried lastIndex reaching this point).
-        code.i32Const(0);
-        code.localGet(countLocal);
-        code.call(this.regexInterp.newCaptureArray());
-        code.call(this.regexInterp.exec());
+        code.localGet(reLocal);
+        code.call(this.regexState.capNew());
+        code.call(this.regexState.bexec());
         code.localSet(matchedLocal);
         this.releaseScratch(I32, countLocal);
         this.releaseScratch(bcRefT, bcLocal);
@@ -40265,7 +39303,7 @@ class Assembler {
         this.releaseScratch(I32, isLiteralLocal);
         code.i32Eqz();
         this.openIf(); // !isLiteral -> value path, guard needed
-        this.emitRegexValueFlagGuard(code, bcLocal, LRE_FLAG_GLOBAL | LRE_FLAG_STICKY);
+        // (board #301: lastIndex is modelled — the value-path trap is gone)
         this.close();
 
         const countLocal = this.acquireScratch(I32);
@@ -40281,12 +39319,12 @@ class Assembler {
         code.i32Add();
         code.localSet(countLocal);
 
-        code.localGet(bcLocal);
+        // Board #301: RegExpPrototypeExec, lastIndex-aware (assert.match's).
+        code.localGet(reLocal);
         code.localGet(stringifiedLocal);
-        code.i32Const(0); // startIndex — same rationale as assert.match/throwsRegex above
-        code.localGet(countLocal);
-        code.call(this.regexInterp.newCaptureArray());
-        code.call(this.regexInterp.exec()); // -> i32, 1/0 — the BOOL result, left on the stack
+        code.localGet(reLocal);
+        code.call(this.regexState.capNew());
+        code.call(this.regexState.bexec()); // -> i32, 1/0 — the BOOL result, left on the stack
         this.releaseScratch(I32, countLocal);
         this.releaseScratch(bcRefT, bcLocal);
         this.releaseScratch(strRefT, stringifiedLocal);
@@ -41799,13 +40837,13 @@ class Assembler {
       c.structGet(this.regex.regexType, 3); // captureCount
       c.i32Add();
       c.localSet(RECNT);
-      c.localGet(REBC);
+      // Board #301: RegExpPrototypeExec, lastIndex-aware (assert.match's).
+      c.globalGet(regexValG);
       c.globalGet(errGlobal);
       c.structGet(errT, structField);
-      c.i32Const(0); // startIndex
-      c.localGet(RECNT);
-      c.call(this.regexInterp.newCaptureArray());
-      c.call(this.regexInterp.exec());
+      c.globalGet(regexValG);
+      c.call(this.regexState.capNew());
+      c.call(this.regexState.bexec());
     };
 
     // ── stage 1: present flags + per-key equality ──

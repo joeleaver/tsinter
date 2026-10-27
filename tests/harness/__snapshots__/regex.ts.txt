@@ -1,29 +1,11 @@
-regex.ts:7:11 - error SC1121: '.test()' on a regex with the 'g' or 'y' flag is not supported yet
-
-  6 | // compile — corpus 2448).
-  7 | const g = /ab/g.test("abab");
-    |           ^~~~~~~~~~~~~~~~~~
-  8 | const y = /ab/y.test("abab");
-
-  hint: g/y regexes carry mutable lastIndex state between calls, which is not modeled; drop the flag for a plain match test, or use replace/replaceAll/split (their iteration is internal)
-
-regex.ts:8:11 - error SC1121: '.test()' on a regex with the 'g' or 'y' flag is not supported yet
-
-  7 | const g = /ab/g.test("abab");
-  8 | const y = /ab/y.test("abab");
-    |           ^~~~~~~~~~~~~~~~~~
-  9 | const indices = /cat/d;
-
-  hint: g/y regexes carry mutable lastIndex state between calls, which is not modeled; drop the flag for a plain match test, or use replace/replaceAll/split (their iteration is internal)
-
 regex.ts:9:17 - error SC1120: the regex 'd' flag (match indices) is not supported yet
 
-   8 | const y = /ab/y.test("abab");
+   8 | // (Node: undefined) refuses.
    9 | const indices = /cat/d;
      |                 ^~~~~~
   10 | const sets = /[\p{L}]/v;
 
-  hint: supported: literal regexes with the g/i/m/s/u/y flags — .test(), .exec()/.match()/.matchAll(), named capture groups (.groups, $<name> templates, \k<name>), .source/.flags, and string replace/replaceAll/split with string replacement templates
+  hint: supported: regexes with the g/i/m/s/u/y flags — .test()/.exec() (stateful through lastIndex with g/y), .match()/.matchAll()/.search(), replace/replaceAll with replacement templates or function replacers, split (with a limit), named capture groups (.groups, $<name> templates, \k<name>), and .source/.flags/.lastIndex
 
 regex.ts:10:14 - error SC1120: the regex 'v' flag (unicode sets) is not supported yet
 
@@ -32,7 +14,7 @@ regex.ts:10:14 - error SC1120: the regex 'v' flag (unicode sets) is not supporte
      |              ^~~~~~~~~~
   11 | const asValue = /x/.test;
 
-  hint: supported: literal regexes with the g/i/m/s/u/y flags — .test(), .exec()/.match()/.matchAll(), named capture groups (.groups, $<name> templates, \k<name>), .source/.flags, and string replace/replaceAll/split with string replacement templates
+  hint: supported: regexes with the g/i/m/s/u/y flags — .test()/.exec() (stateful through lastIndex with g/y), .match()/.matchAll()/.search(), replace/replaceAll with replacement templates or function replacers, split (with a limit), named capture groups (.groups, $<name> templates, \k<name>), and .source/.flags/.lastIndex
 
 regex.ts:11:17 - error SC1090: regex methods as values (call 'test' directly) are not supported yet
 
@@ -48,13 +30,31 @@ regex.ts:15:22 - error SC2020: 'RegExpExecArray.groups' is part of the standard 
      |                      ^~~~~~~~
   16 | }
 
-  hint: '.groups' lowers when the match's regex is STATICALLY known — a regex literal, or a const initialized with one (the group-name table is built at compile time) — and the read is not an optional-chain step: narrow the match instead (if (m) { m.groups } or m!.groups)
+  hint: '.groups' lowers when the match's regex is STATICALLY known — a regex literal, or a const initialized with one (the group-name table is built at compile time) — and the result is a variable assigned only from direct exec/match calls over that one pattern, read in the function that assigns it; here the regex is not statically known (a parameter or a computed value), so its group names are not
 
-regex.ts:20:15 - error SC1121: '.exec()' on a regex with the 'g' or 'y' flag is not supported yet
+regex.ts:19:10 - error SC2020: 'RegExpExecArray.index' is part of the standard library types but has no scriptc lowering yet
 
-  19 | // test()'s default feature text.
-  20 | const execG = /ab/g.exec("abab");
-     |               ^~~~~~~~~~~~~~~~~~
-  21 | 
+  18 | function indexOf(m: RegExpExecArray): number {
+  19 |   return m.index;
+     |          ^~~~~~~
+  20 | }
 
-  hint: g/y regexes carry mutable lastIndex state between calls, which is not modeled; drop the flag for a plain match test, or use replace/replaceAll/split (their iteration is internal)
+  hint: '.index' reads Node's value on a variable assigned ONLY from direct re.exec(s) / s.match(re) calls (or null) and read in the function that assigns it — while ((m = re.exec(s)) !== null) { ... m.index ... }, and on the const binding of a for-of over s.matchAll(re); here 'm' is a parameter — the exec/match call happened in another function
+
+regex.ts:24:24 - error SC2020: 'RegExpExecArray.input' is part of the standard library types but has no scriptc lowering yet
+
+  23 | const alias = k;
+  24 | if (alias) console.log(alias.input);
+     |                        ^~~~~~~~~~~
+  25 | const every = "aa".match(/a/g);
+
+  hint: '.input' reads Node's value on a variable assigned ONLY from direct re.exec(s) / s.match(re) calls (or null) and read in the function that assigns it — while ((m = re.exec(s)) !== null) { ... m.input ... }; here 'alias' is initialized from something other than a direct exec/match call (an alias, a function's result, an array element)
+
+regex.ts:26:24 - error SC1120: '.index' of a global match() result (Node answers undefined: the every-match array has no index) is not supported yet
+
+  25 | const every = "aa".match(/a/g);
+  26 | if (every) console.log(every.index);
+     |                        ^~~~~~~~~~~
+  27 | 
+
+  hint: supported: regexes with the g/i/m/s/u/y flags — .test()/.exec() (stateful through lastIndex with g/y), .match()/.matchAll()/.search(), replace/replaceAll with replacement templates or function replacers, split (with a limit), named capture groups (.groups, $<name> templates, \k<name>), and .source/.flags/.lastIndex

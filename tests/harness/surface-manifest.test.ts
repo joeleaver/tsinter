@@ -123,7 +123,7 @@ const PROBES: Probe[] = [
   // analyzed clean under --dynamic
   { id: "stdlib.number.toPrecision", source: "console.log((2).toPrecision(3));\n" },
   { id: "stdlib.string.at", source: 'console.log("ab".at(1));\n' },
-  { id: "stdlib.string.replace", source: 'console.log("aa".replace("a", "b"));\n' },
+  { id: "stdlib.number.toString", source: "console.log((10).toString(2));\n" },
   { id: "diagnostic.sc2011", source: "const y: any = 1;\nconst z = y * 2;\nconsole.log(0);\n" },
   // status unsupported — refused with the entry's code
   { id: "syntax.debugger-statements", source: "debugger;\nconsole.log(0);\n" },
@@ -135,7 +135,7 @@ const PROBES: Probe[] = [
   // Class-instance field/getter destructures graduated (corpus 2429); the
   // METHOD-extraction refusal carries the sample now.
   { id: "diagnostic.sc1031", source: "class C {\n  f = 1;\n  m(): number {\n    return this.f;\n  }\n}\nconst { m } = new C();\nconsole.log(m());\n" },
-  { id: "diagnostic.sc1121", source: 'console.log(/ab/g.test("abab"));\n' },
+  { id: "diagnostic.sc1120", source: "console.log(/cat/d.source);\n" },
   {
     id: "node-builtin.zlib.gzipSync",
     source: 'import { gzipSync } from "node:zlib";\ngzipSync("data");\nconsole.log(0);\n',

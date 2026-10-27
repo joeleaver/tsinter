@@ -2875,7 +2875,7 @@ export class RegexCompilerBuilder {
           $.aset(this.re.strArrType, $.l(NAMES), $.sub($.l(I), $.i(1)), $.l(NM));
         });
       });
-      $.put(R, $.new_(this.re.regexType, $.call(this.fEscapeSource), $.call(this.fCanonFlags), $.l(BYTES), this.gg($, "capCount"), $.l(NAMES)));
+      $.put(R, $.new_(this.re.regexType, $.call(this.fEscapeSource), $.call(this.fCanonFlags), $.l(BYTES), this.gg($, "capCount"), $.l(NAMES), ...(this.re.hasLastIndex ? [$.d(0)] : [])));
       $.if($.not(this.gg($, "uni")), () => {
         // Annex B (a tier policy): a pattern that
         // fails to parse with /u forced on relies on a legacy production.

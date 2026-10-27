@@ -49,33 +49,24 @@ export type IrType =
    * of sets, not JSON-safe) and never cycle-capable: elements are scalars
    * or strings, which cannot point back. */
   | { kind: "set"; elem: IrType }
-  /** A regular expression — IMMUTABLE, no lastIndex field: the value
-   * itself carries no statefulness (repoint, INC-24 P5 — this comment
-   * used to say "heap, refcounted" unconditionally, which held for the C
-   * lane's ScrRegex but is already false for the wasm lane's %w.re.Regex,
-   * a WasmGC struct with no refcounting at all; representation is a
-   * per-backend concern this type does not pin).
+  /** A regular expression. Its pattern, flags and compiled program are
+   * immutable; its `lastIndex` is the one piece of MUTABLE state (board
+   * #301): every lane carries it on the value (the wasm lane's
+   * %w.re.Regex has a mutable f64 field; the native ScrRegex a
+   * `last_index`), and every regex method follows the spec's rules for it
+   * (see IrRegexIntrinsicMethod). Representation is otherwise a per-backend
+   * concern this type does not pin (the native lanes refcount a heap
+   * ScrRegex; the wasm lane's struct is GC-managed).
    *
-   * A regex value originates from EITHER a LITERAL (interned by backends
-   * that choose to: the wasm lane's own regexLiteral() builds ONE
-   * immortal static per (pattern, flags) pair per module) OR, since P5,
-   * `new RegExp(...)` construction (regex.new), which is DELIBERATELY
-   * NOT interned — `new RegExp("a") !== new RegExp("a")`, matching
-   * Node, so two distinct call sites (or the same one evaluated twice)
-   * never share a struct. This comment previously claimed "every regex
-   * value today originates from a literal," which P5 made false.
-   *
-   * /g and /y are NOT "supported only inside replace/replaceAll/split,
-   * with test() rejected" — that was already stale before P5 (P4's own
-   * F5 fix): a regex VALUE (as opposed to a literal used directly at its
-   * own call site, which the wasm lane can specialize at compile time)
-   * carrying a runtime GLOBAL or STICKY flag TRAPS on test/exec/match
-   * (any flag) or replace's non-global branch (sticky alone) — the S003
-   * bridge, uncatchable, standing in for the lastIndex tracking this
-   * value shape cannot represent. A non-stateful value (no g, no y) works
-   * on every method, unconditionally, regardless of whether it came from
-   * a literal or regex.new — the guard keys on the VALUE's own runtime
-   * flags, never on which expression produced it.
+   * A regex value originates from EITHER a LITERAL or `new RegExp(...)`
+   * (regex.new). Both evaluate to a FRESH object every time, as in JS —
+   * observable through lastIndex: backends may intern a literal's compiled
+   * program (one immortal per (pattern, flags) pair per module), but each
+   * EVALUATION copies it into a new value with lastIndex 0. (The native
+   * emitters hand a literal that is itself the direct operand of a regex
+   * method its immortal static, which stands for that fresh object: the
+   * runtime starts it at lastIndex 0 on entry, and nothing can observe it
+   * afterwards.)
    *
    * Deliberately narrower than string: no array elements, no map
    * keys/values, no union arms (a regex arm would have no narrowing
@@ -1655,21 +1646,19 @@ export const MAY_THROW_BYTES_METHODS: ReadonlySet<IrBytesIntrinsicMethod> = new 
  * `test` takes a regex receiver and one string arg (bool result); `source`
  * and `flags` are property reads on a regex receiver (owned string result);
  * `replace`/`replaceAll`/`split` take a STRING receiver with args[0] the
- * regex and (for the replaces) args[1] the replacement template — string
- * replacements only, function replacements are checker-rejected (the
- * ambient overloads accept only strings). `replaceAll` THROWS Node's
- * TypeError when the regex lacks /g (catchable, every lane). `split` on a
- * pattern with capture groups is PER-LANE (S066): the wasm tier SPLICES
- * the captured values into the result, Node-exact; the native lanes THROW
- * a catchable TypeError instead (capture-splicing predates their own
- * split() support). Backends' may-throw analyses must still seed on both
- * `replaceAll` and `split` like a `throw` — a wasm backend that never
- * throws on split is a harmless over-approximation there, not a
- * mismatch. */
-/** `match` takes a STRING receiver with args[0] the regex (non-g/y — the
- * frontend fences literal g/y flags; a g-flagged value reaching the
- * runtime aborts like test()) and produces the PROGRAM-DEPENDENT
- * `string[] | null` union: the matched slice [whole, ...captures] wrapped
+ * regex and (for the replaces) args[1] the replacement template. A
+ * FUNCTION replacement lowers through `collect`/`collectAll` plus a lifted
+ * loop the frontend builds (lower-regex.ts), so no backend calls user
+ * code from inside a match. `replaceAll` THROWS Node's TypeError when the
+ * regex lacks /g (catchable, every lane). `split` SPLICES capture groups'
+ * values into the result on every lane (S066). Backends' may-throw
+ * analyses seed on `replaceAll`, `split`/`splitLimit`, `matchAll`/
+ * `matchAllInto` and `collectAll` like a `throw` (split no longer throws —
+ * a harmless over-approximation). */
+/** `match` takes a STRING receiver with args[0] the regex and produces the
+ * PROGRAM-DEPENDENT `string[] | null` union: Symbol.match — for a
+ * non-global regex the matched slice [whole, ...captures] (RegExpBuiltinExec,
+ * lastIndex-aware when sticky), for a global one every whole match — wrapped
  * into the array arm, or the interned null-arm instance for no match. A
  * NONPARTICIPATING capture holds "" where Node's slot is undefined
  * (SEMANTICS.md S064). Never throws. */
@@ -1697,7 +1686,57 @@ export type IrRegexIntrinsicMethod =
   | "flags"
   | "replace"
   | "replaceAll"
-  | "split";
+  | "split"
+  /* ── Board #301: the regex value carries lastIndex (mutable state). ──
+   * Every method above now follows the spec's lastIndex rules on every
+   * lane: test/match/exec read ToLength(lastIndex) on a global or sticky
+   * regex and store the match end (or 0); match on a GLOBAL regex returns
+   * every whole match (string[] | null — the same IR shape); replace and
+   * replaceAll reset a global regex's lastIndex to 0; matchAll starts at
+   * the regex's lastIndex without writing it; split and search leave it
+   * alone. */
+  /** `s.match(re)` that also fills args[1] (a number[], cleared first)
+   * with the match's capture positions — 2 per capture (start, end), -1
+   * for a capture that did not participate; left EMPTY for a global
+   * regex's every-match form. The `.index` companion of a match result
+   * bound to a local. Same result as match. */
+  | "matchInto"
+  /** `re.exec(s)`: receiver the regex, args[0] the subject; the
+   * `string[] | null` union like match (never the every-match form). */
+  | "exec"
+  /** exec + args[1] the positions companion (matchInto's rule). */
+  | "execInto"
+  /** `re.lastIndex` (the stored number, unconverted). */
+  | "lastIndex"
+  /** `re.lastIndex = v`: args[0] the number; void. */
+  | "setLastIndex"
+  /** The collection phase of `s.replace(re, fn)` (Symbol.replace): every
+   * result as its honest row with the GAP before it appended ([whole,
+   * ...captures, gap], nonparticipating captures ""), then a final [tail]
+   * row (so the caller never slices the subject),
+   * args[1] (a number[], cleared first) receiving each row's capture
+   * positions (matchInto's layout). The frontend calls the replacer over
+   * the rows afterwards. Never throws. */
+  | "collect"
+  /** collect for `replaceAll`: throws Node's TypeError on a non-global
+   * regex first (catchable). */
+  | "collectAll"
+  /** `s.split(re, limit)`: args[1] is the RAW limit number (backends apply
+   * ToUint32, and pick V8's fast or slow split path from the raw value). */
+  | "splitLimit"
+  /** `s.replace(pat, tpl)` / `s.replaceAll(pat, tpl)` with a STRING
+   * pattern: receiver the subject, args [pattern, template]; the template
+   * runs GetSubstitution ($$, $&, $`, $' — a string pattern has no
+   * captures). No regex involved; they live with the regex runtime for its
+   * GetSubstitution. Never throw. */
+  | "strReplace"
+  | "strReplaceAll"
+  /** A STRING pattern's collection for a function replacer (replace /
+   * replaceAll): receiver the subject, args [pattern, positions]; rows
+   * [match, gap] per occurrence, then a final [tail] row (collect's
+   * layout). Never throw. */
+  | "strCollect"
+  | "strCollectAll";
 
 /** The complete standard-library surface (mirrors ambient/scriptc.d.ts: the
  * `process` and `JSON` globals and `declare module "node:fs"`). A closed
@@ -4307,15 +4346,17 @@ export type IrExpr =
   /** A regex literal `/ab+c/gi`. `pattern` is the text between the slashes
    * exactly as written (escapes UNprocessed — the regex engine parses them),
    * `flags` the trailing flags in source order (alphabet fenced to gimsuy by
-   * the frontend). Backends intern ONE immortal static per (pattern, flags)
-   * pair — like string literals, so repeated evaluation is free and
-   * `re === re` would hold. WHAT HAPPENS WHEN THE ENGINE REJECTS THE PATTERN
+   * the frontend). Backends may intern ONE immortal compiled program per
+   * (pattern, flags) pair, but each EVALUATION is a fresh value with
+   * lastIndex 0 (board #301 — see the regex type). WHAT HAPPENS WHEN THE ENGINE REJECTS THE PATTERN
    * is PER-LANE, not shared (SEMANTICS.md S065): the wasm tier compiles at
    * COMPILE TIME and reports there (no binary emitted — zero program
    * output, matching Node's own parse-time failure); the native lanes
    * compile lazily at first use and ABORT UNCATCHABLY there, after any
    * side effects already run. Node itself throws a catchable SyntaxError
-   * at parse time. Result is +1 (a no-op retain on the immortal). */
+   * at parse time. Result is +1 (the fresh value). (The PER-LANE paragraph
+   * predates follow-up unit D: every lane now judges a literal at build
+   * time — S065.) */
   | { kind: "regexLit"; pattern: string; flags: string; type: IrType; loc: SrcLoc }
   /** The strings object of a tagged template `tag\`a${x}b\`` — the COOKED
    * span texts. `key` is a per-SITE identity (the spec canonicalizes the
@@ -4331,10 +4372,10 @@ export type IrExpr =
   | { kind: "templateStrings"; key: string; cooked: string[]; type: IrType; loc: SrcLoc }
   /** A regex operation (see IrRegexIntrinsicMethod for the surface and the
    * receiver/arg conventions). The receiver and args are BORROWED;
-   * string/array results are owned (+1). `replaceAll` and `split` MAY THROW
-   * catchable TypeErrors (backends seed their may-throw analyses on them);
-   * `test` on a g/y-flagged regex aborts at runtime (the frontend rejects
-   * the literal-receiver cases it can see at compile time). */
+   * string/array results are owned (+1). `replaceAll`, `matchAll` and
+   * `collectAll` MAY THROW catchable TypeErrors (backends seed their
+   * may-throw analyses on them, and on split); a global or sticky regex
+   * reads and writes its lastIndex as the spec says (board #301). */
   | {
       kind: "regexIntrinsic";
       method: IrRegexIntrinsicMethod;

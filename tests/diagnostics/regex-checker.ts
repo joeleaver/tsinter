@@ -1,5 +1,11 @@
-// Checker-level regex fences: function replacements — tsc rejects them
-// before lowering starts. (exec lowers through the match intrinsic and
-// `new RegExp(pattern, flags)` compiles now, so neither appears here.)
-const m = /a(b)/.exec("ab");
-const fn = "abc".replace(/b/, (s: string) => s);
+// Function replacers compile since board #301 — except where Node's
+// argument positions are not known at compile time: capture/offset
+// parameters over a regex whose captures the compiler cannot see, and a
+// rest-parameter replacer, and one that reads `arguments`.
+function swap(re: RegExp, s: string): string {
+  return s.replace(re, (m: string, a: string) => a);
+}
+const rest = "abc".replace(/b/, (...xs: string[]) => xs[0]!);
+console.log(swap(/(a)/, "a"), rest);
+function counts(m: string): string { return m + arguments.length; }
+console.log("ab".replace(/a/, counts));
