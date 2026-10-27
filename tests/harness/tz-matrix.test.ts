@@ -12,9 +12,9 @@
  * own Date — so this file sets process.env.TZ around each wasm run (Node
  * re-reads its zone on the assignment) and puts it back.
  *
- * The engine program (Date inside __island_eval) runs on c and llvm only:
- * the WasmGC tier's engine still answers local time in UTC (S103 (e)) until
- * its localtime is wired to tzCall.
+ * The engine program (Date inside __island_eval) runs on every lane too:
+ * the WasmGC tier's engine asks the same tzCall (OFFSET, and NAME for the
+ * Date#toString suffix).
  *
  * Children run under LC_ALL=C: Node's zone NAMES follow the locale, the
  * native lanes print the English ones (S113). */
@@ -155,7 +155,7 @@ async function runWasmUnder(path: string, tz: string): Promise<string> {
 beforeAll(async () => {
   work = mkdtempSync(join(tmpdir(), "tsinter-tz-matrix-"));
   await build("static", STATIC_SRC, false, ["c", "llvm", "wasm"]);
-  await build("engine", ENGINE_SRC, true, ["c", "llvm"]);
+  await build("engine", ENGINE_SRC, true, ["c", "llvm", "wasm"]);
 }, 600_000);
 
 afterAll(() => {

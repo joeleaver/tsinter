@@ -7069,7 +7069,7 @@ witness per fence key, and the syntax errors a fence must not hide),
 corpus 2448 and 2748 on the wasm census. Measured against Node
 v24.18.1.
 
-## S103 — `__island_eval` on the wasm lane runs in the embedded engine: its recursion depth is about a tenth of Node's and some deep engine recursion overflows the host stack uncatchably, Node globals and locale methods it lacks are fenced by name, its jobs run at the checkpoint instead of in Node's microtask queue, its error messages and some limits are QuickJS's, its local time is UTC, its NaNs are canonical and its `**` operator is musl's pow, an error crossing out keeps name, message and a string code only, and a rejection with an 'unhandledRejection' listener is fenced *(wasm lane; (c) and (d) are shared with the native lanes)*
+## S103 — `__island_eval` on the wasm lane runs in the embedded engine: its recursion depth is about a tenth of Node's and some deep engine recursion overflows the host stack uncatchably, Node globals and locale methods it lacks are fenced by name, its jobs run at the checkpoint instead of in Node's microtask queue, its error messages and some limits are QuickJS's, its local time is the host's (S113; once UTC), its NaNs are canonical and its `**` operator is musl's pow, an error crossing out keeps name, message and a string code only, and a rejection with an 'unhandledRejection' listener is fenced *(wasm lane; (c) and (d) are shared with the native lanes)*
 
 A module that reaches `__island_eval` carries the quickjs-ng engine the native
 lanes embed, at the same pin, compiled to wasm32 with wasi-libc
@@ -7170,13 +7170,15 @@ except:
   matches it); a chain of 10,000 `bind`s throws RangeError when called
   (Node answers). The native lanes run the same engine and print the same
   texts.
-- **(e) Local time is UTC.** wasi-libc's `localtime_r` has no time zone, so
-  inside the engine `getTimezoneOffset()` is 0 and every local-time method and
-  `toString` answers in UTC; measured under `TZ=America/New_York`, Node
-  answers `new Date(0).getTimezoneOffset()` with 300. The native lanes use the
-  host's zone, through the engine's zone hooks (S113). The import this engine
-  will ask exists — `tsinter.tzCall` (S113), already serving the static tier's
-  local date strings — and the engine's localtime is wired to it next.
+- **(e) Local time — RESOLVED (the engine follow-up of the local time zone
+  unit).** wasi-libc's `localtime_r` has no time zone, so the engine used to
+  answer every local-time method and `toString` in UTC. The engine's Date now
+  reads the host's zone through `tsinter.tzCall` (S113): quickjs-ng's zone
+  hooks are defined in this build too, isl_core.c's `scr_tz_offset_ms` /
+  `scr_tz_local_to_utc` ask OFFSET (through the static tier's own checked
+  `%w.date.zoneOffset`), and the `Date#toString` / `#toTimeString` suffix asks
+  NAME at V8's equivalent instant — the native lanes' rules, over the host.
+  What remains is S113's.
   `toString` and `toTimeString` carry the suffix ` (Coordinated Universal Time)`,
   Node's under `TZ=UTC` (S108's Date patch).
 - **(f) Math inside the engine is Node's, but a NaN loses its bits and the
@@ -7332,12 +7334,13 @@ one day — Europe/Riga, 1944-10-02 — where Node itself answers differently fo
 depending on what it was asked before (its DateCache; two fresh processes disagree), see (e); the
 unit's review fuzz (7,448 strings over 25 zones) found the same quirk on a second Riga day, 1944-10-13.
 
-Today the wasm tier reaches local time in ONE place, `date.parseGetTime`'s offset-less date-time (S069's
+The wasm tier reaches local time in two places: its embedded engine's Date (every engine-carrying module
+imports `tzCall`; the engine's local time and its `Date#toString` name are the host's OFFSET and NAME,
+under the same rules as the native engine below), and `date.parseGetTime`'s offset-less date-time (S069's
 amendment): the import is minted in every module whose parse may see one — every parse site except a
 string literal that carries its zone (`Z`, `±HH:MM`, ` GMT`), has no time, or has no digit, so a module
 parsing only such literals needs no zone from its host — and a module that also writes `process.env`
-sends ZONE when the key is `TZ`. Its embedded engine still answers in UTC (S103 (e))
-until that engine's localtime asks the same import. The native lanes read the C library's zone directly
+sends ZONE when the key is `TZ`. The native lanes read the C library's zone directly
 (scr_lib.c `scr_tz_offset_ms`, `scr_tz_local_to_utc`; `process.env.TZ` writes and deletes call `tzset`),
 in their static parse and in their engine: the vendored quickjs-ng carries a second local patch
 (vendor/README.md) routing its Date's local time through those two functions — milliseconds instead of
@@ -7400,8 +7403,8 @@ rewritten.
   range's edge takes the offset at the edge, which differs from Node only if a zone transition fell in
   that day (measured: no zone of the 598 changes offset within two days of either edge in Node's data).
 
-**Tested by:** `tests/harness/tz-matrix.test.ts` (a static program on c, llvm and wasm and an engine
-program on c and llvm, against Node, under 23 TZ values: Chicago, Kolkata, Lord Howe, London, UTC,
+**Tested by:** `tests/harness/tz-matrix.test.ts` (a static program and an engine program, each on c,
+llvm and wasm, against Node, under 23 TZ values: Chicago, Kolkata, Lord Howe, London, UTC,
 St John's, Chatham, Kathmandu, an invalid name, the empty string, unset, and the shapes of the choice
 above — `posix/` and `right/` and `:` prefixes, `:/etc/localtime`, a zoneinfo path, `UTC+3`, `GMT-2`,
 `JST-9`, `<+0330>-3:30`, a POSIX rule string, `EST5EDT`, `Asia/Tokyo/`); `packages/compiler/test/

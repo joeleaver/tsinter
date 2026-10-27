@@ -48476,19 +48476,17 @@ static const JSCFunctionListEntry js_math_obj[] = {
 /* Date */
 
 /* tsinter patch (packages/runtime/vendor/README.md; SEMANTICS.md S113):
- * in native builds the engine's local time is the tsinter runtime's zone
+ * the engine's local time is the tsinter runtime's zone
  * (scr_lib.c) — the offset in MILLISECONDS (a local-mean-time offset keeps
  * its seconds, where upstream rounds to whole minutes), V8's ToUTC for a
  * local time (the offset in force before a gap or an overlap, ICU's
  * UCAL_TZ_LOCAL_FORMER), and V8's truncated minutes for
- * getTimezoneOffset and the GMT±hhmm field. The wasi build (the WasmGC
- * tier's engine.wasm) keeps upstream's code until its host zone is wired
- * (S103 (e)). */
-#if !defined(__wasi__)
+ * getTimezoneOffset and the GMT±hhmm field. Every build: the wasi build
+ * (the WasmGC tier's engine.wasm) defines the two functions in isl_core.c
+ * over its host's tzCall import. */
 #define TSINTER_ZONE_HOOKS 1
 double scr_tz_offset_ms(double t);
 double scr_tz_local_to_utc(double local);
-#endif
 
 #ifndef TSINTER_ZONE_HOOKS
 /* OS dependent. d = argv[0] is in ms from 1970. Return the difference

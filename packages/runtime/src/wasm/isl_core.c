@@ -72,6 +72,31 @@ __attribute__((import_module("tsinter_engine"), import_name("random"))) void isl
  * runs. */
 __attribute__((import_module("tsinter_engine"), import_name("pow"))) double isl_host_pow(double x, double y);
 
+/* The host's local time zone (SEMANTICS.md S113): the module's own
+ * %w.date.zoneOffset (tzCall OFFSET, clamped and checked — a broken host is
+ * the module's named trap) and tzCall NAME written into THIS module's
+ * memory at p (at most cap UTF-16 units; the answer is the name's length,
+ * hostStr's retry contract). */
+__attribute__((import_module("tsinter_engine"), import_name("tz_offset"))) double isl_host_tz_offset(double ms);
+__attribute__((import_module("tsinter_engine"), import_name("tz_name"))) int isl_host_tz_name(double ms, uint16_t *p, int cap);
+
+/* performance.now as the static side reads it (`now` minus the origin the
+ * module sampled at _start), for Event#timeStamp — native's scr_perf_now. */
+__attribute__((import_module("tsinter_engine"), import_name("perf_now"))) double isl_host_perf_now(void);
+
+/* The engine's Date local time (quickjs.c's tsinter zone hooks, defined
+ * for this build too): the offset at a UTC instant in ms, seconds kept,
+ * and V8's ToUTC — scr_lib.c's two functions, over tzCall instead of the C
+ * library. The FORMER rule: a local time L takes the offset at
+ * L - max(offset a day before, offset a day after). */
+double scr_tz_offset_ms(double t) { return isl_host_tz_offset(t); }
+double scr_tz_local_to_utc(double local) {
+  if (!(fabs(local) <= 8640000000000000.0 + 864000000.0)) return NAN;
+  double before = isl_host_tz_offset(local - 86400000.0);
+  double after = isl_host_tz_offset(local + 86400000.0);
+  return local - isl_host_tz_offset(local - (before > after ? before : after));
+}
+
 /* The engine's Math, as Node computes it (SEMANTICS.md S100): the native
  * island's own override (scr_island_math.h) over the same ports
  * (scr_jsmath.h, defined here) and the same V8 ieee754.cc (scr_ieee754.cc,
@@ -405,33 +430,67 @@ static JSValue isl_web_uuid(JSContext *ctx, JSValueConst this_val, int argc, JSV
   return JS_NewStringLen(ctx, out, sizeof out);
 }
 
-/* host.now(): performance.now — the module's monotonic clock (the WASI
- * clock_time_get shim's non-realtime arm, abi.ts's `now`), in ms. */
+/* host.now(): performance.now as the static side reads it — the same
+ * origin (sampled at _start) and clock, so Event#timeStamp and a static
+ * performance.now() agree, as native's scr_perf_now does. */
 static JSValue isl_web_now(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
   (void)this_val;
   (void)argc;
   (void)argv;
-  struct timespec ts;
-  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return JS_NewFloat64(ctx, 0);
-  return JS_NewFloat64(ctx, (double)ts.tv_sec * 1e3 + (double)ts.tv_nsec / 1e6);
+  return JS_NewFloat64(ctx, isl_host_perf_now());
 }
 
-/* host.tzname(ms): Date#toString's zone-name suffix — native's
- * web_host_tzname over wasi-libc, whose local time is UTC (S103 (e)), so
- * the answer is "Coordinated Universal Time", Node's spelling under UTC. */
+static long long isl_days_from_civil(long long y, int m, int d) {
+  y -= m <= 2;
+  long long era = (y >= 0 ? y : y - 399) / 400;
+  unsigned long long yoe = (unsigned long long)(y - era * 400);
+  unsigned long long doy = (unsigned long long)((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1);
+  unsigned long long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + (long long)doe - 719468;
+}
+
+/* V8's DateCache::EquivalentTime for an instant outside [0, kMaxInt s] —
+ * native scr_web.c's web_equivalent_time: tzCall NAME is asked only about
+ * instants in that range (abi.ts). */
+static double isl_equivalent_time(double ms) {
+  if (ms >= 0 && ms <= 2147483647000.0) return ms;
+  long long days = (long long)floor(ms / 86400000.0);
+  double within = ms - (double)days * 86400000.0;
+  long long z = days + 719468;
+  long long era = (z >= 0 ? z : z - 146096) / 146097;
+  unsigned long long doe = (unsigned long long)(z - era * 146097);
+  unsigned long long yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  unsigned long long doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  unsigned long long mp = (5 * doy + 2) / 153;
+  int d = (int)(doy - (153 * mp + 2) / 5 + 1);
+  int m = (int)(mp < 10 ? mp + 3 : mp - 9);
+  long long y = (long long)yoe + era * 400 + (m <= 2);
+  int leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+  int week_day = (int)(((isl_days_from_civil(y, 1, 1) + 4) % 7 + 7) % 7);
+  int recent_year = (leap ? 1956 : 1967) + (week_day * 12) % 28;
+  int year = 2008 + (recent_year + 3 * 28 - 2008) % 28;
+  return (double)(isl_days_from_civil(year, m, 1) + d - 1) * 86400000.0 + within;
+}
+
+/* host.tzname(ms): Date#toString's zone-name suffix — the host's own name
+ * for the zone at V8's equivalent instant (tzCall NAME; SEMANTICS.md S113),
+ * as native's web_host_tzname answers it from its table. */
 static JSValue isl_web_tzname(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
   (void)this_val;
   (void)argc;
   double ms = 0;
   if (JS_ToFloat64(ctx, &ms, argv[0])) return JS_EXCEPTION;
   if (!isfinite(ms)) return JS_NewString(ctx, "");
-  time_t t = (time_t)floor(ms / 1000.0);
-  struct tm tmv;
-  if (localtime_r(&t, &tmv) == NULL) return JS_NewString(ctx, "");
-  const char *name = tmv.tm_zone;
-  if (name == NULL) name = "";
-  if (strcmp(name, "UTC") == 0) name = "Coordinated Universal Time";
-  return JS_NewString(ctx, name);
+  double at = isl_equivalent_time(ms);
+  uint16_t small[128];
+  int n = isl_host_tz_name(at, small, (int)(sizeof small / sizeof small[0]));
+  if (n <= (int)(sizeof small / sizeof small[0])) return JS_NewStringUTF16(ctx, small, (size_t)n);
+  uint16_t *big = malloc((size_t)n * sizeof *big);
+  if (big == NULL) return JS_ThrowOutOfMemory(ctx);
+  int m = isl_host_tz_name(at, big, n);
+  JSValue r = JS_NewStringUTF16(ctx, big, (size_t)(m <= n ? m : 0));
+  free(big);
+  return r;
 }
 
 /* host.timer / host.setTimer / host.clearTimer: the engine has no timer

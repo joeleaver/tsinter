@@ -1250,10 +1250,11 @@
  *     NOTHING — the harness's own rows are the check.
  *
  *   (import "tsinter" "tzCall" (func (param i32 f64 i32 i32) (result f64)))
- *     [local-time modules only — those whose `date.parseGetTime` may see an
- *     offset-less date-time (local time): a parse whose argument is a
- *     string literal carrying its zone (Z, ±HH:MM, " GMT"), a date with no
- *     time, or no digit at all never asks, so a module whose every parse
+ *     [local-time modules only — engine-carrying modules (the engine's
+ *     Date asks OFFSET and NAME), and those whose `date.parseGetTime` may
+ *     see an offset-less date-time (local time): a parse whose argument is
+ *     a string literal carrying its zone (Z, ±HH:MM, " GMT"), a date with
+ *     no time, or no digit at all never asks, so a module whose every parse
  *     site is such a literal does not import it. Minted after fetch, so no
  *     earlier import index moves. SEMANTICS.md S113.]
  *     tzCall(op, ms, ptr, len) -> f64: the host's LOCAL TIME ZONE, asked
@@ -1295,12 +1296,11 @@
  *                                    maps every other instant to V8's
  *                                    equivalent one itself. A browser
  *                                    answers the parenthesized suffix of
- *                                    its own `String(new Date(ms))`. NO
- *                                    MODULE ASKS IT YET: its consumer is the
- *                                    embedded engine's Date#toString
- *                                    (S103 (e)), wired next; hosts
- *                                    implement it now so that wiring is
- *                                    not an ABI change.
+ *                                    its own `String(new Date(ms))`. The
+ *                                    embedded engine's Date#toString and
+ *                                    #toTimeString ask it (isl_core.c's
+ *                                    host.tzname), with a 128-unit buffer
+ *                                    first.
  *       op 2 ZONE(0, ptr, len)    -> 0. The program set its TZ variable to
  *                                    the UTF-16 string at ptr (len code
  *                                    units), or removed it (len -1): answer

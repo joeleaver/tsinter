@@ -117,7 +117,7 @@ async function fenceList(bytes) {
     fd_seek: () => 70,
     fd_write: () => 0,
   };
-  const { instance } = await WebAssembly.instantiate(bytes, { wasi_snapshot_preview1: wasi, tsinter_engine: { math_random: () => 0.5, random: () => {}, pow: Math.pow } });
+  const { instance } = await WebAssembly.instantiate(bytes, { wasi_snapshot_preview1: wasi, tsinter_engine: { math_random: () => 0.5, random: () => {}, pow: Math.pow, tz_offset: () => 0, tz_name: () => 0, perf_now: () => 0 } });
   mem = instance.exports.memory;
   instance.exports._initialize();
   const p = instance.exports.isl_fence_list();

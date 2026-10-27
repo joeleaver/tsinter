@@ -154,6 +154,7 @@ import {
   IMPORT_WALL_CLOCK,
   IMPORT_TZ_CALL,
   TZ_OP_ZONE,
+  TZ_OP_NAME,
   IMPORT_WRITE,
 } from "./abi.js";
 import { BUF, LEN, VecBuilder, type VecInfo } from "./arrays.js";
@@ -2845,7 +2846,7 @@ class Assembler {
     // offset-less date-time (local time) — a parse of a string literal that
     // carries its zone, or has no time, never asks — minted after fetch so
     // no earlier import index moves.
-    this.tzCallFunc = libCallWhere(mod, (fn, args) => fn === "date.parseGetTime" && !zoneFreeDateLiteral(args[0]))
+    this.tzCallFunc = this.engineLive || libCallWhere(mod, (fn, args) => fn === "date.parseGetTime" && !zoneFreeDateLiteral(args[0]))
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_TZ_CALL, this.mb.funcType([I32, F64, I32, I32], [F64]))
       : null;
     // ── end INC-26 host-import block ──
@@ -4755,7 +4756,7 @@ class Assembler {
       // anywhere in this backend, so "T0 at instantiation" is not a
       // choice this emitter could even make by accident — `_start`
       // entry IS the earliest point `now()` is ever read here.
-      if (perfNowReachable(this.mod)) {
+      if (perfNowReachable(this.mod) || this.engineLive) {
         c.call(this.nowFuncOrThrow());
         c.globalSet(this.perfT0Global());
       }
@@ -6702,6 +6703,24 @@ class Assembler {
       // the static `**`: V8's math::pow over the tier's glibc pow (S079).
       return this.jsPowHelper();
     }
+    if (imp.module === "tsinter_engine" && imp.name === "tz_offset" && sig === "f64->f64") {
+      // The engine's local time IS the static tier's: tzCall OFFSET,
+      // clamped and checked by %w.date.zoneOffset (SEMANTICS.md S113).
+      return this.date.zoneOffsetHelper();
+    }
+    if (imp.module === "tsinter_engine" && imp.name === "tz_name" && sig === "f64,i32,i32->i32") {
+      return this.islandTzNameShim(t);
+    }
+    if (imp.module === "tsinter_engine" && imp.name === "perf_now" && sig === "->f64") {
+      // Event#timeStamp: performance.now as the static side reads it.
+      const idx = this.mb.declareFunc(this.mb.funcType(t.params, t.results), "%isl.perfNow");
+      const c = new Code();
+      c.call(this.nowFuncOrThrow());
+      c.globalGet(this.perfT0Global());
+      c.f64Sub();
+      this.mb.setBody(idx, [], c.bytes());
+      return idx;
+    }
     const want: Record<string, string> = {
       clock_time_get: "i32,i64,i32->i32",
       fd_close: "i32->i32",
@@ -6881,6 +6900,62 @@ class Assembler {
     c.end();
     c.end();
     this.mb.setBody(idx, [I32], c.bytes());
+    return idx;
+  }
+
+  /** The engine's zone name (isl_core.c's `tsinter_engine.tz_name(ms, p,
+   * cap)`): tzCall NAME into OUR memory above the staging cursor, then the
+   * units copied into the engine's memory at p when they fit — hostStr's
+   * retry contract passed through (the engine asks again with room). An
+   * answer that is not a non-negative integer is the named trap. */
+  private islandTzNameShim(t: { params: ValType[]; results: ValType[] }): number {
+    const tz = this.tzCallFunc;
+    if (tz === null) throw new Error("emitter bug: an engine module without tsinter.tzCall");
+    const idx = this.mb.declareFunc(this.mb.funcType(t.params, t.results), "%isl.tzName");
+    const c = new Code();
+    const MS = 0, P = 1, CAP = 2, V = 3, LEN = 4;
+    this.emitEnsureCapacity(c, () => {
+      c.localGet(CAP);
+      c.i32Const(1);
+      c.i32Shl();
+    });
+    c.i32Const(TZ_OP_NAME);
+    c.localGet(MS);
+    c.globalGet(this.cursorGlobal);
+    c.localGet(CAP);
+    c.call(tz);
+    c.localSet(V);
+    c.localGet(V);
+    c.localGet(V);
+    c.f64Trunc();
+    c.f64Ne();
+    c.localGet(V);
+    c.f64Const(0);
+    c.f64Lt();
+    c.i32Or();
+    c.localGet(V);
+    c.f64Const(0x7fffffff);
+    c.f64Gt();
+    c.i32Or();
+    c.ifVoid();
+    this.date.emitTzHostFailure(c);
+    c.end();
+    c.localGet(V);
+    c.i32TruncF64S();
+    c.localSet(LEN);
+    c.localGet(LEN);
+    c.localGet(CAP);
+    c.i32LeS();
+    c.ifVoid();
+    c.localGet(P);
+    c.globalGet(this.cursorGlobal);
+    c.localGet(LEN);
+    c.i32Const(1);
+    c.i32Shl();
+    c.memoryCopy(ENGINE_MEMORY, undefined);
+    c.end();
+    c.localGet(LEN);
+    this.mb.setBody(idx, [F64, I32], c.bytes());
     return idx;
   }
 

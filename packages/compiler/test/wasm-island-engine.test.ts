@@ -85,13 +85,30 @@ function countOf(b: Uint8Array, id: number): number | null {
   return s === undefined ? null : uleb(b, s.start)[0];
 }
 
+/** Runs `f` with this process's TZ set (Node re-reads its zone), then puts
+ * it back: the shared host's tzCall answers from this process's Date. */
+async function withTz<T>(tz: string, f: () => Promise<T>): Promise<T> {
+  const had = Object.prototype.hasOwnProperty.call(process.env, "TZ");
+  const saved = process.env["TZ"];
+  process.env["TZ"] = tz;
+  try {
+    return await f();
+  } finally {
+    if (had) process.env["TZ"] = saved;
+    else delete process.env["TZ"];
+  }
+}
+
 describe("E0: the engine artifact and the merger", () => {
   test("the checked-in artifact matches its recorded sha256 and passes the format check", () => {
     const img = loadEngine();
     expect(img.imports.map((i) => `${i.module}.${i.name}`).sort()).toEqual([
       "tsinter_engine.math_random",
+      "tsinter_engine.perf_now",
       "tsinter_engine.pow",
       "tsinter_engine.random",
+      "tsinter_engine.tz_name",
+      "tsinter_engine.tz_offset",
       "wasi_snapshot_preview1.clock_time_get",
       "wasi_snapshot_preview1.fd_close",
       "wasi_snapshot_preview1.fd_fdstat_get",
@@ -157,13 +174,15 @@ describe("E0: the engine artifact and the merger", () => {
     const mod = new WebAssembly.Module(bytes);
     // The host contract is unchanged: the same import names a non-engine
     // module of this shape would mint, plus the two clocks and the entropy
-    // read (the web prelude's crypto, E2) — no WASI.
+    // read (the web prelude's crypto, E2) and the local zone (tzCall,
+    // the engine's Date, S113) — no WASI.
     expect(WebAssembly.Module.imports(mod).map((i) => `${i.module}.${i.name}`)).toEqual([
       "tsinter.write",
       "tsinter.now",
       "tsinter.seed",
       "tsinter.wallClock",
       "tsinter.random",
+      "tsinter.tzCall",
     ]);
     const exp = sections(bytes).find((s) => s.id === 7)!;
     const [n, first] = uleb(bytes, exp.start);
@@ -303,17 +322,19 @@ describe("E1: __island_eval through the engine", () => {
     expect(r.stderr).toBe("Unhandled promise rejection: TypeError: island boom\n");
   });
 
-  test("tier-only (S103 (d), (e)): QuickJS's error texts, and the engine's local time is UTC", async () => {
-    const r = await run(
-      "texts-tz",
-      [
-        `try { __island_eval("null.x"); } catch (e) { if (e instanceof TypeError) console.log(e.message); }`,
-        `try { __island_eval("undefined()"); } catch (e) { if (e instanceof TypeError) console.log(e.message); }`,
-        `console.log(__island_eval("new Date(0).getTimezoneOffset()"), __island_eval("new Date(0).getHours()"));`,
-      ].join("\n"),
+  test("tier-only (S103 (d)): QuickJS's error texts; the engine's local time is the host's zone (S113)", async () => {
+    const r = await withTz("Asia/Kolkata", () =>
+      run(
+        "texts-tz",
+        [
+          `try { __island_eval("null.x"); } catch (e) { if (e instanceof TypeError) console.log(e.message); }`,
+          `try { __island_eval("undefined()"); } catch (e) { if (e instanceof TypeError) console.log(e.message); }`,
+          `console.log(__island_eval("new Date(0).getTimezoneOffset()"), __island_eval("new Date(0).getHours()"));`,
+        ].join("\n"),
+      ),
     );
     expect(r.exitCode).toBe(0);
-    expect(r.stdout).toBe("cannot read property 'x' of null\nnot a function\n0 0\n");
+    expect(r.stdout).toBe("cannot read property 'x' of null\nnot a function\n-330 5\n");
   });
 
   test("tier-only (S103 (a)): engine recursion its budget undercounts overflows the HOST stack, uncatchably", async () => {
@@ -376,7 +397,7 @@ describe("E1: __island_eval through the engine", () => {
         fd_seek: () => 70,
         fd_write: () => 0,
       },
-      tsinter_engine: { math_random: () => 0.5, random: () => {}, pow: Math.pow },
+      tsinter_engine: { math_random: () => 0.5, random: () => {}, pow: Math.pow, tz_offset: () => 0, tz_name: () => 0, perf_now: () => 0 },
     });
     box.mem = instance.exports["memory"] as WebAssembly.Memory;
     (instance.exports["_initialize"] as () => void)();
@@ -560,14 +581,20 @@ describe("E2: the web globals are the native island's own text", () => {
     );
   });
 
-  test("Date#toString carries Node's zone-name suffix (the engine's zone is UTC, S103 (e))", async () => {
-    const r = await run(
-      "date-suffix",
-      `console.log(__island_eval("new Date(0).toString() + ' | ' + new Date(86400000).toTimeString() + ' | ' + String(new Date(NaN))"));`,
-    );
-    // Node under TZ=UTC prints the same line.
-    expect(r.stdout).toBe("Thu Jan 01 1970 00:00:00 GMT+0000 (Coordinated Universal Time) | 00:00:00 GMT+0000 (Coordinated Universal Time) | Invalid Date\n");
-  });
+  for (const tz of ["UTC", "America/Chicago", "Australia/Lord_Howe"]) {
+    test(`Date#toString carries Node's zone-name suffix — the host's NAME (tzCall, S113), TZ=${tz}`, async () => {
+      const r = await withTz(tz, () =>
+        run(
+          "date-suffix",
+          `console.log(__island_eval("new Date(0).toString() + ' | ' + new Date(86400000).toTimeString() + ' | ' + new Date(-5364662400000).toString() + ' | ' + String(new Date(NaN))"));`,
+        ),
+      );
+      const want = await withTz(tz, async () =>
+        `${new Date(0).toString()} | ${new Date(86400000).toTimeString()} | ${new Date(-5364662400000).toString()} | Invalid Date\n`,
+      );
+      expect(r.stdout).toBe(want);
+    });
+  }
 
   test("tier-only (S103 (b)): the timer globals stay fenced, and AbortSignal.timeout throws the same named error", async () => {
     const r = await run(
@@ -607,7 +634,7 @@ describe("E1: the counting allocator (the engine's leak oracle)", () => {
       fd_seek: () => 0,
       fd_write: () => 0,
     };
-    const { instance } = await WebAssembly.instantiate(bytes, { wasi_snapshot_preview1: wasi, tsinter_engine: { math_random: () => 0.5, random: () => {}, pow: Math.pow } });
+    const { instance } = await WebAssembly.instantiate(bytes, { wasi_snapshot_preview1: wasi, tsinter_engine: { math_random: () => 0.5, random: () => {}, pow: Math.pow, tz_offset: () => 0, tz_name: () => 0, perf_now: () => 0 } });
     const e = instance.exports as Record<string, (...a: number[]) => number>;
     const mem = instance.exports["memory"] as WebAssembly.Memory;
     memBox.mem = mem;
