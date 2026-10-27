@@ -418,7 +418,7 @@ export class QsBuilder {
       const K = f.local(I32);
       const str = (s: X): X => $.call(this.encodeIntoFn(), $.l(O), s);
       $.put(K, $.get(dyn.dynT(), DYN_KIND, $.l(V)));
-      $.if($.eq($.l(K), $.i(DK.STR)), () => $.ret(str($.cast(this.S, $.get(dyn.dynT(), DYN_REF, $.l(V))))));
+      $.if($.eq($.l(K), $.i(DK.STR)), () => $.ret(str($.flatCast(this.S, $.get(dyn.dynT(), DYN_REF, $.l(V))))));
       $.if($.eq($.l(K), $.i(DK.NUM)), () => {
         // NumberIsFinite: v - v === 0
         $.if($.deq($.dsub($.get(dyn.dynT(), DYN_NUM, $.l(V)), $.get(dyn.dynT(), DYN_NUM, $.l(V))), $.d(0)), () =>
@@ -480,7 +480,7 @@ export class QsBuilder {
         $.put(PAIR, arrAt($.l(ENTS), $.l(I)));
         // ks = convert(k, encode) + eq
         $.put(KB, W.ubNew($));
-        $.if($.not($.call(this.encodeIntoFn(), $.l(KB), $.cast(this.S, $.get(dynT, DYN_REF, arrAt($.l(PAIR), $.i(0)))))), fail);
+        $.if($.not($.call(this.encodeIntoFn(), $.l(KB), $.flatCast(this.S, $.get(dynT, DYN_REF, arrAt($.l(PAIR), $.i(0)))))), fail);
         $.run(W.ubAppendFn(), $.l(KB), $.l(EQ), $.i(0), $.alen($.l(EQ)));
         $.put(KS, $.call(W.ubToStrFn(), $.l(KB)));
         $.put(V, arrAt($.l(PAIR), $.i(1)));

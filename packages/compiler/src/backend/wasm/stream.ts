@@ -94,7 +94,7 @@
  * destroy-on-exit, frontend-only; #76 repro derivation) + close-out. */
 import type { ByteWriter } from "./bytes.js";
 import { Code } from "./code.js";
-import { emitFlat } from "./strings.js";
+import { emitFlat, emitFlatCast } from "./strings.js";
 import { F64, I32, ModuleBuilder, type FieldType, type ValType } from "./module.js";
 import { LEN, BUF } from "./arrays.js";
 import { DK, DYN_KIND, DYN_REF } from "./dyn.js";
@@ -4271,7 +4271,7 @@ export class StreamBuilder {
       c.ifResult(this.deps.bytesRef());
       c.localGet(D);
       c.structGet(this.deps.dynT(), DYN_REF);
-      c.refCast(this.deps.strType());
+      emitFlatCast(c, this.deps.strType());
       c.call(this.deps.bytesFromStrUtf8());
       c.else_();
       this.deps.bytesPayloadBytes(c, (cc) => cc.localGet(D));

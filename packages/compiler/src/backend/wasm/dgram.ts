@@ -637,15 +637,15 @@ export class DgramBuilder {
       $.put(U, $.cast(this.udpT(), $.l(e.a)));
       // Handle has been closed in the mean time
       $.if($.get(this.udpT(), U_CLOSED, $.l(U)), () => $.ret());
-      this.deps.ensureCapacity(f.c, () => $.do($.add($.shl($.alen($.cast(this.S, $.l(e.b))), $.i(1)), $.i(64))));
+      this.deps.ensureCapacity(f.c, () => $.do($.add($.shl($.alen($.flatCast(this.S, $.l(e.b))), $.i(1)), $.i(64))));
       this.base($, BASE);
-      $.put(P, $.call(this.stageAddrFn(), $.l(BASE), $.d2i($.l(e.x)), $.cast(this.S, $.l(e.b))));
+      $.put(P, $.call(this.stageAddrFn(), $.l(BASE), $.d2i($.l(e.x)), $.flatCast(this.S, $.l(e.b))));
       // flags: bit 0 reuseAddr
       this.storeU32($, $.l(P), $.get(this.udpT(), U_REUSE, $.l(U)));
       $.put(R, $.call(this.deps.netCallFunc(), $.i(OP_UDP_BIND), $.l(BASE), $.add($.sub($.l(P), $.l(BASE)), $.i(4)), $.i(0), $.i(0)));
       $.if($.lt($.l(R), $.i(0)), () => {
         $.set(this.udpT(), U_BIND, $.l(U), $.i(0));
-        $.run(this.emitErrorFn(), $.l(U), $.call(this.net.hostPortExHelper(), $.l(R), this.lit($, "bind"), $.cast(this.S, $.l(e.b)), $.d2i($.l(e.x))));
+        $.run(this.emitErrorFn(), $.l(U), $.call(this.net.hostPortExHelper(), $.l(R), this.lit($, "bind"), $.flatCast(this.S, $.l(e.b)), $.d2i($.l(e.x))));
         $.ret();
       });
       $.if($.eq($.l(R), $.i(0)), () => this.trap($));
@@ -748,7 +748,7 @@ export class DgramBuilder {
   /** The queued _connect (env a = socket, b = address, c = cb, x = port). */
   private connectNowFn(): number {
     return this.tick("connectNow", ($, e) => {
-      $.drop($.call(this.connectInnerFn(), $.cast(this.udpT(), $.l(e.a)), $.l(e.x), $.cast(this.S, $.l(e.b)), $.cast(this.deps.voidClos().clos, $.l(e.cc))));
+      $.drop($.call(this.connectInnerFn(), $.cast(this.udpT(), $.l(e.a)), $.l(e.x), $.flatCast(this.S, $.l(e.b)), $.cast(this.deps.voidClos().clos, $.l(e.cc))));
     });
   }
 
@@ -777,13 +777,13 @@ export class DgramBuilder {
       const T = this.udpT();
       $.put(U, $.cast(T, $.l(e.a)));
       $.if($.get(T, U_CLOSED, $.l(U)), () => $.ret());
-      this.deps.ensureCapacity(f.c, () => $.do($.add($.shl($.alen($.cast(this.S, $.l(e.b))), $.i(1)), $.i(64))));
+      this.deps.ensureCapacity(f.c, () => $.do($.add($.shl($.alen($.flatCast(this.S, $.l(e.b))), $.i(1)), $.i(64))));
       this.base($, BASE);
-      $.put(P, $.call(this.stageAddrFn(), $.l(BASE), $.d2i($.l(e.x)), $.cast(this.S, $.l(e.b))));
+      $.put(P, $.call(this.stageAddrFn(), $.l(BASE), $.d2i($.l(e.x)), $.flatCast(this.S, $.l(e.b))));
       $.put(R, $.call(this.deps.netCallFunc(), $.i(OP_UDP_CONNECT), $.l(BASE), $.sub($.l(P), $.l(BASE)), $.get(T, U_H, $.l(U)), $.i(0)));
       $.if($.lt($.l(R), $.i(0)), () => {
         $.set(T, U_CONN, $.l(U), $.i(0));
-        this.nextTick($, this.connectErrorFn(), { a: $.l(U), b: $.call(this.net.hostPortExHelper(), $.l(R), this.lit($, "connect"), $.cast(this.S, $.l(e.b)), $.d2i($.l(e.x))), c: $.l(e.cc) });
+        this.nextTick($, this.connectErrorFn(), { a: $.l(U), b: $.call(this.net.hostPortExHelper(), $.l(R), this.lit($, "connect"), $.flatCast(this.S, $.l(e.b)), $.d2i($.l(e.x))), c: $.l(e.cc) });
         $.ret();
       });
       $.if($.ne($.l(R), $.i(0)), () => this.trap($));
@@ -850,7 +850,7 @@ export class DgramBuilder {
    * string "0" that passed the first check fails this one). */
   private sendLaterFn(): number {
     return this.tick("sendLater", ($, e) => {
-      $.drop($.call(this.sendTypedFn(), $.cast(this.udpT(), $.l(e.a)), $.cast(this.BT, $.l(e.b)), $.l(e.x), $.cast(this.S, $.l(e.cc))));
+      $.drop($.call(this.sendTypedFn(), $.cast(this.udpT(), $.l(e.a)), $.cast(this.BT, $.l(e.b)), $.l(e.x), $.flatCast(this.S, $.l(e.cc))));
     });
   }
 
@@ -872,7 +872,7 @@ export class DgramBuilder {
 
   private doSendTickFn(): number {
     return this.tick("doSendTick", ($, e) => {
-      $.run(this.doSendFn(), $.cast(this.udpT(), $.l(e.a)), $.cast(this.BT, $.l(e.b)), $.l(e.x), $.cast(this.S, $.l(e.cc)));
+      $.run(this.doSendFn(), $.cast(this.udpT(), $.l(e.a)), $.cast(this.BT, $.l(e.b)), $.l(e.x), $.flatCast(this.S, $.l(e.cc)));
     });
   }
 
@@ -1011,7 +1011,7 @@ export class DgramBuilder {
       $.put(N, $.d(0));
       $.if($.eq($.l(K), $.i(K_NUM)), () => $.put(N, $.get(this.DT, 1, $.l(D))));
       $.if($.eq($.l(K), $.i(K_BOOL)), () => $.put(N, $.get(this.DT, 1, $.l(D))));
-      $.if($.eq($.l(K), $.i(K_STR)), () => $.put(N, $.call(this.deps.strToNumber(), $.cast(this.S, $.get(this.DT, 2, $.l(D))))));
+      $.if($.eq($.l(K), $.i(K_STR)), () => $.put(N, $.call(this.deps.strToNumber(), $.flatCast(this.S, $.get(this.DT, 2, $.l(D))))));
       // an object, array, Buffer or function goes through ToPrimitive
       // (valueOf / toString): not modelled
       $.if($.not($.either($.either($.eq($.l(K), $.i(K_NUM)), $.eq($.l(K), $.i(K_BOOL))), $.either($.eq($.l(K), $.i(K_STR)), $.either($.eq($.l(K), $.i(K_UNDEF)), $.eq($.l(K), $.i(K_NULL)))))), () => {
@@ -1050,7 +1050,7 @@ export class DgramBuilder {
         $.put(N, $.get(this.DT, 1, $.l(D)));
         $.ret($.both($.dne($.l(N), $.d(0)), $.deq($.l(N), $.l(N))));
       });
-      $.if($.eq($.l(K), $.i(K_STR)), () => $.ret($.gt($.alen($.cast(this.S, $.get(this.DT, 2, $.l(D)))), $.i(0))));
+      $.if($.eq($.l(K), $.i(K_STR)), () => $.ret($.gt($.alen($.flatCast(this.S, $.get(this.DT, 2, $.l(D)))), $.i(0))));
       $.do($.i(1));
     });
   }
@@ -1062,7 +1062,7 @@ export class DgramBuilder {
   private byteLenFn(): number {
     return this.fn("byteLen", [this.dynRef], [F64], (f, $) => {
       const D = 0;
-      $.if($.eq(this.kind($, $.l(D)), $.i(K_STR)), () => $.ret($.i2d($.get(this.BT, 2, $.call(this.deps.strToBytes(), $.cast(this.S, $.get(this.DT, 2, $.l(D))))))));
+      $.if($.eq(this.kind($, $.l(D)), $.i(K_STR)), () => $.ret($.i2d($.get(this.BT, 2, $.call(this.deps.strToBytes(), $.flatCast(this.S, $.get(this.DT, 2, $.l(D))))))));
       $.do($.i2d($.get(this.BT, 2, $.call(this.deps.dynBytes(), $.l(D)))));
     });
   }
@@ -1155,8 +1155,8 @@ export class DgramBuilder {
         const PSTR = f.local(I32);
         $.put(PNUM, $.d(-1));
         $.if($.andThen($.notNull($.l(PORT)), $.eq(this.kind($, $.l(PORT)), $.i(K_NUM))), () => $.put(PNUM, $.get(this.DT, 1, $.l(PORT))));
-        $.if($.andThen($.notNull($.l(PORT)), $.andThen($.eq(this.kind($, $.l(PORT)), $.i(K_STR)), $.gt($.alen($.cast(this.S, $.get(this.DT, 2, $.l(PORT)))), $.i(0)))), () => {
-          $.put(PNUM, $.call(this.deps.strToNumber(), $.cast(this.S, $.get(this.DT, 2, $.l(PORT)))));
+        $.if($.andThen($.notNull($.l(PORT)), $.andThen($.eq(this.kind($, $.l(PORT)), $.i(K_STR)), $.gt($.alen($.flatCast(this.S, $.get(this.DT, 2, $.l(PORT)))), $.i(0)))), () => {
+          $.put(PNUM, $.call(this.deps.strToNumber(), $.flatCast(this.S, $.get(this.DT, 2, $.l(PORT)))));
           $.put(PSTR, $.i(1));
         });
         // validatePort's `port === 0 && !allowZero` compares the value
@@ -1190,11 +1190,11 @@ export class DgramBuilder {
         $.ret($.i(0));
       });
       // the datagram: the buffer (sliced), as bytes
-      $.put(BYTES, $.sel(this.bytesRef, $.eq(this.kind($, $.l(BUF)), $.i(K_STR)), $.call(this.deps.strToBytes(), $.cast(this.S, $.get(this.DT, 2, $.l(BUF)))), $.call(this.deps.dynBytes(), $.l(BUF))));
+      $.put(BYTES, $.sel(this.bytesRef, $.eq(this.kind($, $.l(BUF)), $.i(K_STR)), $.call(this.deps.strToBytes(), $.flatCast(this.S, $.get(this.DT, 2, $.l(BUF)))), $.call(this.deps.dynBytes(), $.l(BUF))));
       $.if($.l(SLICED), () => {
         $.put(BYTES, $.new_(this.BT, $.get(this.BT, 0, $.l(BYTES)), $.add($.get(this.BT, 1, $.l(BYTES)), $.d2i($.l(O32))), $.d2i($.l(L32))));
       });
-      $.do($.call(this.sendFn(), $.l(U), $.l(BYTES), $.sel(F64, $.l(CONNECTED), $.d(0), $.l(PNUM)), $.sel(this.strRef, $.andThen($.notNull($.l(ADDR)), $.eq(this.kind($, $.l(ADDR)), $.i(K_STR))), $.cast(this.S, $.get(this.DT, 2, $.l(ADDR))), this.lit($, ""))));
+      $.do($.call(this.sendFn(), $.l(U), $.l(BYTES), $.sel(F64, $.l(CONNECTED), $.d(0), $.l(PNUM)), $.sel(this.strRef, $.andThen($.notNull($.l(ADDR)), $.eq(this.kind($, $.l(ADDR)), $.i(K_STR))), $.flatCast(this.S, $.get(this.DT, 2, $.l(ADDR))), this.lit($, ""))));
     });
   }
 }

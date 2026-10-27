@@ -4,7 +4,7 @@
  * bytes stay exactly what the equivalent straight-line Code calls emit.
  * Nothing here knows any runtime type; it only spells instructions. */
 import { Code } from "./code.js";
-import { emitFlat } from "./strings.js";
+import { emitFlat, emitFlatCast } from "./strings.js";
 import { F64, I32, I64, type ValType } from "./module.js";
 
 /** A value: pushes its result(s) onto the stack when called. */
@@ -123,6 +123,15 @@ export class A {
     return () => {
       o();
       emitFlat(this.c, strType);
+    };
+  }
+  /** A string recovered from generic (anyref/eqref) storage made flat
+   * `$chars`, trapping on null (strings.ts emitFlatCast) — never
+   * `cast(strType, …)`, which code.ts refuses. */
+  flatCast(strType: number, o: X): X {
+    return () => {
+      o();
+      emitFlatCast(this.c, strType);
     };
   }
   test(T: number, o: X): X {

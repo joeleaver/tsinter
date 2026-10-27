@@ -25,6 +25,23 @@ export function currentOurMemoryIndex(): number {
   return ourMem;
 }
 
+/** The flat string array type (`$chars`) of the module being emitted —
+ * set by the Assembler for the length of one emission (like `ourMem`),
+ * null otherwise. refCast/refCastNull refuse it: a string value may be a
+ * concatenation node (strings unit S2), so the only crossing to `$chars`
+ * is strings.ts emitFlat/emitFlatCast (castChars, inside it). */
+let charsType: number | null = null;
+
+export function setCharsType(t: number | null): void {
+  charsType = t;
+}
+
+function guardChars(typeIndex: number): void {
+  if (charsType !== null && typeIndex === charsType) {
+    throw new Error("wasm emitter bug: a raw ref.cast to the flat string type — route it through strings.ts emitFlat/emitFlatCast (a string value may be a concatenation node)");
+  }
+}
+
 /** The engine's memory (memory 0 of an engine-carrying module). */
 export const ENGINE_MEMORY = 0;
 
@@ -133,16 +150,29 @@ export class Code {
     this.w.uleb(funcIndex);
   }
   /** ref.cast (ref $t) — traps when the value isn't a $t (the closure
-   * env downcast can never fail by construction). */
+   * env downcast can never fail by construction). Never to the flat
+   * string array type: see castChars. */
   refCast(typeIndex: number): void {
+    guardChars(typeIndex);
     this.w.u8(0xfb);
     this.w.uleb(0x16);
     this.w.sleb(typeIndex);
   }
   /** ref.cast (ref null $t) — refCast that passes null through. */
   refCastNull(typeIndex: number): void {
+    guardChars(typeIndex);
     this.w.u8(0xfb);
     this.w.uleb(0x17);
+    this.w.sleb(typeIndex);
+  }
+  /** ref.cast to the flat string array type — strings.ts and ropes.ts
+   * ONLY (the flatten boundary, where the operand is known flat). Every
+   * other site turns a string value into `$chars` through strings.ts
+   * emitFlat/emitFlatCast: a raw cast traps on a concatenation node
+   * (strings unit S2). */
+  castChars(typeIndex: number, nullable: boolean): void {
+    this.w.u8(0xfb);
+    this.w.uleb(nullable ? 0x17 : 0x16);
     this.w.sleb(typeIndex);
   }
   /** ref.test (ref $t) → i32 — refCast's total twin, for the one place
@@ -152,6 +182,12 @@ export class Code {
   refTest(typeIndex: number): void {
     this.w.u8(0xfb);
     this.w.uleb(0x14);
+    this.w.sleb(typeIndex);
+  }
+  /** ref.test (ref null $t) → i32 — refTest that answers 1 for null. */
+  refTestNull(typeIndex: number): void {
+    this.w.u8(0xfb);
+    this.w.uleb(0x15);
     this.w.sleb(typeIndex);
   }
   drop(): void {

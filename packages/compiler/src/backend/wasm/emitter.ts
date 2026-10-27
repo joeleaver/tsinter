@@ -236,7 +236,8 @@ import {
   INJECT_NEXT,
   INJECT_THROW,
 } from "./generators.js";
-import { StrBuilder, emitFlat, emitFlatCast } from "./strings.js";
+import { StrBuilder, emitFlat, emitFlatCast, emitFlatInline, setFlatCrossing } from "./strings.js";
+import { Ropes } from "./ropes.js";
 import { CasingBuilder } from "./casing.js";
 import { RegexBuilder } from "./regex-value.js";
 import { RegexStateBuilder } from "./regex-state.js";
@@ -292,7 +293,7 @@ import {
 } from "./stream.js";
 import { SymBuilder } from "./symbols.js";
 import { UnionBuilder, type UnionArmRep } from "./unions.js";
-import { Code, ENGINE_MEMORY } from "./code.js";
+import { Code, ENGINE_MEMORY, setCharsType } from "./code.js";
 import { EngineFormatError, fencedGlobalIn, loadEngine, type EngineImage } from "./engine.js";
 import { buildF64ToStr } from "./numfmt.js";
 import { buildPowCore } from "./pow.js";
@@ -354,7 +355,15 @@ const VALUE_POSITIONS: ReadonlyMap<string, readonly string[]> = new Map([
  * every read). A pure performance prescan: a binding it misses still
  * reads correctly through the tested (lazy) path, and one it wrongly
  * includes only pays a flatten per write. */
-function flatReadIds(roots: unknown, ids: ReadonlySet<string>): Set<string> {
+/** Strings unit S2's extra value positions (a module with concatenation
+ * nodes: Assembler.ropesLive): a class-field write and an assignment
+ * expression move their value. */
+const ROPE_VALUE_POSITIONS: ReadonlyMap<string, readonly string[]> = new Map([
+  ["fieldSet", ["value"]],
+  ["assignExpr", ["value"]],
+]);
+
+function flatReadIds(roots: unknown, ids: ReadonlySet<string>, ropes: boolean): Set<string> {
   const out = new Set<string>();
   const seen = new Set<object>();
   const visit = (v: unknown, valuePos: boolean): void => {
@@ -369,7 +378,34 @@ function flatReadIds(roots: unknown, ids: ReadonlySet<string>): Set<string> {
       if (!valuePos && typeof o.localId === "string" && ids.has(o.localId)) out.add(o.localId);
       return;
     }
-    const moves = typeof o.kind === "string" ? VALUE_POSITIONS.get(o.kind) : undefined;
+    // A concatenation's operands are read as it is: values when it
+    // builds a value (a node, strings unit S2), flat when it is read flat.
+    if (ropes && o.kind === "strConcat") {
+      const sc = o as { left?: unknown; right?: unknown };
+      visit(sc.left, valuePos);
+      visit(sc.right, valuePos);
+      return;
+    }
+    // A string ternary's arms and a sequence's result are read as the
+    // whole expression is.
+    if (ropes && (o.kind === "ternary" || o.kind === "seqExpr") && (o as { type?: { kind?: unknown } }).type?.kind === "string") {
+      const t = o as { cond?: unknown; then?: unknown; else_?: unknown; stmts?: unknown; result?: unknown };
+      if (o.kind === "ternary") {
+        visit(t.cond, false);
+        visit(t.then, valuePos);
+        visit(t.else_, valuePos);
+      } else {
+        visit(t.stmts, false);
+        visit(t.result, valuePos);
+      }
+      return;
+    }
+    // `.length` reads a value's stored length, never its code units.
+    if (ropes && o.kind === "strIntrinsic" && (o as { method?: unknown }).method === "length") {
+      visit((o as { receiver?: unknown }).receiver, true);
+      return;
+    }
+    const moves = typeof o.kind === "string" ? (VALUE_POSITIONS.get(o.kind) ?? (ropes ? ROPE_VALUE_POSITIONS.get(o.kind) : undefined)) : undefined;
     for (const [k, x] of Object.entries(o)) {
       if (o.kind === "recordLit" && k === "fields" && Array.isArray(x)) {
         for (const f of x) {
@@ -383,6 +419,44 @@ function flatReadIds(roots: unknown, ids: ReadonlySet<string>): Set<string> {
     }
   };
   visit(roots, false);
+  return out;
+}
+
+/** The ids among `ids` with an ACCUMULATING write (strings unit S2): an
+ * assign/declaration/assignExpr whose value is a concatenation or reads
+ * the binding itself (`s += x`, `s = "a" + s`, `s = f(s)`). Such a
+ * binding stays LAZY even when read flat: an eager shadow would flatten
+ * the fresh node at every write, turning a linear accumulation loop back
+ * into a quadratic one; lazily, the flatten happens at the next flat read
+ * (and once, if the reads come after the loop). */
+function accumulatingIds(roots: unknown, ids: ReadonlySet<string>): Set<string> {
+  const out = new Set<string>();
+  const seen = new Set<object>();
+  const mentions = (v: unknown, id: string, seen2: Set<object>): boolean => {
+    if (v === null || typeof v !== "object" || seen2.has(v)) return false;
+    seen2.add(v);
+    if (Array.isArray(v)) return v.some((x) => mentions(x, id, seen2));
+    const o = v as { kind?: unknown; localId?: unknown };
+    if (o.kind === "varRef" && o.localId === id) return true;
+    return Object.values(o).some((x) => mentions(x, id, seen2));
+  };
+  const visit = (v: unknown): void => {
+    if (v === null || typeof v !== "object" || seen.has(v)) return;
+    seen.add(v);
+    if (Array.isArray(v)) {
+      for (const x of v) visit(x);
+      return;
+    }
+    const o = v as { kind?: unknown; localId?: unknown; value?: unknown; init?: unknown };
+    if ((o.kind === "assign" || o.kind === "assignExpr" || o.kind === "varDecl") && typeof o.localId === "string" && ids.has(o.localId)) {
+      const value = o.kind === "varDecl" ? o.init : o.value;
+      if (value !== null && typeof value === "object") {
+        if ((value as { kind?: unknown }).kind === "strConcat" || mentions(value, o.localId, new Set())) out.add(o.localId);
+      }
+    }
+    for (const x of Object.values(o)) visit(x);
+  };
+  visit(roots);
   return out;
 }
 
@@ -1154,7 +1228,11 @@ function spawnSyncMayThrowView(mod: WModule): WModule {
   scan(mod.functions);
   // INC-29 U4: the socketless TLS keys (createSecureContext, the CA store) throw too.
   const netKeys = netModuleReachable(mod) || libCallWhere(mod, isTlsKey);
-  if (!found && !netKeys) return mod;
+  // Strings unit S2: a concatenation past V8's string length limit throws
+  // Node's RangeError on this tier (the native lanes abort), so each one
+  // reads as a throwing call.
+  const concats = hasStrConcat(mod);
+  if (!found && !netKeys && !concats) return mod;
   const copy = (node: unknown): unknown => {
     if (Array.isArray(node)) return node.map(copy);
     if (node !== null && typeof node === "object") {
@@ -1171,6 +1249,9 @@ function spawnSyncMayThrowView(mod: WModule): WModule {
       // INC-29 U1 (review): in a module that boxes net handles, `in` on a
       // checked-dynamic value can throw (the handle fence), so it reads as
       // a throwing call here.
+      if (out["kind"] === "strConcat") {
+        return { kind: "libCall", fn: "cp.execSync", args: [out["left"], out["right"]], type: out["type"], loc: out["loc"] };
+      }
       if (out["kind"] === "dynHasKey" && netKeys) {
         return { kind: "libCall", fn: "cp.execSync", args: [out["value"]], type: out["type"], loc: out["loc"] };
       }
@@ -1371,6 +1452,35 @@ function libCallWhere(mod: WModule, pred: (fn: string, args: readonly unknown[])
     if (node !== null && typeof node === "object") {
       const rec = node as Record<string, unknown>;
       if (rec["kind"] === "libCall" && typeof rec["fn"] === "string" && pred(rec["fn"], Array.isArray(rec["args"]) ? (rec["args"] as unknown[]) : [])) {
+        found = true;
+        return;
+      }
+      for (const value of Object.values(rec)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn.body);
+  }
+  return found;
+}
+
+/** Does any emitted function contain a string concatenation (strConcat)?
+ * Strings unit S2: only a concatenation in value position builds a
+ * concatenation node, so a module with none holds flat strings only and
+ * keeps S1's plain-cast flatten crossing — byte-identical to a build
+ * before ropes existed. Scans the same reachable set as libCallWhere. */
+function hasStrConcat(mod: WModule): boolean {
+  const reachable = reachableFunctionNames(mod);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      const rec = node as Record<string, unknown>;
+      if (rec["kind"] === "strConcat") {
         found = true;
         return;
       }
@@ -1621,9 +1731,14 @@ export function emitWasmModule(mod: IrModule): Uint8Array {
   const refuse: Refuse = (kind, loc) => {
     throw new WasmUnsupportedError(kind, loc);
   };
-  const asm = new Assembler(lowerResumableFunctions(mod, refuse), refuse);
-  asm.run();
-  return asm.finish();
+  try {
+    const asm = new Assembler(lowerResumableFunctions(mod, refuse), refuse);
+    asm.run();
+    return asm.finish();
+  } finally {
+    setFlatCrossing(null);
+    setCharsType(null);
+  }
 }
 
 /** Every distinct construct this module needs from the wasm backend, in
@@ -1635,7 +1750,12 @@ export function surveyWasmModule(mod: IrModule): string[] {
   const refuse: Refuse = (kind) => {
     seen.add(kind);
   };
-  new Assembler(lowerResumableFunctions(mod, refuse), refuse).run();
+  try {
+    new Assembler(lowerResumableFunctions(mod, refuse), refuse).run();
+  } finally {
+    setFlatCrossing(null);
+    setCharsType(null);
+  }
   return [...seen];
 }
 
@@ -2435,8 +2555,10 @@ const ANY_HEAP = -0x12;
 const ANY_REF: ValType = { kind: "ref", nullable: true, typeIndex: ANY_HEAP };
 /** Expression kinds whose string result is a freshly built or interned
  * flat `$chars` (never read back from value storage): walkExpr skips the
- * flatten cast after them. */
-const FLAT_STRING_EXPRS: ReadonlySet<string> = new Set(["strLit", "strConcat", "strIntrinsic", "toString"]);
+ * flatten after them. (strConcat is not one: in value position it may
+ * build a concatenation node — strings unit S2 — and walkExpr gives it
+ * its own flat path.) */
+const FLAT_STRING_EXPRS: ReadonlySet<string> = new Set(["strLit", "strIntrinsic", "toString"]);
 /** The string value type (strings unit S1): `(ref null eq)`. See strVal. */
 const STR_VAL: ValType = { kind: "ref", nullable: true, typeIndex: -0x13 };
 
@@ -2496,6 +2618,11 @@ class Assembler {
   private readonly funcIndexByName = new Map<string, number>();
   private readonly funcByName = new Map<string, WFunction>();
   private readonly strType: number;
+  /** Strings unit S2: the concatenation-node helpers (ropes.ts). */
+  private readonly ropes: Ropes;
+  /** Whether this module can build a concatenation node at all
+   * (hasStrConcat). */
+  private readonly ropesLive: boolean;
   private readonly cursorGlobal: number;
   private readonly writeFunc: number;
   /** `tsinter.now`'s index, or null in a module that cannot arm a timer
@@ -2754,6 +2881,15 @@ class Assembler {
     // require it — strings stay immutable by discipline: nothing outside
     // the concat builder may write an element.
     this.strType = this.mb.arrayType("i16", true);
+    // No raw ref.cast to it from here on (code.ts castChars).
+    setCharsType(this.strType);
+    // Strings unit S2: concatenation nodes (ropes.ts), and the flatten
+    // crossing every code-unit reader goes through (strings.ts emitFlat).
+    // A module with no concatenation can hold no node: it keeps the
+    // plain-cast crossing (strings.ts, crossing unset).
+    this.ropes = new Ropes(this.mb, this.strType, () => this.concatHelper(), () => this.strTooLongHelper());
+    this.ropesLive = hasStrConcat(mod);
+    setFlatCrossing(this.ropesLive ? { strType: this.strType, flat: () => this.ropes.flat(), flatCast: () => this.ropes.flatCast() } : null);
     // Phase 2 E0/E1: a module that reaches the island engine carries it
     // (engine.ts), and the engine's code owns memory 0 — so the decision
     // is made HERE, before any instruction is built, and moves every
@@ -5050,12 +5186,66 @@ class Assembler {
   }
 
   /** Flatten-if-needed: the value on the stack (any string value — eqref
-   * or anyref storage, nullable) becomes a `(ref null $chars)`. Only flat
-   * strings exist yet, so this is a cast (free where V8 already knows the
-   * operand is flat); ropes and slices make it the inline fast path plus
-   * a `%w.flat` call. */
+   * or anyref storage, nullable) becomes a `(ref null $chars)`: a flat
+   * array answers itself, a concatenation node (strings unit S2, ropes.ts)
+   * is flattened once and caches the result in place (%w.str.flat). */
   private emitFlat(code: Code = this.fn.code): void {
-    emitFlat(code, this.strType);
+    if (!this.ropesLive || (this.fn as FnState | undefined)?.code !== code) {
+      emitFlat(code, this.strType);
+      return;
+    }
+    // In a function body the flat test is inlined (a call per crossing
+    // cost a field-comparing sort comparator ~25%; inline, ~10%): only a
+    // node takes the call. (br_on_cast would make it one instruction;
+    // wasm2c's whole-program subset does not translate it yet.)
+    const t = this.acquireScratch(STR_VAL);
+    emitFlatInline(code, this.strType, t);
+    this.releaseScratch(STR_VAL, t);
+  }
+
+  /** A string expression's length as an i32 without flattening it
+   * (strings unit S2): a binding with a filled flat shadow answers from
+   * the shadow, anything else from the value (%w.str.len — a node stores
+   * its length). */
+  private emitStrValueLength(e: WExpr): void {
+    const code = this.fn.code;
+    if (!this.ropesLive) {
+      // Every string is flat: the length of the flat read.
+      this.walkExpr(e);
+      code.arrayLen();
+      return;
+    }
+    if (e.kind === "varRef") {
+      const global = this.globalById.get(e.localId);
+      const shadow = this.bindingShadow(e.localId, e.loc);
+      if (shadow !== undefined) {
+        const get = (i: number): void => (shadow.global ? code.globalGet(i) : code.localGet(i));
+        const slot = global !== undefined ? this.globalIndex(global, e.loc) : this.localIndex(e.localId);
+        if (this.bindingEager(e.localId)) {
+          if (FLAT_CHECK) this.emitFlatCheck(shadow.slot, slot, shadow.global);
+          get(shadow.slot);
+          code.arrayLen();
+          return;
+        }
+        get(shadow.slot);
+        code.refIsNull();
+        code.ifResult(I32);
+        get(slot);
+        code.call(this.ropes.len());
+        code.else_();
+        get(shadow.slot);
+        code.arrayLen();
+        code.end();
+        return;
+      }
+    }
+    if (FLAT_STRING_EXPRS.has(e.kind)) {
+      this.walkExprValue(e);
+      code.arrayLen();
+      return;
+    }
+    this.walkValue(e);
+    code.call(this.ropes.len());
   }
 
   /* ── closures ───────────────────────────────────────────────────────────
@@ -13781,7 +13971,7 @@ class Assembler {
   }
 
   private dynStr($: A, d: X): X {
-    return $.cast(this.strType, $.get(this.dyn.dynT(), DYN_REF, d));
+    return $.flatCast(this.strType, $.get(this.dyn.dynT(), DYN_REF, d));
   }
 
   private boxStrX($: A, s: X): X {
@@ -18446,7 +18636,8 @@ class Assembler {
       flatShadow.set(id, fn.params.length + 1 + localsOut.length);
       localsOut.push(this.strRef);
     }
-    const eagerFlat = shadowed.size > 0 ? flatReadIds(fn.body, shadowed) : new Set<string>();
+    const eagerFlat = shadowed.size > 0 ? flatReadIds(fn.body, shadowed, this.ropesLive) : new Set<string>();
+    if (this.ropesLive && eagerFlat.size > 0) for (const id of accumulatingIds(fn.body, eagerFlat)) eagerFlat.delete(id);
     this.fn = {
       fn,
       code: new Code(),
@@ -19025,7 +19216,9 @@ class Assembler {
         const field = this.classField(s.className, s.field, s.loc);
         if (field === null) return;
         this.walkExpr(s.obj);
-        this.walkExpr(s.value);
+        // A class field holds a string VALUE (`this.buf += x` stays a node).
+        if (this.ropesLive) this.walkValue(s.value);
+        else this.walkExpr(s.value);
         code.structSet(field.info.struct, field.index);
         return;
       }
@@ -19658,7 +19851,10 @@ class Assembler {
     if (this.globalEagerFlatField === null) {
       const ids = new Set<string>();
       for (const g of this.globalById.values()) if (g.type.kind === "string") ids.add(g.id);
-      this.globalEagerFlatField = ids.size > 0 ? flatReadIds(this.mod.functions.map((f) => f.body), ids) : new Set();
+      const bodies = this.mod.functions.map((f) => f.body);
+      const eager = ids.size > 0 ? flatReadIds(bodies, ids, this.ropesLive) : new Set<string>();
+      if (this.ropesLive && eager.size > 0) for (const id of accumulatingIds(bodies, eager)) eager.delete(id);
+      this.globalEagerFlatField = eager;
     }
     return this.globalEagerFlatField;
   }
@@ -19735,6 +19931,29 @@ class Assembler {
    * sized) cast. walkValue is the non-flattening twin for pure moves. */
   private walkExpr(e: WExpr): void {
     if (e.kind === "varRef" && e.type.kind === "string" && this.readFlatShadow(e.localId, e.loc)) return;
+    if (this.ropesLive && e.type.kind === "string" && e.kind === "ternary") {
+      // Read flat: each arm flat (walkExprValue's value twin keeps nodes).
+      this.walkExpr(e.cond);
+      this.openIfResult(this.strRef);
+      this.walkExpr(e.then);
+      this.fn.code.else_();
+      this.walkExpr(e.else_);
+      this.close();
+      return;
+    }
+    if (this.ropesLive && e.type.kind === "string" && e.kind === "seqExpr") {
+      this.walkBody(e.stmts);
+      this.walkExpr(e.result);
+      return;
+    }
+    if (e.kind === "strConcat") {
+      // Read flat on the spot: one flat copy, never a node to flatten.
+      this.walkExpr(e.left);
+      this.walkExpr(e.right);
+      this.fn.code.call(this.ropes.flatCat());
+      this.emitPendingCheck(); // past the length limit: RangeError
+      return;
+    }
     this.walkExprValue(e);
     if (e.type.kind === "string" && !FLAT_STRING_EXPRS.has(e.kind)) this.emitFlat();
   }
@@ -20084,7 +20303,10 @@ class Assembler {
       }
 
       case "assignExpr": {
-        this.walkExpr(e.value);
+        // A string is assigned as a VALUE (strings unit S2); walkExpr
+        // flattens the result only where it is read flat.
+        if (this.ropesLive) this.walkValue(e.value);
+        else this.walkExpr(e.value);
         const local = this.fn.localById.get(e.localId);
         if (local?.boxed === true) {
           const soft = this.mapTypeSoft(local.type);
@@ -20098,7 +20320,7 @@ class Assembler {
           this.releaseScratch(soft, v);
           return;
         }
-        this.bindingSet(e.localId, e.loc, e.value.type.kind === "string", true);
+        this.bindingSet(e.localId, e.loc, !this.ropesLive && e.value.type.kind === "string", true);
         return;
       }
 
@@ -20242,18 +20464,23 @@ class Assembler {
           code.unreachable();
           return;
         }
+        // A string ternary in value position keeps its arms as values
+        // (strings unit S2: `s = c ? s + x : y + s` stays a node; walkExpr
+        // has the flat twin).
+        const arm = (x: WExpr): void => (this.ropesLive ? this.walkValue(x) : this.walkExpr(x));
         this.walkExpr(e.cond);
         this.openIfResult(t);
-        this.walkExpr(e.then);
+        arm(e.then);
         code.else_();
-        this.walkExpr(e.else_);
+        arm(e.else_);
         this.close();
         return;
       }
 
       case "seqExpr":
         this.walkBody(e.stmts);
-        this.walkExpr(e.result);
+        if (this.ropesLive) this.walkValue(e.result);
+        else this.walkExpr(e.result);
         return;
 
       case "strEq":
@@ -20276,9 +20503,12 @@ class Assembler {
       }
 
       case "strConcat":
-        this.walkExpr(e.left);
-        this.walkExpr(e.right);
-        code.call(this.concatHelper());
+        // A VALUE: a concatenation node at 13 code units or more
+        // (strings unit S2, ropes.ts) — `s += x` in a loop is linear.
+        this.walkValue(e.left);
+        this.walkValue(e.right);
+        code.call(this.ropes.cat());
+        this.emitPendingCheck(); // past the length limit: RangeError
         return;
 
       case "arrayLit": {
@@ -25823,6 +26053,12 @@ class Assembler {
         // discriminated-union type too, so `e` itself narrows to `never`
         // in the default arm below — `e.loc` there would not typecheck.
         const loc = e.loc;
+        if (m === "length") {
+          // O(1) on either shape (strings unit S2): never flattens.
+          this.emitStrValueLength(e.receiver);
+          code.f64ConvertI32S();
+          return;
+        }
         this.walkExpr(e.receiver);
         const argOr = (i: number, dflt: number): void => {
           const a = e.args[i];
@@ -25830,10 +26066,6 @@ class Assembler {
           else code.f64Const(dflt);
         };
         switch (m) {
-          case "length":
-            code.arrayLen();
-            code.f64ConvertI32S();
-            return;
           case "charCodeAt":
             this.walkExpr(e.args[0]!);
             code.call(this.strs.charCodeAt());
@@ -51393,6 +51625,21 @@ class Assembler {
   }
 
   private concatFunc: number | null = null;
+  private strTooLongFunc: number | null = null;
+
+  /** %w.str.tooLong() — fills the exception cell with Node's
+   * `RangeError: Invalid string length` (a concatenation past V8's
+   * String::kMaxLength, ropes.ts MAX_STRING_LENGTH); the concatenation
+   * site's pending check unwinds. */
+  private strTooLongHelper(): number {
+    if (this.strTooLongFunc !== null) return this.strTooLongFunc;
+    const idx = this.mb.declareFunc(this.mb.funcType([], []), "%w.str.tooLong");
+    this.strTooLongFunc = idx;
+    const c = new Code();
+    this.emitSetCellError(c, "%RangeError", "RangeError", (c2) => this.pushStrLitInto(c2, "Invalid string length"), null);
+    this.mb.setBody(idx, [], c.bytes());
+    return idx;
+  }
 
   /** %w.concat(ref, ref) → ref — the one place string storage is written:
    * a fresh array filled by two array.copys, immutable from then on. */

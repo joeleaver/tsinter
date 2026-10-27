@@ -243,7 +243,7 @@ export class FetchBuilder {
   }
 
   private strOf($: A, d: X): X {
-    return $.cast(this.deps.strType(), $.get(this.dyn.dynT(), DYN_REF, d));
+    return $.flatCast(this.deps.strType(), $.get(this.dyn.dynT(), DYN_REF, d));
   }
 
   private boxHandle($: A, tag: number, ref: X): X {

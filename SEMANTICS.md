@@ -241,21 +241,29 @@ confirmed (own hand-verification, reverted, hash equal before/after):
 routing the pending check to a dead condition reddens that pin by
 name.
 
-## S008 — Wasm tier: string `repeat`/`pad` size cap is 2^31 units
+## S008 — Wasm tier: string `repeat`/`pad`/`join` past the length limit trap
 
 `String.prototype.repeat` with a negative or infinite count traps (the
 spec's RangeError through the S003 bridge, exit 1 like Node). The SIZE
-limit differs: results at or past 2^31 UTF-16 units trap, where Node's
-RangeError fires around 2^29 units — so a result length in [2^29, 2^31)
-that Node rejects may instead be attempted here and survive if the GC can
-allocate it. **Rationale:** native parity — the C runtime's `scr_str_repeat` aborts
-through `scr_trap` on the same conditions (an UNCATCHABLE termination where
-Node throws a catchable RangeError; the may-throw analysis counts runtime
-traps as aborts on every tier), and 2^31 is the wasm storage's own bound;
-real programs between the thresholds are allocating gigabytes of string
-either way. **Tested by:** the wasm emitter unit test covers the trap side
-(negative count); the divergent window is deliberately untested — corpus
-programs cannot sit in it without multi-GB appetites.
+limit is Node's own — V8's String::kMaxLength, 0x1fffffe8 (2^29 − 24)
+UTF-16 units — but the failure mode differs: a `repeat`, `padStart`/
+`padEnd` or `Array.prototype.join` result past it traps (checked before
+anything is allocated), where Node throws a catchable `RangeError:
+Invalid string length`. **Rationale:** native parity — the C runtime's
+`scr_str_repeat` aborts through `scr_trap` on the same conditions (an
+UNCATCHABLE termination where Node throws a catchable RangeError; the
+may-throw analysis counts runtime traps as aborts on every tier); real
+programs at the threshold are allocating a gigabyte of string either way.
+Concatenation is NOT in this entry: `+`, `+=` and template literals throw
+Node's catchable RangeError at exactly the same limit on this tier
+(strings unit S2 — a concatenation node makes a string past the limit
+cheap to describe, so the check sits where the concatenation is built,
+and a function containing one counts as may-throw).
+*Amended (strings unit S2):* the cap was 2^31 units for `repeat`/`pad`
+and absent for `join`; it is now Node's threshold for all three.
+**Tested by:** packages/compiler/test/wasm-string-length-limit.test.ts —
+`repeat` and `padStart` one past the limit trap; concatenation's
+catchable RangeError and exactly-the-limit acceptance match Node.
 
 ## S009 — A checked cast on a catch binding validates instead of erasing *(inherited)*
 

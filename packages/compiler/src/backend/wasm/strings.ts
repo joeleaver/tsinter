@@ -18,7 +18,7 @@
  * which come from the shared single-character table (%w.str.unit, #299)
  * — string identity is unobservable for JS primitives, and no helper
  * writes into an array it did not allocate itself. RangeError sites (repeat's negative or
- * infinite count, repeat/pad results at or past 2^31 units) TRAP — the
+ * infinite count, repeat/pad results past V8's string length limit) TRAP — the
  * S003 bridge, exit 1 like Node's uncaught RangeError; Node's own
  * threshold is lower (~2^29 units) but everything between traps on
  * allocation anyway. toLowerCase/toUpperCase are NOT here: ECMA Default
@@ -27,29 +27,78 @@
 import { Code } from "./code.js";
 import { F64, I32, ModuleBuilder, type ValType } from "./module.js";
 import { BUF, LEN, type VecInfo } from "./arrays.js";
+import { MAX_STRING_LENGTH } from "./ropes.js";
 import type { BytesElem } from "./typedarrays.js";
 
-/** Strings unit S1 — flatten-if-needed: the string VALUE on top of the
- * stack (read from value storage typed `(ref null eq)`, or from generic
- * eqref/anyref storage, nullable) becomes the `(ref null $chars)` flat
- * array every reader of code units takes. Only flat strings exist yet, so
- * this is a `ref.cast null $chars` — free where V8 already knows the
- * operand is flat. Ropes and slices (S2/S3) make it the inline fast path
- * plus a `%w.flat` call, so EVERY site that turns a string value into
- * code units must come through here (a raw `$chars` use of value storage
+/** The module being emitted's flatten crossing (strings unit S2): the
+ * flat array type and the rope-aware helpers (ropes.ts) behind emitFlat
+ * and emitFlatCast. Set by the Assembler as it starts a module — one
+ * module is emitted at a time, synchronously from construction to
+ * finish (code.ts's `ourMem` has the same lifetime) — and cleared when
+ * it ends. A body built while a DIFFERENT string type's crossing is live
+ * fails loudly instead of calling the wrong helper.
+ *
+ * With no crossing set the module is not the Assembler's (a helper
+ * builder exercised on its own module, as the unit tests do): nothing in
+ * such a module can build a concatenation node — %w.str.cat exists only
+ * beside a registered crossing — so every string in it is flat, and the
+ * crossing is the S1 cast. */
+interface FlatCrossing {
+  strType: number;
+  flat(): number;
+  flatCast(): number;
+}
+let crossing: FlatCrossing | null = null;
+
+export function setFlatCrossing(x: FlatCrossing | null): void {
+  crossing = x;
+}
+
+function crossingFor(strType: number): FlatCrossing | null {
+  if (crossing !== null && crossing.strType !== strType) {
+    throw new Error(`wasm emitter bug: string flatten for $chars type ${strType} while type ${crossing.strType}'s module is being emitted`);
+  }
+  return crossing;
+}
+
+/** Flatten-if-needed (strings units S1/S2): the string VALUE on top of
+ * the stack (read from value storage typed `(ref null eq)`, or from
+ * generic eqref/anyref storage, nullable) becomes the `(ref null $chars)`
+ * flat array every reader of code units takes — a flat array answers
+ * itself, a concatenation node (ropes.ts) is flattened once and caches
+ * the result in place. EVERY site that turns a string value into code
+ * units must come through here (a raw `$chars` use of value storage
  * fails validation; this is the one sanctioned crossing). */
 export function emitFlat(c: Code, strType: number): void {
-  c.refCastNull(strType);
+  const x = crossingFor(strType);
+  if (x === null) c.castChars(strType, true);
+  else c.call(x.flat());
+}
+
+/** emitFlat with its flat test inlined: `scratch` is an eqref local the
+ * caller owns for the duration. A flat array (or null) is cast in place;
+ * only a concatenation node takes the call. */
+export function emitFlatInline(c: Code, strType: number, scratch: number): void {
+  c.localTee(scratch);
+  c.refTestNull(strType);
+  c.ifResult({ kind: "ref", nullable: true, typeIndex: strType });
+  c.localGet(scratch);
+  c.castChars(strType, true);
+  c.else_();
+  c.localGet(scratch);
+  emitFlat(c, strType);
+  c.end();
 }
 
 /** emitFlat for a string recovered from GENERIC storage (an anyref/eqref
  * slot whose tag says it holds a string: a dyn box, the exception cell, a
  * promise payload, an event argument): flatten, and trap on null as the
- * `ref.cast $chars` it replaces always did. One instruction today; the
- * rope/slice-aware crossing once those shapes exist (a string value may
- * have reached such a slot without passing walkExpr). */
+ * `ref.cast $chars` it replaces always did (a string value may have
+ * reached such a slot without passing walkExpr). */
 export function emitFlatCast(c: Code, strType: number): void {
-  c.refCast(strType);
+  const x = crossingFor(strType);
+  if (x === null) c.castChars(strType, false);
+  else c.call(x.flatCast());
 }
 
 export interface StrDeps {
@@ -877,8 +926,9 @@ export class StrBuilder {
   }
 
   /** %w.str.repeat — (s, f64 count) → str. Negative or +Infinity counts
-   * are the spec's RangeError → trap (S003 bridge); results at or past
-   * 2^31 units trap too (Node's own RangeError fires around 2^29). */
+   * are the spec's RangeError → trap (S003 bridge); a result longer than
+   * V8's String::kMaxLength (ropes.ts MAX_STRING_LENGTH, Node's own
+   * RangeError threshold) traps too (S008). */
   repeat(): number {
     return this.cached("repeat", () => {
       const idx = this.mb.declareFunc(
@@ -924,10 +974,10 @@ export class StrBuilder {
       c.localGet(L);
       c.f64ConvertI32S();
       c.f64Mul();
-      c.f64Const(2147483648);
-      c.f64Ge();
+      c.f64Const(MAX_STRING_LENGTH);
+      c.f64Gt();
       c.ifVoid();
-      c.unreachable(); // result size unrepresentable — RangeError's trap
+      c.unreachable(); // past V8's String::kMaxLength — RangeError's trap (S008)
       c.end();
       c.localGet(X);
       c.i32TruncF64S();
@@ -1163,8 +1213,8 @@ export class StrBuilder {
    * target in UTF-16 units. At-or-below-target and empty-fill answer the
    * RECEIVER (identity — unobservable for primitives); the truncated
    * final fill keeps its first rem units EXACTLY (a split astral pair
-   * keeps the lone high half, JS's answer — no U+FFFD here). Targets at
-   * or past 2^31 trap (the repeat() policy). */
+   * keeps the lone high half, JS's answer — no U+FFFD here). Targets
+   * past MAX_STRING_LENGTH trap (the repeat() policy, S008). */
   pad(): number {
     return this.cached("pad", () => {
       const idx = this.mb.declareFunc(
@@ -1197,10 +1247,10 @@ export class StrBuilder {
       c.return_();
       c.end();
       c.localGet(X);
-      c.f64Const(2147483648);
-      c.f64Ge();
+      c.f64Const(MAX_STRING_LENGTH);
+      c.f64Gt();
       c.ifVoid();
-      c.unreachable(); // target size unrepresentable — RangeError's trap
+      c.unreachable(); // past V8's String::kMaxLength — RangeError's trap (S008)
       c.end();
       c.localGet(X);
       c.i32TruncF64S();

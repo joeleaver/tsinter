@@ -490,7 +490,7 @@ export class TlsBuilder {
     return $.andThen($.notNull(d), $.eq(this.kind($, d), $.i(k)));
   }
   private dstr($: A, d: X): X {
-    return $.cast(this.S, $.get(this.DT, 2, d));
+    return $.flatCast(this.S, $.get(this.DT, 2, d));
   }
   /** A string or ArrayBufferView's bytes (validateKeyOrCertOption has
    * passed): a string's UTF-8, a view's bytes. */

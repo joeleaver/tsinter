@@ -19,6 +19,7 @@
 import { Code } from "./code.js";
 import { F64, I32, ModuleBuilder, type StorageType, type ValType } from "./module.js";
 import { emitFlat } from "./strings.js";
+import { MAX_STRING_LENGTH } from "./ropes.js";
 
 export interface VecDeps {
   /** %w.strEq's index (content equality for string elements). */
@@ -729,6 +730,24 @@ export class VecBuilder {
         c.arrayNewDefault(partsType);
         c.localSet(PARTS);
       }
+      // A result past V8's String::kMaxLength is Node's RangeError: a trap
+      // here (S008), checked in f64 so no i32 sum can wrap first.
+      const tooLong = (): void => {
+        c.f64Const(MAX_STRING_LENGTH);
+        c.f64Gt();
+        c.ifVoid();
+        c.unreachable();
+        c.end();
+      };
+      c.localGet(L);
+      c.i32Const(1);
+      c.i32Sub();
+      c.f64ConvertI32S();
+      c.localGet(SEP);
+      c.arrayLen();
+      c.f64ConvertI32S();
+      c.f64Mul();
+      tooLong();
       // separators: (L - 1) * |sep| when L > 0
       c.localGet(L);
       c.ifResult(I32);
@@ -776,7 +795,9 @@ export class VecBuilder {
         c.arrayLen();
         c.localGet(TOT);
         c.i32Add();
-        c.localSet(TOT);
+        c.localTee(TOT);
+        c.f64ConvertI32U();
+        tooLong();
       });
       c.localGet(TOT);
       c.arrayNewDefault(strType);

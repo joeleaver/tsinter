@@ -6547,7 +6547,7 @@ export class HttpBuilder {
       const AT = this.AT;
       $.put(AG, $.cast(AT, $.l(e.a)));
       $.put(S, $.cast(this.sockT, $.l(e.b)));
-      $.put(NAME, $.cast(this.strT, $.l(e.c)));
+      $.put(NAME, $.flatCast(this.strT, $.l(e.c)));
       $.if($.not($.call(this.net.writableGetterHelper(), $.l(S))), () => {
         $.run(this.net.destroyHelper(), $.l(S), $.nul(this.deps.errType()));
         $.ret();
@@ -6676,7 +6676,7 @@ export class HttpBuilder {
     return this.tick("agentOnClose", ($, e) => {
       const ag = $.cast(this.AT, $.l(e.a));
       $.set(this.AT, A_TOTAL, ag, $.dsub($.get(this.AT, A_TOTAL, ag), $.d(1)));
-      $.run(this.agentRemoveSocketFn(), ag, $.cast(this.sockT, $.l(e.b)), $.cast(this.strT, $.l(e.c)));
+      $.run(this.agentRemoveSocketFn(), ag, $.cast(this.sockT, $.l(e.b)), $.flatCast(this.strT, $.l(e.c)));
     });
   }
 
@@ -6704,7 +6704,7 @@ export class HttpBuilder {
       $.put(AG, $.cast(this.AT, $.l(e.a)));
       $.put(S, $.cast(this.sockT, $.l(e.b)));
       $.set(this.AT, A_TOTAL, $.l(AG), $.dsub($.get(this.AT, A_TOTAL, $.l(AG)), $.d(1)));
-      $.run(this.agentRemoveSocketFn(), $.l(AG), $.l(S), $.cast(this.strT, $.l(e.c)));
+      $.run(this.agentRemoveSocketFn(), $.l(AG), $.l(S), $.flatCast(this.strT, $.l(e.c)));
       $.put(H, $.call(this.hcliFn(), $.l(S)));
       this.soff($, NET_LISTS.L_CLOSE, $.l(S), $.get(this.hcliT, 8, $.l(H)));
       this.soff($, NET_LISTS.L_FREE, $.l(S), $.get(this.hcliT, 7, $.l(H)));
