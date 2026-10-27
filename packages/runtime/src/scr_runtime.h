@@ -4543,6 +4543,11 @@ double scr_date_parse_get_time(ScrStr *s);
 double scr_tz_offset_ms(double t);
 double scr_tz_local_to_utc(double local);
 void scr_tz_changed(void);
+/* The zone's DST flag at an instant, and the zone as chosen (0 the C
+ * library's own, unidentified; 1 a named zone, *id its name; 2 a fixed
+ * zone, *id the TZ name ICU did not know). */
+int scr_tz_isdst(double t);
+int scr_tz_zone(const char **id);
 /* Date.UTC over already-number arguments (frontend completes the spec's
  * defaults): MakeDay/MakeTime/TimeClip exactly — 0–99 maps to 1900+year,
  * month/date rollover, NaN for non-finite parts, out-of-range results,

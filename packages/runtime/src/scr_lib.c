@@ -3504,38 +3504,173 @@ ScrStr *scr_date_to_iso(double ms) {
 
 /* ── the local time zone (SEMANTICS.md S113) ─────────────────────────────
  *
- * The C library's zone (TZ, else the system zone), asked one instant at a
- * time — what the WasmGC tier asks its host through tzCall OFFSET. Every
- * Node rule lives in the callers: scr_tz_local_to_utc is V8's ToUTC, and
- * the engine's Date (quickjs.c's tsinter zone hooks) and Date#toString's
- * zone name (scr_web.c) read the offset from here. Seconds are kept: a
- * local-mean-time offset (Chicago before 1883: -5:50:36) is exact, as in
- * Node. localtime_r need not re-read TZ, so the first use and every
- * process.env.TZ write or delete call tzset (Node re-reads its zone then
- * too). */
+ * The zone Node would pick, asked one instant at a time — what the WasmGC
+ * tier asks its host through tzCall OFFSET. Every Node rule lives in the
+ * callers: scr_tz_local_to_utc is V8's ToUTC, and the engine's Date
+ * (quickjs.c's tsinter zone hooks) and Date#toString's zone name (scr_web.c)
+ * read the zone from here. Seconds are kept: a local-mean-time offset
+ * (Chicago before 1883: -5:50:36) is exact, as in Node.
+ *
+ * WHICH zone is ICU's choice (TimeZone::detectHostTimeZone / uprv_tzname),
+ * measured against Node v24.18.1, not the C library's reading of TZ:
+ *   - TZ passes ICU's isValidOlsonID (no digit or comma before the end,
+ *     except at most two trailing digits — "UTC+3", "GMT-2", "JST-9" —
+ *     or one of PST8PDT MST7MDT CST6CDT EST5EDT): less a leading ':' and a
+ *     "posix/" or "right/" prefix, it names the zone. A zone file of that
+ *     name (TZDIR, else /usr/share/zoneinfo) makes it a ZONE with its full
+ *     history; any other name is a FIXED zone at the C library's standard
+ *     offset for the original TZ ("UTC+3" is -03:00 all year, ":/etc/
+ *     localtime" is the system zone's standard offset with no DST, "foo"
+ *     and "" are +00:00).
+ *   - TZ unset, or failing that check ("EST5EDT,M3.2.0,M11.1.0",
+ *     "<+0330>-3:30", "UTC-05:30"): the system zone, /etc/localtime's
+ *     resolved path below "/zoneinfo/" (ICU's realpath), a ZONE as above.
+ *   - Neither: the C library's own zone, as it reads TZ (SYSTEM).
+ * A ZONE whose name differs from TZ is read by pointing the C library at
+ * it for the moment of the question — tzset over a private one-entry
+ * environment, the real one restored at once — so process.env.TZ itself
+ * is never rewritten. localtime_r need not re-read TZ, so the choice is
+ * remade at the first use and at every process.env.TZ write or delete
+ * (Node re-reads its zone then too). */
+enum { SCR_TZ_SYSTEM = 0, SCR_TZ_ZONE = 1, SCR_TZ_FIXED = 2 };
 static bool scr_tz_ready = false;
+static int scr_tz_mode = SCR_TZ_SYSTEM;
+static char scr_tz_id[256];          /* the zone's name (SCR_TZ_ZONE / FIXED) */
+static char scr_tz_env[260];         /* "TZ=<id>" when the C library needs pointing */
+static bool scr_tz_swap = false;
+static long scr_tz_raw_s = 0;        /* SCR_TZ_FIXED: seconds east */
 
-void scr_tz_changed(void) {
-  tzset();
-  scr_tz_ready = true;
+static bool scr_tz_valid_olson(const char *id) {
+  size_t i = 0;
+  while (id[i] != '\0' && !(id[i] >= '0' && id[i] <= '9') && id[i] != ',') i++;
+  size_t max = i + 2;
+  while (i < max && id[i] >= '0' && id[i] <= '9') i++;
+  return id[i] == '\0' || strcmp(id, "PST8PDT") == 0 || strcmp(id, "MST7MDT") == 0 ||
+         strcmp(id, "CST6CDT") == 0 || strcmp(id, "EST5EDT") == 0;
 }
 
-double scr_tz_offset_ms(double t) {
-  if (!scr_tz_ready) scr_tz_changed();
+#if !defined(_WIN32)
+static bool scr_tz_zone_file(const char *id) {
+  if (id[0] == '\0' || id[0] == '/' || strstr(id, "..") != NULL) return false;
+  const char *dir = getenv("TZDIR");
+  if (dir == NULL || dir[0] == '\0') dir = "/usr/share/zoneinfo";
+  char path[PATH_MAX];
+  if ((size_t)snprintf(path, sizeof path, "%s/%s", dir, id) >= sizeof path) return false;
+  struct stat st;
+  return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+/* ICU's uprv_timezone(): the standard offset (seconds WEST) of the zone the
+ * C library reads from the real TZ. */
+static long scr_tz_libc_west(void) {
+#if defined(__GLIBC__)
+  return timezone;
+#else
+  time_t now = time(NULL);
+  struct tm tm;
+  if (localtime_r(&now, &tm) == NULL) return 0;
+  return -(tm.tm_gmtoff - (tm.tm_isdst > 0 ? 3600 : 0));
+#endif
+}
+#endif
+
+static void scr_tz_resolve(void) {
+  scr_tz_ready = true;
+  scr_tz_mode = SCR_TZ_SYSTEM;
+  scr_tz_swap = false;
+  tzset(); /* the real TZ, as the C library reads it */
+#if !defined(_WIN32)
+  const char *tz = getenv("TZ");
+  const char *id = NULL;
+  char link[PATH_MAX];
+  if (tz != NULL && scr_tz_valid_olson(tz)) {
+    if (*tz == ':') tz++;
+    if (strncmp(tz, "posix/", 6) == 0 || strncmp(tz, "right/", 6) == 0) tz += 6;
+    if (strlen(tz) >= sizeof scr_tz_id) return;
+    strcpy(scr_tz_id, tz);
+    if (!scr_tz_zone_file(tz)) {
+      scr_tz_mode = SCR_TZ_FIXED;
+      scr_tz_raw_s = -scr_tz_libc_west();
+      return;
+    }
+    id = scr_tz_id;
+  } else if (realpath("/etc/localtime", link) != NULL) {
+    const char *tail = strstr(link, "/zoneinfo/");
+    if (tail != NULL && scr_tz_valid_olson(tail + 10) && scr_tz_zone_file(tail + 10) &&
+        strlen(tail + 10) < sizeof scr_tz_id) {
+      strcpy(scr_tz_id, tail + 10);
+      id = scr_tz_id;
+    }
+  }
+  if (id == NULL) return;
+  scr_tz_mode = SCR_TZ_ZONE;
+  /* The C library already reads this zone when TZ names it exactly, or
+   * when TZ is unset and the zone is the system's; otherwise point it. */
+  const char *real = getenv("TZ");
+  if (real != NULL && strcmp(real, id) != 0) {
+    snprintf(scr_tz_env, sizeof scr_tz_env, "TZ=%s", id);
+    scr_tz_swap = true;
+  }
+#endif
+}
+
+void scr_tz_changed(void) {
+  scr_tz_resolve();
+}
+
+/* localtime_r of the chosen zone. */
+static bool scr_tz_localtime(time_t s, struct tm *tm) {
+  if (!scr_tz_ready) scr_tz_resolve();
+#if defined(_WIN32)
+  return _localtime64_s(tm, &s) == 0;
+#else
+  if (scr_tz_swap) {
+    char *envp[2] = {scr_tz_env, NULL};
+    char **saved = environ;
+    environ = envp;
+    tzset(); /* a no-op when the C library already holds this zone */
+    environ = saved;
+  }
+  return localtime_r(&s, tm) != NULL;
+#endif
+}
+
+static time_t scr_tz_seconds(double t) {
   /* Only instants a Date can hold are asked about (TimeClip's range). */
   if (t < -8640000000000000.0) t = -8640000000000000.0;
   if (t > 8640000000000000.0) t = 8640000000000000.0;
-  time_t s = (time_t)floor(t / 1000.0);
+  return (time_t)floor(t / 1000.0);
+}
+
+double scr_tz_offset_ms(double t) {
+  if (!scr_tz_ready) scr_tz_resolve();
+  if (scr_tz_mode == SCR_TZ_FIXED) return (double)scr_tz_raw_s * 1000.0;
+  time_t s = scr_tz_seconds(t);
   struct tm tm;
+  if (!scr_tz_localtime(s, &tm)) return 0;
 #if defined(_WIN32)
   /* The CRT's zone: no history before 1970 (localtime fails there) —
    * SEMANTICS.md S113's Windows note. */
-  if (_localtime64_s(&tm, &s) != 0) return 0;
   return (double)(_mkgmtime64(&tm) - s) * 1000.0;
 #else
-  if (localtime_r(&s, &tm) == NULL) return 0;
   return (double)tm.tm_gmtoff * 1000.0;
 #endif
+}
+
+/* The zone's DST flag at an instant (the name's choice, scr_web.c), and
+ * the zone as chosen: SCR_TZ_ZONE with its name, SCR_TZ_FIXED, or
+ * SCR_TZ_SYSTEM (unidentified). */
+int scr_tz_isdst(double t) {
+  if (!scr_tz_ready) scr_tz_resolve();
+  if (scr_tz_mode == SCR_TZ_FIXED) return 0;
+  struct tm tm;
+  return scr_tz_localtime(scr_tz_seconds(t), &tm) && tm.tm_isdst > 0;
+}
+
+int scr_tz_zone(const char **id) {
+  if (!scr_tz_ready) scr_tz_resolve();
+  *id = scr_tz_mode == SCR_TZ_SYSTEM ? NULL : scr_tz_id;
+  return scr_tz_mode;
 }
 
 /* V8's DateCache::ToUTC for a local time value: NaN outside

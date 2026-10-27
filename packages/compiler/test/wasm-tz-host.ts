@@ -71,8 +71,12 @@ export function makeTzHost(memory: () => WebAssembly.Memory): TzHost {
         if (len < 0) {
           delete process.env["TZ"];
         } else {
+          // Decoded in chunks: a spread of a long value would overflow the
+          // argument list.
           const units = new Uint16Array(memory().buffer, ptr, len);
-          process.env["TZ"] = String.fromCharCode(...units);
+          let tz = "";
+          for (let i = 0; i < units.length; i += 4096) tz += String.fromCharCode(...units.subarray(i, i + 4096));
+          process.env["TZ"] = tz;
         }
         return 0;
       }

@@ -46,9 +46,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#if !defined(_WIN32)
-#include <unistd.h>
-#endif
 
 #include "quickjs.h"
 
@@ -1710,11 +1707,10 @@ static JSValue web_host_uuid(JSContext *ctx, JSValueConst this_val, int argc,
  * the year of 2008..2035 with the same leap-ness and January 1st weekday).
  * Here the flag is the C library's tm_isdst at that equivalent instant, and
  * scr_zone_names.h (generated from Node by scripts/gen-zone-names.mjs) maps
- * (zone, flag) to Node's name. The zone is ICU's choice: TZ (less a leading
- * ':' and a "posix/" or "right/" prefix), else the /etc/localtime link's
- * target under zoneinfo/. A zone the table does not name gets ICU's
- * fallback for an unknown zone, "GMT±hh:mm" of its offset (Node:
- * TZ=Invalid/Zone prints "(GMT+00:00)"). */
+ * (zone, flag) to Node's name. The zone is ICU's choice (scr_lib.c's
+ * scr_tz_resolve). A zone the table does not name gets ICU's fallback for
+ * an unknown zone, "GMT±hh:mm" of its offset (Node: TZ=Invalid/Zone prints
+ * "(GMT+00:00)"). */
 #include "scr_zone_names.h"
 
 static long long web_days_from_civil(long long y, int m, int d) {
@@ -1751,27 +1747,6 @@ static int web_zone_cmp(const void *key, const void *elem) {
   return strcmp((const char *)key, ((const ScrZoneName *)elem)->id);
 }
 
-/* The zone ICU would pick, or NULL. */
-static const char *web_zone_id(char *buf, size_t cap) {
-  const char *tz = getenv("TZ");
-  if (tz != NULL) {
-    if (*tz == ':') tz++;
-    if (strncmp(tz, "posix/", 6) == 0 || strncmp(tz, "right/", 6) == 0) tz += 6;
-    return tz;
-  }
-#if defined(_WIN32)
-  (void)buf;
-  (void)cap;
-  return NULL;
-#else
-  ssize_t n = readlink("/etc/localtime", buf, cap - 1);
-  if (n <= 0) return NULL;
-  buf[n] = '\0';
-  const char *tail = strstr(buf, "zoneinfo/");
-  return tail != NULL ? tail + 9 : NULL;
-#endif
-}
-
 static JSValue web_host_tzname(JSContext *ctx, JSValueConst this_val, int argc,
                                JSValueConst *argv) {
   (void)this_val;
@@ -1779,26 +1754,18 @@ static JSValue web_host_tzname(JSContext *ctx, JSValueConst this_val, int argc,
   double ms = 0;
   if (JS_ToFloat64(ctx, &ms, argv[0])) return JS_EXCEPTION;
   if (!isfinite(ms)) return JS_NewString(ctx, "");
-  scr_tz_offset_ms(0); /* the zone is read (tzset) before the flag is */
-  char link[4096];
-  const char *id = web_zone_id(link, sizeof link);
+  const char *id = NULL;
+  int mode = scr_tz_zone(&id); /* ICU's choice of zone (scr_lib.c) */
   const ScrZoneName *row =
-      id == NULL ? NULL
-                 : bsearch(id, scr_zone_names, sizeof scr_zone_names / sizeof scr_zone_names[0],
-                           sizeof scr_zone_names[0], web_zone_cmp);
+      mode != 1 ? NULL
+                : bsearch(id, scr_zone_names, sizeof scr_zone_names / sizeof scr_zone_names[0],
+                          sizeof scr_zone_names[0], web_zone_cmp);
   if (row != NULL) {
-    time_t t = (time_t)floor(web_equivalent_time(ms) / 1000.0);
-    int isdst = 0;
-#if defined(_WIN32)
-    struct tm tmv;
-    if (_localtime64_s(&tmv, &t) == 0) isdst = tmv.tm_isdst > 0;
-#else
-    struct tm tmv;
-    if (localtime_r(&t, &tmv) != NULL) isdst = tmv.tm_isdst > 0;
-#endif
+    int isdst = scr_tz_isdst(web_equivalent_time(ms));
     return JS_NewString(ctx, scr_zone_name_strs[isdst ? row->dst_name : row->std_name]);
   }
-  /* ICU's unknown zone: a fixed zone at the C library's offset. */
+  /* ICU's unknown zone: a fixed zone at the C library's standard offset
+   * (scr_tz_offset_ms answers that constant for a fixed zone). */
   long east = (long)(scr_tz_offset_ms(ms) / 1000.0);
   char buf[32];
   long a = east < 0 ? -east : east;

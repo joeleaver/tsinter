@@ -1248,8 +1248,11 @@
  *     NOTHING — the harness's own rows are the check.
  *
  *   (import "tsinter" "tzCall" (func (param i32 f64 i32 i32) (result f64)))
- *     [local-time modules only — those reaching `date.parseGetTime`, whose
- *     offset-less date-time form is local time; minted after fetch, so no
+ *     [local-time modules only — those whose `date.parseGetTime` may see an
+ *     offset-less date-time (local time): a parse whose argument is a
+ *     string literal carrying its zone (Z, ±HH:MM, " GMT"), a date with no
+ *     time, or no digit at all never asks, so a module whose every parse
+ *     site is such a literal does not import it. Minted after fetch, so no
  *     earlier import index moves. SEMANTICS.md S113.]
  *     tzCall(op, ms, ptr, len) -> f64: the host's LOCAL TIME ZONE, asked
  *     about one instant at a time — localtime_r's shape (a native host:
@@ -1266,7 +1269,8 @@
  *                                    -21036000 — seconds are kept, never
  *                                    rounded to minutes). `ms` is an
  *                                    integer in [-8.64e15, 8.64e15]; the
- *                                    answer must be an integer. ptr and len
+ *                                    answer must be an integer of magnitude
+ *                                    below one day (86400000). ptr and len
  *                                    are 0. A browser answers
  *                                    `localMs - ms` from its Date's local
  *                                    getters (NOT getTimezoneOffset, which
@@ -1289,22 +1293,66 @@
  *                                    maps every other instant to V8's
  *                                    equivalent one itself. A browser
  *                                    answers the parenthesized suffix of
- *                                    its own `String(new Date(ms))`.
+ *                                    its own `String(new Date(ms))`. NO
+ *                                    MODULE ASKS IT YET: its consumer is the
+ *                                    embedded engine's Date#toString
+ *                                    (S103 (e)), wired next; hosts
+ *                                    implement it now so that wiring is
+ *                                    not an ABI change.
  *       op 2 ZONE(0, ptr, len)    -> 0. The program set its TZ variable to
  *                                    the UTF-16 string at ptr (len code
  *                                    units), or removed it (len -1): answer
  *                                    every later OFFSET and NAME for the
- *                                    zone that TZ value selects, as the
- *                                    host's own TZ variable would (Node:
- *                                    `process.env.TZ = s`; a C host:
- *                                    setenv / unsetenv, then tzset; a
- *                                    browser: Intl's timeZone option, or
- *                                    its default zone after a removal).
+ *                                    zone that TZ value selects.
+ *     WHICH ZONE a TZ value selects, as Node does it (ICU's
+ *     detectHostTimeZone; measured, SEMANTICS.md S113 — the native lanes'
+ *     scr_lib.c scr_tz_resolve is this rule in C):
+ *       - a value with no digit or comma before its end, except at most two
+ *         trailing digits ("UTC+3", "GMT-2", "JST-9", "UTC0"), or one of
+ *         PST8PDT MST7MDT CST6CDT EST5EDT, names the zone, less a leading
+ *         ':' and a "posix/" or "right/" prefix. A name the zone database
+ *         knows ("Asia/Tokyo", "posix/Asia/Tokyo", "EST", "GMT+0") is that
+ *         zone with its whole history; any other ("UTC+3", "Invalid/Zone",
+ *         "foo", "", ":/etc/localtime", "/usr/share/zoneinfo/Asia/Tokyo")
+ *         is a FIXED zone at the standard offset the C library reads from
+ *         that TZ, POSIX's sign included ("UTC+3" is -03:00, "GMT-2"
+ *         +02:00, "Invalid/Zone" and "" +00:00), named "GMT±hh:mm";
+ *       - any other value ("EST5EDT,M3.2.0,M11.1.0", "<+0330>-3:30",
+ *         "UTC-05:30"), and a removal, selects the system's own zone.
+ *     A host holding a zone per module (an engine host running several
+ *     modules, or one that will not touch its process's environment from
+ *     another thread) keeps the selected zone with the module instead of
+ *     calling setenv/tzset process-wide; nothing in the contract needs the
+ *     process's own TZ to change. A C host: setenv / unsetenv, then tzset
+ *     (or a per-module zone as just said). Node: `process.env.TZ = s`
+ *     (Node re-reads its zone). A browser has no TZ to set; it keeps the
+ *     name and answers through Intl — about ten lines:
+ *
+ *       const days = (y, m, d) => { y -= m <= 2 ? 1 : 0;
+ *         const e = Math.floor(y / 400), yoe = y - e * 400;
+ *         return e * 146097 + yoe * 365 + Math.floor(yoe / 4) - Math.floor(yoe / 100)
+ *           + Math.floor((153 * (m + (m > 2 ? -3 : 9)) + 2) / 5) + d - 1 - 719468; };
+ *       const fmt = new Intl.DateTimeFormat("en-US", { timeZone: zone, hourCycle: "h23",
+ *         era: "short", year: "numeric", month: "numeric", day: "numeric",
+ *         hour: "numeric", minute: "numeric", second: "numeric" });
+ *       function offset(ms) { const p = {};
+ *         for (const { type, value } of fmt.formatToParts(ms)) p[type] = value;
+ *         const y = p.era === "BC" ? 1 - Number(p.year) : Number(p.year);
+ *         return days(y, +p.month, +p.day) * 864e5 + p.hour * 36e5 + p.minute * 6e4
+ *           + p.second * 1e3 + ((ms % 1000) + 1000) % 1000 - ms; }
+ *
+ *     (checked against Node's own Date over eight zones, 205,040 instants
+ *     across the whole range: equal). Where Intl's constructor rejects the
+ *     name, the browser applies the FIXED rule above itself (it has no C
+ *     library standard offset: a "UTC+3"-shaped name gives its POSIX-sign
+ *     offset, any other +00:00).
  *     A host that has no local zone to report answers OFFSET 0 and the name
  *     its own Date prints for UTC; a host that will not answer at all DOES
  *     NOT SUPPLY THE IMPORT (S004's precedent: a LinkError at
- *     instantiation, naming tzCall). Any other op, or an answer that is not
- *     an integer, is the module's named trap "tzCall: host failure".
+ *     instantiation, naming tzCall). An OFFSET answer that is not an
+ *     integer of magnitude below one day, and a ZONE answer other than 0,
+ *     is the module's uncatchable named trap "tzCall: host failure"; the
+ *     module never asks an op other than these three.
  *     tzCall's VALUE TIER: that the offset and name are the host zone's own
  *     is enforced by NOTHING — the harness's rows (the TZ matrix, run
  *     against Node under several zones) are the check.

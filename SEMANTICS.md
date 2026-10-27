@@ -7222,11 +7222,14 @@ is the first 01:30, 06:30Z), computed as the offset at L - max(offset a day befo
 queries are clamped into ±8.64e15. Measured against Node v24.18.1 over every transition of 598 zones from
 1850 to 2040 (570,430 local times around each transition's two edges): equal, except 19 local times on
 one day — Europe/Riga, 1944-10-02 — where Node itself answers differently for the same instant
-depending on what it was asked before (its DateCache; two fresh processes disagree), see (e).
+depending on what it was asked before (its DateCache; two fresh processes disagree), see (e); the
+unit's review fuzz (7,448 strings over 25 zones) found the same quirk on a second Riga day, 1944-10-13.
 
 Today the wasm tier reaches local time in ONE place, `date.parseGetTime`'s offset-less date-time (S069's
-amendment): the import is minted in every module that parses a date string, and a module that also
-writes `process.env` sends ZONE when the key is `TZ`. Its embedded engine still answers in UTC (S103 (e))
+amendment): the import is minted in every module whose parse may see one — every parse site except a
+string literal that carries its zone (`Z`, `±HH:MM`, ` GMT`), has no time, or has no digit, so a module
+parsing only such literals needs no zone from its host — and a module that also writes `process.env`
+sends ZONE when the key is `TZ`. Its embedded engine still answers in UTC (S103 (e))
 until that engine's localtime asks the same import. The native lanes read the C library's zone directly
 (scr_lib.c `scr_tz_offset_ms`, `scr_tz_local_to_utc`; `process.env.TZ` writes and deletes call `tzset`),
 in their static parse and in their engine: the vendored quickjs-ng carries a second local patch
@@ -7238,10 +7241,26 @@ standard or daylight name by ICU's DST flag, after mapping an instant before 197
 to the "equivalent" instant in 2008-2035 with the same leap-ness and January-1 weekday — which is why
 Node prints Chicago in July 1800 as "(Central Daylight Time)" at a local-mean-time offset — and the
 native lanes read the C library's DST flag at that same equivalent instant and look the name up in
-`scr_zone_names.h`, generated from Node by `scripts/gen-zone-names.mjs`. The zone is ICU's choice: TZ
-less a leading `:` and a `posix/` / `right/` prefix, else the `/etc/localtime` link's target; a zone the
-table does not name prints ICU's unknown-zone name, `GMT±hh:mm` of its offset (`TZ=Invalid/Zone` and
-`TZ=` print `(GMT+00:00)` with offset 0 on Node and every lane).
+`scr_zone_names.h`, generated from Node by `scripts/gen-zone-names.mjs`.
+
+**Which zone a TZ value selects** is ICU's choice (TimeZone::detectHostTimeZone), not the C library's,
+and both the native lanes (scr_lib.c `scr_tz_resolve`, offsets and names alike) and the harness's wasm
+host (Node itself) follow it; abi.ts states it for every host. Measured under Node v24.18.1 and matched
+natively for 25 TZ shapes:
+- A value ICU takes as a zone name — no digit or comma before its end except at most two trailing digits,
+  or one of PST8PDT MST7MDT CST6CDT EST5EDT — names the zone, less a leading `:` and a `posix/` or
+  `right/` prefix: `posix/Asia/Tokyo`, `right/Asia/Tokyo` and `:Asia/Tokyo` are Tokyo (where this box's C
+  library has no `posix/` directory and would answer UTC). A name the zone database lacks is a FIXED zone
+  at the standard offset the C library reads from that TZ, POSIX's sign included, with no DST and the name
+  `GMT±hh:mm`: `UTC+3` is -03:00, `GMT-2` +02:00, `JST-9` +09:00, `Invalid/Zone`, `foo`, `Asia/Tokyo/` and
+  `TZ=` +00:00, `/usr/share/zoneinfo/Asia/Tokyo` +09:00 for all of history, and — systemd's and Docker's
+  `TZ=:/etc/localtime` — the system zone's STANDARD offset all year (this box: a fixed -07:00, "GMT-07:00",
+  where the C library follows America/Denver with DST; the native lanes now print Node's).
+- Any other value — a POSIX rule string (`EST5EDT,M3.2.0,M11.1.0`, `<+0330>-3:30`, `UTC-05:30`) — and an
+  unset TZ select the system zone, `/etc/localtime`'s resolved path below `/zoneinfo/`.
+The native lanes read a chosen zone whose name differs from TZ by pointing the C library at it for the
+moment of each question (tzset over a private one-entry environment), so `process.env.TZ` itself is never
+rewritten.
 
 **The divergences registered.**
 - **(a) Zone DATA is the host's.** Node's offsets come from its bundled ICU (tz 2026b in v24.18.1); the
@@ -7257,16 +7276,17 @@ table does not name prints ICU's unknown-zone name, `GMT±hh:mm` of its offset (
   in the measurement above, counted per zone in the generated header. The names are English: Node's
   follow the locale (`LANG=de_DE.UTF-8` prints "(Mitteleuropäische Normalzeit)"), the native lanes
   print the en-US name under every locale.
-- **(c) Zone CHOICE (native).** ICU accepts only zone names in TZ, the C library also POSIX rule strings
-  and paths: `TZ=EST5EDT,M3.2.0,M11.1.0` is the system zone on Node and US Eastern rules natively;
-  `TZ=/usr/share/zoneinfo/Asia/Tokyo` is a fixed +09:00 named "GMT+09:00" on Node and Tokyo's full history
-  natively (equal after 1951); an `/etc/localtime` that is a copy rather than a link gets the
-  `GMT±hh:mm` name natively where ICU searches zoneinfo for the matching file.
+- **(c) Zone CHOICE (native), what remains.** The choice above is mirrored; what is not: a zone name the
+  C library's zone directory has but ICU lacks (or the reverse) — the native lanes decide "known" by the
+  zone FILE (TZDIR, else /usr/share/zoneinfo), ICU by its own list; an `/etc/localtime` that is a copy
+  rather than a link, where ICU searches zoneinfo for the matching file and the native lanes keep the C
+  library's zone with a `GMT±hh:mm` name; and ICU's 3-4-letter abbreviation check (a known short name whose
+  standard offset disagrees with the C library's is dropped), not modelled.
 - **(d) Windows (native).** The CRT's zone: TZ is not IANA-shaped and there is no history before 1970
   (offset 0 there). Corpus 2771 is on the Windows lane's skip list.
 - **(e) Node's own cache.** V8 answers UTC-to-local offsets through its DateCache, which can answer a
   different offset for the same instant depending on the queries before it (measured: Europe/Riga,
-  1944-10-02T01:00Z, +3:00 after a forward scan, +1:00 in a fresh process). Every lane answers the zone
+  1944-10-02T01:00Z, +3:00 after a forward scan, +1:00 in a fresh process; 1944-10-13 behaves the same). Every lane answers the zone
   data's offset; a program reaching such an instant can differ from Node, as Node can differ from
   itself.
 - **(f) The clamp.** The wasm tier asks about instants in ±8.64e15 only; a local time within a day of the
@@ -7274,9 +7294,13 @@ table does not name prints ICU's unknown-zone name, `GMT±hh:mm` of its offset (
   that day (measured: no zone of the 598 changes offset within two days of either edge in Node's data).
 
 **Tested by:** `tests/harness/tz-matrix.test.ts` (a static program on c, llvm and wasm and an engine
-program on c and llvm, against Node, under eleven TZ values: Chicago, Kolkata, Lord Howe, London, UTC,
-St John's, Chatham, Kathmandu, an invalid name, the empty string and unset); `packages/compiler/test/
-wasm-date.test.ts` (local rows against this process's Date under seven zones, the import-section pin,
-the non-integer-answer trap, the ZONE op's order); corpus 2771 (the program sets its own zones). Broken
-once by hand: the max of the two offsets turned into a min (static rows red, wasm included), the engine
-hook rounded to minutes and the name table's daylight column ignored (engine rows red).
+program on c and llvm, against Node, under 23 TZ values: Chicago, Kolkata, Lord Howe, London, UTC,
+St John's, Chatham, Kathmandu, an invalid name, the empty string, unset, and the shapes of the choice
+above — `posix/` and `right/` and `:` prefixes, `:/etc/localtime`, a zoneinfo path, `UTC+3`, `GMT-2`,
+`JST-9`, `<+0330>-3:30`, a POSIX rule string, `EST5EDT`, `Asia/Tokyo/`); `packages/compiler/test/
+wasm-date.test.ts` (local rows against this process's Date under seven zones, the import-section pins —
+a zoned or date-only literal imports nothing — the OFFSET bound and integer traps, the ZONE answer trap,
+the ZONE op's order, a 200,000-unit TZ value); corpus 2771 (the program sets its own zones). Broken once by
+hand: the max of the two offsets turned into a min (static rows red, wasm included), the engine hook
+rounded to minutes and the name table's daylight column ignored (engine rows red), the `posix/` strip
+dropped (the `posix/` and `right/` rows red).

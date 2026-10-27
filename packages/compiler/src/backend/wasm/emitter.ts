@@ -1319,6 +1319,22 @@ function libCallWhere(mod: WModule, pred: (fn: string, args: readonly unknown[])
   return found;
 }
 
+/** S113: a date.parseGetTime argument that can never be an offset-less
+ * date-time — a string literal ending in a zone (Z, ±HH:MM, " GMT"), a
+ * date with no time, or one with no ASCII digit (always NaN). Such a parse
+ * never asks the host's zone. */
+function zoneFreeDateLiteral(arg: unknown): boolean {
+  if (arg === null || typeof arg !== "object") return false;
+  const rec = arg as { kind?: unknown; value?: unknown };
+  if (rec.kind !== "strLit" || typeof rec.value !== "string") return false;
+  const s = rec.value;
+  return (
+    /(Z|[+-]\d\d:\d\d| GMT)$/.test(s) ||
+    /^([+-]\d{6}|\d{4})(-\d\d(-\d\d)?)?$/.test(s) ||
+    !/[0-9]/.test(s)
+  );
+}
+
 /** INC-29 U4: a TLS key that needs the host's engine or stores (imports
  * tlsCall). Reading the bundled roots, getCACertificates('bundled' /
  * 'default') by literal, and setDefaultCACertificates are the module's
@@ -2824,10 +2840,11 @@ class Assembler {
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_FETCH, this.mb.funcType([I32, I32, I32, I32, I32], [I32]))
       : null;
     // `tzCall`'s decision (SEMANTICS.md S113, abi.ts): the host's local
-    // time zone, in modules that parse a date string (an offset-less
-    // date-time is local time), minted after fetch so no earlier import
-    // index moves.
-    this.tzCallFunc = libCallWhere(mod, (fn) => fn === "date.parseGetTime")
+    // time zone, in modules that parse a date string that may be an
+    // offset-less date-time (local time) — a parse of a string literal that
+    // carries its zone, or has no time, never asks — minted after fetch so
+    // no earlier import index moves.
+    this.tzCallFunc = libCallWhere(mod, (fn, args) => fn === "date.parseGetTime" && !zoneFreeDateLiteral(args[0]))
       ? this.mb.importFunc(IMPORT_MODULE, IMPORT_TZ_CALL, this.mb.funcType([I32, F64, I32, I32], [F64]))
       : null;
     // ── end INC-26 host-import block ──
@@ -9671,10 +9688,7 @@ class Assembler {
     this.dateField ??= new DateBuilder(this.mb, {
       strRef: () => this.strRef,
       strType: () => this.strType,
-      tzCall: () => {
-        if (this.tzCallFunc === null) throw new Error("wasm emitter bug: local time without the tzCall import");
-        return this.tzCallFunc;
-      },
+      tzCall: () => this.tzCallFunc,
       namedTrap: (c, message) => {
         const exc = this.exc();
         this.pushStrLitInto(c, message);
@@ -9955,7 +9969,12 @@ class Assembler {
       code.i32Const(-1);
     }
     code.call(this.tzCallFunc!);
-    code.drop();
+    // ZONE answers 0; anything else is the host's failure (abi.ts).
+    code.f64Const(0);
+    code.f64Ne();
+    code.ifVoid();
+    this.date.emitTzHostFailure(code);
+    code.end();
     code.end();
     this.releaseScratch(this.strRef, VALUE);
     this.releaseScratch(this.strRef, KEY);

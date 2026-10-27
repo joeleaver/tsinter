@@ -106,7 +106,7 @@ export interface DateDeps {
   /** `tsinter.tzCall`'s function index (abi.ts) — minted in every module
    * that reaches `date.parseGetTime`, the one static surface that reads
    * local time (an offset-less date-time). */
-  tzCall: () => number;
+  tzCall: () => number | null;
   /** Emits the module's named trap (an uncatchable report) with `message`. */
   namedTrap: (c: Code, message: string) => void;
 }
@@ -1462,15 +1462,19 @@ export class DateBuilder {
         // D-beta: subtract the offset, THEN TimeClip — once, here. An
         // offset-less date-time is LOCAL (SEMANTICS.md S113): V8's
         // ParseDateTimeString bounds the local value, then ToUTC.
-        c.localGet(LOCALZ);
-        c.ifResult(F64);
-        c.localGet(DAYSF);
-        c.call(this.localToUtcHelper());
-        c.else_();
+        // (A module without tzCall never passes LOCALZ — tryGrammar2 fences
+        // that arm there — so it builds no local conversion at all.)
+        if (this.deps.tzCall() !== null) {
+          c.localGet(LOCALZ);
+          c.ifResult(F64);
+          c.localGet(DAYSF);
+          c.call(this.localToUtcHelper());
+          c.else_();
+        }
         c.localGet(DAYSF);
         c.localGet(OFF);
         c.f64Sub();
-        c.end();
+        if (this.deps.tzCall() !== null) c.end();
         c.localSet(T);
         c.localGet(T);
         c.f64Abs();
@@ -1722,11 +1726,17 @@ export class DateBuilder {
       c.end();
 
       // offset-less date-time: LOCAL time through the host's zone
-      // (tzCall, SEMANTICS.md S113) — fenced (D6-ii) until the zone import.
+      // (tzCall, SEMANTICS.md S113). A module whose every parse site is a
+      // literal with a zone has no tzCall; this arm is unreachable there
+      // and keeps the fence (D6-ii).
       c.localGet(POS);
       c.localGet(LEN);
       c.i32Eq();
       c.ifVoid();
+      if (this.deps.tzCall() === null) {
+        fail();
+        c.end();
+      } else {
       c.localGet(YY);
       c.localGet(BARE);
       c.localGet(MO);
@@ -1740,6 +1750,7 @@ export class DateBuilder {
       c.call(this.g2FinishHelper());
       c.return_();
       c.end();
+      }
 
       c.f64Const(0);
       c.localSet(OFF);
@@ -1857,13 +1868,20 @@ export class DateBuilder {
     });
   }
 
+  /** The named trap for a tzCall answer outside its contract (abi.ts). */
+  emitTzHostFailure(c: Code): void {
+    this.deps.namedTrap(c, "tzCall: host failure");
+    c.unreachable();
+  }
+
   /** `%w.date.zoneOffset(t) -> f64` — the host zone's offset (local -
    * UTC, milliseconds) at the UTC instant `t`, through `tzCall` OFFSET
    * (abi.ts). `t` is clamped into TimeClip's range first: the host is only
    * ever asked about an instant its own Date can represent, and the
    * clamped query differs only where a zone transition falls within a day
-   * of ±8.64e15 (SEMANTICS.md S113). A non-integral (or non-finite) answer
-   * is the named trap "tzCall: host failure". */
+   * of ±8.64e15 (SEMANTICS.md S113). An answer that is not an integer of
+   * magnitude below one day (NaN and the infinities included) is the named
+   * trap "tzCall: host failure" — never a NaN or far-off date. */
   zoneOffsetHelper(): number {
     return this.cached("zoneOffset", [F64], [F64], (idx) => {
       const c = new Code();
@@ -1876,7 +1894,7 @@ export class DateBuilder {
       c.f64Min();
       c.i32Const(0);
       c.i32Const(0);
-      c.call(this.deps.tzCall());
+      c.call(this.deps.tzCall()!);
       c.localSet(V);
       c.localGet(V);
       c.localGet(V);
@@ -1884,6 +1902,11 @@ export class DateBuilder {
       c.f64Sub();
       c.f64Const(0);
       c.f64Ne();
+      c.localGet(V);
+      c.f64Abs();
+      c.f64Const(86400000);
+      c.f64Ge();
+      c.i32Or();
       c.ifVoid();
       this.deps.namedTrap(c, "tzCall: host failure");
       c.unreachable();

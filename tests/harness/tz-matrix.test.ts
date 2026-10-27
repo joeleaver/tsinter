@@ -3,7 +3,8 @@
  * the same TZ. The corpus runs under the machine's one zone; this file is
  * what shows local time FOLLOWS the zone — a DST gap and overlap, half-hour
  * and 45-minute zones, local mean time before 1900 (seconds kept), a zone
- * ICU does not know, an unset and an empty TZ.
+ * ICU does not know, an unset and an empty TZ, and the TZ shapes ICU reads
+ * differently from the C library (prefixes, fixed names, POSIX strings).
  *
  * Lanes: Node (the oracle, a child with the TZ); the c and llvm binaries (a
  * child with the TZ — the C library's zone); the WasmGC module, run in this
@@ -44,6 +45,21 @@ const ZONES = [
   "Invalid/Zone",
   "",
   "-",
+  // TZ values ICU reads differently from the C library (S113): prefixes
+  // ICU strips, names it fixes at the C library's standard offset, POSIX
+  // strings it replaces with the system zone.
+  "posix/Asia/Tokyo",
+  "right/Asia/Tokyo",
+  ":Asia/Tokyo",
+  ":/etc/localtime",
+  "/usr/share/zoneinfo/Asia/Tokyo",
+  "UTC+3",
+  "GMT-2",
+  "JST-9",
+  "<+0330>-3:30",
+  "EST5EDT,M3.2.0,M11.1.0",
+  "EST5EDT",
+  "Asia/Tokyo/",
 ];
 
 // The static tier: offset-less date-times are local time (date.parseGetTime).

@@ -267,11 +267,32 @@ describe("date.parseGetTime — offset-less date-times are local time under the 
       }
     });
   }
-  test("tzCall answering a non-integer offset is the named trap, never a value", async () => {
-    const path = await build("local-badhost.ts", `console.log("before");\nconsole.log(new Date("2020-01-01T00:00").getTime());`);
-    const { stdout, stderr } = await runWasmToTrap(path, { imports: { tzCall: (): number => 0.5 } });
+  for (const [what, answer] of [["a non-integer", 0.5], ["NaN", NaN], ["a day", 86400000], ["minus a day", -86400000], ["Infinity", Infinity]] as const) {
+    test(`tzCall answering ${what} as an OFFSET is the named trap, never a value`, async () => {
+      const path = await build("local-badhost.ts", `console.log("before");\nconsole.log(new Date("2020-01-01T00:00").getTime());`);
+      const { stdout, stderr } = await runWasmToTrap(path, { imports: { tzCall: (): number => answer } });
+      expect(stdout).toBe("before\n");
+      expect(stderr).toMatch(/tzCall: host failure/);
+    });
+  }
+  test("an OFFSET just inside a day is answered, not trapped (the bound's other side)", async () => {
+    const path = await build("local-edgehost.ts", `console.log(new Date("2020-01-01T00:00").getTime());`);
+    const { stdout } = await runWasm(path, { imports: { tzCall: (): number => 86399999 } });
+    expect(stdout).toBe(`${Date.UTC(2020, 0, 1) - 86399999}\n`);
+  });
+  test("a ZONE answer other than 0 is the named trap", async () => {
+    const path = await build("local-badzone.ts", `console.log("before");\nprocess.env.TZ = "UTC";\nconsole.log(new Date("2020-01-01T00:00").getTime());`);
+    const { stdout, stderr } = await runWasmToTrap(path, { imports: { tzCall: (op: number): number => (op === 2 ? 1 : 0) } });
     expect(stdout).toBe("before\n");
     expect(stderr).toMatch(/tzCall: host failure/);
+  });
+  test("the shared host takes a long TZ value (decoded in chunks, Node's answer for an unknown name)", async () => {
+    const path = await build(
+      "local-longzone.ts",
+      `process.env.TZ = "x".repeat(200000);\nconsole.log(new Date("2020-01-01T00:00").getTime());`,
+    );
+    const { stdout } = await runWasm(path);
+    expect(stdout).toBe(`${Date.UTC(2020, 0, 1)}\n`);
   });
   test("process.env.TZ writes and deletes reach the host as ZONE, before the next local-time question", async () => {
     const path = await build(
@@ -527,8 +548,17 @@ describe("the `wallClock`/`now` import-section pins (WebAssembly.Module.imports)
     expect(names).toContain("tsinter.now");
     expect(names).not.toContain("tsinter.wallClock");
   });
-  test("a date-string parse declares tzCall (S113); Date.UTC and toISOString alone do not", async () => {
-    expect(await importsOf(await build("imp-tz-parse.ts", `console.log(new Date("2020-01-01").getTime());`))).toContain("tsinter.tzCall");
+  test("a date-string parse that may be local declares tzCall (S113); a zoned or date-only literal, Date.UTC and toISOString do not", async () => {
+    expect(await importsOf(await build("imp-tz-parse.ts", `const s: string = process.argv.length > 5 ? "x" : "2020-01-01T00:00"; console.log(new Date(s).getTime());`))).toContain("tsinter.tzCall");
+    expect(await importsOf(await build("imp-tz-local-lit.ts", `console.log(new Date("2020-01-01T00:00").getTime());`))).toContain("tsinter.tzCall");
+    expect(
+      await importsOf(
+        await build(
+          "imp-tz-zoned.ts",
+          `console.log(new Date("2020-01-01T00:00Z").getTime(), new Date("2020-01-01T00:00+05:30").getTime(), new Date("2020-01-01").getTime(), new Date("Jul  1 00:00:00 2026 GMT").getTime(), new Date("bogus").getTime());`,
+        ),
+      ),
+    ).not.toContain("tsinter.tzCall");
     expect(await importsOf(await build("imp-tz-utc.ts", `console.log(Date.UTC(2020, 0), new Date(0).toISOString());`))).not.toContain("tsinter.tzCall");
   });
   test("new Date(ms).toISOString() with an explicit ms declares NEITHER (D-alpha's own DELTA-3 discriminator: this is the row a date.-PREFIX prescan would over-mint on)", async () => {
