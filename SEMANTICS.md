@@ -7175,3 +7175,17 @@ on every lane — (d) is why that row's failing conversion checks the error's na
 NAN ((b) pinned: every lane `7ffc…`, Node either), ENGINE (the engine's Math, which (c) leaves intact).
 Corpus 2757; corpus 2781 and 2786 (the binary operators on island values — own, prototype-chain, accessor and function members — board #251, every lane). Measured against Node
 v24.18.1 on x86-64.
+
+## S109 — a module-scope binding's TDZ check on a folded `void` read inside a short-circuit or conditional branch runs before the branch is decided *(every lane)*
+
+A file-scope `const`/`let`/`class` read before its declaration ran throws Node's
+catchable `ReferenceError: Cannot access '<name>' before initialization` on
+every lane (board #265; `packages/compiler/src/frontend/lowering/module-tdz.ts`).
+Reads, writes and `typeof` are checked at the access itself, including reads the
+lowering folds or aliases away (`late === undefined`, `void late`, a class alias).
+One residue: a read that folds to the bare `undefined` value in EXPRESSION
+position (`void late`) hands its check to the smallest enclosing expression, so
+in `cond && void late` (or a `?:` arm) the check runs even when the branch is not
+taken — where Node evaluates nothing and throws nothing, this tier throws the
+ReferenceError. Statement-level `void late;` is exact. Measured against Node
+v24.18.1; pinned by packages/compiler/test/module-tdz.test.ts and corpus 2765.

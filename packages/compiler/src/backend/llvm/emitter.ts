@@ -10294,6 +10294,27 @@ class LlEmitter {
       this.emitPendingCheck();
       return out;
     }
+    if (e.fn === "global.tdzCheck") {
+      // The module TDZ guard (board #265): a false init flag throws
+      // Node's exact catchable ReferenceError and unwinds in its own
+      // block; the initialized path falls through with no pending check.
+      const nameArg = e.args[1]!;
+      if (nameArg.kind !== "strLit") throw new Error("llvm emitter bug: global.tdzCheck's name arg must be a strLit");
+      const flag = this.emitExpr(e.args[0]!);
+      const lt = B.newLabel("mtdz.t");
+      const lk = B.newLabel("mtdz.k");
+      B.condBr(flag.name, lk, lt);
+      B.startBlock(lt);
+      // Interned literals are immortal (rc SIZE_MAX), so handing them to
+      // the ownership-taking thrower is safe.
+      const errName = this.internLiteral("ReferenceError");
+      const msg = this.internLiteral(`Cannot access '${nameArg.value}' before initialization`);
+      this.declare(`declare void @scr_throw_error_named(ptr, ptr)`);
+      B.line(`call void @scr_throw_error_named(ptr ${errName}, ptr ${msg})`);
+      this.emitUnwind();
+      B.startBlock(lk);
+      return { name: "", type: e.type };
+    }
     if (e.fn === "global.undefRead") {
       // A declare-d const nothing defines: Node's catchable
       // ReferenceError at the access (always throws — the typed dummy is

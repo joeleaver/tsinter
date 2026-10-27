@@ -21846,6 +21846,24 @@ class Assembler {
           code.call(this.regex.escapeHelper());
           return;
         }
+        if (e.fn === "global.tdzCheck") {
+          // The module TDZ guard (board #265): args[0] is the binding's
+          // i32 init flag, args[1] its name literal. A zero flag throws
+          // Node's exact catchable ReferenceError — the boxed-local TDZ
+          // site's emitSetCellErrorLit + emitUnwind, inside the branch,
+          // so the initialized path is one global.get + br_if-shaped test.
+          const nameArg = e.args[1]!;
+          if (nameArg.kind !== "strLit") {
+            throw new Error("wasm emitter bug: global.tdzCheck's name arg must be a compile-time literal");
+          }
+          this.walkExpr(e.args[0]!);
+          code.i32Eqz();
+          this.openIf();
+          this.emitSetCellErrorLit("%Error", "ReferenceError", `Cannot access '${nameArg.value}' before initialization`, null);
+          this.emitUnwind();
+          this.close();
+          return;
+        }
         if (e.fn === "global.undefRead") {
           // INC-25 rider R0 (design-number-v4.txt f7327c29, §7.2/§6.5): a
           // read of an ambient `declare`d binding NOTHING defines — Node

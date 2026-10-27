@@ -772,7 +772,14 @@ function inTypePosition7(node: ts.Node): boolean {
  * conservative — anything that could CALL user code (directly, through a
  * callback-invoking builtin, a getter, an iterator, or an implicit
  * coercion of a user object) disqualifies the module's cycles. */
-function nonInertTopLevel7(program: ts.Program, sf: ts.SourceFile): ts.Node | null {
+/** The inert-expression predicates nonInertTopLevel7 judges a module body
+ * with, shared with the module-TDZ analysis (module-tdz.ts): `inert(e)`
+ * holds when evaluating `e` can run no user code; `inertClass(c)` names
+ * the first class element whose definition-time evaluation could. */
+function makeInertPredicates7(program: ts.Program): {
+  inert: (e: ts.Expression) => boolean;
+  inertClass: (c: ts.ClassLikeDeclaration) => ts.Node | null;
+} {
   const checker = program.getTypeChecker();
   const PRIM =
     ts.TypeFlags.StringLike |
@@ -852,7 +859,8 @@ function nonInertTopLevel7(program: ts.Program, sf: ts.SourceFile): ts.Node | nu
     ts.SyntaxKind.BarBarToken,
     ts.SyntaxKind.QuestionQuestionToken,
     ts.SyntaxKind.CommaToken,
-    ts.SyntaxKind.InstanceOfKeyword,
+    // NOT instanceof: `x instanceof K` calls K's static
+    // [Symbol.hasInstance] when it has one — user code.
   ]);
   const inert = (e: ts.Expression): boolean => {
     if (
@@ -921,11 +929,20 @@ function nonInertTopLevel7(program: ts.Program, sf: ts.SourceFile): ts.Node | nu
         (a) =>
           inert(a) &&
           !containsFunctionLike(a) &&
-          (checker.getCallSignatures(checker.getTypeAtLocation(a)).length === 0 || dtsRooted(a)),
+          // A user CLASS argument is user code too: `String(K)` runs K's
+          // static toString / [Symbol.toPrimitive].
+          ((checker.getCallSignatures(checker.getTypeAtLocation(a)).length === 0 &&
+            checker.getConstructSignatures(checker.getTypeAtLocation(a)).length === 0) ||
+            dtsRooted(a)),
       );
     }
     return false;
   };
+  return { inert, inertClass };
+}
+
+function nonInertTopLevel7(program: ts.Program, sf: ts.SourceFile): ts.Node | null {
+  const { inert, inertClass } = makeInertPredicates7(program);
   for (const stmt of sf.statements) {
     if (
       ts.isImportDeclaration(stmt) ||
@@ -2475,6 +2492,8 @@ export {
   resolveImport7 as resolveImport,
   resolveNpmImport7 as resolveNpmImport,
   locOf7 as locOf,
+  nonInertTopLevel7 as nonInertTopLevel,
+  makeInertPredicates7 as makeInertPredicates,
 };
 
 /** True for JavaScript source files (.js/.mjs/.cjs) — the files whose

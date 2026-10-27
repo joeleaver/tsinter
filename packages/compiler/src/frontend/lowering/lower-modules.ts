@@ -1500,10 +1500,10 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
             L.globalsBySymbol.set(symbol, g);
             L.globalsList.push(g);
             // Mutable checked-dynamic LET globals ride the same entry
-            // init: a closure called above the declaration statement
-            // reads the dyn undefined instead of faulting on NULL — the
-            // dyn face of let's documented pre-declaration window (Node
-            // throws the TDZ ReferenceError there).
+            // init, so the slot is never NULL. A closure that can run
+            // above the declaration statement does not observe it: its
+            // access is guarded by the module-TDZ analysis
+            // (module-tdz.ts) and throws Node's ReferenceError there.
             if (isVarDeclared(decl) || (g.type.kind === "dyn" && g.mutable)) {
               noteVarGlobalEntryInit(L, sf, g);
             }
@@ -1875,7 +1875,7 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
           // even live in another file.
           c.decl && ts.isClassDeclaration(c.decl) && !c.mixinInstance && c.decl.getSourceFile() === sf &&
           (c.staticFields.length > 0 || (c.staticBlocks?.length ?? 0) > 0 || c.classDecorators !== undefined))
-        .map((c) => ({ pos: c.decl!.getStart(), info: c }));
+        .map((c): { pos: number; info: ClassInfo | null; tdzFlag?: IrStmt } => ({ pos: c.decl!.getStart(), info: c }));
       // Statics-bearing MIXIN instantiations whose call evaluates in THIS
       // file: their declaration-time code runs when the call does — the
       // top-level statement lower-mixins recorded. Insertion order is
@@ -1885,6 +1885,15 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
       for (const c of L.classes.values()) {
         const ms = c.mixinInstance?.statics;
         if (ms && ms.sf === sf) statics.push({ pos: ms.pos, info: c });
+      }
+      // Module-TDZ class flags (module-tdz.ts): the binding initializes
+      // once the class definition completed — after its own statics (the
+      // stable sort keeps a flag behind its class's entry).
+      for (const st of L.moduleTdz === null ? [] : sf.statements) {
+        if (!ts.isClassDeclaration(st) || st.name === undefined) continue;
+        const sym = L.checker.getSymbolAtLocation(st.name);
+        const b = sym !== undefined ? L.moduleTdz!.bySymbol.get(sym) : undefined;
+        if (b !== undefined) statics.push({ pos: st.getStart(), info: null, tdzFlag: L.moduleTdz!.flagSet(b, locOf(st)) });
       }
       statics.sort((a, b) => a.pos - b.pos);
       const body = [...header, ...prelude];
@@ -1896,7 +1905,8 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
         // declarations never share a kept statement's start, so `<=`
         // changes nothing for them.
         while (at < statics.length && statics[at]!.pos <= stmt.getStart()) {
-          body.push(...L.lowerStaticFieldInits(statics[at]!.info));
+          const ev = statics[at]!;
+          body.push(...(ev.tdzFlag !== undefined ? [ev.tdzFlag] : L.lowerStaticFieldInits(ev.info!)));
           at++;
         }
         const stmtIr = L.lowerStmts([stmt]);
@@ -1906,7 +1916,8 @@ export function collectGlobals(L: Lowerer, sf: ts.SourceFile, topStmts: ts.State
         body.push(...L.pendingClassExprInits.splice(0), ...stmtIr);
       }
       while (at < statics.length) {
-        body.push(...L.lowerStaticFieldInits(statics[at]!.info));
+        const ev = statics[at]!;
+        body.push(...(ev.tdzFlag !== undefined ? [ev.tdzFlag] : L.lowerStaticFieldInits(ev.info!)));
         at++;
       }
       const loc: SrcLoc = { file: sf.fileName, start: 0, end: 0 };

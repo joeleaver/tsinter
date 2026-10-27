@@ -4672,6 +4672,25 @@ export function emitExpr(E: CEmitter, e: IrExpr): Temp {
             return finish(
               `(scr_throw_node_coded(${arg(0)}, ${arg(1)}, ${arg(2)}), ${isRefCounted(e.type) ? `(${cType(e.type).trim()})NULL` : "0"})`,
             );
+          case "global.tdzCheck": {
+            // The module TDZ guard (board #265): a false init flag is the
+            // temporal dead zone — Node's exact catchable ReferenceError,
+            // thrown and unwound inside the branch, so the initialized
+            // (hot) path pays one flag test and no pending check.
+            // Interned literals are immortal (rc SIZE_MAX), so handing
+            // them to the ownership-taking thrower is safe.
+            const nameArg = e.args[1]!;
+            if (nameArg.kind !== "strLit") throw new Error("emitter bug: global.tdzCheck's name arg must be a strLit");
+            const errName = E.internLiteral("ReferenceError");
+            const msg = E.internLiteral(`Cannot access '${nameArg.value}' before initialization`);
+            E.line(`if (!${arg(0)}) { /* TDZ: module binding before initialization */${E.srcComment(e.loc)}`);
+            E.indent++;
+            E.line(`scr_throw_error_named((ScrStr *)&${errName}, (ScrStr *)&${msg});`);
+            E.emitUnwind();
+            E.indent--;
+            E.line(`}`);
+            return { name: "", type: e.type };
+          }
           case "global.undefRead":
             // A declare-d const nothing defines: Node's catchable
             // ReferenceError at the access (always throws — the typed

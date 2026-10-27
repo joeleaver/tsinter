@@ -141,6 +141,11 @@ export function provenanceElidedConstDecl(L: Lowerer, decl: ts.VariableDeclarati
           // becomes the statement's runtimeFence exactly like every other
           // deferred rejection.
           if (lowered) enforceLibBoundary(L, lowered);
+          // Module-TDZ (module-tdz.ts): a guarded read the statement's
+          // lowering folded away (no expression hook saw it) is checked
+          // before the statement.
+          const owed = L.moduleTdz !== null && L.moduleTdz.occByFile.size > 0 ? L.moduleTdz.owedChecks(stmt, lowered) : null;
+          if (owed !== null) out.push(...owed);
           if (Array.isArray(lowered)) out.push(...lowered);
           else if (lowered) out.push(lowered);
           // Island accounting (--dynamic coverage): a statement that lowered
@@ -864,7 +869,7 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
     }
     const isConst = (list.flags & ts.NodeFlags.Const) !== 0;
     const isLet = (list.flags & ts.NodeFlags.Let) !== 0 || (list.flags & ts.NodeFlags.BlockScoped) === 0;
-    return list.declarations.flatMap((decl) => {
+    return list.declarations.flatMap((decl) => withModuleTdzFlags(L, stmt, decl, ((): IrStmt[] => {
       // CommonJS require declarations (JS files): at the module's top
       // level the BINDINGS are alias plumbing (no storage;
       // resolveValueSymbol routes the reads), but the require itself is
@@ -920,7 +925,38 @@ export function lowerStmt(L: Lowerer, stmt: ts.Statement): IrStmt | IrStmt[] | n
       if (drained) return drained;
       const lowered = L.lowerVarDecl(decl, isLet);
       return lowered ? [lowered] : [];
+    })()));
+  }
+
+/** A file-scope declarator's module-TDZ init flags (module-tdz.ts). A
+   * binding initializes the moment it is bound: an identifier declarator
+   * after its own statements; a destructuring PATTERN binding right after
+   * its own assign (the desugar binds element by element, and a later
+   * element's default — or a getter the pattern reads — may call a
+   * function reading an earlier element). */
+  function withModuleTdzFlags(L: Lowerer, stmt: ts.VariableStatement, decl: ts.VariableDeclaration, out: IrStmt[]): IrStmt[] {
+    const tdz = L.moduleTdz;
+    if (tdz === null || tdz.bySymbol.size === 0 || !ts.isSourceFile(stmt.parent)) return out;
+    const flagged = boundIdentifiersOf(decl.name).flatMap((nameNode) => {
+      const sym = L.checker.getSymbolAtLocation(nameNode);
+      const b = sym !== undefined ? tdz.bySymbol.get(sym) : undefined;
+      return b !== undefined ? [{ b, global: sym !== undefined ? L.globalsBySymbol.get(sym) : undefined }] : [];
     });
+    if (flagged.length === 0) return out;
+    if (ts.isIdentifier(decl.name)) return [...out, ...flagged.map(({ b }) => tdz.flagSet(b, locOf(decl)))];
+    const result = [...out];
+    for (const { b, global } of flagged) {
+      const at = global === undefined ? -1 : result.findIndex((st) => st.kind === "assign" && st.localId === global.id);
+      if (at < 0) {
+        L.unsupported(
+          "SC1090",
+          decl,
+          `a file-scope destructuring declaration binding '${b.name}', which a function may read before the declaration finished (its binding step could not be located)`,
+        );
+      }
+      result.splice(at + 1, 0, tdz.flagSet(b, locOf(decl)));
+    }
+    return result;
   }
 
 /** The numeric indexed source of a built-in value-iterator expression:

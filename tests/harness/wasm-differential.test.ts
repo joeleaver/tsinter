@@ -3634,6 +3634,11 @@ const TIER_FLOOR: string[] = [
   "2782-promise-catch-any-reason.js",
   "2783-js-package-type-module.js",
   "2786-island-toprimitive-proto-fn.js",
+  // Unit B (board #265): module-scope TDZ — a const/let/class read,
+  // written or typeof-tested before its declaration ran throws Node's
+  // catchable ReferenceError (module-tdz.ts); a new program, passing here
+  // from its first run: 1089 -> 1090.
+  "2765-module-tdz/main.ts",
 ];
 
 interface RunResult {

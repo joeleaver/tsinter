@@ -7,6 +7,7 @@
 import * as ts from "../ts7/adapter.js";
 import { dirname } from "node:path";
 import type { Lowerer } from "./lowerer.js";
+import type { ModuleTdz } from "./module-tdz.js";
 import { BOOL, CAUGHT, DYN, DYN_HANDLE_KINDS, F64, IrExpr, IrFunction, IrJsOp, IrLocal, IrRecordShape, IrStmt, IrType, JSVAL, NULL_T, REF_TRUTHY_KINDS, REGEX, RUNTIME_ERROR_CLASSES, SEARCH_PARAMS_T, STRING, SrcLoc, UNDEFINED_T, VOID, arrayOf, canAdaptDynFuncTo, canBoxFuncIntoDyn, canDynCheckTo, funcOf, isJsonSafeType, isUnitType, jsOpResultKind, shapeHasAccessorSlots, typeEquals, typeKey, unionFuncSetArmsOk } from "../../ir/nodes.js";
 import { cjsClassExprWholeExportOf, cjsExportAssignmentOf, cjsExportDiscardReason, isCjsExportTableLiteral, isCjsJsFile, isJsSourceFile, isModuleExportsAccess, isNodeEsmFile, locOf } from "../program.js";
 import { ARRAY_METHODS, builtinConstLit, builtinFenceHintOf, builtinModuleConstOf, builtinModulesArrayLit, builtinModuleFnOf, CompoundOp, ISLAND_SURFACE, isChildSurfaceMember, MAP_METHODS, NARROW_FIRST, SET_METHODS, STR_METHODS, UNSUPPORTED_EXPR, sideEffectFreeOptionValue, stdlibGlobalNameOf } from "./surfaces.js";
@@ -106,11 +107,45 @@ export function lowerExpr(L: Lowerer, expr: ts.Expression): IrExpr {
     }
     lowerExprDepth++;
     try {
+      const tdz = L.moduleTdz;
+      if (tdz !== null && tdz.occByFile.size > 0) return guardModuleTdz(L, tdz, expr, lowerExprInner(L, expr));
       return lowerExprInner(L, expr);
     } finally {
       lowerExprDepth--;
     }
   }
+
+/** Module-TDZ guard (module-tdz.ts): whatever a guarded source read
+ * lowered to — a global read the IR pass guards, or a FOLDED/ALIASED form
+ * with no global read left (`late === undefined`, `void late`, `typeof
+ * late`, `Alias.scale` through a class alias, `new C`) — the lowered
+ * expression owes one check per binding read inside it that left no
+ * access behind; the check runs before the expression. `x instanceof C`
+ * evaluates `x` first: exact only when `x` cannot have effects, anything
+ * else refuses by name. */
+function guardModuleTdz(L: Lowerer, tdz: ModuleTdz, expr: ts.Expression, lowered: IrExpr): IrExpr {
+  // A unit literal is a pseudo-value its PARENT coerces by kind (the
+  // unionWrap of `undefined`): leave the debt to the parent's hook, which
+  // sees the same deficit (the statement hook is the backstop).
+  if (lowered.kind === "unitLit") return lowered;
+  const owed = tdz.owedChecks(expr, lowered);
+  if (owed === null) return lowered;
+  if (ts.isBinaryExpression(expr) && expr.operatorToken.kind === ts.SyntaxKind.InstanceOfKeyword) {
+    let left: ts.Expression = expr.left;
+    while (ts.isParenthesizedExpression(left)) left = left.expression;
+    let right: ts.Expression = expr.right;
+    while (ts.isParenthesizedExpression(right)) right = right.expression;
+    if (ts.isIdentifier(right) && tdz.guardedRef(L, right) !== null && !ts.isIdentifier(left) && left.kind !== ts.SyntaxKind.ThisKeyword) {
+      L.unsupported(
+        "SC1090",
+        expr,
+        `'instanceof ${right.getText()}' with an effectful left operand where '${right.getText()}' may still be uninitialized (bind the left operand to a const first)`,
+      );
+    }
+  }
+  const loc = locOf(expr);
+  return { kind: "seqExpr", stmts: owed, result: lowered, type: lowered.type, loc };
+}
 
 function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
     const loc = locOf(expr);

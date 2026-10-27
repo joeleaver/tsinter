@@ -103,6 +103,7 @@ import { lowerNodeTestModuleCall, lowerTestDirectCall, lowerTestMethodCall, lowe
 import { lowerAssertModuleCall, lowerAssertDirectCall } from "./lower-assert.js";
 import { lowerUtilModuleCall } from "./lower-inspect.js";
 import { lowerComptime, comptimeBakeable, rejectComptimeCaptures, comptimeValueToIr } from "./lower-comptime.js";
+import { ModuleTdz, analyzeModuleTdz, insertModuleTdzChecks } from "./module-tdz.js";
 import { lowerStmts, noteBlockedBindings, isBlockedBinding, lowerScopedBlock, predeclareForwardCapture, predeclareForwardFnDecl, predeclareForwardVar, rejectJumpCrossingFinally, lowerStmt, lowerVarStatement, lowerDestructuringDecl, lowerDestructuringAssignParts, lowerBindingPattern, lowerJsvalBindingPattern, checkBindingElement, bindPatternTarget, lowerVarDeclList, lowerVarDecl, lowerSwitch, lowerTry, lowerExprStatement, lowerForOf, lowerForStatement } from "./lower-stmts.js";
 import { FieldTarget, droppableStatic, lowerDynObjectLiteral, lowerExpr, maybeNarrow, lowerUnitComparison, lowerNullishCoalesce, lowerOptionalChain, finishOptionalChain, lowerCondition, ensureBool, requireTruthyUnion, eqComparableUnion, lowerIntrinsicProperty, lowerArrayLiteral, lowerObjectLiteral, lowerShorthandValue, rejectThisInObjectMethod, lowerElementAccess, lowerElementWrite, lowerRecordKeyRead, ensureString, lowerTemplate, lowerAsExpression, lowerPrefixUnary, lowerBinary, lowerCaughtTypeofTest, caughtRead, caughtLocalOf, caughtToString, lowerInstanceOf, lowerRegexLiteral, lowerFieldRead, lowerUnionProperty, fieldTarget, fieldGetExpr, fieldSetStmt, lowerFieldCompound, uniqueSymbolKeyOf, foldedStringKeyOf } from "./lower-exprs.js";
 import type { ExpandoMember } from "./lower-expando.js";
@@ -1039,6 +1040,9 @@ export class Lowerer {
    * falls back through the shared node (collectGlobals registers both). */
   readonly globalsByDeclNode = new Map<ts.Node, IrGlobal>();
   readonly globalsList: IrGlobal[] = [];
+  /** The module-scope TDZ analysis (module-tdz.ts), computed once per
+   * pass after collection; null until run() reaches it. */
+  moduleTdz: ModuleTdz | null = null;
   /** npm-import init statements (--dynamic), keyed by file AND import
    * declaration: the island.import assignments/side-effect loads for that
    * statement. lowerFileInit splices them into the importing file's %init
@@ -1922,6 +1926,7 @@ export class Lowerer {
     // (valueGlobalId) settled before any body lowers.
     for (const info of this.classes.values()) analyzeClassDecoration(this, info);
     this.prepareModuleInits(parts);
+    this.moduleTdz = analyzeModuleTdz(this, parts);
 
     const functions: IrFunction[] = [];
     for (const fp of parts) {
@@ -2023,6 +2028,9 @@ export class Lowerer {
     // implicit-any instances lowered eagerly at their first call sites.
     functions.push(...this.liftedFns);
     functions.push(...this.implicitFns);
+    // Module-scope TDZ guards (board #265): every access the analysis
+    // could not prove late enough tests its binding's init flag.
+    insertModuleTdzChecks(this.moduleTdz, functions, this.globalsList);
 
     if (this.remainder) {
       // Deferred collection diagnostics nothing flushed — declarations no

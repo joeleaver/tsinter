@@ -3278,6 +3278,15 @@ export type IrLibFn =
    * name; the result type is the read's declared type (a typed dummy the
    * unwind abandons — the value never exists). */
   | "global.undefRead"
+  /** The module-scope temporal dead zone (board #265): args[0] is the
+   * binding's BOOL init flag (a `%g.…%tdz` global the declaration
+   * statement sets true), args[1] the binding's name as a compile-time
+   * strLit. A false flag throws Node's catchable ReferenceError "Cannot
+   * access '<name>' before initialization"; a true flag does nothing.
+   * VOID. Emitted only where the frontend's module-TDZ analysis
+   * (module-tdz.ts) cannot prove the binding initialized. May-throw
+   * seed. */
+  | "global.tdzCheck"
   /** `X.name` through a class VALUE (scr_object.c): args[0] is a borrowed
    * classval; the result is the class object's stored .name string,
    * retained (+1 — the string is an interned immortal, so the retain is a
@@ -7052,6 +7061,9 @@ export const MAY_THROW_LIB_FNS: ReadonlySet<IrLibFn> = new Set([
   // A read of a declare-d const nothing defines: always throws Node's
   // catchable ReferenceError.
   "global.undefRead",
+  // A module-scope binding read/written before its declaration ran:
+  // Node's catchable TDZ ReferenceError.
+  "global.tdzCheck",
   // The compiler-resolved Node-parity throw: always throws, catchably.
   "error.nodeThrow",
   // USVString coercion runs user toString/valueOf — throws propagate.
