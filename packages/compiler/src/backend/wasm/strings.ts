@@ -14,8 +14,10 @@
  *
  * Helpers BORROW everything (the GC owns storage); string results are
  * fresh arrays except the documented identity returns (pad at or below
- * the target, toWellFormed of well-formed input — string identity is
- * unobservable for JS primitives). RangeError sites (repeat's negative or
+ * the target, toWellFormed of well-formed input) and one-unit results,
+ * which come from the shared single-character table (%w.str.unit, #299)
+ * — string identity is unobservable for JS primitives, and no helper
+ * writes into an array it did not allocate itself. RangeError sites (repeat's negative or
  * infinite count, repeat/pad results at or past 2^31 units) TRAP — the
  * S003 bridge, exit 1 like Node's uncaught RangeError; Node's own
  * threshold is lower (~2^29 units) but everything between traps on
@@ -72,6 +74,91 @@ export class StrBuilder {
     const idx = build();
     this.fns.set(name, idx);
     return idx;
+  }
+
+  /** %w.str.unit — (i32 u) → str: THE one-code-unit string for u (u in
+   * [0, 0xFFFF]), from a module-level table filled on first use — V8's
+   * single-character string cache (board #299). Every producer whose
+   * result is a single code unit (charAt, `s[i]`, the string iterator's
+   * BMP step under for-of/spread, `split("")`, a one-unit fromCharCode,
+   * a one-unit slice/substring/trim/split piece) answers from here, so a
+   * per-character walk over a big string allocates nothing per step
+   * instead of one array each (millions of small arrays were what made
+   * `[...s]`/`split("")` super-linear on wasm above 1 MB).
+   *
+   * Sharing is safe because strings are immutable on this tier: every
+   * helper writes only into an array it allocated itself, before the
+   * array escapes — the same invariant that already lets one string be
+   * held by many variables, array slots and map keys. Identity is not
+   * observable for JS primitives (=== compares contents; strings are
+   * never WeakMap keys or memo identities here), so no behaviour moves.
+   *
+   * Shape: a 256-entry directory of lazily made 256-entry pages, each
+   * slot filled on its first request — the whole BMP is cached, but only
+   * the pages a program touches exist (V8 caches Latin-1 only; caching
+   * more is unobservable and spares CJK text the same churn). */
+  unit(): number {
+    return this.cached("unit", () => {
+      const pageT = this.mb.arrayType(this.strRef(), true);
+      const pageRef: ValType = { kind: "ref", nullable: true, typeIndex: pageT };
+      const dirT = this.mb.arrayType(pageRef, true);
+      const dirRef: ValType = { kind: "ref", nullable: true, typeIndex: dirT };
+      const g = this.mb.addGlobal(dirRef, true, (w) => {
+        w.u8(0xd0); // ref.null $dir
+        w.sleb(dirT);
+      });
+      const idx = this.mb.declareFunc(this.mb.funcType([I32], [this.strRef()]), "%w.str.unit");
+      const c = new Code();
+      const U = 0, D = 1, P = 2, R = 3;
+      c.globalGet(g);
+      c.localTee(D);
+      c.refIsNull();
+      c.ifVoid();
+      c.i32Const(256);
+      c.arrayNewDefault(dirT);
+      c.localTee(D);
+      c.globalSet(g);
+      c.end();
+      c.localGet(D);
+      c.localGet(U);
+      c.i32Const(8);
+      c.i32ShrU();
+      c.arrayGet(dirT);
+      c.localTee(P);
+      c.refIsNull();
+      c.ifVoid();
+      c.i32Const(256);
+      c.arrayNewDefault(pageT);
+      c.localSet(P);
+      c.localGet(D);
+      c.localGet(U);
+      c.i32Const(8);
+      c.i32ShrU();
+      c.localGet(P);
+      c.arraySet(dirT);
+      c.end();
+      c.localGet(P);
+      c.localGet(U);
+      c.i32Const(0xff);
+      c.i32And();
+      c.arrayGet(pageT);
+      c.localTee(R);
+      c.refIsNull();
+      c.ifVoid();
+      c.localGet(U);
+      c.arrayNewFixed(this.strType, 1);
+      c.localSet(R);
+      c.localGet(P);
+      c.localGet(U);
+      c.i32Const(0xff);
+      c.i32And();
+      c.localGet(R);
+      c.arraySet(pageT);
+      c.end();
+      c.localGet(R);
+      this.mb.setBody(idx, [dirRef, pageRef, this.strRef()], c.bytes());
+      return idx;
+    });
   }
 
   /** ECMA ToIntegerOrInfinity on the f64 in local X, in place: NaN → +0,
@@ -135,9 +222,21 @@ export class StrBuilder {
     c.end();
   }
 
-  /** A fresh copy of s[F, F+CNT) — (ref $str) onto the stack. S/F/CNT are
+  /** s[F, F+CNT) — a fresh copy, or the shared one-unit string when CNT
+   * is 1 (callers only return or store the result, never write into it)
+   * — onto the stack. S/F/CNT are
    * locals (CNT computed by the caller); R is a (ref null $str) scratch. */
   private emitCopySpan(c: Code, S: number, F: number, CNT: number, R: number): void {
+    // One unit: the shared single-character string (%w.str.unit, #299).
+    c.localGet(CNT);
+    c.i32Const(1);
+    c.i32Eq();
+    c.ifResult(this.strRef());
+    c.localGet(S);
+    c.localGet(F);
+    c.arrayGetU(this.strType);
+    c.call(this.unit());
+    c.else_();
     c.localGet(CNT);
     c.arrayNewDefault(this.strType);
     c.localSet(R);
@@ -148,6 +247,7 @@ export class StrBuilder {
     c.localGet(CNT);
     c.arrayCopy(this.strType, this.strType);
     c.localGet(R);
+    c.end();
   }
 
   /** %w.str.isWs — (i32 unit) → i32: exact ECMA-262 WhiteSpace ∪
@@ -324,7 +424,7 @@ export class StrBuilder {
       c.localGet(X);
       c.i32TruncF64S();
       c.arrayGetU(this.strType);
-      c.arrayNewFixed(this.strType, 1);
+      c.call(this.unit());
       this.mb.setBody(idx, [I32], c.bytes());
       return idx;
     });
@@ -406,8 +506,103 @@ export class StrBuilder {
       c.end();
       c.end();
       c.localGet(U);
-      c.arrayNewFixed(this.strType, 1);
+      c.call(this.unit());
       this.mb.setBody(idx, [I32, I32, I32, I32], c.bytes());
+      return idx;
+    });
+  }
+
+  /** %w.str.chars — (s) → vec(str): the string iterator run to the end
+   * in one pass, `[...s]` / `Array.from(s)` (the frontend's lifted
+   * `%str.chars` helper gets this as its body — emitter.ts
+   * emitStrCharsBody). Exactly cpAt's stepping: a high surrogate followed
+   * by a low half is one two-unit piece, anything else (a lone half
+   * included) one unit, from the shared table (#299). The buffer is sized
+   * to the unit count up front — an upper bound on the piece count, the
+   * slack staying vec capacity — so no growth step runs per piece. */
+  chars(): number {
+    return this.cached("chars", () => {
+      const { info } = this.deps.vecStr();
+      const vecRef: ValType = { kind: "ref", nullable: true, typeIndex: info.struct };
+      const bufRef: ValType = { kind: "ref", nullable: true, typeIndex: info.bufType };
+      const idx = this.mb.declareFunc(this.mb.funcType([this.strRef()], [vecRef]), "%w.str.chars");
+      const c = new Code();
+      const S = 0, L = 1, B = 2, I = 3, N = 4, U = 5, U2 = 6;
+      c.localGet(S);
+      c.arrayLen();
+      c.localSet(L);
+      c.localGet(L);
+      c.arrayNewDefault(info.bufType);
+      c.localSet(B);
+      c.block();
+      c.loop();
+      c.localGet(I);
+      c.localGet(L);
+      c.i32GeS();
+      c.brIf(1);
+      c.localGet(S);
+      c.localGet(I);
+      c.arrayGetU(this.strType);
+      c.localSet(U);
+      c.localGet(B);
+      c.localGet(N);
+      // A high surrogate with a following low half → the two-unit char.
+      c.localGet(U);
+      c.i32Const(0xfc00);
+      c.i32And();
+      c.i32Const(0xd800);
+      c.i32Eq();
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localGet(L);
+      c.i32LtS();
+      c.i32And();
+      {
+        c.ifResult(I32);
+        c.localGet(S);
+        c.localGet(I);
+        c.i32Const(1);
+        c.i32Add();
+        c.arrayGetU(this.strType);
+        c.localTee(U2);
+        c.i32Const(0xfc00);
+        c.i32And();
+        c.i32Const(0xdc00);
+        c.i32Eq();
+        c.else_();
+        c.i32Const(0);
+        c.end();
+      }
+      c.ifResult(this.strRef());
+      c.localGet(U);
+      c.localGet(U2);
+      c.arrayNewFixed(this.strType, 2);
+      c.localGet(I);
+      c.i32Const(2);
+      c.i32Add();
+      c.localSet(I);
+      c.else_();
+      c.localGet(U);
+      c.call(this.unit());
+      c.localGet(I);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(I);
+      c.end();
+      c.arraySet(info.bufType);
+      c.localGet(N);
+      c.i32Const(1);
+      c.i32Add();
+      c.localSet(N);
+      c.br(0);
+      c.end();
+      c.end();
+      c.localGet(N);
+      c.localGet(B);
+      c.refAsNonNull();
+      c.structNew(info.struct);
+      this.mb.setBody(idx, [I32, bufRef, I32, I32, I32, I32], c.bytes());
       return idx;
     });
   }
@@ -837,7 +1032,8 @@ export class StrBuilder {
         "%w.str.split",
       );
       const c = new Code();
-      const S = 0, SEP = 1, L = 2, SL = 3, OUT = 4, I = 5, START = 6, CNT = 7, R = 8;
+      const S = 0, SEP = 1, L = 2, SL = 3, OUT = 4, I = 5, START = 6, CNT = 7, R = 8, B = 9;
+      const bufRef: ValType = { kind: "ref", nullable: true, typeIndex: info.bufType };
       c.localGet(S);
       c.arrayLen();
       c.localSet(L);
@@ -853,7 +1049,12 @@ export class StrBuilder {
       c.i32Eqz();
       c.ifVoid();
       {
-        // Per-unit pieces; the loop body IS "".split("")'s [] for free.
+        // Per-unit pieces into a buffer sized up front (the count IS the
+        // length), each the shared one-unit string (#299); the loop body
+        // IS "".split("")'s [] for free.
+        c.localGet(L);
+        c.arrayNewDefault(info.bufType);
+        c.localSet(B);
         c.i32Const(0);
         c.localSet(I);
         c.block();
@@ -862,12 +1063,13 @@ export class StrBuilder {
         c.localGet(L);
         c.i32GeS();
         c.brIf(1);
-        c.localGet(OUT);
+        c.localGet(B);
+        c.localGet(I);
         c.localGet(S);
         c.localGet(I);
         c.arrayGetU(this.strType);
-        c.arrayNewFixed(this.strType, 1);
-        c.call(push1);
+        c.call(this.unit());
+        c.arraySet(info.bufType);
         c.localGet(I);
         c.i32Const(1);
         c.i32Add();
@@ -875,7 +1077,10 @@ export class StrBuilder {
         c.br(0);
         c.end();
         c.end();
-        c.localGet(OUT);
+        c.localGet(L);
+        c.localGet(B);
+        c.refAsNonNull();
+        c.structNew(info.struct);
         c.return_();
       }
       c.end();
@@ -926,7 +1131,7 @@ export class StrBuilder {
       this.emitCopySpan(c, S, START, CNT, R);
       c.call(push1);
       c.localGet(OUT);
-      this.mb.setBody(idx, [I32, I32, vecRef, I32, I32, I32, this.strRef()], c.bytes());
+      this.mb.setBody(idx, [I32, I32, vecRef, I32, I32, I32, this.strRef(), bufRef], c.bytes());
       return idx;
     });
   }
@@ -1296,6 +1501,21 @@ export class StrBuilder {
       c.localGet(V);
       c.structGet(v.struct, LEN);
       c.localSet(L);
+      // One code unit: the shared single-character string (#299).
+      c.localGet(L);
+      c.i32Const(1);
+      c.i32Eq();
+      c.ifVoid();
+      c.localGet(V);
+      c.structGet(v.struct, BUF);
+      c.i32Const(0);
+      c.arrayGet(v.bufType);
+      c.localSet(X);
+      this.emitToUint16(c, X, OUT);
+      c.localGet(OUT);
+      c.call(this.unit());
+      c.return_();
+      c.end();
       c.localGet(L);
       c.arrayNewDefault(this.strType);
       c.localSet(R);

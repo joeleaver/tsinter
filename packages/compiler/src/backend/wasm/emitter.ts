@@ -4720,6 +4720,7 @@ class Assembler {
       ) {
         this.refuse("libCall:qs.parse:null-proto-reshape", fn.loc);
       }
+      if (fn.name === "%str.chars" && this.emitStrCharsBody(fn)) continue;
       this.walkFunction(fn);
     }
     // Board #75's universal unwrap: every reachable function has now been
@@ -18251,6 +18252,28 @@ class Assembler {
   }
 
   /* ── functions ──────────────────────────────────────────────────────── */
+
+  /** Board #299: the frontend's lifted `%str.chars` helper (`[...s]` /
+   * `Array.from(s)`, lower-containers.ts buildStrCharsFn — the string
+   * iterator's cpAt loop pushing each piece) gets strings.ts's one-pass
+   * %w.str.chars as its whole body: the same pieces in the same order,
+   * without a call, a growth check and a length read per character
+   * (Node's own spread of a string is a builtin fast path; the walked
+   * loop stayed 4x behind it at 4 MB). Answers false, leaving the
+   * ordinary walk, for any helper of another shape. */
+  private emitStrCharsBody(fn: WFunction): boolean {
+    const p = fn.params[0];
+    if (fn.params.length !== 1 || p === undefined || p.type.kind !== "string") return false;
+    const ret = fn.returnType;
+    if (ret.kind !== "array" || ret.elem.kind !== "string") return false;
+    const idx = this.funcIndexByName.get(fn.name);
+    if (idx === undefined) return false;
+    const c = new Code();
+    c.localGet(1); // arg0 is the closure (uniform ABI)
+    c.call(this.strs.chars());
+    this.mb.setBody(idx, [], c.bytes());
+    return true;
+  }
 
   private walkFunction(fn: WFunction): void {
     // Whole-function shapes, tested BEFORE the body: async and generators

@@ -482,7 +482,16 @@ static const char *scr_byte_find(const char *hay, size_t hay_len,
   return NULL;
 }
 
+/* A short string's length is counted directly and never takes a cache
+ * slot: the string iterator asks `ch.length` of every character it
+ * yields, and with each character claiming one of the SCR_SIDX_N slots
+ * the subject's own entry was evicted every few steps — its length was
+ * recounted per character, making `for (const c of s)` and `[...s]`
+ * quadratic (board #299: 13 s at 1 MB). Counting 32 bytes costs less
+ * than the slot it would evict. */
+#define SCR_SIDX_SMALL 32
 double scr_str_utf16_len(ScrStr *s) {
+  if (s->len <= SCR_SIDX_SMALL) return (double)scr_utf16_units(s);
   return (double)scr_sidx_len(s, scr_sidx(s));
 }
 
