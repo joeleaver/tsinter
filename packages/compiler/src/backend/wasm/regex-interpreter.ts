@@ -193,6 +193,10 @@ export class RegexInterpreterBuilder {
     // (never silent — but only surfaces once something actually wires
     // both builders together, which nothing did before P2).
     injectedBcType?: number,
+    /** Strings unit S3: match a WINDOW of the subject array (see
+     * windowGlobal) — the output module's matcher when it holds slice
+     * views. */
+    private readonly windowed = false,
   ) {
     this.casingField = injectedCasing ?? null;
     this.bcType = injectedBcType ?? mb.arrayType("i8", false);
@@ -602,8 +606,7 @@ export class RegexInterpreterBuilder {
       c.localGet(IDX);
       c.i32Const(1);
       c.i32Add();
-      c.localGet(SUBJECT);
-      c.arrayLen();
+      this.emitEnd(c, SUBJECT);
       c.i32LtS();
       c.i32And();
       c.ifVoid();
@@ -690,8 +693,7 @@ export class RegexInterpreterBuilder {
       c.localGet(IDX);
       c.i32Const(1);
       c.i32Add();
-      c.localGet(SUBJECT);
-      c.arrayLen();
+      this.emitEnd(c, SUBJECT);
       c.i32LtS();
       c.i32And();
       c.ifVoid();
@@ -765,7 +767,7 @@ export class RegexInterpreterBuilder {
       c.localGet(IDX);
       c.i32Const(2);
       c.i32Sub();
-      c.i32Const(0);
+      this.emitBegin(c);
       c.i32GeS();
       c.i32And();
       c.ifVoid();
@@ -842,7 +844,7 @@ export class RegexInterpreterBuilder {
       c.localGet(IDX);
       c.i32Const(2);
       c.i32Sub();
-      c.i32Const(0);
+      this.emitBegin(c);
       c.i32GeS();
       c.i32And();
       c.ifVoid();
@@ -904,13 +906,12 @@ export class RegexInterpreterBuilder {
       });
       retIf0(() => {
         c.localGet(IDX);
-        c.i32Const(0);
+        this.emitBegin(c);
         c.i32LeS();
       });
       retIf0(() => {
         c.localGet(IDX);
-        c.localGet(SUBJECT);
-        c.arrayLen();
+        this.emitEnd(c, SUBJECT);
         c.i32GeS();
       });
       retIf0(() => {
@@ -1361,14 +1362,13 @@ export class RegexInterpreterBuilder {
 
       // subject exhausted? default forward (cptr>=subject.length), override backward (cptr==0)
       c.localGet(CPTR);
-      c.localGet(SUBJECT);
-      c.arrayLen();
+      this.emitEnd(c, SUBJECT);
       c.i32GeS();
       c.localSet(EXHAUSTED);
       c.localGet(IS_BACKWARD);
       c.ifVoid();
       c.localGet(CPTR);
-      c.i32Eqz();
+      this.emitIsBegin(c);
       c.localSet(EXHAUSTED);
       c.end();
       c.localGet(EXHAUSTED);
@@ -1890,6 +1890,65 @@ export class RegexInterpreterBuilder {
     return g;
   }
 
+  /* ── the subject WINDOW (strings unit S3) ──────────────────────────
+   * A windowed matcher (built for a module that holds slice views,
+   * slices.ts) matches the code units subject[begin, end) of its subject
+   * array: the start of the subject (^, \b, lookbehind, a backward
+   * step) is `begin`, its end `end`, and every position — the start
+   * index, the captures — is an ABSOLUTE index into the array. exec sets
+   * the window to the whole array; execW (regex-state.ts's view entry
+   * points) to a view's span, so a view is matched in place and never
+   * copied. The window lives in two module globals (the matcher never
+   * re-enters: nothing it calls runs user code or another match — the
+   * shared backtrack stack's own invariant). An unwindowed matcher (the
+   * native engine module, a module without views) reads 0 and
+   * subject.length exactly as before: byte-identical. */
+  private windowGlobal(name: "begin" | "end"): number {
+    const hit = this.scratchGlobals.get(name);
+    if (hit !== undefined) return hit;
+    const g = this.mb.addGlobal(I32, true, (w) => {
+      w.u8(0x41); // i32.const 0
+      w.sleb(0);
+    });
+    this.scratchGlobals.set(name, g);
+    return g;
+  }
+
+  /** execAt's own copies of the window (two i32 locals read once on
+   * entry), for the body being built into `code` — its per-character
+   * checks then read a local, not a global; the helpers it calls read
+   * the globals. */
+  private windowLocals: { code: Code; begin: number; end: number } | null = null;
+
+  /** The subject's first index onto the stack. */
+  private emitBegin(c: Code): void {
+    if (!this.windowed) c.i32Const(0);
+    else if (this.windowLocals?.code === c) c.localGet(this.windowLocals.begin);
+    else c.globalGet(this.windowGlobal("begin"));
+  }
+
+  /** `x == begin` for the i32 on the stack. */
+  private emitIsBegin(c: Code): void {
+    if (!this.windowed) {
+      c.i32Eqz();
+      return;
+    }
+    this.emitBegin(c);
+    c.i32Eq();
+  }
+
+  /** The subject's end index (one past its last unit) onto the stack. */
+  private emitEnd(c: Code, subject: number): void {
+    if (!this.windowed) {
+      c.localGet(subject);
+      c.arrayLen();
+    } else if (this.windowLocals?.code === c) {
+      c.localGet(this.windowLocals.end);
+    } else {
+      c.globalGet(this.windowGlobal("end"));
+    }
+  }
+
   /** exec(bytecode, subject, startIndex, captureOut) -> i32 — design
    * §2.1's own signature, this file's central deliverable. THIS SLICE
    * covers REOP_char, REOP_char32, REOP_char_i, REOP_char32_i (the
@@ -1951,13 +2010,44 @@ export class RegexInterpreterBuilder {
    * between the two attempts. */
   exec(): number {
     return this.cached("exec", () => {
-      const BYTECODE = 0;
-      const SUBJECT = 1;
-      const START_INDEX = 2;
-      const CAPTURE_OUT = 3;
-      const I = 4;
       const idx = this.mb.declareFunc(this.mb.funcType([this.bcRefType(), this.strRefType(), I32, this.capRefType()], [I32]), "%w.re.exec");
       const c = new Code();
+      if (this.windowed) {
+        // The whole subject is the window.
+        c.i32Const(0);
+        c.globalSet(this.windowGlobal("begin"));
+        c.localGet(1);
+        c.arrayLen();
+        c.globalSet(this.windowGlobal("end"));
+      }
+      this.emitExecBody(c, 0, 1, 2, 3, 4);
+      this.mb.setBody(idx, [I32], c.bytes());
+      return idx;
+    });
+  }
+
+  /** execW(bytecode, subject, begin, end, startIndex, captureOut) -> i32
+   * — exec over the WINDOW subject[begin, end) of a windowed matcher
+   * (windowGlobal): startIndex and the captures are absolute indices
+   * into the subject array, begin <= startIndex <= end. */
+  execW(): number {
+    return this.cached("execW", () => {
+      if (!this.windowed) throw new Error("wasm emitter bug: execW on an unwindowed regex matcher");
+      const idx = this.mb.declareFunc(this.mb.funcType([this.bcRefType(), this.strRefType(), I32, I32, I32, this.capRefType()], [I32]), "%w.re.execW");
+      const c = new Code();
+      c.localGet(2);
+      c.globalSet(this.windowGlobal("begin"));
+      c.localGet(3);
+      c.globalSet(this.windowGlobal("end"));
+      this.emitExecBody(c, 0, 1, 4, 5, 6);
+      this.mb.setBody(idx, [I32], c.bytes());
+      return idx;
+    });
+  }
+
+  /** exec's body over its parameter/local indices (one scratch i32, I). */
+  private emitExecBody(c: Code, BYTECODE: number, SUBJECT: number, START_INDEX: number, CAPTURE_OUT: number, I: number): void {
+    {
       const tryAt = (start: () => void): void => {
         c.localGet(BYTECODE);
         c.localGet(SUBJECT);
@@ -2017,9 +2107,7 @@ export class RegexInterpreterBuilder {
       c.end();
       c.end();
       tryAt(() => c.localGet(START_INDEX));
-      this.mb.setBody(idx, [I32], c.bytes());
-      return idx;
-    });
+    }
   }
 
   /** The lre_exec port proper (see exec() above for the entry point). */
@@ -2064,6 +2152,16 @@ export class RegexInterpreterBuilder {
 
       const idx = this.mb.declareFunc(this.mb.funcType([this.bcRefType(), this.strRefType(), I32, this.capRefType()], [I32]), "%w.re.execAt");
       const c = new Code();
+      // A windowed matcher reads the window once, into two locals.
+      const WIN_BEGIN = 36;
+      const WIN_END = 37;
+      if (this.windowed) {
+        c.globalGet(this.windowGlobal("begin"));
+        c.localSet(WIN_BEGIN);
+        c.globalGet(this.windowGlobal("end"));
+        c.localSet(WIN_END);
+        this.windowLocals = { code: c, begin: WIN_BEGIN, end: WIN_END };
+      }
 
       // Setup (lre_exec, libregexp.c:3346-3363, minus the capture[]=NULL
       // loop — that's the CALLER's job now: newCaptureArray() already
@@ -2269,8 +2367,7 @@ export class RegexInterpreterBuilder {
           // if (cptr >= subject.length) goto no_match;
           failIf(() => {
             c.localGet(CPTR);
-            c.localGet(SUBJECT);
-            c.arrayLen();
+            this.emitEnd(c, SUBJECT);
             c.i32GeS();
           }, continueLoopDepth);
           failIfMidPair(continueLoopDepth);
@@ -2594,8 +2691,7 @@ export class RegexInterpreterBuilder {
         return (continueLoopDepth: number) => {
           failIf(() => {
             c.localGet(CPTR);
-            c.localGet(SUBJECT);
-            c.arrayLen();
+            this.emitEnd(c, SUBJECT);
             c.i32GeS();
           }, continueLoopDepth);
           if (isAny) {
@@ -2625,7 +2721,7 @@ export class RegexInterpreterBuilder {
       const emitPrev = (continueLoopDepth: number): void => {
         failIf(() => {
           c.localGet(CPTR);
-          c.i32Eqz();
+          this.emitIsBegin(c);
         }, continueLoopDepth);
         failIfMidPair(continueLoopDepth);
         c.localGet(SUBJECT);
@@ -2660,8 +2756,7 @@ export class RegexInterpreterBuilder {
           c.localSet(TABLE_POS);
           failIf(() => {
             c.localGet(CPTR);
-            c.localGet(SUBJECT);
-            c.arrayLen();
+            this.emitEnd(c, SUBJECT);
             c.i32GeS();
           }, continueLoopDepth);
           failIfMidPair(continueLoopDepth);
@@ -2720,8 +2815,7 @@ export class RegexInterpreterBuilder {
         return (continueLoopDepth: number) => {
           failIf(() => {
             c.localGet(CPTR);
-            c.localGet(SUBJECT);
-            c.arrayLen();
+            this.emitEnd(c, SUBJECT);
             c.i32GeS();
           }, continueLoopDepth);
           failIfMidPair(continueLoopDepth);
@@ -2800,7 +2894,7 @@ export class RegexInterpreterBuilder {
           if (!isMultiline) {
             failIf(() => {
               c.localGet(CPTR);
-              c.i32Const(0);
+              this.emitBegin(c);
               c.i32Ne();
             }, continueLoopDepth);
             return;
@@ -2808,7 +2902,7 @@ export class RegexInterpreterBuilder {
           c.i32Const(0);
           c.localSet(MATCHED); // reused as the FAIL flag here, not a rangeSearch result
           c.localGet(CPTR);
-          c.i32Const(0);
+          this.emitBegin(c);
           c.i32Ne();
           c.ifVoid();
           // cptr != 0 here — PEEK_PREV_CHAR is provably safe.
@@ -2830,8 +2924,7 @@ export class RegexInterpreterBuilder {
           if (!isMultiline) {
             failIf(() => {
               c.localGet(CPTR);
-              c.localGet(SUBJECT);
-              c.arrayLen();
+              this.emitEnd(c, SUBJECT);
               c.i32Ne();
             }, continueLoopDepth);
             return;
@@ -2839,8 +2932,7 @@ export class RegexInterpreterBuilder {
           c.i32Const(0);
           c.localSet(MATCHED);
           c.localGet(CPTR);
-          c.localGet(SUBJECT);
-          c.arrayLen();
+          this.emitEnd(c, SUBJECT);
           c.i32Ne();
           c.ifVoid();
           // cptr != subject.length here — PEEK_CHAR is provably safe.
@@ -2878,7 +2970,7 @@ export class RegexInterpreterBuilder {
           c.i32Const(0);
           c.localSet(V1);
           c.localGet(CPTR);
-          c.i32Const(0);
+          this.emitBegin(c);
           c.i32Ne();
           c.ifVoid();
           c.localGet(SUBJECT);
@@ -2913,8 +3005,7 @@ export class RegexInterpreterBuilder {
           c.i32Const(0);
           c.localSet(V2);
           c.localGet(CPTR);
-          c.localGet(SUBJECT);
-          c.arrayLen();
+          this.emitEnd(c, SUBJECT);
           c.i32LtS();
           c.ifVoid();
           c.localGet(SUBJECT);
@@ -3538,9 +3629,11 @@ export class RegexInterpreterBuilder {
           I32,
           I32, // PRELUDE_PC
           I32, // SELF_REF
+          ...(this.windowed ? [I32, I32] : []), // WIN_BEGIN, WIN_END
         ],
         c.bytes(),
       );
+      this.windowLocals = null;
       return idx;
     });
   }

@@ -27,6 +27,11 @@ export interface VecDeps {
   /** Flatten the string value on the stack to `$chars` (strings.ts
    * emitFlat) — string elements are stored as string VALUES. */
   flat: (c: Code) => void;
+  /** Strings unit S3, a module with slice views: a string value's length
+   * without flattening (ropes.ts %w.str.len) and its copy into a flat
+   * array straight from its window (slices.ts %w.str.copyInto: dest,
+   * pos, value → units copied) — join then never materialises a view. */
+  strViews?: { len: () => number; copyInto: () => number };
   /** The flat string type `(ref null $chars)`. */
   strRef: () => ValType;
   /** %w.f64ToStr's index (join over number elements). */
@@ -691,6 +696,14 @@ export class VecBuilder {
       const DEST = 7; // str
       const PARTS = 8; // parts (non-string elements only)
       const stringElems = v.elemKind === "string";
+      const views = stringElems ? this.deps.strViews : undefined;
+      /** A string element's VALUE (views: measured and copied in place). */
+      const elemValue = (): void => {
+        c.localGet(V);
+        c.structGet(v.struct, BUF);
+        c.localGet(I);
+        this.emitElemRead(c, v);
+      };
       const pushElem = (): void => {
         if (stringElems) {
           c.localGet(V);
@@ -762,8 +775,12 @@ export class VecBuilder {
       c.end();
       c.localSet(TOT);
       forEach(() => {
-        if (stringElems) {
+        if (views !== undefined) {
+          elemValue();
+          c.call(views.len());
+        } else if (stringElems) {
           pushElem();
+          c.arrayLen();
         } else {
           c.localGet(V);
           c.structGet(v.struct, BUF);
@@ -791,8 +808,8 @@ export class VecBuilder {
           c.localGet(S);
           c.arraySet(partsType);
           c.localGet(S);
+          c.arrayLen();
         }
-        c.arrayLen();
         c.localGet(TOT);
         c.i32Add();
         c.localTee(TOT);
@@ -820,6 +837,16 @@ export class VecBuilder {
         c.i32Add();
         c.localSet(POS);
         c.end();
+        if (views !== undefined) {
+          c.localGet(DEST);
+          c.localGet(POS);
+          elemValue();
+          c.call(views.copyInto());
+          c.localGet(POS);
+          c.i32Add();
+          c.localSet(POS);
+          return;
+        }
         pushElem();
         c.localSet(S);
         c.localGet(DEST);

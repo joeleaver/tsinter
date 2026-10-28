@@ -61,12 +61,13 @@ function crossingFor(strType: number): FlatCrossing | null {
   return crossing;
 }
 
-/** Flatten-if-needed (strings units S1/S2): the string VALUE on top of
+/** Flatten-if-needed (strings units S1/S2/S3): the string VALUE on top of
  * the stack (read from value storage typed `(ref null eq)`, or from
  * generic eqref/anyref storage, nullable) becomes the `(ref null $chars)`
  * flat array every reader of code units takes — a flat array answers
  * itself, a concatenation node (ropes.ts) is flattened once and caches
- * the result in place. EVERY site that turns a string value into code
+ * the result in place, a slice view (slices.ts) is materialised once
+ * and re-pointed at its copy. EVERY site that turns a string value into code
  * units must come through here (a raw `$chars` use of value storage
  * fails validation; this is the one sanctioned crossing). */
 export function emitFlat(c: Code, strType: number): void {
@@ -87,6 +88,24 @@ export function emitFlatInline(c: Code, strType: number, scratch: number): void 
   c.else_();
   c.localGet(scratch);
   emitFlat(c, strType);
+  c.end();
+}
+
+/** Strings unit S3's inline fast path for a window reader: with the
+ * string VALUE in local `x` (an eqref), `flatArm` runs with x as
+ * `(ref $chars)` on the stack when it is flat, `nodeArm` with x itself
+ * otherwise (a view or a rope, read by the window helper); both leave a
+ * `result`. */
+export function emitIfFlat(c: Code, strType: number, x: number, result: ValType, flatArm: () => void, nodeArm: () => void): void {
+  c.localGet(x);
+  c.refTest(strType);
+  c.ifResult(result);
+  c.localGet(x);
+  c.castChars(strType, false);
+  flatArm();
+  c.else_();
+  c.localGet(x);
+  nodeArm();
   c.end();
 }
 
@@ -125,6 +144,10 @@ export interface StrDeps {
   bytesRef: () => ValType;
   bytesGet: (elem: BytesElem) => number;
   bytesLength: () => number;
+  /** Strings unit S3: slices.ts %w.str.span — ($chars, i32 off, i32 cnt)
+   * → a str value (a view at 13 units or more) — when the module holds
+   * slice views; split's pieces are then values. Absent: flat copies. */
+  span?: () => number;
 }
 
 export class StrBuilder {
@@ -235,7 +258,7 @@ export class StrBuilder {
 
   /** ECMA ToIntegerOrInfinity on the f64 in local X, in place: NaN → +0,
    * otherwise truncate toward zero, ±Infinity preserved. */
-  private emitToIntInf(c: Code, X: number): void {
+  emitToIntInf(c: Code, X: number): void {
     c.localGet(X);
     c.localGet(X);
     c.f64Ne(); // NaN is the only x != x
@@ -322,10 +345,25 @@ export class StrBuilder {
     c.end();
   }
 
+  /** A split piece s[F, F+CNT) onto the stack: with slice views live
+   * (strings unit S3, slices.ts) the cheapest VALUE — a view at 13 units
+   * or more — else emitCopySpan's flat copy. */
+  private emitPiece(c: Code, S: number, F: number, CNT: number, R: number): void {
+    const span = this.deps.span;
+    if (span === undefined) {
+      this.emitCopySpan(c, S, F, CNT, R);
+      return;
+    }
+    c.localGet(S);
+    c.localGet(F);
+    c.localGet(CNT);
+    c.call(span());
+  }
+
   /** %w.str.isWs — (i32 unit) → i32: exact ECMA-262 WhiteSpace ∪
    * LineTerminator membership. The whole set is BMP, so unit-wise
    * membership IS code-point membership (surrogate halves are not in it). */
-  private isWs(): number {
+  isWs(): number {
     return this.cached("isWs", () => {
       const idx = this.mb.declareFunc(this.mb.funcType([I32], [I32]), "%w.str.isWs");
       const c = new Code();
@@ -791,7 +829,7 @@ export class StrBuilder {
   /** One slice() boundary out of the f64 in local X (already through
    * ToIntegerOrInfinity): negatives are relative to the end, then clamp
    * to [0, len]. Leaves the i32 on the stack; clobbers X. */
-  private emitSliceBoundary(c: Code, X: number, L: number): void {
+  emitSliceBoundary(c: Code, X: number, L: number): void {
     c.localGet(X);
     c.f64Const(0);
     c.f64Lt();
@@ -864,7 +902,7 @@ export class StrBuilder {
 
   /** One substring() boundary: ToIntegerOrInfinity'd X clamped ABSOLUTE
    * to [0, len] (no relative negatives — substring's contract). */
-  private emitAbsBoundary(c: Code, X: number, L: number): void {
+  emitAbsBoundary(c: Code, X: number, L: number): void {
     c.localGet(X);
     c.f64Const(0);
     c.f64Le();
@@ -1179,7 +1217,7 @@ export class StrBuilder {
       c.localGet(START);
       c.i32Sub();
       c.localSet(CNT);
-      this.emitCopySpan(c, S, START, CNT, R);
+      this.emitPiece(c, S, START, CNT, R);
       c.call(push1);
       c.localGet(I);
       c.localGet(SL);
@@ -1201,7 +1239,7 @@ export class StrBuilder {
       c.localGet(START);
       c.i32Sub();
       c.localSet(CNT);
-      this.emitCopySpan(c, S, START, CNT, R);
+      this.emitPiece(c, S, START, CNT, R);
       c.call(push1);
       c.localGet(OUT);
       this.mb.setBody(idx, [I32, I32, vecRef, I32, I32, I32, this.strRef(), bufRef], c.bytes());

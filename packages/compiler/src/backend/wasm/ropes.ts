@@ -38,6 +38,14 @@
  * type as some program struct of the same shape (a `ref.test` against
  * such a struct must not answer yes for a rope).
  *
+ * Strings unit S3 adds the third shape beside these two: the `$slice`
+ * view {len, base, off} (V8's SlicedString — slices.ts builds and reads
+ * them). In a module that can hold views (viewsLive) every shape test
+ * here knows it: len answers its stored length, the crossings
+ * materialise it (one exact copy, cached by re-pointing the view at it),
+ * and the flatten walk copies a view leaf straight from its base. A rope
+ * child may be a view; a view's base is always flat.
+ *
  * Nothing here is observable: strings stay immutable values with the same
  * contents, and identity is not observable for JS primitives. */
 import { Code } from "./code.js";
@@ -67,6 +75,10 @@ const ANY_REF: ValType = { kind: "ref", nullable: true, typeIndex: ANY_HEAP };
 const LEN = 0;
 const L = 1;
 const R = 2;
+/** Slice view field indices (strings unit S3). */
+export const SL_LEN = 0;
+export const SL_BASE = 1;
+export const SL_OFF = 2;
 
 export class Ropes {
   /** The `$rope` struct: (len i32, l (mut eqref), r (mut eqref)). */
@@ -80,7 +92,115 @@ export class Ropes {
     private readonly flatConcat: () => number,
     /** Fills the exception cell with RangeError "Invalid string length". */
     private readonly tooLong: () => number,
+    /** Strings unit S3: the module can hold SLICE views (slices.ts) —
+     * every shape test below then knows the third shape. Without it the
+     * helpers are byte-identical to S2's. */
+    readonly viewsLive = false,
   ) {}
+
+  private sliceTypeField: number | null = null;
+
+  /** Strings unit S3, V8's SlicedString: the `$slice` struct
+   * (len i32, base (mut (ref $chars)), off (mut i32)) — the code units
+   * base[off, off + len). Always over a FLAT base (a view of a view is
+   * re-pointed at the root, a rope is flattened first: slices.ts), so a
+   * reader never chains. `base`/`off` are mutable for one reason: the
+   * first flat read MATERIALISES the view (materialise below) and
+   * re-points it at its own exact copy, offset 0 — a second read is O(1)
+   * and the parent is released to the collector. Declared on first use;
+   * its own rec group with a private brand, as the rope's. */
+  get sliceType(): number {
+    if (!this.viewsLive) throw new Error("wasm emitter bug: a slice view in a module without views (Ropes.viewsLive)");
+    this.sliceTypeField ??= this.mb.recGroup2("%w.slice", () => [
+      {
+        kind: "struct",
+        fields: [
+          { storage: I32, mutable: false },
+          { storage: { kind: "ref", nullable: false, typeIndex: this.strType }, mutable: true },
+          { storage: I32, mutable: true },
+        ],
+      },
+      // The brand: never instantiated, it only makes the group unique.
+      { kind: "struct", fields: [{ storage: "i16", mutable: false }, { storage: "i8", mutable: false }, { storage: "i16", mutable: false }] },
+    ]);
+    return this.sliceTypeField;
+  }
+
+  /** %w.str.materialise (ref $slice) → (ref $chars) — a view's flat
+   * form: the base itself when the view covers all of it (a view already
+   * materialised), else an exact copy, cached by re-pointing the view at
+   * it (base := copy, off := 0), so the parent is no longer retained. */
+  materialise(): number {
+    return this.cached("materialise", () => {
+      const T = this.sliceType;
+      const sliceRef: ValType = { kind: "ref", nullable: false, typeIndex: T };
+      const idx = this.mb.declareFunc(this.mb.funcType([sliceRef], [this.strRef(false)]), "%w.str.materialise");
+      const V = 0;
+      const B = 1; // (ref null $chars)
+      const N = 2; // (ref null $chars)
+      const c = new Code();
+      c.localGet(V);
+      c.structGet(T, SL_BASE);
+      c.localSet(B);
+      c.localGet(V);
+      c.structGet(T, SL_OFF);
+      c.i32Eqz();
+      c.localGet(B);
+      c.arrayLen();
+      c.localGet(V);
+      c.structGet(T, SL_LEN);
+      c.i32Eq();
+      c.i32And();
+      c.ifVoid();
+      c.localGet(B);
+      c.refAsNonNull();
+      c.return_();
+      c.end();
+      c.localGet(V);
+      c.structGet(T, SL_LEN);
+      c.arrayNewDefault(this.strType);
+      c.localSet(N);
+      c.localGet(N);
+      c.i32Const(0);
+      c.localGet(B);
+      c.localGet(V);
+      c.structGet(T, SL_OFF);
+      c.localGet(V);
+      c.structGet(T, SL_LEN);
+      c.arrayCopy(this.strType, this.strType);
+      c.localGet(V);
+      c.localGet(N);
+      c.refAsNonNull();
+      c.structSet(T, SL_BASE);
+      c.localGet(V);
+      c.i32Const(0);
+      c.structSet(T, SL_OFF);
+      c.localGet(N);
+      c.refAsNonNull();
+      this.mb.setBody(idx, [this.strRef(true), this.strRef(true)], c.bytes());
+      return idx;
+    });
+  }
+
+  /** A string NODE in local `x` (not flat) made flat: a slice view
+   * materialised, else a rope flattened — the `ref.cast $rope` traps on
+   * anything else (null included), as the cast it replaces did. Leaves a
+   * `(ref $chars)`. */
+  private emitNodeFlat(c: Code, x: number): void {
+    if (this.viewsLive) {
+      c.localGet(x);
+      c.refTest(this.sliceType);
+      c.ifResult(this.strRef(false));
+      c.localGet(x);
+      c.refCast(this.sliceType);
+      c.call(this.materialise());
+      c.else_();
+    }
+    c.localGet(x);
+    c.refCast(this.ropeType);
+    c.call(this.flatten());
+    if (this.viewsLive) c.end();
+  }
 
   /** The `$rope` struct: (len i32, l (mut eqref), r (mut eqref)) —
    * declared on first use, so a module that never flattens or
@@ -127,9 +247,21 @@ export class Ropes {
       c.castChars(this.strType, false);
       c.arrayLen();
       c.else_();
+      if (this.viewsLive) {
+        c.localGet(0);
+        c.refTest(this.ropeType);
+        c.ifResult(I32);
+      }
       c.localGet(0);
       c.refCast(this.ropeType);
       c.structGet(this.ropeType, LEN);
+      if (this.viewsLive) {
+        c.else_();
+        c.localGet(0);
+        c.refCast(this.sliceType);
+        c.structGet(this.sliceType, SL_LEN);
+        c.end();
+      }
       c.end();
       this.mb.setBody(idx, [], c.bytes());
       return idx;
@@ -148,9 +280,7 @@ export class Ropes {
       c.localGet(0);
       c.castChars(this.strType, true);
       c.else_();
-      c.localGet(0);
-      c.refCast(this.ropeType);
-      c.call(this.flatten());
+      this.emitNodeFlat(c, 0);
       c.end();
       this.mb.setBody(idx, [], c.bytes());
       return idx;
@@ -170,9 +300,7 @@ export class Ropes {
       c.localGet(0);
       c.castChars(this.strType, false);
       c.else_();
-      c.localGet(0);
-      c.refCast(this.ropeType);
-      c.call(this.flatten());
+      this.emitNodeFlat(c, 0);
       c.end();
       this.mb.setBody(idx, [], c.bytes());
       return idx;
@@ -287,9 +415,55 @@ export class Ropes {
       c.localSet(OFFS);
       c.localGet(P);
       c.localSet(CUR);
+      // Resume the newest continuation (or finish): inside a leaf's
+      // ifVoid, so $done is 2 out and $walk 1.
+      const popOrDone = (): void => {
+        c.localGet(SP);
+        c.i32Eqz();
+        c.brIf(2); // $done
+        c.localGet(SP);
+        c.i32Const(1);
+        c.i32Sub();
+        c.localSet(SP);
+        c.localGet(NODES);
+        c.localGet(SP);
+        c.arrayGet(nodesT);
+        c.localSet(CUR);
+        // A popped slot keeps nothing alive.
+        c.localGet(NODES);
+        c.localGet(SP);
+        c.refNull(EQ_HEAP);
+        c.arraySet(nodesT);
+        c.localGet(OFFS);
+        c.localGet(SP);
+        c.arrayGet(offsT);
+        c.localSet(OFF);
+        c.br(1); // $walk
+      };
       c.block(); // $done
       c.loop(); // $walk
       {
+        // A slice view leaf (strings unit S3): copy its span of the base.
+        if (this.viewsLive) {
+          const T = this.sliceType;
+          c.localGet(CUR);
+          c.refTest(T);
+          c.ifVoid();
+          c.localGet(D);
+          c.localGet(OFF);
+          c.localGet(CUR);
+          c.refCast(T);
+          c.structGet(T, SL_BASE);
+          c.localGet(CUR);
+          c.refCast(T);
+          c.structGet(T, SL_OFF);
+          c.localGet(CUR);
+          c.refCast(T);
+          c.structGet(T, SL_LEN);
+          c.arrayCopy(this.strType, this.strType);
+          popOrDone();
+          c.end();
+        }
         // A flat leaf: copy it at OFF, then resume the newest continuation.
         c.localGet(CUR);
         c.refTest(this.strType);
@@ -304,27 +478,7 @@ export class Ropes {
           c.localGet(CH);
           c.arrayLen();
           c.arrayCopy(this.strType, this.strType);
-          c.localGet(SP);
-          c.i32Eqz();
-          c.brIf(2); // $done
-          c.localGet(SP);
-          c.i32Const(1);
-          c.i32Sub();
-          c.localSet(SP);
-          c.localGet(NODES);
-          c.localGet(SP);
-          c.arrayGet(nodesT);
-          c.localSet(CUR);
-          // A popped slot keeps nothing alive.
-          c.localGet(NODES);
-          c.localGet(SP);
-          c.refNull(EQ_HEAP);
-          c.arraySet(nodesT);
-          c.localGet(OFFS);
-          c.localGet(SP);
-          c.arrayGet(offsT);
-          c.localSet(OFF);
-          c.br(1); // $walk
+          popOrDone();
         }
         c.end();
         c.localGet(CUR);

@@ -236,8 +236,9 @@ import {
   INJECT_NEXT,
   INJECT_THROW,
 } from "./generators.js";
-import { StrBuilder, emitFlat, emitFlatCast, emitFlatInline, setFlatCrossing } from "./strings.js";
+import { StrBuilder, emitFlat, emitFlatCast, emitFlatInline, emitIfFlat, setFlatCrossing } from "./strings.js";
 import { Ropes } from "./ropes.js";
+import { Slices, type SliceOpKind, type WinForm } from "./slices.js";
 import { CasingBuilder } from "./casing.js";
 import { RegexBuilder } from "./regex-value.js";
 import { RegexStateBuilder } from "./regex-state.js";
@@ -356,14 +357,14 @@ const VALUE_POSITIONS: ReadonlyMap<string, readonly string[]> = new Map([
  * reads correctly through the tested (lazy) path, and one it wrongly
  * includes only pays a flatten per write. */
 /** Strings unit S2's extra value positions (a module with concatenation
- * nodes: Assembler.ropesLive): a class-field write and an assignment
+ * nodes: Assembler.nodesLive): a class-field write and an assignment
  * expression move their value. */
 const ROPE_VALUE_POSITIONS: ReadonlyMap<string, readonly string[]> = new Map([
   ["fieldSet", ["value"]],
   ["assignExpr", ["value"]],
 ]);
 
-function flatReadIds(roots: unknown, ids: ReadonlySet<string>, ropes: boolean): Set<string> {
+function flatReadIds(roots: unknown, ids: ReadonlySet<string>, ropes: boolean, views = false): Set<string> {
   const out = new Set<string>();
   const seen = new Set<object>();
   const visit = (v: unknown, valuePos: boolean): void => {
@@ -405,6 +406,26 @@ function flatReadIds(roots: unknown, ids: ReadonlySet<string>, ropes: boolean): 
       visit((o as { receiver?: unknown }).receiver, true);
       return;
     }
+    // Strings unit S3: a window reader takes its receiver (a regex
+    // method its subject) as a VALUE — reading a view in place.
+    // ...and an array push moves its elements (the emitter's push case).
+    if (views && o.kind === "arrIntrinsic" && (o as { method?: unknown }).method === "push") {
+      const r = o as { receiver?: unknown; args?: unknown };
+      visit(r.receiver, false);
+      visit(r.args, true);
+      return;
+    }
+    if (views && (o.kind === "strIntrinsic" || o.kind === "regexIntrinsic")) {
+      const r = o as { method?: unknown; receiver?: unknown; args?: unknown };
+      const m = typeof r.method === "string" ? r.method : "";
+      const recvValue = o.kind === "strIntrinsic" ? VIEW_READER_METHODS.has(m) : VIEW_REGEX_SUBJECT_RECV.has(m);
+      const arg0Value = o.kind === "regexIntrinsic" && VIEW_REGEX_SUBJECT_ARG0.has(m);
+      if (recvValue || arg0Value) {
+        visit(r.receiver, recvValue);
+        if (Array.isArray(r.args)) r.args.forEach((a, i) => visit(a, i === 0 && arg0Value));
+        return;
+      }
+    }
     const moves = typeof o.kind === "string" ? (VALUE_POSITIONS.get(o.kind) ?? (ropes ? ROPE_VALUE_POSITIONS.get(o.kind) : undefined)) : undefined;
     for (const [k, x] of Object.entries(o)) {
       if (o.kind === "recordLit" && k === "fields" && Array.isArray(x)) {
@@ -422,6 +443,35 @@ function flatReadIds(roots: unknown, ids: ReadonlySet<string>, ropes: boolean): 
   return out;
 }
 
+/** Strings unit S3: the ids among `ids` read DIRECTLY (a bare varRef) as
+ * a window reader's operand — a VIEW_READER_METHODS receiver, a regex
+ * method's subject. The emitter gives those with no flat read a window
+ * shadow. A pure performance prescan, like flatReadIds. */
+function windowReadIds(roots: unknown, ids: ReadonlySet<string>): Set<string> {
+  const out = new Set<string>();
+  const seen = new Set<object>();
+  const bare = (x: unknown): void => {
+    const r = x as { kind?: unknown; localId?: unknown } | null;
+    if (r !== null && typeof r === "object" && r.kind === "varRef" && typeof r.localId === "string" && ids.has(r.localId)) out.add(r.localId);
+  };
+  const visit = (v: unknown): void => {
+    if (v === null || typeof v !== "object" || seen.has(v)) return;
+    seen.add(v);
+    if (Array.isArray(v)) {
+      for (const x of v) visit(x);
+      return;
+    }
+    const o = v as { kind?: unknown; method?: unknown; receiver?: unknown; args?: unknown };
+    const m = typeof o.method === "string" ? o.method : "";
+    if (o.kind === "strIntrinsic" && VIEW_READER_METHODS.has(m)) bare(o.receiver);
+    if (o.kind === "regexIntrinsic" && VIEW_REGEX_SUBJECT_RECV.has(m)) bare(o.receiver);
+    if (o.kind === "regexIntrinsic" && VIEW_REGEX_SUBJECT_ARG0.has(m) && Array.isArray(o.args)) bare(o.args[0]);
+    for (const x of Object.values(o)) visit(x);
+  };
+  visit(roots);
+  return out;
+}
+
 /** The ids among `ids` with an ACCUMULATING write (strings unit S2): an
  * assign/declaration/assignExpr whose value is a concatenation or reads
  * the binding itself (`s += x`, `s = "a" + s`, `s = f(s)`). Such a
@@ -429,7 +479,7 @@ function flatReadIds(roots: unknown, ids: ReadonlySet<string>, ropes: boolean): 
  * the fresh node at every write, turning a linear accumulation loop back
  * into a quadratic one; lazily, the flatten happens at the next flat read
  * (and once, if the reads come after the loop). */
-function accumulatingIds(roots: unknown, ids: ReadonlySet<string>): Set<string> {
+function accumulatingIds(roots: unknown, ids: ReadonlySet<string>, views = false): Set<string> {
   const out = new Set<string>();
   const seen = new Set<object>();
   const mentions = (v: unknown, id: string, seen2: Set<object>): boolean => {
@@ -451,7 +501,12 @@ function accumulatingIds(roots: unknown, ids: ReadonlySet<string>): Set<string> 
     if ((o.kind === "assign" || o.kind === "assignExpr" || o.kind === "varDecl") && typeof o.localId === "string" && ids.has(o.localId)) {
       const value = o.kind === "varDecl" ? o.init : o.value;
       if (value !== null && typeof value === "object") {
-        if ((value as { kind?: unknown }).kind === "strConcat" || mentions(value, o.localId, new Set())) out.add(o.localId);
+        const vk = value as { kind?: unknown; method?: unknown };
+        // Strings unit S3: a view-producing write (`rest = src.slice(i)`)
+        // stays lazy too — an eager shadow would copy the view's span at
+        // every write, where the window readers need no copy at all.
+        const view = views && vk.kind === "strIntrinsic" && typeof vk.method === "string" && VIEW_PRODUCER_METHODS.has(vk.method);
+        if (vk.kind === "strConcat" || view || mentions(value, o.localId, new Set())) out.add(o.localId);
       }
     }
     for (const x of Object.values(o)) visit(x);
@@ -1493,6 +1548,58 @@ function hasStrConcat(mod: WModule): boolean {
   return found;
 }
 
+/** Strings unit S3 (slices.ts): the string methods whose result can be a
+ * slice VIEW (in value position), and whose receiver a reader can take as
+ * a window. */
+const VIEW_PRODUCER_METHODS: ReadonlySet<string> = new Set(["slice", "substring", "trim", "trimStart", "trimEnd"]);
+/** The string methods that read their receiver through a window (no
+ * materialisation): the hot readers and the producers. */
+const VIEW_READER_METHODS: ReadonlySet<string> = new Set([
+  "charCodeAt", "charAt", "cpAt", "indexOf", "includes", "startsWith", "endsWith",
+  "slice", "substring", "trim", "trimStart", "trimEnd",
+]);
+/** Regex methods that build pieces (rows, global-match and split pieces —
+ * views at 13 units or more). */
+const VIEW_REGEX_PIECE_METHODS: ReadonlySet<string> = new Set([
+  "exec", "execInto", "match", "matchInto", "matchAll", "matchAllInto", "split", "splitLimit",
+]);
+/** Regex methods whose SUBJECT a window reader takes (the subject is the
+ * receiver for match/search, args[0] for test/exec). */
+const VIEW_REGEX_SUBJECT_RECV: ReadonlySet<string> = new Set(["match", "matchInto", "search"]);
+const VIEW_REGEX_SUBJECT_ARG0: ReadonlySet<string> = new Set(["test", "exec", "execInto"]);
+
+/** Does any emitted function build a slice view (strings unit S3)? A
+ * view-producing string method (VIEW_PRODUCER_METHODS), a split, or a
+ * regex method that builds pieces. A module with none holds no view and
+ * is byte-identical to one built before views existed. Scans the same
+ * reachable set as hasStrConcat. */
+function hasStrView(mod: WModule): boolean {
+  const reachable = reachableFunctionNames(mod);
+  let found = false;
+  const scan = (node: unknown): void => {
+    if (found) return;
+    if (Array.isArray(node)) {
+      for (const item of node) scan(item);
+      return;
+    }
+    if (node !== null && typeof node === "object") {
+      const rec = node as Record<string, unknown>;
+      const m = rec["method"];
+      if (typeof m === "string") {
+        if ((rec["kind"] === "strIntrinsic" && (VIEW_PRODUCER_METHODS.has(m) || m === "split")) || (rec["kind"] === "regexIntrinsic" && VIEW_REGEX_PIECE_METHODS.has(m))) {
+          found = true;
+          return;
+        }
+      }
+      for (const value of Object.values(rec)) scan(value);
+    }
+  };
+  for (const fn of mod.functions) {
+    if (reachable.has(fn.name)) scan(fn.body);
+  }
+  return found;
+}
+
 /** S113: a date.parseGetTime argument that can never be an offset-less
  * date-time — a string literal ending in a zone (Z, ±HH:MM, " GMT"), a
  * date with no time, or one with no ASCII digit (always NaN). Such a parse
@@ -1787,6 +1894,13 @@ interface FnState {
    * no test. The others are LAZY: a write clears the shadow and a flat
    * read tests it — so `const r = a + b; return r` never flattens. */
   eagerFlat: Set<string>;
+  /** Strings unit S3: a WINDOW SHADOW for an unboxed string local/param
+   * whose code-unit reads are all window readers (slices.ts — charCodeAt,
+   * slice, indexOf, a regex subject...; windowReadIds) — three slots
+   * holding the value's window (base, off, len), filled in O(1) at every
+   * write (bindingSet) and on entry, so those reads pay no shape test and
+   * a view is never copied. */
+  winShadow: Map<string, { b: number; off: number; len: number }>;
   /** Scratch locals, pooled per type so heavy functions don't grow a
    * local per use site. */
   scratchFree: Map<string, number[]>;
@@ -2620,9 +2734,13 @@ class Assembler {
   private readonly strType: number;
   /** Strings unit S2: the concatenation-node helpers (ropes.ts). */
   private readonly ropes: Ropes;
-  /** Whether this module can build a concatenation node at all
-   * (hasStrConcat). */
-  private readonly ropesLive: boolean;
+  /** Whether this module can hold a string NODE at all — a concatenation
+   * node (hasStrConcat, strings unit S2) or a slice view (strViewsLive): the
+   * flatten crossing, value positions and lazy shadows follow it. */
+  private readonly nodesLive: boolean;
+  /** Strings unit S3: whether this module can build a slice view
+   * (hasStrView — slices.ts). */
+  private readonly strViewsLive: boolean;
   private readonly cursorGlobal: number;
   private readonly writeFunc: number;
   /** `tsinter.now`'s index, or null in a module that cannot arm a timer
@@ -2887,9 +3005,12 @@ class Assembler {
     // crossing every code-unit reader goes through (strings.ts emitFlat).
     // A module with no concatenation can hold no node: it keeps the
     // plain-cast crossing (strings.ts, crossing unset).
-    this.ropes = new Ropes(this.mb, this.strType, () => this.concatHelper(), () => this.strTooLongHelper());
-    this.ropesLive = hasStrConcat(mod);
-    setFlatCrossing(this.ropesLive ? { strType: this.strType, flat: () => this.ropes.flat(), flatCast: () => this.ropes.flatCast() } : null);
+    // Strings unit S3: slice views (slices.ts) — a module with no view
+    // producer keeps S2's two shapes, byte-identical.
+    this.strViewsLive = hasStrView(mod);
+    this.ropes = new Ropes(this.mb, this.strType, () => this.concatHelper(), () => this.strTooLongHelper(), this.strViewsLive);
+    this.nodesLive = this.strViewsLive || hasStrConcat(mod);
+    setFlatCrossing(this.nodesLive ? { strType: this.strType, flat: () => this.ropes.flat(), flatCast: () => this.ropes.flatCast() } : null);
     // Phase 2 E0/E1: a module that reaches the island engine carries it
     // (engine.ts), and the engine's code owns memory 0 — so the decision
     // is made HERE, before any instruction is built, and moves every
@@ -5190,7 +5311,7 @@ class Assembler {
    * array answers itself, a concatenation node (strings unit S2, ropes.ts)
    * is flattened once and caches the result in place (%w.str.flat). */
   private emitFlat(code: Code = this.fn.code): void {
-    if (!this.ropesLive || (this.fn as FnState | undefined)?.code !== code) {
+    if (!this.nodesLive || (this.fn as FnState | undefined)?.code !== code) {
       emitFlat(code, this.strType);
       return;
     }
@@ -5209,10 +5330,25 @@ class Assembler {
    * its length). */
   private emitStrValueLength(e: WExpr): void {
     const code = this.fn.code;
-    if (!this.ropesLive) {
+    if (!this.nodesLive) {
       // Every string is flat: the length of the flat read.
       this.walkExpr(e);
       code.arrayLen();
+      return;
+    }
+    const win = this.windowShadowOf(e);
+    if (win !== undefined) {
+      // The window shadow's length; unfilled (a rope, or null), the
+      // value's own — %w.str.len never flattens, and traps on null.
+      if (FLAT_CHECK) this.emitWindowEnsure(e as WExpr & { kind: "varRef" }, win);
+      code.localGet(win.b);
+      code.refIsNull();
+      code.ifResult(I32);
+      code.localGet(this.localIndex((e as WExpr & { kind: "varRef" }).localId));
+      code.call(this.ropes.len());
+      code.else_();
+      code.localGet(win.len);
+      code.end();
       return;
     }
     if (e.kind === "varRef") {
@@ -5230,8 +5366,14 @@ class Assembler {
         get(shadow.slot);
         code.refIsNull();
         code.ifResult(I32);
-        get(slot);
-        code.call(this.ropes.len());
+        if (this.strViewsLive && !shadow.global) {
+          // A lazy binding read only through window readers (strings
+          // unit S3) never fills its shadow: test the value inline.
+          emitIfFlat(code, this.strType, slot, I32, () => code.arrayLen(), () => code.call(this.ropes.len()));
+        } else {
+          get(slot);
+          code.call(this.ropes.len());
+        }
         code.else_();
         get(shadow.slot);
         code.arrayLen();
@@ -5239,7 +5381,7 @@ class Assembler {
         return;
       }
     }
-    if (FLAT_STRING_EXPRS.has(e.kind)) {
+    if (this.isFlatStringExpr(e)) {
       this.walkExprValue(e);
       code.arrayLen();
       return;
@@ -18636,8 +18778,20 @@ class Assembler {
       flatShadow.set(id, fn.params.length + 1 + localsOut.length);
       localsOut.push(this.strRef);
     }
-    const eagerFlat = shadowed.size > 0 ? flatReadIds(fn.body, shadowed, this.ropesLive) : new Set<string>();
-    if (this.ropesLive && eagerFlat.size > 0) for (const id of accumulatingIds(fn.body, eagerFlat)) eagerFlat.delete(id);
+    const eagerFlat = shadowed.size > 0 ? flatReadIds(fn.body, shadowed, this.nodesLive, this.strViewsLive) : new Set<string>();
+    if (this.nodesLive && eagerFlat.size > 0) for (const id of accumulatingIds(fn.body, eagerFlat, this.strViewsLive)) eagerFlat.delete(id);
+    const winShadow = new Map<string, { b: number; off: number; len: number }>();
+    if (this.strViewsLive && shadowed.size > 0) {
+      // Read only through window readers (no flat read at all — a
+      // binding read flat keeps its flat shadow alone).
+      const flatRead = flatReadIds(fn.body, shadowed, this.nodesLive, true);
+      for (const id of windowReadIds(fn.body, shadowed)) {
+        if (flatRead.has(id)) continue;
+        const b = fn.params.length + 1 + localsOut.length;
+        localsOut.push(this.strRef, I32, I32);
+        winShadow.set(id, { b, off: b + 1, len: b + 2 });
+      }
+    }
     this.fn = {
       fn,
       code: new Code(),
@@ -18646,6 +18800,7 @@ class Assembler {
       localsOut,
       flatShadow,
       eagerFlat,
+      winShadow,
       scratchFree: new Map(),
       depth: 0,
       control: [],
@@ -18737,6 +18892,9 @@ class Assembler {
     // first write). Built after the body only so it can sit in front.
     const prologue = new Code();
     for (const p of fn.params) {
+      // A window shadow (strings unit S3) is filled on entry too.
+      const w = this.fn.winShadow.get(p.localId);
+      if (w !== undefined) this.slices.emitWindowFill(prologue, this.localIndex(p.localId), w.b, w.off, w.len);
       if (!this.fn.eagerFlat.has(p.localId)) continue;
       prologue.localGet(this.localIndex(p.localId));
       this.emitFlat(prologue);
@@ -19217,7 +19375,7 @@ class Assembler {
         if (field === null) return;
         this.walkExpr(s.obj);
         // A class field holds a string VALUE (`this.buf += x` stays a node).
-        if (this.ropesLive) this.walkValue(s.value);
+        if (this.nodesLive) this.walkValue(s.value);
         else this.walkExpr(s.value);
         code.structSet(field.info.struct, field.index);
         return;
@@ -19752,7 +19910,7 @@ class Assembler {
       return;
     }
     if (value.type.kind === "string" && this.bindingShadow(localId, loc) !== undefined) {
-      if (FLAT_STRING_EXPRS.has(value.kind)) {
+      if (this.isFlatStringExpr(value)) {
         // Statically flat: it fills the shadow as it is stored.
         this.walkExprValue(value);
         this.bindingSet(localId, loc, true, false);
@@ -19809,6 +19967,35 @@ class Assembler {
    * eager (read flat somewhere — its reads then do no test), cleared
    * otherwise (lazy: the next flat read fills it). */
   private bindingSet(localId: string, loc: SrcLoc, flat: boolean, keep: boolean): void {
+    const w = this.globalById.has(localId) ? undefined : this.fn.winShadow.get(localId);
+    if (w !== undefined) {
+      // Strings unit S3: the window shadow follows every write (O(1)).
+      this.bindingSetValue(localId, loc, flat, false);
+      const slot = this.localIndex(localId);
+      const shadowed = this.bindingShadow(localId, loc);
+      if (flat && shadowed !== undefined) {
+        // Statically flat: the whole array is the window, no test.
+        const code = this.fn.code;
+        code.localGet(shadowed.slot);
+        code.localTee(w.b);
+        code.arrayLen();
+        code.localSet(w.len);
+        code.i32Const(0);
+        code.localSet(w.off);
+      } else {
+        this.slices.emitWindowFill(this.fn.code, slot, w.b, w.off, w.len);
+      }
+      if (keep) {
+        const shadow = this.bindingShadow(localId, loc);
+        this.fn.code.localGet(flat && shadow !== undefined ? shadow.slot : slot);
+      }
+      return;
+    }
+    this.bindingSetValue(localId, loc, flat, keep);
+  }
+
+  /** bindingSet's slot and flat-shadow half. */
+  private bindingSetValue(localId: string, loc: SrcLoc, flat: boolean, keep: boolean): void {
     const code = this.fn.code;
     const global = this.globalById.get(localId);
     const slot = global !== undefined ? this.globalIndex(global, loc) : this.localIndex(localId);
@@ -19852,8 +20039,8 @@ class Assembler {
       const ids = new Set<string>();
       for (const g of this.globalById.values()) if (g.type.kind === "string") ids.add(g.id);
       const bodies = this.mod.functions.map((f) => f.body);
-      const eager = ids.size > 0 ? flatReadIds(bodies, ids, this.ropesLive) : new Set<string>();
-      if (this.ropesLive && eager.size > 0) for (const id of accumulatingIds(bodies, eager)) eager.delete(id);
+      const eager = ids.size > 0 ? flatReadIds(bodies, ids, this.nodesLive, this.strViewsLive) : new Set<string>();
+      if (this.nodesLive && eager.size > 0) for (const id of accumulatingIds(bodies, eager, this.strViewsLive)) eager.delete(id);
       this.globalEagerFlatField = eager;
     }
     return this.globalEagerFlatField;
@@ -19931,7 +20118,7 @@ class Assembler {
    * sized) cast. walkValue is the non-flattening twin for pure moves. */
   private walkExpr(e: WExpr): void {
     if (e.kind === "varRef" && e.type.kind === "string" && this.readFlatShadow(e.localId, e.loc)) return;
-    if (this.ropesLive && e.type.kind === "string" && e.kind === "ternary") {
+    if (this.nodesLive && e.type.kind === "string" && e.kind === "ternary") {
       // Read flat: each arm flat (walkExprValue's value twin keeps nodes).
       this.walkExpr(e.cond);
       this.openIfResult(this.strRef);
@@ -19941,7 +20128,7 @@ class Assembler {
       this.close();
       return;
     }
-    if (this.ropesLive && e.type.kind === "string" && e.kind === "seqExpr") {
+    if (this.nodesLive && e.type.kind === "string" && e.kind === "seqExpr") {
       this.walkBody(e.stmts);
       this.walkExpr(e.result);
       return;
@@ -19954,8 +20141,166 @@ class Assembler {
       this.emitPendingCheck(); // past the length limit: RangeError
       return;
     }
+    if (this.strViewsLive && e.kind === "strIntrinsic" && VIEW_PRODUCER_METHODS.has(e.method)) {
+      // Read flat on the spot (strings unit S3): the span copied out of
+      // the receiver's window — never a view to materialise.
+      this.emitSliceOp(e, false);
+      return;
+    }
     this.walkExprValue(e);
     if (e.type.kind === "string" && !FLAT_STRING_EXPRS.has(e.kind)) this.emitFlat();
+  }
+
+  /** Statically flat: a string expression whose walkExprValue already
+   * leaves a flat `$chars` (FLAT_STRING_EXPRS) — except, with slice views
+   * live, a view producer, whose VALUE may be a view. */
+  private isFlatStringExpr(e: WExpr): boolean {
+    if (!FLAT_STRING_EXPRS.has(e.kind)) return false;
+    return !(this.strViewsLive && e.kind === "strIntrinsic" && VIEW_PRODUCER_METHODS.has(e.method));
+  }
+
+  /** A window reader's string operand (strings unit S3): "flat" when it
+   * left a flat `$chars` (an eager binding's shadow, a statically flat
+   * expression — the reader's flat helper takes it, no test), "value"
+   * when it left the str VALUE (`(ref null eq)`: maybe a view, read in
+   * place by the reader's window helper). Without views: always flat. */
+  private walkWindowOperand(e: WExpr): "flat" | "value" | "window" {
+    const w = this.windowShadowOf(e);
+    if (w !== undefined) {
+      // A window shadow: the held (base, off, len) — no shape test, no
+      // copy; an unfilled one (a rope was written) is filled first.
+      this.emitWindowEnsure(e as WExpr & { kind: "varRef" }, w);
+      this.fn.code.localGet(w.b);
+      this.fn.code.localGet(w.off);
+      this.fn.code.localGet(w.len);
+      return "window";
+    }
+    if (this.windowOperandFlat(e)) {
+      this.walkExpr(e);
+      return "flat";
+    }
+    this.walkValue(e);
+    return "value";
+  }
+
+  /** A window shadow about to be read: refilled from the binding's value
+   * when a write left it unfilled (B null: a rope or a null was stored —
+   * the rope is flattened here, once, and cached in the node; a null
+   * stays null and the W reader traps on it). TSINTER_WASM_FLAT_CHECK=1
+   * re-derives the window from the value and traps unless the two spell
+   * the same code units. */
+  private emitWindowEnsure(e: WExpr & { kind: "varRef" }, w: { b: number; off: number; len: number }): void {
+    const code = this.fn.code;
+    const slot = this.localIndex(e.localId);
+    code.localGet(w.b);
+    code.refIsNull();
+    code.ifVoid();
+    this.slices.emitWindow(code, slot, w.b, w.off, w.len, true);
+    code.end();
+    if (FLAT_CHECK) this.emitWindowCheck(slot, w);
+  }
+
+  /** FLAT_CHECK for a window shadow: the value's window re-derived into
+   * scratch must have the shadow's length and units (by content: a
+   * view materialised since the write re-points at an equal copy). */
+  private emitWindowCheck(slot: number, w: { b: number; off: number; len: number }): void {
+    const code = this.fn.code;
+    const b2 = this.acquireScratch(this.strRef);
+    const off2 = this.acquireScratch(I32);
+    const len2 = this.acquireScratch(I32);
+    const i = this.acquireScratch(I32);
+    this.slices.emitWindow(code, slot, b2, off2, len2, true);
+    code.localGet(len2);
+    code.localGet(w.len);
+    code.i32Ne();
+    code.ifVoid();
+    code.unreachable();
+    code.end();
+    // The same base and offset is the common answer (O(1)); only a view
+    // materialised since the write (re-pointed at its copy) compares units.
+    code.localGet(b2);
+    code.refIsNull();
+    code.i32Eqz();
+    code.localGet(b2);
+    code.localGet(w.b);
+    code.refEq();
+    code.localGet(off2);
+    code.localGet(w.off);
+    code.i32Eq();
+    code.i32And();
+    code.i32Eqz();
+    code.i32And();
+    code.ifVoid();
+    code.i32Const(0);
+    code.localSet(i);
+    code.block();
+    code.loop();
+    code.localGet(i);
+    code.localGet(len2);
+    code.i32GeS();
+    code.brIf(1);
+    code.localGet(b2);
+    code.localGet(off2);
+    code.localGet(i);
+    code.i32Add();
+    code.arrayGetU(this.strType);
+    code.localGet(w.b);
+    code.localGet(w.off);
+    code.localGet(i);
+    code.i32Add();
+    code.arrayGetU(this.strType);
+    code.i32Ne();
+    code.ifVoid();
+    code.unreachable();
+    code.end();
+    code.localGet(i);
+    code.i32Const(1);
+    code.i32Add();
+    code.localSet(i);
+    code.br(0);
+    code.end();
+    code.end();
+    code.end();
+    this.releaseScratch(I32, i);
+    this.releaseScratch(I32, len2);
+    this.releaseScratch(I32, off2);
+    this.releaseScratch(this.strRef, b2);
+  }
+
+  /** A bare local read with a window shadow (strings unit S3). */
+  private windowShadowOf(e: WExpr): { b: number; off: number; len: number } | undefined {
+    if (!this.strViewsLive || e.kind !== "varRef" || this.globalById.has(e.localId)) return undefined;
+    return this.fn.winShadow.get(e.localId);
+  }
+
+  /** walkWindowOperand's choice, without walking (false for a window
+   * shadow too: callers test windowShadowOf first). */
+  private windowOperandFlat(e: WExpr): boolean {
+    if (!this.strViewsLive) return true;
+    if (this.windowShadowOf(e) !== undefined) return false;
+    if (e.kind === "varRef" && this.bindingShadow(e.localId, e.loc) !== undefined && this.bindingEager(e.localId)) return true;
+    return this.isFlatStringExpr(e) || e.kind === "strConcat";
+  }
+
+  /** slice / substring / trim* with views live: `asView` (value
+   * position) builds a str value — a view at 13 units or more — else the
+   * flat span; the receiver is read as a window either way (slices.ts). */
+  private emitSliceOp(e: WExpr & { kind: "strIntrinsic" }, asView: boolean): void {
+    const code = this.fn.code;
+    const m = e.method;
+    const kind: SliceOpKind = m === "slice" ? "slice" : m === "substring" ? "substring" : m === "trim" ? "trim:both" : m === "trimStart" ? "trim:start" : "trim:end";
+    // A window shadow's held window, else the receiver's value (any
+    // shape: the V helper extracts the window).
+    const form: WinForm = this.walkWindowOperand(e.receiver) === "window" ? "W" : "V";
+    if (kind === "slice" || kind === "substring") {
+      const a0 = e.args[0];
+      if (a0 !== undefined) this.walkExpr(a0);
+      else code.f64Const(0);
+      const a1 = e.args[1];
+      if (a1 !== undefined) this.walkExpr(a1);
+      else code.f64Const(Number.POSITIVE_INFINITY);
+    }
+    code.call(this.slices.op(kind, asView, form));
   }
 
   /** A code-unit read of a string binding through its flat shadow (a
@@ -20305,7 +20650,7 @@ class Assembler {
       case "assignExpr": {
         // A string is assigned as a VALUE (strings unit S2); walkExpr
         // flattens the result only where it is read flat.
-        if (this.ropesLive) this.walkValue(e.value);
+        if (this.nodesLive) this.walkValue(e.value);
         else this.walkExpr(e.value);
         const local = this.fn.localById.get(e.localId);
         if (local?.boxed === true) {
@@ -20320,7 +20665,7 @@ class Assembler {
           this.releaseScratch(soft, v);
           return;
         }
-        this.bindingSet(e.localId, e.loc, !this.ropesLive && e.value.type.kind === "string", true);
+        this.bindingSet(e.localId, e.loc, !this.nodesLive && e.value.type.kind === "string", true);
         return;
       }
 
@@ -20467,7 +20812,7 @@ class Assembler {
         // A string ternary in value position keeps its arms as values
         // (strings unit S2: `s = c ? s + x : y + s` stays a node; walkExpr
         // has the flat twin).
-        const arm = (x: WExpr): void => (this.ropesLive ? this.walkValue(x) : this.walkExpr(x));
+        const arm = (x: WExpr): void => (this.nodesLive ? this.walkValue(x) : this.walkExpr(x));
         this.walkExpr(e.cond);
         this.openIfResult(t);
         arm(e.then);
@@ -20479,7 +20824,7 @@ class Assembler {
 
       case "seqExpr":
         this.walkBody(e.stmts);
-        if (this.ropesLive) this.walkValue(e.result);
+        if (this.nodesLive) this.walkValue(e.result);
         else this.walkExpr(e.result);
         return;
 
@@ -26059,7 +26404,17 @@ class Assembler {
           code.f64ConvertI32S();
           return;
         }
-        this.walkExpr(e.receiver);
+        if (this.strViewsLive && VIEW_PRODUCER_METHODS.has(m)) {
+          // VALUE position (walkExpr took the flat form): a view at 13
+          // units or more (strings unit S3, slices.ts).
+          this.emitSliceOp(e, true);
+          return;
+        }
+        // The window readers take the receiver's value when it may be a
+        // view (strings unit S3): read in place, never materialised.
+        const recv = this.strViewsLive && VIEW_READER_METHODS.has(m) ? this.walkWindowOperand(e.receiver) : (this.walkExpr(e.receiver), "flat" as const);
+        const v = recv === "value";
+        const wf: WinForm = recv === "window" ? "W" : "V";
         const argOr = (i: number, dflt: number): void => {
           const a = e.args[i];
           if (a !== undefined) this.walkExpr(a);
@@ -26067,28 +26422,58 @@ class Assembler {
         };
         switch (m) {
           case "charCodeAt":
-            this.walkExpr(e.args[0]!);
-            code.call(this.strs.charCodeAt());
-            return;
           case "charAt":
+          case "cpAt": {
+            const flatH = m === "charCodeAt" ? this.strs.charCodeAt() : m === "charAt" ? this.strs.charAt() : this.strs.cpAt();
+            if (recv === "window") {
+              this.walkExpr(e.args[0]!);
+              code.call(m === "charCodeAt" ? this.slices.charCodeAt("W") : m === "charAt" ? this.slices.charAt("W") : this.slices.cpAt("W"));
+              return;
+            }
+            if (!v) {
+              this.walkExpr(e.args[0]!);
+              code.call(flatH);
+              return;
+            }
+            // A value receiver (strings unit S3): the flat test inlined —
+            // a flat array takes the flat helper, only a view or a rope
+            // the window helper (a lexer's charCodeAt loop pays a test,
+            // not a call into the dispatch).
+            const viewH = m === "charCodeAt" ? this.slices.charCodeAt() : m === "charAt" ? this.slices.charAt() : this.slices.cpAt();
+            const r = this.acquireScratch(STR_VAL);
+            code.localSet(r);
+            const x = this.acquireScratch(F64);
             this.walkExpr(e.args[0]!);
-            code.call(this.strs.charAt());
+            code.localSet(x);
+            emitIfFlat(
+              code,
+              this.strType,
+              r,
+              m === "charCodeAt" ? F64 : this.strRef,
+              () => {
+                code.localGet(x);
+                code.call(flatH);
+              },
+              () => {
+                code.localGet(x);
+                code.call(viewH);
+              },
+            );
+            this.releaseScratch(F64, x);
+            this.releaseScratch(STR_VAL, r);
             return;
-          case "cpAt":
-            this.walkExpr(e.args[0]!);
-            code.call(this.strs.cpAt());
-            return;
+          }
           case "indexOf":
             this.walkExpr(e.args[0]!);
             argOr(1, 0);
-            code.call(this.strs.indexOf());
+            code.call(recv !== "flat" ? this.slices.indexOf(wf) : this.strs.indexOf());
             return;
           case "includes":
             // The position form is indexOf's clamp exactly (the spec
             // routes both through StringIndexOf): found ⇔ index != -1.
             this.walkExpr(e.args[0]!);
             argOr(1, 0);
-            code.call(this.strs.indexOf());
+            code.call(recv !== "flat" ? this.slices.indexOf(wf) : this.strs.indexOf());
             code.f64Const(-1);
             code.f64Ne();
             return;
@@ -26096,11 +26481,11 @@ class Assembler {
             // The prefix match IS matchAt anchored at 0.
             this.walkExpr(e.args[0]!);
             code.i32Const(0);
-            code.call(this.strs.matchAt());
+            code.call(recv !== "flat" ? this.slices.matchAt(wf) : this.strs.matchAt());
             return;
           case "endsWith":
             this.walkExpr(e.args[0]!);
-            code.call(this.strs.endsWith());
+            code.call(recv !== "flat" ? this.slices.endsWith(wf) : this.strs.endsWith());
             return;
           case "slice":
             argOr(0, 0);
@@ -28403,10 +28788,11 @@ class Assembler {
             const reLocal = this.acquireScratch(rs.reT);
             this.walkExpr(e.receiver);
             code.localTee(reLocal);
-            this.walkExpr(e.args[0]!);
+            // A subject that may be a view is matched in place (S3).
+            const subj = this.walkWindowOperand(e.args[0]!);
             code.localGet(reLocal);
             code.call(rs.capNew());
-            code.call(rs.bexec());
+            code.call(subj === "window" ? rs.bexecW() : subj === "value" ? rs.bexecV() : rs.bexec());
             this.releaseScratch(rs.reT, reLocal);
             return;
           }
@@ -28436,6 +28822,17 @@ class Assembler {
             // than re-walking e.receiver at that later point (which
             // would evaluate it a second time, doubling any side effect,
             // AND out of order).
+            if (!this.windowOperandFlat(e.receiver)) {
+              // A subject that may be a view: matched in place (S3).
+              const subjV = this.acquireScratch(STR_VAL);
+              this.walkValue(e.receiver);
+              code.localSet(subjV);
+              this.walkExpr(e.args[0]!);
+              code.localGet(subjV);
+              code.call(this.regexState.searchV());
+              this.releaseScratch(STR_VAL, subjV);
+              return;
+            }
             const strRefT = this.strRef;
             const regexRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.regexType };
             const bcRefT: ValType = { kind: "ref", nullable: true, typeIndex: this.regex.bcType };
@@ -28569,19 +28966,29 @@ class Assembler {
             const isExec = e.method === "exec" || e.method === "execInto";
             const into = e.method === "matchInto" || e.method === "execInto";
             const reLocal = this.acquireScratch(rs.reT);
-            const subjLocal = this.acquireScratch(this.strRef);
+            // A subject that may be a view is matched in place (S3).
+            const subjExpr = isExec ? e.args[0]! : e.receiver;
+            const subjFlat = this.windowOperandFlat(subjExpr);
+            const subjT = subjFlat ? this.strRef : STR_VAL;
+            const subjLocal = this.acquireScratch(subjT);
+            const walkSubj = (): void => {
+              if (subjFlat) this.walkExpr(subjExpr);
+              else this.walkValue(subjExpr);
+            };
             // JS order: match's receiver is the subject, exec's the regex.
-            this.walkExpr(e.receiver);
+            if (isExec) this.walkExpr(e.receiver);
+            else walkSubj();
             code.localSet(isExec ? reLocal : subjLocal);
-            this.walkExpr(e.args[0]!);
+            if (isExec) walkSubj();
+            else this.walkExpr(e.args[0]!);
             code.localSet(isExec ? subjLocal : reLocal);
             code.localGet(reLocal);
             code.localGet(subjLocal);
             if (into) this.walkExpr(e.args[1]!);
             else code.refNull(rs.numT.kind === "ref" ? rs.numT.typeIndex : 0);
-            code.call(isExec ? rs.exec() : rs.match());
+            code.call(subjFlat ? (isExec ? rs.exec() : rs.match()) : isExec ? rs.execV() : rs.matchV());
             this.releaseScratch(rs.reT, reLocal);
-            this.releaseScratch(this.strRef, subjLocal);
+            this.releaseScratch(subjT, subjLocal);
             const rowLocal = this.acquireScratch(rs.rowT);
             code.localTee(rowLocal);
             code.refIsNull();
@@ -30639,6 +31046,7 @@ class Assembler {
     this.vecsField ??= new VecBuilder(this.mb, {
       strEq: () => this.strEqHelper(),
       flat: (c) => this.emitFlat(c),
+      ...(this.strViewsLive ? { strViews: { len: () => this.ropes.len(), copyInto: () => this.slices.copyInto() } } : {}),
       strRef: () => this.strRef,
       f64ToStr: () => this.f64ToStrHelper(),
       concat: () => this.concatHelper(),
@@ -30713,6 +31121,7 @@ class Assembler {
       bytesRef: () => this.bytesB.bytesRef(),
       bytesGet: (elem) => this.bytesB.get(elem),
       bytesLength: () => this.bytesB.length(),
+      ...(this.strViewsLive ? { span: () => this.slices.span() } : {}),
     });
     return this.strsField;
   }
@@ -30752,7 +31161,7 @@ class Assembler {
     // stores, or a struct.get'd bytecode ref fails WasmGC validation
     // against the interpreter's own self-built type. See
     // RegexInterpreterBuilder's own injectedBcType doc comment.
-    this.regexInterpField ??= new RegexInterpreterBuilder(this.mb, this.strType, this.casing, this.regex.bcType);
+    this.regexInterpField ??= new RegexInterpreterBuilder(this.mb, this.strType, this.casing, this.regex.bcType, this.strViewsLive);
     return this.regexInterpField;
   }
 
@@ -30777,9 +31186,27 @@ class Assembler {
         join: () => this.vecs.join(rowVec, this.strRef),
         getSubstitution: () => this.getSubstitutionHelper(),
         indexOf: () => this.strs.indexOf(),
+        ...(this.strViewsLive
+          ? {
+              views: {
+                span: () => this.slices.span(),
+                window: (a: A, x: number, b: number, off: number, len: number) => this.slices.window(a, x, b, off, len),
+              },
+            }
+          : {}),
       });
     }
     return this.regexStateField;
+  }
+
+  private slicesField: Slices | null = null;
+
+  /** Strings unit S3: slice views (slices.ts) — the producers, the
+   * window readers. Only a module with views (strViewsLive) builds them. */
+  private get slices(): Slices {
+    if (!this.strViewsLive) throw new Error("wasm emitter bug: slice views in a module without views (strViewsLive)");
+    this.slicesField ??= new Slices(this.mb, this.strType, this.ropes, this.strs);
+    return this.slicesField;
   }
 
   private regexCompilerField: RegexCompilerBuilder | null = null;
@@ -33271,7 +33698,11 @@ class Assembler {
         this.walkExpr(e.receiver);
         code.localSet(vec);
         const staged = e.args.map((a) => {
-          this.walkExpr(a);
+          // A string element only MOVES into the array: with slice views
+          // live (strings unit S3) it stays a value (a view is pushed as
+          // a view, V8's policy), like an arraySet's.
+          if (this.strViewsLive && a.type.kind === "string") this.walkValue(a);
+          else this.walkExpr(a);
           const s = this.acquireScratch(info.elemVal);
           code.localSet(s);
           return s;

@@ -53,6 +53,16 @@ export interface RegexStateDeps {
   join: () => number; // %w.vec.join over rowVec (vec, sep) -> str
   getSubstitution: () => number; // (S, start, end, cap, ncap, names, tpl) -> str
   indexOf: () => number; // %w.str.indexOf (str, needle, f64 from) -> f64
+  /** Strings unit S3, a module with slice views (slices.ts): the
+   * piece builder (%w.str.span: base, off, cnt -> str value) — rows,
+   * global-match and split pieces are then values (a view at 13 units or
+   * more) — and the window reader behind the view entry points (execV,
+   * bexecV, matchV, searchV), whose subject is a str VALUE matched in
+   * place through interp.execW. */
+  views?: {
+    span: () => number;
+    window: ($: A, x: number, b: number, off: number, len: number) => void;
+  };
 }
 
 export class RegexStateBuilder {
@@ -184,6 +194,24 @@ export class RegexStateBuilder {
     return $.call(this.d.slice(), S, $.i2d(a), $.i2d(b));
   }
 
+  /** A piece S[a, b) handed back to the program (a row element, a
+   * global-match or split piece): with views live the cheapest value
+   * (%w.str.span — a view at 13 units or more), else sub's flat copy. */
+  private piece($: A, S: X, a: X, b: X): X {
+    const v = this.d.views;
+    if (v === undefined) return this.sub($, S, a, b);
+    return () => {
+      const A0 = $.local(I32);
+      $.put(A0, a);
+      $.do($.call(v.span(), S, $.l(A0), $.sub(b, $.l(A0))));
+    };
+  }
+
+  /** The type of a piece (a `$.sel` arm's). */
+  private get pieceT(): ValType {
+    return this.d.views === undefined ? this.strRefT : { kind: "ref", nullable: true, typeIndex: -0x13 };
+  }
+
   /** The honest match row: [whole, ...captures], "" for a capture that
    * did not participate (S064). */
   row(): number {
@@ -201,11 +229,169 @@ export class RegexStateBuilder {
         $.run(
           this.d.vecs.pushOne(this.d.rowVec),
           $.l(OUT),
-          $.sel(this.strRefT, $.lt($.l(CS), $.i(0)), this.emptyStr($), this.sub($, S, $.l(CS), $.aget(capT, CAP, $.add($.shl($.l(K), $.i(1)), $.i(1))))),
+          $.sel(this.pieceT, $.lt($.l(CS), $.i(0)), this.emptyStr($), this.piece($, S, $.l(CS), $.aget(capT, CAP, $.add($.shl($.l(K), $.i(1)), $.i(1))))),
         );
       });
       $.do($.l(OUT));
     });
+  }
+
+  /* ── the view entry points (strings unit S3) ────────────────────────
+   * The subject is a str VALUE read as a window B[OFF, OFF + LEN) of a
+   * flat array (slices.ts window): a slice view is matched IN PLACE by
+   * the windowed matcher (interp.execW), never copied — a tokenizer's
+   * `re.exec(src)` over `src = src.slice(n)` stays linear. The capture
+   * array comes back RELATIVE to the window (rebased), so lastIndex, the
+   * positions companion and every caller read exactly what the flat
+   * entry points produce. */
+
+  private get views(): NonNullable<RegexStateDeps["views"]> {
+    const v = this.d.views;
+    if (v === undefined) throw new Error("wasm emitter bug: a regex view entry point in a module without views");
+    return v;
+  }
+
+  /** bexec over the window (B, OFF, LEN): (re, B, off, len, cap) → i32. */
+  bexecW(): number {
+    return this.fn("bexecW", [this.reT, this.strRefT, I32, I32, this.capT], [I32], ($) => {
+      const RE = $.l(0);
+      const B = $.l(1);
+      const OFF = $.l(2);
+      const LEN = $.l(3);
+      const CAP = $.l(4);
+      const GY = $.local(I32);
+      const LI = $.local(F64);
+      const I = $.local(I32);
+      const V = $.local(I32);
+      const T = this.d.re.regexType;
+      const capT = this.d.interp.capType;
+      $.put(GY, $.and($.call(this.flags(), RE), $.i(LRE_FLAG_GLOBAL | LRE_FLAG_STICKY)));
+      $.put(LI, $.sel(F64, $.l(GY), $.call(this.toIndex(), $.get(T, F_LAST, RE)), $.d(0)));
+      const fail = (): void => {
+        $.if($.l(GY), () => $.set(T, F_LAST, RE, $.d(0)));
+        $.ret($.i(0));
+      };
+      $.if($.dgt($.l(LI), $.i2d(LEN)), fail);
+      this.reset($, CAP, I);
+      $.if($.not($.call(this.d.interp.execW(), $.get(T, F_BC, RE), B, OFF, $.add(OFF, LEN), $.add(OFF, $.d2i($.l(LI))), CAP)), fail);
+      // Rebase the capture slots (not the registers past them) to the window.
+      $.if(OFF, () =>
+        $.for(I, $.i(0), $.shl($.get(T, F_CAPS, RE), $.i(1)), () => {
+          $.put(V, $.aget(capT, CAP, $.l(I)));
+          $.if($.ge($.l(V), $.i(0)), () => $.aset(capT, CAP, $.l(I), $.sub($.l(V), OFF)));
+        }),
+      );
+      $.if($.l(GY), () => $.set(T, F_LAST, RE, $.i2d($.aget(capT, CAP, $.i(1)))));
+      $.do($.i(1));
+    });
+  }
+
+  /** row over the window: the pieces are B[OFF + start, OFF + end). */
+  private rowW(): number {
+    return this.fn("rowW", [this.strRefT, I32, this.capT, I32], [this.rowT], ($) => {
+      const B = $.l(0);
+      const OFF = $.l(1);
+      const CAP = $.l(2);
+      const N = $.l(3);
+      const OUT = $.local(this.rowT);
+      const K = $.local(I32);
+      const CS = $.local(I32);
+      const capT = this.d.interp.capType;
+      const EQ: ValType = { kind: "ref", nullable: true, typeIndex: -0x13 };
+      $.put(OUT, $.call(this.d.vecs.newLen(this.d.rowVec), $.d(0)));
+      $.for(K, $.i(0), N, () => {
+        $.put(CS, $.aget(capT, CAP, $.shl($.l(K), $.i(1))));
+        $.run(
+          this.d.vecs.pushOne(this.d.rowVec),
+          $.l(OUT),
+          $.sel(EQ, $.lt($.l(CS), $.i(0)), this.emptyStr($), $.call(this.views.span(), B, $.add(OFF, $.l(CS)), $.sub($.aget(capT, CAP, $.add($.shl($.l(K), $.i(1)), $.i(1))), $.l(CS)))),
+        );
+      });
+      $.do($.l(OUT));
+    });
+  }
+
+  /** A view entry point's prologue: the window of the str value in
+   * param `x` into three fresh locals. */
+  private win($: A, x: number): { B: number; OFF: number; LEN: number } {
+    const B = $.local(this.strRefT);
+    const OFF = $.local(I32);
+    const LEN = $.local(I32);
+    this.views.window($, x, B, OFF, LEN);
+    return { B, OFF, LEN };
+  }
+
+  /** bexec over a str value: (re, str value, cap) → i32 (test). */
+  bexecV(): number {
+    const EQ: ValType = { kind: "ref", nullable: true, typeIndex: -0x13 };
+    return this.fn("bexecV", [this.reT, EQ, this.capT], [I32], ($) => {
+      const w = this.win($, 1);
+      $.do($.call(this.bexecW(), $.l(0), $.l(w.B), $.l(w.OFF), $.l(w.LEN), $.l(2)));
+    });
+  }
+
+  /** RegExp.prototype.exec over a window: (re, B, off, len, pos) → row. */
+  execW(): number {
+    return this.fn("execRowW", [this.reT, this.strRefT, I32, I32, this.numT], [this.rowT], ($) => {
+      const RE = $.l(0);
+      const B = $.l(1);
+      const OFF = $.l(2);
+      const P = $.l(4);
+      const CAP = $.local(this.capT);
+      $.if($.notNull(P), () => this.clearVec($, P));
+      $.put(CAP, $.call(this.capNew(), RE));
+      $.if($.not($.call(this.bexecW(), RE, B, OFF, $.l(3), $.l(CAP))), () => $.ret($.nul(this.d.rowVec.struct)));
+      const n = $.get(this.d.re.regexType, F_CAPS, RE);
+      $.if($.notNull(P), () => $.run(this.pushPos(), P, $.l(CAP), n));
+      $.do($.call(this.rowW(), B, OFF, $.l(CAP), n));
+    });
+  }
+
+  /** Symbol.match over a window: a non-global regex is execW; a global
+   * one (every match — O(n) anyway) reads the window's span flat. */
+  matchW(): number {
+    return this.fn("matchW", [this.reT, this.strRefT, I32, I32, this.numT], [this.rowT], ($) => {
+      $.if($.not($.and($.call(this.flags(), $.l(0)), $.i(LRE_FLAG_GLOBAL))), () => $.ret($.call(this.execW(), $.l(0), $.l(1), $.l(2), $.l(3), $.l(4))));
+      $.do($.call(this.match(), $.l(0), this.sub($, $.l(1), $.l(2), $.add($.l(2), $.l(3))), $.l(4)));
+    });
+  }
+
+  /** Symbol.search over a window: (re, B, off, len) → f64, the first
+   * match's index or -1 (one exec from 0; lastIndex untouched). */
+  searchW(): number {
+    return this.fn("searchW", [this.reT, this.strRefT, I32, I32], [F64], ($) => {
+      const RE = $.l(0);
+      const B = $.l(1);
+      const OFF = $.l(2);
+      const CAP = $.local(this.capT);
+      $.put(CAP, $.call(this.capNew(), RE));
+      $.if($.not($.call(this.d.interp.execW(), $.get(this.d.re.regexType, F_BC, RE), B, OFF, $.add(OFF, $.l(3)), OFF, $.l(CAP))), () => $.ret($.d(-1)));
+      $.do($.i2d($.sub($.aget(this.d.interp.capType, $.l(CAP), $.i(0)), OFF)));
+    });
+  }
+
+  /** The V entry points: the str value's window, then the W form. */
+  private viaWindow(name: string, extra: ValType[], result: ValType, w: () => number): number {
+    const EQ: ValType = { kind: "ref", nullable: true, typeIndex: -0x13 };
+    return this.fn(name, [this.reT, EQ, ...extra], [result], ($) => {
+      const win = this.win($, 1);
+      $.do($.call(w(), $.l(0), $.l(win.B), $.l(win.OFF), $.l(win.LEN), ...extra.map((_, i) => $.l(2 + i))));
+    });
+  }
+
+  /** RegExp.prototype.exec over a str value: (re, str value, pos) → row. */
+  execV(): number {
+    return this.viaWindow("execRowV", [this.numT], this.rowT, () => this.execW());
+  }
+
+  /** Symbol.match over a str value. */
+  matchV(): number {
+    return this.viaWindow("matchV", [this.numT], this.rowT, () => this.matchW());
+  }
+
+  /** Symbol.search over a str value: (re, str value) → f64. */
+  searchV(): number {
+    return this.viaWindow("searchV", [], F64, () => this.searchW());
   }
 
   /** Appends the match's 2*n capture positions (start, end; -1 unset). */
@@ -278,7 +464,7 @@ export class RegexStateBuilder {
           () => {
             const s0 = $.aget(capT, $.l(CAP), $.i(0));
             const e0 = $.aget(capT, $.l(CAP), $.i(1));
-            $.run(this.d.vecs.pushOne(this.d.rowVec), $.l(OUT), this.sub($, S, s0, e0));
+            $.run(this.d.vecs.pushOne(this.d.rowVec), $.l(OUT), this.piece($, S, s0, e0));
             $.if($.eq(s0, e0), () => this.bumpEmpty($, RE, S, $.l(U)));
           },
           () => $.put(GO, $.i(0)),
@@ -646,11 +832,11 @@ export class RegexStateBuilder {
                   $.eq($.l(EN), $.l(P)),
                   () => $.put(Q, $.call(this.advance(), S, $.l(ST), $.l(U))),
                   () => {
-                    push(this.sub($, S, $.l(P), $.l(ST)));
+                    push(this.piece($, S, $.l(P), $.l(ST)));
                     $.put(P, $.l(EN));
                     $.for(K, $.i(1), $.l(N), () => {
                       $.put(CS, $.aget(capT, $.l(CAP), $.shl($.l(K), $.i(1))));
-                      push($.sel(this.strRefT, $.lt($.l(CS), $.i(0)), this.emptyStr($), this.sub($, S, $.l(CS), $.aget(capT, $.l(CAP), $.add($.shl($.l(K), $.i(1)), $.i(1))))));
+                      push($.sel(this.pieceT, $.lt($.l(CS), $.i(0)), this.emptyStr($), this.piece($, S, $.l(CS), $.aget(capT, $.l(CAP), $.add($.shl($.l(K), $.i(1)), $.i(1))))));
                     });
                     $.put(Q, $.l(P));
                   },
@@ -660,7 +846,7 @@ export class RegexStateBuilder {
           },
         );
       });
-      $.run(this.d.vecs.pushOne(this.d.rowVec), $.l(OUT), this.sub($, S, $.l(P), $.alen(S)));
+      $.run(this.d.vecs.pushOne(this.d.rowVec), $.l(OUT), this.piece($, S, $.l(P), $.alen(S)));
       $.do($.l(OUT));
     });
   }
