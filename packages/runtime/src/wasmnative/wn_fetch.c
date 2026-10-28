@@ -774,6 +774,8 @@ typedef struct Req {
   unsigned long long bytes_read;
   int completed;         /* request.onComplete ran */
   int destroyed;         /* util.destroy(socket, err) ran: its error */
+  int tls_err;           /* a TLS error after the handshake was emitted on
+                          * the socket (kError: d_*), which stays open */
   char *d_name, *d_msg, *d_code;
   unsigned long long rx; /* bytes read on this hop */
   int hop_last_;
@@ -939,31 +941,54 @@ static int fetch_verify_continue(int preverify_ok, X509_STORE_CTX *ctx) {
 }
 /* undici's connections: tls.connect with a default secure context (its
  * store the root store: addRootCerts) */
-static SSL_CTX *fetch_ctx(void) {
+static SSL_CTX *fetch_ctx(WnCtxError *err) {
   static SSL_CTX *sc;
   if (!sc) {
-    sc = wn_ossl_ctx_new();
-    wn_ossl_ctx_roots(sc);
+    sc = wn_ossl_ctx_new_checked(err);
+    if (sc) wn_ossl_ctx_roots(sc);
   }
   return sc;
 }
-/* a TLS failure as the socket's error (TLSWrap::ClearOut): the message is
- * GetBIOError's, the code "ERR_SSL_" + the first error's reason,
- * upper-cased; a TLS alert waiting in the output goes out first */
-static void tls_ssl_fail(Req *r) {
+/* TLSWrap::ClearOut's error: the message is GetBIOError's, the code
+ * "ERR_SSL_" + the first error's reason, upper-cased (NULL: a reason Node
+ * cannot name — Node emits nothing); a TLS alert waiting in the output goes
+ * out first */
+static char *tls_ssl_error(Req *r, char *code, size_t cap) {
   unsigned long first = ERR_peek_error();
   const char *rs = first ? ERR_reason_error_string(first) : NULL;
   char *msg = wn_ossl_bio_error();
-  char code[160] = "";
-  if (rs) {
-    size_t k = (size_t)snprintf(code, sizeof code, "ERR_SSL_");
-    for (size_t i = 0; rs[i] && k + 1 < sizeof code; i++) code[k++] = rs[i] == ' ' ? '_' : (rs[i] >= 'a' && rs[i] <= 'z' ? (char)(rs[i] - 32) : rs[i]);
-    code[k] = 0;
-  }
   tls_flush(r);
   flush_out(r);
-  req_fail(r, "Error", msg, code);
+  if (!rs) {
+    free(msg);
+    return NULL;
+  }
+  size_t k = (size_t)snprintf(code, cap, "ERR_SSL_");
+  for (size_t i = 0; rs[i] && k + 1 < cap; i++) code[k++] = rs[i] == ' ' ? '_' : (rs[i] >= 'a' && rs[i] <= 'z' ? (char)(rs[i] - 32) : rs[i]);
+  code[k] = 0;
+  return msg;
+}
+/* before the handshake finished: the TLSSocket is destroyed with it */
+static void tls_ssl_fail(Req *r) {
+  char code[160] = "";
+  char *msg = tls_ssl_error(r, code, sizeof code);
+  req_fail(r, "Error", msg ? msg : "", code);
   free(msg);
+}
+
+/* SSL_write of every byte, in pieces an int can count (a memory BIO takes
+ * everything; only a failed engine refuses — what it refused never reaches
+ * the peer, and the read side reports the failure): 1, or 0 */
+static int tls_write_all(Req *r, const uint8_t *p, size_t n) {
+  while (n > 0) {
+    int part = n > (1u << 30) ? 1 << 30 : (int)n;
+    int w = SSL_write(r->ssl, p, part);
+    if (w <= 0) return 0;
+    tls_flush(r);
+    p += w;
+    n -= (size_t)w;
+  }
+  return 1;
 }
 
 /* the request head, as undici writes it */
@@ -1018,8 +1043,8 @@ static void write_head(Req *r) {
     /* undici writes the head, then the body: each SSL_write a whole
      * record run into the output BIO */
     ERR_set_mark();
-    if (h.n) SSL_write(r->ssl, h.p, (int)h.n);
-    if (r->has_body && r->blen) SSL_write(r->ssl, r->body, (int)r->blen);
+    int ok = tls_write_all(r, (const uint8_t *)h.p, h.n);
+    if (ok && r->has_body) ok = tls_write_all(r, r->body, r->blen);
     ERR_pop_to_mark();
     tls_flush(r);
   } else {
@@ -1228,8 +1253,15 @@ static void hop_start(Req *r) {
 }
 
 static void tls_begin(Req *r) {
+  /* tls.connect's createSecureContext: what it throws fails the request */
+  WnCtxError ce;
+  SSL_CTX *sc = fetch_ctx(&ce);
+  if (!sc) {
+    req_fail(r, ce.type_error ? "TypeError" : "Error", ce.message, ce.code);
+    return;
+  }
   /* TLSWrap::InitSSL on undici's tls.connect */
-  r->ssl = SSL_new(fetch_ctx());
+  r->ssl = SSL_new(sc);
   if (!r->ssl) wn_host_fail("fetch: SSL_new failed");
   r->rbio = BIO_new(BIO_s_mem());
   r->wbio = BIO_new(BIO_s_mem());
@@ -1258,6 +1290,7 @@ static void tls_begin(Req *r) {
     SSL_set_tlsext_host_name(r->ssl, r->url.host);
     ERR_pop_to_mark();
   }
+  wn_ossl_socket_init(r->ssl);
   SSL_set_connect_state(r->ssl);
   r->state = ST_TLS;
 }
@@ -1532,6 +1565,10 @@ static int32_t ll_new(void) {
 static void u_destroy(Req *r, const char *name, const char *msg, const char *code) {
   if (r->destroyed) return;
   r->destroyed = 1;
+  /* the 'error' it emits replaces any earlier one as kError */
+  free(r->d_name);
+  free(r->d_msg);
+  free(r->d_code);
   r->d_name = xstrdup(name);
   r->d_msg = xstrdup(msg);
   r->d_code = code ? xstrdup(code) : NULL;
@@ -1848,8 +1885,9 @@ static void u_finish(Req *r) {
  * with the error the socket was destroyed with, or "closed" */
 static void on_close(Req *r) {
   if (r->dead) return;
-  if (!r->destroyed && r->u_status && !r->u_keepalive) u_finish(r);
+  if (!r->destroyed && !r->tls_err && r->u_status && !r->u_keepalive) u_finish(r);
   settle(r);
+  if (!r->dead && r->tls_err) req_fail(r, r->d_name, r->d_msg, r->d_code);
   if (!r->dead) req_fail(r, "SocketError", "closed", "UND_ERR_SOCKET");
 }
 /* the end of the stream (onHttpSocketEnd) */
@@ -1865,7 +1903,7 @@ static void on_read_error(Req *r, int e) {
   if (r->dead) return;
   if (e == ECONNRESET && r->u_status && !r->u_keepalive) {
     u_finish(r);
-  } else if (e == ECONNRESET && r->rx == 0) {
+  } else if (e == ECONNRESET && r->rx == 0 && !r->tls_err) {
     /* measured: a peer that resets before it answers reads as an end */
     u_destroy(r, "SocketError", "other side closed", "UND_ERR_SOCKET");
   } else {
@@ -1949,8 +1987,26 @@ static void tls_pump(Req *r) {
       return;
     }
     if (e != SSL_ERROR_WANT_READ && e != SSL_ERROR_WANT_WRITE) {
-      tls_ssl_fail(r);
-      return;
+      /* after the handshake a TLS error is EMITTED on the socket, not a
+       * destroy (_tls_wrap.js onerror -> _emitTLSError; only the first:
+       * _hadError): undici keeps it as kError and the request fails when
+       * the socket closes — unless the peer's end or reset comes first
+       * and replaces it (onHttpSocketEnd / onHttpSocketError). The socket
+       * keeps being read, its records into the failed engine. */
+      char code[160];
+      char *msg = tls_ssl_error(r, code, sizeof code);
+      if (msg && !r->tls_err && !r->destroyed) {
+        r->tls_err = 1;
+        free(r->d_name);
+        free(r->d_msg);
+        free(r->d_code);
+        r->d_name = xstrdup("Error");
+        r->d_msg = msg;
+        r->d_code = xstrdup(code);
+      } else
+        free(msg);
+      ERR_clear_error();
+      if (r->dead) return;
     }
     f = tls_fill(r, &rerr);
     if (f > 0) continue;

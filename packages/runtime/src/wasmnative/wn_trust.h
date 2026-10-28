@@ -30,6 +30,11 @@ X509_STORE *wn_trust_new_root_store(void);
  * GetExtraCACertificates keep) */
 X509 *const *wn_trust_system(size_t *n);
 X509 *const *wn_trust_extra(size_t *n);
+/* node_credentials.cc SafeGetenv: NULL in a process with elevated rights */
+const char *wn_safe_getenv(const char *name);
+/* a new TLS socket's Node-wide set-up (--tls-keylog: the keylog lines and
+ * Node's warning) */
+void wn_ossl_socket_init(SSL *ssl);
 /* --use-system-ca / NODE_USE_SYSTEM_CA=1 */
 int wn_trust_use_system_ca(void);
 
@@ -39,6 +44,14 @@ int wn_trust_use_system_ca(void);
  * DEFAULT_CIPHER_LIST_CORE), ecdhCurve 'auto' (no call), and the ticket
  * key callback over CSPRNG keys */
 SSL_CTX *wn_ossl_ctx_new(void);
+/* the same, NULL when Node's createSecureContext would throw over the
+ * --tls-cipher-list default (the error Node throws) */
+typedef struct {
+  int type_error; /* a TypeError (ERR_INVALID_ARG_VALUE), else an Error */
+  char message[256];
+  char code[96];
+} WnCtxError;
+SSL_CTX *wn_ossl_ctx_new_checked(WnCtxError *err);
 /* SecureContext::SetRootCerts (addRootCerts): the shared root store */
 void wn_ossl_ctx_roots(SSL_CTX *sc);
 /* SecureContext::GetCertStoreOwnedByThisSecureContext: the context's own

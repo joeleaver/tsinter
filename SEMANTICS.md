@@ -8377,10 +8377,34 @@ configuration error ends the process there, with Node's text
 ("<argv[0]>: OpenSSL configuration error:" and OpenSSL's error lines) under
 the executable's own name and Node's exit status (the error's reason), and
 a program that uses no TLS never reads the configuration (Node refuses to
-start). Each context is a Node SecureContext (`crypto_context.cc`): an
-SSL_CTX made as `SecureContext::Init` makes one (TLS 1.2 to 1.3, Node's
-options, modes, session-cache mode and ticket-key callback) with
-`configSecureContext`'s defaults (Node's TLS 1.3 suites and cipher list;
+start). The other TLS options Node takes from `NODE_OPTIONS` are applied
+as Node applies them: `--tls-min-v1.0` / `-v1.1` / `-v1.2` / `-v1.3` and
+`--tls-max-v1.2` / `-v1.3` set the protocol bounds every context starts
+with (lib/tls.js's precedence), `--tls-cipher-list` the default cipher list
+(split by `processCiphers`; no TLS 1.2 cipher makes TLS 1.3 the minimum),
+`--tls-keylog` appends each TLS socket's key lines to its file (mode 0600)
+after Node's warning, `--use-openssl-ca` / `--use-bundled-ca` /
+`--use-system-ca` pick the stores; Node's start-up refusals of these —
+`--tls-min-v1.3` with `--tls-max-v1.2`, a `--tls-cipher-list=` or
+`--tls-keylog=` without a value (exit 9), `--enable-fips` / `--force-fips`
+with no FIPS provider, which Node's bundled OpenSSL lacks ("OpenSSL error
+when trying to enable FIPS:", exit 1) — happen at the first TLS use, as
+the configuration's do. A default cipher list Node's `createSecureContext`
+throws over (OpenSSL refuses it, or it names no cipher) fails a fetch with
+Node's error, and is a named refusal for a node:tls context (the module's
+CTX_NEW has no failure answer; Node throws it to the program). Node's
+keylog warning prints its `--trace-warnings` hint itself, so a program
+that also emits a warning sees the hint twice. Node's tls.DEFAULT_MIN_VERSION,
+DEFAULT_MAX_VERSION and DEFAULT_CIPHERS, which a program can read, stay
+the module's defaults. The host reads `NODE_OPTIONS`, `NODE_USE_SYSTEM_CA`,
+`NODE_EXTRA_CA_CERTS`, `OPENSSL_CONF`, `SSL_CERT_FILE` and `SSL_CERT_DIR`
+as Node's `credentials::SafeGetenv` does — unset in a process running with
+elevated rights (AT_SECURE, or a real uid/gid other than the effective
+one); the proxy variables fetch reads are JavaScript's `process.env` under
+Node, plain. Each context is a Node SecureContext (`crypto_context.cc`): an
+SSL_CTX made as `SecureContext::Init` makes one (those protocol bounds,
+Node's options, modes, session-cache mode and ticket-key callback) with
+`configSecureContext`'s defaults (that cipher list;
 `ecdhCurve` `auto`, so OpenSSL's groups, X25519MLKEM768 first); a `cert`
 is Node's `SSL_CTX_use_certificate_chain` and a `key`
 `PEM_read_bio_PrivateKey` + `SSL_CTX_use_PrivateKey`, their failures
@@ -8438,7 +8462,15 @@ no connect, headers or body timeouts (undici's are 10 s, 300 s and 300 s:
 a server that stalls holds the request until the program aborts it); TLS
 verification is (g)'s, as undici's tls.connect reaches it (a default
 secure context over (g)'s root store, SNI for a host name, ALPN
-`http/1.1`; a TLS failure is the socket's error, Node's message and code;
+`http/1.1`; a TLS failure before the handshake ends is the socket's
+error, Node's message and code; one after it is EMITTED on the socket and
+the socket stays open, as `_tls_wrap.js` does — undici keeps it as the
+socket's error and the request fails with it when the socket closes,
+unless what follows replaces it first (a reset's `read ECONNRESET`, the
+peer's end — undici's "other side closed" or a finished response —, a
+parser error such as the content-length mismatch), so against a peer that
+corrupts records, sends an alert mid-body or demands a client certificate
+after a TLS 1.3 handshake fetch fails exactly as Node's does;
 no TLS session is kept for resumption — undici's session cache shows only
 to the server), with
 Node's code and reason (its `--use-system-ca` suggestion included), and
@@ -8492,7 +8524,7 @@ malformed responses and its fuzz of them; the proxy's refusal row holds
 the lane alone, Node retrying; its board #332 rows hold (g) over the
 malformed certificates `tests/fixtures/tls-review/gen-malformed.py` makes,
 served by `esrv.c` on mbedTLS, through fetch and tls.connect, every
-verdict and handshake failure — message and code — Node's);
+verdict and handshake failure — message and code — Node's; its O23 rows hold (g)'s NODE_OPTIONS TLS options and (h)'s error mapping against `tests/fixtures/tls-review/hostile.py`'s peers);
 `packages/compiler/test/openssl-vendor.test.ts` (the vendored OpenSSL is
 Node's, and joining a multi-line macro call keeps every line's number);
 `tests/harness/event-loop.test.ts`, `console-io.test.ts` and

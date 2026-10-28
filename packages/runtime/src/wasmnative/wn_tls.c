@@ -437,6 +437,7 @@ static int32_t secure(uint32_t ptr, int32_t h) {
   SSL_set_mode(t->ssl, SSL_MODE_AUTO_RETRY);
   SSL_set_ex_data(t->ssl, tls_index, s);
   SSL_set_info_callback(t->ssl, info_cb);
+  wn_ossl_socket_init(t->ssl);
   if (t->server) {
     SSL_CTX_set_tlsext_servername_callback(sc, sni_noack);
     SSL_set_accept_state(t->ssl);

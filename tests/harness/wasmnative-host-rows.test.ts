@@ -31,7 +31,7 @@ import { createServer as createHttpsServer } from "node:https";
 import { createConnection, createServer as createNetServer, type AddressInfo, type Server } from "node:net";
 import { createServer as createTlsServer, type Server as TlsServer } from "node:tls";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -908,6 +908,176 @@ main();
       rmSync(b.dir, { recursive: true, force: true });
     }
   }, 120_000);
+
+  /* ── the OpenSSL units' review (O2/O3) ───────────────────────────────── */
+  const tidOf = (b: Buffer): string => b.toString("latin1").replace(/[0-9A-F]{8,16}:error:/g, "TID:error:");
+  /* a start-up error names the executable (argv[0]): compared from ": " on */
+  const errOf = (b: Buffer): string => b.toString("latin1").replace(/^[^\n:]*: /, "<argv0>: ").replace(/\(node:\d+\)/g, "(node:PID)");
+
+  test("O23-B1: Node's TLS options in NODE_OPTIONS reach the host's secure contexts as Node applies them — --tls-min-v1.x / --tls-max-v1.x (and both at once: Node's start-up error), --tls-cipher-list (TLS 1.3 suites, TLS 1.2 ciphers, what createSecureContext throws), --enable-fips / --force-fips (no FIPS provider: Node's start-up error), --tls-keylog (the lines, mode 0600, Node's warning)", async () => {
+    const ip = cases.find((c) => c.name === "ip_ok")!;
+    const key = readFileSync(join(pki, "ip_ok.key"));
+    const cert = readFileSync(join(pki, "ip_ok.pem"));
+    const tls12 = createHttpsServer({ key, cert, maxVersion: "TLSv1.2" }, (_q, r) => r.end("hi 1.2"));
+    const tls13 = createHttpsServer({ key, cert, minVersion: "TLSv1.3" }, (_q, r) => r.end("hi 1.3"));
+    for (const s of [tls12, tls13]) s.on("tlsClientError", () => {});
+    const port12 = await new Promise<number>((res) => tls12.listen(0, "127.0.0.1", () => res((tls12.address() as AddressInfo).port)));
+    const port13 = await new Promise<number>((res) => tls13.listen(0, "127.0.0.1", () => res((tls13.address() as AddressInfo).port)));
+    const dir = mkdtempSync(join(tmpdir(), "wn-o23-"));
+    try {
+      const ca = JSON.stringify(readFileSync(join(pki, "extra.pem"), "utf8"));
+      const fetchSrc = `async function go(n: string, u: string): Promise<void> {
+  try {
+    const r = await fetch(u);
+    console.log(n, "OK", r.status, await r.text());
+  } catch (e) {
+    const x: unknown = e;
+    const c = (x as { cause: { name: string; code: string; message: string } }).cause;
+    console.log(n, "ERR", c.name, c.code, JSON.stringify(c.message));
+  }
+}
+async function main(): Promise<void> {
+  await go("fetch12", "https://127.0.0.1:${port12}/");
+  await go("fetch13", "https://127.0.0.1:${port13}/");
+}
+main();
+`;
+      const tlsSrc = `import * as tls from "node:tls";
+function conn(n: string, port: number, next: () => void): void {
+  const s = tls.connect({ host: "127.0.0.1", port, ca: ${ca} }, () => {
+    console.log(n, "SECURE", s.authorized);
+    s.destroy();
+    next();
+  });
+  s.on("error", (e: Error) => {
+    console.log(n, "ERR", JSON.stringify(e.message));
+    next();
+  });
+}
+conn("tls12", ${port12}, () => conn("tls13", ${port13}, () => {}));
+`;
+      const mk = async (name: string, src: string): Promise<{ entry: string; bin: string }> => {
+        const entry = join(dir, `${name}.ts`);
+        writeFileSync(entry, src);
+        const res = await compile(entry, { outPath: join(dir, `out-${name}`, "program"), outDir: join(dir, `out-${name}`), dynamic: false, backend: "wasm-native" });
+        if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => `${d.code} ${d.message}`).join("; ")}`);
+        return { entry, bin: res.binaryPath };
+      };
+      const progs = [await mk("f", fetchSrc), await mk("t", tlsSrc)];
+      expect(ip.host).toBe("127.0.0.1");
+      const sets = [
+        "",
+        "--tls-min-v1.3",
+        "--tls-max-v1.2",
+        "--tls-min-v1.0",
+        "--tls-max-v1.3 --tls-min-v1.2",
+        "--tls-cipher-list=TLS_AES_128_GCM_SHA256",
+        "--tls-cipher-list=ECDHE-RSA-AES256-GCM-SHA384",
+        "--tls-cipher-list=bogus",
+        "--tls-cipher-list=:",
+        "--tls-min-v1.3 --tls-max-v1.2",
+        "--tls-cipher-list=",
+        "--enable-fips",
+        "--force-fips",
+      ];
+      for (const b of progs)
+      for (const opts of sets) {
+        const env = { NODE_OPTIONS: opts, NODE_EXTRA_CA_CERTS: join(pki, "extra.pem") };
+        const node = await run(process.execPath, ["--import", comptimeShim, "--import", islandShim, b.entry], repoRoot, undefined, env);
+        const native = await run(b.bin, [], repoRoot, undefined, env);
+        if (b === progs[1] && (opts === "--tls-cipher-list=bogus" || opts === "--tls-cipher-list=:")) {
+          // S117 (g): what tls.connect's createSecureContext throws over the
+          // default cipher list, a secure context cannot answer — a named
+          // refusal (Node throws it to the program)
+          expect(node.code).toBe(1);
+          expect(native.code).toBe(70);
+          expect(native.stderr.toString("utf8")).toContain("NODE_OPTIONS --tls-cipher-list makes Node's createSecureContext throw");
+          continue;
+        }
+        expect(tidOf(native.stdout), opts).toBe(tidOf(node.stdout));
+        expect(errOf(native.stderr), opts).toBe(errOf(node.stderr));
+        expect(native.code, opts).toBe(node.code);
+        if (opts === "--tls-min-v1.3" && b === progs[0]) expect(node.stdout.toString("utf8")).toContain("fetch12 ERR");
+        if (opts === "--tls-cipher-list=bogus" && b === progs[0]) expect(node.stdout.toString("utf8")).toContain("ERR_SSL_NO_CIPHER_MATCH");
+        if (opts === "--enable-fips") expect(node.code).toBe(1);
+        if (opts === "--tls-min-v1.3 --tls-max-v1.2") expect(node.code).toBe(9);
+      }
+      // --tls-keylog: the key lines (one per secret, newline-ended), mode 0600, the warning
+      const kn = join(dir, "kl-node.txt");
+      const kw = join(dir, "kl-native.txt");
+      const b = progs[0]!;
+      const node = await run(process.execPath, ["--import", comptimeShim, "--import", islandShim, b.entry], repoRoot, undefined, { NODE_OPTIONS: `--tls-keylog=${kn}`, NODE_EXTRA_CA_CERTS: join(pki, "extra.pem") });
+      const native = await run(b.bin, [], repoRoot, undefined, { NODE_OPTIONS: `--tls-keylog=${kw}`, NODE_EXTRA_CA_CERTS: join(pki, "extra.pem") });
+      expect(native.stdout.toString("utf8")).toBe(node.stdout.toString("utf8"));
+      expect(errOf(native.stderr).replace(kw, "<file>")).toBe(errOf(node.stderr).replace(kn, "<file>"));
+      const labels = (f: string): string[] => readFileSync(f, "latin1").split("\n").map((l) => l.split(" ")[0]!);
+      expect(labels(kw)).toEqual(labels(kn));
+      expect(labels(kn)).toContain("CLIENT_HANDSHAKE_TRAFFIC_SECRET");
+      expect(statSync(kw).mode & 0o777).toBe(statSync(kn).mode & 0o777);
+    } finally {
+      tls12.close();
+      tls13.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 600_000);
+
+  test("O23-M1: after the handshake a TLS failure is the socket's emitted error, not its end — undici keeps it as kError and the peer's reset, end or a parser error replaces it — so fetch fails as Node's does against hostile peers (garbage, oversized and bad-MAC records, an alert mid-body, duplicate ChangeCipherSpec, a reset mid-body, truncated flights) and a server that demands a client certificate after a TLS 1.3 handshake", async () => {
+    const key = readFileSync(join(pki, "ip_ok.key"));
+    const cert = readFileSync(join(pki, "ip_ok.pem"));
+    const hostile: ReturnType<typeof spawn>[] = [];
+    const ports: [string, number][] = [];
+    try {
+      for (const maxv of ["13", "12"]) {
+        const p = spawn("python3", ["-I", join(repoRoot, "tests/fixtures/tls-review/hostile.py"), maxv, join(pki, "ip_ok.pem"), join(pki, "ip_ok.key")], { stdio: ["ignore", "pipe", "inherit"] });
+        hostile.push(p);
+        const lines = await new Promise<string[]>((resolve, reject) => {
+          let buf = "";
+          p.stdout!.on("data", (d: Buffer) => {
+            buf += d.toString("utf8");
+            if (buf.includes("ready\n")) resolve(buf.split("\n"));
+          });
+          p.on("error", reject);
+        });
+        for (const l of lines) {
+          const [m, port] = l.split(" ");
+          if (m && port) ports.push([`${maxv}:${m}`, Number(port)]);
+        }
+      }
+      // a TLS 1.3 server that requires a client certificate: its alert comes after the client's handshake
+      const certReq = createHttpsServer({ key, cert, requestCert: true, rejectUnauthorized: true, minVersion: "TLSv1.3" }, (_q, r) => r.end("hi"));
+      const certReq12 = createHttpsServer({ key, cert, requestCert: true, rejectUnauthorized: true, maxVersion: "TLSv1.2" }, (_q, r) => r.end("hi"));
+      for (const s of [certReq, certReq12]) {
+        s.on("tlsClientError", () => {});
+        servers.push(s);
+        ports.push([s === certReq ? "13:cert-required" : "12:cert-required", await new Promise<number>((res) => s.listen(0, "127.0.0.1", () => res((s.address() as AddressInfo).port)))]);
+      }
+      const src = `const P: [string, number][] = ${JSON.stringify(ports)};
+async function main(): Promise<void> {
+  for (const [n, p] of P) {
+    try {
+      const r = await fetch("https://127.0.0.1:" + p + "/");
+      const t = await r.text();
+      console.log(n, "OK", r.status, t.length);
+    } catch (e) {
+      const x: unknown = e;
+      const m = (x as { message: string }).message;
+      const c = (x as { cause: { name: string; code: string; message: string } }).cause;
+      console.log(n, "ERR", m, c.name, String(c.code), JSON.stringify(c.message));
+    }
+  }
+}
+main();
+`;
+      const { node, native } = await both(src, { NODE_EXTRA_CA_CERTS: join(pki, "extra.pem") });
+      const out = tidOf(node.stdout);
+      expect(out).toContain("13:bad_mac ERR fetch failed Error ECONNRESET");
+      expect(out).toContain("13:cert-required ERR fetch failed SocketError UND_ERR_SOCKET");
+      expect(tidOf(native.stdout)).toBe(out);
+      expect(native.code).toBe(node.code);
+    } finally {
+      for (const p of hostile) p.kill();
+    }
+  }, 600_000);
 
   test("notes: a redirect to a URL with credentials is refused as Node refuses it (request mode cors), an invalid punycode label is an Invalid URL, an IPv6 host prints as the WHATWG serializer prints it", async () => {
     const P = `http://127.0.0.1:${plainPort}`;
