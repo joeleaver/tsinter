@@ -6534,8 +6534,13 @@ on `arguments`), `typeof arguments` (`"object"`), `arguments == null` (`false`),
 
 The two answers DIVERGE on the eleven observables below, each measured against Node v24.18.1 (`arguments`
 inside a CLASS or STATIC method is a DIFFERENT construct, not this entry's territory: there the front
-end folds `arguments.length` to the declared parameter count in a TypeScript file, where tsc enforces the
-arity, and refuses it by name in a JavaScript file, where a caller may pass any count — board #164):
+end folds `arguments.length` to the declared parameter count in a TypeScript file only where every
+invocation is a direct call tsc arity-checks — the method never extracted, its class without heritage, its
+instances never typed through another member of that name — refuses it by name in a TypeScript file
+otherwise, and refuses it by name in a JavaScript file, where a caller may pass any count — board #164,
+GH #22). The same eleven observables hold when such a variadic function is handed to a builtin that calls
+it — the array iteration methods and a sort comparator pass every argument Node passes, a composite one
+(the array) crossing by S014's copy:
 
 `.callee` — strict mode: Node throws a TypeError reading it (`'caller', 'callee', and 'arguments'
 properties may not be accessed`) where this tier answers `undefined` (S081-8, a strict `.cjs`). Sloppy

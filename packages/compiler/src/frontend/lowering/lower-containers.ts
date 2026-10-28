@@ -520,6 +520,42 @@ function lowerOptionalDefaultArg(
     return lowerArrayReduceCall(L, call, access, name as "reduce" | "reduceRight", elem);
   }
 
+/** A VARIADIC JS callback (`function () { ... arguments ... }`, `(...a)
+   * => ...` — the dyn-rest func ABI) handed to a builtin that calls it with
+   * exactly `params`: it takes that FULL arity through the rest adapter
+   * (funcCoerceAdapter → restFuncAdapter), so `arguments` / the rest array
+   * holds every argument Node passes — never the declared-prefix arity,
+   * which would leave it empty, nor a rest-typed value in a fixed-arity
+   * helper slot (the SC9001 this replaced; GH #22). Any other value passes
+   * through untouched. */
+  export function adaptVariadicCallback(L: Lowerer, argNode: ts.Node, fnArg: IrExpr, params: IrType[]): IrExpr {
+    if (fnArg.type.kind !== "func" || fnArg.type.rest !== true) return fnArg;
+    const fullT: IrType & { kind: "func" } = { kind: "func", params, ret: fnArg.type.ret };
+    const adapted = L.coerceToExpected(fnArg, fullT);
+    if (adapted.type.kind !== "func" || adapted.type.rest === true) {
+      L.unsupported(
+        "SC1090",
+        argNode,
+        "variadic callbacks (a rest parameter or 'arguments') whose arguments or result cannot cross into dynamically-typed code",
+      );
+    }
+    return adapted;
+  }
+
+/** The builtins whose desugared loop cannot hand a callback EVERY argument
+   * Node passes (Map/Set forEach pass (value, key) but not the collection
+   * itself): a variadic callback there would see a short `arguments`, so
+   * it refuses by name instead (GH #22). */
+  export function refuseVariadicCallback(L: Lowerer, argNode: ts.Node, fnArg: IrExpr, what: string): void {
+    if (fnArg.type.kind === "func" && fnArg.type.rest === true) {
+      L.unsupported(
+        "SC1090",
+        argNode,
+        `variadic callbacks (a rest parameter or 'arguments') passed to ${what} (the collection argument Node passes third is not modeled)`,
+      );
+    }
+  }
+
 /** Lowers and validates a HOF callback argument. The lib declares optional
    * trailing (index, array) parameters after `lead` (the element for the
    * map family, accumulator + element for reduce); a callback may declare
@@ -566,6 +602,9 @@ function lowerOptionalDefaultArg(
       for (const n of overridden) L.chainNarrowedType.delete(n);
     }
     const full = [...lead, F64, arrT];
+    // A VARIADIC JS callback: Node passes it every argument — element,
+    // index, array (the accumulator first for reduce).
+    fnArg = adaptVariadicCallback(L, argNode, fnArg, full);
     if (
       fnArg.type.kind !== "func" ||
       fnArg.type.params.length > full.length ||
@@ -1582,7 +1621,7 @@ function lowerOptionalDefaultArg(
     }
     const receiver = L.lowerExpr(access.expression);
     const argNode = call.arguments[0]!;
-    const fnArg = L.lowerExpr(argNode);
+    const fnArg = adaptVariadicCallback(L, argNode, L.lowerExpr(argNode), [elem, elem]);
     // The comparator receives exactly (a, b); declaring a prefix is
     // ordinary TS. Its result must be number (the spec coerces arbitrary
     // results — no lowering for that).
@@ -2832,6 +2871,7 @@ const MAP_ITER_METHODS = new Set(["keys", "values", "entries"]);
     const argNode = call.arguments[0];
     if (!argNode) L.unsupported("SC1090", call, "this call form"); // tsc-guarded
     const fnArg = L.lowerExpr(argNode);
+    refuseVariadicCallback(L, argNode, fnArg, "Map.prototype.forEach");
     if (
       fnArg.type.kind !== "func" ||
       fnArg.type.params.length > 2 ||
@@ -3042,6 +3082,7 @@ const MAP_ITER_METHODS = new Set(["keys", "values", "entries"]);
     const argNode = call.arguments[0];
     if (!argNode) L.unsupported("SC1090", call, "this call form"); // tsc-guarded
     const fnArg = L.lowerExpr(argNode);
+    refuseVariadicCallback(L, argNode, fnArg, "Set.prototype.forEach");
     if (
       fnArg.type.kind !== "func" ||
       fnArg.type.params.length > 2 ||

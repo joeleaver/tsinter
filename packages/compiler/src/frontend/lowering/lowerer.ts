@@ -50,7 +50,7 @@ import type {
   IrUnionDef,
   SrcLoc,
 } from "../../ir/nodes.js";
-import { arrayOf, BOOL, canAdaptDynFuncTo, canConvertToDyn, canCrossIslandBoundary, canExitIslandToType, canMarshalTypedFuncIntoIsland, DYN, F64, isJsonSafeType, isUndefinedArmedUnion, isUnitType, JSVAL, pureArityDrop, RUNTIME_ERROR_CLASSES, STRING, typeEquals, UNDEFINED_T, VOID } from "../../ir/nodes.js";
+import { arrayOf, BOOL, canAdaptDynFuncTo, canBoxFuncIntoDyn, canConvertToDyn, canCrossIslandBoundary, canExitIslandToType, canMarshalTypedFuncIntoIsland, DYN, F64, isJsonSafeType, isUndefinedArmedUnion, isUnitType, JSVAL, pureArityDrop, RUNTIME_ERROR_CLASSES, STRING, typeEquals, UNDEFINED_T, VOID } from "../../ir/nodes.js";
 import { type DynamicImportResolution, type NpmBuiltinUse, type NpmLazyTrap } from "../npm.js";
 import { provenanceActive } from "../provenance-registry.js";
 import {
@@ -4872,6 +4872,9 @@ export class Lowerer {
    * off()-family without altering calling behavior at all — see
    * ir/nodes.ts's closure-node doc for the field's contract. */
   funcCoerceAdapter(fromT: IrType & { kind: "func" }, toT: IrType & { kind: "func" }, loc: SrcLoc): string | null {
+    if (fromT.rest === true && fromT.restAbi !== "jsval" && toT.rest !== true) {
+      return this.restFuncAdapter(fromT, toT, loc);
+    }
     if (fromT.rest === true || toT.rest === true) return null;
     if (fromT.params.length > toT.params.length) return null;
     // Piece dispositions beyond coercibleValue, all CHECKER-APPROVED
@@ -5005,6 +5008,86 @@ export class Lowerer {
           // and nothing else) as this closure's true reference identity.
           // See ir/nodes.ts's own field doc for what each backend does
           // with it; this line never changes CALLING behavior.
+          value: { kind: "closure", fnName: impl, captures: ["f.0"], identityOriginal: "f.0", type: toT, loc },
+          loc,
+        },
+      ],
+      loc,
+    });
+    return name;
+  }
+
+  /** A VARIADIC JS function (a `(...args)` rest parameter, or a body
+   * reading `arguments` — the dyn-rest ABI) into a fixed-arity slot: a
+   * builtin callback slot (`[1, 2].map(function () { return
+   * arguments.length; })` — Node passes element, index and array), a
+   * stream write option, any typed callback parameter (GH #22). The
+   * adapter takes the slot's parameters and calls the function exactly
+   * the way an over-arity JS call does — box it (dynFrom) and dynCall with
+   * every argument converted to dyn — so the boxed thunk delivers JS arity:
+   * leading parameters bind positionally, the rest/`arguments` array holds
+   * the surplus (composite arguments cross by S014's copy, `arguments` is
+   * S081's real array). The dyn result checks back into the slot's return
+   * type (a mismatch is the catchable TypeError every dyn check throws).
+   * Null — the caller's fence stands — when the function cannot box or an
+   * argument/result has no dyn crossing. */
+  restFuncAdapter(fromT: IrType & { kind: "func" }, toT: IrType & { kind: "func" }, loc: SrcLoc): string | null {
+    if (!canBoxFuncIntoDyn(fromT, (id) => this.shapes.get(id), (id) => this.unions.get(id))) return null;
+    if (fromT.params.length > toT.params.length) return null;
+    const key = `fnrest:${typeKey(fromT)}:${typeKey(toT)}`;
+    const existing = this.retagHelpers.get(key);
+    if (existing) return existing;
+    const args: IrExpr[] = [];
+    for (let i = 0; i < toT.params.length; i++) {
+      const aRef: IrExpr = { kind: "varRef", localId: `a.${i}`, type: toT.params[i]!, loc };
+      const converted = this.coerceToExpected(aRef, DYN);
+      if (converted.type.kind !== "dyn") return null;
+      args.push(converted);
+    }
+    const call: IrExpr = {
+      kind: "dynCall",
+      callee: { kind: "dynFrom", value: { kind: "varRef", localId: "f.0", type: fromT, loc }, type: DYN, loc },
+      calleeName: "callback",
+      args,
+      type: DYN,
+      loc,
+    };
+    let body: IrStmt[];
+    if (toT.ret.kind === "void") {
+      body = [
+        { kind: "exprStmt", expr: call, loc },
+        { kind: "return", value: null, loc },
+      ];
+    } else {
+      const result = this.coerceToExpected(call, toT.ret);
+      if (!typeEquals(result.type, toT.ret)) return null;
+      body = [{ kind: "return", value: result, loc }];
+    }
+    const name = `%fn.adapt.${this.retagHelpers.size}`;
+    this.retagHelpers.set(key, name);
+    const impl = `${name}.impl`;
+    this.liftedFns.push({
+      name: impl,
+      params: toT.params.map((t, i) => ({ localId: `a.${i}`, name: `a${i}`, type: t })),
+      returnType: toT.ret,
+      captures: [{ localId: "f.0", name: "f", type: fromT }],
+      locals: [
+        { id: "f.0", name: "f", type: fromT, mutable: false, boxed: true },
+        ...toT.params.map((t, i) => ({ id: `a.${i}`, name: `a${i}`, type: t, mutable: false })),
+      ],
+      body,
+      loc,
+    });
+    this.liftedFns.push({
+      name,
+      params: [{ localId: "f.0", name: "f", type: fromT }],
+      returnType: toT,
+      locals: [{ id: "f.0", name: "f", type: fromT, mutable: false, boxed: true }],
+      body: [
+        {
+          kind: "return",
+          // BOARD #89's identity rule: the adapter answers as the wrapped
+          // original at ===/!== and the listener-removal sites.
           value: { kind: "closure", fnName: impl, captures: ["f.0"], identityOriginal: "f.0", type: toT, loc },
           loc,
         },

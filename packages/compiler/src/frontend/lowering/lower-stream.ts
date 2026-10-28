@@ -160,6 +160,17 @@ function lowerStreamCallback(
   if (node.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword)) {
     L.unsupported("SC1090", node, `async stream '${which}' callbacks`);
   }
+  // A VARIADIC callback (a rest parameter, or a body reading `arguments`
+  // — the dyn-rest func ABI): the stream invoke thunk passes declared
+  // positions only, so the rest array would come up short of what Node
+  // passes — refused by name, never an ill-typed closure (GH #22).
+  if (funcType.rest === true) {
+    L.unsupported(
+      "SC1090",
+      node,
+      `variadic stream '${which}' callbacks (a rest parameter or 'arguments' — declare the parameters Node passes instead)`,
+    );
+  }
   if (funcType.params.length > fullTuple.length) {
     L.noLowering(
       `a '${which}' callback declaring ${funcType.params.length} parameters where Node passes ${fullTuple.length}`,

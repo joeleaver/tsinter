@@ -103,6 +103,132 @@ export function abstractPropertyDeclOf(L: Lowerer, expr: ts.PropertyAccessExpres
     );
 }
 
+/** True when every invocation of `fn` is a call tsc arity-checks against
+ * `fn`'s OWN parameter list, so the call's argument count IS the declared
+ * count and `arguments.length` folds to a constant (GH #22). The fold's
+ * premise fails wherever the function is reachable without such a call:
+ *  - a function declaration referenced other than as a call's callee (a
+ *    value — a builtin callback slot passes extra arguments, and TS lets a
+ *    shorter function into a wider function-typed slot); a function
+ *    expression other than an immediately-invoked one;
+ *  - a class method referenced other than as a callee, declared on a class
+ *    with heritage (a base or interface may declare the member with more
+ *    parameters, and calls through it dispatch here), or whose instances
+ *    flow into a contextual type whose same-named member is not this one
+ *    (a structural interface, `any`, a union, a type parameter);
+ *  - a constructor whose class is used as a value (a construct-signature
+ *    slot may declare more parameters).
+ * Accessors are always static (a get passes none, a set exactly one). */
+function argumentsCountIsStatic(L: Lowerer, fn: ts.FunctionLikeDeclaration): boolean {
+  if (ts.isGetAccessorDeclaration(fn) || ts.isSetAccessorDeclaration(fn)) return true;
+  const unwrapParens = (n: ts.Node): ts.Node => {
+    let cur = n;
+    while (cur.parent !== undefined && ts.isParenthesizedExpression(cur.parent)) cur = cur.parent;
+    return cur;
+  };
+  const isCallee = (n: ts.Node): boolean => {
+    const outer = unwrapParens(n);
+    const p = outer.parent;
+    return p !== undefined && ts.isCallExpression(p) && p.expression === outer;
+  };
+  const files = L.program.getSourceFiles().filter((f) => !f.isDeclarationFile && !L.isStdlibFile(f));
+  const resolve = (n: ts.Node): ts.Symbol | undefined => {
+    let sym = L.checker.getSymbolAtLocation(n);
+    if (sym && sym.flags & ts.SymbolFlags.Alias) sym = L.checker.getAliasedSymbol(sym);
+    return sym;
+  };
+  /** Every identifier/name in the program resolving to `sym` satisfies `ok`. */
+  const everyRef = (sym: ts.Symbol, name: string, ok: (n: ts.Node) => boolean): boolean => {
+    let good = true;
+    for (const f of files) {
+      ts.walkPreorder(f, (n) => {
+        if (!good) return "stop";
+        if (ts.isTypeNode(n)) return "skip";
+        if ((ts.isIdentifier(n) || ts.isPrivateIdentifier(n) || ts.isStringLiteral(n)) && n.text === name && resolve(n) === sym) {
+          const p = n.parent;
+          const isDeclName = p !== undefined && (p as { name?: ts.Node }).name === n && (ts.isFunctionDeclaration(p) || ts.isMethodDeclaration(p) || ts.isClassDeclaration(p) || ts.isFunctionExpression(p) || ts.isClassExpression(p));
+          const isAliasSite = p !== undefined && (ts.isImportSpecifier(p) || ts.isExportSpecifier(p) || ts.isImportClause(p));
+          if (!isDeclName && !isAliasSite && !ok(n)) good = false;
+        }
+        return undefined;
+      });
+      if (!good) break;
+    }
+    return good;
+  };
+  if (ts.isFunctionExpression(fn)) {
+    if (!isCallee(fn)) return false;
+    // A named expression's self-references must be calls too.
+    if (fn.name) {
+      const sym = L.checker.getSymbolAtLocation(fn.name);
+      if (sym && !everyRef(sym, fn.name.text, isCallee)) return false;
+    }
+    return true;
+  }
+  if (ts.isFunctionDeclaration(fn)) {
+    if (!fn.name) return false; // `export default function () {}` — a value
+    const sym = L.checker.getSymbolAtLocation(fn.name);
+    if (!sym) return false;
+    return everyRef(sym, fn.name.text, isCallee);
+  }
+  const cls = fn.parent;
+  if (cls === undefined || !(ts.isClassDeclaration(cls) || ts.isClassExpression(cls))) return false;
+  if (ts.isConstructorDeclaration(fn)) {
+    if (!cls.name) return false;
+    const csym = L.checker.getSymbolAtLocation(cls.name);
+    if (!csym) return false;
+    return everyRef(csym, cls.name.text, (n) => {
+      const outer = unwrapParens(n);
+      const p = outer.parent;
+      if (p === undefined) return false;
+      if (ts.isNewExpression(p) && p.expression === outer) return true;
+      if (ts.isExpressionWithTypeArguments(p)) return true; // extends C
+      if (ts.isPropertyAccessExpression(p) && p.expression === outer) return p.name.text !== "prototype";
+      if (ts.isBinaryExpression(p) && p.operatorToken.kind === ts.SyntaxKind.InstanceOfKeyword && p.right === outer) return true;
+      if (ts.isTypeQueryNode(p)) return true;
+      return false;
+    });
+  }
+  if (!ts.isMethodDeclaration(fn) || fn.name === undefined) return false;
+  if (cls.heritageClauses !== undefined && cls.heritageClauses.length > 0) return false;
+  const msym = L.checker.getSymbolAtLocation(fn.name);
+  const mname = ts.isIdentifier(fn.name) || ts.isPrivateIdentifier(fn.name) || ts.isStringLiteral(fn.name) ? fn.name.text : null;
+  if (!msym || mname === null) return false;
+  const isMember = (n: ts.Node): boolean => {
+    const p = n.parent;
+    if (p === undefined) return false;
+    if ((ts.isPropertyAccessExpression(p) && p.name === n) || (ts.isElementAccessExpression(p) && p.argumentExpression === n)) {
+      return isCallee(p);
+    }
+    return false;
+  };
+  if (!everyRef(msym, mname, isMember)) return false;
+  // Structural escape: an expression whose type carries THIS method,
+  // contextually typed by a type whose same-named member is another.
+  let escapes = false;
+  for (const f of files) {
+    ts.walkPreorder(f, (n) => {
+      if (escapes) return "stop";
+      if (ts.isTypeNode(n)) return "skip";
+      const candidate =
+        (ts.isIdentifier(n) && !(n.parent !== undefined && (n.parent as { name?: ts.Node }).name === n && !ts.isShorthandPropertyAssignment(n.parent))) ||
+        n.kind === ts.SyntaxKind.ThisKeyword ||
+        ts.isNewExpression(n) || ts.isCallExpression(n) || ts.isPropertyAccessExpression(n) ||
+        ts.isElementAccessExpression(n) || ts.isParenthesizedExpression(n) || ts.isConditionalExpression(n) ||
+        ts.isBinaryExpression(n) || ts.isNonNullExpression(n) || ts.isAsExpression(n) || ts.isAwaitExpression(n);
+      if (!candidate) return undefined;
+      const t = L.checker.getTypeAtLocation(n);
+      if (L.checker.getPropertyOfType(t, mname) !== msym) return undefined;
+      const ctx = L.checker.getContextualType(n);
+      if (ctx === undefined) return undefined;
+      if (L.checker.getPropertyOfType(L.checker.getNonNullableType(ctx), mname) !== msym) escapes = true;
+      return undefined;
+    });
+    if (escapes) break;
+  }
+  return !escapes;
+}
+
 export function lowerExpr(L: Lowerer, expr: ts.Expression): IrExpr {
     if (lowerExprDepth >= LOWER_EXPR_MAX_DEPTH) {
       L.unsupported("SC1090", expr, `expressions nested deeper than ${LOWER_EXPR_MAX_DEPTH} levels`);
@@ -1526,12 +1652,16 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
       }
       // `arguments.length` in a TYPED function whose signature is
       // FIXED-ARITY (no optional/default/rest parameters): tsc enforces
-      // exact arity at every call site and call/apply/bind indirection is
-      // fenced, so the actual count IS the declared count — a compile-time
-      // constant. Arrows don't bind `arguments` (the walk skips them,
-      // exactly JS's scoping); variable-arity signatures keep the fence
-      // (the count would need a hidden argc). The JS-source variadic
-      // `arguments` object (dynRest) was claimed at identifier lowering.
+      // exact arity at every DIRECT call site and call/apply/bind
+      // indirection is fenced, so where every invocation is such a call
+      // (argumentsCountIsStatic proves it) the actual count IS the
+      // declared count — a compile-time constant. Anywhere else (a value,
+      // a callback, a wider signature) the count is a runtime fact and
+      // the read refuses (GH #22). Arrows don't bind `arguments` (the walk
+      // skips them, exactly JS's scoping); variable-arity signatures keep
+      // the fence (the count would need a hidden argc). The JS-source
+      // variadic `arguments` object (dynRest) was claimed at identifier
+      // lowering.
       if (
         expr.name.text === "length" &&
         !expr.questionDotToken &&
@@ -1557,8 +1687,22 @@ function lowerExprInner(L: Lowerer, expr: ts.Expression): IrExpr {
           );
           // Board #164: only TypeScript enforces the arity — a JavaScript
           // caller may pass any count (`m(1, 2)` on a parameterless method
-          // is legal JS), so a JS-source function never folds.
+          // is legal JS), so a JS-source function never folds. And tsc
+          // enforces it only at DIRECT calls: a function taken as a value
+          // reaches callers that pass more than it declares — every
+          // builtin callback slot (`[1, 2].map(function () { ... })` gets
+          // element, index and array), any wider function-typed slot TS
+          // assignability admits, a method reached through a base or
+          // structural type that declares more parameters (GH #22) — so
+          // the fold needs argumentsCountIsStatic's proof first.
           const jsSource = isJsSourceFile(fn.getSourceFile());
+          if (fixedArity && !jsSource && !argumentsCountIsStatic(L, fn as ts.FunctionLikeDeclaration)) {
+            L.unsupported(
+              "SC1090",
+              expr,
+              "'arguments.length' in a function that can be called with more arguments than it declares (it is used as a value, passed as a callback, or reachable through a wider signature — the count is not static there)",
+            );
+          }
           if (fixedArity && !jsSource) {
             return {
               kind: "numLit",
@@ -5942,6 +6086,21 @@ export function lowerObjectLiteral(L: Lowerer, expr: ts.ObjectLiteralExpression)
         // read rides engine ops, exiting at the declared per-index type
         // like the array path.
         if (obj.type.kind === "jsval") return islandElementRead(L, expr, obj);
+        // A JS rest parameter the CONTEXT types as a tuple (`(...a) =>
+        // a[0]` passed to reduce: tsc spreads the slot's parameter list
+        // into the rest binding) while its VALUE is the dyn rest array:
+        // the read goes through the checked-dynamic keyed read, like any
+        // dyn receiver.
+        if (obj.type.kind === "dyn") {
+          const rawKey = L.lowerExpr(expr.argumentExpression);
+          const key: IrExpr | null =
+            rawKey.type.kind === "string"
+              ? rawKey
+              : rawKey.type.kind === "f64"
+                ? { kind: "toString", operand: rawKey, type: STRING, loc: rawKey.loc }
+                : null;
+          if (key) return { kind: "dynKeyGet", key, value: obj, type: DYN, loc: locOf(expr) };
+        }
         const idx = tupleLiteralIndex(expr.argumentExpression);
         if (idx === null) {
           L.unsupported(

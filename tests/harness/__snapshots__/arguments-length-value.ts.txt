@@ -1,0 +1,13 @@
+arguments-length-value.ts:5:45 - error SC1090: 'arguments.length' in a function that can be called with more arguments than it declares (it is used as a value, passed as a callback, or reachable through a wider signature — the count is not static there) are not supported yet
+
+  4 | // as a callback gets the same. Refused by name, never a silent 0 (GH #22).
+  5 | console.log([1, 2].map(function () { return arguments.length; }).join(","));
+    |                                             ^~~~~~~~~~~~~~~~
+  6 | function direct(): number { return arguments.length; }
+
+arguments-length-value.ts:6:36 - error SC1090: 'arguments.length' in a function that can be called with more arguments than it declares (it is used as a value, passed as a callback, or reachable through a wider signature — the count is not static there) are not supported yet
+
+  5 | console.log([1, 2].map(function () { return arguments.length; }).join(","));
+  6 | function direct(): number { return arguments.length; }
+    |                                    ^~~~~~~~~~~~~~~~
+  7 | console.log(direct(), [7].map(direct).join(","));
