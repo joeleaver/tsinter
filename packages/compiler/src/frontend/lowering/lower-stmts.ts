@@ -3418,6 +3418,250 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
    * bodies, lazy source-order test evaluation, fall-through. tsc has already
    * checked case-test comparability (TS2678) — the kind check below is the
    * backstop for cases tsc lets through (e.g. `unknown as` casts). */
+/** The switch-block temporal dead zone (GH #22's sibling, GH #49). The
+   * case clauses of a switch share ONE block scope, and a case label is
+   * the one same-function jump that can land PAST a lexical declaration
+   * still inside its scope: `case 0: let x = 1; ... case 1: x = 5;` —
+   * entering at `case 1` leaves `x` uninitialized, and Node throws
+   * "ReferenceError: Cannot access 'x' before initialization" on any read
+   * or write. (Uses textually after the declaration in the SAME clause
+   * always run after it; uses before it are tsc's TS2448.)
+   *
+   * Every let/const declared directly in a clause and referenced from a
+   * DIFFERENT clause (its statements or a later case test) gets a BOOL
+   * init flag — declared false ahead of the switch, set true right after
+   * the binding's own varDecl — and each such access is guarded with
+   * `global.tdzCheck(flag, name)` in module-TDZ order (reads, updates and
+   * typeof test first; a plain write's RHS evaluates first, Node's
+   * PutValue order). A cross-clause reference the rewrite cannot cover
+   * (one inside a nested function — the flag is not a capture — a read
+   * lowering folded away, a class declaration) refuses by name instead of
+   * running unguarded. Returns the statements to run before the switch
+   * (empty when no binding crosses a clause: such switches cost nothing). */
+  function switchClauseTdz(
+    L: Lowerer,
+    stmt: ts.SwitchStatement,
+    frame: Map<ts.Symbol, IrLocal>,
+    bodies: { body: IrStmt[]; tests: IrExpr[] }[],
+  ): IrStmt[] {
+    const clauses = stmt.caseBlock.clauses;
+    const declClause = new Map<ts.Symbol, { clause: number; name: ts.Identifier; isClass: boolean }>();
+    clauses.forEach((clause, ci) => {
+      for (const s of clause.statements) {
+        if (ts.isVariableStatement(s) && (ts.getCombinedNodeFlags(s.declarationList) & ts.NodeFlags.BlockScoped) !== 0) {
+          for (const d of s.declarationList.declarations) {
+            for (const id of boundIdentifiersOf(d.name)) {
+              const sym = L.checker.getSymbolAtLocation(id);
+              if (sym) declClause.set(sym, { clause: ci, name: id, isClass: false });
+            }
+          }
+        } else if (ts.isClassDeclaration(s) && s.name) {
+          const sym = L.checker.getSymbolAtLocation(s.name);
+          if (sym) declClause.set(sym, { clause: ci, name: s.name, isClass: true });
+        }
+      }
+    });
+    if (declClause.size === 0) return [];
+    // Cross-clause source references, by binding.
+    const refs = new Map<ts.Symbol, ts.Identifier[]>();
+    const visit = (n: ts.Node, ci: number, inFn: boolean): void => {
+      let ident: ts.Identifier | null = null;
+      let sym: ts.Symbol | undefined;
+      if (ts.isShorthandPropertyAssignment(n)) {
+        ident = n.name as ts.Identifier;
+        sym = L.checker.getShorthandAssignmentValueSymbol(n);
+      } else if (ts.isIdentifier(n)) {
+        ident = n;
+        sym = L.checker.getSymbolAtLocation(n);
+      }
+      if (ident && sym) {
+        const d = declClause.get(sym);
+        if (d && d.clause !== ci && d.name !== ident) {
+          if (inFn || d.isClass) {
+            L.unsupported(
+              "SC1090",
+              ident,
+              `${inFn ? "a nested function using" : "using"} the switch-case ${d.isClass ? "class" : "binding"} '${ident.text}' from another case clause (it may still be uninitialized there — declare it before the switch, or inside braces in its own case)`,
+            );
+          }
+          const list = refs.get(sym) ?? [];
+          list.push(ident);
+          refs.set(sym, list);
+        }
+      }
+      if (ts.isShorthandPropertyAssignment(n)) {
+        if (n.objectAssignmentInitializer) visit(n.objectAssignmentInitializer, ci, inFn);
+        return;
+      }
+      const fn = inFn || ts.isFunctionLike(n) || ts.isClassDeclaration(n) || ts.isClassExpression(n);
+      ts.forEachChild(n, (c) => {
+        visit(c, ci, fn);
+        return undefined;
+      });
+    };
+    clauses.forEach((clause, ci) => {
+      if (ts.isCaseClause(clause)) visit(clause.expression, ci, false);
+      for (const s of clause.statements) visit(s, ci, false);
+    });
+    if (refs.size === 0) return [];
+    const pre: IrStmt[] = [];
+    for (const [sym, idents] of refs) {
+      const d = declClause.get(sym)!;
+      const local = frame.get(sym);
+      const name = d.name.text;
+      const refuse = (at: ts.Node): never =>
+        L.unsupported(
+          "SC1090",
+          at,
+          `using the switch-case binding '${name}' from another case clause in a form the TDZ guard cannot cover (declare it before the switch, or inside braces in its own case)`,
+        );
+      if (!local) refuse(idents[0]!);
+      const loc = locOf(d.name);
+      const flag = L.declareHiddenMutableLocal(`%swtdz.${name}`, BOOL);
+      pre.push({ kind: "varDecl", localId: flag.id, init: { kind: "boolLit", value: false, type: BOOL, loc }, loc });
+      const check = (at: SrcLoc): IrStmt => ({
+        kind: "exprStmt",
+        expr: {
+          kind: "libCall",
+          fn: "global.tdzCheck",
+          args: [
+            { kind: "varRef", localId: flag.id, type: BOOL, loc: at },
+            { kind: "strLit", value: name, type: STRING, loc: at },
+          ],
+          type: VOID,
+          loc: at,
+        },
+        loc: at,
+      });
+      // The flag set: right after the binding's own varDecl, wherever the
+      // declaring clause's lowering put it.
+      let setPlaced = false;
+      const placeSet = (arr: unknown[]): void => {
+        for (let i = 0; i < arr.length; i++) {
+          const item = arr[i] as Record<string, unknown> | null;
+          if (item === null || typeof item !== "object") continue;
+          if (item["kind"] === "varDecl" && item["localId"] === local!.id) {
+            arr.splice(i + 1, 0, { kind: "assign", localId: flag.id, value: { kind: "boolLit", value: true, type: BOOL, loc }, loc });
+            setPlaced = true;
+            return;
+          }
+          for (const k of Object.keys(item)) {
+            if (k === "type" || k === "loc") continue;
+            const v = item[k];
+            if (Array.isArray(v)) placeSet(v);
+            else if (v !== null && typeof v === "object") placeSet([v]);
+            if (setPlaced) return;
+          }
+        }
+      };
+      placeSet(bodies[d.clause]!.body);
+      if (!setPlaced) refuse(idents[0]!);
+      // Guard every access of the local in the OTHER clauses.
+      const covered: SrcLoc[] = [];
+      const rewrite = (node: Record<string, unknown>): Record<string, unknown> => {
+        for (const k of Object.keys(node)) {
+          if (k === "type" || k === "loc") continue;
+          const v = node[k];
+          if (Array.isArray(v)) {
+            for (let i = 0; i < v.length; i++) {
+              const item = v[i];
+              if (item !== null && typeof item === "object") v[i] = rewrite(item as Record<string, unknown>);
+            }
+          } else if (v !== null && typeof v === "object") {
+            node[k] = rewrite(v as Record<string, unknown>);
+          }
+        }
+        const kind = node["kind"];
+        if (node["localId"] !== local!.id) {
+          if (kind === "closure" && (node["captures"] as string[]).includes(local!.id)) {
+            refuse(idents[0]!);
+          }
+          return node;
+        }
+        const at = node["loc"] as SrcLoc;
+        if (kind === "varRef" || kind === "incDec") {
+          covered.push(at);
+          return { kind: "seqExpr", stmts: [check(at)], result: node, type: node["type"], loc: at };
+        }
+        if (kind === "assign" || kind === "assignExpr") {
+          covered.push(at);
+          const value = node["value"] as IrExpr;
+          const tmp = L.declareHiddenLocal("%swtdzv", value.type);
+          node["value"] = {
+            kind: "seqExpr",
+            stmts: [{ kind: "varDecl", localId: tmp.id, init: value, loc: at }, check(at)],
+            result: { kind: "varRef", localId: tmp.id, type: value.type, loc: at },
+            type: value.type,
+            loc: at,
+          };
+          return node;
+        }
+        if (kind === "forOf") {
+          covered.push(at);
+          node["body"] = [check(at), ...(node["body"] as IrStmt[])];
+          return node;
+        }
+        return node;
+      };
+      bodies.forEach((b, ci) => {
+        if (ci === d.clause) return;
+        b.body.forEach((s, i) => (b.body[i] = rewrite(s as unknown as Record<string, unknown>) as unknown as IrStmt));
+        b.tests.forEach((t, i) => (b.tests[i] = rewrite(t as unknown as Record<string, unknown>) as unknown as IrExpr));
+      });
+      const sf = stmt.getSourceFile();
+      for (const id of idents) {
+        const start = id.getStart(sf);
+        if (!covered.some((c) => c.file === sf.fileName && c.start <= start && start < c.end)) refuse(id);
+      }
+    }
+    return pre;
+  }
+
+/** A function declaration directly in a case clause is hoisted to the
+   * switch BLOCK's entry (initialized before any case test runs), so a
+   * call from another clause — entered by a jump that skipped the
+   * declaring clause — reaches the function, Node-exact. Lowered in
+   * place, its local would still be unset there (a null closure trap).
+   * Declarations referenced only from their own clause keep the ordinary
+   * in-place lowering (the list-level forward hoisting covers them).
+   * Returns the hoisted varDecls, to run ahead of the switch. */
+  function hoistSwitchFnDecls(L: Lowerer, stmt: ts.SwitchStatement): IrStmt[] {
+    const clauses = stmt.caseBlock.clauses;
+    const fns = new Map<ts.Symbol, { decl: ts.FunctionDeclaration; clause: number }>();
+    clauses.forEach((clause, ci) => {
+      for (const s of clause.statements) {
+        if (ts.isFunctionDeclaration(s) && s.body && s.name) {
+          const sym = L.checker.getSymbolAtLocation(s.name);
+          if (sym) fns.set(sym, { decl: s, clause: ci });
+        }
+      }
+    });
+    if (fns.size === 0) return [];
+    const cross = new Set<ts.FunctionDeclaration>();
+    const visit = (n: ts.Node, ci: number): void => {
+      if (ts.isIdentifier(n)) {
+        const sym = L.checker.getSymbolAtLocation(n);
+        const f = sym ? fns.get(sym) : undefined;
+        if (f && f.clause !== ci) cross.add(f.decl);
+      }
+      ts.forEachChild(n, (c) => {
+        visit(c, ci);
+        return undefined;
+      });
+    };
+    clauses.forEach((clause, ci) => {
+      if (ts.isCaseClause(clause)) visit(clause.expression, ci);
+      for (const s of clause.statements) visit(s, ci);
+    });
+    const out: IrStmt[] = [];
+    for (const { decl } of fns.values()) {
+      if (!cross.has(decl) || L.hoistedFnDecls.has(decl)) continue;
+      L.hoistedFnDecls.add(decl);
+      out.push(L.lowerNestedFunctionDecl(decl));
+    }
+    return out;
+  }
+
   export function lowerSwitch(L: Lowerer, stmt: ts.SwitchStatement): IrStmt {
     // Labels consume HERE, before any nested statement can see them; the
     // union desugar drops them (its if/else chain has no switch-end label
@@ -3434,8 +3678,10 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
     }
     // The whole case-body sequence is ONE lexical scope in JS: a bare `let`
     // in one case is visible in later cases.
-    L.scopes.push(new Map());
+    const frame = new Map<ts.Symbol, IrLocal>();
+    L.scopes.push(frame);
     try {
+      const hoisted = hoistSwitchFnDecls(L, stmt);
       const cases: { test: IrExpr | null; body: IrStmt[] }[] = [];
       for (const clause of stmt.caseBlock.clauses) {
         let test: IrExpr | null = null;
@@ -3451,7 +3697,13 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
         }
         cases.push({ test, body: L.inCtl("switch", () => L.lowerStmts(clause.statements), labels) });
       }
-      return { kind: "switch", disc, cases, ...(labels && { labels }), loc: locOf(stmt) };
+      const perClause = cases.map((c) => ({ body: c.body, tests: c.test ? [c.test] : [] }));
+      const pre = [...hoisted, ...switchClauseTdz(L, stmt, frame, perClause)];
+      perClause.forEach((c, i) => {
+        if (cases[i]!.test) cases[i]!.test = c.tests[0]!;
+      });
+      const sw: IrStmt = { kind: "switch", disc, cases, ...(labels && { labels }), loc: locOf(stmt) };
+      return pre.length > 0 ? { kind: "block", body: [...pre, sw], loc: locOf(stmt) } : sw;
     } finally {
       L.scopes.pop();
     }
@@ -3531,14 +3783,21 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
     };
     // The whole case-body sequence is ONE lexical scope, like the real
     // switch lowering.
-    L.scopes.push(new Map());
+    const frame = new Map<ts.Symbol, IrLocal>();
+    L.scopes.push(frame);
     try {
+      const hoisted = hoistSwitchFnDecls(L, stmt);
       // Group clauses: consecutive test-only cases (empty statements) share
       // the next body, exactly JS's grouped-case idiom.
       const groups: { tests: IrExpr[]; body: IrStmt[]; isDefault: boolean }[] = [];
+      // Per source clause: its body (the group's, for the clause that owns
+      // it) and its test's slot — the switch-block TDZ rewrite's view.
+      const perClause: { body: IrStmt[]; tests: IrExpr[] }[] = [];
+      const testSlots: { tests: IrExpr[]; at: number }[] = [];
       let pendingTests: IrExpr[] = [];
       for (let i = 0; i < clauses.length; i++) {
         const clause = clauses[i]!;
+        perClause.push({ body: [], tests: [] });
         if (ts.isCaseClause(clause)) {
           const test = L.lowerExpr(clause.expression);
           // Case tests must be side-effect-free (literals or plain reads):
@@ -3565,6 +3824,7 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
             test.kind === "unitLit"
               ? L.lowerUnitComparison(disc, test, false, locOf(clause.expression))
               : null;
+          testSlots[i] = { tests: pendingTests, at: pendingTests.length };
           pendingTests.push(
             unitTest ?? {
               kind: "unionEq",
@@ -3597,9 +3857,17 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
           ? clause.statements.slice(0, -1)
           : clause.statements.slice();
         const body = L.lowerStmts(stmts);
+        perClause[i]!.body = body;
         groups.push({ tests: pendingTests, body, isDefault });
         pendingTests = [];
       }
+      testSlots.forEach((slot, i) => {
+        if (slot) perClause[i]!.tests.push(slot.tests[slot.at]!);
+      });
+      const pre = [...hoisted, ...switchClauseTdz(L, stmt, frame, perClause)];
+      testSlots.forEach((slot, i) => {
+        if (slot) slot.tests[slot.at] = perClause[i]!.tests[0]!;
+      });
       // A default clause anywhere lands in the chain's final else; JS
       // reaches it only after every case test fails, which the chain
       // reproduces because default bodies that don't exit were fenced
@@ -3616,7 +3884,7 @@ export function lowerVarDecl(L: Lowerer, decl: ts.VariableDeclaration, isLet: bo
         }
         chain = [{ kind: "if", cond, then: g.body, else_: chain.length > 0 ? chain : null, loc }];
       }
-      return { kind: "block", body: chain, loc };
+      return { kind: "block", body: [...pre, ...chain], loc };
     } finally {
       L.scopes.pop();
     }

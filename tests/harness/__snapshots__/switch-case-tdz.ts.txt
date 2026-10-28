@@ -1,0 +1,6 @@
+switch-case-tdz.ts:12:9 - error SC1090: a nested function using the switch-case binding 'x' from another case clause (it may still be uninitialized there — declare it before the switch, or inside braces in its own case) is not supported yet
+
+  11 |       const set = (): void => {
+  12 |         x = 3;
+     |         ^
+  13 |       };
