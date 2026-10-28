@@ -12,7 +12,7 @@
  * back. Each answers a checksum, so the work is inside the timing.
  *
  * The probe is wasm-rope-scaling.test.ts's: the best of several runs at
- * N and at 4N, timed inside the program against the host's clock —
+ * N and at 4N, timed inside the program against the host's CPU clock (scaling-clock.ts) —
  * linear work answers ≈ 4×, the old quadratic path ≥ 16×; the bound sits
  * between them. Below a noise floor a ratio is not checked. Every result
  * is compared with Node running the same program. */
@@ -23,6 +23,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import { compile } from "../src/index.js";
 import { runWasm } from "./wasm-host.js";
+import { cpuClockMs } from "./scaling-clock.js";
 
 let scratch: string;
 beforeAll(async () => {
@@ -107,7 +108,7 @@ test("S3 front-consuming string loops (slice(1), regex tokenizers, field/paramet
   await writeFile(entry, program());
   const res = await compile(entry, { outPath: join(scratch, "slices.wasm"), outDir: scratch, backend: "wasm" });
   if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => d.message).join(" | ")}`);
-  const run = await runWasm(res.binaryPath, { imports: { now: () => performance.now() } });
+  const run = await runWasm(res.binaryPath, { imports: { now: cpuClockMs } });
   expect(run.stderr).toBe("");
   const out = run.stdout.split("\n");
   const node = execFileSync(process.execPath, [entry], { encoding: "utf8" }).split("\n");

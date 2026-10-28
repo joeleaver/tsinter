@@ -174,4 +174,7 @@ test(`every corpus program is 100% static (corpus and coverage agree${shardSuffi
     expect.soft(coverage.stats.statementsFailed, file).toBe(deferred ? Number(deferred[1]) : 0);
     if (++n % 10 === 0) await new Promise((r) => setImmediate(r));
   }
-}, 600_000);
+  // A hang detector, not a performance bound: the sweep takes ~130 s alone
+  // (2026-10-28, 1099 programs) but 260–600+ s inside a full run sharing the
+  // box (a2cd9c1: 260 s; 016bef7: 412 s; 9920ae5: >600 s in a 5.4 h run).
+}, 900_000);

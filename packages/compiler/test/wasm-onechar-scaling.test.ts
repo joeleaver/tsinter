@@ -8,7 +8,8 @@
  * ×4 input; a charAt loop ×18; Node 24–40 ms).
  *
  * Two probes, both shaped to hold on a loaded box (best of several runs,
- * timed inside the program against the host's real clock):
+ * timed inside the program against the host's CPU clock, scaling-clock.ts —
+ * Node's side too):
  * - SCALING: each per-character walk at N and 4N code units must answer
  *   ≤ ×10 (linear is ≈ ×4–5; the churn measured ×7–×18).
  * - NODE PARITY for the two builtins Node fast-paths, split("") and the
@@ -23,6 +24,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import { compile } from "../src/index.js";
 import { runWasm } from "./wasm-host.js";
+import { cpuClockMs, NODE_CPU_CLOCK } from "./scaling-clock.js";
 
 let scratch: string;
 beforeAll(async () => {
@@ -95,10 +97,10 @@ test("#299 one-unit strings are shared: per-character walks scale linearly on wa
   await writeFile(entry, program());
   const res = await compile(entry, { outPath: join(scratch, "onechar.wasm"), outDir: scratch, backend: "wasm" });
   if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => d.message).join(" | ")}`);
-  const run = await runWasm(res.binaryPath, { imports: { now: () => performance.now() } });
+  const run = await runWasm(res.binaryPath, { imports: { now: cpuClockMs } });
   expect(run.stderr).toBe("");
   const out = run.stdout.split("\n");
-  const node = execFileSync(process.execPath, [entry], { encoding: "utf8" }).split("\n");
+  const node = execFileSync(process.execPath, [...NODE_CPU_CLOCK, entry], { encoding: "utf8" }).split("\n");
 
   const timesOf = (lines: string[]): Map<number, [number, number]> =>
     new Map(

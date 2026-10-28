@@ -417,41 +417,41 @@ function collectOccurrences(L: Lowerer, tdz: ModuleTdz): void {
   }
   for (const sf of tdz.files) {
     const out: Occurrence[] = [];
-    const stack: ts.Node[] = [];
-    const record = (n: ts.Node, sym: ts.Symbol | undefined): void => {
+    const record = (n: ts.Node, sym: ts.Symbol | undefined, unit: ts.Node): void => {
       if (sym === undefined) return;
       if (sym.flags & ts.SymbolFlags.Alias) sym = L.checker.getAliasedSymbol(sym);
       const b = tdz.bySymbol.get(sym);
       if (b === undefined) return;
       const start = n.getStart(sf);
       if (!tdz.needsCheck(b, sf.fileName, start)) return;
-      out.push({ start, end: n.end, b, unit: stack[stack.length - 1]! });
+      out.push({ start, end: n.end, b, unit });
     };
-    const visit = (n: ts.Node): void => {
+    // Iterative (each entry carries its innermost enclosing unit): a
+    // thousands-deep expression must not overflow the JS stack. `out` is
+    // sorted below, so visit order is immaterial.
+    const work: [ts.Node, ts.Node | undefined][] = [[sf, undefined]];
+    while (work.length > 0) {
+      const [n, outer] = work.pop()!;
       if (ts.isTypeNode(n) && !(ts.isExpressionWithTypeArguments(n) && n.parent !== undefined && ts.isHeritageClause(n.parent) && n.parent.token === ts.SyntaxKind.ExtendsKeyword)) {
-        return;
+        continue;
       }
-      const unit = isUnit(n);
-      if (unit) stack.push(n);
-      if (stack.length > 0) {
+      const unit = isUnit(n) ? n : outer;
+      if (unit !== undefined) {
         if (ts.isIdentifier(n)) {
           // Name pre-filter: a cycle-mode binding may be imported under
           // another name, so every identifier resolves then.
-          if (anyCycle || names.has(n.text)) record(n, L.checker.getSymbolAtLocation(n));
+          if (anyCycle || names.has(n.text)) record(n, L.checker.getSymbolAtLocation(n), unit);
         } else if (ts.isShorthandPropertyAssignment(n)) {
-          if (anyCycle || (ts.isIdentifier(n.name) && names.has(n.name.text))) record(n.name, L.checker.getShorthandAssignmentValueSymbol(n));
-          if (n.objectAssignmentInitializer !== undefined) visit(n.objectAssignmentInitializer);
-          if (unit) stack.pop();
-          return;
+          if (anyCycle || (ts.isIdentifier(n.name) && names.has(n.name.text))) record(n.name, L.checker.getShorthandAssignmentValueSymbol(n), unit);
+          if (n.objectAssignmentInitializer !== undefined) work.push([n.objectAssignmentInitializer, unit]);
+          continue;
         }
       }
       ts.forEachChild(n, (c) => {
-        visit(c);
+        work.push([c, unit]);
         return undefined;
       });
-      if (unit) stack.pop();
-    };
-    visit(sf);
+    }
     if (out.length > 0) {
       out.sort((a, b) => a.start - b.start);
       tdz.occByFile.set(sf.fileName, out);
@@ -467,6 +467,9 @@ function collectOccurrences(L: Lowerer, tdz: ModuleTdz): void {
 export function assertTdzCoverage(tdz: ModuleTdz, functions: IrFunction[]): void {
   const checks = new Map<string, { b: TdzBinding; start: number }[]>();
   const locs = new Map<string, number[]>();
+  // Statements lowered to a deferred runtimeFence: they throw before any
+  // access inside them could run, so those accesses owe no guard.
+  const fences = new Map<string, SrcLoc[]>();
   const seen = new WeakSet<object>();
   const scan = (v: unknown): void => {
     if (v === null || typeof v !== "object" || seen.has(v)) return;
@@ -481,6 +484,11 @@ export function assertTdzCoverage(tdz: ModuleTdz, functions: IrFunction[]): void
       let arr = locs.get(loc.file);
       if (arr === undefined) locs.set(loc.file, (arr = []));
       arr.push(loc.start);
+      if (r["kind"] === "runtimeFence") {
+        let f = fences.get(loc.file);
+        if (f === undefined) fences.set(loc.file, (f = []));
+        f.push(loc);
+      }
       if (r["kind"] === "libCall" && r["fn"] === "global.tdzCheck") {
         const flag = (r["args"] as { localId?: string }[])[0];
         const b = flag?.localId !== undefined ? tdz.byFlagId.get(flag.localId) : undefined;
@@ -499,22 +507,20 @@ export function assertTdzCoverage(tdz: ModuleTdz, functions: IrFunction[]): void
     if (occs === undefined) continue;
     const fileLocs = locs.get(sf.fileName) ?? [];
     const fileChecks = checks.get(sf.fileName) ?? [];
+    const fileFences = fences.get(sf.fileName) ?? [];
     for (const o of occs) {
+      if (fileFences.some((f) => f.start <= o.start && o.end <= f.end)) continue;
       const uStart = o.unit.getStart(sf);
       // A unit nothing lowered (unreachable) has no IR to guard.
       if (!fileLocs.some((p) => p > uStart && p < o.unit.end)) continue;
       let stmt: ts.Node = o.unit;
       // The innermost statement (or the unit's concise body) around it.
-      const find = (n: ts.Node): void => {
-        if (n.getStart(sf) <= o.start && o.end <= n.end) {
-          if ((ts.isStatement(n) || n === o.unit) && n !== sf) stmt = n;
-          ts.forEachChild(n, (c) => {
-            find(c);
-            return undefined;
-          });
-        }
-      };
-      find(o.unit);
+      // (Preorder, iterative: the last containing statement is the innermost.)
+      ts.walkPreorder(o.unit, (n) => {
+        if (!(n.getStart(sf) <= o.start && o.end <= n.end)) return "skip";
+        if ((ts.isStatement(n) || n === o.unit) && n !== sf) stmt = n;
+        return undefined;
+      });
       const s0 = stmt.getStart(sf);
       if (!fileChecks.some((c) => c.b === o.b && c.start >= s0 && c.start < stmt.end)) {
         const lc = ts.getLineAndCharacterOfPosition(sf, o.start);
@@ -538,12 +544,15 @@ function clusterUnitRefs(
   if (hit !== undefined) return hit;
   const refs = new Set<ts.Symbol>();
   for (const m of comp) {
-    const visit = (n: ts.Node, inUnit: boolean): void => {
+    // Iterative: a thousands-deep expression must not overflow the JS stack.
+    const work: [ts.Node, boolean][] = [[m, false]];
+    while (work.length > 0) {
+      const [n, inUnit] = work.pop()!;
       if (inUnit && ts.isIdentifier(n)) {
         let sym = L.checker.getSymbolAtLocation(n);
         if (sym !== undefined && sym.flags & ts.SymbolFlags.Alias) sym = L.checker.getAliasedSymbol(sym);
         if (sym !== undefined) refs.add(sym);
-        return;
+        continue;
       }
       if (inUnit && ts.isShorthandPropertyAssignment(n)) {
         const sym = L.checker.getShorthandAssignmentValueSymbol(n);
@@ -551,11 +560,10 @@ function clusterUnitRefs(
       }
       const inner = inUnit || isUnit(n);
       ts.forEachChild(n, (c) => {
-        visit(c, inner);
+        work.push([c, inner]);
         return undefined;
       });
-    };
-    visit(m, false);
+    }
   }
   memo.set(comp, refs);
   return refs;
@@ -723,7 +731,18 @@ function analyzeFile(
       for (const m of classMemberUnits(c)) addUnit(m);
     }
   };
-  const visitExec = (n: ts.Node, inUnit: boolean): void => {
+  // Iterative (an explicit stack, like walkPreorder): an expression nested
+  // thousands deep must not overflow the JS stack before lowering's named
+  // SC1090 fence fires. Visit order is immaterial — every effect (addUnit,
+  // referenceSym) records the same `at` for the whole call.
+  const visitExec = (root: ts.Node, inUnit: boolean): void => {
+    const stack: ts.Node[] = [root];
+    while (stack.length > 0) {
+      const n = stack.pop()!;
+      visitExecStep(n, inUnit, stack);
+    }
+  };
+  const visitExecStep = (n: ts.Node, inUnit: boolean, stack: ts.Node[]): void => {
     if (isUnit(n)) {
       if (!deferredUnits.has(n)) addUnit(n);
       return;
@@ -746,10 +765,10 @@ function analyzeFile(
       // `const f = () => ...` must not count as calling f); defaults,
       // computed keys and initializers execute.
       if (ts.isBindingElement(n) && n.propertyName !== undefined && ts.isComputedPropertyName(n.propertyName)) {
-        visitExec(n.propertyName.expression, inUnit);
+        stack.push(n.propertyName.expression);
       }
-      if (n.name !== undefined && !ts.isIdentifier(n.name)) visitExec(n.name, inUnit);
-      if (n.initializer !== undefined) visitExec(n.initializer, inUnit);
+      if (n.name !== undefined && !ts.isIdentifier(n.name)) stack.push(n.name);
+      if (n.initializer !== undefined) stack.push(n.initializer);
       return;
     }
     if (ts.isIdentifier(n)) {
@@ -758,11 +777,11 @@ function analyzeFile(
     }
     if (ts.isShorthandPropertyAssignment(n)) {
       referenceSym(checker.getShorthandAssignmentValueSymbol(n), inUnit, n);
-      if (n.objectAssignmentInitializer !== undefined) visitExec(n.objectAssignmentInitializer, inUnit);
+      if (n.objectAssignmentInitializer !== undefined) stack.push(n.objectAssignmentInitializer);
       return;
     }
     ts.forEachChild(n, (c) => {
-      visitExec(c, inUnit);
+      stack.push(c);
       return undefined;
     });
   };

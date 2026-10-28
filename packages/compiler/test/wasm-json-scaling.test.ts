@@ -15,7 +15,7 @@
  *
  * The probe is wasm-string-scaling.test.ts's: a SCALING RATIO, not an
  * absolute time — each operation over an input of N and of 4N, best of
- * several runs, timed inside the program against the host's real clock.
+ * several runs, timed inside the program against the host's CPU clock (scaling-clock.ts).
  * Linear work answers ≈ 4×; the quadratic paths answered 16× and far
  * more. Below a noise floor (the 4N run under 3 ms) a ratio is not
  * checked; a run of N slower than SLOW_N_MS is reported as the quadratic
@@ -28,6 +28,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import { compile } from "../src/index.js";
 import { runWasm } from "./wasm-host.js";
+import { cpuClockMs } from "./scaling-clock.js";
 
 let scratch: string;
 beforeAll(async () => {
@@ -136,7 +137,7 @@ async function probe(label: string, ops: Op[], dynamic: boolean): Promise<void> 
   await writeFile(entry, program(ops, dynamic));
   const res = await compile(entry, { outPath: join(scratch, `${label}.wasm`), outDir: scratch, backend: "wasm", dynamic });
   if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => d.message).join(" | ")}`);
-  const run = await runWasm(res.binaryPath, { imports: { now: () => performance.now() } });
+  const run = await runWasm(res.binaryPath, { imports: { now: cpuClockMs } });
   expect(run.stderr).toBe("");
   const out = run.stdout.split("\n");
   const node = execFileSync(process.execPath, ["--experimental-strip-types", "--no-warnings", entry], {

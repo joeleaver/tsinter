@@ -7,7 +7,7 @@
  *
  * A SCALING RATIO, not an absolute time (the wasm-string-scaling.test.ts
  * method): each operation runs at N and 4N, best of several runs, timed
- * inside the program against the host's real clock; linear work answers
+ * inside the program against the host's CPU clock (scaling-clock.ts); linear work answers
  * ≈ 4×, the quadratic path ≥ 16×. Results are compared with Node. */
 import { execFileSync } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -16,6 +16,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import { compile } from "../src/index.js";
 import { runWasm } from "./wasm-host.js";
+import { cpuClockMs } from "./scaling-clock.js";
 
 let scratch: string;
 beforeAll(async () => {
@@ -79,7 +80,7 @@ test("H-SCALE-01 view mutations and walks scale linearly on wasm, and agree with
   await writeFile(entry, program());
   const res = await compile(entry, { outPath: join(scratch, "view-scaling.wasm"), outDir: scratch, backend: "wasm", dynamic: true });
   if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => d.message).join(" | ")}`);
-  const run = await runWasm(res.binaryPath, { imports: { now: () => performance.now() } });
+  const run = await runWasm(res.binaryPath, { imports: { now: cpuClockMs } });
   expect(run.stderr).toBe("");
   const out = run.stdout.split("\n");
   const node = execFileSync(process.execPath, ["--experimental-transform-types", "--no-warnings", entry], { encoding: "utf8" }).split("\n");

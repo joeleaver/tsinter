@@ -9,9 +9,10 @@
  * The probe is a SCALING RATIO, not an absolute time, so it holds on a
  * loaded box: each operation runs over a subject of N and of 4N code
  * units, best of several runs each (a load spike or a GC pause inflates
- * a run, never deflates one), timed inside the program against a real
- * clock the test host supplies. Linear work answers ≈ 4× (a little more
- * as the GC's live set grows); the quadratic join answered ≥ 16× — at
+ * a run, never deflates one), timed inside the program against the
+ * thread CPU clock the test host supplies (scaling-clock.ts: a descheduled
+ * run costs nothing, so load cannot fake a superlinear ratio). Linear work
+ * answers ≈ 4× (a little more as the GC's live set grows); the quadratic join answered ≥ 16× — at
  * these sizes the old build measured 30–60×. The bound sits between
  * them, generous on the linear side. Below a noise floor (the 4N run
  * under 3 ms) a ratio is not meaningful and is not checked: the old,
@@ -27,6 +28,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, expect, test } from "vitest";
 import { compile } from "../src/index.js";
 import { runWasm } from "./wasm-host.js";
+import { cpuClockMs } from "./scaling-clock.js";
 
 let scratch: string;
 beforeAll(async () => {
@@ -103,7 +105,7 @@ test("#291 global replace and the string paths under it scale linearly on wasm, 
   await writeFile(entry, program());
   const res = await compile(entry, { outPath: join(scratch, "scaling.wasm"), outDir: scratch, backend: "wasm" });
   if (!res.ok) throw new Error(`refused: ${res.diagnostics.map((d) => d.message).join(" | ")}`);
-  const run = await runWasm(res.binaryPath, { imports: { now: () => performance.now() } });
+  const run = await runWasm(res.binaryPath, { imports: { now: cpuClockMs } });
   expect(run.stderr).toBe("");
   const out = run.stdout.split("\n");
   const node = execFileSync(process.execPath, [entry], { encoding: "utf8" }).split("\n");

@@ -604,7 +604,9 @@ function selfImportTdzFences7(
     if (sym === undefined || !(sym.flags & ts.SymbolFlags.Alias)) return;
     const end = tdzEndOf(checker.getAliasedSymbol(sym));
     if (end === null) return;
-    const visit = (node: ts.Node): void => {
+    // Iterative (walkPreorder): a thousands-deep expression must not
+    // overflow the JS stack.
+    ts.walkPreorder(sf, (node) => {
       if (
         ts.isIdentifier(node) &&
         node !== bindingName &&
@@ -615,9 +617,8 @@ function selfImportTdzFences7(
       ) {
         fence(node, bindingName.text);
       }
-      ts.forEachChild(node, visit);
-    };
-    visit(sf);
+      return undefined;
+    });
   };
   if (clause.name !== undefined) checkNamed(clause.name);
   if (clause.namedBindings !== undefined && ts.isNamedImports(clause.namedBindings)) {
@@ -629,7 +630,7 @@ function selfImportTdzFences7(
     const nsName = clause.namedBindings.name;
     const nsSym = checker.getSymbolAtLocation(nsName);
     if (nsSym === undefined) return;
-    const visit = (node: ts.Node): void => {
+    ts.walkPreorder(sf, (node) => {
       if (
         ts.isPropertyAccessExpression(node) &&
         ts.isIdentifier(node.expression) &&
@@ -644,9 +645,8 @@ function selfImportTdzFences7(
           if (end !== null && node.getStart(sf) < end) fence(node.expression, `${nsName.text}.${node.name.text}`);
         }
       }
-      ts.forEachChild(node, visit);
-    };
-    visit(sf);
+      return undefined;
+    });
   }
 }
 
@@ -664,8 +664,9 @@ function nsBindingUsesAreBareStatements7(
   const bindingSym = checker.getSymbolAtLocation(nsName);
   if (bindingSym === undefined) return false;
   let bareOnly = true;
-  const visit = (node: ts.Node): void => {
-    if (!bareOnly) return;
+  // Iterative (walkPreorder): a thousands-deep expression must not
+  // overflow the JS stack.
+  ts.walkPreorder(sf, (node) => {
     if (
       ts.isIdentifier(node) &&
       node !== nsName &&
@@ -674,12 +675,11 @@ function nsBindingUsesAreBareStatements7(
     ) {
       if (!(node.parent !== undefined && ts.isExpressionStatement(node.parent) && node.parent.expression === node)) {
         bareOnly = false;
-        return;
+        return "stop";
       }
     }
-    ts.forEachChild(node, visit);
-  };
-  visit(sf);
+    return undefined;
+  });
   return bareOnly;
 }
 
@@ -1017,8 +1017,10 @@ function backEdgeUseOffence7(
     const sym = checker.getSymbolAtLocation(bindingName);
     if (sym === undefined) continue;
     let offence: { name: string; node: ts.Node } | null = null;
-    const visit = (node: ts.Node): void => {
-      if (offence !== null || ts.isImportDeclaration(node)) return;
+    // Iterative (walkPreorder): a thousands-deep expression must not
+    // overflow the JS stack.
+    ts.walkPreorder(sf, (node) => {
+      if (ts.isImportDeclaration(node)) return "skip";
       if (
         ts.isIdentifier(node) &&
         node.text === bindingName.text &&
@@ -1028,11 +1030,10 @@ function backEdgeUseOffence7(
         !inDeferredPosition7(node)
       ) {
         offence = { name: bindingName.text, node };
-        return;
+        return "stop";
       }
-      ts.forEachChild(node, visit);
-    };
-    visit(sf);
+      return undefined;
+    });
     if (offence !== null) return offence;
   }
   return null;

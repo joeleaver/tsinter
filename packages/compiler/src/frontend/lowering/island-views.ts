@@ -840,15 +840,16 @@ export function fnReturnsFreshArray(fn: ts.Node, L: Lowerer): boolean {
   if (ts.isExpression(body)) return arrayContainerFresh(L, body);
   const rets: ts.Expression[] = [];
   let bare = false;
-  const visit = (x: ts.Node): void => {
-    if (ts.isFunctionLike(x)) return;
+  // Iterative (walkPreorder): a thousands-deep expression in the body
+  // must not overflow the JS stack.
+  ts.walkPreorder(body, (x) => {
+    if (x !== body && ts.isFunctionLike(x)) return "skip";
     if (ts.isReturnStatement(x)) {
       if (x.expression) rets.push(x.expression);
       else bare = true;
     }
-    x.forEachChild(visit);
-  };
-  body.forEachChild(visit);
+    return undefined;
+  });
   return !bare && rets.length > 0 && rets.every((r) => arrayContainerFresh(L, r));
 }
 
@@ -863,15 +864,16 @@ function returnsFresh(L: Lowerer, fn: ts.Node, t: IrType, seen: Set<ts.Node>): b
   if (ts.isExpression(body)) return exitIsFresh(L, body, t, seen);
   const rets: ts.Expression[] = [];
   let bare = false;
-  const visit = (x: ts.Node): void => {
-    if (ts.isFunctionLike(x)) return;
+  // Iterative (walkPreorder): a thousands-deep expression in the body
+  // must not overflow the JS stack.
+  ts.walkPreorder(body, (x) => {
+    if (x !== body && ts.isFunctionLike(x)) return "skip";
     if (ts.isReturnStatement(x)) {
       if (x.expression) rets.push(x.expression);
       else bare = true;
     }
-    x.forEachChild(visit);
-  };
-  body.forEachChild(visit);
+    return undefined;
+  });
   return !bare && rets.length > 0 && rets.every((r) => exitIsFresh(L, r, t, seen));
 }
 
